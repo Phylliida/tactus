@@ -1,0 +1,952 @@
+# Tactus Design Document
+
+Tactus is a verified Rust tool built by modifying Verus to use Lean 4's proof kernel instead of Z3. All proof obligations go through Lean — there is no Z3 backend. Users write `.rs` files with specs and Lean-style tactic proofs. The `.rs` files are the single source of truth.
+
+## Why
+
+Verus uses Z3 (SMT solver) for proof checking. This works well for simple obligations but causes pain for hard mathematical proofs:
+
+- **Context pollution**: Z3 is superlinear in proof size. Functions >50 assertions consistently fail even with high rlimit.
+- **No goal states**: Z3 says "assertion might not hold" with no indication of what remains to prove.
+- **Manual guidance**: Users write 150+ line assert chains to guide Z3 through algebraic identities.
+- **eqv infrastructure**: Z3 needs explicit equivalence relations (`eqv`) with congruence axioms, symmetric/transitive chains, direction management.
+- **Fragile automation**: Z3's heuristics are unpredictable. Small edits can cause rlimit explosion.
+
+Lean replaces all of this:
+
+- **Tactics**: `ring`, `omega`, `nlinarith`, `simp`, `field_simp` solve in one line what takes 150 lines of assert chains.
+- **Goal states**: On failure, Lean shows exactly what remains to prove.
+- **Propositional equality**: `==` maps to Lean's `=`. No `eqv`, no congruence axioms, no direction flipping.
+- **Mathlib**: Hundreds of thousands of proven lemmas for algebra, analysis, number theory, etc.
+- **Deterministic**: Tactics either work or show remaining goals. No heuristic rlimit games.
+
+## Design principles
+
+1. **Transparency**: Nothing happens automatically behind the user's back. Imports are explicit. Mutual recursion is user-declared. No magic auto-detection.
+2. **Lean-native**: All proofs go through Lean. No Z3, no SMT, no dual backend. Tactic proofs are the only proof language.
+3. **Source of truth**: `.rs` files contain everything. No separate `.lean` files for users to manage.
+4. **Minimal axioms**: Every axiom is a soundness risk. Use `def` instead of `axiom` when the value is computable. Keep the trusted base small.
+
+## Pipeline
+
+### Verus today
+```
+.rs → verus! macro → rustc_driver → HIR → VIR-AST → VIR-SST → sst_to_air → AIR → SMT-LIB → Z3
+```
+
+### Tactus
+```
+.rs → tactus! macro → rustc_driver → HIR → VIR-AST → VIR-SST → sst_to_lean → Lean 4 → lean kernel
+```
+
+We replace `sst_to_air` (and everything after it) with `sst_to_lean`. The AIR crate, SMT-LIB encoding, and Z3 invocation are removed entirely.
+
+### Why cut at SST?
+
+**VIR-AST** has the original program structure but hasn't generated verification conditions yet.
+
+**VIR-SST** is a cleaned-up AST: no side effects in expressions, no statements inside expressions. It's the input to VC generation.
+
+**AIR** is too low — it encodes generics as `Poly` (universal type with box/unbox, an SMT workaround for Z3's lack of parametric polymorphism) and generates triggers. Lean has native parametric polymorphism and doesn't need triggers. Translating AIR → Lean would mean undoing SMT-specific encodings.
+
+We implement **fresh VC generation targeting Lean directly** in `sst_to_lean`, rather than reusing `sst_to_air`. This avoids inheriting SMT-specific design decisions (Poly encoding, trigger inference, fuel encoding, expression flattening).
+
+### Proof fns vs exec fns
+
+**Proof fns** (with `by { ... }` tactic blocks) bypass VC generation entirely:
+- `requires` → Lean theorem hypotheses
+- `ensures` → Lean theorem goal
+- Tactic body → Lean proof (verbatim pass-through)
+
+**Exec fns** need VC generation (loops, mutation, overflow, bounds):
+- VIR → SST (existing `ast_to_sst`, unchanged)
+- SST → Lean VCs via `sst_to_lean` (new, Phase 2)
+- Each obligation becomes a Lean `theorem` with auto-tactics
+
+Phase 1 implements proof fn support. Phase 2 implements exec fn VC generation — this is the **hard part** (see Phased Implementation).
+
+## What Tactus code looks like
+
+### Lean imports (first-class syntax, explicit)
+
+```rust
+import Mathlib.Tactic.Ring
+import Mathlib.Tactic.Linarith
+import Mathlib.Tactic.NormNum
+import Mathlib.Tactic.Positivity
+import Mathlib.Tactic.FieldSimp
+```
+
+`import` is a first-class Tactus keyword, not a macro. It mirrors Lean's import syntax exactly because these ARE Lean imports — they control what `import` statements appear in the generated Lean. Users explicitly declare which Mathlib modules they need. No auto-detection.
+
+Tree-sitter-tactus recognizes `import` declarations at the top of files. The proc macro passes them through to the Lean generation layer.
+
+### Spec functions
+
+```rust
+spec fn double(x: nat) -> nat {
+    x + x
+}
+
+spec fn triangle(n: nat) -> nat
+    decreases n
+{
+    if n == 0 { 0 } else { n + triangle((n - 1) as nat) }
+}
+```
+
+### Spec fn opacity model
+
+All spec fns are **irreducible by default** — Lean tactics cannot see their bodies unless explicitly unfolded. This prevents Lean's elaborator from diverging on recursive functions and gives users full control over what gets unfolded.
+
+- `spec fn` → `@[irreducible] noncomputable def` (body hidden, use `unfold f` in tactics)
+- `open spec fn` → `noncomputable def` (body visible to `simp` and other tactics)
+
+The Verus attribute `#[verifier::opaque]` is redundant with the default and is not needed. In Tactus, all spec fns behave like Verus's `opaque` by default. `open` is the opt-in for transparency.
+
+This matches how well-written Lean code works — you mark definitions `@[irreducible]` and explicitly control unfolding. The `reveal(f)` pattern from Verus maps to `unfold f` in tactic blocks.
+
+### Mutual recursion (user-specified)
+
+```rust
+mutual
+spec fn is_even(n: nat) -> bool
+    decreases n
+{
+    if n == 0 { true } else { is_odd((n - 1) as nat) }
+}
+
+spec fn is_odd(n: nat) -> bool
+    decreases n
+{
+    if n == 0 { false } else { is_even((n - 1) as nat) }
+}
+end mutual
+```
+
+Mirrors Lean's `mutual ... end` syntax. Mutual recursion is not inferred — the user wraps mutually recursive functions in `mutual ... end mutual`.
+
+### Proof functions (tactic bodies)
+
+```rust
+proof fn lemma_norm_nonneg(re: int, im: int, d: int)
+    requires d <= 0
+    ensures re * re - d * (im * im) >= 0
+by {
+    nlinarith [sq_nonneg re, sq_nonneg im]
+}
+```
+
+The `by` keyword signals "what follows is Lean tactic syntax, not Rust." This is visually distinct from exec fn bodies and unambiguous to the parser.
+
+### Proof blocks inside exec functions
+
+```rust
+fn compute(x: u32) -> (result: u32)
+    requires x < 100
+    ensures result == x + 1
+{
+    let result = x + 1;
+    proof {
+        // Tactic proof — results thread into VC context
+        have h : result == x + 1 := by omega
+    }
+    result
+}
+```
+
+`proof { ... }` keeps its syntax. The body is Lean tactics. Tactic results (`have h : P := by ...`) are threaded into the VC context as hypotheses for subsequent proof obligations (handled by `sst_to_lean` in Phase 2).
+
+### Exec functions with auto-generated obligations
+
+```rust
+fn binary_search(v: &Vec<i32>, target: i32) -> (idx: Option<usize>)
+    requires is_sorted(v@)
+    ensures match idx {
+        Some(i) => i < v.len() && v@[i as int] == target,
+        None => !v@.contains(target),
+    }
+{
+    let mut lo: usize = 0;
+    let mut hi: usize = v.len();
+    while lo < hi
+        invariant
+            lo <= hi <= v.len(),
+            forall|i: int| 0 <= i < lo ==> v@[i] < target,
+            forall|i: int| hi <= i < v.len() ==> v@[i] > target,
+        decreases hi - lo
+    {
+        let mid = lo + (hi - lo) / 2;
+        if v[mid] < target {
+            lo = mid + 1;
+        } else if v[mid] > target {
+            hi = mid;
+        } else {
+            return Some(mid);
+        }
+    }
+    None
+}
+```
+
+Auto-generated obligations (from `sst_to_lean`, Phase 2) are checked with `tactus_auto`. If it fails, the user sees the goal state and can add an explicit `proof { }` block.
+
+### Assume expressions
+
+```rust
+assume(P);  // → have : P := sorry (with compiler warning)
+```
+
+`assume(P)` translates to `have : P := sorry`. Tactus emits a warning: "unproved assumption at line N". This is the escape hatch for incremental development.
+
+## Unicode in tactic blocks
+
+Lean tactics use Unicode: `⟨a, b⟩`, `·`, `∀`, `∃`, `¬`, `∧`, `∨`, `→`, `↔`, `≤`, `≥`, `≠`.
+
+### The problem
+
+Rust's `proc_macro::TokenTree` API has no way to represent Unicode punctuation. `Punct` only handles ASCII. `Ident` validates XID_Start/XID_Continue (rejects `⟨`). Even if `rustc_lexer` accepted these characters, the proc macro bridge cannot pass them through. This is a fundamental API limitation, not a lexer issue.
+
+### The solution: dual-parser architecture
+
+Tactic blocks are processed by **tree-sitter-tactus** (which handles Unicode natively), NOT by rustc's proc macro. The two parsers work on the same `.rs` file but extract different information:
+
+```
+.rs file
+  ├→ tree-sitter-tactus ─→ tactic text extraction (Unicode-aware)
+  │                          extracts raw text of each by{}/proof{} block
+  │                          indexed by source span (file, line, column)
+  │
+  └→ rustc (proc macro) ──→ VIR construction (type-checked)
+                              tactic blocks stored as TacticBlock(span)
+                              actual tactic TEXT comes from tree-sitter
+
+Lean generation combines both:
+  VIR structure (types, spec fns, proof fn signatures)  ← from rustc path
+  + tactic text                                          ← from tree-sitter path
+  → generated .lean file
+```
+
+The proc macro sees `by { ... }` as a regular Rust block with ASCII tokens (keywords like `ring`, `omega` parse as identifiers). It captures the block's **source span** and stores `TacticBlock(span)` in VIR. The actual Unicode-containing tactic text is retrieved from tree-sitter's output using the span as a key.
+
+This is clean because:
+- tree-sitter handles all Unicode natively — no rustc modification needed
+- The proc macro doesn't need to understand tactic content at all
+- No changes to `rustc_lexer` or `proc_macro` API
+- tree-sitter is already fast and incremental
+- We already have tree-sitter-tactus with Lean-like tactic grammar rules
+
+### What the proc macro sees vs what Lean gets
+
+User writes:
+```rust
+proof fn foo() ensures P
+by {
+    intro ⟨a, b⟩
+    exact ⟨b, a⟩
+}
+```
+
+Proc macro sees (ASCII tokens only):
+```
+by { intro < a , b > exact < b , a > }
+```
+...and records the span (file.rs:3:1 - 6:1).
+
+tree-sitter-tactus extracts (Unicode-aware):
+```
+intro ⟨a, b⟩
+exact ⟨b, a⟩
+```
+...from the same span.
+
+Lean generation uses tree-sitter's extraction:
+```lean
+theorem foo : P := by
+  intro ⟨a, b⟩
+  exact ⟨b, a⟩
+```
+
+## Keyword handling in tactic blocks
+
+### The `forall`/`exists` conflict
+
+`forall` and `exists` are Verus keywords with special syntax (`forall|x| P`). Inside tactic blocks, they may appear as Lean identifiers (`exact forall_comm`).
+
+**Fix**: The proc macro enters "tactic mode" when processing `by { }` or `proof { }` bodies. In tactic mode, all Verus-specific keyword parsing is suspended. The body is captured as a `TokenStream` (balanced braces handled by Rust's tokenizer) and the **source span** is recorded as `TacticBlock(span)` in VIR.
+
+The actual tactic text (including any Unicode) is retrieved from tree-sitter-tactus's output at Lean generation time, using the span as a key. The proc macro never needs to understand or represent Unicode tactic content.
+
+### `assert forall` auto-intro
+
+```rust
+assert forall|x: nat, y: nat| x + y == y + x by {
+    omega
+}
+```
+
+The translation auto-inserts `intro` for quantified variables:
+```lean
+have h : ∀ (x y : Nat), x + y = y + x := by
+  intro x y
+  omega
+```
+
+## Tactic block parsing (tree-sitter-tactus)
+
+Inside `by { }` and `proof { }`, we parse Lean-like tactic syntax drawing from tree-sitter-lean's grammar. Well-known tactics get specific rules (for highlighting and structure). Unknown tactics fall through to a balanced token-tree catch-all.
+
+Key Lean syntax supported:
+- `| name binders => ...` (induction/cases arms)
+- `·` and `.` for focusing
+- `⟨a, b⟩` anonymous constructors
+- `[expr, expr, ...]` simp/rw lemma lists
+- `at h` / `at *` location specifiers
+- Nested `by { }` inside `have`
+
+## Equality model
+
+`==` in spec mode maps to Lean's `=`. No `eqv` trait, no congruence axioms, no direction management.
+
+In VIR, equality is `ExprX::Binary(BinaryOp::Eq(Mode::Spec), lhs, rhs)`. The translation emits `l = r`.
+
+### Extensional equality
+
+Verus's `=~=` (extensional equality) also maps to Lean's `=`. This is correct because Lean 4's type theory includes function extensionality: for function types, `f = g ↔ ∀ x, f x = g x` is provable (via `funext`). So Lean's `=` on functions IS extensional equality — no separate encoding needed.
+
+In VIR: `BinaryOpr(ExtEq(deep), l, r)` → `l = r` in Lean. The `deep` flag (for nested extensionality on collections, etc.) is also handled by Lean's `=` since it's structural equality on inductive types.
+
+### Migration
+
+`eqv(a, b)` translates to `a = b`. Congruence axioms become trivially true. Existing code works — the `eqv` infrastructure is redundant but not broken.
+
+## Lean invocation
+
+### Mathlib setup (precompiled oleans)
+
+Tactus manages a persistent Lake project:
+
+```
+~/.tactus/
+  lean-project/
+    lakefile.lean        # imports Mathlib
+    lean-toolchain       # pins Lean version
+    .lake/               # precompiled Mathlib oleans
+    TactusPrelude.lean   # built-in type definitions (Seq, Set, etc.)
+    _check/              # temp generated .lean files
+```
+
+First-run setup:
+```bash
+tactus setup
+# 1. Creates ~/.tactus/lean-project/
+# 2. Writes lakefile.lean with Mathlib dependency + lean-toolchain
+# 3. Runs `lake exe cache get` to download precompiled Mathlib oleans
+#    (~2 GB download, ~2-5 minutes — no compilation needed)
+# 4. Done
+```
+
+If precompiled oleans aren't available for the pinned toolchain, falls back to `lake build` (~30-60 min, 16+ GB RAM). Clear progress indication shown.
+
+`tactus setup --no-mathlib` creates the project without Mathlib for faster setup (core Lean tactics only: `omega`, `simp`, `decide`, `exact`, `apply`, `intro`, `induction`, `cases`, `rfl`).
+
+### Invocation
+
+```bash
+lake env lean ~/.tactus/lean-project/_check/MyModule.lean --json -q
+```
+
+Per-module `.lean` files generated in `_check/`. Each file imports `TactusPrelude` and the user's declared imports.
+
+### Caching
+
+Lean's `.olean` caching handles incremental checking. Unchanged modules skip re-elaboration. We do NOT use Verus's function-level SHA-256 cache — Lean's built-in caching is sufficient.
+
+## Generated Lean structure
+
+### Namespacing
+
+Generated Lean definitions use VIR's `Path` (fully qualified name) as namespace:
+
+```lean
+namespace my_crate.my_module
+
+@[irreducible] noncomputable def double (x : Nat) : Nat := x + x
+
+theorem lemma_double_pos (x : Nat) (h₀ : x > 0) : double x > x := by
+  unfold double
+  omega
+
+end my_crate.my_module
+```
+
+This prevents name collisions between modules. Tactic bodies reference function names within the same namespace — `unfold double` works because `double` is in scope.
+
+### Definition ordering
+
+Lean requires definitions before use within a file. Generated definitions are topologically sorted using VIR's call-graph dependency information.
+
+Mutual recursion uses `mutual ... end` blocks (from the user's `mutual ... end mutual` declarations in Tactus source).
+
+### Prelude (TactusPrelude.lean)
+
+The prelude defines Verus's built-in types. **No `sorry`, no unnecessary axioms.** Values known at compile time use `def`, not `axiom`.
+
+```lean
+import Mathlib.Data.Int.Lemmas
+
+-- Seq type (Verus's spec-level sequence)
+abbrev Seq (α : Type) := List α
+
+namespace Seq
+  def empty : Seq α := []
+  def len (s : Seq α) : Nat := s.length
+
+  -- Opaque indexing: in-bounds is specified, out-of-bounds is truly unspecified.
+  -- Using opaque + axiom ensures no equalities are provable between different
+  -- out-of-bounds indices, exactly matching Verus's semantics.
+  opaque index {α : Type} (s : Seq α) (i : Nat) : α
+  @[simp] axiom index_in_bounds {α : Type} (s : Seq α) (i : Nat) (h : i < s.length) :
+      index s i = s[i]'h
+
+  def push (s : Seq α) (x : α) : Seq α := s ++ [x]
+  def subrange (s : Seq α) (lo hi : Nat) : Seq α := (s.drop lo).take (hi - lo)
+  def update (s : Seq α) (i : Nat) (x : α) : Seq α := s.set i x
+  def contains [DecidableEq α] (s : Seq α) (x : α) : Prop := x ∈ s
+end Seq
+
+-- Set type
+abbrev VerusSet (α : Type) := Set α
+
+-- Integer clip functions (fixed-width type semantics)
+def u_hi (bits : Nat) : Nat := 2 ^ bits
+def i_lo (bits : Nat) : Int := -(2 ^ (bits - 1))
+def i_hi (bits : Nat) : Int := 2 ^ (bits - 1)
+def u_clip (bits : Nat) (x : Int) : Nat := (x % (u_hi bits)).toNat
+def i_clip (bits : Nat) (x : Int) : Int :=
+  let m := u_hi bits
+  let r := x % m
+  if r ≥ i_hi bits then r - m else r
+
+-- Arch word size — axiom because the correct value depends on the compilation
+-- target, and we want proofs to hold for the declared architecture without
+-- hardcoding a specific value. Axiom is sound as long as --target matches
+-- the actual deployment architecture.
+axiom arch_word_bits : Nat
+axiom arch_word_bits_valid : arch_word_bits = 32 ∨ arch_word_bits = 64
+```
+
+### Axiom inventory
+
+The prelude's trusted base:
+1. `Seq.index` (opaque constant) — existence of a total indexing function
+2. `Seq.index_in_bounds` — in-bounds behavior matches `List.get`
+3. `arch_word_bits` — word size for the target architecture
+4. `arch_word_bits_valid` — word size is 32 or 64
+
+Axioms 1-2 are sound by construction: any total function from `List α × Nat → α` that agrees with `List.get` on in-bounds indices satisfies these. `Classical.choice` guarantees such a function exists.
+
+Axioms 3-4 are a configuration parameter — sound as long as `--target` matches the deployment platform.
+
+Cross-crate declarations (see below) add axioms for externally-verified theorems. Each is sound assuming the source crate verified correctly and the translation was correct.
+
+All other prelude definitions are `def` (computable, no trust needed).
+
+### Spec fn translation
+
+Default (irreducible):
+```rust
+spec fn double(x: nat) -> nat { x + x }
+```
+→
+```lean
+@[irreducible] noncomputable def double (x : Nat) : Nat := x + x
+```
+
+Open (transparent):
+```rust
+open spec fn double(x: nat) -> nat { x + x }
+```
+→
+```lean
+noncomputable def double (x : Nat) : Nat := x + x
+```
+
+Recursive with `decreases`:
+```rust
+spec fn factorial(n: nat) -> nat
+    decreases n
+{ if n == 0 { 1 } else { n * factorial((n - 1) as nat) } }
+```
+→
+```lean
+@[irreducible] noncomputable def factorial (n : Nat) : Nat :=
+  if n = 0 then 1 else n * factorial (n - 1)
+termination_by n
+```
+
+### Proof fn translation
+
+```rust
+proof fn lemma_double(x: nat)
+    requires x > 0
+    ensures double(x) > x
+by {
+    unfold double
+    omega
+}
+```
+→
+```lean
+theorem lemma_double (x : Nat) (h₀ : x > 0) : double x > x := by
+  unfold double
+  omega
+```
+
+**Rules**:
+- Each `requires` clause → hypothesis parameter `(hᵢ : clause)`
+- `ensures` clause → theorem goal
+- Multiple ensures → conjunction `E₁ ∧ E₂ ∧ ...` (user splits with `constructor` or `refine ⟨?_, ?_⟩`)
+- Tactic body → verbatim after `:= by`
+- Named return `-> (result: T)` → `result` bound in the goal
+
+### Auto-generated obligations (Phase 2)
+
+Each exec fn obligation becomes a separate Lean theorem:
+
+```lean
+macro "tactus_auto" : tactic => `(tactic|
+  first | omega | simp_all | decide | norm_num | linarith | nlinarith |
+    (fail "tactus: auto-tactic failed — add explicit proof block"))
+```
+
+`tactus_auto` uses `fail` as the final fallback, not `sorry`. This makes auto-tactic failures real errors. User-written `sorry` in tactic blocks remains a Lean warning for incremental development.
+
+## Semantic details
+
+### Nat subtraction
+
+Lean's `Nat` has truncating subtraction: `5 - 7 = 0`. Verus's `nat` requires `b ≤ a` for `a - b`.
+
+This works naturally: Verus's precondition becomes a Lean hypothesis. Lean's truncating subtraction agrees with mathematical subtraction when `b ≤ a`. No special handling needed.
+
+### Integer division
+
+VIR uses Euclidean division (`ArithOp::EuclideanDiv`). Lean's `Int.div` is T-division (rounds toward zero).
+
+**Fix**: Use Mathlib's `Int.ediv` and `Int.emod` for `Int`. For `Nat`, Lean's `/` and `%` are already Euclidean.
+
+### Bool vs Prop
+
+VIR's `TypX::Bool` in spec context → Lean `Prop`. In exec context → Lean `Bool`. VIR tracks modes.
+
+### Seq indexing
+
+Verus's `s[i]` in spec mode is total — returns an unspecified value for out-of-bounds. Lean's `List.get` requires a bounds proof.
+
+**Fix**: Opaque `Seq.index` (see prelude). Out-of-bounds is truly unspecified — no equalities provable between different out-of-bounds indices. Exactly matches Verus semantics.
+
+### Seq as List
+
+`Seq` is `abbrev`'d to `List`, meaning all `List` lemmas from Lean's standard library and Mathlib apply directly. Users can use `List.length_append`, `List.get_set`, etc. in their tactic proofs. Type errors show `List` (not `Seq`) which is transparent — the user knows `Seq = List`.
+
+### Seq.subrange edge cases
+
+`Seq.subrange s lo hi` = `(s.drop lo).take (hi - lo)`. When `lo > hi`, this gives `take 0 ... = []` (empty). When indices exceed length, `drop` and `take` truncate naturally. This matches Verus's edge-case semantics.
+
+## vstd (Verus standard library) translation
+
+Verus ships `vstd` — its verified standard library (`vstd::seq::Seq`, `vstd::set::Set`, `vstd::map::Map`, `vstd::arithmetic::*`, etc.). Every Verus program depends on it.
+
+**Approach**: Translate `vstd` to a Lean library (`TactusStd.lean`) that lives in the managed Lake project alongside `TactusPrelude.lean`. This is a parallel workstream to the core tool.
+
+### VIR path → Lean name mapping
+
+VIR represents function calls with fully-qualified paths (`vstd::seq::Seq::<T>::push`). The Lean translation needs a lookup table mapping Verus built-in paths to their Lean equivalents:
+
+| VIR Path | Lean Name |
+|----------|-----------|
+| `vstd::seq::Seq::empty` | `Seq.empty` |
+| `vstd::seq::Seq::len` | `Seq.len` |
+| `vstd::seq::Seq::index` | `Seq.index` |
+| `vstd::seq::Seq::push` | `Seq.push` |
+| `vstd::seq::Seq::subrange` | `Seq.subrange` |
+| `vstd::seq::Seq::update` | `Seq.update` |
+| `vstd::seq::Seq::add` | `(· ++ ·)` (List.append) |
+| `vstd::seq::Seq::ext_equal` | `(· = ·)` |
+| `vstd::set::Set::empty` | `(∅ : Set _)` |
+| `vstd::set::Set::contains` | `(· ∈ ·)` |
+| `vstd::set::Set::insert` | `Set.insert` |
+| `vstd::set::Set::union` | `(· ∪ ·)` |
+| `vstd::set::Set::intersect` | `(· ∩ ·)` |
+| `vstd::map::Map::empty` | `(∅ : Finmap _)` |
+| `vstd::map::Map::dom` | `Finmap.keys` |
+| `vstd::map::Map::index` | `Finmap.lookup` |
+| `vstd::pervasive::arbitrary` | `Classical.arbitrary` |
+| ... | ... |
+
+This table is built incrementally. Initially we support functions that DON'T use vstd. As vstd functions are translated, entries are added.
+
+### vstd translation strategy
+
+1. **Start with no vstd support** — functions using vstd types/methods get "unsupported vstd function" errors
+2. **Translate core Seq/Set/Map operations** — the prelude already covers basics
+3. **Translate vstd spec fns** — each becomes a Lean `def` in `TactusStd.lean`
+4. **Translate vstd proof fns** — each becomes a Lean `theorem` (may need rewriting from assert-chain to tactic style)
+5. **Arithmetic lemmas** (`vstd::arithmetic::*`) — many map directly to Mathlib lemmas
+
+This is ongoing work that grows the supported surface area incrementally.
+
+## Soundness and trust model
+
+### Trusted computing base
+
+The correctness of Tactus depends on:
+
+1. **Lean's kernel** — small, well-audited, formally specified
+2. **VIR → Lean translation** (`to_lean_expr.rs`, `to_lean_type.rs`, `to_lean_fn.rs`, `sst_to_lean.rs`) — **NEW, unaudited.** This is the primary soundness risk.
+3. **Prelude axioms** — 4 axioms (see inventory above)
+4. **Cross-crate axioms** — one per externally-verified theorem
+5. **The proc macro** (`builtin_macros`) — modified to handle tactic blocks
+
+### The translation correctness risk
+
+If `to_lean_expr.rs` has a bug that translates VIR expression `P` to Lean expression `P'` where `P' ≠ P`, Lean verifies `P'` but the user thinks `P` is verified. This is **silent unsoundness**.
+
+**Mitigations**:
+- **Differential testing**: Run the same spec through both Verus (Z3) and Tactus (Lean). If both verify, confidence increases. If they disagree, investigate.
+- **Translation unit tests**: For each VIR expression type, verify the Lean output against a known-correct reference.
+- **Lean `#check` assertions**: Optionally emit `#check` statements that validate translated types match expectations.
+- **Keep translations simple**: Prefer direct 1:1 mappings over clever optimizations. Boring code has fewer bugs.
+- **The translation is auditable**: Generated Lean is readable text. Users can inspect it via `tactus translate file.rs`.
+
+## Heartbeat annotations
+
+Lean's deterministic timeout uses `maxHeartbeats`. Reuses Verus's rlimit annotation pattern:
+
+```rust
+#[verifier::heartbeats(1600000)]
+proof fn expensive_lemma(...)
+by {
+    nlinarith [sq_nonneg a, sq_nonneg b, sq_nonneg c, sq_nonneg d]
+}
+```
+→
+```lean
+set_option maxHeartbeats 1600000 in
+theorem expensive_lemma ... := by
+  nlinarith [sq_nonneg a, sq_nonneg b, sq_nonneg c, sq_nonneg d]
+```
+
+Default: 800000 heartbeats (configurable via `--heartbeats N`).
+
+## Variable naming in Lean output
+
+SST renames variables for disambiguation (`x` → `x@0`). This produces ugly goal states.
+
+**Fix**: `sst_to_lean` uses original Rust variable names from VIR. Disambiguation suffixes added only for actual collisions (two `x` in nested scopes → `x` and `x'`). SST tracks original names via `VarIdentDisambiguate`.
+
+## Cross-crate spec fn availability
+
+When crate B depends on A, B's generated Lean needs A's spec fn definitions.
+
+Each crate generates a `CrateDecls.lean` containing spec fn signatures and axiomatized ensures:
+
+```lean
+namespace crate_a.module
+@[irreducible] noncomputable def double (x : Nat) : Nat := x + x
+axiom lemma_double_pos : ∀ (x : Nat), x > 0 → double x > x
+end crate_a.module
+```
+
+Downstream crates import declaration files. Axioms are sound because crate A verified the theorems.
+
+Phase 1 is single-crate. Multi-crate is Phase 3.
+
+## Type mapping (VIR/SST → Lean)
+
+| VIR/SST Type | Lean Type | Notes |
+|--------------|-----------|-------|
+| `TypX::Int(IntRange::Int)` | `Int` | |
+| `TypX::Int(IntRange::Nat)` | `Nat` | |
+| `TypX::Int(IntRange::U(n))` | `Nat` | Overflow as separate obligation |
+| `TypX::Int(IntRange::I(n))` | `Int` | Range as separate obligation |
+| `TypX::Bool` | `Prop` (spec) / `Bool` (exec) | Context-dependent |
+| `TypX::Tuple(types)` | `T₁ × T₂ × ...` | |
+| `TypX::Lambda(params, ret)` | `T₁ → T₂ → ... → Ret` | |
+| `TypX::Datatype(name, args)` | Lean structure/inductive | |
+| `TypX::Boxed(t)` | `t` | Boxing erased in spec |
+| `TypX::TypParam(name)` | `name` | Native polymorphism |
+
+## Expression mapping (VIR/SST → Lean)
+
+| VIR/SST Expr | Lean |
+|--------------|------|
+| `Const(Bool(b))` | `True` / `False` |
+| `Const(Nat(n))` | `(n : Nat)` |
+| `Var(x)` | `x` (original name) |
+| `Binary(Eq(Spec), l, r)` | `l = r` |
+| `Binary(Ne, l, r)` | `l ≠ r` |
+| `Binary(Inequality(Le), l, r)` | `l ≤ r` |
+| `Binary(Inequality(Lt), l, r)` | `l < r` |
+| `Binary(Inequality(Ge), l, r)` | `l ≥ r` |
+| `Binary(Inequality(Gt), l, r)` | `l > r` |
+| `Binary(Arith(Add(_)), l, r)` | `l + r` |
+| `Binary(Arith(Sub(_)), l, r)` | `l - r` |
+| `Binary(Arith(Mul(_)), l, r)` | `l * r` |
+| `Binary(Arith(EuclideanDiv(_)), l, r)` | `Int.ediv l r` (Int) / `l / r` (Nat) |
+| `Binary(Arith(EuclideanMod(_)), l, r)` | `Int.emod l r` (Int) / `l % r` (Nat) |
+| `Binary(And, l, r)` | `l ∧ r` |
+| `Binary(Or, l, r)` | `l ∨ r` |
+| `Binary(Implies, l, r)` | `l → r` |
+| `Unary(Not, e)` | `¬ e` |
+| `Quant(Forall, binders, body)` | `∀ (x : T), body` |
+| `Quant(Exists, binders, body)` | `∃ (x : T), body` |
+| `If(cond, then_, else_)` | `if cond then ... else ...` |
+| `Call(fun, args)` | `fun arg₁ arg₂ ...` |
+| `Bind(Let, binders, body)` | `let x := val; body` |
+| `Choose(params, cond, body)` | `Classical.choose ...` |
+| `BinaryOpr(ExtEq, l, r)` | `l = r` (see note) |
+
+**Note on ExtEq**: Verus's `=~=` (extensional equality) maps to Lean's `=` because Lean 4's type theory includes function extensionality. For function types, `f = g ↔ ∀ x, f x = g x` is provable via `funext` (which is a theorem, not an axiom, in Lean 4 due to eta-expansion in definitional equality). So Lean's `=` on functions IS extensional equality — no separate encoding needed.
+
+## VC generation for exec functions (Phase 2)
+
+Phase 2 implements **weakest-precondition VC generation** fresh in `sst_to_lean`. This is textbook WP, implemented from scratch targeting Lean rather than extracted from `sst_to_air` (which is entangled with Poly encoding, triggers, fuel, and SMT expression flattening).
+
+**Important**: VIR-SST is a cleaned-up AST, NOT a set of pre-generated VCs. The actual VC generation (turning imperative code into logical formulas) happens in the `sst_to_*` step. In Verus, that's `sst_to_air` (~3000 lines). In Tactus, it's `sst_to_lean` (comparable complexity). This is the largest single engineering effort in the project.
+
+### WP rules
+
+For a function with `requires P`, body `S`, `ensures Q(result)`, the obligation is: `P → wp(S, Q)`.
+
+| Statement | Weakest precondition |
+|-----------|---------------------|
+| `let x = e; rest` | `let x := e; wp(rest, Q)` |
+| `if c { s1 } else { s2 }` | `(c → wp(s1, Q)) ∧ (¬c → wp(s2, Q))` |
+| `return e` | `Q(e)` |
+| `while cond inv I dec D { body }` | Three theorems: I_init, I_maintain, I_use |
+| `assert(P) by { tactics }` | `have h : P := by <tactics>; wp(rest, Q)` |
+| `proof { have h : P := by t }` | `have h : P := by t; wp(rest, Q)` |
+| `assume(P)` | `have h : P := sorry; wp(rest, Q)` (warning) |
+| `x = e` (mutation) | SSA: `let x' := e; wp(rest[x→x'], Q)` |
+
+Additional cases handled in Phase 2 but not listed for brevity: pattern matching (case splits), closures, borrow semantics (mutable references as functional updates), break/continue/early return (control flow), Ghost/Tracked parameter unwrapping.
+
+### Loop obligations
+
+```
+while cond invariant I decreases D { body }
+```
+
+Generates three theorems:
+1. **Init**: `requires ∧ setup → I`
+2. **Maintain**: `I ∧ cond → wp(body, I) ∧ D_decreases`
+3. **Use**: `I ∧ ¬cond → ensures`
+
+Each is a separate Lean `theorem`. Auto-checked by `tactus_auto`. On failure, user adds `proof { }` blocks.
+
+### Overflow obligations
+
+Each arithmetic op on fixed-width types generates:
+```lean
+theorem overflow_check_line_N ... : 0 ≤ result ∧ result < 2^bits := by tactus_auto
+```
+
+### Scope and difficulty
+
+Implementing `sst_to_lean` with full WP is the most significant engineering effort — comparable to `sst_to_air` (~3000 lines). It handles mutation as SSA, control flow, pattern matching, closures, borrow semantics. **Estimated: 3-6 months.**
+
+## Error experience
+
+### Successful check
+```
+$ tactus check src/algebra.rs
+  ✓ double                    (spec fn)
+  ✓ triangle                  (spec fn)
+  ✓ lemma_double_pos          (0.3s, 42k heartbeats)
+  ✓ lemma_norm_nonneg         (0.5s, 118k heartbeats)
+
+4 items checked, 0 errors
+```
+
+### Failed tactic
+```
+$ tactus check src/quad_ext.rs
+
+error: unsolved goal
+  --> src/quad_ext.rs:42:1 (norm_nonneg)
+
+  re im d : Int
+  h₀ : d ≤ 0
+  ⊢ re * re - d * (im * im) ≥ 0
+
+  try: nlinarith [sq_nonneg re, sq_nonneg im]
+```
+
+### Auto obligation failure (Phase 2)
+```
+$ tactus check src/search.rs
+
+error: tactus: auto-tactic failed (overflow check)
+  --> src/search.rs:15:25
+
+  lo hi n : Nat
+  h₀ : lo < hi
+  h₁ : hi ≤ n
+  ⊢ lo + (hi - lo) / 2 < 2^64
+
+  add `proof { omega }` at src/search.rs:15
+```
+
+### Assumption warning
+```
+$ tactus check src/wip.rs
+
+warning: unproved assumption
+  --> src/wip.rs:28:5
+
+  assume(hard_lemma(x, y))
+  ^^^^^^^^^^^^^^^^^^^^^^^ backed by sorry — prove or remove before release
+```
+
+## Crate structure in tactus/source/
+
+### New crate: `lean_verify/`
+```
+lean_verify/
+  Cargo.toml
+  src/
+    lib.rs
+    lean_process.rs       — lean subprocess via `lake env lean`
+    diagnostics.rs        — parse Lean JSON diagnostics
+    source_map.rs         — Lean positions → .rs positions
+    prelude.rs            — TactusPrelude.lean content
+    project.rs            — manage ~/.tactus/lean-project/ setup
+    tactic_extractor.rs   — tree-sitter-tactus: extract tactic text by span
+    builtin_paths.rs      — VIR path → Lean name lookup table
+```
+
+### New files in `vir/`
+```
+vir/src/
+  sst_to_lean.rs       — Track B: WP-based VC generation from SST
+  to_lean_expr.rs      — VIR/SST expressions → Lean expression text
+  to_lean_type.rs      — VIR types → Lean type text
+  to_lean_fn.rs        — spec fn → @[irreducible] def, proof fn → theorem
+  to_lean_datatype.rs  — Track D: struct → structure, enum → inductive
+```
+
+### Modified files
+| File | Change |
+|------|--------|
+| `builtin_macros/src/syntax.rs` | Tactic mode: capture `by {}`/`proof {}` as TokenStream + span, suspend Verus keywords |
+| `vir/src/ast.rs` | Add `TacticBlock(Span)` variant to function body (span, not string — text comes from tree-sitter) |
+| `rust_verify/src/verifier.rs` | Route proof fns to `lean_verify` |
+| `rust_verify/src/config.rs` | Add `--heartbeats`, `--lean-path` flags |
+
+No `rustc_lexer` modification needed — Unicode is handled by tree-sitter, not the proc macro.
+
+### Removed (after Track B completes)
+- `air/` crate — Z3 interface
+- `sst_to_air.rs`, `sst_to_air_func.rs` — replaced by `sst_to_lean`
+
+Kept during Track B development for reference and differential testing.
+
+## Trait mapping (Phase 3)
+
+| Tactus Trait | Lean/Mathlib Class |
+|---|---|
+| `Ring` | `CommRing` |
+| `OrderedRing` | `LinearOrderedCommRing` |
+| `Field` | `Field` |
+| `OrderedField` | `LinearOrderedField` |
+| `AdditiveGroup` | `AddCommGroup` |
+| `PartialOrder` | `PartialOrder` |
+
+## Implementation plan
+
+Work proceeds in parallel across three tracks. No sequential gating — all tracks start immediately.
+
+### Track A: Proof fn pipeline (the core loop)
+
+Gets a proof fn from `.rs` all the way to a verified Lean theorem. This is the foundation everything else builds on.
+
+1. Modify `builtin_macros/` — tactic mode (TokenStream capture + span recording), keyword suspension
+2. Integrate tree-sitter-tactus — extract tactic block text (Unicode-aware) by source span
+3. Add `import` keyword to grammar and proc macro
+4. Add `mutual ... end mutual` syntax to grammar and proc macro
+5. Thread `TacticBlock(span)` through VIR
+6. Create `lean_verify/` crate — Lake project management, precompiled Mathlib (`lake exe cache get`), Lean subprocess
+7. Implement `to_lean_type.rs` and `to_lean_expr.rs`
+8. Implement `to_lean_fn.rs` — spec fn → `@[irreducible] noncomputable def`, proof fn → `theorem`
+9. Implement definition ordering (topological sort from VIR call graph)
+10. Implement namespacing (VIR Path → Lean namespace)
+11. Source map + error mapping
+12. Modify `verifier.rs` — route proof fns to Lean
+
+**Milestone**: spec fns + proof fns with `by { ring }`, `by { omega }`, `by { nlinarith [...] }` verify end-to-end.
+
+### Track B: Exec fn VC generation (`sst_to_lean`)
+
+Implements weakest-precondition VC generation from SST targeting Lean. This is the largest single effort. Runs in parallel with Track A — shares `to_lean_expr.rs` and `to_lean_type.rs`.
+
+1. Implement `sst_to_lean.rs` — WP-based VC generation from SST
+2. Simple straight-line code first (let, if/else, return)
+3. Mutation as SSA (variable versioning)
+4. Loop obligations (init/maintain/use)
+5. Control flow (break, continue, early return)
+6. Overflow checking for fixed-width types
+7. `proof { }` results threaded into VC context
+8. `assert(P) by { tactics }` → `have h : P := by <tactics>` in VC
+9. `assert forall|x| P by { tactics }` → auto-intro + tactics
+10. `assume(P)` → sorry + warning
+11. `tactus_auto` macro for auto obligations
+12. Pattern matching, closures, borrow semantics (mutable refs as functional updates)
+13. Ghost/Tracked parameter unwrapping, `@` view operator
+
+**Milestone**: exec fns with loops, mutation, and overflow checks verify through Lean.
+
+Once Track B is complete, `air/` crate and `sst_to_air` are removed.
+
+### Track C: vstd translation + built-in path mapping
+
+Translates Verus's standard library to Lean. Ongoing, incremental.
+
+1. Write `TactusPrelude.lean` — Seq (opaque index), Set, clip fns, arch_word_bits axiom
+2. Build VIR path → Lean name lookup table (start with core Seq/Set/Map operations)
+3. Translate `vstd::seq` spec fns to Lean
+4. Translate `vstd::set` spec fns
+5. Translate `vstd::map` spec fns
+6. Translate `vstd::arithmetic` lemmas (many map to Mathlib)
+7. Expand coverage incrementally as users hit "unsupported vstd function" errors
+
+**Milestone**: Programs using basic Seq/Set/Map operations verify.
+
+### Track D: Types, traits, multi-crate (starts after A+B have milestones)
+
+1. Struct → `structure`, Enum → `inductive`
+2. Trait → `class`, Impl → `instance`
+3. Map to Mathlib hierarchy (Ring → CommRing, etc.)
+4. Cross-crate declaration files (`CrateDecls.lean`)
+5. `mutual ... end mutual` → Lean `mutual ... end`
+
+### Ongoing: Polish
+
+1. Per-module Lean generation with imports
+2. IDE integration (show goal states)
+3. Better error messages with tactic suggestions
+4. Performance profiling
+5. Differential testing (Verus vs Tactus on same specs)
+
+## Open questions
+
+1. **Recursive termination**: Simple `decreases n` → `termination_by n`. Complex `decreases` with `via` clauses → `termination_by` + `decreasing_by`. Design when we encounter real examples.
+
+2. **Broadcast lemmas**: `broadcast proof fn` + `use broadcast` → require users to invoke lemmas explicitly in tactics (per transparency principle). No automatic ambient facts.
+
+3. **Bitwise operations**: VIR's `BitwiseOp` → Lean/Mathlib `BitVec`. Needs design for bitvector-heavy proofs.
+
+4. **Spec closures**: `FnSpec` type → Lean function type `A → B`. Behavioral differences TBD.
+
+5. **Multiple ensures**: Currently conjunction `E₁ ∧ E₂`. Users split with `constructor` or `refine ⟨?_, ?_⟩`. Consider alternative: separate theorems per ensures clause.
