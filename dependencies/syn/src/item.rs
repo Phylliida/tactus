@@ -1734,7 +1734,11 @@ pub(crate) mod parsing {
         vis: Visibility,
         sig: Signature,
     ) -> Result<ItemFn> {
-        let (brace_token, stmts, semi_token) = if input.peek(Token![;]) {
+        let (brace_token, stmts, semi_token) = if sig.spec.tactic_by.is_some() {
+            // Tactus: `by { }` was already consumed by SignatureSpec parsing.
+            // Provide an empty body — the tactic text is in sig.spec.tactic_by.
+            (token::Brace(sig.fn_token.span), vec![], None)
+        } else if input.peek(Token![;]) {
             let semi_token: Token![;] = input.parse()?;
             (token::Brace(semi_token.span), vec![], Some(semi_token))
         } else {
@@ -3037,11 +3041,14 @@ pub(crate) mod parsing {
         let defaultness: Option<Token![default]> = input.parse()?;
         let sig: Signature = input.parse()?;
 
-        let (block, semi_token) = if let Some(semi) = input.parse::<Option<Token![;]>>()? {
-            // Accept methods without a body in an impl block because
-            // rustc's *parser* does not reject them (the compilation error
-            // is emitted later than parsing) and it can be useful for macro
-            // DSLs.
+        let (block, semi_token) = if sig.spec.tactic_by.is_some() {
+            // Tactus: `by { }` was already consumed by SignatureSpec parsing.
+            let block = Block {
+                brace_token: token::Brace(sig.fn_token.span),
+                stmts: vec![],
+            };
+            (block, None)
+        } else if let Some(semi) = input.parse::<Option<Token![;]>>()? {
             let span = sig.paren_token.span;
             let block = Block {
                 brace_token: token::Brace { span },

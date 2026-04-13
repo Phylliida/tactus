@@ -291,8 +291,8 @@ ast_struct! {
         pub invariants: Option<SignatureInvariants>,
         pub unwind: Option<SignatureUnwind>,
         pub with: Option<WithSpecOnFn>,
-        /// Tactus: `by` keyword before the function body block, signaling tactic proof mode
-        pub tactic_by: Option<Token![by]>,
+        /// Tactus: `by { tactic_body }` — the raw tactic body text (not parsed as Rust)
+        pub tactic_by: Option<(Token![by], proc_macro2::TokenStream)>,
     }
 }
 
@@ -1283,9 +1283,14 @@ pub mod parsing {
             let unwind: Option<SignatureUnwind> = input.parse()?;
 
             // Tactus: check for `by` keyword before function body block.
-            // Only consume `by` if it's followed by `{` (to distinguish from other uses of `by`).
+            // Only consume `by` if it's followed by `{` (to distinguish from other uses).
+            // Captures the block content as a raw TokenStream — NOT parsed as Rust statements.
             let tactic_by = if input.peek(Token![by]) && input.peek2(token::Brace) {
-                Some(input.parse()?)
+                let by_token: Token![by] = input.parse()?;
+                let content;
+                let _brace = braced!(content in input);
+                let tokens: proc_macro2::TokenStream = content.parse()?;
+                Some((by_token, tokens))
             } else {
                 None
             };
