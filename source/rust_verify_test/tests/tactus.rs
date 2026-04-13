@@ -105,3 +105,66 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// === Dependency ordering: helper → double → proof fn ===
+
+test_verify_one_file! {
+    #[test] test_dep_ordering verus_code! {
+        // helper is called by double_plus_one, must come first in Lean output
+        spec fn helper(x: nat) -> nat {
+            x + x
+        }
+
+        spec fn double_plus_one(x: nat) -> nat {
+            helper(x) + 1
+        }
+
+        proof fn lemma_dpo(x: nat)
+            requires x > 0
+            ensures double_plus_one(x) > 1
+        by {
+            unfold double_plus_one; unfold helper; omega
+        }
+    } => Ok(())
+}
+
+// === Mutual recursion: is_even/is_odd ===
+
+test_verify_one_file! {
+    #[test] test_mutual_recursion verus_code! {
+        spec fn is_even(n: nat) -> bool
+            decreases n
+        {
+            if n == 0 { true } else { is_odd((n - 1) as nat) }
+        }
+
+        spec fn is_odd(n: nat) -> bool
+            decreases n
+        {
+            if n == 0 { false } else { is_even((n - 1) as nat) }
+        }
+
+        proof fn even_zero()
+            ensures is_even(0) == true
+        by {
+            unfold is_even; simp
+        }
+    } => Ok(())
+}
+
+// === Only referenced spec fns are included (unreferenced fn shouldn't cause issues) ===
+
+test_verify_one_file! {
+    #[test] test_filtering verus_code! {
+        spec fn used(x: nat) -> nat { x + 1 }
+
+        // This fn is never referenced by the proof fn — should be excluded
+        spec fn unused_fn(x: nat) -> nat { x * x * x * x }
+
+        proof fn lemma_used(x: nat)
+            ensures used(x) > x
+        by {
+            unfold used; omega
+        }
+    } => Ok(())
+}

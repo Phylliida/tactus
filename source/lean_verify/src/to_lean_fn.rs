@@ -1,17 +1,19 @@
 //! Translate VIR functions to Lean 4 definitions and theorems.
 
 use vir::ast::*;
+use crate::dep_order::{FnGroup, order_spec_fns};
 use crate::prelude::TACTUS_PRELUDE;
 use crate::to_lean_expr::{write_expr, write_name};
 use crate::to_lean_type::write_typ;
 
 /// Generate a complete Lean file from VIR functions.
 ///
-/// `spec_fns` must be in dependency order (callees before callers).
-/// Each proof fn is paired with its tactic body text.
-/// `namespace` is the Lean namespace (e.g., "my_crate.my_module").
+/// `all_fns` is the full set of VIR functions from the crate.
+/// `proof_fns` are the proof fns to verify, each paired with tactic body text.
+/// Spec fns are automatically filtered to only those transitively referenced,
+/// topologically sorted, and grouped by mutual recursion.
 pub fn generate_lean_file(
-    spec_fns: &[&FunctionX],
+    all_fns: &[&FunctionX],
     proof_fns: &[(&FunctionX, &str)],
     imports: &[String],
     namespace: Option<&str>,
@@ -34,9 +36,25 @@ pub fn generate_lean_file(
         out.push_str("\n\n");
     }
 
-    for f in spec_fns {
-        write_spec_fn(&mut out, f);
-        out.push('\n');
+    // Order spec fns: filter to referenced, topological sort, group mutual recursion
+    let proof_fn_refs: Vec<&FunctionX> = proof_fns.iter().map(|(f, _)| *f).collect();
+    let groups = order_spec_fns(all_fns, &proof_fn_refs);
+
+    for group in &groups {
+        match group {
+            FnGroup::Single(f) => {
+                write_spec_fn(&mut out, f);
+                out.push('\n');
+            }
+            FnGroup::Mutual(fns) => {
+                out.push_str("mutual\n");
+                for f in fns {
+                    write_spec_fn(&mut out, f);
+                    out.push('\n');
+                }
+                out.push_str("end\n\n");
+            }
+        }
     }
 
     for (f, tactics) in proof_fns {
