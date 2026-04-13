@@ -34,8 +34,24 @@ pub fn write_typ(out: &mut String, typ: &TypX) {
         }
         // Decorations (references, etc.) are transparent in spec mode
         TypX::Decorate(_, _, inner) => write_typ(out, inner),
-        // Projection: <T as Trait>::Assoc — just emit the name
         TypX::Projection { name, .. } => out.push_str(name),
+        TypX::Primitive(prim, args) => {
+            out.push_str(match prim {
+                vir::ast::Primitive::Array => "Array",
+                vir::ast::Primitive::Slice => "List",
+                vir::ast::Primitive::StrSlice => "String",
+                vir::ast::Primitive::Ptr => "sorry /- Ptr -/",
+                vir::ast::Primitive::Global => "sorry /- Global -/",
+            });
+            for arg in args.iter() {
+                out.push(' ');
+                write_typ(out, arg);
+            }
+        }
+        TypX::ConstInt(n) => { out.push_str(&n.to_string()); }
+        TypX::ConstBool(b) => { out.push_str(if *b { "true" } else { "false" }); }
+        TypX::Real => out.push_str("Real"),
+        TypX::TypeId => out.push_str("Nat"), // TypeId has no Lean equivalent, use Nat as placeholder
         _ => write_todo(out, "type"),
     }
 }
@@ -45,9 +61,36 @@ pub(crate) fn short_name(path: &Path) -> &str {
     path.segments.last().map(|s| s.as_str()).unwrap_or("_")
 }
 
+/// Resolve a VIR path to a Lean name, using more segments if short name collides.
+pub(crate) fn resolve_name(path: &Path, collisions: &std::collections::HashSet<String>) -> String {
+    let short = short_name(path);
+    if !collisions.contains(short) {
+        return short.to_string();
+    }
+    // Use last two segments: module.name
+    let segs = &path.segments;
+    if segs.len() >= 2 {
+        format!("{}.{}", segs[segs.len() - 2], segs[segs.len() - 1])
+    } else {
+        short.to_string()
+    }
+}
+
+/// Build the set of short names that appear more than once across all declarations.
+pub(crate) fn find_collisions<'a>(paths: impl Iterator<Item = &'a str>) -> std::collections::HashSet<String> {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for name in paths {
+        *counts.entry(name).or_insert(0) += 1;
+    }
+    counts.into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(name, _)| name.to_string())
+        .collect()
+}
+
 /// Write items separated by a delimiter.
 pub(crate) fn write_sep<T>(
-    out: &mut String, items: &[T], sep: &str, f: impl Fn(&mut String, &T),
+    out: &mut String, items: &[T], sep: &str, mut f: impl FnMut(&mut String, &T),
 ) {
     for (i, item) in items.iter().enumerate() {
         if i > 0 { out.push_str(sep); }
@@ -72,9 +115,9 @@ pub(crate) fn walk_typ<'a>(typ: &'a TypX, visit: &mut impl FnMut(&'a TypX)) {
     }
 }
 
-/// Write a `sorry` placeholder with a TODO comment.
+/// Write a `sorry` placeholder for an unsupported VIR feature.
 pub(crate) fn write_todo(out: &mut String, what: &str) {
-    out.push_str("sorry /- TODO: ");
+    out.push_str("sorry /- UNSUPPORTED: ");
     out.push_str(what);
     out.push_str(" -/");
 }

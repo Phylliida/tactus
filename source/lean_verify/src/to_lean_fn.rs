@@ -5,17 +5,14 @@
 
 use std::collections::HashMap;
 use vir::ast::*;
+use std::collections::HashSet;
 use crate::to_lean_expr::{write_expr, write_name};
-use crate::to_lean_type::{write_typ, short_name, write_sep};
+use crate::to_lean_type::{write_typ, short_name, write_sep, resolve_name};
 
 // ── Source map ──────────────────────────────────────────────────────────
 
-/// Maps positions in generated Lean back to proof fn tactic bodies.
+/// Maps Lean line numbers back to the proof fn's tactic body.
 pub struct LeanSourceMap {
-    pub proof_fns: Vec<ProofFnMapping>,
-}
-
-pub struct ProofFnMapping {
     pub fn_name: String,
     /// 1-indexed line in generated .lean where the tactic body starts
     pub tactic_start_line: usize,
@@ -23,29 +20,27 @@ pub struct ProofFnMapping {
 }
 
 impl LeanSourceMap {
-    /// Given a 1-indexed Lean line number, find which proof fn's tactic body
-    /// it falls in and return (fn_name, offset within tactic body).
-    pub fn find_tactic_line(&self, lean_line: usize) -> Option<(&str, usize)> {
-        for pf in &self.proof_fns {
-            let end = pf.tactic_start_line + pf.tactic_line_count;
-            if lean_line >= pf.tactic_start_line && lean_line < end {
-                return Some((&pf.fn_name, lean_line - pf.tactic_start_line));
-            }
+    /// Given a 1-indexed Lean line number, return the offset within the tactic body.
+    pub fn find_tactic_line(&self, lean_line: usize) -> Option<usize> {
+        let end = self.tactic_start_line + self.tactic_line_count;
+        if lean_line >= self.tactic_start_line && lean_line < end {
+            Some(lean_line - self.tactic_start_line)
+        } else {
+            None
         }
-        None
     }
 }
 
 // ── Spec fn ─────────────────────────────────────────────────────────────
 
 /// Write a spec fn as `@[irreducible] noncomputable def`.
-pub fn write_spec_fn(out: &mut String, f: &FunctionX) {
+pub fn write_spec_fn(out: &mut String, f: &FunctionX, collisions: &HashSet<String>) {
     if matches!(f.opaqueness, Opaqueness::Opaque) {
         out.push_str("@[irreducible] ");
     }
     out.push_str("noncomputable def ");
-    write_fn_name(out, &f.name);
-    write_fn_params(out, f);
+    write_fn_name(out, &f.name, collisions);
+    write_fn_params(out, f, collisions);
 
     out.push_str(" : ");
     write_typ(out, &f.ret.x.typ);
@@ -69,10 +64,11 @@ pub fn write_spec_fn(out: &mut String, f: &FunctionX) {
 // ── Proof fn ────────────────────────────────────────────────────────────
 
 /// Write a proof fn as `theorem ... := by <tactics>`.
-pub fn write_proof_fn(out: &mut String, f: &FunctionX, tactic_body: &str) {
+/// Returns the 1-indexed line where the tactic body starts in the output.
+pub fn write_proof_fn(out: &mut String, f: &FunctionX, tactic_body: &str, collisions: &HashSet<String>) -> usize {
     out.push_str("theorem ");
-    write_fn_name(out, &f.name);
-    write_fn_params(out, f);
+    write_fn_name(out, &f.name, collisions);
+    write_fn_params(out, f, collisions);
 
     for (i, req) in f.require.iter().enumerate() {
         out.push_str(" (h");
@@ -86,6 +82,9 @@ pub fn write_proof_fn(out: &mut String, f: &FunctionX, tactic_body: &str) {
     write_ensures(out, &f.ensure.0);
     out.push_str(" := by\n");
 
+    // Record where tactic body starts (1-indexed line number)
+    let tactic_start_line = out.chars().filter(|&c| c == '\n').count() + 1;
+
     for line in tactic_body.lines() {
         if line.trim().is_empty() {
             out.push('\n');
@@ -95,12 +94,14 @@ pub fn write_proof_fn(out: &mut String, f: &FunctionX, tactic_body: &str) {
             out.push('\n');
         }
     }
+
+    tactic_start_line
 }
 
 // ── Datatype ────────────────────────────────────────────────────────────
 
 /// Write a VIR datatype as a Lean `structure` (1 variant) or `inductive` (multiple).
-pub fn write_datatype(out: &mut String, dt: &DatatypeX) {
+pub fn write_datatype(out: &mut String, dt: &DatatypeX, _collisions: &HashSet<String>) {
     let name = match &dt.name {
         Dt::Path(p) => short_name(p),
         Dt::Tuple(_) => return,
@@ -146,6 +147,7 @@ pub fn write_trait(
     out: &mut String,
     tr: &TraitX,
     method_lookup: &HashMap<&Fun, &FunctionX>,
+    _collisions: &HashSet<String>,
 ) {
     let name = short_name(&tr.name);
 
@@ -171,12 +173,13 @@ pub fn write_trait(
 }
 
 /// Write method type: `Self → ParamType → ... → RetType`.
-/// First param is self (emitted as `Self`), rest use their VIR types.
+/// Self is detected by name ("self") or position (first param of a method).
 fn write_method_type(out: &mut String, func: &FunctionX) {
-    // Self → Param1 → ... → ParamN → RetType
     for (i, p) in func.params.iter().enumerate() {
         if i > 0 { out.push_str(" → "); }
-        if i == 0 { out.push_str("Self"); } else { write_typ(out, &p.x.typ); }
+        let is_self = i == 0 && (p.x.name.0.as_str() == "self"
+            || p.x.name.0.contains("self"));
+        if is_self { out.push_str("Self"); } else { write_typ(out, &p.x.typ); }
     }
     if !func.params.is_empty() { out.push_str(" → "); }
     write_typ(out, &func.ret.x.typ);
@@ -185,7 +188,7 @@ fn write_method_type(out: &mut String, func: &FunctionX) {
 // ── Shared helpers ──────────────────────────────────────────────────────
 
 /// Write type params, trait bounds, and value params.
-fn write_fn_params(out: &mut String, f: &FunctionX) {
+fn write_fn_params(out: &mut String, f: &FunctionX, collisions: &HashSet<String>) {
     for tp in f.typ_params.iter() {
         out.push_str(" (");
         out.push_str(tp);
@@ -194,7 +197,7 @@ fn write_fn_params(out: &mut String, f: &FunctionX) {
     for bound in f.typ_bounds.iter() {
         if let GenericBoundX::Trait(TraitId::Path(path), typs) = &**bound {
             out.push_str(" [");
-            out.push_str(short_name(path));
+            out.push_str(&resolve_name(path, collisions));
             for t in typs.iter() {
                 out.push(' ');
                 write_typ(out, t);
@@ -228,6 +231,7 @@ fn write_field_name(out: &mut String, name: &str) {
     }
 }
 
-fn write_fn_name(out: &mut String, fun: &Fun) {
-    write_name(out, short_name(&fun.path));
+fn write_fn_name(out: &mut String, fun: &Fun, collisions: &HashSet<String>) {
+    let name = resolve_name(&fun.path, collisions);
+    write_name(out, &name);
 }

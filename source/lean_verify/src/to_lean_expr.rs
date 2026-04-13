@@ -64,23 +64,18 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
         }
 
         ExprX::Unary(UnaryOp::Clip { range, .. }, inner) => {
-            // `as nat` / `as int` etc. In spec mode, VIR uses mathematical Int/Nat,
-            // so clips between same-signedness families are identity.
-            // For fixed-width clips (U(32), I(64)), modular arithmetic would apply
-            // in exec mode — but spec mode just checks the range as a separate obligation.
-            let src_is_nat = matches!(&*inner.typ, TypX::Int(
-                IntRange::Nat | IntRange::U(_) | IntRange::USize | IntRange::Char
+            // Int → Nat needs explicit conversion; all other clips are identity
+            // (Nat → Int is implicit in Lean, same-family clips are no-ops)
+            let src_is_int = matches!(&*inner.typ, TypX::Int(
+                IntRange::Int | IntRange::I(_) | IntRange::ISize
             ));
             let dst_is_nat = matches!(range,
                 IntRange::Nat | IntRange::U(_) | IntRange::USize | IntRange::Char
             );
-            if src_is_nat == dst_is_nat {
-                write_expr(out, &inner.x);
-            } else if dst_is_nat {
+            if src_is_int && dst_is_nat {
                 out.push_str("Int.toNat ");
                 write_expr_prec(out, &inner.x, PREC_ATOM, true);
             } else {
-                // Nat → Int: implicit coercion in Lean
                 write_expr(out, &inner.x);
             }
         }
@@ -105,7 +100,10 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
                     }
                 }
                 CallTarget::FnSpec(inner) => write_expr_prec(out, &inner.x, PREC_ATOM, true),
-                _ => write_todo(out, "call target"),
+                CallTarget::BuiltinSpecFun(_, _, _) => {
+                    // ClosureReq/ClosureEns/DefaultEns — rare, emit a placeholder name
+                    out.push_str("builtinSpecFun");
+                }
             }
             for arg in args.iter() {
                 out.push(' ');
@@ -182,7 +180,7 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
         // Construct datatype: Struct { field: val } → { field := val } or ⟨val1, val2⟩
         ExprX::Ctor(dt, variant, fields, update) => {
             if update.is_some() {
-                write_todo(out, "Ctor with update (..)");
+                write_todo(out, "struct update { ..base }");
             } else {
                 write_ctor(out, dt, variant, fields);
             }
@@ -220,11 +218,44 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
         }
         ExprX::UnaryOpr(UnaryOpr::CustomErr(_), inner) => write_expr(out, &inner.x),
 
-        ExprX::Header(_) => {} // skip header expressions (requires/ensures markers)
+        ExprX::NullaryOpr(NullaryOpr::ConstGeneric(typ)) => {
+            // const generic parameter used as expression — emit its type as a value
+            out.push('(');
+            write_typ(out, typ);
+            out.push(')');
+        }
+        ExprX::NullaryOpr(NullaryOpr::TraitBound(..)) => out.push_str("True"),
+        ExprX::NullaryOpr(_) => out.push_str("True"),
 
+        ExprX::Multi(_, exprs) => {
+            // Multi-operand: emit as nested application
+            for (i, e) in exprs.iter().enumerate() {
+                if i > 0 { out.push_str(", "); }
+                write_expr(out, &e.x);
+            }
+        }
+        ExprX::ArrayLiteral(exprs) => {
+            out.push_str("[");
+            for (i, e) in exprs.iter().enumerate() {
+                if i > 0 { out.push_str(", "); }
+                write_expr(out, &e.x);
+            }
+            out.push_str("]");
+        }
+
+        ExprX::Header(_) => {}
+        ExprX::Fuel(..) | ExprX::RevealString(_) | ExprX::AirStmt(_) => {}
+        ExprX::StaticVar(fun) | ExprX::ExecFnByName(fun) => write_fn_ref(out, fun),
+        ExprX::Nondeterministic => out.push_str("sorry /- nondeterministic -/"),
+        ExprX::BreakOrContinue { .. } => {} // exec only, shouldn't appear in spec
+
+        // Exec-mode only (Track B)
         ExprX::Assign { .. } => write_todo(out, "Assign"),
+        ExprX::AssignToPlace { .. } => write_todo(out, "AssignToPlace"),
         ExprX::Loop { .. } => write_todo(out, "Loop"),
         ExprX::Return(_) => write_todo(out, "Return"),
+        ExprX::NonSpecClosure { .. } => write_todo(out, "NonSpecClosure"),
+
         _ => write_todo(out, "expr"),
     }
 }
@@ -262,7 +293,28 @@ fn write_const(out: &mut String, c: &Constant) {
                 out.push_str(&s);
             }
         }
-        _ => write_todo(out, "const"),
+        Constant::StrSlice(s) => {
+            out.push('"');
+            out.push_str(s);
+            out.push('"');
+        }
+        Constant::Char(c) => {
+            out.push('\'');
+            out.push(*c);
+            out.push('\'');
+        }
+        Constant::Real(s) => {
+            // VIR stores reals as "digits.digits" strings
+            out.push('(');
+            out.push_str(s);
+            out.push_str(" : Real)");
+        }
+        Constant::Float32(bits) => {
+            out.push_str(&format!("({} : Float)", f32::from_bits(*bits)));
+        }
+        Constant::Float64(bits) => {
+            out.push_str(&format!("({} : Float)", f64::from_bits(*bits)));
+        }
     }
 }
 
@@ -344,9 +396,26 @@ fn write_pattern(out: &mut String, pat: &PatternX) {
             out.push_str(" | ");
             write_pattern(out, &right.x);
         }
+        PatternX::Binding { binding, sub_pat } => {
+            write_name(out, &binding.name.0);
+            out.push('@');
+            write_pattern(out, &sub_pat.x);
+        }
         PatternX::Expr(e) => write_expr(out, &e.x),
+        PatternX::Range(lo, hi) => {
+            // Lean doesn't have range patterns; emit as a numeric literal if possible
+            if let Some(lo) = lo { write_expr(out, &lo.x); }
+            else { out.push('_'); }
+            // Range patterns are rare in spec mode (ast_simplify usually eliminates Match)
+            if let Some((hi, op)) = hi {
+                out.push_str(match op {
+                    InequalityOp::Le => " /* ..= */ ",
+                    _ => " /* .. */ ",
+                });
+                write_expr(out, &hi.x);
+            }
+        }
         PatternX::MutRef(inner) | PatternX::ImmutRef(inner) => write_pattern(out, &inner.x),
-        _ => write_todo(out, "pattern"),
     }
 }
 
@@ -388,17 +457,15 @@ fn write_place(out: &mut String, place: &PlaceX) {
         }
         PlaceX::DerefMut(inner) => write_place(out, &inner.x),
         PlaceX::ModeUnwrap(inner, _) => write_place(out, &inner.x),
-        // Temporary: evaluate expression and return as a place
         PlaceX::Temporary(expr) => write_expr(out, &expr.x),
-        // WithExpr: evaluate side-effect expr, then return place
         PlaceX::WithExpr(_, place) => write_place(out, &place.x),
-        _ => write_todo(out, "place"),
+        PlaceX::Index(base, idx, _, _) => {
+            write_place(out, &base.x);
+            out.push('[');
+            write_expr(out, &idx.x);
+            out.push(']');
+        }
+        PlaceX::UserDefinedTypInvariantObligation(inner, _) => write_place(out, &inner.x),
     }
 }
 
-/// Convenience: return expression as String.
-pub fn expr_to_lean(expr: &ExprX) -> String {
-    let mut s = String::new();
-    write_expr(&mut s, expr);
-    s
-}

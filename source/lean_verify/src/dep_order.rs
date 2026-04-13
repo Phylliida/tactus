@@ -26,10 +26,11 @@ pub struct References<'a> {
     pub traits: HashSet<&'a str>,
 }
 
-/// Collect all referenced datatype/trait names and return spec fns in dependency order.
+/// Collect all referenced datatype/trait names from proof fns and their
+/// transitive spec fn dependencies.
 pub fn collect_references<'a>(
-    all_fns: &'a [&'a FunctionX],
-    proof_fns: &[&'a FunctionX],  // needs 'a for worklist Fun refs
+    spec_fn_map: &HashMap<&Fun, &'a FunctionX>,
+    proof_fns: &[&'a FunctionX],
 ) -> References<'a> {
     let mut refs = References { datatypes: HashSet::new(), traits: HashSet::new() };
 
@@ -37,19 +38,9 @@ pub fn collect_references<'a>(
         collect_from_fn(pf, &mut refs);
     }
 
-    // Transitive closure: scan spec fns reachable from proof fns
-    let spec_fn_map: HashMap<&Fun, &'a FunctionX> = all_fns.iter()
-        .filter(|f| matches!(f.mode, Mode::Spec) && f.body.is_some())
-        .map(|f| (&f.name, *f))
-        .collect();
-
     let mut visited: HashSet<&Fun> = HashSet::new();
     let mut worklist: Vec<&'a Fun> = Vec::new();
-    for pf in proof_fns {
-        for e in pf.require.iter() { collect_fun_refs(e, &mut worklist); }
-        for e in pf.ensure.0.iter() { collect_fun_refs(e, &mut worklist); }
-        for e in pf.ensure.1.iter() { collect_fun_refs(e, &mut worklist); }
-    }
+    seed_worklist(proof_fns, &mut worklist);
     while let Some(fun) = worklist.pop() {
         if visited.contains(fun) { continue; }
         visited.insert(fun);
@@ -103,25 +94,25 @@ fn collect_from_fn<'a>(f: &'a FunctionX, refs: &mut References<'a>) {
     if let Some(body) = &f.body { scan_expr(body); }
 }
 
-/// Given all VIR functions and proof fns, return spec fns in dependency order.
+/// Build the spec fn lookup map (shared between collect_references and order_spec_fns).
+pub fn build_spec_fn_map<'a>(all_fns: &'a [&'a FunctionX]) -> HashMap<&'a Fun, &'a FunctionX> {
+    all_fns.iter()
+        .filter(|f| matches!(f.mode, Mode::Spec) && f.body.is_some())
+        .map(|f| (&f.name, *f))
+        .collect()
+}
+
+/// Given spec fn map and proof fns, return spec fns in dependency order.
 pub fn order_spec_fns<'a>(
+    spec_fn_map: &HashMap<&Fun, &'a FunctionX>,
     all_fns: &'a [&'a FunctionX],
     proof_fns: &[&'a FunctionX],
 ) -> Vec<FnGroup<'a>> {
-    let spec_fn_map: HashMap<&Fun, &'a FunctionX> = all_fns.iter()
-        .filter(|f| matches!(f.mode, Mode::Spec) && f.body.is_some())
-        .map(|f| (&f.name, *f))
-        .collect();
-
     let mut needed: HashSet<&Fun> = HashSet::new();
     let mut edges: HashMap<&'a Fun, HashSet<&'a Fun>> = HashMap::new();
     let mut worklist: Vec<&'a Fun> = Vec::new();
 
-    for pf in proof_fns {
-        for e in pf.require.iter() { collect_fun_refs(e, &mut worklist); }
-        for e in pf.ensure.0.iter() { collect_fun_refs(e, &mut worklist); }
-        for e in pf.ensure.1.iter() { collect_fun_refs(e, &mut worklist); }
-    }
+    seed_worklist(proof_fns, &mut worklist);
 
     while let Some(fun) = worklist.pop() {
         if needed.contains(fun) { continue; }
@@ -159,6 +150,15 @@ pub fn order_spec_fns<'a>(
             FnGroup::Mutual(scc.iter().map(|name| fn_lookup[name]).collect())
         }
     }).collect()
+}
+
+/// Seed a worklist from proof fn requires/ensures.
+fn seed_worklist<'a>(proof_fns: &[&'a FunctionX], worklist: &mut Vec<&'a Fun>) {
+    for pf in proof_fns {
+        for e in pf.require.iter() { collect_fun_refs(e, worklist); }
+        for e in pf.ensure.0.iter() { collect_fun_refs(e, worklist); }
+        for e in pf.ensure.1.iter() { collect_fun_refs(e, worklist); }
+    }
 }
 
 // ── Expression walker ───────────────────────────────────────────────────
@@ -215,9 +215,34 @@ fn walk_expr<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
         ExprX::Return(e) => { if let Some(e) = e { walk_expr(e, visit); } }
         ExprX::AssignToPlace { rhs, .. } => walk_expr(rhs, visit),
         ExprX::OpenInvariant(a, _, b, _) => { walk_expr(a, visit); walk_expr(b, visit); }
+        ExprX::NonSpecClosure { body, requires, ensures, external_spec, .. } => {
+            walk_expr(body, visit);
+            for r in requires.iter() { walk_expr(r, visit); }
+            for e in ensures.iter() { walk_expr(e, visit); }
+            if let Some((_, e)) = external_spec { walk_expr(e, visit); }
+        }
+        ExprX::Loop { cond, body, invs, decrease, .. } => {
+            if let Some(c) = cond { walk_expr(c, visit); }
+            walk_expr(body, visit);
+            for d in decrease.iter() { walk_expr(d, visit); }
+            for inv in invs.iter() { walk_expr(&inv.inv, visit); }
+        }
+        ExprX::AssertQuery { requires, ensures, proof, .. } => {
+            for r in requires.iter() { walk_expr(r, visit); }
+            for e in ensures.iter() { walk_expr(e, visit); }
+            walk_expr(proof, visit);
+        }
 
-        // Leaf nodes
-        _ => {}
+        // Leaf nodes (no sub-expressions)
+        ExprX::Const(_) | ExprX::Var(_) | ExprX::ConstVar(..) | ExprX::StaticVar(_)
+        | ExprX::VarLoc(_) | ExprX::ExecFnByName(_) | ExprX::Fuel(..)
+        | ExprX::NullaryOpr(_) | ExprX::Header(_) | ExprX::AirStmt(_)
+        | ExprX::RevealString(_) | ExprX::Nondeterministic
+        | ExprX::BreakOrContinue { .. } | ExprX::ReadPlace(..)
+        | ExprX::BorrowMut(_) | ExprX::TwoPhaseBorrowMut(_)
+        | ExprX::VarAt(..) | ExprX::BorrowMutTracked(_)
+        | ExprX::ImplicitReborrowOrSpecRead(..)
+        | ExprX::EvalAndResolve(..) | ExprX::Old(_) => {}
     }
 }
 
