@@ -62,17 +62,23 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
 
         ExprX::Unary(UnaryOp::Clip { range, .. }, inner) => {
             // `as nat` / `as int` / `as u32` etc.
-            // In spec mode, these are identity for matching ranges, or Int.toNat / Int.ofNat
-            match range {
-                IntRange::Nat | IntRange::U(_) | IntRange::USize | IntRange::Char => {
-                    // `as nat` from int: Int.toNat (truncates negative to 0)
-                    out.push_str("Int.toNat ");
-                    write_expr_prec(out, &inner.x, PREC_ATOM, true);
-                }
-                IntRange::Int | IntRange::I(_) | IntRange::ISize => {
-                    // `as int` from nat: just coerce (Nat embeds into Int)
-                    write_expr(out, &inner.x);
-                }
+            // Check source type to decide if conversion is needed or if it's identity.
+            let src_is_nat = matches!(&*inner.typ, TypX::Int(
+                IntRange::Nat | IntRange::U(_) | IntRange::USize | IntRange::Char
+            ));
+            let dst_is_nat = matches!(range,
+                IntRange::Nat | IntRange::U(_) | IntRange::USize | IntRange::Char
+            );
+            if src_is_nat == dst_is_nat {
+                // Same signedness family — identity in spec mode
+                write_expr(out, &inner.x);
+            } else if dst_is_nat {
+                // Int → Nat: Int.toNat (truncates negative to 0)
+                out.push_str("Int.toNat ");
+                write_expr_prec(out, &inner.x, PREC_ATOM, true);
+            } else {
+                // Nat → Int: implicit coercion (↑) in Lean
+                write_expr(out, &inner.x);
             }
         }
 
@@ -141,19 +147,23 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
         ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => write_expr(out, &inner.x),
 
         ExprX::ReadPlace(place, _) => write_place(out, &place.x),
-        ExprX::NullaryOpr(nop) => write_todo(out, &format!("nullary({:?})", nop)),
-        ExprX::Multi(mop, _) => write_todo(out, &format!("multi({:?})", mop)),
-        ExprX::UnaryOpr(_uop, inner) => {
-            // Many UnaryOpr are transparent (Box, Unbox, coercions)
-            write_expr(out, &inner.x);
+
+        ExprX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
+            write_expr_prec(out, &inner.x, PREC_ATOM, true);
+            out.push('.');
+            out.push_str(&field_opr.field);
         }
-        ExprX::Header(_) => {} // skip header expressions
-        other => {
-            // Use Debug trait to get the actual variant name
-            let debug_str = format!("{:?}", other);
-            let variant = debug_str.split('(').next().unwrap_or("??");
-            write_todo(out, &format!("expr:{}", variant));
+        ExprX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => {
+            write_expr_prec(out, &inner.x, PREC_ATOM, true);
+            out.push_str(".is");
+            out.push_str(variant);
         }
+        // Remaining UnaryOpr that are genuinely transparent in spec mode
+        ExprX::UnaryOpr(UnaryOpr::CustomErr(_), inner) => write_expr(out, &inner.x),
+
+        ExprX::Header(_) => {} // skip header expressions (requires/ensures markers)
+
+        _ => write_todo(out, "expr"),
     }
 }
 
