@@ -8,6 +8,7 @@ edition = "2024"
 [dependencies]
 air = { path = "../air" }
 vir = { path = "../vir" }
+lean_verify = { path = "../lean_verify" }
 serde = "1"
 serde_json = { version = ">=1.0.95", features = ["preserve_order"] }
 bincode = "1.0.1"

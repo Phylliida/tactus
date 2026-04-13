@@ -1497,6 +1497,8 @@ pub struct FunctionAttrsX {
     pub tracked_take_option: bool,
     /// Tactus: proof fn body is a Lean tactic block, verified by Lean kernel
     pub tactic_proof: bool,
+    /// Tactus: captured tactic body text (from proc macro)
+    pub tactic_body: Option<String>,
 }
 
 /// Function specification of its invariant mask
