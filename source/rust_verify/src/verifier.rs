@@ -1599,9 +1599,8 @@ impl Verifier {
                                 }
                             };
 
-                            // Collect spec fns from the VIR krate
-                            let spec_fns: Vec<&vir::ast::FunctionX> = vir_krate.functions.iter()
-                                .filter(|f| matches!(f.x.mode, vir::ast::Mode::Spec) && f.x.body.is_some())
+                            // Collect all VIR functions (dep_order will filter and sort)
+                            let all_fns: Vec<&vir::ast::FunctionX> = vir_krate.functions.iter()
                                 .map(|f| &f.x)
                                 .collect();
 
@@ -1617,7 +1616,7 @@ impl Verifier {
 
                             // Generate Lean file and invoke Lean
                             let lean_source = lean_verify::to_lean_fn::generate_lean_file(
-                                &spec_fns,
+                                &all_fns,
                                 &[(&vir_fn.x, tactic_body.as_str())],
                                 &[],
                                 namespace.as_deref(),
