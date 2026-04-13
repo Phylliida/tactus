@@ -1580,15 +1580,22 @@ impl Verifier {
                         if function.x.attrs.tactic_proof {
                             let fn_name = vir::ast_util::fun_as_friendly_rust_name(&function.x.name);
 
-                            // Get tactic body text from attribute
+                            // Get tactic body text from attribute and clean up Rust tokenization.
+                            // The proc macro captures as Rust tokens, so user writes:
+                            //   unfold(double); omega()
+                            // and we get the token string: "unfold(double) ; omega()"
+                            // We clean each semicolon-separated statement, converting
+                            // Rust-style function calls back to Lean tactic syntax.
+                            let fn_span = &function.span;
                             let tactic_body = match &function.x.attrs.tactic_body {
-                                Some(body) => body.clone(),
+                                Some(body) => clean_tactic_body(body),
                                 None => {
                                     self.count_errors += 1;
-                                    eprintln!(
-                                        "error: tactic proof fn {} has no tactic body",
-                                        fn_name
-                                    );
+                                    reporter.report(&message(
+                                        MessageLevel::Error,
+                                        format!("tactic proof fn {} has no tactic body", fn_name),
+                                        fn_span,
+                                    ).to_any());
                                     continue;
                                 }
                             };
@@ -1601,10 +1608,11 @@ impl Verifier {
                                 Some(f) => f,
                                 None => {
                                     self.count_errors += 1;
-                                    eprintln!(
-                                        "error: could not find VIR function for tactic proof fn {}",
-                                        fn_name
-                                    );
+                                    reporter.report(&message(
+                                        MessageLevel::Error,
+                                        format!("could not find VIR function for tactic proof fn {}", fn_name),
+                                        fn_span,
+                                    ).to_any());
                                     continue;
                                 }
                             };
@@ -1615,11 +1623,22 @@ impl Verifier {
                                 .map(|f| &f.x)
                                 .collect();
 
+                            // Compute namespace from the proof fn's owning module
+                            let namespace = vir_fn.x.owning_module.as_ref().and_then(|p| {
+                                let ns = p.segments.iter()
+                                    .map(|s| s.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .collect::<Vec<_>>()
+                                    .join(".");
+                                if ns.is_empty() { None } else { Some(ns) }
+                            });
+
                             // Generate Lean file and invoke Lean
                             let lean_source = lean_verify::to_lean_fn::generate_lean_file(
                                 &spec_fns,
                                 &[(&vir_fn.x, tactic_body.as_str())],
                                 &[],
+                                namespace.as_deref(),
                             );
 
                             match lean_verify::lean_process::check_lean_stdin(&lean_source) {
@@ -1628,21 +1647,31 @@ impl Verifier {
                                         self.count_verified += 1;
                                     } else {
                                         self.count_errors += 1;
-                                        eprintln!("error: Lean verification failed for {}", fn_name);
+                                        // Build error message with Lean goal state
+                                        let mut error_details = Vec::new();
                                         for diag in &result.diagnostics {
                                             if diag.severity == "error" {
-                                                eprintln!("  [lean error] {}", diag.data);
+                                                error_details.push(diag.data.clone());
                                             }
                                         }
-                                        // Print generated Lean for debugging
-                                        eprintln!("  generated Lean:\n{}", lean_source);
+                                        let msg = format!(
+                                            "Lean verification failed for {}:\n{}",
+                                            fn_name,
+                                            error_details.join("\n")
+                                        );
+                                        reporter.report(
+                                            &message(MessageLevel::Error, msg, fn_span).to_any()
+                                        );
                                     }
                                 }
                                 Err(e) => {
                                     self.count_errors += 1;
-                                    eprintln!(
-                                        "error: failed to invoke Lean for {}: {}",
+                                    let msg = format!(
+                                        "failed to invoke Lean for {}: {}. Is Lean 4 installed?",
                                         fn_name, e
+                                    );
+                                    reporter.report(
+                                        &message(MessageLevel::Error, msg, fn_span).to_any()
                                     );
                                 }
                             }
@@ -3166,6 +3195,111 @@ impl Verifier {
             }
         }
     }
+}
+
+/// Clean up Rust-tokenized tactic body for Lean.
+///
+/// The proc macro captures tactic bodies as Rust tokens. Users write Lean-like
+/// syntax using Rust-compatible forms:
+///   `unfold(double); omega()` → `unfold double\nomega`
+///   `constructor(); omega()` → `constructor\nomega`
+///   `nlinarith([sq_nonneg(re), sq_nonneg(im)])` → `nlinarith [sq_nonneg re, sq_nonneg im]`
+///   `exact(Nat.mul_pos(by(omega), ih))` → `exact Nat.mul_pos (by omega) ih`
+///
+/// Semicolons separate tactic lines. Single `ident(args)` becomes `ident args`.
+fn clean_tactic_body(body: &str) -> String {
+    body.split(';')
+        .map(|stmt| clean_tactic_stmt(stmt.trim()))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Clean a single tactic statement from Rust token form to Lean form.
+fn clean_tactic_stmt(stmt: &str) -> String {
+    if stmt.is_empty() { return String::new(); }
+
+    // Find the outermost balanced parens after an identifier prefix
+    if let Some(pos) = stmt.find('(') {
+        let name = &stmt[..pos];
+        // Only convert if the prefix is a simple identifier (tactic name)
+        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+            if let Some(inner) = extract_balanced_parens(&stmt[pos..]) {
+                let rest = &stmt[pos + inner.len() + 2..]; // +2 for parens
+                let cleaned_inner = clean_tactic_args(inner.trim());
+                if cleaned_inner.is_empty() && rest.is_empty() {
+                    return name.to_string();
+                }
+                let rest_clean = if rest.is_empty() { String::new() } else {
+                    format!(" {}", clean_tactic_stmt(rest.trim()))
+                };
+                return format!("{} {}{}", name, cleaned_inner, rest_clean).trim().to_string();
+            }
+        }
+    }
+
+    stmt.to_string()
+}
+
+/// Extract content between balanced parens. Returns None if unbalanced.
+fn extract_balanced_parens(s: &str) -> Option<&str> {
+    if !s.starts_with('(') { return None; }
+    let mut depth = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[1..i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Clean tactic arguments: recursively clean nested `ident(args)` patterns.
+fn clean_tactic_args(args: &str) -> String {
+    if args.is_empty() { return String::new(); }
+
+    // Handle bracket-delimited lists like [sq_nonneg(re), sq_nonneg(im)]
+    if args.starts_with('[') && args.ends_with(']') {
+        let inner = &args[1..args.len()-1];
+        let cleaned: Vec<String> = split_top_level(inner, ',')
+            .iter()
+            .map(|a| clean_tactic_stmt(a.trim()))
+            .collect();
+        return format!("[{}]", cleaned.join(", "));
+    }
+
+    // Otherwise, clean each comma-separated arg
+    let parts: Vec<String> = split_top_level(args, ',')
+        .iter()
+        .map(|a| clean_tactic_stmt(a.trim()))
+        .collect();
+    parts.join(", ")
+}
+
+/// Split a string by a delimiter, respecting balanced parens and brackets.
+fn split_top_level(s: &str, delim: char) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0;
+    for c in s.chars() {
+        match c {
+            '(' | '[' | '{' => { depth += 1; current.push(c); }
+            ')' | ']' | '}' => { depth -= 1; current.push(c); }
+            c if c == delim && depth == 0 => {
+                parts.push(current.clone());
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() { parts.push(current); }
+    parts
 }
 
 fn delete_dir_if_exists_and_is_dir(dir: &std::path::PathBuf) -> Result<(), VirErr> {

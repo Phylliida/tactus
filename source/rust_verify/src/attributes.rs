@@ -455,12 +455,6 @@ pub(crate) fn parse_attrs(
                 AttrTree::Fun(_, name, None) if name == "all_triggers" => v.push(Attr::AllTriggers),
                 AttrTree::Fun(_, arg, None) if arg == "verus_macro" => v.push(Attr::VerusMacro),
                 AttrTree::Fun(_, arg, None) if arg == "external_body" => v.push(Attr::ExternalBody),
-                AttrTree::Fun(_, arg, None) if arg == "tactic_proof" => v.push(Attr::TacticProof),
-                AttrTree::Fun(_, arg, Some(box [AttrTree::Lit(LitKind::Str, body)]))
-                    if arg == "tactic_body" =>
-                {
-                    v.push(Attr::TacticBody(body.clone()))
-                }
                 AttrTree::Fun(_, arg, None) if arg == "external" => v.push(Attr::External),
                 AttrTree::Fun(_, arg, None) if arg == "verify" => v.push(Attr::Verify),
                 AttrTree::Fun(_, arg, None) if arg == "opaque" => v.push(Attr::Opaque),
@@ -709,6 +703,10 @@ pub(crate) fn parse_attrs(
                 AttrTree::Fun(_, arg, None) if arg == "tracked_take_option_primitive" => {
                     v.push(Attr::TrackedTakeOption)
                 }
+                // Tactus: #[verifier::tactic] marks a proof fn as using Lean tactics
+                AttrTree::Fun(_, arg, None) if arg == "tactic" => {
+                    v.push(Attr::TacticProof)
+                }
                 _ => return err_span(span, "unrecognized verifier attribute"),
             },
             AttrPrefix::Verus(verus_prefix) => match verus_prefix {
@@ -854,6 +852,15 @@ pub(crate) fn parse_attrs(
                     }
                     AttrTree::Fun(_, arg, None) if arg == "structural_const_wrapper" => {
                         v.push(Attr::StructuralConstWrapper)
+                    }
+                    // Tactus: tactic proof attributes
+                    AttrTree::Fun(_, arg, None) if arg == "tactic_proof" => {
+                        v.push(Attr::TacticProof)
+                    }
+                    AttrTree::Fun(_, arg, Some(box [AttrTree::Lit(LitKind::Str, body)]))
+                        if arg == "tactic_body" =>
+                    {
+                        v.push(Attr::TacticBody(body.clone()));
                     }
                     _ => {
                         return err_span(span, "unrecognized internal attribute");

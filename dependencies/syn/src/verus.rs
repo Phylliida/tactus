@@ -291,6 +291,8 @@ ast_struct! {
         pub invariants: Option<SignatureInvariants>,
         pub unwind: Option<SignatureUnwind>,
         pub with: Option<WithSpecOnFn>,
+        /// Tactus: `by` keyword before the function body block, signaling tactic proof mode
+        pub tactic_by: Option<Token![by]>,
     }
 }
 
@@ -305,6 +307,7 @@ impl SignatureSpec {
         self.decreases = None;
         self.invariants = None;
         self.unwind = None;
+        self.tactic_by = None;
     }
 }
 
@@ -1279,6 +1282,14 @@ pub mod parsing {
             let invariants: Option<SignatureInvariants> = input.parse()?;
             let unwind: Option<SignatureUnwind> = input.parse()?;
 
+            // Tactus: check for `by` keyword before function body block.
+            // Only consume `by` if it's followed by `{` (to distinguish from other uses of `by`).
+            let tactic_by = if input.peek(Token![by]) && input.peek2(token::Brace) {
+                Some(input.parse()?)
+            } else {
+                None
+            };
+
             Ok(SignatureSpec {
                 prover,
                 requires,
@@ -1290,6 +1301,7 @@ pub mod parsing {
                 invariants,
                 unwind,
                 with,
+                tactic_by,
             })
         }
     }

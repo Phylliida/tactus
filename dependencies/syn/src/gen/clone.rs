@@ -2497,6 +2497,7 @@ impl Clone for crate::SignatureSpec {
             invariants: self.invariants.clone(),
             unwind: self.unwind.clone(),
             with: self.with.clone(),
+            tactic_by: self.tactic_by.clone(),
         }
     }
 }

@@ -9,10 +9,12 @@ use crate::to_lean_type::write_typ;
 ///
 /// `spec_fns` must be in dependency order (callees before callers).
 /// Each proof fn is paired with its tactic body text.
+/// `namespace` is the Lean namespace (e.g., "my_crate.my_module").
 pub fn generate_lean_file(
     spec_fns: &[&FunctionX],
     proof_fns: &[(&FunctionX, &str)],
     imports: &[String],
+    namespace: Option<&str>,
 ) -> String {
     let mut out = String::new();
     out.push_str(TACTUS_PRELUDE);
@@ -26,6 +28,12 @@ pub fn generate_lean_file(
         out.push('\n');
     }
 
+    if let Some(ns) = namespace {
+        out.push_str("namespace ");
+        out.push_str(ns);
+        out.push_str("\n\n");
+    }
+
     for f in spec_fns {
         write_spec_fn(&mut out, f);
         out.push('\n');
@@ -33,6 +41,12 @@ pub fn generate_lean_file(
 
     for (f, tactics) in proof_fns {
         write_proof_fn(&mut out, f, tactics);
+        out.push('\n');
+    }
+
+    if let Some(ns) = namespace {
+        out.push_str("end ");
+        out.push_str(ns);
         out.push('\n');
     }
 
