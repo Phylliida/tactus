@@ -1,5 +1,9 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::Duration;
+
+/// Maximum time to wait for Lean before giving up.
+const LEAN_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// A single diagnostic from Lean's `--json` output.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -39,7 +43,7 @@ pub fn format_error(
 
     // Tactic line info
     if let Some(pos) = &diag.pos {
-        if let Some((_, offset)) = source_map.find_tactic_line(pos.line) {
+        if let Some(offset) = source_map.find_tactic_line(pos.line) {
             out.push_str(&format!("tactic line {}: ", offset + 1));
         }
     }
@@ -130,20 +134,53 @@ fn run_lean(
         .write_all(lean_source.as_bytes())
         .map_err(|e| format!("Failed to write to lean stdin: {}", e))?;
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to wait for lean: {}", e))?;
+    // Wait with timeout to avoid hanging on elaboration loops
+    let output = match wait_with_timeout(child, LEAN_TIMEOUT)? {
+        Some(out) => out,
+        None => return Err("Lean timed out (120s). The proof may cause elaboration to loop.".into()),
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let diagnostics = parse_diagnostics(&stdout);
 
     let has_error = diagnostics.iter().any(|d| d.severity == "error");
+    // If no JSON diagnostics but process failed, include stderr
     let success = output.status.success() && !has_error;
+    if !success && diagnostics.is_empty() && !stderr.is_empty() {
+        return Err(format!("Lean failed: {}", stderr.trim()));
+    }
 
     Ok(LeanResult {
         success,
         diagnostics,
     })
+}
+
+/// Wait for a child process with a timeout. Returns None if timed out.
+/// Takes ownership of the child because `wait_with_output` requires it.
+fn wait_with_timeout(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> Result<Option<std::process::Output>, String> {
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child.wait_with_output()
+                    .map(Some)
+                    .map_err(|e| format!("Failed to read lean output: {}", e));
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(format!("Failed to wait for lean: {}", e)),
+        }
+    }
 }
 
 /// Parse Lean's JSON diagnostic output (one JSON object per line).
