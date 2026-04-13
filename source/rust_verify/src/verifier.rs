@@ -1588,7 +1588,7 @@ impl Verifier {
                             // Rust-style function calls back to Lean tactic syntax.
                             let fn_span = &function.span;
                             let tactic_body = match &function.x.attrs.tactic_body {
-                                Some(body) => lean_verify::tactic_cleanup::clean_tactic_body(body),
+                                Some(body) => body.clone(),
                                 None => {
                                     self.count_errors += 1;
                                     reporter.report(&message(

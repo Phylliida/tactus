@@ -11,13 +11,11 @@ test_verify_one_file! {
             x + x
         }
 
-        #[verifier::tactic]
         proof fn lemma_double_pos(x: nat)
             requires x > 0
             ensures double(x) > x
-        {
-            unfold(double);
-            omega();
+        by {
+            unfold double; omega
         }
     } => Ok(())
 }
@@ -26,11 +24,10 @@ test_verify_one_file! {
 
 test_verify_one_file! {
     #[test] test_wrong_proof_rejected verus_code! {
-        #[verifier::tactic]
         proof fn wrong(x: nat)
             ensures x + 1 == x
-        {
-            omega();
+        by {
+            omega
         }
     } => Err(err) => {
         assert!(err.errors.len() >= 1, "Expected at least one error for wrong proof");
@@ -41,31 +38,23 @@ test_verify_one_file! {
 
 test_verify_one_file! {
     #[test] test_add_comm verus_code! {
-        #[verifier::tactic]
         proof fn add_comm(a: int, b: int)
             ensures a + b == b + a
-        {
-            omega();
+        by {
+            omega
         }
     } => Ok(())
 }
 
-// === Multiple requires and ensures (conjunction with ∧) ===
+// === Multiple requires and ensures (conjunction) ===
 
 test_verify_one_file! {
     #[test] test_multiple_requires_ensures verus_code! {
-        #[verifier::tactic]
         proof fn bounds(x: int, y: int)
-            requires
-                x > 0,
-                y > 0,
-            ensures
-                x + y > 0,
-                x + y > 1,
-        {
-            constructor();
-            omega();
-            omega();
+            requires x > 0, y > 0
+            ensures x + y > 0, x + y > 1
+        by {
+            omega
         }
     } => Ok(())
 }
@@ -74,12 +63,11 @@ test_verify_one_file! {
 
 test_verify_one_file! {
     #[test] test_implies verus_code! {
-        #[verifier::tactic]
         proof fn pos_add(x: int)
             requires x > 0
             ensures x + 1 > 1
-        {
-            omega();
+        by {
+            omega
         }
     } => Ok(())
 }
@@ -92,46 +80,12 @@ test_verify_one_file! {
             if x >= 0 { x } else { -x }
         }
 
-        #[verifier::tactic]
         proof fn abs_nonneg(x: int)
             ensures abs(x) >= 0
-        {
-            unfold(abs);
-            omega();
+        by {
+            unfold abs; omega
         }
     } => Ok(())
-}
-
-// === by { } syntax (DESIGN.md canonical form) ===
-
-test_verify_one_file! {
-    #[test] test_by_syntax verus_code! {
-        spec fn double(x: nat) -> nat {
-            x + x
-        }
-
-        proof fn lemma_double_by(x: nat)
-            requires x > 0
-            ensures double(x) > x
-        by {
-            unfold(double);
-            omega();
-        }
-    } => Ok(())
-}
-
-// === by { } syntax with wrong proof (rejected) ===
-
-test_verify_one_file! {
-    #[test] test_by_syntax_rejected verus_code! {
-        proof fn wrong_by(x: nat)
-            ensures x + 1 == x
-        by {
-            omega();
-        }
-    } => Err(err) => {
-        assert!(err.errors.len() >= 1, "Expected Lean to reject wrong proof");
-    }
 }
 
 // === Recursive spec fn with termination_by ===
@@ -144,12 +98,10 @@ test_verify_one_file! {
             if n == 0 { 0 } else { (n + triangle((n - 1) as nat)) as nat }
         }
 
-        #[verifier::tactic]
         proof fn triangle_zero()
             ensures triangle(0) == 0
-        {
-            unfold(triangle);
-            simp();
+        by {
+            unfold triangle; simp
         }
     } => Ok(())
 }

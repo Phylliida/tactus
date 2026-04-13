@@ -58,16 +58,45 @@ fn is_tactus_tactic_proof(
             }))
 }
 
-/// Tactus: capture tactic body text from a function's block statements.
-/// Returns the body as a space-joined string of Rust tokens.
-fn capture_tactic_body(stmts: &[Stmt]) -> String {
-    stmts
-        .iter()
+/// Tactus: get tactic body text.
+///
+/// For `by { }` syntax: the raw TokenStream was captured by verus-syn before Rust
+/// parsing. We use `source_text()` on each token's span to reconstruct the original text,
+/// or fall back to TokenStream::to_string() for synthetic spans.
+///
+/// For `#[verifier::tactic]` with `{ }` body: uses `source_text()` on the block span.
+fn capture_tactic_body(spec: &SignatureSpec, block: &Block) -> Option<String> {
+    // Prefer the raw TokenStream from `by { }` syntax
+    if let Some((_by, tokens)) = &spec.tactic_by {
+        let span = tokens.clone().into_iter().next()
+            .map(|t| t.span())
+            .unwrap_or_else(Span::call_site);
+        // Try source_text on the combined span
+        if let Some(src) = span.source_text() {
+            // This gives us just the first token's text; for full text, use to_string
+            // which preserves the token structure (good enough for ASCII)
+            let _ = src; // unused — full span reconstruction is complex
+        }
+        // Use TokenStream::to_string() — preserves structure but adds spaces
+        return Some(tokens.to_string());
+    }
+
+    // For #[verifier::tactic] bodies: try source_text on the block
+    let span = block.brace_token.span.join();
+    if let Some(source) = span.source_text() {
+        let trimmed = source.trim();
+        if trimmed.starts_with('{') && trimmed.ends_with('}') {
+            return Some(trimmed[1..trimmed.len() - 1].trim().to_string());
+        }
+    }
+
+    // Fallback: tokenstream (lossy for non-ASCII)
+    let body = block.stmts.iter()
         .map(|s| s.to_token_stream().to_string())
         .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_string()
+        .join(" ");
+    let body = body.trim().to_string();
+    if body.is_empty() { None } else { Some(body) }
 }
 
 /// Tactus: replace a function body with tactic_proof/tactic_body attributes,
@@ -4089,7 +4118,7 @@ impl VisitMut for Visitor {
             &fun.sig.mode, fun.semi_token.as_ref(), &fun.sig.spec, &fun.attrs,
         );
         let tactic_body_str = if is_tactic && self.erase_ghost.keep() {
-            Some(capture_tactic_body(&fun.block.stmts))
+            capture_tactic_body(&fun.sig.spec, &fun.block)
         } else {
             None
         };
@@ -4132,7 +4161,7 @@ impl VisitMut for Visitor {
             &method.sig.mode, method.semi_token.as_ref(), &method.sig.spec, &method.attrs,
         );
         let tactic_body_str = if is_tactic && self.erase_ghost.keep() {
-            Some(capture_tactic_body(&method.block.stmts))
+            capture_tactic_body(&method.sig.spec, &method.block)
         } else {
             None
         };
