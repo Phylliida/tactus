@@ -1578,14 +1578,74 @@ impl Verifier {
 
                         // Tactus: route tactic proof fns to Lean instead of Z3
                         if function.x.attrs.tactic_proof {
-                            // TODO: Call lean_verify here
-                            // For now, skip verification (treat as verified)
-                            // This will be replaced with actual Lean invocation
-                            self.count_verified += 1;
-                            eprintln!(
-                                "tactus: skipping tactic proof fn {} (Lean backend not yet wired)",
-                                vir::ast_util::fun_as_friendly_rust_name(&function.x.name)
+                            let fn_name = vir::ast_util::fun_as_friendly_rust_name(&function.x.name);
+
+                            // Get tactic body text from attribute
+                            let tactic_body = match &function.x.attrs.tactic_body {
+                                Some(body) => body.clone(),
+                                None => {
+                                    self.count_errors += 1;
+                                    eprintln!(
+                                        "error: tactic proof fn {} has no tactic body",
+                                        fn_name
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            // Look up the VIR function from the VIR krate
+                            let vir_krate = self.vir_crate.as_ref().expect("vir_crate should be initialized");
+                            let vir_fn = vir_krate.functions.iter()
+                                .find(|f| f.x.name == function.x.name);
+                            let vir_fn = match vir_fn {
+                                Some(f) => f,
+                                None => {
+                                    self.count_errors += 1;
+                                    eprintln!(
+                                        "error: could not find VIR function for tactic proof fn {}",
+                                        fn_name
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            // Collect spec fns from the VIR krate
+                            let spec_fns: Vec<&vir::ast::FunctionX> = vir_krate.functions.iter()
+                                .filter(|f| matches!(f.x.mode, vir::ast::Mode::Spec) && f.x.body.is_some())
+                                .map(|f| &f.x)
+                                .collect();
+
+                            // Generate Lean file and invoke Lean
+                            let lean_source = lean_verify::to_lean_fn::generate_lean_file(
+                                &spec_fns,
+                                &[(&vir_fn.x, tactic_body.as_str())],
+                                &[],
                             );
+
+                            match lean_verify::lean_process::check_lean_stdin(&lean_source) {
+                                Ok(result) => {
+                                    if result.success {
+                                        self.count_verified += 1;
+                                    } else {
+                                        self.count_errors += 1;
+                                        eprintln!("error: Lean verification failed for {}", fn_name);
+                                        for diag in &result.diagnostics {
+                                            if diag.severity == "error" {
+                                                eprintln!("  [lean error] {}", diag.data);
+                                            }
+                                        }
+                                        // Print generated Lean for debugging
+                                        eprintln!("  generated Lean:\n{}", lean_source);
+                                    }
+                                }
+                                Err(e) => {
+                                    self.count_errors += 1;
+                                    eprintln!(
+                                        "error: failed to invoke Lean for {}: {}",
+                                        fn_name, e
+                                    );
+                                }
+                            }
                             continue;
                         }
 
