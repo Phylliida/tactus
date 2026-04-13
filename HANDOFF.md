@@ -23,11 +23,15 @@ verus! {
 }
 ```
 
-And Tactus generates Lean, invokes `lean --stdin --json`, and reports the result through the standard Verus verification pipeline. Wrong proofs are correctly rejected with Lean's goal state shown in the error.
+And Tactus generates Lean, invokes Lean (via `lake env lean` or bare `lean`), and reports the result through the standard Verus verification pipeline. Wrong proofs are correctly rejected with Lean's goal state shown in the error.
+
+**Track A milestone met:** `ring`, `omega`, and `nlinarith` verify end-to-end through Mathlib.
 
 ### What works today
 
 - **`by { }` syntax**: verus-syn parser captures tactic block content as raw `TokenStream` before Rust parsing, preserving verbatim Lean syntax
+- **`import` keyword**: `import Mathlib.Tactic.Ring` at the top of `verus!` blocks, threaded through proc macro → VIR → generated Lean
+- **Mathlib support**: Lake project at `~/.tactus/lean-project/` with precompiled Mathlib oleans, `ring`/`nlinarith`/`linarith` all work
 - **Spec fn → Lean**: `spec fn` → `@[irreducible] noncomputable def`, `open spec fn` → `noncomputable def`
 - **Proof fn → Lean**: `proof fn ... by { tactics }` → `theorem ... := by tactics`
 - **Requires/ensures**: each `requires` → hypothesis `(hᵢ : clause)`, multiple `ensures` → conjunction with `∧`
@@ -35,19 +39,20 @@ And Tactus generates Lean, invokes `lean --stdin --json`, and reports the result
 - **Dependency ordering**: Tarjan's SCC detects mutual recursion, topological sort ensures callees before callers, only transitively referenced spec fns are included
 - **Mutual recursion**: mutually recursive spec fns wrapped in Lean `mutual ... end`
 - **Namespacing**: generated Lean uses VIR `owning_module` path as `namespace`
+- **Source map**: Lean errors include tactic line numbers within the `by { }` block
 - **Error reporting**: Lean errors go through Verus's diagnostic system with source spans
 - **Expression translation**: constants, variables, binary ops, unary ops, if/else, function calls, quantifiers, choose, extensional equality, ReadPlace, Field, Clip, CoerceMode, Trigger (dropped), Ghost/ProofInSpec (transparent)
 - **Full vstd build**: `vargo build --release` → 1530 verified, 0 errors
-- **10 end-to-end tests**: basic omega, wrong proof rejected, add_comm, multiple requires/ensures, implies, if-then-else spec fn, recursive spec fn, dependency ordering, mutual recursion, filtering
+- **14 end-to-end tests**: basic omega, wrong proof rejected, add_comm, multiple requires/ensures, implies, if-then-else spec fn, recursive spec fn, dependency ordering, mutual recursion, filtering, imports, Mathlib ring, Mathlib nlinarith, error reporting
 
 ### Test summary
 
 ```bash
-# lean_verify unit + integration tests (13 tests, needs Lean 4):
+# lean_verify unit + integration tests (needs Lean 4):
 cargo test -p lean_verify
 
-# End-to-end tests through full Verus pipeline (10 tests, needs Lean 4):
-# Must use tactus's own vargo:
+# End-to-end tests through full Verus pipeline (14 tests):
+# Core tests (10) need Lean 4. Mathlib tests (2) need Lake project with Mathlib.
 PATH="tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Full build (1530 vstd fns verified):
@@ -66,14 +71,15 @@ tactus/
       item.rs                  ← MODIFIED: empty body when tactic_by consumed the block
       gen/clone.rs             ← MODIFIED: clone for tactic_by tuple
   source/
-    lean_verify/               ← Lean generation + invocation (828 lines)
+    lean_verify/               ← Lean generation + invocation
       TactusPrelude.lean       ← Lean prelude (real .lean file)
       src/
-        dep_order.rs           ← dependency analysis: filtering, topo sort, Tarjan's SCC (164 lines)
-        to_lean_type.rs        ← vir::ast::TypX → Lean type syntax (90 lines)
-        to_lean_expr.rs        ← vir::ast::ExprX → Lean expr syntax (277 lines)
-        to_lean_fn.rs          ← FunctionX → noncomputable def / theorem + mutual blocks (169 lines)
-        lean_process.rs        ← invoke `lean --stdin --json`, parse JSON diagnostics (116 lines)
+        dep_order.rs           ← dependency analysis: filtering, topo sort, Tarjan's SCC
+        to_lean_type.rs        ← vir::ast::TypX → Lean type syntax
+        to_lean_expr.rs        ← vir::ast::ExprX → Lean expr syntax
+        to_lean_fn.rs          ← FunctionX → noncomputable def / theorem + source map
+        lean_process.rs        ← invoke lean (bare or via lake env lean), parse JSON diagnostics
+        project.rs             ← manage ~/.tactus/lean-project/ (Lake + Mathlib)
         prelude.rs             ← include_str! of TactusPrelude.lean
         lib.rs
       tests/
@@ -118,10 +124,11 @@ VIR construction (rust_to_vir_func.rs):
 Verifier (verifier.rs):
   if let Some(tactic_body) = &function.x.attrs.tactic_body
   → Looks up VIR function from self.vir_crate
-  → Collects all VIR functions, passes to generate_lean_file
+  → Collects all VIR functions + lean_imports, passes to generate_lean_file
   → dep_order filters to referenced spec fns, topologically sorts
-  → Generates Lean with namespace, mutual blocks
-  → Invokes lean --stdin --json
+  → Generates Lean with imports, namespace, mutual blocks, returns source map
+  → Invokes lean via lake env lean (if project exists) or bare lean --stdin --json
+  → Uses source map to report tactic line numbers in errors
   → Reports success/failure through Verus diagnostics
 ```
 
@@ -131,26 +138,19 @@ Verifier (verifier.rs):
 2. **Verbatim capture** — verus-syn captures `by { }` content as raw `TokenStream` before Rust statement parsing. No string rewriting needed.
 3. **VIR's expr_visitor_walk** — dependency analysis reuses VIR's built-in expression walker instead of hand-rolling one. Only the Fun-reference-collecting callback is custom.
 4. **lean_verify depends on VIR directly** — no intermediate IR. Translators operate on VIR's `TypX`, `ExprX`, `FunctionX`.
+5. **Per-function imports** — `import` statements parsed from `verus!` blocks are attached to each tactic proof fn as `lean_import` attributes. Simple and correct since each proof fn generates its own .lean file.
+6. **Lake project fallback** — verifier checks for `~/.tactus/lean-project/`. If present, uses `lake env lean` (Mathlib available). Otherwise falls back to bare `lean --stdin` (core tactics only).
 
 ## What needs to be done next
 
-### Track A completion: Source map + error mapping
+### Track A: COMPLETE
 
-The one remaining Track A item. Currently, Lean errors show the proof fn's source span but don't pinpoint which tactic line failed. Need to map Lean's line/column positions in the generated `.lean` back to the user's `.rs` source positions.
+Track A is done. `ring`, `omega`, `nlinarith` verify end-to-end through Lean/Mathlib. Source map provides tactic line numbers in errors. Import keyword enables Mathlib. Lake project manages Mathlib oleans.
 
-Design from DESIGN.md:
-```
-$ tactus check src/quad_ext.rs
-
-error: unsolved goal
-  --> src/quad_ext.rs:42:1 (norm_nonneg)
-
-  re im d : Int
-  h₀ : d ≤ 0
-  ⊢ re * re - d * (im * im) ≥ 0
-
-  try: nlinarith [sq_nonneg re, sq_nonneg im]
-```
+**Remaining Track A polish** (not blocking):
+- Tree-sitter Unicode extraction (current TokenStream approach works for ASCII tactics; Unicode like `⟨a, b⟩` needs tree-sitter-tactus integration)
+- `mutual ... end mutual` user syntax (currently auto-detected by Tarjan's SCC, which works but DESIGN.md prefers explicit declaration)
+- Per-module Lean generation (currently one .lean file per proof fn invocation)
 
 ### Track B: Exec fn VC generation (`sst_to_lean`)
 
@@ -235,28 +235,74 @@ Currently the prelude is minimal (just `set_option`). Programs using vstd types 
 | `BitNot/IntToReal/RealToInt` | specialized arithmetic |
 | `NullaryOpr/Multi` | misc |
 
-## How to build and test
+## How to set up, build, and test
+
+### Prerequisites
+
+1. **Lean 4** — install via [elan](https://github.com/leanprover/elan): `curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh`
+2. **Rust nightly** — Verus requires nightly Rust (the fork pins a specific version)
+
+### First-time setup
+
+```bash
+cd tactus
+
+# 1. Build vargo (tactus's custom cargo wrapper)
+cd tools/vargo && cargo build --release && cd ../../source
+
+# 2. Build tactus + vstd
+PATH="../tools/vargo/target/release:$PATH" vargo build --release
+# Expected: "1530 verified, 0 errors"
+
+# 3. (Optional) Set up Mathlib for ring/nlinarith/linarith
+#    Creates ~/.tactus/lean-project/ with precompiled Mathlib oleans (~2 GB download)
+mkdir -p ~/.tactus/lean-project && cd ~/.tactus/lean-project
+lean --version | sed 's/.*version \([^,]*\).*/leanprover\/lean4:v\1/' > lean-toolchain
+cat > lakefile.lean << 'EOF'
+import Lake
+open Lake DSL
+package «tactus-project» where
+  leanOptions := #[⟨`autoImplicit, false⟩]
+require mathlib from git
+  "https://github.com/leanprover-community/mathlib4" @ "v4.25.0"
+@[default_target]
+lean_lib TactusPrelude where
+  srcDir := "."
+EOF
+cp /path/to/tactus/source/lean_verify/TactusPrelude.lean .
+lake update && lake exe cache get && lake build
+cd /path/to/tactus/source
+```
+
+### Running tests
 
 ```bash
 cd tactus/source
 
-# First time: build vargo from tactus's tools
-cd ../tools/vargo && cargo build --release && cd ../../source
-
-# Build everything including vstd:
-PATH="../tools/vargo/target/release:$PATH" vargo build --release
-
-# Run lean_verify unit tests (no special toolchain needed):
+# lean_verify unit tests (needs Lean 4):
 cargo test -p lean_verify
 
-# Run end-to-end tests (needs Lean 4 on PATH):
+# End-to-end tests (14 tests):
+# - 10 core tests need Lean 4
+# - 2 Mathlib tests need Lake project with Mathlib (step 3 above)
+# - 2 error/import tests need Lean 4
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
-# Build lean_verify only (no RUSTC_BOOTSTRAP needed):
-cargo build -p lean_verify
+# Full vstd build (1530 fns verified):
+PATH="../tools/vargo/target/release:$PATH" vargo build --release
+```
 
-# Build rust_verify only:
-RUSTC_BOOTSTRAP=1 cargo build -p rust_verify
+### Quick check during development
+
+```bash
+# Check lean_verify compiles (fast, no RUSTC_BOOTSTRAP needed):
+cargo check -p lean_verify
+
+# Check everything compiles:
+RUSTC_BOOTSTRAP=1 cargo check -p rust_verify
+
+# Run a single test:
+PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus -- test_mathlib_ring
 ```
 
 ## Lessons learned this session
@@ -274,6 +320,12 @@ RUSTC_BOOTSTRAP=1 cargo build -p rust_verify
 6. **Reuse VIR infrastructure** — `expr_visitor_walk` already handles all ExprX variants correctly. Hand-rolling a walker is 150 lines of code that will miss future variants. Making one function `pub` saved ~200 lines.
 
 7. **Single field > boolean + option** — `tactic_proof: bool` + `tactic_body: Option<String>` always move together. Collapsing to just `tactic_body: Option<String>` (presence = tactic proof) removed code across 5 files.
+
+8. **Lean imports must come before set_option** — in generated .lean files, `import` statements must precede any `set_option` commands. The prelude (which contains `set_option`) must come after imports.
+
+9. **Name collisions with Mathlib** — Lean theorem names in the generated file can collide with Mathlib names (e.g., `sq_nonneg`). Namespacing helps, but users should be aware when testing without namespaces.
+
+10. **Lake project fallback is clean** — checking `project_ready()` (lakefile.lean + .lake/ exist) and branching to `lake env lean` vs bare `lean` adds ~5 lines to the verifier. No config flags needed.
 
 ## Git log
 
@@ -306,17 +358,19 @@ bb18bff DESIGN.md: comprehensive design after 4 critique rounds
 
 | File | What it does |
 |------|-------------|
-| `lean_verify/src/to_lean_fn.rs` | Core: generates .lean files from VIR FunctionX, handles mutual blocks |
+| `lean_verify/src/to_lean_fn.rs` | Core: generates .lean files from VIR FunctionX, source map, mutual blocks |
 | `lean_verify/src/to_lean_expr.rs` | VIR ExprX → Lean expression text (precedence-based parens) |
 | `lean_verify/src/to_lean_type.rs` | VIR TypX → Lean type text |
 | `lean_verify/src/dep_order.rs` | Dependency filtering, topological sort, Tarjan's SCC |
-| `lean_verify/src/lean_process.rs` | Invokes `lean --stdin --json`, parses JSON diagnostics |
+| `lean_verify/src/lean_process.rs` | Invokes lean (bare or via lake), parses JSON diagnostics |
+| `lean_verify/src/project.rs` | Manages ~/.tactus/lean-project/ Lake project for Mathlib |
 | `lean_verify/TactusPrelude.lean` | Lean prelude (set_option only for now, will grow) |
 | `dependencies/syn/src/verus.rs` | Where `by { }` is parsed (tactic_by on SignatureSpec) |
 | `dependencies/syn/src/item.rs` | Where empty body is provided when tactic_by consumed the block |
 | `builtin_macros/src/syntax.rs:~45` | Tactus helper fns: is_tactus_tactic_proof, get_tactic_body, apply_tactic_attrs |
+| `builtin_macros/src/syntax.rs:~4473` | Items struct with import parsing + import attr attachment |
 | `builtin_macros/src/syntax.rs:~4090` | Where tactic fns are detected + tactic body captured |
-| `rust_verify/src/attributes.rs` | Where `tactic_body` attr is parsed (Internal prefix) |
-| `rust_verify/src/verifier.rs:~1580` | Where tactic fns are routed to Lean |
-| `vir/src/ast.rs:~1498` | `FunctionAttrsX.tactic_body: Option<String>` |
-| `DESIGN.md` | Full design: architecture, decisions, rationale |
+| `rust_verify/src/attributes.rs` | Where `tactic_body` + `lean_import` attrs are parsed |
+| `rust_verify/src/verifier.rs:~1580` | Where tactic fns are routed to Lean (with Lake fallback) |
+| `vir/src/ast.rs:~1498` | `FunctionAttrsX.tactic_body` + `lean_imports` |
+| `DESIGN.md` | Full design: architecture, decisions, setup, rationale |

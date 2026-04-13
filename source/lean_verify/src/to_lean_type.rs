@@ -1,7 +1,6 @@
 //! Translate VIR types to Lean 4 type syntax.
 
-use std::sync::Arc;
-use vir::ast::{Dt, IntRange, TypX};
+use vir::ast::{Dt, IntRange, Path, TypX};
 
 /// Write a VIR type as Lean 4 syntax.
 pub fn write_typ(out: &mut String, typ: &TypX) {
@@ -15,7 +14,7 @@ pub fn write_typ(out: &mut String, typ: &TypX) {
         TypX::Boxed(inner) => write_typ(out, inner),
         TypX::Datatype(dt, args, _) => {
             match dt {
-                Dt::Path(path) => write_path_last(out, &path.segments),
+                Dt::Path(path) => out.push_str(short_name(path)),
                 Dt::Tuple(n) => { out.push_str("Tuple"); out.push_str(&n.to_string()); }
             }
             for arg in args.iter() {
@@ -33,13 +32,44 @@ pub fn write_typ(out: &mut String, typ: &TypX) {
             }
             write_typ(out, ret);
         }
+        // Decorations (references, etc.) are transparent in spec mode
+        TypX::Decorate(_, _, inner) => write_typ(out, inner),
+        // Projection: <T as Trait>::Assoc — just emit the name
+        TypX::Projection { name, .. } => out.push_str(name),
         _ => write_todo(out, "type"),
     }
 }
 
-/// Write the last segment of a path.
-pub(crate) fn write_path_last(out: &mut String, segments: &[Arc<String>]) {
-    out.push_str(segments.last().map(|s| s.as_str()).unwrap_or("_"));
+/// Get the short name (last path segment) from a VIR path.
+pub(crate) fn short_name(path: &Path) -> &str {
+    path.segments.last().map(|s| s.as_str()).unwrap_or("_")
+}
+
+/// Write items separated by a delimiter.
+pub(crate) fn write_sep<T>(
+    out: &mut String, items: &[T], sep: &str, f: impl Fn(&mut String, &T),
+) {
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 { out.push_str(sep); }
+        f(out, item);
+    }
+}
+
+/// Walk a TypX recursively, calling `visit` at each node.
+/// Preserves the input lifetime `'a` so callers can borrow from the AST.
+pub(crate) fn walk_typ<'a>(typ: &'a TypX, visit: &mut impl FnMut(&'a TypX)) {
+    visit(typ);
+    match typ {
+        TypX::Datatype(_, args, _) => {
+            for arg in args.iter() { walk_typ(arg, visit); }
+        }
+        TypX::Boxed(inner) | TypX::Decorate(_, _, inner) => walk_typ(inner, visit),
+        TypX::SpecFn(params, ret) => {
+            for p in params.iter() { walk_typ(p, visit); }
+            walk_typ(ret, visit);
+        }
+        _ => {}
+    }
 }
 
 /// Write a `sorry` placeholder with a TODO comment.
@@ -59,6 +89,7 @@ pub fn typ_to_lean(typ: &TypX) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_basic_types() {

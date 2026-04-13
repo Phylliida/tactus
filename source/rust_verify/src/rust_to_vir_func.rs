@@ -260,6 +260,7 @@ fn handle_autospec<'tcx>(
                     tracked_swap: false,
                     tracked_take_option: false,
                     tactic_body: None,
+                    lean_imports: Vec::new(),
                 }),
                 body: Some(ret_clause.clone()),
                 extra_dependencies: functionx.extra_dependencies.clone(),
@@ -1319,6 +1320,7 @@ fn make_attributes<'tcx>(
         tracked_swap: vattrs.tracked_swap,
         tracked_take_option: vattrs.tracked_take_option,
         tactic_body: vattrs.tactic_body.clone(),
+        lean_imports: vattrs.lean_imports.clone(),
     };
     Ok(Arc::new(fattrs))
 }

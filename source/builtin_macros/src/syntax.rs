@@ -4471,16 +4471,43 @@ impl VisitMut for Visitor {
 }
 
 struct Items {
+    /// Tactus: `import Foo.Bar` declarations at the top of a verus! block.
+    imports: Vec<String>,
     items: Vec<Item>,
 }
 
 impl Parse for Items {
     fn parse(input: ParseStream) -> verus_syn::parse::Result<Items> {
+        let mut imports = Vec::new();
         let mut items = Vec::new();
+
+        // Tactus: parse `import Dotted.Path` at top before items
+        while !input.is_empty() {
+            let fork = input.fork();
+            if let Ok(ident) = fork.parse::<Ident>() {
+                if ident == "import" {
+                    // Consume "import" from real stream
+                    let _: Ident = input.parse()?;
+                    // Parse dotted path: Ident(.Ident)*
+                    let first: Ident = input.parse()?;
+                    let mut path = first.to_string();
+                    while input.peek(Token![.]) {
+                        let _: Token![.] = input.parse()?;
+                        let seg: Ident = input.parse()?;
+                        path.push('.');
+                        path.push_str(&seg.to_string());
+                    }
+                    imports.push(path);
+                    continue;
+                }
+            }
+            break;
+        }
+
         while !input.is_empty() {
             items.push(input.parse()?);
         }
-        Ok(Items { items })
+        Ok(Items { imports, items })
     }
 }
 
@@ -4770,6 +4797,23 @@ pub(crate) fn rewrite_items(
         visitor.inside_arith = InsideArith::None;
     }
     visitor.visit_items_post(&mut items.items);
+
+    // Tactus: attach imports to tactic proof fns.
+    // tactic_by survives the visitor (only erase_spec_fields clears it,
+    // which is only called for trait methods in syntax_trait.rs).
+    if !items.imports.is_empty() {
+        for item in &mut items.items {
+            if let Item::Fn(f) = item {
+                if f.sig.spec.tactic_by.is_some() {
+                    let span = f.sig.fn_token.span;
+                    for imp in &items.imports {
+                        f.attrs.push(mk_verus_attr(span, quote! { lean_import(#imp) }));
+                    }
+                }
+            }
+        }
+    }
+
     for item in items.items {
         item.to_tokens(&mut new_stream);
     }

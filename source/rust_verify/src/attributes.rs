@@ -362,6 +362,8 @@ pub(crate) enum Attr {
     TrackedTakeOption,
     // Tactus: proof fn body is a Lean tactic block, with verbatim tactic text
     TacticBody(String),
+    // Tactus: Lean import path (e.g., "Mathlib.Tactic.Ring")
+    LeanImport(String),
 }
 
 fn get_trigger_arg(span: Span, attr_tree: &AttrTree) -> Result<u64, VirErr> {
@@ -853,6 +855,12 @@ pub(crate) fn parse_attrs(
                     {
                         v.push(Attr::TacticBody(body.clone()));
                     }
+                    // Tactus: Lean import path
+                    AttrTree::Fun(_, arg, Some(box [AttrTree::Lit(LitKind::Str, path)]))
+                        if arg == "lean_import" =>
+                    {
+                        v.push(Attr::LeanImport(path.clone()));
+                    }
                     _ => {
                         return err_span(span, "unrecognized internal attribute");
                     }
@@ -1149,6 +1157,8 @@ pub(crate) struct VerifierAttrs {
     pub(crate) tracked_take_option: bool,
     // Tactus: if Some, proof fn uses Lean tactics (verbatim body from `by { }`)
     pub(crate) tactic_body: Option<String>,
+    // Tactus: Lean import paths for this proof fn
+    pub(crate) lean_imports: Vec<String>,
 }
 
 // Check for the `get_field_many_variants` attribute
@@ -1325,6 +1335,7 @@ pub(crate) fn get_verifier_attrs_maybe_check(
         tracked_swap: false,
         tracked_take_option: false,
         tactic_body: None,
+        lean_imports: Vec::new(),
     };
     let mut unsupported_rustc_attr: Option<(String, Span)> = None;
     for attr in parse_attrs(attrs, diagnostics)? {
@@ -1410,6 +1421,7 @@ pub(crate) fn get_verifier_attrs_maybe_check(
             Attr::TrackedSwap => vs.tracked_swap = true,
             Attr::TrackedTakeOption => vs.tracked_take_option = true,
             Attr::TacticBody(body) => vs.tactic_body = Some(body.clone()),
+            Attr::LeanImport(path) => vs.lean_imports.push(path.clone()),
             _ => {}
         }
     }
