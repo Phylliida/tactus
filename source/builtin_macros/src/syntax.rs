@@ -42,73 +42,28 @@ use verus_syn::{
 
 pub(crate) const VERUS_SPEC: &str = "VERUS_SPEC__";
 
-/// Tactus: check if a proof fn should use Lean tactic verification.
-/// Returns true if it uses `by { }` syntax or has `#[verifier::tactic]`.
-fn is_tactus_tactic_proof(
-    mode: &FnMode,
-    semi_token: Option<&Token![;]>,
-    spec: &SignatureSpec,
-    attrs: &[Attribute],
-) -> bool {
-    matches!(mode, FnMode::Proof(_))
-        && semi_token.is_none()
-        && (spec.tactic_by.is_some()
-            || attrs.iter().any(|a| {
-                a.meta.path().segments.iter().any(|seg| seg.ident == "tactic")
-            }))
+/// Tactus: check if a proof fn uses `by { }` tactic syntax.
+fn is_tactus_tactic_proof(mode: &FnMode, spec: &SignatureSpec) -> bool {
+    matches!(mode, FnMode::Proof(_)) && spec.tactic_by.is_some()
 }
 
-/// Tactus: get tactic body text.
-///
-/// For `by { }` syntax: the raw TokenStream was captured by verus-syn before Rust
-/// parsing. We use `source_text()` on each token's span to reconstruct the original text,
-/// or fall back to TokenStream::to_string() for synthetic spans.
-///
-/// For `#[verifier::tactic]` with `{ }` body: uses `source_text()` on the block span.
-fn capture_tactic_body(spec: &SignatureSpec, block: &Block) -> Option<String> {
-    // Prefer the raw TokenStream from `by { }` syntax
-    if let Some((_by, tokens)) = &spec.tactic_by {
-        let span = tokens.clone().into_iter().next()
-            .map(|t| t.span())
-            .unwrap_or_else(Span::call_site);
-        // Try source_text on the combined span
-        if let Some(src) = span.source_text() {
-            // This gives us just the first token's text; for full text, use to_string
-            // which preserves the token structure (good enough for ASCII)
-            let _ = src; // unused — full span reconstruction is complex
-        }
-        // Use TokenStream::to_string() — preserves structure but adds spaces
-        return Some(tokens.to_string());
-    }
-
-    // For #[verifier::tactic] bodies: try source_text on the block
-    let span = block.brace_token.span.join();
-    if let Some(source) = span.source_text() {
-        let trimmed = source.trim();
-        if trimmed.starts_with('{') && trimmed.ends_with('}') {
-            return Some(trimmed[1..trimmed.len() - 1].trim().to_string());
-        }
-    }
-
-    // Fallback: tokenstream (lossy for non-ASCII)
-    let body = block.stmts.iter()
-        .map(|s| s.to_token_stream().to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let body = body.trim().to_string();
-    if body.is_empty() { None } else { Some(body) }
+/// Tactus: get the tactic body text from the `by { }` block.
+/// The raw TokenStream was captured by verus-syn before Rust parsing,
+/// so the text is verbatim Lean tactic syntax.
+fn get_tactic_body(spec: &SignatureSpec) -> Option<String> {
+    let (_by, tokens) = spec.tactic_by.as_ref()?;
+    Some(tokens.to_string())
 }
 
-/// Tactus: replace a function body with tactic_proof/tactic_body attributes,
-/// keeping only the first `num_spec_stmts` (requires/ensures stmts from visit_fn).
-fn apply_tactic_replacement(
+/// Tactus: emit tactic_body attribute and clear the function body,
+/// keeping only the first `num_spec_stmts` (requires/ensures from visit_fn).
+fn apply_tactic_attrs(
     attrs: &mut Vec<Attribute>,
     block: &mut Block,
     body_str: &str,
     num_spec_stmts: usize,
 ) {
     let span = block.brace_token.span.join();
-    attrs.push(mk_verus_attr(span, quote! { tactic_proof }));
     attrs.push(mk_verus_attr(span, quote! { tactic_body(#body_str) }));
     block.stmts.truncate(num_spec_stmts);
 }
@@ -4114,11 +4069,9 @@ impl VisitMut for Visitor {
         }
 
         // Tactus: detect + capture tactic body before any transformation
-        let is_tactic = is_tactus_tactic_proof(
-            &fun.sig.mode, fun.semi_token.as_ref(), &fun.sig.spec, &fun.attrs,
-        );
+        let is_tactic = is_tactus_tactic_proof(&fun.sig.mode, &fun.sig.spec);
         let tactic_body_str = if is_tactic && self.erase_ghost.keep() {
-            capture_tactic_body(&fun.sig.spec, &fun.block)
+            get_tactic_body(&fun.sig.spec)
         } else {
             None
         };
@@ -4147,7 +4100,7 @@ impl VisitMut for Visitor {
 
         // Tactus: replace tactic body, keeping spec stmts
         if let Some(body_str) = tactic_body_str {
-            apply_tactic_replacement(&mut fun.attrs, &mut fun.block, &body_str, num_spec_stmts);
+            apply_tactic_attrs(&mut fun.attrs, &mut fun.block, &body_str, num_spec_stmts);
         }
     }
 
@@ -4157,11 +4110,9 @@ impl VisitMut for Visitor {
         }
 
         // Tactus: detect + capture tactic body before any transformation
-        let is_tactic = is_tactus_tactic_proof(
-            &method.sig.mode, method.semi_token.as_ref(), &method.sig.spec, &method.attrs,
-        );
+        let is_tactic = is_tactus_tactic_proof(&method.sig.mode, &method.sig.spec);
         let tactic_body_str = if is_tactic && self.erase_ghost.keep() {
-            capture_tactic_body(&method.sig.spec, &method.block)
+            get_tactic_body(&method.sig.spec)
         } else {
             None
         };
@@ -4190,7 +4141,7 @@ impl VisitMut for Visitor {
 
         // Tactus: replace tactic body, keeping spec stmts
         if let Some(body_str) = tactic_body_str {
-            apply_tactic_replacement(&mut method.attrs, &mut method.block, &body_str, num_spec_stmts);
+            apply_tactic_attrs(&mut method.attrs, &mut method.block, &body_str, num_spec_stmts);
         }
     }
 
