@@ -1,10 +1,9 @@
 //! Translate VIR expressions to Lean 4 expression syntax.
 
-use std::fmt::Write;
 use vir::ast::*;
-use crate::to_lean_type::write_typ;
+use crate::to_lean_type::{write_typ, write_todo};
 
-/// Lean operator precedence levels (higher = tighter binding).
+// Lean operator precedence (higher = tighter binding).
 const PREC_IMPLIES: u8 = 25;
 const PREC_OR: u8 = 30;
 const PREC_AND: u8 = 35;
@@ -18,8 +17,7 @@ fn binop_prec(op: &BinaryOp) -> u8 {
         BinaryOp::Implies => PREC_IMPLIES,
         BinaryOp::Or => PREC_OR,
         BinaryOp::And => PREC_AND,
-        BinaryOp::Eq(_) | BinaryOp::Ne => PREC_CMP,
-        BinaryOp::Inequality(_) => PREC_CMP,
+        BinaryOp::Eq(_) | BinaryOp::Ne | BinaryOp::Inequality(_) => PREC_CMP,
         BinaryOp::Arith(ArithOp::Add(_) | ArithOp::Sub(_)) => PREC_ADD,
         BinaryOp::Arith(ArithOp::Mul(_) | ArithOp::EuclideanDiv(_) | ArithOp::EuclideanMod(_)) => PREC_MUL,
         _ => PREC_CMP,
@@ -28,8 +26,7 @@ fn binop_prec(op: &BinaryOp) -> u8 {
 
 fn expr_prec(expr: &ExprX) -> u8 {
     match expr {
-        ExprX::Const(_) | ExprX::Var(_) | ExprX::ConstVar(..) => PREC_ATOM,
-        ExprX::Call(..) => PREC_ATOM,
+        ExprX::Const(_) | ExprX::Var(_) | ExprX::ConstVar(..) | ExprX::Call(..) => PREC_ATOM,
         ExprX::Binary(op, _, _) => binop_prec(op),
         ExprX::Unary(..) => PREC_MUL + 1,
         _ => 0,
@@ -40,12 +37,8 @@ fn expr_prec(expr: &ExprX) -> u8 {
 pub fn write_expr(out: &mut String, expr: &ExprX) {
     match expr {
         ExprX::Const(c) => write_const(out, c),
-
         ExprX::Var(ident) => write_name(out, &ident.0),
-
-        ExprX::ConstVar(fun, _) => {
-            write_fn_ref(out, fun);
-        }
+        ExprX::ConstVar(fun, _) => write_fn_ref(out, fun),
 
         ExprX::Binary(op, lhs, rhs) => {
             let p = binop_prec(op);
@@ -57,24 +50,20 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
         }
 
         ExprX::BinaryOpr(BinaryOpr::ExtEq(_, _), lhs, rhs) => {
-            // ExtEq → Lean = (function extensionality is built into Lean 4)
             write_expr_prec(out, &lhs.x, PREC_CMP, true);
             out.push_str(" = ");
             write_expr_prec(out, &rhs.x, PREC_CMP, false);
         }
 
-        ExprX::Unary(op, inner) => match op {
-            UnaryOp::Not => {
-                out.push('¬');
-                write_expr_prec(out, &inner.x, PREC_ATOM, true);
-            }
-            _ => { let _ = write!(out, "sorry /- unary {:?} -/", op); }
-        },
+        ExprX::Unary(UnaryOp::Not, inner) => {
+            out.push('¬');
+            write_expr_prec(out, &inner.x, PREC_ATOM, true);
+        }
 
         ExprX::Call(target, args, _) => {
             match target {
                 CallTarget::Fun(_, fun, _, _, _, _) => write_fn_ref(out, fun),
-                _ => out.push_str("sorry /- call -/"),
+                _ => write_todo(out, "call target"),
             }
             for arg in args.iter() {
                 out.push(' ');
@@ -94,61 +83,60 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
         }
 
         ExprX::Quant(quant, binders, body) => {
-            match quant.quant {
-                air::ast::Quant::Forall => out.push_str("∀ "),
-                air::ast::Quant::Exists => out.push_str("∃ "),
-            }
-            for (i, b) in binders.iter().enumerate() {
-                if i > 0 { out.push(' '); }
-                out.push('(');
-                write_name(out, &b.name.0);
-                out.push_str(" : ");
-                write_typ(out, &b.a);
-                out.push(')');
-            }
+            out.push_str(match quant.quant {
+                air::ast::Quant::Forall => "∀ ",
+                air::ast::Quant::Exists => "∃ ",
+            });
+            write_binders(out, binders);
             out.push_str(", ");
             write_expr(out, &body.x);
         }
 
         ExprX::Choose { params, cond, body: _ } => {
             out.push_str("Classical.choose (show ∃ ");
-            for (i, b) in params.iter().enumerate() {
-                if i > 0 { out.push(' '); }
-                out.push('(');
-                write_name(out, &b.name.0);
-                out.push_str(" : ");
-                write_typ(out, &b.a);
-                out.push(')');
-            }
+            write_binders(out, params);
             out.push_str(", ");
             write_expr(out, &cond.x);
             out.push_str(" from sorry)");
         }
 
-        ExprX::WithTriggers { body, .. } => {
-            // Drop triggers — Lean doesn't use them
-            write_expr(out, &body.x);
-        }
+        ExprX::WithTriggers { body, .. } => write_expr(out, &body.x),
 
         ExprX::Block(stmts, final_expr) => {
             for stmt in stmts.iter() {
-                write_stmt(out, &stmt.x);
+                match &stmt.x {
+                    StmtX::Expr(e) => { write_expr(out, &e.x); out.push_str("; "); }
+                    StmtX::Decl { .. } => { write_todo(out, "decl"); out.push_str("; "); }
+                }
             }
             if let Some(e) = final_expr {
                 write_expr(out, &e.x);
             }
         }
 
-        _ => { let _ = write!(out, "sorry /- unhandled -/"); }
+        _ => write_todo(out, "expr"),
     }
 }
 
+/// Write expression, adding parens if needed by precedence.
 fn write_expr_prec(out: &mut String, expr: &ExprX, parent_prec: u8, is_left: bool) {
     let child_prec = expr_prec(expr);
     let needs_parens = child_prec < parent_prec || (child_prec == parent_prec && !is_left);
     if needs_parens { out.push('('); }
     write_expr(out, expr);
     if needs_parens { out.push(')'); }
+}
+
+/// Write `(name₁ : Type₁) (name₂ : Type₂) ...` binder list.
+pub(crate) fn write_binders(out: &mut String, binders: &VarBinders<Typ>) {
+    for (i, b) in binders.iter().enumerate() {
+        if i > 0 { out.push(' '); }
+        out.push('(');
+        write_name(out, &b.name.0);
+        out.push_str(" : ");
+        write_typ(out, &b.a);
+        out.push(')');
+    }
 }
 
 fn write_const(out: &mut String, c: &Constant) {
@@ -158,12 +146,12 @@ fn write_const(out: &mut String, c: &Constant) {
         Constant::Int(n) => {
             let s = n.to_string();
             if s.starts_with('-') {
-                let _ = write!(out, "({})", s);
+                out.push('('); out.push_str(&s); out.push(')');
             } else {
                 out.push_str(&s);
             }
         }
-        _ => { let _ = write!(out, "sorry /- const -/"); }
+        _ => write_todo(out, "const"),
     }
 }
 
@@ -183,34 +171,22 @@ fn write_binop(out: &mut String, op: &BinaryOp) {
         BinaryOp::Arith(ArithOp::Mul(_)) => "*",
         BinaryOp::Arith(ArithOp::EuclideanDiv(_)) => "/",
         BinaryOp::Arith(ArithOp::EuclideanMod(_)) => "%",
-        _ => "sorry /- op -/",
+        _ => "sorry /- TODO: op -/",
     });
 }
 
-fn write_stmt(out: &mut String, stmt: &StmtX) {
-    match stmt {
-        StmtX::Expr(e) => {
-            write_expr(out, &e.x);
-            out.push_str("; ");
-        }
-        StmtX::Decl { .. } => {
-            // Decl uses Place (exec-level), skip for now
-            out.push_str("sorry /- decl -/; ");
-        }
-    }
-}
-
 fn write_fn_ref(out: &mut String, fun: &Fun) {
-    let name = fun.path.segments.last().map(|s| s.as_str()).unwrap_or("?");
-    write_name(out, name);
+    write_name(out, fun.path.segments.last().map(|s| s.as_str()).unwrap_or("_"));
 }
 
-fn write_name(out: &mut String, name: &str) {
-    let clean = name.replace('@', "_").replace('#', "_");
-    if is_lean_keyword(&clean) {
-        let _ = write!(out, "«{}»", clean);
+/// Write a name, escaping Lean keywords.
+pub(crate) fn write_name(out: &mut String, name: &str) {
+    if is_lean_keyword(name) {
+        out.push('«'); out.push_str(name); out.push('»');
     } else {
-        out.push_str(&clean);
+        for c in name.chars() {
+            match c { '@' | '#' => out.push('_'), _ => out.push(c) }
+        }
     }
 }
 
