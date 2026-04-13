@@ -1,7 +1,7 @@
 //! Translate VIR expressions to Lean 4 expression syntax.
 
 use vir::ast::*;
-use crate::to_lean_type::{write_typ, write_todo};
+use crate::to_lean_type::{write_typ, write_todo, short_name};
 
 // Lean operator precedence (higher = tighter binding).
 const PREC_IMPLIES: u8 = 25;
@@ -26,7 +26,10 @@ fn binop_prec(op: &BinaryOp) -> u8 {
 
 fn expr_prec(expr: &ExprX) -> u8 {
     match expr {
-        ExprX::Const(_) | ExprX::Var(_) | ExprX::ConstVar(..) | ExprX::Call(..) => PREC_ATOM,
+        ExprX::Const(_) | ExprX::Var(_) | ExprX::ConstVar(..) => PREC_ATOM,
+        // A call with args (e.g., `f x`) is NOT atomic — it needs parens when
+        // used as an argument to another call: `g (f x)` not `g f x`.
+        ExprX::Call(_, args, _) => if args.is_empty() { PREC_ATOM } else { 0 },
         ExprX::Binary(op, _, _) => binop_prec(op),
         ExprX::Unary(..) => PREC_MUL + 1,
         _ => 0,
@@ -88,7 +91,20 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
 
         ExprX::Call(target, args, _) => {
             match target {
-                CallTarget::Fun(_, fun, _, _, _, _) => write_fn_ref(out, fun),
+                CallTarget::Fun(kind, fun, _, _, _, _) => {
+                    match kind {
+                        // Concrete dispatch: use resolved impl function
+                        CallTargetKind::DynamicResolved { resolved, .. } => {
+                            write_fn_ref(out, resolved);
+                        }
+                        // Generic dispatch: emit TraitName.method for class resolution
+                        CallTargetKind::Dynamic => {
+                            write_trait_method_ref(out, fun);
+                        }
+                        _ => write_fn_ref(out, fun),
+                    }
+                }
+                CallTarget::FnSpec(inner) => write_expr_prec(out, &inner.x, PREC_ATOM, true),
                 _ => write_todo(out, "call target"),
             }
             for arg in args.iter() {
@@ -132,11 +148,56 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
             for stmt in stmts.iter() {
                 match &stmt.x {
                     StmtX::Expr(e) => { write_expr(out, &e.x); out.push_str("; "); }
-                    StmtX::Decl { .. } => { write_todo(out, "decl"); out.push_str("; "); }
+                    StmtX::Decl { pattern, init, .. } => {
+                        out.push_str("let ");
+                        write_pattern(out, &pattern.x);
+                        if let Some(place) = init {
+                            out.push_str(" := ");
+                            write_place(out, &place.x);
+                        }
+                        out.push_str("; ");
+                    }
                 }
             }
             if let Some(e) = final_expr {
                 write_expr(out, &e.x);
+            }
+        }
+
+        // Spec closure: |x, y| body → fun x y => body
+        ExprX::Closure(params, body) => {
+            out.push_str("fun ");
+            for (i, p) in params.iter().enumerate() {
+                if i > 0 { out.push(' '); }
+                out.push('(');
+                write_name(out, &p.name.0);
+                out.push_str(" : ");
+                write_typ(out, &p.a);
+                out.push(')');
+            }
+            out.push_str(" => ");
+            write_expr(out, &body.x);
+        }
+
+        // Construct datatype: Struct { field: val } → { field := val } or ⟨val1, val2⟩
+        ExprX::Ctor(dt, variant, fields, update) => {
+            if update.is_some() {
+                write_todo(out, "Ctor with update (..)");
+            } else {
+                write_ctor(out, dt, variant, fields);
+            }
+        }
+
+        // Match expression
+        ExprX::Match(place, arms) => {
+            out.push_str("match ");
+            write_place(out, &place.x);
+            out.push_str(" with");
+            for arm in arms.iter() {
+                out.push_str(" | ");
+                write_pattern(out, &arm.x.pattern.x);
+                out.push_str(" => ");
+                write_expr(out, &arm.x.body.x);
             }
         }
 
@@ -157,14 +218,10 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
             out.push_str(".is");
             out.push_str(variant);
         }
-        // Remaining UnaryOpr that are genuinely transparent in spec mode
         ExprX::UnaryOpr(UnaryOpr::CustomErr(_), inner) => write_expr(out, &inner.x),
 
         ExprX::Header(_) => {} // skip header expressions (requires/ensures markers)
 
-        ExprX::Ctor(..) => write_todo(out, "Ctor"),
-        ExprX::Closure(..) => write_todo(out, "Closure"),
-        ExprX::Match(..) => write_todo(out, "Match"),
         ExprX::Assign { .. } => write_todo(out, "Assign"),
         ExprX::Loop { .. } => write_todo(out, "Loop"),
         ExprX::Return(_) => write_todo(out, "Return"),
@@ -230,7 +287,19 @@ fn write_binop(out: &mut String, op: &BinaryOp) {
 }
 
 fn write_fn_ref(out: &mut String, fun: &Fun) {
-    write_name(out, fun.path.segments.last().map(|s| s.as_str()).unwrap_or("_"));
+    write_name(out, short_name(&fun.path));
+}
+
+/// Write a trait method reference as `TraitName.method` for Lean class dispatch.
+fn write_trait_method_ref(out: &mut String, fun: &Fun) {
+    let segs = &fun.path.segments;
+    if segs.len() >= 2 {
+        write_name(out, segs[segs.len() - 2].as_str());
+        out.push('.');
+        write_name(out, segs[segs.len() - 1].as_str());
+    } else {
+        write_fn_ref(out, fun);
+    }
 }
 
 /// Write a name, escaping Lean keywords.
@@ -254,6 +323,60 @@ fn is_lean_keyword(s: &str) -> bool {
     )
 }
 
+/// Write a VIR pattern as Lean syntax.
+fn write_pattern(out: &mut String, pat: &PatternX) {
+    match pat {
+        PatternX::Wildcard(_) => out.push('_'),
+        PatternX::Var(binding) => write_name(out, &binding.name.0),
+        PatternX::Constructor(dt, variant, pats) => {
+            write_dt_variant(out, dt, variant);
+            for p in pats.iter() {
+                out.push(' ');
+                // Wrap non-trivial patterns in parens
+                let needs_parens = matches!(&p.a.x, PatternX::Constructor(..));
+                if needs_parens { out.push('('); }
+                write_pattern(out, &p.a.x);
+                if needs_parens { out.push(')'); }
+            }
+        }
+        PatternX::Or(left, right) => {
+            write_pattern(out, &left.x);
+            out.push_str(" | ");
+            write_pattern(out, &right.x);
+        }
+        PatternX::Expr(e) => write_expr(out, &e.x),
+        PatternX::MutRef(inner) | PatternX::ImmutRef(inner) => write_pattern(out, &inner.x),
+        _ => write_todo(out, "pattern"),
+    }
+}
+
+/// Write a Ctor expression as Lean syntax.
+/// Positional fields ("0", "1", ...): `Type.Variant val1 val2`
+/// Named fields: `Type.Variant val1 val2` (field order from VIR)
+/// No fields: `Type.Variant`
+fn write_ctor(out: &mut String, dt: &Dt, variant: &Ident, fields: &Binders<Expr>) {
+    write_dt_variant(out, dt, variant);
+    for f in fields.iter() {
+        out.push(' ');
+        write_expr_prec(out, &f.a.x, PREC_ATOM, true);
+    }
+}
+
+/// Write datatype variant name: Type.Variant, or Type.mk for structs (where variant == type name).
+fn write_dt_variant(out: &mut String, dt: &Dt, variant: &Ident) {
+    match dt {
+        Dt::Path(path) => {
+            let type_name = short_name(path);
+            out.push_str(type_name);
+            out.push('.');
+            // Structs: VIR uses type name as variant, Lean uses `mk`
+            if variant.as_str() == type_name { out.push_str("mk"); }
+            else { write_name(out, variant); }
+        }
+        Dt::Tuple(_) => write_name(out, variant),
+    }
+}
+
 /// Write a VIR place as Lean syntax (for ReadPlace).
 fn write_place(out: &mut String, place: &PlaceX) {
     match place {
@@ -265,6 +388,10 @@ fn write_place(out: &mut String, place: &PlaceX) {
         }
         PlaceX::DerefMut(inner) => write_place(out, &inner.x),
         PlaceX::ModeUnwrap(inner, _) => write_place(out, &inner.x),
+        // Temporary: evaluate expression and return as a place
+        PlaceX::Temporary(expr) => write_expr(out, &expr.x),
+        // WithExpr: evaluate side-effect expr, then return place
+        PlaceX::WithExpr(_, place) => write_place(out, &place.x),
         _ => write_todo(out, "place"),
     }
 }

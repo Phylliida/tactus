@@ -939,6 +939,87 @@ Translates Verus's standard library to Lean. Ongoing, incremental.
 4. Performance profiling
 5. Differential testing (Verus vs Tactus on same specs)
 
+## Setup and testing
+
+### Prerequisites
+
+- **Lean 4**: Install via [elan](https://github.com/leanprover/elan): `curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh`
+- **Rust nightly**: Verus pins a specific nightly version
+
+### First-time build
+
+```bash
+cd tactus
+
+# Build vargo (tactus's custom cargo wrapper, needed for all vargo commands)
+cd tools/vargo && cargo build --release && cd ../../source
+
+# Build tactus + vstd (expected: "1530 verified, 0 errors")
+PATH="../tools/vargo/target/release:$PATH" vargo build --release
+```
+
+### Mathlib setup (optional, for ring/nlinarith/linarith)
+
+Tactus manages a persistent Lake project at `~/.tactus/lean-project/`. This provides Mathlib's precompiled oleans (~2 GB download, 2-5 min):
+
+```bash
+mkdir -p ~/.tactus/lean-project && cd ~/.tactus/lean-project
+
+# Pin to your Lean version
+lean --version | sed 's/.*version \([^,]*\).*/leanprover\/lean4:v\1/' > lean-toolchain
+
+# Write lakefile.lean
+cat > lakefile.lean << 'EOF'
+import Lake
+open Lake DSL
+package «tactus-project» where
+  leanOptions := #[⟨`autoImplicit, false⟩]
+require mathlib from git
+  "https://github.com/leanprover-community/mathlib4" @ "v4.25.0"
+@[default_target]
+lean_lib TactusPrelude where
+  srcDir := "."
+EOF
+
+# Copy prelude and build
+cp /path/to/tactus/source/lean_verify/TactusPrelude.lean .
+lake update && lake exe cache get && lake build
+```
+
+Without this setup, core tactics (`omega`, `simp`, `decide`, `exact`, `apply`, `intro`, `induction`, `cases`, `rfl`, `unfold`) still work. Mathlib tactics (`ring`, `nlinarith`, `linarith`, `norm_num`, `positivity`, `field_simp`) require the Lake project.
+
+### Running tests
+
+```bash
+cd tactus/source
+
+# Unit tests for lean_verify crate:
+cargo test -p lean_verify
+
+# End-to-end tests (14 tests, includes Mathlib tests):
+PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
+
+# Run a single test:
+PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus -- test_mathlib_ring
+
+# Quick compile check (no RUSTC_BOOTSTRAP needed):
+cargo check -p lean_verify
+
+# Full compile check:
+RUSTC_BOOTSTRAP=1 cargo check -p rust_verify
+```
+
+### How the verifier routes to Lean
+
+When Tactus encounters a `proof fn` with a `by { }` block:
+
+1. The proc macro captures the tactic body as a raw `TokenStream` and emits `#[verus::internal(tactic_body("..."))]` plus `#[verus::internal(lean_import("..."))]` for each import
+2. `rust_to_vir_func.rs` threads these to `FunctionAttrsX.tactic_body` and `FunctionAttrsX.lean_imports`
+3. `verifier.rs` detects `tactic_body.is_some()`, collects all VIR functions, and calls `generate_lean_file`
+4. `generate_lean_file` emits imports, prelude, topologically-sorted spec fns (with mutual recursion groups), and the theorem with tactic body; returns a source map
+5. The verifier invokes `lake env lean --stdin --json` (if `~/.tactus/lean-project/` exists) or `lean --stdin --json` (fallback)
+6. Lean's JSON diagnostics are parsed, source map translates line numbers, and errors are reported through Verus's standard diagnostic system
+
 ## Open questions
 
 1. **Recursive termination**: Simple `decreases n` → `termination_by n`. Complex `decreases` with `via` clauses → `termination_by` + `decreasing_by`. Design when we encounter real examples.

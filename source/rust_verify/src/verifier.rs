@@ -1578,18 +1578,15 @@ impl Verifier {
 
                         // Tactus: route tactic proof fns to Lean instead of Z3
                         if let Some(tactic_body) = &function.x.attrs.tactic_body {
-                            let fn_name = vir::ast_util::fun_as_friendly_rust_name(&function.x.name);
                             let fn_span = &function.span;
-                            let tactic_body = tactic_body.clone();
 
                             // Look up the VIR function from the VIR krate
                             let vir_krate = self.vir_crate.as_ref().expect("vir_crate should be initialized");
-                            let vir_fn = vir_krate.functions.iter()
-                                .find(|f| f.x.name == function.x.name);
-                            let vir_fn = match vir_fn {
+                            let vir_fn = match vir_krate.functions.iter().find(|f| f.x.name == function.x.name) {
                                 Some(f) => f,
                                 None => {
                                     self.count_errors += 1;
+                                    let fn_name = vir::ast_util::fun_as_friendly_rust_name(&function.x.name);
                                     reporter.report(&message(
                                         MessageLevel::Error,
                                         format!("could not find VIR function for tactic proof fn {}", fn_name),
@@ -1598,11 +1595,6 @@ impl Verifier {
                                     continue;
                                 }
                             };
-
-                            // Collect all VIR functions (dep_order will filter and sort)
-                            let all_fns: Vec<&vir::ast::FunctionX> = vir_krate.functions.iter()
-                                .map(|f| &f.x)
-                                .collect();
 
                             // Compute namespace from the proof fn's owning module
                             let namespace = vir_fn.x.owning_module.as_ref().and_then(|p| {
@@ -1614,46 +1606,31 @@ impl Verifier {
                                 if ns.is_empty() { None } else { Some(ns) }
                             });
 
-                            // Generate Lean file and invoke Lean
-                            let lean_source = lean_verify::to_lean_fn::generate_lean_file(
-                                &all_fns,
-                                &[(&vir_fn.x, tactic_body.as_str())],
-                                &[],
+                            // Single entry point: generate Lean, invoke, format errors
+                            match lean_verify::check_proof_fn(
+                                vir_krate,
+                                &vir_fn.x,
+                                tactic_body,
+                                &vir_fn.x.attrs.lean_imports,
                                 namespace.as_deref(),
-                            );
-
-                            match lean_verify::lean_process::check_lean_stdin(&lean_source) {
-                                Ok(result) => {
-                                    if result.success {
-                                        self.count_verified += 1;
-                                    } else {
-                                        self.count_errors += 1;
-                                        // Build error message with Lean goal state
-                                        let mut error_details = Vec::new();
-                                        for diag in &result.diagnostics {
-                                            if diag.severity == "error" {
-                                                error_details.push(diag.data.clone());
-                                            }
-                                        }
-                                        let msg = format!(
-                                            "Lean verification failed for {}:\n{}",
-                                            fn_name,
-                                            error_details.join("\n")
-                                        );
-                                        reporter.report(
-                                            &message(MessageLevel::Error, msg, fn_span).to_any()
-                                        );
-                                    }
+                            ) {
+                                lean_verify::CheckResult::Success => {
+                                    self.count_verified += 1;
                                 }
-                                Err(e) => {
+                                lean_verify::CheckResult::Failed(msg) => {
                                     self.count_errors += 1;
-                                    let msg = format!(
-                                        "failed to invoke Lean for {}: {}. Is Lean 4 installed?",
-                                        fn_name, e
-                                    );
                                     reporter.report(
                                         &message(MessageLevel::Error, msg, fn_span).to_any()
                                     );
+                                }
+                                lean_verify::CheckResult::Error(e) => {
+                                    self.count_errors += 1;
+                                    let fn_name = vir::ast_util::fun_as_friendly_rust_name(&function.x.name);
+                                    reporter.report(&message(
+                                        MessageLevel::Error,
+                                        format!("failed to invoke Lean for {}: {}. Is Lean 4 installed?", fn_name, e),
+                                        fn_span,
+                                    ).to_any());
                                 }
                             }
                             continue;

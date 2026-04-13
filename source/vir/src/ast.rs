@@ -1498,6 +1498,11 @@ pub struct FunctionAttrsX {
     /// Tactus: if Some, this proof fn uses Lean tactic verification.
     /// The string is the verbatim tactic body text from the `by { }` block.
     pub tactic_body: Option<String>,
+    /// Tactus: Lean import paths (e.g., "Mathlib.Tactic.Ring").
+    /// Imports are module-level but stored per-function because each proof fn
+    /// currently generates its own .lean file. All tactic proof fns in the same
+    /// verus! block share the same imports.
+    pub lean_imports: Vec<String>,
 }
 
 /// Function specification of its invariant mask
