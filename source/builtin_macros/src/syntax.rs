@@ -1749,6 +1749,7 @@ impl Visitor {
                 invariants: invariants,
                 unwind: unwind,
                 with: None,
+                tactic_by: None,
             },
         };
 
@@ -4041,13 +4042,27 @@ impl VisitMut for Visitor {
             crate::rustdoc::process_item_fn(fun);
         }
 
-        // Tactus: detect proof fn with body → tactic proof mode.
-        // All proof fn bodies in Tactus are Lean tactic blocks.
-        // We mark the function with a tactic_proof attribute and replace the
-        // body with a dummy. The actual tactic text is extracted later by
-        // tree-sitter-tactus using the source span.
+        // Tactus: detect proof fn with tactic body.
+        // A proof fn is a tactic proof if:
+        //   1. It uses `by { }` syntax (tactic_by is Some in signature spec), OR
+        //   2. It has #[verifier::tactic] attribute (explicit marker)
         let is_tactic_proof = matches!(fun.sig.mode, FnMode::Proof(_))
-            && fun.semi_token.is_none(); // has body
+            && fun.semi_token.is_none()
+            && (fun.sig.spec.tactic_by.is_some()
+                || fun.attrs.iter().any(|a| {
+                    a.meta.path().segments.iter().any(|seg| seg.ident == "tactic")
+                }));
+
+        // Tactus: capture the ORIGINAL tactic body text before any transformation
+        let tactic_body_str = if is_tactic_proof && self.erase_ghost.keep() {
+            let body_tokens = fun.block.stmts.iter()
+                .map(|s| s.to_token_stream().to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(body_tokens.trim().to_string())
+        } else {
+            None
+        };
 
         let stmts = self.visit_fn(
             &mut fun.attrs,
@@ -4057,39 +4072,28 @@ impl VisitMut for Visitor {
             false,
             false,
         );
+        let num_spec_stmts = stmts.len();
         fun.block.stmts.splice(0..0, stmts);
         fun.semi_token = None;
 
-        if is_tactic_proof && self.erase_ghost.keep() {
-            // Add tactic_proof marker attribute for VIR to pick up
+        // Always do the recursive visit for type transformations (e.g. spec_fn → FnSpec)
+        let is_external_code = has_external_code(&fun.attrs);
+        if is_external_code {
+            self.inside_external_code += 1;
+        }
+        visit_item_fn_mut(self, fun);
+        if is_external_code {
+            self.inside_external_code -= 1;
+        }
+
+        // Tactus: AFTER the recursive visit, replace tactic proof body but KEEP spec stmts
+        if let Some(body_str) = tactic_body_str {
             let span = fun.block.brace_token.span.join();
             fun.attrs.push(mk_verus_attr(span, quote! { tactic_proof }));
+            fun.attrs.push(mk_verus_attr(span, quote! { tactic_body(#body_str) }));
 
-            // Capture tactic body text before replacing with dummy.
-            // Strip outer braces — we want the inner tactic text.
-            let body_tokens = fun.block.stmts.iter()
-                .map(|s| s.to_token_stream().to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let body_str = body_tokens.trim().to_string();
-            fun.attrs.push(mk_verus_attr(span, quote! { tactic_body = #body_str }));
-
-            // Replace body with dummy — the real proof text is stored in the attribute.
-            fun.block.stmts = vec![Stmt::Expr(
-                Expr::Verbatim(quote_spanned!(span => unimplemented!())),
-                None,
-            )];
-
-            // Skip recursive visit — don't transform tactic body as Rust statements
-        } else {
-            let is_external_code = has_external_code(&fun.attrs);
-            if is_external_code {
-                self.inside_external_code += 1;
-            }
-            visit_item_fn_mut(self, fun);
-            if is_external_code {
-                self.inside_external_code -= 1;
-            }
+            // Keep the spec stmts (requires/ensures), remove the original body
+            fun.block.stmts.truncate(num_spec_stmts);
         }
     }
 
@@ -4098,9 +4102,24 @@ impl VisitMut for Visitor {
             crate::rustdoc::process_impl_item_method(method);
         }
 
-        // Tactus: detect proof method with tactic body
+        // Tactus: detect proof method with tactic body (by { } or #[verifier::tactic])
         let is_tactic_proof = matches!(method.sig.mode, FnMode::Proof(_))
-            && method.semi_token.is_none();
+            && method.semi_token.is_none()
+            && (method.sig.spec.tactic_by.is_some()
+                || method.attrs.iter().any(|a| {
+                    a.meta.path().segments.iter().any(|seg| seg.ident == "tactic")
+                }));
+
+        // Tactus: capture the ORIGINAL tactic body text before any transformation
+        let tactic_body_str = if is_tactic_proof && self.erase_ghost.keep() {
+            let body_tokens = method.block.stmts.iter()
+                .map(|s| s.to_token_stream().to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(body_tokens.trim().to_string())
+        } else {
+            None
+        };
 
         let stmts = self.visit_fn(
             &mut method.attrs,
@@ -4110,33 +4129,27 @@ impl VisitMut for Visitor {
             false,
             true,
         );
+        let num_spec_stmts = stmts.len();
         method.block.stmts.splice(0..0, stmts);
         method.semi_token = None;
 
-        if is_tactic_proof && self.erase_ghost.keep() {
+        // Always do the recursive visit for type transformations (e.g. spec_fn → FnSpec)
+        let is_external_code = has_external_code(&method.attrs);
+        if is_external_code {
+            self.inside_external_code += 1;
+        }
+        visit_impl_item_fn_mut(self, method);
+        if is_external_code {
+            self.inside_external_code -= 1;
+        }
+
+        // Tactus: AFTER the recursive visit, replace tactic proof body but KEEP spec stmts
+        if let Some(body_str) = tactic_body_str {
             let span = method.block.brace_token.span.join();
             method.attrs.push(mk_verus_attr(span, quote! { tactic_proof }));
+            method.attrs.push(mk_verus_attr(span, quote! { tactic_body(#body_str) }));
 
-            let body_tokens = method.block.stmts.iter()
-                .map(|s| s.to_token_stream().to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let body_str = body_tokens.trim().to_string();
-            method.attrs.push(mk_verus_attr(span, quote! { tactic_body = #body_str }));
-
-            method.block.stmts = vec![Stmt::Expr(
-                Expr::Verbatim(quote_spanned!(span => unimplemented!())),
-                None,
-            )];
-        } else {
-            let is_external_code = has_external_code(&method.attrs);
-            if is_external_code {
-                self.inside_external_code += 1;
-            }
-            visit_impl_item_fn_mut(self, method);
-            if is_external_code {
-                self.inside_external_code -= 1;
-            }
+            method.block.stmts.truncate(num_spec_stmts);
         }
     }
 
