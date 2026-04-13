@@ -259,7 +259,6 @@ fn handle_autospec<'tcx>(
                     ignore_outside_new_mut_ref: functionx.attrs.ignore_outside_new_mut_ref,
                     tracked_swap: false,
                     tracked_take_option: false,
-                    tactic_proof: false,
                     tactic_body: None,
                 }),
                 body: Some(ret_clause.clone()),
@@ -1319,7 +1318,6 @@ fn make_attributes<'tcx>(
         ignore_outside_new_mut_ref,
         tracked_swap: vattrs.tracked_swap,
         tracked_take_option: vattrs.tracked_take_option,
-        tactic_proof: vattrs.tactic_proof,
         tactic_body: vattrs.tactic_body.clone(),
     };
     Ok(Arc::new(fattrs))

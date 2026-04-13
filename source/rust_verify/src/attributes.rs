@@ -360,9 +360,7 @@ pub(crate) enum Attr {
     MigratePostconditionsWithMutRefs(bool),
     TrackedSwap,
     TrackedTakeOption,
-    // Tactus: proof fn body is a Lean tactic block, verified by Lean kernel
-    TacticProof,
-    // Tactus: captured tactic body text (ASCII representation from proc macro)
+    // Tactus: proof fn body is a Lean tactic block, with verbatim tactic text
     TacticBody(String),
 }
 
@@ -703,10 +701,6 @@ pub(crate) fn parse_attrs(
                 AttrTree::Fun(_, arg, None) if arg == "tracked_take_option_primitive" => {
                     v.push(Attr::TrackedTakeOption)
                 }
-                // Tactus: #[verifier::tactic] marks a proof fn as using Lean tactics
-                AttrTree::Fun(_, arg, None) if arg == "tactic" => {
-                    v.push(Attr::TacticProof)
-                }
                 _ => return err_span(span, "unrecognized verifier attribute"),
             },
             AttrPrefix::Verus(verus_prefix) => match verus_prefix {
@@ -853,10 +847,7 @@ pub(crate) fn parse_attrs(
                     AttrTree::Fun(_, arg, None) if arg == "structural_const_wrapper" => {
                         v.push(Attr::StructuralConstWrapper)
                     }
-                    // Tactus: tactic proof attributes
-                    AttrTree::Fun(_, arg, None) if arg == "tactic_proof" => {
-                        v.push(Attr::TacticProof)
-                    }
+                    // Tactus: tactic body from `by { }` block
                     AttrTree::Fun(_, arg, Some(box [AttrTree::Lit(LitKind::Str, body)]))
                         if arg == "tactic_body" =>
                     {
@@ -1156,9 +1147,7 @@ pub(crate) struct VerifierAttrs {
     pub(crate) ignore_outside_new_mut_ref_experiment: bool,
     pub(crate) tracked_swap: bool,
     pub(crate) tracked_take_option: bool,
-    // Tactus: proof fn body is a Lean tactic block
-    pub(crate) tactic_proof: bool,
-    // Tactus: captured tactic body text
+    // Tactus: if Some, proof fn uses Lean tactics (verbatim body from `by { }`)
     pub(crate) tactic_body: Option<String>,
 }
 
@@ -1335,7 +1324,6 @@ pub(crate) fn get_verifier_attrs_maybe_check(
         ignore_outside_new_mut_ref_experiment: false,
         tracked_swap: false,
         tracked_take_option: false,
-        tactic_proof: false,
         tactic_body: None,
     };
     let mut unsupported_rustc_attr: Option<(String, Span)> = None;
@@ -1421,7 +1409,6 @@ pub(crate) fn get_verifier_attrs_maybe_check(
             }
             Attr::TrackedSwap => vs.tracked_swap = true,
             Attr::TrackedTakeOption => vs.tracked_take_option = true,
-            Attr::TacticProof => vs.tactic_proof = true,
             Attr::TacticBody(body) => vs.tactic_body = Some(body.clone()),
             _ => {}
         }

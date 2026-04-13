@@ -1495,9 +1495,8 @@ pub struct FunctionAttrsX {
     pub tracked_swap: bool,
     /// Is this function `Option::tracked_take`, which requires special handling
     pub tracked_take_option: bool,
-    /// Tactus: proof fn body is a Lean tactic block, verified by Lean kernel
-    pub tactic_proof: bool,
-    /// Tactus: captured tactic body text (from proc macro)
+    /// Tactus: if Some, this proof fn uses Lean tactic verification.
+    /// The string is the verbatim tactic body text from the `by { }` block.
     pub tactic_body: Option<String>,
 }
 

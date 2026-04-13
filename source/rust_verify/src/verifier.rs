@@ -1577,28 +1577,10 @@ impl Verifier {
                         self.expand_flag = query_op.is_expanded();
 
                         // Tactus: route tactic proof fns to Lean instead of Z3
-                        if function.x.attrs.tactic_proof {
+                        if let Some(tactic_body) = &function.x.attrs.tactic_body {
                             let fn_name = vir::ast_util::fun_as_friendly_rust_name(&function.x.name);
-
-                            // Get tactic body text from attribute and clean up Rust tokenization.
-                            // The proc macro captures as Rust tokens, so user writes:
-                            //   unfold(double); omega()
-                            // and we get the token string: "unfold(double) ; omega()"
-                            // We clean each semicolon-separated statement, converting
-                            // Rust-style function calls back to Lean tactic syntax.
                             let fn_span = &function.span;
-                            let tactic_body = match &function.x.attrs.tactic_body {
-                                Some(body) => body.clone(),
-                                None => {
-                                    self.count_errors += 1;
-                                    reporter.report(&message(
-                                        MessageLevel::Error,
-                                        format!("tactic proof fn {} has no tactic body", fn_name),
-                                        fn_span,
-                                    ).to_any());
-                                    continue;
-                                }
-                            };
+                            let tactic_body = tactic_body.clone();
 
                             // Look up the VIR function from the VIR krate
                             let vir_krate = self.vir_crate.as_ref().expect("vir_crate should be initialized");
