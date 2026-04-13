@@ -1,6 +1,5 @@
 //! Translate VIR types to Lean 4 type syntax.
 
-use std::fmt::Write;
 use std::sync::Arc;
 use vir::ast::{Dt, IntRange, TypX};
 
@@ -8,19 +7,16 @@ use vir::ast::{Dt, IntRange, TypX};
 pub fn write_typ(out: &mut String, typ: &TypX) {
     match typ {
         TypX::Bool => out.push_str("Prop"),
-        TypX::Int(range) => write_int_range(out, range),
+        TypX::Int(range) => out.push_str(match range {
+            IntRange::Int | IntRange::I(_) | IntRange::ISize => "Int",
+            IntRange::Nat | IntRange::U(_) | IntRange::USize | IntRange::Char => "Nat",
+        }),
         TypX::TypParam(name) => out.push_str(name),
         TypX::Boxed(inner) => write_typ(out, inner),
         TypX::Datatype(dt, args, _) => {
             match dt {
-                Dt::Path(path) => {
-                    let name = path.segments.last().map(|s: &Arc<String>| s.as_str()).unwrap_or("?");
-                    out.push_str(name);
-                }
-                Dt::Tuple(n) => {
-                    // Tuple type as datatype
-                    let _ = write!(out, "Tuple{}", n);
-                }
+                Dt::Path(path) => write_path_last(out, &path.segments),
+                Dt::Tuple(n) => { out.push_str("Tuple"); out.push_str(&n.to_string()); }
             }
             for arg in args.iter() {
                 out.push(' ');
@@ -37,19 +33,20 @@ pub fn write_typ(out: &mut String, typ: &TypX) {
             }
             write_typ(out, ret);
         }
-        // Types we don't fully handle yet — emit a placeholder
-        _ => { let _ = write!(out, "sorry /- unhandled type: {:?} -/", typ); }
+        _ => write_todo(out, "type"),
     }
 }
 
-fn write_int_range(out: &mut String, range: &IntRange) {
-    match range {
-        IntRange::Int => out.push_str("Int"),
-        IntRange::Nat => out.push_str("Nat"),
-        IntRange::U(_) | IntRange::USize => out.push_str("Nat"),
-        IntRange::I(_) | IntRange::ISize => out.push_str("Int"),
-        IntRange::Char => out.push_str("Nat"),
-    }
+/// Write the last segment of a path.
+pub(crate) fn write_path_last(out: &mut String, segments: &[Arc<String>]) {
+    out.push_str(segments.last().map(|s| s.as_str()).unwrap_or("_"));
+}
+
+/// Write a `sorry` placeholder with a TODO comment.
+pub(crate) fn write_todo(out: &mut String, what: &str) {
+    out.push_str("sorry /- TODO: ");
+    out.push_str(what);
+    out.push_str(" -/");
 }
 
 /// Convenience: return type as String.
@@ -62,7 +59,6 @@ pub fn typ_to_lean(typ: &TypX) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     #[test]
     fn test_basic_types() {
@@ -80,8 +76,7 @@ mod tests {
 
     #[test]
     fn test_boxed_transparent() {
-        let inner = Arc::new(TypX::Int(IntRange::Nat));
-        assert_eq!(typ_to_lean(&TypX::Boxed(inner)), "Nat");
+        assert_eq!(typ_to_lean(&TypX::Boxed(Arc::new(TypX::Int(IntRange::Nat)))), "Nat");
     }
 
     #[test]
@@ -92,5 +87,4 @@ mod tests {
         );
         assert_eq!(typ_to_lean(&t), "Nat → Nat");
     }
-
 }

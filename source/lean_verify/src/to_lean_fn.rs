@@ -2,17 +2,16 @@
 
 use vir::ast::*;
 use crate::prelude::TACTUS_PRELUDE;
-use crate::to_lean_expr::write_expr;
+use crate::to_lean_expr::{write_expr, write_name};
 use crate::to_lean_type::write_typ;
 
 /// Generate a complete Lean file from VIR functions.
 ///
 /// `spec_fns` must be in dependency order (callees before callers).
-/// `proof_fns` are emitted after all spec fns.
 /// Each proof fn is paired with its tactic body text.
 pub fn generate_lean_file(
     spec_fns: &[&FunctionX],
-    proof_fns: &[(&FunctionX, &str)], // (function, tactic_body)
+    proof_fns: &[(&FunctionX, &str)],
     imports: &[String],
 ) -> String {
     let mut out = String::new();
@@ -42,36 +41,20 @@ pub fn generate_lean_file(
 
 /// Write a spec fn as `@[irreducible] noncomputable def`.
 pub fn write_spec_fn(out: &mut String, f: &FunctionX) {
-    let is_open = !matches!(f.opaqueness, Opaqueness::Opaque);
-    if !is_open {
+    if matches!(f.opaqueness, Opaqueness::Opaque) {
         out.push_str("@[irreducible] ");
     }
     out.push_str("noncomputable def ");
-
     write_fn_name(out, &f.name);
-
-    for tp in f.typ_params.iter() {
-        out.push_str(" (");
-        out.push_str(tp);
-        out.push_str(" : Type*)");
-    }
-
-    for p in f.params.iter() {
-        out.push_str(" (");
-        out.push_str(&p.x.name.0);
-        out.push_str(" : ");
-        write_typ(out, &p.x.typ);
-        out.push(')');
-    }
+    write_fn_params(out, f);
 
     out.push_str(" : ");
     write_typ(out, &f.ret.x.typ);
     out.push_str(" :=\n  ");
 
-    if let Some(body) = &f.body {
-        write_expr(out, &body.x);
-    } else {
-        out.push_str("sorry");
+    match &f.body {
+        Some(body) => write_expr(out, &body.x),
+        None => out.push_str("sorry"),
     }
     out.push('\n');
 
@@ -95,22 +78,8 @@ pub fn write_spec_fn(out: &mut String, f: &FunctionX) {
 pub fn write_proof_fn(out: &mut String, f: &FunctionX, tactic_body: &str) {
     out.push_str("theorem ");
     write_fn_name(out, &f.name);
+    write_fn_params(out, f);
 
-    for tp in f.typ_params.iter() {
-        out.push_str(" (");
-        out.push_str(tp);
-        out.push_str(" : Type*)");
-    }
-
-    for p in f.params.iter() {
-        out.push_str(" (");
-        out.push_str(&p.x.name.0);
-        out.push_str(" : ");
-        write_typ(out, &p.x.typ);
-        out.push(')');
-    }
-
-    // requires → hypotheses
     for (i, req) in f.require.iter().enumerate() {
         out.push_str(" (h");
         out.push_str(&i.to_string());
@@ -119,12 +88,10 @@ pub fn write_proof_fn(out: &mut String, f: &FunctionX, tactic_body: &str) {
         out.push(')');
     }
 
-    // ensures → goal
     out.push_str(" :\n    ");
     write_ensures(out, &f.ensure.0);
     out.push_str(" := by\n");
 
-    // tactic body (verbatim, indented 2 spaces)
     for line in tactic_body.lines() {
         if line.trim().is_empty() {
             out.push('\n');
@@ -136,25 +103,35 @@ pub fn write_proof_fn(out: &mut String, f: &FunctionX, tactic_body: &str) {
     }
 }
 
+/// Write type params + value params shared by spec and proof fns.
+fn write_fn_params(out: &mut String, f: &FunctionX) {
+    for tp in f.typ_params.iter() {
+        out.push_str(" (");
+        out.push_str(tp);
+        out.push_str(" : Type*)");
+    }
+    for p in f.params.iter() {
+        out.push_str(" (");
+        write_name(out, &p.x.name.0);
+        out.push_str(" : ");
+        write_typ(out, &p.x.typ);
+        out.push(')');
+    }
+}
+
 fn write_ensures(out: &mut String, ensures: &[Expr]) {
-    if ensures.is_empty() {
-        out.push_str("True");
-    } else if ensures.len() == 1 {
-        write_expr(out, &ensures[0].x);
-    } else {
-        for (i, e) in ensures.iter().enumerate() {
-            if i > 0 { out.push_str(" ∧ "); }
-            write_expr(out, &e.x);
+    match ensures.len() {
+        0 => out.push_str("True"),
+        1 => write_expr(out, &ensures[0].x),
+        _ => {
+            for (i, e) in ensures.iter().enumerate() {
+                if i > 0 { out.push_str(" ∧ "); }
+                write_expr(out, &e.x);
+            }
         }
     }
 }
 
 fn write_fn_name(out: &mut String, fun: &Fun) {
-    let segments = &fun.path.segments;
-    if segments.len() == 1 {
-        out.push_str(&segments[0]);
-    } else {
-        // Use last segment — namespacing handled by caller wrapping in `namespace`
-        out.push_str(segments.last().map(|s| s.as_str()).unwrap_or("?"));
-    }
+    out.push_str(fun.path.segments.last().map(|s| s.as_str()).unwrap_or("_"));
 }
