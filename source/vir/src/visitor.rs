@@ -157,7 +157,7 @@ impl Returner for Rewrite {
 }
 
 #[derive(PartialEq, Eq, Debug)]
-pub(crate) enum VisitorControlFlow<T> {
+pub enum VisitorControlFlow<T> {
     Recurse,
     Return,
     Stop(T),

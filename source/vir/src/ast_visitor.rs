@@ -1732,7 +1732,9 @@ where
     }
 }
 
-pub(crate) fn expr_visitor_walk<MF>(expr: &Expr, mf: &mut MF)
+/// Walk all sub-expressions in an expression tree, calling `mf` for each one.
+/// Returns `Recurse` to continue into children, `Return` to skip children.
+pub fn expr_visitor_walk<MF>(expr: &Expr, mf: &mut MF)
 where
     MF: FnMut(&Expr) -> VisitorControlFlow<()>,
 {
