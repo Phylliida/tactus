@@ -10,6 +10,10 @@ use vir::ast::*;
 
 /// A group of functions that should be emitted together.
 /// Single functions are emitted normally; mutual groups use `mutual ... end`.
+///
+/// Note: a self-recursive function (e.g., `factorial`) forms a single-element SCC.
+/// It does NOT need `mutual ... end` — Lean handles single recursion with `termination_by`.
+/// Only functions that call EACH OTHER (2+ element SCC) need `mutual ... end`.
 pub enum FnGroup<'a> {
     Single(&'a FunctionX),
     Mutual(Vec<&'a FunctionX>),
@@ -27,55 +31,57 @@ pub fn order_spec_fns<'a>(
         .map(|f| (&f.name, *f))
         .collect();
 
-    // Collect all function names referenced transitively from proof fns
+    // Single pass: collect transitive closure AND build edge map simultaneously.
+    // For each needed spec fn, we store its direct callees (within the spec fn set).
     let mut needed: HashSet<Fun> = HashSet::new();
+    let mut edges: HashMap<Fun, HashSet<Fun>> = HashMap::new();
     let mut worklist: Vec<Fun> = Vec::new();
 
-    // Seed from proof fn requires, ensures, and spec fn bodies
+    // Seed from proof fn requires/ensures
     for pf in proof_fns {
         collect_fun_refs_from_exprs(&pf.require, &mut worklist);
         collect_fun_refs_from_exprs(&pf.ensure.0, &mut worklist);
         collect_fun_refs_from_exprs(&pf.ensure.1, &mut worklist);
     }
 
-    // Transitive closure
+    // Transitive closure: for each new function, collect its callees
     while let Some(fun) = worklist.pop() {
         if needed.contains(&fun) {
             continue;
         }
         needed.insert(fun.clone());
         if let Some(f) = spec_fn_map.get(&fun) {
-            // Collect references from this spec fn's body and decrease clauses
+            let mut callees = Vec::new();
             if let Some(body) = &f.body {
-                collect_fun_refs_from_expr(body, &mut worklist);
+                collect_fun_refs_from_expr(body, &mut callees);
             }
-            collect_fun_refs_from_exprs(&f.decrease, &mut worklist);
+            collect_fun_refs_from_exprs(&f.decrease, &mut callees);
+
+            // Add unvisited callees to worklist
+            for c in &callees {
+                if !needed.contains(c) {
+                    worklist.push(c.clone());
+                }
+            }
+
+            // Store edges (only to other needed spec fns)
+            let callee_set: HashSet<Fun> = callees.into_iter()
+                .filter(|c| spec_fn_map.contains_key(c))
+                .collect();
+            edges.insert(fun, callee_set);
         }
     }
 
-    // Build adjacency list for the needed spec fns
+    // Collect the needed spec fns in their original order (for determinism)
     let needed_fns: Vec<&'a FunctionX> = all_fns.iter()
         .filter(|f| needed.contains(&f.name) && matches!(f.mode, Mode::Spec) && f.body.is_some())
         .copied()
         .collect();
 
-    // Build call graph edges (caller → callees)
-    let mut edges: HashMap<Fun, HashSet<Fun>> = HashMap::new();
-    for f in &needed_fns {
-        let mut callees = Vec::new();
-        if let Some(body) = &f.body {
-            collect_fun_refs_from_expr(body, &mut callees);
-        }
-        let callee_set: HashSet<Fun> = callees.into_iter()
-            .filter(|c| needed.contains(c))
-            .collect();
-        edges.insert(f.name.clone(), callee_set);
-    }
-
-    // Tarjan's SCC to find mutual recursion groups, then topological sort
+    // Tarjan's SCC: find mutual recursion groups + topological order
     let sccs = tarjan_scc(&needed_fns, &edges);
 
-    // Convert SCCs to FnGroups (already in reverse topological order from Tarjan's)
+    // Convert SCCs to FnGroups
     let fn_map: HashMap<&Fun, &'a FunctionX> = needed_fns.iter()
         .map(|f| (&f.name, *f))
         .collect();
@@ -91,168 +97,268 @@ pub fn order_spec_fns<'a>(
 
 /// Tarjan's strongly connected components algorithm.
 /// Returns SCCs in reverse topological order (dependencies first).
+///
+/// Uses `Fun` references internally to avoid cloning `Arc`s where possible.
+/// The `Fun` type is `Arc<FunX>`, so clones are just refcount bumps.
 fn tarjan_scc(fns: &[&FunctionX], edges: &HashMap<Fun, HashSet<Fun>>) -> Vec<Vec<Fun>> {
-    let mut index_counter: usize = 0;
-    let mut stack: Vec<Fun> = Vec::new();
-    let mut on_stack: HashSet<Fun> = HashSet::new();
-    let mut index: HashMap<Fun, usize> = HashMap::new();
-    let mut lowlink: HashMap<Fun, usize> = HashMap::new();
-    let mut result: Vec<Vec<Fun>> = Vec::new();
+    struct State {
+        index_counter: usize,
+        stack: Vec<Fun>,
+        on_stack: HashSet<Fun>,
+        index: HashMap<Fun, usize>,
+        lowlink: HashMap<Fun, usize>,
+        result: Vec<Vec<Fun>>,
+    }
 
-    fn strongconnect(
-        v: &Fun,
-        edges: &HashMap<Fun, HashSet<Fun>>,
-        index_counter: &mut usize,
-        stack: &mut Vec<Fun>,
-        on_stack: &mut HashSet<Fun>,
-        index: &mut HashMap<Fun, usize>,
-        lowlink: &mut HashMap<Fun, usize>,
-        result: &mut Vec<Vec<Fun>>,
-    ) {
-        index.insert(v.clone(), *index_counter);
-        lowlink.insert(v.clone(), *index_counter);
-        *index_counter += 1;
-        stack.push(v.clone());
-        on_stack.insert(v.clone());
+    fn strongconnect(v: &Fun, edges: &HashMap<Fun, HashSet<Fun>>, s: &mut State) {
+        s.index.insert(v.clone(), s.index_counter);
+        s.lowlink.insert(v.clone(), s.index_counter);
+        s.index_counter += 1;
+        s.stack.push(v.clone());
+        s.on_stack.insert(v.clone());
 
         if let Some(neighbors) = edges.get(v) {
             for w in neighbors {
-                if !index.contains_key(w) {
-                    strongconnect(w, edges, index_counter, stack, on_stack, index, lowlink, result);
-                    let wl = lowlink[w];
-                    let vl = lowlink.get_mut(v).unwrap();
-                    if wl < *vl {
-                        *vl = wl;
-                    }
-                } else if on_stack.contains(w) {
-                    let wi = index[w];
-                    let vl = lowlink.get_mut(v).unwrap();
-                    if wi < *vl {
-                        *vl = wi;
-                    }
+                if !s.index.contains_key(w) {
+                    strongconnect(w, edges, s);
+                    let wl = s.lowlink[w];
+                    let vl = s.lowlink.get_mut(v).unwrap();
+                    *vl = (*vl).min(wl);
+                } else if s.on_stack.contains(w) {
+                    let wi = s.index[w];
+                    let vl = s.lowlink.get_mut(v).unwrap();
+                    *vl = (*vl).min(wi);
                 }
             }
         }
 
-        if lowlink[v] == index[v] {
+        if s.lowlink[v] == s.index[v] {
             let mut scc = Vec::new();
             loop {
-                let w = stack.pop().unwrap();
-                on_stack.remove(&w);
-                scc.push(w.clone());
-                if &w == v {
-                    break;
-                }
+                let w = s.stack.pop().unwrap();
+                s.on_stack.remove(&w);
+                let done = &w == v;
+                scc.push(w);
+                if done { break; }
             }
             scc.reverse();
-            result.push(scc);
+            s.result.push(scc);
         }
     }
+
+    let mut state = State {
+        index_counter: 0,
+        stack: Vec::new(),
+        on_stack: HashSet::new(),
+        index: HashMap::new(),
+        lowlink: HashMap::new(),
+        result: Vec::new(),
+    };
 
     for f in fns {
-        if !index.contains_key(&f.name) {
-            strongconnect(
-                &f.name, edges, &mut index_counter, &mut stack, &mut on_stack,
-                &mut index, &mut lowlink, &mut result,
-            );
+        if !state.index.contains_key(&f.name) {
+            strongconnect(&f.name, edges, &mut state);
         }
     }
 
-    result
+    state.result
 }
 
-/// Collect all Fun references from an expression tree.
+// ── Expression walking ──────────────────────────────────────────────────────
+
+/// Collect all Fun references from an expression.
 fn collect_fun_refs_from_expr(expr: &Expr, out: &mut Vec<Fun>) {
-    collect_fun_refs_from_exprx(&expr.x, out);
+    walk_expr(&expr.x, out);
 }
 
 fn collect_fun_refs_from_exprs(exprs: &[Expr], out: &mut Vec<Fun>) {
-    for e in exprs {
-        collect_fun_refs_from_expr(e, out);
-    }
+    for e in exprs { walk_expr(&e.x, out); }
 }
 
-fn collect_fun_refs_from_exprx(expr: &ExprX, out: &mut Vec<Fun>) {
+/// Walk an ExprX, collecting all function references.
+/// Handles ALL ExprX variants explicitly — no silent catch-all.
+fn walk_expr(expr: &ExprX, out: &mut Vec<Fun>) {
     match expr {
-        ExprX::Call(target, args, _) => {
-            if let CallTarget::Fun(_, fun, _, _, _, _) = target {
-                out.push(fun.clone());
-            }
-            for arg in args.iter() {
-                collect_fun_refs_from_expr(arg, out);
-            }
+        // Function references
+        ExprX::Call(target, args, extra) => {
+            walk_call_target(target, out);
+            for arg in args.iter() { walk_expr(&arg.x, out); }
+            if let Some(e) = extra { walk_expr(&e.x, out); }
         }
-        ExprX::ConstVar(fun, _) => {
+        ExprX::ConstVar(fun, _) | ExprX::StaticVar(fun) | ExprX::ExecFnByName(fun) => {
             out.push(fun.clone());
         }
-        // Recurse into subexpressions
+        ExprX::Fuel(fun, _, _) => {
+            out.push(fun.clone());
+        }
+
+        // Unary
         ExprX::Unary(_, e) | ExprX::UnaryOpr(_, e) | ExprX::Loc(e) => {
-            collect_fun_refs_from_expr(e, out);
+            walk_expr(&e.x, out);
         }
+
+        // Binary
         ExprX::Binary(_, a, b) | ExprX::BinaryOpr(_, a, b) => {
-            collect_fun_refs_from_expr(a, out);
-            collect_fun_refs_from_expr(b, out);
+            walk_expr(&a.x, out);
+            walk_expr(&b.x, out);
         }
+
+        // Control flow
         ExprX::If(c, t, e) => {
-            collect_fun_refs_from_expr(c, out);
-            collect_fun_refs_from_expr(t, out);
-            if let Some(e) = e {
-                collect_fun_refs_from_expr(e, out);
+            walk_expr(&c.x, out);
+            walk_expr(&t.x, out);
+            if let Some(e) = e { walk_expr(&e.x, out); }
+        }
+        ExprX::Match(place, arms) => {
+            walk_place(&place.x, out);
+            for arm in arms.iter() {
+                walk_expr(&arm.x.guard.x, out);
+                walk_expr(&arm.x.body.x, out);
             }
         }
+        ExprX::Loop { cond, body, invs, decrease, .. } => {
+            if let Some(c) = cond { walk_expr(&c.x, out); }
+            walk_expr(&body.x, out);
+            for inv in invs.iter() { walk_expr(&inv.inv.x, out); }
+            for d in decrease.iter() { walk_expr(&d.x, out); }
+        }
+
+        // Quantifiers / closures
         ExprX::Quant(_, _, body) | ExprX::Closure(_, body) => {
-            collect_fun_refs_from_expr(body, out);
+            walk_expr(&body.x, out);
         }
+        ExprX::NonSpecClosure { body, requires, ensures, external_spec, .. } => {
+            walk_expr(&body.x, out);
+            for r in requires.iter() { walk_expr(&r.x, out); }
+            for e in ensures.iter() { walk_expr(&e.x, out); }
+            if let Some(spec) = external_spec { walk_expr(&spec.1.x, out); }
+        }
+
+        // Choose / triggers
         ExprX::Choose { cond, body, .. } => {
-            collect_fun_refs_from_expr(cond, out);
-            collect_fun_refs_from_expr(body, out);
+            walk_expr(&cond.x, out);
+            walk_expr(&body.x, out);
         }
-        ExprX::WithTriggers { body, .. } => {
-            collect_fun_refs_from_expr(body, out);
+        ExprX::WithTriggers { triggers, body } => {
+            for trig in triggers.iter() {
+                for e in trig.iter() { walk_expr(&e.x, out); }
+            }
+            walk_expr(&body.x, out);
         }
+
+        // Blocks
         ExprX::Block(stmts, final_expr) => {
             for stmt in stmts.iter() {
                 match &stmt.x {
-                    StmtX::Expr(e) => collect_fun_refs_from_expr(e, out),
-                    StmtX::Decl { .. } => {} // TODO: handle decl init exprs
+                    StmtX::Expr(e) => walk_expr(&e.x, out),
+                    StmtX::Decl { init, els, .. } => {
+                        if let Some(place) = init { walk_place(&place.x, out); }
+                        if let Some(e) = els { walk_expr(&e.x, out); }
+                    }
                 }
             }
-            if let Some(e) = final_expr {
-                collect_fun_refs_from_expr(e, out);
-            }
+            if let Some(e) = final_expr { walk_expr(&e.x, out); }
         }
-        ExprX::ReadPlace(place, _) => {
-            collect_fun_refs_from_place(place, out);
+
+        // Constructors
+        ExprX::Ctor(_, _, binders, update_tail) => {
+            for b in binders.iter() { walk_expr(&b.a.x, out); }
+            if let Some(tail) = update_tail { walk_place(&tail.place.x, out); }
         }
-        ExprX::Ghost { expr, .. } | ExprX::ProofInSpec(expr) => {
-            collect_fun_refs_from_expr(expr, out);
+        ExprX::ArrayLiteral(exprs) | ExprX::Multi(_, exprs) => {
+            for e in exprs.iter() { walk_expr(&e.x, out); }
         }
-        ExprX::Multi(_, exprs) => {
-            for e in exprs.iter() {
-                collect_fun_refs_from_expr(e, out);
-            }
+
+        // Assertions
+        ExprX::AssertAssume { expr, .. } | ExprX::AssertCompute(expr, _) => {
+            walk_expr(&expr.x, out);
         }
-        // Leaf nodes with no function references
+        ExprX::AssertAssumeUserDefinedTypeInvariant { expr, fun, .. } => {
+            walk_expr(&expr.x, out);
+            out.push(fun.clone());
+        }
+        ExprX::AssertBy { require, ensure, proof, .. } => {
+            walk_expr(&require.x, out);
+            walk_expr(&ensure.x, out);
+            walk_expr(&proof.x, out);
+        }
+        ExprX::AssertQuery { requires, ensures, proof, .. } => {
+            for r in requires.iter() { walk_expr(&r.x, out); }
+            for e in ensures.iter() { walk_expr(&e.x, out); }
+            walk_expr(&proof.x, out);
+        }
+
+        // Assignments
+        ExprX::Assign { lhs, rhs, .. } => {
+            walk_expr(&lhs.x, out);
+            walk_expr(&rhs.x, out);
+        }
+        ExprX::AssignToPlace { place, rhs, .. } => {
+            walk_place(&place.x, out);
+            walk_expr(&rhs.x, out);
+        }
+
+        // Ghost / mode wrappers
+        ExprX::Ghost { expr, .. } | ExprX::ProofInSpec(expr)
+        | ExprX::NeverToAny(expr) | ExprX::Old(expr) | ExprX::Return(Some(expr)) => {
+            walk_expr(&expr.x, out);
+        }
+
+        // Places
+        ExprX::ReadPlace(place, _) | ExprX::BorrowMut(place)
+        | ExprX::TwoPhaseBorrowMut(place) | ExprX::BorrowMutTracked(place) => {
+            walk_place(&place.x, out);
+        }
+        ExprX::ImplicitReborrowOrSpecRead(place, _, _) => {
+            walk_place(&place.x, out);
+        }
+        ExprX::EvalAndResolve(a, b) => {
+            walk_expr(&a.x, out);
+            walk_expr(&b.x, out);
+        }
+        ExprX::OpenInvariant(e1, _, e2, _) => {
+            walk_expr(&e1.x, out);
+            walk_expr(&e2.x, out);
+        }
+
+        // Leaf nodes — no function references
         ExprX::Const(_) | ExprX::Var(_) | ExprX::VarLoc(_) | ExprX::VarAt(..)
-        | ExprX::NullaryOpr(_) | ExprX::Header(_) | ExprX::Nondeterministic => {}
-        // Other expressions — conservatively skip (no function refs in most)
-        _ => {}
+        | ExprX::NullaryOpr(_) | ExprX::Header(_) | ExprX::Nondeterministic
+        | ExprX::BreakOrContinue { .. } | ExprX::Return(None)
+        | ExprX::RevealString(_) | ExprX::AirStmt(_) => {}
     }
 }
 
-fn collect_fun_refs_from_place(place: &Place, out: &mut Vec<Fun>) {
-    match &place.x {
+/// Extract function references from a CallTarget.
+fn walk_call_target(target: &CallTarget, out: &mut Vec<Fun>) {
+    match target {
+        CallTarget::Fun(_, fun, _, _, _, _) => out.push(fun.clone()),
+        CallTarget::FnSpec(expr) => walk_expr(&expr.x, out),
+        // BuiltinSpecFun references built-in operations (e.g., Seq.len),
+        // not user-defined functions. No Fun to collect.
+        CallTarget::BuiltinSpecFun(_, _, _) => {}
+    }
+}
+
+/// Walk a PlaceX, collecting function references from any sub-expressions.
+fn walk_place(place: &PlaceX, out: &mut Vec<Fun>) {
+    match place {
         PlaceX::Local(_) => {}
         PlaceX::Field(_, base) | PlaceX::DerefMut(base) | PlaceX::ModeUnwrap(base, _) => {
-            collect_fun_refs_from_place(base, out);
+            walk_place(&base.x, out);
         }
         PlaceX::Index(base, idx, _, _) => {
-            collect_fun_refs_from_place(base, out);
-            collect_fun_refs_from_expr(idx, out);
+            walk_place(&base.x, out);
+            walk_expr(&idx.x, out);
         }
-        PlaceX::Temporary(e) => {
-            collect_fun_refs_from_expr(e, out);
+        PlaceX::Temporary(e) => walk_expr(&e.x, out),
+        PlaceX::WithExpr(e, place) => {
+            walk_expr(&e.x, out);
+            walk_place(&place.x, out);
         }
-        _ => {}
+        PlaceX::UserDefinedTypInvariantObligation(place, fun) => {
+            walk_place(&place.x, out);
+            out.push(fun.clone());
+        }
     }
 }
