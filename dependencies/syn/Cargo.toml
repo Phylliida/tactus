@@ -1,0 +1,220 @@
+[package]
+name = "verus_syn"
+version = "0.0.0-2026-04-05-0114"
+authors = ["David Tolnay <dtolnay@gmail.com>", "The Verus Contributors"]
+categories = ["development-tools::procedural-macro-helpers", "parser-implementations"]
+description = "Parser for Rust source code extended to support Verus"
+documentation = "https://docs.rs/syn"
+edition = "2021"
+include = [
+    "/benches/**",
+    "/Cargo.toml",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+    "/README.md",
+    "/src/**",
+    "/tests/**",
+]
+keywords = ["macros", "syn"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dtolnay/syn"
+rust-version = "1.68"
+
+[features]
+default = ["full", "derive", "parsing", "printing", "clone-impls", "proc-macro"]
+derive = []
+full = []
+parsing = []
+printing = ["dep:quote"]
+visit = []
+visit-mut = []
+fold = []
+clone-impls = []
+extra-traits = []
+proc-macro = ["proc-macro2/proc-macro", "quote?/proc-macro"]
+# test = ["syn-test-suite/all-features"]
+
+[dependencies]
+proc-macro2 = { version = "1.0.101", default-features = false, features = ["span-locations"] }
+quote = { version = "1.0.35", optional = true, default-features = false }
+unicode-ident = "1"
+
+[dev-dependencies]
+anyhow = "1"
+automod = "1"
+insta = "1"
+ref-cast = "1"
+rustversion = "1"
+# syn-test-suite = { version = "0", path = "tests/features" }
+termcolor = "1"
+
+[target.'cfg(not(miri))'.dev-dependencies]
+flate2 = "1"
+rayon = "1"
+reqwest = { version = "0.12", features = ["blocking"] }
+tar = "0.4.16"
+walkdir = "2.3.2"
+
+[lib]
+doctest = false
+
+[[bench]]
+name = "rust"
+harness = false
+required-features = ["full", "parsing"]
+
+[[bench]]
+name = "file"
+required-features = ["full", "parsing"]
+
+[package.metadata.docs.rs]
+all-features = true
+targets = ["x86_64-unknown-linux-gnu"]
+rustdoc-args = [
+    "--generate-link-to-definition",
+    "--generate-macro-expansion",
+    "--extend-css=src/gen/token.css",
+    "--extern-html-root-url=core=https://doc.rust-lang.org",
+    "--extern-html-root-url=alloc=https://doc.rust-lang.org",
+    "--extern-html-root-url=std=https://doc.rust-lang.org",
+    "--extern-html-root-url=proc_macro=https://doc.rust-lang.org",
+]
+
+[package.metadata.playground]
+features = ["full", "visit", "visit-mut", "fold", "extra-traits"]
+
+[[test]]
+name = "regression"
+test = false
+
+[[test]]
+name = "test_asyncness"
+test = false
+
+[[test]]
+name = "test_attribute"
+test = false
+
+[[test]]
+name = "test_derive_input"
+test = false
+
+[[test]]
+name = "test_expr"
+test = false
+
+[[test]]
+name = "test_generics"
+test = false
+
+[[test]]
+name = "test_grouping"
+test = false
+
+[[test]]
+name = "test_ident"
+test = false
+
+[[test]]
+name = "test_item"
+test = false
+
+[[test]]
+name = "test_lit"
+test = false
+
+[[test]]
+name = "test_meta"
+test = false
+
+[[test]]
+name = "test_parse_buffer"
+test = false
+
+[[test]]
+name = "test_parse_stream"
+test = false
+
+[[test]]
+name = "test_parse_quote"
+test = false
+
+[[test]]
+name = "test_pat"
+test = false
+
+[[test]]
+name = "test_path"
+test = false
+
+[[test]]
+name = "test_precedence"
+test = false
+
+[[test]]
+name = "test_punctuated"
+test = false
+
+[[test]]
+name = "test_receiver"
+test = false
+
+[[test]]
+name = "test_round_trip"
+test = false
+
+[[test]]
+name = "test_shebang"
+test = false
+
+[[test]]
+name = "test_size"
+test = false
+
+[[test]]
+name = "test_stmt"
+test = false
+
+[[test]]
+name = "test_token_trees"
+test = false
+
+[[test]]
+name = "test_ty"
+test = false
+
+[[test]]
+name = "test_unparenthesize"
+test = false
+
+[[test]]
+name = "test_visibility"
+test = false
+
+[[test]]
+name = "zzz_stable"
+test = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(doc_cfg)',
+  'cfg(syn_omit_await_from_token_macro)',
+  'cfg(syn_no_non_exhaustive)',
+  'cfg(syn_no_const_vec_new)',
+  'cfg(syn_no_negative_literal_parse)',
+  'cfg(test)',
+] }
+
+# [workspace]
+# members = [
+#     "dev",
+#     "examples/dump-syntax",
+#     "examples/heapsize/example",
+#     "examples/heapsize/heapsize",
+#     "examples/heapsize/heapsize_derive",
+#     "examples/lazy-static/example",
+#     "examples/lazy-static/lazy-static",
+#     "examples/trace-var/example",
+#     "examples/trace-var/trace-var",
+#     "tests/features",
+# ]

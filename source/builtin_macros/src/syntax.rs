@@ -4065,9 +4065,16 @@ impl VisitMut for Visitor {
             let span = fun.block.brace_token.span.join();
             fun.attrs.push(mk_verus_attr(span, quote! { tactic_proof }));
 
-            // Replace body with dummy — the real proof is in the tactic block,
-            // extracted by tree-sitter at Lean generation time.
-            // We keep the original block in the source for tree-sitter to read.
+            // Capture tactic body text before replacing with dummy.
+            // Strip outer braces — we want the inner tactic text.
+            let body_tokens = fun.block.stmts.iter()
+                .map(|s| s.to_token_stream().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let body_str = body_tokens.trim().to_string();
+            fun.attrs.push(mk_verus_attr(span, quote! { tactic_body = #body_str }));
+
+            // Replace body with dummy — the real proof text is stored in the attribute.
             fun.block.stmts = vec![Stmt::Expr(
                 Expr::Verbatim(quote_spanned!(span => unimplemented!())),
                 None,
@@ -4109,6 +4116,14 @@ impl VisitMut for Visitor {
         if is_tactic_proof && self.erase_ghost.keep() {
             let span = method.block.brace_token.span.join();
             method.attrs.push(mk_verus_attr(span, quote! { tactic_proof }));
+
+            let body_tokens = method.block.stmts.iter()
+                .map(|s| s.to_token_stream().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let body_str = body_tokens.trim().to_string();
+            method.attrs.push(mk_verus_attr(span, quote! { tactic_body = #body_str }));
+
             method.block.stmts = vec![Stmt::Expr(
                 Expr::Verbatim(quote_spanned!(span => unimplemented!())),
                 None,

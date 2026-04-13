@@ -1,0 +1,473 @@
+#![allow(unused_imports)]
+use super::super::prelude::*;
+use super::super::wrapping::*;
+
+use core::cmp::Ordering;
+
+macro_rules! num_specs {
+    ($uN: ty, $iN: ty, $mod_u_tmp:ident, $mod_i_tmp:ident, $mod_u:ident, $mod_i:ident, $range:expr) => {
+        verus! {
+
+        // Unsigned ints (u8, u16, etc.)
+
+        // Put in separate module to avoid name collisions.
+        // Names don't matter - the user uses the stdlib functions.
+        mod $mod_u_tmp {
+            use super::*;
+
+            pub assume_specification[<$uN as Clone>::clone](x: &$uN) -> (res: $uN)
+                ensures res == x;
+
+            impl super::super::cmp::PartialEqSpecImpl for $uN {
+                open spec fn obeys_eq_spec() -> bool {
+                    true
+                }
+
+                open spec fn eq_spec(&self, other: &$uN) -> bool {
+                    *self == *other
+                }
+            }
+
+            impl super::super::cmp::PartialOrdSpecImpl for $uN {
+                open spec fn obeys_partial_cmp_spec() -> bool {
+                    true
+                }
+
+                open spec fn partial_cmp_spec(&self, other: &$uN) -> Option<Ordering> {
+                    if *self < *other {
+                        Some(Ordering::Less)
+                    } else if *self > *other {
+                        Some(Ordering::Greater)
+                    } else {
+                        Some(Ordering::Equal)
+                    }
+                }
+            }
+
+            impl super::super::cmp::OrdSpecImpl for $uN {
+                open spec fn obeys_cmp_spec() -> bool {
+                    true
+                }
+
+                open spec fn cmp_spec(&self, other: &$uN) -> Ordering {
+                    if *self < *other {
+                        Ordering::Less
+                    } else if *self > *other {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Equal
+                    }
+                }
+            }
+
+            pub assume_specification[<$uN as PartialEq<$uN>>::eq](x: &$uN, y: &$uN) -> bool;
+
+            pub assume_specification[<$uN as PartialEq<$uN>>::ne](x: &$uN, y: &$uN) -> bool;
+
+            pub assume_specification[<$uN as Ord>::cmp](x: &$uN, y: &$uN) -> Ordering;
+
+            pub assume_specification[<$uN as PartialOrd<$uN>>::partial_cmp](x: &$uN, y: &$uN) -> Option<Ordering>;
+
+            pub assume_specification[<$uN as PartialOrd<$uN>>::lt](x: &$uN, y: &$uN) -> bool;
+
+            pub assume_specification[<$uN as PartialOrd<$uN>>::le](x: &$uN, y: &$uN) -> bool;
+
+            pub assume_specification[<$uN as PartialOrd<$uN>>::gt](x: &$uN, y: &$uN) -> bool;
+
+            pub assume_specification[<$uN as PartialOrd<$uN>>::ge](x: &$uN, y: &$uN) -> bool;
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$uN>::wrapping_add](x: $uN, y: $uN) -> $uN
+                returns $mod_u::wrapping_add(x, y);
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$uN>::wrapping_add_signed](x: $uN, y: $iN) -> $uN
+                returns $mod_u::wrapping_add_signed(x, y);
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$uN>::wrapping_sub](x: $uN, y: $uN) -> $uN
+                returns $mod_u::wrapping_sub(x, y);
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$uN>::wrapping_mul](x: $uN, y: $uN) -> $uN
+                returns $mod_u::wrapping_mul(x, y);
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$uN>::checked_add](x: $uN, y: $uN) -> Option<$uN>
+                returns (
+                    if x + y > <$uN>::MAX {
+                        None
+                    } else {
+                        Some((x + y) as $uN)
+                    }
+                );
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$uN>::checked_add_signed](x: $uN, y: $iN) -> Option<$uN>
+                returns (
+                    if x + y > <$uN>::MAX || x + y < 0 {
+                        None
+                    } else {
+                        Some((x + y) as $uN)
+                    }
+                );
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$uN>::checked_sub](x: $uN, y: $uN) -> Option<$uN>
+                returns (
+                    if x - y < 0 {
+                        None
+                    } else {
+                        Some((x - y) as $uN)
+                    }
+                );
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$uN>::checked_mul](x: $uN, y: $uN) -> Option<$uN>
+                returns (
+                    if x * y > <$uN>::MAX {
+                        None
+                    } else {
+                        Some((x * y) as $uN)
+                    }
+                );
+
+            pub open spec fn checked_div(x: $uN, y: $uN) -> Option<$uN> {
+                if y == 0 {
+                    None
+                } else {
+                    Some(x / y)
+                }
+            }
+
+            #[verifier::when_used_as_spec(checked_div)]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$uN>::checked_div](lhs: $uN, rhs: $uN) -> (result: Option<$uN>)
+                ensures
+                    result == checked_div(lhs, rhs);
+
+            #[verifier::when_used_as_spec(checked_div)]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$uN>::checked_div_euclid](lhs: $uN, rhs: $uN) -> (result: Option<$uN>)
+                ensures
+                    // checked_div is the same as checked_div_euclid for unsigned ints
+                    result == checked_div(lhs, rhs);
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$uN>::checked_rem](lhs: $uN, rhs: $uN) -> Option<$uN>
+                returns (
+                    if rhs == 0 {
+                        None
+                    }
+                    else {
+                        Some((lhs % rhs) as $uN)
+                    }
+                );
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$uN>::checked_rem_euclid](lhs: $uN, rhs: $uN) -> Option<$uN>
+                returns (
+                    if rhs == 0 {
+                        None
+                    }
+                    else {
+                        Some((lhs % rhs) as $uN)
+                    }
+                );
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$uN>::saturating_add](x: $uN, y: $uN) -> $uN
+                returns (
+                    if x + y > <$uN>::MAX {
+                        <$uN>::MAX
+                    } else {
+                        (x + y) as $uN
+                    }
+                );
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$uN>::saturating_sub](x: $uN, y: $uN) -> $uN
+                returns (
+                    if x - y < <$uN>::MIN {
+                        <$uN>::MIN
+                    } else {
+                        (x - y) as $uN
+                    }
+                );
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$uN>::is_multiple_of](x: $uN, y: $uN) -> bool
+                returns (
+                    if y == 0 { x == 0 } else { x % y == 0 }
+                );
+        }
+
+        // Signed ints (i8, i16, etc.)
+
+        mod $mod_i_tmp {
+            use super::*;
+
+            pub assume_specification[<$iN as Clone>::clone](x: &$iN) -> (res: $iN)
+                ensures res == x;
+
+            impl super::super::cmp::PartialEqSpecImpl for $iN {
+                open spec fn obeys_eq_spec() -> bool {
+                    true
+                }
+
+                open spec fn eq_spec(&self, other: &$iN) -> bool {
+                    *self == *other
+                }
+            }
+
+            impl super::super::cmp::PartialOrdSpecImpl for $iN {
+                open spec fn obeys_partial_cmp_spec() -> bool {
+                    true
+                }
+
+                open spec fn partial_cmp_spec(&self, other: &$iN) -> Option<Ordering> {
+                    if *self < *other {
+                        Some(Ordering::Less)
+                    } else if *self > *other {
+                        Some(Ordering::Greater)
+                    } else {
+                        Some(Ordering::Equal)
+                    }
+                }
+            }
+
+            impl super::super::cmp::OrdSpecImpl for $iN {
+                open spec fn obeys_cmp_spec() -> bool {
+                    true
+                }
+
+                open spec fn cmp_spec(&self, other: &$iN) -> Ordering {
+                    if *self < *other {
+                        Ordering::Less
+                    } else if *self > *other {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Equal
+                    }
+                }
+            }
+
+            pub assume_specification[<$iN as PartialEq<$iN>>::eq](x: &$iN, y: &$iN) -> bool;
+
+            pub assume_specification[<$iN as PartialEq<$iN>>::ne](x: &$iN, y: &$iN) -> bool;
+
+            pub assume_specification[<$iN as Ord>::cmp](x: &$iN, y: &$iN) -> Ordering;
+
+            pub assume_specification[<$iN as PartialOrd<$iN>>::partial_cmp](x: &$iN, y: &$iN) -> Option<Ordering>;
+
+            pub assume_specification[<$iN as PartialOrd<$iN>>::lt](x: &$iN, y: &$iN) -> bool;
+
+            pub assume_specification[<$iN as PartialOrd<$iN>>::le](x: &$iN, y: &$iN) -> bool;
+
+            pub assume_specification[<$iN as PartialOrd<$iN>>::gt](x: &$iN, y: &$iN) -> bool;
+
+            pub assume_specification[<$iN as PartialOrd<$iN>>::ge](x: &$iN, y: &$iN) -> bool;
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$iN>::wrapping_add](x: $iN, y: $iN) -> $iN
+                returns $mod_i::wrapping_add(x, y);
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$iN>::wrapping_add_unsigned](x: $iN, y: $uN) -> $iN
+                returns $mod_i::wrapping_add_unsigned(x, y);
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$iN>::wrapping_sub](x: $iN, y: $iN) -> (res: $iN)
+                returns $mod_i::wrapping_sub(x, y);
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$iN>::wrapping_mul](x: $iN, y: $iN) -> $iN
+                returns $mod_i::wrapping_mul(x, y);
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$iN>::checked_add](x: $iN, y: $iN) -> Option<$iN>
+                returns (
+                    if x + y > <$iN>::MAX || x + y < <$iN>::MIN {
+                        None
+                    } else {
+                        Some((x + y) as $iN)
+                    }
+                );
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$iN>::checked_add_unsigned](x: $iN, y: $uN) -> Option<$iN>
+                returns (
+                    if x + y > <$iN>::MAX {
+                        None
+                    } else {
+                        Some((x + y) as $iN)
+                    }
+                );
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$iN>::checked_sub](x: $iN, y: $iN) -> Option<$iN>
+                returns (
+                    if x - y > <$iN>::MAX || x - y < <$iN>::MIN {
+                        None
+                    } else {
+                        Some((x - y) as $iN)
+                    }
+                );
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$iN>::checked_sub_unsigned](x: $iN, y: $uN) -> Option<$iN>
+                returns (
+                    if x - y < <$iN>::MIN {
+                        None
+                    } else {
+                        Some((x - y) as $iN)
+                    }
+                );
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$iN>::checked_mul](x: $iN, y: $iN) -> Option<$iN>
+                returns (
+                    if x * y > <$iN>::MAX || x * y < <$iN>::MIN {
+                        None
+                    } else {
+                        Some((x * y) as $iN)
+                    }
+                );
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$iN>::checked_div](lhs: $iN, rhs: $iN) -> Option<$iN>
+                returns (
+                    if rhs == 0 {
+                        None
+                    }
+                    else {
+                        let x = lhs as int;
+                        let d = rhs as int;
+                        let output = if x == 0 {
+                            0
+                        } else if x > 0 && d > 0 {
+                            x / d
+                        } else if x < 0 && d < 0 {
+                            ((x * -1) / (d * -1))
+                        } else if x < 0 {
+                            ((x * -1) / d) * -1
+                        } else {  // d < 0
+                            (x / (d * -1)) * -1
+                        };
+                        if output < <$iN>::MIN || output > <$iN>::MAX {
+                            None
+                        } else {
+                            Some(output as $iN)
+                        }
+                    }
+                );
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$iN>::checked_div_euclid](lhs: $iN, rhs: $iN) -> Option<$iN>
+                returns (
+                    if rhs == 0 {
+                        None
+                    }
+                    else if <$iN>::MIN <= lhs / rhs <= <$iN>::MAX {
+                        Some((lhs / rhs) as $iN)
+                    }
+                    else {
+                        None
+                    }
+                );
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$iN>::checked_rem](lhs: $iN, rhs: $iN) -> Option<$iN>
+                returns (
+                    if rhs == 0 {
+                        None
+                    }
+                    else {
+                        let x = lhs as int;
+                        let d = rhs as int;
+                        let output = if x == 0 {
+                            0
+                        } else if x > 0 && d > 0 {
+                            x % d
+                        } else if x < 0 && d < 0 {
+                            ((x * -1) % (d * -1)) * -1
+                        } else if x < 0 {
+                            ((x * -1) % d) * -1
+                        } else {  // d < 0
+                            x % (d * -1)
+                        };
+                        if output < <$iN>::MIN || output > <$iN>::MAX {
+                            None
+                        } else {
+                            Some(output as $iN)
+                        }
+                    }
+                );
+
+            #[verifier::allow_in_spec]
+            #[cfg(not(verus_verify_core))]
+            pub assume_specification[<$iN>::checked_rem_euclid](lhs: $iN, rhs: $iN) -> Option<$iN>
+                returns (
+                    if rhs == 0 {
+                        None
+                    }
+                    else if <$iN>::MIN <= lhs % rhs <= <$iN>::MAX {
+                        Some((lhs % rhs) as $iN)
+                    }
+                    else {
+                        None
+                    }
+                );
+        }
+
+        }
+    };
+}
+
+num_specs!(u8, i8, u8_specs_tmp, i8_specs_tmp, u8_specs, i8_specs, 0x100);
+num_specs!(u16, i16, u16_specs_tmp, i16_specs_tmp, u16_specs, i16_specs, 0x1_0000);
+num_specs!(u32, i32, u32_specs_tmp, i32_specs_tmp, u32_specs, i32_specs, 0x1_0000_0000);
+num_specs!(u64, i64, u64_specs_tmp, i64_specs_tmp, u64_specs, i64_specs, 0x1_0000_0000_0000_0000);
+num_specs!(
+    u128,
+    i128,
+    u128_specs_tmp,
+    i128_specs_tmp,
+    u128_specs,
+    i128_specs,
+    0x1_0000_0000_0000_0000_0000_0000_0000_0000
+);
+num_specs!(
+    usize,
+    isize,
+    usize_specs_tmp,
+    isize_specs_tmp,
+    usize_specs,
+    isize_specs,
+    (usize::MAX - usize::MIN + 1)
+);

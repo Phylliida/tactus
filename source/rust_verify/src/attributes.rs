@@ -362,6 +362,8 @@ pub(crate) enum Attr {
     TrackedTakeOption,
     // Tactus: proof fn body is a Lean tactic block, verified by Lean kernel
     TacticProof,
+    // Tactus: captured tactic body text (ASCII representation from proc macro)
+    TacticBody(String),
 }
 
 fn get_trigger_arg(span: Span, attr_tree: &AttrTree) -> Result<u64, VirErr> {
@@ -454,6 +456,11 @@ pub(crate) fn parse_attrs(
                 AttrTree::Fun(_, arg, None) if arg == "verus_macro" => v.push(Attr::VerusMacro),
                 AttrTree::Fun(_, arg, None) if arg == "external_body" => v.push(Attr::ExternalBody),
                 AttrTree::Fun(_, arg, None) if arg == "tactic_proof" => v.push(Attr::TacticProof),
+                AttrTree::Fun(_, arg, Some(box [AttrTree::Lit(LitKind::Str, body)]))
+                    if arg == "tactic_body" =>
+                {
+                    v.push(Attr::TacticBody(body.clone()))
+                }
                 AttrTree::Fun(_, arg, None) if arg == "external" => v.push(Attr::External),
                 AttrTree::Fun(_, arg, None) if arg == "verify" => v.push(Attr::Verify),
                 AttrTree::Fun(_, arg, None) if arg == "opaque" => v.push(Attr::Opaque),
@@ -1144,6 +1151,8 @@ pub(crate) struct VerifierAttrs {
     pub(crate) tracked_take_option: bool,
     // Tactus: proof fn body is a Lean tactic block
     pub(crate) tactic_proof: bool,
+    // Tactus: captured tactic body text
+    pub(crate) tactic_body: Option<String>,
 }
 
 // Check for the `get_field_many_variants` attribute
@@ -1320,6 +1329,7 @@ pub(crate) fn get_verifier_attrs_maybe_check(
         tracked_swap: false,
         tracked_take_option: false,
         tactic_proof: false,
+        tactic_body: None,
     };
     let mut unsupported_rustc_attr: Option<(String, Span)> = None;
     for attr in parse_attrs(attrs, diagnostics)? {
@@ -1405,6 +1415,7 @@ pub(crate) fn get_verifier_attrs_maybe_check(
             Attr::TrackedSwap => vs.tracked_swap = true,
             Attr::TrackedTakeOption => vs.tracked_take_option = true,
             Attr::TacticProof => vs.tactic_proof = true,
+            Attr::TacticBody(body) => vs.tactic_body = Some(body.clone()),
             _ => {}
         }
     }
