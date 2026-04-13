@@ -61,8 +61,10 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
         }
 
         ExprX::Unary(UnaryOp::Clip { range, .. }, inner) => {
-            // `as nat` / `as int` / `as u32` etc.
-            // Check source type to decide if conversion is needed or if it's identity.
+            // `as nat` / `as int` etc. In spec mode, VIR uses mathematical Int/Nat,
+            // so clips between same-signedness families are identity.
+            // For fixed-width clips (U(32), I(64)), modular arithmetic would apply
+            // in exec mode — but spec mode just checks the range as a separate obligation.
             let src_is_nat = matches!(&*inner.typ, TypX::Int(
                 IntRange::Nat | IntRange::U(_) | IntRange::USize | IntRange::Char
             ));
@@ -70,22 +72,19 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
                 IntRange::Nat | IntRange::U(_) | IntRange::USize | IntRange::Char
             );
             if src_is_nat == dst_is_nat {
-                // Same signedness family — identity in spec mode
                 write_expr(out, &inner.x);
             } else if dst_is_nat {
-                // Int → Nat: Int.toNat (truncates negative to 0)
                 out.push_str("Int.toNat ");
                 write_expr_prec(out, &inner.x, PREC_ATOM, true);
             } else {
-                // Nat → Int: implicit coercion (↑) in Lean
+                // Nat → Int: implicit coercion in Lean
                 write_expr(out, &inner.x);
             }
         }
 
-        ExprX::Unary(UnaryOp::CoerceMode { .. }, inner) => {
-            // Ghost/Tracked mode coercions are transparent in spec
-            write_expr(out, &inner.x);
-        }
+        // Transparent unary ops: mode coercions, trigger annotations
+        ExprX::Unary(UnaryOp::CoerceMode { .. }, inner) => write_expr(out, &inner.x),
+        ExprX::Unary(UnaryOp::Trigger(_), inner) => write_expr(out, &inner.x),
 
         ExprX::Call(target, args, _) => {
             match target {
@@ -163,6 +162,12 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
 
         ExprX::Header(_) => {} // skip header expressions (requires/ensures markers)
 
+        ExprX::Ctor(..) => write_todo(out, "Ctor"),
+        ExprX::Closure(..) => write_todo(out, "Closure"),
+        ExprX::Match(..) => write_todo(out, "Match"),
+        ExprX::Assign { .. } => write_todo(out, "Assign"),
+        ExprX::Loop { .. } => write_todo(out, "Loop"),
+        ExprX::Return(_) => write_todo(out, "Return"),
         _ => write_todo(out, "expr"),
     }
 }
