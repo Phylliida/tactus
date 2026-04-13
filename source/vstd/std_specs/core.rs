@@ -1,0 +1,246 @@
+use super::super::prelude::*;
+use core::marker::PointeeSized;
+
+use verus as verus_;
+
+verus_! {
+
+#[verifier::external_trait_specification]
+pub trait ExTuple {
+    type ExternalTraitSpecificationFor: core::marker::Tuple;
+}
+
+#[verifier::external_trait_specification]
+pub trait ExFnOnce<Args: core::marker::Tuple> {
+    type ExternalTraitSpecificationFor: core::ops::FnOnce<Args>;
+
+    type Output;
+}
+
+#[verifier::external_trait_specification]
+pub trait ExFnMut<Args: core::marker::Tuple>: FnOnce<Args> {
+    type ExternalTraitSpecificationFor: core::ops::FnMut<Args>;
+}
+
+#[verifier::external_trait_specification]
+pub trait ExFn<Args: core::marker::Tuple>: FnMut<Args> {
+    type ExternalTraitSpecificationFor: core::ops::Fn<Args>;
+}
+
+#[verifier::external_trait_specification]
+pub trait ExDeref: PointeeSized {
+    type ExternalTraitSpecificationFor: core::ops::Deref;
+
+    type Target: ?Sized;
+
+    fn deref(&self) -> &Self::Target;
+}
+
+#[verifier::external_trait_specification]
+#[verifier::external_trait_extension(IndexSpec via IndexSpecImpl)]
+pub trait ExIndex<Idx> where Idx: ?Sized {
+    type ExternalTraitSpecificationFor: core::ops::Index<Idx>;
+
+    type Output: ?Sized;
+
+    spec fn index_req(&self, index: &Idx) -> bool;
+
+    fn index(&self, index: Idx) -> (output: &Self::Output) where Idx: Sized
+        requires
+            self.index_req(&index);
+}
+
+#[verifier::external_trait_specification]
+pub trait ExIndexMut<Idx>: core::ops::Index<Idx> where Idx: ?Sized {
+    type ExternalTraitSpecificationFor: core::ops::IndexMut<Idx>;
+}
+
+#[verifier::external_trait_specification]
+pub trait ExInteger: Copy {
+    type ExternalTraitSpecificationFor: Integer;
+}
+
+#[verifier::external_trait_specification]
+pub trait ExSpecOrd<Rhs> {
+    type ExternalTraitSpecificationFor: SpecOrd<Rhs>;
+}
+
+#[cfg(not(verus_verify_core))]
+#[verifier::external_trait_specification]
+pub trait ExAllocator {
+    type ExternalTraitSpecificationFor: core::alloc::Allocator;
+}
+
+#[verifier::external_trait_specification]
+pub trait ExFreeze: PointeeSized {
+    type ExternalTraitSpecificationFor: core::marker::Freeze;
+}
+
+#[verifier::external_trait_specification]
+pub trait ExDebug: PointeeSized {
+    type ExternalTraitSpecificationFor: core::fmt::Debug;
+}
+
+#[verifier::external_trait_specification]
+pub trait ExDisplay: PointeeSized {
+    type ExternalTraitSpecificationFor: core::fmt::Display;
+}
+
+#[verifier::external_trait_specification]
+pub trait ExHash: PointeeSized {
+    type ExternalTraitSpecificationFor: core::hash::Hash;
+}
+
+#[verifier::external_trait_specification]
+pub trait ExPtrPointee: PointeeSized {
+    type ExternalTraitSpecificationFor: core::ptr::Pointee;
+
+    type Metadata:
+        Copy + Send + Sync + Ord + core::hash::Hash + Unpin + core::fmt::Debug + Sized + core::marker::Freeze;
+}
+
+#[verifier::external_trait_specification]
+pub trait ExIterator {
+    type ExternalTraitSpecificationFor: core::iter::Iterator;
+
+    type Item;
+
+    fn next(&mut self) -> Option<Self::Item>;
+}
+
+#[verifier::external_trait_specification]
+pub trait ExIntoIterator {
+    type ExternalTraitSpecificationFor: core::iter::IntoIterator;
+}
+
+#[verifier::external_trait_specification]
+pub trait ExIterStep: Clone + PartialOrd + Sized {
+    type ExternalTraitSpecificationFor: core::iter::Step;
+}
+
+#[verifier::external_trait_specification]
+pub trait ExBorrow<Borrowed> where Borrowed: ?Sized {
+    type ExternalTraitSpecificationFor: core::borrow::Borrow<Borrowed>;
+}
+
+#[verifier::external_trait_specification]
+pub trait ExStructural {
+    type ExternalTraitSpecificationFor: Structural;
+}
+
+// Since this trait involves the unstable library feature `const_destruct`,
+// we only enable it when verifying core
+#[cfg(verus_verify_core)]
+#[verifier::external_trait_specification]
+trait ExDestruct: PointeeSized {
+    type ExternalTraitSpecificationFor: core::marker::Destruct;
+}
+
+#[verifier::external_trait_specification]
+pub trait ExMetaSized {
+    type ExternalTraitSpecificationFor: core::marker::MetaSized;
+}
+
+pub assume_specification<T>[ core::mem::swap::<T> ](a: &mut T, b: &mut T)
+    ensures
+        *a == *old(b),
+        *b == *old(a),
+    opens_invariants none
+    no_unwind
+;
+
+#[verifier::external_type_specification]
+pub struct ExOrdering(core::cmp::Ordering);
+
+#[verifier::external_type_specification]
+#[verifier::accept_recursive_types(V)]
+#[verifier::ext_equal]
+pub struct ExOption<V>(core::option::Option<V>);
+
+#[verifier::external_type_specification]
+#[verifier::accept_recursive_types(T)]
+#[verifier::reject_recursive_types_in_ground_variants(E)]
+pub struct ExResult<T, E>(core::result::Result<T, E>);
+
+pub open spec fn iter_into_iter_spec<I: Iterator>(i: I) -> I {
+    i
+}
+
+#[verifier::when_used_as_spec(iter_into_iter_spec)]
+pub assume_specification<I: Iterator>[ <I as IntoIterator>::into_iter ](i: I) -> (r: I)
+    ensures
+        r == i,
+;
+
+// I don't really expect this to be particularly useful;
+// this is mostly here because I wanted an easy way to test
+// the combination of external_type_specification & external_body
+// in a cross-crate context.
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExDuration(core::time::Duration);
+
+#[verifier::external_type_specification]
+#[verifier::accept_recursive_types(V)]
+pub struct ExPhantomData<V: PointeeSized>(core::marker::PhantomData<V>);
+
+pub assume_specification[ core::intrinsics::likely ](b: bool) -> (c: bool)
+    ensures
+        c == b,
+;
+
+pub assume_specification[ core::intrinsics::unlikely ](b: bool) -> (c: bool)
+    ensures
+        c == b,
+;
+
+pub assume_specification<T, F: FnOnce() -> T>[ bool::then ](b: bool, f: F) -> (ret: Option<T>)
+    ensures
+        if b {
+            ret.is_some() && f.ensures((), ret.unwrap())
+        } else {
+            ret.is_none()
+        },
+;
+
+// A private seal trait to prevent a trait from being implemented outside of vstd.
+pub(crate) trait TrustedSpecSealed {}
+
+#[allow(private_bounds)]
+pub trait IndexSetTrustedSpec<Idx>: core::ops::IndexMut<Idx> + TrustedSpecSealed {
+    spec fn spec_index_set_requires(&self, index: Idx) -> bool;
+
+    spec fn spec_index_set_ensures(
+        &self,
+        new_container: &Self,
+        index: Idx,
+        val: Self::Output,
+    ) -> bool where Self::Output: Sized;
+}
+
+// TODO(uutaal): Do not need index_set once mutable reference support lands.
+// Use index_set to replace IndexMut in assign-operator.
+// Users must provide IndexSetTrustedSpec to use it.
+// It could be replaced after mutable reference is fully supported
+// Avoid call it explicitly.
+#[verifier(external_body)]
+pub fn index_set<T, Idx, E>(container: &mut T, index: Idx, val: E) where
+    T: ?Sized + core::ops::IndexMut<Idx> + core::ops::Index<Idx, Output = E> + IndexSetTrustedSpec<
+        Idx,
+    >,
+
+    requires
+        old(container).spec_index_set_requires(index),
+    ensures
+        old(container).spec_index_set_ensures(container, index, val),
+    no_unwind
+{
+    container[index] = val;
+}
+
+} // verus!
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[verifier::accept_recursive_types(T)]
+pub struct ExAssertParamIsClone<T: Clone + PointeeSized>(core::clone::AssertParamIsClone<T>);
