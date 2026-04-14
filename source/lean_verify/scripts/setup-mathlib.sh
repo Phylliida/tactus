@@ -1,63 +1,56 @@
 #!/usr/bin/env bash
 # Set up the Tactus Lean project with precompiled Mathlib.
 #
-# This downloads pre-built Mathlib .olean files (~2 GB) from Mathlib's CI cache.
-# No compilation needed — takes ~2-5 minutes on a decent connection.
+# Downloads pre-built .olean files (~2 GB) from Mathlib's CI cache.
+# No compilation needed — takes ~2-5 minutes.
 #
-# Prerequisites:
-#   - Lean 4 (via `nix-shell -p lean4` or elan)
-#   - lake (comes with Lean 4)
-#
+# Prerequisites: Lean 4 + lake on PATH
 # Usage:
 #   ./scripts/setup-mathlib.sh
-#   # or with nix:
 #   nix-shell -p lean4 --run ./scripts/setup-mathlib.sh
+#   TACTUS_PROJECT_DIR=/custom/path ./scripts/setup-mathlib.sh
 
 set -euo pipefail
 
-# Detect system Lean version
-LEAN_RAW_VERSION=$(lean --version 2>/dev/null | grep -oP 'version \K[^,]+' || echo "")
-if [ -z "$LEAN_RAW_VERSION" ]; then
-    echo "Error: lean not found on PATH. Install via elan or nix-shell -p lean4."
+# Detect Lean version
+LEAN_RAW=$(lean --version 2>/dev/null | grep -oP 'version \K[^,]+' || echo "")
+if [ -z "$LEAN_RAW" ]; then
+    echo "Error: lean not found. Install via elan or nix-shell -p lean4." >&2
     exit 1
 fi
-LEAN_VERSION="leanprover/lean4:v${LEAN_RAW_VERSION}"
+
+# Match Mathlib tag to Lean version (e.g., Lean 4.25.0 → Mathlib v4.25.0)
+MATHLIB_TAG="v${LEAN_RAW}"
 
 PROJECT_DIR="${TACTUS_PROJECT_DIR:-$HOME/.tactus/lean-project}"
 
-echo "Setting up Tactus Lean project at $PROJECT_DIR"
-echo "Lean version: $LEAN_VERSION"
+echo "Lean version:    $LEAN_RAW"
+echo "Mathlib tag:     $MATHLIB_TAG"
+echo "Project dir:     $PROJECT_DIR"
 echo
 
 mkdir -p "$PROJECT_DIR"
+echo "leanprover/lean4:v${LEAN_RAW}" > "$PROJECT_DIR/lean-toolchain"
 
-# Pin Lean version to match system
-echo "$LEAN_VERSION" > "$PROJECT_DIR/lean-toolchain"
-
-# Write lakefile — uses Mathlib master (compatible with latest Lean)
-cat > "$PROJECT_DIR/lakefile.lean" << 'EOF'
+cat > "$PROJECT_DIR/lakefile.lean" << EOF
 import Lake
 open Lake DSL
 
 package tactus where
-  leanOptions := #[⟨`autoImplicit, false⟩]
+  leanOptions := #[⟨\`autoImplicit, false⟩]
 
 @[default_target]
 lean_lib TactusCheck where
   srcDir := "."
 
 require mathlib from git
-  "https://github.com/leanprover-community/mathlib4"
+  "https://github.com/leanprover-community/mathlib4" @ "$MATHLIB_TAG"
 EOF
 
-# Download precompiled Mathlib oleans (no compilation)
-echo "Downloading precompiled Mathlib oleans..."
-echo "This downloads ~2 GB of pre-built files. No compilation needed."
-echo
+echo "Downloading precompiled Mathlib oleans (~2 GB, no compilation)..."
 cd "$PROJECT_DIR"
 lake update
 lake exe cache get
 
 echo
-echo "Done! Mathlib is ready at $PROJECT_DIR"
-echo "Tactus will automatically use this project for Mathlib tactics."
+echo "Done! Mathlib $MATHLIB_TAG ready at $PROJECT_DIR"
