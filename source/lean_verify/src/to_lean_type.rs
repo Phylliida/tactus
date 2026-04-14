@@ -94,12 +94,20 @@ pub(crate) fn short_name(path: &Path) -> &str {
 /// Names are sanitized (@ # → _) and keywords are escaped with «».
 pub(crate) fn lean_name(path: &Path) -> String {
     let segs = &path.segments;
-    // Skip the crate segment (first), use the rest as dotted name
     let start = if segs.len() > 1 { 1 } else { 0 };
-    segs[start..].iter()
+    let relevant = &segs[start..];
+    // Fast path: single segment, no sanitization needed
+    if relevant.len() == 1 && !needs_sanitization(&relevant[0]) {
+        return relevant[0].to_string();
+    }
+    relevant.iter()
         .map(|s| sanitize_ident(s))
         .collect::<Vec<_>>()
         .join(".")
+}
+
+pub(crate) fn needs_sanitization(s: &str) -> bool {
+    is_lean_keyword(s) || s.bytes().any(|b| b == b'@' || b == b'#')
 }
 
 pub(crate) fn sanitize_ident(s: &str) -> String {

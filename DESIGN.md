@@ -943,71 +943,79 @@ Translates Verus's standard library to Lean. Ongoing, incremental.
 
 ### Prerequisites
 
-- **Lean 4**: Install via [elan](https://github.com/leanprover/elan): `curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh`
-- **Rust nightly**: Verus pins a specific nightly version
+- **Lean 4**: via [elan](https://github.com/leanprover/elan) or `nix-shell -p lean4`
+- **Rust 1.94+**: Verus pins a specific stable version (uses `RUSTC_BOOTSTRAP=1` for nightly features)
 
 ### First-time build
 
 ```bash
 cd tactus
 
-# Build vargo (tactus's custom cargo wrapper, needed for all vargo commands)
+# Build vargo (Tactus's custom cargo wrapper)
 cd tools/vargo && cargo build --release && cd ../../source
 
-# Build tactus + vstd (expected: "1530 verified, 0 errors")
+# Build Tactus + vstd (expected: "1530 verified, 0 errors")
 PATH="../tools/vargo/target/release:$PATH" vargo build --release
 ```
 
-### Mathlib setup (optional, for ring/nlinarith/linarith)
+### Mathlib setup (for ring/nlinarith/linarith)
 
-Tactus manages a persistent Lake project at `~/.tactus/lean-project/`. This provides Mathlib's precompiled oleans (~2 GB download, 2-5 min):
+Tactus downloads precompiled Mathlib oleans (~2 GB) from Mathlib's CI cache. No compilation needed — takes 2-5 minutes.
 
 ```bash
-mkdir -p ~/.tactus/lean-project && cd ~/.tactus/lean-project
+# Option 1: Use the setup script
+cd tactus/source/lean_verify
+./scripts/setup-mathlib.sh
 
-# Pin to your Lean version
-lean --version | sed 's/.*version \([^,]*\).*/leanprover\/lean4:v\1/' > lean-toolchain
+# Option 2: With nix
+nix-shell -p lean4 --run ./scripts/setup-mathlib.sh
 
-# Write lakefile.lean
-cat > lakefile.lean << 'EOF'
-import Lake
-open Lake DSL
-package «tactus-project» where
-  leanOptions := #[⟨`autoImplicit, false⟩]
-require mathlib from git
-  "https://github.com/leanprover-community/mathlib4" @ "v4.25.0"
-@[default_target]
-lean_lib TactusPrelude where
-  srcDir := "."
-EOF
-
-# Copy prelude and build
-cp /path/to/tactus/source/lean_verify/TactusPrelude.lean .
-lake update && lake exe cache get && lake build
+# Option 3: Custom project directory
+TACTUS_PROJECT_DIR=/path/to/project ./scripts/setup-mathlib.sh
 ```
 
-Without this setup, core tactics (`omega`, `simp`, `decide`, `exact`, `apply`, `intro`, `induction`, `cases`, `rfl`, `unfold`) still work. Mathlib tactics (`ring`, `nlinarith`, `linarith`, `norm_num`, `positivity`, `field_simp`) require the Lake project.
+This creates `~/.tactus/lean-project/` with:
+- `lakefile.lean` — imports Mathlib
+- `lean-toolchain` — pins Lean version
+- `.lake/` — precompiled Mathlib oleans (downloaded, not compiled)
+
+**Without Mathlib**: Core tactics still work (`omega`, `simp`, `decide`, `exact`, `apply`, `intro`, `induction`, `cases`, `rfl`, `unfold`). Mathlib tactics (`ring`, `nlinarith`, `linarith`, `norm_num`, `positivity`, `field_simp`) require the Lake project.
 
 ### Running tests
 
 ```bash
 cd tactus/source
 
-# Unit tests for lean_verify crate:
+# Quick compile check (no special toolchain):
+cargo check -p lean_verify
+
+# Full compile check (needs RUSTC_BOOTSTRAP for rustc_private):
+RUSTC_BOOTSTRAP=1 cargo check -p rust_verify
+
+# Unit tests for lean_verify (needs Lean 4 on PATH):
 cargo test -p lean_verify
 
-# End-to-end tests (14 tests, includes Mathlib tests):
+# End-to-end tests (63 tests):
+# - 57 tests need Lean 4
+# - 6 tests also need Mathlib (setup-mathlib.sh)
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Run a single test:
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus -- test_mathlib_ring
 
-# Quick compile check (no RUSTC_BOOTSTRAP needed):
-cargo check -p lean_verify
-
-# Full compile check:
-RUSTC_BOOTSTRAP=1 cargo check -p rust_verify
+# vstd verification (1530 functions):
+PATH="../tools/vargo/target/release:$PATH" vargo build --release
 ```
+
+### Test categories
+
+| Category | Count | Requirements |
+|----------|-------|---|
+| Core tactics (omega/simp/decide) | 47 | Lean 4 |
+| Mathlib tactics (ring/nlinarith) | 6 | Lean 4 + Mathlib |
+| Error reporting | 4 | Lean 4 |
+| Datatypes + traits | 6 | Lean 4 |
+| **Total** | **63** | |
 
 ### How the verifier routes to Lean
 

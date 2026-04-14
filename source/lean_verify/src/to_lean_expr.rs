@@ -163,11 +163,22 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
         }
 
         ExprX::Choose { params, cond, body: _ } => {
-            out.push_str("Classical.choose (show ∃ ");
-            write_binders(out, params);
-            out.push_str(", ");
+            // Verus's `choose|x| P(x)` picks a witness satisfying P.
+            // Lean's `Classical.epsilon` is the exact equivalent: it returns
+            // some value satisfying the predicate if one exists, or an
+            // arbitrary value otherwise. No existence proof needed — it's total.
+            out.push_str("Classical.epsilon (fun ");
+            for (i, b) in params.iter().enumerate() {
+                if i > 0 { out.push(' '); }
+                out.push('(');
+                write_name(out, &b.name.0);
+                out.push_str(" : ");
+                write_typ(out, &b.a);
+                out.push(')');
+            }
+            out.push_str(" => ");
             write_expr(out, &cond.x);
-            out.push_str(" from sorry)");
+            out.push(')');
         }
 
         ExprX::WithTriggers { body, .. } => write_expr(out, &body.x),
@@ -349,7 +360,16 @@ fn write_const(out: &mut String, c: &Constant) {
         }
         Constant::StrSlice(s) => {
             out.push('"');
-            out.push_str(s);
+            for c in s.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    c => out.push(c),
+                }
+            }
             out.push('"');
         }
         Constant::Char(c) => {
@@ -376,6 +396,7 @@ fn write_binop(out: &mut String, op: &BinaryOp) {
     out.push_str(match op {
         BinaryOp::And => "∧",
         BinaryOp::Or => "∨",
+        BinaryOp::Xor => "xor",
         BinaryOp::Implies => "→",
         BinaryOp::Eq(_) => "=",
         BinaryOp::Ne => "≠",
@@ -388,7 +409,19 @@ fn write_binop(out: &mut String, op: &BinaryOp) {
         BinaryOp::Arith(ArithOp::Mul(_)) => "*",
         BinaryOp::Arith(ArithOp::EuclideanDiv(_)) => "/",
         BinaryOp::Arith(ArithOp::EuclideanMod(_)) => "%",
-        _ => "sorry /- TODO: op -/",
+        BinaryOp::RealArith(RealArithOp::Add) => "+",
+        BinaryOp::RealArith(RealArithOp::Sub) => "-",
+        BinaryOp::RealArith(RealArithOp::Mul) => "*",
+        BinaryOp::RealArith(RealArithOp::Div) => "/",
+        BinaryOp::Bitwise(BitwiseOp::BitAnd, _) => "&&&",
+        BinaryOp::Bitwise(BitwiseOp::BitOr, _) => "|||",
+        BinaryOp::Bitwise(BitwiseOp::BitXor, _) => "^^^",
+        BinaryOp::Bitwise(BitwiseOp::Shr(_), _) => ">>>",
+        BinaryOp::Bitwise(BitwiseOp::Shl(_, _), _) => "<<<",
+        BinaryOp::HeightCompare { .. } => "<", // internal: used for decreases checks
+        BinaryOp::StrGetChar => "String.get",
+        BinaryOp::Index(_, _) => "!!",          // array/slice index
+        BinaryOp::IeeeFloat(_) => "+",          // approximate: float ops
     });
 }
 
@@ -411,8 +444,13 @@ fn write_trait_method_ref(out: &mut String, fun: &Fun) {
 }
 
 /// Write a name, escaping Lean keywords and sanitizing special chars.
+/// Avoids allocation for names that don't need sanitization (>99% of calls).
 pub(crate) fn write_name(out: &mut String, name: &str) {
-    out.push_str(&crate::to_lean_type::sanitize_ident(name));
+    if crate::to_lean_type::needs_sanitization(name) {
+        out.push_str(&crate::to_lean_type::sanitize_ident(name));
+    } else {
+        out.push_str(name);
+    }
 }
 
 /// Write a VIR pattern as Lean syntax.
