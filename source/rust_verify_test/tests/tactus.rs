@@ -710,3 +710,164 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// === Extensional equality (=~=) ===
+
+test_verify_one_file! {
+    #[test] test_ext_eq verus_code! {
+        proof fn ext_eq_refl(x: int)
+            ensures x =~= x
+        by {
+            simp
+        }
+    } => Ok(())
+}
+
+// === Division and modulo (int, omega can handle) ===
+
+test_verify_one_file! {
+    #[test] test_div_mod verus_code! {
+        proof fn div_pos(x: int)
+            requires x >= 10
+            ensures x / 2 >= 5
+        by {
+            omega
+        }
+
+        proof fn mod_range(x: int)
+            requires x >= 0
+            ensures x % 3 >= 0, x % 3 < 3
+        by {
+            omega
+        }
+    } => Ok(())
+}
+
+// === Wildcard pattern in match ===
+
+test_verify_one_file! {
+    #[test] test_wildcard_match verus_code! {
+        enum Color { Red, Green, Blue }
+
+        spec fn is_red(c: Color) -> bool {
+            match c {
+                Color::Red => true,
+                _ => false,
+            }
+        }
+
+        proof fn red_check()
+            ensures is_red(Color::Red)
+        by {
+            unfold is_red; simp
+        }
+    } => Ok(())
+}
+
+// === Struct update syntax { ..base } ===
+
+test_verify_one_file! {
+    #[test] test_struct_update verus_code! {
+        struct Pair {
+            x: int,
+            y: int,
+        }
+
+        spec fn set_x(p: Pair, new_x: int) -> Pair {
+            Pair { x: new_x, ..p }
+        }
+
+        spec fn get_y(p: Pair) -> int { p.y }
+
+        proof fn update_preserves_y(p: Pair)
+            ensures get_y(set_x(p, 99)) == get_y(p)
+        by {
+            unfold get_y; unfold set_x; simp
+        }
+    } => Ok(())
+}
+
+// === Generic spec fn (type params on spec fn) ===
+
+test_verify_one_file! {
+    #[test] test_generic_spec_fn verus_code! {
+        spec fn identity<T>(x: T) -> T { x }
+
+        proof fn identity_int(n: int)
+            ensures identity::<int>(n) == n
+        by {
+            unfold identity; simp
+        }
+    } => Ok(())
+}
+
+// === Generic datatype ===
+
+test_verify_one_file! {
+    #[test] test_generic_datatype verus_code! {
+        enum MyOption<T> {
+            MySome(T),
+            MyNone,
+        }
+
+        spec fn is_some<T>(o: MyOption<T>) -> bool {
+            match o {
+                MyOption::MySome(_) => true,
+                MyOption::MyNone => false,
+            }
+        }
+
+        proof fn some_is_some(x: MyOption<int>)
+            requires x == MyOption::<int>::MySome(42)
+            ensures is_some::<int>(x)
+        by {
+            unfold is_some; simp_all
+        }
+    } => Ok(())
+}
+
+// === Higher-order spec fn (spec_fn as parameter type) ===
+
+test_verify_one_file! {
+    #[test] test_higher_order verus_code! {
+        spec fn apply(f: spec_fn(int) -> int, x: int) -> int {
+            f(x)
+        }
+
+        spec fn double_fn() -> spec_fn(int) -> int {
+            |x: int| x + x
+        }
+
+        proof fn apply_double()
+            ensures apply(double_fn(), 5) == 10
+        by {
+            unfold apply; unfold double_fn; simp
+        }
+    } => Ok(())
+}
+
+// === Multiple match arms with different constructors ===
+
+test_verify_one_file! {
+    #[test] test_multi_arm_match verus_code! {
+        enum Shape {
+            Circle(int),
+            Rect(int, int),
+            Empty,
+        }
+
+        spec fn area(s: Shape) -> int {
+            match s {
+                Shape::Circle(r) => r * r,
+                Shape::Rect(w, h) => w * h,
+                Shape::Empty => 0,
+            }
+        }
+
+        proof fn empty_area()
+            ensures area(Shape::Empty) == 0
+        by {
+            unfold area; simp
+        }
+    } => Ok(())
+}
