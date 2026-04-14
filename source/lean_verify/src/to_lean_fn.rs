@@ -190,10 +190,28 @@ fn write_method_type(out: &mut String, func: &FunctionX) {
 
 /// Write type params, trait bounds, and value params.
 fn write_fn_params(out: &mut String, f: &FunctionX) {
+    // Check which type params are const generics (have ConstTyp bounds)
+    let const_typ_for = |name: &str| -> Option<&TypX> {
+        for bound in f.typ_bounds.iter() {
+            if let GenericBoundX::ConstTyp(param_typ, val_typ) = &**bound {
+                if let TypX::TypParam(n) = &**param_typ {
+                    if n.as_str() == name { return Some(val_typ); }
+                }
+            }
+        }
+        None
+    };
     for tp in f.typ_params.iter() {
         out.push_str(" (");
         out.push_str(tp);
-        out.push_str(" : Type)");
+        if let Some(val_typ) = const_typ_for(tp) {
+            // Const generic: emit as value param with the value type
+            out.push_str(" : ");
+            write_typ(out, val_typ);
+            out.push(')');
+        } else {
+            out.push_str(" : Type)");
+        }
     }
     for bound in f.typ_bounds.iter() {
         if let GenericBoundX::Trait(TraitId::Path(path), typs) = &**bound {
