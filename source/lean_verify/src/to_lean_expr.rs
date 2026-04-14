@@ -104,23 +104,35 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
 
         ExprX::Call(target, args, _) => {
             match target {
-                CallTarget::Fun(kind, fun, _, _, _, _) => {
+                CallTarget::Fun(kind, fun, typs, _, _, _) => {
                     match kind {
-                        // Concrete dispatch: use resolved impl function
                         CallTargetKind::DynamicResolved { resolved, .. } => {
                             write_fn_ref(out, resolved);
+                            // Resolved impls don't need type args (concrete types)
                         }
-                        // Generic dispatch: emit TraitName.method for class resolution
                         CallTargetKind::Dynamic => {
                             write_trait_method_ref(out, fun);
+                            // Dynamic dispatch gets types via [Class T] instance params
                         }
-                        _ => write_fn_ref(out, fun),
+                        _ => {
+                            write_fn_ref(out, fun);
+                            // Emit explicit type arguments for generic calls
+                            for typ in typs.iter() {
+                                out.push_str(" (");
+                                write_typ(out, typ);
+                                out.push(')');
+                            }
+                        }
                     }
                 }
                 CallTarget::FnSpec(inner) => write_expr_prec(out, &inner.x, PREC_ATOM, true),
-                CallTarget::BuiltinSpecFun(_, _, _) => {
-                    // ClosureReq/ClosureEns/DefaultEns — rare, emit a placeholder name
+                CallTarget::BuiltinSpecFun(_, typs, _) => {
                     out.push_str("builtinSpecFun");
+                    for typ in typs.iter() {
+                        out.push_str(" (");
+                        write_typ(out, typ);
+                        out.push(')');
+                    }
                 }
             }
             for arg in args.iter() {
