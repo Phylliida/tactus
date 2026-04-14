@@ -292,7 +292,9 @@ ast_struct! {
         pub unwind: Option<SignatureUnwind>,
         pub with: Option<WithSpecOnFn>,
         /// Tactus: `by { tactic_body }` — the raw tactic body text (not parsed as Rust)
-        pub tactic_by: Option<(Token![by], proc_macro2::TokenStream)>,
+        /// Tactus: `by { tactic_body }`. Tuple of (by_token, raw_tokens, brace_byte_range).
+        /// brace_byte_range is the byte offset of the `{ ... }` in the source file.
+        pub tactic_by: Option<(Token![by], proc_macro2::TokenStream, std::ops::Range<usize>)>,
     }
 }
 
@@ -1288,9 +1290,12 @@ pub mod parsing {
             let tactic_by = if input.peek(Token![by]) && input.peek2(token::Brace) {
                 let by_token: Token![by] = input.parse()?;
                 let content;
-                let _brace = braced!(content in input);
+                let brace = braced!(content in input);
                 let tokens: proc_macro2::TokenStream = content.parse()?;
-                Some((by_token, tokens))
+                // byte_range() gives the byte offset of { ... } in the source file.
+                // We'll use this to read the exact source text in rust_verify.
+                let byte_range = brace.span.join().byte_range();
+                Some((by_token, tokens, byte_range))
             } else {
                 None
             };
