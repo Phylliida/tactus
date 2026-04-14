@@ -1032,3 +1032,62 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// === Or pattern in match ===
+
+test_verify_one_file! {
+    #[test] test_or_pattern verus_code! {
+        enum Traffic { Red, Yellow, Green }
+
+        spec fn must_stop(t: Traffic) -> bool {
+            match t {
+                Traffic::Red | Traffic::Yellow => true,
+                Traffic::Green => false,
+            }
+        }
+
+        proof fn red_stops()
+            ensures must_stop(Traffic::Red)
+        by {
+            unfold must_stop; simp
+        }
+    } => Ok(())
+}
+
+// === Const generic ===
+
+test_verify_one_file! {
+    #[test] test_const_generic verus_code! {
+        spec fn array_len<const N: usize>() -> nat {
+            N as nat
+        }
+
+        proof fn len_5()
+            ensures array_len::<5>() == 5
+        by {
+            unfold array_len; simp
+        }
+    } => Ok(())
+}
+
+// === Nested enum match (exercises Constructor pattern with multiple fields) ===
+
+test_verify_one_file! {
+    #[test] test_nested_enum verus_code! {
+        enum Inner { X(int), Y }
+        enum Outer { Wrap(Inner), Empty }
+
+        spec fn extract(o: Outer) -> int {
+            match o {
+                Outer::Wrap(Inner::X(n)) => n,
+                _ => 0,
+            }
+        }
+
+        proof fn extract_wrap()
+            ensures extract(Outer::Wrap(Inner::X(7))) == 7
+        by {
+            unfold extract; simp
+        }
+    } => Ok(())
+}
