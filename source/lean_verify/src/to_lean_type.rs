@@ -14,7 +14,7 @@ pub fn write_typ(out: &mut String, typ: &TypX) {
         TypX::Boxed(inner) => write_typ(out, inner),
         TypX::Datatype(dt, args, _) => {
             match dt {
-                Dt::Path(path) => out.push_str(short_name(path)),
+                Dt::Path(path) => out.push_str(&lean_name(path)),
                 Dt::Tuple(n) => { out.push_str("Tuple"); out.push_str(&n.to_string()); }
             }
             for arg in args.iter() {
@@ -40,19 +40,47 @@ pub fn write_typ(out: &mut String, typ: &TypX) {
                 vir::ast::Primitive::Array => "Array",
                 vir::ast::Primitive::Slice => "List",
                 vir::ast::Primitive::StrSlice => "String",
-                vir::ast::Primitive::Ptr => "sorry /- Ptr -/",
-                vir::ast::Primitive::Global => "sorry /- Global -/",
+                vir::ast::Primitive::Ptr => "USize",   // opaque pointer, use Nat-sized
+                vir::ast::Primitive::Global => "Unit",  // global state, erased in spec
             });
             for arg in args.iter() {
                 out.push(' ');
                 write_typ(out, arg);
             }
         }
-        TypX::ConstInt(n) => { out.push_str(&n.to_string()); }
-        TypX::ConstBool(b) => { out.push_str(if *b { "true" } else { "false" }); }
+        TypX::ConstInt(n) => out.push_str(&n.to_string()),
+        TypX::ConstBool(b) => out.push_str(if *b { "true" } else { "false" }),
         TypX::Real => out.push_str("Real"),
-        TypX::TypeId => out.push_str("Nat"), // TypeId has no Lean equivalent, use Nat as placeholder
-        _ => write_todo(out, "type"),
+        TypX::Float(_) => out.push_str("Float"),
+        TypX::TypeId => out.push_str("Nat"),
+        // Function-as-value types: erase to a function type placeholder
+        TypX::FnDef(_, typs, _) => {
+            // FnDef is a zero-sized type identifying a specific function.
+            // In spec mode, treat as Unit (the function is called by name, not by value).
+            if typs.is_empty() { out.push_str("Unit"); }
+            else {
+                out.push_str("(Unit");
+                for t in typs.iter() { out.push_str(" × "); write_typ(out, t); }
+                out.push(')');
+            }
+        }
+        TypX::AnonymousClosure(params, ret, _, _) => {
+            for p in params.iter() { write_typ(out, p); out.push_str(" → "); }
+            write_typ(out, ret);
+        }
+        TypX::Dyn(path, args, _) => {
+            out.push_str(&lean_name(path));
+            for arg in args.iter() { out.push(' '); write_typ(out, arg); }
+        }
+        TypX::Opaque { def_path, args } => {
+            out.push_str(&lean_name(def_path));
+            for arg in args.iter() { out.push(' '); write_typ(out, arg); }
+        }
+        TypX::PointeeMetadata(_) => out.push_str("Nat"),
+        TypX::MutRef(inner) => write_typ(out, inner), // transparent in spec mode
+        // Air types are generated during sst_to_air (which Tactus skips).
+        // If one appears here, it's a bug in VIR pipeline ordering.
+        TypX::Air(_) => panic!("TypX::Air should not appear in Tactus translation"),
     }
 }
 
@@ -61,31 +89,35 @@ pub(crate) fn short_name(path: &Path) -> &str {
     path.segments.last().map(|s| s.as_str()).unwrap_or("_")
 }
 
-/// Resolve a VIR path to a Lean name, using more segments if short name collides.
-pub(crate) fn resolve_name(path: &Path, collisions: &std::collections::HashSet<String>) -> String {
-    let short = short_name(path);
-    if !collisions.contains(short) {
-        return short.to_string();
-    }
-    // Use last two segments: module.name
+/// Convert a VIR path to a Lean dotted name, skipping the crate prefix.
+/// `crate::module::name` → `module.name`
+/// Names are sanitized (@ # → _) and keywords are escaped with «».
+pub(crate) fn lean_name(path: &Path) -> String {
     let segs = &path.segments;
-    if segs.len() >= 2 {
-        format!("{}.{}", segs[segs.len() - 2], segs[segs.len() - 1])
+    // Skip the crate segment (first), use the rest as dotted name
+    let start = if segs.len() > 1 { 1 } else { 0 };
+    segs[start..].iter()
+        .map(|s| sanitize_ident(s))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+pub(crate) fn sanitize_ident(s: &str) -> String {
+    if is_lean_keyword(s) {
+        format!("«{}»", s)
     } else {
-        short.to_string()
+        s.chars().map(|c| match c { '@' | '#' => '_', _ => c }).collect()
     }
 }
 
-/// Build the set of short names that appear more than once across all declarations.
-pub(crate) fn find_collisions<'a>(paths: impl Iterator<Item = &'a str>) -> std::collections::HashSet<String> {
-    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for name in paths {
-        *counts.entry(name).or_insert(0) += 1;
-    }
-    counts.into_iter()
-        .filter(|(_, count)| *count > 1)
-        .map(|(name, _)| name.to_string())
-        .collect()
+fn is_lean_keyword(s: &str) -> bool {
+    matches!(s,
+        "def" | "theorem" | "lemma" | "example" | "abbrev" | "instance" | "class"
+        | "structure" | "inductive" | "where" | "with" | "match" | "do" | "return"
+        | "if" | "then" | "else" | "let" | "have" | "show" | "by" | "at" | "fun"
+        | "forall" | "exists" | "Type" | "Prop" | "Sort" | "import" | "open"
+        | "namespace" | "section" | "end" | "variable" | "universe"
+    )
 }
 
 /// Write items separated by a delimiter.
@@ -113,13 +145,6 @@ pub(crate) fn walk_typ<'a>(typ: &'a TypX, visit: &mut impl FnMut(&'a TypX)) {
         }
         _ => {}
     }
-}
-
-/// Write a `sorry` placeholder for an unsupported VIR feature.
-pub(crate) fn write_todo(out: &mut String, what: &str) {
-    out.push_str("sorry /- UNSUPPORTED: ");
-    out.push_str(what);
-    out.push_str(" -/");
 }
 
 /// Convenience: return type as String.

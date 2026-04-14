@@ -5,9 +5,8 @@
 
 use std::collections::HashMap;
 use vir::ast::*;
-use std::collections::HashSet;
 use crate::to_lean_expr::{write_expr, write_name};
-use crate::to_lean_type::{write_typ, short_name, write_sep, resolve_name};
+use crate::to_lean_type::{write_typ, short_name, write_sep, lean_name};
 
 // ── Source map ──────────────────────────────────────────────────────────
 
@@ -34,13 +33,13 @@ impl LeanSourceMap {
 // ── Spec fn ─────────────────────────────────────────────────────────────
 
 /// Write a spec fn as `@[irreducible] noncomputable def`.
-pub fn write_spec_fn(out: &mut String, f: &FunctionX, collisions: &HashSet<String>) {
+pub fn write_spec_fn(out: &mut String, f: &FunctionX) {
     if matches!(f.opaqueness, Opaqueness::Opaque) {
         out.push_str("@[irreducible] ");
     }
     out.push_str("noncomputable def ");
-    write_fn_name(out, &f.name, collisions);
-    write_fn_params(out, f, collisions);
+    write_fn_name(out, &f.name);
+    write_fn_params(out, f);
 
     out.push_str(" : ");
     write_typ(out, &f.ret.x.typ);
@@ -65,10 +64,10 @@ pub fn write_spec_fn(out: &mut String, f: &FunctionX, collisions: &HashSet<Strin
 
 /// Write a proof fn as `theorem ... := by <tactics>`.
 /// Returns the 1-indexed line where the tactic body starts in the output.
-pub fn write_proof_fn(out: &mut String, f: &FunctionX, tactic_body: &str, collisions: &HashSet<String>) -> usize {
+pub fn write_proof_fn(out: &mut String, f: &FunctionX, tactic_body: &str) -> usize {
     out.push_str("theorem ");
-    write_fn_name(out, &f.name, collisions);
-    write_fn_params(out, f, collisions);
+    write_fn_name(out, &f.name);
+    write_fn_params(out, f);
 
     for (i, req) in f.require.iter().enumerate() {
         out.push_str(" (h");
@@ -101,9 +100,9 @@ pub fn write_proof_fn(out: &mut String, f: &FunctionX, tactic_body: &str, collis
 // ── Datatype ────────────────────────────────────────────────────────────
 
 /// Write a VIR datatype as a Lean `structure` (1 variant) or `inductive` (multiple).
-pub fn write_datatype(out: &mut String, dt: &DatatypeX, _collisions: &HashSet<String>) {
-    let name = match &dt.name {
-        Dt::Path(p) => short_name(p),
+pub fn write_datatype(out: &mut String, dt: &DatatypeX) {
+    let (path, short) = match &dt.name {
+        Dt::Path(p) => (lean_name(p), short_name(p)),
         Dt::Tuple(_) => return,
     };
 
@@ -111,9 +110,9 @@ pub fn write_datatype(out: &mut String, dt: &DatatypeX, _collisions: &HashSet<St
         .map(|(id, _)| format!(" ({} : Type)", id))
         .collect::<String>();
 
-    if dt.variants.len() == 1 && dt.variants[0].name.as_str() == name {
+    if dt.variants.len() == 1 && dt.variants[0].name.as_str() == short {
         let variant = &dt.variants[0];
-        out.push_str(&format!("structure {}{} where\n", name, typ_params_str));
+        out.push_str(&format!("structure {}{} where\n", path, typ_params_str));
         for field in variant.fields.iter() {
             let (typ, _, _) = &field.a;
             out.push_str("  ");
@@ -123,7 +122,7 @@ pub fn write_datatype(out: &mut String, dt: &DatatypeX, _collisions: &HashSet<St
             out.push('\n');
         }
     } else {
-        out.push_str(&format!("inductive {}{} where\n", name, typ_params_str));
+        out.push_str(&format!("inductive {}{} where\n", path, typ_params_str));
         for variant in dt.variants.iter() {
             out.push_str("  | ");
             write_name(out, &variant.name);
@@ -147,12 +146,11 @@ pub fn write_trait(
     out: &mut String,
     tr: &TraitX,
     method_lookup: &HashMap<&Fun, &FunctionX>,
-    _collisions: &HashSet<String>,
 ) {
-    let name = short_name(&tr.name);
+    let name = lean_name(&tr.name);
 
     out.push_str("class ");
-    out.push_str(name);
+    out.push_str(&name);
     out.push_str(" (Self : Type)");
     for (tp, _) in tr.typ_params.iter() {
         out.push_str(&format!(" ({} : Type)", tp));
@@ -188,7 +186,7 @@ fn write_method_type(out: &mut String, func: &FunctionX) {
 // ── Shared helpers ──────────────────────────────────────────────────────
 
 /// Write type params, trait bounds, and value params.
-fn write_fn_params(out: &mut String, f: &FunctionX, collisions: &HashSet<String>) {
+fn write_fn_params(out: &mut String, f: &FunctionX) {
     for tp in f.typ_params.iter() {
         out.push_str(" (");
         out.push_str(tp);
@@ -197,7 +195,7 @@ fn write_fn_params(out: &mut String, f: &FunctionX, collisions: &HashSet<String>
     for bound in f.typ_bounds.iter() {
         if let GenericBoundX::Trait(TraitId::Path(path), typs) = &**bound {
             out.push_str(" [");
-            out.push_str(&resolve_name(path, collisions));
+            out.push_str(&lean_name(path));
             for t in typs.iter() {
                 out.push(' ');
                 write_typ(out, t);
@@ -231,7 +229,6 @@ fn write_field_name(out: &mut String, name: &str) {
     }
 }
 
-fn write_fn_name(out: &mut String, fun: &Fun, collisions: &HashSet<String>) {
-    let name = resolve_name(&fun.path, collisions);
-    write_name(out, &name);
+fn write_fn_name(out: &mut String, fun: &Fun) {
+    out.push_str(&lean_name(&fun.path));
 }
