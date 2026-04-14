@@ -239,7 +239,6 @@ test_verify_one_file! {
             requires x > 0
             ensures triple(x) > x
         by {
-            // open spec fn means body is visible without unfold
             simp [triple]; omega
         }
     } => Ok(())
@@ -1066,6 +1065,22 @@ test_verify_one_file! {
             ensures array_len::<5>() == 5
         by {
             unfold array_len; simp
+        }
+    } => Ok(())
+}
+
+// === Multi-line tactic with Lean comment (verbatim source extraction) ===
+
+test_verify_one_file! {
+    #[test] test_multiline_verbatim verus_code! {
+        spec fn double(x: nat) -> nat { x + x }
+
+        proof fn lemma_double(x: nat)
+            requires x > 0
+            ensures double(x) > x
+        by {
+            unfold double
+            omega
         }
     } => Ok(())
 }

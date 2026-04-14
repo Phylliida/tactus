@@ -360,8 +360,8 @@ pub(crate) enum Attr {
     MigratePostconditionsWithMutRefs(bool),
     TrackedSwap,
     TrackedTakeOption,
-    // Tactus: proof fn body is a Lean tactic block, with verbatim tactic text
-    TacticBody(String),
+    // Tactus: byte range of the `by { }` brace block in the source file
+    TacticSpan(usize, usize),
     // Tactus: Lean import path (e.g., "Mathlib.Tactic.Ring")
     LeanImport(String),
 }
@@ -849,11 +849,13 @@ pub(crate) fn parse_attrs(
                     AttrTree::Fun(_, arg, None) if arg == "structural_const_wrapper" => {
                         v.push(Attr::StructuralConstWrapper)
                     }
-                    // Tactus: tactic body from `by { }` block
-                    AttrTree::Fun(_, arg, Some(box [AttrTree::Lit(LitKind::Str, body)]))
-                        if arg == "tactic_body" =>
+                    // Tactus: byte range of `by { }` in the source file
+                    AttrTree::Fun(_, arg, Some(box [AttrTree::Lit(LitKind::Integer, start), AttrTree::Lit(LitKind::Integer, end)]))
+                        if arg == "tactic_span" =>
                     {
-                        v.push(Attr::TacticBody(body.clone()));
+                        if let (Ok(s), Ok(e)) = (start.parse::<usize>(), end.parse::<usize>()) {
+                            v.push(Attr::TacticSpan(s, e));
+                        }
                     }
                     // Tactus: Lean import path
                     AttrTree::Fun(_, arg, Some(box [AttrTree::Lit(LitKind::Str, path)]))
@@ -1155,8 +1157,9 @@ pub(crate) struct VerifierAttrs {
     pub(crate) ignore_outside_new_mut_ref_experiment: bool,
     pub(crate) tracked_swap: bool,
     pub(crate) tracked_take_option: bool,
-    // Tactus: if Some, proof fn uses Lean tactics (verbatim body from `by { }`)
-    pub(crate) tactic_body: Option<String>,
+    // Tactus: byte range of the `by { }` block in the source file
+    pub(crate) tactic_span: Option<(usize, usize)>,
+    // Tactus: source span of the `by { }` brace block for verbatim text extraction.
     // Tactus: Lean import paths for this proof fn
     pub(crate) lean_imports: Vec<String>,
 }
@@ -1334,7 +1337,7 @@ pub(crate) fn get_verifier_attrs_maybe_check(
         ignore_outside_new_mut_ref_experiment: false,
         tracked_swap: false,
         tracked_take_option: false,
-        tactic_body: None,
+        tactic_span: None,
         lean_imports: Vec::new(),
     };
     let mut unsupported_rustc_attr: Option<(String, Span)> = None;
@@ -1420,7 +1423,7 @@ pub(crate) fn get_verifier_attrs_maybe_check(
             }
             Attr::TrackedSwap => vs.tracked_swap = true,
             Attr::TrackedTakeOption => vs.tracked_take_option = true,
-            Attr::TacticBody(body) => vs.tactic_body = Some(body.clone()),
+            Attr::TacticSpan(start, end) => vs.tactic_span = Some((start, end)),
             Attr::LeanImport(path) => vs.lean_imports.push(path.clone()),
             _ => {}
         }

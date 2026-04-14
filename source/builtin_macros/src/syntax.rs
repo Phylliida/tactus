@@ -47,24 +47,24 @@ fn is_tactus_tactic_proof(mode: &FnMode, spec: &SignatureSpec) -> bool {
     matches!(mode, FnMode::Proof(_)) && spec.tactic_by.is_some()
 }
 
-/// Tactus: get the tactic body text from the `by { }` block.
-/// The raw TokenStream was captured by verus-syn before Rust parsing,
-/// so the text is verbatim Lean tactic syntax.
-fn get_tactic_body(spec: &SignatureSpec) -> Option<String> {
-    let (_by, tokens) = spec.tactic_by.as_ref()?;
-    Some(tokens.to_string())
+/// Tactus: get the byte range of the `by { }` brace block in the source file.
+fn get_tactic_byte_range(spec: &SignatureSpec) -> Option<(usize, usize)> {
+    let (_by, _tokens, byte_range) = spec.tactic_by.as_ref()?;
+    Some((byte_range.start, byte_range.end))
 }
 
-/// Tactus: emit tactic_body attribute and clear the function body,
-/// keeping only the first `num_spec_stmts` (requires/ensures from visit_fn).
+/// Tactus: emit tactic_span attribute and clear the function body.
+/// The byte range points to `{ ... }` in the source file.
+/// rust_verify reads the source directly — no string encoding needed.
 fn apply_tactic_attrs(
     attrs: &mut Vec<Attribute>,
     block: &mut Block,
-    body_str: &str,
+    start_byte: usize,
+    end_byte: usize,
     num_spec_stmts: usize,
 ) {
     let span = block.brace_token.span.join();
-    attrs.push(mk_verus_attr(span, quote! { tactic_body(#body_str) }));
+    attrs.push(mk_verus_attr(span, quote! { tactic_span(#start_byte, #end_byte) }));
     block.stmts.truncate(num_spec_stmts);
 }
 
@@ -4068,10 +4068,10 @@ impl VisitMut for Visitor {
             crate::rustdoc::process_item_fn(fun);
         }
 
-        // Tactus: detect + capture tactic body before any transformation
+        // Tactus: detect + capture tactic byte range before any transformation
         let is_tactic = is_tactus_tactic_proof(&fun.sig.mode, &fun.sig.spec);
-        let tactic_body_str = if is_tactic && self.erase_ghost.keep() {
-            get_tactic_body(&fun.sig.spec)
+        let tactic_range = if is_tactic && self.erase_ghost.keep() {
+            get_tactic_byte_range(&fun.sig.spec)
         } else {
             None
         };
@@ -4098,9 +4098,9 @@ impl VisitMut for Visitor {
             self.inside_external_code -= 1;
         }
 
-        // Tactus: replace tactic body, keeping spec stmts
-        if let Some(body_str) = tactic_body_str {
-            apply_tactic_attrs(&mut fun.attrs, &mut fun.block, &body_str, num_spec_stmts);
+        // Tactus: emit byte range, clear tactic body from block
+        if let Some((start, end)) = tactic_range {
+            apply_tactic_attrs(&mut fun.attrs, &mut fun.block, start, end, num_spec_stmts);
         }
     }
 
@@ -4109,10 +4109,10 @@ impl VisitMut for Visitor {
             crate::rustdoc::process_impl_item_method(method);
         }
 
-        // Tactus: detect + capture tactic body before any transformation
+        // Tactus: detect + capture tactic byte range before any transformation
         let is_tactic = is_tactus_tactic_proof(&method.sig.mode, &method.sig.spec);
-        let tactic_body_str = if is_tactic && self.erase_ghost.keep() {
-            get_tactic_body(&method.sig.spec)
+        let tactic_range = if is_tactic && self.erase_ghost.keep() {
+            get_tactic_byte_range(&method.sig.spec)
         } else {
             None
         };
@@ -4139,9 +4139,9 @@ impl VisitMut for Visitor {
             self.inside_external_code -= 1;
         }
 
-        // Tactus: replace tactic body, keeping spec stmts
-        if let Some(body_str) = tactic_body_str {
-            apply_tactic_attrs(&mut method.attrs, &mut method.block, &body_str, num_spec_stmts);
+        // Tactus: emit byte range, clear tactic body from block
+        if let Some((start, end)) = tactic_range {
+            apply_tactic_attrs(&mut method.attrs, &mut method.block, start, end, num_spec_stmts);
         }
     }
 

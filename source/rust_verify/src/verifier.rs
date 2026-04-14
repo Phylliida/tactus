@@ -373,6 +373,30 @@ impl FuncDetails {
     }
 }
 
+/// Read the verbatim tactic body from the source file using byte range.
+/// `start_byte`/`end_byte` are file-relative (from proc_macro2::Span::byte_range()).
+/// `fn_span` is the VIR span — its `as_string` contains the file path.
+/// The byte range covers `{ ... }` — we strip the braces and return the content.
+fn read_tactic_from_source(
+    fn_span: &vir::messages::Span,
+    start_byte: usize,
+    end_byte: usize,
+) -> Option<String> {
+    // Extract file path from the VIR span (format: "path/to/file.rs:line:col")
+    let file_path = fn_span.as_string.split(':').next()?;
+    let src = std::fs::read_to_string(file_path).ok()?;
+    // Extract the byte range — it covers `{ ... }`
+    if end_byte > src.len() || start_byte >= end_byte { return None; }
+    let snippet = &src[start_byte..end_byte];
+    // Strip the braces
+    let s = snippet.trim();
+    if s.starts_with('{') && s.ends_with('}') {
+        Some(s[1..s.len()-1].trim().to_string())
+    } else {
+        Some(s.to_string())
+    }
+}
+
 fn report_chosen_triggers(
     diagnostics: &impl air::messages::Diagnostics,
     chosen: &vir::context::ChosenTriggers,
@@ -1577,7 +1601,7 @@ impl Verifier {
                         self.expand_flag = query_op.is_expanded();
 
                         // Tactus: route tactic proof fns to Lean instead of Z3
-                        if let Some(tactic_body) = &function.x.attrs.tactic_body {
+                        if let Some((start_byte, end_byte)) = function.x.attrs.tactic_span {
                             let fn_span = &function.span;
 
                             // Look up the VIR function from the VIR krate
@@ -1596,11 +1620,30 @@ impl Verifier {
                                 }
                             };
 
-                            // Single entry point: generate Lean, invoke, format errors
+                            // Read verbatim tactic text from the source file using byte range.
+                            // The byte range covers `{ ... }` — we strip the braces.
+                            // This preserves whitespace, newlines, Unicode, and Lean comments.
+                            let tactic_body = read_tactic_from_source(
+                                fn_span, start_byte, end_byte,
+                            );
+                            let tactic_text = match &tactic_body {
+                                Some(t) => t.as_str(),
+                                None => {
+                                    self.count_errors += 1;
+                                    let fn_name = vir::ast_util::fun_as_friendly_rust_name(&function.x.name);
+                                    reporter.report(&message(
+                                        MessageLevel::Error,
+                                        format!("could not read tactic body for {} from source file", fn_name),
+                                        fn_span,
+                                    ).to_any());
+                                    continue;
+                                }
+                            };
+
                             match lean_verify::check_proof_fn(
                                 vir_krate,
                                 &vir_fn.x,
-                                tactic_body,
+                                tactic_text,
                                 &vir_fn.x.attrs.lean_imports,
                             ) {
                                 lean_verify::CheckResult::Success => {
