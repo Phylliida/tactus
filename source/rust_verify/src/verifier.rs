@@ -1596,23 +1596,12 @@ impl Verifier {
                                 }
                             };
 
-                            // Compute namespace from the proof fn's owning module
-                            let namespace = vir_fn.x.owning_module.as_ref().and_then(|p| {
-                                let ns = p.segments.iter()
-                                    .map(|s| s.as_str())
-                                    .filter(|s| !s.is_empty())
-                                    .collect::<Vec<_>>()
-                                    .join(".");
-                                if ns.is_empty() { None } else { Some(ns) }
-                            });
-
                             // Single entry point: generate Lean, invoke, format errors
                             match lean_verify::check_proof_fn(
                                 vir_krate,
                                 &vir_fn.x,
                                 tactic_body,
                                 &vir_fn.x.attrs.lean_imports,
-                                namespace.as_deref(),
                             ) {
                                 lean_verify::CheckResult::Success => {
                                     self.count_verified += 1;

@@ -1,7 +1,7 @@
 //! Translate VIR expressions to Lean 4 expression syntax.
 
 use vir::ast::*;
-use crate::to_lean_type::{write_typ, write_todo, short_name};
+use crate::to_lean_type::{write_typ, short_name, lean_name};
 
 // Lean operator precedence (higher = tighter binding).
 const PREC_IMPLIES: u8 = 25;
@@ -80,9 +80,27 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
             }
         }
 
-        // Transparent unary ops: mode coercions, trigger annotations
-        ExprX::Unary(UnaryOp::CoerceMode { .. }, inner) => write_expr(out, &inner.x),
-        ExprX::Unary(UnaryOp::Trigger(_), inner) => write_expr(out, &inner.x),
+        // Transparent unary ops
+        ExprX::Unary(UnaryOp::CoerceMode { .. }, inner)
+        | ExprX::Unary(UnaryOp::Trigger(_), inner) => write_expr(out, &inner.x),
+
+        ExprX::Unary(UnaryOp::BitNot(_), inner) => {
+            out.push_str("Complement.complement ");
+            write_expr_prec(out, &inner.x, PREC_ATOM, true);
+        }
+        ExprX::Unary(UnaryOp::IntToReal, inner) => {
+            out.push('(');
+            write_expr(out, &inner.x);
+            out.push_str(" : Real)");
+        }
+        ExprX::Unary(UnaryOp::RealToInt, inner) => {
+            out.push_str("Int.floor ");
+            write_expr_prec(out, &inner.x, PREC_ATOM, true);
+        }
+        ExprX::Unary(UnaryOp::FloatToBits, inner) => write_expr(out, &inner.x),
+        ExprX::Unary(UnaryOp::IeeeFloat(_), inner) => write_expr(out, &inner.x),
+        // Remaining unary ops: transparent (annotations, markers, internal ops)
+        ExprX::Unary(_, inner) => write_expr(out, &inner.x),
 
         ExprX::Call(target, args, _) => {
             match target {
@@ -179,8 +197,18 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
 
         // Construct datatype: Struct { field: val } → { field := val } or ⟨val1, val2⟩
         ExprX::Ctor(dt, variant, fields, update) => {
-            if update.is_some() {
-                write_todo(out, "struct update { ..base }");
+            if let Some(tail) = update {
+                // Struct update: { base with field1 := val1, field2 := val2 }
+                out.push_str("{ ");
+                write_place(out, &tail.place.x);
+                out.push_str(" with ");
+                for (i, f) in fields.iter().enumerate() {
+                    if i > 0 { out.push_str(", "); }
+                    write_name(out, &f.name);
+                    out.push_str(" := ");
+                    write_expr(out, &f.a.x);
+                }
+                out.push_str(" }");
             } else {
                 write_ctor(out, dt, variant, fields);
             }
@@ -217,6 +245,8 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
             out.push_str(variant);
         }
         ExprX::UnaryOpr(UnaryOpr::CustomErr(_), inner) => write_expr(out, &inner.x),
+        // Remaining UnaryOpr: transparent (HasType, IntegerTypeBound, ProofNote, etc.)
+        ExprX::UnaryOpr(_, inner) => write_expr(out, &inner.x),
 
         ExprX::NullaryOpr(NullaryOpr::ConstGeneric(typ)) => {
             // const generic parameter used as expression — emit its type as a value
@@ -246,17 +276,29 @@ pub fn write_expr(out: &mut String, expr: &ExprX) {
         ExprX::Header(_) => {}
         ExprX::Fuel(..) | ExprX::RevealString(_) | ExprX::AirStmt(_) => {}
         ExprX::StaticVar(fun) | ExprX::ExecFnByName(fun) => write_fn_ref(out, fun),
-        ExprX::Nondeterministic => out.push_str("sorry /- nondeterministic -/"),
-        ExprX::BreakOrContinue { .. } => {} // exec only, shouldn't appear in spec
+        ExprX::Nondeterministic => out.push_str("Classical.arbitrary _"),
+        ExprX::BreakOrContinue { .. } => {}
 
-        // Exec-mode only (Track B)
-        ExprX::Assign { .. } => write_todo(out, "Assign"),
-        ExprX::AssignToPlace { .. } => write_todo(out, "AssignToPlace"),
-        ExprX::Loop { .. } => write_todo(out, "Loop"),
-        ExprX::Return(_) => write_todo(out, "Return"),
-        ExprX::NonSpecClosure { .. } => write_todo(out, "NonSpecClosure"),
+        // Exec-mode — can't appear in spec fn bodies (VIR mode checker guarantees this)
+        ExprX::Assign { .. } | ExprX::AssignToPlace { .. }
+        | ExprX::Loop { .. } | ExprX::Return(_) | ExprX::NonSpecClosure { .. } => {
+            panic!("exec-mode expression in spec fn body — VIR mode checker bug");
+        }
 
-        _ => write_todo(out, "expr"),
+        ExprX::AssertAssume { expr: e, .. }
+        | ExprX::AssertAssumeUserDefinedTypeInvariant { expr: e, .. }
+        | ExprX::AssertCompute(e, _)
+        | ExprX::NeverToAny(e) => write_expr(out, &e.x),
+        ExprX::AssertBy { ensure, .. } => write_expr(out, &ensure.x),
+        ExprX::AssertQuery { .. } => out.push_str("True"),
+        ExprX::OpenInvariant(_, _, body, _) => write_expr(out, &body.x),
+
+        // Remaining leaf/transparent nodes
+        ExprX::VarAt(ident, _) => write_name(out, &ident.0),
+        ExprX::Old(e) | ExprX::EvalAndResolve(_, e) => write_expr(out, &e.x),
+        ExprX::BorrowMut(_) | ExprX::TwoPhaseBorrowMut(_)
+        | ExprX::BorrowMutTracked(_) => out.push_str("()"),
+        ExprX::ImplicitReborrowOrSpecRead(place, _, _) => write_place(out, &place.x),
     }
 }
 
@@ -339,10 +381,12 @@ fn write_binop(out: &mut String, op: &BinaryOp) {
 }
 
 fn write_fn_ref(out: &mut String, fun: &Fun) {
-    write_name(out, short_name(&fun.path));
+    out.push_str(&lean_name(&fun.path));
 }
 
 /// Write a trait method reference as `TraitName.method` for Lean class dispatch.
+/// Uses the last two segments (TraitName.method) since class methods
+/// are scoped inside the class.
 fn write_trait_method_ref(out: &mut String, fun: &Fun) {
     let segs = &fun.path.segments;
     if segs.len() >= 2 {
@@ -354,25 +398,9 @@ fn write_trait_method_ref(out: &mut String, fun: &Fun) {
     }
 }
 
-/// Write a name, escaping Lean keywords.
+/// Write a name, escaping Lean keywords and sanitizing special chars.
 pub(crate) fn write_name(out: &mut String, name: &str) {
-    if is_lean_keyword(name) {
-        out.push('«'); out.push_str(name); out.push('»');
-    } else {
-        for c in name.chars() {
-            match c { '@' | '#' => out.push('_'), _ => out.push(c) }
-        }
-    }
-}
-
-fn is_lean_keyword(s: &str) -> bool {
-    matches!(s,
-        "def" | "theorem" | "lemma" | "example" | "abbrev" | "instance" | "class"
-        | "structure" | "inductive" | "where" | "with" | "match" | "do" | "return"
-        | "if" | "then" | "else" | "let" | "have" | "show" | "by" | "at" | "fun"
-        | "forall" | "exists" | "Type" | "Prop" | "Sort" | "import" | "open"
-        | "namespace" | "section" | "end" | "variable" | "universe"
-    )
+    out.push_str(&crate::to_lean_type::sanitize_ident(name));
 }
 
 /// Write a VIR pattern as Lean syntax.
@@ -435,11 +463,11 @@ fn write_ctor(out: &mut String, dt: &Dt, variant: &Ident, fields: &Binders<Expr>
 fn write_dt_variant(out: &mut String, dt: &Dt, variant: &Ident) {
     match dt {
         Dt::Path(path) => {
-            let type_name = short_name(path);
-            out.push_str(type_name);
+            let type_name = lean_name(path);
+            out.push_str(&type_name);
             out.push('.');
             // Structs: VIR uses type name as variant, Lean uses `mk`
-            if variant.as_str() == type_name { out.push_str("mk"); }
+            if variant.as_str() == short_name(path) { out.push_str("mk"); }
             else { write_name(out, variant); }
         }
         Dt::Tuple(_) => write_name(out, variant),
