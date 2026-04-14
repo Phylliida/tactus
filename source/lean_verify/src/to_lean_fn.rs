@@ -171,13 +171,16 @@ pub fn write_trait(
 }
 
 /// Write method type: `Self → ParamType → ... → RetType`.
-/// Self is detected by name ("self") or position (first param of a method).
 fn write_method_type(out: &mut String, func: &FunctionX) {
     for (i, p) in func.params.iter().enumerate() {
         if i > 0 { out.push_str(" → "); }
-        let is_self = i == 0 && (p.x.name.0.as_str() == "self"
-            || p.x.name.0.contains("self"));
-        if is_self { out.push_str("Self"); } else { write_typ(out, &p.x.typ); }
+        // Self param: detected by exact name match or first-param position
+        // (VIR may rename self to self%0 etc., so check both)
+        if p.x.name.0.as_str() == "self" || (i == 0 && p.x.name.0.starts_with("self")) {
+            out.push_str("Self");
+        } else {
+            write_typ(out, &p.x.typ);
+        }
     }
     if !func.params.is_empty() { out.push_str(" → "); }
     write_typ(out, &func.ret.x.typ);
