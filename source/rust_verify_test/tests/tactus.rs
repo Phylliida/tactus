@@ -871,3 +871,164 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// === Exists quantifier ===
+
+test_verify_one_file! {
+    #[test] test_exists verus_code! {
+        spec fn gt_zero(x: int) -> bool { x > 0 }
+
+        proof fn exists_witness()
+            ensures exists|x: int| #[trigger] gt_zero(x)
+        by {
+            unfold gt_zero; exact Exists.intro 1 (by omega)
+        }
+    } => Ok(())
+}
+
+// === Implies in spec fn body ===
+
+test_verify_one_file! {
+    #[test] test_implies_spec verus_code! {
+        spec fn safe_div(x: int, y: int) -> bool {
+            y != 0 ==> x / y * y <= x
+        }
+
+        proof fn safe_div_pos()
+            ensures safe_div(10, 3)
+        by {
+            unfold safe_div; omega
+        }
+    } => Ok(())
+}
+
+// === Fixed-width integer types (u32 → Nat, i64 → Int) ===
+
+test_verify_one_file! {
+    #[test] test_fixed_width_types verus_code! {
+        proof fn u32_bound(x: u32)
+            ensures x >= 0
+        by {
+            omega
+        }
+
+        proof fn i64_range(x: i64, y: i64)
+            requires x > 0, y > 0
+            ensures x + y > 1
+        by {
+            omega
+        }
+    } => Ok(())
+}
+
+// === Multiple type params ===
+
+test_verify_one_file! {
+    #[test] test_multi_type_params verus_code! {
+        spec fn pair_eq<A, B>(a1: A, a2: A, b1: B, b2: B) -> bool {
+            a1 == a2 && b1 == b2
+        }
+
+        proof fn pair_eq_refl(x: int, y: nat)
+            ensures pair_eq::<int, nat>(x, x, y, y)
+        by {
+            unfold pair_eq; simp
+        }
+    } => Ok(())
+}
+
+// === Deeply nested precedence ===
+
+test_verify_one_file! {
+    #[test] test_precedence verus_code! {
+        import Mathlib.Tactic.Ring
+
+        proof fn precedence(a: int, b: int, c: int)
+            ensures (a + b) * c == a * c + b * c
+        by {
+            ring
+        }
+    } => Ok(())
+}
+
+// === Enum variant check in spec fn ===
+
+test_verify_one_file! {
+    #[test] test_variant_check verus_code! {
+        enum AB { A(int), B }
+
+        spec fn is_a(x: AB) -> bool {
+            match x {
+                AB::A(_) => true,
+                AB::B => false,
+            }
+        }
+
+        proof fn a_check()
+            ensures is_a(AB::A(42))
+        by {
+            unfold is_a; simp
+        }
+    } => Ok(())
+}
+
+// === Proof fn with only requires, no interesting ensures ===
+
+test_verify_one_file! {
+    #[test] test_trivial_ensures verus_code! {
+        proof fn simple_passthrough(x: int)
+            requires x > 0
+            ensures x > 0
+        by {
+            omega
+        }
+    } => Ok(())
+}
+
+// === Nat subtraction (clips to 0) ===
+
+test_verify_one_file! {
+    #[test] test_nat_clip verus_code! {
+        proof fn nat_sub_clip(a: nat, b: nat)
+            requires b > a
+            ensures (a - b) as nat == 0
+        by {
+            omega
+        }
+    } => Ok(())
+}
+
+// === Chained spec fn: all ops in one expression ===
+
+test_verify_one_file! {
+    #[test] test_complex_expr verus_code! {
+        spec fn complex(x: int, y: int, z: int) -> int {
+            if x > 0 && y > 0 {
+                let sum = x + y;
+                sum * z - (x - y)
+            } else {
+                0
+            }
+        }
+
+        proof fn complex_zero()
+            ensures complex(0, 0, 0) == 0
+        by {
+            unfold complex; simp
+        }
+    } => Ok(())
+}
+
+// === Proof fn with named return (ensures references result) ===
+
+test_verify_one_file! {
+    #[test] test_named_return verus_code! {
+        spec fn succ(n: nat) -> nat { n + 1 }
+
+        proof fn succ_pos(n: nat)
+            ensures succ(n) > 0
+        by {
+            unfold succ; omega
+        }
+    } => Ok(())
+}
