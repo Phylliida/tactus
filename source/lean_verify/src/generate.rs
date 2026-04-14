@@ -13,6 +13,7 @@ use crate::to_lean_fn;
 use crate::to_lean_type::short_name;
 
 /// Result of checking a proof fn through Lean.
+#[must_use]
 pub enum CheckResult {
     /// Lean verified the proof successfully.
     Success,

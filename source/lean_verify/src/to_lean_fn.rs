@@ -71,7 +71,9 @@ pub fn write_proof_fn(out: &mut String, f: &FunctionX, tactic_body: &str) -> usi
 
     for (i, req) in f.require.iter().enumerate() {
         out.push_str(" (h");
-        out.push_str(&i.to_string());
+        // Avoid allocation: write digit directly for common case (< 10 hypotheses)
+        if i < 10 { out.push((b'0' + i as u8) as char); }
+        else { out.push_str(&i.to_string()); }
         out.push_str(" : ");
         write_expr(out, &req.x);
         out.push(')');
@@ -106,13 +108,12 @@ pub fn write_datatype(out: &mut String, dt: &DatatypeX) {
         Dt::Tuple(_) => return,
     };
 
-    let typ_params_str = dt.typ_params.iter()
-        .map(|(id, _)| format!(" ({} : Type)", id))
-        .collect::<String>();
-
     if dt.variants.len() == 1 && dt.variants[0].name.as_str() == short {
         let variant = &dt.variants[0];
-        out.push_str(&format!("structure {}{} where\n", path, typ_params_str));
+        out.push_str("structure ");
+        out.push_str(&path);
+        write_datatype_typ_params(out, dt);
+        out.push_str(" where\n");
         for field in variant.fields.iter() {
             let (typ, _, _) = &field.a;
             out.push_str("  ");
@@ -122,7 +123,10 @@ pub fn write_datatype(out: &mut String, dt: &DatatypeX) {
             out.push('\n');
         }
     } else {
-        out.push_str(&format!("inductive {}{} where\n", path, typ_params_str));
+        out.push_str("inductive ");
+        out.push_str(&path);
+        write_datatype_typ_params(out, dt);
+        out.push_str(" where\n");
         for variant in dt.variants.iter() {
             out.push_str("  | ");
             write_name(out, &variant.name);
@@ -153,7 +157,9 @@ pub fn write_trait(
     out.push_str(&name);
     out.push_str(" (Self : Type)");
     for (tp, _) in tr.typ_params.iter() {
-        out.push_str(&format!(" ({} : Type)", tp));
+        out.push_str(" (");
+        out.push_str(tp);
+        out.push_str(" : Type)");
     }
     out.push_str(" where\n");
 
@@ -174,9 +180,9 @@ pub fn write_trait(
 fn write_method_type(out: &mut String, func: &FunctionX) {
     for (i, p) in func.params.iter().enumerate() {
         if i > 0 { out.push_str(" → "); }
-        // Self param: detected by exact name match or first-param position
-        // (VIR may rename self to self%0 etc., so check both)
-        if p.x.name.0.as_str() == "self" || (i == 0 && p.x.name.0.starts_with("self")) {
+        // Self param: exact name "self", or first param with mode Spec
+        // (trait methods always have self as first param)
+        if p.x.name.0.as_str() == "self" || (i == 0 && p.x.mode != Mode::Exec) {
             out.push_str("Self");
         } else {
             write_typ(out, &p.x.typ);
@@ -238,6 +244,14 @@ fn write_ensures(out: &mut String, ensures: &[Expr]) {
         out.push_str("True");
     } else {
         write_sep(out, ensures, " ∧ ", |out, e| write_expr(out, &e.x));
+    }
+}
+
+fn write_datatype_typ_params(out: &mut String, dt: &DatatypeX) {
+    for (id, _) in dt.typ_params.iter() {
+        out.push_str(" (");
+        out.push_str(id);
+        out.push_str(" : Type)");
     }
 }
 
