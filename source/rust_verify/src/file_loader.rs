@@ -354,6 +354,58 @@ mod tests {
         assert!(sanitized.contains("requires"));
         assert!(sanitized.contains("ensures"));
     }
-}
 
-// --- dedent unit tests (separate from FileLoader) ---
+    // --- Edge cases ---
+
+    #[test]
+    fn test_garbage_input() {
+        // Totally invalid input — tree-sitter should handle gracefully
+        let src = "}{][)(🎉🎉🎉 not valid rust at all !!!";
+        assert_eq!(sanitize_tactic_blocks(src), src);
+    }
+
+    #[test]
+    fn test_empty_input() {
+        assert_eq!(sanitize_tactic_blocks(""), "");
+    }
+
+    #[test]
+    fn test_only_comments() {
+        let src = "// just a comment\n/* block */";
+        assert_eq!(sanitize_tactic_blocks(src), src);
+    }
+
+    // --- read_tactic_from_source edge cases ---
+
+    #[test]
+    fn test_read_tactic_nonexistent_file() {
+        let result = crate::verifier::read_tactic_from_source(
+            "/nonexistent/path/file.rs", 0, 10,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_read_tactic_out_of_bounds() {
+        let dir = std::env::temp_dir().join("tactus_test_oob");
+        std::fs::write(&dir, "by { omega }").unwrap();
+        let path = dir.to_str().unwrap();
+        // end_byte past file length
+        assert!(crate::verifier::read_tactic_from_source(path, 0, 9999).is_none());
+        // start+1 >= end (degenerate range)
+        assert!(crate::verifier::read_tactic_from_source(path, 5, 5).is_none());
+        assert!(crate::verifier::read_tactic_from_source(path, 5, 6).is_none());
+        std::fs::remove_file(&dir).ok();
+    }
+
+    #[test]
+    fn test_read_tactic_normal() {
+        let dir = std::env::temp_dir().join("tactus_test_normal");
+        std::fs::write(&dir, "by {\n    omega\n}").unwrap();
+        let path = dir.to_str().unwrap();
+        // byte range covers "{\n    omega\n}" (positions 3..15)
+        let result = crate::verifier::read_tactic_from_source(path, 3, 15);
+        assert_eq!(result.as_deref(), Some("\nomega"));
+        std::fs::remove_file(&dir).ok();
+    }
+}
