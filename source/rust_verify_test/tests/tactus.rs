@@ -732,6 +732,131 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === Trait with multiple methods ===
+
+test_verify_one_file! {
+    #[test] test_trait_multi_method verus_code! {
+        trait Bounds {
+            spec fn lo(&self) -> int;
+            spec fn hi(&self) -> int;
+        }
+
+        struct Range { start: int, end: int }
+
+        impl Bounds for Range {
+            spec fn lo(&self) -> int { self.start }
+            spec fn hi(&self) -> int { self.end }
+        }
+
+        proof fn range_lo()
+            ensures (Range { start: 1, end: 10 }).lo() == 1
+        by {
+            unfold lo
+            simp
+        }
+
+        proof fn range_hi()
+            ensures (Range { start: 1, end: 10 }).hi() == 10
+        by {
+            unfold hi
+            simp
+        }
+    } => Ok(())
+}
+
+// === Same trait, two impl types ===
+
+test_verify_one_file! {
+    #[test] test_trait_two_impls verus_code! {
+        trait IsZero {
+            spec fn is_zero(&self) -> bool;
+        }
+
+        struct MyInt { v: int }
+        struct MyNat { v: nat }
+
+        impl IsZero for MyInt {
+            spec fn is_zero(&self) -> bool { self.v == 0 }
+        }
+
+        impl IsZero for MyNat {
+            spec fn is_zero(&self) -> bool { self.v == 0 }
+        }
+
+        proof fn int_zero()
+            ensures (MyInt { v: 0 }).is_zero()
+        by {
+            unfold is_zero; simp
+        }
+
+        proof fn nat_zero()
+            ensures (MyNat { v: 0 }).is_zero()
+        by {
+            unfold is_zero; simp
+        }
+    } => Ok(())
+}
+
+// === Generic struct with multiple type params ===
+
+test_verify_one_file! {
+    #[test] test_generic_multi_param verus_code! {
+        struct Pair<A, B> { fst: A, snd: B }
+
+        spec fn get_fst<A, B>(p: Pair<A, B>) -> A { p.fst }
+        spec fn get_snd<A, B>(p: Pair<A, B>) -> B { p.snd }
+
+        proof fn pair_access()
+            ensures get_fst(Pair { fst: 1int, snd: true }) == 1
+        by {
+            unfold get_fst; simp
+        }
+    } => Ok(())
+}
+
+// === Enum with multi-field variant ===
+
+test_verify_one_file! {
+    #[test] test_enum_multi_field verus_code! {
+        enum Shape {
+            Circle(int),
+            Rect(int, int),
+            Empty,
+        }
+
+        spec fn area(s: Shape) -> int {
+            match s {
+                Shape::Circle(r) => r * r,
+                Shape::Rect(w, h) => w * h,
+                Shape::Empty => 0,
+            }
+        }
+
+        proof fn rect_area()
+            ensures area(Shape::Rect(3, 4)) == 12
+        by {
+            unfold area; simp
+        }
+    } => Ok(())
+}
+
+// === Trait method through generic (passthrough proof) ===
+
+test_verify_one_file! {
+    #[test] test_trait_generic_passthrough verus_code! {
+        trait HasLen {
+            spec fn len(&self) -> nat;
+        }
+
+        proof fn len_eq<T: HasLen>(a: T, b: T)
+            requires a.len() == b.len()
+            ensures a.len() == b.len()
+        by {
+            omega
+        }
+    } => Ok(())
+}
+
 // === Extensional equality (=~=) ===
 
 test_verify_one_file! {
