@@ -119,7 +119,24 @@ fn generate_lean(
         }
     }
 
-    // 3. Spec fns (topologically sorted, with mutual recursion groups)
+    // 3. Trait impls (instances) — after traits and datatypes, before spec fns
+    for ti in &krate.trait_impls {
+        if !refs.traits.contains(short_name(&ti.x.trait_path)) {
+            continue;
+        }
+        // Find method impl functions belonging to this impl
+        let method_impls: Vec<&FunctionX> = all_fns.iter()
+            .filter(|f| matches!(&f.kind, FunctionKind::TraitMethodImpl { impl_path, .. }
+                if impl_path == &ti.x.impl_path))
+            .copied()
+            .collect();
+        if !method_impls.is_empty() {
+            to_lean_fn::write_trait_impl(&mut out, &ti.x, &method_impls);
+            out.push('\n');
+        }
+    }
+
+    // 4. Spec fns (topologically sorted, with mutual recursion groups)
     let groups = dep_order::order_spec_fns(&spec_fn_map, &all_fns, &[proof_fn]);
     for group in &groups {
         match group {

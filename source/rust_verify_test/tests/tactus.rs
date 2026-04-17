@@ -710,6 +710,28 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === Trait impl: instance resolution ===
+
+test_verify_one_file! {
+    #[test] test_trait_impl_instance verus_code! {
+        trait HasVal {
+            spec fn val(&self) -> int;
+        }
+
+        struct Wrap { inner: int }
+
+        impl HasVal for Wrap {
+            spec fn val(&self) -> int { self.inner }
+        }
+
+        proof fn impl_works()
+            ensures (Wrap { inner: 7 }).val() == 7
+        by {
+            unfold val; simp
+        }
+    } => Ok(())
+}
+
 // === Extensional equality (=~=) ===
 
 test_verify_one_file! {

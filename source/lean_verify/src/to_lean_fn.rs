@@ -192,6 +192,54 @@ fn write_method_type(out: &mut String, func: &FunctionX) {
     write_typ(out, &func.ret.x.typ);
 }
 
+// ── Trait impl ─────────────────────────────────────────────────────────
+
+/// Write a trait impl as a Lean `instance`.
+///
+/// ```lean
+/// noncomputable instance : HasValue MyNum where
+///   value := fun self => self.val
+/// ```
+pub fn write_trait_impl(
+    out: &mut String,
+    ti: &TraitImplX,
+    method_impls: &[&FunctionX],
+) {
+    out.push_str("noncomputable instance : ");
+    out.push_str(&lean_name(&ti.trait_path));
+
+    // Type arguments: first is Self type, rest are trait type params
+    for typ in ti.trait_typ_args.iter() {
+        out.push(' ');
+        write_typ(out, typ);
+    }
+    out.push_str(" where\n");
+
+    for func in method_impls {
+        let method_name = func.name.path.segments.last()
+            .map(|s| s.as_str()).unwrap_or("_");
+        out.push_str("  ");
+        write_name(out, method_name);
+        out.push_str(" := ");
+
+        // Write as lambda: fun param1 param2 => body
+        let params: Vec<_> = func.params.iter().collect();
+        if !params.is_empty() {
+            out.push_str("fun");
+            for p in &params {
+                out.push(' ');
+                write_name(out, p.x.name.0.as_str());
+            }
+            out.push_str(" => ");
+        }
+        match &func.body {
+            Some(body) => write_expr(out, &body.x),
+            None => out.push_str("sorry"),
+        }
+        out.push('\n');
+    }
+}
+
 // ── Shared helpers ──────────────────────────────────────────────────────
 
 /// Write type params, trait bounds, and value params.
