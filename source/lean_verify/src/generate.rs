@@ -130,8 +130,13 @@ fn generate_lean(
                 if impl_path == &ti.x.impl_path))
             .copied()
             .collect();
-        if !method_impls.is_empty() {
-            to_lean_fn::write_trait_impl(&mut out, &ti.x, &method_impls);
+        // Find associated type impls belonging to this impl
+        let assoc_types: Vec<&AssocTypeImplX> = krate.assoc_type_impls.iter()
+            .filter(|a| a.x.impl_path == ti.x.impl_path)
+            .map(|a| &a.x)
+            .collect();
+        if !method_impls.is_empty() || !assoc_types.is_empty() {
+            to_lean_fn::write_trait_impl(&mut out, &ti.x, &method_impls, &assoc_types);
             out.push('\n');
         }
     }

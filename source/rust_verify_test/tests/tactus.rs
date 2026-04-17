@@ -857,6 +857,54 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === Generic trait impl (implicit type params in instance) ===
+
+test_verify_one_file! {
+    #[test] test_generic_trait_impl verus_code! {
+        trait Wrapper {
+            spec fn unwrap(&self) -> int;
+        }
+
+        struct Box<T> { val: T }
+
+        impl Wrapper for Box<int> {
+            spec fn unwrap(&self) -> int { self.val }
+        }
+
+        proof fn box_unwrap()
+            ensures (Box { val: 42int }).unwrap() == 42
+        by {
+            unfold unwrap
+            simp
+        }
+    } => Ok(())
+}
+
+// === Associated type: trait with type Output ===
+
+test_verify_one_file! {
+    #[test] test_assoc_type_basic verus_code! {
+        trait Converter {
+            type Output;
+            spec fn convert(&self) -> Self::Output;
+        }
+
+        struct MyNum { val: int }
+
+        impl Converter for MyNum {
+            type Output = bool;
+            spec fn convert(&self) -> bool { self.val > 0 }
+        }
+
+        proof fn converter_works()
+            ensures (MyNum { val: 5 }).convert()
+        by {
+            unfold convert
+            simp
+        }
+    } => Ok(())
+}
+
 // === Extensional equality (=~=) ===
 
 test_verify_one_file! {
