@@ -154,9 +154,12 @@ struct CompilerCallbacksEraseMacro {
 }
 
 impl rustc_driver::Callbacks for CompilerCallbacksEraseMacro {
-    // Adding `override_stability` and `stable_attr` functions is a hacky solution specifically for verifying core,
-    // to fix an issue with stability attributes.
     fn config(&mut self, config: &mut rustc_interface::interface::Config) {
+        // Tactus: sanitize tactic blocks in both compilation passes.
+        config.file_loader = Some(Box::new(crate::file_loader::TactusFileLoader));
+
+        // Adding `override_stability` and `stable_attr` functions is a hacky solution specifically for verifying core,
+        // to fix an issue with stability attributes.
         if self.override_stability {
             config.override_queries = Some(|_session, providers| {
                 providers.queries.hir_attr_map = |tcx, owner_id| {

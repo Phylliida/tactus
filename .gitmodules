@@ -1,0 +1,3 @@
+[submodule "tree-sitter-tactus"]
+	path = tree-sitter-tactus
+	url = https://github.com/Phylliida/tree-sitter-tactus.git

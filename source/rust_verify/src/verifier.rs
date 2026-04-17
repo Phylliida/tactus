@@ -1632,6 +1632,20 @@ impl Verifier {
                                 }
                             };
 
+                            // Check for // in tactic body — Lean uses // for integer
+                            // division, but it conflicts with Rust line comments in the
+                            // tree-sitter grammar. Users should use Nat.div/Int.div instead.
+                            if tactic_text.contains("//") {
+                                self.count_errors += 1;
+                                let fn_name = vir::ast_util::fun_as_friendly_rust_name(&function.x.name);
+                                reporter.report(&message(
+                                    MessageLevel::Error,
+                                    format!("{}: `//` is not supported in tactic blocks (tree-sitter treats it as a Rust line comment). Use `Nat.div` or `Int.div` instead.", fn_name),
+                                    fn_span,
+                                ).to_any());
+                                continue;
+                            }
+
                             match lean_verify::check_proof_fn(
                                 vir_krate,
                                 &vir_fn.x,
