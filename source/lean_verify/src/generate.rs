@@ -91,8 +91,9 @@ fn generate_lean(
     out.push_str(TACTUS_PRELUDE);
 
     // Wrap in namespace to avoid collisions with Lean builtins (Unit, Empty, etc.)
+    let ns = crate::to_lean_type::sanitize_ident(crate_name);
     out.push_str("namespace ");
-    out.push_str(crate_name);
+    out.push_str(&ns);
     out.push('\n');
 
     let all_fns: Vec<&FunctionX> = krate.functions.iter().map(|f| &f.x).collect();
@@ -124,7 +125,10 @@ fn generate_lean(
         }
     }
 
-    // 3. Trait impls (instances) — after traits and datatypes, before spec fns
+    // 3. Trait impls (instances)
+    // TODO: trait impls should be topologically sorted with spec fns, not emitted
+    // before them. If an instance method body references a spec fn, Lean needs the
+    // spec fn to be defined first. Currently works because lambda bodies are lazy.
     for ti in &krate.trait_impls {
         if !refs.traits.contains(short_name(&ti.x.trait_path)) {
             continue;
@@ -147,6 +151,7 @@ fn generate_lean(
     }
 
     // 4. Spec fns (topologically sorted, with mutual recursion groups)
+    // Note: trait impl method bodies may reference these — see TODO above.
     let groups = dep_order::order_spec_fns(&spec_fn_map, &all_fns, &[proof_fn]);
     for group in &groups {
         match group {
@@ -165,7 +170,7 @@ fn generate_lean(
         }
     }
 
-    // 4. Proof fn theorem
+    // 5. Proof fn theorem
     let tactic_start_line = to_lean_fn::write_proof_fn(&mut out, proof_fn, tactic_body);
     let source_map = to_lean_fn::LeanSourceMap {
         fn_name: short_name(&proof_fn.name.path).to_string(),
@@ -175,7 +180,7 @@ fn generate_lean(
     out.push('\n');
 
     out.push_str("end ");
-    out.push_str(crate_name);
+    out.push_str(&ns);
     out.push('\n');
 
     LeanOutput { text: out, source_map }

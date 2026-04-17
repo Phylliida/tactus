@@ -193,9 +193,7 @@ pub fn write_trait(
 fn write_method_type(out: &mut String, func: &FunctionX) {
     for (i, p) in func.params.iter().enumerate() {
         if i > 0 { out.push_str(" → "); }
-        // Self param: exact name "self", or first param with mode Spec
-        // (trait methods always have self as first param)
-        if p.x.name.0.as_str() == "self" || (i == 0 && p.x.mode != Mode::Exec) {
+        if p.x.name.0.as_str() == "self" {
             out.push_str("Self");
         } else {
             write_typ(out, &p.x.typ);
@@ -220,19 +218,18 @@ pub fn write_trait_impl(
     method_impls: &[&FunctionX],
     assoc_types: &[&AssocTypeImplX],
 ) {
-    out.push_str("noncomputable instance ");
+    out.push_str("noncomputable instance");
 
     // Generic type params as implicit bindings: {T : Type} {U : Type}
     for tp in ti.typ_params.iter() {
-        out.push_str("{");
+        out.push_str(" {");
         out.push_str(tp);
-        out.push_str(" : Type} ");
+        out.push_str(" : Type}");
     }
     // Trait bounds on type params: [TraitName T]
     write_trait_bounds(out, &ti.typ_bounds);
-    if !ti.typ_bounds.is_empty() { out.push(' '); }
 
-    out.push_str(": ");
+    out.push_str(" : ");
     out.push_str(&lean_name(&ti.trait_path));
 
     // Type arguments: first is Self type, rest are trait type params

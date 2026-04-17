@@ -103,10 +103,12 @@ pub(crate) fn short_name(path: &Path) -> &str {
 /// `crate::module::name` → `module.name`
 /// Names are sanitized (@ # → _) and keywords are escaped with «».
 pub(crate) fn lean_name(path: &Path) -> String {
-    let segs = &path.segments;
-    // Skip first segment for multi-segment paths (synthetic impl names like "impl&%0")
-    let start = if segs.len() > 1 { 1 } else { 0 };
-    let relevant = &segs[start..];
+    // Filter out synthetic impl segments (e.g., "impl&%0") — these are VIR-internal
+    // names for trait impl blocks, not user-visible names. They always contain
+    // non-alphanumeric characters like & or %.
+    let relevant: Vec<_> = path.segments.iter()
+        .filter(|s| !(s.starts_with("impl") && s.bytes().any(|b| b == b'&' || b == b'%')))
+        .collect();
     if relevant.len() == 1 && !needs_sanitization(&relevant[0]) {
         return relevant[0].to_string();
     }
