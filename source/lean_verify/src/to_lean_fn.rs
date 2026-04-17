@@ -252,10 +252,9 @@ pub fn write_trait_impl(
         out.push_str(" := ");
 
         // Write as lambda: fun param1 param2 => body
-        let params: Vec<_> = func.params.iter().collect();
-        if !params.is_empty() {
+        if !func.params.is_empty() {
             out.push_str("fun");
-            for p in &params {
+            for p in func.params.iter() {
                 out.push(' ');
                 write_name(out, p.x.name.0.as_str());
             }

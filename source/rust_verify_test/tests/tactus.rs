@@ -880,6 +880,29 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === Trait method with self and extra params ===
+
+test_verify_one_file! {
+    #[test] test_trait_method_multi_param verus_code! {
+        trait Adder {
+            spec fn add(&self, other: int) -> int;
+        }
+
+        struct MyVal { v: int }
+
+        impl Adder for MyVal {
+            spec fn add(&self, other: int) -> int { self.v + other }
+        }
+
+        proof fn add_works()
+            ensures (MyVal { v: 10 }).add(5) == 15
+        by {
+            unfold add
+            simp
+        }
+    } => Ok(())
+}
+
 // === Associated type: trait with type Output ===
 
 test_verify_one_file! {
