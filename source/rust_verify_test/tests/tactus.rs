@@ -1023,14 +1023,14 @@ test_verify_one_file! {
 
 test_verify_one_file! {
     #[test] test_empty_struct verus_code! {
-        struct Marker {}
+        struct Unit {}
 
-        spec fn make_marker() -> Marker { Marker {} }
+        spec fn make_unit() -> Unit { Unit {} }
 
-        proof fn marker_eq()
-            ensures make_marker() == make_marker()
+        proof fn unit_eq()
+            ensures make_unit() == make_unit()
         by {
-            unfold make_marker
+            unfold make_unit
             simp
         }
     } => Ok(())

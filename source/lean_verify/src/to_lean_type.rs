@@ -104,9 +104,9 @@ pub(crate) fn short_name(path: &Path) -> &str {
 /// Names are sanitized (@ # → _) and keywords are escaped with «».
 pub(crate) fn lean_name(path: &Path) -> String {
     let segs = &path.segments;
+    // Skip first segment for multi-segment paths (synthetic impl names like "impl&%0")
     let start = if segs.len() > 1 { 1 } else { 0 };
     let relevant = &segs[start..];
-    // Fast path: single segment, no sanitization needed
     if relevant.len() == 1 && !needs_sanitization(&relevant[0]) {
         return relevant[0].to_string();
     }

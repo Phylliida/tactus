@@ -35,8 +35,9 @@ pub fn check_proof_fn(
     proof_fn: &FunctionX,
     tactic_body: &str,
     imports: &[String],
+    crate_name: &str,
 ) -> CheckResult {
-    let lean_source = generate_lean(krate, proof_fn, tactic_body, imports);
+    let lean_source = generate_lean(krate, proof_fn, tactic_body, imports, crate_name);
 
     // Invoke Lean
     let dir = project::default_project_dir();
@@ -75,6 +76,7 @@ fn generate_lean(
     proof_fn: &FunctionX,
     tactic_body: &str,
     imports: &[String],
+    crate_name: &str,
 ) -> LeanOutput {
     let mut out = String::new();
 
@@ -88,7 +90,10 @@ fn generate_lean(
 
     out.push_str(TACTUS_PRELUDE);
 
-    // No namespace wrapper needed — all names are fully qualified via lean_name()
+    // Wrap in namespace to avoid collisions with Lean builtins (Unit, Empty, etc.)
+    out.push_str("namespace ");
+    out.push_str(crate_name);
+    out.push('\n');
 
     let all_fns: Vec<&FunctionX> = krate.functions.iter().map(|f| &f.x).collect();
     let spec_fn_map = dep_order::build_spec_fn_map(&all_fns);
@@ -167,6 +172,10 @@ fn generate_lean(
         tactic_start_line,
         tactic_line_count: tactic_body.lines().count().max(1),
     };
+    out.push('\n');
+
+    out.push_str("end ");
+    out.push_str(crate_name);
     out.push('\n');
 
     LeanOutput { text: out, source_map }
