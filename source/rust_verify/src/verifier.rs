@@ -388,24 +388,7 @@ fn read_tactic_from_source(
     let inner = &src[start_byte + 1..end_byte - 1];
     // Dedent: strip common leading whitespace so Lean sees sibling tactics
     // at the same indent level (Lean's tactic parser is indentation-sensitive).
-    Some(dedent(inner))
-}
-
-/// Strip common leading whitespace from all non-empty lines.
-fn dedent(s: &str) -> String {
-    let min_indent = s.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| line.len() - line.trim_start().len())
-        .min()
-        .unwrap_or(0);
-    let mut out = String::new();
-    for (i, line) in s.lines().enumerate() {
-        if i > 0 { out.push('\n'); }
-        if !line.trim().is_empty() {
-            out.push_str(&line[min_indent..]);
-        }
-    }
-    out
+    Some(crate::file_loader::dedent(inner))
 }
 
 fn report_chosen_triggers(
