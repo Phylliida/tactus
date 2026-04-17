@@ -971,6 +971,122 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === Parameterized trait: trait Foo<T> ===
+
+test_verify_one_file! {
+    #[test] test_parameterized_trait verus_code! {
+        trait Container<T> {
+            spec fn peek(&self) -> T;
+        }
+
+        struct IntBox { val: int }
+
+        impl Container<int> for IntBox {
+            spec fn peek(&self) -> int { self.val }
+        }
+
+        proof fn peek_works()
+            ensures (IntBox { val: 7 }).peek() == 7
+        by {
+            unfold peek
+            simp
+        }
+    } => Ok(())
+}
+
+// === Associated type in method signature ===
+
+test_verify_one_file! {
+    #[test] test_assoc_type_in_method verus_code! {
+        trait Producer {
+            type Item;
+            spec fn produce(&self) -> Self::Item;
+        }
+
+        struct IntMaker { val: int }
+
+        impl Producer for IntMaker {
+            type Item = int;
+            spec fn produce(&self) -> int { self.val }
+        }
+
+        proof fn producer_test()
+            ensures (IntMaker { val: 42 }).produce() == 42
+        by {
+            unfold produce
+            simp
+        }
+    } => Ok(())
+}
+
+// === Empty struct (no fields) ===
+
+test_verify_one_file! {
+    #[test] test_empty_struct verus_code! {
+        struct Marker {}
+
+        spec fn make_marker() -> Marker { Marker {} }
+
+        proof fn marker_eq()
+            ensures make_marker() == make_marker()
+        by {
+            unfold make_marker
+            simp
+        }
+    } => Ok(())
+}
+
+// === Nested datatype: struct containing enum ===
+
+test_verify_one_file! {
+    #[test] test_nested_datatype verus_code! {
+        enum Color { Red, Blue }
+
+        struct Pixel {
+            x: int,
+            y: int,
+            color: Color,
+        }
+
+        spec fn is_red(p: Pixel) -> bool {
+            match p.color {
+                Color::Red => true,
+                Color::Blue => false,
+            }
+        }
+
+        proof fn red_pixel_is_red()
+            ensures is_red(Pixel { x: 0, y: 0, color: Color::Red })
+        by {
+            unfold is_red
+            simp
+        }
+    } => Ok(())
+}
+
+// === Trait method returning bool (exercises Bool → Prop mapping) ===
+
+test_verify_one_file! {
+    #[test] test_trait_bool_return verus_code! {
+        trait Predicate {
+            spec fn holds(&self) -> bool;
+        }
+
+        struct AlwaysTrue {}
+
+        impl Predicate for AlwaysTrue {
+            spec fn holds(&self) -> bool { true }
+        }
+
+        proof fn always_true_holds()
+            ensures (AlwaysTrue {}).holds()
+        by {
+            unfold holds
+            simp
+        }
+    } => Ok(())
+}
+
 // === Extensional equality (=~=) ===
 
 test_verify_one_file! {
