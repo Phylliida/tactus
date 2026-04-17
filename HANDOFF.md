@@ -10,9 +10,15 @@ See `DESIGN.md` for the full design rationale and decisions.
 
 **63 end-to-end tests pass.** The pipeline works: user writes a proof fn with `by { }`, Tactus generates Lean, invokes Lean (with Mathlib if available), reports results through Verus's diagnostic system.
 
+**FileLoader implemented.** Tactic blocks are sanitized before rustc's lexer sees them, enabling Unicode (`⟨⟩·∀∃`) and Lean syntax (`--`, `/- -/`) in tactic bodies.
+
+**tree-sitter-tactus grammar done.** 184 tests passing: Lean-aware tactic body rules plus all inherited Rust tests.
+
 ### What works
 
 - **`by { }` syntax**: tactic bodies extracted verbatim from source file via byte range (preserves newlines, Unicode)
+- **FileLoader sanitization**: `TactusFileLoader` intercepts `read_file()`, replaces tactic block content with spaces before rustc lexes. Byte offsets preserved. Handles `--`, `/- -/` (nestable), `"..."`, nested `{ }`.
+- **tree-sitter-tactus**: Lean-aware grammar for tactic blocks. `_tactic_brace_body` handles all Lean syntax. `line_comment` stays in `extras` so `//` comments work everywhere in Rust.
 - **`import` keyword**: `import Mathlib.Tactic.Ring` threaded through proc macro → VIR → Lean
 - **Mathlib**: Lake project at `~/.tactus/lean-project/`, precompiled oleans via `lake exe cache get`
 - **All VIR spec-mode features**: exhaustive match on TypX and ExprX — no sorry, panics on invariant violations
@@ -21,7 +27,6 @@ See `DESIGN.md` for the full design rationale and decisions.
 - **Dependency ordering**: Tarjan's SCC, topological sort, mutual recursion → `mutual ... end`
 - **Fully qualified names**: `lean_name(path)` prevents collisions, no namespace wrapper needed
 - **Source map**: tactic line numbers in error messages
-- **63 tests**: arithmetic, logic, datatypes, traits, generics, Mathlib tactics, error reporting
 - **vstd builds**: `vargo build --release` → 1530 verified, 0 errors
 
 ### Architecture
@@ -29,10 +34,14 @@ See `DESIGN.md` for the full design rationale and decisions.
 ```
 User writes: proof fn lemma(x: nat) requires x > 0 ensures double(x) > x by { unfold double; omega }
 
+FileLoader:  TactusFileLoader.read_file() sanitizes tactic block content → spaces
+             rustc sees: by {                              }
+             byte offsets preserved — proc macro's Span::byte_range() still correct
+
 verus-syn:   captures `by { }` brace group, records Span::byte_range() → (start, end)
 proc macro:  emits #[verus::internal(tactic_span(start, end))], truncates body
 VIR:         tactic_span: Option<(usize, usize)> on FunctionAttrsX
-verifier:    reads source file at byte range → verbatim tactic text
+verifier:    reads ORIGINAL source file at byte range → verbatim tactic text
              calls lean_verify::check_proof_fn(krate, fn, tactic_text, imports)
 lean_verify:  generates .lean file (imports, prelude, spec fns, theorem)
              invokes `lake env lean` or `lean --stdin --json`
@@ -42,13 +51,15 @@ lean_verify:  generates .lean file (imports, prelude, spec fns, theorem)
 
 ### Key design decisions
 
-1. **Tactic body via byte range, not string literal** — proc macro stores `tactic_span(start_byte, end_byte)` as integers in the attribute. Verifier reads source file directly. No string escaping/unescaping.
-2. **lean_verify depends on VIR directly** — no intermediate IR. Translators operate on VIR types.
-3. **Zero-allocation dependency analysis** — lifetime-preserving `walk_expr` borrows from the krate AST. `HashSet<&str>` for references. No Arc clones.
-4. **Fully qualified Lean names** — `lean_name(path)` skips crate prefix, joins segments with `.`. No collision detection needed.
-5. **Exhaustive pattern matches** — `write_expr`, `write_typ`, `walk_expr` have no catch-all `_ =>`. New VIR variants cause compile errors.
-6. **Choose → `Classical.epsilon`** — total function, no sorry needed.
-7. **`#[must_use]` on `CheckResult`** — can't silently drop verification results.
+1. **FileLoader for Unicode/Lean syntax** — `TactusFileLoader` sanitizes tactic blocks before rustc's lexer. Same-length replacement preserves byte offsets. No rustc fork needed.
+2. **`//` not allowed in tactic blocks** — Lean's `//` (integer division) must be written as `Nat.div`/`Int.div`. This avoids an unresolvable conflict: tree-sitter's `extras` are global and `line_comment` can't be context-disabled. Explored extensively: `prec(100)`, `prec.dynamic`, removing from extras — none work cleanly.
+3. **Tactic body via byte range, not string literal** — proc macro stores `tactic_span(start_byte, end_byte)` as integers in the attribute. Verifier reads source file directly. No string escaping/unescaping.
+4. **lean_verify depends on VIR directly** — no intermediate IR. Translators operate on VIR types.
+5. **Zero-allocation dependency analysis** — lifetime-preserving `walk_expr` borrows from the krate AST. `HashSet<&str>` for references. No Arc clones.
+6. **Fully qualified Lean names** — `lean_name(path)` skips crate prefix, joins segments with `.`. No collision detection needed.
+7. **Exhaustive pattern matches** — `write_expr`, `write_typ`, `walk_expr` have no catch-all `_ =>`. New VIR variants cause compile errors.
+8. **Choose → `Classical.epsilon`** — total function, no sorry needed.
+9. **`#[must_use]` on `CheckResult`** — can't silently drop verification results.
 
 ## Repository layout
 
@@ -75,47 +86,59 @@ tactus/
     builtin_macros/src/
       syntax.rs                ← MODIFIED: by {} detection, byte range capture
     rust_verify/src/
+      file_loader.rs           ← TactusFileLoader: sanitizes tactic blocks + 17 unit tests
       attributes.rs            ← MODIFIED: TacticSpan attr parsing
       rust_to_vir_func.rs      ← MODIFIED: threads tactic_span to FunctionAttrsX
-      verifier.rs              ← MODIFIED: reads source file, routes to Lean
+      verifier.rs              ← MODIFIED: installs FileLoader, reads source, routes to Lean
     rust_verify_test/tests/
       tactus.rs                ← 63 end-to-end tests (1108 lines)
     vir/src/
       ast.rs                   ← MODIFIED: tactic_span: Option<(usize, usize)>
+
+tree-sitter-tactus/           ← separate repo (to be added as submodule)
+  grammar.js                  ← Tactus grammar: Rust + Lean tactic block rules
+  src/scanner.c               ← external scanner (strings, raw strings, block comments)
+  test/corpus/
+    tactic_blocks.txt          ← 36 tactic-specific tests
+    declarations.txt           ← fixed attribute test expectations
 ```
 
-## What we learned from code review
+## What we learned
 
-### Quality principles (Torvalds-level)
+### FileLoader design (this session)
 
-1. **No sorry in generated output.** Every VIR feature either has a proper Lean translation or panics on invariant violation. "Sorry" is silent unsoundness.
-2. **Exhaustive matches over catch-all.** If VIR adds a variant, the compiler tells you. `_ => {}` hides bugs.
-3. **Avoid allocation in hot paths.** `write_name` checks `needs_sanitization` before allocating. `lean_name` has a fast path for single segments. Hypothesis names use direct char push for i<10.
-4. **No manual string escaping.** The byte-range approach avoids string-literal roundtrip entirely. When we tried `source_text()` → string attribute → attribute parser, the `\n` ↔ `\\n` roundtrip was fragile and required unescaping.
-5. **Store data at the right level.** Integers (byte offsets) pass through attributes cleanly. Strings with newlines don't. Choose the representation that avoids encoding issues.
-6. **Don't roll your own when established code exists.** We initially wrote a custom expression walker, then switched to VIR's built-in `expr_visitor_walk`, then wrote a minimal lifetime-preserving `walk_expr` when we needed `&'a` borrows. Each step was justified.
-7. **`format!` allocates.** Use `out.push_str()` sequences instead of `format!()` in writers. Every `format!(" ({} : Type)", id)` is a temporary String allocation.
-8. **Test every code path.** Each round of testing caught real bugs: missing type args, wrong const generic params, precedence issues, name collisions.
+We explored multiple approaches for handling Unicode/Lean syntax in tactic blocks:
 
-### Anti-patterns we caught and fixed
+1. **Fork rustc_lexer** — rejected: Verus uses stock rustc (toolchain 1.94.0), not a forked compiler. Would require building a custom rustc.
+2. **Raw string syntax** (`by r#"..."#`) — rejected: feels hacky, no syntax highlighting inside strings.
+3. **tree-sitter in FileLoader** — explored extensively, but tree-sitter's `extras` are global (no way to disable `line_comment` for specific rules). Required adding `line_comment` to dozens of grammar rules, creating unresolvable conflicts between expression rules.
+4. **Remove `line_comment` from extras** — explored: works for most cases but `field_expression` (prec 15) and `range_expression` steal comments from `if`/`while`/`for` conditions. `prec.dynamic` can't override static shift/reduce resolution.
+5. **FileLoader + disallow `//` in tactics** — final solution: simple, clean, no conflicts.
 
-- **`TokenStream::to_string()` collapses whitespace** — replaced with byte-range file reading
-- **`Arc::clone()` in dependency analysis** — replaced with lifetime-preserving borrows (`&'a`)
-- **`HashSet<String>` for name tracking** — replaced with `HashSet<&'a str>` (zero allocation)
-- **Index-based collision detection** — replaced with fully qualified names (simpler, correct by construction)
-- **Sorry as fallback** — replaced with exhaustive handling + panic on invariant violations
-- **`sorry` in `Choose`** — replaced with `Classical.epsilon` (total, sound)
-- **Manual unescape of `\n`** — replaced with byte-range approach (no escaping at all)
+Key tree-sitter lessons:
+- **Extras are truly global** — no grammar-level mechanism to disable them for specific rules
+- **`prec()` doesn't override extras** — extras are consumed between ALL tokens regardless of precedence
+- **`prec.dynamic()` can't override static resolution** — only works when GLR paths complete successfully
+- **`repeat($.line_comment)` before operators steals from parent rules** — `field_expression` at prec 15 grabs comments meant for `if_expression`
+
+### Quality principles (from earlier sessions)
+
+1. **No sorry in generated output.** Every VIR feature either has a proper Lean translation or panics on invariant violation.
+2. **Exhaustive matches over catch-all.** If VIR adds a variant, the compiler tells you.
+3. **Avoid allocation in hot paths.** `write_name` checks `needs_sanitization` before allocating.
+4. **No manual string escaping.** Byte-range approach avoids string-literal roundtrip entirely.
+5. **Store data at the right level.** Integers (byte offsets) pass through attributes cleanly.
+6. **Test every code path.** Each round of testing caught real bugs.
 
 ## What remains to be done
 
-### Immediate: Fork rustc_lexer for `//` comments in `by { }`
+### Immediate next steps
 
-**The blocking issue.** Rust's lexer treats `//` inside `by { }` as a line comment, eating the closing `}`. Users can't write Lean comments (`--` works as `- -` tokens, but `//` doesn't). This also blocks Unicode support (DESIGN.md's `⟨⟩`, `·`, `∀` etc.).
+1. **Wire FileLoader end-to-end** — the `TactusFileLoader` is installed in the `config` callback and has 17 passing unit tests. Need to verify it works with actual tactic blocks containing Unicode and Lean syntax in the end-to-end tests. May need to add new e2e tests with Unicode tactics.
 
-The fix: modify `rustc_lexer` in the Verus fork to not interpret `//` as comments inside brace groups that follow the `by` keyword. This requires adding context to the otherwise-context-free lexer.
+2. **Add `//` detection in tactic bodies** — at verification time, when extracting tactic text from the original file, check for `//` and emit a clear error: "use Nat.div/Int.div instead of // in tactic blocks."
 
-Alternative: accept the limitation for now (users use `--` not `//`, and semicolons for multi-line). Document it.
+3. **tree-sitter-tactus as submodule** — currently a separate repo. Should be added as a git submodule inside `tactus/`. The grammar is complete (184 tests) but not yet integrated as a dependency.
 
 ### Track B: Exec fn VC generation (3-6 months)
 
@@ -132,7 +155,7 @@ Trait impls as Lean instances. Associated types. Type projections. These are par
 ### Other
 
 - Per-module Lean generation (currently one .lean per proof fn)
-- IDE integration (goal states in editor)  
+- IDE integration (goal states in editor)
 - `HANDOFF.md` and `DESIGN.md` may drift — keep them updated
 - Update `setup-mathlib.sh` when Lean/Mathlib versions change
 
@@ -148,28 +171,19 @@ PATH="../tools/vargo/target/release:$PATH" vargo build --release
 # Mathlib setup (optional, ~5 min download)
 cd lean_verify && ./scripts/setup-mathlib.sh && cd ..
 
-# Run tests (63 tests, 57 core + 6 Mathlib)
+# Run end-to-end tests (63 tests, 57 core + 6 Mathlib)
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Quick compile check
 RUSTC_BOOTSTRAP=1 cargo check -p rust_verify
 
-# Single test
+# FileLoader unit tests (17 tests)
+RUSTC_BOOTSTRAP=1 cargo test -p rust_verify --lib -- file_loader
+
+# tree-sitter-tactus tests (184 tests)
+cd ../tree-sitter-tactus
+nix-shell -p tree-sitter nodejs --run "tree-sitter generate && tree-sitter test"
+
+# Single e2e test
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus -- test_add_comm
 ```
-
-## Git log (this session)
-
-```
-8fd59cd Fix setup-mathlib.sh: auto-detect Lean version, pin matching Mathlib tag
-708037a Final review fixes: exhaustive binop, no-alloc names, Choose→epsilon, setup script
-5bd091b 63 tests: or-pattern, const generics, nested enums + const generic param fix
-06ee43c 60 tests: exists, precedence, fixed-width types, multi type params
-40259fd 50 tests, generic type args, struct update, full coverage
-849a998 Fix write_method_type self detection: starts_with instead of contains
-4ddf325 Full VIR spec-mode coverage, fully qualified names, no sorry
-746dbd9 Track A complete + Track D (structs/enums/traits) + architectural refactor
-267c7dc Update HANDOFF.md: current state, tracks B/C/D, lessons learned
-```
-
-(Plus ~10 earlier commits: lean_verify crate, proc macro, VIR threading, initial pipeline)

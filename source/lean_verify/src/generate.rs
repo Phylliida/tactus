@@ -39,11 +39,11 @@ pub fn check_proof_fn(
     let lean_source = generate_lean(krate, proof_fn, tactic_body, imports);
 
     // Invoke Lean
-    let result = match project::default_project_dir() {
-        Some(dir) if project::project_ready(&dir) => {
-            lean_process::check_lean_in_project(&lean_source.text, &dir)
-        }
-        _ => lean_process::check_lean_stdin(&lean_source.text),
+    let dir = project::default_project_dir();
+    let result = if project::project_ready(&dir) {
+        lean_process::check_lean_in_project(&lean_source.text, &dir)
+    } else {
+        lean_process::check_lean_stdin(&lean_source.text)
     };
 
     match result {

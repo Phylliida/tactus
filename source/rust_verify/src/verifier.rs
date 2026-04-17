@@ -374,27 +374,38 @@ impl FuncDetails {
 }
 
 /// Read the verbatim tactic body from the source file using byte range.
-/// `start_byte`/`end_byte` are file-relative (from proc_macro2::Span::byte_range()).
-/// `fn_span` is the VIR span — its `as_string` contains the file path.
-/// The byte range covers `{ ... }` — we strip the braces and return the content.
+/// The file path and byte range are stored in VIR `tactic_span` at construction time
+/// (when the SourceMap is available), so this function works on any thread.
+/// The byte range covers `{ ... }` — we strip the braces and dedent.
 fn read_tactic_from_source(
-    fn_span: &vir::messages::Span,
+    file_path: &str,
     start_byte: usize,
     end_byte: usize,
 ) -> Option<String> {
-    // Extract file path from the VIR span (format: "path/to/file.rs:line:col")
-    let file_path = fn_span.as_string.split(':').next()?;
     let src = std::fs::read_to_string(file_path).ok()?;
-    // Extract the byte range — it covers `{ ... }`
-    if end_byte > src.len() || start_byte >= end_byte { return None; }
-    let snippet = &src[start_byte..end_byte];
-    // Strip the braces
-    let s = snippet.trim();
-    if s.starts_with('{') && s.ends_with('}') {
-        Some(s[1..s.len()-1].trim().to_string())
-    } else {
-        Some(s.to_string())
+    // Byte range from syn's brace span includes { and } — take the content between them.
+    if start_byte + 1 >= end_byte || end_byte > src.len() { return None; }
+    let inner = &src[start_byte + 1..end_byte - 1];
+    // Dedent: strip common leading whitespace so Lean sees sibling tactics
+    // at the same indent level (Lean's tactic parser is indentation-sensitive).
+    Some(dedent(inner))
+}
+
+/// Strip common leading whitespace from all non-empty lines.
+fn dedent(s: &str) -> String {
+    let min_indent = s.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    let mut out = String::new();
+    for (i, line) in s.lines().enumerate() {
+        if i > 0 { out.push('\n'); }
+        if !line.trim().is_empty() {
+            out.push_str(&line[min_indent..]);
+        }
     }
+    out
 }
 
 fn report_chosen_triggers(
@@ -1601,7 +1612,7 @@ impl Verifier {
                         self.expand_flag = query_op.is_expanded();
 
                         // Tactus: route tactic proof fns to Lean instead of Z3
-                        if let Some((start_byte, end_byte)) = function.x.attrs.tactic_span {
+                        if let Some((ref file_path, start_byte, end_byte)) = function.x.attrs.tactic_span {
                             let fn_span = &function.span;
 
                             // Look up the VIR function from the VIR krate
@@ -1621,10 +1632,8 @@ impl Verifier {
                             };
 
                             // Read verbatim tactic text from the source file using byte range.
-                            // The byte range covers `{ ... }` — we strip the braces.
-                            // This preserves whitespace, newlines, Unicode, and Lean comments.
                             let tactic_body = read_tactic_from_source(
-                                fn_span, start_byte, end_byte,
+                                file_path, start_byte, end_byte,
                             );
                             let tactic_text = match &tactic_body {
                                 Some(t) => t.as_str(),
@@ -3272,6 +3281,11 @@ fn hir_crate<'tcx>(tcx: TyCtxt<'tcx>, _: ()) -> rustc_hir::Crate<'tcx> {
 
 impl rustc_driver::Callbacks for VerifierCallbacksEraseMacro {
     fn config(&mut self, config: &mut rustc_interface::interface::Config) {
+        // Install the Tactus file loader to sanitize tactic blocks before
+        // rustc's lexer sees them. This replaces Lean syntax (Unicode, --
+        // comments, /- -/ comments) with spaces so rustc doesn't error.
+        config.file_loader = Some(Box::new(crate::file_loader::TactusFileLoader));
+
         if let Some(mut dep_tracker) = self.verifier.dep_tracker.take() {
             let import_dep_if_present = &self
                 .verifier

@@ -9,6 +9,8 @@ edition = "2024"
 air = { path = "../air" }
 vir = { path = "../vir" }
 lean_verify = { path = "../lean_verify" }
+tree-sitter = "0.25"
+tree-sitter-tactus = { path = "../../../tree-sitter-tactus" }
 serde = "1"
 serde_json = { version = ">=1.0.95", features = ["preserve_order"] }
 bincode = "1.0.1"

@@ -1496,9 +1496,9 @@ pub struct FunctionAttrsX {
     /// Is this function `Option::tracked_take`, which requires special handling
     pub tracked_take_option: bool,
     /// Tactus: if Some, this proof fn uses Lean tactic verification.
-    /// The (start_byte, end_byte) is the byte range of `{ ... }` in the source file.
-    /// rust_verify reads the source at this range to get verbatim tactic text.
-    pub tactic_span: Option<(usize, usize)>,
+    /// (file_path, start_byte, end_byte) — the byte range of `{ ... }` in the source file.
+    /// The file path is resolved at VIR construction time (when SourceMap is available).
+    pub tactic_span: Option<(String, usize, usize)>,
     /// Tactus: Lean import paths (e.g., "Mathlib.Tactic.Ring").
     /// Imports are module-level but stored per-function because each proof fn
     /// currently generates its own .lean file. All tactic proof fns in the same
