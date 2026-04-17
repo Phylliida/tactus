@@ -161,6 +161,7 @@ pub fn write_trait(
         out.push_str(tp);
         out.push_str(" : Type)");
     }
+    write_trait_bounds(out, &tr.typ_bounds);
     out.push_str(" where\n");
 
     // Associated types as Type fields
@@ -171,15 +172,19 @@ pub fn write_trait(
     }
 
     for method_fun in tr.methods.iter() {
+        let method_name = method_fun.path.segments.last()
+            .map(|s| s.as_str()).unwrap_or("_");
+        out.push_str("  ");
+        write_name(out, method_name);
+        out.push_str(" : ");
         if let Some(func) = method_lookup.get(method_fun) {
-            let method_name = method_fun.path.segments.last()
-                .map(|s| s.as_str()).unwrap_or("_");
-            out.push_str("  ");
-            write_name(out, method_name);
-            out.push_str(" : ");
             write_method_type(out, func);
-            out.push('\n');
+        } else {
+            // Method not found — emit a sorry-typed placeholder so Lean
+            // gives a clear error instead of silently producing a wrong class.
+            out.push_str("sorry /- method not found in VIR -/");
         }
+        out.push('\n');
     }
 }
 
@@ -222,6 +227,9 @@ pub fn write_trait_impl(
         out.push_str(tp);
         out.push_str(" : Type} ");
     }
+    // Trait bounds on type params: [TraitName T]
+    write_trait_bounds(out, &ti.typ_bounds);
+    if !ti.typ_bounds.is_empty() { out.push(' '); }
 
     out.push_str(": ");
     out.push_str(&lean_name(&ti.trait_path));
@@ -270,6 +278,21 @@ pub fn write_trait_impl(
 
 // ── Shared helpers ──────────────────────────────────────────────────────
 
+/// Write trait bounds as Lean instance params: `[TraitName T1 T2]`.
+fn write_trait_bounds(out: &mut String, bounds: &GenericBounds) {
+    for bound in bounds.iter() {
+        if let GenericBoundX::Trait(TraitId::Path(path), typs) = &**bound {
+            out.push_str(" [");
+            out.push_str(&lean_name(path));
+            for t in typs.iter() {
+                out.push(' ');
+                write_typ(out, t);
+            }
+            out.push(']');
+        }
+    }
+}
+
 /// Write type params, trait bounds, and value params.
 fn write_fn_params(out: &mut String, f: &FunctionX) {
     // Check which type params are const generics (have ConstTyp bounds)
@@ -287,7 +310,6 @@ fn write_fn_params(out: &mut String, f: &FunctionX) {
         out.push_str(" (");
         out.push_str(tp);
         if let Some(val_typ) = const_typ_for(tp) {
-            // Const generic: emit as value param with the value type
             out.push_str(" : ");
             write_typ(out, val_typ);
             out.push(')');
@@ -295,17 +317,7 @@ fn write_fn_params(out: &mut String, f: &FunctionX) {
             out.push_str(" : Type)");
         }
     }
-    for bound in f.typ_bounds.iter() {
-        if let GenericBoundX::Trait(TraitId::Path(path), typs) = &**bound {
-            out.push_str(" [");
-            out.push_str(&lean_name(path));
-            for t in typs.iter() {
-                out.push(' ');
-                write_typ(out, t);
-            }
-            out.push(']');
-        }
-    }
+    write_trait_bounds(out, &f.typ_bounds);
     for p in f.params.iter() {
         out.push_str(" (");
         write_name(out, &p.x.name.0);
