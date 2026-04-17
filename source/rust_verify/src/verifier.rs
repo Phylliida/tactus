@@ -1647,11 +1647,13 @@ impl Verifier {
                                 continue;
                             }
 
+                            let crate_name = self.crate_name.as_deref().unwrap_or("crate");
                             match lean_verify::check_proof_fn(
                                 vir_krate,
                                 &vir_fn.x,
                                 tactic_text,
                                 &vir_fn.x.attrs.lean_imports,
+                                crate_name,
                             ) {
                                 lean_verify::CheckResult::Success => {
                                     self.count_verified += 1;

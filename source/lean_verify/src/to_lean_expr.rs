@@ -429,9 +429,8 @@ fn write_fn_ref(out: &mut String, fun: &Fun) {
     out.push_str(&lean_name(&fun.path));
 }
 
-/// Write a trait method reference as `TraitName.method` for Lean class dispatch.
-/// Uses the last two segments (TraitName.method) since class methods
-/// are scoped inside the class.
+/// Write a trait method reference as `Crate.Module.TraitName.method` for Lean class dispatch.
+/// Uses the full path (via lean_name) of the trait, then `.method`.
 fn write_trait_method_ref(out: &mut String, fun: &Fun) {
     let segs = &fun.path.segments;
     if segs.len() >= 2 {
