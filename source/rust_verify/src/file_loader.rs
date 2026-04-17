@@ -8,6 +8,23 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Strip common leading whitespace from all non-empty lines.
+pub(crate) fn dedent(s: &str) -> String {
+    let min_indent = s.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    let mut out = String::new();
+    for (i, line) in s.lines().enumerate() {
+        if i > 0 { out.push('\n'); }
+        if !line.trim().is_empty() {
+            out.push_str(&line[min_indent..]);
+        }
+    }
+    out
+}
+
 /// FileLoader that sanitizes tactic blocks before rustc lexes the source.
 pub struct TactusFileLoader;
 
@@ -264,5 +281,125 @@ mod tests {
     fn test_trigger_in_forall_expr() {
         let src = "verus! {\nspec fn p() -> bool { forall|x: int| #[trigger] f(x) }\n}";
         assert_eq!(sanitize_tactic_blocks(src), src);
+    }
+
+    #[test]
+    fn test_trigger_in_exists_expr() {
+        let src = "verus! {\nspec fn p() -> bool { exists|x: int| #[trigger] f(x) }\n}";
+        assert_eq!(sanitize_tactic_blocks(src), src);
+    }
+
+    // --- Lean syntax edge cases inside tactic blocks (the whole point of FileLoader) ---
+
+    #[test]
+    fn test_lean_line_comment_with_brace_in_verus() {
+        // `-- comment }` must not close the tactic block
+        let src = "verus! {\nproof fn t() ensures true\nby {\n    -- comment with } brace\n    omega\n}\n}";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert_eq!(sanitized.matches('}').count(), 2); // verus! closing } + tactic closing }
+        assert_eq!(sanitized.len(), src.len());
+    }
+
+    #[test]
+    fn test_lean_block_comment_with_brace_in_verus() {
+        // `/- comment } -/` must not close the tactic block
+        let src = "verus! {\nproof fn t() ensures true\nby {\n    /- comment } -/\n    omega\n}\n}";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert_eq!(sanitized.matches('}').count(), 2);
+        assert_eq!(sanitized.len(), src.len());
+    }
+
+    #[test]
+    fn test_string_with_brace_in_tactic() {
+        // `"}"` inside tactic block must not close the block
+        let src = "verus! {\nproof fn t() ensures true\nby {\n    have h := \"}\"\n    omega\n}\n}";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert_eq!(sanitized.matches('}').count(), 2);
+        assert_eq!(sanitized.len(), src.len());
+    }
+
+    #[test]
+    fn test_nested_braces_in_tactic() {
+        // Nested { } inside tactic block must balance correctly
+        let src = "verus! {\nproof fn t() ensures true\nby {\n    { exact h }\n    omega\n}\n}";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert_eq!(sanitized.matches('}').count(), 2);
+        assert_eq!(sanitized.len(), src.len());
+    }
+
+    #[test]
+    fn test_empty_tactic_block() {
+        let src = "verus! {\nproof fn t() ensures true by { }\n}";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert_eq!(sanitized.len(), src.len());
+    }
+
+    #[test]
+    fn test_multiple_tactic_blocks_in_verus() {
+        let src = "verus! {\n\
+            proof fn a() ensures true by { omega }\n\
+            proof fn b() ensures true by { simp }\n\
+        }";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert!(!sanitized.contains("omega"));
+        assert!(!sanitized.contains("simp"));
+        assert_eq!(sanitized.len(), src.len());
+    }
+
+    #[test]
+    fn test_requires_and_ensures_before_by() {
+        let src = "verus! {\nproof fn t(x: nat)\n    requires x > 0\n    ensures x >= 1\nby {\n    omega\n}\n}";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert!(!sanitized.contains("omega"));
+        assert!(sanitized.contains("requires"));
+        assert!(sanitized.contains("ensures"));
+    }
+}
+
+// --- dedent unit tests (separate from FileLoader) ---
+
+#[cfg(test)]
+mod dedent_tests {
+    use super::dedent;
+
+    #[test]
+    fn test_dedent_uniform_indent() {
+        assert_eq!(dedent("    a\n    b"), "a\nb");
+    }
+
+    #[test]
+    fn test_dedent_mixed_indent() {
+        assert_eq!(dedent("    a\n        b\n    c"), "a\n    b\nc");
+    }
+
+    #[test]
+    fn test_dedent_no_indent() {
+        assert_eq!(dedent("a\nb"), "a\nb");
+    }
+
+    #[test]
+    fn test_dedent_empty_lines_ignored() {
+        assert_eq!(dedent("    a\n\n    b"), "a\n\nb");
+    }
+
+    #[test]
+    fn test_dedent_single_line() {
+        assert_eq!(dedent("    omega"), "omega");
+    }
+
+    #[test]
+    fn test_dedent_empty_input() {
+        assert_eq!(dedent(""), "");
+    }
+
+    #[test]
+    fn test_dedent_only_whitespace() {
+        // Empty lines preserved as structure, content stripped
+        assert_eq!(dedent("   \n   "), "\n");
+    }
+
+    #[test]
+    fn test_dedent_leading_blank_lines() {
+        assert_eq!(dedent("\n\n    a\n    b"), "\n\na\nb");
     }
 }
