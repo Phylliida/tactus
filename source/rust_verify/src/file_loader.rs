@@ -64,13 +64,12 @@ fn find_tactic_block_ranges(src: &[u8]) -> Vec<(usize, usize)> {
         None => return Vec::new(),
     };
 
+    // Only match tactic_block (= `by { }` on proof fns).
+    // assert-by and proof blocks contain Verus code in vstd, not Lean.
+    // Phase 2 will add proof_block and assert-by when exec fn Lean support lands.
     let query = tree_sitter::Query::new(
         &lang,
-        r#"
-        (tactic_block "{" @open "}" @close)
-        (proof_block "{" @open "}" @close)
-        (assert_expression "by" "{" @open "}" @close)
-        "#,
+        r#"(tactic_block "{" @open "}" @close)"#,
     ).expect("Invalid tree-sitter query");
 
     let open_idx = query.capture_index_for_name("open").unwrap();
@@ -152,11 +151,10 @@ mod tests {
     }
 
     #[test]
-    fn test_assert_by_sanitized() {
+    fn test_assert_by_not_sanitized() {
+        // assert-by contains Verus proof code, not Lean — not sanitized (Phase 2).
         let src = "fn test() { assert(true) by { omega }; }";
-        let sanitized = sanitize_tactic_blocks(src);
-        assert!(!sanitized.contains("omega"));
-        assert_eq!(sanitized.len(), src.len());
+        assert_eq!(sanitize_tactic_blocks(src), src);
     }
 
     #[test]
@@ -182,5 +180,89 @@ mod tests {
         let src = "proof fn test() ensures true\nby {\n    intro ⟨a, b⟩\n    /- comment } -/\n    omega\n}";
         let sanitized = sanitize_tactic_blocks(src);
         assert_eq!(sanitized.len(), src.len());
+    }
+
+    // --- Inside verus! { } macro (the real-world case) ---
+
+    #[test]
+    fn test_inside_verus_macro() {
+        let src = "verus! {\nproof fn test() ensures true\nby {\n    intro ⟨a, b⟩\n}\n}";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert!(!sanitized.contains("⟨"), "Unicode inside verus! macro must be sanitized");
+        assert_eq!(sanitized.len(), src.len());
+    }
+
+    #[test]
+    fn test_inside_scoped_verus_macro() {
+        // Real test files use ::verus_builtin_macros::verus!{ }
+        let src = "::verus_builtin_macros::verus!{\nproof fn t() ensures true by { omega }\n}";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert!(!sanitized.contains("omega"));
+        assert_eq!(sanitized.len(), src.len());
+    }
+
+    #[test]
+    fn test_verus_macro_assert_by_not_sanitized() {
+        // assert-by inside verus! must NOT be sanitized — it's Verus proof code
+        let src = "verus! {\nfn test() {\n    assert(true) by { lemma_foo(); };\n}\n}";
+        assert_eq!(sanitize_tactic_blocks(src), src);
+    }
+
+    #[test]
+    fn test_verus_macro_assert_forall_by_not_sanitized() {
+        // assert forall ... by { } inside verus! — Verus proof code, not sanitized
+        let src = "verus! {\nfn test() {\n    assert forall|i: int| #[trigger] f(i) by { lemma(i); };\n}\n}";
+        assert_eq!(sanitize_tactic_blocks(src), src);
+    }
+
+    #[test]
+    fn test_verus_macro_mixed_tactic_and_assert() {
+        // tactic_block sanitized, assert-by left alone, in same verus! block
+        let src = "verus! {\n\
+            proof fn lem() ensures true by { omega }\n\
+            fn exec() {\n\
+                assert(true) by { lemma_call(); };\n\
+            }\n\
+        }";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert!(!sanitized.contains("omega"), "tactic block should be sanitized");
+        assert!(sanitized.contains("lemma_call"), "assert-by should NOT be sanitized");
+    }
+
+    #[test]
+    fn test_verus_macro_spec_fn_not_sanitized() {
+        let src = "verus! {\nspec fn double(x: nat) -> nat { x + x }\n}";
+        assert_eq!(sanitize_tactic_blocks(src), src);
+    }
+
+    // --- Paren/bracket macros stay as token trees (not parsed as statements) ---
+
+    #[test]
+    fn test_paren_macro_not_parsed() {
+        let src = "println!(\"by {{ omega }}\");";
+        assert_eq!(sanitize_tactic_blocks(src), src);
+    }
+
+    #[test]
+    fn test_bracket_macro_not_parsed() {
+        let src = "vec![1, 2, 3];";
+        assert_eq!(sanitize_tactic_blocks(src), src);
+    }
+
+    // --- attributed_expression (#[trigger]) in quantifiers ---
+
+    #[test]
+    fn test_trigger_in_assert_forall() {
+        // #[trigger] before the condition — must parse without errors
+        // so the `by { }` is recognized as assert-by, NOT a stray tactic_block
+        let src = "verus! {\nfn test() {\n    assert forall|x: int| #[trigger] f(x) by { lem(x); };\n}\n}";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert!(sanitized.contains("lem(x)"), "#[trigger] assert-by must not be sanitized");
+    }
+
+    #[test]
+    fn test_trigger_in_forall_expr() {
+        let src = "verus! {\nspec fn p() -> bool { forall|x: int| #[trigger] f(x) }\n}";
+        assert_eq!(sanitize_tactic_blocks(src), src);
     }
 }
