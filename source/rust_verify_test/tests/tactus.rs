@@ -928,6 +928,49 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === Trait bound on generic function ===
+
+test_verify_one_file! {
+    #[test] test_trait_bound_on_fn verus_code! {
+        trait HasSize {
+            spec fn size(&self) -> nat;
+        }
+
+        spec fn double_size<T: HasSize>(x: T) -> nat {
+            x.size() + x.size()
+        }
+
+        proof fn double_is_even<T: HasSize>(x: T)
+            ensures double_size(x) >= x.size()
+        by {
+            unfold double_size
+            omega
+        }
+    } => Ok(())
+}
+
+// === Trait bound on generic impl ===
+
+test_verify_one_file! {
+    #[test] test_trait_bound_on_impl verus_code! {
+        trait ToInt {
+            spec fn to_int(&self) -> int;
+        }
+
+        trait Summable {
+            spec fn sum(&self) -> int;
+        }
+
+        struct Pair<T> { a: T, b: T }
+
+        impl<T: ToInt> Summable for Pair<T> {
+            spec fn sum(&self) -> int {
+                self.a.to_int() + self.b.to_int()
+            }
+        }
+    } => Ok(())
+}
+
 // === Extensional equality (=~=) ===
 
 test_verify_one_file! {
