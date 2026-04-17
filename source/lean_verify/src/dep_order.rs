@@ -57,8 +57,14 @@ pub fn collect_references<'a>(
 /// Collect datatype/trait references from a function's types and expressions.
 fn collect_from_fn<'a>(f: &'a FunctionX, refs: &mut References<'a>) {
     for bound in f.typ_bounds.iter() {
-        if let GenericBoundX::Trait(TraitId::Path(path), _) = &**bound {
-            refs.traits.insert(short_name(path));
+        match &**bound {
+            GenericBoundX::Trait(TraitId::Path(path), _) => {
+                refs.traits.insert(short_name(path));
+            }
+            GenericBoundX::TypEquality(path, _, _, _) => {
+                refs.traits.insert(short_name(path));
+            }
+            _ => {}
         }
     }
 

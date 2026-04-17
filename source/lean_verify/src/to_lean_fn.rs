@@ -161,15 +161,14 @@ pub fn write_trait(
         out.push_str(tp);
         out.push_str(" : Type)");
     }
+    // Associated types as type params (not fields) so TypEquality bounds can constrain them
+    for assoc_name in tr.assoc_typs.iter() {
+        out.push_str(" (");
+        write_name(out, assoc_name);
+        out.push_str(" : Type)");
+    }
     write_trait_bounds(out, &tr.typ_bounds);
     out.push_str(" where\n");
-
-    // Associated types as Type fields
-    for assoc_name in tr.assoc_typs.iter() {
-        out.push_str("  ");
-        write_name(out, assoc_name);
-        out.push_str(" : Type\n");
-    }
 
     for method_fun in tr.methods.iter() {
         let method_name = method_fun.path.segments.last()
@@ -190,17 +189,27 @@ pub fn write_trait(
 }
 
 /// Write method type: `Self → ParamType → ... → RetType`.
+/// Projections like `Self::Item` are written as bare `Item` since
+/// associated types are type params on the class.
 fn write_method_type(out: &mut String, func: &FunctionX) {
+    let write_method_typ = |out: &mut String, typ: &TypX| {
+        // Inside a class, Self::AssocType is just the type param name
+        if let TypX::Projection { name, .. } = typ {
+            write_name(out, name);
+        } else {
+            write_typ(out, typ);
+        }
+    };
     for (i, p) in func.params.iter().enumerate() {
         if i > 0 { out.push_str(" → "); }
         if p.x.name.0.as_str() == "self" {
             out.push_str("Self");
         } else {
-            write_typ(out, &p.x.typ);
+            write_method_typ(out, &p.x.typ);
         }
     }
     if !func.params.is_empty() { out.push_str(" → "); }
-    write_typ(out, &func.ret.x.typ);
+    write_method_typ(out, &func.ret.x.typ);
 }
 
 // ── Trait impl ─────────────────────────────────────────────────────────
@@ -238,16 +247,13 @@ pub fn write_trait_impl(
         write_typ(out, typ);
         out.push(')');
     }
-    out.push_str(" where\n");
-
-    // Associated type assignments
+    // Associated type values as type arguments (matching class type params)
     for at_ in assoc_types {
-        out.push_str("  ");
-        write_name(out, &at_.name);
-        out.push_str(" := ");
+        out.push_str(" (");
         write_typ(out, &at_.typ);
-        out.push('\n');
+        out.push(')');
     }
+    out.push_str(" where\n");
 
     // Method implementations
     for func in method_impls {
@@ -278,6 +284,9 @@ pub fn write_trait_impl(
 
 /// Write trait bounds as Lean instance params: `[TraitName T1 T2]`.
 fn write_trait_bounds(out: &mut String, bounds: &GenericBounds) {
+    // For each Trait bound, merge in any TypEquality bounds for the same trait.
+    // VIR emits both Trait(Producer, [T]) and TypEquality(Producer, [T], "Item", Int)
+    // for `T: Producer<Item = int>`. We merge them into `[Producer T Int]`.
     for bound in bounds.iter() {
         if let GenericBoundX::Trait(TraitId::Path(path), typs) = &**bound {
             out.push_str(" [");
@@ -285,6 +294,15 @@ fn write_trait_bounds(out: &mut String, bounds: &GenericBounds) {
             for t in typs.iter() {
                 out.push(' ');
                 write_typ(out, t);
+            }
+            // Append associated type values from matching TypEquality bounds
+            for other in bounds.iter() {
+                if let GenericBoundX::TypEquality(eq_path, _, _, typ) = &**other {
+                    if lean_name(eq_path) == lean_name(path) {
+                        out.push(' ');
+                        write_typ(out, typ);
+                    }
+                }
             }
             out.push(']');
         }
