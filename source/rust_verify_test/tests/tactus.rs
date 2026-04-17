@@ -1087,6 +1087,51 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === Instance method calls spec fn (ordering test) ===
+
+test_verify_one_file! {
+    #[test] test_instance_calls_spec_fn verus_code! {
+        spec fn double(x: int) -> int { x + x }
+
+        trait Doubler {
+            spec fn dbl(&self) -> int;
+        }
+
+        struct MyVal { v: int }
+
+        impl Doubler for MyVal {
+            spec fn dbl(&self) -> int { double(self.v) }
+        }
+
+        proof fn dbl_works()
+            ensures (MyVal { v: 3 }).dbl() == 6
+        by {
+            unfold dbl
+            unfold double
+            simp
+        }
+    } => Ok(())
+}
+
+// === TypEquality bound: T: Trait<AssocType = ConcreteType> ===
+
+test_verify_one_file! {
+    #[test] test_typ_equality_bound verus_code! {
+        trait Producer {
+            type Item;
+            spec fn produce(&self) -> Self::Item;
+        }
+
+        // Function with TypEquality bound: Item must be int
+        proof fn produce_eq<T: Producer<Item = int>>(a: T, b: T)
+            requires a.produce() == b.produce()
+            ensures a.produce() == b.produce()
+        by {
+            omega
+        }
+    } => Ok(())
+}
+
 // === Extensional equality (=~=) ===
 
 test_verify_one_file! {

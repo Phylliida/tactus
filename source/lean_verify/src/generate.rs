@@ -125,33 +125,7 @@ fn generate_lean(
         }
     }
 
-    // 3. Trait impls (instances)
-    // TODO: trait impls should be topologically sorted with spec fns, not emitted
-    // before them. If an instance method body references a spec fn, Lean needs the
-    // spec fn to be defined first. Currently works because lambda bodies are lazy.
-    for ti in &krate.trait_impls {
-        if !refs.traits.contains(short_name(&ti.x.trait_path)) {
-            continue;
-        }
-        // Find method impl functions belonging to this impl
-        let method_impls: Vec<&FunctionX> = all_fns.iter()
-            .filter(|f| matches!(&f.kind, FunctionKind::TraitMethodImpl { impl_path, .. }
-                if impl_path == &ti.x.impl_path))
-            .copied()
-            .collect();
-        // Find associated type impls belonging to this impl
-        let assoc_types: Vec<&AssocTypeImplX> = krate.assoc_type_impls.iter()
-            .filter(|a| a.x.impl_path == ti.x.impl_path)
-            .map(|a| &a.x)
-            .collect();
-        if !method_impls.is_empty() || !assoc_types.is_empty() {
-            to_lean_fn::write_trait_impl(&mut out, &ti.x, &method_impls, &assoc_types);
-            out.push('\n');
-        }
-    }
-
-    // 4. Spec fns (topologically sorted, with mutual recursion groups)
-    // Note: trait impl method bodies may reference these — see TODO above.
+    // 3. Spec fns (topologically sorted, with mutual recursion groups)
     let groups = dep_order::order_spec_fns(&spec_fn_map, &all_fns, &[proof_fn]);
     for group in &groups {
         match group {
@@ -170,6 +144,26 @@ fn generate_lean(
         }
     }
 
+    // 4. Trait impls (instances) — after spec fns so method bodies can reference them
+    for ti in &krate.trait_impls {
+        if !refs.traits.contains(short_name(&ti.x.trait_path)) {
+            continue;
+        }
+        let method_impls: Vec<&FunctionX> = all_fns.iter()
+            .filter(|f| matches!(&f.kind, FunctionKind::TraitMethodImpl { impl_path, .. }
+                if impl_path == &ti.x.impl_path))
+            .copied()
+            .collect();
+        let assoc_types: Vec<&AssocTypeImplX> = krate.assoc_type_impls.iter()
+            .filter(|a| a.x.impl_path == ti.x.impl_path)
+            .map(|a| &a.x)
+            .collect();
+        if !method_impls.is_empty() || !assoc_types.is_empty() {
+            to_lean_fn::write_trait_impl(&mut out, &ti.x, &method_impls, &assoc_types);
+            out.push('\n');
+        }
+    }
+
     // 5. Proof fn theorem
     let tactic_start_line = to_lean_fn::write_proof_fn(&mut out, proof_fn, tactic_body);
     let source_map = to_lean_fn::LeanSourceMap {
@@ -182,6 +176,9 @@ fn generate_lean(
     out.push_str("end ");
     out.push_str(&ns);
     out.push('\n');
+
+    // Temp debug: write generated Lean to file
+    let _ = std::fs::write("/tmp/tactus_generated.lean", &out);
 
     LeanOutput { text: out, source_map }
 }

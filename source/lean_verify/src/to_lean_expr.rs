@@ -37,9 +37,10 @@ fn expr_prec(expr: &ExprX) -> u8 {
 }
 
 /// Write a VIR expression as Lean 4 syntax.
-pub fn write_expr(out: &mut String, expr: &ExprX) {
-    match expr {
-        ExprX::Const(c) => write_const(out, c),
+/// Takes the full `Expr` (not just `ExprX`) to access type information.
+pub fn write_expr(out: &mut String, expr: &Expr) {
+    match &expr.x {
+        ExprX::Const(c) => write_const(out, c, &expr.typ),
         ExprX::Var(ident) => write_name(out, &ident.0),
         ExprX::ConstVar(fun, _) => write_fn_ref(out, fun),
 
@@ -351,9 +352,18 @@ fn write_const(out: &mut String, c: &Constant) {
         Constant::Bool(true) => out.push_str("True"),
         Constant::Bool(false) => out.push_str("False"),
         Constant::Int(n) => {
+            // Annotate with type to avoid Lean defaulting bare `0` to Nat
+            // when the context expects Int (matters for type class synthesis).
             let s = n.to_string();
-            if s.starts_with('-') {
-                out.push('('); out.push_str(&s); out.push(')');
+            let is_int = matches!(&**typ, TypX::Int(IntRange::Int | IntRange::I(_) | IntRange::ISize));
+            if is_int {
+                out.push('(');
+                out.push_str(&s);
+                out.push_str(" : Int)");
+            } else if s.starts_with('-') {
+                out.push('(');
+                out.push_str(&s);
+                out.push(')');
             } else {
                 out.push_str(&s);
             }
