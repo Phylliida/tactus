@@ -1085,6 +1085,60 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === Unicode: Lean line comment with -- ===
+// Unicode tactic bodies can't go through verus_code! (rustc can't lex them).
+// Build the source string manually instead.
+
+fn verus_body(body: &str) -> String {
+    format!(
+        "::verus_builtin_macros::verus!{{\n{body}\n}}\n"
+    )
+}
+
+test_verify_one_file! {
+    #[test] test_unicode_lean_line_comment verus_body("
+        spec fn double(x: nat) -> nat { x + x }
+
+        proof fn lemma_double(x: nat)
+            requires x > 0
+            ensures double(x) > x
+        by {
+            -- This is a Lean line comment
+            unfold double
+            omega
+        }
+    ") => Ok(())
+}
+
+// === Unicode: focus dot · in tactic body ===
+
+test_verify_one_file! {
+    #[test] test_unicode_focus_dot verus_body("
+        proof fn conj(a: int, b: int)
+            requires a > 0, b > 0
+            ensures a > 0, b > 0
+        by {
+            constructor
+            · omega
+            · omega
+        }
+    ") => Ok(())
+}
+
+// === Error: // in tactic body ===
+
+test_verify_one_file! {
+    #[test] test_double_slash_error verus_code! {
+        proof fn bad() ensures true
+        by {
+            // this looks like a comment but is disallowed
+            omega
+        }
+    } => Err(e) => {
+        assert!(e.errors.iter().any(|d| d.message.contains("Nat.div")));
+    }
+}
+
 // === Nested enum match (exercises Constructor pattern with multiple fields) ===
 
 test_verify_one_file! {

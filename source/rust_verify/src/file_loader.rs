@@ -284,6 +284,23 @@ mod tests {
     }
 
     #[test]
+    fn test_unicode_focus_dot_in_verus() {
+        let src = "::verus_builtin_macros::verus!{\n\
+            proof fn conj(a: int, b: int)\n\
+                requires a > 0, b > 0\n\
+                ensures a > 0, b > 0\n\
+            by {\n\
+                constructor\n\
+                \u{b7} omega\n\
+                \u{b7} omega\n\
+            }\n\
+        }";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert!(!sanitized.contains('\u{b7}'), "· must be sanitized: got {sanitized}");
+        assert_eq!(sanitized.len(), src.len());
+    }
+
+    #[test]
     fn test_trigger_in_exists_expr() {
         let src = "verus! {\nspec fn p() -> bool { exists|x: int| #[trigger] f(x) }\n}";
         assert_eq!(sanitize_tactic_blocks(src), src);
