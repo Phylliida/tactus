@@ -388,7 +388,7 @@ fn read_tactic_from_source(
     let inner = &src[start_byte + 1..end_byte - 1];
     // Dedent: strip common leading whitespace so Lean sees sibling tactics
     // at the same indent level (Lean's tactic parser is indentation-sensitive).
-    Some(crate::file_loader::dedent(inner))
+    Some(crate::util::dedent(inner))
 }
 
 fn report_chosen_triggers(
@@ -1632,9 +1632,10 @@ impl Verifier {
                                 }
                             };
 
-                            // Check for // in tactic body — Lean uses // for integer
-                            // division, but it conflicts with Rust line comments in the
-                            // tree-sitter grammar. Users should use Nat.div/Int.div instead.
+                            // Check for // in tactic body. Tree-sitter's line_comment
+                            // extra consumes // to end-of-line globally (including inside
+                            // tactic blocks), so any content after // is invisible to the
+                            // grammar and silently lost from the sanitized source.
                             if tactic_text.contains("//") {
                                 self.count_errors += 1;
                                 let fn_name = vir::ast_util::fun_as_friendly_rust_name(&function.x.name);
