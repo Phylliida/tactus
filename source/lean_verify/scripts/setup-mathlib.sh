@@ -8,7 +8,7 @@
 # Usage:
 #   ./scripts/setup-mathlib.sh
 #   nix-shell -p lean4 --run ./scripts/setup-mathlib.sh
-#   TACTUS_PROJECT_DIR=/custom/path ./scripts/setup-mathlib.sh
+#   TACTUS_LEAN_PROJECT=/custom/path ./scripts/setup-mathlib.sh
 
 set -euo pipefail
 
@@ -22,7 +22,10 @@ fi
 # Match Mathlib tag to Lean version (e.g., Lean 4.25.0 → Mathlib v4.25.0)
 MATHLIB_TAG="v${LEAN_RAW}"
 
-PROJECT_DIR="${TACTUS_PROJECT_DIR:-$HOME/.tactus/lean-project}"
+# Default: tactus/lean-project/ (repo-local)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DEFAULT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)/lean-project"
+PROJECT_DIR="${TACTUS_LEAN_PROJECT:-$DEFAULT_DIR}"
 
 echo "Lean version:    $LEAN_RAW"
 echo "Mathlib tag:     $MATHLIB_TAG"

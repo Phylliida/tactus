@@ -199,73 +199,55 @@ assume(P);  // → have : P := sorry (with compiler warning)
 
 `assume(P)` translates to `have : P := sorry`. Tactus emits a warning: "unproved assumption at line N". This is the escape hatch for incremental development.
 
-## Unicode in tactic blocks
+## Unicode and Lean syntax in tactic blocks
 
-Lean tactics use Unicode: `⟨a, b⟩`, `·`, `∀`, `∃`, `¬`, `∧`, `∨`, `→`, `↔`, `≤`, `≥`, `≠`.
+Lean tactics use Unicode: `⟨a, b⟩`, `·`, `∀`, `∃`, `¬`, `∧`, `∨`, `→`, `↔`, `≤`, `≥`, `≠`. They also use `--` line comments, `/- -/` nestable block comments, and other syntax that isn't valid Rust.
 
 ### The problem
 
-Rust's `proc_macro::TokenTree` API has no way to represent Unicode punctuation. `Punct` only handles ASCII. `Ident` validates XID_Start/XID_Continue (rejects `⟨`). Even if `rustc_lexer` accepted these characters, the proc macro bridge cannot pass them through. This is a fundamental API limitation, not a lexer issue.
+Rust's lexer runs before any proc macro or parser sees the source. Unicode punctuation like `⟨⟩` causes lexer errors, and Lean syntax like `--` or `/- -/` isn't recognized. The proc macro never gets a chance to see the content.
 
-### The solution: dual-parser architecture
+### The solution: FileLoader sanitization
 
-Tactic blocks are processed by **tree-sitter-tactus** (which handles Unicode natively), NOT by rustc's proc macro. The two parsers work on the same `.rs` file but extract different information:
+A custom `FileLoader` intercepts `read_file()` before rustc's lexer runs. It finds tactic blocks (`by { }`, `proof { }`, `assert(...) by { }`), and replaces their content with spaces — same byte length, preserving newlines.
 
 ```
-.rs file
-  ├→ tree-sitter-tactus ─→ tactic text extraction (Unicode-aware)
-  │                          extracts raw text of each by{}/proof{} block
-  │                          indexed by source span (file, line, column)
+.rs file (on disk)
   │
-  └→ rustc (proc macro) ──→ VIR construction (type-checked)
-                              tactic blocks stored as TacticBlock(span)
-                              actual tactic TEXT comes from tree-sitter
-
-Lean generation combines both:
-  VIR structure (types, spec fns, proof fn signatures)  ← from rustc path
-  + tactic text                                          ← from tree-sitter path
-  → generated .lean file
+  └→ TactusFileLoader.read_file()
+       1. Read original file
+       2. Find tactic blocks (by {}, proof {})
+       3. Replace content between { } with spaces (same byte offsets)
+       4. Return sanitized source to rustc
+  │
+  ├→ rustc lexer/parser → proc macro → VIR
+  │   (sees only spaces inside tactic blocks — no Unicode errors)
+  │   proc macro records byte range via Span::byte_range()
+  │
+  └→ At verification time: read ORIGINAL file at byte range → real tactic text
 ```
 
-The proc macro sees `by { ... }` as a regular Rust block with ASCII tokens (keywords like `ring`, `omega` parse as identifiers). It captures the block's **source span** and stores `TacticBlock(span)` in VIR. The actual Unicode-containing tactic text is retrieved from tree-sitter's output using the span as a key.
+The FileLoader scanner:
+- **Phase 1 (Rust context)**: scans for `by` or `proof` keywords with word-boundary checks, skipping Rust strings (`"..."`, `r#"..."#`), comments (`//`, `/* */`), and char literals
+- **Phase 2 (Lean context)**: counts braces to find matching `}`, understanding Lean `--` line comments, `/- -/` nestable block comments, and `"..."` strings (all of which can contain `}`)
+- **Phase 3**: replaces content between `{` and `}` with spaces, preserving `\n`
 
-This is clean because:
-- tree-sitter handles all Unicode natively — no rustc modification needed
-- The proc macro doesn't need to understand tactic content at all
-- No changes to `rustc_lexer` or `proc_macro` API
-- tree-sitter is already fast and incremental
-- We already have tree-sitter-tactus with Lean-like tactic grammar rules
+Byte offsets are identical between sanitized and original, so `Span::byte_range()` works unchanged.
 
-### What the proc macro sees vs what Lean gets
+### `//` in tactic blocks
 
-User writes:
-```rust
-proof fn foo() ensures P
-by {
-    intro ⟨a, b⟩
-    exact ⟨b, a⟩
-}
-```
+`//` (Lean's integer division) is **not supported** in tactic blocks. Use `Nat.div` or `Int.div` instead. This avoids a fundamental conflict: Rust's lexer treats `//` as a line comment (consuming the rest of the line including potential `}`), and tree-sitter's extras mechanism makes `//` comments globally unavoidable in the grammar.
 
-Proc macro sees (ASCII tokens only):
-```
-by { intro < a , b > exact < b , a > }
-```
-...and records the span (file.rs:3:1 - 6:1).
+In practice, `//` rarely appears in tactic proofs. Tactics are proof steps (`omega`, `simp`, `ring`, etc.), not computations. `--` is the Lean comment syntax and works correctly.
 
-tree-sitter-tactus extracts (Unicode-aware):
-```
-intro ⟨a, b⟩
-exact ⟨b, a⟩
-```
-...from the same span.
+### tree-sitter-tactus grammar
 
-Lean generation uses tree-sitter's extraction:
-```lean
-theorem foo : P := by
-  intro ⟨a, b⟩
-  exact ⟨b, a⟩
-```
+tree-sitter-tactus has Lean-aware rules for tactic block content:
+- `_tactic_brace_body`: `{ ... }` with Lean-aware content parsing
+- `_tactic_item`: handles `--` comments, `/- -/` nestable block comments, `"..."` strings, Unicode content, nested `{ }` braces
+- `line_comment` stays in `extras` (global) — `//` is treated as a Rust comment everywhere including tactic blocks
+
+The grammar has **184 tests** including 36 tactic-specific tests covering all Lean syntax edge cases.
 
 ## Keyword handling in tactic blocks
 
@@ -823,8 +805,7 @@ lean_verify/
     source_map.rs         — Lean positions → .rs positions
     prelude.rs            — TactusPrelude.lean content
     project.rs            — manage ~/.tactus/lean-project/ setup
-    tactic_extractor.rs   — tree-sitter-tactus: extract tactic text by span
-    builtin_paths.rs      — VIR path → Lean name lookup table
+    builtin_paths.rs      — VIR path → Lean name lookup table (Track C)
 ```
 
 ### New files in `vir/`
@@ -841,11 +822,23 @@ vir/src/
 | File | Change |
 |------|--------|
 | `builtin_macros/src/syntax.rs` | Tactic mode: capture `by {}`/`proof {}` as TokenStream + span, suspend Verus keywords |
-| `vir/src/ast.rs` | Add `TacticBlock(Span)` variant to function body (span, not string — text comes from tree-sitter) |
-| `rust_verify/src/verifier.rs` | Route proof fns to `lean_verify` |
+| `vir/src/ast.rs` | Add `TacticBlock(Span)` variant to function body (span, not string) |
+| `rust_verify/src/verifier.rs` | Route proof fns to `lean_verify` + install TactusFileLoader |
+| `rust_verify/src/file_loader.rs` | TactusFileLoader: sanitizes tactic blocks before rustc lexer |
 | `rust_verify/src/config.rs` | Add `--heartbeats`, `--lean-path` flags |
 
-No `rustc_lexer` modification needed — Unicode is handled by tree-sitter, not the proc macro.
+### tree-sitter-tactus (separate repo)
+```
+tree-sitter-tactus/
+  grammar.js              — Tactus grammar: Rust + Lean tactic block rules
+  src/scanner.c           — external scanner (strings, raw strings, block comments)
+  test/corpus/
+    tactic_blocks.txt     — 36 tactic-specific tests
+    declarations.txt      — Rust declaration tests (attribute fixes)
+    ...                   — other inherited tree-sitter-rust tests
+```
+
+No `rustc_lexer` modification needed. Unicode and Lean syntax are handled by the FileLoader sanitization.
 
 ### Removed (after Track B completes)
 - `air/` crate — Z3 interface
@@ -1039,3 +1032,5 @@ When Tactus encounters a `proof fn` with a `by { }` block:
 4. **Spec closures**: `FnSpec` type → Lean function type `A → B`. Behavioral differences TBD.
 
 5. **Multiple ensures**: Currently conjunction `E₁ ∧ E₂`. Users split with `constructor` or `refine ⟨?_, ?_⟩`. Consider alternative: separate theorems per ensures clause.
+
+6. **Lean project path for distribution**: The Lean project path (`tactus/lean-project/`) is currently resolved via `CARGO_MANIFEST_DIR` at compile time. This works for development but breaks if the binary is moved. For distribution, need a runtime discovery strategy (e.g., relative to executable, or `TACTUS_LEAN_PROJECT` env var which is already supported).

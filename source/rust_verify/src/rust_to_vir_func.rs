@@ -1319,7 +1319,18 @@ fn make_attributes<'tcx>(
         ignore_outside_new_mut_ref,
         tracked_swap: vattrs.tracked_swap,
         tracked_take_option: vattrs.tracked_take_option,
-        tactic_span: vattrs.tactic_span,
+        tactic_span: vattrs.tactic_span.and_then(|(start, end)| {
+            let filename = ctxt.tcx.sess.source_map().span_to_filename(span);
+            match &filename {
+                rustc_span::FileName::Real(real) => {
+                    real.local_path()
+                        .and_then(|p| p.canonicalize().ok())
+                        .and_then(|p| p.to_str().map(str::to_owned))
+                        .map(|p| (p, start, end))
+                }
+                _ => None,
+            }
+        }),
         lean_imports: vattrs.lean_imports.clone(),
     };
     Ok(Arc::new(fattrs))
