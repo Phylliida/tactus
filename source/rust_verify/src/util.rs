@@ -3,6 +3,23 @@ use std::{collections::HashMap, fmt::Display};
 use rustc_span::Span;
 use vir::ast::VirErr;
 
+/// Strip common leading whitespace from all non-empty lines.
+pub fn dedent(s: &str) -> String {
+    let min_indent = s.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    let mut out = String::new();
+    for (i, line) in s.lines().enumerate() {
+        if i > 0 { out.push('\n'); }
+        if !line.trim().is_empty() {
+            out.push_str(&line[min_indent..]);
+        }
+    }
+    out
+}
+
 pub(crate) fn err_span<A, S: Into<String>>(span: Span, msg: S) -> Result<A, VirErr> {
     Err(vir::messages::error(&crate::spans::err_air_span(span), msg))
 }
@@ -333,6 +350,51 @@ macro_rules! backtrace {
 
 #[allow(unused_imports)]
 pub(crate) use backtrace;
+
+#[cfg(test)]
+mod tests {
+    use super::dedent;
+
+    #[test]
+    fn test_dedent_uniform_indent() {
+        assert_eq!(dedent("    a\n    b"), "a\nb");
+    }
+
+    #[test]
+    fn test_dedent_mixed_indent() {
+        assert_eq!(dedent("    a\n        b\n    c"), "a\n    b\nc");
+    }
+
+    #[test]
+    fn test_dedent_no_indent() {
+        assert_eq!(dedent("a\nb"), "a\nb");
+    }
+
+    #[test]
+    fn test_dedent_empty_lines_ignored() {
+        assert_eq!(dedent("    a\n\n    b"), "a\n\nb");
+    }
+
+    #[test]
+    fn test_dedent_single_line() {
+        assert_eq!(dedent("    omega"), "omega");
+    }
+
+    #[test]
+    fn test_dedent_empty_input() {
+        assert_eq!(dedent(""), "");
+    }
+
+    #[test]
+    fn test_dedent_only_whitespace() {
+        assert_eq!(dedent("   \n   "), "\n");
+    }
+
+    #[test]
+    fn test_dedent_leading_blank_lines() {
+        assert_eq!(dedent("\n\n    a\n    b"), "\n\na\nb");
+    }
+}
 
 pub trait HashMapAbsorbWith<K, V> {
     fn absorb_with<F>(&mut self, other: HashMap<K, V>, absorb_value: F)

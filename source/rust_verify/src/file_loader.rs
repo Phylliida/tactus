@@ -1,29 +1,12 @@
 //! Tactus FileLoader: sanitizes tactic blocks before rustc sees them.
 //!
-//! Uses tree-sitter-tactus to find tactic blocks (`by { }`, `proof { }`,
-//! `assert(...) by { }`), then replaces their content with spaces.
-//! Byte offsets are preserved so `Span::byte_range()` still works.
-//! The verifier reads the original file later to recover verbatim tactic text.
+//! Uses tree-sitter-tactus to find `tactic_block` nodes (`by { }` on proof fns)
+//! and replaces their content with spaces. Byte offsets are preserved so
+//! `Span::byte_range()` still works. The verifier reads the original file
+//! later to recover verbatim tactic text.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// Strip common leading whitespace from all non-empty lines.
-pub(crate) fn dedent(s: &str) -> String {
-    let min_indent = s.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| line.len() - line.trim_start().len())
-        .min()
-        .unwrap_or(0);
-    let mut out = String::new();
-    for (i, line) in s.lines().enumerate() {
-        if i > 0 { out.push('\n'); }
-        if !line.trim().is_empty() {
-            out.push_str(&line[min_indent..]);
-        }
-    }
-    out
-}
 
 /// FileLoader that sanitizes tactic blocks before rustc lexes the source.
 pub struct TactusFileLoader;
@@ -374,49 +357,3 @@ mod tests {
 }
 
 // --- dedent unit tests (separate from FileLoader) ---
-
-#[cfg(test)]
-mod dedent_tests {
-    use super::dedent;
-
-    #[test]
-    fn test_dedent_uniform_indent() {
-        assert_eq!(dedent("    a\n    b"), "a\nb");
-    }
-
-    #[test]
-    fn test_dedent_mixed_indent() {
-        assert_eq!(dedent("    a\n        b\n    c"), "a\n    b\nc");
-    }
-
-    #[test]
-    fn test_dedent_no_indent() {
-        assert_eq!(dedent("a\nb"), "a\nb");
-    }
-
-    #[test]
-    fn test_dedent_empty_lines_ignored() {
-        assert_eq!(dedent("    a\n\n    b"), "a\n\nb");
-    }
-
-    #[test]
-    fn test_dedent_single_line() {
-        assert_eq!(dedent("    omega"), "omega");
-    }
-
-    #[test]
-    fn test_dedent_empty_input() {
-        assert_eq!(dedent(""), "");
-    }
-
-    #[test]
-    fn test_dedent_only_whitespace() {
-        // Empty lines preserved as structure, content stripped
-        assert_eq!(dedent("   \n   "), "\n");
-    }
-
-    #[test]
-    fn test_dedent_leading_blank_lines() {
-        assert_eq!(dedent("\n\n    a\n    b"), "\n\na\nb");
-    }
-}
