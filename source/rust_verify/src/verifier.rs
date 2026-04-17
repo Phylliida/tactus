@@ -377,7 +377,7 @@ impl FuncDetails {
 /// The file path and byte range are stored in VIR `tactic_span` at construction time
 /// (when the SourceMap is available), so this function works on any thread.
 /// The byte range covers `{ ... }` — we strip the braces and dedent.
-fn read_tactic_from_source(
+pub(crate) fn read_tactic_from_source(
     file_path: &str,
     start_byte: usize,
     end_byte: usize,
