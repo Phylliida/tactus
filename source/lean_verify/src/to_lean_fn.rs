@@ -177,13 +177,14 @@ pub fn write_trait(
         out.push_str("  ");
         write_name(out, method_name);
         out.push_str(" : ");
-        if let Some(func) = method_lookup.get(method_fun) {
-            write_method_type(out, func);
-        } else {
-            // Method not found — emit a sorry-typed placeholder so Lean
-            // gives a clear error instead of silently producing a wrong class.
-            out.push_str("sorry /- method not found in VIR -/");
-        }
+        let func = method_lookup.get(method_fun).unwrap_or_else(|| {
+            panic!(
+                "trait method {:?} not found in VIR function list — \
+                 this is a Tactus bug, please report it",
+                method_fun.path
+            )
+        });
+        write_method_type(out, func);
         out.push('\n');
     }
 }
