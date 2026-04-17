@@ -34,7 +34,17 @@ pub fn write_typ(out: &mut String, typ: &TypX) {
         }
         // Decorations (references, etc.) are transparent in spec mode
         TypX::Decorate(_, _, inner) => write_typ(out, inner),
-        TypX::Projection { name, .. } => out.push_str(name),
+        TypX::Projection { trait_typ_args, trait_path, name } => {
+            // <Self as Trait>::AssocType → Trait.AssocType Self
+            out.push_str(&lean_name(trait_path));
+            out.push('.');
+            out.push_str(name);
+            for typ in trait_typ_args.iter() {
+                out.push_str(" (");
+                write_typ(out, typ);
+                out.push(')');
+            }
+        }
         TypX::Primitive(prim, args) => {
             out.push_str(match prim {
                 vir::ast::Primitive::Array => "Array",

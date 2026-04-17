@@ -163,6 +163,13 @@ pub fn write_trait(
     }
     out.push_str(" where\n");
 
+    // Associated types as Type fields
+    for assoc_name in tr.assoc_typs.iter() {
+        out.push_str("  ");
+        write_name(out, assoc_name);
+        out.push_str(" : Type\n");
+    }
+
     for method_fun in tr.methods.iter() {
         if let Some(func) = method_lookup.get(method_fun) {
             let method_name = method_fun.path.segments.last()
@@ -197,24 +204,46 @@ fn write_method_type(out: &mut String, func: &FunctionX) {
 /// Write a trait impl as a Lean `instance`.
 ///
 /// ```lean
-/// noncomputable instance : HasValue MyNum where
-///   value := fun self => self.val
+/// noncomputable instance {T : Type} : HasValue (Container T) where
+///   value := fun self => self.inner
+///   Output := Int
 /// ```
 pub fn write_trait_impl(
     out: &mut String,
     ti: &TraitImplX,
     method_impls: &[&FunctionX],
+    assoc_types: &[&AssocTypeImplX],
 ) {
-    out.push_str("noncomputable instance : ");
+    out.push_str("noncomputable instance ");
+
+    // Generic type params as implicit bindings: {T : Type} {U : Type}
+    for tp in ti.typ_params.iter() {
+        out.push_str("{");
+        out.push_str(tp);
+        out.push_str(" : Type} ");
+    }
+
+    out.push_str(": ");
     out.push_str(&lean_name(&ti.trait_path));
 
     // Type arguments: first is Self type, rest are trait type params
     for typ in ti.trait_typ_args.iter() {
-        out.push(' ');
+        out.push_str(" (");
         write_typ(out, typ);
+        out.push(')');
     }
     out.push_str(" where\n");
 
+    // Associated type assignments
+    for at_ in assoc_types {
+        out.push_str("  ");
+        write_name(out, &at_.name);
+        out.push_str(" := ");
+        write_typ(out, &at_.typ);
+        out.push('\n');
+    }
+
+    // Method implementations
     for func in method_impls {
         let method_name = func.name.path.segments.last()
             .map(|s| s.as_str()).unwrap_or("_");
