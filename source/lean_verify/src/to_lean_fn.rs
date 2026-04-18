@@ -46,7 +46,7 @@ pub fn write_spec_fn(out: &mut String, f: &FunctionX) {
     out.push_str(" :=\n  ");
 
     match &f.body {
-        Some(body) => write_expr(out, &body.x),
+        Some(body) => write_expr(out, body),
         None => out.push_str("sorry"),
     }
     out.push('\n');
@@ -54,7 +54,7 @@ pub fn write_spec_fn(out: &mut String, f: &FunctionX) {
     if !f.decrease.is_empty() {
         out.push_str("termination_by ");
         if f.decrease.len() > 1 { out.push('('); }
-        write_sep(out, &*f.decrease, ", ", |out, d| write_expr(out, &d.x));
+        write_sep(out, &*f.decrease, ", ", |out, d| write_expr(out, d));
         if f.decrease.len() > 1 { out.push(')'); }
         out.push('\n');
     }
@@ -75,7 +75,7 @@ pub fn write_proof_fn(out: &mut String, f: &FunctionX, tactic_body: &str) -> usi
         if i < 10 { out.push((b'0' + i as u8) as char); }
         else { out.push_str(&i.to_string()); }
         out.push_str(" : ");
-        write_expr(out, &req.x);
+        write_expr(out, req);
         out.push(')');
     }
 
@@ -273,7 +273,7 @@ pub fn write_trait_impl(
             out.push_str(" => ");
         }
         match &func.body {
-            Some(body) => write_expr(out, &body.x),
+            Some(body) => write_expr(out, body),
             None => out.push_str("sorry"),
         }
         out.push('\n');
@@ -347,7 +347,7 @@ fn write_ensures(out: &mut String, ensures: &[Expr]) {
     if ensures.is_empty() {
         out.push_str("True");
     } else {
-        write_sep(out, ensures, " ∧ ", |out, e| write_expr(out, &e.x));
+        write_sep(out, ensures, " ∧ ", |out, e| write_expr(out, e));
     }
 }
 

@@ -1123,9 +1123,9 @@ test_verify_one_file! {
         }
 
         // Function with TypEquality bound: Item must be int
-        proof fn produce_eq<T: Producer<Item = int>>(a: T, b: T)
-            requires a.produce() == b.produce()
-            ensures a.produce() == b.produce()
+        proof fn produce_is_positive<T: Producer<Item = int>>(t: T)
+            requires t.produce() > 0
+            ensures t.produce() > 0
         by {
             omega
         }

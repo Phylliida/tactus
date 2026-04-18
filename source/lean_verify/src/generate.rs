@@ -177,8 +177,5 @@ fn generate_lean(
     out.push_str(&ns);
     out.push('\n');
 
-    // Temp debug: write generated Lean to file
-    let _ = std::fs::write("/tmp/tactus_generated.lean", &out);
-
     LeanOutput { text: out, source_map }
 }

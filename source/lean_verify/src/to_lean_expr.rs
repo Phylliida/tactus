@@ -46,22 +46,22 @@ pub fn write_expr(out: &mut String, expr: &Expr) {
 
         ExprX::Binary(op, lhs, rhs) => {
             let p = binop_prec(op);
-            write_expr_prec(out, &lhs.x, p, true);
+            write_expr_prec(out, lhs, p, true);
             out.push(' ');
             write_binop(out, op);
             out.push(' ');
-            write_expr_prec(out, &rhs.x, p, false);
+            write_expr_prec(out, rhs, p, false);
         }
 
         ExprX::BinaryOpr(BinaryOpr::ExtEq(_, _), lhs, rhs) => {
-            write_expr_prec(out, &lhs.x, PREC_CMP, true);
+            write_expr_prec(out, lhs, PREC_CMP, true);
             out.push_str(" = ");
-            write_expr_prec(out, &rhs.x, PREC_CMP, false);
+            write_expr_prec(out, rhs, PREC_CMP, false);
         }
 
         ExprX::Unary(UnaryOp::Not, inner) => {
             out.push('¬');
-            write_expr_prec(out, &inner.x, PREC_ATOM, true);
+            write_expr_prec(out, inner, PREC_ATOM, true);
         }
 
         ExprX::Unary(UnaryOp::Clip { range, .. }, inner) => {
@@ -75,33 +75,33 @@ pub fn write_expr(out: &mut String, expr: &Expr) {
             );
             if src_is_int && dst_is_nat {
                 out.push_str("Int.toNat ");
-                write_expr_prec(out, &inner.x, PREC_ATOM, true);
+                write_expr_prec(out, inner, PREC_ATOM, true);
             } else {
-                write_expr(out, &inner.x);
+                write_expr(out, inner);
             }
         }
 
         // Transparent unary ops
         ExprX::Unary(UnaryOp::CoerceMode { .. }, inner)
-        | ExprX::Unary(UnaryOp::Trigger(_), inner) => write_expr(out, &inner.x),
+        | ExprX::Unary(UnaryOp::Trigger(_), inner) => write_expr(out, inner),
 
         ExprX::Unary(UnaryOp::BitNot(_), inner) => {
             out.push_str("Complement.complement ");
-            write_expr_prec(out, &inner.x, PREC_ATOM, true);
+            write_expr_prec(out, inner, PREC_ATOM, true);
         }
         ExprX::Unary(UnaryOp::IntToReal, inner) => {
             out.push('(');
-            write_expr(out, &inner.x);
+            write_expr(out, inner);
             out.push_str(" : Real)");
         }
         ExprX::Unary(UnaryOp::RealToInt, inner) => {
             out.push_str("Int.floor ");
-            write_expr_prec(out, &inner.x, PREC_ATOM, true);
+            write_expr_prec(out, inner, PREC_ATOM, true);
         }
-        ExprX::Unary(UnaryOp::FloatToBits, inner) => write_expr(out, &inner.x),
-        ExprX::Unary(UnaryOp::IeeeFloat(_), inner) => write_expr(out, &inner.x),
+        ExprX::Unary(UnaryOp::FloatToBits, inner) => write_expr(out, inner),
+        ExprX::Unary(UnaryOp::IeeeFloat(_), inner) => write_expr(out, inner),
         // Remaining unary ops: transparent (annotations, markers, internal ops)
-        ExprX::Unary(_, inner) => write_expr(out, &inner.x),
+        ExprX::Unary(_, inner) => write_expr(out, inner),
 
         ExprX::Call(target, args, _) => {
             match target {
@@ -112,8 +112,17 @@ pub fn write_expr(out: &mut String, expr: &Expr) {
                             // Resolved impls don't need type args (concrete types)
                         }
                         CallTargetKind::Dynamic => {
+                            // Annotate return type so Lean can resolve associated type params.
+                            // `(TraitName.method : T → RetType)` helps type class synthesis.
+                            out.push_str("(");
                             write_trait_method_ref(out, fun);
-                            // Dynamic dispatch gets types via [Class T] instance params
+                            out.push_str(" : ");
+                            // Write the method's function type from Self → ... → Ret
+                            for _ in 0..args.len() {
+                                out.push_str("_ → ");
+                            }
+                            write_typ(out, &expr.typ);
+                            out.push(')');
                         }
                         _ => {
                             write_fn_ref(out, fun);
@@ -126,7 +135,7 @@ pub fn write_expr(out: &mut String, expr: &Expr) {
                         }
                     }
                 }
-                CallTarget::FnSpec(inner) => write_expr_prec(out, &inner.x, PREC_ATOM, true),
+                CallTarget::FnSpec(inner) => write_expr_prec(out, inner, PREC_ATOM, true),
                 CallTarget::BuiltinSpecFun(_, typs, _) => {
                     out.push_str("builtinSpecFun");
                     for typ in typs.iter() {
@@ -138,18 +147,18 @@ pub fn write_expr(out: &mut String, expr: &Expr) {
             }
             for arg in args.iter() {
                 out.push(' ');
-                write_expr_prec(out, &arg.x, PREC_ATOM, true);
+                write_expr_prec(out, arg, PREC_ATOM, true);
             }
         }
 
         ExprX::If(cond, then_e, else_e) => {
             out.push_str("if ");
-            write_expr(out, &cond.x);
+            write_expr(out, cond);
             out.push_str(" then ");
-            write_expr(out, &then_e.x);
+            write_expr(out, then_e);
             if let Some(else_e) = else_e {
                 out.push_str(" else ");
-                write_expr(out, &else_e.x);
+                write_expr(out, else_e);
             }
         }
 
@@ -160,7 +169,7 @@ pub fn write_expr(out: &mut String, expr: &Expr) {
             });
             write_binders(out, binders);
             out.push_str(", ");
-            write_expr(out, &body.x);
+            write_expr(out, body);
         }
 
         ExprX::Choose { params, cond, body: _ } => {
@@ -178,16 +187,16 @@ pub fn write_expr(out: &mut String, expr: &Expr) {
                 out.push(')');
             }
             out.push_str(" => ");
-            write_expr(out, &cond.x);
+            write_expr(out, cond);
             out.push(')');
         }
 
-        ExprX::WithTriggers { body, .. } => write_expr(out, &body.x),
+        ExprX::WithTriggers { body, .. } => write_expr(out, body),
 
         ExprX::Block(stmts, final_expr) => {
             for stmt in stmts.iter() {
                 match &stmt.x {
-                    StmtX::Expr(e) => { write_expr(out, &e.x); out.push_str("; "); }
+                    StmtX::Expr(e) => { write_expr(out, e); out.push_str("; "); }
                     StmtX::Decl { pattern, init, .. } => {
                         out.push_str("let ");
                         write_pattern(out, &pattern.x);
@@ -200,7 +209,7 @@ pub fn write_expr(out: &mut String, expr: &Expr) {
                 }
             }
             if let Some(e) = final_expr {
-                write_expr(out, &e.x);
+                write_expr(out, e);
             }
         }
 
@@ -216,7 +225,7 @@ pub fn write_expr(out: &mut String, expr: &Expr) {
                 out.push(')');
             }
             out.push_str(" => ");
-            write_expr(out, &body.x);
+            write_expr(out, body);
         }
 
         // Construct datatype: Struct { field: val } → { field := val } or ⟨val1, val2⟩
@@ -230,7 +239,7 @@ pub fn write_expr(out: &mut String, expr: &Expr) {
                     if i > 0 { out.push_str(", "); }
                     write_name(out, &f.name);
                     out.push_str(" := ");
-                    write_expr(out, &f.a.x);
+                    write_expr(out, &f.a);
                 }
                 out.push_str(" }");
             } else {
@@ -247,30 +256,30 @@ pub fn write_expr(out: &mut String, expr: &Expr) {
                 out.push_str(" | ");
                 write_pattern(out, &arm.x.pattern.x);
                 out.push_str(" => ");
-                write_expr(out, &arm.x.body.x);
+                write_expr(out, &arm.x.body);
             }
         }
 
-        ExprX::Ghost { expr, .. } | ExprX::ProofInSpec(expr) => write_expr(out, &expr.x),
-        ExprX::Loc(expr) => write_expr(out, &expr.x),
+        ExprX::Ghost { expr, .. } | ExprX::ProofInSpec(expr) => write_expr(out, expr),
+        ExprX::Loc(expr) => write_expr(out, expr),
         ExprX::VarLoc(ident) => write_name(out, &ident.0),
-        ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => write_expr(out, &inner.x),
+        ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => write_expr(out, inner),
 
         ExprX::ReadPlace(place, _) => write_place(out, &place.x),
 
         ExprX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
-            write_expr_prec(out, &inner.x, PREC_ATOM, true);
+            write_expr_prec(out, inner, PREC_ATOM, true);
             out.push('.');
             out.push_str(&field_opr.field);
         }
         ExprX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => {
-            write_expr_prec(out, &inner.x, PREC_ATOM, true);
+            write_expr_prec(out, inner, PREC_ATOM, true);
             out.push_str(".is");
             out.push_str(variant);
         }
-        ExprX::UnaryOpr(UnaryOpr::CustomErr(_), inner) => write_expr(out, &inner.x),
+        ExprX::UnaryOpr(UnaryOpr::CustomErr(_), inner) => write_expr(out, inner),
         // Remaining UnaryOpr: transparent (HasType, IntegerTypeBound, ProofNote, etc.)
-        ExprX::UnaryOpr(_, inner) => write_expr(out, &inner.x),
+        ExprX::UnaryOpr(_, inner) => write_expr(out, inner),
 
         ExprX::NullaryOpr(NullaryOpr::ConstGeneric(typ)) => {
             // const generic parameter used as expression — emit its type as a value
@@ -285,14 +294,14 @@ pub fn write_expr(out: &mut String, expr: &Expr) {
             // Multi-operand: emit as nested application
             for (i, e) in exprs.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
-                write_expr(out, &e.x);
+                write_expr(out, e);
             }
         }
         ExprX::ArrayLiteral(exprs) => {
             out.push_str("[");
             for (i, e) in exprs.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
-                write_expr(out, &e.x);
+                write_expr(out, e);
             }
             out.push_str("]");
         }
@@ -312,14 +321,14 @@ pub fn write_expr(out: &mut String, expr: &Expr) {
         ExprX::AssertAssume { expr: e, .. }
         | ExprX::AssertAssumeUserDefinedTypeInvariant { expr: e, .. }
         | ExprX::AssertCompute(e, _)
-        | ExprX::NeverToAny(e) => write_expr(out, &e.x),
-        ExprX::AssertBy { ensure, .. } => write_expr(out, &ensure.x),
+        | ExprX::NeverToAny(e) => write_expr(out, e),
+        ExprX::AssertBy { ensure, .. } => write_expr(out, ensure),
         ExprX::AssertQuery { .. } => out.push_str("True"),
-        ExprX::OpenInvariant(_, _, body, _) => write_expr(out, &body.x),
+        ExprX::OpenInvariant(_, _, body, _) => write_expr(out, body),
 
         // Remaining leaf/transparent nodes
         ExprX::VarAt(ident, _) => write_name(out, &ident.0),
-        ExprX::Old(e) | ExprX::EvalAndResolve(_, e) => write_expr(out, &e.x),
+        ExprX::Old(e) | ExprX::EvalAndResolve(_, e) => write_expr(out, e),
         ExprX::BorrowMut(_) | ExprX::TwoPhaseBorrowMut(_)
         | ExprX::BorrowMutTracked(_) => out.push_str("()"),
         ExprX::ImplicitReborrowOrSpecRead(place, _, _) => write_place(out, &place.x),
@@ -327,8 +336,8 @@ pub fn write_expr(out: &mut String, expr: &Expr) {
 }
 
 /// Write expression, adding parens if needed by precedence.
-fn write_expr_prec(out: &mut String, expr: &ExprX, parent_prec: u8, is_left: bool) {
-    let child_prec = expr_prec(expr);
+fn write_expr_prec(out: &mut String, expr: &Expr, parent_prec: u8, is_left: bool) {
+    let child_prec = expr_prec(&expr.x);
     let needs_parens = child_prec < parent_prec || (child_prec == parent_prec && !is_left);
     if needs_parens { out.push('('); }
     write_expr(out, expr);
@@ -347,23 +356,15 @@ pub(crate) fn write_binders(out: &mut String, binders: &VarBinders<Typ>) {
     }
 }
 
-fn write_const(out: &mut String, c: &Constant) {
+fn write_const(out: &mut String, c: &Constant, _typ: &Typ) {
     match c {
         Constant::Bool(true) => out.push_str("True"),
         Constant::Bool(false) => out.push_str("False"),
         Constant::Int(n) => {
-            // Annotate with type to avoid Lean defaulting bare `0` to Nat
-            // when the context expects Int (matters for type class synthesis).
             let s = n.to_string();
-            let is_int = matches!(&**typ, TypX::Int(IntRange::Int | IntRange::I(_) | IntRange::ISize));
-            if is_int {
-                out.push('(');
-                out.push_str(&s);
-                out.push_str(" : Int)");
-            } else if s.starts_with('-') {
-                out.push('(');
-                out.push_str(&s);
-                out.push(')');
+            if s.starts_with('-') {
+                // Negative literals need parens: (-5) not -5
+                out.push('('); out.push_str(&s); out.push(')');
             } else {
                 out.push_str(&s);
             }
@@ -488,10 +489,10 @@ fn write_pattern(out: &mut String, pat: &PatternX) {
             out.push('@');
             write_pattern(out, &sub_pat.x);
         }
-        PatternX::Expr(e) => write_expr(out, &e.x),
+        PatternX::Expr(e) => write_expr(out, e),
         PatternX::Range(lo, hi) => {
             // Lean doesn't have range patterns; emit as a numeric literal if possible
-            if let Some(lo) = lo { write_expr(out, &lo.x); }
+            if let Some(lo) = lo { write_expr(out, lo); }
             else { out.push('_'); }
             // Range patterns are rare in spec mode (ast_simplify usually eliminates Match)
             if let Some((hi, op)) = hi {
@@ -499,7 +500,7 @@ fn write_pattern(out: &mut String, pat: &PatternX) {
                     InequalityOp::Le => " /* ..= */ ",
                     _ => " /* .. */ ",
                 });
-                write_expr(out, &hi.x);
+                write_expr(out, hi);
             }
         }
         PatternX::MutRef(inner) | PatternX::ImmutRef(inner) => write_pattern(out, &inner.x),
@@ -514,7 +515,7 @@ fn write_ctor(out: &mut String, dt: &Dt, variant: &Ident, fields: &Binders<Expr>
     write_dt_variant(out, dt, variant);
     for f in fields.iter() {
         out.push(' ');
-        write_expr_prec(out, &f.a.x, PREC_ATOM, true);
+        write_expr_prec(out, &f.a, PREC_ATOM, true);
     }
 }
 
@@ -544,12 +545,12 @@ fn write_place(out: &mut String, place: &PlaceX) {
         }
         PlaceX::DerefMut(inner) => write_place(out, &inner.x),
         PlaceX::ModeUnwrap(inner, _) => write_place(out, &inner.x),
-        PlaceX::Temporary(expr) => write_expr(out, &expr.x),
+        PlaceX::Temporary(expr) => write_expr(out, expr),
         PlaceX::WithExpr(_, place) => write_place(out, &place.x),
         PlaceX::Index(base, idx, _, _) => {
             write_place(out, &base.x);
             out.push('[');
-            write_expr(out, &idx.x);
+            write_expr(out, idx);
             out.push(']');
         }
         PlaceX::UserDefinedTypInvariantObligation(inner, _) => write_place(out, &inner.x),
