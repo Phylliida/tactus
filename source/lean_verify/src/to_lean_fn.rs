@@ -161,11 +161,12 @@ pub fn write_trait(
         out.push_str(tp);
         out.push_str(" : Type)");
     }
-    // Associated types as type params (not fields) so TypEquality bounds can constrain them
+    // Associated types as outParam — Lean knows they're uniquely determined by Self,
+    // so instance synthesis resolves them automatically (no return type annotations needed).
     for assoc_name in tr.assoc_typs.iter() {
         out.push_str(" (");
         write_name(out, assoc_name);
-        out.push_str(" : Type)");
+        out.push_str(" : outParam Type)");
     }
     write_trait_bounds(out, &tr.typ_bounds);
     out.push_str(" where\n");

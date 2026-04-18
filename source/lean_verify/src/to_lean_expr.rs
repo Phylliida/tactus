@@ -112,17 +112,7 @@ pub fn write_expr(out: &mut String, expr: &Expr) {
                             // Resolved impls don't need type args (concrete types)
                         }
                         CallTargetKind::Dynamic => {
-                            // Annotate return type so Lean can resolve associated type params.
-                            // `(TraitName.method : T → RetType)` helps type class synthesis.
-                            out.push_str("(");
                             write_trait_method_ref(out, fun);
-                            out.push_str(" : ");
-                            // Write the method's function type from Self → ... → Ret
-                            for _ in 0..args.len() {
-                                out.push_str("_ → ");
-                            }
-                            write_typ(out, &expr.typ);
-                            out.push(')');
                         }
                         _ => {
                             write_fn_ref(out, fun);
