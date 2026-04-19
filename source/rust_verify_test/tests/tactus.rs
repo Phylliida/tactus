@@ -1132,6 +1132,127 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === Negation in spec ===
+
+test_verify_one_file! {
+    #[test] test_negation verus_code! {
+        proof fn not_false()
+            ensures !false
+        by {
+            simp
+        }
+    } => Ok(())
+}
+
+// === If-then-else in spec fn ===
+
+test_verify_one_file! {
+    #[test] test_ite_in_spec verus_code! {
+        spec fn abs(x: int) -> int {
+            if x >= 0 { x } else { -x }
+        }
+
+        proof fn abs_nonneg(x: int)
+            ensures abs(x) >= 0
+        by {
+            unfold abs
+            omega
+        }
+    } => Ok(())
+}
+
+// === Let binding in spec fn ===
+
+test_verify_one_file! {
+    #[test] test_let_in_spec verus_code! {
+        spec fn with_let(x: int) -> int {
+            let y = x + 1;
+            y + y
+        }
+
+        proof fn let_works()
+            ensures with_let(3) == 8
+        by {
+            unfold with_let
+            simp
+        }
+    } => Ok(())
+}
+
+// === Spec fn with no params ===
+
+test_verify_one_file! {
+    #[test] test_nullary_spec_fn verus_code! {
+        spec fn answer() -> int { 42 }
+
+        proof fn answer_is_42()
+            ensures answer() == 42
+        by {
+            unfold answer
+            simp
+        }
+    } => Ok(())
+}
+
+// === Boolean ops in spec (&&, ||, ==>) ===
+
+test_verify_one_file! {
+    #[test] test_bool_ops_in_spec verus_code! {
+        spec fn both(a: bool, b: bool) -> bool { a && b }
+
+        proof fn both_tt()
+            ensures both(true, true)
+        by {
+            unfold both
+            simp
+        }
+    } => Ok(())
+}
+
+// === Multiple associated types ===
+
+test_verify_one_file! {
+    #[test] test_multi_assoc_type verus_code! {
+        trait Pair {
+            type Fst;
+            type Snd;
+            spec fn fst(&self) -> Self::Fst;
+            spec fn snd(&self) -> Self::Snd;
+        }
+
+        struct IntBoolPair { a: int, b: bool }
+
+        impl Pair for IntBoolPair {
+            type Fst = int;
+            type Snd = bool;
+            spec fn fst(&self) -> int { self.a }
+            spec fn snd(&self) -> bool { self.b }
+        }
+
+        proof fn pair_fst()
+            ensures (IntBoolPair { a: 7, b: true }).fst() == 7
+        by {
+            unfold fst
+            simp
+        }
+    } => Ok(())
+}
+
+// === Spec closure applied (FnSpec) ===
+
+test_verify_one_file! {
+    #[test] test_spec_fn_apply verus_code! {
+        spec fn apply(f: spec_fn(int) -> int, x: int) -> int { f(x) }
+
+        proof fn apply_id()
+            ensures apply(|x: int| x, 5) == 5
+        by {
+            unfold apply
+            simp
+        }
+    } => Ok(())
+}
+
 // === Extensional equality (=~=) ===
 
 test_verify_one_file! {
