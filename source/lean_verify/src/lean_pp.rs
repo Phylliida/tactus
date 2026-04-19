@@ -43,7 +43,6 @@ fn binop_info(op: BinOp) -> (u16, Assoc) {
         | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => (PREC_CMP, Assoc::None_),
         BinOp::Add | BinOp::Sub => (PREC_ADD, Assoc::Left),
         BinOp::Mul | BinOp::Div | BinOp::Mod => (PREC_MUL, Assoc::Left),
-        BinOp::Xor => (PREC_CMP, Assoc::None_), // treat as non-assoc comparison-y
         // Bitwise: Lean uses custom operators at ~65/70 range.
         BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => (PREC_ADD, Assoc::Left),
         BinOp::Shr | BinOp::Shl => (PREC_ADD, Assoc::Left),
@@ -56,7 +55,6 @@ fn binop_symbol(op: BinOp) -> &'static str {
         BinOp::Or => "∨",
         BinOp::Implies => "→",
         BinOp::Iff => "↔",
-        BinOp::Xor => "xor",
         BinOp::Eq => "=",
         BinOp::Ne => "≠",
         BinOp::Lt => "<",
@@ -82,7 +80,7 @@ fn expr_prec(node: &ExprNode) -> u16 {
         | ExprNode::LitStr(_) | ExprNode::LitChar(_)
         | ExprNode::ArrayLit(_) | ExprNode::StructUpdate { .. }
         | ExprNode::Raw(_) => PREC_ATOM,
-        ExprNode::FieldProj { .. } => PREC_ATOM,
+        ExprNode::FieldProj { .. } | ExprNode::Index { .. } => PREC_ATOM,
         ExprNode::BinOp { op, .. } => binop_info(*op).0,
         ExprNode::UnOp { op: UnOp::Not, .. } => PREC_NOT,
         ExprNode::UnOp { op: UnOp::Neg, .. } => PREC_MUL + 1,
@@ -97,17 +95,31 @@ fn expr_prec(node: &ExprNode) -> u16 {
 
 // ── Public entry points ────────────────────────────────────────────────
 
-pub fn pp_command(cmd: &Command) -> String {
-    let mut out = String::new();
-    write_command(&mut out, cmd);
-    out
+/// Pretty-print output plus structural landmarks discovered during emission.
+pub struct PpOutput {
+    pub text: String,
+    /// For every `Tactic::Raw` body encountered (in source order): the
+    /// 1-indexed line in `text` where the first character of the body
+    /// appears. The proof-fn pipeline uses this to build a `LeanSourceMap`
+    /// without having to scan the output for a marker string.
+    pub tactic_starts: Vec<usize>,
 }
 
-pub fn pp_commands(cmds: &[Command]) -> String {
+pub fn pp_commands(cmds: &[Command]) -> PpOutput {
     let mut out = String::new();
+    let mut tactic_starts = Vec::new();
     for cmd in cmds {
-        write_command(&mut out, cmd);
+        write_command(&mut out, cmd, &mut tactic_starts);
     }
+    PpOutput { text: out, tactic_starts }
+}
+
+/// Render a single command. Discards any tactic-start landmarks; use
+/// `pp_commands` when you need them.
+pub fn pp_command(cmd: &Command) -> String {
+    let mut out = String::new();
+    let mut discard = Vec::new();
+    write_command(&mut out, cmd, &mut discard);
     out
 }
 
@@ -117,9 +129,16 @@ pub fn pp_expr(e: &Expr) -> String {
     out
 }
 
+/// Count `\n` bytes in the buffer. Cheap enough for the one-theorem-per-file
+/// case we currently have; if we ever emit many theorems per file this is the
+/// natural place to maintain a running counter instead.
+fn current_line(out: &str) -> usize {
+    1 + out.bytes().filter(|&b| b == b'\n').count()
+}
+
 // ── Command writers ─────────────────────────────────────────────────────
 
-fn write_command(out: &mut String, cmd: &Command) {
+fn write_command(out: &mut String, cmd: &Command, tactic_starts: &mut Vec<usize>) {
     match cmd {
         Command::Raw(s) => {
             out.push_str(s);
@@ -149,11 +168,11 @@ fn write_command(out: &mut String, cmd: &Command) {
         }
         Command::Mutual(cmds) => {
             out.push_str("mutual\n");
-            for c in cmds { write_command(out, c); }
+            for c in cmds { write_command(out, c, tactic_starts); }
             out.push_str("end\n\n");
         }
         Command::Def(d) => write_def(out, d),
-        Command::Theorem(t) => write_theorem(out, t),
+        Command::Theorem(t) => write_theorem(out, t, tactic_starts),
         Command::Datatype(dt) => write_datatype(out, dt),
         Command::Class(c) => write_class(out, c),
         Command::Instance(i) => write_instance(out, i),
@@ -166,10 +185,10 @@ fn write_def(out: &mut String, d: &Def) {
         out.push_str(attr);
         out.push_str("] ");
     }
-    if d.noncomputable {
-        out.push_str("noncomputable ");
-    }
-    out.push_str("def ");
+    // All Tactus-emitted defs are `noncomputable`: spec fns are Prop-land
+    // and can use classical axioms that Lean refuses to compile. Rather
+    // than making every caller set a flag that's always true, bake it in.
+    out.push_str("noncomputable def ");
     out.push_str(&d.name);
     write_binders(out, &d.binders);
     out.push_str(" : ");
@@ -177,21 +196,32 @@ fn write_def(out: &mut String, d: &Def) {
     out.push_str(" :=\n  ");
     write_expr(out, &d.body, 0);
     out.push('\n');
-    if let Some(t) = &d.termination_by {
-        out.push_str("termination_by ");
-        write_expr(out, t, 0);
-        out.push('\n');
+    match d.termination_by.as_slice() {
+        [] => {}
+        [single] => {
+            out.push_str("termination_by ");
+            write_expr(out, single, 0);
+            out.push('\n');
+        }
+        many => {
+            out.push_str("termination_by (");
+            for (i, e) in many.iter().enumerate() {
+                if i > 0 { out.push_str(", "); }
+                write_expr(out, e, 0);
+            }
+            out.push_str(")\n");
+        }
     }
 }
 
-fn write_theorem(out: &mut String, t: &Theorem) {
+fn write_theorem(out: &mut String, t: &Theorem, tactic_starts: &mut Vec<usize>) {
     out.push_str("theorem ");
     out.push_str(&t.name);
     write_binders(out, &t.binders);
     out.push_str(" :\n    ");
     write_expr(out, &t.goal, 0);
     out.push_str(" := by\n");
-    write_tactic_block(out, &t.tactic, "  ");
+    write_tactic_block(out, &t.tactic, "  ", tactic_starts);
 }
 
 fn write_datatype(out: &mut String, dt: &Datatype) {
@@ -291,10 +321,18 @@ fn write_binders(out: &mut String, binders: &[Binder]) {
 
 // ── Tactic writers ──────────────────────────────────────────────────────
 
-fn write_tactic_block(out: &mut String, t: &Tactic, indent: &str) {
+fn write_tactic_block(
+    out: &mut String,
+    t: &Tactic,
+    indent: &str,
+    tactic_starts: &mut Vec<usize>,
+) {
     match t {
         Tactic::Raw(body) => {
-            // Preserve the user's formatting verbatim; indent each line.
+            // Record the 1-indexed line where the first character of the
+            // raw body lands. `LeanSourceMap` uses this to map Lean-reported
+            // positions back to offsets within the user's tactic text.
+            tactic_starts.push(current_line(out));
             for line in body.lines() {
                 if line.trim().is_empty() {
                     out.push('\n');
@@ -311,7 +349,7 @@ fn write_tactic_block(out: &mut String, t: &Tactic, indent: &str) {
             out.push('\n');
         }
         Tactic::Seq(ts) => {
-            for inner in ts { write_tactic_block(out, inner, indent); }
+            for inner in ts { write_tactic_block(out, inner, indent, tactic_starts); }
         }
     }
 }
@@ -430,8 +468,10 @@ fn write_expr_body(out: &mut String, node: &ExprNode) {
             write_expr(out, cond, 0);
             out.push_str(" then ");
             write_expr(out, then_, 0);
-            out.push_str(" else ");
-            write_expr(out, else_, 0);
+            if let Some(e) = else_ {
+                out.push_str(" else ");
+                write_expr(out, e, 0);
+            }
         }
 
         ExprNode::Match { scrutinee, arms } => {
@@ -479,6 +519,13 @@ fn write_expr_body(out: &mut String, node: &ExprNode) {
                 if i > 0 { out.push_str(", "); }
                 write_expr(out, e, 0);
             }
+            out.push(']');
+        }
+
+        ExprNode::Index { base, idx } => {
+            write_expr(out, base, PREC_ATOM);
+            out.push('[');
+            write_expr(out, idx, 0);
             out.push(']');
         }
     }
@@ -630,7 +677,6 @@ mod tests {
     fn simple_def_renders() {
         let d = Def {
             attrs: vec!["irreducible".into()],
-            noncomputable: true,
             name: "double".into(),
             binders: vec![Binder {
                 name: Some("x".into()),
@@ -639,8 +685,7 @@ mod tests {
             }],
             ret_ty: var("Nat"),
             body: bin(BinOp::Add, var("x"), var("x")),
-            termination_by: None,
-            span: None,
+            termination_by: vec![],
         };
         let expected = "@[irreducible] noncomputable def double (x : Nat) : Nat :=\n  x + x\n";
         assert_eq!(pp_command(&Command::Def(d)), expected);
@@ -657,11 +702,69 @@ mod tests {
             }],
             goal: bin(BinOp::Eq, var("x"), var("x")),
             tactic: Tactic::Named("rfl".into()),
-            span: None,
         };
         let out = pp_command(&Command::Theorem(t));
         assert!(out.contains("theorem foo (x : Nat)"));
         assert!(out.contains("x = x := by"));
         assert!(out.contains("  rfl"));
+    }
+
+    #[test]
+    fn if_without_else() {
+        let e = Expr::new(ExprNode::If {
+            cond: Box::new(var("c")),
+            then_: Box::new(var("t")),
+            else_: None,
+        });
+        assert_eq!(pp_expr(&e), "if c then t");
+    }
+
+    #[test]
+    fn pp_records_raw_tactic_start() {
+        // The tactic body is `omega`. The theorem emits four lines before
+        // the body starts (`theorem …`, ` … goal`, ` … := by`, then the
+        // indented tactic). Confirm `tactic_starts` points at the right line.
+        let t = Theorem {
+            name: "foo".into(),
+            binders: vec![],
+            goal: bin(BinOp::Eq, lit(1), lit(1)),
+            tactic: Tactic::Raw("omega".into()),
+        };
+        let out = pp_commands(&[Command::Theorem(t)]);
+        assert_eq!(out.tactic_starts.len(), 1);
+        // Pull the recorded line and verify it contains the tactic text.
+        let start = out.tactic_starts[0];
+        let line = out.text.lines().nth(start - 1).expect("tactic line in range");
+        assert!(line.contains("omega"), "line {} was {:?}", start, line);
+    }
+
+    #[test]
+    fn pp_index_is_atomic() {
+        // `base[idx]` shouldn't take outer parens when used as a call arg.
+        let idx = Expr::new(ExprNode::Index {
+            base: Box::new(var("xs")),
+            idx: Box::new(lit(0)),
+        });
+        let apply_f = Expr::new(ExprNode::App {
+            head: Box::new(var("f")),
+            args: vec![idx],
+        });
+        assert_eq!(pp_expr(&apply_f), "f xs[0]");
+    }
+
+    #[test]
+    fn termination_by_tuple() {
+        let d = Def {
+            attrs: vec![],
+            name: "f".into(),
+            binders: vec![Binder {
+                name: Some("n".into()), ty: var("Nat"), kind: BinderKind::Explicit,
+            }],
+            ret_ty: var("Nat"),
+            body: var("n"),
+            termination_by: vec![var("n"), var("m")],
+        };
+        let out = pp_command(&Command::Def(d));
+        assert!(out.contains("termination_by (n, m)"), "{out}");
     }
 }

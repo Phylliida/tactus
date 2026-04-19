@@ -1,13 +1,7 @@
 //! Typed AST for the subset of Lean 4 we emit.
 //!
-//! Replaces ad-hoc `String::push_str` construction. Benefits:
-//!   * Precedence is handled by the pretty-printer, not by callers
-//!     sprinkling defensive parens.
-//!   * Every node carries an optional `vir::messages::Span` so Lean-position
-//!     diagnostics can be mapped back to Rust source locations. (The
-//!     pretty-printer records which span is active at each output
-//!     character; see `lean_pp.rs`.)
-//!   * New syntax (match arms, `have` in tactics, …) is added in one place.
+//! Replaces ad-hoc `String::push_str` construction. Precedence is handled
+//! by the pretty-printer, not by callers sprinkling defensive parens.
 //!
 //! The scope is intentionally narrow: we *emit* Lean, we don't parse it.
 //! `Tactic::Raw` and `Command::Raw` are escape hatches for user-authored
@@ -19,8 +13,10 @@
 //! construction is the caller's responsibility — see `to_lean_type::lean_name`.
 //!
 //! See `lean_pp.rs` for how these nodes render.
-
-use vir::messages::Span;
+//!
+//! Note: there's no span field here yet. When we wire Lean-position →
+//! Rust-span mapping for exec-fn diagnostics, the field and the pp-side
+//! tracking land together.
 
 // ── Commands (top-level declarations) ──────────────────────────────────
 
@@ -47,13 +43,13 @@ pub enum Command {
 pub struct Def {
     /// Bracketed attributes emitted before the keyword, e.g. `@[irreducible]`.
     pub attrs: Vec<String>,
-    pub noncomputable: bool,
     pub name: String,
     pub binders: Vec<Binder>,
     pub ret_ty: Expr,
     pub body: Expr,
-    pub termination_by: Option<Expr>,
-    pub span: Option<Span>,
+    /// `termination_by d₁` if one measure, `termination_by (d₁, d₂, …)` for
+    /// lexicographic. Empty `Vec` means no termination clause.
+    pub termination_by: Vec<Expr>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,7 +58,6 @@ pub struct Theorem {
     pub binders: Vec<Binder>,
     pub goal: Expr,
     pub tactic: Tactic,
-    pub span: Option<Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,7 +65,6 @@ pub struct Datatype {
     pub name: String,
     pub typ_params: Vec<String>,
     pub kind: DatatypeKind,
-    pub span: Option<Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +96,6 @@ pub struct Class {
     /// Trait-level bounds, emitted as `[Trait T …]` instance binders.
     pub bounds: Vec<Binder>,
     pub methods: Vec<ClassMethod>,
-    pub span: Option<Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,7 +112,6 @@ pub struct Instance {
     /// `HasValue (Container T) Int`. Represented as a single `Expr::App`.
     pub target: Expr,
     pub methods: Vec<InstanceMethod>,
-    pub span: Option<Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -158,16 +150,10 @@ pub enum BinderKind {
 #[derive(Debug, Clone)]
 pub struct Expr {
     pub node: ExprNode,
-    pub span: Option<Span>,
 }
 
 impl Expr {
-    pub fn new(node: ExprNode) -> Self {
-        Expr { node, span: None }
-    }
-    pub fn with_span(self, span: Option<Span>) -> Self {
-        Expr { node: self.node, span }
-    }
+    pub fn new(node: ExprNode) -> Self { Expr { node } }
 }
 
 #[derive(Debug, Clone)]
@@ -194,8 +180,9 @@ pub enum ExprNode {
     Forall { binders: Vec<Binder>, body: Box<Expr> },
     Exists { binders: Vec<Binder>, body: Box<Expr> },
 
-    /// `if cond then t else e`.
-    If { cond: Box<Expr>, then_: Box<Expr>, else_: Box<Expr> },
+    /// `if cond then t else e`. `else_` is optional — `if` without `else`
+    /// renders without the keyword (rare in spec code, but VIR supports it).
+    If { cond: Box<Expr>, then_: Box<Expr>, else_: Option<Box<Expr>> },
     /// `match scr with | p1 => b1 | p2 => b2 …`.
     Match { scrutinee: Box<Expr>, arms: Vec<MatchArm> },
 
@@ -214,14 +201,23 @@ pub enum ExprNode {
     /// `[a, b, c]` array literal.
     ArrayLit(Vec<Expr>),
 
+    /// `base[idx]` — array/slice indexing as a dedicated form so pp can
+    /// parenthesize the base against application precedence.
+    Index { base: Box<Expr>, idx: Box<Expr> },
+
     /// Escape hatch: verbatim Lean text. Used sparingly for forms we don't
-    /// yet model (e.g., `Classical.epsilon`-style closures).
+    /// yet model (Block statements, Multi, type-level `×` tuples).
     Raw(String),
 }
 
+/// Structural binary operators.
+///
+/// Anything that Lean doesn't treat as a real binary operator (xor,
+/// bitvector ops that are actually function calls, …) is built via
+/// `ExprNode::App` with a `Var` head, not squeezed into this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
-    And, Or, Implies, Iff, Xor,
+    And, Or, Implies, Iff,
     Eq, Ne, Lt, Le, Gt, Ge,
     Add, Sub, Mul, Div, Mod,
     BitAnd, BitOr, BitXor, Shr, Shl,
@@ -263,4 +259,26 @@ pub enum Tactic {
     Named(String),
     /// Sequence of tactics, pretty-printed one per line.
     Seq(Vec<Tactic>),
+}
+
+// ── Constructors ──────────────────────────────────────────────────────
+
+/// Right-associative conjunction over a list of AST Exprs. Empty → `True`.
+///
+/// Used by both proof-fn and exec-fn builders to fold ensures clauses into
+/// a single goal. Lean's `∧` is right-associative, so folding from the
+/// right keeps the first clause leftmost in the printed output.
+pub fn and_all(mut exprs: Vec<Expr>) -> Expr {
+    if exprs.is_empty() {
+        return Expr::new(ExprNode::LitBool(true));
+    }
+    let mut acc = exprs.pop().unwrap();
+    while let Some(e) = exprs.pop() {
+        acc = Expr::new(ExprNode::BinOp {
+            op: BinOp::And,
+            lhs: Box::new(e),
+            rhs: Box::new(acc),
+        });
+    }
+    acc
 }

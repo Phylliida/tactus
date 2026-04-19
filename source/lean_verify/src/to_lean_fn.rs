@@ -8,13 +8,12 @@
 use std::collections::HashMap;
 use vir::ast::*;
 use crate::lean_ast::{
-    Binder as LBinder, BinderKind, Class, ClassMethod, Command, Datatype,
+    and_all, Binder as LBinder, BinderKind, Class, ClassMethod, Datatype,
     DatatypeKind, Def, Expr as LExpr, ExprNode, Field, Instance, InstanceMethod,
     Theorem, Tactic, Variant,
 };
-use crate::lean_pp::{pp_command, pp_expr};
-use crate::to_lean_expr::{sanitize, vir_expr_to_ast};
-use crate::to_lean_type::{lean_name, short_name, typ_to_expr};
+use crate::to_lean_expr::vir_expr_to_ast;
+use crate::to_lean_type::{lean_name, sanitize, short_name, typ_to_expr};
 
 // ── Source map ──────────────────────────────────────────────────────────
 
@@ -51,30 +50,15 @@ pub fn spec_fn_to_ast(f: &FunctionX) -> Def {
         Some(b) => vir_expr_to_ast(b),
         None => LExpr::new(ExprNode::Var("sorry".into())),
     };
-    let termination_by = if f.decrease.is_empty() {
-        None
-    } else if f.decrease.len() == 1 {
-        Some(vir_expr_to_ast(&f.decrease[0]))
-    } else {
-        // Tuple of decreases expressions. AST has no tuple node; emit as Raw.
-        let parts: Vec<String> = f.decrease.iter()
-            .map(|d| pp_expr(&vir_expr_to_ast(d))).collect();
-        Some(LExpr::new(ExprNode::Raw(format!("({})", parts.join(", ")))))
-    };
+    let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| vir_expr_to_ast(d)).collect();
     Def {
         attrs,
-        noncomputable: true,
         name: lean_name(&f.name.path),
         binders: fn_binders(f),
         ret_ty: typ_to_expr(&f.ret.x.typ),
         body,
         termination_by,
-        span: None,
     }
-}
-
-pub fn write_spec_fn(out: &mut String, f: &FunctionX) {
-    out.push_str(&pp_command(&Command::Def(spec_fn_to_ast(f))));
 }
 
 // ── Proof fn ────────────────────────────────────────────────────────────
@@ -89,32 +73,13 @@ pub fn proof_fn_to_ast(f: &FunctionX, tactic_body: &str) -> Theorem {
             kind: BinderKind::Explicit,
         });
     }
-    let goal = ensures_conj(&f.ensure.0);
+    let goal = and_all(f.ensure.0.iter().map(|e| vir_expr_to_ast(e)).collect());
     Theorem {
         name: lean_name(&f.name.path),
         binders,
         goal,
         tactic: Tactic::Raw(tactic_body.to_string()),
-        span: None,
     }
-}
-
-/// Write a proof fn as a Lean theorem and return the 1-indexed line where
-/// the tactic body starts in the accumulated output — callers use this to
-/// build a `LeanSourceMap`.
-pub fn write_proof_fn(out: &mut String, f: &FunctionX, tactic_body: &str) -> usize {
-    let t = proof_fn_to_ast(f, tactic_body);
-    let rendered = pp_command(&Command::Theorem(t));
-    // The pp format guarantees one `:= by\n` marker in the theorem; count
-    // newlines in `out` through (and including) that marker to get the
-    // 1-indexed line where the tactic body begins.
-    let tail_start = rendered.find(":= by\n").expect("theorem without `:= by`");
-    let newlines_before = out.chars().filter(|&c| c == '\n').count();
-    let newlines_in_prefix = rendered[..tail_start + ":= by\n".len()]
-        .chars().filter(|&c| c == '\n').count();
-    let tactic_start_line = newlines_before + newlines_in_prefix + 1;
-    out.push_str(&rendered);
-    tactic_start_line
 }
 
 // ── Datatype ────────────────────────────────────────────────────────────
@@ -147,13 +112,7 @@ pub fn datatype_to_ast(dt: &DatatypeX) -> Option<Datatype> {
             }).collect(),
         }
     };
-    Some(Datatype { name: path, typ_params, kind, span: None })
-}
-
-pub fn write_datatype(out: &mut String, dt: &DatatypeX) {
-    if let Some(d) = datatype_to_ast(dt) {
-        out.push_str(&pp_command(&Command::Datatype(d)));
-    }
+    Some(Datatype { name: path, typ_params, kind })
 }
 
 // ── Trait (Lean `class`) ───────────────────────────────────────────────
@@ -207,16 +166,7 @@ pub fn trait_to_ast(
         typ_params,
         bounds,
         methods,
-        span: None,
     }
-}
-
-pub fn write_trait(
-    out: &mut String,
-    tr: &TraitX,
-    method_lookup: &HashMap<&Fun, &FunctionX>,
-) {
-    out.push_str(&pp_command(&Command::Class(trait_to_ast(tr, method_lookup))));
 }
 
 /// Build the method type `Self → P₁ → … → Ret`. Inside a class, associated
@@ -290,30 +240,24 @@ pub fn trait_impl_to_ast(
     let methods = method_impls.iter().map(|func| {
         let short = func.name.path.segments.last()
             .map(|s| s.as_str()).unwrap_or("_");
-        // If the method has params, wrap body in `fun p1 p2 … => body`.
         let body = match &func.body {
             Some(b) => {
                 let ast_body = vir_expr_to_ast(b);
                 if func.params.is_empty() {
                     ast_body
                 } else {
+                    // `fun (p₁ : _) (p₂ : _) … => body`. The `_` lets Lean
+                    // infer each parameter type from the class's method
+                    // signature, which is what we want.
                     let binders: Vec<LBinder> = func.params.iter().map(|p| LBinder {
                         name: Some(sanitize(p.x.name.0.as_str())),
-                        // Type irrelevant here (Lean infers from the class),
-                        // but we need a valid Expr; use `_` placeholder.
                         ty: LExpr::new(ExprNode::Var("_".into())),
                         kind: BinderKind::Explicit,
                     }).collect();
-                    // We actually want `fun p1 p2 => body` without type
-                    // annotations. The AST Lambda requires typed binders, so
-                    // we render as Raw for brevity.
-                    let params: Vec<String> = func.params.iter()
-                        .map(|p| sanitize(p.x.name.0.as_str())).collect();
-                    let body_txt = pp_expr(&ast_body);
-                    let _ = binders; // keep-warn-suppress placeholder unused
-                    LExpr::new(ExprNode::Raw(
-                        format!("fun {} => {}", params.join(" "), body_txt)
-                    ))
+                    LExpr::new(ExprNode::Lambda {
+                        binders,
+                        body: Box::new(ast_body),
+                    })
                 }
             }
             None => LExpr::new(ExprNode::Var("sorry".into())),
@@ -321,18 +265,7 @@ pub fn trait_impl_to_ast(
         InstanceMethod { name: sanitize(short), body }
     }).collect();
 
-    Instance { binders, target, methods, span: None }
-}
-
-pub fn write_trait_impl(
-    out: &mut String,
-    ti: &TraitImplX,
-    method_impls: &[&FunctionX],
-    assoc_types: &[&AssocTypeImplX],
-) {
-    out.push_str(&pp_command(&Command::Instance(
-        trait_impl_to_ast(ti, method_impls, assoc_types)
-    )));
+    Instance { binders, target, methods }
 }
 
 // ── Shared helpers ──────────────────────────────────────────────────────
@@ -402,26 +335,6 @@ fn trait_bounds_to_ast(bounds: &GenericBounds) -> Vec<LBinder> {
         }
     }
     out
-}
-
-/// Conjoin a list of ensures clauses into a single `Expr`. Empty → `True`.
-fn ensures_conj(ensures: &[Expr]) -> LExpr {
-    if ensures.is_empty() {
-        return LExpr::new(ExprNode::LitBool(true));
-    }
-    let mut iter = ensures.iter().rev();
-    let mut acc = vir_expr_to_ast(iter.next().unwrap());
-    for e in iter {
-        acc = LExpr::new(ExprNode::BinOp {
-            op: crate::lean_ast::BinOp::And,
-            // Note: `∧` is right-associative in Lean. To match left-to-right
-            // ordering of ensures clauses we fold right-to-left (first ens
-            // ends up leftmost).
-            lhs: Box::new(vir_expr_to_ast(e)),
-            rhs: Box::new(acc),
-        });
-    }
-    acc
 }
 
 fn field_name(name: &str) -> String {
