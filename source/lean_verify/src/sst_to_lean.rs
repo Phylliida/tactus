@@ -36,11 +36,10 @@
 use vir::sst::{BndX, CallFun, Dest, Exp, ExpX, FuncCheckSst, FunctionSst, Stm, StmX};
 use vir::ast::{BinaryOp, UnaryOp};
 use crate::lean_ast::{
-    BinOp as L, Binder as LBinder, BinderKind, Expr as LExpr, ExprNode, Tactic, Theorem,
+    and_all, BinOp as L, Binder as LBinder, BinderKind, Expr as LExpr, ExprNode, Tactic, Theorem,
 };
-use crate::to_lean_expr::sanitize;
 use crate::to_lean_sst_expr::sst_exp_to_ast;
-use crate::to_lean_type::{lean_name, typ_to_expr};
+use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
 
 // ── Support check ──────────────────────────────────────────────────────
 //
@@ -184,7 +183,6 @@ pub fn exec_fn_theorem_to_ast(fn_sst: &FunctionSst, check: &FuncCheckSst) -> The
         binders,
         goal,
         tactic: Tactic::Named("tactus_auto".to_string()),
-        span: None,
     }
 }
 
@@ -229,7 +227,7 @@ fn final_goal(
     ret_name: Option<&str>,
     ensures: &[Exp],
 ) -> LExpr {
-    let ens_conj = ensures_conj(ensures);
+    let ens_conj = and_all(ensures.iter().map(|e| sst_exp_to_ast(e)).collect());
     match (return_expr, ret_name) {
         (Some(re), Some(name)) => LExpr::new(ExprNode::Let {
             name: sanitize(name),
@@ -238,22 +236,6 @@ fn final_goal(
         }),
         _ => ens_conj,
     }
-}
-
-fn ensures_conj(ensures: &[Exp]) -> LExpr {
-    if ensures.is_empty() {
-        return LExpr::new(ExprNode::LitBool(true));
-    }
-    let mut iter = ensures.iter().rev();
-    let mut acc = sst_exp_to_ast(iter.next().unwrap());
-    for e in iter {
-        acc = LExpr::new(ExprNode::BinOp {
-            op: L::And,
-            lhs: Box::new(sst_exp_to_ast(e)),
-            rhs: Box::new(acc),
-        });
-    }
-    acc
 }
 
 // ── Body walk ──────────────────────────────────────────────────────────

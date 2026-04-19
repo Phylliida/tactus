@@ -14,8 +14,7 @@ use crate::lean_ast::{
     BinOp as L, Binder as LBinder, BinderKind, Expr as LExpr, ExprNode, UnOp as LUn,
 };
 use crate::lean_pp::pp_expr;
-use crate::to_lean_expr::sanitize;
-use crate::to_lean_type::{lean_name, typ_to_expr};
+use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
 
 /// Build a `lean_ast::Expr` from an SST expression.
 pub fn sst_exp_to_ast(e: &Exp) -> LExpr {
@@ -93,10 +92,14 @@ fn exp_to_node(e: &Exp) -> ExprNode {
                 lhs: Box::new(sst_exp_to_ast(lhs)),
                 rhs: Box::new(sst_exp_to_ast(rhs)),
             },
-            None => panic!(
-                "to_lean_sst_expr: binop {:?} should have been rejected by supported_body",
-                op
-            ),
+            // Non-structural: emit as `head lhs rhs` via App. HeightCompare
+            // / Index / StrGetChar / IeeeFloat are rejected earlier by
+            // `sst_to_lean::supported_body`; the only op that reaches here
+            // is `Xor`, which renders as `xor lhs rhs`.
+            None => ExprNode::App {
+                head: Box::new(var("xor")),
+                args: vec![sst_exp_to_ast(lhs), sst_exp_to_ast(rhs)],
+            },
         },
         ExpX::BinaryOpr(BinaryOpr::ExtEq(_, _), lhs, rhs) => ExprNode::BinOp {
             op: L::Eq,
@@ -107,7 +110,7 @@ fn exp_to_node(e: &Exp) -> ExprNode {
         ExpX::If(cond, then_e, else_e) => ExprNode::If {
             cond: Box::new(sst_exp_to_ast(cond)),
             then_: Box::new(sst_exp_to_ast(then_e)),
-            else_: Box::new(sst_exp_to_ast(else_e)),
+            else_: Some(Box::new(sst_exp_to_ast(else_e))),
         },
 
         ExpX::Call(CallFun::Fun(fun, _), typs, args)
@@ -214,7 +217,6 @@ fn binop_to_ast(op: &BinaryOp) -> Option<L> {
     Some(match op {
         BinaryOp::And => L::And,
         BinaryOp::Or => L::Or,
-        BinaryOp::Xor => L::Xor,
         BinaryOp::Implies => L::Implies,
         BinaryOp::Eq(_) => L::Eq,
         BinaryOp::Ne => L::Ne,
@@ -236,7 +238,8 @@ fn binop_to_ast(op: &BinaryOp) -> Option<L> {
         BinaryOp::Bitwise(BitwiseOp::BitXor, _) => L::BitXor,
         BinaryOp::Bitwise(BitwiseOp::Shr(_), _) => L::Shr,
         BinaryOp::Bitwise(BitwiseOp::Shl(_, _), _) => L::Shl,
-        BinaryOp::HeightCompare { .. }
+        BinaryOp::Xor
+        | BinaryOp::HeightCompare { .. }
         | BinaryOp::StrGetChar
         | BinaryOp::Index(_, _)
         | BinaryOp::IeeeFloat(_) => return None,

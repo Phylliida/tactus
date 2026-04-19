@@ -1,9 +1,4 @@
-//! Translate VIR-AST expressions to Lean 4 via `lean_ast`.
-//!
-//! `vir_expr_to_ast` is the canonical builder. `write_expr` is kept as a
-//! compatibility wrapper that pretty-prints the AST into a shared `String`
-//! buffer — callers are being migrated off it as they move to building
-//! `lean_ast::Command`s directly.
+//! Translate VIR-AST expressions to `lean_ast::Expr`.
 
 use vir::ast::*;
 use crate::lean_ast::{
@@ -11,19 +6,11 @@ use crate::lean_ast::{
     ExprNode, MatchArm as LMatchArm, Pattern as LPattern, UnOp as LUn,
 };
 use crate::lean_pp::pp_expr;
-use crate::to_lean_type::{lean_name, sanitize_ident, short_name, typ_to_expr, needs_sanitization};
-
-// ── Public API ──────────────────────────────────────────────────────────
+use crate::to_lean_type::{lean_name, sanitize, short_name, typ_to_expr};
 
 /// Build a `lean_ast::Expr` from a VIR-AST expression.
 pub fn vir_expr_to_ast(expr: &Expr) -> LExpr {
     LExpr::new(expr_to_node(expr))
-}
-
-/// Back-compat: emit a VIR expression as Lean text into `out`. New code
-/// should call `vir_expr_to_ast` and embed the result in a larger AST.
-pub fn write_expr(out: &mut String, expr: &Expr) {
-    out.push_str(&pp_expr(&vir_expr_to_ast(expr)));
 }
 
 /// Build `VarBinders<Typ>` → AST binders for proof/spec fn parameters.
@@ -34,11 +21,6 @@ pub(crate) fn vir_var_binders_to_ast(binders: &VarBinders<Typ>) -> Vec<LBinder> 
         ty: typ_to_expr(&b.a),
         kind: BinderKind::Explicit,
     }).collect()
-}
-
-/// Shared sanitizer — used by every caller that emits an identifier.
-pub(crate) fn sanitize(s: &str) -> String {
-    if needs_sanitization(s) { sanitize_ident(s) } else { s.to_string() }
 }
 
 // ── Internal: build ExprNode ────────────────────────────────────────────
@@ -74,14 +56,12 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
                 lhs: Box::new(vir_expr_to_ast(lhs)),
                 rhs: Box::new(vir_expr_to_ast(rhs)),
             },
-            // Operators we don't model as BinOp — emit the Lean text via
-            // a function application, preserving precedence under `App`.
-            None => ExprNode::Raw(format!(
-                "{} {} {}",
-                pp_expr(&vir_expr_to_ast(lhs)),
-                raw_binop_symbol(op),
-                pp_expr(&vir_expr_to_ast(rhs)),
-            )),
+            // Non-structural: emit as `head lhs rhs` via App so the pp layer
+            // handles precedence and spans flow through normally.
+            None => ExprNode::App {
+                head: Box::new(LExpr::new(ExprNode::Var(non_binop_head(op).to_string()))),
+                args: vec![vir_expr_to_ast(lhs), vir_expr_to_ast(rhs)],
+            },
         },
 
         ExprX::BinaryOpr(BinaryOpr::ExtEq(_, _), lhs, rhs) => ExprNode::BinOp {
@@ -129,22 +109,11 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
 
         ExprX::Call(target, args, _) => call_to_node(target, args),
 
-        ExprX::If(cond, then_e, else_e) => {
-            if let Some(e) = else_e {
-                ExprNode::If {
-                    cond: Box::new(vir_expr_to_ast(cond)),
-                    then_: Box::new(vir_expr_to_ast(then_e)),
-                    else_: Box::new(vir_expr_to_ast(e)),
-                }
-            } else {
-                // No else branch — rare in spec code. Fall back to Raw.
-                let mut s = String::from("if ");
-                s.push_str(&pp_expr(&vir_expr_to_ast(cond)));
-                s.push_str(" then ");
-                s.push_str(&pp_expr(&vir_expr_to_ast(then_e)));
-                ExprNode::Raw(s)
-            }
-        }
+        ExprX::If(cond, then_e, else_e) => ExprNode::If {
+            cond: Box::new(vir_expr_to_ast(cond)),
+            then_: Box::new(vir_expr_to_ast(then_e)),
+            else_: else_e.as_ref().map(|e| Box::new(vir_expr_to_ast(e))),
+        },
 
         ExprX::Quant(quant, binders, body) => {
             let l_binders = vir_var_binders_to_ast(binders);
@@ -238,7 +207,10 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
 
         ExprX::Header(_) => ExprNode::Raw(String::new()),
         ExprX::Fuel(..) | ExprX::RevealString(_) | ExprX::AirStmt(_) => ExprNode::Raw(String::new()),
-        ExprX::Nondeterministic => ExprNode::Raw("Classical.arbitrary _".into()),
+        ExprX::Nondeterministic => ExprNode::App {
+            head: Box::new(LExpr::new(ExprNode::Var("Classical.arbitrary".into()))),
+            args: vec![LExpr::new(ExprNode::Var("_".into()))],
+        },
         ExprX::BreakOrContinue { .. } => ExprNode::Raw(String::new()),
 
         // Exec-mode forms — VIR mode checker guarantees these don't appear
@@ -291,7 +263,6 @@ fn binop_to_ast(op: &BinaryOp) -> Option<L> {
     Some(match op {
         BinaryOp::And => L::And,
         BinaryOp::Or => L::Or,
-        BinaryOp::Xor => L::Xor,
         BinaryOp::Implies => L::Implies,
         BinaryOp::Eq(_) => L::Eq,
         BinaryOp::Ne => L::Ne,
@@ -313,21 +284,26 @@ fn binop_to_ast(op: &BinaryOp) -> Option<L> {
         BinaryOp::Bitwise(BitwiseOp::BitXor, _) => L::BitXor,
         BinaryOp::Bitwise(BitwiseOp::Shr(_), _) => L::Shr,
         BinaryOp::Bitwise(BitwiseOp::Shl(_, _), _) => L::Shl,
-        BinaryOp::HeightCompare { .. }
+        // These aren't real Lean binary operators; callers route them through
+        // `App` with an explicit head name.
+        BinaryOp::Xor
+        | BinaryOp::HeightCompare { .. }
         | BinaryOp::StrGetChar
         | BinaryOp::Index(_, _)
         | BinaryOp::IeeeFloat(_) => return None,
     })
 }
 
-/// Fallback symbol for binops we don't model as `L`. Used only via
-/// `ExprNode::Raw`, so precedence is up to the caller.
-fn raw_binop_symbol(op: &BinaryOp) -> &'static str {
+/// Head identifier used when a VIR binop is expressed as a 2-arg function
+/// call rather than a structural `BinOp`. Kept narrow: these all render
+/// harmlessly if the call ever gets executed — they're just stand-ins.
+fn non_binop_head(op: &BinaryOp) -> &'static str {
     match op {
-        BinaryOp::HeightCompare { .. } => "<",
+        BinaryOp::Xor => "xor",
+        BinaryOp::HeightCompare { .. } => "Tactus.heightLt",
         BinaryOp::StrGetChar => "String.get",
-        BinaryOp::Index(_, _) => "!!",
-        BinaryOp::IeeeFloat(_) => "+",
+        BinaryOp::Index(_, _) => "Tactus.index",
+        BinaryOp::IeeeFloat(_) => "Tactus.floatOp",
         _ => "?",
     }
 }
@@ -539,13 +515,10 @@ fn place_to_expr(place: &PlaceX) -> LExpr {
         }
         PlaceX::Temporary(expr) => return vir_expr_to_ast(expr),
         PlaceX::WithExpr(_, place) => return place_to_expr(&place.x),
-        PlaceX::Index(base, idx, _, _) => {
-            // `base[idx]` — represented as Raw since `[]` is not in our AST
-            // yet. Index syntax can be promoted to a real node when needed.
-            let b = pp_expr(&place_to_expr(&base.x));
-            let i = pp_expr(&vir_expr_to_ast(idx));
-            ExprNode::Raw(format!("{}[{}]", b, i))
-        }
+        PlaceX::Index(base, idx, _, _) => ExprNode::Index {
+            base: Box::new(place_to_expr(&base.x)),
+            idx: Box::new(vir_expr_to_ast(idx)),
+        },
         PlaceX::UserDefinedTypInvariantObligation(inner, _) => {
             return place_to_expr(&inner.x);
         }

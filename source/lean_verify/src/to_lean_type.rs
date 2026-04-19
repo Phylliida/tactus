@@ -1,19 +1,8 @@
-//! Translate VIR types to Lean 4 type syntax.
-//!
-//! `typ_to_expr` is the canonical API — it returns a `lean_ast::Expr` (in
-//! Lean, types are expressions). `write_typ` is a thin compatibility wrapper
-//! that pretty-prints into a `String` buffer; callers are gradually moving
-//! off it.
+//! Translate VIR types to `lean_ast::Expr` (in Lean, types are expressions).
 
 use vir::ast::{Dt, IntRange, Path, TypX};
 use crate::lean_ast::{BinOp, Expr, ExprNode};
 use crate::lean_pp::pp_expr;
-
-/// Write a VIR type as Lean 4 syntax by way of the AST + pretty-printer.
-/// Preserved for callers that still emit into a shared `String` buffer.
-pub fn write_typ(out: &mut String, typ: &TypX) {
-    out.push_str(&pp_expr(&typ_to_expr(typ)));
-}
 
 /// Canonical VIR-type → Lean-AST translator.
 pub fn typ_to_expr(typ: &TypX) -> Expr {
@@ -139,24 +128,25 @@ pub(crate) fn lean_name(path: &Path) -> String {
     if relevant.len() == 1 && !needs_sanitization(&relevant[0]) {
         return relevant[0].to_string();
     }
-    relevant.iter()
-        .map(|s| sanitize_ident(s))
-        .collect::<Vec<_>>()
-        .join(".")
+    relevant.iter().map(|s| sanitize(s)).collect::<Vec<_>>().join(".")
 }
 
-pub(crate) fn needs_sanitization(s: &str) -> bool {
+fn needs_sanitization(s: &str) -> bool {
     is_lean_keyword(s) || s.bytes().any(|b| b == b'@' || b == b'#' || b == b'%')
 }
 
-pub(crate) fn sanitize_ident(s: &str) -> String {
+/// Make a raw identifier safe to emit as a Lean identifier: keyword-quote
+/// with `«…»` if it collides with a Lean reserved word, otherwise squash
+/// Verus-internal punctuation (`%` from `assert(P)` desugaring, `@`/`#`
+/// from VIR disambiguation) to `_`. No-op fast path for the common case
+/// of already-safe names.
+pub(crate) fn sanitize(s: &str) -> String {
+    if !needs_sanitization(s) {
+        return s.to_string();
+    }
     if is_lean_keyword(s) {
         format!("«{}»", s)
     } else {
-        // `%` appears in Verus-synthetic identifiers (e.g., `tmp%` from
-        // desugared `assert(P)`). `@`/`#` come from VIR's disambiguation
-        // suffixes. All three get squashed to `_` since Lean identifiers
-        // accept underscores.
         s.chars().map(|c| match c { '@' | '#' | '%' => '_', _ => c }).collect()
     }
 }
@@ -188,35 +178,30 @@ pub(crate) fn walk_typ<'a>(typ: &'a TypX, visit: &mut impl FnMut(&'a TypX)) {
     }
 }
 
-/// Convenience: return type as String.
-pub fn typ_to_lean(typ: &TypX) -> String {
-    let mut s = String::new();
-    write_typ(&mut s, typ);
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
 
+    fn render(t: &TypX) -> String { pp_expr(&typ_to_expr(t)) }
+
     #[test]
     fn test_basic_types() {
-        assert_eq!(typ_to_lean(&TypX::Bool), "Prop");
-        assert_eq!(typ_to_lean(&TypX::Int(IntRange::Int)), "Int");
-        assert_eq!(typ_to_lean(&TypX::Int(IntRange::Nat)), "Nat");
-        assert_eq!(typ_to_lean(&TypX::Int(IntRange::U(32))), "Nat");
-        assert_eq!(typ_to_lean(&TypX::Int(IntRange::I(64))), "Int");
+        assert_eq!(render(&TypX::Bool), "Prop");
+        assert_eq!(render(&TypX::Int(IntRange::Int)), "Int");
+        assert_eq!(render(&TypX::Int(IntRange::Nat)), "Nat");
+        assert_eq!(render(&TypX::Int(IntRange::U(32))), "Nat");
+        assert_eq!(render(&TypX::Int(IntRange::I(64))), "Int");
     }
 
     #[test]
     fn test_type_param() {
-        assert_eq!(typ_to_lean(&TypX::TypParam(Arc::new("T".into()))), "T");
+        assert_eq!(render(&TypX::TypParam(Arc::new("T".into()))), "T");
     }
 
     #[test]
     fn test_boxed_transparent() {
-        assert_eq!(typ_to_lean(&TypX::Boxed(Arc::new(TypX::Int(IntRange::Nat)))), "Nat");
+        assert_eq!(render(&TypX::Boxed(Arc::new(TypX::Int(IntRange::Nat)))), "Nat");
     }
 
     #[test]
@@ -225,6 +210,6 @@ mod tests {
             Arc::new(vec![Arc::new(TypX::Int(IntRange::Nat))]),
             Arc::new(TypX::Int(IntRange::Nat)),
         );
-        assert_eq!(typ_to_lean(&t), "Nat → Nat");
+        assert_eq!(render(&t), "Nat → Nat");
     }
 }

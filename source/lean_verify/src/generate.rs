@@ -16,7 +16,7 @@ use crate::prelude::TACTUS_PRELUDE;
 use crate::project;
 use crate::sst_to_lean;
 use crate::to_lean_fn::{self, LeanSourceMap};
-use crate::to_lean_type::{lean_name, sanitize_ident, short_name};
+use crate::to_lean_type::{lean_name, sanitize, short_name};
 
 // ── Artifact location ──────────────────────────────────────────────────
 
@@ -41,7 +41,7 @@ fn lean_out_root() -> PathBuf {
 /// Structure: `{root}/{crate}/{fn_lean_name_with_underscores}.lean`.
 /// Dots in Lean names (module separators) become `__` so the file name stays flat.
 fn lean_file_path(crate_name: &str, fn_path: &vir::ast::Path) -> PathBuf {
-    let ns = sanitize_ident(crate_name);
+    let ns = sanitize(crate_name);
     let leaf = lean_name(fn_path).replace('.', "__");
     lean_out_root().join(ns).join(format!("{}.lean", leaf))
 }
@@ -79,7 +79,7 @@ fn krate_preamble(
     }
     cmds.push(Command::Raw(TACTUS_PRELUDE.to_string()));
 
-    let ns = sanitize_ident(crate_name);
+    let ns = sanitize(crate_name);
     cmds.push(Command::NamespaceOpen(ns.clone()));
 
     let all_fns: Vec<&FunctionX> = krate.functions.iter().map(|f| &f.x).collect();
@@ -167,11 +167,16 @@ pub fn check_proof_fn(
     cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body)));
     cmds.push(Command::NamespaceClose(ns));
 
-    let text = pp_commands(&cmds);
-    let source_map = build_proof_source_map(proof_fn, tactic_body, &text);
+    let rendered = pp_commands(&cmds);
+    let source_map = LeanSourceMap {
+        fn_name: short_name(&proof_fn.name.path).to_string(),
+        // One proof fn per file → exactly one `Tactic::Raw` emission.
+        tactic_start_line: rendered.tactic_starts.first().copied().unwrap_or(0),
+        tactic_line_count: tactic_body.lines().count().max(1),
+    };
 
     let file_path = lean_file_path(crate_name, &proof_fn.name.path);
-    if let Err(e) = write_lean_file(&file_path, &text) {
+    if let Err(e) = write_lean_file(&file_path, &rendered.text) {
         return CheckResult::Error(e);
     }
 
@@ -216,10 +221,10 @@ pub fn check_exec_fn(
     cmds.push(Command::Theorem(sst_to_lean::exec_fn_theorem_to_ast(fn_sst, check)));
     cmds.push(Command::NamespaceClose(ns));
 
-    let text = pp_commands(&cmds);
+    let rendered = pp_commands(&cmds);
 
     let file_path = lean_file_path(crate_name, &vir_fn.name.path);
-    if let Err(e) = write_lean_file(&file_path, &text) {
+    if let Err(e) = write_lean_file(&file_path, &rendered.text) {
         return CheckResult::Error(e);
     }
 
@@ -252,27 +257,3 @@ pub fn check_exec_fn(
     }
 }
 
-// ── Source map ─────────────────────────────────────────────────────────
-
-/// Find where the proof fn's tactic body starts in the pretty-printed Lean.
-/// The AST theorem writer emits `...:= by\n` right before the tactic block,
-/// so we scan the file for that marker inside the theorem declaration.
-fn build_proof_source_map(
-    proof_fn: &FunctionX,
-    tactic_body: &str,
-    text: &str,
-) -> LeanSourceMap {
-    let fn_name = short_name(&proof_fn.name.path).to_string();
-    let marker_prefix = format!("theorem {}", lean_name(&proof_fn.name.path));
-    let start = text.find(&marker_prefix).and_then(|i| {
-        text[i..].find(":= by\n").map(|j| i + j + ":= by\n".len())
-    });
-    let tactic_start_line = start
-        .map(|byte_off| 1 + text[..byte_off].bytes().filter(|&b| b == b'\n').count())
-        .unwrap_or(0);
-    LeanSourceMap {
-        fn_name,
-        tactic_start_line,
-        tactic_line_count: tactic_body.lines().count().max(1),
-    }
-}
