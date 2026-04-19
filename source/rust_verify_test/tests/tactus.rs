@@ -1253,6 +1253,158 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === Complex proofs ===
+
+// Multi-step proof with have
+test_verify_one_file! {
+    #[test] test_proof_with_have verus_code! {
+        import Mathlib.Tactic.Linarith
+
+        spec fn square(x: int) -> int { x * x }
+
+        proof fn square_nonneg(x: int)
+            ensures square(x) >= 0
+        by {
+            unfold square
+            nlinarith [sq_nonneg x]
+        }
+    } => Ok(())
+}
+
+// Proof calling another lemma
+test_verify_one_file! {
+    #[test] test_lemma_chain verus_code! {
+        spec fn double(x: int) -> int { x + x }
+        spec fn quadruple(x: int) -> int { double(double(x)) }
+
+        proof fn double_pos(x: int)
+            requires x > 0
+            ensures double(x) > x
+        by {
+            unfold double
+            omega
+        }
+
+        proof fn quadruple_pos(x: int)
+            requires x > 0
+            ensures quadruple(x) > x
+        by {
+            unfold quadruple
+            unfold double
+            omega
+        }
+    } => Ok(())
+}
+
+// Proof about recursive function with induction
+test_verify_one_file! {
+    #[test] test_recursive_sum verus_code! {
+        spec fn sum_to(n: nat) -> nat
+            decreases n
+        {
+            if n == 0 { 0 } else { (n + sum_to((n - 1) as nat)) as nat }
+        }
+
+        proof fn sum_zero()
+            ensures sum_to(0) == 0
+        by {
+            unfold sum_to
+            simp
+        }
+    } => Ok(())
+}
+
+// Multi-line tactic with multiple unfolds and reasoning steps
+test_verify_one_file! {
+    #[test] test_multi_step_proof verus_code! {
+        spec fn max(a: int, b: int) -> int {
+            if a >= b { a } else { b }
+        }
+
+        spec fn min(a: int, b: int) -> int {
+            if a <= b { a } else { b }
+        }
+
+        proof fn max_ge_min(a: int, b: int)
+            ensures max(a, b) >= min(a, b)
+        by {
+            unfold max
+            unfold min
+            omega
+        }
+    } => Ok(())
+}
+
+// Proof with conjunction (multiple ensures) using constructor + focus dots
+test_verify_one_file! {
+    #[test] test_conjunction_proof verus_body("
+        proof fn conj_proof(x: int)
+            requires x > 0
+            ensures x > 0, x >= 0
+        by {
+            constructor
+            · omega
+            · omega
+        }
+    ") => Ok(())
+}
+
+// Mathlib ring tactic for polynomial identity
+test_verify_one_file! {
+    #[test] test_ring_identity verus_code! {
+        import Mathlib.Tactic.Ring
+
+        proof fn square_of_sum(a: int, b: int)
+            ensures (a + b) * (a + b) == a * a + 2 * a * b + b * b
+        by {
+            ring
+        }
+    } => Ok(())
+}
+
+// Proof combining recursive spec fn + trait method + multi-step
+test_verify_one_file! {
+    #[test] test_complex_combo verus_code! {
+        spec fn fib(n: nat) -> nat
+            decreases n
+        {
+            if n == 0 { 0 }
+            else if n == 1 { 1 }
+            else { (fib((n - 1) as nat) + fib((n - 2) as nat)) as nat }
+        }
+
+        proof fn fib_base()
+            ensures fib(0) == 0, fib(1) == 1
+        by {
+            unfold fib
+            simp
+        }
+    } => Ok(())
+}
+
+// Proof about enum with pattern matching in spec
+test_verify_one_file! {
+    #[test] test_enum_proof verus_code! {
+        enum Dir { North, South, East, West }
+
+        spec fn opposite(d: Dir) -> Dir {
+            match d {
+                Dir::North => Dir::South,
+                Dir::South => Dir::North,
+                Dir::East => Dir::West,
+                Dir::West => Dir::East,
+            }
+        }
+
+        proof fn opposite_north()
+            ensures opposite(Dir::North) == Dir::South
+        by {
+            unfold opposite
+            simp
+        }
+    } => Ok(())
+}
+
 // === Extensional equality (=~=) ===
 
 test_verify_one_file! {
