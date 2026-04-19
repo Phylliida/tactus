@@ -190,11 +190,10 @@ pub fn write_trait(
 }
 
 /// Write method type: `Self → ParamType → ... → RetType`.
-/// Projections like `Self::Item` are written as bare `Item` since
-/// associated types are type params on the class.
+/// Inside a class definition, `Self::Item` projections are written as bare `Item`
+/// since associated types are type params on the class.
 fn write_method_type(out: &mut String, func: &FunctionX) {
     let write_method_typ = |out: &mut String, typ: &TypX| {
-        // Inside a class, Self::AssocType is just the type param name
         if let TypX::Projection { name, .. } = typ {
             write_name(out, name);
         } else {
