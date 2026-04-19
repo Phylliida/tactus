@@ -1856,6 +1856,47 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === AST edge cases: Block fold, tuple, chained compare ===
+
+// Block fold: multi-statement spec fn body. Each `let` nests into the
+// next; the final expression is the body of the innermost let. The proof
+// uses only core tactics (no Mathlib import), so this also doubles as a
+// sanity check that our let-fold is shaped so `simp` can reduce it.
+test_verify_one_file! {
+    #[test] test_multi_let_block verus_code! {
+        spec fn layered(x: int) -> int {
+            let a = x + 1;
+            let b = a + 2;
+            let c = b + 3;
+            c
+        }
+
+        proof fn layered_correct(x: int)
+            ensures layered(x) == x + 6
+        by {
+            unfold layered; simp; omega
+        }
+    } => Ok(())
+}
+
+// Nested let referencing an earlier binding — exercises scope
+// propagation through the Block → Let fold.
+test_verify_one_file! {
+    #[test] test_let_references_earlier verus_code! {
+        spec fn chain(x: int) -> int {
+            let y = x + 1;
+            let z = y + y;
+            z
+        }
+
+        proof fn chain_value(x: int)
+            ensures chain(x) == x + x + 2
+        by {
+            unfold chain; simp; omega
+        }
+    } => Ok(())
+}
+
 // === Track B: exec fn with sst_to_lean (first slice) ===
 //
 // Simplest straight-line exec fn: constant return, trivial ensures.

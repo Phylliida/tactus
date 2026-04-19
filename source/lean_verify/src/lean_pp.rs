@@ -27,6 +27,7 @@ const PREC_NOT: u16 = 40;
 const PREC_CMP: u16 = 50;
 const PREC_ADD: u16 = 65;
 const PREC_MUL: u16 = 70;
+const PREC_PROD: u16 = 35;
 const PREC_APP: u16 = 1024;
 const PREC_ATOM: u16 = u16::MAX;
 
@@ -46,6 +47,8 @@ fn binop_info(op: BinOp) -> (u16, Assoc) {
         // Bitwise: Lean uses custom operators at ~65/70 range.
         BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => (PREC_ADD, Assoc::Left),
         BinOp::Shr | BinOp::Shl => (PREC_ADD, Assoc::Left),
+        // Lean's `×` is right-associative at 35 (same prec as `∧`).
+        BinOp::Prod => (PREC_PROD, Assoc::Right),
     }
 }
 
@@ -71,6 +74,7 @@ fn binop_symbol(op: BinOp) -> &'static str {
         BinOp::BitXor => "^^^",
         BinOp::Shr => ">>>",
         BinOp::Shl => "<<<",
+        BinOp::Prod => "×",
     }
 }
 
@@ -79,7 +83,7 @@ fn expr_prec(node: &ExprNode) -> u16 {
         ExprNode::Var(_) | ExprNode::Lit(_) | ExprNode::LitBool(_)
         | ExprNode::LitStr(_) | ExprNode::LitChar(_)
         | ExprNode::ArrayLit(_) | ExprNode::StructUpdate { .. }
-        | ExprNode::Raw(_) => PREC_ATOM,
+        | ExprNode::Anon(_) | ExprNode::Raw(_) => PREC_ATOM,
         ExprNode::FieldProj { .. } | ExprNode::Index { .. } => PREC_ATOM,
         ExprNode::BinOp { op, .. } => binop_info(*op).0,
         ExprNode::UnOp { op: UnOp::Not, .. } => PREC_NOT,
@@ -528,6 +532,15 @@ fn write_expr_body(out: &mut String, node: &ExprNode) {
             write_expr(out, idx, 0);
             out.push(']');
         }
+
+        ExprNode::Anon(elts) => {
+            out.push('⟨');
+            for (i, e) in elts.iter().enumerate() {
+                if i > 0 { out.push_str(", "); }
+                write_expr(out, e, 0);
+            }
+            out.push('⟩');
+        }
     }
 }
 
@@ -750,6 +763,39 @@ mod tests {
             args: vec![idx],
         });
         assert_eq!(pp_expr(&apply_f), "f xs[0]");
+    }
+
+    #[test]
+    fn anon_constructor_tuple() {
+        let e = Expr::new(ExprNode::Anon(vec![var("a"), var("b"), var("c")]));
+        assert_eq!(pp_expr(&e), "⟨a, b, c⟩");
+    }
+
+    #[test]
+    fn anon_is_atomic_in_application() {
+        // `f ⟨a, b⟩` — ⟨⟩ doesn't need outer parens as an arg.
+        let tup = Expr::new(ExprNode::Anon(vec![var("a"), var("b")]));
+        let e = Expr::new(ExprNode::App {
+            head: Box::new(var("f")),
+            args: vec![tup],
+        });
+        assert_eq!(pp_expr(&e), "f ⟨a, b⟩");
+    }
+
+    #[test]
+    fn type_product_right_associative() {
+        // T × U × V = T × (U × V); no parens on the right.
+        let inner = bin(BinOp::Prod, var("U"), var("V"));
+        let e = bin(BinOp::Prod, var("T"), inner);
+        assert_eq!(pp_expr(&e), "T × U × V");
+    }
+
+    #[test]
+    fn type_product_left_nested_needs_parens() {
+        // (T × U) × V — left child at same prec on right-assoc op parens.
+        let inner = bin(BinOp::Prod, var("T"), var("U"));
+        let e = bin(BinOp::Prod, inner, var("V"));
+        assert_eq!(pp_expr(&e), "(T × U) × V");
     }
 
     #[test]
