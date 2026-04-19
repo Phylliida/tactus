@@ -1504,6 +1504,10 @@ pub struct FunctionAttrsX {
     /// currently generates its own .lean file. All tactic proof fns in the same
     /// verus! block share the same imports.
     pub lean_imports: Vec<String>,
+    /// Tactus: if true, route this exec fn's body obligations through Lean
+    /// (via `sst_to_lean` WP generation) instead of Z3. Opt-in for now while
+    /// the exec-fn pipeline is incomplete.
+    pub tactus_auto: bool,
 }
 
 /// Function specification of its invariant mask

@@ -1677,6 +1677,70 @@ impl Verifier {
                             continue;
                         }
 
+                        // Tactus: route exec fns marked #[verifier(tactus_auto)] through
+                        // sst_to_lean WP generation instead of Z3. Only fires on the
+                        // "Body(Normal)" query (the obligation generated from the body);
+                        // skip for recommends-check / api-safety / expanded re-runs.
+                        if function.x.attrs.tactus_auto
+                            && matches!(query_op, QueryOp::Body(Style::Normal))
+                        {
+                            let fn_span = &function.span;
+                            let vir_krate = self.vir_crate.as_ref()
+                                .expect("vir_crate should be initialized");
+                            let vir_fn = match vir_krate.functions.iter()
+                                .find(|f| f.x.name == function.x.name)
+                            {
+                                Some(f) => f,
+                                None => {
+                                    self.count_errors += 1;
+                                    let fn_name = vir::ast_util::fun_as_friendly_rust_name(
+                                        &function.x.name);
+                                    reporter.report(&message(
+                                        MessageLevel::Error,
+                                        format!("could not find VIR function for tactus_auto exec fn {}", fn_name),
+                                        fn_span,
+                                    ).to_any());
+                                    continue;
+                                }
+                            };
+                            let Some(check_sst) = func_check_sst.as_ref() else {
+                                // No body to check (e.g., external_body) — nothing to verify.
+                                continue;
+                            };
+                            let crate_name = self.crate_name.as_deref().unwrap_or("crate");
+                            match lean_verify::check_exec_fn(
+                                vir_krate,
+                                &vir_fn.x,
+                                function,
+                                check_sst,
+                                &vir_fn.x.attrs.lean_imports,
+                                crate_name,
+                            ) {
+                                lean_verify::CheckResult::Success => {
+                                    self.count_verified += 1;
+                                }
+                                lean_verify::CheckResult::Failed(msg) => {
+                                    self.count_errors += 1;
+                                    reporter.report(
+                                        &message(MessageLevel::Error, msg, fn_span).to_any()
+                                    );
+                                }
+                                lean_verify::CheckResult::Error(e) => {
+                                    self.count_errors += 1;
+                                    let fn_name = vir::ast_util::fun_as_friendly_rust_name(
+                                        &function.x.name);
+                                    reporter.report(&message(
+                                        MessageLevel::Error,
+                                        format!(
+                                            "failed to invoke Lean for {}: {}. Is Lean 4 installed?",
+                                            fn_name, e),
+                                        fn_span,
+                                    ).to_any());
+                                }
+                            }
+                            continue;
+                        }
+
                         // Cache: compute key, skip if cached (key reused for store below)
                         let cache_key = if let Some(ref bc) = cache {
                             bc.try_key(
