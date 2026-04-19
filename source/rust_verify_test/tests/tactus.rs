@@ -1879,6 +1879,25 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Tuple-returning spec fn: exercises the dep_order walker finding
+// `pair` when it's referenced through tuple field access in ensures.
+// Specifically guards against the bug where `ReadPlace(Place::Field(…,
+// Temporary(Call(pair, …))))` buried the call in a Place the walker
+// treated as a leaf.
+test_verify_one_file! {
+    #[test] test_tuple_return verus_code! {
+        spec fn pair(x: int) -> (int, int) {
+            (x, x + 1)
+        }
+
+        proof fn pair_diff(x: int)
+            ensures pair(x).1 - pair(x).0 == 1
+        by {
+            unfold pair; simp; omega
+        }
+    } => Ok(())
+}
+
 // Nested let referencing an earlier binding — exercises scope
 // propagation through the Block → Let fold.
 test_verify_one_file! {

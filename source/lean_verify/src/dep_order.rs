@@ -210,7 +210,8 @@ fn walk_expr<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
         ExprX::Choose { cond, body, .. } => {
             walk_expr(cond, visit); walk_expr(body, visit);
         }
-        ExprX::Match(_, arms) => {
+        ExprX::Match(place, arms) => {
+            walk_place(&place.x, visit);
             for arm in arms.iter() { walk_expr(&arm.x.body, visit); }
         }
         ExprX::AssertAssume { expr: e, .. }
@@ -219,7 +220,10 @@ fn walk_expr<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
             walk_expr(require, visit); walk_expr(ensure, visit); walk_expr(proof, visit);
         }
         ExprX::Return(e) => { if let Some(e) = e { walk_expr(e, visit); } }
-        ExprX::AssignToPlace { rhs, .. } => walk_expr(rhs, visit),
+        ExprX::AssignToPlace { place, rhs, .. } => {
+            walk_place(&place.x, visit);
+            walk_expr(rhs, visit);
+        }
         ExprX::OpenInvariant(a, _, b, _) => { walk_expr(a, visit); walk_expr(b, visit); }
         ExprX::NonSpecClosure { body, requires, ensures, external_spec, .. } => {
             walk_expr(body, visit);
@@ -239,16 +243,39 @@ fn walk_expr<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
             walk_expr(proof, visit);
         }
 
+        // Place-containing variants: recurse through `walk_place` to find
+        // any Exprs buried inside Temporary / Index / WithExpr.
+        ExprX::ReadPlace(place, _)
+        | ExprX::BorrowMut(place)
+        | ExprX::TwoPhaseBorrowMut(place)
+        | ExprX::BorrowMutTracked(place) => walk_place(&place.x, visit),
+        ExprX::ImplicitReborrowOrSpecRead(place, _, _) => walk_place(&place.x, visit),
+
         // Leaf nodes (no sub-expressions)
         ExprX::Const(_) | ExprX::Var(_) | ExprX::ConstVar(..) | ExprX::StaticVar(_)
         | ExprX::VarLoc(_) | ExprX::ExecFnByName(_) | ExprX::Fuel(..)
         | ExprX::NullaryOpr(_) | ExprX::Header(_) | ExprX::AirStmt(_)
         | ExprX::RevealString(_) | ExprX::Nondeterministic
-        | ExprX::BreakOrContinue { .. } | ExprX::ReadPlace(..)
-        | ExprX::BorrowMut(_) | ExprX::TwoPhaseBorrowMut(_)
-        | ExprX::VarAt(..) | ExprX::BorrowMutTracked(_)
-        | ExprX::ImplicitReborrowOrSpecRead(..)
+        | ExprX::BreakOrContinue { .. }
+        | ExprX::VarAt(..)
         | ExprX::EvalAndResolve(..) | ExprX::Old(_) => {}
+    }
+}
+
+/// Walk a `PlaceX`, visiting any `Expr` nodes embedded in its variants.
+/// Without this, spec-fn calls buried inside a `Temporary(...)` place (e.g.
+/// `pair(x).0` reached via `ReadPlace(Field("0", Temporary(Call(pair, x))))`)
+/// never hit the Expr visitor and wouldn't be pulled into `dep_order`.
+fn walk_place<'a>(place: &'a PlaceX, visit: &mut impl FnMut(&'a Expr)) {
+    match place {
+        PlaceX::Local(_) => {}
+        PlaceX::Field(_, p)
+        | PlaceX::DerefMut(p)
+        | PlaceX::ModeUnwrap(p, _)
+        | PlaceX::UserDefinedTypInvariantObligation(p, _) => walk_place(&p.x, visit),
+        PlaceX::Temporary(e) => walk_expr(e, visit),
+        PlaceX::WithExpr(e, p) => { walk_expr(e, visit); walk_place(&p.x, visit); }
+        PlaceX::Index(p, e, _, _) => { walk_place(&p.x, visit); walk_expr(e, visit); }
     }
 }
 
