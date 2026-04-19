@@ -2,28 +2,44 @@
 //!
 //! Run: nix-shell -p lean4 --run "cargo test -p lean_verify --test integration"
 
-use lean_verify::lean_process::check_lean_stdin;
+use lean_verify::lean_process::check_lean_file;
 use lean_verify::prelude::TACTUS_PRELUDE;
 
-fn verify(lean: &str) {
+/// Write `lean` (prefixed with the Tactus prelude) to a tmp file and invoke
+/// Lean on it. Matches the "file artifact" invocation used by the main
+/// verifier, not stdin piping.
+fn run(lean: &str) -> Option<lean_verify::lean_process::LeanResult> {
     let full = format!("{}{}", TACTUS_PRELUDE, lean);
-    match check_lean_stdin(&full) {
-        Ok(r) => {
+    let pid = std::process::id();
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir()
+        .join(format!("tactus_integration_{}_{}.lean", pid, uniq));
+    std::fs::write(&path, full).expect("write tmp");
+    let result = check_lean_file(&path, None).ok();
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+fn verify(lean: &str) {
+    match run(lean) {
+        Some(r) => {
             for d in &r.diagnostics { eprintln!("[{}] {}", d.severity, d.data); }
             assert!(r.success, "Lean verification failed");
         }
-        Err(e) => eprintln!("Lean not available, skipping: {}", e),
+        None => eprintln!("Lean not available, skipping"),
     }
 }
 
 fn reject(lean: &str) {
-    let full = format!("{}{}", TACTUS_PRELUDE, lean);
-    match check_lean_stdin(&full) {
-        Ok(r) => {
+    match run(lean) {
+        Some(r) => {
             assert!(!r.success, "Expected Lean to reject this");
             assert!(r.diagnostics.iter().any(|d| d.severity == "error"));
         }
-        Err(e) => eprintln!("Lean not available, skipping: {}", e),
+        None => eprintln!("Lean not available, skipping"),
     }
 }
 

@@ -1,28 +1,11 @@
 //! Translate VIR expressions to Lean 4 expression syntax.
 
 use vir::ast::*;
+use crate::to_lean_common::{
+    binop_prec, binop_symbol, write_const,
+    PREC_ATOM, PREC_CMP, PREC_MUL,
+};
 use crate::to_lean_type::{write_typ, short_name, lean_name};
-
-// Lean operator precedence (higher = tighter binding).
-const PREC_IMPLIES: u8 = 25;
-const PREC_OR: u8 = 30;
-const PREC_AND: u8 = 35;
-const PREC_CMP: u8 = 50;
-const PREC_ADD: u8 = 65;
-const PREC_MUL: u8 = 70;
-const PREC_ATOM: u8 = 255;
-
-fn binop_prec(op: &BinaryOp) -> u8 {
-    match op {
-        BinaryOp::Implies => PREC_IMPLIES,
-        BinaryOp::Or => PREC_OR,
-        BinaryOp::And => PREC_AND,
-        BinaryOp::Eq(_) | BinaryOp::Ne | BinaryOp::Inequality(_) => PREC_CMP,
-        BinaryOp::Arith(ArithOp::Add(_) | ArithOp::Sub(_)) => PREC_ADD,
-        BinaryOp::Arith(ArithOp::Mul(_) | ArithOp::EuclideanDiv(_) | ArithOp::EuclideanMod(_)) => PREC_MUL,
-        _ => PREC_CMP,
-    }
-}
 
 fn expr_prec(expr: &ExprX) -> u8 {
     match expr {
@@ -346,84 +329,8 @@ pub(crate) fn write_binders(out: &mut String, binders: &VarBinders<Typ>) {
     }
 }
 
-fn write_const(out: &mut String, c: &Constant) {
-    match c {
-        Constant::Bool(true) => out.push_str("True"),
-        Constant::Bool(false) => out.push_str("False"),
-        Constant::Int(n) => {
-            let s = n.to_string();
-            if s.starts_with('-') {
-                // Negative literals need parens: (-5) not -5
-                out.push('('); out.push_str(&s); out.push(')');
-            } else {
-                out.push_str(&s);
-            }
-        }
-        Constant::StrSlice(s) => {
-            out.push('"');
-            for c in s.chars() {
-                match c {
-                    '"' => out.push_str("\\\""),
-                    '\\' => out.push_str("\\\\"),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => out.push_str("\\r"),
-                    '\t' => out.push_str("\\t"),
-                    c => out.push(c),
-                }
-            }
-            out.push('"');
-        }
-        Constant::Char(c) => {
-            out.push('\'');
-            out.push(*c);
-            out.push('\'');
-        }
-        Constant::Real(s) => {
-            // VIR stores reals as "digits.digits" strings
-            out.push('(');
-            out.push_str(s);
-            out.push_str(" : Real)");
-        }
-        Constant::Float32(bits) => {
-            out.push_str(&format!("({} : Float)", f32::from_bits(*bits)));
-        }
-        Constant::Float64(bits) => {
-            out.push_str(&format!("({} : Float)", f64::from_bits(*bits)));
-        }
-    }
-}
-
 fn write_binop(out: &mut String, op: &BinaryOp) {
-    out.push_str(match op {
-        BinaryOp::And => "∧",
-        BinaryOp::Or => "∨",
-        BinaryOp::Xor => "xor",
-        BinaryOp::Implies => "→",
-        BinaryOp::Eq(_) => "=",
-        BinaryOp::Ne => "≠",
-        BinaryOp::Inequality(InequalityOp::Le) => "≤",
-        BinaryOp::Inequality(InequalityOp::Lt) => "<",
-        BinaryOp::Inequality(InequalityOp::Ge) => "≥",
-        BinaryOp::Inequality(InequalityOp::Gt) => ">",
-        BinaryOp::Arith(ArithOp::Add(_)) => "+",
-        BinaryOp::Arith(ArithOp::Sub(_)) => "-",
-        BinaryOp::Arith(ArithOp::Mul(_)) => "*",
-        BinaryOp::Arith(ArithOp::EuclideanDiv(_)) => "/",
-        BinaryOp::Arith(ArithOp::EuclideanMod(_)) => "%",
-        BinaryOp::RealArith(RealArithOp::Add) => "+",
-        BinaryOp::RealArith(RealArithOp::Sub) => "-",
-        BinaryOp::RealArith(RealArithOp::Mul) => "*",
-        BinaryOp::RealArith(RealArithOp::Div) => "/",
-        BinaryOp::Bitwise(BitwiseOp::BitAnd, _) => "&&&",
-        BinaryOp::Bitwise(BitwiseOp::BitOr, _) => "|||",
-        BinaryOp::Bitwise(BitwiseOp::BitXor, _) => "^^^",
-        BinaryOp::Bitwise(BitwiseOp::Shr(_), _) => ">>>",
-        BinaryOp::Bitwise(BitwiseOp::Shl(_, _), _) => "<<<",
-        BinaryOp::HeightCompare { .. } => "<", // internal: used for decreases checks
-        BinaryOp::StrGetChar => "String.get",
-        BinaryOp::Index(_, _) => "!!",          // array/slice index
-        BinaryOp::IeeeFloat(_) => "+",          // approximate: float ops
-    });
+    out.push_str(binop_symbol(op));
 }
 
 fn write_fn_ref(out: &mut String, fun: &Fun) {
