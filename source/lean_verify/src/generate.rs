@@ -15,10 +15,13 @@ use crate::sst_to_lean;
 use crate::to_lean_fn;
 use crate::to_lean_type::{lean_name, sanitize_ident, short_name};
 
-/// Where to write generated Lean artifacts. Resolved at invocation time so
-/// the verifier running in any CWD uses a sensible location.
+/// Where to write generated Lean artifacts.
 ///
 /// Priority: `$TACTUS_LEAN_OUT` → `$CARGO_TARGET_DIR/tactus-lean` → `./target/tactus-lean`.
+/// The last fallback is CWD-relative, which works correctly when Tactus is
+/// invoked from a Cargo project root (cargo's convention) but will scatter
+/// artifacts if invoked from elsewhere. Set `$TACTUS_LEAN_OUT` explicitly
+/// for reproducible builds outside Cargo.
 fn lean_out_root() -> PathBuf {
     if let Ok(dir) = std::env::var("TACTUS_LEAN_OUT") {
         return PathBuf::from(dir);
@@ -47,6 +50,100 @@ fn write_lean_file(path: &Path, source: &str) -> Result<(), String> {
     }
     std::fs::write(path, source)
         .map_err(|e| format!("could not write {}: {}", path.display(), e))
+}
+
+/// Emit the shared preamble (imports, prelude, namespace opener, and entity
+/// declarations transitively referenced by `root_fns`). Returns the opened
+/// namespace so the caller can emit a matching `end <ns>` after the theorem.
+///
+/// Both `generate_lean` (proof fns) and `generate_lean_exec` (exec fns) use
+/// this — they differ only in the theorem that comes after.
+///
+/// Note: reference collection walks VIR-AST bodies. For exec fns the SST
+/// body may reference spec fns not reachable from the VIR body alone; the
+/// first slice only hits pure arithmetic so this isn't an issue yet. When
+/// `sst_to_lean` starts emitting calls into spec code, extend this to also
+/// walk the SST body.
+fn write_krate_preamble(
+    out: &mut String,
+    krate: &KrateX,
+    imports: &[String],
+    crate_name: &str,
+    root_fns: &[&FunctionX],
+) -> String {
+    for imp in imports {
+        out.push_str("import ");
+        out.push_str(imp);
+        out.push('\n');
+    }
+    if !imports.is_empty() { out.push('\n'); }
+
+    out.push_str(TACTUS_PRELUDE);
+
+    let ns = sanitize_ident(crate_name);
+    out.push_str("namespace ");
+    out.push_str(&ns);
+    out.push('\n');
+
+    let all_fns: Vec<&FunctionX> = krate.functions.iter().map(|f| &f.x).collect();
+    let spec_fn_map = dep_order::build_spec_fn_map(&all_fns);
+    let refs = dep_order::collect_references(&spec_fn_map, root_fns);
+    let method_lookup: std::collections::HashMap<&Fun, &FunctionX> = all_fns.iter()
+        .map(|f| (&f.name, *f))
+        .collect();
+
+    for tr in &krate.traits {
+        if refs.traits.contains(short_name(&tr.x.name)) {
+            to_lean_fn::write_trait(out, &tr.x, &method_lookup);
+            out.push('\n');
+        }
+    }
+
+    for dt in &krate.datatypes {
+        if let Dt::Path(p) = &dt.x.name {
+            if refs.datatypes.contains(short_name(p)) {
+                to_lean_fn::write_datatype(out, &dt.x);
+                out.push('\n');
+            }
+        }
+    }
+
+    let groups = dep_order::order_spec_fns(&spec_fn_map, &all_fns, root_fns);
+    for group in &groups {
+        match group {
+            FnGroup::Single(f) => {
+                to_lean_fn::write_spec_fn(out, f);
+                out.push('\n');
+            }
+            FnGroup::Mutual(fns) => {
+                out.push_str("mutual\n");
+                for f in fns {
+                    to_lean_fn::write_spec_fn(out, f);
+                    out.push('\n');
+                }
+                out.push_str("end\n\n");
+            }
+        }
+    }
+
+    for ti in &krate.trait_impls {
+        if !refs.traits.contains(short_name(&ti.x.trait_path)) { continue; }
+        let method_impls: Vec<&FunctionX> = all_fns.iter()
+            .filter(|f| matches!(&f.kind, FunctionKind::TraitMethodImpl { impl_path, .. }
+                if impl_path == &ti.x.impl_path))
+            .copied()
+            .collect();
+        let assoc_types: Vec<&AssocTypeImplX> = krate.assoc_type_impls.iter()
+            .filter(|a| a.x.impl_path == ti.x.impl_path)
+            .map(|a| &a.x)
+            .collect();
+        if !method_impls.is_empty() || !assoc_types.is_empty() {
+            to_lean_fn::write_trait_impl(out, &ti.x, &method_impls, &assoc_types);
+            out.push('\n');
+        }
+    }
+
+    ns
 }
 
 /// Result of checking a proof fn through Lean.
@@ -120,92 +217,8 @@ fn generate_lean(
     crate_name: &str,
 ) -> LeanOutput {
     let mut out = String::new();
+    let ns = write_krate_preamble(&mut out, krate, imports, crate_name, &[proof_fn]);
 
-    // Imports before any commands (Lean requirement)
-    for imp in imports {
-        out.push_str("import ");
-        out.push_str(imp);
-        out.push('\n');
-    }
-    if !imports.is_empty() { out.push('\n'); }
-
-    out.push_str(TACTUS_PRELUDE);
-
-    // Wrap in namespace to avoid collisions with Lean builtins (Unit, Empty, etc.)
-    let ns = crate::to_lean_type::sanitize_ident(crate_name);
-    out.push_str("namespace ");
-    out.push_str(&ns);
-    out.push('\n');
-
-    let all_fns: Vec<&FunctionX> = krate.functions.iter().map(|f| &f.x).collect();
-    let spec_fn_map = dep_order::build_spec_fn_map(&all_fns);
-
-    // Collect all referenced entities (shares spec_fn_map with order_spec_fns)
-    let refs = dep_order::collect_references(&spec_fn_map, &[proof_fn]);
-
-    // Function lookup for trait class method signatures
-    let method_lookup: std::collections::HashMap<&Fun, &FunctionX> = all_fns.iter()
-        .map(|f| (&f.name, *f))
-        .collect();
-
-    // 1. Traits
-    for tr in &krate.traits {
-        if refs.traits.contains(short_name(&tr.x.name)) {
-            to_lean_fn::write_trait(&mut out, &tr.x, &method_lookup);
-            out.push('\n');
-        }
-    }
-
-    // 2. Datatypes
-    for dt in &krate.datatypes {
-        if let Dt::Path(p) = &dt.x.name {
-            if refs.datatypes.contains(short_name(p)) {
-                to_lean_fn::write_datatype(&mut out, &dt.x);
-                out.push('\n');
-            }
-        }
-    }
-
-    // 3. Spec fns (topologically sorted, with mutual recursion groups)
-    let groups = dep_order::order_spec_fns(&spec_fn_map, &all_fns, &[proof_fn]);
-    for group in &groups {
-        match group {
-            FnGroup::Single(f) => {
-                to_lean_fn::write_spec_fn(&mut out, f);
-                out.push('\n');
-            }
-            FnGroup::Mutual(fns) => {
-                out.push_str("mutual\n");
-                for f in fns {
-                    to_lean_fn::write_spec_fn(&mut out, f);
-                    out.push('\n');
-                }
-                out.push_str("end\n\n");
-            }
-        }
-    }
-
-    // 4. Trait impls (instances) — after spec fns so method bodies can reference them
-    for ti in &krate.trait_impls {
-        if !refs.traits.contains(short_name(&ti.x.trait_path)) {
-            continue;
-        }
-        let method_impls: Vec<&FunctionX> = all_fns.iter()
-            .filter(|f| matches!(&f.kind, FunctionKind::TraitMethodImpl { impl_path, .. }
-                if impl_path == &ti.x.impl_path))
-            .copied()
-            .collect();
-        let assoc_types: Vec<&AssocTypeImplX> = krate.assoc_type_impls.iter()
-            .filter(|a| a.x.impl_path == ti.x.impl_path)
-            .map(|a| &a.x)
-            .collect();
-        if !method_impls.is_empty() || !assoc_types.is_empty() {
-            to_lean_fn::write_trait_impl(&mut out, &ti.x, &method_impls, &assoc_types);
-            out.push('\n');
-        }
-    }
-
-    // 5. Proof fn theorem
     let tactic_start_line = to_lean_fn::write_proof_fn(&mut out, proof_fn, tactic_body);
     let source_map = to_lean_fn::LeanSourceMap {
         fn_name: short_name(&proof_fn.name.path).to_string(),
@@ -236,7 +249,7 @@ pub fn check_exec_fn(
     crate_name: &str,
 ) -> CheckResult {
     // Bail out clearly if the body has shapes we haven't implemented yet.
-    if let Err(reason) = sst_to_lean::supported_body(&check.body) {
+    if let Err(reason) = sst_to_lean::supported_body(check) {
         return CheckResult::Failed(format!(
             "tactus_auto: {} (first slice supports only straight-line exec fns)",
             reason
@@ -254,12 +267,20 @@ pub fn check_exec_fn(
     let lake_dir = if project::project_ready(&dir) { Some(dir.as_path()) } else { None };
     let result = lean_process::check_lean_file(&file_path, lake_dir);
 
+    // Empty source map — exec fns don't have a tactic body to map into yet.
+    // `format_error` gracefully handles zero-length tactic ranges.
+    let empty_source_map = to_lean_fn::LeanSourceMap {
+        fn_name: short_name(&vir_fn.name.path).to_string(),
+        tactic_start_line: 0,
+        tactic_line_count: 0,
+    };
+
     match result {
         Ok(r) if r.success => CheckResult::Success,
         Ok(r) => {
             let errors: Vec<_> = r.diagnostics.iter()
                 .filter(|d| d.severity == "error")
-                .map(|d| d.data.clone())
+                .map(|d| lean_process::format_error(d, &empty_source_map))
                 .collect();
             CheckResult::Failed(format!(
                 "Lean tactus_auto failed for {}:\n\n{}",
@@ -283,80 +304,9 @@ fn generate_lean_exec(
     crate_name: &str,
 ) -> String {
     let mut out = String::new();
+    let ns = write_krate_preamble(&mut out, krate, imports, crate_name, &[vir_fn]);
 
-    for imp in imports {
-        out.push_str("import ");
-        out.push_str(imp);
-        out.push('\n');
-    }
-    if !imports.is_empty() { out.push('\n'); }
-
-    out.push_str(TACTUS_PRELUDE);
-
-    let ns = crate::to_lean_type::sanitize_ident(crate_name);
-    out.push_str("namespace ");
-    out.push_str(&ns);
-    out.push('\n');
-
-    let all_fns: Vec<&FunctionX> = krate.functions.iter().map(|f| &f.x).collect();
-    let spec_fn_map = dep_order::build_spec_fn_map(&all_fns);
-    let refs = dep_order::collect_references(&spec_fn_map, &[vir_fn]);
-    let method_lookup: std::collections::HashMap<&Fun, &FunctionX> = all_fns.iter()
-        .map(|f| (&f.name, *f))
-        .collect();
-
-    for tr in &krate.traits {
-        if refs.traits.contains(short_name(&tr.x.name)) {
-            to_lean_fn::write_trait(&mut out, &tr.x, &method_lookup);
-            out.push('\n');
-        }
-    }
-
-    for dt in &krate.datatypes {
-        if let Dt::Path(p) = &dt.x.name {
-            if refs.datatypes.contains(short_name(p)) {
-                to_lean_fn::write_datatype(&mut out, &dt.x);
-                out.push('\n');
-            }
-        }
-    }
-
-    let groups = dep_order::order_spec_fns(&spec_fn_map, &all_fns, &[vir_fn]);
-    for group in &groups {
-        match group {
-            FnGroup::Single(f) => {
-                to_lean_fn::write_spec_fn(&mut out, f);
-                out.push('\n');
-            }
-            FnGroup::Mutual(fns) => {
-                out.push_str("mutual\n");
-                for f in fns {
-                    to_lean_fn::write_spec_fn(&mut out, f);
-                    out.push('\n');
-                }
-                out.push_str("end\n\n");
-            }
-        }
-    }
-
-    for ti in &krate.trait_impls {
-        if !refs.traits.contains(short_name(&ti.x.trait_path)) { continue; }
-        let method_impls: Vec<&FunctionX> = all_fns.iter()
-            .filter(|f| matches!(&f.kind, FunctionKind::TraitMethodImpl { impl_path, .. }
-                if impl_path == &ti.x.impl_path))
-            .copied()
-            .collect();
-        let assoc_types: Vec<&AssocTypeImplX> = krate.assoc_type_impls.iter()
-            .filter(|a| a.x.impl_path == ti.x.impl_path)
-            .map(|a| &a.x)
-            .collect();
-        if !method_impls.is_empty() || !assoc_types.is_empty() {
-            to_lean_fn::write_trait_impl(&mut out, &ti.x, &method_impls, &assoc_types);
-            out.push('\n');
-        }
-    }
-
-    let _line_count = sst_to_lean::write_exec_fn_theorem(&mut out, fn_sst, check);
+    sst_to_lean::write_exec_fn_theorem(&mut out, fn_sst, check);
     out.push('\n');
 
     out.push_str("end ");

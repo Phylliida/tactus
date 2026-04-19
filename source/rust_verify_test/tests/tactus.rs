@@ -1899,3 +1899,36 @@ test_verify_one_file! {
         assert!(err.errors.len() >= 1, "Expected error for wrong exec ensures");
     }
 }
+
+// Assert discharge: a body assert that holds under the requires should pass.
+// Catches the bug where Asserts were silently dropped.
+test_verify_one_file! {
+    #[test] test_exec_assert_holds verus_code! {
+        #[verifier::tactus_auto]
+        fn with_assert(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x
+        {
+            assert(x < 200);
+            x
+        }
+    } => Ok(())
+}
+
+// Assert discharge: a body assert that does NOT hold must be rejected.
+// Before the fix, this test would have passed (bug #1) because Asserts were
+// skipped in `supported_stmt`.
+test_verify_one_file! {
+    #[test] test_exec_assert_fails verus_code! {
+        #[verifier::tactus_auto]
+        fn with_false_assert(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x
+        {
+            assert(x < 50);  // fails when x is, e.g., 99
+            x
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "Expected error for false body assert");
+    }
+}

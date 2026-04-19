@@ -13,29 +13,12 @@
 
 use vir::ast::*;
 use vir::sst::{BndX, CallFun, Exp, ExpX};
+use crate::to_lean_common::{
+    binop_prec, binop_symbol, write_const,
+    PREC_ATOM, PREC_CMP, PREC_MUL,
+};
 use crate::to_lean_expr::write_name;
 use crate::to_lean_type::{write_typ, lean_name};
-
-// Precedence (same scheme as to_lean_expr)
-const PREC_IMPLIES: u8 = 25;
-const PREC_OR: u8 = 30;
-const PREC_AND: u8 = 35;
-const PREC_CMP: u8 = 50;
-const PREC_ADD: u8 = 65;
-const PREC_MUL: u8 = 70;
-const PREC_ATOM: u8 = 255;
-
-fn binop_prec(op: &BinaryOp) -> u8 {
-    match op {
-        BinaryOp::Implies => PREC_IMPLIES,
-        BinaryOp::Or => PREC_OR,
-        BinaryOp::And => PREC_AND,
-        BinaryOp::Eq(_) | BinaryOp::Ne | BinaryOp::Inequality(_) => PREC_CMP,
-        BinaryOp::Arith(ArithOp::Add(_) | ArithOp::Sub(_)) => PREC_ADD,
-        BinaryOp::Arith(ArithOp::Mul(_) | ArithOp::EuclideanDiv(_) | ArithOp::EuclideanMod(_)) => PREC_MUL,
-        _ => PREC_CMP,
-    }
-}
 
 fn expx_prec(e: &ExpX) -> u8 {
     match e {
@@ -92,7 +75,19 @@ pub fn write_sst_exp(out: &mut String, e: &Exp) {
             out.push('.');
             out.push_str(&field_opr.field);
         }
-        // Remaining UnaryOpr: transparent (HasType, IntegerTypeBound, etc.)
+        // Type propositions (HasType, IntegerTypeBound at spec mode) become
+        // `True` in Lean: the Verus integer type is already reflected in the
+        // Lean parameter type, so the proposition is trivially true. Without
+        // this case the previous fallthrough emitted the *argument* of the
+        // wrapper, turning `HasType(x+1, U8)` into the arithmetic expression
+        // `x+1` where a proposition was expected.
+        ExpX::UnaryOpr(UnaryOpr::HasType(_), _)
+        | ExpX::UnaryOpr(UnaryOpr::IntegerTypeBound(_, _), _) => {
+            out.push_str("True");
+        }
+        // IsVariant, CustomErr and other per-datatype checks: keep the
+        // transparent fallthrough (IsVariant is rendered explicitly via the
+        // `ExpX::Unary(Clip…)` path in practice; CustomErr is informational).
         ExpX::UnaryOpr(_, inner) => write_sst_exp(out, inner),
 
         ExpX::Binary(op, lhs, rhs) => {
@@ -222,56 +217,6 @@ fn write_prec(out: &mut String, e: &Exp, parent_prec: u8, is_left: bool) {
     if needs_parens { out.push(')'); }
 }
 
-fn write_const(out: &mut String, c: &Constant) {
-    match c {
-        Constant::Bool(true) => out.push_str("True"),
-        Constant::Bool(false) => out.push_str("False"),
-        Constant::Int(n) => {
-            let s = n.to_string();
-            if s.starts_with('-') {
-                out.push('('); out.push_str(&s); out.push(')');
-            } else {
-                out.push_str(&s);
-            }
-        }
-        Constant::StrSlice(s) => {
-            out.push('"');
-            for c in s.chars() {
-                match c {
-                    '"' => out.push_str("\\\""),
-                    '\\' => out.push_str("\\\\"),
-                    '\n' => out.push_str("\\n"),
-                    c => out.push(c),
-                }
-            }
-            out.push('"');
-        }
-        Constant::Char(c) => {
-            out.push('\'');
-            out.push(*c);
-            out.push('\'');
-        }
-        _ => panic!("sst_to_lean: constant {:?} unsupported in first slice", c),
-    }
-}
-
 fn write_binop(out: &mut String, op: &BinaryOp) {
-    out.push_str(match op {
-        BinaryOp::And => "∧",
-        BinaryOp::Or => "∨",
-        BinaryOp::Xor => "xor",
-        BinaryOp::Implies => "→",
-        BinaryOp::Eq(_) => "=",
-        BinaryOp::Ne => "≠",
-        BinaryOp::Inequality(InequalityOp::Le) => "≤",
-        BinaryOp::Inequality(InequalityOp::Lt) => "<",
-        BinaryOp::Inequality(InequalityOp::Ge) => "≥",
-        BinaryOp::Inequality(InequalityOp::Gt) => ">",
-        BinaryOp::Arith(ArithOp::Add(_)) => "+",
-        BinaryOp::Arith(ArithOp::Sub(_)) => "-",
-        BinaryOp::Arith(ArithOp::Mul(_)) => "*",
-        BinaryOp::Arith(ArithOp::EuclideanDiv(_)) => "/",
-        BinaryOp::Arith(ArithOp::EuclideanMod(_)) => "%",
-        _ => panic!("sst_to_lean: binop {:?} unsupported in first slice", op),
-    });
+    out.push_str(binop_symbol(op));
 }

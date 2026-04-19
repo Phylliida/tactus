@@ -119,14 +119,18 @@ pub(crate) fn lean_name(path: &Path) -> String {
 }
 
 pub(crate) fn needs_sanitization(s: &str) -> bool {
-    is_lean_keyword(s) || s.bytes().any(|b| b == b'@' || b == b'#')
+    is_lean_keyword(s) || s.bytes().any(|b| b == b'@' || b == b'#' || b == b'%')
 }
 
 pub(crate) fn sanitize_ident(s: &str) -> String {
     if is_lean_keyword(s) {
         format!("«{}»", s)
     } else {
-        s.chars().map(|c| match c { '@' | '#' => '_', _ => c }).collect()
+        // `%` appears in Verus-synthetic identifiers (e.g., `tmp%` from
+        // desugared `assert(P)`). `@`/`#` come from VIR's disambiguation
+        // suffixes. All three get squashed to `_` since Lean identifiers
+        // accept underscores.
+        s.chars().map(|c| match c { '@' | '#' | '%' => '_', _ => c }).collect()
     }
 }
 
