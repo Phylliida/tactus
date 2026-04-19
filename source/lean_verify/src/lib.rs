@@ -1,10 +1,11 @@
 pub mod dep_order;
 pub mod generate;
+pub mod lean_ast;
+pub mod lean_pp;
 pub mod lean_process;
 pub mod prelude;
 pub mod project;
 pub mod sst_to_lean;
-pub mod to_lean_common;
 pub mod to_lean_expr;
 pub mod to_lean_fn;
 pub mod to_lean_sst_expr;

@@ -1,95 +1,122 @@
 //! Translate VIR types to Lean 4 type syntax.
+//!
+//! `typ_to_expr` is the canonical API — it returns a `lean_ast::Expr` (in
+//! Lean, types are expressions). `write_typ` is a thin compatibility wrapper
+//! that pretty-prints into a `String` buffer; callers are gradually moving
+//! off it.
 
 use vir::ast::{Dt, IntRange, Path, TypX};
+use crate::lean_ast::{BinOp, Expr, ExprNode};
+use crate::lean_pp::pp_expr;
 
-/// Write a VIR type as Lean 4 syntax.
+/// Write a VIR type as Lean 4 syntax by way of the AST + pretty-printer.
+/// Preserved for callers that still emit into a shared `String` buffer.
 pub fn write_typ(out: &mut String, typ: &TypX) {
+    out.push_str(&pp_expr(&typ_to_expr(typ)));
+}
+
+/// Canonical VIR-type → Lean-AST translator.
+pub fn typ_to_expr(typ: &TypX) -> Expr {
+    Expr::new(typ_to_node(typ))
+}
+
+fn typ_to_node(typ: &TypX) -> ExprNode {
+    // Helper: build `App { head: Var(name), args }`.
+    let applied = |name: &str, args: Vec<Expr>| {
+        if args.is_empty() {
+            ExprNode::Var(name.to_string())
+        } else {
+            ExprNode::App {
+                head: Box::new(Expr::new(ExprNode::Var(name.to_string()))),
+                args,
+            }
+        }
+    };
     match typ {
-        TypX::Bool => out.push_str("Prop"),
-        TypX::Int(range) => out.push_str(match range {
-            IntRange::Int | IntRange::I(_) | IntRange::ISize => "Int",
-            IntRange::Nat | IntRange::U(_) | IntRange::USize | IntRange::Char => "Nat",
+        TypX::Bool => ExprNode::Var("Prop".into()),
+        TypX::Int(range) => ExprNode::Var(match range {
+            IntRange::Int | IntRange::I(_) | IntRange::ISize => "Int".into(),
+            IntRange::Nat | IntRange::U(_) | IntRange::USize | IntRange::Char => "Nat".into(),
         }),
-        TypX::TypParam(name) => out.push_str(name),
-        TypX::Boxed(inner) => write_typ(out, inner),
+        TypX::TypParam(name) => ExprNode::Var(name.to_string()),
+        TypX::Boxed(inner) => typ_to_node(inner),
         TypX::Datatype(dt, args, _) => {
-            match dt {
-                Dt::Path(path) => out.push_str(&lean_name(path)),
-                Dt::Tuple(n) => { out.push_str("Tuple"); out.push_str(&n.to_string()); }
-            }
-            for arg in args.iter() {
-                out.push(' ');
-                let needs_parens = matches!(&**arg, TypX::Datatype(_, a, _) if !a.is_empty());
-                if needs_parens { out.push('('); }
-                write_typ(out, arg);
-                if needs_parens { out.push(')'); }
-            }
+            let name = match dt {
+                Dt::Path(path) => lean_name(path),
+                Dt::Tuple(n) => format!("Tuple{}", n),
+            };
+            applied(&name, args.iter().map(|a| typ_to_expr(a)).collect())
         }
         TypX::SpecFn(params, ret) => {
-            for param in params.iter() {
-                write_typ(out, param);
-                out.push_str(" → ");
+            // Fold params right-to-left into nested → so the AST reflects
+            // Lean's right-associative arrow.
+            let mut out = typ_to_expr(ret);
+            for p in params.iter().rev() {
+                out = Expr::new(ExprNode::BinOp {
+                    op: BinOp::Implies,
+                    lhs: Box::new(typ_to_expr(p)),
+                    rhs: Box::new(out),
+                });
             }
-            write_typ(out, ret);
+            out.node
         }
-        // Decorations (references, etc.) are transparent in spec mode
-        TypX::Decorate(_, _, inner) => write_typ(out, inner),
+        TypX::Decorate(_, _, inner) => typ_to_node(inner),
         TypX::Projection { trait_typ_args, trait_path, name } => {
-            // <Self as Trait>::AssocType → Trait.AssocType Self
-            out.push_str(&lean_name(trait_path));
-            out.push('.');
-            out.push_str(name);
-            for typ in trait_typ_args.iter() {
-                out.push_str(" (");
-                write_typ(out, typ);
-                out.push(')');
-            }
+            // <Self as Trait>::AssocType → Trait.AssocType Self …
+            let head = format!("{}.{}", lean_name(trait_path), name);
+            applied(&head, trait_typ_args.iter().map(|t| typ_to_expr(t)).collect())
         }
         TypX::Primitive(prim, args) => {
-            out.push_str(match prim {
+            let head = match prim {
                 vir::ast::Primitive::Array => "Array",
                 vir::ast::Primitive::Slice => "List",
                 vir::ast::Primitive::StrSlice => "String",
-                vir::ast::Primitive::Ptr => "USize",   // opaque pointer, use Nat-sized
-                vir::ast::Primitive::Global => "Unit",  // global state, erased in spec
-            });
-            for arg in args.iter() {
-                out.push(' ');
-                write_typ(out, arg);
-            }
+                vir::ast::Primitive::Ptr => "USize",
+                vir::ast::Primitive::Global => "Unit",
+            };
+            applied(head, args.iter().map(|a| typ_to_expr(a)).collect())
         }
-        TypX::ConstInt(n) => out.push_str(&n.to_string()),
-        TypX::ConstBool(b) => out.push_str(if *b { "true" } else { "false" }),
-        TypX::Real => out.push_str("Real"),
-        TypX::Float(_) => out.push_str("Float"),
-        TypX::TypeId => out.push_str("Nat"),
-        // Function-as-value types: erase to a function type placeholder
+        TypX::ConstInt(n) => ExprNode::Lit(n.to_string()),
+        TypX::ConstBool(b) => ExprNode::Var(if *b { "true".into() } else { "false".into() }),
+        TypX::Real => ExprNode::Var("Real".into()),
+        TypX::Float(_) => ExprNode::Var("Float".into()),
+        TypX::TypeId => ExprNode::Var("Nat".into()),
         TypX::FnDef(_, typs, _) => {
-            // FnDef is a zero-sized type identifying a specific function.
-            // In spec mode, treat as Unit (the function is called by name, not by value).
-            if typs.is_empty() { out.push_str("Unit"); }
-            else {
-                out.push_str("(Unit");
-                for t in typs.iter() { out.push_str(" × "); write_typ(out, t); }
-                out.push(')');
+            // Zero-sized identifier type → Unit (possibly paired with extra
+            // type args for disambiguation).
+            if typs.is_empty() {
+                ExprNode::Var("Unit".into())
+            } else {
+                // `(Unit × T₁ × T₂ …)` — emitted as Raw since `×` is not in
+                // our BinOp set (no need to add it just for this one case).
+                let mut s = String::from("(Unit");
+                for t in typs.iter() {
+                    s.push_str(" × ");
+                    s.push_str(&pp_expr(&typ_to_expr(t)));
+                }
+                s.push(')');
+                ExprNode::Raw(s)
             }
         }
         TypX::AnonymousClosure(params, ret, _, _) => {
-            for p in params.iter() { write_typ(out, p); out.push_str(" → "); }
-            write_typ(out, ret);
+            let mut out = typ_to_expr(ret);
+            for p in params.iter().rev() {
+                out = Expr::new(ExprNode::BinOp {
+                    op: BinOp::Implies,
+                    lhs: Box::new(typ_to_expr(p)),
+                    rhs: Box::new(out),
+                });
+            }
+            out.node
         }
         TypX::Dyn(path, args, _) => {
-            out.push_str(&lean_name(path));
-            for arg in args.iter() { out.push(' '); write_typ(out, arg); }
+            applied(&lean_name(path), args.iter().map(|a| typ_to_expr(a)).collect())
         }
         TypX::Opaque { def_path, args } => {
-            out.push_str(&lean_name(def_path));
-            for arg in args.iter() { out.push(' '); write_typ(out, arg); }
+            applied(&lean_name(def_path), args.iter().map(|a| typ_to_expr(a)).collect())
         }
-        TypX::PointeeMetadata(_) => out.push_str("Nat"),
-        TypX::MutRef(inner) => write_typ(out, inner), // transparent in spec mode
-        // Air types are generated during sst_to_air (which Tactus skips).
-        // If one appears here, it's a bug in VIR pipeline ordering.
+        TypX::PointeeMetadata(_) => ExprNode::Var("Nat".into()),
+        TypX::MutRef(inner) => typ_to_node(inner),
         TypX::Air(_) => panic!("TypX::Air should not appear in Tactus translation"),
     }
 }
@@ -142,16 +169,6 @@ fn is_lean_keyword(s: &str) -> bool {
         | "forall" | "exists" | "Type" | "Prop" | "Sort" | "import" | "open"
         | "namespace" | "section" | "end" | "variable" | "universe"
     )
-}
-
-/// Write items separated by a delimiter.
-pub(crate) fn write_sep<T>(
-    out: &mut String, items: &[T], sep: &str, mut f: impl FnMut(&mut String, &T),
-) {
-    for (i, item) in items.iter().enumerate() {
-        if i > 0 { out.push_str(sep); }
-        f(out, item);
-    }
 }
 
 /// Walk a TypX recursively, calling `visit` at each node.

@@ -1,12 +1,20 @@
-//! Write individual VIR declarations as Lean 4 syntax.
+//! Translate VIR declarations to `lean_ast` commands and pp them.
 //!
-//! Each `write_*` function appends Lean text to a `String`.
-//! Orchestration (file layout, ordering, imports) is in `generate.rs`.
+//! Each `write_*` entry point builds a `lean_ast::Command` (or a `Vec` of
+//! them) and pretty-prints it into the caller's `String` buffer. The
+//! `*_to_ast` variants expose the command for callers that want to collect
+//! a whole krate and pp at the end.
 
 use std::collections::HashMap;
 use vir::ast::*;
-use crate::to_lean_expr::{write_expr, write_name};
-use crate::to_lean_type::{write_typ, short_name, write_sep, lean_name};
+use crate::lean_ast::{
+    Binder as LBinder, BinderKind, Class, ClassMethod, Command, Datatype,
+    DatatypeKind, Def, Expr as LExpr, ExprNode, Field, Instance, InstanceMethod,
+    Theorem, Tactic, Variant,
+};
+use crate::lean_pp::{pp_command, pp_expr};
+use crate::to_lean_expr::{sanitize, vir_expr_to_ast};
+use crate::to_lean_type::{lean_name, short_name, typ_to_expr};
 
 // ── Source map ──────────────────────────────────────────────────────────
 
@@ -32,151 +40,153 @@ impl LeanSourceMap {
 
 // ── Spec fn ─────────────────────────────────────────────────────────────
 
-/// Write a spec fn as `@[irreducible] noncomputable def`.
+/// Build a `Def` AST node for a spec fn.
+pub fn spec_fn_to_ast(f: &FunctionX) -> Def {
+    let attrs = if matches!(f.opaqueness, Opaqueness::Opaque) {
+        vec!["irreducible".into()]
+    } else {
+        vec![]
+    };
+    let body = match &f.body {
+        Some(b) => vir_expr_to_ast(b),
+        None => LExpr::new(ExprNode::Var("sorry".into())),
+    };
+    let termination_by = if f.decrease.is_empty() {
+        None
+    } else if f.decrease.len() == 1 {
+        Some(vir_expr_to_ast(&f.decrease[0]))
+    } else {
+        // Tuple of decreases expressions. AST has no tuple node; emit as Raw.
+        let parts: Vec<String> = f.decrease.iter()
+            .map(|d| pp_expr(&vir_expr_to_ast(d))).collect();
+        Some(LExpr::new(ExprNode::Raw(format!("({})", parts.join(", ")))))
+    };
+    Def {
+        attrs,
+        noncomputable: true,
+        name: lean_name(&f.name.path),
+        binders: fn_binders(f),
+        ret_ty: typ_to_expr(&f.ret.x.typ),
+        body,
+        termination_by,
+        span: None,
+    }
+}
+
 pub fn write_spec_fn(out: &mut String, f: &FunctionX) {
-    if matches!(f.opaqueness, Opaqueness::Opaque) {
-        out.push_str("@[irreducible] ");
-    }
-    out.push_str("noncomputable def ");
-    write_fn_name(out, &f.name);
-    write_fn_params(out, f);
-
-    out.push_str(" : ");
-    write_typ(out, &f.ret.x.typ);
-    out.push_str(" :=\n  ");
-
-    match &f.body {
-        Some(body) => write_expr(out, body),
-        None => out.push_str("sorry"),
-    }
-    out.push('\n');
-
-    if !f.decrease.is_empty() {
-        out.push_str("termination_by ");
-        if f.decrease.len() > 1 { out.push('('); }
-        write_sep(out, &*f.decrease, ", ", |out, d| write_expr(out, d));
-        if f.decrease.len() > 1 { out.push(')'); }
-        out.push('\n');
-    }
+    out.push_str(&pp_command(&Command::Def(spec_fn_to_ast(f))));
 }
 
 // ── Proof fn ────────────────────────────────────────────────────────────
 
-/// Write a proof fn as `theorem ... := by <tactics>`.
-/// Returns the 1-indexed line where the tactic body starts in the output.
-pub fn write_proof_fn(out: &mut String, f: &FunctionX, tactic_body: &str) -> usize {
-    out.push_str("theorem ");
-    write_fn_name(out, &f.name);
-    write_fn_params(out, f);
-
+/// Build a `Theorem` AST node for a proof fn with the given tactic text.
+pub fn proof_fn_to_ast(f: &FunctionX, tactic_body: &str) -> Theorem {
+    let mut binders = fn_binders(f);
     for (i, req) in f.require.iter().enumerate() {
-        out.push_str(" (h");
-        // Avoid allocation: write digit directly for common case (< 10 hypotheses)
-        if i < 10 { out.push((b'0' + i as u8) as char); }
-        else { out.push_str(&i.to_string()); }
-        out.push_str(" : ");
-        write_expr(out, req);
-        out.push(')');
+        binders.push(LBinder {
+            name: Some(format!("h{}", i)),
+            ty: vir_expr_to_ast(req),
+            kind: BinderKind::Explicit,
+        });
     }
-
-    out.push_str(" :\n    ");
-    write_ensures(out, &f.ensure.0);
-    out.push_str(" := by\n");
-
-    // Record where tactic body starts (1-indexed line number)
-    let tactic_start_line = out.chars().filter(|&c| c == '\n').count() + 1;
-
-    for line in tactic_body.lines() {
-        if line.trim().is_empty() {
-            out.push('\n');
-        } else {
-            out.push_str("  ");
-            out.push_str(line);
-            out.push('\n');
-        }
+    let goal = ensures_conj(&f.ensure.0);
+    Theorem {
+        name: lean_name(&f.name.path),
+        binders,
+        goal,
+        tactic: Tactic::Raw(tactic_body.to_string()),
+        span: None,
     }
+}
 
+/// Write a proof fn as a Lean theorem and return the 1-indexed line where
+/// the tactic body starts in the accumulated output — callers use this to
+/// build a `LeanSourceMap`.
+pub fn write_proof_fn(out: &mut String, f: &FunctionX, tactic_body: &str) -> usize {
+    let t = proof_fn_to_ast(f, tactic_body);
+    let rendered = pp_command(&Command::Theorem(t));
+    // The pp format guarantees one `:= by\n` marker in the theorem; count
+    // newlines in `out` through (and including) that marker to get the
+    // 1-indexed line where the tactic body begins.
+    let tail_start = rendered.find(":= by\n").expect("theorem without `:= by`");
+    let newlines_before = out.chars().filter(|&c| c == '\n').count();
+    let newlines_in_prefix = rendered[..tail_start + ":= by\n".len()]
+        .chars().filter(|&c| c == '\n').count();
+    let tactic_start_line = newlines_before + newlines_in_prefix + 1;
+    out.push_str(&rendered);
     tactic_start_line
 }
 
 // ── Datatype ────────────────────────────────────────────────────────────
 
-/// Write a VIR datatype as a Lean `structure` (1 variant) or `inductive` (multiple).
-pub fn write_datatype(out: &mut String, dt: &DatatypeX) {
+pub fn datatype_to_ast(dt: &DatatypeX) -> Option<Datatype> {
     let (path, short) = match &dt.name {
-        Dt::Path(p) => (lean_name(p), short_name(p)),
-        Dt::Tuple(_) => return,
+        Dt::Path(p) => (lean_name(p), short_name(p).to_string()),
+        Dt::Tuple(_) => return None,
     };
+    let typ_params: Vec<String> = dt.typ_params.iter()
+        .map(|(id, _)| id.to_string())
+        .collect();
 
-    if dt.variants.len() == 1 && dt.variants[0].name.as_str() == short {
+    let kind = if dt.variants.len() == 1 && dt.variants[0].name.as_str() == short {
         let variant = &dt.variants[0];
-        out.push_str("structure ");
-        out.push_str(&path);
-        write_datatype_typ_params(out, dt);
-        out.push_str(" where\n");
-        for field in variant.fields.iter() {
-            let (typ, _, _) = &field.a;
-            out.push_str("  ");
-            write_field_name(out, &field.name);
-            out.push_str(" : ");
-            write_typ(out, typ);
-            out.push('\n');
+        DatatypeKind::Structure {
+            fields: variant.fields.iter().map(|f| Field {
+                name: field_name(&f.name),
+                ty: typ_to_expr(&f.a.0),
+            }).collect(),
         }
     } else {
-        out.push_str("inductive ");
-        out.push_str(&path);
-        write_datatype_typ_params(out, dt);
-        out.push_str(" where\n");
-        for variant in dt.variants.iter() {
-            out.push_str("  | ");
-            write_name(out, &variant.name);
-            for field in variant.fields.iter() {
-                let (typ, _, _) = &field.a;
-                out.push_str(" (");
-                write_field_name(out, &field.name);
-                out.push_str(" : ");
-                write_typ(out, typ);
-                out.push(')');
-            }
-            out.push('\n');
+        DatatypeKind::Inductive {
+            variants: dt.variants.iter().map(|v| Variant {
+                name: sanitize(&v.name),
+                fields: v.fields.iter().map(|f| Field {
+                    name: field_name(&f.name),
+                    ty: typ_to_expr(&f.a.0),
+                }).collect(),
+            }).collect(),
         }
+    };
+    Some(Datatype { name: path, typ_params, kind, span: None })
+}
+
+pub fn write_datatype(out: &mut String, dt: &DatatypeX) {
+    if let Some(d) = datatype_to_ast(dt) {
+        out.push_str(&pp_command(&Command::Datatype(d)));
     }
 }
 
-// ── Trait ────────────────────────────────────────────────────────────────
+// ── Trait (Lean `class`) ───────────────────────────────────────────────
 
-/// Write a VIR trait as a Lean `class`.
-pub fn write_trait(
-    out: &mut String,
+pub fn trait_to_ast(
     tr: &TraitX,
     method_lookup: &HashMap<&Fun, &FunctionX>,
-) {
-    let name = lean_name(&tr.name);
-
-    out.push_str("class ");
-    out.push_str(&name);
-    out.push_str(" (Self : Type)");
+) -> Class {
+    // Positional class binders: `(Self : Type) (T : Type) … (Item : outParam Type)`.
+    let mut typ_params: Vec<LBinder> = Vec::new();
+    typ_params.push(LBinder {
+        name: Some("Self".into()),
+        ty: LExpr::new(ExprNode::Var("Type".into())),
+        kind: BinderKind::Explicit,
+    });
     for (tp, _) in tr.typ_params.iter() {
-        out.push_str(" (");
-        out.push_str(tp);
-        out.push_str(" : Type)");
+        typ_params.push(LBinder {
+            name: Some(tp.to_string()),
+            ty: LExpr::new(ExprNode::Var("Type".into())),
+            kind: BinderKind::Explicit,
+        });
     }
-    // Associated types as outParam — Lean knows they're uniquely determined by Self,
-    // so instance synthesis resolves them automatically (no return type annotations needed).
     for assoc_name in tr.assoc_typs.iter() {
-        out.push_str(" (");
-        write_name(out, assoc_name);
-        out.push_str(" : outParam Type)");
+        typ_params.push(LBinder {
+            name: Some(sanitize(assoc_name)),
+            ty: LExpr::new(ExprNode::Var("Type".into())),
+            kind: BinderKind::OutParam,
+        });
     }
-    write_trait_bounds(out, &tr.typ_bounds);
-    out.push_str(" where\n");
 
-    for method_fun in tr.methods.iter() {
-        let method_name = method_fun.path.segments.last()
-            .map(|s| s.as_str()).unwrap_or("_");
-        out.push_str("  ");
-        write_name(out, method_name);
-        out.push_str(" : ");
+    let bounds = trait_bounds_to_ast(&tr.typ_bounds);
+
+    let methods = tr.methods.iter().map(|method_fun| {
         let func = method_lookup.get(method_fun).unwrap_or_else(|| {
             panic!(
                 "trait method {:?} not found in VIR function list — \
@@ -184,134 +194,155 @@ pub fn write_trait(
                 method_fun.path
             )
         });
-        write_method_type(out, func);
-        out.push('\n');
+        let short = method_fun.path.segments.last()
+            .map(|s| s.as_str()).unwrap_or("_");
+        ClassMethod {
+            name: sanitize(short),
+            ty: method_type(func),
+        }
+    }).collect();
+
+    Class {
+        name: lean_name(&tr.name),
+        typ_params,
+        bounds,
+        methods,
+        span: None,
     }
 }
 
-/// Write method type: `Self → ParamType → ... → RetType`.
-/// Inside a class definition, `Self::Item` projections are written as bare `Item`
-/// since associated types are type params on the class.
-fn write_method_type(out: &mut String, func: &FunctionX) {
-    let write_method_typ = |out: &mut String, typ: &TypX| {
-        if let TypX::Projection { name, .. } = typ {
-            write_name(out, name);
+pub fn write_trait(
+    out: &mut String,
+    tr: &TraitX,
+    method_lookup: &HashMap<&Fun, &FunctionX>,
+) {
+    out.push_str(&pp_command(&Command::Class(trait_to_ast(tr, method_lookup))));
+}
+
+/// Build the method type `Self → P₁ → … → Ret`. Inside a class, associated
+/// types become unqualified identifiers (they're class type params), so a
+/// `TypX::Projection { name, … }` renders as just the projection name.
+fn method_type(func: &FunctionX) -> LExpr {
+    let param_type = |p: &vir::ast::Param| -> LExpr {
+        if p.x.name.0.as_str() == "self" {
+            LExpr::new(ExprNode::Var("Self".into()))
         } else {
-            write_typ(out, typ);
+            typ_maybe_projection_to_expr(&p.x.typ)
         }
     };
-    for (i, p) in func.params.iter().enumerate() {
-        if i > 0 { out.push_str(" → "); }
-        if p.x.name.0.as_str() == "self" {
-            out.push_str("Self");
-        } else {
-            write_method_typ(out, &p.x.typ);
-        }
+
+    // Fold right-to-left into nested `→`. For zero params, the "arrow
+    // chain" is just the return type.
+    let mut out = typ_maybe_projection_to_expr(&func.ret.x.typ);
+    for p in func.params.iter().rev() {
+        out = LExpr::new(ExprNode::BinOp {
+            op: crate::lean_ast::BinOp::Implies,
+            lhs: Box::new(param_type(p)),
+            rhs: Box::new(out),
+        });
     }
-    if !func.params.is_empty() { out.push_str(" → "); }
-    write_method_typ(out, &func.ret.x.typ);
+    out
 }
 
-// ── Trait impl ─────────────────────────────────────────────────────────
+/// Inside a class definition, a `Self::AssocType` projection renders as the
+/// bare associated-type name (a class type param). Everywhere else, delegate
+/// to the standard type translator.
+fn typ_maybe_projection_to_expr(typ: &TypX) -> LExpr {
+    if let TypX::Projection { name, .. } = typ {
+        LExpr::new(ExprNode::Var(sanitize(name)))
+    } else {
+        typ_to_expr(typ)
+    }
+}
 
-/// Write a trait impl as a Lean `instance`.
-///
-/// ```lean
-/// noncomputable instance {T : Type} : HasValue (Container T) where
-///   value := fun self => self.inner
-///   Output := Int
-/// ```
+// ── Trait impl (Lean `instance`) ───────────────────────────────────────
+
+pub fn trait_impl_to_ast(
+    ti: &TraitImplX,
+    method_impls: &[&FunctionX],
+    assoc_types: &[&AssocTypeImplX],
+) -> Instance {
+    let mut binders: Vec<LBinder> = Vec::new();
+    for tp in ti.typ_params.iter() {
+        binders.push(LBinder {
+            name: Some(tp.to_string()),
+            ty: LExpr::new(ExprNode::Var("Type".into())),
+            kind: BinderKind::Implicit,
+        });
+    }
+    binders.extend(trait_bounds_to_ast(&ti.typ_bounds));
+
+    // Build `TraitName arg1 arg2 …` — trait_typ_args are the positional
+    // trait type arguments (Self + extras); assoc_types fill the outParam
+    // slots declared by the class.
+    let mut target_args: Vec<LExpr> = Vec::new();
+    for t in ti.trait_typ_args.iter() { target_args.push(typ_to_expr(t)); }
+    for a in assoc_types { target_args.push(typ_to_expr(&a.typ)); }
+    let target = if target_args.is_empty() {
+        LExpr::new(ExprNode::Var(lean_name(&ti.trait_path)))
+    } else {
+        LExpr::new(ExprNode::App {
+            head: Box::new(LExpr::new(ExprNode::Var(lean_name(&ti.trait_path)))),
+            args: target_args,
+        })
+    };
+
+    let methods = method_impls.iter().map(|func| {
+        let short = func.name.path.segments.last()
+            .map(|s| s.as_str()).unwrap_or("_");
+        // If the method has params, wrap body in `fun p1 p2 … => body`.
+        let body = match &func.body {
+            Some(b) => {
+                let ast_body = vir_expr_to_ast(b);
+                if func.params.is_empty() {
+                    ast_body
+                } else {
+                    let binders: Vec<LBinder> = func.params.iter().map(|p| LBinder {
+                        name: Some(sanitize(p.x.name.0.as_str())),
+                        // Type irrelevant here (Lean infers from the class),
+                        // but we need a valid Expr; use `_` placeholder.
+                        ty: LExpr::new(ExprNode::Var("_".into())),
+                        kind: BinderKind::Explicit,
+                    }).collect();
+                    // We actually want `fun p1 p2 => body` without type
+                    // annotations. The AST Lambda requires typed binders, so
+                    // we render as Raw for brevity.
+                    let params: Vec<String> = func.params.iter()
+                        .map(|p| sanitize(p.x.name.0.as_str())).collect();
+                    let body_txt = pp_expr(&ast_body);
+                    let _ = binders; // keep-warn-suppress placeholder unused
+                    LExpr::new(ExprNode::Raw(
+                        format!("fun {} => {}", params.join(" "), body_txt)
+                    ))
+                }
+            }
+            None => LExpr::new(ExprNode::Var("sorry".into())),
+        };
+        InstanceMethod { name: sanitize(short), body }
+    }).collect();
+
+    Instance { binders, target, methods, span: None }
+}
+
 pub fn write_trait_impl(
     out: &mut String,
     ti: &TraitImplX,
     method_impls: &[&FunctionX],
     assoc_types: &[&AssocTypeImplX],
 ) {
-    out.push_str("noncomputable instance");
-
-    // Generic type params as implicit bindings: {T : Type} {U : Type}
-    for tp in ti.typ_params.iter() {
-        out.push_str(" {");
-        out.push_str(tp);
-        out.push_str(" : Type}");
-    }
-    // Trait bounds on type params: [TraitName T]
-    write_trait_bounds(out, &ti.typ_bounds);
-
-    out.push_str(" : ");
-    out.push_str(&lean_name(&ti.trait_path));
-
-    // Type arguments: first is Self type, rest are trait type params
-    for typ in ti.trait_typ_args.iter() {
-        out.push_str(" (");
-        write_typ(out, typ);
-        out.push(')');
-    }
-    // Associated type values as type arguments (matching class type params)
-    for at_ in assoc_types {
-        out.push_str(" (");
-        write_typ(out, &at_.typ);
-        out.push(')');
-    }
-    out.push_str(" where\n");
-
-    // Method implementations
-    for func in method_impls {
-        let method_name = func.name.path.segments.last()
-            .map(|s| s.as_str()).unwrap_or("_");
-        out.push_str("  ");
-        write_name(out, method_name);
-        out.push_str(" := ");
-
-        // Write as lambda: fun param1 param2 => body
-        if !func.params.is_empty() {
-            out.push_str("fun");
-            for p in func.params.iter() {
-                out.push(' ');
-                write_name(out, p.x.name.0.as_str());
-            }
-            out.push_str(" => ");
-        }
-        match &func.body {
-            Some(body) => write_expr(out, body),
-            None => out.push_str("sorry"),
-        }
-        out.push('\n');
-    }
+    out.push_str(&pp_command(&Command::Instance(
+        trait_impl_to_ast(ti, method_impls, assoc_types)
+    )));
 }
 
 // ── Shared helpers ──────────────────────────────────────────────────────
 
-/// Write trait bounds as Lean instance params: `[TraitName T1 T2]`.
-fn write_trait_bounds(out: &mut String, bounds: &GenericBounds) {
-    // For each Trait bound, merge in any TypEquality bounds for the same trait.
-    // VIR emits both Trait(Producer, [T]) and TypEquality(Producer, [T], "Item", Int)
-    // for `T: Producer<Item = int>`. We merge them into `[Producer T Int]`.
-    for bound in bounds.iter() {
-        if let GenericBoundX::Trait(TraitId::Path(path), typs) = &**bound {
-            out.push_str(" [");
-            out.push_str(&lean_name(path));
-            for t in typs.iter() {
-                out.push(' ');
-                write_typ(out, t);
-            }
-            // Append associated type values from matching TypEquality bounds
-            for other in bounds.iter() {
-                if let GenericBoundX::TypEquality(eq_path, _, _, typ) = &**other {
-                    if lean_name(eq_path) == lean_name(path) {
-                        out.push(' ');
-                        write_typ(out, typ);
-                    }
-                }
-            }
-            out.push(']');
-        }
-    }
-}
+/// Function parameter list as AST binders: type params, trait bounds,
+/// then value params. Const generics become explicit `(N : ConstType)`
+/// instead of `(N : Type)`.
+fn fn_binders(f: &FunctionX) -> Vec<LBinder> {
+    let mut out: Vec<LBinder> = Vec::new();
 
-/// Write type params, trait bounds, and value params.
-fn write_fn_params(out: &mut String, f: &FunctionX) {
-    // Check which type params are const generics (have ConstTyp bounds)
     let const_typ_for = |name: &str| -> Option<&TypX> {
         for bound in f.typ_bounds.iter() {
             if let GenericBoundX::ConstTyp(param_typ, val_typ) = &**bound {
@@ -322,52 +353,81 @@ fn write_fn_params(out: &mut String, f: &FunctionX) {
         }
         None
     };
+
     for tp in f.typ_params.iter() {
-        out.push_str(" (");
-        out.push_str(tp);
-        if let Some(val_typ) = const_typ_for(tp) {
-            out.push_str(" : ");
-            write_typ(out, val_typ);
-            out.push(')');
+        let ty = if let Some(val_typ) = const_typ_for(tp) {
+            typ_to_expr(val_typ)
         } else {
-            out.push_str(" : Type)");
+            LExpr::new(ExprNode::Var("Type".into()))
+        };
+        out.push(LBinder {
+            name: Some(tp.to_string()),
+            ty,
+            kind: BinderKind::Explicit,
+        });
+    }
+
+    out.extend(trait_bounds_to_ast(&f.typ_bounds));
+
+    for p in f.params.iter() {
+        out.push(LBinder {
+            name: Some(sanitize(&p.x.name.0)),
+            ty: typ_to_expr(&p.x.typ),
+            kind: BinderKind::Explicit,
+        });
+    }
+
+    out
+}
+
+/// Generic bounds → Lean `[Trait T₁ T₂ …]` instance binders, with any
+/// matching `TypEquality` bounds merged in as extra type arguments.
+fn trait_bounds_to_ast(bounds: &GenericBounds) -> Vec<LBinder> {
+    let mut out = Vec::new();
+    for bound in bounds.iter() {
+        if let GenericBoundX::Trait(TraitId::Path(path), typs) = &**bound {
+            let mut args: Vec<LExpr> = typs.iter().map(|t| typ_to_expr(t)).collect();
+            for other in bounds.iter() {
+                if let GenericBoundX::TypEquality(eq_path, _, _, typ) = &**other {
+                    if lean_name(eq_path) == lean_name(path) {
+                        args.push(typ_to_expr(typ));
+                    }
+                }
+            }
+            let target = LExpr::new(ExprNode::App {
+                head: Box::new(LExpr::new(ExprNode::Var(lean_name(path)))),
+                args,
+            });
+            out.push(LBinder { name: None, ty: target, kind: BinderKind::Instance });
         }
     }
-    write_trait_bounds(out, &f.typ_bounds);
-    for p in f.params.iter() {
-        out.push_str(" (");
-        write_name(out, &p.x.name.0);
-        out.push_str(" : ");
-        write_typ(out, &p.x.typ);
-        out.push(')');
-    }
+    out
 }
 
-fn write_ensures(out: &mut String, ensures: &[Expr]) {
+/// Conjoin a list of ensures clauses into a single `Expr`. Empty → `True`.
+fn ensures_conj(ensures: &[Expr]) -> LExpr {
     if ensures.is_empty() {
-        out.push_str("True");
-    } else {
-        write_sep(out, ensures, " ∧ ", |out, e| write_expr(out, e));
+        return LExpr::new(ExprNode::LitBool(true));
     }
+    let mut iter = ensures.iter().rev();
+    let mut acc = vir_expr_to_ast(iter.next().unwrap());
+    for e in iter {
+        acc = LExpr::new(ExprNode::BinOp {
+            op: crate::lean_ast::BinOp::And,
+            // Note: `∧` is right-associative in Lean. To match left-to-right
+            // ordering of ensures clauses we fold right-to-left (first ens
+            // ends up leftmost).
+            lhs: Box::new(vir_expr_to_ast(e)),
+            rhs: Box::new(acc),
+        });
+    }
+    acc
 }
 
-fn write_datatype_typ_params(out: &mut String, dt: &DatatypeX) {
-    for (id, _) in dt.typ_params.iter() {
-        out.push_str(" (");
-        out.push_str(id);
-        out.push_str(" : Type)");
-    }
-}
-
-fn write_field_name(out: &mut String, name: &str) {
+fn field_name(name: &str) -> String {
     if name.parse::<usize>().is_ok() {
-        out.push_str("val");
-        out.push_str(name);
+        format!("val{}", name)
     } else {
-        write_name(out, name);
+        sanitize(name)
     }
-}
-
-fn write_fn_name(out: &mut String, fun: &Fun) {
-    out.push_str(&lean_name(&fun.path));
 }

@@ -1,55 +1,100 @@
-//! Translate VIR expressions to Lean 4 expression syntax.
+//! Translate VIR-AST expressions to Lean 4 via `lean_ast`.
+//!
+//! `vir_expr_to_ast` is the canonical builder. `write_expr` is kept as a
+//! compatibility wrapper that pretty-prints the AST into a shared `String`
+//! buffer — callers are being migrated off it as they move to building
+//! `lean_ast::Command`s directly.
 
 use vir::ast::*;
-use crate::to_lean_common::{
-    binop_prec, binop_symbol, write_const,
-    PREC_ATOM, PREC_CMP, PREC_MUL,
+use crate::lean_ast::{
+    BinOp as L, Binder as LBinder, BinderKind, Expr as LExpr,
+    ExprNode, MatchArm as LMatchArm, Pattern as LPattern, UnOp as LUn,
 };
-use crate::to_lean_type::{write_typ, short_name, lean_name};
+use crate::lean_pp::pp_expr;
+use crate::to_lean_type::{lean_name, sanitize_ident, short_name, typ_to_expr, needs_sanitization};
 
-fn expr_prec(expr: &ExprX) -> u8 {
-    match expr {
-        ExprX::Const(_) | ExprX::Var(_) | ExprX::ConstVar(..) => PREC_ATOM,
-        // A call with args (e.g., `f x`) is NOT atomic — it needs parens when
-        // used as an argument to another call: `g (f x)` not `g f x`.
-        ExprX::Call(_, args, _) => if args.is_empty() { PREC_ATOM } else { 0 },
-        ExprX::Binary(op, _, _) => binop_prec(op),
-        ExprX::Unary(..) => PREC_MUL + 1,
-        _ => 0,
+// ── Public API ──────────────────────────────────────────────────────────
+
+/// Build a `lean_ast::Expr` from a VIR-AST expression.
+pub fn vir_expr_to_ast(expr: &Expr) -> LExpr {
+    LExpr::new(expr_to_node(expr))
+}
+
+/// Back-compat: emit a VIR expression as Lean text into `out`. New code
+/// should call `vir_expr_to_ast` and embed the result in a larger AST.
+pub fn write_expr(out: &mut String, expr: &Expr) {
+    out.push_str(&pp_expr(&vir_expr_to_ast(expr)));
+}
+
+/// Build `VarBinders<Typ>` → AST binders for proof/spec fn parameters.
+/// Each becomes an explicit `(name : Type)` binder.
+pub(crate) fn vir_var_binders_to_ast(binders: &VarBinders<Typ>) -> Vec<LBinder> {
+    binders.iter().map(|b| LBinder {
+        name: Some(sanitize(b.name.0.as_str())),
+        ty: typ_to_expr(&b.a),
+        kind: BinderKind::Explicit,
+    }).collect()
+}
+
+/// Shared sanitizer — used by every caller that emits an identifier.
+pub(crate) fn sanitize(s: &str) -> String {
+    if needs_sanitization(s) { sanitize_ident(s) } else { s.to_string() }
+}
+
+// ── Internal: build ExprNode ────────────────────────────────────────────
+
+fn boxed(n: ExprNode) -> Box<LExpr> {
+    Box::new(LExpr::new(n))
+}
+
+fn var(name: impl Into<String>) -> LExpr {
+    LExpr::new(ExprNode::Var(name.into()))
+}
+
+fn apply(head: &str, args: Vec<LExpr>) -> ExprNode {
+    if args.is_empty() {
+        ExprNode::Var(head.to_string())
+    } else {
+        ExprNode::App { head: Box::new(var(head)), args }
     }
 }
 
-/// Write a VIR expression as Lean 4 syntax.
-/// Takes the full `Expr` (not just `ExprX`) to access type information.
-pub fn write_expr(out: &mut String, expr: &Expr) {
+fn expr_to_node(expr: &Expr) -> ExprNode {
     match &expr.x {
-        ExprX::Const(c) => write_const(out, c),
-        ExprX::Var(ident) => write_name(out, &ident.0),
-        ExprX::ConstVar(fun, _) => write_fn_ref(out, fun),
+        ExprX::Const(c) => const_to_node(c),
+        ExprX::Var(ident) => ExprNode::Var(sanitize(&ident.0)),
+        ExprX::VarAt(ident, _) => ExprNode::Var(sanitize(&ident.0)),
+        ExprX::VarLoc(ident) => ExprNode::Var(sanitize(&ident.0)),
+        ExprX::ConstVar(fun, _) => ExprNode::Var(lean_name(&fun.path)),
+        ExprX::StaticVar(fun) | ExprX::ExecFnByName(fun) => ExprNode::Var(lean_name(&fun.path)),
 
-        ExprX::Binary(op, lhs, rhs) => {
-            let p = binop_prec(op);
-            write_expr_prec(out, lhs, p, true);
-            out.push(' ');
-            write_binop(out, op);
-            out.push(' ');
-            write_expr_prec(out, rhs, p, false);
-        }
+        ExprX::Binary(op, lhs, rhs) => match binop_to_ast(op) {
+            Some(l_op) => ExprNode::BinOp {
+                op: l_op,
+                lhs: Box::new(vir_expr_to_ast(lhs)),
+                rhs: Box::new(vir_expr_to_ast(rhs)),
+            },
+            // Operators we don't model as BinOp — emit the Lean text via
+            // a function application, preserving precedence under `App`.
+            None => ExprNode::Raw(format!(
+                "{} {} {}",
+                pp_expr(&vir_expr_to_ast(lhs)),
+                raw_binop_symbol(op),
+                pp_expr(&vir_expr_to_ast(rhs)),
+            )),
+        },
 
-        ExprX::BinaryOpr(BinaryOpr::ExtEq(_, _), lhs, rhs) => {
-            write_expr_prec(out, lhs, PREC_CMP, true);
-            out.push_str(" = ");
-            write_expr_prec(out, rhs, PREC_CMP, false);
-        }
+        ExprX::BinaryOpr(BinaryOpr::ExtEq(_, _), lhs, rhs) => ExprNode::BinOp {
+            op: L::Eq,
+            lhs: Box::new(vir_expr_to_ast(lhs)),
+            rhs: Box::new(vir_expr_to_ast(rhs)),
+        },
 
-        ExprX::Unary(UnaryOp::Not, inner) => {
-            out.push('¬');
-            write_expr_prec(out, inner, PREC_ATOM, true);
-        }
-
+        ExprX::Unary(UnaryOp::Not, inner) => ExprNode::UnOp {
+            op: LUn::Not,
+            arg: Box::new(vir_expr_to_ast(inner)),
+        },
         ExprX::Unary(UnaryOp::Clip { range, .. }, inner) => {
-            // Int → Nat needs explicit conversion; all other clips are identity
-            // (Nat → Int is implicit in Lean, same-family clips are no-ops)
             let src_is_int = matches!(&*inner.typ, TypX::Int(
                 IntRange::Int | IntRange::I(_) | IntRange::ISize
             ));
@@ -57,235 +102,147 @@ pub fn write_expr(out: &mut String, expr: &Expr) {
                 IntRange::Nat | IntRange::U(_) | IntRange::USize | IntRange::Char
             );
             if src_is_int && dst_is_nat {
-                out.push_str("Int.toNat ");
-                write_expr_prec(out, inner, PREC_ATOM, true);
+                apply("Int.toNat", vec![vir_expr_to_ast(inner)])
             } else {
-                write_expr(out, inner);
+                expr_to_node(inner)
             }
         }
-
-        // Transparent unary ops
         ExprX::Unary(UnaryOp::CoerceMode { .. }, inner)
-        | ExprX::Unary(UnaryOp::Trigger(_), inner) => write_expr(out, inner),
+        | ExprX::Unary(UnaryOp::Trigger(_), inner) => expr_to_node(inner),
 
-        ExprX::Unary(UnaryOp::BitNot(_), inner) => {
-            out.push_str("Complement.complement ");
-            write_expr_prec(out, inner, PREC_ATOM, true);
-        }
-        ExprX::Unary(UnaryOp::IntToReal, inner) => {
-            out.push('(');
-            write_expr(out, inner);
-            out.push_str(" : Real)");
-        }
-        ExprX::Unary(UnaryOp::RealToInt, inner) => {
-            out.push_str("Int.floor ");
-            write_expr_prec(out, inner, PREC_ATOM, true);
-        }
-        ExprX::Unary(UnaryOp::FloatToBits, inner) => write_expr(out, inner),
-        ExprX::Unary(UnaryOp::IeeeFloat(_), inner) => write_expr(out, inner),
-        // Remaining unary ops: transparent (annotations, markers, internal ops)
-        ExprX::Unary(_, inner) => write_expr(out, inner),
+        ExprX::Unary(UnaryOp::BitNot(_), inner) => apply(
+            "Complement.complement",
+            vec![vir_expr_to_ast(inner)],
+        ),
+        ExprX::Unary(UnaryOp::IntToReal, inner) => ExprNode::TypeAnnot {
+            expr: Box::new(vir_expr_to_ast(inner)),
+            ty: Box::new(var("Real")),
+        },
+        ExprX::Unary(UnaryOp::RealToInt, inner) => apply(
+            "Int.floor",
+            vec![vir_expr_to_ast(inner)],
+        ),
+        ExprX::Unary(UnaryOp::FloatToBits, inner) => expr_to_node(inner),
+        ExprX::Unary(UnaryOp::IeeeFloat(_), inner) => expr_to_node(inner),
+        // Remaining unary ops: transparent annotations/markers/internal ops.
+        ExprX::Unary(_, inner) => expr_to_node(inner),
 
-        ExprX::Call(target, args, _) => {
-            match target {
-                CallTarget::Fun(kind, fun, typs, _, _, _) => {
-                    match kind {
-                        CallTargetKind::DynamicResolved { resolved, .. } => {
-                            write_fn_ref(out, resolved);
-                            // Resolved impls don't need type args (concrete types)
-                        }
-                        CallTargetKind::Dynamic => {
-                            write_trait_method_ref(out, fun);
-                        }
-                        _ => {
-                            write_fn_ref(out, fun);
-                            // Emit explicit type arguments for generic calls
-                            for typ in typs.iter() {
-                                out.push_str(" (");
-                                write_typ(out, typ);
-                                out.push(')');
-                            }
-                        }
-                    }
-                }
-                CallTarget::FnSpec(inner) => write_expr_prec(out, inner, PREC_ATOM, true),
-                CallTarget::BuiltinSpecFun(_, typs, _) => {
-                    out.push_str("builtinSpecFun");
-                    for typ in typs.iter() {
-                        out.push_str(" (");
-                        write_typ(out, typ);
-                        out.push(')');
-                    }
-                }
-            }
-            for arg in args.iter() {
-                out.push(' ');
-                write_expr_prec(out, arg, PREC_ATOM, true);
-            }
-        }
+        ExprX::Call(target, args, _) => call_to_node(target, args),
 
         ExprX::If(cond, then_e, else_e) => {
-            out.push_str("if ");
-            write_expr(out, cond);
-            out.push_str(" then ");
-            write_expr(out, then_e);
-            if let Some(else_e) = else_e {
-                out.push_str(" else ");
-                write_expr(out, else_e);
+            if let Some(e) = else_e {
+                ExprNode::If {
+                    cond: Box::new(vir_expr_to_ast(cond)),
+                    then_: Box::new(vir_expr_to_ast(then_e)),
+                    else_: Box::new(vir_expr_to_ast(e)),
+                }
+            } else {
+                // No else branch — rare in spec code. Fall back to Raw.
+                let mut s = String::from("if ");
+                s.push_str(&pp_expr(&vir_expr_to_ast(cond)));
+                s.push_str(" then ");
+                s.push_str(&pp_expr(&vir_expr_to_ast(then_e)));
+                ExprNode::Raw(s)
             }
         }
 
         ExprX::Quant(quant, binders, body) => {
-            out.push_str(match quant.quant {
-                air::ast::Quant::Forall => "∀ ",
-                air::ast::Quant::Exists => "∃ ",
-            });
-            write_binders(out, binders);
-            out.push_str(", ");
-            write_expr(out, body);
+            let l_binders = vir_var_binders_to_ast(binders);
+            let body = Box::new(vir_expr_to_ast(body));
+            match quant.quant {
+                air::ast::Quant::Forall => ExprNode::Forall { binders: l_binders, body },
+                air::ast::Quant::Exists => ExprNode::Exists { binders: l_binders, body },
+            }
         }
 
         ExprX::Choose { params, cond, body: _ } => {
-            // Verus's `choose|x| P(x)` picks a witness satisfying P.
-            // Lean's `Classical.epsilon` is the exact equivalent: it returns
-            // some value satisfying the predicate if one exists, or an
-            // arbitrary value otherwise. No existence proof needed — it's total.
-            out.push_str("Classical.epsilon (fun ");
-            for (i, b) in params.iter().enumerate() {
-                if i > 0 { out.push(' '); }
-                out.push('(');
-                write_name(out, &b.name.0);
-                out.push_str(" : ");
-                write_typ(out, &b.a);
-                out.push(')');
-            }
-            out.push_str(" => ");
-            write_expr(out, cond);
-            out.push(')');
-        }
-
-        ExprX::WithTriggers { body, .. } => write_expr(out, body),
-
-        ExprX::Block(stmts, final_expr) => {
-            for stmt in stmts.iter() {
-                match &stmt.x {
-                    StmtX::Expr(e) => { write_expr(out, e); out.push_str("; "); }
-                    StmtX::Decl { pattern, init, .. } => {
-                        out.push_str("let ");
-                        write_pattern(out, &pattern.x);
-                        if let Some(place) = init {
-                            out.push_str(" := ");
-                            write_place(out, &place.x);
-                        }
-                        out.push_str("; ");
-                    }
-                }
-            }
-            if let Some(e) = final_expr {
-                write_expr(out, e);
+            // `Classical.epsilon (fun (x : T) ... => P)` — the epsilon operator
+            // returns *some* witness satisfying P if one exists. No existence
+            // proof is required because `Classical.epsilon` is total.
+            let lambda = LExpr::new(ExprNode::Lambda {
+                binders: vir_var_binders_to_ast(params),
+                body: Box::new(vir_expr_to_ast(cond)),
+            });
+            ExprNode::App {
+                head: boxed(ExprNode::Var("Classical.epsilon".into())),
+                args: vec![lambda],
             }
         }
 
-        // Spec closure: |x, y| body → fun x y => body
-        ExprX::Closure(params, body) => {
-            out.push_str("fun ");
-            for (i, p) in params.iter().enumerate() {
-                if i > 0 { out.push(' '); }
-                out.push('(');
-                write_name(out, &p.name.0);
-                out.push_str(" : ");
-                write_typ(out, &p.a);
-                out.push(')');
-            }
-            out.push_str(" => ");
-            write_expr(out, body);
-        }
+        ExprX::WithTriggers { body, .. } => expr_to_node(body),
 
-        // Construct datatype: Struct { field: val } → { field := val } or ⟨val1, val2⟩
+        ExprX::Block(stmts, final_expr) => block_to_node(stmts, final_expr.as_ref()),
+
+        ExprX::Closure(params, body) => ExprNode::Lambda {
+            binders: vir_var_binders_to_ast(params),
+            body: Box::new(vir_expr_to_ast(body)),
+        },
+
         ExprX::Ctor(dt, variant, fields, update) => {
             if let Some(tail) = update {
-                // Struct update: { base with field1 := val1, field2 := val2 }
-                out.push_str("{ ");
-                write_place(out, &tail.place.x);
-                out.push_str(" with ");
-                for (i, f) in fields.iter().enumerate() {
-                    if i > 0 { out.push_str(", "); }
-                    write_name(out, &f.name);
-                    out.push_str(" := ");
-                    write_expr(out, &f.a);
+                ExprNode::StructUpdate {
+                    base: Box::new(place_to_expr(&tail.place.x)),
+                    updates: fields.iter().map(|f|
+                        (sanitize(&f.name), vir_expr_to_ast(&f.a))
+                    ).collect(),
                 }
-                out.push_str(" }");
             } else {
-                write_ctor(out, dt, variant, fields);
+                ctor_to_node(dt, variant, fields)
             }
         }
 
-        // Match expression
-        ExprX::Match(place, arms) => {
-            out.push_str("match ");
-            write_place(out, &place.x);
-            out.push_str(" with");
-            for arm in arms.iter() {
-                out.push_str(" | ");
-                write_pattern(out, &arm.x.pattern.x);
-                out.push_str(" => ");
-                write_expr(out, &arm.x.body);
-            }
-        }
+        ExprX::Match(place, arms) => ExprNode::Match {
+            scrutinee: Box::new(place_to_expr(&place.x)),
+            arms: arms.iter().map(|arm| LMatchArm {
+                pattern: pattern_to_ast(&arm.x.pattern.x),
+                body: vir_expr_to_ast(&arm.x.body),
+            }).collect(),
+        },
 
-        ExprX::Ghost { expr, .. } | ExprX::ProofInSpec(expr) => write_expr(out, expr),
-        ExprX::Loc(expr) => write_expr(out, expr),
-        ExprX::VarLoc(ident) => write_name(out, &ident.0),
-        ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => write_expr(out, inner),
+        ExprX::Ghost { expr, .. } | ExprX::ProofInSpec(expr) => expr_to_node(expr),
+        ExprX::Loc(expr) => expr_to_node(expr),
 
-        ExprX::ReadPlace(place, _) => write_place(out, &place.x),
+        ExprX::ReadPlace(place, _) => place_to_expr(&place.x).node,
 
-        ExprX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
-            write_expr_prec(out, inner, PREC_ATOM, true);
-            out.push('.');
-            out.push_str(&field_opr.field);
-        }
-        ExprX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => {
-            write_expr_prec(out, inner, PREC_ATOM, true);
-            out.push_str(".is");
-            out.push_str(variant);
-        }
-        ExprX::UnaryOpr(UnaryOpr::CustomErr(_), inner) => write_expr(out, inner),
-        // Remaining UnaryOpr: transparent (HasType, IntegerTypeBound, ProofNote, etc.)
-        ExprX::UnaryOpr(_, inner) => write_expr(out, inner),
+        ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => expr_to_node(inner),
+        ExprX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => ExprNode::FieldProj {
+            expr: Box::new(vir_expr_to_ast(inner)),
+            field: sanitize(&field_opr.field),
+        },
+        ExprX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => ExprNode::FieldProj {
+            expr: Box::new(vir_expr_to_ast(inner)),
+            field: format!("is{}", variant),
+        },
+        ExprX::UnaryOpr(UnaryOpr::CustomErr(_), inner) => expr_to_node(inner),
+        ExprX::UnaryOpr(_, inner) => expr_to_node(inner),
 
         ExprX::NullaryOpr(NullaryOpr::ConstGeneric(typ)) => {
-            // const generic parameter used as expression — emit its type as a value
-            out.push('(');
-            write_typ(out, typ);
-            out.push(')');
+            // const generic parameter used as a value — the VIR typ is the
+            // generic parameter's name/type (typically `TypParam(N)`), and we
+            // emit it as an identifier expression. `(typ : typ)` would be
+            // nonsense; just render the typ as an expression.
+            typ_to_expr(typ).node
         }
-        ExprX::NullaryOpr(NullaryOpr::TraitBound(..)) => out.push_str("True"),
-        ExprX::NullaryOpr(_) => out.push_str("True"),
+        ExprX::NullaryOpr(_) => ExprNode::LitBool(true),
 
         ExprX::Multi(_, exprs) => {
-            // Multi-operand: emit as nested application
-            for (i, e) in exprs.iter().enumerate() {
-                if i > 0 { out.push_str(", "); }
-                write_expr(out, e);
-            }
+            // Comma-separated list — rare in spec output; keep as Raw.
+            let parts: Vec<String> = exprs.iter()
+                .map(|e| pp_expr(&vir_expr_to_ast(e)))
+                .collect();
+            ExprNode::Raw(parts.join(", "))
         }
         ExprX::ArrayLiteral(exprs) => {
-            out.push_str("[");
-            for (i, e) in exprs.iter().enumerate() {
-                if i > 0 { out.push_str(", "); }
-                write_expr(out, e);
-            }
-            out.push_str("]");
+            ExprNode::ArrayLit(exprs.iter().map(|e| vir_expr_to_ast(e)).collect())
         }
 
-        ExprX::Header(_) => {}
-        ExprX::Fuel(..) | ExprX::RevealString(_) | ExprX::AirStmt(_) => {}
-        ExprX::StaticVar(fun) | ExprX::ExecFnByName(fun) => write_fn_ref(out, fun),
-        ExprX::Nondeterministic => out.push_str("Classical.arbitrary _"),
-        ExprX::BreakOrContinue { .. } => {}
+        ExprX::Header(_) => ExprNode::Raw(String::new()),
+        ExprX::Fuel(..) | ExprX::RevealString(_) | ExprX::AirStmt(_) => ExprNode::Raw(String::new()),
+        ExprX::Nondeterministic => ExprNode::Raw("Classical.arbitrary _".into()),
+        ExprX::BreakOrContinue { .. } => ExprNode::Raw(String::new()),
 
-        // Exec-mode — can't appear in spec fn bodies (VIR mode checker guarantees this)
+        // Exec-mode forms — VIR mode checker guarantees these don't appear
+        // inside spec fn bodies.
         ExprX::Assign { .. } | ExprX::AssignToPlace { .. }
         | ExprX::Loop { .. } | ExprX::Return(_) | ExprX::NonSpecClosure { .. } => {
             panic!("exec-mode expression in spec fn body — VIR mode checker bug");
@@ -294,163 +251,303 @@ pub fn write_expr(out: &mut String, expr: &Expr) {
         ExprX::AssertAssume { expr: e, .. }
         | ExprX::AssertAssumeUserDefinedTypeInvariant { expr: e, .. }
         | ExprX::AssertCompute(e, _)
-        | ExprX::NeverToAny(e) => write_expr(out, e),
-        ExprX::AssertBy { ensure, .. } => write_expr(out, ensure),
-        ExprX::AssertQuery { .. } => out.push_str("True"),
-        ExprX::OpenInvariant(_, _, body, _) => write_expr(out, body),
+        | ExprX::NeverToAny(e) => expr_to_node(e),
+        ExprX::AssertBy { ensure, .. } => expr_to_node(ensure),
+        ExprX::AssertQuery { .. } => ExprNode::LitBool(true),
+        ExprX::OpenInvariant(_, _, body, _) => expr_to_node(body),
 
-        // Remaining leaf/transparent nodes
-        ExprX::VarAt(ident, _) => write_name(out, &ident.0),
-        ExprX::Old(e) | ExprX::EvalAndResolve(_, e) => write_expr(out, e),
+        ExprX::Old(e) | ExprX::EvalAndResolve(_, e) => expr_to_node(e),
         ExprX::BorrowMut(_) | ExprX::TwoPhaseBorrowMut(_)
-        | ExprX::BorrowMutTracked(_) => out.push_str("()"),
-        ExprX::ImplicitReborrowOrSpecRead(place, _, _) => write_place(out, &place.x),
+        | ExprX::BorrowMutTracked(_) => ExprNode::Var("()".into()),
+        ExprX::ImplicitReborrowOrSpecRead(place, _, _) => place_to_expr(&place.x).node,
     }
 }
 
-/// Write expression, adding parens if needed by precedence.
-fn write_expr_prec(out: &mut String, expr: &Expr, parent_prec: u8, is_left: bool) {
-    let child_prec = expr_prec(&expr.x);
-    let needs_parens = child_prec < parent_prec || (child_prec == parent_prec && !is_left);
-    if needs_parens { out.push('('); }
-    write_expr(out, expr);
-    if needs_parens { out.push(')'); }
-}
+// ── Helpers ─────────────────────────────────────────────────────────────
 
-/// Write `(name₁ : Type₁) (name₂ : Type₂) ...` binder list.
-pub(crate) fn write_binders(out: &mut String, binders: &VarBinders<Typ>) {
-    for (i, b) in binders.iter().enumerate() {
-        if i > 0 { out.push(' '); }
-        out.push('(');
-        write_name(out, &b.name.0);
-        out.push_str(" : ");
-        write_typ(out, &b.a);
-        out.push(')');
+fn const_to_node(c: &Constant) -> ExprNode {
+    match c {
+        Constant::Bool(b) => ExprNode::LitBool(*b),
+        Constant::Int(n) => ExprNode::Lit(n.to_string()),
+        Constant::StrSlice(s) => ExprNode::LitStr(s.to_string()),
+        Constant::Char(c) => ExprNode::LitChar(*c),
+        Constant::Real(s) => ExprNode::TypeAnnot {
+            expr: Box::new(LExpr::new(ExprNode::Lit(s.to_string()))),
+            ty: Box::new(var("Real")),
+        },
+        Constant::Float32(bits) => ExprNode::TypeAnnot {
+            expr: Box::new(LExpr::new(ExprNode::Lit(f32::from_bits(*bits).to_string()))),
+            ty: Box::new(var("Float")),
+        },
+        Constant::Float64(bits) => ExprNode::TypeAnnot {
+            expr: Box::new(LExpr::new(ExprNode::Lit(f64::from_bits(*bits).to_string()))),
+            ty: Box::new(var("Float")),
+        },
     }
 }
 
-fn write_binop(out: &mut String, op: &BinaryOp) {
-    out.push_str(binop_symbol(op));
+/// Map VIR binary ops we model structurally. `None` means "emit via Raw".
+fn binop_to_ast(op: &BinaryOp) -> Option<L> {
+    Some(match op {
+        BinaryOp::And => L::And,
+        BinaryOp::Or => L::Or,
+        BinaryOp::Xor => L::Xor,
+        BinaryOp::Implies => L::Implies,
+        BinaryOp::Eq(_) => L::Eq,
+        BinaryOp::Ne => L::Ne,
+        BinaryOp::Inequality(InequalityOp::Le) => L::Le,
+        BinaryOp::Inequality(InequalityOp::Lt) => L::Lt,
+        BinaryOp::Inequality(InequalityOp::Ge) => L::Ge,
+        BinaryOp::Inequality(InequalityOp::Gt) => L::Gt,
+        BinaryOp::Arith(ArithOp::Add(_)) => L::Add,
+        BinaryOp::Arith(ArithOp::Sub(_)) => L::Sub,
+        BinaryOp::Arith(ArithOp::Mul(_)) => L::Mul,
+        BinaryOp::Arith(ArithOp::EuclideanDiv(_)) => L::Div,
+        BinaryOp::Arith(ArithOp::EuclideanMod(_)) => L::Mod,
+        BinaryOp::RealArith(RealArithOp::Add) => L::Add,
+        BinaryOp::RealArith(RealArithOp::Sub) => L::Sub,
+        BinaryOp::RealArith(RealArithOp::Mul) => L::Mul,
+        BinaryOp::RealArith(RealArithOp::Div) => L::Div,
+        BinaryOp::Bitwise(BitwiseOp::BitAnd, _) => L::BitAnd,
+        BinaryOp::Bitwise(BitwiseOp::BitOr, _) => L::BitOr,
+        BinaryOp::Bitwise(BitwiseOp::BitXor, _) => L::BitXor,
+        BinaryOp::Bitwise(BitwiseOp::Shr(_), _) => L::Shr,
+        BinaryOp::Bitwise(BitwiseOp::Shl(_, _), _) => L::Shl,
+        BinaryOp::HeightCompare { .. }
+        | BinaryOp::StrGetChar
+        | BinaryOp::Index(_, _)
+        | BinaryOp::IeeeFloat(_) => return None,
+    })
 }
 
-fn write_fn_ref(out: &mut String, fun: &Fun) {
-    out.push_str(&lean_name(&fun.path));
+/// Fallback symbol for binops we don't model as `L`. Used only via
+/// `ExprNode::Raw`, so precedence is up to the caller.
+fn raw_binop_symbol(op: &BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::HeightCompare { .. } => "<",
+        BinaryOp::StrGetChar => "String.get",
+        BinaryOp::Index(_, _) => "!!",
+        BinaryOp::IeeeFloat(_) => "+",
+        _ => "?",
+    }
 }
 
-/// Write a trait method reference as `Crate.Module.TraitName.method` for Lean class dispatch.
-/// Uses the full path (via lean_name) of the trait, then `.method`.
-fn write_trait_method_ref(out: &mut String, fun: &Fun) {
+fn call_to_node(target: &CallTarget, args: &Exprs) -> ExprNode {
+    let head = match target {
+        CallTarget::Fun(kind, fun, typs, _, _, _) => {
+            match kind {
+                CallTargetKind::DynamicResolved { resolved, .. } => {
+                    var(&lean_name(&resolved.path))
+                }
+                CallTargetKind::Dynamic => trait_method_ref(fun),
+                _ => {
+                    // Emit explicit type arguments for generic calls by
+                    // building an intermediate App head: `fn T1 T2 …`.
+                    let base = var(&lean_name(&fun.path));
+                    if typs.is_empty() {
+                        base
+                    } else {
+                        LExpr::new(ExprNode::App {
+                            head: Box::new(base),
+                            args: typs.iter().map(|t| typ_to_expr(t)).collect(),
+                        })
+                    }
+                }
+            }
+        }
+        CallTarget::FnSpec(inner) => vir_expr_to_ast(inner),
+        CallTarget::BuiltinSpecFun(_, typs, _) => {
+            let base = var("builtinSpecFun");
+            if typs.is_empty() {
+                base
+            } else {
+                LExpr::new(ExprNode::App {
+                    head: Box::new(base),
+                    args: typs.iter().map(|t| typ_to_expr(t)).collect(),
+                })
+            }
+        }
+    };
+    if args.is_empty() {
+        head.node
+    } else {
+        ExprNode::App {
+            head: Box::new(head),
+            args: args.iter().map(|a| vir_expr_to_ast(a)).collect(),
+        }
+    }
+}
+
+fn trait_method_ref(fun: &Fun) -> LExpr {
     let segs = &fun.path.segments;
     if segs.len() >= 2 {
-        write_name(out, segs[segs.len() - 2].as_str());
-        out.push('.');
-        write_name(out, segs[segs.len() - 1].as_str());
+        let t = sanitize(segs[segs.len() - 2].as_str());
+        let m = sanitize(segs[segs.len() - 1].as_str());
+        var(&format!("{}.{}", t, m))
     } else {
-        write_fn_ref(out, fun);
+        var(&lean_name(&fun.path))
     }
 }
 
-/// Write a name, escaping Lean keywords and sanitizing special chars.
-/// Avoids allocation for names that don't need sanitization (>99% of calls).
-pub(crate) fn write_name(out: &mut String, name: &str) {
-    if crate::to_lean_type::needs_sanitization(name) {
-        out.push_str(&crate::to_lean_type::sanitize_ident(name));
-    } else {
-        out.push_str(name);
-    }
-}
-
-/// Write a VIR pattern as Lean syntax.
-fn write_pattern(out: &mut String, pat: &PatternX) {
-    match pat {
-        PatternX::Wildcard(_) => out.push('_'),
-        PatternX::Var(binding) => write_name(out, &binding.name.0),
-        PatternX::Constructor(dt, variant, pats) => {
-            write_dt_variant(out, dt, variant);
-            for p in pats.iter() {
-                out.push(' ');
-                // Wrap non-trivial patterns in parens
-                let needs_parens = matches!(&p.a.x, PatternX::Constructor(..));
-                if needs_parens { out.push('('); }
-                write_pattern(out, &p.a.x);
-                if needs_parens { out.push(')'); }
-            }
-        }
-        PatternX::Or(left, right) => {
-            write_pattern(out, &left.x);
-            out.push_str(" | ");
-            write_pattern(out, &right.x);
-        }
-        PatternX::Binding { binding, sub_pat } => {
-            write_name(out, &binding.name.0);
-            out.push('@');
-            write_pattern(out, &sub_pat.x);
-        }
-        PatternX::Expr(e) => write_expr(out, e),
-        PatternX::Range(lo, hi) => {
-            // Lean doesn't have range patterns; emit as a numeric literal if possible
-            if let Some(lo) = lo { write_expr(out, lo); }
-            else { out.push('_'); }
-            // Range patterns are rare in spec mode (ast_simplify usually eliminates Match)
-            if let Some((hi, op)) = hi {
-                out.push_str(match op {
-                    InequalityOp::Le => " /* ..= */ ",
-                    _ => " /* .. */ ",
-                });
-                write_expr(out, hi);
-            }
-        }
-        PatternX::MutRef(inner) | PatternX::ImmutRef(inner) => write_pattern(out, &inner.x),
-    }
-}
-
-/// Write a Ctor expression as Lean syntax.
-/// Positional fields ("0", "1", ...): `Type.Variant val1 val2`
-/// Named fields: `Type.Variant val1 val2` (field order from VIR)
-/// No fields: `Type.Variant`
-fn write_ctor(out: &mut String, dt: &Dt, variant: &Ident, fields: &Binders<Expr>) {
-    write_dt_variant(out, dt, variant);
-    for f in fields.iter() {
-        out.push(' ');
-        write_expr_prec(out, &f.a, PREC_ATOM, true);
-    }
-}
-
-/// Write datatype variant name: Type.Variant, or Type.mk for structs (where variant == type name).
-fn write_dt_variant(out: &mut String, dt: &Dt, variant: &Ident) {
-    match dt {
+fn ctor_to_node(dt: &Dt, variant: &Ident, fields: &Binders<Expr>) -> ExprNode {
+    let head = match dt {
         Dt::Path(path) => {
             let type_name = lean_name(path);
-            out.push_str(&type_name);
-            out.push('.');
-            // Structs: VIR uses type name as variant, Lean uses `mk`
-            if variant.as_str() == short_name(path) { out.push_str("mk"); }
-            else { write_name(out, variant); }
+            let variant_seg = if variant.as_str() == short_name(path) {
+                "mk".to_string()
+            } else {
+                sanitize(variant)
+            };
+            format!("{}.{}", type_name, variant_seg)
         }
-        Dt::Tuple(_) => write_name(out, variant),
+        Dt::Tuple(_) => sanitize(variant),
+    };
+    if fields.is_empty() {
+        ExprNode::Var(head)
+    } else {
+        ExprNode::App {
+            head: Box::new(var(&head)),
+            args: fields.iter().map(|f| vir_expr_to_ast(&f.a)).collect(),
+        }
     }
 }
 
-/// Write a VIR place as Lean syntax (for ReadPlace).
-fn write_place(out: &mut String, place: &PlaceX) {
-    match place {
-        PlaceX::Local(ident) => write_name(out, &ident.0),
-        PlaceX::Field(field_opr, base) => {
-            write_place(out, &base.x);
-            out.push('.');
-            out.push_str(&field_opr.field);
+fn block_to_node(stmts: &[Stmt], final_expr: Option<&Expr>) -> ExprNode {
+    // Lean has no direct analogue of a VIR `Block` in spec mode — we emit
+    // `stmt; stmt; final` as a `Raw` segment because the semantics are
+    // usually "evaluate for side-effects" (which don't exist in spec) or
+    // desugar to a nested let. In practice Tactus only sees Block in
+    // transparent contexts, so a best-effort render is fine.
+    let mut s = String::new();
+    for stmt in stmts {
+        match &stmt.x {
+            StmtX::Expr(e) => {
+                s.push_str(&pp_expr(&vir_expr_to_ast(e)));
+                s.push_str("; ");
+            }
+            StmtX::Decl { pattern, init, .. } => {
+                s.push_str("let ");
+                pp_pattern_into(&mut s, &pattern.x);
+                if let Some(place) = init {
+                    s.push_str(" := ");
+                    s.push_str(&pp_expr(&place_to_expr(&place.x)));
+                }
+                s.push_str("; ");
+            }
         }
-        PlaceX::DerefMut(inner) => write_place(out, &inner.x),
-        PlaceX::ModeUnwrap(inner, _) => write_place(out, &inner.x),
-        PlaceX::Temporary(expr) => write_expr(out, expr),
-        PlaceX::WithExpr(_, place) => write_place(out, &place.x),
+    }
+    if let Some(e) = final_expr {
+        s.push_str(&pp_expr(&vir_expr_to_ast(e)));
+    }
+    ExprNode::Raw(s)
+}
+
+// ── Patterns ────────────────────────────────────────────────────────────
+
+pub(crate) fn pattern_to_ast(pat: &PatternX) -> LPattern {
+    match pat {
+        PatternX::Wildcard(_) => LPattern::Wildcard,
+        PatternX::Var(binding) => LPattern::Var(sanitize(&binding.name.0)),
+        PatternX::Constructor(dt, variant, pats) => {
+            let name = match dt {
+                Dt::Path(path) => {
+                    let v = if variant.as_str() == short_name(path) {
+                        "mk".to_string()
+                    } else {
+                        sanitize(variant)
+                    };
+                    format!("{}.{}", lean_name(path), v)
+                }
+                Dt::Tuple(_) => sanitize(variant),
+            };
+            LPattern::Ctor {
+                name,
+                args: pats.iter().map(|p| pattern_to_ast(&p.a.x)).collect(),
+            }
+        }
+        PatternX::Or(l, r) => LPattern::Or(
+            Box::new(pattern_to_ast(&l.x)),
+            Box::new(pattern_to_ast(&r.x)),
+        ),
+        PatternX::Binding { binding, sub_pat } => LPattern::Binding {
+            name: sanitize(&binding.name.0),
+            sub: Box::new(pattern_to_ast(&sub_pat.x)),
+        },
+        PatternX::Expr(e) => LPattern::Lit(expr_to_node(e)),
+        PatternX::Range(lo, _hi) => {
+            // Lean doesn't have numeric range patterns; fall back to the low
+            // bound (or wildcard if absent). Range patterns are rare in spec
+            // mode (ast_simplify usually eliminates Match).
+            match lo {
+                Some(e) => LPattern::Lit(expr_to_node(e)),
+                None => LPattern::Wildcard,
+            }
+        }
+        PatternX::MutRef(inner) | PatternX::ImmutRef(inner) => pattern_to_ast(&inner.x),
+    }
+}
+
+/// Pattern pretty-print helper for the Block fallback above.
+fn pp_pattern_into(out: &mut String, pat: &PatternX) {
+    let p = pattern_to_ast(pat);
+    write_pattern_ast(out, &p);
+}
+
+fn write_pattern_ast(out: &mut String, p: &LPattern) {
+    match p {
+        LPattern::Var(s) => out.push_str(s),
+        LPattern::Wildcard => out.push('_'),
+        LPattern::Ctor { name, args } => {
+            out.push_str(name);
+            for a in args {
+                out.push(' ');
+                let needs = matches!(a, LPattern::Ctor { args, .. } if !args.is_empty());
+                if needs { out.push('('); }
+                write_pattern_ast(out, a);
+                if needs { out.push(')'); }
+            }
+        }
+        LPattern::Or(l, r) => {
+            write_pattern_ast(out, l);
+            out.push_str(" | ");
+            write_pattern_ast(out, r);
+        }
+        LPattern::Binding { name, sub } => {
+            out.push_str(name);
+            out.push('@');
+            write_pattern_ast(out, sub);
+        }
+        LPattern::Lit(node) => {
+            // Render via pp_expr on a fresh Expr.
+            let tmp = LExpr::new(node.clone());
+            out.push_str(&pp_expr(&tmp));
+        }
+    }
+}
+
+// ── Places ──────────────────────────────────────────────────────────────
+
+fn place_to_expr(place: &PlaceX) -> LExpr {
+    LExpr::new(match place {
+        PlaceX::Local(ident) => ExprNode::Var(sanitize(&ident.0)),
+        PlaceX::Field(field_opr, base) => ExprNode::FieldProj {
+            expr: Box::new(place_to_expr(&base.x)),
+            field: sanitize(&field_opr.field),
+        },
+        PlaceX::DerefMut(inner) | PlaceX::ModeUnwrap(inner, _) => {
+            return place_to_expr(&inner.x);
+        }
+        PlaceX::Temporary(expr) => return vir_expr_to_ast(expr),
+        PlaceX::WithExpr(_, place) => return place_to_expr(&place.x),
         PlaceX::Index(base, idx, _, _) => {
-            write_place(out, &base.x);
-            out.push('[');
-            write_expr(out, idx);
-            out.push(']');
+            // `base[idx]` — represented as Raw since `[]` is not in our AST
+            // yet. Index syntax can be promoted to a real node when needed.
+            let b = pp_expr(&place_to_expr(&base.x));
+            let i = pp_expr(&vir_expr_to_ast(idx));
+            ExprNode::Raw(format!("{}[{}]", b, i))
         }
-        PlaceX::UserDefinedTypInvariantObligation(inner, _) => write_place(out, &inner.x),
-    }
+        PlaceX::UserDefinedTypInvariantObligation(inner, _) => {
+            return place_to_expr(&inner.x);
+        }
+    })
 }
-
