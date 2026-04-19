@@ -364,6 +364,8 @@ pub(crate) enum Attr {
     TacticSpan(usize, usize),
     // Tactus: Lean import path (e.g., "Mathlib.Tactic.Ring")
     LeanImport(String),
+    // Tactus: route this exec fn's body through Lean (sst_to_lean + tactus_auto)
+    TactusAuto,
 }
 
 fn get_trigger_arg(span: Span, attr_tree: &AttrTree) -> Result<u64, VirErr> {
@@ -635,6 +637,8 @@ pub(crate) fn parse_attrs(
                     v.push(Attr::AutoExtEqual(auto_ext_equal))
                 }
                 AttrTree::Fun(_, arg, None) if arg == "memoize" => v.push(Attr::Memoize),
+                // Tactus: opt-in to Lean-based exec fn verification
+                AttrTree::Fun(_, arg, None) if arg == "tactus_auto" => v.push(Attr::TactusAuto),
                 AttrTree::Fun(span, name, attrs) if name == "rlimit" => {
                     let number = get_rlimit_arg(*span, attrs)?;
                     v.push(Attr::RLimit(number));
@@ -1162,6 +1166,8 @@ pub(crate) struct VerifierAttrs {
     // Tactus: source span of the `by { }` brace block for verbatim text extraction.
     // Tactus: Lean import paths for this proof fn
     pub(crate) lean_imports: Vec<String>,
+    // Tactus: opt-in marker for Lean-based exec fn verification
+    pub(crate) tactus_auto: bool,
 }
 
 // Check for the `get_field_many_variants` attribute
@@ -1339,6 +1345,7 @@ pub(crate) fn get_verifier_attrs_maybe_check(
         tracked_take_option: false,
         tactic_span: None,
         lean_imports: Vec::new(),
+        tactus_auto: false,
     };
     let mut unsupported_rustc_attr: Option<(String, Span)> = None;
     for attr in parse_attrs(attrs, diagnostics)? {
@@ -1425,6 +1432,7 @@ pub(crate) fn get_verifier_attrs_maybe_check(
             Attr::TrackedTakeOption => vs.tracked_take_option = true,
             Attr::TacticSpan(start, end) => vs.tactic_span = Some((start, end)),
             Attr::LeanImport(path) => vs.lean_imports.push(path.clone()),
+            Attr::TactusAuto => vs.tactus_auto = true,
             _ => {}
         }
     }

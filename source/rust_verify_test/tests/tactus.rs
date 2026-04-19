@@ -1855,3 +1855,47 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// === Track B: exec fn with sst_to_lean (first slice) ===
+//
+// Simplest straight-line exec fn: constant return, trivial ensures.
+// Verified end-to-end through Lean's `tactus_auto` (→ rfl/decide/omega).
+
+test_verify_one_file! {
+    #[test] test_exec_const_return verus_code! {
+        #[verifier::tactus_auto]
+        fn five() -> (r: u8)
+            ensures r == 5
+        {
+            5
+        }
+    } => Ok(())
+}
+
+// Exec fn with one parameter and arithmetic in the return expression.
+// Ensures references the return value via its declared name.
+test_verify_one_file! {
+    #[test] test_exec_add_one verus_code! {
+        #[verifier::tactus_auto]
+        fn add_one(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            x + 1
+        }
+    } => Ok(())
+}
+
+// Wrong exec fn: ensures is false. Lean should reject.
+test_verify_one_file! {
+    #[test] test_exec_wrong_ensures verus_code! {
+        #[verifier::tactus_auto]
+        fn five_but_wrong() -> (r: u8)
+            ensures r == 6
+        {
+            5
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "Expected error for wrong exec ensures");
+    }
+}

@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::process::{Command, Stdio};
 
 /// A single diagnostic from Lean's `--json` output.
@@ -84,74 +83,52 @@ fn split_goal_state(data: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// Check Lean source by piping it to `lean --stdin --json`.
+/// Check a Lean source file by invoking `lean --json <path>`, optionally inside a
+/// Lake project so imports (e.g., Mathlib) resolve.
 ///
-/// This is the simplest invocation mode — no Lake project, no Mathlib.
-/// For Mathlib support, use `check_lean_in_project` instead.
-pub fn check_lean_stdin(lean_source: &str) -> Result<LeanResult, String> {
-    run_lean(&["lean", "--stdin", "--json"], lean_source, None)
-}
-
-/// Check Lean source using `lake env lean` from a Lake project directory.
-///
-/// This mode provides access to Mathlib and other Lake dependencies.
-pub fn check_lean_in_project(
-    lean_source: &str,
-    project_dir: &std::path::Path,
+/// The source is expected to already be on disk at `file_path`; this function
+/// does not write. See `generate::check_proof_fn` / `check_exec_fn` for the
+/// full write-then-check flow.
+pub fn check_lean_file(
+    file_path: &std::path::Path,
+    lake_dir: Option<&std::path::Path>,
 ) -> Result<LeanResult, String> {
-    run_lean(
-        &["lake", "env", "lean", "--stdin", "--json"],
-        lean_source,
-        Some(project_dir),
-    )
-}
+    let abs_path = file_path.canonicalize()
+        .unwrap_or_else(|_| file_path.to_path_buf());
+    let path_str = abs_path.to_string_lossy().into_owned();
 
-fn run_lean(
-    cmd: &[&str],
-    lean_source: &str,
-    working_dir: Option<&std::path::Path>,
-) -> Result<LeanResult, String> {
-    let mut command = Command::new(cmd[0]);
-    command.args(&cmd[1..])
-        .stdin(Stdio::piped())
+    let (mut command, label) = match lake_dir {
+        Some(dir) => {
+            let mut c = Command::new("lake");
+            c.args(["env", "lean", "--json", &path_str]);
+            c.current_dir(dir);
+            (c, "lake env lean")
+        }
+        None => {
+            let mut c = Command::new("lean");
+            c.args(["--json", &path_str]);
+            (c, "lean")
+        }
+    };
+    command
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(dir) = working_dir {
-        command.current_dir(dir);
-    }
 
-    let mut child = command.spawn()
-        .map_err(|e| format!("Failed to spawn {}: {}. Is Lean 4 installed?", cmd[0], e))?;
-
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(lean_source.as_bytes())
-        .map_err(|e| format!("Failed to write to lean stdin: {}", e))?;
-
-    // Lean's maxHeartbeats (set in TactusPrelude.lean) handles timeouts —
-    // if elaboration takes too long, Lean returns an error diagnostic.
-    // No process-level timeout needed.
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to wait for lean: {}", e))?;
+    let output = command.output()
+        .map_err(|e| format!("Failed to spawn {}: {}. Is Lean 4 installed?", label, e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let diagnostics = parse_diagnostics(&stdout);
 
     let has_error = diagnostics.iter().any(|d| d.severity == "error");
-    // If no JSON diagnostics but process failed, include stderr
     let success = output.status.success() && !has_error;
     if !success && diagnostics.is_empty() && !stderr.is_empty() {
         return Err(format!("Lean failed: {}", stderr.trim()));
     }
 
-    Ok(LeanResult {
-        success,
-        diagnostics,
-    })
+    Ok(LeanResult { success, diagnostics })
 }
 
 /// Parse Lean's JSON diagnostic output (one JSON object per line).
@@ -164,24 +141,35 @@ fn parse_diagnostics(output: &str) -> Vec<LeanDiagnostic> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn write_tmp(source: &str, suffix: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("tactus_leanprocess_{}_{}.lean", pid, suffix));
+        let mut f = std::fs::File::create(&path).expect("tmp file");
+        f.write_all(source.as_bytes()).expect("write tmp");
+        path
+    }
 
     #[test]
     fn test_trivial_lean_check() {
-        let result = check_lean_stdin("theorem foo : 1 + 1 = 2 := by omega\n");
+        let path = write_tmp("theorem foo : 1 + 1 = 2 := by omega\n", "pass");
+        let result = check_lean_file(&path, None);
         match result {
             Ok(r) => {
                 assert!(r.success, "Lean should verify 1+1=2. Diagnostics: {:?}", r.diagnostics);
             }
             Err(e) => {
-                // Lean might not be installed in CI — skip gracefully
                 eprintln!("Skipping test (lean not available): {}", e);
             }
         }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn test_failing_lean_check() {
-        let result = check_lean_stdin("theorem foo : 1 + 1 = 3 := by omega\n");
+        let path = write_tmp("theorem foo : 1 + 1 = 3 := by omega\n", "fail");
+        let result = check_lean_file(&path, None);
         match result {
             Ok(r) => {
                 assert!(!r.success, "Lean should reject 1+1=3");
@@ -194,5 +182,6 @@ mod tests {
                 eprintln!("Skipping test (lean not available): {}", e);
             }
         }
+        let _ = std::fs::remove_file(&path);
     }
 }

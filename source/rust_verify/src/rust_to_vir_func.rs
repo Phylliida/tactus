@@ -261,6 +261,7 @@ fn handle_autospec<'tcx>(
                     tracked_take_option: false,
                     tactic_span: None,
                     lean_imports: Vec::new(),
+                    tactus_auto: false,
                 }),
                 body: Some(ret_clause.clone()),
                 extra_dependencies: functionx.extra_dependencies.clone(),
@@ -1332,6 +1333,7 @@ fn make_attributes<'tcx>(
             }
         }),
         lean_imports: vattrs.lean_imports.clone(),
+        tactus_auto: vattrs.tactus_auto,
     };
     Ok(Arc::new(fattrs))
 }
