@@ -5,7 +5,6 @@ use crate::lean_ast::{
     BinOp as L, Binder as LBinder, BinderKind, Expr as LExpr,
     ExprNode, MatchArm as LMatchArm, Pattern as LPattern, UnOp as LUn,
 };
-use crate::lean_pp::pp_expr;
 use crate::to_lean_type::{lean_name, sanitize, short_name, typ_to_expr};
 
 /// Build a `lean_ast::Expr` from a VIR-AST expression.
@@ -195,23 +194,37 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
         ExprX::NullaryOpr(_) => ExprNode::LitBool(true),
 
         ExprX::Multi(_, exprs) => {
-            // Comma-separated list — rare in spec output; keep as Raw.
-            let parts: Vec<String> = exprs.iter()
-                .map(|e| pp_expr(&vir_expr_to_ast(e)))
-                .collect();
-            ExprNode::Raw(parts.join(", "))
+            // VIR's Multi carries a list of operands (tuple construction,
+            // chained conjunction, etc.). Render as Lean's anonymous
+            // constructor `⟨a, b, c⟩` — correct for tuples, works for any
+            // shape where the target type is inferred from context.
+            ExprNode::Anon(exprs.iter().map(|e| vir_expr_to_ast(e)).collect())
         }
         ExprX::ArrayLiteral(exprs) => {
             ExprNode::ArrayLit(exprs.iter().map(|e| vir_expr_to_ast(e)).collect())
         }
 
-        ExprX::Header(_) => ExprNode::Raw(String::new()),
-        ExprX::Fuel(..) | ExprX::RevealString(_) | ExprX::AirStmt(_) => ExprNode::Raw(String::new()),
+        // `ExprX::Header` is a requires/ensures marker that VIR
+        // simplification strips before spec fn bodies reach us. Reaching
+        // it would mean the pipeline ordering got swapped.
+        ExprX::Header(_) => panic!(
+            "ExprX::Header in spec fn body — VIR should have stripped it \
+             before translation"
+        ),
+        // `BreakOrContinue` is exec-mode only.
+        ExprX::BreakOrContinue { .. } => panic!(
+            "ExprX::BreakOrContinue in spec fn body — VIR mode checker bug"
+        ),
+        // Z3-specific markers that have no Lean analogue: fuel control,
+        // hidden-string reveals, raw AIR statements. They're genuinely
+        // effectless at our layer, so emit nothing.
+        ExprX::Fuel(..) | ExprX::RevealString(_) | ExprX::AirStmt(_) => {
+            ExprNode::Raw(String::new())
+        }
         ExprX::Nondeterministic => ExprNode::App {
             head: Box::new(LExpr::new(ExprNode::Var("Classical.arbitrary".into()))),
             args: vec![LExpr::new(ExprNode::Var("_".into()))],
         },
-        ExprX::BreakOrContinue { .. } => ExprNode::Raw(String::new()),
 
         // Exec-mode forms — VIR mode checker guarantees these don't appear
         // inside spec fn bodies.
@@ -388,34 +401,55 @@ fn ctor_to_node(dt: &Dt, variant: &Ident, fields: &Binders<Expr>) -> ExprNode {
     }
 }
 
+/// Fold a VIR `Block` into nested Lean lets.
+///
+/// * `StmtX::Decl { pattern: Var(x), init: Some(e) }`  →  `let x := e; rest`
+/// * `StmtX::Decl { pattern: <non-var>, init: Some(e) }`  →  `match e with | p => rest`
+///   (Lean pattern-lets require `match` for non-variable LHS.)
+/// * `StmtX::Expr(e)` with a following statement  →  `let _ := e; rest`
+///   (drops the value like Rust's `;` does).
+/// * Last stmt with no `final_expr` is the body.
 fn block_to_node(stmts: &[Stmt], final_expr: Option<&Expr>) -> ExprNode {
-    // Lean has no direct analogue of a VIR `Block` in spec mode — we emit
-    // `stmt; stmt; final` as a `Raw` segment because the semantics are
-    // usually "evaluate for side-effects" (which don't exist in spec) or
-    // desugar to a nested let. In practice Tactus only sees Block in
-    // transparent contexts, so a best-effort render is fine.
-    let mut s = String::new();
-    for stmt in stmts {
-        match &stmt.x {
-            StmtX::Expr(e) => {
-                s.push_str(&pp_expr(&vir_expr_to_ast(e)));
-                s.push_str("; ");
-            }
+    let body = match final_expr {
+        Some(e) => vir_expr_to_ast(e),
+        None if stmts.is_empty() => LExpr::new(ExprNode::Var("()".into())),
+        // No final expression — the last stmt's value is the block's value.
+        // In spec mode this is unusual; fall back to unit.
+        None => LExpr::new(ExprNode::Var("()".into())),
+    };
+
+    let mut folded = body;
+    for stmt in stmts.iter().rev() {
+        folded = match &stmt.x {
             StmtX::Decl { pattern, init, .. } => {
-                s.push_str("let ");
-                pp_pattern_into(&mut s, &pattern.x);
-                if let Some(place) = init {
-                    s.push_str(" := ");
-                    s.push_str(&pp_expr(&place_to_expr(&place.x)));
+                let value = match init {
+                    Some(place) => place_to_expr(&place.x),
+                    // No initializer (e.g., `let x;`) — give a placeholder.
+                    None => LExpr::new(ExprNode::Var("_".into())),
+                };
+                match &pattern.x {
+                    PatternX::Var(binding) => LExpr::new(ExprNode::Let {
+                        name: sanitize(&binding.name.0),
+                        value: Box::new(value),
+                        body: Box::new(folded),
+                    }),
+                    other => LExpr::new(ExprNode::Match {
+                        scrutinee: Box::new(value),
+                        arms: vec![crate::lean_ast::MatchArm {
+                            pattern: pattern_to_ast(other),
+                            body: folded,
+                        }],
+                    }),
                 }
-                s.push_str("; ");
             }
-        }
+            StmtX::Expr(e) => LExpr::new(ExprNode::Let {
+                name: "_".to_string(),
+                value: Box::new(vir_expr_to_ast(e)),
+                body: Box::new(folded),
+            }),
+        };
     }
-    if let Some(e) = final_expr {
-        s.push_str(&pp_expr(&vir_expr_to_ast(e)));
-    }
-    ExprNode::Raw(s)
+    folded.node
 }
 
 // ── Patterns ────────────────────────────────────────────────────────────
@@ -460,44 +494,6 @@ pub(crate) fn pattern_to_ast(pat: &PatternX) -> LPattern {
             }
         }
         PatternX::MutRef(inner) | PatternX::ImmutRef(inner) => pattern_to_ast(&inner.x),
-    }
-}
-
-/// Pattern pretty-print helper for the Block fallback above.
-fn pp_pattern_into(out: &mut String, pat: &PatternX) {
-    let p = pattern_to_ast(pat);
-    write_pattern_ast(out, &p);
-}
-
-fn write_pattern_ast(out: &mut String, p: &LPattern) {
-    match p {
-        LPattern::Var(s) => out.push_str(s),
-        LPattern::Wildcard => out.push('_'),
-        LPattern::Ctor { name, args } => {
-            out.push_str(name);
-            for a in args {
-                out.push(' ');
-                let needs = matches!(a, LPattern::Ctor { args, .. } if !args.is_empty());
-                if needs { out.push('('); }
-                write_pattern_ast(out, a);
-                if needs { out.push(')'); }
-            }
-        }
-        LPattern::Or(l, r) => {
-            write_pattern_ast(out, l);
-            out.push_str(" | ");
-            write_pattern_ast(out, r);
-        }
-        LPattern::Binding { name, sub } => {
-            out.push_str(name);
-            out.push('@');
-            write_pattern_ast(out, sub);
-        }
-        LPattern::Lit(node) => {
-            // Render via pp_expr on a fresh Expr.
-            let tmp = LExpr::new(node.clone());
-            out.push_str(&pp_expr(&tmp));
-        }
     }
 }
 

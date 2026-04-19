@@ -2,7 +2,6 @@
 
 use vir::ast::{Dt, IntRange, Path, TypX};
 use crate::lean_ast::{BinOp, Expr, ExprNode};
-use crate::lean_pp::pp_expr;
 
 /// Canonical VIR-type → Lean-AST translator.
 pub fn typ_to_expr(typ: &TypX) -> Expr {
@@ -71,21 +70,19 @@ fn typ_to_node(typ: &TypX) -> ExprNode {
         TypX::Float(_) => ExprNode::Var("Float".into()),
         TypX::TypeId => ExprNode::Var("Nat".into()),
         TypX::FnDef(_, typs, _) => {
-            // Zero-sized identifier type → Unit (possibly paired with extra
-            // type args for disambiguation).
-            if typs.is_empty() {
-                ExprNode::Var("Unit".into())
-            } else {
-                // `(Unit × T₁ × T₂ …)` — emitted as Raw since `×` is not in
-                // our BinOp set (no need to add it just for this one case).
-                let mut s = String::from("(Unit");
-                for t in typs.iter() {
-                    s.push_str(" × ");
-                    s.push_str(&pp_expr(&typ_to_expr(t)));
-                }
-                s.push(')');
-                ExprNode::Raw(s)
+            // Zero-sized identifier type → `Unit` (possibly paired with
+            // extra type args for disambiguation as `Unit × T₁ × T₂ …`).
+            // `×` is right-associative, so folding from the right gives
+            // the pp the shape Lean expects without defensive parens.
+            let mut out = Expr::new(ExprNode::Var("Unit".into()));
+            for t in typs.iter() {
+                out = Expr::new(ExprNode::BinOp {
+                    op: BinOp::Prod,
+                    lhs: Box::new(out),
+                    rhs: Box::new(typ_to_expr(t)),
+                });
             }
+            out.node
         }
         TypX::AnonymousClosure(params, ret, _, _) => {
             let mut out = typ_to_expr(ret);
@@ -181,6 +178,7 @@ pub(crate) fn walk_typ<'a>(typ: &'a TypX, visit: &mut impl FnMut(&'a TypX)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lean_pp::pp_expr;
     use std::sync::Arc;
 
     fn render(t: &TypX) -> String { pp_expr(&typ_to_expr(t)) }

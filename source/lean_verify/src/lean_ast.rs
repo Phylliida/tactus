@@ -205,8 +205,13 @@ pub enum ExprNode {
     /// parenthesize the base against application precedence.
     Index { base: Box<Expr>, idx: Box<Expr> },
 
-    /// Escape hatch: verbatim Lean text. Used sparingly for forms we don't
-    /// yet model (Block statements, Multi, type-level `×` tuples).
+    /// `⟨a, b, c⟩` — Lean's anonymous constructor. Used for tuples and for
+    /// inferred data constructors where the target type is unambiguous.
+    Anon(Vec<Expr>),
+
+    /// Escape hatch: verbatim Lean text. Reserved for VIR forms that have
+    /// no direct Lean analogue (effectless markers, exotic shapes). The
+    /// goal is to keep this set small; prefer adding a real node.
     Raw(String),
 }
 
@@ -221,6 +226,9 @@ pub enum BinOp {
     Eq, Ne, Lt, Le, Gt, Ge,
     Add, Sub, Mul, Div, Mod,
     BitAnd, BitOr, BitXor, Shr, Shl,
+    /// Type-level Cartesian product `×`. Right-associative at ~35 in Lean.
+    /// Used for tuple types, including Verus `FnDef` encodings.
+    Prod,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
