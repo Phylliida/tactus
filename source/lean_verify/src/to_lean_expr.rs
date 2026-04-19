@@ -40,7 +40,7 @@ fn expr_prec(expr: &ExprX) -> u8 {
 /// Takes the full `Expr` (not just `ExprX`) to access type information.
 pub fn write_expr(out: &mut String, expr: &Expr) {
     match &expr.x {
-        ExprX::Const(c) => write_const(out, c, &expr.typ),
+        ExprX::Const(c) => write_const(out, c),
         ExprX::Var(ident) => write_name(out, &ident.0),
         ExprX::ConstVar(fun, _) => write_fn_ref(out, fun),
 
@@ -346,7 +346,7 @@ pub(crate) fn write_binders(out: &mut String, binders: &VarBinders<Typ>) {
     }
 }
 
-fn write_const(out: &mut String, c: &Constant, _typ: &Typ) {
+fn write_const(out: &mut String, c: &Constant) {
     match c {
         Constant::Bool(true) => out.push_str("True"),
         Constant::Bool(false) => out.push_str("False"),
