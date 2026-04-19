@@ -1,19 +1,24 @@
 //! Orchestrates Lean file generation and verification.
 //!
-//! This is the main entry point for lean_verify. Given a VIR krate and a
-//! proof fn, it generates a complete .lean file, invokes Lean, and returns
-//! a formatted error message on failure.
+//! Build a `Vec<Command>` via the AST, pretty-print once, and invoke Lean
+//! on the resulting `.lean` file. Per-declaration writers live in
+//! `to_lean_fn` / `sst_to_lean`; this file only sequences them and handles
+//! artifact I/O.
 
 use std::path::{Path, PathBuf};
 use vir::ast::*;
 use vir::sst::{FuncCheckSst, FunctionSst};
 use crate::dep_order::{self, FnGroup};
+use crate::lean_ast::Command;
+use crate::lean_pp::pp_commands;
 use crate::lean_process;
 use crate::prelude::TACTUS_PRELUDE;
 use crate::project;
 use crate::sst_to_lean;
-use crate::to_lean_fn;
+use crate::to_lean_fn::{self, LeanSourceMap};
 use crate::to_lean_type::{lean_name, sanitize_ident, short_name};
+
+// ── Artifact location ──────────────────────────────────────────────────
 
 /// Where to write generated Lean artifacts.
 ///
@@ -33,7 +38,6 @@ fn lean_out_root() -> PathBuf {
 }
 
 /// Compute the on-disk artifact path for a given function.
-///
 /// Structure: `{root}/{crate}/{fn_lean_name_with_underscores}.lean`.
 /// Dots in Lean names (module separators) become `__` so the file name stays flat.
 fn lean_file_path(crate_name: &str, fn_path: &vir::ast::Path) -> PathBuf {
@@ -42,7 +46,6 @@ fn lean_file_path(crate_name: &str, fn_path: &vir::ast::Path) -> PathBuf {
     lean_out_root().join(ns).join(format!("{}.lean", leaf))
 }
 
-/// Write `source` to `path`, creating parents as needed.
 fn write_lean_file(path: &Path, source: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -52,38 +55,32 @@ fn write_lean_file(path: &Path, source: &str) -> Result<(), String> {
         .map_err(|e| format!("could not write {}: {}", path.display(), e))
 }
 
-/// Emit the shared preamble (imports, prelude, namespace opener, and entity
-/// declarations transitively referenced by `root_fns`). Returns the opened
-/// namespace so the caller can emit a matching `end <ns>` after the theorem.
-///
-/// Both `generate_lean` (proof fns) and `generate_lean_exec` (exec fns) use
-/// this — they differ only in the theorem that comes after.
+// ── Preamble builder ───────────────────────────────────────────────────
+
+/// Build the shared preamble: imports, prelude, namespace-open, and entity
+/// declarations transitively referenced by `root_fns`. Returns a (preamble
+/// Vec, namespace) pair. Callers append the theorem command and the matching
+/// `end <ns>` command.
 ///
 /// Note: reference collection walks VIR-AST bodies. For exec fns the SST
 /// body may reference spec fns not reachable from the VIR body alone; the
 /// first slice only hits pure arithmetic so this isn't an issue yet. When
 /// `sst_to_lean` starts emitting calls into spec code, extend this to also
 /// walk the SST body.
-fn write_krate_preamble(
-    out: &mut String,
+fn krate_preamble(
     krate: &KrateX,
     imports: &[String],
     crate_name: &str,
     root_fns: &[&FunctionX],
-) -> String {
+) -> (Vec<Command>, String) {
+    let mut cmds: Vec<Command> = Vec::new();
     for imp in imports {
-        out.push_str("import ");
-        out.push_str(imp);
-        out.push('\n');
+        cmds.push(Command::Import(imp.clone()));
     }
-    if !imports.is_empty() { out.push('\n'); }
-
-    out.push_str(TACTUS_PRELUDE);
+    cmds.push(Command::Raw(TACTUS_PRELUDE.to_string()));
 
     let ns = sanitize_ident(crate_name);
-    out.push_str("namespace ");
-    out.push_str(&ns);
-    out.push('\n');
+    cmds.push(Command::NamespaceOpen(ns.clone()));
 
     let all_fns: Vec<&FunctionX> = krate.functions.iter().map(|f| &f.x).collect();
     let spec_fn_map = dep_order::build_spec_fn_map(&all_fns);
@@ -94,16 +91,16 @@ fn write_krate_preamble(
 
     for tr in &krate.traits {
         if refs.traits.contains(short_name(&tr.x.name)) {
-            to_lean_fn::write_trait(out, &tr.x, &method_lookup);
-            out.push('\n');
+            cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup)));
         }
     }
 
     for dt in &krate.datatypes {
         if let Dt::Path(p) = &dt.x.name {
             if refs.datatypes.contains(short_name(p)) {
-                to_lean_fn::write_datatype(out, &dt.x);
-                out.push('\n');
+                if let Some(d) = to_lean_fn::datatype_to_ast(&dt.x) {
+                    cmds.push(Command::Datatype(d));
+                }
             }
         }
     }
@@ -112,16 +109,13 @@ fn write_krate_preamble(
     for group in &groups {
         match group {
             FnGroup::Single(f) => {
-                to_lean_fn::write_spec_fn(out, f);
-                out.push('\n');
+                cmds.push(Command::Def(to_lean_fn::spec_fn_to_ast(f)));
             }
             FnGroup::Mutual(fns) => {
-                out.push_str("mutual\n");
-                for f in fns {
-                    to_lean_fn::write_spec_fn(out, f);
-                    out.push('\n');
-                }
-                out.push_str("end\n\n");
+                let inner: Vec<Command> = fns.iter()
+                    .map(|f| Command::Def(to_lean_fn::spec_fn_to_ast(f)))
+                    .collect();
+                cmds.push(Command::Mutual(inner));
             }
         }
     }
@@ -138,15 +132,17 @@ fn write_krate_preamble(
             .map(|a| &a.x)
             .collect();
         if !method_impls.is_empty() || !assoc_types.is_empty() {
-            to_lean_fn::write_trait_impl(out, &ti.x, &method_impls, &assoc_types);
-            out.push('\n');
+            cmds.push(Command::Instance(
+                to_lean_fn::trait_impl_to_ast(&ti.x, &method_impls, &assoc_types)
+            ));
         }
     }
 
-    ns
+    (cmds, ns)
 }
 
-/// Result of checking a proof fn through Lean.
+// ── Check results ──────────────────────────────────────────────────────
+
 #[must_use]
 pub enum CheckResult {
     /// Lean verified the proof successfully.
@@ -157,13 +153,9 @@ pub enum CheckResult {
     Error(String),
 }
 
-/// Check a tactic proof fn by generating Lean and invoking the Lean checker.
-///
-/// This is the single entry point for the verifier. It handles:
-/// - Collecting referenced spec fns, datatypes, and traits from the krate
-/// - Generating the complete .lean file with proper declaration ordering
-/// - Invoking Lean (via Lake project if available, bare lean otherwise)
-/// - Formatting error diagnostics with source map and goal states
+// ── Entry points ───────────────────────────────────────────────────────
+
+/// Check a tactic proof fn.
 pub fn check_proof_fn(
     krate: &KrateX,
     proof_fn: &FunctionX,
@@ -171,13 +163,15 @@ pub fn check_proof_fn(
     imports: &[String],
     crate_name: &str,
 ) -> CheckResult {
-    let lean_source = generate_lean(krate, proof_fn, tactic_body, imports, crate_name);
+    let (mut cmds, ns) = krate_preamble(krate, imports, crate_name, &[proof_fn]);
+    cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body)));
+    cmds.push(Command::NamespaceClose(ns));
 
-    // Write the generated Lean to disk as a build artifact, then invoke Lean on it.
-    // This gives (a) debuggable on-disk output, (b) real file paths in Lean's
-    // diagnostics, and (c) a foundation for Lake-managed `.olean` caching later.
+    let text = pp_commands(&cmds);
+    let source_map = build_proof_source_map(proof_fn, tactic_body, &text);
+
     let file_path = lean_file_path(crate_name, &proof_fn.name.path);
-    if let Err(e) = write_lean_file(&file_path, &lean_source.text) {
+    if let Err(e) = write_lean_file(&file_path, &text) {
         return CheckResult::Error(e);
     }
 
@@ -190,7 +184,7 @@ pub fn check_proof_fn(
         Ok(r) => {
             let errors: Vec<_> = r.diagnostics.iter()
                 .filter(|d| d.severity == "error")
-                .map(|d| lean_process::format_error(d, &lean_source.source_map))
+                .map(|d| lean_process::format_error(d, &source_map))
                 .collect();
             let fn_short = short_name(&proof_fn.name.path);
             CheckResult::Failed(format!(
@@ -202,44 +196,7 @@ pub fn check_proof_fn(
     }
 }
 
-/// Generated Lean source with source map for error reporting.
-struct LeanOutput {
-    text: String,
-    source_map: to_lean_fn::LeanSourceMap,
-}
-
-/// Generate a complete .lean file from a VIR krate and proof fn.
-fn generate_lean(
-    krate: &KrateX,
-    proof_fn: &FunctionX,
-    tactic_body: &str,
-    imports: &[String],
-    crate_name: &str,
-) -> LeanOutput {
-    let mut out = String::new();
-    let ns = write_krate_preamble(&mut out, krate, imports, crate_name, &[proof_fn]);
-
-    let tactic_start_line = to_lean_fn::write_proof_fn(&mut out, proof_fn, tactic_body);
-    let source_map = to_lean_fn::LeanSourceMap {
-        fn_name: short_name(&proof_fn.name.path).to_string(),
-        tactic_start_line,
-        tactic_line_count: tactic_body.lines().count().max(1),
-    };
-    out.push('\n');
-
-    out.push_str("end ");
-    out.push_str(&ns);
-    out.push('\n');
-
-    LeanOutput { text: out, source_map }
-}
-
-/// Check an exec fn by generating its body VC through SST → Lean WP and invoking Lean.
-///
-/// First-slice entry point for Track B. Takes the VIR krate (for prelude +
-/// spec fn dependencies), the VIR function (for imports), and the SST view
-/// (`FunctionSst` + `FuncCheckSst`) which carries the body in a form where
-/// VC generation is tractable.
+/// Check an exec fn via SST → WP → Lean.
 pub fn check_exec_fn(
     krate: &KrateX,
     vir_fn: &FunctionX,
@@ -248,7 +205,6 @@ pub fn check_exec_fn(
     imports: &[String],
     crate_name: &str,
 ) -> CheckResult {
-    // Bail out clearly if the body has shapes we haven't implemented yet.
     if let Err(reason) = sst_to_lean::supported_body(check) {
         return CheckResult::Failed(format!(
             "tactus_auto: {} (first slice supports only straight-line exec fns)",
@@ -256,10 +212,14 @@ pub fn check_exec_fn(
         ));
     }
 
-    let lean_source = generate_lean_exec(krate, vir_fn, fn_sst, check, imports, crate_name);
+    let (mut cmds, ns) = krate_preamble(krate, imports, crate_name, &[vir_fn]);
+    cmds.push(Command::Theorem(sst_to_lean::exec_fn_theorem_to_ast(fn_sst, check)));
+    cmds.push(Command::NamespaceClose(ns));
+
+    let text = pp_commands(&cmds);
 
     let file_path = lean_file_path(crate_name, &vir_fn.name.path);
-    if let Err(e) = write_lean_file(&file_path, &lean_source) {
+    if let Err(e) = write_lean_file(&file_path, &text) {
         return CheckResult::Error(e);
     }
 
@@ -267,9 +227,9 @@ pub fn check_exec_fn(
     let lake_dir = if project::project_ready(&dir) { Some(dir.as_path()) } else { None };
     let result = lean_process::check_lean_file(&file_path, lake_dir);
 
-    // Empty source map — exec fns don't have a tactic body to map into yet.
-    // `format_error` gracefully handles zero-length tactic ranges.
-    let empty_source_map = to_lean_fn::LeanSourceMap {
+    // Exec fns don't have a user-written tactic body yet (see TODO in
+    // `sst_to_lean::exec_fn_theorem_to_ast`). Use an empty source map.
+    let empty = LeanSourceMap {
         fn_name: short_name(&vir_fn.name.path).to_string(),
         tactic_start_line: 0,
         tactic_line_count: 0,
@@ -280,7 +240,7 @@ pub fn check_exec_fn(
         Ok(r) => {
             let errors: Vec<_> = r.diagnostics.iter()
                 .filter(|d| d.severity == "error")
-                .map(|d| lean_process::format_error(d, &empty_source_map))
+                .map(|d| lean_process::format_error(d, &empty))
                 .collect();
             CheckResult::Failed(format!(
                 "Lean tactus_auto failed for {}:\n\n{}",
@@ -292,26 +252,27 @@ pub fn check_exec_fn(
     }
 }
 
-/// Emit the full Lean source for an exec fn body check.
-/// Shares the imports/prelude/traits/datatypes/spec-fns preamble with the
-/// proof-fn path; differs only in the final theorem (WP from SST).
-fn generate_lean_exec(
-    krate: &KrateX,
-    vir_fn: &FunctionX,
-    fn_sst: &FunctionSst,
-    check: &FuncCheckSst,
-    imports: &[String],
-    crate_name: &str,
-) -> String {
-    let mut out = String::new();
-    let ns = write_krate_preamble(&mut out, krate, imports, crate_name, &[vir_fn]);
+// ── Source map ─────────────────────────────────────────────────────────
 
-    sst_to_lean::write_exec_fn_theorem(&mut out, fn_sst, check);
-    out.push('\n');
-
-    out.push_str("end ");
-    out.push_str(&ns);
-    out.push('\n');
-
-    out
+/// Find where the proof fn's tactic body starts in the pretty-printed Lean.
+/// The AST theorem writer emits `...:= by\n` right before the tactic block,
+/// so we scan the file for that marker inside the theorem declaration.
+fn build_proof_source_map(
+    proof_fn: &FunctionX,
+    tactic_body: &str,
+    text: &str,
+) -> LeanSourceMap {
+    let fn_name = short_name(&proof_fn.name.path).to_string();
+    let marker_prefix = format!("theorem {}", lean_name(&proof_fn.name.path));
+    let start = text.find(&marker_prefix).and_then(|i| {
+        text[i..].find(":= by\n").map(|j| i + j + ":= by\n".len())
+    });
+    let tactic_start_line = start
+        .map(|byte_off| 1 + text[..byte_off].bytes().filter(|&b| b == b'\n').count())
+        .unwrap_or(0);
+    LeanSourceMap {
+        fn_name,
+        tactic_start_line,
+        tactic_line_count: tactic_body.lines().count().max(1),
+    }
 }
