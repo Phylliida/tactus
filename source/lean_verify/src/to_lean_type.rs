@@ -28,13 +28,28 @@ fn typ_to_node(typ: &TypX) -> ExprNode {
         }),
         TypX::TypParam(name) => ExprNode::Var(name.to_string()),
         TypX::Boxed(inner) => typ_to_node(inner),
-        TypX::Datatype(dt, args, _) => {
-            let name = match dt {
-                Dt::Path(path) => lean_name(path),
-                Dt::Tuple(n) => format!("Tuple{}", n),
-            };
-            applied(&name, args.iter().map(|a| typ_to_expr(a)).collect())
-        }
+        TypX::Datatype(dt, args, _) => match dt {
+            Dt::Path(path) => applied(&lean_name(path), args.iter().map(|a| typ_to_expr(a)).collect()),
+            // Anonymous Rust tuple → Lean product type `T₁ × T₂ × … × Tₙ`.
+            // Zero-element → `Unit`; single-element → the element itself
+            // (Verus doesn't produce 1-tuples, but handle it defensively).
+            Dt::Tuple(_) => match args.len() {
+                0 => ExprNode::Var("Unit".into()),
+                1 => typ_to_node(&args[0]),
+                _ => {
+                    let mut iter = args.iter().rev();
+                    let mut acc = typ_to_expr(iter.next().unwrap());
+                    for a in iter {
+                        acc = Expr::new(ExprNode::BinOp {
+                            op: BinOp::Prod,
+                            lhs: Box::new(typ_to_expr(a)),
+                            rhs: Box::new(acc),
+                        });
+                    }
+                    acc.node
+                }
+            },
+        },
         TypX::SpecFn(params, ret) => {
             // Fold params right-to-left into nested → so the AST reflects
             // Lean's right-associative arrow.

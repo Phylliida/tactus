@@ -175,7 +175,7 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
         ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => expr_to_node(inner),
         ExprX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => ExprNode::FieldProj {
             expr: Box::new(vir_expr_to_ast(inner)),
-            field: sanitize(&field_opr.field),
+            field: field_access_name(field_opr),
         },
         ExprX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => ExprNode::FieldProj {
             expr: Box::new(vir_expr_to_ast(inner)),
@@ -378,8 +378,28 @@ fn trait_method_ref(fun: &Fun) -> LExpr {
     }
 }
 
+/// Map a VIR field access name to the one the Lean side expects.
+///
+/// * Anonymous tuple (`Dt::Tuple`) uses 0-indexed numeric fields like `"0"`
+///   and `"1"`; Lean's `Prod`-derived accessor is 1-indexed (`.1`, `.2`).
+///   So `"0"` → `"1"`, `"1"` → `"2"`, etc.
+/// * Tuple-struct variant (`Dt::Path` with numeric field names): our
+///   datatype emitter renames the fields to `val0` / `val1` / … (see
+///   `to_lean_fn::field_name`), so access must match.
+/// * Named struct fields pass through unchanged (after identifier
+///   sanitization).
+fn field_access_name(field_opr: &FieldOpr) -> String {
+    let raw = field_opr.field.as_str();
+    let numeric = raw.parse::<usize>().ok();
+    match (&field_opr.datatype, numeric) {
+        (Dt::Tuple(_), Some(n)) => (n + 1).to_string(),
+        (Dt::Path(_), Some(n)) => format!("val{}", n),
+        _ => sanitize(raw),
+    }
+}
+
 fn ctor_to_node(dt: &Dt, variant: &Ident, fields: &Binders<Expr>) -> ExprNode {
-    let head = match dt {
+    match dt {
         Dt::Path(path) => {
             let type_name = lean_name(path);
             let variant_seg = if variant.as_str() == short_name(path) {
@@ -387,17 +407,21 @@ fn ctor_to_node(dt: &Dt, variant: &Ident, fields: &Binders<Expr>) -> ExprNode {
             } else {
                 sanitize(variant)
             };
-            format!("{}.{}", type_name, variant_seg)
+            let head = format!("{}.{}", type_name, variant_seg);
+            if fields.is_empty() {
+                ExprNode::Var(head)
+            } else {
+                ExprNode::App {
+                    head: Box::new(var(&head)),
+                    args: fields.iter().map(|f| vir_expr_to_ast(&f.a)).collect(),
+                }
+            }
         }
-        Dt::Tuple(_) => sanitize(variant),
-    };
-    if fields.is_empty() {
-        ExprNode::Var(head)
-    } else {
-        ExprNode::App {
-            head: Box::new(var(&head)),
-            args: fields.iter().map(|f| vir_expr_to_ast(&f.a)).collect(),
-        }
+        // Anonymous tuple → Lean anonymous constructor `⟨a, b, c⟩`, which
+        // elaborates against the tuple's product type.
+        Dt::Tuple(_) => ExprNode::Anon(
+            fields.iter().map(|f| vir_expr_to_ast(&f.a)).collect()
+        ),
     }
 }
 
@@ -504,7 +528,7 @@ fn place_to_expr(place: &PlaceX) -> LExpr {
         PlaceX::Local(ident) => ExprNode::Var(sanitize(&ident.0)),
         PlaceX::Field(field_opr, base) => ExprNode::FieldProj {
             expr: Box::new(place_to_expr(&base.x)),
-            field: sanitize(&field_opr.field),
+            field: field_access_name(field_opr),
         },
         PlaceX::DerefMut(inner) | PlaceX::ModeUnwrap(inner, _) => {
             return place_to_expr(&inner.x);
