@@ -221,7 +221,9 @@ pub fn check_exec_fn(
     }
 
     let (mut cmds, ns) = krate_preamble(krate, imports, crate_name, &[vir_fn]);
-    cmds.push(Command::Theorem(sst_to_lean::exec_fn_theorem_to_ast(fn_sst, check)));
+    for theorem in sst_to_lean::exec_fn_theorems_to_ast(fn_sst, check) {
+        cmds.push(Command::Theorem(theorem));
+    }
     cmds.push(Command::NamespaceClose(ns));
 
     debug_check(&cmds);
@@ -238,7 +240,7 @@ pub fn check_exec_fn(
     let result = lean_process::check_lean_file(&file_path, lake_dir);
 
     // Exec fns don't have a user-written tactic body yet (see TODO in
-    // `sst_to_lean::exec_fn_theorem_to_ast`). Use an empty source map.
+    // `sst_to_lean::exec_fn_theorems_to_ast`). Use an empty source map.
     let empty = LeanSourceMap {
         fn_name: short_name(&vir_fn.name.path).to_string(),
         tactic_start_line: 0,

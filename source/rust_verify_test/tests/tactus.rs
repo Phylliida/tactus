@@ -2406,3 +2406,31 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// ── Slice 5: loops (init / maintain / use) ────────────────────────────
+//
+// Simplest loop shape we support: exactly one top-level `while` with a
+// simple condition, invariant true at entry AND exit, single-expression
+// `decreases`, `loop_isolation: true`, no break/continue. The loop emits
+// three separate theorems: init (pre-loop → invariant), maintain
+// (invariant ∧ cond → wp(body, invariant ∧ decreases-measure decreased)),
+// and a main theorem where post-loop code runs under havoced modified
+// vars + invariant + ¬cond.
+
+test_verify_one_file! {
+    #[test] test_exec_loop_count_down verus_code! {
+        #[verifier::tactus_auto]
+        fn count_down(n: u8) -> (r: u8)
+            ensures r == 0
+        {
+            let mut x: u8 = n;
+            while x > 0
+                invariant x <= n
+                decreases x
+            {
+                x = x - 1;
+            }
+            x
+        }
+    } => Ok(())
+}
+
