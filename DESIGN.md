@@ -753,6 +753,12 @@ The honest choice for now is to emit no bound for usize/isize and document that 
 
 Alternative: introduce a `let _goal_k := <rest_goal>` binding at each if and have both branches refer to `_goal_k`. This preserves logical equivalence with linear size. Not implemented — the cost hasn't shown up yet — but noted here so the trade-off is explicit when someone hits it.
 
+### `_tactus_d_old` aliasing across nested loops
+
+`sst_to_lean::build_loop_conjunction` emits `let _tactus_d_old := D; …` inside every loop's maintain clause to capture the decrease measure pre-body. The name is literal, not gensym'd, so nested loops' `let _tactus_d_old` bindings shadow each other in Lean.
+
+This is correct for the current architecture: the inner loop's shadow is confined to the inner's maintain conjunct, and the outer's `_tactus_d_old` reference lives in the outer's maintain conjunct (a sibling, not a descendant), so they never clash in scope. A gensym'd `_tactus_d_old_<loop_id>` would make the independence syntactically obvious but doesn't change semantics. Worth threading a counter through `build_loop_conjunction` if we ever refactor loops into a structure where scoping IS ambiguous — until then, the literal name is fine and keeps the generated Lean readable.
+
 ### Tactic-string interning (minor TODO)
 
 `sst_to_lean::loop_tactic()` allocates the same `"tactus_peel; all_goals tactus_auto"` String on every call. For a crate with hundreds of exec fns with loops this adds up. Options: `const` static slice + a `Tactic::Static(&'static str)` variant, or define the composite as a single macro in `TactusPrelude.lean` (e.g., `tactus_auto_loop`) and emit `Tactic::Named("tactus_auto_loop")`. Not urgent — current cost is negligible — but worth nudging on any next prelude pass.
