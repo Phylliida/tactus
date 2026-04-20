@@ -8,11 +8,19 @@ See `DESIGN.md` for the full design rationale and decisions.
 
 ## Current state (2026-04 session end)
 
-**109 end-to-end tests + 1 coverage test + 35 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**119 end-to-end tests + 1 coverage test + 35 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
-### Recent session summary (Track A stabilization → Track B first slice → infrastructure hardening)
+### Follow-up session (slices 2, 3, 6 of Track B; overflow soundness fix)
 
-This session landed 13 commits on `main`:
+Landed three more commits on top of the prior session's 13, covering the remaining non-loop Track B slices. Slice 5 (loops) is still pending.
+
+1. **Slice 2 — if/else WP rule (`dd2df26`).** `StmX::If(cond, then, Option<else>)` folds to `(c → wp(then ++ rest)) ∧ (¬c → wp(else ++ rest))`. `BodyItem` gains an `IfThenElse { cond, then_items, else_items }` variant; `walk` recurses into both branches, `build_goal` duplicates the continuation into both sides (syntactic — not a shared goal). Four tests: both-branches-assert, no-else, false-assert-in-branch (rejection), nested if.
+2. **Slice 3 — mutation via SSA (`808b6ff`).** Zero code changes: Lean's let-shadowing gives SSA for free. Every `StmX::Assign { is_init: _ }` emits `let x := e`, so sequential mutation just shadows; in-branch mutation also shadows correctly because each branch has its own scope. Three tests including a negative test that confirms the else-branch correctly reads the pre-mutation value. Loops won't inherit this — a loop body's mutations can't tunnel out through shadowing.
+3. **Slice 6 — overflow obligations / soundness fix (`556b09e`).** `HasType(e, U(n))` used to render as `True`; we relied on parameter types to carry bounds, but u8 renders as `Nat` which gives the lower bound for free and drops the upper. Every fixed-width exec fn was potentially unsound. Now `HasType` emits the real predicate (`e < 2^n` for U, `-2^(n-1) ≤ e ∧ e < 2^(n-1)` for I, `e < 0x110000` for Char), and fixed-width params get `(h_<name>_bound : …)` hypotheses injected after the param binders. USize/ISize still elided (needs `arch_word_bits` wired through the prelude). `IntegerTypeBound` kept as `True` with a TODO — it returns a value not a predicate, and no test touches it yet.
+
+### Prior session summary (Track A stabilization → Track B first slice → infrastructure hardening)
+
+That session landed 13 commits on `main`:
 
 1. **Track B first slice (`cac0f28`)** — `sst_to_lean.rs` generates a weakest-precondition theorem for `#[verifier::tactus_auto]` exec fns. Handles straight-line code only (Block + Return + Assign). On-disk Lean artifacts replaced stdin piping.
 2. **Slice 1 review (`e2b2fcb`)** — sound assert/assume handling (they were being silently dropped); expression-level support check so unsupported forms fail cleanly; preamble extraction; shared helpers.
@@ -139,21 +147,60 @@ Semantic model (WP, in body order):
 
 Tests: `test_exec_const_return`, `test_exec_add_one`, `test_exec_wrong_ensures`, `test_exec_assert_holds`, `test_exec_assert_fails`.
 
-### Slice 2–5: remaining work (pending tasks)
+### Slice 2: if/else WP rule ✅
+
+`StmX::If(cond, then, Option<else>)` folds to `(c → wp(then ++ rest)) ∧ (¬c → wp(else ++ rest))`. `BodyItem` has an `IfThenElse` variant with per-branch sub-lists; `build_goal` duplicates the continuation into both branches (syntactic — no shared let-goal).
+
+Tests: `test_exec_if_assert_holds`, `test_exec_if_no_else`, `test_exec_if_assert_fails`, `test_exec_nested_if`.
+
+### Slice 3: mutation via SSA ✅
+
+No-op: Lean's let-shadowing gives SSA for free. Every `StmX::Assign` emits `let x := e` regardless of `is_init`; sequential mutation shadows, branch-local mutation is scoped to its branch's implication.
+
+Tests: `test_exec_mut_seq`, `test_exec_mut_in_branch`, `test_exec_mut_branch_leak` (negative — confirms the else-branch sees the pre-mutation value).
+
+### Slice 6: overflow obligations ✅ (soundness fix)
+
+`HasType(e, U(n))` now emits `e < 2^n` (was `True` — a soundness bug). Fixed-width params get `(h_<name>_bound : …)` hypotheses. `I(n)` produces `-2^(n-1) ≤ e ∧ e < 2^(n-1)`. USize/ISize still elided (needs prelude `arch_word_bits` plumbing).
+
+Tests: `test_exec_overflow_diagnostic` (unguarded `u8+u8` correctly rejected), `test_exec_overflow_tight_ok` (`requires x+y ≤ 255` makes it pass), `test_exec_signed_overflow_fails` (`i8+i8` without bounds rejected).
+
+Known gap: `IntegerTypeBound(kind, _)` still renders as `True` — it's a value (like `usize::MAX`), not a proposition, so the right fix is to emit the actual numeric literal. Deferred until a test needs it.
+
+### Slice 4: loops — pending
 
 | # | Task | Notes |
 |---|------|-------|
-| 3 | **if/else WP rule** | `ExprNode::If` already has `else_: Option<Box<Expr>>` + precedence-tested pp. WP rule: `(c → wp(t)) ∧ (¬c → wp(e))`. Add `StmX::If` to `supported_body`. |
-| 4 | **Mutation via SSA** | `let mut x = …; x = …;` → variable versioning. Maintain a rename map as we walk the body; each mutation creates `x_1`, `x_2`, etc. |
-| 5 | **Loop obligations** | `while cond invariant I decreases D { body }` → three theorems: init (`requires ⟹ I`), maintain (`I ∧ cond ⟹ wp(body, I) ∧ D decreases`), use (`I ∧ ¬cond ⟹ ensures`). Each becomes its own `Command::Theorem`. |
-| 6 | **Overflow obligations** | Each arithmetic op on fixed-width types emits an `Assert` for `0 ≤ result ∧ result < 2^bits`. Currently silently skipped — all `test_exec_*` functions use `u8` with generous bounds. |
+| 5 | **Loop obligations** | `while cond invariant I decreases D { body }` → three theorems: init (`pre → I`), maintain (havoc modified vars; `I ∧ cond → wp(body, I) ∧ D_decreases`), use (havoc modified vars; `I ∧ ¬cond → ensures`). Each becomes its own `Command::Theorem`. |
+
+**Architecture changes needed:**
+
+- `exec_fn_theorem_to_ast` → `exec_fn_theorems_to_ast` returning `Vec<Theorem>`.
+- `generate.rs::check_exec_fn` pushes each theorem as its own `Command::Theorem`; failure of any = failure of the fn.
+- `supported_body` detects loops and only accepts the simplest shape first (cond = Some, `loop_isolation: true`, no break/continue, top-level loop).
+- `build_goal` splits the body at the loop: pre-loop items → init goal; loop body → maintain goal (with modified vars universally re-bound); post-loop items + ensures → use goal.
+- Havoc: read `Loop::modified_vars` (Option<HavocSet>) and re-quantify those variables in maintain + use. Variables absent from the set retain their pre-loop values.
+
+**Likely shape of the first test:**
+```rust
+fn count_down(n: u8) -> (r: u8) ensures r == 0 {
+    let mut x = n;
+    while x > 0 invariant x <= n decreases x {
+        x = x - 1;
+    }
+    x
+}
+```
+Init: `n ≤ n`. Maintain: `x ≤ n ∧ x > 0 → (x - 1 ≤ n ∧ x - 1 < x)`. Use: `x ≤ n ∧ ¬(x > 0) → x = 0`. All three discharge by `omega`.
+
+### Adding new slices
 
 Each new slice should:
-1. Extend `sst_to_lean::supported_body` / `supported_stmt` to accept the new form.
-2. Extend `sst_to_lean::build_goal` to fold it into the WP nesting structure.
+1. Extend `sst_to_lean::supported_body` / `check_stm` to accept the new form.
+2. Extend `sst_to_lean::build_goal` (or the theorem-list builder) to fold it into the WP nesting structure.
 3. If it produces new AST shapes, extend `lean_ast` and `lean_pp`.
-4. Add one or more snippets to `tactus_coverage::run_snippets` that exercise the new walker path.
-5. Add the new ExprX / PlaceX variants to `EXPECTED_EXPR_VARIANTS` / `EXPECTED_PLACE_VARIANTS` if they become reachable.
+4. Add one or more snippets to `tactus_coverage::run_snippets` that exercise the new walker path (SST-only forms don't need coverage — `dep_order::walk_expr` is VIR-AST-only).
+5. Add new ExprX / PlaceX variants to `EXPECTED_EXPR_VARIANTS` / `EXPECTED_PLACE_VARIANTS` if they become reachable.
 6. Update the expected variants in `sanity.rs` only if new Lean-level builtins become referenced.
 
 ## Testing infrastructure
@@ -164,7 +211,7 @@ Each new slice should:
 |---|---|---|
 | `cargo test -p lean_verify --lib` | 35 | AST pp (precedence, tuples, indexing), type translation, sanity check scope tracking, lean_process |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
-| `vargo test -p rust_verify_test --test tactus` | 109 | Full e2e: VIR → AST → Lean for proof fns + exec fns |
+| `vargo test -p rust_verify_test --test tactus` | 119 | Full e2e: VIR → AST → Lean for proof fns + exec fns (includes slices 1–6 exc. loops) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
 | `vargo build --release` (vstd) | 1530 | Regression guard: vstd proof library still verifies |
 
