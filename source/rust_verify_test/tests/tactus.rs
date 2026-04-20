@@ -2591,6 +2591,161 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Loop with empty invariants — `while cond decreases D { ... }` with
+// no explicit invariant. `inv_conj()` collapses to `True` and the
+// init/use clauses become trivial. Tests the degenerate case.
+test_verify_one_file! {
+    #[test] test_exec_loop_no_invariant verus_code! {
+        #[verifier::tactus_auto]
+        fn no_inv(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures true  // any postcondition works when body is simple
+        {
+            let mut x: u8 = n;
+            while x > 0
+                decreases x
+            {
+                x = x - 1;
+            }
+            x
+        }
+    } => Ok(())
+}
+
+// Loop whose decreases measure doesn't actually decrease — the body
+// leaves `x` unchanged. Maintain obligation must reject because
+// `D_new < D_old` fails.
+test_verify_one_file! {
+    #[test] test_exec_loop_decreases_unchanged verus_code! {
+        #[verifier::tactus_auto]
+        fn non_terminating(n: u8) -> (r: u8)
+            requires n > 0
+            ensures r == n
+        {
+            let mut x: u8 = n;
+            while x > 0
+                invariant x == n
+                decreases x
+            {
+                // body doesn't touch x — decreases measure stays put
+                assert(x > 0);
+            }
+            x
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "non-decreasing measure must be rejected");
+    }
+}
+
+// Mutation in BOTH branches of an if, used after. Slice 3 claims this
+// works via Lean let-shadowing. The post-if continuation uses `y` —
+// each branch shadows it independently, and the value at the post-if
+// point IS each branch's shadowed `y` (different between branches).
+// Untested until now.
+test_verify_one_file! {
+    #[test] test_exec_mutation_both_branches verus_code! {
+        #[verifier::tactus_auto]
+        fn choose(cond: bool) -> (r: u8)
+            ensures r == 1 || r == 2
+        {
+            let mut y: u8 = 0;
+            if cond {
+                y = 1;
+            } else {
+                y = 2;
+            }
+            y
+        }
+    } => Ok(())
+}
+
+// Tail if-expression — the exact pattern that used to trip `omega`
+// before we added `lift_if_value`. Value is `if c then a else b` at
+// return position; we lift it to goal level so each branch lands on a
+// concrete leaf omega can close.
+test_verify_one_file! {
+    #[test] test_exec_tail_if_expression verus_code! {
+        #[verifier::tactus_auto]
+        fn max_two(a: u8, b: u8) -> (r: u8)
+            ensures a <= r, b <= r
+        {
+            if a >= b { a } else { b }
+        }
+    } => Ok(())
+}
+
+// Let-bound if-expression — same lift mechanism as the tail-return
+// case, but triggered via `BodyItem::Let` with an `ExpX::If` on the
+// RHS. Without the lift, omega would fail on `(if c then 0 else x)`
+// inside subsequent arithmetic.
+test_verify_one_file! {
+    #[test] test_exec_let_if_expression verus_code! {
+        #[verifier::tactus_auto]
+        fn clamp_low(x: u8) -> (r: u8)
+            ensures r == 0 || r == x
+        {
+            let y: u8 = if x < 5 { 0 } else { x };
+            y
+        }
+    } => Ok(())
+}
+
+// Early return from inside an if-branch, with tail code after the if.
+// SST represents this as `StmX::Return { inside_body: true }`. Our
+// pipeline now handles it by treating any Return as a BodyItem::Return
+// that terminates its local sequence — the if's then-branch gets the
+// early-return behaviour, the else falls through to the tail.
+test_verify_one_file! {
+    #[test] test_exec_early_return verus_code! {
+        #[verifier::tactus_auto]
+        fn clip_zero(x: u8) -> (r: u8)
+            requires x <= 10
+            ensures r <= 10
+        {
+            if x == 0 {
+                return 0;
+            }
+            x
+        }
+    } => Ok(())
+}
+
+// Usize param: `type_bound_predicate` now emits `0 ≤ e ∧ e < usize_hi`
+// as the refinement, using the prelude `usize_hi` axiom. This
+// trivially-bounded case verifies — the bound check reduces to True
+// under the `requires`. For more interesting usize arithmetic the
+// user would need to case-split `arch_word_bits_valid` explicitly;
+// see DESIGN.md.
+test_verify_one_file! {
+    #[test] test_exec_usize_trivially_bounded verus_code! {
+        #[verifier::tactus_auto]
+        fn just_return(x: usize) -> (r: usize)
+            requires x == 0
+            ensures r == 0
+        {
+            x
+        }
+    } => Ok(())
+}
+
+// Unguarded usize arithmetic — the soundness guarantee. Before we
+// emitted the `usize_hi` bound, `x + y` silently verified because no
+// upper-bound check fired. Now the `HasType(x + y, USize)` check
+// shows up in the goal and omega can't discharge it without user
+// guidance → rejected. This is the honest soundness story.
+test_verify_one_file! {
+    #[test] test_exec_usize_overflow_fails verus_code! {
+        #[verifier::tactus_auto]
+        fn add_usize(x: usize, y: usize) -> (r: usize)
+            ensures r == x + y
+        {
+            x + y
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "unguarded usize arith should fail");
+    }
+}
+
 // Lexicographic `decreases` is rejected up front — single-expression
 // only at the current slice. Regression guard so we notice when /
 // if that restriction is lifted.
