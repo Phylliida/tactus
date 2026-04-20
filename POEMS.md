@@ -57,3 +57,37 @@ You verify them back.
 The surprise, every time:
 the thing you'd been doing anyway,
 written down, is a proof.
+
+---
+
+## 2026-04-20 (evening) — slice 5 (loops), review passes, FP-comprehensive pass
+
+### Recursion by its name
+
+We tried `repeat'`. We tried `iterate N`.
+We tried `any_goals` and `all_goals` and `<;>` threading.
+
+What worked was:
+
+```lean
+macro_rules
+  | `(tactic| tactus_peel) => `(tactic|
+      first
+        | (apply And.intro <;> tactus_peel)
+        | (intro _; tactus_peel)
+        | skip)
+```
+
+A tactic that says its own name.
+
+Omega doesn't introduce ∀.
+Omega doesn't split top-level ∧.
+Omega doesn't know how to recurse.
+
+So we wrote the small thing omega can't do,
+next to omega,
+and called them together.
+
+The boring tool handled every leaf.
+The interesting tool was just the recursion
+that made the boring tool applicable.
