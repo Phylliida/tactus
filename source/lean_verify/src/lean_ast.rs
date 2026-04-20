@@ -154,6 +154,84 @@ pub struct Expr {
 
 impl Expr {
     pub fn new(node: ExprNode) -> Self { Expr { node } }
+
+    // ── Smart constructors ─────────────────────────────────────────────
+    //
+    // The AST's wire format puts every non-leaf field behind a `Box<Expr>`
+    // so recursive construction quickly becomes `Box::new(Expr::new(
+    // ExprNode::BinOp { ... }))` chains. Callers can use these helpers
+    // to build trees readably — `Expr::and(l, r)` instead of the full
+    // three-line incantation.
+    //
+    // Naming follows the ExprNode variants where that's clearest
+    // (`binop`, `unop`, `app`, `let_bind`, `field_proj`, `anon`); binary
+    // operators also get shorthand aliases (`and`, `or`, `implies`,
+    // `eq`, `lt`, `le`, `gt`, `ge`, `add`, `sub`, `mul`). Unary ops get
+    // `not` and `neg`.
+
+    pub fn var(name: impl Into<String>) -> Self {
+        Expr::new(ExprNode::Var(name.into()))
+    }
+    pub fn lit_bool(b: bool) -> Self { Expr::new(ExprNode::LitBool(b)) }
+    pub fn lit_true() -> Self { Expr::lit_bool(true) }
+    pub fn lit_false() -> Self { Expr::lit_bool(false) }
+    /// Integer literal from a pre-formatted decimal or hex string. The
+    /// pp doesn't inspect the contents; it just embeds the text.
+    pub fn lit_int(s: impl Into<String>) -> Self {
+        Expr::new(ExprNode::Lit(s.into()))
+    }
+
+    pub fn binop(op: BinOp, lhs: Expr, rhs: Expr) -> Self {
+        Expr::new(ExprNode::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) })
+    }
+    pub fn and(lhs: Expr, rhs: Expr) -> Self { Expr::binop(BinOp::And, lhs, rhs) }
+    pub fn or(lhs: Expr, rhs: Expr) -> Self { Expr::binop(BinOp::Or, lhs, rhs) }
+    pub fn implies(lhs: Expr, rhs: Expr) -> Self { Expr::binop(BinOp::Implies, lhs, rhs) }
+    pub fn eq(lhs: Expr, rhs: Expr) -> Self { Expr::binop(BinOp::Eq, lhs, rhs) }
+    pub fn ne(lhs: Expr, rhs: Expr) -> Self { Expr::binop(BinOp::Ne, lhs, rhs) }
+    pub fn lt(lhs: Expr, rhs: Expr) -> Self { Expr::binop(BinOp::Lt, lhs, rhs) }
+    pub fn le(lhs: Expr, rhs: Expr) -> Self { Expr::binop(BinOp::Le, lhs, rhs) }
+    pub fn gt(lhs: Expr, rhs: Expr) -> Self { Expr::binop(BinOp::Gt, lhs, rhs) }
+    pub fn ge(lhs: Expr, rhs: Expr) -> Self { Expr::binop(BinOp::Ge, lhs, rhs) }
+    pub fn add(lhs: Expr, rhs: Expr) -> Self { Expr::binop(BinOp::Add, lhs, rhs) }
+    pub fn sub(lhs: Expr, rhs: Expr) -> Self { Expr::binop(BinOp::Sub, lhs, rhs) }
+    pub fn mul(lhs: Expr, rhs: Expr) -> Self { Expr::binop(BinOp::Mul, lhs, rhs) }
+
+    pub fn unop(op: UnOp, arg: Expr) -> Self {
+        Expr::new(ExprNode::UnOp { op, arg: Box::new(arg) })
+    }
+    pub fn not(arg: Expr) -> Self { Expr::unop(UnOp::Not, arg) }
+    pub fn neg(arg: Expr) -> Self { Expr::unop(UnOp::Neg, arg) }
+
+    /// `head args[0] args[1] …`. Zero args collapses to `head` — App
+    /// with an empty arg list is meaningless and confuses the pp.
+    pub fn app(head: Expr, args: Vec<Expr>) -> Self {
+        if args.is_empty() {
+            head
+        } else {
+            Expr::new(ExprNode::App { head: Box::new(head), args })
+        }
+    }
+    /// `head arg` — shorthand for the common unary-application case.
+    pub fn app1(head: Expr, arg: Expr) -> Self { Expr::app(head, vec![arg]) }
+
+    pub fn let_bind(name: impl Into<String>, value: Expr, body: Expr) -> Self {
+        Expr::new(ExprNode::Let {
+            name: name.into(),
+            value: Box::new(value),
+            body: Box::new(body),
+        })
+    }
+
+    pub fn field_proj(expr: Expr, field: impl Into<String>) -> Self {
+        Expr::new(ExprNode::FieldProj { expr: Box::new(expr), field: field.into() })
+    }
+
+    pub fn anon(elems: Vec<Expr>) -> Self { Expr::new(ExprNode::Anon(elems)) }
+
+    pub fn type_annot(expr: Expr, ty: Expr) -> Self {
+        Expr::new(ExprNode::TypeAnnot { expr: Box::new(expr), ty: Box::new(ty) })
+    }
 }
 
 #[derive(Debug, Clone)]

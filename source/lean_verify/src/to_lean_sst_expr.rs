@@ -11,7 +11,7 @@
 use vir::ast::*;
 use vir::sst::{BndX, CallFun, Exp, ExpX};
 use crate::lean_ast::{
-    BinOp as L, Binder as LBinder, BinderKind, Expr as LExpr, ExprNode, UnOp as LUn,
+    BinOp as L, Binder as LBinder, BinderKind, Expr as LExpr, ExprNode,
 };
 use crate::lean_pp::pp_expr;
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
@@ -25,10 +25,6 @@ pub fn sst_exp_to_ast(e: &Exp) -> LExpr {
 /// while callers are migrated to the AST API.
 pub fn write_sst_exp(out: &mut String, e: &Exp) {
     out.push_str(&pp_expr(&sst_exp_to_ast(e)));
-}
-
-fn var(s: impl Into<String>) -> LExpr {
-    LExpr::new(ExprNode::Var(s.into()))
 }
 
 /// `2^n` rendered as a decimal string. Supports 0 ≤ n ≤ 128 — VIR's
@@ -45,9 +41,7 @@ fn two_pow_str(n: u32) -> String {
     }
 }
 
-fn two_pow_lit(n: u32) -> LExpr {
-    LExpr::new(ExprNode::Lit(two_pow_str(n)))
-}
+fn two_pow_lit(n: u32) -> LExpr { LExpr::lit_int(two_pow_str(n)) }
 
 /// If `e` is a constant non-negative integer that fits in `u32`, return
 /// its value. Used to read the bit-width argument of `IntegerTypeBound`
@@ -164,52 +158,21 @@ pub fn type_bound_predicate(e: &LExpr, ty: &Typ) -> Option<LExpr> {
         _ => return None,
     };
     match range {
-        IntRange::U(n) => Some(LExpr::new(ExprNode::BinOp {
-            op: L::Lt,
-            lhs: Box::new(e.clone()),
-            rhs: Box::new(two_pow_lit(*n)),
-        })),
+        IntRange::U(n) => Some(LExpr::lt(e.clone(), two_pow_lit(*n))),
         IntRange::I(n) => {
             let hi = two_pow_lit(*n - 1);
-            let lo = LExpr::new(ExprNode::UnOp {
-                op: LUn::Neg,
-                arg: Box::new(hi.clone()),
-            });
-            let lo_le = LExpr::new(ExprNode::BinOp {
-                op: L::Le,
-                lhs: Box::new(lo),
-                rhs: Box::new(e.clone()),
-            });
-            let e_lt = LExpr::new(ExprNode::BinOp {
-                op: L::Lt,
-                lhs: Box::new(e.clone()),
-                rhs: Box::new(hi),
-            });
-            Some(LExpr::new(ExprNode::BinOp {
-                op: L::And,
-                lhs: Box::new(lo_le),
-                rhs: Box::new(e_lt),
-            }))
+            Some(LExpr::and(
+                LExpr::le(LExpr::neg(hi.clone()), e.clone()),
+                LExpr::lt(e.clone(), hi),
+            ))
         }
-        // Unicode scalar range: 0 ≤ c ≤ U+10FFFF. We render as
-        // `c < 0x110000`; `0 ≤` is free from `Nat`. (Surrogates
+        // Unicode scalar range: 0 ≤ c ≤ U+10FFFF. `c < 0x110000` covers
+        // the upper half; `0 ≤` is free from `Nat`. (Surrogates
         // U+D800..U+DFFF are technically excluded from Unicode scalar
         // values, but Verus and Rust's `char` don't track that, and
         // omega's simpler with a single upper-bound literal.)
-        IntRange::Char => Some(LExpr::new(ExprNode::BinOp {
-            op: L::Lt,
-            lhs: Box::new(e.clone()),
-            rhs: Box::new(LExpr::new(ExprNode::Lit("0x110000".to_string()))),
-        })),
+        IntRange::Char => Some(LExpr::lt(e.clone(), LExpr::lit_int("0x110000"))),
         IntRange::Nat | IntRange::Int | IntRange::USize | IntRange::ISize => None,
-    }
-}
-
-fn apply(head: LExpr, args: Vec<LExpr>) -> ExprNode {
-    if args.is_empty() {
-        head.node
-    } else {
-        ExprNode::App { head: Box::new(head), args }
     }
 }
 
@@ -248,8 +211,8 @@ fn clip_to_node(src: &Typ, dst: &IntRange, inner: &Exp) -> ExprNode {
     };
     let rendered = sst_exp_to_ast(inner);
     match (renders_as_lean_int(src_range), renders_as_lean_int(dst)) {
-        (true, false) => apply(var("Int.toNat"), vec![rendered]),
-        (false, true) => apply(var("Int.ofNat"), vec![rendered]),
+        (true, false) => LExpr::app1(LExpr::var("Int.toNat"), rendered).node,
+        (false, true) => LExpr::app1(LExpr::var("Int.ofNat"), rendered).node,
         _ => rendered.node,
     }
 }
@@ -264,10 +227,7 @@ fn exp_to_node(e: &Exp) -> ExprNode {
             ExprNode::Var(lean_name(&fun.path))
         }
 
-        ExpX::Unary(UnaryOp::Not, inner) => ExprNode::UnOp {
-            op: LUn::Not,
-            arg: Box::new(sst_exp_to_ast(inner)),
-        },
+        ExpX::Unary(UnaryOp::Not, inner) => LExpr::not(sst_exp_to_ast(inner)).node,
         ExpX::Unary(UnaryOp::Clip { range, .. }, inner) => {
             clip_to_node(&inner.typ, range, inner)
         }
@@ -280,10 +240,9 @@ fn exp_to_node(e: &Exp) -> ExprNode {
 
         // Box/Unbox: transparent. Field projection.
         ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => exp_to_node(inner),
-        ExpX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => ExprNode::FieldProj {
-            expr: Box::new(sst_exp_to_ast(inner)),
-            field: sanitize(&field_opr.field),
-        },
+        ExpX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
+            LExpr::field_proj(sst_exp_to_ast(inner), sanitize(&field_opr.field)).node
+        }
         // `HasType(e, t)` — the refinement constraint for `e` to inhabit
         // `t`. For fixed-width ints (u8, i32, …) this is the bounds check
         // Verus emits at every arithmetic site. For unbounded types (Nat,
@@ -312,26 +271,21 @@ fn exp_to_node(e: &Exp) -> ExprNode {
         }
         ExpX::UnaryOpr(_, inner) => exp_to_node(inner),
 
-        ExpX::Binary(op, lhs, rhs) => match binop_to_ast(op) {
-            Some(l_op) => ExprNode::BinOp {
-                op: l_op,
-                lhs: Box::new(sst_exp_to_ast(lhs)),
-                rhs: Box::new(sst_exp_to_ast(rhs)),
-            },
-            // Non-structural: emit as `head lhs rhs` via App. HeightCompare
-            // / Index / StrGetChar / IeeeFloat are rejected earlier by
-            // `sst_to_lean::supported_body`; the only op that reaches here
-            // is `Xor`, which renders as `xor lhs rhs`.
-            None => ExprNode::App {
-                head: Box::new(var("xor")),
-                args: vec![sst_exp_to_ast(lhs), sst_exp_to_ast(rhs)],
-            },
-        },
-        ExpX::BinaryOpr(BinaryOpr::ExtEq(_, _), lhs, rhs) => ExprNode::BinOp {
-            op: L::Eq,
-            lhs: Box::new(sst_exp_to_ast(lhs)),
-            rhs: Box::new(sst_exp_to_ast(rhs)),
-        },
+        ExpX::Binary(op, lhs, rhs) => {
+            let (l, r) = (sst_exp_to_ast(lhs), sst_exp_to_ast(rhs));
+            match binop_to_ast(op) {
+                Some(l_op) => LExpr::binop(l_op, l, r).node,
+                // Non-structural: emit as `head lhs rhs` via App.
+                // HeightCompare / Index / StrGetChar / IeeeFloat are
+                // rejected earlier by `sst_to_lean::supported_body`; the
+                // only op that reaches here is `Xor`, which renders as
+                // `xor lhs rhs`.
+                None => LExpr::app(LExpr::var("xor"), vec![l, r]).node,
+            }
+        }
+        ExpX::BinaryOpr(BinaryOpr::ExtEq(_, _), lhs, rhs) => {
+            LExpr::eq(sst_exp_to_ast(lhs), sst_exp_to_ast(rhs)).node
+        }
 
         ExpX::If(cond, then_e, else_e) => ExprNode::If {
             cond: Box::new(sst_exp_to_ast(cond)),
@@ -341,16 +295,11 @@ fn exp_to_node(e: &Exp) -> ExprNode {
 
         ExpX::Call(CallFun::Fun(fun, _), typs, args)
         | ExpX::Call(CallFun::Recursive(fun), typs, args) => {
-            let base = var(&lean_name(&fun.path));
-            let head = if typs.is_empty() {
-                base
-            } else {
-                LExpr::new(ExprNode::App {
-                    head: Box::new(base),
-                    args: typs.iter().map(|t| typ_to_expr(t)).collect(),
-                })
-            };
-            apply(head, args.iter().map(|a| sst_exp_to_ast(a)).collect())
+            let head = LExpr::app(
+                LExpr::var(lean_name(&fun.path)),
+                typs.iter().map(|t| typ_to_expr(t)).collect(),
+            );
+            LExpr::app(head, args.iter().map(|a| sst_exp_to_ast(a)).collect()).node
         }
         ExpX::Call(CallFun::InternalFun(_), _, _) => panic!(
             "to_lean_sst_expr: InternalFun should have been rejected by supported_body"
@@ -360,14 +309,9 @@ fn exp_to_node(e: &Exp) -> ExprNode {
             BndX::Let(binders) => {
                 // Nest single-variable lets right-to-left so each binder is
                 // in scope for the remainder.
-                let mut out = sst_exp_to_ast(body);
-                for b in binders.iter().rev() {
-                    out = LExpr::new(ExprNode::Let {
-                        name: sanitize(&b.name.0),
-                        value: Box::new(sst_exp_to_ast(&b.a)),
-                        body: Box::new(out),
-                    });
-                }
+                let out = binders.iter().rev().fold(sst_exp_to_ast(body), |acc, b| {
+                    LExpr::let_bind(sanitize(&b.name.0), sst_exp_to_ast(&b.a), acc)
+                });
                 out.node
             }
             BndX::Quant(quant, binders, _, _) => {
@@ -392,23 +336,15 @@ fn exp_to_node(e: &Exp) -> ExprNode {
             },
             BndX::Choose(binders, _, cond) => {
                 // `Classical.epsilon (fun (x : T) => cond ∧ body)`
-                let lambda_body = LExpr::new(ExprNode::BinOp {
-                    op: L::And,
-                    lhs: Box::new(sst_exp_to_ast(cond)),
-                    rhs: Box::new(sst_exp_to_ast(body)),
-                });
                 let lambda = LExpr::new(ExprNode::Lambda {
                     binders: binders.iter().map(|b| LBinder {
                         name: Some(sanitize(&b.name.0)),
                         ty: typ_to_expr(&b.a),
                         kind: BinderKind::Explicit,
                     }).collect(),
-                    body: Box::new(lambda_body),
+                    body: Box::new(LExpr::and(sst_exp_to_ast(cond), sst_exp_to_ast(body))),
                 });
-                ExprNode::App {
-                    head: Box::new(var("Classical.epsilon")),
-                    args: vec![lambda],
-                }
+                LExpr::app1(LExpr::var("Classical.epsilon"), lambda).node
             }
         },
 

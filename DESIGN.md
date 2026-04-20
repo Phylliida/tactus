@@ -747,6 +747,15 @@ theorem overflow_check_line_N ... : 0 ≤ result ∧ result < 2^bits := by tactu
 
 Alternative: introduce a `let _goal_k := <rest_goal>` binding at each if and have both branches refer to `_goal_k`. This preserves logical equivalence with linear size. Not implemented — the cost hasn't shown up yet — but noted here so the trade-off is explicit when someone hits it.
 
+### `BodyItem` as a future WP DSL
+
+`sst_to_lean::BodyItem` is currently a hand-rolled enum whose variants (Let, Assert, Assume, Return, IfThenElse) each represent one weakest-precondition-transforming step. It works, but conflates two shapes:
+
+* **Continuation transformers** — `Let`, `Assert`, `Assume` each take a "rest of body" goal and wrap it, producing an outer goal. They compose as a right-fold over a flat list.
+* **Control flow** — `Return` discards the continuation; `IfThenElse` splits into two sub-continuations.
+
+When loops land (which bring `Init` / `Maintain` / `Use` theorems with their own quantifier structure) and `assert(P) by { … }` gains a tactic-block form, this flat enum will probably want to graduate to something more principled — e.g., a small algebra whose constructors are explicit about whether they wrap, branch, or terminate, or a free-monad-ish "WP DSL" where each node carries its continuation by construction. Premature to refactor now. Worth keeping in mind so the next handful of slices don't accidentally keep piling onto the flat-enum shape past its natural limits.
+
 ### Scope and difficulty
 
 Implementing `sst_to_lean` with full WP is the most significant engineering effort — comparable to `sst_to_air` (~3000 lines). It handles mutation as SSA, control flow, pattern matching, closures, borrow semantics. **Estimated: 3-6 months.**
