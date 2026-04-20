@@ -14,6 +14,7 @@ use crate::lean_pp::pp_commands;
 use crate::lean_process;
 use crate::prelude::TACTUS_PRELUDE;
 use crate::project;
+use crate::sanity;
 use crate::sst_to_lean;
 use crate::to_lean_fn::{self, LeanSourceMap};
 use crate::to_lean_type::{lean_name, sanitize, short_name};
@@ -167,6 +168,8 @@ pub fn check_proof_fn(
     cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body)));
     cmds.push(Command::NamespaceClose(ns));
 
+    debug_check(&cmds);
+
     let rendered = pp_commands(&cmds);
     let source_map = LeanSourceMap {
         fn_name: short_name(&proof_fn.name.path).to_string(),
@@ -221,6 +224,8 @@ pub fn check_exec_fn(
     cmds.push(Command::Theorem(sst_to_lean::exec_fn_theorem_to_ast(fn_sst, check)));
     cmds.push(Command::NamespaceClose(ns));
 
+    debug_check(&cmds);
+
     let rendered = pp_commands(&cmds);
 
     let file_path = lean_file_path(crate_name, &vir_fn.name.path);
@@ -254,6 +259,33 @@ pub fn check_exec_fn(
             ))
         }
         Err(e) => CheckResult::Error(e),
+    }
+}
+
+/// In debug builds, verify the command stream is internally consistent —
+/// every `Var` in a theorem goal / def body / instance method body is
+/// either a local binder, an earlier top-level definition, or a known
+/// Lean/Mathlib built-in. A violation means we lost track of a
+/// dependency and Lean would reject the file; panicking here points at
+/// the exact identifier instead of forcing the user to decode a Lean
+/// unknown-identifier error.
+///
+/// Compiled out of release builds.
+fn debug_check(_cmds: &[Command]) {
+    #[cfg(debug_assertions)]
+    {
+        let violations = sanity::check_references(_cmds);
+        if !violations.is_empty() {
+            let lines: Vec<String> = violations.iter()
+                .map(|v| format!("  in `{}`: unresolved `{}`", v.context, v.name))
+                .collect();
+            panic!(
+                "Tactus codegen produced unresolved references:\n{}\n\nThis usually means \
+                 `dep_order` missed a fn while walking VIR (check `walk_expr` / `walk_place` \
+                 coverage for any new ExprX/PlaceX variants).",
+                lines.join("\n")
+            );
+        }
     }
 }
 
