@@ -4,18 +4,20 @@
 //! and produces a `Theorem` AST node whose goal is the WP of the body and
 //! whose tactic body is `tactus_auto`.
 //!
-//! # First-slice scope
+//! # Current scope
 //!
-//! Handles straight-line code only: a body that is a (possibly nested)
-//! `StmX::Block` of
+//! Handles bodies built from:
 //!
+//!   * `StmX::Block`     — nested/sequential composition
 //!   * `StmX::Assign`    — simple `let x := e` bindings
 //!   * `StmX::Assert`    — obligations, conjoined into the goal
 //!   * `StmX::Assume`    — hypotheses, threaded into the goal as implications
-//!   * `StmX::Return`    — the final returned expression (at most one)
+//!   * `StmX::If`        — branching; WP splits across cond / ¬cond (slice 2)
+//!   * `StmX::Return`    — the final returned expression (at most one,
+//!                         top-level only; `inside_body: true` is rejected)
 //!   * `StmX::Air`, `StmX::Fuel`, `StmX::RevealString` — transparent
 //!
-//! Not yet supported: if/else, mutation/SSA, loops, fixed-width overflow as
+//! Not yet supported: mutation/SSA, loops, fixed-width overflow as
 //! a separate obligation, pattern matching, closures, mutable references.
 //!
 //! # Semantic model (weakest-precondition, in body order)
@@ -27,16 +29,22 @@
 //! * `assert(P)` becomes `(P) ∧ (<rest>)`. `P` must be provable without
 //!   using assumes that appear *after* it — this is the property that
 //!   separates us from a naive "conjoin everything" scheme.
+//! * `if c { s₁ } else { s₂ }` becomes
+//!   `(c → wp(s₁; <rest>)) ∧ (¬c → wp(s₂; <rest>))`. Both branches share
+//!   the same continuation; we duplicate `<rest>` syntactically rather
+//!   than let-binding a shared goal.
 //! * `return e` ends the body; if the ensures references the return name,
 //!   we wrap the ensures in `let <ret_name> := e; <ensures_conj>`.
 //!
 //! The AST pretty-printer handles precedence, so constructors just build
-//! `BinOp::And` / `BinOp::Implies` / `Let` without worrying about parens.
+//! `BinOp::And` / `BinOp::Implies` / `UnOp::Not` / `Let` without worrying
+//! about parens.
 
 use vir::sst::{BndX, CallFun, Dest, Exp, ExpX, FuncCheckSst, FunctionSst, Stm, StmX};
 use vir::ast::{BinaryOp, UnaryOp};
 use crate::lean_ast::{
     and_all, BinOp as L, Binder as LBinder, BinderKind, Expr as LExpr, ExprNode, Tactic, Theorem,
+    UnOp as LU,
 };
 use crate::to_lean_sst_expr::sst_exp_to_ast;
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
@@ -78,7 +86,12 @@ fn check_stm(stm: &Stm) -> Result<(), String> {
         StmX::Assert(_, _, e) | StmX::Assume(e) => check_exp(e),
         StmX::AssertCompute(_, e, _) => check_exp(e),
         StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => Ok(()),
-        StmX::If(..) => Err("if/else in exec fn body not yet supported".to_string()),
+        StmX::If(cond, then_stm, else_stm) => {
+            check_exp(cond)?;
+            check_stm(then_stm)?;
+            if let Some(e) = else_stm { check_stm(e)?; }
+            Ok(())
+        }
         StmX::Loop { .. } => Err("loops in exec fn body not yet supported".to_string()),
         StmX::Call { .. } => Err("function calls in exec fn body not yet supported".to_string()),
         StmX::BreakOrContinue { .. } => Err("break/continue not yet supported".to_string()),
@@ -172,7 +185,6 @@ pub fn exec_fn_theorem_to_ast(fn_sst: &FunctionSst, check: &FuncCheckSst) -> The
 
     let goal = build_goal(
         &items,
-        0,
         return_expr,
         check.post_condition.dest.as_ref().map(|v| v.0.as_str()),
         &check.post_condition.ens_exps,
@@ -193,30 +205,61 @@ pub fn exec_fn_theorem_to_ast(fn_sst: &FunctionSst, check: &FuncCheckSst) -> The
 /// the remainder of the body.
 fn build_goal(
     items: &[BodyItem<'_>],
-    i: usize,
     return_expr: Option<&Exp>,
     ret_name: Option<&str>,
     ensures: &[Exp],
 ) -> LExpr {
-    if i >= items.len() {
+    let Some((head, rest)) = items.split_first() else {
         return final_goal(return_expr, ret_name, ensures);
-    }
-    match &items[i] {
+    };
+    match head {
         BodyItem::Let(name, rhs) => LExpr::new(ExprNode::Let {
             name: sanitize(name),
             value: Box::new(sst_exp_to_ast(rhs)),
-            body: Box::new(build_goal(items, i + 1, return_expr, ret_name, ensures)),
+            body: Box::new(build_goal(rest, return_expr, ret_name, ensures)),
         }),
         BodyItem::Assume(e) => LExpr::new(ExprNode::BinOp {
             op: L::Implies,
             lhs: Box::new(sst_exp_to_ast(e)),
-            rhs: Box::new(build_goal(items, i + 1, return_expr, ret_name, ensures)),
+            rhs: Box::new(build_goal(rest, return_expr, ret_name, ensures)),
         }),
         BodyItem::Assert(e) => LExpr::new(ExprNode::BinOp {
             op: L::And,
             lhs: Box::new(sst_exp_to_ast(e)),
-            rhs: Box::new(build_goal(items, i + 1, return_expr, ret_name, ensures)),
+            rhs: Box::new(build_goal(rest, return_expr, ret_name, ensures)),
         }),
+        BodyItem::IfThenElse { cond, then_items, else_items } => {
+            // WP: (c → wp(then ++ rest)) ∧ (¬c → wp(else ++ rest)).
+            // `rest` duplicates syntactically — we don't share goals via
+            // a named let-binding. Exponential in nesting depth, but Lean
+            // / Z3 see the same logical goal either way.
+            let then_all: Vec<BodyItem<'_>> =
+                then_items.iter().chain(rest.iter()).cloned().collect();
+            let else_all: Vec<BodyItem<'_>> =
+                else_items.iter().chain(rest.iter()).cloned().collect();
+            let cond_ast = sst_exp_to_ast(cond);
+            let not_cond = LExpr::new(ExprNode::UnOp {
+                op: LU::Not,
+                arg: Box::new(cond_ast.clone()),
+            });
+            let then_goal = build_goal(&then_all, return_expr, ret_name, ensures);
+            let else_goal = build_goal(&else_all, return_expr, ret_name, ensures);
+            let then_branch = LExpr::new(ExprNode::BinOp {
+                op: L::Implies,
+                lhs: Box::new(cond_ast),
+                rhs: Box::new(then_goal),
+            });
+            let else_branch = LExpr::new(ExprNode::BinOp {
+                op: L::Implies,
+                lhs: Box::new(not_cond),
+                rhs: Box::new(else_goal),
+            });
+            LExpr::new(ExprNode::BinOp {
+                op: L::And,
+                lhs: Box::new(then_branch),
+                rhs: Box::new(else_branch),
+            })
+        }
     }
 }
 
@@ -240,10 +283,18 @@ fn final_goal(
 
 // ── Body walk ──────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 enum BodyItem<'a> {
     Let(&'a str, &'a Exp),
     Assert(&'a Exp),
     Assume(&'a Exp),
+    /// `if <cond> { <then_items> } else { <else_items> }` — both branches
+    /// are already flattened into `BodyItem` sequences.
+    IfThenElse {
+        cond: &'a Exp,
+        then_items: Vec<BodyItem<'a>>,
+        else_items: Vec<BodyItem<'a>>,
+    },
 }
 
 fn collect_body_items<'a>(body: &'a Stm) -> (Vec<BodyItem<'a>>, Option<&'a Exp>) {
@@ -268,6 +319,25 @@ fn walk<'a>(
         StmX::Assert(_, _, e) | StmX::AssertCompute(_, e, _) => items.push(BodyItem::Assert(e)),
         StmX::Assume(e) => items.push(BodyItem::Assume(e)),
         StmX::Return { ret_exp: Some(e), .. } => { *ret = Some(e); }
+        StmX::If(cond, then_stm, else_stm) => {
+            let mut then_items = Vec::new();
+            let mut then_ret = None;
+            walk(then_stm, &mut then_items, &mut then_ret);
+            let mut else_items = Vec::new();
+            let mut else_ret = None;
+            if let Some(e) = else_stm {
+                walk(e, &mut else_items, &mut else_ret);
+            }
+            // Branch-level returns would require merging their values with
+            // the outer ensures across branches. `check_stm` rejects
+            // `inside_body: true` returns, so this should be unreachable
+            // in well-formed input; assert for safety.
+            debug_assert!(
+                then_ret.is_none() && else_ret.is_none(),
+                "branch-level return escaped supported_body filter",
+            );
+            items.push(BodyItem::IfThenElse { cond, then_items, else_items });
+        }
         _ => {}
     }
 }

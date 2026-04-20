@@ -2016,3 +2016,88 @@ test_verify_one_file! {
         assert!(err.errors.len() >= 1, "Expected error for false body assert");
     }
 }
+
+// ── Slice 2: if/else WP rule ───────────────────────────────────────────
+//
+// `if c { s1 } else { s2 }` folds to
+// `(c → wp(s1; rest)) ∧ (¬c → wp(s2; rest))`. These tests exercise
+// branching at the statement level, paired with asserts or per-branch
+// assigns flowing into a tail value.
+
+// Both branches assert a fact provable from the condition. Each branch
+// re-establishes its own side of `c`/`¬c` as an assert; the WP split
+// supplies that fact as a hypothesis.
+test_verify_one_file! {
+    #[test] test_exec_if_assert_holds verus_code! {
+        #[verifier::tactus_auto]
+        fn describe(x: u8) -> (r: u8)
+            ensures r == x
+        {
+            if x < 10 {
+                assert(x < 10);
+            } else {
+                assert(x >= 10);
+            }
+            x
+        }
+    } => Ok(())
+}
+
+// Missing else branch — the then-branch side only contributes its
+// asserts when `c` holds. When `c` is false, the goal reduces to the
+// continuation with `¬c` as a hypothesis.
+test_verify_one_file! {
+    #[test] test_exec_if_no_else verus_code! {
+        #[verifier::tactus_auto]
+        fn maybe_check(x: u8) -> (r: u8)
+            ensures r == x
+        {
+            if x > 0 {
+                assert(x > 0);
+            }
+            x
+        }
+    } => Ok(())
+}
+
+// Assert inside a branch is false under the hypothesis. Lean must reject:
+// the assert's negation can be witnessed within the `c → …` implication.
+test_verify_one_file! {
+    #[test] test_exec_if_assert_fails verus_code! {
+        #[verifier::tactus_auto]
+        fn bad_describe(x: u8) -> (r: u8)
+            ensures r == x
+        {
+            if x < 10 {
+                assert(x >= 10);  // contradicts the then-branch hypothesis
+            }
+            x
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "Expected error for false assert in then-branch");
+    }
+}
+
+// Nested if/else. The inner branch's hypothesis stacks with the outer one
+// — `assert(x < 100)` under the `else` of the inner if has both `x >= 50`
+// and the outer `x < 100` available.
+test_verify_one_file! {
+    #[test] test_exec_nested_if verus_code! {
+        #[verifier::tactus_auto]
+        fn nested_check(x: u8) -> (r: u8)
+            ensures r == x
+        {
+            if x < 100 {
+                if x < 50 {
+                    assert(x < 50);
+                } else {
+                    assert(x >= 50);
+                    assert(x < 100);
+                }
+            } else {
+                assert(x >= 100);
+            }
+            x
+        }
+    } => Ok(())
+}
