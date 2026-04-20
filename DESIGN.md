@@ -735,11 +735,17 @@ Each arithmetic op on fixed-width types generates:
 theorem overflow_check_line_N ... : 0 ≤ result ∧ result < 2^bits := by tactus_auto
 ```
 
-**Current implementation status**: u8/u16/… render as Lean `Nat`; i8/i16/… render as Lean `Int`. `HasType(e, U(n))` emits `e < 2^n` (the upper bound); the lower bound is free from `Nat`. `HasType(e, I(n))` emits both bounds. Each fixed-width param picks up a `(h_<name>_bound : …)` hypothesis.
+**Current implementation status**: u8/u16/…/u128 render as Lean `Int` with both-sided refinement; i8/i16/…/i128 also render as `Int`. `HasType(e, U(n))` emits `0 ≤ e ∧ e < 2^n`; `HasType(e, I(n))` emits `-2^(n-1) ≤ e ∧ e < 2^(n-1)`. Each fixed-width param picks up a `(h_<name>_bound : …)` hypothesis via both `exec_fn_theorem_to_ast` (exec fns) and `fn_binders` (proof fns). `IntegerTypeBound(kind, _)` (i.e., `u8::MAX`, `i32::MIN`, etc.) evaluates to a decimal literal at codegen when the bit-width argument is a `Constant::Int`; `ArchWordBits` emits a reference to the prelude axiom.
 
-**Known gap — u8 subtraction underflow is not caught.** Because we render u8 as `Nat`, Lean's subtraction truncates (`0 - 1 = 0`), and the overflow check `x - y < 256` is trivially true for a `Nat`. This means `fn sub(x: u8, y: u8) -> (r: u8) ensures r == x - y { x - y }` currently verifies despite underflowing in Rust. The fix is to render u8 as `Int` with `(h : 0 ≤ x ∧ x < 2^n)` bounds — then subtraction uses Int semantics and the lower-bound check becomes meaningful. Same gap applies to any u-type operation whose result can go negative. Signed types (i8/i16/…) are not affected because they already render as `Int`. Multiplication and addition on u-types ARE caught because Nat arithmetic doesn't truncate them upward.
+**Why u-types render as `Int` rather than `Nat`.** Lean's `Nat` has truncating subtraction (`0 - 1 = 0`). If we rendered u-types as `Nat`, the overflow check `HasType(x - y, U(n))` would reduce to `0 ≤ x - y ∧ x - y < 2^n` — and the left half is trivially true for any `Nat`, so unguarded u8 subtraction would silently verify despite underflowing in Rust. Rendering as `Int` with an explicit `0 ≤ x` lower-bound hypothesis makes subtraction give the true mathematical value, so the refinement check can catch underflow. Mul and add on u-types worked either way (Nat doesn't truncate upward); only sub was at risk.
 
-`IntegerTypeBound(kind, _)` (i.e., `u8::MAX`, `i32::MIN`, etc.) evaluates to a decimal literal at codegen when the bit-width argument is a `Constant::Int`. `ArchWordBits` panics for now — it requires an `arch_word_bits` axiom in the prelude that isn't wired through.
+### `usize`/`isize` soundness gap
+
+`type_bound_predicate` returns `None` for `USize`/`ISize`. Emitting `e < 2 ^ arch_word_bits` as a refinement would be easy syntactically but costly in practice: tactus_auto's toolbox (`rfl` | `decide` | `omega` | `simp_all`) can't reason about symbolic exponents, and omega doesn't know `2 ^ arch_word_bits ≥ 2^32`. Adding the bound without tactic support would make previously-working `usize`-heavy exec fns fail with "auto-tactic failed" goals the user can't easily discharge.
+
+The honest choice for now is to emit no bound for usize/isize and document that as a known gap — same as stock Verus when compiling without `--target`. When we have the tactic support (a custom `tactus_usize_bound` that case-splits `arch_word_bits_valid` and invokes `Nat.pow_le_pow_right`-style reasoning), we can flip `type_bound_predicate` over.
+
+`arch_word_bits` itself is wired through — `IntegerTypeBound::ArchWordBits` resolves to the axiom `arch_word_bits : Nat` declared in `TactusPrelude.lean`, and the disjunction `arch_word_bits_valid : arch_word_bits = 32 ∨ arch_word_bits = 64` is available for users who need a case-split.
 
 ### Known codegen-complexity trade-offs
 

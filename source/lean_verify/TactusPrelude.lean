@@ -2,6 +2,17 @@
 set_option linter.unusedVariables false
 set_option maxHeartbeats 800000
 
+-- Architecture word size for `usize` / `isize`. Kept as an opaque
+-- `Nat` plus a validity axiom — concrete values come from the build
+-- target. `IntegerTypeBound::ArchWordBits` renders as `arch_word_bits`;
+-- `usize::MAX` / `isize::MAX` etc. reduce to expressions over it. For
+-- now `type_bound_predicate` does *not* emit refinement bounds for
+-- `usize`/`isize`, because tactus_auto's current toolbox can't reason
+-- about symbolic exponents (`2 ^ arch_word_bits`). See DESIGN.md
+-- "Fixed-width types" for the tradeoff.
+axiom arch_word_bits : Nat
+axiom arch_word_bits_valid : arch_word_bits = 32 ∨ arch_word_bits = 64
+
 -- Tactus: auto-tactic used by sst_to_lean when emitting exec fn obligations.
 -- First tactic that works wins; `fail` at the end turns "none worked" into a
 -- real error (not a `sorry`).
