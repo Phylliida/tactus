@@ -13,38 +13,21 @@ set_option maxHeartbeats 800000
 axiom arch_word_bits : Nat
 axiom arch_word_bits_valid : arch_word_bits = 32 ∨ arch_word_bits = 64
 
--- Tactus: auto-tactic used by sst_to_lean when emitting exec fn obligations.
+-- Tactus: the *atomic closer* used at the leaves of the tactics we emit.
+-- Intentionally kept to simple, always-closing tactics — `rfl`, `decide`,
+-- `omega`, `simp_all`. Any structural peeling (`refine ⟨?_, ?_⟩`,
+-- `intros`, etc.) is the codegen's job, not this macro's: the emitter
+-- knows exactly what goal shape each theorem has, and wraps the right
+-- structural tactics around `tactus_auto` calls. See `sst_to_lean`'s
+-- loop-theorem emission.
 --
--- Peel away every `∧` split and `∀`/`→` intro across all open goals, then
--- close each arithmetic leaf with rfl / decide / omega / simp_all. This
--- single sequence handles both the flat-goal shapes from straight-line
--- exec fns and the nested `∀ … → … → A ∧ (B ∧ C)` shapes that come out
--- of loops (see `sst_to_lean`'s "Loop obligations" note).
---
--- `repeat'` applies its argument to every open goal until it stops making
--- progress. `all_goals` then runs the finisher on each leaf. If any leaf
--- can't be closed, the whole tactic fails and the user sees the
--- unresolved subgoal.
--- First pass: `try simp_all` normalizes `let x := n` and trivial
--- conjuncts like `n ≤ n`. It always succeeds (even as a no-op), so
--- the `first …` block below always gets to pick a real closer.
--- That's important: without `try`, `first | … | simp_all | …` would
--- stop at simp_all even when simp_all simplified but didn't close.
---
--- The `refine ⟨?_, ?_⟩ <;> intros <;> omega`-style branches handle
--- loop goals shaped like `maintain ∧ use`, or nested `init ∧ maintain
--- ∧ use`. Omega handles the propositional leaves (it splits hypothesis
--- `And`s and handles top-level `∧`/`→` in goals, but doesn't
--- introduce `∀`).
+-- `simp_all` comes last because it doesn't fail on partial progress —
+-- if an earlier closer like `omega` would have worked, we pick it first.
+-- `fail` turns "nothing worked" into a real error instead of a `sorry`.
 macro "tactus_auto" : tactic => `(tactic|
-  (try simp_all);
   first
     | rfl
     | decide
     | omega
-    | (intros; omega)
-    | (refine ⟨?_, ?_⟩ <;> intros <;> omega)
-    | (refine ⟨?_, ?_, ?_⟩ <;> intros <;> omega)
-    | (refine ⟨?_, ?_⟩ <;> intros <;>
-        (first | omega | (refine ⟨?_, ?_⟩ <;> intros <;> omega)))
+    | simp_all
     | (fail "tactus: auto-tactic failed — add explicit proof block"))
