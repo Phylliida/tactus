@@ -2388,3 +2388,21 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// `usize::BITS` — an `IntegerTypeBound::ArchWordBits` reference. Before
+// wiring this through the prelude axiom, the codegen path panicked. Now
+// it emits `arch_word_bits` (an opaque `Nat` axiom), so `x < usize::BITS`
+// becomes `x < arch_word_bits`. The proof needs `arch_word_bits_valid` —
+// the disjunction axiom — but omega + decide can close it after a
+// case-split via `rcases`. Rather than hand-prove, we keep this as a
+// minimal "doesn't panic" smoke test: ensures is trivially `True`.
+test_verify_one_file! {
+    #[test] test_proof_arch_word_bits_compiles verus_code! {
+        proof fn arch_bits_referenced(x: u32)
+            requires x < usize::BITS
+            ensures true
+        by {
+            simp
+        }
+    } => Ok(())
+}
+

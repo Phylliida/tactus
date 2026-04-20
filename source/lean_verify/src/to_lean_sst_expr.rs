@@ -63,16 +63,20 @@ fn const_u32_from_vir(e: &Expr) -> Option<u32> {
 
 /// Shared helper: lower `IntegerTypeBound(kind, _) applied to <bit width>`.
 /// Both the SST and VIR-AST paths end up here once they've extracted
-/// `bits`. `ArchWordBits` panics — it needs prelude plumbing that isn't
-/// wired through yet.
+/// `bits`. `ArchWordBits` is handled specially — it's a reference to
+/// the prelude axiom rather than a computed literal.
 pub fn integer_type_bound_node(kind: &IntegerTypeBoundKind, bits: u32) -> ExprNode {
-    if matches!(kind, IntegerTypeBoundKind::ArchWordBits) {
-        panic!(
-            "IntegerTypeBound::ArchWordBits requires arch_word_bits in the \
-             Tactus prelude, which isn't wired through yet"
-        );
+    match kind {
+        IntegerTypeBoundKind::ArchWordBits => {
+            // `arch_word_bits : Nat` from TactusPrelude — an opaque axiom
+            // whose value comes from the build target. Downstream tactics
+            // only know `arch_word_bits = 32 ∨ arch_word_bits = 64`; that
+            // disjunction is available as the `arch_word_bits_valid`
+            // axiom if a proof needs to case-split.
+            LExpr::var("arch_word_bits").node
+        }
+        _ => integer_type_bound_lit(kind.clone(), bits).node,
     }
-    integer_type_bound_lit(kind.clone(), bits).node
 }
 
 /// Entry point for the VIR-AST rendering path (`to_lean_expr.rs`).
