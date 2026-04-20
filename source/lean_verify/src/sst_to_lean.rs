@@ -61,8 +61,7 @@
 use vir::sst::{BndX, CallFun, Dest, Exp, ExpX, FuncCheckSst, FunctionSst, Par, Stm, StmX};
 use vir::ast::{BinaryOp, UnaryOp};
 use crate::lean_ast::{
-    and_all, BinOp as L, Binder as LBinder, BinderKind, Expr as LExpr, ExprNode, Tactic, Theorem,
-    UnOp as LU,
+    and_all, Binder as LBinder, BinderKind, Expr as LExpr, Tactic, Theorem,
 };
 use crate::to_lean_sst_expr::{sst_exp_to_ast, type_bound_predicate};
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
@@ -87,10 +86,7 @@ pub fn supported_body(check: &FuncCheckSst) -> Result<(), String> {
 
 fn check_stm(stm: &Stm) -> Result<(), String> {
     match &stm.x {
-        StmX::Block(stms) => {
-            for s in stms.iter() { check_stm(s)?; }
-            Ok(())
-        }
+        StmX::Block(stms) => stms.iter().try_for_each(check_stm),
         StmX::Assign { lhs: Dest { dest, .. }, rhs } => {
             check_exp(dest)?;
             check_exp(rhs)?;
@@ -119,8 +115,7 @@ fn check_stm(stm: &Stm) -> Result<(), String> {
         StmX::If(cond, then_stm, else_stm) => {
             check_exp(cond)?;
             check_stm(then_stm)?;
-            if let Some(e) = else_stm { check_stm(e)?; }
-            Ok(())
+            else_stm.as_ref().map_or(Ok(()), |e| check_stm(e))
         }
         StmX::Loop { .. } => Err("loops in exec fn body not yet supported".to_string()),
         StmX::Call { .. } => Err("function calls in exec fn body not yet supported".to_string()),
@@ -158,12 +153,11 @@ fn check_exp(e: &Exp) -> Result<(), String> {
             if matches!(target, CallFun::InternalFun(_)) {
                 return Err("internal function calls not yet supported".to_string());
             }
-            for a in args.iter() { check_exp(a)?; }
-            Ok(())
+            args.iter().try_for_each(check_exp)
         }
         ExpX::Bind(bnd, body) => {
             match &bnd.x {
-                BndX::Let(binders) => for b in binders.iter() { check_exp(&b.a)?; },
+                BndX::Let(binders) => binders.iter().try_for_each(|b| check_exp(&b.a))?,
                 BndX::Quant(..) | BndX::Lambda(..) => {}
                 BndX::Choose(_, _, cond) => check_exp(cond)?,
             }
@@ -203,10 +197,7 @@ pub fn exec_fn_theorem_to_ast(fn_sst: &FunctionSst, check: &FuncCheckSst) -> The
             ty: typ_to_expr(&p.x.typ),
             kind: BinderKind::Explicit,
         });
-        if let Some(pred) = type_bound_predicate(
-            &LExpr::new(ExprNode::Var(name.clone())),
-            &p.x.typ,
-        ) {
+        if let Some(pred) = type_bound_predicate(&LExpr::var(name.clone()), &p.x.typ) {
             binders.push(LBinder {
                 name: Some(format!("h_{}_bound", name)),
                 ty: pred,
@@ -224,10 +215,8 @@ pub fn exec_fn_theorem_to_ast(fn_sst: &FunctionSst, check: &FuncCheckSst) -> The
         });
     }
 
-    let items = collect_body_items(&check.body);
-
     let goal = build_goal(
-        &items,
+        &walk(&check.body),
         check.post_condition.dest.as_ref().map(|v| v.0.as_str()),
         &check.post_condition.ens_exps,
     );
@@ -246,99 +235,59 @@ pub fn exec_fn_theorem_to_ast(fn_sst: &FunctionSst, check: &FuncCheckSst) -> The
 /// the module doc for the WP rules — each item wraps the goal built from
 /// the remainder of the body. `Return` terminates: items after it are
 /// dropped because they're unreachable.
+///
+/// The base case (empty items, no return seen) emits the ensures
+/// conjunction unchanged. `Return(e)` with a named dest emits
+/// `let <ret> := e; <ensures>`; without a dest (unit return in a unit
+/// fn), the return value is dropped — it's always `()`.
 fn build_goal(
     items: &[BodyItem<'_>],
     ret_name: Option<&str>,
     ensures: &[Exp],
 ) -> LExpr {
+    let ens_conj = || and_all(ensures.iter().map(sst_exp_to_ast).collect());
     let Some((head, rest)) = items.split_first() else {
-        return final_goal(None, ret_name, ensures);
+        // Reached the end with no `Return`: return name (if any) was
+        // bound earlier via an `Assign`, so ensures can reference it
+        // directly.
+        return ens_conj();
     };
     match head {
-        BodyItem::Let(name, rhs) => LExpr::new(ExprNode::Let {
-            name: sanitize(name),
-            value: Box::new(sst_exp_to_ast(rhs)),
-            body: Box::new(build_goal(rest, ret_name, ensures)),
-        }),
-        BodyItem::Assume(e) => LExpr::new(ExprNode::BinOp {
-            op: L::Implies,
-            lhs: Box::new(sst_exp_to_ast(e)),
-            rhs: Box::new(build_goal(rest, ret_name, ensures)),
-        }),
-        BodyItem::Assert(e) => LExpr::new(ExprNode::BinOp {
-            op: L::And,
-            lhs: Box::new(sst_exp_to_ast(e)),
-            rhs: Box::new(build_goal(rest, ret_name, ensures)),
-        }),
-        BodyItem::Return(e) => final_goal(Some(e), ret_name, ensures),
+        BodyItem::Let(name, rhs) => LExpr::let_bind(
+            sanitize(name), sst_exp_to_ast(rhs),
+            build_goal(rest, ret_name, ensures),
+        ),
+        BodyItem::Assume(e) => LExpr::implies(
+            sst_exp_to_ast(e),
+            build_goal(rest, ret_name, ensures),
+        ),
+        BodyItem::Assert(e) => LExpr::and(
+            sst_exp_to_ast(e),
+            build_goal(rest, ret_name, ensures),
+        ),
+        // Terminator: `let <ret> := e; <ensures>`. If there's no ret
+        // name (unit-returning fn with an explicit `return ();`), the
+        // return expression is `()` and we just emit the ensures.
+        BodyItem::Return(e) => match ret_name {
+            Some(name) => LExpr::let_bind(sanitize(name), sst_exp_to_ast(e), ens_conj()),
+            None => ens_conj(),
+        },
+        // WP: `(c → wp(then ++ rest)) ∧ (¬c → wp(else ++ rest))`. `rest`
+        // duplicates syntactically — see DESIGN.md "Known codegen-
+        // complexity trade-offs". If a branch ends in `Return`, its
+        // continuation terminates there and `rest` is appended but
+        // ignored.
         BodyItem::IfThenElse { cond, then_items, else_items } => {
-            // WP: (c → wp(then ++ rest)) ∧ (¬c → wp(else ++ rest)).
-            // `rest` duplicates syntactically — we don't share goals via
-            // a named let-binding. Exponential in nesting depth (see
-            // DESIGN.md "Known codegen-complexity trade-offs"), but Lean
-            // / Z3 see the same logical goal either way. If either branch
-            // ends with `Return`, its continuation naturally terminates
-            // there and `rest` is appended but ignored.
             let then_all: Vec<BodyItem<'_>> =
                 then_items.iter().chain(rest.iter()).cloned().collect();
             let else_all: Vec<BodyItem<'_>> =
                 else_items.iter().chain(rest.iter()).cloned().collect();
             let cond_ast = sst_exp_to_ast(cond);
-            let not_cond = LExpr::new(ExprNode::UnOp {
-                op: LU::Not,
-                arg: Box::new(cond_ast.clone()),
-            });
-            let then_goal = build_goal(&then_all, ret_name, ensures);
-            let else_goal = build_goal(&else_all, ret_name, ensures);
-            let then_branch = LExpr::new(ExprNode::BinOp {
-                op: L::Implies,
-                lhs: Box::new(cond_ast),
-                rhs: Box::new(then_goal),
-            });
-            let else_branch = LExpr::new(ExprNode::BinOp {
-                op: L::Implies,
-                lhs: Box::new(not_cond),
-                rhs: Box::new(else_goal),
-            });
-            LExpr::new(ExprNode::BinOp {
-                op: L::And,
-                lhs: Box::new(then_branch),
-                rhs: Box::new(else_branch),
-            })
+            LExpr::and(
+                LExpr::implies(cond_ast.clone(), build_goal(&then_all, ret_name, ensures)),
+                LExpr::implies(LExpr::not(cond_ast), build_goal(&else_all, ret_name, ensures)),
+            )
         }
-    }
-}
-
-/// Innermost goal: the ensures conjunction, optionally preceded by a
-/// `let <ret> := <ret_expr>;` binding so the ensures can reference the
-/// returned value by name. Empty ensures → `True`.
-///
-/// The four `(return_expr, ret_name)` cases:
-///
-///   * `(Some(re), Some(name))` — non-unit fn with a reachable `Return`:
-///     bind then check ensures. This is the common shape.
-///   * `(None, Some(name))` — the return value was bound earlier via an
-///     `Assign` (typical "fn foo() -> T { let r := e; r }" pattern); the
-///     name is already in scope.
-///   * `(None, None)` — unit-returning fn (or one without ensures
-///     referencing a return).
-///   * `(Some(re), None)` — a `return` carrying a value but no named
-///     destination. This happens when Rust desugars `return;` to
-///     `return ()` in a unit-returning fn. `re` is unit in that case;
-///     dropping it is correct since there's no name to bind it to.
-fn final_goal(
-    return_expr: Option<&Exp>,
-    ret_name: Option<&str>,
-    ensures: &[Exp],
-) -> LExpr {
-    let ens_conj = and_all(ensures.iter().map(|e| sst_exp_to_ast(e)).collect());
-    match (return_expr, ret_name) {
-        (Some(re), Some(name)) => LExpr::new(ExprNode::Let {
-            name: sanitize(name),
-            value: Box::new(sst_exp_to_ast(re)),
-            body: Box::new(ens_conj),
-        }),
-        (None, Some(_)) | (None, None) | (Some(_), None) => ens_conj,
     }
 }
 
@@ -363,39 +312,31 @@ enum BodyItem<'a> {
     },
 }
 
-fn collect_body_items<'a>(body: &'a Stm) -> Vec<BodyItem<'a>> {
-    let mut items = Vec::new();
-    walk(body, &mut items);
-    items
-}
-
-fn walk<'a>(stm: &'a Stm, items: &mut Vec<BodyItem<'a>>) {
+/// Flatten an SST statement tree into a sequence of `BodyItem`s. A
+/// `Block` concatenates its children's flattenings; an `If` becomes a
+/// single `IfThenElse` whose branches are recursively flattened;
+/// transparent forms (`Air`, `Fuel`, `RevealString`) contribute
+/// nothing; and variants rejected by `check_stm` are unreachable.
+fn walk<'a>(stm: &'a Stm) -> Vec<BodyItem<'a>> {
     match &stm.x {
-        StmX::Block(stms) => for s in stms.iter() { walk(s, items); },
+        StmX::Block(stms) => stms.iter().flat_map(|s| walk(s)).collect(),
         StmX::Assign { lhs: Dest { dest, .. }, rhs } => {
-            if let Some(name) = extract_simple_var(dest) {
-                items.push(BodyItem::Let(name, rhs));
-            }
+            extract_simple_var(dest).map_or_else(Vec::new, |name| vec![BodyItem::Let(name, rhs)])
         }
-        StmX::Assert(_, _, e) | StmX::AssertCompute(_, e, _) => items.push(BodyItem::Assert(e)),
-        StmX::Assume(e) => items.push(BodyItem::Assume(e)),
-        // `Return { ret_exp: Some, inside_body: false }` is the normal
-        // case — a tail return either at top level or ending a branch.
-        // `ret_exp: None` is a unit return with no value to bind; skip.
-        StmX::Return { ret_exp: Some(e), .. } => items.push(BodyItem::Return(e)),
-        StmX::Return { ret_exp: None, .. } => {}
-        StmX::If(cond, then_stm, else_stm) => {
-            let mut then_items = Vec::new();
-            walk(then_stm, &mut then_items);
-            let mut else_items = Vec::new();
-            if let Some(e) = else_stm {
-                walk(e, &mut else_items);
-            }
-            items.push(BodyItem::IfThenElse { cond, then_items, else_items });
-        }
+        StmX::Assert(_, _, e) | StmX::AssertCompute(_, e, _) => vec![BodyItem::Assert(e)],
+        StmX::Assume(e) => vec![BodyItem::Assume(e)],
+        // `ret_exp: Some` — normal tail return (top-level or ending a
+        // branch). `ret_exp: None` is a unit return; contributes nothing.
+        StmX::Return { ret_exp: Some(e), .. } => vec![BodyItem::Return(e)],
+        StmX::Return { ret_exp: None, .. } => Vec::new(),
+        StmX::If(cond, then_stm, else_stm) => vec![BodyItem::IfThenElse {
+            cond,
+            then_items: walk(then_stm),
+            else_items: else_stm.as_ref().map_or_else(Vec::new, |e| walk(e)),
+        }],
         // Transparent in SST: contribute nothing to the WP goal.
-        StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => {}
-        // These all fail `check_stm`. Reaching them here means the
+        StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => Vec::new(),
+        // All rejected by `check_stm`. Reaching them here means the
         // support-check and the walker fell out of sync.
         StmX::Call { .. }
         | StmX::BreakOrContinue { .. }
@@ -404,12 +345,10 @@ fn walk<'a>(stm: &'a Stm, items: &mut Vec<BodyItem<'a>>) {
         | StmX::DeadEnd(_)
         | StmX::OpenInvariant(_)
         | StmX::ClosureInner { .. }
-        | StmX::Loop { .. } => {
-            unreachable!(
-                "sst_to_lean::walk: {:?} should have been rejected by supported_body",
-                stm.x
-            )
-        }
+        | StmX::Loop { .. } => unreachable!(
+            "sst_to_lean::walk: {:?} should have been rejected by supported_body",
+            stm.x
+        ),
     }
 }
 

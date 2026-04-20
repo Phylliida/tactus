@@ -3,7 +3,7 @@
 use vir::ast::*;
 use crate::lean_ast::{
     BinOp as L, Binder as LBinder, BinderKind, Expr as LExpr,
-    ExprNode, MatchArm as LMatchArm, Pattern as LPattern, UnOp as LUn,
+    ExprNode, MatchArm as LMatchArm, Pattern as LPattern,
 };
 use crate::to_lean_type::{lean_name, sanitize, short_name, typ_to_expr};
 
@@ -24,20 +24,13 @@ pub(crate) fn vir_var_binders_to_ast(binders: &VarBinders<Typ>) -> Vec<LBinder> 
 
 // ── Internal: build ExprNode ────────────────────────────────────────────
 
-fn boxed(n: ExprNode) -> Box<LExpr> {
-    Box::new(LExpr::new(n))
-}
-
-fn var(name: impl Into<String>) -> LExpr {
-    LExpr::new(ExprNode::Var(name.into()))
-}
+// Local aliases delegating to `LExpr`'s smart constructors. Keep the
+// short names around — most call sites read better as `var("Real")` or
+// `apply("Int.floor", …)` than as the longer chained form.
+fn var(name: impl Into<String>) -> LExpr { LExpr::var(name) }
 
 fn apply(head: &str, args: Vec<LExpr>) -> ExprNode {
-    if args.is_empty() {
-        ExprNode::Var(head.to_string())
-    } else {
-        ExprNode::App { head: Box::new(var(head)), args }
-    }
+    LExpr::app(LExpr::var(head), args).node
 }
 
 fn expr_to_node(expr: &Expr) -> ExprNode {
@@ -49,30 +42,21 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
         ExprX::ConstVar(fun, _) => ExprNode::Var(lean_name(&fun.path)),
         ExprX::StaticVar(fun) | ExprX::ExecFnByName(fun) => ExprNode::Var(lean_name(&fun.path)),
 
-        ExprX::Binary(op, lhs, rhs) => match binop_to_ast(op) {
-            Some(l_op) => ExprNode::BinOp {
-                op: l_op,
-                lhs: Box::new(vir_expr_to_ast(lhs)),
-                rhs: Box::new(vir_expr_to_ast(rhs)),
-            },
-            // Non-structural: emit as `head lhs rhs` via App so the pp layer
-            // handles precedence and spans flow through normally.
-            None => ExprNode::App {
-                head: Box::new(LExpr::new(ExprNode::Var(non_binop_head(op).to_string()))),
-                args: vec![vir_expr_to_ast(lhs), vir_expr_to_ast(rhs)],
-            },
-        },
+        ExprX::Binary(op, lhs, rhs) => {
+            let (l, r) = (vir_expr_to_ast(lhs), vir_expr_to_ast(rhs));
+            match binop_to_ast(op) {
+                Some(l_op) => LExpr::binop(l_op, l, r).node,
+                // Non-structural: emit as `head lhs rhs` via App so the pp
+                // layer handles precedence and spans flow through normally.
+                None => LExpr::app(LExpr::var(non_binop_head(op)), vec![l, r]).node,
+            }
+        }
 
-        ExprX::BinaryOpr(BinaryOpr::ExtEq(_, _), lhs, rhs) => ExprNode::BinOp {
-            op: L::Eq,
-            lhs: Box::new(vir_expr_to_ast(lhs)),
-            rhs: Box::new(vir_expr_to_ast(rhs)),
-        },
+        ExprX::BinaryOpr(BinaryOpr::ExtEq(_, _), lhs, rhs) => {
+            LExpr::eq(vir_expr_to_ast(lhs), vir_expr_to_ast(rhs)).node
+        }
 
-        ExprX::Unary(UnaryOp::Not, inner) => ExprNode::UnOp {
-            op: LUn::Not,
-            arg: Box::new(vir_expr_to_ast(inner)),
-        },
+        ExprX::Unary(UnaryOp::Not, inner) => LExpr::not(vir_expr_to_ast(inner)).node,
         ExprX::Unary(UnaryOp::Clip { range, .. }, inner) => {
             let src_is_int = matches!(&*inner.typ, TypX::Int(
                 IntRange::Int | IntRange::I(_) | IntRange::ISize
@@ -93,10 +77,9 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
             "Complement.complement",
             vec![vir_expr_to_ast(inner)],
         ),
-        ExprX::Unary(UnaryOp::IntToReal, inner) => ExprNode::TypeAnnot {
-            expr: Box::new(vir_expr_to_ast(inner)),
-            ty: Box::new(var("Real")),
-        },
+        ExprX::Unary(UnaryOp::IntToReal, inner) => {
+            LExpr::type_annot(vir_expr_to_ast(inner), LExpr::var("Real")).node
+        }
         ExprX::Unary(UnaryOp::RealToInt, inner) => apply(
             "Int.floor",
             vec![vir_expr_to_ast(inner)],
@@ -131,10 +114,7 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
                 binders: vir_var_binders_to_ast(params),
                 body: Box::new(vir_expr_to_ast(cond)),
             });
-            ExprNode::App {
-                head: boxed(ExprNode::Var("Classical.epsilon".into())),
-                args: vec![lambda],
-            }
+            LExpr::app1(LExpr::var("Classical.epsilon"), lambda).node
         }
 
         ExprX::WithTriggers { body, .. } => expr_to_node(body),
@@ -173,24 +153,21 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
         ExprX::ReadPlace(place, _) => place_to_expr(&place.x).node,
 
         ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => expr_to_node(inner),
-        ExprX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => ExprNode::FieldProj {
-            expr: Box::new(vir_expr_to_ast(inner)),
-            field: field_access_name(field_opr),
-        },
-        ExprX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => ExprNode::FieldProj {
-            expr: Box::new(vir_expr_to_ast(inner)),
-            field: format!("is{}", variant),
-        },
+        ExprX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
+            LExpr::field_proj(vir_expr_to_ast(inner), field_access_name(field_opr)).node
+        }
+        ExprX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => {
+            LExpr::field_proj(vir_expr_to_ast(inner), format!("is{}", variant)).node
+        }
         ExprX::UnaryOpr(UnaryOpr::HasType(t), inner) => {
             // Refinement invariant: `e < 2^n` for `U(n)`, `-2^(n-1) ≤ e ∧
             // e < 2^(n-1)` for `I(n)`, etc. Mirrors the `to_lean_sst_expr`
             // version — proof fns and exec fns must agree on what
             // `HasType` means.
             let e_ast = vir_expr_to_ast(inner);
-            match crate::to_lean_sst_expr::type_bound_predicate(&e_ast, t) {
-                Some(pred) => pred.node,
-                None => ExprNode::LitBool(true),
-            }
+            crate::to_lean_sst_expr::type_bound_predicate(&e_ast, t)
+                .map(|pred| pred.node)
+                .unwrap_or(ExprNode::LitBool(true))
         }
         ExprX::UnaryOpr(UnaryOpr::IntegerTypeBound(kind, _), inner) => {
             // Same handling as the SST path: evaluate the bit width at
@@ -215,7 +192,7 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
             // chained conjunction, etc.). Render as Lean's anonymous
             // constructor `⟨a, b, c⟩` — correct for tuples, works for any
             // shape where the target type is inferred from context.
-            ExprNode::Anon(exprs.iter().map(|e| vir_expr_to_ast(e)).collect())
+            LExpr::anon(exprs.iter().map(|e| vir_expr_to_ast(e)).collect()).node
         }
         ExprX::ArrayLiteral(exprs) => {
             ExprNode::ArrayLit(exprs.iter().map(|e| vir_expr_to_ast(e)).collect())
@@ -238,10 +215,9 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
         ExprX::Fuel(..) | ExprX::RevealString(_) | ExprX::AirStmt(_) => {
             ExprNode::Raw(String::new())
         }
-        ExprX::Nondeterministic => ExprNode::App {
-            head: Box::new(LExpr::new(ExprNode::Var("Classical.arbitrary".into()))),
-            args: vec![LExpr::new(ExprNode::Var("_".into()))],
-        },
+        ExprX::Nondeterministic => {
+            LExpr::app1(LExpr::var("Classical.arbitrary"), LExpr::var("_")).node
+        }
 
         // Exec-mode forms — VIR mode checker guarantees these don't appear
         // inside spec fn bodies.
