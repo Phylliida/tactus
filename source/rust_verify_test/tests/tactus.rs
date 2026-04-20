@@ -2300,3 +2300,78 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// ── Review follow-ups ──────────────────────────────────────────────────
+
+// A `char` param gets an `h_c_bound : c < 0x110000` hypothesis from
+// `type_bound_predicate`. This test body has nothing to verify on its
+// own — it's a regression guard that adding the Char bound didn't break
+// the generator. If the predicate ever stops rendering or omega trips
+// over the hex literal, this test fails.
+test_verify_one_file! {
+    #[test] test_exec_char_bound verus_code! {
+        #[verifier::tactus_auto]
+        fn trivial_char(c: char) -> (r: bool)
+            ensures r == true
+        {
+            true
+        }
+    } => Ok(())
+}
+
+// Cross-width int cast: u8 → i16 widening. The fix to `clip_to_node`
+// inserts `Int.ofNat` when a `Nat`-rendered source (u8) goes to an
+// `Int`-rendered destination (i16). Before, this rendered as a plain
+// `x`, leaving the result type-mismatched in Lean.
+test_verify_one_file! {
+    #[test] test_exec_widen_u8_to_i16 verus_code! {
+        #[verifier::tactus_auto]
+        fn widen(x: u8) -> (r: i16)
+            ensures r >= 0
+        {
+            x as i16
+        }
+    } => Ok(())
+}
+
+// Non-simple LHS assignment used to be silently dropped by `walk`.
+// Now it's rejected upfront by `check_stm` with a clear "not yet
+// supported" error. This uses a struct field assignment, which Verus
+// compiles to `StmX::Assign` with a non-simple `dest`.
+test_verify_one_file! {
+    #[test] test_exec_field_assign_rejected verus_code! {
+        struct Pair { a: u8, b: u8 }
+
+        #[verifier::tactus_auto]
+        fn bump_first(p: Pair) -> (r: Pair)
+            requires p.a < 100
+            ensures r.a == p.a + 1, r.b == p.b
+        {
+            let mut out = p;
+            out.a = out.a + 1;  // non-simple LHS — not yet supported
+            out
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("non-simple LHS")
+                || e.message.contains("not yet supported")),
+            "expected a non-simple-LHS rejection"
+        );
+    }
+}
+
+// Proof fn using `u8::MAX` in a precondition. Goes through the VIR-AST
+// path (`to_lean_expr.rs`) rather than SST. Verus typically const-folds
+// `u8::MAX` to 255 at VIR construction, but if it ever doesn't, this
+// test exercises the mirrored `IntegerTypeBound` fix that used to
+// silently emit the bit-width instead of the bound.
+test_verify_one_file! {
+    #[test] test_proof_u8_max_usage verus_code! {
+        proof fn below_u8_max(x: u8)
+            requires x < u8::MAX
+            ensures (x as int) + 1 <= 255
+        by {
+            omega
+        }
+    } => Ok(())
+}
+

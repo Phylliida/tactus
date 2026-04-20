@@ -181,6 +181,23 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
             expr: Box::new(vir_expr_to_ast(inner)),
             field: format!("is{}", variant),
         },
+        ExprX::UnaryOpr(UnaryOpr::HasType(t), inner) => {
+            // Refinement invariant: `e < 2^n` for `U(n)`, `-2^(n-1) ≤ e ∧
+            // e < 2^(n-1)` for `I(n)`, etc. Mirrors the `to_lean_sst_expr`
+            // version — proof fns and exec fns must agree on what
+            // `HasType` means.
+            let e_ast = vir_expr_to_ast(inner);
+            match crate::to_lean_sst_expr::type_bound_predicate(&e_ast, t) {
+                Some(pred) => pred.node,
+                None => ExprNode::LitBool(true),
+            }
+        }
+        ExprX::UnaryOpr(UnaryOpr::IntegerTypeBound(kind, _), inner) => {
+            // Same handling as the SST path: evaluate the bit width at
+            // codegen and emit the literal bound. Split out to a shared
+            // helper so the two paths can't drift.
+            crate::to_lean_sst_expr::integer_type_bound_from_vir(kind, inner).node
+        }
         ExprX::UnaryOpr(UnaryOpr::CustomErr(_), inner) => expr_to_node(inner),
         ExprX::UnaryOpr(_, inner) => expr_to_node(inner),
 
