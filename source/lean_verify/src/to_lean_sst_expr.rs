@@ -50,12 +50,53 @@ fn two_pow_lit(n: u32) -> LExpr {
 }
 
 /// If `e` is a constant non-negative integer that fits in `u32`, return
-/// its value. Used to read the bit-width argument of `IntegerTypeBound`.
-fn const_u32(e: &Exp) -> Option<u32> {
+/// its value. Used to read the bit-width argument of `IntegerTypeBound`
+/// from an SST `Exp`.
+fn const_u32_from_sst(e: &Exp) -> Option<u32> {
     match &e.x {
         ExpX::Const(Constant::Int(n)) => n.to_string().parse().ok(),
         _ => None,
     }
+}
+
+/// VIR-AST counterpart of `const_u32_from_sst`.
+fn const_u32_from_vir(e: &Expr) -> Option<u32> {
+    match &e.x {
+        ExprX::Const(Constant::Int(n)) => n.to_string().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Shared helper: lower `IntegerTypeBound(kind, _) applied to <bit width>`.
+/// Both the SST and VIR-AST paths end up here once they've extracted
+/// `bits`. `ArchWordBits` panics — it needs prelude plumbing that isn't
+/// wired through yet.
+pub fn integer_type_bound_node(kind: &IntegerTypeBoundKind, bits: u32) -> ExprNode {
+    if matches!(kind, IntegerTypeBoundKind::ArchWordBits) {
+        panic!(
+            "IntegerTypeBound::ArchWordBits requires arch_word_bits in the \
+             Tactus prelude, which isn't wired through yet"
+        );
+    }
+    integer_type_bound_lit(kind.clone(), bits).node
+}
+
+/// Entry point for the VIR-AST rendering path (`to_lean_expr.rs`).
+pub fn integer_type_bound_from_vir(
+    kind: &IntegerTypeBoundKind,
+    inner: &Expr,
+) -> LExpr {
+    if matches!(kind, IntegerTypeBoundKind::ArchWordBits) {
+        // Fall through to the shared helper's panic so the message
+        // matches regardless of which pipeline tripped it.
+        return LExpr::new(integer_type_bound_node(kind, 0));
+    }
+    let bits = const_u32_from_vir(inner).unwrap_or_else(|| panic!(
+        "IntegerTypeBound({:?}): non-constant bit width is not supported \
+         (VIR-AST inner = {:?})",
+        kind, inner.x,
+    ));
+    LExpr::new(integer_type_bound_node(kind, bits))
 }
 
 /// The literal value of `IntegerTypeBound(kind, _)` at the given bit width.
@@ -65,7 +106,7 @@ fn const_u32(e: &Exp) -> Option<u32> {
 ///   * `SignedMin`   → `-2^(bits-1)`
 ///   * `SignedMax`   → `2^(bits-1) - 1`
 ///
-/// `ArchWordBits` is handled at the call site (it needs prelude plumbing).
+/// `ArchWordBits` is handled by the caller (it needs prelude plumbing).
 fn integer_type_bound_lit(kind: IntegerTypeBoundKind, bits: u32) -> LExpr {
     let s = match kind {
         IntegerTypeBoundKind::UnsignedMax => {
@@ -150,10 +191,15 @@ pub fn type_bound_predicate(e: &LExpr, ty: &Typ) -> Option<LExpr> {
                 rhs: Box::new(e_lt),
             }))
         }
+        // Unicode scalar range: 0 ≤ c ≤ U+10FFFF. We render as
+        // `c < 0x110000`; `0 ≤` is free from `Nat`. (Surrogates
+        // U+D800..U+DFFF are technically excluded from Unicode scalar
+        // values, but Verus and Rust's `char` don't track that, and
+        // omega's simpler with a single upper-bound literal.)
         IntRange::Char => Some(LExpr::new(ExprNode::BinOp {
             op: L::Lt,
             lhs: Box::new(e.clone()),
-            rhs: Box::new(LExpr::new(ExprNode::Lit("1114112".to_string()))),
+            rhs: Box::new(LExpr::new(ExprNode::Lit("0x110000".to_string()))),
         })),
         IntRange::Nat | IntRange::Int | IntRange::USize | IntRange::ISize => None,
     }
@@ -164,6 +210,47 @@ fn apply(head: LExpr, args: Vec<LExpr>) -> ExprNode {
         head.node
     } else {
         ExprNode::App { head: Box::new(head), args }
+    }
+}
+
+/// `true` iff VIR's `IntRange` renders as Lean `Int` (the signed side
+/// plus unbounded `Int`). The complement renders as `Nat`. Keep in
+/// sync with `to_lean_type::typ_to_expr`.
+fn renders_as_lean_int(range: &IntRange) -> bool {
+    matches!(range, IntRange::Int | IntRange::I(_) | IntRange::ISize)
+}
+
+/// Lower a `Clip { range: dst }` applied to an expression of type `src`.
+///
+/// Verus's Clip is a value-preserving coercion *if* the source value
+/// actually fits in `dst` — overflow is guarded by a neighbouring
+/// `HasType(inner, dst)` assertion. So our job is just to keep Lean's
+/// types aligned:
+///
+///   * Int-rendered source, Nat-rendered dst → `Int.toNat`
+///   * Nat-rendered source, Int-rendered dst → `Int.ofNat`
+///   * Same-side → transparent (Lean accepts the value as-is)
+///
+/// Dropping the coercion in the mixed case (the old behaviour) caused a
+/// soundness hole in exec-fn WP: `x as int - y as int` for `x, y : u8`
+/// rendered as `x - y` on `Nat`, which truncates negatives to zero. The
+/// `Int.ofNat` insertion forces subtraction to happen over `Int` so the
+/// lower-bound refinement check (if present) can actually fire.
+fn clip_to_node(src: &Typ, dst: &IntRange, inner: &Exp) -> ExprNode {
+    let src_range = match &**src {
+        TypX::Int(r) => r,
+        // Boxed int? Peel the box; otherwise the inner isn't an int type
+        // at all (shouldn't happen for Clip) and we pass through.
+        TypX::Boxed(t) => if let TypX::Int(r) = &**t { r } else {
+            return exp_to_node(inner);
+        },
+        _ => return exp_to_node(inner),
+    };
+    let rendered = sst_exp_to_ast(inner);
+    match (renders_as_lean_int(src_range), renders_as_lean_int(dst)) {
+        (true, false) => apply(var("Int.toNat"), vec![rendered]),
+        (false, true) => apply(var("Int.ofNat"), vec![rendered]),
+        _ => rendered.node,
     }
 }
 
@@ -182,17 +269,7 @@ fn exp_to_node(e: &Exp) -> ExprNode {
             arg: Box::new(sst_exp_to_ast(inner)),
         },
         ExpX::Unary(UnaryOp::Clip { range, .. }, inner) => {
-            let src_is_int = matches!(&*inner.typ, TypX::Int(
-                IntRange::Int | IntRange::I(_) | IntRange::ISize
-            ));
-            let dst_is_nat = matches!(range,
-                IntRange::Nat | IntRange::U(_) | IntRange::USize | IntRange::Char
-            );
-            if src_is_int && dst_is_nat {
-                apply(var("Int.toNat"), vec![sst_exp_to_ast(inner)])
-            } else {
-                exp_to_node(inner)
-            }
+            clip_to_node(&inner.typ, range, inner)
         }
         ExpX::Unary(UnaryOp::CoerceMode { .. }, inner)
         | ExpX::Unary(UnaryOp::Trigger(_), inner) => exp_to_node(inner),
@@ -221,22 +298,17 @@ fn exp_to_node(e: &Exp) -> ExprNode {
         // `IntegerTypeBound(kind, _)` returns the numeric bound of a
         // fixed-width int type. The inner expression is the bit width
         // (a literal like 8, 32, …) — we evaluate at codegen time and
-        // emit the decimal literal directly. `ArchWordBits` is the one
-        // case that doesn't take a width; it panics for now (prelude
-        // plumbing missing).
+        // emit the decimal literal directly.
         ExpX::UnaryOpr(UnaryOpr::IntegerTypeBound(kind, _), inner) => {
             if matches!(kind, IntegerTypeBoundKind::ArchWordBits) {
-                panic!(
-                    "IntegerTypeBound::ArchWordBits requires arch_word_bits in the \
-                     Tactus prelude, which isn't wired through yet"
-                );
+                return integer_type_bound_node(kind, 0);
             }
-            let bits = const_u32(inner).unwrap_or_else(|| panic!(
+            let bits = const_u32_from_sst(inner).unwrap_or_else(|| panic!(
                 "IntegerTypeBound({:?}): non-constant bit width is not supported \
-                 (inner = {:?})",
+                 (SST inner = {:?})",
                 kind, inner.x,
             ));
-            integer_type_bound_lit(kind.clone(), bits).node
+            integer_type_bound_node(kind, bits)
         }
         ExpX::UnaryOpr(_, inner) => exp_to_node(inner),
 

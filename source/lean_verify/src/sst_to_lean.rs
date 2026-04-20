@@ -9,16 +9,19 @@
 //! Handles bodies built from:
 //!
 //!   * `StmX::Block`     — nested/sequential composition
-//!   * `StmX::Assign`    — simple `let x := e` bindings
+//!   * `StmX::Assign`    — simple-LHS `let x := e` bindings; non-simple
+//!                         LHS (field writes, etc.) is rejected upfront
 //!   * `StmX::Assert`    — obligations, conjoined into the goal
 //!   * `StmX::Assume`    — hypotheses, threaded into the goal as implications
-//!   * `StmX::If`        — branching; WP splits across cond / ¬cond (slice 2)
-//!   * `StmX::Return`    — the final returned expression (at most one,
-//!                         top-level only; `inside_body: true` is rejected)
+//!   * `StmX::If`        — branching; WP splits across `cond` / `¬cond`
+//!   * `StmX::Return`    — terminator (works at top level and inside a
+//!                         branch; `inside_body: true` is rejected)
 //!   * `StmX::Air`, `StmX::Fuel`, `StmX::RevealString` — transparent
 //!
-//! Not yet supported: loops, fixed-width overflow as a separate
-//! obligation, pattern matching, closures, mutable references (`&mut`).
+//! Not yet supported: loops, pattern matching, closures, mutable
+//! references (`&mut`). Fixed-width arithmetic overflow IS checked,
+//! but via `HasType` assertions folded into the body WP — not via
+//! separate per-op theorems.
 //!
 //! # Mutation
 //!
@@ -55,7 +58,7 @@
 //! `BinOp::And` / `BinOp::Implies` / `UnOp::Not` / `Let` without worrying
 //! about parens.
 
-use vir::sst::{BndX, CallFun, Dest, Exp, ExpX, FuncCheckSst, FunctionSst, Stm, StmX};
+use vir::sst::{BndX, CallFun, Dest, Exp, ExpX, FuncCheckSst, FunctionSst, Par, Stm, StmX};
 use vir::ast::{BinaryOp, UnaryOp};
 use crate::lean_ast::{
     and_all, BinOp as L, Binder as LBinder, BinderKind, Expr as LExpr, ExprNode, Tactic, Theorem,
@@ -70,7 +73,7 @@ use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
 // every statement and every expression is something we know how to emit.
 
 /// Confirm the function's body, requires, and ensures only use SST forms
-/// that the first slice supports.
+/// that `sst_to_lean` currently knows how to emit.
 pub fn supported_body(check: &FuncCheckSst) -> Result<(), String> {
     check_stm(&check.body)?;
     for req in check.reqs.iter() {
@@ -91,6 +94,18 @@ fn check_stm(stm: &Stm) -> Result<(), String> {
         StmX::Assign { lhs: Dest { dest, .. }, rhs } => {
             check_exp(dest)?;
             check_exp(rhs)?;
+            // `walk` can only turn simple-var LHS assignments into
+            // `let` bindings; anything fancier (field writes, index
+            // writes, tuple destructure) would be silently dropped,
+            // which is a soundness hazard. Reject upfront so the
+            // user sees a clear "not yet supported" instead of a
+            // spurious pass.
+            if extract_simple_var(dest).is_none() {
+                return Err(format!(
+                    "assignment with non-simple LHS (got {:?}) is not yet supported",
+                    dest.x
+                ));
+            }
             Ok(())
         }
         StmX::Return { ret_exp: Some(e), inside_body: false, .. } => check_exp(e),
@@ -176,26 +191,22 @@ fn check_exp(e: &Exp) -> Result<(), String> {
 pub fn exec_fn_theorem_to_ast(fn_sst: &FunctionSst, check: &FuncCheckSst) -> Theorem {
     let mut binders: Vec<LBinder> = Vec::new();
 
-    // Function params. Skip Verus-synthetic dummy params (names containing
-    // `%`, e.g., `no%param` injected for zero-arg functions).
-    for p in fn_sst.x.pars.iter() {
-        if p.x.name.0.contains('%') { continue; }
+    // Each real param contributes one binder — `(name : T)` — and, for
+    // fixed-width integer types, one hypothesis binder right after —
+    // `(h_<name>_bound : <predicate>)`. Interleaving is fine because
+    // each hypothesis only references its own immediately preceding
+    // param.
+    for p in fn_sst.x.pars.iter().filter(|p| !is_synthetic_param(p)) {
+        let name = sanitize(&p.x.name.0);
         binders.push(LBinder {
-            name: Some(sanitize(&p.x.name.0)),
+            name: Some(name.clone()),
             ty: typ_to_expr(&p.x.typ),
             kind: BinderKind::Explicit,
         });
-    }
-
-    // Param type-bound hypotheses. For each u8/i32/… param we inject
-    // `(h_<name>_bound : <bound>)` so the body has the refinement Verus
-    // usually gets from the type itself. Unbounded types (Nat, Int,
-    // structs) contribute nothing.
-    for p in fn_sst.x.pars.iter() {
-        if p.x.name.0.contains('%') { continue; }
-        let name = sanitize(&p.x.name.0);
-        let name_expr = LExpr::new(ExprNode::Var(name.clone()));
-        if let Some(pred) = type_bound_predicate(&name_expr, &p.x.typ) {
+        if let Some(pred) = type_bound_predicate(
+            &LExpr::new(ExprNode::Var(name.clone())),
+            &p.x.typ,
+        ) {
             binders.push(LBinder {
                 name: Some(format!("h_{}_bound", name)),
                 ty: pred,
@@ -298,8 +309,23 @@ fn build_goal(
     }
 }
 
-/// Innermost goal: optional `let <ret> := <ret_expr>; <ensures_conj>`,
-/// else just the ensures conjunction. Empty ensures → `True`.
+/// Innermost goal: the ensures conjunction, optionally preceded by a
+/// `let <ret> := <ret_expr>;` binding so the ensures can reference the
+/// returned value by name. Empty ensures → `True`.
+///
+/// The four `(return_expr, ret_name)` cases:
+///
+///   * `(Some(re), Some(name))` — non-unit fn with a reachable `Return`:
+///     bind then check ensures. This is the common shape.
+///   * `(None, Some(name))` — the return value was bound earlier via an
+///     `Assign` (typical "fn foo() -> T { let r := e; r }" pattern); the
+///     name is already in scope.
+///   * `(None, None)` — unit-returning fn (or one without ensures
+///     referencing a return).
+///   * `(Some(re), None)` — a `return` carrying a value but no named
+///     destination. This happens when Rust desugars `return;` to
+///     `return ()` in a unit-returning fn. `re` is unit in that case;
+///     dropping it is correct since there's no name to bind it to.
 fn final_goal(
     return_expr: Option<&Exp>,
     ret_name: Option<&str>,
@@ -312,7 +338,7 @@ fn final_goal(
             value: Box::new(sst_exp_to_ast(re)),
             body: Box::new(ens_conj),
         }),
-        _ => ens_conj,
+        (None, Some(_)) | (None, None) | (Some(_), None) => ens_conj,
     }
 }
 
@@ -393,4 +419,11 @@ fn extract_simple_var<'a>(e: &'a Exp) -> Option<&'a str> {
         ExpX::Loc(inner) => extract_simple_var(inner),
         _ => None,
     }
+}
+
+/// Verus injects synthetic params (`no%param`, etc.) with `%` in the
+/// name for zero-arg functions and a few internal cases. They have no
+/// user-visible semantics and must be dropped from the theorem binders.
+fn is_synthetic_param(p: &Par) -> bool {
+    p.x.name.0.contains('%')
 }
