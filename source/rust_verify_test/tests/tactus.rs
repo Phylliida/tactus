@@ -2122,6 +2122,59 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// ── Slice 6: overflow obligations for fixed-width arithmetic ──────────
+//
+// `HasType(e, U(n))` / `HasType(e, I(n))` now render as the refinement
+// predicate (`e < 2^n` / `-2^(n-1) ≤ e ∧ e < 2^(n-1)`) instead of `True`.
+// Function params typed `u8`, `i32`, … pick up `(h_<name>_bound : …)`
+// hypotheses so the body inherits the usual Verus type invariant.
+
+// Without a precondition, `x + y` on two u8 values can overflow.
+// Previously this was wrongly accepted; now the `x + y < 256` assert
+// in the WP has no way to discharge and Lean rejects the fn.
+test_verify_one_file! {
+    #[test] test_exec_overflow_diagnostic verus_code! {
+        #[verifier::tactus_auto]
+        fn add_both(x: u8, y: u8) -> (r: u8)
+            ensures r == x + y
+        {
+            x + y
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "arith on unbounded u8 should fail overflow check");
+    }
+}
+
+// Tight bound: requires x + y ≤ 255 (the largest non-overflowing sum).
+// Should verify — omega proves `x + y < 256` from the requires.
+test_verify_one_file! {
+    #[test] test_exec_overflow_tight_ok verus_code! {
+        #[verifier::tactus_auto]
+        fn add_both_guarded(x: u8, y: u8) -> (r: u8)
+            requires x + y <= 255
+            ensures r == x + y
+        {
+            x + y
+        }
+    } => Ok(())
+}
+
+// Signed arithmetic: i8 range is [-128, 127]. Adding two i8s can
+// underflow below -128 or overflow above 127. Without guards, omega
+// fails to discharge both bounds.
+test_verify_one_file! {
+    #[test] test_exec_signed_overflow_fails verus_code! {
+        #[verifier::tactus_auto]
+        fn add_i8(x: i8, y: i8) -> (r: i8)
+            ensures r as int == x as int + y as int
+        {
+            x + y
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "signed u8 arith without bounds should fail");
+    }
+}
+
 // Mutation visible only within one branch must not leak past the if.
 // Without proper scoping this would incorrectly satisfy `r == x + 1`
 // even when the else-branch runs; Lean's let-shadowing rejects it.

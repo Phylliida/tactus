@@ -57,7 +57,7 @@ use crate::lean_ast::{
     and_all, BinOp as L, Binder as LBinder, BinderKind, Expr as LExpr, ExprNode, Tactic, Theorem,
     UnOp as LU,
 };
-use crate::to_lean_sst_expr::sst_exp_to_ast;
+use crate::to_lean_sst_expr::{sst_exp_to_ast, type_bound_predicate};
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
 
 // ── Support check ──────────────────────────────────────────────────────
@@ -181,6 +181,23 @@ pub fn exec_fn_theorem_to_ast(fn_sst: &FunctionSst, check: &FuncCheckSst) -> The
             ty: typ_to_expr(&p.x.typ),
             kind: BinderKind::Explicit,
         });
+    }
+
+    // Param type-bound hypotheses. For each u8/i32/… param we inject
+    // `(h_<name>_bound : <bound>)` so the body has the refinement Verus
+    // usually gets from the type itself. Unbounded types (Nat, Int,
+    // structs) contribute nothing.
+    for p in fn_sst.x.pars.iter() {
+        if p.x.name.0.contains('%') { continue; }
+        let name = sanitize(&p.x.name.0);
+        let name_expr = LExpr::new(ExprNode::Var(name.clone()));
+        if let Some(pred) = type_bound_predicate(&name_expr, &p.x.typ) {
+            binders.push(LBinder {
+                name: Some(format!("h_{}_bound", name)),
+                ty: pred,
+                kind: BinderKind::Explicit,
+            });
+        }
     }
 
     // Requires → hypothesis params.
