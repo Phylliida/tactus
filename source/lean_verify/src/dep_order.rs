@@ -167,6 +167,37 @@ fn seed_worklist<'a>(proof_fns: &[&'a FunctionX], worklist: &mut Vec<&'a Fun>) {
     }
 }
 
+// ── Coverage instrumentation ───────────────────────────────────────────
+//
+// When `$TACTUS_COVERAGE_FILE` is set, every ExprX / PlaceX variant
+// visited by the walkers is appended to that file (one line per visit).
+// The test binary `tactus_coverage` sets this path, runs a battery of
+// targeted snippets, and asserts the expected variant set was hit.
+//
+// Off by default — zero cost in normal runs (one `OnceLock` lookup).
+
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+static COVERAGE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+fn coverage_path() -> Option<&'static PathBuf> {
+    COVERAGE_PATH.get_or_init(|| {
+        std::env::var_os("TACTUS_COVERAGE_FILE").map(PathBuf::from)
+    }).as_ref()
+}
+
+/// Append `kind` to the coverage file if one is configured. Best-effort:
+/// failures are swallowed since we're in a diagnostic-only path.
+fn record(kind: &str) {
+    if let Some(path) = coverage_path() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{}", kind);
+        }
+    }
+}
+
 // ── Expression walker ───────────────────────────────────────────────────
 
 /// Walk all sub-expressions, preserving the krate lifetime `'a`.
@@ -190,6 +221,7 @@ fn seed_worklist<'a>(proof_fns: &[&'a FunctionX], worklist: &mut Vec<&'a Fun>) {
 /// sub-`Expr` and call `walk_place` for every sub-`Place`.
 fn walk_expr<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
     visit(expr);
+    record(expr_variant_name(&expr.x));
     match &expr.x {
         ExprX::Unary(_, e) | ExprX::UnaryOpr(_, e) | ExprX::Loc(e)
         | ExprX::Ghost { expr: e, .. } | ExprX::ProofInSpec(e) | ExprX::NeverToAny(e)
@@ -281,6 +313,7 @@ fn walk_expr<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
 /// `pair(x).0` reached via `ReadPlace(Field("0", Temporary(Call(pair, x))))`)
 /// never hit the Expr visitor and wouldn't be pulled into `dep_order`.
 fn walk_place<'a>(place: &'a PlaceX, visit: &mut impl FnMut(&'a Expr)) {
+    record(&format!("Place::{}", place_variant_name(place)));
     match place {
         PlaceX::Local(_) => {}
         PlaceX::Field(_, p)
@@ -290,6 +323,60 @@ fn walk_place<'a>(place: &'a PlaceX, visit: &mut impl FnMut(&'a Expr)) {
         PlaceX::Temporary(e) => walk_expr(e, visit),
         PlaceX::WithExpr(e, p) => { walk_expr(e, visit); walk_place(&p.x, visit); }
         PlaceX::Index(p, e, _, _) => { walk_place(&p.x, visit); walk_expr(e, visit); }
+    }
+}
+
+/// Stable short name for an `ExprX` variant. Used only by the coverage
+/// instrumentation — not for diagnostics. If you add a new variant, add
+/// it here and (ideally) to the expected set in `tactus_coverage`.
+fn expr_variant_name(e: &ExprX) -> &'static str {
+    match e {
+        ExprX::Const(_) => "Const", ExprX::Var(_) => "Var",
+        ExprX::ConstVar(..) => "ConstVar", ExprX::StaticVar(_) => "StaticVar",
+        ExprX::VarLoc(_) => "VarLoc", ExprX::VarAt(..) => "VarAt",
+        ExprX::Loc(_) => "Loc", ExprX::ReadPlace(..) => "ReadPlace",
+        ExprX::ExecFnByName(_) => "ExecFnByName", ExprX::NullaryOpr(_) => "NullaryOpr",
+        ExprX::Unary(..) => "Unary", ExprX::UnaryOpr(..) => "UnaryOpr",
+        ExprX::Binary(..) => "Binary", ExprX::BinaryOpr(..) => "BinaryOpr",
+        ExprX::Call(..) => "Call", ExprX::Ctor(..) => "Ctor",
+        ExprX::If(..) => "If", ExprX::Match(..) => "Match",
+        ExprX::Block(..) => "Block", ExprX::Closure(..) => "Closure",
+        ExprX::NonSpecClosure { .. } => "NonSpecClosure",
+        ExprX::Quant(..) => "Quant", ExprX::Choose { .. } => "Choose",
+        ExprX::WithTriggers { .. } => "WithTriggers",
+        ExprX::Multi(..) => "Multi", ExprX::ArrayLiteral(_) => "ArrayLiteral",
+        ExprX::Assign { .. } => "Assign", ExprX::AssignToPlace { .. } => "AssignToPlace",
+        ExprX::Loop { .. } => "Loop", ExprX::Return(_) => "Return",
+        ExprX::AssertAssume { .. } => "AssertAssume",
+        ExprX::AssertAssumeUserDefinedTypeInvariant { .. } => "AssertAssumeUDTI",
+        ExprX::AssertBy { .. } => "AssertBy", ExprX::AssertQuery { .. } => "AssertQuery",
+        ExprX::AssertCompute(..) => "AssertCompute",
+        ExprX::OpenInvariant(..) => "OpenInvariant",
+        ExprX::Fuel(..) => "Fuel", ExprX::Header(_) => "Header",
+        ExprX::RevealString(_) => "RevealString", ExprX::AirStmt(_) => "AirStmt",
+        ExprX::Nondeterministic => "Nondeterministic",
+        ExprX::BreakOrContinue { .. } => "BreakOrContinue",
+        ExprX::Ghost { .. } => "Ghost", ExprX::ProofInSpec(_) => "ProofInSpec",
+        ExprX::NeverToAny(_) => "NeverToAny",
+        ExprX::BorrowMut(_) => "BorrowMut", ExprX::TwoPhaseBorrowMut(_) => "TwoPhaseBorrowMut",
+        ExprX::BorrowMutTracked(_) => "BorrowMutTracked",
+        ExprX::ImplicitReborrowOrSpecRead(..) => "ImplicitReborrowOrSpecRead",
+        ExprX::EvalAndResolve(..) => "EvalAndResolve",
+        ExprX::Old(_) => "Old",
+    }
+}
+
+/// Stable short name for a `PlaceX` variant.
+fn place_variant_name(p: &PlaceX) -> &'static str {
+    match p {
+        PlaceX::Local(_) => "Local",
+        PlaceX::Field(..) => "Field",
+        PlaceX::DerefMut(_) => "DerefMut",
+        PlaceX::ModeUnwrap(..) => "ModeUnwrap",
+        PlaceX::Temporary(_) => "Temporary",
+        PlaceX::WithExpr(..) => "WithExpr",
+        PlaceX::Index(..) => "Index",
+        PlaceX::UserDefinedTypInvariantObligation(..) => "UDTI",
     }
 }
 
