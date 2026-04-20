@@ -302,12 +302,28 @@ fn fn_binders(f: &FunctionX) -> Vec<LBinder> {
 
     out.extend(trait_bounds_to_ast(&f.typ_bounds));
 
+    // Each param → one binder, and (for fixed-width int types) one
+    // hypothesis binder right after giving the refinement bounds.
+    // Must mirror `sst_to_lean::exec_fn_theorem_to_ast`: both paths
+    // need to agree on the in-scope refinement for the same param,
+    // or proof fns and the exec fns that call them diverge.
     for p in f.params.iter() {
+        let name = sanitize(&p.x.name.0);
         out.push(LBinder {
-            name: Some(sanitize(&p.x.name.0)),
+            name: Some(name.clone()),
             ty: typ_to_expr(&p.x.typ),
             kind: BinderKind::Explicit,
         });
+        if let Some(pred) = crate::to_lean_sst_expr::type_bound_predicate(
+            &LExpr::var(name.clone()),
+            &p.x.typ,
+        ) {
+            out.push(LBinder {
+                name: Some(format!("h_{}_bound", name)),
+                ty: pred,
+                kind: BinderKind::Explicit,
+            });
+        }
     }
 
     out

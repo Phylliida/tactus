@@ -141,13 +141,15 @@ fn integer_type_bound_lit(kind: IntegerTypeBoundKind, bits: u32) -> LExpr {
 ///
 /// Returns `Some(pred)` otherwise.
 ///
-/// For `U(n)` (rendered as `Nat`): `e < 2^n`. The `0 ≤ e` half comes for
-/// free from `Nat`.
+/// For `U(n)` (rendered as `Int`): `0 ≤ e ∧ e < 2^n`. Rendering u-types
+/// as `Int` rather than `Nat` is what makes subtraction underflow
+/// catchable — Lean's `Nat` silently truncates negatives, but `Int`
+/// gives the true mathematical value so this refinement check can fire.
 ///
-/// For `I(n)` (rendered as `Int`): `-2^(n-1) ≤ e ∧ e < 2^(n-1)`. `e` is
-/// duplicated in the predicate.
+/// For `I(n)` (rendered as `Int`): `-2^(n-1) ≤ e ∧ e < 2^(n-1)`.
 ///
-/// For `Char`: `e < 0x110000` (Unicode scalar range).
+/// For `Char` (rendered as `Nat`): `e < 0x110000`. The `0 ≤` half comes
+/// for free from `Nat`.
 pub fn type_bound_predicate(e: &LExpr, ty: &Typ) -> Option<LExpr> {
     // Transparent: unbox before examining.
     if let TypX::Boxed(inner) = &**ty {
@@ -158,7 +160,10 @@ pub fn type_bound_predicate(e: &LExpr, ty: &Typ) -> Option<LExpr> {
         _ => return None,
     };
     match range {
-        IntRange::U(n) => Some(LExpr::lt(e.clone(), two_pow_lit(*n))),
+        IntRange::U(n) => Some(LExpr::and(
+            LExpr::le(LExpr::lit_int("0"), e.clone()),
+            LExpr::lt(e.clone(), two_pow_lit(*n)),
+        )),
         IntRange::I(n) => {
             let hi = two_pow_lit(*n - 1);
             Some(LExpr::and(
@@ -177,10 +182,15 @@ pub fn type_bound_predicate(e: &LExpr, ty: &Typ) -> Option<LExpr> {
 }
 
 /// `true` iff VIR's `IntRange` renders as Lean `Int` (the signed side
-/// plus unbounded `Int`). The complement renders as `Nat`. Keep in
-/// sync with `to_lean_type::typ_to_expr`.
+/// plus unbounded `Int`, and also fixed-width u-types — their spec-mode
+/// subtraction is mathematical rather than truncating). The complement
+/// — `Nat`, `USize`, `Char` — renders as `Nat`. Keep in sync with
+/// `to_lean_type::typ_to_expr`.
 fn renders_as_lean_int(range: &IntRange) -> bool {
-    matches!(range, IntRange::Int | IntRange::I(_) | IntRange::ISize)
+    matches!(
+        range,
+        IntRange::Int | IntRange::I(_) | IntRange::ISize | IntRange::U(_)
+    )
 }
 
 /// Lower a `Clip { range: dst }` applied to an expression of type `src`.
