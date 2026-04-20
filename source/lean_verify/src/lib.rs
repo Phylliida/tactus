@@ -5,6 +5,7 @@ pub mod lean_pp;
 pub mod lean_process;
 pub mod prelude;
 pub mod project;
+pub mod sanity;
 pub mod sst_to_lean;
 pub mod to_lean_expr;
 pub mod to_lean_fn;

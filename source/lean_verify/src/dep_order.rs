@@ -174,6 +174,20 @@ fn seed_worklist<'a>(proof_fns: &[&'a FunctionX], worklist: &mut Vec<&'a Fun>) {
 /// Unlike VIR's `expr_visitor_walk`, this gives the callback `&'a Expr`
 /// (not a short-lived `&Expr`), so callers can borrow data from the AST
 /// without Arc clones.
+///
+/// # Invariant
+///
+/// **Every `Expr` and every `Place` embedded in an `ExprX` variant must be
+/// recursed into.** Missing a field here silently drops the subtree — which
+/// for dep_order means any spec-fn reference inside never surfaces, and the
+/// callee ends up missing from the generated Lean preamble. That was the
+/// bug behind the tuple regression: `ReadPlace(Place::Field(…, Temporary(
+/// Call(pair, …))))` hid the call inside a `Place`, and this walker used
+/// to treat `ReadPlace` as a leaf.
+///
+/// When adding a new `ExprX` variant: the match below is exhaustive, so
+/// the compiler will force you to handle it. When doing so, walk **every**
+/// sub-`Expr` and call `walk_place` for every sub-`Place`.
 fn walk_expr<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
     visit(expr);
     match &expr.x {

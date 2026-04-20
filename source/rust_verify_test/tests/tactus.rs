@@ -1884,16 +1884,40 @@ test_verify_one_file! {
 // Specifically guards against the bug where `ReadPlace(Place::Field(…,
 // Temporary(Call(pair, …))))` buried the call in a Place the walker
 // treated as a leaf.
+//
+// Ensures is an inequality so the proof doesn't depend on arithmetic
+// normalization making `x + 1 - x` collapse to `1`. After `unfold; simp`
+// the goal is literally `x < x + 1`, which `omega` closes directly.
 test_verify_one_file! {
     #[test] test_tuple_return verus_code! {
         spec fn pair(x: int) -> (int, int) {
             (x, x + 1)
         }
 
-        proof fn pair_diff(x: int)
-            ensures pair(x).1 - pair(x).0 == 1
+        proof fn pair_lt(x: int)
+            ensures pair(x).0 < pair(x).1
         by {
             unfold pair; simp; omega
+        }
+    } => Ok(())
+}
+
+// Tuple-struct field access: the other branch of `field_access_name`.
+// `Dt::Path + numeric field` must map to `valN` to match the datatype
+// emitter's `field_name` rename. If this test fails, the two sides
+// disagree on where struct field "0" went.
+test_verify_one_file! {
+    #[test] test_tuple_struct_field verus_code! {
+        struct Point(int, int);
+
+        spec fn origin() -> Point {
+            Point(0, 0)
+        }
+
+        proof fn origin_x_zero()
+            ensures origin().0 == 0
+        by {
+            unfold origin; simp
         }
     } => Ok(())
 }
