@@ -2565,6 +2565,32 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Mirror of the above with the loop in the *else*-branch — guards
+// against a copy-paste bug in `BodyItem::contains_loop` or
+// `build_goal`'s If arm that only handled the `then` side.
+test_verify_one_file! {
+    #[test] test_exec_loop_in_else_branch verus_code! {
+        #[verifier::tactus_auto]
+        fn loop_in_else(n: u8, skip: bool) -> (r: u8)
+            requires n <= 50
+            ensures r <= n
+        {
+            let mut x: u8 = n;
+            if skip {
+                // no-op; loop is in the else branch
+            } else {
+                while x > 0
+                    invariant x <= n
+                    decreases x
+                {
+                    x = x - 1;
+                }
+            }
+            x
+        }
+    } => Ok(())
+}
+
 // Lexicographic `decreases` is rejected up front — single-expression
 // only at the current slice. Regression guard so we notice when /
 // if that restriction is lifted.

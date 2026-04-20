@@ -17,18 +17,23 @@
 //!   * `StmX::Return`    — terminator (works at top level and inside a
 //!                         branch; `inside_body: true` is rejected)
 //!   * `StmX::Air`, `StmX::Fuel`, `StmX::RevealString` — transparent
-//!   * `StmX::Loop`      — simple `while` loops only (one per function,
-//!                         top-level, `loop_isolation: true`, empty
-//!                         `cond` setup, single-expression `decreases`,
-//!                         invariants true at both entry and exit, no
-//!                         `break`/`continue`, no nested loops).
-//!                         Emits three obligations: init, maintain, use
-//!                         (see "Loop obligations" below).
+//!   * `StmX::Loop`      — `while` loops with `loop_isolation: true`,
+//!                         simple `while` condition (no setup
+//!                         statements), single-expression `decreases`,
+//!                         invariants true at both entry and exit.
+//!                         Loops can appear anywhere — top level,
+//!                         inside if-branches, nested within another
+//!                         loop's body, or in sequence — because each
+//!                         loop contributes its obligations as
+//!                         conjuncts into the enclosing goal (see
+//!                         "Loop obligations" below). `break` /
+//!                         `continue` aren't supported yet.
 //!
-//! Not yet supported: nested/sequential loops, break/continue, pattern
-//! matching, closures, mutable references (`&mut`). Fixed-width
-//! arithmetic overflow IS checked, but via `HasType` assertions folded
-//! into the body WP — not via separate per-op theorems.
+//! Not yet supported: break/continue, lexicographic `decreases`,
+//! pattern matching, closures, mutable references (`&mut`).
+//! Fixed-width arithmetic overflow IS checked, but via `HasType`
+//! assertions folded into the body WP — not via separate per-op
+//! theorems.
 //!
 //! # Loop obligations (conjunctive WP)
 //!
@@ -283,7 +288,7 @@ pub fn exec_fn_theorems_to_ast(fn_sst: &FunctionSst, check: &FuncCheckSst) -> Ve
         .collect();
 
     let items = walk(&check.body, &type_map);
-    let has_loop = items_contain_loop(&items);
+    let has_loop = items.iter().any(BodyItem::contains_loop);
     let goal = build_goal(
         &items,
         check.post_condition.dest.as_ref().map(|v| v.0.as_str()),
@@ -321,17 +326,6 @@ fn loop_tactic() -> Tactic {
     Tactic::Raw("tactus_peel; all_goals tactus_auto".to_string())
 }
 
-/// Recurse through the item tree to find any `Loop`. Used to pick the
-/// right tactic shape at theorem-emit time.
-fn items_contain_loop(items: &[BodyItem<'_>]) -> bool {
-    items.iter().any(|item| match item {
-        BodyItem::Loop { .. } => true,
-        BodyItem::IfThenElse { then_items, else_items, .. } => {
-            items_contain_loop(then_items) || items_contain_loop(else_items)
-        }
-        _ => false,
-    })
-}
 
 // ── Binder builders ────────────────────────────────────────────────────
 
@@ -374,41 +368,51 @@ fn build_req_binders(check: &FuncCheckSst) -> Vec<LBinder> {
 /// the remainder of the body. `Return` terminates: items after it are
 /// dropped because they're unreachable.
 ///
-/// The base case (empty items, no return seen) emits the ensures
-/// conjunction unchanged. `Return(e)` with a named dest emits
-/// `let <ret> := e; <ensures>`; without a dest (unit return in a unit
-/// fn), the return value is dropped — it's always `()`.
+/// Thin wrapper around `build_goal_with_terminator`; the terminator for
+/// the top-level call is the ensures conjunction.
 fn build_goal(
     items: &[BodyItem<'_>],
     ret_name: Option<&str>,
     ensures: &[Exp],
 ) -> LExpr {
-    let ens_conj = || and_all(ensures.iter().map(sst_exp_to_ast).collect());
-    let Some((head, rest)) = items.split_first() else {
-        // Reached the end with no `Return`: return name (if any) was
-        // bound earlier via an `Assign`, so ensures can reference it
-        // directly.
-        return ens_conj();
-    };
+    let terminator = and_all(ensures.iter().map(sst_exp_to_ast).collect());
+    build_goal_with_terminator(items, ret_name, &terminator)
+}
+
+/// The real WP builder, parameterized on what the continuation ends in.
+///
+/// At the top of the body, `terminator` is the ensures conjunction and
+/// the function acts like textbook WP. Inside a loop's maintain clause,
+/// `terminator` is `I ∧ D < d_old` — so the loop's body walker can
+/// reuse all of the same item-handling logic with a different terminal
+/// goal. One function, one set of rules.
+///
+/// The base case (empty items) returns a clone of the terminator.
+/// `Return(e)` with a named dest emits `let <ret> := e; <terminator>`;
+/// without a dest (unit return in a unit fn), the return value is
+/// dropped — it's always `()`.
+fn build_goal_with_terminator(
+    items: &[BodyItem<'_>],
+    ret_name: Option<&str>,
+    terminator: &LExpr,
+) -> LExpr {
+    let Some((head, rest)) = items.split_first() else { return terminator.clone() };
     match head {
         BodyItem::Let(name, rhs) => LExpr::let_bind(
             sanitize(name), sst_exp_to_ast(rhs),
-            build_goal(rest, ret_name, ensures),
+            build_goal_with_terminator(rest, ret_name, terminator),
         ),
         BodyItem::Assume(e) => LExpr::implies(
             sst_exp_to_ast(e),
-            build_goal(rest, ret_name, ensures),
+            build_goal_with_terminator(rest, ret_name, terminator),
         ),
         BodyItem::Assert(e) => LExpr::and(
             sst_exp_to_ast(e),
-            build_goal(rest, ret_name, ensures),
+            build_goal_with_terminator(rest, ret_name, terminator),
         ),
-        // Terminator: `let <ret> := e; <ensures>`. If there's no ret
-        // name (unit-returning fn with an explicit `return ();`), the
-        // return expression is `()` and we just emit the ensures.
         BodyItem::Return(e) => match ret_name {
-            Some(name) => LExpr::let_bind(sanitize(name), sst_exp_to_ast(e), ens_conj()),
-            None => ens_conj(),
+            Some(name) => LExpr::let_bind(sanitize(name), sst_exp_to_ast(e), terminator.clone()),
+            None => terminator.clone(),
         },
         // WP: `(c → wp(then ++ rest)) ∧ (¬c → wp(else ++ rest))`. `rest`
         // duplicates syntactically — see DESIGN.md "Known codegen-
@@ -422,8 +426,14 @@ fn build_goal(
                 else_items.iter().chain(rest.iter()).cloned().collect();
             let cond_ast = sst_exp_to_ast(cond);
             LExpr::and(
-                LExpr::implies(cond_ast.clone(), build_goal(&then_all, ret_name, ensures)),
-                LExpr::implies(LExpr::not(cond_ast), build_goal(&else_all, ret_name, ensures)),
+                LExpr::implies(
+                    cond_ast.clone(),
+                    build_goal_with_terminator(&then_all, ret_name, terminator),
+                ),
+                LExpr::implies(
+                    LExpr::not(cond_ast),
+                    build_goal_with_terminator(&else_all, ret_name, terminator),
+                ),
             )
         }
         // WP: `I ∧ maintain ∧ havoc_continuation`. See the
@@ -432,7 +442,7 @@ fn build_goal(
         BodyItem::Loop { cond, invs, decrease, modified_vars, body_items } => {
             build_loop_conjunction(
                 cond, invs, decrease, modified_vars, body_items,
-                rest, ret_name, ensures,
+                rest, ret_name, terminator,
             )
         }
     }
@@ -441,24 +451,29 @@ fn build_goal(
 /// Build the three-way conjunction contributed by a loop.
 ///
 ///   `I ∧ (∀ mod_vars, bounds → I ∧ cond → <maintain>)
-///      ∧ (∀ mod_vars, bounds → I ∧ ¬cond → <wp(rest, ensures)>)`
+///      ∧ (∀ mod_vars, bounds → I ∧ ¬cond → <wp(rest, outer_terminator)>)`
 ///
 /// The outer `I` asserts the invariant at loop entry. Maintain and use
 /// are both universally quantified over the loop's modified vars —
 /// maintain because the loop body must preserve `I` and decrease `D`
 /// for an arbitrary iteration start; use because after the loop exits,
 /// the only thing we know about modified vars is `I ∧ ¬cond`.
+///
+/// The maintain clause uses its own local terminator `I ∧ D < d_old`
+/// (one per loop). The use clause threads the outer `terminator`
+/// through, so a nested loop's post-loop code feeds back into the
+/// outer loop's post-body goal / fn ensures.
 fn build_loop_conjunction(
     cond: &Exp,
-    invs: &[&Exp],
+    invs: &[LoopInv],
     decrease: &Exp,
     modified_vars: &[(&VarIdent, &Typ)],
     body_items: &[BodyItem<'_>],
     rest: &[BodyItem<'_>],
     ret_name: Option<&str>,
-    ensures: &[Exp],
+    terminator: &LExpr,
 ) -> LExpr {
-    let inv_conj = || and_all(invs.iter().map(|e| sst_exp_to_ast(e)).collect());
+    let inv_conj = || and_all(invs.iter().map(|i| sst_exp_to_ast(&i.inv)).collect());
     let cond_ast = || sst_exp_to_ast(cond);
     let decrease_ast = || sst_exp_to_ast(decrease);
 
@@ -471,25 +486,23 @@ fn build_loop_conjunction(
     // The `let d_old := D` captures the decrease measure before the
     // body runs; the inner `D` after any mutations inside body has
     // shadowed the relevant variable will refer to the new value.
-    let post_body = LExpr::and(inv_conj(), LExpr::lt(decrease_ast(), LExpr::var("_d_old")));
-    let maintain_body_wp = build_wrapped(body_items, ret_name, post_body);
-    let maintain_core = LExpr::let_bind("_d_old", decrease_ast(), maintain_body_wp);
+    let post_body = LExpr::and(
+        inv_conj(),
+        LExpr::lt(decrease_ast(), LExpr::var("_tactus_d_old")),
+    );
+    let maintain_body_wp = build_goal_with_terminator(body_items, ret_name, &post_body);
+    let maintain_core = LExpr::let_bind("_tactus_d_old", decrease_ast(), maintain_body_wp);
     let maintain_clause = quantify_mod_vars(
         modified_vars,
-        LExpr::implies(
-            LExpr::and(inv_conj(), cond_ast()),
-            maintain_core,
-        ),
+        LExpr::implies(LExpr::and(inv_conj(), cond_ast()), maintain_core),
     );
 
-    // Use / continuation: `∀ mod_vars, bounds → I ∧ ¬cond → wp(rest, ensures)`.
-    let rest_goal = build_goal(rest, ret_name, ensures);
+    // Use / continuation: `∀ mod_vars, bounds → I ∧ ¬cond →
+    //   wp(rest, outer_terminator)`.
+    let rest_goal = build_goal_with_terminator(rest, ret_name, terminator);
     let use_clause = quantify_mod_vars(
         modified_vars,
-        LExpr::implies(
-            LExpr::and(inv_conj(), LExpr::not(cond_ast())),
-            rest_goal,
-        ),
+        LExpr::implies(LExpr::and(inv_conj(), LExpr::not(cond_ast())), rest_goal),
     );
 
     LExpr::and(init_clause, LExpr::and(maintain_clause, use_clause))
@@ -522,68 +535,6 @@ fn quantify_mod_vars(
     out
 }
 
-/// Fold `items` around a supplied `inner` goal. Same WP rules as
-/// `build_goal` but with an externally-supplied terminator — used by
-/// the loop builder to construct "wp(body, post-body-goal)".
-fn build_wrapped(items: &[BodyItem<'_>], ret_name: Option<&str>, inner: LExpr) -> LExpr {
-    let Some((head, rest)) = items.split_first() else { return inner };
-    match head {
-        BodyItem::Let(n, rhs) => LExpr::let_bind(
-            sanitize(n), sst_exp_to_ast(rhs),
-            build_wrapped(rest, ret_name, inner),
-        ),
-        BodyItem::Assume(e) => LExpr::implies(
-            sst_exp_to_ast(e), build_wrapped(rest, ret_name, inner),
-        ),
-        BodyItem::Assert(e) => LExpr::and(
-            sst_exp_to_ast(e), build_wrapped(rest, ret_name, inner),
-        ),
-        BodyItem::Return(e) => match ret_name {
-            Some(name) => LExpr::let_bind(sanitize(name), sst_exp_to_ast(e), inner),
-            None => inner,
-        },
-        BodyItem::IfThenElse { cond, then_items, else_items } => {
-            let then_all: Vec<BodyItem<'_>> =
-                then_items.iter().chain(rest.iter()).cloned().collect();
-            let else_all: Vec<BodyItem<'_>> =
-                else_items.iter().chain(rest.iter()).cloned().collect();
-            let cond_ast = sst_exp_to_ast(cond);
-            LExpr::and(
-                LExpr::implies(cond_ast.clone(), build_wrapped(&then_all, ret_name, inner.clone())),
-                LExpr::implies(LExpr::not(cond_ast), build_wrapped(&else_all, ret_name, inner)),
-            )
-        }
-        BodyItem::Loop { cond, invs, decrease, modified_vars, body_items } => {
-            // A loop whose continuation ends with `inner` rather than
-            // the fn's ensures. Same three-way conjunction shape —
-            // init / maintain / use — but the use clause terminates
-            // with `wp(rest, inner)` instead of `wp(rest, ensures)`.
-            let inv_conj = || and_all(invs.iter().map(|e| sst_exp_to_ast(e)).collect());
-            let cond_ast = || sst_exp_to_ast(cond);
-            let decrease_ast = || sst_exp_to_ast(decrease);
-            let post_body = LExpr::and(
-                inv_conj(),
-                LExpr::lt(decrease_ast(), LExpr::var("_d_old")),
-            );
-            let maintain_body_wp = build_wrapped(body_items, ret_name, post_body);
-            let maintain_core = LExpr::let_bind("_d_old", decrease_ast(), maintain_body_wp);
-            let maintain_clause = quantify_mod_vars(
-                modified_vars,
-                LExpr::implies(LExpr::and(inv_conj(), cond_ast()), maintain_core),
-            );
-            let tail = build_wrapped(rest, ret_name, inner);
-            let use_clause = quantify_mod_vars(
-                modified_vars,
-                LExpr::implies(
-                    LExpr::and(inv_conj(), LExpr::not(cond_ast())),
-                    tail,
-                ),
-            );
-            LExpr::and(inv_conj(), LExpr::and(maintain_clause, use_clause))
-        }
-    }
-}
-
 // ── Body walk ──────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -604,18 +555,39 @@ enum BodyItem<'a> {
         else_items: Vec<BodyItem<'a>>,
     },
     /// `while <cond> invariant <invs> decreases <decrease> { <body_items> }`.
-    /// Loop bodies are fully flattened — nested loops appear as inner
-    /// `Loop` variants and compose naturally through `build_goal`.
-    /// Modified vars are computed from the body's assignments and
-    /// resolved to types at walk time so `build_goal` doesn't need the
-    /// type map.
+    /// Loop bodies are flattened through `Block` composition; nested
+    /// loops appear as inner `Loop` variants and compose naturally
+    /// through `build_goal`. Modified vars are computed from the
+    /// body's assignments and resolved to types at walk time so
+    /// `build_goal` doesn't need the type map.
+    ///
+    /// `invs` is borrowed directly from the SST's `LoopInvs` (an
+    /// `Arc<Vec<LoopInv>>`) — no intermediate `Vec`. `build_goal`
+    /// pulls the `.inv` field off each `LoopInv` when it needs the
+    /// invariant expression.
     Loop {
         cond: &'a Exp,
-        invs: Vec<&'a Exp>,
+        invs: &'a [LoopInv],
         decrease: &'a Exp,
         modified_vars: Vec<(&'a VarIdent, &'a Typ)>,
         body_items: Vec<BodyItem<'a>>,
     },
+}
+
+impl<'a> BodyItem<'a> {
+    /// Does this item — or any sub-item nested inside it — contain a
+    /// loop? Used at theorem-emit time to pick between the plain
+    /// `tactus_auto` tactic and the structural-peeling loop tactic.
+    fn contains_loop(&self) -> bool {
+        match self {
+            BodyItem::Loop { .. } => true,
+            BodyItem::IfThenElse { then_items, else_items, .. } => {
+                then_items.iter().any(Self::contains_loop)
+                    || else_items.iter().any(Self::contains_loop)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Flatten an SST statement tree into a sequence of `BodyItem`s. A
@@ -647,7 +619,6 @@ fn walk<'a>(
         }],
         StmX::Loop { cond, body, invs, decrease, .. } => {
             let (_, cond_exp) = cond.as_ref().expect("check_stm guarantees Some cond");
-            let invs_exps: Vec<&'a Exp> = invs.iter().map(|inv: &LoopInv| &inv.inv).collect();
             let decrease_exp = decrease.first().expect("check_stm guarantees one decrease");
             // Compute modified vars from the loop body's *non-init*
             // assignments — `let mut x = …` inside the body is local
@@ -667,7 +638,7 @@ fn walk<'a>(
                 .collect();
             vec![BodyItem::Loop {
                 cond: cond_exp,
-                invs: invs_exps,
+                invs: &invs[..],
                 decrease: decrease_exp,
                 modified_vars,
                 body_items: walk(body, type_map),
@@ -737,11 +708,7 @@ fn extract_simple_var_ident<'a>(e: &'a Exp) -> Option<&'a VarIdent> {
 }
 
 fn extract_simple_var<'a>(e: &'a Exp) -> Option<&'a str> {
-    match &e.x {
-        ExpX::Var(ident) | ExpX::VarLoc(ident) => Some(ident.0.as_str()),
-        ExpX::Loc(inner) => extract_simple_var(inner),
-        _ => None,
-    }
+    extract_simple_var_ident(e).map(|id| id.0.as_str())
 }
 
 
