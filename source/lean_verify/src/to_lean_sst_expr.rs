@@ -139,9 +139,6 @@ fn integer_type_bound_lit(kind: IntegerTypeBoundKind, bits: u32) -> LExpr {
 /// Returns `None` when the target type carries no additional constraint:
 ///   * `Nat`, `Int` — unbounded
 ///   * non-integer types — structural, no refinement
-///   * `USize`, `ISize` — depend on `arch_word_bits`, not yet wired through
-///     the prelude; treated as unbounded for now (accepted soundness gap,
-///     same as stock Verus when compiling without `--target`)
 ///
 /// Returns `Some(pred)` otherwise.
 ///
@@ -151,6 +148,14 @@ fn integer_type_bound_lit(kind: IntegerTypeBoundKind, bits: u32) -> LExpr {
 /// gives the true mathematical value so this refinement check can fire.
 ///
 /// For `I(n)` (rendered as `Int`): `-2^(n-1) ≤ e ∧ e < 2^(n-1)`.
+///
+/// For `USize` (rendered as `Int`): `0 ≤ e ∧ e < usize_hi`, where
+/// `usize_hi = 2^arch_word_bits` is a prelude-defined constant. For
+/// `ISize`: `-isize_hi ≤ e ∧ e < isize_hi`, same idea. `tactus_auto`
+/// generally can't discharge these symbolically (omega doesn't reason
+/// about `2^n` for unknown `n`) — proofs often need an explicit
+/// `cases arch_word_bits_valid` step. Emitting them anyway is the
+/// soundness-preserving choice.
 ///
 /// For `Char` (rendered as `Nat`): `e < 0x110000`. The `0 ≤` half comes
 /// for free from `Nat`.
@@ -175,13 +180,27 @@ pub fn type_bound_predicate(e: &LExpr, ty: &Typ) -> Option<LExpr> {
                 LExpr::lt(e.clone(), hi),
             ))
         }
+        IntRange::USize => {
+            let hi = LExpr::var("usize_hi");
+            Some(LExpr::and(
+                LExpr::le(LExpr::lit_int("0"), e.clone()),
+                LExpr::lt(e.clone(), hi),
+            ))
+        }
+        IntRange::ISize => {
+            let hi = LExpr::var("isize_hi");
+            Some(LExpr::and(
+                LExpr::le(LExpr::neg(hi.clone()), e.clone()),
+                LExpr::lt(e.clone(), hi),
+            ))
+        }
         // Unicode scalar range: 0 ≤ c ≤ U+10FFFF. `c < 0x110000` covers
         // the upper half; `0 ≤` is free from `Nat`. (Surrogates
         // U+D800..U+DFFF are technically excluded from Unicode scalar
         // values, but Verus and Rust's `char` don't track that, and
         // omega's simpler with a single upper-bound literal.)
         IntRange::Char => Some(LExpr::lt(e.clone(), LExpr::lit_int("0x110000"))),
-        IntRange::Nat | IntRange::Int | IntRange::USize | IntRange::ISize => None,
+        IntRange::Nat | IntRange::Int => None,
     }
 }
 

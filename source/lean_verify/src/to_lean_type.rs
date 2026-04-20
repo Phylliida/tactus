@@ -23,17 +23,22 @@ fn typ_to_node(typ: &TypX) -> ExprNode {
     match typ {
         TypX::Bool => ExprNode::Var("Prop".into()),
         TypX::Int(range) => ExprNode::Var(match range {
-            // Any type that can participate in signed arithmetic — including
-            // fixed-width u-types, since their spec-mode subtraction is
-            // mathematical (goes negative) rather than truncating, and we
-            // need `Int` semantics to catch underflow via `HasType` bounds.
+            // Fixed-width u-types and i-types render as `Int` so that
+            // their spec-mode subtraction is mathematical (can go
+            // negative); `HasType` bounds then catch underflow.
             IntRange::Int | IntRange::I(_) | IntRange::ISize
             | IntRange::U(_) => "Int".into(),
-            // `nat` is Verus's unbounded non-negative type — maps directly
-            // to Lean `Nat` with matching semantics. USize has no upper
-            // bound yet (needs prelude `arch_word_bits`) but at least
-            // stays non-negative. Char stays `Nat` because char values
-            // rarely participate in arithmetic.
+            // `nat` maps directly to Lean `Nat` — matching semantics.
+            // `USize` stays `Nat` too (rather than `Int`) because
+            // Verus elides `as nat` casts from `usize` in spec
+            // contexts — const-generic bodies like `N as nat`
+            // render as just `N`, so the param's Lean type has to
+            // BE `Nat` or we get a type mismatch. Same reason for
+            // `Char`. The upper bound still gets emitted via the
+            // `usize_hi` prelude axiom in `type_bound_predicate`;
+            // the subtraction-truncation risk that motivated u8→Int
+            // exists here but is rare in practice for usize and
+            // accepted as a known gap pending a deeper fix.
             IntRange::Nat | IntRange::USize | IntRange::Char => "Nat".into(),
         }),
         TypX::TypParam(name) => ExprNode::Var(name.to_string()),

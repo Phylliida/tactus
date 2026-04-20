@@ -13,6 +13,19 @@ set_option maxHeartbeats 800000
 axiom arch_word_bits : Nat
 axiom arch_word_bits_valid : arch_word_bits = 32 ∨ arch_word_bits = 64
 
+-- Upper bounds for `usize` / `isize`, used as the refinement target
+-- by `type_bound_predicate` in sst_to_lean.
+--
+-- We define them in `Int` rather than `Nat` so the resulting
+-- refinement (`0 ≤ e ∧ e < usize_hi` etc.) composes cleanly with
+-- `e : Int` without coercion clutter. tactus_auto can't generally
+-- discharge these symbolically — proofs involving `usize` / `isize`
+-- arithmetic will often need an explicit `cases arch_word_bits_valid`
+-- step. That's the accepted trade-off for having the bounds be
+-- present at all.
+noncomputable def usize_hi : Int := (2 : Int) ^ arch_word_bits
+noncomputable def isize_hi : Int := (2 : Int) ^ (arch_word_bits - 1)
+
 -- Tactus: the *atomic closer* used at the leaves of the tactics we emit.
 -- Intentionally kept to simple, always-closing tactics — `rfl`, `decide`,
 -- `omega`, `simp_all`. Any structural peeling (`refine ⟨?_, ?_⟩`,

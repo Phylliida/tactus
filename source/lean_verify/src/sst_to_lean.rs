@@ -14,8 +14,12 @@
 //!   * `StmX::Assert`    — obligations, conjoined into the goal
 //!   * `StmX::Assume`    — hypotheses, threaded into the goal as implications
 //!   * `StmX::If`        — branching; WP splits across `cond` / `¬cond`
-//!   * `StmX::Return`    — terminator (works at top level and inside a
-//!                         branch; `inside_body: true` is rejected)
+//!   * `StmX::Return`    — terminator; any items after it in the
+//!                         same sequence are unreachable and dropped.
+//!                         Works at top level, inside a branch, or as
+//!                         an early-return mid-block (`inside_body:
+//!                         true`) — all three lower to the same
+//!                         `BodyItem::Return`.
 //!   * `StmX::Air`, `StmX::Fuel`, `StmX::RevealString` — transparent
 //!   * `StmX::Loop`      — `while` loops with `loop_isolation: true`,
 //!                         simple `while` condition (no setup
@@ -108,7 +112,7 @@ use std::collections::{HashMap, HashSet};
 use vir::sst::{
     BndX, CallFun, Dest, Exp, ExpX, FuncCheckSst, FunctionSst, LoopInv, Par, Stm, StmX,
 };
-use vir::ast::{BinaryOp, Typ, UnaryOp, VarIdent};
+use vir::ast::{BinaryOp, Typ, UnaryOp, UnaryOpr, VarIdent};
 use crate::lean_ast::{
     and_all, Binder as LBinder, BinderKind, Expr as LExpr, Tactic, Theorem,
 };
@@ -153,11 +157,14 @@ fn check_stm(stm: &Stm) -> Result<(), String> {
             }
             Ok(())
         }
-        StmX::Return { ret_exp: Some(e), inside_body: false, .. } => check_exp(e),
-        StmX::Return { ret_exp: None, inside_body: false, .. } => Ok(()),
-        StmX::Return { inside_body: true, .. } => Err(
-            "early returns from within a block are not yet supported".to_string()
-        ),
+        // `inside_body` distinguishes a tail return from an "early"
+        // return (one with code after it in the same block). Both
+        // exit the fn; the `walk` / `build_goal` pipeline already
+        // handles them uniformly — each `Return` terminates its
+        // item list and subsequent items get dropped on that branch.
+        // See the "early return" section of the module doc.
+        StmX::Return { ret_exp: Some(e), .. } => check_exp(e),
+        StmX::Return { ret_exp: None, .. } => Ok(()),
         StmX::Assert(_, _, e) | StmX::Assume(e) => check_exp(e),
         StmX::AssertCompute(_, e, _) => check_exp(e),
         StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => Ok(()),
@@ -399,10 +406,19 @@ fn build_goal_with_terminator(
 ) -> LExpr {
     let Some((head, rest)) = items.split_first() else { return terminator.clone() };
     match head {
-        BodyItem::Let(name, rhs) => LExpr::let_bind(
-            sanitize(name), sst_exp_to_ast(rhs),
-            build_goal_with_terminator(rest, ret_name, terminator),
-        ),
+        // An `ExpX::If` on the RHS of a let (or as the returned value,
+        // below) is a value whose structure omega can't reason about —
+        // omega handles `∧`/`→`/`¬` over linear arith but not
+        // `if c then a else b` inside the goal. Lift it out: split
+        // `let x := if c then a else b; rest` into
+        // `(c → let x := a; rest) ∧ (¬c → let x := b; rest)`.
+        // Recursion handles nested if-exprs.
+        BodyItem::Let(name, rhs) => lift_if_value(rhs, &|rhs_ast| {
+            LExpr::let_bind(
+                sanitize(name), rhs_ast,
+                build_goal_with_terminator(rest, ret_name, terminator),
+            )
+        }),
         BodyItem::Assume(e) => LExpr::implies(
             sst_exp_to_ast(e),
             build_goal_with_terminator(rest, ret_name, terminator),
@@ -411,10 +427,10 @@ fn build_goal_with_terminator(
             sst_exp_to_ast(e),
             build_goal_with_terminator(rest, ret_name, terminator),
         ),
-        BodyItem::Return(e) => match ret_name {
-            Some(name) => LExpr::let_bind(sanitize(name), sst_exp_to_ast(e), terminator.clone()),
+        BodyItem::Return(e) => lift_if_value(e, &|e_ast| match ret_name {
+            Some(name) => LExpr::let_bind(sanitize(name), e_ast, terminator.clone()),
             None => terminator.clone(),
-        },
+        }),
         // WP: `(c → wp(then ++ rest)) ∧ (¬c → wp(else ++ rest))`. `rest`
         // duplicates syntactically — see DESIGN.md "Known codegen-
         // complexity trade-offs". If a branch ends in `Return`, its
@@ -446,6 +462,60 @@ fn build_goal_with_terminator(
                 rest, ret_name, terminator,
             )
         }
+    }
+}
+
+/// Lift `ExpX::If` expressions from value-position to goal-level.
+///
+/// For a value `if c then a else b` at the source level, `emit_leaf`
+/// describes how to wrap the final Lean expression (e.g., `let x :=
+/// <value>; rest` or `let r := <value>; ensures`). This helper recurses
+/// through nested `ExpX::If`s, transparent wrappers (`Loc` / `Box` /
+/// `Unbox` / mode-coercion / trigger markers), and single-binder
+/// `let`-expressions (`ExpX::Bind(Let, …)`) — calling `emit_leaf` at
+/// each leaf with the already-rendered Lean value. The results get
+/// wrapped with `(c → …) ∧ (¬c → …)` around each if.
+///
+/// Purpose: `omega` handles propositional structure (∧, →, ¬) over
+/// linear arithmetic, but not `if c then a else b` inside the goal.
+/// Lifting the if out gives omega two simpler side-goals instead of
+/// one mixed one, restoring automation.
+///
+/// Exponential in if-nesting depth, but matches the expected size of
+/// the goal the user is writing. For non-if values this is a direct
+/// call to `emit_leaf` with the rendered expression — no overhead.
+fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
+    match &e.x {
+        ExpX::If(cond, then_e, else_e) => {
+            let c = sst_exp_to_ast(cond);
+            LExpr::and(
+                LExpr::implies(c.clone(), lift_if_value(then_e, emit_leaf)),
+                LExpr::implies(LExpr::not(c), lift_if_value(else_e, emit_leaf)),
+            )
+        }
+        // Peel transparent wrappers — they don't emit any Lean code
+        // (`to_lean_sst_expr` elides them) so peeling here is safe.
+        ExpX::Loc(inner) => lift_if_value(inner, emit_leaf),
+        ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => {
+            lift_if_value(inner, emit_leaf)
+        }
+        ExpX::Unary(UnaryOp::CoerceMode { .. } | UnaryOp::Trigger(_), inner) => {
+            lift_if_value(inner, emit_leaf)
+        }
+        // Single-binder `let y := e_rhs; body` — if the rhs has an if,
+        // lift it out, re-threading `body` through each branch. Verus
+        // often emits `let y = …; y` blocks as this shape, which would
+        // otherwise hide the if from our lift.
+        ExpX::Bind(bnd, body) if matches!(&bnd.x, BndX::Let(bs) if bs.len() == 1) => {
+            let BndX::Let(binders) = &bnd.x else { unreachable!() };
+            let b = &binders[0];
+            let name = sanitize(&b.name.0);
+            let body_ast = sst_exp_to_ast(body);
+            lift_if_value(&b.a, &|rhs_leaf| {
+                emit_leaf(LExpr::let_bind(name.clone(), rhs_leaf, body_ast.clone()))
+            })
+        }
+        _ => emit_leaf(sst_exp_to_ast(e)),
     }
 }
 
@@ -702,8 +772,18 @@ fn collect_modifications<'a>(
             collect_modifications(s, locally_declared, out);
         },
         StmX::If(_, t, e) => {
-            collect_modifications(t, locally_declared, out);
-            if let Some(e) = e { collect_modifications(e, locally_declared, out); }
+            // Clone `locally_declared` for each branch so a `let mut x`
+            // in one branch doesn't leak into the other's scope.
+            // Today Verus alpha-renames branch-locals to unique idents
+            // so the leak is invisible; cloning is the explicit
+            // semantic-level guarantee in case that ever stops
+            // holding (or we port this to a different frontend).
+            let mut t_decl = locally_declared.clone();
+            collect_modifications(t, &mut t_decl, out);
+            if let Some(e) = e {
+                let mut e_decl = locally_declared.clone();
+                collect_modifications(e, &mut e_decl, out);
+            }
         }
         StmX::Loop { body, .. } => collect_modifications(body, locally_declared, out),
         _ => {}

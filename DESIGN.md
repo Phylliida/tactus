@@ -753,6 +753,19 @@ The honest choice for now is to emit no bound for usize/isize and document that 
 
 Alternative: introduce a `let _goal_k := <rest_goal>` binding at each if and have both branches refer to `_goal_k`. This preserves logical equivalence with linear size. Not implemented — the cost hasn't shown up yet — but noted here so the trade-off is explicit when someone hits it.
 
+### `StmX::Call` — the next major capability
+
+`sst_to_lean` currently rejects every exec-mode function call (`StmX::Call { .. } => Err("function calls in exec fn body not yet supported")`). Every real Rust program calls functions — this is the single biggest feature gap for users who want to verify non-trivial exec code with Tactus.
+
+Supporting it needs:
+
+* **Callee obligation encoding** — when `foo(args)` is called, the callee's `requires` becomes an obligation on the caller (inline `∧`) and its `ensures` becomes a hypothesis (inline `→`). The callee's spec fn body is already emitted in the preamble (via `dep_order`), so looking up the signature from `FunctionSst` is straightforward; the tricky part is which fn-id → Lean-name mapping to use and how to thread `Fun` lookups through `sst_to_lean`.
+* **Return-value binding** — `let r = foo(args)` turns into `let r := <havoc> ; <ensures(r)>` or equivalently `∃ r, ensures(r) ∧ rest`. Verus uses the second shape via havoc; we'd do the same.
+* **Termination** — recursive callees need the decreasing-measure obligation (similar to loops but per-fn).
+* **Closure / trait dispatch** — fn-pointer and trait-method calls need resolution. Initially we can punt and only handle direct named calls.
+
+The cleanest way in is to walk the `FunctionSst` crate and build a `Fun → Signature` map (requires/ensures exprs plus termination info) once per-fn-verification, then have `check_stm` / `walk` / `build_goal_with_terminator` consume it in a new `BodyItem::Call { fun, args, bind }` variant. The WP rule: `requires(args) ∧ ∀ r, ensures(args, r) → wp(rest[r/bind])`.
+
 ### `_tactus_d_old` aliasing across nested loops
 
 `sst_to_lean::build_loop_conjunction` emits `let _tactus_d_old := D; …` inside every loop's maintain clause to capture the decrease measure pre-body. The name is literal, not gensym'd, so nested loops' `let _tactus_d_old` bindings shadow each other in Lean.

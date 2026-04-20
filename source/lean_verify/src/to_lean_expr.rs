@@ -58,16 +58,19 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
 
         ExprX::Unary(UnaryOp::Not, inner) => LExpr::not(vir_expr_to_ast(inner)).node,
         ExprX::Unary(UnaryOp::Clip { range, .. }, inner) => {
-            let src_is_int = matches!(&*inner.typ, TypX::Int(
-                IntRange::Int | IntRange::I(_) | IntRange::ISize
-            ));
-            let dst_is_nat = matches!(range,
-                IntRange::Nat | IntRange::U(_) | IntRange::USize | IntRange::Char
+            // Keep in sync with `to_lean_sst_expr::clip_to_node`: the
+            // set of ranges that render as Lean `Int` vs `Nat` has to
+            // agree between the two paths.
+            let renders_int = |r: &IntRange| matches!(
+                r,
+                IntRange::Int | IntRange::I(_) | IntRange::ISize | IntRange::U(_)
             );
-            if src_is_int && dst_is_nat {
-                apply("Int.toNat", vec![vir_expr_to_ast(inner)])
-            } else {
-                expr_to_node(inner)
+            let src_int = matches!(&*inner.typ, TypX::Int(r) if renders_int(r));
+            let dst_int = renders_int(range);
+            match (src_int, dst_int) {
+                (true, false) => apply("Int.toNat", vec![vir_expr_to_ast(inner)]),
+                (false, true) => apply("Int.ofNat", vec![vir_expr_to_ast(inner)]),
+                _ => expr_to_node(inner),
             }
         }
         ExprX::Unary(UnaryOp::CoerceMode { .. }, inner)
