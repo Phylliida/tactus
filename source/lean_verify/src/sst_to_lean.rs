@@ -312,21 +312,13 @@ fn simple_tactic() -> Tactic {
 /// open goals until no more structural splitting is possible. The
 /// resulting leaves are arithmetic; `tactus_auto` closes each.
 fn loop_tactic() -> Tactic {
-    // Structural peeling: each round splits one layer of `∧` and
-    // introduces one layer of `∀`/`→` across every open sub-goal.
-    // `iterate N` repeats that N times — a fixed depth that scales
-    // with nesting but stops before runaway. The `try` guards the
-    // tactic on the final round when there's nothing left to peel.
-    // `all_goals tactus_auto` then closes each arithmetic leaf.
-    //
-    // Eight rounds comfortably covers what we've seen: three levels
-    // of loop (nested), three conjuncts per loop (init / maintain /
-    // use), plus the `A ∧ (cond → B)` shape around `HasType`
-    // assertions. Bump the count if a deeper construct ever surfaces.
-    Tactic::Raw(
-        "iterate 8 (all_goals (try (first | apply And.intro | intros))); \
-         all_goals tactus_auto".to_string()
-    )
+    // `tactus_peel` (defined in TactusPrelude.lean) recursively splits
+    // `∧`s and introduces `∀` / `→` binders across all subgoals,
+    // terminating naturally at arithmetic leaves. Then
+    // `all_goals tactus_auto` closes each leaf. No hardcoded depth —
+    // the recursion follows the goal's structure, so deeply-nested
+    // loops work the same as shallow ones.
+    Tactic::Raw("tactus_peel; all_goals tactus_auto".to_string())
 }
 
 /// Recurse through the item tree to find any `Loop`. Used to pick the

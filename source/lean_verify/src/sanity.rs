@@ -259,10 +259,11 @@ fn name_resolves(name: &str, defined: &HashSet<String>, scope: &HashSet<String>)
         | "And" | "Or" | "Not" | "Iff"
         | "True" | "False"
         | "()"
-        // Tactus prelude axioms — resolved by the `Command::Raw` block
-        // in the preamble, not by our own declarations, so the sanity
-        // check needs them explicitly.
+        // Tactus prelude axioms / macros — resolved by the `Command::Raw`
+        // block in the preamble, not by our own declarations, so the
+        // sanity check needs them explicitly.
         | "arch_word_bits" | "arch_word_bits_valid"
+        | "tactus_peel"
     )
 }
 
