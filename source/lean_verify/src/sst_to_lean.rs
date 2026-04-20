@@ -17,8 +17,19 @@
 //!                         top-level only; `inside_body: true` is rejected)
 //!   * `StmX::Air`, `StmX::Fuel`, `StmX::RevealString` — transparent
 //!
-//! Not yet supported: mutation/SSA, loops, fixed-width overflow as
-//! a separate obligation, pattern matching, closures, mutable references.
+//! Not yet supported: loops, fixed-width overflow as a separate
+//! obligation, pattern matching, closures, mutable references (`&mut`).
+//!
+//! # Mutation
+//!
+//! Simple mutation (`let mut x = …; x = …;`) needs no rename pass:
+//! `StmX::Assign { is_init: false }` emits `let x := e` just like an
+//! init, and Lean's let-shadowing gives us SSA semantics naturally.
+//! This also works across if-branches — an inner branch's `let x := …`
+//! only shadows within its implication, so the outer `x` remains in
+//! scope for the other branch and the code after the if. Loops break
+//! this trick because the loop body's mutations can't tunnel out
+//! through shadowing; that's slice 4's problem.
 //!
 //! # Semantic model (weakest-precondition, in body order)
 //!

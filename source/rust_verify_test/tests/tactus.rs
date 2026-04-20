@@ -2078,6 +2078,71 @@ test_verify_one_file! {
     }
 }
 
+// ── Slice 3: mutation as SSA ───────────────────────────────────────────
+//
+// Mutation falls out of slice 1+2 for free via Lean's let-shadowing:
+// every `StmX::Assign { is_init: false }` re-emits `let x := e`, which
+// shadows the previous binding. Same mechanism works across if-branches
+// since each branch has its own scope. Loops would need a real rename
+// pass (slice 4).
+
+// Simple sequential mutation. Each `y = y + 1` becomes `let y := y + 1`
+// in Lean; the outer `y` is shadowed.
+test_verify_one_file! {
+    #[test] test_exec_mut_seq verus_code! {
+        #[verifier::tactus_auto]
+        fn add_two(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 2
+        {
+            let mut y = x;
+            y = y + 1;
+            y = y + 1;
+            y
+        }
+    } => Ok(())
+}
+
+// Mutation inside a branch. After the `if`, `y` in the then-branch was
+// re-let-bound (so the continuation sees `y + 1`); in the else-branch
+// the outer `y` is still in scope. The ensures must hold in both.
+test_verify_one_file! {
+    #[test] test_exec_mut_in_branch verus_code! {
+        #[verifier::tactus_auto]
+        fn bump_if(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r >= x
+        {
+            let mut y = x;
+            if y < 50 {
+                y = y + 10;
+            }
+            y
+        }
+    } => Ok(())
+}
+
+// Mutation visible only within one branch must not leak past the if.
+// Without proper scoping this would incorrectly satisfy `r == x + 1`
+// even when the else-branch runs; Lean's let-shadowing rejects it.
+test_verify_one_file! {
+    #[test] test_exec_mut_branch_leak verus_code! {
+        #[verifier::tactus_auto]
+        fn bump_if_wrong(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1  // false when the else-branch runs
+        {
+            let mut y = x;
+            if y < 50 {
+                y = y + 1;
+            }
+            y
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "post-if must reference outer y in else branch");
+    }
+}
+
 // Nested if/else. The inner branch's hypothesis stacks with the outer one
 // — `assert(x < 100)` under the `else` of the inner if has both `x >= 50`
 // and the outer `x < 100` available.
