@@ -2175,15 +2175,9 @@ test_verify_one_file! {
     }
 }
 
-// u8 subtraction with a sufficient guard. Both `Nat` and `Int`
-// semantics agree when `y ≤ x`, so this passes.
-//
-// NOTE: the unguarded counterpart (`x - y` with y possibly > x) is a
-// known soundness gap — because we render `u8` as `Nat`, Lean's
-// truncating subtraction silently makes `0 - 1 = 0`, and the
-// `HasType(x - y, U(8))` check reduces to `0 ≤ x - y < 256` which is
-// trivially true for `Nat`. Catching underflow properly requires
-// rendering u8 as `Int` with both bounds; see DESIGN.md.
+// u8 subtraction with a sufficient guard. The `requires y <= x` makes
+// `x - y` non-negative; the u-as-Int encoding gives us `Int`
+// subtraction, so omega sees the true mathematical value.
 test_verify_one_file! {
     #[test] test_exec_underflow_guarded verus_code! {
         #[verifier::tactus_auto]
@@ -2194,6 +2188,25 @@ test_verify_one_file! {
             x - y
         }
     } => Ok(())
+}
+
+// Unguarded u8 subtraction. With u-types rendered as Lean `Int`, the
+// subtraction is mathematical (goes negative when y > x), so the
+// `HasType(x - y, U(8))` refinement check — specifically the `0 ≤`
+// half — catches the underflow. Before the u-as-Int fix this test
+// *incorrectly* verified because Nat's truncating subtraction made
+// the lower bound trivially true.
+test_verify_one_file! {
+    #[test] test_exec_underflow_unguarded_fails verus_code! {
+        #[verifier::tactus_auto]
+        fn sub_u8(x: u8, y: u8) -> (r: u8)
+            ensures r as int == x as int - y as int
+        {
+            x - y
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "u8 sub without a lower-bound guard should fail");
+    }
 }
 
 // u8 multiplication has a MUCH tighter overflow bound than addition:

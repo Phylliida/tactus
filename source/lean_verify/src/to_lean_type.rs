@@ -23,8 +23,18 @@ fn typ_to_node(typ: &TypX) -> ExprNode {
     match typ {
         TypX::Bool => ExprNode::Var("Prop".into()),
         TypX::Int(range) => ExprNode::Var(match range {
-            IntRange::Int | IntRange::I(_) | IntRange::ISize => "Int".into(),
-            IntRange::Nat | IntRange::U(_) | IntRange::USize | IntRange::Char => "Nat".into(),
+            // Any type that can participate in signed arithmetic — including
+            // fixed-width u-types, since their spec-mode subtraction is
+            // mathematical (goes negative) rather than truncating, and we
+            // need `Int` semantics to catch underflow via `HasType` bounds.
+            IntRange::Int | IntRange::I(_) | IntRange::ISize
+            | IntRange::U(_) => "Int".into(),
+            // `nat` is Verus's unbounded non-negative type — maps directly
+            // to Lean `Nat` with matching semantics. USize has no upper
+            // bound yet (needs prelude `arch_word_bits`) but at least
+            // stays non-negative. Char stays `Nat` because char values
+            // rarely participate in arithmetic.
+            IntRange::Nat | IntRange::USize | IntRange::Char => "Nat".into(),
         }),
         TypX::TypParam(name) => ExprNode::Var(name.to_string()),
         TypX::Boxed(inner) => typ_to_node(inner),
@@ -203,7 +213,7 @@ mod tests {
         assert_eq!(render(&TypX::Bool), "Prop");
         assert_eq!(render(&TypX::Int(IntRange::Int)), "Int");
         assert_eq!(render(&TypX::Int(IntRange::Nat)), "Nat");
-        assert_eq!(render(&TypX::Int(IntRange::U(32))), "Nat");
+        assert_eq!(render(&TypX::Int(IntRange::U(32))), "Int");
         assert_eq!(render(&TypX::Int(IntRange::I(64))), "Int");
     }
 
