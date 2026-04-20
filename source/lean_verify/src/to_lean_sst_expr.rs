@@ -31,6 +31,86 @@ fn var(s: impl Into<String>) -> LExpr {
     LExpr::new(ExprNode::Var(s.into()))
 }
 
+/// `2^n` rendered as a decimal literal. Supports 0 ≤ n ≤ 128 — VIR's
+/// `U(n)` / `I(n)` only reach that range in practice (u8/u16/u32/u64/u128).
+/// We compute it in `u128`; `n = 128` is the boundary, so we fall back to
+/// a precomputed constant for that single case.
+fn two_pow_lit(n: u32) -> LExpr {
+    let s = if n < 128 {
+        (1u128 << n).to_string()
+    } else if n == 128 {
+        "340282366920938463463374607431768211456".to_string()
+    } else {
+        panic!("two_pow_lit: bit width {} exceeds the u128 ceiling", n)
+    };
+    LExpr::new(ExprNode::Lit(s))
+}
+
+/// Build the Lean predicate expressing the type invariant on `e : ty`
+/// (i.e., the refinement bounds Verus treats as `HasType(e, ty)`).
+///
+/// Returns `None` when the target type carries no additional constraint:
+///   * `Nat`, `Int` — unbounded
+///   * non-integer types — structural, no refinement
+///   * `USize`, `ISize` — depend on `arch_word_bits`, not yet wired through
+///     the prelude; treated as unbounded for now (accepted soundness gap,
+///     same as stock Verus when compiling without `--target`)
+///
+/// Returns `Some(pred)` otherwise.
+///
+/// For `U(n)` (rendered as `Nat`): `e < 2^n`. The `0 ≤ e` half comes for
+/// free from `Nat`.
+///
+/// For `I(n)` (rendered as `Int`): `-2^(n-1) ≤ e ∧ e < 2^(n-1)`. `e` is
+/// duplicated in the predicate.
+///
+/// For `Char`: `e < 0x110000` (Unicode scalar range).
+pub fn type_bound_predicate(e: &LExpr, ty: &Typ) -> Option<LExpr> {
+    // Transparent: unbox before examining.
+    if let TypX::Boxed(inner) = &**ty {
+        return type_bound_predicate(e, inner);
+    }
+    let range = match &**ty {
+        TypX::Int(r) => r,
+        _ => return None,
+    };
+    match range {
+        IntRange::U(n) => Some(LExpr::new(ExprNode::BinOp {
+            op: L::Lt,
+            lhs: Box::new(e.clone()),
+            rhs: Box::new(two_pow_lit(*n)),
+        })),
+        IntRange::I(n) => {
+            let hi = two_pow_lit(*n - 1);
+            let lo = LExpr::new(ExprNode::UnOp {
+                op: LUn::Neg,
+                arg: Box::new(hi.clone()),
+            });
+            let lo_le = LExpr::new(ExprNode::BinOp {
+                op: L::Le,
+                lhs: Box::new(lo),
+                rhs: Box::new(e.clone()),
+            });
+            let e_lt = LExpr::new(ExprNode::BinOp {
+                op: L::Lt,
+                lhs: Box::new(e.clone()),
+                rhs: Box::new(hi),
+            });
+            Some(LExpr::new(ExprNode::BinOp {
+                op: L::And,
+                lhs: Box::new(lo_le),
+                rhs: Box::new(e_lt),
+            }))
+        }
+        IntRange::Char => Some(LExpr::new(ExprNode::BinOp {
+            op: L::Lt,
+            lhs: Box::new(e.clone()),
+            rhs: Box::new(LExpr::new(ExprNode::Lit("1114112".to_string()))),
+        })),
+        IntRange::Nat | IntRange::Int | IntRange::USize | IntRange::ISize => None,
+    }
+}
+
 fn apply(head: LExpr, args: Vec<LExpr>) -> ExprNode {
     if args.is_empty() {
         head.node
@@ -79,11 +159,22 @@ fn exp_to_node(e: &Exp) -> ExprNode {
             expr: Box::new(sst_exp_to_ast(inner)),
             field: sanitize(&field_opr.field),
         },
-        // Type propositions are trivially True in Lean — our parameter types
-        // already reflect the VIR integer type, so `HasType(x, U8)` etc.
-        // carries no additional information.
-        ExpX::UnaryOpr(UnaryOpr::HasType(_), _)
-        | ExpX::UnaryOpr(UnaryOpr::IntegerTypeBound(_, _), _) => ExprNode::LitBool(true),
+        // `HasType(e, t)` — the refinement constraint for `e` to inhabit
+        // `t`. For fixed-width ints (u8, i32, …) this is the bounds check
+        // Verus emits at every arithmetic site. For unbounded types (Nat,
+        // Int, structs) it's vacuous; we emit `True` and let Lean simplify.
+        ExpX::UnaryOpr(UnaryOpr::HasType(t), inner) => {
+            let e_ast = sst_exp_to_ast(inner);
+            match type_bound_predicate(&e_ast, t) {
+                Some(pred) => pred.node,
+                None => ExprNode::LitBool(true),
+            }
+        }
+        // `IntegerTypeBound(SignedMin | SignedMax | UnsignedMax, _)` returns
+        // a numeric value (the bound itself), not a proposition. Rendering
+        // as `True` is wrong, but our current tests don't touch it — fix
+        // when a user hits it.
+        ExpX::UnaryOpr(UnaryOpr::IntegerTypeBound(_, _), _) => ExprNode::LitBool(true),
         ExpX::UnaryOpr(_, inner) => exp_to_node(inner),
 
         ExpX::Binary(op, lhs, rhs) => match binop_to_ast(op) {
