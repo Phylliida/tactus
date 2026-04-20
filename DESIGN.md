@@ -739,13 +739,17 @@ theorem overflow_check_line_N ... : 0 ≤ result ∧ result < 2^bits := by tactu
 
 **Why u-types render as `Int` rather than `Nat`.** Lean's `Nat` has truncating subtraction (`0 - 1 = 0`). If we rendered u-types as `Nat`, the overflow check `HasType(x - y, U(n))` would reduce to `0 ≤ x - y ∧ x - y < 2^n` — and the left half is trivially true for any `Nat`, so unguarded u8 subtraction would silently verify despite underflowing in Rust. Rendering as `Int` with an explicit `0 ≤ x` lower-bound hypothesis makes subtraction give the true mathematical value, so the refinement check can catch underflow. Mul and add on u-types worked either way (Nat doesn't truncate upward); only sub was at risk.
 
-### `usize`/`isize` soundness gap
+### `usize`/`isize` bounds — emitted but rarely auto-discharged
 
-`type_bound_predicate` returns `None` for `USize`/`ISize`. Emitting `e < 2 ^ arch_word_bits` as a refinement would be easy syntactically but costly in practice: tactus_auto's toolbox (`rfl` | `decide` | `omega` | `simp_all`) can't reason about symbolic exponents, and omega doesn't know `2 ^ arch_word_bits ≥ 2^32`. Adding the bound without tactic support would make previously-working `usize`-heavy exec fns fail with "auto-tactic failed" goals the user can't easily discharge.
+`type_bound_predicate` emits `0 ≤ e ∧ e < usize_hi` for `USize` and `-isize_hi ≤ e ∧ e < isize_hi` for `ISize`, where `usize_hi` / `isize_hi` are prelude `Int` constants defined as `(2 : Int) ^ arch_word_bits` and `(2 : Int) ^ (arch_word_bits - 1)`. Fn params and `HasType` sites both pick up the refinement.
 
-The honest choice for now is to emit no bound for usize/isize and document that as a known gap — same as stock Verus when compiling without `--target`. When we have the tactic support (a custom `tactus_usize_bound` that case-splits `arch_word_bits_valid` and invokes `Nat.pow_le_pow_right`-style reasoning), we can flip `type_bound_predicate` over.
+`arch_word_bits` itself is an axiom (`arch_word_bits : Nat`) with a validity disjunction (`arch_word_bits_valid : arch_word_bits = 32 ∨ arch_word_bits = 64`). The concrete value is left abstract so proofs hold for any supported target; the disjunction is there for users who need to case-split.
 
-`arch_word_bits` itself is wired through — `IntegerTypeBound::ArchWordBits` resolves to the axiom `arch_word_bits : Nat` declared in `TactusPrelude.lean`, and the disjunction `arch_word_bits_valid : arch_word_bits = 32 ∨ arch_word_bits = 64` is available for users who need a case-split.
+**Rendering: `USize` → Lean `Nat`, `ISize` → Lean `Int`**. USize *wants* to be `Int` (same argument as for u-types — `Int` semantics catch subtraction underflow), but Verus elides `as nat` casts from `usize` in spec contexts, so const-generic bodies like `N as nat` render as just `N`. If `USize` rendered as `Int`, those const-generic defs would have body type `Int` and declared return type `Nat` — a mismatch that breaks the translation (`test_const_generic`). ISize has no such constraint and does render as `Int`.
+
+**Trade-off: USize subtraction truncates silently.** Because `USize` → `Nat`, `let r: usize = x - y;` for usize `x`, `y` truncates at zero if `y > x`. The `0 ≤` side of the `usize_hi` refinement is then trivially true and the underflow silently passes. Parallel to the u8-subtraction soundness hole before the u8 → Int change. Proper fix is the same: find a way to make USize render as Int without breaking const-generics. Open.
+
+**tactus_auto can't discharge `< usize_hi` automatically.** `omega` doesn't reason about `2 ^ arch_word_bits` for unknown `arch_word_bits`. `tactus_auto`'s current toolbox (`rfl | decide | omega | simp_all`) can't either. Non-trivial usize arithmetic needs user-written `proof { … }` blocks that case-split `arch_word_bits_valid` and invoke `Nat.pow_le_pow_right` / `Int.pow`-style lemmas — a significant ergonomics burden. A custom `tactus_usize_bound` tactic that automates this is an obvious future addition; until then, the bound is *present* for soundness but not discharged for usability.
 
 ### Known codegen-complexity trade-offs
 
@@ -775,6 +779,93 @@ This is correct for the current architecture: the inner loop's shadow is confine
 ### Tactic-string interning (minor TODO)
 
 `sst_to_lean::loop_tactic()` allocates the same `"tactus_peel; all_goals tactus_auto"` String on every call. For a crate with hundreds of exec fns with loops this adds up. Options: `const` static slice + a `Tactic::Static(&'static str)` variant, or define the composite as a single macro in `TactusPrelude.lean` (e.g., `tactus_auto_loop`) and emit `Tactic::Named("tactus_auto_loop")`. Not urgent — current cost is negligible — but worth nudging on any next prelude pass.
+
+### Known deferrals, rejected cases, and untested edges
+
+A flat catalogue of things that don't work yet, organized by where in the pipeline they're rejected or where the gap lives. Updated as of the post-slice-5 FP pass. If a gap has its own detailed section elsewhere in this doc, it's cross-referenced rather than duplicated.
+
+#### Documentation debt
+
+* **HANDOFF.md is out of date.** Reflects the 109-test / pre-loop baseline. Missing: the unified `build_goal_with_terminator` story, `tactus_peel` recursive macro, u-types-as-Int soundness fix, `lift_if_value` for tail / let-bound if-expressions, early-return support, the shape-specific-tactics-at-emit-time principle, `arch_word_bits` wiring, usize/isize status. Top priority for the next session.
+
+#### Statement-level forms rejected by `check_stm`
+
+Each one returns `Err("… not yet supported")`; users get a clean rejection instead of silent pass.
+
+* **`StmX::Call`** — all exec-mode function calls. See "`StmX::Call` — the next major capability" section.
+* **`StmX::BreakOrContinue`** — `break` / `continue` inside loops. Blocks `while`-with-exit patterns. Enabling this also requires relaxing `cond: Some` (loops that break compile to `cond: None`) and accepting `invariant_except_break` invariants (at-entry but not at-exit).
+* **`StmX::AssertBitVector`** — `assert by(bit_vector)`. Bitvector reasoning backend.
+* **`StmX::AssertQuery`** — `assert by(…)` with specific tactics / queries. Would need to translate the `AssertQueryMode` into a Lean tactic choice.
+* **`StmX::DeadEnd`** — markers Verus uses for unreachable code. Usually harmless to skip, but we reject rather than silently strip in case a future pipeline relies on them.
+* **`StmX::OpenInvariant`** — atomic invariant opening for concurrent verification. Out of scope until concurrency support lands.
+* **`StmX::ClosureInner`** — exec closure bodies. Depends on `ExpX::CallLambda` support.
+
+#### Expression-level forms rejected by `check_exp`
+
+* **`UnaryOp` variants beyond `Not` / `Clip` / `CoerceMode` / `Trigger`** — the spec-fn path (`to_lean_expr`) handles more (BitNot, IntToReal, etc.) but `check_exp` on exec bodies is conservative; add as needed.
+* **`BinaryOp::HeightCompare { … }`** — VIR's termination-height comparison.
+* **`BinaryOp::Index(_, _)`** — array / slice indexing with bounds check.
+* **`BinaryOp::StrGetChar`** — string character lookup.
+* **`BinaryOp::IeeeFloat(_)`** — IEEE float comparisons. Verus doesn't support `f32`/`f64` at all; this branch exists for completeness.
+* **`ExpX::Ctor(..)`** — datatype constructors in exec fns. Blocks any exec code that constructs enum/struct values.
+* **`ExpX::CallLambda(..)`** — closure calls. Blocks fns that invoke stored closures.
+* **`ExpX::ArrayLiteral(_)`** — `[a, b, c]` literals.
+* **`ExpX::Old(..)`** — `old(x)` (pre-state). Relevant for `ensures` that compare post-state to pre-state; untested even for supported features because we don't handle it anywhere.
+* **`ExpX::Interp(_)`** — only appears inside Verus's interpreter; an internal-bug rejection rather than a feature gap.
+* **`ExpX::FuelConst(_)`** — fuel-reveal constants. Blocks `reveal_with_fuel` in exec fns.
+* **`CallFun::InternalFun(_)`** — Verus's internal fns (distinct from user fns).
+
+#### Loop-shape restrictions (rejected by `check_loop`)
+
+Only the simplest `while` shape is accepted. All other loop shapes return `Err`.
+
+* **`loop_isolation: false`** — non-isolated loops (body sees outer context directly rather than via the invariant).
+* **`cond: None`** — loops without a simple `while` condition. Includes anything with `break`, any `for` loop, any `loop { … }` with manual exit.
+* **Non-empty condition setup block** — `while` conditions that desugar into a small statement prelude (complex expressions that aren't pure).
+* **Lexicographic `decreases`** — multi-expression measures (`decreases (a, b)`). Only single-expression is accepted.
+* **`invariant_except_break` / `ensures` loop invariants** — any invariant with `at_entry: false` or `at_exit: false`. Only "true at entry AND exit" variants accepted.
+
+#### Soundness trade-offs accepted (not pure bugs, but worth knowing)
+
+* **Usize subtraction truncates silently** — see the usize/isize section above.
+* **Usize arithmetic rarely verifies automatically** — bounds are emitted but `tactus_auto` can't discharge symbolic `< usize_hi`; users need custom `proof { … }` with `arch_word_bits_valid` case-split.
+* **Char bound admits surrogates** — `c < 0x110000` covers U+0000..U+10FFFF but includes the UTF-16 surrogate range U+D800..U+DFFF. Verus / Rust's `char` also don't distinguish, so our bound matches their semantics. No downstream soundness impact within the same system.
+* **`BodyItem` clone cost is exponential in nested if/lift depth** — documented under "Known codegen-complexity trade-offs". Fine for realistic code.
+* **`_tactus_d_old` shadows in nested loops** — relies on scope to disambiguate; documented in its own section.
+
+#### User-facing features not tested (or possibly broken)
+
+* **`proof { … }` blocks inside exec fns** — DESIGN.md describes them as supported, but we never exercised them against the slice-1-through-5 WP pipeline. The `have h : P := by <tactics>` plumbing likely needs explicit support in `walk` / `build_goal_with_terminator` for hypothesis threading. Untested.
+* **`assert(P) by { tactics }`** — user-written tactic bodies for asserts inside exec fns. Currently `StmX::Assert` treats the assert as a leaf obligation closed by `tactus_auto`; user-provided tactic bodies are not plumbed through.
+* **`assume(P)` warnings** — DESIGN.md promises a "unproved assumption" warning. Not wired; `StmX::Assume` emits the hypothesis silently.
+* **Return in the `else` branch of an if** (where `then` falls through) — inverse of `test_exec_early_return`. Untested.
+* **Loops modifying multiple variables** — `quantify_mod_vars` handles arbitrary-arity modified sets, but every loop test modifies exactly one var.
+* **Nested if where each branch contains a different loop** — combinatorial coverage gap.
+* **Loop body ending in an early return** — `while c { if p { return 0; } … }`. Should work in principle (early return handling composes), untested.
+* **Bit-width coverage** — only `u8`, `u32`, `i8` tested end-to-end. `u16` / `u64` / `u128` / `i16` / `i32` / `i64` / `i128` go through the same codegen path but lack regression tests.
+
+#### Tactic / automation limitations
+
+* **`tactus_auto`'s toolbox is `rfl | decide | omega | simp_all`.** Exec-fn obligations needing `nlinarith`, `ring`, `polyrith`, `aesop`, `positivity`, etc. fall through to the `fail` branch. Proof fns *can* use any Mathlib tactic in their `by { … }` block; exec fns can't.
+* **No per-fn tactic override.** A user who wants `ring` for a specific exec fn has no way to request it. A `#[verifier::tactus_tactic("ring")]` attribute plumbed into `FunctionAttrs` would fix it.
+* **Mathlib auto-tactics unused for exec fns.** Exec-fn `tactus_auto` is intentionally minimal to keep verification predictable; extending it is a design call, not a straight addition.
+
+#### Architecture debts (working-but-not-ideal)
+
+* **Two-pass over loop bodies.** `walk`'s Loop arm calls both `collect_modifications` and `walk` on the body; fusing would save a pass but entangles modifications with WP-item collection. Documented; left alone.
+* **`walk` allocates 1-element `Vec`s per non-Block statement.** Keeps the pure-fn signature simple at the cost of heap traffic. `SmallVec` would help; not worth a new dep yet.
+* **Sanity-check allowlist maintained by hand.** Adding a prelude def (like `usize_hi`) requires remembering to update `sanity.rs`. No automated sync; compiler error on mismatch (panic in debug builds).
+* **`_tactus_d_old` not gensym'd** — see its dedicated section.
+* **`loop_tactic()` allocates its tactic string on every call** — tiny TODO, see its dedicated section.
+
+#### Phase-3 work (explicit non-goals for current scope)
+
+These are deferred by design — the current slice is single-crate exec+proof-fn verification.
+
+* **Cross-crate verification** — `CrateDecls.lean` files holding signatures for downstream crates. DESIGN.md "Cross-crate spec fn availability".
+* **`#[verifier::heartbeats(N)]` attribute** — per-fn Lean `maxHeartbeats` override. DESIGN.md mentions; not wired through `vir::ast::FunctionAttrsX`.
+* **Lean version pinning / CI matrix.** `lean-toolchain` is pinned to `v4.25.0`; tactic behaviour could shift on upgrade. No automated regression against multiple Lean versions.
+* **Per-module `.lean` file generation.** Current design emits one file per fn (`target/tactus-lean/{crate}/{fn}.lean`). At scale, per-module would amortize preamble and olean caching; HANDOFF notes it as future work.
 
 ### `BodyItem` as a future WP DSL
 
