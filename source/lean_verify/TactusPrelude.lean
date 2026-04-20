@@ -14,12 +14,37 @@ axiom arch_word_bits : Nat
 axiom arch_word_bits_valid : arch_word_bits = 32 ∨ arch_word_bits = 64
 
 -- Tactus: auto-tactic used by sst_to_lean when emitting exec fn obligations.
--- First tactic that works wins; `fail` at the end turns "none worked" into a
--- real error (not a `sorry`).
+--
+-- Peel away every `∧` split and `∀`/`→` intro across all open goals, then
+-- close each arithmetic leaf with rfl / decide / omega / simp_all. This
+-- single sequence handles both the flat-goal shapes from straight-line
+-- exec fns and the nested `∀ … → … → A ∧ (B ∧ C)` shapes that come out
+-- of loops (see `sst_to_lean`'s "Loop obligations" note).
+--
+-- `repeat'` applies its argument to every open goal until it stops making
+-- progress. `all_goals` then runs the finisher on each leaf. If any leaf
+-- can't be closed, the whole tactic fails and the user sees the
+-- unresolved subgoal.
+-- First pass: `try simp_all` normalizes `let x := n` and trivial
+-- conjuncts like `n ≤ n`. It always succeeds (even as a no-op), so
+-- the `first …` block below always gets to pick a real closer.
+-- That's important: without `try`, `first | … | simp_all | …` would
+-- stop at simp_all even when simp_all simplified but didn't close.
+--
+-- The `refine ⟨?_, ?_⟩ <;> intros <;> omega`-style branches handle
+-- loop goals shaped like `maintain ∧ use`, or nested `init ∧ maintain
+-- ∧ use`. Omega handles the propositional leaves (it splits hypothesis
+-- `And`s and handles top-level `∧`/`→` in goals, but doesn't
+-- introduce `∀`).
 macro "tactus_auto" : tactic => `(tactic|
+  (try simp_all);
   first
     | rfl
     | decide
     | omega
-    | simp_all
+    | (intros; omega)
+    | (refine ⟨?_, ?_⟩ <;> intros <;> omega)
+    | (refine ⟨?_, ?_, ?_⟩ <;> intros <;> omega)
+    | (refine ⟨?_, ?_⟩ <;> intros <;>
+        (first | omega | (refine ⟨?_, ?_⟩ <;> intros <;> omega)))
     | (fail "tactus: auto-tactic failed — add explicit proof block"))

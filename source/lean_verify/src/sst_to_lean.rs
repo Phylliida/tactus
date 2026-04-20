@@ -17,11 +17,51 @@
 //!   * `StmX::Return`    — terminator (works at top level and inside a
 //!                         branch; `inside_body: true` is rejected)
 //!   * `StmX::Air`, `StmX::Fuel`, `StmX::RevealString` — transparent
+//!   * `StmX::Loop`      — simple `while` loops only (one per function,
+//!                         top-level, `loop_isolation: true`, empty
+//!                         `cond` setup, single-expression `decreases`,
+//!                         invariants true at both entry and exit, no
+//!                         `break`/`continue`, no nested loops).
+//!                         Emits three obligations: init, maintain, use
+//!                         (see "Loop obligations" below).
 //!
-//! Not yet supported: loops, pattern matching, closures, mutable
-//! references (`&mut`). Fixed-width arithmetic overflow IS checked,
-//! but via `HasType` assertions folded into the body WP — not via
-//! separate per-op theorems.
+//! Not yet supported: nested/sequential loops, break/continue, pattern
+//! matching, closures, mutable references (`&mut`). Fixed-width
+//! arithmetic overflow IS checked, but via `HasType` assertions folded
+//! into the body WP — not via separate per-op theorems.
+//!
+//! # Loop obligations (conjunctive WP)
+//!
+//! A loop inside an exec fn body contributes three pieces to the goal
+//! of the enclosing theorem — conjoined inline rather than split into
+//! separate theorems:
+//!
+//! ```
+//! wp(pre; while cond inv I dec D { body }; post, ensures)
+//!   = wp(pre,
+//!       I                                       -- init: I holds at loop entry
+//!       ∧ maintain_clause                       -- body preserves I and decreases D
+//!       ∧ ∀ (mod_vars …), bounds → I ∧ ¬cond →  -- havoc; post-loop is reachable
+//!           wp(post, ensures))
+//! ```
+//!
+//! where `maintain_clause` is
+//!
+//! ```
+//!   ∀ (mod_vars …), bounds → I ∧ cond →
+//!     let d_old := D;
+//!     wp(body, I ∧ D < d_old)
+//! ```
+//!
+//! Non-modified surrounding state (fn params, other local lets) stays
+//! in scope via the outer `let`/`∀` nesting that `build_goal` is
+//! already building. Only `mod_vars` — variables the loop body writes
+//! to — get the fresh universal quantification.
+//!
+//! Because the loop's contribution is itself a goal expression, the
+//! recursion composes: a loop inside another loop's `body` lands
+//! inside that inner `wp(body, …)`, and a loop inside an if-branch
+//! lands inside the branch's continuation.
 //!
 //! # Mutation
 //!
@@ -58,8 +98,10 @@
 //! `BinOp::And` / `BinOp::Implies` / `UnOp::Not` / `Let` without worrying
 //! about parens.
 
-use vir::sst::{BndX, CallFun, Dest, Exp, ExpX, FuncCheckSst, FunctionSst, Par, Stm, StmX};
-use vir::ast::{BinaryOp, UnaryOp};
+use vir::sst::{
+    BndX, CallFun, Dest, Exp, ExpX, FuncCheckSst, FunctionSst, LoopInv, Par, Stm, StmX,
+};
+use vir::ast::{BinaryOp, Typ, UnaryOp, VarIdent};
 use crate::lean_ast::{
     and_all, Binder as LBinder, BinderKind, Expr as LExpr, Tactic, Theorem,
 };
@@ -117,7 +159,52 @@ fn check_stm(stm: &Stm) -> Result<(), String> {
             check_stm(then_stm)?;
             else_stm.as_ref().map_or(Ok(()), |e| check_stm(e))
         }
-        StmX::Loop { .. } => Err("loops in exec fn body not yet supported".to_string()),
+        StmX::Loop {
+            loop_isolation, cond, body, invs, decrease, modified_vars, ..
+        } => {
+            if !loop_isolation {
+                return Err(
+                    "non-isolated loops (loop_isolation: false) not yet supported".to_string()
+                );
+            }
+            let Some((cond_setup, cond_exp)) = cond else {
+                return Err("loops without a simple `while` condition not yet supported".to_string());
+            };
+            // The condition setup block must be empty — complex condition
+            // expressions that desugar into statements aren't supported.
+            if !matches!(&cond_setup.x, StmX::Block(ss) if ss.is_empty()) {
+                return Err(
+                    "loop condition with setup statements not yet supported".to_string()
+                );
+            }
+            if decrease.len() != 1 {
+                return Err(format!(
+                    "loop `decreases` must be a single expression (got {})", decrease.len()
+                ));
+            }
+            if !invs.iter().all(|i| i.at_entry && i.at_exit) {
+                return Err(
+                    "loop invariants must hold at both entry and exit (not \
+                     invariant_except_break / ensures)".to_string()
+                );
+            }
+            // Verus may or may not populate `modified_vars` at this
+            // stage of the pipeline (it's computed on the way into
+            // sst_to_air, which we're not going through). We don't
+            // rely on it — we recompute the set ourselves from the
+            // body's `StmX::Assign` LHSs. Flag as "ignored" to make
+            // the binding explicit.
+            let _ = modified_vars;
+            check_exp(cond_exp)?;
+            check_stm(body)?;
+            for inv in invs.iter() {
+                check_exp(&inv.inv)?;
+            }
+            for d in decrease.iter() {
+                check_exp(d)?;
+            }
+            Ok(())
+        }
         StmX::Call { .. } => Err("function calls in exec fn body not yet supported".to_string()),
         StmX::BreakOrContinue { .. } => Err("break/continue not yet supported".to_string()),
         StmX::AssertBitVector { .. } => Err("assert by(bit_vector) not yet supported".to_string()),
@@ -177,56 +264,69 @@ fn check_exp(e: &Exp) -> Result<(), String> {
 
 // ── Theorem builder ────────────────────────────────────────────────────
 
-/// Build a Lean `Theorem` AST node for an exec fn body check.
+/// Build the Lean `Theorem`s for an exec fn body check.
 ///
-/// Precondition: `supported_body(check)` returned `Ok(())`. Name follows
-/// the reserved `_tactus_body_` prefix so it can't collide with a user
-/// identifier (Rust doesn't emit names starting with `_tactus_`).
-pub fn exec_fn_theorem_to_ast(fn_sst: &FunctionSst, check: &FuncCheckSst) -> Theorem {
-    let mut binders: Vec<LBinder> = Vec::new();
+/// Precondition: `supported_body(check)` returned `Ok(())`. Returns a
+/// `Vec` because future slices may want to split obligations into
+/// separate theorems (e.g., for per-loop diagnostics); today it's
+/// always length 1 — loops contribute conjuncts to the main goal
+/// rather than their own top-level theorems.
+pub fn exec_fn_theorems_to_ast(fn_sst: &FunctionSst, check: &FuncCheckSst) -> Vec<Theorem> {
+    let name = format!("_tactus_body_{}", lean_name(&fn_sst.x.name.path));
+    let mut binders = build_param_binders(fn_sst);
+    binders.extend(build_req_binders(check));
 
-    // Each real param contributes one binder — `(name : T)` — and, for
-    // fixed-width integer types, one hypothesis binder right after —
-    // `(h_<name>_bound : <predicate>)`. Interleaving is fine because
-    // each hypothesis only references its own immediately preceding
-    // param.
+    // `check.local_decls` → type lookup for modified-var bounds when a
+    // loop emits its havoc quantification.
+    let type_map: std::collections::HashMap<&VarIdent, &Typ> = check.local_decls.iter()
+        .map(|d| (&d.ident, &d.typ))
+        .collect();
+
+    let items = walk(&check.body, &type_map);
+    let goal = build_goal(
+        &items,
+        check.post_condition.dest.as_ref().map(|v| v.0.as_str()),
+        &check.post_condition.ens_exps,
+    );
+    vec![mk_theorem(name, binders, goal)]
+}
+
+// ── Binder builders ────────────────────────────────────────────────────
+
+fn mk_theorem(name: String, binders: Vec<LBinder>, goal: LExpr) -> Theorem {
+    Theorem { name, binders, goal, tactic: Tactic::Named("tactus_auto".to_string()) }
+}
+
+/// Function params + their type-bound hypotheses. Shared across all
+/// theorems emitted for a given fn (init / maintain / use all start
+/// from these).
+fn build_param_binders(fn_sst: &FunctionSst) -> Vec<LBinder> {
+    let mut out: Vec<LBinder> = Vec::new();
     for p in fn_sst.x.pars.iter().filter(|p| !is_synthetic_param(p)) {
         let name = sanitize(&p.x.name.0);
-        binders.push(LBinder {
+        out.push(LBinder {
             name: Some(name.clone()),
             ty: typ_to_expr(&p.x.typ),
             kind: BinderKind::Explicit,
         });
         if let Some(pred) = type_bound_predicate(&LExpr::var(name.clone()), &p.x.typ) {
-            binders.push(LBinder {
+            out.push(LBinder {
                 name: Some(format!("h_{}_bound", name)),
                 ty: pred,
                 kind: BinderKind::Explicit,
             });
         }
     }
+    out
+}
 
-    // Requires → hypothesis params.
-    for (i, req) in check.reqs.iter().enumerate() {
-        binders.push(LBinder {
-            name: Some(format!("h_req{}", i)),
-            ty: sst_exp_to_ast(req),
-            kind: BinderKind::Explicit,
-        });
-    }
-
-    let goal = build_goal(
-        &walk(&check.body),
-        check.post_condition.dest.as_ref().map(|v| v.0.as_str()),
-        &check.post_condition.ens_exps,
-    );
-
-    Theorem {
-        name: format!("_tactus_body_{}", lean_name(&fn_sst.x.name.path)),
-        binders,
-        goal,
-        tactic: Tactic::Named("tactus_auto".to_string()),
-    }
+/// `(h_req<i> : <req_i>)` for each requires clause.
+fn build_req_binders(check: &FuncCheckSst) -> Vec<LBinder> {
+    check.reqs.iter().enumerate().map(|(i, req)| LBinder {
+        name: Some(format!("h_req{}", i)),
+        ty: sst_exp_to_ast(req),
+        kind: BinderKind::Explicit,
+    }).collect()
 }
 
 // ── Goal builder ───────────────────────────────────────────────────────
@@ -288,6 +388,161 @@ fn build_goal(
                 LExpr::implies(LExpr::not(cond_ast), build_goal(&else_all, ret_name, ensures)),
             )
         }
+        // WP: `I ∧ maintain ∧ havoc_continuation`. See the
+        // "Loop obligations (conjunctive WP)" section of the module
+        // doc for the shape.
+        BodyItem::Loop { cond, invs, decrease, modified_vars, body_items } => {
+            build_loop_conjunction(
+                cond, invs, decrease, modified_vars, body_items,
+                rest, ret_name, ensures,
+            )
+        }
+    }
+}
+
+/// Build the three-way conjunction contributed by a loop.
+///
+///   `I ∧ (∀ mod_vars, bounds → I ∧ cond → <maintain>)
+///      ∧ (∀ mod_vars, bounds → I ∧ ¬cond → <wp(rest, ensures)>)`
+///
+/// The outer `I` asserts the invariant at loop entry. Maintain and use
+/// are both universally quantified over the loop's modified vars —
+/// maintain because the loop body must preserve `I` and decrease `D`
+/// for an arbitrary iteration start; use because after the loop exits,
+/// the only thing we know about modified vars is `I ∧ ¬cond`.
+fn build_loop_conjunction(
+    cond: &Exp,
+    invs: &[&Exp],
+    decrease: &Exp,
+    modified_vars: &[(&VarIdent, &Typ)],
+    body_items: &[BodyItem<'_>],
+    rest: &[BodyItem<'_>],
+    ret_name: Option<&str>,
+    ensures: &[Exp],
+) -> LExpr {
+    let inv_conj = || and_all(invs.iter().map(|e| sst_exp_to_ast(e)).collect());
+    let cond_ast = || sst_exp_to_ast(cond);
+    let decrease_ast = || sst_exp_to_ast(decrease);
+
+    // Init: at the loop entry (in the current enclosing context), the
+    // invariant conjunction must hold.
+    let init_clause = inv_conj();
+
+    // Maintain: `∀ mod_vars, bounds → I ∧ cond →
+    //              (let d_old := D; wp(body, I ∧ D < d_old))`.
+    // The `let d_old := D` captures the decrease measure before the
+    // body runs; the inner `D` after any mutations inside body has
+    // shadowed the relevant variable will refer to the new value.
+    let post_body = LExpr::and(inv_conj(), LExpr::lt(decrease_ast(), LExpr::var("_d_old")));
+    let maintain_body_wp = build_wrapped(body_items, ret_name, post_body);
+    let maintain_core = LExpr::let_bind("_d_old", decrease_ast(), maintain_body_wp);
+    let maintain_clause = quantify_mod_vars(
+        modified_vars,
+        LExpr::implies(
+            LExpr::and(inv_conj(), cond_ast()),
+            maintain_core,
+        ),
+    );
+
+    // Use / continuation: `∀ mod_vars, bounds → I ∧ ¬cond → wp(rest, ensures)`.
+    let rest_goal = build_goal(rest, ret_name, ensures);
+    let use_clause = quantify_mod_vars(
+        modified_vars,
+        LExpr::implies(
+            LExpr::and(inv_conj(), LExpr::not(cond_ast())),
+            rest_goal,
+        ),
+    );
+
+    LExpr::and(init_clause, LExpr::and(maintain_clause, use_clause))
+}
+
+/// `∀ (x₁ : T₁), bounds₁ → … ∀ (xₙ : Tₙ), boundsₙ → body` — wraps
+/// `body` with a universal quantifier per modified variable plus its
+/// type-bound hypothesis (where applicable).
+fn quantify_mod_vars(
+    modified_vars: &[(&VarIdent, &Typ)],
+    body: LExpr,
+) -> LExpr {
+    use crate::lean_ast::ExprNode;
+    let mut out = body;
+    // Fold right-to-left so the outermost ∀ is the first modified var.
+    for (ident, typ) in modified_vars.iter().rev() {
+        let name = sanitize(&ident.0);
+        // Optionally wrap with `bound → …` first.
+        if let Some(pred) = type_bound_predicate(&LExpr::var(name.clone()), typ) {
+            out = LExpr::implies(pred, out);
+        }
+        // Then wrap with `∀ (x : T), …`.
+        let binder = LBinder {
+            name: Some(name),
+            ty: typ_to_expr(typ),
+            kind: BinderKind::Explicit,
+        };
+        out = LExpr::new(ExprNode::Forall { binders: vec![binder], body: Box::new(out) });
+    }
+    out
+}
+
+/// Fold `items` around a supplied `inner` goal. Same WP rules as
+/// `build_goal` but with an externally-supplied terminator — used by
+/// the loop builder to construct "wp(body, post-body-goal)".
+fn build_wrapped(items: &[BodyItem<'_>], ret_name: Option<&str>, inner: LExpr) -> LExpr {
+    let Some((head, rest)) = items.split_first() else { return inner };
+    match head {
+        BodyItem::Let(n, rhs) => LExpr::let_bind(
+            sanitize(n), sst_exp_to_ast(rhs),
+            build_wrapped(rest, ret_name, inner),
+        ),
+        BodyItem::Assume(e) => LExpr::implies(
+            sst_exp_to_ast(e), build_wrapped(rest, ret_name, inner),
+        ),
+        BodyItem::Assert(e) => LExpr::and(
+            sst_exp_to_ast(e), build_wrapped(rest, ret_name, inner),
+        ),
+        BodyItem::Return(e) => match ret_name {
+            Some(name) => LExpr::let_bind(sanitize(name), sst_exp_to_ast(e), inner),
+            None => inner,
+        },
+        BodyItem::IfThenElse { cond, then_items, else_items } => {
+            let then_all: Vec<BodyItem<'_>> =
+                then_items.iter().chain(rest.iter()).cloned().collect();
+            let else_all: Vec<BodyItem<'_>> =
+                else_items.iter().chain(rest.iter()).cloned().collect();
+            let cond_ast = sst_exp_to_ast(cond);
+            LExpr::and(
+                LExpr::implies(cond_ast.clone(), build_wrapped(&then_all, ret_name, inner.clone())),
+                LExpr::implies(LExpr::not(cond_ast), build_wrapped(&else_all, ret_name, inner)),
+            )
+        }
+        BodyItem::Loop { cond, invs, decrease, modified_vars, body_items } => {
+            // A loop whose continuation ends with `inner` rather than
+            // the fn's ensures. Same three-way conjunction shape —
+            // init / maintain / use — but the use clause terminates
+            // with `wp(rest, inner)` instead of `wp(rest, ensures)`.
+            let inv_conj = || and_all(invs.iter().map(|e| sst_exp_to_ast(e)).collect());
+            let cond_ast = || sst_exp_to_ast(cond);
+            let decrease_ast = || sst_exp_to_ast(decrease);
+            let post_body = LExpr::and(
+                inv_conj(),
+                LExpr::lt(decrease_ast(), LExpr::var("_d_old")),
+            );
+            let maintain_body_wp = build_wrapped(body_items, ret_name, post_body);
+            let maintain_core = LExpr::let_bind("_d_old", decrease_ast(), maintain_body_wp);
+            let maintain_clause = quantify_mod_vars(
+                modified_vars,
+                LExpr::implies(LExpr::and(inv_conj(), cond_ast()), maintain_core),
+            );
+            let tail = build_wrapped(rest, ret_name, inner);
+            let use_clause = quantify_mod_vars(
+                modified_vars,
+                LExpr::implies(
+                    LExpr::and(inv_conj(), LExpr::not(cond_ast())),
+                    tail,
+                ),
+            );
+            LExpr::and(inv_conj(), LExpr::and(maintain_clause, use_clause))
+        }
     }
 }
 
@@ -310,16 +565,34 @@ enum BodyItem<'a> {
         then_items: Vec<BodyItem<'a>>,
         else_items: Vec<BodyItem<'a>>,
     },
+    /// `while <cond> invariant <invs> decreases <decrease> { <body_items> }`.
+    /// Loop bodies are fully flattened — nested loops appear as inner
+    /// `Loop` variants and compose naturally through `build_goal`.
+    /// Modified vars are computed from the body's assignments and
+    /// resolved to types at walk time so `build_goal` doesn't need the
+    /// type map.
+    Loop {
+        cond: &'a Exp,
+        invs: Vec<&'a Exp>,
+        decrease: &'a Exp,
+        modified_vars: Vec<(&'a VarIdent, &'a Typ)>,
+        body_items: Vec<BodyItem<'a>>,
+    },
 }
 
 /// Flatten an SST statement tree into a sequence of `BodyItem`s. A
-/// `Block` concatenates its children's flattenings; an `If` becomes a
-/// single `IfThenElse` whose branches are recursively flattened;
-/// transparent forms (`Air`, `Fuel`, `RevealString`) contribute
-/// nothing; and variants rejected by `check_stm` are unreachable.
-fn walk<'a>(stm: &'a Stm) -> Vec<BodyItem<'a>> {
+/// `Block` concatenates its children's flattenings; `If` / `Loop`
+/// become their own composite items whose sub-bodies are recursively
+/// flattened; transparent forms (`Air`, `Fuel`, `RevealString`)
+/// contribute nothing; and variants rejected by `check_stm` are
+/// unreachable. `type_map` is threaded through so loops can attach the
+/// type of each modified variable.
+fn walk<'a>(
+    stm: &'a Stm,
+    type_map: &std::collections::HashMap<&'a VarIdent, &'a Typ>,
+) -> Vec<BodyItem<'a>> {
     match &stm.x {
-        StmX::Block(stms) => stms.iter().flat_map(|s| walk(s)).collect(),
+        StmX::Block(stms) => stms.iter().flat_map(|s| walk(s, type_map)).collect(),
         StmX::Assign { lhs: Dest { dest, .. }, rhs } => {
             extract_simple_var(dest).map_or_else(Vec::new, |name| vec![BodyItem::Let(name, rhs)])
         }
@@ -331,9 +604,31 @@ fn walk<'a>(stm: &'a Stm) -> Vec<BodyItem<'a>> {
         StmX::Return { ret_exp: None, .. } => Vec::new(),
         StmX::If(cond, then_stm, else_stm) => vec![BodyItem::IfThenElse {
             cond,
-            then_items: walk(then_stm),
-            else_items: else_stm.as_ref().map_or_else(Vec::new, |e| walk(e)),
+            then_items: walk(then_stm, type_map),
+            else_items: else_stm.as_ref().map_or_else(Vec::new, |e| walk(e, type_map)),
         }],
+        StmX::Loop { cond, body, invs, decrease, .. } => {
+            let (_, cond_exp) = cond.as_ref().expect("check_stm guarantees Some cond");
+            let invs_exps: Vec<&'a Exp> = invs.iter().map(|inv: &LoopInv| &inv.inv).collect();
+            let decrease_exp = decrease.first().expect("check_stm guarantees one decrease");
+            // Compute modified vars from the loop body's assignment
+            // LHSs. Verus's own `modified_vars` field isn't populated
+            // on the SST we receive (it's filled in on the way to
+            // `sst_to_air`), but computing it here is straightforward
+            // and works regardless of pipeline stage.
+            let mut mod_names: Vec<&'a VarIdent> = Vec::new();
+            collect_assigned_vars(body, &mut mod_names);
+            let modified_vars: Vec<(&'a VarIdent, &'a Typ)> = mod_names.into_iter()
+                .filter_map(|id| type_map.get(id).map(|typ| (id, *typ)))
+                .collect();
+            vec![BodyItem::Loop {
+                cond: cond_exp,
+                invs: invs_exps,
+                decrease: decrease_exp,
+                modified_vars,
+                body_items: walk(body, type_map),
+            }]
+        }
         // Transparent in SST: contribute nothing to the WP goal.
         StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => Vec::new(),
         // All rejected by `check_stm`. Reaching them here means the
@@ -344,11 +639,41 @@ fn walk<'a>(stm: &'a Stm) -> Vec<BodyItem<'a>> {
         | StmX::AssertQuery { .. }
         | StmX::DeadEnd(_)
         | StmX::OpenInvariant(_)
-        | StmX::ClosureInner { .. }
-        | StmX::Loop { .. } => unreachable!(
+        | StmX::ClosureInner { .. } => unreachable!(
             "sst_to_lean::walk: {:?} should have been rejected by supported_body",
             stm.x
         ),
+    }
+}
+
+/// Recurse through a statement collecting every variable that appears
+/// as the LHS of a `StmX::Assign`. Order preserves first-assignment;
+/// duplicates are dropped. Used to compute the modified-var set for
+/// loop havoc.
+fn collect_assigned_vars<'a>(stm: &'a Stm, out: &mut Vec<&'a VarIdent>) {
+    match &stm.x {
+        StmX::Assign { lhs: Dest { dest, .. }, .. } => {
+            if let Some(ident) = extract_simple_var_ident(dest) {
+                if !out.contains(&ident) {
+                    out.push(ident);
+                }
+            }
+        }
+        StmX::Block(stms) => for s in stms.iter() { collect_assigned_vars(s, out); },
+        StmX::If(_, t, e) => {
+            collect_assigned_vars(t, out);
+            if let Some(e) = e { collect_assigned_vars(e, out); }
+        }
+        StmX::Loop { body, .. } => collect_assigned_vars(body, out),
+        _ => {}
+    }
+}
+
+fn extract_simple_var_ident<'a>(e: &'a Exp) -> Option<&'a VarIdent> {
+    match &e.x {
+        ExpX::Var(ident) | ExpX::VarLoc(ident) => Some(ident),
+        ExpX::Loc(inner) => extract_simple_var_ident(inner),
+        _ => None,
     }
 }
 
@@ -359,6 +684,7 @@ fn extract_simple_var<'a>(e: &'a Exp) -> Option<&'a str> {
         _ => None,
     }
 }
+
 
 /// Verus injects synthetic params (`no%param`, etc.) with `%` in the
 /// name for zero-arg functions and a few internal cases. They have no
