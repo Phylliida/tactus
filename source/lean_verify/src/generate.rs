@@ -255,9 +255,11 @@ pub fn check_exec_fn(
                 .map(|d| lean_process::format_error(d, &empty))
                 .collect();
             CheckResult::Failed(format!(
-                "Lean tactus_auto failed for {}:\n\n{}",
+                "Lean tactus_auto failed for {}:\n\n{}\n\n\
+                 (generated .lean file: {})",
                 short_name(&vir_fn.name.path),
                 errors.join("\n"),
+                file_path.display(),
             ))
         }
         Err(e) => CheckResult::Error(e),

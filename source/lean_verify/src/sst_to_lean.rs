@@ -283,19 +283,55 @@ pub fn exec_fn_theorems_to_ast(fn_sst: &FunctionSst, check: &FuncCheckSst) -> Ve
         .collect();
 
     let items = walk(&check.body, &type_map);
+    let has_loop = items_contain_loop(&items);
     let goal = build_goal(
         &items,
         check.post_condition.dest.as_ref().map(|v| v.0.as_str()),
         &check.post_condition.ens_exps,
     );
-    vec![mk_theorem(name, binders, goal)]
+    let tactic = if has_loop { loop_tactic() } else { simple_tactic() };
+    vec![Theorem { name, binders, goal, tactic }]
+}
+
+/// Atomic `tactus_auto` for straight-line exec fn theorems — their
+/// goals are a single chain of `let` / `→` / `∧` that omega handles
+/// directly.
+fn simple_tactic() -> Tactic {
+    Tactic::Named("tactus_auto".to_string())
+}
+
+/// Loop theorems have a conjunctive shape `init ∧ maintain ∧ use`
+/// wrapped inside an outer `let` (from pre-loop init). Structural
+/// peeling — split the top-level `∧`s, introduce the `∀ / →` binders —
+/// belongs at the emit side because we know the shape at codegen time.
+/// Each resulting leaf is arithmetic, so `tactus_auto` closes.
+///
+/// Try the three-way split first (the canonical shape with a non-trivial
+/// init conjunct); fall back to two-way (when the init was absorbed
+/// into a trivial like `n ≤ n`); finally just invoke `tactus_auto`
+/// directly in case Lean's elaborator has pre-simplified the whole
+/// thing into a leaf.
+fn loop_tactic() -> Tactic {
+    Tactic::Raw(
+        "first | (refine ⟨?_, ?_, ?_⟩ <;> intros <;> tactus_auto) \
+               | (refine ⟨?_, ?_⟩ <;> intros <;> tactus_auto) \
+               | tactus_auto".to_string()
+    )
+}
+
+/// Recurse through the item tree to find any `Loop`. Used to pick the
+/// right tactic shape at theorem-emit time.
+fn items_contain_loop(items: &[BodyItem<'_>]) -> bool {
+    items.iter().any(|item| match item {
+        BodyItem::Loop { .. } => true,
+        BodyItem::IfThenElse { then_items, else_items, .. } => {
+            items_contain_loop(then_items) || items_contain_loop(else_items)
+        }
+        _ => false,
+    })
 }
 
 // ── Binder builders ────────────────────────────────────────────────────
-
-fn mk_theorem(name: String, binders: Vec<LBinder>, goal: LExpr) -> Theorem {
-    Theorem { name, binders, goal, tactic: Tactic::Named("tactus_auto".to_string()) }
-}
 
 /// Function params + their type-bound hypotheses. Shared across all
 /// theorems emitted for a given fn (init / maintain / use all start

@@ -2434,3 +2434,49 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Loop that counts *up* — modified var is a different kind of
+// monotonic, and the invariant bounds it against an upper ceiling
+// from the requires, not a fn param directly.
+test_verify_one_file! {
+    #[test] test_exec_loop_count_up verus_code! {
+        #[verifier::tactus_auto]
+        fn count_up_to(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r == n
+        {
+            let mut x: u8 = 0;
+            while x < n
+                invariant x <= n
+                decreases n - x
+            {
+                x = x + 1;
+            }
+            x
+        }
+    } => Ok(())
+}
+
+// A loop whose invariant gets violated — here the maintain obligation
+// fails because `x = x + 2` breaks the invariant `x <= n`. This tests
+// the maintain theorem's rejection path.
+test_verify_one_file! {
+    #[test] test_exec_loop_invariant_fails verus_code! {
+        #[verifier::tactus_auto]
+        fn bad_loop(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r == n
+        {
+            let mut x: u8 = 0;
+            while x < n
+                invariant x <= n
+                decreases n - x
+            {
+                x = x + 2;  // overshoots — invariant x <= n may fail
+            }
+            x
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "broken-invariant loop should be rejected");
+    }
+}
+
