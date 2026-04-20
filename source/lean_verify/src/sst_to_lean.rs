@@ -301,21 +301,31 @@ fn simple_tactic() -> Tactic {
 }
 
 /// Loop theorems have a conjunctive shape `init ∧ maintain ∧ use`
-/// wrapped inside an outer `let` (from pre-loop init). Structural
-/// peeling — split the top-level `∧`s, introduce the `∀ / →` binders —
-/// belongs at the emit side because we know the shape at codegen time.
-/// Each resulting leaf is arithmetic, so `tactus_auto` closes.
+/// per loop; nested / sequential loops produce nested conjunctions
+/// of the same shape. Structural peeling belongs at emit time because
+/// we know the shape, but we don't know a priori how deeply nested it
+/// is: sequential loops chain, loops inside if-branches compose with
+/// the branch's `c → …`, and nested loops stack within maintain.
 ///
-/// Try the three-way split first (the canonical shape with a non-trivial
-/// init conjunct); fall back to two-way (when the init was absorbed
-/// into a trivial like `n ≤ n`); finally just invoke `tactus_auto`
-/// directly in case Lean's elaborator has pre-simplified the whole
-/// thing into a leaf.
+/// `repeat'` recursively peels any top-level `∧` (via `apply
+/// And.intro`) and any leading `∀` / `→` (via `intro`) across all
+/// open goals until no more structural splitting is possible. The
+/// resulting leaves are arithmetic; `tactus_auto` closes each.
 fn loop_tactic() -> Tactic {
+    // Structural peeling: each round splits one layer of `∧` and
+    // introduces one layer of `∀`/`→` across every open sub-goal.
+    // `iterate N` repeats that N times — a fixed depth that scales
+    // with nesting but stops before runaway. The `try` guards the
+    // tactic on the final round when there's nothing left to peel.
+    // `all_goals tactus_auto` then closes each arithmetic leaf.
+    //
+    // Eight rounds comfortably covers what we've seen: three levels
+    // of loop (nested), three conjuncts per loop (init / maintain /
+    // use), plus the `A ∧ (cond → B)` shape around `HasType`
+    // assertions. Bump the count if a deeper construct ever surfaces.
     Tactic::Raw(
-        "first | (refine ⟨?_, ?_, ?_⟩ <;> intros <;> tactus_auto) \
-               | (refine ⟨?_, ?_⟩ <;> intros <;> tactus_auto) \
-               | tactus_auto".to_string()
+        "iterate 8 (all_goals (try (first | apply And.intro | intros))); \
+         all_goals tactus_auto".to_string()
     )
 }
 
@@ -647,13 +657,19 @@ fn walk<'a>(
             let (_, cond_exp) = cond.as_ref().expect("check_stm guarantees Some cond");
             let invs_exps: Vec<&'a Exp> = invs.iter().map(|inv: &LoopInv| &inv.inv).collect();
             let decrease_exp = decrease.first().expect("check_stm guarantees one decrease");
-            // Compute modified vars from the loop body's assignment
-            // LHSs. Verus's own `modified_vars` field isn't populated
-            // on the SST we receive (it's filled in on the way to
-            // `sst_to_air`), but computing it here is straightforward
-            // and works regardless of pipeline stage.
+            // Compute modified vars from the loop body's *non-init*
+            // assignments — `let mut x = …` inside the body is local
+            // to each iteration and shouldn't leak into the outer
+            // quantification. (Nested loops use the same logic
+            // recursively, so an inner loop's local decls stay local
+            // even when the outer loop computes its own modified set.)
+            // Verus's own `modified_vars` field isn't populated on the
+            // SST we receive here; computing it ourselves works
+            // regardless of pipeline stage.
             let mut mod_names: Vec<&'a VarIdent> = Vec::new();
-            collect_assigned_vars(body, &mut mod_names);
+            let mut locally_declared: std::collections::HashSet<&'a VarIdent> =
+                std::collections::HashSet::new();
+            collect_modifications(body, &mut locally_declared, &mut mod_names);
             let modified_vars: Vec<(&'a VarIdent, &'a Typ)> = mod_names.into_iter()
                 .filter_map(|id| type_map.get(id).map(|typ| (id, *typ)))
                 .collect();
@@ -682,25 +698,40 @@ fn walk<'a>(
     }
 }
 
-/// Recurse through a statement collecting every variable that appears
-/// as the LHS of a `StmX::Assign`. Order preserves first-assignment;
-/// duplicates are dropped. Used to compute the modified-var set for
-/// loop havoc.
-fn collect_assigned_vars<'a>(stm: &'a Stm, out: &mut Vec<&'a VarIdent>) {
+/// Collect variables that a loop body modifies *externally* — writes
+/// to vars declared outside the body. Locally-declared vars (via
+/// `let mut x = …`) stay out of the set even when subsequent
+/// assignments hit them, because they're each iteration's fresh locals.
+///
+/// `is_init: true` assignments are treated as declarations and recorded
+/// in `locally_declared`. `is_init: false` assignments to a var NOT in
+/// `locally_declared` count as external modifications and go into
+/// `out`. Nested loops inherit the current `locally_declared` set, so
+/// a variable `x` declared in an outer loop body and modified by an
+/// inner loop still counts as modified by the outer.
+fn collect_modifications<'a>(
+    stm: &'a Stm,
+    locally_declared: &mut std::collections::HashSet<&'a VarIdent>,
+    out: &mut Vec<&'a VarIdent>,
+) {
     match &stm.x {
-        StmX::Assign { lhs: Dest { dest, .. }, .. } => {
+        StmX::Assign { lhs: Dest { dest, is_init }, .. } => {
             if let Some(ident) = extract_simple_var_ident(dest) {
-                if !out.contains(&ident) {
+                if *is_init {
+                    locally_declared.insert(ident);
+                } else if !locally_declared.contains(&ident) && !out.contains(&ident) {
                     out.push(ident);
                 }
             }
         }
-        StmX::Block(stms) => for s in stms.iter() { collect_assigned_vars(s, out); },
+        StmX::Block(stms) => for s in stms.iter() {
+            collect_modifications(s, locally_declared, out);
+        },
         StmX::If(_, t, e) => {
-            collect_assigned_vars(t, out);
-            if let Some(e) = e { collect_assigned_vars(e, out); }
+            collect_modifications(t, locally_declared, out);
+            if let Some(e) = e { collect_modifications(e, locally_declared, out); }
         }
-        StmX::Loop { body, .. } => collect_assigned_vars(body, out),
+        StmX::Loop { body, .. } => collect_modifications(body, locally_declared, out),
         _ => {}
     }
 }

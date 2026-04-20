@@ -2480,3 +2480,152 @@ test_verify_one_file! {
     }
 }
 
+// Two sequential loops in one fn. Each loop emits its own conjunction
+// in the main goal; the second loop's continuation is nested inside
+// the first's use clause. Structurally:
+//   init₁ ∧ maintain₁ ∧ (havoc₁ → init₂ ∧ maintain₂ ∧ (havoc₂ → ensures))
+test_verify_one_file! {
+    #[test] test_exec_loop_sequential verus_code! {
+        #[verifier::tactus_auto]
+        fn two_loops(n: u8) -> (r: u8)
+            requires n <= 50
+            ensures r == 0
+        {
+            let mut x: u8 = n;
+            while x > 0
+                invariant x <= n
+                decreases x
+            {
+                x = x - 1;
+            }
+            // x == 0 here
+            let mut y: u8 = 0;
+            while y < x
+                invariant y <= x, x == 0
+                decreases x - y
+            {
+                y = y + 1;
+            }
+            x
+        }
+    } => Ok(())
+}
+
+// Nested loops — the outer loop's body contains another loop. The
+// inner loop's obligations (init/maintain/use) land inside the
+// outer's maintain clause. A genuine stress test of the recursive
+// architecture.
+test_verify_one_file! {
+    #[test] test_exec_loop_nested verus_code! {
+        #[verifier::tactus_auto]
+        fn nested(n: u8) -> (r: u8)
+            requires n <= 10
+            ensures r == 0
+        {
+            let mut i: u8 = n;
+            while i > 0
+                invariant i <= n
+                decreases i
+            {
+                let mut j: u8 = i;
+                while j > 0
+                    invariant j <= i, i <= n
+                    decreases j
+                {
+                    j = j - 1;
+                }
+                i = i - 1;
+            }
+            i
+        }
+    } => Ok(())
+}
+
+// Loop inside an `if` branch — the loop's obligations land inside
+// the branch's `c → …` continuation. Tests that the WP composition
+// flows through IfThenElse into BodyItem::Loop correctly.
+test_verify_one_file! {
+    #[test] test_exec_loop_in_if_branch verus_code! {
+        #[verifier::tactus_auto]
+        fn conditional_loop(n: u8, cond: bool) -> (r: u8)
+            requires n <= 50
+            ensures r <= n
+        {
+            let mut x: u8 = n;
+            if cond {
+                while x > 0
+                    invariant x <= n
+                    decreases x
+                {
+                    x = x - 1;
+                }
+            }
+            x
+        }
+    } => Ok(())
+}
+
+// Lexicographic `decreases` is rejected up front — single-expression
+// only at the current slice. Regression guard so we notice when /
+// if that restriction is lifted.
+test_verify_one_file! {
+    #[test] test_exec_loop_lex_decreases_rejected verus_code! {
+        #[verifier::tactus_auto]
+        fn lex_loop(a: u8, b: u8) -> (r: u8)
+            requires a <= 10, b <= 10
+            ensures r == 0
+        {
+            let mut x: u8 = a;
+            let mut y: u8 = b;
+            while x > 0 || y > 0
+                invariant x <= a, y <= b
+                decreases x, y  // lexicographic — not yet supported
+            {
+                if y > 0 {
+                    y = y - 1;
+                } else {
+                    x = x - 1;
+                    y = b;
+                }
+            }
+            x + y
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("decreases")
+                || e.message.contains("not yet supported")),
+            "lexicographic decreases should be rejected",
+        );
+    }
+}
+
+// `break` inside the loop body. Verus compiles this to a non-simple
+// loop (cond: None, with break statements); `check_stm` rejects
+// because we require `cond: Some`.
+test_verify_one_file! {
+    #[test] test_exec_loop_break_rejected verus_code! {
+        #[verifier::tactus_auto]
+        fn with_break(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r <= n
+        {
+            let mut x: u8 = n;
+            while x > 0
+                invariant x <= n
+                decreases x
+            {
+                if x == 5 {
+                    break;
+                }
+                x = x - 1;
+            }
+            x
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("not yet supported")),
+            "loop with break should be rejected",
+        );
+    }
+}
+
