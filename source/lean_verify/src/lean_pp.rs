@@ -352,9 +352,6 @@ fn write_tactic_block(
             out.push_str(name);
             out.push('\n');
         }
-        Tactic::Seq(ts) => {
-            for inner in ts { write_tactic_block(out, inner, indent, tactic_starts); }
-        }
     }
 }
 

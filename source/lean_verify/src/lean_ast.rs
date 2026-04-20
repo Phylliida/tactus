@@ -265,8 +265,6 @@ pub enum Tactic {
     Raw(String),
     /// A single named tactic like `omega`, `rfl`, or `tactus_auto`.
     Named(String),
-    /// Sequence of tactics, pretty-printed one per line.
-    Seq(Vec<Tactic>),
 }
 
 // ── Constructors ──────────────────────────────────────────────────────
