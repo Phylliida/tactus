@@ -29,7 +29,8 @@
 //! only shadows within its implication, so the outer `x` remains in
 //! scope for the other branch and the code after the if. Loops break
 //! this trick because the loop body's mutations can't tunnel out
-//! through shadowing; that's slice 4's problem.
+//! through shadowing; they'll need a real rename pass when we get
+//! there.
 //!
 //! # Semantic model (weakest-precondition, in body order)
 //!
@@ -44,8 +45,11 @@
 //!   `(c → wp(s₁; <rest>)) ∧ (¬c → wp(s₂; <rest>))`. Both branches share
 //!   the same continuation; we duplicate `<rest>` syntactically rather
 //!   than let-binding a shared goal.
-//! * `return e` ends the body; if the ensures references the return name,
-//!   we wrap the ensures in `let <ret_name> := e; <ensures_conj>`.
+//! * `return e` is a terminator: it wraps the ensures as `let <ret> :=
+//!   e; <ensures>` and any items after it in the same sequence are
+//!   unreachable and dropped. Works for both tail returns and for
+//!   early returns inside an `if` branch (the branch's continuation
+//!   ends at the return; the outer `rest` never gets appended past it).
 //!
 //! The AST pretty-printer handles precedence, so constructors just build
 //! `BinOp::And` / `BinOp::Implies` / `UnOp::Not` / `Let` without worrying
@@ -209,11 +213,10 @@ pub fn exec_fn_theorem_to_ast(fn_sst: &FunctionSst, check: &FuncCheckSst) -> The
         });
     }
 
-    let (items, return_expr) = collect_body_items(&check.body);
+    let items = collect_body_items(&check.body);
 
     let goal = build_goal(
         &items,
-        return_expr,
         check.post_condition.dest.as_ref().map(|v| v.0.as_str()),
         &check.post_condition.ens_exps,
     );
@@ -230,37 +233,41 @@ pub fn exec_fn_theorem_to_ast(fn_sst: &FunctionSst, check: &FuncCheckSst) -> The
 
 /// Construct the theorem goal by folding body items in source order. See
 /// the module doc for the WP rules — each item wraps the goal built from
-/// the remainder of the body.
+/// the remainder of the body. `Return` terminates: items after it are
+/// dropped because they're unreachable.
 fn build_goal(
     items: &[BodyItem<'_>],
-    return_expr: Option<&Exp>,
     ret_name: Option<&str>,
     ensures: &[Exp],
 ) -> LExpr {
     let Some((head, rest)) = items.split_first() else {
-        return final_goal(return_expr, ret_name, ensures);
+        return final_goal(None, ret_name, ensures);
     };
     match head {
         BodyItem::Let(name, rhs) => LExpr::new(ExprNode::Let {
             name: sanitize(name),
             value: Box::new(sst_exp_to_ast(rhs)),
-            body: Box::new(build_goal(rest, return_expr, ret_name, ensures)),
+            body: Box::new(build_goal(rest, ret_name, ensures)),
         }),
         BodyItem::Assume(e) => LExpr::new(ExprNode::BinOp {
             op: L::Implies,
             lhs: Box::new(sst_exp_to_ast(e)),
-            rhs: Box::new(build_goal(rest, return_expr, ret_name, ensures)),
+            rhs: Box::new(build_goal(rest, ret_name, ensures)),
         }),
         BodyItem::Assert(e) => LExpr::new(ExprNode::BinOp {
             op: L::And,
             lhs: Box::new(sst_exp_to_ast(e)),
-            rhs: Box::new(build_goal(rest, return_expr, ret_name, ensures)),
+            rhs: Box::new(build_goal(rest, ret_name, ensures)),
         }),
+        BodyItem::Return(e) => final_goal(Some(e), ret_name, ensures),
         BodyItem::IfThenElse { cond, then_items, else_items } => {
             // WP: (c → wp(then ++ rest)) ∧ (¬c → wp(else ++ rest)).
             // `rest` duplicates syntactically — we don't share goals via
-            // a named let-binding. Exponential in nesting depth, but Lean
-            // / Z3 see the same logical goal either way.
+            // a named let-binding. Exponential in nesting depth (see
+            // DESIGN.md "Known codegen-complexity trade-offs"), but Lean
+            // / Z3 see the same logical goal either way. If either branch
+            // ends with `Return`, its continuation naturally terminates
+            // there and `rest` is appended but ignored.
             let then_all: Vec<BodyItem<'_>> =
                 then_items.iter().chain(rest.iter()).cloned().collect();
             let else_all: Vec<BodyItem<'_>> =
@@ -270,8 +277,8 @@ fn build_goal(
                 op: LU::Not,
                 arg: Box::new(cond_ast.clone()),
             });
-            let then_goal = build_goal(&then_all, return_expr, ret_name, ensures);
-            let else_goal = build_goal(&else_all, return_expr, ret_name, ensures);
+            let then_goal = build_goal(&then_all, ret_name, ensures);
+            let else_goal = build_goal(&else_all, ret_name, ensures);
             let then_branch = LExpr::new(ExprNode::BinOp {
                 op: L::Implies,
                 lhs: Box::new(cond_ast),
@@ -316,8 +323,13 @@ enum BodyItem<'a> {
     Let(&'a str, &'a Exp),
     Assert(&'a Exp),
     Assume(&'a Exp),
+    /// Terminator: wraps the ensures as `let <ret> := e; <ensures>` and
+    /// discards any subsequent items in the same sequence. Populated
+    /// from `StmX::Return { ret_exp: Some(_), inside_body: false }`.
+    Return(&'a Exp),
     /// `if <cond> { <then_items> } else { <else_items> }` — both branches
-    /// are already flattened into `BodyItem` sequences.
+    /// are already flattened into `BodyItem` sequences. Either branch
+    /// may end with a `Return` (handled by `build_goal`).
     IfThenElse {
         cond: &'a Exp,
         then_items: Vec<BodyItem<'a>>,
@@ -325,20 +337,15 @@ enum BodyItem<'a> {
     },
 }
 
-fn collect_body_items<'a>(body: &'a Stm) -> (Vec<BodyItem<'a>>, Option<&'a Exp>) {
+fn collect_body_items<'a>(body: &'a Stm) -> Vec<BodyItem<'a>> {
     let mut items = Vec::new();
-    let mut ret = None;
-    walk(body, &mut items, &mut ret);
-    (items, ret)
+    walk(body, &mut items);
+    items
 }
 
-fn walk<'a>(
-    stm: &'a Stm,
-    items: &mut Vec<BodyItem<'a>>,
-    ret: &mut Option<&'a Exp>,
-) {
+fn walk<'a>(stm: &'a Stm, items: &mut Vec<BodyItem<'a>>) {
     match &stm.x {
-        StmX::Block(stms) => for s in stms.iter() { walk(s, items, ret); },
+        StmX::Block(stms) => for s in stms.iter() { walk(s, items); },
         StmX::Assign { lhs: Dest { dest, .. }, rhs } => {
             if let Some(name) = extract_simple_var(dest) {
                 items.push(BodyItem::Let(name, rhs));
@@ -346,27 +353,37 @@ fn walk<'a>(
         }
         StmX::Assert(_, _, e) | StmX::AssertCompute(_, e, _) => items.push(BodyItem::Assert(e)),
         StmX::Assume(e) => items.push(BodyItem::Assume(e)),
-        StmX::Return { ret_exp: Some(e), .. } => { *ret = Some(e); }
+        // `Return { ret_exp: Some, inside_body: false }` is the normal
+        // case — a tail return either at top level or ending a branch.
+        // `ret_exp: None` is a unit return with no value to bind; skip.
+        StmX::Return { ret_exp: Some(e), .. } => items.push(BodyItem::Return(e)),
+        StmX::Return { ret_exp: None, .. } => {}
         StmX::If(cond, then_stm, else_stm) => {
             let mut then_items = Vec::new();
-            let mut then_ret = None;
-            walk(then_stm, &mut then_items, &mut then_ret);
+            walk(then_stm, &mut then_items);
             let mut else_items = Vec::new();
-            let mut else_ret = None;
             if let Some(e) = else_stm {
-                walk(e, &mut else_items, &mut else_ret);
+                walk(e, &mut else_items);
             }
-            // Branch-level returns would require merging their values with
-            // the outer ensures across branches. `check_stm` rejects
-            // `inside_body: true` returns, so this should be unreachable
-            // in well-formed input; assert for safety.
-            debug_assert!(
-                then_ret.is_none() && else_ret.is_none(),
-                "branch-level return escaped supported_body filter",
-            );
             items.push(BodyItem::IfThenElse { cond, then_items, else_items });
         }
-        _ => {}
+        // Transparent in SST: contribute nothing to the WP goal.
+        StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => {}
+        // These all fail `check_stm`. Reaching them here means the
+        // support-check and the walker fell out of sync.
+        StmX::Call { .. }
+        | StmX::BreakOrContinue { .. }
+        | StmX::AssertBitVector { .. }
+        | StmX::AssertQuery { .. }
+        | StmX::DeadEnd(_)
+        | StmX::OpenInvariant(_)
+        | StmX::ClosureInner { .. }
+        | StmX::Loop { .. } => {
+            unreachable!(
+                "sst_to_lean::walk: {:?} should have been rejected by supported_body",
+                stm.x
+            )
+        }
     }
 }
 

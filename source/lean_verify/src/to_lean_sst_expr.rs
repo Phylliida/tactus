@@ -31,17 +31,65 @@ fn var(s: impl Into<String>) -> LExpr {
     LExpr::new(ExprNode::Var(s.into()))
 }
 
-/// `2^n` rendered as a decimal literal. Supports 0 ≤ n ≤ 128 — VIR's
+/// `2^n` rendered as a decimal string. Supports 0 ≤ n ≤ 128 — VIR's
 /// `U(n)` / `I(n)` only reach that range in practice (u8/u16/u32/u64/u128).
 /// We compute it in `u128`; `n = 128` is the boundary, so we fall back to
 /// a precomputed constant for that single case.
-fn two_pow_lit(n: u32) -> LExpr {
-    let s = if n < 128 {
+fn two_pow_str(n: u32) -> String {
+    if n < 128 {
         (1u128 << n).to_string()
     } else if n == 128 {
         "340282366920938463463374607431768211456".to_string()
     } else {
-        panic!("two_pow_lit: bit width {} exceeds the u128 ceiling", n)
+        panic!("two_pow_str: bit width {} exceeds the u128 ceiling", n)
+    }
+}
+
+fn two_pow_lit(n: u32) -> LExpr {
+    LExpr::new(ExprNode::Lit(two_pow_str(n)))
+}
+
+/// If `e` is a constant non-negative integer that fits in `u32`, return
+/// its value. Used to read the bit-width argument of `IntegerTypeBound`.
+fn const_u32(e: &Exp) -> Option<u32> {
+    match &e.x {
+        ExpX::Const(Constant::Int(n)) => n.to_string().parse().ok(),
+        _ => None,
+    }
+}
+
+/// The literal value of `IntegerTypeBound(kind, _)` at the given bit width.
+///
+/// Mirrors the AIR encoding in `sst_to_air::exp_to_expr`:
+///   * `UnsignedMax` → `2^bits - 1`
+///   * `SignedMin`   → `-2^(bits-1)`
+///   * `SignedMax`   → `2^(bits-1) - 1`
+///
+/// `ArchWordBits` is handled at the call site (it needs prelude plumbing).
+fn integer_type_bound_lit(kind: IntegerTypeBoundKind, bits: u32) -> LExpr {
+    let s = match kind {
+        IntegerTypeBoundKind::UnsignedMax => {
+            // 2^bits - 1. At bits == 128 we hit u128::MAX; shift-by-128
+            // is UB so branch around it.
+            if bits == 128 {
+                "340282366920938463463374607431768211455".to_string()
+            } else if bits == 0 {
+                "0".to_string()
+            } else {
+                ((1u128 << bits) - 1).to_string()
+            }
+        }
+        IntegerTypeBoundKind::SignedMin => {
+            assert!(bits >= 1, "SignedMin on 0-bit int");
+            format!("-{}", two_pow_str(bits - 1))
+        }
+        IntegerTypeBoundKind::SignedMax => {
+            assert!(bits >= 1, "SignedMax on 0-bit int");
+            ((1u128 << (bits - 1)) - 1).to_string()
+        }
+        IntegerTypeBoundKind::ArchWordBits => unreachable!(
+            "integer_type_bound_lit: ArchWordBits should be handled at the call site"
+        ),
     };
     LExpr::new(ExprNode::Lit(s))
 }
@@ -170,11 +218,26 @@ fn exp_to_node(e: &Exp) -> ExprNode {
                 None => ExprNode::LitBool(true),
             }
         }
-        // `IntegerTypeBound(SignedMin | SignedMax | UnsignedMax, _)` returns
-        // a numeric value (the bound itself), not a proposition. Rendering
-        // as `True` is wrong, but our current tests don't touch it — fix
-        // when a user hits it.
-        ExpX::UnaryOpr(UnaryOpr::IntegerTypeBound(_, _), _) => ExprNode::LitBool(true),
+        // `IntegerTypeBound(kind, _)` returns the numeric bound of a
+        // fixed-width int type. The inner expression is the bit width
+        // (a literal like 8, 32, …) — we evaluate at codegen time and
+        // emit the decimal literal directly. `ArchWordBits` is the one
+        // case that doesn't take a width; it panics for now (prelude
+        // plumbing missing).
+        ExpX::UnaryOpr(UnaryOpr::IntegerTypeBound(kind, _), inner) => {
+            if matches!(kind, IntegerTypeBoundKind::ArchWordBits) {
+                panic!(
+                    "IntegerTypeBound::ArchWordBits requires arch_word_bits in the \
+                     Tactus prelude, which isn't wired through yet"
+                );
+            }
+            let bits = const_u32(inner).unwrap_or_else(|| panic!(
+                "IntegerTypeBound({:?}): non-constant bit width is not supported \
+                 (inner = {:?})",
+                kind, inner.x,
+            ));
+            integer_type_bound_lit(kind.clone(), bits).node
+        }
         ExpX::UnaryOpr(_, inner) => exp_to_node(inner),
 
         ExpX::Binary(op, lhs, rhs) => match binop_to_ast(op) {

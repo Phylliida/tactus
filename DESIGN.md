@@ -735,6 +735,18 @@ Each arithmetic op on fixed-width types generates:
 theorem overflow_check_line_N ... : 0 ≤ result ∧ result < 2^bits := by tactus_auto
 ```
 
+**Current implementation status**: u8/u16/… render as Lean `Nat`; i8/i16/… render as Lean `Int`. `HasType(e, U(n))` emits `e < 2^n` (the upper bound); the lower bound is free from `Nat`. `HasType(e, I(n))` emits both bounds. Each fixed-width param picks up a `(h_<name>_bound : …)` hypothesis.
+
+**Known gap — u8 subtraction underflow is not caught.** Because we render u8 as `Nat`, Lean's subtraction truncates (`0 - 1 = 0`), and the overflow check `x - y < 256` is trivially true for a `Nat`. This means `fn sub(x: u8, y: u8) -> (r: u8) ensures r == x - y { x - y }` currently verifies despite underflowing in Rust. The fix is to render u8 as `Int` with `(h : 0 ≤ x ∧ x < 2^n)` bounds — then subtraction uses Int semantics and the lower-bound check becomes meaningful. Same gap applies to any u-type operation whose result can go negative. Signed types (i8/i16/…) are not affected because they already render as `Int`. Multiplication and addition on u-types ARE caught because Nat arithmetic doesn't truncate them upward.
+
+`IntegerTypeBound(kind, _)` (i.e., `u8::MAX`, `i32::MIN`, etc.) evaluates to a decimal literal at codegen when the bit-width argument is a `Constant::Int`. `ArchWordBits` panics for now — it requires an `arch_word_bits` axiom in the prelude that isn't wired through.
+
+### Known codegen-complexity trade-offs
+
+`sst_to_lean::build_goal` handles `if c { s1 } else { s2 }` by cloning the continuation `rest` into both branches syntactically: `wp(s1 ++ rest) ∧ wp(s2 ++ rest)`. `BodyItem::IfThenElse` carries `Vec<BodyItem>` per branch, so cloning is recursive. N sequential ifs at the same level produce 2^N copies of the innermost continuation in the goal AST. For realistic exec fn bodies (few-level nesting) this is fine; for pathological cases it could bloat codegen time and the generated `.lean` file.
+
+Alternative: introduce a `let _goal_k := <rest_goal>` binding at each if and have both branches refer to `_goal_k`. This preserves logical equivalence with linear size. Not implemented — the cost hasn't shown up yet — but noted here so the trade-off is explicit when someone hits it.
+
 ### Scope and difficulty
 
 Implementing `sst_to_lean` with full WP is the most significant engineering effort — comparable to `sst_to_air` (~3000 lines). It handles mutation as SSA, control flow, pattern matching, closures, borrow semantics. **Estimated: 3-6 months.**

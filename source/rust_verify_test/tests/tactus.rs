@@ -2084,7 +2084,7 @@ test_verify_one_file! {
 // every `StmX::Assign { is_init: false }` re-emits `let x := e`, which
 // shadows the previous binding. Same mechanism works across if-branches
 // since each branch has its own scope. Loops would need a real rename
-// pass (slice 4).
+// pass — that's the loop slice's job.
 
 // Simple sequential mutation. Each `y = y + 1` becomes `let y := y + 1`
 // in Lean; the outer `y` is shadowed.
@@ -2171,8 +2171,88 @@ test_verify_one_file! {
             x + y
         }
     } => Err(err) => {
-        assert!(err.errors.len() >= 1, "signed u8 arith without bounds should fail");
+        assert!(err.errors.len() >= 1, "signed i8 arith without bounds should fail");
     }
+}
+
+// u8 subtraction with a sufficient guard. Both `Nat` and `Int`
+// semantics agree when `y ≤ x`, so this passes.
+//
+// NOTE: the unguarded counterpart (`x - y` with y possibly > x) is a
+// known soundness gap — because we render `u8` as `Nat`, Lean's
+// truncating subtraction silently makes `0 - 1 = 0`, and the
+// `HasType(x - y, U(8))` check reduces to `0 ≤ x - y < 256` which is
+// trivially true for `Nat`. Catching underflow properly requires
+// rendering u8 as `Int` with both bounds; see DESIGN.md.
+test_verify_one_file! {
+    #[test] test_exec_underflow_guarded verus_code! {
+        #[verifier::tactus_auto]
+        fn sub_u8_guarded(x: u8, y: u8) -> (r: u8)
+            requires y <= x
+            ensures r as int == x as int - y as int
+        {
+            x - y
+        }
+    } => Ok(())
+}
+
+// u8 multiplication has a MUCH tighter overflow bound than addition:
+// two u8s up to 255 each can produce up to 65025. Without bounds,
+// omega rejects.
+test_verify_one_file! {
+    #[test] test_exec_mul_overflow_fails verus_code! {
+        #[verifier::tactus_auto]
+        fn mul_u8(x: u8, y: u8) -> (r: u8)
+            ensures r == x * y
+        {
+            x * y
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "u8 mul without bounds should fail");
+    }
+}
+
+// u32 arithmetic: exercises the wider range (bound `2^32`). Uses a
+// precondition that's tight enough for omega to discharge.
+test_verify_one_file! {
+    #[test] test_exec_u32_add_guarded verus_code! {
+        #[verifier::tactus_auto]
+        fn add_u32(x: u32, y: u32) -> (r: u32)
+            requires x < 1_000_000, y < 1_000_000
+            ensures r == x + y
+        {
+            x + y
+        }
+    } => Ok(())
+}
+
+// `u8::MAX` in a spec context. Verus emits this as
+// `IntegerTypeBound(UnsignedMax, _)` applied to literal bit-width 8;
+// until this session that rendered as `True` and any test touching it
+// failed with a Lean type error. Now it's `255`.
+test_verify_one_file! {
+    #[test] test_exec_integer_type_bound_u8_max verus_code! {
+        #[verifier::tactus_auto]
+        fn near_max(x: u8) -> (r: u8)
+            requires x < u8::MAX
+            ensures r == x + 1
+        {
+            x + 1
+        }
+    } => Ok(())
+}
+
+// `i8::MAX` — SignedMax, which Verus emits as `2^(bits-1) - 1`.
+test_verify_one_file! {
+    #[test] test_exec_integer_type_bound_i8_max verus_code! {
+        #[verifier::tactus_auto]
+        fn near_max_i8(x: i8) -> (r: i8)
+            requires x < i8::MAX
+            ensures r as int == x as int + 1
+        {
+            x + 1
+        }
+    } => Ok(())
 }
 
 // Mutation visible only within one branch must not leak past the if.
@@ -2219,3 +2299,4 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
