@@ -232,6 +232,16 @@ impl Expr {
     pub fn type_annot(expr: Expr, ty: Expr) -> Self {
         Expr::new(ExprNode::TypeAnnot { expr: Box::new(expr), ty: Box::new(ty) })
     }
+
+    pub fn forall(binders: Vec<Binder>, body: Expr) -> Self {
+        Expr::new(ExprNode::Forall { binders, body: Box::new(body) })
+    }
+    pub fn exists_(binders: Vec<Binder>, body: Expr) -> Self {
+        Expr::new(ExprNode::Exists { binders, body: Box::new(body) })
+    }
+    pub fn lambda(binders: Vec<Binder>, body: Expr) -> Self {
+        Expr::new(ExprNode::Lambda { binders, body: Box::new(body) })
+    }
 }
 
 #[derive(Debug, Clone)]

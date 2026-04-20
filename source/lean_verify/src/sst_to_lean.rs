@@ -103,6 +103,8 @@
 //! `BinOp::And` / `BinOp::Implies` / `UnOp::Not` / `Let` without worrying
 //! about parens.
 
+use std::collections::{HashMap, HashSet};
+
 use vir::sst::{
     BndX, CallFun, Dest, Exp, ExpX, FuncCheckSst, FunctionSst, LoopInv, Par, Stm, StmX,
 };
@@ -164,52 +166,7 @@ fn check_stm(stm: &Stm) -> Result<(), String> {
             check_stm(then_stm)?;
             else_stm.as_ref().map_or(Ok(()), |e| check_stm(e))
         }
-        StmX::Loop {
-            loop_isolation, cond, body, invs, decrease, modified_vars, ..
-        } => {
-            if !loop_isolation {
-                return Err(
-                    "non-isolated loops (loop_isolation: false) not yet supported".to_string()
-                );
-            }
-            let Some((cond_setup, cond_exp)) = cond else {
-                return Err("loops without a simple `while` condition not yet supported".to_string());
-            };
-            // The condition setup block must be empty — complex condition
-            // expressions that desugar into statements aren't supported.
-            if !matches!(&cond_setup.x, StmX::Block(ss) if ss.is_empty()) {
-                return Err(
-                    "loop condition with setup statements not yet supported".to_string()
-                );
-            }
-            if decrease.len() != 1 {
-                return Err(format!(
-                    "loop `decreases` must be a single expression (got {})", decrease.len()
-                ));
-            }
-            if !invs.iter().all(|i| i.at_entry && i.at_exit) {
-                return Err(
-                    "loop invariants must hold at both entry and exit (not \
-                     invariant_except_break / ensures)".to_string()
-                );
-            }
-            // Verus may or may not populate `modified_vars` at this
-            // stage of the pipeline (it's computed on the way into
-            // sst_to_air, which we're not going through). We don't
-            // rely on it — we recompute the set ourselves from the
-            // body's `StmX::Assign` LHSs. Flag as "ignored" to make
-            // the binding explicit.
-            let _ = modified_vars;
-            check_exp(cond_exp)?;
-            check_stm(body)?;
-            for inv in invs.iter() {
-                check_exp(&inv.inv)?;
-            }
-            for d in decrease.iter() {
-                check_exp(d)?;
-            }
-            Ok(())
-        }
+        StmX::Loop { .. } => check_loop(&stm.x),
         StmX::Call { .. } => Err("function calls in exec fn body not yet supported".to_string()),
         StmX::BreakOrContinue { .. } => Err("break/continue not yet supported".to_string()),
         StmX::AssertBitVector { .. } => Err("assert by(bit_vector) not yet supported".to_string()),
@@ -218,6 +175,59 @@ fn check_stm(stm: &Stm) -> Result<(), String> {
         StmX::OpenInvariant(_) => Err("OpenInvariant not yet supported".to_string()),
         StmX::ClosureInner { .. } => Err("exec closures not yet supported".to_string()),
     }
+}
+
+/// Validate a `StmX::Loop` against the shape restrictions documented at
+/// the top of the module: `loop_isolation: true`, simple `while`
+/// condition with no setup stmts, single-expression `decreases`, and
+/// invariants true at both entry and exit. Recurses into the body +
+/// invariants + decrease-expression via `check_stm` / `check_exp`.
+fn check_loop(stm: &StmX) -> Result<(), String> {
+    let StmX::Loop {
+        loop_isolation, cond, body, invs, decrease, modified_vars, ..
+    } = stm else {
+        unreachable!("check_loop called on non-loop statement");
+    };
+    if !loop_isolation {
+        return Err(
+            "non-isolated loops (loop_isolation: false) not yet supported".to_string()
+        );
+    }
+    let Some((cond_setup, cond_exp)) = cond else {
+        return Err("loops without a simple `while` condition not yet supported".to_string());
+    };
+    // The condition setup block must be empty — complex condition
+    // expressions that desugar into statements aren't supported.
+    if !matches!(&cond_setup.x, StmX::Block(ss) if ss.is_empty()) {
+        return Err(
+            "loop condition with setup statements not yet supported".to_string()
+        );
+    }
+    if decrease.len() != 1 {
+        return Err(format!(
+            "loop `decreases` must be a single expression (got {})", decrease.len()
+        ));
+    }
+    if !invs.iter().all(|i| i.at_entry && i.at_exit) {
+        return Err(
+            "loop invariants must hold at both entry and exit (not \
+             invariant_except_break / ensures)".to_string()
+        );
+    }
+    // `modified_vars` is computed on the way into `sst_to_air`, which
+    // we don't go through. `walk` recomputes the set from the body's
+    // `StmX::Assign` LHSs itself, so we just acknowledge the field
+    // here for the exhaustive match and otherwise ignore it.
+    let _ = modified_vars;
+    check_exp(cond_exp)?;
+    check_stm(body)?;
+    for inv in invs.iter() {
+        check_exp(&inv.inv)?;
+    }
+    for d in decrease.iter() {
+        check_exp(d)?;
+    }
+    Ok(())
 }
 
 fn check_exp(e: &Exp) -> Result<(), String> {
@@ -283,7 +293,7 @@ pub fn exec_fn_theorems_to_ast(fn_sst: &FunctionSst, check: &FuncCheckSst) -> Ve
 
     // `check.local_decls` → type lookup for modified-var bounds when a
     // loop emits its havoc quantification.
-    let type_map: std::collections::HashMap<&VarIdent, &Typ> = check.local_decls.iter()
+    let type_map: HashMap<&VarIdent, &Typ> = check.local_decls.iter()
         .map(|d| (&d.ident, &d.typ))
         .collect();
 
@@ -305,27 +315,18 @@ fn simple_tactic() -> Tactic {
     Tactic::Named("tactus_auto".to_string())
 }
 
-/// Loop theorems have a conjunctive shape `init ∧ maintain ∧ use`
-/// per loop; nested / sequential loops produce nested conjunctions
-/// of the same shape. Structural peeling belongs at emit time because
-/// we know the shape, but we don't know a priori how deeply nested it
-/// is: sequential loops chain, loops inside if-branches compose with
-/// the branch's `c → …`, and nested loops stack within maintain.
-///
-/// `repeat'` recursively peels any top-level `∧` (via `apply
-/// And.intro`) and any leading `∀` / `→` (via `intro`) across all
-/// open goals until no more structural splitting is possible. The
-/// resulting leaves are arithmetic; `tactus_auto` closes each.
+/// Loop theorems have a conjunctive shape `init ∧ maintain ∧ use` per
+/// loop; nested / sequential loops produce nested conjunctions of the
+/// same shape. The goal can therefore be arbitrarily deeply structured,
+/// so we delegate to `tactus_peel` (defined in `TactusPrelude.lean`) —
+/// a recursive macro that strips one layer of `∧` or one `∀` / `→`
+/// per call and bottoms out at arithmetic leaves. `all_goals
+/// tactus_auto` then closes each leaf. No hardcoded depth — the
+/// recursion follows the goal's structure, so deeply-nested loops
+/// work the same as shallow ones.
 fn loop_tactic() -> Tactic {
-    // `tactus_peel` (defined in TactusPrelude.lean) recursively splits
-    // `∧`s and introduces `∀` / `→` binders across all subgoals,
-    // terminating naturally at arithmetic leaves. Then
-    // `all_goals tactus_auto` closes each leaf. No hardcoded depth —
-    // the recursion follows the goal's structure, so deeply-nested
-    // loops work the same as shallow ones.
     Tactic::Raw("tactus_peel; all_goals tactus_auto".to_string())
 }
-
 
 // ── Binder builders ────────────────────────────────────────────────────
 
@@ -482,10 +483,20 @@ fn build_loop_conjunction(
     let init_clause = inv_conj();
 
     // Maintain: `∀ mod_vars, bounds → I ∧ cond →
-    //              (let d_old := D; wp(body, I ∧ D < d_old))`.
-    // The `let d_old := D` captures the decrease measure before the
-    // body runs; the inner `D` after any mutations inside body has
-    // shadowed the relevant variable will refer to the new value.
+    //              (let _tactus_d_old := D; wp(body, I ∧ D < _tactus_d_old))`.
+    // The let-binding captures the decrease measure before the body
+    // runs; the inner `D` after body mutations shadow the relevant
+    // variable refers to the new value.
+    //
+    // We reuse the literal name `_tactus_d_old` for every loop. For
+    // nested loops this means the inner `let _tactus_d_old := D_inner`
+    // shadows the outer's binding — which works out because the
+    // shadow is confined to the inner's maintain clause (its own
+    // conjunct), and the outer's reference to `_tactus_d_old` lives
+    // in the outer's maintain (a different conjunct). See DESIGN.md
+    // "_tactus_d_old aliasing across nested loops" — a gensym'd
+    // name per loop would make the scoping more obvious but isn't
+    // needed for correctness.
     let post_body = LExpr::and(
         inv_conj(),
         LExpr::lt(decrease_ast(), LExpr::var("_tactus_d_old")),
@@ -515,7 +526,6 @@ fn quantify_mod_vars(
     modified_vars: &[(&VarIdent, &Typ)],
     body: LExpr,
 ) -> LExpr {
-    use crate::lean_ast::ExprNode;
     let mut out = body;
     // Fold right-to-left so the outermost ∀ is the first modified var.
     for (ident, typ) in modified_vars.iter().rev() {
@@ -525,12 +535,14 @@ fn quantify_mod_vars(
             out = LExpr::implies(pred, out);
         }
         // Then wrap with `∀ (x : T), …`.
-        let binder = LBinder {
-            name: Some(name),
-            ty: typ_to_expr(typ),
-            kind: BinderKind::Explicit,
-        };
-        out = LExpr::new(ExprNode::Forall { binders: vec![binder], body: Box::new(out) });
+        out = LExpr::forall(
+            vec![LBinder {
+                name: Some(name),
+                ty: typ_to_expr(typ),
+                kind: BinderKind::Explicit,
+            }],
+            out,
+        );
     }
     out
 }
@@ -599,7 +611,7 @@ impl<'a> BodyItem<'a> {
 /// type of each modified variable.
 fn walk<'a>(
     stm: &'a Stm,
-    type_map: &std::collections::HashMap<&'a VarIdent, &'a Typ>,
+    type_map: &HashMap<&'a VarIdent, &'a Typ>,
 ) -> Vec<BodyItem<'a>> {
     match &stm.x {
         StmX::Block(stms) => stms.iter().flat_map(|s| walk(s, type_map)).collect(),
@@ -630,8 +642,7 @@ fn walk<'a>(
             // SST we receive here; computing it ourselves works
             // regardless of pipeline stage.
             let mut mod_names: Vec<&'a VarIdent> = Vec::new();
-            let mut locally_declared: std::collections::HashSet<&'a VarIdent> =
-                std::collections::HashSet::new();
+            let mut locally_declared: HashSet<&'a VarIdent> = HashSet::new();
             collect_modifications(body, &mut locally_declared, &mut mod_names);
             let modified_vars: Vec<(&'a VarIdent, &'a Typ)> = mod_names.into_iter()
                 .filter_map(|id| type_map.get(id).map(|typ| (id, *typ)))
@@ -674,7 +685,7 @@ fn walk<'a>(
 /// inner loop still counts as modified by the outer.
 fn collect_modifications<'a>(
     stm: &'a Stm,
-    locally_declared: &mut std::collections::HashSet<&'a VarIdent>,
+    locally_declared: &mut HashSet<&'a VarIdent>,
     out: &mut Vec<&'a VarIdent>,
 ) {
     match &stm.x {
@@ -710,7 +721,6 @@ fn extract_simple_var_ident<'a>(e: &'a Exp) -> Option<&'a VarIdent> {
 fn extract_simple_var<'a>(e: &'a Exp) -> Option<&'a str> {
     extract_simple_var_ident(e).map(|id| id.0.as_str())
 }
-
 
 /// Verus injects synthetic params (`no%param`, etc.) with `%` in the
 /// name for zero-arg functions and a few internal cases. They have no
