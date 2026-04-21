@@ -141,173 +141,34 @@ pub fn build_fn_map(krate: &KrateX) -> FnMap<'_> {
     krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect()
 }
 
-// ── Support check ──────────────────────────────────────────────────────
+// ── Support check (helpers) ────────────────────────────────────────────
 //
-// Before building any AST, we walk the whole `FuncCheckSst` and confirm
-// every statement and every expression is something we know how to emit.
+// The main validation is fused into `walk` below — a single pass that
+// both checks shape constraints and builds the `BodyItem` sequence. The
+// helpers here are the reusable bits.
 
-/// Confirm the function's body, requires, and ensures only use SST forms
-/// that `sst_to_lean` currently knows how to emit. The `fn_map` is used
-/// to validate that every called fn's spec is available for inlining.
-pub fn supported_body(check: &FuncCheckSst, fn_map: &FnMap<'_>) -> Result<(), String> {
-    check_stm(&check.body, fn_map)?;
-    for req in check.reqs.iter() {
-        check_exp(req)?;
-    }
-    for ens in check.post_condition.ens_exps.iter() {
-        check_exp(ens)?;
-    }
-    Ok(())
+/// Iterate over the callee's real (non-synthetic) parameters. Synthetic
+/// params carry `%` in their name (see `is_synthetic_param`); Verus's
+/// call-site arg list omits them, so after this filter the param count
+/// aligns positionally with `StmX::Call { args }`.
+fn real_params(callee: &FunctionX) -> impl Iterator<Item = &vir::ast::Param> {
+    callee.params.iter().filter(|p| !p.x.name.0.contains('%'))
 }
 
-fn check_stm(stm: &Stm, fn_map: &FnMap<'_>) -> Result<(), String> {
-    match &stm.x {
-        StmX::Block(stms) => stms.iter().try_for_each(|s| check_stm(s, fn_map)),
-        StmX::Assign { lhs: Dest { dest, .. }, rhs } => {
-            check_exp(dest)?;
-            check_exp(rhs)?;
-            // `walk` can only turn simple-var LHS assignments into
-            // `let` bindings; anything fancier (field writes, index
-            // writes, tuple destructure) would be silently dropped,
-            // which is a soundness hazard. Reject upfront so the
-            // user sees a clear "not yet supported" instead of a
-            // spurious pass.
-            if extract_simple_var(dest).is_none() {
-                return Err(format!(
-                    "assignment with non-simple LHS (got {:?}) is not yet supported",
-                    dest.x
-                ));
-            }
-            Ok(())
+/// Does this expression — or any transparently-wrapped inner — use
+/// `ExpX::Loc`? `Loc` marks an L-value (`&mut` argument site). We peel
+/// the same transparent wrappers as `lift_if_value` so a mutable borrow
+/// buried under `Box` / `Unbox` / `CoerceMode` / `Trigger` is still
+/// detected rather than silently accepted as by-value.
+fn contains_loc(e: &Exp) -> bool {
+    match &e.x {
+        ExpX::Loc(_) => true,
+        ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner)
+        | ExpX::Unary(UnaryOp::CoerceMode { .. } | UnaryOp::Trigger(_), inner) => {
+            contains_loc(inner)
         }
-        // `inside_body` distinguishes a tail return from an "early"
-        // return (one with code after it in the same block). Both
-        // exit the fn; the `walk` / `build_goal` pipeline already
-        // handles them uniformly — each `Return` terminates its
-        // item list and subsequent items get dropped on that branch.
-        // See the "early return" section of the module doc.
-        StmX::Return { ret_exp: Some(e), .. } => check_exp(e),
-        StmX::Return { ret_exp: None, .. } => Ok(()),
-        StmX::Assert(_, _, e) | StmX::Assume(e) => check_exp(e),
-        StmX::AssertCompute(_, e, _) => check_exp(e),
-        StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => Ok(()),
-        StmX::If(cond, then_stm, else_stm) => {
-            check_exp(cond)?;
-            check_stm(then_stm, fn_map)?;
-            else_stm.as_ref().map_or(Ok(()), |e| check_stm(e, fn_map))
-        }
-        StmX::Loop { .. } => check_loop(&stm.x, fn_map),
-        StmX::Call { .. } => check_call(&stm.x, fn_map),
-        StmX::BreakOrContinue { .. } => Err(
-            "break/continue not yet supported".to_string()
-        ),
-        StmX::AssertBitVector { .. } => Err("assert by(bit_vector) not yet supported".to_string()),
-        StmX::AssertQuery { .. } => Err("assert by(...) queries not yet supported".to_string()),
-        StmX::DeadEnd(_) => Err("DeadEnd not yet supported".to_string()),
-        StmX::OpenInvariant(_) => Err("OpenInvariant not yet supported".to_string()),
-        StmX::ClosureInner { .. } => Err("exec closures not yet supported".to_string()),
+        _ => false,
     }
-}
-
-/// Validate a `StmX::Loop` against the shape restrictions documented at
-/// the top of the module: `loop_isolation: true`, simple `while`
-/// condition with no setup stmts, single-expression `decreases`, and
-/// invariants true at both entry and exit. Recurses into the body +
-/// invariants + decrease-expression via `check_stm` / `check_exp`.
-/// Validate a `StmX::Call`: must be a direct named call to a fn we
-/// have the signature for, no trait-method dispatch, no by-`&mut`
-/// args, no generic type arguments. The last two restrictions can be
-/// lifted later with more plumbing; the first just reflects that we
-/// only inline callee specs and don't resolve dispatch ourselves.
-fn check_call(stm: &StmX, fn_map: &FnMap<'_>) -> Result<(), String> {
-    let StmX::Call {
-        fun, resolved_method, typ_args, args, split, ..
-    } = stm else {
-        unreachable!("check_call called on non-Call statement");
-    };
-    if resolved_method.is_some() {
-        return Err(
-            "calls to trait methods (requiring dynamic dispatch resolution) are not \
-             yet supported".to_string()
-        );
-    }
-    if split.is_some() {
-        return Err(
-            "calls with split-assertion error reporting are not yet supported".to_string()
-        );
-    }
-    if !typ_args.is_empty() {
-        return Err(
-            "calls to generic functions (non-empty type args) are not yet supported".to_string()
-        );
-    }
-    if !fn_map.contains_key(fun) {
-        return Err(format!(
-            "callee `{:?}` not found in the crate's function map — cross-crate calls are \
-             not yet supported",
-            fun.path
-        ));
-    }
-    for a in args.iter() {
-        // `ExpX::Loc` shows up when an argument is passed by `&mut`
-        // reference. We only support by-value arguments for now —
-        // `&mut` needs havoc-after-call semantics.
-        if matches!(&a.x, ExpX::Loc(_)) {
-            return Err(
-                "calls with `&mut` arguments are not yet supported".to_string()
-            );
-        }
-        check_exp(a)?;
-    }
-    Ok(())
-}
-
-fn check_loop(stm: &StmX, fn_map: &FnMap<'_>) -> Result<(), String> {
-    let StmX::Loop {
-        loop_isolation, cond, body, invs, decrease, modified_vars, ..
-    } = stm else {
-        unreachable!("check_loop called on non-loop statement");
-    };
-    if !loop_isolation {
-        return Err(
-            "non-isolated loops (loop_isolation: false) not yet supported".to_string()
-        );
-    }
-    let Some((cond_setup, cond_exp)) = cond else {
-        return Err("loops without a simple `while` condition not yet supported".to_string());
-    };
-    // The condition setup block must be empty — complex condition
-    // expressions that desugar into statements aren't supported.
-    if !matches!(&cond_setup.x, StmX::Block(ss) if ss.is_empty()) {
-        return Err(
-            "loop condition with setup statements not yet supported".to_string()
-        );
-    }
-    if decrease.len() != 1 {
-        return Err(format!(
-            "loop `decreases` must be a single expression (got {})", decrease.len()
-        ));
-    }
-    if !invs.iter().all(|i| i.at_entry && i.at_exit) {
-        return Err(
-            "loop invariants must hold at both entry and exit (not \
-             invariant_except_break / ensures)".to_string()
-        );
-    }
-    // `modified_vars` is computed on the way into `sst_to_air`, which
-    // we don't go through. `walk` recomputes the set from the body's
-    // `StmX::Assign` LHSs itself, so we just acknowledge the field
-    // here for the exhaustive match and otherwise ignore it.
-    let _ = modified_vars;
-    check_exp(cond_exp)?;
-    check_stm(body, fn_map)?;
-    for inv in invs.iter() {
-        check_exp(&inv.inv)?;
-    }
-    for d in decrease.iter() {
-        check_exp(d)?;
-    }
-    Ok(())
 }
 
 fn check_exp(e: &Exp) -> Result<(), String> {
@@ -361,16 +222,30 @@ fn check_exp(e: &Exp) -> Result<(), String> {
 
 /// Build the Lean `Theorem`s for an exec fn body check.
 ///
-/// Precondition: `supported_body(check)` returned `Ok(())`. Returns a
-/// `Vec` because future slices may want to split obligations into
-/// separate theorems (e.g., for per-loop diagnostics); today it's
+/// Returns a `Vec` because future slices may want to split obligations
+/// into separate theorems (e.g., for per-loop diagnostics); today it's
 /// always length 1 — loops contribute conjuncts to the main goal
 /// rather than their own top-level theorems.
+///
+/// Returns `Err` if any part of `check` uses an SST form we don't know
+/// how to emit. Validation and AST construction share a single pass
+/// (`walk`) so the "validate-first" precondition is enforced by
+/// construction — there's no way to produce `BodyItem`s without having
+/// already cleared the shape checks.
 pub fn exec_fn_theorems_to_ast(
     fn_sst: &FunctionSst,
     check: &FuncCheckSst,
     fn_map: &FnMap<'_>,
-) -> Vec<Theorem> {
+) -> Result<Vec<Theorem>, String> {
+    // Expressions in requires/ensures aren't walked (they aren't
+    // statements), so validate them separately here.
+    for req in check.reqs.iter() {
+        check_exp(req)?;
+    }
+    for ens in check.post_condition.ens_exps.iter() {
+        check_exp(ens)?;
+    }
+
     let name = format!("_tactus_body_{}", lean_name(&fn_sst.x.name.path));
     let mut binders = build_param_binders(fn_sst);
     binders.extend(build_req_binders(check));
@@ -381,7 +256,7 @@ pub fn exec_fn_theorems_to_ast(
         .map(|d| (&d.ident, &d.typ))
         .collect();
 
-    let items = walk(&check.body, &type_map, fn_map);
+    let items = walk(&check.body, &type_map, fn_map)?;
     let has_loop_or_call = items.iter().any(BodyItem::needs_peel);
     let goal = build_goal(
         &items,
@@ -390,7 +265,7 @@ pub fn exec_fn_theorems_to_ast(
         fn_map,
     );
     let tactic = if has_loop_or_call { loop_tactic() } else { simple_tactic() };
-    vec![Theorem { name, binders, goal, tactic }]
+    Ok(vec![Theorem { name, binders, goal, tactic }])
 }
 
 /// Atomic `tactus_auto` for straight-line exec fn theorems — their
@@ -708,25 +583,35 @@ fn build_call_conjunction(
     terminator: &LExpr,
     fn_map: &FnMap<'_>,
 ) -> LExpr {
-    // Filter out Verus-synthetic params (same `%` filter as
-    // `build_param_binders`). The arg list Verus emits is aligned
-    // with the real params, so skipping the synthetic ones on the
-    // callee side also skips their positional slot in `args`.
-    let real_params: Vec<_> = callee.params.iter()
-        .filter(|p| !p.x.name.0.contains('%'))
-        .collect();
-    debug_assert_eq!(
-        real_params.len(), args.len(),
-        "callee real-param count {} != caller arg count {} for {:?}",
-        real_params.len(), args.len(), callee.name.path,
+    // Filter out Verus-synthetic params (same `%` filter `walk_call`
+    // uses). The arg list Verus emits is aligned with the real params,
+    // so skipping the synthetic ones on the callee side also skips
+    // their positional slot in `args`.
+    //
+    // `walk_call` has already verified `real_params(callee).count() ==
+    // args.len()` before producing this `BodyItem::Call`, so zipping
+    // cannot silently truncate. We keep an unconditional assert as
+    // defense-in-depth: if a future refactor produces `BodyItem::Call`
+    // through a different path, this fires immediately rather than
+    // binding the wrong variables silently.
+    let real_params_vec: Vec<_> = real_params(callee).collect();
+    assert_eq!(
+        real_params_vec.len(), args.len(),
+        "callee real-param count {} != caller arg count {} for {:?} — \
+         walk_call should have rejected this",
+        real_params_vec.len(), args.len(), callee.name.path,
     );
+
+    // Render each arg's Lean expression once; reuse across the
+    // requires wrap and the ensures wrap.
+    let arg_asts: Vec<LExpr> = args.iter().map(|a| sst_exp_to_ast(a)).collect();
 
     // Wrap a goal `inner` with `let p1 := arg1; let p2 := arg2; …;
     // inner` so the callee's param names resolve to the caller's
     // argument expressions without needing a tree-rewrite pass.
     let wrap_with_arg_lets = |inner: LExpr| -> LExpr {
-        real_params.iter().zip(args.iter()).rev().fold(inner, |acc, (p, arg)| {
-            LExpr::let_bind(sanitize(&p.x.name.0), sst_exp_to_ast(arg), acc)
+        real_params_vec.iter().zip(arg_asts.iter()).rev().fold(inner, |acc, (p, arg_ast)| {
+            LExpr::let_bind(sanitize(&p.x.name.0), arg_ast.clone(), acc)
         })
     };
 
@@ -876,92 +761,256 @@ impl<'a> BodyItem<'a> {
     }
 }
 
-/// Flatten an SST statement tree into a sequence of `BodyItem`s. A
-/// `Block` concatenates its children's flattenings; `If` / `Loop`
-/// become their own composite items whose sub-bodies are recursively
-/// flattened; transparent forms (`Air`, `Fuel`, `RevealString`)
-/// contribute nothing; and variants rejected by `check_stm` are
-/// unreachable. `type_map` is threaded through so loops can attach the
-/// type of each modified variable.
+/// Flatten an SST statement tree into a sequence of `BodyItem`s, while
+/// simultaneously validating every shape we see. A `Block` concatenates
+/// its children's flattenings; `If` / `Loop` become their own composite
+/// items whose sub-bodies are recursively flattened; transparent forms
+/// (`Air`, `Fuel`, `RevealString`) contribute nothing; and any variant
+/// we don't know how to emit — plus any disallowed shape nested inside
+/// one we do — becomes an `Err("… not yet supported")` that bubbles up
+/// through the call chain.
+///
+/// Fusing validation with transformation means the "supported_body ran
+/// first" precondition is enforced by construction: there's no way to
+/// reach the body of `exec_fn_theorems_to_ast` with unchecked `BodyItem`s
+/// because `walk` is the only producer. Previously this was a runtime
+/// invariant guarded by `.expect`; now it's a type-level one guarded by
+/// `Result`.
+///
+/// `type_map` is threaded through so loops can attach the type of each
+/// modified variable; `fn_map` is threaded so calls can look up the
+/// callee's `FunctionX`.
 fn walk<'a>(
     stm: &'a Stm,
     type_map: &HashMap<&'a VarIdent, &'a Typ>,
     fn_map: &FnMap<'a>,
-) -> Vec<BodyItem<'a>> {
+) -> Result<Vec<BodyItem<'a>>, String> {
     match &stm.x {
-        StmX::Block(stms) => stms.iter().flat_map(|s| walk(s, type_map, fn_map)).collect(),
+        StmX::Block(stms) => {
+            let mut out: Vec<BodyItem<'a>> = Vec::new();
+            for s in stms.iter() {
+                out.extend(walk(s, type_map, fn_map)?);
+            }
+            Ok(out)
+        }
         StmX::Assign { lhs: Dest { dest, .. }, rhs } => {
-            extract_simple_var(dest).map_or_else(Vec::new, |name| vec![BodyItem::Let(name, rhs)])
+            check_exp(dest)?;
+            check_exp(rhs)?;
+            // `BodyItem::Let` needs a simple-var LHS; anything fancier
+            // (field writes, index writes, tuple destructure) would
+            // need a different WP shape. Reject upfront so the user
+            // sees a clear "not yet supported" instead of a silent
+            // drop.
+            let Some(name) = extract_simple_var(dest) else {
+                return Err(format!(
+                    "assignment with non-simple LHS (got {:?}) is not yet supported",
+                    dest.x
+                ));
+            };
+            Ok(vec![BodyItem::Let(name, rhs)])
         }
-        StmX::Assert(_, _, e) | StmX::AssertCompute(_, e, _) => vec![BodyItem::Assert(e)],
-        StmX::Assume(e) => vec![BodyItem::Assume(e)],
-        // `ret_exp: Some` — normal tail return (top-level or ending a
-        // branch). `ret_exp: None` is a unit return; contributes nothing.
-        StmX::Return { ret_exp: Some(e), .. } => vec![BodyItem::Return(e)],
-        StmX::Return { ret_exp: None, .. } => Vec::new(),
-        StmX::If(cond, then_stm, else_stm) => vec![BodyItem::IfThenElse {
-            cond,
-            then_items: walk(then_stm, type_map, fn_map),
-            else_items: else_stm.as_ref().map_or_else(Vec::new, |e| walk(e, type_map, fn_map)),
-        }],
-        StmX::Call { fun, args, dest, .. } => {
-            let callee = fn_map.get(fun).copied()
-                .expect("check_call guarantees the callee is in the map");
-            let arg_refs: Vec<&'a Exp> = args.iter().collect();
-            // `Dest { dest: <Exp>, is_init: _ }` — extract the simple
-            // var name + its type. `None` if the call discards the
-            // result (`foo(…);` without `let x =`).
-            let bound_dest: Option<(&'a VarIdent, &'a Typ)> = dest.as_ref().and_then(|d| {
-                let ident = extract_simple_var_ident(&d.dest)?;
-                let typ = type_map.get(ident).copied()?;
-                Some((ident, typ))
-            });
-            vec![BodyItem::Call {
-                callee,
-                args: arg_refs,
-                dest: bound_dest,
-            }]
+        StmX::Assert(_, _, e) | StmX::AssertCompute(_, e, _) => {
+            check_exp(e)?;
+            Ok(vec![BodyItem::Assert(e)])
         }
-        StmX::Loop { cond, body, invs, decrease, .. } => {
-            let (_, cond_exp) = cond.as_ref().expect("check_stm guarantees Some cond");
-            let decrease_exp = decrease.first().expect("check_stm guarantees one decrease");
-            // Compute modified vars from the loop body's *non-init*
-            // assignments — `let mut x = …` inside the body is local
-            // to each iteration and shouldn't leak into the outer
-            // quantification. (Nested loops use the same logic
-            // recursively, so an inner loop's local decls stay local
-            // even when the outer loop computes its own modified set.)
-            // Verus's own `modified_vars` field isn't populated on the
-            // SST we receive here; computing it ourselves works
-            // regardless of pipeline stage.
-            let mut mod_names: Vec<&'a VarIdent> = Vec::new();
-            let mut locally_declared: HashSet<&'a VarIdent> = HashSet::new();
-            collect_modifications(body, &mut locally_declared, &mut mod_names);
-            let modified_vars: Vec<(&'a VarIdent, &'a Typ)> = mod_names.into_iter()
-                .filter_map(|id| type_map.get(id).map(|typ| (id, *typ)))
-                .collect();
-            vec![BodyItem::Loop {
-                cond: cond_exp,
-                invs: &invs[..],
-                decrease: decrease_exp,
-                modified_vars,
-                body_items: walk(body, type_map, fn_map),
-            }]
+        StmX::Assume(e) => {
+            check_exp(e)?;
+            Ok(vec![BodyItem::Assume(e)])
         }
+        // `inside_body` distinguishes a tail return from an "early"
+        // return (one with code after it in the same block). Both
+        // exit the fn; `build_goal_with_terminator` handles them
+        // uniformly — each `Return` terminates its item list and
+        // subsequent items get dropped on that branch.
+        StmX::Return { ret_exp: Some(e), .. } => {
+            check_exp(e)?;
+            Ok(vec![BodyItem::Return(e)])
+        }
+        StmX::Return { ret_exp: None, .. } => Ok(Vec::new()),
+        StmX::If(cond, then_stm, else_stm) => {
+            check_exp(cond)?;
+            let then_items = walk(then_stm, type_map, fn_map)?;
+            let else_items = match else_stm {
+                Some(e) => walk(e, type_map, fn_map)?,
+                None => Vec::new(),
+            };
+            Ok(vec![BodyItem::IfThenElse { cond, then_items, else_items }])
+        }
+        StmX::Call { .. } => walk_call(stm, type_map, fn_map),
+        StmX::Loop { .. } => walk_loop(stm, type_map, fn_map),
         // Transparent in SST: contribute nothing to the WP goal.
-        StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => Vec::new(),
-        // All rejected by `check_stm`. Reaching them here means the
-        // support-check and the walker fell out of sync.
-        StmX::BreakOrContinue { .. }
-        | StmX::AssertBitVector { .. }
-        | StmX::AssertQuery { .. }
-        | StmX::DeadEnd(_)
-        | StmX::OpenInvariant(_)
-        | StmX::ClosureInner { .. } => unreachable!(
-            "sst_to_lean::walk: {:?} should have been rejected by supported_body",
-            stm.x
+        StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => Ok(Vec::new()),
+        StmX::BreakOrContinue { .. } => Err(
+            "break/continue not yet supported".to_string()
         ),
+        StmX::AssertBitVector { .. } => Err(
+            "assert by(bit_vector) not yet supported".to_string()
+        ),
+        StmX::AssertQuery { .. } => Err(
+            "assert by(...) queries not yet supported".to_string()
+        ),
+        StmX::DeadEnd(_) => Err("DeadEnd not yet supported".to_string()),
+        StmX::OpenInvariant(_) => Err("OpenInvariant not yet supported".to_string()),
+        StmX::ClosureInner { .. } => Err("exec closures not yet supported".to_string()),
     }
+}
+
+/// Validate and build a `BodyItem::Call`. Destructures every field
+/// explicitly (no `..`) so any future Verus field addition forces a
+/// compile error here.
+fn walk_call<'a>(
+    stm: &'a Stm,
+    type_map: &HashMap<&'a VarIdent, &'a Typ>,
+    fn_map: &FnMap<'a>,
+) -> Result<Vec<BodyItem<'a>>, String> {
+    let StmX::Call {
+        fun,
+        resolved_method,
+        mode: _,               // exec-fn bodies only route here
+        is_trait_default,
+        typ_args,
+        args,
+        split,
+        dest,
+        assert_id: _,          // Verus-internal error id, behaviourally inert
+    } = &stm.x else {
+        unreachable!("walk_call called on non-Call statement");
+    };
+    // Reject every known "dispatch isn't just a direct call" shape.
+    if resolved_method.is_some() {
+        return Err(
+            "calls to trait methods (requiring dynamic dispatch resolution) are not \
+             yet supported".to_string()
+        );
+    }
+    if is_trait_default.is_some() {
+        return Err(
+            "calls resolved to a trait's default impl are not yet supported".to_string()
+        );
+    }
+    if split.is_some() {
+        return Err(
+            "calls with split-assertion error reporting are not yet supported".to_string()
+        );
+    }
+    if !typ_args.is_empty() {
+        return Err(
+            "calls to generic functions (non-empty type args) are not yet supported".to_string()
+        );
+    }
+    let Some(callee) = fn_map.get(fun).copied() else {
+        return Err(format!(
+            "callee `{:?}` not found in the crate's function map — cross-crate calls are \
+             not yet supported",
+            fun.path
+        ));
+    };
+    // Param/arg count MUST match after dropping synthetic (`%`-named)
+    // params. If Verus ever changes its arg-passing convention so this
+    // invariant breaks, we want a clean rejection here — not a silent
+    // zip-to-shorter in `build_call_conjunction`, which would bind the
+    // wrong variables and produce a spec that isn't the callee's.
+    let real_param_count = real_params(callee).count();
+    if real_param_count != args.len() {
+        return Err(format!(
+            "callee `{:?}` has {} real param(s) but call site passes {} arg(s) — \
+             synthetic-param filter may be out of sync with Verus's arg-passing \
+             convention; this would bind wrong variables if we proceeded",
+            fun.path, real_param_count, args.len(),
+        ));
+    }
+    for a in args.iter() {
+        // `ExpX::Loc` marks `&mut` args (even under transparent
+        // wrappers). We only support by-value today; `&mut` would
+        // need havoc-after-call semantics.
+        if contains_loc(a) {
+            return Err(
+                "calls with `&mut` arguments are not yet supported".to_string()
+            );
+        }
+        check_exp(a)?;
+    }
+    let arg_refs: Vec<&'a Exp> = args.iter().collect();
+    // Extract the caller's destination var name + type. `None` if the
+    // call discards its result (`foo(…);` without `let x =`).
+    let bound_dest: Option<(&'a VarIdent, &'a Typ)> = dest.as_ref().and_then(|d| {
+        let ident = extract_simple_var_ident(&d.dest)?;
+        let typ = type_map.get(ident).copied()?;
+        Some((ident, typ))
+    });
+    Ok(vec![BodyItem::Call {
+        callee,
+        args: arg_refs,
+        dest: bound_dest,
+    }])
+}
+
+/// Validate and build a `BodyItem::Loop`. See the module doc for the
+/// shape restrictions this enforces.
+fn walk_loop<'a>(
+    stm: &'a Stm,
+    type_map: &HashMap<&'a VarIdent, &'a Typ>,
+    fn_map: &FnMap<'a>,
+) -> Result<Vec<BodyItem<'a>>, String> {
+    let StmX::Loop {
+        loop_isolation, cond, body, invs, decrease, modified_vars: _, ..
+    } = &stm.x else {
+        unreachable!("walk_loop called on non-loop statement");
+    };
+    if !loop_isolation {
+        return Err(
+            "non-isolated loops (loop_isolation: false) not yet supported".to_string()
+        );
+    }
+    let Some((cond_setup, cond_exp)) = cond else {
+        return Err("loops without a simple `while` condition not yet supported".to_string());
+    };
+    if !matches!(&cond_setup.x, StmX::Block(ss) if ss.is_empty()) {
+        return Err(
+            "loop condition with setup statements not yet supported".to_string()
+        );
+    }
+    if decrease.len() != 1 {
+        return Err(format!(
+            "loop `decreases` must be a single expression (got {})", decrease.len()
+        ));
+    }
+    if !invs.iter().all(|i| i.at_entry && i.at_exit) {
+        return Err(
+            "loop invariants must hold at both entry and exit (not \
+             invariant_except_break / ensures)".to_string()
+        );
+    }
+    check_exp(cond_exp)?;
+    for inv in invs.iter() {
+        check_exp(&inv.inv)?;
+    }
+    for d in decrease.iter() {
+        check_exp(d)?;
+    }
+    let decrease_exp = &decrease[0];
+
+    // Compute modified vars from the body's *non-init* assignments —
+    // `let mut x = …` inside the body is local to each iteration and
+    // shouldn't leak into the outer quantification. Nested loops use
+    // the same logic recursively, so an inner loop's local decls stay
+    // local even when the outer loop computes its own modified set.
+    let mut mod_names: Vec<&'a VarIdent> = Vec::new();
+    let mut locally_declared: HashSet<&'a VarIdent> = HashSet::new();
+    collect_modifications(body, &mut locally_declared, &mut mod_names);
+    let modified_vars: Vec<(&'a VarIdent, &'a Typ)> = mod_names.into_iter()
+        .filter_map(|id| type_map.get(id).map(|typ| (id, *typ)))
+        .collect();
+
+    let body_items = walk(body, type_map, fn_map)?;
+
+    Ok(vec![BodyItem::Loop {
+        cond: cond_exp,
+        invs: &invs[..],
+        decrease: decrease_exp,
+        modified_vars,
+        body_items,
+    }])
 }
 
 /// Collect variables that a loop body modifies *externally* — writes

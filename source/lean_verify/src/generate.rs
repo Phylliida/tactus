@@ -214,15 +214,16 @@ pub fn check_exec_fn(
     crate_name: &str,
 ) -> CheckResult {
     let fn_map = sst_to_lean::build_fn_map(krate);
-    if let Err(reason) = sst_to_lean::supported_body(check, &fn_map) {
-        return CheckResult::Failed(format!(
+    let theorems = match sst_to_lean::exec_fn_theorems_to_ast(fn_sst, check, &fn_map) {
+        Ok(ts) => ts,
+        Err(reason) => return CheckResult::Failed(format!(
             "tactus_auto: {} (first slice supports only straight-line exec fns)",
             reason
-        ));
-    }
+        )),
+    };
 
     let (mut cmds, ns) = krate_preamble(krate, imports, crate_name, &[vir_fn]);
-    for theorem in sst_to_lean::exec_fn_theorems_to_ast(fn_sst, check, &fn_map) {
+    for theorem in theorems {
         cmds.push(Command::Theorem(theorem));
     }
     cmds.push(Command::NamespaceClose(ns));
