@@ -3000,6 +3000,43 @@ test_verify_one_file! {
     }
 }
 
+// Mutual recursion across an SCC. Verus's recursion pass inserts
+// `CheckDecreaseHeight` before each cross-fn call in the SCC, same
+// way as self-recursion — our lowering handles both uniformly. This
+// test exercises the path end-to-end so we catch regressions if
+// either the SCC detection upstream changes shape or our
+// CheckDecreaseHeight lowering breaks for mutual-recursion args.
+// Specs are deliberately kept trivial (`r == 0`) so omega can close
+// them — the point here is to check termination plumbing, not
+// to exercise tactic reasoning about mutual-recursion semantics.
+test_verify_one_file! {
+    #[test] test_exec_call_mutual_recursion verus_code! {
+        #[verifier::tactus_auto]
+        fn ping(n: u8) -> (r: u8)
+            ensures r == 0
+            decreases n
+        {
+            if n == 0 {
+                0
+            } else {
+                pong((n - 1) as u8)
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn pong(n: u8) -> (r: u8)
+            ensures r == 0
+            decreases n
+        {
+            if n == 0 {
+                0
+            } else {
+                ping((n - 1) as u8)
+            }
+        }
+    } => Ok(())
+}
+
 // Trait method call — rejected by `walk_call` because the
 // `resolved_method` field is populated (dynamic dispatch resolution
 // that we don't handle yet).
@@ -3029,6 +3066,31 @@ test_verify_one_file! {
         assert!(
             err.errors.iter().any(|e| e.message.contains("not yet supported")),
             "trait-method call should be rejected",
+        );
+    }
+}
+
+// Datatype constructor (Ctor) in exec fn body is rejected — we don't
+// render them yet (would need struct/enum → Lean inductive encoding).
+// The error comes from `sst_exp_to_ast_checked`'s Ctor arm, triggered
+// when walk validates the let-RHS expression.
+test_verify_one_file! {
+    #[test] test_exec_ctor_rejected verus_code! {
+        struct Point { x: u8, y: u8 }
+
+        #[verifier::tactus_auto]
+        fn make_point() -> (r: u8)
+            ensures r == 3
+        {
+            let p = Point { x: 1, y: 2 };
+            p.x + p.y
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("datatype constructors")
+                || e.message.contains("not yet supported")),
+            "Ctor in exec fn body should be rejected, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
         );
     }
 }
