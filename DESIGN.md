@@ -874,6 +874,18 @@ Each one returns `Err("… not yet supported")`; users get a clean rejection ins
 * **`CallFun::InternalFun(_)` other than `CheckDecreaseHeight`** — `CheckDecreaseHeight` is lowered (for int-typed decreases); other `InternalFun` variants rejected.
 * **Non-int `CheckDecreaseHeight`** — datatype-typed decreases need a Lean `height` function encoding. Reject at validation time rather than emit an unsound obligation.
 
+#### Lossy accepted forms (renders but drops info)
+
+Forms we accept and render, but with semantic information dropped. None of these cause unsoundness today — the dropped info is either irrelevant to VC validity or is auxiliary metadata. Listing here so a future behaviour change (e.g., a tactic that *does* use the dropped info) has a bug site to start from.
+
+* **`ExpX::NullaryOpr(_)` renders as `True`.** All nullary operators (e.g., `NoInferSpecForLoopIter`) collapse to `True`. Loses the operator-specific meaning. Safe today because VCs don't depend on it.
+* **`ExpX::WithTriggers(_, inner)` drops the triggers.** We render the inner expression as-is; the attached trigger annotations (used by Z3's quantifier instantiation in Verus's pipeline) are ignored. Lean's tactics don't use them, so no downstream effect.
+* **`BndX::Quant(_, binders, triggers, _)` drops triggers + the trailing param.** Same rationale. Universally-quantified spec clauses render their body correctly; the triggers and whatever the fourth field is get dropped silently.
+* **`ExpX::VarAt(ident, at_label)` treats all VarAt occurrences identically to `Var`.** The `at_label` information (which distinguishes pre-state from post-state references in old-style ensures) is discarded. Acceptable because `ExpX::Old(..)` is already rejected upstream, so at-labels shouldn't arrive with meaning attached. If a future VIR change routes at-state expressions through `VarAt` without going through `Old`, we'd silently conflate them.
+* **`BinaryOp::Xor`** — renders as `App(Var("xor"), [l, r])`. Relies on Lean's `xor` being defined or imported; no test exercises it in an exec-fn body.
+* **`ExpX::Bind(BndX::Choose, ...)` → `Classical.epsilon (fun ... => cond ∧ body)`.** Untested directly; `Classical.epsilon` is total but its behaviour on unsatisfiable `cond` is unspecified. Exec-fn tests don't exercise the Choose shape.
+* **`lift_if_value` only handles single-binder `Bind(Let)`.** Multi-binder lets (`let (a, b) = expr; …`) pass through without peeling. An if-expression buried inside a multi-binder let won't lift to goal level — omega would then see it as a value-position if and fail.
+
 #### Loop-shape restrictions (rejected by `build_wp_loop`)
 
 Only the simplest `while` shape is accepted. All other loop shapes return `Err`.
@@ -899,11 +911,15 @@ Only the simplest `while` shape is accepted. All other loop shapes return `Err`.
 * **`assert(P) by { tactics }`** — user-written tactic bodies for asserts inside exec fns. Currently `StmX::Assert` treats the assert as a leaf obligation closed by `tactus_auto`; user-provided tactic bodies are not plumbed through.
 * **`assume(P)` warnings** — DESIGN.md promises a "unproved assumption" warning. Not wired; `StmX::Assume` emits the hypothesis silently.
 * **Return in the `else` branch of an if** (where `then` falls through) — inverse of `test_exec_early_return`. Untested.
-* **Return inside a loop body** — semantically fn-exit (new DSL writes `ctx.ensures_goal` correctly); no test exercises the shape.
+* **Return inside a loop body** — ✅ covered by `test_exec_return_inside_loop`. Pins the Wp DSL's fn-exit semantics (Return writes `ctx.ensures_goal` regardless of nesting). Loop body's decrease obligation is naturally skipped on the return branch because `Wp::Done` terminates.
 * **Loops modifying multiple variables** — `quantify_mod_vars` handles arbitrary-arity modified sets, but every loop test modifies exactly one var.
 * **Nested if where each branch contains a different loop** — combinatorial coverage gap.
-* **Loop body ending in an early return** — `while c { if p { return 0; } … }`. Should work in principle (early return handling composes through `Wp::Done`), untested.
+* **Loop body ending in an early return** — `while c { if p { return 0; } … }`. The inner return produces `Wp::Done(ensures_goal)` in that branch; maintain clause's post-iteration decrease check is skipped on the return branch only. Should work in principle, untested directly (the `test_exec_return_inside_loop` fn doesn't re-enter the loop after the return).
 * **Bit-width coverage** — only `u8`, `u32`, `i8` tested end-to-end. `u16` / `u64` / `u128` / `i16` / `i32` / `i64` / `i128` go through the same codegen path but lack regression tests.
+* **Direct unit tests for `lower_loop` and `lower_call`** — the two largest lowering functions are only exercised via e2e tests. Constructing the synthetic Wp + FunctionX + arg list to unit-test them is involved; we covered cheaper variants (`Done`/`Let`/`Assert`/`Assume`/`Branch`) directly and trust e2e for the rest.
+* **Name collision: callee's ret name vs caller-scope names** — `lower_call` emits `∀ <ret_name_cal : T>, …` using `sanitize(callee.ret.name.0)`. If the caller has a local variable with the same sanitized name, Lean's ∀ shadows it inside the scope — semantically fine (the ∀ binding is what Verus intends) but visually confusing in the generated Lean. No test pins a collision scenario.
+* **Zero-arg callee spec referencing the dummy param** — for a fn with no user params, Verus injects a `no%param` dummy; our `lower_call` substitutes `{no_param: Const(0)}`. If the callee's `require` / `ensure` ever syntactically references this dummy (they shouldn't, by Verus convention), we'd inline `0` for it — semantically correct but relies on the convention holding.
+* **Non-constant `IntegerTypeBound` bit width** — `const_u32_from_sst` / `_vir` extract the bit width via `.expect("…non-constant bit width…")`. Verus's `IntegerTypeBound(kind, bits)` always has `bits` as a literal for concrete int types, but a const-generic context (`<const N: u32>` as bit width) would panic at codegen. Untested.
 
 #### Tactic / automation limitations
 
@@ -921,6 +937,10 @@ Only the simplest `while` shape is accepted. All other loop shapes return `Err`.
 * **`loop_tactic()` allocates its tactic string on every call** — tiny TODO, see its dedicated section.
 * **`needs_peel` is a recursive tree walk.** Could be a constructor-level bit on `Wp::Loop` / `Wp::Call`, computed once at build time. Constant-cost at realistic sizes; revisit if more variants need peeling.
 * **`substitute` boilerplate.** ~130 lines of per-variant dispatch across `substitute_impl` / `collect_free_vars`. Adding an `ExprNode` variant means editing three places (plus `lean_pp`). A `walk_children` helper or proc-macro would collapse it to ~30 lines — not worth doing yet, worth flagging.
+* **No shape-drift test for `CheckDecreaseHeight` Assert-before-Call ordering.** We have a test for the `cur` arg's Bind(Let) shape (`full_check_decrease_height_shape_pinned`) but not for the pass-ordering invariant ("Assert is inserted before the Call in the SST statement sequence"). A drift here would produce recursive fns that verify without termination checks. Worth adding: construct a self-recursive SST fragment and assert the first `Wp::Assert` precedes the `Wp::Call` in the built Wp tree.
+* **No test that `WpCtx::new` rejects an Err-form req/ensure cleanly.** We have `test_exec_ctor_rejected` for body-path Ctor, but no direct test that a `requires Ctor(...)` clause produces the WpCtx::new Err path (vs. panicking or passing through). Low risk — the validation logic is shared with the body — but a regression guard would be cheap.
+* **`lift_if_value` single-binder Bind(Let) restriction.** Multi-binder lets (`let (a, b) = …; …`) pass through without peeling. If a user writes `let (a, b) = foo(); if x { … } else { … }` the if won't be lifted to goal level — currently fine because such let-patterns aren't common in our tests, but the restriction is implicit.
+* **No direct test of `simplified_krate()` None branch.** Unreachable by design (verify_crate_inner populates it before verify_bucket runs). If a future code path hits the unreachable branch, users see our "pipeline ordering bug" error instead of a panic — but we don't exercise the error path.
 
 #### Phase-3 work (explicit non-goals for current scope)
 
@@ -930,6 +950,24 @@ These are deferred by design — the current slice is single-crate exec+proof-fn
 * **`#[verifier::heartbeats(N)]` attribute** — per-fn Lean `maxHeartbeats` override. DESIGN.md mentions; not wired through `vir::ast::FunctionAttrsX`.
 * **Lean version pinning / CI matrix.** `lean-toolchain` is pinned to `v4.25.0`; tactic behaviour could shift on upgrade. No automated regression against multiple Lean versions.
 * **Per-module `.lean` file generation.** Current design emits one file per fn (`target/tactus-lean/{crate}/{fn}.lean`). At scale, per-module would amortize preamble and olean caching; HANDOFF notes it as future work.
+
+#### Verus-side invariants we depend on
+
+Assumptions about upstream VIR/SST shape or Verus compiler-pass ordering that aren't (and can't straightforwardly be) enforced by Rust's type system. If any of these drift in an upstream rebase, our verification silently mis-compiles or panics. Each has either a shape-drift test, a compile-catch, or a documented fix site.
+
+* **`vir::recursion` inserts `CheckDecreaseHeight` BEFORE the recursive `StmX::Call`.** Our `Wp::Assert` walk relies on this ordering — the assert must appear in the statement sequence strictly before the Call so `build_wp`'s right-to-left fold produces `Assert(CheckDecreaseHeight, Call(...))` rather than `Call(..., Assert(CheckDecreaseHeight))`. If Verus changes the pass to insert after (or inline the check into the call somehow), recursive fns would verify without the termination obligation. **No compile catch; no shape-drift test.** A regression test that constructs a minimal self-recursive SST and verifies the Assert-Call ordering in the walk output would lock this down.
+* **`CheckDecreaseHeight.args[0]` is `Bind(Let(params → args, decrease))`** — possibly wrapped in Box/Unbox/CoerceMode/Trigger. `render_checked_decrease_arg` peels and substitutes. **Shape-drift test**: `full_check_decrease_height_shape_pinned` asserts the substituted form, with a failure message naming the fix site.
+* **`DUMMY_PARAM = "no%param"` is always position 0 of `callee.params` for zero-arg fns.** `is_zero_arg_desugared` (now retired) relied on this. Post the simplified-krate refactor, both `callee.params` and the call-site args carry the dummy symmetrically, so the check disappeared — but we still rely on Verus inserting the dummy consistently on both sides.
+* **Poly wrapper set is `UnaryOpr::Box` / `Unbox` / `Unary::CoerceMode` / `Trigger`.** `peel_transparent` centralises it. Adding a new transparent wrapper that we don't peel would be silently miscompiled. **Shape-drift tests**: `peel_transparent_*` covers each wrapper and the Loc-not-peeled / If-not-peeled cases.
+* **`VarIdent` equality by string content, not disambiguate.** Our `sanitize(&ident.0)` uses only the name string, collapsing different `VarIdentDisambiguate` tags with the same name into the same Lean identifier. Verus uses this for SSA renaming (`VarIdent("x", Renamed(2))` vs `VarIdent("x", AirLocal)`). In practice the cases we see are all either fully-renamed (different strings) or consistently-tagged, so collapse is safe — but a future Verus change that relies on disambiguates having different string-level effects would surprise us.
+* **Param name stability.** `lower_call`'s substitution map is keyed by `sanitize(param.name.0)`. If Verus starts appending disambiguators to param names (e.g., `foo@0`), the keys in our map and the references in the callee's require/ensure would drift apart.
+* **`FunctionX` fields we read:** `params`, `ret`, `require`, `ensure.0`, `typ_params`, `item_kind`, `attrs.broadcast_forall`, `decrease` (via `CheckDecreaseHeight`). Renames break compile (good). Semantic changes (e.g., `require` splitting into static/dynamic halves) would need re-evaluation.
+* **`FuncCheckSst` fields we read:** `reqs`, `body`, `post_condition.dest`, `post_condition.ens_exps`, `local_decls`. Same story — renames compile-break.
+* **Verus's `ast_simplify` is a monotonic transformation w.r.t. what we care about.** Specifically: it adds the zero-arg dummy, it alpha-renames for unique locals, but it doesn't erase information we depend on. If it starts dropping fields we read, we break.
+* **`simplified_krate()` is populated before `verify_bucket` runs** on the same code path. Encoded as `Option<&Krate>`; the `None` case reports a pipeline-ordering error. Unreachable today by design of `verify_crate_inner`, but a new code path could hit it. `verifier.rs` line 1727 handles it gracefully.
+* **Mathlib's `omega` / `simp_all` behaviour on the goal shapes we emit.** `tactus_auto`'s closure depends on these tactics handling `∧`-conjoined hypotheses, implications over linear arithmetic, and the let-reduction behaviour we rely on. A Lean/Mathlib upgrade could shift these in subtle ways; we'd likely see test regressions in bulk across a version bump.
+* **The `arch_word_bits` / `usize_hi` / `isize_hi` prelude names.** Our codegen emits bare `Var` references to these; the prelude provides the axioms/defs. If the prelude is swapped for a different environment, the references break. Kept in sync via `sanity.rs`'s allowlist.
+* **Verus's `StmX` destructures are `..`-free** in our code. Any field addition to `StmX::Assign` / `Return` / `Loop` / `Call` causes a compile error that forces audit. This is the compile-time defence in the upstream-robustness triangle.
 
 ### `Wp` — WP DSL (landed)
 
