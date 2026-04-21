@@ -4,116 +4,102 @@
 //! and produces a `Theorem` AST node whose goal is the WP of the body and
 //! whose tactic body is `tactus_auto`.
 //!
-//! # Current scope
+//! # Pipeline
 //!
-//! Handles bodies built from:
+//! `exec_fn_theorems_to_ast` runs the pipeline:
 //!
-//!   * `StmX::Block`     — nested/sequential composition
-//!   * `StmX::Assign`    — simple-LHS `let x := e` bindings; non-simple
-//!                         LHS (field writes, etc.) is rejected upfront
-//!   * `StmX::Assert`    — obligations, conjoined into the goal
-//!   * `StmX::Assume`    — hypotheses, threaded into the goal as implications
-//!   * `StmX::If`        — branching; WP splits across `cond` / `¬cond`
-//!   * `StmX::Return`    — terminator; any items after it in the
-//!                         same sequence are unreachable and dropped.
-//!                         Works at top level, inside a branch, or as
-//!                         an early-return mid-block (`inside_body:
-//!                         true`) — all three lower to the same
-//!                         `BodyItem::Return`.
-//!   * `StmX::Air`, `StmX::Fuel`, `StmX::RevealString` — transparent
-//!   * `StmX::Call`      — direct named function calls. The callee's
-//!                         `requires` becomes an obligation, its
-//!                         `ensures` a hypothesis bound under `∀ ret`.
-//!                         Callees are inlined (their spec is pulled
-//!                         from `FunctionX`), so no Lean definition of
-//!                         the callee is needed. Rejects: trait
-//!                         methods, generics, `&mut` args, cross-crate
-//!                         calls. See "Loop / Call obligations" below.
-//!   * `StmX::Loop`      — `while` loops with `loop_isolation: true`,
-//!                         simple `while` condition (no setup
-//!                         statements), single-expression `decreases`,
-//!                         invariants true at both entry and exit.
-//!                         Loops can appear anywhere — top level,
-//!                         inside if-branches, nested within another
-//!                         loop's body, or in sequence — because each
-//!                         loop contributes its obligations as
-//!                         conjuncts into the enclosing goal (see
-//!                         "Loop obligations" below). `break` /
-//!                         `continue` aren't supported yet.
+//! 1. `WpCtx::new` validates `reqs` / `ens_exps` via `check_exp` and
+//!    constructs the shared context (fn_map, type_map, ret_name,
+//!    ensures_goal).
+//! 2. `build_wp(&check.body, Wp::Done(ensures_goal), &ctx)` walks the
+//!    SST body right-to-left, producing a `Wp<'a>` tree where each
+//!    compound node carries its own continuation by construction. Any
+//!    unsupported SST form returns `Err` and bubbles up.
+//! 3. `lower_wp(&body_wp, &ctx)` interprets the `Wp` tree into a Lean
+//!    `LExpr` goal.
+//! 4. Emission wraps the goal in a `Theorem` with either `tactus_auto`
+//!    (flat goals) or `tactus_peel; all_goals tactus_auto` (when the
+//!    WP introduces nested ∀/∧ structure — see `Wp::needs_peel`).
 //!
-//! Not yet supported: break/continue, lexicographic `decreases`,
-//! pattern matching, closures, mutable references (`&mut`).
-//! Fixed-width arithmetic overflow IS checked, but via `HasType`
-//! assertions folded into the body WP — not via separate per-op
-//! theorems.
+//! # The `Wp` DSL
+//!
+//! `Wp<'a>` is a small algebra of WP-shaped operations:
+//!
+//!   * `Done(LExpr)` — terminator leaf; no continuation slot. Built
+//!     from the fn's ensures at top level, `I ∧ D < _tactus_d_old`
+//!     inside a loop body, or `let <ret> := e; ensures_goal` from a
+//!     `return` statement.
+//!   * `Let(x, rhs, after)` — `let x := rhs; <after>`. Lowering uses
+//!     `lift_if_value` so an `ExpX::If` RHS lifts to goal level.
+//!   * `Assert(P, after)` — `P ∧ <after>`.
+//!   * `Assume(P, after)` — `P → <after>`.
+//!   * `Branch { cond, then_branch, else_branch }` —
+//!     `(c → then_branch) ∧ (¬c → else_branch)`. Each branch carries
+//!     its own continuation; no shared-rest parameter.
+//!   * `Loop { cond, invs, decrease, modified_vars, body, after }` —
+//!     lowered to `I ∧ maintain_clause ∧ havoc_continuation`. `body`
+//!     is built with its own `Done(I ∧ D < _tactus_d_old)`
+//!     terminator; `after` is the post-loop continuation.
+//!   * `Call { callee, args, dest, after }` — `requires(subst) ∧ ∀ ret,
+//!     bound(ret) → ensures_using_ret(subst) → let dest := ret;
+//!     <after>`. Inlines the callee's `require`/`ensure` via
+//!     `lean_ast::substitute` (capture-avoiding).
+//!
+//! Three structural properties the DSL gets for free:
+//!
+//!   * **Continuation is type-level.** `Done` has no slot for a
+//!     continuation, so "discard after Return" is enforced by the
+//!     type system rather than by a positional convention.
+//!   * **`Return` is fn-exit by construction.** Walk's `Return` arm
+//!     ignores its `after` parameter and writes `Done(let <ret> := e;
+//!     ctx.ensures_goal)`. No way to accidentally write to a loop's
+//!     local terminator.
+//!   * **Composition is structural.** Loops and calls compose like
+//!     any other node; recursion into them is a normal tree walk,
+//!     no special-case dispatcher.
+//!
+//! `build_wp` folds right-to-left over `StmX::Block` so each
+//! statement's `after` is the already-built Wp for the rest of the
+//! block. `Return` terminates a branch by dropping `after`.
 //!
 //! # Loop obligations (conjunctive WP)
 //!
-//! A loop inside an exec fn body contributes three pieces to the goal
-//! of the enclosing theorem — conjoined inline rather than split into
-//! separate theorems:
+//! A loop contributes three pieces to the goal of the enclosing
+//! theorem — conjoined inline rather than split into separate
+//! theorems:
 //!
 //! ```
-//! wp(pre; while cond inv I dec D { body }; post, ensures)
-//!   = wp(pre,
-//!       I                                       -- init: I holds at loop entry
-//!       ∧ maintain_clause                       -- body preserves I and decreases D
-//!       ∧ ∀ (mod_vars …), bounds → I ∧ ¬cond →  -- havoc; post-loop is reachable
-//!           wp(post, ensures))
+//! lower(Wp::Loop{ cond, invs, decrease, modified_vars, body, after })
+//!   = I                                                      -- init
+//!     ∧ (∀ mod_vars, bounds → I ∧ cond →
+//!         let _tactus_d_old := D; lower(body))               -- maintain
+//!     ∧ (∀ mod_vars, bounds → I ∧ ¬cond →
+//!         lower(after))                                      -- havoc
 //! ```
 //!
-//! where `maintain_clause` is
+//! where `body` has `Done(I ∧ D < _tactus_d_old)` as its own
+//! terminator, so `lower(body)` naturally produces the maintain
+//! clause's inner goal. The Lean `let _tactus_d_old := D; ...`
+//! wrapper puts the pre-body `D` in scope; references to `D` *inside*
+//! the body see post-body values via let-shadowing from intervening
+//! assignments.
 //!
-//! ```
-//!   ∀ (mod_vars …), bounds → I ∧ cond →
-//!     let d_old := D;
-//!     wp(body, I ∧ D < d_old)
-//! ```
-//!
-//! Non-modified surrounding state (fn params, other local lets) stays
-//! in scope via the outer `let`/`∀` nesting that `build_goal` is
-//! already building. Only `mod_vars` — variables the loop body writes
-//! to — get the fresh universal quantification.
-//!
-//! Because the loop's contribution is itself a goal expression, the
-//! recursion composes: a loop inside another loop's `body` lands
-//! inside that inner `wp(body, …)`, and a loop inside an if-branch
-//! lands inside the branch's continuation.
+//! Non-modified surrounding state stays in scope via the outer
+//! `let`/`∀` nesting already built by the enclosing `lower_wp`
+//! frames. Only `mod_vars` — variables the loop body writes to —
+//! get the fresh universal quantification.
 //!
 //! # Mutation
 //!
 //! Simple mutation (`let mut x = …; x = …;`) needs no rename pass:
-//! `StmX::Assign { is_init: false }` emits `let x := e` just like an
-//! init, and Lean's let-shadowing gives us SSA semantics naturally.
-//! This also works across if-branches — an inner branch's `let x := …`
-//! only shadows within its implication, so the outer `x` remains in
-//! scope for the other branch and the code after the if. Loops break
-//! this trick because the loop body's mutations can't tunnel out
-//! through shadowing; they'll need a real rename pass when we get
-//! there.
-//!
-//! # Semantic model (weakest-precondition, in body order)
-//!
-//! We walk statements in source order and nest each one into the goal:
-//!
-//! * `let x = e` becomes `let x := e; <rest>`.
-//! * `assume(P)` becomes `(P) → <rest>`.
-//! * `assert(P)` becomes `(P) ∧ (<rest>)`. `P` must be provable without
-//!   using assumes that appear *after* it — this is the property that
-//!   separates us from a naive "conjoin everything" scheme.
-//! * `if c { s₁ } else { s₂ }` becomes
-//!   `(c → wp(s₁; <rest>)) ∧ (¬c → wp(s₂; <rest>))`. Both branches share
-//!   the same continuation; we duplicate `<rest>` syntactically rather
-//!   than let-binding a shared goal.
-//! * `return e` is a terminator: it wraps the ensures as `let <ret> :=
-//!   e; <ensures>` and any items after it in the same sequence are
-//!   unreachable and dropped. Works for both tail returns and for
-//!   early returns inside an `if` branch (the branch's continuation
-//!   ends at the return; the outer `rest` never gets appended past it).
-//!
-//! The AST pretty-printer handles precedence, so constructors just build
-//! `BinOp::And` / `BinOp::Implies` / `UnOp::Not` / `Let` without worrying
-//! about parens.
+//! `StmX::Assign { is_init: false }` emits `Wp::Let(x, e, body)` just
+//! like an init, and Lean's let-shadowing gives us SSA semantics
+//! naturally. This also works across if-branches — an inner branch's
+//! `let x := …` only shadows within its implication, so the outer
+//! `x` remains in scope for the other branch and the code after the
+//! if. Loops break this trick because the loop body's mutations
+//! can't tunnel out through shadowing; they'll need a real rename
+//! pass when we get there.
 
 use std::collections::{HashMap, HashSet};
 
@@ -129,9 +115,9 @@ use crate::to_lean_sst_expr::{sst_exp_to_ast, sst_exp_to_ast_checked, type_bound
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
 
 /// Lookup table from callee `Fun` to its VIR-AST `FunctionX`. Used by
-/// `BodyItem::Call` to inline a callee's `requires` / `ensures` at the
-/// call site. Callee's spec lives on `FunctionX` (VIR-AST), not on
-/// its `FunctionSst`, so the map points at the AST form.
+/// `Wp::Call` lowering to inline a callee's `requires` / `ensures`
+/// at the call site. Callee's spec lives on `FunctionX` (VIR-AST),
+/// not on its `FunctionSst`, so the map points at the AST form.
 pub type FnMap<'a> = HashMap<&'a Fun, &'a FunctionX>;
 
 /// Shared context threaded through the WP builder. Collects the
@@ -159,25 +145,37 @@ pub struct WpCtx<'a> {
 impl<'a> WpCtx<'a> {
     /// Build the context for verifying `check` against `krate`.
     ///
-    /// Precondition: expressions in `check.post_condition.ens_exps`
-    /// have been validated (e.g., via `check_exp`) — `sst_exp_to_ast`
-    /// is infallible and would panic on unsupported forms. Validation
-    /// happens in `exec_fn_theorems_to_ast` before calling `new`.
-    pub fn new(krate: &'a KrateX, check: &'a FuncCheckSst) -> Self {
+    /// Validates `check.reqs` and `check.post_condition.ens_exps`
+    /// up front via `check_exp`. If any expression uses an SST form
+    /// we don't support, returns `Err(reason)` before constructing
+    /// anything — in particular before the infallible
+    /// `sst_exp_to_ast` call that renders `ensures_goal`, which
+    /// would otherwise panic.
+    ///
+    /// The precondition "ens_exps is supported" thus lives in the
+    /// type signature rather than in a docstring: you can only get
+    /// a `WpCtx` by passing validation.
+    pub fn new(krate: &'a KrateX, check: &'a FuncCheckSst) -> Result<Self, String> {
+        for req in check.reqs.iter() {
+            check_exp(req)?;
+        }
+        for ens in check.post_condition.ens_exps.iter() {
+            check_exp(ens)?;
+        }
         let fn_map = krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
         let type_map = check.local_decls.iter().map(|d| (&d.ident, &d.typ)).collect();
         let ret_name = check.post_condition.dest.as_ref().map(|v| v.0.as_str());
         let ensures_goal = and_all(
             check.post_condition.ens_exps.iter().map(sst_exp_to_ast).collect()
         );
-        Self { fn_map, type_map, ret_name, ensures_goal }
+        Ok(Self { fn_map, type_map, ret_name, ensures_goal })
     }
 }
 
 // ── Support check (helpers) ────────────────────────────────────────────
 //
-// The main validation is fused into `walk` below — a single pass that
-// both checks shape constraints and builds the `BodyItem` sequence. The
+// The main validation is fused into `build_wp` below — a single pass
+// that both checks shape constraints and builds the `Wp` tree. The
 // helpers here are the reusable bits.
 
 // Callee param iteration is just `callee.params.iter()`. Our `FnMap`
@@ -206,10 +204,10 @@ fn contains_loc(e: &Exp) -> bool {
 
 /// Validate an SST expression — `sst_exp_to_ast_checked` does both
 /// validation AND rendering in a single pass, so we just call it and
-/// discard the rendered result. Used by `walk` at the points where
-/// it encounters expressions that `build_goal` will later re-render
-/// via the infallible wrapper (at which point validation is known to
-/// have passed).
+/// discard the rendered result. Used by `build_wp` at the points
+/// where it encounters expressions that `lower_wp` will later
+/// re-render via the infallible wrapper (at which point validation
+/// is known to have passed).
 fn check_exp(e: &Exp) -> Result<(), String> {
     sst_exp_to_ast_checked(e).map(|_| ())
 }
@@ -225,24 +223,17 @@ fn check_exp(e: &Exp) -> Result<(), String> {
 ///
 /// Returns `Err` if any part of `check` uses an SST form we don't know
 /// how to emit. Validation and AST construction share a single pass
-/// (`walk`) so the "validate-first" precondition is enforced by
-/// construction — there's no way to produce `BodyItem`s without having
-/// already cleared the shape checks.
+/// (`build_wp` + `sst_exp_to_ast_checked`), so the "validate-first"
+/// precondition is enforced by construction — there's no way to
+/// produce a `Wp` tree without having already cleared the shape
+/// checks.
 pub fn exec_fn_theorems_to_ast<'a>(
     krate: &'a KrateX,
     fn_sst: &'a FunctionSst,
     check: &'a FuncCheckSst,
 ) -> Result<Vec<Theorem>, String> {
-    // Validate reqs / ens expressions before WpCtx::new renders them
-    // via the infallible `sst_exp_to_ast`.
-    for req in check.reqs.iter() {
-        check_exp(req)?;
-    }
-    for ens in check.post_condition.ens_exps.iter() {
-        check_exp(ens)?;
-    }
-
-    let ctx = WpCtx::new(krate, check);
+    // `WpCtx::new` validates reqs / ens_exps before rendering them.
+    let ctx = WpCtx::new(krate, check)?;
 
     let name = format!("_tactus_body_{}", lean_name(&fn_sst.x.name.path));
     let mut binders = build_param_binders(fn_sst);
@@ -341,8 +332,8 @@ fn build_req_binders(check: &FuncCheckSst) -> Vec<LBinder> {
 //     `BodyItem::Loop` / `Call`.
 //
 // Adding a new WP form means adding a constructor + an arm in
-// `build_wp` (where walk produces it) and `lower_wp` (where it lowers
-// to LExpr). No changes needed to a central dispatcher.
+// `build_wp` (where construction happens) and `lower_wp` (where it
+// lowers to LExpr). No changes needed to a central dispatcher.
 
 /// A WP program. Each compound node carries its own continuation,
 /// so composition is structural and `Return` is naturally a
@@ -399,7 +390,11 @@ enum Wp<'a> {
     Call {
         callee: &'a FunctionX,
         args: Vec<&'a Exp>,
-        dest: Option<(&'a VarIdent, &'a Typ)>,
+        /// Caller's destination variable (`let x = foo(…)` → `Some("x")`;
+        /// `foo(…);` → `None`). Only the name is needed — lowering emits
+        /// `let dest := ret` inside the `∀ ret`, and `ret` already has
+        /// its type-bound hypothesis from `type_bound_predicate`.
+        dest: Option<&'a VarIdent>,
         after: Box<Wp<'a>>,
     },
 }
@@ -512,14 +507,31 @@ fn lower_loop(
 
 /// Lower a `Wp::Call` by inlining the callee's require / ensure via
 /// Lean-AST substitution (rather than textual let-wrapping, which
-/// would shadow caller names on self-recursion). See the old
-/// `build_call_conjunction` comment for the shape rationale; the
-/// change here is just that the continuation is a `Wp` sub-tree
-/// instead of a remaining-items slice.
+/// would shadow caller names on self-recursion).
+///
+/// For `let dest = callee(arg1, arg2, …)` the emitted shape is:
+///
+/// ```text
+/// requires_conj[p1 := arg1, p2 := arg2, …]
+/// ∧ (∀ (ret : RetT), h_ret_bound(ret) →
+///      ensures_conj_using_ret[p1 := arg1, p2 := arg2, …] →
+///      (let dest := ret; <lower_wp(after)>))
+/// ```
+///
+/// The substitution `[p := arg]` is done at the Lean AST level via
+/// `lean_ast::substitute` — direct substitution instead of
+/// `let p := arg; body` wrapping avoids name shadowing when the
+/// caller and callee share a param name (e.g., self-recursion).
+///
+/// Termination obligations for recursive calls are inserted upstream
+/// by Verus's `recursion` pass as `StmX::Assert(InternalFun::
+/// CheckDecreaseHeight)` before the `StmX::Call`; they flow through
+/// `build_wp` as ordinary `Wp::Assert` nodes and lower via
+/// `sst_exp_to_ast_checked`'s `CheckDecreaseHeight` arm.
 fn lower_call(
     callee: &FunctionX,
     args: &[&Exp],
-    dest: Option<(&VarIdent, &Typ)>,
+    dest: Option<&VarIdent>,
     after: &Wp<'_>,
     ctx: &WpCtx<'_>,
 ) -> LExpr {
@@ -550,7 +562,7 @@ fn lower_call(
     let continuation_under_ret = {
         let after_lowered = lower_wp(after, ctx);
         let bound_rest = match dest {
-            Some((dest_ident, _)) => LExpr::let_bind(
+            Some(dest_ident) => LExpr::let_bind(
                 sanitize(&dest_ident.0),
                 LExpr::var(ret_name_cal.clone()),
                 after_lowered,
@@ -629,21 +641,6 @@ fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
     }
 }
 
-/// Build the three-way conjunction contributed by a loop.
-///
-///   `I ∧ (∀ mod_vars, bounds → I ∧ cond → <maintain>)
-///      ∧ (∀ mod_vars, bounds → I ∧ ¬cond → <wp(rest, outer_terminator)>)`
-///
-/// The outer `I` asserts the invariant at loop entry. Maintain and use
-/// are both universally quantified over the loop's modified vars —
-/// maintain because the loop body must preserve `I` and decrease `D`
-/// for an arbitrary iteration start; use because after the loop exits,
-/// the only thing we know about modified vars is `I ∧ ¬cond`.
-///
-/// The maintain clause uses its own local terminator `I ∧ D < d_old`
-/// (one per loop). The use clause threads the outer `terminator`
-/// through, so a nested loop's post-loop code feeds back into the
-/// outer loop's post-body goal / fn ensures.
 /// `∀ (x₁ : T₁), bounds₁ → … ∀ (xₙ : Tₙ), boundsₙ → body` — wraps
 /// `body` with a universal quantifier per modified variable plus its
 /// type-bound hypothesis (where applicable).
@@ -672,7 +669,7 @@ fn quantify_mod_vars(
     out
 }
 
-// ── WP builder (walk) ──────────────────────────────────────────────────
+// ── WP builder ─────────────────────────────────────────────────────────
 
 /// Build the `Wp` tree for a statement, threading the continuation
 /// `after` through. Right-to-left over a `Block` — each statement's
@@ -847,11 +844,8 @@ fn build_wp_call<'a>(
         check_exp(a)?;
     }
     let arg_refs: Vec<&'a Exp> = args.iter().collect();
-    let bound_dest: Option<(&'a VarIdent, &'a Typ)> = dest.as_ref().and_then(|d| {
-        let ident = extract_simple_var_ident(&d.dest)?;
-        let typ = ctx.type_map.get(ident).copied()?;
-        Some((ident, typ))
-    });
+    let bound_dest: Option<&'a VarIdent> = dest.as_ref()
+        .and_then(|d| extract_simple_var_ident(&d.dest));
     // NOTE: the termination obligation for recursive calls is emitted
     // upstream by Verus's `recursion::check_recursive_function` pass,
     // which inserts a `StmX::Assert` wrapping `InternalFun::
