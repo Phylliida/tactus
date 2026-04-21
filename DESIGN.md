@@ -942,6 +942,130 @@ Only the simplest `while` shape is accepted. All other loop shapes return `Err`.
 * **`lift_if_value` single-binder Bind(Let) restriction.** Multi-binder lets (`let (a, b) = …; …`) pass through without peeling. If a user writes `let (a, b) = foo(); if x { … } else { … }` the if won't be lifted to goal level — currently fine because such let-patterns aren't common in our tests, but the restriction is implicit.
 * **No direct test of `simplified_krate()` None branch.** Unreachable by design (verify_crate_inner populates it before verify_bucket runs). If a future code path hits the unreachable branch, users see our "pipeline ordering bug" error instead of a panic — but we don't exercise the error path.
 
+#### Track B tightening roadmap (in-scope, not yet landed)
+
+Distinct from the "Phase-3 non-goals" list below: these are items that
+*should* be part of Track B's tight feature set but currently aren't
+wired. Ordered by unlock-per-day-of-effort. Each is a bounded piece of
+work, sized in rough days for a focused session; the top-tier items
+are what separate "demo-quality Track B" from "usable on realistic
+exec fns."
+
+##### Tier 1 — immediate wins (1–2 days each)
+
+* **`proof { ... }` blocks inside exec fns.** DESIGN.md currently
+  claims support, but the plumbing isn't wired through `build_wp`.
+  Without this, any exec fn obligation that `tactus_auto` can't close
+  has no escape hatch — users can't write `proof { have h : P := by
+  … }` to thread a hypothesis into the VC. Fix sites:
+  `sst_to_lean::build_wp` needs an arm that accepts `StmX` for
+  embedded proof bodies (likely `StmX::Air`-wrapped or a dedicated
+  variant), emits `have h : P := by <user_tactic>;` as a Lean tactic
+  prefix, and threads `h` forward as a hypothesis in `WpCtx`.
+  Companion test: `test_exec_proof_block_threads_hypothesis`.
+  **Without this, Track B is fundamentally incomplete** — no tool for
+  recovery when automation fails.
+
+* **`assert(P) by { tactics }` with user tactic bodies.** Currently
+  `StmX::Assert` emits a leaf obligation closed by `tactus_auto`;
+  user-provided tactic bodies are dropped on the floor. Fix:
+  `StmX::AssertQuery` / `StmX::Assert` needs a variant that carries
+  the user tactic text through (same mechanism as `by { … }` on
+  proof fns — the tactic span is already captured at the proc-macro
+  layer, just not plumbed through SST). Companion test:
+  `test_exec_assert_with_user_tactic`.
+
+* **Source mapping for exec-fn errors.** Lean errors currently point
+  at the generated `.lean` file's line numbers; users have to `cat`
+  the emitted file to understand what failed. The generated path is
+  in the error message, which helps, but true source mapping (Rust
+  `.rs` line numbers in the diagnostic) requires threading `Span`
+  through the Wp tree to tactic emission and building a
+  `LeanSourceMap` entry for each generated tactic. Infrastructure
+  partially exists for proof fns (`LeanSourceMap` in `to_lean_fn.rs`);
+  extend to exec-fn theorems. Scope: ~2 days.
+
+##### Tier 2 — realistic-code unblockers (2–4 days each)
+
+* **`ExpX::Ctor` + pattern matching in exec fns.** Blocks any exec
+  code that constructs enum/struct values or matches on them — i.e.,
+  most real Rust. Fix: lower `ExpX::Ctor` to Lean anonymous
+  constructor (`⟨a, b⟩`) for `Dt::Tuple` or named ctor
+  (`TypeName.variant …`) for `Dt::Path`; add `StmX::Match`-or-body-
+  level `Wp::Match { scrutinee, arms }` variant; emit
+  `match scrutinee with | Pat₁ => wp(body₁) | …`. Datatype
+  definitions need to be in `krate_preamble` for the ctor types used
+  in exec bodies (some are; needs audit). Regression: remove
+  `test_exec_ctor_rejected` once landed.
+
+* **Generic calls (non-empty `typ_args`).** Currently rejected in
+  `build_wp_call` — blocks calls into generic callees like
+  `Vec::<T>::push`, `Option::<T>::unwrap`, any parametric
+  utility fn. Fix: substitute `typ_args` into the callee's spec at
+  inlining time (using the existing `substitute` at the type level,
+  or a new type-substitution pass on the rendered LExpr). Runtime
+  behaviour is generic-erasure in Lean (we already emit typ_params
+  as implicit binders in the callee's theorem); just need the
+  instantiation at call sites.
+
+* **Non-int `decreases` (Lean `height` function per datatype).**
+  Currently `CheckDecreaseHeight` rejects non-int decrease types.
+  Fix: generate a `height : T → Nat` function per datatype used in
+  a decreases clause (recursive definition summing children's
+  heights + 1), add axioms matching the prelude's `height_lt` ↔
+  arithmetic equivalence, and allow `is_int_height` to return true
+  for types with a generated `height`. Companion test: recursive
+  fn with `decreases tree` that case-matches on an `enum Tree`.
+
+##### Tier 3 — bigger slices (~1 week each)
+
+* **`&mut` args on calls.** Havoc-after-call semantics: after
+  `foo(&mut x)` returns, `x` is an arbitrary value satisfying its
+  type invariant and the callee's `ensures` (which may reference
+  the new `x`). Plus aliasing: two `&mut` args to the same call
+  must be distinct (Rust's borrow checker guarantees this upstream).
+  Encoding: emit `∀ (x' : T), type_inv(x') → ensures[x ↦ x'] → …`
+  replacing the current pre-and-post pair with a universally-
+  quantified post-state. Scope is bigger than it looks — aliasing
+  tracking, `ensures` rewrites on mutated params, interaction with
+  `old(x)`. Currently rejected in `build_wp_call` via
+  `contains_loc`.
+
+* **Trait-method calls (dynamic + resolved static).** Currently
+  rejected via `resolved_method: Some(_)` / `CallTargetKind::
+  Dynamic`. Fix: for `DynamicResolved` we can emit a direct call to
+  the resolved impl's Lean name (infrastructure exists in
+  `to_lean_expr`'s `call_to_node`); for `Dynamic` we need trait-
+  method-via-instance encoding (use Lean's typeclass machinery or
+  emit `TraitName.method` with the impl inferred from the receiver
+  type).
+
+* **`break` / `continue`.** Currently rejected via loop-shape
+  restrictions (`cond: None`, `invariant_except_break` rejected).
+  Encoding: loops with breaks need a separate exit-invariant
+  (`invariant_except_break`) distinguishing "holds on continue" from
+  "holds on break"; `break` writes the loop's exit condition,
+  `continue` writes the maintain condition. Loop body becomes a
+  branching WP where the exit paths feed into the post-loop
+  continuation and the continue paths feed back into the loop head.
+
+##### Ordering rationale
+
+Tier 1 is ordered first because each item is low-cost and unblocks
+existing users: every realistic exec fn needs `proof { }` when
+automation fails, every realistic exec fn wants readable errors.
+Tier 2 is realistic-code unblockers — users can work around missing
+pattern matching by avoiding enums, but only so far. Tier 3 is where
+we hit scoping breaks: each is its own mini-project with internal
+design choices, and each depends on infrastructure that the lower
+tiers don't require.
+
+Not on the list: tactic expansion (e.g., routing `nlinarith` /
+`ring` / `polyrith` into `tactus_auto` for exec fns) — that's a
+design call about automation predictability, not a missing
+feature. If a fn needs it today, users can add `proof { by
+nlinarith [...] }` once Tier 1 lands.
+
 #### Phase-3 work (explicit non-goals for current scope)
 
 These are deferred by design — the current slice is single-crate exec+proof-fn verification.
