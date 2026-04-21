@@ -162,42 +162,16 @@ impl<'a> WpCtx<'a> {
 // both checks shape constraints and builds the `BodyItem` sequence. The
 // helpers here are the reusable bits.
 
-/// Detect a call that's been through Verus's zero-arg-fn desugaring.
-///
-/// `ast_simplify` injects a dummy `Const(0)` arg at the call site for
-/// fns that have no user-visible params / type params (see
-/// `ast_simplify.rs:528`). Parallel desugaring injects a matching
-/// `no%param` param into the callee's `params` — BUT that second half
-/// only fires on `simplify_krate`, which runs *after* `self.vir_crate`
-/// is stored (`verifier.rs:3163`). `WpCtx::new` sees the pre-simplify
-/// `FunctionX`, so its `params` for a zero-arg callee is empty.
-///
-/// The asymmetry means: at a zero-arg call site, `args.len() == 1`
-/// (the injected `Const(0)`) but `callee.params.len() == 0`. We detect
-/// this shape explicitly and skip the synthetic arg so zip alignment
-/// stays correct.
-fn is_zero_arg_desugared(callee: &FunctionX) -> bool {
-    use vir::ast::ItemKind;
-    callee.params.is_empty()
-        && callee.typ_params.is_empty()
-        && !matches!(callee.item_kind, ItemKind::Const | ItemKind::Static)
-        && !callee.attrs.broadcast_forall
-}
-
-/// Iterate over the callee's real (user-visible) parameters. Since
-/// our `FnMap` uses the pre-simplify `FunctionX`, synthetic params
-/// haven't been injected yet — so this is just `callee.params.iter()`.
-/// The wrapper exists for symmetry with `skip_zero_arg_dummy` on the
-/// args side and for future expansion if we ever route through a
-/// post-simplify form.
+/// Iterate over the callee's parameters. Our `FnMap` now sees the
+/// POST-simplify `FunctionX` (see `verifier.rs`'s
+/// `vir_crate_simplified`), so for zero-arg fns the params list
+/// includes Verus's injected `no%param` dummy — matched positionally
+/// by a `Const(0)` dummy arg at the call site. Both sides align, so
+/// we can zip directly without filtering: the dummy param's
+/// substitution `let no_param := 0; body` binds a name nothing
+/// references, inert.
 fn real_params(callee: &FunctionX) -> impl Iterator<Item = &vir::ast::Param> {
     callee.params.iter()
-}
-
-/// How many leading args to skip to align with `real_params(callee)`.
-/// See `is_zero_arg_desugared` for the one case that's nonzero today.
-fn arg_skip(callee: &FunctionX) -> usize {
-    if is_zero_arg_desugared(callee) { 1 } else { 0 }
 }
 
 /// Does this type bottom out at `TypX::Int(_)` once transparent
@@ -668,19 +642,17 @@ fn build_call_conjunction(
     ctx: &WpCtx<'_>,
 ) -> LExpr {
     // Strip any `ast_simplify`-injected dummy arg so zip aligns with
-    // `callee.params`. `walk_call` already verified the counts after
-    // the strip, so zipping cannot silently truncate. Unconditional
-    // assert is defense-in-depth: if a future refactor produces
+    // `callee.params`. `walk_call` already verified the counts line
+    // up, so zipping cannot silently truncate. Unconditional assert
+    // is defense-in-depth: if a future refactor produces
     // `BodyItem::Call` through a different path, this fires
     // immediately rather than binding wrong variables silently.
-    let real_params_vec: Vec<_> = real_params(callee).collect();
-    let skip = arg_skip(callee);
-    let real_arg_refs: &[&Exp] = &args[skip..];
+    let params_vec: Vec<_> = real_params(callee).collect();
     assert_eq!(
-        real_params_vec.len(), real_arg_refs.len(),
-        "callee real-param count {} != caller real-arg count {} for {:?} — \
+        params_vec.len(), args.len(),
+        "callee param count {} != caller arg count {} for {:?} — \
          walk_call should have rejected this",
-        real_params_vec.len(), real_arg_refs.len(), callee.name.path,
+        params_vec.len(), args.len(), callee.name.path,
     );
 
     // Build param → arg substitution map. We substitute directly at
@@ -688,10 +660,9 @@ fn build_call_conjunction(
     // emitting `let p := arg; body` wrappers. Direct substitution
     // avoids name shadowing when callee and caller share a param
     // name (e.g., self-recursion) — with let-wrapping the nested
-    // `let n := n - 1; ...; n` defeats omega's let-handling and
-    // required a `(simp_all; omega)` fallback in tactus_auto.
-    let subst: std::collections::HashMap<String, LExpr> = real_params_vec.iter()
-        .zip(real_arg_refs.iter())
+    // `let n := n - 1; ...; n` defeats omega's let-handling.
+    let subst: std::collections::HashMap<String, LExpr> = params_vec.iter()
+        .zip(args.iter())
         .map(|(p, arg)| (sanitize(&p.x.name.0), sst_exp_to_ast(arg)))
         .collect();
 
@@ -996,26 +967,19 @@ fn walk_call<'a>(
         ));
     };
     // Param/arg count MUST match after stripping any `ast_simplify`-
-    // injected dummy arg. If Verus ever changes its arg-passing
-    // convention so this invariant breaks, we want a clean rejection
-    // here — not a silent zip-to-shorter in `build_call_conjunction`,
-    // which would bind the wrong variables and produce a spec that
-    // isn't the callee's.
-    let skip = arg_skip(callee);
-    if args.len() < skip {
+    // convention. Both sides have been through `ast_simplify` by now
+    // (via `vir_crate_simplified`), so zero-arg callees have their
+    // `no%param` dummy in both `params` and `args`. If Verus ever
+    // changes its arg-passing convention so this invariant breaks,
+    // we want a clean rejection here — not a silent zip-to-shorter
+    // in `build_call_conjunction`.
+    let param_count = real_params(callee).count();
+    if param_count != args.len() {
         return Err(format!(
-            "callee `{:?}` looks zero-arg-desugared but call site passes only {} arg(s)",
-            fun.path, args.len(),
-        ));
-    }
-    let real_param_count = real_params(callee).count();
-    let real_arg_count = args.len() - skip;
-    if real_param_count != real_arg_count {
-        return Err(format!(
-            "callee `{:?}` has {} real param(s) but call site passes {} real arg(s) \
-             (raw args: {}; dummy skip: {}) — arg-passing convention may be \
-             out of sync; this would bind wrong variables if we proceeded",
-            fun.path, real_param_count, real_arg_count, args.len(), skip,
+            "callee `{:?}` has {} param(s) but call site passes {} arg(s) — \
+             arg-passing convention may be out of sync (both sides should be \
+             post-ast_simplify); this would bind wrong variables if we proceeded",
+            fun.path, param_count, args.len(),
         ));
     }
     for a in args.iter() {
