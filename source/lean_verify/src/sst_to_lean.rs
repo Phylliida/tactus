@@ -162,18 +162,13 @@ impl<'a> WpCtx<'a> {
 // both checks shape constraints and builds the `BodyItem` sequence. The
 // helpers here are the reusable bits.
 
-/// Iterate over the callee's parameters. Our `FnMap` now sees the
-/// POST-simplify `FunctionX` (see `verifier.rs`'s
-/// `vir_crate_simplified`), so for zero-arg fns the params list
-/// includes Verus's injected `no%param` dummy — matched positionally
-/// by a `Const(0)` dummy arg at the call site. Both sides align, so
-/// we can zip directly without filtering: the dummy param's
-/// substitution `let no_param := 0; body` binds a name nothing
-/// references, inert.
-fn real_params(callee: &FunctionX) -> impl Iterator<Item = &vir::ast::Param> {
-    callee.params.iter()
-}
-
+// Callee param iteration is just `callee.params.iter()`. Our `FnMap`
+// sees the POST-simplify `FunctionX` (see `verifier.rs`'s
+// `vir_crate_simplified`), so for zero-arg fns the params list
+// includes Verus's injected `no%param` dummy — matched positionally
+// by a `Const(0)` dummy arg at the call site. Both sides align, so
+// we can zip directly; the dummy param's substitution binds a name
+// nothing references, inert.
 
 /// Does this expression — or any transparently-wrapped inner — use
 /// `ExpX::Loc`? `Loc` marks an L-value (`&mut` argument site). We peel
@@ -570,7 +565,7 @@ fn build_call_conjunction(
     // is defense-in-depth: if a future refactor produces
     // `BodyItem::Call` through a different path, this fires
     // immediately rather than binding wrong variables silently.
-    let params_vec: Vec<_> = real_params(callee).collect();
+    let params_vec: Vec<_> = callee.params.iter().collect();
     assert_eq!(
         params_vec.len(), args.len(),
         "callee param count {} != caller arg count {} for {:?} — \
@@ -896,7 +891,7 @@ fn walk_call<'a>(
     // changes its arg-passing convention so this invariant breaks,
     // we want a clean rejection here — not a silent zip-to-shorter
     // in `build_call_conjunction`.
-    let param_count = real_params(callee).count();
+    let param_count = callee.params.len();
     if param_count != args.len() {
         return Err(format!(
             "callee `{:?}` has {} param(s) but call site passes {} arg(s) — \

@@ -363,15 +363,23 @@ pub enum Tactic {
 /// `subst` removes that key from the substitution before recursing
 /// into its body, so shadowing works correctly.
 ///
-/// **Capture avoidance (first-cut).** If a binder's name collides
-/// with a name appearing free in ANY value of the substitution, a
-/// capture would occur (the substituted expression's free var gets
-/// accidentally bound by the binder). For now we detect this and
-/// **panic** with a clear message pointing at the collision — the
-/// common Tactus use case (substituting simple caller-arg expressions
-/// for simple callee-param names in arithmetic specs) doesn't hit
-/// this. When it does, alpha-renaming is the proper fix. The panic
-/// is preferred over silent miscompilation.
+/// **Capture avoidance (first-cut).** If a binder would capture a
+/// name appearing free in an active substitution value, we **panic**
+/// with a clear message. The check is *lazy per-scope*: we only
+/// consider names free in the **current** inner substitution at the
+/// binder, not names free in the original top-level substitution.
+/// This avoids false positives like `(∀ y. z) + x` with `{x: y}` —
+/// the outer `∀ y.` can't capture anything because `x` never appears
+/// inside its scope, so no substitution happens there. Alpha-
+/// renaming is the proper fix when a real capture is detected; panic
+/// over silent miscompilation until that's implemented.
+///
+/// **Per-variant boilerplate.** Adding a new `ExprNode` variant
+/// requires editing three places: `substitute_impl`, `collect_free_vars`,
+/// and the pretty-printer. Not painful enough yet to justify a
+/// proc-macro `walk_children` helper, but worth documenting as a
+/// smell — if the variant count climbs, a folding abstraction would
+/// collapse ~130 lines of per-arm dispatch to ~30.
 ///
 /// Used by exec-fn codegen to substitute call-site args for callee
 /// params in inlined `require` / `ensure` / `decrease` expressions.
@@ -380,16 +388,13 @@ pub enum Tactic {
 /// shadowing) and tractable for omega (no zeta-reduction needed).
 pub fn substitute(expr: &Expr, subst: &std::collections::HashMap<String, Expr>) -> Expr {
     if subst.is_empty() { return expr.clone(); }
-    let free_in_subst_values = free_vars_of_subst_values(subst);
-    substitute_impl(expr, subst, &free_in_subst_values)
+    substitute_impl(expr, subst)
 }
 
 fn substitute_impl(
     expr: &Expr,
     subst: &std::collections::HashMap<String, Expr>,
-    free_in_values: &std::collections::HashSet<String>,
 ) -> Expr {
-    use std::collections::HashMap;
     let node = match &expr.node {
         ExprNode::Var(name) => match subst.get(name) {
             Some(replacement) => return replacement.clone(),
@@ -402,103 +407,134 @@ fn substitute_impl(
         ExprNode::Raw(s) => ExprNode::Raw(s.clone()),
         ExprNode::BinOp { op, lhs, rhs } => ExprNode::BinOp {
             op: *op,
-            lhs: Box::new(substitute_impl(lhs, subst, free_in_values)),
-            rhs: Box::new(substitute_impl(rhs, subst, free_in_values)),
+            lhs: Box::new(substitute_impl(lhs, subst)),
+            rhs: Box::new(substitute_impl(rhs, subst)),
         },
         ExprNode::UnOp { op, arg } => ExprNode::UnOp {
             op: *op,
-            arg: Box::new(substitute_impl(arg, subst, free_in_values)),
+            arg: Box::new(substitute_impl(arg, subst)),
         },
         ExprNode::App { head, args } => ExprNode::App {
-            head: Box::new(substitute_impl(head, subst, free_in_values)),
-            args: args.iter().map(|a| substitute_impl(a, subst, free_in_values)).collect(),
+            head: Box::new(substitute_impl(head, subst)),
+            args: args.iter().map(|a| substitute_impl(a, subst)).collect(),
         },
         ExprNode::Let { name, value, body } => {
-            let new_value = substitute_impl(value, subst, free_in_values);
-            check_capture(name, free_in_values, "let");
+            let new_value = substitute_impl(value, subst);
             let inner_subst = subst_without(subst, name);
+            check_capture_lazy(&[name], &inner_subst, "let");
             ExprNode::Let {
                 name: name.clone(),
                 value: Box::new(new_value),
-                body: Box::new(substitute_impl(body, &inner_subst, free_in_values)),
+                body: Box::new(substitute_impl(body, &inner_subst)),
             }
         }
         ExprNode::Lambda { binders, body } => {
-            for b in binders {
-                if let Some(n) = &b.name { check_capture(n, free_in_values, "lambda"); }
-            }
             let inner_subst = subst_remove_binders(subst, binders);
+            let binder_names: Vec<&str> = binders.iter()
+                .filter_map(|b| b.name.as_deref())
+                .collect();
+            check_capture_lazy(&binder_names, &inner_subst, "lambda");
             ExprNode::Lambda {
                 binders: binders.clone(),
-                body: Box::new(substitute_impl(body, &inner_subst, free_in_values)),
+                body: Box::new(substitute_impl(body, &inner_subst)),
             }
         }
         ExprNode::Forall { binders, body } => {
-            for b in binders {
-                if let Some(n) = &b.name { check_capture(n, free_in_values, "forall"); }
-            }
             let inner_subst = subst_remove_binders(subst, binders);
+            let binder_names: Vec<&str> = binders.iter()
+                .filter_map(|b| b.name.as_deref())
+                .collect();
+            check_capture_lazy(&binder_names, &inner_subst, "forall");
             ExprNode::Forall {
                 binders: binders.clone(),
-                body: Box::new(substitute_impl(body, &inner_subst, free_in_values)),
+                body: Box::new(substitute_impl(body, &inner_subst)),
             }
         }
         ExprNode::Exists { binders, body } => {
-            for b in binders {
-                if let Some(n) = &b.name { check_capture(n, free_in_values, "exists"); }
-            }
             let inner_subst = subst_remove_binders(subst, binders);
+            let binder_names: Vec<&str> = binders.iter()
+                .filter_map(|b| b.name.as_deref())
+                .collect();
+            check_capture_lazy(&binder_names, &inner_subst, "exists");
             ExprNode::Exists {
                 binders: binders.clone(),
-                body: Box::new(substitute_impl(body, &inner_subst, free_in_values)),
+                body: Box::new(substitute_impl(body, &inner_subst)),
             }
         }
         ExprNode::If { cond, then_, else_ } => ExprNode::If {
-            cond: Box::new(substitute_impl(cond, subst, free_in_values)),
-            then_: Box::new(substitute_impl(then_, subst, free_in_values)),
-            else_: else_.as_ref().map(|e| Box::new(substitute_impl(e, subst, free_in_values))),
+            cond: Box::new(substitute_impl(cond, subst)),
+            then_: Box::new(substitute_impl(then_, subst)),
+            else_: else_.as_ref().map(|e| Box::new(substitute_impl(e, subst))),
         },
         ExprNode::Match { scrutinee, arms } => ExprNode::Match {
-            scrutinee: Box::new(substitute_impl(scrutinee, subst, free_in_values)),
+            scrutinee: Box::new(substitute_impl(scrutinee, subst)),
             arms: arms.iter().map(|a| {
                 // Pattern variables are locally bound; remove them from subst
                 // for the arm body.
                 let bound = pattern_bound_names(&a.pattern);
-                for n in &bound { check_capture(n, free_in_values, "match pattern"); }
                 let mut inner = subst.clone();
                 for n in &bound { inner.remove(n); }
+                let bound_refs: Vec<&str> = bound.iter().map(String::as_str).collect();
+                check_capture_lazy(&bound_refs, &inner, "match pattern");
                 MatchArm {
                     pattern: a.pattern.clone(),
-                    body: substitute_impl(&a.body, &inner, free_in_values),
+                    body: substitute_impl(&a.body, &inner),
                 }
             }).collect(),
         },
         ExprNode::TypeAnnot { expr, ty } => ExprNode::TypeAnnot {
-            expr: Box::new(substitute_impl(expr, subst, free_in_values)),
+            expr: Box::new(substitute_impl(expr, subst)),
             // Type expressions can also reference vars; substitute too.
-            ty: Box::new(substitute_impl(ty, subst, free_in_values)),
+            ty: Box::new(substitute_impl(ty, subst)),
         },
         ExprNode::FieldProj { expr, field } => ExprNode::FieldProj {
-            expr: Box::new(substitute_impl(expr, subst, free_in_values)),
+            expr: Box::new(substitute_impl(expr, subst)),
             field: field.clone(),
         },
         ExprNode::StructUpdate { base, updates } => ExprNode::StructUpdate {
-            base: Box::new(substitute_impl(base, subst, free_in_values)),
-            updates: updates.iter().map(|(f, e)| (f.clone(), substitute_impl(e, subst, free_in_values))).collect(),
+            base: Box::new(substitute_impl(base, subst)),
+            updates: updates.iter().map(|(f, e)| (f.clone(), substitute_impl(e, subst))).collect(),
         },
         ExprNode::ArrayLit(es) => ExprNode::ArrayLit(
-            es.iter().map(|e| substitute_impl(e, subst, free_in_values)).collect()
+            es.iter().map(|e| substitute_impl(e, subst)).collect()
         ),
         ExprNode::Index { base, idx } => ExprNode::Index {
-            base: Box::new(substitute_impl(base, subst, free_in_values)),
-            idx: Box::new(substitute_impl(idx, subst, free_in_values)),
+            base: Box::new(substitute_impl(base, subst)),
+            idx: Box::new(substitute_impl(idx, subst)),
         },
         ExprNode::Anon(es) => ExprNode::Anon(
-            es.iter().map(|e| substitute_impl(e, subst, free_in_values)).collect()
+            es.iter().map(|e| substitute_impl(e, subst)).collect()
         ),
     };
-    let _ = HashMap::<(), ()>::new; // silence unused import in some cfgs
     Expr::new(node)
+}
+
+/// Per-scope capture check. `binder_names` are the names the current
+/// binder introduces; `inner_subst` is what substitution would actually
+/// apply inside the binder's body (with binder names already removed).
+/// Panics if any binder name appears free in a value of `inner_subst`,
+/// because substituting that value inside the binder would accidentally
+/// rebind it. When `inner_subst` is empty, there's nothing to
+/// substitute inside the body so no capture is possible — this early
+/// exit eliminates false positives on binders whose names happen to
+/// match variables in (inactive) substitution values.
+fn check_capture_lazy(
+    binder_names: &[&str],
+    inner_subst: &std::collections::HashMap<String, Expr>,
+    binder_kind: &str,
+) {
+    if inner_subst.is_empty() { return; }
+    let free_in_values = free_vars_of_subst_values(inner_subst);
+    for name in binder_names {
+        if free_in_values.contains(*name) {
+            panic!(
+                "Lean-AST substitute: binder `{}` (kind: {}) would capture a free \
+                 variable of the same name in a substitution value — alpha-\
+                 renaming not yet implemented. See `substitute` in lean_ast.rs.",
+                name, binder_kind,
+            );
+        }
+    }
 }
 
 fn subst_without(
@@ -519,21 +555,6 @@ fn subst_remove_binders(
         if let Some(n) = &b.name { out.remove(n); }
     }
     out
-}
-
-fn check_capture(
-    bound_name: &str,
-    free_in_values: &std::collections::HashSet<String>,
-    binder_kind: &str,
-) {
-    if free_in_values.contains(bound_name) {
-        panic!(
-            "Lean-AST substitute: binder `{}` (kind: {}) would capture a free \
-             variable of the same name in a substitution value — alpha-\
-             renaming not yet implemented. See `substitute` in lean_ast.rs.",
-            bound_name, binder_kind,
-        );
-    }
 }
 
 fn free_vars_of_subst_values(
