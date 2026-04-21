@@ -335,6 +335,15 @@ pub struct Verifier {
     created_log_dir: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     created_solver_log_dir: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     vir_crate: Option<Krate>,
+    /// Post-`ast_simplify` version of `vir_crate`. Populated inside
+    /// `verify_crate_inner`; `None` until that runs. Tactus exec-fn
+    /// routing reads this because the simplified krate has Verus's
+    /// dummy-param injection applied (zero-arg fns get a `no%param`)
+    /// — using the pre-simplify form would desynchronise with
+    /// post-simplify call-site args. Proof fn routing keeps using the
+    /// pre-simplify `vir_crate` because user-visible spec rendering
+    /// wants the original expression forms.
+    vir_crate_simplified: Option<Krate>,
     crate_name: Option<String>,
     crate_names: Option<Vec<String>>,
     air_no_span: Option<vir::messages::Span>,
@@ -534,6 +543,7 @@ impl Verifier {
             created_log_dir: Arc::new(std::sync::Mutex::new(None)),
             created_solver_log_dir: Arc::new(std::sync::Mutex::new(None)),
             vir_crate: None,
+            vir_crate_simplified: None,
             crate_name: None,
             crate_names: None,
             air_no_span: None,
@@ -584,6 +594,7 @@ impl Verifier {
             created_log_dir: self.created_log_dir.clone(),
             created_solver_log_dir: self.created_solver_log_dir.clone(),
             vir_crate: self.vir_crate.clone(),
+            vir_crate_simplified: self.vir_crate_simplified.clone(),
             crate_name: self.crate_name.clone(),
             crate_names: self.crate_names.clone(),
             air_no_span: self.air_no_span.clone(),
@@ -1685,8 +1696,12 @@ impl Verifier {
                             && matches!(query_op, QueryOp::Body(Style::Normal))
                         {
                             let fn_span = &function.span;
-                            let vir_krate = self.vir_crate.as_ref()
-                                .expect("vir_crate should be initialized");
+                            // Use the post-simplify krate so dummy-param
+                            // injection aligns with what SST call sites
+                            // see — the pre-simplify `vir_crate` would
+                            // desynchronise on zero-arg fns.
+                            let vir_krate = self.vir_crate_simplified.as_ref()
+                                .expect("vir_crate_simplified should be initialized by verify_crate_inner before verify_bucket runs");
                             let vir_fn = match vir_krate.functions.iter()
                                 .find(|f| f.x.name == function.x.name)
                             {
@@ -2300,6 +2315,13 @@ impl Verifier {
         )?;
         vir::recursive_types::check_traits(&krate, &global_ctx)?;
         let krate = vir::ast_simplify::simplify_krate(&mut global_ctx, &krate)?;
+        // Stash the simplified form so Tactus's exec-fn router (which
+        // runs later inside verify_bucket) sees the same zero-arg-fn
+        // dummy-param layout that post-simplify SST call sites use.
+        // Before this, `self.vir_crate` (pre-simplify) had no dummy
+        // and call sites had one — forcing the `arg_skip` /
+        // `is_zero_arg_desugared` workaround in sst_to_lean.
+        self.vir_crate_simplified = Some(krate.clone());
 
         if self.args.log_all || self.args.log_args.log_vir_simple {
             let mut file = self.create_log_file(None, crate::config::VIR_SIMPLE_FILE_SUFFIX)?;
