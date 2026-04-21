@@ -2936,6 +2936,70 @@ test_verify_one_file! {
     }
 }
 
+// Self-recursive call with a decreasing measure — verifies. The
+// termination obligation `decrease_at_args < decrease_at_params`
+// is conjoined onto the call's requires clause by
+// `build_call_conjunction`.
+test_verify_one_file! {
+    #[test] test_exec_call_recursive_decreasing verus_code! {
+        #[verifier::tactus_auto]
+        fn count_down(n: u8) -> (r: u8)
+            ensures r == 0
+            decreases n
+        {
+            if n == 0 {
+                0
+            } else {
+                count_down((n - 1) as u8)
+            }
+        }
+    } => Ok(())
+}
+
+// Self-recursive call where the measure does NOT decrease — must
+// fail. The caller passes the same `n` to itself, so the inlined
+// `let n := n; n < n` obligation is false.
+test_verify_one_file! {
+    #[test] test_exec_call_recursive_nondecreasing verus_code! {
+        #[verifier::tactus_auto]
+        fn infinite_loop(n: u8) -> (r: u8)
+            ensures r == 0
+            decreases n
+        {
+            if n == 0 {
+                0
+            } else {
+                infinite_loop(n)
+            }
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "non-decreasing recursion should fail");
+    }
+}
+
+// Self-recursive call on a fn with NO `decreases` clause — rejected
+// by `walk_call` because there's no way to emit a termination
+// obligation, and allowing the call would silently verify an
+// infinite recursion.
+test_verify_one_file! {
+    #[test] test_exec_call_recursive_no_decreases verus_code! {
+        #[verifier::tactus_auto]
+        fn no_decrease(n: u8) -> (r: u8)
+            ensures r == 0
+        {
+            if n == 0 { 0 } else { no_decrease(n) }
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("no `decreases`")
+                || e.message.contains("cannot prove termination")
+                || e.message.contains("decreases")),
+            "recursion without decreases should be rejected, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
 // Trait method call — rejected by `walk_call` because the
 // `resolved_method` field is populated (dynamic dispatch resolution
 // that we don't handle yet).

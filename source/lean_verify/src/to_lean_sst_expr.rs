@@ -9,7 +9,7 @@
 //! is one we've committed to rendering.
 
 use vir::ast::*;
-use vir::sst::{BndX, CallFun, Exp, ExpX};
+use vir::sst::{BndX, CallFun, Exp, ExpX, InternalFun};
 use crate::lean_ast::{
     BinOp as L, Binder as LBinder, BinderKind, Expr as LExpr, ExprNode,
 };
@@ -341,8 +341,46 @@ fn exp_to_node(e: &Exp) -> ExprNode {
             );
             LExpr::app(head, args.iter().map(|a| sst_exp_to_ast(a)).collect()).node
         }
+        // `CheckDecreaseHeight(cur, prev, otherwise)` is the
+        // termination obligation Verus inserts before each recursive
+        // call (including mutual recursion across an SCC; see
+        // `vir::recursion::check_decrease_call`). Per the prelude
+        // axiom (`vir/src/prelude.rs:1019-1028`), its semantics is:
+        //
+        //   height_lt(height(cur), height(prev))
+        //     ∨ (height(cur) = height(prev) ∧ otherwise)
+        //
+        // For int-typed decreases (`TypX::Int`), `height` is the
+        // identity (modulo poly box/unbox), and the prelude also
+        // axiomatises `height_lt(height(c), height(p)) ↔ 0 ≤ c ∧ c <
+        // p` (`vir/src/prelude.rs:1030-1037`). So we can inline the
+        // whole thing directly at the Lean level — no `height`
+        // function needed, no axioms, completely transparent.
+        //
+        // For non-int (datatype) decreases, the `height` function is
+        // non-trivial (encodes structural recursion on the datatype).
+        // We don't support that yet; `sst_to_lean::check_exp` rejects
+        // CheckDecreaseHeight whose `cur.typ` isn't `TypX::Int`, so
+        // by the time we reach this arm the int-only case is
+        // guaranteed.
+        ExpX::Call(CallFun::InternalFun(InternalFun::CheckDecreaseHeight), _, args) => {
+            assert_eq!(args.len(), 3,
+                "CheckDecreaseHeight expects 3 args (cur, prev, otherwise), got {}",
+                args.len());
+            let cur = sst_exp_to_ast(&args[0]);
+            let prev = sst_exp_to_ast(&args[1]);
+            let otherwise = sst_exp_to_ast(&args[2]);
+            // (0 ≤ cur ∧ cur < prev) ∨ (cur = prev ∧ otherwise)
+            let lt_branch = LExpr::and(
+                LExpr::le(LExpr::lit_int("0"), cur.clone()),
+                LExpr::lt(cur.clone(), prev.clone()),
+            );
+            let eq_branch = LExpr::and(LExpr::eq(cur, prev), otherwise);
+            LExpr::or(lt_branch, eq_branch).node
+        }
         ExpX::Call(CallFun::InternalFun(_), _, _) => panic!(
-            "to_lean_sst_expr: InternalFun should have been rejected by supported_body"
+            "to_lean_sst_expr: InternalFun (non-CheckDecreaseHeight) \
+             should have been rejected by sst_to_lean::check_exp"
         ),
 
         ExpX::Bind(bnd, body) => match &bnd.x {
