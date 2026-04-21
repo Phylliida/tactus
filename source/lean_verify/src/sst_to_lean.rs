@@ -21,6 +21,14 @@
 //!                         true`) — all three lower to the same
 //!                         `BodyItem::Return`.
 //!   * `StmX::Air`, `StmX::Fuel`, `StmX::RevealString` — transparent
+//!   * `StmX::Call`      — direct named function calls. The callee's
+//!                         `requires` becomes an obligation, its
+//!                         `ensures` a hypothesis bound under `∀ ret`.
+//!                         Callees are inlined (their spec is pulled
+//!                         from `FunctionX`), so no Lean definition of
+//!                         the callee is needed. Rejects: trait
+//!                         methods, generics, `&mut` args, cross-crate
+//!                         calls. See "Loop / Call obligations" below.
 //!   * `StmX::Loop`      — `while` loops with `loop_isolation: true`,
 //!                         simple `while` condition (no setup
 //!                         statements), single-expression `decreases`,
@@ -112,12 +120,26 @@ use std::collections::{HashMap, HashSet};
 use vir::sst::{
     BndX, CallFun, Dest, Exp, ExpX, FuncCheckSst, FunctionSst, LoopInv, Par, Stm, StmX,
 };
-use vir::ast::{BinaryOp, Typ, UnaryOp, UnaryOpr, VarIdent};
+use vir::ast::{BinaryOp, Fun, FunctionX, KrateX, Typ, UnaryOp, UnaryOpr, VarIdent};
 use crate::lean_ast::{
     and_all, Binder as LBinder, BinderKind, Expr as LExpr, Tactic, Theorem,
 };
+use crate::to_lean_expr::vir_expr_to_ast;
 use crate::to_lean_sst_expr::{sst_exp_to_ast, type_bound_predicate};
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
+
+/// Lookup table from callee `Fun` to its VIR-AST `FunctionX`. Used by
+/// `BodyItem::Call` to inline a callee's `requires` / `ensures` at the
+/// call site. Callee's spec lives on `FunctionX` (VIR-AST), not on
+/// its `FunctionSst`, so the map points at the AST form.
+pub type FnMap<'a> = HashMap<&'a Fun, &'a FunctionX>;
+
+/// Build the `FnMap` from a crate's full function list. Cheap enough to
+/// rebuild per fn-verification; can be hoisted up the call stack if
+/// profiling ever justifies it.
+pub fn build_fn_map(krate: &KrateX) -> FnMap<'_> {
+    krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect()
+}
 
 // ── Support check ──────────────────────────────────────────────────────
 //
@@ -125,9 +147,10 @@ use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
 // every statement and every expression is something we know how to emit.
 
 /// Confirm the function's body, requires, and ensures only use SST forms
-/// that `sst_to_lean` currently knows how to emit.
-pub fn supported_body(check: &FuncCheckSst) -> Result<(), String> {
-    check_stm(&check.body)?;
+/// that `sst_to_lean` currently knows how to emit. The `fn_map` is used
+/// to validate that every called fn's spec is available for inlining.
+pub fn supported_body(check: &FuncCheckSst, fn_map: &FnMap<'_>) -> Result<(), String> {
+    check_stm(&check.body, fn_map)?;
     for req in check.reqs.iter() {
         check_exp(req)?;
     }
@@ -137,9 +160,9 @@ pub fn supported_body(check: &FuncCheckSst) -> Result<(), String> {
     Ok(())
 }
 
-fn check_stm(stm: &Stm) -> Result<(), String> {
+fn check_stm(stm: &Stm, fn_map: &FnMap<'_>) -> Result<(), String> {
     match &stm.x {
-        StmX::Block(stms) => stms.iter().try_for_each(check_stm),
+        StmX::Block(stms) => stms.iter().try_for_each(|s| check_stm(s, fn_map)),
         StmX::Assign { lhs: Dest { dest, .. }, rhs } => {
             check_exp(dest)?;
             check_exp(rhs)?;
@@ -170,12 +193,14 @@ fn check_stm(stm: &Stm) -> Result<(), String> {
         StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => Ok(()),
         StmX::If(cond, then_stm, else_stm) => {
             check_exp(cond)?;
-            check_stm(then_stm)?;
-            else_stm.as_ref().map_or(Ok(()), |e| check_stm(e))
+            check_stm(then_stm, fn_map)?;
+            else_stm.as_ref().map_or(Ok(()), |e| check_stm(e, fn_map))
         }
-        StmX::Loop { .. } => check_loop(&stm.x),
-        StmX::Call { .. } => Err("function calls in exec fn body not yet supported".to_string()),
-        StmX::BreakOrContinue { .. } => Err("break/continue not yet supported".to_string()),
+        StmX::Loop { .. } => check_loop(&stm.x, fn_map),
+        StmX::Call { .. } => check_call(&stm.x, fn_map),
+        StmX::BreakOrContinue { .. } => Err(
+            "break/continue not yet supported".to_string()
+        ),
         StmX::AssertBitVector { .. } => Err("assert by(bit_vector) not yet supported".to_string()),
         StmX::AssertQuery { .. } => Err("assert by(...) queries not yet supported".to_string()),
         StmX::DeadEnd(_) => Err("DeadEnd not yet supported".to_string()),
@@ -189,7 +214,55 @@ fn check_stm(stm: &Stm) -> Result<(), String> {
 /// condition with no setup stmts, single-expression `decreases`, and
 /// invariants true at both entry and exit. Recurses into the body +
 /// invariants + decrease-expression via `check_stm` / `check_exp`.
-fn check_loop(stm: &StmX) -> Result<(), String> {
+/// Validate a `StmX::Call`: must be a direct named call to a fn we
+/// have the signature for, no trait-method dispatch, no by-`&mut`
+/// args, no generic type arguments. The last two restrictions can be
+/// lifted later with more plumbing; the first just reflects that we
+/// only inline callee specs and don't resolve dispatch ourselves.
+fn check_call(stm: &StmX, fn_map: &FnMap<'_>) -> Result<(), String> {
+    let StmX::Call {
+        fun, resolved_method, typ_args, args, split, ..
+    } = stm else {
+        unreachable!("check_call called on non-Call statement");
+    };
+    if resolved_method.is_some() {
+        return Err(
+            "calls to trait methods (requiring dynamic dispatch resolution) are not \
+             yet supported".to_string()
+        );
+    }
+    if split.is_some() {
+        return Err(
+            "calls with split-assertion error reporting are not yet supported".to_string()
+        );
+    }
+    if !typ_args.is_empty() {
+        return Err(
+            "calls to generic functions (non-empty type args) are not yet supported".to_string()
+        );
+    }
+    if !fn_map.contains_key(fun) {
+        return Err(format!(
+            "callee `{:?}` not found in the crate's function map — cross-crate calls are \
+             not yet supported",
+            fun.path
+        ));
+    }
+    for a in args.iter() {
+        // `ExpX::Loc` shows up when an argument is passed by `&mut`
+        // reference. We only support by-value arguments for now —
+        // `&mut` needs havoc-after-call semantics.
+        if matches!(&a.x, ExpX::Loc(_)) {
+            return Err(
+                "calls with `&mut` arguments are not yet supported".to_string()
+            );
+        }
+        check_exp(a)?;
+    }
+    Ok(())
+}
+
+fn check_loop(stm: &StmX, fn_map: &FnMap<'_>) -> Result<(), String> {
     let StmX::Loop {
         loop_isolation, cond, body, invs, decrease, modified_vars, ..
     } = stm else {
@@ -227,7 +300,7 @@ fn check_loop(stm: &StmX) -> Result<(), String> {
     // here for the exhaustive match and otherwise ignore it.
     let _ = modified_vars;
     check_exp(cond_exp)?;
-    check_stm(body)?;
+    check_stm(body, fn_map)?;
     for inv in invs.iter() {
         check_exp(&inv.inv)?;
     }
@@ -293,7 +366,11 @@ fn check_exp(e: &Exp) -> Result<(), String> {
 /// separate theorems (e.g., for per-loop diagnostics); today it's
 /// always length 1 — loops contribute conjuncts to the main goal
 /// rather than their own top-level theorems.
-pub fn exec_fn_theorems_to_ast(fn_sst: &FunctionSst, check: &FuncCheckSst) -> Vec<Theorem> {
+pub fn exec_fn_theorems_to_ast(
+    fn_sst: &FunctionSst,
+    check: &FuncCheckSst,
+    fn_map: &FnMap<'_>,
+) -> Vec<Theorem> {
     let name = format!("_tactus_body_{}", lean_name(&fn_sst.x.name.path));
     let mut binders = build_param_binders(fn_sst);
     binders.extend(build_req_binders(check));
@@ -304,14 +381,15 @@ pub fn exec_fn_theorems_to_ast(fn_sst: &FunctionSst, check: &FuncCheckSst) -> Ve
         .map(|d| (&d.ident, &d.typ))
         .collect();
 
-    let items = walk(&check.body, &type_map);
-    let has_loop = items.iter().any(BodyItem::contains_loop);
+    let items = walk(&check.body, &type_map, fn_map);
+    let has_loop_or_call = items.iter().any(BodyItem::needs_peel);
     let goal = build_goal(
         &items,
         check.post_condition.dest.as_ref().map(|v| v.0.as_str()),
         &check.post_condition.ens_exps,
+        fn_map,
     );
-    let tactic = if has_loop { loop_tactic() } else { simple_tactic() };
+    let tactic = if has_loop_or_call { loop_tactic() } else { simple_tactic() };
     vec![Theorem { name, binders, goal, tactic }]
 }
 
@@ -382,9 +460,10 @@ fn build_goal(
     items: &[BodyItem<'_>],
     ret_name: Option<&str>,
     ensures: &[Exp],
+    fn_map: &FnMap<'_>,
 ) -> LExpr {
     let terminator = and_all(ensures.iter().map(sst_exp_to_ast).collect());
-    build_goal_with_terminator(items, ret_name, &terminator)
+    build_goal_with_terminator(items, ret_name, &terminator, fn_map)
 }
 
 /// The real WP builder, parameterized on what the continuation ends in.
@@ -403,6 +482,7 @@ fn build_goal_with_terminator(
     items: &[BodyItem<'_>],
     ret_name: Option<&str>,
     terminator: &LExpr,
+    fn_map: &FnMap<'_>,
 ) -> LExpr {
     let Some((head, rest)) = items.split_first() else { return terminator.clone() };
     match head {
@@ -416,16 +496,16 @@ fn build_goal_with_terminator(
         BodyItem::Let(name, rhs) => lift_if_value(rhs, &|rhs_ast| {
             LExpr::let_bind(
                 sanitize(name), rhs_ast,
-                build_goal_with_terminator(rest, ret_name, terminator),
+                build_goal_with_terminator(rest, ret_name, terminator, fn_map),
             )
         }),
         BodyItem::Assume(e) => LExpr::implies(
             sst_exp_to_ast(e),
-            build_goal_with_terminator(rest, ret_name, terminator),
+            build_goal_with_terminator(rest, ret_name, terminator, fn_map),
         ),
         BodyItem::Assert(e) => LExpr::and(
             sst_exp_to_ast(e),
-            build_goal_with_terminator(rest, ret_name, terminator),
+            build_goal_with_terminator(rest, ret_name, terminator, fn_map),
         ),
         BodyItem::Return(e) => lift_if_value(e, &|e_ast| match ret_name {
             Some(name) => LExpr::let_bind(sanitize(name), e_ast, terminator.clone()),
@@ -445,11 +525,11 @@ fn build_goal_with_terminator(
             LExpr::and(
                 LExpr::implies(
                     cond_ast.clone(),
-                    build_goal_with_terminator(&then_all, ret_name, terminator),
+                    build_goal_with_terminator(&then_all, ret_name, terminator, fn_map),
                 ),
                 LExpr::implies(
                     LExpr::not(cond_ast),
-                    build_goal_with_terminator(&else_all, ret_name, terminator),
+                    build_goal_with_terminator(&else_all, ret_name, terminator, fn_map),
                 ),
             )
         }
@@ -459,8 +539,14 @@ fn build_goal_with_terminator(
         BodyItem::Loop { cond, invs, decrease, modified_vars, body_items } => {
             build_loop_conjunction(
                 cond, invs, decrease, modified_vars, body_items,
-                rest, ret_name, terminator,
+                rest, ret_name, terminator, fn_map,
             )
+        }
+        // WP: `requires ∧ (∀ ret, bound(ret) → ensures(ret) →
+        // wp(rest))`. Inlines the callee's spec instead of emitting
+        // a Lean definition for it. See `build_call_conjunction`.
+        BodyItem::Call { callee, args, dest } => {
+            build_call_conjunction(callee, args, *dest, rest, ret_name, terminator, fn_map)
         }
     }
 }
@@ -543,6 +629,7 @@ fn build_loop_conjunction(
     rest: &[BodyItem<'_>],
     ret_name: Option<&str>,
     terminator: &LExpr,
+    fn_map: &FnMap<'_>,
 ) -> LExpr {
     let inv_conj = || and_all(invs.iter().map(|i| sst_exp_to_ast(&i.inv)).collect());
     let cond_ast = || sst_exp_to_ast(cond);
@@ -571,7 +658,7 @@ fn build_loop_conjunction(
         inv_conj(),
         LExpr::lt(decrease_ast(), LExpr::var("_tactus_d_old")),
     );
-    let maintain_body_wp = build_goal_with_terminator(body_items, ret_name, &post_body);
+    let maintain_body_wp = build_goal_with_terminator(body_items, ret_name, &post_body, fn_map);
     let maintain_core = LExpr::let_bind("_tactus_d_old", decrease_ast(), maintain_body_wp);
     let maintain_clause = quantify_mod_vars(
         modified_vars,
@@ -580,13 +667,116 @@ fn build_loop_conjunction(
 
     // Use / continuation: `∀ mod_vars, bounds → I ∧ ¬cond →
     //   wp(rest, outer_terminator)`.
-    let rest_goal = build_goal_with_terminator(rest, ret_name, terminator);
+    let rest_goal = build_goal_with_terminator(rest, ret_name, terminator, fn_map);
     let use_clause = quantify_mod_vars(
         modified_vars,
         LExpr::implies(LExpr::and(inv_conj(), LExpr::not(cond_ast())), rest_goal),
     );
 
     LExpr::and(init_clause, LExpr::and(maintain_clause, use_clause))
+}
+
+/// Emit the WP conjunction contributed by a single function call.
+///
+/// For `let dest = callee(arg1, arg2, …)`:
+///
+/// ```
+/// (let p1 := arg1; let p2 := arg2; …; requires_conj)
+/// ∧ (∀ (ret : RetT), h_ret_bound(ret) →
+///      (let p1 := arg1; let p2 := arg2; …; ensures_conj_using_ret) →
+///      (let dest := ret; wp(rest, outer_terminator)))
+/// ```
+///
+/// Parameter substitution is done via Lean `let`-bindings rather than
+/// rewriting the callee's spec at the SST level — same trick as
+/// `_tactus_d_old`, cheap and obviously correct.
+///
+/// `ret` is the callee's declared return-var name (pulled from
+/// `FunctionX::ret`). If the callee returns unit or the call discards
+/// its result, the `∀` is skipped and `dest` isn't bound.
+///
+/// No termination obligation yet — calls to recursive fns (including
+/// self) will verify even when they're not actually well-founded.
+/// Fixing this requires a decreasing-measure comparison across the
+/// call (like loops have for their `decreases`).
+fn build_call_conjunction(
+    callee: &FunctionX,
+    args: &[&Exp],
+    dest: Option<(&VarIdent, &Typ)>,
+    rest: &[BodyItem<'_>],
+    ret_name: Option<&str>,
+    terminator: &LExpr,
+    fn_map: &FnMap<'_>,
+) -> LExpr {
+    // Filter out Verus-synthetic params (same `%` filter as
+    // `build_param_binders`). The arg list Verus emits is aligned
+    // with the real params, so skipping the synthetic ones on the
+    // callee side also skips their positional slot in `args`.
+    let real_params: Vec<_> = callee.params.iter()
+        .filter(|p| !p.x.name.0.contains('%'))
+        .collect();
+    debug_assert_eq!(
+        real_params.len(), args.len(),
+        "callee real-param count {} != caller arg count {} for {:?}",
+        real_params.len(), args.len(), callee.name.path,
+    );
+
+    // Wrap a goal `inner` with `let p1 := arg1; let p2 := arg2; …;
+    // inner` so the callee's param names resolve to the caller's
+    // argument expressions without needing a tree-rewrite pass.
+    let wrap_with_arg_lets = |inner: LExpr| -> LExpr {
+        real_params.iter().zip(args.iter()).rev().fold(inner, |acc, (p, arg)| {
+            LExpr::let_bind(sanitize(&p.x.name.0), sst_exp_to_ast(arg), acc)
+        })
+    };
+
+    let requires_conj = and_all(
+        callee.require.iter().map(|e| vir_expr_to_ast(e)).collect()
+    );
+    let ensures_conj = and_all(
+        callee.ensure.0.iter().map(|e| vir_expr_to_ast(e)).collect()
+    );
+
+    let requires_clause = wrap_with_arg_lets(requires_conj);
+
+    // Continuation under a havoc'd return value. If the callee's
+    // return type is a tuple or unit with no declared ret name,
+    // skip the ∀ and treat the ensures as a flat hypothesis.
+    let ret = &callee.ret.x;
+    let ret_name_cal = sanitize(&ret.name.0);
+    let ret_typ = typ_to_expr(&ret.typ);
+    let continuation_under_ret = {
+        let rest_goal = build_goal_with_terminator(rest, ret_name, terminator, fn_map);
+        // If the caller has a destination, bind `let dest := <ret>;
+        // rest_goal` inside the ∀. Otherwise rest sees the call as
+        // having no bound value.
+        let bound_rest = match dest {
+            Some((dest_ident, _)) => LExpr::let_bind(
+                sanitize(&dest_ident.0),
+                LExpr::var(ret_name_cal.clone()),
+                rest_goal,
+            ),
+            None => rest_goal,
+        };
+        // ensures(ret) → bound_rest
+        let ensures_impl = LExpr::implies(wrap_with_arg_lets(ensures_conj), bound_rest);
+        // Optionally wrap with `h_bound(ret) → …`.
+        let bounded_impl = match type_bound_predicate(&LExpr::var(ret_name_cal.clone()), &ret.typ) {
+            Some(pred) => LExpr::implies(pred, ensures_impl),
+            None => ensures_impl,
+        };
+        // ∀ ret : RetTyp, ...
+        LExpr::forall(
+            vec![LBinder {
+                name: Some(ret_name_cal.clone()),
+                ty: ret_typ,
+                kind: BinderKind::Explicit,
+            }],
+            bounded_impl,
+        )
+    };
+
+    LExpr::and(requires_clause, continuation_under_ret)
 }
 
 /// `∀ (x₁ : T₁), bounds₁ → … ∀ (xₙ : Tₙ), boundsₙ → body` — wraps
@@ -654,18 +844,32 @@ enum BodyItem<'a> {
         modified_vars: Vec<(&'a VarIdent, &'a Typ)>,
         body_items: Vec<BodyItem<'a>>,
     },
+    /// `foo(arg1, arg2, …)` optionally binding the result to a local.
+    /// `callee` is the full VIR-AST `FunctionX` so `build_goal` has
+    /// the requires / ensures / param list / return var all in one
+    /// place. Args are borrowed from the SST.
+    Call {
+        callee: &'a FunctionX,
+        args: Vec<&'a Exp>,
+        /// `Some((name, typ))` for `let x = foo(…)`; `None` for
+        /// discarded or unit return.
+        dest: Option<(&'a VarIdent, &'a Typ)>,
+    },
 }
 
 impl<'a> BodyItem<'a> {
-    /// Does this item — or any sub-item nested inside it — contain a
-    /// loop? Used at theorem-emit time to pick between the plain
-    /// `tactus_auto` tactic and the structural-peeling loop tactic.
-    fn contains_loop(&self) -> bool {
+    /// Does this item — or any sub-item nested inside it — produce a
+    /// goal shape that needs structural peeling? Loops, calls (which
+    /// introduce `∀ result, …`), and `IfThenElse` wrapping either
+    /// qualify; flat Let/Assert/Assume/Return chains don't. Used at
+    /// theorem-emit time to pick between plain `tactus_auto` and the
+    /// `tactus_peel`-prefixed loop tactic.
+    fn needs_peel(&self) -> bool {
         match self {
-            BodyItem::Loop { .. } => true,
+            BodyItem::Loop { .. } | BodyItem::Call { .. } => true,
             BodyItem::IfThenElse { then_items, else_items, .. } => {
-                then_items.iter().any(Self::contains_loop)
-                    || else_items.iter().any(Self::contains_loop)
+                then_items.iter().any(Self::needs_peel)
+                    || else_items.iter().any(Self::needs_peel)
             }
             _ => false,
         }
@@ -682,9 +886,10 @@ impl<'a> BodyItem<'a> {
 fn walk<'a>(
     stm: &'a Stm,
     type_map: &HashMap<&'a VarIdent, &'a Typ>,
+    fn_map: &FnMap<'a>,
 ) -> Vec<BodyItem<'a>> {
     match &stm.x {
-        StmX::Block(stms) => stms.iter().flat_map(|s| walk(s, type_map)).collect(),
+        StmX::Block(stms) => stms.iter().flat_map(|s| walk(s, type_map, fn_map)).collect(),
         StmX::Assign { lhs: Dest { dest, .. }, rhs } => {
             extract_simple_var(dest).map_or_else(Vec::new, |name| vec![BodyItem::Let(name, rhs)])
         }
@@ -696,9 +901,27 @@ fn walk<'a>(
         StmX::Return { ret_exp: None, .. } => Vec::new(),
         StmX::If(cond, then_stm, else_stm) => vec![BodyItem::IfThenElse {
             cond,
-            then_items: walk(then_stm, type_map),
-            else_items: else_stm.as_ref().map_or_else(Vec::new, |e| walk(e, type_map)),
+            then_items: walk(then_stm, type_map, fn_map),
+            else_items: else_stm.as_ref().map_or_else(Vec::new, |e| walk(e, type_map, fn_map)),
         }],
+        StmX::Call { fun, args, dest, .. } => {
+            let callee = fn_map.get(fun).copied()
+                .expect("check_call guarantees the callee is in the map");
+            let arg_refs: Vec<&'a Exp> = args.iter().collect();
+            // `Dest { dest: <Exp>, is_init: _ }` — extract the simple
+            // var name + its type. `None` if the call discards the
+            // result (`foo(…);` without `let x =`).
+            let bound_dest: Option<(&'a VarIdent, &'a Typ)> = dest.as_ref().and_then(|d| {
+                let ident = extract_simple_var_ident(&d.dest)?;
+                let typ = type_map.get(ident).copied()?;
+                Some((ident, typ))
+            });
+            vec![BodyItem::Call {
+                callee,
+                args: arg_refs,
+                dest: bound_dest,
+            }]
+        }
         StmX::Loop { cond, body, invs, decrease, .. } => {
             let (_, cond_exp) = cond.as_ref().expect("check_stm guarantees Some cond");
             let decrease_exp = decrease.first().expect("check_stm guarantees one decrease");
@@ -722,15 +945,14 @@ fn walk<'a>(
                 invs: &invs[..],
                 decrease: decrease_exp,
                 modified_vars,
-                body_items: walk(body, type_map),
+                body_items: walk(body, type_map, fn_map),
             }]
         }
         // Transparent in SST: contribute nothing to the WP goal.
         StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => Vec::new(),
         // All rejected by `check_stm`. Reaching them here means the
         // support-check and the walker fell out of sync.
-        StmX::Call { .. }
-        | StmX::BreakOrContinue { .. }
+        StmX::BreakOrContinue { .. }
         | StmX::AssertBitVector { .. }
         | StmX::AssertQuery { .. }
         | StmX::DeadEnd(_)

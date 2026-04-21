@@ -757,18 +757,54 @@ theorem overflow_check_line_N ... : 0 ≤ result ∧ result < 2^bits := by tactu
 
 Alternative: introduce a `let _goal_k := <rest_goal>` binding at each if and have both branches refer to `_goal_k`. This preserves logical equivalence with linear size. Not implemented — the cost hasn't shown up yet — but noted here so the trade-off is explicit when someone hits it.
 
-### `StmX::Call` — the next major capability
+### `StmX::Call` — landed (slice 7)
 
-`sst_to_lean` currently rejects every exec-mode function call (`StmX::Call { .. } => Err("function calls in exec fn body not yet supported")`). Every real Rust program calls functions — this is the single biggest feature gap for users who want to verify non-trivial exec code with Tactus.
+Exec fns can now call other exec/proof/spec fns. The WP rule for
+`let y = foo(a1, a2)`:
 
-Supporting it needs:
+```
+(let p1 := a1; let p2 := a2; requires_conj)
+∧ ∀ (ret : RetT), h_ret_bound(ret) →
+    (let p1 := a1; let p2 := a2; ensures_conj_using_ret) →
+    let y := ret; wp(rest, terminator)
+```
 
-* **Callee obligation encoding** — when `foo(args)` is called, the callee's `requires` becomes an obligation on the caller (inline `∧`) and its `ensures` becomes a hypothesis (inline `→`). The callee's spec fn body is already emitted in the preamble (via `dep_order`), so looking up the signature from `FunctionSst` is straightforward; the tricky part is which fn-id → Lean-name mapping to use and how to thread `Fun` lookups through `sst_to_lean`.
-* **Return-value binding** — `let r = foo(args)` turns into `let r := <havoc> ; <ensures(r)>` or equivalently `∃ r, ensures(r) ∧ rest`. Verus uses the second shape via havoc; we'd do the same.
-* **Termination** — recursive callees need the decreasing-measure obligation (similar to loops but per-fn).
-* **Closure / trait dispatch** — fn-pointer and trait-method calls need resolution. Initially we can punt and only handle direct named calls.
+Param substitution is done via Lean `let`-bindings rather than
+rewriting the callee's spec at the SST level — same trick as
+`_tactus_d_old` for loops, cheap and obviously correct. The callee
+does NOT need its own Lean definition; we inline its
+requires/ensures using `vir_expr_to_ast` at each call site.
 
-The cleanest way in is to walk the `FunctionSst` crate and build a `Fun → Signature` map (requires/ensures exprs plus termination info) once per-fn-verification, then have `check_stm` / `walk` / `build_goal_with_terminator` consume it in a new `BodyItem::Call { fun, args, bind }` variant. The WP rule: `requires(args) ∧ ∀ r, ensures(args, r) → wp(rest[r/bind])`.
+`build_fn_map` constructs the `Fun → &FunctionX` lookup once per
+fn-verification and threads it through `check_stm` / `walk` /
+`build_goal_with_terminator`. A new `BodyItem::Call { callee, args,
+dest }` variant captures the relevant shape; `build_call_conjunction`
+emits the WP.
+
+**Restrictions (rejected by `check_call`):**
+
+* **Trait-method calls** — `resolved_method: Some(_)` rejected.
+  Dynamic-dispatch resolution requires plumbing the concrete impl
+  through from VIR; deferred.
+* **Generic calls** (`typ_args` non-empty) — rejected. Generics
+  complicate both the callee signature lookup (monomorphization
+  needed) and the Lean-level type substitution.
+* **`&mut` args** — rejected (`ExpX::Loc` in arg position). Would
+  need "havoc mutated args after call" semantics, parallel to loop
+  modified-var quantification.
+* **Split-assertion calls** (`split: Some(_)`) — rejected. Verus's
+  split-mode error reporting that we don't replicate.
+* **Cross-crate callees** — rejected. The `Fun → FunctionX` map only
+  covers the current crate; cross-crate needs a `CrateDecls.lean`
+  scheme (Phase 3 work).
+
+**Known gap: no termination obligation on recursive calls.**
+A fn that recursively calls itself with the same arguments will
+verify even though it doesn't terminate. Fixing this needs a
+decreasing-measure comparison across the call — similar to loops'
+`decreases` but per-fn. Callee's own termination check handles
+well-foundedness *within* the callee body, but the caller's
+obligation to decrease when recursing isn't emitted.
 
 ### `_tactus_d_old` aliasing across nested loops
 
@@ -792,7 +828,6 @@ A flat catalogue of things that don't work yet, organized by where in the pipeli
 
 Each one returns `Err("… not yet supported")`; users get a clean rejection instead of silent pass.
 
-* **`StmX::Call`** — all exec-mode function calls. See "`StmX::Call` — the next major capability" section.
 * **`StmX::BreakOrContinue`** — `break` / `continue` inside loops. Blocks `while`-with-exit patterns. Enabling this also requires relaxing `cond: Some` (loops that break compile to `cond: None`) and accepting `invariant_except_break` invariants (at-entry but not at-exit).
 * **`StmX::AssertBitVector`** — `assert by(bit_vector)`. Bitvector reasoning backend.
 * **`StmX::AssertQuery`** — `assert by(…)` with specific tactics / queries. Would need to translate the `AssertQueryMode` into a Lean tactic choice.

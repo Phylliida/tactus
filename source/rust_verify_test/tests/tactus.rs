@@ -2746,6 +2746,153 @@ test_verify_one_file! {
     }
 }
 
+// ── Slice 7: function calls in exec fn bodies ─────────────────────────
+//
+// `let y = foo(a)` generates:
+//   (let p := a; requires_conj)
+//   ∧ ∀ (ret : T), h_bound(ret) → (let p := a; ensures_with_ret) →
+//       let y := ret; wp(rest)
+//
+// Callee spec is inlined (via `vir_expr_to_ast` on its require/ensure
+// fields); the callee doesn't need its own Lean definition.
+
+// Simple: caller passes a value, callee's requires is compatible,
+// ensures flows into the caller's tail ensures.
+test_verify_one_file! {
+    #[test] test_exec_call_basic verus_code! {
+        #[verifier::tactus_auto]
+        fn add_one(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            x + 1
+        }
+
+        #[verifier::tactus_auto]
+        fn add_two(x: u8) -> (r: u8)
+            requires x < 50
+            ensures r == x + 2
+        {
+            let y: u8 = add_one(x);
+            add_one(y)
+        }
+    } => Ok(())
+}
+
+// Caller's arg doesn't meet callee's requires — must be rejected.
+// `add_one(x)` needs `x < 100`; caller only guarantees `x <= 200`.
+test_verify_one_file! {
+    #[test] test_exec_call_requires_violated verus_code! {
+        #[verifier::tactus_auto]
+        fn add_one(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            x + 1
+        }
+
+        #[verifier::tactus_auto]
+        fn bad_caller(x: u8) -> (r: u8)
+            requires x <= 200
+            ensures r == x + 1
+        {
+            add_one(x)
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "caller must satisfy callee's requires");
+    }
+}
+
+// Call in an if-branch — the call's conjunction lands inside the
+// branch's `c → …` continuation. Tests that `BodyItem::Call` composes
+// with `IfThenElse` through `build_goal_with_terminator`.
+test_verify_one_file! {
+    #[test] test_exec_call_in_if_branch verus_code! {
+        #[verifier::tactus_auto]
+        fn add_one(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            x + 1
+        }
+
+        #[verifier::tactus_auto]
+        fn maybe_bump(x: u8, flag: bool) -> (r: u8)
+            requires x < 50
+            ensures r <= x + 1
+        {
+            if flag {
+                add_one(x)
+            } else {
+                x
+            }
+        }
+    } => Ok(())
+}
+
+// Call in a loop body — exercises the composition with
+// `build_loop_conjunction`. The inner call's `requires` must hold
+// under the loop's invariant + cond; its `ensures` feeds the
+// decrease-measure proof obligation.
+test_verify_one_file! {
+    #[test] test_exec_call_in_loop verus_code! {
+        #[verifier::tactus_auto]
+        fn dec_one(x: u8) -> (r: u8)
+            requires x > 0
+            ensures r == x - 1
+        {
+            x - 1
+        }
+
+        #[verifier::tactus_auto]
+        fn count_down_via_call(n: u8) -> (r: u8)
+            ensures r == 0
+        {
+            let mut x: u8 = n;
+            while x > 0
+                invariant x <= n
+                decreases x
+            {
+                x = dec_one(x);
+            }
+            x
+        }
+    } => Ok(())
+}
+
+// Trait method call — rejected by `check_call` because the
+// `resolved_method` field is populated (dynamic dispatch resolution
+// that we don't handle yet).
+test_verify_one_file! {
+    #[test] test_exec_call_trait_method_rejected verus_code! {
+        trait Bumper {
+            fn bump(&self, x: u8) -> (r: u8)
+                ensures r == x;
+        }
+
+        struct Id;
+        impl Bumper for Id {
+            fn bump(&self, x: u8) -> (r: u8)
+                ensures r == x
+            {
+                x
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn call_via_trait(b: &Id, x: u8) -> (r: u8)
+            ensures r == x
+        {
+            b.bump(x)
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("not yet supported")),
+            "trait-method call should be rejected",
+        );
+    }
+}
+
 // Lexicographic `decreases` is rejected up front — single-expression
 // only at the current slice. Regression guard so we notice when /
 // if that restriction is lifted.
