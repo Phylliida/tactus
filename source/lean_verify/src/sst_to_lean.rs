@@ -1003,3 +1003,444 @@ fn extract_simple_var<'a>(e: &'a Exp) -> Option<&'a str> {
 fn is_synthetic_param(p: &Par) -> bool {
     p.x.name.0.contains('%')
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the Wp DSL — `needs_peel`, `lower_wp`,
+    //! `contains_loc`, `lift_if_value`, and `build_wp`'s
+    //! right-to-left Block fold.
+    //!
+    //! Test strategy: construct small `Wp` trees with hand-built SST
+    //! `Exp` values (simple Vars, Consts, Ifs) and check that
+    //! `lower_wp` produces the expected `LExpr` shape. For
+    //! `needs_peel` the Exp leaves don't matter — only the tree
+    //! structure — so we use minimal dummy exprs.
+    //!
+    //! These tests are direct-in-crate rather than integration so
+    //! they can exercise private items (`Wp`, `build_wp`, etc.).
+    use super::*;
+    use std::sync::Arc;
+    use vir::ast::{
+        IntRange, SpannedTyped, TypX, VarIdent, VarIdentDisambiguate,
+    };
+    use vir::sst::ExpX;
+    use vir::messages::Span;
+
+    // ── Helpers ─────────────────────────────────────────────────
+
+    /// A span value that passes type-checks but carries no source
+    /// info. Good enough for all our tests — we don't report errors.
+    fn test_span() -> Span {
+        Span {
+            raw_span: Arc::new(()),
+            id: 0,
+            data: vec![],
+            as_string: String::new(),
+        }
+    }
+
+    fn typ_int() -> Typ { Arc::new(TypX::Int(IntRange::Int)) }
+    fn typ_bool() -> Typ { Arc::new(TypX::Bool) }
+
+    fn var_ident(name: &str) -> VarIdent {
+        VarIdent(Arc::new(name.to_string()), VarIdentDisambiguate::AirLocal)
+    }
+
+    /// Construct an SST `Var` expression with a given name and type.
+    fn var_exp(name: &str, typ: Typ) -> Exp {
+        Arc::new(SpannedTyped {
+            span: test_span(),
+            typ,
+            x: ExpX::Var(var_ident(name)),
+        })
+    }
+
+    /// Construct an SST `If` expression.
+    fn if_exp(cond: Exp, then_e: Exp, else_e: Exp) -> Exp {
+        let typ = then_e.typ.clone();
+        Arc::new(SpannedTyped {
+            span: test_span(),
+            typ,
+            x: ExpX::If(cond, then_e, else_e),
+        })
+    }
+
+    /// Wrap an expression in `ExpX::Loc` — the L-value marker used
+    /// for `&mut` args.
+    fn loc_exp(inner: Exp) -> Exp {
+        let typ = inner.typ.clone();
+        Arc::new(SpannedTyped {
+            span: test_span(),
+            typ,
+            x: ExpX::Loc(inner),
+        })
+    }
+
+    /// Wrap in `UnaryOpr::Box` — the poly transparent wrapper.
+    fn box_exp(inner: Exp) -> Exp {
+        let typ = inner.typ.clone();
+        Arc::new(SpannedTyped {
+            span: test_span(),
+            typ: typ.clone(),
+            x: ExpX::UnaryOpr(UnaryOpr::Box(typ), inner),
+        })
+    }
+
+    /// Wrap in `UnaryOpr::Unbox`.
+    fn unbox_exp(inner: Exp) -> Exp {
+        let typ = inner.typ.clone();
+        Arc::new(SpannedTyped {
+            span: test_span(),
+            typ: typ.clone(),
+            x: ExpX::UnaryOpr(UnaryOpr::Unbox(typ), inner),
+        })
+    }
+
+    /// Minimal `WpCtx` for tests that need one but don't exercise
+    /// fn_map / type_map. `ensures_goal` is a simple `True` leaf.
+    fn mk_empty_ctx<'a>() -> WpCtx<'a> {
+        WpCtx {
+            fn_map: HashMap::new(),
+            type_map: HashMap::new(),
+            ret_name: None,
+            ensures_goal: LExpr::new(crate::lean_ast::ExprNode::LitBool(true)),
+        }
+    }
+
+    /// A dummy `Wp::Done(True)` leaf — used as `after` when the
+    /// test doesn't care about post-continuation shape.
+    fn done_true<'a>() -> Wp<'a> {
+        Wp::Done(LExpr::new(crate::lean_ast::ExprNode::LitBool(true)))
+    }
+
+    /// Compare two LExprs structurally by pretty-printing (our
+    /// printer is deterministic so equivalent trees produce
+    /// identical strings).
+    fn pp_eq(a: &LExpr, b: &LExpr) -> bool {
+        crate::lean_pp::pp_expr(a) == crate::lean_pp::pp_expr(b)
+    }
+
+    // ── needs_peel ──────────────────────────────────────────────
+
+    #[test]
+    fn needs_peel_done() {
+        let wp: Wp = Wp::Done(LExpr::var("X"));
+        assert!(!wp.needs_peel());
+    }
+
+    #[test]
+    fn needs_peel_flat_chain() {
+        let x = var_exp("x", typ_int());
+        let wp = Wp::Let("x", &x,
+            Box::new(Wp::Assert(&x,
+                Box::new(Wp::Assume(&x,
+                    Box::new(done_true()))))));
+        assert!(!wp.needs_peel());
+    }
+
+    #[test]
+    fn needs_peel_branch_of_flat_is_false() {
+        let x = var_exp("x", typ_bool());
+        let wp = Wp::Branch {
+            cond: &x,
+            then_branch: Box::new(done_true()),
+            else_branch: Box::new(done_true()),
+        };
+        assert!(!wp.needs_peel());
+    }
+
+    #[test]
+    fn needs_peel_branch_with_call_inside_is_true() {
+        // Hand-roll a `Wp::Call` — we need a FunctionX but only the
+        // tree traversal matters, so we can rely on needs_peel never
+        // looking inside the Call's fields.
+        // Instead: use a Loop (same return value) that doesn't need
+        // a FunctionX.
+        let x = var_exp("x", typ_bool());
+        let invs: Vec<LoopInv> = vec![];
+        let dec = var_exp("d", typ_int());
+        let loop_wp = Wp::Loop {
+            cond: &x,
+            invs: &invs[..],
+            decrease: &dec,
+            modified_vars: Vec::new(),
+            body: Box::new(done_true()),
+            after: Box::new(done_true()),
+        };
+        let wp = Wp::Branch {
+            cond: &x,
+            then_branch: Box::new(loop_wp),
+            else_branch: Box::new(done_true()),
+        };
+        assert!(wp.needs_peel());
+    }
+
+    #[test]
+    fn needs_peel_through_let_wrappers() {
+        // Let of a Done is peel-free; Let of a Loop is not.
+        let x = var_exp("x", typ_int());
+        let c = var_exp("c", typ_bool());
+        let dec = var_exp("d", typ_int());
+        let invs: Vec<LoopInv> = vec![];
+
+        let plain = Wp::Let("x", &x, Box::new(done_true()));
+        assert!(!plain.needs_peel());
+
+        let with_loop = Wp::Let("x", &x, Box::new(Wp::Loop {
+            cond: &c,
+            invs: &invs[..],
+            decrease: &dec,
+            modified_vars: Vec::new(),
+            body: Box::new(done_true()),
+            after: Box::new(done_true()),
+        }));
+        assert!(with_loop.needs_peel());
+    }
+
+    // ── lower_wp ────────────────────────────────────────────────
+
+    #[test]
+    fn lower_done_returns_leaf() {
+        let ctx = mk_empty_ctx();
+        let leaf = LExpr::lit_int("42");
+        let wp = Wp::Done(leaf.clone());
+        assert!(pp_eq(&lower_wp(&wp, &ctx), &leaf));
+    }
+
+    #[test]
+    fn lower_let_wraps_with_let_bind() {
+        let ctx = mk_empty_ctx();
+        // Wp::Let("x", var_exp("y"), Done(x_ref))
+        //   → let x := y; x_ref
+        let y = var_exp("y", typ_int());
+        let body_leaf = LExpr::var("inner");
+        let wp = Wp::Let("x", &y, Box::new(Wp::Done(body_leaf.clone())));
+        let out = lower_wp(&wp, &ctx);
+        let expected = LExpr::let_bind("x", LExpr::var("y"), body_leaf);
+        assert!(pp_eq(&out, &expected),
+            "got: {}\nexpected: {}",
+            crate::lean_pp::pp_expr(&out),
+            crate::lean_pp::pp_expr(&expected));
+    }
+
+    #[test]
+    fn lower_let_with_if_rhs_lifts() {
+        // Wp::Let("x", if c then a else b, Done(body))
+        //   → (c → let x := a; body) ∧ (¬c → let x := b; body)
+        let ctx = mk_empty_ctx();
+        let c = var_exp("c", typ_bool());
+        let a = var_exp("a", typ_int());
+        let b = var_exp("b", typ_int());
+        let if_rhs = if_exp(c, a, b);
+        let body_leaf = LExpr::var("inner");
+        let wp = Wp::Let("x", &if_rhs, Box::new(Wp::Done(body_leaf.clone())));
+        let out = lower_wp(&wp, &ctx);
+        let expected = LExpr::and(
+            LExpr::implies(
+                LExpr::var("c"),
+                LExpr::let_bind("x", LExpr::var("a"), body_leaf.clone()),
+            ),
+            LExpr::implies(
+                LExpr::not(LExpr::var("c")),
+                LExpr::let_bind("x", LExpr::var("b"), body_leaf),
+            ),
+        );
+        assert!(pp_eq(&out, &expected),
+            "got: {}\nexpected: {}",
+            crate::lean_pp::pp_expr(&out),
+            crate::lean_pp::pp_expr(&expected));
+    }
+
+    #[test]
+    fn lower_assert_conjoins() {
+        let ctx = mk_empty_ctx();
+        let p = var_exp("P", typ_bool());
+        let wp = Wp::Assert(&p, Box::new(Wp::Done(LExpr::var("body"))));
+        let out = lower_wp(&wp, &ctx);
+        let expected = LExpr::and(LExpr::var("P"), LExpr::var("body"));
+        assert!(pp_eq(&out, &expected));
+    }
+
+    #[test]
+    fn lower_assume_implies() {
+        let ctx = mk_empty_ctx();
+        let p = var_exp("P", typ_bool());
+        let wp = Wp::Assume(&p, Box::new(Wp::Done(LExpr::var("body"))));
+        let out = lower_wp(&wp, &ctx);
+        let expected = LExpr::implies(LExpr::var("P"), LExpr::var("body"));
+        assert!(pp_eq(&out, &expected));
+    }
+
+    #[test]
+    fn lower_branch_conjoins_two_implications() {
+        let ctx = mk_empty_ctx();
+        let c = var_exp("c", typ_bool());
+        let wp = Wp::Branch {
+            cond: &c,
+            then_branch: Box::new(Wp::Done(LExpr::var("T"))),
+            else_branch: Box::new(Wp::Done(LExpr::var("E"))),
+        };
+        let out = lower_wp(&wp, &ctx);
+        let expected = LExpr::and(
+            LExpr::implies(LExpr::var("c"), LExpr::var("T")),
+            LExpr::implies(LExpr::not(LExpr::var("c")), LExpr::var("E")),
+        );
+        assert!(pp_eq(&out, &expected));
+    }
+
+    #[test]
+    fn lower_assert_assume_right_fold() {
+        // Assert(P, Assume(Q, Done(body)))
+        //   → P ∧ (Q → body)
+        let ctx = mk_empty_ctx();
+        let p = var_exp("P", typ_bool());
+        let q = var_exp("Q", typ_bool());
+        let wp = Wp::Assert(&p, Box::new(Wp::Assume(&q,
+            Box::new(Wp::Done(LExpr::var("body"))))));
+        let out = lower_wp(&wp, &ctx);
+        let expected = LExpr::and(
+            LExpr::var("P"),
+            LExpr::implies(LExpr::var("Q"), LExpr::var("body")),
+        );
+        assert!(pp_eq(&out, &expected));
+    }
+
+    // ── contains_loc ────────────────────────────────────────────
+
+    #[test]
+    fn contains_loc_plain_var_false() {
+        let x = var_exp("x", typ_int());
+        assert!(!contains_loc(&x));
+    }
+
+    #[test]
+    fn contains_loc_direct_loc_true() {
+        let x = var_exp("x", typ_int());
+        assert!(contains_loc(&loc_exp(x)));
+    }
+
+    #[test]
+    fn contains_loc_wrapped_in_box_true() {
+        let x = var_exp("x", typ_int());
+        let wrapped = box_exp(loc_exp(x));
+        assert!(contains_loc(&wrapped));
+    }
+
+    #[test]
+    fn contains_loc_wrapped_in_unbox_true() {
+        let x = var_exp("x", typ_int());
+        let wrapped = unbox_exp(loc_exp(x));
+        assert!(contains_loc(&wrapped));
+    }
+
+    #[test]
+    fn contains_loc_double_wrapped_true() {
+        let x = var_exp("x", typ_int());
+        let wrapped = box_exp(unbox_exp(loc_exp(x)));
+        assert!(contains_loc(&wrapped));
+    }
+
+    #[test]
+    fn contains_loc_box_of_plain_var_false() {
+        let x = var_exp("x", typ_int());
+        assert!(!contains_loc(&box_exp(x)));
+    }
+
+    // ── lift_if_value ───────────────────────────────────────────
+
+    #[test]
+    fn lift_if_value_plain_passes_through() {
+        // Non-if value: `emit_leaf` is called once with the
+        // rendered expression.
+        let x = var_exp("x", typ_int());
+        let out = lift_if_value(&x, &|leaf| LExpr::let_bind("y", leaf, LExpr::var("body")));
+        let expected = LExpr::let_bind("y", LExpr::var("x"), LExpr::var("body"));
+        assert!(pp_eq(&out, &expected));
+    }
+
+    #[test]
+    fn lift_if_value_splits_on_if() {
+        // If(c, a, b) → (c → emit_leaf(a)) ∧ (¬c → emit_leaf(b))
+        let c = var_exp("c", typ_bool());
+        let a = var_exp("a", typ_int());
+        let b = var_exp("b", typ_int());
+        let e = if_exp(c, a, b);
+        let out = lift_if_value(&e, &|leaf| LExpr::let_bind("y", leaf, LExpr::var("body")));
+        let expected = LExpr::and(
+            LExpr::implies(
+                LExpr::var("c"),
+                LExpr::let_bind("y", LExpr::var("a"), LExpr::var("body")),
+            ),
+            LExpr::implies(
+                LExpr::not(LExpr::var("c")),
+                LExpr::let_bind("y", LExpr::var("b"), LExpr::var("body")),
+            ),
+        );
+        assert!(pp_eq(&out, &expected));
+    }
+
+    #[test]
+    fn lift_if_value_peels_box_wrapper() {
+        // Box(If(...)) — the Box is transparent, If still lifts.
+        let c = var_exp("c", typ_bool());
+        let a = var_exp("a", typ_int());
+        let b = var_exp("b", typ_int());
+        let e = box_exp(if_exp(c, a, b));
+        let out = lift_if_value(&e, &|leaf| LExpr::let_bind("y", leaf, LExpr::var("body")));
+        let expected = LExpr::and(
+            LExpr::implies(
+                LExpr::var("c"),
+                LExpr::let_bind("y", LExpr::var("a"), LExpr::var("body")),
+            ),
+            LExpr::implies(
+                LExpr::not(LExpr::var("c")),
+                LExpr::let_bind("y", LExpr::var("b"), LExpr::var("body")),
+            ),
+        );
+        assert!(pp_eq(&out, &expected));
+    }
+
+    #[test]
+    fn lift_if_value_peels_loc_wrapper() {
+        // Loc(If(...)) — Loc is also transparent for lifting purposes.
+        let c = var_exp("c", typ_bool());
+        let a = var_exp("a", typ_int());
+        let b = var_exp("b", typ_int());
+        let e = loc_exp(if_exp(c, a, b));
+        let out = lift_if_value(&e, &|leaf| LExpr::let_bind("y", leaf, LExpr::var("body")));
+        let expected = LExpr::and(
+            LExpr::implies(
+                LExpr::var("c"),
+                LExpr::let_bind("y", LExpr::var("a"), LExpr::var("body")),
+            ),
+            LExpr::implies(
+                LExpr::not(LExpr::var("c")),
+                LExpr::let_bind("y", LExpr::var("b"), LExpr::var("body")),
+            ),
+        );
+        assert!(pp_eq(&out, &expected));
+    }
+
+    // ── extract_simple_var ─────────────────────────────────────
+
+    #[test]
+    fn extract_simple_var_from_plain_var() {
+        let x = var_exp("x", typ_int());
+        assert_eq!(extract_simple_var(&x), Some("x"));
+    }
+
+    #[test]
+    fn extract_simple_var_through_loc() {
+        let x = var_exp("x", typ_int());
+        assert_eq!(extract_simple_var(&loc_exp(x)), Some("x"));
+    }
+
+    #[test]
+    fn extract_simple_var_from_if_is_none() {
+        let c = var_exp("c", typ_bool());
+        let a = var_exp("a", typ_int());
+        let b = var_exp("b", typ_int());
+        let e = if_exp(c, a, b);
+        assert_eq!(extract_simple_var(&e), None);
+    }
+}

@@ -3037,6 +3037,35 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Early return inside a loop body — the WP DSL's `Return` arm writes
+// `ctx.ensures_goal` (the fn's ensures) by construction, regardless
+// of how deeply nested the return is. Pre-DSL code conflated this
+// with the loop's local `I ∧ D < d_old` terminator; the Wp DSL
+// shape gets it right for free. This test pins the behaviour so
+// someone "fixing" Return to use `after` instead of `ensures_goal`
+// would trip it.
+test_verify_one_file! {
+    #[test] test_exec_return_inside_loop verus_code! {
+        #[verifier::tactus_auto]
+        fn find_in_range(target: u8, n: u8) -> (r: u8)
+            requires n > 0
+            ensures r == target || r == n
+        {
+            let mut i: u8 = 0;
+            while i < n
+                invariant i <= n
+                decreases n - i
+            {
+                if i == target {
+                    return target;
+                }
+                i = i + 1;
+            }
+            n
+        }
+    } => Ok(())
+}
+
 // Trait method call — rejected by `walk_call` because the
 // `resolved_method` field is populated (dynamic dispatch resolution
 // that we don't handle yet).

@@ -757,6 +757,10 @@ theorem overflow_check_line_N ... : 0 ≤ result ∧ result < 2^bits := by tactu
 
 Investigated: introducing a `let _goal_k := <rest_goal>` binding at each if and having both branches refer to `_goal_k` preserves logical equivalence with linear size. **Rejected** as a codegen fix because Lean's `simp_all` / `omega` zeta-reduces through the let, so the tactic-level work still duplicates — the generated `.lean` file gets smaller but the proof search cost stays exponential. The proper fix would be a custom tactic that shares sub-proofs structurally (reuse at the tactic level, not the expression level). Not worth doing until a real program hits the wall.
 
+**Why `Box<Wp<'a>>` and not `Rc` / arena?** Each `Wp` node is heap-allocated via `Box` — one allocation per node, minimal overhead. `Rc<Wp<'a>>` would give structural sharing (the DAG shape on `Branch`) but adds refcount traffic on lowering and doesn't help the tactic-level duplication noted above. An arena (`typed-arena` / `bumpalo` / custom `Vec<Wp>`+indices) would make `after: &'arena Wp<'a>` possible with `Copy`-able references and zero allocations beyond the arena's bump — but at the cost of threading an additional lifetime through every builder signature (`WpCtx<'a>` gains `'arena`, every function taking `&WpCtx` becomes `WpCtx<'arena, 'a>`, etc.). Verification is I/O-bound on Lean anyway; `Box` is fine until a profile says otherwise.
+
+`lift_if_value`'s closure (`&dyn Fn(LExpr) -> LExpr`) also allocates: each recursive call clones the captured body-ast when invoking `emit_leaf`. Each invocation is O(expression size), so the full cost is O(branches × size). Same "fine for realistic code, not worth optimising yet" story — a `FnOnce`-based rewrite or an iterative version would reduce cloning if this ever shows up in profiles.
+
 ### `StmX::Call` — landed (slice 7, with recursion)
 
 Exec fns can call other exec/proof/spec fns. The WP rule for
