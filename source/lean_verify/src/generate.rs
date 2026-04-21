@@ -213,8 +213,7 @@ pub fn check_exec_fn(
     imports: &[String],
     crate_name: &str,
 ) -> CheckResult {
-    let fn_map = sst_to_lean::build_fn_map(krate);
-    let theorems = match sst_to_lean::exec_fn_theorems_to_ast(fn_sst, check, &fn_map) {
+    let theorems = match sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check) {
         Ok(ts) => ts,
         Err(reason) => return CheckResult::Failed(format!(
             "tactus_auto: {} (first slice supports only straight-line exec fns)",

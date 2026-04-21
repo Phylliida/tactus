@@ -134,11 +134,26 @@ use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
 /// its `FunctionSst`, so the map points at the AST form.
 pub type FnMap<'a> = HashMap<&'a Fun, &'a FunctionX>;
 
-/// Build the `FnMap` from a crate's full function list. Cheap enough to
-/// rebuild per fn-verification; can be hoisted up the call stack if
-/// profiling ever justifies it.
-pub fn build_fn_map(krate: &KrateX) -> FnMap<'_> {
-    krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect()
+/// Shared context threaded through the WP builder. Collects the
+/// per-verification-unit state that nearly every walker / builder
+/// needs — the callee lookup (for inlining call specs) and the local
+/// declaration types (for loop modified-var quantification). Future
+/// additions — source spans, current-fn name, ret binder — plug into
+/// this struct instead of growing every function signature.
+pub struct WpCtx<'a> {
+    pub fn_map: FnMap<'a>,
+    pub type_map: HashMap<&'a VarIdent, &'a Typ>,
+}
+
+impl<'a> WpCtx<'a> {
+    /// Build the context for verifying `check` against `krate`.
+    /// `fn_map` is from the whole-krate function list; `type_map` is
+    /// from the check's own local declarations.
+    pub fn new(krate: &'a KrateX, check: &'a FuncCheckSst) -> Self {
+        let fn_map = krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
+        let type_map = check.local_decls.iter().map(|d| (&d.ident, &d.typ)).collect();
+        Self { fn_map, type_map }
+    }
 }
 
 // ── Support check (helpers) ────────────────────────────────────────────
@@ -154,9 +169,8 @@ pub fn build_fn_map(krate: &KrateX) -> FnMap<'_> {
 /// `ast_simplify.rs:528`). Parallel desugaring injects a matching
 /// `no%param` param into the callee's `params` — BUT that second half
 /// only fires on `simplify_krate`, which runs *after* `self.vir_crate`
-/// is stored (`verifier.rs:3163`). `build_fn_map` sees the
-/// pre-simplify `FunctionX`, so its `params` for a zero-arg callee is
-/// empty.
+/// is stored (`verifier.rs:3163`). `WpCtx::new` sees the pre-simplify
+/// `FunctionX`, so its `params` for a zero-arg callee is empty.
 ///
 /// The asymmetry means: at a zero-arg call site, `args.len() == 1`
 /// (the injected `Const(0)`) but `callee.params.len() == 0`. We detect
@@ -304,11 +318,13 @@ fn check_exp(e: &Exp) -> Result<(), String> {
 /// (`walk`) so the "validate-first" precondition is enforced by
 /// construction — there's no way to produce `BodyItem`s without having
 /// already cleared the shape checks.
-pub fn exec_fn_theorems_to_ast(
-    fn_sst: &FunctionSst,
-    check: &FuncCheckSst,
-    fn_map: &FnMap<'_>,
+pub fn exec_fn_theorems_to_ast<'a>(
+    krate: &'a KrateX,
+    fn_sst: &'a FunctionSst,
+    check: &'a FuncCheckSst,
 ) -> Result<Vec<Theorem>, String> {
+    let ctx = WpCtx::new(krate, check);
+
     // Expressions in requires/ensures aren't walked (they aren't
     // statements), so validate them separately here.
     for req in check.reqs.iter() {
@@ -322,19 +338,13 @@ pub fn exec_fn_theorems_to_ast(
     let mut binders = build_param_binders(fn_sst);
     binders.extend(build_req_binders(check));
 
-    // `check.local_decls` → type lookup for modified-var bounds when a
-    // loop emits its havoc quantification.
-    let type_map: HashMap<&VarIdent, &Typ> = check.local_decls.iter()
-        .map(|d| (&d.ident, &d.typ))
-        .collect();
-
-    let items = walk(&check.body, &type_map, fn_map)?;
+    let items = walk(&check.body, &ctx)?;
     let has_loop_or_call = items.iter().any(BodyItem::needs_peel);
     let goal = build_goal(
         &items,
         check.post_condition.dest.as_ref().map(|v| v.0.as_str()),
         &check.post_condition.ens_exps,
-        fn_map,
+        &ctx,
     );
     let tactic = if has_loop_or_call { loop_tactic() } else { simple_tactic() };
     Ok(vec![Theorem { name, binders, goal, tactic }])
@@ -407,10 +417,10 @@ fn build_goal(
     items: &[BodyItem<'_>],
     ret_name: Option<&str>,
     ensures: &[Exp],
-    fn_map: &FnMap<'_>,
+    ctx: &WpCtx<'_>,
 ) -> LExpr {
     let terminator = and_all(ensures.iter().map(sst_exp_to_ast).collect());
-    build_goal_with_terminator(items, ret_name, &terminator, fn_map)
+    build_goal_with_terminator(items, ret_name, &terminator, ctx)
 }
 
 /// The real WP builder, parameterized on what the continuation ends in.
@@ -429,7 +439,7 @@ fn build_goal_with_terminator(
     items: &[BodyItem<'_>],
     ret_name: Option<&str>,
     terminator: &LExpr,
-    fn_map: &FnMap<'_>,
+    ctx: &WpCtx<'_>,
 ) -> LExpr {
     let Some((head, rest)) = items.split_first() else { return terminator.clone() };
     match head {
@@ -443,16 +453,16 @@ fn build_goal_with_terminator(
         BodyItem::Let(name, rhs) => lift_if_value(rhs, &|rhs_ast| {
             LExpr::let_bind(
                 sanitize(name), rhs_ast,
-                build_goal_with_terminator(rest, ret_name, terminator, fn_map),
+                build_goal_with_terminator(rest, ret_name, terminator, ctx),
             )
         }),
         BodyItem::Assume(e) => LExpr::implies(
             sst_exp_to_ast(e),
-            build_goal_with_terminator(rest, ret_name, terminator, fn_map),
+            build_goal_with_terminator(rest, ret_name, terminator, ctx),
         ),
         BodyItem::Assert(e) => LExpr::and(
             sst_exp_to_ast(e),
-            build_goal_with_terminator(rest, ret_name, terminator, fn_map),
+            build_goal_with_terminator(rest, ret_name, terminator, ctx),
         ),
         BodyItem::Return(e) => lift_if_value(e, &|e_ast| match ret_name {
             Some(name) => LExpr::let_bind(sanitize(name), e_ast, terminator.clone()),
@@ -472,11 +482,11 @@ fn build_goal_with_terminator(
             LExpr::and(
                 LExpr::implies(
                     cond_ast.clone(),
-                    build_goal_with_terminator(&then_all, ret_name, terminator, fn_map),
+                    build_goal_with_terminator(&then_all, ret_name, terminator, ctx),
                 ),
                 LExpr::implies(
                     LExpr::not(cond_ast),
-                    build_goal_with_terminator(&else_all, ret_name, terminator, fn_map),
+                    build_goal_with_terminator(&else_all, ret_name, terminator, ctx),
                 ),
             )
         }
@@ -486,14 +496,14 @@ fn build_goal_with_terminator(
         BodyItem::Loop { cond, invs, decrease, modified_vars, body_items } => {
             build_loop_conjunction(
                 cond, invs, decrease, modified_vars, body_items,
-                rest, ret_name, terminator, fn_map,
+                rest, ret_name, terminator, ctx,
             )
         }
         // WP: `requires ∧ (∀ ret, bound(ret) → ensures(ret) →
         // wp(rest))`. Inlines the callee's spec instead of emitting
         // a Lean definition for it. See `build_call_conjunction`.
         BodyItem::Call { callee, args, dest } => {
-            build_call_conjunction(callee, args, *dest, rest, ret_name, terminator, fn_map)
+            build_call_conjunction(callee, args, *dest, rest, ret_name, terminator, ctx)
         }
     }
 }
@@ -576,7 +586,7 @@ fn build_loop_conjunction(
     rest: &[BodyItem<'_>],
     ret_name: Option<&str>,
     terminator: &LExpr,
-    fn_map: &FnMap<'_>,
+    ctx: &WpCtx<'_>,
 ) -> LExpr {
     let inv_conj = || and_all(invs.iter().map(|i| sst_exp_to_ast(&i.inv)).collect());
     let cond_ast = || sst_exp_to_ast(cond);
@@ -605,7 +615,7 @@ fn build_loop_conjunction(
         inv_conj(),
         LExpr::lt(decrease_ast(), LExpr::var("_tactus_d_old")),
     );
-    let maintain_body_wp = build_goal_with_terminator(body_items, ret_name, &post_body, fn_map);
+    let maintain_body_wp = build_goal_with_terminator(body_items, ret_name, &post_body, ctx);
     let maintain_core = LExpr::let_bind("_tactus_d_old", decrease_ast(), maintain_body_wp);
     let maintain_clause = quantify_mod_vars(
         modified_vars,
@@ -614,7 +624,7 @@ fn build_loop_conjunction(
 
     // Use / continuation: `∀ mod_vars, bounds → I ∧ ¬cond →
     //   wp(rest, outer_terminator)`.
-    let rest_goal = build_goal_with_terminator(rest, ret_name, terminator, fn_map);
+    let rest_goal = build_goal_with_terminator(rest, ret_name, terminator, ctx);
     let use_clause = quantify_mod_vars(
         modified_vars,
         LExpr::implies(LExpr::and(inv_conj(), LExpr::not(cond_ast())), rest_goal),
@@ -655,7 +665,7 @@ fn build_call_conjunction(
     rest: &[BodyItem<'_>],
     ret_name: Option<&str>,
     terminator: &LExpr,
-    fn_map: &FnMap<'_>,
+    ctx: &WpCtx<'_>,
 ) -> LExpr {
     // Strip any `ast_simplify`-injected dummy arg so zip aligns with
     // `callee.params`. `walk_call` already verified the counts after
@@ -702,7 +712,7 @@ fn build_call_conjunction(
     let ret_name_cal = sanitize(&ret.name.0);
     let ret_typ = typ_to_expr(&ret.typ);
     let continuation_under_ret = {
-        let rest_goal = build_goal_with_terminator(rest, ret_name, terminator, fn_map);
+        let rest_goal = build_goal_with_terminator(rest, ret_name, terminator, ctx);
         // If the caller has a destination, bind `let dest := <ret>;
         // rest_goal` inside the ∀. Otherwise rest sees the call as
         // having no bound value.
@@ -857,22 +867,21 @@ impl<'a> BodyItem<'a> {
 /// invariant guarded by `.expect`; now it's a type-level one guarded by
 /// `Result`.
 ///
-/// `type_map` is threaded through so loops can attach the type of each
-/// modified variable; `fn_map` is threaded so calls can look up the
-/// callee's `FunctionX`. Termination obligations for recursive calls
-/// are emitted upstream by Verus as `StmX::Assert(InternalFun::
+/// `ctx.type_map` is used by loop walking to attach the type of each
+/// modified variable; `ctx.fn_map` is used by call walking to look up
+/// the callee's `FunctionX`. Termination obligations for recursive
+/// calls are emitted upstream by Verus as `StmX::Assert(InternalFun::
 /// CheckDecreaseHeight)` — they flow through here as ordinary
 /// asserts; `sst_exp_to_ast` handles the Lean-level lowering.
 fn walk<'a>(
     stm: &'a Stm,
-    type_map: &HashMap<&'a VarIdent, &'a Typ>,
-    fn_map: &FnMap<'a>,
+    ctx: &WpCtx<'a>,
 ) -> Result<Vec<BodyItem<'a>>, String> {
     match &stm.x {
         StmX::Block(stms) => {
             let mut out: Vec<BodyItem<'a>> = Vec::new();
             for s in stms.iter() {
-                out.extend(walk(s, type_map, fn_map)?);
+                out.extend(walk(s, ctx)?);
             }
             Ok(out)
         }
@@ -912,15 +921,15 @@ fn walk<'a>(
         StmX::Return { ret_exp: None, .. } => Ok(Vec::new()),
         StmX::If(cond, then_stm, else_stm) => {
             check_exp(cond)?;
-            let then_items = walk(then_stm, type_map, fn_map)?;
+            let then_items = walk(then_stm, ctx)?;
             let else_items = match else_stm {
-                Some(e) => walk(e, type_map, fn_map)?,
+                Some(e) => walk(e, ctx)?,
                 None => Vec::new(),
             };
             Ok(vec![BodyItem::IfThenElse { cond, then_items, else_items }])
         }
-        StmX::Call { .. } => walk_call(stm, type_map, fn_map),
-        StmX::Loop { .. } => walk_loop(stm, type_map, fn_map),
+        StmX::Call { .. } => walk_call(stm, ctx),
+        StmX::Loop { .. } => walk_loop(stm, ctx),
         // Transparent in SST: contribute nothing to the WP goal.
         StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => Ok(Vec::new()),
         StmX::BreakOrContinue { .. } => Err(
@@ -943,8 +952,7 @@ fn walk<'a>(
 /// compile error here.
 fn walk_call<'a>(
     stm: &'a Stm,
-    type_map: &HashMap<&'a VarIdent, &'a Typ>,
-    fn_map: &FnMap<'a>,
+    ctx: &WpCtx<'a>,
 ) -> Result<Vec<BodyItem<'a>>, String> {
     let StmX::Call {
         fun,
@@ -981,7 +989,7 @@ fn walk_call<'a>(
             "calls to generic functions (non-empty type args) are not yet supported".to_string()
         );
     }
-    let Some(callee) = fn_map.get(fun).copied() else {
+    let Some(callee) = ctx.fn_map.get(fun).copied() else {
         return Err(format!(
             "callee `{:?}` not found in the crate's function map — cross-crate calls are \
              not yet supported",
@@ -1027,7 +1035,7 @@ fn walk_call<'a>(
     // call discards its result (`foo(…);` without `let x =`).
     let bound_dest: Option<(&'a VarIdent, &'a Typ)> = dest.as_ref().and_then(|d| {
         let ident = extract_simple_var_ident(&d.dest)?;
-        let typ = type_map.get(ident).copied()?;
+        let typ = ctx.type_map.get(ident).copied()?;
         Some((ident, typ))
     });
     // NOTE: termination obligation is emitted upstream by Verus's
@@ -1050,8 +1058,7 @@ fn walk_call<'a>(
 /// shape restrictions this enforces.
 fn walk_loop<'a>(
     stm: &'a Stm,
-    type_map: &HashMap<&'a VarIdent, &'a Typ>,
-    fn_map: &FnMap<'a>,
+    ctx: &WpCtx<'a>,
 ) -> Result<Vec<BodyItem<'a>>, String> {
     let StmX::Loop {
         loop_isolation, cond, body, invs, decrease, modified_vars: _, ..
@@ -1100,10 +1107,10 @@ fn walk_loop<'a>(
     let mut locally_declared: HashSet<&'a VarIdent> = HashSet::new();
     collect_modifications(body, &mut locally_declared, &mut mod_names);
     let modified_vars: Vec<(&'a VarIdent, &'a Typ)> = mod_names.into_iter()
-        .filter_map(|id| type_map.get(id).map(|typ| (id, *typ)))
+        .filter_map(|id| ctx.type_map.get(id).map(|typ| (id, *typ)))
         .collect();
 
-    let body_items = walk(body, type_map, fn_map)?;
+    let body_items = walk(body, ctx)?;
 
     Ok(vec![BodyItem::Loop {
         cond: cond_exp,

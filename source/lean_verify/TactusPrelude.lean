@@ -66,5 +66,11 @@ macro_rules
   | `(tactic| tactus_peel) => `(tactic|
       first
         | (apply And.intro <;> tactus_peel)
+        -- Destructure conjunctive hypotheses on intro so leaf tactics
+        -- that can't split `∧`-hypotheses themselves (not omega — it
+        -- handles them — but future additions like `linarith` /
+        -- `positivity`) get each conjunct as its own hypothesis.
+        -- Matched before plain `intro _` so conjunctions go this path.
+        | (intro ⟨_, _⟩; tactus_peel)
         | (intro _; tactus_peel)
         | skip)
