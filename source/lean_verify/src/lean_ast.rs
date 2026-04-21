@@ -977,4 +977,178 @@ mod substitute_tests {
         assert!(printed.contains("x + 42"), "Some arm body should read x + 42: {}", printed);
         assert!(!printed.contains("+ y"), "y should be substituted: {}", printed);
     }
+
+    // ── Audit-driven tests: per-variant coverage ────────────────
+
+    #[test]
+    fn unop_substitutes_into_arg() {
+        // ¬x  with {x: True}  →  ¬True
+        let e = Expr::new(ExprNode::UnOp {
+            op: UnOp::Not,
+            arg: Box::new(var("x")),
+        });
+        let s = subst_of(&[("x", Expr::new(ExprNode::LitBool(true)))]);
+        let expected = Expr::new(ExprNode::UnOp {
+            op: UnOp::Not,
+            arg: Box::new(Expr::new(ExprNode::LitBool(true))),
+        });
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    fn struct_update_substitutes_base_and_updates() {
+        // {base with f1 := x, f2 := y}  with {base: b, x: 1, y: 2}
+        //   → {b with f1 := 1, f2 := 2}
+        let e = Expr::new(ExprNode::StructUpdate {
+            base: Box::new(var("base")),
+            updates: vec![
+                ("f1".to_string(), var("x")),
+                ("f2".to_string(), var("y")),
+            ],
+        });
+        let s = subst_of(&[
+            ("base", var("b")),
+            ("x", lit(1)),
+            ("y", lit(2)),
+        ]);
+        let expected = Expr::new(ExprNode::StructUpdate {
+            base: Box::new(var("b")),
+            updates: vec![
+                ("f1".to_string(), lit(1)),
+                ("f2".to_string(), lit(2)),
+            ],
+        });
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    fn array_lit_substitutes_each_element() {
+        // [x, y, z]  with {x: 1, y: 2}  →  [1, 2, z]
+        let e = Expr::new(ExprNode::ArrayLit(vec![var("x"), var("y"), var("z")]));
+        let s = subst_of(&[("x", lit(1)), ("y", lit(2))]);
+        let expected = Expr::new(ExprNode::ArrayLit(vec![lit(1), lit(2), var("z")]));
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    fn anon_substitutes_each_element() {
+        // ⟨x, y⟩  with {x: 1, y: 2}  →  ⟨1, 2⟩
+        let e = Expr::new(ExprNode::Anon(vec![var("x"), var("y")]));
+        let s = subst_of(&[("x", lit(1)), ("y", lit(2))]);
+        let expected = Expr::new(ExprNode::Anon(vec![lit(1), lit(2)]));
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    fn index_substitutes_base_and_idx() {
+        // base[i]  with {base: arr, i: 0}  →  arr[0]
+        let e = Expr::new(ExprNode::Index {
+            base: Box::new(var("base")),
+            idx: Box::new(var("i")),
+        });
+        let s = subst_of(&[("base", var("arr")), ("i", lit(0))]);
+        let expected = Expr::new(ExprNode::Index {
+            base: Box::new(var("arr")),
+            idx: Box::new(lit(0)),
+        });
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    fn raw_is_opaque_to_substitution() {
+        // `Raw` is verbatim Lean text — we don't parse into it, so no
+        // substitution can apply. Even if a subst key happens to match
+        // the text, Raw stays literal.
+        let e = Expr::new(ExprNode::Raw("x + y".to_string()));
+        let s = subst_of(&[("x", lit(1)), ("y", lit(2))]);
+        let out = substitute(&e, &s);
+        let printed = crate::lean_pp::pp_expr(&out);
+        // The Raw text is preserved verbatim; no x→1 or y→2 inside.
+        assert!(printed.contains("x + y"), "Raw should preserve contents: {}", printed);
+    }
+
+    // ── Multi-binder shadowing ──────────────────────────────────
+
+    #[test]
+    fn multi_binder_forall_shadows_all() {
+        // ∀ x y. x + y + z   with {x: 1, y: 2, z: 99}
+        //   Inner scope: x and y re-bound; z subst fires.
+        //   → ∀ x y. x + y + 99
+        let e = Expr::new(ExprNode::Forall {
+            binders: vec![
+                Binder {
+                    name: Some("x".to_string()),
+                    ty: var("Int"),
+                    kind: BinderKind::Explicit,
+                },
+                Binder {
+                    name: Some("y".to_string()),
+                    ty: var("Int"),
+                    kind: BinderKind::Explicit,
+                },
+            ],
+            body: Box::new(add(add(var("x"), var("y")), var("z"))),
+        });
+        let s = subst_of(&[("x", lit(1)), ("y", lit(2)), ("z", lit(99))]);
+        let out = substitute(&e, &s);
+        let printed = crate::lean_pp::pp_expr(&out);
+        // Binders `x` and `y` survive; body shows `+ 99` (from z→99).
+        assert!(printed.contains("∀") || printed.contains("forall"),
+            "should still be a Forall: {}", printed);
+        assert!(printed.contains("99"), "z should be substituted to 99: {}", printed);
+        // Crucially, x and y should NOT have been substituted.
+        assert!(!printed.contains("1 + 2"), "x,y should stay bound: {}", printed);
+    }
+
+    #[test]
+    fn multi_binder_forall_capture_panics_on_first_offending_binder() {
+        // ∀ x y. x + y   with {z: x}  — z doesn't occur in body, so
+        // no substitution inside; binders `x` and `y` happen to match
+        // free vars in subst values but that's a false positive and
+        // the lazy check should pass.
+        let e = Expr::new(ExprNode::Forall {
+            binders: vec![
+                Binder {
+                    name: Some("x".to_string()),
+                    ty: var("Int"),
+                    kind: BinderKind::Explicit,
+                },
+                Binder {
+                    name: Some("y".to_string()),
+                    ty: var("Int"),
+                    kind: BinderKind::Explicit,
+                },
+            ],
+            body: Box::new(add(var("x"), var("y"))),
+        });
+        let s = subst_of(&[("z", var("x"))]);
+        // z doesn't occur free in the body, so the capture check
+        // short-circuits on the "live keys" emptiness check.
+        let _ = substitute(&e, &s);
+    }
+
+    #[test]
+    #[should_panic(expected = "would capture a free variable")]
+    fn multi_binder_real_capture_does_panic() {
+        // ∀ x y. z + y   with {z: x}
+        //   z occurs free in the body and subst z→x; binder `x` would
+        //   capture the substituted x. Real capture → panic.
+        let e = Expr::new(ExprNode::Forall {
+            binders: vec![
+                Binder {
+                    name: Some("x".to_string()),
+                    ty: var("Int"),
+                    kind: BinderKind::Explicit,
+                },
+                Binder {
+                    name: Some("y".to_string()),
+                    ty: var("Int"),
+                    kind: BinderKind::Explicit,
+                },
+            ],
+            body: Box::new(add(var("z"), var("y"))),
+        });
+        let s = subst_of(&[("z", var("x"))]);
+        let _ = substitute(&e, &s);
+    }
 }
