@@ -753,64 +753,85 @@ theorem overflow_check_line_N ... : 0 ≤ result ∧ result < 2^bits := by tactu
 
 ### Known codegen-complexity trade-offs
 
-`sst_to_lean::build_goal` handles `if c { s1 } else { s2 }` by cloning the continuation `rest` into both branches syntactically: `wp(s1 ++ rest) ∧ wp(s2 ++ rest)`. `BodyItem::IfThenElse` carries `Vec<BodyItem>` per branch, so cloning is recursive. N sequential ifs at the same level produce 2^N copies of the innermost continuation in the goal AST. For realistic exec fn bodies (few-level nesting) this is fine; for pathological cases it could bloat codegen time and the generated `.lean` file.
+`Wp::Branch`'s two sub-trees each hold their own continuation (`after` cloned into both). N sequential ifs at the same level produce 2^N copies of the innermost continuation in the Wp tree. For realistic exec fn bodies (few-level nesting) this is fine; for pathological cases it could bloat codegen time and the generated `.lean` file.
 
-Alternative: introduce a `let _goal_k := <rest_goal>` binding at each if and have both branches refer to `_goal_k`. This preserves logical equivalence with linear size. Not implemented — the cost hasn't shown up yet — but noted here so the trade-off is explicit when someone hits it.
+Investigated: introducing a `let _goal_k := <rest_goal>` binding at each if and having both branches refer to `_goal_k` preserves logical equivalence with linear size. **Rejected** as a codegen fix because Lean's `simp_all` / `omega` zeta-reduces through the let, so the tactic-level work still duplicates — the generated `.lean` file gets smaller but the proof search cost stays exponential. The proper fix would be a custom tactic that shares sub-proofs structurally (reuse at the tactic level, not the expression level). Not worth doing until a real program hits the wall.
 
-### `StmX::Call` — landed (slice 7)
+### `StmX::Call` — landed (slice 7, with recursion)
 
-Exec fns can now call other exec/proof/spec fns. The WP rule for
-`let y = foo(a1, a2)`:
+Exec fns can call other exec/proof/spec fns. The WP rule for
+`let y = foo(a1, a2)`, lowered by `lower_call` in
+`sst_to_lean.rs`:
 
 ```
-(let p1 := a1; let p2 := a2; requires_conj)
+requires_conj[p1 := a1, p2 := a2]
 ∧ ∀ (ret : RetT), h_ret_bound(ret) →
-    (let p1 := a1; let p2 := a2; ensures_conj_using_ret) →
-    let y := ret; wp(rest, terminator)
+    ensures_conj_using_ret[p1 := a1, p2 := a2] →
+    let y := ret; lower_wp(after)
 ```
 
-Param substitution is done via Lean `let`-bindings rather than
-rewriting the callee's spec at the SST level — same trick as
-`_tactus_d_old` for loops, cheap and obviously correct. The callee
-does NOT need its own Lean definition; we inline its
-requires/ensures using `vir_expr_to_ast` at each call site.
+Param substitution is done via **Lean-AST substitution**
+(`lean_ast::substitute`, capture-avoiding with a lazy per-scope
+capture check) rather than emitting `let p := arg; body` wrappers.
+Direct substitution avoids name shadowing when the caller and
+callee share a param name — the earlier let-wrapping produced
+`let n := n - 1; ...; n` at self-recursion sites, which defeated
+omega's let-handling and forced a `(simp_all; omega)` rung on
+`tactus_auto`. That rung is gone; generated Lean now reads
+`tmp_ < decrease_init0` directly.
 
-`build_fn_map` constructs the `Fun → &FunctionX` lookup once per
-fn-verification and threads it through `check_stm` / `walk` /
-`build_goal_with_terminator`. A new `BodyItem::Call { callee, args,
-dest }` variant captures the relevant shape; `build_call_conjunction`
-emits the WP.
+The callee does NOT need its own Lean definition; we inline its
+requires/ensures from its `FunctionX` via `vir_expr_to_ast` at each
+call site. `WpCtx::new` builds the `Fun → &FunctionX` lookup (and
+the type map for loop modified-var quantification and the fn's
+ret_name + ensures_goal for Return to write to).
 
-**Restrictions (rejected by `check_call`):**
+`build_wp_call` (in `sst_to_lean.rs`) validates the call shape and
+produces the `Wp::Call` node with the post-call continuation as its
+`after: Box<Wp<'a>>` sub-tree. `lower_call` emits the Lean.
+
+**Termination via Verus's own `CheckDecreaseHeight`.** For any
+recursive call (direct or mutual across an SCC), Verus's
+`recursion::check_recursive_function` pass inserts a
+`StmX::Assert(InternalFun::CheckDecreaseHeight)` right before the
+`StmX::Call`. Our walk sees it as a plain `Wp::Assert`;
+`sst_exp_to_ast_checked` lowers `CheckDecreaseHeight` to the int-
+typed termination obligation:
+
+```
+(0 ≤ cur ∧ cur < prev) ∨ (cur = prev ∧ otherwise)
+```
+
+where `cur` is the decrease expression with call-site args
+substituted, `prev` is the decrease-at-entry for the current fn,
+and `otherwise` is the lexicographic-tail marker (`False` for
+single-expression decreases). See `to_lean_sst_expr.rs`'s
+`CheckDecreaseHeight` arm for the lowering; `render_checked_decrease_arg`
+handles the Bind(Let) param-substitution wrapper Verus puts on
+`cur`.
+
+Mutual recursion across an SCC works by construction — Verus's
+recursion pass covers all cross-fn calls in the cycle the same way.
+
+**Restrictions (rejected by `build_wp_call`):**
 
 * **Trait-method calls** — `resolved_method: Some(_)` rejected.
-  Dynamic-dispatch resolution requires plumbing the concrete impl
-  through from VIR; deferred.
-* **Generic calls** (`typ_args` non-empty) — rejected. Generics
-  complicate both the callee signature lookup (monomorphization
-  needed) and the Lean-level type substitution.
-* **`&mut` args** — rejected (`ExpX::Loc` in arg position). Would
-  need "havoc mutated args after call" semantics, parallel to loop
-  modified-var quantification.
-* **Split-assertion calls** (`split: Some(_)`) — rejected. Verus's
-  split-mode error reporting that we don't replicate.
-* **Cross-crate callees** — rejected. The `Fun → FunctionX` map only
-  covers the current crate; cross-crate needs a `CrateDecls.lean`
-  scheme (Phase 3 work).
-
-**Known gap: no termination obligation on recursive calls.**
-A fn that recursively calls itself with the same arguments will
-verify even though it doesn't terminate. Fixing this needs a
-decreasing-measure comparison across the call — similar to loops'
-`decreases` but per-fn. Callee's own termination check handles
-well-foundedness *within* the callee body, but the caller's
-obligation to decrease when recursing isn't emitted.
+* **Trait-default-impl calls** — `is_trait_default: Some(_)` rejected.
+* **Generic calls** (`typ_args` non-empty) — rejected.
+* **`&mut` args** — `contains_loc` peels transparent wrappers
+  (Box/Unbox/CoerceMode/Trigger) and rejects any `ExpX::Loc`.
+* **Split-assertion calls** (`split: Some(_)`) — rejected.
+* **Cross-crate callees** — rejected (fn_map is single-crate).
+* **Non-int decreases** — datatype-typed decreases rejected because
+  we don't encode a Lean `height` function yet. Int decreases work
+  via the transparent-identity `height` for ints (see prelude
+  axioms in `vir/src/prelude.rs:1030-1037`).
 
 ### `_tactus_d_old` aliasing across nested loops
 
-`sst_to_lean::build_loop_conjunction` emits `let _tactus_d_old := D; …` inside every loop's maintain clause to capture the decrease measure pre-body. The name is literal, not gensym'd, so nested loops' `let _tactus_d_old` bindings shadow each other in Lean.
+`sst_to_lean::lower_loop` emits `let _tactus_d_old := D; …` inside every loop's maintain clause to capture the decrease measure pre-body. The name is literal, not gensym'd, so nested loops' `let _tactus_d_old` bindings shadow each other in Lean.
 
-This is correct for the current architecture: the inner loop's shadow is confined to the inner's maintain conjunct, and the outer's `_tactus_d_old` reference lives in the outer's maintain conjunct (a sibling, not a descendant), so they never clash in scope. A gensym'd `_tactus_d_old_<loop_id>` would make the independence syntactically obvious but doesn't change semantics. Worth threading a counter through `build_loop_conjunction` if we ever refactor loops into a structure where scoping IS ambiguous — until then, the literal name is fine and keeps the generated Lean readable.
+This is correct for the current architecture: the inner loop's shadow is confined to the inner's maintain conjunct, and the outer's `_tactus_d_old` reference lives in the outer's maintain conjunct (a sibling, not a descendant), so they never clash in scope. A gensym'd `_tactus_d_old_<loop_id>` would make the independence syntactically obvious but doesn't change semantics. Worth threading a counter through `lower_loop` if we ever refactor loops into a structure where scoping IS ambiguous — until then, the literal name is fine and keeps the generated Lean readable.
 
 ### Tactic-string interning (minor TODO)
 
@@ -818,13 +839,9 @@ This is correct for the current architecture: the inner loop's shadow is confine
 
 ### Known deferrals, rejected cases, and untested edges
 
-A flat catalogue of things that don't work yet, organized by where in the pipeline they're rejected or where the gap lives. Updated as of the post-slice-5 FP pass. If a gap has its own detailed section elsewhere in this doc, it's cross-referenced rather than duplicated.
+A flat catalogue of things that don't work yet, organized by where in the pipeline they're rejected or where the gap lives. If a gap has its own detailed section elsewhere in this doc, it's cross-referenced rather than duplicated.
 
-#### Documentation debt
-
-* **HANDOFF.md is out of date.** Reflects the 109-test / pre-loop baseline. Missing: the unified `build_goal_with_terminator` story, `tactus_peel` recursive macro, u-types-as-Int soundness fix, `lift_if_value` for tail / let-bound if-expressions, early-return support, the shape-specific-tactics-at-emit-time principle, `arch_word_bits` wiring, usize/isize status. Top priority for the next session.
-
-#### Statement-level forms rejected by `check_stm`
+#### Statement-level forms rejected by `build_wp`
 
 Each one returns `Err("… not yet supported")`; users get a clean rejection instead of silent pass.
 
@@ -835,22 +852,25 @@ Each one returns `Err("… not yet supported")`; users get a clean rejection ins
 * **`StmX::OpenInvariant`** — atomic invariant opening for concurrent verification. Out of scope until concurrency support lands.
 * **`StmX::ClosureInner`** — exec closure bodies. Depends on `ExpX::CallLambda` support.
 
-#### Expression-level forms rejected by `check_exp`
+#### Expression-level forms rejected by `sst_exp_to_ast_checked`
 
-* **`UnaryOp` variants beyond `Not` / `Clip` / `CoerceMode` / `Trigger`** — the spec-fn path (`to_lean_expr`) handles more (BitNot, IntToReal, etc.) but `check_exp` on exec bodies is conservative; add as needed.
-* **`BinaryOp::HeightCompare { … }`** — VIR's termination-height comparison.
+`sst_exp_to_ast_checked` is the primary validator+renderer for SST expressions; `check_exp` is a thin wrapper (`.map(|_| ())`). Single case analysis for both validation and rendering.
+
+* **`UnaryOp` variants beyond `Not` / `Clip` / `CoerceMode` / `Trigger`** — the spec-fn path (`to_lean_expr`) handles more (BitNot, IntToReal, etc.) but the SST path on exec bodies is conservative; add as needed.
+* **`BinaryOp::HeightCompare { … }`** — VIR's termination-height comparison (the fn-level wrapper; `CheckDecreaseHeight` below is the per-call-site SST form we DO lower).
 * **`BinaryOp::Index(_, _)`** — array / slice indexing with bounds check.
 * **`BinaryOp::StrGetChar`** — string character lookup.
 * **`BinaryOp::IeeeFloat(_)`** — IEEE float comparisons. Verus doesn't support `f32`/`f64` at all; this branch exists for completeness.
-* **`ExpX::Ctor(..)`** — datatype constructors in exec fns. Blocks any exec code that constructs enum/struct values.
+* **`ExpX::Ctor(..)`** — datatype constructors in exec fns. Blocks any exec code that constructs enum/struct values. Regression test: `test_exec_ctor_rejected`.
 * **`ExpX::CallLambda(..)`** — closure calls. Blocks fns that invoke stored closures.
-* **`ExpX::ArrayLiteral(_)`** — `[a, b, c]` literals.
-* **`ExpX::Old(..)`** — `old(x)` (pre-state). Relevant for `ensures` that compare post-state to pre-state; untested even for supported features because we don't handle it anywhere.
+* **`ExpX::ArrayLiteral(_)`** — `[a, b, c]` literals. Verus rejects these upstream when slice indexing isn't wired, so the Err arm is unreached in practice.
+* **`ExpX::Old(..)`** — `old(x)` (pre-state). Relevant for `ensures` that compare post-state to pre-state.
 * **`ExpX::Interp(_)`** — only appears inside Verus's interpreter; an internal-bug rejection rather than a feature gap.
 * **`ExpX::FuelConst(_)`** — fuel-reveal constants. Blocks `reveal_with_fuel` in exec fns.
-* **`CallFun::InternalFun(_)`** — Verus's internal fns (distinct from user fns).
+* **`CallFun::InternalFun(_)` other than `CheckDecreaseHeight`** — `CheckDecreaseHeight` is lowered (for int-typed decreases); other `InternalFun` variants rejected.
+* **Non-int `CheckDecreaseHeight`** — datatype-typed decreases need a Lean `height` function encoding. Reject at validation time rather than emit an unsound obligation.
 
-#### Loop-shape restrictions (rejected by `check_loop`)
+#### Loop-shape restrictions (rejected by `build_wp_loop`)
 
 Only the simplest `while` shape is accepted. All other loop shapes return `Err`.
 
@@ -865,18 +885,20 @@ Only the simplest `while` shape is accepted. All other loop shapes return `Err`.
 * **Usize subtraction truncates silently** — see the usize/isize section above.
 * **Usize arithmetic rarely verifies automatically** — bounds are emitted but `tactus_auto` can't discharge symbolic `< usize_hi`; users need custom `proof { … }` with `arch_word_bits_valid` case-split.
 * **Char bound admits surrogates** — `c < 0x110000` covers U+0000..U+10FFFF but includes the UTF-16 surrogate range U+D800..U+DFFF. Verus / Rust's `char` also don't distinguish, so our bound matches their semantics. No downstream soundness impact within the same system.
-* **`BodyItem` clone cost is exponential in nested if/lift depth** — documented under "Known codegen-complexity trade-offs". Fine for realistic code.
+* **`Wp` clone cost is exponential in nested if-branch depth** — both branches of `Wp::Branch` clone the outer `after` continuation. Same behaviour as the prior `BodyItem` shape; the DSL refactor didn't fix this. Fine for realistic code.
 * **`_tactus_d_old` shadows in nested loops** — relies on scope to disambiguate; documented in its own section.
+* **`substitute`'s capture check panics rather than alpha-renames** — when a real capture is detected, we panic with a clear message instead of rewriting the binder. Alpha-renaming is the proper fix for when that fires; no test hits it today because callee specs are simple arithmetic.
 
 #### User-facing features not tested (or possibly broken)
 
-* **`proof { … }` blocks inside exec fns** — DESIGN.md describes them as supported, but we never exercised them against the slice-1-through-5 WP pipeline. The `have h : P := by <tactics>` plumbing likely needs explicit support in `walk` / `build_goal_with_terminator` for hypothesis threading. Untested.
+* **`proof { … }` blocks inside exec fns** — DESIGN.md describes them as supported, but we never exercised them against the WP pipeline. The `have h : P := by <tactics>` plumbing likely needs explicit support in `build_wp` for hypothesis threading. Untested.
 * **`assert(P) by { tactics }`** — user-written tactic bodies for asserts inside exec fns. Currently `StmX::Assert` treats the assert as a leaf obligation closed by `tactus_auto`; user-provided tactic bodies are not plumbed through.
 * **`assume(P)` warnings** — DESIGN.md promises a "unproved assumption" warning. Not wired; `StmX::Assume` emits the hypothesis silently.
 * **Return in the `else` branch of an if** (where `then` falls through) — inverse of `test_exec_early_return`. Untested.
+* **Return inside a loop body** — semantically fn-exit (new DSL writes `ctx.ensures_goal` correctly); no test exercises the shape.
 * **Loops modifying multiple variables** — `quantify_mod_vars` handles arbitrary-arity modified sets, but every loop test modifies exactly one var.
 * **Nested if where each branch contains a different loop** — combinatorial coverage gap.
-* **Loop body ending in an early return** — `while c { if p { return 0; } … }`. Should work in principle (early return handling composes), untested.
+* **Loop body ending in an early return** — `while c { if p { return 0; } … }`. Should work in principle (early return handling composes through `Wp::Done`), untested.
 * **Bit-width coverage** — only `u8`, `u32`, `i8` tested end-to-end. `u16` / `u64` / `u128` / `i16` / `i32` / `i64` / `i128` go through the same codegen path but lack regression tests.
 
 #### Tactic / automation limitations
@@ -887,11 +909,14 @@ Only the simplest `while` shape is accepted. All other loop shapes return `Err`.
 
 #### Architecture debts (working-but-not-ideal)
 
-* **Two-pass over loop bodies.** `walk`'s Loop arm calls both `collect_modifications` and `walk` on the body; fusing would save a pass but entangles modifications with WP-item collection. Documented; left alone.
-* **`walk` allocates 1-element `Vec`s per non-Block statement.** Keeps the pure-fn signature simple at the cost of heap traffic. `SmallVec` would help; not worth a new dep yet.
+* **Two parallel expression renderers.** `to_lean_expr.rs` (~500 lines, proof fn / callee spec inlining) and `to_lean_sst_expr.rs` (~550 lines, exec fn bodies) have largely-parallel per-variant dispatch. Shared helpers cover `type_bound_predicate`, `integer_type_bound_node`, `renders_as_lean_int` — but adding a new ExpX form requires editing both. Full unification (via a trait over source-expression type, or routing callee specs through SST) is the largest remaining cleanup. This is the only pending item on the session-end task list.
+* **Two-pass over loop bodies.** `build_wp_loop` calls both `collect_modifications` and `build_wp` on the body; fusing would save a pass but entangles modifications with WP construction. Documented; left alone.
 * **Sanity-check allowlist maintained by hand.** Adding a prelude def (like `usize_hi`) requires remembering to update `sanity.rs`. No automated sync; compiler error on mismatch (panic in debug builds).
+* **Expected VIR variant list for coverage is hand-maintained.** `tactus_coverage.rs` lists variants we expect to see. Macro-deriving from the enum would need Verus-upstream `strum` derives — not feasible without vendoring changes.
 * **`_tactus_d_old` not gensym'd** — see its dedicated section.
 * **`loop_tactic()` allocates its tactic string on every call** — tiny TODO, see its dedicated section.
+* **`needs_peel` is a recursive tree walk.** Could be a constructor-level bit on `Wp::Loop` / `Wp::Call`, computed once at build time. Constant-cost at realistic sizes; revisit if more variants need peeling.
+* **`substitute` boilerplate.** ~130 lines of per-variant dispatch across `substitute_impl` / `collect_free_vars`. Adding an `ExprNode` variant means editing three places (plus `lean_pp`). A `walk_children` helper or proc-macro would collapse it to ~30 lines — not worth doing yet, worth flagging.
 
 #### Phase-3 work (explicit non-goals for current scope)
 
@@ -902,14 +927,52 @@ These are deferred by design — the current slice is single-crate exec+proof-fn
 * **Lean version pinning / CI matrix.** `lean-toolchain` is pinned to `v4.25.0`; tactic behaviour could shift on upgrade. No automated regression against multiple Lean versions.
 * **Per-module `.lean` file generation.** Current design emits one file per fn (`target/tactus-lean/{crate}/{fn}.lean`). At scale, per-module would amortize preamble and olean caching; HANDOFF notes it as future work.
 
-### `BodyItem` as a future WP DSL
+### `Wp` — WP DSL (landed)
 
-`sst_to_lean::BodyItem` is currently a hand-rolled enum whose variants (Let, Assert, Assume, Return, IfThenElse) each represent one weakest-precondition-transforming step. It works, but conflates two shapes:
+The earlier `BodyItem` hand-rolled enum + `build_goal_with_terminator(items, rest, terminator, ctx)` positional recursion was replaced by a proper WP algebra. `Wp<'a>` in `sst_to_lean.rs`:
 
-* **Continuation transformers** — `Let`, `Assert`, `Assume` each take a "rest of body" goal and wrap it, producing an outer goal. They compose as a right-fold over a flat list.
-* **Control flow** — `Return` discards the continuation; `IfThenElse` splits into two sub-continuations.
+```rust
+enum Wp<'a> {
+    Done(LExpr),                                           // terminator
+    Let(&'a str, &'a Exp, Box<Wp<'a>>),                   // continuation wrappers
+    Assert(&'a Exp, Box<Wp<'a>>),
+    Assume(&'a Exp, Box<Wp<'a>>),
+    Branch { cond, then_branch: Box<Wp>, else_branch: Box<Wp> },
+    Loop { cond, invs, decrease, modified_vars, body: Box<Wp>, after: Box<Wp> },
+    Call { callee, args, dest, after: Box<Wp> },
+}
+```
 
-When loops land (which bring `Init` / `Maintain` / `Use` theorems with their own quantifier structure) and `assert(P) by { … }` gains a tactic-block form, this flat enum will probably want to graduate to something more principled — e.g., a small algebra whose constructors are explicit about whether they wrap, branch, or terminate, or a free-monad-ish "WP DSL" where each node carries its continuation by construction. Premature to refactor now. Worth keeping in mind so the next handful of slices don't accidentally keep piling onto the flat-enum shape past its natural limits.
+Each compound node carries its own continuation by construction —
+no separate "rest" parameter, no separate "terminator" parameter.
+`Done(LExpr)` is the only terminator and has no continuation slot,
+so `Return` writing to `Done(let <ret> := e; ctx.ensures_goal)`
+(discarding whatever `after` was at that point) is type-level.
+
+Three structural wins over the prior shape:
+
+* **Continuation is type-level.** Can't accidentally compose after
+  a `Return` because the type system forbids it.
+* **`Return` is cleanly fn-exit.** Previously Return wrote to
+  whatever terminator was being threaded through (loop's local
+  `I ∧ D < d_old` inside a loop body; fn's ensures at top). Now it
+  always writes `ctx.ensures_goal`. No test exercises return-in-loop
+  yet — the DSL shape just gets this right for free.
+* **`needs_peel` is one-line per variant.** Based on the node's own
+  shape, not a post-hoc traversal.
+
+`build_wp(stm, after, ctx) -> Result<Wp, String>` folds right-to-
+left over a `Block`, so each statement's `after` is the already-
+built Wp for the rest of the block. `lower_wp(wp, ctx) -> LExpr`
+interprets the tree.
+
+Adding a new WP form means one constructor + one arm each in
+`build_wp` and `lower_wp`. The old flat enum required editing a
+central dispatcher; the DSL shape makes composition obvious.
+
+Residual smell worth noting: `needs_peel` is still a recursive tree
+walk. Constant-cost today but will want to become a constructor-
+level bit if more variants need peeling.
 
 ### Scope and difficulty
 
