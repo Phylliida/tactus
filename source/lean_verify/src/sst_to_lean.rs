@@ -389,7 +389,11 @@ enum Wp<'a> {
     /// ensures → let dest := ret; after`.
     Call {
         callee: &'a FunctionX,
-        args: Vec<&'a Exp>,
+        /// Borrow the SST's arg slice directly — no `Vec<&Exp>`
+        /// allocation. `StmX::Call::args` is `Arc<Vec<Exp>>`, so
+        /// `&args[..]` gives us a `&'a [Exp]` with the same
+        /// lifetime as the rest of the Wp.
+        args: &'a [Exp],
         /// Caller's destination variable (`let x = foo(…)` → `Some("x")`;
         /// `foo(…);` → `None`). Only the name is needed — lowering emits
         /// `let dest := ret` inside the `∀ ret`, and `ret` already has
@@ -530,7 +534,7 @@ fn lower_loop(
 /// `sst_exp_to_ast_checked`'s `CheckDecreaseHeight` arm.
 fn lower_call(
     callee: &FunctionX,
-    args: &[&Exp],
+    args: &[Exp],
     dest: Option<&VarIdent>,
     after: &Wp<'_>,
     ctx: &WpCtx<'_>,
@@ -843,7 +847,6 @@ fn build_wp_call<'a>(
         }
         check_exp(a)?;
     }
-    let arg_refs: Vec<&'a Exp> = args.iter().collect();
     let bound_dest: Option<&'a VarIdent> = dest.as_ref()
         .and_then(|d| extract_simple_var_ident(&d.dest));
     // NOTE: the termination obligation for recursive calls is emitted
@@ -854,7 +857,7 @@ fn build_wp_call<'a>(
     // as a plain `Wp::Assert`; `sst_exp_to_ast` handles the lowering.
     Ok(Wp::Call {
         callee,
-        args: arg_refs,
+        args: &args[..],
         dest: bound_dest,
         after: Box::new(after),
     })
