@@ -136,23 +136,41 @@ pub type FnMap<'a> = HashMap<&'a Fun, &'a FunctionX>;
 
 /// Shared context threaded through the WP builder. Collects the
 /// per-verification-unit state that nearly every walker / builder
-/// needs — the callee lookup (for inlining call specs) and the local
-/// declaration types (for loop modified-var quantification). Future
-/// additions — source spans, current-fn name, ret binder — plug into
-/// this struct instead of growing every function signature.
+/// needs — the callee lookup, the local declaration types, the fn's
+/// ensures goal (where `return` terminates), and the declared return
+/// var name (if any). Future additions — source spans, current-fn
+/// name, etc. — plug into this struct instead of growing every
+/// function signature.
 pub struct WpCtx<'a> {
     pub fn_map: FnMap<'a>,
     pub type_map: HashMap<&'a VarIdent, &'a Typ>,
+    /// Declared return-var name (`-> (r: T)`), or `None` for unit
+    /// returns. Used by `Wp::Done` leaves produced from `Return`
+    /// statements to bind the returned value before jumping to the
+    /// fn's ensures.
+    pub ret_name: Option<&'a str>,
+    /// Conjoined ensures clauses — what `Return` terminates at. For
+    /// the top-level walk this is passed as the initial `after`; an
+    /// explicit `return e` discards its textual continuation and
+    /// writes `Done(let ret := e; ensures_goal)`.
+    pub ensures_goal: LExpr,
 }
 
 impl<'a> WpCtx<'a> {
     /// Build the context for verifying `check` against `krate`.
-    /// `fn_map` is from the whole-krate function list; `type_map` is
-    /// from the check's own local declarations.
+    ///
+    /// Precondition: expressions in `check.post_condition.ens_exps`
+    /// have been validated (e.g., via `check_exp`) — `sst_exp_to_ast`
+    /// is infallible and would panic on unsupported forms. Validation
+    /// happens in `exec_fn_theorems_to_ast` before calling `new`.
     pub fn new(krate: &'a KrateX, check: &'a FuncCheckSst) -> Self {
         let fn_map = krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
         let type_map = check.local_decls.iter().map(|d| (&d.ident, &d.typ)).collect();
-        Self { fn_map, type_map }
+        let ret_name = check.post_condition.dest.as_ref().map(|v| v.0.as_str());
+        let ensures_goal = and_all(
+            check.post_condition.ens_exps.iter().map(sst_exp_to_ast).collect()
+        );
+        Self { fn_map, type_map, ret_name, ensures_goal }
     }
 }
 
@@ -215,10 +233,8 @@ pub fn exec_fn_theorems_to_ast<'a>(
     fn_sst: &'a FunctionSst,
     check: &'a FuncCheckSst,
 ) -> Result<Vec<Theorem>, String> {
-    let ctx = WpCtx::new(krate, check);
-
-    // Expressions in requires/ensures aren't walked (they aren't
-    // statements), so validate them separately here.
+    // Validate reqs / ens expressions before WpCtx::new renders them
+    // via the infallible `sst_exp_to_ast`.
     for req in check.reqs.iter() {
         check_exp(req)?;
     }
@@ -226,18 +242,19 @@ pub fn exec_fn_theorems_to_ast<'a>(
         check_exp(ens)?;
     }
 
+    let ctx = WpCtx::new(krate, check);
+
     let name = format!("_tactus_body_{}", lean_name(&fn_sst.x.name.path));
     let mut binders = build_param_binders(fn_sst);
     binders.extend(build_req_binders(check));
 
-    let items = walk(&check.body, &ctx)?;
-    let has_loop_or_call = items.iter().any(BodyItem::needs_peel);
-    let goal = build_goal(
-        &items,
-        check.post_condition.dest.as_ref().map(|v| v.0.as_str()),
-        &check.post_condition.ens_exps,
-        &ctx,
-    );
+    // Build the whole WP tree from the body, with the fn's ensures
+    // as the natural continuation at the leaves. `Return` statements
+    // inside the body replace their local `after` with the same
+    // ensures goal (via `ctx.ensures_goal`).
+    let body_wp = build_wp(&check.body, Wp::Done(ctx.ensures_goal.clone()), &ctx)?;
+    let has_loop_or_call = body_wp.needs_peel();
+    let goal = lower_wp(&body_wp, &ctx);
     let tactic = if has_loop_or_call { loop_tactic() } else { simple_tactic() };
     Ok(vec![Theorem { name, binders, goal, tactic }])
 }
@@ -296,108 +313,266 @@ fn build_req_binders(check: &FuncCheckSst) -> Vec<LBinder> {
     }).collect()
 }
 
-// ── Goal builder ───────────────────────────────────────────────────────
+// ── WP DSL ─────────────────────────────────────────────────────────────
+//
+// `Wp<'a>` is a small algebra of WP-shaped operations. Each non-`Done`
+// node carries its own continuation by construction — no separate
+// "rest" parameter, no separate "terminator" parameter. Lowering
+// (`lower_wp`) is a straightforward tree walk; construction
+// (`build_wp`) threads each statement's continuation through at walk
+// time.
+//
+// Compared to the earlier `BodyItem` + `build_goal_with_terminator`
+// design:
+//
+//   * Continuation is type-level, not positional. Can't accidentally
+//     compose after a `Return` because `Done` has no slot for more.
+//   * `Return` is cleanly "terminator-at-fn-exit" rather than
+//     "terminator-in-current-scope" — an early return always writes
+//     the fn's ensures goal, even when nested inside a loop. The
+//     earlier code passed the loop's local goal through as the
+//     terminator, which was incorrect for true fn-exit semantics
+//     (harmless in practice because we don't exercise return-in-loop
+//     yet, but the DSL shape gets this right by construction).
+//   * `Loop` / `Call` compose like any other node — each has `body`
+//     and/or `after` sub-Wps, recursion is structural.
+//   * `needs_peel` is one line per variant, based on the node's own
+//     shape rather than a post-hoc traversal looking for
+//     `BodyItem::Loop` / `Call`.
+//
+// Adding a new WP form means adding a constructor + an arm in
+// `build_wp` (where walk produces it) and `lower_wp` (where it lowers
+// to LExpr). No changes needed to a central dispatcher.
 
-/// Construct the theorem goal by folding body items in source order. See
-/// the module doc for the WP rules — each item wraps the goal built from
-/// the remainder of the body. `Return` terminates: items after it are
-/// dropped because they're unreachable.
-///
-/// Thin wrapper around `build_goal_with_terminator`; the terminator for
-/// the top-level call is the ensures conjunction.
-fn build_goal(
-    items: &[BodyItem<'_>],
-    ret_name: Option<&str>,
-    ensures: &[Exp],
-    ctx: &WpCtx<'_>,
-) -> LExpr {
-    let terminator = and_all(ensures.iter().map(sst_exp_to_ast).collect());
-    build_goal_with_terminator(items, ret_name, &terminator, ctx)
+/// A WP program. Each compound node carries its own continuation,
+/// so composition is structural and `Return` is naturally a
+/// terminator.
+#[derive(Clone)]
+enum Wp<'a> {
+    /// Terminal leaf — the goal at this point in the program. Built
+    /// from the fn's ensures (top-level), from the loop's local
+    /// `I ∧ D < d_old` (loop-body terminator), or from a `return`
+    /// statement's `let <ret> := e; ensures`.
+    Done(LExpr),
+
+    /// `let x := e; <body>`. If `e` contains an `ExpX::If`, the
+    /// lowering pass lifts it out via `lift_if_value` — this keeps
+    /// the Wp tree shape intact while giving omega a tractable goal.
+    Let(&'a str, &'a Exp, Box<Wp<'a>>),
+
+    /// `P ∧ <body>`.
+    Assert(&'a Exp, Box<Wp<'a>>),
+
+    /// `P → <body>`.
+    Assume(&'a Exp, Box<Wp<'a>>),
+
+    /// `(c → then_branch) ∧ (¬c → else_branch)`. Both branches
+    /// carry their own continuations up to the next join — the
+    /// outer WP builder doesn't split continuations textually,
+    /// because each branch already has the right continuation
+    /// embedded in its Wp sub-tree.
+    Branch {
+        cond: &'a Exp,
+        then_branch: Box<Wp<'a>>,
+        else_branch: Box<Wp<'a>>,
+    },
+
+    /// Loop. `body` is the body's Wp built with its own local
+    /// `Done(I ∧ D < _tactus_d_old)` terminator; `after` is the
+    /// post-loop continuation (built with the enclosing scope's
+    /// `after`). Lowering wraps `body` with the `let _tactus_d_old
+    /// := D` binding and the maintain quantifier, and wraps `after`
+    /// with the havoc quantifier.
+    Loop {
+        cond: &'a Exp,
+        invs: &'a [LoopInv],
+        decrease: &'a Exp,
+        modified_vars: Vec<(&'a VarIdent, &'a Typ)>,
+        body: Box<Wp<'a>>,
+        after: Box<Wp<'a>>,
+    },
+
+    /// Direct function call. `after` is the post-call continuation.
+    /// Lowering inlines the callee's require/ensure via
+    /// `lean_ast::substitute` and wraps `after` under `∀ ret, bound →
+    /// ensures → let dest := ret; after`.
+    Call {
+        callee: &'a FunctionX,
+        args: Vec<&'a Exp>,
+        dest: Option<(&'a VarIdent, &'a Typ)>,
+        after: Box<Wp<'a>>,
+    },
 }
 
-/// The real WP builder, parameterized on what the continuation ends in.
-///
-/// At the top of the body, `terminator` is the ensures conjunction and
-/// the function acts like textbook WP. Inside a loop's maintain clause,
-/// `terminator` is `I ∧ D < d_old` — so the loop's body walker can
-/// reuse all of the same item-handling logic with a different terminal
-/// goal. One function, one set of rules.
-///
-/// The base case (empty items) returns a clone of the terminator.
-/// `Return(e)` with a named dest emits `let <ret> := e; <terminator>`;
-/// without a dest (unit return in a unit fn), the return value is
-/// dropped — it's always `()`.
-fn build_goal_with_terminator(
-    items: &[BodyItem<'_>],
-    ret_name: Option<&str>,
-    terminator: &LExpr,
-    ctx: &WpCtx<'_>,
-) -> LExpr {
-    let Some((head, rest)) = items.split_first() else { return terminator.clone() };
-    match head {
-        // An `ExpX::If` on the RHS of a let (or as the returned value,
-        // below) is a value whose structure omega can't reason about —
-        // omega handles `∧`/`→`/`¬` over linear arith but not
-        // `if c then a else b` inside the goal. Lift it out: split
-        // `let x := if c then a else b; rest` into
-        // `(c → let x := a; rest) ∧ (¬c → let x := b; rest)`.
-        // Recursion handles nested if-exprs.
-        BodyItem::Let(name, rhs) => lift_if_value(rhs, &|rhs_ast| {
-            LExpr::let_bind(
-                sanitize(name), rhs_ast,
-                build_goal_with_terminator(rest, ret_name, terminator, ctx),
-            )
-        }),
-        BodyItem::Assume(e) => LExpr::implies(
-            sst_exp_to_ast(e),
-            build_goal_with_terminator(rest, ret_name, terminator, ctx),
-        ),
-        BodyItem::Assert(e) => LExpr::and(
-            sst_exp_to_ast(e),
-            build_goal_with_terminator(rest, ret_name, terminator, ctx),
-        ),
-        BodyItem::Return(e) => lift_if_value(e, &|e_ast| match ret_name {
-            Some(name) => LExpr::let_bind(sanitize(name), e_ast, terminator.clone()),
-            None => terminator.clone(),
-        }),
-        // WP: `(c → wp(then ++ rest)) ∧ (¬c → wp(else ++ rest))`. `rest`
-        // duplicates syntactically — see DESIGN.md "Known codegen-
-        // complexity trade-offs". If a branch ends in `Return`, its
-        // continuation terminates there and `rest` is appended but
-        // ignored.
-        BodyItem::IfThenElse { cond, then_items, else_items } => {
-            let then_all: Vec<BodyItem<'_>> =
-                then_items.iter().chain(rest.iter()).cloned().collect();
-            let else_all: Vec<BodyItem<'_>> =
-                else_items.iter().chain(rest.iter()).cloned().collect();
-            let cond_ast = sst_exp_to_ast(cond);
-            LExpr::and(
-                LExpr::implies(
-                    cond_ast.clone(),
-                    build_goal_with_terminator(&then_all, ret_name, terminator, ctx),
-                ),
-                LExpr::implies(
-                    LExpr::not(cond_ast),
-                    build_goal_with_terminator(&else_all, ret_name, terminator, ctx),
-                ),
-            )
-        }
-        // WP: `I ∧ maintain ∧ havoc_continuation`. See the
-        // "Loop obligations (conjunctive WP)" section of the module
-        // doc for the shape.
-        BodyItem::Loop { cond, invs, decrease, modified_vars, body_items } => {
-            build_loop_conjunction(
-                cond, invs, decrease, modified_vars, body_items,
-                rest, ret_name, terminator, ctx,
-            )
-        }
-        // WP: `requires ∧ (∀ ret, bound(ret) → ensures(ret) →
-        // wp(rest))`. Inlines the callee's spec instead of emitting
-        // a Lean definition for it. See `build_call_conjunction`.
-        BodyItem::Call { callee, args, dest } => {
-            build_call_conjunction(callee, args, *dest, rest, ret_name, terminator, ctx)
+impl<'a> Wp<'a> {
+    /// Does lowering this Wp produce a goal shape that needs
+    /// structural peeling (nested `∀` / `∧` beyond what omega can
+    /// chase directly)? Flat Let/Assert/Assume/Branch chains over
+    /// arithmetic don't; Loops and Calls do because they introduce
+    /// quantifiers and conjunctive splits. `Branch` by itself is
+    /// peel-free (just two implications under a conjunction) — only
+    /// needs peel when a sub-branch does.
+    fn needs_peel(&self) -> bool {
+        match self {
+            Wp::Done(_) => false,
+            Wp::Let(_, _, body) | Wp::Assert(_, body) | Wp::Assume(_, body) => body.needs_peel(),
+            Wp::Branch { then_branch, else_branch, .. } => {
+                then_branch.needs_peel() || else_branch.needs_peel()
+            }
+            Wp::Loop { .. } | Wp::Call { .. } => true,
         }
     }
+}
+
+// ── WP lowering ────────────────────────────────────────────────────────
+
+/// Interpret a `Wp` tree into a Lean `LExpr`. Each node has a
+/// corresponding WP rule; see the variant docs on `Wp` for details.
+fn lower_wp(wp: &Wp<'_>, ctx: &WpCtx<'_>) -> LExpr {
+    match wp {
+        Wp::Done(leaf) => leaf.clone(),
+        Wp::Let(name, rhs, body) => {
+            // If `rhs` has an `ExpX::If` (possibly under transparent
+            // wrappers), lift it to goal level: `let x := if c then
+            // a else b; rest` becomes `(c → let x := a; rest) ∧ (¬c →
+            // let x := b; rest)`. Omega can chase each branch
+            // separately; it can't see inside a value-position if.
+            let body_lowered = lower_wp(body, ctx);
+            lift_if_value(rhs, &|rhs_ast| {
+                LExpr::let_bind(sanitize(name), rhs_ast, body_lowered.clone())
+            })
+        }
+        Wp::Assert(e, body) => LExpr::and(sst_exp_to_ast(e), lower_wp(body, ctx)),
+        Wp::Assume(e, body) => LExpr::implies(sst_exp_to_ast(e), lower_wp(body, ctx)),
+        Wp::Branch { cond, then_branch, else_branch } => {
+            let c = sst_exp_to_ast(cond);
+            LExpr::and(
+                LExpr::implies(c.clone(), lower_wp(then_branch, ctx)),
+                LExpr::implies(LExpr::not(c), lower_wp(else_branch, ctx)),
+            )
+        }
+        Wp::Loop { cond, invs, decrease, modified_vars, body, after } => {
+            lower_loop(cond, invs, decrease, modified_vars, body, after, ctx)
+        }
+        Wp::Call { callee, args, dest, after } => {
+            lower_call(callee, args, *dest, after, ctx)
+        }
+    }
+}
+
+/// Lower a `Wp::Loop` to the three-part conjunction
+/// `I ∧ maintain ∧ havoc_continuation` — see DESIGN.md "Loop
+/// obligations (conjunctive WP)" for the shape and rationale.
+///
+/// `body` was built with `Done(I ∧ D < _tactus_d_old)` as its
+/// terminator (see `build_wp_loop`), so `lower_wp(body, ctx)` already
+/// produces the maintain clause's inner goal. Wrapping with
+/// `let _tactus_d_old := D` around it lets the inner `D` reference
+/// the post-body value while `_tactus_d_old` retains the pre-body
+/// value — straight Lean let-scoping does the right thing.
+fn lower_loop(
+    cond: &Exp,
+    invs: &[LoopInv],
+    decrease: &Exp,
+    modified_vars: &[(&VarIdent, &Typ)],
+    body: &Wp<'_>,
+    after: &Wp<'_>,
+    ctx: &WpCtx<'_>,
+) -> LExpr {
+    let inv_conj = || and_all(invs.iter().map(|i| sst_exp_to_ast(&i.inv)).collect());
+    let cond_ast = || sst_exp_to_ast(cond);
+    let decrease_ast = || sst_exp_to_ast(decrease);
+
+    // Init: invariant conjunction at loop entry.
+    let init_clause = inv_conj();
+
+    // Maintain: `∀ mod_vars, bounds → I ∧ cond →
+    //             (let _tactus_d_old := D; lower_wp(body))`.
+    // See DESIGN.md "_tactus_d_old aliasing across nested loops" for
+    // the rationale behind the literal name.
+    let maintain_body_lowered = lower_wp(body, ctx);
+    let maintain_core = LExpr::let_bind("_tactus_d_old", decrease_ast(), maintain_body_lowered);
+    let maintain_clause = quantify_mod_vars(
+        modified_vars,
+        LExpr::implies(LExpr::and(inv_conj(), cond_ast()), maintain_core),
+    );
+
+    // Use / post-loop continuation: `∀ mod_vars, bounds → I ∧ ¬cond →
+    //   lower_wp(after)`. `after`'s Done leaves point at the outer
+    // ensures (or whatever the enclosing scope's `after` was), so
+    // nested loops' post-body code feeds back correctly.
+    let after_lowered = lower_wp(after, ctx);
+    let use_clause = quantify_mod_vars(
+        modified_vars,
+        LExpr::implies(LExpr::and(inv_conj(), LExpr::not(cond_ast())), after_lowered),
+    );
+
+    LExpr::and(init_clause, LExpr::and(maintain_clause, use_clause))
+}
+
+/// Lower a `Wp::Call` by inlining the callee's require / ensure via
+/// Lean-AST substitution (rather than textual let-wrapping, which
+/// would shadow caller names on self-recursion). See the old
+/// `build_call_conjunction` comment for the shape rationale; the
+/// change here is just that the continuation is a `Wp` sub-tree
+/// instead of a remaining-items slice.
+fn lower_call(
+    callee: &FunctionX,
+    args: &[&Exp],
+    dest: Option<(&VarIdent, &Typ)>,
+    after: &Wp<'_>,
+    ctx: &WpCtx<'_>,
+) -> LExpr {
+    let params_vec: Vec<_> = callee.params.iter().collect();
+    assert_eq!(
+        params_vec.len(), args.len(),
+        "callee param count {} != caller arg count {} for {:?} — \
+         build_wp_call should have rejected this",
+        params_vec.len(), args.len(), callee.name.path,
+    );
+
+    let subst: std::collections::HashMap<String, LExpr> = params_vec.iter()
+        .zip(args.iter())
+        .map(|(p, arg)| (sanitize(&p.x.name.0), sst_exp_to_ast(arg)))
+        .collect();
+
+    let requires_conj = and_all(
+        callee.require.iter().map(|e| vir_expr_to_ast(e)).collect()
+    );
+    let ensures_conj = and_all(
+        callee.ensure.0.iter().map(|e| vir_expr_to_ast(e)).collect()
+    );
+    let requires_clause = substitute(&requires_conj, &subst);
+
+    let ret = &callee.ret.x;
+    let ret_name_cal = sanitize(&ret.name.0);
+    let ret_typ = typ_to_expr(&ret.typ);
+    let continuation_under_ret = {
+        let after_lowered = lower_wp(after, ctx);
+        let bound_rest = match dest {
+            Some((dest_ident, _)) => LExpr::let_bind(
+                sanitize(&dest_ident.0),
+                LExpr::var(ret_name_cal.clone()),
+                after_lowered,
+            ),
+            None => after_lowered,
+        };
+        let ensures_impl = LExpr::implies(substitute(&ensures_conj, &subst), bound_rest);
+        let bounded_impl = match type_bound_predicate(&LExpr::var(ret_name_cal.clone()), &ret.typ) {
+            Some(pred) => LExpr::implies(pred, ensures_impl),
+            None => ensures_impl,
+        };
+        LExpr::forall(
+            vec![LBinder {
+                name: Some(ret_name_cal.clone()),
+                ty: ret_typ,
+                kind: BinderKind::Explicit,
+            }],
+            bounded_impl,
+        )
+    };
+
+    LExpr::and(requires_clause, continuation_under_ret)
 }
 
 /// Lift `ExpX::If` expressions from value-position to goal-level.
@@ -469,170 +644,6 @@ fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
 /// (one per loop). The use clause threads the outer `terminator`
 /// through, so a nested loop's post-loop code feeds back into the
 /// outer loop's post-body goal / fn ensures.
-fn build_loop_conjunction(
-    cond: &Exp,
-    invs: &[LoopInv],
-    decrease: &Exp,
-    modified_vars: &[(&VarIdent, &Typ)],
-    body_items: &[BodyItem<'_>],
-    rest: &[BodyItem<'_>],
-    ret_name: Option<&str>,
-    terminator: &LExpr,
-    ctx: &WpCtx<'_>,
-) -> LExpr {
-    let inv_conj = || and_all(invs.iter().map(|i| sst_exp_to_ast(&i.inv)).collect());
-    let cond_ast = || sst_exp_to_ast(cond);
-    let decrease_ast = || sst_exp_to_ast(decrease);
-
-    // Init: at the loop entry (in the current enclosing context), the
-    // invariant conjunction must hold.
-    let init_clause = inv_conj();
-
-    // Maintain: `∀ mod_vars, bounds → I ∧ cond →
-    //              (let _tactus_d_old := D; wp(body, I ∧ D < _tactus_d_old))`.
-    // The let-binding captures the decrease measure before the body
-    // runs; the inner `D` after body mutations shadow the relevant
-    // variable refers to the new value.
-    //
-    // We reuse the literal name `_tactus_d_old` for every loop. For
-    // nested loops this means the inner `let _tactus_d_old := D_inner`
-    // shadows the outer's binding — which works out because the
-    // shadow is confined to the inner's maintain clause (its own
-    // conjunct), and the outer's reference to `_tactus_d_old` lives
-    // in the outer's maintain (a different conjunct). See DESIGN.md
-    // "_tactus_d_old aliasing across nested loops" — a gensym'd
-    // name per loop would make the scoping more obvious but isn't
-    // needed for correctness.
-    let post_body = LExpr::and(
-        inv_conj(),
-        LExpr::lt(decrease_ast(), LExpr::var("_tactus_d_old")),
-    );
-    let maintain_body_wp = build_goal_with_terminator(body_items, ret_name, &post_body, ctx);
-    let maintain_core = LExpr::let_bind("_tactus_d_old", decrease_ast(), maintain_body_wp);
-    let maintain_clause = quantify_mod_vars(
-        modified_vars,
-        LExpr::implies(LExpr::and(inv_conj(), cond_ast()), maintain_core),
-    );
-
-    // Use / continuation: `∀ mod_vars, bounds → I ∧ ¬cond →
-    //   wp(rest, outer_terminator)`.
-    let rest_goal = build_goal_with_terminator(rest, ret_name, terminator, ctx);
-    let use_clause = quantify_mod_vars(
-        modified_vars,
-        LExpr::implies(LExpr::and(inv_conj(), LExpr::not(cond_ast())), rest_goal),
-    );
-
-    LExpr::and(init_clause, LExpr::and(maintain_clause, use_clause))
-}
-
-/// Emit the WP conjunction contributed by a single function call.
-///
-/// For `let dest = callee(arg1, arg2, …)`:
-///
-/// ```
-/// (let p1 := arg1; let p2 := arg2; …; requires_conj)
-/// ∧ (∀ (ret : RetT), h_ret_bound(ret) →
-///      (let p1 := arg1; let p2 := arg2; …; ensures_conj_using_ret) →
-///      (let dest := ret; wp(rest, outer_terminator)))
-/// ```
-///
-/// Parameter substitution is done via Lean `let`-bindings rather than
-/// rewriting the callee's spec at the SST level — same trick as
-/// `_tactus_d_old`, cheap and obviously correct.
-///
-/// `ret` is the callee's declared return-var name (pulled from
-/// `FunctionX::ret`). If the callee returns unit or the call discards
-/// its result, the `∀` is skipped and `dest` isn't bound.
-///
-/// Termination obligations (for recursive calls, including mutual)
-/// are injected upstream by Verus's `recursion` pass as
-/// `StmX::Assert(InternalFun::CheckDecreaseHeight)` — they appear
-/// before the `StmX::Call` in the SST and flow through `walk` as
-/// normal assert items. The Lean lowering lives in
-/// `to_lean_sst_expr::sst_exp_to_ast`.
-fn build_call_conjunction(
-    callee: &FunctionX,
-    args: &[&Exp],
-    dest: Option<(&VarIdent, &Typ)>,
-    rest: &[BodyItem<'_>],
-    ret_name: Option<&str>,
-    terminator: &LExpr,
-    ctx: &WpCtx<'_>,
-) -> LExpr {
-    // Strip any `ast_simplify`-injected dummy arg so zip aligns with
-    // `callee.params`. `walk_call` already verified the counts line
-    // up, so zipping cannot silently truncate. Unconditional assert
-    // is defense-in-depth: if a future refactor produces
-    // `BodyItem::Call` through a different path, this fires
-    // immediately rather than binding wrong variables silently.
-    let params_vec: Vec<_> = callee.params.iter().collect();
-    assert_eq!(
-        params_vec.len(), args.len(),
-        "callee param count {} != caller arg count {} for {:?} — \
-         walk_call should have rejected this",
-        params_vec.len(), args.len(), callee.name.path,
-    );
-
-    // Build param → arg substitution map. We substitute directly at
-    // the Lean AST level (via `lean_ast::substitute`) rather than
-    // emitting `let p := arg; body` wrappers. Direct substitution
-    // avoids name shadowing when callee and caller share a param
-    // name (e.g., self-recursion) — with let-wrapping the nested
-    // `let n := n - 1; ...; n` defeats omega's let-handling.
-    let subst: std::collections::HashMap<String, LExpr> = params_vec.iter()
-        .zip(args.iter())
-        .map(|(p, arg)| (sanitize(&p.x.name.0), sst_exp_to_ast(arg)))
-        .collect();
-
-    let requires_conj = and_all(
-        callee.require.iter().map(|e| vir_expr_to_ast(e)).collect()
-    );
-    let ensures_conj = and_all(
-        callee.ensure.0.iter().map(|e| vir_expr_to_ast(e)).collect()
-    );
-
-    let requires_clause = substitute(&requires_conj, &subst);
-
-    // Continuation under a havoc'd return value. If the callee's
-    // return type is a tuple or unit with no declared ret name,
-    // skip the ∀ and treat the ensures as a flat hypothesis.
-    let ret = &callee.ret.x;
-    let ret_name_cal = sanitize(&ret.name.0);
-    let ret_typ = typ_to_expr(&ret.typ);
-    let continuation_under_ret = {
-        let rest_goal = build_goal_with_terminator(rest, ret_name, terminator, ctx);
-        // If the caller has a destination, bind `let dest := <ret>;
-        // rest_goal` inside the ∀. Otherwise rest sees the call as
-        // having no bound value.
-        let bound_rest = match dest {
-            Some((dest_ident, _)) => LExpr::let_bind(
-                sanitize(&dest_ident.0),
-                LExpr::var(ret_name_cal.clone()),
-                rest_goal,
-            ),
-            None => rest_goal,
-        };
-        // ensures(ret) → bound_rest
-        let ensures_impl = LExpr::implies(substitute(&ensures_conj, &subst), bound_rest);
-        // Optionally wrap with `h_bound(ret) → …`.
-        let bounded_impl = match type_bound_predicate(&LExpr::var(ret_name_cal.clone()), &ret.typ) {
-            Some(pred) => LExpr::implies(pred, ensures_impl),
-            None => ensures_impl,
-        };
-        // ∀ ret : RetTyp, ...
-        LExpr::forall(
-            vec![LBinder {
-                name: Some(ret_name_cal.clone()),
-                ty: ret_typ,
-                kind: BinderKind::Explicit,
-            }],
-            bounded_impl,
-        )
-    };
-
-    LExpr::and(requires_clause, continuation_under_ret)
-}
-
 /// `∀ (x₁ : T₁), bounds₁ → … ∀ (xₙ : Tₙ), boundsₙ → body` — wraps
 /// `body` with a universal quantifier per modified variable plus its
 /// type-bound hypothesis (where applicable).
@@ -661,165 +672,97 @@ fn quantify_mod_vars(
     out
 }
 
-// ── Body walk ──────────────────────────────────────────────────────────
+// ── WP builder (walk) ──────────────────────────────────────────────────
 
-#[derive(Clone)]
-enum BodyItem<'a> {
-    Let(&'a str, &'a Exp),
-    Assert(&'a Exp),
-    Assume(&'a Exp),
-    /// Terminator: wraps the ensures as `let <ret> := e; <ensures>` and
-    /// discards any subsequent items in the same sequence. Populated
-    /// from `StmX::Return { ret_exp: Some(_), inside_body: false }`.
-    Return(&'a Exp),
-    /// `if <cond> { <then_items> } else { <else_items> }` — both branches
-    /// are already flattened into `BodyItem` sequences. Either branch
-    /// may end with a `Return` (handled by `build_goal`).
-    IfThenElse {
-        cond: &'a Exp,
-        then_items: Vec<BodyItem<'a>>,
-        else_items: Vec<BodyItem<'a>>,
-    },
-    /// `while <cond> invariant <invs> decreases <decrease> { <body_items> }`.
-    /// Loop bodies are flattened through `Block` composition; nested
-    /// loops appear as inner `Loop` variants and compose naturally
-    /// through `build_goal`. Modified vars are computed from the
-    /// body's assignments and resolved to types at walk time so
-    /// `build_goal` doesn't need the type map.
-    ///
-    /// `invs` is borrowed directly from the SST's `LoopInvs` (an
-    /// `Arc<Vec<LoopInv>>`) — no intermediate `Vec`. `build_goal`
-    /// pulls the `.inv` field off each `LoopInv` when it needs the
-    /// invariant expression.
-    Loop {
-        cond: &'a Exp,
-        invs: &'a [LoopInv],
-        decrease: &'a Exp,
-        modified_vars: Vec<(&'a VarIdent, &'a Typ)>,
-        body_items: Vec<BodyItem<'a>>,
-    },
-    /// `foo(arg1, arg2, …)` optionally binding the result to a local.
-    /// `callee` is the full VIR-AST `FunctionX` so `build_goal` has
-    /// the requires / ensures / param list / return var all in one
-    /// place. Args are borrowed from the SST.
-    ///
-    /// **Termination obligations for recursive calls** are handled
-    /// upstream by Verus itself (`vir::recursion`): right before each
-    /// recursive call, Verus inserts a `StmX::Assert(…)` containing
-    /// an `ExpX::Call(InternalFun::CheckDecreaseHeight, …)` that
-    /// encodes "callee's decrease strictly decreases from caller's."
-    /// So we get termination for free — including mutual recursion
-    /// across a whole SCC — as long as our SST translator knows how
-    /// to lower `CheckDecreaseHeight`. See `sst_exp_to_ast`.
-    Call {
-        callee: &'a FunctionX,
-        args: Vec<&'a Exp>,
-        /// `Some((name, typ))` for `let x = foo(…)`; `None` for
-        /// discarded or unit return.
-        dest: Option<(&'a VarIdent, &'a Typ)>,
-    },
-}
-
-impl<'a> BodyItem<'a> {
-    /// Does this item — or any sub-item nested inside it — produce a
-    /// goal shape that needs structural peeling? Loops, calls (which
-    /// introduce `∀ result, …`), and `IfThenElse` wrapping either
-    /// qualify; flat Let/Assert/Assume/Return chains don't. Used at
-    /// theorem-emit time to pick between plain `tactus_auto` and the
-    /// `tactus_peel`-prefixed loop tactic.
-    fn needs_peel(&self) -> bool {
-        match self {
-            BodyItem::Loop { .. } | BodyItem::Call { .. } => true,
-            BodyItem::IfThenElse { then_items, else_items, .. } => {
-                then_items.iter().any(Self::needs_peel)
-                    || else_items.iter().any(Self::needs_peel)
-            }
-            _ => false,
-        }
-    }
-}
-
-/// Flatten an SST statement tree into a sequence of `BodyItem`s, while
-/// simultaneously validating every shape we see. A `Block` concatenates
-/// its children's flattenings; `If` / `Loop` become their own composite
-/// items whose sub-bodies are recursively flattened; transparent forms
-/// (`Air`, `Fuel`, `RevealString`) contribute nothing; and any variant
-/// we don't know how to emit — plus any disallowed shape nested inside
-/// one we do — becomes an `Err("… not yet supported")` that bubbles up
-/// through the call chain.
+/// Build the `Wp` tree for a statement, threading the continuation
+/// `after` through. Right-to-left over a `Block` — each statement's
+/// `after` is the already-built Wp for the rest of the block.
 ///
-/// Fusing validation with transformation means the "supported_body ran
-/// first" precondition is enforced by construction: there's no way to
-/// reach the body of `exec_fn_theorems_to_ast` with unchecked `BodyItem`s
-/// because `walk` is the only producer. Previously this was a runtime
-/// invariant guarded by `.expect`; now it's a type-level one guarded by
-/// `Result`.
+/// `Return` discards `after` and writes a `Done` leaf at the fn's
+/// ensures goal. Other variants wrap `after` with their respective
+/// WP rule.
 ///
-/// `ctx.type_map` is used by loop walking to attach the type of each
-/// modified variable; `ctx.fn_map` is used by call walking to look up
-/// the callee's `FunctionX`. Termination obligations for recursive
-/// calls are emitted upstream by Verus as `StmX::Assert(InternalFun::
-/// CheckDecreaseHeight)` — they flow through here as ordinary
-/// asserts; `sst_exp_to_ast` handles the Lean-level lowering.
-fn walk<'a>(
+/// Validation is fused with construction: any unsupported SST form
+/// returns `Err` and bubbles up, so the caller of `build_wp` is
+/// guaranteed that the returned `Wp` is lowerable without panics.
+/// The "validate-first" precondition is type-level — there's no way
+/// to produce a `Wp` without clearing the shape checks.
+fn build_wp<'a>(
     stm: &'a Stm,
+    after: Wp<'a>,
     ctx: &WpCtx<'a>,
-) -> Result<Vec<BodyItem<'a>>, String> {
+) -> Result<Wp<'a>, String> {
     match &stm.x {
         StmX::Block(stms) => {
-            let mut out: Vec<BodyItem<'a>> = Vec::new();
-            for s in stms.iter() {
-                out.extend(walk(s, ctx)?);
+            // Fold right-to-left: walk(s_last, outer_after),
+            //                     walk(s_{n-1}, that),
+            //                     ...,
+            //                     walk(s_0, whole_rest).
+            let mut wp = after;
+            for s in stms.iter().rev() {
+                wp = build_wp(s, wp, ctx)?;
             }
-            Ok(out)
+            Ok(wp)
         }
         StmX::Assign { lhs: Dest { dest, .. }, rhs } => {
             check_exp(dest)?;
             check_exp(rhs)?;
-            // `BodyItem::Let` needs a simple-var LHS; anything fancier
-            // (field writes, index writes, tuple destructure) would
-            // need a different WP shape. Reject upfront so the user
-            // sees a clear "not yet supported" instead of a silent
-            // drop.
             let Some(name) = extract_simple_var(dest) else {
                 return Err(format!(
                     "assignment with non-simple LHS (got {:?}) is not yet supported",
                     dest.x
                 ));
             };
-            Ok(vec![BodyItem::Let(name, rhs)])
+            Ok(Wp::Let(name, rhs, Box::new(after)))
         }
         StmX::Assert(_, _, e) | StmX::AssertCompute(_, e, _) => {
             check_exp(e)?;
-            Ok(vec![BodyItem::Assert(e)])
+            Ok(Wp::Assert(e, Box::new(after)))
         }
         StmX::Assume(e) => {
             check_exp(e)?;
-            Ok(vec![BodyItem::Assume(e)])
+            Ok(Wp::Assume(e, Box::new(after)))
         }
-        // `inside_body` distinguishes a tail return from an "early"
-        // return (one with code after it in the same block). Both
-        // exit the fn; `build_goal_with_terminator` handles them
-        // uniformly — each `Return` terminates its item list and
-        // subsequent items get dropped on that branch.
+        // `return e` discards the textual continuation (`after`) and
+        // terminates at the fn's ensures. Discard is type-level:
+        // `Done` has no continuation slot. If the return value has
+        // an `ExpX::If`, lift it via `lift_if_value` so the Done
+        // leaf has goal-level `(c → …) ∧ (¬c → …)` shape rather than
+        // an opaque-to-omega value-position if.
         StmX::Return { ret_exp: Some(e), .. } => {
             check_exp(e)?;
-            Ok(vec![BodyItem::Return(e)])
+            let ensures_goal = ctx.ensures_goal.clone();
+            let ret_name = ctx.ret_name;
+            let leaf = lift_if_value(e, &|e_ast| match ret_name {
+                Some(name) => LExpr::let_bind(sanitize(name), e_ast, ensures_goal.clone()),
+                None => ensures_goal.clone(),
+            });
+            Ok(Wp::Done(leaf))
         }
-        StmX::Return { ret_exp: None, .. } => Ok(Vec::new()),
+        StmX::Return { ret_exp: None, .. } => Ok(Wp::Done(ctx.ensures_goal.clone())),
         StmX::If(cond, then_stm, else_stm) => {
             check_exp(cond)?;
-            let then_items = walk(then_stm, ctx)?;
-            let else_items = match else_stm {
-                Some(e) => walk(e, ctx)?,
-                None => Vec::new(),
+            // Both branches share the same post-if continuation. Clone
+            // `after` into each — this is where the pre-DSL code's
+            // exponential-in-nested-ifs size comes from; see DESIGN.md
+            // "Known codegen-complexity trade-offs" for the shared-
+            // continuation let-binding optimization we chose not to
+            // implement (simp zeta-reduces it, so no saving).
+            let then_branch = build_wp(then_stm, after.clone(), ctx)?;
+            let else_branch = match else_stm {
+                Some(e) => build_wp(e, after, ctx)?,
+                None => after,
             };
-            Ok(vec![BodyItem::IfThenElse { cond, then_items, else_items }])
+            Ok(Wp::Branch {
+                cond,
+                then_branch: Box::new(then_branch),
+                else_branch: Box::new(else_branch),
+            })
         }
-        StmX::Call { .. } => walk_call(stm, ctx),
-        StmX::Loop { .. } => walk_loop(stm, ctx),
-        // Transparent in SST: contribute nothing to the WP goal.
-        StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => Ok(Vec::new()),
+        StmX::Call { .. } => build_wp_call(stm, after, ctx),
+        StmX::Loop { .. } => build_wp_loop(stm, after, ctx),
+        // Transparent in SST: pass `after` through unchanged.
+        StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => Ok(after),
         StmX::BreakOrContinue { .. } => Err(
             "break/continue not yet supported".to_string()
         ),
@@ -835,13 +778,14 @@ fn walk<'a>(
     }
 }
 
-/// Validate and build a `BodyItem::Call`. Destructures every field
-/// explicitly (no `..`) so any future Verus field addition forces a
-/// compile error here.
-fn walk_call<'a>(
+/// Validate and build a `Wp::Call`. Destructures every `StmX::Call`
+/// field explicitly (no `..`) so any future Verus field addition
+/// forces a compile error here.
+fn build_wp_call<'a>(
     stm: &'a Stm,
+    after: Wp<'a>,
     ctx: &WpCtx<'a>,
-) -> Result<Vec<BodyItem<'a>>, String> {
+) -> Result<Wp<'a>, String> {
     let StmX::Call {
         fun,
         resolved_method,
@@ -853,9 +797,8 @@ fn walk_call<'a>(
         dest,
         assert_id: _,          // Verus-internal error id, behaviourally inert
     } = &stm.x else {
-        unreachable!("walk_call called on non-Call statement");
+        unreachable!("build_wp_call called on non-Call statement");
     };
-    // Reject every known "dispatch isn't just a direct call" shape.
     if resolved_method.is_some() {
         return Err(
             "calls to trait methods (requiring dynamic dispatch resolution) are not \
@@ -884,13 +827,8 @@ fn walk_call<'a>(
             fun.path
         ));
     };
-    // Param/arg count MUST match after stripping any `ast_simplify`-
-    // convention. Both sides have been through `ast_simplify` by now
-    // (via `vir_crate_simplified`), so zero-arg callees have their
-    // `no%param` dummy in both `params` and `args`. If Verus ever
-    // changes its arg-passing convention so this invariant breaks,
-    // we want a clean rejection here — not a silent zip-to-shorter
-    // in `build_call_conjunction`.
+    // Param/arg count must align (both sides are post-`ast_simplify`
+    // so zero-arg callees have their `no%param` dummy in both).
     let param_count = callee.params.len();
     if param_count != args.len() {
         return Err(format!(
@@ -901,9 +839,6 @@ fn walk_call<'a>(
         ));
     }
     for a in args.iter() {
-        // `ExpX::Loc` marks `&mut` args (even under transparent
-        // wrappers). We only support by-value today; `&mut` would
-        // need havoc-after-call semantics.
         if contains_loc(a) {
             return Err(
                 "calls with `&mut` arguments are not yet supported".to_string()
@@ -912,39 +847,39 @@ fn walk_call<'a>(
         check_exp(a)?;
     }
     let arg_refs: Vec<&'a Exp> = args.iter().collect();
-    // Extract the caller's destination var name + type. `None` if the
-    // call discards its result (`foo(…);` without `let x =`).
     let bound_dest: Option<(&'a VarIdent, &'a Typ)> = dest.as_ref().and_then(|d| {
         let ident = extract_simple_var_ident(&d.dest)?;
         let typ = ctx.type_map.get(ident).copied()?;
         Some((ident, typ))
     });
-    // NOTE: termination obligation is emitted upstream by Verus's
-    // own `recursion::check_recursive_function` pass, which inserts a
-    // `StmX::Assert` wrapping `InternalFun::CheckDecreaseHeight`
-    // right before each recursive call (including mutual recursion
-    // across an SCC). Our walk sees that Assert as a normal
-    // `BodyItem::Assert`; the conjunct appears in the WP goal and
-    // `tactus_auto` / the user must discharge it. See
-    // `to_lean_sst_expr::call_fun_to_ast`'s `CheckDecreaseHeight`
-    // arm for the Lean lowering.
-    Ok(vec![BodyItem::Call {
+    // NOTE: the termination obligation for recursive calls is emitted
+    // upstream by Verus's `recursion::check_recursive_function` pass,
+    // which inserts a `StmX::Assert` wrapping `InternalFun::
+    // CheckDecreaseHeight` right before each recursive call
+    // (including mutual recursion across an SCC). `build_wp` sees it
+    // as a plain `Wp::Assert`; `sst_exp_to_ast` handles the lowering.
+    Ok(Wp::Call {
         callee,
         args: arg_refs,
         dest: bound_dest,
-    }])
+        after: Box::new(after),
+    })
 }
 
-/// Validate and build a `BodyItem::Loop`. See the module doc for the
-/// shape restrictions this enforces.
-fn walk_loop<'a>(
+/// Validate and build a `Wp::Loop`. See the module doc for the shape
+/// restrictions. The loop's body is built with its OWN terminator —
+/// `Done(I ∧ D < _tactus_d_old)` — rather than the outer `after`,
+/// because a fall-through end of an iteration re-enters the loop's
+/// maintain clause, not the post-loop continuation.
+fn build_wp_loop<'a>(
     stm: &'a Stm,
+    after: Wp<'a>,
     ctx: &WpCtx<'a>,
-) -> Result<Vec<BodyItem<'a>>, String> {
+) -> Result<Wp<'a>, String> {
     let StmX::Loop {
         loop_isolation, cond, body, invs, decrease, modified_vars: _, ..
     } = &stm.x else {
-        unreachable!("walk_loop called on non-loop statement");
+        unreachable!("build_wp_loop called on non-loop statement");
     };
     if !loop_isolation {
         return Err(
@@ -980,10 +915,7 @@ fn walk_loop<'a>(
     let decrease_exp = &decrease[0];
 
     // Compute modified vars from the body's *non-init* assignments —
-    // `let mut x = …` inside the body is local to each iteration and
-    // shouldn't leak into the outer quantification. Nested loops use
-    // the same logic recursively, so an inner loop's local decls stay
-    // local even when the outer loop computes its own modified set.
+    // `let mut x = …` inside the body is local to each iteration.
     let mut mod_names: Vec<&'a VarIdent> = Vec::new();
     let mut locally_declared: HashSet<&'a VarIdent> = HashSet::new();
     collect_modifications(body, &mut locally_declared, &mut mod_names);
@@ -991,15 +923,24 @@ fn walk_loop<'a>(
         .filter_map(|id| ctx.type_map.get(id).map(|typ| (id, *typ)))
         .collect();
 
-    let body_items = walk(body, ctx)?;
+    // Body's local terminator: `I ∧ D < _tactus_d_old`. The reference
+    // to `_tactus_d_old` here is a Var; lowering wraps the body-WP
+    // with the `let _tactus_d_old := D` binding to put it in scope.
+    let inv_conj = and_all(invs.iter().map(|i| sst_exp_to_ast(&i.inv)).collect());
+    let maintain_local_goal = LExpr::and(
+        inv_conj,
+        LExpr::lt(sst_exp_to_ast(decrease_exp), LExpr::var("_tactus_d_old")),
+    );
+    let body_wp = build_wp(body, Wp::Done(maintain_local_goal), ctx)?;
 
-    Ok(vec![BodyItem::Loop {
+    Ok(Wp::Loop {
         cond: cond_exp,
         invs: &invs[..],
         decrease: decrease_exp,
         modified_vars,
-        body_items,
-    }])
+        body: Box::new(body_wp),
+        after: Box::new(after),
+    })
 }
 
 /// Collect variables that a loop body modifies *externally* — writes
