@@ -1,4 +1,5 @@
 pub mod dep_order;
+pub mod expr_shared;
 pub mod generate;
 pub mod lean_ast;
 pub mod lean_pp;

@@ -23,10 +23,10 @@
 
 use vir::ast::*;
 use vir::sst::{BndX, CallFun, Exp, ExpX, InternalFun};
-use crate::lean_ast::{
-    substitute, BinOp as L, Binder as LBinder, BinderKind, Expr as LExpr, ExprNode,
-};
+use crate::expr_shared::{binop_to_ast, clip_coercion_head, const_to_node_common};
+use crate::lean_ast::{substitute, Expr as LExpr, ExprNode};
 use crate::lean_pp::pp_expr;
+use crate::to_lean_expr::vir_var_binders_to_ast;
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
 
 /// Build a `lean_ast::Expr` from an SST expression, validating as we
@@ -278,10 +278,9 @@ fn clip_to_node_checked(src: &Typ, dst: &IntRange, inner: &Exp) -> Result<ExprNo
         _ => return exp_to_node_checked(inner),
     };
     let rendered = sst_exp_to_ast_checked(inner)?;
-    Ok(match (renders_as_lean_int(src_range), renders_as_lean_int(dst)) {
-        (true, false) => LExpr::app1(LExpr::var("Int.toNat"), rendered).node,
-        (false, true) => LExpr::app1(LExpr::var("Int.ofNat"), rendered).node,
-        _ => rendered.node,
+    Ok(match clip_coercion_head(renders_as_lean_int(src_range), renders_as_lean_int(dst)) {
+        Some(head) => LExpr::app1(LExpr::var(head), rendered).node,
+        None => rendered.node,
     })
 }
 
@@ -503,11 +502,7 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 out.node
             }
             BndX::Quant(quant, binders, _, _) => {
-                let l_binders: Vec<LBinder> = binders.iter().map(|b| LBinder {
-                    name: Some(sanitize(&b.name.0)),
-                    ty: typ_to_expr(&b.a),
-                    kind: BinderKind::Explicit,
-                }).collect();
+                let l_binders = vir_var_binders_to_ast(binders);
                 let body = Box::new(sst_exp_to_ast_checked(body)?);
                 match quant.quant {
                     air::ast::Quant::Forall => ExprNode::Forall { binders: l_binders, body },
@@ -515,24 +510,15 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 }
             }
             BndX::Lambda(binders, _) => ExprNode::Lambda {
-                binders: binders.iter().map(|b| LBinder {
-                    name: Some(sanitize(&b.name.0)),
-                    ty: typ_to_expr(&b.a),
-                    kind: BinderKind::Explicit,
-                }).collect(),
+                binders: vir_var_binders_to_ast(binders),
                 body: Box::new(sst_exp_to_ast_checked(body)?),
             },
             BndX::Choose(binders, _, cond) => {
                 // `Classical.epsilon (fun (x : T) => cond ∧ body)`
-                let l_binders: Vec<LBinder> = binders.iter().map(|b| LBinder {
-                    name: Some(sanitize(&b.name.0)),
-                    ty: typ_to_expr(&b.a),
-                    kind: BinderKind::Explicit,
-                }).collect();
                 let cond_ast = sst_exp_to_ast_checked(cond)?;
                 let body_ast = sst_exp_to_ast_checked(body)?;
                 let lambda = LExpr::new(ExprNode::Lambda {
-                    binders: l_binders,
+                    binders: vir_var_binders_to_ast(binders),
                     body: Box::new(LExpr::and(cond_ast, body_ast)),
                 });
                 LExpr::app1(LExpr::var("Classical.epsilon"), lambda).node
@@ -575,46 +561,7 @@ fn is_int_height(typ: &Typ) -> bool {
 }
 
 fn const_to_node_checked(c: &Constant) -> Result<ExprNode, String> {
-    Ok(match c {
-        Constant::Bool(b) => ExprNode::LitBool(*b),
-        Constant::Int(n) => ExprNode::Lit(n.to_string()),
-        Constant::StrSlice(s) => ExprNode::LitStr(s.to_string()),
-        Constant::Char(c) => ExprNode::LitChar(*c),
-        Constant::Real(_) | Constant::Float32(_) | Constant::Float64(_) => {
-            return Err(format!("unsupported constant: {:?}", c));
-        }
-    })
-}
-
-fn binop_to_ast(op: &BinaryOp) -> Option<L> {
-    Some(match op {
-        BinaryOp::And => L::And,
-        BinaryOp::Or => L::Or,
-        BinaryOp::Implies => L::Implies,
-        BinaryOp::Eq(_) => L::Eq,
-        BinaryOp::Ne => L::Ne,
-        BinaryOp::Inequality(InequalityOp::Le) => L::Le,
-        BinaryOp::Inequality(InequalityOp::Lt) => L::Lt,
-        BinaryOp::Inequality(InequalityOp::Ge) => L::Ge,
-        BinaryOp::Inequality(InequalityOp::Gt) => L::Gt,
-        BinaryOp::Arith(ArithOp::Add(_)) => L::Add,
-        BinaryOp::Arith(ArithOp::Sub(_)) => L::Sub,
-        BinaryOp::Arith(ArithOp::Mul(_)) => L::Mul,
-        BinaryOp::Arith(ArithOp::EuclideanDiv(_)) => L::Div,
-        BinaryOp::Arith(ArithOp::EuclideanMod(_)) => L::Mod,
-        BinaryOp::RealArith(RealArithOp::Add) => L::Add,
-        BinaryOp::RealArith(RealArithOp::Sub) => L::Sub,
-        BinaryOp::RealArith(RealArithOp::Mul) => L::Mul,
-        BinaryOp::RealArith(RealArithOp::Div) => L::Div,
-        BinaryOp::Bitwise(BitwiseOp::BitAnd, _) => L::BitAnd,
-        BinaryOp::Bitwise(BitwiseOp::BitOr, _) => L::BitOr,
-        BinaryOp::Bitwise(BitwiseOp::BitXor, _) => L::BitXor,
-        BinaryOp::Bitwise(BitwiseOp::Shr(_), _) => L::Shr,
-        BinaryOp::Bitwise(BitwiseOp::Shl(_, _), _) => L::Shl,
-        BinaryOp::Xor
-        | BinaryOp::HeightCompare { .. }
-        | BinaryOp::StrGetChar
-        | BinaryOp::Index(_, _)
-        | BinaryOp::IeeeFloat(_) => return None,
-    })
+    const_to_node_common(c).ok_or_else(||
+        format!("unsupported constant: {:?}", c)
+    )
 }

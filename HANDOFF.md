@@ -55,6 +55,8 @@ Net -59 lines (including fuller docstrings) and green on first compile — the t
 - **`full_check_decrease_height_shape_pinned` test** constructs a synthetic `CheckDecreaseHeight(Box(Let([(n, tmp)], n)), Box(n_old), False)` and asserts the substituted-form lowering. If Verus's encoding drifts, the assertion message points at `render_checked_decrease_arg` — turning a future recursive-fn verification mystery into a focused test failure with a named fix site.
 - 12 total new tests (8 `peel_transparent` wrapper matrix + 4 shape-drift), including specific "Loc NOT peeled" and "If NOT peeled" checks.
 
+**Expression-renderer shared leaves (this session).** Investigated full unification of `to_lean_expr.rs` (VIR-AST; spec/proof fns + callee-spec inlining) and `to_lean_sst_expr.rs` (SST; exec-fn bodies). Rejected approaches 1 (trait over source-expression type) and 2 (route callee specs through SST) after reviewing the actual overlap — roughly half the variants are asymmetric (VIR-AST's `Block`/`Match`/`Ctor`/`Place` vs SST's `CheckDecreaseHeight`/`InternalFun`/flattened statements), so full unification would rearrange boilerplate without eliminating it. Chose approach 3: extract the rules both renderers must apply identically into a new `expr_shared.rs` module — `binop_to_ast`, `non_binop_head`, `const_to_node_common`, `clip_coercion_head` + `apply_clip_coercion`. SST also now calls `vir_var_binders_to_ast` directly for `BndX::Quant`/`Lambda`/`Choose` binder construction. Net: the op-table, constant-rendering, Clip-coercion, and binder-construction rules each live in exactly one place; walker asymmetry is documented, not pretended away. Full analysis in DESIGN.md § "Two parallel expression renderers — and why we didn't fully unify them".
+
 ## Architecture
 
 ### Full pipeline
@@ -147,11 +149,23 @@ lean_verify/src/
                      because Verus elides `as nat` casts from usize (breaks
                      const generics if changed). sanitize() handles keywords
                      + %/@/# chars.
+  expr_shared.rs     Rules both expression renderers must apply identically:
+                     `binop_to_ast` (op table), `non_binop_head` (head for
+                     non-structural binops), `const_to_node_common` (non-float
+                     Constant arms), `clip_coercion_head` + `apply_clip_coercion`
+                     (Int/Nat wrapper resolution). Plus the existing
+                     `pub(crate)` helpers in `to_lean_sst_expr.rs`
+                     (`type_bound_predicate`, `integer_type_bound_node`,
+                     `renders_as_lean_int`) that predate the split. Module
+                     docstring lays out the analysis of trait unification
+                     and SST-routing, and why shared leaves is the chosen
+                     level of unification.
   to_lean_expr.rs    VIR-AST Expr → lean_ast::Expr. Includes field_access_name
                      (Dt::Tuple + numeric → n+1, Dt::Path + numeric → valN).
-                     HasType / IntegerTypeBound render via
-                     to_lean_sst_expr's shared helpers (pub(crate)); Clip uses
-                     the shared `renders_as_lean_int` predicate.
+                     Delegates to `expr_shared` for op tables and constant
+                     rendering; HasType / IntegerTypeBound render via
+                     `to_lean_sst_expr`'s shared helpers; Clip uses the
+                     shared `renders_as_lean_int` + `apply_clip_coercion`.
   to_lean_sst_expr.rs  SST Exp → lean_ast::Expr. Dual API:
                        `sst_exp_to_ast_checked(e) -> Result<LExpr, String>`
                        (primary; validates as it renders) and
@@ -295,7 +309,7 @@ See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the c
 - **`assume(P)` warnings** — DESIGN.md promises a "unproved assumption" warning; not wired.
 - **USize arith rarely auto-verifies** — the bound is emitted, but `tactus_auto` can't discharge symbolic `2 ^ arch_word_bits`. Users need `cases arch_word_bits_valid` proofs.
 - **Pattern matching in exec bodies** (`StmX` has no Match, but `ExpX::Ctor` / `ExpX::CallLambda` / `ExpX::ArrayLiteral` rejected — blocks match scrutinees containing these).
-- **Unified VIR / SST expression renderers** — still two parallel implementations (to_lean_expr.rs ~500 lines, to_lean_sst_expr.rs ~550 lines). Shared helpers cover the easy cases; unifying via a trait or routing everything through SST is future work.
+- **VIR / SST expression renderer unification** — shared leaves extracted into `expr_shared.rs` (op tables, constant rendering, `Clip` coercion, binder construction). The two walkers themselves stay separate because the source trees are genuinely different shapes; see DESIGN.md § "Two parallel expression renderers — and why we didn't fully unify them" for the full analysis of why approaches 1 (trait over source-expression type) and 2 (route callee specs through SST) were rejected.
 
 ### Adding new slices
 
@@ -395,6 +409,9 @@ tactus/
         dep_order.rs           ← walker + coverage instrumentation
         generate.rs            ← orchestration + debug_check
         to_lean_type.rs        ← TypX → Expr
+        expr_shared.rs         ← shared-leaf helpers (op tables, constants,
+                                 Clip coercion) — see module docstring for
+                                 the trait-unification / SST-routing analysis
         to_lean_expr.rs        ← VIR Expr → Expr
         to_lean_sst_expr.rs    ← SST Exp → Expr (_checked primary,
                                  infallible wrapper; shared helpers)
@@ -433,7 +450,7 @@ See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the c
 5. **Per-module Lean generation not implemented.** One `.lean` file per proof fn / exec fn. Fine at our scale; future work when we have many fns per module.
 6. **`//` not allowed in tactic blocks.** tree-sitter's `line_comment` extra consumes `//` globally. Reported as a clear error at verification time; use `Nat.div` / `Int.div`.
 7. **USize arith bounds are emitted but rarely auto-discharge.** `tactus_auto` can't handle symbolic `2 ^ arch_word_bits`. User proofs need `cases arch_word_bits_valid`. A future `tactus_usize_bound` tactic could automate this.
-8. **Parallel VIR / SST renderers.** ~1050 lines of largely-similar per-variant dispatch across `to_lean_expr.rs` (proof fns) and `to_lean_sst_expr.rs` (exec fns). Kept in sync via shared helpers (`type_bound_predicate`, `integer_type_bound_node`, `renders_as_lean_int`); full unification via a trait or an SST-only routing is the largest remaining cleanup.
+8. **Parallel VIR / SST renderers — shared leaves, not full unification.** `to_lean_expr.rs` (VIR-AST for proof fns + callee inlining) and `to_lean_sst_expr.rs` (SST for exec fn bodies) render structurally different trees. The common rules live in `expr_shared.rs`: op tables (`binop_to_ast`, `non_binop_head`), constant rendering (`const_to_node_common`), Clip coercion (`clip_coercion_head`), plus existing shared helpers (`type_bound_predicate`, `integer_type_bound_node`, `renders_as_lean_int`). The walkers themselves stay separate because the asymmetric variants (VIR-AST `Block`/`Match`/`Ctor`/`Place` vs SST `CheckDecreaseHeight`/`InternalFun`/flattened statements) would still need per-path dispatch even behind a unification trait. Full unification investigation recorded in DESIGN.md § "Two parallel expression renderers — and why we didn't fully unify them".
 9. **Return inside a loop body writes the fn's ensures.** Semantically correct (it's a fn-exit, enforced by the DSL's `Wp::Done` terminator shape). Pinned by `test_exec_return_inside_loop`.
 10. **`needs_peel` is a recursive tree walk.** Constant-cost today but will want to become a constructor-level bit if more variants need peeling.
 11. **`Wp::Branch` still clones `after` into both branches.** Exponential in nested if-depth. Fine for realistic code (documented in DESIGN.md § "Known codegen-complexity trade-offs"). Rc/arena would fix cleanly; neither is worth the lifetime-threading cost yet.
