@@ -118,14 +118,14 @@
 use std::collections::{HashMap, HashSet};
 
 use vir::sst::{
-    BndX, CallFun, Dest, Exp, ExpX, FuncCheckSst, FunctionSst, LoopInv, Par, Stm, StmX,
+    BndX, Dest, Exp, ExpX, FuncCheckSst, FunctionSst, LoopInv, Par, Stm, StmX,
 };
-use vir::ast::{BinaryOp, Fun, FunctionX, KrateX, Typ, UnaryOp, UnaryOpr, VarIdent};
+use vir::ast::{Fun, FunctionX, KrateX, Typ, UnaryOp, UnaryOpr, VarIdent};
 use crate::lean_ast::{
     and_all, substitute, Binder as LBinder, BinderKind, Expr as LExpr, Tactic, Theorem,
 };
 use crate::to_lean_expr::vir_expr_to_ast;
-use crate::to_lean_sst_expr::{sst_exp_to_ast, type_bound_predicate};
+use crate::to_lean_sst_expr::{sst_exp_to_ast, sst_exp_to_ast_checked, type_bound_predicate};
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
 
 /// Lookup table from callee `Fun` to its VIR-AST `FunctionX`. Used by
@@ -174,20 +174,6 @@ fn real_params(callee: &FunctionX) -> impl Iterator<Item = &vir::ast::Param> {
     callee.params.iter()
 }
 
-/// Does this type bottom out at `TypX::Int(_)` once transparent
-/// wrappers (`Boxed`, `Decorate`) are peeled? Mirrors
-/// `vir::recursion::height_is_int` — for those types the `height`
-/// encoding is identity and `CheckDecreaseHeight` lowers to a plain
-/// `0 ≤ cur ∧ cur < prev` check (see `to_lean_sst_expr.rs`).
-fn is_int_height(typ: &Typ) -> bool {
-    match &**typ {
-        vir::ast::TypX::Int(_) => true,
-        vir::ast::TypX::Boxed(inner) | vir::ast::TypX::Decorate(_, _, inner) => {
-            is_int_height(inner)
-        }
-        _ => false,
-    }
-}
 
 /// Does this expression — or any transparently-wrapped inner — use
 /// `ExpX::Loc`? `Loc` marks an L-value (`&mut` argument site). We peel
@@ -205,77 +191,14 @@ fn contains_loc(e: &Exp) -> bool {
     }
 }
 
+/// Validate an SST expression — `sst_exp_to_ast_checked` does both
+/// validation AND rendering in a single pass, so we just call it and
+/// discard the rendered result. Used by `walk` at the points where
+/// it encounters expressions that `build_goal` will later re-render
+/// via the infallible wrapper (at which point validation is known to
+/// have passed).
 fn check_exp(e: &Exp) -> Result<(), String> {
-    match &e.x {
-        ExpX::Const(_) | ExpX::Var(_) | ExpX::VarLoc(_) | ExpX::VarAt(..)
-        | ExpX::StaticVar(_) | ExpX::ExecFnByName(_) | ExpX::NullaryOpr(_) => Ok(()),
-        ExpX::Unary(op, inner) => match op {
-            UnaryOp::Not
-            | UnaryOp::Clip { .. }
-            | UnaryOp::CoerceMode { .. }
-            | UnaryOp::Trigger(_) => check_exp(inner),
-            other => Err(format!("unsupported unary op: {:?}", other)),
-        },
-        ExpX::UnaryOpr(_, inner) => check_exp(inner),
-        ExpX::Binary(op, l, r) => match op {
-            BinaryOp::HeightCompare { .. }
-            | BinaryOp::Index(_, _)
-            | BinaryOp::StrGetChar
-            | BinaryOp::IeeeFloat(_) => Err(format!("unsupported binary op: {:?}", op)),
-            _ => { check_exp(l)?; check_exp(r) }
-        },
-        ExpX::BinaryOpr(_, l, r) => { check_exp(l)?; check_exp(r) }
-        ExpX::If(c, t, e) => { check_exp(c)?; check_exp(t)?; check_exp(e) }
-        ExpX::Call(target, _, args) => {
-            use vir::sst::InternalFun;
-            match target {
-                // `CheckDecreaseHeight` is Verus's auto-injected
-                // termination obligation for recursive calls. We
-                // support int-typed decreases (the common case) and
-                // lower in `sst_exp_to_ast`. Non-int decreases would
-                // need a Lean `height` function encoding — deferred.
-                CallFun::InternalFun(InternalFun::CheckDecreaseHeight) => {
-                    if args.len() != 3 {
-                        return Err(format!(
-                            "CheckDecreaseHeight expects 3 args (cur, prev, otherwise), got {}",
-                            args.len()
-                        ));
-                    }
-                    if !is_int_height(&args[0].typ) {
-                        return Err(format!(
-                            "recursive call termination check with non-int decrease \
-                             (type {:?}) not yet supported — only int decreases work today",
-                            args[0].typ
-                        ));
-                    }
-                    args.iter().try_for_each(check_exp)
-                }
-                CallFun::InternalFun(_) => Err(
-                    "internal function calls not yet supported".to_string()
-                ),
-                CallFun::Fun(_, _) | CallFun::Recursive(_) => {
-                    args.iter().try_for_each(check_exp)
-                }
-            }
-        }
-        ExpX::Bind(bnd, body) => {
-            match &bnd.x {
-                BndX::Let(binders) => binders.iter().try_for_each(|b| check_exp(&b.a))?,
-                BndX::Quant(..) | BndX::Lambda(..) => {}
-                BndX::Choose(_, _, cond) => check_exp(cond)?,
-            }
-            check_exp(body)
-        }
-        ExpX::WithTriggers(_, inner) | ExpX::Loc(inner) => check_exp(inner),
-        ExpX::Ctor(..) => Err("datatype constructors not yet supported in exec fns".to_string()),
-        ExpX::CallLambda(..) => Err("closure calls not yet supported in exec fns".to_string()),
-        ExpX::ArrayLiteral(_) => Err("array literals not yet supported in exec fns".to_string()),
-        ExpX::Old(..) => Err("`old(...)` not yet supported in exec fns".to_string()),
-        ExpX::Interp(_) => Err(
-            "Interp nodes should never escape the interpreter (internal bug)".to_string()
-        ),
-        ExpX::FuelConst(_) => Err("FuelConst not yet supported".to_string()),
-    }
+    sst_exp_to_ast_checked(e).map(|_| ())
 }
 
 // ── Theorem builder ────────────────────────────────────────────────────
