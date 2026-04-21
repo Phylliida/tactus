@@ -937,15 +937,22 @@ The earlier `BodyItem` hand-rolled enum + `build_goal_with_terminator(items, res
 
 ```rust
 enum Wp<'a> {
-    Done(LExpr),                                           // terminator
-    Let(&'a str, &'a Exp, Box<Wp<'a>>),                   // continuation wrappers
+    Done(LExpr),                                              // terminator
+    Let(&'a str, &'a Exp, Box<Wp<'a>>),                      // continuation wrappers
     Assert(&'a Exp, Box<Wp<'a>>),
     Assume(&'a Exp, Box<Wp<'a>>),
-    Branch { cond, then_branch: Box<Wp>, else_branch: Box<Wp> },
-    Loop { cond, invs, decrease, modified_vars, body: Box<Wp>, after: Box<Wp> },
-    Call { callee, args, dest, after: Box<Wp> },
+    Branch { cond: &'a Exp, then_branch: Box<Wp<'a>>, else_branch: Box<Wp<'a>> },
+    Loop { cond, invs, decrease, modified_vars, body: Box<Wp<'a>>, after: Box<Wp<'a>> },
+    Call { callee, args: &'a [Exp], dest: Option<&'a VarIdent>, after: Box<Wp<'a>> },
 }
 ```
+
+`args: &'a [Exp]` borrows directly from the SST's
+`Arc<Vec<Exp>>` — no intermediate `Vec<&Exp>`. `dest` is just the
+var name (the destination's type was dead weight, dropped). The
+rest of the `Box` uses are forced by Rust's self-referential-enum
+rules; see "Known codegen-complexity trade-offs" for the Rc/arena
+trade-off discussion.
 
 Each compound node carries its own continuation by construction —
 no separate "rest" parameter, no separate "terminator" parameter.
@@ -977,6 +984,63 @@ central dispatcher; the DSL shape makes composition obvious.
 Residual smell worth noting: `needs_peel` is still a recursive tree
 walk. Constant-cost today but will want to become a constructor-
 level bit if more variants need peeling.
+
+### Upstream-robustness patterns
+
+Tactus is a fork; every Verus rebase is a potential source of
+silent breakage. A systematic "what breaks if Verus changes X?"
+audit surfaced three complementary defences, which we apply uniformly:
+
+**Explicit field destructures.** We never use `..` in `StmX::_`
+patterns — every field is listed with `_` for ones we intentionally
+ignore. A Verus-side field addition causes a compile error that
+forces audit. This currently applies to `StmX::Call` (all 9 fields),
+`StmX::Assign` / `Dest` (both fields), `StmX::Return` (all 4 fields),
+and `StmX::Loop` (all 11 fields). The extra lines pay for themselves
+the first time Verus adds a field.
+
+**Shared helpers for implicit shape assumptions.** Logic that depends
+on a specific SST/VIR shape lives in one named helper, not
+duplicated across consumers:
+
+* `peel_transparent(&Exp) -> &Exp` — the Box/Unbox/CoerceMode/
+  Trigger wrapper set. Used by `contains_loc`, `lift_if_value`, and
+  `render_checked_decrease_arg`. Adding a new transparent wrapper =
+  one edit to this helper + compile errors if we missed a site.
+* `renders_as_lean_int(&IntRange) -> bool` — the Int-vs-Nat rendering
+  decision. Shared between the VIR-AST renderer (proof fns) and
+  SST renderer (exec fns) so Clip coercions stay consistent.
+* `type_bound_predicate` / `integer_type_bound_node` — shared bound
+  rendering.
+* `is_int_height` — the int-typed-decrease check for
+  `CheckDecreaseHeight`.
+
+**Shape-drift detection tests.** For implicit shape invariants we
+depend on but can't enforce with types, a test constructs the
+expected shape and asserts the lowering. If Verus's shape drifts,
+the test's assertion message points at the exact fix site.
+
+Canonical example: `full_check_decrease_height_shape_pinned` in
+`sst_to_lean::tests`. It constructs a synthetic
+`CheckDecreaseHeight(Box(Let([(n, tmp)], n)), Box(n_old), False)` —
+the shape Verus's `recursion::check_decrease_call` produces — and
+asserts that lowering yields the substituted form (`tmp < n_old`)
+rather than the shadowing `let n := tmp; n < n_old`. If Verus
+changes how `CheckDecreaseHeight` encodes its param-substitution,
+this test fails with a message that says:
+
+> Verus's CheckDecreaseHeight `cur` shape has drifted; update
+> `render_checked_decrease_arg` in to_lean_sst_expr.rs.
+
+— turning a future mystery (why do my recursive fns suddenly fail
+verification?) into a focused test failure with a named fix site.
+
+The triangle these form:
+* Explicit destructures catch *field additions* at compile time.
+* Shared helpers catch *divergence across consumers* at edit time.
+* Shape-drift tests catch *semantic shifts* at test time.
+
+Each closes a different hole.
 
 ### Scope and difficulty
 

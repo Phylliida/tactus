@@ -16,7 +16,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 This handoff is refreshed at the end of a deep review+refactor cycle. Highlights:
 
-**Soundness hardening (review round 1, `f750a1a`, `9356631`).** Linus-hat review of the slice 7 StmX::Call implementation surfaced a real soundness blocker: `debug_assert_eq!` on param/arg count mismatch compiled to nothing in release, so a silent zip-to-shorter could bind wrong variables. Fixed by moving the check into `walk_call` (Result-returning) and making the defensive assert in the builder unconditional. Other fixes in the same pass:
+**Soundness hardening (review round 1, `f750a1a`, `9356631`).** Linus-hat review of the slice 7 StmX::Call implementation surfaced a real soundness blocker: `debug_assert_eq!` on param/arg count mismatch compiled to nothing in release, so a silent zip-to-shorter could bind wrong variables. Fixed by moving the check into the validator (now `build_wp_call`, then called `walk_call`) — Result-returning, not assert — and making the defensive assert in the builder unconditional. Other fixes in the same pass:
 - `contains_loc` now peels transparent wrappers (Box/Unbox/CoerceMode/Trigger) so `&mut` args can't slip past buried under decoration.
 - `is_trait_default` is rejected alongside `resolved_method` (dispatch shape that was previously un-guarded).
 - `StmX::Call` fields destructured explicitly — future Verus additions force a compile-error audit.
@@ -40,9 +40,20 @@ This handoff is refreshed at the end of a deep review+refactor cycle. Highlights
 - **`Return` is cleanly fn-exit.** Previously Return wrote to whatever terminator was being threaded through (loop's `I ∧ D < d_old` inside a loop body; fn's ensures at top). Now it always writes `ctx.ensures_goal`. The DSL shape gets this right by construction.
 - **`needs_peel` is one-line per variant.** Based on the node's own shape, not a post-hoc traversal looking for Loop/Call.
 
-Net -59 lines including fuller docstrings. 160 e2e + 53 unit + vstd 1530/0 all green on first compile — the types were right.
+Net -59 lines (including fuller docstrings) and green on first compile — the types were right.
 
-**Review-found cleanups (`3ce09c3`, `92ac1a5`, `c635b51`).** Lazy capture check (precise per-scope rather than eager global), dead code deletion, Ok-turbofish cleanup, simplified_krate getter forcing Option handling, and added coverage tests: direct `substitute` unit tests (18), `test_exec_ctor_rejected` for the Ctor Err arm, `test_exec_call_mutual_recursion` for the SCC termination path.
+**Post-DSL review cleanups (`3ce09c3`, `92ac1a5`, `c635b51`, `daf1c95`).** Lazy-per-scope capture check in `substitute`, dead code deletion, Ok-turbofish cleanup, simplified_krate getter forcing Option handling. Refreshed docstrings (module-level + stale refs), dropped `Wp::Call::dest`'s dead Typ field, made `WpCtx::new` return `Result` so the "validate-first" precondition lives in the type signature. Added tests: 18 direct `substitute` unit tests, `test_exec_ctor_rejected` for the Ctor Err arm, `test_exec_call_mutual_recursion` for the SCC termination path, 25 direct `Wp` / `lower_wp` / `needs_peel` / `contains_loc` / `lift_if_value` unit tests, and `test_exec_return_inside_loop` pinning the Wp DSL's fn-exit semantics.
+
+**Audit-driven coverage (`3e03e97`).** Walked recent code paths looking for things that compile but no test executes. Added 14 tests covering: multi-binder shadowing + capture (3), `substitute` missing ExprNode variants (UnOp, StructUpdate, ArrayLit, Anon, Index, Raw — 6 tests), `contains_loc` through `CoerceMode`/`Trigger`/stacked wrappers (3), `lift_if_value` through the `Bind(Let)` branch (2). These exercise real paths that e2e tests covered only indirectly.
+
+**`Wp::Call::args` Vec→slice (`c02ee03`).** Dropped the unnecessary `Vec<&'a Exp>` allocation at every call site; now borrows `&'a [Exp]` directly from the SST's `Arc<Vec<Exp>>`. The one collapsible Box/Arc case found in an audit pass — the rest of the Box uses are load-bearing self-referential enums.
+
+**Upstream-brittleness review (`2a2428c`).** Systematic audit of "what breaks if Verus changes X?" — our fork assumptions made explicit and caught at compile/test time:
+
+- **Explicit field destructures** replace `..` in `StmX::Assign`, `StmX::Return`, `StmX::Loop` (6 previously-hidden Loop fields). Any Verus-side field addition now forces a compile-time audit.
+- **Shared `peel_transparent(e: &Exp) -> &Exp`** centralises the Box/Unbox/CoerceMode/Trigger peel previously duplicated across `contains_loc`, `lift_if_value`, `render_checked_decrease_arg`. Adding a new transparent wrapper is one edit, not three parallel ones.
+- **`full_check_decrease_height_shape_pinned` test** constructs a synthetic `CheckDecreaseHeight(Box(Let([(n, tmp)], n)), Box(n_old), False)` and asserts the substituted-form lowering. If Verus's encoding drifts, the assertion message points at `render_checked_decrease_arg` — turning a future recursive-fn verification mystery into a focused test failure with a named fix site.
+- 12 total new tests (8 `peel_transparent` wrapper matrix + 4 shape-drift), including specific "Loc NOT peeled" and "If NOT peeled" checks.
 
 ## Architecture
 
@@ -117,7 +128,9 @@ lean_verify/src/
                      longer write Box::new(LExpr::new(ExprNode::…)) chains.
                      Also exports `substitute(expr, subst)` — capture-avoiding
                      Lean-AST substitution used at call sites to inline
-                     callee specs without let-shadowing. 18 unit tests.
+                     callee specs without let-shadowing. 27 unit tests
+                     (per-variant coverage, capture avoidance both
+                     positive and negative cases).
   lean_pp.rs         Precedence-aware pretty-printer. 28 unit tests covering
                      associativity, parenthesization, tuple/product rendering,
                      tactic-start tracking. Returns PpOutput { text, tactic_starts }.
@@ -157,13 +170,23 @@ lean_verify/src/
                      shared type_bound_predicate.
   sst_to_lean.rs     SST exec-fn body → Vec<Theorem> via WP. Core module for
                      Track B. Key types:
-                       - `WpCtx<'a>`: fn_map + type_map + ret_name + ensures_goal
+                       - `WpCtx<'a>`: fn_map + type_map + ret_name +
+                         ensures_goal. `WpCtx::new` validates reqs/
+                         ens_exps and returns Result — precondition
+                         enforced in the type.
                        - `Wp<'a>`: Done / Let / Assert / Assume / Branch /
-                         Loop / Call — WP algebra; see "WP emission" above
+                         Loop / Call — WP algebra; see "WP emission" above.
+                         `Wp::Call::args` borrows `&'a [Exp]` from the
+                         SST directly (no Vec allocation).
                      Key fns: `exec_fn_theorems_to_ast`, `build_wp`,
                      `build_wp_call`, `build_wp_loop`, `lower_wp`,
                      `lower_loop`, `lower_call`. `check_exp` is a thin
                      validation wrapper around `sst_exp_to_ast_checked`.
+                     `peel_transparent(&Exp) -> &Exp` is the shared
+                     Box/Unbox/CoerceMode/Trigger peeler used by
+                     `contains_loc`, `lift_if_value`, and
+                     `render_checked_decrease_arg` — adding a new
+                     transparent wrapper = one edit, not three.
   generate.rs        Orchestration: builds Vec<Command>, runs sanity, pp's,
                      writes file, invokes Lean, formats errors. Error output
                      includes the generated .lean path.
@@ -202,6 +225,10 @@ lean_verify/src/
 13. **Pre vs post-simplify krate split.** Proof fns route through `self.vir_crate` (pre-simplify — user-visible spec forms). Exec fns route through `self.simplified_krate()` (post-simplify — aligns with SST call-site arg layout for zero-arg fns).
 14. **Exhaustive matches, no catch-all `_ =>`.** New VIR variants force compile errors at every walker / writer site. Backed by coverage test to make sure the walker is exercised.
 15. **Termination via Verus's own `CheckDecreaseHeight`.** Recursive calls (including mutual across an SCC) are protected by a `StmX::Assert(InternalFun::CheckDecreaseHeight)` that Verus inserts upstream. `sst_exp_to_ast_checked` lowers it to the int-typed obligation; we get termination for free.
+16. **Upstream-robustness patterns** (post-audit pass). Three layers of defence against Verus-side refactors surprising us:
+    - *Explicit field destructures* — no `..` in `StmX::Assign` / `Return` / `Loop` / `Call` patterns. Any Verus-side field addition is a compile error.
+    - *Shared helpers for implicit shapes* — `peel_transparent` centralises the Box/Unbox/CoerceMode/Trigger wrapper set; `renders_as_lean_int` centralises the Int-vs-Nat rendering decision. Adding a new variant = one edit across all consumers.
+    - *Shape-drift tests* — e.g., `full_check_decrease_height_shape_pinned` constructs a synthetic CheckDecreaseHeight and asserts the expected lowering. Failure message points at the exact fix site, turning a future mystery breakage into a focused test fail.
 
 ## Track B status
 
@@ -362,7 +389,7 @@ tactus/
       scripts/setup-mathlib.sh
       src/
         lean_ast.rs            ← typed Lean AST + smart constructors +
-                                 substitute (+18 unit tests)
+                                 substitute (+27 unit tests)
         lean_pp.rs             ← precedence-aware pp + tactic-start tracking
         sanity.rs              ← post-codegen reference check
         dep_order.rs           ← walker + coverage instrumentation
@@ -407,8 +434,9 @@ See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the c
 6. **`//` not allowed in tactic blocks.** tree-sitter's `line_comment` extra consumes `//` globally. Reported as a clear error at verification time; use `Nat.div` / `Int.div`.
 7. **USize arith bounds are emitted but rarely auto-discharge.** `tactus_auto` can't handle symbolic `2 ^ arch_word_bits`. User proofs need `cases arch_word_bits_valid`. A future `tactus_usize_bound` tactic could automate this.
 8. **Parallel VIR / SST renderers.** ~1050 lines of largely-similar per-variant dispatch across `to_lean_expr.rs` (proof fns) and `to_lean_sst_expr.rs` (exec fns). Kept in sync via shared helpers (`type_bound_predicate`, `integer_type_bound_node`, `renders_as_lean_int`); full unification via a trait or an SST-only routing is the largest remaining cleanup.
-9. **Return inside a loop body writes the fn's ensures.** Semantically correct (it's a fn-exit), but the body's `_tactus_d_old` check is skipped on that branch. No test exercises this; if a user tries it and surprises themselves, that's the story.
+9. **Return inside a loop body writes the fn's ensures.** Semantically correct (it's a fn-exit, enforced by the DSL's `Wp::Done` terminator shape). Pinned by `test_exec_return_inside_loop`.
 10. **`needs_peel` is a recursive tree walk.** Constant-cost today but will want to become a constructor-level bit if more variants need peeling.
+11. **`Wp::Branch` still clones `after` into both branches.** Exponential in nested if-depth. Fine for realistic code (documented in DESIGN.md § "Known codegen-complexity trade-offs"). Rc/arena would fix cleanly; neither is worth the lifetime-threading cost yet.
 
 ## Running tests
 
