@@ -58,15 +58,16 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
 
         ExprX::Unary(UnaryOp::Not, inner) => LExpr::not(vir_expr_to_ast(inner)).node,
         ExprX::Unary(UnaryOp::Clip { range, .. }, inner) => {
-            // Keep in sync with `to_lean_sst_expr::clip_to_node`: the
-            // set of ranges that render as Lean `Int` vs `Nat` has to
-            // agree between the two paths.
-            let renders_int = |r: &IntRange| matches!(
-                r,
-                IntRange::Int | IntRange::I(_) | IntRange::ISize | IntRange::U(_)
-            );
-            let src_int = matches!(&*inner.typ, TypX::Int(r) if renders_int(r));
-            let dst_int = renders_int(range);
+            // Shared `renders_as_lean_int` with the SST path — the set
+            // of ranges that render as Lean `Int` vs `Nat` must agree
+            // across both renderers. Exec-fn callees inline their
+            // `require`/`ensure` via THIS path while their own
+            // theorems render via the SST path, so divergence here
+            // would produce a different inlined spec than the callee
+            // proved. Extract-once keeps the two in lockstep.
+            use crate::to_lean_sst_expr::renders_as_lean_int;
+            let src_int = matches!(&*inner.typ, TypX::Int(r) if renders_as_lean_int(r));
+            let dst_int = renders_as_lean_int(range);
             match (src_int, dst_int) {
                 (true, false) => apply("Int.toNat", vec![vir_expr_to_ast(inner)]),
                 (false, true) => apply("Int.ofNat", vec![vir_expr_to_ast(inner)]),
