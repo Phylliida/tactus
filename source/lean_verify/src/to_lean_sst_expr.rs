@@ -209,7 +209,14 @@ pub fn type_bound_predicate(e: &LExpr, ty: &Typ) -> Option<LExpr> {
 /// subtraction is mathematical rather than truncating). The complement
 /// — `Nat`, `USize`, `Char` — renders as `Nat`. Keep in sync with
 /// `to_lean_type::typ_to_expr`.
-fn renders_as_lean_int(range: &IntRange) -> bool {
+///
+/// Shared between the SST path (`clip_to_node` below) and the VIR-AST
+/// path (`to_lean_expr.rs`) so Clip coercions stay consistent across
+/// both renderers — relevant because exec-fn callees inline their
+/// `require`/`ensure` via the VIR path while their own theorems render
+/// via the SST path. Divergence would produce a different inlined
+/// spec than the callee actually proved (silent soundness hole).
+pub(crate) fn renders_as_lean_int(range: &IntRange) -> bool {
     matches!(
         range,
         IntRange::Int | IntRange::I(_) | IntRange::ISize | IntRange::U(_)
