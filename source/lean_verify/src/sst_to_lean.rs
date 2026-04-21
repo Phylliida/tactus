@@ -1096,6 +1096,57 @@ mod tests {
         })
     }
 
+    /// Wrap in `Unary::CoerceMode { .. }` — mode-coercion marker
+    /// (spec/proof/exec boundary); transparent to rendering.
+    fn coerce_mode_exp(inner: Exp) -> Exp {
+        let typ = inner.typ.clone();
+        Arc::new(SpannedTyped {
+            span: test_span(),
+            typ,
+            x: ExpX::Unary(
+                UnaryOp::CoerceMode {
+                    op_mode: vir::ast::Mode::Spec,
+                    from_mode: vir::ast::Mode::Spec,
+                    to_mode: vir::ast::Mode::Spec,
+                    kind: vir::ast::ModeCoercion::Constructor,
+                },
+                inner,
+            ),
+        })
+    }
+
+    /// Wrap in `Unary::Trigger(_)` — a trigger-pattern marker;
+    /// transparent to rendering.
+    fn trigger_exp(inner: Exp) -> Exp {
+        let typ = inner.typ.clone();
+        Arc::new(SpannedTyped {
+            span: test_span(),
+            typ,
+            x: ExpX::Unary(UnaryOp::Trigger(vir::ast::TriggerAnnotation::Trigger(None)), inner),
+        })
+    }
+
+    /// Construct a single-binder SST `Bind(Let)`:
+    /// `let name := value; body`.
+    fn let_exp(name: &str, value: Exp, body: Exp) -> Exp {
+        use vir::ast::VarBinderX;
+        use vir::def::Spanned;
+        let body_typ = body.typ.clone();
+        let binders: Vec<Arc<VarBinderX<Exp>>> = vec![Arc::new(VarBinderX {
+            name: var_ident(name),
+            a: value,
+        })];
+        let bnd = Spanned::new(
+            test_span(),
+            BndX::Let(Arc::new(binders)),
+        );
+        Arc::new(SpannedTyped {
+            span: test_span(),
+            typ: body_typ,
+            x: ExpX::Bind(bnd, body),
+        })
+    }
+
     /// Minimal `WpCtx` for tests that need one but don't exercise
     /// fn_map / type_map. `ensures_goal` is a simple `True` leaf.
     fn mk_empty_ctx<'a>() -> WpCtx<'a> {
@@ -1346,6 +1397,28 @@ mod tests {
         assert!(!contains_loc(&box_exp(x)));
     }
 
+    #[test]
+    fn contains_loc_through_coerce_mode() {
+        // CoerceMode(Loc(x))  — peels the CoerceMode marker.
+        let x = var_exp("x", typ_int());
+        assert!(contains_loc(&coerce_mode_exp(loc_exp(x))));
+    }
+
+    #[test]
+    fn contains_loc_through_trigger() {
+        // Trigger(Loc(x))  — peels the Trigger marker.
+        let x = var_exp("x", typ_int());
+        assert!(contains_loc(&trigger_exp(loc_exp(x))));
+    }
+
+    #[test]
+    fn contains_loc_through_mixed_wrappers() {
+        // Box(CoerceMode(Trigger(Unbox(Loc(x)))))  — all peelable.
+        let x = var_exp("x", typ_int());
+        let wrapped = box_exp(coerce_mode_exp(trigger_exp(unbox_exp(loc_exp(x)))));
+        assert!(contains_loc(&wrapped));
+    }
+
     // ── lift_if_value ───────────────────────────────────────────
 
     #[test]
@@ -1418,6 +1491,65 @@ mod tests {
                 LExpr::let_bind("y", LExpr::var("b"), LExpr::var("body")),
             ),
         );
+        assert!(pp_eq(&out, &expected));
+    }
+
+    #[test]
+    fn lift_if_value_peels_bind_let_with_if_rhs() {
+        // Verus shape: `let y = (if c then a else b); y`
+        // represented as `Bind(Let([(y, If(c,a,b))]), Var(y))`.
+        // lift_if_value peels the single-binder Let, lifts the If,
+        // and re-threads the outer `let y := ...; body` around each
+        // branch.
+        //
+        //   Input shape:  Bind(Let([(y, If(c, a, b))]), Var(y))
+        //   Expected:     (c → let y := a; y) ∧ (¬c → let y := b; y)
+        //                  ^^^^^^^^^^^^^^^^^^     ^^^^^^^^^^^^^^^^^^
+        //                  emit_leaf wraps these, but the body `Var(y)`
+        //                  is the "inner body" captured at peel time.
+        let c = var_exp("c", typ_bool());
+        let a = var_exp("a", typ_int());
+        let b = var_exp("b", typ_int());
+        let y_ref = var_exp("y", typ_int());
+        let e = let_exp("y", if_exp(c, a, b), y_ref);
+
+        let out = lift_if_value(&e, &|leaf| LExpr::let_bind("out", leaf, LExpr::var("done")));
+        // lift_if_value peels the Bind(Let), lifts the If inside the
+        // value position, and re-threads `let y := rhs_leaf; y` into
+        // each branch. Then emit_leaf wraps the whole let-y-y chunk.
+        let expected = LExpr::and(
+            LExpr::implies(
+                LExpr::var("c"),
+                LExpr::let_bind("out",
+                    LExpr::let_bind("y", LExpr::var("a"), LExpr::var("y")),
+                    LExpr::var("done")),
+            ),
+            LExpr::implies(
+                LExpr::not(LExpr::var("c")),
+                LExpr::let_bind("out",
+                    LExpr::let_bind("y", LExpr::var("b"), LExpr::var("y")),
+                    LExpr::var("done")),
+            ),
+        );
+        assert!(pp_eq(&out, &expected),
+            "got: {}\nexpected: {}",
+            crate::lean_pp::pp_expr(&out),
+            crate::lean_pp::pp_expr(&expected));
+    }
+
+    #[test]
+    fn lift_if_value_bind_let_without_if_passes_through() {
+        // `let y := x; y` where x is a plain var — no If to lift.
+        // lift_if_value should recurse into `b.a` (which is Var(x)),
+        // call emit_leaf with the x rendering, then re-wrap with
+        // `let y := x; body`.
+        let x = var_exp("x", typ_int());
+        let y_ref = var_exp("y", typ_int());
+        let e = let_exp("y", x, y_ref);
+        let out = lift_if_value(&e, &|leaf| LExpr::let_bind("out", leaf, LExpr::var("done")));
+        let expected = LExpr::let_bind("out",
+            LExpr::let_bind("y", LExpr::var("x"), LExpr::var("y")),
+            LExpr::var("done"));
         assert!(pp_eq(&out, &expected));
     }
 
