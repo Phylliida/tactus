@@ -4,9 +4,22 @@
 //! VIR-AST's `Expr` / `ExprX`. SST is a cleaned-up AST used as the input
 //! to WP generation for exec fns (`sst_to_lean`).
 //!
-//! `supported_body` in `sst_to_lean.rs` rejects expression forms that
-//! would end up as `Raw` or panic here — so any form reaching this module
-//! is one we've committed to rendering.
+//! ## Fallible vs infallible entry points
+//!
+//! Validation and rendering share a single case analysis:
+//!
+//!   * [`sst_exp_to_ast_checked`] is the primary recursive impl — it
+//!     validates every SST shape as it renders, returning `Err(…)` for
+//!     forms we don't support. Use this at the boundary where unchecked
+//!     SST enters the pipeline (walk, req/ens validation).
+//!   * [`sst_exp_to_ast`] is a thin infallible wrapper that panics on
+//!     `Err`. Use this in build_* paths where `walk` has already
+//!     validated the stored `Exp` refs — the panic is documented as
+//!     "codegen bug: caller should have validated."
+//!
+//! This replaces an earlier split where `check_exp` (in `sst_to_lean`)
+//! and `sst_exp_to_ast` each had parallel case analyses that had to
+//! stay in sync by hand.
 
 use vir::ast::*;
 use vir::sst::{BndX, CallFun, Exp, ExpX, InternalFun};
@@ -16,9 +29,24 @@ use crate::lean_ast::{
 use crate::lean_pp::pp_expr;
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
 
-/// Build a `lean_ast::Expr` from an SST expression.
+/// Build a `lean_ast::Expr` from an SST expression, validating as we
+/// go. Returns `Err(reason)` for any SST form we don't know how to
+/// emit. This is the primary entry point — use it anywhere unchecked
+/// SST enters (walk, req/ens validation).
+pub fn sst_exp_to_ast_checked(e: &Exp) -> Result<LExpr, String> {
+    exp_to_node_checked(e).map(LExpr::new)
+}
+
+/// Infallible wrapper around [`sst_exp_to_ast_checked`] — panics on
+/// `Err` with a documented "caller should have validated" message.
+/// Use in contexts where `walk` or an upstream `sst_exp_to_ast_checked`
+/// call has already cleared validation.
 pub fn sst_exp_to_ast(e: &Exp) -> LExpr {
-    LExpr::new(exp_to_node(e))
+    sst_exp_to_ast_checked(e).unwrap_or_else(|reason| panic!(
+        "sst_exp_to_ast: {} — caller should have validated via \
+         `sst_exp_to_ast_checked` or `walk` before reaching a build_* path",
+        reason
+    ))
 }
 
 /// Back-compat: write an SST expression as Lean text into `out`. Kept
@@ -239,22 +267,22 @@ pub(crate) fn renders_as_lean_int(range: &IntRange) -> bool {
 /// rendered as `x - y` on `Nat`, which truncates negatives to zero. The
 /// `Int.ofNat` insertion forces subtraction to happen over `Int` so the
 /// lower-bound refinement check (if present) can actually fire.
-fn clip_to_node(src: &Typ, dst: &IntRange, inner: &Exp) -> ExprNode {
+fn clip_to_node_checked(src: &Typ, dst: &IntRange, inner: &Exp) -> Result<ExprNode, String> {
     let src_range = match &**src {
         TypX::Int(r) => r,
         // Boxed int? Peel the box; otherwise the inner isn't an int type
         // at all (shouldn't happen for Clip) and we pass through.
         TypX::Boxed(t) => if let TypX::Int(r) = &**t { r } else {
-            return exp_to_node(inner);
+            return exp_to_node_checked(inner);
         },
-        _ => return exp_to_node(inner),
+        _ => return exp_to_node_checked(inner),
     };
-    let rendered = sst_exp_to_ast(inner);
-    match (renders_as_lean_int(src_range), renders_as_lean_int(dst)) {
+    let rendered = sst_exp_to_ast_checked(inner)?;
+    Ok(match (renders_as_lean_int(src_range), renders_as_lean_int(dst)) {
         (true, false) => LExpr::app1(LExpr::var("Int.toNat"), rendered).node,
         (false, true) => LExpr::app1(LExpr::var("Int.ofNat"), rendered).node,
         _ => rendered.node,
-    }
+    })
 }
 
 /// Render a `CheckDecreaseHeight` arg with Verus's param-substitution
@@ -268,13 +296,13 @@ fn clip_to_node(src: &Typ, dst: &IntRange, inner: &Exp) -> ExprNode {
 ///
 /// Only descends through top-level `Bind(Let)` wrappers; other shapes
 /// render as-is via `sst_exp_to_ast`.
-fn render_checked_decrease_arg(e: &Exp) -> LExpr {
+fn render_checked_decrease_arg(e: &Exp) -> Result<LExpr, String> {
     match &e.x {
         // Peel transparent SST wrappers — poly Box/Unbox (inserted
         // by Verus's Poly encoding for heterogeneous int types),
         // mode coercions, and trigger markers all render identically
-        // to their inner expression via `exp_to_node` below. Peeling
-        // here lets us reach a Bind(Let) that sits underneath.
+        // to their inner expression. Peeling here lets us reach a
+        // Bind(Let) that sits underneath.
         ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner)
         | ExpX::Unary(UnaryOp::CoerceMode { .. } | UnaryOp::Trigger(_), inner) => {
             render_checked_decrease_arg(inner)
@@ -286,21 +314,21 @@ fn render_checked_decrease_arg(e: &Exp) -> LExpr {
                 for b in binders.iter() {
                     subst.insert(
                         crate::to_lean_type::sanitize(&b.name.0),
-                        sst_exp_to_ast(&b.a),
+                        sst_exp_to_ast_checked(&b.a)?,
                     );
                 }
-                let body_rendered = render_checked_decrease_arg(body);
-                substitute(&body_rendered, &subst)
+                let body_rendered = render_checked_decrease_arg(body)?;
+                Ok(substitute(&body_rendered, &subst))
             }
-            _ => sst_exp_to_ast(e),
+            _ => sst_exp_to_ast_checked(e),
         },
-        _ => sst_exp_to_ast(e),
+        _ => sst_exp_to_ast_checked(e),
     }
 }
 
-fn exp_to_node(e: &Exp) -> ExprNode {
-    match &e.x {
-        ExpX::Const(c) => const_to_node(c),
+fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
+    Ok(match &e.x {
+        ExpX::Const(c) => const_to_node_checked(c)?,
         ExpX::Var(ident) | ExpX::VarLoc(ident) | ExpX::VarAt(ident, _) => {
             ExprNode::Var(sanitize(&ident.0))
         }
@@ -308,28 +336,29 @@ fn exp_to_node(e: &Exp) -> ExprNode {
             ExprNode::Var(lean_name(&fun.path))
         }
 
-        ExpX::Unary(UnaryOp::Not, inner) => LExpr::not(sst_exp_to_ast(inner)).node,
+        ExpX::Unary(UnaryOp::Not, inner) => LExpr::not(sst_exp_to_ast_checked(inner)?).node,
         ExpX::Unary(UnaryOp::Clip { range, .. }, inner) => {
-            clip_to_node(&inner.typ, range, inner)
+            clip_to_node_checked(&inner.typ, range, inner)?
         }
         ExpX::Unary(UnaryOp::CoerceMode { .. }, inner)
-        | ExpX::Unary(UnaryOp::Trigger(_), inner) => exp_to_node(inner),
-        ExpX::Unary(op, _) => panic!(
-            "to_lean_sst_expr: unary op {:?} should have been rejected by supported_body",
-            op
-        ),
+        | ExpX::Unary(UnaryOp::Trigger(_), inner) => exp_to_node_checked(inner)?,
+        ExpX::Unary(op, _) => {
+            return Err(format!("unsupported unary op: {:?}", op));
+        }
 
         // Box/Unbox: transparent. Field projection.
-        ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => exp_to_node(inner),
+        ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => {
+            exp_to_node_checked(inner)?
+        }
         ExpX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
-            LExpr::field_proj(sst_exp_to_ast(inner), sanitize(&field_opr.field)).node
+            LExpr::field_proj(sst_exp_to_ast_checked(inner)?, sanitize(&field_opr.field)).node
         }
         // `HasType(e, t)` — the refinement constraint for `e` to inhabit
         // `t`. For fixed-width ints (u8, i32, …) this is the bounds check
         // Verus emits at every arithmetic site. For unbounded types (Nat,
         // Int, structs) it's vacuous; we emit `True` and let Lean simplify.
         ExpX::UnaryOpr(UnaryOpr::HasType(t), inner) => {
-            let e_ast = sst_exp_to_ast(inner);
+            let e_ast = sst_exp_to_ast_checked(inner)?;
             match type_bound_predicate(&e_ast, t) {
                 Some(pred) => pred.node,
                 None => ExprNode::LitBool(true),
@@ -341,37 +370,44 @@ fn exp_to_node(e: &Exp) -> ExprNode {
         // emit the decimal literal directly.
         ExpX::UnaryOpr(UnaryOpr::IntegerTypeBound(kind, _), inner) => {
             if matches!(kind, IntegerTypeBoundKind::ArchWordBits) {
-                return integer_type_bound_node(kind, 0);
+                return Ok(integer_type_bound_node(kind, 0));
             }
-            let bits = const_u32_from_sst(inner).unwrap_or_else(|| panic!(
+            let bits = const_u32_from_sst(inner).ok_or_else(|| format!(
                 "IntegerTypeBound({:?}): non-constant bit width is not supported \
                  (SST inner = {:?})",
                 kind, inner.x,
-            ));
+            ))?;
             integer_type_bound_node(kind, bits)
         }
-        ExpX::UnaryOpr(_, inner) => exp_to_node(inner),
+        ExpX::UnaryOpr(_, inner) => exp_to_node_checked(inner)?,
 
         ExpX::Binary(op, lhs, rhs) => {
-            let (l, r) = (sst_exp_to_ast(lhs), sst_exp_to_ast(rhs));
+            match op {
+                BinaryOp::HeightCompare { .. }
+                | BinaryOp::Index(_, _)
+                | BinaryOp::StrGetChar
+                | BinaryOp::IeeeFloat(_) => {
+                    return Err(format!("unsupported binary op: {:?}", op));
+                }
+                _ => {}
+            }
+            let (l, r) = (sst_exp_to_ast_checked(lhs)?, sst_exp_to_ast_checked(rhs)?);
             match binop_to_ast(op) {
                 Some(l_op) => LExpr::binop(l_op, l, r).node,
-                // Non-structural: emit as `head lhs rhs` via App.
-                // HeightCompare / Index / StrGetChar / IeeeFloat are
-                // rejected earlier by `sst_to_lean::supported_body`; the
-                // only op that reaches here is `Xor`, which renders as
-                // `xor lhs rhs`.
+                // Non-structural: emit as `head lhs rhs` via App. The
+                // only reachable case is `Xor`, which renders as `xor
+                // lhs rhs` (the rejected ops already early-exited above).
                 None => LExpr::app(LExpr::var("xor"), vec![l, r]).node,
             }
         }
         ExpX::BinaryOpr(BinaryOpr::ExtEq(_, _), lhs, rhs) => {
-            LExpr::eq(sst_exp_to_ast(lhs), sst_exp_to_ast(rhs)).node
+            LExpr::eq(sst_exp_to_ast_checked(lhs)?, sst_exp_to_ast_checked(rhs)?).node
         }
 
         ExpX::If(cond, then_e, else_e) => ExprNode::If {
-            cond: Box::new(sst_exp_to_ast(cond)),
-            then_: Box::new(sst_exp_to_ast(then_e)),
-            else_: Some(Box::new(sst_exp_to_ast(else_e))),
+            cond: Box::new(sst_exp_to_ast_checked(cond)?),
+            then_: Box::new(sst_exp_to_ast_checked(then_e)?),
+            else_: Some(Box::new(sst_exp_to_ast_checked(else_e)?)),
         },
 
         ExpX::Call(CallFun::Fun(fun, _), typs, args)
@@ -380,7 +416,10 @@ fn exp_to_node(e: &Exp) -> ExprNode {
                 LExpr::var(lean_name(&fun.path)),
                 typs.iter().map(|t| typ_to_expr(t)).collect(),
             );
-            LExpr::app(head, args.iter().map(|a| sst_exp_to_ast(a)).collect()).node
+            let rendered_args: Result<Vec<_>, _> = args.iter()
+                .map(|a| sst_exp_to_ast_checked(a))
+                .collect();
+            LExpr::app(head, rendered_args?).node
         }
         // `CheckDecreaseHeight(cur, prev, otherwise)` is the
         // termination obligation Verus inserts before each recursive
@@ -400,24 +439,30 @@ fn exp_to_node(e: &Exp) -> ExprNode {
         //
         // For non-int (datatype) decreases, the `height` function is
         // non-trivial (encodes structural recursion on the datatype).
-        // We don't support that yet; `sst_to_lean::check_exp` rejects
-        // CheckDecreaseHeight whose `cur.typ` isn't `TypX::Int`, so
-        // by the time we reach this arm the int-only case is
-        // guaranteed.
+        // We don't support that yet; reject here if the decrease type
+        // isn't int-like.
         ExpX::Call(CallFun::InternalFun(InternalFun::CheckDecreaseHeight), _, args) => {
-            assert_eq!(args.len(), 3,
-                "CheckDecreaseHeight expects 3 args (cur, prev, otherwise), got {}",
-                args.len());
+            if args.len() != 3 {
+                return Err(format!(
+                    "CheckDecreaseHeight expects 3 args (cur, prev, otherwise), got {}",
+                    args.len()
+                ));
+            }
+            if !is_int_height(&args[0].typ) {
+                return Err(format!(
+                    "recursive call termination check with non-int decrease \
+                     (type {:?}) not yet supported — only int decreases work today",
+                    args[0].typ
+                ));
+            }
             // `cur` is shaped as `let params = args in decrease_expr`
             // (see `recursion::check_decrease_call`), i.e., Verus
             // encodes parameter substitution via a BndX::Let. Render
             // it with the let zeta-reduced so omega can see the
-            // substituted expression directly — nested `let n := tmp_;
-            // n` defeats omega's let-handling when self-recursion
-            // makes the bound name collide with a caller param.
-            let cur = render_checked_decrease_arg(&args[0]);
-            let prev = render_checked_decrease_arg(&args[1]);
-            let otherwise = sst_exp_to_ast(&args[2]);
+            // substituted expression directly.
+            let cur = render_checked_decrease_arg(&args[0])?;
+            let prev = render_checked_decrease_arg(&args[1])?;
+            let otherwise = sst_exp_to_ast_checked(&args[2])?;
             // (0 ≤ cur ∧ cur < prev) ∨ (cur = prev ∧ otherwise)
             let lt_branch = LExpr::and(
                 LExpr::le(LExpr::lit_int("0"), cur.clone()),
@@ -426,17 +471,24 @@ fn exp_to_node(e: &Exp) -> ExprNode {
             let eq_branch = LExpr::and(LExpr::eq(cur, prev), otherwise);
             LExpr::or(lt_branch, eq_branch).node
         }
-        ExpX::Call(CallFun::InternalFun(_), _, _) => panic!(
-            "to_lean_sst_expr: InternalFun (non-CheckDecreaseHeight) \
-             should have been rejected by sst_to_lean::check_exp"
-        ),
+        ExpX::Call(CallFun::InternalFun(_), _, _) => {
+            return Err("internal function calls not yet supported".to_string());
+        }
 
         ExpX::Bind(bnd, body) => match &bnd.x {
             BndX::Let(binders) => {
+                // Validate binder values first.
+                let rendered_binders: Result<Vec<_>, String> = binders.iter()
+                    .map(|b| Ok::<_, String>(
+                        (sanitize(&b.name.0), sst_exp_to_ast_checked(&b.a)?)
+                    ))
+                    .collect();
+                let rendered_binders = rendered_binders?;
+                let body_rendered = sst_exp_to_ast_checked(body)?;
                 // Nest single-variable lets right-to-left so each binder is
                 // in scope for the remainder.
-                let out = binders.iter().rev().fold(sst_exp_to_ast(body), |acc, b| {
-                    LExpr::let_bind(sanitize(&b.name.0), sst_exp_to_ast(&b.a), acc)
+                let out = rendered_binders.into_iter().rev().fold(body_rendered, |acc, (name, val)| {
+                    LExpr::let_bind(name, val, acc)
                 });
                 out.node
             }
@@ -446,7 +498,7 @@ fn exp_to_node(e: &Exp) -> ExprNode {
                     ty: typ_to_expr(&b.a),
                     kind: BinderKind::Explicit,
                 }).collect();
-                let body = Box::new(sst_exp_to_ast(body));
+                let body = Box::new(sst_exp_to_ast_checked(body)?);
                 match quant.quant {
                     air::ast::Quant::Forall => ExprNode::Forall { binders: l_binders, body },
                     air::ast::Quant::Exists => ExprNode::Exists { binders: l_binders, body },
@@ -458,47 +510,70 @@ fn exp_to_node(e: &Exp) -> ExprNode {
                     ty: typ_to_expr(&b.a),
                     kind: BinderKind::Explicit,
                 }).collect(),
-                body: Box::new(sst_exp_to_ast(body)),
+                body: Box::new(sst_exp_to_ast_checked(body)?),
             },
             BndX::Choose(binders, _, cond) => {
                 // `Classical.epsilon (fun (x : T) => cond ∧ body)`
+                let l_binders: Vec<LBinder> = binders.iter().map(|b| LBinder {
+                    name: Some(sanitize(&b.name.0)),
+                    ty: typ_to_expr(&b.a),
+                    kind: BinderKind::Explicit,
+                }).collect();
+                let cond_ast = sst_exp_to_ast_checked(cond)?;
+                let body_ast = sst_exp_to_ast_checked(body)?;
                 let lambda = LExpr::new(ExprNode::Lambda {
-                    binders: binders.iter().map(|b| LBinder {
-                        name: Some(sanitize(&b.name.0)),
-                        ty: typ_to_expr(&b.a),
-                        kind: BinderKind::Explicit,
-                    }).collect(),
-                    body: Box::new(LExpr::and(sst_exp_to_ast(cond), sst_exp_to_ast(body))),
+                    binders: l_binders,
+                    body: Box::new(LExpr::and(cond_ast, body_ast)),
                 });
                 LExpr::app1(LExpr::var("Classical.epsilon"), lambda).node
             }
         },
 
-        ExpX::WithTriggers(_, inner) | ExpX::Loc(inner) => exp_to_node(inner),
+        ExpX::WithTriggers(_, inner) | ExpX::Loc(inner) => exp_to_node_checked(inner)?,
 
         ExpX::NullaryOpr(_) => ExprNode::LitBool(true),
 
-        // Forms rejected by `supported_body`. If we reach them here, the
-        // support check and this function got out of sync.
-        ExpX::Ctor(..) => panic!("to_lean_sst_expr: Ctor should have been rejected"),
-        ExpX::CallLambda(..) => panic!("to_lean_sst_expr: CallLambda should have been rejected"),
-        ExpX::ArrayLiteral(_) => panic!("to_lean_sst_expr: ArrayLiteral should have been rejected"),
-        ExpX::Old(..) => panic!("to_lean_sst_expr: Old should have been rejected"),
-        ExpX::Interp(_) => panic!("to_lean_sst_expr: Interp must not escape the interpreter"),
-        ExpX::FuelConst(_) => panic!("to_lean_sst_expr: FuelConst should have been rejected"),
+        // Forms we don't know how to render.
+        ExpX::Ctor(..) => return Err(
+            "datatype constructors not yet supported in exec fns".to_string()
+        ),
+        ExpX::CallLambda(..) => return Err(
+            "closure calls not yet supported in exec fns".to_string()
+        ),
+        ExpX::ArrayLiteral(_) => return Err(
+            "array literals not yet supported in exec fns".to_string()
+        ),
+        ExpX::Old(..) => return Err(
+            "`old(...)` not yet supported in exec fns".to_string()
+        ),
+        ExpX::Interp(_) => return Err(
+            "Interp nodes should never escape the interpreter (internal bug)".to_string()
+        ),
+        ExpX::FuelConst(_) => return Err("FuelConst not yet supported".to_string()),
+    })
+}
+
+/// Does this type bottom out at `TypX::Int(_)` once transparent
+/// wrappers (`Boxed`, `Decorate`) are peeled? Mirrors
+/// `vir::recursion::height_is_int`.
+fn is_int_height(typ: &Typ) -> bool {
+    match &**typ {
+        TypX::Int(_) => true,
+        TypX::Boxed(inner) | TypX::Decorate(_, _, inner) => is_int_height(inner),
+        _ => false,
     }
 }
 
-fn const_to_node(c: &Constant) -> ExprNode {
-    match c {
+fn const_to_node_checked(c: &Constant) -> Result<ExprNode, String> {
+    Ok(match c {
         Constant::Bool(b) => ExprNode::LitBool(*b),
         Constant::Int(n) => ExprNode::Lit(n.to_string()),
         Constant::StrSlice(s) => ExprNode::LitStr(s.to_string()),
         Constant::Char(c) => ExprNode::LitChar(*c),
-        Constant::Real(_) | Constant::Float32(_) | Constant::Float64(_) => panic!(
-            "to_lean_sst_expr: constant {:?} should have been rejected by supported_body", c
-        ),
-    }
+        Constant::Real(_) | Constant::Float32(_) | Constant::Float64(_) => {
+            return Err(format!("unsupported constant: {:?}", c));
+        }
+    })
 }
 
 fn binop_to_ast(op: &BinaryOp) -> Option<L> {
