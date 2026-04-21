@@ -421,7 +421,7 @@ fn substitute_impl(
         ExprNode::Let { name, value, body } => {
             let new_value = substitute_impl(value, subst);
             let inner_subst = subst_without(subst, name);
-            check_capture_lazy(&[name], &inner_subst, "let");
+            check_capture_lazy(&[name], &inner_subst, body, "let");
             ExprNode::Let {
                 name: name.clone(),
                 value: Box::new(new_value),
@@ -433,7 +433,7 @@ fn substitute_impl(
             let binder_names: Vec<&str> = binders.iter()
                 .filter_map(|b| b.name.as_deref())
                 .collect();
-            check_capture_lazy(&binder_names, &inner_subst, "lambda");
+            check_capture_lazy(&binder_names, &inner_subst, body, "lambda");
             ExprNode::Lambda {
                 binders: binders.clone(),
                 body: Box::new(substitute_impl(body, &inner_subst)),
@@ -444,7 +444,7 @@ fn substitute_impl(
             let binder_names: Vec<&str> = binders.iter()
                 .filter_map(|b| b.name.as_deref())
                 .collect();
-            check_capture_lazy(&binder_names, &inner_subst, "forall");
+            check_capture_lazy(&binder_names, &inner_subst, body, "forall");
             ExprNode::Forall {
                 binders: binders.clone(),
                 body: Box::new(substitute_impl(body, &inner_subst)),
@@ -455,7 +455,7 @@ fn substitute_impl(
             let binder_names: Vec<&str> = binders.iter()
                 .filter_map(|b| b.name.as_deref())
                 .collect();
-            check_capture_lazy(&binder_names, &inner_subst, "exists");
+            check_capture_lazy(&binder_names, &inner_subst, body, "exists");
             ExprNode::Exists {
                 binders: binders.clone(),
                 body: Box::new(substitute_impl(body, &inner_subst)),
@@ -475,7 +475,7 @@ fn substitute_impl(
                 let mut inner = subst.clone();
                 for n in &bound { inner.remove(n); }
                 let bound_refs: Vec<&str> = bound.iter().map(String::as_str).collect();
-                check_capture_lazy(&bound_refs, &inner, "match pattern");
+                check_capture_lazy(&bound_refs, &inner, &a.body, "match pattern");
                 MatchArm {
                     pattern: a.pattern.clone(),
                     body: substitute_impl(&a.body, &inner),
@@ -509,24 +509,42 @@ fn substitute_impl(
     Expr::new(node)
 }
 
-/// Per-scope capture check. `binder_names` are the names the current
-/// binder introduces; `inner_subst` is what substitution would actually
-/// apply inside the binder's body (with binder names already removed).
-/// Panics if any binder name appears free in a value of `inner_subst`,
-/// because substituting that value inside the binder would accidentally
-/// rebind it. When `inner_subst` is empty, there's nothing to
-/// substitute inside the body so no capture is possible — this early
-/// exit eliminates false positives on binders whose names happen to
-/// match variables in (inactive) substitution values.
+/// Per-scope capture check. Precise enough to avoid false positives:
+/// only panics when substitution would actually happen inside this
+/// binder AND the substituted value's free vars would be captured.
+///
+/// Walks `body` to see which `inner_subst` keys actually occur free
+/// there — if none, no substitution happens inside so no capture is
+/// possible (early exit). Otherwise checks only the values for the
+/// live keys against the binder names. Cost is two extra traversals
+/// per binder hit (body and live-value free-var collection), both
+/// bounded by expression size.
 fn check_capture_lazy(
     binder_names: &[&str],
     inner_subst: &std::collections::HashMap<String, Expr>,
+    body: &Expr,
     binder_kind: &str,
 ) {
     if inner_subst.is_empty() { return; }
-    let free_in_values = free_vars_of_subst_values(inner_subst);
+    let body_free = {
+        let mut out = std::collections::HashSet::new();
+        collect_free_vars(body, &std::collections::HashSet::new(), &mut out);
+        out
+    };
+    // Only keys that actually occur free in the body would trigger
+    // substitution inside this binder's scope.
+    let live_keys: Vec<&str> = inner_subst.keys()
+        .filter(|k| body_free.contains(k.as_str()))
+        .map(String::as_str)
+        .collect();
+    if live_keys.is_empty() { return; }
+
+    let mut free_in_live_values = std::collections::HashSet::new();
+    for k in &live_keys {
+        collect_free_vars(&inner_subst[*k], &std::collections::HashSet::new(), &mut free_in_live_values);
+    }
     for name in binder_names {
-        if free_in_values.contains(*name) {
+        if free_in_live_values.contains(*name) {
             panic!(
                 "Lean-AST substitute: binder `{}` (kind: {}) would capture a free \
                  variable of the same name in a substitution value — alpha-\
@@ -553,16 +571,6 @@ fn subst_remove_binders(
     let mut out = subst.clone();
     for b in binders {
         if let Some(n) = &b.name { out.remove(n); }
-    }
-    out
-}
-
-fn free_vars_of_subst_values(
-    subst: &std::collections::HashMap<String, Expr>,
-) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
-    for v in subst.values() {
-        collect_free_vars(v, &std::collections::HashSet::new(), &mut out);
     }
     out
 }
@@ -676,4 +684,297 @@ pub fn and_all(mut exprs: Vec<Expr>) -> Expr {
         });
     }
     acc
+}
+
+#[cfg(test)]
+mod substitute_tests {
+    //! Direct unit tests for `substitute`. Covers:
+    //!   - basic Var sub + no-op cases
+    //!   - binder shadowing (Let / Forall / Exists / Lambda / Match)
+    //!   - lazy capture panics (real capture detected)
+    //!   - lazy capture does NOT panic when binder is out of subst scope
+    //!   - TypeAnnot substitutes in type position
+    //!   - recursive structure (nested binders, if/match)
+    use super::*;
+    use std::collections::HashMap;
+
+    fn var(n: &str) -> Expr { Expr::new(ExprNode::Var(n.to_string())) }
+    fn lit(n: i64) -> Expr { Expr::new(ExprNode::Lit(n.to_string())) }
+    fn add(l: Expr, r: Expr) -> Expr {
+        Expr::new(ExprNode::BinOp { op: BinOp::Add, lhs: Box::new(l), rhs: Box::new(r) })
+    }
+    fn let_bind(name: &str, val: Expr, body: Expr) -> Expr {
+        Expr::new(ExprNode::Let {
+            name: name.to_string(), value: Box::new(val), body: Box::new(body),
+        })
+    }
+    fn forall(binder_name: &str, body: Expr) -> Expr {
+        Expr::new(ExprNode::Forall {
+            binders: vec![Binder {
+                name: Some(binder_name.to_string()),
+                ty: var("Int"),
+                kind: BinderKind::Explicit,
+            }],
+            body: Box::new(body),
+        })
+    }
+    fn exists(binder_name: &str, body: Expr) -> Expr {
+        Expr::new(ExprNode::Exists {
+            binders: vec![Binder {
+                name: Some(binder_name.to_string()),
+                ty: var("Int"),
+                kind: BinderKind::Explicit,
+            }],
+            body: Box::new(body),
+        })
+    }
+    fn lambda(binder_name: &str, body: Expr) -> Expr {
+        Expr::new(ExprNode::Lambda {
+            binders: vec![Binder {
+                name: Some(binder_name.to_string()),
+                ty: var("Int"),
+                kind: BinderKind::Explicit,
+            }],
+            body: Box::new(body),
+        })
+    }
+    fn subst_of(pairs: &[(&str, Expr)]) -> HashMap<String, Expr> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+    fn node_eq(a: &Expr, b: &Expr) -> bool {
+        // Printed form as a rough structural-equality check — the
+        // pretty-printer is deterministic so equivalent ASTs produce
+        // identical strings.
+        crate::lean_pp::pp_expr(a) == crate::lean_pp::pp_expr(b)
+    }
+
+    #[test]
+    fn empty_subst_is_noop() {
+        let e = add(var("x"), var("y"));
+        let out = substitute(&e, &HashMap::new());
+        assert!(node_eq(&out, &e));
+    }
+
+    #[test]
+    fn simple_var_substitution() {
+        // x + y with {x: 1, y: 2}  →  1 + 2
+        let e = add(var("x"), var("y"));
+        let s = subst_of(&[("x", lit(1)), ("y", lit(2))]);
+        let expected = add(lit(1), lit(2));
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    fn leaves_unsubstituted_vars_alone() {
+        // x + y with {x: 1}  →  1 + y
+        let e = add(var("x"), var("y"));
+        let s = subst_of(&[("x", lit(1))]);
+        let expected = add(lit(1), var("y"));
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    fn literals_pass_through() {
+        let e = add(lit(1), lit(2));
+        let s = subst_of(&[("x", lit(99))]);
+        assert!(node_eq(&substitute(&e, &s), &e));
+    }
+
+    #[test]
+    fn let_shadows_subst_key() {
+        // let x := 3; x + y  with {x: 1, y: 2}
+        //   inside let, x is re-bound, so x stays; y becomes 2
+        //   →  let x := 3; x + 2
+        // (value of x := 3 is the new binding; y substitutes normally.)
+        let e = let_bind("x", lit(3), add(var("x"), var("y")));
+        let s = subst_of(&[("x", lit(1)), ("y", lit(2))]);
+        let expected = let_bind("x", lit(3), add(var("x"), lit(2)));
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    fn let_value_uses_outer_subst() {
+        // let y := x; body  with {x: 42}  →  let y := 42; body
+        // The value side sees the outer substitution; the body sees
+        // the let-bound `y`.
+        let e = let_bind("y", var("x"), var("y"));
+        let s = subst_of(&[("x", lit(42))]);
+        let expected = let_bind("y", lit(42), var("y"));
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    fn forall_shadows() {
+        // ∀ x. x + y  with {x: 1, y: 2}  →  ∀ x. x + 2
+        let e = forall("x", add(var("x"), var("y")));
+        let s = subst_of(&[("x", lit(1)), ("y", lit(2))]);
+        let expected = forall("x", add(var("x"), lit(2)));
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    fn exists_shadows() {
+        let e = exists("x", add(var("x"), var("y")));
+        let s = subst_of(&[("x", lit(1)), ("y", lit(2))]);
+        let expected = exists("x", add(var("x"), lit(2)));
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    fn lambda_shadows() {
+        let e = lambda("x", add(var("x"), var("y")));
+        let s = subst_of(&[("x", lit(1)), ("y", lit(2))]);
+        let expected = lambda("x", add(var("x"), lit(2)));
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    #[should_panic(expected = "would capture a free variable")]
+    fn capture_panics() {
+        // ∀ y. x + y  with {x: y}
+        // x is free inside ∀ y.; substituting x→y would capture the
+        // substituted `y` inside the ∀. Panic.
+        let e = forall("y", add(var("x"), var("y")));
+        let s = subst_of(&[("x", var("y"))]);
+        let _ = substitute(&e, &s);
+    }
+
+    #[test]
+    fn capture_false_positive_avoided_when_binder_out_of_subst_scope() {
+        // (∀ y. z) + x  with {x: y}
+        // The outer binder `∀ y.` doesn't contain `x`, so substitution
+        // never enters its scope — no capture is possible. Old eager
+        // check would panic; lazy check correctly passes.
+        let e = add(forall("y", var("z")), var("x"));
+        let s = subst_of(&[("x", var("y"))]);
+        // No panic expected.
+        let expected = add(forall("y", var("z")), var("y"));
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    fn capture_false_positive_avoided_when_binder_shadows_all_subst_keys() {
+        // ∀ x. x  with {x: y}
+        // Inside the ∀, `x` is re-bound; subst key `x` is removed from
+        // inner_subst which becomes empty. No capture risk even though
+        // `y` (free in the subst value) might match a hypothetical
+        // binder — because subst is empty inside the binder.
+        let e = forall("x", var("x"));
+        let s = subst_of(&[("x", var("y"))]);
+        let expected = forall("x", var("x"));
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    fn nested_binders_respected() {
+        // let x := 1; ∀ y. x + y   with {x: 99, y: 77}
+        //   x on the value side → 99 (not shadowed yet)
+        //   inside let: x now re-bound, ∀ y re-binds y
+        //   → let x := 99; ∀ y. x + y
+        let e = let_bind("x", var("x"), forall("y", add(var("x"), var("y"))));
+        let s = subst_of(&[("x", lit(99)), ("y", lit(77))]);
+        let expected = let_bind("x", lit(99), forall("y", add(var("x"), var("y"))));
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    fn if_substitutes_in_all_branches() {
+        // if c then x else y   with {c: True, x: 1, y: 2}
+        //   → if True then 1 else 2
+        let e = Expr::new(ExprNode::If {
+            cond: Box::new(var("c")),
+            then_: Box::new(var("x")),
+            else_: Some(Box::new(var("y"))),
+        });
+        let s = subst_of(&[
+            ("c", Expr::new(ExprNode::LitBool(true))),
+            ("x", lit(1)),
+            ("y", lit(2)),
+        ]);
+        let expected = Expr::new(ExprNode::If {
+            cond: Box::new(Expr::new(ExprNode::LitBool(true))),
+            then_: Box::new(lit(1)),
+            else_: Some(Box::new(lit(2))),
+        });
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    fn type_annot_substitutes_in_type_position() {
+        // (x : T)  with {x: 42, T: Int}
+        //   → (42 : Int)
+        let e = Expr::new(ExprNode::TypeAnnot {
+            expr: Box::new(var("x")),
+            ty: Box::new(var("T")),
+        });
+        let s = subst_of(&[("x", lit(42)), ("T", var("Int"))]);
+        let expected = Expr::new(ExprNode::TypeAnnot {
+            expr: Box::new(lit(42)),
+            ty: Box::new(var("Int")),
+        });
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    fn field_proj_preserves_field_name() {
+        // e.foo  with {e: x}  →  x.foo  (field name unchanged)
+        let e = Expr::new(ExprNode::FieldProj {
+            expr: Box::new(var("e")),
+            field: "foo".to_string(),
+        });
+        let s = subst_of(&[("e", var("x")), ("foo", lit(999))]);
+        let expected = Expr::new(ExprNode::FieldProj {
+            expr: Box::new(var("x")),
+            field: "foo".to_string(),
+        });
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    fn app_substitutes_head_and_args() {
+        // f x y  with {f: g, x: 1, y: 2}  →  g 1 2
+        let e = Expr::new(ExprNode::App {
+            head: Box::new(var("f")),
+            args: vec![var("x"), var("y")],
+        });
+        let s = subst_of(&[("f", var("g")), ("x", lit(1)), ("y", lit(2))]);
+        let expected = Expr::new(ExprNode::App {
+            head: Box::new(var("g")),
+            args: vec![lit(1), lit(2)],
+        });
+        assert!(node_eq(&substitute(&e, &s), &expected));
+    }
+
+    #[test]
+    fn match_arm_pattern_shadows() {
+        // match scrut with | Some(x) => x + y | None => y
+        //   with {x: 99, y: 42}
+        //   In the Some arm: `x` is pattern-bound, so stays; y→42.
+        //   In the None arm: no bindings, y→42.
+        //   → match scrut with | Some(x) => x + 42 | None => 42
+        let e = Expr::new(ExprNode::Match {
+            scrutinee: Box::new(var("scrut")),
+            arms: vec![
+                MatchArm {
+                    pattern: Pattern::Ctor {
+                        name: "Some".to_string(),
+                        args: vec![Pattern::Var("x".to_string())],
+                    },
+                    body: add(var("x"), var("y")),
+                },
+                MatchArm {
+                    pattern: Pattern::Ctor { name: "None".to_string(), args: vec![] },
+                    body: var("y"),
+                },
+            ],
+        });
+        let s = subst_of(&[("x", lit(99)), ("y", lit(42))]);
+        let out = substitute(&e, &s);
+        // Spot-check printed form has x surviving in the Some arm
+        // and y→42 in both arms.
+        let printed = crate::lean_pp::pp_expr(&out);
+        assert!(printed.contains("Some x"), "Some arm should keep x: {}", printed);
+        assert!(printed.contains("x + 42"), "Some arm body should read x + 42: {}", printed);
+        assert!(!printed.contains("+ y"), "y should be substituted: {}", printed);
+    }
 }
