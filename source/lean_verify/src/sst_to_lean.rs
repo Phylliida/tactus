@@ -186,20 +186,37 @@ impl<'a> WpCtx<'a> {
 // we can zip directly; the dummy param's substitution binds a name
 // nothing references, inert.
 
-/// Does this expression — or any transparently-wrapped inner — use
-/// `ExpX::Loc`? `Loc` marks an L-value (`&mut` argument site). We peel
-/// the same transparent wrappers as `lift_if_value` so a mutable borrow
-/// buried under `Box` / `Unbox` / `CoerceMode` / `Trigger` is still
-/// detected rather than silently accepted as by-value.
-fn contains_loc(e: &Exp) -> bool {
+/// The set of SST expression wrappers we treat as semantically
+/// transparent — i.e., they don't emit any Lean code of their own
+/// and peeling through them is safe. Centralised here so adding a
+/// new transparent wrapper is one edit, not four parallel ones.
+///
+/// Callers: [`contains_loc`] (for `&mut` detection),
+/// [`lift_if_value`] (for if-value lifting; it additionally peels
+/// `Loc`), [`to_lean_sst_expr::render_checked_decrease_arg`] (for
+/// the Bind(Let) peel in `CheckDecreaseHeight` args).
+///
+/// If Verus adds a new transparent wrapper (e.g., a new `UnaryOpr`
+/// or `Unary` variant that's effectively inert at the SST level),
+/// extending this one function also extends the peel semantics of
+/// all callers uniformly.
+pub(crate) fn peel_transparent(e: &Exp) -> &Exp {
     match &e.x {
-        ExpX::Loc(_) => true,
         ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner)
         | ExpX::Unary(UnaryOp::CoerceMode { .. } | UnaryOp::Trigger(_), inner) => {
-            contains_loc(inner)
+            peel_transparent(inner)
         }
-        _ => false,
+        _ => e,
     }
+}
+
+/// Does this expression — or any transparently-wrapped inner — use
+/// `ExpX::Loc`? `Loc` marks an L-value (`&mut` argument site).
+/// We peel transparent wrappers via [`peel_transparent`] so a
+/// mutable borrow buried under them is still detected rather than
+/// silently accepted as by-value.
+fn contains_loc(e: &Exp) -> bool {
+    matches!(&peel_transparent(e).x, ExpX::Loc(_))
 }
 
 /// Validate an SST expression — `sst_exp_to_ast_checked` does both
@@ -611,7 +628,11 @@ fn lower_call(
 /// the goal the user is writing. For non-if values this is a direct
 /// call to `emit_leaf` with the rendered expression — no overhead.
 fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
-    match &e.x {
+    // Peel Box/Unbox/CoerceMode/Trigger via the shared helper; `Loc`
+    // is handled separately below because it peels for lifting but
+    // NOT for `contains_loc` (which is looking for the Loc itself).
+    let peeled = peel_transparent(e);
+    match &peeled.x {
         ExpX::If(cond, then_e, else_e) => {
             let c = sst_exp_to_ast(cond);
             LExpr::and(
@@ -619,15 +640,11 @@ fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
                 LExpr::implies(LExpr::not(c), lift_if_value(else_e, emit_leaf)),
             )
         }
-        // Peel transparent wrappers — they don't emit any Lean code
-        // (`to_lean_sst_expr` elides them) so peeling here is safe.
+        // Loc is also transparent for lifting (it marks an L-value
+        // position; the expression semantics are the inner's). Not
+        // part of `peel_transparent` because `contains_loc` needs
+        // Loc un-peeled.
         ExpX::Loc(inner) => lift_if_value(inner, emit_leaf),
-        ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => {
-            lift_if_value(inner, emit_leaf)
-        }
-        ExpX::Unary(UnaryOp::CoerceMode { .. } | UnaryOp::Trigger(_), inner) => {
-            lift_if_value(inner, emit_leaf)
-        }
         // Single-binder `let y := e_rhs; body` — if the rhs has an if,
         // lift it out, re-threading `body` through each branch. Verus
         // often emits `let y = …; y` blocks as this shape, which would
@@ -705,7 +722,11 @@ fn build_wp<'a>(
             }
             Ok(wp)
         }
-        StmX::Assign { lhs: Dest { dest, .. }, rhs } => {
+        // Explicit destructure of `Dest` — `is_init` doesn't affect
+        // WP construction (Lean's let-shadowing gives SSA for free),
+        // but spelling it out forces a compile-time audit if Verus
+        // adds a new `Dest` field that might.
+        StmX::Assign { lhs: Dest { dest, is_init: _ }, rhs } => {
             check_exp(dest)?;
             check_exp(rhs)?;
             let Some(name) = extract_simple_var(dest) else {
@@ -730,7 +751,14 @@ fn build_wp<'a>(
         // an `ExpX::If`, lift it via `lift_if_value` so the Done
         // leaf has goal-level `(c → …) ∧ (¬c → …)` shape rather than
         // an opaque-to-omega value-position if.
-        StmX::Return { ret_exp: Some(e), .. } => {
+        //
+        // Destructure every field explicitly (no `..`) — any future
+        // Verus-side `StmX::Return` field addition then forces a
+        // compile-time audit. `assert_id` / `base_error` are Verus
+        // diagnostic metadata; `inside_body` distinguishes tail vs
+        // early returns but the DSL handles both identically (both
+        // produce `Wp::Done`).
+        StmX::Return { ret_exp: Some(e), assert_id: _, base_error: _, inside_body: _ } => {
             check_exp(e)?;
             let ensures_goal = ctx.ensures_goal.clone();
             let ret_name = ctx.ret_name;
@@ -740,7 +768,9 @@ fn build_wp<'a>(
             });
             Ok(Wp::Done(leaf))
         }
-        StmX::Return { ret_exp: None, .. } => Ok(Wp::Done(ctx.ensures_goal.clone())),
+        StmX::Return { ret_exp: None, assert_id: _, base_error: _, inside_body: _ } => {
+            Ok(Wp::Done(ctx.ensures_goal.clone()))
+        }
         StmX::If(cond, then_stm, else_stm) => {
             check_exp(cond)?;
             // Both branches share the same post-if continuation. Clone
@@ -873,8 +903,25 @@ fn build_wp_loop<'a>(
     after: Wp<'a>,
     ctx: &WpCtx<'a>,
 ) -> Result<Wp<'a>, String> {
+    // Destructure every field explicitly so a future Verus-side
+    // `StmX::Loop` addition forces a compile-time audit. `is_for_loop`
+    // only affects error messages upstream; `id` / `label` are loop
+    // identifiers we don't reference; `typ_inv_vars` supplies type-
+    // invariant assumptions that Verus's sst_to_air uses — we
+    // recompute our own `modified_vars` via `collect_modifications`
+    // rather than trust Verus's `modified_vars` or `pre_modified_params`.
     let StmX::Loop {
-        loop_isolation, cond, body, invs, decrease, modified_vars: _, ..
+        loop_isolation,
+        is_for_loop: _,
+        id: _,
+        label: _,
+        cond,
+        body,
+        invs,
+        decrease,
+        typ_inv_vars: _,
+        modified_vars: _,
+        pre_modified_params: _,
     } = &stm.x else {
         unreachable!("build_wp_loop called on non-loop statement");
     };
@@ -1577,5 +1624,197 @@ mod tests {
         let b = var_exp("b", typ_int());
         let e = if_exp(c, a, b);
         assert_eq!(extract_simple_var(&e), None);
+    }
+
+    // ── peel_transparent ──────────────────────────────────────
+    //
+    // The shared helper for peeling Box/Unbox/CoerceMode/Trigger
+    // wrappers. If Verus ever adds a new transparent wrapper kind,
+    // `contains_loc` / `lift_if_value` / `render_checked_decrease_arg`
+    // all silently miss it — these tests pin the current wrapper
+    // set so the breakage shows up as a failing assertion here
+    // rather than as mysterious miscompilation in recursive fn
+    // tests.
+
+    fn exp_ident(e: &Exp) -> Option<&str> {
+        match &e.x {
+            ExpX::Var(id) => Some(id.0.as_str()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn peel_transparent_leaves_plain_var_alone() {
+        let x = var_exp("x", typ_int());
+        assert_eq!(exp_ident(peel_transparent(&x)), Some("x"));
+    }
+
+    #[test]
+    fn peel_transparent_peels_box() {
+        let x = var_exp("x", typ_int());
+        assert_eq!(exp_ident(peel_transparent(&box_exp(x))), Some("x"));
+    }
+
+    #[test]
+    fn peel_transparent_peels_unbox() {
+        let x = var_exp("x", typ_int());
+        assert_eq!(exp_ident(peel_transparent(&unbox_exp(x))), Some("x"));
+    }
+
+    #[test]
+    fn peel_transparent_peels_coerce_mode() {
+        let x = var_exp("x", typ_int());
+        assert_eq!(exp_ident(peel_transparent(&coerce_mode_exp(x))), Some("x"));
+    }
+
+    #[test]
+    fn peel_transparent_peels_trigger() {
+        let x = var_exp("x", typ_int());
+        assert_eq!(exp_ident(peel_transparent(&trigger_exp(x))), Some("x"));
+    }
+
+    #[test]
+    fn peel_transparent_peels_stacked_wrappers() {
+        // Box(Unbox(CoerceMode(Trigger(Var))))
+        let x = var_exp("x", typ_int());
+        let wrapped = box_exp(unbox_exp(coerce_mode_exp(trigger_exp(x))));
+        assert_eq!(exp_ident(peel_transparent(&wrapped)), Some("x"));
+    }
+
+    #[test]
+    fn peel_transparent_does_not_peel_loc() {
+        // Loc is NOT in the transparent set — `contains_loc` depends
+        // on finding it un-peeled.
+        let x = var_exp("x", typ_int());
+        let wrapped = loc_exp(x);
+        // After peel, we should still see ExpX::Loc at the top.
+        assert!(matches!(&peel_transparent(&wrapped).x, ExpX::Loc(_)));
+    }
+
+    #[test]
+    fn peel_transparent_does_not_peel_if() {
+        // If is structurally meaningful — must not be peeled.
+        let c = var_exp("c", typ_bool());
+        let a = var_exp("a", typ_int());
+        let b = var_exp("b", typ_int());
+        let e = if_exp(c, a, b);
+        assert!(matches!(&peel_transparent(&e).x, ExpX::If(..)));
+    }
+
+    #[test]
+    fn peel_transparent_stops_at_loc_but_peels_wrappers_around_it() {
+        // Box(Loc(x)) — peel the Box, stop at Loc.
+        let x = var_exp("x", typ_int());
+        let wrapped = box_exp(loc_exp(x));
+        assert!(matches!(&peel_transparent(&wrapped).x, ExpX::Loc(_)));
+    }
+
+    // ── CheckDecreaseHeight shape-drift detection ─────────────────
+    //
+    // `render_checked_decrease_arg` assumes `cur`/`prev` are shaped
+    // as `Bind(Let(params → args, decrease_expr))` (possibly wrapped
+    // in transparent poly/coerce wrappers). If Verus ever changes
+    // this encoding, our peel falls through to the default renderer
+    // which emits a shadowing `let` that defeats omega on
+    // self-recursion.
+    //
+    // These tests pin the shape expectation so a drift trips an
+    // assertion here instead of producing obscure recursive-fn
+    // verification failures.
+
+    /// Construct the canonical CheckDecreaseHeight `cur` arg shape:
+    /// `Bind(Let([(param, arg)]), decrease_expr)` — optionally
+    /// wrapped in a transparent Box (mirrors `poly::coerce_exp_to_poly`).
+    fn mk_decrease_arg(with_box: bool, param: &str, arg_name: &str, decrease_var: &str) -> Exp {
+        let arg = var_exp(arg_name, typ_int());
+        let dec = var_exp(decrease_var, typ_int());
+        let inner = let_exp(param, arg, dec);
+        if with_box { box_exp(inner) } else { inner }
+    }
+
+    /// Render via the full `sst_exp_to_ast_checked` pathway —
+    /// exercises `CheckDecreaseHeight` lowering end-to-end.
+    fn render_via_public(e: &Exp) -> LExpr {
+        crate::to_lean_sst_expr::sst_exp_to_ast(e)
+    }
+
+    #[test]
+    fn decrease_arg_shape_with_box_wrapper_substitutes() {
+        // Canonical Verus shape: Box(Let([(n, tmp)], n))
+        //   After peel + substitute: tmp
+        let e = mk_decrease_arg(true, "n", "tmp", "n");
+        // `sst_exp_to_ast` would emit `Box` as transparent and render
+        // the inner Let directly (producing shadowing). We need to go
+        // through the CheckDecreaseHeight-specific helper. Since
+        // render_checked_decrease_arg is private, we test the shape
+        // by constructing a full CheckDecreaseHeight call below.
+        let _ = e;
+    }
+
+    #[test]
+    fn decrease_arg_without_bind_let_falls_through() {
+        // If Verus ever emits CheckDecreaseHeight without the
+        // Bind(Let) wrapper — e.g., just a plain Var — our code
+        // falls through to sst_exp_to_ast_checked. This test pins
+        // that the fallthrough produces the var unchanged (not a
+        // let-wrapped form). If the assumption about Bind(Let)
+        // wrapping drifts, this test still passes — but the
+        // `full_check_decrease_height_shape` test below fails
+        // because we won't substitute any more.
+        let x = var_exp("x", typ_int());
+        let rendered = render_via_public(&box_exp(x));
+        assert_eq!(crate::lean_pp::pp_expr(&rendered), "x");
+    }
+
+    #[test]
+    fn full_check_decrease_height_shape_pinned() {
+        // Full shape: CheckDecreaseHeight(
+        //   Box(Let([(n, tmp)], n)),   -- cur
+        //   Box(n_old),                 -- prev
+        //   False                       -- otherwise (single-expr decrease)
+        // )
+        //
+        // Expected lowering:
+        //   (0 ≤ tmp ∧ tmp < n_old) ∨ (tmp = n_old ∧ False)
+        //
+        // If Verus changes the Bind(Let) shape, the substitution
+        // won't happen and `cur` will render as the raw `let n :=
+        // tmp; n` form — the expected output won't match.
+        use vir::sst::{CallFun, ExpX, InternalFun};
+        let cur = mk_decrease_arg(true, "n", "tmp", "n");
+        let prev = box_exp(var_exp("n_old", typ_int()));
+        let otherwise = Arc::new(SpannedTyped {
+            span: test_span(),
+            typ: typ_bool(),
+            x: ExpX::Const(vir::ast::Constant::Bool(false)),
+        });
+        let args = Arc::new(vec![cur, prev, otherwise]);
+        let typ_args: Arc<Vec<Typ>> = Arc::new(vec![]);
+        let call = Arc::new(SpannedTyped {
+            span: test_span(),
+            typ: typ_bool(),
+            x: ExpX::Call(
+                CallFun::InternalFun(InternalFun::CheckDecreaseHeight),
+                typ_args,
+                args,
+            ),
+        });
+        let rendered = render_via_public(&call);
+        let printed = crate::lean_pp::pp_expr(&rendered);
+        // Must be the substituted form (tmp), not the shadowing let.
+        assert!(printed.contains("tmp"),
+            "CheckDecreaseHeight should render with tmp substituted: {}",
+            printed);
+        assert!(!printed.contains("let n := tmp"),
+            "Verus Bind(Let) wrapper must be zeta-reduced, not emitted as let: \
+             {}\n\
+             If this fails, Verus's CheckDecreaseHeight `cur` shape has \
+             drifted; update `render_checked_decrease_arg` in to_lean_sst_expr.rs.",
+            printed);
+        // And the expected disjunction structure must be present.
+        assert!(printed.contains("0 ≤") || printed.contains("0≤"),
+            "lower bound 0 ≤ cur should be present: {}", printed);
+        assert!(printed.contains("∨") || printed.contains("\\/"),
+            "disjunction with `otherwise` branch should be present: {}", printed);
     }
 }

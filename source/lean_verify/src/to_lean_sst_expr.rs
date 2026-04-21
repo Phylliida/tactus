@@ -286,27 +286,36 @@ fn clip_to_node_checked(src: &Typ, dst: &IntRange, inner: &Exp) -> Result<ExprNo
 }
 
 /// Render a `CheckDecreaseHeight` arg with Verus's param-substitution
-/// `Bind(Let)` wrapper zeta-reduced. The normal `Bind(Let)` rendering
-/// emits `let x := v; body`, which defeats omega's let-handling when
-/// the bound name shadows a caller-scope variable (common in self-
-/// recursion: callee's decrease uses the callee's param names, which
-/// equal the caller's when self == callee). Substituting directly at
-/// the Lean AST level via `lean_ast::substitute` removes the shadow
-/// and leaves omega-friendly arithmetic.
+/// `Bind(Let)` wrapper zeta-reduced.
 ///
-/// Only descends through top-level `Bind(Let)` wrappers; other shapes
-/// render as-is via `sst_exp_to_ast`.
+/// ## Shape assumption (Verus invariant)
+///
+/// `vir::recursion::check_decrease_call` encodes parameter
+/// substitution as a `Bind(Let(params → args, decrease_expr))`
+/// wrapping the decrease. Additionally, `poly::coerce_exp_to_poly`
+/// may wrap the whole thing in `UnaryOpr::Box` / `UnaryOpr::Unbox`,
+/// and upstream mode-coercion / trigger markers may wrap it in
+/// `Unary::CoerceMode` / `Unary::Trigger`. We peel those via
+/// [`crate::sst_to_lean::peel_transparent`] to reach the Bind(Let),
+/// then substitute at the Lean AST level via `lean_ast::substitute`.
+///
+/// **Why substitute instead of letting the default `Bind(Let)`
+/// renderer emit `let name := value; body`?** On self-recursion the
+/// callee's param names match the caller's, so the emitted let would
+/// shadow — `let n := n - 1; ...; n < old_n` — and omega can't
+/// zeta-reduce through the shadow. Direct substitution removes the
+/// shadow entirely and leaves omega-friendly arithmetic.
+///
+/// If Verus ever changes `check_decrease_call` to encode
+/// substitution differently (e.g., not via Bind(Let)), this peel
+/// falls through to `sst_exp_to_ast_checked` which renders the let
+/// as-is — producing the shadowed form and breaking recursive
+/// `tactus_auto` goals. That would be a caught regression (the
+/// `test_exec_call_recursive_*` suite exercises this path).
 fn render_checked_decrease_arg(e: &Exp) -> Result<LExpr, String> {
-    match &e.x {
-        // Peel transparent SST wrappers — poly Box/Unbox (inserted
-        // by Verus's Poly encoding for heterogeneous int types),
-        // mode coercions, and trigger markers all render identically
-        // to their inner expression. Peeling here lets us reach a
-        // Bind(Let) that sits underneath.
-        ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner)
-        | ExpX::Unary(UnaryOp::CoerceMode { .. } | UnaryOp::Trigger(_), inner) => {
-            render_checked_decrease_arg(inner)
-        }
+    use crate::sst_to_lean::peel_transparent;
+    let peeled = peel_transparent(e);
+    match &peeled.x {
         ExpX::Bind(bnd, body) => match &bnd.x {
             BndX::Let(binders) => {
                 let mut subst: std::collections::HashMap<String, LExpr> =
