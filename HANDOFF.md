@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**161 end-to-end tests + 1 coverage test + 92 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**161 end-to-end tests + 1 coverage test + 104 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), and arithmetic with overflow checking. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args, no generic calls, no break/continue — see DESIGN.md § "Known deferrals").
 
@@ -285,7 +285,7 @@ See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the c
 
 | Binary | Count | What it tests |
 |---|---|---|
-| `cargo test -p lean_verify --lib` | 92 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `Wp` / `lower_wp` / `needs_peel` / `contains_loc` / `lift_if_value`, type translation, sanity check scope tracking, lean_process |
+| `cargo test -p lean_verify --lib` | 104 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `Wp` / `lower_wp` / `needs_peel` / `contains_loc` / `lift_if_value`, type translation, sanity check scope tracking, lean_process |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
 | `vargo test -p rust_verify_test --test tactus` | 161 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
@@ -431,7 +431,7 @@ PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test
 # Coverage matrix (1 test, asserts walker visits the expected variant set)
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus_coverage
 
-# 92 unit tests (AST pp, substitute, Wp DSL, sanity check, type translation)
+# 104 unit tests (AST pp, substitute, Wp DSL, sanity check, type translation)
 cargo test -p lean_verify --lib
 
 # 7 integration tests (Lean invocation end-to-end)
