@@ -2860,7 +2860,83 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Trait method call — rejected by `check_call` because the
+// Zero-arg call — edge case where the real-param filter result is
+// empty. Regression guard: previously `debug_assert_eq!` in
+// `build_call_conjunction` would not fire in release, so a silent
+// miscount here would go undetected; now the real-param / arg
+// count check in `walk_call` catches any mismatch up front.
+test_verify_one_file! {
+    #[test] test_exec_call_zero_args verus_code! {
+        #[verifier::tactus_auto]
+        fn answer() -> (r: u8)
+            ensures r == 42
+        {
+            42
+        }
+
+        #[verifier::tactus_auto]
+        fn caller() -> (r: u8)
+            ensures r == 42
+        {
+            answer()
+        }
+    } => Ok(())
+}
+
+// Many-arg call — exercises the zip in `wrap_with_arg_lets` across
+// a wider param list. Together with zero-args and the basic
+// one-arg case, this covers the filter+zip shape.
+test_verify_one_file! {
+    #[test] test_exec_call_many_args verus_code! {
+        #[verifier::tactus_auto]
+        fn sum4(a: u8, b: u8, c: u8, d: u8) -> (r: u8)
+            requires a + b + c + d < 255
+            ensures r == a + b + c + d
+        {
+            a + b + c + d
+        }
+
+        #[verifier::tactus_auto]
+        fn call_sum4() -> (r: u8)
+            ensures r == 10
+        {
+            sum4(1, 2, 3, 4)
+        }
+    } => Ok(())
+}
+
+// `&mut` arg is rejected. The detector peels transparent SST
+// wrappers (Box/Unbox/CoerceMode/Trigger) before checking for
+// `ExpX::Loc`, so a mutable borrow can't slip past as by-value.
+test_verify_one_file! {
+    #[test] test_exec_call_mut_ref_rejected verus_code! {
+        #[verifier::tactus_auto]
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        #[verifier::tactus_auto]
+        fn call_mut(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            let mut y: u8 = x;
+            bump(&mut y);
+            y
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("not yet supported")),
+            "&mut call arg should be rejected, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
+// Trait method call — rejected by `walk_call` because the
 // `resolved_method` field is populated (dynamic dispatch resolution
 // that we don't handle yet).
 test_verify_one_file! {
