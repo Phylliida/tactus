@@ -477,13 +477,14 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
 
         ExpX::Bind(bnd, body) => match &bnd.x {
             BndX::Let(binders) => {
-                // Validate binder values first.
-                let rendered_binders: Result<Vec<_>, String> = binders.iter()
-                    .map(|b| Ok::<_, String>(
-                        (sanitize(&b.name.0), sst_exp_to_ast_checked(&b.a)?)
-                    ))
-                    .collect();
-                let rendered_binders = rendered_binders?;
+                // Validate + render binder values first. The closure
+                // returns `Result<(String, LExpr), String>`; `collect`
+                // flips it into `Result<Vec<_>, String>` which `?`
+                // unwraps to a plain Vec for the fold.
+                let rendered_binders = binders.iter()
+                    .map(|b| sst_exp_to_ast_checked(&b.a)
+                        .map(|val| (sanitize(&b.name.0), val)))
+                    .collect::<Result<Vec<_>, _>>()?;
                 let body_rendered = sst_exp_to_ast_checked(body)?;
                 // Nest single-variable lets right-to-left so each binder is
                 // in scope for the remainder.

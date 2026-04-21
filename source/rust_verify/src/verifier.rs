@@ -337,12 +337,18 @@ pub struct Verifier {
     vir_crate: Option<Krate>,
     /// Post-`ast_simplify` version of `vir_crate`. Populated inside
     /// `verify_crate_inner`; `None` until that runs. Tactus exec-fn
-    /// routing reads this because the simplified krate has Verus's
-    /// dummy-param injection applied (zero-arg fns get a `no%param`)
-    /// — using the pre-simplify form would desynchronise with
-    /// post-simplify call-site args. Proof fn routing keeps using the
-    /// pre-simplify `vir_crate` because user-visible spec rendering
-    /// wants the original expression forms.
+    /// routing reads this (via [`Verifier::simplified_krate`])
+    /// because the simplified krate has Verus's dummy-param
+    /// injection applied (zero-arg fns get a `no%param`) — using the
+    /// pre-simplify form would desynchronise with post-simplify
+    /// call-site args. Proof fn routing keeps using the pre-simplify
+    /// `vir_crate` because user-visible spec rendering wants the
+    /// original expression forms.
+    ///
+    /// Don't access this field directly — use `simplified_krate()`
+    /// so the "None means called before `verify_crate_inner`" case
+    /// is surfaced in the type signature and any caller explicitly
+    /// handles it.
     vir_crate_simplified: Option<Krate>,
     crate_name: Option<String>,
     crate_names: Option<Vec<String>>,
@@ -624,6 +630,19 @@ impl Verifier {
 
     fn get_bucket<'a>(&'a self, bucket_id: &BucketId) -> &'a Bucket {
         self.buckets.get(bucket_id).expect("expected valid BucketId")
+    }
+
+    /// Post-`ast_simplify` krate, or `None` if `verify_crate_inner`
+    /// hasn't populated it yet. Callers inside `verify_bucket` /
+    /// `verify_bucket_outer` (and everything they reach) run *after*
+    /// simplification, so `Some` is the normal case there — but
+    /// returning an `Option` makes the "not yet initialized" case
+    /// explicit in the type rather than hidden behind `.expect()`.
+    /// If a future caller is added outside the normal verification
+    /// flow, the compiler forces them to handle `None` rather than
+    /// silently panicking at runtime.
+    fn simplified_krate(&self) -> Option<&Krate> {
+        self.vir_crate_simplified.as_ref()
     }
 
     fn ensure_solver_log_dir(&mut self) -> Result<std::path::PathBuf, VirErr> {
@@ -1699,9 +1718,26 @@ impl Verifier {
                             // Use the post-simplify krate so dummy-param
                             // injection aligns with what SST call sites
                             // see — the pre-simplify `vir_crate` would
-                            // desynchronise on zero-arg fns.
-                            let vir_krate = self.vir_crate_simplified.as_ref()
-                                .expect("vir_crate_simplified should be initialized by verify_crate_inner before verify_bucket runs");
+                            // desynchronise on zero-arg fns. The
+                            // `None` branch can't fire in the current
+                            // pipeline (`verify_crate_inner` populates
+                            // this before calling `verify_bucket`), but
+                            // the Option in the type signature forces
+                            // future callers to acknowledge the timing.
+                            let vir_krate = match self.simplified_krate() {
+                                Some(k) => k,
+                                None => {
+                                    self.count_errors += 1;
+                                    reporter.report(&message(
+                                        MessageLevel::Error,
+                                        "tactus_auto: simplified krate not available — \
+                                         pipeline ordering bug (verify_crate_inner should \
+                                         run before verify_bucket)".to_string(),
+                                        fn_span,
+                                    ).to_any());
+                                    continue;
+                                }
+                            };
                             let vir_fn = match vir_krate.functions.iter()
                                 .find(|f| f.x.name == function.x.name)
                             {
