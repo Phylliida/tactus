@@ -11,7 +11,7 @@
 use vir::ast::*;
 use vir::sst::{BndX, CallFun, Exp, ExpX, InternalFun};
 use crate::lean_ast::{
-    BinOp as L, Binder as LBinder, BinderKind, Expr as LExpr, ExprNode,
+    substitute, BinOp as L, Binder as LBinder, BinderKind, Expr as LExpr, ExprNode,
 };
 use crate::lean_pp::pp_expr;
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
@@ -257,6 +257,47 @@ fn clip_to_node(src: &Typ, dst: &IntRange, inner: &Exp) -> ExprNode {
     }
 }
 
+/// Render a `CheckDecreaseHeight` arg with Verus's param-substitution
+/// `Bind(Let)` wrapper zeta-reduced. The normal `Bind(Let)` rendering
+/// emits `let x := v; body`, which defeats omega's let-handling when
+/// the bound name shadows a caller-scope variable (common in self-
+/// recursion: callee's decrease uses the callee's param names, which
+/// equal the caller's when self == callee). Substituting directly at
+/// the Lean AST level via `lean_ast::substitute` removes the shadow
+/// and leaves omega-friendly arithmetic.
+///
+/// Only descends through top-level `Bind(Let)` wrappers; other shapes
+/// render as-is via `sst_exp_to_ast`.
+fn render_checked_decrease_arg(e: &Exp) -> LExpr {
+    match &e.x {
+        // Peel transparent SST wrappers — poly Box/Unbox (inserted
+        // by Verus's Poly encoding for heterogeneous int types),
+        // mode coercions, and trigger markers all render identically
+        // to their inner expression via `exp_to_node` below. Peeling
+        // here lets us reach a Bind(Let) that sits underneath.
+        ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner)
+        | ExpX::Unary(UnaryOp::CoerceMode { .. } | UnaryOp::Trigger(_), inner) => {
+            render_checked_decrease_arg(inner)
+        }
+        ExpX::Bind(bnd, body) => match &bnd.x {
+            BndX::Let(binders) => {
+                let mut subst: std::collections::HashMap<String, LExpr> =
+                    std::collections::HashMap::new();
+                for b in binders.iter() {
+                    subst.insert(
+                        crate::to_lean_type::sanitize(&b.name.0),
+                        sst_exp_to_ast(&b.a),
+                    );
+                }
+                let body_rendered = render_checked_decrease_arg(body);
+                substitute(&body_rendered, &subst)
+            }
+            _ => sst_exp_to_ast(e),
+        },
+        _ => sst_exp_to_ast(e),
+    }
+}
+
 fn exp_to_node(e: &Exp) -> ExprNode {
     match &e.x {
         ExpX::Const(c) => const_to_node(c),
@@ -367,8 +408,15 @@ fn exp_to_node(e: &Exp) -> ExprNode {
             assert_eq!(args.len(), 3,
                 "CheckDecreaseHeight expects 3 args (cur, prev, otherwise), got {}",
                 args.len());
-            let cur = sst_exp_to_ast(&args[0]);
-            let prev = sst_exp_to_ast(&args[1]);
+            // `cur` is shaped as `let params = args in decrease_expr`
+            // (see `recursion::check_decrease_call`), i.e., Verus
+            // encodes parameter substitution via a BndX::Let. Render
+            // it with the let zeta-reduced so omega can see the
+            // substituted expression directly — nested `let n := tmp_;
+            // n` defeats omega's let-handling when self-recursion
+            // makes the bound name collide with a caller param.
+            let cur = render_checked_decrease_arg(&args[0]);
+            let prev = render_checked_decrease_arg(&args[1]);
             let otherwise = sst_exp_to_ast(&args[2]);
             // (0 ≤ cur ∧ cur < prev) ∨ (cur = prev ∧ otherwise)
             let lt_branch = LExpr::and(

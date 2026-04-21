@@ -122,7 +122,7 @@ use vir::sst::{
 };
 use vir::ast::{BinaryOp, Fun, FunctionX, KrateX, Typ, UnaryOp, UnaryOpr, VarIdent};
 use crate::lean_ast::{
-    and_all, Binder as LBinder, BinderKind, Expr as LExpr, Tactic, Theorem,
+    and_all, substitute, Binder as LBinder, BinderKind, Expr as LExpr, Tactic, Theorem,
 };
 use crate::to_lean_expr::vir_expr_to_ast;
 use crate::to_lean_sst_expr::{sst_exp_to_ast, type_bound_predicate};
@@ -683,18 +683,17 @@ fn build_call_conjunction(
         real_params_vec.len(), real_arg_refs.len(), callee.name.path,
     );
 
-    // Render each real arg's Lean expression once; reuse across the
-    // requires wrap and the ensures wrap.
-    let arg_asts: Vec<LExpr> = real_arg_refs.iter().map(|a| sst_exp_to_ast(a)).collect();
-
-    // Wrap a goal `inner` with `let p1 := arg1; let p2 := arg2; …;
-    // inner` so the callee's param names resolve to the caller's
-    // argument expressions without needing a tree-rewrite pass.
-    let wrap_with_arg_lets = |inner: LExpr| -> LExpr {
-        real_params_vec.iter().zip(arg_asts.iter()).rev().fold(inner, |acc, (p, arg_ast)| {
-            LExpr::let_bind(sanitize(&p.x.name.0), arg_ast.clone(), acc)
-        })
-    };
+    // Build param → arg substitution map. We substitute directly at
+    // the Lean AST level (via `lean_ast::substitute`) rather than
+    // emitting `let p := arg; body` wrappers. Direct substitution
+    // avoids name shadowing when callee and caller share a param
+    // name (e.g., self-recursion) — with let-wrapping the nested
+    // `let n := n - 1; ...; n` defeats omega's let-handling and
+    // required a `(simp_all; omega)` fallback in tactus_auto.
+    let subst: std::collections::HashMap<String, LExpr> = real_params_vec.iter()
+        .zip(real_arg_refs.iter())
+        .map(|(p, arg)| (sanitize(&p.x.name.0), sst_exp_to_ast(arg)))
+        .collect();
 
     let requires_conj = and_all(
         callee.require.iter().map(|e| vir_expr_to_ast(e)).collect()
@@ -703,7 +702,7 @@ fn build_call_conjunction(
         callee.ensure.0.iter().map(|e| vir_expr_to_ast(e)).collect()
     );
 
-    let requires_clause = wrap_with_arg_lets(requires_conj);
+    let requires_clause = substitute(&requires_conj, &subst);
 
     // Continuation under a havoc'd return value. If the callee's
     // return type is a tuple or unit with no declared ret name,
@@ -725,7 +724,7 @@ fn build_call_conjunction(
             None => rest_goal,
         };
         // ensures(ret) → bound_rest
-        let ensures_impl = LExpr::implies(wrap_with_arg_lets(ensures_conj), bound_rest);
+        let ensures_impl = LExpr::implies(substitute(&ensures_conj, &subst), bound_rest);
         // Optionally wrap with `h_bound(ret) → …`.
         let bounded_impl = match type_bound_predicate(&LExpr::var(ret_name_cal.clone()), &ret.typ) {
             Some(pred) => LExpr::implies(pred, ensures_impl),

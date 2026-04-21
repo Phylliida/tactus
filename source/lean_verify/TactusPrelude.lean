@@ -27,19 +27,12 @@ noncomputable def usize_hi : Int := (2 : Int) ^ arch_word_bits
 noncomputable def isize_hi : Int := (2 : Int) ^ (arch_word_bits - 1)
 
 -- Tactus: the *atomic closer* used at the leaves of the tactics we emit.
--- Intentionally kept to simple, always-closing tactics. Any structural
--- peeling (`refine ⟨?_, ?_⟩`, `intros`, etc.) is the codegen's job, not
--- this macro's: the emitter knows exactly what goal shape each theorem
--- has, and wraps the right structural tactics around `tactus_auto`
--- calls. See `sst_to_lean`'s loop-theorem emission.
---
--- `(simp_all; omega)` handles the case where `simp_all` normalizes
--- away structural clutter (disjunctions with `∧ False`, let-shadowed
--- vars from call-site parameter substitution, etc.) to leave a
--- straight arithmetic goal that omega can close. Without this rung,
--- `simp_all` would "succeed" in `first` with partial progress and the
--- residual goal would stay open unnoticed. Keep it before the plain
--- `simp_all` so we prefer the closing variant.
+-- Intentionally kept to simple, always-closing tactics — `rfl`,
+-- `decide`, `omega`, `simp_all`. Any structural peeling
+-- (`refine ⟨?_, ?_⟩`, `intros`, etc.) is the codegen's job, not this
+-- macro's: the emitter knows exactly what goal shape each theorem has,
+-- and wraps the right structural tactics around `tactus_auto` calls.
+-- See `sst_to_lean`'s loop-theorem emission.
 --
 -- `fail` turns "nothing worked" into a real error instead of a `sorry`.
 macro "tactus_auto" : tactic => `(tactic|
@@ -47,7 +40,6 @@ macro "tactus_auto" : tactic => `(tactic|
     | rfl
     | decide
     | omega
-    | (simp_all; omega)
     | simp_all
     | (fail "tactus: auto-tactic failed — add explicit proof block"))
 
