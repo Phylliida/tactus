@@ -1,8 +1,9 @@
 //! Translate VIR-AST expressions to `lean_ast::Expr`.
 
 use vir::ast::*;
+use crate::expr_shared::{apply_clip_coercion, binop_to_ast, const_to_node_common, non_binop_head};
 use crate::lean_ast::{
-    BinOp as L, Binder as LBinder, BinderKind, Expr as LExpr,
+    Binder as LBinder, BinderKind, Expr as LExpr,
     ExprNode, MatchArm as LMatchArm, Pattern as LPattern,
 };
 use crate::to_lean_type::{lean_name, sanitize, short_name, typ_to_expr};
@@ -58,21 +59,18 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
 
         ExprX::Unary(UnaryOp::Not, inner) => LExpr::not(vir_expr_to_ast(inner)).node,
         ExprX::Unary(UnaryOp::Clip { range, .. }, inner) => {
-            // Shared `renders_as_lean_int` with the SST path — the set
-            // of ranges that render as Lean `Int` vs `Nat` must agree
-            // across both renderers. Exec-fn callees inline their
-            // `require`/`ensure` via THIS path while their own
-            // theorems render via the SST path, so divergence here
+            // Shared `renders_as_lean_int` classifier + `clip_coercion_head`
+            // from `expr_shared` — the VIR-AST and SST paths must agree on
+            // both which ranges render as Lean `Int` vs `Nat` AND which
+            // coercion wrapper to emit at mixed-side boundaries. Exec-fn
+            // callees inline their `require`/`ensure` via THIS path while
+            // their own theorems render via the SST path; divergence here
             // would produce a different inlined spec than the callee
-            // proved. Extract-once keeps the two in lockstep.
+            // proved.
             use crate::to_lean_sst_expr::renders_as_lean_int;
             let src_int = matches!(&*inner.typ, TypX::Int(r) if renders_as_lean_int(r));
             let dst_int = renders_as_lean_int(range);
-            match (src_int, dst_int) {
-                (true, false) => apply("Int.toNat", vec![vir_expr_to_ast(inner)]),
-                (false, true) => apply("Int.ofNat", vec![vir_expr_to_ast(inner)]),
-                _ => expr_to_node(inner),
-            }
+            apply_clip_coercion(src_int, dst_int, vir_expr_to_ast(inner)).node
         }
         ExprX::Unary(UnaryOp::CoerceMode { .. }, inner)
         | ExprX::Unary(UnaryOp::Trigger(_), inner) => expr_to_node(inner),
@@ -247,12 +245,14 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
+/// Render a `Constant` — shared numeric/bool/string/char arms come from
+/// `expr_shared::const_to_node_common`; floats (rejected by the SST path)
+/// are handled locally with a type-annotated literal.
 fn const_to_node(c: &Constant) -> ExprNode {
+    if let Some(node) = const_to_node_common(c) {
+        return node;
+    }
     match c {
-        Constant::Bool(b) => ExprNode::LitBool(*b),
-        Constant::Int(n) => ExprNode::Lit(n.to_string()),
-        Constant::StrSlice(s) => ExprNode::LitStr(s.to_string()),
-        Constant::Char(c) => ExprNode::LitChar(*c),
         Constant::Real(s) => ExprNode::TypeAnnot {
             expr: Box::new(LExpr::new(ExprNode::Lit(s.to_string()))),
             ty: Box::new(var("Real")),
@@ -265,56 +265,8 @@ fn const_to_node(c: &Constant) -> ExprNode {
             expr: Box::new(LExpr::new(ExprNode::Lit(f64::from_bits(*bits).to_string()))),
             ty: Box::new(var("Float")),
         },
-    }
-}
-
-/// Map VIR binary ops we model structurally. `None` means "emit via Raw".
-fn binop_to_ast(op: &BinaryOp) -> Option<L> {
-    Some(match op {
-        BinaryOp::And => L::And,
-        BinaryOp::Or => L::Or,
-        BinaryOp::Implies => L::Implies,
-        BinaryOp::Eq(_) => L::Eq,
-        BinaryOp::Ne => L::Ne,
-        BinaryOp::Inequality(InequalityOp::Le) => L::Le,
-        BinaryOp::Inequality(InequalityOp::Lt) => L::Lt,
-        BinaryOp::Inequality(InequalityOp::Ge) => L::Ge,
-        BinaryOp::Inequality(InequalityOp::Gt) => L::Gt,
-        BinaryOp::Arith(ArithOp::Add(_)) => L::Add,
-        BinaryOp::Arith(ArithOp::Sub(_)) => L::Sub,
-        BinaryOp::Arith(ArithOp::Mul(_)) => L::Mul,
-        BinaryOp::Arith(ArithOp::EuclideanDiv(_)) => L::Div,
-        BinaryOp::Arith(ArithOp::EuclideanMod(_)) => L::Mod,
-        BinaryOp::RealArith(RealArithOp::Add) => L::Add,
-        BinaryOp::RealArith(RealArithOp::Sub) => L::Sub,
-        BinaryOp::RealArith(RealArithOp::Mul) => L::Mul,
-        BinaryOp::RealArith(RealArithOp::Div) => L::Div,
-        BinaryOp::Bitwise(BitwiseOp::BitAnd, _) => L::BitAnd,
-        BinaryOp::Bitwise(BitwiseOp::BitOr, _) => L::BitOr,
-        BinaryOp::Bitwise(BitwiseOp::BitXor, _) => L::BitXor,
-        BinaryOp::Bitwise(BitwiseOp::Shr(_), _) => L::Shr,
-        BinaryOp::Bitwise(BitwiseOp::Shl(_, _), _) => L::Shl,
-        // These aren't real Lean binary operators; callers route them through
-        // `App` with an explicit head name.
-        BinaryOp::Xor
-        | BinaryOp::HeightCompare { .. }
-        | BinaryOp::StrGetChar
-        | BinaryOp::Index(_, _)
-        | BinaryOp::IeeeFloat(_) => return None,
-    })
-}
-
-/// Head identifier used when a VIR binop is expressed as a 2-arg function
-/// call rather than a structural `BinOp`. Kept narrow: these all render
-/// harmlessly if the call ever gets executed — they're just stand-ins.
-fn non_binop_head(op: &BinaryOp) -> &'static str {
-    match op {
-        BinaryOp::Xor => "xor",
-        BinaryOp::HeightCompare { .. } => "Tactus.heightLt",
-        BinaryOp::StrGetChar => "String.get",
-        BinaryOp::Index(_, _) => "Tactus.index",
-        BinaryOp::IeeeFloat(_) => "Tactus.floatOp",
-        _ => "?",
+        // `const_to_node_common` returned `Some` for every non-float arm.
+        _ => unreachable!("const_to_node_common covers all non-float constants"),
     }
 }
 

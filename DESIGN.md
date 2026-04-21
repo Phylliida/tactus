@@ -929,7 +929,7 @@ Only the simplest `while` shape is accepted. All other loop shapes return `Err`.
 
 #### Architecture debts (working-but-not-ideal)
 
-* **Two parallel expression renderers.** `to_lean_expr.rs` (~500 lines, proof fn / callee spec inlining) and `to_lean_sst_expr.rs` (~550 lines, exec fn bodies) have largely-parallel per-variant dispatch. Shared helpers cover `type_bound_predicate`, `integer_type_bound_node`, `renders_as_lean_int` — but adding a new ExpX form requires editing both. Full unification (via a trait over source-expression type, or routing callee specs through SST) is the largest remaining cleanup. This is the only pending item on the session-end task list.
+* **Two parallel expression renderers — shared leaves extracted, deeper unification rejected.** `to_lean_expr.rs` (~495 lines, proof fn / callee spec inlining) and `to_lean_sst_expr.rs` (~565 lines, exec fn bodies) render structurally different trees: VIR-AST's `Block`/`Match`/`Ctor`/`PatternX`/`PlaceX` don't cross to SST; SST's `CheckDecreaseHeight`/`CallFun::InternalFun`/flattened statement sequence don't cross to VIR-AST. The shared rules — op tables, constant rendering, `Clip` coercion direction, binder construction — live in `expr_shared.rs` so divergence is a compile error. Full unification (trait over source-expression type, or routing callee specs through SST) was investigated and rejected; see the dedicated § "Two parallel expression renderers" above for the analysis.
 * **Two-pass over loop bodies.** `build_wp_loop` calls both `collect_modifications` and `build_wp` on the body; fusing would save a pass but entangles modifications with WP construction. Documented; left alone.
 * **Sanity-check allowlist maintained by hand.** Adding a prelude def (like `usize_hi`) requires remembering to update `sanity.rs`. No automated sync; compiler error on mismatch (panic in debug builds).
 * **Expected VIR variant list for coverage is hand-maintained.** `tactus_coverage.rs` lists variants we expect to see. Macro-deriving from the enum would need Verus-upstream `strum` derives — not feasible without vendoring changes.
@@ -1079,6 +1079,103 @@ The triangle these form:
 * Shape-drift tests catch *semantic shifts* at test time.
 
 Each closes a different hole.
+
+### Two parallel expression renderers — and why we didn't fully unify them
+
+Tactus has two expression renderers:
+
+* `to_lean_expr.rs` (~500 lines) — operates on VIR-AST's `Expr` /
+  `ExprX`. Used for spec fn bodies, proof fn requires / ensures /
+  goals, decreases clauses, and the **callee spec inlining** on
+  exec-fn call sites (the one spot where the exec-fn pipeline reaches
+  back into VIR-AST, because `FunctionX` holds specs in VIR-AST form).
+* `to_lean_sst_expr.rs` (~560 lines) — operates on SST's `Exp` /
+  `ExpX`. Used for exec fn bodies (via the WP pipeline) and the
+  `CheckDecreaseHeight` termination obligation specifically.
+
+~200 lines of the per-variant dispatch is structurally parallel: the
+four arithmetic binops, the comparison operators, `Var` / `VarLoc`
+rendering, `Clip` coercion, constant rendering for the non-float
+arms, the quantifier / lambda / choose binder construction.
+
+We investigated three approaches to eliminating the parallel work.
+
+**Approach 1: `trait SourceExpr` over both enum types.** Define a
+trait that both `vir::ast::Expr` and `vir::sst::Exp` implement,
+exposing methods like `is_var(&self) -> Option<&VarIdent>` or a
+normalized variant enum. One renderer dispatches on the trait.
+
+**Rejected.** Roughly half the variants don't cross the VIR-AST/SST
+boundary: VIR-AST has `Block` / `Match` / `Ctor` / `PatternX` /
+`PlaceX`; SST has `CheckDecreaseHeight` / `CallFun::InternalFun` /
+an already-flattened statement sequence. A shared trait would still
+need per-impl case-splits for the asymmetric half, net-rearranging
+boilerplate without eliminating it. Plus the trait methods would
+need to decide on a common representation of `ExprX::Call` (which
+has `CallTarget`) vs `ExpX::Call` (which has `CallFun`), and those
+are genuinely different shapes — the trait becomes a lossy
+compression layer that makes the asymmetric cases harder to reason
+about.
+
+**Approach 2: Route callee-spec inlining through SST.** Retire
+`to_lean_expr.rs` from the exec-fn path entirely. Before inlining a
+callee's `require` / `ensure` at a call site, run `ast_to_sst_func`
+(or a subset) on those clauses so they reach the inlining point as
+SST expressions.
+
+**Rejected.** `FuncCheckSst` is built per-fn during verification via
+`ast_to_sst_func::sst_for_function`, not prebuilt in the krate. So
+when verifying caller `A` we don't have callee `B`'s SST — we'd
+need to either invoke `ast_to_sst_func` on `B`'s spec on demand
+(invasive into Verus's verification entry points, with its own
+setup-context dependencies), or pre-SSTify every function in the
+krate upfront before verification begins (wasted work if only a
+subset of fns are verified). Also: this only removes the ONE shared
+site (call-site inlining). Proof fn bodies and spec fn bodies stay
+VIR-AST, so `to_lean_expr.rs` still exists — we'd trade
+"two renderers with a shared-helper layer" for "two renderers with
+an invasive SST-promotion step." Not an improvement.
+
+**Approach 3 (chosen): Shared leaves in `expr_shared.rs`.** Extract
+the rules that BOTH renderers must apply identically into a new
+module:
+
+* `binop_to_ast` — the VIR `BinaryOp` → Lean `BinOp` table.
+  Previously duplicated 33 lines × 2 with identical content.
+* `non_binop_head` — head identifier for binops without a structural
+  Lean equivalent (`Xor` → `"xor"`, `HeightCompare` →
+  `"Tactus.heightLt"`, etc.).
+* `const_to_node_common` — the non-float arms of `Constant`
+  (`Bool` / `Int` / `StrSlice` / `Char`). Returns `None` for floats;
+  each renderer handles floats locally (VIR-AST emits a
+  type-annotated literal; SST rejects as unsupported).
+* `clip_coercion_head` / `apply_clip_coercion` — resolve `(src_int,
+  dst_int)` to the Lean coercion wrapper name (`Int.toNat` /
+  `Int.ofNat` / passthrough).
+
+Plus the SST path now calls `to_lean_expr::vir_var_binders_to_ast`
+directly for `BndX::Quant` / `Lambda` / `Choose` binders (both sides
+use `VarBinders<Typ>`).
+
+Why this is the right level of unification:
+
+* Every rule that could silently diverge — op tables, coercion
+  wrappers, constant rendering, binder construction — is now in one
+  place. Editing one side would be a compile error at the other.
+* The asymmetric variants stay separate because they *are* separate
+  — pretending otherwise via a trait would be type-level
+  indirection without semantic win.
+* No invasive changes to Verus's pipeline. The new module imports
+  only `vir::ast` types and `lean_ast` types, so it's orthogonal to
+  both renderers' per-variant dispatch.
+
+Residual trade-off worth naming: each renderer still has its own
+recursive `exp_to_node` / `expr_to_node` walker, because the
+walker's dispatch is on the source-enum variant (which is
+asymmetric). Adding a new variant still requires editing both files
+*if* that variant corresponds to a shape that appears in both
+trees — in practice most new SST variants are exec-specific and
+don't touch the VIR-AST path, and vice versa.
 
 ### Scope and difficulty
 
