@@ -186,6 +186,21 @@ fn arg_skip(callee: &FunctionX) -> usize {
     if is_zero_arg_desugared(callee) { 1 } else { 0 }
 }
 
+/// Does this type bottom out at `TypX::Int(_)` once transparent
+/// wrappers (`Boxed`, `Decorate`) are peeled? Mirrors
+/// `vir::recursion::height_is_int` — for those types the `height`
+/// encoding is identity and `CheckDecreaseHeight` lowers to a plain
+/// `0 ≤ cur ∧ cur < prev` check (see `to_lean_sst_expr.rs`).
+fn is_int_height(typ: &Typ) -> bool {
+    match &**typ {
+        vir::ast::TypX::Int(_) => true,
+        vir::ast::TypX::Boxed(inner) | vir::ast::TypX::Decorate(_, _, inner) => {
+            is_int_height(inner)
+        }
+        _ => false,
+    }
+}
+
 /// Does this expression — or any transparently-wrapped inner — use
 /// `ExpX::Loc`? `Loc` marks an L-value (`&mut` argument site). We peel
 /// the same transparent wrappers as `lift_if_value` so a mutable borrow
@@ -224,10 +239,36 @@ fn check_exp(e: &Exp) -> Result<(), String> {
         ExpX::BinaryOpr(_, l, r) => { check_exp(l)?; check_exp(r) }
         ExpX::If(c, t, e) => { check_exp(c)?; check_exp(t)?; check_exp(e) }
         ExpX::Call(target, _, args) => {
-            if matches!(target, CallFun::InternalFun(_)) {
-                return Err("internal function calls not yet supported".to_string());
+            use vir::sst::InternalFun;
+            match target {
+                // `CheckDecreaseHeight` is Verus's auto-injected
+                // termination obligation for recursive calls. We
+                // support int-typed decreases (the common case) and
+                // lower in `sst_exp_to_ast`. Non-int decreases would
+                // need a Lean `height` function encoding — deferred.
+                CallFun::InternalFun(InternalFun::CheckDecreaseHeight) => {
+                    if args.len() != 3 {
+                        return Err(format!(
+                            "CheckDecreaseHeight expects 3 args (cur, prev, otherwise), got {}",
+                            args.len()
+                        ));
+                    }
+                    if !is_int_height(&args[0].typ) {
+                        return Err(format!(
+                            "recursive call termination check with non-int decrease \
+                             (type {:?}) not yet supported — only int decreases work today",
+                            args[0].typ
+                        ));
+                    }
+                    args.iter().try_for_each(check_exp)
+                }
+                CallFun::InternalFun(_) => Err(
+                    "internal function calls not yet supported".to_string()
+                ),
+                CallFun::Fun(_, _) | CallFun::Recursive(_) => {
+                    args.iter().try_for_each(check_exp)
+                }
             }
-            args.iter().try_for_each(check_exp)
         }
         ExpX::Bind(bnd, body) => {
             match &bnd.x {
@@ -601,10 +642,12 @@ fn build_loop_conjunction(
 /// `FunctionX::ret`). If the callee returns unit or the call discards
 /// its result, the `∀` is skipped and `dest` isn't bound.
 ///
-/// No termination obligation yet — calls to recursive fns (including
-/// self) will verify even when they're not actually well-founded.
-/// Fixing this requires a decreasing-measure comparison across the
-/// call (like loops have for their `decreases`).
+/// Termination obligations (for recursive calls, including mutual)
+/// are injected upstream by Verus's `recursion` pass as
+/// `StmX::Assert(InternalFun::CheckDecreaseHeight)` — they appear
+/// before the `StmX::Call` in the SST and flow through `walk` as
+/// normal assert items. The Lean lowering lives in
+/// `to_lean_sst_expr::sst_exp_to_ast`.
 fn build_call_conjunction(
     callee: &FunctionX,
     args: &[&Exp],
@@ -761,6 +804,15 @@ enum BodyItem<'a> {
     /// `callee` is the full VIR-AST `FunctionX` so `build_goal` has
     /// the requires / ensures / param list / return var all in one
     /// place. Args are borrowed from the SST.
+    ///
+    /// **Termination obligations for recursive calls** are handled
+    /// upstream by Verus itself (`vir::recursion`): right before each
+    /// recursive call, Verus inserts a `StmX::Assert(…)` containing
+    /// an `ExpX::Call(InternalFun::CheckDecreaseHeight, …)` that
+    /// encodes "callee's decrease strictly decreases from caller's."
+    /// So we get termination for free — including mutual recursion
+    /// across a whole SCC — as long as our SST translator knows how
+    /// to lower `CheckDecreaseHeight`. See `sst_exp_to_ast`.
     Call {
         callee: &'a FunctionX,
         args: Vec<&'a Exp>,
@@ -807,7 +859,10 @@ impl<'a> BodyItem<'a> {
 ///
 /// `type_map` is threaded through so loops can attach the type of each
 /// modified variable; `fn_map` is threaded so calls can look up the
-/// callee's `FunctionX`.
+/// callee's `FunctionX`. Termination obligations for recursive calls
+/// are emitted upstream by Verus as `StmX::Assert(InternalFun::
+/// CheckDecreaseHeight)` — they flow through here as ordinary
+/// asserts; `sst_exp_to_ast` handles the Lean-level lowering.
 fn walk<'a>(
     stm: &'a Stm,
     type_map: &HashMap<&'a VarIdent, &'a Typ>,
@@ -975,6 +1030,15 @@ fn walk_call<'a>(
         let typ = type_map.get(ident).copied()?;
         Some((ident, typ))
     });
+    // NOTE: termination obligation is emitted upstream by Verus's
+    // own `recursion::check_recursive_function` pass, which inserts a
+    // `StmX::Assert` wrapping `InternalFun::CheckDecreaseHeight`
+    // right before each recursive call (including mutual recursion
+    // across an SCC). Our walk sees that Assert as a normal
+    // `BodyItem::Assert`; the conjunct appears in the WP goal and
+    // `tactus_auto` / the user must discharge it. See
+    // `to_lean_sst_expr::call_fun_to_ast`'s `CheckDecreaseHeight`
+    // arm for the Lean lowering.
     Ok(vec![BodyItem::Call {
         callee,
         args: arg_refs,
