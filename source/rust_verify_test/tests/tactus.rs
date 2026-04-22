@@ -3118,6 +3118,30 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Generic call: the callee is parametric over `T`, and the call site
+// supplies `T = u8` via `typ_args`. `build_wp_call` used to reject
+// non-empty `typ_args` outright; now `lower_call` substitutes the
+// callee's `typ_params` with the call-site's `typ_args` (mapped
+// through `typ_to_expr`) into the rendered require/ensure, inlining
+// the spec at the concrete instantiation.
+test_verify_one_file! {
+    #[test] test_exec_call_generic verus_code! {
+        #[verifier::tactus_auto]
+        fn identity<T>(x: T) -> (r: T)
+            ensures r == x
+        {
+            x
+        }
+
+        #[verifier::tactus_auto]
+        fn use_identity(n: u8) -> (r: u8)
+            ensures r == n
+        {
+            identity(n)
+        }
+    } => Ok(())
+}
+
 // Multi-variant enum + pattern matching: **infrastructure landed,
 // automation gap remains**. `match` is desugared by ast_simplify into
 // an if-chain using `UnaryOpr::IsVariant` and `UnaryOpr::Field`, and

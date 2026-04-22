@@ -1025,15 +1025,19 @@ exec fns."
     the preamble omitted the struct/enum definition. Now walks
     the `init` Place.
 
-* **Generic calls (non-empty `typ_args`).** Currently rejected in
-  `build_wp_call` — blocks calls into generic callees like
-  `Vec::<T>::push`, `Option::<T>::unwrap`, any parametric
-  utility fn. Fix: substitute `typ_args` into the callee's spec at
-  inlining time (using the existing `substitute` at the type level,
-  or a new type-substitution pass on the rendered LExpr). Runtime
-  behaviour is generic-erasure in Lean (we already emit typ_params
-  as implicit binders in the callee's theorem); just need the
-  instantiation at call sites.
+* **Generic calls (non-empty `typ_args`) — LANDED.** Exec-fn calls
+  can now pass `typ_args` to a generic callee. `Wp::Call` carries
+  `typ_args: &'a [Typ]`; `lower_call` composes the value-param
+  subst with a type-param subst (mapping each `callee.typ_params`
+  name to the rendered `typ_args` via `typ_to_expr`) and applies
+  both to the inlined `require` / `ensure` via the existing
+  `lean_ast::substitute`. Works because `typ_to_expr`'s
+  `TypX::TypParam` arm renders as `Var(name)`, so the value-level
+  substitute rewrites type references in-place. Exec fns also now
+  emit `(T : Type)` binders at theorem level (via
+  `build_param_binders`), so generic exec fns have their
+  typ_params in scope. Regression: `test_exec_call_generic`
+  (identity over a generic T).
 
 * **Non-int `decreases` (Lean `height` function per datatype).**
   Currently `CheckDecreaseHeight` rejects non-int decrease types.

@@ -294,6 +294,17 @@ fn loop_tactic() -> Tactic {
 /// from these).
 fn build_param_binders(fn_sst: &FunctionSst) -> Vec<LBinder> {
     let mut out: Vec<LBinder> = Vec::new();
+    // Type parameters first, so value params can reference them in
+    // their types (`x : T`). Mirrors `to_lean_fn::fn_binders`'
+    // ordering so proof fns and exec fns present a consistent
+    // binder shape for the same fn signature.
+    for tp in fn_sst.x.typ_params.iter() {
+        out.push(LBinder {
+            name: Some(tp.to_string()),
+            ty: LExpr::var("Type"),
+            kind: BinderKind::Explicit,
+        });
+    }
     for p in fn_sst.x.pars.iter().filter(|p| !is_synthetic_param(p)) {
         let name = sanitize(&p.x.name.0);
         out.push(LBinder {
@@ -411,6 +422,11 @@ enum Wp<'a> {
         /// `&args[..]` gives us a `&'a [Exp]` with the same
         /// lifetime as the rest of the Wp.
         args: &'a [Exp],
+        /// Type arguments from the call site, one per `callee.typ_params`.
+        /// Used at lowering time to substitute each `TypParam(id)` in
+        /// the callee's require/ensure with the call site's concrete
+        /// type. Empty slice when the callee is non-generic.
+        typ_args: &'a [Typ],
         /// Caller's destination variable (`let x = foo(…)` → `Some("x")`;
         /// `foo(…);` → `None`). Only the name is needed — lowering emits
         /// `let dest := ret` inside the `∀ ret`, and `ret` already has
@@ -470,8 +486,8 @@ fn lower_wp(wp: &Wp<'_>, ctx: &WpCtx<'_>) -> LExpr {
         Wp::Loop { cond, invs, decrease, modified_vars, body, after } => {
             lower_loop(cond, invs, decrease, modified_vars, body, after, ctx)
         }
-        Wp::Call { callee, args, dest, after } => {
-            lower_call(callee, args, *dest, after, ctx)
+        Wp::Call { callee, args, typ_args, dest, after } => {
+            lower_call(callee, args, typ_args, *dest, after, ctx)
         }
     }
 }
@@ -552,6 +568,7 @@ fn lower_loop(
 fn lower_call(
     callee: &FunctionX,
     args: &[Exp],
+    typ_args: &[Typ],
     dest: Option<&VarIdent>,
     after: &Wp<'_>,
     ctx: &WpCtx<'_>,
@@ -563,11 +580,29 @@ fn lower_call(
          build_wp_call should have rejected this",
         params_vec.len(), args.len(), callee.name.path,
     );
+    assert_eq!(
+        callee.typ_params.len(), typ_args.len(),
+        "callee type param count {} != caller type arg count {} for {:?} — \
+         build_wp_call should have rejected this",
+        callee.typ_params.len(), typ_args.len(), callee.name.path,
+    );
 
-    let subst: std::collections::HashMap<String, LExpr> = params_vec.iter()
+    // Single substitution map combining:
+    //   * value params → call-site arg expressions (substituted directly
+    //     rather than via `let p := arg; body` wrapping — avoids
+    //     shadowing on self-recursion)
+    //   * type params → call-site type expressions (rendered via
+    //     typ_to_expr). `TypParam(T)` renders as `Var("T")` which the
+    //     value-level `substitute` then rewrites to the concrete type.
+    //     This is the only step needed to inline generic callees'
+    //     require/ensure at a specific instantiation.
+    let mut subst: std::collections::HashMap<String, LExpr> = params_vec.iter()
         .zip(args.iter())
         .map(|(p, arg)| (sanitize(&p.x.name.0), sst_exp_to_ast(arg)))
         .collect();
+    for (tp_name, tp_arg) in callee.typ_params.iter().zip(typ_args.iter()) {
+        subst.insert(sanitize(tp_name), typ_to_expr(tp_arg));
+    }
 
     let requires_conj = and_all(
         callee.require.iter().map(|e| vir_expr_to_ast(e)).collect()
@@ -579,7 +614,10 @@ fn lower_call(
 
     let ret = &callee.ret.x;
     let ret_name_cal = sanitize(&ret.name.0);
-    let ret_typ = typ_to_expr(&ret.typ);
+    // Also substitute typ_args in the return type — a callee
+    // `fn foo<T>(x: T) -> T` needs its return bound rendered with the
+    // concrete T, not with the Var("T") placeholder.
+    let ret_typ = substitute(&typ_to_expr(&ret.typ), &subst);
     let continuation_under_ret = {
         let after_lowered = lower_wp(after, ctx);
         let bound_rest = match dest {
@@ -846,11 +884,6 @@ fn build_wp_call<'a>(
             "calls with split-assertion error reporting are not yet supported".to_string()
         );
     }
-    if !typ_args.is_empty() {
-        return Err(
-            "calls to generic functions (non-empty type args) are not yet supported".to_string()
-        );
-    }
     let Some(callee) = ctx.fn_map.get(fun).copied() else {
         return Err(format!(
             "callee `{:?}` not found in the crate's function map — cross-crate calls are \
@@ -867,6 +900,17 @@ fn build_wp_call<'a>(
              arg-passing convention may be out of sync (both sides should be \
              post-ast_simplify); this would bind wrong variables if we proceeded",
             fun.path, param_count, args.len(),
+        ));
+    }
+    // Type params / type args must align — if a call site passes fewer
+    // types than the callee declared, substitution would leave some
+    // `TypParam(T)` references unsubstituted in the inlined spec.
+    if callee.typ_params.len() != typ_args.len() {
+        return Err(format!(
+            "callee `{:?}` declares {} type param(s) but call site passes {} type \
+             arg(s) — would leave type-param references unsubstituted in the \
+             inlined spec",
+            fun.path, callee.typ_params.len(), typ_args.len(),
         ));
     }
     for a in args.iter() {
@@ -888,6 +932,7 @@ fn build_wp_call<'a>(
     Ok(Wp::Call {
         callee,
         args: &args[..],
+        typ_args: &typ_args[..],
         dest: bound_dest,
         after: Box::new(after),
     })
