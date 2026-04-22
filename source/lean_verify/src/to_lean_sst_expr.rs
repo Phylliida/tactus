@@ -23,7 +23,10 @@
 
 use vir::ast::*;
 use vir::sst::{BndX, CallFun, Exp, ExpX, InternalFun};
-use crate::expr_shared::{binop_to_ast, clip_coercion_head, const_to_node_common};
+use crate::expr_shared::{
+    binop_to_ast, clip_coercion_head, const_to_node_common, ctor_node, field_access_name,
+    is_variant_node,
+};
 use crate::lean_ast::{substitute, Expr as LExpr, ExprNode};
 use crate::lean_pp::pp_expr;
 use crate::to_lean_expr::vir_var_binders_to_ast;
@@ -358,8 +361,23 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
         ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => {
             exp_to_node_checked(inner)?
         }
+        // Field projection: `x.name` / `x.0` / `x.val0`. Shared
+        // `field_access_name` with the VIR-AST path — for tuple-struct
+        // variants (`Dt::Path` + numeric field names) Lean's inductive
+        // emits fields as `val0` / `val1` etc., and VIR's match-arm
+        // desugaring lowers to `Field { field: "0", .. }`. Without the
+        // shared mapping the SST side would emit `.0` and Lean would
+        // reject it.
         ExpX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
-            LExpr::field_proj(sst_exp_to_ast_checked(inner)?, sanitize(&field_opr.field)).node
+            LExpr::field_proj(sst_exp_to_ast_checked(inner)?, field_access_name(field_opr)).node
+        }
+        // `IsVariant { datatype, variant }` is the desugared form
+        // `ast_simplify` produces when lowering `match scrutinee { Variant { … } => … }`
+        // into an if-chain (see `vir::ast_simplify::pattern_to_exprs_rec`).
+        // Shared with the VIR-AST renderer so the `is<Variant>` naming
+        // convention matches the one Lean auto-derives on inductives.
+        ExpX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => {
+            is_variant_node(variant, sst_exp_to_ast_checked(inner)?)
         }
         // `HasType(e, t)` — the refinement constraint for `e` to inhabit
         // `t`. For fixed-width ints (u8, i32, …) this is the bounds check
@@ -398,6 +416,24 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                     return Err(format!("unsupported binary op: {:?}", op));
                 }
                 _ => {}
+            }
+            // Fold `e ∧ true` / `true ∧ e` → `e`. `ast_simplify`'s
+            // match desugaring (`pattern_to_exprs_rec` on Wildcard)
+            // emits `Const(Bool(true))` as the per-arm "always true"
+            // base case and chains it with pattern tests via
+            // `BinaryOp::And`. The raw form produces `x.isFoo ∧ True`
+            // in the generated Lean — which type-checks but also
+            // requires `[Decidable …]` synthesis on the combined
+            // proposition for the surrounding `if`. Folding at the
+            // emission layer sidesteps both: we emit just `x.isFoo`,
+            // which is directly decidable.
+            if matches!(op, BinaryOp::And) {
+                if let ExpX::Const(Constant::Bool(true)) = &rhs.x {
+                    return exp_to_node_checked(lhs);
+                }
+                if let ExpX::Const(Constant::Bool(true)) = &lhs.x {
+                    return exp_to_node_checked(rhs);
+                }
             }
             let (l, r) = (sst_exp_to_ast_checked(lhs)?, sst_exp_to_ast_checked(rhs)?);
             match binop_to_ast(op) {
@@ -529,10 +565,21 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
 
         ExpX::NullaryOpr(_) => ExprNode::LitBool(true),
 
+        // Datatype constructors: render via the shared `ctor_node`
+        // so naming (named ctor with `.mk` fallback, anon tuple) agrees
+        // with the VIR-AST path. Exec fn bodies reach this arm when
+        // constructing structs/enums, e.g. `let p = Point { x: 1, y: 2 };`
+        // or `return Some(x);`. The required datatype declarations are
+        // brought into the Lean preamble by `dep_order::walk_expr`'s
+        // `ExprX::Ctor` case.
+        ExpX::Ctor(dt, variant, fields) => {
+            let rendered = fields.iter()
+                .map(|f| sst_exp_to_ast_checked(&f.a))
+                .collect::<Result<Vec<_>, _>>()?;
+            ctor_node(dt, variant, rendered)
+        }
+
         // Forms we don't know how to render.
-        ExpX::Ctor(..) => return Err(
-            "datatype constructors not yet supported in exec fns".to_string()
-        ),
         ExpX::CallLambda(..) => return Err(
             "closure calls not yet supported in exec fns".to_string()
         ),

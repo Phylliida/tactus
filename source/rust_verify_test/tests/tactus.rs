@@ -3099,12 +3099,13 @@ test_verify_one_file! {
     }
 }
 
-// Datatype constructor (Ctor) in exec fn body is rejected — we don't
-// render them yet (would need struct/enum → Lean inductive encoding).
-// The error comes from `sst_exp_to_ast_checked`'s Ctor arm, triggered
-// when walk validates the let-RHS expression.
+// Datatype constructor (Ctor) in exec fn body — struct construction
+// plus field access. Pinned: before #52 landed, this was rejected
+// with "datatype constructors not yet supported in exec fns".
+// Exercises `ExpX::Ctor` routed through the shared `ctor_node` helper
+// (`Dt::Path` + "mk" variant-segment for the sole-variant struct case).
 test_verify_one_file! {
-    #[test] test_exec_ctor_rejected verus_code! {
+    #[test] test_exec_ctor_struct verus_code! {
         struct Point { x: u8, y: u8 }
 
         #[verifier::tactus_auto]
@@ -3114,11 +3115,48 @@ test_verify_one_file! {
             let p = Point { x: 1, y: 2 };
             p.x + p.y
         }
+    } => Ok(())
+}
+
+// Multi-variant enum + pattern matching: **infrastructure landed,
+// automation gap remains**. `match` is desugared by ast_simplify into
+// an if-chain using `UnaryOpr::IsVariant` and `UnaryOpr::Field`, and
+// we now generate the corresponding `Type.is<Variant>` / `Type.<Variant>_<field>`
+// accessor fns in `datatype_to_cmds`. The generated Lean parses and
+// type-checks cleanly — but `tactus_auto` (`rfl | decide | omega |
+// simp_all`) can't close a goal that still contains a `match k with
+// …` expression, which is what the @[simp]-unfolded accessors reduce
+// to. The missing piece is case-analysis on the enum scrutinee; would
+// need `tactus_auto` to learn `cases <enum-typed-var> <;> simp_all
+// <;> omega` or similar. Tracked as a follow-up to #52.
+//
+// Confirmed: the generated Lean file's structural issues are gone.
+// Codegen is correct; automation is the remaining gap.
+test_verify_one_file! {
+    #[test] test_exec_match_enum_automation_gap verus_code! {
+        enum Kind { Foo(u8), Bar(u8) }
+
+        #[verifier::tactus_auto]
+        fn kind_value(k: Kind) -> (r: u8)
+            ensures r <= 100
+        {
+            match k {
+                Kind::Foo(x) => if x <= 100 { x } else { 0 },
+                Kind::Bar(y) => if y <= 100 { y } else { 0 },
+            }
+        }
     } => Err(err) => {
+        // Pin the current failure mode (auto-tactic failed with an
+        // unsolved goal containing `match k with`) so a future change
+        // that accidentally closes the goal without fixing the
+        // automation gap trips this test and prompts a re-evaluation.
         assert!(
-            err.errors.iter().any(|e| e.message.contains("datatype constructors")
-                || e.message.contains("not yet supported")),
-            "Ctor in exec fn body should be rejected, got: {:?}",
+            err.errors.iter().any(|e|
+                e.message.contains("auto-tactic failed") ||
+                e.message.contains("unsolved") ||
+                e.message.contains("match")
+            ),
+            "expected automation-gap failure on enum match, got: {:?}",
             err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
         );
     }

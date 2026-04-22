@@ -1,7 +1,10 @@
 //! Translate VIR-AST expressions to `lean_ast::Expr`.
 
 use vir::ast::*;
-use crate::expr_shared::{apply_clip_coercion, binop_to_ast, const_to_node_common, non_binop_head};
+use crate::expr_shared::{
+    apply_clip_coercion, binop_to_ast, const_to_node_common, ctor_node, field_access_name,
+    is_variant_node, non_binop_head,
+};
 use crate::lean_ast::{
     Binder as LBinder, BinderKind, Expr as LExpr,
     ExprNode, MatchArm as LMatchArm, Pattern as LPattern,
@@ -159,7 +162,7 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
             LExpr::field_proj(vir_expr_to_ast(inner), field_access_name(field_opr)).node
         }
         ExprX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => {
-            LExpr::field_proj(vir_expr_to_ast(inner), format!("is{}", variant)).node
+            is_variant_node(variant, vir_expr_to_ast(inner))
         }
         ExprX::UnaryOpr(UnaryOpr::HasType(t), inner) => {
             // Refinement invariant: `e < 2^n` for `U(n)`, `-2^(n-1) ≤ e ∧
@@ -327,51 +330,10 @@ fn trait_method_ref(fun: &Fun) -> LExpr {
     }
 }
 
-/// Map a VIR field access name to the one the Lean side expects.
-///
-/// * Anonymous tuple (`Dt::Tuple`) uses 0-indexed numeric fields like `"0"`
-///   and `"1"`; Lean's `Prod`-derived accessor is 1-indexed (`.1`, `.2`).
-///   So `"0"` → `"1"`, `"1"` → `"2"`, etc.
-/// * Tuple-struct variant (`Dt::Path` with numeric field names): our
-///   datatype emitter renames the fields to `val0` / `val1` / … (see
-///   `to_lean_fn::field_name`), so access must match.
-/// * Named struct fields pass through unchanged (after identifier
-///   sanitization).
-fn field_access_name(field_opr: &FieldOpr) -> String {
-    let raw = field_opr.field.as_str();
-    let numeric = raw.parse::<usize>().ok();
-    match (&field_opr.datatype, numeric) {
-        (Dt::Tuple(_), Some(n)) => (n + 1).to_string(),
-        (Dt::Path(_), Some(n)) => format!("val{}", n),
-        _ => sanitize(raw),
-    }
-}
 
 fn ctor_to_node(dt: &Dt, variant: &Ident, fields: &Binders<Expr>) -> ExprNode {
-    match dt {
-        Dt::Path(path) => {
-            let type_name = lean_name(path);
-            let variant_seg = if variant.as_str() == short_name(path) {
-                "mk".to_string()
-            } else {
-                sanitize(variant)
-            };
-            let head = format!("{}.{}", type_name, variant_seg);
-            if fields.is_empty() {
-                ExprNode::Var(head)
-            } else {
-                ExprNode::App {
-                    head: Box::new(var(&head)),
-                    args: fields.iter().map(|f| vir_expr_to_ast(&f.a)).collect(),
-                }
-            }
-        }
-        // Anonymous tuple → Lean anonymous constructor `⟨a, b, c⟩`, which
-        // elaborates against the tuple's product type.
-        Dt::Tuple(_) => ExprNode::Anon(
-            fields.iter().map(|f| vir_expr_to_ast(&f.a)).collect()
-        ),
-    }
+    let rendered = fields.iter().map(|f| vir_expr_to_ast(&f.a)).collect();
+    ctor_node(dt, variant, rendered)
 }
 
 /// Fold a VIR `Block` into nested Lean lets.

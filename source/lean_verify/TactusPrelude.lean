@@ -2,6 +2,18 @@
 set_option linter.unusedVariables false
 set_option maxHeartbeats 800000
 
+-- Classical logic: Tactus specs are Prop-valued (mirroring Verus's
+-- spec-mode semantics), and exec fn WP goals embed them inside `if
+-- <Prop> then … else …` expressions. The `if/ite` elaborator requires
+-- `[Decidable P]` for each such P. For match-defined discriminators
+-- like `Type.isFoo` (synthesized by `datatype_to_cmds` for multi-
+-- variant inductives) Lean doesn't derive Decidable automatically, so
+-- we promote all Props to Decidable via Classical. Cost: `decide`
+-- won't reduce through these to concrete truth values, but exec-fn
+-- automation already uses `omega` / `simp_all` rather than `decide`.
+open Classical in
+attribute [instance] Classical.propDecidable
+
 -- Architecture word size for `usize` / `isize`. Kept as an opaque
 -- `Nat` plus a validity axiom — concrete values come from the build
 -- target. `IntegerTypeBound::ArchWordBits` renders as `arch_word_bits`;
