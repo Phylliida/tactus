@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**161 end-to-end tests + 1 coverage test + 104 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**163 end-to-end tests + 1 coverage test + 104 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), and arithmetic with overflow checking. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args, no generic calls, no break/continue — see DESIGN.md § "Known deferrals").
 
@@ -65,6 +65,8 @@ Net -59 lines (including fuller docstrings) and green on first compile — the t
 - **dep_order fix** (incidental): `walk_expr` was skipping `StmtX::Decl { init, .. }`, which meant `let p = Ctor(...)` missed the datatype reference and the preamble omitted the struct/enum definition. Fixed to walk the init `Place`.
 
 Deferred to task #58: **automation** for enum pattern matching. The desugared if-chain over discriminators + @[simp]-unfolded accessors is structurally correct (Lean elaborates, types check), but `tactus_auto` (`rfl | decide | omega | simp_all`) can't case-split the enum scrutinee to close the residual `match k with | Variant _ => …` subterms. Current state pinned by `test_exec_match_enum_automation_gap`.
+
+**Generic calls in exec fns (#53).** `Wp::Call` now carries `typ_args: &'a [Typ]`. `build_wp_call` validates both param/arg and typ_param/typ_arg alignment (would have bound wrong values silently otherwise). `lower_call` composes the existing value-param subst with a type-param subst (each typ_arg rendered via `typ_to_expr` into an LExpr), then applies both through the shared `lean_ast::substitute` — works in one pass because `TypX::TypParam` renders as `Var(name)`, which the value-level substitute rewrites in-place. Return-type rendering runs through the same substitute so `fn foo<T>(x: T) -> T` gets its ret type instantiated at the call site. `build_param_binders` now emits `(T : Type)` binders at the theorem level so generic exec fns have their typ_params in scope — matching `fn_binders`' ordering for proof fns. Test: `test_exec_call_generic`.
 
 ## Architecture
 
