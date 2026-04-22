@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 use vir::ast::*;
 use crate::lean_ast::{
-    and_all, Binder as LBinder, BinderKind, Class, ClassMethod, Datatype,
+    and_all, Binder as LBinder, BinderKind, Class, ClassMethod, Command, Datatype,
     DatatypeKind, Def, Expr as LExpr, ExprNode, Field, Instance, InstanceMethod,
-    Theorem, Tactic, Variant,
+    MatchArm, Pattern as LPattern, Theorem, Tactic, Variant,
 };
 use crate::to_lean_expr::vir_expr_to_ast;
 use crate::to_lean_type::{lean_name, sanitize, short_name, typ_to_expr};
@@ -84,16 +84,46 @@ pub fn proof_fn_to_ast(f: &FunctionX, tactic_body: &str) -> Theorem {
 
 // ── Datatype ────────────────────────────────────────────────────────────
 
-pub fn datatype_to_ast(dt: &DatatypeX) -> Option<Datatype> {
+/// Emit a datatype declaration plus, for multi-variant inductives,
+/// the per-variant discriminator (`Type.is<Variant>`) and accessor
+/// (`Type.<Variant>_<field>`) defs that exec-fn match-desugaring
+/// references.
+///
+/// Why accessors: Lean's `structure` auto-derives field accessors
+/// (`Point.x`), so single-variant structs work out of the box. But
+/// `inductive` doesn't auto-derive per-variant discriminators or
+/// field accessors — in Lean you normally pattern-match on the value.
+/// Exec fns reach this path because `ast_simplify` lowers `match` to
+/// an if-chain built from `UnaryOpr::IsVariant` + `UnaryOpr::Field`,
+/// and the desugared form expects accessor fns to exist. So we
+/// synthesise them.
+///
+/// `emit_accessors` controls whether the accessor defs are produced.
+/// The exec-fn preamble passes `true` — the desugared if-chain
+/// needs them. The proof-fn preamble passes `false` — proof fns
+/// render match as native Lean match (spec fns preserve match
+/// through to VIR-AST), never reach the desugared Field/IsVariant
+/// form, and don't benefit from accessors. More importantly,
+/// emitting accessors for datatypes that proof fns reference but
+/// whose field types lack `Inhabited` (the accessor's fallback
+/// case calls `default`) breaks Lean elaboration even when the
+/// accessor is never called.
+///
+/// Returns an empty `Vec` for `Dt::Tuple` (no declaration needed —
+/// tuples are rendered as `T × U` products).
+pub fn datatype_to_cmds(dt: &DatatypeX, emit_accessors: bool) -> Vec<Command> {
     let (path, short) = match &dt.name {
         Dt::Path(p) => (lean_name(p), short_name(p).to_string()),
-        Dt::Tuple(_) => return None,
+        Dt::Tuple(_) => return vec![],
     };
     let typ_params: Vec<String> = dt.typ_params.iter()
         .map(|(id, _)| id.to_string())
         .collect();
 
-    let kind = if dt.variants.len() == 1 && dt.variants[0].name.as_str() == short {
+    let is_single_variant_struct =
+        dt.variants.len() == 1 && dt.variants[0].name.as_str() == short;
+
+    let kind = if is_single_variant_struct {
         let variant = &dt.variants[0];
         DatatypeKind::Structure {
             fields: variant.fields.iter().map(|f| Field {
@@ -112,7 +142,145 @@ pub fn datatype_to_ast(dt: &DatatypeX) -> Option<Datatype> {
             }).collect(),
         }
     };
-    Some(Datatype { name: path, typ_params, kind })
+
+    let mut cmds = vec![Command::Datatype(Datatype {
+        name: path.clone(),
+        typ_params: typ_params.clone(),
+        kind,
+    })];
+    if !is_single_variant_struct && emit_accessors {
+        cmds.extend(multi_variant_accessor_defs(dt, &path));
+    }
+    cmds
+}
+
+/// Emit `Type.is<Variant>` discriminators and `Type.<Variant>_<field>`
+/// accessors for each (variant, field) pair on a multi-variant
+/// inductive.
+///
+/// Discriminator: `def Type.isFoo : Type → Bool := fun x => match x
+/// with | Type.Foo .. => true | _ => false` — one per variant,
+/// regardless of whether the variant carries fields. `is_variant_node`
+/// in `expr_shared.rs` emits `x.isFoo` references that resolve here.
+///
+/// Accessor: `noncomputable def Type.Foo_val0 : Type → FieldTy :=
+/// fun x => match x with | Type.Foo v _ => v | _ => Classical.arbitrary _`
+/// — one per (variant, field) pair. The `_` patterns ignore the other
+/// fields in that variant; other variants get `Classical.arbitrary _`
+/// because those cases are unreachable when the user's code guards
+/// the projection with a prior `isVariant` check, but Lean still
+/// requires the match to be total. `Classical.arbitrary` needs
+/// `Nonempty` — fine for the primitive types exec-fn match-desugaring
+/// actually reaches (ints, bools, references).
+fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> {
+    let mut cmds = Vec::new();
+    let x_binder = || LBinder {
+        name: Some("x".into()),
+        ty: LExpr::var(type_name),
+        kind: BinderKind::Explicit,
+    };
+    let match_on_x = |arms: Vec<MatchArm>| LExpr::new(ExprNode::Match {
+        scrutinee: Box::new(LExpr::var("x")),
+        arms,
+    });
+
+    // Discriminators: `def Type.isFoo (x : Type) : Prop := match x with …`.
+    // Lean's `inductive` doesn't auto-derive these (only `structure` does);
+    // `is_variant_node` in `expr_shared.rs` emits `x.isFoo` references that
+    // resolve here.
+    //
+    // **Prop, not Bool.** Verus's `TypX::Bool` renders as Lean `Prop`
+    // (see `to_lean_type::typ_to_expr`). The desugared match-test
+    // (`pattern_to_exprs` in ast_simplify) builds expressions typed
+    // `TypX::Bool` and combines them with `BinaryOp::And` — which
+    // maps to Lean `∧ : Prop → Prop → Prop`. So everything in that
+    // chain must be `Prop`. Returning `Bool` would cause the `And`
+    // between `x.isFoo` (Bool) and `True` (from the wildcard base
+    // case) to be a Prop/Bool mismatch.
+    for v in dt.variants.iter() {
+        let var_san = sanitize(&v.name);
+        let wildcards: Vec<LPattern> = v.fields.iter().map(|_| LPattern::Wildcard).collect();
+        cmds.push(Command::Def(Def {
+            // `@[simp]`: let `simp_all` unfold the discriminator so
+            // `tactus_auto` can close exec-fn goals that turn on a
+            // pattern test. Without this, `k.isFoo` stays opaque and
+            // the downstream `omega` / `simp_all` can't case-split
+            // the enum.
+            attrs: vec!["simp".into()],
+            name: format!("{}.is{}", type_name, var_san),
+            binders: vec![x_binder()],
+            ret_ty: LExpr::var("Prop"),
+            body: match_on_x(vec![
+                MatchArm {
+                    pattern: LPattern::Ctor {
+                        name: format!("{}.{}", type_name, var_san),
+                        args: wildcards,
+                    },
+                    body: LExpr::lit_bool(true),
+                },
+                MatchArm {
+                    pattern: LPattern::Wildcard,
+                    body: LExpr::lit_bool(false),
+                },
+            ]),
+            termination_by: vec![],
+        }));
+    }
+
+    // Accessors: `def Type.Foo_val0 (x : Type) : FieldTy := match x with
+    //   | Type.Foo v _ _ => v | _ => Classical.arbitrary _`.
+    // One per (variant, field) pair. The `_` patterns ignore the other
+    // fields in that variant; other variants get `Classical.arbitrary _`
+    // — unreachable in practice (the desugared match guards with a
+    // prior `isVariant` check), but Lean requires totality.
+    // `Classical.arbitrary` needs `[Nonempty α]`, which is auto-derived
+    // for the primitive types exec-fn match-desugaring actually reaches.
+    for v in dt.variants.iter() {
+        let var_san = sanitize(&v.name);
+        for (idx, f) in v.fields.iter().enumerate() {
+            let field_local = format!("_tactus_field_{}", idx);
+            let binders_pat: Vec<LPattern> =
+                (0..v.fields.len()).map(|i| if i == idx {
+                    LPattern::Var(field_local.clone())
+                } else {
+                    LPattern::Wildcard
+                }).collect();
+            cmds.push(Command::Def(Def {
+                // `@[simp]` for the same reason as the discriminator:
+                // `simp_all` should unfold the accessor before `omega`
+                // tries to reason about its result. Without this the
+                // accessor is opaque and goals involving it get stuck.
+                attrs: vec!["simp".into()],
+                name: format!("{}.{}_{}", type_name, var_san, field_name(&f.name)),
+                binders: vec![x_binder()],
+                ret_ty: typ_to_expr(&f.a.0),
+                body: match_on_x(vec![
+                    MatchArm {
+                        pattern: LPattern::Ctor {
+                            name: format!("{}.{}", type_name, var_san),
+                            args: binders_pat,
+                        },
+                        body: LExpr::var(field_local),
+                    },
+                    MatchArm {
+                        pattern: LPattern::Wildcard,
+                        // `default` resolves via `[Inhabited α]`, which
+                        // Lean derives automatically for primitive
+                        // types (Int, Nat, Bool) — the types exec-fn
+                        // match-desugaring actually reaches. Users
+                        // with custom field types may need a manual
+                        // `instance : Inhabited Foo := ⟨…⟩`.
+                        // Unreachable anyway when call sites guard
+                        // the accessor with a prior isVariant check.
+                        body: LExpr::var("default"),
+                    },
+                ]),
+                termination_by: vec![],
+            }));
+        }
+    }
+
+    cmds
 }
 
 // ── Trait (Lean `class`) ───────────────────────────────────────────────

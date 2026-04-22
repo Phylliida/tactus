@@ -31,9 +31,12 @@
 //! makes divergence a compile error rather than a runtime
 //! disagreement.
 
-use vir::ast::{ArithOp, BinaryOp, BitwiseOp, Constant, InequalityOp, RealArithOp};
+use vir::ast::{
+    ArithOp, BinaryOp, BitwiseOp, Constant, Dt, FieldOpr, Ident, InequalityOp, RealArithOp,
+};
 
 use crate::lean_ast::{BinOp as L, Expr as LExpr, ExprNode};
+use crate::to_lean_type::{lean_name, sanitize, short_name};
 
 /// Map a VIR/SST binary op to its structural Lean `BinOp` representation.
 ///
@@ -136,5 +139,101 @@ pub(crate) fn apply_clip_coercion(src_int: bool, dst_int: bool, inner: LExpr) ->
     match clip_coercion_head(src_int, dst_int) {
         Some(head) => LExpr::app1(LExpr::var(head), inner),
         None => inner,
+    }
+}
+
+/// Build a Lean constructor expression from an already-rendered
+/// `Vec<LExpr>` of field values.
+///
+/// * `Dt::Path(path)` + variant → named ctor `TypeName.variant arg₁ arg₂ …`,
+///   with the special case that a struct's sole variant (whose name
+///   equals the type's short name) renders as `TypeName.mk` —
+///   matching Lean's auto-generated `.mk` for single-field-group
+///   inductives.
+/// * `Dt::Tuple(_)` → Lean anonymous constructor `⟨a, b, c⟩`, which
+///   elaborates against the tuple's product type.
+///
+/// Both expression renderers (VIR-AST and SST) use this so the ctor
+/// naming convention can't drift between the proof-fn / spec-fn path
+/// and the exec-fn WP path. Caller is responsible for rendering the
+/// fields via their respective per-tree walker.
+pub(crate) fn ctor_node(
+    dt: &Dt,
+    variant: &Ident,
+    rendered_fields: Vec<LExpr>,
+) -> ExprNode {
+    match dt {
+        Dt::Path(path) => {
+            let type_name = lean_name(path);
+            let variant_seg = if variant.as_str() == short_name(path) {
+                "mk".to_string()
+            } else {
+                sanitize(variant)
+            };
+            let head = format!("{}.{}", type_name, variant_seg);
+            if rendered_fields.is_empty() {
+                ExprNode::Var(head)
+            } else {
+                ExprNode::App {
+                    head: Box::new(LExpr::var(head)),
+                    args: rendered_fields,
+                }
+            }
+        }
+        Dt::Tuple(_) => ExprNode::Anon(rendered_fields),
+    }
+}
+
+/// Render the `is_<variant>` discriminator for a `UnaryOpr::IsVariant`
+/// applied to an already-rendered receiver expression. Lean's inductive
+/// derivation provides these accessors automatically: `x.isSome` for
+/// `Option.Some`, `x.isOk` for `Result.Ok`, etc. Both renderers call
+/// this so the naming convention stays consistent.
+pub(crate) fn is_variant_node(variant: &Ident, inner: LExpr) -> ExprNode {
+    LExpr::field_proj(inner, format!("is{}", variant)).node
+}
+
+/// Map a VIR field access to the Lean side's field name.
+///
+/// * Anonymous tuple (`Dt::Tuple`) uses 0-indexed numeric fields like
+///   `"0"` / `"1"`; Lean's `Prod`-derived accessor is 1-indexed
+///   (`.1`, `.2`), so `"0"` → `"1"`, `"1"` → `"2"`, etc.
+/// * Single-variant struct (`Dt::Path` where the variant name equals
+///   the type's short name) uses the structure-auto-derived accessor
+///   names: numeric `"0"` → `"val0"`, named fields pass through
+///   (after sanitization). Lean's `structure` auto-derives these.
+/// * Multi-variant enum (`Dt::Path` where the variant name differs
+///   from the type's short name) routes through the per-variant
+///   accessor fns emitted by `datatype_to_cmds` — numeric field
+///   becomes `"<Variant>_val<n>"`, named field becomes
+///   `"<Variant>_<field>"`. Lean's `inductive` doesn't auto-derive
+///   field accessors, so we synthesise `def Kind.Foo_val0 : Kind → …`
+///   alongside the inductive declaration.
+///
+/// Shared between the VIR-AST and SST renderers so the naming rule
+/// lives in one place. Divergence would make match-arm desugaring
+/// (exec path) reference a field name that the accessor-fn emission
+/// (preamble path) doesn't define — silent Lean "invalid field"
+/// failure.
+pub(crate) fn field_access_name(field_opr: &FieldOpr) -> String {
+    let raw = field_opr.field.as_str();
+    let numeric = raw.parse::<usize>().ok();
+    match (&field_opr.datatype, numeric) {
+        (Dt::Tuple(_), Some(n)) => (n + 1).to_string(),
+        (Dt::Path(path), _) => {
+            let type_short = short_name(path);
+            let variant = field_opr.variant.as_str();
+            let is_single_variant = variant == type_short;
+            let field_seg = match numeric {
+                Some(n) => format!("val{}", n),
+                None => sanitize(raw),
+            };
+            if is_single_variant {
+                field_seg
+            } else {
+                format!("{}_{}", sanitize(variant), field_seg)
+            }
+        }
+        _ => sanitize(raw),
     }
 }

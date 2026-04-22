@@ -73,6 +73,13 @@ fn krate_preamble(
     imports: &[String],
     crate_name: &str,
     root_fns: &[&FunctionX],
+    // `true` for the exec-fn entry point — exec-fn WPs contain
+    // desugared match expressions (via `IsVariant` / `Field`) that
+    // need accessor fns. `false` for the proof-fn entry point —
+    // proof fns render match natively and don't need accessors,
+    // and emitting accessors for types with non-Inhabited fields
+    // breaks Lean elaboration even when unused.
+    emit_accessors: bool,
 ) -> (Vec<Command>, String) {
     let mut cmds: Vec<Command> = Vec::new();
     for imp in imports {
@@ -99,9 +106,7 @@ fn krate_preamble(
     for dt in &krate.datatypes {
         if let Dt::Path(p) = &dt.x.name {
             if refs.datatypes.contains(short_name(p)) {
-                if let Some(d) = to_lean_fn::datatype_to_ast(&dt.x) {
-                    cmds.push(Command::Datatype(d));
-                }
+                cmds.extend(to_lean_fn::datatype_to_cmds(&dt.x, emit_accessors));
             }
         }
     }
@@ -164,7 +169,11 @@ pub fn check_proof_fn(
     imports: &[String],
     crate_name: &str,
 ) -> CheckResult {
-    let (mut cmds, ns) = krate_preamble(krate, imports, crate_name, &[proof_fn]);
+    // Proof fns render match expressions natively (spec fns
+    // preserve match through to VIR-AST), so accessor fns are
+    // unnecessary and would fail elaboration for enum types whose
+    // field types lack Inhabited.
+    let (mut cmds, ns) = krate_preamble(krate, imports, crate_name, &[proof_fn], false);
     cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body)));
     cmds.push(Command::NamespaceClose(ns));
 
@@ -221,7 +230,10 @@ pub fn check_exec_fn(
         )),
     };
 
-    let (mut cmds, ns) = krate_preamble(krate, imports, crate_name, &[vir_fn]);
+    // Exec fns lower matches to if-chains over `IsVariant` and
+    // `Field`, which the SST renderer routes to the synthesised
+    // accessor fns — so the preamble must include them.
+    let (mut cmds, ns) = krate_preamble(krate, imports, crate_name, &[vir_fn], true);
     for theorem in theorems {
         cmds.push(Command::Theorem(theorem));
     }

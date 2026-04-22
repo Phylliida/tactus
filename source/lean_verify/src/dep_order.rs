@@ -245,7 +245,20 @@ fn walk_expr<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
             if let Some(e) = e { walk_expr(e, visit); }
         }
         ExprX::Block(stmts, final_e) => {
-            for s in stmts.iter() { if let StmtX::Expr(e) = &s.x { walk_expr(e, visit); } }
+            for s in stmts.iter() {
+                match &s.x {
+                    StmtX::Expr(e) => walk_expr(e, visit),
+                    // `let p = e;` — the initializer is a `Place` that may
+                    // hide a `Ctor` / `Call` / `Match` inside its `Temporary`
+                    // arm. Previously we missed these entirely, so any exec
+                    // fn whose only Ctor ref was in a let-RHS (e.g.,
+                    // `let p = Point { x: 1, y: 2 };`) would have its
+                    // datatype dropped from the Lean preamble, producing
+                    // unresolved `Point.mk` references. Walk the place.
+                    StmtX::Decl { init: Some(init), .. } => walk_place(&init.x, visit),
+                    StmtX::Decl { init: None, .. } => {}
+                }
+            }
             if let Some(e) = final_e { walk_expr(e, visit); }
         }
         ExprX::Multi(_, es) | ExprX::ArrayLiteral(es) => {

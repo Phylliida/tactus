@@ -987,16 +987,43 @@ exec fns."
 
 ##### Tier 2 — realistic-code unblockers (2–4 days each)
 
-* **`ExpX::Ctor` + pattern matching in exec fns.** Blocks any exec
-  code that constructs enum/struct values or matches on them — i.e.,
-  most real Rust. Fix: lower `ExpX::Ctor` to Lean anonymous
-  constructor (`⟨a, b⟩`) for `Dt::Tuple` or named ctor
-  (`TypeName.variant …`) for `Dt::Path`; add `StmX::Match`-or-body-
-  level `Wp::Match { scrutinee, arms }` variant; emit
-  `match scrutinee with | Pat₁ => wp(body₁) | …`. Datatype
-  definitions need to be in `krate_preamble` for the ctor types used
-  in exec bodies (some are; needs audit). Regression: remove
-  `test_exec_ctor_rejected` once landed.
+* **`ExpX::Ctor` + pattern matching in exec fns — partially landed.**
+  * **Struct Ctor + field access: works end-to-end.** `ExpX::Ctor`
+    for `Dt::Path` with a sole variant renders as `TypeName.mk arg₁
+    arg₂ …` via the shared `ctor_node` helper in `expr_shared`.
+    Field access via `structure`-auto-derived accessors. Test:
+    `test_exec_ctor_struct`.
+  * **Enum ctor: works.** `ExpX::Ctor` for multi-variant `Dt::Path`
+    renders as `TypeName.Variant arg₁ arg₂ …`.
+  * **Infrastructure for enum match: landed.** `datatype_to_cmds`
+    emits per-variant discriminator fns (`Type.isVariant : Type →
+    Prop`, body = `match x with | Type.Variant _ => True | _ =>
+    False`) and accessor fns (`Type.Variant_val0 : Type → FieldTy`,
+    fallback `default`). `field_access_name` routes
+    multi-variant `Field` projections to the accessor naming
+    (`Variant_val0`). `Classical.propDecidable` is opened in the
+    prelude so match-defined Props decide in `if`-contexts.
+    Accessor emission is guarded (`emit_accessors: bool` on
+    `krate_preamble`) to run only for the exec-fn entry point —
+    spec/proof fns preserve native Lean match, and emitting
+    accessors for types with non-Inhabited fields (which spec fns
+    routinely use) breaks Lean elaboration via the `default`
+    fallback.
+  * **Enum match automation: deferred (task #58).** The desugared
+    if-chain over discriminators + @[simp]-unfolded accessors is
+    structurally correct, but `tactus_auto` (`rfl | decide | omega
+    | simp_all`) can't case-split on the scrutinee to close the
+    residual `match k with …` subterms. Needs either a
+    `cases`-introducing step in `tactus_auto` / `tactus_peel`, a
+    new `tactus_cases` tactic that scans enum-typed hypotheses, or
+    codegen-level `rcases k` insertion when the body matches on k.
+    Current state pinned by `test_exec_match_enum_automation_gap`
+    (an Err expectation).
+  * **Dep_order regression fixed along the way.** `walk_expr`
+    previously skipped `StmtX::Decl { init, .. }`, so
+    `let p = Ctor(...)` missed the Ctor's datatype reference and
+    the preamble omitted the struct/enum definition. Now walks
+    the `init` Place.
 
 * **Generic calls (non-empty `typ_args`).** Currently rejected in
   `build_wp_call` — blocks calls into generic callees like

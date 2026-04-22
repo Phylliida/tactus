@@ -258,6 +258,10 @@ fn name_resolves(name: &str, defined: &HashSet<String>, scope: &HashSet<String>)
         | "List" | "Array" | "Option" | "Prod" | "Sum" | "Unit" | "Empty"
         | "And" | "Or" | "Not" | "Iff"
         | "True" | "False"
+        // `default` resolves via the `Inhabited` typeclass — auto-derived
+        // for primitive types. Used as the fallback value in synthesized
+        // accessor functions for multi-variant inductives.
+        | "default"
         | "()"
         // Tactus prelude axioms / defs / macros — resolved by the
         // `Command::Raw` block in the preamble, not by our own
