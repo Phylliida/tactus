@@ -2025,37 +2025,35 @@ pub(crate) fn expr_to_vir_innermost<'tcx>(
                 invariant_block_to_vir(bctx, expr, modifier)
             } else if let Some(g_attr) = get_ghost_block_opt(bctx.ctxt.tcx.hir_attrs(expr.hir_id)) {
                 // Tactus short-circuit: inside a
-                // `#[verifier::tactus_auto]` fn, a `proof { … }`
-                // block is user-written Lean tactic content (the
-                // FileLoader has sanitized the brace body to
-                // spaces for rustc's benefit). Synthesize an
-                // `ExprX::AssertBy` with trivial require / ensure
-                // and `is_tactus_proof_block: true`, carrying the
-                // span of `{ … }` so `sst_to_lean` can read the
-                // verbatim tactic text off disk and emit it raw
-                // (no `have h : P` wrapping — the user writes
-                // their own `have`s that propagate to theorem
-                // level). Gating on `enclosing_fn_is_tactus_auto`
-                // keeps vstd's Verus-flavoured proof blocks on
-                // the normal Ghost path.
-                // The auto_proof_block pass wraps every assert /
-                // assume in a synthetic `proof { … }` block, so this
-                // arm sees BOTH user-written `proof { … }` blocks AND
-                // auto-wrapped ones. Discriminator: auto-wrapped
-                // blocks contain the wrapped statement(s), while
-                // user-written Tactus blocks are *empty* after
-                // FileLoader sanitization (brace body replaced with
-                // spaces). An empty HIR body + tactus_auto enclosing
-                // fn is a reliable Tactus signal.
+                // `#[verifier::tactus_auto]` fn, a `proof { … }` block
+                // is user-written Lean tactic content. The FileLoader
+                // sanitized the brace body to spaces for rustc's
+                // benefit, so the HIR body is empty; the real payload
+                // lives at `expr.span` in the original source file.
+                // Synthesize an `ExprX::AssertBy` carrying the span —
+                // `sst_to_lean` reads the verbatim tactic text off disk
+                // and emits it raw (no `have h : P` wrapping) so the
+                // user's own `have`s propagate to theorem level.
+                //
+                // Two guards distinguish this from other Ghost blocks:
+                //   1. `enclosing_fn_is_tactus_auto` — keeps vstd's
+                //      Verus-flavoured proof blocks on the normal
+                //      Ghost path; they don't route through Lean.
+                //   2. `hir_body_is_empty` — Verus's `auto_proof_block`
+                //      pass wraps every user `assert(…);` in a
+                //      synthetic `proof { … }`, so this arm also sees
+                //      auto-wrapped blocks. Auto-wrapped blocks
+                //      contain the wrapped statement(s); user-written
+                //      Tactus blocks are empty after sanitization.
+                //      Empty HIR body is the reliable Tactus signal.
                 let hir_body_is_empty = body.stmts.is_empty() && body.expr.is_none();
                 if matches!(g_attr, GhostBlockAttr::Proof)
                     && hir_body_is_empty
                     && crate::fn_call_to_vir::enclosing_fn_is_tactus_auto(bctx)
                 {
-                    let tactic_span = crate::fn_call_to_vir::span_to_file_and_byte_range(
-                        bctx.ctxt.tcx, expr.span,
-                    );
-                    if tactic_span.is_some() {
+                    if let Some(tactus) = crate::fn_call_to_vir::tactus_span_from(
+                        bctx.ctxt.tcx, expr.span, vir::ast::TactusKind::ProofBlock,
+                    ) {
                         let trivial_true = bctx.spanned_typed_new(
                             expr.span,
                             &Arc::new(TypX::Bool),
@@ -2074,8 +2072,7 @@ pub(crate) fn expr_to_vir_innermost<'tcx>(
                                 require: trivial_true.clone(),
                                 ensure: trivial_true,
                                 proof: empty_block,
-                                tactic_span,
-                                is_tactus_proof_block: true,
+                                tactus: Some(tactus),
                             },
                         );
                         // Wrap in `ExprX::Ghost` so mode-checking

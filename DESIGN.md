@@ -954,37 +954,50 @@ exec fns."
 ##### Tier 1 — immediate wins (1–2 days each)
 
 * **`proof { ... }` blocks inside exec fns — LANDED.** Built on
-  #50's infrastructure: `ExprX::AssertBy` grew
-  `is_tactus_proof_block: bool`; `AssertQueryMode::Tactus` grew
-  `kind: TactusKind { AssertBy, ProofBlock }`;
-  `Wp::AssertByTactus::cond` became `Option<&Exp>` (None = proof
-  block). rust_to_vir_expr synthesises an AssertBy-wrapped-in-Ghost
-  for user-written `proof { }` blocks in tactus_auto fns,
+  #50's infrastructure: `TactusSpan::kind` carries which surface
+  form produced the AssertBy (`AssertBy` vs `ProofBlock`);
+  `AssertQueryMode::Tactus` carries the same kind through to SST;
+  `Wp::AssertByTactus::cond` is `Option<&Exp>` (None = proof block
+  — emit tactic raw, no `have h : P :=` wrap).
+  `rust_to_vir_expr` synthesises an AssertBy-wrapped-in-Ghost for
+  user-written `proof { }` blocks in tactus_auto fns,
   discriminating from auto-wrapped blocks (from Verus's
   `auto_proof_block` pass on every `assert(…);`) by HIR-body
   emptiness. sst_to_lean emits the tactic text raw — the user's
   own `have` statements propagate to theorem level for subsequent
-  automation. Regression: `test_exec_proof_block_user_tactic`.
+  automation. Regressions: `test_exec_proof_block_user_tactic`,
+  `test_exec_auto_proof_block_not_tactus` (shape-drift guard for
+  the HIR-body-empty discriminator).
+
+  **Caveat — goal-modifying tactics in proof blocks.** Since the
+  tactic is emitted as a raw theorem-level prefix, goal-modifying
+  tactics like `unfold foo; simp_all` affect the **entire**
+  theorem goal, not just a local sub-proof. Users may expect the
+  Verus-style "self-contained proof block" semantics and be
+  surprised. Isolating the effect (via `have _ : True := by
+  <tac>`) would break the common `have h : P := by tac` case,
+  where we *want* the hypothesis to propagate. Accepted trade-off
+  for now; pinned by `test_exec_proof_block_goal_modifying_tactic`.
 
 * **`assert(P) by { tactics }` with user tactic bodies — LANDED.**
-  `AssertQueryMode` grew a `Tactus { tactic_span }` variant
-  (moving the enum from `Copy` to `Clone` — 5 mechanical sites).
-  `rust_to_vir` captures the `{ … }` byte range onto
-  `ExprX::AssertBy::tactic_span` only inside `tactus_auto` fns.
-  `ast_to_sst` short-circuits that shape to `StmX::AssertQuery`
-  with Tactus mode, bypassing the DeadEnd desugaring. `sst_to_lean`'s
-  `build_wp` reads the verbatim Lean tactic text from the source
-  file via the span and produces a `Wp::AssertByTactus` node;
-  `lower_wp` lowers it identically to `Assume(P, body)` (P not in
-  goal) while pushing the user tactic onto `WpCtx::tactus_asserts`.
-  `exec_fn_theorems_to_ast` drains the collector and prepends
-  `have h_tactus_assert_N : P := by <user_tac>;` clauses before
-  the normal closer — discharging the obligation AND introducing
-  the hypothesis for `simp_all` / `omega` to pick up. Regression:
-  `test_exec_assert_by_user_tactic`. `sst_to_air` short-circuits
-  Tactus mode to a no-op for secondary queries (recommends-check
-  etc. still flow through sst_to_air for tactus_auto fns, but the
-  obligation is Lean's job).
+  `AssertQueryMode` grew a `Tactus { tactic_span, kind: TactusKind }`
+  variant (moving the enum from `Copy` to `Clone` — ~5 mechanical
+  sites). `rust_to_vir` captures the `{ … }` byte range onto
+  `ExprX::AssertBy::tactus: Option<TactusSpan>` (a struct holding
+  file path + byte range + `TactusKind`), only populated inside
+  `tactus_auto` fns. `ast_to_sst` short-circuits that shape to
+  `StmX::AssertQuery` with Tactus mode, bypassing the DeadEnd
+  desugaring. `sst_to_lean`'s `build_wp` reads the verbatim Lean
+  tactic text from the source file via the span and produces a
+  `Wp::AssertByTactus` node; the theorem emitter walks the Wp tree
+  via `collect_tactus_haves` (two-pass; `lower_wp` stays pure) and
+  prepends `have h_tactus_assert_N : P := by <user_tac>;` clauses
+  before the normal closer — discharging the obligation AND
+  introducing the hypothesis for `simp_all` / `omega` to pick up.
+  Regression: `test_exec_assert_by_user_tactic`. `sst_to_air`
+  short-circuits Tactus mode to a no-op for secondary queries
+  (recommends-check etc. still flow through sst_to_air for
+  tactus_auto fns, but the obligation is Lean's job).
 
 * **Source mapping for exec-fn errors.** Lean errors currently point
   at the generated `.lean` file's line numbers; users have to `cat`

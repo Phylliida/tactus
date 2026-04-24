@@ -126,9 +126,29 @@ pub type FnMap<'a> = HashMap<&'a Fun, &'a FunctionX>;
 /// per-verification-unit state that nearly every walker / builder
 /// needs — the callee lookup, the local declaration types, the fn's
 /// ensures goal (where `return` terminates), and the declared return
-/// var name (if any). Future additions — source spans, current-fn
-/// name, etc. — plug into this struct instead of growing every
+/// var name (if any). Future additions that apply to the whole
+/// verification unit plug into this struct instead of growing every
 /// function signature.
+///
+/// Per-loop state (break / continue goal leaves) lives on `WpLoopCtx`
+/// below and is threaded as a separate `Option<&WpLoopCtx>` parameter
+/// — it only applies inside a loop body, so storing it on `WpCtx`
+/// would misleadingly suggest it's always relevant.
+pub struct WpCtx<'a> {
+    pub fn_map: FnMap<'a>,
+    pub type_map: HashMap<&'a VarIdent, &'a Typ>,
+    /// Declared return-var name (`-> (r: T)`), or `None` for unit
+    /// returns. Used by `Wp::Done` leaves produced from `Return`
+    /// statements to bind the returned value before jumping to the
+    /// fn's ensures.
+    pub ret_name: Option<&'a str>,
+    /// Conjoined ensures clauses — what `Return` terminates at. For
+    /// the top-level walk this is passed as the initial `after`; an
+    /// explicit `return e` discards its textual continuation and
+    /// writes `Done(let ret := e; ensures_goal)`.
+    pub ensures_goal: LExpr,
+}
+
 /// The break / continue goal leaves in scope inside a loop body.
 /// Threaded through `build_wp` as `Option<&WpLoopCtx>` — `None`
 /// outside any loop (break/continue rejected), `Some(...)` inside a
@@ -148,21 +168,6 @@ pub type FnMap<'a> = HashMap<&'a Fun, &'a FunctionX>;
 pub struct WpLoopCtx {
     pub break_leaf: LExpr,
     pub continue_leaf: LExpr,
-}
-
-pub struct WpCtx<'a> {
-    pub fn_map: FnMap<'a>,
-    pub type_map: HashMap<&'a VarIdent, &'a Typ>,
-    /// Declared return-var name (`-> (r: T)`), or `None` for unit
-    /// returns. Used by `Wp::Done` leaves produced from `Return`
-    /// statements to bind the returned value before jumping to the
-    /// fn's ensures.
-    pub ret_name: Option<&'a str>,
-    /// Conjoined ensures clauses — what `Return` terminates at. For
-    /// the top-level walk this is passed as the initial `after`; an
-    /// explicit `return e` discards its textual continuation and
-    /// writes `Done(let ret := e; ensures_goal)`.
-    pub ensures_goal: LExpr,
 }
 
 impl<'a> WpCtx<'a> {
@@ -1022,12 +1027,13 @@ fn build_wp<'a>(
                 else_branch: Box::new(else_branch),
             })
         }
-        // `build_wp_call` doesn't recurse into sub-Stms so it doesn't
-        // need `loop_ctx`. `build_wp_loop` does — it builds the
-        // loop's body which can contain break/continue for this very
-        // loop (not the enclosing one).
+        // Neither `build_wp_call` nor `build_wp_loop` needs the
+        // enclosing loop's `loop_ctx`: they don't recurse on stmts
+        // outside their own fixed structure. `build_wp_loop` builds
+        // its OWN loop_ctx for its body (see there); `after` was
+        // already built by the caller with the outer loop_ctx.
         StmX::Call { .. } => build_wp_call(stm, after, ctx),
-        StmX::Loop { .. } => build_wp_loop(stm, after, ctx, loop_ctx),
+        StmX::Loop { .. } => build_wp_loop(stm, after, ctx),
         // Transparent in SST: pass `after` through unchanged.
         StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => Ok(after),
         // `break` / `continue` terminate the current iteration and
@@ -1226,13 +1232,6 @@ fn build_wp_loop<'a>(
     stm: &'a Stm,
     after: Wp<'a>,
     ctx: &WpCtx<'a>,
-    // Enclosing loop's break/continue leaves (if any), forwarded to
-    // any recursion that doesn't enter THIS loop's body. We don't
-    // actually call build_wp on `after` here — `after` was already
-    // built by the caller with the outer loop_ctx. The `_` marker
-    // documents that we accept it for consistency with the normal
-    // build_wp signature.
-    _outer_loop_ctx: Option<&WpLoopCtx>,
 ) -> Result<Wp<'a>, String> {
     // Destructure every field explicitly so a future Verus-side
     // `StmX::Loop` addition forces a compile-time audit. `is_for_loop`
