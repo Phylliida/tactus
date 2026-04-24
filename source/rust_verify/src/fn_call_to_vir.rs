@@ -74,6 +74,20 @@ fn span_to_file_and_byte_range<'tcx>(
     Some((path, lo.pos.0 as usize, hi.pos.0 as usize))
 }
 
+/// Does the currently-processed function carry `#[verifier::tactus_auto]`?
+/// The attribute is what signals "this fn's body routes through the Lean
+/// WP pipeline"; assert-by tactic spans are only meaningful inside such
+/// fns. Outside them (i.e., vstd and regular Verus exec fns), we leave
+/// `ExprX::AssertBy::tactic_span` as `None` so `ast_to_sst`'s normal
+/// DeadEnd desugaring runs unchanged.
+fn enclosing_fn_is_tactus_auto(bctx: &BodyCtxt<'_>) -> bool {
+    let attrs = bctx.ctxt.tcx.get_all_attrs(bctx.fun_id);
+    match crate::attributes::get_verifier_attrs(attrs, None) {
+        Ok(v) => v.tactus_auto,
+        Err(_) => false,
+    }
+}
+
 pub(crate) fn fn_call_to_vir<'tcx>(
     bctx: &BodyCtxt<'tcx>,
     expr: &Expr<'tcx>,
@@ -1228,15 +1242,21 @@ fn verus_item_to_vir<'tcx, 'a>(
                     let ensure = expr_to_vir_consume(bctx, &args[0], ExprModifier::REGULAR)?;
                     let proof = expr_to_vir_consume(bctx, &args[1], ExprModifier::REGULAR)?;
                     // Tactus: capture the proof block's source span so
-                    // `sst_to_lean` can recover the user's verbatim Lean
-                    // tactic text when this assert-by lives inside a
-                    // `#[verifier::tactus_auto]` fn. `args[1].span`
-                    // covers the `{ … }` including braces, which is
-                    // exactly what `read_tactic_from_source` expects.
-                    // Populated unconditionally; only used at Lean-gen.
-                    let tactic_span = span_to_file_and_byte_range(
-                        bctx.ctxt.tcx, args[1].span,
-                    );
+                    // `sst_to_lean` can recover the user's verbatim
+                    // Lean tactic text. Only populated when the
+                    // enclosing fn is `#[verifier::tactus_auto]` —
+                    // otherwise vstd's assert-bys (which carry
+                    // Rust/Verus proof code, not Lean tactics) would
+                    // see Some(span) and get routed through Tactus's
+                    // simpler SST emission, breaking their DeadEnd
+                    // semantics. `args[1].span` covers the `{ … }`
+                    // including braces, which is what
+                    // `read_tactic_from_source` expects.
+                    let tactic_span = if enclosing_fn_is_tactus_auto(bctx) {
+                        span_to_file_and_byte_range(bctx.ctxt.tcx, args[1].span)
+                    } else {
+                        None
+                    };
                     mk_expr(ExprX::AssertBy { vars, require, ensure, proof, tactic_span })
                 }
                 AssertItem::AssertByCompute => {
@@ -2477,12 +2497,15 @@ fn extract_assert_forall_by<'tcx>(
                 )
             };
             let ensure = header.ensure.0[0].clone();
-            // Tactus: capture the forall body's source span for the
-            // same reason as assert-by above. The local `expr` was
-            // shadowed to `&body.value` up at line 2421 — its span
-            // covers the closure body, which is the `{ … }` after
-            // `by`.
-            let tactic_span = span_to_file_and_byte_range(bctx.ctxt.tcx, expr.span);
+            // Tactus: same tactus_auto gate as plain assert-by above.
+            // The local `expr` was shadowed to `&body.value` at line
+            // 2421 — its span covers the closure body (the `{ … }`
+            // after `by`).
+            let tactic_span = if enclosing_fn_is_tactus_auto(bctx) {
+                span_to_file_and_byte_range(bctx.ctxt.tcx, expr.span)
+            } else {
+                None
+            };
             let forallx = ExprX::AssertBy {
                 vars, require, ensure, proof: vir_expr, tactic_span,
             };
