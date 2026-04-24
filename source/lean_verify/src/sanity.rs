@@ -211,6 +211,9 @@ fn check_expr(
             check_expr(base, defined, scope, violations, context);
             check_expr(idx, defined, scope, violations, context);
         }
+        ExprNode::SpanMark { inner, .. } => {
+            check_expr(inner, defined, scope, violations, context);
+        }
     }
 }
 

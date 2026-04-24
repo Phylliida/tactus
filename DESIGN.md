@@ -1020,15 +1020,32 @@ exec fns."
   (recommends-check etc. still flow through sst_to_air for
   tactus_auto fns, but the obligation is Lean's job).
 
-* **Source mapping for exec-fn errors.** Lean errors currently point
-  at the generated `.lean` file's line numbers; users have to `cat`
-  the emitted file to understand what failed. The generated path is
-  in the error message, which helps, but true source mapping (Rust
-  `.rs` line numbers in the diagnostic) requires threading `Span`
-  through the Wp tree to tactic emission and building a
-  `LeanSourceMap` entry for each generated tactic. Infrastructure
-  partially exists for proof fns (`LeanSourceMap` in `to_lean_fn.rs`);
-  extend to exec-fn theorems. Scope: ~2 days.
+* **Source mapping for exec-fn errors — LANDED (#51).**
+  `Wp::Assert(e, …)` wraps its asserted expression in
+  `ExprNode::SpanMark { rust_loc, inner }` using `e.span`
+  (formatted via `format_rust_loc` to `path:line:col`). The pp
+  emits `/- @rust:LOC -/` regular block comments before the
+  inner expression — transparent at the Lean level. After
+  rendering, `scan_span_marks` does a single pass over the
+  output building `(lean_line, rust_loc)` pairs; these land
+  in `LeanSourceMap::span_marks`. On Lean error, `format_error`
+  calls `find_rust_loc(pos.line)` to surface the closest
+  preceding mark as `at <path>:L:C:` in the error body. Users
+  see the Rust location of the failing obligation rather than
+  just the fn declaration.
+
+  Why block comments in the output vs. a pure-metadata side
+  channel: comments are visible in the generated `.lean` file,
+  which doubles as debug aid when users `cat` the file.
+  `/- ... -/` (not `/-! ... -/`) is used — `/-!` is Lean's
+  module-docstring marker and isn't valid inline.
+
+  Coverage: only `Wp::Assert` is wrapped today. `Wp::Branch`,
+  `Wp::Loop`, `Wp::Call`, etc. could also carry source
+  locations; not wired because assertions are the most
+  frequent failure site and incremental wrapping is easy.
+  Paths containing `-/` would break the comment (very unlikely
+  given Verus's `Span::as_string` format).
 
 ##### Tier 2 — realistic-code unblockers (2–4 days each)
 

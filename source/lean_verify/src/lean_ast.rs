@@ -236,6 +236,14 @@ impl Expr {
 
     pub fn anon(elems: Vec<Expr>) -> Self { Expr::new(ExprNode::Anon(elems)) }
 
+    /// Wrap `inner` with a source-location marker. Transparent at
+    /// the Lean level; pp emits a `/-! @rust:LOC -/` block before
+    /// `inner` so error-time scanning can map Lean lines back to
+    /// Rust positions (#51 source mapping).
+    pub fn span_mark(rust_loc: impl Into<String>, inner: Expr) -> Self {
+        Expr::new(ExprNode::SpanMark { rust_loc: rust_loc.into(), inner: Box::new(inner) })
+    }
+
     pub fn type_annot(expr: Expr, ty: Expr) -> Self {
         Expr::new(ExprNode::TypeAnnot { expr: Box::new(expr), ty: Box::new(ty) })
     }
@@ -308,6 +316,16 @@ pub enum ExprNode {
     /// no direct Lean analogue (effectless markers, exotic shapes). The
     /// goal is to keep this set small; prefer adding a real node.
     Raw(String),
+
+    /// Source-span annotation (#51). Transparent at the Lean level —
+    /// pp emits just `inner`'s text — but the pp records
+    /// `(current_line, rust_loc)` in `PpOutput::span_marks` as it
+    /// visits the node. `LeanSourceMap::from_marks` consumes this
+    /// to map Lean error lines back to Rust source positions.
+    /// `lower_wp` wraps `Wp::Assert` / `Wp::Branch.cond` /
+    /// `Wp::Loop.cond` / `Wp::Call` etc. with this carrying the
+    /// underlying SST `Exp.span.as_string`.
+    SpanMark { rust_loc: String, inner: Box<Expr> },
 }
 
 /// Structural binary operators.
@@ -512,6 +530,10 @@ fn substitute_impl(
         ExprNode::Anon(es) => ExprNode::Anon(
             es.iter().map(|e| substitute_impl(e, subst)).collect()
         ),
+        ExprNode::SpanMark { rust_loc, inner } => ExprNode::SpanMark {
+            rust_loc: rust_loc.clone(),
+            inner: Box::new(substitute_impl(inner, subst)),
+        },
     };
     Expr::new(node)
 }
@@ -646,6 +668,7 @@ fn collect_free_vars(
             collect_free_vars(base, bound, out);
             collect_free_vars(idx, bound, out);
         }
+        ExprNode::SpanMark { inner, .. } => collect_free_vars(inner, bound, out),
     }
 }
 

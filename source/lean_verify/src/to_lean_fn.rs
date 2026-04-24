@@ -17,12 +17,23 @@ use crate::to_lean_type::{lean_name, sanitize, short_name, typ_to_expr};
 
 // ── Source map ──────────────────────────────────────────────────────────
 
-/// Maps Lean line numbers back to the proof fn's tactic body.
+/// Maps Lean line numbers back to the user's source.
+///
+/// Two complementary mechanisms:
+/// * **Tactic body** (proof fns): `tactic_start_line` /
+///   `tactic_line_count` bracket the user-written tactic block.
+///   `find_tactic_line` returns the offset within that block.
+/// * **Span marks** (exec fns, #51): `span_marks` is a
+///   `(lean_line, rust_loc)` list populated from `/-! @rust:LOC -/`
+///   markers `lower_wp` emits before each obligation.
+///   `find_rust_loc` returns the closest preceding mark for a
+///   given Lean error line.
 pub struct LeanSourceMap {
     pub fn_name: String,
     /// 1-indexed line in generated .lean where the tactic body starts
     pub tactic_start_line: usize,
     pub tactic_line_count: usize,
+    pub span_marks: Vec<(usize, String)>,
 }
 
 impl LeanSourceMap {
@@ -34,6 +45,17 @@ impl LeanSourceMap {
         } else {
             None
         }
+    }
+
+    /// Given a 1-indexed Lean error line, find the Rust source
+    /// location of the most recent `/-! @rust:LOC -/` marker at or
+    /// before that line. Returns `None` if no marker precedes the
+    /// error (e.g., proof fn paths without #51 instrumentation).
+    pub fn find_rust_loc(&self, lean_line: usize) -> Option<&str> {
+        self.span_marks.iter()
+            .rev()
+            .find(|(line, _)| *line <= lean_line)
+            .map(|(_, loc)| loc.as_str())
     }
 }
 

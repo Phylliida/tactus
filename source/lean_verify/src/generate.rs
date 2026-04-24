@@ -185,6 +185,7 @@ pub fn check_proof_fn(
         // One proof fn per file → exactly one `Tactic::Raw` emission.
         tactic_start_line: rendered.tactic_starts.first().copied().unwrap_or(0),
         tactic_line_count: tactic_body.lines().count().max(1),
+        span_marks: rendered.span_marks.clone(),
     };
 
     let file_path = lean_file_path(crate_name, &proof_fn.name.path);
@@ -253,11 +254,15 @@ pub fn check_exec_fn(
     let result = lean_process::check_lean_file(&file_path, lake_dir);
 
     // Exec fns don't have a user-written tactic body yet (see TODO in
-    // `sst_to_lean::exec_fn_theorems_to_ast`). Use an empty source map.
+    // `sst_to_lean::exec_fn_theorems_to_ast`). The tactic-line offset
+    // is unused for exec fns, but `span_marks` carries the
+    // per-obligation Rust source locations populated by #51's
+    // `lower_wp` SpanMark wrapping.
     let empty = LeanSourceMap {
         fn_name: short_name(&vir_fn.name.path).to_string(),
         tactic_start_line: 0,
         tactic_line_count: 0,
+        span_marks: rendered.span_marks.clone(),
     };
 
     match result {

@@ -36,9 +36,13 @@ pub fn format_error(
 ) -> String {
     let mut out = String::new();
 
-    // Tactic line info
+    // Source location info: prefer the Rust span (from #51's
+    // SpanMark instrumentation, populated for exec fns), fall
+    // back to the tactic-line offset (proof fns).
     if let Some(pos) = &diag.pos {
-        if let Some(offset) = source_map.find_tactic_line(pos.line) {
+        if let Some(rust_loc) = source_map.find_rust_loc(pos.line) {
+            out.push_str(&format!("at {}:\n", rust_loc));
+        } else if let Some(offset) = source_map.find_tactic_line(pos.line) {
             out.push_str(&format!("tactic line {}: ", offset + 1));
         }
     }
