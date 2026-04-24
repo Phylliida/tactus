@@ -2800,6 +2800,16 @@ test_verify_one_file! {
         }
     } => Err(err) => {
         assert!(err.errors.len() >= 1, "caller must satisfy callee's requires");
+        // #51 source mapping: the failing precondition should point
+        // at the CALL SITE (the `add_one(x)` expression in bad_caller),
+        // not at the callee's `requires x < 100` line in add_one.
+        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("at ") && m.contains("test.rs:")),
+            "expected the error to cite a call-site Rust location via #51 \
+             SpanMark instrumentation. got: {:?}",
+            msgs,
+        );
     }
 }
 

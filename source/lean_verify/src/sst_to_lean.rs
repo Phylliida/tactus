@@ -603,6 +603,12 @@ enum Wp<'a> {
         /// `let dest := ret` inside the `∀ ret`, and `ret` already has
         /// its type-bound hypothesis from `type_bound_predicate`.
         dest: Option<&'a VarIdent>,
+        /// Call-site Span — the Rust source location of `callee(args)`.
+        /// Used by `lower_call` to wrap the inlined requires_conj with
+        /// a `SpanMark`, so a failing precondition check surfaces the
+        /// call site in error messages (#51) rather than the fn
+        /// declaration or the callee's own source line.
+        call_span: &'a Span,
         after: Box<Wp<'a>>,
     },
 }
@@ -703,8 +709,8 @@ fn lower_wp(wp: &Wp<'_>, ctx: &WpCtx<'_>) -> LExpr {
         Wp::Loop { cond, invs, decrease, modified_vars, body, after } => {
             lower_loop(*cond, invs, decrease, modified_vars, body, after, ctx)
         }
-        Wp::Call { callee, args, typ_args, dest, after } => {
-            lower_call(callee, args, typ_args, *dest, after, ctx)
+        Wp::Call { callee, args, typ_args, dest, call_span, after } => {
+            lower_call(callee, args, typ_args, *dest, call_span, after, ctx)
         }
     }
 }
@@ -819,6 +825,7 @@ fn lower_call(
     args: &[Exp],
     typ_args: &[Typ],
     dest: Option<&VarIdent>,
+    call_span: &Span,
     after: &Wp<'_>,
     ctx: &WpCtx<'_>,
 ) -> LExpr {
@@ -859,7 +866,15 @@ fn lower_call(
     let ensures_conj = and_all(
         callee.ensure.0.iter().map(|e| vir_expr_to_ast(e)).collect()
     );
-    let requires_clause = substitute(&requires_conj, &subst);
+    // Wrap the substituted requires with the call-site span (#51) —
+    // a failing precondition surfaces the `callee(args)` location in
+    // the caller, not the callee's own source line (which would
+    // confuse: the user is looking at the caller and wondering why
+    // Lean points at foreign code).
+    let requires_clause = LExpr::span_mark(
+        format_rust_loc(call_span),
+        substitute(&requires_conj, &subst),
+    );
 
     let ret = &callee.ret.x;
     let ret_name_cal = sanitize(&ret.name.0);
@@ -1274,6 +1289,7 @@ fn build_wp_call<'a>(
         args: &args[..],
         typ_args: &typ_args[..],
         dest: bound_dest,
+        call_span: &stm.span,
         after: Box::new(after),
     })
 }
