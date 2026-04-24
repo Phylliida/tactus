@@ -3141,6 +3141,33 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// User-written `proof { ... }` block inside a tactus_auto exec fn.
+// Unlike `assert(P) by { ... }` which wraps the user tactic in
+// `have h_N : P := by <tac>`, a proof block emits the user tactic
+// RAW — so `have h : Q := by tac` inside the block introduces `h`
+// at theorem-tactic level, available for subsequent obligations.
+//
+// This test writes a proof block containing `have` statements; the
+// hypotheses they introduce get picked up by `simp_all` / `omega`
+// when proving the ensures clause. rust_to_vir synthesises this as
+// an `ExprX::AssertBy { is_tactus_proof_block: true, … }` which
+// ast_to_sst routes to `AssertQueryMode::Tactus { kind:
+// TactusKind::ProofBlock }`.
+test_verify_one_file! {
+    #[test] test_exec_proof_block_user_tactic verus_code! {
+        #[verifier::tactus_auto]
+        fn g(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            proof {
+                have h : x + 1 <= 100 := by omega
+            }
+            x + 1
+        }
+    } => Ok(())
+}
+
 // Generic call: the callee is parametric over `T`, and the call site
 // supplies `T = u8` via `typ_args`. `build_wp_call` used to reject
 // non-empty `typ_args` outright; now `lower_call` substitutes the

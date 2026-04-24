@@ -2,9 +2,9 @@ use crate::ast::{
     ArithOp, AssertQueryMode, AutospecUsage, BinaryOp, BitshiftBehavior, BitwiseOp, BoundsCheck,
     ByRef, CallTarget, ComputeMode, Constant, Div0Behavior, Expr, ExprX, FieldOpr, Fun, Function,
     Ident, IntRange, InvAtomicity, LoopInvariantKind, MaskSpec, Mode, OverflowBehavior,
-    PatternBinding, PatternX, Place, PlaceX, SpannedTyped, Stmt, StmtX, Typ, TypX, Typs, UnaryOp,
-    UnaryOpr, UnwindSpec, VarAt, VarBinder, VarBinderX, VarBinders, VarIdent, VarIdentDisambiguate,
-    VariantCheck, VirErr,
+    PatternBinding, PatternX, Place, PlaceX, SpannedTyped, Stmt, StmtX, TactusKind, Typ, TypX,
+    Typs, UnaryOp, UnaryOpr, UnwindSpec, VarAt, VarBinder, VarBinderX, VarBinders, VarIdent,
+    VarIdentDisambiguate, VariantCheck, VirErr,
 };
 use crate::ast::{BuiltinSpecFun, Exprs};
 use crate::ast_util::{QUANT_FORALL, bool_typ, types_equal, undecorate_typ, unit_typ};
@@ -2167,7 +2167,7 @@ pub(crate) fn expr_to_stm_opt(
             )?;
             Ok((stms, Maybe::Some(Value::Exp(tmp))))
         }
-        ExprX::AssertBy { vars, require, ensure, proof, tactic_span } => {
+        ExprX::AssertBy { vars, require, ensure, proof, tactic_span, is_tactus_proof_block } => {
             // Tactus short-circuit: when this assert-by carries a
             // `tactic_span` (only set by rust_to_vir inside
             // `#[verifier::tactus_auto]` fns — see
@@ -2192,24 +2192,39 @@ pub(crate) fn expr_to_stm_opt(
             // sanitized the brace body to spaces).
             if let Some((file, start, end)) = tactic_span {
                 let ensure_exp = expr_to_pure_exp_skip_checks(ctx, state, ensure)?;
+                let query_span = expr.span.clone();
+                let kind = if *is_tactus_proof_block {
+                    AssertQueryMode::Tactus {
+                        tactic_span: (file.clone(), *start, *end),
+                        kind: TactusKind::ProofBlock,
+                    }
+                } else {
+                    AssertQueryMode::Tactus {
+                        tactic_span: (file.clone(), *start, *end),
+                        kind: TactusKind::AssertBy,
+                    }
+                };
+                // Body: the assertion we're proving. For assert-by
+                // it's `ensure`. For proof blocks `ensure` is trivial
+                // `true` (proof blocks don't claim anything); we still
+                // route it through `StmX::Assert` so the body shape
+                // stays uniform.
                 let inner_assert = Spanned::new(
                     ensure.span.clone(),
                     StmX::Assert(state.next_assert_id(), None, ensure_exp.clone()),
                 );
-                let query_span = expr.span.clone();
                 let query = Spanned::new(
                     query_span.clone(),
                     StmX::AssertQuery {
-                        mode: AssertQueryMode::Tactus {
-                            tactic_span: (file.clone(), *start, *end),
-                        },
+                        mode: kind,
                         typ_inv_exps: Arc::new(vec![]),
                         typ_inv_vars: Arc::new(vec![]),
                         body: inner_assert,
                     },
                 );
-                // Assume `ensure` for subsequent code — the assert-by's
-                // effect is that `P` holds after the statement.
+                // Assume `ensure` for subsequent code. For assert-by
+                // that's the asserted P; for proof blocks that's just
+                // `true` and has no effect on downstream obligations.
                 let assume_after = Spanned::new(
                     query_span.clone(),
                     StmX::Assume(ensure_exp),

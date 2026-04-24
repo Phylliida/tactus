@@ -56,7 +56,7 @@ use vir::def::field_ident_from_rust;
 /// virtual files, or non-canonicalisable paths, all of which are
 /// benign (just means the span can't be used, and the Tactus pipeline
 /// falls back to the default closer tactic).
-fn span_to_file_and_byte_range<'tcx>(
+pub(crate) fn span_to_file_and_byte_range<'tcx>(
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     span: Span,
 ) -> Option<(String, usize, usize)> {
@@ -80,7 +80,7 @@ fn span_to_file_and_byte_range<'tcx>(
 /// fns. Outside them (i.e., vstd and regular Verus exec fns), we leave
 /// `ExprX::AssertBy::tactic_span` as `None` so `ast_to_sst`'s normal
 /// DeadEnd desugaring runs unchanged.
-fn enclosing_fn_is_tactus_auto(bctx: &BodyCtxt<'_>) -> bool {
+pub(crate) fn enclosing_fn_is_tactus_auto(bctx: &BodyCtxt<'_>) -> bool {
     let attrs = bctx.ctxt.tcx.get_all_attrs(bctx.fun_id);
     match crate::attributes::get_verifier_attrs(attrs, None) {
         Ok(v) => v.tactus_auto,
@@ -1257,7 +1257,10 @@ fn verus_item_to_vir<'tcx, 'a>(
                     } else {
                         None
                     };
-                    mk_expr(ExprX::AssertBy { vars, require, ensure, proof, tactic_span })
+                    mk_expr(ExprX::AssertBy {
+                        vars, require, ensure, proof, tactic_span,
+                        is_tactus_proof_block: false,
+                    })
                 }
                 AssertItem::AssertByCompute => {
                     unsupported_err_unless!(
@@ -2508,6 +2511,7 @@ fn extract_assert_forall_by<'tcx>(
             };
             let forallx = ExprX::AssertBy {
                 vars, require, ensure, proof: vir_expr, tactic_span,
+                is_tactus_proof_block: false,
             };
             Ok(bctx.spanned_typed_new(span, &typ, forallx))
         }

@@ -107,7 +107,7 @@ use vir::sst::{
     BndX, Dest, Exp, ExpX, FuncCheckSst, FunctionSst, LoopInv, Par, Stm, StmX,
 };
 use vir::ast::{
-    AssertQueryMode, Fun, FunctionX, KrateX, Typ, UnaryOp, UnaryOpr, VarIdent,
+    AssertQueryMode, Fun, FunctionX, KrateX, TactusKind, Typ, UnaryOp, UnaryOpr, VarIdent,
 };
 use crate::lean_ast::{
     and_all, substitute, Binder as LBinder, BinderKind, Expr as LExpr, Tactic, Theorem,
@@ -278,29 +278,41 @@ pub fn exec_fn_theorems_to_ast<'a>(
     Ok(vec![Theorem { name, binders, goal, tactic }])
 }
 
-/// Walk the Wp tree and extract one `(hypothesis_name, cond, tactic_text)`
-/// tuple per `Wp::AssertByTactus` node, in structural order. The
-/// resulting list is consumed by `prepend_user_haves` to build the
-/// theorem's prefix.
-fn collect_tactus_haves(wp: &Wp<'_>) -> Vec<(String, LExpr, String)> {
+/// Collected tactic prefix extracted from a `Wp::AssertByTactus` node.
+/// `wrap` distinguishes the two Tactus surface forms — see the
+/// variant's doc for the semantic split.
+struct TactusHave {
+    /// `Some((hypothesis_name, rendered_P))` for assert-by: emission
+    /// wraps as `have <name> : <P> := by <tac>`. `None` for proof
+    /// blocks: emission emits `<tac>` raw.
+    wrap: Option<(String, LExpr)>,
+    tactic_text: String,
+}
+
+/// Walk the Wp tree and extract one `TactusHave` per
+/// `Wp::AssertByTactus` node, in structural order. The resulting
+/// list is consumed by `prepend_user_haves` to build the theorem's
+/// prefix. `lower_wp` stays pure — the Tactus tactic info is
+/// extracted up-front rather than collected via a mutable side
+/// channel during lowering.
+fn collect_tactus_haves(wp: &Wp<'_>) -> Vec<TactusHave> {
     let mut out = Vec::new();
     collect_tactus_haves_into(wp, &mut out);
     out
 }
 
-fn collect_tactus_haves_into(wp: &Wp<'_>, out: &mut Vec<(String, LExpr, String)>) {
+fn collect_tactus_haves_into(wp: &Wp<'_>, out: &mut Vec<TactusHave>) {
     match wp {
         Wp::Done(_) => {}
         Wp::Let(_, _, body) | Wp::Assert(_, body) | Wp::Assume(_, body) => {
             collect_tactus_haves_into(body, out);
         }
         Wp::AssertByTactus { cond, tactic_text, body } => {
-            let idx = out.len();
-            out.push((
-                format!("h_tactus_assert_{}", idx),
-                sst_exp_to_ast(cond),
-                tactic_text.clone(),
-            ));
+            let wrap = cond.map(|c| {
+                let idx = out.len();
+                (format!("h_tactus_assert_{}", idx), sst_exp_to_ast(c))
+            });
+            out.push(TactusHave { wrap, tactic_text: tactic_text.clone() });
             collect_tactus_haves_into(body, out);
         }
         Wp::Branch { then_branch, else_branch, .. } => {
@@ -317,33 +329,44 @@ fn collect_tactus_haves_into(wp: &Wp<'_>, out: &mut Vec<(String, LExpr, String)>
     }
 }
 
-/// If any Tactus `assert-by` user tactics were collected during
-/// `lower_wp`, wrap the normal `closer` with leading `have h_* : P :=
-/// by <user_tac>;` clauses. The hypotheses each `have` introduces
-/// stay in context for the remainder of the proof, so `simp_all` in
-/// `tactus_auto` can use them to close goals that reference P.
+/// Prepend collected Tactus user tactics to the normal theorem
+/// `closer`. Two forms per `TactusHave`:
+///
+/// * `wrap = Some((name, cond))` (assert-by form): emit
+///   `have <name> : <cond> := by <user_tac>` so the user's tactic
+///   discharges the proof obligation for `<cond>` AND the proved
+///   hypothesis <name> is in scope for the rest of the proof.
+/// * `wrap = None` (proof-block form): emit `<user_tac>` raw — the
+///   user's own `have` / `unfold` / etc. run at theorem-tactic
+///   level, affecting outer context and goal.
+///
 /// No-op when the collector is empty — theorems with no Tactus
-/// assert-by keep their single-tactic form unchanged.
-fn prepend_user_haves(
-    haves: Vec<(String, LExpr, String)>,
-    closer: Tactic,
-) -> Tactic {
+/// assert-by / proof-block keep their single-tactic form unchanged.
+fn prepend_user_haves(haves: Vec<TactusHave>, closer: Tactic) -> Tactic {
     if haves.is_empty() {
         return closer;
     }
     let mut body = String::new();
-    for (name, cond, user_tac) in &haves {
-        let cond_text = crate::lean_pp::pp_expr(cond);
-        body.push_str(&format!("have {name} : {cond_text} := by\n"));
-        for line in user_tac.lines() {
-            body.push_str("  ");
-            body.push_str(line);
-            body.push('\n');
+    for h in &haves {
+        match &h.wrap {
+            Some((name, cond)) => {
+                let cond_text = crate::lean_pp::pp_expr(cond);
+                body.push_str(&format!("have {name} : {cond_text} := by\n"));
+                for line in h.tactic_text.lines() {
+                    body.push_str("  ");
+                    body.push_str(line);
+                    body.push('\n');
+                }
+            }
+            None => {
+                for line in h.tactic_text.lines() {
+                    body.push_str(line);
+                    body.push('\n');
+                }
+            }
         }
     }
-    // Splice the closer's textual form after the haves. For
-    // `Tactic::Named(n)` that's just `n`; for `Tactic::Raw(s)` it's
-    // `s` verbatim.
+    // Splice the closer's textual form after the haves.
     match closer {
         Tactic::Named(n) => body.push_str(&n),
         Tactic::Raw(s) => body.push_str(&s),
@@ -469,18 +492,25 @@ enum Wp<'a> {
     /// `P → <body>`.
     Assume(&'a Exp, Box<Wp<'a>>),
 
-    /// `assert(P) by { user_tac }` inside a `tactus_auto` fn. Lowers
-    /// the body exactly like `Assume(P, body)` — the goal doesn't
-    /// mention `P` because the user's tactic discharges the proof
-    /// obligation for `P` at theorem-tactic emission time, leaving
-    /// `P` in the Lean context as a hypothesis. The `tactic_text` is
-    /// the verbatim Lean source from the user's `by { … }` block,
-    /// read from the original file via the `tactic_span` on
-    /// `StmX::AssertQuery` with `AssertQueryMode::Tactus`. Collected
-    /// separately and prepended as `have h_* : P := by <user_tac>`
-    /// clauses in front of the emitted theorem's normal closer.
+    /// User-written Lean tactic inside a `tactus_auto` fn.
+    ///
+    /// Two surface forms produce this node, distinguished by `cond`:
+    /// * `Some(P)` — `assert(P) by { tac }`. Emission prepends
+    ///   `have h_N : P := by <tac>` to the theorem's closer; the
+    ///   user's tactic discharges the obligation for P, and the
+    ///   proved hypothesis h_N is available for the rest of the
+    ///   proof via `simp_all` / `omega`.
+    /// * `None` — `proof { tac }`. Emission prepends `<tac>` raw;
+    ///   the user's own `have` statements inside become theorem-
+    ///   level hypotheses, and `unfold` / `simp` / etc. affect the
+    ///   outer goal. No wrapping, no synthesized condition.
+    ///
+    /// In both cases `body` is the post-block continuation, and the
+    /// body's `lower_wp` passes through unchanged — the tactic
+    /// content is extracted up-front by `collect_tactus_haves` and
+    /// prepended to the closer, not woven into the goal.
     AssertByTactus {
-        cond: &'a Exp,
+        cond: Option<&'a Exp>,
         tactic_text: String,
         body: Box<Wp<'a>>,
     },
@@ -577,11 +607,12 @@ fn lower_wp(wp: &Wp<'_>, ctx: &WpCtx<'_>) -> LExpr {
         }
         Wp::Assert(e, body) => LExpr::and(sst_exp_to_ast(e), lower_wp(body, ctx)),
         Wp::Assume(e, body) => LExpr::implies(sst_exp_to_ast(e), lower_wp(body, ctx)),
-        // The user tactic and the asserted condition are NOT in the
-        // goal — they're extracted up-front by `collect_tactus_haves`
-        // and prepended as `have` clauses before the closer. Here we
-        // just pass the `body`'s lowering through. This keeps
-        // `lower_wp` a pure function of the Wp tree + ctx.
+        // The user tactic is NOT in the goal — it's extracted
+        // up-front by `collect_tactus_haves` and prepended to the
+        // closer (as `have h : P := by tac` for assert-by when
+        // `cond = Some(_)`, or raw when `cond = None` for proof
+        // blocks). Here we just pass through. Keeps `lower_wp` a
+        // pure function of the Wp tree + ctx.
         Wp::AssertByTactus { cond: _, tactic_text: _, body } => lower_wp(body, ctx),
         Wp::Branch { cond, then_branch, else_branch } => {
             let c = sst_exp_to_ast(cond);
@@ -967,7 +998,7 @@ fn build_wp<'a>(
         // the Lean WP pipeline.
         StmX::AssertQuery { mode, typ_inv_exps: _, typ_inv_vars: _, body } => {
             match mode {
-                AssertQueryMode::Tactus { tactic_span } => {
+                AssertQueryMode::Tactus { tactic_span, kind } => {
                     let cond = match &body.x {
                         StmX::Assert(_, _, c) => c,
                         _ => return Err(format!(
@@ -984,8 +1015,16 @@ fn build_wp<'a>(
                         "failed to read assert-by tactic from {} bytes [{}..{}]",
                         path, start, end
                     ))?;
+                    // `kind` distinguishes assert-by (wrap as `have
+                    // h : P := by <tac>`) from proof block (emit
+                    // `<tac>` raw). We encode that in `Wp::AssertByTactus`
+                    // by passing `Some(cond)` vs `None`.
+                    let cond_for_have = match kind {
+                        TactusKind::AssertBy => Some(cond),
+                        TactusKind::ProofBlock => None,
+                    };
                     Ok(Wp::AssertByTactus {
-                        cond,
+                        cond: cond_for_have,
                         tactic_text,
                         body: Box::new(after),
                     })
