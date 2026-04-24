@@ -3037,22 +3037,18 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// `decreases` on a user datatype exercises the #54 pipeline:
-// `datatype_to_cmds` emits the match-based `T.height : T → Nat`
-// fn alongside the inductive, `CheckDecreaseHeight` dispatches
-// to `T.height cur < T.height prev ∨ (T.height cur = T.height
-// prev ∧ otherwise)` via `decrease_height_datatype` (peeling
-// Boxed/Decorate), and Lean auto-proves termination of `height`
-// by structural recursion on its scrutinee.
-//
-// The termination obligation itself is correctly emitted and
-// shape-correct — `(Push_val1 s).height < s.height` under
-// hypothesis `¬s.isEmpty`. Closing it end-to-end needs case
-// analysis on `s`, which is the #58 (match automation) gap.
-// This test pins the "#54 landed, #58 pending" state:
-// verification fails, but with a Lean goal showing the
-// `.height` dispatch worked. When #58 lands and closes match
-// goals, this test flips to `=> Ok(())`.
+// `decreases` on a user datatype exercises the #54 pipeline
+// end-to-end:
+//   1. `datatype_to_cmds` emits the match-based `T.height : T →
+//      Nat` fn alongside the inductive.
+//   2. `CheckDecreaseHeight` dispatches to `T.height cur <
+//      T.height prev ∨ (T.height cur = T.height prev ∧
+//      otherwise)` via `decrease_height_datatype` (peeling
+//      Boxed/Decorate).
+//   3. `tactus_case_split` in `TactusPrelude.lean` (#58) finds
+//      the `s : Stack` local and case-splits, letting simp_all
+//      unfold the match-based accessors and omega close
+//      `rest.height < 1 + rest.height`.
 test_verify_one_file! {
     #[test] test_exec_call_recursive_datatype_termination verus_code! {
         use vstd::std_specs::alloc::*;
@@ -3071,26 +3067,35 @@ test_verify_one_file! {
                 Stack::Push(_, rest) => shrink(rest),
             }
         }
+    } => Ok(())
+}
+
+// Non-decreasing companion: the recursive call passes the SAME
+// `s` (not a subterm), so the termination obligation reduces to
+// `s.height < s.height` which omega rejects. Confirms our
+// height-based lowering actually constrains termination (rather
+// than vacuously passing).
+test_verify_one_file! {
+    #[test] test_exec_call_recursive_datatype_nondecreasing verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum Stack {
+            Empty,
+            Push(u8, Box<Stack>),
+        }
+
+        #[verifier::tactus_auto]
+        fn loops(s: &Stack) -> (r: u64)
+            decreases s
+        {
+            match s {
+                Stack::Empty => 0,
+                Stack::Push(_, _rest) => loops(s),
+            }
+        }
     } => Err(err) => {
-        // The failure should mention the Lean goal referencing
-        // `.height` — that's the signature that #54 dispatch
-        // reached the Lean layer. If it's still a
-        // "non-int decrease rejected" error, the dispatch
-        // regressed.
-        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
-        assert!(
-            msgs.iter().any(|m| m.contains(".height") && m.contains("unsolved goal")),
-            "expected a Lean 'unsolved goal' mentioning `.height` (indicating \
-             the #54 height-fn dispatch reached Lean and the remaining gap is \
-             #58 match automation). got: {:?}",
-            msgs,
-        );
-        assert!(
-            !msgs.iter().any(|m| m.contains("non-int decrease") || m.contains("task #54")),
-            "dispatch should reach Lean, not hit the deferrals-rejection path. \
-             got: {:?}",
-            msgs,
-        );
+        assert!(err.errors.len() >= 1,
+            "non-decreasing recursion on a datatype should fail");
     }
 }
 
@@ -3310,22 +3315,15 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Multi-variant enum + pattern matching: **infrastructure landed,
-// automation gap remains**. `match` is desugared by ast_simplify into
-// an if-chain using `UnaryOpr::IsVariant` and `UnaryOpr::Field`, and
-// we now generate the corresponding `Type.is<Variant>` / `Type.<Variant>_<field>`
-// accessor fns in `datatype_to_cmds`. The generated Lean parses and
-// type-checks cleanly — but `tactus_auto` (`rfl | decide | omega |
-// simp_all`) can't close a goal that still contains a `match k with
-// …` expression, which is what the @[simp]-unfolded accessors reduce
-// to. The missing piece is case-analysis on the enum scrutinee; would
-// need `tactus_auto` to learn `cases <enum-typed-var> <;> simp_all
-// <;> omega` or similar. Tracked as a follow-up to #52.
-//
-// Confirmed: the generated Lean file's structural issues are gone.
-// Codegen is correct; automation is the remaining gap.
+// Multi-variant enum + pattern matching verifies end-to-end via
+// #58's `tactus_case_split` in TactusPrelude.lean: the tactic
+// finds `k : Kind` (gated on `Kind.height` existing, which
+// `height_fn_for_datatype` emits for every concrete datatype)
+// and case-splits, letting `simp_all` unfold the
+// IsVariant/Field accessors into concrete branches that omega
+// can close.
 test_verify_one_file! {
-    #[test] test_exec_match_enum_automation_gap verus_code! {
+    #[test] test_exec_match_enum verus_code! {
         enum Kind { Foo(u8), Bar(u8) }
 
         #[verifier::tactus_auto]
@@ -3337,21 +3335,51 @@ test_verify_one_file! {
                 Kind::Bar(y) => if y <= 100 { y } else { 0 },
             }
         }
-    } => Err(err) => {
-        // Pin the current failure mode (auto-tactic failed with an
-        // unsolved goal containing `match k with`) so a future change
-        // that accidentally closes the goal without fixing the
-        // automation gap trips this test and prompts a re-evaluation.
-        assert!(
-            err.errors.iter().any(|e|
-                e.message.contains("auto-tactic failed") ||
-                e.message.contains("unsolved") ||
-                e.message.contains("match")
-            ),
-            "expected automation-gap failure on enum match, got: {:?}",
-            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
-        );
-    }
+    } => Ok(())
+}
+
+// Match with ensures that reason about variant-specific fields.
+// Exercises that `tactus_case_split` composes correctly with a
+// non-trivial post-condition — not just pattern closure.
+test_verify_one_file! {
+    #[test] test_exec_match_enum_with_ensures verus_code! {
+        enum Choice { Left(u8), Right(u8) }
+
+        #[verifier::tactus_auto]
+        fn unwrap_choice(c: Choice) -> (r: u8)
+            ensures match c {
+                Choice::Left(x) => r == x,
+                Choice::Right(y) => r == y,
+            }
+        {
+            match c {
+                Choice::Left(x) => x,
+                Choice::Right(y) => y,
+            }
+        }
+    } => Ok(())
+}
+
+// Non-enum hypotheses mixed with enum — `tactus_case_split` must
+// pick the datatype local, not the int. The `.height`-existence
+// gate guards against case-splitting on `Int` (which would
+// explode into ofNat/negSucc subgoals). Linear arithmetic in
+// branches so omega can close without nonlinear-arith help.
+test_verify_one_file! {
+    #[test] test_exec_match_enum_with_int_args verus_code! {
+        enum Op { Add, Sub }
+
+        #[verifier::tactus_auto]
+        fn apply_op(op: Op, x: u8, y: u8) -> (r: u8)
+            requires x <= 10, y <= 10, y <= x
+            ensures r <= 20
+        {
+            match op {
+                Op::Add => x + y,
+                Op::Sub => x - y,
+            }
+        }
+    } => Ok(())
 }
 
 // Lexicographic `decreases` is rejected up front — single-expression
