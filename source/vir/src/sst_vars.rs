@@ -312,7 +312,7 @@ fn stm_assign(
         StmX::AssertQuery { mode, typ_inv_exps, typ_inv_vars, body } => {
             assert!(typ_inv_vars.len() == 0);
             let vars = crate::sst_util::free_vars_exps(typ_inv_exps);
-            let mode = *mode;
+            let mode = mode.clone();
             let typ_inv_exps = Arc::new(vec![]);
             let typ_inv_vars = Arc::new(
                 declared.clone().into_iter().filter(|(x, _)| vars.contains_key(x)).collect(),
@@ -486,7 +486,7 @@ fn stm_mutations(param_typs: &[(VarIdent, Typ)], mutations: &mut HavocSet, stm: 
         StmX::AssertQuery { mode, typ_inv_exps, typ_inv_vars, body } => {
             let body = stm_mutations(param_typs, mutations, body);
             stm.new_x(StmX::AssertQuery {
-                mode: *mode,
+                mode: mode.clone(),
                 typ_inv_exps: typ_inv_exps.clone(),
                 typ_inv_vars: typ_inv_vars.clone(),
                 body: body,

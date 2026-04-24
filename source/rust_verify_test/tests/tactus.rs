@@ -3118,6 +3118,29 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// User-written `assert(P) by { lean_tactic }` inside a tactus_auto
+// exec fn — the escape hatch when the default `tactus_auto` closer
+// can't prove an obligation. The FileLoader sanitizes the `{ ... }`
+// content to spaces for rustc, rust_to_vir captures the original
+// source byte range on `ExprX::AssertBy::tactic_span`, ast_to_sst
+// routes it to `StmX::AssertQuery` with `AssertQueryMode::Tactus`,
+// and `sst_to_lean::build_wp` reads the verbatim tactic off disk and
+// prepends a `have h_tactus_assert_N : P := by <user_tac>;` to the
+// theorem's closer. The hypothesis then sits in context for the
+// rest of the proof.
+test_verify_one_file! {
+    #[test] test_exec_assert_by_user_tactic verus_code! {
+        #[verifier::tactus_auto]
+        fn f(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            assert(x < 100 ==> x + 1 <= 100) by { omega }
+            x + 1
+        }
+    } => Ok(())
+}
+
 // Generic call: the callee is parametric over `T`, and the call site
 // supplies `T = u8` via `typ_args`. `build_wp_call` used to reject
 // non-empty `typ_args` outright; now `lower_call` substitutes the

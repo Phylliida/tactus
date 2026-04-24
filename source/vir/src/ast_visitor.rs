@@ -533,7 +533,7 @@ pub(crate) trait AstVisitor<R: Returner, Err, Scope: Scoper> {
                         requires: R::get_vec_a(requires),
                         ensures: R::get_vec_a(ensures),
                         proof: R::get(proof),
-                        mode: *mode,
+                        mode: mode.clone(),
                     })
                 })
             }
