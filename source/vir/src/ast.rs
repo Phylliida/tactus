@@ -974,16 +974,34 @@ pub enum InvAtomicity {
 pub enum AssertQueryMode {
     NonLinear,
     BitVector,
-    /// Tactus: `assert(P) by { lean_tactic }` inside a
-    /// `#[verifier::tactus_auto]` fn. The tactic_span is the
-    /// (canonicalised file path, start byte, end byte) of the `{ … }`
-    /// after `by`; `sst_to_lean` reads the original file at that
-    /// range to recover the verbatim Lean tactic text and emits it
-    /// as the closer for the generated Assert obligation. The
-    /// FileLoader has sanitized the brace body to spaces for rustc's
-    /// benefit, so the `proof` field of the containing
-    /// `ExprX::AssertBy` is always an empty block in this mode.
-    Tactus { tactic_span: (String, usize, usize) },
+    /// Tactus: user-written Lean tactic inside a `#[verifier::
+    /// tactus_auto]` fn. The `tactic_span` is the source-file byte
+    /// range of the `{ … }` whose content `sst_to_lean` reads to
+    /// recover the verbatim Lean tactic text. The FileLoader has
+    /// sanitized that brace body to spaces for rustc's benefit.
+    ///
+    /// `kind` distinguishes the two Tactus surface forms:
+    /// * `AssertBy` — `assert(P) by { tac }`. Emission wraps the
+    ///   tactic as `have h_N : P := by <tac>` so the condition P
+    ///   gets an obligation and the proved hypothesis h_N is
+    ///   available for the rest of the proof.
+    /// * `ProofBlock` — `proof { tac }` (inside a tactus_auto
+    ///   exec fn). Emission emits `<tac>` raw — the user's own
+    ///   `have`s / `unfold`s / etc. run at theorem-tactic level,
+    ///   introducing hypotheses (or modifying the goal) for the
+    ///   rest of the proof.
+    Tactus { tactic_span: (String, usize, usize), kind: TactusKind },
+}
+
+/// Which Tactus surface form produced an `AssertQueryMode::Tactus`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, ToDebugSNode, PartialEq, Eq, Hash)]
+pub enum TactusKind {
+    /// `assert(P) by { tac }` — `tac` proves P; emission wraps in
+    /// `have h_N : P := by <tac>`.
+    AssertBy,
+    /// `proof { tac }` — emission emits `<tac>` raw; hypotheses the
+    /// user introduces via `have` propagate to theorem level.
+    ProofBlock,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -1133,6 +1151,7 @@ pub enum ExprX {
     /// These are added in user_defined_type_invariants.rs
     AssertAssumeUserDefinedTypeInvariant { is_assume: bool, expr: Expr, fun: Fun },
     /// Assert-forall or assert-by statement.
+    ///
     /// `tactic_span: Some((file_path, start_byte, end_byte))` is the
     /// source-file byte range of the `{ ... }` after `by`, populated
     /// only for Tactus-style assert-by inside `#[verifier::tactus_auto]`
@@ -1141,12 +1160,24 @@ pub enum ExprX {
     /// that content to spaces for rustc, so `proof` itself is an empty
     /// block). `None` for regular Verus assert-bys where `proof` is
     /// the real Rust/Verus proof code.
+    ///
+    /// `is_tactus_proof_block: true` means this AssertBy was synthesized
+    /// from a `proof { … }` block inside a tactus_auto fn (rather than
+    /// user-written `assert(P) by { … }` syntax). The distinction
+    /// matters for `sst_to_lean`'s emission: assert-by wraps the user
+    /// tactic in `have h_N : P := by <tac>`, while proof blocks emit
+    /// `<tac>` raw — the user's own `have` statements inside become
+    /// theorem-level hypotheses rather than hypotheses local to a
+    /// sub-proof. `vars` / `require` / `ensure` are all trivial for
+    /// proof blocks (`[]` / `true` / `true`); the real payload is the
+    /// tactic_span.
     AssertBy {
         vars: VarBinders<Typ>,
         require: Expr,
         ensure: Expr,
         proof: Expr,
         tactic_span: Option<(String, usize, usize)>,
+        is_tactus_proof_block: bool,
     },
     /// `assert_by` with a dedicated prover option (nonlinear_arith, bit_vector)
     AssertQuery { requires: Exprs, ensures: Exprs, proof: Expr, mode: AssertQueryMode },

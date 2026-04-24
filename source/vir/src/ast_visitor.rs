@@ -503,7 +503,7 @@ pub(crate) trait AstVisitor<R: Returner, Err, Scope: Scoper> {
                     })
                 })
             }
-            ExprX::AssertBy { vars: bs, require, ensure, proof, tactic_span } => {
+            ExprX::AssertBy { vars: bs, require, ensure, proof, tactic_span, is_tactus_proof_block } => {
                 let binders = self.visit_binders_typ(bs)?;
                 self.push_scope();
                 for b in R::get_vec_or(&binders, bs).iter() {
@@ -514,6 +514,7 @@ pub(crate) trait AstVisitor<R: Returner, Err, Scope: Scoper> {
                 let proof = self.visit_expr(proof)?;
                 self.pop_scope();
                 let tactic_span = tactic_span.clone();
+                let is_tactus_proof_block = *is_tactus_proof_block;
                 R::ret(|| {
                     expr_new(ExprX::AssertBy {
                         vars: R::get_vec_a(binders),
@@ -521,6 +522,7 @@ pub(crate) trait AstVisitor<R: Returner, Err, Scope: Scoper> {
                         ensure: R::get(ensure),
                         proof: R::get(proof),
                         tactic_span: tactic_span.clone(),
+                        is_tactus_proof_block,
                     })
                 })
             }
