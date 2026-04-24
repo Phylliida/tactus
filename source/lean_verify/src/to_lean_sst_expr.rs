@@ -493,9 +493,22 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 ));
             }
             if !is_int_height(&args[0].typ) {
+                // Non-int decrease types (e.g., `decreases t` where `t:
+                // Tree`) need a Lean `height : T → Nat` fn per
+                // datatype so we can emit the structural-subterm
+                // obligation `height cur < height prev ∨ (height cur
+                // = height prev ∧ otherwise)`. Tracked as task #54 —
+                // see DESIGN.md "Non-int decreases" for the plan
+                // (generate height fn alongside each non-generic,
+                // non-SCC datatype's declaration). Rejected here
+                // rather than emitted-as-sorry so users get a clear
+                // signal rather than a silent unsoundness.
                 return Err(format!(
                     "recursive call termination check with non-int decrease \
-                     (type {:?}) not yet supported — only int decreases work today",
+                     (type {:?}) — `decreases` on user datatypes requires \
+                     generating a Lean `height` function per datatype, \
+                     tracked as task #54. Use an int-valued decreases measure \
+                     (e.g., `decreases length_of(t)`) as a workaround.",
                     args[0].typ
                 ));
             }
