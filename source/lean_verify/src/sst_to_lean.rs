@@ -688,7 +688,13 @@ fn lower_wp(wp: &Wp<'_>, ctx: &WpCtx<'_>) -> LExpr {
         // pure function of the Wp tree + ctx.
         Wp::AssertByTactus { cond: _, tactic_text: _, body } => lower_wp(body, ctx),
         Wp::Branch { cond, then_branch, else_branch } => {
-            let c = sst_exp_to_ast(cond);
+            // Wrap the branch cond with its span (#51) — inner
+            // branch failures usually have their own Assert-level
+            // marks, but if the branch cond itself triggers a
+            // `simp_all` / `omega` goal (e.g., when the cond
+            // involves a match or complex expression), the mark
+            // points back at the `if` location in the Rust source.
+            let c = LExpr::span_mark(format_rust_loc(&cond.span), sst_exp_to_ast(cond));
             LExpr::and(
                 LExpr::implies(c.clone(), lower_wp(then_branch, ctx)),
                 LExpr::implies(LExpr::not(c), lower_wp(else_branch, ctx)),
@@ -722,8 +728,24 @@ fn lower_loop(
     after: &Wp<'_>,
     ctx: &WpCtx<'_>,
 ) -> LExpr {
-    let inv_conj = || and_all(invs.iter().map(|i| sst_exp_to_ast(&i.inv)).collect());
-    let decrease_ast = || sst_exp_to_ast(decrease);
+    // Wrap each invariant with its individual span — common failure
+    // mode is "invariant not established at entry" / "not maintained
+    // across body" / "insufficient for post-loop goal", each of which
+    // surfaces as one unsolved conjunct whose location the user
+    // needs to know (#51).
+    let inv_conj = || and_all(
+        invs.iter()
+            .map(|i| LExpr::span_mark(format_rust_loc(&i.inv.span), sst_exp_to_ast(&i.inv)))
+            .collect()
+    );
+    // Wrap the decrease expression so "decrease didn't decrease"
+    // failures point at the `decreases D` clause. CheckDecreaseHeight
+    // obligations (recursive-call termination) go through `Wp::Assert`
+    // and are wrapped there.
+    let decrease_ast = || LExpr::span_mark(
+        format_rust_loc(&decrease.span),
+        sst_exp_to_ast(decrease),
+    );
 
     // Init: invariant conjunction at loop entry.
     let init_clause = inv_conj();
