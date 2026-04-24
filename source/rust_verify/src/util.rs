@@ -4,20 +4,15 @@ use rustc_span::Span;
 use vir::ast::VirErr;
 
 /// Strip common leading whitespace from all non-empty lines.
+///
+/// Delegates to `lean_verify::source_util::dedent` so the proof-fn
+/// tactic-text path and the exec-fn assert-by path (in `sst_to_lean`)
+/// share one implementation. The tests below remain as regression
+/// guards on the rule that assert-by / proof-fn tactic bodies
+/// dedent identically regardless of which extraction path reads
+/// them.
 pub fn dedent(s: &str) -> String {
-    let min_indent = s.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| line.len() - line.trim_start().len())
-        .min()
-        .unwrap_or(0);
-    let mut out = String::new();
-    for (i, line) in s.lines().enumerate() {
-        if i > 0 { out.push('\n'); }
-        if !line.trim().is_empty() {
-            out.push_str(&line[min_indent..]);
-        }
-    }
-    out
+    lean_verify::source_util::dedent(s)
 }
 
 pub(crate) fn err_span<A, S: Into<String>>(span: Span, msg: S) -> Result<A, VirErr> {
