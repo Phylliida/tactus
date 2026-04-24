@@ -109,6 +109,7 @@ use vir::sst::{
 use vir::ast::{
     AssertQueryMode, Fun, FunctionX, KrateX, TactusKind, Typ, UnaryOp, UnaryOpr, VarIdent,
 };
+use vir::messages::Span;
 use crate::lean_ast::{
     and_all, substitute, Binder as LBinder, BinderKind, Expr as LExpr, Tactic, Theorem,
 };
@@ -629,6 +630,30 @@ impl<'a> Wp<'a> {
 
 // ── WP lowering ────────────────────────────────────────────────────────
 
+/// Format a Verus `Span` as a compact `file:line:col` location string
+/// for `/-! @rust:LOC -/` markers in the generated Lean (#51).
+///
+/// Verus's `Span::as_string` is shaped like
+/// `"/path/to/file.rs:LINE:COL: LINE:COL (#0)"` (start position,
+/// end position, hygiene marker). We extract just the start
+/// position — that's what surfaces in error messages.
+///
+/// Returns the full `as_string` unchanged if the format doesn't
+/// match expectations (defensive: better to over-include than to
+/// silently strip information).
+fn format_rust_loc(span: &Span) -> String {
+    let s = &span.as_string;
+    // Find ": " separating start from end positions. Path may
+    // contain `:` (Windows drives, line/col separators), so
+    // splitting from the right at ": " is more robust than from
+    // the left.
+    if let Some(idx) = s.find(": ") {
+        s[..idx].to_string()
+    } else {
+        s.clone()
+    }
+}
+
 /// Interpret a `Wp` tree into a Lean `LExpr`. Each node has a
 /// corresponding WP rule; see the variant docs on `Wp` for details.
 fn lower_wp(wp: &Wp<'_>, ctx: &WpCtx<'_>) -> LExpr {
@@ -645,7 +670,15 @@ fn lower_wp(wp: &Wp<'_>, ctx: &WpCtx<'_>) -> LExpr {
                 LExpr::let_bind(sanitize(name), rhs_ast, body_lowered.clone())
             })
         }
-        Wp::Assert(e, body) => LExpr::and(sst_exp_to_ast(e), lower_wp(body, ctx)),
+        Wp::Assert(e, body) => LExpr::and(
+            // Wrap with the SST span so the pp emits a `/-! @rust:LOC -/`
+            // marker before this assertion. On Lean error, `format_error`
+            // scans back from the reported line for the closest preceding
+            // marker — the user sees the Rust source position of the
+            // failing obligation, not just the fn declaration. (#51)
+            LExpr::span_mark(format_rust_loc(&e.span), sst_exp_to_ast(e)),
+            lower_wp(body, ctx),
+        ),
         Wp::Assume(e, body) => LExpr::implies(sst_exp_to_ast(e), lower_wp(body, ctx)),
         // The user tactic is NOT in the goal — it's extracted
         // up-front by `collect_tactus_haves` and prepended to the
@@ -1575,9 +1608,34 @@ mod tests {
 
     /// Compare two LExprs structurally by pretty-printing (our
     /// printer is deterministic so equivalent trees produce
-    /// identical strings).
+    /// identical strings). Strips `/-! @rust:LOC -/` SpanMark
+    /// markers from both sides before comparing — these are
+    /// instrumentation metadata for #51 source mapping, not
+    /// semantic content, so semantic-equivalence tests should
+    /// ignore them.
     fn pp_eq(a: &LExpr, b: &LExpr) -> bool {
-        crate::lean_pp::pp_expr(a) == crate::lean_pp::pp_expr(b)
+        let strip = |s: &str| -> String {
+            let mut out = String::new();
+            let mut rest = s;
+            while !rest.is_empty() {
+                if let Some(start) = rest.find("/- @rust:") {
+                    out.push_str(&rest[..start]);
+                    let after = &rest[start..];
+                    if let Some(end) = after.find(" -/ ") {
+                        rest = &after[end + " -/ ".len()..];
+                        continue;
+                    } else {
+                        // Unmatched marker — append rest verbatim.
+                        out.push_str(after);
+                        break;
+                    }
+                }
+                out.push_str(rest);
+                break;
+            }
+            out
+        };
+        strip(&crate::lean_pp::pp_expr(a)) == strip(&crate::lean_pp::pp_expr(b))
     }
 
     // ── needs_peel ──────────────────────────────────────────────

@@ -2974,6 +2974,17 @@ test_verify_one_file! {
         }
     } => Err(err) => {
         assert!(err.errors.len() >= 1, "non-decreasing recursion should fail");
+        // #51 source mapping: the error should mention a test.rs:L:C
+        // pointing at the failing obligation (the recursive call's
+        // termination check), not just at the fn declaration.
+        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("at ") && m.contains("test.rs:")),
+            "expected error to include a Rust source location \
+             (`at <path>/test.rs:L:C:`) from #51 SpanMark instrumentation. \
+             got: {:?}",
+            msgs,
+        );
     }
 }
 

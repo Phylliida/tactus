@@ -85,6 +85,9 @@ fn expr_prec(node: &ExprNode) -> u16 {
         | ExprNode::ArrayLit(_) | ExprNode::StructUpdate { .. }
         | ExprNode::Anon(_) | ExprNode::Raw(_) => PREC_ATOM,
         ExprNode::FieldProj { .. } | ExprNode::Index { .. } => PREC_ATOM,
+        // SpanMark is transparent — inherit `inner`'s precedence so
+        // wrapping never changes parenthesization.
+        ExprNode::SpanMark { inner, .. } => expr_prec(&inner.node),
         ExprNode::BinOp { op, .. } => binop_info(*op).0,
         ExprNode::UnOp { op: UnOp::Not, .. } => PREC_NOT,
         ExprNode::UnOp { op: UnOp::Neg, .. } => PREC_MUL + 1,
@@ -107,6 +110,12 @@ pub struct PpOutput {
     /// appears. The proof-fn pipeline uses this to build a `LeanSourceMap`
     /// without having to scan the output for a marker string.
     pub tactic_starts: Vec<usize>,
+    /// `(lean_line, rust_loc)` pairs accumulated as the pp visits
+    /// `ExprNode::SpanMark` nodes. `lean_line` is the 1-indexed line
+    /// in `text` where the marked sub-expression starts. Used by
+    /// `LeanSourceMap` to map Lean error lines back to Rust source
+    /// positions for #51 (exec-fn source mapping).
+    pub span_marks: Vec<(usize, String)>,
 }
 
 pub fn pp_commands(cmds: &[Command]) -> PpOutput {
@@ -115,7 +124,36 @@ pub fn pp_commands(cmds: &[Command]) -> PpOutput {
     for cmd in cmds {
         write_command(&mut out, cmd, &mut tactic_starts);
     }
-    PpOutput { text: out, tactic_starts }
+    let span_marks = scan_span_marks(&out);
+    PpOutput { text: out, tactic_starts, span_marks }
+}
+
+/// Scan the rendered Lean text for `/-! @rust:LOC -/` markers
+/// emitted by `ExprNode::SpanMark` rendering. Returns
+/// `(lean_line, rust_loc)` pairs in source order — `lean_line` is
+/// the 1-indexed line where the marker starts (which is also the
+/// line where the marked sub-expression effectively begins, since
+/// the marker is inline with no newline before the inner expr).
+///
+/// Cheap O(n) scan over the output. Avoids threading `span_marks`
+/// through ~50 `write_*` call sites.
+fn scan_span_marks(text: &str) -> Vec<(usize, String)> {
+    let needle = "/- @rust:";
+    let close = " -/";
+    let mut marks = Vec::new();
+    // `match_indices` returns valid char-boundary byte offsets, so
+    // we don't have to track byte-vs-char boundaries ourselves
+    // (the generated text contains multi-byte UTF-8 like `∧`, `→`).
+    for (byte_pos, _) in text.match_indices(needle) {
+        let start = byte_pos + needle.len();
+        let Some(rel_end) = text[start..].find(close) else { continue };
+        let loc = text[start..start + rel_end].trim().to_string();
+        // Count newlines up to (and not including) this marker's
+        // byte position to derive the 1-indexed line number.
+        let line = 1 + text[..byte_pos].bytes().filter(|&b| b == b'\n').count();
+        marks.push((line, loc));
+    }
+    marks
 }
 
 /// Render a single command. Discards any tactic-start landmarks; use
@@ -542,6 +580,28 @@ fn write_expr_body(out: &mut String, node: &ExprNode) {
                 write_expr(out, e, 0);
             }
             out.push('⟩');
+        }
+
+        // SpanMark: transparent at the value level. Emit a leading
+        // `/- @rust:LOC -/` block-comment marker in the Lean
+        // output so `scan_span_marks` (called by `pp_commands`)
+        // can later map Lean error lines back to Rust source
+        // positions (#51). Regular block comments (`/- ... -/`)
+        // are valid anywhere whitespace is (unlike `/-!`, which
+        // Lean treats as a module docstring and rejects inline).
+        // Terminates only on `-/`; we strip newlines from the loc
+        // text defensively but otherwise preserve it as-is. Paths
+        // containing `-/` would break the comment, but in practice
+        // Verus's `Span::as_string` is `path:line:col` with no
+        // `-/`.
+        ExprNode::SpanMark { rust_loc, inner } => {
+            out.push_str("/- @rust:");
+            for c in rust_loc.chars() {
+                if c == '\n' || c == '\r' { out.push(' '); }
+                else { out.push(c); }
+            }
+            out.push_str(" -/ ");
+            write_expr_body(out, &inner.node);
         }
     }
 }
