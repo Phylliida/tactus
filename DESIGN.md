@@ -1073,12 +1073,51 @@ exec fns."
 
 * **Non-int `decreases` (Lean `height` function per datatype).**
   Currently `CheckDecreaseHeight` rejects non-int decrease types.
-  Fix: generate a `height : T → Nat` function per datatype used in
-  a decreases clause (recursive definition summing children's
-  heights + 1), add axioms matching the prelude's `height_lt` ↔
-  arithmetic equivalence, and allow `is_int_height` to return true
-  for types with a generated `height`. Companion test: recursive
-  fn with `decreases tree` that case-matches on an `enum Tree`.
+  Pinned by `test_exec_call_recursive_datatype_rejected` — the
+  error message names task #54 so when someone hits it in the
+  wild, they get a clear pointer.
+
+  **Implementation plan (MVS scope):**
+  1. In `to_lean_fn::datatype_to_cmds`, emit `def T.height : T →
+     Nat := match x with | Ctor a1 a2 ... => 1 + <sum of
+     height(ai) for ai : T>`. Non-recursive-field contributions
+     are omitted (treat as 0). Needed per datatype that appears
+     (transitively) in any exec-fn's `decreases`.
+  2. In `sst_exp_to_ast_checked`'s `CheckDecreaseHeight` arm, if
+     the decrease type is a supported datatype, emit `T.height
+     cur < T.height prev ∨ (T.height cur = T.height prev ∧
+     otherwise)` instead of the int fast-path. `is_int_height`
+     flips from "gate on support" to a codegen-path selector.
+  3. `Box<T>` / `Arc<T>` wrappers need peeling for both "is this
+     field recursive?" and the `decreases *t` measure shape.
+     Verus renders Rust's `Box<T>` as `TypX::Datatype(alloc::
+     boxed::Box, [T])` — peel at the Lean level or during height
+     generation.
+
+  **Explicit deferrals (reject with clear message):**
+  - **Generic datatypes.** `Tree<A>` would need a `[SizeOf A]`-
+     style height axiom; real implementation routes through Lean
+     typeclasses. Reject if any type param appears as a field
+     type.
+  - **Mutually recursive datatype SCCs.** Emit one `mutual`
+    block of height fns. Defer until we see a real user case.
+  - **Recursive function fields** (`struct S { f: FnSpec(int) →
+    Option<S> }`). Verus has a special axiom for this
+    (`recursive_function_field` in
+    `datatype_height_axioms`); we don't support.
+  - **Lexicographic `decreases a, b`.** Check if exec fn
+    `decreases` is even multi-tuple today — may already be
+    rejected upstream.
+
+  **Companion test to add when feature lands:** take the
+  currently-rejected `test_exec_call_recursive_datatype_rejected`
+  (recursive `Stack` enum), flip it to `=> Ok(())`, and add a
+  companion non-decreasing case. Gotcha: the recursive-enum body
+  uses `match`, so full end-to-end success depends on #58 (match
+  automation) as well. Consider a tacit staging: #54 lands
+  without #58, and the enum test still fails tactus_auto on the
+  match — but the termination obligation itself should verify
+  (decomposable via `if s.isEmpty { … } else { … }`).
 
 ##### Tier 3 — bigger slices (~1 week each)
 

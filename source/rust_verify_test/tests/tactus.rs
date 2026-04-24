@@ -3037,6 +3037,44 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// `decreases` on a user datatype (non-int measure) is currently
+// rejected at `CheckDecreaseHeight` lowering — the fast int-only
+// path in `sst_exp_to_ast_checked` errors out with a clear message
+// pointing at #54. This test pins the rejection so that when the
+// feature lands (Lean `T.height` fn generation), the rejection
+// flips to Ok and someone audits the lowering — rather than
+// silently verifying with a wrong obligation. See DESIGN.md
+// "Non-int decreases" for the implementation plan.
+test_verify_one_file! {
+    #[test] test_exec_call_recursive_datatype_rejected verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum Stack {
+            Empty,
+            Push(u8, Box<Stack>),
+        }
+
+        #[verifier::tactus_auto]
+        fn depth(s: &Stack) -> (r: u64)
+            decreases s
+        {
+            match s {
+                Stack::Empty => 0,
+                Stack::Push(_, rest) => 1 + depth(rest),
+            }
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("non-int decrease")
+                || e.message.contains("height")
+                || e.message.contains("#54")),
+            "non-int decreases should be rejected with a clear message naming \
+             the missing height fn / task #54, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
 // Early return inside a loop body — the WP DSL's `Return` arm writes
 // `ctx.ensures_goal` (the fn's ensures) by construction, regardless
 // of how deeply nested the return is. Pre-DSL code conflated this
