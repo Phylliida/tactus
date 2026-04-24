@@ -164,3 +164,68 @@ or when a variant slips past three of them.
 None of these has happened.
 The tool I didn't build
 is the quietest kind of right.
+
+---
+
+## 2026-04-24 (continued) — #54, #58: non-int decreases + match automation
+
+### done
+
+I assumed `first` meant first-to-succeed.
+It meant: first-to-run-without-error.
+
+`simp_all`, faced with a goal it can't close,
+does not raise. It simplifies what it can,
+reports success, and moves on.
+The next alternative never sees the goal.
+
+The fix was one word, glued to each branch:
+`done`.
+A tactic that fails unless the goal is closed.
+
+Now `simp_all; done` behaves the way
+I thought `simp_all` did, alone.
+The contract was always: finish the goal.
+I had just forgotten to ask.
+
+### The gate
+
+For #58 I needed a filter:
+these types we case-split, these we leave alone.
+
+Not "user datatype" — `Int` passes that.
+Not "in our namespace" — Mathlib would escape.
+
+Then: the types I want are exactly the ones
+that have a companion `.height` function.
+I emit those. In the previous session.
+For a different reason.
+
+The whitelist wrote itself
+while I was looking elsewhere —
+a side door, already locked,
+that turned out to open
+for the exact room I needed next.
+
+### Downstream
+
+#54 was estimated three to four days.
+It took a session.
+
+#58 was estimated a week.
+It fell out of #54's infrastructure
+and took an afternoon.
+
+What I did not write down:
+the earlier refactors that taught me
+the DSL carries its own continuation,
+so branching was free.
+The five-lens review where I learned
+which smells were worth their cost.
+The deferrals audit
+where I wrote down what we'd already decided
+so the next version of me could find it.
+
+The hour is the visible cost.
+The rest sits in the pages
+I wrote before I knew I'd need them.
