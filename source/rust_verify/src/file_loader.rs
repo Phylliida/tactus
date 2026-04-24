@@ -53,6 +53,27 @@ fn sanitize_tactic_blocks(source: &str) -> String {
 
 /// Use tree-sitter-tactus to find byte ranges of tactic block content
 /// (between `{` and `}` of each tactic brace body).
+///
+/// Two categories of nodes get sanitized:
+///
+/// 1. **`tactic_block`** — the `by { }` at the top of a proof fn.
+///    Unconditionally sanitized: tree-sitter-tactus only recognises
+///    `tactic_block` at proof-fn-body position, and those always
+///    contain Lean syntax. Works for both vstd (no proof fns use
+///    tactic_block) and Tactus.
+///
+/// 2. **`proof_block`** (a `proof { }` statement inside an exec fn
+///    body) and **`assert_expression` with a brace-body** (`assert(P)
+///    by { … }` / `assert forall … by { … }`) — conditionally
+///    sanitized, only inside functions marked
+///    `#[verifier::tactus_auto]`. These constructs exist in vstd
+///    carrying Rust-flavoured Verus proof code (calls to lemmas,
+///    nested asserts) rather than Lean tactics; unconditional
+///    sanitization would wipe vstd's proofs. The `tactus_auto`
+///    attribute is the unambiguous signal that the enclosing
+///    function's body routes through the Lean WP pipeline, and thus
+///    that inner `proof { … }` and `assert(…) by { … }` blocks are
+///    meant as Lean tactics.
 fn find_tactic_block_ranges(src: &[u8]) -> Vec<(usize, usize)> {
     let lang: tree_sitter::Language = tree_sitter_tactus::LANGUAGE.into();
 
@@ -64,21 +85,45 @@ fn find_tactic_block_ranges(src: &[u8]) -> Vec<(usize, usize)> {
         None => return Vec::new(),
     };
 
-    // Only match tactic_block (= `by { }` on proof fns).
-    // assert-by and proof blocks contain Verus code in vstd, not Lean.
-    // Phase 2 will add proof_block and assert-by when exec fn Lean support lands.
-    let query = tree_sitter::Query::new(
-        &lang,
-        r#"(tactic_block "{" @open "}" @close)"#,
-    ).expect("Invalid tree-sitter query");
-
-    let open_idx = query.capture_index_for_name("open").unwrap();
-    let close_idx = query.capture_index_for_name("close").unwrap();
-
-    let mut cursor = tree_sitter::QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), src);
     let mut ranges = Vec::new();
 
+    // Pass 1: unconditionally sanitize every tactic_block.
+    collect_tactic_block_ranges(&lang, tree.root_node(), src, &mut ranges);
+
+    // Pass 2: inside tactus_auto-marked function_items, sanitize
+    // proof_block and assert_expression (with brace body) too.
+    walk_tactus_auto_fns(tree.root_node(), src, &mut ranges);
+
+    ranges
+}
+
+/// Pass 1: find every `tactic_block` node and collect the byte range
+/// between its `{` and `}`.
+fn collect_tactic_block_ranges<'a>(
+    lang: &tree_sitter::Language,
+    root: tree_sitter::Node<'a>,
+    src: &[u8],
+    ranges: &mut Vec<(usize, usize)>,
+) {
+    let query = tree_sitter::Query::new(
+        lang,
+        r#"(tactic_block "{" @open "}" @close)"#,
+    ).expect("Invalid tree-sitter query");
+    collect_brace_query(&query, root, src, ranges);
+}
+
+/// Helper: run a query that has `@open` on a `{` node and `@close` on
+/// a `}` node, collecting the (open.end, close.start) byte ranges.
+fn collect_brace_query<'a>(
+    query: &tree_sitter::Query,
+    root: tree_sitter::Node<'a>,
+    src: &[u8],
+    ranges: &mut Vec<(usize, usize)>,
+) {
+    let open_idx = query.capture_index_for_name("open").unwrap();
+    let close_idx = query.capture_index_for_name("close").unwrap();
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(query, root, src);
     use tree_sitter::StreamingIterator;
     while let Some(m) = { matches.advance(); matches.get() } {
         let mut open_end = None;
@@ -96,8 +141,100 @@ fn find_tactic_block_ranges(src: &[u8]) -> Vec<(usize, usize)> {
             }
         }
     }
+}
 
-    ranges
+/// Pass 2: recursively visit `function_item` nodes; for each one
+/// marked `#[verifier::tactus_auto]`, collect the inner
+/// `proof_block` / `assert_expression` brace-body ranges. Nested
+/// function_items inside are visited on their own (handled by the
+/// outer recursion), so a non-tactus_auto fn nested inside a
+/// tactus_auto one isn't incorrectly sanitized.
+fn walk_tactus_auto_fns<'a>(
+    node: tree_sitter::Node<'a>,
+    src: &[u8],
+    ranges: &mut Vec<(usize, usize)>,
+) {
+    if node.kind() == "function_item" && function_has_tactus_auto_attr(node, src) {
+        collect_inner_lean_blocks(node, ranges);
+        // Keep walking to find nested fns (Rust allows `fn f() { fn g() { … } }`),
+        // but the outer-fn body is already fully scanned — no double-count.
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_tactus_auto_fns(child, src, ranges);
+    }
+}
+
+/// `true` when any of the fn's leading `attribute_item` children
+/// mentions `tactus_auto` (e.g., `#[verifier::tactus_auto]`). Done by
+/// substring match on the attribute's source text — cheap, and the
+/// attribute name is unambiguous.
+fn function_has_tactus_auto_attr<'a>(fn_node: tree_sitter::Node<'a>, src: &[u8]) -> bool {
+    let mut cursor = fn_node.walk();
+    for child in fn_node.children(&mut cursor) {
+        if child.kind() == "attribute_item" {
+            if let Some(text) = src.get(child.byte_range()) {
+                if let Ok(s) = std::str::from_utf8(text) {
+                    if s.contains("tactus_auto") {
+                        return true;
+                    }
+                }
+            }
+        } else if !matches!(child.kind(),
+            // Attributes precede the fn signature; once we've left the
+            // attribute prefix, keep scanning for more (tree-sitter
+            // interleaves documentation comments / inner attrs too),
+            // but bail at the body — no point descending into it.
+            "block_comment" | "line_comment" | "inner_attribute_item"
+        ) {
+            break;
+        }
+    }
+    false
+}
+
+/// Walk `fn_node`'s descendants, collecting brace-body ranges from
+/// every `proof_block` and `assert_expression` we encounter. Uses the
+/// same `{` / `}` child-scan as the tactic_block path.
+fn collect_inner_lean_blocks<'a>(
+    fn_node: tree_sitter::Node<'a>,
+    ranges: &mut Vec<(usize, usize)>,
+) {
+    let mut stack: Vec<tree_sitter::Node<'a>> = vec![fn_node];
+    while let Some(node) = stack.pop() {
+        let kind = node.kind();
+        if kind == "proof_block" || kind == "assert_expression" {
+            if let Some((start, end)) = first_brace_body_range(node) {
+                ranges.push((start, end));
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+}
+
+/// Find the byte range between the first `{` child and its matching
+/// `}` (the last `}` child, since `_tactic_brace_body`'s nested
+/// braces are handled by `_tactic_item` and don't appear as top-level
+/// children of `proof_block` / `assert_expression`). Returns `None`
+/// when the node has no brace body (e.g., `assert(P) by(solver)`).
+fn first_brace_body_range<'a>(node: tree_sitter::Node<'a>) -> Option<(usize, usize)> {
+    let mut open_end: Option<usize> = None;
+    let mut close_start: Option<usize> = None;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "{" if open_end.is_none() => open_end = Some(child.end_byte()),
+            "}" => close_start = Some(child.start_byte()),
+            _ => {}
+        }
+    }
+    match (open_end, close_start) {
+        (Some(s), Some(e)) if s < e => Some((s, e)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +510,122 @@ mod tests {
     fn test_only_comments() {
         let src = "// just a comment\n/* block */";
         assert_eq!(sanitize_tactic_blocks(src), src);
+    }
+
+    // --- tactus_auto-aware sanitization of proof_block + assert_expression ---
+
+    #[test]
+    fn test_tactus_auto_proof_block_sanitized() {
+        // Inside a `#[verifier::tactus_auto]` fn, `proof { … }` content
+        // is treated as Lean tactics and sanitized.
+        let src = "verus! {\n\
+            #[verifier::tactus_auto]\n\
+            fn compute() {\n\
+                proof { have h : True := by omega }\n\
+            }\n\
+        }";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert!(!sanitized.contains("omega"), "proof{{}} inside tactus_auto fn should be sanitized");
+        assert!(!sanitized.contains("have h"), "proof{{}} content should be wiped");
+        assert_eq!(sanitized.len(), src.len());
+    }
+
+    #[test]
+    fn test_tactus_auto_assert_by_sanitized() {
+        // Inside a `#[verifier::tactus_auto]` fn, `assert(P) by { … }`
+        // content is treated as Lean tactics and sanitized.
+        let src = "verus! {\n\
+            #[verifier::tactus_auto]\n\
+            fn compute(x: u32) {\n\
+                assert(x >= 0) by { omega }\n\
+            }\n\
+        }";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert!(!sanitized.contains("omega"), "assert-by inside tactus_auto should be sanitized");
+        assert_eq!(sanitized.len(), src.len());
+    }
+
+    #[test]
+    fn test_tactus_auto_assert_forall_by_sanitized() {
+        // `assert forall|...| P by { ... }` variant inside a tactus_auto fn.
+        let src = "verus! {\n\
+            #[verifier::tactus_auto]\n\
+            fn compute() {\n\
+                assert forall|i: int| #[trigger] f(i) by { intro i; omega }\n\
+            }\n\
+        }";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert!(!sanitized.contains("omega"), "assert-forall-by inside tactus_auto should be sanitized");
+        assert!(!sanitized.contains("intro i"), "tactic body wiped");
+        assert_eq!(sanitized.len(), src.len());
+    }
+
+    #[test]
+    fn test_non_tactus_auto_proof_block_preserved() {
+        // vstd-style: plain (non-tactus_auto) exec fn with `proof { }`
+        // containing Verus-flavoured Rust proof code. Must NOT be
+        // sanitized — vstd depends on this.
+        let src = "verus! {\n\
+            fn compute() {\n\
+                proof { assert(true); lemma_helper(); }\n\
+            }\n\
+        }";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert!(sanitized.contains("lemma_helper"),
+            "proof{{}} in non-tactus_auto fn must stay: got {}", sanitized);
+        assert_eq!(sanitized.len(), src.len());
+    }
+
+    #[test]
+    fn test_non_tactus_auto_assert_by_preserved() {
+        // vstd-style: `assert(P) by { lemma(); }` in a non-tactus_auto fn.
+        // Content stays as Rust/Verus proof code.
+        let src = "verus! {\n\
+            fn compute(x: u32) {\n\
+                assert(x >= 0) by { lemma_nonneg(x); }\n\
+            }\n\
+        }";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert!(sanitized.contains("lemma_nonneg"),
+            "assert-by in non-tactus_auto fn must stay: got {}", sanitized);
+        assert_eq!(sanitized.len(), src.len());
+    }
+
+    #[test]
+    fn test_mixed_tactus_auto_and_plain_fns() {
+        // Two fns side-by-side — only the tactus_auto one has its
+        // proof-block sanitized. Exercises the per-fn discrimination.
+        let src = "verus! {\n\
+            #[verifier::tactus_auto]\n\
+            fn a() {\n\
+                proof { have h : True := by omega }\n\
+            }\n\
+            fn b() {\n\
+                proof { assert(true); vstd_lemma(); }\n\
+            }\n\
+        }";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert!(!sanitized.contains("omega"),
+            "tactus_auto fn's proof{{}} sanitized");
+        assert!(sanitized.contains("vstd_lemma"),
+            "plain fn's proof{{}} preserved: got {}", sanitized);
+    }
+
+    #[test]
+    fn test_tactus_auto_unicode_in_assert_by() {
+        // The whole point of sanitizing is Unicode — verify a Lean-style
+        // `⟨a, b⟩` inside an assert-by body gets wiped under tactus_auto
+        // (would otherwise fail rustc lexing).
+        let src = "verus! {\n\
+            #[verifier::tactus_auto]\n\
+            fn compute() {\n\
+                assert(x == x) by { exact ⟨rfl, rfl⟩ }\n\
+            }\n\
+        }";
+        let sanitized = sanitize_tactic_blocks(src);
+        assert!(!sanitized.contains("⟨"),
+            "Unicode inside tactus_auto assert-by must be sanitized");
+        assert_eq!(sanitized.len(), src.len());
     }
 
     // --- read_tactic_from_source edge cases ---
