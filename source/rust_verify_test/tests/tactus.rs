@@ -2938,9 +2938,14 @@ test_verify_one_file! {
             y
         }
     } => Err(err) => {
+        // The rejection message names task #55 and suggests the
+        // refactor-to-non-mutating workaround. Flips to Ok when
+        // #55's havoc-after-call encoding lands.
         assert!(
-            err.errors.iter().any(|e| e.message.contains("not yet supported")),
-            "&mut call arg should be rejected, got: {:?}",
+            err.errors.iter().any(|e| e.message.contains("task #55")
+                || e.message.contains("havoc-after-call")),
+            "expected `&mut` rejection to name task #55 / havoc semantics, \
+             got: {:?}",
             err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
         );
     }

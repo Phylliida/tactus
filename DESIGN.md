@@ -1151,17 +1151,62 @@ exec fns."
 
 ##### Tier 3 — bigger slices (~1 week each)
 
-* **`&mut` args on calls.** Havoc-after-call semantics: after
-  `foo(&mut x)` returns, `x` is an arbitrary value satisfying its
-  type invariant and the callee's `ensures` (which may reference
-  the new `x`). Plus aliasing: two `&mut` args to the same call
-  must be distinct (Rust's borrow checker guarantees this upstream).
-  Encoding: emit `∀ (x' : T), type_inv(x') → ensures[x ↦ x'] → …`
-  replacing the current pre-and-post pair with a universally-
-  quantified post-state. Scope is bigger than it looks — aliasing
-  tracking, `ensures` rewrites on mutated params, interaction with
-  `old(x)`. Currently rejected in `build_wp_call` via
-  `contains_loc`.
+* **`&mut` args on calls (#55).** Currently rejected in
+  `build_wp_call` via `contains_loc`. Pinned by
+  `test_exec_call_mut_arg_rejected` with a rejection message
+  that names the task and suggests the
+  refactor-to-non-mutating workaround.
+
+  **Semantics**: after `foo(&mut x)` returns, `x` is an
+  arbitrary value satisfying its type invariant AND the
+  callee's `ensures` (which may reference the new `x`).
+  Plus aliasing: two `&mut` args to the same call must be
+  distinct (Rust's borrow checker guarantees this upstream,
+  so we don't need to check).
+
+  **Implementation plan (MVS scope):**
+  1. Detect `&mut` parameters at callee-registration time:
+     check `callee.params[i].x.is_mut` (or whatever VIR's
+     field is called — read before coding). Collect indices
+     of `&mut` positions on callee.
+  2. At each call site: for each `&mut` index, extract the
+     caller-side destination `VarIdent` from `args[i]` (the
+     arg is a `Loc` of the mutated caller var).
+  3. In `lower_call`, emit `∀ (x_i' : T_i), type_inv(x_i')`
+     binders for each mutated caller var, threaded around
+     the post-call continuation. The ensures clause is
+     substituted with `p_i ↦ x_i'` (not `p_i ↦ arg_i`).
+     After the ensures implication, the continuation sees
+     `x_i'` as the new value — achieved by textually
+     re-binding the caller var: `let <caller_var_i> :=
+     x_i' in <continuation>`.
+  4. The single-arg case (one `&mut` param) is the MVS;
+     multi-arg is a straightforward extension via nested
+     `∀` quantifiers.
+
+  **Explicit deferrals:**
+  - **`old(x)` in callee's ensures.** Verus's `ExpX::Old`
+    references the pre-call value; currently rejected at
+    the expression level. When supporting `&mut` we need to
+    pass through `old(x)` as a reference to the pre-call
+    value — specifically, the current binding of the
+    substitution `p ↦ arg`. Simplest: substitute
+    `old(p) ↦ arg` and regular `p ↦ x'` in the ensures
+    rewrite.
+  - **`&mut` on a non-local expression** (e.g.,
+    `foo(&mut v[i])` — mutating through an index). The
+    `Loc` may not reduce to a simple `VarIdent`. First
+    slice assumes the arg-side `Loc` extracts to a single
+    `VarIdent` via `extract_simple_var_ident`; reject
+    otherwise.
+  - **Multi-`&mut` aliasing** between args is precluded by
+    Rust's borrow checker at compile time, so no runtime
+    check needed on our side.
+
+  **Companion test to add when feature lands:** the
+  currently-pinned `test_exec_call_mut_arg_rejected` flips
+  to `=> Ok(())`. Add non-decreasing / ensures-violation
+  companions similar to the #54 pattern.
 
 * **Trait-method calls (dynamic + resolved static).** Currently
   rejected via `resolved_method: Some(_)` / `CallTargetKind::
