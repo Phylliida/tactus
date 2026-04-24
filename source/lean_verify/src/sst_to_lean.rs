@@ -1270,8 +1270,19 @@ fn build_wp_call<'a>(
     }
     for a in args.iter() {
         if contains_loc(a) {
+            // `&mut` args need havoc-after-call semantics: post-call,
+            // the mutated parameter is any value satisfying its type
+            // invariant AND the callee's `ensures` (which may
+            // reference the new value). Encoding: `∀ (x' : T),
+            // type_inv(x') → ensures[x ↦ x'] → <continuation>`
+            // replacing the current pre/post pair. Tracked as task
+            // #55 — see DESIGN.md "&mut in exec-fn calls" for the
+            // plan (single-arg first, then multi-arg / aliasing).
             return Err(
-                "calls with `&mut` arguments are not yet supported".to_string()
+                "calls with `&mut` arguments require havoc-after-call \
+                 semantics — tracked as task #55. Workaround: refactor \
+                 to a non-mutating signature (`fn foo(x: T) -> T` + \
+                 caller re-binds) until the feature lands.".to_string()
             );
         }
         check_exp(a)?;
