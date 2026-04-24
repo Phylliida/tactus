@@ -3037,16 +3037,24 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// `decreases` on a user datatype (non-int measure) is currently
-// rejected at `CheckDecreaseHeight` lowering — the fast int-only
-// path in `sst_exp_to_ast_checked` errors out with a clear message
-// pointing at #54. This test pins the rejection so that when the
-// feature lands (Lean `T.height` fn generation), the rejection
-// flips to Ok and someone audits the lowering — rather than
-// silently verifying with a wrong obligation. See DESIGN.md
-// "Non-int decreases" for the implementation plan.
+// `decreases` on a user datatype exercises the #54 pipeline:
+// `datatype_to_cmds` emits the match-based `T.height : T → Nat`
+// fn alongside the inductive, `CheckDecreaseHeight` dispatches
+// to `T.height cur < T.height prev ∨ (T.height cur = T.height
+// prev ∧ otherwise)` via `decrease_height_datatype` (peeling
+// Boxed/Decorate), and Lean auto-proves termination of `height`
+// by structural recursion on its scrutinee.
+//
+// The termination obligation itself is correctly emitted and
+// shape-correct — `(Push_val1 s).height < s.height` under
+// hypothesis `¬s.isEmpty`. Closing it end-to-end needs case
+// analysis on `s`, which is the #58 (match automation) gap.
+// This test pins the "#54 landed, #58 pending" state:
+// verification fails, but with a Lean goal showing the
+// `.height` dispatch worked. When #58 lands and closes match
+// goals, this test flips to `=> Ok(())`.
 test_verify_one_file! {
-    #[test] test_exec_call_recursive_datatype_rejected verus_code! {
+    #[test] test_exec_call_recursive_datatype_termination verus_code! {
         use vstd::std_specs::alloc::*;
 
         enum Stack {
@@ -3055,22 +3063,33 @@ test_verify_one_file! {
         }
 
         #[verifier::tactus_auto]
-        fn depth(s: &Stack) -> (r: u64)
+        fn shrink(s: &Stack) -> (r: u64)
             decreases s
         {
             match s {
                 Stack::Empty => 0,
-                Stack::Push(_, rest) => 1 + depth(rest),
+                Stack::Push(_, rest) => shrink(rest),
             }
         }
     } => Err(err) => {
+        // The failure should mention the Lean goal referencing
+        // `.height` — that's the signature that #54 dispatch
+        // reached the Lean layer. If it's still a
+        // "non-int decrease rejected" error, the dispatch
+        // regressed.
+        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
         assert!(
-            err.errors.iter().any(|e| e.message.contains("non-int decrease")
-                || e.message.contains("height")
-                || e.message.contains("#54")),
-            "non-int decreases should be rejected with a clear message naming \
-             the missing height fn / task #54, got: {:?}",
-            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+            msgs.iter().any(|m| m.contains(".height") && m.contains("unsolved goal")),
+            "expected a Lean 'unsolved goal' mentioning `.height` (indicating \
+             the #54 height-fn dispatch reached Lean and the remaining gap is \
+             #58 match automation). got: {:?}",
+            msgs,
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains("non-int decrease") || m.contains("task #54")),
+            "dispatch should reach Lean, not hit the deferrals-rejection path. \
+             got: {:?}",
+            msgs,
         );
     }
 }

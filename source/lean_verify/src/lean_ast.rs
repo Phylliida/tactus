@@ -65,6 +65,13 @@ pub struct Datatype {
     pub name: String,
     pub typ_params: Vec<String>,
     pub kind: DatatypeKind,
+    /// `deriving` clause class names (e.g., `"Inhabited"`). Emitted
+    /// as `deriving <cls1>, <cls2>` after the variants/fields.
+    /// `datatype_to_cmds` adds `Inhabited` for non-generic datatypes
+    /// so that auto-generated accessors' `default` fallback
+    /// resolves — particularly for self-referential types where
+    /// the accessor's return type is the datatype itself.
+    pub derives: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
