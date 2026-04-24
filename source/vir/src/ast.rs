@@ -1122,8 +1122,22 @@ pub enum ExprX {
     /// Assert or assume user-defined type invariant for `expr` and return `expr`
     /// These are added in user_defined_type_invariants.rs
     AssertAssumeUserDefinedTypeInvariant { is_assume: bool, expr: Expr, fun: Fun },
-    /// Assert-forall or assert-by statement
-    AssertBy { vars: VarBinders<Typ>, require: Expr, ensure: Expr, proof: Expr },
+    /// Assert-forall or assert-by statement.
+    /// `tactic_span: Some((file_path, start_byte, end_byte))` is the
+    /// source-file byte range of the `{ ... }` after `by`, populated
+    /// only for Tactus-style assert-by inside `#[verifier::tactus_auto]`
+    /// fns. The range is read at Lean-gen time to recover the user's
+    /// verbatim Lean tactic text (the FileLoader has already sanitized
+    /// that content to spaces for rustc, so `proof` itself is an empty
+    /// block). `None` for regular Verus assert-bys where `proof` is
+    /// the real Rust/Verus proof code.
+    AssertBy {
+        vars: VarBinders<Typ>,
+        require: Expr,
+        ensure: Expr,
+        proof: Expr,
+        tactic_span: Option<(String, usize, usize)>,
+    },
     /// `assert_by` with a dedicated prover option (nonlinear_arith, bit_vector)
     AssertQuery { requires: Exprs, ensures: Exprs, proof: Expr, mode: AssertQueryMode },
     /// Assertion discharged via computation

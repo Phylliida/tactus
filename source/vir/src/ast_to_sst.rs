@@ -2167,7 +2167,7 @@ pub(crate) fn expr_to_stm_opt(
             )?;
             Ok((stms, Maybe::Some(Value::Exp(tmp))))
         }
-        ExprX::AssertBy { vars, require, ensure, proof } => {
+        ExprX::AssertBy { vars, require, ensure, proof, tactic_span: _ } => {
             // deadend {
             //   assume(require)
             //   proof

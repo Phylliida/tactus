@@ -45,6 +45,35 @@ use vir::ast_util::{
 };
 use vir::def::field_ident_from_rust;
 
+/// Convert a rustc `Span` to `(canonicalised file path, start byte,
+/// end byte)`. Used by Tactus's assert-by handling to capture the
+/// original source position of a user-written `by { ... }` block so
+/// `sst_to_lean` can later read the verbatim tactic text off disk.
+///
+/// Mirrors the proof-fn `tactic_span` handling in
+/// `rust_to_vir_func.rs` — same file-path canonicalisation, same
+/// "only real files" gate. Returns `None` for macro-expanded spans,
+/// virtual files, or non-canonicalisable paths, all of which are
+/// benign (just means the span can't be used, and the Tactus pipeline
+/// falls back to the default closer tactic).
+fn span_to_file_and_byte_range<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    span: Span,
+) -> Option<(String, usize, usize)> {
+    let source_map = tcx.sess.source_map();
+    let filename = source_map.span_to_filename(span);
+    let path = match &filename {
+        rustc_span::FileName::Real(real) => real
+            .local_path()
+            .and_then(|p| p.canonicalize().ok())
+            .and_then(|p| p.to_str().map(str::to_owned))?,
+        _ => return None,
+    };
+    let lo = source_map.lookup_byte_offset(span.lo());
+    let hi = source_map.lookup_byte_offset(span.hi());
+    Some((path, lo.pos.0 as usize, hi.pos.0 as usize))
+}
+
 pub(crate) fn fn_call_to_vir<'tcx>(
     bctx: &BodyCtxt<'tcx>,
     expr: &Expr<'tcx>,
@@ -1198,7 +1227,17 @@ fn verus_item_to_vir<'tcx, 'a>(
                     );
                     let ensure = expr_to_vir_consume(bctx, &args[0], ExprModifier::REGULAR)?;
                     let proof = expr_to_vir_consume(bctx, &args[1], ExprModifier::REGULAR)?;
-                    mk_expr(ExprX::AssertBy { vars, require, ensure, proof })
+                    // Tactus: capture the proof block's source span so
+                    // `sst_to_lean` can recover the user's verbatim Lean
+                    // tactic text when this assert-by lives inside a
+                    // `#[verifier::tactus_auto]` fn. `args[1].span`
+                    // covers the `{ … }` including braces, which is
+                    // exactly what `read_tactic_from_source` expects.
+                    // Populated unconditionally; only used at Lean-gen.
+                    let tactic_span = span_to_file_and_byte_range(
+                        bctx.ctxt.tcx, args[1].span,
+                    );
+                    mk_expr(ExprX::AssertBy { vars, require, ensure, proof, tactic_span })
                 }
                 AssertItem::AssertByCompute => {
                     unsupported_err_unless!(
@@ -2438,7 +2477,15 @@ fn extract_assert_forall_by<'tcx>(
                 )
             };
             let ensure = header.ensure.0[0].clone();
-            let forallx = ExprX::AssertBy { vars, require, ensure, proof: vir_expr };
+            // Tactus: capture the forall body's source span for the
+            // same reason as assert-by above. The local `expr` was
+            // shadowed to `&body.value` up at line 2421 — its span
+            // covers the closure body, which is the `{ … }` after
+            // `by`.
+            let tactic_span = span_to_file_and_byte_range(bctx.ctxt.tcx, expr.span);
+            let forallx = ExprX::AssertBy {
+                vars, require, ensure, proof: vir_expr, tactic_span,
+            };
             Ok(bctx.spanned_typed_new(span, &typ, forallx))
         }
         _ => err_span(expr.span, "argument to forall/exists must be a closure"),
