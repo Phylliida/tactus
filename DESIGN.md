@@ -1082,14 +1082,21 @@ exec fns."
   emit `TraitName.method` with the impl inferred from the receiver
   type).
 
-* **`break` / `continue`.** Currently rejected via loop-shape
-  restrictions (`cond: None`, `invariant_except_break` rejected).
-  Encoding: loops with breaks need a separate exit-invariant
-  (`invariant_except_break`) distinguishing "holds on continue" from
-  "holds on break"; `break` writes the loop's exit condition,
-  `continue` writes the maintain condition. Loop body becomes a
-  branching WP where the exit paths feed into the post-loop
-  continuation and the continue paths feed back into the loop head.
+* **`break` / `continue` — LANDED (partial).** Unlabeled break /
+  continue in while-shaped loops works end-to-end.
+  `Wp::Loop::cond` is now `Option<&Exp>` — `Some` for simple
+  `while c { … }`, `None` for Verus's break-lowered form (`while
+  c { … break; … }` → `loop { if !c { break; } … }`).
+  `WpLoopCtx { break_leaf, continue_leaf }` threads through
+  `build_wp` as an `Option<&WpLoopCtx>` parameter; loop body is
+  built with this loop's leaves as innermost context.
+  `StmX::BreakOrContinue` emits `Wp::Done(leaf)` with the right
+  leaf. Still rejected: labeled break/continue (would need a
+  label-keyed stack); `invariant_except_break` / `ensures`
+  classifications (only at_entry=at_exit=true invariants accepted,
+  which matches what the user's `invariant x <= n` syntax
+  produces by default). Tests: test_exec_loop_with_break,
+  test_exec_loop_with_continue.
 
 ##### Ordering rationale
 
