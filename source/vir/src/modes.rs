@@ -2792,7 +2792,7 @@ fn check_expr_handle_mut_arg(
             Ok((outer_mode, Proph::No))
         }
         ExprX::AssertBy {
-            vars, require, ensure, proof, tactic_span: _, is_tactus_proof_block: _,
+            vars, require, ensure, proof, tactus: _,
         } => {
             if ctxt.check_ghost_blocks && typing.block_ghostness == Ghost::Exec {
                 return Err(error(&expr.span, "cannot use 'assert ... by' in exec mode")

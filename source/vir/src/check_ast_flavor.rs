@@ -148,7 +148,7 @@ fn expr_no_loc_in_spec(
             recurse_in_spec(cond).and_then(|_| recurse_in_spec(body))
         }
         ExprX::AssertBy {
-            vars: _, require, ensure, proof: _, tactic_span: _, is_tactus_proof_block: _,
+            vars: _, require, ensure, proof: _, tactus: _,
         } => {
             recurse_in_spec(require).and_then(|_| recurse_in_spec(ensure))
         }

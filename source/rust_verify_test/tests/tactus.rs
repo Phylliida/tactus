@@ -3168,6 +3168,67 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Proof block containing a *goal-modifying* tactic (`simp_all`, not
+// just `have`). Documents the current semantics: proof-block tactics
+// are prepended to the theorem's closer and run at theorem-tactic
+// level, so `simp_all` simplifies the ENTIRE theorem goal — not just
+// a local sub-proof. Users familiar with Verus's `proof { ... }`
+// blocks (where the content is a self-contained proof) may be
+// surprised. The alternative (wrapping in `have _ : True := by simp`)
+// would isolate the effect but makes `have h : P := by tac` NOT
+// propagate — the common case we actually want.
+//
+// Here `simp_all` is a no-op for this specific goal (no simp lemmas
+// apply), so the test just confirms we accept it and the fn verifies
+// via the downstream omega. If a future change wraps proof-block
+// tactics so they DON'T affect outer goal, this test would break
+// only if the specific tactic relied on that isolation — not the
+// case here.
+test_verify_one_file! {
+    #[test] test_exec_proof_block_goal_modifying_tactic verus_code! {
+        #[verifier::tactus_auto]
+        fn goal_mod(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            proof {
+                simp_all
+            }
+            x + 1
+        }
+    } => Ok(())
+}
+
+// Regression for the Tactus discriminator in rust_to_vir_expr.rs:
+// the empty-HIR-body heuristic distinguishes user-written `proof { }`
+// (sanitized to empty by the FileLoader) from Verus's `auto_proof_block`
+// which wraps `assert(…);` / `assume(…);` in a synthetic proof block
+// with the wrapped stmt inside.
+//
+// This fn has BOTH a plain `assert(P);` (which `auto_proof_block`
+// wraps in a synthetic `proof { assert_(P) }` — non-empty body) AND
+// a user-written `proof { have h := ... }` (which the FileLoader
+// sanitizes to an empty body). Only the latter should route through
+// Tactus synthesis; the former should stay on the normal DeadEnd
+// desugaring. If Verus ever generates truly-empty synthetic proof
+// blocks (from some edge case we haven't seen), our heuristic would
+// mis-classify them — this test would catch that drift by failing.
+test_verify_one_file! {
+    #[test] test_exec_auto_proof_block_not_tactus verus_code! {
+        #[verifier::tactus_auto]
+        fn both(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            assert(x < 100);  // auto_proof_block wraps this; non-empty body
+            proof {
+                have h : x + 1 <= 100 := by omega
+            }
+            x + 1
+        }
+    } => Ok(())
+}
+
 // Generic call: the callee is parametric over `T`, and the call site
 // supplies `T = u8` via `typ_args`. `build_wp_call` used to reject
 // non-empty `typ_args` outright; now `lower_call` substitutes the
@@ -3317,6 +3378,129 @@ test_verify_one_file! {
                     x = x - 1;
                     continue;
                 }
+                x = x - 1;
+            }
+            x
+        }
+    } => Ok(())
+}
+
+// Labeled break — not yet supported. Pinned so a future change that
+// accidentally accepts labeled break / continue (by removing the
+// `label.is_some()` check in `build_wp`'s `StmX::BreakOrContinue`
+// arm) trips this regression test.
+test_verify_one_file! {
+    #[test] test_exec_loop_labeled_break_rejected verus_code! {
+        #[verifier::tactus_auto]
+        fn labeled(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r <= n
+        {
+            let mut x: u8 = n;
+            let mut i: u8 = 0;
+            'outer: while x > 0
+                invariant x <= n, i <= n
+                decreases x
+            {
+                while i < 3
+                    invariant x <= n, i <= n
+                    decreases 3u8 - i
+                {
+                    if x == 10 { break 'outer; }
+                    i = i + 1;
+                }
+                x = x - 1;
+            }
+            x
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e|
+                e.message.contains("labeled break") || e.message.contains("not yet supported")
+            ),
+            "labeled break must be rejected, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
+// Nested loops with break in the inner — innermost `WpLoopCtx` applies
+// to the break. Verifies that inner-loop break writes the inner loop's
+// invariants (not the outer's) and that after the inner loop ends, the
+// outer loop continues its own maintain / use structure correctly.
+test_verify_one_file! {
+    #[test] test_exec_nested_loops_inner_break verus_code! {
+        #[verifier::tactus_auto]
+        fn nested(n: u8) -> (r: u8)
+            requires n <= 50
+            ensures r <= n
+        {
+            let mut x: u8 = n;
+            while x > 0
+                invariant x <= n
+                decreases x
+            {
+                let mut y: u8 = x;
+                while y > 0
+                    invariant y <= x, x <= n
+                    decreases y
+                {
+                    if y == 5 { break; }
+                    y = y - 1;
+                }
+                x = x - 1;
+            }
+            x
+        }
+    } => Ok(())
+}
+
+// break + continue in the same loop body. Each control-flow edge
+// uses the right `WpLoopCtx` leaf (break_leaf vs continue_leaf).
+test_verify_one_file! {
+    #[test] test_exec_loop_break_and_continue verus_code! {
+        #[verifier::tactus_auto]
+        fn both(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r <= n
+        {
+            let mut x: u8 = n;
+            while x > 0
+                invariant x <= n
+                decreases x
+            {
+                if x == 20 { break; }
+                if x == 10 {
+                    x = x - 1;
+                    continue;
+                }
+                x = x - 1;
+            }
+            x
+        }
+    } => Ok(())
+}
+
+// `return` inside a loop body with break — the return's
+// `Wp::Done(ensures_goal)` short-circuits to fn-exit regardless of
+// the current `loop_ctx`. Complements `test_exec_return_inside_loop`
+// for the loop-with-break era. The fn is also allowed to exit via
+// break (falling out of the loop, then `x` is returned); either
+// control-flow path must satisfy the ensures.
+test_verify_one_file! {
+    #[test] test_exec_return_inside_loop_with_break verus_code! {
+        #[verifier::tactus_auto]
+        fn ret_loop(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r <= n
+        {
+            let mut x: u8 = n;
+            while x > 0
+                invariant x <= n
+                decreases x
+            {
+                if x == 5 { return x; }
+                if x == 20 { break; }
                 x = x - 1;
             }
             x

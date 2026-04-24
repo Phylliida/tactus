@@ -1004,6 +1004,28 @@ pub enum TactusKind {
     ProofBlock,
 }
 
+/// Tactus tactic-span metadata on an `ExprX::AssertBy`. Populated
+/// only inside `#[verifier::tactus_auto]` fns, which is why the
+/// whole thing is `Option`al on the AssertBy. Carries (a) the
+/// source-file byte range of the user's `{ ... }` block (the
+/// FileLoader has sanitized the content to spaces for rustc's
+/// benefit, but the original Lean text is still on disk), and (b)
+/// which Tactus surface form produced this AssertBy.
+///
+/// Folds together what were previously two correlated fields
+/// (`tactic_span: Option<_>` and `is_tactus_proof_block: bool`):
+/// they could never take mutually-exclusive values in practice
+/// (proof-block ⇒ span set; no span ⇒ not proof block), so
+/// encoding that invariant in the type eliminates a flag-soup
+/// smell.
+#[derive(Clone, Debug, Serialize, Deserialize, ToDebugSNode, PartialEq, Eq, Hash)]
+pub struct TactusSpan {
+    pub file_path: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub kind: TactusKind,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Quant {
     pub quant: air::ast::Quant,
@@ -1152,32 +1174,22 @@ pub enum ExprX {
     AssertAssumeUserDefinedTypeInvariant { is_assume: bool, expr: Expr, fun: Fun },
     /// Assert-forall or assert-by statement.
     ///
-    /// `tactic_span: Some((file_path, start_byte, end_byte))` is the
-    /// source-file byte range of the `{ ... }` after `by`, populated
-    /// only for Tactus-style assert-by inside `#[verifier::tactus_auto]`
-    /// fns. The range is read at Lean-gen time to recover the user's
-    /// verbatim Lean tactic text (the FileLoader has already sanitized
-    /// that content to spaces for rustc, so `proof` itself is an empty
-    /// block). `None` for regular Verus assert-bys where `proof` is
-    /// the real Rust/Verus proof code.
-    ///
-    /// `is_tactus_proof_block: true` means this AssertBy was synthesized
-    /// from a `proof { … }` block inside a tactus_auto fn (rather than
-    /// user-written `assert(P) by { … }` syntax). The distinction
-    /// matters for `sst_to_lean`'s emission: assert-by wraps the user
-    /// tactic in `have h_N : P := by <tac>`, while proof blocks emit
-    /// `<tac>` raw — the user's own `have` statements inside become
-    /// theorem-level hypotheses rather than hypotheses local to a
-    /// sub-proof. `vars` / `require` / `ensure` are all trivial for
-    /// proof blocks (`[]` / `true` / `true`); the real payload is the
-    /// tactic_span.
+    /// `tactus`: `Some(TactusSpan)` for AssertBys synthesised inside
+    /// `#[verifier::tactus_auto]` fns — both user-written
+    /// `assert(P) by { … }` (kind = AssertBy) and `proof { … }`
+    /// blocks (kind = ProofBlock). The span points at the `{ ... }`
+    /// whose verbatim Lean text `sst_to_lean` reads off disk. `None`
+    /// for regular Verus assert-bys where `proof` is real Rust/Verus
+    /// proof code — those take the classical DeadEnd desugaring.
+    /// For proof-block flavour the `vars` / `require` / `ensure` are
+    /// trivial (`[]` / `true` / `true`); the real payload is the
+    /// tactus span.
     AssertBy {
         vars: VarBinders<Typ>,
         require: Expr,
         ensure: Expr,
         proof: Expr,
-        tactic_span: Option<(String, usize, usize)>,
-        is_tactus_proof_block: bool,
+        tactus: Option<TactusSpan>,
     },
     /// `assert_by` with a dedicated prover option (nonlinear_arith, bit_vector)
     AssertQuery { requires: Exprs, ensures: Exprs, proof: Expr, mode: AssertQueryMode },
