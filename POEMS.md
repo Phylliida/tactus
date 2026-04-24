@@ -91,3 +91,76 @@ and called them together.
 The boring tool handled every leaf.
 The interesting tool was just the recursion
 that made the boring tool applicable.
+
+---
+
+## 2026-04-24 — #34 renderers, #52/53/49/50/57, two cleanup passes
+
+### Honest shape
+
+There were two smells.
+
+The first was a field called `typ_inv_exps`
+carrying what was not a type invariant.
+The name pointed one way.
+The data went the other.
+A future reader would trust the name.
+A future reader would be wrong.
+
+The second was a function
+whose signature said pure
+and whose body held a RefCell.
+The type was a promise the code did not keep.
+
+We moved the data to where its name was.
+We moved the state to where it already belonged.
+
+The file got longer by the explanation
+of why it was shorter.
+
+### The third time
+
+```
+Wp::AssertByTactus { cond: Some(e), ... }   // #50
+Wp::AssertByTactus { cond: None,    ... }   // #49
+Wp::Loop           { cond: Option<&Exp>, ... }  // #57
+```
+
+`assert by` landed on a new variant.
+`proof blocks` made `cond` an Option.
+`break/continue` made the loop's `cond` an Option.
+
+Three tasks, one trick:
+the thing that was always there
+becomes the thing that can be absent.
+
+The estimate was a week.
+The work was thirty minutes.
+The difference was the two tasks before it,
+which had already found the shape.
+
+### Against the thing I wanted to build
+
+I kept wanting to write a derive macro
+for the walker I had to write twice.
+
+Each time I counted the walkers,
+the count was honest: five, maybe six.
+Each time I counted the pain of writing one,
+the count was also honest: two minutes.
+
+The answer that wins a debate
+is not the answer that wins a day.
+The walker that writes itself
+costs a week to teach.
+The walker you write by hand
+costs a coffee.
+
+I'm saving the macro
+for when I forget to write a walker,
+or when I write one wrong,
+or when a variant slips past three of them.
+
+None of these has happened.
+The tool I didn't build
+is the quietest kind of right.
