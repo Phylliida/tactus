@@ -953,18 +953,18 @@ exec fns."
 
 ##### Tier 1 — immediate wins (1–2 days each)
 
-* **`proof { ... }` blocks inside exec fns.** DESIGN.md currently
-  claims support, but the plumbing isn't wired through `build_wp`.
-  Without this, any exec fn obligation that `tactus_auto` can't close
-  has no escape hatch — users can't write `proof { have h : P := by
-  … }` to thread a hypothesis into the VC. Fix sites:
-  `sst_to_lean::build_wp` needs an arm that accepts `StmX` for
-  embedded proof bodies (likely `StmX::Air`-wrapped or a dedicated
-  variant), emits `have h : P := by <user_tactic>;` as a Lean tactic
-  prefix, and threads `h` forward as a hypothesis in `WpCtx`.
-  Companion test: `test_exec_proof_block_threads_hypothesis`.
-  **Without this, Track B is fundamentally incomplete** — no tool for
-  recovery when automation fails.
+* **`proof { ... }` blocks inside exec fns — LANDED.** Built on
+  #50's infrastructure: `ExprX::AssertBy` grew
+  `is_tactus_proof_block: bool`; `AssertQueryMode::Tactus` grew
+  `kind: TactusKind { AssertBy, ProofBlock }`;
+  `Wp::AssertByTactus::cond` became `Option<&Exp>` (None = proof
+  block). rust_to_vir_expr synthesises an AssertBy-wrapped-in-Ghost
+  for user-written `proof { }` blocks in tactus_auto fns,
+  discriminating from auto-wrapped blocks (from Verus's
+  `auto_proof_block` pass on every `assert(…);`) by HIR-body
+  emptiness. sst_to_lean emits the tactic text raw — the user's
+  own `have` statements propagate to theorem level for subsequent
+  automation. Regression: `test_exec_proof_block_user_tactic`.
 
 * **`assert(P) by { tactics }` with user tactic bodies — LANDED.**
   `AssertQueryMode` grew a `Tactus { tactic_span }` variant
