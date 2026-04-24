@@ -2173,44 +2173,50 @@ pub(crate) fn expr_to_stm_opt(
             // `#[verifier::tactus_auto]` fns — see
             // `enclosing_fn_is_tactus_auto`), route it through the
             // `StmX::AssertQuery` node with `AssertQueryMode::Tactus`
-            // instead of the standard DeadEnd desugaring. The Lean
-            // WP pipeline (`sst_to_lean::build_wp`) matches on this
-            // mode and emits the user's verbatim Lean tactic as the
-            // closer for the generated Assert obligation. `vars` /
-            // `require` are empty for plain `assert(P) by { … }`;
-            // the `ensure` is the asserted condition. The `proof`
-            // field is expected to be an empty block (FileLoader
+            // instead of the standard DeadEnd desugaring.
+            //
+            // **Shape**: `body` is a single `StmX::Assert(id, None, P)`
+            // — the assertion we need to prove, with the mode telling
+            // the downstream pipeline *how* to prove it. `typ_inv_*`
+            // are empty (not reused as smuggled side-channels).
+            // `sst_to_lean::build_wp` pattern-matches the body to
+            // extract `P`, reads the verbatim Lean tactic text from
+            // the source file via `tactic_span`, and emits a
+            // `Wp::AssertByTactus` node. `sst_to_air` short-circuits
+            // Tactus mode to a no-op (Lean owns the obligation).
+            //
+            // `vars` / `require` are empty for plain
+            // `assert(P) by { … }`; this path doesn't support the
+            // `assert forall|v| P by { … }` form yet. The `proof`
+            // field of the AssertBy is an empty block (FileLoader
             // sanitized the brace body to spaces).
             if let Some((file, start, end)) = tactic_span {
                 let ensure_exp = expr_to_pure_exp_skip_checks(ctx, state, ensure)?;
+                let inner_assert = Spanned::new(
+                    ensure.span.clone(),
+                    StmX::Assert(state.next_assert_id(), None, ensure_exp.clone()),
+                );
+                let query_span = expr.span.clone();
                 let query = Spanned::new(
-                    expr.span.clone(),
+                    query_span.clone(),
                     StmX::AssertQuery {
                         mode: AssertQueryMode::Tactus {
                             tactic_span: (file.clone(), *start, *end),
                         },
-                        typ_inv_exps: Arc::new(vec![ensure_exp.clone()]),
+                        typ_inv_exps: Arc::new(vec![]),
                         typ_inv_vars: Arc::new(vec![]),
-                        // Body is unused in the Tactus mode (sst_to_lean
-                        // reads the tactic from the file via the span),
-                        // but StmX::AssertQuery's `body` field isn't
-                        // Option — emit a trivial empty Block.
-                        body: Spanned::new(
-                            expr.span.clone(),
-                            StmX::Block(Arc::new(vec![])),
-                        ),
+                        body: inner_assert,
                     },
                 );
-                // Also assume `ensure` for subsequent code — the
-                // assert-by's effect is that `P` holds after the
-                // statement.
+                // Assume `ensure` for subsequent code — the assert-by's
+                // effect is that `P` holds after the statement.
                 let assume_after = Spanned::new(
-                    expr.span.clone(),
+                    query_span.clone(),
                     StmX::Assume(ensure_exp),
                 );
                 return Ok((
                     vec![query, assume_after],
-                    Maybe::Some(Value::ImplicitUnit(expr.span.clone())),
+                    Maybe::Some(Value::ImplicitUnit(query_span)),
                 ));
             }
             // deadend {

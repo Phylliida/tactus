@@ -392,18 +392,17 @@ impl FuncDetails {
 /// The file path and byte range are stored in VIR `tactic_span` at construction time
 /// (when the SourceMap is available), so this function works on any thread.
 /// The byte range covers `{ ... }` — we strip the braces and dedent.
+///
+/// Delegates to `lean_verify::source_util::read_tactic_from_source`
+/// so the proof-fn tactic-extraction path and the exec-fn assert-by
+/// extraction (`sst_to_lean`) share a single implementation —
+/// preventing silent drift in the dedent rule between them.
 pub(crate) fn read_tactic_from_source(
     file_path: &str,
     start_byte: usize,
     end_byte: usize,
 ) -> Option<String> {
-    let src = std::fs::read_to_string(file_path).ok()?;
-    // Byte range from syn's brace span includes { and } — take the content between them.
-    if start_byte + 1 >= end_byte || end_byte > src.len() { return None; }
-    let inner = &src[start_byte + 1..end_byte - 1];
-    // Dedent: strip common leading whitespace so Lean sees sibling tactics
-    // at the same indent level (Lean's tactic parser is indentation-sensitive).
-    Some(crate::util::dedent(inner))
+    lean_verify::source_util::read_tactic_from_source(file_path, start_byte, end_byte)
 }
 
 fn report_chosen_triggers(

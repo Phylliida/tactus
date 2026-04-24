@@ -142,16 +142,6 @@ pub struct WpCtx<'a> {
     /// explicit `return e` discards its textual continuation and
     /// writes `Done(let ret := e; ensures_goal)`.
     pub ensures_goal: LExpr,
-    /// Collector for Tactus `assert(P) by { user_tac }` obligations
-    /// encountered during `lower_wp`. Each entry is
-    /// `(hypothesis_name, rendered_P, user_tactic_text)`. At theorem-
-    /// emission time, these become `have h_<name> : <P> := by
-    /// <user_tac>;` clauses prepended to the theorem's normal closer,
-    /// so the user's tactic discharges the obligation and the
-    /// hypothesis is available for the rest of the proof (via
-    /// `simp_all` / `omega` picking it up). Populated lazily from
-    /// `Wp::AssertByTactus` in `lower_wp`.
-    pub tactus_asserts: std::cell::RefCell<Vec<(String, LExpr, String)>>,
 }
 
 impl<'a> WpCtx<'a> {
@@ -180,10 +170,7 @@ impl<'a> WpCtx<'a> {
         let ensures_goal = and_all(
             check.post_condition.ens_exps.iter().map(sst_exp_to_ast).collect()
         );
-        Ok(Self {
-            fn_map, type_map, ret_name, ensures_goal,
-            tactus_asserts: std::cell::RefCell::new(Vec::new()),
-        })
+        Ok(Self { fn_map, type_map, ret_name, ensures_goal })
     }
 }
 
@@ -277,57 +264,57 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // ensures goal (via `ctx.ensures_goal`).
     let body_wp = build_wp(&check.body, Wp::Done(ctx.ensures_goal.clone()), &ctx)?;
     let has_loop_or_call = body_wp.needs_peel();
+    // Two-pass: collect `have` clauses from every `Wp::AssertByTactus`
+    // node in the tree, then lower the tree to the goal LExpr. The
+    // haves prepend to the closer so each user tactic discharges its
+    // assert obligation AND introduces a hypothesis that `simp_all`
+    // / `omega` can pick up during the rest of the proof. Splitting
+    // the walk from `lower_wp` keeps lowering a pure function of the
+    // tree — no shared-mutable side channel needed.
+    let user_haves = collect_tactus_haves(&body_wp);
     let goal = lower_wp(&body_wp, &ctx);
-    // `Wp::AssertByTactus` nodes during lowering pushed their user
-    // tactics onto `ctx.tactus_asserts`; if any are present, prepend
-    // them as `have` clauses so the user's tactic discharges each
-    // assert-by obligation before the normal closer runs. The
-    // hypotheses they introduce are in scope for `simp_all` / `omega`
-    // to pick up during the rest of the proof.
-    let user_haves = ctx.tactus_asserts.into_inner();
     let closer = if has_loop_or_call { loop_tactic() } else { simple_tactic() };
     let tactic = prepend_user_haves(user_haves, closer);
     Ok(vec![Theorem { name, binders, goal, tactic }])
 }
 
-/// Strip common leading whitespace from all non-empty lines. Ported
-/// from `rust_verify::util::dedent` so tactus_auto / assert-by tactic
-/// text can be placed at any Lean indent level without tripping the
-/// tactic parser's indentation sensitivity.
-fn dedent(s: &str) -> String {
-    let min_indent = s.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| line.len() - line.trim_start().len())
-        .min()
-        .unwrap_or(0);
-    let mut out = String::new();
-    for (i, line) in s.lines().enumerate() {
-        if i > 0 { out.push('\n'); }
-        if !line.trim().is_empty() {
-            out.push_str(&line[min_indent..]);
-        }
-    }
+/// Walk the Wp tree and extract one `(hypothesis_name, cond, tactic_text)`
+/// tuple per `Wp::AssertByTactus` node, in structural order. The
+/// resulting list is consumed by `prepend_user_haves` to build the
+/// theorem's prefix.
+fn collect_tactus_haves(wp: &Wp<'_>) -> Vec<(String, LExpr, String)> {
+    let mut out = Vec::new();
+    collect_tactus_haves_into(wp, &mut out);
     out
 }
 
-/// Read the verbatim `{ ... }` tactic body from the source file at
-/// the given byte range (which includes the braces) and return the
-/// content between them, dedented. Returns `None` for degenerate
-/// ranges or unreadable files (benign: caller falls back to rejecting
-/// the assert-by). Ported from `rust_verify::verifier::
-/// read_tactic_from_source` so `lean_verify` doesn't depend on
-/// `rust_verify`.
-fn read_tactic_from_source(
-    file_path: &str,
-    start_byte: usize,
-    end_byte: usize,
-) -> Option<String> {
-    let src = std::fs::read_to_string(file_path).ok()?;
-    if start_byte + 1 >= end_byte || end_byte > src.len() {
-        return None;
+fn collect_tactus_haves_into(wp: &Wp<'_>, out: &mut Vec<(String, LExpr, String)>) {
+    match wp {
+        Wp::Done(_) => {}
+        Wp::Let(_, _, body) | Wp::Assert(_, body) | Wp::Assume(_, body) => {
+            collect_tactus_haves_into(body, out);
+        }
+        Wp::AssertByTactus { cond, tactic_text, body } => {
+            let idx = out.len();
+            out.push((
+                format!("h_tactus_assert_{}", idx),
+                sst_exp_to_ast(cond),
+                tactic_text.clone(),
+            ));
+            collect_tactus_haves_into(body, out);
+        }
+        Wp::Branch { then_branch, else_branch, .. } => {
+            collect_tactus_haves_into(then_branch, out);
+            collect_tactus_haves_into(else_branch, out);
+        }
+        Wp::Loop { body, after, .. } => {
+            collect_tactus_haves_into(body, out);
+            collect_tactus_haves_into(after, out);
+        }
+        Wp::Call { after, .. } => {
+            collect_tactus_haves_into(after, out);
+        }
     }
-    let inner = &src[start_byte + 1..end_byte - 1];
-    Some(dedent(inner))
 }
 
 /// If any Tactus `assert-by` user tactics were collected during
@@ -590,23 +577,12 @@ fn lower_wp(wp: &Wp<'_>, ctx: &WpCtx<'_>) -> LExpr {
         }
         Wp::Assert(e, body) => LExpr::and(sst_exp_to_ast(e), lower_wp(body, ctx)),
         Wp::Assume(e, body) => LExpr::implies(sst_exp_to_ast(e), lower_wp(body, ctx)),
-        Wp::AssertByTactus { cond, tactic_text, body } => {
-            // Register the user tactic for the theorem-emission step
-            // to prepend as a `have` clause. The P is NOT in the
-            // goal — it's discharged by the user's tactic at
-            // theorem-tactic time, and the hypothesis it produces is
-            // in context for tactus_auto to pick up via simp_all.
-            // Using the vec's length as the index keeps names unique
-            // across multiple assert-bys in the same fn.
-            let idx = ctx.tactus_asserts.borrow().len();
-            let cond_ast = sst_exp_to_ast(cond);
-            ctx.tactus_asserts.borrow_mut().push((
-                format!("h_tactus_assert_{}", idx),
-                cond_ast,
-                tactic_text.clone(),
-            ));
-            lower_wp(body, ctx)
-        }
+        // The user tactic and the asserted condition are NOT in the
+        // goal — they're extracted up-front by `collect_tactus_haves`
+        // and prepended as `have` clauses before the closer. Here we
+        // just pass the `body`'s lowering through. This keeps
+        // `lower_wp` a pure function of the Wp tree + ctx.
+        Wp::AssertByTactus { cond: _, tactic_text: _, body } => lower_wp(body, ctx),
         Wp::Branch { cond, then_branch, else_branch } => {
             let c = sst_exp_to_ast(cond);
             LExpr::and(
@@ -974,29 +950,35 @@ fn build_wp<'a>(
         // a `tactus_auto` fn (see `ExprX::AssertBy` handling there).
         // We read the verbatim Lean tactic text from the original
         // file via the `tactic_span` and produce a `Wp::AssertByTactus`
-        // node; `lower_wp` collects its user tactic, and the theorem
-        // emitter prepends it as a `have` clause before the closer.
+        // node; the theorem emitter walks the Wp tree, collects user
+        // tactics, and prepends them as `have` clauses before the
+        // closer.
         //
-        // `ensures` is the single asserted condition; `vars` /
-        // `requires` are empty for plain assert-by (handled by
-        // `ast_to_sst` before reaching here). `body` is an empty
-        // Block placeholder. Other AssertQuery modes (NonLinear /
-        // BitVector) stay rejected — they're Z3-specific and don't
-        // route through the Lean WP pipeline.
-        StmX::AssertQuery { mode, typ_inv_exps, typ_inv_vars: _, body: _ } => {
+        // **Shape**: `body` is a single `StmX::Assert(_, _, P)` —
+        // the asserted condition, produced by `ast_to_sst`'s
+        // Tactus-shortcut emission. `typ_inv_*` are intentionally
+        // empty (other AssertQuery modes use them for NonLinear/
+        // BitVector context). Extracting `P` from `body` keeps
+        // `AssertQueryMode::Tactus` itself small — no generic `Exp`
+        // field forcing derive-juggling on the enum.
+        //
+        // Other AssertQuery modes (NonLinear / BitVector) stay
+        // rejected — they're Z3-specific and don't route through
+        // the Lean WP pipeline.
+        StmX::AssertQuery { mode, typ_inv_exps: _, typ_inv_vars: _, body } => {
             match mode {
                 AssertQueryMode::Tactus { tactic_span } => {
-                    if typ_inv_exps.len() != 1 {
-                        return Err(format!(
-                            "AssertQueryMode::Tactus expected 1 typ_inv_exp (the \
-                             asserted condition) from ast_to_sst, got {}",
-                            typ_inv_exps.len()
-                        ));
-                    }
-                    let cond = &typ_inv_exps[0];
+                    let cond = match &body.x {
+                        StmX::Assert(_, _, c) => c,
+                        _ => return Err(format!(
+                            "AssertQueryMode::Tactus body expected to be a single \
+                             StmX::Assert carrying the asserted condition, got {:?}",
+                            std::mem::discriminant(&body.x)
+                        )),
+                    };
                     check_exp(cond)?;
                     let (path, start, end) = tactic_span;
-                    let tactic_text = read_tactic_from_source(
+                    let tactic_text = crate::source_util::read_tactic_from_source(
                         path, *start, *end,
                     ).ok_or_else(|| format!(
                         "failed to read assert-by tactic from {} bytes [{}..{}]",
@@ -1425,7 +1407,6 @@ mod tests {
             type_map: HashMap::new(),
             ret_name: None,
             ensures_goal: LExpr::new(crate::lean_ast::ExprNode::LitBool(true)),
-            tactus_asserts: std::cell::RefCell::new(Vec::new()),
         }
     }
 
