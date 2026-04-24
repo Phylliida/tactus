@@ -3274,7 +3274,7 @@ test_verify_one_file! {
 // loop (cond: None, with break statements); `check_stm` rejects
 // because we require `cond: Some`.
 test_verify_one_file! {
-    #[test] test_exec_loop_break_rejected verus_code! {
+    #[test] test_exec_loop_with_break verus_code! {
         #[verifier::tactus_auto]
         fn with_break(n: u8) -> (r: u8)
             requires n <= 100
@@ -3292,11 +3292,35 @@ test_verify_one_file! {
             }
             x
         }
-    } => Err(err) => {
-        assert!(
-            err.errors.iter().any(|e| e.message.contains("not yet supported")),
-            "loop with break should be rejected",
-        );
-    }
+    } => Ok(())
+}
+
+// `continue` inside a loop — skip the rest of the iteration and jump
+// back to the loop head. Exercises the `continue_leaf` path of
+// `WpLoopCtx` (same goal as fallthrough: re-establish invariants AND
+// show decrease). This test uses continue to skip the decrement when
+// x is odd, but the body always reaches a decrement either way —
+// the decrease obligation holds regardless.
+test_verify_one_file! {
+    #[test] test_exec_loop_with_continue verus_code! {
+        #[verifier::tactus_auto]
+        fn with_continue(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r <= n
+        {
+            let mut x: u8 = n;
+            while x > 0
+                invariant x <= n
+                decreases x
+            {
+                if x == 5 {
+                    x = x - 1;
+                    continue;
+                }
+                x = x - 1;
+            }
+            x
+        }
+    } => Ok(())
 }
 

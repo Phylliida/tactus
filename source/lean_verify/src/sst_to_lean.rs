@@ -129,6 +129,27 @@ pub type FnMap<'a> = HashMap<&'a Fun, &'a FunctionX>;
 /// var name (if any). Future additions — source spans, current-fn
 /// name, etc. — plug into this struct instead of growing every
 /// function signature.
+/// The break / continue goal leaves in scope inside a loop body.
+/// Threaded through `build_wp` as `Option<&WpLoopCtx>` — `None`
+/// outside any loop (break/continue rejected), `Some(...)` inside a
+/// loop's body. Inner loops shadow outer loops for unlabeled
+/// break/continue (the innermost applies). Labeled break/continue
+/// would need a stack; not yet supported.
+///
+/// The two leaves differ in what they need to prove:
+/// * `continue_leaf` — on body fallthrough or `continue`, re-establish
+///   the loop invariants AND show the decrease measure decreased.
+///   Currently `I ∧ D < _tactus_d_old`.
+/// * `break_leaf` — on `break`, establish the loop's at-exit
+///   invariants (which the use clause will assume). Currently just
+///   `I` since we only accept all-both invariants (at_entry = at_exit
+///   = true). The decrease obligation doesn't apply on break — the
+///   loop is terminating, not iterating.
+pub struct WpLoopCtx {
+    pub break_leaf: LExpr,
+    pub continue_leaf: LExpr,
+}
+
 pub struct WpCtx<'a> {
     pub fn_map: FnMap<'a>,
     pub type_map: HashMap<&'a VarIdent, &'a Typ>,
@@ -261,8 +282,14 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // Build the whole WP tree from the body, with the fn's ensures
     // as the natural continuation at the leaves. `Return` statements
     // inside the body replace their local `after` with the same
-    // ensures goal (via `ctx.ensures_goal`).
-    let body_wp = build_wp(&check.body, Wp::Done(ctx.ensures_goal.clone()), &ctx)?;
+    // ensures goal (via `ctx.ensures_goal`). Initial loop_ctx is
+    // `None` — break/continue are rejected outside any loop.
+    let body_wp = build_wp(
+        &check.body,
+        Wp::Done(ctx.ensures_goal.clone()),
+        &ctx,
+        None,
+    )?;
     let has_loop_or_call = body_wp.needs_peel();
     // Two-pass: collect `have` clauses from every `Wp::AssertByTactus`
     // node in the tree, then lower the tree to the goal LExpr. The
@@ -532,8 +559,16 @@ enum Wp<'a> {
     /// `after`). Lowering wraps `body` with the `let _tactus_d_old
     /// := D` binding and the maintain quantifier, and wraps `after`
     /// with the havoc quantifier.
+    ///
+    /// `cond` is `Some(c)` for a simple `while c { … }` with no
+    /// breaks (the body runs while `c` holds; exit is via `!c`).
+    /// `cond` is `None` for the break-lowered form Verus produces
+    /// for `while c { … break; … }` (the body sees `if !c { break; }`
+    /// inserted by Verus; exit is only via `break`). The maintain
+    /// clause's `I ∧ cond →` guard is dropped in the `None` case,
+    /// and the use clause's `I ∧ ¬cond →` becomes just `I →`.
     Loop {
-        cond: &'a Exp,
+        cond: Option<&'a Exp>,
         invs: &'a [LoopInv],
         decrease: &'a Exp,
         modified_vars: Vec<(&'a VarIdent, &'a Typ)>,
@@ -622,7 +657,7 @@ fn lower_wp(wp: &Wp<'_>, ctx: &WpCtx<'_>) -> LExpr {
             )
         }
         Wp::Loop { cond, invs, decrease, modified_vars, body, after } => {
-            lower_loop(cond, invs, decrease, modified_vars, body, after, ctx)
+            lower_loop(*cond, invs, decrease, modified_vars, body, after, ctx)
         }
         Wp::Call { callee, args, typ_args, dest, after } => {
             lower_call(callee, args, typ_args, *dest, after, ctx)
@@ -641,7 +676,7 @@ fn lower_wp(wp: &Wp<'_>, ctx: &WpCtx<'_>) -> LExpr {
 /// the post-body value while `_tactus_d_old` retains the pre-body
 /// value — straight Lean let-scoping does the right thing.
 fn lower_loop(
-    cond: &Exp,
+    cond: Option<&Exp>,
     invs: &[LoopInv],
     decrease: &Exp,
     modified_vars: &[(&VarIdent, &Typ)],
@@ -650,31 +685,47 @@ fn lower_loop(
     ctx: &WpCtx<'_>,
 ) -> LExpr {
     let inv_conj = || and_all(invs.iter().map(|i| sst_exp_to_ast(&i.inv)).collect());
-    let cond_ast = || sst_exp_to_ast(cond);
     let decrease_ast = || sst_exp_to_ast(decrease);
 
     // Init: invariant conjunction at loop entry.
     let init_clause = inv_conj();
 
-    // Maintain: `∀ mod_vars, bounds → I ∧ cond →
+    // Maintain: `∀ mod_vars, bounds → I (∧ cond)? →
     //             (let _tactus_d_old := D; lower_wp(body))`.
+    // The `∧ cond` part is only present for `while`-shaped loops
+    // (`cond: Some`). For `cond: None` (Verus's break-lowered form),
+    // the body has an explicit `if !cond { break; }` at the head, so
+    // we don't gate the maintain clause on cond at the meta level.
+    //
     // See DESIGN.md "_tactus_d_old aliasing across nested loops" for
-    // the rationale behind the literal name.
+    // the rationale behind the literal `_tactus_d_old` name.
     let maintain_body_lowered = lower_wp(body, ctx);
     let maintain_core = LExpr::let_bind("_tactus_d_old", decrease_ast(), maintain_body_lowered);
+    let maintain_pre = match cond {
+        Some(c) => LExpr::and(inv_conj(), sst_exp_to_ast(c)),
+        None => inv_conj(),
+    };
     let maintain_clause = quantify_mod_vars(
         modified_vars,
-        LExpr::implies(LExpr::and(inv_conj(), cond_ast()), maintain_core),
+        LExpr::implies(maintain_pre, maintain_core),
     );
 
-    // Use / post-loop continuation: `∀ mod_vars, bounds → I ∧ ¬cond →
-    //   lower_wp(after)`. `after`'s Done leaves point at the outer
-    // ensures (or whatever the enclosing scope's `after` was), so
-    // nested loops' post-body code feeds back correctly.
+    // Use / post-loop continuation: `∀ mod_vars, bounds → I (∧ ¬cond)? →
+    //   lower_wp(after)`. For `cond: Some` the exit is via ¬cond.
+    // For `cond: None` exit is only via `break`, which writes the
+    // break_leaf (= I currently); no ¬cond clause.
+    //
+    // `after`'s Done leaves point at the outer ensures (or whatever
+    // the enclosing scope's `after` was), so nested loops' post-body
+    // code feeds back correctly.
     let after_lowered = lower_wp(after, ctx);
+    let use_pre = match cond {
+        Some(c) => LExpr::and(inv_conj(), LExpr::not(sst_exp_to_ast(c))),
+        None => inv_conj(),
+    };
     let use_clause = quantify_mod_vars(
         modified_vars,
-        LExpr::implies(LExpr::and(inv_conj(), LExpr::not(cond_ast())), after_lowered),
+        LExpr::implies(use_pre, after_lowered),
     );
 
     LExpr::and(init_clause, LExpr::and(maintain_clause, use_clause))
@@ -885,6 +936,11 @@ fn build_wp<'a>(
     stm: &'a Stm,
     after: Wp<'a>,
     ctx: &WpCtx<'a>,
+    // Innermost enclosing loop's break/continue leaves, if any. `None`
+    // outside a loop (where `StmX::BreakOrContinue` is rejected).
+    // Most recursive calls forward this unchanged; only
+    // `build_wp_loop` constructs a new one for the body.
+    loop_ctx: Option<&WpLoopCtx>,
 ) -> Result<Wp<'a>, String> {
     match &stm.x {
         StmX::Block(stms) => {
@@ -894,7 +950,7 @@ fn build_wp<'a>(
             //                     walk(s_0, whole_rest).
             let mut wp = after;
             for s in stms.iter().rev() {
-                wp = build_wp(s, wp, ctx)?;
+                wp = build_wp(s, wp, ctx, loop_ctx)?;
             }
             Ok(wp)
         }
@@ -955,9 +1011,9 @@ fn build_wp<'a>(
             // "Known codegen-complexity trade-offs" for the shared-
             // continuation let-binding optimization we chose not to
             // implement (simp zeta-reduces it, so no saving).
-            let then_branch = build_wp(then_stm, after.clone(), ctx)?;
+            let then_branch = build_wp(then_stm, after.clone(), ctx, loop_ctx)?;
             let else_branch = match else_stm {
-                Some(e) => build_wp(e, after, ctx)?,
+                Some(e) => build_wp(e, after, ctx, loop_ctx)?,
                 None => after,
             };
             Ok(Wp::Branch {
@@ -966,13 +1022,40 @@ fn build_wp<'a>(
                 else_branch: Box::new(else_branch),
             })
         }
+        // `build_wp_call` doesn't recurse into sub-Stms so it doesn't
+        // need `loop_ctx`. `build_wp_loop` does — it builds the
+        // loop's body which can contain break/continue for this very
+        // loop (not the enclosing one).
         StmX::Call { .. } => build_wp_call(stm, after, ctx),
-        StmX::Loop { .. } => build_wp_loop(stm, after, ctx),
+        StmX::Loop { .. } => build_wp_loop(stm, after, ctx, loop_ctx),
         // Transparent in SST: pass `after` through unchanged.
         StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => Ok(after),
-        StmX::BreakOrContinue { .. } => Err(
-            "break/continue not yet supported".to_string()
-        ),
+        // `break` / `continue` terminate the current iteration and
+        // jump to the loop's respective leaf. `after` is discarded —
+        // any statements textually after a break in the SST are
+        // unreachable (Verus's dead-code analysis handles that
+        // upstream; this WP side just needs to reach the right leaf).
+        //
+        // Labeled forms (`break 'outer;`) aren't yet supported — they
+        // would require a stack of loop contexts keyed by label
+        // rather than a single innermost one.
+        StmX::BreakOrContinue { label, is_break } => {
+            if label.is_some() {
+                return Err("labeled break / continue not yet supported".to_string());
+            }
+            let Some(leaves) = loop_ctx else {
+                return Err(
+                    "break / continue outside a loop — SST mode-checker invariant \
+                     violated".to_string()
+                );
+            };
+            let leaf = if *is_break {
+                leaves.break_leaf.clone()
+            } else {
+                leaves.continue_leaf.clone()
+            };
+            Ok(Wp::Done(leaf))
+        }
         StmX::AssertBitVector { .. } => Err(
             "assert by(bit_vector) not yet supported".to_string()
         ),
@@ -1143,6 +1226,13 @@ fn build_wp_loop<'a>(
     stm: &'a Stm,
     after: Wp<'a>,
     ctx: &WpCtx<'a>,
+    // Enclosing loop's break/continue leaves (if any), forwarded to
+    // any recursion that doesn't enter THIS loop's body. We don't
+    // actually call build_wp on `after` here — `after` was already
+    // built by the caller with the outer loop_ctx. The `_` marker
+    // documents that we accept it for consistency with the normal
+    // build_wp signature.
+    _outer_loop_ctx: Option<&WpLoopCtx>,
 ) -> Result<Wp<'a>, String> {
     // Destructure every field explicitly so a future Verus-side
     // `StmX::Loop` addition forces a compile-time audit. `is_for_loop`
@@ -1171,14 +1261,30 @@ fn build_wp_loop<'a>(
             "non-isolated loops (loop_isolation: false) not yet supported".to_string()
         );
     }
-    let Some((cond_setup, cond_exp)) = cond else {
-        return Err("loops without a simple `while` condition not yet supported".to_string());
+    // `cond: Some` — simple `while c { … }` (no breaks) — the
+    // classical form where body re-enters when c holds and exits
+    // when ¬c.
+    // `cond: None` — what Verus lowers `while c { … break; … }` to:
+    //   loop {
+    //     if !c { break; }
+    //     <user body with breaks>
+    //   }
+    // The body contains an explicit `break` at the "cond failed"
+    // check, so the maintain/use clauses don't need to gate on cond.
+    // We accept both forms; break/continue in the body uses
+    // `loop_ctx` to find the right leaf.
+    let cond_exp_opt = match cond {
+        Some((cond_setup, cond_exp)) => {
+            if !matches!(&cond_setup.x, StmX::Block(ss) if ss.is_empty()) {
+                return Err(
+                    "loop condition with setup statements not yet supported".to_string()
+                );
+            }
+            check_exp(cond_exp)?;
+            Some(cond_exp)
+        }
+        None => None,
     };
-    if !matches!(&cond_setup.x, StmX::Block(ss) if ss.is_empty()) {
-        return Err(
-            "loop condition with setup statements not yet supported".to_string()
-        );
-    }
     if decrease.len() != 1 {
         return Err(format!(
             "loop `decreases` must be a single expression (got {})", decrease.len()
@@ -1190,7 +1296,6 @@ fn build_wp_loop<'a>(
              invariant_except_break / ensures)".to_string()
         );
     }
-    check_exp(cond_exp)?;
     for inv in invs.iter() {
         check_exp(&inv.inv)?;
     }
@@ -1208,18 +1313,32 @@ fn build_wp_loop<'a>(
         .filter_map(|id| ctx.type_map.get(id).map(|typ| (id, *typ)))
         .collect();
 
-    // Body's local terminator: `I ∧ D < _tactus_d_old`. The reference
-    // to `_tactus_d_old` here is a Var; lowering wraps the body-WP
-    // with the `let _tactus_d_old := D` binding to put it in scope.
+    // Body's break and continue leaves:
+    // * continue (and fallthrough): re-establish invariants AND show
+    //   the decrease measure decreased — `I ∧ D < _tactus_d_old`.
+    //   The reference to `_tactus_d_old` here is a Var; lowering
+    //   wraps the body-WP with the `let _tactus_d_old := D` binding
+    //   to put it in scope.
+    // * break: establish the at-exit invariants, which currently
+    //   equals `I` (we only accept invariants with at_entry = at_exit
+    //   = true — see validation above). No decrease obligation on
+    //   break since we're leaving the loop, not iterating.
     let inv_conj = and_all(invs.iter().map(|i| sst_exp_to_ast(&i.inv)).collect());
-    let maintain_local_goal = LExpr::and(
-        inv_conj,
+    let continue_leaf = LExpr::and(
+        inv_conj.clone(),
         LExpr::lt(sst_exp_to_ast(decrease_exp), LExpr::var("_tactus_d_old")),
     );
-    let body_wp = build_wp(body, Wp::Done(maintain_local_goal), ctx)?;
+    let break_leaf = inv_conj;
+    let inner_loop_ctx = WpLoopCtx {
+        break_leaf: break_leaf.clone(),
+        continue_leaf: continue_leaf.clone(),
+    };
+    // Body is built with THIS loop's break/continue leaves as the
+    // innermost context — break/continue inside refer to *this* loop.
+    let body_wp = build_wp(body, Wp::Done(continue_leaf), ctx, Some(&inner_loop_ctx))?;
 
     Ok(Wp::Loop {
-        cond: cond_exp,
+        cond: cond_exp_opt,
         invs: &invs[..],
         decrease: decrease_exp,
         modified_vars,
@@ -1502,7 +1621,7 @@ mod tests {
         let invs: Vec<LoopInv> = vec![];
         let dec = var_exp("d", typ_int());
         let loop_wp = Wp::Loop {
-            cond: &x,
+            cond: Some(&x),
             invs: &invs[..],
             decrease: &dec,
             modified_vars: Vec::new(),
@@ -1529,7 +1648,7 @@ mod tests {
         assert!(!plain.needs_peel());
 
         let with_loop = Wp::Let("x", &x, Box::new(Wp::Loop {
-            cond: &c,
+            cond: Some(&c),
             invs: &invs[..],
             decrease: &dec,
             modified_vars: Vec::new(),
