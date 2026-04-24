@@ -966,14 +966,25 @@ exec fns."
   **Without this, Track B is fundamentally incomplete** — no tool for
   recovery when automation fails.
 
-* **`assert(P) by { tactics }` with user tactic bodies.** Currently
-  `StmX::Assert` emits a leaf obligation closed by `tactus_auto`;
-  user-provided tactic bodies are dropped on the floor. Fix:
-  `StmX::AssertQuery` / `StmX::Assert` needs a variant that carries
-  the user tactic text through (same mechanism as `by { … }` on
-  proof fns — the tactic span is already captured at the proc-macro
-  layer, just not plumbed through SST). Companion test:
-  `test_exec_assert_with_user_tactic`.
+* **`assert(P) by { tactics }` with user tactic bodies — LANDED.**
+  `AssertQueryMode` grew a `Tactus { tactic_span }` variant
+  (moving the enum from `Copy` to `Clone` — 5 mechanical sites).
+  `rust_to_vir` captures the `{ … }` byte range onto
+  `ExprX::AssertBy::tactic_span` only inside `tactus_auto` fns.
+  `ast_to_sst` short-circuits that shape to `StmX::AssertQuery`
+  with Tactus mode, bypassing the DeadEnd desugaring. `sst_to_lean`'s
+  `build_wp` reads the verbatim Lean tactic text from the source
+  file via the span and produces a `Wp::AssertByTactus` node;
+  `lower_wp` lowers it identically to `Assume(P, body)` (P not in
+  goal) while pushing the user tactic onto `WpCtx::tactus_asserts`.
+  `exec_fn_theorems_to_ast` drains the collector and prepends
+  `have h_tactus_assert_N : P := by <user_tac>;` clauses before
+  the normal closer — discharging the obligation AND introducing
+  the hypothesis for `simp_all` / `omega` to pick up. Regression:
+  `test_exec_assert_by_user_tactic`. `sst_to_air` short-circuits
+  Tactus mode to a no-op for secondary queries (recommends-check
+  etc. still flow through sst_to_air for tactus_auto fns, but the
+  obligation is Lean's job).
 
 * **Source mapping for exec-fn errors.** Lean errors currently point
   at the generated `.lean` file's line numbers; users have to `cat`
