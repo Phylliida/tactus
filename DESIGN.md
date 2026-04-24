@@ -1266,6 +1266,59 @@ The triangle these form:
 
 Each closes a different hole.
 
+### Code review strategy
+
+When landing non-trivial work, run five review lenses against the
+diff before calling it done. Each catches a different class of
+issue; a single "read it over" pass misses most of them.
+
+**1. Linus hat.** Role-play a grumpy maintainer. Look for clever
+abstractions that make code harder to understand, defensive code
+for scenarios that can't happen, flag soup (`Option<_>` + `bool`
+fields that can never take independent values), bad naming,
+orphaned docstrings, functions whose signature lies about what
+they do.
+
+**2. FP lens.** What's mutable that could be immutable? What's
+stateful that could be a parameter? Common hits: `RefCell` on
+supposedly-pure functions, shared mutable state across module
+boundaries, accumulators that could be folds.
+
+**3. Comprehensive coverage.** What code paths have no test?
+Variants of a new enum that aren't exercised, edge cases at the
+boundaries, negative tests for claimed-rejections, interactions
+between two features.
+
+**4. Upstream-brittleness.** What breaks silently if Verus
+changes X? See § "Upstream-robustness patterns" above for the
+triangle of defences; the review asks "have we used them?"
+
+**5. Documentation / deferrals.** What's landed but not
+documented? Counterintuitive behaviour that needs a caveat?
+Deferrals in code comments that aren't in this document's
+deferrals catalogue? Stale comments asserting rejected features
+that are now accepted?
+
+**Process.** Land the work with tests passing, run the five lenses,
+triage each finding (fix now / file follow-up / skip), do the
+"fix now" list in a follow-up commit labelled "review cleanup".
+Update this document for any caveat or deferral that surfaced.
+Typical cleanup pass: 10-30 minutes, catches 3-5 real issues even
+on code that looked fine.
+
+Canonical examples from the #50 landing's two cleanup passes:
+* *Linus hat* caught `typ_inv_exps` smuggling the asserted condition
+  (field's name didn't match its content) and `WpCtx::tactus_asserts:
+  RefCell<_>` making `lower_wp` lie about its purity.
+* *FP lens* motivated the two-pass `collect_tactus_haves` rewrite.
+* *Coverage* caught missing regression tests for labeled-break
+  rejected, nested-loop inner-break, return-inside-loop-with-break.
+* *Upstream-brittleness* led to `test_exec_auto_proof_block_not_tactus`,
+  which guards against Verus's `auto_proof_block` ever generating
+  empty synthetic blocks (which would mis-classify as Tactus).
+* *Documentation* surfaced the proof-block goal-modifying-tactic
+  semantics worth pinning with a test and a DESIGN.md caveat.
+
 ### Two parallel expression renderers — and why we didn't fully unify them
 
 Tactus has two expression renderers:
