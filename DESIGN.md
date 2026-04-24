@@ -1072,52 +1072,52 @@ exec fns."
   (identity over a generic T).
 
 * **Non-int `decreases` (Lean `height` function per datatype).**
-  Currently `CheckDecreaseHeight` rejects non-int decrease types.
-  Pinned by `test_exec_call_recursive_datatype_rejected` — the
-  error message names task #54 so when someone hits it in the
-  wild, they get a clear pointer.
+  **MVS landed** for concrete, non-generic datatypes:
+  1. `to_lean_fn::height_fn_for_datatype` emits `@[simp] noncomputable
+     def T.height : T → Nat` alongside the datatype in
+     `datatype_to_cmds`. For recursive types: match over variants
+     summing `1 + height(f)` per self-referential field (peeling
+     `TypX::Boxed` / `TypX::Decorate` to match `typ_to_expr`'s
+     Lean-level rendering). For non-recursive types: `fun _ => 1`.
+     Lean's equation compiler proves termination structurally.
+  2. `sst_exp_to_ast_checked`'s `CheckDecreaseHeight` arm
+     dispatches via `decrease_height_datatype(&cur.typ)`: int
+     → fast arithmetic path; concrete datatype → `T.height cur
+     < T.height prev ∨ (T.height cur = T.height prev ∧
+     otherwise)`; other (generic, tuple, etc.) → rejected with
+     a clear deferrals message.
+  3. `deriving Inhabited` added to every non-generic datatype
+     (via a new `Datatype.derives` AST field). Needed because
+     accessors like `Stack.Push_val1 : Stack → Stack` have a
+     `default` fallback that requires `[Inhabited Stack]`.
+     Generic types skip this — would need `[Inhabited A]`
+     bounds we don't thread.
 
-  **Implementation plan (MVS scope):**
-  1. In `to_lean_fn::datatype_to_cmds`, emit `def T.height : T →
-     Nat := match x with | Ctor a1 a2 ... => 1 + <sum of
-     height(ai) for ai : T>`. Non-recursive-field contributions
-     are omitted (treat as 0). Needed per datatype that appears
-     (transitively) in any exec-fn's `decreases`.
-  2. In `sst_exp_to_ast_checked`'s `CheckDecreaseHeight` arm, if
-     the decrease type is a supported datatype, emit `T.height
-     cur < T.height prev ∨ (T.height cur = T.height prev ∧
-     otherwise)` instead of the int fast-path. `is_int_height`
-     flips from "gate on support" to a codegen-path selector.
-  3. `Box<T>` / `Arc<T>` wrappers need peeling for both "is this
-     field recursive?" and the `decreases *t` measure shape.
-     Verus renders Rust's `Box<T>` as `TypX::Datatype(alloc::
-     boxed::Box, [T])` — peel at the Lean level or during height
-     generation.
+  **Known interaction with #58 (match automation):** pinned by
+  `test_exec_call_recursive_datatype_termination` — recursive
+  enum fns compile, the termination obligation is emitted in
+  correct shape (`Stack.height rest < Stack.height s` under
+  `¬s.isEmpty`), but closing it requires case analysis on `s`
+  which is #58's gap. Test asserts the Lean error mentions
+  `.height` and isn't the old deferrals rejection; when #58
+  lands it flips to `=> Ok(())`.
 
-  **Explicit deferrals (reject with clear message):**
+  **Explicit deferrals (still rejected with clear message):**
   - **Generic datatypes.** `Tree<A>` would need a `[SizeOf A]`-
-     style height axiom; real implementation routes through Lean
-     typeclasses. Reject if any type param appears as a field
-     type.
-  - **Mutually recursive datatype SCCs.** Emit one `mutual`
-    block of height fns. Defer until we see a real user case.
+     style height axiom routed through Lean typeclasses.
+     Rejected at `decrease_height_datatype` (requires
+     `args.is_empty()`).
+  - **Mutually recursive datatype SCCs.** Height fns would need
+    a `mutual` block; currently emitted standalone, which Lean
+    rejects for cross-type recursion. Defer until a real user
+    case motivates the plumbing.
   - **Recursive function fields** (`struct S { f: FnSpec(int) →
-    Option<S> }`). Verus has a special axiom for this
-    (`recursive_function_field` in
-    `datatype_height_axioms`); we don't support.
+    Option<S> }`). Verus has a special axiom
+    (`recursive_function_field` in `datatype_height_axioms`) for
+    this; we don't mirror it.
   - **Lexicographic `decreases a, b`.** Check if exec fn
     `decreases` is even multi-tuple today — may already be
     rejected upstream.
-
-  **Companion test to add when feature lands:** take the
-  currently-rejected `test_exec_call_recursive_datatype_rejected`
-  (recursive `Stack` enum), flip it to `=> Ok(())`, and add a
-  companion non-decreasing case. Gotcha: the recursive-enum body
-  uses `match`, so full end-to-end success depends on #58 (match
-  automation) as well. Consider a tacit staging: #54 lands
-  without #58, and the enum test still fails tactus_auto on the
-  match — but the termination obligation itself should verify
-  (decomposable via `if s.isEmpty { … } else { … }`).
 
 ##### Tier 3 — bigger slices (~1 week each)
 
@@ -1204,6 +1204,7 @@ Assumptions about upstream VIR/SST shape or Verus compiler-pass ordering that ar
 * **Verus lowers `while cond { … break; … }` to `cond: None` + an inserted `if !cond { break; }` prelude in the body.** Our `Wp::Loop` accepts both `cond: Some(_)` (no break) and `cond: None` (break-lowered) shapes; `lower_loop` only emits a `cond` gate when `Some`. If Verus changes to keep `cond: Some` with the break preserved in the body, our encoding still produces valid goals but with a spurious `∧ cond` gate that may over-constrain the invariant proof. **No shape-drift test today** — speculative, would surface as a regression in `test_exec_loop_with_break` if Verus's lowering changes.
 * **Verus's `auto_proof_block` pass always wraps non-empty content.** The pass synthesises `proof { ... }` blocks around every `assert(P)` / `assert(P) by { tac }` site so they're parsed as proof-mode. We distinguish user-written `proof { }` (semantically meaningful, routed to `Wp::AssertByTactus` with `cond: None`) from auto-wrapped ones via HIR-body emptiness in `rust_to_vir_expr.rs` — auto-wrapped blocks have non-empty HIR bodies, user-written empty blocks don't. **Guarded by `test_exec_auto_proof_block_not_tactus`** which exercises the auto-wrap path and confirms it doesn't trigger Tactus mode.
 * **`get_ghost_block_opt` returns `Some(GhostBlockAttr::Proof)` for user-written `proof { }` blocks.** Our `enclosing_fn_is_tactus_auto` + ghost-block-attr detection in `fn_call_to_vir.rs` relies on this attribute classification. If Verus changes how it tags ghost blocks (e.g., a new `GhostBlockAttr::TactusProof` variant, or distinguishing wrapped vs unwrapped at this layer), we'd silently stop detecting user-written proof blocks and route them to the wrong path. **No shape-drift test** — would manifest as `test_exec_proof_block_user_tactic` regressing.
+* **`TypX::Boxed` / `TypX::Decorate` are the canonical transparent wrappers for self-referential datatype fields.** `height_fn_for_datatype`'s `field_is_self_recursive` peels these before comparing the field's underlying datatype path to `Self`. This mirrors `typ_to_expr`'s rendering (which peels both to produce Lean-level types). If Verus adds a new transparent wrapper for Rust `&Self` / `Box<Self>` / `Arc<Self>` / etc. that we don't peel, recursive-field detection would fail silently — the field would be treated as non-recursive, yielding `height = 1` for the variant and a false termination obligation (recursion would verify where it shouldn't). **No shape-drift test** — would manifest as `test_exec_call_recursive_datatype_termination` regressing past the current "match-case-split" gap into a verified-but-wrong state.
 
 ### `Wp` — WP DSL (landed)
 

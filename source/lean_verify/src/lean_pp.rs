@@ -270,6 +270,11 @@ fn write_datatype(out: &mut String, dt: &Datatype) {
             }
         }
     }
+    if !dt.derives.is_empty() {
+        out.push_str("  deriving ");
+        out.push_str(&dt.derives.join(", "));
+        out.push('\n');
+    }
 }
 
 fn write_class(out: &mut String, c: &Class) {

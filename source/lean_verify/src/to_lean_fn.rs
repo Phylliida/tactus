@@ -143,15 +143,155 @@ pub fn datatype_to_cmds(dt: &DatatypeX, emit_accessors: bool) -> Vec<Command> {
         }
     };
 
+    // Derive `Inhabited` for non-generic datatypes so that auto-
+    // generated accessors' `default` fallback (`Classical.arbitrary`
+    // for the wildcard arm) resolves. This matters most for self-
+    // referential types like `enum Stack { Empty, Push(u8,
+    // Box<Stack>) }` where `Push_val1 : Stack → Stack` needs
+    // `Inhabited Stack`. Generic datatypes skip this — deriving
+    // Inhabited on `T<A>` would require `[Inhabited A]` bounds we
+    // don't thread through, so we defer until a concrete need
+    // forces the plumbing.
+    let derives = if typ_params.is_empty() {
+        vec!["Inhabited".into()]
+    } else {
+        vec![]
+    };
     let mut cmds = vec![Command::Datatype(Datatype {
         name: path.clone(),
         typ_params: typ_params.clone(),
         kind,
+        derives,
     })];
     if !is_single_variant_struct && emit_accessors {
         cmds.extend(multi_variant_accessor_defs(dt, &path));
     }
+    if let Some(height) = height_fn_for_datatype(dt, &path) {
+        cmds.push(height);
+    }
     cmds
+}
+
+/// Emit `def T.height : T → Nat` alongside the datatype so that
+/// non-int `decreases` measures on `T` can discharge the
+/// termination obligation emitted by `sst_exp_to_ast_checked`'s
+/// `CheckDecreaseHeight` arm.
+///
+/// - **Non-recursive datatype** (no self-referential fields): emit
+///   `fun _ => 1`. Doesn't help termination (there's no structural
+///   subterm), but keeps the Lean symbol resolvable if a user
+///   writes `decreases x` for a non-recursive `x` — the obligation
+///   `1 < 1` is simply false, so the recursion fails verification
+///   with a clear goal.
+/// - **Recursive datatype**: emit a match over variants, summing
+///   `1 + height(f)` for each recursive field `f`, treating non-
+///   recursive fields as 0. Lean's equation compiler proves
+///   termination by structural recursion on the scrutinee.
+///
+/// Returns `None` for:
+/// - **Tuple datatypes** (`Dt::Tuple`) — rendered as products, no
+///   declaration site for a height fn.
+/// - **Generic datatypes** (non-empty `typ_params`) — per DESIGN.md
+///   "Non-int decreases" deferrals, emitting a parametric height
+///   would require a `[SizeOf α]`-style typeclass. Call sites
+///   reach this via `decrease_height_datatype`, which rejects
+///   generic instantiations at the obligation site.
+/// - **Mutually recursive datatype SCCs** — emitting each height
+///   fn standalone makes Lean's structural recursion fail for
+///   cross-type references (it only recurses on `Self`). Deferred
+///   until we support `mutual` blocks for height fns.
+///
+/// The "recursive field" test peels `TypX::Boxed` (poly coercion)
+/// and `TypX::Decorate` (e.g., `Box<Self>`, `&Self`) before
+/// comparing the underlying path — this matches how `typ_to_expr`
+/// renders field types at the Lean level (Box is transparent).
+fn height_fn_for_datatype(dt: &DatatypeX, path: &str) -> Option<Command> {
+    use crate::lean_ast::ExprNode;
+    let dt_path = match &dt.name {
+        Dt::Path(p) => p,
+        Dt::Tuple(_) => return None,
+    };
+    if !dt.typ_params.is_empty() {
+        return None;
+    }
+
+    let x_binder = || LBinder {
+        name: Some("x".into()),
+        ty: LExpr::var(path),
+        kind: BinderKind::Explicit,
+    };
+
+    let has_recursive_field = dt.variants.iter().any(|v|
+        v.fields.iter().any(|f| field_is_self_recursive(&f.a.0, dt_path))
+    );
+
+    let body = if has_recursive_field {
+        let arms: Vec<MatchArm> = dt.variants.iter().map(|v| {
+            let var_san = sanitize(&v.name);
+            let ctor_name = format!("{}.{}", path, var_san);
+            let mut pats = Vec::with_capacity(v.fields.len());
+            let mut recursive_binders: Vec<String> = Vec::new();
+            for (idx, f) in v.fields.iter().enumerate() {
+                if field_is_self_recursive(&f.a.0, dt_path) {
+                    let name = format!("_rec_{}", idx);
+                    pats.push(LPattern::Var(name.clone()));
+                    recursive_binders.push(name);
+                } else {
+                    pats.push(LPattern::Wildcard);
+                }
+            }
+            let mut arm_body = LExpr::lit_int("1");
+            for name in &recursive_binders {
+                arm_body = LExpr::add(
+                    arm_body,
+                    LExpr::app1(
+                        LExpr::var(&format!("{}.height", path)),
+                        LExpr::var(name),
+                    ),
+                );
+            }
+            MatchArm {
+                pattern: LPattern::Ctor { name: ctor_name, args: pats },
+                body: arm_body,
+            }
+        }).collect();
+        LExpr::new(ExprNode::Match {
+            scrutinee: Box::new(LExpr::var("x")),
+            arms,
+        })
+    } else {
+        LExpr::lit_int("1")
+    };
+
+    Some(Command::Def(Def {
+        // `@[simp]`: `simp_all` in `tactus_auto` should unfold
+        // `Stack.height (Stack.Push n rest)` to `1 + Stack.height
+        // rest` so that the termination obligation produced by
+        // `CheckDecreaseHeight` can be closed after case analysis.
+        // Without this, the height call stays opaque and omega
+        // can't reason about structural subterms.
+        attrs: vec!["simp".into()],
+        name: format!("{}.height", path),
+        binders: vec![x_binder()],
+        ret_ty: LExpr::var("Nat"),
+        body,
+        termination_by: vec![],
+    }))
+}
+
+/// Is `typ` a self-referential occurrence of the datatype at
+/// `self_path`? Peels `TypX::Boxed` and `TypX::Decorate` to
+/// handle `Box<Self>`, `&Self`, etc. — these decorate the
+/// pointer shape at the Rust level but render as just `Self`
+/// at the Lean type level.
+fn field_is_self_recursive(typ: &Typ, self_path: &Path) -> bool {
+    match &**typ {
+        TypX::Boxed(inner) | TypX::Decorate(_, _, inner) =>
+            field_is_self_recursive(inner, self_path),
+        TypX::Datatype(Dt::Path(p), args, _) if args.is_empty() =>
+            p == self_path,
+        _ => false,
+    }
 }
 
 /// Emit `Type.is<Variant>` discriminators and `Type.<Variant>_<field>`

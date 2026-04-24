@@ -492,26 +492,6 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                     args.len()
                 ));
             }
-            if !is_int_height(&args[0].typ) {
-                // Non-int decrease types (e.g., `decreases t` where `t:
-                // Tree`) need a Lean `height : T → Nat` fn per
-                // datatype so we can emit the structural-subterm
-                // obligation `height cur < height prev ∨ (height cur
-                // = height prev ∧ otherwise)`. Tracked as task #54 —
-                // see DESIGN.md "Non-int decreases" for the plan
-                // (generate height fn alongside each non-generic,
-                // non-SCC datatype's declaration). Rejected here
-                // rather than emitted-as-sorry so users get a clear
-                // signal rather than a silent unsoundness.
-                return Err(format!(
-                    "recursive call termination check with non-int decrease \
-                     (type {:?}) — `decreases` on user datatypes requires \
-                     generating a Lean `height` function per datatype, \
-                     tracked as task #54. Use an int-valued decreases measure \
-                     (e.g., `decreases length_of(t)`) as a workaround.",
-                    args[0].typ
-                ));
-            }
             // `cur` is shaped as `let params = args in decrease_expr`
             // (see `recursion::check_decrease_call`), i.e., Verus
             // encodes parameter substitution via a BndX::Let. Render
@@ -520,13 +500,44 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
             let cur = render_checked_decrease_arg(&args[0])?;
             let prev = render_checked_decrease_arg(&args[1])?;
             let otherwise = sst_exp_to_ast_checked(&args[2])?;
-            // (0 ≤ cur ∧ cur < prev) ∨ (cur = prev ∧ otherwise)
-            let lt_branch = LExpr::and(
-                LExpr::le(LExpr::lit_int("0"), cur.clone()),
-                LExpr::lt(cur.clone(), prev.clone()),
-            );
-            let eq_branch = LExpr::and(LExpr::eq(cur, prev), otherwise);
-            LExpr::or(lt_branch, eq_branch).node
+            if is_int_height(&args[0].typ) {
+                // Int fast-path. Prelude axiom at prelude.rs:1030-1037
+                // gives `height_lt(height(c), height(p)) ↔ 0 ≤ c ∧ c
+                // < p`, so we inline arithmetic directly — no
+                // `height` fn, no axioms, transparent to omega.
+                // (0 ≤ cur ∧ cur < prev) ∨ (cur = prev ∧ otherwise)
+                let lt_branch = LExpr::and(
+                    LExpr::le(LExpr::lit_int("0"), cur.clone()),
+                    LExpr::lt(cur.clone(), prev.clone()),
+                );
+                let eq_branch = LExpr::and(LExpr::eq(cur, prev), otherwise);
+                LExpr::or(lt_branch, eq_branch).node
+            } else if let Some(path) = decrease_height_datatype(&args[0].typ) {
+                // Datatype path. `to_lean_fn::height_fn_for_datatype`
+                // emits a companion `<path>.height : T → Nat` def
+                // via structural match. Obligation:
+                //   T.height cur < T.height prev
+                //     ∨ (T.height cur = T.height prev ∧ otherwise)
+                let height_name = format!("{}.height", lean_name(path));
+                let apply_height = |x: LExpr| LExpr::app1(LExpr::var(&height_name), x);
+                let cur_h = apply_height(cur);
+                let prev_h = apply_height(prev);
+                let lt_branch = LExpr::lt(cur_h.clone(), prev_h.clone());
+                let eq_branch = LExpr::and(LExpr::eq(cur_h, prev_h), otherwise);
+                LExpr::or(lt_branch, eq_branch).node
+            } else {
+                // Types we can't anchor a height fn on: generic
+                // datatype instantiations, tuples, spec fns, etc.
+                // Tracked as task #54 deferrals — see DESIGN.md
+                // "Non-int decreases".
+                return Err(format!(
+                    "recursive call termination check with non-int decrease \
+                     (type {:?}) — only int and concrete (non-generic) user \
+                     datatypes are supported today. See DESIGN.md 'Non-int \
+                     decreases' for deferrals (generics, SCCs, lexicographic).",
+                    args[0].typ
+                ));
+            }
         }
         ExpX::Call(CallFun::InternalFun(_), _, _) => {
             return Err("internal function calls not yet supported".to_string());
@@ -617,6 +628,20 @@ fn is_int_height(typ: &Typ) -> bool {
         TypX::Int(_) => true,
         TypX::Boxed(inner) | TypX::Decorate(_, _, inner) => is_int_height(inner),
         _ => false,
+    }
+}
+
+/// Extract the datatype Path when a decrease measure is a user
+/// datatype (not int). Peels `Boxed` and `Decorate` wrappers the
+/// same way `is_int_height` does. Returns None for generic
+/// instantiations, tuples, and anything else that can't anchor a
+/// `T.height` fn. `height_fn_name_for_datatype` in `to_lean_fn.rs`
+/// emits the matching definition.
+pub(crate) fn decrease_height_datatype(typ: &Typ) -> Option<&Path> {
+    match &**typ {
+        TypX::Boxed(inner) | TypX::Decorate(_, _, inner) => decrease_height_datatype(inner),
+        TypX::Datatype(Dt::Path(path), args, _) if args.is_empty() => Some(path),
+        _ => None,
     }
 }
 
