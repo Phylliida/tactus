@@ -970,10 +970,20 @@ pub enum InvAtomicity {
     NonAtomic,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, ToDebugSNode, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Serialize, Deserialize, ToDebugSNode, PartialEq, Eq, Hash)]
 pub enum AssertQueryMode {
     NonLinear,
     BitVector,
+    /// Tactus: `assert(P) by { lean_tactic }` inside a
+    /// `#[verifier::tactus_auto]` fn. The tactic_span is the
+    /// (canonicalised file path, start byte, end byte) of the `{ … }`
+    /// after `by`; `sst_to_lean` reads the original file at that
+    /// range to recover the verbatim Lean tactic text and emits it
+    /// as the closer for the generated Assert obligation. The
+    /// FileLoader has sanitized the brace body to spaces for rustc's
+    /// benefit, so the `proof` field of the containing
+    /// `ExprX::AssertBy` is always an empty block in this mode.
+    Tactus { tactic_span: (String, usize, usize) },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]

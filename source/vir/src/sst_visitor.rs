@@ -544,7 +544,7 @@ pub(crate) trait Visitor<R: Returner, Err, Scope: Scoper> {
                 let body = self.visit_stm(body)?;
                 R::ret(|| {
                     stm_new(StmX::AssertQuery {
-                        mode: *mode,
+                        mode: mode.clone(),
                         typ_inv_exps: R::get_vec_a(typ_inv_exps),
                         typ_inv_vars: R::get_vec_a(typ_inv_vars),
                         body: R::get(body),

@@ -885,7 +885,7 @@ fn visit_stm(ctx: &Ctx, state: &mut State, stm: &Stm) -> Stm {
             let typ_inv_vars =
                 typ_inv_vars.iter().map(|(x, _)| (x.clone(), state.types[x].clone())).collect();
             mk_stm(StmX::AssertQuery {
-                mode: *mode,
+                mode: mode.clone(),
                 typ_inv_exps,
                 typ_inv_vars: Arc::new(typ_inv_vars),
                 body,

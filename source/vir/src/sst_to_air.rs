@@ -2298,6 +2298,20 @@ fn stm_to_stmts(ctx: &Ctx, state: &mut State, stm: &Stm) -> Result<Vec<Stmt>, Vi
                 unimplemented!("assert query is unsupported in debugger mode");
             }
 
+            // Tactus `assert(P) by { lean_tactic }` is proved by
+            // `sst_to_lean::build_wp`, not Z3. The primary verify
+            // path short-circuits at verifier.rs before reaching
+            // sst_to_air for `QueryOp::Body(Style::Normal)` on
+            // tactus_auto fns, but secondary queries (recommends
+            // check, safe-api check, etc.) still flow through here.
+            // For those we emit no Z3 obligation — the companion
+            // `StmX::Assume(ensure)` that `ast_to_sst` emits
+            // alongside the Tactus AssertQuery supplies the downstream
+            // "P holds" fact, trusting Lean proved it.
+            if let AssertQueryMode::Tactus { .. } = mode {
+                return Ok(vec![]);
+            }
+
             let mut local = state.local_shared.clone();
             for (x, typ) in typ_inv_vars.iter() {
                 let typ_inv = typ_invariant(ctx, typ, &ident_var(&suffix_local_unique_id(x)));
@@ -2340,6 +2354,16 @@ fn stm_to_stmts(ctx: &Ctx, state: &mut State, stm: &Stm) -> Result<Vec<Stmt>, Vi
                         true,
                     ));
                 }
+                // Tactus `assert(P) by { lean_tactic }` routes to a
+                // different pipeline (`sst_to_lean::build_wp`) and
+                // should never reach sst_to_air. If we hit this arm,
+                // the verifier didn't split the tactus_auto path
+                // early enough — bug in verifier.rs, not in this
+                // handler.
+                AssertQueryMode::Tactus { .. } => unreachable!(
+                    "AssertQueryMode::Tactus reached sst_to_air — \
+                     tactus_auto exec fns should route through sst_to_lean"
+                ),
                 _ => unreachable!("bitvector mode in wrong place"),
             }
 
