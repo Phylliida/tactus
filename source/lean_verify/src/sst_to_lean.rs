@@ -636,29 +636,22 @@ impl<'a> Wp<'a> {
 
 // ── WP lowering ────────────────────────────────────────────────────────
 
-/// Format a Verus `Span` as a compact `file:line:col` location string
-/// for `/- @rust:LOC -/` markers in the generated Lean (#51).
+/// Read the pre-resolved start `file:line:col` from a Verus
+/// `Span` for `/- @rust:LOC -/` markers in the generated Lean
+/// (#51).
 ///
-/// Verus's `Span::as_string` is shaped like
-/// `"/path/to/file.rs:LINE:COL: LINE:COL (#0)"` (start position,
-/// end position, hygiene marker). We extract just the start
-/// position — that's what surfaces in error messages.
-///
-/// The `": "` separator (colon-space) is unambiguous: Windows
-/// drive-letter colons (`C:\...`) have no space after, and paths
-/// don't contain `": "` in practice. First-match via `find` is
-/// correct for both Unix and Windows paths. Pinned by
-/// `format_rust_loc_*` unit tests.
-///
-/// Returns the full `as_string` unchanged if the format doesn't
-/// match expectations (defensive: better to over-include than to
-/// silently strip information).
+/// `Span::start_loc` is populated by
+/// `rust_verify::spans::to_air_span` at SST construction time.
+/// Spans built without rustc context (test fixtures, the
+/// `err_air_span` diagnostic helper, the verifier's "no
+/// location" placeholder) leave `start_loc` empty; we fall back
+/// to `as_string` so something useful surfaces rather than an
+/// empty marker.
 fn format_rust_loc(span: &Span) -> String {
-    let s = &span.as_string;
-    if let Some(idx) = s.find(": ") {
-        s[..idx].to_string()
+    if !span.start_loc.is_empty() {
+        span.start_loc.clone()
     } else {
-        s.clone()
+        span.as_string.clone()
     }
 }
 
@@ -1529,53 +1522,45 @@ mod tests {
             id: 0,
             data: vec![],
             as_string: String::new(),
+            start_loc: String::new(),
         }
     }
 
-    /// Construct a Span with a specific `as_string` for testing
-    /// `format_rust_loc`'s parsing.
-    fn span_with_as_string(s: &str) -> Span {
+    /// Construct a Span with specified `start_loc` and `as_string`
+    /// for testing `format_rust_loc`'s field-vs-fallback logic.
+    fn span_with_locs(start_loc: &str, as_string: &str) -> Span {
         Span {
             raw_span: Arc::new(()),
             id: 0,
             data: vec![],
-            as_string: s.to_string(),
+            as_string: as_string.to_string(),
+            start_loc: start_loc.to_string(),
         }
     }
 
-    // #51 shape-drift: pin the `Span::as_string` parsing. If Verus
-    // changes its format (e.g., drops the hygiene `(#N)` suffix or
-    // switches separators), these tests fire before users see
-    // degraded error messages.
+    // #51 source-mapping pin: format_rust_loc prefers the
+    // pre-resolved `start_loc` (populated by `rust_verify`'s
+    // `to_air_span`) and falls back to `as_string` only when
+    // start_loc is empty (test fixtures / synthetic spans).
 
     #[test]
-    fn format_rust_loc_unix_path() {
-        let s = span_with_as_string(
-            "/home/user/proj/src/main.rs:42:13: 42:20 (#0)"
+    fn format_rust_loc_uses_start_loc_when_present() {
+        let s = span_with_locs(
+            "/home/user/proj/src/main.rs:42:13",
+            "/home/user/proj/src/main.rs:42:13: 42:20 (#0)",
         );
         assert_eq!(format_rust_loc(&s), "/home/user/proj/src/main.rs:42:13");
     }
 
     #[test]
-    fn format_rust_loc_windows_path() {
-        // Drive-letter colon (`C:\`) has no space after, so
-        // find(": ") still hits the right separator.
-        let s = span_with_as_string(
-            r"C:\proj\src\main.rs:10:5: 10:12 (#0)"
-        );
-        assert_eq!(format_rust_loc(&s), r"C:\proj\src\main.rs:10:5");
+    fn format_rust_loc_falls_back_to_as_string_when_start_loc_empty() {
+        let s = span_with_locs("", "synthetic-span-from-test-fixture");
+        assert_eq!(format_rust_loc(&s), "synthetic-span-from-test-fixture");
     }
 
     #[test]
-    fn format_rust_loc_unparseable_falls_through() {
-        // Unexpected format → return as-is rather than lose info.
-        let s = span_with_as_string("no-separator-here");
-        assert_eq!(format_rust_loc(&s), "no-separator-here");
-    }
-
-    #[test]
-    fn format_rust_loc_empty() {
-        let s = span_with_as_string("");
+    fn format_rust_loc_both_empty() {
+        let s = span_with_locs("", "");
         assert_eq!(format_rust_loc(&s), "");
     }
 
