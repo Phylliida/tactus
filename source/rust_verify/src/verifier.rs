@@ -2955,6 +2955,7 @@ impl Verifier {
                 id: 0,
                 data: vec![],
                 as_string: "no location".to_string(),
+                start_loc: String::new(),
             })
         };
 

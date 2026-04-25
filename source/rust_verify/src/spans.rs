@@ -34,7 +34,13 @@ pub(crate) fn from_raw_span(raw_span: &vir::messages::RawSpan) -> Option<Span> {
 pub(crate) fn err_air_span(span: Span) -> vir::messages::Span {
     let raw_span = to_raw_span(span);
     let as_string = format!("{:?}", span);
-    vir::messages::Span { raw_span, id: 0, data: vec![], as_string }
+    vir::messages::Span {
+        raw_span, id: 0, data: vec![], as_string,
+        // Diagnostic-only span used for error reporting; no
+        // SourceMap available here. lean_verify's error formatter
+        // falls back to as_string when start_loc is empty.
+        start_loc: String::new(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -194,7 +200,9 @@ impl SpanContextX {
         }
 
         let next_span_id = std::sync::atomic::AtomicU64::new(1);
-        Arc::new(SpanContextX { local_crate, imported_crates, next_span_id, local_files })
+        Arc::new(SpanContextX {
+            local_crate, imported_crates, next_span_id, local_files,
+        })
     }
 
     fn pos_to_extern_source_file(
@@ -293,7 +301,23 @@ impl SpanContextX {
         let id = self.get_next_span_id();
         let data = self.pack_span(span);
         let as_string = format!("{:?}", span);
-        vir::messages::Span { raw_span, id, data, as_string }
+        // Pre-resolve the start position into a structured
+        // `file:line:col` for `lean_verify`'s error formatter
+        // (#51). Parses `as_string` here on the rust_verify side
+        // — the format is `format!("{:?}", rustc::Span)` which
+        // produces `path:lo_line:lo_col: hi_line:hi_col (#N)`, so
+        // we cut at the first `": "`. We don't store
+        // `Arc<SourceMap>` and call `lookup_char_pos` directly
+        // because `SourceMap` isn't `Sync`, and `SpanContextX` is
+        // shared across threads via `Arc`. Same parsing as before
+        // but done ONCE here, in the crate that owns the
+        // formatting choice — `lean_verify` reads the structured
+        // field directly.
+        let start_loc = match as_string.find(": ") {
+            Some(idx) => as_string[..idx].to_string(),
+            None => as_string.clone(),
+        };
+        vir::messages::Span { raw_span, id, data, as_string, start_loc }
     }
 
     pub(crate) fn from_air_span(

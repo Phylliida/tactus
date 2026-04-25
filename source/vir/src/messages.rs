@@ -19,6 +19,15 @@ pub struct Span {
     pub id: AstId, // arbitrary integer identifier that may be set and used in any way (e.g. as unique id, or just left as 0)
     pub data: Vec<u64>, // arbitrary integers (e.g. for serialization/deserialization)
     pub as_string: String, // if we can't print (description, raw_span), print as_string instead
+    /// Pre-resolved `file:line:col` for the span's start position,
+    /// computed at `rust_verify::spans::to_air_span` time using
+    /// rustc's `SourceMap`. Empty for spans constructed without
+    /// rustc context (e.g., test fixtures). Consumed by
+    /// `lean_verify`'s error formatter (#51 source mapping) to
+    /// surface user-visible Rust locations in Lean diagnostics
+    /// without having to parse `as_string`.
+    #[serde(default)]
+    pub start_loc: String,
 }
 
 impl std::fmt::Debug for Span {
@@ -171,6 +180,7 @@ impl air::messages::MessageInterface for VirMessageInterface {
                 id: 0,
                 data: Vec::new(),
                 as_string: air_span.to_owned(),
+                start_loc: String::new(),
             },
             note: note.to_owned(),
             is_proof_note: false,
