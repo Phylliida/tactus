@@ -264,20 +264,53 @@ fn check_exp(e: &Exp) -> Result<(), String> {
 
 /// Build the Lean `Theorem`s for an exec fn body check.
 ///
-/// Returns a `Vec` of one theorem per obligation in the body — one
-/// per `Wp::Assert` plus one per `Wp::Done` leaf. Multiple theorems
-/// per fn means a Lean error's `pos.line` falls inside exactly one
-/// theorem's `:= by` block, so the source-mapping kind label
-/// (`(precondition)` / `(loop invariant)` / etc.) becomes correct
-/// by construction rather than guessed via a closest-preceding-mark
-/// heuristic on a single mega-theorem (task D in HANDOFF).
+/// Returns a `Vec` of one theorem per obligation in the body —
+/// per `Wp::Assert`, per `Wp::Done` conjunct, per loop invariant
+/// (init + maintain), per loop decrease (maintain), per call
+/// precondition, per assert-by. Multiple theorems per fn means a
+/// Lean error's `pos.line` falls inside exactly one theorem's
+/// `:= by` block, so the source-mapping kind label
+/// (`(precondition)` / `(loop invariant)` / `(termination)` /
+/// etc.) becomes correct by construction rather than guessed via
+/// a closest-preceding-mark heuristic on a single mega-theorem
+/// (task D in HANDOFF — completed across Stages 1-4).
 ///
-/// Stages so far: D Stage 1 walks `Wp::Done` / `Assert` / `Let` /
-/// `Assume` / `Branch` per-obligation. D Stage 2 walks `Wp::Call`
-/// — emitting one theorem for the call's precondition and continuing
-/// with the substituted ensures as a hypothesis. `Wp::Loop` /
-/// `AssertByTactus` still fall back to a single subtree theorem
-/// (Stages 3-4 will replace each).
+/// Walker arms:
+///
+/// * **`Wp::Done(leaf)`** — emit one theorem per top-level
+///   conjunct of `leaf`. Top-level fn-ensures conjuncts produce
+///   `_tactus_ensures_<fn>_<id>`; loop-body terminator conjuncts
+///   produce `_tactus_loop_invariant_<fn>_at_<loc>_<id>` and
+///   `_tactus_loop_decrease_<fn>_at_<loc>_<id>` because each
+///   conjunct carries a SpanMark with its kind from
+///   `build_wp_loop`.
+/// * **`Wp::Assert(P, body)`** — one theorem for `P` (kind
+///   detected via `detect_assert_kind`: Termination for
+///   `CheckDecreaseHeight`, Plain otherwise). Body walked with
+///   `P` as a hypothesis.
+/// * **`Wp::Assume(P, body)`** — no theorem; `P` enters the
+///   context as a hypothesis.
+/// * **`Wp::Let(name, val, body)`** — no theorem; let frame
+///   pushed. If `val` contains a value-position `if`, fork into
+///   recursive walks (one per branch with the cond as a Hyp
+///   frame).
+/// * **`Wp::Branch(cond, t, e)`** — recurse on `t` with `cond`
+///   as a Hyp frame; recurse on `e` with `¬cond`. No theorem at
+///   the branch node.
+/// * **`Wp::Call(callee, args, dest, after)`** — one theorem
+///   for the substituted requires (kind=CallPrecondition).
+///   Continue with `∀ ret, ret_bound → ensures(subst) → let
+///   dest := ret;` frames.
+/// * **`Wp::Loop(invs, dec, mv, body, after)`** — one theorem
+///   per init invariant; walk body in maintain ctx (mv binders,
+///   bounds, invs as hyps, cond as hyp, `_tactus_d_old` let);
+///   walk after in use ctx (mv binders, bounds, invs, ¬cond).
+/// * **`Wp::AssertByTactus(cond, tac, body)`** —
+///   `Some(P)`: one theorem for `P` with `tac` as the closer;
+///   body walked with `P` as a Hyp. `None`: push `tac` onto
+///   `tactic_prefix`; every body theorem gets `(tac) <;> closer`
+///   so the user's `have h : P := by ...` propagates as a local
+///   hypothesis to subsequent obligations.
 ///
 /// Returns `Err` if any part of `check` uses an SST form we don't know
 /// how to emit. Validation and AST construction share a single pass
@@ -314,6 +347,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
         base_binders: binders,
         counter: 0,
         out: Vec::new(),
+        tactic_prefix: Vec::new(),
     };
     walk_obligations(&body_wp, &ctx, &OblCtx::new(), &mut emitter);
     Ok(emitter.out)
@@ -381,17 +415,62 @@ impl OblCtx {
 /// across every theorem the walker emits; `counter` disambiguates
 /// theorem names so multiple obligations of the same kind at the
 /// same source line don't collide.
+///
+/// `tactic_prefix` accumulates user tactic text from enclosing
+/// `Wp::AssertByTactus { cond: None, ... }` nodes (i.e., user-
+/// written `proof { … }` blocks). Each emitted theorem gets these
+/// prefixes prepended to its closer, so the user's `have h : P :=
+/// by …` propagates as local hypotheses to subsequent obligation
+/// theorems within the block's scope. Push/pop is structured around
+/// `walk_obligations` recursion; see the `Wp::AssertByTactus` arm.
 struct ObligationEmitter {
     fn_name: String,
     base_binders: Vec<LBinder>,
     counter: usize,
     out: Vec<Theorem>,
+    tactic_prefix: Vec<String>,
 }
 
 impl ObligationEmitter {
     fn next_id(&mut self) -> usize {
         self.counter += 1;
         self.counter
+    }
+
+    /// Emit a theorem with the given goal and base closer. Applies
+    /// any active `tactic_prefix` (from enclosing proof blocks) by
+    /// running them as a parenthesised sequence followed by `<;>
+    /// closer`, so the closer applies to whatever subgoals the
+    /// prefix leaves. `<;>` is essential here: a goal-modifying
+    /// prefix like `simp_all` may close the goal entirely, in which
+    /// case the closer becomes a no-op rather than failing with
+    /// "no goals" (which `; tactus_auto` would).
+    fn emit(&mut self, name: String, goal: LExpr, closer: Tactic) {
+        let tactic = if self.tactic_prefix.is_empty() {
+            closer
+        } else {
+            let mut body = String::new();
+            body.push_str("(\n");
+            for prefix in &self.tactic_prefix {
+                for line in prefix.lines() {
+                    body.push_str("  ");
+                    body.push_str(line);
+                    body.push('\n');
+                }
+            }
+            body.push_str(") <;> ");
+            match closer {
+                Tactic::Named(n) => body.push_str(&n),
+                Tactic::Raw(s) => body.push_str(&format!("({})", s)),
+            }
+            Tactic::Raw(body)
+        };
+        self.out.push(Theorem {
+            name,
+            binders: self.base_binders.clone(),
+            goal,
+            tactic,
+        });
     }
 }
 
@@ -477,12 +556,7 @@ fn walk_obligations<'a>(
             let name = format!("_tactus_{}_{}_at_{}_{}", label, e.fn_name, suffix, id);
             let cond_ast = sst_exp_to_ast(asserted);
             let goal = LExpr::span_mark(loc, kind, cond_ast.clone());
-            e.out.push(Theorem {
-                name,
-                binders: e.base_binders.clone(),
-                goal: obl.wrap(goal),
-                tactic: simple_tactic(),
-            });
+            e.emit(name, obl.wrap(goal), simple_tactic());
             let new_obl = obl.with_frame(CtxFrame::Hyp(sst_exp_to_ast(asserted)));
             walk_obligations(body, ctx, &new_obl, e);
         }
@@ -526,12 +600,66 @@ fn walk_obligations<'a>(
         Wp::Loop { cond, invs, decrease, modified_vars, body, after } => {
             walk_loop(*cond, invs, decrease, modified_vars, body, after, ctx, obl, e);
         }
-        // Stage 4: emits one theorem covering the whole subtree
-        // wrapped in the current obligation context. Stage 4
-        // (AssertByTactus) replaces this fallback with its own
-        // per-variant walker.
-        Wp::AssertByTactus { .. } => {
-            emit_subtree_fallback(wp, ctx, obl, e);
+        Wp::AssertByTactus { cond, tactic_text, body } => {
+            walk_assert_by_tactus(*cond, tactic_text, body, ctx, obl, e);
+        }
+    }
+}
+
+/// Per-obligation walker for `Wp::AssertByTactus`.
+///
+/// Two surface forms with different scoping:
+///
+/// * **`cond = Some(P)` — `assert(P) by { user_tac }`**: emit a
+///   single theorem for `P` with `user_tac` as the closer (rather
+///   than the standard `tactus_auto`). The asserted condition then
+///   becomes a hypothesis for the rest of the body — so subsequent
+///   per-obligation theorems get `P` in their context, and Lean's
+///   omega/simp_all picks it up automatically.
+///
+/// * **`cond = None` — `proof { user_tac }`**: no theorem emitted
+///   here; `user_tac` is pushed onto `e.tactic_prefix` so every
+///   obligation theorem in the body's lexical scope gets
+///   `user_tac` prepended to its closer. The user's `have h : P
+///   := by ...` lines then introduce named hypotheses scoped to
+///   each subsequent theorem (option (a) from the D plan).
+fn walk_assert_by_tactus<'a>(
+    cond: Option<&'a Exp>,
+    tactic_text: &str,
+    body: &Wp<'a>,
+    ctx: &WpCtx<'a>,
+    obl: &OblCtx,
+    e: &mut ObligationEmitter,
+) {
+    match cond {
+        Some(c) => {
+            // Assert-by: emit one theorem for `c` with the user's
+            // tactic as the closer. The cond becomes a hypothesis
+            // for body theorems. AssertKind::Plain because it's a
+            // user-written `assert(P) by { tac }` — same kind that
+            // a plain `assert(P)` would get from `detect_assert_kind`.
+            let id = e.next_id();
+            let loc = format_rust_loc(&c.span);
+            let suffix = sanitize_loc_for_name(&loc);
+            let name = format!(
+                "_tactus_assert_{}_at_{}_{}", e.fn_name, suffix, id,
+            );
+            let goal = LExpr::span_mark(
+                loc, AssertKind::Plain, sst_exp_to_ast(c),
+            );
+            e.emit(name, obl.wrap(goal), Tactic::Raw(tactic_text.to_string()));
+            // Cond as hypothesis for body theorems.
+            let new_obl = obl.with_frame(CtxFrame::Hyp(sst_exp_to_ast(c)));
+            walk_obligations(body, ctx, &new_obl, e);
+        }
+        None => {
+            // Proof block: tactic prefix flows to every theorem in
+            // body's scope. Push, walk, pop — the prefix only
+            // applies to body theorems, not to obligations
+            // sequentially after the proof block.
+            e.tactic_prefix.push(tactic_text.to_string());
+            walk_obligations(body, ctx, obl, e);
+            e.tactic_prefix.pop();
         }
     }
 }
@@ -567,12 +695,7 @@ fn emit_done_or_split(leaf: &LExpr, obl: &OblCtx, e: &mut ObligationEmitter) {
         let suffix = sanitize_loc_for_name(&loc);
         format!("_tactus_{}_{}_at_{}_{}", kind_label, e.fn_name, suffix, id)
     };
-    e.out.push(Theorem {
-        name,
-        binders: e.base_binders.clone(),
-        goal: obl.wrap(leaf.clone()),
-        tactic: simple_tactic(),
-    });
+    e.emit(name, obl.wrap(leaf.clone()), simple_tactic());
 }
 
 /// Per-obligation walker for `Wp::Loop`. Emits init theorems (one
@@ -622,12 +745,7 @@ fn walk_loop<'a>(
         let name = format!(
             "_tactus_loop_invariant_{}_at_{}_{}", e.fn_name, suffix, id,
         );
-        e.out.push(Theorem {
-            name,
-            binders: e.base_binders.clone(),
-            goal: obl.wrap(inv_marked(inv)),
-            tactic: simple_tactic(),
-        });
+        e.emit(name, obl.wrap(inv_marked(inv)), simple_tactic());
     }
 
     // ── Maintain: walk body with ∀ mod_vars + bounds + invs as
@@ -737,12 +855,7 @@ fn walk_call<'a>(
     let theorem_name = format!(
         "_tactus_precondition_{}_at_{}_{}", e.fn_name, suffix, id,
     );
-    e.out.push(Theorem {
-        name: theorem_name,
-        binders: e.base_binders.clone(),
-        goal: obl.wrap(requires_clause),
-        tactic: simple_tactic(),
-    });
+    e.emit(theorem_name, obl.wrap(requires_clause), simple_tactic());
 
     // Continuation: walk `after` under a fresh context that pushes
     // the post-call binders/hypotheses/lets in the same order
@@ -829,128 +942,6 @@ fn walk_let<'a>(
     }
 }
 
-/// Stage 1 fallback for `Wp::Loop` / `Call` / `AssertByTactus`: emit
-/// one theorem covering the entire subtree, lowered via `lower_wp`,
-/// wrapped in the current obligation context. Replicates the pre-D
-/// single-theorem behaviour for these subtrees; Stages 2-4 replace
-/// each with a per-variant walker.
-fn emit_subtree_fallback<'a>(
-    wp: &Wp<'a>,
-    ctx: &WpCtx<'a>,
-    obl: &OblCtx,
-    e: &mut ObligationEmitter,
-) {
-    let id = e.next_id();
-    let name = format!("_tactus_body_{}_{}", e.fn_name, id);
-    let user_haves = collect_tactus_haves(wp);
-    let goal = lower_wp(wp, ctx);
-    let needs_peel = wp.needs_peel();
-    let closer = if needs_peel { loop_tactic() } else { simple_tactic() };
-    let tactic = prepend_user_haves(user_haves, closer);
-    e.out.push(Theorem {
-        name,
-        binders: e.base_binders.clone(),
-        goal: obl.wrap(goal),
-        tactic,
-    });
-}
-
-/// Collected tactic prefix extracted from a `Wp::AssertByTactus` node.
-/// `wrap` distinguishes the two Tactus surface forms — see the
-/// variant's doc for the semantic split.
-struct TactusHave {
-    /// `Some((hypothesis_name, rendered_P))` for assert-by: emission
-    /// wraps as `have <name> : <P> := by <tac>`. `None` for proof
-    /// blocks: emission emits `<tac>` raw.
-    wrap: Option<(String, LExpr)>,
-    tactic_text: String,
-}
-
-/// Walk the Wp tree and extract one `TactusHave` per
-/// `Wp::AssertByTactus` node, in structural order. The resulting
-/// list is consumed by `prepend_user_haves` to build the theorem's
-/// prefix. `lower_wp` stays pure — the Tactus tactic info is
-/// extracted up-front rather than collected via a mutable side
-/// channel during lowering.
-fn collect_tactus_haves(wp: &Wp<'_>) -> Vec<TactusHave> {
-    let mut out = Vec::new();
-    collect_tactus_haves_into(wp, &mut out);
-    out
-}
-
-fn collect_tactus_haves_into(wp: &Wp<'_>, out: &mut Vec<TactusHave>) {
-    match wp {
-        Wp::Done(_) => {}
-        Wp::Let(_, _, body) | Wp::Assert(_, body) | Wp::Assume(_, body) => {
-            collect_tactus_haves_into(body, out);
-        }
-        Wp::AssertByTactus { cond, tactic_text, body } => {
-            let wrap = cond.map(|c| {
-                let idx = out.len();
-                (format!("h_tactus_assert_{}", idx), sst_exp_to_ast(c))
-            });
-            out.push(TactusHave { wrap, tactic_text: tactic_text.clone() });
-            collect_tactus_haves_into(body, out);
-        }
-        Wp::Branch { then_branch, else_branch, .. } => {
-            collect_tactus_haves_into(then_branch, out);
-            collect_tactus_haves_into(else_branch, out);
-        }
-        Wp::Loop { body, after, .. } => {
-            collect_tactus_haves_into(body, out);
-            collect_tactus_haves_into(after, out);
-        }
-        Wp::Call { after, .. } => {
-            collect_tactus_haves_into(after, out);
-        }
-    }
-}
-
-/// Prepend collected Tactus user tactics to the normal theorem
-/// `closer`. Two forms per `TactusHave`:
-///
-/// * `wrap = Some((name, cond))` (assert-by form): emit
-///   `have <name> : <cond> := by <user_tac>` so the user's tactic
-///   discharges the proof obligation for `<cond>` AND the proved
-///   hypothesis <name> is in scope for the rest of the proof.
-/// * `wrap = None` (proof-block form): emit `<user_tac>` raw — the
-///   user's own `have` / `unfold` / etc. run at theorem-tactic
-///   level, affecting outer context and goal.
-///
-/// No-op when the collector is empty — theorems with no Tactus
-/// assert-by / proof-block keep their single-tactic form unchanged.
-fn prepend_user_haves(haves: Vec<TactusHave>, closer: Tactic) -> Tactic {
-    if haves.is_empty() {
-        return closer;
-    }
-    let mut body = String::new();
-    for h in &haves {
-        match &h.wrap {
-            Some((name, cond)) => {
-                let cond_text = crate::lean_pp::pp_expr(cond);
-                body.push_str(&format!("have {name} : {cond_text} := by\n"));
-                for line in h.tactic_text.lines() {
-                    body.push_str("  ");
-                    body.push_str(line);
-                    body.push('\n');
-                }
-            }
-            None => {
-                for line in h.tactic_text.lines() {
-                    body.push_str(line);
-                    body.push('\n');
-                }
-            }
-        }
-    }
-    // Splice the closer's textual form after the haves.
-    match closer {
-        Tactic::Named(n) => body.push_str(&n),
-        Tactic::Raw(s) => body.push_str(&s),
-    }
-    Tactic::Raw(body)
-}
-
 /// Atomic `tactus_auto` for straight-line exec fn theorems — their
 /// goals are a single chain of `let` / `→` / `∧` that omega handles
 /// directly.
@@ -959,18 +950,6 @@ fn simple_tactic() -> Tactic {
 }
 
 /// Loop theorems have a conjunctive shape `init ∧ maintain ∧ use` per
-/// loop; nested / sequential loops produce nested conjunctions of the
-/// same shape. The goal can therefore be arbitrarily deeply structured,
-/// so we delegate to `tactus_peel` (defined in `TactusPrelude.lean`) —
-/// a recursive macro that strips one layer of `∧` or one `∀` / `→`
-/// per call and bottoms out at arithmetic leaves. `all_goals
-/// tactus_auto` then closes each leaf. No hardcoded depth — the
-/// recursion follows the goal's structure, so deeply-nested loops
-/// work the same as shallow ones.
-fn loop_tactic() -> Tactic {
-    Tactic::Raw("tactus_peel; all_goals tactus_auto".to_string())
-}
-
 // ── Binder builders ────────────────────────────────────────────────────
 
 /// Function params + their type-bound hypotheses. Shared across all
@@ -1157,28 +1136,7 @@ enum Wp<'a> {
     },
 }
 
-impl<'a> Wp<'a> {
-    /// Does lowering this Wp produce a goal shape that needs
-    /// structural peeling (nested `∀` / `∧` beyond what omega can
-    /// chase directly)? Flat Let/Assert/Assume/Branch chains over
-    /// arithmetic don't; Loops and Calls do because they introduce
-    /// quantifiers and conjunctive splits. `Branch` by itself is
-    /// peel-free (just two implications under a conjunction) — only
-    /// needs peel when a sub-branch does.
-    fn needs_peel(&self) -> bool {
-        match self {
-            Wp::Done(_) => false,
-            Wp::Let(_, _, body) | Wp::Assert(_, body) | Wp::Assume(_, body) => body.needs_peel(),
-            Wp::AssertByTactus { body, .. } => body.needs_peel(),
-            Wp::Branch { then_branch, else_branch, .. } => {
-                then_branch.needs_peel() || else_branch.needs_peel()
-            }
-            Wp::Loop { .. } | Wp::Call { .. } => true,
-        }
-    }
-}
-
-// ── WP lowering ────────────────────────────────────────────────────────
+// ── WP lowering helpers ────────────────────────────────────────────────
 
 /// Read the pre-resolved start `file:line:col` from a Verus
 /// `Span` for `/- @rust:LOC -/` markers in the generated Lean
@@ -1217,280 +1175,6 @@ fn detect_assert_kind(e: &Exp) -> AssertKind {
     } else {
         AssertKind::Plain
     }
-}
-
-/// Interpret a `Wp` tree into a Lean `LExpr`. Each node has a
-/// corresponding WP rule; see the variant docs on `Wp` for details.
-fn lower_wp(wp: &Wp<'_>, ctx: &WpCtx<'_>) -> LExpr {
-    match wp {
-        Wp::Done(leaf) => leaf.clone(),
-        Wp::Let(name, rhs, body) => {
-            // If `rhs` has an `ExpX::If` (possibly under transparent
-            // wrappers), lift it to goal level: `let x := if c then
-            // a else b; rest` becomes `(c → let x := a; rest) ∧ (¬c →
-            // let x := b; rest)`. Omega can chase each branch
-            // separately; it can't see inside a value-position if.
-            let body_lowered = lower_wp(body, ctx);
-            lift_if_value(rhs, &|rhs_ast| {
-                LExpr::let_bind(sanitize(name), rhs_ast, body_lowered.clone())
-            })
-        }
-        Wp::Assert(e, body) => LExpr::and(
-            // Wrap with the SST span so the pp emits a `/- @rust:LOC -/`
-            // marker before this assertion (#51). The kind is
-            // detected from the expression shape: Verus's recursion
-            // pass inserts `CheckDecreaseHeight` via `Wp::Assert`,
-            // so we recognize that as a Termination obligation;
-            // everything else is generic.
-            LExpr::span_mark(
-                format_rust_loc(&e.span),
-                detect_assert_kind(e),
-                sst_exp_to_ast(e),
-            ),
-            lower_wp(body, ctx),
-        ),
-        Wp::Assume(e, body) => LExpr::implies(sst_exp_to_ast(e), lower_wp(body, ctx)),
-        // The user tactic is NOT in the goal — it's extracted
-        // up-front by `collect_tactus_haves` and prepended to the
-        // closer (as `have h : P := by tac` for assert-by when
-        // `cond = Some(_)`, or raw when `cond = None` for proof
-        // blocks). Here we just pass through. Keeps `lower_wp` a
-        // pure function of the Wp tree + ctx.
-        Wp::AssertByTactus { cond: _, tactic_text: _, body } => lower_wp(body, ctx),
-        Wp::Branch { cond, then_branch, else_branch } => {
-            // Wrap the branch cond with its span (#51) — inner
-            // branch failures usually have their own Assert-level
-            // marks, but if the branch cond itself triggers a
-            // `simp_all` / `omega` goal (e.g., when the cond
-            // involves a match or complex expression), the mark
-            // points back at the `if` location in the Rust source.
-            let c = LExpr::span_mark(
-                format_rust_loc(&cond.span),
-                AssertKind::BranchCondition,
-                sst_exp_to_ast(cond),
-            );
-            LExpr::and(
-                LExpr::implies(c.clone(), lower_wp(then_branch, ctx)),
-                LExpr::implies(LExpr::not(c), lower_wp(else_branch, ctx)),
-            )
-        }
-        Wp::Loop { cond, invs, decrease, modified_vars, body, after } => {
-            lower_loop(*cond, invs, decrease, modified_vars, body, after, ctx)
-        }
-        Wp::Call { callee, args, typ_args, dest, call_span, after } => {
-            lower_call(callee, args, typ_args, *dest, call_span, after, ctx)
-        }
-    }
-}
-
-/// Lower a `Wp::Loop` to the three-part conjunction
-/// `I ∧ maintain ∧ havoc_continuation` — see DESIGN.md "Loop
-/// obligations (conjunctive WP)" for the shape and rationale.
-///
-/// `body` was built with `Done(I ∧ D < _tactus_d_old)` as its
-/// terminator (see `build_wp_loop`), so `lower_wp(body, ctx)` already
-/// produces the maintain clause's inner goal. Wrapping with
-/// `let _tactus_d_old := D` around it lets the inner `D` reference
-/// the post-body value while `_tactus_d_old` retains the pre-body
-/// value — straight Lean let-scoping does the right thing.
-fn lower_loop(
-    cond: Option<&Exp>,
-    invs: &[LoopInv],
-    decrease: &Exp,
-    modified_vars: &[(&VarIdent, &Typ)],
-    body: &Wp<'_>,
-    after: &Wp<'_>,
-    ctx: &WpCtx<'_>,
-) -> LExpr {
-    // Wrap each invariant with its individual span — common failure
-    // mode is "invariant not established at entry" / "not maintained
-    // across body" / "insufficient for post-loop goal", each of which
-    // surfaces as one unsolved conjunct whose location the user
-    // needs to know (#51).
-    let inv_conj = || and_all(
-        invs.iter()
-            .map(|i| LExpr::span_mark(
-                format_rust_loc(&i.inv.span),
-                AssertKind::LoopInvariant,
-                sst_exp_to_ast(&i.inv),
-            ))
-            .collect()
-    );
-    // Wrap the decrease expression so "decrease didn't decrease"
-    // failures point at the `decreases D` clause. CheckDecreaseHeight
-    // obligations (recursive-call termination) go through `Wp::Assert`
-    // and are wrapped there.
-    let decrease_ast = || LExpr::span_mark(
-        format_rust_loc(&decrease.span),
-        AssertKind::LoopDecrease,
-        sst_exp_to_ast(decrease),
-    );
-
-    // Init: invariant conjunction at loop entry.
-    let init_clause = inv_conj();
-
-    // Maintain: `∀ mod_vars, bounds → I (∧ cond)? →
-    //             (let _tactus_d_old := D; lower_wp(body))`.
-    // The `∧ cond` part is only present for `while`-shaped loops
-    // (`cond: Some`). For `cond: None` (Verus's break-lowered form),
-    // the body has an explicit `if !cond { break; }` at the head, so
-    // we don't gate the maintain clause on cond at the meta level.
-    //
-    // See DESIGN.md "_tactus_d_old aliasing across nested loops" for
-    // the rationale behind the literal `_tactus_d_old` name.
-    let maintain_body_lowered = lower_wp(body, ctx);
-    let maintain_core = LExpr::let_bind("_tactus_d_old", decrease_ast(), maintain_body_lowered);
-    // Wrap the loop condition with its span (#51) so failures
-    // that turn on cond evaluation point at the `while` header
-    // rather than the loop body. Same for the negated cond in
-    // the use clause below.
-    let cond_marked = |c: &Exp| LExpr::span_mark(
-        format_rust_loc(&c.span),
-        AssertKind::LoopCondition,
-        sst_exp_to_ast(c),
-    );
-    let maintain_pre = match cond {
-        Some(c) => LExpr::and(inv_conj(), cond_marked(c)),
-        None => inv_conj(),
-    };
-    let maintain_clause = quantify_mod_vars(
-        modified_vars,
-        LExpr::implies(maintain_pre, maintain_core),
-    );
-
-    // Use / post-loop continuation: `∀ mod_vars, bounds → I (∧ ¬cond)? →
-    //   lower_wp(after)`. For `cond: Some` the exit is via ¬cond.
-    // For `cond: None` exit is only via `break`, which writes the
-    // break_leaf (= I currently); no ¬cond clause.
-    //
-    // `after`'s Done leaves point at the outer ensures (or whatever
-    // the enclosing scope's `after` was), so nested loops' post-body
-    // code feeds back correctly.
-    let after_lowered = lower_wp(after, ctx);
-    let use_pre = match cond {
-        Some(c) => LExpr::and(inv_conj(), LExpr::not(cond_marked(c))),
-        None => inv_conj(),
-    };
-    let use_clause = quantify_mod_vars(
-        modified_vars,
-        LExpr::implies(use_pre, after_lowered),
-    );
-
-    LExpr::and(init_clause, LExpr::and(maintain_clause, use_clause))
-}
-
-/// Lower a `Wp::Call` by inlining the callee's require / ensure via
-/// Lean-AST substitution (rather than textual let-wrapping, which
-/// would shadow caller names on self-recursion).
-///
-/// For `let dest = callee(arg1, arg2, …)` the emitted shape is:
-///
-/// ```text
-/// requires_conj[p1 := arg1, p2 := arg2, …]
-/// ∧ (∀ (ret : RetT), h_ret_bound(ret) →
-///      ensures_conj_using_ret[p1 := arg1, p2 := arg2, …] →
-///      (let dest := ret; <lower_wp(after)>))
-/// ```
-///
-/// The substitution `[p := arg]` is done at the Lean AST level via
-/// `lean_ast::substitute` — direct substitution instead of
-/// `let p := arg; body` wrapping avoids name shadowing when the
-/// caller and callee share a param name (e.g., self-recursion).
-///
-/// Termination obligations for recursive calls are inserted upstream
-/// by Verus's `recursion` pass as `StmX::Assert(InternalFun::
-/// CheckDecreaseHeight)` before the `StmX::Call`; they flow through
-/// `build_wp` as ordinary `Wp::Assert` nodes and lower via
-/// `sst_exp_to_ast_checked`'s `CheckDecreaseHeight` arm.
-fn lower_call(
-    callee: &FunctionX,
-    args: &[Exp],
-    typ_args: &[Typ],
-    dest: Option<&VarIdent>,
-    call_span: &Span,
-    after: &Wp<'_>,
-    ctx: &WpCtx<'_>,
-) -> LExpr {
-    let params_vec: Vec<_> = callee.params.iter().collect();
-    assert_eq!(
-        params_vec.len(), args.len(),
-        "callee param count {} != caller arg count {} for {:?} — \
-         build_wp_call should have rejected this",
-        params_vec.len(), args.len(), callee.name.path,
-    );
-    assert_eq!(
-        callee.typ_params.len(), typ_args.len(),
-        "callee type param count {} != caller type arg count {} for {:?} — \
-         build_wp_call should have rejected this",
-        callee.typ_params.len(), typ_args.len(), callee.name.path,
-    );
-
-    // Single substitution map combining:
-    //   * value params → call-site arg expressions (substituted directly
-    //     rather than via `let p := arg; body` wrapping — avoids
-    //     shadowing on self-recursion)
-    //   * type params → call-site type expressions (rendered via
-    //     typ_to_expr). `TypParam(T)` renders as `Var("T")` which the
-    //     value-level `substitute` then rewrites to the concrete type.
-    //     This is the only step needed to inline generic callees'
-    //     require/ensure at a specific instantiation.
-    let mut subst: std::collections::HashMap<String, LExpr> = params_vec.iter()
-        .zip(args.iter())
-        .map(|(p, arg)| (sanitize(&p.x.name.0), sst_exp_to_ast(arg)))
-        .collect();
-    for (tp_name, tp_arg) in callee.typ_params.iter().zip(typ_args.iter()) {
-        subst.insert(sanitize(tp_name), typ_to_expr(tp_arg));
-    }
-
-    let requires_conj = and_all(
-        callee.require.iter().map(|e| vir_expr_to_ast(e)).collect()
-    );
-    let ensures_conj = and_all(
-        callee.ensure.0.iter().map(|e| vir_expr_to_ast(e)).collect()
-    );
-    // Wrap the substituted requires with the call-site span (#51) —
-    // a failing precondition surfaces the `callee(args)` location in
-    // the caller, not the callee's own source line (which would
-    // confuse: the user is looking at the caller and wondering why
-    // Lean points at foreign code).
-    let requires_clause = LExpr::span_mark(
-        format_rust_loc(call_span),
-        AssertKind::CallPrecondition,
-        substitute(&requires_conj, &subst),
-    );
-
-    let ret = &callee.ret.x;
-    let ret_name_cal = sanitize(&ret.name.0);
-    // Also substitute typ_args in the return type — a callee
-    // `fn foo<T>(x: T) -> T` needs its return bound rendered with the
-    // concrete T, not with the Var("T") placeholder.
-    let ret_typ = substitute(&typ_to_expr(&ret.typ), &subst);
-    let continuation_under_ret = {
-        let after_lowered = lower_wp(after, ctx);
-        let bound_rest = match dest {
-            Some(dest_ident) => LExpr::let_bind(
-                sanitize(&dest_ident.0),
-                LExpr::var(ret_name_cal.clone()),
-                after_lowered,
-            ),
-            None => after_lowered,
-        };
-        let ensures_impl = LExpr::implies(substitute(&ensures_conj, &subst), bound_rest);
-        let bounded_impl = match type_bound_predicate(&LExpr::var(ret_name_cal.clone()), &ret.typ) {
-            Some(pred) => LExpr::implies(pred, ensures_impl),
-            None => ensures_impl,
-        };
-        LExpr::forall(
-            vec![LBinder {
-                name: Some(ret_name_cal.clone()),
-                ty: ret_typ,
-                kind: BinderKind::Explicit,
-            }],
-            bounded_impl,
-        )
-    };
-
-    LExpr::and(requires_clause, continuation_under_ret)
 }
 
 /// Lift `ExpX::If` expressions from value-position to goal-level.
@@ -1545,34 +1229,6 @@ fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
         }
         _ => emit_leaf(sst_exp_to_ast(e)),
     }
-}
-
-/// `∀ (x₁ : T₁), bounds₁ → … ∀ (xₙ : Tₙ), boundsₙ → body` — wraps
-/// `body` with a universal quantifier per modified variable plus its
-/// type-bound hypothesis (where applicable).
-fn quantify_mod_vars(
-    modified_vars: &[(&VarIdent, &Typ)],
-    body: LExpr,
-) -> LExpr {
-    let mut out = body;
-    // Fold right-to-left so the outermost ∀ is the first modified var.
-    for (ident, typ) in modified_vars.iter().rev() {
-        let name = sanitize(&ident.0);
-        // Optionally wrap with `bound → …` first.
-        if let Some(pred) = type_bound_predicate(&LExpr::var(name.clone()), typ) {
-            out = LExpr::implies(pred, out);
-        }
-        // Then wrap with `∀ (x : T), …`.
-        out = LExpr::forall(
-            vec![LBinder {
-                name: Some(name),
-                ty: typ_to_expr(typ),
-                kind: BinderKind::Explicit,
-            }],
-            out,
-        );
-    }
-    out
 }
 
 // ── WP builder ─────────────────────────────────────────────────────────
@@ -2298,23 +1954,6 @@ mod tests {
         })
     }
 
-    /// Minimal `WpCtx` for tests that need one but don't exercise
-    /// fn_map / type_map. `ensures_goal` is a simple `True` leaf.
-    fn mk_empty_ctx<'a>() -> WpCtx<'a> {
-        WpCtx {
-            fn_map: HashMap::new(),
-            type_map: HashMap::new(),
-            ret_name: None,
-            ensures_goal: LExpr::new(crate::lean_ast::ExprNode::LitBool(true)),
-        }
-    }
-
-    /// A dummy `Wp::Done(True)` leaf — used as `after` when the
-    /// test doesn't care about post-continuation shape.
-    fn done_true<'a>() -> Wp<'a> {
-        Wp::Done(LExpr::new(crate::lean_ast::ExprNode::LitBool(true)))
-    }
-
     /// Compare two LExprs structurally by pretty-printing (our
     /// printer is deterministic so equivalent trees produce
     /// identical strings). Strips `/-! @rust:LOC -/` SpanMark
@@ -2325,191 +1964,6 @@ mod tests {
     fn pp_eq(a: &LExpr, b: &LExpr) -> bool {
         let pp = |e: &LExpr| crate::lean_pp::pp_expr(&crate::lean_ast::strip_span_marks(e));
         pp(a) == pp(b)
-    }
-
-    // ── needs_peel ──────────────────────────────────────────────
-
-    #[test]
-    fn needs_peel_done() {
-        let wp: Wp = Wp::Done(LExpr::var("X"));
-        assert!(!wp.needs_peel());
-    }
-
-    #[test]
-    fn needs_peel_flat_chain() {
-        let x = var_exp("x", typ_int());
-        let wp = Wp::Let("x", &x,
-            Box::new(Wp::Assert(&x,
-                Box::new(Wp::Assume(&x,
-                    Box::new(done_true()))))));
-        assert!(!wp.needs_peel());
-    }
-
-    #[test]
-    fn needs_peel_branch_of_flat_is_false() {
-        let x = var_exp("x", typ_bool());
-        let wp = Wp::Branch {
-            cond: &x,
-            then_branch: Box::new(done_true()),
-            else_branch: Box::new(done_true()),
-        };
-        assert!(!wp.needs_peel());
-    }
-
-    #[test]
-    fn needs_peel_branch_with_call_inside_is_true() {
-        // Hand-roll a `Wp::Call` — we need a FunctionX but only the
-        // tree traversal matters, so we can rely on needs_peel never
-        // looking inside the Call's fields.
-        // Instead: use a Loop (same return value) that doesn't need
-        // a FunctionX.
-        let x = var_exp("x", typ_bool());
-        let invs: Vec<LoopInv> = vec![];
-        let dec = var_exp("d", typ_int());
-        let loop_wp = Wp::Loop {
-            cond: Some(&x),
-            invs: &invs[..],
-            decrease: &dec,
-            modified_vars: Vec::new(),
-            body: Box::new(done_true()),
-            after: Box::new(done_true()),
-        };
-        let wp = Wp::Branch {
-            cond: &x,
-            then_branch: Box::new(loop_wp),
-            else_branch: Box::new(done_true()),
-        };
-        assert!(wp.needs_peel());
-    }
-
-    #[test]
-    fn needs_peel_through_let_wrappers() {
-        // Let of a Done is peel-free; Let of a Loop is not.
-        let x = var_exp("x", typ_int());
-        let c = var_exp("c", typ_bool());
-        let dec = var_exp("d", typ_int());
-        let invs: Vec<LoopInv> = vec![];
-
-        let plain = Wp::Let("x", &x, Box::new(done_true()));
-        assert!(!plain.needs_peel());
-
-        let with_loop = Wp::Let("x", &x, Box::new(Wp::Loop {
-            cond: Some(&c),
-            invs: &invs[..],
-            decrease: &dec,
-            modified_vars: Vec::new(),
-            body: Box::new(done_true()),
-            after: Box::new(done_true()),
-        }));
-        assert!(with_loop.needs_peel());
-    }
-
-    // ── lower_wp ────────────────────────────────────────────────
-
-    #[test]
-    fn lower_done_returns_leaf() {
-        let ctx = mk_empty_ctx();
-        let leaf = LExpr::lit_int("42");
-        let wp = Wp::Done(leaf.clone());
-        assert!(pp_eq(&lower_wp(&wp, &ctx), &leaf));
-    }
-
-    #[test]
-    fn lower_let_wraps_with_let_bind() {
-        let ctx = mk_empty_ctx();
-        // Wp::Let("x", var_exp("y"), Done(x_ref))
-        //   → let x := y; x_ref
-        let y = var_exp("y", typ_int());
-        let body_leaf = LExpr::var("inner");
-        let wp = Wp::Let("x", &y, Box::new(Wp::Done(body_leaf.clone())));
-        let out = lower_wp(&wp, &ctx);
-        let expected = LExpr::let_bind("x", LExpr::var("y"), body_leaf);
-        assert!(pp_eq(&out, &expected),
-            "got: {}\nexpected: {}",
-            crate::lean_pp::pp_expr(&out),
-            crate::lean_pp::pp_expr(&expected));
-    }
-
-    #[test]
-    fn lower_let_with_if_rhs_lifts() {
-        // Wp::Let("x", if c then a else b, Done(body))
-        //   → (c → let x := a; body) ∧ (¬c → let x := b; body)
-        let ctx = mk_empty_ctx();
-        let c = var_exp("c", typ_bool());
-        let a = var_exp("a", typ_int());
-        let b = var_exp("b", typ_int());
-        let if_rhs = if_exp(c, a, b);
-        let body_leaf = LExpr::var("inner");
-        let wp = Wp::Let("x", &if_rhs, Box::new(Wp::Done(body_leaf.clone())));
-        let out = lower_wp(&wp, &ctx);
-        let expected = LExpr::and(
-            LExpr::implies(
-                LExpr::var("c"),
-                LExpr::let_bind("x", LExpr::var("a"), body_leaf.clone()),
-            ),
-            LExpr::implies(
-                LExpr::not(LExpr::var("c")),
-                LExpr::let_bind("x", LExpr::var("b"), body_leaf),
-            ),
-        );
-        assert!(pp_eq(&out, &expected),
-            "got: {}\nexpected: {}",
-            crate::lean_pp::pp_expr(&out),
-            crate::lean_pp::pp_expr(&expected));
-    }
-
-    #[test]
-    fn lower_assert_conjoins() {
-        let ctx = mk_empty_ctx();
-        let p = var_exp("P", typ_bool());
-        let wp = Wp::Assert(&p, Box::new(Wp::Done(LExpr::var("body"))));
-        let out = lower_wp(&wp, &ctx);
-        let expected = LExpr::and(LExpr::var("P"), LExpr::var("body"));
-        assert!(pp_eq(&out, &expected));
-    }
-
-    #[test]
-    fn lower_assume_implies() {
-        let ctx = mk_empty_ctx();
-        let p = var_exp("P", typ_bool());
-        let wp = Wp::Assume(&p, Box::new(Wp::Done(LExpr::var("body"))));
-        let out = lower_wp(&wp, &ctx);
-        let expected = LExpr::implies(LExpr::var("P"), LExpr::var("body"));
-        assert!(pp_eq(&out, &expected));
-    }
-
-    #[test]
-    fn lower_branch_conjoins_two_implications() {
-        let ctx = mk_empty_ctx();
-        let c = var_exp("c", typ_bool());
-        let wp = Wp::Branch {
-            cond: &c,
-            then_branch: Box::new(Wp::Done(LExpr::var("T"))),
-            else_branch: Box::new(Wp::Done(LExpr::var("E"))),
-        };
-        let out = lower_wp(&wp, &ctx);
-        let expected = LExpr::and(
-            LExpr::implies(LExpr::var("c"), LExpr::var("T")),
-            LExpr::implies(LExpr::not(LExpr::var("c")), LExpr::var("E")),
-        );
-        assert!(pp_eq(&out, &expected));
-    }
-
-    #[test]
-    fn lower_assert_assume_right_fold() {
-        // Assert(P, Assume(Q, Done(body)))
-        //   → P ∧ (Q → body)
-        let ctx = mk_empty_ctx();
-        let p = var_exp("P", typ_bool());
-        let q = var_exp("Q", typ_bool());
-        let wp = Wp::Assert(&p, Box::new(Wp::Assume(&q,
-            Box::new(Wp::Done(LExpr::var("body"))))));
-        let out = lower_wp(&wp, &ctx);
-        let expected = LExpr::and(
-            LExpr::var("P"),
-            LExpr::implies(LExpr::var("Q"), LExpr::var("body")),
-        );
-        assert!(pp_eq(&out, &expected));
     }
 
     // ── contains_loc ────────────────────────────────────────────
