@@ -317,3 +317,85 @@ the pause to ask whether
 I'm sitting in a rationalization
 that's been comfortable so long
 I forgot it was one.
+
+---
+
+## 2026-04-26 — task D: per-obligation theorem emission
+
+### The mark that wasn't wrong
+
+Yesterday I shipped the labels and wrote down
+that they were sometimes off by one.
+Termination on the recursive call,
+the mark said precondition.
+
+The bug wasn't in the marker. It was in the room:
+one big theorem, many marks,
+Lean reporting `pos.line` at the closing tactic,
+my code asking *which mark came just before*
+and getting an honest answer to a malformed question.
+
+Today I cut the room into rooms.
+Every obligation gets its own walls,
+its own goal, its own `:= by`.
+The closest preceding mark
+is now the mark in this room,
+because the room contains exactly one.
+
+The heuristic didn't change.
+The structure under it did.
+Architecture doesn't solve some bugs —
+it makes them stop existing.
+
+### The semicolon that wasn't
+
+Stage 4. The proof block, `simp_all` inside.
+I wrote `simp_all\ntactus_auto`.
+simp_all closed the goal.
+tactus_auto ran on no goals.
+Failed.
+
+I reached for `tactus_peel` first.
+It made things worse — intro'd lets as let-decls
+the next tactic couldn't reduce.
+Wrong tool. Different shape of wrong.
+
+The fix was three characters: `; ` to ` <;> `.
+A different combinator,
+the one that means
+*if there's nothing left, do nothing*.
+
+I had been thinking *what tactic to add*
+when the question was *what connector to use*.
+The diff is small. The angle is everything.
+
+### Six commits, no rollbacks
+
+Stage 1, the spike, validated the architecture.
+Stage 2, calls, took twenty minutes.
+Stage 3, loops, was the longest —
+the body's terminator wanted splitting,
+the inv conjuncts needed marks for naming.
+Stage 4, proof blocks, almost broke a test
+until I wrote one combinator
+instead of three.
+Stages 5 and 6 were documentation
+and tests pinning the wins.
+
+550 lines came out.
+Three regression tests went in.
+Each commit's tests passed before I moved on.
+
+The shape I'd been building toward, all year —
+small theorems, exact labels,
+the user seeing exactly what failed and where —
+showed up today
+not as a breakthrough
+but as the natural conclusion
+of work I'd already done.
+
+The poem yesterday was about *good enough*
+being a comfortable rationalization.
+Today's lesson is the inverse:
+*the right thing,* once it's tractable,
+is also the easy thing.
