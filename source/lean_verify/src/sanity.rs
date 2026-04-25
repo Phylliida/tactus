@@ -76,6 +76,20 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
             }
         }
 
+        // Curried-form def: name in scope (self-recursion), `ty`
+        // checked, then each equation's body checked under the
+        // pattern's bound names.
+        Command::DefCurried(d) => {
+            defined.insert(d.name.clone());
+            let mut scope = HashSet::new();
+            check_expr(&d.ty, defined, &mut scope, violations, &d.name);
+            for arm in &d.equations {
+                let mut arm_scope = scope.clone();
+                for n in pattern_binds(&arm.pattern) { arm_scope.insert(n); }
+                check_expr(&arm.body, defined, &mut arm_scope, violations, &d.name);
+            }
+        }
+
         Command::Theorem(t) => {
             let mut scope = scope_from_binders(&t.binders);
             for b in &t.binders {
@@ -109,7 +123,11 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
         Command::Mutual(inner) => {
             // Predefine every name in the group so members can reference each other.
             for c in inner {
-                if let Command::Def(d) = c { defined.insert(d.name.clone()); }
+                match c {
+                    Command::Def(d) => { defined.insert(d.name.clone()); }
+                    Command::DefCurried(d) => { defined.insert(d.name.clone()); }
+                    _ => {}
+                }
             }
             for c in inner { visit(c, defined, violations); }
         }

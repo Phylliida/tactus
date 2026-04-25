@@ -102,9 +102,9 @@ fn expr_prec(node: &ExprNode) -> u16 {
 
 // ── Public entry points ────────────────────────────────────────────────
 
-/// Pretty-print output plus structural landmarks accumulated during emission.
-pub struct PpOutput {
-    pub text: String,
+/// Structural landmarks accumulated during emission. Populated
+/// by `write_*` functions as they walk the AST.
+pub struct Landmarks {
     /// For every `Tactic::Raw` body encountered (in source order): the
     /// 1-indexed line in `text` where the first character of the body
     /// appears. The proof-fn pipeline uses this to build a `LeanSourceMap`
@@ -118,46 +118,46 @@ pub struct PpOutput {
     pub span_marks: Vec<(usize, String)>,
 }
 
-/// Mutable landmarks state threaded through every `write_*` function
-/// during emission. Replaces an earlier post-pp `scan_span_marks`
-/// pass that walked the output text looking for `/- @rust:LOC -/`
-/// markers — that approach worked but was fragile (a path
-/// containing `-/` would terminate the comment prematurely and lose
-/// entries) and O(n × m). Direct push during emission is structurally
-/// correct and O(1) per mark.
-struct Landmarks {
-    tactic_starts: Vec<usize>,
-    span_marks: Vec<(usize, String)>,
+impl Landmarks {
+    fn new() -> Self {
+        Landmarks { tactic_starts: Vec::new(), span_marks: Vec::new() }
+    }
+}
+
+/// Pretty-print output plus structural landmarks accumulated during emission.
+pub struct PpOutput {
+    pub text: String,
+    pub landmarks: Landmarks,
 }
 
 pub fn pp_commands(cmds: &[Command]) -> PpOutput {
     let mut out = String::new();
-    let mut lm = Landmarks { tactic_starts: Vec::new(), span_marks: Vec::new() };
+    let mut lm = Landmarks::new();
     for cmd in cmds {
         write_command(&mut out, cmd, &mut lm);
     }
-    PpOutput { text: out, tactic_starts: lm.tactic_starts, span_marks: lm.span_marks }
+    PpOutput { text: out, landmarks: lm }
 }
 
 /// Render a single command. Discards any landmarks; use
 /// `pp_commands` when you need them.
 pub fn pp_command(cmd: &Command) -> String {
     let mut out = String::new();
-    let mut lm = Landmarks { tactic_starts: Vec::new(), span_marks: Vec::new() };
+    let mut lm = Landmarks::new();
     write_command(&mut out, cmd, &mut lm);
     out
 }
 
 pub fn pp_expr(e: &Expr) -> String {
     let mut out = String::new();
-    let mut lm = Landmarks { tactic_starts: Vec::new(), span_marks: Vec::new() };
+    let mut lm = Landmarks::new();
     write_expr(&mut out, e, 0, &mut lm);
     out
 }
 
 pub fn pp_pattern(p: &Pattern) -> String {
     let mut out = String::new();
-    let mut lm = Landmarks { tactic_starts: Vec::new(), span_marks: Vec::new() };
+    let mut lm = Landmarks::new();
     write_pattern(&mut out, p, &mut lm);
     out
 }
@@ -205,10 +205,31 @@ fn write_command(out: &mut String, cmd: &Command, lm: &mut Landmarks) {
             out.push_str("end\n\n");
         }
         Command::Def(d) => write_def(out, d, lm),
+        Command::DefCurried(d) => write_def_curried(out, d, lm),
         Command::Theorem(t) => write_theorem(out, t, lm),
         Command::Datatype(dt) => write_datatype(out, dt, lm),
         Command::Class(c) => write_class(out, c, lm),
         Command::Instance(i) => write_instance(out, i, lm),
+    }
+}
+
+fn write_def_curried(out: &mut String, d: &DefCurried, lm: &mut Landmarks) {
+    for attr in &d.attrs {
+        out.push_str("@[");
+        out.push_str(attr);
+        out.push_str("] ");
+    }
+    out.push_str("noncomputable def ");
+    out.push_str(&d.name);
+    out.push_str(" : ");
+    write_expr(out, &d.ty, 0, lm);
+    out.push('\n');
+    for arm in &d.equations {
+        out.push_str("  | ");
+        write_pattern(out, &arm.pattern, lm);
+        out.push_str(" => ");
+        write_expr(out, &arm.body, 0, lm);
+        out.push('\n');
     }
 }
 
@@ -801,9 +822,9 @@ mod tests {
             tactic: Tactic::Raw("omega".into()),
         };
         let out = pp_commands(&[Command::Theorem(t)]);
-        assert_eq!(out.tactic_starts.len(), 1);
+        assert_eq!(out.landmarks.tactic_starts.len(), 1);
         // Pull the recorded line and verify it contains the tactic text.
-        let start = out.tactic_starts[0];
+        let start = out.landmarks.tactic_starts[0];
         let line = out.text.lines().nth(start - 1).expect("tactic line in range");
         assert!(line.contains("omega"), "line {} was {:?}", start, line);
     }

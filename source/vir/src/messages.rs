@@ -41,6 +41,24 @@ impl std::fmt::Debug for Span {
     }
 }
 
+impl Span {
+    /// A type-checked synthetic Span carrying no source-location
+    /// info. Use in test fixtures, diagnostic placeholders, and
+    /// other contexts where a real rustc Span isn't available.
+    /// `lean_verify`'s `format_rust_loc` falls back to `as_string`
+    /// when `start_loc` is empty, and downstream error formatters
+    /// generally handle dummy spans gracefully.
+    pub fn dummy() -> Self {
+        Span {
+            raw_span: Arc::new(()),
+            id: 0,
+            data: Vec::new(),
+            as_string: String::new(),
+            start_loc: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, ToDebugSNode)]
 pub struct MessageLabel {
     pub span: Span,
