@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use vir::ast::*;
 use crate::lean_ast::{
     and_all, Binder as LBinder, BinderKind, Class, ClassMethod, Command, Datatype,
-    DatatypeKind, Def, Expr as LExpr, ExprNode, Field, Instance, InstanceMethod,
-    MatchArm, Pattern as LPattern, Theorem, Tactic, Variant,
+    DatatypeKind, Def, DefCurried, Expr as LExpr, ExprNode, Field, Instance,
+    InstanceMethod, MatchArm, Pattern as LPattern, Theorem, Tactic, Variant,
 };
 use crate::to_lean_expr::vir_expr_to_ast;
 use crate::to_lean_type::{lean_name, sanitize, short_name, typ_to_expr};
@@ -19,43 +19,59 @@ use crate::to_lean_type::{lean_name, sanitize, short_name, typ_to_expr};
 
 /// Maps Lean line numbers back to the user's source.
 ///
-/// Two complementary mechanisms:
-/// * **Tactic body** (proof fns): `tactic_start_line` /
-///   `tactic_line_count` bracket the user-written tactic block.
-///   `find_tactic_line` returns the offset within that block.
-/// * **Span marks** (exec fns, #51): `span_marks` is a
-///   `(lean_line, rust_loc)` list populated from `/-! @rust:LOC -/`
-///   markers `lower_wp` emits before each obligation.
-///   `find_rust_loc` returns the closest preceding mark for a
-///   given Lean error line.
-pub struct LeanSourceMap {
-    pub fn_name: String,
-    /// 1-indexed line in generated .lean where the tactic body starts
-    pub tactic_start_line: usize,
-    pub tactic_line_count: usize,
-    pub span_marks: Vec<(usize, String)>,
+/// Proof fns and exec fns use different mapping mechanisms — the
+/// enum split makes the dichotomy explicit instead of having one
+/// struct with conditionally-meaningful fields.
+pub enum LeanSourceMap {
+    /// Proof fns: the user-written tactic body starts at
+    /// `tactic_start_line` and runs `tactic_line_count` lines.
+    /// `find_tactic_line` returns the offset within that block.
+    ProofFn {
+        fn_name: String,
+        /// 1-indexed line in generated `.lean` where the tactic body starts.
+        tactic_start_line: usize,
+        tactic_line_count: usize,
+    },
+    /// Exec fns (#51 source mapping): `span_marks` is a list of
+    /// `(lean_line, rust_loc)` pairs populated by the pp as it
+    /// visits `ExprNode::SpanMark` nodes. `find_rust_loc`
+    /// returns the closest preceding mark for a given Lean
+    /// error line.
+    ExecFn {
+        fn_name: String,
+        span_marks: Vec<(usize, String)>,
+    },
 }
 
 impl LeanSourceMap {
-    /// Given a 1-indexed Lean line number, return the offset within the tactic body.
+    /// Proof-fn path: 1-indexed offset within the tactic body for
+    /// a given Lean line number, or `None` outside the body.
     pub fn find_tactic_line(&self, lean_line: usize) -> Option<usize> {
-        let end = self.tactic_start_line + self.tactic_line_count;
-        if lean_line >= self.tactic_start_line && lean_line < end {
-            Some(lean_line - self.tactic_start_line)
-        } else {
-            None
+        match self {
+            LeanSourceMap::ProofFn { tactic_start_line, tactic_line_count, .. } => {
+                let end = tactic_start_line + tactic_line_count;
+                if lean_line >= *tactic_start_line && lean_line < end {
+                    Some(lean_line - tactic_start_line)
+                } else {
+                    None
+                }
+            }
+            LeanSourceMap::ExecFn { .. } => None,
         }
     }
 
-    /// Given a 1-indexed Lean error line, find the Rust source
-    /// location of the most recent `/-! @rust:LOC -/` marker at or
-    /// before that line. Returns `None` if no marker precedes the
-    /// error (e.g., proof fn paths without #51 instrumentation).
+    /// Exec-fn path: closest preceding `(lean_line, rust_loc)` mark.
+    /// `None` for proof-fn maps or when no mark precedes `lean_line`.
     pub fn find_rust_loc(&self, lean_line: usize) -> Option<&str> {
-        self.span_marks.iter()
-            .rev()
-            .find(|(line, _)| *line <= lean_line)
-            .map(|(_, loc)| loc.as_str())
+        match self {
+            LeanSourceMap::ExecFn { span_marks, .. } => {
+                span_marks.iter()
+                    .rev()
+                    .find(|(line, _)| *line <= lean_line)
+                    .map(|(_, loc)| loc.as_str())
+            }
+            LeanSourceMap::ProofFn { .. } => None,
+        }
     }
 }
 
@@ -263,20 +279,14 @@ fn height_fn_for_datatype(dt: &DatatypeX, path: &str) -> Option<Command> {
     // recursion — the equation compiler is designed around it,
     // and WF analysis is more reliable when the recursion is
     // expressed as direct equations rather than a match-on-
-    // binder. We assemble the Lean text directly via
-    // `Command::Raw` because the curried form has no
-    // counterpart in our `Def` AST shape (no `body: Expr`, just
-    // a list of equations with patterns); a one-off Raw
-    // emission is simpler than adding a new `Command::DefCurried`
-    // variant for this single use site.
-    use crate::lean_pp::{pp_expr, pp_pattern};
-    let mut text = String::new();
-    text.push_str("@[simp] noncomputable def ");
-    text.push_str(path);
-    text.push_str(".height : ");
-    text.push_str(path);
-    text.push_str(" → Nat\n");
-    for v in dt.variants.iter() {
+    // binder.
+    use crate::lean_ast::{BinOp, ExprNode};
+    let arrow_ty = LExpr::new(ExprNode::BinOp {
+        op: BinOp::Implies,
+        lhs: Box::new(LExpr::var(path)),
+        rhs: Box::new(LExpr::var("Nat")),
+    });
+    let equations: Vec<MatchArm> = dt.variants.iter().map(|v| {
         let var_san = sanitize(&v.name);
         let ctor_name = format!("{}.{}", path, var_san);
         let mut pats = Vec::with_capacity(v.fields.len());
@@ -297,13 +307,17 @@ fn height_fn_for_datatype(dt: &DatatypeX, path: &str) -> Option<Command> {
                 LExpr::app1(LExpr::var(&format!("{}.height", path)), LExpr::var(name)),
             );
         }
-        text.push_str("  | ");
-        text.push_str(&pp_pattern(&LPattern::Ctor { name: ctor_name, args: pats }));
-        text.push_str(" => ");
-        text.push_str(&pp_expr(&arm_body));
-        text.push('\n');
-    }
-    Some(Command::Raw(text))
+        MatchArm {
+            pattern: LPattern::Ctor { name: ctor_name, args: pats },
+            body: arm_body,
+        }
+    }).collect();
+    Some(Command::DefCurried(DefCurried {
+        attrs: vec!["simp".into()],
+        name: format!("{}.height", path),
+        ty: arrow_ty,
+        equations,
+    }))
 }
 
 
@@ -313,7 +327,7 @@ fn height_fn_for_datatype(dt: &DatatypeX, path: &str) -> Option<Command> {
 /// pointer shape at the Rust level but render as just `Self`
 /// at the Lean type level.
 fn field_is_self_recursive(typ: &Typ, self_path: &Path) -> bool {
-    match &**crate::to_lean_sst_expr::peel_typ_wrappers(typ) {
+    match &**crate::to_lean_type::peel_typ_wrappers(typ) {
         TypX::Datatype(Dt::Path(p), args, _) if args.is_empty() =>
             p == self_path,
         _ => false,

@@ -30,6 +30,14 @@ pub enum Command {
     NamespaceOpen(String),
     NamespaceClose(String),
     Def(Def),
+    /// Curried-form definition with pattern-matched equations:
+    /// `def name : T → R | pat₁ => body₁ | pat₂ => body₂ | …`.
+    /// Used for recursive structural-recursion fns where Lean's
+    /// equation compiler needs the curried shape (e.g.,
+    /// `T.height` for non-int decreases). The `match`-on-binder
+    /// form (`Def`) works for non-recursive defs but the curried
+    /// form is more reliable for WF analysis.
+    DefCurried(DefCurried),
     Theorem(Theorem),
     Datatype(Datatype),
     Class(Class),
@@ -50,6 +58,28 @@ pub struct Def {
     /// `termination_by d₁` if one measure, `termination_by (d₁, d₂, …)` for
     /// lexicographic. Empty `Vec` means no termination clause.
     pub termination_by: Vec<Expr>,
+}
+
+/// Curried-form definition with pattern-matched equations.
+///
+/// Renders as:
+/// ```text
+/// @[attr₁] @[attr₂] noncomputable def name : ty
+///   | pat₁ => body₁
+///   | pat₂ => body₂
+/// ```
+///
+/// `ty` is the full function type — typically `T → R` for a
+/// single-arg fn. The patterns match the implicit binder.
+/// Lean's equation compiler infers WF-recursion from the
+/// pattern shape; works more reliably than the match-on-binder
+/// form (`Def`) for recursive datatypes.
+#[derive(Debug, Clone)]
+pub struct DefCurried {
+    pub attrs: Vec<String>,
+    pub name: String,
+    pub ty: Expr,
+    pub equations: Vec<MatchArm>,
 }
 
 #[derive(Debug, Clone)]

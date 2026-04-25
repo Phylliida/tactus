@@ -1521,25 +1521,15 @@ mod tests {
 
     /// A span value that passes type-checks but carries no source
     /// info. Good enough for all our tests — we don't report errors.
-    fn test_span() -> Span {
-        Span {
-            raw_span: Arc::new(()),
-            id: 0,
-            data: vec![],
-            as_string: String::new(),
-            start_loc: String::new(),
-        }
-    }
+    fn test_span() -> Span { Span::dummy() }
 
     /// Construct a Span with specified `start_loc` and `as_string`
     /// for testing `format_rust_loc`'s field-vs-fallback logic.
     fn span_with_locs(start_loc: &str, as_string: &str) -> Span {
         Span {
-            raw_span: Arc::new(()),
-            id: 0,
-            data: vec![],
             as_string: as_string.to_string(),
             start_loc: start_loc.to_string(),
+            ..Span::dummy()
         }
     }
 

@@ -1,11 +1,25 @@
 //! Translate VIR types to `lean_ast::Expr` (in Lean, types are expressions).
 
-use vir::ast::{Dt, IntRange, Path, TypX};
+use vir::ast::{Dt, IntRange, Path, Typ, TypX};
 use crate::lean_ast::{BinOp, Expr, ExprNode};
 
 /// Canonical VIR-type → Lean-AST translator.
 pub fn typ_to_expr(typ: &TypX) -> Expr {
     Expr::new(typ_to_node(typ))
+}
+
+/// Peel `TypX::Boxed` (poly coercion) and `TypX::Decorate` (Rust
+/// decorations like `Box<T>`, `&T`, `&mut T`) to reach the
+/// underlying type. These are transparent at the Lean level —
+/// `typ_to_expr` also peels both — so multiple distinct checks
+/// (is-int, is-user-datatype, is-self-referential-field) share
+/// this helper. Single edit site if Verus adds a new transparent
+/// wrapper.
+pub(crate) fn peel_typ_wrappers(typ: &Typ) -> &Typ {
+    match &**typ {
+        TypX::Boxed(inner) | TypX::Decorate(_, _, inner) => peel_typ_wrappers(inner),
+        _ => typ,
+    }
 }
 
 fn typ_to_node(typ: &TypX) -> ExprNode {

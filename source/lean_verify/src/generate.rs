@@ -180,12 +180,11 @@ pub fn check_proof_fn(
     debug_check(&cmds);
 
     let rendered = pp_commands(&cmds);
-    let source_map = LeanSourceMap {
+    let source_map = LeanSourceMap::ProofFn {
         fn_name: short_name(&proof_fn.name.path).to_string(),
         // One proof fn per file → exactly one `Tactic::Raw` emission.
-        tactic_start_line: rendered.tactic_starts.first().copied().unwrap_or(0),
+        tactic_start_line: rendered.landmarks.tactic_starts.first().copied().unwrap_or(0),
         tactic_line_count: tactic_body.lines().count().max(1),
-        span_marks: rendered.span_marks.clone(),
     };
 
     let file_path = lean_file_path(crate_name, &proof_fn.name.path);
@@ -253,16 +252,12 @@ pub fn check_exec_fn(
     let lake_dir = if project::project_ready(&dir) { Some(dir.as_path()) } else { None };
     let result = lean_process::check_lean_file(&file_path, lake_dir);
 
-    // Exec fns don't have a user-written tactic body yet (see TODO in
-    // `sst_to_lean::exec_fn_theorems_to_ast`). The tactic-line offset
-    // is unused for exec fns, but `span_marks` carries the
-    // per-obligation Rust source locations populated by #51's
-    // `lower_wp` SpanMark wrapping.
-    let empty = LeanSourceMap {
+    // Exec fns map errors via `span_marks` populated by the pp's
+    // `SpanMark` walker (#51 source mapping) — Rust source
+    // location for each obligation in `lower_wp`'s output.
+    let source_map = LeanSourceMap::ExecFn {
         fn_name: short_name(&vir_fn.name.path).to_string(),
-        tactic_start_line: 0,
-        tactic_line_count: 0,
-        span_marks: rendered.span_marks.clone(),
+        span_marks: rendered.landmarks.span_marks.clone(),
     };
 
     match result {
@@ -270,7 +265,7 @@ pub fn check_exec_fn(
         Ok(r) => {
             let errors: Vec<_> = r.diagnostics.iter()
                 .filter(|d| d.severity == "error")
-                .map(|d| lean_process::format_error(d, &empty))
+                .map(|d| lean_process::format_error(d, &source_map))
                 .collect();
             CheckResult::Failed(format!(
                 "Lean tactus_auto failed for {}:\n\n{}\n\n\
