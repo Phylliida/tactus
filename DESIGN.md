@@ -776,14 +776,14 @@ Investigated: introducing a `let _goal_k := <rest_goal>` binding at each if and 
 ### `StmX::Call` — landed (slice 7, with recursion)
 
 Exec fns can call other exec/proof/spec fns. The WP rule for
-`let y = foo(a1, a2)`, lowered by `lower_call` in
+`let y = foo(a1, a2)`, lowered by `walk_call` in
 `sst_to_lean.rs`:
 
 ```
 requires_conj[p1 := a1, p2 := a2]
 ∧ ∀ (ret : RetT), h_ret_bound(ret) →
     ensures_conj_using_ret[p1 := a1, p2 := a2] →
-    let y := ret; lower_wp(after)
+    let y := ret; walk_obligations(after)
 ```
 
 Param substitution is done via **Lean-AST substitution**
@@ -804,7 +804,7 @@ ret_name + ensures_goal for Return to write to).
 
 `build_wp_call` (in `sst_to_lean.rs`) validates the call shape and
 produces the `Wp::Call` node with the post-call continuation as its
-`after: Box<Wp<'a>>` sub-tree. `lower_call` emits the Lean.
+`after: Box<Wp<'a>>` sub-tree. `walk_call` emits the Lean.
 
 **Termination via Verus's own `CheckDecreaseHeight`.** For any
 recursive call (direct or mutual across an SCC), Verus's
@@ -845,13 +845,9 @@ recursion pass covers all cross-fn calls in the cycle the same way.
 
 ### `_tactus_d_old` aliasing across nested loops
 
-`sst_to_lean::lower_loop` emits `let _tactus_d_old := D; …` inside every loop's maintain clause to capture the decrease measure pre-body. The name is literal, not gensym'd, so nested loops' `let _tactus_d_old` bindings shadow each other in Lean.
+`sst_to_lean::walk_loop` emits `let _tactus_d_old := D; …` inside every loop's maintain clause to capture the decrease measure pre-body. The name is literal, not gensym'd, so nested loops' `let _tactus_d_old` bindings shadow each other in Lean.
 
-This is correct for the current architecture: the inner loop's shadow is confined to the inner's maintain conjunct, and the outer's `_tactus_d_old` reference lives in the outer's maintain conjunct (a sibling, not a descendant), so they never clash in scope. A gensym'd `_tactus_d_old_<loop_id>` would make the independence syntactically obvious but doesn't change semantics. Worth threading a counter through `lower_loop` if we ever refactor loops into a structure where scoping IS ambiguous — until then, the literal name is fine and keeps the generated Lean readable.
-
-### Tactic-string interning (minor TODO)
-
-`sst_to_lean::loop_tactic()` allocates the same `"tactus_peel; all_goals tactus_auto"` String on every call. For a crate with hundreds of exec fns with loops this adds up. Options: `const` static slice + a `Tactic::Static(&'static str)` variant, or define the composite as a single macro in `TactusPrelude.lean` (e.g., `tactus_auto_loop`) and emit `Tactic::Named("tactus_auto_loop")`. Not urgent — current cost is negligible — but worth nudging on any next prelude pass.
+This is correct for the current architecture: the inner loop's shadow is confined to the inner's maintain conjunct, and the outer's `_tactus_d_old` reference lives in the outer's maintain conjunct (a sibling, not a descendant), so they never clash in scope. A gensym'd `_tactus_d_old_<loop_id>` would make the independence syntactically obvious but doesn't change semantics. Worth threading a counter through `walk_loop` if we ever refactor loops into a structure where scoping IS ambiguous — until then, the literal name is fine and keeps the generated Lean readable.
 
 ### Known deferrals, rejected cases, and untested edges
 
@@ -932,9 +928,9 @@ Accepted via #57: **`cond: None`** loops (the form Verus produces when lowering 
 * **Nested if where each branch contains a different loop** — combinatorial coverage gap.
 * **Loop body ending in an early return** — ✅ covered by `test_exec_return_inside_loop_with_break`.
 * **Bit-width coverage** — only `u8`, `u32`, `i8` tested end-to-end. `u16` / `u64` / `u128` / `i16` / `i32` / `i64` / `i128` go through the same codegen path but lack regression tests.
-* **Direct unit tests for `lower_loop` and `lower_call`** — the two largest lowering functions are only exercised via e2e tests. Constructing the synthetic Wp + FunctionX + arg list to unit-test them is involved; we covered cheaper variants (`Done`/`Let`/`Assert`/`Assume`/`Branch`) directly and trust e2e for the rest.
-* **Name collision: callee's ret name vs caller-scope names** — `lower_call` emits `∀ <ret_name_cal : T>, …` using `sanitize(callee.ret.name.0)`. If the caller has a local variable with the same sanitized name, Lean's ∀ shadows it inside the scope — semantically fine (the ∀ binding is what Verus intends) but visually confusing in the generated Lean. No test pins a collision scenario.
-* **Zero-arg callee spec referencing the dummy param** — for a fn with no user params, Verus injects a `no%param` dummy; our `lower_call` substitutes `{no_param: Const(0)}`. If the callee's `require` / `ensure` ever syntactically references this dummy (they shouldn't, by Verus convention), we'd inline `0` for it — semantically correct but relies on the convention holding.
+* **Direct unit tests for `walk_loop` and `walk_call`** — the two largest walker functions are only exercised via e2e tests. Constructing the synthetic Wp + FunctionX + arg list + ObligationEmitter to unit-test them is involved; we cover cheaper variants (`Done`/`Let`/`Assert`/`Assume`/`Branch`) directly and trust e2e for the rest.
+* **Name collision: callee's ret name vs caller-scope names** — `walk_call` emits `∀ <ret_name_cal : T>, …` using `sanitize(callee.ret.name.0)`. If the caller has a local variable with the same sanitized name, Lean's ∀ shadows it inside the scope — semantically fine (the ∀ binding is what Verus intends) but visually confusing in the generated Lean. No test pins a collision scenario.
+* **Zero-arg callee spec referencing the dummy param** — for a fn with no user params, Verus injects a `no%param` dummy; our `walk_call` substitutes `{no_param: Const(0)}`. If the callee's `require` / `ensure` ever syntactically references this dummy (they shouldn't, by Verus convention), we'd inline `0` for it — semantically correct but relies on the convention holding.
 * **Non-constant `IntegerTypeBound` bit width** — `const_u32_from_sst` / `_vir` extract the bit width via `.expect("…non-constant bit width…")`. Verus's `IntegerTypeBound(kind, bits)` always has `bits` as a literal for concrete int types, but a const-generic context (`<const N: u32>` as bit width) would panic at codegen. Untested.
 * **Empty `proof { }` / `assert(P) by { }` brace bodies** — user-written empty tactic blocks inside tactus_auto fns. FileLoader sanitizes to empty, we detect via HIR-body-empty, read tactic_text = whitespace. Emitting `have h : P := by` with empty body after would fail Lean parsing. Not common but plausible (e.g., user writes `proof { }` as a stub). Untested.
 * **Enum accessor fns for types with non-Inhabited field types** — `datatype_to_cmds` emits accessor bodies using `default` for unreachable match arms (other variants). For field types lacking `[Inhabited α]` (user-defined types without a derived instance), Lean elaboration fails. The `emit_accessors: bool` flag skips accessor synthesis in the proof-fn entry path — spec fns reference such types routinely and use native Lean match, not accessors. For an exec fn matching on an enum with non-Inhabited-field'd variants, we'd emit accessors that fail to elaborate. All current test enums have Int/Nat/Bool fields (auto-Inhabited). Untested for user-defined types.
@@ -955,8 +951,7 @@ Accepted via #57: **`cond: None`** loops (the form Verus produces when lowering 
 * **Sanity-check allowlist maintained by hand.** Adding a prelude def (like `usize_hi`) requires remembering to update `sanity.rs`. No automated sync; compiler error on mismatch (panic in debug builds).
 * **Expected VIR variant list for coverage is hand-maintained.** `tactus_coverage.rs` lists variants we expect to see. Macro-deriving from the enum would need Verus-upstream `strum` derives — not feasible without vendoring changes.
 * **`_tactus_d_old` not gensym'd** — see its dedicated section.
-* **`loop_tactic()` allocates its tactic string on every call** — tiny TODO, see its dedicated section.
-* **`needs_peel` is a recursive tree walk.** Could be a constructor-level bit on `Wp::Loop` / `Wp::Call`, computed once at build time. Constant-cost at realistic sizes; revisit if more variants need peeling.
+* **`OblCtx::with_frame` clones the whole `frames` Vec per call** — O(N²) memory across deeply-nested recursion (asserts inside branches inside loops). Realistic exec fns don't go deep enough for this to matter; switching to `Rc<im::Vector<_>>` (structural sharing) would fix it without changing the API. Documented inline at the function site.
 * **`substitute` boilerplate.** ~130 lines of per-variant dispatch across `substitute_impl` / `collect_free_vars`. Adding an `ExprNode` variant means editing three places (plus `lean_pp`). A `walk_children` helper or proc-macro would collapse it to ~30 lines — not worth doing yet, worth flagging.
 * **No shape-drift test for `CheckDecreaseHeight` Assert-before-Call ordering.** We have a test for the `cur` arg's Bind(Let) shape (`full_check_decrease_height_shape_pinned`) but not for the pass-ordering invariant ("Assert is inserted before the Call in the SST statement sequence"). A drift here would produce recursive fns that verify without termination checks. Worth adding: construct a self-recursive SST fragment and assert the first `Wp::Assert` precedes the `Wp::Call` in the built Wp tree.
 * **No test that `WpCtx::new` rejects an Err-form req/ensure cleanly.** We have `test_exec_ctor_rejected` for body-path Ctor, but no direct test that a `requires Ctor(...)` clause produces the WpCtx::new Err path (vs. panicking or passing through). Low risk — the validation logic is shared with the body — but a regression guard would be cheap.
@@ -1010,18 +1005,18 @@ exec fns."
   `StmX::AssertQuery` with Tactus mode, bypassing the DeadEnd
   desugaring. `sst_to_lean`'s `build_wp` reads the verbatim Lean
   tactic text from the source file via the span and produces a
-  `Wp::AssertByTactus` node; the theorem emitter walks the Wp tree
-  via `collect_tactus_haves` (two-pass; `lower_wp` stays pure) and
-  prepends `have h_tactus_assert_N : P := by <user_tac>;` clauses
-  before the normal closer — discharging the obligation AND
-  introducing the hypothesis for `simp_all` / `omega` to pick up.
-  Regression: `test_exec_assert_by_user_tactic`. `sst_to_air`
-  short-circuits Tactus mode to a no-op for secondary queries
-  (recommends-check etc. still flow through sst_to_air for
-  tactus_auto fns, but the obligation is Lean's job).
+  `Wp::AssertByTactus { cond: Some(P), tactic_text }` node.
+  Post-D (2026-04-26), `walk_assert_by_tactus` emits a single
+  obligation theorem for `P` with the user's tactic as the closer
+  (rather than `tactus_auto`); `P` then enters body's `OblCtx` as
+  a hypothesis for subsequent obligations. Regression:
+  `test_exec_assert_by_user_tactic`. `sst_to_air` short-circuits
+  Tactus mode to a no-op for secondary queries (recommends-check
+  etc. still flow through sst_to_air for tactus_auto fns, but
+  the obligation is Lean's job).
 
 * **Source mapping for exec-fn errors — LANDED (#51).**
-  `lower_wp` and friends wrap obligation expressions in
+  `walk_obligations` and friends wrap obligation expressions in
   `ExprNode::SpanMark { rust_loc, kind, inner }`. `rust_loc`
   is the pre-resolved `path:line:col` from the SST `Span`
   (populated by `rust_verify::spans::to_air_span` via
@@ -1044,24 +1039,27 @@ exec fns."
   continuation use the inner `Wp::Assert` marks recursively.
 
   **Known imperfection: position-of-mark vs position-of-failure.**
-  Lean's diagnostic `pos.line` reports where the failing
-  *tactic* invocation is (typically the line of `tactus_peel;
-  all_goals tactus_auto` near the end of the theorem), not the
-  line of the failing obligation expression in the goal tree.
-  `find_span_mark` returns the closest preceding landmark to
-  that tactic line — usually the LAST mark in the theorem.
-  When the failing obligation is also the last mark, the
-  reported `loc` and `kind` are exactly right. When the
-  failing obligation is earlier in the goal tree (e.g., a
-  Termination check on a recursive fn whose call also has a
-  precondition mark afterward), `find_span_mark` returns a
-  mark that's structurally adjacent but not the actual one.
-  The Rust file:line:col is still in the right neighborhood,
-  but the kind label may be one off. The architectural fix is
-  **task D** in HANDOFF.md "Pending work" — per-obligation
-  theorem emission (each Lean theorem gets its own
-  `pos.line`, so the kind label becomes exactly right by
-  construction).
+  Pre-D (i.e., before 2026-04-26): Lean's diagnostic `pos.line`
+  reported the failing *tactic* invocation line (typically the
+  line of `tactus_peel; all_goals tactus_auto` near the end of
+  one mega-theorem per fn), not the line of the failing
+  obligation expression in the goal tree. `find_span_mark`
+  returned the closest preceding landmark to that tactic line —
+  usually the LAST mark in the theorem. When the failing
+  obligation was also the last mark, the reported `loc` and
+  `kind` were exactly right. When the failing obligation was
+  earlier in the goal tree (e.g., a Termination check on a
+  recursive fn whose call also has a precondition mark
+  afterward), `find_span_mark` returned a mark that was
+  structurally adjacent but not the actual one — the kind
+  label was one off.
+
+  **Fixed by D (2026-04-26).** Per-obligation theorem emission
+  isolates each obligation in its own theorem with its own
+  `:= by` block; the closest preceding mark to a failing
+  tactic line is now structurally guaranteed to be the
+  obligation mark for that theorem. AssertKind labels are
+  exactly right by construction. See HANDOFF.md session entry.
 
 ##### Tier 2 — realistic-code unblockers (2–4 days each)
 
@@ -1105,7 +1103,7 @@ exec fns."
 
 * **Generic calls (non-empty `typ_args`) — LANDED.** Exec-fn calls
   can now pass `typ_args` to a generic callee. `Wp::Call` carries
-  `typ_args: &'a [Typ]`; `lower_call` composes the value-param
+  `typ_args: &'a [Typ]`; `walk_call` composes the value-param
   subst with a type-param subst (mapping each `callee.typ_params`
   name to the rendered `typ_args` via `typ_to_expr`) and applies
   both to the inlined `require` / `ensure` via the existing
@@ -1200,7 +1198,7 @@ exec fns."
   2. At each call site: for each `&mut` index, extract the
      caller-side destination `VarIdent` from `args[i]` (the
      arg is a `Loc` of the mutated caller var).
-  3. In `lower_call`, emit `∀ (x_i' : T_i), type_inv(x_i')`
+  3. In `walk_call`, emit `∀ (x_i' : T_i), type_inv(x_i')`
      binders for each mutated caller var, threaded around
      the post-call continuation. The ensures clause is
      substituted with `p_i ↦ x_i'` (not `p_i ↦ arg_i`).
@@ -1296,7 +1294,7 @@ Assumptions about upstream VIR/SST shape or Verus compiler-pass ordering that ar
 * **`DUMMY_PARAM = "no%param"` is always position 0 of `callee.params` for zero-arg fns.** `is_zero_arg_desugared` (now retired) relied on this. Post the simplified-krate refactor, both `callee.params` and the call-site args carry the dummy symmetrically, so the check disappeared — but we still rely on Verus inserting the dummy consistently on both sides.
 * **Poly wrapper set is `UnaryOpr::Box` / `Unbox` / `Unary::CoerceMode` / `Trigger`.** `peel_transparent` centralises it. Adding a new transparent wrapper that we don't peel would be silently miscompiled. **Shape-drift tests**: `peel_transparent_*` covers each wrapper and the Loc-not-peeled / If-not-peeled cases.
 * **`VarIdent` equality by string content, not disambiguate.** Our `sanitize(&ident.0)` uses only the name string, collapsing different `VarIdentDisambiguate` tags with the same name into the same Lean identifier. Verus uses this for SSA renaming (`VarIdent("x", Renamed(2))` vs `VarIdent("x", AirLocal)`). In practice the cases we see are all either fully-renamed (different strings) or consistently-tagged, so collapse is safe — but a future Verus change that relies on disambiguates having different string-level effects would surprise us.
-* **Param name stability.** `lower_call`'s substitution map is keyed by `sanitize(param.name.0)`. If Verus starts appending disambiguators to param names (e.g., `foo@0`), the keys in our map and the references in the callee's require/ensure would drift apart.
+* **Param name stability.** `walk_call`'s substitution map is keyed by `sanitize(param.name.0)`. If Verus starts appending disambiguators to param names (e.g., `foo@0`), the keys in our map and the references in the callee's require/ensure would drift apart.
 * **`FunctionX` fields we read:** `params`, `ret`, `require`, `ensure.0`, `typ_params`, `item_kind`, `attrs.broadcast_forall`, `decrease` (via `CheckDecreaseHeight`). Renames break compile (good). Semantic changes (e.g., `require` splitting into static/dynamic halves) would need re-evaluation.
 * **`FuncCheckSst` fields we read:** `reqs`, `body`, `post_condition.dest`, `post_condition.ens_exps`, `local_decls`. Same story — renames compile-break.
 * **Verus's `ast_simplify` is a monotonic transformation w.r.t. what we care about.** Specifically: it adds the zero-arg dummy, it alpha-renames for unique locals, but it doesn't erase information we depend on. If it starts dropping fields we read, we break.
@@ -1304,7 +1302,7 @@ Assumptions about upstream VIR/SST shape or Verus compiler-pass ordering that ar
 * **Mathlib's `omega` / `simp_all` behaviour on the goal shapes we emit.** `tactus_auto`'s closure depends on these tactics handling `∧`-conjoined hypotheses, implications over linear arithmetic, and the let-reduction behaviour we rely on. A Lean/Mathlib upgrade could shift these in subtle ways; we'd likely see test regressions in bulk across a version bump.
 * **The `arch_word_bits` / `usize_hi` / `isize_hi` prelude names.** Our codegen emits bare `Var` references to these; the prelude provides the axioms/defs. If the prelude is swapped for a different environment, the references break. Kept in sync via `sanity.rs`'s allowlist.
 * **Verus's `StmX` destructures are `..`-free** in our code. Any field addition to `StmX::Assign` / `Return` / `Loop` / `Call` causes a compile error that forces audit. This is the compile-time defence in the upstream-robustness triangle.
-* **Verus lowers `while cond { … break; … }` to `cond: None` + an inserted `if !cond { break; }` prelude in the body.** Our `Wp::Loop` accepts both `cond: Some(_)` (no break) and `cond: None` (break-lowered) shapes; `lower_loop` only emits a `cond` gate when `Some`. If Verus changes to keep `cond: Some` with the break preserved in the body, our encoding still produces valid goals but with a spurious `∧ cond` gate that may over-constrain the invariant proof. **No shape-drift test today** — speculative, would surface as a regression in `test_exec_loop_with_break` if Verus's lowering changes.
+* **Verus lowers `while cond { … break; … }` to `cond: None` + an inserted `if !cond { break; }` prelude in the body.** Our `Wp::Loop` accepts both `cond: Some(_)` (no break) and `cond: None` (break-lowered) shapes; `walk_loop` only emits a `cond` gate when `Some`. If Verus changes to keep `cond: Some` with the break preserved in the body, our encoding still produces valid goals but with a spurious `∧ cond` gate that may over-constrain the invariant proof. **No shape-drift test today** — speculative, would surface as a regression in `test_exec_loop_with_break` if Verus's lowering changes.
 * **Verus's `auto_proof_block` pass always wraps non-empty content.** The pass synthesises `proof { ... }` blocks around every `assert(P)` / `assert(P) by { tac }` site so they're parsed as proof-mode. We distinguish user-written `proof { }` (semantically meaningful, routed to `Wp::AssertByTactus` with `cond: None`) from auto-wrapped ones via HIR-body emptiness in `rust_to_vir_expr.rs` — auto-wrapped blocks have non-empty HIR bodies, user-written empty blocks don't. **Guarded by `test_exec_auto_proof_block_not_tactus`** which exercises the auto-wrap path and confirms it doesn't trigger Tactus mode.
 * **`get_ghost_block_opt` returns `Some(GhostBlockAttr::Proof)` for user-written `proof { }` blocks.** Our `enclosing_fn_is_tactus_auto` + ghost-block-attr detection in `fn_call_to_vir.rs` relies on this attribute classification. If Verus changes how it tags ghost blocks (e.g., a new `GhostBlockAttr::TactusProof` variant, or distinguishing wrapped vs unwrapped at this layer), we'd silently stop detecting user-written proof blocks and route them to the wrong path. **No shape-drift test** — would manifest as `test_exec_proof_block_user_tactic` regressing.
 * **`TypX::Boxed` / `TypX::Decorate` are the canonical transparent wrappers for self-referential datatype fields.** Shared via `peel_typ_wrappers` (in `to_lean_sst_expr.rs`), used by `is_int_height`, `decrease_height_datatype`, and `field_is_self_recursive`. Mirrors `typ_to_expr`'s rendering (which peels both to produce Lean-level types). If Verus adds a new transparent wrapper for Rust `&Self` / `Box<Self>` / `Arc<Self>` / etc., one edit to `peel_typ_wrappers` updates all three call sites — without it, recursive-field detection would fail silently (field treated as non-recursive → `height = 1` for the variant → false termination obligation → recursion verifies where it shouldn't). **No shape-drift test** — would manifest as `test_exec_call_recursive_datatype_termination` regressing past the current "match-case-split" gap into a verified-but-wrong state.
@@ -1338,30 +1336,28 @@ no separate "rest" parameter, no separate "terminator" parameter.
 so `Return` writing to `Done(let <ret> := e; ctx.ensures_goal)`
 (discarding whatever `after` was at that point) is type-level.
 
-Three structural wins over the prior shape:
+Two structural wins over the prior shape:
 
 * **Continuation is type-level.** Can't accidentally compose after
   a `Return` because the type system forbids it.
 * **`Return` is cleanly fn-exit.** Previously Return wrote to
   whatever terminator was being threaded through (loop's local
   `I ∧ D < d_old` inside a loop body; fn's ensures at top). Now it
-  always writes `ctx.ensures_goal`. No test exercises return-in-loop
-  yet — the DSL shape just gets this right for free.
-* **`needs_peel` is one-line per variant.** Based on the node's own
-  shape, not a post-hoc traversal.
+  always writes `ctx.ensures_goal`. The DSL shape gets this right
+  for free, and `test_exec_return_inside_loop` /
+  `test_exec_return_inside_loop_with_break` pin the semantics.
 
 `build_wp(stm, after, ctx) -> Result<Wp, String>` folds right-to-
 left over a `Block`, so each statement's `after` is the already-
-built Wp for the rest of the block. `lower_wp(wp, ctx) -> LExpr`
-interprets the tree.
+built Wp for the rest of the block. The walker
+(`walk_obligations(wp, ctx, obl, emitter)` and friends) interprets
+the tree, emitting one Lean theorem per obligation site (D,
+2026-04-26).
 
 Adding a new WP form means one constructor + one arm each in
-`build_wp` and `lower_wp`. The old flat enum required editing a
-central dispatcher; the DSL shape makes composition obvious.
-
-Residual smell worth noting: `needs_peel` is still a recursive tree
-walk. Constant-cost today but will want to become a constructor-
-level bit if more variants need peeling.
+`build_wp` and `walk_obligations`. The old flat enum required
+editing a central dispatcher; the DSL shape makes composition
+obvious.
 
 ### Upstream-robustness patterns
 
@@ -1463,7 +1459,7 @@ on code that looked fine.
 Canonical examples from the #50 landing's two cleanup passes:
 * *Linus hat* caught `typ_inv_exps` smuggling the asserted condition
   (field's name didn't match its content) and `WpCtx::tactus_asserts:
-  RefCell<_>` making `lower_wp` lie about its purity.
+  RefCell<_>` making `walk_obligations` lie about its purity.
 * *FP lens* motivated the two-pass `collect_tactus_haves` rewrite.
 * *Coverage* caught missing regression tests for labeled-break
   rejected, nested-loop inner-break, return-inside-loop-with-break.

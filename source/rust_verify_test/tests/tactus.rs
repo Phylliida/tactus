@@ -2644,6 +2644,47 @@ test_verify_one_file! {
         }
     } => Err(err) => {
         assert!(err.errors.len() >= 1, "non-decreasing measure must be rejected");
+        // D Stage 6: pin `(loop decrease)` kind label. Per-obligation
+        // emission gives the decrease its own theorem; find_span_mark
+        // returns the LoopDecrease mark by construction.
+        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("(loop decrease)")),
+            "expected (loop decrease) kind label on the failing \
+             obligation. got: {:?}",
+            msgs,
+        );
+    }
+}
+
+// D Stage 6: invariant fails AT ENTRY (init), not in maintain.
+// `false_invariant` requires nothing about x and asserts an
+// invariant that doesn't hold initially. The init-clause theorem
+// (`OblCtx → I`) is the failing one, distinct from any
+// maintain-clause theorem in the same fn.
+test_verify_one_file! {
+    #[test] test_exec_loop_invariant_init_fails verus_code! {
+        #[verifier::tactus_auto]
+        fn bad_init(n: u8) -> (r: u8)
+            ensures r == n
+        {
+            let mut x: u8 = 0;
+            while x < n
+                invariant x > 0  // can't hold at entry: x = 0
+                decreases n - x
+            {
+                x = x + 1;
+            }
+            x
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "init-failing invariant must be rejected");
+        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("(loop invariant)")),
+            "expected (loop invariant) kind label on init failure. got: {:?}",
+            msgs,
+        );
     }
 }
 
@@ -3247,10 +3288,11 @@ test_verify_one_file! {
 // content to spaces for rustc, rust_to_vir captures the original
 // source byte range on `ExprX::AssertBy::tactic_span`, ast_to_sst
 // routes it to `StmX::AssertQuery` with `AssertQueryMode::Tactus`,
-// and `sst_to_lean::build_wp` reads the verbatim tactic off disk and
-// prepends a `have h_tactus_assert_N : P := by <user_tac>;` to the
-// theorem's closer. The hypothesis then sits in context for the
-// rest of the proof.
+// and `sst_to_lean::build_wp` reads the verbatim tactic off disk
+// and produces a `Wp::AssertByTactus { cond: Some(P), tactic_text }`
+// node. The walker emits one theorem for `P` with the user tactic as
+// its closer, and `P` enters the body context as a hypothesis for
+// subsequent obligations.
 test_verify_one_file! {
     #[test] test_exec_assert_by_user_tactic verus_code! {
         #[verifier::tactus_auto]
@@ -3262,6 +3304,28 @@ test_verify_one_file! {
             x + 1
         }
     } => Ok(())
+}
+
+// D Stage 6: failing `assert(P) by { wrong_tactic }`. The user
+// chose the wrong tactic; the assert-by theorem fails. Lean's
+// error must mention this fn (the `wrong_tactic` is `decide`,
+// which can't see arithmetic facts about runtime variables).
+test_verify_one_file! {
+    #[test] test_exec_assert_by_wrong_tactic verus_code! {
+        #[verifier::tactus_auto]
+        fn bad_assert_by(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            // `decide` can't prove this — needs `omega` for the
+            // x-quantified arithmetic. The assert-by theorem
+            // should fail with the user's tactic as the cause.
+            assert(x < 200) by { decide }
+            x + 1
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "wrong assert-by tactic must be rejected");
+    }
 }
 
 // User-written `proof { ... }` block inside a tactus_auto exec fn.
