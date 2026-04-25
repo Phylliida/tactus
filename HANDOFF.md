@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**176 end-to-end tests + 1 coverage test + 113 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**177 end-to-end tests + 1 coverage test + 106 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -87,6 +87,67 @@ Three roadmap tasks completed (#54, #58, #51), one started (#55 first slice), pl
 - Extracted shared `peel_typ_wrappers` helper — the Boxed/Decorate peel was duplicated across `is_int_height`, `decrease_height_datatype`, `field_is_self_recursive`. One edit site if Verus adds a new transparent wrapper.
 
 **Writing** (`8c689b0`) — three poems in POEMS.md: "done" (the `first` semantics surprise), "The gate" (the `.height`-existence whitelist for tactus_case_split was already built for #54 before #58 needed it), "Downstream" (estimates vs actuals, and the foundation work that hides in the visible hour).
+
+#### Current session (2026-04-26 — task D: per-obligation theorem emission)
+
+Task D landed across six staged commits. Replaces the single
+`_tactus_body_<fn>` mega-theorem per exec fn with one theorem per
+obligation. Each theorem gets its own `pos.line` in Lean, so
+`find_span_mark` becomes structurally exact for AssertKind labels —
+the imperfection from #51 (Termination check on a recursive call
+mislabeled as `(precondition)` because `find_span_mark` returned
+the next mark in source order) is now fixed by construction.
+
+**Stage 1** (`5d4b954`) — `walk_obligations` walker handling
+`Wp::Done` / `Assert` / `Let` / `Assume` / `Branch` per-obligation.
+Accumulates context as `OblCtx` (Let / Hyp / Binder frames),
+wrapped around each emitted goal in source order so lets scope
+over the hypotheses that mention their bindings. Theorem naming
+compresses spans to `<basename>_<line>_<col>`.
+
+**Stage 2** (`f937733`) — `walk_call` for `Wp::Call`. Emits one
+theorem for the call's substituted requires (kind=CallPrecondition),
+continues with `∀ ret, ret_bound → ensures(subst) → let dest := ret;`
+frames pushed onto the obligation context.
+
+**Stage 3** (`ee94bce`) — `walk_loop` for `Wp::Loop` + Done leaf
+splitting. Emits one theorem per loop invariant at entry, walks
+body in maintain ctx (mod_var binders + bounds + invs as hyps +
+cond as hyp + `_tactus_d_old := D` let), walks `after` in use ctx.
+The body's `Done(I ∧ D < d_old)` flows through `Wp::Done` →
+`emit_done_or_split`, which splits top-level conjunctions into
+one theorem per conjunct. Each invariant + the decrease comparison
+are wrapped in SpanMarks at build time, so the per-conjunct
+theorems get exact AssertKind names: `_tactus_loop_invariant_*`,
+`_tactus_loop_decrease_*`, etc.
+
+**Stage 4** (`b6133ab`) — `walk_assert_by_tactus` for
+`Wp::AssertByTactus`. `cond=Some(P)` (assert-by) emits one theorem
+for `P` with the user's tactic as closer; body theorems get `P` as
+a Hyp frame. `cond=None` (proof block) pushes the user's tactic
+onto `e.tactic_prefix` so every body theorem gets `(tac) <;> closer`
+— `<;>` rather than `;` so a goal-modifying `simp_all` that closes
+the goal entirely no-ops the closer instead of failing with "no
+goals". Plus a ~550-line dead-code cleanup: `lower_wp` /
+`lower_loop` / `lower_call` / `quantify_mod_vars` / `loop_tactic` /
+`Wp::needs_peel` / `collect_tactus_haves` / `prepend_user_haves` /
+`TactusHave` all removed (replaced by the per-obligation walkers
+and the `tactic_prefix` stack on `ObligationEmitter`).
+
+**Stages 5 + 6** (`4156079`) — `find_span_mark` docstring updated
+to record that closest-preceding-mark is now structurally exact
+under per-obligation emission; AssertKind regression tests added
+to `test_exec_call_recursive_nondecreasing` (`(termination)` label),
+`test_exec_loop_invariant_fails` (`(loop invariant)`),
+`test_exec_call_requires_violated` (`(precondition)`); new
+`test_exec_proof_block_have_propagates_to_assert` exercises the
+Stage 4 tactic-prefix propagation.
+
+**Side effects of per-obligation:** Lean now sees ~3-5x more
+theorems per fn on average. Each is small (a single obligation
+with its accumulated context), so `omega` / `simp_all` are fast
+on each. Total verification time is roughly the same. Generated
+`.lean` files are bigger but still tractable for inspection.
 
 ## Architecture
 
@@ -358,76 +419,7 @@ See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the f
 
 ## Pending work
 
-Three tasks remain. Rough order by cost-effectiveness:
-
-### D — Per-obligation theorem emission  [~1-2 days, architectural]
-
-**What**: Replace the one big `_tactus_body_<fn>` theorem per exec fn with many small theorems, one per obligation. Naming pattern: `_tactus_<kind>_<fn>_at_<loc>` (e.g., `_tactus_precondition_for_bad_caller_at_test_28_5`).
-
-**Why**: Lean reports `pos.line` at the failing tactic invocation, which with one big theorem is always the same line regardless of which obligation failed. `find_span_mark` is then forced to use a "closest preceding mark" heuristic — usually right, but off by one when the failing obligation isn't the LATEST mark in the theorem (e.g., Termination check on a recursive call whose subsequent CallPrecondition mark is closer to the tactic line). Per-theorem gives each obligation its own `pos.line`, making `AssertKind` labels exactly correct by construction.
-
-Secondary wins: theorem names become user-readable (`_tactus_precondition_for_X_at_28_5` vs `case right.left.right`), `tactus_peel` does less work per theorem, Lean caches per-theorem.
-
-**Approach**: Walk the Wp tree, accumulating a "context" (binders + hypotheses + let-bindings) as you descend. At each obligation site, emit a theorem with the accumulated context as binders/let-prefix and the obligation as goal. Tactic body for each theorem is `tactus_auto` (the existing closer).
-
-**Per-Wp-variant rules**:
-- `Wp::Done(leaf)` → emit theorem with `leaf` as goal. Top-level `Done` corresponds to the fn's ensures clause; loop-body `Done` corresponds to the maintain clause's `I ∧ D < d_old`. Theorem name picks via context: `_tactus_ensures_<fn>` for the top, `_tactus_loop_terminate_<fn>_at_<loc>` for nested.
-- `Wp::Assert(e, body)` → emit theorem for `e` with current context. Recurse on `body` with `e` added as a hypothesis (because after asserting, we know it's true). Theorem name uses `detect_assert_kind(e)` — Plain/Termination today, more if `Wp::Assert` learns to carry `AssertKind`.
-- `Wp::Assume(p, body)` → recurse on `body` with `p` added as hypothesis. No theorem emitted at this node.
-- `Wp::Let(name, val, body)` → recurse on `body` with `let name := val;` added to context. No theorem emitted.
-- `Wp::Branch(cond, t, e)` → recurse on `t` with `cond` as hyp; recurse on `e` with `¬cond` as hyp. No theorem at this node — both arms produce their own theorems.
-- `Wp::Loop(invs, dec, mv, body, after)`:
-  - **Init theorems**: emit one theorem per invariant in `invs` for the entry check (current ctx → invariant). Kind: `LoopInvariant`.
-  - **Maintain**: walk `body` in extended ctx — `mv` as ∀-binders, each invariant added as hypothesis, `cond` as hypothesis if Some. Body's `Done(I ∧ D < d_old)` produces theorems for "invariant maintained" + "decrease decreased."
-  - **Use**: walk `after` in extended ctx — `mv` as ∀-binders, invariants as hypotheses, `¬cond` as hypothesis if Some. Produces theorems for the post-loop continuation.
-- `Wp::Call(callee, args, dest, after)`:
-  - **Precondition theorem**: emit one for the substituted `callee.requires`. Kind: `CallPrecondition`. Use `call_span` for the `at <loc>:`.
-  - **Continuation**: walk `after` in extended ctx — `ret` as ∀-binder, ret type-bound as hypothesis, substituted `callee.ensures` as hypothesis, `let dest := ret;` if `dest = Some`. Produces theorems for the rest of the fn body.
-- `Wp::AssertByTactus(cond, tactic_text, body)`:
-  - If cond=Some (assert-by): emit a single theorem for `cond` with `tactic = Tactic::Raw(tactic_text)` (not the standard `tactus_auto`). Recurse on `body` with `cond` added as hypothesis.
-  - If cond=None (proof block): the user's block introduces hypotheses (via their own `have`s) intended to be in scope for subsequent obligations. Two design options:
-    - (a) Apply the user's tactic as a TACTIC PREFIX to every obligation theorem until the proof block scope ends (the body completes). The user's `have`s then become local to each subsequent theorem.
-    - (b) Require proof blocks to be explicit named-`have` form; lift the haves to context-level hypotheses. Wouldn't accept arbitrary tactics that don't introduce named haves.
-  - Recommended: start with (a) — preserves current proof-block semantics. Each obligation theorem in the body's scope gets `<user_tac>;` prepended to its tactic.
-
-**Implementation plan (staged)**:
-
-**Stage 1**: Write `walk_obligations(wp, ctx, out)` walker handling `Wp::Done`, `Wp::Assert`, `Wp::Let`, `Wp::Assume`, `Wp::Branch`. Wire into `exec_fn_theorems_to_ast` for the simple cases. Keep `lower_wp` for inner expressions (it lowers `e` in `Wp::Assert(e, ...)` to LExpr; the walker just emits theorems, it doesn't replace the inner-expression rendering). Run a subset of tests to validate.
-
-**Stage 2**: Add `Wp::Call` handling — precondition theorem + continuation walk. Test that fn-with-call cases work.
-
-**Stage 3**: Add `Wp::Loop` handling — init/maintain/use theorems. Test that fn-with-loop cases work.
-
-**Stage 4**: Add `Wp::AssertByTactus` — option (a) above. Update `prepend_user_haves` / `collect_tactus_haves` semantics.
-
-**Stage 5**: Update `LeanSourceMap` and `format_error` — each theorem now has its own pos.line, so the "closest preceding mark" heuristic can be replaced with "the mark immediately before this theorem's `:= by`." The kind label becomes exactly correct.
-
-**Stage 6**: Audit existing tests for assumptions about theorem count/name. Most check error messages or generated-Lean shape; update where needed.
-
-**Risks / gotchas**:
-- Existing tests assume one theorem per fn. Need audit.
-- `prepend_user_haves` currently runs once per fn; needs to thread per-theorem in proof-block scope (Stage 4).
-- Modified-vars handling: when walking into a loop's maintain or use clause, `mv` becomes ∀-binders on EVERY theorem emitted in that scope. The walker's context needs to track these.
-- Let-binding evaluation order: each obligation theorem's let-prefix needs the lets that were in scope at that obligation's emission point, in source order.
-- Theorem name uniqueness: use a counter (`Cell<usize>`) or location-based suffix to disambiguate when multiple obligations of the same kind appear at the same line (rare, but possible with macros).
-- The `LeanSourceMap` enum becomes per-fn; with many theorems per fn, may need a `Vec<TheoremSourceMap>` or a single map keyed by theorem name. The simplest: each generated theorem comes with its own source-mapping info, indexed by Lean theorem name.
-- Generated `.lean` file size will grow (more boilerplate per theorem). Should still be tractable.
-
-**What to read first**:
-- `sst_to_lean.rs::exec_fn_theorems_to_ast` — current entry point. Returns `Vec<Theorem>` already (good — just emit more).
-- `sst_to_lean.rs::lower_wp` — current single-theorem lowering. We KEEP this for inner expressions (per-obligation walker calls `lower_wp` recursively for sub-expressions in some cases, or extracts what's needed).
-- `sst_to_lean.rs::lower_loop`, `lower_call` — current loop/call lowering. The walker replicates the binders/hypothesis logic but at theorem-boundary level.
-- `sst_to_lean.rs::collect_tactus_haves`, `prepend_user_haves` — proof-block handling. Need rethinking for per-theorem scoping.
-- `to_lean_fn.rs::LeanSourceMap` — currently per-fn. May need per-theorem.
-- `lean_pp.rs::Theorem` struct — target output (no change needed; just emit more).
-
-**Tests to add**:
-- Multi-obligation fn: error at one obligation should name the right theorem in error output.
-- Loop with inv-init failure vs inv-maintain failure: each should be a distinct theorem.
-- Recursive call: termination theorem distinct from precondition theorem (this is what fixes the AssertKind imperfection).
-- Proof block + multi-obligation: user's haves propagate to obligations within scope.
-
-**Estimate**: 1-2 sessions of careful focused work. Stage 1 is the spike — validates the approach. Stages 2-4 add variants. Stages 5-6 close the loop on error formatting + tests.
+Two tasks remain. Rough order by cost-effectiveness:
 
 ### #55 — `&mut` args in exec-fn calls  [~1 week, heavy]
 
