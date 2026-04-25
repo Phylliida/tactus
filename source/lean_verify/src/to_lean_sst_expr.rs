@@ -620,26 +620,35 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
     })
 }
 
+/// Peel `TypX::Boxed` (poly coercion) and `TypX::Decorate` (Rust
+/// decorations like `Box<T>`, `&T`, `&mut T`) to reach the
+/// underlying type. These are transparent at the Lean level —
+/// `typ_to_expr` also peels both — so three otherwise-distinct
+/// checks (is-int, is-user-datatype, is-self-referential-field)
+/// share this helper. Single edit site if Verus adds a new
+/// transparent wrapper.
+pub(crate) fn peel_typ_wrappers(typ: &Typ) -> &Typ {
+    match &**typ {
+        TypX::Boxed(inner) | TypX::Decorate(_, _, inner) => peel_typ_wrappers(inner),
+        _ => typ,
+    }
+}
+
 /// Does this type bottom out at `TypX::Int(_)` once transparent
 /// wrappers (`Boxed`, `Decorate`) are peeled? Mirrors
 /// `vir::recursion::height_is_int`.
 fn is_int_height(typ: &Typ) -> bool {
-    match &**typ {
-        TypX::Int(_) => true,
-        TypX::Boxed(inner) | TypX::Decorate(_, _, inner) => is_int_height(inner),
-        _ => false,
-    }
+    matches!(&**peel_typ_wrappers(typ), TypX::Int(_))
 }
 
 /// Extract the datatype Path when a decrease measure is a user
-/// datatype (not int). Peels `Boxed` and `Decorate` wrappers the
-/// same way `is_int_height` does. Returns None for generic
-/// instantiations, tuples, and anything else that can't anchor a
-/// `T.height` fn. `height_fn_name_for_datatype` in `to_lean_fn.rs`
-/// emits the matching definition.
+/// datatype (not int). Peels `Boxed` and `Decorate` wrappers via
+/// `peel_typ_wrappers`. Returns None for generic instantiations,
+/// tuples, and anything else that can't anchor a `T.height` fn.
+/// `height_fn_for_datatype` in `to_lean_fn.rs` emits the matching
+/// definition.
 pub(crate) fn decrease_height_datatype(typ: &Typ) -> Option<&Path> {
-    match &**typ {
-        TypX::Boxed(inner) | TypX::Decorate(_, _, inner) => decrease_height_datatype(inner),
+    match &**peel_typ_wrappers(typ) {
         TypX::Datatype(Dt::Path(path), args, _) if args.is_empty() => Some(path),
         _ => None,
     }
