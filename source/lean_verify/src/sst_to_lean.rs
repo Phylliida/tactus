@@ -1,8 +1,9 @@
 //! Weakest-precondition VC generation from SST → Lean AST.
 //!
 //! Takes an exec fn's `FuncCheckSst` (from `FunctionSst::exec_proof_check`)
-//! and produces a `Theorem` AST node whose goal is the WP of the body and
-//! whose tactic body is `tactus_auto`.
+//! and produces a `Vec<Theorem>` — one theorem per obligation in the
+//! body. Each theorem's tactic body is `tactus_auto` (or the user's
+//! tactic for `assert(P) by { … }` and proof blocks).
 //!
 //! # Pipeline
 //!
@@ -15,11 +16,19 @@
 //!    SST body right-to-left, producing a `Wp<'a>` tree where each
 //!    compound node carries its own continuation by construction. Any
 //!    unsupported SST form returns `Err` and bubbles up.
-//! 3. `lower_wp(&body_wp, &ctx)` interprets the `Wp` tree into a Lean
-//!    `LExpr` goal.
-//! 4. Emission wraps the goal in a `Theorem` with either `tactus_auto`
-//!    (flat goals) or `tactus_peel; all_goals tactus_auto` (when the
-//!    WP introduces nested ∀/∧ structure — see `Wp::needs_peel`).
+//! 3. `walk_obligations(&body_wp, &ctx, &OblCtx::new(), &mut emitter)`
+//!    walks the Wp tree, accumulating `OblCtx` frames (Let / Hyp /
+//!    Binder) at scope-introducing points and emitting one Lean
+//!    theorem per obligation site. Each emitted theorem's goal is
+//!    `OblCtx::wrap(obligation_lexpr)` — the accumulated frames
+//!    folded around the obligation in source order.
+//!
+//! Per-obligation emission (D, 2026-04-26) replaced an earlier
+//! single-theorem `lower_wp` pipeline that produced one mega-theorem
+//! with `init ∧ maintain ∧ use ∧ ensures …` conjuncts. The split lets
+//! each obligation get its own `pos.line` for Lean diagnostics, so
+//! `find_span_mark` returns the right `AssertKind` label by
+//! construction.
 //!
 //! # The `Wp` DSL
 //!
@@ -29,21 +38,30 @@
 //!     from the fn's ensures at top level, `I ∧ D < _tactus_d_old`
 //!     inside a loop body, or `let <ret> := e; ensures_goal` from a
 //!     `return` statement.
-//!   * `Let(x, rhs, after)` — `let x := rhs; <after>`. Lowering uses
-//!     `lift_if_value` so an `ExpX::If` RHS lifts to goal level.
-//!   * `Assert(P, after)` — `P ∧ <after>`.
-//!   * `Assume(P, after)` — `P → <after>`.
-//!   * `Branch { cond, then_branch, else_branch }` —
-//!     `(c → then_branch) ∧ (¬c → else_branch)`. Each branch carries
-//!     its own continuation; no shared-rest parameter.
+//!   * `Let(x, rhs, after)` — `let x := rhs; <after>`. The walker
+//!     calls `walk_let`, which forks if `rhs` contains a value-
+//!     position `if` (mirroring `lift_if_value`'s behaviour for
+//!     `Return`-position values).
+//!   * `Assert(P, after)` — emit one obligation theorem for `P`;
+//!     body walked with `P` as a Hyp frame.
+//!   * `Assume(P, after)` — body walked with `P` as a Hyp frame; no
+//!     theorem emitted.
+//!   * `Branch { cond, then_branch, else_branch }` — body walked
+//!     under `cond` for the then-branch, `¬cond` for the else; no
+//!     theorem at the branch node.
 //!   * `Loop { cond, invs, decrease, modified_vars, body, after }` —
-//!     lowered to `I ∧ maintain_clause ∧ havoc_continuation`. `body`
-//!     is built with its own `Done(I ∧ D < _tactus_d_old)`
-//!     terminator; `after` is the post-loop continuation.
-//!   * `Call { callee, args, dest, after }` — `requires(subst) ∧ ∀ ret,
-//!     bound(ret) → ensures_using_ret(subst) → let dest := ret;
-//!     <after>`. Inlines the callee's `require`/`ensure` via
-//!     `lean_ast::substitute` (capture-avoiding).
+//!     emit one theorem per invariant (init); walk body in maintain
+//!     ctx; walk `after` in use ctx. See `walk_loop`.
+//!   * `Call { callee, args, dest, after }` — emit one theorem for
+//!     the substituted requires (CallPrecondition); walk `after` in
+//!     ctx with `∀ ret, ret_bound, ensures(subst), let dest := ret;`
+//!     frames pushed. See `walk_call`.
+//!   * `AssertByTactus { cond, tactic_text, body }` — `Some(P)`:
+//!     emit one theorem for `P` with the user's tactic as closer;
+//!     body walked with `P` as a Hyp. `None` (proof block): push
+//!     the user's tactic onto `tactic_prefix` and walk body; every
+//!     emitted theorem in scope gets `(user_tac) <;> closer` so
+//!     the user's `have`s propagate.
 //!
 //! Three structural properties the DSL gets for free:
 //!
@@ -62,32 +80,23 @@
 //! statement's `after` is the already-built Wp for the rest of the
 //! block. `Return` terminates a branch by dropping `after`.
 //!
-//! # Loop obligations (conjunctive WP)
+//! # Loop obligations (per-clause emission)
 //!
-//! A loop contributes three pieces to the goal of the enclosing
-//! theorem — conjoined inline rather than split into separate
-//! theorems:
+//! A loop produces these obligations, each as its own Lean theorem:
 //!
-//! ```
-//! lower(Wp::Loop{ cond, invs, decrease, modified_vars, body, after })
-//!   = I                                                      -- init
-//!     ∧ (∀ mod_vars, bounds → I ∧ cond →
-//!         let _tactus_d_old := D; lower(body))               -- maintain
-//!     ∧ (∀ mod_vars, bounds → I ∧ ¬cond →
-//!         lower(after))                                      -- havoc
-//! ```
+//! * **Init** — one theorem per invariant: `OblCtx → I_i`.
+//! * **Maintain** — body's `Done(inv_conj ∧ D < _tactus_d_old)` flows
+//!   through the walker; `emit_done_or_split` splits the conjunction
+//!   into one theorem per invariant + one for the decrease. Maintain
+//!   ctx adds `∀ mod_vars + bounds + invs as hyps + cond as hyp +
+//!   `_tactus_d_old := D`` let.
+//! * **Use** — `after` walked in use ctx (`∀ mod_vars + bounds +
+//!   invs as hyps + ¬cond as hyp`); produces theorems for the
+//!   post-loop continuation.
 //!
-//! where `body` has `Done(I ∧ D < _tactus_d_old)` as its own
-//! terminator, so `lower(body)` naturally produces the maintain
-//! clause's inner goal. The Lean `let _tactus_d_old := D; ...`
-//! wrapper puts the pre-body `D` in scope; references to `D` *inside*
-//! the body see post-body values via let-shadowing from intervening
-//! assignments.
-//!
-//! Non-modified surrounding state stays in scope via the outer
-//! `let`/`∀` nesting already built by the enclosing `lower_wp`
-//! frames. Only `mod_vars` — variables the loop body writes to —
-//! get the fresh universal quantification.
+//! Non-modified surrounding state stays in scope via the OblCtx
+//! frames built up by enclosing scopes. Only `mod_vars` — variables
+//! the loop body writes to — get fresh universal quantification.
 //!
 //! # Mutation
 //!
@@ -98,8 +107,8 @@
 //! `let x := …` only shadows within its implication, so the outer
 //! `x` remains in scope for the other branch and the code after the
 //! if. Loops break this trick because the loop body's mutations
-//! can't tunnel out through shadowing; they'll need a real rename
-//! pass when we get there.
+//! can't tunnel out through shadowing; they're handled by the
+//! `∀ mod_vars` quantification in maintain/use ctx.
 
 use std::collections::{HashMap, HashSet};
 
@@ -389,6 +398,13 @@ struct OblCtx {
 impl OblCtx {
     fn new() -> Self { Self { frames: Vec::new() } }
 
+    /// Append a frame to a fresh copy. Cloning the whole `frames`
+    /// Vec per call is O(N²) memory across deeply-nested
+    /// recursion (e.g., a chain of asserts with branches inside).
+    /// Realistic exec fns don't go deep enough for this to matter;
+    /// if a future profile says otherwise, switching to
+    /// `Rc<im::Vector<_>>` (structural sharing) would fix it
+    /// without changing the API.
     fn with_frame(&self, f: CtxFrame) -> Self {
         let mut new = self.clone();
         new.frames.push(f);
@@ -942,14 +958,14 @@ fn walk_let<'a>(
     }
 }
 
-/// Atomic `tactus_auto` for straight-line exec fn theorems — their
-/// goals are a single chain of `let` / `→` / `∧` that omega handles
-/// directly.
+/// Atomic `tactus_auto` for per-obligation theorems. Each emitted
+/// goal is a single obligation wrapped in let/→/∀ frames from the
+/// `OblCtx`, which `omega` and `simp_all` handle natively (intros
+/// for `∀`/`→`, zeta-reduction for `let`).
 fn simple_tactic() -> Tactic {
     Tactic::Named("tactus_auto".to_string())
 }
 
-/// Loop theorems have a conjunctive shape `init ∧ maintain ∧ use` per
 // ── Binder builders ────────────────────────────────────────────────────
 
 /// Function params + their type-bound hypotheses. Shared across all
@@ -999,32 +1015,25 @@ fn build_req_binders(check: &FuncCheckSst) -> Vec<LBinder> {
 //
 // `Wp<'a>` is a small algebra of WP-shaped operations. Each non-`Done`
 // node carries its own continuation by construction — no separate
-// "rest" parameter, no separate "terminator" parameter. Lowering
-// (`lower_wp`) is a straightforward tree walk; construction
-// (`build_wp`) threads each statement's continuation through at walk
-// time.
+// "rest" parameter, no separate "terminator" parameter. The walker
+// (`walk_obligations` and friends) is a straightforward tree walk;
+// construction (`build_wp`) threads each statement's continuation
+// through at walk time.
 //
-// Compared to the earlier `BodyItem` + `build_goal_with_terminator`
-// design:
+// Structural properties:
 //
 //   * Continuation is type-level, not positional. Can't accidentally
 //     compose after a `Return` because `Done` has no slot for more.
 //   * `Return` is cleanly "terminator-at-fn-exit" rather than
 //     "terminator-in-current-scope" — an early return always writes
-//     the fn's ensures goal, even when nested inside a loop. The
-//     earlier code passed the loop's local goal through as the
-//     terminator, which was incorrect for true fn-exit semantics
-//     (harmless in practice because we don't exercise return-in-loop
-//     yet, but the DSL shape gets this right by construction).
+//     the fn's ensures goal, even when nested inside a loop.
 //   * `Loop` / `Call` compose like any other node — each has `body`
 //     and/or `after` sub-Wps, recursion is structural.
-//   * `needs_peel` is one line per variant, based on the node's own
-//     shape rather than a post-hoc traversal looking for
-//     `BodyItem::Loop` / `Call`.
 //
 // Adding a new WP form means adding a constructor + an arm in
-// `build_wp` (where construction happens) and `lower_wp` (where it
-// lowers to LExpr). No changes needed to a central dispatcher.
+// `build_wp` (where construction happens) and `walk_obligations`
+// (where it emits theorems). No changes needed to a central
+// dispatcher.
 
 /// A WP program. Each compound node carries its own continuation,
 /// so composition is structural and `Return` is naturally a
@@ -1037,45 +1046,43 @@ enum Wp<'a> {
     /// statement's `let <ret> := e; ensures`.
     Done(LExpr),
 
-    /// `let x := e; <body>`. If `e` contains an `ExpX::If`, the
-    /// lowering pass lifts it out via `lift_if_value` — this keeps
-    /// the Wp tree shape intact while giving omega a tractable goal.
+    /// `let x := e; <body>`. If `e` contains a value-position
+    /// `if c then a else b`, `walk_let` forks into two recursive
+    /// walks (with cond as a Hyp frame) so omega sees a clean
+    /// goal in each branch instead of an opaque value-position
+    /// if.
     Let(&'a str, &'a Exp, Box<Wp<'a>>),
 
-    /// `P ∧ <body>`.
+    /// Obligation: prove `P`, then `body` proceeds with `P` as a
+    /// hypothesis. Walker emits one theorem per `Wp::Assert`.
     Assert(&'a Exp, Box<Wp<'a>>),
 
-    /// `P → <body>`.
+    /// Hypothesis: `body` proceeds with `P` as a hypothesis. No
+    /// obligation; walker emits no theorem at this node.
     Assume(&'a Exp, Box<Wp<'a>>),
 
     /// User-written Lean tactic inside a `tactus_auto` fn.
     ///
     /// Two surface forms produce this node, distinguished by `cond`:
-    /// * `Some(P)` — `assert(P) by { tac }`. Emission prepends
-    ///   `have h_N : P := by <tac>` to the theorem's closer; the
-    ///   user's tactic discharges the obligation for P, and the
-    ///   proved hypothesis h_N is available for the rest of the
-    ///   proof via `simp_all` / `omega`.
-    /// * `None` — `proof { tac }`. Emission prepends `<tac>` raw;
-    ///   the user's own `have` statements inside become theorem-
-    ///   level hypotheses, and `unfold` / `simp` / etc. affect the
-    ///   outer goal. No wrapping, no synthesized condition.
-    ///
-    /// In both cases `body` is the post-block continuation, and the
-    /// body's `lower_wp` passes through unchanged — the tactic
-    /// content is extracted up-front by `collect_tactus_haves` and
-    /// prepended to the closer, not woven into the goal.
+    /// * `Some(P)` — `assert(P) by { tac }`. Walker emits one
+    ///   theorem for `P` with `tac` as the closer (rather than
+    ///   the standard `tactus_auto`). `P` then enters body's
+    ///   context as a hypothesis.
+    /// * `None` — `proof { tac }`. Walker pushes `tac` onto
+    ///   `e.tactic_prefix` and walks body; every theorem in
+    ///   body's scope gets `(tac) <;> closer` so the user's
+    ///   `have h : P := by …` lines propagate as local
+    ///   hypotheses to subsequent obligations.
     AssertByTactus {
         cond: Option<&'a Exp>,
         tactic_text: String,
         body: Box<Wp<'a>>,
     },
 
-    /// `(c → then_branch) ∧ (¬c → else_branch)`. Both branches
-    /// carry their own continuations up to the next join — the
-    /// outer WP builder doesn't split continuations textually,
-    /// because each branch already has the right continuation
-    /// embedded in its Wp sub-tree.
+    /// `if cond { then_branch } else { else_branch }`. Walker
+    /// recurses on `then_branch` with `cond` as a Hyp frame, and
+    /// on `else_branch` with `¬cond`. No theorem at the branch
+    /// node; each branch's sub-Wp produces its own theorems.
     Branch {
         cond: &'a Exp,
         then_branch: Box<Wp<'a>>,
@@ -1085,17 +1092,19 @@ enum Wp<'a> {
     /// Loop. `body` is the body's Wp built with its own local
     /// `Done(I ∧ D < _tactus_d_old)` terminator; `after` is the
     /// post-loop continuation (built with the enclosing scope's
-    /// `after`). Lowering wraps `body` with the `let _tactus_d_old
-    /// := D` binding and the maintain quantifier, and wraps `after`
-    /// with the havoc quantifier.
+    /// `after`). `walk_loop` emits one init theorem per invariant,
+    /// walks `body` in maintain ctx (∀ mod_vars + bounds + invs as
+    /// hyps + cond as hyp + `_tactus_d_old := D` let), and walks
+    /// `after` in use ctx (∀ mod_vars + bounds + invs as hyps +
+    /// ¬cond as hyp).
     ///
     /// `cond` is `Some(c)` for a simple `while c { … }` with no
     /// breaks (the body runs while `c` holds; exit is via `!c`).
     /// `cond` is `None` for the break-lowered form Verus produces
     /// for `while c { … break; … }` (the body sees `if !c { break; }`
-    /// inserted by Verus; exit is only via `break`). The maintain
-    /// clause's `I ∧ cond →` guard is dropped in the `None` case,
-    /// and the use clause's `I ∧ ¬cond →` becomes just `I →`.
+    /// inserted by Verus; exit is only via `break`). For `cond:
+    /// None` the maintain ctx drops the `cond` hyp and the use
+    /// ctx drops the `¬cond` hyp.
     Loop {
         cond: Option<&'a Exp>,
         invs: &'a [LoopInv],
@@ -1106,9 +1115,12 @@ enum Wp<'a> {
     },
 
     /// Direct function call. `after` is the post-call continuation.
-    /// Lowering inlines the callee's require/ensure via
-    /// `lean_ast::substitute` and wraps `after` under `∀ ret, bound →
-    /// ensures → let dest := ret; after`.
+    /// `walk_call` emits one theorem for the substituted
+    /// `callee.requires` (CallPrecondition), then walks `after`
+    /// under context frames `∀ ret, ret_bound → ensures(subst) →
+    /// let dest := ret;`. The require/ensure are inlined via
+    /// `lean_ast::substitute` (capture-avoiding, mirrors what the
+    /// pre-D `lower_call` did).
     Call {
         callee: &'a FunctionX,
         /// Borrow the SST's arg slice directly — no `Vec<&Exp>`
@@ -1117,17 +1129,18 @@ enum Wp<'a> {
         /// lifetime as the rest of the Wp.
         args: &'a [Exp],
         /// Type arguments from the call site, one per `callee.typ_params`.
-        /// Used at lowering time to substitute each `TypParam(id)` in
+        /// `walk_call` uses these to substitute each `TypParam(id)` in
         /// the callee's require/ensure with the call site's concrete
         /// type. Empty slice when the callee is non-generic.
         typ_args: &'a [Typ],
         /// Caller's destination variable (`let x = foo(…)` → `Some("x")`;
-        /// `foo(…);` → `None`). Only the name is needed — lowering emits
-        /// `let dest := ret` inside the `∀ ret`, and `ret` already has
-        /// its type-bound hypothesis from `type_bound_predicate`.
+        /// `foo(…);` → `None`). Only the name is needed — `walk_call`
+        /// pushes a `let dest := ret` frame inside the `∀ ret`, and
+        /// `ret` already has its type-bound hypothesis from
+        /// `type_bound_predicate`.
         dest: Option<&'a VarIdent>,
         /// Call-site Span — the Rust source location of `callee(args)`.
-        /// Used by `lower_call` to wrap the inlined requires_conj with
+        /// Used by `walk_call` to wrap the inlined requires_conj with
         /// a `SpanMark`, so a failing precondition check surfaces the
         /// call site in error messages (#51) rather than the fn
         /// declaration or the callee's own source line.
@@ -1136,7 +1149,7 @@ enum Wp<'a> {
     },
 }
 
-// ── WP lowering helpers ────────────────────────────────────────────────
+// ── Walker helpers ─────────────────────────────────────────────────────
 
 /// Read the pre-resolved start `file:line:col` from a Verus
 /// `Span` for `/- @rust:LOC -/` markers in the generated Lean
@@ -1163,8 +1176,8 @@ fn format_rust_loc(span: &Span) -> String {
 /// pass inserts `CheckDecreaseHeight` calls via `Wp::Assert`
 /// which we recognize as Termination obligations. Other
 /// non-Plain kinds (LoopInvariant / CallPrecondition / etc.) are
-/// set explicitly at their wrapping sites in `lower_loop` /
-/// `lower_call`.
+/// set explicitly at their wrapping sites in `walk_loop` /
+/// `walk_call`.
 fn detect_assert_kind(e: &Exp) -> AssertKind {
     // Peel transparent wrappers (Box / Unbox / CoerceMode /
     // Trigger / Loc) — Verus may wrap the CheckDecreaseHeight
