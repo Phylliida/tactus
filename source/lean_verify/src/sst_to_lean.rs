@@ -762,8 +762,13 @@ fn lower_loop(
     // the rationale behind the literal `_tactus_d_old` name.
     let maintain_body_lowered = lower_wp(body, ctx);
     let maintain_core = LExpr::let_bind("_tactus_d_old", decrease_ast(), maintain_body_lowered);
+    // Wrap the loop condition with its span (#51) so failures
+    // that turn on cond evaluation point at the `while` header
+    // rather than the loop body. Same for the negated cond in
+    // the use clause below.
+    let cond_marked = |c: &Exp| LExpr::span_mark(format_rust_loc(&c.span), sst_exp_to_ast(c));
     let maintain_pre = match cond {
-        Some(c) => LExpr::and(inv_conj(), sst_exp_to_ast(c)),
+        Some(c) => LExpr::and(inv_conj(), cond_marked(c)),
         None => inv_conj(),
     };
     let maintain_clause = quantify_mod_vars(
@@ -781,7 +786,7 @@ fn lower_loop(
     // code feeds back correctly.
     let after_lowered = lower_wp(after, ctx);
     let use_pre = match cond {
-        Some(c) => LExpr::and(inv_conj(), LExpr::not(sst_exp_to_ast(c))),
+        Some(c) => LExpr::and(inv_conj(), LExpr::not(cond_marked(c))),
         None => inv_conj(),
     };
     let use_clause = quantify_mod_vars(
@@ -1697,28 +1702,8 @@ mod tests {
     /// semantic content, so semantic-equivalence tests should
     /// ignore them.
     fn pp_eq(a: &LExpr, b: &LExpr) -> bool {
-        let strip = |s: &str| -> String {
-            let mut out = String::new();
-            let mut rest = s;
-            while !rest.is_empty() {
-                if let Some(start) = rest.find("/- @rust:") {
-                    out.push_str(&rest[..start]);
-                    let after = &rest[start..];
-                    if let Some(end) = after.find(" -/ ") {
-                        rest = &after[end + " -/ ".len()..];
-                        continue;
-                    } else {
-                        // Unmatched marker — append rest verbatim.
-                        out.push_str(after);
-                        break;
-                    }
-                }
-                out.push_str(rest);
-                break;
-            }
-            out
-        };
-        strip(&crate::lean_pp::pp_expr(a)) == strip(&crate::lean_pp::pp_expr(b))
+        let pp = |e: &LExpr| crate::lean_pp::pp_expr(&crate::lean_ast::strip_span_marks(e));
+        pp(a) == pp(b)
     }
 
     // ── needs_peel ──────────────────────────────────────────────

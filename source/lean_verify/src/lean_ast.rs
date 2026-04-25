@@ -416,6 +416,91 @@ pub fn substitute(expr: &Expr, subst: &std::collections::HashMap<String, Expr>) 
     substitute_impl(expr, subst)
 }
 
+/// Recursively strip `ExprNode::SpanMark` wrappers from an
+/// expression tree, returning a structurally-equivalent tree
+/// with all source-mapping metadata removed. Used by tests
+/// (`pp_eq`) to compare semantic-equivalent expressions where
+/// one side carries `SpanMark` wrappers from `lower_wp` and the
+/// other doesn't. Strips are reasonable here because `SpanMark`
+/// is transparent at the Lean level — the wrapping affects only
+/// the pp output (a leading `/- @rust:LOC -/` comment) and the
+/// landmark side-channel, never semantics.
+pub fn strip_span_marks(expr: &Expr) -> Expr {
+    Expr::new(strip_span_marks_node(&expr.node))
+}
+
+fn strip_span_marks_node(node: &ExprNode) -> ExprNode {
+    match node {
+        ExprNode::SpanMark { inner, .. } => strip_span_marks_node(&inner.node),
+        ExprNode::Var(s) => ExprNode::Var(s.clone()),
+        ExprNode::Lit(s) => ExprNode::Lit(s.clone()),
+        ExprNode::LitBool(b) => ExprNode::LitBool(*b),
+        ExprNode::LitStr(s) => ExprNode::LitStr(s.clone()),
+        ExprNode::LitChar(c) => ExprNode::LitChar(*c),
+        ExprNode::Raw(s) => ExprNode::Raw(s.clone()),
+        ExprNode::BinOp { op, lhs, rhs } => ExprNode::BinOp {
+            op: *op,
+            lhs: Box::new(strip_span_marks(lhs)),
+            rhs: Box::new(strip_span_marks(rhs)),
+        },
+        ExprNode::UnOp { op, arg } => ExprNode::UnOp {
+            op: *op,
+            arg: Box::new(strip_span_marks(arg)),
+        },
+        ExprNode::App { head, args } => ExprNode::App {
+            head: Box::new(strip_span_marks(head)),
+            args: args.iter().map(strip_span_marks).collect(),
+        },
+        ExprNode::Let { name, value, body } => ExprNode::Let {
+            name: name.clone(),
+            value: Box::new(strip_span_marks(value)),
+            body: Box::new(strip_span_marks(body)),
+        },
+        ExprNode::Lambda { binders, body } => ExprNode::Lambda {
+            binders: binders.clone(),
+            body: Box::new(strip_span_marks(body)),
+        },
+        ExprNode::Forall { binders, body } => ExprNode::Forall {
+            binders: binders.clone(),
+            body: Box::new(strip_span_marks(body)),
+        },
+        ExprNode::Exists { binders, body } => ExprNode::Exists {
+            binders: binders.clone(),
+            body: Box::new(strip_span_marks(body)),
+        },
+        ExprNode::If { cond, then_, else_ } => ExprNode::If {
+            cond: Box::new(strip_span_marks(cond)),
+            then_: Box::new(strip_span_marks(then_)),
+            else_: else_.as_ref().map(|e| Box::new(strip_span_marks(e))),
+        },
+        ExprNode::Match { scrutinee, arms } => ExprNode::Match {
+            scrutinee: Box::new(strip_span_marks(scrutinee)),
+            arms: arms.iter().map(|a| MatchArm {
+                pattern: a.pattern.clone(),
+                body: strip_span_marks(&a.body),
+            }).collect(),
+        },
+        ExprNode::TypeAnnot { expr, ty } => ExprNode::TypeAnnot {
+            expr: Box::new(strip_span_marks(expr)),
+            ty: Box::new(strip_span_marks(ty)),
+        },
+        ExprNode::FieldProj { expr, field } => ExprNode::FieldProj {
+            expr: Box::new(strip_span_marks(expr)),
+            field: field.clone(),
+        },
+        ExprNode::StructUpdate { base, updates } => ExprNode::StructUpdate {
+            base: Box::new(strip_span_marks(base)),
+            updates: updates.iter().map(|(f, e)| (f.clone(), strip_span_marks(e))).collect(),
+        },
+        ExprNode::ArrayLit(es) => ExprNode::ArrayLit(es.iter().map(strip_span_marks).collect()),
+        ExprNode::Index { base, idx } => ExprNode::Index {
+            base: Box::new(strip_span_marks(base)),
+            idx: Box::new(strip_span_marks(idx)),
+        },
+        ExprNode::Anon(es) => ExprNode::Anon(es.iter().map(strip_span_marks).collect()),
+    }
+}
+
 fn substitute_impl(
     expr: &Expr,
     subst: &std::collections::HashMap<String, Expr>,

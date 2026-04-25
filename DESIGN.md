@@ -1123,6 +1123,18 @@ exec fns."
      Generic types skip this — would need `[Inhabited A]`
      bounds we don't thread.
 
+     **Future polish — accuracy:** we currently over-derive,
+     emitting `deriving Inhabited` on every non-generic datatype
+     even when no accessor's `default` fallback is reachable in
+     practice (e.g., a single-variant struct never needs the
+     fallback because its accessor is total). Lean's derive is
+     cheap and over-deriving is harmless, so this hasn't been a
+     problem; if/when we hit a datatype whose Inhabited
+     derivation Lean rejects (zero-variant enums, recursively-
+     uninhabitable shapes), narrow the gate to "emit only when
+     a multi-variant accessor with a non-Inhabited field type
+     exists."
+
   **Known interaction with #58 (match automation):** pinned by
   `test_exec_call_recursive_datatype_termination` — recursive
   enum fns compile, the termination obligation is emitted in
