@@ -2477,6 +2477,16 @@ test_verify_one_file! {
         }
     } => Err(err) => {
         assert!(err.errors.len() >= 1, "broken-invariant loop should be rejected");
+        // D Stage 5: the maintain failure should be labeled
+        // `(loop invariant)` — per-obligation theorem emission
+        // makes find_span_mark structurally exact for loops.
+        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("(loop invariant)")),
+            "expected (loop invariant) kind label on the failing \
+             obligation. got: {:?}",
+            msgs,
+        );
     }
 }
 
@@ -2810,6 +2820,18 @@ test_verify_one_file! {
              SpanMark instrumentation. got: {:?}",
             msgs,
         );
+        // D Stage 5: precondition failures get a (precondition)
+        // kind label. Per-obligation theorem emission isolates
+        // each call-site precondition into its own theorem, so
+        // find_span_mark returns the CallPrecondition mark
+        // (rather than confusing it with adjacent obligations
+        // like termination checks or call-ensures hyps).
+        assert!(
+            msgs.iter().any(|m| m.contains("(precondition)")),
+            "expected (precondition) kind label on the failing \
+             obligation. got: {:?}",
+            msgs,
+        );
     }
 }
 
@@ -2998,6 +3020,19 @@ test_verify_one_file! {
             "expected error to include a Rust source location \
              (`at <path>/test.rs:L:C:`) from #51 SpanMark instrumentation. \
              got: {:?}",
+            msgs,
+        );
+        // D Stage 5: per-obligation theorems give find_span_mark a
+        // structurally exact answer for AssertKind labels — the
+        // failing tactic's pos.line is inside exactly one
+        // theorem's `:= by` block, and the closest preceding mark
+        // is that theorem's obligation. For this fn the failure
+        // is the recursive call's CheckDecreaseHeight, which
+        // wraps with kind=Termination.
+        assert!(
+            msgs.iter().any(|m| m.contains("(termination)")),
+            "expected (termination) kind label on the failing \
+             obligation. got: {:?}",
             msgs,
         );
     }
@@ -3251,6 +3286,30 @@ test_verify_one_file! {
             proof {
                 have h : x + 1 <= 100 := by omega
             }
+            x + 1
+        }
+    } => Ok(())
+}
+
+// D Stage 6: proof-block `have`s should propagate to ALL obligation
+// theorems within the body's lexical scope. With per-obligation
+// theorem emission, each obligation theorem in scope gets the
+// proof-block tactic prefixed via `<;>`, so the `have h : P := by …`
+// introduces `h` for every theorem's closer. Without correct
+// propagation (D Stage 4), the final `assert(P)` after the proof
+// block would have no way to see `h_step`, and `tactus_auto` would
+// fail.
+test_verify_one_file! {
+    #[test] test_exec_proof_block_have_propagates_to_assert verus_code! {
+        #[verifier::tactus_auto]
+        fn use_have(x: u8) -> (r: u8)
+            requires x < 50
+            ensures r == x + 1
+        {
+            proof {
+                have h_step : x < 200 := by omega
+            }
+            assert(x < 200);
             x + 1
         }
     } => Ok(())
