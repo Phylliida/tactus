@@ -228,7 +228,6 @@ pub fn datatype_to_cmds(dt: &DatatypeX, emit_accessors: bool) -> Vec<Command> {
 /// comparing the underlying path — this matches how `typ_to_expr`
 /// renders field types at the Lean level (Box is transparent).
 fn height_fn_for_datatype(dt: &DatatypeX, path: &str) -> Option<Command> {
-    use crate::lean_ast::ExprNode;
     let dt_path = match &dt.name {
         Dt::Path(p) => p,
         Dt::Tuple(_) => return None,
@@ -237,69 +236,76 @@ fn height_fn_for_datatype(dt: &DatatypeX, path: &str) -> Option<Command> {
         return None;
     }
 
-    let x_binder = || LBinder {
-        name: Some("x".into()),
-        ty: LExpr::var(path),
-        kind: BinderKind::Explicit,
-    };
-
     let has_recursive_field = dt.variants.iter().any(|v|
         v.fields.iter().any(|f| field_is_self_recursive(&f.a.0, dt_path))
     );
 
-    let body = if has_recursive_field {
-        let arms: Vec<MatchArm> = dt.variants.iter().map(|v| {
-            let var_san = sanitize(&v.name);
-            let ctor_name = format!("{}.{}", path, var_san);
-            let mut pats = Vec::with_capacity(v.fields.len());
-            let mut recursive_binders: Vec<String> = Vec::new();
-            for (idx, f) in v.fields.iter().enumerate() {
-                if field_is_self_recursive(&f.a.0, dt_path) {
-                    let name = format!("_rec_{}", idx);
-                    pats.push(LPattern::Var(name.clone()));
-                    recursive_binders.push(name);
-                } else {
-                    pats.push(LPattern::Wildcard);
-                }
-            }
-            let mut arm_body = LExpr::lit_int("1");
-            for name in &recursive_binders {
-                arm_body = LExpr::add(
-                    arm_body,
-                    LExpr::app1(
-                        LExpr::var(&format!("{}.height", path)),
-                        LExpr::var(name),
-                    ),
-                );
-            }
-            MatchArm {
-                pattern: LPattern::Ctor { name: ctor_name, args: pats },
-                body: arm_body,
-            }
-        }).collect();
-        LExpr::new(ExprNode::Match {
-            scrutinee: Box::new(LExpr::var("x")),
-            arms,
-        })
-    } else {
-        LExpr::lit_int("1")
-    };
+    if !has_recursive_field {
+        // Non-recursive: simple constant fn. The match-on-binder
+        // form is fine here — there's no WF analysis needed.
+        return Some(Command::Def(Def {
+            attrs: vec!["simp".into()],
+            name: format!("{}.height", path),
+            binders: vec![LBinder {
+                name: Some("_".into()),
+                ty: LExpr::var(path),
+                kind: BinderKind::Explicit,
+            }],
+            ret_ty: LExpr::var("Nat"),
+            body: LExpr::lit_int("1"),
+            termination_by: vec![],
+        }));
+    }
 
-    Some(Command::Def(Def {
-        // `@[simp]`: `simp_all` in `tactus_auto` should unfold
-        // `Stack.height (Stack.Push n rest)` to `1 + Stack.height
-        // rest` so that the termination obligation produced by
-        // `CheckDecreaseHeight` can be closed after case analysis.
-        // Without this, the height call stays opaque and omega
-        // can't reason about structural subterms.
-        attrs: vec!["simp".into()],
-        name: format!("{}.height", path),
-        binders: vec![x_binder()],
-        ret_ty: LExpr::var("Nat"),
-        body,
-        termination_by: vec![],
-    }))
+    // Recursive: emit curried-form `def T.height : T → Nat | pat
+    // => body | ...` rather than the match-on-binder form. The
+    // curried form is the Lean-idiomatic shape for structural
+    // recursion — the equation compiler is designed around it,
+    // and WF analysis is more reliable when the recursion is
+    // expressed as direct equations rather than a match-on-
+    // binder. We assemble the Lean text directly via
+    // `Command::Raw` because the curried form has no
+    // counterpart in our `Def` AST shape (no `body: Expr`, just
+    // a list of equations with patterns); a one-off Raw
+    // emission is simpler than adding a new `Command::DefCurried`
+    // variant for this single use site.
+    use crate::lean_pp::{pp_expr, pp_pattern};
+    let mut text = String::new();
+    text.push_str("@[simp] noncomputable def ");
+    text.push_str(path);
+    text.push_str(".height : ");
+    text.push_str(path);
+    text.push_str(" → Nat\n");
+    for v in dt.variants.iter() {
+        let var_san = sanitize(&v.name);
+        let ctor_name = format!("{}.{}", path, var_san);
+        let mut pats = Vec::with_capacity(v.fields.len());
+        let mut recursive_binders: Vec<String> = Vec::new();
+        for (idx, f) in v.fields.iter().enumerate() {
+            if field_is_self_recursive(&f.a.0, dt_path) {
+                let name = format!("_rec_{}", idx);
+                pats.push(LPattern::Var(name.clone()));
+                recursive_binders.push(name);
+            } else {
+                pats.push(LPattern::Wildcard);
+            }
+        }
+        let mut arm_body = LExpr::lit_int("1");
+        for name in &recursive_binders {
+            arm_body = LExpr::add(
+                arm_body,
+                LExpr::app1(LExpr::var(&format!("{}.height", path)), LExpr::var(name)),
+            );
+        }
+        text.push_str("  | ");
+        text.push_str(&pp_pattern(&LPattern::Ctor { name: ctor_name, args: pats }));
+        text.push_str(" => ");
+        text.push_str(&pp_expr(&arm_body));
+        text.push('\n');
+    }
+    Some(Command::Raw(text))
 }
+
 
 /// Is `typ` a self-referential occurrence of the datatype at
 /// `self_path`? Peels `TypX::Boxed` and `TypX::Decorate` to
