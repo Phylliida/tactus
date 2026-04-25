@@ -454,18 +454,15 @@ fn walk_obligations<'a>(
 ) {
     match wp {
         Wp::Done(leaf) => {
-            // Terminal goal: the fn's ensures (top-level Done), or
-            // a loop body's `I ∧ D < d_old` (loop-body Done — Stage 3).
-            // Stage 1 sees only the top-level form because Loop/Call
-            // fall back; both lower the leaf identically.
-            let id = e.next_id();
-            let name = format!("_tactus_ensures_{}_{}", e.fn_name, id);
-            e.out.push(Theorem {
-                name,
-                binders: e.base_binders.clone(),
-                goal: obl.wrap(leaf.clone()),
-                tactic: simple_tactic(),
-            });
+            // Terminal goal: the fn's ensures conjunction (top-level
+            // Done) or a loop body's `I ∧ D < d_old` (loop-body Done
+            // emitted by `build_wp_loop`'s `continue_leaf`). Split
+            // top-level conjunctions into one theorem per conjunct so
+            // each clause has its own pos.line in Lean — gets the
+            // AssertKind exactly right when the conjuncts carry
+            // different SpanMark wrappings (LoopInvariant /
+            // LoopDecrease for loop-body terminators).
+            emit_done_or_split(leaf, obl, e);
         }
         Wp::Assert(asserted, body) => {
             // Emit one theorem for this assertion. The asserted
@@ -526,12 +523,162 @@ fn walk_obligations<'a>(
         Wp::Call { callee, args, typ_args, dest, call_span, after } => {
             walk_call(callee, args, typ_args, *dest, call_span, after, ctx, obl, e);
         }
-        // Stages 3-4: emit one theorem covering the whole subtree
-        // wrapped in the current obligation context. Stage 3 (Loop)
-        // and Stage 4 (AssertByTactus) replace this fallback with
-        // per-variant walkers.
-        Wp::Loop { .. } | Wp::AssertByTactus { .. } => {
+        Wp::Loop { cond, invs, decrease, modified_vars, body, after } => {
+            walk_loop(*cond, invs, decrease, modified_vars, body, after, ctx, obl, e);
+        }
+        // Stage 4: emits one theorem covering the whole subtree
+        // wrapped in the current obligation context. Stage 4
+        // (AssertByTactus) replaces this fallback with its own
+        // per-variant walker.
+        Wp::AssertByTactus { .. } => {
             emit_subtree_fallback(wp, ctx, obl, e);
+        }
+    }
+}
+
+/// Emit one or more theorems for a `Wp::Done` leaf. If the leaf is
+/// a top-level conjunction, recursively split into one theorem per
+/// conjunct. Each conjunct preserves its own `SpanMark` wrapping
+/// (if any), so loop-body terminators (`(I_1 ∧ I_2 ∧ ...) ∧
+/// D < d_old`) yield separate `LoopInvariant_*` / `LoopDecrease_*`
+/// theorems with the right kind in each name. Top-level fn-ensures
+/// terminators (no SpanMark wrapping) yield `_tactus_ensures_N`
+/// per clause.
+fn emit_done_or_split(leaf: &LExpr, obl: &OblCtx, e: &mut ObligationEmitter) {
+    use crate::lean_ast::{BinOp, ExprNode};
+    if let ExprNode::BinOp { op: BinOp::And, lhs, rhs } = &leaf.node {
+        emit_done_or_split(lhs, obl, e);
+        emit_done_or_split(rhs, obl, e);
+        return;
+    }
+    let id = e.next_id();
+    let (kind_label, loc) = match &leaf.node {
+        ExprNode::SpanMark { rust_loc, kind, .. } => {
+            (kind_to_name(*kind), rust_loc.clone())
+        }
+        // Unwrapped → top-level fn ensures clause. Use "ensures"
+        // rather than `kind_to_name(Plain)` ("assert") since the
+        // theorem isn't an explicit `assert(P)`.
+        _ => ("ensures", String::new()),
+    };
+    let name = if loc.is_empty() {
+        format!("_tactus_{}_{}_{}", kind_label, e.fn_name, id)
+    } else {
+        let suffix = sanitize_loc_for_name(&loc);
+        format!("_tactus_{}_{}_at_{}_{}", kind_label, e.fn_name, suffix, id)
+    };
+    e.out.push(Theorem {
+        name,
+        binders: e.base_binders.clone(),
+        goal: obl.wrap(leaf.clone()),
+        tactic: simple_tactic(),
+    });
+}
+
+/// Per-obligation walker for `Wp::Loop`. Emits init theorems (one
+/// per invariant), walks the body in a maintain context, and walks
+/// `after` in a use context. Per-obligation equivalent of
+/// [`lower_loop`]'s `init ∧ maintain ∧ use` conjunctive form —
+/// splitting it so each invariant's init/maintain check, the
+/// decrease-decreased check, and the post-loop continuation get
+/// their own pos.line in Lean.
+///
+/// The body's `Done(I ∧ D < d_old)` terminator (built by
+/// `build_wp_loop`) flows naturally through `walk_obligations`'s
+/// `Wp::Done` arm via [`emit_done_or_split`], producing one
+/// theorem per conjunct (each invariant + the decrease).
+fn walk_loop<'a>(
+    cond: Option<&Exp>,
+    invs: &[LoopInv],
+    decrease: &Exp,
+    modified_vars: &[(&'a VarIdent, &'a Typ)],
+    body: &Wp<'a>,
+    after: &Wp<'a>,
+    ctx: &WpCtx<'a>,
+    obl: &OblCtx,
+    e: &mut ObligationEmitter,
+) {
+    // Build the SpanMark-wrapped invariants & decrease & cond once;
+    // reused for init theorems, maintain hyps, use hyps.
+    let inv_marked = |i: &LoopInv| LExpr::span_mark(
+        format_rust_loc(&i.inv.span),
+        AssertKind::LoopInvariant,
+        sst_exp_to_ast(&i.inv),
+    );
+    let cond_marked = |c: &Exp| LExpr::span_mark(
+        format_rust_loc(&c.span),
+        AssertKind::LoopCondition,
+        sst_exp_to_ast(c),
+    );
+    let inv_conj_marked = and_all(invs.iter().map(inv_marked).collect());
+
+    // ── Init: one theorem per invariant. The invariant must hold at
+    // loop entry given the current obligation context (no body
+    // execution yet).
+    for inv in invs {
+        let id = e.next_id();
+        let loc = format_rust_loc(&inv.inv.span);
+        let suffix = sanitize_loc_for_name(&loc);
+        let name = format!(
+            "_tactus_loop_invariant_{}_at_{}_{}", e.fn_name, suffix, id,
+        );
+        e.out.push(Theorem {
+            name,
+            binders: e.base_binders.clone(),
+            goal: obl.wrap(inv_marked(inv)),
+            tactic: simple_tactic(),
+        });
+    }
+
+    // ── Maintain: walk body with ∀ mod_vars + bounds + invs as
+    // hyps + cond as hyp + `_tactus_d_old := D` let. The body's
+    // Done leaf (= `inv_conj ∧ decrease_marked`) splits into one
+    // theorem per invariant + one for the decrease via
+    // `emit_done_or_split`.
+    let mut maintain_obl = obl.clone();
+    push_mod_var_frames(&mut maintain_obl, modified_vars);
+    maintain_obl.frames.push(CtxFrame::Hyp(inv_conj_marked.clone()));
+    if let Some(c) = cond {
+        maintain_obl.frames.push(CtxFrame::Hyp(cond_marked(c)));
+    }
+    // `let _tactus_d_old := D` — pre-body decrease value, referenced
+    // by the body's continue_leaf as `D < _tactus_d_old`. Must come
+    // AFTER the cond hyp (which doesn't reference `_tactus_d_old`)
+    // but BEFORE walking the body (which does).
+    maintain_obl.frames.push(CtxFrame::Let(
+        "_tactus_d_old".to_string(),
+        sst_exp_to_ast(decrease),
+    ));
+    walk_obligations(body, ctx, &maintain_obl, e);
+
+    // ── Use: walk `after` with ∀ mod_vars + bounds + invs as hyps
+    // + ¬cond as hyp. No `_tactus_d_old` here — the decrease
+    // obligation only applies to fall-through inside the body.
+    let mut use_obl = obl.clone();
+    push_mod_var_frames(&mut use_obl, modified_vars);
+    use_obl.frames.push(CtxFrame::Hyp(inv_conj_marked));
+    if let Some(c) = cond {
+        use_obl.frames.push(CtxFrame::Hyp(LExpr::not(cond_marked(c))));
+    }
+    walk_obligations(after, ctx, &use_obl, e);
+}
+
+/// Push one `∀ x : T` binder + optional `bound →` hyp per modified
+/// variable. Called by `walk_loop` for both maintain and use ctx
+/// builds — same shape both times.
+fn push_mod_var_frames<'a>(
+    obl: &mut OblCtx,
+    modified_vars: &[(&'a VarIdent, &'a Typ)],
+) {
+    for (ident, typ) in modified_vars {
+        let name = sanitize(&ident.0);
+        obl.frames.push(CtxFrame::Binder(LBinder {
+            name: Some(name.clone()),
+            ty: typ_to_expr(typ),
+            kind: BinderKind::Explicit,
+        }));
+        if let Some(pred) = type_bound_predicate(&LExpr::var(name), typ) {
+            obl.frames.push(CtxFrame::Hyp(pred));
         }
     }
 }
@@ -1840,11 +1987,23 @@ fn build_wp_loop<'a>(
     //   equals `I` (we only accept invariants with at_entry = at_exit
     //   = true — see validation above). No decrease obligation on
     //   break since we're leaving the loop, not iterating.
-    let inv_conj = and_all(invs.iter().map(|i| sst_exp_to_ast(&i.inv)).collect());
-    let continue_leaf = LExpr::and(
-        inv_conj.clone(),
+    // Wrap each invariant + the decrease comparison with a SpanMark
+    // carrying the right `AssertKind`. When the per-obligation walker
+    // (D Stage 3) splits a body's terminator at top-level conjunction,
+    // each leaf retains its kind for theorem naming. Without these
+    // wrappers, every conjunct would be labeled `ensures` (the
+    // unwrapped default in `emit_done_or_split`).
+    let inv_conj = and_all(invs.iter().map(|i| LExpr::span_mark(
+        format_rust_loc(&i.inv.span),
+        AssertKind::LoopInvariant,
+        sst_exp_to_ast(&i.inv),
+    )).collect());
+    let decrease_marked = LExpr::span_mark(
+        format_rust_loc(&decrease_exp.span),
+        AssertKind::LoopDecrease,
         LExpr::lt(sst_exp_to_ast(decrease_exp), LExpr::var("_tactus_d_old")),
     );
+    let continue_leaf = LExpr::and(inv_conj.clone(), decrease_marked);
     let break_leaf = inv_conj;
     let inner_loop_ctx = WpLoopCtx {
         break_leaf: break_leaf.clone(),
