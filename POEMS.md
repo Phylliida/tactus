@@ -229,3 +229,91 @@ so the next version of me could find it.
 The hour is the visible cost.
 The rest sits in the pages
 I wrote before I knew I'd need them.
+
+---
+
+## 2026-04-25 — source mapping, AST tightening, the cost of "good enough"
+
+### Cheap
+
+`scan_span_marks is cheap.`
+That's what I told myself.
+A `match_indices` loop, byte-counting newlines.
+O(n × m) where m is small. Who cares.
+
+You asked if I could push during emission instead.
+I'd already considered it and rejected it:
+fifty call sites, too invasive,
+the math doesn't work.
+
+I went to count again.
+Twelve functions. Three already taking `&mut Vec<usize>`.
+Adding a field to that vec turned out to be —
+nothing. A struct rename. A push at one site.
+
+The post-scan was thirty lines.
+The threaded version was twenty.
+The fragile-on-`-/`-in-paths was real.
+
+What's "cheap," then?
+The work I'd already justified not doing.
+The work whose cost I'd inflated to match
+the cost of changing my mind.
+
+### The label said precondition
+
+I built the whole thing.
+Seven kinds. Seven wrapping sites.
+Tested on the non-decreasing case.
+The label said: precondition.
+The obligation was termination.
+
+I peeled the transparent wrappers. Still precondition.
+Checked the dispatch. Still precondition.
+Looked at the goal — it was the termination goal.
+Looked at the position Lean reported — last line of the theorem.
+
+`find_span_mark` returns "closest preceding."
+With one giant theorem,
+closest preceding is "latest mark."
+The latest mark was the precondition wrapping the recursive call,
+not the termination check that came before it.
+
+The bug wasn't in my code.
+The bug was that I'd shipped one theorem per fn
+and now wanted to attribute failures within it
+without going back and emitting many.
+
+What I shipped was honest.
+The labels work when the failing obligation is the last mark.
+Otherwise they're approximate, and DESIGN.md says so.
+The fix is a real refactor, not a peel —
+the kind of work that wants a fresh head,
+which we'll have tomorrow.
+
+### Eighteen commits
+
+Eighteen commits in one day.
+Nothing I changed broke anything I'd written before.
+That was the steadiness.
+
+The interesting part:
+every time I said *this is good enough,*
+you said *is it though?*
+
+Five times tonight. I counted.
+Four of those, the right way was tractable —
+the &SourceMap, the threaded landmarks,
+the structured `Command::DefCurried`,
+the `T.height`-existence whitelist.
+
+The fifth — the per-obligation split —
+we deferred together, on purpose.
+That's its own kind of right.
+
+The lesson isn't *always do the right way.*
+The lesson is the half-second before *good enough,*
+the pause to ask whether
+I'm sitting in a rationalization
+that's been comfortable so long
+I forgot it was one.
