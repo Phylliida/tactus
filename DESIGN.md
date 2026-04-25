@@ -1021,31 +1021,45 @@ exec fns."
   tactus_auto fns, but the obligation is Lean's job).
 
 * **Source mapping for exec-fn errors — LANDED (#51).**
-  `Wp::Assert(e, …)` wraps its asserted expression in
-  `ExprNode::SpanMark { rust_loc, inner }` using `e.span`
-  (formatted via `format_rust_loc` to `path:line:col`). The pp
-  emits `/- @rust:LOC -/` regular block comments before the
-  inner expression — transparent at the Lean level. After
-  rendering, `scan_span_marks` does a single pass over the
-  output building `(lean_line, rust_loc)` pairs; these land
-  in `LeanSourceMap::span_marks`. On Lean error, `format_error`
-  calls `find_rust_loc(pos.line)` to surface the closest
-  preceding mark as `at <path>:L:C:` in the error body. Users
-  see the Rust location of the failing obligation rather than
-  just the fn declaration.
+  `lower_wp` and friends wrap obligation expressions in
+  `ExprNode::SpanMark { rust_loc, kind, inner }`. `rust_loc`
+  is the pre-resolved `path:line:col` from the SST `Span`
+  (populated by `rust_verify::spans::to_air_span` via
+  `SourceMap.lookup_char_pos`). `kind: AssertKind` carries
+  the obligation's semantic class — `Plain`, `LoopInvariant`,
+  `LoopDecrease`, `LoopCondition`, `BranchCondition`,
+  `CallPrecondition`, or `Termination`.
 
-  Why block comments in the output vs. a pure-metadata side
-  channel: comments are visible in the generated `.lean` file,
-  which doubles as debug aid when users `cat` the file.
-  `/- ... -/` (not `/-! ... -/`) is used — `/-!` is Lean's
-  module-docstring marker and isn't valid inline.
+  The pp emits `/- @rust:LOC -/` regular block comments before
+  the inner expression (visible debug aid in the generated
+  `.lean` file) AND records `SpanMarkLandmark { line, loc, kind
+  }` in `Landmarks::span_marks` directly during emission. On
+  Lean error, `format_error` calls `find_span_mark(pos.line)`
+  to surface the closest preceding landmark as
+  `at <path>:L:C (<kind label>):` in the error body.
 
-  Coverage: only `Wp::Assert` is wrapped today. `Wp::Branch`,
-  `Wp::Loop`, `Wp::Call`, etc. could also carry source
-  locations; not wired because assertions are the most
-  frequent failure site and incremental wrapping is easy.
-  Paths containing `-/` would break the comment (very unlikely
-  given Verus's `Span::as_string` format).
+  Coverage: `Wp::Assert` (Plain or Termination by detection),
+  `Wp::Branch.cond`, `Wp::Loop.invs` / `decrease` / `cond`,
+  `Wp::Call` (call-site requires_conj). Loop body / call
+  continuation use the inner `Wp::Assert` marks recursively.
+
+  **Known imperfection: position-of-mark vs position-of-failure.**
+  Lean's diagnostic `pos.line` reports where the failing
+  *tactic* invocation is (typically the line of `tactus_peel;
+  all_goals tactus_auto` near the end of the theorem), not the
+  line of the failing obligation expression in the goal tree.
+  `find_span_mark` returns the closest preceding landmark to
+  that tactic line — usually the LAST mark in the theorem.
+  When the failing obligation is also the last mark, the
+  reported `loc` and `kind` are exactly right. When the
+  failing obligation is earlier in the goal tree (e.g., a
+  Termination check on a recursive fn whose call also has a
+  precondition mark afterward), `find_span_mark` returns a
+  mark that's structurally adjacent but not the actual one.
+  The Rust file:line:col is still in the right neighborhood,
+  but the kind label may be one off. The architectural fix
+  is per-obligation theorem emission (each Lean theorem
+  gets its own `pos.line`) — see "future work" notes.
 
 ##### Tier 2 — realistic-code unblockers (2–4 days each)
 
