@@ -1057,9 +1057,11 @@ exec fns."
   precondition mark afterward), `find_span_mark` returns a
   mark that's structurally adjacent but not the actual one.
   The Rust file:line:col is still in the right neighborhood,
-  but the kind label may be one off. The architectural fix
-  is per-obligation theorem emission (each Lean theorem
-  gets its own `pos.line`) — see "future work" notes.
+  but the kind label may be one off. The architectural fix is
+  **task D** in HANDOFF.md "Pending work" — per-obligation
+  theorem emission (each Lean theorem gets its own
+  `pos.line`, so the kind label becomes exactly right by
+  construction).
 
 ##### Tier 2 — realistic-code unblockers (2–4 days each)
 
