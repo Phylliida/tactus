@@ -1404,7 +1404,7 @@ pub(crate) fn expr_to_vir_with_adjustments<'tcx>(
                             let x = ExprX::ImplicitReborrowOrSpecRead(
                                 p.clone(),
                                 b,
-                                bctx.ctxt.spans.to_air_span(expr.span),
+                                bctx.ctxt.to_air_span(expr.span),
                             );
                             let typ = bctx.mid_ty_to_vir(expr.span, &adjustment.target, false)?;
                             let e = bctx.spanned_typed_new(expr.span, &typ, x);
@@ -2204,7 +2204,7 @@ pub(crate) fn expr_to_vir_innermost<'tcx>(
 
                         // non-static calls are translated into a static call to
                         // `exec_nonstatic_call` which is defined in the vstd lib.
-                        let span = bctx.ctxt.spans.to_air_span(expr.span.clone());
+                        let span = bctx.ctxt.to_air_span(expr.span.clone());
                         let tup = vir::ast_util::mk_tuple(&span, &Arc::new(vir_args));
                         let helper_fun =
                             vir::def::nonstatic_call_fun(&bctx.ctxt.vstd_crate_name, is_proof_fun);

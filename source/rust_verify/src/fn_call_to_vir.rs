@@ -651,7 +651,7 @@ fn verus_item_to_vir<'tcx, 'a>(
                             Arc::new(HeaderExprX::Recommends(Arc::new(vir_args)))
                         }
                         SpecItem::OpensInvariants => Arc::new(HeaderExprX::InvariantOpens(
-                            bctx.ctxt.spans.to_air_span(expr.span.clone()),
+                            bctx.ctxt.to_air_span(expr.span.clone()),
                             Arc::new(vir_args),
                         )),
                         SpecItem::Returns => Arc::new(HeaderExprX::Returns(vir_args[0].clone())),
@@ -669,7 +669,7 @@ fn verus_item_to_vir<'tcx, 'a>(
                 SpecItem::OpensInvariantsNone => {
                     record_spec_fn_pure_args_only(bctx, expr);
                     let header = Arc::new(HeaderExprX::InvariantOpens(
-                        bctx.ctxt.spans.to_air_span(expr.span.clone()),
+                        bctx.ctxt.to_air_span(expr.span.clone()),
                         Arc::new(Vec::new()),
                     ));
                     mk_expr(ExprX::Header(header))
@@ -677,7 +677,7 @@ fn verus_item_to_vir<'tcx, 'a>(
                 SpecItem::OpensInvariantsAny => {
                     record_spec_fn_pure_args_only(bctx, expr);
                     let header = Arc::new(HeaderExprX::InvariantOpensExcept(
-                        bctx.ctxt.spans.to_air_span(expr.span.clone()),
+                        bctx.ctxt.to_air_span(expr.span.clone()),
                         Arc::new(Vec::new()),
                     ));
                     mk_expr(ExprX::Header(header))

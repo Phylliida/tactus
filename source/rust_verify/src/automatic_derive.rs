@@ -171,13 +171,13 @@ fn cleanup_span_ids<'tcx>(ctxt: &Context<'tcx>, span: Span, hir_id: HirId, expr:
     vir::ast_visitor::map_expr_place_visitor(
         expr,
         &|e: &Expr| {
-            let e = ctxt.spans.spanned_typed_new(span, &e.typ, e.x.clone());
+            let e = ctxt.spanned_typed_new(span, &e.typ, e.x.clone());
             let mut erasure_info = ctxt.erasure_info.borrow_mut();
             erasure_info.hir_vir_ids.push((hir_id, e.span.id));
             Ok(e)
         },
         &|p: &Place| {
-            let p = ctxt.spans.spanned_typed_new(span, &p.typ, p.x.clone());
+            let p = ctxt.spanned_typed_new(span, &p.typ, p.x.clone());
             let mut erasure_info = ctxt.erasure_info.borrow_mut();
             erasure_info.hir_vir_ids.push((hir_id, p.span.id));
             Ok(p)
