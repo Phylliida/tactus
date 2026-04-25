@@ -272,11 +272,12 @@ fn check_exp(e: &Exp) -> Result<(), String> {
 /// by construction rather than guessed via a closest-preceding-mark
 /// heuristic on a single mega-theorem (task D in HANDOFF).
 ///
-/// Stage 1 (this commit): `Wp::Done` / `Assert` / `Let` / `Assume` /
-/// `Branch` walked per-obligation. `Wp::Loop` / `Call` /
-/// `AssertByTactus` fall back to a single theorem covering the
-/// subtree (Stages 2-4 will replace each fallback with its own
-/// per-obligation expansion).
+/// Stages so far: D Stage 1 walks `Wp::Done` / `Assert` / `Let` /
+/// `Assume` / `Branch` per-obligation. D Stage 2 walks `Wp::Call`
+/// — emitting one theorem for the call's precondition and continuing
+/// with the substituted ensures as a hypothesis. `Wp::Loop` /
+/// `AssertByTactus` still fall back to a single subtree theorem
+/// (Stages 3-4 will replace each).
 ///
 /// Returns `Err` if any part of `check` uses an SST form we don't know
 /// how to emit. Validation and AST construction share a single pass
@@ -340,10 +341,9 @@ enum CtxFrame {
     /// assertions that already passed (the asserted condition
     /// becomes a hypothesis for the rest of the body).
     Hyp(LExpr),
-    /// `∀ (x : T),` wrapping. Currently unused in Stage 1 — Stage
-    /// 3's loop walker pushes one per modified variable when
-    /// emitting maintain/use clauses.
-    #[allow(dead_code)]
+    /// `∀ (x : T),` wrapping. Stage 2's call walker pushes one
+    /// for the callee's return value; Stage 3's loop walker will
+    /// push one per modified variable.
     Binder(LBinder),
 }
 
@@ -523,16 +523,111 @@ fn walk_obligations<'a>(
                 e,
             );
         }
-        // Stages 2-4: emit one theorem covering the whole subtree
-        // wrapped in the current obligation context. This is the
-        // pre-D single-theorem behaviour, scoped to whatever path
-        // led here; Stage 2 (Call), Stage 3 (Loop), and Stage 4
-        // (AssertByTactus) each replace one of these fallbacks
-        // with its own per-obligation walker.
-        Wp::Loop { .. } | Wp::Call { .. } | Wp::AssertByTactus { .. } => {
+        Wp::Call { callee, args, typ_args, dest, call_span, after } => {
+            walk_call(callee, args, typ_args, *dest, call_span, after, ctx, obl, e);
+        }
+        // Stages 3-4: emit one theorem covering the whole subtree
+        // wrapped in the current obligation context. Stage 3 (Loop)
+        // and Stage 4 (AssertByTactus) replace this fallback with
+        // per-variant walkers.
+        Wp::Loop { .. } | Wp::AssertByTactus { .. } => {
             emit_subtree_fallback(wp, ctx, obl, e);
         }
     }
+}
+
+/// Per-obligation walker for `Wp::Call`. Emits one theorem for the
+/// callee's precondition (substituted with call-site args), then
+/// continues walking `after` with the extended context: a `∀ ret`
+/// binder, the ret's type-bound hypothesis (if any), the callee's
+/// substituted `ensures` as a hypothesis, and a `let dest := ret`
+/// if the call has a destination var. Per-obligation equivalent of
+/// [`lower_call`]'s
+/// `requires ∧ ∀ ret, bound → ensures → let dest := ret; <after>`
+/// shape — splitting it into a precondition theorem (Lean checks
+/// `requires`) plus a richer context for the continuation (which
+/// produces its own theorems via the recursive walk).
+fn walk_call<'a>(
+    callee: &FunctionX,
+    args: &[Exp],
+    typ_args: &[Typ],
+    dest: Option<&VarIdent>,
+    call_span: &Span,
+    after: &Wp<'a>,
+    ctx: &WpCtx<'a>,
+    obl: &OblCtx,
+    e: &mut ObligationEmitter,
+) {
+    // Substitution map combining value params → call-site args and
+    // type params → call-site type expressions. Mirrors `lower_call`
+    // exactly so the per-obligation form produces the same logical
+    // content as the prior single-theorem form. `TypParam(T)` renders
+    // as `Var("T")` so the value-level substitute rewrites both kinds.
+    let params_vec: Vec<_> = callee.params.iter().collect();
+    let mut subst: std::collections::HashMap<String, LExpr> = params_vec.iter()
+        .zip(args.iter())
+        .map(|(p, arg)| (sanitize(&p.x.name.0), sst_exp_to_ast(arg)))
+        .collect();
+    for (tp_name, tp_arg) in callee.typ_params.iter().zip(typ_args.iter()) {
+        subst.insert(sanitize(tp_name), typ_to_expr(tp_arg));
+    }
+
+    // Precondition theorem: substitute requires with subst, wrap in a
+    // SpanMark with the call-site span (NOT the callee's source) so
+    // a failing precondition surfaces the call in the caller's source
+    // — same rationale as `lower_call`'s requires_clause wrapping.
+    let requires_conj = and_all(
+        callee.require.iter().map(|e| vir_expr_to_ast(e)).collect()
+    );
+    let loc = format_rust_loc(call_span);
+    let requires_clause = LExpr::span_mark(
+        loc.clone(),
+        AssertKind::CallPrecondition,
+        substitute(&requires_conj, &subst),
+    );
+    let id = e.next_id();
+    let suffix = sanitize_loc_for_name(&loc);
+    let theorem_name = format!(
+        "_tactus_precondition_{}_at_{}_{}", e.fn_name, suffix, id,
+    );
+    e.out.push(Theorem {
+        name: theorem_name,
+        binders: e.base_binders.clone(),
+        goal: obl.wrap(requires_clause),
+        tactic: simple_tactic(),
+    });
+
+    // Continuation: walk `after` under a fresh context that pushes
+    // the post-call binders/hypotheses/lets in the same order
+    // `lower_call` would have nested them. Reading the resulting
+    // wrap from outermost to innermost: `∀ ret, ret_bound → ensures
+    // → let dest := ret; <continuation>`.
+    let ret = &callee.ret.x;
+    let ret_name_cal = sanitize(&ret.name.0);
+    let ret_typ = substitute(&typ_to_expr(&ret.typ), &subst);
+    let ensures_conj = and_all(
+        callee.ensure.0.iter().map(|e| vir_expr_to_ast(e)).collect()
+    );
+    let substituted_ensures = substitute(&ensures_conj, &subst);
+
+    let mut new_obl = obl.clone();
+    new_obl.frames.push(CtxFrame::Binder(LBinder {
+        name: Some(ret_name_cal.clone()),
+        ty: ret_typ,
+        kind: BinderKind::Explicit,
+    }));
+    if let Some(pred) = type_bound_predicate(&LExpr::var(ret_name_cal.clone()), &ret.typ) {
+        new_obl.frames.push(CtxFrame::Hyp(pred));
+    }
+    new_obl.frames.push(CtxFrame::Hyp(substituted_ensures));
+    if let Some(dest_ident) = dest {
+        new_obl.frames.push(CtxFrame::Let(
+            sanitize(&dest_ident.0),
+            LExpr::var(ret_name_cal),
+        ));
+    }
+
+    walk_obligations(after, ctx, &new_obl, e);
 }
 
 /// `Wp::Let` walker with if-RHS lifting (mirrors `lift_if_value`'s
