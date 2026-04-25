@@ -87,7 +87,7 @@ pub(crate) fn process_const_early<'tcx>(
         };
         let size = size.get();
 
-        vir::layout::layout_of_typ_supported(&ty, &ctxt.spans.to_air_span(item.span))?;
+        vir::layout::layout_of_typ_supported(&ty, &ctxt.to_air_span(item.span))?;
 
         match typs_sizes_set.entry(TypIgnoreImplPaths(ty.clone())) {
             std::collections::hash_map::Entry::Occupied(_occ) => {

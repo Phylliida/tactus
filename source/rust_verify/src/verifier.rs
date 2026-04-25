@@ -3599,6 +3599,7 @@ impl rustc_driver::Callbacks for VerifierCallbacksEraseMacro {
                 };
                 crate::trait_check::check_trait_conflicts(
                     &spans,
+                    compiler.sess.source_map(),
                     self.verifier.vir_crate.as_ref().expect("vir_crate should be initialized"),
                     tc_log_file,
                 )

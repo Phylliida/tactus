@@ -174,6 +174,7 @@ fn main() {}
 
 fn emit_check_trait_conflicts<'tcx>(
     spans: &SpanContext,
+    source_map: &rustc_span::source_map::SourceMap,
     emit_state: &mut EmitState,
     vir_crate: &vir::ast::Krate,
 ) -> State {
@@ -256,11 +257,12 @@ pub fn trait_check_rustc_driver(rustc_args: &[String], rust_code: String) {
 
 pub(crate) fn check_trait_conflicts<'tcx>(
     spans: &SpanContext,
+    source_map: &rustc_span::source_map::SourceMap,
     vir_crate: &vir::ast::Krate,
     tc_log_file: Option<File>,
 ) -> Result<Vec<Message>, VirErr> {
     let mut emit_state = EmitState::new();
-    let gen_state = emit_check_trait_conflicts(spans, &mut emit_state, vir_crate);
+    let gen_state = emit_check_trait_conflicts(spans, source_map, &mut emit_state, vir_crate);
     let mut rust_code: String = String::new();
     for line in &emit_state.lines {
         rust_code.push_str(&line.text);
@@ -323,7 +325,7 @@ pub(crate) fn check_trait_conflicts<'tcx>(
                         dspan.column_end - 1,
                     );
                     if let Some(span) = span {
-                        msg = msg.primary_span(&spans.to_air_span(span));
+                        msg = msg.primary_span(&spans.to_air_span(span, source_map));
                     } else {
                         eprintln!(
                             "note: could not find span associated with error message; printing raw error message instead"

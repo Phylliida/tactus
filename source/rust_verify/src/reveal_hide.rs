@@ -120,7 +120,7 @@ pub(crate) fn handle_reveal_hide<'ctxt>(
     let ExprKind::Lit(fuel_lit) = args[1].kind else {
         unsupported_err!(expr.span, "invalid reveal", &args);
     };
-    let span = &ctxt.spans.to_air_span(expr.span);
+    let span = &ctxt.to_air_span(expr.span);
     let rustc_ast::LitKind::Int(fuel_val, rustc_ast::LitIntType::Unsuffixed) = fuel_lit.node else {
         return Err(vir::messages::error(span, "Fuel must be a u32 value"));
     };

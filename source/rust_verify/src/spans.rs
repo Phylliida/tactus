@@ -295,27 +295,48 @@ impl SpanContextX {
         self.next_span_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
-    pub(crate) fn to_air_span(&self, span: Span) -> vir::messages::Span {
+    /// Build a `vir::messages::Span` from a rustc `Span`, using
+    /// `source_map` to pre-resolve the start position into a
+    /// structured `file:line:col` (`start_loc` field) for
+    /// `lean_verify`'s error formatter (#51).
+    ///
+    /// Takes `source_map` by reference because `SourceMap` isn't
+    /// `Sync` — storing `Arc<SourceMap>` in `SpanContextX` would
+    /// break `Send` for `Arc<SpanContextX>`. References are the
+    /// right tool when the lifetime is bounded by the rustc
+    /// session: callers fetch via `tcx.sess.source_map()` and
+    /// the borrow is valid for the whole compilation.
+    pub(crate) fn to_air_span(&self, span: Span, source_map: &SourceMap)
+        -> vir::messages::Span
+    {
         let raw_span = to_raw_span(span);
-
         let id = self.get_next_span_id();
         let data = self.pack_span(span);
         let as_string = format!("{:?}", span);
-        // Pre-resolve the start position into a structured
-        // `file:line:col` for `lean_verify`'s error formatter
-        // (#51). Parses `as_string` here on the rust_verify side
-        // — the format is `format!("{:?}", rustc::Span)` which
-        // produces `path:lo_line:lo_col: hi_line:hi_col (#N)`, so
-        // we cut at the first `": "`. We don't store
-        // `Arc<SourceMap>` and call `lookup_char_pos` directly
-        // because `SourceMap` isn't `Sync`, and `SpanContextX` is
-        // shared across threads via `Arc`. Same parsing as before
-        // but done ONCE here, in the crate that owns the
-        // formatting choice — `lean_verify` reads the structured
-        // field directly.
-        let start_loc = match as_string.find(": ") {
-            Some(idx) => as_string[..idx].to_string(),
-            None => as_string.clone(),
+        // Direct SourceMap lookup — no string parsing. Format is
+        // `<filename>:<line>:<col>` of the start position. The
+        // file path comes from rustc's `FileName::prefer_local`
+        // (which gives the user-visible Unix path on local
+        // builds, matching what rustc itself reports). For
+        // synthetic spans without a source position
+        // (`span.is_dummy()`), leave `start_loc` empty so
+        // `lean_verify` falls back to `as_string`.
+        let start_loc = if span.is_dummy() {
+            String::new()
+        } else {
+            let loc = source_map.lookup_char_pos(span.lo());
+            // Render filename via the FileName::Real path (mirrors
+            // `rust_to_vir_func.rs::tactic_span` handling). Other
+            // FileName variants (synthetic, anon) fall back to
+            // empty so lean_verify uses `as_string`.
+            let filename = match &loc.file.name {
+                FileName::Real(real) => real.local_path().and_then(|p| p.to_str().map(str::to_owned)),
+                _ => None,
+            };
+            match filename {
+                Some(f) => format!("{}:{}:{}", f, loc.line, loc.col.0 + 1),
+                None => String::new(),
+            }
         };
         vir::messages::Span { raw_span, id, data, as_string, start_loc }
     }
@@ -332,22 +353,35 @@ impl SpanContextX {
         }
     }
 
-    pub(crate) fn spanned_new<X>(&self, span: Span, x: X) -> Arc<Spanned<X>> {
-        Spanned::new(self.to_air_span(span), x)
+    pub(crate) fn spanned_new<X>(&self, span: Span, source_map: &SourceMap, x: X)
+        -> Arc<Spanned<X>>
+    {
+        Spanned::new(self.to_air_span(span, source_map), x)
     }
 
-    pub(crate) fn spanned_typed_new<X>(&self, span: Span, typ: &Typ, x: X) -> Arc<SpannedTyped<X>> {
-        SpannedTyped::new(&self.to_air_span(span), typ, x)
+    pub(crate) fn spanned_typed_new<X>(
+        &self, span: Span, source_map: &SourceMap, typ: &Typ, x: X,
+    ) -> Arc<SpannedTyped<X>> {
+        SpannedTyped::new(&self.to_air_span(span, source_map), typ, x)
     }
 }
 
 impl<'tcx> crate::context::ContextX<'tcx> {
+    /// Build an air span using the rustc session's `SourceMap`,
+    /// available via `self.tcx`. Most callers use this rather
+    /// than `self.spans.to_air_span(span, source_map)` directly
+    /// — the `ContextX` already has rustc state, so threading
+    /// the `&SourceMap` argument adds noise without value.
+    pub(crate) fn to_air_span(&self, span: Span) -> vir::messages::Span {
+        self.spans.to_air_span(span, self.tcx.sess.source_map())
+    }
+
     pub(crate) fn spanned_new<X>(&self, span: Span, x: X) -> Arc<Spanned<X>> {
-        self.spans.spanned_new(span, x)
+        self.spans.spanned_new(span, self.tcx.sess.source_map(), x)
     }
 
     pub(crate) fn spanned_typed_new<X>(&self, span: Span, typ: &Typ, x: X) -> Arc<SpannedTyped<X>> {
-        self.spans.spanned_typed_new(span, typ, x)
+        self.spans.spanned_typed_new(span, self.tcx.sess.source_map(), typ, x)
     }
 
     pub(crate) fn spanned_typed_new_vir<X>(
@@ -363,6 +397,10 @@ impl<'tcx> crate::context::ContextX<'tcx> {
 }
 
 impl<'tcx> crate::context::BodyCtxt<'tcx> {
+    pub(crate) fn to_air_span(&self, span: Span) -> vir::messages::Span {
+        self.ctxt.to_air_span(span)
+    }
+
     pub(crate) fn spanned_new<X>(&self, span: Span, x: X) -> Arc<Spanned<X>> {
         self.ctxt.spanned_new(span, x)
     }
