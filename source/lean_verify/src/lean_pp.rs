@@ -171,6 +171,12 @@ pub fn pp_expr(e: &Expr) -> String {
     out
 }
 
+pub fn pp_pattern(p: &Pattern) -> String {
+    let mut out = String::new();
+    write_pattern(&mut out, p);
+    out
+}
+
 /// Count `\n` bytes in the buffer. Cheap enough for the one-theorem-per-file
 /// case we currently have; if we ever emit many theorems per file this is the
 /// natural place to maintain a running counter instead.

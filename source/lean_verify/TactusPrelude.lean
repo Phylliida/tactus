@@ -39,23 +39,45 @@ axiom arch_word_bits_valid : arch_word_bits = 32 ∨ arch_word_bits = 64
 noncomputable def usize_hi : Int := (2 : Int) ^ arch_word_bits
 noncomputable def isize_hi : Int := (2 : Int) ^ (arch_word_bits - 1)
 
--- `tactus_case_split`: find the first hypothesis of user-datatype
--- type and case-split on it. "User-datatype" is gated on having a
--- companion `.height` fn (which `to_lean_fn::height_fn_for_datatype`
--- emits for every concrete non-generic datatype — see DESIGN.md
--- "Non-int decreases"). This gate filters out `Int` / `Nat` /
--- `Bool` / `Option` / core types that have their own automation
--- (omega) and would explode the subgoal count if case-split.
+-- `tactus_first | t1 | t2 | …` desugars to `first | (t1; done) |
+-- (t2; done) | …`. Each alternative is required to fully close
+-- the goal — without `done`, a tactic that succeeds while
+-- leaving unsolved subgoals (e.g., `simp_all` in some
+-- configurations) commits early and blocks later alternatives.
+-- `tactus_first` makes the closure contract explicit at the
+-- combinator name rather than relying on every alternative to
+-- remember to append `; done`.
+syntax "tactus_first" ("|" tacticSeq)+ : tactic
+macro_rules
+  | `(tactic| tactus_first $[| $ts:tacticSeq]*) => do
+    let wrapped ← ts.mapM (fun t => `(tacticSeq| ($t:tacticSeq); done))
+    `(tactic| first $[| $wrapped:tacticSeq]*)
+
+-- `tactus_case_split closer`: try each user-datatype-typed
+-- local in turn, running `closer` on each subgoal produced by
+-- `cases`. Commit the first candidate where `closer` closes ALL
+-- subgoals; restore state and try the next candidate
+-- otherwise. Throws if no candidate works (so it composes with
+-- `tactus_first` / `first` for fallthrough).
 --
--- No-op (succeeds with unchanged goal) if no such hypothesis
--- exists — safe to compose with other tactics in `first` /
--- `<;>` chains.
+-- "User datatype" is gated on having a companion `.height` fn
+-- (emitted by `to_lean_fn::height_fn_for_datatype` for every
+-- concrete non-generic datatype — see DESIGN.md "Non-int
+-- decreases"). This filters out `Int` / `Nat` / `Bool` /
+-- `Option` / core types that have their own automation (omega)
+-- and would explode the subgoal count if case-split.
+--
+-- Trying each candidate (rather than just the first) means a fn
+-- with multiple datatype locals — e.g., `(a: Foo, b: Bar)` —
+-- works regardless of which one is the right scrutinee. Cost is
+-- O(n_candidates × closer_cost), bounded by the locals in
+-- scope.
 open Lean Elab Tactic Meta in
-elab "tactus_case_split" : tactic => do
+elab "tactus_case_split" closer:tacticSeq : tactic => do
   let goal ← getMainGoal
-  let newGoals ← goal.withContext do
+  let candidates ← goal.withContext do
     let ctx ← getLCtx
-    let mut result : List MVarId := [goal]
+    let mut out : Array LocalDecl := #[]
     for decl in ctx do
       if decl.isImplementationDetail then continue
       let ty ← whnf decl.type
@@ -63,29 +85,27 @@ elab "tactus_case_split" : tactic => do
         let env ← getEnv
         if let some info := env.find? name then
           if info matches .inductInfo _ then
-            -- Gate: only split types for which we've emitted a
-            -- `.height` companion (i.e., our user datatypes).
             let heightName := Name.str name "height"
-            if env.find? heightName |>.isNone then continue
-            -- `cases` can fail for reasons other than the wrong
-            -- decl (e.g., dependent indices that prevent
-            -- substitution). Catching silently lets the loop try
-            -- the next candidate decl. If ALL candidates fail we
-            -- fall through to `return result` (the unchanged
-            -- goal), and `tactus_auto`'s `first` falls to the
-            -- next alternative or the `fail` branch.
-            try
-              let subgoals ← goal.cases decl.fvarId
-              return subgoals.map (·.mvarId) |>.toList
-            catch _ => pure ()
-    return result
-  replaceMainGoal newGoals
+            if env.find? heightName |>.isSome then
+              out := out.push decl
+    return out
+  for decl in candidates do
+    let saved ← saveState
+    try
+      let subgoals ← goal.cases decl.fvarId
+      setGoals (subgoals.map (·.mvarId)).toList
+      evalTactic (← `(tactic| all_goals ($closer)))
+      -- All goals closed if we got here.
+      return
+    catch _ =>
+      restoreState saved
+  throwError "tactus_case_split: no datatype-local case-split closes the goal"
 
 -- Tactus: the *atomic closer* used at the leaves of the tactics we emit.
 -- Intentionally kept to simple, always-closing tactics — `rfl`,
--- `decide`, `omega`, `simp_all`, and `tactus_case_split <;> simp_all
--- <;> omega` for goals that need case analysis on a user datatype
--- (recursive-enum fns, #58).
+-- `decide`, `omega`, `simp_all`, and `tactus_case_split` for goals
+-- that need case analysis on a user datatype (recursive-enum fns,
+-- #58).
 --
 -- Any structural peeling (`refine ⟨?_, ?_⟩`, `intros`, etc.) is the
 -- codegen's job, not this macro's: the emitter knows exactly what
@@ -93,22 +113,20 @@ elab "tactus_case_split" : tactic => do
 -- tactics around `tactus_auto` calls. See `sst_to_lean`'s loop-
 -- theorem emission.
 --
--- Each alternative is wrapped with `done` — without it, `simp_all`
--- can succeed having made progress but left unsolved subgoals,
--- blocking `first` from trying later alternatives. `done` forces
--- the closure check: if the tactic didn't fully close the goal,
--- treat it as a failure so the next alternative is tried.
+-- `tactus_first` enforces that each alternative closes the goal
+-- (wraps each in `; done`), preventing partial-success tactics
+-- like `simp_all` from blocking later alternatives.
 --
 -- `fail` turns "nothing worked" into a real error instead of a `sorry`.
 macro "tactus_auto" : tactic => `(tactic|
-  first
-    | (rfl; done)
-    | (decide; done)
-    | (omega; done)
-    | (simp_all; done)
-    | (tactus_case_split <;> simp_all <;> (first | omega | done))
-    | (tactus_case_split <;> simp_all; done)
-    | (fail "tactus: auto-tactic failed — add explicit proof block"))
+  tactus_first
+    | rfl
+    | decide
+    | omega
+    | simp_all
+    | tactus_case_split (simp_all <;> first | omega | done)
+    | tactus_case_split (simp_all)
+    | fail "tactus: auto-tactic failed — add explicit proof block")
 
 -- Recursively peel goal structure: split any top-level `∧`, introduce
 -- any leading `∀` / `→`, and recurse on the resulting subgoals. Each

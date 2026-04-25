@@ -498,23 +498,23 @@ Each exec fn obligation becomes a separate Lean theorem:
 
 ```lean
 macro "tactus_auto" : tactic => `(tactic|
-  first
-    | (rfl; done)
-    | (decide; done)
-    | (omega; done)
-    | (simp_all; done)
-    | (tactus_case_split <;> simp_all <;> (first | omega | done))
-    | (tactus_case_split <;> simp_all; done)
-    | (fail "tactus: auto-tactic failed — add explicit proof block"))
+  tactus_first
+    | rfl
+    | decide
+    | omega
+    | simp_all
+    | tactus_case_split (simp_all <;> first | omega | done)
+    | tactus_case_split (simp_all)
+    | fail "tactus: auto-tactic failed — add explicit proof block")
 ```
 
+Built on two combinators in `TactusPrelude.lean`:
+
+**`tactus_first | t1 | t2 | …`** — variant of `first` that wraps each alternative in `; done`. Without it, a tactic that succeeds while leaving unsolved subgoals (e.g., `simp_all` in some configurations) would commit early and block later alternatives. The closure contract lives at the combinator name rather than relying on every alternative to remember to append `; done`.
+
+**`tactus_case_split closer`** (elaborator tactic, #58): tries each user-datatype-typed local in turn, running `closer` on each subgoal produced by `cases`. Commits the first split where `closer` closes ALL subgoals; restores state and tries the next candidate otherwise. Throws if no candidate works — composes with `tactus_first` for fallthrough. "User datatype" is gated on having a companion `.height` fn (which `to_lean_fn::height_fn_for_datatype` emits for every concrete non-generic datatype — see "Non-int decreases"). The gate filters out `Int` / `Nat` / `Bool` / `List` / etc., which have their own automation (omega / simp_all) and would explode the subgoal count if case-split.
+
 `tactus_auto` uses `fail` as the final fallback, not `sorry`. This makes auto-tactic failures real errors. User-written `sorry` in tactic blocks remains a Lean warning for incremental development.
-
-Each alternative is wrapped with `done` because `simp_all` (and some other tactics) can succeed while leaving unsolved subgoals. Without `done`, `first` would treat that as a successful alternative and never try the later `tactus_case_split` paths.
-
-**`tactus_case_split`** (elaborator tactic in `TactusPrelude.lean`, #58): scans the local context for the first hypothesis whose type is a user-defined datatype, and `cases`-splits it. "User-defined" is gated on the type having a companion `.height` fn — `to_lean_fn::height_fn_for_datatype` emits one per concrete datatype (see "Non-int decreases"), so this doubles as a convenient whitelist. The gate filters out `Int` / `Nat` / `Bool` / `List` / etc., which have their own automation (omega / simp_all) and would explode the subgoal count if case-split.
-
-The tactic is a no-op (succeeds with unchanged goal) when no splittable local exists, so it composes safely with other tactics in `first` / `<;>` chains. It only performs one split per invocation — nested or multi-variable case analysis requires user-written `proof { }` blocks.
 
 ## Semantic details
 
@@ -919,7 +919,7 @@ Accepted via #57: **`cond: None`** loops (the form Verus produces when lowering 
 * **`Classical.propDecidable` opens all Props.** Added to `TactusPrelude.lean` so accessor-derived Props (from `datatype_to_cmds`'s synthesized `Type.isVariant`) decide in `if <prop> then … else …` contexts. Side effect: `decide` can't reduce through classical-only Props — `decide` loses some reducibility relative to a prelude without this. `tactus_auto` uses `omega` / `simp_all`, not `decide` directly, so no current impact. A future tactic relying on `decide` to compute through Prop formulas would need to be aware.
 * **Tactus tactic-text prepending runs at theorem level, not locally.** When a user writes `assert(P) by { tac }` or `proof { have h := by tac }` inside a loop body (or any nested construct), the `have` is prepended to the THEOREM's tactic at theorem-start — before any `intro` of modified-var quantifiers. Variable references in the tactic resolve to the OUTER scope (fn param, not loop-local). For simple cases (e.g., `assert(x < 256) by { omega }` where `x` is a u8 fn param and the tactic only uses fn-level bounds) this works. For tactics that would need a loop invariant as a hypothesis, the invariant isn't in scope at theorem-tactic prefix. Known design limitation; a per-loop-scoped `have` would require per-loop tactic emission, which we don't have. Not tested end-to-end with tactics that depend on loop-local state.
 * **Proof-block goal-modifying tactics affect the outer goal.** `proof { simp_all }` simplifies the entire theorem goal, not just a local sub-proof. Users coming from Verus's self-contained proof blocks may be surprised. Pinned by `test_exec_proof_block_goal_modifying_tactic`; the alternative (wrapping in a local `have _ : True := by <tac>`) breaks the common `have h : P := by tac` propagation case — which is the primary reason users write proof blocks.
-* **`tactus_case_split` picks the first splittable local.** When multiple user datatypes are in scope (e.g., a fn taking `a: Foo, b: Bar`), the tactic splits whichever `LCtx` visits first — usually the earliest-declared. If the user needs to split on `b` (not `a`), a single `tactus_case_split` won't reach it; users write an explicit `cases b` in a `proof { }` block. The tactic doesn't try all splits in combination (no cartesian-product explosion) because doing so would regress compile time on simple fns. Pinned by `test_exec_match_enum_with_int_args`, which has both `op: Op` and `x, y: Int` and relies on splitting on `op` first (the int gate excludes `Int` from splits).
+* **`tactus_case_split` tries each user-datatype local in turn.** Takes a `closer` tactic argument and commits the first split where the closer closes ALL subgoals; restores state and tries the next candidate otherwise. Means a fn with multiple datatype locals — e.g., `(a: Foo, b: Bar)` — works regardless of which is the right scrutinee. Cost is O(n_candidates × closer_cost), bounded by the locals in scope. The `.height`-existence gate filters out `Int`/`Nat`/etc. so we don't case-split on primitives. Pinned by `test_exec_match_enum_with_int_args` (mixed enum + int locals).
 
 #### User-facing features not tested (or possibly broken)
 
