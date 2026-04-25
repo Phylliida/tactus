@@ -110,12 +110,21 @@ pub struct Landmarks {
     /// appears. The proof-fn pipeline uses this to build a `LeanSourceMap`
     /// without having to scan the output for a marker string.
     pub tactic_starts: Vec<usize>,
-    /// `(lean_line, rust_loc)` pairs pushed as the pp visits each
-    /// `ExprNode::SpanMark` node. `lean_line` is the 1-indexed line
-    /// in `text` where the marked sub-expression starts. Used by
-    /// `LeanSourceMap` to map Lean error lines back to Rust source
-    /// positions for #51 (exec-fn source mapping).
-    pub span_marks: Vec<(usize, String)>,
+    /// One per `ExprNode::SpanMark` visited during pp, in source
+    /// order. Used by `LeanSourceMap` to map Lean error lines
+    /// back to Rust source positions and obligation kinds (#51).
+    pub span_marks: Vec<SpanMarkLandmark>,
+}
+
+/// Per-`SpanMark`-visit landmark. `line` is the 1-indexed Lean
+/// line where the marked sub-expression starts; `loc` is the
+/// pre-resolved Rust `file:line:col`; `kind` is the obligation's
+/// semantic class for error-message labeling.
+#[derive(Debug, Clone)]
+pub struct SpanMarkLandmark {
+    pub line: usize,
+    pub loc: String,
+    pub kind: AssertKind,
 }
 
 impl Landmarks {
@@ -606,14 +615,18 @@ fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
         // `/-!`, which Lean treats as a module docstring and
         // rejects inline). We strip newlines from the loc text
         // defensively.
-        ExprNode::SpanMark { rust_loc, inner } => {
+        ExprNode::SpanMark { rust_loc, kind, inner } => {
             // Sanitize: strip newlines so a multi-line loc can't
             // break the block comment AND so the recorded
             // landmark string has no embedded newlines.
             let sanitized: String = rust_loc.chars()
                 .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
                 .collect();
-            lm.span_marks.push((current_line(out), sanitized.clone()));
+            lm.span_marks.push(SpanMarkLandmark {
+                line: current_line(out),
+                loc: sanitized.clone(),
+                kind: *kind,
+            });
             out.push_str("/- @rust:");
             out.push_str(&sanitized);
             out.push_str(" -/ ");

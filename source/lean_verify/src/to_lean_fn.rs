@@ -33,13 +33,12 @@ pub enum LeanSourceMap {
         tactic_line_count: usize,
     },
     /// Exec fns (#51 source mapping): `span_marks` is a list of
-    /// `(lean_line, rust_loc)` pairs populated by the pp as it
-    /// visits `ExprNode::SpanMark` nodes. `find_rust_loc`
-    /// returns the closest preceding mark for a given Lean
-    /// error line.
+    /// landmarks populated by the pp as it visits
+    /// `ExprNode::SpanMark` nodes. `find_rust_loc` returns the
+    /// closest preceding mark for a given Lean error line.
     ExecFn {
         fn_name: String,
-        span_marks: Vec<(usize, String)>,
+        span_marks: Vec<crate::lean_pp::SpanMarkLandmark>,
     },
 }
 
@@ -60,15 +59,15 @@ impl LeanSourceMap {
         }
     }
 
-    /// Exec-fn path: closest preceding `(lean_line, rust_loc)` mark.
-    /// `None` for proof-fn maps or when no mark precedes `lean_line`.
-    pub fn find_rust_loc(&self, lean_line: usize) -> Option<&str> {
+    /// Exec-fn path: closest preceding `SpanMarkLandmark` for a
+    /// Lean error line. Returns `None` for proof-fn maps or when
+    /// no mark precedes the line.
+    pub fn find_span_mark(&self, lean_line: usize) -> Option<&crate::lean_pp::SpanMarkLandmark> {
         match self {
             LeanSourceMap::ExecFn { span_marks, .. } => {
                 span_marks.iter()
                     .rev()
-                    .find(|(line, _)| *line <= lean_line)
-                    .map(|(_, loc)| loc.as_str())
+                    .find(|m| m.line <= lean_line)
             }
             LeanSourceMap::ProofFn { .. } => None,
         }

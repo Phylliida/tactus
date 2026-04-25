@@ -104,14 +104,16 @@
 use std::collections::{HashMap, HashSet};
 
 use vir::sst::{
-    BndX, Dest, Exp, ExpX, FuncCheckSst, FunctionSst, LoopInv, Par, Stm, StmX,
+    BndX, CallFun, Dest, Exp, ExpX, FuncCheckSst, FunctionSst, InternalFun, LoopInv,
+    Par, Stm, StmX,
 };
 use vir::ast::{
     AssertQueryMode, Fun, FunctionX, KrateX, TactusKind, Typ, UnaryOp, UnaryOpr, VarIdent,
 };
 use vir::messages::Span;
 use crate::lean_ast::{
-    and_all, substitute, Binder as LBinder, BinderKind, Expr as LExpr, Tactic, Theorem,
+    and_all, substitute, AssertKind, Binder as LBinder, BinderKind, Expr as LExpr,
+    Tactic, Theorem,
 };
 use crate::to_lean_expr::vir_expr_to_ast;
 use crate::to_lean_sst_expr::{sst_exp_to_ast, sst_exp_to_ast_checked, type_bound_predicate};
@@ -655,6 +657,26 @@ fn format_rust_loc(span: &Span) -> String {
     }
 }
 
+/// Classify an assertion expression for error-message labeling.
+/// `Wp::Assert` is the catch-all for obligations Verus inserts —
+/// most are user `assert(P)` (kind=Plain), but the recursion
+/// pass inserts `CheckDecreaseHeight` calls via `Wp::Assert`
+/// which we recognize as Termination obligations. Other
+/// non-Plain kinds (LoopInvariant / CallPrecondition / etc.) are
+/// set explicitly at their wrapping sites in `lower_loop` /
+/// `lower_call`.
+fn detect_assert_kind(e: &Exp) -> AssertKind {
+    // Peel transparent wrappers (Box / Unbox / CoerceMode /
+    // Trigger / Loc) — Verus may wrap the CheckDecreaseHeight
+    // call in any of these before inserting it as an Assert.
+    let peeled = peel_transparent(e);
+    if let ExpX::Call(CallFun::InternalFun(InternalFun::CheckDecreaseHeight), _, _) = &peeled.x {
+        AssertKind::Termination
+    } else {
+        AssertKind::Plain
+    }
+}
+
 /// Interpret a `Wp` tree into a Lean `LExpr`. Each node has a
 /// corresponding WP rule; see the variant docs on `Wp` for details.
 fn lower_wp(wp: &Wp<'_>, ctx: &WpCtx<'_>) -> LExpr {
@@ -672,12 +694,17 @@ fn lower_wp(wp: &Wp<'_>, ctx: &WpCtx<'_>) -> LExpr {
             })
         }
         Wp::Assert(e, body) => LExpr::and(
-            // Wrap with the SST span so the pp emits a `/-! @rust:LOC -/`
-            // marker before this assertion. On Lean error, `format_error`
-            // scans back from the reported line for the closest preceding
-            // marker — the user sees the Rust source position of the
-            // failing obligation, not just the fn declaration. (#51)
-            LExpr::span_mark(format_rust_loc(&e.span), sst_exp_to_ast(e)),
+            // Wrap with the SST span so the pp emits a `/- @rust:LOC -/`
+            // marker before this assertion (#51). The kind is
+            // detected from the expression shape: Verus's recursion
+            // pass inserts `CheckDecreaseHeight` via `Wp::Assert`,
+            // so we recognize that as a Termination obligation;
+            // everything else is generic.
+            LExpr::span_mark(
+                format_rust_loc(&e.span),
+                detect_assert_kind(e),
+                sst_exp_to_ast(e),
+            ),
             lower_wp(body, ctx),
         ),
         Wp::Assume(e, body) => LExpr::implies(sst_exp_to_ast(e), lower_wp(body, ctx)),
@@ -695,7 +722,11 @@ fn lower_wp(wp: &Wp<'_>, ctx: &WpCtx<'_>) -> LExpr {
             // `simp_all` / `omega` goal (e.g., when the cond
             // involves a match or complex expression), the mark
             // points back at the `if` location in the Rust source.
-            let c = LExpr::span_mark(format_rust_loc(&cond.span), sst_exp_to_ast(cond));
+            let c = LExpr::span_mark(
+                format_rust_loc(&cond.span),
+                AssertKind::BranchCondition,
+                sst_exp_to_ast(cond),
+            );
             LExpr::and(
                 LExpr::implies(c.clone(), lower_wp(then_branch, ctx)),
                 LExpr::implies(LExpr::not(c), lower_wp(else_branch, ctx)),
@@ -736,7 +767,11 @@ fn lower_loop(
     // needs to know (#51).
     let inv_conj = || and_all(
         invs.iter()
-            .map(|i| LExpr::span_mark(format_rust_loc(&i.inv.span), sst_exp_to_ast(&i.inv)))
+            .map(|i| LExpr::span_mark(
+                format_rust_loc(&i.inv.span),
+                AssertKind::LoopInvariant,
+                sst_exp_to_ast(&i.inv),
+            ))
             .collect()
     );
     // Wrap the decrease expression so "decrease didn't decrease"
@@ -745,6 +780,7 @@ fn lower_loop(
     // and are wrapped there.
     let decrease_ast = || LExpr::span_mark(
         format_rust_loc(&decrease.span),
+        AssertKind::LoopDecrease,
         sst_exp_to_ast(decrease),
     );
 
@@ -766,7 +802,11 @@ fn lower_loop(
     // that turn on cond evaluation point at the `while` header
     // rather than the loop body. Same for the negated cond in
     // the use clause below.
-    let cond_marked = |c: &Exp| LExpr::span_mark(format_rust_loc(&c.span), sst_exp_to_ast(c));
+    let cond_marked = |c: &Exp| LExpr::span_mark(
+        format_rust_loc(&c.span),
+        AssertKind::LoopCondition,
+        sst_exp_to_ast(c),
+    );
     let maintain_pre = match cond {
         Some(c) => LExpr::and(inv_conj(), cond_marked(c)),
         None => inv_conj(),
@@ -873,6 +913,7 @@ fn lower_call(
     // Lean points at foreign code).
     let requires_clause = LExpr::span_mark(
         format_rust_loc(call_span),
+        AssertKind::CallPrecondition,
         substitute(&requires_conj, &subst),
     );
 

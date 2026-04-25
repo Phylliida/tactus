@@ -266,12 +266,17 @@ impl Expr {
 
     pub fn anon(elems: Vec<Expr>) -> Self { Expr::new(ExprNode::Anon(elems)) }
 
-    /// Wrap `inner` with a source-location marker. Transparent at
-    /// the Lean level; pp emits a `/-! @rust:LOC -/` block before
-    /// `inner` so error-time scanning can map Lean lines back to
-    /// Rust positions (#51 source mapping).
-    pub fn span_mark(rust_loc: impl Into<String>, inner: Expr) -> Self {
-        Expr::new(ExprNode::SpanMark { rust_loc: rust_loc.into(), inner: Box::new(inner) })
+    /// Wrap `inner` with a source-location marker carrying the
+    /// obligation's semantic kind. Transparent at the Lean level;
+    /// pp emits a `/- @rust:LOC -/` block before `inner` and
+    /// records `(line, loc, kind)` in landmarks for #51 error
+    /// formatting.
+    pub fn span_mark(rust_loc: impl Into<String>, kind: AssertKind, inner: Expr) -> Self {
+        Expr::new(ExprNode::SpanMark {
+            rust_loc: rust_loc.into(),
+            kind,
+            inner: Box::new(inner),
+        })
     }
 
     pub fn type_annot(expr: Expr, ty: Expr) -> Self {
@@ -348,14 +353,62 @@ pub enum ExprNode {
     Raw(String),
 
     /// Source-span annotation (#51). Transparent at the Lean level —
-    /// pp emits just `inner`'s text — but the pp records
-    /// `(current_line, rust_loc)` in `PpOutput::span_marks` as it
-    /// visits the node. `LeanSourceMap::from_marks` consumes this
-    /// to map Lean error lines back to Rust source positions.
-    /// `lower_wp` wraps `Wp::Assert` / `Wp::Branch.cond` /
-    /// `Wp::Loop.cond` / `Wp::Call` etc. with this carrying the
-    /// underlying SST `Exp.span.as_string`.
-    SpanMark { rust_loc: String, inner: Box<Expr> },
+    /// pp emits a leading `/- @rust:LOC -/` block comment and
+    /// records `(line, loc, kind)` in landmarks. `LeanSourceMap`
+    /// consumes the landmarks at error time to map Lean lines
+    /// back to Rust source positions.
+    ///
+    /// `kind` carries the semantic class of the obligation
+    /// (precondition / loop invariant / termination check /
+    /// etc.) so error messages can include a label like
+    /// "(precondition)" alongside `at <loc>:`. Set by the
+    /// wrapping site in `lower_wp` / `lower_loop` / `lower_call`
+    /// / etc.
+    SpanMark {
+        rust_loc: String,
+        kind: AssertKind,
+        inner: Box<Expr>,
+    },
+}
+
+/// Semantic class of an obligation, attached to `SpanMark`
+/// nodes so error formatting can label `at <loc>:` with the
+/// kind of check that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssertKind {
+    /// Generic — user-written `assert(P)`, or an obligation
+    /// without a more specific class.
+    Plain,
+    /// Loop invariant (entry, maintain, or use clause).
+    LoopInvariant,
+    /// Loop decrease measure (`D_new < D_old`).
+    LoopDecrease,
+    /// Loop condition expression (in maintain or use guard).
+    LoopCondition,
+    /// `if` / `match` branch condition.
+    BranchCondition,
+    /// Precondition of a callee at the call site.
+    CallPrecondition,
+    /// Termination check for a recursive call
+    /// (`CheckDecreaseHeight` lowering).
+    Termination,
+}
+
+impl AssertKind {
+    /// Short user-visible label for the `at <loc> (<label>):`
+    /// prefix in error messages. Empty string for `Plain`
+    /// (no extra label needed).
+    pub fn label(&self) -> &'static str {
+        match self {
+            AssertKind::Plain => "",
+            AssertKind::LoopInvariant => "loop invariant",
+            AssertKind::LoopDecrease => "loop decrease",
+            AssertKind::LoopCondition => "loop condition",
+            AssertKind::BranchCondition => "branch condition",
+            AssertKind::CallPrecondition => "precondition",
+            AssertKind::Termination => "termination",
+        }
+    }
 }
 
 /// Structural binary operators.
@@ -645,8 +698,9 @@ fn substitute_impl(
         ExprNode::Anon(es) => ExprNode::Anon(
             es.iter().map(|e| substitute_impl(e, subst)).collect()
         ),
-        ExprNode::SpanMark { rust_loc, inner } => ExprNode::SpanMark {
+        ExprNode::SpanMark { rust_loc, kind, inner } => ExprNode::SpanMark {
             rust_loc: rust_loc.clone(),
+            kind: *kind,
             inner: Box::new(substitute_impl(inner, subst)),
         },
     };

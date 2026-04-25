@@ -40,8 +40,15 @@ pub fn format_error(
     // SpanMark instrumentation, populated for exec fns), fall
     // back to the tactic-line offset (proof fns).
     if let Some(pos) = &diag.pos {
-        if let Some(rust_loc) = source_map.find_rust_loc(pos.line) {
-            out.push_str(&format!("at {}:\n", rust_loc));
+        if let Some(mark) = source_map.find_span_mark(pos.line) {
+            // `at <loc> (<kind label>):` — kind label only when
+            // non-empty (Plain has no extra context worth showing).
+            let label = mark.kind.label();
+            if label.is_empty() {
+                out.push_str(&format!("at {}:\n", mark.loc));
+            } else {
+                out.push_str(&format!("at {} ({}):\n", mark.loc, label));
+            }
         } else if let Some(offset) = source_map.find_tactic_line(pos.line) {
             out.push_str(&format!("tactic line {}: ", offset + 1));
         }
