@@ -264,10 +264,19 @@ fn check_exp(e: &Exp) -> Result<(), String> {
 
 /// Build the Lean `Theorem`s for an exec fn body check.
 ///
-/// Returns a `Vec` because future slices may want to split obligations
-/// into separate theorems (e.g., for per-loop diagnostics); today it's
-/// always length 1 — loops contribute conjuncts to the main goal
-/// rather than their own top-level theorems.
+/// Returns a `Vec` of one theorem per obligation in the body — one
+/// per `Wp::Assert` plus one per `Wp::Done` leaf. Multiple theorems
+/// per fn means a Lean error's `pos.line` falls inside exactly one
+/// theorem's `:= by` block, so the source-mapping kind label
+/// (`(precondition)` / `(loop invariant)` / etc.) becomes correct
+/// by construction rather than guessed via a closest-preceding-mark
+/// heuristic on a single mega-theorem (task D in HANDOFF).
+///
+/// Stage 1 (this commit): `Wp::Done` / `Assert` / `Let` / `Assume` /
+/// `Branch` walked per-obligation. `Wp::Loop` / `Call` /
+/// `AssertByTactus` fall back to a single theorem covering the
+/// subtree (Stages 2-4 will replace each fallback with its own
+/// per-obligation expansion).
 ///
 /// Returns `Err` if any part of `check` uses an SST form we don't know
 /// how to emit. Validation and AST construction share a single pass
@@ -283,7 +292,6 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // `WpCtx::new` validates reqs / ens_exps before rendering them.
     let ctx = WpCtx::new(krate, check)?;
 
-    let name = format!("_tactus_body_{}", lean_name(&fn_sst.x.name.path));
     let mut binders = build_param_binders(fn_sst);
     binders.extend(build_req_binders(check));
 
@@ -298,19 +306,311 @@ pub fn exec_fn_theorems_to_ast<'a>(
         &ctx,
         None,
     )?;
-    let has_loop_or_call = body_wp.needs_peel();
-    // Two-pass: collect `have` clauses from every `Wp::AssertByTactus`
-    // node in the tree, then lower the tree to the goal LExpr. The
-    // haves prepend to the closer so each user tactic discharges its
-    // assert obligation AND introduces a hypothesis that `simp_all`
-    // / `omega` can pick up during the rest of the proof. Splitting
-    // the walk from `lower_wp` keeps lowering a pure function of the
-    // tree — no shared-mutable side channel needed.
-    let user_haves = collect_tactus_haves(&body_wp);
-    let goal = lower_wp(&body_wp, &ctx);
-    let closer = if has_loop_or_call { loop_tactic() } else { simple_tactic() };
+
+    let fn_name = lean_name(&fn_sst.x.name.path);
+    let mut emitter = ObligationEmitter {
+        fn_name,
+        base_binders: binders,
+        counter: 0,
+        out: Vec::new(),
+    };
+    walk_obligations(&body_wp, &ctx, &OblCtx::new(), &mut emitter);
+    Ok(emitter.out)
+}
+
+/// One frame of accumulated context as the obligation walker descends
+/// into a Wp tree. Pushed at scope-introducing points (let bindings,
+/// branch hypotheses, assert hypotheses, assume hypotheses); popped
+/// implicitly when the walker returns from a recursive call.
+///
+/// At theorem-emission time, [`OblCtx::wrap`] folds the frames around
+/// the obligation goal in source order: outermost frame first, so
+/// the resulting LExpr has the same scope structure the user wrote.
+/// Lets, hypotheses (as `→`), and `∀`-binders are encoded into the
+/// goal expression itself rather than as theorem-level binders so
+/// that lets can scope over hypotheses that mention the let-bound
+/// names — the "everything in the goal" form gives correct scoping
+/// for free.
+#[derive(Clone)]
+enum CtxFrame {
+    /// `let x := v;` wrapping. The walker pushes this at every
+    /// `Wp::Let` (or while peeling a `Bind(Let)` inside a let-RHS).
+    Let(String, LExpr),
+    /// `P →` wrapping. Pushed for assumes, branch conditions, and
+    /// assertions that already passed (the asserted condition
+    /// becomes a hypothesis for the rest of the body).
+    Hyp(LExpr),
+    /// `∀ (x : T),` wrapping. Currently unused in Stage 1 — Stage
+    /// 3's loop walker pushes one per modified variable when
+    /// emitting maintain/use clauses.
+    #[allow(dead_code)]
+    Binder(LBinder),
+}
+
+#[derive(Clone)]
+struct OblCtx {
+    frames: Vec<CtxFrame>,
+}
+
+impl OblCtx {
+    fn new() -> Self { Self { frames: Vec::new() } }
+
+    fn with_frame(&self, f: CtxFrame) -> Self {
+        let mut new = self.clone();
+        new.frames.push(f);
+        new
+    }
+
+    /// Wrap `goal` with all accumulated frames, outermost first
+    /// (matching source order). A `Let("x", v)` outside a
+    /// `Hyp(P_uses_x)` frame produces `let x := v; P_uses_x → goal`,
+    /// so the hypothesis can reference `x`.
+    fn wrap(&self, mut goal: LExpr) -> LExpr {
+        for frame in self.frames.iter().rev() {
+            goal = match frame {
+                CtxFrame::Let(name, v) => LExpr::let_bind(name.clone(), v.clone(), goal),
+                CtxFrame::Hyp(p) => LExpr::implies(p.clone(), goal),
+                CtxFrame::Binder(b) => LExpr::forall(vec![b.clone()], goal),
+            };
+        }
+        goal
+    }
+}
+
+/// Per-walk emission state. `fn_name` and `base_binders` are shared
+/// across every theorem the walker emits; `counter` disambiguates
+/// theorem names so multiple obligations of the same kind at the
+/// same source line don't collide.
+struct ObligationEmitter {
+    fn_name: String,
+    base_binders: Vec<LBinder>,
+    counter: usize,
+    out: Vec<Theorem>,
+}
+
+impl ObligationEmitter {
+    fn next_id(&mut self) -> usize {
+        self.counter += 1;
+        self.counter
+    }
+}
+
+/// Snake-case name fragment for an `AssertKind`, used in theorem
+/// naming. The visible per-error label still goes through
+/// [`AssertKind::label`] — the fragment here is only for unique
+/// identifiers in generated Lean.
+fn kind_to_name(k: AssertKind) -> &'static str {
+    match k {
+        AssertKind::Plain => "assert",
+        AssertKind::LoopInvariant => "loop_invariant",
+        AssertKind::LoopDecrease => "loop_decrease",
+        AssertKind::LoopCondition => "loop_condition",
+        AssertKind::BranchCondition => "branch_condition",
+        AssertKind::CallPrecondition => "precondition",
+        AssertKind::Termination => "termination",
+    }
+}
+
+/// Compress a Rust source location like
+/// `"/home/me/project/src/main.rs:42:13"` into a short fragment for
+/// theorem naming: drop the directory path and any extension, then
+/// sanitize remaining non-identifier chars to `_`. The above example
+/// becomes `"main_42_13"`. Result is appended to
+/// `_tactus_<kind>_<fn>_at_<loc>_<id>`; we want it short enough that
+/// a fn with many obligations doesn't produce kilobyte-long
+/// theorem names. The structured `path:line:col` still goes into
+/// `SpanMark` for error messages — this fragment is purely cosmetic.
+fn sanitize_loc_for_name(loc: &str) -> String {
+    // Strip everything before the last `/` (directory) and the
+    // first `.` of the basename (extension).
+    let after_slash = loc.rsplit('/').next().unwrap_or(loc);
+    let mut basename = after_slash.to_string();
+    if let Some(dot) = basename.find('.') {
+        // Replace the extension with the rest (line/col), turning
+        // "main.rs:42:13" into "main:42:13" (extension dropped) —
+        // the `.rs` bit is noise we don't need in identifiers.
+        let after_dot = &basename[dot + 1..];
+        // After the dot, find where the extension ends (next non-
+        // alphanumeric char). Anything from there onward is line/col.
+        let ext_end = after_dot
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(after_dot.len());
+        let suffix = &after_dot[ext_end..];
+        basename = format!("{}{}", &basename[..dot], suffix);
+    }
+    basename.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
+}
+
+/// Walk a `Wp` tree, emitting one Lean theorem per obligation. See
+/// the doc on [`exec_fn_theorems_to_ast`] for the staging plan and
+/// the per-Wp-variant behaviour.
+fn walk_obligations<'a>(
+    wp: &Wp<'a>,
+    ctx: &WpCtx<'a>,
+    obl: &OblCtx,
+    e: &mut ObligationEmitter,
+) {
+    match wp {
+        Wp::Done(leaf) => {
+            // Terminal goal: the fn's ensures (top-level Done), or
+            // a loop body's `I ∧ D < d_old` (loop-body Done — Stage 3).
+            // Stage 1 sees only the top-level form because Loop/Call
+            // fall back; both lower the leaf identically.
+            let id = e.next_id();
+            let name = format!("_tactus_ensures_{}_{}", e.fn_name, id);
+            e.out.push(Theorem {
+                name,
+                binders: e.base_binders.clone(),
+                goal: obl.wrap(leaf.clone()),
+                tactic: simple_tactic(),
+            });
+        }
+        Wp::Assert(asserted, body) => {
+            // Emit one theorem for this assertion. The asserted
+            // condition becomes a hypothesis for the rest of the
+            // body — its proof sits in this theorem, the body's
+            // theorems can assume it.
+            let id = e.next_id();
+            let kind = detect_assert_kind(asserted);
+            let label = kind_to_name(kind);
+            let loc = format_rust_loc(&asserted.span);
+            let suffix = sanitize_loc_for_name(&loc);
+            let name = format!("_tactus_{}_{}_at_{}_{}", label, e.fn_name, suffix, id);
+            let cond_ast = sst_exp_to_ast(asserted);
+            let goal = LExpr::span_mark(loc, kind, cond_ast.clone());
+            e.out.push(Theorem {
+                name,
+                binders: e.base_binders.clone(),
+                goal: obl.wrap(goal),
+                tactic: simple_tactic(),
+            });
+            let new_obl = obl.with_frame(CtxFrame::Hyp(sst_exp_to_ast(asserted)));
+            walk_obligations(body, ctx, &new_obl, e);
+        }
+        Wp::Assume(p, body) => {
+            // No theorem; the assumption just enters the context.
+            let new_obl = obl.with_frame(CtxFrame::Hyp(sst_exp_to_ast(p)));
+            walk_obligations(body, ctx, &new_obl, e);
+        }
+        Wp::Let(name, val, body) => {
+            walk_let(name, val, body, ctx, obl, e);
+        }
+        Wp::Branch { cond, then_branch, else_branch } => {
+            // Each branch walks under its own hypothesis (cond / ¬cond).
+            // The Wp tree clones `after` into both branches at build
+            // time, so the post-if continuation's obligations are
+            // visited twice — once with `c` as a hypothesis, once with
+            // `¬c`. Fine for correctness (each emitted theorem is its
+            // own valid obligation); does duplicate work for branches
+            // that fall through to the same `after`. Same exponential-
+            // in-nested-if behaviour as the pre-D codegen — DESIGN.md
+            // documents the trade-off.
+            let cond_marked = LExpr::span_mark(
+                format_rust_loc(&cond.span),
+                AssertKind::BranchCondition,
+                sst_exp_to_ast(cond),
+            );
+            walk_obligations(
+                then_branch, ctx,
+                &obl.with_frame(CtxFrame::Hyp(cond_marked.clone())),
+                e,
+            );
+            walk_obligations(
+                else_branch, ctx,
+                &obl.with_frame(CtxFrame::Hyp(LExpr::not(cond_marked))),
+                e,
+            );
+        }
+        // Stages 2-4: emit one theorem covering the whole subtree
+        // wrapped in the current obligation context. This is the
+        // pre-D single-theorem behaviour, scoped to whatever path
+        // led here; Stage 2 (Call), Stage 3 (Loop), and Stage 4
+        // (AssertByTactus) each replace one of these fallbacks
+        // with its own per-obligation walker.
+        Wp::Loop { .. } | Wp::Call { .. } | Wp::AssertByTactus { .. } => {
+            emit_subtree_fallback(wp, ctx, obl, e);
+        }
+    }
+}
+
+/// `Wp::Let` walker with if-RHS lifting (mirrors `lift_if_value`'s
+/// behaviour in `lower_wp`). `let x := if c then a else b; rest`
+/// forks into two recursive walks, each with cond as a hypothesis
+/// frame and the corresponding branch as the let value. Without
+/// this, `omega` can't see inside the value-position if and the
+/// let theorems would fail.
+fn walk_let<'a>(
+    name: &'a str,
+    val: &'a Exp,
+    body: &Wp<'a>,
+    ctx: &WpCtx<'a>,
+    obl: &OblCtx,
+    e: &mut ObligationEmitter,
+) {
+    // Peel transparent wrappers AND a single layer of `Loc` — same as
+    // `lift_if_value`. `Loc` peels for if-detection but isn't part of
+    // `peel_transparent` because `contains_loc` needs Loc un-peeled.
+    let peeled = peel_transparent(val);
+    let peeled = match &peeled.x {
+        ExpX::Loc(inner) => peel_transparent(inner),
+        _ => peeled,
+    };
+    match &peeled.x {
+        ExpX::If(cond, then_e, else_e) => {
+            let c_ast = sst_exp_to_ast(cond);
+            walk_let(name, then_e, body, ctx,
+                &obl.with_frame(CtxFrame::Hyp(c_ast.clone())), e);
+            walk_let(name, else_e, body, ctx,
+                &obl.with_frame(CtxFrame::Hyp(LExpr::not(c_ast))), e);
+        }
+        // `let outer := (let z := zval; bodyval); rest`
+        //   ≡ `let z := zval; let outer := bodyval; rest`
+        // Peel one layer of inner let, then continue lifting on
+        // `bodyval` (which may itself be an If or another nested let).
+        ExpX::Bind(bnd, inner_body) if matches!(&bnd.x, BndX::Let(bs) if bs.len() == 1) => {
+            let BndX::Let(bs) = &bnd.x else { unreachable!() };
+            let inner_b = &bs[0];
+            let inner_name = sanitize(&inner_b.name.0);
+            let new_obl = obl.with_frame(CtxFrame::Let(
+                inner_name, sst_exp_to_ast(&inner_b.a),
+            ));
+            walk_let(name, inner_body, body, ctx, &new_obl, e);
+        }
+        _ => {
+            let new_obl = obl.with_frame(CtxFrame::Let(
+                sanitize(name), sst_exp_to_ast(val),
+            ));
+            walk_obligations(body, ctx, &new_obl, e);
+        }
+    }
+}
+
+/// Stage 1 fallback for `Wp::Loop` / `Call` / `AssertByTactus`: emit
+/// one theorem covering the entire subtree, lowered via `lower_wp`,
+/// wrapped in the current obligation context. Replicates the pre-D
+/// single-theorem behaviour for these subtrees; Stages 2-4 replace
+/// each with a per-variant walker.
+fn emit_subtree_fallback<'a>(
+    wp: &Wp<'a>,
+    ctx: &WpCtx<'a>,
+    obl: &OblCtx,
+    e: &mut ObligationEmitter,
+) {
+    let id = e.next_id();
+    let name = format!("_tactus_body_{}_{}", e.fn_name, id);
+    let user_haves = collect_tactus_haves(wp);
+    let goal = lower_wp(wp, ctx);
+    let needs_peel = wp.needs_peel();
+    let closer = if needs_peel { loop_tactic() } else { simple_tactic() };
     let tactic = prepend_user_haves(user_haves, closer);
-    Ok(vec![Theorem { name, binders, goal, tactic }])
+    e.out.push(Theorem {
+        name,
+        binders: e.base_binders.clone(),
+        goal: obl.wrap(goal),
+        tactic,
+    });
 }
 
 /// Collected tactic prefix extracted from a `Wp::AssertByTactus` node.
@@ -1598,6 +1898,42 @@ mod tests {
     fn format_rust_loc_both_empty() {
         let s = span_with_locs("", "");
         assert_eq!(format_rust_loc(&s), "");
+    }
+
+    // ── sanitize_loc_for_name (D Stage 1) ───────────────────────
+    //
+    // Theorem-naming compression: keeps just `<basename>_<line>_<col>`
+    // so per-obligation theorem names stay short enough that a fn
+    // with many obligations doesn't produce kilobyte-long names.
+
+    #[test]
+    fn sanitize_loc_full_path_strips_directory_and_extension() {
+        assert_eq!(
+            sanitize_loc_for_name("/home/user/proj/src/main.rs:42:13"),
+            "main_42_13",
+        );
+    }
+
+    #[test]
+    fn sanitize_loc_no_directory_strips_extension() {
+        assert_eq!(sanitize_loc_for_name("main.rs:5:1"), "main_5_1");
+    }
+
+    #[test]
+    fn sanitize_loc_no_extension_no_directory() {
+        // Fallback path for as_string-style spans without a dot.
+        assert_eq!(sanitize_loc_for_name("synthetic-fixture"), "synthetic_fixture");
+    }
+
+    #[test]
+    fn sanitize_loc_empty() {
+        assert_eq!(sanitize_loc_for_name(""), "");
+    }
+
+    #[test]
+    fn sanitize_loc_dotted_basename_keeps_underscore() {
+        // A basename like `foo_bar.rs` should keep the underscore.
+        assert_eq!(sanitize_loc_for_name("foo_bar.rs:10:20"), "foo_bar_10_20");
     }
 
     fn typ_int() -> Typ { Arc::new(TypX::Int(IntRange::Int)) }
