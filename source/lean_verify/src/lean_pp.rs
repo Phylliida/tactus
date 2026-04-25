@@ -102,7 +102,7 @@ fn expr_prec(node: &ExprNode) -> u16 {
 
 // ── Public entry points ────────────────────────────────────────────────
 
-/// Pretty-print output plus structural landmarks discovered during emission.
+/// Pretty-print output plus structural landmarks accumulated during emission.
 pub struct PpOutput {
     pub text: String,
     /// For every `Tactic::Raw` body encountered (in source order): the
@@ -110,70 +110,55 @@ pub struct PpOutput {
     /// appears. The proof-fn pipeline uses this to build a `LeanSourceMap`
     /// without having to scan the output for a marker string.
     pub tactic_starts: Vec<usize>,
-    /// `(lean_line, rust_loc)` pairs accumulated as the pp visits
-    /// `ExprNode::SpanMark` nodes. `lean_line` is the 1-indexed line
+    /// `(lean_line, rust_loc)` pairs pushed as the pp visits each
+    /// `ExprNode::SpanMark` node. `lean_line` is the 1-indexed line
     /// in `text` where the marked sub-expression starts. Used by
     /// `LeanSourceMap` to map Lean error lines back to Rust source
     /// positions for #51 (exec-fn source mapping).
     pub span_marks: Vec<(usize, String)>,
 }
 
+/// Mutable landmarks state threaded through every `write_*` function
+/// during emission. Replaces an earlier post-pp `scan_span_marks`
+/// pass that walked the output text looking for `/- @rust:LOC -/`
+/// markers — that approach worked but was fragile (a path
+/// containing `-/` would terminate the comment prematurely and lose
+/// entries) and O(n × m). Direct push during emission is structurally
+/// correct and O(1) per mark.
+struct Landmarks {
+    tactic_starts: Vec<usize>,
+    span_marks: Vec<(usize, String)>,
+}
+
 pub fn pp_commands(cmds: &[Command]) -> PpOutput {
     let mut out = String::new();
-    let mut tactic_starts = Vec::new();
+    let mut lm = Landmarks { tactic_starts: Vec::new(), span_marks: Vec::new() };
     for cmd in cmds {
-        write_command(&mut out, cmd, &mut tactic_starts);
+        write_command(&mut out, cmd, &mut lm);
     }
-    let span_marks = scan_span_marks(&out);
-    PpOutput { text: out, tactic_starts, span_marks }
+    PpOutput { text: out, tactic_starts: lm.tactic_starts, span_marks: lm.span_marks }
 }
 
-/// Scan the rendered Lean text for `/-! @rust:LOC -/` markers
-/// emitted by `ExprNode::SpanMark` rendering. Returns
-/// `(lean_line, rust_loc)` pairs in source order — `lean_line` is
-/// the 1-indexed line where the marker starts (which is also the
-/// line where the marked sub-expression effectively begins, since
-/// the marker is inline with no newline before the inner expr).
-///
-/// Cheap O(n) scan over the output. Avoids threading `span_marks`
-/// through ~50 `write_*` call sites.
-fn scan_span_marks(text: &str) -> Vec<(usize, String)> {
-    let needle = "/- @rust:";
-    let close = " -/";
-    let mut marks = Vec::new();
-    // `match_indices` returns valid char-boundary byte offsets, so
-    // we don't have to track byte-vs-char boundaries ourselves
-    // (the generated text contains multi-byte UTF-8 like `∧`, `→`).
-    for (byte_pos, _) in text.match_indices(needle) {
-        let start = byte_pos + needle.len();
-        let Some(rel_end) = text[start..].find(close) else { continue };
-        let loc = text[start..start + rel_end].trim().to_string();
-        // Count newlines up to (and not including) this marker's
-        // byte position to derive the 1-indexed line number.
-        let line = 1 + text[..byte_pos].bytes().filter(|&b| b == b'\n').count();
-        marks.push((line, loc));
-    }
-    marks
-}
-
-/// Render a single command. Discards any tactic-start landmarks; use
+/// Render a single command. Discards any landmarks; use
 /// `pp_commands` when you need them.
 pub fn pp_command(cmd: &Command) -> String {
     let mut out = String::new();
-    let mut discard = Vec::new();
-    write_command(&mut out, cmd, &mut discard);
+    let mut lm = Landmarks { tactic_starts: Vec::new(), span_marks: Vec::new() };
+    write_command(&mut out, cmd, &mut lm);
     out
 }
 
 pub fn pp_expr(e: &Expr) -> String {
     let mut out = String::new();
-    write_expr(&mut out, e, 0);
+    let mut lm = Landmarks { tactic_starts: Vec::new(), span_marks: Vec::new() };
+    write_expr(&mut out, e, 0, &mut lm);
     out
 }
 
 pub fn pp_pattern(p: &Pattern) -> String {
     let mut out = String::new();
-    write_pattern(&mut out, p);
+    let mut lm = Landmarks { tactic_starts: Vec::new(), span_marks: Vec::new() };
+    write_pattern(&mut out, p, &mut lm);
     out
 }
 
@@ -186,7 +171,7 @@ fn current_line(out: &str) -> usize {
 
 // ── Command writers ─────────────────────────────────────────────────────
 
-fn write_command(out: &mut String, cmd: &Command, tactic_starts: &mut Vec<usize>) {
+fn write_command(out: &mut String, cmd: &Command, lm: &mut Landmarks) {
     match cmd {
         Command::Raw(s) => {
             out.push_str(s);
@@ -216,18 +201,18 @@ fn write_command(out: &mut String, cmd: &Command, tactic_starts: &mut Vec<usize>
         }
         Command::Mutual(cmds) => {
             out.push_str("mutual\n");
-            for c in cmds { write_command(out, c, tactic_starts); }
+            for c in cmds { write_command(out, c, lm); }
             out.push_str("end\n\n");
         }
-        Command::Def(d) => write_def(out, d),
-        Command::Theorem(t) => write_theorem(out, t, tactic_starts),
-        Command::Datatype(dt) => write_datatype(out, dt),
-        Command::Class(c) => write_class(out, c),
-        Command::Instance(i) => write_instance(out, i),
+        Command::Def(d) => write_def(out, d, lm),
+        Command::Theorem(t) => write_theorem(out, t, lm),
+        Command::Datatype(dt) => write_datatype(out, dt, lm),
+        Command::Class(c) => write_class(out, c, lm),
+        Command::Instance(i) => write_instance(out, i, lm),
     }
 }
 
-fn write_def(out: &mut String, d: &Def) {
+fn write_def(out: &mut String, d: &Def, lm: &mut Landmarks) {
     for attr in &d.attrs {
         out.push_str("@[");
         out.push_str(attr);
@@ -238,41 +223,41 @@ fn write_def(out: &mut String, d: &Def) {
     // than making every caller set a flag that's always true, bake it in.
     out.push_str("noncomputable def ");
     out.push_str(&d.name);
-    write_binders(out, &d.binders);
+    write_binders(out, &d.binders, lm);
     out.push_str(" : ");
-    write_expr(out, &d.ret_ty, 0);
+    write_expr(out, &d.ret_ty, 0, lm);
     out.push_str(" :=\n  ");
-    write_expr(out, &d.body, 0);
+    write_expr(out, &d.body, 0, lm);
     out.push('\n');
     match d.termination_by.as_slice() {
         [] => {}
         [single] => {
             out.push_str("termination_by ");
-            write_expr(out, single, 0);
+            write_expr(out, single, 0, lm);
             out.push('\n');
         }
         many => {
             out.push_str("termination_by (");
             for (i, e) in many.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
-                write_expr(out, e, 0);
+                write_expr(out, e, 0, lm);
             }
             out.push_str(")\n");
         }
     }
 }
 
-fn write_theorem(out: &mut String, t: &Theorem, tactic_starts: &mut Vec<usize>) {
+fn write_theorem(out: &mut String, t: &Theorem, lm: &mut Landmarks) {
     out.push_str("theorem ");
     out.push_str(&t.name);
-    write_binders(out, &t.binders);
+    write_binders(out, &t.binders, lm);
     out.push_str(" :\n    ");
-    write_expr(out, &t.goal, 0);
+    write_expr(out, &t.goal, 0, lm);
     out.push_str(" := by\n");
-    write_tactic_block(out, &t.tactic, "  ", tactic_starts);
+    write_tactic_block(out, &t.tactic, "  ", lm);
 }
 
-fn write_datatype(out: &mut String, dt: &Datatype) {
+fn write_datatype(out: &mut String, dt: &Datatype, lm: &mut Landmarks) {
     match &dt.kind {
         DatatypeKind::Structure { fields } => {
             out.push_str("structure ");
@@ -287,7 +272,7 @@ fn write_datatype(out: &mut String, dt: &Datatype) {
                 out.push_str("  ");
                 out.push_str(&f.name);
                 out.push_str(" : ");
-                write_expr(out, &f.ty, 0);
+                write_expr(out, &f.ty, 0, lm);
                 out.push('\n');
             }
         }
@@ -307,7 +292,7 @@ fn write_datatype(out: &mut String, dt: &Datatype) {
                     out.push_str(" (");
                     out.push_str(&f.name);
                     out.push_str(" : ");
-                    write_expr(out, &f.ty, 0);
+                    write_expr(out, &f.ty, 0, lm);
                     out.push(')');
                 }
                 out.push('\n');
@@ -321,37 +306,37 @@ fn write_datatype(out: &mut String, dt: &Datatype) {
     }
 }
 
-fn write_class(out: &mut String, c: &Class) {
+fn write_class(out: &mut String, c: &Class, lm: &mut Landmarks) {
     out.push_str("class ");
     out.push_str(&c.name);
-    write_binders(out, &c.typ_params);
-    write_binders(out, &c.bounds);
+    write_binders(out, &c.typ_params, lm);
+    write_binders(out, &c.bounds, lm);
     out.push_str(" where\n");
     for m in &c.methods {
         out.push_str("  ");
         out.push_str(&m.name);
         out.push_str(" : ");
-        write_expr(out, &m.ty, 0);
+        write_expr(out, &m.ty, 0, lm);
         out.push('\n');
     }
 }
 
-fn write_instance(out: &mut String, i: &Instance) {
+fn write_instance(out: &mut String, i: &Instance, lm: &mut Landmarks) {
     out.push_str("noncomputable instance");
-    write_binders(out, &i.binders);
+    write_binders(out, &i.binders, lm);
     out.push_str(" : ");
-    write_expr(out, &i.target, 0);
+    write_expr(out, &i.target, 0, lm);
     out.push_str(" where\n");
     for m in &i.methods {
         out.push_str("  ");
         out.push_str(&m.name);
         out.push_str(" := ");
-        write_expr(out, &m.body, 0);
+        write_expr(out, &m.body, 0, lm);
         out.push('\n');
     }
 }
 
-fn write_binders(out: &mut String, binders: &[Binder]) {
+fn write_binders(out: &mut String, binders: &[Binder], lm: &mut Landmarks) {
     for b in binders {
         out.push(' ');
         let (lo, hi) = match b.kind {
@@ -367,7 +352,7 @@ fn write_binders(out: &mut String, binders: &[Binder]) {
         if matches!(b.kind, BinderKind::OutParam) {
             out.push_str("outParam ");
         }
-        write_expr(out, &b.ty, 0);
+        write_expr(out, &b.ty, 0, lm);
         out.push(hi);
     }
 }
@@ -378,14 +363,14 @@ fn write_tactic_block(
     out: &mut String,
     t: &Tactic,
     indent: &str,
-    tactic_starts: &mut Vec<usize>,
+    lm: &mut Landmarks,
 ) {
     match t {
         Tactic::Raw(body) => {
             // Record the 1-indexed line where the first character of the
             // raw body lands. `LeanSourceMap` uses this to map Lean-reported
             // positions back to offsets within the user's tactic text.
-            tactic_starts.push(current_line(out));
+            lm.tactic_starts.push(current_line(out));
             for line in body.lines() {
                 if line.trim().is_empty() {
                     out.push('\n');
@@ -406,15 +391,15 @@ fn write_tactic_block(
 
 // ── Expression writer ──────────────────────────────────────────────────
 
-fn write_expr(out: &mut String, e: &Expr, parent_prec: u16) {
+fn write_expr(out: &mut String, e: &Expr, parent_prec: u16, lm: &mut Landmarks) {
     let my_prec = expr_prec(&e.node);
     let needs_parens = my_prec < parent_prec;
     if needs_parens { out.push('('); }
-    write_expr_body(out, &e.node);
+    write_expr_body(out, &e.node, lm);
     if needs_parens { out.push(')'); }
 }
 
-fn write_expr_body(out: &mut String, node: &ExprNode) {
+fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
     match node {
         ExprNode::Var(s) => out.push_str(s),
         ExprNode::Lit(s) => {
@@ -456,11 +441,11 @@ fn write_expr_body(out: &mut String, node: &ExprNode) {
                 Assoc::Right => (p + 1, p),
                 Assoc::None_ => (p + 1, p + 1),
             };
-            write_expr(out, lhs, lp);
+            write_expr(out, lhs, lp, lm);
             out.push(' ');
             out.push_str(binop_symbol(*op));
             out.push(' ');
-            write_expr(out, rhs, rp);
+            write_expr(out, rhs, rp, lm);
         }
 
         ExprNode::UnOp { op, arg } => {
@@ -471,17 +456,17 @@ fn write_expr_body(out: &mut String, node: &ExprNode) {
             });
             // Unary ops tuck tight — emit arg at prec APP so any non-atom
             // arg (including another UnOp) parenthesizes.
-            write_expr(out, arg, PREC_APP);
+            write_expr(out, arg, PREC_APP, lm);
         }
 
         ExprNode::App { head, args } => {
             if args.is_empty() {
-                write_expr(out, head, PREC_ATOM);
+                write_expr(out, head, PREC_ATOM, lm);
             } else {
-                write_expr(out, head, PREC_APP);
+                write_expr(out, head, PREC_APP, lm);
                 for a in args {
                     out.push(' ');
-                    write_expr(out, a, PREC_APP + 1);
+                    write_expr(out, a, PREC_APP + 1, lm);
                 }
             }
         }
@@ -490,75 +475,75 @@ fn write_expr_body(out: &mut String, node: &ExprNode) {
             out.push_str("let ");
             out.push_str(name);
             out.push_str(" := ");
-            write_expr(out, value, 0);
+            write_expr(out, value, 0, lm);
             out.push_str(";\n    ");
-            write_expr(out, body, 0);
+            write_expr(out, body, 0, lm);
         }
         ExprNode::Lambda { binders, body } => {
             out.push_str("fun");
-            write_binders(out, binders);
+            write_binders(out, binders, lm);
             out.push_str(" => ");
-            write_expr(out, body, 0);
+            write_expr(out, body, 0, lm);
         }
         ExprNode::Forall { binders, body } => {
             out.push('∀');
-            write_binders(out, binders);
+            write_binders(out, binders, lm);
             out.push_str(", ");
-            write_expr(out, body, 0);
+            write_expr(out, body, 0, lm);
         }
         ExprNode::Exists { binders, body } => {
             out.push('∃');
-            write_binders(out, binders);
+            write_binders(out, binders, lm);
             out.push_str(", ");
-            write_expr(out, body, 0);
+            write_expr(out, body, 0, lm);
         }
 
         ExprNode::If { cond, then_, else_ } => {
             out.push_str("if ");
-            write_expr(out, cond, 0);
+            write_expr(out, cond, 0, lm);
             out.push_str(" then ");
-            write_expr(out, then_, 0);
+            write_expr(out, then_, 0, lm);
             if let Some(e) = else_ {
                 out.push_str(" else ");
-                write_expr(out, e, 0);
+                write_expr(out, e, 0, lm);
             }
         }
 
         ExprNode::Match { scrutinee, arms } => {
             out.push_str("match ");
-            write_expr(out, scrutinee, 0);
+            write_expr(out, scrutinee, 0, lm);
             out.push_str(" with");
             for arm in arms {
                 out.push_str(" | ");
-                write_pattern(out, &arm.pattern);
+                write_pattern(out, &arm.pattern, lm);
                 out.push_str(" => ");
-                write_expr(out, &arm.body, 0);
+                write_expr(out, &arm.body, 0, lm);
             }
         }
 
         ExprNode::TypeAnnot { expr, ty } => {
             out.push('(');
-            write_expr(out, expr, 0);
+            write_expr(out, expr, 0, lm);
             out.push_str(" : ");
-            write_expr(out, ty, 0);
+            write_expr(out, ty, 0, lm);
             out.push(')');
         }
 
         ExprNode::FieldProj { expr, field } => {
-            write_expr(out, expr, PREC_ATOM);
+            write_expr(out, expr, PREC_ATOM, lm);
             out.push('.');
             out.push_str(field);
         }
 
         ExprNode::StructUpdate { base, updates } => {
             out.push_str("{ ");
-            write_expr(out, base, 0);
+            write_expr(out, base, 0, lm);
             out.push_str(" with ");
             for (i, (name, val)) in updates.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
                 out.push_str(name);
                 out.push_str(" := ");
-                write_expr(out, val, 0);
+                write_expr(out, val, 0, lm);
             }
             out.push_str(" }");
         }
@@ -567,15 +552,15 @@ fn write_expr_body(out: &mut String, node: &ExprNode) {
             out.push('[');
             for (i, e) in elts.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
-                write_expr(out, e, 0);
+                write_expr(out, e, 0, lm);
             }
             out.push(']');
         }
 
         ExprNode::Index { base, idx } => {
-            write_expr(out, base, PREC_ATOM);
+            write_expr(out, base, PREC_ATOM, lm);
             out.push('[');
-            write_expr(out, idx, 0);
+            write_expr(out, idx, 0, lm);
             out.push(']');
         }
 
@@ -583,36 +568,40 @@ fn write_expr_body(out: &mut String, node: &ExprNode) {
             out.push('⟨');
             for (i, e) in elts.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
-                write_expr(out, e, 0);
+                write_expr(out, e, 0, lm);
             }
             out.push('⟩');
         }
 
         // SpanMark: transparent at the value level. Emit a leading
         // `/- @rust:LOC -/` block-comment marker in the Lean
-        // output so `scan_span_marks` (called by `pp_commands`)
-        // can later map Lean error lines back to Rust source
-        // positions (#51). Regular block comments (`/- ... -/`)
-        // are valid anywhere whitespace is (unlike `/-!`, which
-        // Lean treats as a module docstring and rejects inline).
-        // Terminates only on `-/`; we strip newlines from the loc
-        // text defensively but otherwise preserve it as-is. Paths
-        // containing `-/` would break the comment, but in practice
-        // Verus's `Span::as_string` is `path:line:col` with no
-        // `-/`.
+        // output AND record `(current_line, rust_loc)` directly in
+        // the landmarks struct (#51 source mapping). The comment
+        // is kept in the output as a debug aid for users
+        // inspecting the generated `.lean` file; the structured
+        // landmark is what `LeanSourceMap::find_rust_loc` reads
+        // at error-formatting time. Regular block comments (`/-
+        // ... -/`) are valid anywhere whitespace is (unlike
+        // `/-!`, which Lean treats as a module docstring and
+        // rejects inline). We strip newlines from the loc text
+        // defensively.
         ExprNode::SpanMark { rust_loc, inner } => {
+            // Sanitize: strip newlines so a multi-line loc can't
+            // break the block comment AND so the recorded
+            // landmark string has no embedded newlines.
+            let sanitized: String = rust_loc.chars()
+                .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                .collect();
+            lm.span_marks.push((current_line(out), sanitized.clone()));
             out.push_str("/- @rust:");
-            for c in rust_loc.chars() {
-                if c == '\n' || c == '\r' { out.push(' '); }
-                else { out.push(c); }
-            }
+            out.push_str(&sanitized);
             out.push_str(" -/ ");
-            write_expr_body(out, &inner.node);
+            write_expr_body(out, &inner.node, lm);
         }
     }
 }
 
-fn write_pattern(out: &mut String, p: &Pattern) {
+fn write_pattern(out: &mut String, p: &Pattern, lm: &mut Landmarks) {
     match p {
         Pattern::Var(s) => out.push_str(s),
         Pattern::Wildcard => out.push('_'),
@@ -622,21 +611,21 @@ fn write_pattern(out: &mut String, p: &Pattern) {
                 out.push(' ');
                 let needs = matches!(a, Pattern::Ctor { args, .. } if !args.is_empty());
                 if needs { out.push('('); }
-                write_pattern(out, a);
+                write_pattern(out, a, lm);
                 if needs { out.push(')'); }
             }
         }
         Pattern::Or(l, r) => {
-            write_pattern(out, l);
+            write_pattern(out, l, lm);
             out.push_str(" | ");
-            write_pattern(out, r);
+            write_pattern(out, r, lm);
         }
         Pattern::Binding { name, sub } => {
             out.push_str(name);
             out.push('@');
-            write_pattern(out, sub);
+            write_pattern(out, sub, lm);
         }
-        Pattern::Lit(node) => write_expr_body(out, node),
+        Pattern::Lit(node) => write_expr_body(out, node, lm),
     }
 }
 
