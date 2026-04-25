@@ -67,6 +67,13 @@ elab "tactus_case_split" : tactic => do
             -- `.height` companion (i.e., our user datatypes).
             let heightName := Name.str name "height"
             if env.find? heightName |>.isNone then continue
+            -- `cases` can fail for reasons other than the wrong
+            -- decl (e.g., dependent indices that prevent
+            -- substitution). Catching silently lets the loop try
+            -- the next candidate decl. If ALL candidates fail we
+            -- fall through to `return result` (the unchanged
+            -- goal), and `tactus_auto`'s `first` falls to the
+            -- next alternative or the `fail` branch.
             try
               let subgoals ← goal.cases decl.fvarId
               return subgoals.map (·.mvarId) |>.toList

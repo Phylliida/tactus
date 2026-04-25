@@ -307,9 +307,7 @@ fn height_fn_for_datatype(dt: &DatatypeX, path: &str) -> Option<Command> {
 /// pointer shape at the Rust level but render as just `Self`
 /// at the Lean type level.
 fn field_is_self_recursive(typ: &Typ, self_path: &Path) -> bool {
-    match &**typ {
-        TypX::Boxed(inner) | TypX::Decorate(_, _, inner) =>
-            field_is_self_recursive(inner, self_path),
+    match &**crate::to_lean_sst_expr::peel_typ_wrappers(typ) {
         TypX::Datatype(Dt::Path(p), args, _) if args.is_empty() =>
             p == self_path,
         _ => false,
