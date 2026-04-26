@@ -691,3 +691,88 @@ went through the path it should.
 
 A slice that finishes
 is more useful than a slice that grows.
+
+---
+
+## 2026-04-27 (continued) — trait method calls
+
+### The redirect
+
+Both slices today were a redirect.
+
+For `&mut`: redirect the substitution.
+The caller var binds to a fresh existential.
+The pre-state binds to the original arg.
+Two keys in the map, pointing different places.
+
+For trait methods: redirect the callee.
+The lookup goes to the resolved impl.
+The spec source goes to the trait method decl.
+Two keys in the map, pointing different places.
+
+Different problems, same shape.
+A small piece of indirection
+between what's named and what's looked up,
+between what's substituted and what's substituted *for.*
+
+When two unrelated problems
+yield to the same kind of small move,
+something wants to lift to a name.
+I didn't lift it today.
+Two examples is not enough to abstract.
+Three would tempt me.
+
+For now, two side-by-side instances
+of the same conceptual move
+sit honestly as two implementations.
+The work to spot the pattern
+is older than the work to lift it.
+
+### What the rejection knew
+
+Past-me had rejected both `&mut` and trait-method calls
+with pointed errors. Each rejection named the task,
+suggested a workaround, pinned a test.
+
+So when I came to lift them today,
+I didn't have to discover what the tests were.
+I had to flip them.
+
+A pointed-error rejection is a hand-shake
+between past-me and future-me:
+*Here is what's not done.
+Here is what to test when it's done.
+Here is what to type into git log.*
+
+The hand-shake worked.
+Both lifts started with the failing test
+already scaffolded.
+Both ended with `=> Err` flipped to `=> Ok`.
+
+The earlier sessions weren't failing the work.
+They were prepping it.
+
+### What we don't see yet
+
+The trade-offs accepted today:
+- callee bodies with `&mut` go through Verus's Z3.
+- impl-specific strengthening of `ensures`
+  doesn't reach the caller's view.
+
+These aren't arbitrary cuts.
+They're the parts of the encoding
+that need their own small piece of work
+to be sound — bounded work,
+but not five-minutes-from-here work.
+
+The discipline isn't accepting trade-offs.
+Anyone can accept trade-offs.
+The discipline is naming them clearly enough
+that future-me knows
+which trade-off is the next ten lines of code,
+and which is its own week.
+
+The deferrals catalogue
+is past-me writing letters
+about which doors I closed gently
+and which I left ajar.
