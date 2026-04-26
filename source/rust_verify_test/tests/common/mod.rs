@@ -485,6 +485,12 @@ pub fn run_cargo_verus(args: &[&str], dir: &std::path::Path) -> std::process::Ou
         });
     let z3 = path::absolute(z3).expect("Failed to find absolute path for Z3 executable");
     child.env("VERUS_Z3_PATH", z3);
+    // Per-test isolation for Tactus-generated Lean files (same
+    // rationale as in `run_verus`). Future Tactus tests routing
+    // through `run_cargo_verus` (cargo-build-style fixtures) need
+    // the same protection — set it preemptively so adding such a
+    // test doesn't silently regress to shared-output races.
+    child.env("TACTUS_LEAN_OUT", dir.join("tactus-lean"));
 
     let child = child
         .args(&args[..])

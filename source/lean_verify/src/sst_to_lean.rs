@@ -321,12 +321,13 @@ fn check_exp(e: &Exp) -> Result<(), String> {
 /// Walker arms:
 ///
 /// * **`Wp::Done(leaf)`** — emit one theorem per top-level
-///   conjunct of `leaf`. Top-level fn-ensures conjuncts produce
-///   `_tactus_ensures_<fn>_<id>`; loop-body terminator conjuncts
-///   produce `_tactus_loop_invariant_<fn>_at_<loc>_<id>` and
-///   `_tactus_loop_decrease_<fn>_at_<loc>_<id>` because each
-///   conjunct carries a SpanMark with its kind from
-///   `build_wp_loop`.
+///   conjunct of `leaf`. Each fn-ensures clause is wrapped in a
+///   `Postcondition` SpanMark at `WpCtx::new` time, yielding
+///   `_tactus_postcondition_<fn>_at_<loc>_<id>` per clause;
+///   loop-body terminator conjuncts (each invariant + the
+///   decrease) are similarly pre-wrapped by `build_wp_loop`,
+///   yielding `_tactus_loop_invariant_*` and
+///   `_tactus_loop_decrease_*`.
 /// * **`Wp::Assert(P, body)`** — one theorem for `P` (kind
 ///   detected via `detect_assert_kind`: Termination for
 ///   `CheckDecreaseHeight`, Plain otherwise). Body walked with
@@ -418,9 +419,9 @@ enum CtxFrame {
     /// assertions that already passed (the asserted condition
     /// becomes a hypothesis for the rest of the body).
     Hyp(LExpr),
-    /// `∀ (x : T),` wrapping. Stage 2's call walker pushes one
-    /// for the callee's return value; Stage 3's loop walker will
-    /// push one per modified variable.
+    /// `∀ (x : T),` wrapping. `walk_call` pushes one for the
+    /// callee's return value; `walk_loop` pushes one per modified
+    /// variable in maintain / use ctx.
     Binder(LBinder),
 }
 
@@ -827,18 +828,19 @@ fn build_theorem_name(kind_label: &str, fn_name: &str, loc: &str, id: usize) -> 
     }
 }
 
-/// Per-obligation walker for `Wp::Loop`. Emits init theorems (one
-/// per invariant), walks the body in a maintain context, and walks
-/// `after` in a use context. Per-obligation equivalent of
-/// [`lower_loop`]'s `init ∧ maintain ∧ use` conjunctive form —
-/// splitting it so each invariant's init/maintain check, the
-/// decrease-decreased check, and the post-loop continuation get
-/// their own pos.line in Lean.
+/// Per-obligation walker for `Wp::Loop`. Splits the loop's
+/// obligations across separate Lean theorems so each gets its own
+/// `pos.line`:
 ///
-/// The body's `Done(I ∧ D < d_old)` terminator (built by
-/// `build_wp_loop`) flows naturally through `walk_obligations`'s
-/// `Wp::Done` arm via [`emit_done_or_split`], producing one
-/// theorem per conjunct (each invariant + the decrease).
+/// * **Init**: one theorem per invariant (entry check).
+/// * **Maintain**: walk the body in maintain ctx (∀ mod_vars +
+///   bounds + invs as hyps + cond as hyp + `_tactus_d_old := D`
+///   let). The body's `Done(I ∧ D < d_old)` terminator flows
+///   through `walk_obligations`'s `Wp::Done` arm via
+///   [`emit_done_or_split`], producing one theorem per conjunct
+///   (each invariant + the decrease).
+/// * **Use**: walk `after` in use ctx (∀ mod_vars + bounds +
+///   invs as hyps + ¬cond as hyp).
 fn walk_loop<'a>(
     cond: Option<&Exp>,
     invs: &[LoopInv],
@@ -929,17 +931,21 @@ fn push_mod_var_frames<'a>(
     }
 }
 
-/// Per-obligation walker for `Wp::Call`. Emits one theorem for the
-/// callee's precondition (substituted with call-site args), then
-/// continues walking `after` with the extended context: a `∀ ret`
-/// binder, the ret's type-bound hypothesis (if any), the callee's
-/// substituted `ensures` as a hypothesis, and a `let dest := ret`
-/// if the call has a destination var. Per-obligation equivalent of
-/// [`lower_call`]'s
-/// `requires ∧ ∀ ret, bound → ensures → let dest := ret; <after>`
-/// shape — splitting it into a precondition theorem (Lean checks
-/// `requires`) plus a richer context for the continuation (which
-/// produces its own theorems via the recursive walk).
+/// Per-obligation walker for `Wp::Call`. Splits the call's
+/// obligations across separate theorems:
+///
+/// * Emit one theorem for the callee's precondition (substituted
+///   with call-site args, wrapped with `CallPrecondition`
+///   SpanMark). Skipped when `callee.require` is empty — the
+///   goal would be `True` and the theorem would be wasted noise.
+/// * Walk `after` with extended context frames: `∀ ret` binder,
+///   `ret_bound →` if the return type has one, `ensures(subst) →`
+///   if `callee.ensure` is non-empty, and `let dest := ret;` if
+///   the call has a destination var.
+///
+/// Substitution combines value params (`p ↦ arg`) and type
+/// params (`T ↦ typ_arg`); `TypParam(T)` renders as `Var("T")`
+/// so the value-level `lean_ast::substitute` rewrites both kinds.
 fn walk_call<'a>(
     callee: &FunctionX,
     args: &[Exp],
@@ -952,10 +958,9 @@ fn walk_call<'a>(
     e: &mut ObligationEmitter,
 ) {
     // Substitution map combining value params → call-site args and
-    // type params → call-site type expressions. Mirrors `lower_call`
-    // exactly so the per-obligation form produces the same logical
-    // content as the prior single-theorem form. `TypParam(T)` renders
-    // as `Var("T")` so the value-level substitute rewrites both kinds.
+    // type params → call-site type expressions. `TypParam(T)`
+    // renders as `Var("T")` so the value-level substitute rewrites
+    // both kinds in one pass.
     let params_vec: Vec<_> = callee.params.iter().collect();
     let mut subst: std::collections::HashMap<String, LExpr> = params_vec.iter()
         .zip(args.iter())
@@ -1024,12 +1029,14 @@ fn walk_call<'a>(
     walk_obligations(after, ctx, &new_obl, e);
 }
 
-/// `Wp::Let` walker with if-RHS lifting (mirrors `lift_if_value`'s
-/// behaviour in `lower_wp`). `let x := if c then a else b; rest`
-/// forks into two recursive walks, each with cond as a hypothesis
-/// frame and the corresponding branch as the let value. Without
-/// this, `omega` can't see inside the value-position if and the
-/// let theorems would fail.
+/// `Wp::Let` walker with if-RHS lifting. `let x := if c then a
+/// else b; rest` forks into two recursive walks, each with cond
+/// as a hypothesis frame and the corresponding branch as the
+/// let value. Without this, `omega` can't see inside the
+/// value-position if and the let theorems would fail. Same
+/// lifting strategy as [`lift_if_value`] (used by `Return`-
+/// position values), specialized for the walker's per-
+/// obligation emission.
 fn walk_let<'a>(
     name: &'a str,
     val: &'a Exp,
@@ -1083,9 +1090,10 @@ fn simple_tactic() -> Tactic {
 
 // ── Binder builders ────────────────────────────────────────────────────
 
-/// Function params + their type-bound hypotheses. Shared across all
-/// theorems emitted for a given fn (init / maintain / use all start
-/// from these).
+/// Function params + their type-bound hypotheses. Shared across
+/// every theorem the walker emits for the fn — they sit on
+/// `ObligationEmitter::base_binders` and prepend to each
+/// theorem's binder list at emit time.
 fn build_param_binders(fn_sst: &FunctionSst) -> Vec<LBinder> {
     let mut out: Vec<LBinder> = Vec::new();
     // Type parameters first, so value params can reference them in
@@ -1340,8 +1348,10 @@ fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
         // otherwise hide the if from our lift.
         ExpX::Bind(bnd, body) => {
             if let Some((name, rhs, inner_body)) = match_single_let_bind(bnd, body) {
+                // `name` is already an owned `String` from
+                // `match_single_let_bind`; the closure captures
+                // it by reference and clones per leaf invocation.
                 let body_ast = sst_exp_to_ast(inner_body);
-                let name = name.to_string();
                 lift_if_value(rhs, &|rhs_leaf| {
                     emit_leaf(LExpr::let_bind(name.clone(), rhs_leaf, body_ast.clone()))
                 })
@@ -1515,13 +1525,15 @@ fn build_wp<'a>(
             "assert by(bit_vector) not yet supported".to_string()
         ),
         // `StmX::AssertQuery` with `AssertQueryMode::Tactus` is how
-        // `ast_to_sst` encodes an `assert(P) by { lean_tac }` inside
-        // a `tactus_auto` fn (see `ExprX::AssertBy` handling there).
-        // We read the verbatim Lean tactic text from the original
-        // file via the `tactic_span` and produce a `Wp::AssertByTactus`
-        // node; the theorem emitter walks the Wp tree, collects user
-        // tactics, and prepends them as `have` clauses before the
-        // closer.
+        // `ast_to_sst` encodes an `assert(P) by { lean_tac }` (or
+        // a `proof { lean_tac }`) inside a `tactus_auto` fn (see
+        // `ExprX::AssertBy` handling there). We read the verbatim
+        // Lean tactic text from the original file via the
+        // `tactic_span` and produce a `Wp::AssertByTactus` node;
+        // `walk_assert_by_tactus` then either emits a single
+        // theorem with the user's tactic as the closer
+        // (`assert(P) by` form) or pushes the tactic as a prefix
+        // applied via `<;>` to every body theorem (`proof` form).
         //
         // **Shape**: `body` is a single `StmX::Assert(_, _, P)` —
         // the asserted condition, produced by `ast_to_sst`'s
@@ -1776,19 +1788,20 @@ fn build_wp_loop<'a>(
     // Body's break and continue leaves:
     // * continue (and fallthrough): re-establish invariants AND show
     //   the decrease measure decreased — `I ∧ D < _tactus_d_old`.
-    //   The reference to `_tactus_d_old` here is a Var; lowering
-    //   wraps the body-WP with the `let _tactus_d_old := D` binding
-    //   to put it in scope.
+    //   The reference to `_tactus_d_old` here is a Var; `walk_loop`
+    //   pushes a `Let("_tactus_d_old", D)` frame onto the maintain
+    //   ctx so the body's continue_leaf sees it in scope.
     // * break: establish the at-exit invariants, which currently
     //   equals `I` (we only accept invariants with at_entry = at_exit
     //   = true — see validation above). No decrease obligation on
     //   break since we're leaving the loop, not iterating.
-    // Wrap each invariant + the decrease comparison with a SpanMark
-    // carrying the right `AssertKind`. When the per-obligation walker
-    // (D Stage 3) splits a body's terminator at top-level conjunction,
-    // each leaf retains its kind for theorem naming. Without these
-    // wrappers, every conjunct would be labeled `ensures` (the
-    // unwrapped default in `emit_done_or_split`).
+    //
+    // Each invariant + the decrease comparison is wrapped in its
+    // own `SpanMark` with the right `AssertKind` here, so that when
+    // `emit_done_or_split` splits the body's terminator at top-
+    // level conjunction, each leaf retains its kind for theorem
+    // naming. Without these wrappers, the unwrapped default
+    // (`"ensures"`) would label every conjunct.
     let inv_conj = and_all(invs.iter().map(|i| LExpr::span_mark(
         format_rust_loc(&i.inv.span),
         AssertKind::LoopInvariant,
