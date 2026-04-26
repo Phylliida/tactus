@@ -354,7 +354,25 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
         ExpX::Unary(UnaryOp::CoerceMode { .. }, inner)
         | ExpX::Unary(UnaryOp::Trigger(_), inner) => exp_to_node_checked(inner)?,
         ExpX::Unary(op, _) => {
-            return Err(format!("unsupported unary op: {:?}", op));
+            // The exec-fn SST path is conservative — we accept Not /
+            // Clip / CoerceMode / Trigger directly above, and reject
+            // the rest. Common surface forms reaching here:
+            // * `BitNot(_)` — `!x` on int types (`!0u8`, `!x` for
+            //   signed types). The proof-fn / spec-fn path handles
+            //   it; lifting to exec-fn requires extending
+            //   `to_lean_sst_expr` to mirror `to_lean_expr`.
+            // * `IntToReal` / `RealToInt` / `FloatToBits` /
+            //   `IeeeFloat` — float ops; Verus rejects floats
+            //   upstream so these are only reachable in spec.
+            // * `MutRefCurrent` / `MutRefFuture` — new-mut-ref mode
+            //   (#95 follow-up to #55).
+            return Err(format!(
+                "unsupported unary op `{:?}` in exec-fn body — the SST renderer \
+                 accepts only Not / Clip / CoerceMode / Trigger today. See \
+                 DESIGN.md \"Expression-level forms rejected by \
+                 sst_exp_to_ast_checked\" for the catalogue.",
+                op
+            ));
         }
 
         // Box/Unbox: transparent. Field projection.
@@ -453,10 +471,22 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 return Ok(cmp.node);
             }
             match op {
-                BinaryOp::Index(_, _)
-                | BinaryOp::StrGetChar
-                | BinaryOp::IeeeFloat(_) => {
-                    return Err(format!("unsupported binary op: {:?}", op));
+                BinaryOp::Index(_, _) => {
+                    return Err(
+                        "array/slice indexing (`a[i]`) not yet supported in \
+                         exec fns (#91)".to_string()
+                    );
+                }
+                BinaryOp::StrGetChar => {
+                    return Err(
+                        "string character lookup not yet supported in exec fns".to_string()
+                    );
+                }
+                BinaryOp::IeeeFloat(_) => {
+                    return Err(
+                        "IEEE float comparison not yet supported (Verus rejects \
+                         f32/f64 upstream; this path exists for completeness)".to_string()
+                    );
                 }
                 _ => {}
             }
@@ -585,8 +615,13 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 ));
             }
         }
-        ExpX::Call(CallFun::InternalFun(_), _, _) => {
-            return Err("internal function calls not yet supported".to_string());
+        ExpX::Call(CallFun::InternalFun(internal_fun), _, _) => {
+            return Err(format!(
+                "calls to Verus's internal `{:?}` builtin not yet supported in \
+                 exec fns (only `CheckDecreaseHeight` is lowered today). See \
+                 DESIGN.md \"Expression-level forms rejected\" for the list.",
+                internal_fun
+            ));
         }
 
         ExpX::Bind(bnd, body) => match &bnd.x {
@@ -651,23 +686,33 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
 
         // Forms we don't know how to render.
         ExpX::CallLambda(..) => return Err(
-            "closure calls not yet supported in exec fns".to_string()
+            "closure calls not yet supported in exec fns (#93). Workaround: \
+             extract the closure into a named fn.".to_string()
         ),
         ExpX::ArrayLiteral(_) => return Err(
-            "array literals not yet supported in exec fns".to_string()
+            "array literal `[a, b, c]` not yet supported in exec fns (Verus \
+             rejects these upstream when slice indexing is unwired, so this is \
+             usually unreachable)".to_string()
         ),
+        // Internal-bug rejection (see ExpX::Old's `Snapshot reference for
+        // generating AIR Old expressions; only used during sst_to_air`
+        // docstring in `vir/sst.rs`). User-syntax `old(x)` lowers to
+        // `ExpX::VarAt(x, Pre)` at AST→SST time, which Tactus handles
+        // directly. Hitting this means Verus's pipeline changed; please
+        // open an issue.
         ExpX::Old(..) => return Err(
-            "ExpX::Old is an internal Verus form (snapshot reference for sst_to_air's \
-             AIR encoding) that shouldn't escape into the SST we see. User-written \
-             `old(x)` syntax lowers to `ExpX::VarAt(x, Pre)` at AST→SST time, which \
-             Tactus handles directly (the `&mut` callee-spec rewrite at #55 uses it). \
-             If this fires, Verus's pipeline has changed and ExpX::Old is leaking; \
-             check sst_to_air invariants.".to_string()
+            "ExpX::Old leaked from Verus's sst_to_air pipeline into Tactus's \
+             SST input — internal bug, please open an issue.".to_string()
         ),
         ExpX::Interp(_) => return Err(
-            "Interp nodes should never escape the interpreter (internal bug)".to_string()
+            "Interp nodes should never escape the interpreter — internal bug, \
+             please open an issue.".to_string()
         ),
-        ExpX::FuelConst(_) => return Err("FuelConst not yet supported".to_string()),
+        ExpX::FuelConst(_) => return Err(
+            "`reveal_with_fuel(f, n)` not yet supported in exec fns (#84). \
+             Workaround: use `reveal(f)` if available, or ensure the fn's \
+             default fuel is sufficient.".to_string()
+        ),
     })
 }
 

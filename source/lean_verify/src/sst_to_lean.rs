@@ -1972,12 +1972,19 @@ fn build_wp<'a>(
         // rather than a single innermost one.
         StmX::BreakOrContinue { label, is_break } => {
             if label.is_some() {
-                return Err("labeled break / continue not yet supported".to_string());
+                return Err(
+                    "labeled `break 'label;` / `continue 'label;` not yet \
+                     supported (#88). Workaround: refactor to remove the \
+                     label, or use a flag variable + unlabeled break.".to_string()
+                );
             }
             let Some(leaves) = loop_ctx else {
+                // Should never fire — Verus's mode checker rejects
+                // break/continue outside loops upstream.
                 return Err(
-                    "break / continue outside a loop — SST mode-checker invariant \
-                     violated".to_string()
+                    "break / continue appeared outside any loop — Verus's mode \
+                     checker should have caught this; please open an issue."
+                        .to_string()
                 );
             };
             let leaf = if *is_break {
@@ -1988,7 +1995,10 @@ fn build_wp<'a>(
             Ok(Wp::Done(leaf))
         }
         StmX::AssertBitVector { .. } => Err(
-            "assert by(bit_vector) not yet supported".to_string()
+            "`assert(...) by(bit_vector)` not yet supported — Tactus has no \
+             bitvector reasoning backend. Workaround: prove the property \
+             via `assert(P) by { … }` with a Lean tactic (e.g., \
+             `decide` for small bitwidths) inside a `tactus_auto` fn.".to_string()
         ),
         // `StmX::AssertQuery` with `AssertQueryMode::Tactus` is how
         // `ast_to_sst` encodes an `assert(P) by { lean_tac }` (or
@@ -2053,9 +2063,20 @@ fn build_wp<'a>(
                 ),
             }
         }
-        StmX::DeadEnd(_) => Err("DeadEnd not yet supported".to_string()),
-        StmX::OpenInvariant(_) => Err("OpenInvariant not yet supported".to_string()),
-        StmX::ClosureInner { .. } => Err("exec closures not yet supported".to_string()),
+        StmX::DeadEnd(_) => Err(
+            "Verus's internal `DeadEnd` marker reached the SST — this shouldn't \
+             appear in user code. If you're seeing this, please open an issue.".to_string()
+        ),
+        StmX::OpenInvariant(_) => Err(
+            "`open_atomic_invariant!` (atomic invariant opening) not yet supported \
+             in tactus_auto fns — out of scope until Tactus's concurrency story \
+             lands. Workaround: extract the invariant-opening logic into a \
+             non-tactus_auto fn (Verus's Z3 path handles it).".to_string()
+        ),
+        StmX::ClosureInner { .. } => Err(
+            "exec closure bodies not yet supported (#93). Workaround: extract \
+             the closure into a named fn and call it directly.".to_string()
+        ),
     }
 }
 
@@ -2311,8 +2332,16 @@ fn build_wp_loop<'a>(
     // loop instance, so two nested loops can never collide.
     let d_old_name = format!("_tactus_d_old_{}", id);
     if !loop_isolation {
+        // `loop_isolation` is set by Verus based on whether the loop
+        // body is verified independently from the outer context.
+        // Users don't control it directly — it's flipped by Verus
+        // when, e.g., the loop appears inside a closure or a context
+        // that would otherwise unsoundly leak invariants.
         return Err(
-            "non-isolated loops (loop_isolation: false) not yet supported".to_string()
+            "this loop's body would need to see outer context directly \
+             (loop_isolation: false) — not yet supported by tactus_auto. \
+             Workaround: refactor to a self-contained loop with explicit \
+             invariants.".to_string()
         );
     }
     // `cond: Some` — simple `while c { … }` (no breaks) — the
@@ -2331,7 +2360,11 @@ fn build_wp_loop<'a>(
         Some((cond_setup, cond_exp)) => {
             if !matches!(&cond_setup.x, StmX::Block(ss) if ss.is_empty()) {
                 return Err(
-                    "loop condition with setup statements not yet supported".to_string()
+                    "loop condition has a setup-statement prelude (Verus lowers \
+                     complex `while` conditions into a small statement block + \
+                     pure expression). Tactus only handles the pure-expression \
+                     case today. Workaround: extract the condition's side-\
+                     effecting parts into a let-binding before the loop.".to_string()
                 );
             }
             check_exp(cond_exp)?;
@@ -2341,13 +2374,24 @@ fn build_wp_loop<'a>(
     };
     if decrease.len() != 1 {
         return Err(format!(
-            "loop `decreases` must be a single expression (got {})", decrease.len()
+            "loop `decreases` must be a single expression — got {} (lexicographic \
+             `decreases (a, b, c)` not yet supported)",
+            decrease.len()
         ));
     }
     if !invs.iter().all(|i| i.at_entry && i.at_exit) {
+        // User's `invariant x <= n` produces at_entry=at_exit=true by
+        // default; this fires for `invariant_except_break` (loops
+        // that may exit via break with weaker exit-state) and
+        // `ensures` clauses on loops (the at-exit-only form).
+        // Tracked as #89.
         return Err(
-            "loop invariants must hold at both entry and exit (not \
-             invariant_except_break / ensures)".to_string()
+            "loop invariant has an at-entry-only or at-exit-only classification \
+             (invariant_except_break / loop ensures) — only invariants holding at \
+             both entry AND exit are supported today (#89). The user-written \
+             `invariant x <= n;` syntax produces both, so this typically only \
+             fires for desugared `while let Some(x) = it.next() { ... }` and \
+             similar.".to_string()
         );
     }
     for inv in invs.iter() {
