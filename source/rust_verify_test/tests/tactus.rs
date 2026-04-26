@@ -3173,6 +3173,136 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Negative: caller's postcondition reads the post-call value
+// incorrectly. Pins that the substituted ensures only gives us
+// `*y_post == y_pre + 1` and not `*y_post == y_pre + 2`. If the
+// substitution had a bug (e.g., dropping the +1 or aliasing pre
+// with post in the wrong direction), this test would flip to
+// Ok and silently mask the bug.
+test_verify_one_file! {
+    #[test] test_exec_call_mut_arg_wrong_post verus_code! {
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        #[verifier::tactus_auto]
+        fn call_mut(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 2  // wrong! callee promises +1
+        {
+            let mut y: u8 = x;
+            bump(&mut y);
+            y
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("postcondition")),
+            "expected postcondition failure, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
+// Negative: caller violates the callee's `requires *old(x) < 100`.
+// Exercises the CallPrecondition theorem path: the substituted
+// requires (`y < 100` at the call site) is what gets emitted as
+// the precondition obligation, and it fails when the caller can
+// only prove `y < 200` from its own context.
+test_verify_one_file! {
+    #[test] test_exec_call_mut_arg_requires_violated verus_code! {
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        #[verifier::tactus_auto]
+        fn call_mut(x: u8) -> (r: u8)
+            requires x < 200  // weaker than callee needs
+            ensures r == x + 1
+        {
+            let mut y: u8 = x;
+            bump(&mut y);  // callee needs y < 100 here
+            y
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("precondition")),
+            "expected precondition failure, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
+// `&mut x.f` (mutating through a field) is rejected — the call-site
+// arg isn't a simple `Loc(VarLoc(_))`. Pins the deferral with a
+// pointed error message that names task #55 and suggests the
+// extract-to-local workaround. Flips to Ok if/when we add the
+// havoc-base + assume-other-fields-unchanged encoding.
+test_verify_one_file! {
+    #[test] test_exec_call_mut_arg_field_rejected verus_code! {
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        struct Holder { val: u8 }
+
+        #[verifier::tactus_auto]
+        fn call_field_mut(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            let mut h = Holder { val: x };
+            bump(&mut h.val);  // field mut — not yet supported
+            h.val
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e|
+                e.message.contains("simple local")
+                || e.message.contains("&mut x.f")
+                || e.message.contains("not a simple")),
+            "expected `&mut x.f` rejection, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
+// Multi-`&mut`: two mut args at the same call site. Exercises the
+// stacked-frames encoding (each &mut arg gets its own existential
+// + caller-rebinding pair). Borrow check guarantees the two args
+// bind distinct caller vars, so we don't need to check aliasing.
+test_verify_one_file! {
+    #[test] test_exec_call_two_mut_args verus_code! {
+        fn swap_then_bump(a: &mut u8, b: &mut u8)
+            requires *old(a) < 100, *old(b) < 100
+            ensures *a == *old(b) + 1, *b == *old(a) + 1
+        {
+            let tmp = *a;
+            *a = *b + 1;
+            *b = tmp + 1;
+        }
+
+        #[verifier::tactus_auto]
+        fn call_swap(x: u8, y: u8) -> (r: u8)
+            requires x < 100, y < 100
+            ensures r == y + 1
+        {
+            let mut a: u8 = x;
+            let mut b: u8 = y;
+            swap_then_bump(&mut a, &mut b);
+            a
+        }
+    } => Ok(())
+}
+
 // Self-recursive call with a decreasing measure — verifies. The
 // termination obligation `decrease_at_args < decrease_at_params`
 // is conjoined onto the call's requires clause by
