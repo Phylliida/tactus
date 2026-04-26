@@ -420,6 +420,17 @@ pub fn run_verus(
                 }
             }),
     );
+    // Per-test isolation for Tactus-generated Lean files. Without
+    // this, every test writes to a shared `<rust_verify_test
+    // target>/tactus-lean/test_crate/<fn>.lean` (CARGO_TARGET_DIR
+    // is inherited by the subprocess and overrides the relative
+    // CWD fallback in `lean_out_root`). Tests that share a fn
+    // name with different content then race in parallel runs —
+    // sometimes one wins, sometimes the other, producing flaky
+    // failures whose root cause is invisible. Pinning
+    // `TACTUS_LEAN_OUT` to a per-test dir gives each test its
+    // own output tree.
+    child.env("TACTUS_LEAN_OUT", test_dir.join("tactus-lean"));
     let child = child
         .args(&verus_args[..])
         .stdout(std::process::Stdio::piped())
