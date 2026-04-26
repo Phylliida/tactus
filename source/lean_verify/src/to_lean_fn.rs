@@ -59,28 +59,31 @@ impl LeanSourceMap {
         }
     }
 
-    /// Exec-fn path: closest preceding `SpanMarkLandmark` for a
-    /// Lean error line. Returns `None` for proof-fn maps or when
-    /// no mark precedes the line.
+    /// Exec-fn path: closest preceding **obligation-kind**
+    /// `SpanMarkLandmark` for a Lean error line. Returns `None`
+    /// for proof-fn maps or when no obligation-kind mark
+    /// precedes the line.
     ///
     /// Structurally exact for per-obligation theorems (D, Stages
     /// 1-4): each theorem has exactly one "obligation mark" at
     /// the innermost (latest, in source order) position of its
-    /// goal — preceding hypothesis frames may carry their own
-    /// marks (LoopInvariant for invs in scope, LoopCondition for
-    /// the loop cond, etc.), but those appear earlier in the
-    /// goal. Lean's `pos.line` for a failure points at the
-    /// theorem's tactic invocation, which is just after the
-    /// goal; the closest preceding mark is therefore the
-    /// obligation mark, with the right `AssertKind` for the
-    /// failing obligation. No per-theorem indexing needed —
-    /// the structural ordering does the work.
+    /// goal. Hypothesis-kind marks (LoopCondition for the
+    /// loop's cond, BranchCondition for an `if`'s cond) appear
+    /// earlier in the goal but are filtered out here via
+    /// `AssertKind::is_obligation_kind` — they exist for the
+    /// `/- @rust:LOC -/` comments in the generated `.lean`
+    /// (visual debugging) but never fire as error labels.
+    /// Lean's `pos.line` for a failure points at the theorem's
+    /// tactic invocation, which is just after the goal; the
+    /// closest preceding obligation mark is therefore the
+    /// obligation mark for that theorem, with the right
+    /// `AssertKind` for the failing obligation.
     pub fn find_span_mark(&self, lean_line: usize) -> Option<&crate::lean_pp::SpanMarkLandmark> {
         match self {
             LeanSourceMap::ExecFn { span_marks, .. } => {
                 span_marks.iter()
                     .rev()
-                    .find(|m| m.line <= lean_line)
+                    .find(|m| m.line <= lean_line && m.kind.is_obligation_kind())
             }
             LeanSourceMap::ProofFn { .. } => None,
         }

@@ -371,42 +371,101 @@ pub enum ExprNode {
     },
 }
 
-/// Semantic class of an obligation, attached to `SpanMark`
-/// nodes so error formatting can label `at <loc>:` with the
-/// kind of check that failed.
+/// Semantic class of a `SpanMark`'s annotated expression.
+///
+/// SpanMarks fall into two structural roles:
+///
+/// * **Obligation kinds** — wrapped around the expression that
+///   IS the proof goal of an emitted theorem. `find_span_mark`
+///   returns these when looking up the kind label for a Lean
+///   error: the failing tactic's `pos.line` is just after the
+///   goal, and the obligation's mark is the closest preceding.
+///
+/// * **Hypothesis kinds** — wrapped around an expression used as
+///   a hypothesis frame in the OblCtx (e.g., a loop's `cond` or
+///   `¬cond`, an `if`'s branch condition). These appear earlier
+///   in the goal than the obligation's own mark, so they're
+///   structurally shadowed for `find_span_mark`. They still
+///   produce `/- @rust:LOC -/` comments in the generated `.lean`
+///   for visual debugging, but never fire as error labels.
+///
+/// The split is enforced by [`AssertKind::is_obligation_kind`].
+/// A theorem whose only marks are hypothesis kinds is a codegen
+/// bug — the obligation should always be wrapped in an
+/// obligation-kind SpanMark at its emission site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssertKind {
-    /// Generic — user-written `assert(P)`, or an obligation
-    /// without a more specific class.
+    // ── Obligation kinds (fire as error labels) ────────────
+
+    /// User-written `assert(P)`, or an obligation without a
+    /// more specific class.
     Plain,
-    /// Loop invariant (entry, maintain, or use clause).
+    /// `ensures` clause of a fn — wrapped at WpCtx::new time
+    /// per-clause, so multi-clause ensures becomes one
+    /// theorem per clause via `emit_done_or_split`.
+    Postcondition,
+    /// Loop invariant: init theorem (entry check), or one
+    /// conjunct of a maintain theorem (split from the body's
+    /// `inv_conj ∧ decrease` terminator).
     LoopInvariant,
-    /// Loop decrease measure (`D_new < D_old`).
+    /// Loop decrease measure (`D_new < D_old`) — the
+    /// decrease conjunct of a maintain theorem.
     LoopDecrease,
-    /// Loop condition expression (in maintain or use guard).
-    LoopCondition,
-    /// `if` / `match` branch condition.
-    BranchCondition,
     /// Precondition of a callee at the call site.
     CallPrecondition,
     /// Termination check for a recursive call
     /// (`CheckDecreaseHeight` lowering).
     Termination,
+
+    // ── Hypothesis kinds (shadowed by obligation marks) ────
+
+    /// Loop condition expression — appears as a hypothesis
+    /// (`cond` for maintain, `¬cond` for use). Provides a
+    /// `/- @rust:LOC -/` comment in the generated `.lean` for
+    /// visual debugging; never an error label (any obligation
+    /// in scope has its own obligation-kind mark which
+    /// shadows this).
+    LoopCondition,
+    /// `if` / `match` branch condition — appears as a
+    /// hypothesis. Same documentation-only role as
+    /// `LoopCondition`.
+    BranchCondition,
 }
 
 impl AssertKind {
     /// Short user-visible label for the `at <loc> (<label>):`
     /// prefix in error messages. Empty string for `Plain`
-    /// (no extra label needed).
+    /// (no extra label needed). Hypothesis kinds also return
+    /// labels — they show up via `/- @rust:LOC -/` comments,
+    /// but `find_span_mark` filters them out so they never
+    /// reach the error label path.
     pub fn label(&self) -> &'static str {
         match self {
             AssertKind::Plain => "",
+            AssertKind::Postcondition => "postcondition",
             AssertKind::LoopInvariant => "loop invariant",
             AssertKind::LoopDecrease => "loop decrease",
             AssertKind::LoopCondition => "loop condition",
             AssertKind::BranchCondition => "branch condition",
             AssertKind::CallPrecondition => "precondition",
             AssertKind::Termination => "termination",
+        }
+    }
+
+    /// Whether a `SpanMark` with this kind should fire as an
+    /// error label via `find_span_mark`. False for hypothesis-
+    /// frame kinds (LoopCondition / BranchCondition); true for
+    /// obligation-frame kinds.
+    pub fn is_obligation_kind(&self) -> bool {
+        match self {
+            AssertKind::LoopCondition
+            | AssertKind::BranchCondition => false,
+            AssertKind::Plain
+            | AssertKind::Postcondition
+            | AssertKind::LoopInvariant
+            | AssertKind::LoopDecrease
+            | AssertKind::CallPrecondition
+            | AssertKind::Termination => true,
         }
     }
 }

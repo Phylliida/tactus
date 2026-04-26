@@ -205,8 +205,21 @@ impl<'a> WpCtx<'a> {
         let fn_map = krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
         let type_map = check.local_decls.iter().map(|d| (&d.ident, &d.typ)).collect();
         let ret_name = check.post_condition.dest.as_ref().map(|v| v.0.as_str());
+        // Wrap each ensures clause with a `Postcondition` SpanMark so
+        // every Done leaf has an obligation-kind mark — without this,
+        // a fn-ensures failure inside an if-branch would leave
+        // `find_span_mark` returning the BranchCondition hypothesis
+        // mark (closest preceding) and the error label would say
+        // `(branch condition)` instead of `(postcondition)`.
+        // `emit_done_or_split` then splits the conjunction per-clause,
+        // so multi-clause ensures naturally yields one Postcondition
+        // theorem per clause with its own location.
         let ensures_goal = and_all(
-            check.post_condition.ens_exps.iter().map(sst_exp_to_ast).collect()
+            check.post_condition.ens_exps.iter().map(|ens| LExpr::span_mark(
+                format_rust_loc(&ens.span),
+                AssertKind::Postcondition,
+                sst_exp_to_ast(ens),
+            )).collect()
         );
         Ok(Self { fn_map, type_map, ret_name, ensures_goal })
     }
@@ -497,6 +510,7 @@ impl ObligationEmitter {
 fn kind_to_name(k: AssertKind) -> &'static str {
     match k {
         AssertKind::Plain => "assert",
+        AssertKind::Postcondition => "postcondition",
         AssertKind::LoopInvariant => "loop_invariant",
         AssertKind::LoopDecrease => "loop_decrease",
         AssertKind::LoopCondition => "loop_condition",
@@ -564,16 +578,19 @@ fn walk_obligations<'a>(
             // condition becomes a hypothesis for the rest of the
             // body — its proof sits in this theorem, the body's
             // theorems can assume it.
-            let id = e.next_id();
             let kind = detect_assert_kind(asserted);
-            let label = kind_to_name(kind);
             let loc = format_rust_loc(&asserted.span);
-            let suffix = sanitize_loc_for_name(&loc);
-            let name = format!("_tactus_{}_{}_at_{}_{}", label, e.fn_name, suffix, id);
             let cond_ast = sst_exp_to_ast(asserted);
-            let goal = LExpr::span_mark(loc, kind, cond_ast.clone());
+            let goal = LExpr::span_mark(loc.clone(), kind, cond_ast.clone());
+            let id = e.next_id();
+            let name = build_theorem_name(
+                kind_to_name(kind), &e.fn_name, &loc, id,
+            );
             e.emit(name, obl.wrap(goal), simple_tactic());
-            let new_obl = obl.with_frame(CtxFrame::Hyp(sst_exp_to_ast(asserted)));
+            // Reuse cond_ast for the body's hypothesis frame —
+            // sst_exp_to_ast is deterministic, so re-rendering
+            // the same Exp would only repeat work.
+            let new_obl = obl.with_frame(CtxFrame::Hyp(cond_ast));
             walk_obligations(body, ctx, &new_obl, e);
         }
         Wp::Assume(p, body) => {
@@ -654,18 +671,27 @@ fn walk_assert_by_tactus<'a>(
             // for body theorems. AssertKind::Plain because it's a
             // user-written `assert(P) by { tac }` — same kind that
             // a plain `assert(P)` would get from `detect_assert_kind`.
-            let id = e.next_id();
+            // Whitespace-only `tactic_text` (`assert(P) by { }`)
+            // would emit `:= by ` with nothing after it (Lean parse
+            // error); fall back to `tactus_auto` so the obligation
+            // still gets verified.
             let loc = format_rust_loc(&c.span);
-            let suffix = sanitize_loc_for_name(&loc);
-            let name = format!(
-                "_tactus_assert_{}_at_{}_{}", e.fn_name, suffix, id,
-            );
+            let cond_ast = sst_exp_to_ast(c);
             let goal = LExpr::span_mark(
-                loc, AssertKind::Plain, sst_exp_to_ast(c),
+                loc.clone(), AssertKind::Plain, cond_ast.clone(),
             );
-            e.emit(name, obl.wrap(goal), Tactic::Raw(tactic_text.to_string()));
-            // Cond as hypothesis for body theorems.
-            let new_obl = obl.with_frame(CtxFrame::Hyp(sst_exp_to_ast(c)));
+            let id = e.next_id();
+            let name = build_theorem_name(
+                "assert", &e.fn_name, &loc, id,
+            );
+            let closer = if tactic_text.trim().is_empty() {
+                simple_tactic()
+            } else {
+                Tactic::Raw(tactic_text.to_string())
+            };
+            e.emit(name, obl.wrap(goal), closer);
+            // Cond as hypothesis for body theorems (reuse cond_ast).
+            let new_obl = obl.with_frame(CtxFrame::Hyp(cond_ast));
             walk_obligations(body, ctx, &new_obl, e);
         }
         None => {
@@ -673,45 +699,84 @@ fn walk_assert_by_tactus<'a>(
             // body's scope. Push, walk, pop — the prefix only
             // applies to body theorems, not to obligations
             // sequentially after the proof block.
-            e.tactic_prefix.push(tactic_text.to_string());
-            walk_obligations(body, ctx, obl, e);
-            e.tactic_prefix.pop();
+            // Whitespace-only `tactic_text` (`proof { }`) would
+            // emit `( ) <;> closer` (Lean parse error); skip the
+            // push entirely. `emit()`'s prefix-iteration would
+            // also produce empty content, but skipping avoids
+            // the empty parens regardless.
+            if tactic_text.trim().is_empty() {
+                walk_obligations(body, ctx, obl, e);
+            } else {
+                e.tactic_prefix.push(tactic_text.to_string());
+                walk_obligations(body, ctx, obl, e);
+                e.tactic_prefix.pop();
+            }
         }
     }
 }
 
-/// Emit one or more theorems for a `Wp::Done` leaf. If the leaf is
-/// a top-level conjunction, recursively split into one theorem per
-/// conjunct. Each conjunct preserves its own `SpanMark` wrapping
-/// (if any), so loop-body terminators (`(I_1 ∧ I_2 ∧ ...) ∧
-/// D < d_old`) yield separate `LoopInvariant_*` / `LoopDecrease_*`
-/// theorems with the right kind in each name. Top-level fn-ensures
-/// terminators (no SpanMark wrapping) yield `_tactus_ensures_N`
-/// per clause.
+/// Emit one or more theorems for a `Wp::Done` leaf. Recursively
+/// peels two structural shapes before emitting:
+///
+/// * **Top-level `Let { name, value, body }`** — push `Let(name,
+///   value)` onto the OblCtx as a frame and recurse on `body`.
+///   Same final goal expression as wrapping the leaf as-is, but
+///   lets us peel further into a conjunction or a SpanMark for
+///   the body.
+/// * **Top-level `BinOp::And { lhs, rhs }`** — split into two
+///   recursive emissions. Each conjunct keeps its own SpanMark
+///   wrapping, so multi-clause ensures (each clause wrapped with
+///   `Postcondition` at `WpCtx::new` time) and loop-body
+///   terminators (`(I_1 ∧ ...) ∧ decrease_marked`) yield one
+///   theorem per conjunct with the right kind.
+///
+/// At the leaf (neither Let nor And), the kind label and location
+/// come from the outermost `SpanMark`. Unwrapped leaves only occur
+/// when ensures is empty (`and_all([]) = LitBool(true)`) — the
+/// goal is `True` and tactus_auto closes it trivially.
 fn emit_done_or_split(leaf: &LExpr, obl: &OblCtx, e: &mut ObligationEmitter) {
     use crate::lean_ast::{BinOp, ExprNode};
-    if let ExprNode::BinOp { op: BinOp::And, lhs, rhs } = &leaf.node {
-        emit_done_or_split(lhs, obl, e);
-        emit_done_or_split(rhs, obl, e);
-        return;
+    match &leaf.node {
+        ExprNode::BinOp { op: BinOp::And, lhs, rhs } => {
+            emit_done_or_split(lhs, obl, e);
+            emit_done_or_split(rhs, obl, e);
+            return;
+        }
+        ExprNode::Let { name, value, body } => {
+            // Peel the let into an OblCtx frame and recurse on
+            // body. obl.wrap will reconstruct the let around the
+            // final emitted goal — same final goal expression,
+            // but now we can split or label the body's contents.
+            let new_obl = obl.with_frame(CtxFrame::Let(
+                name.clone(), value.as_ref().clone(),
+            ));
+            emit_done_or_split(body, &new_obl, e);
+            return;
+        }
+        _ => {}
     }
-    let id = e.next_id();
     let (kind_label, loc) = match &leaf.node {
         ExprNode::SpanMark { rust_loc, kind, .. } => {
             (kind_to_name(*kind), rust_loc.clone())
         }
-        // Unwrapped → top-level fn ensures clause. Use "ensures"
-        // rather than `kind_to_name(Plain)` ("assert") since the
-        // theorem isn't an explicit `assert(P)`.
         _ => ("ensures", String::new()),
     };
-    let name = if loc.is_empty() {
-        format!("_tactus_{}_{}_{}", kind_label, e.fn_name, id)
-    } else {
-        let suffix = sanitize_loc_for_name(&loc);
-        format!("_tactus_{}_{}_at_{}_{}", kind_label, e.fn_name, suffix, id)
-    };
+    let id = e.next_id();
+    let name = build_theorem_name(kind_label, &e.fn_name, &loc, id);
     e.emit(name, obl.wrap(leaf.clone()), simple_tactic());
+}
+
+/// Construct a per-obligation theorem name. Drops the `_at_<loc>`
+/// suffix when `loc` is empty (synthetic / unmapped spans) so we
+/// don't produce double-underscore names like
+/// `_tactus_assert_<fn>_at__7`.
+fn build_theorem_name(kind_label: &str, fn_name: &str, loc: &str, id: usize) -> String {
+    if loc.is_empty() {
+        format!("_tactus_{}_{}_{}", kind_label, fn_name, id)
+    } else {
+        let suffix = sanitize_loc_for_name(loc);
+        format!("_tactus_{}_{}_at_{}_{}", kind_label, fn_name, suffix, id)
+    }
 }
 
 /// Per-obligation walker for `Wp::Loop`. Emits init theorems (one
@@ -755,11 +820,10 @@ fn walk_loop<'a>(
     // loop entry given the current obligation context (no body
     // execution yet).
     for inv in invs {
-        let id = e.next_id();
         let loc = format_rust_loc(&inv.inv.span);
-        let suffix = sanitize_loc_for_name(&loc);
-        let name = format!(
-            "_tactus_loop_invariant_{}_at_{}_{}", e.fn_name, suffix, id,
+        let id = e.next_id();
+        let name = build_theorem_name(
+            "loop_invariant", &e.fn_name, &loc, id,
         );
         e.emit(name, obl.wrap(inv_marked(inv)), simple_tactic());
     }
@@ -853,38 +917,39 @@ fn walk_call<'a>(
         subst.insert(sanitize(tp_name), typ_to_expr(tp_arg));
     }
 
-    // Precondition theorem: substitute requires with subst, wrap in a
-    // SpanMark with the call-site span (NOT the callee's source) so
-    // a failing precondition surfaces the call in the caller's source
-    // — same rationale as `lower_call`'s requires_clause wrapping.
-    let requires_conj = and_all(
-        callee.require.iter().map(|e| vir_expr_to_ast(e)).collect()
-    );
+    // Precondition theorem: substitute requires with subst, wrap in
+    // a SpanMark with the call-site span (NOT the callee's source)
+    // so a failing precondition surfaces the call in the caller's
+    // source. Skip emission entirely when the callee has no
+    // `requires` clauses — the goal would be `True` and the
+    // theorem would be wasted noise.
     let loc = format_rust_loc(call_span);
-    let requires_clause = LExpr::span_mark(
-        loc.clone(),
-        AssertKind::CallPrecondition,
-        substitute(&requires_conj, &subst),
-    );
-    let id = e.next_id();
-    let suffix = sanitize_loc_for_name(&loc);
-    let theorem_name = format!(
-        "_tactus_precondition_{}_at_{}_{}", e.fn_name, suffix, id,
-    );
-    e.emit(theorem_name, obl.wrap(requires_clause), simple_tactic());
+    if !callee.require.is_empty() {
+        let requires_conj = and_all(
+            callee.require.iter().map(|e| vir_expr_to_ast(e)).collect()
+        );
+        let requires_clause = LExpr::span_mark(
+            loc.clone(),
+            AssertKind::CallPrecondition,
+            substitute(&requires_conj, &subst),
+        );
+        let id = e.next_id();
+        let theorem_name = build_theorem_name(
+            "precondition", &e.fn_name, &loc, id,
+        );
+        e.emit(theorem_name, obl.wrap(requires_clause), simple_tactic());
+    }
 
-    // Continuation: walk `after` under a fresh context that pushes
-    // the post-call binders/hypotheses/lets in the same order
-    // `lower_call` would have nested them. Reading the resulting
-    // wrap from outermost to innermost: `∀ ret, ret_bound → ensures
-    // → let dest := ret; <continuation>`.
+    // Continuation: walk `after` under a fresh context with the
+    // post-call binders/hypotheses/lets pushed. Reading the
+    // resulting wrap outermost-to-innermost: `∀ ret, ret_bound →
+    // ensures → let dest := ret; <continuation>`. Frames pushed
+    // only when meaningful — an empty ensures would push a
+    // tautological `True →` that just adds noise to every
+    // downstream goal.
     let ret = &callee.ret.x;
     let ret_name_cal = sanitize(&ret.name.0);
     let ret_typ = substitute(&typ_to_expr(&ret.typ), &subst);
-    let ensures_conj = and_all(
-        callee.ensure.0.iter().map(|e| vir_expr_to_ast(e)).collect()
-    );
-    let substituted_ensures = substitute(&ensures_conj, &subst);
 
     let mut new_obl = obl.clone();
     new_obl.frames.push(CtxFrame::Binder(LBinder {
@@ -895,7 +960,12 @@ fn walk_call<'a>(
     if let Some(pred) = type_bound_predicate(&LExpr::var(ret_name_cal.clone()), &ret.typ) {
         new_obl.frames.push(CtxFrame::Hyp(pred));
     }
-    new_obl.frames.push(CtxFrame::Hyp(substituted_ensures));
+    if !callee.ensure.0.is_empty() {
+        let ensures_conj = and_all(
+            callee.ensure.0.iter().map(|e| vir_expr_to_ast(e)).collect()
+        );
+        new_obl.frames.push(CtxFrame::Hyp(substitute(&ensures_conj, &subst)));
+    }
     if let Some(dest_ident) = dest {
         new_obl.frames.push(CtxFrame::Let(
             sanitize(&dest_ident.0),
