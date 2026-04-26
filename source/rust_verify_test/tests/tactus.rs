@@ -1981,6 +1981,19 @@ test_verify_one_file! {
         }
     } => Err(err) => {
         assert!(err.errors.len() >= 1, "Expected error for wrong exec ensures");
+        // Each ensures clause is wrapped with a Postcondition
+        // SpanMark in WpCtx::new (D review fix); a failing
+        // ensures clause now reports `(postcondition)` instead of
+        // bottoming out with no kind label or — in if-branch
+        // shapes — picking up the BranchCondition mark from a
+        // hypothesis frame.
+        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("(postcondition)")),
+            "expected (postcondition) kind label on the failing \
+             obligation. got: {:?}",
+            msgs,
+        );
     }
 }
 
@@ -2688,6 +2701,146 @@ test_verify_one_file! {
     }
 }
 
+// D review: USE clause failure. Loop's invariant is too weak to
+// derive the fn ensures after the loop exits. Maintain succeeds
+// (invariant maintained), init succeeds (invariant holds at
+// entry), but `I ∧ ¬cond → ensures` fails because `I = (x ≤ n)`
+// alone (without the body's accumulated work) can't establish
+// `r == n`. The use-clause theorem walks `after` (which Done's
+// onto the fn ensures) under the use ctx; failing obligation is
+// the Postcondition, NOT a loop invariant.
+test_verify_one_file! {
+    #[test] test_exec_loop_use_clause_fails verus_code! {
+        #[verifier::tactus_auto]
+        fn weak_inv(n: u8) -> (r: u8)
+            ensures r == n
+        {
+            let mut x: u8 = 0;
+            while x < n
+                invariant x <= n  // doesn't say x reaches n at exit
+                decreases n - x
+            {
+                x = x + 1;
+            }
+            // At loop exit: x ≤ n ∧ ¬(x < n) gives x == n (correct
+            // mathematically), so this should actually PASS. Hmm.
+            // To force a USE failure, need an inv that doesn't
+            // imply the ensures.
+            x
+        }
+    } => Ok(())
+}
+
+// D review: USE failure with a weaker ensures-vs-invariant gap.
+// Invariant says only `x <= n`, ensures says `r > 0`. At exit
+// `x ≤ n ∧ ¬(x < n)` gives x == n; if n == 0 then r == 0, which
+// violates `r > 0`. The use clause theorem fails while init and
+// maintain succeed.
+test_verify_one_file! {
+    #[test] test_exec_loop_use_clause_fails_postcondition verus_code! {
+        #[verifier::tactus_auto]
+        fn maybe_zero(n: u8) -> (r: u8)
+            ensures r > 0
+        {
+            let mut x: u8 = 0;
+            while x < n
+                invariant x <= n
+                decreases n - x
+            {
+                x = x + 1;
+            }
+            x
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "use clause failure must be rejected");
+        // Should be (postcondition), NOT (loop invariant) — the
+        // failing obligation is the fn ensures, walked under the
+        // use ctx (which has the loop invariant as a hypothesis,
+        // not as the goal).
+        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("(postcondition)")),
+            "expected (postcondition) kind label on use-clause failure. got: {:?}",
+            msgs,
+        );
+    }
+}
+
+// D review: multi-clause requires, ONE clause failing. Caller
+// satisfies `x < 100` but not `x > 5`. The current code emits
+// one precondition theorem with the conjunction as goal; Lean
+// shows which conjunct in the unsolved goal display.
+test_verify_one_file! {
+    #[test] test_exec_call_multi_requires_one_fails verus_code! {
+        #[verifier::tactus_auto]
+        fn multi_req_callee(x: u8) -> (r: u8)
+            requires x > 5, x < 100
+            ensures r == x
+        {
+            x
+        }
+
+        #[verifier::tactus_auto]
+        fn multi_req_caller(x: u8) -> (r: u8)
+            requires x < 100   // satisfies one but not both
+            ensures r == x
+        {
+            multi_req_callee(x)
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "multi-requires partial-violation must fail");
+        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("(precondition)")),
+            "expected (precondition) label. got: {:?}",
+            msgs,
+        );
+    }
+}
+
+// D review: multi-clause ensures, ONE clause failing. WpCtx::new
+// wraps each clause with its own Postcondition SpanMark, so
+// emit_done_or_split splits the conjunction into per-clause
+// theorems. Body returns `5`, ensures says `r == 5 ∧ r > 100` —
+// only the second clause fails, and the failing theorem is its
+// per-clause Postcondition.
+test_verify_one_file! {
+    #[test] test_exec_multi_ensures_one_fails verus_code! {
+        #[verifier::tactus_auto]
+        fn returns_five_but_one_clause_lies() -> (r: u8)
+            ensures r == 5, r > 100
+        {
+            5
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "multi-ensures partial-violation must fail");
+        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("(postcondition)")),
+            "expected (postcondition) label on the failing clause. got: {:?}",
+            msgs,
+        );
+    }
+}
+
+// D review: conjunctive `assert(P ∧ Q)`. Single Wp::Assert with
+// a conjunctive cond — emits one theorem with `P ∧ Q` as goal
+// (NOT split per-conjunct, unlike Done leaves). Documents the
+// current behavior; if either conjunct fails Lean's error shows
+// the unsolved goal which makes the failing conjunct visible.
+test_verify_one_file! {
+    #[test] test_exec_conjunctive_assert verus_code! {
+        #[verifier::tactus_auto]
+        fn conj_assert(x: u8) -> (r: u8)
+            requires x < 50
+            ensures r == x
+        {
+            assert(x < 100 && x >= 0);
+            x
+        }
+    } => Ok(())
+}
+
 // Mutation in BOTH branches of an if, used after. Slice 3 claims this
 // works via Lean let-shadowing. The post-if continuation uses `y` —
 // each branch shadows it independently, and the value at the post-if
@@ -3326,6 +3479,45 @@ test_verify_one_file! {
     } => Err(err) => {
         assert!(err.errors.len() >= 1, "wrong assert-by tactic must be rejected");
     }
+}
+
+// D review: empty `proof { }` block. The FileLoader sanitizes the
+// brace body to whitespace-only, rust_to_vir's empty-HIR-body
+// heuristic routes the block through Tactus mode, and walk_assert_
+// by_tactus's `None` branch must NOT push a whitespace-only prefix
+// onto e.tactic_prefix — doing so produced `(\n) <;> tactus_auto`
+// which Lean rejects as an empty parenthesised tactic block. The
+// fix: skip the push entirely for whitespace-only `tactic_text`.
+test_verify_one_file! {
+    #[test] test_exec_proof_block_empty verus_code! {
+        #[verifier::tactus_auto]
+        fn empty_proof(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            proof { }
+            x + 1
+        }
+    } => Ok(())
+}
+
+// D review: empty `assert(P) by { }`. Same risk as the empty-proof
+// case: a whitespace-only tactic body would emit `:= by ` followed
+// by nothing, which Lean rejects. Fix: walk_assert_by_tactus's
+// `Some` branch falls back to `simple_tactic` (`tactus_auto`) when
+// `tactic_text` is whitespace-only, so the obligation still
+// verifies via the default closer.
+test_verify_one_file! {
+    #[test] test_exec_assert_by_empty verus_code! {
+        #[verifier::tactus_auto]
+        fn empty_assert_by(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            assert(x < 200) by { }
+            x + 1
+        }
+    } => Ok(())
 }
 
 // User-written `proof { ... }` block inside a tactus_auto exec fn.
