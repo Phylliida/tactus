@@ -2369,6 +2369,24 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// HeightCompare on int operands: `is_smaller_than(a, b)` lowers to
+// `lhs < rhs` when both heights are int (the int's height IS the
+// int per `vir::recursion::height_is_int`). Pins the codegen path
+// — previously rejected with "unsupported binary op".
+test_verify_one_file! {
+    #[test] test_exec_is_smaller_than_int verus_code! {
+        use verus_builtin::*;
+
+        #[verifier::tactus_auto]
+        fn check_smaller(a: u8, b: u8) -> (r: bool)
+            requires a < b
+            ensures is_smaller_than(a as int, b as int)
+        {
+            true
+        }
+    } => Ok(())
+}
+
 // NOTE: Multi-binder `Bind(Let([(a, val_a), (b, val_b)]), body)`
 // support landed in `lift_if_value` and `walk_let` (#92). It's
 // defensive — turns out Verus's SST for tuple destructure patterns
