@@ -197,28 +197,6 @@ pub(crate) fn is_variant_node(variant: &Ident, inner: LExpr) -> ExprNode {
     LExpr::field_proj(inner, format!("is{}", variant)).node
 }
 
-/// Map a VIR field access to the Lean side's field name.
-///
-/// * Anonymous tuple (`Dt::Tuple`) uses 0-indexed numeric fields like
-///   `"0"` / `"1"`; Lean's `Prod`-derived accessor is 1-indexed
-///   (`.1`, `.2`), so `"0"` → `"1"`, `"1"` → `"2"`, etc.
-/// * Single-variant struct (`Dt::Path` where the variant name equals
-///   the type's short name) uses the structure-auto-derived accessor
-///   names: numeric `"0"` → `"val0"`, named fields pass through
-///   (after sanitization). Lean's `structure` auto-derives these.
-/// * Multi-variant enum (`Dt::Path` where the variant name differs
-///   from the type's short name) routes through the per-variant
-///   accessor fns emitted by `datatype_to_cmds` — numeric field
-///   becomes `"<Variant>_val<n>"`, named field becomes
-///   `"<Variant>_<field>"`. Lean's `inductive` doesn't auto-derive
-///   field accessors, so we synthesise `def Kind.Foo_val0 : Kind → …`
-///   alongside the inductive declaration.
-///
-/// Shared between the VIR-AST and SST renderers so the naming rule
-/// lives in one place. Divergence would make match-arm desugaring
-/// (exec path) reference a field name that the accessor-fn emission
-/// (preamble path) doesn't define — silent Lean "invalid field"
-/// failure.
 /// Render a `VarAt(x, Pre)` reference (the post-`old(x)` form Verus
 /// uses for pre-state references in `&mut` ensures clauses) as a
 /// distinct Lean identifier.
@@ -246,6 +224,28 @@ pub(crate) fn varat_pre_name(name: &str) -> String {
     format!("{}_at_pre_tactus", name)
 }
 
+/// Map a VIR field access to the Lean side's field name.
+///
+/// * Anonymous tuple (`Dt::Tuple`) uses 0-indexed numeric fields like
+///   `"0"` / `"1"`; Lean's `Prod`-derived accessor is 1-indexed
+///   (`.1`, `.2`), so `"0"` → `"1"`, `"1"` → `"2"`, etc.
+/// * Single-variant struct (`Dt::Path` where the variant name equals
+///   the type's short name) uses the structure-auto-derived accessor
+///   names: numeric `"0"` → `"val0"`, named fields pass through
+///   (after sanitization). Lean's `structure` auto-derives these.
+/// * Multi-variant enum (`Dt::Path` where the variant name differs
+///   from the type's short name) routes through the per-variant
+///   accessor fns emitted by `datatype_to_cmds` — numeric field
+///   becomes `"<Variant>_val<n>"`, named field becomes
+///   `"<Variant>_<field>"`. Lean's `inductive` doesn't auto-derive
+///   field accessors, so we synthesise `def Kind.Foo_val0 : Kind → …`
+///   alongside the inductive declaration.
+///
+/// Shared between the VIR-AST and SST renderers so the naming rule
+/// lives in one place. Divergence would make match-arm desugaring
+/// (exec path) reference a field name that the accessor-fn emission
+/// (preamble path) doesn't define — silent Lean "invalid field"
+/// failure.
 pub(crate) fn field_access_name(field_opr: &FieldOpr) -> String {
     let raw = field_opr.field.as_str();
     let numeric = raw.parse::<usize>().ok();
