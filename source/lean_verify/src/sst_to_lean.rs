@@ -117,13 +117,17 @@ use vir::sst::{
     Par, Stm, StmX,
 };
 use vir::ast::{
-    AssertQueryMode, Fun, FunctionX, KrateX, TactusKind, Typ, UnaryOp, UnaryOpr, VarIdent,
+    AssertQueryMode, Expr, ExprX, Fun, FunctionX, KrateX, SpannedTyped, TactusKind, Typ, UnaryOp,
+    UnaryOpr, VarAt, VarIdent,
 };
+use vir::ast_visitor::map_expr_visitor;
 use vir::messages::Span;
 use crate::lean_ast::{
     and_all, substitute, AssertKind, Binder as LBinder, BinderKind, Expr as LExpr,
     Tactic, Theorem,
 };
+use crate::expr_shared::varat_pre_name;
+use std::sync::Arc;
 use crate::to_lean_expr::vir_expr_to_ast;
 use crate::to_lean_sst_expr::{sst_exp_to_ast, sst_exp_to_ast_checked, type_bound_predicate};
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
@@ -662,8 +666,10 @@ fn walk_obligations<'a>(
                 e,
             );
         }
-        Wp::Call { callee, args, typ_args, dest, call_span, after } => {
-            walk_call(callee, args, typ_args, *dest, call_span, after, ctx, obl, e);
+        Wp::Call { callee, args, typ_args, dest, call_span, mut_args, after } => {
+            walk_call(
+                callee, args, typ_args, *dest, call_span, mut_args, after, ctx, obl, e,
+            );
         }
         Wp::Loop { cond, invs, decrease, modified_vars, body, after } => {
             walk_loop(*cond, invs, decrease, modified_vars, body, after, ctx, obl, e);
@@ -931,6 +937,55 @@ fn push_mod_var_frames<'a>(
     }
 }
 
+/// Rewrite `VarAt(p, Pre)` references for the given `&mut` param
+/// names to a synthetic `Var(<p>_at_pre_tactus)` so the call-site
+/// renderer-then-substitution can target pre-state independently
+/// of post-state (`Var(p)` stays as-is for post-state references).
+///
+/// This pre-rewrite happens at the VIR-AST level — *before*
+/// `vir_expr_to_ast` collapses `VarAt(_, _)` into `Var(_)`. We
+/// don't change the renderer because `VarAt` is also used outside
+/// `&mut` (loop ensures' at-entry references, where the natural
+/// collapse to `Var` is correct), and changing the global
+/// rendering would unbind the `_at_pre_tactus` names in those
+/// contexts. Doing the rewrite here, scoped by the &mut param
+/// name set, keeps the change local to `&mut` callee-spec
+/// inlining.
+///
+/// `mut_param_names` is the set of `sanitize`d param-name strings
+/// for `&mut` parameters of the callee. Other vars (callee-local
+/// loop vars referenced via `VarAt`, non-mut params, etc.) are
+/// left alone — their natural `VarAt → Var` collapse is what we
+/// want.
+fn rewrite_varat_for_mut_params(
+    expr: &Expr,
+    mut_param_names: &std::collections::HashSet<String>,
+) -> Expr {
+    map_expr_visitor(expr, &|e: &Expr| {
+        if let ExprX::VarAt(ident, VarAt::Pre) = &e.x {
+            let raw_name = sanitize(&ident.0);
+            if mut_param_names.contains(&raw_name) {
+                // Use `raw_name` (already sanitized) so the synthetic
+                // string matches what `subst`'s key — `varat_pre_name(
+                // sanitize(p.name))` — produces. `sanitize` is
+                // idempotent on the resulting `<name>_at_pre_tactus`
+                // shape (no special chars introduced).
+                let new_str: vir::ast::Ident = Arc::new(varat_pre_name(&raw_name));
+                let new_ident = VarIdent(new_str, ident.1.clone());
+                return Ok(SpannedTyped::new(
+                    &e.span,
+                    &e.typ,
+                    ExprX::Var(new_ident),
+                ));
+            }
+        }
+        Ok(e.clone())
+    })
+    // The closure only constructs valid Var nodes from existing
+    // VarAt nodes; it cannot fail.
+    .expect("rewrite_varat_for_mut_params is structural and shouldn't error")
+}
+
 /// Per-obligation walker for `Wp::Call`. Splits the call's
 /// obligations across separate theorems:
 ///
@@ -943,48 +998,98 @@ fn push_mod_var_frames<'a>(
 ///   if `callee.ensure` is non-empty, and `let dest := ret;` if
 ///   the call has a destination var.
 ///
-/// Substitution combines value params (`p ↦ arg`) and type
+/// Substitutions combine value params (`p ↦ arg`) and type
 /// params (`T ↦ typ_arg`); `TypParam(T)` renders as `Var("T")`
 /// so the value-level `lean_ast::substitute` rewrites both kinds.
+///
+/// **`&mut` handling (#55).** For each `(idx, caller_var)` in
+/// `mut_args`, the post-call value of the mutated location is
+/// modeled as a fresh existential `_tactus_mut_post_<id>`:
+///   * Requires uses the same `p ↦ arg` (pre-call value) for both
+///     non-mut and mut params, since at requires time only the
+///     pre-call value exists.
+///   * Ensures uses `p ↦ Var(post_id)` (post-call value) and
+///     additionally `varat_pre_name(p) ↦ arg` (pre-call value
+///     reachable via `*old(x)` syntax in the source, rendered as
+///     `<p>_at_pre_tactus` by `to_lean_expr`).
+/// After the ensures Hyp frame, a `let caller_var := post_id`
+/// frame rebinds the caller-side variable so subsequent
+/// obligations see the post-call value.
 fn walk_call<'a>(
     callee: &FunctionX,
     args: &[Exp],
     typ_args: &[Typ],
     dest: Option<&VarIdent>,
     call_span: &Span,
+    mut_args: &[(usize, &VarIdent)],
     after: &Wp<'a>,
     ctx: &WpCtx<'a>,
     obl: &OblCtx,
     e: &mut ObligationEmitter,
 ) {
-    // Substitution map combining value params → call-site args and
-    // type params → call-site type expressions. `TypParam(T)`
-    // renders as `Var("T")` so the value-level substitute rewrites
-    // both kinds in one pass.
-    let params_vec: Vec<_> = callee.params.iter().collect();
-    let mut subst: std::collections::HashMap<String, LExpr> = params_vec.iter()
-        .zip(args.iter())
-        .map(|(p, arg)| (sanitize(&p.x.name.0), sst_exp_to_ast(arg)))
-        .collect();
+    // ── Type-param substitution (shared by req + ens) ─────────────
+    let mut typ_subst: HashMap<String, LExpr> = HashMap::new();
     for (tp_name, tp_arg) in callee.typ_params.iter().zip(typ_args.iter()) {
-        subst.insert(sanitize(tp_name), typ_to_expr(tp_arg));
+        typ_subst.insert(sanitize(tp_name), typ_to_expr(tp_arg));
     }
 
-    // Precondition theorem: substitute requires with subst, wrap in
-    // a SpanMark with the call-site span (NOT the callee's source)
-    // so a failing precondition surfaces the call in the caller's
-    // source. Skip emission entirely when the callee has no
-    // `requires` clauses — the goal would be `True` and the
-    // theorem would be wasted noise.
+    // ── Set of &mut param names for VarAt rewriting ────────────────
+    // Pre-state references in the callee's spec (`*old(x)` syntax →
+    // `VarAt(p, Pre)` in VIR-AST) are rewritten to `Var(<p>_at_pre_
+    // tactus)` BEFORE rendering, so the substitution map below can
+    // distinguish them from post-state `Var(p)` references.
+    let mut_param_name_set: std::collections::HashSet<String> = mut_args.iter()
+        .map(|(idx, _)| sanitize(&callee.params[*idx].x.name.0))
+        .collect();
+
+    // ── Render args once (Loc-peeling included for &mut shapes) ───
+    // For a `&mut x` arg shape `Loc(VarLoc(x))`,
+    // `sst_exp_to_ast` peels Loc transparently, so the rendered form
+    // is the caller-side variable reference (the pre-call value).
+    let arg_lexprs: Vec<LExpr> =
+        args.iter().map(|a| sst_exp_to_ast(a)).collect();
+
+    // ── Generate fresh post-call names per &mut arg ────────────────
+    // The `_tactus_mut_post_` prefix is reserved (won't collide with
+    // user names — Rust source can't produce `_tactus_` identifiers).
+    let mut mut_idx_to_fresh: HashMap<usize, String> = HashMap::new();
+    for (idx, _) in mut_args {
+        let id = e.next_id();
+        mut_idx_to_fresh.insert(*idx, format!("_tactus_mut_post_{}", id));
+    }
+
+    // ── Build requires substitution map ────────────────────────────
+    // Requires references only the pre-call values:
+    //   * non-mut param p: `p ↦ arg`
+    //   * mut param p: `p ↦ arg` AND `<p>_at_pre_tactus ↦ arg`
+    //     (covers both bare `p` and `*old(p)` syntax)
+    let mut req_subst: HashMap<String, LExpr> = typ_subst.clone();
+    for (i, p) in callee.params.iter().enumerate() {
+        let pname = sanitize(&p.x.name.0);
+        req_subst.insert(pname.clone(), arg_lexprs[i].clone());
+        if p.x.is_mut {
+            req_subst.insert(varat_pre_name(&pname), arg_lexprs[i].clone());
+        }
+    }
+
+    // ── Emit precondition theorem ──────────────────────────────────
     let loc = format_rust_loc(call_span);
     if !callee.require.is_empty() {
+        // Rewrite VarAt(p, Pre) for &mut p before rendering so the
+        // substitution map below can target pre-state separately
+        // from post-state. No-op when mut_param_name_set is empty.
         let requires_conj = and_all(
-            callee.require.iter().map(|e| vir_expr_to_ast(e)).collect()
+            callee.require.iter()
+                .map(|e| {
+                    let rewritten = rewrite_varat_for_mut_params(e, &mut_param_name_set);
+                    vir_expr_to_ast(&rewritten)
+                })
+                .collect()
         );
         let requires_clause = LExpr::span_mark(
             loc.clone(),
             AssertKind::CallPrecondition,
-            substitute(&requires_conj, &subst),
+            substitute(&requires_conj, &req_subst),
         );
         let id = e.next_id();
         let theorem_name = build_theorem_name(
@@ -993,18 +1098,60 @@ fn walk_call<'a>(
         e.emit(theorem_name, obl.wrap(requires_clause), simple_tactic());
     }
 
-    // Continuation: walk `after` under a fresh context with the
-    // post-call binders/hypotheses/lets pushed. Reading the
-    // resulting wrap outermost-to-innermost: `∀ ret, ret_bound →
-    // ensures → let dest := ret; <continuation>`. Frames pushed
-    // only when meaningful — an empty ensures would push a
-    // tautological `True →` that just adds noise to every
-    // downstream goal.
+    // ── Build ensures substitution map ─────────────────────────────
+    // Ensures references both pre- and post-call values:
+    //   * non-mut param p: `p ↦ arg`
+    //   * mut param p at idx i: `p ↦ Var(post_i)` (post-state),
+    //                           `<p>_at_pre_tactus ↦ arg` (pre-state)
+    let mut ens_subst: HashMap<String, LExpr> = typ_subst.clone();
+    for (i, p) in callee.params.iter().enumerate() {
+        let pname = sanitize(&p.x.name.0);
+        if p.x.is_mut {
+            let fresh = mut_idx_to_fresh.get(&i)
+                .expect("fresh name should exist for every &mut param idx");
+            ens_subst.insert(pname.clone(), LExpr::var(fresh.clone()));
+            ens_subst.insert(varat_pre_name(&pname), arg_lexprs[i].clone());
+        } else {
+            ens_subst.insert(pname, arg_lexprs[i].clone());
+        }
+    }
+
+    // ── Build context frames for `after` walk ──────────────────────
+    // Frames pushed in source order; OblCtx::wrap folds them
+    // outermost-first, yielding the goal shape (reading top-down):
+    //   ∀ post_i,                       ─┐
+    //   type_inv(post_i) →               │ per &mut arg
+    //   ∀ ret,                          ─┘
+    //   ret_bound →
+    //   ensures(subst) →
+    //   let caller_var_i := post_i;     ─┐ per &mut arg
+    //   let dest := ret;                 │
+    //   <continuation goal>
+    //
+    // Frames pushed only when meaningful — an empty ensures or a
+    // missing ret_bound is skipped to avoid `True →` clutter on
+    // every downstream goal.
+    let mut new_obl = obl.clone();
+
+    // 1. Per-&mut existential binder + type-inv hypothesis
+    for (idx, _caller_var) in mut_args {
+        let fresh = mut_idx_to_fresh.get(idx).unwrap();
+        let typ = &callee.params[*idx].x.typ;
+        let lean_typ = substitute(&typ_to_expr(typ), &typ_subst);
+        new_obl.frames.push(CtxFrame::Binder(LBinder {
+            name: Some(fresh.clone()),
+            ty: lean_typ,
+            kind: BinderKind::Explicit,
+        }));
+        if let Some(pred) = type_bound_predicate(&LExpr::var(fresh.clone()), typ) {
+            new_obl.frames.push(CtxFrame::Hyp(pred));
+        }
+    }
+
+    // 2. Return-value binder + bound
     let ret = &callee.ret.x;
     let ret_name_cal = sanitize(&ret.name.0);
-    let ret_typ = substitute(&typ_to_expr(&ret.typ), &subst);
-
-    let mut new_obl = obl.clone();
+    let ret_typ = substitute(&typ_to_expr(&ret.typ), &typ_subst);
     new_obl.frames.push(CtxFrame::Binder(LBinder {
         name: Some(ret_name_cal.clone()),
         ty: ret_typ,
@@ -1013,12 +1160,32 @@ fn walk_call<'a>(
     if let Some(pred) = type_bound_predicate(&LExpr::var(ret_name_cal.clone()), &ret.typ) {
         new_obl.frames.push(CtxFrame::Hyp(pred));
     }
+
+    // 3. Ensures (post-call assumption)
     if !callee.ensure.0.is_empty() {
         let ensures_conj = and_all(
-            callee.ensure.0.iter().map(|e| vir_expr_to_ast(e)).collect()
+            callee.ensure.0.iter()
+                .map(|e| {
+                    let rewritten = rewrite_varat_for_mut_params(e, &mut_param_name_set);
+                    vir_expr_to_ast(&rewritten)
+                })
+                .collect()
         );
-        new_obl.frames.push(CtxFrame::Hyp(substitute(&ensures_conj, &subst)));
+        new_obl.frames.push(CtxFrame::Hyp(substitute(&ensures_conj, &ens_subst)));
     }
+
+    // 4. Caller-side rebindings for &mut args (placed AFTER ensures
+    //    so the ensures Hyp references the fresh existential, not
+    //    the rebound caller name)
+    for (idx, caller_var) in mut_args {
+        let fresh = mut_idx_to_fresh.get(idx).unwrap();
+        new_obl.frames.push(CtxFrame::Let(
+            sanitize(&caller_var.0),
+            LExpr::var(fresh.clone()),
+        ));
+    }
+
+    // 5. Dest binding for the call's return value (`let r = foo(…)`)
     if let Some(dest_ident) = dest {
         new_obl.frames.push(CtxFrame::Let(
             sanitize(&dest_ident.0),
@@ -1268,6 +1435,18 @@ enum Wp<'a> {
         /// call site in error messages (#51) rather than the fn
         /// declaration or the callee's own source line.
         call_span: &'a Span,
+        /// `&mut` parameters at this call site. Each entry is
+        /// `(param_idx, caller_var)`: the index into `callee.params` /
+        /// `args` of the `&mut` parameter, and the caller-side
+        /// `VarIdent` whose memory is being mutated. `walk_call` uses
+        /// these to introduce a fresh existential per `&mut` arg
+        /// (the post-call value), substitute the callee's
+        /// `varat_pre_name(p) ↦ caller_arg` (pre-state) and
+        /// `p ↦ fresh` (post-state) in the inlined ensures, and
+        /// rebind the caller's local to the fresh value after the
+        /// callee's ensures Hyp frame. Empty for fns with no `&mut`
+        /// params (the common case). See task #55.
+        mut_args: Vec<(usize, &'a VarIdent)>,
         after: Box<Wp<'a>>,
     },
 }
@@ -1659,24 +1838,48 @@ fn build_wp_call<'a>(
             fun.path, callee.typ_params.len(), typ_args.len(),
         ));
     }
-    for a in args.iter() {
-        if contains_loc(a) {
-            // `&mut` args need havoc-after-call semantics: post-call,
-            // the mutated parameter is any value satisfying its type
-            // invariant AND the callee's `ensures` (which may
-            // reference the new value). Encoding: `∀ (x' : T),
-            // type_inv(x') → ensures[x ↦ x'] → <continuation>`
-            // replacing the current pre/post pair. Tracked as task
-            // #55 — see DESIGN.md "&mut in exec-fn calls" for the
-            // plan (single-arg first, then multi-arg / aliasing).
-            return Err(
-                "calls with `&mut` arguments require havoc-after-call \
-                 semantics — tracked as task #55. Workaround: refactor \
-                 to a non-mutating signature (`fn foo(x: T) -> T` + \
-                 caller re-binds) until the feature lands.".to_string()
-            );
+    // Build the `&mut` arg list while validating each arg. For each
+    // `&mut` param, the call-site arg must be a simple
+    // `Loc(VarLoc(...))` — `&mut x.f` / `&mut v[i]` / etc. would
+    // require additional encoding (havoc-base + assume-other-fields-
+    // unchanged style) which is deferred. Non-`&mut` args go through
+    // the usual `check_exp` validation.
+    let mut mut_args: Vec<(usize, &'a VarIdent)> = Vec::new();
+    for (i, (param, a)) in callee.params.iter().zip(args.iter()).enumerate() {
+        if param.x.is_mut {
+            // Caller-side var must extract cleanly. `extract_simple_var_ident`
+            // peels `Loc` and any wrappers down to `Var`/`VarLoc`, so this
+            // succeeds for the simple `&mut local` case and fails for
+            // `&mut x.f` / `&mut v[i]`.
+            match extract_simple_var_ident(a) {
+                Some(v) => mut_args.push((i, v)),
+                None => return Err(format!(
+                    "&mut argument at position {} is not a simple local variable. \
+                     `&mut x.f` / `&mut v[i]` / etc. require additional encoding \
+                     (havoc base + assume-other-fields-unchanged) — deferred \
+                     follow-up to #55. Workaround: bind to a local first \
+                     (`let mut tmp = expr; foo(&mut tmp); … = tmp;`).",
+                    i,
+                )),
+            }
+            // Don't `check_exp(a)` here — `a` is a `Loc` shape, not a
+            // value-position expression. The inner var has already been
+            // structurally validated by `extract_simple_var_ident`.
+        } else {
+            if contains_loc(a) {
+                // Loc on a non-&mut param shouldn't happen (Verus's
+                // borrow check would reject it upstream). Defensive
+                // rejection so an unexpected VIR shape fails loudly
+                // rather than silently encoding wrong.
+                return Err(format!(
+                    "unexpected `Loc`-wrapped argument at non-&mut position {} — \
+                     callee param.is_mut=false but arg is an L-value. Refusing \
+                     to encode silently.",
+                    i,
+                ));
+            }
+            check_exp(a)?;
         }
-        check_exp(a)?;
     }
     let bound_dest: Option<&'a VarIdent> = dest.as_ref()
         .and_then(|d| extract_simple_var_ident(&d.dest));
@@ -1692,6 +1895,7 @@ fn build_wp_call<'a>(
         typ_args: &typ_args[..],
         dest: bound_dest,
         call_span: &stm.span,
+        mut_args,
         after: Box::new(after),
     })
 }

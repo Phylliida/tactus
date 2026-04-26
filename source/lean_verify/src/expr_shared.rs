@@ -215,6 +215,33 @@ pub(crate) fn is_variant_node(variant: &Ident, inner: LExpr) -> ExprNode {
 /// (exec path) reference a field name that the accessor-fn emission
 /// (preamble path) doesn't define — silent Lean "invalid field"
 /// failure.
+/// Render a `VarAt(x, Pre)` reference (the post-`old(x)` form Verus
+/// uses for pre-state references in `&mut` ensures clauses) as a
+/// distinct Lean identifier.
+///
+/// Why distinct from `Var(x)`: in a callee with `fn bump(x: &mut u8)
+/// requires *old(x) < 100 ensures *x == *old(x) + 1`, the VIR-AST
+/// ensures contains both `Var(x)` (post-call value) and `VarAt(x,
+/// Pre)` (pre-call value). If both rendered to the same Lean name,
+/// the ensures would collapse to `x == x + 1` — vacuously false for
+/// finite arithmetic, silent translation bug. Rendering `VarAt(x,
+/// Pre)` to a syntactically distinct name lets the call-site
+/// substitution map send it to the caller's pre-call value while
+/// `Var(x)` goes to a fresh existential for the post-call value.
+///
+/// The `_at_pre_tactus` suffix is reserved (combined with the
+/// already-documented `_tactus_` prefix convention, won't collide
+/// with user identifiers — Rust source can't produce trailing
+/// `_tactus`).
+///
+/// Shared between the VIR-AST and SST renderers so the rendering
+/// rule lives in one place. Divergence would make the
+/// substitution-key in `walk_call` (built against VIR-AST shape)
+/// fail to match the SST renderer's output for the same VarAt.
+pub(crate) fn varat_pre_name(name: &str) -> String {
+    format!("{}_at_pre_tactus", name)
+}
+
 pub(crate) fn field_access_name(field_opr: &FieldOpr) -> String {
     let raw = field_opr.field.as_str();
     let numeric = raw.parse::<usize>().ok();

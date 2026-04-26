@@ -41,6 +41,14 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
     match &expr.x {
         ExprX::Const(c) => const_to_node(c),
         ExprX::Var(ident) => ExprNode::Var(sanitize(&ident.0)),
+        // `VarAt(x, Pre)` collapses to `Var(x)` for the general path
+        // (non-mut params, loop ensures' at-entry refs, etc. — these
+        // are correct because the AT-entry value equals the current
+        // value at the relevant scope). For `&mut` callee-spec
+        // inlining, `walk_call` pre-rewrites `VarAt(p, Pre)` to a
+        // synthetic distinct name BEFORE this renderer runs, so the
+        // substitution map can target pre- and post-state separately.
+        // See `walk_call` and `varat_pre_name` for the full picture.
         ExprX::VarAt(ident, _) => ExprNode::Var(sanitize(&ident.0)),
         ExprX::VarLoc(ident) => ExprNode::Var(sanitize(&ident.0)),
         ExprX::ConstVar(fun, _) => ExprNode::Var(lean_name(&fun.path)),
