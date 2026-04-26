@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**177 end-to-end tests + 1 coverage test + 106 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**189 end-to-end tests + 1 coverage test + 114 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -149,6 +149,140 @@ with its accumulated context), so `omega` / `simp_all` are fast
 on each. Total verification time is roughly the same. Generated
 `.lean` files are bigger but still tractable for inspection.
 
+#### Current session (2026-04-26 continued — D review passes)
+
+After D landed, six subsequent review/cleanup passes surfaced
+non-trivial findings each. Documented as a discipline lesson:
+no single read-through catches everything because each pass
+filters through a different question.
+
+**Five-lens review** (`2432eac`):
+- Linus-hat: 11 stale comments referencing the deleted
+  `lower_wp` / `lower_loop` / `lower_call` / `needs_peel` /
+  `loop_tactic` / `BodyItem` machinery — module-top docstring,
+  section headers, every `Wp` variant doc.
+- FP lens: documented `OblCtx::with_frame`'s O(N²) clone cost
+  (not urgent at realistic exec-fn sizes).
+- Coverage: 3 new tests — loop INIT failure path, assert-by
+  with failing tactic, `(loop decrease)` label pinning.
+- DESIGN.md global rename of `lower_*` → `walk_*`; obsolete
+  `loop_tactic` / `needs_peel` bullets removed.
+
+**"Right way" pass** (`5fd39e5`) — addressed three findings the
+five-lens pass missed because they needed a different question
+(*what could be done right that we accepted as imperfect?*):
+- **P0 correctness bug** — empty `proof { }` and `assert(P) by
+  { }` produced broken Lean syntax (`( ) <;> tactus_auto` and
+  `:= by` with nothing after). `walk_assert_by_tactus` now
+  skips whitespace-only prefix pushes (proof-block path) and
+  falls back to `simple_tactic()` when the user's tactic is
+  whitespace-only (assert-by path).
+- **AssertKind cleaner split** — added `Postcondition` kind +
+  `is_obligation_kind()` method on AssertKind, splitting kinds
+  into obligation-firing vs hypothesis-only. `find_span_mark`
+  filters non-obligation kinds; LoopCondition / BranchCondition
+  now provide `/- @rust:LOC -/` comments only, never error
+  labels. Each ensures clause wrapped with Postcondition
+  SpanMark in `WpCtx::new`, so multi-clause ensures yields
+  per-clause Postcondition theorems via `emit_done_or_split`.
+- **`emit_done_or_split` peels Let** — `let r := x; SpanMark(...)`
+  was hiding the obligation kind from the leaf-extraction path.
+  Now peels the Let into an OblCtx frame and recurses on body,
+  exposing the SpanMark for kind/loc extraction.
+- **P1 cleanups**: skip empty-requires precondition theorem,
+  skip `Hyp(True)` frames in walk_call, reuse cond_ast in
+  Wp::Assert (one less redundant `sst_exp_to_ast` call).
+- **P3 unified naming**: `build_theorem_name` helper drops the
+  `_at_<suffix>` part when loc is empty (no more
+  `_tactus_assert_<fn>_at__7` double-underscore names).
+- 7 new e2e tests pinning `(postcondition)` / `(precondition)` /
+  `(loop invariant)` / `(loop decrease)` labels + empty
+  proof-block / empty assert-by / multi-clause-ensures-with-one-
+  failing / loop-use-clause-failure / conjunctive-assert.
+
+**Test isolation fix** (`984caa8`) — discovered while debugging
+the multi-clause requires test: `cargo test`'s inherited
+`CARGO_TARGET_DIR` was pointing every test's Tactus output
+at the shared `<rust_verify_test target>/tactus-lean/test_crate/
+<fn>.lean` path. Tests with same fn name + different content
+raced in parallel runs. Pre-D this was masked by content
+homogeneity (most identical-name fns had identical bodies);
+per-D made writes distinctive enough to surface as flakes.
+Fix: `run_verus` and `run_cargo_verus` set
+`TACTUS_LEAN_OUT=<test_input_dir>/tactus-lean` per-test. 4
+consecutive full runs all green with the previously-colliding
+`fn five` and `fn caller` restored. Documented in HANDOFF.md
+"Per-test isolation" with the regression-detection symptom
+(test passes alone, fails in suite, different test fails next
+run).
+
+**Reasoning-clarity pass** (`fb94f78`):
+- Extracted `peel_value_position` helper — the
+  transparent-plus-Loc peeling duplicated (with shadowing
+  `let-peeled`) in `walk_let` and `lift_if_value`.
+- Extracted `match_single_let_bind` helper — replaces the
+  awkward `matches!`-guard + `let-else` re-destructure pattern
+  with a clean `if let Some((name, rhs, body))`.
+- `kind_to_name(AssertKind::…)` everywhere instead of literal
+  strings — single source of truth for kind names.
+- `OblCtx::wrap` doc gets a worked example showing why
+  reverse-iteration produces correct scope ordering.
+- `emit_done_or_split` shape unified into a single match (was
+  early-return + fall-through emit).
+
+**Final review pass** (`1ac7581`):
+- 9 more stale doc references to deleted lowering pass —
+  `walk_loop` / `walk_call` / `walk_let` doc strings, the
+  `CtxFrame::Binder` "Stage 2 will / Stage 3 will" framing,
+  `build_param_binders` "init / maintain / use" loop-specific
+  framing, `StmX::AssertQuery` comment describing the OLD
+  collect-haves-and-prepend approach.
+- Removed redundant `let name = name.to_string()` in
+  `lift_if_value` (was shadowing an already-`String` from
+  `match_single_let_bind`; survived three review passes
+  because it *looked* like reasonable closure-ownership setup).
+- Defensive: `run_cargo_verus` also sets `TACTUS_LEAN_OUT` for
+  future-proofing (no current Tactus tests use that path, but
+  adding one would silently regress).
+
+**Coverage audit** (`c6365ce`):
+- 8 unit tests for the helpers extracted today: 6 for
+  `peel_value_position` (plain / Box / Loc / Box+Loc / Loc+Box
+  / doesn't-peel-If) + 1 for `match_single_let_bind` + 1
+  comment-proxy for the negative case.
+- 4 new e2e tests for paths that lacked coverage:
+  - `test_exec_assert_fails` strengthened to pin
+    `AssertKind::Plain`'s empty-label format (`at <loc>:`
+    without parens). Regression guard.
+  - `test_exec_proof_block_sequential` — two consecutive
+    proof blocks exercise the `tactic_prefix` STACK with
+    multiple entries, not just single-entry.
+  - `test_exec_no_ensures` — the *only* reachable path to
+    `emit_done_or_split`'s unwrapped fallback. Was untested;
+    now has a witness.
+  - `test_exec_call_no_requires_no_ensures` — exercises
+    `walk_call`'s skip-precondition and skip-Hyp(True) paths.
+
+**Writing** (3 commits in POEMS.md):
+- (`5d2e8ee`) "Cheap" / "The label said precondition" /
+  "Eighteen commits" — yesterday's rationalization, the #51
+  imperfection, the day's commits.
+- (`f663dc1`) "The mark that wasn't wrong" / "The semicolon
+  that wasn't" / "Six commits, no rollbacks" — D landing.
+- (`3572755`) "The race that was always there" / "Three
+  sites" / "The mark that kept missing" — review pass +
+  test isolation + the imperfection-fixed-via-two-insights.
+- (`a768d8a`) "Six lenses" / "Looking reasonable" /
+  "Witness" — the orthogonality of review lenses,
+  prefabricated-explanations as camouflage, the gap
+  between code-path-existing and code-path-tested.
+
+**Net for the day**: 17 commits, ~1100 lines net change
+(D itself added ~400, dead-code cleanup removed ~700, review
+passes net-positive ~400 from added doc + tests). 13 new
+tests across all the passes. 12 poems committed across the
+broader cadence.
+
 ## Architecture
 
 ### Full pipeline
@@ -185,32 +319,42 @@ lean_verify pipeline (AST-based):
        proof_fn  → to_lean_fn::proof_fn_to_ast  (Tactic::Raw from user text)
        exec_fn   → sst_to_lean::exec_fn_theorems_to_ast  (Vec<Theorem>)
                      validates reqs/ens via `check_exp` (which calls sst_exp_to_ast_checked)
-                     constructs WpCtx (fn_map, type_map, ret_name, ensures_goal)
+                     constructs WpCtx (fn_map, type_map, ret_name, ensures_goal_with_marks)
                      build_wp(check.body, Done(ensures_goal), ctx) → Wp<'_>
-                     lower_wp(wp, ctx) → LExpr
+                     walk_obligations(wp, ctx, OblCtx::new(), &mut emitter) → Vec<Theorem>
+                       — one theorem per obligation site (Assert / Done conjunct / loop
+                         init invariant / loop maintain conjunct / call precondition /
+                         assert-by). See "Per-obligation theorem emission" below.
   3. debug_check(&cmds) — sanity::check_references panics on unresolved references
      (gated on #[cfg(debug_assertions)])
-  4. pp_commands(&cmds) → PpOutput { text, tactic_starts }
-     — tactic_starts[0] gives 1-indexed line where `Tactic::Raw` body begins, for source map
-  5. write_lean_file(path, text) → target/tactus-lean/{crate}/{fn}.lean
+  4. pp_commands(&cmds) → PpOutput { text, landmarks: { tactic_starts, span_marks } }
+     — tactic_starts[0] gives 1-indexed line where `Tactic::Raw` body begins (proof fns);
+       span_marks[i] = { line, loc, kind } per emitted SpanMark (exec fns)
+  5. write_lean_file(path, text) → $TACTUS_LEAN_OUT/{crate}/{fn}.lean
   6. lean_process::check_lean_file(path, lake_dir) — invokes `lake env lean --json <path>`
-  7. Parse JSON diagnostics, map via LeanSourceMap, report through Verus
+  7. Parse JSON diagnostics, map via LeanSourceMap (find_span_mark filters to obligation
+     kinds only; closest-preceding-mark is structurally exact under per-obligation),
+     report through Verus
      (error messages include the generated .lean path for easy inspection)
 ```
 
-### WP emission for exec fns
+### Per-obligation theorem emission
 
-`sst_to_lean::build_wp` (SST → Wp) and `lower_wp` (Wp → LExpr) replace the earlier `walk` + `build_goal_with_terminator` pair. Each `Wp<'a>` variant is one WP rule:
+`sst_to_lean::build_wp` (SST → Wp) and `walk_obligations` + helpers (Wp → Vec<Theorem>). Each `Wp<'a>` variant has its own walker arm; obligation sites emit theorems, structural sites push frames onto an `OblCtx`. The `OblCtx` accumulates Let / Hyp / Binder frames as the walker descends, and `wrap` folds them around each emitted goal in source order.
 
-- **`Done(leaf)`** — terminator. Built from the fn's ensures at top level, from `Done(I ∧ D < _tactus_d_old)` for loop bodies, or from `Return(e)`'s `let <ret> := e; ensures_goal` (discarding whatever `after` was at that point).
-- **`Let(x, rhs, body)`** → `let x := rhs; lower_wp(body)`. If `rhs` is an `ExpX::If`, lowering lifts via `lift_if_value` — splits into `(c → let x := a; body) ∧ (¬c → let x := b; body)` so omega sees each branch.
-- **`Assume(P, body)`** → `P → lower_wp(body)`.
-- **`Assert(P, body)`** → `P ∧ lower_wp(body)`. Crucially not just "conjoin everything" — Verus's `assert(P)` desugars to `Assert(P); Assume(P)`, and without the asymmetry the assert would trivially satisfy itself.
-- **`Branch { cond, then_branch, else_branch }`** → `(c → lower_wp(then_branch)) ∧ (¬c → lower_wp(else_branch))`. Each branch carries its own continuation via its sub-Wp tree.
-- **`Loop { cond, invs, decrease, modified_vars, body, after }`** → `init ∧ maintain ∧ use`. Maintain wraps `lower_wp(body)` with `let _tactus_d_old := D; ...` (the body was built with `Done(I ∧ D < _tactus_d_old)` as its terminator, referencing `_tactus_d_old` as a Var). Use quantifies over modified vars and lowers `after`.
-- **`Call { callee, args, dest, after }`** → `requires(subst) ∧ ∀ ret, h_bound(ret) → ensures_using_ret(subst) → (let dest := ret; lower_wp(after))`. Inlines the callee's spec via `lean_ast::substitute` (no let-wrapping — avoids name shadowing).
+- **`Done(leaf)`** — `emit_done_or_split` peels top-level `Let` (push to OblCtx, recurse on body), splits top-level `And` (recurse on each conjunct), and emits the leaf at SpanMark or unwrapped fallback. Multi-clause ensures naturally yields one Postcondition theorem per clause; loop-body terminators yield per-invariant + per-decrease theorems.
+- **`Let(x, rhs, body)`** — `walk_let` peels for value-position if-shapes (forks into two recursive walks with cond as Hyp frame) and inner `let z := zval; bodyval` shapes (peels one layer of inner let into OblCtx, continues lifting on bodyval). Plain rhs pushes a Let frame and recurses on body. No theorem emitted.
+- **`Assume(P, body)`** — pushes `Hyp(P)` frame; no theorem emitted.
+- **`Assert(P, body)`** — emits one theorem for `P` (kind from `detect_assert_kind`: `Termination` for `CheckDecreaseHeight`, `Plain` otherwise). Body walks with `P` as a Hyp frame for subsequent obligations.
+- **`Branch { cond, then_branch, else_branch }`** — walks each branch under its own `Hyp(cond)` / `Hyp(¬cond)` frame. `cond` is wrapped in a `BranchCondition` SpanMark — hypothesis-kind, never an error label, but produces the `/- @rust:LOC -/` comment.
+- **`Loop { cond, invs, decrease, modified_vars, body, after }`** — `walk_loop` emits one init theorem per invariant; walks `body` in maintain ctx (∀ mod_vars + bounds + invs as hyps + cond as hyp + `_tactus_d_old := D` let); walks `after` in use ctx (∀ mod_vars + bounds + invs as hyps + ¬cond as hyp). Body's `Done(inv_conj_marked ∧ decrease_marked)` flows through `Wp::Done` → `emit_done_or_split` per-conjunct.
+- **`Call { callee, args, dest, after }`** — `walk_call` emits a precondition theorem for substituted requires (skipped when callee.require is empty), then walks `after` under `∀ ret, ret_bound → ensures(subst) → let dest := ret;` frames (each frame pushed only when meaningful — empty ensures skips the Hyp(True) push).
+- **`AssertByTactus { cond: Some(P), tactic, body }`** — emits one theorem for `P` with the user's tactic as closer (or `tactus_auto` if tactic is empty); body walks with `P` as Hyp.
+- **`AssertByTactus { cond: None, tactic, body }`** — pushes the tactic onto `e.tactic_prefix`; every theorem emitted in body's scope gets `(tactic) <;> closer` (skipped if tactic is empty). `<;>` rather than `;` handles goal-closing prefixes (e.g., `simp_all`) cleanly: zero remaining subgoals means the closer no-ops instead of failing with "no goals".
 
-`needs_peel()` on the Wp tree decides tactic shape: flat Let/Assert/Assume chains over arithmetic get `Tactic::Named("tactus_auto")`; anything with Loop/Call gets `Tactic::Raw("tactus_peel; all_goals tactus_auto")`. `tactus_peel` (prelude macro) recursively strips `∧` / `∀` / `→` / `intro ⟨_, _⟩` (destructure And-hypotheses); `tactus_auto` is a dumb leaf closer (`rfl | decide | omega | simp_all | fail`).
+Each emitted theorem's tactic body is `tactus_auto` (`rfl | decide | omega | simp_all | tactus_case_split | fail`) — no `tactus_peel` needed because per-obligation theorems are flat (single obligation, accumulated context as frames). `tactus_auto`'s `omega` and `simp_all` handle ∀/→/let frames natively.
+
+`AssertKind` splits into obligation-firing kinds (Plain / Postcondition / LoopInvariant / LoopDecrease / CallPrecondition / Termination) and hypothesis-only kinds (LoopCondition / BranchCondition). `find_span_mark` filters to obligation kinds only — hypothesis SpanMarks provide visual `/- @rust:LOC -/` debug comments but never appear as error labels. The split is enforced by `is_obligation_kind()`.
 
 ### `lean_verify` module map
 
@@ -285,14 +429,19 @@ lean_verify/src/
                          `Wp::Call::args` borrows `&'a [Exp]` from the
                          SST directly (no Vec allocation).
                      Key fns: `exec_fn_theorems_to_ast`, `build_wp`,
-                     `build_wp_call`, `build_wp_loop`, `lower_wp`,
-                     `lower_loop`, `lower_call`. `check_exp` is a thin
-                     validation wrapper around `sst_exp_to_ast_checked`.
+                     `build_wp_call`, `build_wp_loop`, `walk_obligations`,
+                     `walk_call`, `walk_loop`, `walk_let`,
+                     `walk_assert_by_tactus`, `emit_done_or_split`.
+                     `check_exp` is a thin validation wrapper around
+                     `sst_exp_to_ast_checked`.
                      `peel_transparent(&Exp) -> &Exp` is the shared
-                     Box/Unbox/CoerceMode/Trigger peeler used by
-                     `contains_loc`, `lift_if_value`, and
-                     `render_checked_decrease_arg` — adding a new
-                     transparent wrapper = one edit, not three.
+                     Box/Unbox/CoerceMode/Trigger peeler;
+                     `peel_value_position` adds a layer of `Loc` peel
+                     for value-position lookups (`walk_let`,
+                     `lift_if_value`); `match_single_let_bind`
+                     destructures `Bind(BndX::Let([single]), body)`.
+                     Adding a new transparent wrapper = one edit
+                     to `peel_transparent`, not multiple.
   generate.rs        Orchestration: builds Vec<Command>, runs sanity, pp's,
                      writes file, invokes Lean, formats errors. Error output
                      includes the generated .lean path.
@@ -319,13 +468,13 @@ lean_verify/src/
 1. **Typed AST with smart constructors + Lean-AST substitution.** `lean_ast.rs` has 30+ constructors plus `substitute` (capture-avoiding, lazy-per-scope capture check, panics on real captures). Call-site inlining substitutes directly rather than emitting nested `let` bindings that would shadow caller names.
 2. **On-disk Lean artifacts.** Every generated file lands in `target/tactus-lean/{crate}/{fn}.lean`. Debuggable (`cat` the file) and referenced from error messages.
 3. **Sanity check every generation (debug builds).** Catches "dep_order dropped a reference" class of bug with pointed errors; allowlist for Tactus prelude names.
-4. **`tactus_auto` is a dumb leaf closer; `tactus_peel` is a recursive peeler.** Structural tactics — which `refine ⟨?_, ?_⟩` to use, which `intros` — belong at codegen time because the emitter knows the shape. Loops/calls emit `tactus_peel; all_goals tactus_auto`.
+4. **`tactus_auto` is a dumb leaf closer.** Per-obligation theorem emission means each theorem's goal is a single obligation wrapped in the OblCtx's let/→/∀ frames — no nested `∧` structure to peel. `tactus_auto`'s `omega` and `simp_all` handle the frames natively (intros, zeta-reduction). `tactus_peel` (a recursive `∧/∀/→` peeler) survives in the prelude as a tool for ad-hoc proof blocks but isn't part of the codegen-emitted closer set anymore.
 5. **Assert/assume as WP nesting, not conjoined.** `assert(P); assume(P)` (Verus's desugaring of user `assert(P)`) must NOT trivially satisfy itself. `(P) ∧ (rest)` for asserts vs `(P) → rest` for assumes.
 6. **`_tactus_body_` / `_tactus_d_old` / `tactus_peel` reserved prefix.** Tool-generated names never collide with user code (Rust doesn't produce `_tactus_` or `tactus_`-prefixed identifiers).
 7. **Two-layer dependency walking.** `dep_order::walk_expr` recurses through ExprX; `dep_order::walk_place` recurses through PlaceX. Place variants can hide Call refs inside; both walkers cover the full tree.
 8. **Tuple rendering.** `Dt::Tuple(n)` → `T₁ × T₂ × …` type, `⟨a, b, …⟩` constructor, `.1`/`.2` field access (Lean 1-indexed).
 9. **u-types render as Int, not Nat.** Lean's `Nat` truncates subtraction (`0 - 1 = 0`); rendering u8/u16/…/u128 as `Int` with both-sided bounds makes underflow catchable. USize keeps rendering as `Nat` — const-generic constraint (see DESIGN.md).
-10. **WP DSL (`Wp<'a>`) with structural continuations.** Each compound node carries its own `after: Box<Wp<'a>>`; `Done(leaf)` is the only terminator and has no continuation slot. `Return` writes `Done(let ret := e; ctx.ensures_goal)`, naturally fn-exit by construction. Adding a new WP form means one constructor + one arm each in `build_wp` and `lower_wp` — no central dispatcher to keep in sync.
+10. **WP DSL (`Wp<'a>`) with structural continuations.** Each compound node carries its own `after: Box<Wp<'a>>`; `Done(leaf)` is the only terminator and has no continuation slot. `Return` writes `Done(let ret := e; ctx.ensures_goal)`, naturally fn-exit by construction. Adding a new WP form means one constructor + one arm each in `build_wp` and `walk_obligations` — no central dispatcher to keep in sync.
 11. **Single fallible case analysis for SST lowering.** `sst_exp_to_ast_checked` validates and renders in one pass. `check_exp` is a thin wrapper; `sst_exp_to_ast` is the infallible form for already-validated contexts. Adding a new `ExpX` variant means one edit.
 12. **Callees inlined via Lean-AST substitution, not Lean definitions.** Exec fn calls pull callee's `require`/`ensure` from its `FunctionX` and substitute arg expressions for param names via `lean_ast::substitute` — no shadowing, no zeta-reduction needed for omega.
 13. **Pre vs post-simplify krate split.** Proof fns route through `self.vir_crate` (pre-simplify — user-visible spec forms). Exec fns route through `self.simplified_krate()` (post-simplify — aligns with SST call-site arg layout for zero-arg fns).
@@ -336,7 +485,9 @@ lean_verify/src/
     - *Shared helpers for implicit shapes* — `peel_transparent` centralises the Box/Unbox/CoerceMode/Trigger wrapper set; `renders_as_lean_int` centralises the Int-vs-Nat rendering decision. Adding a new variant = one edit across all consumers.
     - *Shape-drift tests* — e.g., `full_check_decrease_height_shape_pinned` constructs a synthetic CheckDecreaseHeight and asserts the expected lowering. Failure message points at the exact fix site, turning a future mystery breakage into a focused test fail.
 17. **Tactus tactic-span plumbing via `TactusSpan`.** A single `Option<TactusSpan>` field on `ExprX::AssertBy` carries (file path, byte range, kind: AssertBy / ProofBlock) for both user-tactic escape hatches. The previous flag-soup (`Option<(path, s, e)>` + `is_tactus_proof_block: bool`) coupled two fields that could never take independent values; folding into one struct encodes the invariant in the type. `rust_to_vir` populates only inside `tactus_auto` fns; `ast_to_sst` routes to `AssertQueryMode::Tactus { kind }`; `sst_to_lean` branches on kind for the `have`-wrap vs raw emission.
-18. **Loop break / continue via threaded `WpLoopCtx`.** `build_wp` takes `Option<&WpLoopCtx>` as a parameter; `WpLoopCtx { break_leaf, continue_leaf }` holds the goals each control-flow edge must establish. Inner loops shadow outer (innermost applies). `StmX::BreakOrContinue` emits `Wp::Done(chosen_leaf)`. `Wp::Loop::cond` is `Option<&Exp>` — `None` is Verus's break-lowered `while c { … break; … }` shape; `lower_loop` drops the cond-gates in that case.
+18. **Loop break / continue via threaded `WpLoopCtx`.** `build_wp` takes `Option<&WpLoopCtx>` as a parameter; `WpLoopCtx { break_leaf, continue_leaf }` holds the goals each control-flow edge must establish. Inner loops shadow outer (innermost applies). `StmX::BreakOrContinue` emits `Wp::Done(chosen_leaf)`. `Wp::Loop::cond` is `Option<&Exp>` — `None` is Verus's break-lowered `while c { … break; … }` shape; `walk_loop` drops the cond-gates in that case.
+19. **Per-obligation theorem emission (D, 2026-04-26).** One Lean theorem per obligation site instead of one mega-theorem per fn. Each theorem gets its own `pos.line` in Lean diagnostics, so `find_span_mark` returns the right `AssertKind` label by structural construction (the closest preceding obligation-kind mark IS the obligation for that theorem). `OblCtx` accumulates Let / Hyp / Binder frames as the walker descends; `wrap` folds them around each emitted goal. `AssertKind` splits into obligation-firing kinds vs hypothesis-only kinds (`is_obligation_kind()`); hypothesis-side SpanMarks (LoopCondition, BranchCondition) provide `/- @rust:LOC -/` debug comments but are filtered out of error labels.
+20. **Per-test Tactus output isolation (`TACTUS_LEAN_OUT`).** `run_verus` and `run_cargo_verus` set `TACTUS_LEAN_OUT=<test_input_dir>/tactus-lean` per spawned subprocess. Without this, `cargo test`'s inherited `CARGO_TARGET_DIR` routes every test's Lean output to a shared path, races across parallel tests with same-name fns + different-content writes. Pre-D the races were masked by content homogeneity (same fn name → usually same content); per-D writes are distinctive enough to surface. See "Per-test isolation" under Testing infrastructure.
 
 ## Track B status
 
@@ -362,13 +513,13 @@ Tests: `test_exec_mut_seq`, `test_exec_mut_in_branch`, `test_exec_mut_branch_lea
 
 ### Slice 4: tail / let if-expression lift ✅
 
-`let y = if c then a else b; rest` lifts to `(c → let y := a; rest) ∧ (¬c → let y := b; rest)` via `lift_if_value` in `lower_wp`'s `Let` arm. Peels through transparent wrappers and single-binder `ExpX::Bind(Let, …)`. Same helper applies at Return position.
+`let y = if c then a else b; rest` forks into `(c → let y := a; rest) ∧ (¬c → let y := b; rest)`. At `Return`-position, `lift_if_value` produces this directly in the Done leaf. At `Let`-position (`Wp::Let`), `walk_let` peels for the same shape — recursing per branch with cond as a Hyp frame. Both peel through transparent wrappers and single-binder `ExpX::Bind(Let, …)`.
 
 Tests: `test_exec_tail_if_expression`, `test_exec_let_if_expression`.
 
 ### Slice 5: loops ✅
 
-`StmX::Loop` becomes `Wp::Loop { body, after }` — `body` is built with `Done(I ∧ D < _tactus_d_old)` as its terminator; `after` is the post-loop continuation. Lowering emits `init ∧ maintain ∧ use`; nested loops compose structurally. `tactus_peel` strips the goal's `∧`/`∀` structure; `tactus_auto` closes each leaf.
+`StmX::Loop` becomes `Wp::Loop { body, after }` — `body` is built with `Done(I ∧ D < _tactus_d_old)` as its terminator; `after` is the post-loop continuation. `walk_loop` emits one init theorem per invariant, walks `body` in maintain ctx (∀ mod_vars + bounds + invs as hyps + cond as hyp + `_tactus_d_old := D` let), walks `after` in use ctx. Body's `Done(inv_conj_marked ∧ decrease_marked)` flows through `Wp::Done` → `emit_done_or_split` per-conjunct — yielding `_tactus_loop_invariant_*` and `_tactus_loop_decrease_*` theorems with their own pos.line.
 
 Tests: `test_exec_loop_count_down`, `test_exec_loop_count_up`, `test_exec_loop_invariant_fails` (negative), `test_exec_loop_sequential`, `test_exec_loop_nested`, `test_exec_loop_in_if_branch`, `test_exec_loop_in_else_branch`, `test_exec_loop_lex_decreases_rejected`, `test_exec_loop_break_rejected`, `test_exec_loop_no_invariant`, `test_exec_loop_decreases_unchanged` (negative).
 
@@ -382,7 +533,7 @@ Tests: `test_exec_overflow_diagnostic`, `test_exec_overflow_tight_ok`, `test_exe
 
 ### Slice 7: function calls ✅ (with recursion)
 
-`StmX::Call` becomes `Wp::Call { callee, args, dest, after }`. Lowering emits `requires(subst) ∧ ∀ ret, h_bound(ret) → ensures_using_ret(subst) → let dest := ret; lower_wp(after)`. Callee's `require`/`ensure` are rendered via `vir_expr_to_ast` and param-substituted via `lean_ast::substitute` — no let-shadowing.
+`StmX::Call` becomes `Wp::Call { callee, args, dest, after }`. `walk_call` emits one theorem for the substituted requires (kind=`CallPrecondition`, skipped if requires is empty), then walks `after` under `∀ ret, ret_bound → ensures(subst) → let dest := ret;` frames (each frame skipped when meaningful — empty ensures skips the Hyp(True) push). Callee's `require`/`ensure` are rendered via `vir_expr_to_ast` and param-substituted via `lean_ast::substitute` — no let-shadowing.
 
 **Termination** comes via Verus's own `recursion` pass, which inserts a `StmX::Assert(InternalFun::CheckDecreaseHeight)` before every recursive call site (including mutual recursion across an SCC). `sst_exp_to_ast_checked` lowers `CheckDecreaseHeight` to the int-typed obligation `(0 ≤ cur ∧ cur < prev) ∨ (cur = prev ∧ otherwise)`. Non-int decreases rejected with a clear error.
 
@@ -392,15 +543,12 @@ Rejected (in `build_wp_call`): trait-method calls (dynamic dispatch), trait-defa
 
 ### What's deferred
 
-The seven original Track B slices are all landed. Subsequent Tier 1-3 roadmap tasks have continued the work — see **Pending work** below for the remaining queue. Landed from the roadmap this session: #50 assert-by user tactics, #49 proof blocks, #52 struct Ctor (enum infra + automation gap as #58), #53 generic calls, #57 break/continue.
+The seven original Track B slices are all landed, plus #49 / #50 / #51 / #52 (struct Ctor) / #53 / #54 / #57 / #58 / D from the Tier 1-3 roadmap. See **Pending work** below for the remaining queue.
 
 See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the full catalogue. Currently blocking realistic exec fns:
 
 - **`&mut` args** — rejected; needs havoc-after-call semantics. Task #55.
 - **Trait-method calls** — rejected; needs dispatch resolution. Task #56.
-- **Non-int decreases** — datatype-typed decreases rejected; needs Lean `height` function generation per datatype. Task #54.
-- **Enum pattern-matching verification** — structural codegen works; `tactus_auto` can't case-split the enum scrutinee. Task #58.
-- **Source-mapping exec-fn errors** — Lean errors cite generated-file line numbers, not Rust source. Task #51.
 - **`assume(P)` warning** — DESIGN.md promises a "unproved assumption" compile warning; not wired.
 - **USize arith rarely auto-verifies** — the bound is emitted, but `tactus_auto` can't discharge symbolic `2 ^ arch_word_bits`. Users need `cases arch_word_bits_valid` proofs.
 - **Labeled `break` / `continue`** — rejected in `build_wp`'s StmX::BreakOrContinue arm; would need a label-keyed stack of loop contexts.
@@ -410,7 +558,7 @@ See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the f
 ### Adding new slices
 
 1. Extend `sst_to_lean::build_wp` / `build_wp_call` / `build_wp_loop` to produce a new `Wp` variant (or accept a new form). Validation (Err for unsupported shapes) happens in the same pass.
-2. Extend `Wp` enum with the new variant if the WP rule doesn't fit an existing one. Each new variant needs: constructor + `needs_peel` arm + `lower_wp` arm + `collect_tactus_haves_into` arm.
+2. Extend `Wp` enum with the new variant if the WP rule doesn't fit an existing one. Each new variant needs: constructor + `walk_obligations` arm. If the variant's emission diverges enough, also add a dedicated `walk_<variant>` helper.
 3. If the goal shape makes `tactus_auto` fail, add a prelude macro or emit a targeted `Tactic::Raw` at emission time. Keep `tactus_auto` dumb.
 4. If new AST shapes are needed, extend `lean_ast` (preferably via smart constructors) and `lean_pp`. If the new shape has binders, extend `lean_ast::substitute` and `collect_free_vars` — three places to edit.
 5. Add snippets to `tactus_coverage::run_snippets` if new VIR variants become reachable via `dep_order::walk_expr` / `walk_place`.
@@ -430,12 +578,12 @@ Two tasks remain. Rough order by cost-effectiveness:
 **Approach (MVS)**:
 1. Detect `&mut` parameters at callee-registration time (check `callee.params[i].x.is_mut` or whatever VIR's field is called — read before coding).
 2. At each call site: extract the caller-side destination `VarIdent` from `args[i]` for each `&mut` index (the arg is a `Loc` of the mutated caller var; use `extract_simple_var_ident`).
-3. In `lower_call`, emit `∀ (x_i' : T_i), type_inv(x_i')` binders for each mutated caller var, threaded around the post-call continuation. Substitute `p_i ↦ x_i'` in the ensures (NOT `p_i ↦ arg_i`). After the ensures implication, re-bind the caller var: `let <caller_var_i> := x_i' in <continuation>`.
-4. Single-arg case is the MVS; multi-arg is a straightforward extension via nested ∀ quantifiers.
+3. In `walk_call`, push `Binder(x_i' : T_i)` and `Hyp(type_inv(x_i'))` frames for each mutated caller var. Substitute `p_i ↦ x_i'` in the ensures (NOT `p_i ↦ arg_i`). After the ensures Hyp frame, push `Let(<caller_var_i>, x_i')` so the continuation sees the post-call value.
+4. Single-arg case is the MVS; multi-arg is a straightforward extension via stacked frames.
 
 **Explicit deferrals**: `old(x)` expressions in ensures (need substitution `old(p) ↦ arg`), `&mut v[i]` and other non-local Loc shapes (first slice assumes `extract_simple_var_ident` succeeds), multi-`&mut` aliasing (precluded by Rust's borrow checker upstream so no runtime check needed).
 
-**What to read first**: `build_wp_call` current rejection logic, `lower_call` for the current non-mut encoding, DESIGN.md "Tier 3 — `&mut` args on calls" for the full plan.
+**What to read first**: `build_wp_call` current rejection logic, `walk_call` for the current non-mut encoding, DESIGN.md "Tier 3 — `&mut` args on calls" for the full plan.
 
 **Gotcha**: VIR's representation of `&mut` parameters — `is_mut` field, `Loc` shapes of args, how `old(x)` desugars upstream. Inspect a real `StmX::Call` with `&mut` args first to confirm shape before coding.
 
@@ -540,9 +688,9 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 
 | Binary | Count | What it tests |
 |---|---|---|
-| `cargo test -p lean_verify --lib` | 106 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value`, type translation, sanity check scope tracking, `format_rust_loc`, lean_process |
+| `cargo test -p lean_verify --lib` | 114 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking, `format_rust_loc`, lean_process |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
-| `vargo test -p rust_verify_test --test tactus` | 186 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes) |
+| `vargo test -p rust_verify_test --test tactus` | 189 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
 | `vargo build --release` (vstd) | 1530 | Regression guard: vstd proof library still verifies |
 
@@ -636,7 +784,7 @@ tactus/
         to_lean_sst_expr.rs    ← SST Exp → Expr (_checked primary,
                                  infallible wrapper; shared helpers)
         to_lean_fn.rs          ← VIR decls → Commands + LeanSourceMap
-        sst_to_lean.rs         ← WpCtx + Wp DSL + build_wp / lower_wp
+        sst_to_lean.rs         ← WpCtx + Wp DSL + build_wp / walk_obligations
                                  (core of Track B)
         lean_process.rs        ← file-based Lean invocation
         project.rs             ← Lake project discovery
@@ -677,8 +825,8 @@ See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the c
 7. **USize arith bounds are emitted but rarely auto-discharge.** `tactus_auto` can't handle symbolic `2 ^ arch_word_bits`. User proofs need `cases arch_word_bits_valid`. A future `tactus_usize_bound` tactic could automate this.
 8. **Parallel VIR / SST renderers — shared leaves, not full unification.** Full analysis in DESIGN.md § "Two parallel expression renderers". Shared rules live in `expr_shared.rs`; walkers stay separate because the source trees are genuinely different shapes.
 9. **Return inside a loop body writes the fn's ensures.** Semantically correct (it's a fn-exit, enforced by the DSL's `Wp::Done` terminator shape). Pinned by `test_exec_return_inside_loop` + `test_exec_return_inside_loop_with_break`.
-10. **`needs_peel` is a recursive tree walk.** Constant-cost today but will want to become a constructor-level bit if more variants need peeling. Same rationale applies to `collect_tactus_haves`.
-11. **`Wp::Branch` still clones `after` into both branches.** Exponential in nested if-depth. Fine for realistic code (DESIGN.md § "Known codegen-complexity trade-offs"). Rc/arena would fix cleanly; neither is worth the lifetime-threading cost yet.
+10. **`OblCtx::with_frame` clones the whole `frames` Vec per call.** O(N²) memory across deeply-nested recursion (asserts inside branches inside loops). Realistic exec fns don't go deep enough for this to matter; switching to `Rc<im::Vector<_>>` (structural sharing) would fix it without changing the API.
+11. **`Wp::Branch` still clones `after` into both branches.** Exponential in nested if-depth. Fine for realistic code (DESIGN.md § "Known codegen-complexity trade-offs"). Rc/arena would fix cleanly; neither is worth the lifetime-threading cost yet. The same pattern repeats at the walker level: per-obligation emission visits the post-if continuation's obligations once per branch path, so a fn with K nested ifs and N obligations after the last if emits 2^K × N theorems for the post-if work. Realistic code stays well below.
 12. **Proof-block goal-modifying tactics affect the outer goal.** `proof { simp_all }` simplifies the whole theorem goal, not just a local sub-proof. Pinned by `test_exec_proof_block_goal_modifying_tactic`; users coming from Verus's self-contained proof blocks may be surprised. The alternative (wrapping in a local `have`) breaks the common `have h : P := by tac` propagation case.
 13. **Labeled break / continue** rejected in `build_wp`. Pinned by `test_exec_loop_labeled_break_rejected`. Would need a label-keyed stack of `WpLoopCtx` rather than the current single innermost-loop context.
 14. **`enclosing_fn_is_tactus_auto` re-parses attrs per call site.** Each AssertBy / proof-block re-parses the enclosing fn's attrs. O(attrs) per site, cheap in practice; caching would add per-verification-unit state for unmeasured gain.

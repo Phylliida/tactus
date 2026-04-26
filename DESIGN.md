@@ -730,15 +730,16 @@ Additional cases handled in Phase 2 but not listed for brevity: pattern matching
 ### Loop obligations
 
 ```
-while cond invariant I decreases D { body }
+while cond invariant I_1, I_2, ... decreases D { body }
 ```
 
-Generates three theorems:
-1. **Init**: `requires ∧ setup → I`
-2. **Maintain**: `I ∧ cond → wp(body, I) ∧ D_decreases`
-3. **Use**: `I ∧ ¬cond → ensures`
+Per-obligation emission (D, 2026-04-26) generates the following separate Lean theorems:
 
-Each is a separate Lean `theorem`. Auto-checked by `tactus_auto`. On failure, user adds `proof { }` blocks.
+1. **Init**: one theorem per invariant — `<outer ctx> → I_i` for each `i`. The invariant must hold at loop entry.
+2. **Maintain**: walk `body` in maintain ctx (`∀ mod_vars + bounds + I_1 ∧ ... as hyps + cond as hyp + _tactus_d_old := D` let). The body's `Done(I_1 ∧ ... ∧ I_n ∧ D < d_old)` terminator splits per-conjunct via `emit_done_or_split` — yielding one theorem per invariant (LoopInvariant kind) plus one for the decrease (LoopDecrease kind). User-written assertions inside the body emit their own theorems too.
+3. **Use**: walk `after` in use ctx (`∀ mod_vars + bounds + I_1 ∧ ... as hyps + ¬cond as hyp`). Produces theorems for the post-loop continuation (Postcondition theorems for the fn's ensures, plus any obligations in the post-loop code).
+
+Each theorem auto-checked by `tactus_auto`. Failure points the user at `_tactus_loop_invariant_<fn>_at_<loc>_<id>` / `_tactus_loop_decrease_<fn>_at_<loc>_<id>` / `_tactus_postcondition_<fn>_at_<loc>_<id>` etc. with the matching `(loop invariant)` / `(loop decrease)` / `(postcondition)` kind label.
 
 ### Overflow obligations
 
@@ -1317,9 +1318,17 @@ enum Wp<'a> {
     Let(&'a str, &'a Exp, Box<Wp<'a>>),                      // continuation wrappers
     Assert(&'a Exp, Box<Wp<'a>>),
     Assume(&'a Exp, Box<Wp<'a>>),
+    AssertByTactus { cond: Option<&'a Exp>, tactic_text: String, body: Box<Wp<'a>> },
     Branch { cond: &'a Exp, then_branch: Box<Wp<'a>>, else_branch: Box<Wp<'a>> },
-    Loop { cond, invs, decrease, modified_vars, body: Box<Wp<'a>>, after: Box<Wp<'a>> },
-    Call { callee, args: &'a [Exp], dest: Option<&'a VarIdent>, after: Box<Wp<'a>> },
+    Loop {
+        cond: Option<&'a Exp>, invs, decrease, modified_vars,
+        body: Box<Wp<'a>>, after: Box<Wp<'a>>,
+    },
+    Call {
+        callee, args: &'a [Exp], typ_args: &'a [Typ],
+        dest: Option<&'a VarIdent>, call_span: &'a Span,
+        after: Box<Wp<'a>>,
+    },
 }
 ```
 
@@ -1358,6 +1367,78 @@ Adding a new WP form means one constructor + one arm each in
 `build_wp` and `walk_obligations`. The old flat enum required
 editing a central dispatcher; the DSL shape makes composition
 obvious.
+
+### Per-obligation theorem emission (D, 2026-04-26)
+
+Replaces the earlier single-theorem emission (`_tactus_body_<fn>`
+with a goal that conjoins all obligations) with one Lean theorem
+per obligation site. The motivation was an imperfection in the
+#51 source-mapping work: with one mega-theorem, Lean's diagnostic
+`pos.line` always pointed at the same closing-tactic line
+regardless of which obligation failed, so `find_span_mark` had
+to use a "closest preceding mark" heuristic that could be off by
+one when the failing obligation wasn't the latest mark in the
+theorem (e.g., a Termination check on a recursive call followed
+by a CallPrecondition mark — the heuristic returned the
+CallPrecondition mark instead).
+
+**Architecture.** A walker (`walk_obligations` + per-variant
+helpers) descends the `Wp` tree, accumulating an `OblCtx`
+(`Let` / `Hyp` / `Binder` frames) at scope-introducing points.
+At each obligation site (Assert, Done leaf, loop invariant init,
+loop maintain conjunct, call precondition, assert-by) the walker
+emits a separate Lean `Theorem`. The obligation goal is
+`OblCtx::wrap(obligation_lexpr)` — frames folded outermost-first
+to preserve source-order scoping (lets bind names visible to
+later hypotheses).
+
+**`AssertKind` split.** SpanMark kinds fall into two roles:
+*obligation kinds* (Plain / Postcondition / LoopInvariant /
+LoopDecrease / CallPrecondition / Termination) wrap the
+expression that IS the proof goal, and *hypothesis kinds*
+(LoopCondition / BranchCondition) wrap expressions used as
+hypothesis frames (loop cond, branch cond). `find_span_mark`
+filters to obligation kinds only — hypothesis SpanMarks
+provide `/- @rust:LOC -/` debug comments in the generated
+`.lean` but never appear as error labels. The split is
+enforced by `AssertKind::is_obligation_kind`.
+
+**Postcondition wrapping.** Each fn-ensures clause is wrapped
+in a `Postcondition` SpanMark at `WpCtx::new` time. Without
+this, a fn-ensures failure inside an if-branch would surface
+the BranchCondition hypothesis mark (closest preceding) and
+produce a `(branch condition)` error label; with it, the
+Postcondition mark always shadows hypothesis-side marks, and
+`emit_done_or_split` splits the wrapped-conjunction Done leaf
+into one theorem per ensures clause.
+
+**Done leaf walker.** `emit_done_or_split` recursively peels
+two structural shapes: top-level `Let` (push to OblCtx and
+recurse on body, so the SpanMark wrapped inside the let
+becomes visible) and top-level `BinOp::And` (split into per-
+conjunct theorems). Other shapes emit one theorem with kind /
+loc from the leaf's outermost SpanMark, falling back to
+`"ensures"` / empty loc when the leaf is unwrapped (only
+reachable when the fn has zero ensures clauses).
+
+**Tactic-prefix stack.** `Wp::AssertByTactus { cond: None,
+tactic }` (i.e., `proof { tactic }`) pushes `tactic` onto
+`ObligationEmitter::tactic_prefix` and walks body. Every
+theorem emitted in body's scope gets `(tactic) <;> closer`
+prepended via `e.emit()`. The `<;>` combinator (rather than
+`;`) handles goal-modifying user tactics correctly: a
+`simp_all` that closes the goal entirely yields zero remaining
+subgoals, and `<;> closer` is a no-op rather than failing
+with "no goals".
+
+**Trade-off: theorem count.** Lean now sees ~3-5x more theorems
+per fn on average. Each is small (single obligation + frames),
+so omega/simp_all are fast on each. Total verification time
+is roughly the same. Generated `.lean` files are bigger but
+still tractable for inspection. The user-visible win is
+exact AssertKind labels and structurally meaningful theorem
+names (`_tactus_loop_invariant_count_down_at_test_21_19_3`
+vs the prior `_tactus_body_count_down`).
 
 ### Upstream-robustness patterns
 
