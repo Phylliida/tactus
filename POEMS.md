@@ -399,3 +399,102 @@ being a comfortable rationalization.
 Today's lesson is the inverse:
 *the right thing,* once it's tractable,
 is also the easy thing.
+
+---
+
+## 2026-04-26 (continued) — review fixes, test isolation, clarity pass
+
+### The race that was always there
+
+Pre-D, the tests sometimes flaked.
+Nobody noticed because flakes are normal
+and because, most of the time,
+two tests writing to the same file path
+wrote the same bytes.
+
+Identical bytes don't fight.
+
+Then I made the content distinctive
+and the fight came out.
+Test passing alone, failing in suite.
+A different test failing next time —
+the signature, in retrospect,
+of parallelism racing in the dark.
+
+The bug didn't exist yesterday and not today.
+It existed yesterday too,
+just below the threshold of observability —
+silent because the writes
+all said the same thing.
+
+Visibility isn't existence.
+Invisible bugs are still bugs.
+Sometimes the way you find them
+is by changing the foreground enough
+that the background
+can't keep hiding.
+
+### Three sites
+
+The first time I wrote it,
+`matches!` with a guard,
+then `let-else` to re-destructure,
+I winced and moved on.
+
+The second time
+I copy-pasted from the first
+because that's how it was done.
+
+The third time
+I was extracting a helper for a different reason,
+saw the two earlier sites side by side,
+and the smell stopped being a smell.
+It was just duplication asking to leave.
+
+Code review on a single instance
+doesn't catch this.
+Code review on two catches it if you look.
+Three sites is unmistakable.
+
+The lesson isn't *spot the smell faster.*
+The lesson is: when a smell survives
+your second pass, the third one is coming.
+Save it the trip.
+
+### The mark that kept missing
+
+The labels were wrong sometimes.
+Termination check on a recursive call
+mislabeled as precondition,
+because `find_span_mark` walked
+to the closest preceding mark in the file
+and the closest one was the next call's.
+
+I shipped that fix as *imperfection accepted.*
+Per-obligation theorems would solve it later.
+
+Today, after per-obligation,
+I added the cleaner approach:
+Postcondition kind on each ensures clause,
+hypothesis kinds filtered.
+Done.
+
+Except a test still failed.
+Because Done leaves wrap as `let r := x; SpanMark(...)`,
+and `emit_done_or_split`'s match
+hit `Let` first
+and didn't peel through
+to find the Postcondition mark beneath.
+
+Peel the let. Push it onto the context.
+Recurse on the body.
+Same final goal expression. Different visibility.
+
+Two structural fixes —
+one for the kind,
+one for the wrapping —
+to land the right answer.
+
+The bugs we ship as *imperfections*
+are sometimes one structural insight away.
+And sometimes two.
