@@ -1575,6 +1575,11 @@ pub struct FunctionAttrsX {
     /// (via `sst_to_lean` WP generation) instead of Z3. Opt-in for now while
     /// the exec-fn pipeline is incomplete.
     pub tactus_auto: bool,
+    /// Tactus: per-fn tactic-closer override. When `Some(tac)`, replaces
+    /// `tactus_auto` in generated theorems with the user-supplied Lean
+    /// tactic (e.g., `"ring"`, `"nlinarith"`, `"(simp_all; nlinarith)"`).
+    /// Only meaningful in tactus_auto exec fns.
+    pub tactus_tactic: Option<String>,
 }
 
 /// Function specification of its invariant mask

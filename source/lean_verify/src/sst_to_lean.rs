@@ -390,12 +390,17 @@ pub fn exec_fn_theorems_to_ast<'a>(
     )?;
 
     let fn_name = lean_name(&fn_sst.x.name.path);
+    let default_closer = match &fn_sst.x.attrs.tactus_tactic {
+        Some(tac) => Tactic::Raw(tac.clone()),
+        None => Tactic::Named("tactus_auto".to_string()),
+    };
     let mut emitter = ObligationEmitter {
         fn_name,
         base_binders: binders,
         counter: 0,
         out: Vec::new(),
         tactic_prefix: Vec::new(),
+        default_closer,
     };
     walk_obligations(&body_wp, &ctx, &OblCtx::new(), &mut emitter);
     Ok(emitter.out)
@@ -531,6 +536,12 @@ struct ObligationEmitter {
     counter: usize,
     out: Vec<Theorem>,
     tactic_prefix: Vec<String>,
+    /// The default closer for emitted theorems. Normally
+    /// `Tactic::Named("tactus_auto")`; overridden via the
+    /// `#[verifier::tactus_tactic("...")]` attribute on the fn.
+    /// Doesn't affect `assert(P) by { user_tac }` sites — those
+    /// always use the user-supplied tactic from the assert-by.
+    default_closer: Tactic,
 }
 
 impl ObligationEmitter {
@@ -659,7 +670,7 @@ fn walk_obligations<'a>(
             let name = build_theorem_name(
                 kind_to_name(kind), &e.fn_name, &loc, id,
             );
-            e.emit(name, obl.wrap(goal), simple_tactic());
+            e.emit(name, obl.wrap(goal), simple_tactic(e));
             // Reuse cond_ast for the body's hypothesis frame —
             // sst_exp_to_ast is deterministic, so re-rendering
             // the same Exp would only repeat work.
@@ -769,7 +780,7 @@ fn walk_assert_by_tactus<'a>(
             let closer = if user_tactic_present {
                 Tactic::Raw(tactic_text.to_string())
             } else {
-                simple_tactic()
+                simple_tactic(e)
             };
             e.emit(name, obl.wrap(goal), closer);
             // Cond as hypothesis for body theorems (reuse cond_ast).
@@ -854,7 +865,7 @@ fn emit_leaf_theorem(
 ) {
     let id = e.next_id();
     let name = build_theorem_name(kind_label, &e.fn_name, loc, id);
-    e.emit(name, obl.wrap(leaf.clone()), simple_tactic());
+    e.emit(name, obl.wrap(leaf.clone()), simple_tactic(e));
 }
 
 /// Construct a per-obligation theorem name. Drops the `_at_<loc>`
@@ -918,7 +929,7 @@ fn walk_loop<'a>(
         let name = build_theorem_name(
             kind_to_name(AssertKind::LoopInvariant), &e.fn_name, &loc, id,
         );
-        e.emit(name, obl.wrap(inv_marked(inv)), simple_tactic());
+        e.emit(name, obl.wrap(inv_marked(inv)), simple_tactic(e));
     }
 
     // ── Maintain: walk body with ∀ mod_vars + bounds + invs as
@@ -1195,7 +1206,7 @@ fn walk_call<'a>(
         let theorem_name = build_theorem_name(
             kind_to_name(AssertKind::CallPrecondition), &e.fn_name, &loc, id,
         );
-        e.emit(theorem_name, obl.wrap(requires_clause), simple_tactic());
+        e.emit(theorem_name, obl.wrap(requires_clause), simple_tactic(e));
     }
 
     // ── Build ensures substitution map ─────────────────────────────
@@ -1358,12 +1369,19 @@ fn walk_let<'a>(
     walk_obligations(body, ctx, &new_obl, e);
 }
 
-/// Atomic `tactus_auto` for per-obligation theorems. Each emitted
+/// Atomic default closer for per-obligation theorems. Each emitted
 /// goal is a single obligation wrapped in let/→/∀ frames from the
 /// `OblCtx`, which `omega` and `simp_all` handle natively (intros
 /// for `∀`/`→`, zeta-reduction for `let`).
-fn simple_tactic() -> Tactic {
-    Tactic::Named("tactus_auto".to_string())
+///
+/// Reads the closer from the `ObligationEmitter` so per-fn
+/// overrides via `#[verifier::tactus_tactic("...")]` apply
+/// uniformly across every emitter site (Wp::Assert,
+/// emit_done_or_split, walk_loop's init, walk_call's
+/// precondition, walk_assert_by_tactus's empty-tactic
+/// fallback).
+fn simple_tactic(e: &ObligationEmitter) -> Tactic {
+    e.default_closer.clone()
 }
 
 // ── Binder builders ────────────────────────────────────────────────────

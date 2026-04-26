@@ -366,6 +366,11 @@ pub(crate) enum Attr {
     LeanImport(String),
     // Tactus: route this exec fn's body through Lean (sst_to_lean + tactus_auto)
     TactusAuto,
+    // Tactus: per-fn tactic-closer override. Replaces `tactus_auto` in
+    // generated theorems with the user-supplied tactic (e.g., "ring",
+    // "nlinarith", "(simp_all <;> nlinarith)"). Only meaningful in
+    // tactus_auto exec fns.
+    TactusTactic(String),
 }
 
 fn get_trigger_arg(span: Span, attr_tree: &AttrTree) -> Result<u64, VirErr> {
@@ -639,6 +644,18 @@ pub(crate) fn parse_attrs(
                 AttrTree::Fun(_, arg, None) if arg == "memoize" => v.push(Attr::Memoize),
                 // Tactus: opt-in to Lean-based exec fn verification
                 AttrTree::Fun(_, arg, None) if arg == "tactus_auto" => v.push(Attr::TactusAuto),
+                // Tactus: per-fn tactic override. Argument is a string
+                // literal containing a Lean tactic that replaces
+                // `tactus_auto` for this fn's emitted theorems.
+                AttrTree::Fun(span, name, Some(box [AttrTree::Lit(LitKind::Str, tac)]))
+                    if name == "tactus_tactic" =>
+                {
+                    if tac.trim().is_empty() {
+                        return err_span(*span,
+                            "tactus_tactic argument must be a non-empty Lean tactic string");
+                    }
+                    v.push(Attr::TactusTactic(tac.clone()));
+                }
                 AttrTree::Fun(span, name, attrs) if name == "rlimit" => {
                     let number = get_rlimit_arg(*span, attrs)?;
                     v.push(Attr::RLimit(number));
@@ -1168,6 +1185,10 @@ pub(crate) struct VerifierAttrs {
     pub(crate) lean_imports: Vec<String>,
     // Tactus: opt-in marker for Lean-based exec fn verification
     pub(crate) tactus_auto: bool,
+    // Tactus: per-fn tactic-closer override. When `Some(tac)`, replaces
+    // `tactus_auto` in generated theorems with the user-supplied Lean
+    // tactic. None = use the default closer.
+    pub(crate) tactus_tactic: Option<String>,
 }
 
 // Check for the `get_field_many_variants` attribute
@@ -1346,6 +1367,7 @@ pub(crate) fn get_verifier_attrs_maybe_check(
         tactic_span: None,
         lean_imports: Vec::new(),
         tactus_auto: false,
+        tactus_tactic: None,
     };
     let mut unsupported_rustc_attr: Option<(String, Span)> = None;
     for attr in parse_attrs(attrs, diagnostics)? {
@@ -1433,6 +1455,7 @@ pub(crate) fn get_verifier_attrs_maybe_check(
             Attr::TacticSpan(start, end) => vs.tactic_span = Some((start, end)),
             Attr::LeanImport(path) => vs.lean_imports.push(path.clone()),
             Attr::TactusAuto => vs.tactus_auto = true,
+            Attr::TactusTactic(tac) => vs.tactus_tactic = Some(tac.clone()),
             _ => {}
         }
     }
