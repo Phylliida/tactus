@@ -832,17 +832,33 @@ recursion pass covers all cross-fn calls in the cycle the same way.
 
 **Restrictions (rejected by `build_wp_call`):**
 
-* **Trait-method calls** — `resolved_method: Some(_)` rejected.
+* **Trait-method calls** — `resolved_method: Some(_)` rejected (#56).
 * **Trait-default-impl calls** — `is_trait_default: Some(_)` rejected.
-* **Generic calls** (`typ_args` non-empty) — rejected.
-* **`&mut` args** — `contains_loc` peels transparent wrappers
-  (Box/Unbox/CoerceMode/Trigger) and rejects any `ExpX::Loc`.
 * **Split-assertion calls** (`split: Some(_)`) — rejected.
 * **Cross-crate callees** — rejected (fn_map is single-crate).
-* **Non-int decreases** — datatype-typed decreases rejected because
-  we don't encode a Lean `height` function yet. Int decreases work
-  via the transparent-identity `height` for ints (see prelude
-  axioms in `vir/src/prelude.rs:1030-1037`).
+
+**Accepted forms (with restrictions):**
+
+* **Generic calls** (`typ_args` non-empty) — LANDED. `walk_call`
+  composes value-param + type-param substitution.
+* **`&mut` args** — caller-side LANDED (#55, slice 1). `walk_call`
+  introduces fresh existentials per `&mut` arg, substitutes
+  pre-/post-state separately in the inlined ensures, and rebinds
+  caller locals via `Let` frames after the ensures `Hyp`. Subset:
+  - **Simple `Loc(VarLoc(_))` only.** `&mut x.f` / `&mut v[i]`
+    rejected via `extract_simple_var_ident`-fail with a pointed
+    error message (deferred follow-up to #55).
+  - **Legacy-mode `VarAt(p, Pre)` only.** New-mut-ref's
+    `MutRefCurrent`/`MutRefFuture` UnaryOps not handled.
+  - **Caller side only.** Fns taking `&mut` params can't yet have
+    their OWN bodies verified by `tactus_auto` — needs
+    fn-entry binding of `<x>_at_pre_tactus` and post-state
+    threading through body assignments. Workaround: have
+    `&mut`-taking fns go through Verus's Z3 path while their
+    callers use `tactus_auto`.
+* **Non-int decreases** — datatype-typed decreases via emitted
+  `T.height` companion fn (see #54 in Tier 2). Int decreases work
+  via the transparent-identity `height` for ints.
 
 ### `_tactus_d_old` aliasing across nested loops
 
@@ -1178,62 +1194,72 @@ exec fns."
 
 ##### Tier 3 — bigger slices (~1 week each)
 
-* **`&mut` args on calls (#55).** Currently rejected in
-  `build_wp_call` via `contains_loc`. Pinned by
-  `test_exec_call_mut_arg_rejected` with a rejection message
-  that names the task and suggests the
-  refactor-to-non-mutating workaround.
+* **`&mut` args on calls (#55) — caller-side LANDED.**
+  `walk_call` introduces a fresh existential `_tactus_mut_post_<id>`
+  per `&mut` arg (the post-call value), substitutes
+  `varat_pre_name(p) ↦ caller_arg` (pre-state) and `p ↦ Var(fresh)`
+  (post-state) in the inlined ensures, then rebinds the caller's
+  local to the fresh value via a `Let` frame placed AFTER the
+  ensures `Hyp` so subsequent obligations see the post-call value.
 
-  **Semantics**: after `foo(&mut x)` returns, `x` is an
-  arbitrary value satisfying its type invariant AND the
-  callee's `ensures` (which may reference the new `x`).
-  Plus aliasing: two `&mut` args to the same call must be
-  distinct (Rust's borrow checker guarantees this upstream,
-  so we don't need to check).
+  **VarAt rewrite via local visitor.** `*old(x)` syntax → VIR-AST
+  `VarAt(p, Pre)` for `&mut` params. The renderer collapses
+  `VarAt(_, _) → Var(_)` globally — correct for non-mut params and
+  loop ensures' at-entry refs, but it would break `&mut`
+  substitution by aliasing pre-state with post-state. Fix:
+  `rewrite_varat_for_mut_params` walks the VIR-AST `Expr` BEFORE
+  rendering and renames `VarAt(p, Pre)` to `Var(<p>_at_pre_tactus)`
+  scoped to the `&mut` param name set. The renderer stays
+  unchanged for everything else. (Initial attempt to make the
+  renderer distinguish `VarAt` globally failed 54 tests because
+  loop ensures rely on the collapse.)
 
-  **Implementation plan (MVS scope):**
-  1. Detect `&mut` parameters at callee-registration time:
-     check `callee.params[i].x.is_mut` (or whatever VIR's
-     field is called — read before coding). Collect indices
-     of `&mut` positions on callee.
-  2. At each call site: for each `&mut` index, extract the
-     caller-side destination `VarIdent` from `args[i]` (the
-     arg is a `Loc` of the mutated caller var).
-  3. In `walk_call`, emit `∀ (x_i' : T_i), type_inv(x_i')`
-     binders for each mutated caller var, threaded around
-     the post-call continuation. The ensures clause is
-     substituted with `p_i ↦ x_i'` (not `p_i ↦ arg_i`).
-     After the ensures implication, the continuation sees
-     `x_i'` as the new value — achieved by textually
-     re-binding the caller var: `let <caller_var_i> :=
-     x_i' in <continuation>`.
-  4. The single-arg case (one `&mut` param) is the MVS;
-     multi-arg is a straightforward extension via nested
-     `∀` quantifiers.
+  **Aliasing**: two `&mut` args to the same call must be distinct.
+  Rust's borrow checker guarantees this upstream, so we don't
+  check.
 
-  **Explicit deferrals:**
-  - **`old(x)` in callee's ensures.** Verus's `ExpX::Old`
-    references the pre-call value; currently rejected at
-    the expression level. When supporting `&mut` we need to
-    pass through `old(x)` as a reference to the pre-call
-    value — specifically, the current binding of the
-    substitution `p ↦ arg`. Simplest: substitute
-    `old(p) ↦ arg` and regular `p ↦ x'` in the ensures
-    rewrite.
-  - **`&mut` on a non-local expression** (e.g.,
-    `foo(&mut v[i])` — mutating through an index). The
-    `Loc` may not reduce to a simple `VarIdent`. First
-    slice assumes the arg-side `Loc` extracts to a single
-    `VarIdent` via `extract_simple_var_ident`; reject
-    otherwise.
-  - **Multi-`&mut` aliasing** between args is precluded by
-    Rust's borrow checker at compile time, so no runtime
-    check needed on our side.
+  **Tests** (all positive except where noted):
+  - `test_exec_call_mut_arg`: single `&mut` arg from tactus_auto
+    caller into Verus-Z3-verified callee.
+  - `test_exec_call_mut_arg_wrong_post`: caller's ensures has +2
+    instead of +1 → `(postcondition)` failure. Pins that
+    substitution doesn't alias pre/post.
+  - `test_exec_call_mut_arg_requires_violated`: caller's `< 200`
+    weaker than callee's `*old(x) < 100` → `(precondition)`
+    failure. Exercises CallPrecondition theorem path.
+  - `test_exec_call_mut_arg_field_rejected` (Err): `&mut h.val`
+    rejected with pointed error (extract_simple_var_ident-fail
+    path).
+  - `test_exec_call_two_mut_args`: two `&mut` args at the same
+    call site exercise the stacked-frames encoding.
 
-  **Companion test to add when feature lands:** the
-  currently-pinned `test_exec_call_mut_arg_rejected` flips
-  to `=> Ok(())`. Add non-decreasing / ensures-violation
-  companions similar to the #54 pattern.
+  **Slice scope (caller side only).** The fn's OWN body
+  verification when it takes `&mut` params is a separate concern:
+  `bump(x: &mut u8) { *x = *x + 1; }` as `tactus_auto` would need
+  Tactus to bind `x_at_pre_tactus` at fn entry and thread the
+  post-state through body assignments. Not in this slice;
+  workaround is to have `&mut`-taking fns go through Verus's Z3
+  path while their callers use `tactus_auto`. The MVS test uses
+  this split.
+
+  **Explicit deferrals (rejected in `build_wp_call`):**
+  - **`&mut x.f` / `&mut v[i]`** — non-simple `Loc` shapes where
+    `extract_simple_var_ident` returns `None`. Verus's Z3 path
+    handles this via havoc-base + assume-other-fields-unchanged.
+    Workaround: extract to a local first.
+  - **New-mut-ref mode (`UnaryOp::MutRefCurrent` /
+    `MutRefFuture`).** This slice handles legacy-mode
+    `VarAt(p, Pre)` only. Migrated functions (per
+    `migrate_mut_refs.rs`) use `MutRefCurrent`/`MutRefFuture`
+    UnaryOps instead of `VarAt`. Not currently exercised by any
+    test; would need parallel handling at the same rewrite site.
+  - **Callee-side `&mut` body verification.** See above.
+
+  **Why `varat_pre_name` lives in `expr_shared.rs`.** Both the
+  rewrite (which produces the synthetic name) and the
+  substitution-map key (which targets it) must agree on the
+  string format. Centralizing in `expr_shared.rs` makes
+  divergence a compile error rather than a runtime mismatch.
 
 * **Trait-method calls (dynamic + resolved static).** Currently
   rejected via `resolved_method: Some(_)` / `CallTargetKind::

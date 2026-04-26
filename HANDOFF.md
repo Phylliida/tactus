@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**189 end-to-end tests + 1 coverage test + 114 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**193 end-to-end tests + 1 coverage test + 114 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -283,6 +283,83 @@ passes net-positive ~400 from added doc + tests). 13 new
 tests across all the passes. 12 poems committed across the
 broader cadence.
 
+#### Current session (2026-04-27 — #55 caller-side &mut MVS)
+
+`&mut` args at exec-fn call sites land. The DESIGN.md plan for
+#55 was a sketch; implementation surfaced one structural wrinkle
+the plan didn't anticipate (VarAt rendering), one course
+correction (scoping the rewrite locally instead of changing the
+renderer globally), and one slice-discipline call (callee-side
+verification stays out of scope).
+
+**What landed:**
+- `walk_call` introduces a fresh existential `_tactus_mut_post_<id>`
+  per `&mut` arg (the post-call value), substitutes
+  `varat_pre_name(p) ↦ caller_arg` (pre-state) and `p ↦ Var(fresh)`
+  (post-state) in the inlined ensures, then rebinds the caller's
+  local to the fresh value via a `Let` frame placed AFTER the
+  ensures `Hyp` so subsequent obligations see the post-call value.
+- `rewrite_varat_for_mut_params` walks the VIR-AST `Expr` BEFORE
+  rendering and renames `VarAt(p, Pre)` to `Var(<p>_at_pre_tactus)`
+  scoped to the `&mut` param name set. Uses `vir::ast_visitor::
+  map_expr_visitor` from upstream rather than rolling our own
+  walker.
+- `varat_pre_name` lives in `expr_shared.rs` so the rewrite (which
+  produces the synthetic name) and the substitution-map key
+  (which targets it) stay in sync — divergence would be a compile
+  error, not a runtime mismatch.
+- `Wp::Call` carries `mut_args: Vec<(usize, &VarIdent)>` —
+  computed in `build_wp_call`, consumed in `walk_call`.
+- `build_wp_call` validates: `&mut` arg must extract to a simple
+  `VarIdent` via `extract_simple_var_ident`. `&mut x.f` /
+  `&mut v[i]` rejected with a pointed error message naming the
+  task and suggesting the extract-to-local workaround.
+
+**Course correction worth recording.** First instinct was to make
+the renderer distinguish `VarAt(x, _)` from `Var(x)` globally —
+emit `<x>_at_pre_tactus` everywhere. That broke 54 tests because
+`VarAt` is used outside `&mut` (loop ensures' at-entry refs),
+where the natural collapse to `Var` is correct. The fix was to
+revert the renderer change and do the rewrite locally at
+substitution time, scoped by the `&mut` param name set. The
+renderer is general; the rewrite is specific. Documented in DESIGN.md
+"Tier 3 — `&mut` args on calls".
+
+**Slice scope (caller side only).** The fn's OWN body
+verification when it takes `&mut` params is a separate concern.
+For example, `bump(x: &mut u8) { *x = *x + 1; }` as `tactus_auto`
+would need Tactus to bind `x_at_pre_tactus` at fn entry and
+thread the post-state through body assignments. The MVS test
+splits the responsibilities: `bump` goes through Verus's Z3 path
+while `call_mut` (the caller) uses `tactus_auto` and exercises
+the new caller-side encoding.
+
+**Tests** (4 new, 1 renamed):
+- `test_exec_call_mut_arg` (renamed from `test_exec_call_mut_ref_rejected`,
+  flipped to `=> Ok(())`): single `&mut` arg, MVS happy path.
+- `test_exec_call_mut_arg_wrong_post`: caller's ensures has +2
+  instead of +1 → `(postcondition)` failure. Pins that
+  substitution doesn't alias pre/post.
+- `test_exec_call_mut_arg_requires_violated`: caller's `< 200`
+  weaker than callee's `*old(x) < 100` → `(precondition)`
+  failure.
+- `test_exec_call_mut_arg_field_rejected` (Err): `&mut h.val`
+  rejected — extract_simple_var_ident-fail path.
+- `test_exec_call_two_mut_args`: two `&mut` args at the same
+  call site exercise the stacked-frames encoding.
+
+**Explicit deferrals** (rejected with clear messages):
+- `&mut x.f` / `&mut v[i]` (non-simple `Loc` shapes) — needs
+  havoc-base + assume-other-fields-unchanged encoding.
+- New-mut-ref's `MutRefCurrent`/`MutRefFuture` UnaryOps — this
+  slice handles legacy-mode `VarAt` only.
+- Callee-side body verification with `&mut` params (separate task).
+
+**Net for the day**: 3 commits (MVS, coverage tests, poems), ~430
+lines added across 4 source files + DESIGN/HANDOFF/POEMS, 4 new
+e2e tests + 1 renamed positive test. 193 e2e tests pass. Single
+remaining pending task: #56 trait-method calls.
+
 ## Architecture
 
 ### Full pipeline
@@ -488,6 +565,7 @@ lean_verify/src/
 18. **Loop break / continue via threaded `WpLoopCtx`.** `build_wp` takes `Option<&WpLoopCtx>` as a parameter; `WpLoopCtx { break_leaf, continue_leaf }` holds the goals each control-flow edge must establish. Inner loops shadow outer (innermost applies). `StmX::BreakOrContinue` emits `Wp::Done(chosen_leaf)`. `Wp::Loop::cond` is `Option<&Exp>` — `None` is Verus's break-lowered `while c { … break; … }` shape; `walk_loop` drops the cond-gates in that case.
 19. **Per-obligation theorem emission (D, 2026-04-26).** One Lean theorem per obligation site instead of one mega-theorem per fn. Each theorem gets its own `pos.line` in Lean diagnostics, so `find_span_mark` returns the right `AssertKind` label by structural construction (the closest preceding obligation-kind mark IS the obligation for that theorem). `OblCtx` accumulates Let / Hyp / Binder frames as the walker descends; `wrap` folds them around each emitted goal. `AssertKind` splits into obligation-firing kinds vs hypothesis-only kinds (`is_obligation_kind()`); hypothesis-side SpanMarks (LoopCondition, BranchCondition) provide `/- @rust:LOC -/` debug comments but are filtered out of error labels.
 20. **Per-test Tactus output isolation (`TACTUS_LEAN_OUT`).** `run_verus` and `run_cargo_verus` set `TACTUS_LEAN_OUT=<test_input_dir>/tactus-lean` per spawned subprocess. Without this, `cargo test`'s inherited `CARGO_TARGET_DIR` routes every test's Lean output to a shared path, races across parallel tests with same-name fns + different-content writes. Pre-D the races were masked by content homogeneity (same fn name → usually same content); per-D writes are distinctive enough to surface. See "Per-test isolation" under Testing infrastructure.
+21. **`&mut` at call sites via local VIR-AST rewrite (#55).** `walk_call` introduces a fresh existential per `&mut` arg (post-call value), substitutes `varat_pre_name(p) ↦ caller_arg` (pre-state) and `p ↦ Var(fresh)` (post-state) in the inlined ensures, then rebinds the caller's local via a `Let` frame placed AFTER the ensures `Hyp`. The `VarAt(p, Pre)` rewrite to `Var(<p>_at_pre_tactus)` happens at the VIR-AST level via `rewrite_varat_for_mut_params` (a small `vir::ast_visitor::map_expr_visitor` user) BEFORE rendering — scoped to the `&mut` param name set so loop ensures' at-entry refs and non-mut params keep the natural `VarAt → Var` collapse. First instinct of changing the renderer globally failed 54 tests; scoped rewrite is the right level. `varat_pre_name` lives in `expr_shared.rs` so the rewrite-side and substitution-key-side stay in sync (compile error on divergence).
 
 ## Track B status
 
@@ -537,17 +615,17 @@ Tests: `test_exec_overflow_diagnostic`, `test_exec_overflow_tight_ok`, `test_exe
 
 **Termination** comes via Verus's own `recursion` pass, which inserts a `StmX::Assert(InternalFun::CheckDecreaseHeight)` before every recursive call site (including mutual recursion across an SCC). `sst_exp_to_ast_checked` lowers `CheckDecreaseHeight` to the int-typed obligation `(0 ≤ cur ∧ cur < prev) ∨ (cur = prev ∧ otherwise)`. Non-int decreases rejected with a clear error.
 
-Tests: `test_exec_call_basic`, `test_exec_call_requires_violated` (negative), `test_exec_call_in_if_branch`, `test_exec_call_in_loop`, `test_exec_call_trait_method_rejected`, `test_exec_call_zero_args`, `test_exec_call_many_args`, `test_exec_call_mut_ref_rejected`, `test_exec_call_recursive_decreasing`, `test_exec_call_recursive_nondecreasing` (negative), `test_exec_call_recursive_no_decreases` (negative), `test_exec_call_mutual_recursion`, `test_exec_ctor_rejected`.
+Tests: `test_exec_call_basic`, `test_exec_call_requires_violated` (negative), `test_exec_call_in_if_branch`, `test_exec_call_in_loop`, `test_exec_call_trait_method_rejected`, `test_exec_call_zero_args`, `test_exec_call_many_args`, `test_exec_call_mut_arg`, `test_exec_call_mut_arg_wrong_post` (negative), `test_exec_call_mut_arg_requires_violated` (negative), `test_exec_call_mut_arg_field_rejected` (negative), `test_exec_call_two_mut_args`, `test_exec_call_recursive_decreasing`, `test_exec_call_recursive_nondecreasing` (negative), `test_exec_call_recursive_no_decreases` (negative), `test_exec_call_mutual_recursion`, `test_exec_ctor_rejected`.
 
-Rejected (in `build_wp_call`): trait-method calls (dynamic dispatch), trait-default-impl calls, generic calls (`typ_args` non-empty), `&mut` args (detected through transparent wrappers), cross-crate callees, split-assertion calls.
+Rejected (in `build_wp_call`): trait-method calls (dynamic dispatch — #56), trait-default-impl calls, cross-crate callees, split-assertion calls, `&mut x.f` / `&mut v[i]` (non-simple Loc shapes — #55 follow-up).
 
 ### What's deferred
 
-The seven original Track B slices are all landed, plus #49 / #50 / #51 / #52 (struct Ctor) / #53 / #54 / #57 / #58 / D from the Tier 1-3 roadmap. See **Pending work** below for the remaining queue.
+The seven original Track B slices are all landed, plus #49 / #50 / #51 / #52 (struct Ctor) / #53 / #54 / #55 (caller-side) / #57 / #58 / D from the Tier 1-3 roadmap. See **Pending work** below for the remaining queue.
 
 See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the full catalogue. Currently blocking realistic exec fns:
 
-- **`&mut` args** — rejected; needs havoc-after-call semantics. Task #55.
+- **`&mut` args at call sites** — caller-side LANDED (#55). Callee-side body verification (`tactus_auto` on a fn that itself takes `&mut`), `&mut x.f` / `&mut v[i]` shapes, and new-mut-ref mode are documented `#55` follow-ups.
 - **Trait-method calls** — rejected; needs dispatch resolution. Task #56.
 - **`assume(P)` warning** — DESIGN.md promises a "unproved assumption" compile warning; not wired.
 - **USize arith rarely auto-verifies** — the bound is emitted, but `tactus_auto` can't discharge symbolic `2 ^ arch_word_bits`. Users need `cases arch_word_bits_valid` proofs.
@@ -567,25 +645,25 @@ See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the f
 
 ## Pending work
 
-Two tasks remain. Rough order by cost-effectiveness:
+One Tier-3 task remains, plus a few `&mut` follow-ups documented as deferrals
+under #55.
 
-### #55 — `&mut` args in exec-fn calls  [~1 week, heavy]
+### #55 follow-ups
 
-**First slice landed (`8920937`)**: rejection error at `build_wp_call`'s `contains_loc` check now names the task and suggests the refactor-to-non-mutating workaround. `test_exec_call_mut_ref_rejected` pins the new error format. Implementation plan written into DESIGN.md.
+The caller-side MVS landed. The remaining `&mut` work breaks into three
+distinct sub-tasks; each could be picked up independently:
 
-**What**: `build_wp_call` rejects calls with `&mut` args (via `contains_loc`). Blocks any fn that mutates through a reference — common in idiomatic Rust.
-
-**Approach (MVS)**:
-1. Detect `&mut` parameters at callee-registration time (check `callee.params[i].x.is_mut` or whatever VIR's field is called — read before coding).
-2. At each call site: extract the caller-side destination `VarIdent` from `args[i]` for each `&mut` index (the arg is a `Loc` of the mutated caller var; use `extract_simple_var_ident`).
-3. In `walk_call`, push `Binder(x_i' : T_i)` and `Hyp(type_inv(x_i'))` frames for each mutated caller var. Substitute `p_i ↦ x_i'` in the ensures (NOT `p_i ↦ arg_i`). After the ensures Hyp frame, push `Let(<caller_var_i>, x_i')` so the continuation sees the post-call value.
-4. Single-arg case is the MVS; multi-arg is a straightforward extension via stacked frames.
-
-**Explicit deferrals**: `old(x)` expressions in ensures (need substitution `old(p) ↦ arg`), `&mut v[i]` and other non-local Loc shapes (first slice assumes `extract_simple_var_ident` succeeds), multi-`&mut` aliasing (precluded by Rust's borrow checker upstream so no runtime check needed).
-
-**What to read first**: `build_wp_call` current rejection logic, `walk_call` for the current non-mut encoding, DESIGN.md "Tier 3 — `&mut` args on calls" for the full plan.
-
-**Gotcha**: VIR's representation of `&mut` parameters — `is_mut` field, `Loc` shapes of args, how `old(x)` desugars upstream. Inspect a real `StmX::Call` with `&mut` args first to confirm shape before coding.
+- **Callee-side body verification.** Allow `tactus_auto` on a fn that takes
+  `&mut` params. Needs fn-entry binding of `<x>_at_pre_tactus` and
+  rewriting of body assignments to thread post-state forward through SSA.
+  Largest of the three.
+- **Non-simple `Loc` shapes** (`&mut x.f`, `&mut v[i]`). Currently rejected
+  in `build_wp_call`. Verus's Z3 path uses havoc-base + assume-other-fields-
+  unchanged; we'd need a parallel encoding.
+- **New-mut-ref mode** (`UnaryOp::MutRefCurrent` / `MutRefFuture`). The
+  current MVS handles legacy-mode `VarAt(p, Pre)` only. Migrated functions
+  use `MutRefCurrent`/`MutRefFuture` UnaryOps instead. Would need
+  parallel handling at the rewrite site.
 
 ### #56 — Trait-method calls  [~1 week, heavy]
 
@@ -690,7 +768,7 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 |---|---|---|
 | `cargo test -p lean_verify --lib` | 114 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking, `format_rust_loc`, lean_process |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
-| `vargo test -p rust_verify_test --test tactus` | 189 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned) |
+| `vargo test -p rust_verify_test --test tactus` | 193 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
 | `vargo build --release` (vstd) | 1530 | Regression guard: vstd proof library still verifies |
 
@@ -803,7 +881,7 @@ tactus/
       fn_call_to_vir.rs        ← tactus_span_from, enclosing_fn_is_tactus_auto
       rust_to_vir_expr.rs      ← Tactus proof-block synthesis (AssertBy-in-Ghost)
     rust_verify_test/tests/
-      tactus.rs                ← 189 end-to-end tests
+      tactus.rs                ← 193 end-to-end tests
       tactus_coverage.rs       ← coverage matrix test binary
     vir/src/
       ast.rs                   ← FunctionAttrs.tactic_span + tactus_auto;
@@ -846,7 +924,7 @@ cd lean_verify && ./scripts/setup-mathlib.sh && cd ..
 # or: TACTUS_LEAN_PROJECT=/custom/path ./scripts/setup-mathlib.sh
 
 # ── Full test suite ────────────────────────────────────────────────
-# 189 end-to-end tests
+# 193 end-to-end tests
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Coverage matrix (1 test, asserts walker visits the expected variant set)
