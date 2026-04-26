@@ -2369,6 +2369,31 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// ── assume(P) warning ─────────────────────────────────────────────
+// `assume(P)` enters P as a hypothesis without a proof — a soundness
+// escape hatch for incremental development. Tactus surfaces a
+// warning per `assume` site so users know which assumptions are
+// load-bearing on their verification.
+test_verify_one_file! {
+    #[test] test_exec_assume_warning verus_code! {
+        #[verifier::tactus_auto]
+        fn use_assume(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 5
+        {
+            assume(x + 5 < 256);  // unproved: caller doesn't bound x to <251
+            x + 5
+        }
+    } => Ok(err) => {
+        assert!(
+            err.warnings.iter().any(|w| w.message.contains("unproved assumption")
+                || w.message.contains("assume(P)")),
+            "expected an unproved-assumption warning, got: {:?}",
+            err.warnings.iter().map(|w| &w.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
 // ── Bit-width coverage matrix ─────────────────────────────────────
 // u8/u32/i8 are exercised by the overflow/widen tests above. The
 // codegen path is identical across widths (just a different bound

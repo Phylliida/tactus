@@ -401,6 +401,40 @@ pub fn exec_fn_theorems_to_ast<'a>(
     Ok(emitter.out)
 }
 
+/// Walk a VIR-AST `Expr` body and collect spans of every
+/// user-written `assume(P)` site. Used by `generate::check_exec_fn`
+/// to emit "unproved assumption" warnings — `assume(P)` enters an
+/// unverified hypothesis into the proof context, so each site
+/// needs a visible reminder.
+///
+/// Operates on the AST (`vir_fn.body`) rather than the SST because
+/// only the AST distinguishes user-written `assume(P)` (rendered as
+/// `ExprX::AssertAssume { is_assume: true, .. }`) from synthetic
+/// `StmX::Assume` statements injected by Verus's later passes
+/// (post-overflow-check, post-call ensures, etc.). Walking the SST
+/// and warning on every `StmX::Assume` produces false positives on
+/// every overflow-checked arithmetic op.
+pub fn collect_assume_sites(body: &Expr) -> Vec<Span> {
+    use std::cell::RefCell;
+    let out: RefCell<Vec<Span>> = RefCell::new(Vec::new());
+    let _ = map_expr_visitor(body, &|e: &Expr| {
+        if let ExprX::AssertAssume { is_assume: true, .. } = &e.x {
+            out.borrow_mut().push(e.span.clone());
+        }
+        Ok(e.clone())
+    });
+    out.into_inner()
+}
+
+/// Format a `Span` for a user-facing diagnostic. Prefers the
+/// pre-resolved `start_loc` (populated by `rust_verify`'s
+/// `to_air_span`); falls back to `as_string` for synthetic spans.
+/// Same logic as the internal `format_rust_loc` but exposed for
+/// `generate.rs`'s warning emission path.
+pub fn format_span_loc(span: &Span) -> String {
+    format_rust_loc(span)
+}
+
 /// One frame of accumulated context as the obligation walker descends
 /// into a Wp tree. Pushed at scope-introducing points (let bindings,
 /// branch hypotheses, assert hypotheses, assume hypotheses); popped
