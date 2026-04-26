@@ -118,7 +118,7 @@ use vir::sst::{
 };
 use vir::ast::{
     AssertQueryMode, Expr, ExprX, Fun, FunctionKind, FunctionX, KrateX, SpannedTyped, TactusKind,
-    Typ, UnaryOp, UnaryOpr, VarAt, VarIdent,
+    Typ, UnaryOp, UnaryOpr, VarAt, VarBinder, VarIdent,
 };
 use vir::ast_visitor::map_expr_visitor;
 use vir::messages::Span;
@@ -1348,15 +1348,22 @@ fn walk_let<'a>(
         //   ≡ `let z := zval; let outer := bodyval; rest`
         // Peel one layer of inner let, then continue lifting on
         // `bodyval` (which may itself be an If or another nested let).
+        // Multi-binder lets (`let (a, b) = …`) iterate the binder
+        // list inline: each binder becomes its own frame, then we
+        // recurse on the inner body for the outer let-binding.
         ExpX::Bind(bnd, inner_body) => {
-            if let Some((inner_name, rhs, after_inner)) =
-                match_single_let_bind(bnd, inner_body)
-            {
-                let new_obl = obl.with_frame(CtxFrame::Let(
-                    inner_name, sst_exp_to_ast(rhs),
-                ));
-                walk_let(name, after_inner, body, ctx, &new_obl, e);
-                return;
+            if let BndX::Let(bs) = &bnd.x {
+                if !bs.is_empty() {
+                    let mut chain_obl = obl.clone();
+                    for b in bs.iter() {
+                        chain_obl.frames.push(CtxFrame::Let(
+                            sanitize(&b.name.0),
+                            sst_exp_to_ast(&b.a),
+                        ));
+                    }
+                    walk_let(name, inner_body, body, ctx, &chain_obl, e);
+                    return;
+                }
             }
         }
         _ => {}
@@ -1660,11 +1667,25 @@ fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
                 LExpr::implies(LExpr::not(c), lift_if_value(else_e, emit_leaf)),
             )
         }
-        // Single-binder `let y := e_rhs; body` — if the rhs has an if,
-        // lift it out, re-threading `body` through each branch. Verus
-        // often emits `let y = …; y` blocks as this shape, which would
-        // otherwise hide the if from our lift.
+        // `let y := e_rhs; body` — if any rhs has an if, lift it out,
+        // re-threading `body` through each branch. Verus often emits
+        // `let y = …; y` blocks as this shape, which would otherwise
+        // hide the if from our lift.
+        //
+        // Multi-binder lets (`let (a, b) = …; body`, represented as
+        // `Bind(Let([(a, val_a), (b, val_b)]), body)`) are unfolded
+        // to a chain of single-binder lets up front; the existing
+        // single-binder logic then handles each layer naturally.
         ExpX::Bind(bnd, body) => {
+            if let BndX::Let(bs) = &bnd.x {
+                if bs.len() > 1 {
+                    // Unfold to single-binder chain, then recurse.
+                    let unfolded = unfold_multi_binder_let(
+                        &bs[..], body, &peeled.span, &peeled.typ,
+                    );
+                    return lift_if_value(&unfolded, emit_leaf);
+                }
+            }
             if let Some((name, rhs, inner_body)) = match_single_let_bind(bnd, body) {
                 // `name` is already an owned `String` from
                 // `match_single_let_bind`; the closure captures
@@ -1679,6 +1700,36 @@ fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
         }
         _ => emit_leaf(sst_exp_to_ast(e)),
     }
+}
+
+/// Convert a multi-binder `Bind(Let([b1, b2, ...]), body)` into the
+/// equivalent chain of single-binder lets:
+///   `Bind(Let([b1]), Bind(Let([b2]), ..., body))`
+///
+/// Used by `lift_if_value` and `walk_let` so the existing
+/// single-binder peel logic handles each binder layer naturally —
+/// without this unfold, a multi-binder let would silently pass
+/// through with no peeling, hiding any if-values inside its
+/// rhs's from goal-level lift.
+fn unfold_multi_binder_let(
+    bs: &[VarBinder<Exp>],
+    body: &Exp,
+    span: &Span,
+    typ: &Typ,
+) -> Exp {
+    if bs.is_empty() {
+        return body.clone();
+    }
+    let inner = unfold_multi_binder_let(&bs[1..], body, span, typ);
+    let single_bnd = vir::def::Spanned::new(
+        span.clone(),
+        BndX::Let(Arc::new(vec![bs[0].clone()])),
+    );
+    Arc::new(SpannedTyped {
+        span: span.clone(),
+        typ: typ.clone(),
+        x: ExpX::Bind(single_bnd, inner),
+    })
 }
 
 /// Destructure `ExpX::Bind(BndX::Let([single binder]), body)` into
