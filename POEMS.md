@@ -498,3 +498,98 @@ to land the right answer.
 The bugs we ship as *imperfections*
 are sometimes one structural insight away.
 And sometimes two.
+
+---
+
+## 2026-04-26 (evening) — review passes, isolation catch, coverage audit
+
+### Six lenses
+
+You read the diff once.
+That's the smell pass.
+
+You read it again, asking
+*what's lying about purity.*
+That's the FP pass.
+
+You read a third time, asking
+*what test is missing.*
+That's coverage.
+
+A fourth: *what breaks if Verus changes X.*
+A fifth: *what's landed but not documented.*
+A sixth, today, that I hadn't named before:
+*what was the right way to begin with —
+not what we accepted, but what we deferred.*
+
+Six passes, six different questions,
+six different sets of findings.
+None of the passes is sloppy.
+None of them is enough.
+
+A single read-through only sees
+what its current question makes salient.
+Other things sit in the page unobserved —
+not invisible, just not the answer
+to what was asked.
+
+The lenses aren't six views of one thing.
+They're six different things,
+the same code in six lights.
+You don't pick which is right.
+You walk the room with each.
+
+### Looking reasonable
+
+`let name = name.to_string()`
+
+It survived the first cleanup,
+the second,
+and was waved through three review passes
+because each time my eye said
+*ownership for the closure*
+before the question even arrived.
+A reasonable explanation, prefabricated,
+took the shape of an answer.
+
+Then I extracted a helper somewhere else,
+came back, looked at the line,
+and saw what it actually was:
+a String being cloned to a String.
+A no-op, dressed in plausibility.
+
+The most stubborn bugs aren't the ones
+hiding from review.
+They're the ones claiming to be obvious.
+Your brain accepts the claim
+and moves on.
+
+The trick is asking not
+*does this make sense*
+but *what is this actually doing,*
+which are different questions
+that can both be answered yes.
+
+### Witness
+
+There was a code path
+that fired only when ensures was empty.
+The docstring said so. I wrote it.
+The path was real. I'd written that too.
+
+Today, in the coverage audit,
+I asked: when does this actually run?
+And the answer was: in no test we have.
+
+So I wrote a fn with no ensures
+and the test passed,
+and now the path has a witness.
+
+Existence and observation are not the same thing.
+A line of code that runs only
+under conditions you don't test
+is a well-documented hypothesis.
+
+The docstring was true about what *would* happen.
+But truth and verification
+were one test apart.
