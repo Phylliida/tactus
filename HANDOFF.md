@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**196 end-to-end tests + 1 coverage test + 114 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**216 end-to-end tests + 1 coverage test + 114 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -429,6 +429,88 @@ follow-up.
 **Net for the day so far**: 4 commits (#55 + #56 slices + docs).
 196 e2e tests pass. #56 caller-side MVS landed.
 
+#### Current session (2026-04-28 — deferrals batch + small features)
+
+A focused day going through the deferrals catalogue. Twelve
+tasks closed across coverage, small features, and one
+architectural cleanup pass at the end.
+
+**Tier 1 (test coverage)**:
+- #76 bit-width matrix (u16/u64/u128/i16/i32/i64/i128 + 1
+  negative). 8 tests.
+- #77 control-flow combinations (return-in-else, 4-var loop,
+  nested-if-with-loops). 3 tests.
+- #79 lossy-accept paths (Xor, Choose, assert-forall-with-vars
+  documented as upstream-panic). 2 tests + 1 comment-doc gap.
+  Surfaced renderer divergence: SST hardcoded `"xor"` while
+  VIR-AST went through the shared `non_binop_head` table —
+  fixed both to route through `non_binop_head`. Then
+  `non_binop_head` updated from `"xor"` to `"Bool.xor"` (dotted
+  bypasses sanity allowlist; native Lean).
+- #78 shape-drift + WpCtx + edge cases (name collision test).
+  1 test, surfaced a real soundness bug.
+
+**Soundness fix surfaced by #78**: when a callee's `ret.name.0`
+matches a caller-scope local of the same sanitized name, the ∀-
+binder we emit in `walk_call` shadowed the caller's local for
+the post-call frames — subsequent uses of the caller's `r`
+silently bound to the ∀-bound ret value. Fix: gensym the ret
+name to `_tactus_ret_<id>` in `walk_call`; substitute the
+callee's source ret-name → fresh in the ensures rendering. Six
+lines.
+
+**Tier 2 (small features)**:
+- #80 `assume(P)` compile warning. `CheckResult` shape changed
+  to carry `warnings: Vec<String>`. Walks the VIR-AST body
+  (`vir_fn.body`) for `ExprX::AssertAssume { is_assume: true,
+  .. }` (NOT the SST — synthetic StmX::Assume from overflow
+  passes would false-positive).
+- #81 per-fn tactic override `#[verifier::tactus_tactic("…")]`.
+  Replaces the default closer for the marked fn's emitted
+  theorems. `simple_tactic` now reads from `ObligationEmitter`
+  rather than returning a hardcoded constant.
+- #82 `tactus_usize_bound` tactic in TactusPrelude.lean.
+  Discharges goals over `usize_hi` / `isize_hi` by case-splitting
+  on `arch_word_bits_valid` and reducing the literal `2 ^ 32` /
+  `2 ^ 64`. Composes with the per-fn override (#81).
+- #83 gensym `_tactus_d_old` per loop. Same shape as today's
+  ret-name gensym, six lines. Uses Verus's stable
+  `StmX::Loop::id` (no codegen counter needed).
+
+**Tier 3 (medium features, smaller end)**:
+- #85 ExpX::Old investigation. The deferral was a wrong
+  description: SST-level `ExpX::Old` is internal to Verus's
+  AIR pipeline ("only used during sst_to_air") — user-syntax
+  `old(x)` lowers to `ExpX::VarAt(x, Pre)` which Tactus already
+  handles. Closed by writing better error messages and
+  docstrings, no behavior change.
+- #90 `BinaryOp::HeightCompare`. Dispatches by operand type:
+  int-height → direct `<` / `=`; same datatype → `T.height` fn
+  comparison.
+- #92 `lift_if_value` + `walk_let` multi-binder support.
+  Defensive — Verus's tuple destructure goes through
+  Ctor + projection, not multi-binder Bind(Let), so no e2e
+  test exercises this directly. The hardening stays.
+
+**Cleanup pass (5-lens review)**:
+- Linus hat: orphaned `field_access_name` docstring (insertion
+  of `varat_pre_name` split it from its fn). Reordered.
+- Linus hat: `pick_spec_source`'s `_ =>` catch-all on
+  `FunctionKind` would silently accept new variants. Converted
+  to exhaustive match (Static / TraitMethodImpl /
+  TraitMethodDecl / ForeignTraitMethodImpl).
+- FP: `collect_assume_sites` uses `RefCell` because
+  `map_expr_visitor` takes `Fn` not `FnMut` — added a comment
+  explaining why we discard the rebuilt expr (using a
+  transformer as an inspector).
+- Coverage: empty `tactus_tactic("")` rejection had no test —
+  added `test_exec_tactus_tactic_empty_rejected`.
+
+**Net for the day**: 14 commits + 1 cleanup follow-up. 196 →
+216 e2e tests (+20). Three real bugs surfaced + fixed.
+Twelve deferral tasks closed (#76–80, #82–83, #85, #90, #92).
+Six poems committed across two batches.
+
 ## Architecture
 
 ### Full pipeline
@@ -636,6 +718,9 @@ lean_verify/src/
 20. **Per-test Tactus output isolation (`TACTUS_LEAN_OUT`).** `run_verus` and `run_cargo_verus` set `TACTUS_LEAN_OUT=<test_input_dir>/tactus-lean` per spawned subprocess. Without this, `cargo test`'s inherited `CARGO_TARGET_DIR` routes every test's Lean output to a shared path, races across parallel tests with same-name fns + different-content writes. Pre-D the races were masked by content homogeneity (same fn name → usually same content); per-D writes are distinctive enough to surface. See "Per-test isolation" under Testing infrastructure.
 21. **`&mut` at call sites via local VIR-AST rewrite (#55).** `walk_call` introduces a fresh existential per `&mut` arg (post-call value), substitutes `varat_pre_name(p) ↦ caller_arg` (pre-state) and `p ↦ Var(fresh)` (post-state) in the inlined ensures, then rebinds the caller's local via a `Let` frame placed AFTER the ensures `Hyp`. The `VarAt(p, Pre)` rewrite to `Var(<p>_at_pre_tactus)` happens at the VIR-AST level via `rewrite_varat_for_mut_params` (a small `vir::ast_visitor::map_expr_visitor` user) BEFORE rendering — scoped to the `&mut` param name set so loop ensures' at-entry refs and non-mut params keep the natural `VarAt → Var` collapse. First instinct of changing the renderer globally failed 54 tests; scoped rewrite is the right level. `varat_pre_name` lives in `expr_shared.rs` so the rewrite-side and substitution-key-side stay in sync (compile error on divergence).
 22. **Trait-method calls via callee-redirect + spec-source split (#56).** When `StmX::Call::resolved_method = Some((resolved_fun, resolved_typs))`, `build_wp_call` redirects the callee lookup from `fun` (trait method decl) to `resolved_fun` (resolved concrete impl), and uses `resolved_typs` as the type-args slice (`Self` is filled in by Verus's resolution). Inside `walk_call`, `pick_spec_source` further redirects spec lookup to the trait method decl when callee is `TraitMethodImpl`. Reason: Verus rejects impl-side `requires` declarations (impls inherit), so the impl's `require` is empty; using the trait's spec is sound because Verus enforces impl ⇒ trait via its trait-impl-checking pass. Trade-off: impl-specific strengthening of `ensures` isn't seen at call sites (caller sees the trait-level contract); deferred follow-up. `is_trait_default = Some(true)` (default-impl invocation) still rejected — separate concern.
+23. **Gensym for callee return name and per-loop d_old (#78, #83).** Two same-shape gensyms after they surfaced as soundness/hardening fixes: (a) `walk_call` emits `_tactus_ret_<id>` for the ∀-bound return value (not the callee's source-level ret name), substituting the original ret name in the ensures rendering — pinned by `test_exec_call_ret_name_collision` after a real shadowing bug surfaced. (b) `Wp::Loop` carries `d_old_name: String` (built from Verus's stable `StmX::Loop::id`); `walk_loop` uses it for the `let _tactus_d_old_<id> := D` binding. Both reserve the `_tactus_*` prefix; user code can't collide. Same conceptual move in two places; the second was preemptive after the first surfaced as a real bug.
+24. **`assume(P)` warnings + `CheckResult` shape (#80).** `CheckResult::Success` and `Failed` carry `warnings: Vec<String>`. The verifier emits each as `MessageLevel::Warning` before the success/error path. `collect_assume_sites` walks the VIR-AST `vir_fn.body` (NOT the SST) to find user-written `ExprX::AssertAssume { is_assume: true, .. }` — the SST has synthetic `StmX::Assume` injected by Verus's overflow / call-ensures passes, which would false-positive every overflow-checked op.
+25. **Per-fn tactic override (#81) + `tactus_usize_bound` (#82).** `#[verifier::tactus_tactic("…")]` plumbs through `FunctionAttrsX::tactus_tactic: Option<String>`. `ObligationEmitter::default_closer: Tactic` is read by `simple_tactic` rather than returning a hardcoded constant — every codegen site honors the override uniformly. `assert(P) by { user_tac }` sites still use the user-supplied tactic from the assert-by; the override applies only to default-closer sites. `tactus_usize_bound` in `TactusPrelude.lean` discharges symbolic `2 ^ arch_word_bits` via `rcases arch_word_bits_valid; subst; simp; first | decide | omega`. Composes via `tactus_first | tactus_auto | tactus_usize_bound`.
 
 ## Track B status
 
@@ -855,7 +940,7 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 |---|---|---|
 | `cargo test -p lean_verify --lib` | 114 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking, `format_rust_loc`, lean_process |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
-| `vargo test -p rust_verify_test --test tactus` | 196 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites, trait-method calls) |
+| `vargo test -p rust_verify_test --test tactus` | 216 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites, trait-method calls, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
 | `vargo build --release` (vstd) | 1530 | Regression guard: vstd proof library still verifies |
 
@@ -968,7 +1053,7 @@ tactus/
       fn_call_to_vir.rs        ← tactus_span_from, enclosing_fn_is_tactus_auto
       rust_to_vir_expr.rs      ← Tactus proof-block synthesis (AssertBy-in-Ghost)
     rust_verify_test/tests/
-      tactus.rs                ← 196 end-to-end tests
+      tactus.rs                ← 216 end-to-end tests
       tactus_coverage.rs       ← coverage matrix test binary
     vir/src/
       ast.rs                   ← FunctionAttrs.tactic_span + tactus_auto;
@@ -1011,7 +1096,7 @@ cd lean_verify && ./scripts/setup-mathlib.sh && cd ..
 # or: TACTUS_LEAN_PROJECT=/custom/path ./scripts/setup-mathlib.sh
 
 # ── Full test suite ────────────────────────────────────────────────
-# 196 end-to-end tests
+# 216 end-to-end tests
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Coverage matrix (1 test, asserts walker visits the expected variant set)

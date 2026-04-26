@@ -2439,6 +2439,27 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Negative: empty `tactus_tactic("")` is rejected at parse time
+// (rather than emitting `:= by` followed by nothing in Lean).
+// Pins the parser's empty-trim check in `attributes.rs`.
+test_verify_one_file! {
+    #[test] test_exec_tactus_tactic_empty_rejected verus_code! {
+        #[verifier::tactus_auto]
+        #[verifier::tactus_tactic("")]
+        fn add_one(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        { x + 1 }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("non-empty")
+                || e.message.contains("tactus_tactic")),
+            "expected empty-tactic-string rejection, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
 // Negative: a tactic override that can't discharge the goal still
 // fails cleanly. Pins that the user's tactic IS being invoked
 // (and isn't being silently augmented with the default closer).

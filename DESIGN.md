@@ -969,9 +969,10 @@ Accepted via #57: **`cond: None`** loops (the form Verus produces when lowering 
 
 #### Tactic / automation limitations
 
-* **`tactus_auto`'s toolbox is `rfl | decide | omega | simp_all`.** Exec-fn obligations needing `nlinarith`, `ring`, `polyrith`, `aesop`, `positivity`, etc. fall through to the `fail` branch. Proof fns *can* use any Mathlib tactic in their `by { … }` block; exec fns can't.
-* **No per-fn tactic override.** A user who wants `ring` for a specific exec fn has no way to request it. A `#[verifier::tactus_tactic("ring")]` attribute plumbed into `FunctionAttrs` would fix it.
-* **Mathlib auto-tactics unused for exec fns.** Exec-fn `tactus_auto` is intentionally minimal to keep verification predictable; extending it is a design call, not a straight addition.
+* **`tactus_auto`'s default toolbox is `rfl | decide | omega | simp_all | tactus_case_split`.** Exec-fn obligations needing `nlinarith`, `ring`, `polyrith`, `aesop`, `positivity`, etc. fall through to the `fail` branch — unless a per-fn override is set (see below). Proof fns *can* use any Mathlib tactic in their `by { … }` block.
+* **Per-fn tactic override (LANDED, #81).** `#[verifier::tactus_tactic("…")]` replaces `tactus_auto` as the default closer for the marked fn's emitted theorems. The argument is any Lean tactic string (e.g., `"ring"`, `"nlinarith"`, `"first | tactus_auto | tactus_usize_bound"`). Doesn't affect `assert(P) by { user_tac }` sites — those always use the user-supplied tactic. Empty strings rejected at parse time.
+* **`tactus_usize_bound` tactic (LANDED, #82).** Discharges goals over `usize_hi` / `isize_hi` (`2 ^ arch_word_bits` / `2 ^ (arch_word_bits - 1)`) by `rcases arch_word_bits_valid; subst; simp only [usize_hi, isize_hi]; first | decide | omega`. Composes via `tactus_first` so users can layer it: `#[verifier::tactus_tactic("first | tactus_auto | tactus_usize_bound")]`. Without this, USize/ISize arithmetic obligations needed manual `cases arch_word_bits_valid` blocks.
+* **Mathlib auto-tactics unused by default for exec fns.** Exec-fn `tactus_auto` is intentionally minimal to keep verification predictable; extending the default toolbox is a design call. Per-fn override is the per-fn opt-in.
 
 #### Architecture debts (working-but-not-ideal)
 

@@ -421,7 +421,14 @@ pub fn exec_fn_theorems_to_ast<'a>(
 /// every overflow-checked arithmetic op.
 pub fn collect_assume_sites(body: &Expr) -> Vec<Span> {
     use std::cell::RefCell;
+    // `RefCell` because `map_expr_visitor` takes `Fn`, not `FnMut`
+    // — we need interior mutability for the per-node side-effect
+    // collection. The borrow scope is local to this fn.
     let out: RefCell<Vec<Span>> = RefCell::new(Vec::new());
+    // We discard the rebuilt `Expr` (the `let _ =`) because we're
+    // using a transformer as an inspector — the visitor's natural
+    // shape rebuilds the tree, but we only care about the
+    // side-effect collection in `out`.
     let _ = map_expr_visitor(body, &|e: &Expr| {
         if let ExprX::AssertAssume { is_assume: true, .. } = &e.x {
             out.borrow_mut().push(e.span.clone());
@@ -1064,6 +1071,12 @@ fn pick_spec_source<'a>(
     callee: &'a FunctionX,
     fn_map: &FnMap<'a>,
 ) -> Result<&'a FunctionX, String> {
+    // Explicit destructure of every FunctionKind variant — a new
+    // upstream variant that needs spec redirection (e.g., a future
+    // "TraitMethodImplWithDefault" or similar) would force a compile
+    // error here rather than silently falling through to "use the
+    // callee's specs as-is" (which can be wrong if the impl
+    // inherits from another source).
     match &callee.kind {
         FunctionKind::TraitMethodImpl { method, .. } => {
             fn_map.get(method).copied().ok_or_else(|| format!(
@@ -1073,7 +1086,15 @@ fn pick_spec_source<'a>(
                 method.path, callee.name.path,
             ))
         }
-        _ => Ok(callee),
+        // `Static` — regular fn, specs are on the callee itself.
+        // `TraitMethodDecl` — the trait method itself (called via
+        //   non-DynamicResolved path); specs are on the callee.
+        // `ForeignTraitMethodImpl` — per its docstring, demoted to
+        //   Static by `demote_foreign_traits`, so we shouldn't see
+        //   it here. If we do, treat as Static (specs on callee).
+        FunctionKind::Static
+        | FunctionKind::TraitMethodDecl { .. }
+        | FunctionKind::ForeignTraitMethodImpl { .. } => Ok(callee),
     }
 }
 
