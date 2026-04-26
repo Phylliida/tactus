@@ -3519,11 +3519,13 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Trait method call — rejected by `walk_call` because the
-// `resolved_method` field is populated (dynamic dispatch resolution
-// that we don't handle yet).
+// Trait method call resolved to a concrete impl. `b.bump(x)` with
+// `b: &Id` is a `DynamicResolved` case: Verus knows the receiver
+// type so `resolved_method = Some((Id::bump, [Id]))`. `walk_call`
+// redirects the callee lookup to the resolved impl and substitutes
+// the impl's specs (which equal or strengthen the trait's specs).
 test_verify_one_file! {
-    #[test] test_exec_call_trait_method_rejected verus_code! {
+    #[test] test_exec_call_trait_method verus_code! {
         trait Bumper {
             fn bump(&self, x: u8) -> (r: u8)
                 ensures r == x;
@@ -3544,12 +3546,121 @@ test_verify_one_file! {
         {
             b.bump(x)
         }
+    } => Ok(())
+}
+
+// Negative: trait method's requires is violated at the call site.
+// Pins that the substituted requires (from the resolved impl) is
+// what gets emitted as the precondition obligation.
+test_verify_one_file! {
+    #[test] test_exec_call_trait_method_requires_violated verus_code! {
+        trait Bounded {
+            fn checked_add(&self, x: u8, y: u8) -> (r: u8)
+                requires x + y < 256
+                ensures r == x + y;
+        }
+
+        struct Adder;
+        impl Bounded for Adder {
+            fn checked_add(&self, x: u8, y: u8) -> (r: u8)
+                ensures r == x + y
+            {
+                x + y
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn try_add(a: &Adder, x: u8) -> (r: u8)
+            ensures r == x
+        {
+            // x + 200 may overflow when x > 55 — caller has no bound on x
+            a.checked_add(x, 200)
+        }
     } => Err(err) => {
         assert!(
-            err.errors.iter().any(|e| e.message.contains("not yet supported")),
-            "trait-method call should be rejected",
+            err.errors.iter().any(|e| e.message.contains("precondition")),
+            "expected precondition failure on trait method call, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
         );
     }
+}
+
+// Two impls of the same trait — the caller picks one statically.
+// Each call site's `resolved_method` points at a different impl,
+// but Tactus uses the TRAIT's spec for both (impl-specific
+// strengthening isn't seen — documented trade-off in DESIGN.md).
+// The caller's ensures must align with what the trait promises.
+test_verify_one_file! {
+    #[test] test_exec_call_trait_method_two_impls verus_code! {
+        trait Wrapper {
+            fn unwrap(&self) -> (r: u8)
+                ensures r < 100;
+        }
+
+        struct AlwaysFive;
+        impl Wrapper for AlwaysFive {
+            fn unwrap(&self) -> (r: u8)
+                ensures r == 5
+            {
+                5
+            }
+        }
+
+        struct AlwaysTen;
+        impl Wrapper for AlwaysTen {
+            fn unwrap(&self) -> (r: u8)
+                ensures r == 10
+            {
+                10
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn use_either(w: &AlwaysFive) -> (r: u8)
+            ensures r < 100  // trait-level guarantee
+        {
+            w.unwrap()
+        }
+
+        #[verifier::tactus_auto]
+        fn use_other(w: &AlwaysTen) -> (r: u8)
+            ensures r < 100  // same trait-level guarantee — impl differs
+        {
+            w.unwrap()
+        }
+    } => Ok(())
+}
+
+// Trait method that takes additional non-self args. Pins that the
+// substitution map handles trait-method param names (`x: u8`)
+// correctly when the resolved impl is a different fn than the trait
+// decl — both have the same param names but the LExpr for the param
+// binding must come from the right place.
+test_verify_one_file! {
+    #[test] test_exec_call_trait_method_with_args verus_code! {
+        trait Adder {
+            fn add_one(&self, x: u8) -> (r: u8)
+                requires x < 200
+                ensures r == x + 1;
+        }
+
+        struct Plain;
+        impl Adder for Plain {
+            fn add_one(&self, x: u8) -> (r: u8)
+                ensures r == x + 1
+            {
+                x + 1
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn caller(a: &Plain, n: u8) -> (r: u8)
+            requires n < 100
+            ensures r == n + 1
+        {
+            a.add_one(n)
+        }
+    } => Ok(())
 }
 
 // Datatype constructor (Ctor) in exec fn body — struct construction
