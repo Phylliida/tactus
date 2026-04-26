@@ -832,15 +832,27 @@ recursion pass covers all cross-fn calls in the cycle the same way.
 
 **Restrictions (rejected by `build_wp_call`):**
 
-* **Trait-method calls** — `resolved_method: Some(_)` rejected (#56).
-* **Trait-default-impl calls** — `is_trait_default: Some(_)` rejected.
+* **Trait-default-impl calls** — `is_trait_default: Some(true)`
+  rejected (#56 follow-up). `Some(false)` is accepted (concrete
+  impl on a trait that has a default).
 * **Split-assertion calls** (`split: Some(_)`) — rejected.
 * **Cross-crate callees** — rejected (fn_map is single-crate).
+* **Cross-crate trait method decls** — when the resolved impl is
+  `TraitMethodImpl { method, .. }` and `method` isn't in fn_map,
+  rejected with a clear error.
 
 **Accepted forms (with restrictions):**
 
 * **Generic calls** (`typ_args` non-empty) — LANDED. `walk_call`
   composes value-param + type-param substitution.
+* **Trait-method calls** — LANDED for `DynamicResolved` and
+  `Static`/`Dynamic` paths that resolve to a same-crate trait or
+  impl (#56). `build_wp_call` redirects the callee lookup to the
+  resolved impl when `resolved_method` is `Some`; `pick_spec_source`
+  uses the trait method decl's `require/ensure` (the impl's is
+  inherited/empty). Trade-off: impl-specific strengthening of
+  `ensures` not seen at call sites — caller sees the trait-level
+  contract.
 * **`&mut` args** — caller-side LANDED (#55, slice 1). `walk_call`
   introduces fresh existentials per `&mut` arg, substitutes
   pre-/post-state separately in the inlined ensures, and rebinds
@@ -1261,14 +1273,65 @@ exec fns."
   string format. Centralizing in `expr_shared.rs` makes
   divergence a compile error rather than a runtime mismatch.
 
-* **Trait-method calls (dynamic + resolved static).** Currently
-  rejected via `resolved_method: Some(_)` / `CallTargetKind::
-  Dynamic`. Fix: for `DynamicResolved` we can emit a direct call to
-  the resolved impl's Lean name (infrastructure exists in
-  `to_lean_expr`'s `call_to_node`); for `Dynamic` we need trait-
-  method-via-instance encoding (use Lean's typeclass machinery or
-  emit `TraitName.method` with the impl inferred from the receiver
-  type).
+* **Trait-method calls (#56) — DynamicResolved LANDED.**
+  When `StmX::Call::resolved_method = Some((resolved_fun, resolved_typs))`
+  (Verus's `CallTargetKind::DynamicResolved`), `build_wp_call`
+  redirects the callee lookup from `fun` (the trait method decl) to
+  `resolved_fun` (the resolved concrete impl). `resolved_typs`
+  becomes the type-args slice (Self is already filled in by Verus's
+  resolution).
+
+  **Spec source via `pick_spec_source`.** For
+  `FunctionKind::TraitMethodImpl` callees, Tactus uses the TRAIT
+  method decl's `require/ensure` rather than the impl's. Verus
+  rejects impl-side `requires` declarations (impl inherits trait's
+  requires), so the impl's require is always empty. Impls may
+  redeclare `ensures` only if they imply the trait's, so using the
+  trait's ensures is sound (it's the weakest contract any impl
+  satisfies).
+
+  **Trade-off — impl-specific strengthening not seen.** A trait
+  with `ensures r < 100` whose impl strengthens to `ensures r == 5`
+  produces a call site that sees only `r < 100`. Pinned by
+  `test_exec_call_trait_method_two_impls` (caller's ensures is the
+  trait-level `r < 100`, not the impl-specific `r == 5`). To see
+  the impl's strengthening, a caller would need a per-clause
+  merge: pick the strongest of (trait, impl) for each ensures
+  clause. Deferred follow-up.
+
+  **Cross-crate traits rejected at build time.** If the resolved
+  impl is `TraitMethodImpl { method, .. }` and `method` (the trait
+  method decl Fun) isn't in `fn_map`, `build_wp_call` fails with a
+  pointed error naming `#56` deferrals. The lookup itself is in
+  `pick_spec_source` (called from `walk_call`); the validation is
+  hoisted into `build_wp_call` so failures surface at codegen
+  time, not as a panic.
+
+  **Explicit deferrals (still rejected with clear messages):**
+  - **`is_trait_default = Some(true)`** (call resolved to the
+    trait's default impl). The default body uses `Self` as a
+    parameter that we'd need additional substitution to handle.
+    `Some(false)` is fine (concrete impl on a trait that has a
+    default — different from invoking the default itself).
+  - **`CallTargetKind::Dynamic`** (truly dynamic dispatch through
+    `dyn Trait`) is indistinguishable from `Static` at the SST
+    level — both have `resolved_method: None`. Currently falls
+    through to the existing fn_map lookup of `fun`; if the trait
+    method decl is in the same crate, the lookup succeeds and
+    substitution proceeds via the trait's spec. For cross-crate
+    `dyn Trait` calls, the lookup fails with the cross-crate
+    error.
+  - **`CallTargetKind::ExternalTraitDefault`** also falls through
+    to the existing path.
+
+  Tests: `test_exec_call_trait_method` (basic, was rejected),
+  `test_exec_call_trait_method_requires_violated` (negative —
+  trait's requires becomes the precondition obligation),
+  `test_exec_call_trait_method_two_impls` (same trait, two impls;
+  caller relies on trait-level contract),
+  `test_exec_call_trait_method_with_args` (trait method with
+  non-self args; param-name alignment between trait decl and
+  impl).
 
 * **`break` / `continue` — LANDED (partial).** Unlabeled break /
   continue in while-shaped loops works end-to-end.
