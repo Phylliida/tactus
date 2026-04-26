@@ -2369,6 +2369,14 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// NOTE: Multi-binder `Bind(Let([(a, val_a), (b, val_b)]), body)`
+// support landed in `lift_if_value` and `walk_let` (#92). It's
+// defensive — turns out Verus's SST for tuple destructure patterns
+// goes through `Ctor` + field projection, not multi-binder Let.
+// Constructing a regression test would require synthetic SST input;
+// the unfold is unit-tested via `match_single_let_bind`'s edge
+// cases, which cover the single-binder path.
+
 // ── tactus_usize_bound tactic ─────────────────────────────────────
 // Discharges `x < usize_hi` / `-isize_hi ≤ x ∧ x < isize_hi` shapes
 // that the default `tactus_auto` toolbox can't close due to the
