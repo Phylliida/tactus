@@ -243,6 +243,32 @@ impl<'a> WpCtx<'a> {
 // we can zip directly; the dummy param's substitution binds a name
 // nothing references, inert.
 
+// ── Peel/lift helpers ──────────────────────────────────────────────────
+//
+// Several closely-related helpers for "look through SST wrappers,
+// destructure binders, lift if-values to goal level." They're easy
+// to confuse, so the dispatch table:
+//
+// | Helper                       | Use when                                  | Semantics                                                     |
+// |------------------------------|-------------------------------------------|---------------------------------------------------------------|
+// | `peel_transparent`           | "is the wrapped value an `X`?"            | Strips Box/Unbox/CoerceMode/Trigger only. Does NOT peel `Loc`. |
+// | `peel_value_position`        | "what's the value-position expr here?"    | `peel_transparent` + one layer of `Loc` peel.                 |
+// | `contains_loc`               | "is this a `&mut`-style L-value arg?"     | Peels transparents; checks for `ExpX::Loc` at top.            |
+// | `match_single_let_bind`      | "is this a `let single = …; body`?"       | Returns Some((name, rhs, body)) for single-binder, None else. |
+// | `unfold_multi_binder_let`    | "convert `let (a,b) = …` to single-let chain" | Builds `Bind(Let([b1]), Bind(Let([b2]), …, body))`.       |
+// | `lift_if_value`              | "Return-position has an `if`; lift to `(c → …) ∧ (¬c → …)`" | Recursive walker over If/Bind(Let)/transparents.    |
+// | `walk_let`                   | Same as lift_if_value but for `Wp::Let` walker (per-obligation emission, not value-position). | Pushes Hyp/Let frames, recurses. |
+//
+// Why two peels (`peel_transparent` and `peel_value_position`):
+// `contains_loc` needs `Loc` UN-peeled (to detect `&mut` sites),
+// while `lift_if_value` needs `Loc` PEELED (to find the inner
+// value). Two helpers makes the asymmetry explicit; calling
+// `peel_value_position` from `contains_loc` would silently erase
+// the `&mut` detection.
+//
+// All helpers are pure (no side effects); the recursion structure
+// is bounded by SST tree size.
+
 /// The set of SST expression wrappers we treat as semantically
 /// transparent — i.e., they don't emit any Lean code of their own
 /// and peeling through them is safe. Centralised here so adding a
@@ -1099,34 +1125,29 @@ fn pick_spec_source<'a>(
 }
 
 /// Per-obligation walker for `Wp::Call`. Splits the call's
-/// obligations across separate theorems:
+/// obligations across separate theorems and pushes post-call
+/// frames onto the obligation context.
 ///
-/// * Emit one theorem for the callee's precondition (substituted
-///   with call-site args, wrapped with `CallPrecondition`
-///   SpanMark). Skipped when `callee.require` is empty — the
-///   goal would be `True` and the theorem would be wasted noise.
-/// * Walk `after` with extended context frames: `∀ ret` binder,
-///   `ret_bound →` if the return type has one, `ensures(subst) →`
-///   if `callee.ensure` is non-empty, and `let dest := ret;` if
-///   the call has a destination var.
+/// **Two callee views.** Trait-method calls have a dual structure:
+/// * `callee: &FunctionX` — the resolved concrete impl. Source
+///   for params, typ_params, and ret type (concrete types, used
+///   for binder rendering and arg substitution).
+/// * `spec_callee: &FunctionX` — where to read `require`/`ensure`
+///   from. For trait-method-impl callees, this is the trait
+///   method decl (the impl's specs are typically empty since
+///   Verus rejects impl-side `requires` clauses; trait specs are
+///   inherited). For all other callees, `spec_callee == callee`.
+///   See `pick_spec_source`.
 ///
-/// Substitutions combine value params (`p ↦ arg`) and type
-/// params (`T ↦ typ_arg`); `TypParam(T)` renders as `Var("T")`
-/// so the value-level `lean_ast::substitute` rewrites both kinds.
-///
-/// **`&mut` handling (#55).** For each `(idx, caller_var)` in
-/// `mut_args`, the post-call value of the mutated location is
-/// modeled as a fresh existential `_tactus_mut_post_<id>`:
-///   * Requires uses the same `p ↦ arg` (pre-call value) for both
-///     non-mut and mut params, since at requires time only the
-///     pre-call value exists.
-///   * Ensures uses `p ↦ Var(post_id)` (post-call value) and
-///     additionally `varat_pre_name(p) ↦ arg` (pre-call value
-///     reachable via `*old(x)` syntax in the source, rendered as
-///     `<p>_at_pre_tactus` by `to_lean_expr`).
-/// After the ensures Hyp frame, a `let caller_var := post_id`
-/// frame rebinds the caller-side variable so subsequent
-/// obligations see the post-call value.
+/// **Phases.** The walker delegates to three helpers:
+/// 1. `build_call_substitutions` — render args, gensym fresh
+///    names, build req/ens substitution maps. See its docs for
+///    the substitution scheme (especially the `&mut` case).
+/// 2. `emit_call_precondition_theorem` — one theorem for
+///    `requires(subst)`, wrapped with `CallPrecondition` SpanMark.
+/// 3. `push_post_call_frames` — the `∀ post_i, ∀ ret, ensures →
+///    let caller_var_i := post_i; let dest := ret;` chain that
+///    shapes the obligation context for the post-call continuation.
 fn walk_call<'a>(
     callee: &FunctionX,
     args: &[Exp],
@@ -1139,146 +1160,197 @@ fn walk_call<'a>(
     obl: &OblCtx,
     e: &mut ObligationEmitter,
 ) {
-    // ── Type-param substitution (shared by req + ens) ─────────────
+    let spec_callee = pick_spec_source(callee, &ctx.fn_map)
+        .expect("build_wp_call should have rejected unresolvable trait-spec lookups");
+
+    let subst = build_call_substitutions(callee, typ_args, args, mut_args, e);
+
+    if !spec_callee.require.is_empty() {
+        emit_call_precondition_theorem(spec_callee, &subst, call_span, obl, e);
+    }
+
+    let new_obl = push_post_call_frames(
+        callee, spec_callee, &subst, mut_args, dest, obl,
+    );
+    walk_obligations(after, ctx, &new_obl, e);
+}
+
+/// Substitution-related state needed to inline a callee's specs at
+/// a call site. Built once by `build_call_substitutions`, used
+/// twice — once for the precondition theorem (via `req_subst`)
+/// and once for the post-call ensures hypothesis (via `ens_subst`).
+struct CallSubstitutions {
+    /// Type-arg substitution: `TypParam(T) ↦ Var(rendered_typ_arg)`.
+    /// Shared between req and ens. `TypParam` renders as `Var("T")`
+    /// so value-level substitution rewrites it.
+    typ_subst: HashMap<String, LExpr>,
+    /// `requires` substitution: param names map to caller args
+    /// (pre-call values). For `&mut` params, both `p` and
+    /// `varat_pre_name(p)` map to the same arg — at requires-time
+    /// only the pre-call value exists.
+    req_subst: HashMap<String, LExpr>,
+    /// `ensures` substitution: non-mut params map to caller args;
+    /// `&mut` params map `p ↦ Var(fresh_post_state)` and
+    /// `varat_pre_name(p) ↦ caller_arg` (pre-state via `*old(x)`).
+    /// Plus `callee.ret.name ↦ Var(fresh_ret_name)` so the
+    /// rendered ensures uses the gensym'd ret instead of the
+    /// callee's source-level ret-name (which could shadow a
+    /// caller-scope local).
+    ens_subst: HashMap<String, LExpr>,
+    /// Set of `&mut` param names (sanitized) — used by
+    /// `rewrite_varat_for_mut_params` to rename `VarAt(p, Pre) →
+    /// Var(<p>_at_pre_tactus)` in the VIR-AST spec BEFORE
+    /// rendering, so the substitution maps above can target
+    /// pre-state references separately from post-state.
+    mut_param_names: HashSet<String>,
+    /// Fresh post-state name per `&mut` param, indexed by
+    /// `callee.params` position. Used both in `ens_subst` and as
+    /// the ∀-binder name in the post-call frames.
+    mut_idx_to_fresh: HashMap<usize, String>,
+    /// Fresh name for the callee's return value. Used as the
+    /// ∀-binder name in post-call frames; substituted in the
+    /// ensures rendering. Avoids shadowing caller-scope locals
+    /// that happen to share the callee's source ret name.
+    fresh_ret_name: String,
+}
+
+/// Build the substitution maps and fresh names for a call site.
+/// See `CallSubstitutions` for the field semantics.
+fn build_call_substitutions(
+    callee: &FunctionX,
+    typ_args: &[Typ],
+    args: &[Exp],
+    mut_args: &[(usize, &VarIdent)],
+    e: &mut ObligationEmitter,
+) -> CallSubstitutions {
+    // Type-param substitution (shared by req + ens). `TypParam(T)`
+    // renders as `Var("T")` so value-level substitute rewrites it.
     let mut typ_subst: HashMap<String, LExpr> = HashMap::new();
     for (tp_name, tp_arg) in callee.typ_params.iter().zip(typ_args.iter()) {
         typ_subst.insert(sanitize(tp_name), typ_to_expr(tp_arg));
     }
 
-    // ── Spec source (trait decl for trait impls, callee otherwise) ─
-    // For `TraitMethodImpl` callees, use the trait method decl's
-    // `require`/`ensure` instead of the impl's (the impl's are
-    // typically empty since Verus rejects impl-side `requires`
-    // declarations and trait specs are inherited). The lookup is
-    // infallible at this point because `build_wp_call` validated
-    // it before constructing the Wp::Call. See `pick_spec_source`
-    // for the rationale.
-    //
-    // Cross-crate trait calls (where the trait decl isn't in
-    // `fn_map`) are rejected upstream in `build_wp_call`.
-    let spec_source = pick_spec_source(callee, &ctx.fn_map)
-        .expect("build_wp_call should have rejected unresolvable trait-spec lookups");
-
-    // ── Set of &mut param names for VarAt rewriting ────────────────
-    // Pre-state references in the callee's spec (`*old(x)` syntax →
-    // `VarAt(p, Pre)` in VIR-AST) are rewritten to `Var(<p>_at_pre_
-    // tactus)` BEFORE rendering, so the substitution map below can
-    // distinguish them from post-state `Var(p)` references.
-    let mut_param_name_set: std::collections::HashSet<String> = mut_args.iter()
-        .map(|(idx, _)| sanitize(&callee.params[*idx].x.name.0))
-        .collect();
-
-    // ── Render args once (Loc-peeling included for &mut shapes) ───
-    // For a `&mut x` arg shape `Loc(VarLoc(x))`,
-    // `sst_exp_to_ast` peels Loc transparently, so the rendered form
-    // is the caller-side variable reference (the pre-call value).
+    // Render each arg once. `sst_exp_to_ast` peels `Loc` for &mut
+    // arg shapes, so the rendered form is the caller-side variable
+    // reference (the pre-call value).
     let arg_lexprs: Vec<LExpr> =
         args.iter().map(|a| sst_exp_to_ast(a)).collect();
 
-    // ── Generate fresh post-call names per &mut arg ────────────────
-    // The `_tactus_mut_post_` prefix is reserved (won't collide with
-    // user names — Rust source can't produce `_tactus_` identifiers).
+    // Set of &mut param names for the VarAt rewriter.
+    let mut_param_names: HashSet<String> = mut_args.iter()
+        .map(|(idx, _)| sanitize(&callee.params[*idx].x.name.0))
+        .collect();
+
+    // Fresh post-call name per &mut param. The `_tactus_mut_post_`
+    // prefix is reserved (won't collide with user names).
     let mut mut_idx_to_fresh: HashMap<usize, String> = HashMap::new();
     for (idx, _) in mut_args {
         let id = e.next_id();
         mut_idx_to_fresh.insert(*idx, format!("_tactus_mut_post_{}", id));
     }
 
-    // ── Build requires substitution map ────────────────────────────
-    // Requires references only the pre-call values:
-    //   * non-mut param p: `p ↦ arg`
-    //   * mut param p: `p ↦ arg` AND `<p>_at_pre_tactus ↦ arg`
-    //     (covers both bare `p` and `*old(p)` syntax)
+    // Fresh ret name (gensym to avoid caller-scope collisions).
+    let fresh_ret_name = format!("_tactus_ret_{}", e.next_id());
+
+    // Build req_subst and ens_subst from the maps above.
     let mut req_subst: HashMap<String, LExpr> = typ_subst.clone();
-    for (i, p) in callee.params.iter().enumerate() {
-        let pname = sanitize(&p.x.name.0);
-        req_subst.insert(pname.clone(), arg_lexprs[i].clone());
-        if p.x.is_mut {
-            req_subst.insert(varat_pre_name(&pname), arg_lexprs[i].clone());
-        }
-    }
-
-    // ── Emit precondition theorem ──────────────────────────────────
-    let loc = format_rust_loc(call_span);
-    if !spec_source.require.is_empty() {
-        // Rewrite VarAt(p, Pre) for &mut p before rendering so the
-        // substitution map below can target pre-state separately
-        // from post-state. No-op when mut_param_name_set is empty.
-        //
-        // For trait calls, `spec_source` is the trait method decl;
-        // its require references param names that match the impl's
-        // param names (Verus enforces alignment), so the
-        // substitution map keyed by impl-param names also works
-        // against the trait's specs.
-        let requires_conj = and_all(
-            spec_source.require.iter()
-                .map(|e| {
-                    let rewritten = rewrite_varat_for_mut_params(e, &mut_param_name_set);
-                    vir_expr_to_ast(&rewritten)
-                })
-                .collect()
-        );
-        let requires_clause = LExpr::span_mark(
-            loc.clone(),
-            AssertKind::CallPrecondition,
-            substitute(&requires_conj, &req_subst),
-        );
-        let id = e.next_id();
-        let theorem_name = build_theorem_name(
-            kind_to_name(AssertKind::CallPrecondition), &e.fn_name, &loc, id,
-        );
-        e.emit(theorem_name, obl.wrap(requires_clause), simple_tactic(e));
-    }
-
-    // ── Build ensures substitution map ─────────────────────────────
-    // Ensures references both pre- and post-call values:
-    //   * non-mut param p: `p ↦ arg`
-    //   * mut param p at idx i: `p ↦ Var(post_i)` (post-state),
-    //                           `<p>_at_pre_tactus ↦ arg` (pre-state)
-    //   * callee's ret (name from `callee.ret.x.name`): substitute
-    //     to a fresh `_tactus_ret_<id>` so the ∀-binder we emit
-    //     below doesn't shadow a caller-scope local of the same
-    //     name. Pinned by `test_exec_call_ret_name_collision`.
     let mut ens_subst: HashMap<String, LExpr> = typ_subst.clone();
     for (i, p) in callee.params.iter().enumerate() {
         let pname = sanitize(&p.x.name.0);
+        // Requires: same map for mut and non-mut (only pre-state exists).
+        req_subst.insert(pname.clone(), arg_lexprs[i].clone());
         if p.x.is_mut {
+            req_subst.insert(varat_pre_name(&pname), arg_lexprs[i].clone());
+            // Ensures: mut param's `p` → fresh post-state; pre-state via varat_pre_name.
             let fresh = mut_idx_to_fresh.get(&i)
                 .expect("fresh name should exist for every &mut param idx");
             ens_subst.insert(pname.clone(), LExpr::var(fresh.clone()));
             ens_subst.insert(varat_pre_name(&pname), arg_lexprs[i].clone());
         } else {
+            // Non-mut ensures: param → arg.
             ens_subst.insert(pname, arg_lexprs[i].clone());
         }
     }
-    let fresh_ret_name = format!("_tactus_ret_{}", e.next_id());
+    // Callee's ret name → fresh_ret_name in ensures.
     let ret_orig_name = sanitize(&callee.ret.x.name.0);
     if ret_orig_name != fresh_ret_name {
         ens_subst.insert(ret_orig_name, LExpr::var(fresh_ret_name.clone()));
     }
 
-    // ── Build context frames for `after` walk ──────────────────────
-    // Frames pushed in source order; OblCtx::wrap folds them
-    // outermost-first, yielding the goal shape (reading top-down):
-    //   ∀ post_i,                       ─┐
-    //   type_inv(post_i) →               │ per &mut arg
-    //   ∀ ret,                          ─┘
-    //   ret_bound →
-    //   ensures(subst) →
-    //   let caller_var_i := post_i;     ─┐ per &mut arg
-    //   let dest := ret;                 │
-    //   <continuation goal>
-    //
-    // Frames pushed only when meaningful — an empty ensures or a
-    // missing ret_bound is skipped to avoid `True →` clutter on
-    // every downstream goal.
+    CallSubstitutions {
+        typ_subst,
+        req_subst,
+        ens_subst,
+        mut_param_names,
+        mut_idx_to_fresh,
+        fresh_ret_name,
+    }
+}
+
+/// Emit the precondition theorem for a call. The `spec_callee`'s
+/// `require` clauses are rewritten (VarAt → varat_pre_name) and
+/// rendered, then substituted with `subst.req_subst`, and wrapped
+/// in a `CallPrecondition` SpanMark with the call-site span.
+fn emit_call_precondition_theorem(
+    spec_callee: &FunctionX,
+    subst: &CallSubstitutions,
+    call_span: &Span,
+    obl: &OblCtx,
+    e: &mut ObligationEmitter,
+) {
+    let loc = format_rust_loc(call_span);
+    let requires_conj = and_all(
+        spec_callee.require.iter()
+            .map(|expr| {
+                let rewritten = rewrite_varat_for_mut_params(expr, &subst.mut_param_names);
+                vir_expr_to_ast(&rewritten)
+            })
+            .collect()
+    );
+    let requires_clause = LExpr::span_mark(
+        loc.clone(),
+        AssertKind::CallPrecondition,
+        substitute(&requires_conj, &subst.req_subst),
+    );
+    let id = e.next_id();
+    let theorem_name = build_theorem_name(
+        kind_to_name(AssertKind::CallPrecondition), &e.fn_name, &loc, id,
+    );
+    e.emit(theorem_name, obl.wrap(requires_clause), simple_tactic(e));
+}
+
+/// Push the post-call frames onto the obligation context. Reading
+/// the resulting goal top-down:
+///
+/// ```text
+///   ∀ post_i,                       ─┐
+///   type_inv(post_i) →               │ per &mut arg (Phase 1)
+///   ∀ ret,                          ─┐
+///   ret_bound →                      │ Phase 2: ret binder + bound
+///   ensures(subst) →                 ─ Phase 3: ensures hyp (uses ens_subst)
+///   let caller_var_i := post_i;     ─┐ Phase 4: per &mut rebind
+///   let dest := ret;                 ─ Phase 5: dest binding
+///   <continuation goal>
+/// ```
+///
+/// Frames pushed only when meaningful — empty ensures / missing
+/// ret_bound is skipped to avoid `True →` clutter on every
+/// downstream goal.
+fn push_post_call_frames(
+    callee: &FunctionX,
+    spec_callee: &FunctionX,
+    subst: &CallSubstitutions,
+    mut_args: &[(usize, &VarIdent)],
+    dest: Option<&VarIdent>,
+    obl: &OblCtx,
+) -> OblCtx {
     let mut new_obl = obl.clone();
 
-    // 1. Per-&mut existential binder + type-inv hypothesis
+    // Phase 1: per-&mut existential binder + type-inv hypothesis.
     for (idx, _caller_var) in mut_args {
-        let fresh = mut_idx_to_fresh.get(idx).unwrap();
+        let fresh = subst.mut_idx_to_fresh.get(idx).unwrap();
         let typ = &callee.params[*idx].x.typ;
-        let lean_typ = substitute(&typ_to_expr(typ), &typ_subst);
+        let lean_typ = substitute(&typ_to_expr(typ), &subst.typ_subst);
         new_obl.frames.push(CtxFrame::Binder(LBinder {
             name: Some(fresh.clone()),
             ty: lean_typ,
@@ -1289,54 +1361,58 @@ fn walk_call<'a>(
         }
     }
 
-    // 2. Return-value binder + bound. Use the gensym'd ret name
-    //    (built in the ens_subst step above) instead of the
-    //    callee's source-level ret name — the latter could collide
-    //    with a caller-scope local and the ∀ would silently shadow.
+    // Phase 2: return-value binder + bound. Uses fresh_ret_name
+    // (the gensym from build_call_substitutions) — the callee's
+    // source-level ret name could shadow a caller-scope local.
     let ret = &callee.ret.x;
-    let ret_typ = substitute(&typ_to_expr(&ret.typ), &typ_subst);
+    let ret_typ = substitute(&typ_to_expr(&ret.typ), &subst.typ_subst);
     new_obl.frames.push(CtxFrame::Binder(LBinder {
-        name: Some(fresh_ret_name.clone()),
+        name: Some(subst.fresh_ret_name.clone()),
         ty: ret_typ,
         kind: BinderKind::Explicit,
     }));
-    if let Some(pred) = type_bound_predicate(&LExpr::var(fresh_ret_name.clone()), &ret.typ) {
+    if let Some(pred) = type_bound_predicate(
+        &LExpr::var(subst.fresh_ret_name.clone()), &ret.typ,
+    ) {
         new_obl.frames.push(CtxFrame::Hyp(pred));
     }
 
-    // 3. Ensures (post-call assumption)
-    if !spec_source.ensure.0.is_empty() {
+    // Phase 3: ensures (post-call assumption). Uses spec_callee's
+    // ensures (= trait decl for trait-method-impl callees).
+    if !spec_callee.ensure.0.is_empty() {
         let ensures_conj = and_all(
-            spec_source.ensure.0.iter()
-                .map(|e| {
-                    let rewritten = rewrite_varat_for_mut_params(e, &mut_param_name_set);
+            spec_callee.ensure.0.iter()
+                .map(|expr| {
+                    let rewritten = rewrite_varat_for_mut_params(expr, &subst.mut_param_names);
                     vir_expr_to_ast(&rewritten)
                 })
                 .collect()
         );
-        new_obl.frames.push(CtxFrame::Hyp(substitute(&ensures_conj, &ens_subst)));
+        new_obl.frames.push(CtxFrame::Hyp(
+            substitute(&ensures_conj, &subst.ens_subst),
+        ));
     }
 
-    // 4. Caller-side rebindings for &mut args (placed AFTER ensures
-    //    so the ensures Hyp references the fresh existential, not
-    //    the rebound caller name)
+    // Phase 4: caller-side rebindings for &mut args. Placed AFTER
+    // ensures so the ensures Hyp references the fresh existential,
+    // not the rebound caller name.
     for (idx, caller_var) in mut_args {
-        let fresh = mut_idx_to_fresh.get(idx).unwrap();
+        let fresh = subst.mut_idx_to_fresh.get(idx).unwrap();
         new_obl.frames.push(CtxFrame::Let(
             sanitize(&caller_var.0),
             LExpr::var(fresh.clone()),
         ));
     }
 
-    // 5. Dest binding for the call's return value (`let r = foo(…)`)
+    // Phase 5: dest binding for the call's return (`let r = foo(…)`).
     if let Some(dest_ident) = dest {
         new_obl.frames.push(CtxFrame::Let(
             sanitize(&dest_ident.0),
-            LExpr::var(fresh_ret_name.clone()),
+            LExpr::var(subst.fresh_ret_name.clone()),
         ));
     }
 
-    walk_obligations(after, ctx, &new_obl, e);
+    new_obl
 }
 
 /// `Wp::Let` walker with if-RHS lifting. `let x := if c then a
@@ -1986,6 +2062,17 @@ fn build_wp<'a>(
 /// Validate and build a `Wp::Call`. Destructures every `StmX::Call`
 /// field explicitly (no `..`) so any future Verus field addition
 /// forces a compile error here.
+///
+/// Validation breaks into four named phases via helpers:
+/// 1. `reject_unsupported_call_shapes` — `split` / `is_trait_default
+///    = Some(true)` (deferred).
+/// 2. `resolve_callee` — pick callee + type args based on
+///    `resolved_method` (DynamicResolved redirect) and look both up
+///    in fn_map (plus the trait-method-decl side for impls).
+/// 3. `validate_call_arities` — param count vs args count, typ_args
+///    count vs callee.typ_params count.
+/// 4. `build_call_mut_args` — extract `&mut` arg destinations,
+///    rejecting non-simple-Loc shapes.
 fn build_wp_call<'a>(
     stm: &'a Stm,
     after: Wp<'a>,
@@ -2004,134 +2091,19 @@ fn build_wp_call<'a>(
     } = &stm.x else {
         unreachable!("build_wp_call called on non-Call statement");
     };
-    if split.is_some() {
-        return Err(
-            "calls with split-assertion error reporting are not yet supported".to_string()
-        );
-    }
-    // `is_trait_default = Some(true)` means the call resolved to the
-    // trait's default impl (not a concrete impl). The default body
-    // uses `Self` as a parameter that we'd need to substitute with
-    // the call site's concrete type — separate concern from the
-    // resolved-impl path. `Some(false)` is fine (concrete impl, just
-    // happens to be on a trait that has a default).
-    if matches!(is_trait_default, Some(true)) {
-        return Err(
-            "calls resolved to a trait's default impl (rather than a concrete impl) \
-             are not yet supported (#56 follow-up)".to_string()
-        );
-    }
-    // Pick callee + type args:
-    //   * `resolved_method = Some((resolved_fun, resolved_typs))` —
-    //     `DynamicResolved` case: use the resolved concrete impl as
-    //     callee. Its `requires/ensures/params` get inlined; the
-    //     resolved type args have `Self` filled in with the concrete
-    //     type and any method type params expanded. The trait
-    //     method's spec is satisfied by every impl (Verus enforces
-    //     this at the trait-impl boundary), so substituting via the
-    //     resolved impl is sound.
-    //   * `resolved_method = None` — `Static` / `ProofFn` /
-    //     `Dynamic` / `ExternalTraitDefault`. The latter three may
-    //     not have a body or may not be in fn_map; the lookup below
-    //     fails cleanly with the cross-crate error.
-    let (callee_fun, callee_typ_args): (&'a Fun, &'a [Typ]) = match resolved_method {
-        Some((resolved, resolved_typs)) => (resolved, &resolved_typs[..]),
-        None => (fun, &typ_args[..]),
-    };
-    let Some(callee) = ctx.fn_map.get(callee_fun).copied() else {
-        return Err(format!(
-            "callee `{:?}` not found in the crate's function map — cross-crate calls are \
-             not yet supported",
-            callee_fun.path
-        ));
-    };
-    // For trait method impls, also verify the trait method decl is in
-    // fn_map. `walk_call` reads the trait's `require/ensure` (the impl's
-    // are typically empty/inherited), so the trait decl needs to be
-    // resolvable. Cross-crate traits aren't yet supported.
-    if let FunctionKind::TraitMethodImpl { method, .. } = &callee.kind {
-        if !ctx.fn_map.contains_key(method) {
-            return Err(format!(
-                "trait method decl `{:?}` for resolved impl `{:?}` not found in \
-                 the crate's function map — cross-crate trait calls are not yet \
-                 supported (#56 follow-up)",
-                method.path, callee_fun.path,
-            ));
-        }
-    }
-    // Param/arg count must align (both sides are post-`ast_simplify`
-    // so zero-arg callees have their `no%param` dummy in both).
-    let param_count = callee.params.len();
-    if param_count != args.len() {
-        return Err(format!(
-            "callee `{:?}` has {} param(s) but call site passes {} arg(s) — \
-             arg-passing convention may be out of sync (both sides should be \
-             post-ast_simplify); this would bind wrong variables if we proceeded",
-            callee_fun.path, param_count, args.len(),
-        ));
-    }
-    // Type params / type args must align — if a call site passes fewer
-    // types than the callee declared, substitution would leave some
-    // `TypParam(T)` references unsubstituted in the inlined spec.
-    //
-    // For `DynamicResolved`, `callee_typ_args` is the resolved-impl's
-    // type args (with `Self` already filled in by Verus's resolution).
-    // It must match the resolved impl's `typ_params.len()` — different
-    // from the trait method's `typ_params.len()` when the trait has
-    // type params that the impl monomorphizes.
-    if callee.typ_params.len() != callee_typ_args.len() {
-        return Err(format!(
-            "callee `{:?}` declares {} type param(s) but call site passes {} type \
-             arg(s) — would leave type-param references unsubstituted in the \
-             inlined spec",
-            callee_fun.path, callee.typ_params.len(), callee_typ_args.len(),
-        ));
-    }
-    // Build the `&mut` arg list while validating each arg. For each
-    // `&mut` param, the call-site arg must be a simple
-    // `Loc(VarLoc(...))` — `&mut x.f` / `&mut v[i]` / etc. would
-    // require additional encoding (havoc-base + assume-other-fields-
-    // unchanged style) which is deferred. Non-`&mut` args go through
-    // the usual `check_exp` validation.
-    let mut mut_args: Vec<(usize, &'a VarIdent)> = Vec::new();
-    for (i, (param, a)) in callee.params.iter().zip(args.iter()).enumerate() {
-        if param.x.is_mut {
-            // Caller-side var must extract cleanly. `extract_simple_var_ident`
-            // peels `Loc` and any wrappers down to `Var`/`VarLoc`, so this
-            // succeeds for the simple `&mut local` case and fails for
-            // `&mut x.f` / `&mut v[i]`.
-            match extract_simple_var_ident(a) {
-                Some(v) => mut_args.push((i, v)),
-                None => return Err(format!(
-                    "&mut argument at position {} is not a simple local variable. \
-                     `&mut x.f` / `&mut v[i]` / etc. require additional encoding \
-                     (havoc base + assume-other-fields-unchanged) — deferred \
-                     follow-up to #55. Workaround: bind to a local first \
-                     (`let mut tmp = expr; foo(&mut tmp); … = tmp;`).",
-                    i,
-                )),
-            }
-            // Don't `check_exp(a)` here — `a` is a `Loc` shape, not a
-            // value-position expression. The inner var has already been
-            // structurally validated by `extract_simple_var_ident`.
-        } else {
-            if contains_loc(a) {
-                // Loc on a non-&mut param shouldn't happen (Verus's
-                // borrow check would reject it upstream). Defensive
-                // rejection so an unexpected VIR shape fails loudly
-                // rather than silently encoding wrong.
-                return Err(format!(
-                    "unexpected `Loc`-wrapped argument at non-&mut position {} — \
-                     callee param.is_mut=false but arg is an L-value. Refusing \
-                     to encode silently.",
-                    i,
-                ));
-            }
-            check_exp(a)?;
-        }
-    }
+
+    reject_unsupported_call_shapes(split, is_trait_default)?;
+
+    let (callee, callee_typ_args) =
+        resolve_callee(fun, resolved_method, typ_args, ctx)?;
+
+    validate_call_arities(callee, args, callee_typ_args)?;
+
+    let mut_args = build_call_mut_args(&callee.params, args)?;
+
     let bound_dest: Option<&'a VarIdent> = dest.as_ref()
         .and_then(|d| extract_simple_var_ident(&d.dest));
+
     // NOTE: the termination obligation for recursive calls is emitted
     // upstream by Verus's `recursion::check_recursive_function` pass,
     // which inserts a `StmX::Assert` wrapping `InternalFun::
@@ -2147,6 +2119,160 @@ fn build_wp_call<'a>(
         mut_args,
         after: Box::new(after),
     })
+}
+
+/// Phase 1: Reject call shapes Tactus doesn't yet support.
+///
+/// * `split.is_some()` — split-assertion error reporting; the SST
+///   shape distributes the error to multiple sites and we don't
+///   replicate that.
+/// * `is_trait_default = Some(true)` — call resolved to the trait's
+///   default impl rather than a concrete impl. The default body
+///   uses `Self` as a parameter that needs concrete-type
+///   substitution (#56 follow-up). `Some(false)` is fine (concrete
+///   impl on a trait that happens to have a default).
+fn reject_unsupported_call_shapes(
+    split: &Option<vir::messages::Message>,
+    is_trait_default: &Option<bool>,
+) -> Result<(), String> {
+    if split.is_some() {
+        return Err(
+            "calls with split-assertion error reporting are not yet supported".to_string()
+        );
+    }
+    if matches!(is_trait_default, Some(true)) {
+        return Err(
+            "calls resolved to a trait's default impl (rather than a concrete impl) \
+             are not yet supported (#56 follow-up)".to_string()
+        );
+    }
+    Ok(())
+}
+
+/// Phase 2: Resolve the call to a `(callee, callee_typ_args)` pair.
+///
+/// `resolved_method` discriminates the cases:
+/// * `Some((resolved_fun, resolved_typs))` — `DynamicResolved`:
+///   use the resolved concrete impl as callee. The resolved typs
+///   have `Self` filled in with the concrete receiver type.
+/// * `None` — `Static` / `ProofFn` / `Dynamic` / `ExternalTraitDefault`.
+///   Use the original `fun` and `typ_args`. The latter three cases
+///   may not be in fn_map; we let the lookup fail with the
+///   cross-crate error.
+///
+/// For `TraitMethodImpl` callees, additionally verify the trait
+/// method decl is in fn_map — `walk_call` reads the trait's
+/// `require`/`ensure` from there (the impl's are typically empty,
+/// inheriting from the trait).
+fn resolve_callee<'a>(
+    fun: &'a Fun,
+    resolved_method: &'a Option<(Fun, vir::ast::Typs)>,
+    typ_args: &'a vir::ast::Typs,
+    ctx: &WpCtx<'a>,
+) -> Result<(&'a FunctionX, &'a [Typ]), String> {
+    let (callee_fun, callee_typ_args): (&'a Fun, &'a [Typ]) = match resolved_method {
+        Some((resolved, resolved_typs)) => (resolved, &resolved_typs[..]),
+        None => (fun, &typ_args[..]),
+    };
+    let Some(callee) = ctx.fn_map.get(callee_fun).copied() else {
+        return Err(format!(
+            "callee `{:?}` not found in the crate's function map — cross-crate calls are \
+             not yet supported",
+            callee_fun.path
+        ));
+    };
+    if let FunctionKind::TraitMethodImpl { method, .. } = &callee.kind {
+        if !ctx.fn_map.contains_key(method) {
+            return Err(format!(
+                "trait method decl `{:?}` for resolved impl `{:?}` not found in \
+                 the crate's function map — cross-crate trait calls are not yet \
+                 supported (#56 follow-up)",
+                method.path, callee_fun.path,
+            ));
+        }
+    }
+    Ok((callee, callee_typ_args))
+}
+
+/// Phase 3: Validate that the call's arities (value-args + type-args)
+/// match the callee's declared params + typ_params.
+///
+/// Both sides are post-`ast_simplify` so zero-arg callees carry the
+/// `no%param` dummy on both. For `DynamicResolved`, `callee_typ_args`
+/// is already the resolved-impl's type args (Self filled in), which
+/// must match the impl's `typ_params.len()` — possibly different
+/// from the trait method's `typ_params.len()` if the trait has
+/// type params the impl monomorphizes.
+fn validate_call_arities(
+    callee: &FunctionX,
+    args: &[Exp],
+    callee_typ_args: &[Typ],
+) -> Result<(), String> {
+    if callee.params.len() != args.len() {
+        return Err(format!(
+            "callee `{:?}` has {} param(s) but call site passes {} arg(s) — \
+             arg-passing convention may be out of sync (both sides should be \
+             post-ast_simplify); this would bind wrong variables if we proceeded",
+            callee.name.path, callee.params.len(), args.len(),
+        ));
+    }
+    if callee.typ_params.len() != callee_typ_args.len() {
+        return Err(format!(
+            "callee `{:?}` declares {} type param(s) but call site passes {} type \
+             arg(s) — would leave type-param references unsubstituted in the \
+             inlined spec",
+            callee.name.path, callee.typ_params.len(), callee_typ_args.len(),
+        ));
+    }
+    Ok(())
+}
+
+/// Phase 4: Walk the args + params in lockstep, build the `&mut`
+/// arg list, and validate each non-mut arg via `check_exp`.
+///
+/// For each `&mut` param, the call-site arg must reduce to a simple
+/// `VarIdent` (peeled through `Loc` and transparent wrappers). Non-
+/// simple shapes (`&mut x.f`, `&mut v[i]`) need additional encoding
+/// (havoc-base + assume-other-fields-unchanged) and are rejected
+/// with a pointed error message — deferred follow-up to #55.
+///
+/// Defensive: a `Loc`-wrapped arg at a non-`&mut` position
+/// shouldn't happen (Rust's borrow checker would reject it upstream),
+/// but if it does we error rather than silently encode wrong.
+fn build_call_mut_args<'a>(
+    callee_params: &vir::ast::Params,
+    args: &'a vir::sst::Exps,
+) -> Result<Vec<(usize, &'a VarIdent)>, String> {
+    let mut mut_args: Vec<(usize, &'a VarIdent)> = Vec::new();
+    for (i, (param, a)) in callee_params.iter().zip(args.iter()).enumerate() {
+        if param.x.is_mut {
+            match extract_simple_var_ident(a) {
+                Some(v) => mut_args.push((i, v)),
+                None => return Err(format!(
+                    "&mut argument at position {} is not a simple local variable. \
+                     `&mut x.f` / `&mut v[i]` / etc. require additional encoding \
+                     (havoc base + assume-other-fields-unchanged) — deferred \
+                     follow-up to #55. Workaround: bind to a local first \
+                     (`let mut tmp = expr; foo(&mut tmp); … = tmp;`).",
+                    i,
+                )),
+            }
+            // Don't `check_exp(a)` — `a` is a `Loc` shape, not a
+            // value-position expression. The inner var has been
+            // structurally validated above.
+        } else {
+            if contains_loc(a) {
+                return Err(format!(
+                    "unexpected `Loc`-wrapped argument at non-&mut position {} — \
+                     callee param.is_mut=false but arg is an L-value. Refusing \
+                     to encode silently.",
+                    i,
+                ));
+            }
+            check_exp(a)?;
+        }
+    }
+    Ok(mut_args)
 }
 
 /// Validate and build a `Wp::Loop`. See the module doc for the shape
