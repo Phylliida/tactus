@@ -272,6 +272,27 @@ fn contains_loc(e: &Exp) -> bool {
     matches!(&peel_transparent(e).x, ExpX::Loc(_))
 }
 
+/// Peel transparent wrappers AND a single layer of `Loc`. Used at
+/// value-position sites (`walk_let`, `lift_if_value`) where we want
+/// to see THROUGH the L-value marker to find the underlying
+/// expression — for if-detection on the value, or for further
+/// peeling of nested let/if shapes.
+///
+/// Distinct from [`peel_transparent`] (which doesn't peel `Loc`)
+/// because `contains_loc` needs `Loc` un-peeled to detect
+/// `&mut`-borrow sites. Pulling this into a single helper keeps
+/// the asymmetry expressed in one place: callers ask either
+/// "what's beneath the wrappers?" (`peel_value_position`) or
+/// "is there a Loc anywhere here?" (`contains_loc`), and the
+/// difference between them is centralized.
+fn peel_value_position(e: &Exp) -> &Exp {
+    let p = peel_transparent(e);
+    match &p.x {
+        ExpX::Loc(inner) => peel_transparent(inner),
+        _ => p,
+    }
+}
+
 /// Validate an SST expression — `sst_exp_to_ast_checked` does both
 /// validation AND rendering in a single pass, so we just call it and
 /// discard the rendered result. Used by `build_wp` at the points
@@ -425,9 +446,22 @@ impl OblCtx {
     }
 
     /// Wrap `goal` with all accumulated frames, outermost first
-    /// (matching source order). A `Let("x", v)` outside a
-    /// `Hyp(P_uses_x)` frame produces `let x := v; P_uses_x → goal`,
-    /// so the hypothesis can reference `x`.
+    /// (matching source order). Iterating `frames` in reverse is
+    /// the right direction: each frame wraps the *current* goal,
+    /// so the LAST frame applied ends up OUTERMOST in the result.
+    /// We want the FIRST-pushed frame outermost, so we iterate
+    /// last-pushed-first.
+    ///
+    /// Worked example with `frames = [Let("x", v), Hyp(P)]`
+    /// (Let pushed first, Hyp pushed second):
+    ///
+    /// 1. Start: `goal = G`
+    /// 2. Iterate `Hyp(P)` (last pushed): `goal = P → G`
+    /// 3. Iterate `Let("x", v)` (first pushed): `goal = let x := v; P → G`
+    ///
+    /// Result: `let x := v; P → G` — the let binds `x` outside
+    /// the hypothesis so `P` can mention `x`. Push order matches
+    /// source order; wrap order is the natural inversion.
     fn wrap(&self, mut goal: LExpr) -> LExpr {
         for frame in self.frames.iter().rev() {
             goal = match frame {
@@ -664,17 +698,22 @@ fn walk_assert_by_tactus<'a>(
     obl: &OblCtx,
     e: &mut ObligationEmitter,
 ) {
+    // A whitespace-only `tactic_text` (user wrote `proof { }` /
+    // `assert(P) by { }`) would emit broken Lean: `( ) <;> closer`
+    // for the proof-block path or `:= by ` with nothing after it
+    // for assert-by. Treat as if the user supplied no tactic at
+    // all — fall back to the default closer for assert-by, skip
+    // the prefix push for proof block.
+    let user_tactic_present = !tactic_text.trim().is_empty();
+
     match cond {
         Some(c) => {
             // Assert-by: emit one theorem for `c` with the user's
-            // tactic as the closer. The cond becomes a hypothesis
-            // for body theorems. AssertKind::Plain because it's a
-            // user-written `assert(P) by { tac }` — same kind that
-            // a plain `assert(P)` would get from `detect_assert_kind`.
-            // Whitespace-only `tactic_text` (`assert(P) by { }`)
-            // would emit `:= by ` with nothing after it (Lean parse
-            // error); fall back to `tactus_auto` so the obligation
-            // still gets verified.
+            // tactic as the closer (or `tactus_auto` if empty).
+            // The cond becomes a hypothesis for body theorems.
+            // AssertKind::Plain because it's a user-written
+            // `assert(P) by { tac }` — same kind a plain
+            // `assert(P)` would get via `detect_assert_kind`.
             let loc = format_rust_loc(&c.span);
             let cond_ast = sst_exp_to_ast(c);
             let goal = LExpr::span_mark(
@@ -682,12 +721,12 @@ fn walk_assert_by_tactus<'a>(
             );
             let id = e.next_id();
             let name = build_theorem_name(
-                "assert", &e.fn_name, &loc, id,
+                kind_to_name(AssertKind::Plain), &e.fn_name, &loc, id,
             );
-            let closer = if tactic_text.trim().is_empty() {
-                simple_tactic()
-            } else {
+            let closer = if user_tactic_present {
                 Tactic::Raw(tactic_text.to_string())
+            } else {
+                simple_tactic()
             };
             e.emit(name, obl.wrap(goal), closer);
             // Cond as hypothesis for body theorems (reuse cond_ast).
@@ -699,17 +738,12 @@ fn walk_assert_by_tactus<'a>(
             // body's scope. Push, walk, pop — the prefix only
             // applies to body theorems, not to obligations
             // sequentially after the proof block.
-            // Whitespace-only `tactic_text` (`proof { }`) would
-            // emit `( ) <;> closer` (Lean parse error); skip the
-            // push entirely. `emit()`'s prefix-iteration would
-            // also produce empty content, but skipping avoids
-            // the empty parens regardless.
-            if tactic_text.trim().is_empty() {
-                walk_obligations(body, ctx, obl, e);
-            } else {
+            if user_tactic_present {
                 e.tactic_prefix.push(tactic_text.to_string());
                 walk_obligations(body, ctx, obl, e);
                 e.tactic_prefix.pop();
+            } else {
+                walk_obligations(body, ctx, obl, e);
             }
         }
     }
@@ -737,32 +771,46 @@ fn walk_assert_by_tactus<'a>(
 fn emit_done_or_split(leaf: &LExpr, obl: &OblCtx, e: &mut ObligationEmitter) {
     use crate::lean_ast::{BinOp, ExprNode};
     match &leaf.node {
+        // Split conjunctions per-conjunct.
         ExprNode::BinOp { op: BinOp::And, lhs, rhs } => {
             emit_done_or_split(lhs, obl, e);
             emit_done_or_split(rhs, obl, e);
-            return;
         }
+        // Peel the let into an OblCtx frame and recurse on body.
+        // `obl.wrap` reconstructs the let around the final emitted
+        // goal — same final expression, but now we can split or
+        // label the body's contents.
         ExprNode::Let { name, value, body } => {
-            // Peel the let into an OblCtx frame and recurse on
-            // body. obl.wrap will reconstruct the let around the
-            // final emitted goal — same final goal expression,
-            // but now we can split or label the body's contents.
             let new_obl = obl.with_frame(CtxFrame::Let(
                 name.clone(), value.as_ref().clone(),
             ));
             emit_done_or_split(body, &new_obl, e);
-            return;
         }
-        _ => {}
-    }
-    let (kind_label, loc) = match &leaf.node {
+        // SpanMark-wrapped leaf: emit one theorem with the kind /
+        // loc from the wrapping.
         ExprNode::SpanMark { rust_loc, kind, .. } => {
-            (kind_to_name(*kind), rust_loc.clone())
+            emit_leaf_theorem(kind_to_name(*kind), rust_loc, leaf, obl, e);
         }
-        _ => ("ensures", String::new()),
-    };
+        // Unwrapped leaf: only reachable when ensures is empty
+        // (`and_all([]) = LitBool(true)`). The goal is `True` and
+        // tactus_auto closes it trivially. "ensures" is the
+        // cosmetic label for this degenerate case.
+        _ => emit_leaf_theorem("ensures", "", leaf, obl, e),
+    }
+}
+
+/// Build the theorem name and emit one theorem for a leaf
+/// obligation. Shared between `emit_done_or_split`'s SpanMark and
+/// fallback arms.
+fn emit_leaf_theorem(
+    kind_label: &str,
+    loc: &str,
+    leaf: &LExpr,
+    obl: &OblCtx,
+    e: &mut ObligationEmitter,
+) {
     let id = e.next_id();
-    let name = build_theorem_name(kind_label, &e.fn_name, &loc, id);
+    let name = build_theorem_name(kind_label, &e.fn_name, loc, id);
     e.emit(name, obl.wrap(leaf.clone()), simple_tactic());
 }
 
@@ -823,7 +871,7 @@ fn walk_loop<'a>(
         let loc = format_rust_loc(&inv.inv.span);
         let id = e.next_id();
         let name = build_theorem_name(
-            "loop_invariant", &e.fn_name, &loc, id,
+            kind_to_name(AssertKind::LoopInvariant), &e.fn_name, &loc, id,
         );
         e.emit(name, obl.wrap(inv_marked(inv)), simple_tactic());
     }
@@ -935,7 +983,7 @@ fn walk_call<'a>(
         );
         let id = e.next_id();
         let theorem_name = build_theorem_name(
-            "precondition", &e.fn_name, &loc, id,
+            kind_to_name(AssertKind::CallPrecondition), &e.fn_name, &loc, id,
         );
         e.emit(theorem_name, obl.wrap(requires_clause), simple_tactic());
     }
@@ -990,14 +1038,7 @@ fn walk_let<'a>(
     obl: &OblCtx,
     e: &mut ObligationEmitter,
 ) {
-    // Peel transparent wrappers AND a single layer of `Loc` — same as
-    // `lift_if_value`. `Loc` peels for if-detection but isn't part of
-    // `peel_transparent` because `contains_loc` needs Loc un-peeled.
-    let peeled = peel_transparent(val);
-    let peeled = match &peeled.x {
-        ExpX::Loc(inner) => peel_transparent(inner),
-        _ => peeled,
-    };
+    let peeled = peel_value_position(val);
     match &peeled.x {
         ExpX::If(cond, then_e, else_e) => {
             let c_ast = sst_exp_to_ast(cond);
@@ -1005,27 +1046,31 @@ fn walk_let<'a>(
                 &obl.with_frame(CtxFrame::Hyp(c_ast.clone())), e);
             walk_let(name, else_e, body, ctx,
                 &obl.with_frame(CtxFrame::Hyp(LExpr::not(c_ast))), e);
+            return;
         }
         // `let outer := (let z := zval; bodyval); rest`
         //   ≡ `let z := zval; let outer := bodyval; rest`
         // Peel one layer of inner let, then continue lifting on
         // `bodyval` (which may itself be an If or another nested let).
-        ExpX::Bind(bnd, inner_body) if matches!(&bnd.x, BndX::Let(bs) if bs.len() == 1) => {
-            let BndX::Let(bs) = &bnd.x else { unreachable!() };
-            let inner_b = &bs[0];
-            let inner_name = sanitize(&inner_b.name.0);
-            let new_obl = obl.with_frame(CtxFrame::Let(
-                inner_name, sst_exp_to_ast(&inner_b.a),
-            ));
-            walk_let(name, inner_body, body, ctx, &new_obl, e);
+        ExpX::Bind(bnd, inner_body) => {
+            if let Some((inner_name, rhs, after_inner)) =
+                match_single_let_bind(bnd, inner_body)
+            {
+                let new_obl = obl.with_frame(CtxFrame::Let(
+                    inner_name, sst_exp_to_ast(rhs),
+                ));
+                walk_let(name, after_inner, body, ctx, &new_obl, e);
+                return;
+            }
         }
-        _ => {
-            let new_obl = obl.with_frame(CtxFrame::Let(
-                sanitize(name), sst_exp_to_ast(val),
-            ));
-            walk_obligations(body, ctx, &new_obl, e);
-        }
+        _ => {}
     }
+    // Plain let with no peelable structure — push the let frame
+    // and continue walking the body.
+    let new_obl = obl.with_frame(CtxFrame::Let(
+        sanitize(name), sst_exp_to_ast(val),
+    ));
+    walk_obligations(body, ctx, &new_obl, e);
 }
 
 /// Atomic `tactus_auto` for per-obligation theorems. Each emitted
@@ -1280,10 +1325,7 @@ fn detect_assert_kind(e: &Exp) -> AssertKind {
 /// the goal the user is writing. For non-if values this is a direct
 /// call to `emit_leaf` with the rendered expression — no overhead.
 fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
-    // Peel Box/Unbox/CoerceMode/Trigger via the shared helper; `Loc`
-    // is handled separately below because it peels for lifting but
-    // NOT for `contains_loc` (which is looking for the Loc itself).
-    let peeled = peel_transparent(e);
+    let peeled = peel_value_position(e);
     match &peeled.x {
         ExpX::If(cond, then_e, else_e) => {
             let c = sst_exp_to_ast(cond);
@@ -1292,26 +1334,41 @@ fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
                 LExpr::implies(LExpr::not(c), lift_if_value(else_e, emit_leaf)),
             )
         }
-        // Loc is also transparent for lifting (it marks an L-value
-        // position; the expression semantics are the inner's). Not
-        // part of `peel_transparent` because `contains_loc` needs
-        // Loc un-peeled.
-        ExpX::Loc(inner) => lift_if_value(inner, emit_leaf),
         // Single-binder `let y := e_rhs; body` — if the rhs has an if,
         // lift it out, re-threading `body` through each branch. Verus
         // often emits `let y = …; y` blocks as this shape, which would
         // otherwise hide the if from our lift.
-        ExpX::Bind(bnd, body) if matches!(&bnd.x, BndX::Let(bs) if bs.len() == 1) => {
-            let BndX::Let(binders) = &bnd.x else { unreachable!() };
-            let b = &binders[0];
-            let name = sanitize(&b.name.0);
-            let body_ast = sst_exp_to_ast(body);
-            lift_if_value(&b.a, &|rhs_leaf| {
-                emit_leaf(LExpr::let_bind(name.clone(), rhs_leaf, body_ast.clone()))
-            })
+        ExpX::Bind(bnd, body) => {
+            if let Some((name, rhs, inner_body)) = match_single_let_bind(bnd, body) {
+                let body_ast = sst_exp_to_ast(inner_body);
+                let name = name.to_string();
+                lift_if_value(rhs, &|rhs_leaf| {
+                    emit_leaf(LExpr::let_bind(name.clone(), rhs_leaf, body_ast.clone()))
+                })
+            } else {
+                emit_leaf(sst_exp_to_ast(e))
+            }
         }
         _ => emit_leaf(sst_exp_to_ast(e)),
     }
+}
+
+/// Destructure `ExpX::Bind(BndX::Let([single binder]), body)` into
+/// `(sanitized_name, rhs_value, body)`. Centralizes the "single-
+/// binder let-bind" check that both `lift_if_value` and `walk_let`
+/// need, replacing the awkward `matches!`-guard + `let-else`
+/// re-destructure pattern with a clean `if let Some((...))`.
+/// Returns `None` for non-Let binders or for multi-binder Lets
+/// (multi-binder lets are deferred — see DESIGN.md "Lossy accepted
+/// forms").
+fn match_single_let_bind<'a>(
+    bnd: &'a vir::sst::Bnd,
+    body: &'a Exp,
+) -> Option<(String, &'a Exp, &'a Exp)> {
+    let BndX::Let(bs) = &bnd.x else { return None };
+    if bs.len() != 1 { return None; }
+    let b = &bs[0];
+    Some((sanitize(&b.name.0), &b.a, body))
 }
 
 // ── WP builder ─────────────────────────────────────────────────────────
