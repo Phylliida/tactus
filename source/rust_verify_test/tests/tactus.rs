@@ -2369,6 +2369,99 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// ── Bit-width coverage matrix ─────────────────────────────────────
+// u8/u32/i8 are exercised by the overflow/widen tests above. The
+// codegen path is identical across widths (just a different bound
+// constant), but until these regression tests landed only three
+// widths had explicit coverage. Each test pins arithmetic + a tight
+// `requires` that lets omega discharge the overflow check.
+
+test_verify_one_file! {
+    #[test] test_exec_u16_add verus_code! {
+        #[verifier::tactus_auto]
+        fn add_u16(x: u16, y: u16) -> (r: u16)
+            requires x < 30_000, y < 30_000
+            ensures r == x + y
+        { x + y }
+    } => Ok(())
+}
+
+test_verify_one_file! {
+    #[test] test_exec_u64_add verus_code! {
+        #[verifier::tactus_auto]
+        fn add_u64(x: u64, y: u64) -> (r: u64)
+            requires x < 1_000_000_000_000, y < 1_000_000_000_000
+            ensures r == x + y
+        { x + y }
+    } => Ok(())
+}
+
+test_verify_one_file! {
+    #[test] test_exec_u128_add verus_code! {
+        #[verifier::tactus_auto]
+        fn add_u128(x: u128, y: u128) -> (r: u128)
+            requires x < 1_000_000_000_000, y < 1_000_000_000_000
+            ensures r == x + y
+        { x + y }
+    } => Ok(())
+}
+
+test_verify_one_file! {
+    #[test] test_exec_i16_add verus_code! {
+        #[verifier::tactus_auto]
+        fn add_i16(x: i16, y: i16) -> (r: i16)
+            requires -10_000 <= x < 10_000, -10_000 <= y < 10_000
+            ensures r as int == x as int + y as int
+        { x + y }
+    } => Ok(())
+}
+
+test_verify_one_file! {
+    #[test] test_exec_i32_add verus_code! {
+        #[verifier::tactus_auto]
+        fn add_i32(x: i32, y: i32) -> (r: i32)
+            requires -1_000_000 <= x < 1_000_000, -1_000_000 <= y < 1_000_000
+            ensures r as int == x as int + y as int
+        { x + y }
+    } => Ok(())
+}
+
+test_verify_one_file! {
+    #[test] test_exec_i64_add verus_code! {
+        #[verifier::tactus_auto]
+        fn add_i64(x: i64, y: i64) -> (r: i64)
+            requires -1_000_000_000 <= x < 1_000_000_000,
+                     -1_000_000_000 <= y < 1_000_000_000
+            ensures r as int == x as int + y as int
+        { x + y }
+    } => Ok(())
+}
+
+test_verify_one_file! {
+    #[test] test_exec_i128_add verus_code! {
+        #[verifier::tactus_auto]
+        fn add_i128(x: i128, y: i128) -> (r: i128)
+            requires -1_000_000_000 <= x < 1_000_000_000,
+                     -1_000_000_000 <= y < 1_000_000_000
+            ensures r as int == x as int + y as int
+        { x + y }
+    } => Ok(())
+}
+
+// Negative companion: u16 overflow should fire just like u8/u32 do.
+// Pins that the bound expression is non-trivially used (not just a
+// `True` placeholder) for u16.
+test_verify_one_file! {
+    #[test] test_exec_u16_overflow_fails verus_code! {
+        #[verifier::tactus_auto]
+        fn add_u16_unbounded(x: u16, y: u16) -> (r: u16)
+            ensures r == x + y
+        { x + y }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "u16 add without bounds should fail");
+    }
+}
+
 // Non-simple LHS assignment used to be silently dropped by `walk`.
 // Now it's rejected upfront by `check_stm` with a clear "not yet
 // supported" error. This uses a struct field assignment, which Verus
@@ -3662,6 +3755,149 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// ── Control-flow combination coverage ──────────────────────────────
+// Three combinatorial gaps: return-in-else (inverse of test_exec_
+// early_return), loops modifying many vars (only 1-2 tested), and
+// nested ifs each containing their own loop.
+
+// Return in the `else` branch where the `then` falls through to tail
+// code. Verus's SST may produce a different StmX::Return.inside_body
+// shape vs the test_exec_early_return case — this pins both shapes.
+test_verify_one_file! {
+    #[test] test_exec_return_in_else verus_code! {
+        #[verifier::tactus_auto]
+        fn clip_to_zero_else(x: u8) -> (r: u8)
+            requires x <= 10
+            ensures r <= 10
+        {
+            if x == 0 {
+                // then falls through
+            } else {
+                return 0;
+            }
+            x
+        }
+    } => Ok(())
+}
+
+// Loop modifying 4 variables. `quantify_mod_vars` handles arbitrary-
+// arity modified sets; only 1-2 vars were tested. Pins that the
+// ∀-quantification + modified-var binding still works at width-4.
+test_verify_one_file! {
+    #[test] test_exec_loop_many_mod_vars verus_code! {
+        #[verifier::tactus_auto]
+        fn count_quad(n: u8) -> (r: u8)
+            requires n <= 50
+            ensures r <= 200
+        {
+            let mut a: u8 = 0;
+            let mut b: u8 = 0;
+            let mut c: u8 = 0;
+            let mut d: u8 = 0;
+            let mut i: u8 = 0;
+            while i < n
+                invariant
+                    i <= n,
+                    a <= i,
+                    b <= i,
+                    c <= i,
+                    d <= i,
+                decreases n - i
+            {
+                a = a + 1;
+                b = b + 1;
+                c = c + 1;
+                d = d + 1;
+                i = i + 1;
+            }
+            a + b + c + d
+        }
+    } => Ok(())
+}
+
+// Nested if where each branch contains its own loop. Combinatorial
+// coverage gap noted in DESIGN.md — exercises Wp::Branch wrapping
+// Wp::Loop in both arms, with each loop having distinct mod-vars and
+// invariants.
+test_verify_one_file! {
+    #[test] test_exec_nested_if_with_loops verus_code! {
+        #[verifier::tactus_auto]
+        fn maybe_count(flag: bool, n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r <= 100
+        {
+            let mut acc: u8 = 0;
+            if flag {
+                let mut i: u8 = 0;
+                while i < n
+                    invariant i <= n, acc <= i
+                    decreases n - i
+                {
+                    acc = acc + 1;
+                    i = i + 1;
+                }
+            } else {
+                let mut j: u8 = 0;
+                while j < n
+                    invariant j <= n, acc <= j
+                    decreases n - j
+                {
+                    acc = acc + 1;
+                    j = j + 1;
+                }
+            }
+            acc
+        }
+    } => Ok(())
+}
+
+// ── Lossy-accept paths (renderer drops or normalizes info) ────────
+// Three paths documented as accepted-with-info-dropped in DESIGN.md
+// "Lossy accepted forms" but lacking direct tests.
+
+// `BinaryOp::Xor` renders via `App(Var("xor"), [l, r])`. If the
+// rendering ever changes (or the prelude's `xor` definition shifts),
+// this regression catches it. Bool xor is the simplest exec-level
+// case — Verus accepts `^` on bools.
+test_verify_one_file! {
+    #[test] test_exec_xor_bool verus_code! {
+        #[verifier::tactus_auto]
+        fn xor_bools(a: bool, b: bool) -> (r: bool)
+            ensures r == (a ^ b)
+        { a ^ b }
+    } => Ok(())
+}
+
+// `ExpX::Bind(BndX::Choose, ...)` in spec context. Rendered as
+// `Classical.epsilon (fun ... => cond ∧ body)`. Pin that the
+// rendering doesn't crash codegen — Verus's recommends checks on
+// `choose` may still apply, but the Lean output must at least
+// be syntactically valid. Accepted-with-info-dropped per DESIGN.md.
+test_verify_one_file! {
+    #[test] test_exec_choose_in_spec verus_code! {
+        spec fn p(n: nat) -> bool { n > 0 }
+
+        spec fn pos_witness() -> nat {
+            choose|n: nat| #[trigger] p(n)
+        }
+
+        #[verifier::tactus_auto]
+        fn use_p() -> (r: u8)
+            ensures r == 1u8 || pos_witness() > 0
+        { 1 }
+    } => Ok(())
+}
+
+// NOTE: `assert forall|v: T| P by { tac }` (with non-empty `vars`)
+// inside a tactus_auto fn currently panics in Verus's poly encoding
+// pass (`vir/src/poly.rs:462`). The Tactus AssertBy + Ghost wrap
+// doesn't carry the binder information through to where poly
+// expects it. This is documented as a #79 follow-up — the panic
+// blocks adding a regression test (we can't `Err(_)` against an
+// upstream panic), so the gap is just a comment for now. Workaround
+// for users: pull the forall into a separate proof fn and `assert`
+// the application.
 
 // Datatype constructor (Ctor) in exec fn body — struct construction
 // plus field access. Pinned: before #52 landed, this was rejected

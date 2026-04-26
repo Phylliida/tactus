@@ -85,7 +85,11 @@ pub(crate) fn binop_to_ast(op: &BinaryOp) -> Option<L> {
 /// upstream. The spec/proof VIR path reaches all cases.
 pub(crate) fn non_binop_head(op: &BinaryOp) -> &'static str {
     match op {
-        BinaryOp::Xor => "xor",
+        // Lean's `Bool.xor` — dotted so it bypasses the sanity allowlist
+        // and resolves natively. Verus's `BinaryOp::Xor` is logical xor on
+        // bools (bitwise xor on ints goes through `BitwiseOp::BitXor`,
+        // which already has a structural `BinOp::BitXor`).
+        BinaryOp::Xor => "Bool.xor",
         BinaryOp::HeightCompare { .. } => "Tactus.heightLt",
         BinaryOp::StrGetChar => "String.get",
         BinaryOp::Index(_, _) => "Tactus.index",

@@ -25,7 +25,7 @@ use vir::ast::*;
 use vir::sst::{BndX, CallFun, Exp, ExpX, InternalFun};
 use crate::expr_shared::{
     binop_to_ast, clip_coercion_head, const_to_node_common, ctor_node, field_access_name,
-    is_variant_node,
+    is_variant_node, non_binop_head,
 };
 use crate::lean_ast::{substitute, Expr as LExpr, ExprNode};
 use crate::lean_pp::pp_expr;
@@ -439,9 +439,12 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
             match binop_to_ast(op) {
                 Some(l_op) => LExpr::binop(l_op, l, r).node,
                 // Non-structural: emit as `head lhs rhs` via App. The
-                // only reachable case is `Xor`, which renders as `xor
-                // lhs rhs` (the rejected ops already early-exited above).
-                None => LExpr::app(LExpr::var("xor"), vec![l, r]).node,
+                // only reachable case in the exec-fn path is `Xor`
+                // (other non-structural ops are rejected above).
+                // Routed through the shared `non_binop_head` table so
+                // the head string stays in sync with the VIR-AST
+                // renderer.
+                None => LExpr::app(LExpr::var(non_binop_head(op)), vec![l, r]).node,
             }
         }
         ExpX::BinaryOpr(BinaryOpr::ExtEq(_, _), lhs, rhs) => {
