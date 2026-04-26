@@ -408,9 +408,52 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
         ExpX::UnaryOpr(_, inner) => exp_to_node_checked(inner)?,
 
         ExpX::Binary(op, lhs, rhs) => {
+            // HeightCompare: `is_smaller_than(lhs, rhs)` for decreases-
+            // related ordering. `strictly_lt` distinguishes `<` from
+            // `==`. Lower based on operand height type:
+            //   * Int height (lhs.typ peels to TypX::Int) → emit
+            //     direct `lhs < rhs` / `lhs = rhs`. The "height" of an
+            //     int IS the int (per `vir::recursion::height_is_int`).
+            //   * Same datatype on both sides → emit `T.height lhs <
+            //     T.height rhs` (or `=`). The companion `T.height` fn
+            //     is emitted by `to_lean_fn::height_fn_for_datatype`.
+            //   * Otherwise → reject (mixed types, generics, etc.).
+            if let BinaryOp::HeightCompare { strictly_lt, .. } = op {
+                let l_int = is_int_height(&lhs.typ);
+                let r_int = is_int_height(&rhs.typ);
+                let l_dt = decrease_height_datatype(&lhs.typ);
+                let r_dt = decrease_height_datatype(&rhs.typ);
+                let (l, r) = (sst_exp_to_ast_checked(lhs)?, sst_exp_to_ast_checked(rhs)?);
+                let (l_h, r_h) = if l_int && r_int {
+                    (l, r)
+                } else if let (Some(lp), Some(rp)) = (l_dt, r_dt) {
+                    if lp != rp {
+                        return Err(format!(
+                            "HeightCompare across different datatypes ({:?} vs {:?}) \
+                             not supported",
+                            lp, rp,
+                        ));
+                    }
+                    let head = format!("{}.height", lean_name(lp));
+                    let lh = LExpr::app(LExpr::var(head.clone()), vec![l]);
+                    let rh = LExpr::app(LExpr::var(head), vec![r]);
+                    (lh, rh)
+                } else {
+                    return Err(format!(
+                        "HeightCompare on non-int / non-concrete-datatype types \
+                         (lhs: {:?}, rhs: {:?}) is not yet supported",
+                        lhs.typ, rhs.typ,
+                    ));
+                };
+                let cmp = if *strictly_lt {
+                    LExpr::lt(l_h, r_h)
+                } else {
+                    LExpr::eq(l_h, r_h)
+                };
+                return Ok(cmp.node);
+            }
             match op {
-                BinaryOp::HeightCompare { .. }
-                | BinaryOp::Index(_, _)
+                BinaryOp::Index(_, _)
                 | BinaryOp::StrGetChar
                 | BinaryOp::IeeeFloat(_) => {
                     return Err(format!("unsupported binary op: {:?}", op));
