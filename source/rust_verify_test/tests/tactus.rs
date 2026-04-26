@@ -3889,6 +3889,34 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// ── Shape-drift / regression-guard tests ──────────────────────────
+// Tests pinning behavior that's easy to silently regress under a
+// Verus rebase or a refactor of our walker.
+
+// Name collision: callee's `ret.name.0` (the Rust source-level name
+// of the return — `r` in `-> (r: u8)`) clashes with a caller-scope
+// local of the same sanitized name. `walk_call` emits `∀ <ret_name
+// : T>, …` where `<ret_name>` shadows the caller's `r` for the
+// duration of the post-call frames. Semantically fine — the ∀
+// binding is what Verus intends — but visually confusing if the
+// shadow ever produces wrong-binding behavior. Pin that this works.
+test_verify_one_file! {
+    #[test] test_exec_call_ret_name_collision verus_code! {
+        fn make_one() -> (r: u8)
+            ensures r == 1
+        { 1 }
+
+        #[verifier::tactus_auto]
+        fn caller() -> (out: u8)
+            ensures out == 8
+        {
+            let r: u8 = 7;        // collides with callee's ret name
+            let val = make_one(); // ∀ r, r == 1 → ...
+            r + val               // caller's r is 7, val is 1
+        }
+    } => Ok(())
+}
+
 // NOTE: `assert forall|v: T| P by { tac }` (with non-empty `vars`)
 // inside a tactus_auto fn currently panics in Verus's poly encoding
 // pass (`vir/src/poly.rs:462`). The Tactus AssertBy + Ghost wrap

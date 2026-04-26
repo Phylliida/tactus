@@ -1164,6 +1164,10 @@ fn walk_call<'a>(
     //   * non-mut param p: `p ↦ arg`
     //   * mut param p at idx i: `p ↦ Var(post_i)` (post-state),
     //                           `<p>_at_pre_tactus ↦ arg` (pre-state)
+    //   * callee's ret (name from `callee.ret.x.name`): substitute
+    //     to a fresh `_tactus_ret_<id>` so the ∀-binder we emit
+    //     below doesn't shadow a caller-scope local of the same
+    //     name. Pinned by `test_exec_call_ret_name_collision`.
     let mut ens_subst: HashMap<String, LExpr> = typ_subst.clone();
     for (i, p) in callee.params.iter().enumerate() {
         let pname = sanitize(&p.x.name.0);
@@ -1175,6 +1179,11 @@ fn walk_call<'a>(
         } else {
             ens_subst.insert(pname, arg_lexprs[i].clone());
         }
+    }
+    let fresh_ret_name = format!("_tactus_ret_{}", e.next_id());
+    let ret_orig_name = sanitize(&callee.ret.x.name.0);
+    if ret_orig_name != fresh_ret_name {
+        ens_subst.insert(ret_orig_name, LExpr::var(fresh_ret_name.clone()));
     }
 
     // ── Build context frames for `after` walk ──────────────────────
@@ -1209,16 +1218,18 @@ fn walk_call<'a>(
         }
     }
 
-    // 2. Return-value binder + bound
+    // 2. Return-value binder + bound. Use the gensym'd ret name
+    //    (built in the ens_subst step above) instead of the
+    //    callee's source-level ret name — the latter could collide
+    //    with a caller-scope local and the ∀ would silently shadow.
     let ret = &callee.ret.x;
-    let ret_name_cal = sanitize(&ret.name.0);
     let ret_typ = substitute(&typ_to_expr(&ret.typ), &typ_subst);
     new_obl.frames.push(CtxFrame::Binder(LBinder {
-        name: Some(ret_name_cal.clone()),
+        name: Some(fresh_ret_name.clone()),
         ty: ret_typ,
         kind: BinderKind::Explicit,
     }));
-    if let Some(pred) = type_bound_predicate(&LExpr::var(ret_name_cal.clone()), &ret.typ) {
+    if let Some(pred) = type_bound_predicate(&LExpr::var(fresh_ret_name.clone()), &ret.typ) {
         new_obl.frames.push(CtxFrame::Hyp(pred));
     }
 
@@ -1250,7 +1261,7 @@ fn walk_call<'a>(
     if let Some(dest_ident) = dest {
         new_obl.frames.push(CtxFrame::Let(
             sanitize(&dest_ident.0),
-            LExpr::var(ret_name_cal),
+            LExpr::var(fresh_ret_name.clone()),
         ));
     }
 
