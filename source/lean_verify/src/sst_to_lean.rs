@@ -117,8 +117,8 @@ use vir::sst::{
     Par, Stm, StmX,
 };
 use vir::ast::{
-    AssertQueryMode, Expr, ExprX, Fun, FunctionX, KrateX, SpannedTyped, TactusKind, Typ, UnaryOp,
-    UnaryOpr, VarAt, VarIdent,
+    AssertQueryMode, Expr, ExprX, Fun, FunctionKind, FunctionX, KrateX, SpannedTyped, TactusKind,
+    Typ, UnaryOp, UnaryOpr, VarAt, VarIdent,
 };
 use vir::ast_visitor::map_expr_visitor;
 use vir::messages::Span;
@@ -986,6 +986,47 @@ fn rewrite_varat_for_mut_params(
     .expect("rewrite_varat_for_mut_params is structural and shouldn't error")
 }
 
+/// Pick the source of `require`/`ensure` clauses for a callee.
+///
+/// For `FunctionKind::TraitMethodImpl` callees, the impl's
+/// `require`/`ensure` are typically empty (Verus rejects impl-side
+/// `requires` clauses; impls may redeclare `ensures` only if they
+/// imply the trait's). The CALLER'S contract is the trait method
+/// decl's spec — that's the weakest, and any impl satisfies it by
+/// Verus's trait-impl-checking pass.
+///
+/// This helper redirects spec lookup to the trait method decl when
+/// the callee is a `TraitMethodImpl`. The impl's params/typ_params/
+/// ret stay as-is (they have concrete types, used for binder
+/// rendering); only `require`/`ensure` come from the trait decl.
+///
+/// **Trade-off**: impl-specific strengthening of `ensures` isn't
+/// seen at call sites yet. A pure spec-via-trait MVS doesn't see
+/// the case where an impl says "ensures r > 0" while the trait
+/// only said "ensures r ≠ 5". Strengthening cases would require
+/// a per-clause merge. Deferred follow-up to #56.
+///
+/// **Sound by construction.** Verus's trait-impl-checking pass
+/// guarantees the impl's spec implies the trait's spec
+/// (modulo Self substitution). Using the trait's spec is always
+/// at least as conservative as the impl's at the caller site.
+fn pick_spec_source<'a>(
+    callee: &'a FunctionX,
+    fn_map: &FnMap<'a>,
+) -> Result<&'a FunctionX, String> {
+    match &callee.kind {
+        FunctionKind::TraitMethodImpl { method, .. } => {
+            fn_map.get(method).copied().ok_or_else(|| format!(
+                "trait method decl `{:?}` for resolved impl `{:?}` not found \
+                 in the crate's function map — cross-crate trait calls are \
+                 not yet supported",
+                method.path, callee.name.path,
+            ))
+        }
+        _ => Ok(callee),
+    }
+}
+
 /// Per-obligation walker for `Wp::Call`. Splits the call's
 /// obligations across separate theorems:
 ///
@@ -1033,6 +1074,20 @@ fn walk_call<'a>(
         typ_subst.insert(sanitize(tp_name), typ_to_expr(tp_arg));
     }
 
+    // ── Spec source (trait decl for trait impls, callee otherwise) ─
+    // For `TraitMethodImpl` callees, use the trait method decl's
+    // `require`/`ensure` instead of the impl's (the impl's are
+    // typically empty since Verus rejects impl-side `requires`
+    // declarations and trait specs are inherited). The lookup is
+    // infallible at this point because `build_wp_call` validated
+    // it before constructing the Wp::Call. See `pick_spec_source`
+    // for the rationale.
+    //
+    // Cross-crate trait calls (where the trait decl isn't in
+    // `fn_map`) are rejected upstream in `build_wp_call`.
+    let spec_source = pick_spec_source(callee, &ctx.fn_map)
+        .expect("build_wp_call should have rejected unresolvable trait-spec lookups");
+
     // ── Set of &mut param names for VarAt rewriting ────────────────
     // Pre-state references in the callee's spec (`*old(x)` syntax →
     // `VarAt(p, Pre)` in VIR-AST) are rewritten to `Var(<p>_at_pre_
@@ -1074,12 +1129,18 @@ fn walk_call<'a>(
 
     // ── Emit precondition theorem ──────────────────────────────────
     let loc = format_rust_loc(call_span);
-    if !callee.require.is_empty() {
+    if !spec_source.require.is_empty() {
         // Rewrite VarAt(p, Pre) for &mut p before rendering so the
         // substitution map below can target pre-state separately
         // from post-state. No-op when mut_param_name_set is empty.
+        //
+        // For trait calls, `spec_source` is the trait method decl;
+        // its require references param names that match the impl's
+        // param names (Verus enforces alignment), so the
+        // substitution map keyed by impl-param names also works
+        // against the trait's specs.
         let requires_conj = and_all(
-            callee.require.iter()
+            spec_source.require.iter()
                 .map(|e| {
                     let rewritten = rewrite_varat_for_mut_params(e, &mut_param_name_set);
                     vir_expr_to_ast(&rewritten)
@@ -1162,9 +1223,9 @@ fn walk_call<'a>(
     }
 
     // 3. Ensures (post-call assumption)
-    if !callee.ensure.0.is_empty() {
+    if !spec_source.ensure.0.is_empty() {
         let ensures_conj = and_all(
-            callee.ensure.0.iter()
+            spec_source.ensure.0.iter()
                 .map(|e| {
                     let rewritten = rewrite_varat_for_mut_params(e, &mut_param_name_set);
                     vir_expr_to_ast(&rewritten)
@@ -1793,29 +1854,61 @@ fn build_wp_call<'a>(
     } = &stm.x else {
         unreachable!("build_wp_call called on non-Call statement");
     };
-    if resolved_method.is_some() {
-        return Err(
-            "calls to trait methods (requiring dynamic dispatch resolution) are not \
-             yet supported".to_string()
-        );
-    }
-    if is_trait_default.is_some() {
-        return Err(
-            "calls resolved to a trait's default impl are not yet supported".to_string()
-        );
-    }
     if split.is_some() {
         return Err(
             "calls with split-assertion error reporting are not yet supported".to_string()
         );
     }
-    let Some(callee) = ctx.fn_map.get(fun).copied() else {
+    // `is_trait_default = Some(true)` means the call resolved to the
+    // trait's default impl (not a concrete impl). The default body
+    // uses `Self` as a parameter that we'd need to substitute with
+    // the call site's concrete type — separate concern from the
+    // resolved-impl path. `Some(false)` is fine (concrete impl, just
+    // happens to be on a trait that has a default).
+    if matches!(is_trait_default, Some(true)) {
+        return Err(
+            "calls resolved to a trait's default impl (rather than a concrete impl) \
+             are not yet supported (#56 follow-up)".to_string()
+        );
+    }
+    // Pick callee + type args:
+    //   * `resolved_method = Some((resolved_fun, resolved_typs))` —
+    //     `DynamicResolved` case: use the resolved concrete impl as
+    //     callee. Its `requires/ensures/params` get inlined; the
+    //     resolved type args have `Self` filled in with the concrete
+    //     type and any method type params expanded. The trait
+    //     method's spec is satisfied by every impl (Verus enforces
+    //     this at the trait-impl boundary), so substituting via the
+    //     resolved impl is sound.
+    //   * `resolved_method = None` — `Static` / `ProofFn` /
+    //     `Dynamic` / `ExternalTraitDefault`. The latter three may
+    //     not have a body or may not be in fn_map; the lookup below
+    //     fails cleanly with the cross-crate error.
+    let (callee_fun, callee_typ_args): (&'a Fun, &'a [Typ]) = match resolved_method {
+        Some((resolved, resolved_typs)) => (resolved, &resolved_typs[..]),
+        None => (fun, &typ_args[..]),
+    };
+    let Some(callee) = ctx.fn_map.get(callee_fun).copied() else {
         return Err(format!(
             "callee `{:?}` not found in the crate's function map — cross-crate calls are \
              not yet supported",
-            fun.path
+            callee_fun.path
         ));
     };
+    // For trait method impls, also verify the trait method decl is in
+    // fn_map. `walk_call` reads the trait's `require/ensure` (the impl's
+    // are typically empty/inherited), so the trait decl needs to be
+    // resolvable. Cross-crate traits aren't yet supported.
+    if let FunctionKind::TraitMethodImpl { method, .. } = &callee.kind {
+        if !ctx.fn_map.contains_key(method) {
+            return Err(format!(
+                "trait method decl `{:?}` for resolved impl `{:?}` not found in \
+                 the crate's function map — cross-crate trait calls are not yet \
+                 supported (#56 follow-up)",
+                method.path, callee_fun.path,
+            ));
+        }
+    }
     // Param/arg count must align (both sides are post-`ast_simplify`
     // so zero-arg callees have their `no%param` dummy in both).
     let param_count = callee.params.len();
@@ -1824,18 +1917,24 @@ fn build_wp_call<'a>(
             "callee `{:?}` has {} param(s) but call site passes {} arg(s) — \
              arg-passing convention may be out of sync (both sides should be \
              post-ast_simplify); this would bind wrong variables if we proceeded",
-            fun.path, param_count, args.len(),
+            callee_fun.path, param_count, args.len(),
         ));
     }
     // Type params / type args must align — if a call site passes fewer
     // types than the callee declared, substitution would leave some
     // `TypParam(T)` references unsubstituted in the inlined spec.
-    if callee.typ_params.len() != typ_args.len() {
+    //
+    // For `DynamicResolved`, `callee_typ_args` is the resolved-impl's
+    // type args (with `Self` already filled in by Verus's resolution).
+    // It must match the resolved impl's `typ_params.len()` — different
+    // from the trait method's `typ_params.len()` when the trait has
+    // type params that the impl monomorphizes.
+    if callee.typ_params.len() != callee_typ_args.len() {
         return Err(format!(
             "callee `{:?}` declares {} type param(s) but call site passes {} type \
              arg(s) — would leave type-param references unsubstituted in the \
              inlined spec",
-            fun.path, callee.typ_params.len(), typ_args.len(),
+            callee_fun.path, callee.typ_params.len(), callee_typ_args.len(),
         ));
     }
     // Build the `&mut` arg list while validating each arg. For each
@@ -1892,7 +1991,7 @@ fn build_wp_call<'a>(
     Ok(Wp::Call {
         callee,
         args: &args[..],
-        typ_args: &typ_args[..],
+        typ_args: callee_typ_args,
         dest: bound_dest,
         call_span: &stm.span,
         mut_args,
