@@ -3141,12 +3141,19 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// `&mut` arg is rejected. The detector peels transparent SST
-// wrappers (Box/Unbox/CoerceMode/Trigger) before checking for
-// `ExpX::Loc`, so a mutable borrow can't slip past as by-value.
+// `&mut` arg from a tactus_auto caller into a non-tactus_auto
+// callee (verified through Verus's normal path). This is the MVS
+// for #55: at the CALL SITE, `walk_call` introduces a fresh
+// existential for the post-call value, substitutes
+// `varat_pre_name(p) ↦ caller_arg` (pre-state) and `p ↦ fresh`
+// (post-state) in the inlined ensures, then rebinds the caller's
+// local to the fresh value via a Let frame.
+//
+// `bump` itself stays on Verus's Z3 path because Tactus doesn't
+// yet handle &mut params in the fn's OWN body (separate task —
+// caller-side and callee-side &mut are distinct concerns).
 test_verify_one_file! {
-    #[test] test_exec_call_mut_ref_rejected verus_code! {
-        #[verifier::tactus_auto]
+    #[test] test_exec_call_mut_arg verus_code! {
         fn bump(x: &mut u8)
             requires *old(x) < 100
             ensures *x == *old(x) + 1
@@ -3163,18 +3170,7 @@ test_verify_one_file! {
             bump(&mut y);
             y
         }
-    } => Err(err) => {
-        // The rejection message names task #55 and suggests the
-        // refactor-to-non-mutating workaround. Flips to Ok when
-        // #55's havoc-after-call encoding lands.
-        assert!(
-            err.errors.iter().any(|e| e.message.contains("task #55")
-                || e.message.contains("havoc-after-call")),
-            "expected `&mut` rejection to name task #55 / havoc semantics, \
-             got: {:?}",
-            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
-        );
-    }
+    } => Ok(())
 }
 
 // Self-recursive call with a decreasing measure — verifies. The
