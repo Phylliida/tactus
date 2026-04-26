@@ -101,6 +101,29 @@ elab "tactus_case_split" closer:tacticSeq : tactic => do
       restoreState saved
   throwError "tactus_case_split: no datatype-local case-split closes the goal"
 
+-- `tactus_usize_bound`: discharge a goal involving `usize_hi` /
+-- `isize_hi` (i.e., `2 ^ arch_word_bits` or `2 ^ (arch_word_bits -
+-- 1)`) by case-splitting on `arch_word_bits_valid` and reducing
+-- the resulting concrete `2 ^ 32` / `2 ^ 64` literals. The
+-- `tactus_auto` toolbox (rfl/decide/omega/simp_all) can't handle
+-- symbolic exponents, so usize/isize arithmetic obligations
+-- normally need an explicit `proof { tactus_usize_bound }` block.
+--
+-- Order of operations:
+-- 1. `rcases` arch_word_bits_valid into the two literal cases.
+-- 2. `subst` substitutes 32 or 64 throughout the goal.
+-- 3. `simp_all only [usize_hi, isize_hi]` unfolds the defs to
+--    expose the `2 ^ ...` literal.
+-- 4. `decide` (for purely-arithmetic-on-literals goals) or
+--    `omega` (for linear-arith with the literal as a constant)
+--    closes the case.
+--
+-- Composes with `tactus_first` so users can layer it: e.g.,
+-- `tactus_first | tactus_auto | tactus_usize_bound | ...`.
+macro "tactus_usize_bound" : tactic => `(tactic|
+  rcases arch_word_bits_valid with h | h <;>
+    (subst h; simp only [usize_hi, isize_hi]; first | decide | omega))
+
 -- Tactus: the *atomic closer* used at the leaves of the tactics we emit.
 -- Intentionally kept to simple, always-closing tactics — `rfl`,
 -- `decide`, `omega`, `simp_all`, and `tactus_case_split` for goals

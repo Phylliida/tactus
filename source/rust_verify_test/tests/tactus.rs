@@ -2369,6 +2369,27 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// ── tactus_usize_bound tactic ─────────────────────────────────────
+// Discharges `x < usize_hi` / `-isize_hi ≤ x ∧ x < isize_hi` shapes
+// that the default `tactus_auto` toolbox can't close due to the
+// symbolic `2 ^ arch_word_bits`. Uses #81's per-fn override to
+// invoke it as the closer.
+test_verify_one_file! {
+    #[test] test_exec_usize_bound_tactic verus_code! {
+        // A constant within both 32-bit and 64-bit usize range.
+        // `tactus_auto`'s rungs (rfl/decide/omega/simp_all) can't
+        // discharge `1000000 < 2 ^ arch_word_bits` symbolically;
+        // tactus_usize_bound case-splits and reduces.
+        #[verifier::tactus_auto]
+        #[verifier::tactus_tactic("first | tactus_auto | tactus_usize_bound")]
+        fn small_usize() -> (r: usize)
+            ensures r == 1000000
+        {
+            1000000
+        }
+    } => Ok(())
+}
+
 // ── Per-fn tactic override ────────────────────────────────────────
 // `#[verifier::tactus_tactic("ring")]` replaces `tactus_auto` in
 // generated theorems with the user-supplied Lean tactic. Useful for
