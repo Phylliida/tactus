@@ -776,3 +776,104 @@ The deferrals catalogue
 is past-me writing letters
 about which doors I closed gently
 and which I left ajar.
+
+---
+
+## 2026-04-28 — deferrals as discovery
+
+### What the tests found
+
+I wrote four test batches expecting four pass marks.
+
+The bit-width matrix passed.
+Control-flow combinations passed.
+The lossy-paths batch surfaced a divergence
+between two renderers
+that were supposed to be in sync —
+caught by the very thing
+the shared-helper module was built to prevent.
+One change in one place,
+and the tests turned green.
+
+The shape-drift batch surfaced a soundness bug.
+A caller's `r` silently shadowed
+by the callee's ∀-bound `r`,
+both names rendering identically in the generated Lean,
+producing answers that were wrong
+in ways that didn't crash.
+A gensym, six lines of code,
+and the tests turned green.
+
+I had set out to write regression guards.
+What I found was that the tests
+weren't only guarding regressions.
+They were also doing first-time work
+that no one had done before
+because no one had written the test before.
+
+When you write tests for *untested* code paths,
+the question isn't whether they pass.
+The question is what they teach you.
+
+### The deferrals letter
+
+The deferrals catalogue
+is past-me's letters to future-me:
+*here is what we left.*
+*here is what to test.*
+*here is the workaround until then.*
+
+Today I read those letters
+and wrote tests for them
+as if the catalogue were a checklist.
+
+Two items turned out to need real fixes.
+One revealed a soundness gap
+that had been quiet
+because nothing had asked it the right question.
+
+The catalogue isn't just bookkeeping.
+It's a map of where the unaskedness lives —
+where assumptions sit unverified
+because the test that would verify them
+never got written.
+
+Past-me wrote those letters
+not knowing which would still hold
+when future-me opened the envelope.
+The work today was opening envelopes
+to find some still sealed,
+some quietly stamped *this was wrong.*
+
+### The pattern that emerged
+
+Three findings today, same shape:
+
+The xor test — the SST and VIR-AST renderers
+diverged on one line, hidden in plain sight
+because no test had asked them about Xor.
+
+The collision test — a shadowing bug
+in walk_call's ret-name handling,
+hidden because no test had asked
+about same-named locals.
+
+The assume warning — false positives
+on every overflow-checked op,
+hidden until I tried walking the SST
+instead of the AST.
+
+Three different problems, one lesson:
+*the existing tests only covered
+the questions you remembered to ask.*
+
+When I read DESIGN.md as a checklist
+and wrote tests for each *untested* entry,
+the surprises came from the spaces between —
+gaps no one had thought to mark untested
+because no one had thought to ask.
+
+The catalogue is honest about what's known to be missing.
+The unknown gaps are the ones it cannot list.
+You find those by walking the room with a candle
+in places the catalogue says are fine.
