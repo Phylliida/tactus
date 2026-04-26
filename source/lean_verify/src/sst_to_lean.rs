@@ -705,8 +705,10 @@ fn walk_obligations<'a>(
                 callee, args, typ_args, *dest, call_span, mut_args, after, ctx, obl, e,
             );
         }
-        Wp::Loop { cond, invs, decrease, modified_vars, body, after } => {
-            walk_loop(*cond, invs, decrease, modified_vars, body, after, ctx, obl, e);
+        Wp::Loop { cond, invs, decrease, modified_vars, body, after, d_old_name } => {
+            walk_loop(
+                *cond, invs, decrease, modified_vars, body, after, d_old_name, ctx, obl, e,
+            );
         }
         Wp::AssertByTactus { cond, tactic_text, body } => {
             walk_assert_by_tactus(*cond, tactic_text, body, ctx, obl, e);
@@ -888,6 +890,7 @@ fn walk_loop<'a>(
     modified_vars: &[(&'a VarIdent, &'a Typ)],
     body: &Wp<'a>,
     after: &Wp<'a>,
+    d_old_name: &str,
     ctx: &WpCtx<'a>,
     obl: &OblCtx,
     e: &mut ObligationEmitter,
@@ -929,12 +932,14 @@ fn walk_loop<'a>(
     if let Some(c) = cond {
         maintain_obl.frames.push(CtxFrame::Hyp(cond_marked(c)));
     }
-    // `let _tactus_d_old := D` — pre-body decrease value, referenced
-    // by the body's continue_leaf as `D < _tactus_d_old`. Must come
-    // AFTER the cond hyp (which doesn't reference `_tactus_d_old`)
-    // but BEFORE walking the body (which does).
+    // `let _tactus_d_old_<id> := D` — pre-body decrease value,
+    // referenced by the body's continue_leaf as
+    // `D < _tactus_d_old_<id>`. Per-loop-unique name (gensym'd in
+    // `build_wp_loop` from the loop's id) avoids any chance of
+    // shadowing across nested loops, even if a future refactor
+    // changes scope structure.
     maintain_obl.frames.push(CtxFrame::Let(
-        "_tactus_d_old".to_string(),
+        d_old_name.to_string(),
         sst_exp_to_ast(decrease),
     ));
     walk_obligations(body, ctx, &maintain_obl, e);
@@ -1508,6 +1513,16 @@ enum Wp<'a> {
         modified_vars: Vec<(&'a VarIdent, &'a Typ)>,
         body: Box<Wp<'a>>,
         after: Box<Wp<'a>>,
+        /// Per-loop-unique name for the pre-body decrease snapshot
+        /// (`let _tactus_d_old_<id> := D` in the maintain ctx).
+        /// Built from Verus's `StmX::Loop::id` in `build_wp_loop` so
+        /// nested loops never share the name. Without gensym, an
+        /// inner loop's `let _tactus_d_old := D_inner` would shadow
+        /// the outer's binding for any references on the same
+        /// scope path — currently impossible (sibling conjuncts),
+        /// but a future refactor that mixes scopes would silently
+        /// miscompile.
+        d_old_name: String,
     },
 
     /// Direct function call. `after` is the post-call continuation.
@@ -2064,7 +2079,7 @@ fn build_wp_loop<'a>(
     let StmX::Loop {
         loop_isolation,
         is_for_loop: _,
-        id: _,
+        id,
         label: _,
         cond,
         body,
@@ -2076,6 +2091,9 @@ fn build_wp_loop<'a>(
     } = &stm.x else {
         unreachable!("build_wp_loop called on non-loop statement");
     };
+    // Per-loop-unique d_old name. Verus's `id: u64` is stable per
+    // loop instance, so two nested loops can never collide.
+    let d_old_name = format!("_tactus_d_old_{}", id);
     if !loop_isolation {
         return Err(
             "non-isolated loops (loop_isolation: false) not yet supported".to_string()
@@ -2158,7 +2176,7 @@ fn build_wp_loop<'a>(
     let decrease_marked = LExpr::span_mark(
         format_rust_loc(&decrease_exp.span),
         AssertKind::LoopDecrease,
-        LExpr::lt(sst_exp_to_ast(decrease_exp), LExpr::var("_tactus_d_old")),
+        LExpr::lt(sst_exp_to_ast(decrease_exp), LExpr::var(d_old_name.clone())),
     );
     let continue_leaf = LExpr::and(inv_conj.clone(), decrease_marked);
     let break_leaf = inv_conj;
@@ -2177,6 +2195,7 @@ fn build_wp_loop<'a>(
         modified_vars,
         body: Box::new(body_wp),
         after: Box::new(after),
+        d_old_name,
     })
 }
 
