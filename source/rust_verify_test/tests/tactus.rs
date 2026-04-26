@@ -2773,7 +2773,7 @@ test_verify_one_file! {
 test_verify_one_file! {
     #[test] test_exec_call_multi_requires_one_fails verus_code! {
         #[verifier::tactus_auto]
-        fn multi_req_callee(x: u8) -> (r: u8)
+        fn callee(x: u8) -> (r: u8)
             requires x > 5, x < 100
             ensures r == x
         {
@@ -2781,11 +2781,11 @@ test_verify_one_file! {
         }
 
         #[verifier::tactus_auto]
-        fn multi_req_caller(x: u8) -> (r: u8)
+        fn caller(x: u8) -> (r: u8)
             requires x < 100   // satisfies one but not both
             ensures r == x
         {
-            multi_req_callee(x)
+            callee(x)
         }
     } => Err(err) => {
         assert!(err.errors.len() >= 1, "multi-requires partial-violation must fail");
@@ -2807,7 +2807,7 @@ test_verify_one_file! {
 test_verify_one_file! {
     #[test] test_exec_multi_ensures_one_fails verus_code! {
         #[verifier::tactus_auto]
-        fn returns_five_but_one_clause_lies() -> (r: u8)
+        fn five() -> (r: u8)
             ensures r == 5, r > 100
         {
             5

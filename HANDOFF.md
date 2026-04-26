@@ -540,11 +540,17 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 
 | Binary | Count | What it tests |
 |---|---|---|
-| `cargo test -p lean_verify --lib` | 113 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `lower_wp` / `needs_peel` / `contains_loc` / `lift_if_value`, type translation, sanity check scope tracking, `format_rust_loc`, lean_process |
+| `cargo test -p lean_verify --lib` | 106 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value`, type translation, sanity check scope tracking, `format_rust_loc`, lean_process |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
-| `vargo test -p rust_verify_test --test tactus` | 176 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes) |
+| `vargo test -p rust_verify_test --test tactus` | 186 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
 | `vargo build --release` (vstd) | 1530 | Regression guard: vstd proof library still verifies |
+
+### Per-test isolation for Tactus output (`TACTUS_LEAN_OUT`)
+
+`run_verus` in `tests/common/mod.rs` sets `TACTUS_LEAN_OUT` to `<test_input_dir>/tactus-lean` for every spawned subprocess. Without this, generated `.lean` files would land in the shared `<rust_verify_test target>/tactus-lean/test_crate/<fn>.lean` (because cargo's inherited `CARGO_TARGET_DIR` overrides the relative-CWD fallback in `lean_out_root`). Two tests defining a fn with the same name but different content would race in parallel runs, producing flaky failures whose root cause is invisible (one test's output overwrites the other's between Lean spawn and disk read). Per-test `TACTUS_LEAN_OUT` gives each test its own output tree.
+
+Symptom of regression: same test fails on one cargo run and passes on the next; running it alone passes. Likely cause: the env-var setting got lost.
 
 ### Sanity check (`lean_verify/src/sanity.rs`)
 
