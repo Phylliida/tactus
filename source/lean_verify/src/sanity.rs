@@ -289,7 +289,7 @@ fn name_resolves(name: &str, defined: &HashSet<String>, scope: &HashSet<String>)
         // declarations, so the sanity check needs them explicitly.
         | "arch_word_bits" | "arch_word_bits_valid"
         | "usize_hi" | "isize_hi"
-        | "tactus_peel"
+        | "tactus_peel" | "tactus_usize_bound"
     )
 }
 
