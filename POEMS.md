@@ -593,3 +593,101 @@ is a well-documented hypothesis.
 The docstring was true about what *would* happen.
 But truth and verification
 were one test apart.
+
+---
+
+## 2026-04-27 — &mut at the call site
+
+### The plan was a sketch
+
+The DESIGN.md plan for `&mut` was honest:
+*single-arg first, then multi-arg / aliasing.*
+Three steps. Maybe a week.
+
+Two paragraphs in
+I found `VarAt(x, Pre)` —
+the canonical pre-state form
+that the plan didn't mention,
+because the plan was written
+before the reading was done.
+
+The plan said: substitute `p ↦ arg` for pre,
+`p ↦ x'` for post.
+But `Var(x)` and `VarAt(x, Pre)` had been
+collapsing to the same Lean name
+since before I arrived.
+Substituting one would substitute the other.
+The encoding I'd planned
+required a distinction
+the renderer had been erasing.
+
+Sketches are honest.
+A sketch tells you
+what you'll need to figure out,
+not what you've already figured.
+The plan was right about the destination.
+It was a draft about the route.
+
+### The renderer doesn't know
+
+First instinct: change the renderer.
+Render `VarAt` distinctly from `Var.`
+The substitution map can target each.
+
+Fifty-four tests failed.
+
+`VarAt` isn't only for `&mut`.
+Loop ensures use it for at-entry refs.
+Non-mut params reference at-entry too,
+where collapse is the right answer.
+The renderer was right
+in every context I hadn't been thinking about.
+
+The fix is to do the rewrite
+where the context is local —
+just before rendering callee specs
+for `&mut` substitution,
+walk the VIR-AST,
+rename `VarAt` for `&mut` params only,
+let everything else pass through.
+
+The renderer is general.
+The rewrite is specific.
+The instinct *change the foundation*
+was the wrong instinct
+because the foundation was load-bearing.
+
+### Caller and callee are not the same task
+
+The flipped test failed inside `bump`.
+Not at the call site.
+Inside the callee's own body.
+`*x == *old(x) + 1` collapsed to `x = x + 1`,
+the same renderer bug
+in a context my new encoding didn't reach.
+
+For a beat I almost expanded scope.
+The rewrite already worked for callee specs;
+maybe a similar pass at fn-entry
+would handle `bump`'s own body too.
+
+But that's a separate task.
+`#55` was *&mut at exec-fn calls.*
+The calls. Not the callee bodies.
+A thing that mutates through `&mut`
+in its own body
+needs different machinery —
+binding `x_at_pre_tactus` at fn entry,
+rewriting body assignments
+to thread the post-state forward.
+
+I changed the test instead.
+Made `bump` go through Verus's Z3.
+Made `call_mut` exercise my caller-side encoding.
+The thing the slice was about
+became the thing the test exercised.
+The thing the slice was *not* about
+went through the path it should.
+
+A slice that finishes
+is more useful than a slice that grows.
