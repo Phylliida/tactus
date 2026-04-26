@@ -2369,6 +2369,50 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// ── Per-fn tactic override ────────────────────────────────────────
+// `#[verifier::tactus_tactic("ring")]` replaces `tactus_auto` in
+// generated theorems with the user-supplied Lean tactic. Useful for
+// fns where the default toolbox (rfl/decide/omega/simp_all) can't
+// discharge the obligations.
+test_verify_one_file! {
+    #[test] test_exec_tactus_tactic_override verus_code! {
+        // Use `omega` directly as the override — simpler than the
+        // default toolbox (no rfl/decide/simp_all rungs) but
+        // sufficient for this linear-arithmetic goal. Pins that the
+        // user's tactic gets used, not silently augmented with the
+        // default closer.
+        #[verifier::tactus_auto]
+        #[verifier::tactus_tactic("omega")]
+        fn add_one(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            x + 1
+        }
+    } => Ok(())
+}
+
+// Negative: a tactic override that can't discharge the goal still
+// fails cleanly. Pins that the user's tactic IS being invoked
+// (and isn't being silently augmented with the default closer).
+test_verify_one_file! {
+    #[test] test_exec_tactus_tactic_failing verus_code! {
+        #[verifier::tactus_auto]
+        #[verifier::tactus_tactic("rfl")]  // rfl can't prove arithmetic
+        fn add_one_rfl(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            x + 1
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.len() >= 1,
+            "rfl override on arith goal should fail",
+        );
+    }
+}
+
 // ── assume(P) warning ─────────────────────────────────────────────
 // `assume(P)` enters P as a hypothesis without a proof — a soundness
 // escape hatch for incremental development. Tactus surfaces a
