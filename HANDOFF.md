@@ -803,7 +803,7 @@ tactus/
       fn_call_to_vir.rs        ← tactus_span_from, enclosing_fn_is_tactus_auto
       rust_to_vir_expr.rs      ← Tactus proof-block synthesis (AssertBy-in-Ghost)
     rust_verify_test/tests/
-      tactus.rs                ← 172 end-to-end tests
+      tactus.rs                ← 189 end-to-end tests
       tactus_coverage.rs       ← coverage matrix test binary
     vir/src/
       ast.rs                   ← FunctionAttrs.tactic_span + tactus_auto;
@@ -846,13 +846,13 @@ cd lean_verify && ./scripts/setup-mathlib.sh && cd ..
 # or: TACTUS_LEAN_PROJECT=/custom/path ./scripts/setup-mathlib.sh
 
 # ── Full test suite ────────────────────────────────────────────────
-# 172 end-to-end tests
+# 189 end-to-end tests
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Coverage matrix (1 test, asserts walker visits the expected variant set)
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus_coverage
 
-# 110 unit tests (AST pp, substitute, Wp DSL, sanity check, type translation,
+# 114 unit tests (AST pp, substitute, Wp DSL, sanity check, type translation,
 #                 source_util — dedent + read_tactic_from_source)
 cargo test -p lean_verify --lib
 
