@@ -151,10 +151,16 @@ fn krate_preamble(
 
 #[must_use]
 pub enum CheckResult {
-    /// Lean verified the proof successfully.
-    Success,
-    /// Lean rejected the proof. The string is a formatted error message.
-    Failed(String),
+    /// Lean verified the proof successfully. `warnings` carries
+    /// non-fatal diagnostics — currently used for `assume(P)` site
+    /// notifications (each `assume` is a soundness escape hatch
+    /// backed by `sorry`).
+    Success { warnings: Vec<String> },
+    /// Lean rejected the proof. The string is a formatted error
+    /// message. `warnings` carries non-fatal diagnostics from the
+    /// same crate (assume sites, etc.) that are worth surfacing
+    /// even when verification itself fails.
+    Failed { error: String, warnings: Vec<String> },
     /// Lean could not be invoked (not installed, project missing, etc.)
     Error(String),
 }
@@ -197,17 +203,17 @@ pub fn check_proof_fn(
     let result = lean_process::check_lean_file(&file_path, lake_dir);
 
     match result {
-        Ok(r) if r.success => CheckResult::Success,
+        Ok(r) if r.success => CheckResult::Success { warnings: vec![] },
         Ok(r) => {
             let errors: Vec<_> = r.diagnostics.iter()
                 .filter(|d| d.severity == "error")
                 .map(|d| lean_process::format_error(d, &source_map))
                 .collect();
             let fn_short = short_name(&proof_fn.name.path);
-            CheckResult::Failed(format!(
-                "Lean tactic failed for {}:\n\n{}",
-                fn_short, errors.join("\n"),
-            ))
+            CheckResult::Failed {
+                error: format!("Lean tactic failed for {}:\n\n{}", fn_short, errors.join("\n")),
+                warnings: vec![],
+            }
         }
         Err(e) => CheckResult::Error(e),
     }
@@ -222,12 +228,35 @@ pub fn check_exec_fn(
     imports: &[String],
     crate_name: &str,
 ) -> CheckResult {
+    // Collect `assume(P)` sites first so warnings surface even when
+    // the rest of the codegen rejects the fn. Each `assume` is a
+    // soundness escape hatch — `assume(P)` enters its expression
+    // as a hypothesis without a backing proof obligation, so users
+    // need a visible reminder per site. Walks the VIR-AST body
+    // (`vir_fn.body`) rather than the SST so synthetic
+    // `StmX::Assume` injected by Verus's later passes (overflow,
+    // call-ensures) doesn't produce false positives.
+    let assume_warnings: Vec<String> = vir_fn.body.as_ref()
+        .map(|body| sst_to_lean::collect_assume_sites(body))
+        .unwrap_or_default()
+        .iter()
+        .map(|span| format!(
+            "unproved assumption at {}: backed by an unverified hypothesis (`assume(P)` \
+             enters the spec as fact without a proof). Replace with a proven \
+             `assert(P) by {{ ... }}` before relying on this in production.",
+            sst_to_lean::format_span_loc(span),
+        ))
+        .collect();
+
     let theorems = match sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check) {
         Ok(ts) => ts,
-        Err(reason) => return CheckResult::Failed(format!(
-            "tactus_auto: {} (first slice supports only straight-line exec fns)",
-            reason
-        )),
+        Err(reason) => return CheckResult::Failed {
+            error: format!(
+                "tactus_auto: {} (first slice supports only straight-line exec fns)",
+                reason,
+            ),
+            warnings: assume_warnings,
+        },
     };
 
     // Exec fns lower matches to if-chains over `IsVariant` and
@@ -247,6 +276,7 @@ pub fn check_exec_fn(
     if let Err(e) = write_lean_file(&file_path, &rendered.text) {
         return CheckResult::Error(e);
     }
+    let warnings = assume_warnings;
 
     let dir = project::default_project_dir();
     let lake_dir = if project::project_ready(&dir) { Some(dir.as_path()) } else { None };
@@ -261,19 +291,22 @@ pub fn check_exec_fn(
     };
 
     match result {
-        Ok(r) if r.success => CheckResult::Success,
+        Ok(r) if r.success => CheckResult::Success { warnings },
         Ok(r) => {
             let errors: Vec<_> = r.diagnostics.iter()
                 .filter(|d| d.severity == "error")
                 .map(|d| lean_process::format_error(d, &source_map))
                 .collect();
-            CheckResult::Failed(format!(
-                "Lean tactus_auto failed for {}:\n\n{}\n\n\
-                 (generated .lean file: {})",
-                short_name(&vir_fn.name.path),
-                errors.join("\n"),
-                file_path.display(),
-            ))
+            CheckResult::Failed {
+                error: format!(
+                    "Lean tactus_auto failed for {}:\n\n{}\n\n\
+                     (generated .lean file: {})",
+                    short_name(&vir_fn.name.path),
+                    errors.join("\n"),
+                    file_path.display(),
+                ),
+                warnings,
+            }
         }
         Err(e) => CheckResult::Error(e),
     }

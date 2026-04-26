@@ -1684,13 +1684,23 @@ impl Verifier {
                                 &vir_fn.x.attrs.lean_imports,
                                 crate_name,
                             ) {
-                                lean_verify::CheckResult::Success => {
+                                lean_verify::CheckResult::Success { warnings } => {
                                     self.count_verified += 1;
+                                    for w in warnings {
+                                        reporter.report(
+                                            &message(MessageLevel::Warning, w, fn_span).to_any()
+                                        );
+                                    }
                                 }
-                                lean_verify::CheckResult::Failed(msg) => {
+                                lean_verify::CheckResult::Failed { error, warnings } => {
                                     self.count_errors += 1;
+                                    for w in warnings {
+                                        reporter.report(
+                                            &message(MessageLevel::Warning, w, fn_span).to_any()
+                                        );
+                                    }
                                     reporter.report(
-                                        &message(MessageLevel::Error, msg, fn_span).to_any()
+                                        &message(MessageLevel::Error, error, fn_span).to_any()
                                     );
                                 }
                                 lean_verify::CheckResult::Error(e) => {
@@ -1766,13 +1776,23 @@ impl Verifier {
                                 &vir_fn.x.attrs.lean_imports,
                                 crate_name,
                             ) {
-                                lean_verify::CheckResult::Success => {
+                                lean_verify::CheckResult::Success { warnings } => {
                                     self.count_verified += 1;
+                                    for w in warnings {
+                                        reporter.report(
+                                            &message(MessageLevel::Warning, w, fn_span).to_any()
+                                        );
+                                    }
                                 }
-                                lean_verify::CheckResult::Failed(msg) => {
+                                lean_verify::CheckResult::Failed { error, warnings } => {
                                     self.count_errors += 1;
+                                    for w in warnings {
+                                        reporter.report(
+                                            &message(MessageLevel::Warning, w, fn_span).to_any()
+                                        );
+                                    }
                                     reporter.report(
-                                        &message(MessageLevel::Error, msg, fn_span).to_any()
+                                        &message(MessageLevel::Error, error, fn_span).to_any()
                                     );
                                 }
                                 lean_verify::CheckResult::Error(e) => {
