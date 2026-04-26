@@ -247,6 +247,12 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
         ExprX::AssertQuery { .. } => ExprNode::LitBool(true),
         ExprX::OpenInvariant(_, _, body, _) => expr_to_node(body),
 
+        // `ExprX::Old(e)` wraps the inner expression for well-
+        // formedness checking ("ignored after these checks are
+        // complete" per the AST docstring). The actual pre-state
+        // reference uses `ExprX::VarAt(x, Pre)`, which we render
+        // distinctly via `varat_pre_name` for &mut callee-spec
+        // inlining (#55). For this arm: render the inner unchanged.
         ExprX::Old(e) | ExprX::EvalAndResolve(_, e) => expr_to_node(e),
         ExprX::BorrowMut(_) | ExprX::TwoPhaseBorrowMut(_)
         | ExprX::BorrowMutTracked(_) => ExprNode::Var("()".into()),

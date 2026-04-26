@@ -657,7 +657,12 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
             "array literals not yet supported in exec fns".to_string()
         ),
         ExpX::Old(..) => return Err(
-            "`old(...)` not yet supported in exec fns".to_string()
+            "ExpX::Old is an internal Verus form (snapshot reference for sst_to_air's \
+             AIR encoding) that shouldn't escape into the SST we see. User-written \
+             `old(x)` syntax lowers to `ExpX::VarAt(x, Pre)` at AST→SST time, which \
+             Tactus handles directly (the `&mut` callee-spec rewrite at #55 uses it). \
+             If this fires, Verus's pipeline has changed and ExpX::Old is leaking; \
+             check sst_to_air invariants.".to_string()
         ),
         ExpX::Interp(_) => return Err(
             "Interp nodes should never escape the interpreter (internal bug)".to_string()
