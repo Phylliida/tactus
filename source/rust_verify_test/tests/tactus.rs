@@ -2027,6 +2027,16 @@ test_verify_one_file! {
         }
     } => Err(err) => {
         assert!(err.errors.len() >= 1, "Expected error for false body assert");
+        // D review: AssertKind::Plain has an empty label, so the
+        // error format is `at <loc>:` (no parenthesized kind).
+        // Pin this so the format doesn't regress to e.g.
+        // `(assert)` if someone changes Plain's label.
+        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("test.rs:") && !m.contains("(assert)")),
+            "expected `at test.rs:L:C:` without `(assert)` parenthetical for Plain assert. got: {:?}",
+            msgs,
+        );
     }
 }
 
@@ -3516,6 +3526,75 @@ test_verify_one_file! {
         {
             assert(x < 200) by { }
             x + 1
+        }
+    } => Ok(())
+}
+
+// Coverage gap: two sequential `proof { ... }` blocks. Walker
+// pushes both prefixes onto `e.tactic_prefix`, so every emitted
+// theorem in their combined scope gets `(prefix1\n prefix2) <;>
+// closer`. Hypotheses introduced by the first block are in scope
+// for the second's `have` and for the closer.
+test_verify_one_file! {
+    #[test] test_exec_proof_block_sequential verus_code! {
+        #[verifier::tactus_auto]
+        fn use_two_haves(x: u8) -> (r: u8)
+            requires x < 50
+            ensures r == x + 1
+        {
+            proof {
+                have h1 : x < 100 := by omega
+            }
+            proof {
+                have h2 : x < 200 := by omega
+            }
+            // Both h1 and h2 are in scope here for tactus_auto to
+            // pick up via simp_all.
+            x + 1
+        }
+    } => Ok(())
+}
+
+// Coverage gap: fn with no `ensures` clauses. `WpCtx::new` builds
+// `ensures_goal = and_all([]) = LitBool(true)` (unwrapped — no
+// SpanMark since the per-clause map() iterates nothing). The Done
+// leaf is `let r := e; True`; emit_done_or_split peels the Let,
+// recurses on `True`, and falls into the unwrapped fallback
+// (kind_label = "ensures", empty loc) → emits one trivial theorem.
+// Untested before this commit.
+test_verify_one_file! {
+    #[test] test_exec_no_ensures verus_code! {
+        #[verifier::tactus_auto]
+        fn no_ensures_clause() -> (r: u8) {
+            5
+        }
+    } => Ok(())
+}
+
+// Coverage gap: callee with NO requires AND NO ensures. Exercises
+// `walk_call`'s skip-precondition path (no theorem emitted for an
+// empty requires) and skip-ensures-frame path (no `Hyp(True)`
+// pushed for an empty ensures). Without these guards we'd emit
+// trivial precondition theorems and add tautological frames to
+// the continuation context.
+//
+// Caller's ensures doesn't depend on the callee's return — that
+// would require the callee to have ensures. We're exercising the
+// CALL CONTEXT, not the value flow.
+test_verify_one_file! {
+    #[test] test_exec_call_no_requires_no_ensures verus_code! {
+        #[verifier::tactus_auto]
+        fn trivial_callee() -> (r: u8) {
+            42
+        }
+
+        #[verifier::tactus_auto]
+        fn trivial_caller() -> (r: u8)
+            ensures r == 7
+        {
+            // Discard callee's return; our ensures is independent.
+            let _ignored = trivial_callee();
+            7
         }
     } => Ok(())
 }
