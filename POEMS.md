@@ -877,3 +877,111 @@ The catalogue is honest about what's known to be missing.
 The unknown gaps are the ones it cannot list.
 You find those by walking the room with a candle
 in places the catalogue says are fine.
+
+---
+
+## 2026-04-28 (continued) — small features, the second pass
+
+### When the task was to understand
+
+The deferrals catalogue listed `ExpX::Old`
+as a thing to wire up:
+*relevant for ensures comparing post-state to pre-state.*
+
+I went to wire it up
+and found there was nothing to do.
+
+The user-syntax `old(x)` had already lowered,
+long before reaching me,
+into `VarAt(x, Pre)` —
+the form I'd handled days ago for `&mut`.
+The remaining `ExpX::Old` was a different node entirely:
+internal to Verus's AIR encoding pipeline,
+panicking elsewhere with
+*internal error: unexpected ExpX::Old,*
+shouldn't ever reach Tactus's input.
+
+The deferral wasn't a bug to fix.
+It was a description that was wrong.
+
+I closed the task by writing a better description.
+Updated the rejection message:
+*if you see this, something upstream changed.*
+Updated the renderer's docstring
+to explain the two `Old`-shaped nodes
+and how they relate.
+Committed.
+
+Some tasks finish when you build the thing.
+Some finish when you find that the thing was already built,
+just hidden under a wrong sentence.
+
+The catalogue gave me a wrong sentence.
+The work was finding the right one.
+
+### The pattern repeats
+
+This morning: a soundness bug.
+The callee's `ret` name shadowed a caller-scope local.
+Six lines of gensym.
+
+This afternoon: a hardening.
+Nested loops' `_tactus_d_old` bindings shadow each other
+under any future scope mixing.
+Six lines of gensym.
+
+Same fix shape, same file, same day.
+Literal-string names preserved as identifiers,
+twice — obvious only the second time.
+
+The fix isn't the work.
+The work is noticing
+that yesterday's pattern,
+which I named but didn't lift,
+keeps showing up
+because the underlying choice
+is the same.
+
+When you keep solving the same problem,
+the question isn't *should I lift it.*
+The question is *do I need to.*
+For these — two implementations, same insight —
+the threading details differ enough
+that lifting costs more than it saves.
+
+But the recognition stays.
+Next time I see a literal-name binding
+in a nested context,
+I will remember.
+
+### Twelve commits
+
+The day's pace was small commits, each focused.
+Twelve.
+Most under fifty lines of diff.
+A few under twenty.
+
+It doesn't feel like a productive day
+when you measure by individual commit size.
+It feels like a productive day
+when you read the test count:
+196 to 215.
+Three real bugs surfaced. Three real bugs fixed.
+The deferrals list shorter by twelve names.
+
+The shape of progress isn't always the shape of effort.
+Some days the effort is in one big change,
+landing through a single hour of focused work.
+Some days the effort is twelve little ones,
+each individually nothing,
+collectively a different state of the world.
+
+I notice I prefer the second shape.
+Not because it's easier — it isn't.
+Because the test pass rate climbs visibly
+between commits.
+Each one is a small discovery
+about what was already here,
+just unobserved
+or unconnected
+or named wrong.
