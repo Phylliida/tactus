@@ -287,6 +287,10 @@ fn name_resolves(name: &str, defined: &HashSet<String>, scope: &HashSet<String>)
         // Tactus prelude axioms / defs / macros — resolved by the
         // `Command::Raw` block in the preamble, not by our own
         // declarations, so the sanity check needs them explicitly.
+        // (Convention 4 in `expr_shared.rs`'s "Reserved identifier
+        // conventions" section: bare names in TactusPrelude.lean.)
+        // Adding a new prelude def or tactic means updating this
+        // allowlist.
         | "arch_word_bits" | "arch_word_bits_valid"
         | "usize_hi" | "isize_hi"
         | "tactus_peel" | "tactus_usize_bound"
