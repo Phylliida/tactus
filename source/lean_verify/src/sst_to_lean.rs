@@ -166,11 +166,14 @@ pub struct WpCtx<'a> {
 }
 
 /// The break / continue goal leaves in scope inside a loop body.
-/// Threaded through `build_wp` as `Option<&WpLoopCtx>` — `None`
-/// outside any loop (break/continue rejected), `Some(...)` inside a
-/// loop's body. Inner loops shadow outer loops for unlabeled
-/// break/continue (the innermost applies). Labeled break/continue
-/// would need a stack; not yet supported.
+/// Threaded through `build_wp` as `&[&WpLoopCtx]` (innermost-first)
+/// so labeled break/continue can search for the matching loop.
+/// Empty slice outside any loop; one entry per enclosing loop body
+/// when nested.
+///
+/// **Unlabeled** break/continue resolves to `stack[0]` (innermost).
+/// **Labeled** `break 'outer;` searches the stack for an entry with
+/// `label == Some("outer")` and uses that loop's leaves.
 ///
 /// The two leaves differ in what they need to prove:
 /// * `continue_leaf` — on body fallthrough or `continue`, re-establish
@@ -182,6 +185,11 @@ pub struct WpCtx<'a> {
 ///   = true). The decrease obligation doesn't apply on break — the
 ///   loop is terminating, not iterating.
 pub struct WpLoopCtx {
+    /// The loop's source-level label (`'outer: while …` →
+    /// `Some("outer")`). `None` for unlabeled loops. Compared
+    /// against the `label` field on `StmX::BreakOrContinue` to
+    /// resolve labeled break/continue.
+    pub label: Option<String>,
     pub break_leaf: LExpr,
     pub continue_leaf: LExpr,
 }
@@ -406,13 +414,13 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // Build the whole WP tree from the body, with the fn's ensures
     // as the natural continuation at the leaves. `Return` statements
     // inside the body replace their local `after` with the same
-    // ensures goal (via `ctx.ensures_goal`). Initial loop_ctx is
-    // `None` — break/continue are rejected outside any loop.
+    // ensures goal (via `ctx.ensures_goal`). Initial loop_stack is
+    // empty — break/continue are rejected outside any loop.
     let body_wp = build_wp(
         &check.body,
         Wp::Done(ctx.ensures_goal.clone()),
         &ctx,
-        None,
+        &[],
     )?;
 
     let fn_name = lean_name(&fn_sst.x.name.path);
@@ -1870,11 +1878,12 @@ fn build_wp<'a>(
     stm: &'a Stm,
     after: Wp<'a>,
     ctx: &WpCtx<'a>,
-    // Innermost enclosing loop's break/continue leaves, if any. `None`
-    // outside a loop (where `StmX::BreakOrContinue` is rejected).
-    // Most recursive calls forward this unchanged; only
-    // `build_wp_loop` constructs a new one for the body.
-    loop_ctx: Option<&WpLoopCtx>,
+    // Stack of enclosing loops' break/continue leaves, innermost
+    // first. Empty outside any loop (where `StmX::BreakOrContinue`
+    // is rejected). Most recursive calls forward this unchanged;
+    // only `build_wp_loop` constructs a new one (extending the
+    // stack) for the loop body.
+    loop_stack: &[&WpLoopCtx],
 ) -> Result<Wp<'a>, String> {
     match &stm.x {
         StmX::Block(stms) => {
@@ -1884,7 +1893,7 @@ fn build_wp<'a>(
             //                     walk(s_0, whole_rest).
             let mut wp = after;
             for s in stms.iter().rev() {
-                wp = build_wp(s, wp, ctx, loop_ctx)?;
+                wp = build_wp(s, wp, ctx, loop_stack)?;
             }
             Ok(wp)
         }
@@ -1945,9 +1954,9 @@ fn build_wp<'a>(
             // "Known codegen-complexity trade-offs" for the shared-
             // continuation let-binding optimization we chose not to
             // implement (simp zeta-reduces it, so no saving).
-            let then_branch = build_wp(then_stm, after.clone(), ctx, loop_ctx)?;
+            let then_branch = build_wp(then_stm, after.clone(), ctx, loop_stack)?;
             let else_branch = match else_stm {
-                Some(e) => build_wp(e, after, ctx, loop_ctx)?,
+                Some(e) => build_wp(e, after, ctx, loop_stack)?,
                 None => after,
             };
             Ok(Wp::Branch {
@@ -1956,13 +1965,14 @@ fn build_wp<'a>(
                 else_branch: Box::new(else_branch),
             })
         }
-        // Neither `build_wp_call` nor `build_wp_loop` needs the
-        // enclosing loop's `loop_ctx`: they don't recurse on stmts
-        // outside their own fixed structure. `build_wp_loop` builds
-        // its OWN loop_ctx for its body (see there); `after` was
-        // already built by the caller with the outer loop_ctx.
+        // `build_wp_call` doesn't need the enclosing loop_stack: it
+        // doesn't recurse on stmts outside its own structure.
+        // `build_wp_loop` DOES — it extends the stack with this
+        // loop's WpLoopCtx and recurses on the body. `after` was
+        // already built by our caller with the outer stack, so we
+        // don't pass it for `after` recursion.
         StmX::Call { .. } => build_wp_call(stm, after, ctx),
-        StmX::Loop { .. } => build_wp_loop(stm, after, ctx),
+        StmX::Loop { .. } => build_wp_loop(stm, after, ctx, loop_stack),
         // Transparent in SST: pass `after` through unchanged.
         StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => Ok(after),
         // `break` / `continue` terminate the current iteration and
@@ -1971,25 +1981,40 @@ fn build_wp<'a>(
         // unreachable (Verus's dead-code analysis handles that
         // upstream; this WP side just needs to reach the right leaf).
         //
-        // Labeled forms (`break 'outer;`) aren't yet supported — they
-        // would require a stack of loop contexts keyed by label
-        // rather than a single innermost one.
+        // **Unlabeled** (`break;` / `continue;`) — uses the innermost
+        // enclosing loop (loop_stack[0]).
+        // **Labeled** (`break 'outer;`) — searches `loop_stack` for
+        // the entry whose label matches.
         StmX::BreakOrContinue { label, is_break } => {
-            if label.is_some() {
-                return Err(
-                    "labeled `break 'label;` / `continue 'label;` not yet \
-                     supported (#88). Workaround: refactor to remove the \
-                     label, or use a flag variable + unlabeled break.".to_string()
-                );
-            }
-            let Some(leaves) = loop_ctx else {
-                // Should never fire — Verus's mode checker rejects
-                // break/continue outside loops upstream.
-                return Err(
-                    "break / continue appeared outside any loop — Verus's mode \
-                     checker should have caught this; please open an issue."
-                        .to_string()
-                );
+            let leaves = match label {
+                None => {
+                    let Some(innermost) = loop_stack.first() else {
+                        // Should never fire — Verus's mode checker
+                        // rejects break/continue outside loops.
+                        return Err(
+                            "break / continue appeared outside any loop — Verus's \
+                             mode checker should have caught this; please open an \
+                             issue.".to_string()
+                        );
+                    };
+                    *innermost
+                }
+                Some(target) => {
+                    let target_str = target.as_str();
+                    let Some(matched) = loop_stack.iter().find(|ctx| {
+                        ctx.label.as_deref() == Some(target_str)
+                    }) else {
+                        // Should never fire — Verus's mode checker
+                        // requires the label to be in scope.
+                        return Err(format!(
+                            "labeled break/continue references unknown loop label \
+                             `{}` — Verus's mode checker should have caught this; \
+                             please open an issue.",
+                            target_str,
+                        ));
+                    };
+                    *matched
+                }
             };
             let leaf = if *is_break {
                 leaves.break_leaf.clone()
@@ -2309,6 +2334,7 @@ fn build_wp_loop<'a>(
     stm: &'a Stm,
     after: Wp<'a>,
     ctx: &WpCtx<'a>,
+    outer_loop_stack: &[&WpLoopCtx],
 ) -> Result<Wp<'a>, String> {
     // Destructure every field explicitly so a future Verus-side
     // `StmX::Loop` addition forces a compile-time audit. `is_for_loop`
@@ -2321,7 +2347,7 @@ fn build_wp_loop<'a>(
         loop_isolation,
         is_for_loop: _,
         id,
-        label: _,
+        label,
         cond,
         body,
         invs,
@@ -2450,12 +2476,17 @@ fn build_wp_loop<'a>(
     let continue_leaf = LExpr::and(inv_conj.clone(), decrease_marked);
     let break_leaf = inv_conj;
     let inner_loop_ctx = WpLoopCtx {
+        label: label.clone(),
         break_leaf: break_leaf.clone(),
         continue_leaf: continue_leaf.clone(),
     };
-    // Body is built with THIS loop's break/continue leaves as the
-    // innermost context — break/continue inside refer to *this* loop.
-    let body_wp = build_wp(body, Wp::Done(continue_leaf), ctx, Some(&inner_loop_ctx))?;
+    // Body is built with THIS loop's WpLoopCtx pushed at the front
+    // of the stack (innermost-first). Unlabeled break/continue in
+    // the body resolves to this loop; labeled break/continue
+    // searches the stack by label.
+    let mut inner_stack: Vec<&WpLoopCtx> = vec![&inner_loop_ctx];
+    inner_stack.extend_from_slice(outer_loop_stack);
+    let body_wp = build_wp(body, Wp::Done(continue_leaf), ctx, &inner_stack)?;
 
     Ok(Wp::Loop {
         cond: cond_exp_opt,
