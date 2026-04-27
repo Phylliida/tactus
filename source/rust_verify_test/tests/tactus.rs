@@ -4528,43 +4528,83 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Labeled break — not yet supported. Pinned so a future change that
-// accidentally accepts labeled break / continue (by removing the
-// `label.is_some()` check in `build_wp`'s `StmX::BreakOrContinue`
-// arm) trips this regression test.
+// Labeled break — landed (#88). The inner loop has a `break 'outer;`
+// that jumps to the outer loop's break_leaf (its at-exit invariants),
+// not the inner loop's. `WpLoopCtx` carries the loop's `label`, and
+// `loop_stack` is searched for the matching label; unlabeled
+// `break;` still resolves to the innermost (loop_stack[0]).
 test_verify_one_file! {
-    #[test] test_exec_loop_labeled_break_rejected verus_code! {
+    #[test] test_exec_loop_labeled_break verus_code! {
         #[verifier::tactus_auto]
         fn labeled(n: u8) -> (r: u8)
             requires n <= 100
-            ensures r <= n
+            ensures r <= 100
         {
             let mut x: u8 = n;
-            let mut i: u8 = 0;
             'outer: while x > 0
-                invariant x <= n, i <= n
+                invariant x <= 100
                 decreases x
             {
-                while i < 3
-                    invariant x <= n, i <= n
-                    decreases 3u8 - i
+                let mut i: u8 = 0;
+                while i < 5
+                    invariant i <= 5, x <= 100
+                    decreases 5u8 - i
                 {
-                    if x == 10 { break 'outer; }
+                    if x < 10 { break 'outer; }  // outer's break_leaf: x <= 100
                     i = i + 1;
                 }
                 x = x - 1;
             }
             x
         }
-    } => Err(err) => {
-        assert!(
-            err.errors.iter().any(|e|
-                e.message.contains("labeled break") || e.message.contains("not yet supported")
-            ),
-            "labeled break must be rejected, got: {:?}",
-            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
-        );
-    }
+    } => Ok(())
+}
+
+// NOTE: labeled `continue 'outer;` is rejected by Verus upstream
+// ("decrease checking for labeled continue not supported unless
+// loop is marked #[verifier::loop_isolation(false)]"). Tactus's
+// label-stack handling supports it in principle (the same code
+// path as labeled break, just using `continue_leaf` instead of
+// `break_leaf`), but exercising it end-to-end requires
+// `loop_isolation(false)` which we don't yet support either.
+// Documented here so a future contributor doesn't add an Ok
+// test without realizing.
+
+// Labeled break also works in deeply-nested cases — three loops,
+// inner break jumps to the outermost. Pinned to confirm the
+// stack search isn't off-by-one.
+test_verify_one_file! {
+    #[test] test_exec_loop_labeled_break_three_deep verus_code! {
+        #[verifier::tactus_auto]
+        fn three_deep(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r <= 100
+        {
+            let mut x: u8 = n;
+            'outermost: while x > 0
+                invariant x <= 100
+                decreases x
+            {
+                let mut j: u8 = 0;
+                while j < 3
+                    invariant j <= 3, x <= 100
+                    decreases 3u8 - j
+                {
+                    let mut k: u8 = 0;
+                    while k < 3
+                        invariant k <= 3, j <= 3, x <= 100
+                        decreases 3u8 - k
+                    {
+                        if x == 5 { break 'outermost; }
+                        k = k + 1;
+                    }
+                    j = j + 1;
+                }
+                x = x - 1;
+            }
+            x
+        }
+    } => Ok(())
 }
 
 // Nested loops with break in the inner — innermost `WpLoopCtx` applies
