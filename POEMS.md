@@ -985,3 +985,117 @@ about what was already here,
 just unobserved
 or unconnected
 or named wrong.
+
+---
+
+## 2026-04-28 (evening) — review lenses, again
+
+### What the second pass saw
+
+The five lenses found eight things to fix.
+I fixed them.
+
+Then I asked a different question:
+*if I came back in a month,
+what would slow me down?*
+
+That question found four more things
+the lenses hadn't named.
+Not bugs. Not smells.
+Just code that worked
+and was hard to read.
+
+The five lenses pointed at the surface.
+The reasoning question pointed at the inside.
+Both true at once.
+Both passes useful.
+
+One day I'll learn to ask
+all the questions
+on the first pass.
+But probably not.
+Probably the way
+to find the questions
+is to write the answers
+and then notice
+what was still missing.
+
+### On naming the conventions
+
+Four reserved-identifier conventions
+had grown across the project.
+Underscore-prefix gensyms.
+A suffix-style outlier.
+User-visible tactic names.
+Bare prelude defs.
+
+The conventions were already there.
+Loop gensyms followed one shape,
+trait-pre-state followed another,
+prelude defs followed a third,
+user-tactic names followed a fourth.
+
+The work wasn't inventing them.
+The work was writing them down —
+numbering them,
+naming what each was for,
+explaining the one exception
+(the `_at_pre_tactus` suffix —
+the only suffix in a sea of prefixes,
+because keeping `x` readable
+in error messages
+mattered more than the symmetry).
+
+Now a future contributor
+will read four numbered paragraphs
+and know which convention to follow.
+
+The tribal knowledge fits in one head.
+Until it doesn't.
+The work of writing it down
+is the work of preparing
+for the second head.
+
+### What the rejection said
+
+For weeks the error said:
+*FuelConst not yet supported.*
+
+The user had written
+`reveal_with_fuel(f, n)`.
+
+The error didn't tell them
+what they had written.
+It told them
+what we had named the thing
+they'd written.
+
+There's a translation gap
+between how compilers think
+and how users think.
+Closing it isn't always work.
+Sometimes it's just
+choosing better words.
+
+We trade out
+*FuelConst*
+for
+*`reveal_with_fuel(f, n)` not yet supported (#84).
+Workaround: use `reveal(f)` if available.*
+
+Same depth of feature.
+Different surface.
+Same severity.
+Different actionability.
+
+A user gets the same outcome —
+they can't do the thing —
+but now they know what they did,
+where the limit is,
+and what to try next.
+
+The compiler's error messages
+are the compiler's only voice
+when it doesn't understand the user.
+The voice should at least
+speak the user's language.
