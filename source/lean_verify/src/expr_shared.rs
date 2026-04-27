@@ -197,6 +197,69 @@ pub(crate) fn is_variant_node(variant: &Ident, inner: LExpr) -> ExprNode {
     LExpr::field_proj(inner, format!("is{}", variant)).node
 }
 
+// ── Reserved identifier conventions ────────────────────────────────────
+//
+// Tactus codegen produces several kinds of synthetic Lean identifiers.
+// The conventions below describe what each prefix/suffix means and
+// when to use which. A new contributor adding a gensym site or a
+// prelude def should pick the matching convention rather than invent
+// a new one.
+//
+// **Convention 1: `_tactus_<role>_<id>` prefix** — codegen-internal
+// gensyms and theorem names. Reserved by virtue of leading underscore
+// + `tactus_` prefix; Rust source can't produce these as identifiers.
+// Examples:
+//   * `_tactus_d_old_<loop_id>` — pre-body decrease snapshot per loop
+//     (`build_wp_loop`).
+//   * `_tactus_ret_<id>` — post-call ∀-bound return value
+//     (`build_call_substitutions`).
+//   * `_tactus_mut_post_<id>` — post-call existential for a `&mut`
+//     arg (`build_call_substitutions`).
+//   * `_tactus_field_<idx>` — accessor-fn body's field-extract local
+//     (`to_lean_fn::datatype_to_cmds`).
+//   * `_tactus_<kind>_<fn>_at_<loc>_<id>` — per-obligation theorem
+//     names (`build_theorem_name`).
+//
+// **Convention 2: `<x>_at_pre_tactus` SUFFIX** — pre-state references
+// for `&mut` params in callee-spec inlining. The ONLY suffix-style
+// reserved name; every other convention is a prefix. Justification:
+// the suffix preserves the original param name `x` at the start of
+// the identifier, which keeps Lean error messages readable
+// (`x_at_pre_tactus = 5` is more legible than
+// `_tactus_at_pre_x = 5`). See `varat_pre_name`.
+//
+// **Convention 3: `tactus_<name>` (no underscore prefix)** — user-
+// visible Lean tactics defined in `TactusPrelude.lean`. Users may
+// reference these in `proof { … }` blocks or via the
+// `#[verifier::tactus_tactic("…")]` attribute. Examples:
+//   `tactus_auto`, `tactus_peel`, `tactus_first`,
+//   `tactus_case_split`, `tactus_usize_bound`.
+// No leading underscore because they're meant to be human-typed.
+//
+// **Convention 4: Bare names in `TactusPrelude.lean`** — axioms /
+// defs that are user-visible but read-only. Examples:
+//   `arch_word_bits`, `arch_word_bits_valid`, `usize_hi`, `isize_hi`.
+// These look unprotected but actually can't collide with user code:
+// Tactus generates user definitions inside `namespace
+// crate.module`, while these live at top-level in TactusPrelude.
+// Lean's namespace resolution prevents the collision. Listed in
+// `sanity::name_resolves`'s allowlist so the post-codegen check
+// doesn't flag them as unresolved.
+//
+// **Gensym mechanism choice**: when generating a `_tactus_<role>_<id>`
+// name:
+//   * Use Verus's stable identifier (e.g., `StmX::Loop::id`, a
+//     `u64` per loop instance) when one is available — gives
+//     deterministic output that's stable across runs.
+//   * Fall back to `ObligationEmitter::next_id()` (per-fn
+//     monotonic counter) when no stable upstream ID exists.
+//     Theorem names are namespaced by `fn_name` so per-fn
+//     uniqueness is sufficient.
+//
+// **`sanity::name_resolves` is the canonical allowlist** for names
+// that resolve via the prelude rather than via emitted definitions.
+// Adding a new prelude def means updating the allowlist.
+
 /// Render a `VarAt(x, Pre)` reference (the post-`old(x)` form Verus
 /// uses for pre-state references in `&mut` ensures clauses) as a
 /// distinct Lean identifier.

@@ -1241,15 +1241,19 @@ fn build_call_substitutions(
         .map(|(idx, _)| sanitize(&callee.params[*idx].x.name.0))
         .collect();
 
-    // Fresh post-call name per &mut param. The `_tactus_mut_post_`
-    // prefix is reserved (won't collide with user names).
+    // Fresh post-call name per &mut param. The `_tactus_*` prefix is
+    // reserved per Convention 1 in `expr_shared.rs`'s "Reserved
+    // identifier conventions" section. `next_id()` is the per-fn
+    // counter — sufficient because theorem names are namespaced by
+    // fn_name.
     let mut mut_idx_to_fresh: HashMap<usize, String> = HashMap::new();
     for (idx, _) in mut_args {
         let id = e.next_id();
         mut_idx_to_fresh.insert(*idx, format!("_tactus_mut_post_{}", id));
     }
 
-    // Fresh ret name (gensym to avoid caller-scope collisions).
+    // Fresh ret name (gensym to avoid caller-scope collisions). Same
+    // convention as mut_post above.
     let fresh_ret_name = format!("_tactus_ret_{}", e.next_id());
 
     // Build req_subst and ens_subst from the maps above.
@@ -2328,8 +2332,13 @@ fn build_wp_loop<'a>(
     } = &stm.x else {
         unreachable!("build_wp_loop called on non-loop statement");
     };
-    // Per-loop-unique d_old name. Verus's `id: u64` is stable per
-    // loop instance, so two nested loops can never collide.
+    // Per-loop-unique d_old name. Verus's `StmX::Loop::id` is the
+    // upstream-stable identifier per loop instance — preferred over
+    // `next_id()` because it gives deterministic output across runs
+    // (the per-fn counter would too, but Loop::id is "free" and
+    // stable across fn-body refactors). See `expr_shared.rs`'s
+    // "Reserved identifier conventions" — Convention 1 + the
+    // gensym-mechanism-choice note.
     let d_old_name = format!("_tactus_d_old_{}", id);
     if !loop_isolation {
         // `loop_isolation` is set by Verus based on whether the loop
