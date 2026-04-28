@@ -929,7 +929,7 @@ Forms we accept and render, but with semantic information dropped. None of these
 * **Non-empty condition setup block** — `while` conditions that desugar into a small statement prelude (complex expressions that aren't pure).
 * **Lexicographic `decreases`** — multi-expression measures (`decreases (a, b)`). Only single-expression is accepted.
 * **`invariant_except_break` / `ensures` loop invariants** — any invariant with `at_entry: false` or `at_exit: false`. Only "true at entry AND exit" variants accepted. User's `invariant x <= n` syntax produces at_entry = at_exit = true by default, so common cases work; uncommon desugarings (e.g., from `while let Some(x) = it.next() { … }`) may hit this.
-* **Labeled `break` / `continue`** — `break 'outer;` / `continue 'outer;` rejected in `build_wp`. Unlabeled break/continue in `while` loops works via #57. Pinned by `test_exec_loop_labeled_break_rejected`.
+* **Labeled `break`** — LANDED via #88. `WpLoopCtx` carries `label: Option<String>`; `build_wp` threads a `&[&WpLoopCtx]` stack (innermost-first) instead of `Option<&WpLoopCtx>`. `StmX::BreakOrContinue { label: Some(target), .. }` searches the stack by matching label. Pinned by `test_exec_loop_labeled_break` + `test_exec_loop_labeled_break_three_deep`. Labeled `continue 'outer;` is rejected by Verus upstream without `loop_isolation(false)` (which Tactus also doesn't support); the label-stack handles it in principle.
 
 Accepted via #57: **`cond: None`** loops (the form Verus produces when lowering `while c { … break; … }` or `loop { … break; … }`). Maintain/use clauses drop the cond-gate in this case; break/continue in the body thread through `WpLoopCtx`.
 
@@ -1334,21 +1334,27 @@ exec fns."
   non-self args; param-name alignment between trait decl and
   impl).
 
-* **`break` / `continue` — LANDED (partial).** Unlabeled break /
-  continue in while-shaped loops works end-to-end.
-  `Wp::Loop::cond` is now `Option<&Exp>` — `Some` for simple
-  `while c { … }`, `None` for Verus's break-lowered form (`while
-  c { … break; … }` → `loop { if !c { break; } … }`).
-  `WpLoopCtx { break_leaf, continue_leaf }` threads through
-  `build_wp` as an `Option<&WpLoopCtx>` parameter; loop body is
-  built with this loop's leaves as innermost context.
-  `StmX::BreakOrContinue` emits `Wp::Done(leaf)` with the right
-  leaf. Still rejected: labeled break/continue (would need a
-  label-keyed stack); `invariant_except_break` / `ensures`
-  classifications (only at_entry=at_exit=true invariants accepted,
-  which matches what the user's `invariant x <= n` syntax
-  produces by default). Tests: test_exec_loop_with_break,
-  test_exec_loop_with_continue.
+* **`break` / `continue` — LANDED.** Unlabeled break/continue
+  via #57; labeled `break 'outer;` via #88. `Wp::Loop::cond` is
+  `Option<&Exp>` — `Some` for simple `while c { … }`, `None` for
+  Verus's break-lowered form (`while c { … break; … }` → `loop
+  { if !c { break; } … }`).
+  `WpLoopCtx { label, break_leaf, continue_leaf }` threads through
+  `build_wp` as a `&[&WpLoopCtx]` stack (innermost-first). Each
+  loop body extends the stack with its own ctx.
+  `StmX::BreakOrContinue { label, is_break }` emits `Wp::Done(leaf)`:
+  unlabeled resolves to `stack[0]`; labeled searches the stack
+  by `label`. Tests: `test_exec_loop_with_break`,
+  `test_exec_loop_with_continue`,
+  `test_exec_loop_labeled_break`,
+  `test_exec_loop_labeled_break_three_deep`.
+  Still rejected: labeled `continue 'outer;` (Verus upstream
+  needs `loop_isolation(false)` — which we don't support either;
+  the label-stack handles it in principle if the Verus
+  restriction is lifted); `invariant_except_break` / `ensures`
+  invariant classifications (#89; only `at_entry = at_exit = true`
+  accepted, which matches what `invariant x <= n;` produces by
+  default).
 
 ##### Ordering rationale
 
@@ -1626,6 +1632,49 @@ triage each finding (fix now / file follow-up / skip), do the
 Update this document for any caveat or deferral that surfaced.
 Typical cleanup pass: 10-30 minutes, catches 3-5 real issues even
 on code that looked fine.
+
+**Beyond the five core lenses.** A 2026-04-28 session ran
+additional review-style passes after the standard five had been
+applied — each surfaced findings the prior passes hadn't named.
+Each lens is a different question; the questions are
+non-redundant.
+
+* **Reasoning-clarity lens.** *If I came back in a month, what
+  would slow me down?* Different from "Linus hat" — not bugs or
+  smells, just code that worked but was hard to read. Surfaced
+  the `walk_call`-as-200-line-mixed-phases issue and the
+  `pick_spec_source` `_ =>` catch-all that worked but encoded
+  a brittle assumption.
+
+* **Error message quality lens.** Every `Err(...)` message
+  reviewed for the convention "answer (a) what did the user
+  write?, (b) is there a workaround?, (c) is this tracked?"
+  Surfaced 13 messages using internal type names (`FuelConst`,
+  `OpenInvariant`, etc.) instead of surface syntax (`reveal_with_
+  fuel`, `open_atomic_invariant!`). Convention now applied
+  uniformly.
+
+* **Identifier conventions lens.** Reserved-name and gensym
+  conventions had grown across sessions with no single source of
+  truth. Surfaced four conventions (`_tactus_<role>_<id>` prefix,
+  `<x>_at_pre_tactus` suffix, `tactus_<name>` for user-visible
+  tactics, bare names in TactusPrelude) plus two gensym
+  mechanisms (`StmX::Loop::id` vs `next_id()`). Documented as a
+  numbered convention list in `expr_shared.rs`'s "Reserved
+  identifier conventions" section.
+
+* **Simplify lens (reuse / quality / efficiency).** Cross-check
+  for newly-written code that could use existing helpers,
+  hidden-state smells, and missed early-return short-circuits.
+  Surfaced one pure-rename `let warnings = assume_warnings;`,
+  one over-broad `pub` visibility (`WpLoopCtx`), and one
+  efficiency issue (`rewrite_varat_for_mut_params` walked the
+  entire AST even when its set was empty — common case).
+
+The pattern: each new lens is a new *question*, not a new
+*place to look*. Review passes never reach a fixed point because
+the questions are unbounded; what you do is run enough lenses
+that the *known unknowns* are small.
 
 Canonical examples from the #50 landing's two cleanup passes:
 * *Linus hat* caught `typ_inv_exps` smuggling the asserted condition
