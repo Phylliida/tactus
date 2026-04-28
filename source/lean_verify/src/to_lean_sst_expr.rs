@@ -708,10 +708,30 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
             "Interp nodes should never escape the interpreter — internal bug, \
              please open an issue.".to_string()
         ),
+        // Internal-bug rejection. `ExpX::FuelConst(i)` is produced
+        // exclusively by `vir::recursion::rewrite_rec_call_with_fuel_const`,
+        // which is only called from `vir::expand_errors` — Verus's Z3
+        // SMT-error-expansion pipeline. Tactus doesn't traverse that
+        // pipeline (we go VIR → SST → Lean directly, never through
+        // AIR / Z3 / expand_errors), so `FuelConst` should never reach
+        // this rendering path.
+        //
+        // Hitting this arm would mean Verus's pipeline changed —
+        // either `expand_errors` started running for Tactus fns, or
+        // a new producer of `FuelConst` was added. Please open an issue.
+        //
+        // Note for users: `reveal_with_fuel(f, n)` itself is a separate
+        // VIR construct (`StmX::Fuel(..)`, handled transparently in
+        // `build_wp`) and is unrelated to `FuelConst`. In tactus_auto
+        // fns, the user-facing way to expose a spec fn body is Lean's
+        // `proof { unfold f }`, since the Verus fuel concept (Z3
+        // recursion-unrolling depth) has no analog in Lean's
+        // deterministic kernel. See DESIGN.md "reveal_with_fuel and
+        // unfold in Tactus".
         ExpX::FuelConst(_) => return Err(
-            "`reveal_with_fuel(f, n)` not yet supported in exec fns (#84). \
-             Workaround: use `reveal(f)` if available, or ensure the fn's \
-             default fuel is sufficient.".to_string()
+            "ExpX::FuelConst leaked from Verus's expand_errors / \
+             Z3 pipeline into Tactus's SST input — internal bug, \
+             please open an issue.".to_string()
         ),
     })
 }

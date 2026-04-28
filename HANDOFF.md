@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**217 end-to-end tests + 1 coverage test + 114 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**219 end-to-end tests + 1 coverage test + 114 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -606,6 +606,66 @@ tests (+21). Three real bugs surfaced + fixed. Thirteen deferral
 tasks closed (#76–80, #82–83, #85, #88, #90, #92). Nine poems
 committed across three batches.
 
+#### Current session (2026-04-29 morning — #84 FuelConst clarified)
+
+Closed #84 by establishing what was actually true: the deferrals
+catalogue described `ExpX::FuelConst(_)` as "Blocks `reveal_with_fuel`
+in exec fns," but tracing the producer-consumer chain revealed
+that `FuelConst` is generated *only* by
+`vir::recursion::rewrite_rec_call_with_fuel_const`, which is
+called *only* from `vir::expand_errors` — Verus's Z3 SMT-error-
+expansion pipeline. Tactus doesn't traverse that pipeline (we go
+VIR → SST → Lean directly). So the `FuelConst` rejection is
+structurally unreachable from the Tactus path; it's defensive
+code, not a user-feature blocker.
+
+The actual user-facing question — "how do I expose a recursive
+spec fn's body in a `tactus_auto` fn?" — has a different answer.
+`reveal_with_fuel` is a Verus-mode statement; in Tactus
+`proof { ... }` blocks hold raw Lean tactic text. The Lean idiom
+is `proof { unfold f }`, which propagates through the existing
+theorem-level tactic-prefix mechanism (see `Wp::AssertByTactus
+{ cond: None, .. }` — the same path as #49's proof-block
+implementation).
+
+**What changed:**
+- `to_lean_sst_expr.rs`'s `ExpX::FuelConst(_)` arm: rewrote from
+  a user-facing deferral error ("not yet supported (#84)") to
+  an internal-bug message naming the reachability invariant.
+  Comment block above the arm walks through the producer-consumer
+  chain so a future maintainer can re-derive the unreachability.
+- DESIGN.md "Expression-level forms rejected by
+  `sst_exp_to_ast_checked`": `ExpX::FuelConst` entry rewritten
+  with cross-reference to the new architectural section.
+- DESIGN.md new subsection "reveal_with_fuel and unfold in
+  Tactus" (under "Spec fn opacity model"): explains why Verus's
+  fuel concept doesn't translate, and what the user does
+  instead. Covers both `tactus_auto` exec fns (proof block →
+  Lean tactic) and proof fns (`by { }` body → Lean tactic).
+- 2 regression tests in `tactus.rs`:
+  - `test_exec_recursive_spec_fn_no_reveal_needed` — pins that
+    a `tactus_auto` fn referencing a recursive spec fn verifies
+    when the obligation doesn't need unfolding (no fuel/reveal
+    machinery required).
+  - `test_exec_unfold_for_recursive_spec` — pins the user-facing
+    workflow: `proof { unfold double }` propagates as a
+    theorem-level prefix, exposing the spec-fn body to
+    subsequent obligations.
+
+**Discipline note worth recording: the deferral entry was
+*describing the symptom*, not the cause.** The first instinct
+("FuelConst rejection is the bug; lift it to allow reveal_with_fuel")
+would have been wrong — there's no FuelConst arriving to lift,
+and `reveal_with_fuel` doesn't translate at all. Tracing the
+producer chain (one `Grep` for `ExpX::FuelConst` matches, then
+following the only generator) was load-bearing. Without it I'd
+have spent a day building a fuel-handling path that fired zero
+times.
+
+**Net for the morning**: 1 commit (this work bundled),
+217 → 219 e2e tests (+2). One pending task closed (#84).
+Documentation tightened.
+
 ## Architecture
 
 ### Full pipeline
@@ -1040,7 +1100,7 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 |---|---|---|
 | `cargo test -p lean_verify --lib` | 114 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking, `format_rust_loc`, lean_process |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
-| `vargo test -p rust_verify_test --test tactus` | 217 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites, trait-method calls, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break) |
+| `vargo test -p rust_verify_test --test tactus` | 219 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites, trait-method calls, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
 | `vargo build --release` (vstd) | 1530 | Regression guard: vstd proof library still verifies |
 
@@ -1153,7 +1213,7 @@ tactus/
       fn_call_to_vir.rs        ← tactus_span_from, enclosing_fn_is_tactus_auto
       rust_to_vir_expr.rs      ← Tactus proof-block synthesis (AssertBy-in-Ghost)
     rust_verify_test/tests/
-      tactus.rs                ← 217 end-to-end tests
+      tactus.rs                ← 219 end-to-end tests
       tactus_coverage.rs       ← coverage matrix test binary
     vir/src/
       ast.rs                   ← FunctionAttrs.tactic_span + tactus_auto;
@@ -1203,7 +1263,7 @@ cd lean_verify && ./scripts/setup-mathlib.sh && cd ..
 # (See DESIGN.md "Putting Lean on PATH" for the long form.)
 
 # ── Full test suite ────────────────────────────────────────────────
-# 217 end-to-end tests
+# 219 end-to-end tests
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Coverage matrix (1 test, asserts walker visits the expected variant set)
