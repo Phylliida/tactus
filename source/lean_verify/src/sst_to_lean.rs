@@ -147,7 +147,7 @@ pub type FnMap<'a> = HashMap<&'a Fun, &'a FunctionX>;
 /// function signature.
 ///
 /// Per-loop state (break / continue goal leaves) lives on `WpLoopCtx`
-/// below and is threaded as a separate `Option<&WpLoopCtx>` parameter
+/// below and is threaded as a `&[&WpLoopCtx]` stack parameter
 /// — it only applies inside a loop body, so storing it on `WpCtx`
 /// would misleadingly suggest it's always relevant.
 pub struct WpCtx<'a> {
@@ -184,14 +184,14 @@ pub struct WpCtx<'a> {
 ///   `I` since we only accept all-both invariants (at_entry = at_exit
 ///   = true). The decrease obligation doesn't apply on break — the
 ///   loop is terminating, not iterating.
-pub struct WpLoopCtx {
+struct WpLoopCtx {
     /// The loop's source-level label (`'outer: while …` →
     /// `Some("outer")`). `None` for unlabeled loops. Compared
     /// against the `label` field on `StmX::BreakOrContinue` to
     /// resolve labeled break/continue.
-    pub label: Option<String>,
-    pub break_leaf: LExpr,
-    pub continue_leaf: LExpr,
+    label: Option<String>,
+    break_leaf: LExpr,
+    continue_leaf: LExpr,
 }
 
 impl<'a> WpCtx<'a> {
@@ -1052,6 +1052,12 @@ fn rewrite_varat_for_mut_params(
     expr: &Expr,
     mut_param_names: &std::collections::HashSet<String>,
 ) -> Expr {
+    // Short-circuit: callees without &mut params (the common case)
+    // don't need any rewriting. `map_expr_visitor` would otherwise
+    // walk + clone the whole tree for nothing.
+    if mut_param_names.is_empty() {
+        return expr.clone();
+    }
     map_expr_visitor(expr, &|e: &Expr| {
         if let ExprX::VarAt(ident, VarAt::Pre) = &e.x {
             let raw_name = sanitize(&ident.0);
