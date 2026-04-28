@@ -141,7 +141,7 @@ pub(crate) fn clip_coercion_head(src_int: bool, dst_int: bool) -> Option<&'stati
 /// (same-side) returns the expression unchanged.
 pub(crate) fn apply_clip_coercion(src_int: bool, dst_int: bool, inner: LExpr) -> LExpr {
     match clip_coercion_head(src_int, dst_int) {
-        Some(head) => LExpr::app1(LExpr::var(head), inner),
+        Some(head) => LExpr::app1(LExpr::var_lit(head), inner),
         None => inner,
     }
 }
@@ -175,11 +175,15 @@ pub(crate) fn ctor_node(
                 sanitize(variant)
             };
             let head = format!("{}.{}", type_name, variant_seg);
+            // Constructor heads are dotted Lean names like `MyType.Variant`.
+            // They're path-derived (not VarIdent), but the path has already
+            // been sanitized via `lean_name`. `synthetic` wraps verbatim.
+            let head_name = crate::lean_name::LeanName::synthetic(head);
             if rendered_fields.is_empty() {
-                ExprNode::Var(head)
+                ExprNode::Var(head_name)
             } else {
                 ExprNode::App {
-                    head: Box::new(LExpr::var(head)),
+                    head: Box::new(LExpr::var(head_name)),
                     args: rendered_fields,
                 }
             }

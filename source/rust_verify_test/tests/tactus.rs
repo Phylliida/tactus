@@ -4812,7 +4812,7 @@ test_verify_one_file! {
             let mut i: i8 = 0;
             loop
                 invariant_except_break i <= 9
-                invariant 0 <= i && i <= 10
+                invariant 0 <= i <= 10
                 ensures 1 <= i
                 decreases 10 - i
             {
@@ -4839,7 +4839,7 @@ test_verify_one_file! {
             let mut i: i8 = 10;
             loop
                 invariant_except_break i <= 9
-                invariant 0 <= i && i <= 10
+                invariant 0 <= i <= 10
                 ensures 1 <= i
                 decreases 10 - i
             {
@@ -4859,17 +4859,13 @@ test_verify_one_file! {
 // `invariant` (both); the test exercises all three flag
 // combinations in one loop.
 //
-// Note on chained vs `&&` syntax: avoiding Verus's chained
-// `0 <= i <= 10` form. It goes through ast_simplify's
-// `temp_var` path, producing N temporary VarIdents that all
-// share the base name `tmp%%` and shadow each other when our
-// `sanitize` collapses the `%`s without including the
-// disambiguator's id. Avoiding the chained form sidesteps the
-// shadowing entirely. Tracked as a known limitation; the fix
-// would be a `sanitize` variant that includes the disambiguator
-// id, but that has wider consequences for binder/var-ref
-// matching across the renderer (revisit when chained-compare
-// in tactus_auto fns gets exercised in real code).
+// Uses the chained `0 <= i <= 10` syntax — the `LeanName`
+// typed-name refactor (#99) made VarIdent → name conversions
+// disambiguator-aware throughout the renderer, so the synthetic
+// temps from `ast_simplify::temp_var` no longer shadow each
+// other. Pre-#99 this test had to use `&&` to sidestep the
+// shadowing (which silently lowered the conjunction to `True`
+// — a soundness hole).
 test_verify_one_file! {
     #[test] test_exec_loop_ensures_only verus_code! {
         #[verifier::tactus_auto]
@@ -4879,7 +4875,7 @@ test_verify_one_file! {
             let mut i: i8 = 0;
             loop
                 invariant_except_break i <= 9
-                invariant 0 <= i && i <= 10
+                invariant 0 <= i <= 10
                 ensures 1 <= i
                 decreases 10 - i
             {
@@ -4891,6 +4887,40 @@ test_verify_one_file! {
             i
         }
     } => Ok(())
+}
+
+// #99 regression: chained comparisons (`0 <= i <= 10`) in
+// tactus_auto fn specs lower correctly with disambiguator-
+// aware `LeanName::from_var_ident`.
+//
+// Pre-#99: ast_simplify created N temp VarIdents with base
+// name `tmp%%` (different VirRenumbered ids) for the chained
+// form. Our renderer used `sanitize(&v.0)` which lost the
+// disambiguator, collapsing them all to `tmp__`. Nested let-
+// bindings shadowed each other, and the body's `tmp__ ≤ tmp__
+// ∧ tmp__ ≤ tmp__` reduced (via Lean's let-evaluation) to a
+// trivially-true `10 ≤ 10 ∧ 10 ≤ 10` — the proof obligation
+// silently disappeared.
+//
+// This test passes a deliberately-violated chained compare
+// in the requires (with `i = 50`, `0 <= i < 10` is false) and
+// expects the precondition to fire — confirming the temps
+// stay distinct and the body's `tmp_a ≤ tmp_b ∧ tmp_b < tmp_c`
+// retains its semantics through to Lean's elaborator.
+test_verify_one_file! {
+    #[test] test_exec_chained_compare_distinct_temps verus_code! {
+        #[verifier::tactus_auto]
+        fn helper(i: i32)
+            requires 0 <= i < 10
+        {
+        }
+
+        #[verifier::tactus_auto]
+        fn caller()
+        {
+            helper(50);  // FAILS: i=50 doesn't satisfy 0 <= i < 10
+        }
+    } => Err(_)
 }
 
 // Loop `ensures` violated at the break point — negative test.
@@ -4905,7 +4935,7 @@ test_verify_one_file! {
         {
             let mut i: i8 = 0;
             loop
-                invariant 0 <= i && i <= 10
+                invariant 0 <= i <= 10
                 ensures i == 100
                 decreases 10 - i
             {

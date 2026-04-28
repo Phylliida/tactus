@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**226 end-to-end tests + 1 coverage test + 114 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**227 end-to-end tests + 1 coverage test + 118 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -810,6 +810,107 @@ within scope.
 **Net for late morning**: 1 commit, 222 → 226 e2e tests (+4),
 one pending task closed (#89). Down to 8 pending tasks.
 
+#### Current session (2026-04-29 afternoon — #99 typed LeanName refactor)
+
+The chained-compare hole from #89 — where Verus's
+`ast_simplify::temp_var` produced N synthetic temps with the
+same base name `tmp%%` and our `sanitize` collapsed them all
+to `tmp__`, silently lowering chained `0 <= i <= 10` to
+`True` via Lean's let-shadowing — is now closed at the type
+level. Closes #99.
+
+**The fix: typed `LeanName` newtype.** A newtype with no
+`From<String>` / `From<&str>` impl, only constructable via
+explicit constructors:
+- `LeanName::from_var_ident(&VarIdent)` — canonical for any
+  VarIdent → name conversion. Always includes the
+  disambiguator's id when needed (synthetic-prefix names like
+  `tmp%%`, `tmp%`, `expand%`); user-named locals (`i`, `count`,
+  no `%` in source name) keep their natural names.
+- `LeanName::from_path(&Path)` — VIR `Path` → dotted Lean name.
+- `LeanName::lit(&str)` — hardcoded prelude refs (`"Nat"`,
+  `"omega"`, `"Int.toNat"`).
+- `LeanName::synthetic(impl Into<String>)` — codegen-generated
+  names (gensyms, `_tactus_*` prefixes, `h_<i>` hypothesis
+  names).
+- `LeanName::from_field(&str)` — struct/enum field names that
+  arrive as `&str` from VIR.
+
+`ExprNode::Var(LeanName)`, `ExprNode::Let { name: LeanName,
+.. }`, `Binder { name: Option<LeanName>, .. }`,
+`Pattern::Var(LeanName)`, `Pattern::Binding { name: LeanName,
+.. }` enforce at compile time that any name flowing into the
+AST came from one of the explicit constructors. A future
+contributor can't accidentally write `ExprNode::Var(sanitize(&v.0))`
+— that's a type error.
+
+**What's NOT migrated to LeanName:** top-level command names
+(`Def.name`, `Theorem.name`, etc.) and field-name-shaped
+strings (`FieldProj.field`, `Pattern::Ctor.name`,
+`StructUpdate` keys). Those are codegen-synthesized or
+path-derived and don't have shadowing concerns.
+
+**Convenience constructors on `LExpr`:**
+- `LExpr::var(LeanName)` — strict
+- `LExpr::var_lit(&str)` — wraps in `lit` (literal Lean ref)
+- `LExpr::var_synthetic(impl Into<String>)` — wraps in
+  `synthetic` (already-processed name)
+- Same pattern for `let_bind` / `let_bind_synthetic`
+
+The two convenience constructors keep call sites readable for
+the common cases (literal references and pre-processed
+strings) while the strict `var(LeanName)` form is what the AST
+actually requires.
+
+**What landed:**
+- `lean_name.rs`: new module with `LeanName` newtype + 5
+  constructors. 4 unit tests pinning user-var-no-suffix,
+  synthetic-temp-disambiguated, lean-keyword-quoted,
+  lit-unchanged.
+- `lean_ast.rs`: `Var`, `Let.name`, `Binder.name`,
+  `Pattern::Var`, `Pattern::Binding.name` migrated to
+  `LeanName`. `substitute` / `strip_span_marks` /
+  `collect_free_vars` updated to use `as_str()` for keying.
+- All 5 renderers (`to_lean_type`, `to_lean_expr`,
+  `to_lean_sst_expr`, `to_lean_fn`, `sst_to_lean`) updated
+  to go through `LeanName::*` constructors at every name-
+  conversion site. ~80 call sites total.
+- `sanity.rs`, `lean_pp.rs`: updated to call `as_str()` on
+  LeanName for HashSet keying / output.
+- One regression test added: `test_exec_chained_compare_distinct_temps`
+  pins that chained `0 <= i < 10` doesn't silently lower to
+  `True` (uses a deliberately-violated chained compare and
+  expects the precondition obligation to fire).
+- Restored chained syntax in `test_exec_loop_ensures_only`,
+  `test_exec_loop_ensures_fails`, `test_exec_loop_invariant_except_break`
+  (had been changed to `&&` form during #89 to sidestep the
+  shadowing).
+
+**Discipline note worth recording:** the refactor cascaded
+through ~75 call sites across 5 files. The work was
+mechanical but the *type system carried the cost* — every
+site that previously passed a `String` to an AST constructor
+became a compile error pointing at exactly where the choice
+of constructor (lit / synthetic / from_var_ident / from_path)
+needed to be made. Half-done refactors couldn't compile,
+which is exactly the property that made the original sanity-
+check / runtime-detection approach fragile. The compiler
+itself enforces the invariant now.
+
+The 4 i16/i32/i64/i128 tests caught the ONE remaining
+inconsistency I missed (`build_call_substitutions` was using
+`sanitize(&p.x.name.0)` for the subst key while the body's
+var refs went through `from_var_ident`). Once the test
+suite was green, we know every site agrees.
+
+**Net for the afternoon**: 1 scaffolding commit (lean_name
+module + poems) + 1 big refactor commit. 226 → 227 e2e tests
+(+1 chained-compare regression). 4 unit tests added (+4 →
+118). One pending task closed (#99). Most importantly: the
+soundness hole that "was indistinguishable from no fix when
+the bug is about consistency across sites" is now
+type-system-prevented.
+
 ## Architecture
 
 ### Full pipeline
@@ -1244,7 +1345,7 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 |---|---|---|
 | `cargo test -p lean_verify --lib` | 114 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking, `format_rust_loc`, lean_process |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
-| `vargo test -p rust_verify_test --test tactus` | 226 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites, trait-method calls, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures) |
+| `vargo test -p rust_verify_test --test tactus` | 227 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites, trait-method calls, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
 | `vargo build --release` (vstd) | 1530 | Regression guard: vstd proof library still verifies |
 
@@ -1357,7 +1458,7 @@ tactus/
       fn_call_to_vir.rs        ← tactus_span_from, enclosing_fn_is_tactus_auto
       rust_to_vir_expr.rs      ← Tactus proof-block synthesis (AssertBy-in-Ghost)
     rust_verify_test/tests/
-      tactus.rs                ← 226 end-to-end tests
+      tactus.rs                ← 227 end-to-end tests
       tactus_coverage.rs       ← coverage matrix test binary
     vir/src/
       ast.rs                   ← FunctionAttrs.tactic_span + tactus_auto;
@@ -1407,7 +1508,7 @@ cd lean_verify && ./scripts/setup-mathlib.sh && cd ..
 # (See DESIGN.md "Putting Lean on PATH" for the long form.)
 
 # ── Full test suite ────────────────────────────────────────────────
-# 226 end-to-end tests
+# 227 end-to-end tests
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Coverage matrix (1 test, asserts walker visits the expected variant set)

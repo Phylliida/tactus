@@ -2,6 +2,7 @@
 
 use vir::ast::{Dt, IntRange, Path, Typ, TypX};
 use crate::lean_ast::{BinOp, Expr, ExprNode};
+use crate::lean_name::LeanName;
 
 /// Canonical VIR-type → Lean-AST translator.
 pub fn typ_to_expr(typ: &TypX) -> Expr {
@@ -23,25 +24,28 @@ pub(crate) fn peel_typ_wrappers(typ: &Typ) -> &Typ {
 }
 
 fn typ_to_node(typ: &TypX) -> ExprNode {
-    // Helper: build `App { head: Var(name), args }`.
+    // Helper: build `App { head: Var(LeanName::lit(name)), args }`.
+    // Type-position names (`Int`, `Prop`, `Array`, etc.) are hardcoded
+    // Lean type constructors — the `lit` constructor is correct here.
     let applied = |name: &str, args: Vec<Expr>| {
         if args.is_empty() {
-            ExprNode::Var(name.to_string())
+            ExprNode::Var(LeanName::lit(name))
         } else {
             ExprNode::App {
-                head: Box::new(Expr::new(ExprNode::Var(name.to_string()))),
+                head: Box::new(Expr::new(ExprNode::Var(LeanName::lit(name)))),
                 args,
             }
         }
     };
+    let lit_var = |s: &str| ExprNode::Var(LeanName::lit(s));
     match typ {
-        TypX::Bool => ExprNode::Var("Prop".into()),
-        TypX::Int(range) => ExprNode::Var(match range {
+        TypX::Bool => lit_var("Prop"),
+        TypX::Int(range) => lit_var(match range {
             // Fixed-width u-types and i-types render as `Int` so that
             // their spec-mode subtraction is mathematical (can go
             // negative); `HasType` bounds then catch underflow.
             IntRange::Int | IntRange::I(_) | IntRange::ISize
-            | IntRange::U(_) => "Int".into(),
+            | IntRange::U(_) => "Int",
             // `nat` maps directly to Lean `Nat` — matching semantics.
             // `USize` stays `Nat` too (rather than `Int`) because
             // Verus elides `as nat` casts from `usize` in spec
@@ -53,9 +57,12 @@ fn typ_to_node(typ: &TypX) -> ExprNode {
             // the subtraction-truncation risk that motivated u8→Int
             // exists here but is rare in practice for usize and
             // accepted as a known gap pending a deeper fix.
-            IntRange::Nat | IntRange::USize | IntRange::Char => "Nat".into(),
+            IntRange::Nat | IntRange::USize | IntRange::Char => "Nat",
         }),
-        TypX::TypParam(name) => ExprNode::Var(name.to_string()),
+        // Type parameter names are user-named generic params (`A`, `T`,
+        // etc.). They come from VIR as plain `Ident`, no disambiguator —
+        // emit via `lit` since they're already valid identifiers.
+        TypX::TypParam(name) => ExprNode::Var(LeanName::lit(name.as_str())),
         TypX::Boxed(inner) => typ_to_node(inner),
         TypX::Datatype(dt, args, _) => match dt {
             Dt::Path(path) => applied(&lean_name(path), args.iter().map(|a| typ_to_expr(a)).collect()),
@@ -63,7 +70,7 @@ fn typ_to_node(typ: &TypX) -> ExprNode {
             // Zero-element → `Unit`; single-element → the element itself
             // (Verus doesn't produce 1-tuples, but handle it defensively).
             Dt::Tuple(_) => match args.len() {
-                0 => ExprNode::Var("Unit".into()),
+                0 => lit_var("Unit"),
                 1 => typ_to_node(&args[0]),
                 _ => {
                     let mut iter = args.iter().rev();
@@ -121,16 +128,16 @@ fn typ_to_node(typ: &TypX) -> ExprNode {
             applied(head, type_args)
         }
         TypX::ConstInt(n) => ExprNode::Lit(n.to_string()),
-        TypX::ConstBool(b) => ExprNode::Var(if *b { "true".into() } else { "false".into() }),
-        TypX::Real => ExprNode::Var("Real".into()),
-        TypX::Float(_) => ExprNode::Var("Float".into()),
-        TypX::TypeId => ExprNode::Var("Nat".into()),
+        TypX::ConstBool(b) => lit_var(if *b { "true" } else { "false" }),
+        TypX::Real => lit_var("Real"),
+        TypX::Float(_) => lit_var("Float"),
+        TypX::TypeId => lit_var("Nat"),
         TypX::FnDef(_, typs, _) => {
             // Zero-sized identifier type → `Unit` (possibly paired with
             // extra type args for disambiguation as `Unit × T₁ × T₂ …`).
             // `×` is right-associative, so folding from the right gives
             // the pp the shape Lean expects without defensive parens.
-            let mut out = Expr::new(ExprNode::Var("Unit".into()));
+            let mut out = Expr::new(lit_var("Unit"));
             for t in typs.iter() {
                 out = Expr::new(ExprNode::BinOp {
                     op: BinOp::Prod,
@@ -157,7 +164,7 @@ fn typ_to_node(typ: &TypX) -> ExprNode {
         TypX::Opaque { def_path, args } => {
             applied(&lean_name(def_path), args.iter().map(|a| typ_to_expr(a)).collect())
         }
-        TypX::PointeeMetadata(_) => ExprNode::Var("Nat".into()),
+        TypX::PointeeMetadata(_) => lit_var("Nat"),
         TypX::MutRef(inner) => typ_to_node(inner),
         TypX::Air(_) => panic!("TypX::Air should not appear in Tactus translation"),
     }
