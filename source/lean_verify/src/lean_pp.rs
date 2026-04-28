@@ -587,11 +587,14 @@ fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
             out.push(']');
         }
 
-        ExprNode::Index { base, idx } => {
+        ExprNode::Index { base, idx, bang } => {
             write_expr(out, base, PREC_ATOM, lm);
             out.push('[');
             write_expr(out, idx, 0, lm);
             out.push(']');
+            if *bang {
+                out.push('!');
+            }
         }
 
         ExprNode::Anon(elts) => {
@@ -848,6 +851,7 @@ mod tests {
         let idx = Expr::new(ExprNode::Index {
             base: Box::new(var("xs")),
             idx: Box::new(lit(0)),
+            bang: false,
         });
         let apply_f = Expr::new(ExprNode::App {
             head: Box::new(var("f")),

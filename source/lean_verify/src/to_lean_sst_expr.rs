@@ -471,11 +471,38 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 return Ok(cmp.node);
             }
             match op {
-                BinaryOp::Index(_, _) => {
-                    return Err(
-                        "array/slice indexing (`a[i]`) not yet supported in \
-                         exec fns (#91)".to_string()
-                    );
+                BinaryOp::Index(_kind, _bounds) => {
+                    // `a[i]` in exec fns. The SST guarantees
+                    // `BoundsCheck::Allow` (the bounds obligation is
+                    // discharged separately by Verus's mode pass), so we
+                    // don't emit a precondition theorem here — we just
+                    // render the indexing operation.
+                    //
+                    // Lean's `xs[i]!` notation handles both `Array α`
+                    // (Verus arrays — `[T; N]`) and `List α` (Verus
+                    // slices — `&[T]`) via the `GetElem` typeclass with
+                    // `getElem!` — total in the type system, panics
+                    // out-of-bounds. The panic is observationally fine:
+                    // Tactus only verifies the goal, never executes the
+                    // generated Lean. Out-of-bounds is unspecified, which
+                    // matches Verus's "spec is total but unspecified
+                    // out-of-bounds" model. Requires `[Inhabited α]`,
+                    // which holds for primitives and for non-generic
+                    // user datatypes (we already emit `deriving Inhabited`
+                    // — see DESIGN.md "Non-int decreases").
+                    //
+                    // The index in `array_index(a, i)` is Verus's `int`
+                    // (lowers to Lean `Int`), but `getElem!` wants `Nat`.
+                    // Coerce via `Int.toNat`. For an `Int` index that's
+                    // already non-negative (always true under
+                    // `BoundsCheck::Allow`), `Int.toNat` is identity.
+                    let (l, r) = (sst_exp_to_ast_checked(lhs)?, sst_exp_to_ast_checked(rhs)?);
+                    let r_nat = LExpr::app(LExpr::var("Int.toNat".to_string()), vec![r]);
+                    return Ok(ExprNode::Index {
+                        base: Box::new(l),
+                        idx: Box::new(r_nat),
+                        bang: true,
+                    });
                 }
                 BinaryOp::StrGetChar => {
                     return Err(

@@ -106,7 +106,19 @@ fn typ_to_node(typ: &TypX) -> ExprNode {
                 vir::ast::Primitive::Ptr => "USize",
                 vir::ast::Primitive::Global => "Unit",
             };
-            applied(head, args.iter().map(|a| typ_to_expr(a)).collect())
+            // Lean's `Array α` and `List α` are unary type
+            // constructors; Verus's `[T; N]` carries `[T, N]` as args
+            // (element type + const-length), and we drop the length
+            // because Lean has no length-indexed Array. Bounds are
+            // tracked separately via spec-level `len()` queries.
+            // Slice has just `[T]`, but applying defensively for both.
+            let type_args: Vec<_> = match prim {
+                vir::ast::Primitive::Array | vir::ast::Primitive::Slice => {
+                    args.iter().take(1).map(|a| typ_to_expr(a)).collect()
+                }
+                _ => args.iter().map(|a| typ_to_expr(a)).collect(),
+            };
+            applied(head, type_args)
         }
         TypX::ConstInt(n) => ExprNode::Lit(n.to_string()),
         TypX::ConstBool(b) => ExprNode::Var(if *b { "true".into() } else { "false".into() }),

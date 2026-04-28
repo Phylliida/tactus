@@ -339,9 +339,12 @@ pub enum ExprNode {
     /// `[a, b, c]` array literal.
     ArrayLit(Vec<Expr>),
 
-    /// `base[idx]` — array/slice indexing as a dedicated form so pp can
-    /// parenthesize the base against application precedence.
-    Index { base: Box<Expr>, idx: Box<Expr> },
+    /// `base[idx]` or `base[idx]!` — array/slice indexing as a dedicated form
+    /// so pp can parenthesize the base against application precedence.
+    /// `bang: true` emits Lean's panic-on-out-of-bounds variant
+    /// (`getElem!`, requires `Inhabited`); `false` emits plain `[idx]`
+    /// which Lean elaborates with an inferred bounds proof.
+    Index { base: Box<Expr>, idx: Box<Expr>, bang: bool },
 
     /// `⟨a, b, c⟩` — Lean's anonymous constructor. Used for tuples and for
     /// inferred data constructors where the target type is unambiguous.
@@ -635,9 +638,10 @@ fn strip_span_marks_node(node: &ExprNode) -> ExprNode {
             updates: updates.iter().map(|(f, e)| (f.clone(), strip_span_marks(e))).collect(),
         },
         ExprNode::ArrayLit(es) => ExprNode::ArrayLit(es.iter().map(strip_span_marks).collect()),
-        ExprNode::Index { base, idx } => ExprNode::Index {
+        ExprNode::Index { base, idx, bang } => ExprNode::Index {
             base: Box::new(strip_span_marks(base)),
             idx: Box::new(strip_span_marks(idx)),
+            bang: *bang,
         },
         ExprNode::Anon(es) => ExprNode::Anon(es.iter().map(strip_span_marks).collect()),
     }
@@ -750,9 +754,10 @@ fn substitute_impl(
         ExprNode::ArrayLit(es) => ExprNode::ArrayLit(
             es.iter().map(|e| substitute_impl(e, subst)).collect()
         ),
-        ExprNode::Index { base, idx } => ExprNode::Index {
+        ExprNode::Index { base, idx, bang } => ExprNode::Index {
             base: Box::new(substitute_impl(base, subst)),
             idx: Box::new(substitute_impl(idx, subst)),
+            bang: *bang,
         },
         ExprNode::Anon(es) => ExprNode::Anon(
             es.iter().map(|e| substitute_impl(e, subst)).collect()
@@ -892,7 +897,7 @@ fn collect_free_vars(
         ExprNode::ArrayLit(es) | ExprNode::Anon(es) => {
             for e in es { collect_free_vars(e, bound, out); }
         }
-        ExprNode::Index { base, idx } => {
+        ExprNode::Index { base, idx, bang: _ } => {
             collect_free_vars(base, bound, out);
             collect_free_vars(idx, bound, out);
         }
@@ -1303,11 +1308,13 @@ mod substitute_tests {
         let e = Expr::new(ExprNode::Index {
             base: Box::new(var("base")),
             idx: Box::new(var("i")),
+            bang: false,
         });
         let s = subst_of(&[("base", var("arr")), ("i", lit(0))]);
         let expected = Expr::new(ExprNode::Index {
             base: Box::new(var("arr")),
             idx: Box::new(lit(0)),
+            bang: false,
         });
         assert!(node_eq(&substitute(&e, &s), &expected));
     }
