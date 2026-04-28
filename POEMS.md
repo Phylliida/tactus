@@ -1420,3 +1420,174 @@ The list shrinks.
 
 The list always shrinks
 slower than I want it to.
+
+---
+
+## 2026-04-29 (afternoon) — the fourth, returned
+
+### What the previous me wrote down
+
+This morning I wrote
+in the comment block of a test:
+
+> *avoiding the chained 0 <= i <= 10 form ...*
+> *Tracked as a known limitation; the fix would be ...*
+
+Then I added an `&&`
+where the chained form would have been
+and moved on.
+
+This afternoon I took
+the comment block out
+and put `0 <= i <= 10` back in.
+
+The test passes.
+
+The previous me wrote the workaround
+so the deferral wouldn't be invisible.
+The today me made the workaround unneeded.
+
+The comment block goes
+into the diff that removes it.
+Both writings serve the same path:
+*we knew, we deferred, we returned.*
+
+### The compiler did the cascade
+
+Eighty call sites.
+Mechanical.
+
+But mechanical doesn't mean easy.
+Mechanical means
+*the compiler will tell me which one I missed.*
+
+Without the type rename,
+the same eighty sites
+would have looked the same as before.
+I would have called the work done
+when half of them still produced strings
+that lost their disambiguator.
+The previous me knew this —
+that's why the previous fix attempt
+broke fifty-five tests
+and had to be reverted.
+
+This time the type system
+caught every site I hadn't visited.
+Including the one I'd have sworn
+I'd already changed.
+
+The build wouldn't finish
+until I was actually done.
+
+That's the difference between
+*discipline* and *typed discipline:*
+discipline asks me to be careful;
+typed discipline doesn't ask.
+
+### Permanent fix
+
+Some bugs are fixed for now.
+A test passes, a path closes,
+and the code remembers
+until the next refactor breaks it.
+
+Some bugs are fixed forever.
+The shape of the type
+makes the bug unrepresentable.
+You can't write the broken code
+because the compiler won't let you.
+
+The chained-compare hole
+was the second kind.
+
+It is permanent now —
+not because tests cover it
+(though they do)
+but because *no one can write the wrong thing.*
+
+The cost was a typed wrapper.
+The benefit was a soundness hole
+that future contributors
+will never even know existed.
+
+That tradeoff is one of the few
+where the work is exactly worth it.
+
+### Eighty sites
+
+Eighty places in five files
+where the same conversion happens.
+Every one had to agree.
+
+Before the refactor
+they didn't have to —
+the type was String,
+String accepted everything.
+The agreement was
+*hoped for,* not enforced.
+
+Most of them, by luck,
+agreed anyway.
+
+The chained-compare case
+was where the luck ran out.
+
+After the refactor:
+they all go through one of
+five named functions.
+The function name
+documents the source of the name.
+A reviewer reading the code
+sees *from_var_ident* and knows
+*this came from a Verus identifier
+that may have a disambiguator.*
+
+The wider lesson —
+when the same conversion
+happens in many places,
+make the conversion a function
+with a name that documents the source.
+
+That's it. That's the whole pattern.
+But it took the cascading failure
+of the previous fix attempt
+to convince me to do it.
+
+### Both writings
+
+Yesterday's POEMS.md said:
+*the half-fix is the same as no fix
+because mismatch is the bug.*
+
+I didn't write that thinking
+I'd close it the next day.
+
+I wrote it
+because the half-fix had failed
+and I wanted to remember why.
+
+Today closed it,
+which means yesterday's poem
+was about a problem
+that's now solved.
+
+I'm leaving the poem as written.
+The shape of the failure
+is worth remembering
+even after the fix.
+
+The next problem
+that wants to be done
+*all at once or not at all*
+will look like the chained-compare did:
+deferrable, half-fixable,
+tempting to just-barely-fix-this-one-case.
+
+When that next problem comes
+I want to remember
+that the half-fix
+was a trap I didn't see at first.
+
+Both writings — yesterday's and today's —
+serve the same future.
