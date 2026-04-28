@@ -7,10 +7,31 @@
 //! `Tactic::Raw` and `Command::Raw` are escape hatches for user-authored
 //! tactic bodies and the verbatim prelude.
 //!
-//! Identifier strings passed to `Var`, `name` fields, etc., are assumed to
-//! already be valid Lean identifiers (sanitized of `%` / `@` / `#`, dotted
-//! path separators preserved, keywords optionally quoted with `«…»`). Name
-//! construction is the caller's responsibility — see `to_lean_type::lean_name`.
+//! ## Names
+//!
+//! Variable-bearing nodes (`Var`, `Let.name`, `Binder.name`, pattern
+//! bindings) hold a [`LeanName`] rather than a raw `String`. `LeanName` is
+//! a newtype with no `From<String>` impl — the only way to construct one
+//! is through an explicit constructor in `lean_name.rs`:
+//!
+//! * [`LeanName::from_var_ident`] — for VarIdent → name (always includes
+//!   the disambiguator id; this is the chained-compare-shadowing fix).
+//! * [`LeanName::from_path`] / [`LeanName::from_path_short`] — for VIR
+//!   `Path` → dotted Lean name.
+//! * [`LeanName::lit`] — for hardcoded prelude refs (`"Nat"`, `"omega"`).
+//! * [`LeanName::synthetic`] — for codegen-generated names.
+//! * [`LeanName::from_field`] — for struct/enum field-name strings that
+//!   arrive as `&str` from VIR.
+//!
+//! The compiler enforces: any VarIdent → name conversion that flows into
+//! `ExprNode::Var(LeanName)` must go through `from_var_ident`. A future
+//! contributor can't accidentally `ExprNode::Var(sanitize(&v.0))` (that's
+//! a type error). See the `lean_name` module docs for the soundness story.
+//!
+//! Top-level command names (`Def.name`, `Theorem.name`, etc.) and
+//! field-name-shaped `String`s (`FieldProj.field`, `Pattern::Ctor.name`,
+//! `StructUpdate` keys) stay `String` — those are codegen-synthesized or
+//! path-derived and don't have the same shadowing concerns.
 //!
 //! See `lean_pp.rs` for how these nodes render.
 //!
@@ -162,7 +183,7 @@ pub struct InstanceMethod {
 #[derive(Debug, Clone)]
 pub struct Binder {
     /// `None` for purely instance-style bracket binders like `[Ring T]`.
-    pub name: Option<String>,
+    pub name: Option<crate::lean_name::LeanName>,
     pub ty: Expr,
     pub kind: BinderKind,
 }
@@ -206,8 +227,24 @@ impl Expr {
     // `eq`, `lt`, `le`, `gt`, `ge`, `add`, `sub`, `mul`). Unary ops get
     // `not` and `neg`.
 
-    pub fn var(name: impl Into<String>) -> Self {
-        Expr::new(ExprNode::Var(name.into()))
+    pub fn var(name: crate::lean_name::LeanName) -> Self {
+        Expr::new(ExprNode::Var(name))
+    }
+    /// Convenience for hardcoded literal Lean identifiers (`"Nat"`,
+    /// `"omega"`, `"Int.toNat"`). Wraps the string in `LeanName::lit`
+    /// internally — caller guarantees the string is a valid Lean
+    /// identifier already (no special chars to sanitize, no
+    /// disambiguation needed).
+    pub fn var_lit(name: &str) -> Self {
+        Expr::new(ExprNode::Var(crate::lean_name::LeanName::lit(name)))
+    }
+    /// Convenience for already-processed name strings (path-derived
+    /// names from `lean_name(&path)`, sanitized synthetic temps, etc.).
+    /// Wraps in `LeanName::synthetic` — the caller is asserting the
+    /// string is a valid Lean identifier. Use `var(LeanName::from_var_ident(v))`
+    /// when constructing from a VarIdent.
+    pub fn var_synthetic(name: impl Into<String>) -> Self {
+        Expr::new(ExprNode::Var(crate::lean_name::LeanName::synthetic(name)))
     }
     pub fn lit_bool(b: bool) -> Self { Expr::new(ExprNode::LitBool(b)) }
     pub fn lit_true() -> Self { Expr::lit_bool(true) }
@@ -252,9 +289,17 @@ impl Expr {
     /// `head arg` — shorthand for the common unary-application case.
     pub fn app1(head: Expr, arg: Expr) -> Self { Expr::app(head, vec![arg]) }
 
-    pub fn let_bind(name: impl Into<String>, value: Expr, body: Expr) -> Self {
+    pub fn let_bind(name: crate::lean_name::LeanName, value: Expr, body: Expr) -> Self {
         Expr::new(ExprNode::Let {
-            name: name.into(),
+            name,
+            value: Box::new(value),
+            body: Box::new(body),
+        })
+    }
+    /// Convenience for already-processed name strings. See [`Expr::var_synthetic`].
+    pub fn let_bind_synthetic(name: impl Into<String>, value: Expr, body: Expr) -> Self {
+        Expr::new(ExprNode::Let {
+            name: crate::lean_name::LeanName::synthetic(name),
             value: Box::new(value),
             body: Box::new(body),
         })
@@ -297,8 +342,10 @@ impl Expr {
 #[derive(Debug, Clone)]
 pub enum ExprNode {
     /// Simple identifier (possibly dotted, like `List.length`).
-    /// Caller is responsible for having already sanitized segments.
-    Var(String),
+    /// `LeanName` enforces that the name went through one of the
+    /// explicit constructors — `from_var_ident` for VarIdent-derived
+    /// names, `lit` for hardcoded prelude refs, etc.
+    Var(crate::lean_name::LeanName),
     /// Integer literal as a string (supports big ints). Leading `-` means
     /// negative; pp will parenthesize negatives.
     Lit(String),
@@ -313,7 +360,7 @@ pub enum ExprNode {
     App { head: Box<Expr>, args: Vec<Expr> },
 
     /// `let name := value; body`. Lean's goal-type let.
-    Let { name: String, value: Box<Expr>, body: Box<Expr> },
+    Let { name: crate::lean_name::LeanName, value: Box<Expr>, body: Box<Expr> },
     Lambda { binders: Vec<Binder>, body: Box<Expr> },
     Forall { binders: Vec<Binder>, body: Box<Expr> },
     Exists { binders: Vec<Binder>, body: Box<Expr> },
@@ -502,13 +549,16 @@ pub struct MatchArm {
 
 #[derive(Debug, Clone)]
 pub enum Pattern {
-    Var(String),
+    Var(crate::lean_name::LeanName),
     Wildcard,
     /// `Name arg1 arg2 …`. Used for both data constructors and nested patterns.
+    /// `name` stays `String` — it's the constructor name (e.g.,
+    /// `MyType.Variant`), path-derived and not subject to VarIdent
+    /// shadowing.
     Ctor { name: String, args: Vec<Pattern> },
     Or(Box<Pattern>, Box<Pattern>),
     /// `name@pattern`.
-    Binding { name: String, sub: Box<Pattern> },
+    Binding { name: crate::lean_name::LeanName, sub: Box<Pattern> },
     /// Literal patterns (integers, strings, etc.). Reuses `ExprNode` literals.
     Lit(ExprNode),
 }
@@ -577,7 +627,7 @@ pub fn strip_span_marks(expr: &Expr) -> Expr {
 fn strip_span_marks_node(node: &ExprNode) -> ExprNode {
     match node {
         ExprNode::SpanMark { inner, .. } => strip_span_marks_node(&inner.node),
-        ExprNode::Var(s) => ExprNode::Var(s.clone()),
+        ExprNode::Var(n) => ExprNode::Var(n.clone()),
         ExprNode::Lit(s) => ExprNode::Lit(s.clone()),
         ExprNode::LitBool(b) => ExprNode::LitBool(*b),
         ExprNode::LitStr(s) => ExprNode::LitStr(s.clone()),
@@ -652,7 +702,7 @@ fn substitute_impl(
     subst: &std::collections::HashMap<String, Expr>,
 ) -> Expr {
     let node = match &expr.node {
-        ExprNode::Var(name) => match subst.get(name) {
+        ExprNode::Var(name) => match subst.get(name.as_str()) {
             Some(replacement) => return replacement.clone(),
             None => ExprNode::Var(name.clone()),
         },
@@ -676,8 +726,8 @@ fn substitute_impl(
         },
         ExprNode::Let { name, value, body } => {
             let new_value = substitute_impl(value, subst);
-            let inner_subst = subst_without(subst, name);
-            check_capture_lazy(&[name], &inner_subst, body, "let");
+            let inner_subst = subst_without(subst, name.as_str());
+            check_capture_lazy(&[name.as_str()], &inner_subst, body, "let");
             ExprNode::Let {
                 name: name.clone(),
                 value: Box::new(new_value),
@@ -687,7 +737,7 @@ fn substitute_impl(
         ExprNode::Lambda { binders, body } => {
             let inner_subst = subst_remove_binders(subst, binders);
             let binder_names: Vec<&str> = binders.iter()
-                .filter_map(|b| b.name.as_deref())
+                .filter_map(|b| b.name.as_ref().map(|n| n.as_str()))
                 .collect();
             check_capture_lazy(&binder_names, &inner_subst, body, "lambda");
             ExprNode::Lambda {
@@ -698,7 +748,7 @@ fn substitute_impl(
         ExprNode::Forall { binders, body } => {
             let inner_subst = subst_remove_binders(subst, binders);
             let binder_names: Vec<&str> = binders.iter()
-                .filter_map(|b| b.name.as_deref())
+                .filter_map(|b| b.name.as_ref().map(|n| n.as_str()))
                 .collect();
             check_capture_lazy(&binder_names, &inner_subst, body, "forall");
             ExprNode::Forall {
@@ -709,7 +759,7 @@ fn substitute_impl(
         ExprNode::Exists { binders, body } => {
             let inner_subst = subst_remove_binders(subst, binders);
             let binder_names: Vec<&str> = binders.iter()
-                .filter_map(|b| b.name.as_deref())
+                .filter_map(|b| b.name.as_ref().map(|n| n.as_str()))
                 .collect();
             check_capture_lazy(&binder_names, &inner_subst, body, "exists");
             ExprNode::Exists {
@@ -832,7 +882,7 @@ fn subst_remove_binders(
 ) -> std::collections::HashMap<String, Expr> {
     let mut out = subst.clone();
     for b in binders {
-        if let Some(n) = &b.name { out.remove(n); }
+        if let Some(n) = &b.name { out.remove(n.as_str()); }
     }
     out
 }
@@ -844,7 +894,7 @@ fn collect_free_vars(
 ) {
     match &expr.node {
         ExprNode::Var(n) => {
-            if !bound.contains(n) { out.insert(n.clone()); }
+            if !bound.contains(n.as_str()) { out.insert(n.as_str().to_string()); }
         }
         ExprNode::Lit(_) | ExprNode::LitBool(_) | ExprNode::LitStr(_)
         | ExprNode::LitChar(_) | ExprNode::Raw(_) => {}
@@ -860,7 +910,7 @@ fn collect_free_vars(
         ExprNode::Let { name, value, body } => {
             collect_free_vars(value, bound, out);
             let mut inner = bound.clone();
-            inner.insert(name.clone());
+            inner.insert(name.as_str().to_string());
             collect_free_vars(body, &inner, out);
         }
         ExprNode::Lambda { binders, body }
@@ -868,7 +918,7 @@ fn collect_free_vars(
         | ExprNode::Exists { binders, body } => {
             let mut inner = bound.clone();
             for b in binders {
-                if let Some(n) = &b.name { inner.insert(n.clone()); }
+                if let Some(n) = &b.name { inner.insert(n.as_str().to_string()); }
             }
             collect_free_vars(body, &inner, out);
         }
@@ -913,7 +963,7 @@ fn pattern_bound_names(pat: &Pattern) -> Vec<String> {
 
 fn pattern_bound_names_impl(pat: &Pattern, out: &mut Vec<String>) {
     match pat {
-        Pattern::Var(n) => out.push(n.clone()),
+        Pattern::Var(n) => out.push(n.as_str().to_string()),
         Pattern::Wildcard | Pattern::Lit(_) => {}
         Pattern::Ctor { args, .. } => {
             for a in args { pattern_bound_names_impl(a, out); }
@@ -923,7 +973,7 @@ fn pattern_bound_names_impl(pat: &Pattern, out: &mut Vec<String>) {
             pattern_bound_names_impl(r, out);
         }
         Pattern::Binding { name, sub } => {
-            out.push(name.clone());
+            out.push(name.as_str().to_string());
             pattern_bound_names_impl(sub, out);
         }
     }
@@ -961,20 +1011,22 @@ mod substitute_tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn var(n: &str) -> Expr { Expr::new(ExprNode::Var(n.to_string())) }
+    use crate::lean_name::LeanName;
+
+    fn var(n: &str) -> Expr { Expr::new(ExprNode::Var(LeanName::lit(n))) }
     fn lit(n: i64) -> Expr { Expr::new(ExprNode::Lit(n.to_string())) }
     fn add(l: Expr, r: Expr) -> Expr {
         Expr::new(ExprNode::BinOp { op: BinOp::Add, lhs: Box::new(l), rhs: Box::new(r) })
     }
     fn let_bind(name: &str, val: Expr, body: Expr) -> Expr {
         Expr::new(ExprNode::Let {
-            name: name.to_string(), value: Box::new(val), body: Box::new(body),
+            name: LeanName::lit(name), value: Box::new(val), body: Box::new(body),
         })
     }
     fn forall(binder_name: &str, body: Expr) -> Expr {
         Expr::new(ExprNode::Forall {
             binders: vec![Binder {
-                name: Some(binder_name.to_string()),
+                name: Some(LeanName::lit(binder_name)),
                 ty: var("Int"),
                 kind: BinderKind::Explicit,
             }],
@@ -984,7 +1036,7 @@ mod substitute_tests {
     fn exists(binder_name: &str, body: Expr) -> Expr {
         Expr::new(ExprNode::Exists {
             binders: vec![Binder {
-                name: Some(binder_name.to_string()),
+                name: Some(LeanName::lit(binder_name)),
                 ty: var("Int"),
                 kind: BinderKind::Explicit,
             }],
@@ -994,7 +1046,7 @@ mod substitute_tests {
     fn lambda(binder_name: &str, body: Expr) -> Expr {
         Expr::new(ExprNode::Lambda {
             binders: vec![Binder {
-                name: Some(binder_name.to_string()),
+                name: Some(LeanName::lit(binder_name)),
                 ty: var("Int"),
                 kind: BinderKind::Explicit,
             }],
@@ -1221,7 +1273,7 @@ mod substitute_tests {
                 MatchArm {
                     pattern: Pattern::Ctor {
                         name: "Some".to_string(),
-                        args: vec![Pattern::Var("x".to_string())],
+                        args: vec![Pattern::Var(LeanName::lit("x"))],
                     },
                     body: add(var("x"), var("y")),
                 },
@@ -1342,12 +1394,12 @@ mod substitute_tests {
         let e = Expr::new(ExprNode::Forall {
             binders: vec![
                 Binder {
-                    name: Some("x".to_string()),
+                    name: Some(LeanName::lit("x")),
                     ty: var("Int"),
                     kind: BinderKind::Explicit,
                 },
                 Binder {
-                    name: Some("y".to_string()),
+                    name: Some(LeanName::lit("y")),
                     ty: var("Int"),
                     kind: BinderKind::Explicit,
                 },
@@ -1374,12 +1426,12 @@ mod substitute_tests {
         let e = Expr::new(ExprNode::Forall {
             binders: vec![
                 Binder {
-                    name: Some("x".to_string()),
+                    name: Some(LeanName::lit("x")),
                     ty: var("Int"),
                     kind: BinderKind::Explicit,
                 },
                 Binder {
-                    name: Some("y".to_string()),
+                    name: Some(LeanName::lit("y")),
                     ty: var("Int"),
                     kind: BinderKind::Explicit,
                 },
@@ -1401,12 +1453,12 @@ mod substitute_tests {
         let e = Expr::new(ExprNode::Forall {
             binders: vec![
                 Binder {
-                    name: Some("x".to_string()),
+                    name: Some(LeanName::lit("x")),
                     ty: var("Int"),
                     kind: BinderKind::Explicit,
                 },
                 Binder {
-                    name: Some("y".to_string()),
+                    name: Some(LeanName::lit("y")),
                     ty: var("Int"),
                     kind: BinderKind::Explicit,
                 },

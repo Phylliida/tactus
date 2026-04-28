@@ -376,7 +376,7 @@ fn write_binders(out: &mut String, binders: &[Binder], lm: &mut Landmarks) {
         };
         out.push(lo);
         if let Some(name) = &b.name {
-            out.push_str(name);
+            out.push_str(name.as_str());
             out.push_str(" : ");
         }
         if matches!(b.kind, BinderKind::OutParam) {
@@ -431,7 +431,7 @@ fn write_expr(out: &mut String, e: &Expr, parent_prec: u16, lm: &mut Landmarks) 
 
 fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
     match node {
-        ExprNode::Var(s) => out.push_str(s),
+        ExprNode::Var(s) => out.push_str(s.as_str()),
         ExprNode::Lit(s) => {
             if s.starts_with('-') {
                 out.push('(');
@@ -503,7 +503,7 @@ fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
 
         ExprNode::Let { name, value, body } => {
             out.push_str("let ");
-            out.push_str(name);
+            out.push_str(name.as_str());
             out.push_str(" := ");
             write_expr(out, value, 0, lm);
             out.push_str(";\n    ");
@@ -640,7 +640,7 @@ fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
 
 fn write_pattern(out: &mut String, p: &Pattern, lm: &mut Landmarks) {
     match p {
-        Pattern::Var(s) => out.push_str(s),
+        Pattern::Var(s) => out.push_str(s.as_str()),
         Pattern::Wildcard => out.push('_'),
         Pattern::Ctor { name, args } => {
             out.push_str(name);
@@ -658,7 +658,7 @@ fn write_pattern(out: &mut String, p: &Pattern, lm: &mut Landmarks) {
             write_pattern(out, r, lm);
         }
         Pattern::Binding { name, sub } => {
-            out.push_str(name);
+            out.push_str(name.as_str());
             out.push('@');
             write_pattern(out, sub, lm);
         }
@@ -670,7 +670,7 @@ fn write_pattern(out: &mut String, p: &Pattern, lm: &mut Landmarks) {
 mod tests {
     use super::*;
 
-    fn var(s: &str) -> Expr { Expr::new(ExprNode::Var(s.into())) }
+    fn var(s: &str) -> Expr { Expr::new(ExprNode::Var(crate::lean_name::LeanName::lit(s))) }
     fn lit(n: i64) -> Expr { Expr::new(ExprNode::Lit(n.to_string())) }
     fn bin(op: BinOp, l: Expr, r: Expr) -> Expr {
         Expr::new(ExprNode::BinOp { op, lhs: Box::new(l), rhs: Box::new(r) })
@@ -786,7 +786,7 @@ mod tests {
             attrs: vec!["irreducible".into()],
             name: "double".into(),
             binders: vec![Binder {
-                name: Some("x".into()),
+                name: Some(crate::lean_name::LeanName::lit("x")),
                 ty: var("Nat"),
                 kind: BinderKind::Explicit,
             }],
@@ -803,7 +803,7 @@ mod tests {
         let t = Theorem {
             name: "foo".into(),
             binders: vec![Binder {
-                name: Some("x".into()),
+                name: Some(crate::lean_name::LeanName::lit("x")),
                 ty: var("Nat"),
                 kind: BinderKind::Explicit,
             }],
@@ -899,7 +899,7 @@ mod tests {
             attrs: vec![],
             name: "f".into(),
             binders: vec![Binder {
-                name: Some("n".into()), ty: var("Nat"), kind: BinderKind::Explicit,
+                name: Some(crate::lean_name::LeanName::lit("n")), ty: var("Nat"), kind: BinderKind::Explicit,
             }],
             ret_ty: var("Nat"),
             body: var("n"),

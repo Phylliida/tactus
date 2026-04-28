@@ -104,7 +104,7 @@ pub fn integer_type_bound_node(kind: &IntegerTypeBoundKind, bits: u32) -> ExprNo
             // only know `arch_word_bits = 32 ∨ arch_word_bits = 64`; that
             // disjunction is available as the `arch_word_bits_valid`
             // axiom if a proof needs to case-split.
-            LExpr::var("arch_word_bits").node
+            LExpr::var_lit("arch_word_bits").node
         }
         _ => integer_type_bound_lit(kind.clone(), bits).node,
     }
@@ -212,14 +212,14 @@ pub fn type_bound_predicate(e: &LExpr, ty: &Typ) -> Option<LExpr> {
             ))
         }
         IntRange::USize => {
-            let hi = LExpr::var("usize_hi");
+            let hi = LExpr::var_lit("usize_hi");
             Some(LExpr::and(
                 LExpr::le(LExpr::lit_int("0"), e.clone()),
                 LExpr::lt(e.clone(), hi),
             ))
         }
         IntRange::ISize => {
-            let hi = LExpr::var("isize_hi");
+            let hi = LExpr::var_lit("isize_hi");
             Some(LExpr::and(
                 LExpr::le(LExpr::neg(hi.clone()), e.clone()),
                 LExpr::lt(e.clone(), hi),
@@ -282,7 +282,7 @@ fn clip_to_node_checked(src: &Typ, dst: &IntRange, inner: &Exp) -> Result<ExprNo
     };
     let rendered = sst_exp_to_ast_checked(inner)?;
     Ok(match clip_coercion_head(renders_as_lean_int(src_range), renders_as_lean_int(dst)) {
-        Some(head) => LExpr::app1(LExpr::var(head), rendered).node,
+        Some(head) => LExpr::app1(LExpr::var_lit(head), rendered).node,
         None => rendered.node,
     })
 }
@@ -324,7 +324,7 @@ fn render_checked_decrease_arg(e: &Exp) -> Result<LExpr, String> {
                     std::collections::HashMap::new();
                 for b in binders.iter() {
                     subst.insert(
-                        crate::to_lean_type::sanitize(&b.name.0),
+                        crate::lean_name::LeanName::from_var_ident(&b.name).into_string(),
                         sst_exp_to_ast_checked(&b.a)?,
                     );
                 }
@@ -341,10 +341,10 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
     Ok(match &e.x {
         ExpX::Const(c) => const_to_node_checked(c)?,
         ExpX::Var(ident) | ExpX::VarLoc(ident) | ExpX::VarAt(ident, _) => {
-            ExprNode::Var(sanitize(&ident.0))
+            ExprNode::Var(crate::lean_name::LeanName::from_var_ident(ident))
         }
         ExpX::StaticVar(fun) | ExpX::ExecFnByName(fun) => {
-            ExprNode::Var(lean_name(&fun.path))
+            ExprNode::Var(crate::lean_name::LeanName::from_path(&fun.path))
         }
 
         ExpX::Unary(UnaryOp::Not, inner) => LExpr::not(sst_exp_to_ast_checked(inner)?).node,
@@ -453,8 +453,8 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                         ));
                     }
                     let head = format!("{}.height", lean_name(lp));
-                    let lh = LExpr::app(LExpr::var(head.clone()), vec![l]);
-                    let rh = LExpr::app(LExpr::var(head), vec![r]);
+                    let lh = LExpr::app(LExpr::var_synthetic(head.clone()), vec![l]);
+                    let rh = LExpr::app(LExpr::var_synthetic(head), vec![r]);
                     (lh, rh)
                 } else {
                     return Err(format!(
@@ -497,7 +497,7 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                     // already non-negative (always true under
                     // `BoundsCheck::Allow`), `Int.toNat` is identity.
                     let (l, r) = (sst_exp_to_ast_checked(lhs)?, sst_exp_to_ast_checked(rhs)?);
-                    let r_nat = LExpr::app(LExpr::var("Int.toNat".to_string()), vec![r]);
+                    let r_nat = LExpr::app(LExpr::var_lit("Int.toNat"), vec![r]);
                     return Ok(ExprNode::Index {
                         base: Box::new(l),
                         idx: Box::new(r_nat),
@@ -544,7 +544,7 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 // Routed through the shared `non_binop_head` table so
                 // the head string stays in sync with the VIR-AST
                 // renderer.
-                None => LExpr::app(LExpr::var(non_binop_head(op)), vec![l, r]).node,
+                None => LExpr::app(LExpr::var_lit(non_binop_head(op)), vec![l, r]).node,
             }
         }
         ExpX::BinaryOpr(BinaryOpr::ExtEq(_, _), lhs, rhs) => {
@@ -560,7 +560,7 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
         ExpX::Call(CallFun::Fun(fun, _), typs, args)
         | ExpX::Call(CallFun::Recursive(fun), typs, args) => {
             let head = LExpr::app(
-                LExpr::var(lean_name(&fun.path)),
+                LExpr::var(crate::lean_name::LeanName::from_path(&fun.path)),
                 typs.iter().map(|t| typ_to_expr(t)).collect(),
             );
             let rendered_args: Result<Vec<_>, _> = args.iter()
@@ -622,7 +622,7 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 //   T.height cur < T.height prev
                 //     ∨ (T.height cur = T.height prev ∧ otherwise)
                 let height_name = format!("{}.height", lean_name(path));
-                let apply_height = |x: LExpr| LExpr::app1(LExpr::var(&height_name), x);
+                let apply_height = |x: LExpr| LExpr::app1(LExpr::var_synthetic(height_name.clone()), x);
                 let cur_h = apply_height(cur);
                 let prev_h = apply_height(prev);
                 let lt_branch = LExpr::lt(cur_h.clone(), prev_h.clone());
@@ -659,7 +659,7 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 // unwraps to a plain Vec for the fold.
                 let rendered_binders = binders.iter()
                     .map(|b| sst_exp_to_ast_checked(&b.a)
-                        .map(|val| (sanitize(&b.name.0), val)))
+                        .map(|val| (crate::lean_name::LeanName::from_var_ident(&b.name), val)))
                     .collect::<Result<Vec<_>, _>>()?;
                 let body_rendered = sst_exp_to_ast_checked(body)?;
                 // Nest single-variable lets right-to-left so each binder is
@@ -689,7 +689,7 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                     binders: vir_var_binders_to_ast(binders),
                     body: Box::new(LExpr::and(cond_ast, body_ast)),
                 });
-                LExpr::app1(LExpr::var("Classical.epsilon"), lambda).node
+                LExpr::app1(LExpr::var_lit("Classical.epsilon"), lambda).node
             }
         },
 

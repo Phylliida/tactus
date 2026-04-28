@@ -20,7 +20,7 @@ pub fn vir_expr_to_ast(expr: &Expr) -> LExpr {
 /// Each becomes an explicit `(name : Type)` binder.
 pub(crate) fn vir_var_binders_to_ast(binders: &VarBinders<Typ>) -> Vec<LBinder> {
     binders.iter().map(|b| LBinder {
-        name: Some(sanitize(b.name.0.as_str())),
+        name: Some(crate::lean_name::LeanName::from_var_ident(&b.name)),
         ty: typ_to_expr(&b.a),
         kind: BinderKind::Explicit,
     }).collect()
@@ -30,17 +30,19 @@ pub(crate) fn vir_var_binders_to_ast(binders: &VarBinders<Typ>) -> Vec<LBinder> 
 
 // Local aliases delegating to `LExpr`'s smart constructors. Keep the
 // short names around — most call sites read better as `var("Real")` or
-// `apply("Int.floor", …)` than as the longer chained form.
-fn var(name: impl Into<String>) -> LExpr { LExpr::var(name) }
+// `apply("Int.floor", …)` than as the longer chained form. These
+// take `&str` and produce `lit`-typed `LeanName`s, since they're for
+// hardcoded prelude / Mathlib references.
+fn var(name: &str) -> LExpr { LExpr::var_lit(name) }
 
 fn apply(head: &str, args: Vec<LExpr>) -> ExprNode {
-    LExpr::app(LExpr::var(head), args).node
+    LExpr::app(LExpr::var_lit(head), args).node
 }
 
 fn expr_to_node(expr: &Expr) -> ExprNode {
     match &expr.x {
         ExprX::Const(c) => const_to_node(c),
-        ExprX::Var(ident) => ExprNode::Var(sanitize(&ident.0)),
+        ExprX::Var(ident) => ExprNode::Var(crate::lean_name::LeanName::from_var_ident(ident)),
         // `VarAt(x, Pre)` collapses to `Var(x)` for the general path
         // (non-mut params, loop ensures' at-entry refs, etc. — these
         // are correct because the AT-entry value equals the current
@@ -49,10 +51,10 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
         // synthetic distinct name BEFORE this renderer runs, so the
         // substitution map can target pre- and post-state separately.
         // See `walk_call` and `varat_pre_name` for the full picture.
-        ExprX::VarAt(ident, _) => ExprNode::Var(sanitize(&ident.0)),
-        ExprX::VarLoc(ident) => ExprNode::Var(sanitize(&ident.0)),
-        ExprX::ConstVar(fun, _) => ExprNode::Var(lean_name(&fun.path)),
-        ExprX::StaticVar(fun) | ExprX::ExecFnByName(fun) => ExprNode::Var(lean_name(&fun.path)),
+        ExprX::VarAt(ident, _) => ExprNode::Var(crate::lean_name::LeanName::from_var_ident(ident)),
+        ExprX::VarLoc(ident) => ExprNode::Var(crate::lean_name::LeanName::from_var_ident(ident)),
+        ExprX::ConstVar(fun, _) => ExprNode::Var(crate::lean_name::LeanName::from_path(&fun.path)),
+        ExprX::StaticVar(fun) | ExprX::ExecFnByName(fun) => ExprNode::Var(crate::lean_name::LeanName::from_path(&fun.path)),
 
         ExprX::Binary(op, lhs, rhs) => {
             let (l, r) = (vir_expr_to_ast(lhs), vir_expr_to_ast(rhs));
@@ -60,7 +62,7 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
                 Some(l_op) => LExpr::binop(l_op, l, r).node,
                 // Non-structural: emit as `head lhs rhs` via App so the pp
                 // layer handles precedence and spans flow through normally.
-                None => LExpr::app(LExpr::var(non_binop_head(op)), vec![l, r]).node,
+                None => LExpr::app(LExpr::var_lit(non_binop_head(op)), vec![l, r]).node,
             }
         }
 
@@ -91,7 +93,7 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
             vec![vir_expr_to_ast(inner)],
         ),
         ExprX::Unary(UnaryOp::IntToReal, inner) => {
-            LExpr::type_annot(vir_expr_to_ast(inner), LExpr::var("Real")).node
+            LExpr::type_annot(vir_expr_to_ast(inner), LExpr::var_lit("Real")).node
         }
         ExprX::Unary(UnaryOp::RealToInt, inner) => apply(
             "Int.floor",
@@ -127,7 +129,7 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
                 binders: vir_var_binders_to_ast(params),
                 body: Box::new(vir_expr_to_ast(cond)),
             });
-            LExpr::app1(LExpr::var("Classical.epsilon"), lambda).node
+            LExpr::app1(LExpr::var_lit("Classical.epsilon"), lambda).node
         }
 
         ExprX::WithTriggers { body, .. } => expr_to_node(body),
@@ -229,7 +231,7 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
             ExprNode::Raw(String::new())
         }
         ExprX::Nondeterministic => {
-            LExpr::app1(LExpr::var("Classical.arbitrary"), LExpr::var("_")).node
+            LExpr::app1(LExpr::var_lit("Classical.arbitrary"), LExpr::var_lit("_")).node
         }
 
         // Exec-mode forms — VIR mode checker guarantees these don't appear
@@ -255,7 +257,7 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
         // inlining (#55). For this arm: render the inner unchanged.
         ExprX::Old(e) | ExprX::EvalAndResolve(_, e) => expr_to_node(e),
         ExprX::BorrowMut(_) | ExprX::TwoPhaseBorrowMut(_)
-        | ExprX::BorrowMutTracked(_) => ExprNode::Var("()".into()),
+        | ExprX::BorrowMutTracked(_) => ExprNode::Var(crate::lean_name::LeanName::lit("()")),
         ExprX::ImplicitReborrowOrSpecRead(place, _, _) => place_to_expr(&place.x).node,
     }
 }
@@ -361,10 +363,10 @@ fn ctor_to_node(dt: &Dt, variant: &Ident, fields: &Binders<Expr>) -> ExprNode {
 fn block_to_node(stmts: &[Stmt], final_expr: Option<&Expr>) -> ExprNode {
     let body = match final_expr {
         Some(e) => vir_expr_to_ast(e),
-        None if stmts.is_empty() => LExpr::new(ExprNode::Var("()".into())),
+        None if stmts.is_empty() => LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("()"))),
         // No final expression — the last stmt's value is the block's value.
         // In spec mode this is unusual; fall back to unit.
-        None => LExpr::new(ExprNode::Var("()".into())),
+        None => LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("()"))),
     };
 
     let mut folded = body;
@@ -374,11 +376,11 @@ fn block_to_node(stmts: &[Stmt], final_expr: Option<&Expr>) -> ExprNode {
                 let value = match init {
                     Some(place) => place_to_expr(&place.x),
                     // No initializer (e.g., `let x;`) — give a placeholder.
-                    None => LExpr::new(ExprNode::Var("_".into())),
+                    None => LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("_"))),
                 };
                 match &pattern.x {
                     PatternX::Var(binding) => LExpr::new(ExprNode::Let {
-                        name: sanitize(&binding.name.0),
+                        name: crate::lean_name::LeanName::from_var_ident(&binding.name),
                         value: Box::new(value),
                         body: Box::new(folded),
                     }),
@@ -392,7 +394,7 @@ fn block_to_node(stmts: &[Stmt], final_expr: Option<&Expr>) -> ExprNode {
                 }
             }
             StmtX::Expr(e) => LExpr::new(ExprNode::Let {
-                name: "_".to_string(),
+                name: crate::lean_name::LeanName::lit("_"),
                 value: Box::new(vir_expr_to_ast(e)),
                 body: Box::new(folded),
             }),
@@ -406,7 +408,7 @@ fn block_to_node(stmts: &[Stmt], final_expr: Option<&Expr>) -> ExprNode {
 pub(crate) fn pattern_to_ast(pat: &PatternX) -> LPattern {
     match pat {
         PatternX::Wildcard(_) => LPattern::Wildcard,
-        PatternX::Var(binding) => LPattern::Var(sanitize(&binding.name.0)),
+        PatternX::Var(binding) => LPattern::Var(crate::lean_name::LeanName::from_var_ident(&binding.name)),
         PatternX::Constructor(dt, variant, pats) => {
             let name = match dt {
                 Dt::Path(path) => {
@@ -429,7 +431,7 @@ pub(crate) fn pattern_to_ast(pat: &PatternX) -> LPattern {
             Box::new(pattern_to_ast(&r.x)),
         ),
         PatternX::Binding { binding, sub_pat } => LPattern::Binding {
-            name: sanitize(&binding.name.0),
+            name: crate::lean_name::LeanName::from_var_ident(&binding.name),
             sub: Box::new(pattern_to_ast(&sub_pat.x)),
         },
         PatternX::Expr(e) => LPattern::Lit(expr_to_node(e)),
@@ -450,7 +452,7 @@ pub(crate) fn pattern_to_ast(pat: &PatternX) -> LPattern {
 
 fn place_to_expr(place: &PlaceX) -> LExpr {
     LExpr::new(match place {
-        PlaceX::Local(ident) => ExprNode::Var(sanitize(&ident.0)),
+        PlaceX::Local(ident) => ExprNode::Var(crate::lean_name::LeanName::from_var_ident(ident)),
         PlaceX::Field(field_opr, base) => ExprNode::FieldProj {
             expr: Box::new(place_to_expr(&base.x)),
             field: field_access_name(field_opr),

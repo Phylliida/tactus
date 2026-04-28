@@ -498,7 +498,7 @@ pub fn format_span_loc(span: &Span) -> String {
 enum CtxFrame {
     /// `let x := v;` wrapping. The walker pushes this at every
     /// `Wp::Let` (or while peeling a `Bind(Let)` inside a let-RHS).
-    Let(String, LExpr),
+    Let(crate::lean_name::LeanName, LExpr),
     /// `P →` wrapping. Pushed for assumes, branch conditions, and
     /// assertions that already passed (the asserted condition
     /// becomes a hypothesis for the rest of the body).
@@ -1006,7 +1006,7 @@ fn walk_loop<'a>(
     // shadowing across nested loops, even if a future refactor
     // changes scope structure.
     maintain_obl.frames.push(CtxFrame::Let(
-        d_old_name.to_string(),
+        crate::lean_name::LeanName::synthetic(d_old_name),
         sst_exp_to_ast(decrease),
     ));
     walk_obligations(body, ctx, &maintain_obl, e);
@@ -1040,7 +1040,11 @@ fn push_mod_var_frames<'a>(
     modified_vars: &[(&'a VarIdent, &'a Typ)],
 ) {
     for (ident, typ) in modified_vars {
-        let name = sanitize(&ident.0);
+        // Modified-var binders carry the user's local-var VarIdent
+        // verbatim. `from_var_ident` is the canonical entry point; it
+        // includes the disambiguator id when needed (synthetic temps),
+        // and falls through to plain `sanitize` for user-named locals.
+        let name = crate::lean_name::LeanName::from_var_ident(ident);
         obl.frames.push(CtxFrame::Binder(LBinder {
             name: Some(name.clone()),
             ty: typ_to_expr(typ),
@@ -1243,13 +1247,15 @@ struct CallSubstitutions {
     mut_param_names: HashSet<String>,
     /// Fresh post-state name per `&mut` param, indexed by
     /// `callee.params` position. Used both in `ens_subst` and as
-    /// the ∀-binder name in the post-call frames.
-    mut_idx_to_fresh: HashMap<usize, String>,
+    /// the ∀-binder name in the post-call frames. `synthetic`-typed
+    /// because gensym'd via `_tactus_mut_post_<id>` — already a
+    /// valid Lean identifier, no sanitization needed.
+    mut_idx_to_fresh: HashMap<usize, crate::lean_name::LeanName>,
     /// Fresh name for the callee's return value. Used as the
     /// ∀-binder name in post-call frames; substituted in the
     /// ensures rendering. Avoids shadowing caller-scope locals
     /// that happen to share the callee's source ret name.
-    fresh_ret_name: String,
+    fresh_ret_name: crate::lean_name::LeanName,
 }
 
 /// Build the substitution maps and fresh names for a call site.
@@ -1284,21 +1290,25 @@ fn build_call_substitutions(
     // identifier conventions" section. `next_id()` is the per-fn
     // counter — sufficient because theorem names are namespaced by
     // fn_name.
-    let mut mut_idx_to_fresh: HashMap<usize, String> = HashMap::new();
+    let mut mut_idx_to_fresh: HashMap<usize, crate::lean_name::LeanName> = HashMap::new();
     for (idx, _) in mut_args {
         let id = e.next_id();
-        mut_idx_to_fresh.insert(*idx, format!("_tactus_mut_post_{}", id));
+        mut_idx_to_fresh.insert(*idx, crate::lean_name::LeanName::synthetic(format!("_tactus_mut_post_{}", id)));
     }
 
     // Fresh ret name (gensym to avoid caller-scope collisions). Same
     // convention as mut_post above.
-    let fresh_ret_name = format!("_tactus_ret_{}", e.next_id());
+    let fresh_ret_name = crate::lean_name::LeanName::synthetic(format!("_tactus_ret_{}", e.next_id()));
 
     // Build req_subst and ens_subst from the maps above.
     let mut req_subst: HashMap<String, LExpr> = typ_subst.clone();
     let mut ens_subst: HashMap<String, LExpr> = typ_subst.clone();
     for (i, p) in callee.params.iter().enumerate() {
-        let pname = sanitize(&p.x.name.0);
+        // Subst keys must match what `to_lean_expr::vir_expr_to_ast`
+        // produces for `ExprX::Var(p.name)` — i.e., go through the
+        // canonical `LeanName::from_var_ident` (includes the
+        // disambiguator id when needed).
+        let pname = crate::lean_name::LeanName::from_var_ident(&p.x.name).into_string();
         // Requires: same map for mut and non-mut (only pre-state exists).
         req_subst.insert(pname.clone(), arg_lexprs[i].clone());
         if p.x.is_mut {
@@ -1314,8 +1324,8 @@ fn build_call_substitutions(
         }
     }
     // Callee's ret name → fresh_ret_name in ensures.
-    let ret_orig_name = sanitize(&callee.ret.x.name.0);
-    if ret_orig_name != fresh_ret_name {
+    let ret_orig_name = crate::lean_name::LeanName::from_var_ident(&callee.ret.x.name).into_string();
+    if ret_orig_name != fresh_ret_name.as_str() {
         ens_subst.insert(ret_orig_name, LExpr::var(fresh_ret_name.clone()));
     }
 
@@ -1441,7 +1451,7 @@ fn push_post_call_frames(
     for (idx, caller_var) in mut_args {
         let fresh = subst.mut_idx_to_fresh.get(idx).unwrap();
         new_obl.frames.push(CtxFrame::Let(
-            sanitize(&caller_var.0),
+            crate::lean_name::LeanName::from_var_ident(caller_var),
             LExpr::var(fresh.clone()),
         ));
     }
@@ -1449,7 +1459,7 @@ fn push_post_call_frames(
     // Phase 5: dest binding for the call's return (`let r = foo(…)`).
     if let Some(dest_ident) = dest {
         new_obl.frames.push(CtxFrame::Let(
-            sanitize(&dest_ident.0),
+            crate::lean_name::LeanName::from_var_ident(dest_ident),
             LExpr::var(subst.fresh_ret_name.clone()),
         ));
     }
@@ -1466,7 +1476,7 @@ fn push_post_call_frames(
 /// position values), specialized for the walker's per-
 /// obligation emission.
 fn walk_let<'a>(
-    name: &'a str,
+    name: &crate::lean_name::LeanName,
     val: &'a Exp,
     body: &Wp<'a>,
     ctx: &WpCtx<'a>,
@@ -1496,7 +1506,7 @@ fn walk_let<'a>(
                     let mut chain_obl = obl.clone();
                     for b in bs.iter() {
                         chain_obl.frames.push(CtxFrame::Let(
-                            sanitize(&b.name.0),
+                            crate::lean_name::LeanName::from_var_ident(&b.name),
                             sst_exp_to_ast(&b.a),
                         ));
                     }
@@ -1510,7 +1520,7 @@ fn walk_let<'a>(
     // Plain let with no peelable structure — push the let frame
     // and continue walking the body.
     let new_obl = obl.with_frame(CtxFrame::Let(
-        sanitize(name), sst_exp_to_ast(val),
+        name.clone(), sst_exp_to_ast(val),
     ));
     walk_obligations(body, ctx, &new_obl, e);
 }
@@ -1544,13 +1554,15 @@ fn build_param_binders(fn_sst: &FunctionSst) -> Vec<LBinder> {
     // binder shape for the same fn signature.
     for tp in fn_sst.x.typ_params.iter() {
         out.push(LBinder {
-            name: Some(tp.to_string()),
-            ty: LExpr::var("Type"),
+            // Type parameter names are user-named generics (`T`, `A`).
+            // No disambiguator; emit via `lit`.
+            name: Some(crate::lean_name::LeanName::lit(tp.as_str())),
+            ty: LExpr::var_lit("Type"),
             kind: BinderKind::Explicit,
         });
     }
     for p in fn_sst.x.pars.iter().filter(|p| !is_synthetic_param(p)) {
-        let name = sanitize(&p.x.name.0);
+        let name = crate::lean_name::LeanName::from_var_ident(&p.x.name);
         out.push(LBinder {
             name: Some(name.clone()),
             ty: typ_to_expr(&p.x.typ),
@@ -1558,7 +1570,10 @@ fn build_param_binders(fn_sst: &FunctionSst) -> Vec<LBinder> {
         });
         if let Some(pred) = type_bound_predicate(&LExpr::var(name.clone()), &p.x.typ) {
             out.push(LBinder {
-                name: Some(format!("h_{}_bound", name)),
+                // `h_<name>_bound` is a synthesized hypothesis name —
+                // already a valid Lean identifier, no further
+                // sanitization needed.
+                name: Some(crate::lean_name::LeanName::synthetic(format!("h_{}_bound", name.as_str()))),
                 ty: pred,
                 kind: BinderKind::Explicit,
             });
@@ -1570,7 +1585,7 @@ fn build_param_binders(fn_sst: &FunctionSst) -> Vec<LBinder> {
 /// `(h_req<i> : <req_i>)` for each requires clause.
 fn build_req_binders(check: &FuncCheckSst) -> Vec<LBinder> {
     check.reqs.iter().enumerate().map(|(i, req)| LBinder {
-        name: Some(format!("h_req{}", i)),
+        name: Some(crate::lean_name::LeanName::synthetic(format!("h_req{}", i))),
         ty: sst_exp_to_ast(req),
         kind: BinderKind::Explicit,
     }).collect()
@@ -1616,7 +1631,7 @@ enum Wp<'a> {
     /// walks (with cond as a Hyp frame) so omega sees a clean
     /// goal in each branch instead of an opaque value-position
     /// if.
-    Let(&'a str, &'a Exp, Box<Wp<'a>>),
+    Let(crate::lean_name::LeanName, &'a Exp, Box<Wp<'a>>),
 
     /// Obligation: prove `P`, then `body` proceeds with `P` as a
     /// hypothesis. Walker emits one theorem per `Wp::Assert`.
@@ -1882,11 +1897,11 @@ fn unfold_multi_binder_let(
 fn match_single_let_bind<'a>(
     bnd: &'a vir::sst::Bnd,
     body: &'a Exp,
-) -> Option<(String, &'a Exp, &'a Exp)> {
+) -> Option<(crate::lean_name::LeanName, &'a Exp, &'a Exp)> {
     let BndX::Let(bs) = &bnd.x else { return None };
     if bs.len() != 1 { return None; }
     let b = &bs[0];
-    Some((sanitize(&b.name.0), &b.a, body))
+    Some((crate::lean_name::LeanName::from_var_ident(&b.name), &b.a, body))
 }
 
 // ── WP builder ─────────────────────────────────────────────────────────
@@ -1934,13 +1949,13 @@ fn build_wp<'a>(
         StmX::Assign { lhs: Dest { dest, is_init: _ }, rhs } => {
             check_exp(dest)?;
             check_exp(rhs)?;
-            let Some(name) = extract_simple_var(dest) else {
+            let Some(ident) = extract_simple_var_ident(dest) else {
                 return Err(format!(
                     "assignment with non-simple LHS (got {:?}) is not yet supported",
                     dest.x
                 ));
             };
-            Ok(Wp::Let(name, rhs, Box::new(after)))
+            Ok(Wp::Let(crate::lean_name::LeanName::from_var_ident(ident), rhs, Box::new(after)))
         }
         StmX::Assert(_, _, e) | StmX::AssertCompute(_, e, _) => {
             check_exp(e)?;
@@ -1968,7 +1983,7 @@ fn build_wp<'a>(
             let ensures_goal = ctx.ensures_goal.clone();
             let ret_name = ctx.ret_name;
             let leaf = lift_if_value(e, &|e_ast| match ret_name {
-                Some(name) => LExpr::let_bind(sanitize(name), e_ast, ensures_goal.clone()),
+                Some(name) => LExpr::let_bind_synthetic(sanitize(name), e_ast, ensures_goal.clone()),
                 None => ensures_goal.clone(),
             });
             Ok(Wp::Done(leaf))
@@ -2512,7 +2527,7 @@ fn build_wp_loop<'a>(
     let decrease_marked = LExpr::span_mark(
         format_rust_loc(&decrease_exp.span),
         AssertKind::LoopDecrease,
-        LExpr::lt(sst_exp_to_ast(decrease_exp), LExpr::var(d_old_name.clone())),
+        LExpr::lt(sst_exp_to_ast(decrease_exp), LExpr::var_synthetic(d_old_name.clone())),
     );
     // continue_leaf = entry-invs ∧ decrease (re-establish at_entry
     // invs at every iteration boundary). break_leaf = exit-invs
@@ -2900,8 +2915,8 @@ mod tests {
         // Non-if value: `emit_leaf` is called once with the
         // rendered expression.
         let x = var_exp("x", typ_int());
-        let out = lift_if_value(&x, &|leaf| LExpr::let_bind("y", leaf, LExpr::var("body")));
-        let expected = LExpr::let_bind("y", LExpr::var("x"), LExpr::var("body"));
+        let out = lift_if_value(&x, &|leaf| LExpr::let_bind_synthetic("y", leaf, LExpr::var_lit("body")));
+        let expected = LExpr::let_bind_synthetic("y", LExpr::var_lit("x"), LExpr::var_lit("body"));
         assert!(pp_eq(&out, &expected));
     }
 
@@ -2912,15 +2927,15 @@ mod tests {
         let a = var_exp("a", typ_int());
         let b = var_exp("b", typ_int());
         let e = if_exp(c, a, b);
-        let out = lift_if_value(&e, &|leaf| LExpr::let_bind("y", leaf, LExpr::var("body")));
+        let out = lift_if_value(&e, &|leaf| LExpr::let_bind_synthetic("y", leaf, LExpr::var_lit("body")));
         let expected = LExpr::and(
             LExpr::implies(
-                LExpr::var("c"),
-                LExpr::let_bind("y", LExpr::var("a"), LExpr::var("body")),
+                LExpr::var_lit("c"),
+                LExpr::let_bind_synthetic("y", LExpr::var_lit("a"), LExpr::var_lit("body")),
             ),
             LExpr::implies(
-                LExpr::not(LExpr::var("c")),
-                LExpr::let_bind("y", LExpr::var("b"), LExpr::var("body")),
+                LExpr::not(LExpr::var_lit("c")),
+                LExpr::let_bind_synthetic("y", LExpr::var_lit("b"), LExpr::var_lit("body")),
             ),
         );
         assert!(pp_eq(&out, &expected));
@@ -2933,15 +2948,15 @@ mod tests {
         let a = var_exp("a", typ_int());
         let b = var_exp("b", typ_int());
         let e = box_exp(if_exp(c, a, b));
-        let out = lift_if_value(&e, &|leaf| LExpr::let_bind("y", leaf, LExpr::var("body")));
+        let out = lift_if_value(&e, &|leaf| LExpr::let_bind_synthetic("y", leaf, LExpr::var_lit("body")));
         let expected = LExpr::and(
             LExpr::implies(
-                LExpr::var("c"),
-                LExpr::let_bind("y", LExpr::var("a"), LExpr::var("body")),
+                LExpr::var_lit("c"),
+                LExpr::let_bind_synthetic("y", LExpr::var_lit("a"), LExpr::var_lit("body")),
             ),
             LExpr::implies(
-                LExpr::not(LExpr::var("c")),
-                LExpr::let_bind("y", LExpr::var("b"), LExpr::var("body")),
+                LExpr::not(LExpr::var_lit("c")),
+                LExpr::let_bind_synthetic("y", LExpr::var_lit("b"), LExpr::var_lit("body")),
             ),
         );
         assert!(pp_eq(&out, &expected));
@@ -2954,15 +2969,15 @@ mod tests {
         let a = var_exp("a", typ_int());
         let b = var_exp("b", typ_int());
         let e = loc_exp(if_exp(c, a, b));
-        let out = lift_if_value(&e, &|leaf| LExpr::let_bind("y", leaf, LExpr::var("body")));
+        let out = lift_if_value(&e, &|leaf| LExpr::let_bind_synthetic("y", leaf, LExpr::var_lit("body")));
         let expected = LExpr::and(
             LExpr::implies(
-                LExpr::var("c"),
-                LExpr::let_bind("y", LExpr::var("a"), LExpr::var("body")),
+                LExpr::var_lit("c"),
+                LExpr::let_bind_synthetic("y", LExpr::var_lit("a"), LExpr::var_lit("body")),
             ),
             LExpr::implies(
-                LExpr::not(LExpr::var("c")),
-                LExpr::let_bind("y", LExpr::var("b"), LExpr::var("body")),
+                LExpr::not(LExpr::var_lit("c")),
+                LExpr::let_bind_synthetic("y", LExpr::var_lit("b"), LExpr::var_lit("body")),
             ),
         );
         assert!(pp_eq(&out, &expected));
@@ -2987,22 +3002,22 @@ mod tests {
         let y_ref = var_exp("y", typ_int());
         let e = let_exp("y", if_exp(c, a, b), y_ref);
 
-        let out = lift_if_value(&e, &|leaf| LExpr::let_bind("out", leaf, LExpr::var("done")));
+        let out = lift_if_value(&e, &|leaf| LExpr::let_bind_synthetic("out", leaf, LExpr::var_lit("done")));
         // lift_if_value peels the Bind(Let), lifts the If inside the
         // value position, and re-threads `let y := rhs_leaf; y` into
         // each branch. Then emit_leaf wraps the whole let-y-y chunk.
         let expected = LExpr::and(
             LExpr::implies(
-                LExpr::var("c"),
-                LExpr::let_bind("out",
-                    LExpr::let_bind("y", LExpr::var("a"), LExpr::var("y")),
-                    LExpr::var("done")),
+                LExpr::var_lit("c"),
+                LExpr::let_bind_synthetic("out",
+                    LExpr::let_bind_synthetic("y", LExpr::var_lit("a"), LExpr::var_lit("y")),
+                    LExpr::var_lit("done")),
             ),
             LExpr::implies(
-                LExpr::not(LExpr::var("c")),
-                LExpr::let_bind("out",
-                    LExpr::let_bind("y", LExpr::var("b"), LExpr::var("y")),
-                    LExpr::var("done")),
+                LExpr::not(LExpr::var_lit("c")),
+                LExpr::let_bind_synthetic("out",
+                    LExpr::let_bind_synthetic("y", LExpr::var_lit("b"), LExpr::var_lit("y")),
+                    LExpr::var_lit("done")),
             ),
         );
         assert!(pp_eq(&out, &expected),
@@ -3020,10 +3035,10 @@ mod tests {
         let x = var_exp("x", typ_int());
         let y_ref = var_exp("y", typ_int());
         let e = let_exp("y", x, y_ref);
-        let out = lift_if_value(&e, &|leaf| LExpr::let_bind("out", leaf, LExpr::var("done")));
-        let expected = LExpr::let_bind("out",
-            LExpr::let_bind("y", LExpr::var("x"), LExpr::var("y")),
-            LExpr::var("done"));
+        let out = lift_if_value(&e, &|leaf| LExpr::let_bind_synthetic("out", leaf, LExpr::var_lit("done")));
+        let expected = LExpr::let_bind_synthetic("out",
+            LExpr::let_bind_synthetic("y", LExpr::var_lit("x"), LExpr::var_lit("y")),
+            LExpr::var_lit("done"));
         assert!(pp_eq(&out, &expected));
     }
 
@@ -3206,7 +3221,7 @@ mod tests {
         let result = match_single_let_bind(bnd, body_inner);
         assert!(result.is_some());
         let (name, rhs, body_out) = result.unwrap();
-        assert_eq!(name, "z");
+        assert_eq!(name.as_str(), "z");
         assert_eq!(exp_ident(rhs), Some("zval"));
         assert_eq!(exp_ident(body_out), Some("body"));
     }

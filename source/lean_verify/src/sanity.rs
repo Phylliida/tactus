@@ -135,7 +135,7 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
 }
 
 fn scope_from_binders(binders: &[Binder]) -> HashSet<String> {
-    binders.iter().filter_map(|b| b.name.clone()).collect()
+    binders.iter().filter_map(|b| b.name.as_ref().map(|n| n.as_str().to_string())).collect()
 }
 
 fn check_expr(
@@ -147,10 +147,10 @@ fn check_expr(
 ) {
     match &e.node {
         ExprNode::Var(name) => {
-            if !name_resolves(name, defined, scope) {
+            if !name_resolves(name.as_str(), defined, scope) {
                 violations.push(Violation {
                     context: context.to_string(),
-                    name: name.clone(),
+                    name: name.as_str().to_string(),
                 });
             }
         }
@@ -163,9 +163,9 @@ fn check_expr(
         // Binders introduce local scope.
         ExprNode::Let { name, value, body } => {
             check_expr(value, defined, scope, violations, context);
-            let shadowed = !scope.insert(name.clone());
+            let shadowed = !scope.insert(name.as_str().to_string());
             check_expr(body, defined, scope, violations, context);
-            if !shadowed { scope.remove(name); }
+            if !shadowed { scope.remove(name.as_str()); }
         }
         ExprNode::Lambda { binders, body }
         | ExprNode::Forall { binders, body }
@@ -174,7 +174,8 @@ fn check_expr(
             for b in binders { check_expr(&b.ty, defined, scope, violations, context); }
             let added: Vec<String> = binders.iter().filter_map(|b| {
                 b.name.as_ref().and_then(|n| {
-                    if scope.insert(n.clone()) { Some(n.clone()) } else { None }
+                    let s = n.as_str().to_string();
+                    if scope.insert(s.clone()) { Some(s) } else { None }
                 })
             }).collect();
             check_expr(body, defined, scope, violations, context);
@@ -245,7 +246,7 @@ fn pattern_binds(p: &Pattern) -> Vec<String> {
 
 fn collect_pattern_binders(p: &Pattern, out: &mut Vec<String>) {
     match p {
-        Pattern::Var(n) => out.push(n.clone()),
+        Pattern::Var(n) => out.push(n.as_str().to_string()),
         Pattern::Wildcard | Pattern::Lit(_) => {}
         Pattern::Ctor { args, .. } => {
             for a in args { collect_pattern_binders(a, out); }
@@ -255,7 +256,7 @@ fn collect_pattern_binders(p: &Pattern, out: &mut Vec<String>) {
             collect_pattern_binders(r, out);
         }
         Pattern::Binding { name, sub } => {
-            out.push(name.clone());
+            out.push(name.as_str().to_string());
             collect_pattern_binders(sub, out);
         }
     }
@@ -301,7 +302,7 @@ fn name_resolves(name: &str, defined: &HashSet<String>, scope: &HashSet<String>)
 mod tests {
     use super::*;
 
-    fn var(s: &str) -> Expr { Expr::new(ExprNode::Var(s.into())) }
+    fn var(s: &str) -> Expr { Expr::new(ExprNode::Var(crate::lean_name::LeanName::lit(s))) }
 
     #[test]
     fn known_builtins_pass() {
@@ -342,7 +343,7 @@ mod tests {
             attrs: vec![],
             name: "f".into(),
             binders: vec![Binder {
-                name: Some("x".into()), ty: var("Nat"), kind: BinderKind::Explicit,
+                name: Some(crate::lean_name::LeanName::lit("x")), ty: var("Nat"), kind: BinderKind::Explicit,
             }],
             ret_ty: var("Nat"),
             body: var("x"),
@@ -351,7 +352,7 @@ mod tests {
         let t = Theorem {
             name: "t".into(),
             binders: vec![Binder {
-                name: Some("n".into()), ty: var("Nat"), kind: BinderKind::Explicit,
+                name: Some(crate::lean_name::LeanName::lit("n")), ty: var("Nat"), kind: BinderKind::Explicit,
             }],
             goal: Expr::new(ExprNode::App {
                 head: Box::new(var("f")),
@@ -367,7 +368,7 @@ mod tests {
     fn let_binder_shadows_reference() {
         // `let x := 5; x + x` — `x` is bound, should resolve.
         let body = Expr::new(ExprNode::Let {
-            name: "x".into(),
+            name: crate::lean_name::LeanName::lit("x"),
             value: Box::new(Expr::new(ExprNode::Lit("5".into()))),
             body: Box::new(Expr::new(ExprNode::BinOp {
                 op: BinOp::Add,
@@ -386,7 +387,7 @@ mod tests {
     fn forall_binder_scopes_body() {
         let goal = Expr::new(ExprNode::Forall {
             binders: vec![Binder {
-                name: Some("k".into()), ty: var("Nat"), kind: BinderKind::Explicit,
+                name: Some(crate::lean_name::LeanName::lit("k")), ty: var("Nat"), kind: BinderKind::Explicit,
             }],
             body: Box::new(Expr::new(ExprNode::BinOp {
                 op: BinOp::Eq,
