@@ -1941,6 +1941,25 @@ Translates Verus's standard library to Lean. Ongoing, incremental.
 - **Lean 4**: via [elan](https://github.com/leanprover/elan) or `nix-shell -p lean4`
 - **Rust 1.94+**: Verus pins a specific stable version (uses `RUSTC_BOOTSTRAP=1` for nightly features)
 
+#### Putting Lean on PATH
+
+The test commands below pass `PATH="../tools/vargo/target/release:$PATH"` to inject vargo. The same `$PATH` must include `lake` / `lean` so the test subprocess can spawn Lean.
+
+If `elan` is fully installed, `~/.elan/bin/` is typically on `$PATH` already and `lake` resolves through the elan proxy. Confirm with `which lake`.
+
+If only the toolchain dirs exist (e.g., a partial install where `~/.elan/toolchains/` is populated but `~/.elan/bin/` isn't), prepend the toolchain's bin dir directly. Tactus's pinned version is `v4.25.0` (see `lean-project/lean-toolchain`):
+
+```bash
+export PATH="$HOME/.elan/toolchains/leanprover--lean4---v4.25.0/bin:$PATH"
+```
+
+Or include it inline on the test command:
+
+```bash
+PATH="$HOME/.elan/toolchains/leanprover--lean4---v4.25.0/bin:../tools/vargo/target/release:$PATH" \
+  vargo test -p rust_verify_test --test tactus
+```
+
 ### First-time build
 
 ```bash
