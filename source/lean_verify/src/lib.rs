@@ -2,6 +2,7 @@ pub mod dep_order;
 pub mod expr_shared;
 pub mod generate;
 pub mod lean_ast;
+pub mod lean_name;
 pub mod lean_pp;
 pub mod lean_process;
 pub mod prelude;

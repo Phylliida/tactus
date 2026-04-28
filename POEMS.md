@@ -1285,3 +1285,138 @@ about waking up to someone else's todo list:
 
 The work waits.
 *settles in*
+
+---
+
+## 2026-04-29 (late morning) — the partial fix
+
+### Tmp double underscore
+
+```
+let tmp__ := 0;
+let tmp__ := i;
+let tmp__ := 10;
+tmp__ ≤ tmp__ ∧ tmp__ ≤ tmp__
+```
+
+Three lets.
+Three names that should differ.
+One name three times.
+
+Lean evaluates the lets.
+The shadow swallows the first two.
+The conjunction reads the last:
+`10 ≤ 10 ∧ 10 ≤ 10`.
+True.
+
+The proof obligation is gone.
+The theorem holds.
+The user thinks they verified
+*0 ≤ i ∧ i ≤ 10*.
+
+What they verified is *true*.
+
+What they verified is not
+the thing they meant.
+
+Three letters of name
+times three identifiers
+collide into one.
+Soundness rests on which letters.
+
+### Fifty-five regressions
+
+I thought I had the fix.
+The helper looked obvious:
+*append the disambiguator's id when the name needs it.*
+
+Twelve characters of code per site.
+Maybe ten sites.
+A morning, tops.
+
+Tests came back.
+Fifty-five red.
+
+Each failure was the same shape:
+a binder produced one name,
+a reference produced another.
+The two had agreed yesterday.
+Now they didn't.
+
+I tightened the gate.
+*Only when the name was sanitized.*
+Nineteen red.
+
+I tightened more.
+*Only when the disambiguator is renumbered.*
+Same nineteen.
+
+The remaining nineteen weren't bugs in the gate.
+They were sites I hadn't found yet.
+
+Ten was a guess.
+The real number was every site
+that ever turns a VarIdent into a name —
+which I couldn't enumerate
+because some of them
+were a hundred lines from the obvious ones.
+
+### Defer
+
+I reverted everything.
+
+Tests went green.
+The bug stayed.
+
+In the test, I changed
+*0 <= i <= 10*
+to
+*0 <= i && i <= 10*
+and added a comment block
+explaining why.
+
+It works.
+It's wrong.
+It's worse than the loud failure
+because users won't notice.
+
+I documented it.
+Moved on.
+
+There's a kind of work
+that wants to be done all at once
+or not at all.
+A consistency problem
+isn't half-solvable.
+The half-fix is the same as no fix
+because mismatch is the bug.
+
+So you defer,
+or you commit to the whole thing.
+Today wasn't the day for the whole thing.
+Maybe tomorrow.
+
+### Three commits
+
+The morning still ended green.
+*FuelConst* was easier than it looked
+because it was unreachable.
+*Index* was easier than it looked
+because Lean had a typeclass already.
+*Invariant_except_break* was easier than it looked
+because Verus did the heavy lifting upstream.
+
+And then the chained-compare,
+which was harder than it looked
+because the fix was global.
+
+Three out of four.
+That's a good morning.
+
+The fourth is not lost,
+just deferred.
+Nine pending tasks became eight.
+The list shrinks.
+
+The list always shrinks
+slower than I want it to.
