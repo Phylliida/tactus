@@ -947,8 +947,15 @@ fn walk_loop<'a>(
     obl: &OblCtx,
     e: &mut ObligationEmitter,
 ) {
-    // Build the SpanMark-wrapped invariants & decrease & cond once;
-    // reused for init theorems, maintain hyps, use hyps.
+    // Build SpanMark-wrapped invariant + cond helpers once; reused
+    // across init theorems, maintain hyps, use hyps. The
+    // entry/exit split mirrors `build_wp_loop`'s classification:
+    //   * `at_entry`: holds at iteration boundaries → init
+    //     theorems + maintain ctx hyp + body's continue_leaf.
+    //   * `at_exit`: holds at loop exit → break_leaf + use ctx hyp.
+    // Plain `invariant P` (at_entry = at_exit = true) flows into
+    // both. `invariant_except_break` (at_entry only) and loop
+    // `ensures` (at_exit only) flow into one each.
     let inv_marked = |i: &LoopInv| LExpr::span_mark(
         format_rust_loc(&i.inv.span),
         AssertKind::LoopInvariant,
@@ -959,12 +966,18 @@ fn walk_loop<'a>(
         AssertKind::LoopCondition,
         sst_exp_to_ast(c),
     );
-    let inv_conj_marked = and_all(invs.iter().map(inv_marked).collect());
+    let entry_inv_conj_marked = and_all(
+        invs.iter().filter(|i| i.at_entry).map(inv_marked).collect()
+    );
+    let exit_inv_conj_marked = and_all(
+        invs.iter().filter(|i| i.at_exit).map(inv_marked).collect()
+    );
 
-    // ── Init: one theorem per invariant. The invariant must hold at
-    // loop entry given the current obligation context (no body
-    // execution yet).
-    for inv in invs {
+    // ── Init: one theorem per `at_entry` invariant. These are the
+    // ones the user claims hold at loop entry (i.e., before the
+    // first iteration). Loop ensures (`at_entry = false`) skip init
+    // — they're established at exit, not at entry.
+    for inv in invs.iter().filter(|i| i.at_entry) {
         let loc = format_rust_loc(&inv.inv.span);
         let id = e.next_id();
         let name = build_theorem_name(
@@ -973,14 +986,16 @@ fn walk_loop<'a>(
         e.emit(name, obl.wrap(inv_marked(inv)), simple_tactic(e));
     }
 
-    // ── Maintain: walk body with ∀ mod_vars + bounds + invs as
-    // hyps + cond as hyp + `_tactus_d_old := D` let. The body's
-    // Done leaf (= `inv_conj ∧ decrease_marked`) splits into one
-    // theorem per invariant + one for the decrease via
-    // `emit_done_or_split`.
+    // ── Maintain: walk body with ∀ mod_vars + bounds + at_entry
+    // invs as hyps + cond as hyp + `_tactus_d_old := D` let. The
+    // body's Done leaf (= `entry_inv_conj ∧ decrease_marked`)
+    // splits into one theorem per `at_entry` invariant + one for
+    // the decrease via `emit_done_or_split`. `at_exit`-only
+    // invariants (loop ensures) aren't visible during iteration —
+    // they're only required at break.
     let mut maintain_obl = obl.clone();
     push_mod_var_frames(&mut maintain_obl, modified_vars);
-    maintain_obl.frames.push(CtxFrame::Hyp(inv_conj_marked.clone()));
+    maintain_obl.frames.push(CtxFrame::Hyp(entry_inv_conj_marked));
     if let Some(c) = cond {
         maintain_obl.frames.push(CtxFrame::Hyp(cond_marked(c)));
     }
@@ -996,12 +1011,21 @@ fn walk_loop<'a>(
     ));
     walk_obligations(body, ctx, &maintain_obl, e);
 
-    // ── Use: walk `after` with ∀ mod_vars + bounds + invs as hyps
-    // + ¬cond as hyp. No `_tactus_d_old` here — the decrease
-    // obligation only applies to fall-through inside the body.
+    // ── Use: walk `after` with ∀ mod_vars + bounds + at_exit invs
+    // as hyps + ¬cond as hyp. After the loop, control got here via
+    // either a break (where the body established the at_exit invs
+    // as the break_leaf) or natural fallthrough (where the loop
+    // condition became false, and the body's last iteration
+    // re-established the entry invs). For `cond: Some(_)` loops,
+    // Verus's lowering forces at_entry = at_exit, so both lists
+    // agree. For `cond: None` loops (break-only exit), the use
+    // ctx must NOT assume at_entry-only invs (`invariant_except_
+    // break`) — break may have invalidated them. No
+    // `_tactus_d_old` here — the decrease obligation only applies
+    // to fall-through inside the body.
     let mut use_obl = obl.clone();
     push_mod_var_frames(&mut use_obl, modified_vars);
-    use_obl.frames.push(CtxFrame::Hyp(inv_conj_marked));
+    use_obl.frames.push(CtxFrame::Hyp(exit_inv_conj_marked));
     if let Some(c) = cond {
         use_obl.frames.push(CtxFrame::Hyp(LExpr::not(cond_marked(c))));
     }
@@ -2420,21 +2444,21 @@ fn build_wp_loop<'a>(
             decrease.len()
         ));
     }
-    if !invs.iter().all(|i| i.at_entry && i.at_exit) {
-        // User's `invariant x <= n` produces at_entry=at_exit=true by
-        // default; this fires for `invariant_except_break` (loops
-        // that may exit via break with weaker exit-state) and
-        // `ensures` clauses on loops (the at-exit-only form).
-        // Tracked as #89.
-        return Err(
-            "loop invariant has an at-entry-only or at-exit-only classification \
-             (invariant_except_break / loop ensures) — only invariants holding at \
-             both entry AND exit are supported today (#89). The user-written \
-             `invariant x <= n;` syntax produces both, so this typically only \
-             fires for desugared `while let Some(x) = it.next() { ... }` and \
-             similar.".to_string()
-        );
-    }
+    // Each invariant carries `at_entry: bool` and `at_exit: bool`
+    // flags. Three classifications:
+    //   * `invariant P` — at_entry = at_exit = true. Holds at every
+    //     loop-iteration boundary AND at every loop exit.
+    //   * `invariant_except_break P` — at_entry = true, at_exit = false.
+    //     Holds at iteration boundaries but not necessarily at break.
+    //     Produced from `while_loop_invariant_except_break!` macro
+    //     usage and similar.
+    //   * `ensures P` (on a loop) — at_entry = false, at_exit = true.
+    //     Required at every loop exit (break or natural fallthrough).
+    //
+    // For `cond: Some(_)` loops (`while c { ... }`), Verus's lowering
+    // asserts at_entry = at_exit = true (see sst_to_air.rs:2655),
+    // so the split is trivial. For `cond: None` loops (the
+    // break-lowered form), the flags can differ.
     for inv in invs.iter() {
         check_exp(&inv.inv)?;
     }
@@ -2469,18 +2493,32 @@ fn build_wp_loop<'a>(
     // level conjunction, each leaf retains its kind for theorem
     // naming. Without these wrappers, the unwrapped default
     // (`"ensures"`) would label every conjunct.
-    let inv_conj = and_all(invs.iter().map(|i| LExpr::span_mark(
+    // Split by classification (see comment block above on
+    // invariant / invariant_except_break / loop ensures). Each list
+    // independently folds into a marked conjunction; an empty list
+    // folds to `True` (handled by `and_all`), which is harmless as
+    // a hypothesis or trivially-provable as a Done leaf.
+    let inv_marked = |i: &LoopInv| LExpr::span_mark(
         format_rust_loc(&i.inv.span),
         AssertKind::LoopInvariant,
         sst_exp_to_ast(&i.inv),
-    )).collect());
+    );
+    let entry_inv_conj = and_all(
+        invs.iter().filter(|i| i.at_entry).map(inv_marked).collect()
+    );
+    let exit_inv_conj = and_all(
+        invs.iter().filter(|i| i.at_exit).map(inv_marked).collect()
+    );
     let decrease_marked = LExpr::span_mark(
         format_rust_loc(&decrease_exp.span),
         AssertKind::LoopDecrease,
         LExpr::lt(sst_exp_to_ast(decrease_exp), LExpr::var(d_old_name.clone())),
     );
-    let continue_leaf = LExpr::and(inv_conj.clone(), decrease_marked);
-    let break_leaf = inv_conj;
+    // continue_leaf = entry-invs ∧ decrease (re-establish at_entry
+    // invs at every iteration boundary). break_leaf = exit-invs
+    // (establish at_exit invs at the break point).
+    let continue_leaf = LExpr::and(entry_inv_conj, decrease_marked);
+    let break_leaf = exit_inv_conj;
     let inner_loop_ctx = WpLoopCtx {
         label: label.clone(),
         break_leaf: break_leaf.clone(),

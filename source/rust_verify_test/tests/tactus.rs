@@ -4797,6 +4797,128 @@ test_verify_one_file! {
 // access through tactus_auto would need either vstd routing
 // or a synthetic same-crate exec wrapper. Tracked as #91 follow-up.
 
+// #89: `invariant_except_break P` (at_entry only) — `P` holds at
+// each iteration boundary but is NOT required at break, so the
+// post-loop ctx doesn't get to assume it. The decreases-style
+// `loop { ... break; ... }` form (cond: None after Verus
+// lowering) is the only place these flags can differ; for plain
+// `while c { ... }`, Verus's lowering forces at_entry = at_exit.
+test_verify_one_file! {
+    #[test] test_exec_loop_invariant_except_break verus_code! {
+        #[verifier::tactus_auto]
+        fn count_to_ten() -> (r: i8)
+            ensures 1 <= r
+        {
+            let mut i: i8 = 0;
+            loop
+                invariant_except_break i <= 9
+                invariant 0 <= i && i <= 10
+                ensures 1 <= i
+                decreases 10 - i
+            {
+                i = i + 1;
+                if i == 10 {
+                    break;
+                }
+            }
+            i
+        }
+    } => Ok(())
+}
+
+// `invariant_except_break` violated at iteration boundary —
+// negative test. The user claims `i <= 9` holds at every
+// iteration, but starts with `i: i8 = 10`. The init theorem
+// for the at_entry invariant fires.
+test_verify_one_file! {
+    #[test] test_exec_loop_invariant_except_break_init_fails verus_code! {
+        #[verifier::tactus_auto]
+        fn bad_start() -> (r: i8)
+            ensures 1 <= r
+        {
+            let mut i: i8 = 10;
+            loop
+                invariant_except_break i <= 9
+                invariant 0 <= i && i <= 10
+                ensures 1 <= i
+                decreases 10 - i
+            {
+                i = i + 1;
+                if i == 10 {
+                    break;
+                }
+            }
+            i
+        }
+    } => Err(_)
+}
+
+// Loop `ensures` (at_exit only) — `R` must hold at each loop
+// exit but isn't visible during iteration. Pinned alongside
+// `invariant_except_break` (at_entry only) and a regular
+// `invariant` (both); the test exercises all three flag
+// combinations in one loop.
+//
+// Note on chained vs `&&` syntax: avoiding Verus's chained
+// `0 <= i <= 10` form. It goes through ast_simplify's
+// `temp_var` path, producing N temporary VarIdents that all
+// share the base name `tmp%%` and shadow each other when our
+// `sanitize` collapses the `%`s without including the
+// disambiguator's id. Avoiding the chained form sidesteps the
+// shadowing entirely. Tracked as a known limitation; the fix
+// would be a `sanitize` variant that includes the disambiguator
+// id, but that has wider consequences for binder/var-ref
+// matching across the renderer (revisit when chained-compare
+// in tactus_auto fns gets exercised in real code).
+test_verify_one_file! {
+    #[test] test_exec_loop_ensures_only verus_code! {
+        #[verifier::tactus_auto]
+        fn at_least_one() -> (r: i8)
+            ensures 1 <= r
+        {
+            let mut i: i8 = 0;
+            loop
+                invariant_except_break i <= 9
+                invariant 0 <= i && i <= 10
+                ensures 1 <= i
+                decreases 10 - i
+            {
+                i = i + 1;
+                if i == 10 {
+                    break;
+                }
+            }
+            i
+        }
+    } => Ok(())
+}
+
+// Loop `ensures` violated at the break point — negative test.
+// `ensures i == 100` requires that the value at every break
+// equals 100; the only break here happens at i=10. Init theorem
+// for ensures isn't emitted (at_entry=false), but the body's
+// break_leaf must establish `i == 100`, which it can't.
+test_verify_one_file! {
+    #[test] test_exec_loop_ensures_fails verus_code! {
+        #[verifier::tactus_auto]
+        fn bad_ensures() -> (r: i8)
+        {
+            let mut i: i8 = 0;
+            loop
+                invariant 0 <= i && i <= 10
+                ensures i == 100
+                decreases 10 - i
+            {
+                i = i + 1;
+                if i == 10 {
+                    break;
+                }
+            }
+            i
+        }
+    } => Err(_)
+}
+
 // #84 cont'd: when an obligation DOES need spec-fn unfolding,
 // the Tactus equivalent of `reveal_with_fuel` is a `proof { ... }`
 // block containing the Lean `unfold` tactic. This works because

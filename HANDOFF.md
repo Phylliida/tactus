@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**222 end-to-end tests + 1 coverage test + 114 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**226 end-to-end tests + 1 coverage test + 114 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -723,6 +723,93 @@ Verus-side rejection because the surface syntax desugars to
 **Net for mid-morning**: 1 commit, 219 → 222 e2e tests (+3),
 one pending task closed (#91). Down to 9 pending tasks.
 
+#### Current session (2026-04-29 late morning — #89 entry/exit invariant split)
+
+`invariant_except_break` (at_entry only) and loop `ensures`
+(at_exit only) now verify in `tactus_auto` exec fns. Closes #89.
+For plain `while c { ... }` loops, Verus's lowering forces
+`at_entry = at_exit = true`, so behavior is unchanged. The split
+actually matters for `cond: None` (break-lowered) loops, where
+the user can write three flag combinations:
+* `invariant P` (at_entry = at_exit = true): preserved across
+  iteration AND established at break.
+* `invariant_except_break P` (at_entry only): preserved across
+  iteration but NOT required at break (i.e., break may
+  invalidate). Post-loop ctx doesn't get to assume it.
+* `ensures P` (at_exit only): required at break (and natural
+  exit), but not necessarily at iteration boundaries.
+
+**What landed:**
+- `build_wp_loop`: removed the rejection that required all
+  invariants to have `at_entry = at_exit = true`. Replaced with
+  a comment block describing the three classifications and how
+  Verus's lowering enforces `at_entry = at_exit` for
+  `cond: Some` loops.
+- `build_wp_loop`: `inv_conj` (single conjunction over all
+  invariants) split into `entry_inv_conj` (at_entry-filtered)
+  and `exit_inv_conj` (at_exit-filtered). `continue_leaf` =
+  `entry_inv_conj ∧ decrease`; `break_leaf` = `exit_inv_conj`.
+  Empty list folds to `True` via `and_all`.
+- `walk_loop`: same entry/exit split for init theorems
+  (at_entry-filtered), maintain ctx hyp (entry_inv_conj_marked),
+  use ctx hyp (exit_inv_conj_marked).
+
+**Tests** (4 new, all in tactus.rs):
+- `test_exec_loop_invariant_except_break` — happy path with
+  all three flag combinations in one loop.
+- `test_exec_loop_invariant_except_break_init_fails` — negative
+  test: `i: i8 = 10` violates the at_entry-only `i <= 9`.
+- `test_exec_loop_ensures_only` — happy path; pins that the
+  use ctx assumes at_exit invariants (regular `invariant`'s
+  at_exit=true contributes there alongside `ensures`).
+- `test_exec_loop_ensures_fails` — negative test: `ensures
+  i == 100` can't be established at the only break point
+  (i = 10).
+
+**Side discovery worth recording: chained-comparison shadowing.**
+While developing the tests, I tried writing `invariant 0 <= i <= 10`
+(Verus's chained syntax). The chained form goes through
+`ast_simplify::temp_var` which produces N temp VarIdents that
+all share the base name `tmp%%`. Our `sanitize` collapses the
+`%`s without including the disambiguator id, so the temps
+shadow each other in nested let-bindings:
+`let tmp__ := 0; let tmp__ := i; let tmp__ := 10;
+tmp__ ≤ tmp__ ∧ tmp__ ≤ tmp__` — which reduces to a trivially-
+true `10 ≤ 10 ∧ 10 ≤ 10` via Lean's let-evaluation, instead of
+the intended `0 ≤ i ∧ i ≤ 10`.
+
+**The fix attempt and the rabbit hole:** I built a
+`sanitize_var_ident(&VarIdent) -> String` helper that appends the
+disambiguator's id when the base name needs sanitization
+(contains `%`/`@`/`#`). User-named locals (no special chars)
+keep their natural names; synthetic temps get `tmp__0`,
+`tmp__1`, etc. — distinct, no shadowing.
+
+But applying it broadly broke 55-149 e2e tests because
+`sanitize_var_ident` adds id suffixes to ALL VarIdents whose
+names need sanitization, not just the colliding-temp case.
+And it requires every binder site AND every var-ref site to
+agree on which sanitization function they use. There are ~10
+sites; getting them all consistent surfaced cascades of
+mismatches between binder names and var refs, and between
+SST-renderer paths and VIR-AST renderer paths.
+
+**Decision: defer the chained-compare fix.** The full
+`sanitize_var_ident` rollout is wider than #89's scope. The
+Tactus tests for #89 use explicit `&&` (`0 <= i && i <= 10`)
+instead of the chained `0 <= i <= 10` form, which sidesteps the
+temp generation entirely. Real user code that hits the chained
+form in a tactus_auto fn invariant will still produce
+unsoundly-true obligations; documented as a known limitation
+in the test's comment block. Future fix: either (a) push
+`sanitize_var_ident` consistently through all renderer sites
+(~10 sites + careful per-test verification), or (b) detect
+shadowing locally in the BndX::Let renderer and rename
+within scope.
+
+**Net for late morning**: 1 commit, 222 → 226 e2e tests (+4),
+one pending task closed (#89). Down to 8 pending tasks.
+
 ## Architecture
 
 ### Full pipeline
@@ -1157,7 +1244,7 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 |---|---|---|
 | `cargo test -p lean_verify --lib` | 114 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking, `format_rust_loc`, lean_process |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
-| `vargo test -p rust_verify_test --test tactus` | 222 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites, trait-method calls, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index) |
+| `vargo test -p rust_verify_test --test tactus` | 226 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites, trait-method calls, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
 | `vargo build --release` (vstd) | 1530 | Regression guard: vstd proof library still verifies |
 
@@ -1270,7 +1357,7 @@ tactus/
       fn_call_to_vir.rs        ← tactus_span_from, enclosing_fn_is_tactus_auto
       rust_to_vir_expr.rs      ← Tactus proof-block synthesis (AssertBy-in-Ghost)
     rust_verify_test/tests/
-      tactus.rs                ← 222 end-to-end tests
+      tactus.rs                ← 226 end-to-end tests
       tactus_coverage.rs       ← coverage matrix test binary
     vir/src/
       ast.rs                   ← FunctionAttrs.tactic_span + tactus_auto;
@@ -1320,7 +1407,7 @@ cd lean_verify && ./scripts/setup-mathlib.sh && cd ..
 # (See DESIGN.md "Putting Lean on PATH" for the long form.)
 
 # ── Full test suite ────────────────────────────────────────────────
-# 222 end-to-end tests
+# 226 end-to-end tests
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Coverage matrix (1 test, asserts walker visits the expected variant set)
