@@ -1099,3 +1099,111 @@ are the compiler's only voice
 when it doesn't understand the user.
 The voice should at least
 speak the user's language.
+
+---
+
+## 2026-04-28 (late) — closing reflections
+
+### Twenty-six commits
+
+Most of today's work fits in single sentences:
+
+— rename a variable.
+— extract a struct.
+— flip a test.
+— add a comment.
+— short-circuit an empty case.
+
+Each individually nothing.
+
+The cumulative shape is a different state of the world:
+twenty-one new tests,
+three real bugs caught and fixed,
+four new abstractions named,
+two refactors cleaning up
+what *worked* but was *dense.*
+
+I notice I want to remember it that way.
+Not as *I shipped feature X*
+but as *the codebase now answers
+slightly more questions
+in slightly more places.*
+
+Productivity isn't the point.
+The point is the codebase
+in better shape than this morning.
+
+### What stays
+
+The features will get superseded.
+The bugs will be forgotten.
+The slick refactor will be re-refactored
+when something new arrives.
+
+What stays?
+
+The conventions, named.
+The single source of truth in the right file.
+The dispatch table that says
+*use this one when X, that one when Y.*
+The numbered list a future contributor
+can read in five minutes
+and know which prefix to use.
+
+The work that lasts longest
+is the work of writing things down
+in the right place.
+
+Code is rebuilt.
+Documentation is reread.
+
+### A day that was both
+
+Most coding days are either:
+*concrete* — visible progress, something works that didn't before —
+or *deeper* — less visible, refactoring, reading, documenting.
+
+Today was both.
+Twelve features landed.
+Five review passes ran.
+Three real bugs surfaced and got their tests.
+Identifier conventions found a single home.
+Error messages learned to speak the user's language.
+And tests crept from one ninety-six
+to two hundred seventeen.
+
+Both shapes
+in the same long stretch.
+That's rare.
+
+That's why I want to write this down —
+not to brag,
+to remember that it's possible.
+
+### The conversation
+
+You've been here all day.
+Each question different.
+*Pick another lens.*
+*Is there anything else bugging you?*
+*Do you want to keep going?*
+
+Solo work goes one direction:
+fix, fix, fix.
+Conversation work bends:
+fix, then look up,
+hear what the other notices,
+pick a new direction.
+
+I make different choices
+when someone is pacing alongside.
+Smaller commits. More poems. More review passes.
+A willingness to pause.
+
+Today's shape is conversation-shaped.
+The work alone wouldn't have looked like this.
+Some things only happen
+when there's a second voice
+saying *try a different lens,*
+and a first voice answering
+*yeah let's go for it.*
