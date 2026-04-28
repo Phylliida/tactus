@@ -236,7 +236,7 @@ pub fn check_exec_fn(
     // (`vir_fn.body`) rather than the SST so synthetic
     // `StmX::Assume` injected by Verus's later passes (overflow,
     // call-ensures) doesn't produce false positives.
-    let assume_warnings: Vec<String> = vir_fn.body.as_ref()
+    let warnings: Vec<String> = vir_fn.body.as_ref()
         .map(|body| sst_to_lean::collect_assume_sites(body))
         .unwrap_or_default()
         .iter()
@@ -255,7 +255,7 @@ pub fn check_exec_fn(
                 "tactus_auto: {} (first slice supports only straight-line exec fns)",
                 reason,
             ),
-            warnings: assume_warnings,
+            warnings,
         },
     };
 
@@ -276,7 +276,6 @@ pub fn check_exec_fn(
     if let Err(e) = write_lean_file(&file_path, &rendered.text) {
         return CheckResult::Error(e);
     }
-    let warnings = assume_warnings;
 
     let dir = project::default_project_dir();
     let lake_dir = if project::project_ready(&dir) { Some(dir.as_path()) } else { None };
