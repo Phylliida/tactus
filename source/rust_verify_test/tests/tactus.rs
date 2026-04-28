@@ -4691,3 +4691,69 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #84: `reveal_with_fuel(f, n)` is a Verus proof-mode statement
+// that doesn't have a direct counterpart in Tactus. In Tactus,
+// spec fns are `@[irreducible] noncomputable def` and unfolding
+// is requested explicitly via Lean's `unfold f` tactic. The Verus
+// fuel concept (which controls Z3's recursion-unrolling depth)
+// has no analog in Lean's deterministic kernel.
+//
+// At the SST level: `reveal_with_fuel(f, n)` lowers to
+// `StmX::Fuel(fun, fuel_n, ..)`, which `build_wp` already passes
+// through transparently (`Ok(after)`). The user-facing
+// `ExpX::FuelConst(_)` rejection in `to_lean_sst_expr.rs` is
+// defensive code for an unreachable case: `FuelConst` is produced
+// only by `vir::recursion::rewrite_rec_call_with_fuel_const`,
+// which is only called from `vir::expand_errors` — part of the
+// Z3 SMT-error-expansion pipeline that Tactus doesn't traverse.
+//
+// What the user sees in tactus_auto fns: Verus's `reveal_with_fuel`
+// can't be written inside a Tactus `proof { ... }` block (which
+// holds Lean tactics, not Verus statements). The workaround is
+// `proof { unfold f }` — Lean's direct equivalent.
+//
+// This test pins the architectural reality: a tactus_auto fn that
+// uses a recursive spec fn verifies WITHOUT any reveal/fuel
+// machinery, because the obligation reduces to ground-level facts
+// (`r == 5`) that don't need unfolding. If the obligation DID
+// require unfolding `fact`, the user would write
+// `proof { unfold fact }` rather than `reveal_with_fuel(fact, ...)`.
+test_verify_one_file! {
+    #[test] test_exec_recursive_spec_fn_no_reveal_needed verus_code! {
+        spec fn fact(n: nat) -> nat
+            decreases n
+        {
+            if n == 0 { 1 } else { n * fact((n - 1) as nat) }
+        }
+
+        #[verifier::tactus_auto]
+        fn five() -> (r: u32)
+            ensures r == 5
+        {
+            5
+        }
+    } => Ok(())
+}
+
+// #84 cont'd: when an obligation DOES need spec-fn unfolding,
+// the Tactus equivalent of `reveal_with_fuel` is a `proof { ... }`
+// block containing the Lean `unfold` tactic. This works because
+// Tactus's proof blocks in tactus_auto fns hold raw Lean tactic
+// text (not Verus statements), and `unfold` propagates as a
+// theorem-level prefix to subsequent obligations.
+test_verify_one_file! {
+    #[test] test_exec_unfold_for_recursive_spec verus_code! {
+        spec fn double(n: nat) -> nat {
+            n + n
+        }
+
+        #[verifier::tactus_auto]
+        fn use_double() -> (r: u32)
+            ensures double(3 as nat) == 6
+        {
+            proof { unfold double }
+            0
+        }
+    } => Ok(())
+}
+

@@ -106,6 +106,16 @@ The Verus attribute `#[verifier::opaque]` is redundant with the default and is n
 
 This matches how well-written Lean code works — you mark definitions `@[irreducible]` and explicitly control unfolding. The `reveal(f)` pattern from Verus maps to `unfold f` in tactic blocks.
 
+### reveal_with_fuel and unfold in Tactus
+
+Verus's `reveal_with_fuel(f, n)` controls Z3's recursion-unrolling depth — telling the SMT solver it may unfold `f` up to `n` times when discharging the surrounding obligation. Lean's deterministic kernel has no analog: unfolding is requested explicitly with `unfold f` (one step) or `simp [f]` (full unfolding under simp-rewrite control), and the kernel evaluates termination structurally rather than via fuel-bounded unrolling.
+
+In a `tactus_auto` exec fn, `proof { ... }` blocks hold raw Lean tactic text (the FileLoader sanitizes the brace body to spaces; the original bytes are read off disk at codegen time and emitted verbatim). So a user who would write `proof { reveal_with_fuel(fact, 3); }` in a Verus fn writes `proof { unfold fact }` in a Tactus fn. The latter exposes `fact`'s body to subsequent obligations via the theorem-level tactic-prefix mechanism (see `Wp::AssertByTactus { cond: None, .. }`).
+
+For proof fns (`by { ... }` syntax), the entire body is Lean tactic text by construction — `unfold f` works directly there too, and `reveal_with_fuel` doesn't apply.
+
+The `ExpX::FuelConst(_)` SST variant is a separate, internal Verus construct: produced only by `vir::recursion::rewrite_rec_call_with_fuel_const`, and only called from `vir::expand_errors` (the Z3 SMT-error-expansion pipeline). Tactus doesn't traverse that pipeline, so `FuelConst` is structurally unreachable in our path. The catch-all `Err` arm in `to_lean_sst_expr.rs` is defensive — hitting it would mean a Verus-side pipeline change worth investigating.
+
 ### Mutual recursion (user-specified)
 
 ```rust
@@ -907,7 +917,7 @@ Each one returns `Err("… not yet supported")`; users get a clean rejection ins
 * **`ExpX::ArrayLiteral(_)`** — `[a, b, c]` literals. Verus rejects these upstream when slice indexing isn't wired, so the Err arm is unreached in practice.
 * **`ExpX::Old(..)`** — `old(x)` (pre-state). Relevant for `ensures` that compare post-state to pre-state.
 * **`ExpX::Interp(_)`** — only appears inside Verus's interpreter; an internal-bug rejection rather than a feature gap.
-* **`ExpX::FuelConst(_)`** — fuel-reveal constants. Blocks `reveal_with_fuel` in exec fns.
+* **`ExpX::FuelConst(_)`** — internal-bug rejection (#84 closed). Produced exclusively by `vir::recursion::rewrite_rec_call_with_fuel_const`, which is only called from `vir::expand_errors` (Verus's Z3 SMT-error-expansion pipeline). Tactus doesn't traverse that pipeline, so this arm is structurally unreachable. Hitting it means Verus's pipeline drifted; the message points the reader at filing an issue. **Note**: `reveal_with_fuel(f, n)` (the user-facing Verus syntax) is *not* blocked by this arm — it lowers to `StmX::Fuel(..)`, which `build_wp` already passes through transparently. The Lean side has no fuel concept (spec fns are `@[irreducible] noncomputable def`); the Tactus equivalent of reveal-for-unfolding is `proof { unfold f }`. See "reveal_with_fuel and unfold in Tactus" below.
 * **`CallFun::InternalFun(_)` other than `CheckDecreaseHeight`** — `CheckDecreaseHeight` is lowered (for int-typed decreases); other `InternalFun` variants rejected.
 * **Non-int `CheckDecreaseHeight`** — datatype-typed decreases need a Lean `height` function encoding. Reject at validation time rather than emit an unsound obligation.
 
