@@ -4735,6 +4735,68 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #91: array indexing in a tactus_auto fn's spec via the Verus
+// builtin `array_index(a, i)` — lowers to
+// `BinaryOp::Index(ArrayKind::Array, BoundsCheck::Allow)` in SST.
+// Tactus emits `lhs[Int.toNat rhs]!` (Lean's `getElem!`-based
+// indexing — total in the type system, panics out-of-bounds, but
+// Tactus only verifies the goal so panic semantics are
+// observationally fine; out-of-bounds is unspecified, matching
+// Verus's spec semantics).
+//
+// Side effect: this also pinned `Primitive::Array` rendering —
+// Lean's `Array` is a unary type constructor, but Verus carries
+// `[T, N]` (element + const-length) as type args. The renderer
+// drops the length to avoid `Array Int 4` "Function expected"
+// errors. Bounds are tracked separately via spec-level `len()`.
+test_verify_one_file! {
+    #[test] test_exec_index_array_in_requires verus_code! {
+        #[verifier::tactus_auto]
+        fn caller(a: [u8; 4])
+            requires array_index(a, 0) == 7u8
+        {
+        }
+    } => Ok(())
+}
+
+// Indexing in an ensures clause — same mechanism, different
+// position. Pins that the inlined ensures (in calling-fn
+// contexts) handles indexing correctly.
+test_verify_one_file! {
+    #[test] test_exec_index_array_in_ensures verus_code! {
+        #[verifier::tactus_auto]
+        fn first_eq(a: [u8; 4]) -> (b: u8)
+            requires array_index(a, 0) == 7u8
+            ensures b == array_index(a, 0)
+        {
+            7
+        }
+    } => Ok(())
+}
+
+// Multiple indexing operations in an assert. Exercises the
+// indexing renderer composing with itself + arithmetic.
+test_verify_one_file! {
+    #[test] test_exec_index_array_in_assert verus_code! {
+        #[verifier::tactus_auto]
+        fn check(a: [u8; 4])
+            requires
+                array_index(a, 0) == 1u8,
+                array_index(a, 1) == 2u8,
+        {
+            assert(array_index(a, 0) + array_index(a, 1) == 3u8);
+        }
+    } => Ok(())
+}
+
+// Exec-mode array indexing rejected at the Verus layer:
+// `a[i]` desugars to `vstd::array::array_index_get` which Tactus
+// can't inline (cross-crate). The `BinaryOp::Index` SST form we
+// support fires when bounds have been checked elsewhere — i.e.,
+// in spec contexts via `array_index(a, i)`. Exec-mode array
+// access through tactus_auto would need either vstd routing
+// or a synthetic same-crate exec wrapper. Tracked as #91 follow-up.
+
 // #84 cont'd: when an obligation DOES need spec-fn unfolding,
 // the Tactus equivalent of `reveal_with_fuel` is a `proof { ... }`
 // block containing the Lean `unfold` tactic. This works because

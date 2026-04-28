@@ -225,7 +225,7 @@ fn check_expr(
         ExprNode::ArrayLit(elts) | ExprNode::Anon(elts) => {
             for e in elts { check_expr(e, defined, scope, violations, context); }
         }
-        ExprNode::Index { base, idx } => {
+        ExprNode::Index { base, idx, bang: _ } => {
             check_expr(base, defined, scope, violations, context);
             check_expr(idx, defined, scope, violations, context);
         }

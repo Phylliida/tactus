@@ -463,6 +463,11 @@ fn place_to_expr(place: &PlaceX) -> LExpr {
         PlaceX::Index(base, idx, _, _) => ExprNode::Index {
             base: Box::new(place_to_expr(&base.x)),
             idx: Box::new(vir_expr_to_ast(idx)),
+            // Place-position indexing in proof fns is rare and usually
+            // sees the bounds proof in scope (legacy mut-ref code).
+            // Keep the plain `[idx]` form here; add `!` only when we
+            // identify a concrete shape that needs it.
+            bang: false,
         },
         PlaceX::UserDefinedTypInvariantObligation(inner, _) => {
             return place_to_expr(&inner.x);

@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**219 end-to-end tests + 1 coverage test + 114 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**222 end-to-end tests + 1 coverage test + 114 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -666,6 +666,63 @@ times.
 217 → 219 e2e tests (+2). One pending task closed (#84).
 Documentation tightened.
 
+#### Current session (2026-04-29 mid-morning — #91 BinaryOp::Index)
+
+`array_index(a, i)` and exec-mode array indexing (after bounds-
+check resolution) now lower to Lean's panic-on-out-of-bounds
+indexing form `lhs[Int.toNat rhs]!` (total via the GetElem
+typeclass; observationally fine because Tactus only verifies,
+never executes the generated Lean). Closes #91 for spec-mode
+indexing; exec-mode `a[i]` in user code still hits a
+Verus-side rejection because the surface syntax desugars to
+`vstd::array::array_index_get` (cross-crate, can't inline).
+
+**What landed:**
+- `to_lean_sst_expr.rs`: `BinaryOp::Index(_kind, _bounds)` arm
+  added. Renders as `ExprNode::Index { base, idx, bang: true }`,
+  with `idx` wrapped in `Int.toNat` to coerce Verus's `int` index
+  type to Lean's `Nat` (which is what GetElem expects). Both
+  `ArrayKind::Array` and `ArrayKind::Slice` go through the same
+  rendering — Lean's `Array α` and `List α` both implement
+  GetElem with Nat-indexed `[i]!`.
+- `to_lean_type.rs`: `Primitive::Array` and `Primitive::Slice`
+  type rendering now drops the second type argument (the const
+  length carried by `[T; N]`). Lean's `Array α` and `List α` are
+  unary type constructors; passing two args produced `Array Int 4`
+  errors of "Function expected at `Array Int`" before this fix.
+- `lean_ast.rs`: `ExprNode::Index` grew a `bang: bool` flag so
+  the same node serves both `xs[i]` (existing PlaceX path, plain
+  `[idx]`) and `xs[i]!` (new BinaryOp::Index, panic-on-OOB).
+  Updated 5 sites: pp, sanity, strip_span_marks, substitute_impl,
+  collect_free_vars, plus the unit test fixtures.
+- `to_lean_expr.rs`: existing `PlaceX::Index` rendering keeps
+  `bang: false` — proof-fn place indexing is rare and usually
+  has the bounds proof in scope already (legacy mut-ref code).
+  Add `!` only when a concrete shape needs it.
+
+**Tests** (3 new):
+- `test_exec_index_array_in_requires` — pinpoints the minimal
+  shape: `array_index(a, 0)` in a requires clause renders cleanly.
+- `test_exec_index_array_in_ensures` — same builtin in ensures.
+  Pins the inlined-ensures rendering path.
+- `test_exec_index_array_in_assert` — two indexing operations
+  composed with arithmetic in an `assert(P)`.
+
+**Caveats / followups documented (rejected with clear messages):**
+- Exec-mode `a[i]` user syntax for slices/arrays goes through
+  `vstd::array::array_index_get` / `vstd::slice::slice_index_get`,
+  which Tactus can't inline (cross-crate). Workaround for now:
+  use the spec builtin `array_index(a, i)` in proof contexts; for
+  exec read of array elements, route through a same-crate exec
+  wrapper. Tracked as a #91 follow-up.
+- Element types must be `[Inhabited α]` for `xs[i]!` to elaborate.
+  Primitives and non-generic user datatypes already satisfy this
+  (`deriving Inhabited` from #54). Generic element types may
+  not — currently no test pins this.
+
+**Net for mid-morning**: 1 commit, 219 → 222 e2e tests (+3),
+one pending task closed (#91). Down to 9 pending tasks.
+
 ## Architecture
 
 ### Full pipeline
@@ -1100,7 +1157,7 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 |---|---|---|
 | `cargo test -p lean_verify --lib` | 114 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking, `format_rust_loc`, lean_process |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
-| `vargo test -p rust_verify_test --test tactus` | 219 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites, trait-method calls, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow) |
+| `vargo test -p rust_verify_test --test tactus` | 222 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites, trait-method calls, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
 | `vargo build --release` (vstd) | 1530 | Regression guard: vstd proof library still verifies |
 
@@ -1213,7 +1270,7 @@ tactus/
       fn_call_to_vir.rs        ← tactus_span_from, enclosing_fn_is_tactus_auto
       rust_to_vir_expr.rs      ← Tactus proof-block synthesis (AssertBy-in-Ghost)
     rust_verify_test/tests/
-      tactus.rs                ← 219 end-to-end tests
+      tactus.rs                ← 222 end-to-end tests
       tactus_coverage.rs       ← coverage matrix test binary
     vir/src/
       ast.rs                   ← FunctionAttrs.tactic_span + tactus_auto;
@@ -1263,7 +1320,7 @@ cd lean_verify && ./scripts/setup-mathlib.sh && cd ..
 # (See DESIGN.md "Putting Lean on PATH" for the long form.)
 
 # ── Full test suite ────────────────────────────────────────────────
-# 219 end-to-end tests
+# 222 end-to-end tests
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Coverage matrix (1 test, asserts walker visits the expected variant set)
