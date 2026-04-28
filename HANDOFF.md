@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**216 end-to-end tests + 1 coverage test + 114 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**217 end-to-end tests + 1 coverage test + 114 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -506,10 +506,12 @@ lines.
 - Coverage: empty `tactus_tactic("")` rejection had no test —
   added `test_exec_tactus_tactic_empty_rejected`.
 
-**Net for the day**: 14 commits + 1 cleanup follow-up. 196 →
-216 e2e tests (+20). Three real bugs surfaced + fixed.
-Twelve deferral tasks closed (#76–80, #82–83, #85, #90, #92).
-Six poems committed across two batches.
+**Net for the day**: 23 commits across the deferrals batch, four
+review-style passes (5-lens / reasoning-clarity / error quality /
+identifier conventions / simplify), and one Tier-3 feature
+(#88 labeled break). 196 → 217 e2e tests (+21). Three real bugs
+surfaced + fixed. Thirteen deferral tasks closed (#76–80, #82–83,
+#85, #88, #90, #92). Nine poems committed across three batches.
 
 ## Architecture
 
@@ -940,7 +942,7 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 |---|---|---|
 | `cargo test -p lean_verify --lib` | 114 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking, `format_rust_loc`, lean_process |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
-| `vargo test -p rust_verify_test --test tactus` | 216 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites, trait-method calls, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare) |
+| `vargo test -p rust_verify_test --test tactus` | 217 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites, trait-method calls, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
 | `vargo build --release` (vstd) | 1530 | Regression guard: vstd proof library still verifies |
 
@@ -1053,7 +1055,7 @@ tactus/
       fn_call_to_vir.rs        ← tactus_span_from, enclosing_fn_is_tactus_auto
       rust_to_vir_expr.rs      ← Tactus proof-block synthesis (AssertBy-in-Ghost)
     rust_verify_test/tests/
-      tactus.rs                ← 216 end-to-end tests
+      tactus.rs                ← 217 end-to-end tests
       tactus_coverage.rs       ← coverage matrix test binary
     vir/src/
       ast.rs                   ← FunctionAttrs.tactic_span + tactus_auto;
@@ -1095,8 +1097,15 @@ PATH="../tools/vargo/target/release:$PATH" vargo build --release
 cd lean_verify && ./scripts/setup-mathlib.sh && cd ..
 # or: TACTUS_LEAN_PROJECT=/custom/path ./scripts/setup-mathlib.sh
 
+# Lean must be on PATH for the test subprocess. If `which lake` works,
+# `PATH="../tools/vargo/target/release:$PATH"` is enough. If only
+# `~/.elan/toolchains/` is populated (no `~/.elan/bin/` proxy),
+# prepend the pinned toolchain's bin dir explicitly:
+#   PATH="$HOME/.elan/toolchains/leanprover--lean4---v4.25.0/bin:../tools/vargo/target/release:$PATH"
+# (See DESIGN.md "Putting Lean on PATH" for the long form.)
+
 # ── Full test suite ────────────────────────────────────────────────
-# 216 end-to-end tests
+# 217 end-to-end tests
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Coverage matrix (1 test, asserts walker visits the expected variant set)

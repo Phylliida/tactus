@@ -14,6 +14,39 @@ that, for example, manipulates raw pointers.
 
 ![VS Code Demo](source/docs/verus-demo.png)
 
+## Tactus (this fork)
+
+This is **Tactus**, a fork of Verus that replaces Z3 with Lean 4's proof kernel
+for verification. See [`DESIGN.md`](DESIGN.md) for the architecture, and
+[`HANDOFF.md`](HANDOFF.md) for the working state and roadmap.
+
+### Quick start (running tests)
+
+```bash
+cd tactus/source
+
+# First-time vargo build
+cd ../tools/vargo && cargo build --release && cd ../../source
+
+# Build Tactus + vstd (~1530 verified, 0 errors expected)
+PATH="../tools/vargo/target/release:$PATH" vargo build --release
+
+# Run the e2e test suite — the test subprocess needs Lean on PATH.
+# If `which lake` works, the line below is enough. If only the
+# toolchain dirs are populated under ~/.elan/ (no `~/.elan/bin/`
+# proxy), prepend the pinned v4.25.0 toolchain bin dir directly:
+PATH="$HOME/.elan/toolchains/leanprover--lean4---v4.25.0/bin:../tools/vargo/target/release:$PATH" \
+  vargo test -p rust_verify_test --test tactus
+```
+
+The pinned Lean version lives in `tactus/lean-project/lean-toolchain`. See
+[`DESIGN.md` § "Putting Lean on PATH"](DESIGN.md) for full setup notes,
+[`HANDOFF.md` § "Running tests"](HANDOFF.md) for unit / integration / coverage
+test commands, and [`lean_verify/scripts/setup-mathlib.sh`](source/lean_verify/scripts/setup-mathlib.sh)
+for Mathlib (needed by `ring` / `nlinarith` / `polyrith` style tactics).
+
+---
+
 ## Status
 
 Verus is under *active development*. Features may be broken and/or missing, and
