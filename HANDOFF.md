@@ -506,12 +506,105 @@ lines.
 - Coverage: empty `tactus_tactic("")` rejection had no test —
   added `test_exec_tactus_tactic_empty_rejected`.
 
-**Net for the day**: 23 commits across the deferrals batch, four
+**Reasoning-clarity refactor**: looking for "what would slow me
+down in a month" rather than for smells. Different lens, different
+findings.
+- `walk_call` was 200 lines doing 6 mixed phases. Split into
+  three named helpers: `build_call_substitutions` returns a new
+  `CallSubstitutions` struct (typ_subst, req_subst, ens_subst,
+  mut_param_names, mut_idx_to_fresh, fresh_ret_name) bundling
+  state previously scattered as 6 locals;
+  `emit_call_precondition_theorem` and `push_post_call_frames`
+  for the two emission phases. `walk_call` itself is now ~30
+  lines.
+- `build_wp_call` was 140 lines with 6 early-Err sites + arity
+  + mut-arg building. Split into 4 named phases:
+  `reject_unsupported_call_shapes`, `resolve_callee`,
+  `validate_call_arities`, `build_call_mut_args`.
+- Renamed `spec_source` → `spec_callee` to mirror `callee`.
+  Added a header doc in walk_call explaining the dual structure
+  (callee for binders/types, spec_callee for require/ensure).
+- Added a "Peel/lift helpers" dispatch-table comment block in
+  sst_to_lean.rs explaining 7 closely-related helpers
+  (peel_transparent / peel_value_position / contains_loc /
+  match_single_let_bind / unfold_multi_binder_let /
+  lift_if_value / walk_let).
+
+**Error message quality pass**: every `Err(...)` message reviewed
+for "what did the user write? / is there a workaround? / is this
+tracked?" Convention now applied uniformly:
+- Cryptic short errors using internal type names → surface
+  syntax. `"FuelConst not yet supported"` →
+  `"reveal_with_fuel(f, n) not yet supported (#84). Workaround:
+  use reveal(f) if available."` Same treatment for
+  `OpenInvariant` (→ `open_atomic_invariant!`), `ClosureInner`,
+  `DeadEnd`, the unary/binary catch-all errors, etc.
+- `ExpX::Old` rejection (5-line essay added earlier today)
+  collapsed to one-line internal-bug message. Long
+  explanation moved to a code comment.
+- 13 error messages rewritten total; behavioral surface
+  unchanged.
+
+**Reserved identifier conventions** (single source of truth):
+- Four conventions had grown across sessions:
+  `_tactus_<role>_<id>` prefix (codegen gensyms + theorem names),
+  `<x>_at_pre_tactus` suffix (the only suffix outlier — keeps
+  param name readable), `tactus_<name>` no-prefix (user-visible
+  tactics), bare names in TactusPrelude (axioms / defs).
+- Documented as a numbered convention list in
+  `expr_shared.rs`'s "Reserved identifier conventions" section.
+  Cross-references from `sanity::name_resolves` (Convention 4)
+  and from the gensym sites in `walk_call` / `build_wp_loop`
+  (Convention 1 + the `StmX::Loop::id` vs `next_id()` choice).
+- Two gensym mechanisms documented: prefer Verus-stable IDs
+  (e.g., `StmX::Loop::id`, `u64` per loop instance) when one is
+  available; fall back to `ObligationEmitter::next_id()`
+  (per-fn counter).
+
+**Tier 3 #88 — labeled break / continue (LANDED)**:
+- `WpLoopCtx::label: Option<String>` carries the loop's
+  source-level label.
+- `build_wp` parameter changed from `Option<&WpLoopCtx>` to
+  `&[&WpLoopCtx]` (innermost-first).
+- `build_wp_loop` extends the stack with the new ctx for body
+  walks. Each loop's body gets its own pushed-front Vec.
+- Resolution: unlabeled break uses `stack[0]`; labeled break
+  searches by `label`. "Not found" cases produce
+  internal-bug errors (Verus's mode checker should prevent them).
+- Tests: `test_exec_loop_labeled_break` (renamed from
+  `_rejected`, flipped to Ok); `test_exec_loop_labeled_break_three_deep`.
+- Note: labeled `continue 'outer;` is rejected by Verus
+  upstream without `loop_isolation(false)` (which we don't
+  support either); the label-stack handles it in principle.
+
+**Simplify pass** (reuse / quality / efficiency review):
+- `let warnings = assume_warnings;` was a pure rename — removed.
+- `WpLoopCtx` was `pub struct` with `pub` fields but used only
+  internally. Narrowed to module-private.
+- `rewrite_varat_for_mut_params` walked + rebuilt the entire
+  VIR-AST tree even when `mut_param_names` was empty (every
+  non-`&mut` callee). Added an empty-set short-circuit (just
+  `expr.clone()`). Common-case efficiency win.
+- Stale `Option<&WpLoopCtx>` doc on `WpLoopCtx` updated.
+
+**Documentation pass**:
+- README.md got a new "Tactus (this fork)" section above the
+  upstream Verus "Status" — quick-start with the explicit
+  toolchain-bin PATH command + pointers to DESIGN.md / HANDOFF.md.
+- DESIGN.md got a "Putting Lean on PATH" subsection covering
+  both the elan-bin-proxy case and the partial-install fallback.
+- DESIGN.md got an "Beyond the five core lenses" section in
+  the code-review-strategy chapter, documenting the four extra
+  review lenses applied today and the meta-pattern (each lens
+  is a new question).
+
+**Net for the day**: 25 commits across the deferrals batch, five
 review-style passes (5-lens / reasoning-clarity / error quality /
-identifier conventions / simplify), and one Tier-3 feature
-(#88 labeled break). 196 → 217 e2e tests (+21). Three real bugs
-surfaced + fixed. Thirteen deferral tasks closed (#76–80, #82–83,
-#85, #88, #90, #92). Nine poems committed across three batches.
+identifier conventions / simplify), one Tier-3 feature
+(#88 labeled break), and a documentation pass. 196 → 217 e2e
+tests (+21). Three real bugs surfaced + fixed. Thirteen deferral
+tasks closed (#76–80, #82–83, #85, #88, #90, #92). Nine poems
+committed across three batches.
 
 ## Architecture
 
@@ -723,6 +816,11 @@ lean_verify/src/
 23. **Gensym for callee return name and per-loop d_old (#78, #83).** Two same-shape gensyms after they surfaced as soundness/hardening fixes: (a) `walk_call` emits `_tactus_ret_<id>` for the ∀-bound return value (not the callee's source-level ret name), substituting the original ret name in the ensures rendering — pinned by `test_exec_call_ret_name_collision` after a real shadowing bug surfaced. (b) `Wp::Loop` carries `d_old_name: String` (built from Verus's stable `StmX::Loop::id`); `walk_loop` uses it for the `let _tactus_d_old_<id> := D` binding. Both reserve the `_tactus_*` prefix; user code can't collide. Same conceptual move in two places; the second was preemptive after the first surfaced as a real bug.
 24. **`assume(P)` warnings + `CheckResult` shape (#80).** `CheckResult::Success` and `Failed` carry `warnings: Vec<String>`. The verifier emits each as `MessageLevel::Warning` before the success/error path. `collect_assume_sites` walks the VIR-AST `vir_fn.body` (NOT the SST) to find user-written `ExprX::AssertAssume { is_assume: true, .. }` — the SST has synthetic `StmX::Assume` injected by Verus's overflow / call-ensures passes, which would false-positive every overflow-checked op.
 25. **Per-fn tactic override (#81) + `tactus_usize_bound` (#82).** `#[verifier::tactus_tactic("…")]` plumbs through `FunctionAttrsX::tactus_tactic: Option<String>`. `ObligationEmitter::default_closer: Tactic` is read by `simple_tactic` rather than returning a hardcoded constant — every codegen site honors the override uniformly. `assert(P) by { user_tac }` sites still use the user-supplied tactic from the assert-by; the override applies only to default-closer sites. `tactus_usize_bound` in `TactusPrelude.lean` discharges symbolic `2 ^ arch_word_bits` via `rcases arch_word_bits_valid; subst; simp; first | decide | omega`. Composes via `tactus_first | tactus_auto | tactus_usize_bound`.
+26. **Labeled break via stack-threaded `WpLoopCtx` (#88).** `WpLoopCtx::label: Option<String>` carries the loop's source label. `build_wp` parameter changed from `loop_ctx: Option<&WpLoopCtx>` to `loop_stack: &[&WpLoopCtx]` (innermost-first). Each `build_wp_loop` extends the stack with its own ctx for body walks. `StmX::BreakOrContinue { label, .. }` resolves the leaf: unlabeled → `stack.first()`; labeled → `stack.iter().find(|c| c.label.as_deref() == Some(target))`. "Not found" produces internal-bug errors (Verus's mode checker should prevent them).
+27. **`walk_call` substitution-state via `CallSubstitutions` struct.** What used to be 6 scattered locals (typ_subst, req_subst, ens_subst, mut_param_names, mut_idx_to_fresh, fresh_ret_name) bundle into a single struct built by `build_call_substitutions`. Two emission helpers (`emit_call_precondition_theorem`, `push_post_call_frames`) take the struct as a single shared input. Reduces `walk_call` from ~200 lines of mixed phases to ~30 lines orchestrating three named helpers; the substitution scheme (especially the `&mut` pre/post split) lives in one place with documented invariants.
+28. **`build_wp_call` four-phase validation.** Was 140 lines with 6 early-Err sites + arity + mut-arg building inline. Split into `reject_unsupported_call_shapes` (split / is_trait_default), `resolve_callee` (resolved_method redirect + fn_map lookups), `validate_call_arities` (param + typ_args counts), `build_call_mut_args` (&mut detection + simple-Loc extraction). Each helper has a single concern; `build_wp_call` itself is ~50 lines.
+29. **Reserved identifier conventions** (single source of truth in `expr_shared.rs`). Four conventions: (1) `_tactus_<role>_<id>` prefix for codegen-internal gensyms + theorem names; (2) `<x>_at_pre_tactus` SUFFIX (the only outlier — keeps original param name first for readable error messages); (3) `tactus_<name>` no-prefix for user-visible Lean tactics in TactusPrelude; (4) bare names in TactusPrelude (`usize_hi`, `arch_word_bits`, etc.) — safe because Tactus generates user defs inside `namespace crate.module` while these live at top-level. Cross-referenced from `sanity::name_resolves` and the gensym sites. Two gensym mechanisms: prefer Verus-stable IDs (e.g., `StmX::Loop::id`) when available; fall back to `ObligationEmitter::next_id()`.
+30. **Error messages follow a three-question convention.** Every user-facing `Err(...)` answers in order: (a) what surface syntax did the user write?, (b) is there a workaround?, (c) is this tracked (task #)? Internal-bug rejections (paths that should never fire) get a short message + "please open an issue" rather than long explanations of pipeline invariants — those move to code comments.
 
 ## Track B status
 
@@ -778,7 +876,7 @@ Rejected (in `build_wp_call`): trait-default-impl calls (`is_trait_default = Som
 
 ### What's deferred
 
-The seven original Track B slices are all landed, plus #49 / #50 / #51 / #52 (struct Ctor) / #53 / #54 / #55 (caller-side) / #56 (caller-side) / #57 / #58 / D from the Tier 1-3 roadmap. See **Pending work** below for the remaining queue.
+The seven original Track B slices are all landed, plus #49 / #50 / #51 / #52 (struct Ctor) / #53 / #54 / #55 (caller-side) / #56 (caller-side) / #57 / #58 / #76 / #77 / #78 / #79 / #80 / #81 / #82 / #83 / #85 / #88 / #90 / #92 / D from the Tier 1-3 roadmap. See **Pending work** below for the remaining queue.
 
 See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the full catalogue. Currently blocking realistic exec fns:
 
@@ -786,7 +884,7 @@ See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the f
 - **Trait-method calls** — caller-side LANDED (#56) for `DynamicResolved` (concrete-receiver) and same-crate `Static`/`Dynamic` paths. Trade-off: impl-specific strengthening of `ensures` not seen at call sites (caller sees the trait-level contract). `is_trait_default = Some(true)` and cross-crate trait method decls are documented `#56` follow-ups.
 - **`assume(P)` warning** — DESIGN.md promises a "unproved assumption" compile warning; not wired.
 - **USize arith rarely auto-verifies** — the bound is emitted, but `tactus_auto` can't discharge symbolic `2 ^ arch_word_bits`. Users need `cases arch_word_bits_valid` proofs.
-- **Labeled `break` / `continue`** — rejected in `build_wp`'s StmX::BreakOrContinue arm; would need a label-keyed stack of loop contexts.
+- **Labeled `break`** — landed via #88 (label-keyed stack of `WpLoopCtx`). Labeled `continue 'outer;` still rejected by Verus upstream (needs `loop_isolation(false)` which we don't support either); the label-stack handles it in principle.
 - **`invariant_except_break` / `ensures` loop invariants** — only `at_entry = at_exit = true` invariants accepted. Verus's default `invariant x …` syntax produces both, so this covers the user-written common case; more complex loop shapes (e.g., ones desugared from `while let Some(x) = it.next() { … }`) may hit it.
 - **VIR / SST expression renderer unification** — shared leaves extracted into `expr_shared.rs`; the walkers themselves stay separate because the source trees are genuinely different shapes. See DESIGN.md § "Two parallel expression renderers" for the analysis of why full unification was rejected.
 
