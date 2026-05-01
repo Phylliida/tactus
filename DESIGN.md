@@ -905,9 +905,14 @@ recursion pass covers all cross-fn calls in the cycle the same way.
   introduces fresh existentials per `&mut` arg, substitutes
   pre-/post-state separately in the inlined ensures, and rebinds
   caller locals via `Let` frames after the ensures `Hyp`. Subset:
-  - **Simple `Loc(VarLoc(_))` only.** `&mut x.f` / `&mut v[i]`
-    rejected via `extract_simple_var_ident`-fail with a pointed
-    error message (deferred follow-up to #55).
+  - **`Loc(VarLoc(_))` and `Loc(Field(VarLoc(_)))` for single-
+    variant structs.** `&mut x` (LANDED slice 1) and `&mut x.f`
+    (LANDED #87) are accepted; the field case rebinds via Lean's
+    structure-update syntax `let x := { x with f := <fresh> }`
+    (no havoc-base + assume-other-fields-unchanged dance — Lean's
+    type system enforces other-fields-unchanged structurally).
+    `&mut v[i]` (Index L-value), deeper field paths (`&mut a.b.c`),
+    and multi-variant enum field mutation remain deferred.
   - **Legacy-mode `VarAt(p, Pre)` only.** New-mut-ref's
     `MutRefCurrent`/`MutRefFuture` UnaryOps not handled.
   - **Caller side LANDED in slice 1; callee side LANDED via #94.**
@@ -958,10 +963,16 @@ recursion pass covers all cross-fn calls in the cycle the same way.
     active in the same crate — pins the shared `varat_pre_name`
     contract).
 
-    **Still deferred**: `&mut x.f` / `&mut v[i]` (#87 — non-simple
-    Loc shapes need havoc-base + assume-other-fields-unchanged
-    encoding); new-mut-ref mode `MutRefCurrent` / `MutRefFuture`
-    (#95 — separate UnaryOps that don't go through `VarAt`).
+    **Still deferred**: `&mut v[i]` (Index L-value), deeper paths
+    `&mut a.b.c`, multi-variant enum field mutation (Lean's
+    structure-update syntax doesn't compose with multi-variant
+    inductives), and new-mut-ref mode `MutRefCurrent` /
+    `MutRefFuture` (#95 — separate UnaryOps that don't go through
+    `VarAt`). `&mut x.f` for single-variant structs LANDED via #87
+    using Lean's structure update — the encoding doesn't need
+    havoc-base + assume-other-fields-unchanged because Lean's
+    `{ x with f := … }` syntax structurally preserves all other
+    fields.
 * **Non-int decreases** — datatype-typed decreases via emitted
   `T.height` companion fn (see #54 in Tier 2). Int decreases work
   via the transparent-identity `height` for ints.
@@ -1350,15 +1361,29 @@ exec fns."
   encoding (#55) and shares the synthetic name via
   `varat_pre_name` in `expr_shared.rs`.
 
-  **Explicit deferrals (rejected in `build_wp_call`):**
-  - **`&mut x.f` / `&mut v[i]`** — non-simple `Loc` shapes where
-    `extract_simple_var_ident` returns `None`. Verus's Z3 path
-    handles this via havoc-base + assume-other-fields-unchanged.
-    Workaround: extract to a local first.
+  **`&mut x.f` LANDED via #87.** `extract_mut_target` recognises
+  the field shape `Loc(UnaryOpr(Field, base))` (with transparent
+  Box/Unbox/CoerceMode wrappers peeled around `base`) for single-
+  variant structs. The post-call rebind uses Lean's structure-update
+  syntax: `let x := { x with field := <fresh_post> }`. The "all
+  other fields unchanged" property is automatic from the syntax —
+  no separate havoc-base + assume-other-fields-unchanged dance.
+  `MutTargetRaw::{Var, Field}` discriminates the shapes;
+  `MutArgInfo.field_path: Option<String>` carries the field name
+  through to `push_post_call_frames` Phase 4.
+
+  **Explicit deferrals (still rejected in `build_wp_call`):**
+  - **`&mut v[i]`** (Index L-value), **deeper paths** (`&mut a.b.c`),
+    **multi-variant enum field mutation**. The single-variant gate
+    in `extract_mut_target` catches the multi-variant case
+    explicitly (Lean's structure-update syntax doesn't compose with
+    multi-variant inductives). Deeper paths and Index need separate
+    encodings (Index in particular needs a way to express the array
+    "one-element-changed" property).
   - **New-mut-ref mode (`UnaryOp::MutRefCurrent` /
-    `MutRefFuture`).** Both the caller-side (#55) and callee-side
-    (#94) rewrites handle legacy-mode `VarAt(p, Pre)` only.
-    Migrated functions (per `migrate_mut_refs.rs`) use
+    `MutRefFuture`).** Both the caller-side (#55, #87) and
+    callee-side (#94) rewrites handle legacy-mode `VarAt(p, Pre)`
+    only. Migrated functions (per `migrate_mut_refs.rs`) use
     `MutRefCurrent`/`MutRefFuture` UnaryOps instead of `VarAt`.
     Not currently exercised by any test; would need parallel
     handling at the same rewrite site (#95).

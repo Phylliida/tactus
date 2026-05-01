@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**238 end-to-end tests + 1 coverage test + 118 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**240 end-to-end tests + 1 coverage test + 118 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -1456,6 +1456,75 @@ truly dynamic dispatch via `dyn Trait` (cross-crate variant only).
 tests pass; 1530 vstd functions still verify. Down to 5 pending
 tasks (was 6 + closed #96).
 
+#### Current session (2026-05-01 early afternoon — #87 &mut x.f via structure update)
+
+Closed #87 for the single-variant struct case. The encoding turned
+out simpler than the DESIGN.md plan suggested: instead of havoc-base
++ assume-other-fields-unchanged, Lean's `{ x with f := v }` syntax
+structurally preserves all other fields by definition.
+
+**Encoding (`extract_mut_target` + Phase 4 of `push_post_call_frames`):**
+
+1. `MutTargetRaw<'a>` enum: `Var(&VarIdent)` (existing simple case)
+   or `Field { base: &VarIdent, field_name: String }` (new).
+   `extract_mut_target` peels the outer `Loc(_)`, peels transparent
+   wrappers (Box/Unbox/CoerceMode/Trigger) via `peel_transparent`,
+   then matches `VarLoc(_)` for Var case or `UnaryOpr(Field(opr),
+   inner)` for Field case. Inside Field, also peels transparent
+   wrappers around the base before requiring it to be a plain
+   VarLoc (depth-1 only). The transparent-wrapper handling was the
+   probe surprise — Verus inserts `Unbox(Box(...))` around the
+   Field's base in the SST, which the initial sketch didn't peel.
+
+2. Single-variant gate: `field_opr.variant.as_str() ==
+   to_lean_type::short_name(path)` ensures the datatype has only
+   one variant (struct-shaped). Multi-variant enums fall through
+   to `None` because Lean's `{ x with f := v }` syntax doesn't
+   compose with multi-variant inductives — a match-and-rebuild
+   encoding would be needed.
+
+3. `MutArgInfo.field_path: Option<String>`: `None` for simple Var,
+   `Some(field_name)` for Field. Phase 4 of `push_post_call_frames`
+   dispatches: `let local := fresh` (Var) or `let local := { local
+   with field := fresh }` via `ExprNode::StructUpdate` (Field).
+
+**Why no havoc-base + assume-other-fields-unchanged?** Verus's Z3
+path uses that pattern because SMT can't natively express "the
+post-state struct has these specific fields and others unchanged".
+Lean CAN — the structure-update syntax IS that semantics, in the
+type system. The post-call `{ h with val := v }` has type-level
+guarantee that all other fields equal `h`'s. No additional
+hypothesis needed.
+
+**Tests** (3 new, 238 → 240 e2e):
+- `test_exec_call_mut_arg_field` (positive, renamed from
+  `_rejected`): basic `bump(&mut h.val)` happy path.
+- `test_exec_call_mut_arg_field_wrong_post` (negative): caller's
+  ensures wrong; pins that the field's post-state is what callee
+  promised.
+- `test_exec_call_mut_arg_field_other_preserved`: multi-field
+  struct (`Pair { val, tag }`); caller's ensures references the
+  unmutated `tag` field. Pins that Lean's structure update
+  preserves other fields automatically.
+
+**Discipline note: structure update beat the planned encoding.**
+DESIGN.md said `&mut x.f` would need "havoc-base + assume-other-
+fields-unchanged" mirroring Verus's Z3 path. The Lean structure
+update was simpler AND more semantically tight — the fields-
+unchanged property is structural, not asserted. **The encoding
+doesn't always have to mirror Verus's.** Sometimes the target
+language has a feature that makes the SMT-style encoding
+unnecessary. Worth keeping in mind for #87 follow-ups (deeper
+paths, Index, multi-variant) — Lean might offer cleaner shapes.
+
+**What remains in #87:** `&mut v[i]` (Index L-value), deeper
+paths `&mut a.b.c`, multi-variant enum field mutation. All
+deferred separately.
+
+**Net for early afternoon**: 1 commit. 240 e2e + 118 unit + 1
+coverage tests pass; 1530 vstd functions still verify. Down to 4
+pending tasks (was 5 + closed #87 single-variant case).
+
 ## Architecture
 
 ### Full pipeline
@@ -1722,7 +1791,7 @@ Tests: `test_exec_overflow_diagnostic`, `test_exec_overflow_tight_ok`, `test_exe
 
 Tests: `test_exec_call_basic`, `test_exec_call_requires_violated` (negative), `test_exec_call_in_if_branch`, `test_exec_call_in_loop`, `test_exec_call_trait_method`, `test_exec_call_trait_method_requires_violated` (negative), `test_exec_call_trait_method_two_impls`, `test_exec_call_trait_method_with_args`, `test_exec_call_zero_args`, `test_exec_call_many_args`, `test_exec_call_mut_arg`, `test_exec_call_mut_arg_wrong_post` (negative), `test_exec_call_mut_arg_requires_violated` (negative), `test_exec_call_mut_arg_field_rejected` (negative), `test_exec_call_two_mut_args`, `test_exec_call_recursive_decreasing`, `test_exec_call_recursive_nondecreasing` (negative), `test_exec_call_recursive_no_decreases` (negative), `test_exec_call_mutual_recursion`, `test_exec_ctor_rejected`.
 
-Rejected (in `build_wp_call`): cross-crate callees, cross-crate trait method decls (#56 follow-up), split-assertion calls, `&mut x.f` / `&mut v[i]` (non-simple Loc shapes — #87, #55 follow-up). `is_trait_default = Some(true)` is now ACCEPTED (#96) — the call redirects to the trait method decl which holds the default body and spec.
+Rejected (in `build_wp_call`): cross-crate callees, cross-crate trait method decls (#56 follow-up), split-assertion calls, `&mut v[i]` / deeper field paths / multi-variant enum field mutation (still deferred). `&mut x.f` for single-variant structs LANDED (#87) via Lean structure-update rebind. `is_trait_default = Some(true)` LANDED (#96) — call redirects to the trait method decl.
 
 ### What's deferred
 
@@ -1730,7 +1799,7 @@ The seven original Track B slices are all landed, plus #49 / #50 / #51 / #52 (st
 
 See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the full catalogue. Currently blocking realistic exec fns:
 
-- **`&mut` args at call sites** — caller-side LANDED (#55), callee-side body verification LANDED (#94). `&mut x.f` / `&mut v[i]` shapes (#87) and new-mut-ref mode `MutRefCurrent`/`MutRefFuture` (#95) remain as `#55` follow-ups.
+- **`&mut` args at call sites** — caller-side LANDED (#55), callee-side body verification LANDED (#94), `&mut x.f` for single-variant structs LANDED (#87 via Lean structure-update rebind). `&mut v[i]` / deeper paths / multi-variant enum field mutation, plus new-mut-ref mode `MutRefCurrent`/`MutRefFuture` (#95), remain as `#55` follow-ups.
 - **Trait-method calls** — caller-side LANDED (#56) for `DynamicResolved` (concrete-receiver) and same-crate `Static`/`Dynamic` paths. Impl-specific strengthening of `ensures` LANDED via #86 — caller sees the conjunction of trait's and resolved-impl's ensures. Trait default-impl invocation LANDED via #96 — when the impl uses the trait's default body, `resolve_callee` redirects to the trait method decl (which holds the default body + spec) using the call site's typ_args. Cross-crate trait method decls remain a `#56` follow-up.
 - **`assume(P)` warning** — DESIGN.md promises a "unproved assumption" compile warning; not wired.
 - **USize arith rarely auto-verifies** — the bound is emitted, but `tactus_auto` can't discharge symbolic `2 ^ arch_word_bits`. Users need `cases arch_word_bits_valid` proofs.
@@ -1757,18 +1826,21 @@ follow-ups, each smaller and pickable independently.
 ### #55 follow-ups
 
 Caller-side MVS landed (#55). Callee-side body verification landed
-(#94 — `tactus_auto` on a fn that itself takes `&mut`). Remaining
-sub-tasks:
+(#94). `&mut x.f` for single-variant structs landed (#87 via Lean
+structure-update). Remaining sub-tasks:
 
-- **Non-simple `Loc` shapes** (`&mut x.f`, `&mut v[i]`) — #87.
-  Currently rejected in `build_wp_call`. Verus's Z3 path uses
-  havoc-base + assume-other-fields-unchanged; we'd need a parallel
-  encoding.
+- **`&mut v[i]` / deeper paths / multi-variant enum field mutation.**
+  Index L-values need a different encoding (array "one-element-changed"
+  property); deeper field paths can extend #87's structure-update
+  pattern but need recursive Loc handling; multi-variant enum field
+  mutation needs a match-and-rebuild encoding because Lean's
+  structure-update syntax doesn't compose with multi-variant
+  inductives.
 - **New-mut-ref mode** (`UnaryOp::MutRefCurrent` / `MutRefFuture`)
-  — #95. Both the caller-side (#55) and callee-side (#94) rewrites
-  handle legacy-mode `VarAt(p, Pre)` only. Migrated functions use
-  `MutRefCurrent`/`MutRefFuture` UnaryOps instead of `VarAt`. Would
-  need parallel handling at both rewrite sites.
+  — #95. Both the caller-side (#55, #87) and callee-side (#94)
+  rewrites handle legacy-mode `VarAt(p, Pre)` only. Migrated
+  functions use `MutRefCurrent`/`MutRefFuture` UnaryOps instead of
+  `VarAt`. Would need parallel handling at both rewrite sites.
 
 ### #56 follow-ups
 
@@ -1880,7 +1952,7 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 |---|---|---|
 | `cargo test -p lean_verify --lib` | 118 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking, `format_rust_loc`, lean_process, `LeanName` constructors |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
-| `vargo test -p rust_verify_test --test tactus` | 238 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body, trait-method calls with impl-strengthened ensures + default-impl invocation, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression) |
+| `vargo test -p rust_verify_test --test tactus` | 240 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body + &mut x.f via structure update, trait-method calls with impl-strengthened ensures + default-impl invocation, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
 | `vargo build --release` (vstd) | 1530 | Regression guard: vstd proof library still verifies |
 
@@ -1993,7 +2065,7 @@ tactus/
       fn_call_to_vir.rs        ← tactus_span_from, enclosing_fn_is_tactus_auto
       rust_to_vir_expr.rs      ← Tactus proof-block synthesis (AssertBy-in-Ghost)
     rust_verify_test/tests/
-      tactus.rs                ← 238 end-to-end tests
+      tactus.rs                ← 240 end-to-end tests
       tactus_coverage.rs       ← coverage matrix test binary
     vir/src/
       ast.rs                   ← FunctionAttrs.tactic_span + tactus_auto;
@@ -2043,7 +2115,7 @@ cd lean_verify && ./scripts/setup-mathlib.sh && cd ..
 # (See DESIGN.md "Putting Lean on PATH" for the long form.)
 
 # ── Full test suite ────────────────────────────────────────────────
-# 238 end-to-end tests
+# 240 end-to-end tests
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Coverage matrix (1 test, asserts walker visits the expected variant set)
