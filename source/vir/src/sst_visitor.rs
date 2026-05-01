@@ -890,7 +890,11 @@ where
     map_exp_visitor_bind(exp, &mut map, &mut |e, _| f(e))
 }
 
-pub(crate) fn map_exp_visitor<F>(exp: &Exp, f: &mut F) -> Exp
+// Exposed for Tactus's `lean_verify` (callee-side `&mut` body
+// rewrite, #94 — analogous to the AST-level `rewrite_varat_for_mut_
+// params` in `sst_to_lean::sst_to_lean`). Other Tactus rewrites that
+// need an SST-level Exp walker can use this too.
+pub fn map_exp_visitor<F>(exp: &Exp, f: &mut F) -> Exp
 where
     F: FnMut(&Exp) -> Exp,
 {
@@ -1197,7 +1201,11 @@ where
     }
 }
 
-pub(crate) fn map_exps_in_stm_visitor<F>(stm: &Stm, fe: &mut F) -> Stm
+// Exposed for Tactus's `lean_verify` (callee-side `&mut` body
+// rewrite, #94 — applies an Exp-level rewrite uniformly to every
+// Exp embedded in a Stm tree). Other Tactus passes that need a
+// uniform Exp-rewrite over an Stm can use this too.
+pub fn map_exps_in_stm_visitor<F>(stm: &Stm, fe: &mut F) -> Stm
 where
     F: FnMut(&Exp) -> Exp,
 {
