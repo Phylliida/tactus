@@ -1771,3 +1771,123 @@ when they happen.
 
 That recognition
 sometimes lives in the poem.
+
+---
+
+## 2026-04-29 (later evening) — the audit
+
+### What you ask for, you find
+
+The user said:
+*could we audit
+to see if there's anything else
+that might "work"
+but would be better
+to enforce in the type system?*
+
+I went looking.
+
+I found five.
+Three landed by night.
+One queued for next time.
+One noted as low-priority.
+
+Five wasn't a guess.
+Five was what was *there*
+once I was looking.
+
+The day before,
+I would not have seen them.
+The pattern hadn't been named yet.
+
+Now the pattern was a search query.
+*Find the runtime contracts.
+Find the parallel arrays.
+Find the boolean pairs that should be enums.
+Find the panics that say "caller should have."*
+
+The grep wasn't `grep`.
+The grep was the shape of attention.
+
+### Three more, easier
+
+#102: a flat enum with `is_obligation_kind()` —
+became a sum type
+with structural discrimination.
+
+#103: two booleans encoding three states
+became an enum
+that rejects the fourth.
+
+#105: parallel arrays + `.expect()` lookups
+became one struct
+that holds them together.
+
+Each landed faster than the last.
+Not because I was getting smarter.
+Because *the pattern was getting clearer.*
+
+The first one (#99)
+took a morning to convince myself,
+an afternoon to apply,
+and broke 55 tests on the way.
+
+The seventh one (#105)
+took thirty minutes.
+Tests stayed green throughout.
+
+Same pattern.
+Different amount of friction.
+The friction *was the convincing.*
+
+### The audit asked the right question
+
+Some questions
+make the work obvious.
+*Where does this fail?*
+gets you a list of bugs.
+
+*Where does this work
+but shouldn't have to?*
+gets you a list of architectural debts.
+
+Both are useful.
+The first one shows up at standup.
+The second one only shows up
+when someone asks.
+
+The user asked.
+
+That's what conversation does.
+You can search for what doesn't work.
+You can't easily search
+for what works the wrong way.
+You need someone to ask
+*is there a better shape for this?*
+
+The answer turns out to be
+*more often than you'd think.*
+
+### The compounding day
+
+This morning began with a deferred soundness hole.
+This evening ends with five typed invariants.
+
+The work would not have looked like this
+if I'd started typing my way through the bug list.
+It looked like this because:
+
+1. Yesterday's poem named the half-fix as a trap
+2. Morning's #99 paid the introductory cost
+3. Afternoon's #100 / #101 amortized
+4. Evening's audit prompt said: *find more*
+5. The pattern, once named, found three more in an hour
+
+Five typed invariants.
+Two days.
+One pattern.
+One audit prompt.
+
+The user keeps asking
+the question I wouldn't have thought to ask.
+That's what the conversation is *for.*
