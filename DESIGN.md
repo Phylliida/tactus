@@ -1423,12 +1423,25 @@ exec fns."
   hoisted into `build_wp_call` so failures surface at codegen
   time, not as a panic.
 
+  **`is_trait_default = Some(true)` LANDED via #96.** When the
+  call resolves to the trait's default body (impl doesn't override),
+  `resolve_callee` redirects to use `fun` (the trait method decl,
+  which holds the default body and its specs) and `typ_args` (the
+  call site's typ args, including the concrete Self) directly,
+  rather than the synthesized `<impl>%default%<method>` wrapper
+  that Verus's resolution produces. `Self` then resolves through
+  the existing typ_args / typ_subst machinery — no Self-specific
+  substitution needed. `pick_spec_source` returns the trait method
+  decl (its `FunctionKind::TraitMethodDecl` arm gives `Ok(callee)`),
+  so `callee == spec_callee` and #86's impl-strengthening path is a
+  no-op (there's no separate impl — the default IS the body). Pinned
+  by `test_exec_call_trait_default` (basic), `test_exec_call_trait_default_wrong_ensures`
+  (negative), `test_exec_call_trait_default_with_args` (default with
+  precondition + non-self params), `test_exec_call_trait_default_overridden`
+  (impl OVERRIDES the default; pins that we still go through the
+  concrete-impl path with #86 strengthening when an override exists).
+
   **Explicit deferrals (still rejected with clear messages):**
-  - **`is_trait_default = Some(true)`** (call resolved to the
-    trait's default impl). The default body uses `Self` as a
-    parameter that we'd need additional substitution to handle.
-    `Some(false)` is fine (concrete impl on a trait that has a
-    default — different from invoking the default itself).
   - **`CallTargetKind::Dynamic`** (truly dynamic dispatch through
     `dyn Trait`) is indistinguishable from `Static` at the SST
     level — both have `resolved_method: None`. Currently falls

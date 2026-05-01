@@ -2603,7 +2603,7 @@ fn build_wp_call<'a>(
     reject_unsupported_call_shapes(split, is_trait_default)?;
 
     let (callee, callee_typ_args) =
-        resolve_callee(fun, resolved_method, typ_args, ctx)?;
+        resolve_callee(fun, resolved_method, is_trait_default, typ_args, ctx)?;
 
     validate_call_arities(callee, args, callee_typ_args)?;
 
@@ -2651,12 +2651,14 @@ fn reject_unsupported_call_shapes(
             "calls with split-assertion error reporting are not yet supported".to_string()
         );
     }
-    if matches!(is_trait_default, Some(true)) {
-        return Err(
-            "calls resolved to a trait's default impl (rather than a concrete impl) \
-             are not yet supported (#56 follow-up)".to_string()
-        );
-    }
+    // Note: `is_trait_default = Some(true)` (calls resolved to the
+    // trait's default impl) is now accepted (#96). The default body
+    // lives on the trait method decl, which `pick_spec_source` returns
+    // as `spec_callee`. The same logic that handles concrete-impl
+    // calls applies — `Self` resolves through the existing typ_args /
+    // typ_subst machinery (Verus tags Self as a regular type
+    // parameter at the spec level).
+    let _ = is_trait_default;
     Ok(())
 }
 
@@ -2678,13 +2680,30 @@ fn reject_unsupported_call_shapes(
 fn resolve_callee<'a>(
     fun: &'a Fun,
     resolved_method: &'a Option<(Fun, vir::ast::Typs)>,
+    is_trait_default: &Option<bool>,
     typ_args: &'a vir::ast::Typs,
     ctx: &WpCtx<'a>,
 ) -> Result<(&'a FunctionX, &'a [Typ]), String> {
-    let (callee_fun, callee_typ_args): (&'a Fun, &'a [Typ]) = match resolved_method {
-        Some((resolved, resolved_typs)) => (resolved, &resolved_typs[..]),
-        None => (fun, &typ_args[..]),
-    };
+    // For `is_trait_default = Some(true)` calls (#96): the
+    // `resolved_method`'s fn is a synthesized wrapper around the
+    // trait's default body (path looks like `<impl>%default%<method>`),
+    // and its `typ_params` differ from the call-site's `typ_args`
+    // (the wrapper has Self specialized, the call site passes Self
+    // explicitly). Skip the redirect — use `fun` (the trait method
+    // decl) directly, since the trait method decl already holds the
+    // default body and its specs. `pick_spec_source` then returns
+    // it as both callee and spec_callee (TraitMethodDecl arm), so
+    // no impl-strengthening conjunction is added (there's no impl
+    // for default-impl calls — the default IS the body).
+    let (callee_fun, callee_typ_args): (&'a Fun, &'a [Typ]) =
+        if matches!(is_trait_default, Some(true)) {
+            (fun, &typ_args[..])
+        } else {
+            match resolved_method {
+                Some((resolved, resolved_typs)) => (resolved, &resolved_typs[..]),
+                None => (fun, &typ_args[..]),
+            }
+        };
     let Some(callee) = ctx.fn_map.get(callee_fun).copied() else {
         return Err(format!(
             "callee `{:?}` not found in the crate's function map — cross-crate calls are \
