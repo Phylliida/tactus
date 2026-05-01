@@ -1792,10 +1792,14 @@ fn push_post_call_frames(
             vir_expr_to_ast(&rewritten)
         })
         .collect();
-    // Avoid duplicating the trait's own clauses when callee == spec_callee.
-    // We use VIR's `Fun` (= `Arc<FunX>`) name comparison: same Fun
-    // means same fn, so no impl-strengthening to add.
-    let is_trait_method_impl = !std::sync::Arc::ptr_eq(&callee.name, &spec_callee.name);
+    // Add the impl's strengthened ensures only when the call is a
+    // trait-method-impl dispatch (then callee is the impl, spec_callee
+    // is the trait method decl — see `pick_spec_source`). For all
+    // other callees, callee == spec_callee structurally, and the
+    // impl-strengthening conjunction would just duplicate the same
+    // clauses.
+    let is_trait_method_impl =
+        matches!(callee.kind, FunctionKind::TraitMethodImpl { .. });
     if is_trait_method_impl {
         for expr in callee.ensure.0.iter() {
             let rewritten = rewrite_varat_for_mut_params(expr, &subst.mut_param_names);
