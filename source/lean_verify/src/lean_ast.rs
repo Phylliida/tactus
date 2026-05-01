@@ -606,7 +606,10 @@ pub enum Tactic {
 /// This replaces the older `let p := arg; body` wrapping — direct
 /// substitution produces Lean that's both cleaner (no nested let
 /// shadowing) and tractable for omega (no zeta-reduction needed).
-pub fn substitute(expr: &Expr, subst: &std::collections::HashMap<String, Expr>) -> Expr {
+pub fn substitute(
+    expr: &Expr,
+    subst: &std::collections::HashMap<crate::lean_name::LeanName, Expr>,
+) -> Expr {
     if subst.is_empty() { return expr.clone(); }
     substitute_impl(expr, subst)
 }
@@ -699,10 +702,10 @@ fn strip_span_marks_node(node: &ExprNode) -> ExprNode {
 
 fn substitute_impl(
     expr: &Expr,
-    subst: &std::collections::HashMap<String, Expr>,
+    subst: &std::collections::HashMap<crate::lean_name::LeanName, Expr>,
 ) -> Expr {
     let node = match &expr.node {
-        ExprNode::Var(name) => match subst.get(name.as_str()) {
+        ExprNode::Var(name) => match subst.get(name) {
             Some(replacement) => return replacement.clone(),
             None => ExprNode::Var(name.clone()),
         },
@@ -726,8 +729,8 @@ fn substitute_impl(
         },
         ExprNode::Let { name, value, body } => {
             let new_value = substitute_impl(value, subst);
-            let inner_subst = subst_without(subst, name.as_str());
-            check_capture_lazy(&[name.as_str()], &inner_subst, body, "let");
+            let inner_subst = subst_without(subst, name);
+            check_capture_lazy(&[name], &inner_subst, body, "let");
             ExprNode::Let {
                 name: name.clone(),
                 value: Box::new(new_value),
@@ -736,8 +739,8 @@ fn substitute_impl(
         }
         ExprNode::Lambda { binders, body } => {
             let inner_subst = subst_remove_binders(subst, binders);
-            let binder_names: Vec<&str> = binders.iter()
-                .filter_map(|b| b.name.as_ref().map(|n| n.as_str()))
+            let binder_names: Vec<&crate::lean_name::LeanName> = binders.iter()
+                .filter_map(|b| b.name.as_ref())
                 .collect();
             check_capture_lazy(&binder_names, &inner_subst, body, "lambda");
             ExprNode::Lambda {
@@ -747,8 +750,8 @@ fn substitute_impl(
         }
         ExprNode::Forall { binders, body } => {
             let inner_subst = subst_remove_binders(subst, binders);
-            let binder_names: Vec<&str> = binders.iter()
-                .filter_map(|b| b.name.as_ref().map(|n| n.as_str()))
+            let binder_names: Vec<&crate::lean_name::LeanName> = binders.iter()
+                .filter_map(|b| b.name.as_ref())
                 .collect();
             check_capture_lazy(&binder_names, &inner_subst, body, "forall");
             ExprNode::Forall {
@@ -758,8 +761,8 @@ fn substitute_impl(
         }
         ExprNode::Exists { binders, body } => {
             let inner_subst = subst_remove_binders(subst, binders);
-            let binder_names: Vec<&str> = binders.iter()
-                .filter_map(|b| b.name.as_ref().map(|n| n.as_str()))
+            let binder_names: Vec<&crate::lean_name::LeanName> = binders.iter()
+                .filter_map(|b| b.name.as_ref())
                 .collect();
             check_capture_lazy(&binder_names, &inner_subst, body, "exists");
             ExprNode::Exists {
@@ -778,9 +781,12 @@ fn substitute_impl(
                 // Pattern variables are locally bound; remove them from subst
                 // for the arm body.
                 let bound = pattern_bound_names(&a.pattern);
+                let bound_lns: Vec<crate::lean_name::LeanName> = bound.iter()
+                    .map(|n| crate::lean_name::LeanName::synthetic(n.clone()))
+                    .collect();
                 let mut inner = subst.clone();
-                for n in &bound { inner.remove(n); }
-                let bound_refs: Vec<&str> = bound.iter().map(String::as_str).collect();
+                for n in &bound_lns { inner.remove(n); }
+                let bound_refs: Vec<&crate::lean_name::LeanName> = bound_lns.iter().collect();
                 check_capture_lazy(&bound_refs, &inner, &a.body, "match pattern");
                 MatchArm {
                     pattern: a.pattern.clone(),
@@ -832,8 +838,8 @@ fn substitute_impl(
 /// per binder hit (body and live-value free-var collection), both
 /// bounded by expression size.
 fn check_capture_lazy(
-    binder_names: &[&str],
-    inner_subst: &std::collections::HashMap<String, Expr>,
+    binder_names: &[&crate::lean_name::LeanName],
+    inner_subst: &std::collections::HashMap<crate::lean_name::LeanName, Expr>,
     body: &Expr,
     binder_kind: &str,
 ) {
@@ -845,9 +851,8 @@ fn check_capture_lazy(
     };
     // Only keys that actually occur free in the body would trigger
     // substitution inside this binder's scope.
-    let live_keys: Vec<&str> = inner_subst.keys()
+    let live_keys: Vec<&crate::lean_name::LeanName> = inner_subst.keys()
         .filter(|k| body_free.contains(k.as_str()))
-        .map(String::as_str)
         .collect();
     if live_keys.is_empty() { return; }
 
@@ -856,33 +861,33 @@ fn check_capture_lazy(
         collect_free_vars(&inner_subst[*k], &std::collections::HashSet::new(), &mut free_in_live_values);
     }
     for name in binder_names {
-        if free_in_live_values.contains(*name) {
+        if free_in_live_values.contains(name.as_str()) {
             panic!(
                 "Lean-AST substitute: binder `{}` (kind: {}) would capture a free \
                  variable of the same name in a substitution value — alpha-\
                  renaming not yet implemented. See `substitute` in lean_ast.rs.",
-                name, binder_kind,
+                name.as_str(), binder_kind,
             );
         }
     }
 }
 
 fn subst_without(
-    subst: &std::collections::HashMap<String, Expr>,
-    name: &str,
-) -> std::collections::HashMap<String, Expr> {
+    subst: &std::collections::HashMap<crate::lean_name::LeanName, Expr>,
+    name: &crate::lean_name::LeanName,
+) -> std::collections::HashMap<crate::lean_name::LeanName, Expr> {
     let mut out = subst.clone();
     out.remove(name);
     out
 }
 
 fn subst_remove_binders(
-    subst: &std::collections::HashMap<String, Expr>,
+    subst: &std::collections::HashMap<crate::lean_name::LeanName, Expr>,
     binders: &[Binder],
-) -> std::collections::HashMap<String, Expr> {
+) -> std::collections::HashMap<crate::lean_name::LeanName, Expr> {
     let mut out = subst.clone();
     for b in binders {
-        if let Some(n) = &b.name { out.remove(n.as_str()); }
+        if let Some(n) = &b.name { out.remove(n); }
     }
     out
 }
@@ -1053,8 +1058,8 @@ mod substitute_tests {
             body: Box::new(body),
         })
     }
-    fn subst_of(pairs: &[(&str, Expr)]) -> HashMap<String, Expr> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    fn subst_of(pairs: &[(&str, Expr)]) -> HashMap<crate::lean_name::LeanName, Expr> {
+        pairs.iter().map(|(k, v)| (LeanName::lit(*k), v.clone())).collect()
     }
     fn node_eq(a: &Expr, b: &Expr) -> bool {
         // Printed form as a rough structural-equality check — the
