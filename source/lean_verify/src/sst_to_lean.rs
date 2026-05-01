@@ -885,9 +885,9 @@ fn walk_obligations<'a>(
                 e,
             );
         }
-        Wp::Call { callee, args, typ_args, dest, call_span, mut_args, after } => {
+        Wp::Call { callee, spec_callee, args, typ_args, dest, call_span, mut_args, after } => {
             walk_call(
-                callee, args, typ_args, *dest, call_span, mut_args, after, ctx, obl, e,
+                callee, spec_callee, args, typ_args, *dest, call_span, mut_args, after, ctx, obl, e,
             );
         }
         Wp::Loop { cond, invs, validated_invs, inv_kinds, decrease, modified_vars, body, after, d_old_name } => {
@@ -1324,61 +1324,6 @@ fn rewrite_one_varat(e: &Exp, mut_param_names: &HashSet<String>) -> Exp {
     e.clone()
 }
 
-/// Pick the source of `require`/`ensure` clauses for a callee.
-///
-/// For `FunctionKind::TraitMethodImpl` callees, the impl's
-/// `require`/`ensure` are typically empty (Verus rejects impl-side
-/// `requires` clauses; impls may redeclare `ensures` only if they
-/// imply the trait's). The CALLER'S contract is the trait method
-/// decl's spec — that's the weakest, and any impl satisfies it by
-/// Verus's trait-impl-checking pass.
-///
-/// This helper redirects spec lookup to the trait method decl when
-/// the callee is a `TraitMethodImpl`. The impl's params/typ_params/
-/// ret stay as-is (they have concrete types, used for binder
-/// rendering); only `require`/`ensure` come from the trait decl.
-///
-/// **Trade-off**: impl-specific strengthening of `ensures` isn't
-/// seen at call sites yet. A pure spec-via-trait MVS doesn't see
-/// the case where an impl says "ensures r > 0" while the trait
-/// only said "ensures r ≠ 5". Strengthening cases would require
-/// a per-clause merge. Deferred follow-up to #56.
-///
-/// **Sound by construction.** Verus's trait-impl-checking pass
-/// guarantees the impl's spec implies the trait's spec
-/// (modulo Self substitution). Using the trait's spec is always
-/// at least as conservative as the impl's at the caller site.
-fn pick_spec_source<'a>(
-    callee: &'a FunctionX,
-    fn_map: &FnMap<'a>,
-) -> Result<&'a FunctionX, String> {
-    // Explicit destructure of every FunctionKind variant — a new
-    // upstream variant that needs spec redirection (e.g., a future
-    // "TraitMethodImplWithDefault" or similar) would force a compile
-    // error here rather than silently falling through to "use the
-    // callee's specs as-is" (which can be wrong if the impl
-    // inherits from another source).
-    match &callee.kind {
-        FunctionKind::TraitMethodImpl { method, .. } => {
-            fn_map.get(method).copied().ok_or_else(|| format!(
-                "trait method decl `{:?}` for resolved impl `{:?}` not found \
-                 in the crate's function map — cross-crate trait calls are \
-                 not yet supported",
-                method.path, callee.name.path,
-            ))
-        }
-        // `Static` — regular fn, specs are on the callee itself.
-        // `TraitMethodDecl` — the trait method itself (called via
-        //   non-DynamicResolved path); specs are on the callee.
-        // `ForeignTraitMethodImpl` — per its docstring, demoted to
-        //   Static by `demote_foreign_traits`, so we shouldn't see
-        //   it here. If we do, treat as Static (specs on callee).
-        FunctionKind::Static
-        | FunctionKind::TraitMethodDecl { .. }
-        | FunctionKind::ForeignTraitMethodImpl { .. } => Ok(callee),
-    }
-}
-
 /// Per-obligation walker for `Wp::Call`. Splits the call's
 /// obligations across separate theorems and pushes post-call
 /// frames onto the obligation context.
@@ -1392,7 +1337,7 @@ fn pick_spec_source<'a>(
 ///   method decl (the impl's specs are typically empty since
 ///   Verus rejects impl-side `requires` clauses; trait specs are
 ///   inherited). For all other callees, `spec_callee == callee`.
-///   See `pick_spec_source`.
+///   Resolved by `resolve_callee`.
 ///
 /// **Phases.** The walker delegates to three helpers:
 /// 1. `build_call_substitutions` — render args, gensym fresh
@@ -1405,6 +1350,7 @@ fn pick_spec_source<'a>(
 ///    shapes the obligation context for the post-call continuation.
 fn walk_call<'a>(
     callee: &FunctionX,
+    spec_callee: &FunctionX,
     args: &[Validated<'a>],
     typ_args: &[Typ],
     dest: Option<&VarIdent>,
@@ -1415,8 +1361,9 @@ fn walk_call<'a>(
     obl: &OblCtx,
     e: &mut ObligationEmitter,
 ) {
-    let spec_callee = pick_spec_source(callee, &ctx.fn_map)
-        .expect("build_wp_call should have rejected unresolvable trait-spec lookups");
+    // `spec_callee` was resolved at build time (see `resolve_callee`)
+    // and threaded through `Wp::Call`. No re-derivation, no `expect()`
+    // — the type system guarantees it's present.
 
     let subst = build_call_substitutions(callee, spec_callee, typ_args, args, mut_args, e);
 
@@ -1794,7 +1741,7 @@ fn push_post_call_frames(
         .collect();
     // Add the impl's strengthened ensures only when the call is a
     // trait-method-impl dispatch (then callee is the impl, spec_callee
-    // is the trait method decl — see `pick_spec_source`). For all
+    // is the trait method decl — see `resolve_callee`). For all
     // other callees, callee == spec_callee structurally, and the
     // impl-strengthening conjunction would just duplicate the same
     // clauses.
@@ -2111,6 +2058,15 @@ enum Wp<'a> {
     /// pre-D `lower_call` did).
     Call {
         callee: &'a FunctionX,
+        /// Source of `require`/`ensure` clauses for this call. For
+        /// trait-method-impl callees, this is the trait method decl
+        /// (different `FunctionX` than `callee`); for all other
+        /// callees, this is `callee` itself. Resolved once at build
+        /// time by `resolve_callee` so `walk_call` doesn't need to
+        /// re-derive it via a fallible lookup. The type system
+        /// now guarantees `spec_callee` is always present — no
+        /// runtime `expect()` needed.
+        spec_callee: &'a FunctionX,
         /// Validated arg expressions, in the same order as
         /// `callee.params`. Built at `build_wp_call` time; each
         /// arg is checked once and the witness is held here so
@@ -2648,7 +2604,7 @@ fn build_wp_call<'a>(
 ) -> Result<Wp<'a>, String> {
     reject_unsupported_call_shapes(split)?;
 
-    let (callee, callee_typ_args) =
+    let (callee, spec_callee, callee_typ_args) =
         resolve_callee(fun, resolved_method, is_trait_default, typ_args, ctx)?;
 
     validate_call_arities(callee, args, callee_typ_args)?;
@@ -2669,6 +2625,7 @@ fn build_wp_call<'a>(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Wp::Call {
         callee,
+        spec_callee,
         args: validated_args,
         typ_args: callee_typ_args,
         dest: bound_dest,
@@ -2686,7 +2643,7 @@ fn build_wp_call<'a>(
 ///
 /// `is_trait_default = Some(true)` is NOT rejected here (#96): the
 /// default body lives on the trait method decl, which
-/// `pick_spec_source` returns as `spec_callee` after `resolve_callee`
+/// `resolve_callee` returns as `spec_callee` after `resolve_callee`
 /// redirects to the trait method decl. The default-impl path goes
 /// through the same logic as concrete-impl calls; `Self` resolves
 /// via the existing typ_args / typ_subst machinery.
@@ -2701,7 +2658,9 @@ fn reject_unsupported_call_shapes(
     Ok(())
 }
 
-/// Phase 2: Resolve the call to a `(callee, callee_typ_args)` pair.
+/// Phase 2: Resolve the call to a `(callee, spec_callee, typ_args)`
+/// triple. Looking both up at build time eliminates the runtime
+/// re-resolution in `walk_call` and the corresponding `expect()`.
 ///
 /// `resolved_method` discriminates the cases:
 /// * `Some((resolved_fun, resolved_typs))` — `DynamicResolved`:
@@ -2712,17 +2671,21 @@ fn reject_unsupported_call_shapes(
 ///   may not be in fn_map; we let the lookup fail with the
 ///   cross-crate error.
 ///
-/// For `TraitMethodImpl` callees, additionally verify the trait
-/// method decl is in fn_map — `walk_call` reads the trait's
-/// `require`/`ensure` from there (the impl's are typically empty,
-/// inheriting from the trait).
+/// `spec_callee` is the source of `require`/`ensure` clauses:
+/// * For `FunctionKind::TraitMethodImpl` callees, the trait method
+///   decl (looked up via `callee.kind.method`).
+/// * Otherwise, the callee itself.
+///
+/// Resolving `spec_callee` here means `walk_call` doesn't need to
+/// re-derive it via fallible lookup, and the type system
+/// guarantees `spec_callee` is always present (no `expect()`).
 fn resolve_callee<'a>(
     fun: &'a Fun,
     resolved_method: &'a Option<(Fun, vir::ast::Typs)>,
     is_trait_default: &Option<bool>,
     typ_args: &'a vir::ast::Typs,
     ctx: &WpCtx<'a>,
-) -> Result<(&'a FunctionX, &'a [Typ]), String> {
+) -> Result<(&'a FunctionX, &'a FunctionX, &'a [Typ]), String> {
     // For `is_trait_default = Some(true)` calls (#96): the
     // `resolved_method`'s fn is a synthesized wrapper around the
     // trait's default body (path looks like `<impl>%default%<method>`),
@@ -2730,7 +2693,7 @@ fn resolve_callee<'a>(
     // (the wrapper has Self specialized, the call site passes Self
     // explicitly). Skip the redirect — use `fun` (the trait method
     // decl) directly, since the trait method decl already holds the
-    // default body and its specs. `pick_spec_source` then returns
+    // default body and its specs. `resolve_callee` then returns
     // it as both callee and spec_callee (TraitMethodDecl arm), so
     // no impl-strengthening conjunction is added (there's no impl
     // for default-impl calls — the default IS the body).
@@ -2750,17 +2713,24 @@ fn resolve_callee<'a>(
             callee_fun.path
         ));
     };
-    if let FunctionKind::TraitMethodImpl { method, .. } = &callee.kind {
-        if !ctx.fn_map.contains_key(method) {
-            return Err(format!(
+    // Resolve spec_callee structurally. For TraitMethodImpl, redirect
+    // to the trait method decl (Verus rejects impl-side `requires`,
+    // so the impl's spec is empty/inherited). For all other kinds,
+    // specs live on the callee itself.
+    let spec_callee = match &callee.kind {
+        FunctionKind::TraitMethodImpl { method, .. } => {
+            ctx.fn_map.get(method).copied().ok_or_else(|| format!(
                 "trait method decl `{:?}` for resolved impl `{:?}` not found in \
                  the crate's function map — cross-crate trait calls are not yet \
                  supported (#56 follow-up)",
                 method.path, callee_fun.path,
-            ));
+            ))?
         }
-    }
-    Ok((callee, callee_typ_args))
+        FunctionKind::Static
+        | FunctionKind::TraitMethodDecl { .. }
+        | FunctionKind::ForeignTraitMethodImpl { .. } => callee,
+    };
+    Ok((callee, spec_callee, callee_typ_args))
 }
 
 /// Phase 3: Validate that the call's arities (value-args + type-args)
