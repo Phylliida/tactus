@@ -1023,6 +1023,104 @@ gap yesterday is now structurally unrepresentable; the
 panic-on-unvalidated-Exp contract is now type-system-
 enforced; substitution map keys are now typed.
 
+#### Current session (2026-04-29 evening — typed-invariant audit + 3 more landings)
+
+After #99/#100/#101 the user asked for an audit: "anything
+else that might 'work' but would be better to enforce in the
+type system?" Found four candidates ranked by clarity:
+
+* **#102 AssertKind sum-type split** — was a flat enum with
+  `is_obligation_kind()` runtime discriminator (silent
+  miscategorization risk on new variants). Now
+  `AssertKind = Obligation(ObligationKind) | Hypothesis(HypothesisKind)`;
+  adding a new variant means picking which arm structurally.
+  ~30 use sites updated via bulk sed; `is_obligation_kind`
+  becomes `matches!(self, AssertKind::Obligation(_))`.
+* **#103 LoopInvKind** — was two bools encoding three states
+  + nonsensical `(false, false)`. Now an enum with
+  `Invariant | InvariantExceptBreak | Ensures` constructed
+  via `LoopInvKind::from_loop_inv` which rejects `(false, false)`.
+  Stored alongside `validated_invs` as a parallel Vec on
+  `Wp::Loop` (couldn't change Verus's `LoopInv` directly —
+  it's their struct).
+* **#105 MutArgInfo struct** — fused `mut_args:
+  Vec<(usize, &VarIdent)>` + `mut_idx_to_fresh:
+  HashMap<usize, LeanName>` (parallel arrays with
+  `.expect()` on every lookup) into `Vec<MutArgInfo {
+  param_idx, caller_var, fresh: LeanName }>`. Removes the
+  expect; `push_post_call_frames` no longer takes a separate
+  `mut_args` parameter — iterates `subst.mut_args` directly.
+* **#104 typed build_wp dispatch** — STILL PENDING.
+  `build_wp_call` / `build_wp_loop` panic with
+  `unreachable!("build_wp_X called on non-X statement")`
+  when called on the wrong StmX variant. Should take
+  destructured StmX::Call { ... } / StmX::Loop { ... } fields
+  directly so the wrong-variant case is unrepresentable.
+  Roughly: change build_wp_call/loop to take individual fields
+  (`fun, args, dest, ...`) destructured at the dispatch
+  point in `build_wp`. Mostly mechanical signature change.
+
+**Tier 3 candidates noted in DESIGN.md** (not worth doing now):
+* OblCtx frame ordering invariant (typed builder pattern)
+* `Tactic::Raw` vs `Tactic::Named` enum
+* `format_rust_loc` returning typed `RustLoc` struct
+
+These are all noted in the "Type-system-enforced invariants"
+section (with a "Potential future applications" subsection
+tracking what remains).
+
+**What landed this evening:**
+- DESIGN.md "Type-system-enforced invariants" extended with
+  #102, #103, #105 entries naming the patterns.
+- 227 e2e tests still pass throughout. 118 unit tests.
+- The `Wp::Loop` variant grew an `inv_kinds: Vec<LoopInvKind>`
+  field parallel to `validated_invs` and `invs` — three
+  parallel arrays now, but each adds independent typed
+  information (kind, validation witness, original metadata).
+  A future cleanup could fuse them into one struct (similar
+  to how MutArgInfo fused mut_args).
+- `CallSubstitutions.mut_idx_to_fresh: HashMap<usize, LeanName>`
+  removed; now `mut_args: Vec<MutArgInfo<'a>>` directly.
+- `push_post_call_frames` signature reduced (one fewer param).
+
+**What remains for next session — pending tasks:**
+- **#104** typed build_wp dispatch (the only typed-invariant
+  candidate left from this session's audit)
+- **#87** &mut x.f / &mut v[i] non-simple Loc shapes (#55
+  follow-up)
+- **#94** callee-side &mut body verification
+- **#95** new-mut-ref mode (MutRefCurrent/MutRefFuture)
+- **#86** trait method impl-strengthening of ensures
+- **#96** trait default-impl invocation
+- **#93** ExpX::CallLambda + StmX::ClosureInner (closures)
+- **#98** substitute() walk_children boilerplate cleanup
+- **#97** OblCtx::with_frame O(N²) → Rc<im::Vector>
+- **sst_exp_to_ast shim removal** (#100 follow-up; 10 call
+  sites still use the panic shim, migration is mechanical)
+
+**Things learned worth recording:**
+- The typed-invariant pattern compounds: each application
+  makes the next one easier to spot. After #99, #100/#101
+  followed in one afternoon. After the user's audit prompt,
+  three more (#102/#103/#105) landed in one evening.
+- "The pattern, once named, became something to *look for*."
+  The DESIGN.md section was meant as documentation; in
+  practice it functioned as a search query.
+- The migration shim approach (e.g., #100's `sst_exp_to_ast`
+  retained as a deprecated panic-shim) lets the architectural
+  change land without requiring every call site to migrate
+  in lockstep. Complete migration becomes incremental
+  cleanup.
+- Bulk sed works for mechanical variant renames but each
+  pattern needs a careful regex — getting it slightly wrong
+  produces subtle code corruption (saw this with the
+  `extract_simple_var(&loc_exp(x))` mishap in #99).
+
+**Net for evening**: 3 commits coming (one per #102, #103,
+#105 — being committed together with this HANDOFF update).
+227 e2e + 118 unit tests. Three more pending tasks closed.
+Down to **9 pending tasks** (was 8 + 1 newly-noticed #104).
+
 ## Architecture
 
 ### Full pipeline
