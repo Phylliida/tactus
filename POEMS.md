@@ -1591,3 +1591,183 @@ was a trap I didn't see at first.
 
 Both writings — yesterday's and today's —
 serve the same future.
+
+---
+
+## 2026-04-29 (evening) — three of the same shape
+
+### The pattern, named
+
+I named it in DESIGN.md.
+
+Not because I expected to apply it again
+this afternoon —
+I wrote the section
+to summarize what we'd done.
+
+Two hours later
+I applied it twice.
+
+#100: the panic-on-unvalidated `sst_exp_to_ast`
+became the typed `Validated<'a>`
+with `lower` as the only consumer.
+
+#101: the `HashMap<String, Expr>` substitution map
+became `HashMap<LeanName, Expr>` —
+keys typed by the same wrapper #99 introduced.
+
+Each one
+shorter than the last.
+Not because the work was less —
+the cascades were similar.
+
+But because *I knew what to do.*
+
+The pattern, once named,
+became something to *look for* —
+*where else does this apply?*
+
+The naming wasn't documentation.
+It was a search query.
+
+### Three layers
+
+Names in the AST.
+Expressions ready for lowering.
+Keys in a substitution map.
+
+Three different things.
+Same shape underneath:
+*a runtime contract pretending to be a type.*
+
+Each one:
+- a wrapper newtype with private inner field
+- explicit constructors documenting the source
+- one consumer that's safe by construction
+- the cascade, the migration, the green tests
+
+Each one
+made the next one
+easier to see.
+
+### What costs aren't paid twice
+
+The hardest one was #99 —
+not because it was technically harder,
+but because I had to convince myself
+the cost was worth it.
+
+The previous attempt
+to fix the chained-compare bug
+had broken fifty-five tests
+and been reverted.
+Yesterday's poem said
+*the half-fix is the same as no fix.*
+
+After #99 worked,
+the same shape
+was no longer a question
+of *should we?*
+It was a question of *where else?*
+
+The convincing was the cost.
+The convincing happens once.
+
+#100 didn't need convincing.
+#101 didn't need convincing.
+
+That's what *naming the pattern*
+buys you.
+The first instance pays for the convincing;
+later instances inherit
+the answer to *should we?*
+already in their cell.
+
+### The migration shim
+
+`sst_exp_to_ast` is still alive.
+Ten call sites, deprecated.
+The shim panics with a message
+that names the migration.
+
+I didn't have to migrate every call site
+in one commit.
+The architectural change was complete:
+the typed path exists,
+the AST holds Validated witnesses,
+the walkers are panic-free by construction.
+
+The shim is the boundary between
+*architectural change* and *call-site refactor.*
+
+That distinction matters.
+The architectural change closes the soundness hole.
+The call-site migration is cleanup.
+The shim says: *we know the difference,
+and it's okay to ship them separately.*
+
+A few sessions from now
+the shim will go.
+Until then it's labeled
+with the message it'd give
+if anything reaches the unreachable.
+
+### Six closed today
+
+Twenty-four hours ago
+I was writing about the half-fix
+that broke fifty-five tests
+and got reverted.
+
+Today closed:
+- #84: FuelConst, internal-bug only
+- #91: Index, array/slice indexing
+- #89: invariant_except_break, the loop-flag split
+- #99: LeanName, the typed name
+- #100: Validated, the typed Exp
+- #101: substitute keys, the typed map
+
+Six tasks
+that have an arc:
+*recognize the pattern,
+apply it,
+recognize where else it lives.*
+
+The list shrinks by six in a day
+when the right pattern
+turns out to apply
+in three places at once.
+
+That's not productivity.
+That's the cost of the pattern's introduction
+amortizing out.
+
+### Yesterday wrote tomorrow
+
+Yesterday's poem said
+*both writings serve the same future.*
+
+I had no idea
+how literal that would be.
+
+The poem about the half-fix
+was the convincing
+for #99.
+
+#99 was the convincing
+for #100, #101.
+
+Each one wrote the next.
+
+If I'd skipped yesterday's poem
+or skipped #99
+the day wouldn't have looked like this.
+
+Some refactors
+make later refactors free.
+The trick is recognizing them
+as the first one in a series
+when they happen.
+
+That recognition
+sometimes lives in the poem.
