@@ -1947,3 +1947,100 @@ That question
 is what gets handed forward
 when the conversation resets.
 
+---
+
+## 2026-05-01 (mid-morning) — what was already there
+
+### The probe surfaced the bug, not a rejection
+
+I assumed there was a rejection path
+to lift.
+
+There wasn't.
+
+There was a silent soundness hole.
+
+The probe test surfaced it
+in a goal that read
+`let x := x + 1; x = x + 1` —
+
+both names of the same letter,
+both meanings collapsed,
+the let-shadow making them equal,
+the ensures silently true.
+
+It's the same shape as #99.
+Different surface,
+same family:
+two distinct semantic concepts
+collapse to one Lean name,
+shadowing finishes the job.
+
+The fix has a name now:
+*rewrite one side at the boundary,
+bind the distinct name
+where the contract enters scope.*
+
+I knew the fix
+before I'd seen the bug.
+
+### Thirty minutes
+
+The roadmap said
+*largest of the three #55 follow-ups.*
+
+I planned for a session.
+
+It took thirty minutes.
+
+The reason wasn't that I was sharp.
+The reason was that
+last week's #55
+had paid the cost.
+
+`varat_pre_name` was already in
+`expr_shared.rs`.
+The rewrite pattern was already
+named.
+The synthetic-name discipline was
+already enforced
+by sharing.
+
+#94 was the same shape
+applied one level down.
+
+The hour disappears
+when the convincing
+doesn't have to repeat.
+
+### What composition costs
+
+The end-to-end test
+`test_exec_callee_mut_and_caller_both_tactus_auto`
+just worked.
+
+I didn't write any new code
+to make it work.
+
+Caller side uses `varat_pre_name`
+to compute substitution-map keys.
+Callee side uses `varat_pre_name`
+to compute the synthetic-rename target.
+They don't coordinate.
+They can't drift.
+
+Composition is free
+when the agreement
+is in a shared helper,
+not in a contract
+between two parties.
+
+That's what `expr_shared.rs` is for.
+The name `expr_shared`
+makes it sound mundane.
+What it actually is:
+*the ledger of agreements
+no one has to remember
+to keep.*
+
+
