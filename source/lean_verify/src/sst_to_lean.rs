@@ -124,6 +124,7 @@ use vir::ast_visitor::map_expr_visitor;
 use vir::messages::Span;
 use crate::lean_ast::{
     and_all, substitute, AssertKind, Binder as LBinder, BinderKind, Expr as LExpr,
+    HypothesisKind, ObligationKind,
     Tactic, Theorem,
 };
 use crate::expr_shared::varat_pre_name;
@@ -131,6 +132,71 @@ use std::sync::Arc;
 use crate::to_lean_expr::vir_expr_to_ast;
 use crate::to_lean_sst_expr::{lower as lower_validated, sst_exp_to_ast, sst_exp_to_ast_checked, type_bound_predicate, Validated};
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
+
+/// Typed view of a loop invariant's classification (#103).
+///
+/// Verus's `LoopInv` carries `at_entry: bool` + `at_exit: bool` —
+/// two booleans that encode three meaningful states *and* one
+/// nonsensical `(false, false)` we'd silently filter to no
+/// contribution. Pre-#103 our code used `i.at_entry` / `i.at_exit`
+/// directly; if Verus ever produced `(false, false)`, we'd carry
+/// the inv through the rendering pipeline only to skip both
+/// emission paths.
+///
+/// Post-#103: at the build_wp_loop boundary, each `LoopInv` is
+/// classified into one of three named states; `(false, false)` is
+/// rejected with a clear error rather than silently dropped. The
+/// downstream pipeline pattern-matches on the kind, and adding a
+/// new variant forces every consumer site to make a decision
+/// (Rust's exhaustive-match check).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LoopInvKind {
+    /// `invariant P` — at_entry = at_exit = true. Holds at every
+    /// iteration boundary AND at every loop exit.
+    Invariant,
+    /// `invariant_except_break P` — at_entry = true, at_exit = false.
+    /// Holds at iteration boundaries; break may invalidate.
+    InvariantExceptBreak,
+    /// `ensures P` (on a loop) — at_entry = false, at_exit = true.
+    /// Required at every loop exit; not required during iteration.
+    Ensures,
+}
+
+impl LoopInvKind {
+    /// Convert from Verus's flag pair, rejecting the nonsensical
+    /// `(false, false)` shape.
+    fn from_loop_inv(inv: &LoopInv) -> Result<Self, String> {
+        match (inv.at_entry, inv.at_exit) {
+            (true, true) => Ok(LoopInvKind::Invariant),
+            (true, false) => Ok(LoopInvKind::InvariantExceptBreak),
+            (false, true) => Ok(LoopInvKind::Ensures),
+            (false, false) => Err(
+                "loop invariant has neither at_entry nor at_exit set — \
+                 this combination is meaningless (Verus internal bug?). \
+                 Please open an issue.".to_string()
+            ),
+        }
+    }
+
+    /// Whether this kind contributes to the iteration-boundary
+    /// (continue / fallthrough) obligations: init theorems,
+    /// maintain ctx hyp, body's continue_leaf.
+    pub fn at_entry(&self) -> bool {
+        match self {
+            LoopInvKind::Invariant | LoopInvKind::InvariantExceptBreak => true,
+            LoopInvKind::Ensures => false,
+        }
+    }
+
+    /// Whether this kind contributes to the loop-exit (break /
+    /// natural-fallthrough) obligations: break_leaf, use ctx hyp.
+    pub fn at_exit(&self) -> bool {
+        match self {
+            LoopInvKind::Invariant | LoopInvKind::Ensures => true,
+            LoopInvKind::InvariantExceptBreak => false,
+        }
+    }
+}
 
 /// Lookup table from callee `Fun` to its VIR-AST `FunctionX`. Used by
 /// `Wp::Call` lowering to inline a callee's `requires` / `ensures`
@@ -229,7 +295,7 @@ impl<'a> WpCtx<'a> {
         let ensures_goal = and_all(
             check.post_condition.ens_exps.iter().map(|ens| LExpr::span_mark(
                 format_rust_loc(&ens.span),
-                AssertKind::Postcondition,
+                AssertKind::Obligation(ObligationKind::Postcondition),
                 sst_exp_to_ast(ens),
             )).collect()
         );
@@ -634,14 +700,14 @@ impl ObligationEmitter {
 /// identifiers in generated Lean.
 fn kind_to_name(k: AssertKind) -> &'static str {
     match k {
-        AssertKind::Plain => "assert",
-        AssertKind::Postcondition => "postcondition",
-        AssertKind::LoopInvariant => "loop_invariant",
-        AssertKind::LoopDecrease => "loop_decrease",
-        AssertKind::LoopCondition => "loop_condition",
-        AssertKind::BranchCondition => "branch_condition",
-        AssertKind::CallPrecondition => "precondition",
-        AssertKind::Termination => "termination",
+        AssertKind::Obligation(ObligationKind::Plain) => "assert",
+        AssertKind::Obligation(ObligationKind::Postcondition) => "postcondition",
+        AssertKind::Obligation(ObligationKind::LoopInvariant) => "loop_invariant",
+        AssertKind::Obligation(ObligationKind::LoopDecrease) => "loop_decrease",
+        AssertKind::Hypothesis(HypothesisKind::LoopCondition) => "loop_condition",
+        AssertKind::Hypothesis(HypothesisKind::BranchCondition) => "branch_condition",
+        AssertKind::Obligation(ObligationKind::CallPrecondition) => "precondition",
+        AssertKind::Obligation(ObligationKind::Termination) => "termination",
     }
 }
 
@@ -739,7 +805,7 @@ fn walk_obligations<'a>(
             // documents the trade-off.
             let cond_marked = LExpr::span_mark(
                 format_rust_loc(&cond.raw().span),
-                AssertKind::BranchCondition,
+                AssertKind::Hypothesis(HypothesisKind::BranchCondition),
                 lower_validated(*cond),
             );
             walk_obligations(
@@ -758,9 +824,9 @@ fn walk_obligations<'a>(
                 callee, args, typ_args, *dest, call_span, mut_args, after, ctx, obl, e,
             );
         }
-        Wp::Loop { cond, invs, validated_invs, decrease, modified_vars, body, after, d_old_name } => {
+        Wp::Loop { cond, invs, validated_invs, inv_kinds, decrease, modified_vars, body, after, d_old_name } => {
             walk_loop(
-                *cond, invs, validated_invs, *decrease, modified_vars, body, after, d_old_name, ctx, obl, e,
+                *cond, invs, validated_invs, inv_kinds, *decrease, modified_vars, body, after, d_old_name, ctx, obl, e,
             );
         }
         Wp::AssertByTactus { cond, tactic_text, body } => {
@@ -807,17 +873,17 @@ fn walk_assert_by_tactus<'a>(
             // Assert-by: emit one theorem for `c` with the user's
             // tactic as the closer (or `tactus_auto` if empty).
             // The cond becomes a hypothesis for body theorems.
-            // AssertKind::Plain because it's a user-written
+            // AssertKind::Obligation(ObligationKind::Plain) because it's a user-written
             // `assert(P) by { tac }` — same kind a plain
             // `assert(P)` would get via `detect_assert_kind`.
             let loc = format_rust_loc(&c.raw().span);
             let cond_ast = lower_validated(c);
             let goal = LExpr::span_mark(
-                loc.clone(), AssertKind::Plain, cond_ast.clone(),
+                loc.clone(), AssertKind::Obligation(ObligationKind::Plain), cond_ast.clone(),
             );
             let id = e.next_id();
             let name = build_theorem_name(
-                kind_to_name(AssertKind::Plain), &e.fn_name, &loc, id,
+                kind_to_name(AssertKind::Obligation(ObligationKind::Plain)), &e.fn_name, &loc, id,
             );
             let closer = if user_tactic_present {
                 Tactic::Raw(tactic_text.to_string())
@@ -940,6 +1006,7 @@ fn walk_loop<'a>(
     cond: Option<Validated<'a>>,
     invs: &[LoopInv],
     validated_invs: &[Validated<'a>],
+    inv_kinds: &[LoopInvKind],
     decrease: Validated<'a>,
     modified_vars: &[(&'a VarIdent, &'a Typ)],
     body: &Wp<'a>,
@@ -960,34 +1027,34 @@ fn walk_loop<'a>(
     // `ensures` (at_exit only) flow into one each.
     let inv_marked = |(i, v): (&LoopInv, &Validated<'a>)| LExpr::span_mark(
         format_rust_loc(&i.inv.span),
-        AssertKind::LoopInvariant,
+        AssertKind::Obligation(ObligationKind::LoopInvariant),
         lower_validated(*v),
     );
     let cond_marked = |c: Validated<'a>| LExpr::span_mark(
         format_rust_loc(&c.raw().span),
-        AssertKind::LoopCondition,
+        AssertKind::Hypothesis(HypothesisKind::LoopCondition),
         lower_validated(c),
     );
     let entry_inv_conj_marked = and_all(
-        invs.iter().zip(validated_invs.iter())
-            .filter(|(i, _)| i.at_entry)
-            .map(inv_marked).collect()
+        invs.iter().zip(validated_invs.iter()).zip(inv_kinds.iter())
+            .filter(|(_, k)| k.at_entry())
+            .map(|((i, v), _)| inv_marked((i, v))).collect()
     );
     let exit_inv_conj_marked = and_all(
-        invs.iter().zip(validated_invs.iter())
-            .filter(|(i, _)| i.at_exit)
-            .map(inv_marked).collect()
+        invs.iter().zip(validated_invs.iter()).zip(inv_kinds.iter())
+            .filter(|(_, k)| k.at_exit())
+            .map(|((i, v), _)| inv_marked((i, v))).collect()
     );
 
     // ── Init: one theorem per `at_entry` invariant. These are the
     // ones the user claims hold at loop entry (i.e., before the
     // first iteration). Loop ensures (`at_entry = false`) skip init
     // — they're established at exit, not at entry.
-    for (inv, v) in invs.iter().zip(validated_invs.iter()).filter(|(i, _)| i.at_entry) {
+    for ((inv, v), _) in invs.iter().zip(validated_invs.iter()).zip(inv_kinds.iter()).filter(|(_, k)| k.at_entry()) {
         let loc = format_rust_loc(&inv.inv.span);
         let id = e.next_id();
         let name = build_theorem_name(
-            kind_to_name(AssertKind::LoopInvariant), &e.fn_name, &loc, id,
+            kind_to_name(AssertKind::Obligation(ObligationKind::LoopInvariant)), &e.fn_name, &loc, id,
         );
         e.emit(name, obl.wrap(inv_marked((inv, v))), simple_tactic(e));
     }
@@ -1218,16 +1285,40 @@ fn walk_call<'a>(
     }
 
     let new_obl = push_post_call_frames(
-        callee, spec_callee, &subst, mut_args, dest, obl,
+        callee, spec_callee, &subst, dest, obl,
     );
     walk_obligations(after, ctx, &new_obl, e);
+}
+
+/// One `&mut` argument at a call site (#105).
+///
+/// Pre-#105, `mut_args: Vec<(usize, &VarIdent)>` and
+/// `mut_idx_to_fresh: HashMap<usize, LeanName>` were parallel
+/// structures keyed on the same `usize`. Every consumer site did
+/// `mut_idx_to_fresh.get(idx).expect(…)` — a runtime check for
+/// "every mut_args entry has a matching fresh name." Fusing the
+/// two into a struct removes the lookup-and-expect; the type
+/// guarantees the fresh name is present.
+#[derive(Clone)]
+struct MutArgInfo<'a> {
+    /// Index into `callee.params` / call-site `args` of this
+    /// `&mut` parameter.
+    param_idx: usize,
+    /// Caller-side `VarIdent` whose memory is being mutated.
+    /// Extracted from the call-site arg via `extract_simple_var_ident`.
+    caller_var: &'a VarIdent,
+    /// Fresh `_tactus_mut_post_<id>` post-call name for this
+    /// `&mut` arg. `walk_call` introduces this as the ∀-binder
+    /// for the post-call existential; the ensures Hyp references
+    /// it as the post-state value.
+    fresh: crate::lean_name::LeanName,
 }
 
 /// Substitution-related state needed to inline a callee's specs at
 /// a call site. Built once by `build_call_substitutions`, used
 /// twice — once for the precondition theorem (via `req_subst`)
 /// and once for the post-call ensures hypothesis (via `ens_subst`).
-struct CallSubstitutions {
+struct CallSubstitutions<'a> {
     /// Type-arg substitution: `TypParam(T) ↦ Var(rendered_typ_arg)`.
     /// Shared between req and ens. `TypParam` renders as `Var("T")`
     /// so value-level substitution rewrites it.
@@ -1251,12 +1342,12 @@ struct CallSubstitutions {
     /// rendering, so the substitution maps above can target
     /// pre-state references separately from post-state.
     mut_param_names: HashSet<String>,
-    /// Fresh post-state name per `&mut` param, indexed by
-    /// `callee.params` position. Used both in `ens_subst` and as
-    /// the ∀-binder name in the post-call frames. `synthetic`-typed
-    /// because gensym'd via `_tactus_mut_post_<id>` — already a
-    /// valid Lean identifier, no sanitization needed.
-    mut_idx_to_fresh: HashMap<usize, crate::lean_name::LeanName>,
+    /// One entry per `&mut` arg at this call site (#105). Each
+    /// `MutArgInfo` bundles the param index, caller-side variable,
+    /// and the gensym'd post-call fresh name — replacing the
+    /// pre-#105 parallel `mut_args: Vec<(usize, &VarIdent)>` +
+    /// `mut_idx_to_fresh: HashMap<usize, LeanName>`.
+    mut_args: Vec<MutArgInfo<'a>>,
     /// Fresh name for the callee's return value. Used as the
     /// ∀-binder name in post-call frames; substituted in the
     /// ensures rendering. Avoids shadowing caller-scope locals
@@ -1270,9 +1361,9 @@ fn build_call_substitutions<'a>(
     callee: &FunctionX,
     typ_args: &[Typ],
     args: &[Validated<'a>],
-    mut_args: &[(usize, &VarIdent)],
+    mut_args_raw: &[(usize, &'a VarIdent)],
     e: &mut ObligationEmitter,
-) -> CallSubstitutions {
+) -> CallSubstitutions<'a> {
     // Type-param substitution (shared by req + ens). `TypParam(T)`
     // renders as `Var("T")` so value-level substitute rewrites it.
     let mut typ_subst: HashMap<crate::lean_name::LeanName, LExpr> = HashMap::new();
@@ -1290,20 +1381,26 @@ fn build_call_substitutions<'a>(
         args.iter().map(|a| lower_validated(*a)).collect();
 
     // Set of &mut param names for the VarAt rewriter.
-    let mut_param_names: HashSet<String> = mut_args.iter()
+    let mut_param_names: HashSet<String> = mut_args_raw.iter()
         .map(|(idx, _)| sanitize(&callee.params[*idx].x.name.0))
         .collect();
 
-    // Fresh post-call name per &mut param. The `_tactus_*` prefix is
-    // reserved per Convention 1 in `expr_shared.rs`'s "Reserved
-    // identifier conventions" section. `next_id()` is the per-fn
-    // counter — sufficient because theorem names are namespaced by
-    // fn_name.
-    let mut mut_idx_to_fresh: HashMap<usize, crate::lean_name::LeanName> = HashMap::new();
-    for (idx, _) in mut_args {
-        let id = e.next_id();
-        mut_idx_to_fresh.insert(*idx, crate::lean_name::LeanName::synthetic(format!("_tactus_mut_post_{}", id)));
-    }
+    // One MutArgInfo per `&mut` arg — bundles param_idx,
+    // caller_var, and the gensym'd fresh post-call name (#105).
+    // Replaces the pre-#105 parallel `mut_args` + `mut_idx_to_fresh`.
+    // The `_tactus_*` prefix is reserved per Convention 1 in
+    // `expr_shared.rs`'s "Reserved identifier conventions" section.
+    // `next_id()` is the per-fn counter — sufficient because theorem
+    // names are namespaced by fn_name.
+    let mut_args: Vec<MutArgInfo<'a>> = mut_args_raw.iter()
+        .map(|(idx, caller_var)| MutArgInfo {
+            param_idx: *idx,
+            caller_var,
+            fresh: crate::lean_name::LeanName::synthetic(
+                format!("_tactus_mut_post_{}", e.next_id()),
+            ),
+        })
+        .collect();
 
     // Fresh ret name (gensym to avoid caller-scope collisions). Same
     // convention as mut_post above.
@@ -1324,9 +1421,12 @@ fn build_call_substitutions<'a>(
         if p.x.is_mut {
             req_subst.insert(pname_pre.clone(), arg_lexprs[i].clone());
             // Ensures: mut param's `p` → fresh post-state; pre-state via varat_pre_name.
-            let fresh = mut_idx_to_fresh.get(&i)
-                .expect("fresh name should exist for every &mut param idx");
-            ens_subst.insert(pname.clone(), LExpr::var(fresh.clone()));
+            // Find the MutArgInfo by matching param_idx — replaces the
+            // pre-#105 `mut_idx_to_fresh.get(idx).expect(...)` lookup.
+            let info = mut_args.iter().find(|m| m.param_idx == i)
+                .expect("MutArgInfo should exist for every &mut param idx — \
+                         build_call_mut_args populates one per is_mut param");
+            ens_subst.insert(pname.clone(), LExpr::var(info.fresh.clone()));
             ens_subst.insert(pname_pre, arg_lexprs[i].clone());
         } else {
             // Non-mut ensures: param → arg.
@@ -1344,7 +1444,7 @@ fn build_call_substitutions<'a>(
         req_subst,
         ens_subst,
         mut_param_names,
-        mut_idx_to_fresh,
+        mut_args,
         fresh_ret_name,
     }
 }
@@ -1371,12 +1471,12 @@ fn emit_call_precondition_theorem(
     );
     let requires_clause = LExpr::span_mark(
         loc.clone(),
-        AssertKind::CallPrecondition,
+        AssertKind::Obligation(ObligationKind::CallPrecondition),
         substitute(&requires_conj, &subst.req_subst),
     );
     let id = e.next_id();
     let theorem_name = build_theorem_name(
-        kind_to_name(AssertKind::CallPrecondition), &e.fn_name, &loc, id,
+        kind_to_name(AssertKind::Obligation(ObligationKind::CallPrecondition)), &e.fn_name, &loc, id,
     );
     e.emit(theorem_name, obl.wrap(requires_clause), simple_tactic(e));
 }
@@ -1402,23 +1502,23 @@ fn push_post_call_frames(
     callee: &FunctionX,
     spec_callee: &FunctionX,
     subst: &CallSubstitutions,
-    mut_args: &[(usize, &VarIdent)],
     dest: Option<&VarIdent>,
     obl: &OblCtx,
 ) -> OblCtx {
     let mut new_obl = obl.clone();
 
     // Phase 1: per-&mut existential binder + type-inv hypothesis.
-    for (idx, _caller_var) in mut_args {
-        let fresh = subst.mut_idx_to_fresh.get(idx).unwrap();
-        let typ = &callee.params[*idx].x.typ;
+    // `subst.mut_args` (#105) bundles param_idx, caller_var, and
+    // fresh into one struct — no parallel-array lookups.
+    for info in &subst.mut_args {
+        let typ = &callee.params[info.param_idx].x.typ;
         let lean_typ = substitute(&typ_to_expr(typ), &subst.typ_subst);
         new_obl.frames.push(CtxFrame::Binder(LBinder {
-            name: Some(fresh.clone()),
+            name: Some(info.fresh.clone()),
             ty: lean_typ,
             kind: BinderKind::Explicit,
         }));
-        if let Some(pred) = type_bound_predicate(&LExpr::var(fresh.clone()), typ) {
+        if let Some(pred) = type_bound_predicate(&LExpr::var(info.fresh.clone()), typ) {
             new_obl.frames.push(CtxFrame::Hyp(pred));
         }
     }
@@ -1458,11 +1558,10 @@ fn push_post_call_frames(
     // Phase 4: caller-side rebindings for &mut args. Placed AFTER
     // ensures so the ensures Hyp references the fresh existential,
     // not the rebound caller name.
-    for (idx, caller_var) in mut_args {
-        let fresh = subst.mut_idx_to_fresh.get(idx).unwrap();
+    for info in &subst.mut_args {
         new_obl.frames.push(CtxFrame::Let(
-            crate::lean_name::LeanName::from_var_ident(caller_var),
-            LExpr::var(fresh.clone()),
+            crate::lean_name::LeanName::from_var_ident(info.caller_var),
+            LExpr::var(info.fresh.clone()),
         ));
     }
 
@@ -1697,13 +1796,21 @@ enum Wp<'a> {
     /// ctx drops the `¬cond` hyp.
     Loop {
         cond: Option<crate::to_lean_sst_expr::Validated<'a>>,
-        /// The original invariant metadata (at_entry/at_exit flags,
-        /// span). Iterated in parallel with `validated_invs` for
-        /// emission.
+        /// The original invariant metadata (span). Iterated in parallel
+        /// with `validated_invs` and `inv_kinds` for emission. The
+        /// at_entry/at_exit booleans on `LoopInv` are NOT consulted
+        /// directly — `inv_kinds` is the classified, validated view
+        /// (#103), which rejects the nonsensical `(false, false)`
+        /// combination at build_wp_loop time.
         invs: &'a [LoopInv],
         /// Validated witnesses for each invariant's `inv` expression,
         /// in the same order as `invs`. Built at `build_wp_loop` time.
         validated_invs: Vec<crate::to_lean_sst_expr::Validated<'a>>,
+        /// Classification of each invariant — same order as `invs`.
+        /// Replaces direct use of `LoopInv.at_entry` / `LoopInv.at_exit`
+        /// with a typed enum that makes the meaningful states explicit
+        /// and `(false, false)` unrepresentable.
+        inv_kinds: Vec<LoopInvKind>,
         decrease: crate::to_lean_sst_expr::Validated<'a>,
         modified_vars: Vec<(&'a VarIdent, &'a Typ)>,
         body: Box<Wp<'a>>,
@@ -1802,9 +1909,9 @@ fn detect_assert_kind(e: &Exp) -> AssertKind {
     // call in any of these before inserting it as an Assert.
     let peeled = peel_transparent(e);
     if let ExpX::Call(CallFun::InternalFun(InternalFun::CheckDecreaseHeight), _, _) = &peeled.x {
-        AssertKind::Termination
+        AssertKind::Obligation(ObligationKind::Termination)
     } else {
-        AssertKind::Plain
+        AssertKind::Obligation(ObligationKind::Plain)
     }
 }
 
@@ -2497,6 +2604,9 @@ fn build_wp_loop<'a>(
     let validated_invs: Vec<crate::to_lean_sst_expr::Validated<'a>> = invs.iter()
         .map(|inv| crate::to_lean_sst_expr::Validated::check(&inv.inv))
         .collect::<Result<Vec<_>, _>>()?;
+    let inv_kinds: Vec<LoopInvKind> = invs.iter()
+        .map(LoopInvKind::from_loop_inv)
+        .collect::<Result<Vec<_>, _>>()?;
     let validated_decrease: Vec<crate::to_lean_sst_expr::Validated<'a>> = decrease.iter()
         .map(|d| crate::to_lean_sst_expr::Validated::check(d))
         .collect::<Result<Vec<_>, _>>()?;
@@ -2538,22 +2648,22 @@ fn build_wp_loop<'a>(
     // a hypothesis or trivially-provable as a Done leaf.
     let inv_marked = |(i, v): (&LoopInv, &crate::to_lean_sst_expr::Validated<'a>)| LExpr::span_mark(
         format_rust_loc(&i.inv.span),
-        AssertKind::LoopInvariant,
+        AssertKind::Obligation(ObligationKind::LoopInvariant),
         crate::to_lean_sst_expr::lower(*v),
     );
     let entry_inv_conj = and_all(
-        invs.iter().zip(validated_invs.iter())
-            .filter(|(i, _)| i.at_entry)
-            .map(inv_marked).collect()
+        invs.iter().zip(validated_invs.iter()).zip(inv_kinds.iter())
+            .filter(|(_, k)| k.at_entry())
+            .map(|((i, v), _)| inv_marked((i, v))).collect()
     );
     let exit_inv_conj = and_all(
-        invs.iter().zip(validated_invs.iter())
-            .filter(|(i, _)| i.at_exit)
-            .map(inv_marked).collect()
+        invs.iter().zip(validated_invs.iter()).zip(inv_kinds.iter())
+            .filter(|(_, k)| k.at_exit())
+            .map(|((i, v), _)| inv_marked((i, v))).collect()
     );
     let decrease_marked = LExpr::span_mark(
         format_rust_loc(&decrease_exp.span),
-        AssertKind::LoopDecrease,
+        AssertKind::Obligation(ObligationKind::LoopDecrease),
         LExpr::lt(
             crate::to_lean_sst_expr::lower(validated_decrease[0]),
             LExpr::var_synthetic(d_old_name.clone()),
@@ -2581,6 +2691,7 @@ fn build_wp_loop<'a>(
         cond: cond_exp_opt,
         invs: &invs[..],
         validated_invs,
+        inv_kinds,
         decrease: validated_decrease[0],
         modified_vars,
         body: Box::new(body_wp),
