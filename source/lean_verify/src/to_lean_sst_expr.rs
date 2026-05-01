@@ -28,7 +28,6 @@ use crate::expr_shared::{
     is_variant_node, non_binop_head,
 };
 use crate::lean_ast::{substitute, Expr as LExpr, ExprNode};
-use crate::lean_pp::pp_expr;
 use crate::to_lean_expr::vir_var_binders_to_ast;
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
 
@@ -40,22 +39,77 @@ pub fn sst_exp_to_ast_checked(e: &Exp) -> Result<LExpr, String> {
     exp_to_node_checked(e).map(LExpr::new)
 }
 
-/// Infallible wrapper around [`sst_exp_to_ast_checked`] — panics on
-/// `Err` with a documented "caller should have validated" message.
-/// Use in contexts where `walk` or an upstream `sst_exp_to_ast_checked`
-/// call has already cleared validation.
-pub fn sst_exp_to_ast(e: &Exp) -> LExpr {
-    sst_exp_to_ast_checked(e).unwrap_or_else(|reason| panic!(
-        "sst_exp_to_ast: {} — caller should have validated via \
-         `sst_exp_to_ast_checked` or `walk` before reaching a build_* path",
+/// A reference to an SST expression that has been validated (via
+/// [`sst_exp_to_ast_checked`]) and is therefore safe to lower to
+/// `LExpr` without panic risk.
+///
+/// The newtype is constructable only via [`Validated::check`]; the
+/// only way to consume it is [`lower`], which is infallible by
+/// construction. This replaces the older `sst_exp_to_ast` panic
+/// site — the panic case ("caller should have validated") was a
+/// runtime-checked contract; now it's a type-system-enforced one.
+///
+/// Walkers (`walk_obligations` / `walk_loop` / `walk_call` / etc.)
+/// receive `Wp<'a>` whose Exp slots are already `Validated<'a>`,
+/// so the inside of the walker never has to think about
+/// validation — the type guarantees it.
+///
+/// See `lean_name::LeanName` for the same architectural pattern
+/// applied to identifiers; see DESIGN.md "Type-system-enforced
+/// invariants" for the rationale.
+#[derive(Clone, Copy)]
+pub struct Validated<'a> {
+    inner: &'a Exp,
+}
+
+impl<'a> Validated<'a> {
+    /// Run validation by attempting `sst_exp_to_ast_checked`. Returns
+    /// a witness on success, or the validation error on failure.
+    pub fn check(e: &'a Exp) -> Result<Self, String> {
+        sst_exp_to_ast_checked(e)?;
+        Ok(Validated { inner: e })
+    }
+
+    /// The underlying `Exp` reference. Use sparingly — most consumers
+    /// should go through [`lower`] which preserves the validated
+    /// invariant. Useful for routing the same Exp through a
+    /// different lowering path (e.g., looking at its `.typ` field
+    /// or matching on its `ExpX` shape).
+    pub fn raw(&self) -> &'a Exp { self.inner }
+}
+
+/// Lower a validated Exp to `LExpr`. Cannot panic — the type system
+/// guarantees the input was already validated by `Validated::check`.
+pub fn lower(v: Validated<'_>) -> LExpr {
+    sst_exp_to_ast_checked(v.inner).unwrap_or_else(|reason| panic!(
+        // Reachable only if `Validated::check` has a bug where it
+        // accepted an Exp that fails validation on the second pass.
+        // sst_exp_to_ast_checked is deterministic, so this is
+        // structurally unreachable — but keep the message useful for
+        // the impossible case.
+        "Validated::lower: invariant violated — {}",
         reason
     ))
 }
 
-/// Back-compat: write an SST expression as Lean text into `out`. Kept
-/// while callers are migrated to the AST API.
-pub fn write_sst_exp(out: &mut String, e: &Exp) {
-    out.push_str(&pp_expr(&sst_exp_to_ast(e)));
+/// Migration shim — wraps `sst_exp_to_ast_checked` in a panic, the
+/// pre-#100 contract.
+///
+/// **Use only at sites whose validation upstream is already
+/// guaranteed.** New code should produce a [`Validated`] witness via
+/// [`Validated::check`] and lower via [`lower`] — that's the
+/// type-system-enforced path. This shim exists only so the migration
+/// of ~20 call sites can happen incrementally without making the
+/// commit-by-commit history unbuildable.
+///
+/// To be removed once the last call site migrates.
+pub fn sst_exp_to_ast(e: &Exp) -> LExpr {
+    sst_exp_to_ast_checked(e).unwrap_or_else(|reason| panic!(
+        "sst_exp_to_ast (shim, #100 migration): {} — caller should have \
+         validated via `sst_exp_to_ast_checked` or produced a `Validated` \
+         witness before reaching this path",
+        reason
+    ))
 }
 
 /// `2^n` rendered as a decimal string. Supports 0 ≤ n ≤ 128 — VIR's

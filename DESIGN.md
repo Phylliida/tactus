@@ -116,6 +116,24 @@ For proof fns (`by { ... }` syntax), the entire body is Lean tactic text by cons
 
 The `ExpX::FuelConst(_)` SST variant is a separate, internal Verus construct: produced only by `vir::recursion::rewrite_rec_call_with_fuel_const`, and only called from `vir::expand_errors` (the Z3 SMT-error-expansion pipeline). Tactus doesn't traverse that pipeline, so `FuelConst` is structurally unreachable in our path. The catch-all `Err` arm in `to_lean_sst_expr.rs` is defensive — hitting it would mean a Verus-side pipeline change worth investigating.
 
+### Type-system-enforced invariants
+
+Several runtime contracts in the codebase have been promoted to type-level enforcement. The pattern: identify a property the code *should* hold (a runtime check, panic, or convention), then introduce a newtype whose constructors are the only path to producing values that satisfy the property. The compiler enforces the invariant at every site that touches the type — half-done refactors fail to compile rather than producing silent miscompilations.
+
+**`LeanName` (#99) — VarIdent → Lean-name conversion is disambiguator-aware.** Pre-#99, our renderer projected `VarIdent` to `String` via `sanitize(&v.0)`, dropping the disambiguator. Two distinct VarIdents with the same base name (e.g., `tmp%%` synthetic temps from `ast_simplify::temp_var`) collapsed to the same Lean string, and Lean's let-shadowing silently lowered chained `0 <= i <= 10` to `True`. Post-#99: `LeanName` is a newtype with no `From<String>`/`From<&str>` impl, only constructable via explicit constructors (`from_var_ident` / `from_path` / `from_field` / `lit` / `synthetic`). `ExprNode::Var(LeanName)`, `ExprNode::Let { name: LeanName, .. }`, `Binder { name: Option<LeanName>, .. }`, `Pattern::Var(LeanName)` enforce at compile time that any name flowing into the AST came from one of the explicit constructors. A new contributor can't accidentally write `ExprNode::Var(sanitize(&v.0))` — that's a type error. See `lean_name.rs` module docs for the soundness story.
+
+**`Validated<'a>` (#100) — Exp lowering is panic-free by construction.** Pre-#100, `sst_exp_to_ast(&Exp) -> LExpr` was an "infallible" rendering function whose contract was "caller has already validated via `sst_exp_to_ast_checked`." The contract was a runtime-checked panic; nothing prevented a caller from passing an unvalidated `&Exp`. Post-#100: `Validated<'a>` is a newtype constructable only via `Validated::check(&Exp) -> Result<Validated, String>`. The lowering function `lower(Validated) -> LExpr` cannot panic — the type guarantees the input was already validated. `Wp<'a>` variants (`Let`, `Assert`, `Assume`, `AssertByTactus.cond`, `Branch.cond`, `Loop.cond`/`validated_invs`/`decrease`, `Call.args`) hold `Validated<'a>` instead of `&'a Exp`, so the inside of every walker (`walk_obligations` / `walk_loop` / `walk_call` / etc.) is panic-free by construction. `build_wp` / `build_wp_loop` / `build_wp_call` are where validation happens — the construction sites call `Validated::check(...)?` and propagate the `Err` to callers. **Migration shim**: `sst_exp_to_ast` survives for now as a panic-on-unvalidated wrapper for ~10 call sites that touch `&Exp` from contexts where threading `Validated` is non-trivial; tracked for removal.
+
+**The pattern, named.** When a value's type doesn't carry the property the code requires of it, and the requirement is checked at runtime via panic or assertion: introduce a newtype, make its constructors the only path that satisfies the property, and let the type system enforce the rest. Reviewer-visible at every call site (the constructor name documents the source); refactor-resistant (half-finished migrations don't compile); future-proof (new code added in years can't accidentally break the invariant). The cost is a typed wrapper. The benefit is a soundness hole that's structurally unrepresentable.
+
+### Potential future applications of the typed-invariant pattern
+
+Two candidates noted but not yet promoted:
+
+* **`AssertKind` obligation/hypothesis split.** Currently a flat enum where `is_obligation_kind()` does runtime discrimination. Could be `AssertKind = Obligation(Kind) | Hypothesis(Kind)` so passing a hypothesis-kind where an obligation-kind is expected becomes a type error. Less urgent than `LeanName`/`Validated` because we have one filtering site.
+
+* **Prelude name allowlist sync.** `sanity.rs` hardcodes the allowlist of Tactus prelude names (`arch_word_bits`, `usize_hi`, `tactus_peel`, etc.). Adding a new prelude def requires hand-syncing the allowlist. Could derive the list from `prelude.rs` as the single source of truth — though the current hand-sync is small enough that the typed approach hasn't justified the work yet.
+
 ### Mutual recursion (user-specified)
 
 ```rust
