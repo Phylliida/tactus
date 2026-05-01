@@ -29,7 +29,7 @@ use crate::expr_shared::{
 };
 use crate::lean_ast::{substitute, Expr as LExpr, ExprNode};
 use crate::to_lean_expr::vir_var_binders_to_ast;
-use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
+use crate::to_lean_type::{lean_name, typ_to_expr};
 
 /// Build a `lean_ast::Expr` from an SST expression, validating as we
 /// go. Returns `Err(reason)` for any SST form we don't know how to
@@ -374,11 +374,11 @@ fn render_checked_decrease_arg(e: &Exp) -> Result<LExpr, String> {
     match &peeled.x {
         ExpX::Bind(bnd, body) => match &bnd.x {
             BndX::Let(binders) => {
-                let mut subst: std::collections::HashMap<String, LExpr> =
+                let mut subst: std::collections::HashMap<crate::lean_name::LeanName, LExpr> =
                     std::collections::HashMap::new();
                 for b in binders.iter() {
                     subst.insert(
-                        crate::lean_name::LeanName::from_var_ident(&b.name).into_string(),
+                        crate::lean_name::LeanName::from_var_ident(&b.name),
                         sst_exp_to_ast_checked(&b.a)?,
                     );
                 }

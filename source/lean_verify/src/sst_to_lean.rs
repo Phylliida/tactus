@@ -1231,12 +1231,12 @@ struct CallSubstitutions {
     /// Type-arg substitution: `TypParam(T) ↦ Var(rendered_typ_arg)`.
     /// Shared between req and ens. `TypParam` renders as `Var("T")`
     /// so value-level substitution rewrites it.
-    typ_subst: HashMap<String, LExpr>,
+    typ_subst: HashMap<crate::lean_name::LeanName, LExpr>,
     /// `requires` substitution: param names map to caller args
     /// (pre-call values). For `&mut` params, both `p` and
     /// `varat_pre_name(p)` map to the same arg — at requires-time
     /// only the pre-call value exists.
-    req_subst: HashMap<String, LExpr>,
+    req_subst: HashMap<crate::lean_name::LeanName, LExpr>,
     /// `ensures` substitution: non-mut params map to caller args;
     /// `&mut` params map `p ↦ Var(fresh_post_state)` and
     /// `varat_pre_name(p) ↦ caller_arg` (pre-state via `*old(x)`).
@@ -1244,7 +1244,7 @@ struct CallSubstitutions {
     /// rendered ensures uses the gensym'd ret instead of the
     /// callee's source-level ret-name (which could shadow a
     /// caller-scope local).
-    ens_subst: HashMap<String, LExpr>,
+    ens_subst: HashMap<crate::lean_name::LeanName, LExpr>,
     /// Set of `&mut` param names (sanitized) — used by
     /// `rewrite_varat_for_mut_params` to rename `VarAt(p, Pre) →
     /// Var(<p>_at_pre_tactus)` in the VIR-AST spec BEFORE
@@ -1275,9 +1275,12 @@ fn build_call_substitutions<'a>(
 ) -> CallSubstitutions {
     // Type-param substitution (shared by req + ens). `TypParam(T)`
     // renders as `Var("T")` so value-level substitute rewrites it.
-    let mut typ_subst: HashMap<String, LExpr> = HashMap::new();
+    let mut typ_subst: HashMap<crate::lean_name::LeanName, LExpr> = HashMap::new();
     for (tp_name, tp_arg) in callee.typ_params.iter().zip(typ_args.iter()) {
-        typ_subst.insert(sanitize(tp_name), typ_to_expr(tp_arg));
+        // Type parameter names are user-named generics (`T`, `A`).
+        // Match what `typ_to_expr` produces for `TypX::TypParam` —
+        // `LeanName::lit(name)`.
+        typ_subst.insert(crate::lean_name::LeanName::lit(tp_name.as_str()), typ_to_expr(tp_arg));
     }
 
     // Render each arg once. The lower path peels `Loc` for &mut
@@ -1307,31 +1310,32 @@ fn build_call_substitutions<'a>(
     let fresh_ret_name = crate::lean_name::LeanName::synthetic(format!("_tactus_ret_{}", e.next_id()));
 
     // Build req_subst and ens_subst from the maps above.
-    let mut req_subst: HashMap<String, LExpr> = typ_subst.clone();
-    let mut ens_subst: HashMap<String, LExpr> = typ_subst.clone();
+    let mut req_subst: HashMap<crate::lean_name::LeanName, LExpr> = typ_subst.clone();
+    let mut ens_subst: HashMap<crate::lean_name::LeanName, LExpr> = typ_subst.clone();
     for (i, p) in callee.params.iter().enumerate() {
         // Subst keys must match what `to_lean_expr::vir_expr_to_ast`
         // produces for `ExprX::Var(p.name)` — i.e., go through the
         // canonical `LeanName::from_var_ident` (includes the
         // disambiguator id when needed).
-        let pname = crate::lean_name::LeanName::from_var_ident(&p.x.name).into_string();
+        let pname = crate::lean_name::LeanName::from_var_ident(&p.x.name);
+        let pname_pre = crate::lean_name::LeanName::synthetic(varat_pre_name(pname.as_str()));
         // Requires: same map for mut and non-mut (only pre-state exists).
         req_subst.insert(pname.clone(), arg_lexprs[i].clone());
         if p.x.is_mut {
-            req_subst.insert(varat_pre_name(&pname), arg_lexprs[i].clone());
+            req_subst.insert(pname_pre.clone(), arg_lexprs[i].clone());
             // Ensures: mut param's `p` → fresh post-state; pre-state via varat_pre_name.
             let fresh = mut_idx_to_fresh.get(&i)
                 .expect("fresh name should exist for every &mut param idx");
             ens_subst.insert(pname.clone(), LExpr::var(fresh.clone()));
-            ens_subst.insert(varat_pre_name(&pname), arg_lexprs[i].clone());
+            ens_subst.insert(pname_pre, arg_lexprs[i].clone());
         } else {
             // Non-mut ensures: param → arg.
             ens_subst.insert(pname, arg_lexprs[i].clone());
         }
     }
     // Callee's ret name → fresh_ret_name in ensures.
-    let ret_orig_name = crate::lean_name::LeanName::from_var_ident(&callee.ret.x.name).into_string();
-    if ret_orig_name != fresh_ret_name.as_str() {
+    let ret_orig_name = crate::lean_name::LeanName::from_var_ident(&callee.ret.x.name);
+    if ret_orig_name.as_str() != fresh_ret_name.as_str() {
         ens_subst.insert(ret_orig_name, LExpr::var(fresh_ret_name.clone()));
     }
 
@@ -3070,13 +3074,13 @@ mod tests {
     #[test]
     fn extract_simple_var_from_plain_var() {
         let x = var_exp("x", typ_int());
-        assert_eq!(extract_simple_var(&x), Some("x"));
+        assert_eq!(extract_simple_var_ident(&x).map(|i| i.0.as_str()), Some("x"));
     }
 
     #[test]
     fn extract_simple_var_through_loc() {
         let x = var_exp("x", typ_int());
-        assert_eq!(extract_simple_var(&loc_exp(x)), Some("x"));
+        assert_eq!(extract_simple_var_ident(&loc_exp(x)).map(|i| i.0.as_str()), Some("x"));
     }
 
     #[test]
@@ -3085,7 +3089,7 @@ mod tests {
         let a = var_exp("a", typ_int());
         let b = var_exp("b", typ_int());
         let e = if_exp(c, a, b);
-        assert_eq!(extract_simple_var(&e), None);
+        assert_eq!(extract_simple_var_ident(&e).map(|i| i.0.as_str()), None);
     }
 
     // ── peel_transparent ──────────────────────────────────────

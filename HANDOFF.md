@@ -970,6 +970,59 @@ prelude-name allowlist sync as further-out candidates).
 pass (no regression). One pending task closed (#100). #101
 remains for next session if desired.
 
+#### Current session (2026-04-29 evening — #101 substitute keys typed as LeanName)
+
+`HashMap<String, Expr>` → `HashMap<LeanName, Expr>` for the
+substitution map used by `lean_ast::substitute`. Follows
+naturally from #99 / #100 — same architectural pattern,
+applied one layer up to the call-site-inlining substitution
+pipeline.
+
+**The change:**
+- `substitute(&Expr, &HashMap<LeanName, Expr>) -> Expr` —
+  signature change; the helpers `subst_without`,
+  `subst_remove_binders`, `check_capture_lazy` updated to
+  match.
+- `CallSubstitutions` struct fields (`typ_subst`,
+  `req_subst`, `ens_subst`) now `HashMap<LeanName, LExpr>`.
+- Construction sites in `build_call_substitutions`
+  (sst_to_lean.rs) and `render_checked_decrease_arg`
+  (to_lean_sst_expr.rs) use `LeanName::lit` (for type
+  parameters), `LeanName::from_var_ident` (for value
+  parameters / ret), or `LeanName::synthetic` (for
+  pre-state names like `<x>_at_pre_tactus`).
+- Test fixture `subst_of` updated to construct `LeanName`
+  keys via `LeanName::lit`.
+
+**What this prevents.** A future contributor can't accidentally
+write `subst.insert("x".to_string(), ...)` where `"x"`
+came from somewhere other than a known name source — that's
+a type error now. The key has to be a `LeanName`, which only
+comes from one of the five typed constructors.
+
+**No new tests** — refactor is internal; the existing 227
+e2e + 118 unit tests confirm output equivalence to the old
+String-keyed pipeline.
+
+**DESIGN.md addition** — new "#101" entry under
+"Type-system-enforced invariants" explaining that the
+substitution-map keying follows naturally from #99: now that
+names in the AST are typed, the substitution-keying layer
+inherits the typing for free.
+
+**Net for evening**: 1 commit. Still 227 e2e + 118 unit
+tests, all passing. One pending task closed (#101).
+
+**Day total**: 6 commits across 6 closed tasks today (#84
+FuelConst, #91 Index, #89 invariant_except_break, #99
+LeanName, #100 Validated, #101 substitute-keying), plus
+2 architectural cleanup tasks. ~1500 lines of net change.
+217 → 227 e2e tests (+10). 114 → 118 unit tests (+4).
+Six poems. The chained-compare hole that was a soundness
+gap yesterday is now structurally unrepresentable; the
+panic-on-unvalidated-Exp contract is now type-system-
+enforced; substitution map keys are now typed.
+
 ## Architecture
 
 ### Full pipeline
