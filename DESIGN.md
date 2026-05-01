@@ -1824,6 +1824,28 @@ non-redundant.
   efficiency issue (`rewrite_varat_for_mut_params` walked the
   entire AST even when its set was empty — common case).
 
+* **Right-way lens.** *This works — but is there a "right way" to
+  do it?* Different from Linus-hat (which catches bad shape) and
+  Simplify (which catches missed reuse). This lens catches code
+  that's correct, idiomatic-enough, but uses a low-level or
+  Verus-mirroring shape where a more meaningful or target-native
+  shape would express the same thing better. Two flavours:
+  - *Implementation level.* `Arc::ptr_eq(&callee.name,
+    &spec_callee.name)` works as a "this is a trait-method-impl
+    call" check, but it's pointer-identity proxying for a
+    structural property. The right way is `matches!(callee.kind,
+    FunctionKind::TraitMethodImpl { .. })` — the discriminant is
+    meaningful, the pointer comparison is implementation detail.
+  - *Encoding level.* DESIGN.md § "What doesn't have to mirror
+    Verus's encoding" names this for the obligation-shape side:
+    when Verus uses an SMT-style encoding (havoc-base, fresh
+    existentials, conjoined preservation hypotheses), ask whether
+    Lean's type system can make the property structural rather
+    than asserted. #87's `{ x with f := v }` was this lens
+    applied at design time.
+  The question: *what does this code MEAN, and is the shape it
+  takes the most direct expression of that meaning?*
+
 The pattern: each new lens is a new *question*, not a new
 *place to look*. Review passes never reach a fixed point because
 the questions are unbounded; what you do is run enough lenses
