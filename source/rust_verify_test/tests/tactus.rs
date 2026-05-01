@@ -3917,10 +3917,14 @@ test_verify_one_file! {
 }
 
 // Two impls of the same trait — the caller picks one statically.
-// Each call site's `resolved_method` points at a different impl,
-// but Tactus uses the TRAIT's spec for both (impl-specific
-// strengthening isn't seen — documented trade-off in DESIGN.md).
-// The caller's ensures must align with what the trait promises.
+// Each call site's `resolved_method` points at a different impl;
+// post-#86 the caller sees BOTH the trait's ensures AND the
+// resolved impl's strengthened ensures conjoined. This test pins
+// the basic shape (caller's ensures is the trait-level `r < 100`,
+// which is satisfied by either impl). For tests that exercise
+// the impl-specific strengthening visibly, see
+// `test_exec_call_trait_method_impl_strengthens` /
+// `test_exec_call_trait_method_wrong_impl_strengthening`.
 test_verify_one_file! {
     #[test] test_exec_call_trait_method_two_impls verus_code! {
         trait Wrapper {
@@ -3992,6 +3996,83 @@ test_verify_one_file! {
             a.add_one(n)
         }
     } => Ok(())
+}
+
+// #86: impl-specific strengthening of `ensures`. The trait declares a
+// weak postcondition; the impl strengthens it. Caller sees BOTH
+// conjoined, so they can rely on the impl's specific guarantee.
+//
+// Pre-#86 this test would fail (caller would only see `r < 100` from
+// the trait, can't prove `r == 5`). Post-#86 the impl's `ensures r == 5`
+// is conjoined into the post-call hypothesis, and the caller's
+// stronger ensures `r == 5` becomes provable.
+test_verify_one_file! {
+    #[test] test_exec_call_trait_method_impl_strengthens verus_code! {
+        trait Wrapper {
+            fn unwrap(&self) -> (r: u8)
+                ensures r < 100;
+        }
+
+        struct AlwaysFive;
+        impl Wrapper for AlwaysFive {
+            fn unwrap(&self) -> (r: u8)
+                ensures r == 5
+            {
+                5
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn use_strengthened(w: &AlwaysFive) -> (r: u8)
+            ensures r == 5  // impl-specific guarantee, not just trait's r < 100
+        {
+            w.unwrap()
+        }
+    } => Ok(())
+}
+
+// Negative: caller relies on impl-specific strengthening that the
+// resolved impl doesn't actually provide. Pins that the impl-side
+// ensures we conjoin is the RESOLVED impl's, not some other impl
+// of the same trait.
+test_verify_one_file! {
+    #[test] test_exec_call_trait_method_wrong_impl_strengthening verus_code! {
+        trait Wrapper {
+            fn unwrap(&self) -> (r: u8)
+                ensures r < 100;
+        }
+
+        struct AlwaysFive;
+        impl Wrapper for AlwaysFive {
+            fn unwrap(&self) -> (r: u8)
+                ensures r == 5
+            {
+                5
+            }
+        }
+
+        struct AlwaysTen;
+        impl Wrapper for AlwaysTen {
+            fn unwrap(&self) -> (r: u8)
+                ensures r == 10
+            {
+                10
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn caller(w: &AlwaysFive) -> (r: u8)
+            ensures r == 10  // wrong: AlwaysFive returns 5
+        {
+            w.unwrap()
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("postcondition")),
+            "expected postcondition failure, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
 }
 
 // ── Control-flow combination coverage ──────────────────────────────

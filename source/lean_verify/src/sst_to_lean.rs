@@ -1418,7 +1418,7 @@ fn walk_call<'a>(
     let spec_callee = pick_spec_source(callee, &ctx.fn_map)
         .expect("build_wp_call should have rejected unresolvable trait-spec lookups");
 
-    let subst = build_call_substitutions(callee, typ_args, args, mut_args, e);
+    let subst = build_call_substitutions(callee, spec_callee, typ_args, args, mut_args, e);
 
     if !spec_callee.require.is_empty() {
         emit_call_precondition_theorem(spec_callee, &subst, call_span, obl, e);
@@ -1495,10 +1495,76 @@ struct CallSubstitutions<'a> {
     fresh_ret_name: crate::lean_name::LeanName,
 }
 
+/// Insert substitution entries for one set of params (either the
+/// resolved-impl's `callee.params` or the trait method decl's
+/// `spec_callee.params` — see `build_call_substitutions` and #86).
+/// Both maps are populated:
+/// * `req_subst`: param `p` → arg (only pre-state exists at requires
+///   time, both for mut and non-mut params).
+/// * `ens_subst`: non-mut param `p` → arg; mut param `p` → fresh
+///   post-state, plus `<p>_at_pre_tactus` → arg (pre-state alias
+///   for `*old(p)` references).
+/// `mut_param_names` accumulates sanitized name strings for each
+/// `&mut` param — consumed by `rewrite_varat_for_mut_params` to
+/// rename `VarAt(p, Pre) → Var(<p>_at_pre_tactus)` in the spec
+/// rendering.
+///
+/// Calling this twice (once for callee.params, once for
+/// spec_callee.params) is intentional and harmless when both name
+/// the same params: the second insert overwrites with identical
+/// values. When trait and impl have different param names (allowed
+/// by Rust), both spellings receive the same arg mapping.
+fn add_param_subst_entries<'a>(
+    params: &vir::ast::Params,
+    arg_lexprs: &[LExpr],
+    mut_args: &[MutArgInfo<'a>],
+    req_subst: &mut HashMap<crate::lean_name::LeanName, LExpr>,
+    ens_subst: &mut HashMap<crate::lean_name::LeanName, LExpr>,
+    mut_param_names: &mut HashSet<String>,
+) {
+    for (i, p) in params.iter().enumerate() {
+        // Subst keys must match what `to_lean_expr::vir_expr_to_ast`
+        // produces for `ExprX::Var(p.name)` — i.e., go through the
+        // canonical `LeanName::from_var_ident` (includes the
+        // disambiguator id when needed).
+        let pname = crate::lean_name::LeanName::from_var_ident(&p.x.name);
+        let pname_pre = crate::lean_name::LeanName::synthetic(varat_pre_name(pname.as_str()));
+        // Requires: same map for mut and non-mut (only pre-state exists).
+        req_subst.insert(pname.clone(), arg_lexprs[i].clone());
+        if p.x.is_mut {
+            mut_param_names.insert(sanitize(&p.x.name.0));
+            req_subst.insert(pname_pre.clone(), arg_lexprs[i].clone());
+            // Ensures: mut param's `p` → fresh post-state; pre-state via varat_pre_name.
+            // Find the MutArgInfo by matching param_idx — replaces the
+            // pre-#105 `mut_idx_to_fresh.get(idx).expect(...)` lookup.
+            // The `param_idx` is positional, so it works whether the
+            // current pass is over callee.params or spec_callee.params
+            // (Rust requires positional alignment).
+            let info = mut_args.iter().find(|m| m.param_idx == i)
+                .expect("MutArgInfo should exist for every &mut param idx — \
+                         build_call_mut_args populates one per is_mut param");
+            ens_subst.insert(pname.clone(), LExpr::var(info.fresh.clone()));
+            ens_subst.insert(pname_pre, arg_lexprs[i].clone());
+        } else {
+            // Non-mut ensures: param → arg.
+            ens_subst.insert(pname, arg_lexprs[i].clone());
+        }
+    }
+}
+
 /// Build the substitution maps and fresh names for a call site.
 /// See `CallSubstitutions` for the field semantics.
+///
+/// Takes both `callee` (the resolved concrete impl) and `spec_callee`
+/// (where `require`/`ensure` come from — for trait-method-impl
+/// callees this is the trait method decl; otherwise same as callee).
+/// When they differ, the substitution maps include keys for BOTH
+/// callee's and spec_callee's param/ret names — same arg values,
+/// just both spellings of each name, so we can substitute either
+/// the trait's specs or the impl's strengthened specs (#86).
 fn build_call_substitutions<'a>(
     callee: &FunctionX,
+    spec_callee: &FunctionX,
     typ_args: &[Typ],
     args: &[Validated<'a>],
     mut_args_raw: &[(usize, &'a VarIdent)],
@@ -1519,11 +1585,6 @@ fn build_call_substitutions<'a>(
     // reference (the pre-call value).
     let arg_lexprs: Vec<LExpr> =
         args.iter().map(|a| lower_validated(*a)).collect();
-
-    // Set of &mut param names for the VarAt rewriter.
-    let mut_param_names: HashSet<String> = mut_args_raw.iter()
-        .map(|(idx, _)| sanitize(&callee.params[*idx].x.name.0))
-        .collect();
 
     // One MutArgInfo per `&mut` arg — bundles param_idx,
     // caller_var, and the gensym'd fresh post-call name (#105).
@@ -1546,37 +1607,51 @@ fn build_call_substitutions<'a>(
     // convention as mut_post above.
     let fresh_ret_name = crate::lean_name::LeanName::synthetic(format!("_tactus_ret_{}", e.next_id()));
 
-    // Build req_subst and ens_subst from the maps above.
+    // Build req_subst and ens_subst.
     let mut req_subst: HashMap<crate::lean_name::LeanName, LExpr> = typ_subst.clone();
     let mut ens_subst: HashMap<crate::lean_name::LeanName, LExpr> = typ_subst.clone();
-    for (i, p) in callee.params.iter().enumerate() {
-        // Subst keys must match what `to_lean_expr::vir_expr_to_ast`
-        // produces for `ExprX::Var(p.name)` — i.e., go through the
-        // canonical `LeanName::from_var_ident` (includes the
-        // disambiguator id when needed).
-        let pname = crate::lean_name::LeanName::from_var_ident(&p.x.name);
-        let pname_pre = crate::lean_name::LeanName::synthetic(varat_pre_name(pname.as_str()));
-        // Requires: same map for mut and non-mut (only pre-state exists).
-        req_subst.insert(pname.clone(), arg_lexprs[i].clone());
-        if p.x.is_mut {
-            req_subst.insert(pname_pre.clone(), arg_lexprs[i].clone());
-            // Ensures: mut param's `p` → fresh post-state; pre-state via varat_pre_name.
-            // Find the MutArgInfo by matching param_idx — replaces the
-            // pre-#105 `mut_idx_to_fresh.get(idx).expect(...)` lookup.
-            let info = mut_args.iter().find(|m| m.param_idx == i)
-                .expect("MutArgInfo should exist for every &mut param idx — \
-                         build_call_mut_args populates one per is_mut param");
-            ens_subst.insert(pname.clone(), LExpr::var(info.fresh.clone()));
-            ens_subst.insert(pname_pre, arg_lexprs[i].clone());
-        } else {
-            // Non-mut ensures: param → arg.
-            ens_subst.insert(pname, arg_lexprs[i].clone());
-        }
+    let mut mut_param_names: HashSet<String> = HashSet::new();
+
+    // First pass: keys from `callee.params` (the impl's, or the
+    // non-trait callee's — same as spec_callee in that case).
+    add_param_subst_entries(
+        &callee.params,
+        &arg_lexprs,
+        &mut_args,
+        &mut req_subst,
+        &mut ens_subst,
+        &mut mut_param_names,
+    );
+    // Second pass: keys from `spec_callee.params` (trait method
+    // decl's). When trait and impl have matching param names this is
+    // a no-op (overwrites entries with identical values). When they
+    // differ — Rust allows this, the names are positionally aligned
+    // but textually independent — both spellings get the same
+    // substitution mapping. Needed by #86 so trait-side ensures
+    // (which use trait param names) substitute correctly even when
+    // we're simultaneously inlining impl-side ensures (which use
+    // impl param names). For non-trait callees `callee == spec_callee`
+    // and the second pass is fully redundant — running it
+    // unconditionally keeps the code simple at zero correctness cost.
+    add_param_subst_entries(
+        &spec_callee.params,
+        &arg_lexprs,
+        &mut_args,
+        &mut req_subst,
+        &mut ens_subst,
+        &mut mut_param_names,
+    );
+
+    // Callee's ret name → fresh_ret_name in ensures. Same for
+    // spec_callee's ret name when different — handles the case
+    // where the impl's ret name differs from the trait's.
+    let callee_ret = crate::lean_name::LeanName::from_var_ident(&callee.ret.x.name);
+    if callee_ret.as_str() != fresh_ret_name.as_str() {
+        ens_subst.insert(callee_ret, LExpr::var(fresh_ret_name.clone()));
     }
-    // Callee's ret name → fresh_ret_name in ensures.
-    let ret_orig_name = crate::lean_name::LeanName::from_var_ident(&callee.ret.x.name);
-    if ret_orig_name.as_str() != fresh_ret_name.as_str() {
-        ens_subst.insert(ret_orig_name, LExpr::var(fresh_ret_name.clone()));
+    let spec_ret = crate::lean_name::LeanName::from_var_ident(&spec_callee.ret.x.name);
+    if spec_ret.as_str() != fresh_ret_name.as_str() {
+        ens_subst.insert(spec_ret, LExpr::var(fresh_ret_name.clone()));
     }
 
     CallSubstitutions {
@@ -1679,17 +1754,37 @@ fn push_post_call_frames(
         new_obl.frames.push(CtxFrame::Hyp(pred));
     }
 
-    // Phase 3: ensures (post-call assumption). Uses spec_callee's
-    // ensures (= trait decl for trait-method-impl callees).
-    if !spec_callee.ensure.0.is_empty() {
-        let ensures_conj = and_all(
-            spec_callee.ensure.0.iter()
-                .map(|expr| {
-                    let rewritten = rewrite_varat_for_mut_params(expr, &subst.mut_param_names);
-                    vir_expr_to_ast(&rewritten)
-                })
-                .collect()
-        );
+    // Phase 3: ensures (post-call assumption). Uses both
+    // spec_callee's ensures (the trait method decl's, for trait-
+    // method-impl callees; same as callee otherwise) AND the impl's
+    // own ensures when they differ (#86 impl-strengthening). Verus
+    // enforces impl ⇒ trait, so the conjunction is satisfiable; the
+    // caller gets the strongest contract any specific impl provides
+    // rather than just the trait-level guarantee.
+    //
+    // `subst.ens_subst` includes keys for both callee.params and
+    // spec_callee.params (built by the two passes in
+    // `build_call_substitutions`), plus both ret names → fresh_ret_name.
+    // So substituting either the trait's or the impl's clauses
+    // works regardless of whether trait/impl param names match.
+    let mut ensures_clauses: Vec<LExpr> = spec_callee.ensure.0.iter()
+        .map(|expr| {
+            let rewritten = rewrite_varat_for_mut_params(expr, &subst.mut_param_names);
+            vir_expr_to_ast(&rewritten)
+        })
+        .collect();
+    // Avoid duplicating the trait's own clauses when callee == spec_callee.
+    // We use VIR's `Fun` (= `Arc<FunX>`) name comparison: same Fun
+    // means same fn, so no impl-strengthening to add.
+    let is_trait_method_impl = !std::sync::Arc::ptr_eq(&callee.name, &spec_callee.name);
+    if is_trait_method_impl {
+        for expr in callee.ensure.0.iter() {
+            let rewritten = rewrite_varat_for_mut_params(expr, &subst.mut_param_names);
+            ensures_clauses.push(vir_expr_to_ast(&rewritten));
+        }
+    }
+    if !ensures_clauses.is_empty() {
+        let ensures_conj = and_all(ensures_clauses);
         new_obl.frames.push(CtxFrame::Hyp(
             substitute(&ensures_conj, &subst.ens_subst),
         ));
