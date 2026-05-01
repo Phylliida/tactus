@@ -3468,13 +3468,13 @@ test_verify_one_file! {
     }
 }
 
-// `&mut x.f` (mutating through a field) is rejected — the call-site
-// arg isn't a simple `Loc(VarLoc(_))`. Pins the deferral with a
-// pointed error message that names task #55 and suggests the
-// extract-to-local workaround. Flips to Ok if/when we add the
-// havoc-base + assume-other-fields-unchanged encoding.
+// #87: `&mut x.f` (mutating through a struct field) now verifies.
+// Encoded via Lean's structure update: post-call we rebind
+// `let h := { h with val := <fresh_post> }`, which preserves all
+// other fields automatically — no havoc-base + assume-other-fields-
+// unchanged dance needed (the syntax IS that semantics).
 test_verify_one_file! {
-    #[test] test_exec_call_mut_arg_field_rejected verus_code! {
+    #[test] test_exec_call_mut_arg_field verus_code! {
         fn bump(x: &mut u8)
             requires *old(x) < 100
             ensures *x == *old(x) + 1
@@ -3490,19 +3490,67 @@ test_verify_one_file! {
             ensures r == x + 1
         {
             let mut h = Holder { val: x };
-            bump(&mut h.val);  // field mut — not yet supported
+            bump(&mut h.val);
+            h.val
+        }
+    } => Ok(())
+}
+
+// Negative: caller asserts wrong post-state for the mutated field.
+test_verify_one_file! {
+    #[test] test_exec_call_mut_arg_field_wrong_post verus_code! {
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        struct Holder { val: u8 }
+
+        #[verifier::tactus_auto]
+        fn call_field_mut(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 2  // wrong: callee promises +1
+        {
+            let mut h = Holder { val: x };
+            bump(&mut h.val);
             h.val
         }
     } => Err(err) => {
         assert!(
-            err.errors.iter().any(|e|
-                e.message.contains("simple local")
-                || e.message.contains("&mut x.f")
-                || e.message.contains("not a simple")),
-            "expected `&mut x.f` rejection, got: {:?}",
+            err.errors.iter().any(|e| e.message.contains("postcondition")),
+            "expected postcondition failure, got: {:?}",
             err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
         );
     }
+}
+
+// Multi-field struct: pins that other fields are preserved across
+// the field mutation. Lean's `{ h with val := … }` syntax preserves
+// `other` by definition; this test exercises that the caller can
+// rely on it.
+test_verify_one_file! {
+    #[test] test_exec_call_mut_arg_field_other_preserved verus_code! {
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        struct Pair { val: u8, tag: u8 }
+
+        #[verifier::tactus_auto]
+        fn call_field_mut(x: u8, t: u8) -> (r: u8)
+            requires x < 100
+            ensures r == t  // tag must stay equal to t after mutating val
+        {
+            let mut p = Pair { val: x, tag: t };
+            bump(&mut p.val);
+            p.tag
+        }
+    } => Ok(())
 }
 
 // Multi-`&mut`: two mut args at the same call site. Exercises the

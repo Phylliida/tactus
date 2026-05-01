@@ -124,7 +124,7 @@ use vir::ast_visitor::map_expr_visitor;
 use vir::messages::Span;
 use crate::lean_ast::{
     and_all, substitute, AssertKind, Binder as LBinder, BinderKind, Expr as LExpr,
-    HypothesisKind, ObligationKind,
+    ExprNode, HypothesisKind, ObligationKind,
     Tactic, Theorem,
 };
 use crate::expr_shared::varat_pre_name;
@@ -1409,7 +1409,7 @@ fn walk_call<'a>(
     typ_args: &[Typ],
     dest: Option<&VarIdent>,
     call_span: &Span,
-    mut_args: &[(usize, &VarIdent)],
+    mut_args: &[(usize, MutTargetRaw<'a>)],
     after: &Wp<'a>,
     ctx: &WpCtx<'a>,
     obl: &OblCtx,
@@ -1444,9 +1444,19 @@ struct MutArgInfo<'a> {
     /// Index into `callee.params` / call-site `args` of this
     /// `&mut` parameter.
     param_idx: usize,
-    /// Caller-side `VarIdent` whose memory is being mutated.
-    /// Extracted from the call-site arg via `extract_simple_var_ident`.
+    /// Caller-side `VarIdent` of the LOCAL whose memory is being
+    /// mutated. For `&mut x` this is `x`; for `&mut h.field` this
+    /// is `h` (the local that holds the struct, NOT the field).
+    /// `walk_call`'s post-call rebinding (Phase 4) emits a `Let`
+    /// frame keyed on this name.
     caller_var: &'a VarIdent,
+    /// Optional field path (#87): when the call is `&mut <local>.<field>`,
+    /// holds the Lean field name as produced by `field_access_name`.
+    /// `None` for the simple `&mut <local>` case; the rebind is then
+    /// `let caller_var := fresh`. `Some(field)` triggers the
+    /// structure-update rebind: `let caller_var := { caller_var with
+    /// field := fresh }`.
+    field_path: Option<String>,
     /// Fresh `_tactus_mut_post_<id>` post-call name for this
     /// `&mut` arg. `walk_call` introduces this as the ∀-binder
     /// for the post-call existential; the ensures Hyp references
@@ -1567,7 +1577,7 @@ fn build_call_substitutions<'a>(
     spec_callee: &FunctionX,
     typ_args: &[Typ],
     args: &[Validated<'a>],
-    mut_args_raw: &[(usize, &'a VarIdent)],
+    mut_args_raw: &[(usize, MutTargetRaw<'a>)],
     e: &mut ObligationEmitter,
 ) -> CallSubstitutions<'a> {
     // Type-param substitution (shared by req + ens). `TypParam(T)`
@@ -1594,12 +1604,22 @@ fn build_call_substitutions<'a>(
     // `next_id()` is the per-fn counter — sufficient because theorem
     // names are namespaced by fn_name.
     let mut_args: Vec<MutArgInfo<'a>> = mut_args_raw.iter()
-        .map(|(idx, caller_var)| MutArgInfo {
-            param_idx: *idx,
-            caller_var,
-            fresh: crate::lean_name::LeanName::synthetic(
-                format!("_tactus_mut_post_{}", e.next_id()),
-            ),
+        .map(|(idx, target)| {
+            let (caller_var, field_path) = match target {
+                MutTargetRaw::Var(v) => (*v, None),
+                MutTargetRaw::Field { base, field_name } => (
+                    *base,
+                    Some(field_name.clone()),
+                ),
+            };
+            MutArgInfo {
+                param_idx: *idx,
+                caller_var,
+                field_path,
+                fresh: crate::lean_name::LeanName::synthetic(
+                    format!("_tactus_mut_post_{}", e.next_id()),
+                ),
+            }
         })
         .collect();
 
@@ -1793,11 +1813,28 @@ fn push_post_call_frames(
     // Phase 4: caller-side rebindings for &mut args. Placed AFTER
     // ensures so the ensures Hyp references the fresh existential,
     // not the rebound caller name.
+    //
+    // Two shapes (#87):
+    // * Simple `&mut <local>`: `let local := fresh`. The local
+    //   takes on the post-call value directly.
+    // * Field `&mut <local>.<field>`: `let local := { local with
+    //   field := fresh }`. Lean's structure update preserves all
+    //   other fields automatically — no havoc-base + assume-other-
+    //   fields-unchanged dance needed (the syntax IS that
+    //   semantics, in the type system).
     for info in &subst.mut_args {
-        new_obl.frames.push(CtxFrame::Let(
-            crate::lean_name::LeanName::from_var_ident(info.caller_var),
-            LExpr::var(info.fresh.clone()),
-        ));
+        let local_name = crate::lean_name::LeanName::from_var_ident(info.caller_var);
+        let new_value = match &info.field_path {
+            None => LExpr::var(info.fresh.clone()),
+            Some(field_name) => LExpr::new(ExprNode::StructUpdate {
+                base: Box::new(LExpr::var(local_name.clone())),
+                updates: vec![(
+                    field_name.clone(),
+                    LExpr::var(info.fresh.clone()),
+                )],
+            }),
+        };
+        new_obl.frames.push(CtxFrame::Let(local_name, new_value));
     }
 
     // Phase 5: dest binding for the call's return (`let r = foo(…)`).
@@ -2103,8 +2140,10 @@ enum Wp<'a> {
         /// `p ↦ fresh` (post-state) in the inlined ensures, and
         /// rebind the caller's local to the fresh value after the
         /// callee's ensures Hyp frame. Empty for fns with no `&mut`
-        /// params (the common case). See task #55.
-        mut_args: Vec<(usize, &'a VarIdent)>,
+        /// params (the common case). Field-path entries (#87) carry
+        /// the field name so the post-call rebind can use Lean's
+        /// structure-update syntax. See task #55 and #87.
+        mut_args: Vec<(usize, MutTargetRaw<'a>)>,
         after: Box<Wp<'a>>,
     },
 }
@@ -2757,14 +2796,85 @@ fn validate_call_arities(
     Ok(())
 }
 
+/// Raw extraction of an `&mut`-arg's target shape from a call-site
+/// `Exp`. The arg's outer `Loc(...)` wrapper is peeled; we recognise
+/// two shapes:
+///
+/// * `Loc(VarLoc(x))` — simple `&mut x`. Variant: `Var(x)`.
+/// * `Loc(UnaryOpr(Field(field_opr), VarLoc(x)))` — depth-1 field
+///   mutation `&mut x.field` (#87). Variant: `Field { base, field_name }`
+///   where `field_name` is the Lean-renderable field name produced
+///   by `field_access_name`. Restricted to single-variant datatypes
+///   (struct-like) — see check below.
+///
+/// Returns `None` for unsupported shapes:
+/// * `&mut v[i]` (Index L-value)
+/// * `&mut x.f.g` (depth ≥ 2)
+/// * `&mut *p` (DerefMut)
+/// * Multi-variant enum field mutation (Lean's structure update
+///   syntax doesn't compose with multi-variant inductives).
+#[derive(Clone)]
+enum MutTargetRaw<'a> {
+    Var(&'a VarIdent),
+    Field { base: &'a VarIdent, field_name: String },
+}
+
+fn extract_mut_target<'a>(e: &'a Exp) -> Option<MutTargetRaw<'a>> {
+    // Peel the outer Loc.
+    let inner = match &e.x {
+        ExpX::Loc(inner) => inner,
+        _ => return None,
+    };
+    // Peel transparent wrappers (Box/Unbox/CoerceMode/Trigger) that
+    // Verus's `ast_to_sst` sometimes inserts around the L-value's
+    // base. For `&mut h.field`, the SST shape we observed is:
+    //   Loc(UnaryOpr(Field, Unbox(Box(VarLoc(h)))))
+    // — the Field's base is wrapped through transparent boxing.
+    // `peel_transparent` peels everything except the Loc itself
+    // (which we already peeled above).
+    let inner = peel_transparent(inner);
+    match &inner.x {
+        ExpX::Var(ident) | ExpX::VarLoc(ident) => Some(MutTargetRaw::Var(ident)),
+        ExpX::UnaryOpr(UnaryOpr::Field(field_opr), base_exp) => {
+            // Single-variant gate (#87 MVS). Lean's `{ x with f := v }`
+            // syntax works for `structure` types (single ctor). For
+            // multi-variant inductives a match-and-rebuild encoding
+            // would be needed — deferred.
+            let is_single_variant = match &field_opr.datatype {
+                vir::ast::Dt::Path(path) => {
+                    field_opr.variant.as_str()
+                        == crate::to_lean_type::short_name(path)
+                }
+                vir::ast::Dt::Tuple(_) => true,
+            };
+            if !is_single_variant {
+                return None;
+            }
+            // The inner of Field(...) — peel transparent wrappers
+            // again, then require a plain VarLoc/Var (depth-1 only
+            // for MVS — `&mut x.f.g` with deeper paths is deferred).
+            let base = peel_transparent(base_exp);
+            let base_ident = match &base.x {
+                ExpX::Var(ident) | ExpX::VarLoc(ident) => ident,
+                _ => return None,
+            };
+            Some(MutTargetRaw::Field {
+                base: base_ident,
+                field_name: crate::expr_shared::field_access_name(field_opr),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Phase 4: Walk the args + params in lockstep, build the `&mut`
 /// arg list, and validate each non-mut arg via `check_exp`.
 ///
-/// For each `&mut` param, the call-site arg must reduce to a simple
-/// `VarIdent` (peeled through `Loc` and transparent wrappers). Non-
-/// simple shapes (`&mut x.f`, `&mut v[i]`) need additional encoding
-/// (havoc-base + assume-other-fields-unchanged) and are rejected
-/// with a pointed error message — deferred follow-up to #55.
+/// For each `&mut` param, the call-site arg must reduce via
+/// `extract_mut_target` to either a simple local or a single-variant
+/// field projection. Other shapes (`&mut v[i]`, deeper paths,
+/// multi-variant enum fields, `&mut *p`) are rejected with a
+/// pointed error message — deferred follow-up to #55 / #87.
 ///
 /// Defensive: a `Loc`-wrapped arg at a non-`&mut` position
 /// shouldn't happen (Rust's borrow checker would reject it upstream),
@@ -2772,18 +2882,21 @@ fn validate_call_arities(
 fn build_call_mut_args<'a>(
     callee_params: &vir::ast::Params,
     args: &'a vir::sst::Exps,
-) -> Result<Vec<(usize, &'a VarIdent)>, String> {
-    let mut mut_args: Vec<(usize, &'a VarIdent)> = Vec::new();
+) -> Result<Vec<(usize, MutTargetRaw<'a>)>, String> {
+    let mut mut_args: Vec<(usize, MutTargetRaw<'a>)> = Vec::new();
     for (i, (param, a)) in callee_params.iter().zip(args.iter()).enumerate() {
         if param.x.is_mut {
-            match extract_simple_var_ident(a) {
-                Some(v) => mut_args.push((i, v)),
+            match extract_mut_target(a) {
+                Some(target) => mut_args.push((i, target)),
                 None => return Err(format!(
-                    "&mut argument at position {} is not a simple local variable. \
-                     `&mut x.f` / `&mut v[i]` / etc. require additional encoding \
-                     (havoc base + assume-other-fields-unchanged) — deferred \
-                     follow-up to #55. Workaround: bind to a local first \
-                     (`let mut tmp = expr; foo(&mut tmp); … = tmp;`).",
+                    "&mut argument at position {} is not a supported L-value \
+                     shape. Tactus accepts `&mut <local>` (simple) and `&mut \
+                     <local>.<field>` for single-variant structs (#87). \
+                     `&mut v[i]`, deeper paths like `&mut x.f.g`, multi-\
+                     variant enum field mutation, and `&mut *p` need \
+                     additional encoding and are deferred (#87 / #95). \
+                     Workaround: bind to a local first (`let mut tmp = expr; \
+                     foo(&mut tmp); ... = tmp;`).",
                     i,
                 )),
             }
