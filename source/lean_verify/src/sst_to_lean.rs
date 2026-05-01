@@ -1444,24 +1444,33 @@ struct MutArgInfo<'a> {
     /// Index into `callee.params` / call-site `args` of this
     /// `&mut` parameter.
     param_idx: usize,
-    /// Caller-side `VarIdent` of the LOCAL whose memory is being
-    /// mutated. For `&mut x` this is `x`; for `&mut h.field` this
-    /// is `h` (the local that holds the struct, NOT the field).
-    /// `walk_call`'s post-call rebinding (Phase 4) emits a `Let`
-    /// frame keyed on this name.
-    caller_var: &'a VarIdent,
-    /// Optional field path (#87): when the call is `&mut <local>.<field>`,
-    /// holds the Lean field name as produced by `field_access_name`.
-    /// `None` for the simple `&mut <local>` case; the rebind is then
-    /// `let caller_var := fresh`. `Some(field)` triggers the
-    /// structure-update rebind: `let caller_var := { caller_var with
-    /// field := fresh }`.
-    field_path: Option<String>,
+    /// What the call is mutating, structurally: a simple local
+    /// (`&mut x`) or a single-variant struct field (`&mut h.f`,
+    /// landed via #87). The variant determines `walk_call`'s
+    /// post-call rebinding shape (Phase 4):
+    /// * `Var(x)` → `let x := fresh`.
+    /// * `Field { base, field_name }` → `let base := { base with
+    ///   field_name := fresh }` via Lean structure update.
+    /// Avoids the `(caller_var, field_path: Option<String>)` flag-
+    /// soup shape — same typed-invariant discipline as #103/#105.
+    target: MutTargetRaw<'a>,
     /// Fresh `_tactus_mut_post_<id>` post-call name for this
     /// `&mut` arg. `walk_call` introduces this as the ∀-binder
     /// for the post-call existential; the ensures Hyp references
     /// it as the post-state value.
     fresh: crate::lean_name::LeanName,
+}
+
+impl<'a> MutArgInfo<'a> {
+    /// The local `VarIdent` to rebind after the call. For
+    /// `Var(x)` this is `x` itself; for `Field { base, .. }`
+    /// it's the base (the struct local that holds the field).
+    fn rebind_local(&self) -> &'a VarIdent {
+        match &self.target {
+            MutTargetRaw::Var(v) => v,
+            MutTargetRaw::Field { base, .. } => base,
+        }
+    }
 }
 
 /// Substitution-related state needed to inline a callee's specs at
@@ -1596,30 +1605,20 @@ fn build_call_substitutions<'a>(
     let arg_lexprs: Vec<LExpr> =
         args.iter().map(|a| lower_validated(*a)).collect();
 
-    // One MutArgInfo per `&mut` arg — bundles param_idx,
-    // caller_var, and the gensym'd fresh post-call name (#105).
-    // Replaces the pre-#105 parallel `mut_args` + `mut_idx_to_fresh`.
-    // The `_tactus_*` prefix is reserved per Convention 1 in
-    // `expr_shared.rs`'s "Reserved identifier conventions" section.
-    // `next_id()` is the per-fn counter — sufficient because theorem
-    // names are namespaced by fn_name.
+    // One MutArgInfo per `&mut` arg — bundles param_idx, target
+    // (the L-value shape, post-#87), and the gensym'd fresh post-
+    // call name (#105). Replaces the pre-#105 parallel `mut_args`
+    // + `mut_idx_to_fresh`. The `_tactus_*` prefix is reserved per
+    // Convention 1 in `expr_shared.rs`'s "Reserved identifier
+    // conventions" section. `next_id()` is the per-fn counter —
+    // sufficient because theorem names are namespaced by fn_name.
     let mut_args: Vec<MutArgInfo<'a>> = mut_args_raw.iter()
-        .map(|(idx, target)| {
-            let (caller_var, field_path) = match target {
-                MutTargetRaw::Var(v) => (*v, None),
-                MutTargetRaw::Field { base, field_name } => (
-                    *base,
-                    Some(field_name.clone()),
-                ),
-            };
-            MutArgInfo {
-                param_idx: *idx,
-                caller_var,
-                field_path,
-                fresh: crate::lean_name::LeanName::synthetic(
-                    format!("_tactus_mut_post_{}", e.next_id()),
-                ),
-            }
+        .map(|(idx, target)| MutArgInfo {
+            param_idx: *idx,
+            target: target.clone(),
+            fresh: crate::lean_name::LeanName::synthetic(
+                format!("_tactus_mut_post_{}", e.next_id()),
+            ),
         })
         .collect();
 
@@ -1823,10 +1822,10 @@ fn push_post_call_frames(
     //   fields-unchanged dance needed (the syntax IS that
     //   semantics, in the type system).
     for info in &subst.mut_args {
-        let local_name = crate::lean_name::LeanName::from_var_ident(info.caller_var);
-        let new_value = match &info.field_path {
-            None => LExpr::var(info.fresh.clone()),
-            Some(field_name) => LExpr::new(ExprNode::StructUpdate {
+        let local_name = crate::lean_name::LeanName::from_var_ident(info.rebind_local());
+        let new_value = match &info.target {
+            MutTargetRaw::Var(_) => LExpr::var(info.fresh.clone()),
+            MutTargetRaw::Field { field_name, .. } => LExpr::new(ExprNode::StructUpdate {
                 base: Box::new(LExpr::var(local_name.clone())),
                 updates: vec![(
                     field_name.clone(),
@@ -2131,13 +2130,15 @@ enum Wp<'a> {
         /// declaration or the callee's own source line.
         call_span: &'a Span,
         /// `&mut` parameters at this call site. Each entry is
-        /// `(param_idx, caller_var)`: the index into `callee.params` /
-        /// `args` of the `&mut` parameter, and the caller-side
-        /// `VarIdent` whose memory is being mutated. `walk_call` uses
-        /// these to introduce a fresh existential per `&mut` arg
-        /// (the post-call value), substitute the callee's
-        /// `varat_pre_name(p) ↦ caller_arg` (pre-state) and
-        /// `p ↦ fresh` (post-state) in the inlined ensures, and
+        /// `(param_idx, target)`: the index into `callee.params` /
+        /// `args` of the `&mut` parameter, and the L-value shape
+        /// the call is mutating (`Var(x)` for `&mut x`,
+        /// `Field { base, field_name }` for `&mut x.field` after
+        /// #87). `walk_call` uses these to introduce a fresh
+        /// existential per `&mut` arg (the post-call value),
+        /// substitute the callee's `varat_pre_name(p) ↦ caller_arg`
+        /// (pre-state) and `p ↦ fresh` (post-state) in the inlined
+        /// ensures, and
         /// rebind the caller's local to the fresh value after the
         /// callee's ensures Hyp frame. Empty for fns with no `&mut`
         /// params (the common case). Field-path entries (#87) carry
@@ -2618,11 +2619,13 @@ fn build_wp<'a>(
 /// Verus-side field addition causes a compile error.
 ///
 /// Validation breaks into four named phases via helpers:
-/// 1. `reject_unsupported_call_shapes` — `split` / `is_trait_default
-///    = Some(true)` (deferred).
+/// 1. `reject_unsupported_call_shapes` — `split` (assertion-splitting
+///    error reporting; deferred).
 /// 2. `resolve_callee` — pick callee + type args based on
-///    `resolved_method` (DynamicResolved redirect) and look both up
-///    in fn_map (plus the trait-method-decl side for impls).
+///    `resolved_method` (DynamicResolved redirect, including the
+///    `is_trait_default = Some(true)` redirect to the trait method
+///    decl introduced in #96) and look both up in fn_map (plus the
+///    trait-method-decl side for impls).
 /// 3. `validate_call_arities` — param count vs args count, typ_args
 ///    count vs callee.typ_params count.
 /// 4. `build_call_mut_args` — extract `&mut` arg destinations,
@@ -2639,7 +2642,7 @@ fn build_wp_call<'a>(
     after: Wp<'a>,
     ctx: &WpCtx<'a>,
 ) -> Result<Wp<'a>, String> {
-    reject_unsupported_call_shapes(split, is_trait_default)?;
+    reject_unsupported_call_shapes(split)?;
 
     let (callee, callee_typ_args) =
         resolve_callee(fun, resolved_method, is_trait_default, typ_args, ctx)?;
@@ -2676,28 +2679,21 @@ fn build_wp_call<'a>(
 /// * `split.is_some()` — split-assertion error reporting; the SST
 ///   shape distributes the error to multiple sites and we don't
 ///   replicate that.
-/// * `is_trait_default = Some(true)` — call resolved to the trait's
-///   default impl rather than a concrete impl. The default body
-///   uses `Self` as a parameter that needs concrete-type
-///   substitution (#56 follow-up). `Some(false)` is fine (concrete
-///   impl on a trait that happens to have a default).
+///
+/// `is_trait_default = Some(true)` is NOT rejected here (#96): the
+/// default body lives on the trait method decl, which
+/// `pick_spec_source` returns as `spec_callee` after `resolve_callee`
+/// redirects to the trait method decl. The default-impl path goes
+/// through the same logic as concrete-impl calls; `Self` resolves
+/// via the existing typ_args / typ_subst machinery.
 fn reject_unsupported_call_shapes(
     split: &Option<vir::messages::Message>,
-    is_trait_default: &Option<bool>,
 ) -> Result<(), String> {
     if split.is_some() {
         return Err(
             "calls with split-assertion error reporting are not yet supported".to_string()
         );
     }
-    // Note: `is_trait_default = Some(true)` (calls resolved to the
-    // trait's default impl) is now accepted (#96). The default body
-    // lives on the trait method decl, which `pick_spec_source` returns
-    // as `spec_callee`. The same logic that handles concrete-impl
-    // calls applies — `Self` resolves through the existing typ_args /
-    // typ_subst machinery (Verus tags Self as a regular type
-    // parameter at the spec level).
-    let _ = is_trait_default;
     Ok(())
 }
 

@@ -1939,6 +1939,26 @@ asymmetric). Adding a new variant still requires editing both files
 trees — in practice most new SST variants are exec-specific and
 don't touch the VIR-AST path, and vice versa.
 
+### What doesn't have to mirror Verus's encoding
+
+Tactus inherits Verus's pipeline through SST, but the *encoding* of obligations on the Lean side doesn't always have to mirror Verus's Z3-targeted encoding. Verus introduces specific patterns — havoc-base + assume-other-fields-unchanged for `&mut x.f`, fresh existentials for return values, explicit pre/post-state hypotheses — *because SMT needs them*. SMT solvers can't natively express "this struct's post-state has these specific fields and others unchanged"; the property has to be asserted as a conjunction of clauses.
+
+When the target is Lean's dependent type theory, some of these encodings collapse. The canonical example is **`&mut x.f` (#87)**: DESIGN.md initially planned a havoc-base + assume-other-fields-unchanged encoding mirroring Verus's Z3 path. The actual implementation turned out to be one Lean expression: `let x := { x with f := <fresh> }`. Lean's structure-update syntax IS "all other fields unchanged" — the property is structural, not asserted. Ten lines of hypothesis become one line of syntax, enforced by elaboration rather than by proof.
+
+**The discipline.** When designing a Tactus encoding, ask both:
+1. *How does Verus do this?* — establishes correctness of the obligation shape.
+2. *What would Lean do?* — establishes whether the SMT-style encoding is the only option, or if Lean's type system can make some hypotheses structurally true.
+
+When the answers differ, the Lean-native shape is usually shorter, tighter, and reduces the unverified surface between Verus and Tactus. The translation table (DESIGN.md § "Expression mapping") leans heavily on this: `=~=` (extensional equality) maps to `=` not because we encode extensionality, but because Lean 4's `=` already IS extensional on functions via funext.
+
+**Where this discipline applies in the deferred queue.**
+* **Deeper field paths** (`&mut a.b.c`) extend #87's structure-update pattern recursively: `let a := { a with b := { a.b with c := <fresh> } }`. No havoc encoding.
+* **Multi-variant enum field mutation** is the one case Lean's structure-update syntax doesn't compose with — it'd need a match-and-rebuild encoding. But that's a specific Lean idiom (`match a with | Variant fs => Variant { fs with f := <fresh> }`), not a havoc.
+* **Closures (#93)** target Lean's first-class function types directly rather than encoding the FnOnce/Fn/FnMut hierarchy as Z3 axioms.
+* **Indexed L-values (`&mut v[i]`)** need a `Vector.set i v` style encoding — Lean has it, no havoc needed.
+
+**When the discipline doesn't apply.** Some obligations are inherently shaped by the source semantics, not the target. Termination via `CheckDecreaseHeight`, fixed-width integer overflow checks, and SSA mutation as let-shadowing are all encodings the SMT path uses that translate cleanly because the property at hand IS first-order arithmetic (or first-order shadowing). The discipline matters most when the property is *higher-order* or *structural* — where Lean's expressivity exceeds SMT's.
+
 ### Scope and difficulty
 
 Implementing `sst_to_lean` with full WP is the most significant engineering effort — comparable to `sst_to_air` (~3000 lines). It handles mutation as SSA, control flow, pattern matching, closures, borrow semantics. **Estimated: 3-6 months.**
