@@ -3553,6 +3553,75 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #87 rejection: `&mut a.b.c` (depth-2 field path). The MVS only
+// accepts depth-1 field paths; deeper paths would extend the
+// structure-update encoding recursively but aren't wired yet.
+test_verify_one_file! {
+    #[test] test_exec_call_mut_arg_field_deep_rejected verus_code! {
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        struct Inner { val: u8 }
+        struct Outer { inner: Inner }
+
+        #[verifier::tactus_auto]
+        fn call_deep_mut(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            let mut o = Outer { inner: Inner { val: x } };
+            bump(&mut o.inner.val);  // depth-2 — not yet supported
+            o.inner.val
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e|
+                e.message.contains("not a supported L-value shape")
+                || e.message.contains("&mut <local>.<field>")),
+            "expected depth-2 path rejection, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
+// #86 latent-bug coverage: trait method and impl declare the same
+// param with TEXTUALLY DIFFERENT names. Pre-#86 the substitution
+// map was keyed only on impl param names; trait specs (with trait
+// param names) wouldn't substitute. The #86 union-key pass
+// addresses this. Pin it with a test that uses different names.
+test_verify_one_file! {
+    #[test] test_exec_call_trait_method_differing_param_names verus_code! {
+        trait Adder {
+            fn add_one(&self, x: u8) -> (r: u8)
+                requires x < 200
+                ensures r == x + 1;
+        }
+
+        struct Plain;
+        impl Adder for Plain {
+            // Param renamed `x` → `n`, return name renamed `r` → `s`.
+            // Both are positionally aligned with the trait's spec.
+            fn add_one(&self, n: u8) -> (s: u8)
+                ensures s == n + 1
+            {
+                n + 1
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn caller(a: &Plain, k: u8) -> (r: u8)
+            requires k < 100
+            ensures r == k + 1
+        {
+            a.add_one(k)
+        }
+    } => Ok(())
+}
+
 // Multi-`&mut`: two mut args at the same call site. Exercises the
 // stacked-frames encoding (each &mut arg gets its own existential
 // + caller-rebinding pair). Borrow check guarantees the two args
