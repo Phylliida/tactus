@@ -891,10 +891,16 @@ recursion pass covers all cross-fn calls in the cycle the same way.
   `Static`/`Dynamic` paths that resolve to a same-crate trait or
   impl (#56). `build_wp_call` redirects the callee lookup to the
   resolved impl when `resolved_method` is `Some`; `pick_spec_source`
-  uses the trait method decl's `require/ensure` (the impl's is
-  inherited/empty). Trade-off: impl-specific strengthening of
-  `ensures` not seen at call sites — caller sees the trait-level
-  contract.
+  uses the trait method decl's `require` (the impl's is empty —
+  Verus rejects impl-side requires). For `ensure`, callers see the
+  conjunction of trait's AND impl's ensures (#86 — impl-specific
+  strengthening): the trait's spec is the weakest contract, the
+  impl's spec is at-least-as-strong (Verus enforces impl ⇒ trait),
+  and conjoining gives the caller the strongest available
+  guarantee. `build_call_substitutions` builds substitution maps
+  keyed on BOTH callee.params (impl) and spec_callee.params (trait)
+  so either side's clauses substitute correctly even when trait
+  and impl have textually different param names.
 * **`&mut` args** — caller-side LANDED (#55, slice 1). `walk_call`
   introduces fresh existentials per `&mut` arg, substitutes
   pre-/post-state separately in the inlined ensures, and rebinds
@@ -1373,21 +1379,41 @@ exec fns."
 
   **Spec source via `pick_spec_source`.** For
   `FunctionKind::TraitMethodImpl` callees, Tactus uses the TRAIT
-  method decl's `require/ensure` rather than the impl's. Verus
-  rejects impl-side `requires` declarations (impl inherits trait's
-  requires), so the impl's require is always empty. Impls may
-  redeclare `ensures` only if they imply the trait's, so using the
-  trait's ensures is sound (it's the weakest contract any impl
-  satisfies).
+  method decl's `require`. Verus rejects impl-side `requires`
+  declarations (impl inherits trait's requires), so the impl's
+  require is always empty.
 
-  **Trade-off — impl-specific strengthening not seen.** A trait
-  with `ensures r < 100` whose impl strengthens to `ensures r == 5`
-  produces a call site that sees only `r < 100`. Pinned by
-  `test_exec_call_trait_method_two_impls` (caller's ensures is the
-  trait-level `r < 100`, not the impl-specific `r == 5`). To see
-  the impl's strengthening, a caller would need a per-clause
-  merge: pick the strongest of (trait, impl) for each ensures
-  clause. Deferred follow-up.
+  **Impl-strengthening of `ensures` LANDED via #86.** When the
+  resolved impl strengthens the trait's `ensures` (e.g., trait says
+  `r < 100`, impl says `r == 5`), the call site now sees the
+  conjunction `(trait_ensures) ∧ (impl_ensures)`. Verus enforces
+  `impl ⇒ trait` via its trait-impl-checking pass, so the
+  conjunction is satisfiable and caller never proves something
+  inconsistent. `build_call_substitutions` builds substitution maps
+  keyed on BOTH `callee.params` (impl) and `spec_callee.params`
+  (trait) — same arg values for both spellings of each param's
+  name, so either side's clauses substitute correctly even when
+  trait and impl have textually different param names (Rust allows
+  this; the names are positionally aligned but textually
+  independent). `push_post_call_frames`'s Phase 3 conjoins
+  `spec_callee.ensure.0` with `callee.ensure.0` (when the resolved
+  impl differs from the trait method decl, detected via
+  `Arc::ptr_eq` on the `Fun` field). Pinned by
+  `test_exec_call_trait_method_impl_strengthens` (caller relies on
+  the impl-specific `r == 5`, not just the trait's `r < 100`) and
+  `test_exec_call_trait_method_wrong_impl_strengthening` (caller
+  asserts the wrong impl's value — fails postcondition, pins that
+  the strengthening comes from the resolved impl, not some other
+  impl of the same trait).
+
+  **Aesthetic note (not a correctness issue).** When trait and
+  impl have identical `ensures` (a common case — impl just repeats
+  the trait), the conjunction duplicates the clause:
+  `(r == x) ∧ (r == x)`. `omega`/`simp_all` handle this fine; the
+  generated Lean is slightly verbose but unambiguous. A future
+  refinement could detect equivalent clauses and dedup, but the
+  cost (syntactic comparison on VIR-AST expressions) outweighs the
+  current readability cost.
 
   **Cross-crate traits rejected at build time.** If the resolved
   impl is `TraitMethodImpl { method, .. }` and `method` (the trait

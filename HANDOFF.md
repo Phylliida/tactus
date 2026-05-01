@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**232 end-to-end tests + 1 coverage test + 118 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**234 end-to-end tests + 1 coverage test + 118 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -1297,6 +1297,90 @@ shapes — `&mut x.f` / `&mut v[i]`); #95 (new-mut-ref mode —
 tests pass; 1530 vstd functions still verify. Down to 7 pending
 tasks (was 8 + closed #94).
 
+#### Current session (2026-05-01 late morning — #86 impl-strengthening of ensures)
+
+Closed #86. When the resolved trait impl strengthens the trait's
+ensures (e.g., trait says `r < 100`, impl says `r == 5`), the call
+site now sees the conjunction `(trait_ensures) ∧ (impl_ensures)`.
+Caller can rely on the impl-specific guarantee, not just the
+trait-level contract.
+
+Verus's trait-impl-checking pass already enforces `impl ⇒ trait`,
+so the conjunction is satisfiable — caller never proves something
+inconsistent.
+
+**Encoding (`build_call_substitutions` + `push_post_call_frames`):**
+
+1. `build_call_substitutions` now takes `spec_callee` (the trait
+   method decl, when callee is a `TraitMethodImpl`) in addition to
+   `callee` (the resolved impl). Builds substitution maps keyed on
+   BOTH `callee.params` (impl) and `spec_callee.params` (trait) —
+   same arg values for both spellings of each param's name. Needed
+   because Rust allows trait and impl to use textually different
+   param names (positionally aligned but textually independent),
+   and the trait's ensures uses trait names while the impl's uses
+   impl names.
+2. Same approach for the ret name: both `callee.ret.name` and
+   `spec_callee.ret.name` map to `fresh_ret_name`. So either side's
+   ensures clause renders with the gensym'd ret regardless of
+   whether trait/impl ret names match.
+3. `push_post_call_frames` Phase 3 now conjoins
+   `spec_callee.ensure.0` (trait's clauses) with `callee.ensure.0`
+   (impl's clauses) when callee != spec_callee (detected via
+   `Arc::ptr_eq` on the `Fun` field). Both substituted via the
+   same `subst.ens_subst` (which now has both spellings).
+4. Helper `add_param_subst_entries` extracts the per-param
+   subst-building logic so the two passes (callee + spec_callee)
+   share implementation. The second pass is a no-op when
+   `callee == spec_callee` — overwrites entries with identical
+   values; running unconditionally keeps the code simple.
+
+**Aesthetic note (not a bug).** When trait and impl have IDENTICAL
+ensures (a common case — impl just repeats the trait), the
+conjunction duplicates the clause: `(r == x) ∧ (r == x)`. Goals
+look slightly verbose. `omega`/`simp_all` handle this fine. A
+future refinement could syntactically dedup but the cost outweighs
+the readability hit at current scale.
+
+**Tests** (2 new, 232 → 234 e2e):
+- `test_exec_call_trait_method_impl_strengthens` (positive): trait
+  declares `ensures r < 100`; impl strengthens to `ensures r == 5`;
+  caller's `ensures r == 5` becomes provable. Pre-#86 this would
+  fail (caller would only see `r < 100` from the trait).
+- `test_exec_call_trait_method_wrong_impl_strengthening` (negative):
+  same trait with two impls (`AlwaysFive: r == 5`,
+  `AlwaysTen: r == 10`). Caller of `AlwaysFive::unwrap()` claims
+  `r == 10` — fails postcondition. Pins that the impl-strengthening
+  comes from the RESOLVED impl, not some other impl of the same
+  trait. The goal generated shows `_tactus_ret_1 < 100 ∧
+  _tactus_ret_1 = 5` as the conjoined hypothesis — both clauses
+  visible.
+- Existing `test_exec_call_trait_method_two_impls` still passes
+  (caller's `ensures r < 100` is implied by impl's `r == 5` /
+  `r == 10`). Updated comment to reference the new tests.
+- Existing `test_exec_call_trait_method_with_args` still passes
+  (impl and trait have matching param names; the second
+  substitution pass is a no-op).
+
+**Latent bug fixed along the way.** Pre-#86 the substitution map
+was keyed only on `callee.params` (impl) names, but applied to
+`spec_callee.ensure.0` (trait's clauses with trait names). When
+trait and impl had matching param names — the case all current
+tests covered — substitution worked. When they differed, the
+trait-side names wouldn't substitute and the rendered ensures
+would have free variables. No test exercised the differing-name
+case, so the bug was unobserved; the new union-key approach
+addresses it incidentally.
+
+**What remains (still in #56 follow-ups):**
+- #96 `is_trait_default = Some(true)` (default-impl invocation)
+- Cross-crate trait method decls (Phase 3 work)
+- Truly dynamic dispatch via `dyn Trait` (cross-crate variant)
+
+**Net for late morning**: 1 commit. 234 e2e + 118 unit + 1 coverage
+tests pass; 1530 vstd functions still verify. Down to 6 pending
+tasks (was 7 + closed #86).
+
 ## Architecture
 
 ### Full pipeline
@@ -1572,7 +1656,7 @@ The seven original Track B slices are all landed, plus #49 / #50 / #51 / #52 (st
 See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the full catalogue. Currently blocking realistic exec fns:
 
 - **`&mut` args at call sites** — caller-side LANDED (#55), callee-side body verification LANDED (#94). `&mut x.f` / `&mut v[i]` shapes (#87) and new-mut-ref mode `MutRefCurrent`/`MutRefFuture` (#95) remain as `#55` follow-ups.
-- **Trait-method calls** — caller-side LANDED (#56) for `DynamicResolved` (concrete-receiver) and same-crate `Static`/`Dynamic` paths. Trade-off: impl-specific strengthening of `ensures` not seen at call sites (caller sees the trait-level contract). `is_trait_default = Some(true)` and cross-crate trait method decls are documented `#56` follow-ups.
+- **Trait-method calls** — caller-side LANDED (#56) for `DynamicResolved` (concrete-receiver) and same-crate `Static`/`Dynamic` paths. Impl-specific strengthening of `ensures` LANDED via #86 — caller sees the conjunction of trait's and resolved-impl's ensures, so impls that strengthen the trait's contract are visible at the call site. `is_trait_default = Some(true)` (#96) and cross-crate trait method decls remain `#56` follow-ups.
 - **`assume(P)` warning** — DESIGN.md promises a "unproved assumption" compile warning; not wired.
 - **USize arith rarely auto-verifies** — the bound is emitted, but `tactus_auto` can't discharge symbolic `2 ^ arch_word_bits`. Users need `cases arch_word_bits_valid` proofs.
 - **Labeled `break`** — landed via #88 (label-keyed stack of `WpLoopCtx`). Labeled `continue 'outer;` still rejected by Verus upstream (needs `loop_isolation(false)` which we don't support either); the label-stack handles it in principle.
@@ -1615,16 +1699,9 @@ sub-tasks:
 
 The caller-side MVS for trait method calls landed (DynamicResolved
 + Static/Dynamic same-crate paths via `walk_call`'s standard
-inlining). Remaining sub-tasks:
+inlining). Impl-strengthening of ensures landed via #86 (callers
+see trait + resolved-impl conjoined). Remaining sub-tasks:
 
-- **Impl-specific strengthening of `ensures`.** Currently
-  `pick_spec_source` returns the trait method decl, so a
-  caller never sees the impl's strengthened ensures (e.g.,
-  trait says `r < 100`, impl says `r == 5` → caller sees
-  only `r < 100`). Per-clause merge: at each call site,
-  conjoin the trait's ensures with the impl's (already
-  proven trait-implication-sound by Verus). Bounded work
-  but invasive — touches the substitution map shape.
 - **`is_trait_default = Some(true)`** (calls resolved to the
   trait's default impl, not a concrete impl). The default
   body uses `Self` as a parameter that needs additional
@@ -1730,7 +1807,7 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 |---|---|---|
 | `cargo test -p lean_verify --lib` | 118 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking, `format_rust_loc`, lean_process, `LeanName` constructors |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
-| `vargo test -p rust_verify_test --test tactus` | 232 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body, trait-method calls, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression) |
+| `vargo test -p rust_verify_test --test tactus` | 234 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body, trait-method calls with impl-strengthened ensures, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
 | `vargo build --release` (vstd) | 1530 | Regression guard: vstd proof library still verifies |
 
@@ -1843,7 +1920,7 @@ tactus/
       fn_call_to_vir.rs        ← tactus_span_from, enclosing_fn_is_tactus_auto
       rust_to_vir_expr.rs      ← Tactus proof-block synthesis (AssertBy-in-Ghost)
     rust_verify_test/tests/
-      tactus.rs                ← 232 end-to-end tests
+      tactus.rs                ← 234 end-to-end tests
       tactus_coverage.rs       ← coverage matrix test binary
     vir/src/
       ast.rs                   ← FunctionAttrs.tactic_span + tactus_auto;
@@ -1893,7 +1970,7 @@ cd lean_verify && ./scripts/setup-mathlib.sh && cd ..
 # (See DESIGN.md "Putting Lean on PATH" for the long form.)
 
 # ── Full test suite ────────────────────────────────────────────────
-# 232 end-to-end tests
+# 234 end-to-end tests
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Coverage matrix (1 test, asserts walker visits the expected variant set)
