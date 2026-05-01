@@ -1829,10 +1829,10 @@ fn push_post_call_frames(
         let local_name = crate::lean_name::LeanName::from_var_ident(info.rebind_local());
         let new_value = match &info.target {
             MutTargetRaw::Var(_) => LExpr::var(info.fresh.clone()),
-            MutTargetRaw::Field { field_name, .. } => LExpr::new(ExprNode::StructUpdate {
+            MutTargetRaw::Field { field_opr, .. } => LExpr::new(ExprNode::StructUpdate {
                 base: Box::new(LExpr::var(local_name.clone())),
                 updates: vec![(
-                    field_name.clone(),
+                    crate::expr_shared::field_access_name(field_opr),
                     LExpr::var(info.fresh.clone()),
                 )],
             }),
@@ -2816,7 +2816,14 @@ fn validate_call_arities(
 #[derive(Clone)]
 enum MutTargetRaw<'a> {
     Var(&'a VarIdent),
-    Field { base: &'a VarIdent, field_name: String },
+    /// `&mut <base>.<field>` for a single-variant struct. Stores
+    /// the structural references (`base` ident from the L-value's
+    /// VarLoc, `field_opr` from the Field projection) — the Lean-
+    /// rendered field name is computed at emission time via
+    /// `field_access_name(field_opr)`. Symmetric with the `Var`
+    /// variant which also stores a structural reference rather than
+    /// a pre-rendered string.
+    Field { base: &'a VarIdent, field_opr: &'a vir::ast::FieldOpr },
 }
 
 fn extract_mut_target<'a>(e: &'a Exp) -> Option<MutTargetRaw<'a>> {
@@ -2858,10 +2865,7 @@ fn extract_mut_target<'a>(e: &'a Exp) -> Option<MutTargetRaw<'a>> {
                 ExpX::Var(ident) | ExpX::VarLoc(ident) => ident,
                 _ => return None,
             };
-            Some(MutTargetRaw::Field {
-                base: base_ident,
-                field_name: crate::expr_shared::field_access_name(field_opr),
-            })
+            Some(MutTargetRaw::Field { base: base_ident, field_opr })
         }
         _ => None,
     }
