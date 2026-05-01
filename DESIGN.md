@@ -1755,121 +1755,170 @@ Each closes a different hole.
 
 ### Code review strategy
 
-When landing non-trivial work, run five review lenses against the
-diff before calling it done. Each catches a different class of
-issue; a single "read it over" pass misses most of them.
+When landing non-trivial work, run review lenses against the diff
+before calling it done. Each lens is a different *question*; each
+question is non-redundant; each catches a class of issue the others
+miss. A single "read it over" pass catches almost none of them.
+
+The list below grew lens-by-lens across sessions — new lenses get
+added when an existing review pass surfaces something the named
+lenses didn't ask about. Run as many as feel useful; the typical
+cleanup pass uses the first 5 and runs 10-30 minutes per landing,
+catching 3-5 real issues even on code that looked fine.
+
+#### Core lenses
 
 **1. Linus hat.** Role-play a grumpy maintainer. Look for clever
 abstractions that make code harder to understand, defensive code
 for scenarios that can't happen, flag soup (`Option<_>` + `bool`
 fields that can never take independent values), bad naming,
 orphaned docstrings, functions whose signature lies about what
-they do.
+they do. *Canonical hits*: `typ_inv_exps` smuggling the asserted
+condition (field's name didn't match its content); `MutArgInfo`'s
+`(caller_var, field_path: Option<String>)` flag-soup before
+embedding `MutTargetRaw`.
 
 **2. FP lens.** What's mutable that could be immutable? What's
 stateful that could be a parameter? Common hits: `RefCell` on
 supposedly-pure functions, shared mutable state across module
-boundaries, accumulators that could be folds.
+boundaries, accumulators that could be folds. *Canonical hit*:
+`WpCtx::tactus_asserts: RefCell<_>` making `walk_obligations` lie
+about its purity → replaced with `collect_tactus_haves` two-pass
+walk.
 
 **3. Comprehensive coverage.** What code paths have no test?
 Variants of a new enum that aren't exercised, edge cases at the
 boundaries, negative tests for claimed-rejections, interactions
-between two features.
+between two features. *Canonical hit*: missing regression tests
+for labeled-break-rejected, nested-loop inner-break, return-
+inside-loop-with-break after #57 landed.
 
-**4. Upstream-brittleness.** What breaks silently if Verus
-changes X? See § "Upstream-robustness patterns" above for the
-triangle of defences; the review asks "have we used them?"
+**4. Upstream-brittleness.** What breaks silently if Verus changes
+X? See § "Upstream-robustness patterns" above for the triangle of
+defences (explicit field destructures, shared helpers for implicit
+shapes, shape-drift tests); the review asks "have we used them?"
+*Canonical hit*: `test_exec_auto_proof_block_not_tactus` guards
+against Verus's `auto_proof_block` ever generating empty synthetic
+blocks (which would mis-classify as Tactus).
 
-**5. Documentation / deferrals.** What's landed but not
-documented? Counterintuitive behaviour that needs a caveat?
-Deferrals in code comments that aren't in this document's
-deferrals catalogue? Stale comments asserting rejected features
-that are now accepted?
+**5. Documentation / deferrals.** What's landed but not documented?
+Counterintuitive behaviour that needs a caveat? Deferrals in code
+comments that aren't in this document's deferrals catalogue? Stale
+comments asserting rejected features that are now accepted?
+*Canonical hit*: proof-block goal-modifying-tactic semantics worth
+pinning with a test and a DESIGN.md caveat after #49 landed.
 
-**Process.** Land the work with tests passing, run the five lenses,
-triage each finding (fix now / file follow-up / skip), do the
-"fix now" list in a follow-up commit labelled "review cleanup".
-Update this document for any caveat or deferral that surfaced.
-Typical cleanup pass: 10-30 minutes, catches 3-5 real issues even
-on code that looked fine.
+#### Additional lenses (each surfaced findings the core five missed)
 
-**Beyond the five core lenses.** A 2026-04-28 session ran
-additional review-style passes after the standard five had been
-applied — each surfaced findings the prior passes hadn't named.
-Each lens is a different question; the questions are
-non-redundant.
+**6. Reasoning-clarity lens.** *If I came back in a month, what
+would slow me down?* Different from Linus-hat — not bugs or smells,
+just code that worked but was hard to read. *Canonical hits*:
+`walk_call`-as-200-line-mixed-phases (split into 3 named helpers);
+the `pick_spec_source` `_ =>` catch-all that worked but encoded a
+brittle assumption (made exhaustive).
 
-* **Reasoning-clarity lens.** *If I came back in a month, what
-  would slow me down?* Different from "Linus hat" — not bugs or
-  smells, just code that worked but was hard to read. Surfaced
-  the `walk_call`-as-200-line-mixed-phases issue and the
-  `pick_spec_source` `_ =>` catch-all that worked but encoded
-  a brittle assumption.
+**7. Error-message quality lens.** Every `Err(...)` message reviewed
+for the convention *"answer (a) what did the user write?, (b) is
+there a workaround?, (c) is this tracked?"* *Canonical hit*: 13
+messages using internal type names (`FuelConst`, `OpenInvariant`)
+instead of surface syntax (`reveal_with_fuel`, `open_atomic_invariant!`).
+Convention now applied uniformly.
 
-* **Error message quality lens.** Every `Err(...)` message
-  reviewed for the convention "answer (a) what did the user
-  write?, (b) is there a workaround?, (c) is this tracked?"
-  Surfaced 13 messages using internal type names (`FuelConst`,
-  `OpenInvariant`, etc.) instead of surface syntax (`reveal_with_
-  fuel`, `open_atomic_invariant!`). Convention now applied
-  uniformly.
+**8. Identifier-conventions lens.** Reserved-name and gensym
+conventions tend to grow across sessions with no single source of
+truth. The lens asks: *what naming patterns has the codebase
+accreted? are they documented?* Surfaced four conventions
+(`_tactus_<role>_<id>` prefix, `<x>_at_pre_tactus` suffix,
+`tactus_<name>` for user-visible tactics, bare names in
+TactusPrelude) and two gensym mechanisms (`StmX::Loop::id` vs
+`next_id()`). Documented in `expr_shared.rs` § "Reserved identifier
+conventions".
 
-* **Identifier conventions lens.** Reserved-name and gensym
-  conventions had grown across sessions with no single source of
-  truth. Surfaced four conventions (`_tactus_<role>_<id>` prefix,
-  `<x>_at_pre_tactus` suffix, `tactus_<name>` for user-visible
-  tactics, bare names in TactusPrelude) plus two gensym
-  mechanisms (`StmX::Loop::id` vs `next_id()`). Documented as a
-  numbered convention list in `expr_shared.rs`'s "Reserved
-  identifier conventions" section.
+**9. Simplify lens (reuse / quality / efficiency).** Cross-check for
+newly-written code that could use existing helpers, hidden-state
+smells, and missed early-return short-circuits. *Canonical hits*:
+pure-rename `let warnings = assume_warnings;` (removed); over-broad
+`pub` visibility on `WpLoopCtx` (narrowed); efficiency issue —
+`rewrite_varat_for_mut_params` walked the entire AST even when its
+set was empty.
 
-* **Simplify lens (reuse / quality / efficiency).** Cross-check
-  for newly-written code that could use existing helpers,
-  hidden-state smells, and missed early-return short-circuits.
-  Surfaced one pure-rename `let warnings = assume_warnings;`,
-  one over-broad `pub` visibility (`WpLoopCtx`), and one
-  efficiency issue (`rewrite_varat_for_mut_params` walked the
-  entire AST even when its set was empty — common case).
+**10. Right-way lens.** *This works — but is there a "right way" to
+do it?* Different from Linus-hat (which catches bad shape) and
+Simplify (which catches missed reuse). Catches code that's correct
+and idiomatic-enough, but uses a low-level or Verus-mirroring shape
+where a more meaningful or target-native shape would express the
+same thing better. The question: *what does this code MEAN, and is
+the shape it takes the most direct expression of that meaning?*
+Two flavours:
+- *Implementation level.* `Arc::ptr_eq(&callee.name,
+  &spec_callee.name)` works as a "this is a trait-method-impl
+  call" check, but it's pointer-identity proxying for a structural
+  property. Right way: `matches!(callee.kind,
+  FunctionKind::TraitMethodImpl { .. })` — the discriminant IS the
+  meaning.
+- *Encoding level.* See § "What doesn't have to mirror Verus's
+  encoding". When Verus uses an SMT-style encoding (havoc-base,
+  fresh existentials, conjoined preservation hypotheses), ask
+  whether Lean's type system can make the property structural
+  rather than asserted. #87's `{ x with f := v }` was this lens
+  applied at design time.
 
-* **Right-way lens.** *This works — but is there a "right way" to
-  do it?* Different from Linus-hat (which catches bad shape) and
-  Simplify (which catches missed reuse). This lens catches code
-  that's correct, idiomatic-enough, but uses a low-level or
-  Verus-mirroring shape where a more meaningful or target-native
-  shape would express the same thing better. Two flavours:
-  - *Implementation level.* `Arc::ptr_eq(&callee.name,
-    &spec_callee.name)` works as a "this is a trait-method-impl
-    call" check, but it's pointer-identity proxying for a
-    structural property. The right way is `matches!(callee.kind,
-    FunctionKind::TraitMethodImpl { .. })` — the discriminant is
-    meaningful, the pointer comparison is implementation detail.
-  - *Encoding level.* DESIGN.md § "What doesn't have to mirror
-    Verus's encoding" names this for the obligation-shape side:
-    when Verus uses an SMT-style encoding (havoc-base, fresh
-    existentials, conjoined preservation hypotheses), ask whether
-    Lean's type system can make the property structural rather
-    than asserted. #87's `{ x with f := v }` was this lens
-    applied at design time.
-  The question: *what does this code MEAN, and is the shape it
-  takes the most direct expression of that meaning?*
+**11. Rust-antipattern lens.** *Are we using `Arc`/`RefCell`/clones/
+`Box<dyn>` where direct references or simpler ownership would work?
+Are we storing pre-rendered output where a structural reference
+would defer the work?* The lens has a high false-positive rate —
+many `Arc` uses are required by upstream type design — but the
+true positives are real. *Canonical hit*: `MutTargetRaw::Field`
+stored a pre-rendered Lean field name (`String`) where a structural
+`&FieldOpr` reference works. Asymmetric with `Var(&VarIdent)` which
+already stored a structural ref. Changed to match.
 
-The pattern: each new lens is a new *question*, not a new
-*place to look*. Review passes never reach a fixed point because
-the questions are unbounded; what you do is run enough lenses
-that the *known unknowns* are small.
+**12. Edge-case lens.** *Anywhere we've deferred handling without
+either tracking it explicitly or rejecting it explicitly?* Implicit
+edge cases — silent acceptances of cases the implementation doesn't
+actually handle — are the dangerous class. *Canonical hit*: the
+single-variant gate for `&mut x.f` had `Dt::Tuple(_) => true`
+(silently accept). Probe surfaced that Lean's structure-update
+syntax doesn't compose with `Prod` — would have produced
+elaboration errors at every tuple-field mutation. Gate flipped to
+explicit rejection; documented in deferrals; rejection test added.
 
-Canonical examples from the #50 landing's two cleanup passes:
-* *Linus hat* caught `typ_inv_exps` smuggling the asserted condition
-  (field's name didn't match its content) and `WpCtx::tactus_asserts:
-  RefCell<_>` making `walk_obligations` lie about its purity.
-* *FP lens* motivated the two-pass `collect_tactus_haves` rewrite.
-* *Coverage* caught missing regression tests for labeled-break
-  rejected, nested-loop inner-break, return-inside-loop-with-break.
-* *Upstream-brittleness* led to `test_exec_auto_proof_block_not_tactus`,
-  which guards against Verus's `auto_proof_block` ever generating
-  empty synthetic blocks (which would mis-classify as Tactus).
-* *Documentation* surfaced the proof-block goal-modifying-tactic
-  semantics worth pinning with a test and a DESIGN.md caveat.
+**13. Typed-invariant lens.** *Anywhere we're enforcing an invariant
+via runtime check (`expect`, `unwrap`, `assert`, panic, runtime
+discriminator) where the type system could carry the proof
+structurally?* The audit batch (#99–#105) named this pattern; this
+lens applies it as a review pass. *Canonical hits*: `walk_call`'s
+`pick_spec_source(callee, &fn_map).expect(...)` where the lookup
+was already validated upstream — moved to `Wp::Call` as a structural
+field, removing both the runtime check and the dead `pick_spec_source`
+helper.
+
+**14. Regression-test lens.** *For every fix in this diff, is there
+a test that would catch a similar bug class in the future?* Distinct
+from the "Coverage" lens — Coverage asks about untested CODE PATHS,
+this asks about untested BUG CLASSES. *Canonical hit*: `&mut` +
+trait/impl differing-param-names interaction wasn't tested after
+#86's union-key landing — added `test_exec_call_trait_mut_differing_param_names`.
+
+#### Process
+
+Land the work with tests passing, then run lenses 1–5 minimum.
+Triage each finding (fix now / file follow-up / skip), do the
+"fix now" list in a follow-up commit labelled "review (lens-name)".
+Update this document for any caveat, deferral, or new lens that
+surfaced.
+
+When time allows, also run lenses 6–14. Even on code that passed
+the core 5, additional lenses surface findings (today's session:
+6 lenses run, 6 cleanup commits, 1 real bug found by the
+edge-case lens). The lens list isn't exhaustive — when a review
+pass surfaces a finding that doesn't fit any existing lens, the
+question that surfaced it is itself a candidate new lens.
+
+The pattern: each new lens is a new *question*, not a new *place
+to look*. Review passes never reach a fixed point because the
+questions are unbounded; what you do is run enough lenses that
+the *known unknowns* are small.
 
 ### Two parallel expression renderers — and why we didn't fully unify them
 
