@@ -911,6 +911,65 @@ soundness hole that "was indistinguishable from no fix when
 the bug is about consistency across sites" is now
 type-system-prevented.
 
+#### Current session (2026-04-29 late afternoon — #100 Validated<Exp> typestate)
+
+The `sst_exp_to_ast` panic site is now a type-system-enforced
+invariant. Same architectural pattern as #99: identify a
+runtime contract (here, "caller has already validated"),
+introduce a newtype whose constructors are the only path to
+the property, let the compiler enforce consistency.
+
+**The change:**
+- `Validated<'a>` newtype in `to_lean_sst_expr.rs`. Constructable
+  only via `Validated::check(&Exp) -> Result<Validated, String>`.
+- `lower(Validated<'_>) -> LExpr` is the only consumer.
+- `Wp<'a>` variants migrated: `Let`, `Assert`, `Assume`,
+  `AssertByTactus.cond`, `Branch.cond`, `Loop.cond` /
+  `validated_invs` / `decrease`, `Call.args` all hold
+  `Validated<'a>` instead of `&'a Exp`.
+- `build_wp` / `build_wp_loop` / `build_wp_call` construct
+  via `Validated::check(...)?` (errors propagate to callers).
+- Walkers (`walk_obligations` / `walk_loop` / `walk_call` /
+  `walk_assert_by_tactus`) are panic-free by construction —
+  they call `lower_validated(...)` on Validated witnesses
+  threaded through the Wp tree.
+
+**Migration shim for incremental rollout.** ~10 sites still
+call the legacy `sst_exp_to_ast(&Exp) -> LExpr` (panic
+version), e.g., `WpCtx::new`'s ensures rendering, `walk_let`'s
+peeled-bind handling, `build_req_binders`, `lift_if_value`,
+the test-fixture site. These contexts have `&Exp` references
+without easy access to a `Validated` witness; threading
+through would cascade further. The shim panics with a clear
+message that documents the migration; tracked for removal as
+each site gets refactored.
+
+The architectural change is in place — every NEW Wp construction
+site goes through `Validated::check`; the walker interior is
+guaranteed-no-panic; the `lower` function takes a typed
+witness. The shim is a transition aid, not part of the
+intended API.
+
+**No new tests** — the change is internal refactor; the
+existing 227 e2e tests + 118 unit tests all pass, confirming
+the typed pipeline produces identical output to the prior
+`String`/`&Exp` pipeline. The unit tests in `lean_name.rs`
+exercise the parallel typed-name pattern; future tests for
+`Validated` could pin the "ill-formed Exp produces Err
+instead of panic at lower" path.
+
+**DESIGN.md additions** — new "Type-system-enforced
+invariants" section under "Spec fn opacity model" naming the
+pattern (LeanName + Validated as the two examples) and a
+"Potential future applications" subsection noting the two
+candidates that didn't make the cut today (#101 substitute-
+keying-with-LeanName scheduled next; AssertKind split and
+prelude-name allowlist sync as further-out candidates).
+
+**Net for late afternoon**: 1 commit, 227 e2e tests still
+pass (no regression). One pending task closed (#100). #101
+remains for next session if desired.
+
 ## Architecture
 
 ### Full pipeline
