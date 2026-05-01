@@ -2827,6 +2827,14 @@ enum MutTargetRaw<'a> {
 }
 
 fn extract_mut_target<'a>(e: &'a Exp) -> Option<MutTargetRaw<'a>> {
+    // Peel transparent wrappers (Box/Unbox/CoerceMode/Trigger) at
+    // the outermost level too — for some L-value shapes (e.g.,
+    // tuple field mutation, before we reject it) the SST has
+    // `UnaryOpr(Unbox(_), Loc(...))`, with the Unbox outside the
+    // Loc rather than inside it. `peel_transparent` stops at Loc
+    // (per its semantics), so this just removes any surrounding
+    // boxing.
+    let e = peel_transparent(e);
     // Peel the outer Loc.
     let inner = match &e.x {
         ExpX::Loc(inner) => inner,
@@ -2847,14 +2855,24 @@ fn extract_mut_target<'a>(e: &'a Exp) -> Option<MutTargetRaw<'a>> {
             // syntax works for `structure` types (single ctor). For
             // multi-variant inductives a match-and-rebuild encoding
             // would be needed — deferred.
-            let is_single_variant = match &field_opr.datatype {
+            let supported_kind = match &field_opr.datatype {
                 vir::ast::Dt::Path(path) => {
+                    // Single-variant struct: the variant name equals
+                    // the type's short name. Multi-variant enums fall
+                    // through to None (Lean's `{ x with f := v }`
+                    // doesn't compose with multi-variant inductives).
                     field_opr.variant.as_str()
                         == crate::to_lean_type::short_name(path)
                 }
-                vir::ast::Dt::Tuple(_) => true,
+                // Tuple field mutation `&mut t.0` is rejected: Lean's
+                // structure-update syntax doesn't work for `Prod`
+                // types ("expected structure" elaboration error).
+                // Encoding would need explicit ctor rebuild: `let t :=
+                // (v, t.1)` style. Tracked separately — different
+                // from the struct case.
+                vir::ast::Dt::Tuple(_) => false,
             };
-            if !is_single_variant {
+            if !supported_kind {
                 return None;
             }
             // The inner of Field(...) — peel transparent wrappers

@@ -3553,6 +3553,40 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #87 rejection: tuple field mutation `&mut t.0`. Lean's structure-
+// update syntax `{ x with f := v }` doesn't compose with `Prod`
+// types — Lean's elaborator rejects with "expected structure". Would
+// need a different encoding (explicit ctor rebuild: `let t := (v,
+// t.1)`). Pinned as a rejection so a future tuple-aware encoding
+// flips the assertion.
+test_verify_one_file! {
+    #[test] test_exec_call_mut_arg_tuple_field_rejected verus_code! {
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        #[verifier::tactus_auto]
+        fn call_tuple_mut(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            let mut t: (u8, u8) = (x, 0);
+            bump(&mut t.0);
+            t.0
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e|
+                e.message.contains("not a supported L-value shape")),
+            "expected tuple-field rejection, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
 // #87 rejection: `&mut a.b.c` (depth-2 field path). The MVS only
 // accepts depth-1 field paths; deeper paths would extend the
 // structure-update encoding recursively but aren't wired yet.
