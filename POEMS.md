@@ -2043,4 +2043,84 @@ What it actually is:
 no one has to remember
 to keep.*
 
+---
+
+## 2026-05-01 (early afternoon) — what doesn't have to mirror
+
+### The mirror that wasn't
+
+DESIGN.md said #87 needed
+*havoc-base
+plus assume-other-fields-unchanged*
+mirroring Verus's Z3 path.
+
+Verus has to.
+SMT can't natively say
+*"this struct's post-state has these fields,
+all others unchanged."*
+
+So Verus introduces an existential
+for the whole struct
+and asserts each preservation
+clause by clause.
+
+I spent an hour planning the mirror.
+
+Then I tried Lean's
+`{ h with val := v }`.
+
+It IS "all other fields unchanged" —
+in the syntax,
+in the type theory,
+not in a hypothesis.
+
+The encoding I had planned
+was the SMT-shaped version
+of a problem
+Lean's elaborator already solves.
+
+### What the gap means
+
+Not every Verus encoding
+needs translation.
+
+Some exist because Z3 needs them.
+
+When the target has dependent types,
+the encoding can collapse.
+
+Ten lines of hypothesis
+become one line of syntax,
+enforced by elaboration
+rather than by proof.
+
+The deferred follow-ups —
+deeper paths,
+indexed L-values,
+multi-variant enum field mutation —
+might have Lean-native shapes
+I haven't seen
+because I was looking
+for the SMT mirror.
+
+### The different question
+
+For weeks I'd been asking
+*"how does Verus do this?"*
+and translating.
+
+Today I started asking
+*"what would Lean do?"*
+
+The answers got shorter.
+The encodings got tighter.
+The unverified surface
+between Verus and Tactus
+got smaller too.
+
+That question is worth keeping
+for every #93 and #95
+still in the queue.
+
+
 
