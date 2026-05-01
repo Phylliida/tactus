@@ -2135,14 +2135,72 @@ fn build_wp<'a>(
                 else_branch: Box::new(else_branch),
             })
         }
-        // `build_wp_call` doesn't need the enclosing loop_stack: it
-        // doesn't recurse on stmts outside its own structure.
-        // `build_wp_loop` DOES — it extends the stack with this
-        // loop's WpLoopCtx and recurses on the body. `after` was
-        // already built by our caller with the outer stack, so we
-        // don't pass it for `after` recursion.
-        StmX::Call { .. } => build_wp_call(stm, after, ctx),
-        StmX::Loop { .. } => build_wp_loop(stm, after, ctx, loop_stack),
+        // The Call / Loop destructures live HERE at the dispatch site
+        // rather than inside their respective build_wp_* helpers
+        // (#104). Reasons:
+        //   1. The wrong-variant case is unrepresentable: build_wp_call
+        //      can't be called on a non-Call statement because it
+        //      doesn't take a Stm — only the destructured fields.
+        //   2. The explicit-fields-no-`..` upstream-robustness defence
+        //      (DESIGN.md § "Upstream-robustness patterns") still
+        //      applies: any Verus-side field addition to StmX::Call /
+        //      StmX::Loop forces a compile error at this match arm.
+        //   3. `mode` / `assert_id` (Call) and `is_for_loop` /
+        //      `typ_inv_vars` / `modified_vars` / `pre_modified_params`
+        //      (Loop) are spelled out as `_` so the audit catches
+        //      additions even at fields we currently ignore.
+        //
+        // build_wp_call doesn't need the enclosing loop_stack — its
+        // call_span is `&stm.span`, threaded through. build_wp_loop
+        // DOES — it extends the stack with this loop's WpLoopCtx and
+        // recurses on the body. `after` was already built by our
+        // caller with the outer stack.
+        StmX::Call {
+            fun,
+            resolved_method,
+            mode: _,
+            is_trait_default,
+            typ_args,
+            args,
+            split,
+            dest,
+            assert_id: _,
+        } => build_wp_call(
+            fun,
+            resolved_method,
+            is_trait_default,
+            typ_args,
+            args,
+            split,
+            dest.as_ref(),
+            &stm.span,
+            after,
+            ctx,
+        ),
+        StmX::Loop {
+            loop_isolation,
+            is_for_loop: _,
+            id,
+            label,
+            cond,
+            body,
+            invs,
+            decrease,
+            typ_inv_vars: _,
+            modified_vars: _,
+            pre_modified_params: _,
+        } => build_wp_loop(
+            *loop_isolation,
+            *id,
+            label,
+            cond,
+            body,
+            invs,
+            decrease,
+            after,
+            ctx,
+            loop_stack,
+        ),
         // Transparent in SST: pass `after` through unchanged.
         StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => Ok(after),
         // `break` / `continue` terminate the current iteration and
@@ -2279,9 +2337,11 @@ fn build_wp<'a>(
     }
 }
 
-/// Validate and build a `Wp::Call`. Destructures every `StmX::Call`
-/// field explicitly (no `..`) so any future Verus field addition
-/// forces a compile error here.
+/// Validate and build a `Wp::Call`. Takes the destructured `StmX::Call`
+/// fields directly (#104) — the wrong-variant case is unrepresentable
+/// because the function never sees a `Stm`. The explicit field
+/// destructure happens at the `build_wp` dispatch site, where any
+/// Verus-side field addition causes a compile error.
 ///
 /// Validation breaks into four named phases via helpers:
 /// 1. `reject_unsupported_call_shapes` — `split` / `is_trait_default
@@ -2294,24 +2354,17 @@ fn build_wp<'a>(
 /// 4. `build_call_mut_args` — extract `&mut` arg destinations,
 ///    rejecting non-simple-Loc shapes.
 fn build_wp_call<'a>(
-    stm: &'a Stm,
+    fun: &'a Fun,
+    resolved_method: &'a Option<(Fun, vir::ast::Typs)>,
+    is_trait_default: &'a Option<bool>,
+    typ_args: &'a vir::ast::Typs,
+    args: &'a vir::sst::Exps,
+    split: &'a Option<vir::messages::Message>,
+    dest: Option<&'a Dest>,
+    call_span: &'a Span,
     after: Wp<'a>,
     ctx: &WpCtx<'a>,
 ) -> Result<Wp<'a>, String> {
-    let StmX::Call {
-        fun,
-        resolved_method,
-        mode: _,               // exec-fn bodies only route here
-        is_trait_default,
-        typ_args,
-        args,
-        split,
-        dest,
-        assert_id: _,          // Verus-internal error id, behaviourally inert
-    } = &stm.x else {
-        unreachable!("build_wp_call called on non-Call statement");
-    };
-
     reject_unsupported_call_shapes(split, is_trait_default)?;
 
     let (callee, callee_typ_args) =
@@ -2321,7 +2374,7 @@ fn build_wp_call<'a>(
 
     let mut_args = build_call_mut_args(&callee.params, args)?;
 
-    let bound_dest: Option<&'a VarIdent> = dest.as_ref()
+    let bound_dest: Option<&'a VarIdent> = dest
         .and_then(|d| extract_simple_var_ident(&d.dest));
 
     // NOTE: the termination obligation for recursive calls is emitted
@@ -2338,7 +2391,7 @@ fn build_wp_call<'a>(
         args: validated_args,
         typ_args: callee_typ_args,
         dest: bound_dest,
-        call_span: &stm.span,
+        call_span,
         mut_args,
         after: Box::new(after),
     })
@@ -2498,39 +2551,29 @@ fn build_call_mut_args<'a>(
     Ok(mut_args)
 }
 
-/// Validate and build a `Wp::Loop`. See the module doc for the shape
-/// restrictions. The loop's body is built with its OWN terminator —
-/// `Done(I ∧ D < _tactus_d_old)` — rather than the outer `after`,
-/// because a fall-through end of an iteration re-enters the loop's
-/// maintain clause, not the post-loop continuation.
+/// Validate and build a `Wp::Loop`. Takes the destructured `StmX::Loop`
+/// fields directly (#104) — the wrong-variant case is unrepresentable
+/// because the function never sees a `Stm`. The explicit field
+/// destructure happens at the `build_wp` dispatch site, where any
+/// Verus-side field addition causes a compile error.
+///
+/// See the module doc for the shape restrictions. The loop's body is
+/// built with its OWN terminator — `Done(I ∧ D < _tactus_d_old)` —
+/// rather than the outer `after`, because a fall-through end of an
+/// iteration re-enters the loop's maintain clause, not the post-loop
+/// continuation.
 fn build_wp_loop<'a>(
-    stm: &'a Stm,
+    loop_isolation: bool,
+    id: u64,
+    label: &'a Option<String>,
+    cond: &'a Option<(Stm, Exp)>,
+    body: &'a Stm,
+    invs: &'a vir::sst::LoopInvs,
+    decrease: &'a vir::sst::Exps,
     after: Wp<'a>,
     ctx: &WpCtx<'a>,
     outer_loop_stack: &[&WpLoopCtx],
 ) -> Result<Wp<'a>, String> {
-    // Destructure every field explicitly so a future Verus-side
-    // `StmX::Loop` addition forces a compile-time audit. `is_for_loop`
-    // only affects error messages upstream; `id` / `label` are loop
-    // identifiers we don't reference; `typ_inv_vars` supplies type-
-    // invariant assumptions that Verus's sst_to_air uses — we
-    // recompute our own `modified_vars` via `collect_modifications`
-    // rather than trust Verus's `modified_vars` or `pre_modified_params`.
-    let StmX::Loop {
-        loop_isolation,
-        is_for_loop: _,
-        id,
-        label,
-        cond,
-        body,
-        invs,
-        decrease,
-        typ_inv_vars: _,
-        modified_vars: _,
-        pre_modified_params: _,
-    } = &stm.x else {
-        unreachable!("build_wp_loop called on non-loop statement");
-    };
     // Per-loop-unique d_old name. Verus's `StmX::Loop::id` is the
     // upstream-stable identifier per loop instance — preferred over
     // `next_id()` because it gives deterministic output across runs
