@@ -912,7 +912,12 @@ recursion pass covers all cross-fn calls in the cycle the same way.
     (no havoc-base + assume-other-fields-unchanged dance — Lean's
     type system enforces other-fields-unchanged structurally).
     `&mut v[i]` (Index L-value), deeper field paths (`&mut a.b.c`),
-    and multi-variant enum field mutation remain deferred.
+    multi-variant enum field mutation, and tuple field mutation
+    (`&mut t.0`) remain deferred. Tuple specifically: Lean's
+    structure-update syntax doesn't compose with `Prod` types
+    ("expected structure" elaboration error), so a different
+    encoding is needed (explicit ctor rebuild, e.g.
+    `let t := (v, t.1)`).
   - **Legacy-mode `VarAt(p, Pre)` only.** New-mut-ref's
     `MutRefCurrent`/`MutRefFuture` UnaryOps not handled.
   - **Caller side LANDED in slice 1; callee side LANDED via #94.**
@@ -966,7 +971,9 @@ recursion pass covers all cross-fn calls in the cycle the same way.
     **Still deferred**: `&mut v[i]` (Index L-value), deeper paths
     `&mut a.b.c`, multi-variant enum field mutation (Lean's
     structure-update syntax doesn't compose with multi-variant
-    inductives), and new-mut-ref mode `MutRefCurrent` /
+    inductives), tuple field mutation `&mut t.0` (structure update
+    doesn't work for `Prod` either — needs ctor rebuild instead),
+    and new-mut-ref mode `MutRefCurrent` /
     `MutRefFuture` (#95 — separate UnaryOps that don't go through
     `VarAt`). `&mut x.f` for single-variant structs LANDED via #87
     using Lean's structure update — the encoding doesn't need
