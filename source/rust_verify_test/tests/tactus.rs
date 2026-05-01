@@ -3998,6 +3998,125 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #96: trait method with a default body, impl doesn't override.
+// The call resolves to the trait's default. `resolve_callee` redirects
+// to use the trait method decl (which holds the default body and
+// spec) instead of Verus's synthesized `<impl>%default%<method>`
+// wrapper — Self resolves through the existing typ_args / typ_subst
+// machinery.
+test_verify_one_file! {
+    #[test] test_exec_call_trait_default verus_code! {
+        trait Greeter {
+            fn salute(&self) -> (r: u8)
+                ensures r == 1
+            {
+                1
+            }
+        }
+
+        struct Plain;
+        impl Greeter for Plain {}
+
+        #[verifier::tactus_auto]
+        fn caller(p: &Plain) -> (r: u8)
+            ensures r == 1
+        {
+            p.salute()
+        }
+    } => Ok(())
+}
+
+// Negative: caller's ensures contradicts the trait default's ensures.
+// Pins that the trait default's spec is what the caller sees as a
+// post-call hypothesis (not some unrelated fallback).
+test_verify_one_file! {
+    #[test] test_exec_call_trait_default_wrong_ensures verus_code! {
+        trait Greeter {
+            fn salute(&self) -> (r: u8)
+                ensures r == 1
+            {
+                1
+            }
+        }
+
+        struct Plain;
+        impl Greeter for Plain {}
+
+        #[verifier::tactus_auto]
+        fn caller(p: &Plain) -> (r: u8)
+            ensures r == 5  // wrong: default returns 1
+        {
+            p.salute()
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("postcondition")),
+            "expected postcondition failure, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
+// Default with non-self params + a precondition. Pins that the
+// trait default's `requires` reaches the precondition obligation,
+// AND that args substitute correctly into both the requires and
+// ensures.
+test_verify_one_file! {
+    #[test] test_exec_call_trait_default_with_args verus_code! {
+        trait Inc {
+            fn inc(&self, x: u8) -> (r: u8)
+                requires x < 200
+                ensures r == x + 1
+            {
+                x + 1
+            }
+        }
+
+        struct Plain;
+        impl Inc for Plain {}
+
+        #[verifier::tactus_auto]
+        fn caller(p: &Plain, x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            p.inc(x)
+        }
+    } => Ok(())
+}
+
+// Mixed: trait has a default; some impls override, others don't.
+// Caller invokes the OVERRIDING impl; pins that we still go through
+// the concrete-impl path (and impl-strengthening from #86 still
+// applies — caller's stronger ensures is provable).
+test_verify_one_file! {
+    #[test] test_exec_call_trait_default_overridden verus_code! {
+        trait Greeter {
+            fn salute(&self) -> (r: u8)
+                ensures r < 100
+            {
+                1
+            }
+        }
+
+        struct Strong;
+        impl Greeter for Strong {
+            fn salute(&self) -> (r: u8)
+                ensures r == 42
+            {
+                42
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn caller(s: &Strong) -> (r: u8)
+            ensures r == 42  // caller relies on Strong's strengthened ensures
+        {
+            s.salute()
+        }
+    } => Ok(())
+}
+
 // #86: impl-specific strengthening of `ensures`. The trait declares a
 // weak postcondition; the impl strengthens it. Caller sees BOTH
 // conjoined, so they can rely on the impl's specific guarantee.
