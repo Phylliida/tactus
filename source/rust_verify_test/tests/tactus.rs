@@ -3622,6 +3622,46 @@ test_verify_one_file! {
     }
 }
 
+// #86 + #55 interaction: trait method takes `&mut`, AND trait/impl
+// have textually different param names. Exercises the union-key
+// substitution for BOTH `pname` (post-state) AND `pname_pre`
+// (`<x>_at_pre_tactus`, pre-state) — four keys total per &mut
+// param across both passes. If either spelling were missing from
+// the map, the inlined ensures would have unsubstituted vars.
+test_verify_one_file! {
+    #[test] test_exec_call_trait_mut_differing_param_names verus_code! {
+        trait Bumper {
+            fn bump(&self, x: &mut u8)
+                requires *old(x) < 100
+                ensures *x == *old(x) + 1;
+        }
+
+        struct Plain;
+        impl Bumper for Plain {
+            // Param renamed `x` → `n` at the impl site. Verus inherits
+            // requires/ensures from the trait decl (impl can't declare
+            // its own); the impl's spec gets re-keyed to `n` at the
+            // trait-impl-checking pass. Tactus must thread BOTH `x`
+            // (trait spelling) and `n` (impl spelling) into the
+            // substitution map for &mut params.
+            fn bump(&self, n: &mut u8)
+            {
+                *n = *n + 1;
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn caller(b: &Plain, k: u8) -> (r: u8)
+            requires k < 100
+            ensures r == k + 1
+        {
+            let mut y = k;
+            b.bump(&mut y);
+            y
+        }
+    } => Ok(())
+}
+
 // #86 latent-bug coverage: trait method and impl declare the same
 // param with TEXTUALLY DIFFERENT names. Pre-#86 the substitution
 // map was keyed only on impl param names; trait specs (with trait
