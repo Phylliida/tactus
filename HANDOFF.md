@@ -1121,6 +1121,85 @@ tracking what remains).
 227 e2e + 118 unit tests. Three more pending tasks closed.
 Down to **9 pending tasks** (was 8 + 1 newly-noticed #104).
 
+#### Current session (2026-05-01 morning — #104 typed build_wp dispatch)
+
+The last typed-invariant audit candidate landed. `build_wp_call`
+and `build_wp_loop` previously took a `&'a Stm` and re-destructured
+internally with `let StmX::Call { … } = &stm.x else { unreachable!(...) };`
+— a runtime panic if the dispatcher ever called them on the wrong
+variant. Post-#104 they take the destructured fields directly:
+
+```rust
+fn build_wp_call<'a>(
+    fun: &'a Fun,
+    resolved_method: &'a Option<(Fun, Typs)>,
+    is_trait_default: &'a Option<bool>,
+    typ_args: &'a Typs,
+    args: &'a Exps,
+    split: &'a Option<Message>,
+    dest: Option<&'a Dest>,
+    call_span: &'a Span,
+    after: Wp<'a>,
+    ctx: &WpCtx<'a>,
+) -> Result<Wp<'a>, String>
+```
+
+The destructure happens at the `build_wp` dispatch site (an
+explicit `StmX::Call { … }` / `StmX::Loop { … }` match arm with no
+`..`), where any Verus-side field addition still causes a compile
+error — the upstream-robustness defence stays intact, just lifted
+from inside the helpers to the dispatcher. The wrong-variant case
+is now structurally unrepresentable: there's no `Stm` parameter
+to mismatch against.
+
+**What landed:**
+- `build_wp` dispatch arm for `StmX::Call` destructures all 9
+  fields explicitly (with `mode: _` and `assert_id: _` for the
+  ones we ignore), passes the rest as named parameters to
+  `build_wp_call`.
+- Same shape for `StmX::Loop` — 11 fields destructured
+  (`is_for_loop`, `typ_inv_vars`, `modified_vars`,
+  `pre_modified_params` as `_`).
+- `build_wp_call`'s `unreachable!` panic and the inline
+  destructure-or-error pattern are gone. Same for `build_wp_loop`.
+- Doc comments updated on both helpers to record the new shape
+  and where the upstream-robustness defence lives.
+
+**Testing**: 227 e2e + 118 unit + 1 coverage tests all green
+on first run, no regressions. The refactor is mechanical and
+the type system carried the migration cost — `cargo check`
+caught every site that needed updating during the edit.
+
+**DESIGN.md additions:**
+- New `#104` entry under "Type-system-enforced invariants".
+- "Potential future applications" section refreshed: stale
+  AssertKind entry removed (landed as #102 already), and the
+  three Tier 3 candidates noted in the audit poem (`OblCtx`
+  frame ordering, `Tactic::Raw` vs `Tactic::Named`, typed
+  `RustLoc`) added with cost/benefit framing for why they're
+  deferred.
+
+**What remains pending:**
+- **#87** &mut x.f / &mut v[i] non-simple Loc shapes (#55 follow-up)
+- **#94** callee-side &mut body verification (#55 follow-up)
+- **#95** new-mut-ref mode (MutRefCurrent/MutRefFuture) (#55 follow-up)
+- **#86** trait method impl-strengthening of ensures (#56 follow-up)
+- **#96** trait default-impl invocation (#56 follow-up)
+- **#93** ExpX::CallLambda + StmX::ClosureInner (closures)
+- **#98** substitute() walk_children boilerplate cleanup
+- **#97** OblCtx::with_frame O(N²) → Rc<im::Vector>
+- **`sst_exp_to_ast` shim removal** (#100 follow-up; ~10 call sites)
+
+The typed-invariant audit batch is now complete: seven applications
+of the pattern landed (#99, #100, #101, #102, #103, #104, #105)
+across two days. The pattern that started as a single fix for a
+chained-compare soundness hole turned out to apply structurally
+across the codebase once named.
+
+**Net for the morning**: 1 commit. 227 e2e + 118 unit + 1 coverage
+tests still pass. Down to 8 pending tasks (closes the typed-invariant
+audit batch from yesterday's session).
+
 ## Architecture
 
 ### Full pipeline

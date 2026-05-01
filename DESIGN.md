@@ -132,15 +132,21 @@ Several runtime contracts in the codebase have been promoted to type-level enfor
 
 **`MutArgInfo` struct fuses parallel arrays (#105).** Pre-#105, `mut_args: Vec<(usize, &VarIdent)>` and `mut_idx_to_fresh: HashMap<usize, LeanName>` were parallel structures keyed on the same `usize`, with `.expect("fresh name should exist for every &mut param idx")` on every consumer-side lookup. Post-#105: `Vec<MutArgInfo { param_idx, caller_var, fresh }>` bundles the three fields together. The `expect()` is gone; the type guarantees the fresh name is present alongside the rest of the entry. `push_post_call_frames` no longer takes a separate `mut_args` parameter — it iterates `subst.mut_args` directly.
 
+**`build_wp_call` / `build_wp_loop` take destructured fields directly (#104).** Pre-#104, both helpers took a `&'a Stm` and immediately re-destructured with `let StmX::Call { … } = &stm.x else { unreachable!("build_wp_call called on non-Call statement"); };` — a runtime panic if the dispatcher ever called them on the wrong variant. Post-#104: `build_wp_call(fun, resolved_method, is_trait_default, typ_args, args, split, dest, call_span, after, ctx)` and `build_wp_loop(loop_isolation, id, label, cond, body, invs, decrease, after, ctx, outer_loop_stack)` take the fields directly. The destructure happens at the `build_wp` dispatch site (an explicit `StmX::Call { … }` / `StmX::Loop { … }` match arm with no `..`), where any Verus-side field addition still causes a compile error — the upstream-robustness defence stays intact, just lifted from inside the helpers to the dispatcher. The wrong-variant case is now structurally unrepresentable: there's no `Stm` parameter to mismatch against.
+
 **The pattern, named.** When a value's type doesn't carry the property the code requires of it, and the requirement is checked at runtime via panic or assertion: introduce a newtype, make its constructors the only path that satisfies the property, and let the type system enforce the rest. Reviewer-visible at every call site (the constructor name documents the source); refactor-resistant (half-finished migrations don't compile); future-proof (new code added in years can't accidentally break the invariant). The cost is a typed wrapper. The benefit is a soundness hole that's structurally unrepresentable.
 
 ### Potential future applications of the typed-invariant pattern
 
-Two candidates noted but not yet promoted:
-
-* **`AssertKind` obligation/hypothesis split.** Currently a flat enum where `is_obligation_kind()` does runtime discrimination. Could be `AssertKind = Obligation(Kind) | Hypothesis(Kind)` so passing a hypothesis-kind where an obligation-kind is expected becomes a type error. Less urgent than `LeanName`/`Validated` because we have one filtering site.
+Candidates noted from prior audits but not yet promoted. Each is a runtime-checked invariant that could be lifted to the type system; each was judged below the cost/benefit threshold *for now*. If a related bug surfaces — or if the codebase grows to where the runtime check becomes load-bearing — they're the natural next applications.
 
 * **Prelude name allowlist sync.** `sanity.rs` hardcodes the allowlist of Tactus prelude names (`arch_word_bits`, `usize_hi`, `tactus_peel`, etc.). Adding a new prelude def requires hand-syncing the allowlist. Could derive the list from `prelude.rs` as the single source of truth — though the current hand-sync is small enough that the typed approach hasn't justified the work yet.
+
+* **`OblCtx` frame ordering invariant.** `OblCtx::with_frame` accepts any `CtxFrame` in any order; `wrap` folds outermost-first to preserve source-scoping. The "outermost-first" invariant is a documented contract on the API, not enforced by the type. A typed builder pattern (e.g., separate `OblCtxOuter` / `OblCtxInner` typestates with constructors that allow only consistent additions) would make wrong-order use a compile error. Cost: more types, more transitions. Current cost of the runtime convention: zero bugs to date.
+
+* **`Tactic::Raw` vs `Tactic::Named`.** The `Tactic` enum has a single `Raw(String)` variant covering both arbitrary-text closer tactics (`tactus_auto`, user overrides) and structurally-meaningful names. A split (`Raw(String)` for free-form text, `Named(LeanName)` for known prelude tactics) would let the pp / sanity layers treat them differently without parsing the string. Today everything goes through string equality; no bug has surfaced from the conflation.
+
+* **`format_rust_loc` returning typed `RustLoc`.** The function returns a `String` formatted as `path:line:col`. Downstream `find_span_mark` parses it back to extract the line. A typed `RustLoc { path, line, col }` struct would eliminate the parse-format roundtrip. Bounded mechanical work; the current shape is small enough that the round-trip cost isn't visible.
 
 ### Mutual recursion (user-specified)
 
