@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**227 end-to-end tests + 1 coverage test + 118 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**232 end-to-end tests + 1 coverage test + 118 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -1200,6 +1200,103 @@ across the codebase once named.
 tests still pass. Down to 8 pending tasks (closes the typed-invariant
 audit batch from yesterday's session).
 
+#### Current session (2026-05-01 mid-morning — #94 callee-side &mut body)
+
+Closed #94: `tactus_auto` on a fn that itself takes `&mut` params now
+verifies. The roadmap called this "the largest of the three #55 follow-
+ups" but the implementation was actually session-sized — the AST-side
+caller infrastructure (`varat_pre_name` in `expr_shared.rs`, the
+rewrite pattern in `rewrite_varat_for_mut_params`) had already
+established the *shape*; #94 just applied the same shape one layer
+down at the SST level.
+
+**The bug surfaced first.** Probe test (flipping `tactus_auto` on
+`bump(x: &mut u8) { *x = *x + 1; }`) produced this goal:
+
+```
+let x := x + 1;
+x = x + 1
+```
+
+Both `*x` (post-state) and `*old(x)` (pre-state) lowered to `Var(x)`,
+and the body's `let x := x + 1` shadow made them equal — silently
+wrong. The ensures `*x = *old(x) + 1` evaluated against shadowed-x
+on BOTH sides: `(x+1) = (x+1)+1`, false. (This is similar to the
+#99 chained-compare hole — different shape, same family.)
+
+**Encoding (mirrors caller-side #55):**
+1. **SST-level rewrite**: `rewrite_varat_for_mut_params_in_stm` and
+   `_in_exp` walk the body and ensures, replacing
+   `ExpX::VarAt(x, Pre)` with `ExpX::Var(<x>_at_pre_tactus)` for
+   every `&mut` param x. Uses `vir::sst_visitor::map_exps_in_stm_visitor`
+   / `map_exp_visitor` (newly promoted from `pub(crate)` to `pub`,
+   plus the containing `sst_visitor` module promoted from `mod` to
+   `pub mod`). Synthetic name produced via the shared
+   `varat_pre_name` helper in `expr_shared.rs` — same one the
+   caller-side path uses for substitution-map keys.
+2. **Initial OblCtx Let frame** per `&mut` param:
+   `Let(<x>_at_pre_tactus, Var(x))` — wraps the goal at theorem-
+   emission time so the body's WP (which after rewrite mentions
+   `<x>_at_pre_tactus`) sees the pre-state captured before any
+   body modification.
+3. **Requires NOT rewritten**: at fn entry, x IS the pre-state;
+   `*old(x) ≡ x` for requires evaluation. The natural VarAt → Var
+   collapse in the SST renderer is correct for them, and they go
+   to theorem-level binders (`build_req_binders`) emitted before
+   the body's WP wrap.
+4. **Symmetry payoff**: the encoding works end-to-end with the
+   caller-side path because both use the SAME `varat_pre_name`
+   helper for the synthetic name, AND the caller's
+   `build_call_substitutions` already inserts a binding for
+   `<p>_at_pre_tactus → arg` in the inlined ensures. So a fn
+   verified callee-side with `*old(x)` references composes cleanly
+   when called from a tactus_auto caller. Pinned by
+   `test_exec_callee_mut_and_caller_both_tactus_auto`.
+
+**Tests** (5 new, 227 → 232):
+- `test_exec_callee_mut_simple` — happy path, `bump(x: &mut u8)
+  { *x = *x + 1; }` with `*old(x) < 100` requires and `*x == *old(x) + 1`
+  ensures. Foundation regression guard.
+- `test_exec_callee_mut_wrong_body` (negative) — body assigns
+  `*x = *x + 2` instead of `+ 1`. Pins that the ensures actually
+  sees the body's let-shadow, not just the original pre-state value
+  (would catch a regression where rewrite or Let frame is missing).
+- `test_exec_callee_mut_multiple_writes` — `*x = *x + 1; *x = *x + 1;`
+  with ensures `*x == *old(x) + 2`. Pins that successive
+  let-shadows compose correctly.
+- `test_exec_callee_two_mut_params` — `bump_both(a: &mut u8, b: &mut u8)`.
+  Pins that the per-param Let frames don't collide.
+- `test_exec_callee_mut_and_caller_both_tactus_auto` — end-to-end
+  with both #55 caller-side and #94 callee-side active in the
+  same crate. Pins the shared `varat_pre_name` contract.
+
+**Upstream change:** `vir/src/lib.rs` promoted `mod sst_visitor` to
+`pub mod sst_visitor`. Plus two functions (`map_exp_visitor`,
+`map_exps_in_stm_visitor`) went from `pub(crate)` to `pub`. Comments
+at all three sites cross-reference #94 so a future rebase audit
+knows why they're exposed. No semantic change to upstream Verus —
+this is just a visibility bump.
+
+**Discipline note worth recording: estimates were off by an order
+of magnitude.** I planned for a session-sized task; actual work
+was ~30 minutes after the probe test. The reason: the AST-side
+caller infrastructure had already established the conceptual
+pattern (rewrite VarAt at the SST/AST level, share synthetic-name
+helper). #94 was a parallel application at one level down — same
+mechanical shape, same shared helper, same name-management
+discipline. This mirrors the typed-invariant audit pattern
+(#99–#105): once the *shape* is named once, applying it
+elsewhere is fast. The first instance pays for the convincing;
+later instances inherit it.
+
+**What remains (still in #55 follow-ups):** #87 (non-simple Loc
+shapes — `&mut x.f` / `&mut v[i]`); #95 (new-mut-ref mode —
+`MutRefCurrent`/`MutRefFuture` UnaryOps).
+
+**Net for mid-morning**: 1 commit. 232 e2e + 118 unit + 1 coverage
+tests pass; 1530 vstd functions still verify. Down to 7 pending
+tasks (was 8 + closed #94).
+
 ## Architecture
 
 ### Full pipeline
@@ -1470,11 +1567,11 @@ Rejected (in `build_wp_call`): trait-default-impl calls (`is_trait_default = Som
 
 ### What's deferred
 
-The seven original Track B slices are all landed, plus #49 / #50 / #51 / #52 (struct Ctor) / #53 / #54 / #55 (caller-side) / #56 (caller-side) / #57 / #58 / #76 / #77 / #78 / #79 / #80 / #81 / #82 / #83 / #85 / #88 / #90 / #92 / D from the Tier 1-3 roadmap. See **Pending work** below for the remaining queue.
+The seven original Track B slices are all landed, plus #49 / #50 / #51 / #52 (struct Ctor) / #53 / #54 / #55 (caller-side) / #56 (caller-side) / #57 / #58 / #76 / #77 / #78 / #79 / #80 / #81 / #82 / #83 / #85 / #88 / #90 / #92 / #94 (callee-side `&mut`) / #99 / #100 / #101 / #102 / #103 / #104 / #105 / D from the Tier 1-3 roadmap. See **Pending work** below for the remaining queue.
 
 See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the full catalogue. Currently blocking realistic exec fns:
 
-- **`&mut` args at call sites** — caller-side LANDED (#55). Callee-side body verification (`tactus_auto` on a fn that itself takes `&mut`), `&mut x.f` / `&mut v[i]` shapes, and new-mut-ref mode are documented `#55` follow-ups.
+- **`&mut` args at call sites** — caller-side LANDED (#55), callee-side body verification LANDED (#94). `&mut x.f` / `&mut v[i]` shapes (#87) and new-mut-ref mode `MutRefCurrent`/`MutRefFuture` (#95) remain as `#55` follow-ups.
 - **Trait-method calls** — caller-side LANDED (#56) for `DynamicResolved` (concrete-receiver) and same-crate `Static`/`Dynamic` paths. Trade-off: impl-specific strengthening of `ensures` not seen at call sites (caller sees the trait-level contract). `is_trait_default = Some(true)` and cross-crate trait method decls are documented `#56` follow-ups.
 - **`assume(P)` warning** — DESIGN.md promises a "unproved assumption" compile warning; not wired.
 - **USize arith rarely auto-verifies** — the bound is emitted, but `tactus_auto` can't discharge symbolic `2 ^ arch_word_bits`. Users need `cases arch_word_bits_valid` proofs.
@@ -1500,20 +1597,19 @@ follow-ups, each smaller and pickable independently.
 
 ### #55 follow-ups
 
-The caller-side MVS landed. The remaining `&mut` work breaks into three
-distinct sub-tasks; each could be picked up independently:
+Caller-side MVS landed (#55). Callee-side body verification landed
+(#94 — `tactus_auto` on a fn that itself takes `&mut`). Remaining
+sub-tasks:
 
-- **Callee-side body verification.** Allow `tactus_auto` on a fn that takes
-  `&mut` params. Needs fn-entry binding of `<x>_at_pre_tactus` and
-  rewriting of body assignments to thread post-state forward through SSA.
-  Largest of the three.
-- **Non-simple `Loc` shapes** (`&mut x.f`, `&mut v[i]`). Currently rejected
-  in `build_wp_call`. Verus's Z3 path uses havoc-base + assume-other-fields-
-  unchanged; we'd need a parallel encoding.
-- **New-mut-ref mode** (`UnaryOp::MutRefCurrent` / `MutRefFuture`). The
-  current MVS handles legacy-mode `VarAt(p, Pre)` only. Migrated functions
-  use `MutRefCurrent`/`MutRefFuture` UnaryOps instead. Would need
-  parallel handling at the rewrite site.
+- **Non-simple `Loc` shapes** (`&mut x.f`, `&mut v[i]`) — #87.
+  Currently rejected in `build_wp_call`. Verus's Z3 path uses
+  havoc-base + assume-other-fields-unchanged; we'd need a parallel
+  encoding.
+- **New-mut-ref mode** (`UnaryOp::MutRefCurrent` / `MutRefFuture`)
+  — #95. Both the caller-side (#55) and callee-side (#94) rewrites
+  handle legacy-mode `VarAt(p, Pre)` only. Migrated functions use
+  `MutRefCurrent`/`MutRefFuture` UnaryOps instead of `VarAt`. Would
+  need parallel handling at both rewrite sites.
 
 ### #56 follow-ups
 
@@ -1632,9 +1728,9 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 
 | Binary | Count | What it tests |
 |---|---|---|
-| `cargo test -p lean_verify --lib` | 114 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking, `format_rust_loc`, lean_process |
+| `cargo test -p lean_verify --lib` | 118 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking, `format_rust_loc`, lean_process, `LeanName` constructors |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
-| `vargo test -p rust_verify_test --test tactus` | 227 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites, trait-method calls, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression) |
+| `vargo test -p rust_verify_test --test tactus` | 232 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body, trait-method calls, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
 | `vargo build --release` (vstd) | 1530 | Regression guard: vstd proof library still verifies |
 
@@ -1747,7 +1843,7 @@ tactus/
       fn_call_to_vir.rs        ← tactus_span_from, enclosing_fn_is_tactus_auto
       rust_to_vir_expr.rs      ← Tactus proof-block synthesis (AssertBy-in-Ghost)
     rust_verify_test/tests/
-      tactus.rs                ← 227 end-to-end tests
+      tactus.rs                ← 232 end-to-end tests
       tactus_coverage.rs       ← coverage matrix test binary
     vir/src/
       ast.rs                   ← FunctionAttrs.tactic_span + tactus_auto;
@@ -1797,7 +1893,7 @@ cd lean_verify && ./scripts/setup-mathlib.sh && cd ..
 # (See DESIGN.md "Putting Lean on PATH" for the long form.)
 
 # ── Full test suite ────────────────────────────────────────────────
-# 227 end-to-end tests
+# 232 end-to-end tests
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Coverage matrix (1 test, asserts walker visits the expected variant set)

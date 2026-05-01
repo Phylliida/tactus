@@ -3533,6 +3533,107 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #94 callee-side &mut body: tactus_auto on a fn that takes a &mut
+// param can verify its own body. Encoding (sst_to_lean):
+//   1. SST-level rewrite of body+ensures: VarAt(x, Pre) for &mut x
+//      becomes Var(<x>_at_pre_tactus) — the synthetic pre-state name.
+//      Distinguishes pre-state from post-state which would otherwise
+//      collide with the body's let-shadow `let x := expr`.
+//   2. Initial OblCtx Let frame `let <x>_at_pre_tactus := x` per
+//      &mut param at fn entry — captures pre-state before any
+//      body modifications can shadow it.
+//   3. Requires aren't rewritten: at fn entry x IS the pre-state,
+//      so VarAt → Var natural collapse is correct there.
+test_verify_one_file! {
+    #[test] test_exec_callee_mut_simple verus_code! {
+        #[verifier::tactus_auto]
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+    } => Ok(())
+}
+
+// Negative — body assigns the wrong value. Pins that the &mut
+// post-state in ensures sees the body's let-shadow, not just the
+// original pre-state value.
+test_verify_one_file! {
+    #[test] test_exec_callee_mut_wrong_body verus_code! {
+        #[verifier::tactus_auto]
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 2;  // wrong: ensures says +1
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("postcondition")),
+            "expected postcondition failure, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
+// Multiple body modifications — pins that successive `*x = …`
+// assignments thread state correctly via Lean let-shadowing.
+test_verify_one_file! {
+    #[test] test_exec_callee_mut_multiple_writes verus_code! {
+        #[verifier::tactus_auto]
+        fn bump_twice(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 2
+        {
+            *x = *x + 1;
+            *x = *x + 1;
+        }
+    } => Ok(())
+}
+
+// Multiple &mut params — each gets its own <x>_at_pre_tactus binding.
+// Pins that the per-param Let frames don't collide.
+test_verify_one_file! {
+    #[test] test_exec_callee_two_mut_params verus_code! {
+        #[verifier::tactus_auto]
+        fn bump_both(a: &mut u8, b: &mut u8)
+            requires *old(a) < 100, *old(b) < 100
+            ensures *a == *old(a) + 1, *b == *old(b) + 1
+        {
+            *a = *a + 1;
+            *b = *b + 1;
+        }
+    } => Ok(())
+}
+
+// End-to-end: callee verified by tactus_auto AND caller by
+// tactus_auto, both in the same crate. Pins that the call-site
+// inlining (#55) and callee-body verification (#94) are
+// compatible — they use the same `<x>_at_pre_tactus` name via
+// the shared `varat_pre_name` helper in expr_shared.rs.
+test_verify_one_file! {
+    #[test] test_exec_callee_mut_and_caller_both_tactus_auto verus_code! {
+        #[verifier::tactus_auto]
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        #[verifier::tactus_auto]
+        fn call_mut(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            let mut y: u8 = x;
+            bump(&mut y);
+            y
+        }
+    } => Ok(())
+}
+
 // Self-recursive call with a decreasing measure — verifies. The
 // termination obligation `decrease_at_args < decrease_at_params`
 // is conjoined onto the call's requires clause by

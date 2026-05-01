@@ -72,7 +72,12 @@ mod sst_to_air;
 pub mod sst_to_air_func;
 pub mod sst_util;
 mod sst_vars;
-mod sst_visitor;
+// Exposed for Tactus's `lean_verify` (callee-side `&mut` body
+// rewrite, #94). Most upstream Verus consumers don't need this
+// module directly; we promote it to `pub` so Tactus can use the
+// `pub fn map_exp_visitor` / `pub fn map_exps_in_stm_visitor`
+// helpers without re-implementing the SST walker.
+pub mod sst_visitor;
 pub mod traits;
 mod triggers;
 mod triggers_auto;

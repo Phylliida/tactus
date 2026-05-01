@@ -904,12 +904,58 @@ recursion pass covers all cross-fn calls in the cycle the same way.
     error message (deferred follow-up to #55).
   - **Legacy-mode `VarAt(p, Pre)` only.** New-mut-ref's
     `MutRefCurrent`/`MutRefFuture` UnaryOps not handled.
-  - **Caller side only.** Fns taking `&mut` params can't yet have
-    their OWN bodies verified by `tactus_auto` — needs
-    fn-entry binding of `<x>_at_pre_tactus` and post-state
-    threading through body assignments. Workaround: have
-    `&mut`-taking fns go through Verus's Z3 path while their
-    callers use `tactus_auto`.
+  - **Caller side LANDED in slice 1; callee side LANDED via #94.**
+    Fns taking `&mut` params can have their OWN bodies verified
+    by `tactus_auto`. Encoding (`exec_fn_theorems_to_ast` in
+    `sst_to_lean.rs`):
+    1. **SST-level rewrite of body + ensures**: at fn entry,
+       `rewrite_varat_for_mut_params_in_stm` / `_in_exp` walks
+       the body and ensures, replacing `ExpX::VarAt(x, Pre)` with
+       `ExpX::Var(<x>_at_pre_tactus)` for every `&mut` param x.
+       This disambiguates pre-state references (`*old(x)`) from
+       post-state ones (`*x`) — the body's `*x = expr` lowers to
+       `let x := expr` (Lean shadowing), so without the rewrite
+       both would collapse to `Var(x)` and the let-shadow would
+       silently make them equal (bug demonstrated in dev: ensures
+       `*x == *old(x) + 1` reduced to `(x+1) = (x+1)+1`, false).
+    2. **Initial OblCtx Let frame** per `&mut` param:
+       `Let(<x>_at_pre_tactus, Var(x))` — captures the pre-state
+       BEFORE any body modification can shadow `x`. The frame
+       wraps the goal at theorem-emission time via `OblCtx::wrap`
+       (outermost-first), so the body's WP sees `<x>_at_pre_tactus`
+       in scope for any post-rewrite reference.
+    3. **Requires NOT rewritten**: at fn entry, x IS the pre-state,
+       so `*old(x) ≡ x` for requires evaluation; the natural
+       `VarAt → Var` collapse in the SST renderer is correct
+       there. Requires hypotheses go to theorem-level binders
+       (`build_req_binders`) which are emitted before the body.
+    4. **Symmetry with caller-side (#55)**: both paths use
+       `varat_pre_name` from `expr_shared.rs` to produce the
+       synthetic `<p>_at_pre_tactus` name — the rewrite-side and
+       Let-binding-side stay in sync via shared helper, so a future
+       contributor can't accidentally pick a different name in
+       one place.
+    5. **Upstream change**: `vir/src/lib.rs` promoted the
+       `sst_visitor` module from `mod` to `pub mod` so we can use
+       `vir::sst_visitor::map_exp_visitor` /
+       `map_exps_in_stm_visitor` for the rewrite walkers (these
+       in turn went from `pub(crate)` to `pub`). Comment at the
+       module-promotion site cross-references #94.
+
+    **Pinned by**: `test_exec_callee_mut_simple`,
+    `test_exec_callee_mut_wrong_body` (negative — wrong body
+    assignment fails postcondition), `test_exec_callee_mut_multiple_writes`
+    (multiple `*x = ...` writes thread through Lean let-shadowing),
+    `test_exec_callee_two_mut_params` (per-param Let frames don't
+    collide), `test_exec_callee_mut_and_caller_both_tactus_auto`
+    (end-to-end with both #55 caller-side and #94 callee-side
+    active in the same crate — pins the shared `varat_pre_name`
+    contract).
+
+    **Still deferred**: `&mut x.f` / `&mut v[i]` (#87 — non-simple
+    Loc shapes need havoc-base + assume-other-fields-unchanged
+    encoding); new-mut-ref mode `MutRefCurrent` / `MutRefFuture`
+    (#95 — separate UnaryOps that don't go through `VarAt`).
 * **Non-int decreases** — datatype-typed decreases via emitted
   `T.height` companion fn (see #54 in Tier 2). Int decreases work
   via the transparent-identity `height` for ints.
@@ -1288,14 +1334,15 @@ exec fns."
   - `test_exec_call_two_mut_args`: two `&mut` args at the same
     call site exercise the stacked-frames encoding.
 
-  **Slice scope (caller side only).** The fn's OWN body
-  verification when it takes `&mut` params is a separate concern:
-  `bump(x: &mut u8) { *x = *x + 1; }` as `tactus_auto` would need
-  Tactus to bind `x_at_pre_tactus` at fn entry and thread the
-  post-state through body assignments. Not in this slice;
-  workaround is to have `&mut`-taking fns go through Verus's Z3
-  path while their callers use `tactus_auto`. The MVS test uses
-  this split.
+  **Callee-side body verification LANDED via #94.** Implementation
+  details are in the bullet at the top of the §"Tier 3 — `&mut`
+  args on calls" block above (the slice 1 description was updated
+  in place). High-level summary: SST-level rewrite of body+ensures
+  to rename `VarAt(x, Pre)` → `Var(<x>_at_pre_tactus)` for &mut
+  params; initial OblCtx Let frame `let <x>_at_pre_tactus := x`
+  binds the pre-state at fn entry. Mirrors the caller-side
+  encoding (#55) and shares the synthetic name via
+  `varat_pre_name` in `expr_shared.rs`.
 
   **Explicit deferrals (rejected in `build_wp_call`):**
   - **`&mut x.f` / `&mut v[i]`** — non-simple `Loc` shapes where
@@ -1303,12 +1350,12 @@ exec fns."
     handles this via havoc-base + assume-other-fields-unchanged.
     Workaround: extract to a local first.
   - **New-mut-ref mode (`UnaryOp::MutRefCurrent` /
-    `MutRefFuture`).** This slice handles legacy-mode
-    `VarAt(p, Pre)` only. Migrated functions (per
-    `migrate_mut_refs.rs`) use `MutRefCurrent`/`MutRefFuture`
-    UnaryOps instead of `VarAt`. Not currently exercised by any
-    test; would need parallel handling at the same rewrite site.
-  - **Callee-side `&mut` body verification.** See above.
+    `MutRefFuture`).** Both the caller-side (#55) and callee-side
+    (#94) rewrites handle legacy-mode `VarAt(p, Pre)` only.
+    Migrated functions (per `migrate_mut_refs.rs`) use
+    `MutRefCurrent`/`MutRefFuture` UnaryOps instead of `VarAt`.
+    Not currently exercised by any test; would need parallel
+    handling at the same rewrite site (#95).
 
   **Why `varat_pre_name` lives in `expr_shared.rs`.** Both the
   rewrite (which produces the synthetic name) and the

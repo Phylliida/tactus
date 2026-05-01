@@ -273,7 +273,16 @@ impl<'a> WpCtx<'a> {
     /// The precondition "ens_exps is supported" thus lives in the
     /// type signature rather than in a docstring: you can only get
     /// a `WpCtx` by passing validation.
-    pub fn new(krate: &'a KrateX, check: &'a FuncCheckSst) -> Result<Self, String> {
+    pub fn new(
+        krate: &'a KrateX,
+        check: &'a FuncCheckSst,
+        // For callee-side `&mut` body verification (#94): set of
+        // sanitized param-name strings for the fn's `&mut` params.
+        // Each ens_exp is rewritten so `*old(x)` → `<x>_at_pre_tactus`
+        // for x in this set, before rendering to LExpr. Empty for
+        // fns without `&mut` params (the common case).
+        mut_param_names: &HashSet<String>,
+    ) -> Result<Self, String> {
         for req in check.reqs.iter() {
             check_exp(req)?;
         }
@@ -292,12 +301,19 @@ impl<'a> WpCtx<'a> {
         // `emit_done_or_split` then splits the conjunction per-clause,
         // so multi-clause ensures naturally yields one Postcondition
         // theorem per clause with its own location.
+        //
+        // Rewrite VarAt(x, Pre) → Var(<x>_at_pre_tactus) for &mut
+        // params (#94) BEFORE rendering — the rewrite is on SST,
+        // and `sst_exp_to_ast` then sees only Var nodes.
         let ensures_goal = and_all(
-            check.post_condition.ens_exps.iter().map(|ens| LExpr::span_mark(
-                format_rust_loc(&ens.span),
-                AssertKind::Obligation(ObligationKind::Postcondition),
-                sst_exp_to_ast(ens),
-            )).collect()
+            check.post_condition.ens_exps.iter().map(|ens| {
+                let rewritten = rewrite_varat_for_mut_params_in_exp(ens, mut_param_names);
+                LExpr::span_mark(
+                    format_rust_loc(&ens.span),
+                    AssertKind::Obligation(ObligationKind::Postcondition),
+                    sst_exp_to_ast(&rewritten),
+                )
+            }).collect()
         );
         Ok(Self { fn_map, type_map, ret_name, ensures_goal })
     }
@@ -471,19 +487,49 @@ pub fn exec_fn_theorems_to_ast<'a>(
     fn_sst: &'a FunctionSst,
     check: &'a FuncCheckSst,
 ) -> Result<Vec<Theorem>, String> {
+    // `&mut` params of the fn being verified (#94 callee-side body).
+    // For each, the body and ensures get a SST-level rewrite so that
+    // `*old(x)` (`VarAt(x, Pre)`) renders as `Var(<x>_at_pre_tactus)`,
+    // distinct from `*x` (`Var(x)`) which is the post-state — the
+    // body's `*x = expr` lowers to `let x := expr` (Lean shadowing),
+    // so without the rewrite both would collapse to the same name
+    // and the let-shadow would silently make them equal. Empty for
+    // fns without `&mut` params (the common case).
+    let mut_param_names: HashSet<String> = fn_sst.x.pars.iter()
+        .filter(|p| p.x.is_mut)
+        .map(|p| sanitize(&p.x.name.0))
+        .collect();
+
+    // Pre-rewrite the body so VarAt(x, Pre) → Var(<x>_at_pre_tactus)
+    // for &mut x. The rewritten body is owned by this fn's stack
+    // frame; build_wp's output borrows from it, but we consume that
+    // output via walk_obligations before this fn returns, so the
+    // lifetime is sound. (WpCtx<'a> covariant in 'a allows the
+    // shorter inner lifetime here.)
+    //
+    // For non-`&mut` fns, `mut_param_names` is empty and the rewrite
+    // helper short-circuits to a plain `clone()` — zero overhead.
+    let rewritten_body: Stm = rewrite_varat_for_mut_params_in_stm(
+        &check.body,
+        &mut_param_names,
+    );
+
     // `WpCtx::new` validates reqs / ens_exps before rendering them.
-    let ctx = WpCtx::new(krate, check)?;
+    // It also applies the same rewrite to each ens_exp so the
+    // `ensures_goal` LExpr already has the synthetic names baked in.
+    let ctx = WpCtx::new(krate, check, &mut_param_names)?;
 
     let mut binders = build_param_binders(fn_sst);
     binders.extend(build_req_binders(check));
 
-    // Build the whole WP tree from the body, with the fn's ensures
-    // as the natural continuation at the leaves. `Return` statements
-    // inside the body replace their local `after` with the same
-    // ensures goal (via `ctx.ensures_goal`). Initial loop_stack is
-    // empty — break/continue are rejected outside any loop.
+    // Build the whole WP tree from the (rewritten) body, with the
+    // fn's ensures as the natural continuation at the leaves.
+    // `Return` statements inside the body replace their local `after`
+    // with the same ensures goal (via `ctx.ensures_goal`). Initial
+    // loop_stack is empty — break/continue are rejected outside any
+    // loop.
     let body_wp = build_wp(
-        &check.body,
+        &rewritten_body,
         Wp::Done(ctx.ensures_goal.clone()),
         &ctx,
         &[],
@@ -502,7 +548,27 @@ pub fn exec_fn_theorems_to_ast<'a>(
         tactic_prefix: Vec::new(),
         default_closer,
     };
-    walk_obligations(&body_wp, &ctx, &OblCtx::new(), &mut emitter);
+
+    // Initial OblCtx with `let <x>_at_pre_tactus := x` for each &mut
+    // param. These frames wrap the goal at theorem-emission time,
+    // so the body's WP (which after the rewrite mentions
+    // <x>_at_pre_tactus wherever the user wrote `*old(x)`) sees
+    // the pre-state captured before any body modifications shadow
+    // the param. The fn's requires stay in theorem-level binders
+    // (`build_req_binders` above) and are NOT rewritten — at fn
+    // entry, x IS the pre-state, so `*old(x) ≡ x` for requires
+    // evaluation; the natural VarAt → Var collapse in the renderer
+    // gives the right thing for them.
+    let mut initial_obl_ctx = OblCtx::new();
+    for par in fn_sst.x.pars.iter().filter(|p| p.x.is_mut) {
+        let raw_name = sanitize(&par.x.name.0);
+        let pre_name = crate::lean_name::LeanName::synthetic(
+            varat_pre_name(&raw_name),
+        );
+        let var_x = LExpr::var(crate::lean_name::LeanName::from_var_ident(&par.x.name));
+        initial_obl_ctx = initial_obl_ctx.with_frame(CtxFrame::Let(pre_name, var_x));
+    }
+    walk_obligations(&body_wp, &ctx, &initial_obl_ctx, &mut emitter);
     Ok(emitter.out)
 }
 
@@ -1182,6 +1248,80 @@ fn rewrite_varat_for_mut_params(
     // The closure only constructs valid Var nodes from existing
     // VarAt nodes; it cannot fail.
     .expect("rewrite_varat_for_mut_params is structural and shouldn't error")
+}
+
+/// SST-side analogue of `rewrite_varat_for_mut_params` (#94 callee-
+/// side body verification).
+///
+/// Rewrites every `ExpX::VarAt(p, Pre)` whose name is in
+/// `mut_param_names` to `ExpX::Var(<p>_at_pre_tactus)`. Used at fn
+/// entry to disambiguate pre-state references (`*old(x)` in the
+/// callee's own body and ensures) from the post-state `Var(x)` after
+/// body modifications shadow it via Lean `let`-shadowing.
+///
+/// **Why not collapse VarAt → Var unconditionally?** Verus's
+/// `sst_util::stm_with_vars_at_pre_state` synthesises VarAt(_, Pre)
+/// for loop modified-vars too — those expect the natural collapse,
+/// where the pre-state name IS the same `Var(x)` re-bound at the
+/// start of each iteration. Scoping the rewrite to the &mut param
+/// name set keeps the loop case unaffected. Same approach as the
+/// AST-level `rewrite_varat_for_mut_params` (call-site &mut, #55).
+///
+/// **Symmetry with the call-site path.** `varat_pre_name` lives in
+/// `expr_shared.rs` and is the single source of truth for the
+/// `<p>_at_pre_tactus` synthetic name. Both this rewrite (which
+/// produces it) and the OblCtx Let frame (which binds it) use it,
+/// so divergence is a compile error rather than a runtime mismatch.
+fn rewrite_varat_for_mut_params_in_exp(
+    exp: &Exp,
+    mut_param_names: &HashSet<String>,
+) -> Exp {
+    if mut_param_names.is_empty() {
+        return exp.clone();
+    }
+    vir::sst_visitor::map_exp_visitor(exp, &mut |e: &Exp| {
+        rewrite_one_varat(e, mut_param_names)
+    })
+}
+
+/// As above but for an entire `Stm` — applies the per-Exp rewrite
+/// uniformly to every Exp embedded in the body's statement tree.
+fn rewrite_varat_for_mut_params_in_stm(
+    stm: &Stm,
+    mut_param_names: &HashSet<String>,
+) -> Stm {
+    if mut_param_names.is_empty() {
+        return stm.clone();
+    }
+    vir::sst_visitor::map_exps_in_stm_visitor(stm, &mut |e: &Exp| {
+        rewrite_one_varat(e, mut_param_names)
+    })
+}
+
+/// Single-Exp leaf rewrite shared by both walkers above.
+fn rewrite_one_varat(e: &Exp, mut_param_names: &HashSet<String>) -> Exp {
+    if let ExpX::VarAt(ident, vir::ast::VarAt::Pre) = &e.x {
+        let raw_name = sanitize(&ident.0);
+        if mut_param_names.contains(&raw_name) {
+            // `varat_pre_name` is the canonical synthetic-name producer
+            // — same one used by the AST-level rewrite for caller-side
+            // &mut. Sharing it keeps the rewrite-side and Let-frame-
+            // side names in sync.
+            let new_str: vir::ast::Ident = Arc::new(varat_pre_name(&raw_name));
+            // Reuse the original ident's disambiguator. For a user-
+            // named param like `x` (no special chars), the resulting
+            // `<x>_at_pre_tactus` also has no special chars, so
+            // `LeanName::from_var_ident` won't append a suffix —
+            // the rendered name is exactly `<x>_at_pre_tactus`.
+            let new_ident = VarIdent(new_str, ident.1.clone());
+            return SpannedTyped::new(
+                &e.span,
+                &e.typ,
+                ExpX::Var(new_ident),
+            );
+        }
+    }
+    e.clone()
 }
 
 /// Pick the source of `require`/`ensure` clauses for a callee.
