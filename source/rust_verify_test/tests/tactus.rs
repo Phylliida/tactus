@@ -3908,6 +3908,32 @@ test_verify_one_file! {
     }
 }
 
+// 3-level lexicographic `decreases (a, b, c)` (#110 review-pass
+// follow-up). Exercises `lex_decrease_obligation`'s recursion at
+// depth ≥ 3 — the recursion is correct by induction (verified via
+// the unit test `lex_decrease_obligation_three_levels_recurses_correctly`),
+// but an e2e test pins that Verus's `recursion::check_decrease`
+// produces the matching CheckDecreaseHeight chain.
+test_verify_one_file! {
+    #[test] test_exec_call_recursive_lex3_decreases verus_code! {
+        #[verifier::tactus_auto]
+        fn lex3_count(a: u8, b: u8, c: u8) -> (r: u8)
+            ensures r == 0
+            decreases a, b, c
+        {
+            if a == 0 && b == 0 && c == 0 {
+                0
+            } else if c > 0 {
+                lex3_count(a, b, (c - 1) as u8)
+            } else if b > 0 {
+                lex3_count(a, (b - 1) as u8, 100)
+            } else {
+                lex3_count((a - 1) as u8, 100, 100)
+            }
+        }
+    } => Ok(())
+}
+
 // Self-recursive call where the measure does NOT decrease — must
 // fail. The caller passes the same `n` to itself, so the inlined
 // `let n := n; n < n` obligation is false.
@@ -5069,26 +5095,15 @@ test_verify_one_file! {
     }
 }
 
-// Loop with non-empty cond_setup (#114 sub-feature 1). Pre-#114
-// these were rejected with a "loop condition has a setup-statement
-// prelude" error. Post-#114 we transform: cond_setup walks as a wp
-// prefix in BOTH the maintain ctx (under `assume cond_exp`) AND
-// the use ctx (under `assume ¬cond_exp`), mirroring Verus's two-
-// query encoding (sst_to_air.rs:2789-2797 + 2730-2737).
-//
-// The encoding lands; the test below pins that the rejection error
-// is gone — Verus's pipeline now generates Lean (rather than
-// erroring out at build_wp_loop). A function-call-in-cond is the
-// canonical trigger: Verus's `expr_to_stm_opt` introduces a `_tmp`
-// for the call result, populating cond_setup.
-//
-// **Note on automation**: tactus_auto's default closer
-// (`rfl | decide | omega | simp_all`) doesn't compose well for
-// goals with `_tactus_ret_N : Prop` quantified vars (the call's
-// ret value renders as Prop in spec contexts). Closing such goals
-// generally needs a custom `#[verifier::tactus_tactic("intros;
-// simp_all; omega")]` override. The encoding is correct; the
-// automation gap is tracked separately as a follow-up to #114.
+// Loop with non-empty cond_setup (#114 sub-feature 1). A function
+// call in the loop's cond triggers Verus's `expr_to_stm_opt` to
+// produce setup-stmts for the call result. Pre-#114 we rejected;
+// post-#114 the cond_setup walks as a wp prefix in both the maintain
+// and use ctx (mirroring Verus's two-query encoding). Pins that the
+// pre-#114 rejection error is gone. Closing the resulting Lean
+// goals needs a tactus_tactic override (#128) — the encoding is
+// correct; the automation is the gap. See DESIGN.md "Loop-shape
+// restrictions" for full details.
 test_verify_one_file! {
     #[test] test_exec_loop_cond_with_setup_no_longer_rejected verus_code! {
         fn keep_going(x: u8) -> (r: bool)
