@@ -3845,6 +3845,69 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Lexicographic `decreases (a, b)` on a recursive fn (#110). Verus's
+// `recursion::check_decrease` builds a nested CheckDecreaseHeight:
+//
+//     CheckDecreaseHeight(a_cur, a_old,
+//       CheckDecreaseHeight(b_cur, b_old, False))
+//
+// The `otherwise` field of the OUTER call is the inner CheckDecreaseHeight.
+// Our `sst_exp_to_ast_checked` arm renders `otherwise` recursively via
+// itself, so the lex shape composes:
+//
+//   ((0 ≤ a_cur ∧ a_cur < a_old)
+//     ∨ (a_cur = a_old ∧
+//        ((0 ≤ b_cur ∧ b_cur < b_old) ∨ (b_cur = b_old ∧ False))))
+//
+// First call decreases `a` (from 5 to 4), so the outer disjunct fires.
+// Second call holds `a` constant and decreases `b`, so the inner
+// disjunct fires.
+test_verify_one_file! {
+    #[test] test_exec_call_recursive_lex_decreases verus_code! {
+        #[verifier::tactus_auto]
+        fn lex_count(a: u8, b: u8) -> (r: u8)
+            ensures r == 0
+            decreases a, b
+        {
+            if a == 0 && b == 0 {
+                0
+            } else if b == 0 {
+                lex_count((a - 1) as u8, 100)
+            } else {
+                lex_count(a, (b - 1) as u8)
+            }
+        }
+    } => Ok(())
+}
+
+// Negative test: lex decrease where neither component decreases.
+// Both calls pass (a, b) unchanged, so the lex obligation
+// `(a_cur < a_old) ∨ (a_cur = a_old ∧ (b_cur < b_old ∨ ...))`
+// is false at both levels.
+test_verify_one_file! {
+    #[test] test_exec_call_recursive_lex_nondecreasing verus_code! {
+        #[verifier::tactus_auto]
+        fn lex_loop(a: u8, b: u8) -> (r: u8)
+            ensures r == 0
+            decreases a, b
+        {
+            if a == 0 && b == 0 {
+                0
+            } else {
+                lex_loop(a, b)
+            }
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1, "non-decreasing lex recursion should fail");
+        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("(termination)")),
+            "expected (termination) kind label on the failing obligation. got: {:?}",
+            msgs,
+        );
+    }
+}
+
 // Self-recursive call where the measure does NOT decrease — must
 // fail. The caller passes the same `n` to itself, so the inlined
 // `let n := n; n < n` obligation is false.
@@ -4932,11 +4995,17 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Lexicographic `decreases` is rejected up front — single-expression
-// only at the current slice. Regression guard so we notice when /
-// if that restriction is lifted.
+// Lexicographic `decreases (x, y)` on a loop (#110). Each iteration
+// either decreases `y` (inner-level decrease) or decreases `x` and
+// resets `y` (outer-level decrease + permitted equality on `y` is
+// vacuously satisfied since the inner branch isn't taken). The
+// maintain obligation:
+//
+//   (x' < x_old) ∨ (x' = x_old ∧ y' < y_old)
+//
+// is exactly the lex disjunction `lex_decrease_obligation` builds.
 test_verify_one_file! {
-    #[test] test_exec_loop_lex_decreases_rejected verus_code! {
+    #[test] test_exec_loop_lex_decreases verus_code! {
         #[verifier::tactus_auto]
         fn lex_loop(a: u8, b: u8) -> (r: u8)
             requires a <= 10, b <= 10
@@ -4946,7 +5015,7 @@ test_verify_one_file! {
             let mut y: u8 = b;
             while x > 0 || y > 0
                 invariant x <= a, y <= b
-                decreases x, y  // lexicographic — not yet supported
+                decreases x, y
             {
                 if y > 0 {
                     y = y - 1;
@@ -4957,11 +5026,45 @@ test_verify_one_file! {
             }
             x + y
         }
+    } => Ok(())
+}
+
+// Negative test: a lex loop where neither component decreases on at
+// least one iteration. Body sometimes leaves both `x` and `y`
+// unchanged — the lex obligation `(x' < x_old) ∨ (x' = x_old ∧ y' <
+// y_old)` then fails on that iteration.
+test_verify_one_file! {
+    #[test] test_exec_loop_lex_decreases_nondecreasing verus_code! {
+        #[verifier::tactus_auto]
+        fn lex_loop_bad(a: u8) -> (r: u8)
+            requires a <= 10
+            ensures r == 0
+        {
+            let mut x: u8 = a;
+            let y: u8 = 5;
+            while x > 0
+                invariant x <= a
+                decreases x, y
+            {
+                // x decreases but y stays the same — this is fine for
+                // lex (outer level fires). Add a noop branch where
+                // neither changes to break it:
+                if x == a {
+                    // No change to x or y → obligation fails.
+                } else {
+                    x = x - 1;
+                }
+            }
+            x + y - 5
+        }
     } => Err(err) => {
+        assert!(err.errors.len() >= 1,
+            "non-decreasing lex loop should fail");
+        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
         assert!(
-            err.errors.iter().any(|e| e.message.contains("decreases")
-                || e.message.contains("not yet supported")),
-            "lexicographic decreases should be rejected",
+            msgs.iter().any(|m| m.contains("(loop decrease)")),
+            "expected (loop decrease) kind label on the failing obligation. got: {:?}",
+            msgs,
         );
     }
 }

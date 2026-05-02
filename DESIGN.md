@@ -863,11 +863,14 @@ typed termination obligation:
 
 where `cur` is the decrease expression with call-site args
 substituted, `prev` is the decrease-at-entry for the current fn,
-and `otherwise` is the lexicographic-tail marker (`False` for
-single-expression decreases). See `to_lean_sst_expr.rs`'s
-`CheckDecreaseHeight` arm for the lowering; `render_checked_decrease_arg`
-handles the Bind(Let) param-substitution wrapper Verus puts on
-`cur`.
+and `otherwise` is the lexicographic-tail marker — `False` for
+single-expression decreases, the inner level's CheckDecreaseHeight
+call for lex `decreases a, b, …` (Verus's `recursion::check_decrease`
+builds the recursive structure, so the lex shape composes through
+our existing arm — pinned by `test_exec_call_recursive_lex_decreases`).
+See `to_lean_sst_expr.rs`'s `CheckDecreaseHeight` arm for the
+lowering; `render_checked_decrease_arg` handles the Bind(Let)
+param-substitution wrapper Verus puts on `cur`.
 
 Mutual recursion across an SCC works by construction — Verus's
 recursion pass covers all cross-fn calls in the cycle the same way.
@@ -1050,7 +1053,13 @@ Forms we accept and render, but with semantic information dropped. None of these
 
 * **`loop_isolation: false`** — non-isolated loops (body sees outer context directly rather than via the invariant).
 * **Non-empty condition setup block** — `while` conditions that desugar into a small statement prelude (complex expressions that aren't pure).
-* **Lexicographic `decreases`** — multi-expression measures (`decreases (a, b)`). Only single-expression is accepted.
+* **Lexicographic `decreases` — LANDED via #110.** Loop-level multi-expression measures (`decreases D1, D2, ...`) build the lex disjunction in `lex_decrease_obligation` (`sst_to_lean.rs`):
+  ```
+  (D1' < D1_old)
+    ∨ (D1' = D1_old ∧ ((D2' < D2_old)
+        ∨ (D2' = D2_old ∧ ... (Dn' < Dn_old))))
+  ```
+  which generalises the single-expression case (`(D1' < D1_old) ∨ (D1' = D1_old ∧ False) ≡ D1' < D1_old`). Per-loop, per-level d_old gensyms (`_tactus_d_old_<id>_<i>`) keep nested loops AND lex tiers structurally distinct. Pinned by `test_exec_loop_lex_decreases`, `test_exec_loop_lex_decreases_nondecreasing`. Fn-level lex decreases works through Verus's own `recursion::check_decrease` recursion (the `otherwise` field of CheckDecreaseHeight wraps the next level), pinned by `test_exec_call_recursive_lex_decreases`, `test_exec_call_recursive_lex_nondecreasing`.
 * **`invariant_except_break` / `ensures` loop invariants** — LANDED via #89. `build_wp_loop` splits invariants by their `at_entry` / `at_exit` flags into entry-side (init theorems + maintain ctx hyp + body's continue_leaf) and exit-side (break_leaf + use ctx hyp) groups. `walk_loop` filters init emission to `at_entry = true` invariants and uses the corresponding entry/exit conjunctions in maintain/use frames. For `cond: Some(_)` loops (`while c { ... }`), Verus's lowering forces at_entry = at_exit = true so behavior is unchanged from the pre-#89 state; the split actually matters for `cond: None` (break-lowered) loops. Pinned by `test_exec_loop_invariant_except_break`, `test_exec_loop_invariant_except_break_init_fails`, `test_exec_loop_ensures_only`, `test_exec_loop_ensures_fails`.
 * **Labeled `break`** — LANDED via #88. `WpLoopCtx` carries `label: Option<String>`; `build_wp` threads a `&[&WpLoopCtx]` stack (innermost-first) instead of `Option<&WpLoopCtx>`. `StmX::BreakOrContinue { label: Some(target), .. }` searches the stack by matching label. Pinned by `test_exec_loop_labeled_break` + `test_exec_loop_labeled_break_three_deep`. Labeled `continue 'outer;` is rejected by Verus upstream without `loop_isolation(false)` (which Tactus also doesn't support); the label-stack handles it in principle.
 
@@ -1325,9 +1334,8 @@ exec fns."
     Option<S> }`). Verus has a special axiom
     (`recursive_function_field` in `datatype_height_axioms`) for
     this; we don't mirror it.
-  - **Lexicographic `decreases a, b`.** Check if exec fn
-    `decreases` is even multi-tuple today — may already be
-    rejected upstream.
+  - **Lexicographic `decreases a, b` — LANDED via #110.** See
+    "Loop-shape restrictions" entry above for the encoding.
 
 ##### Tier 3 — bigger slices (~1 week each)
 
