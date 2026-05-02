@@ -1978,8 +1978,23 @@ pub(crate) fn expr_to_stm_opt(
             let (inner_stms, typ_inv_vars) =
                 exec_closure_body_stms(ctx, state, params, ret, body, requires, ensures)?;
             let block = Spanned::new(expr.span.clone(), StmX::Block(Arc::new(inner_stms)));
-            let clos =
-                Spanned::new(expr.span.clone(), StmX::ClosureInner { body: block, typ_inv_vars });
+            // Tactus needs the AST closure expression (the whole
+            // `ExprX::NonSpecClosure { params, body, external_spec, ... }`)
+            // for rendering as a first-class Lean lambda. Z3 doesn't,
+            // but preserving here is cheap (one Arc clone) and avoids
+            // the alternative of either (a) reverse-engineering the
+            // body from the SST stms or (b) maintaining a separate
+            // span-keyed AST lookup. We clone `expr` (not `body`) so
+            // `params`, `body`, and `external_spec.cid` all reach
+            // Tactus's renderer.
+            let clos = Spanned::new(
+                expr.span.clone(),
+                StmX::ClosureInner {
+                    body: block,
+                    typ_inv_vars,
+                    ast_body: expr.clone(),
+                },
+            );
             all_stms.push(clos);
 
             // Create the closure object and assume all the information given in its

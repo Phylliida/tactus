@@ -341,7 +341,7 @@ fn stm_assign(
             Spanned::new(stm.span.clone(), StmX::DeadEnd(s))
         }
         StmX::BreakOrContinue { label: _, is_break: _ } => stm.clone(),
-        StmX::ClosureInner { body, typ_inv_vars } => {
+        StmX::ClosureInner { body, typ_inv_vars, ast_body } => {
             let pre_modified = modified.clone();
             let pre_assigned = assigned.clone();
             let body = stm_assign(assign_map, declared, assigned, modified, body);
@@ -350,7 +350,11 @@ fn stm_assign(
 
             Spanned::new(
                 stm.span.clone(),
-                StmX::ClosureInner { body, typ_inv_vars: typ_inv_vars.clone() },
+                StmX::ClosureInner {
+                    body,
+                    typ_inv_vars: typ_inv_vars.clone(),
+                    ast_body: ast_body.clone(),
+                },
             )
         }
         StmX::If(cond, lhs, rhs) => {
@@ -555,9 +559,13 @@ fn stm_mutations(param_typs: &[(VarIdent, Typ)], mutations: &mut HavocSet, stm: 
             let body = stm_mutations(param_typs, mutations, body);
             stm.new_x(StmX::OpenInvariant(body))
         }
-        StmX::ClosureInner { body, typ_inv_vars } => {
+        StmX::ClosureInner { body, typ_inv_vars, ast_body } => {
             let body = stm_mutations(param_typs, mutations, body);
-            stm.new_x(StmX::ClosureInner { body, typ_inv_vars: typ_inv_vars.clone() })
+            stm.new_x(StmX::ClosureInner {
+                body,
+                typ_inv_vars: typ_inv_vars.clone(),
+                ast_body: ast_body.clone(),
+            })
         }
         StmX::Block(stms) => {
             let mut v = vec![];

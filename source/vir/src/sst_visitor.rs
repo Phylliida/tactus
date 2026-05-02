@@ -528,13 +528,15 @@ pub(crate) trait Visitor<R: Returner, Err, Scope: Scoper> {
                 let stms = self.visit_stms(stms)?;
                 R::ret(|| stm_new(StmX::Block(R::get_vec_a(stms))))
             }
-            StmX::ClosureInner { body, typ_inv_vars } => {
+            StmX::ClosureInner { body, typ_inv_vars, ast_body } => {
                 let body = self.visit_stm(body)?;
                 let typ_inv_vars = self.visit_typ_inv_vars(typ_inv_vars)?;
+                let ast_body = ast_body.clone();
                 R::ret(|| {
                     stm_new(StmX::ClosureInner {
                         body: R::get(body),
                         typ_inv_vars: R::get_vec_a(typ_inv_vars),
+                        ast_body: ast_body.clone(),
                     })
                 })
             }

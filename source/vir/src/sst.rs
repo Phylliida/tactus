@@ -245,8 +245,21 @@ pub enum StmX {
     },
     /// Atomic invariant opening for concurrent verification
     OpenInvariant(Stm),
-    /// Body of an exec closure, with associated type invariants
-    ClosureInner { body: Stm, typ_inv_vars: Arc<Vec<(UniqueIdent, Typ)>> },
+    /// Body of an exec closure, with associated type invariants.
+    ///
+    /// `ast_body`: Tactus-specific. Verus's SST normally throws away
+    /// the closure's AST `Expr` body (the body lives only as the `body`
+    /// `Stm` here, verified as a dead-end scope, plus
+    /// `ClosureReq`/`ClosureEns` axioms at call sites). For Lean we want
+    /// the closure value as a first-class lambda, which means we need
+    /// the original AST `Expr`. Verus's Z3 path doesn't read this field
+    /// — it's populated unconditionally by `ast_to_sst` but ignored
+    /// everywhere outside Tactus's renderer.
+    ClosureInner {
+        body: Stm,
+        typ_inv_vars: Arc<Vec<(UniqueIdent, Typ)>>,
+        ast_body: crate::ast::Expr,
+    },
     /// Raw AIR code injection (for internal use only)
     Air(Arc<String>),
     /// Sequential composition of statements

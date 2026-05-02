@@ -997,7 +997,7 @@ fn visit_stm(ctx: &Ctx, state: &mut State, stm: &Stm) -> Stm {
             let s = visit_stm(ctx, state, s);
             mk_stm(StmX::OpenInvariant(s))
         }
-        StmX::ClosureInner { body, typ_inv_vars } => {
+        StmX::ClosureInner { body, typ_inv_vars, ast_body } => {
             let typ_inv_vars = Arc::new(
                 typ_inv_vars
                     .iter()
@@ -1011,7 +1011,7 @@ fn visit_stm(ctx: &Ctx, state: &mut State, stm: &Stm) -> Stm {
             }
             let body = visit_stm(ctx, state, body);
             state.types.pop_scope();
-            mk_stm(StmX::ClosureInner { body, typ_inv_vars: typ_inv_vars })
+            mk_stm(StmX::ClosureInner { body, typ_inv_vars, ast_body: ast_body.clone() })
         }
         StmX::Air(_) => stm.clone(),
         StmX::Block(stms) => mk_stm(StmX::Block(visit_stms(ctx, state, stms))),
