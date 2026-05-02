@@ -5548,3 +5548,92 @@ test_verify_one_file_with_options! {
     }
 }
 
+// #93 closure probes — characterize what the renderer rejects so a
+// future implementation has tests to flip. Two distinct shapes in the
+// SST:
+//   - `ExpX::CallLambda(f, args)` — spec-level call to a FnSpec value
+//     (e.g., `f(x)` where `f: spec_fn(int) -> int`). Reachable from a
+//     tactus_auto exec fn when its ensures applies a spec-closure
+//     parameter.
+//   - `StmX::ClosureInner { body, .. }` — exec-mode closure body
+//     verification (reachable when an exec fn declares a closure
+//     locally, even if it doesn't immediately apply it).
+
+// Probe 1: spec closure parameter applied in an ensures clause —
+// produces ExpX::CallLambda.
+// `f(x)` in ensures lowers to `ExpX::CallLambda(f, [x])`. Renders as
+// Lean `f x` (App). Requires that `f` is the identity function so the
+// caller-supplied body `r = x` actually satisfies `r == f(x)`.
+test_verify_one_file! {
+    #[test] test_exec_spec_closure_in_ensures verus_code! {
+        #[verifier::tactus_auto]
+        fn apply_id(f: spec_fn(int) -> int, x: int) -> (r: int)
+            requires forall|y: int| #[trigger] f(y) == y
+            ensures r == f(x)
+        {
+            x
+        }
+    } => Ok(())
+}
+
+// Negative: spec-closure call in ensures with a wrong body value
+// should fail the postcondition. Pins that the closure call IS reaching
+// the goal — not silently dropped. Uses u32 (exec-supported arithmetic)
+// so the body type-checks; closure is still spec-mode.
+test_verify_one_file! {
+    #[test] test_exec_spec_closure_in_ensures_wrong_body verus_code! {
+        #[verifier::tactus_auto]
+        fn apply_id_wrong(f: spec_fn(int) -> int, x: u32) -> (r: u32)
+            requires
+                x < 100,
+                forall|y: int| #[trigger] f(y) == y,
+            ensures r as int == f(x as int)
+        {
+            x + 1  // body returns x+1, not x — doesn't satisfy r == f(x)
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("postcondition")),
+            "expected postcondition failure, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
+// Closure call in requires position — also produces ExpX::CallLambda,
+// but in the requires-binders path instead of the ensures-goal path.
+test_verify_one_file! {
+    #[test] test_exec_spec_closure_in_requires verus_code! {
+        #[verifier::tactus_auto]
+        fn requires_pos(f: spec_fn(int) -> bool, x: int) -> (r: int)
+            requires f(x)
+            ensures r == x
+        {
+            x
+        }
+    } => Ok(())
+}
+
+// Probe 2: exec-mode closure DECLARATION (not call) — produces
+// `StmX::ClosureInner` plus `ClosureReq` / `ClosureEns` internal-fn
+// calls in the SST. Stays deferred as a separate #93 sub-task; the
+// rejection now hits the `ClosureReq` arm rather than the CallLambda
+// arm we just lifted.
+test_verify_one_file! {
+    #[test] test_exec_closure_decl_rejected verus_code! {
+        #[verifier::tactus_auto]
+        fn make_adder() -> (r: u32)
+            ensures r == 5
+        {
+            let add_one = |x: u32| x + 1;
+            5
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("Closure") || e.message.contains("closure")),
+            "expected closure rejection, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+

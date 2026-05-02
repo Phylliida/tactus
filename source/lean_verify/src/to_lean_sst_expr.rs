@@ -772,11 +772,27 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
             ctor_node(dt, variant, rendered)
         }
 
-        // Forms we don't know how to render.
-        ExpX::CallLambda(..) => return Err(
-            "closure calls not yet supported in exec fns (#93). Workaround: \
-             extract the closure into a named fn.".to_string()
-        ),
+        // Spec-closure call (`f(args)` where `f: spec_fn(_) -> _`).
+        // Lean's function types are first-class — `spec_fn(int) -> int`
+        // renders as `Int → Int` via `typ_to_expr`'s `Lambda` arm — so
+        // calling a closure is just an `App` with the closure value as
+        // head. This mirrors the proof-fn path's `CallTarget::FnSpec`
+        // handling in `to_lean_expr::call_to_node`. Closure construction
+        // (`StmX::ClosureInner`) and exec-mode `FnOnce`/`Fn`/`FnMut`
+        // calls remain deferred — see #93.
+        ExpX::CallLambda(f, args) => {
+            let f_rendered = sst_exp_to_ast_checked(f)?;
+            if args.is_empty() {
+                return Ok(f_rendered.node);
+            }
+            let args_rendered = args.iter()
+                .map(|a| sst_exp_to_ast_checked(a))
+                .collect::<Result<Vec<_>, _>>()?;
+            ExprNode::App {
+                head: Box::new(f_rendered),
+                args: args_rendered,
+            }
+        }
         ExpX::ArrayLiteral(_) => return Err(
             "array literal `[a, b, c]` not yet supported in exec fns (Verus \
              rejects these upstream when slice indexing is unwired, so this is \
