@@ -5736,3 +5736,81 @@ test_verify_one_file! {
     }
 }
 
+// Coverage: zero-arg closure. `closure_params` is empty;
+// `push_mod_var_frames` is a no-op. The body verification scope
+// still needs to run (in case of overflow etc.), but no `∀`
+// binders are pushed.
+test_verify_one_file! {
+    #[test] test_exec_closure_zero_args verus_code! {
+        #[verifier::tactus_auto]
+        fn make_const() -> (r: u8)
+            ensures r == 0
+        {
+            let _five = || 5u8;
+            0
+        }
+    } => Ok(())
+}
+
+// Coverage: multi-arg closure. `closure_params` has 2 entries;
+// `push_mod_var_frames` pushes 2 binders + 2 type-bound hyps. The
+// body's `x + y` for `x, y: u8` overflows generically (caller
+// could supply x=200, y=200), so this should FAIL the body's
+// overflow check — pinning the multi-binder shape AND the
+// soundness path simultaneously.
+test_verify_one_file! {
+    #[test] test_exec_closure_multi_arg_overflow verus_code! {
+        #[verifier::tactus_auto]
+        fn make_adder() -> (r: u8)
+            ensures r == 0
+        {
+            let _bad = |x: u8, y: u8| x + y;  // unsound: 200 + 200 overflows
+            0
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("overflow") || e.message.contains("arithmetic")),
+            "expected overflow failure inside closure body, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
+// Coverage: nested closure. `Wp::ClosureBody` whose `body`
+// contains another `Wp::ClosureBody`. The inner closure's
+// verification scope nests inside the outer's.
+test_verify_one_file! {
+    #[test] test_exec_closure_nested verus_code! {
+        #[verifier::tactus_auto]
+        fn make_layered() -> (r: u8)
+            ensures r == 0
+        {
+            let _outer = |y: u8| {
+                let _inner = |x: u8| x;
+                y
+            };
+            0
+        }
+    } => Ok(())
+}
+
+// Coverage: closure captures local. `let n = 5; let f = |x| x + n;` —
+// the lambda `fun (x : Int) => x + n` references `n` from the
+// surrounding scope. Lean's let-in handles this naturally; the body
+// verification scope needs `n` available as a captured variable.
+// Here we use `n = 0` so the body's overflow check `x + 0` has no
+// risk: `0 ≤ x ∧ x < 256 → 0 ≤ x + 0 ∧ x + 0 < 256` is trivially
+// true.
+test_verify_one_file! {
+    #[test] test_exec_closure_captures_local verus_code! {
+        #[verifier::tactus_auto]
+        fn make_with_capture() -> (r: u8)
+            ensures r == 0
+        {
+            let n: u8 = 0;
+            let _add_n = |x: u8| x + n;
+            0
+        }
+    } => Ok(())
+}
+
