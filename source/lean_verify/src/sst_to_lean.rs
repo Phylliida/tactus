@@ -130,7 +130,7 @@ use crate::lean_ast::{
 use crate::expr_shared::varat_pre_name;
 use std::sync::Arc;
 use crate::to_lean_expr::vir_expr_to_ast;
-use crate::to_lean_sst_expr::{lower as lower_validated, sst_exp_to_ast, sst_exp_to_ast_checked, type_bound_predicate, Validated};
+use crate::to_lean_sst_expr::{lower as lower_validated, sst_exp_to_ast_checked, type_bound_predicate, Validated};
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
 
 /// Typed view of a loop invariant's classification (#103).
@@ -266,9 +266,9 @@ impl<'a> WpCtx<'a> {
     /// Validates `check.reqs` and `check.post_condition.ens_exps`
     /// up front via `check_exp`. If any expression uses an SST form
     /// we don't support, returns `Err(reason)` before constructing
-    /// anything — in particular before the infallible
-    /// `sst_exp_to_ast` call that renders `ensures_goal`, which
-    /// would otherwise panic.
+    /// anything — in particular before lowering `ensures_goal` via
+    /// the typed `Validated::check + lower` pipeline (post-#115;
+    /// previously the infallible `sst_exp_to_ast` shim).
     ///
     /// The precondition "ens_exps is supported" thus lives in the
     /// type signature rather than in a docstring: you can only get
@@ -320,9 +320,9 @@ impl<'a> WpCtx<'a> {
         //
         // Rewrite VarAt(x, Pre) → Var(<x>_at_pre_tactus) for &mut
         // params (#94) BEFORE rendering — the rewrite is on SST,
-        // and `sst_exp_to_ast` then sees only Var nodes.
+        // and the renderer then sees only Var nodes.
         let ensures_goal = and_all(
-            check.post_condition.ens_exps.iter().map(|ens| {
+            check.post_condition.ens_exps.iter().map(|ens| -> Result<LExpr, String> {
                 // First normalize new-mut-ref shapes (`MutRefCurrent` →
                 // `VarAt(_, Pre)`, `MutRefFuture/Final` → `Var`) so the
                 // existing #94 rewrite step then handles it as if the
@@ -334,12 +334,18 @@ impl<'a> WpCtx<'a> {
                     NormalizePhase::CurrentIsPreState,
                 );
                 let rewritten = rewrite_varat_for_mut_params_in_exp(&normalized, mut_param_names);
-                LExpr::span_mark(
+                // The rewrite is structural (VarAt(p, Pre) →
+                // Var(<p>_at_pre_tactus)) and preserves ExpX shape, so
+                // validation that succeeded on `normalized` (the
+                // earlier `check_exp` call in this fn) succeeds on
+                // `rewritten`. `Validated::check` is deterministic;
+                // propagating its Err handles any unexpected drift.
+                Ok(LExpr::span_mark(
                     format_rust_loc(&ens.span),
                     AssertKind::Obligation(ObligationKind::Postcondition),
-                    sst_exp_to_ast(&rewritten),
-                )
-            }).collect()
+                    lower_validated(Validated::check(&rewritten)?),
+                ))
+            }).collect::<Result<Vec<_>, String>>()?
         );
         Ok(Self { fn_map, type_map, ret_name, ensures_goal })
     }
@@ -1041,8 +1047,8 @@ fn walk_obligations<'a>(
             );
             e.emit(name, obl.wrap(goal), simple_tactic(e));
             // Reuse cond_ast for the body's hypothesis frame —
-            // sst_exp_to_ast is deterministic, so re-rendering
-            // the same Exp would only repeat work.
+            // rendering is deterministic, so re-running it on the
+            // same Exp would only repeat work.
             let new_obl = obl.with_frame(CtxFrame::Hyp(cond_ast));
             walk_obligations(body, ctx, &new_obl, e);
         }
@@ -2212,10 +2218,19 @@ fn walk_let<'a>(
     obl: &OblCtx,
     e: &mut ObligationEmitter,
 ) {
+    // `val` was validated upstream: `Wp::Let.value: Validated<'a>`,
+    // and walk_let's caller (`walk_obligations` Wp::Let arm) extracts
+    // `.raw()` from that witness. Sub-expressions (cond / branches /
+    // inner_body / binder rhs) are valid by structural induction on
+    // the validated tree. We re-run `sst_exp_to_ast_checked` at each
+    // sub-render site for a cheap, deterministic re-check; an Err
+    // would indicate validator drift between Validated::check and
+    // sub-expression rendering.
     let peeled = peel_value_position(val);
     match &peeled.x {
         ExpX::If(cond, then_e, else_e) => {
-            let c_ast = sst_exp_to_ast(cond);
+            let c_ast = sst_exp_to_ast_checked(cond)
+                .expect("walk_let if-cond: sub of validated Exp tree");
             walk_let(name, then_e, body, ctx,
                 &obl.with_frame(CtxFrame::Hyp(c_ast.clone())), e);
             walk_let(name, else_e, body, ctx,
@@ -2236,7 +2251,8 @@ fn walk_let<'a>(
                     for b in bs.iter() {
                         chain_obl.frames.push(CtxFrame::Let(
                             crate::lean_name::LeanName::from_var_ident(&b.name),
-                            sst_exp_to_ast(&b.a),
+                            sst_exp_to_ast_checked(&b.a)
+                                .expect("walk_let binder rhs: sub of validated Exp tree"),
                         ));
                     }
                     walk_let(name, inner_body, body, ctx, &chain_obl, e);
@@ -2249,7 +2265,9 @@ fn walk_let<'a>(
     // Plain let with no peelable structure — push the let frame
     // and continue walking the body.
     let new_obl = obl.with_frame(CtxFrame::Let(
-        name.clone(), sst_exp_to_ast(val),
+        name.clone(),
+        sst_exp_to_ast_checked(val)
+            .expect("walk_let val: validated upstream via Wp::Let.value"),
     ));
     walk_obligations(body, ctx, &new_obl, e);
 }
@@ -2327,9 +2345,16 @@ fn build_req_binders(check: &FuncCheckSst, mut_param_names: &HashSet<String>) ->
             mut_param_names,
             NormalizePhase::CurrentIsLocal,
         );
+        // The same `normalized` shape was validated in `WpCtx::new`
+        // (the same caller that just succeeded earlier in this fn);
+        // `normalize_mut_ref_in_exp` is deterministic, so re-running
+        // here produces the identical Exp. Re-checking is cheap and
+        // would only fail on validator drift between WpCtx::new and
+        // here — which would mean a Verus-side ordering bug.
         LBinder {
             name: Some(crate::lean_name::LeanName::synthetic(format!("h_req{}", i))),
-            ty: sst_exp_to_ast(&normalized),
+            ty: sst_exp_to_ast_checked(&normalized)
+                .expect("build_req_binders: req validated by WpCtx::new"),
             kind: BinderKind::Explicit,
         }
     }).collect()
@@ -2609,10 +2634,17 @@ fn detect_assert_kind(e: &Exp) -> AssertKind {
 /// the goal the user is writing. For non-if values this is a direct
 /// call to `emit_leaf` with the rendered expression — no overhead.
 fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
+    // `e` was validated upstream: `Return` checks via `check_exp(e)`
+    // before calling lift_if_value (sst_to_lean.rs:2793). Sub-
+    // expressions are valid by structural induction; the
+    // `sst_exp_to_ast_checked(...).expect(...)` calls below re-run
+    // the deterministic validator and would only fire if the
+    // validator drifted between the upstream check_exp and here.
     let peeled = peel_value_position(e);
     match &peeled.x {
         ExpX::If(cond, then_e, else_e) => {
-            let c = sst_exp_to_ast(cond);
+            let c = sst_exp_to_ast_checked(cond)
+                .expect("lift_if_value if-cond: sub of validated Exp tree");
             LExpr::and(
                 LExpr::implies(c.clone(), lift_if_value(then_e, emit_leaf)),
                 LExpr::implies(LExpr::not(c), lift_if_value(else_e, emit_leaf)),
@@ -2641,15 +2673,18 @@ fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
                 // `name` is already an owned `String` from
                 // `match_single_let_bind`; the closure captures
                 // it by reference and clones per leaf invocation.
-                let body_ast = sst_exp_to_ast(inner_body);
+                let body_ast = sst_exp_to_ast_checked(inner_body)
+                    .expect("lift_if_value let-body: sub of validated Exp tree");
                 lift_if_value(rhs, &|rhs_leaf| {
                     emit_leaf(LExpr::let_bind(name.clone(), rhs_leaf, body_ast.clone()))
                 })
             } else {
-                emit_leaf(sst_exp_to_ast(e))
+                emit_leaf(sst_exp_to_ast_checked(e)
+                    .expect("lift_if_value bind-fallthrough: validated upstream"))
             }
         }
-        _ => emit_leaf(sst_exp_to_ast(e)),
+        _ => emit_leaf(sst_exp_to_ast_checked(e)
+            .expect("lift_if_value leaf: validated upstream")),
     }
 }
 
@@ -3110,7 +3145,7 @@ fn build_wp_call<'a>(
     // which inserts a `StmX::Assert` wrapping `InternalFun::
     // CheckDecreaseHeight` right before each recursive call
     // (including mutual recursion across an SCC). `build_wp` sees it
-    // as a plain `Wp::Assert`; `sst_exp_to_ast` handles the lowering.
+    // as a plain `Wp::Assert`; `sst_exp_to_ast_checked` handles the lowering.
     let validated_args: Vec<Validated<'a>> = args.iter()
         .map(|a| Validated::check(a))
         .collect::<Result<Vec<_>, _>>()?;
@@ -4293,9 +4328,12 @@ mod tests {
     }
 
     /// Render via the full `sst_exp_to_ast_checked` pathway —
-    /// exercises `CheckDecreaseHeight` lowering end-to-end.
+    /// exercises `CheckDecreaseHeight` lowering end-to-end. Test
+    /// fixtures pass well-formed Exps so `.expect` here is a
+    /// safety net for fixture bugs rather than a runtime path.
     fn render_via_public(e: &Exp) -> LExpr {
-        crate::to_lean_sst_expr::sst_exp_to_ast(e)
+        crate::to_lean_sst_expr::sst_exp_to_ast_checked(e)
+            .expect("test fixture: well-formed Exp")
     }
 
     #[test]
@@ -4303,7 +4341,7 @@ mod tests {
         // Canonical Verus shape: Box(Let([(n, tmp)], n))
         //   After peel + substitute: tmp
         let e = mk_decrease_arg(true, "n", "tmp", "n");
-        // `sst_exp_to_ast` would emit `Box` as transparent and render
+        // The renderer would emit `Box` as transparent and render
         // the inner Let directly (producing shadowing). We need to go
         // through the CheckDecreaseHeight-specific helper. Since
         // render_checked_decrease_arg is private, we test the shape
