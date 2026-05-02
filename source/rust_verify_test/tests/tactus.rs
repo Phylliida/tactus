@@ -5621,13 +5621,18 @@ test_verify_one_file! {
 // Lean lambda via `vir_expr_to_ast`'s `NonSpecClosure` arm, and bound
 // to the cid via `Wp::LetRaw`. The Verus-side spec assume is dropped
 // because the lambda binding is structurally the same fact.
+//
+// Closure body `|x: u32| x` is identity — generically sound for any
+// u32 (no overflow risk). The body's verification scope emits a
+// theorem like `∀ x : Int, 0 ≤ x ∧ x < 2^32 → 0 ≤ x ∧ x < 2^32` which
+// closes trivially.
 test_verify_one_file! {
     #[test] test_exec_closure_decl verus_code! {
         #[verifier::tactus_auto]
         fn make_adder() -> (r: u32)
             ensures r == 5
         {
-            let add_one = |x: u32| x + 1;
+            let identity = |x: u32| x;
             5
         }
     } => Ok(())
@@ -5642,7 +5647,7 @@ test_verify_one_file! {
         fn make_adder() -> (r: u32)
             ensures r == 6  // body returns 5 — should fail
         {
-            let _add_one = |x: u32| x + 1;
+            let _identity = |x: u32| x;
             5
         }
     } => Err(err) => {
@@ -5652,5 +5657,49 @@ test_verify_one_file! {
             err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
         );
     }
+}
+
+// Soundness probe: closure body has an overflow that should NOT
+// verify. Body is `x + 200` for `x: u8` — when called with x=100
+// (or anything ≥ 56), this overflows. The body should fail an
+// overflow check, but the surrounding fn returns 5 (unrelated to
+// the closure). Pre-`Wp::ClosureBody`, the closure body's
+// verification scope was silently skipped — `r == 5` would pass
+// even though the closure body `x + 200` is genuinely unsound.
+// Now the closure body's overflow check is emitted as a theorem
+// under `∀ x : Int, 0 ≤ x ∧ x < 2^8`, and tactus_auto correctly
+// rejects.
+test_verify_one_file! {
+    #[test] test_exec_closure_body_overflow_caught verus_code! {
+        #[verifier::tactus_auto]
+        fn unsound_overflow() -> (r: u8)
+            ensures r == 5
+        {
+            let _bad = |x: u8| x + 200;  // should fail: x + 200 may overflow u8
+            5
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("overflow") || e.message.contains("arithmetic")),
+            "expected overflow failure inside closure body, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
+// Positive: closure body computes something arithmetic but bounded
+// by the input type. `x / 2` for `x: u8` is always sound (no overflow
+// possible — the result is between 0 and 127). Pins that body
+// verification doesn't false-fail on legitimately-sound bodies.
+test_verify_one_file! {
+    #[test] test_exec_closure_body_safe_arithmetic verus_code! {
+        #[verifier::tactus_auto]
+        fn make_halver() -> (r: u8)
+            ensures r == 0
+        {
+            let _half = |x: u8| x / 2;
+            0
+        }
+    } => Ok(())
 }
 
