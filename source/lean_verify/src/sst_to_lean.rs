@@ -2841,8 +2841,13 @@ fn build_wp<'a>(
              non-tactus_auto fn (Verus's Z3 path handles it).".to_string()
         ),
         StmX::ClosureInner { .. } => Err(
-            "exec closure bodies not yet supported (#93). Workaround: extract \
-             the closure into a named fn and call it directly.".to_string()
+            "exec closure declarations not yet supported (#93). Probe for the \
+             closure-decl encoding hit a deeper issue: Verus's `ast_to_sst` \
+             threads synthetic `tmp%%` temps through the closure-spec assume's \
+             surrounding scope, and dropping just `ClosureInner` + the \
+             ClosureReq/Ens-bearing assume leaves dangling `Var(tmp%%)` \
+             references in the postcondition theorem's binder list. Workaround: \
+             extract the closure into a named fn and call it directly.".to_string()
         ),
     }
 }
