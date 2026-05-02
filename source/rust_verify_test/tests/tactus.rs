@@ -5703,3 +5703,36 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Probe: exec closure CALL via FnOnce/Fn/FnMut. Verus translates
+// `f(x)` to `vstd::pervasive::exec_nonstatic_call(f, (x,))`. Without
+// vstd imported the call is rejected upstream ("not supported (note:
+// you may be able to add a Verus specification...)"). With vstd
+// imported, the call resolves to vstd's `exec_nonstatic_call` —
+// a `verifier::external_body` fn whose `requires/ensures` use
+// `call_requires` / `call_ensures` builtins (which lower to
+// `BuiltinSpecFun::ClosureReq` / `ClosureEns` — and our renderer
+// treats those as synthetic closure-spec stuff to drop). So even
+// with vstd it's not a one-line fix.
+//
+// Documenting as Err for now; lifting it is its own slice (likely
+// needs proper handling of `BuiltinSpecFun::ClosureReq/Ens` in spec
+// position so the inlined `exec_nonstatic_call` ensures resolves to
+// `ClosureEns(f, args, output)` ↔ the lambda's value).
+test_verify_one_file! {
+    #[test] test_exec_closure_call_unsupported_upstream verus_code! {
+        #[verifier::tactus_auto]
+        fn use_closure() -> (r: u8)
+            ensures r == 5
+        {
+            let identity = |x: u8| x;
+            identity(5)
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("exec_nonstatic_call")),
+            "expected upstream `exec_nonstatic_call is not supported`, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
