@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**261 end-to-end tests + 1 coverage test + 118 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**261 end-to-end tests + 1 coverage test + 121 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -1632,6 +1632,76 @@ POEMS.md restructured. Two pending tasks remain:
 - **#98** Architecture: `substitute()` boilerplate (walk_children
   helper). Pure ergonomics.
 
+#### Current session (2026-05-03 morning — task list audit + #120 partial)
+
+A focused morning. Two pieces of work:
+
+**Task list audit (no commit; task tool only).** Yesterday's pending
+list was tiny (#97 + #98) but DESIGN.md's deferrals catalogue was
+much richer. A systematic pass through DESIGN.md found ~30 distinct
+deferred items; 20 were promoted to tasks. Deleted 28 completed
+tasks for cleanup. Final state: 22 pending across 6 themes:
+
+- Feature deferrals with clear shape (#106–114): &mut non-Var L-values,
+  caller-side new-mut-ref, three #54 follow-ups (generic / mutual /
+  lex decreases), AssertBitVector, OpenInvariant, StrGetChar, loop
+  shape extensions.
+- Architecture cleanups (#97, #98, #115–119): sst_exp_to_ast shim
+  removal, substitute capture alpha-rename, two-pass loop fusion,
+  prelude allowlist auto-derive, lift_if_value multi-binder, OblCtx
+  perf, walk_children helper.
+- Robustness + test gaps (#120, #121).
+- Phase 3 (#122, #123): cross-crate verification, heartbeats / per-
+  module / CI matrix.
+- Upstream-blocked (#124, #125): exec-mode closure calls, cross-crate
+  trait method decls / dyn Trait.
+
+The threshold-judgment was load-bearing: DESIGN.md called several
+candidates "below the cost/benefit threshold" (typed `RustLoc`,
+`Tactic::Raw`/`Named` split, OblCtx frame ordering invariant) — those
+stayed as documentation only, not promoted to tasks. The doc was right;
+a list that holds everything holds nothing.
+
+**#120 partial landing (commit `8d4d1c1`).** Two of four DESIGN.md-
+flagged shape-drift gaps closed:
+
+- **CheckDecreaseHeight Assert-before-Call ordering** — covered
+  structurally via `build_wp_block_preserves_assert_before_assume_ordering`
+  + `build_wp_block_preserves_three_stmt_ordering`. The pass-ordering
+  invariant reduces to "`build_wp` preserves `StmX::Block` source
+  order in the Wp tree's left-to-right shape." The CheckDecreaseHeight
+  `cur` arg shape was already pinned by `full_check_decrease_height_shape_pinned`
+  (a sibling test); together they cover both halves of the invariant.
+- **`StmX::ClosureInner.ast_body` shape-drift** (#93 follow-up) —
+  pinned by `closure_lambda_from_ast_rejects_non_closure_ast_body`.
+  The helper rejects non-`ExprX::NonSpecClosure` ast_body with a
+  documented error naming `ast_to_sst` as the fix site.
+
+Plus added a minimal `WpCtx<'static>` test fixture (`mk_test_ctx`) —
+foundation for future direct walk_loop / walk_call unit tests.
+
+Two remaining shape-drift gaps (`WpCtx::new` Err-form req/ensure,
+direct `walk_loop`/`walk_call` tests) split out as **#126**. Both
+require `FuncCheckSst` / synthetic Wp fixtures DESIGN.md describes
+as "involved"; deferred until alongside larger work in those areas.
+
+**Discipline note worth recording: "what would slow me down" lens
+chose the work.** The shape-drift tests aren't motivated by realistic
+code (#97 / #98 also aren't). What they're motivated by is *future
+robustness* — a Verus rebase silently changing pass ordering, or a
+future contributor changing `ast_to_sst`'s ast_body population. The
+test catches the drift before it manifests as obscure verification
+regressions. This is the same lens that made #103/#104/#105 worth
+doing: the runtime check (here, an assertion that "this never
+fires") becomes a focused error message naming the fix site.
+
+**Net for the morning**: 1 commit (`8d4d1c1`), 3 new unit tests
+(118 → 121), DESIGN.md "Architecture debts" updated to flip the
+two covered items, task list audited (28 deleted + 20 added + 1
+closed + 1 follow-up created — final 22 pending). 1 poem batch
+(2026-05-03.md: twenty-eight to twenty-two; the threshold; the
+audit as repair).
+
 ## Architecture
 
 ### Full pipeline
@@ -1928,38 +1998,74 @@ See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the f
 
 All major Tier-3 tasks have landed (#55 caller-side `&mut`, #56
 caller-side trait method calls, #93 closures, #95 new-mut-ref
-callee-side). Two pending tasks remain — both unmotivated by
-realistic code, neither soundness-shaped.
+callee-side). The 2026-05-03 morning audit went through DESIGN.md
+systematically and surfaced ~20 deferred items that hadn't been
+promoted to tasks; final pending count is **22 across 6 themes**.
+None is on the critical path for realistic code today.
 
-### #97 — Architecture: `OblCtx::with_frame` O(N²) → `Rc<im::Vector>`
+The full catalogue lives in DESIGN.md § "Known deferrals, rejected
+cases, and untested edges" — this section summarizes the task
+themes:
 
-`OblCtx::with_frame` clones the whole `frames` Vec per call.
-Across deeply-nested recursion (asserts inside branches inside
-loops inside calls), the cost is O(N²) in frame count. Realistic
-exec fns don't go deep enough to feel it; switching to
-`Rc<im::Vector<_>>` (structural sharing) would fix it without
-changing the API. Documented inline at the function site.
+### Feature deferrals with clear shape (8 tasks)
 
-### #98 — Architecture: substitute boilerplate (walk_children helper)
+- **#106** &mut at call sites for non-Var L-values (umbrella for
+  Index, deeper paths, multi-variant enum, tuple field).
+- **#107** caller-side new-mut-ref mode (synthetic MutRef-typed
+  locals around exec calls).
+- **#108** non-int decreases for generic datatypes.
+- **#109** non-int decreases for mutually recursive datatype SCCs.
+- **#110** lexicographic decreases (loops + fns).
+- **#111** StmX::AssertBitVector (bit_vector reasoning).
+- **#112** StmX::OpenInvariant (atomic invariants for concurrency).
+- **#113** BinaryOp::StrGetChar + string operations.
+- **#114** loop shape extensions (loop_isolation: false, non-empty
+  cond setup).
 
-`lean_ast::substitute` has ~130 lines of per-variant dispatch
-across `substitute_impl` / `collect_free_vars`. Adding an
-`ExprNode` variant means editing three places (plus `lean_pp`).
-A `walk_children` helper or proc-macro would collapse it to ~30
-lines. Pure ergonomics; no soundness or feature impact.
+### Architecture cleanups (7 tasks)
 
-### Closed today (sub-tasks captured for history)
+- **#97** `OblCtx::with_frame` O(N²) → `Rc<im::Vector>` (perf,
+  unmotivated by realistic code).
+- **#98** `substitute` walk_children helper (pure ergonomics).
+- **#115** `sst_exp_to_ast` shim removal (#100 follow-up; ~10 sites).
+- **#116** `substitute` capture-check alpha-rename (vs panic).
+- **#117** fuse two-pass over loop bodies.
+- **#118** sanity-check allowlist auto-derive from prelude.rs.
+- **#119** `lift_if_value` multi-binder Bind(Let) support.
 
-The following sub-tasks closed today and are documented under
-`### Recent session landings` above and in DESIGN.md's catalogue:
+### Robustness + test gaps (2 tasks)
 
-- **#95 new-mut-ref callee-side** (LANDED) — caller-side still
-  deferred (synthetic MutRef-typed local around exec calls). See
-  `test_exec_call_mut_arg_new_mut_ref_rejected`.
-- **#93 closures** (LANDED, three slices: spec-closure calls via
-  CallLambda, closure decl via `ast_body` field on `StmX::ClosureInner`,
-  closure body verification scope). FnOnce/Fn/FnMut exec calls
-  upstream-blocked (see DESIGN.md "Upstream-blocked deferrals").
+- **#121** test coverage: untested-but-possibly-working paths
+  (closures with user requires/ensures; `assert forall|v| P by
+  { tac }`; return-in-else; multi-var loops; tactic referencing
+  loop-local; etc.).
+- **#126** WpCtx::new Err-form req/ensure + direct walk_loop /
+  walk_call tests (split from #120 — both involve `FuncCheckSst`
+  fixtures).
+
+### Phase 3 (2 tasks)
+
+- **#122** cross-crate verification (CrateDecls.lean) — gating
+  for everything cross-crate.
+- **#123** heartbeats attribute + per-module .lean + CI matrix
+  (three small Phase-3 polish items grouped).
+
+### Upstream-blocked (2 tasks)
+
+- **#124** exec-mode closure calls (FnOnce/Fn/FnMut) — Verus's
+  `exec_nonstatic_call` not supported; lifting needs Verus-side
+  work.
+- **#125** cross-crate trait method decls + cross-crate dyn Trait
+  — unblocked by completing #122.
+
+### Tasks closed in 2026-05-02 / 2026-05-03 (sub-tasks for history)
+
+- **#95 new-mut-ref callee-side** (2026-05-02). Caller-side still
+  deferred → #107.
+- **#93 closures** (2026-05-02). Three slices landed; FnOnce/Fn/FnMut
+  exec calls deferred → #124.
+- **#120 (partial) shape-drift tests** (2026-05-03). Two of four
+  gaps closed; remaining two split → #126.
 
 ### Earlier-deferred items still open
 
