@@ -1107,7 +1107,7 @@ Accepted via #57: **`cond: None`** loops (the form Verus produces when lowering 
 * **`_tactus_d_old` not gensym'd** — see its dedicated section.
 * **`OblCtx::with_frame` clones the whole `frames` Vec per call** — O(N²) memory across deeply-nested recursion (asserts inside branches inside loops). Realistic exec fns don't go deep enough for this to matter; switching to `Rc<im::Vector<_>>` (structural sharing) would fix it without changing the API. Documented inline at the function site.
 * **`substitute` boilerplate.** ~130 lines of per-variant dispatch across `substitute_impl` / `collect_free_vars`. Adding an `ExprNode` variant means editing three places (plus `lean_pp`). A `walk_children` helper or proc-macro would collapse it to ~30 lines — not worth doing yet, worth flagging.
-* **No shape-drift test for `CheckDecreaseHeight` Assert-before-Call ordering.** We have a test for the `cur` arg's Bind(Let) shape (`full_check_decrease_height_shape_pinned`) but not for the pass-ordering invariant ("Assert is inserted before the Call in the SST statement sequence"). A drift here would produce recursive fns that verify without termination checks. Worth adding: construct a self-recursive SST fragment and assert the first `Wp::Assert` precedes the `Wp::Call` in the built Wp tree.
+* **CheckDecreaseHeight Assert-before-Call ordering — covered structurally** (`build_wp_block_preserves_assert_before_assume_ordering`, `build_wp_block_preserves_three_stmt_ordering`). The pass-ordering invariant reduces to "`build_wp` preserves `StmX::Block` source order in the Wp tree's left-to-right shape" — pinned with simple Assert/Assume stmts (no fn_map dependency). The CheckDecreaseHeight `cur` arg shape is separately pinned by `full_check_decrease_height_shape_pinned`.
 * **No test that `WpCtx::new` rejects an Err-form req/ensure cleanly.** We have `test_exec_ctor_rejected` for body-path Ctor, but no direct test that a `requires Ctor(...)` clause produces the WpCtx::new Err path (vs. panicking or passing through). Low risk — the validation logic is shared with the body — but a regression guard would be cheap.
 * **`lift_if_value` single-binder Bind(Let) restriction.** Multi-binder lets (`let (a, b) = …; …`) pass through without peeling. If a user writes `let (a, b) = foo(); if x { … } else { … }` the if won't be lifted to goal level — currently fine because such let-patterns aren't common in our tests, but the restriction is implicit.
 * **No direct test of `simplified_krate()` None branch.** Unreachable by design (verify_crate_inner populates it before verify_bucket runs). If a future code path hits the unreachable branch, users see our "pipeline ordering bug" error instead of a panic — but we don't exercise the error path.
@@ -1637,13 +1637,13 @@ exec fns."
     inner asserts), but no test pins this — the Verus surface
     syntax is finicky and we didn't get it to parse cleanly in
     a tactus_auto fn. Untested.
-  - **`StmX::ClosureInner.ast_body` field — no shape-drift unit
-    test.** The contract that `ast_to_sst` always populates this
-    field with the same `expr.clone()` as the SST's
-    `expr.span.clone()` is enforced only by the e2e tests today.
-    A focused unit test constructing a synthetic
-    `StmX::ClosureInner` with a known `ast_body` would be belt-
-    and-suspenders.
+  - **`StmX::ClosureInner.ast_body` shape-drift — pinned** by
+    `closure_lambda_from_ast_rejects_non_closure_ast_body`. The
+    helper rejects a non-`ExprX::NonSpecClosure` ast_body with a
+    documented error naming `ast_to_sst` as the fix site. If a
+    future rebase changes the population path (e.g., stores `body`
+    alone instead of the full closure expr, or forgets the field),
+    the unit test fires before e2e regressions surface.
 
 ##### Ordering rationale
 

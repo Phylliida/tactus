@@ -4377,4 +4377,170 @@ mod tests {
         assert!(printed.contains("∨") || printed.contains("\\/"),
             "disjunction with `otherwise` branch should be present: {}", printed);
     }
+
+    // ── #120 shape-drift tests ──────────────────────────────────
+    //
+    // Belt-and-suspenders against silent breakage from upstream
+    // Verus changes. Each test here pins an invariant Tactus
+    // depends on but can't enforce statically. Fails here turn
+    // into focused error messages naming the fix site instead of
+    // obscure end-to-end verification regressions.
+    //
+    // Two invariants pinned:
+    //
+    // 1. `build_wp` preserves `StmX::Block` source ordering as the
+    //    Wp tree's left-to-right shape. The
+    //    `vir::recursion::CheckDecreaseHeight`-before-recursive-Call
+    //    invariant reduces to this structural property: as long as
+    //    Verus inserts the Assert before the Call in the SST
+    //    statement sequence, our right-to-left fold makes the Wp
+    //    tree have Assert wrapping Call. If `build_wp`'s fold
+    //    direction drifted, recursive fns would silently lose
+    //    their termination obligation.
+    //
+    // 2. `closure_lambda_from_ast` rejects an ast_body that isn't
+    //    `ExprX::NonSpecClosure`. The contract is that
+    //    `ast_to_sst` populates `StmX::ClosureInner.ast_body`
+    //    (added in #93) with the closure's original AST `Expr`.
+    //    If a future rebase changes that population path, this
+    //    test catches the contract violation before it manifests
+    //    as nonsense generated Lean.
+
+    /// Construct an SST `Stm` wrapping `StmX::Assert(None, None, e)`.
+    fn assert_stm(e: Exp) -> Stm {
+        use vir::def::Spanned;
+        Spanned::new(test_span(), StmX::Assert(None, None, e))
+    }
+
+    /// Construct an SST `Stm` wrapping `StmX::Assume(e)`.
+    fn assume_stm(e: Exp) -> Stm {
+        use vir::def::Spanned;
+        Spanned::new(test_span(), StmX::Assume(e))
+    }
+
+    /// Construct an SST `Stm` wrapping `StmX::Block(stms)`.
+    fn block_stm(stms: Vec<Stm>) -> Stm {
+        use vir::def::Spanned;
+        Spanned::new(test_span(), StmX::Block(Arc::new(stms)))
+    }
+
+    /// Minimal `WpCtx<'static>` for tests that don't need fn lookup
+    /// or type info. `build_wp` on `Assert` / `Assume` / `Block`
+    /// doesn't read `fn_map` / `type_map` — only `Return` / `Call` /
+    /// `Loop` paths do.
+    fn mk_test_ctx() -> WpCtx<'static> {
+        WpCtx {
+            fn_map: HashMap::new(),
+            type_map: HashMap::new(),
+            ret_name: None,
+            ensures_goal: LExpr::lit_true(),
+        }
+    }
+
+    #[test]
+    fn build_wp_block_preserves_assert_before_assume_ordering() {
+        // Source order [assert(p), assume(q)] must produce
+        // Wp::Assert(p, Box::new(Wp::Assume(q, Box::new(after)))) —
+        // the structural property that `vir::recursion`'s
+        // CheckDecreaseHeight-before-Call invariant relies on.
+        let p = var_exp("p", typ_bool());
+        let q = var_exp("q", typ_bool());
+        let block = block_stm(vec![assert_stm(p), assume_stm(q)]);
+        let ctx = mk_test_ctx();
+        let after = Wp::Done(LExpr::lit_true());
+        let wp = build_wp(&block, after, &ctx, &[]).expect("build_wp");
+
+        match wp {
+            Wp::Assert(_, inner1) => match *inner1 {
+                Wp::Assume(_, inner2) => {
+                    assert!(matches!(*inner2, Wp::Done(_)),
+                        "expected Done innermost; if this fails the \
+                         Block fold's terminator threading has drifted");
+                }
+                _ => panic!(
+                    "expected Wp::Assume after Assert (Block source \
+                     ordering preserved). If this fails, build_wp's \
+                     right-to-left fold over Block has drifted, \
+                     breaking the recursion-pass invariant that \
+                     Assert(CheckDecreaseHeight) precedes the Call \
+                     in the Wp tree. Fix site: build_wp's \
+                     StmX::Block arm in sst_to_lean.rs."
+                ),
+            }
+            _ => panic!(
+                "expected Wp::Assert as outermost (first stmt was an \
+                 Assert). If this fails, build_wp's Block fold direction \
+                 reversed."
+            ),
+        }
+    }
+
+    #[test]
+    fn build_wp_block_preserves_three_stmt_ordering() {
+        // Three-stmt block exercises a deeper fold. Source order
+        // [assert(p), assume(q), assert(r)] should produce
+        // Assert(p) → Assume(q) → Assert(r) → Done.
+        let p = var_exp("p", typ_bool());
+        let q = var_exp("q", typ_bool());
+        let r = var_exp("r", typ_bool());
+        let block = block_stm(vec![
+            assert_stm(p),
+            assume_stm(q),
+            assert_stm(r),
+        ]);
+        let ctx = mk_test_ctx();
+        let after = Wp::Done(LExpr::lit_true());
+        let wp = build_wp(&block, after, &ctx, &[]).expect("build_wp");
+
+        match wp {
+            Wp::Assert(_, b1) => match *b1 {
+                Wp::Assume(_, b2) => match *b2 {
+                    Wp::Assert(_, b3) => assert!(matches!(*b3, Wp::Done(_))),
+                    _ => panic!("expected Wp::Assert at depth 3"),
+                }
+                _ => panic!("expected Wp::Assume at depth 2"),
+            }
+            _ => panic!("expected Wp::Assert outermost"),
+        }
+    }
+
+    /// Construct a synthetic VIR-AST `Expr` with the given `ExprX`.
+    fn ast_expr(x: ExprX, typ: Typ) -> Expr {
+        Arc::new(SpannedTyped {
+            span: test_span(),
+            typ,
+            x,
+        })
+    }
+
+    #[test]
+    fn closure_lambda_from_ast_rejects_non_closure_ast_body() {
+        // Pass a bogus ast_body that's NOT an ExprX::NonSpecClosure
+        // (here, a Const). `closure_lambda_from_ast` must return Err
+        // with the documented "wasn't an ExprX::NonSpecClosure"
+        // message — not panic, not pass through to `vir_expr_to_ast`
+        // (which would render as something nonsensical).
+        //
+        // If `ast_to_sst` ever stops populating
+        // `StmX::ClosureInner.ast_body` with the closure's
+        // ExprX::NonSpecClosure (e.g., it stores body alone, or
+        // forgets entirely), this is the test that fires.
+        let bogus = ast_expr(
+            ExprX::Const(vir::ast::Constant::Bool(false)),
+            typ_bool(),
+        );
+        let result = closure_lambda_from_ast(&bogus);
+        assert!(result.is_err(), "expected Err for non-NonSpecClosure ast_body");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("wasn't an ExprX::NonSpecClosure"),
+            "expected error to name the contract violation; got: {}",
+            err
+        );
+        assert!(
+            err.contains("ast_to_sst"),
+            "expected error to point at the fix site (ast_to_sst); got: {}",
+            err
+        );
+    }
 }
