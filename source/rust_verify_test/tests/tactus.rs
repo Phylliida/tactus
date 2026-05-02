@@ -5814,3 +5814,42 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Coverage (12.1): closure declared inside a loop body.
+// `Wp::ClosureBody` nests inside `Wp::Loop`'s body's WP.
+test_verify_one_file! {
+    #[test] test_exec_closure_inside_loop verus_code! {
+        #[verifier::tactus_auto]
+        fn loop_with_closure() -> (r: u8)
+            ensures r == 0
+        {
+            let mut i: u8 = 0;
+            while i < 3
+                invariant i <= 3
+                decreases 3 - i
+            {
+                let _f = |x: u8| x;
+                i = i + 1;
+            }
+            0
+        }
+    } => Ok(())
+}
+
+// Coverage (12.2): closure declared inside an if-branch.
+// `Wp::ClosureBody` nests inside `Wp::Branch`'s `then_branch`.
+test_verify_one_file! {
+    #[test] test_exec_closure_inside_if verus_code! {
+        #[verifier::tactus_auto]
+        fn branch_with_closure(c: bool) -> (r: u8)
+            ensures r == 0
+        {
+            if c {
+                let _f = |x: u8| x;
+                0
+            } else {
+                0
+            }
+        }
+    } => Ok(())
+}
+

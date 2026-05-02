@@ -702,6 +702,37 @@ fn closure_lambda_from_ast(
     Ok((cid_name, lambda))
 }
 
+/// Assemble the closure-decl Wp shape:
+///
+/// ```text
+///   ClosureBody {
+///     closure_params,
+///     body: body_wp,                  // closure's own verification scope
+///     after: LetRaw { cid := lambda; outer_after }   // outer fn continues
+///   }
+/// ```
+///
+/// Extracted from the `StmX::ClosureInner` handler in `build_wp` so
+/// the call site reads as a single named operation instead of three
+/// levels of `Box::new` / nested struct-literal nesting.
+fn closure_decl_wp<'a>(
+    closure_params: Vec<(&'a VarIdent, &'a Typ)>,
+    body_wp: Wp<'a>,
+    cid: crate::lean_name::LeanName,
+    lambda: LExpr,
+    outer_after: Wp<'a>,
+) -> Wp<'a> {
+    Wp::ClosureBody {
+        closure_params,
+        body: Box::new(body_wp),
+        after: Box::new(Wp::LetRaw {
+            name: cid,
+            value: lambda,
+            body: Box::new(outer_after),
+        }),
+    }
+}
+
 /// True if the SST `Exp` `e` is the body of a synthetic `StmX::Assume`
 /// that Tactus should drop entirely (rather than render as a Hyp
 /// frame). Two synthetic sources are recognized:
@@ -3027,15 +3058,7 @@ fn build_wp<'a>(
                 .iter()
                 .map(|(uid, typ)| (uid, typ))
                 .collect();
-            Ok(Wp::ClosureBody {
-                closure_params,
-                body: Box::new(body_wp),
-                after: Box::new(Wp::LetRaw {
-                    name: cid,
-                    value: lambda,
-                    body: Box::new(after),
-                }),
-            })
+            Ok(closure_decl_wp(closure_params, body_wp, cid, lambda, after))
         }
     }
 }
