@@ -1003,7 +1003,7 @@ Each one returns `Err("… not yet supported")`; users get a clean rejection ins
 * **`StmX::AssertQuery`** — `assert by(…)` with specific tactics / queries. Would need to translate the `AssertQueryMode` into a Lean tactic choice.
 * **`StmX::DeadEnd`** — markers Verus uses for unreachable code. Usually harmless to skip, but we reject rather than silently strip in case a future pipeline relies on them.
 * **`StmX::OpenInvariant`** — atomic invariant opening for concurrent verification. Out of scope until concurrency support lands.
-* **`StmX::ClosureInner`** — exec closure bodies. Depends on `ExpX::CallLambda` support.
+* **`StmX::ClosureInner`** — LANDED (#93). The `StmX::ClosureInner` variant gained a `ast_body: Expr` field populated by `ast_to_sst` (see `vir/src/sst.rs`), and Tactus reads it to render the closure as a first-class Lean lambda. The closure body's own verification scope (overflow checks etc.) emits as a separate set of theorems via `Wp::ClosureBody`'s walker, which pushes `∀ p : T, h_p_bound → ...` binders for each closure param. Pinned by `test_exec_closure_decl`, `test_exec_closure_decl_wrong_ensures`, `test_exec_closure_body_overflow_caught` (negative — soundness probe), `test_exec_closure_body_safe_arithmetic`.
 
 #### Expression-level forms rejected by `sst_exp_to_ast_checked`
 
@@ -1015,7 +1015,7 @@ Each one returns `Err("… not yet supported")`; users get a clean rejection ins
 * **`BinaryOp::StrGetChar`** — string character lookup.
 * **`BinaryOp::IeeeFloat(_)`** — IEEE float comparisons. Verus doesn't support `f32`/`f64` at all; this branch exists for completeness.
 * **`ExpX::Ctor(..)`** — datatype constructors in exec fns. Blocks any exec code that constructs enum/struct values. Regression test: `test_exec_ctor_rejected`.
-* **`ExpX::CallLambda(..)`** — closure calls. Blocks fns that invoke stored closures.
+* **`ExpX::CallLambda(..)`** — LANDED (#93) for spec-closure calls (`f(x)` where `f: spec_fn(_) -> _`). Renders as `App(f, args)` since Lean's `spec_fn(int) -> int` already maps to `Int → Int` via `typ_to_expr`'s Lambda arm. Mirrors the proof-fn path's `CallTarget::FnSpec` handling. Pinned by `test_exec_spec_closure_in_ensures`, `test_exec_spec_closure_in_requires`, `test_exec_spec_closure_in_ensures_wrong_body` (negative). Exec-mode closure calls (`identity(5)` for `let identity = |x: u8| x;`) are upstream-blocked — see "Upstream-blocked deferrals" below.
 * **`ExpX::ArrayLiteral(_)`** — `[a, b, c]` literals. Verus rejects these upstream when slice indexing isn't wired, so the Err arm is unreached in practice.
 * **`ExpX::Old(..)`** — `old(x)` (pre-state). Relevant for `ensures` that compare post-state to pre-state.
 * **`ExpX::Interp(_)`** — only appears inside Verus's interpreter; an internal-bug rejection rather than a feature gap.
@@ -1542,6 +1542,14 @@ These are deferred by design — the current slice is single-crate exec+proof-fn
 * **Lean version pinning / CI matrix.** `lean-toolchain` is pinned to `v4.25.0`; tactic behaviour could shift on upgrade. No automated regression against multiple Lean versions.
 * **Per-module `.lean` file generation.** Current design emits one file per fn (`target/tactus-lean/{crate}/{fn}.lean`). At scale, per-module would amortize preamble and olean caching; HANDOFF notes it as future work.
 
+#### Upstream-blocked deferrals
+
+These are deferred not by Tactus design choice but by upstream Verus pipeline state. Lifting any of them depends on Verus-side work first; pinned tests document the current rejection so a future rebase that lifts the upstream limitation surfaces here as a flippable Err.
+
+* **Exec-mode closure calls (`identity(5)` for an exec closure)** — Verus translates `f(x)` to `vstd::pervasive::exec_nonstatic_call(f, (x,))`. Without vstd imported, the call is rejected at Verus's resolution level with `vstd::pervasive::exec_nonstatic_call is not supported`. Even with vstd, `exec_nonstatic_call` is `external_body` with `requires`/`ensures` that use `call_requires` / `call_ensures` builtins, lowering to `BuiltinSpecFun::ClosureReq` / `ClosureEns` — the same shapes Tactus drops as synthetic in closure-decl scope. To verify call sites, those builtins would need a *spec-position* resolution (currently they only appear inside synthetic spec assumes that we drop): `ClosureReq(f, args)` → `True` (or the closure's actual requires applied to args), `ClosureEns(f, args, output)` → `output = f args` for the renderer's purpose. Pinned by `test_exec_closure_call_unsupported_upstream`.
+* **Cross-crate trait method decls** — when `walk_call`'s `pick_spec_source` resolves to a `TraitMethodImpl { method, .. }` and `method` (the trait's decl `Fun`) isn't in `fn_map`, Tactus rejects with a pointed error. This is technically Phase-3 (`CrateDecls.lean`) work, but we list it here too because the user-facing symptom is the same shape: the limitation isn't in Tactus's encoding, it's in the cross-crate inlining infrastructure.
+* **Cross-crate `dyn Trait`** — the `Dynamic` `CallTargetKind` (truly dynamic dispatch) falls through to the existing fn_map lookup; same-crate works, cross-crate hits the cross-crate rejection.
+
 #### Verus-side invariants we depend on
 
 Assumptions about upstream VIR/SST shape or Verus compiler-pass ordering that aren't (and can't straightforwardly be) enforced by Rust's type system. If any of these drift in an upstream rebase, our verification silently mis-compiles or panics. Each has either a shape-drift test, a compile-catch, or a documented fix site.
@@ -2032,7 +2040,7 @@ When the answers differ, the Lean-native shape is usually shorter, tighter, and 
 **Where this discipline applies in the deferred queue.**
 * **Deeper field paths** (`&mut a.b.c`) extend #87's structure-update pattern recursively: `let a := { a with b := { a.b with c := <fresh> } }`. No havoc encoding.
 * **Multi-variant enum field mutation** is the one case Lean's structure-update syntax doesn't compose with — it'd need a match-and-rebuild encoding. But that's a specific Lean idiom (`match a with | Variant fs => Variant { fs with f := <fresh> }`), not a havoc.
-* **Closures (#93)** target Lean's first-class function types directly rather than encoding the FnOnce/Fn/FnMut hierarchy as Z3 axioms.
+* **Closures (#93)** target Lean's first-class function types directly rather than encoding the FnOnce/Fn/FnMut hierarchy as Z3 axioms. Closure declarations bind `cid` to a real Lean lambda (`fun (x : T) => body`) via `Wp::LetRaw`; calls to spec closures lower to `App(f, args)`. Verus's synthesized `Assume(forall|x| ClosureReq(cid, x) ↔ ... ∧ ClosureEns(cid, x, body(x)) ↔ ...)` is dropped because the lambda binding IS the same fact structurally — no axiomatization needed. The only piece this encoding doesn't yet cover is exec-mode closure CALLS (Verus's `exec_nonstatic_call` desugar), which is upstream-blocked rather than encoding-shaped.
 * **Indexed L-values (`&mut v[i]`)** need a `Vector.set i v` style encoding — Lean has it, no havoc needed.
 
 **When the discipline doesn't apply.** Some obligations are inherently shaped by the source semantics, not the target. Termination via `CheckDecreaseHeight`, fixed-width integer overflow checks, and SSA mutation as let-shadowing are all encodings the SMT path uses that translate cleanly because the property at hand IS first-order arithmetic (or first-order shadowing). The discipline matters most when the property is *higher-order* or *structural* — where Lean's expressivity exceeds SMT's.
