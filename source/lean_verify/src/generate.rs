@@ -105,7 +105,21 @@ fn krate_preamble(
 
     for dt in &krate.datatypes {
         if let Dt::Path(p) = &dt.x.name {
-            if refs.datatypes.contains(short_name(p)) {
+            // Skip Verus's synthesized closure datatypes (#93). Their
+            // names start with `anonymous_closure%` (see
+            // `vir::def::PREFIX_CLOSURE_TYPE`). Z3 needs them as
+            // distinct opaque types so `ClosureReq`/`ClosureEns`
+            // predicates can refer to closure identities; Tactus
+            // renders closures as first-class Lean function values
+            // (`fun (x : T) => body` of type `T → R`), so the
+            // synthesized opaque inductive isn't needed and would
+            // fail Lean's `deriving Inhabited` (zero-variant
+            // inductives are not Inhabited).
+            let short = short_name(p);
+            if short.starts_with("anonymous_closure") {
+                continue;
+            }
+            if refs.datatypes.contains(short) {
                 cmds.extend(to_lean_fn::datatype_to_cmds(&dt.x, emit_accessors));
             }
         }

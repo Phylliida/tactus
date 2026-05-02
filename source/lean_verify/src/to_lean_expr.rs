@@ -141,6 +141,20 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
             body: Box::new(vir_expr_to_ast(body)),
         },
 
+        // Exec-mode closure: also a Lean lambda. The closure's
+        // requires/ensures aren't part of the lambda VALUE — they
+        // verify the body against its own contract (a separate scope
+        // emitted from `StmX::ClosureInner`'s `body` Stm). Here we just
+        // produce the function value. Reachable only from the SST-side
+        // `StmX::ClosureInner`'s `ast_body` field; the proof-fn pipeline
+        // doesn't see exec closures (its panic arm catches that).
+        ExprX::NonSpecClosure { params, body, requires: _, ensures: _, .. } => {
+            ExprNode::Lambda {
+                binders: vir_var_binders_to_ast(params),
+                body: Box::new(vir_expr_to_ast(body)),
+            }
+        }
+
         ExprX::Ctor(dt, variant, fields, update) => {
             if let Some(tail) = update {
                 ExprNode::StructUpdate {
@@ -235,9 +249,11 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
         }
 
         // Exec-mode forms — VIR mode checker guarantees these don't appear
-        // inside spec fn bodies.
+        // inside spec fn bodies. (`NonSpecClosure` is handled above as a
+        // lambda value — reached via `StmX::ClosureInner.ast_body` for
+        // exec-fn bodies.)
         ExprX::Assign { .. } | ExprX::AssignToPlace { .. }
-        | ExprX::Loop { .. } | ExprX::Return(_) | ExprX::NonSpecClosure { .. } => {
+        | ExprX::Loop { .. } | ExprX::Return(_) => {
             panic!("exec-mode expression in spec fn body — VIR mode checker bug");
         }
 

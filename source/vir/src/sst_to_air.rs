@@ -2573,7 +2573,7 @@ fn stm_to_stmts(ctx: &Ctx, state: &mut State, stm: &Stm) -> Result<Vec<Stmt>, Vi
             }
             stmts
         }
-        StmX::ClosureInner { body, typ_inv_vars } => {
+        StmX::ClosureInner { body, typ_inv_vars, ast_body: _ } => {
             let mut stmts = vec![];
             for (x, typ) in typ_inv_vars.iter() {
                 let typ_inv = typ_invariant(ctx, typ, &ident_var(&suffix_local_unique_id(x)));

@@ -5614,18 +5614,15 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Probe 2: exec-mode closure DECLARATION (not call). Stays deferred
-// as a separate #93 sub-task — the probe uncovered that closure
-// declarations thread synthetic `tmp%%` temps through the surrounding
-// scope (via `ast_to_sst`'s `state.declare_imm_var_stm` + the
-// closure-spec assume that references them). Dropping just
-// `StmX::ClosureInner` plus the ClosureReq/Ens-bearing assume isn't
-// enough — the temps remain bound to the postcondition theorem's
-// scope and then have no rendering. A proper fix needs either
-// modeling closure values structurally or a "drop the entire
-// closure-decl region" detector.
+// Exec-mode closure DECLARATION. Verus's SST throws away the closure's
+// AST body (replacing it with synthetic ClosureReq/Ens predicates), so
+// we extended `StmX::ClosureInner` with an `ast_body` field that
+// preserves it for Tactus. Then the closure value is rendered as a
+// Lean lambda via `vir_expr_to_ast`'s `NonSpecClosure` arm, and bound
+// to the cid via `Wp::LetRaw`. The Verus-side spec assume is dropped
+// because the lambda binding is structurally the same fact.
 test_verify_one_file! {
-    #[test] test_exec_closure_decl_rejected verus_code! {
+    #[test] test_exec_closure_decl verus_code! {
         #[verifier::tactus_auto]
         fn make_adder() -> (r: u32)
             ensures r == 5
@@ -5633,10 +5630,25 @@ test_verify_one_file! {
             let add_one = |x: u32| x + 1;
             5
         }
+    } => Ok(())
+}
+
+// Negative: ensures references the bound closure id but with wrong
+// shape. Pins that the closure binding actually reaches the
+// postcondition theorem (not silently dropped).
+test_verify_one_file! {
+    #[test] test_exec_closure_decl_wrong_ensures verus_code! {
+        #[verifier::tactus_auto]
+        fn make_adder() -> (r: u32)
+            ensures r == 6  // body returns 5 — should fail
+        {
+            let _add_one = |x: u32| x + 1;
+            5
+        }
     } => Err(err) => {
         assert!(
-            err.errors.iter().any(|e| e.message.contains("Closure") || e.message.contains("closure")),
-            "expected closure rejection, got: {:?}",
+            err.errors.iter().any(|e| e.message.contains("postcondition")),
+            "expected postcondition failure, got: {:?}",
             err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
         );
     }

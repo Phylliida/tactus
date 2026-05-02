@@ -660,15 +660,76 @@ fn is_synthetic_resolution_assume(e: &Expr) -> bool {
     }
 }
 
+/// Extract `(cid, lambda)` from the AST body of an exec closure
+/// (`ExprX::NonSpecClosure`). The cid comes from `external_spec`
+/// (populated by `ast_simplify`); the lambda is rendered via
+/// `vir_expr_to_ast`'s extended `NonSpecClosure` arm. Returns `Err`
+/// if the AST shape is unexpected (e.g., `external_spec` missing —
+/// shouldn't happen for code that reaches the SST).
+fn closure_lambda_from_ast(
+    ast_body: &Expr,
+) -> Result<(crate::lean_name::LeanName, LExpr), String> {
+    let (cid, _cexpr) = match &ast_body.x {
+        ExprX::NonSpecClosure { external_spec, .. } => {
+            external_spec.as_ref().ok_or_else(|| {
+                "closure's `external_spec` is None at SST time — \
+                 should have been populated by ast_simplify".to_string()
+            })?
+        }
+        _ => return Err(format!(
+            "StmX::ClosureInner.ast_body wasn't an ExprX::NonSpecClosure (got {:?}) — \
+             internal bug: ast_to_sst should only set ast_body to the closure expr",
+            ast_body.typ
+        )),
+    };
+    let cid_name = crate::lean_name::LeanName::from_var_ident(cid);
+    let lambda = vir_expr_to_ast(ast_body);
+    Ok((cid_name, lambda))
+}
+
 /// SST-side equivalent of `is_synthetic_resolution_assume`. The
 /// `Assume` SST statement carries an `Exp` (not an `Expr`) — same
 /// shape, different Rust type — so we mirror the recognition here.
+///
+/// Also recognizes closure-spec assumes (#93). Verus's `ast_to_sst`
+/// emits an `Assume(forall|x| ClosureReq(cid, x) ↔ ... ∧
+/// ClosureEns(cid, x, body(x)) ↔ ...)` after each `StmX::ClosureInner`
+/// to teach Z3 about the closure's spec via predicates. Tactus binds
+/// `cid` to a Lean lambda directly (see `StmX::ClosureInner` handler),
+/// so the predicate-style assume is structurally redundant. We
+/// recognize it by walking the expression tree for a `ClosureReq` /
+/// `ClosureEns` / `DefaultEns` `InternalFun` reference — these don't
+/// appear in user-written code, so any expression containing one is
+/// synthetic.
 fn is_synthetic_resolution_exp(e: &Exp) -> bool {
     match &e.x {
         ExpX::UnaryOpr(UnaryOpr::HasResolved(_), _) => true,
         ExpX::Binary(BinaryOp::Implies, _lhs, rhs) => is_synthetic_resolution_exp(rhs),
-        _ => false,
+        _ => contains_closure_internal_fn(e),
     }
+}
+
+/// True if `e` references one of Verus's closure-spec `InternalFun`
+/// variants anywhere in its tree. A whole-tree walk is the simplest
+/// predicate — the closure-spec assume is densely shaped around these
+/// calls (and uses `forall` + `Bind(Let)` for synthetic temps), so we
+/// can't easily pattern-match the whole shape.
+fn contains_closure_internal_fn(e: &Exp) -> bool {
+    let mut found = false;
+    let _ = vir::sst_visitor::map_exp_visitor(e, &mut |inner: &Exp| {
+        if let ExpX::Call(
+            CallFun::InternalFun(
+                InternalFun::ClosureReq | InternalFun::ClosureEns | InternalFun::DefaultEns,
+            ),
+            _,
+            _,
+        ) = &inner.x
+        {
+            found = true;
+        }
+        inner.clone()
+    });
+    found
 }
 
 /// Format a `Span` for a user-facing diagnostic. Prefers the
@@ -925,6 +986,14 @@ fn walk_obligations<'a>(
         }
         Wp::Let(name, val, body) => {
             walk_let(name, val.raw(), body, ctx, obl, e);
+        }
+        Wp::LetRaw { name, value, body } => {
+            // Pre-rendered RHS — push the Let frame directly. No need
+            // to re-validate or to fork on value-position ifs (the
+            // closure case that produces this doesn't have if-shaped
+            // RHSs by construction).
+            let new_obl = obl.with_frame(CtxFrame::Let(name.clone(), value.clone()));
+            walk_obligations(body, ctx, &new_obl, e);
         }
         Wp::Branch { cond, then_branch, else_branch } => {
             // Each branch walks under its own hypothesis (cond / ¬cond).
@@ -2227,6 +2296,18 @@ enum Wp<'a> {
     /// if.
     Let(crate::lean_name::LeanName, crate::to_lean_sst_expr::Validated<'a>, Box<Wp<'a>>),
 
+    /// Like `Let`, but the RHS is an already-rendered `LExpr` rather
+    /// than an SST `Exp`. Used by `StmX::ClosureInner` to bind the
+    /// closure id to a Lean lambda — the lambda's body comes from the
+    /// preserved AST (`StmX::ClosureInner.ast_body`), which doesn't go
+    /// through SST's renderer. Walker pushes a `CtxFrame::Let` frame
+    /// directly without revalidating.
+    LetRaw {
+        name: crate::lean_name::LeanName,
+        value: LExpr,
+        body: Box<Wp<'a>>,
+    },
+
     /// Obligation: prove `P`, then `body` proceeds with `P` as a
     /// hypothesis. Walker emits one theorem per `Wp::Assert`.
     Assert(crate::to_lean_sst_expr::Validated<'a>, Box<Wp<'a>>),
@@ -2840,15 +2921,32 @@ fn build_wp<'a>(
              lands. Workaround: extract the invariant-opening logic into a \
              non-tactus_auto fn (Verus's Z3 path handles it).".to_string()
         ),
-        StmX::ClosureInner { .. } => Err(
-            "exec closure declarations not yet supported (#93). Probe for the \
-             closure-decl encoding hit a deeper issue: Verus's `ast_to_sst` \
-             threads synthetic `tmp%%` temps through the closure-spec assume's \
-             surrounding scope, and dropping just `ClosureInner` + the \
-             ClosureReq/Ens-bearing assume leaves dangling `Var(tmp%%)` \
-             references in the postcondition theorem's binder list. Workaround: \
-             extract the closure into a named fn and call it directly.".to_string()
-        ),
+        // Exec-mode closure declaration. Verus's SST decomposed the
+        // user's `let f = |x| body` into:
+        //   1. `StmX::ClosureInner { body: <body's verification scope>,
+        //      ast_body: <preserved AST closure expression> }`
+        //   2. A subsequent `StmX::Assume(<closure's external spec —
+        //      forall|x| ClosureReq(cid, x) ↔ ... + ClosureEns ↔ ...>)`
+        //   3. A subsequent reference to `Var(cid)` as the closure value.
+        //
+        // For Lean we want the closure to be a first-class function
+        // value. We use the preserved AST `ast_body` (the
+        // `ExprX::NonSpecClosure { params, body, external_spec, ... }`)
+        // to render a Lean lambda, then bind `cid` to it via
+        // `Wp::LetRaw`. The synthetic spec assume in (2) is dropped
+        // because the binding in (1) is structurally the same fact.
+        // The closure body's own verification (overflow checks etc.)
+        // currently isn't emitted as a theorem — `body` is skipped, so
+        // the closure body is trusted. (#93 follow-up: emit the
+        // closure body as its own dead-end theorem.)
+        StmX::ClosureInner { body: _, typ_inv_vars: _, ast_body } => {
+            let (cid, lambda) = closure_lambda_from_ast(ast_body)?;
+            Ok(Wp::LetRaw {
+                name: cid,
+                value: lambda,
+                body: Box::new(after),
+            })
+        }
     }
 }
 
