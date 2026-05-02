@@ -4721,4 +4721,142 @@ mod tests {
             err
         );
     }
+
+    // ── #114 follow-up coverage: Wp::Hyp + 3-level lex ────────────
+    //
+    // Two regression-test gaps surfaced by the post-#114 review pass
+    // (P2 findings; this is the follow-up that closes them):
+    //
+    // 1. `Wp::Hyp` walker arm — covered end-to-end via #114's
+    //    cond_setup transform but no direct unit test. Pin that the
+    //    walker pushes the LExpr as a CtxFrame::Hyp (vs. ignoring it
+    //    or wrapping wrong).
+    //
+    // 2. `lex_decrease_obligation` recursion at depth ≥ 3 — #110's
+    //    e2e tests cover 2-level lex; the recursive structure is
+    //    correct by induction but a 3-level test pins the depth.
+
+    /// Minimal `ObligationEmitter` for tests. The default closer is
+    /// `tactus_auto`; tests inspecting emitted theorems can ignore
+    /// the closer field.
+    fn mk_test_emitter() -> ObligationEmitter {
+        ObligationEmitter {
+            fn_name: "test_fn".to_string(),
+            base_binders: Vec::new(),
+            counter: 0,
+            out: Vec::new(),
+            tactic_prefix: Vec::new(),
+            default_closer: crate::lean_ast::Tactic::Named("tactus_auto".to_string()),
+        }
+    }
+
+    #[test]
+    fn wp_hyp_walker_wraps_done_leaf_with_hyp_frame() {
+        // Wp::Hyp { hyp: p, body: Wp::Done(q) }
+        // Walker pushes CtxFrame::Hyp(p), then walks body (Done) →
+        // emits one theorem whose wrapped goal contains `p → q`.
+        let p = LExpr::var_lit("p_test_hyp");
+        let q = LExpr::var_lit("q_test_done");
+        let wp = Wp::Hyp {
+            hyp: p.clone(),
+            body: Box::new(Wp::Done(q.clone())),
+        };
+        let ctx = mk_test_ctx();
+        let mut emitter = mk_test_emitter();
+        walk_obligations(&wp, &ctx, &OblCtx::new(), &mut emitter);
+
+        assert_eq!(emitter.out.len(), 1,
+            "expected exactly one theorem emitted from Wp::Done leaf");
+        let theorem = &emitter.out[0];
+        let printed = crate::lean_pp::pp_expr(
+            &crate::lean_ast::strip_span_marks(&theorem.goal),
+        );
+        // After wrap: the Hyp frame becomes `p_test_hyp → ...` and
+        // the Done leaf is `q_test_done`. The printer renders `→`
+        // explicitly; both names should appear.
+        assert!(printed.contains("p_test_hyp"),
+            "expected hyp `p_test_hyp` in goal; got: {}", printed);
+        assert!(printed.contains("q_test_done"),
+            "expected leaf `q_test_done` in goal; got: {}", printed);
+        assert!(printed.contains("→"),
+            "expected `→` (implication from hyp); got: {}", printed);
+    }
+
+    #[test]
+    fn wp_hyp_walker_passes_through_with_no_body_obligations() {
+        // If body is Wp::Done(true), the walker still emits one
+        // theorem (the Done leaf) — the Hyp's only effect is to
+        // appear in the wrapped goal. No silent dropping.
+        let hyp = LExpr::var_lit("just_a_hyp");
+        let wp = Wp::Hyp {
+            hyp,
+            body: Box::new(Wp::Done(LExpr::lit_true())),
+        };
+        let ctx = mk_test_ctx();
+        let mut emitter = mk_test_emitter();
+        walk_obligations(&wp, &ctx, &OblCtx::new(), &mut emitter);
+        assert_eq!(emitter.out.len(), 1,
+            "Wp::Hyp wrapping Done(True) emits one theorem (Done's)");
+    }
+
+    /// Construct a `DecreaseLevel` for tests with a synthetic Var
+    /// expression and a custom d_old name.
+    fn mk_decrease_level(value_var: &str, typ: Typ, d_old_name: &str) -> DecreaseLevel<'static> {
+        // Leak the Exp to give it 'static lifetime — fine for tests
+        // since we don't care about reclamation. The Validated
+        // borrow is from the leaked allocation.
+        let exp: &'static Exp = Box::leak(Box::new(var_exp(value_var, typ)));
+        let value = crate::to_lean_sst_expr::Validated::check(exp)
+            .expect("test fixture: synthetic var should validate");
+        DecreaseLevel { value, d_old_name: d_old_name.to_string() }
+    }
+
+    #[test]
+    fn lex_decrease_obligation_three_levels_recurses_correctly() {
+        // 3-level lex `decreases a, b, c`. Verify the obligation has
+        // the expected shape:
+        //   (a < a_old) ∨ (a = a_old ∧ ((b < b_old) ∨ (b = b_old ∧ c < c_old)))
+        let levels = vec![
+            mk_decrease_level("a", typ_int(), "a_old_test"),
+            mk_decrease_level("b", typ_int(), "b_old_test"),
+            mk_decrease_level("c", typ_int(), "c_old_test"),
+        ];
+        let result = lex_decrease_obligation(&levels);
+        let printed = crate::lean_pp::pp_expr(&result);
+
+        // All three (cur, old) pairs should appear.
+        for s in &["a", "b", "c", "a_old_test", "b_old_test", "c_old_test"] {
+            assert!(printed.contains(s),
+                "expected `{}` in 3-level lex obligation; got: {}", s, printed);
+        }
+        // Two `∨` (one per non-base level — the base just emits `<`).
+        let or_count = printed.matches('∨').count();
+        assert_eq!(or_count, 2,
+            "3-level lex should have 2 disjunctions (one per non-base level); got {}: {}",
+            or_count, printed);
+        // Two `=` from the equality-falls-through arms (one per
+        // non-base level), plus possibly more from sub-expressions.
+        // Just require ≥ 2.
+        let eq_count = printed.matches('=').count();
+        assert!(eq_count >= 2,
+            "3-level lex should have ≥ 2 `=`s (equality-falls-through); got {}: {}",
+            eq_count, printed);
+    }
+
+    #[test]
+    fn lex_decrease_obligation_single_level_collapses_to_lt() {
+        // Single-level case: just `cur < old`. The lex tail
+        // `(cur = old ∧ False)` collapses (recursion's base is
+        // structurally absent for len 1), so we emit just lt.
+        let levels = vec![
+            mk_decrease_level("d", typ_int(), "d_old_test"),
+        ];
+        let result = lex_decrease_obligation(&levels);
+        let printed = crate::lean_pp::pp_expr(&result);
+        assert!(printed.contains("d") && printed.contains("d_old_test"),
+            "expected both `d` and `d_old_test` in single-level obligation; got: {}",
+            printed);
+        assert!(!printed.contains('∨'),
+            "single-level should have NO disjunction; got: {}", printed);
+    }
 }
