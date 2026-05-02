@@ -995,6 +995,20 @@ fn walk_obligations<'a>(
             let new_obl = obl.with_frame(CtxFrame::Let(name.clone(), value.clone()));
             walk_obligations(body, ctx, &new_obl, e);
         }
+        Wp::ClosureBody { closure_params, body, after } => {
+            // Walk the closure body under `∀ p : T, h_p_bound → ...`
+            // for each closure param. Theorems emitted from inside
+            // the body (overflow checks, the closure's own ensures-
+            // asserting, etc.) inherit those binders via the OblCtx,
+            // so they verify against any caller-supplied input
+            // satisfying the type bounds.
+            let mut closure_obl = obl.clone();
+            push_mod_var_frames(&mut closure_obl, closure_params);
+            walk_obligations(body, ctx, &closure_obl, e);
+            // Continue with `after` under the original obl — the
+            // closure params don't escape the closure scope.
+            walk_obligations(after, ctx, obl, e);
+        }
         Wp::Branch { cond, then_branch, else_branch } => {
             // Each branch walks under its own hypothesis (cond / ¬cond).
             // The Wp tree clones `after` into both branches at build
@@ -2308,6 +2322,20 @@ enum Wp<'a> {
         body: Box<Wp<'a>>,
     },
 
+    /// Closure body verification scope (#93). Walks `body` under
+    /// `∀ p : T, h_p_bound → ...` binders for each closure param,
+    /// then walks `after` under the original obl. The body is its
+    /// own dead-end — its theorems are emitted (overflow checks
+    /// inside the closure body, the closure's own ensures, etc.)
+    /// but its terminator doesn't carry through; the surrounding
+    /// fn's flow continues with `after` unchanged. Created from
+    /// `StmX::ClosureInner` in `build_wp`.
+    ClosureBody {
+        closure_params: Vec<(&'a VarIdent, &'a Typ)>,
+        body: Box<Wp<'a>>,
+        after: Box<Wp<'a>>,
+    },
+
     /// Obligation: prove `P`, then `body` proceeds with `P` as a
     /// hypothesis. Walker emits one theorem per `Wp::Assert`.
     Assert(crate::to_lean_sst_expr::Validated<'a>, Box<Wp<'a>>),
@@ -2924,6 +2952,7 @@ fn build_wp<'a>(
         // Exec-mode closure declaration. Verus's SST decomposed the
         // user's `let f = |x| body` into:
         //   1. `StmX::ClosureInner { body: <body's verification scope>,
+        //      typ_inv_vars: <closure params + their types>,
         //      ast_body: <preserved AST closure expression> }`
         //   2. A subsequent `StmX::Assume(<closure's external spec —
         //      forall|x| ClosureReq(cid, x) ↔ ... + ClosureEns ↔ ...>)`
@@ -2935,16 +2964,41 @@ fn build_wp<'a>(
         // to render a Lean lambda, then bind `cid` to it via
         // `Wp::LetRaw`. The synthetic spec assume in (2) is dropped
         // because the binding in (1) is structurally the same fact.
-        // The closure body's own verification (overflow checks etc.)
-        // currently isn't emitted as a theorem — `body` is skipped, so
-        // the closure body is trusted. (#93 follow-up: emit the
-        // closure body as its own dead-end theorem.)
-        StmX::ClosureInner { body: _, typ_inv_vars: _, ast_body } => {
+        //
+        // The closure body's own verification (overflow checks inside
+        // the closure body's arithmetic, the closure's own ensures,
+        // etc.) is emitted as a separate scope via `Wp::ClosureBody`:
+        // its theorems get `∀ p : T, h_p_bound → ...` for each closure
+        // param. Without this, a closure body containing a soundness
+        // gap (`|x: u8| x + 200` overflows when called with x ≥ 56)
+        // would be silently accepted.
+        StmX::ClosureInner { body, typ_inv_vars, ast_body } => {
             let (cid, lambda) = closure_lambda_from_ast(ast_body)?;
-            Ok(Wp::LetRaw {
-                name: cid,
-                value: lambda,
-                body: Box::new(after),
+            // Build the body's Wp with `Done(True)` as a no-op
+            // terminator — the closure body's own ensures-asserting
+            // happens via `closure_emit_postconditions`-injected
+            // asserts inside `body`, so there's no fn-exit obligation.
+            let body_wp = build_wp(
+                body,
+                Wp::Done(LExpr::lit_bool(true)),
+                ctx,
+                loop_stack,
+            )?;
+            // Convert typ_inv_vars to (`&VarIdent`, `&Typ`) form
+            // for `push_mod_var_frames` (same shape it takes for
+            // loop modified-vars).
+            let closure_params: Vec<(&VarIdent, &Typ)> = typ_inv_vars
+                .iter()
+                .map(|(uid, typ)| (uid, typ))
+                .collect();
+            Ok(Wp::ClosureBody {
+                closure_params,
+                body: Box::new(body_wp),
+                after: Box::new(Wp::LetRaw {
+                    name: cid,
+                    value: lambda,
+                    body: Box::new(after),
+                }),
             })
         }
     }
