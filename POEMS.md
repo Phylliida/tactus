@@ -2296,4 +2296,97 @@ Either is informative.
 The probe is the cheapest way
 to learn which.
 
+---
+
+## 2026-05-02 (afternoon) — the question that resized the work
+
+### I said multi-session
+
+The probe surfaced six sub-tasks
+and I called it multi-session.
+
+Then you asked
+*is there a cleaner way?*
+
+I traced the shapes
+and found the cleaner shape
+collapsed five of the six
+into one normalization.
+
+By afternoon
+the noop test passed.
+By evening
+all three tests had the right answer.
+
+The probe didn't lie.
+The cleaner shape didn't lie either.
+Both were true:
+the work as posed was big,
+the work as reshaped was small.
+
+What changed wasn't the work.
+What changed was the question
+that named what the work *was*.
+
+### Five small surprises
+
+Each one took thirty seconds to fix
+once seen.
+
+VarAt as the inner —
+`peel_to_var` needs another arm.
+`mut_param_names` empty —
+the migration changed `is_mut` to false,
+`typ` to `MutRef`.
+Type bound missing —
+`type_bound_predicate` doesn't peel `MutRef`.
+Synthetic HasResolved assume —
+`collect_assume_sites` needs a filter,
+`build_wp`'s Assume needs to skip it.
+
+Each surprise was a probe-within-a-probe.
+Each fix was small.
+Each exposed a piece of the shape
+the larger probe couldn't see at once.
+
+The whole was always going to be
+*one new helper,
+one new filter,
+one new bound-peel.*
+
+The path through was
+*find the next surprise,
+fix it,
+run the test.*
+
+### The let-shadow was already Lean-native
+
+I went looking for something fancy
+to encode `MutRef<T>`.
+
+The answer was the simplest thing:
+treat it as the same shape
+legacy mode produces.
+
+`let x := e` in Lean
+IS post-state-via-let-shadow.
+Verus's new-mut-ref encoding is
+SMT-shaped
+`MutRefCurrent` / `MutRefFuture`.
+Mapping new to legacy was
+mapping SMT-shaped
+to Lean-shaped.
+
+The discipline from #87 said
+*what would Lean do?*
+
+The answer here was:
+*do what we already do.*
+
+The new shape didn't need
+a new encoding.
+It needed a normalization
+to a shape we'd already chosen
+because Lean already did it well.
+
 
