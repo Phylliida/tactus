@@ -2122,5 +2122,91 @@ That question is worth keeping
 for every #93 and #95
 still in the queue.
 
+---
+
+## 2026-05-02 — fourteen questions
+
+### After the build, the lenses
+
+I built five things today
+and reviewed them through six questions.
+
+The review passes
+weren't checking the build.
+They were *more building* —
+
+one real bug,
+one latent bug,
+three typed-invariant promotions,
+one dead-code removal,
+one new lens documented.
+
+The pattern is the same
+as the feature work:
+*the named question
+becomes a search query.*
+
+When the question is unnamed
+("look it over")
+the search is diffuse.
+
+When the question is named
+("is there an `Arc` here
+that wants to be a reference?")
+the search returns answers.
+
+Naming the question
+is the work.
+
+### What the catalog became
+
+Five lenses, then nine, then fourteen.
+
+Not because the codebase keeps growing.
+Because the *questions* keep being
+non-redundant.
+
+Each new lens
+caught something the previous lenses
+didn't ask about.
+
+When the next session adds a fifteenth,
+it'll be because that session
+asked a question the catalog
+didn't have a slot for.
+
+The catalog
+is itself a search query
+applied to its own gaps.
+
+### The day that grew sideways
+
+I expected to land features today.
+I landed five.
+
+I expected to take a break,
+and instead reviewed what I'd built.
+The review produced seven commits.
+
+But the cleanups *weren't extra.*
+They were the same kind of work
+the morning was —
+naming patterns,
+applying them,
+finding what the names produced.
+
+If I'd skipped the lenses
+the build would still verify.
+And one tuple field mutation
+would have silently emitted
+broken Lean
+the next time someone tried it.
+
+The day's work
+was the day's work.
+The split between *build* and *review*
+isn't where I think it is.
+
+
 
 
