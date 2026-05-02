@@ -343,7 +343,7 @@ impl<'a> WpCtx<'a> {
                 Ok(LExpr::span_mark(
                     format_rust_loc(&ens.span),
                     AssertKind::Obligation(ObligationKind::Postcondition),
-                    lower_validated(Validated::check(&rewritten)?),
+                    lower_validated(&Validated::check(&rewritten)?),
                 ))
             }).collect::<Result<Vec<_>, String>>()?
         );
@@ -1039,7 +1039,7 @@ fn walk_obligations<'a>(
             let asserted_exp = asserted.raw();
             let kind = detect_assert_kind(asserted_exp);
             let loc = format_rust_loc(&asserted_exp.span);
-            let cond_ast = lower_validated(*asserted);
+            let cond_ast = lower_validated(asserted);
             let goal = LExpr::span_mark(loc.clone(), kind, cond_ast.clone());
             let id = e.next_id();
             let name = build_theorem_name(
@@ -1054,7 +1054,7 @@ fn walk_obligations<'a>(
         }
         Wp::Assume(p, body) => {
             // No theorem; the assumption just enters the context.
-            let new_obl = obl.with_frame(CtxFrame::Hyp(lower_validated(*p)));
+            let new_obl = obl.with_frame(CtxFrame::Hyp(lower_validated(p)));
             walk_obligations(body, ctx, &new_obl, e);
         }
         Wp::Let(name, val, body) => {
@@ -1095,7 +1095,7 @@ fn walk_obligations<'a>(
             let cond_marked = LExpr::span_mark(
                 format_rust_loc(&cond.raw().span),
                 AssertKind::Hypothesis(HypothesisKind::BranchCondition),
-                lower_validated(*cond),
+                lower_validated(cond),
             );
             walk_obligations(
                 then_branch, ctx,
@@ -1115,11 +1115,11 @@ fn walk_obligations<'a>(
         }
         Wp::Loop { cond, invs, validated_invs, inv_kinds, decrease, modified_vars, body, after, d_old_names } => {
             walk_loop(
-                *cond, invs, validated_invs, inv_kinds, decrease, modified_vars, body, after, d_old_names, ctx, obl, e,
+                cond.clone(), invs, validated_invs, inv_kinds, decrease, modified_vars, body, after, d_old_names, ctx, obl, e,
             );
         }
         Wp::AssertByTactus { cond, tactic_text, body } => {
-            walk_assert_by_tactus(*cond, tactic_text, body, ctx, obl, e);
+            walk_assert_by_tactus(cond.clone(), tactic_text, body, ctx, obl, e);
         }
     }
 }
@@ -1142,7 +1142,7 @@ fn walk_obligations<'a>(
 ///   := by ...` lines then introduce named hypotheses scoped to
 ///   each subsequent theorem (option (a) from the D plan).
 fn walk_assert_by_tactus<'a>(
-    cond: Option<Validated<'a>>,
+    cond: Option<Validated>,
     tactic_text: &str,
     body: &Wp<'a>,
     ctx: &WpCtx<'a>,
@@ -1166,7 +1166,7 @@ fn walk_assert_by_tactus<'a>(
             // `assert(P) by { tac }` — same kind a plain
             // `assert(P)` would get via `detect_assert_kind`.
             let loc = format_rust_loc(&c.raw().span);
-            let cond_ast = lower_validated(c);
+            let cond_ast = lower_validated(&c);
             let goal = LExpr::span_mark(
                 loc.clone(), AssertKind::Obligation(ObligationKind::Plain), cond_ast.clone(),
             );
@@ -1292,11 +1292,11 @@ fn build_theorem_name(kind_label: &str, fn_name: &str, loc: &str, id: usize) -> 
 /// * **Use**: walk `after` in use ctx (∀ mod_vars + bounds +
 ///   invs as hyps + ¬cond as hyp).
 fn walk_loop<'a>(
-    cond: Option<Validated<'a>>,
+    cond: Option<Validated>,
     invs: &[LoopInv],
-    validated_invs: &[Validated<'a>],
+    validated_invs: &[Validated],
     inv_kinds: &[LoopInvKind],
-    decrease: &[Validated<'a>],
+    decrease: &[Validated],
     modified_vars: &[(&'a VarIdent, &'a Typ)],
     body: &Wp<'a>,
     after: &Wp<'a>,
@@ -1314,12 +1314,12 @@ fn walk_loop<'a>(
     // Plain `invariant P` (at_entry = at_exit = true) flows into
     // both. `invariant_except_break` (at_entry only) and loop
     // `ensures` (at_exit only) flow into one each.
-    let inv_marked = |(i, v): (&LoopInv, &Validated<'a>)| LExpr::span_mark(
+    let inv_marked = |(i, v): (&LoopInv, &Validated)| LExpr::span_mark(
         format_rust_loc(&i.inv.span),
         AssertKind::Obligation(ObligationKind::LoopInvariant),
-        lower_validated(*v),
+        lower_validated(v),
     );
-    let cond_marked = |c: Validated<'a>| LExpr::span_mark(
+    let cond_marked = |c: &Validated| LExpr::span_mark(
         format_rust_loc(&c.raw().span),
         AssertKind::Hypothesis(HypothesisKind::LoopCondition),
         lower_validated(c),
@@ -1358,7 +1358,7 @@ fn walk_loop<'a>(
     let mut maintain_obl = obl.clone();
     push_mod_var_frames(&mut maintain_obl, modified_vars);
     maintain_obl.frames.push(CtxFrame::Hyp(entry_inv_conj_marked));
-    if let Some(c) = cond {
+    if let Some(c) = cond.as_ref() {
         maintain_obl.frames.push(CtxFrame::Hyp(cond_marked(c)));
     }
     // `let _tactus_d_old_<id>_<i> := D_i` — one pre-body snapshot
@@ -1372,7 +1372,7 @@ fn walk_loop<'a>(
     for (level, name) in d_old_names.iter().enumerate() {
         maintain_obl.frames.push(CtxFrame::Let(
             crate::lean_name::LeanName::synthetic(name.clone()),
-            lower_validated(decrease[level]),
+            lower_validated(&decrease[level]),
         ));
     }
     walk_obligations(body, ctx, &maintain_obl, e);
@@ -1392,7 +1392,7 @@ fn walk_loop<'a>(
     let mut use_obl = obl.clone();
     push_mod_var_frames(&mut use_obl, modified_vars);
     use_obl.frames.push(CtxFrame::Hyp(exit_inv_conj_marked));
-    if let Some(c) = cond {
+    if let Some(c) = cond.as_ref() {
         use_obl.frames.push(CtxFrame::Hyp(LExpr::not(cond_marked(c))));
     }
     walk_obligations(after, ctx, &use_obl, e);
@@ -1759,7 +1759,7 @@ fn normalize_mut_ref_in_stm(
 fn walk_call<'a>(
     callee: &FunctionX,
     spec_callee: &FunctionX,
-    args: &[Validated<'a>],
+    args: &[Validated],
     typ_args: &[Typ],
     dest: Option<&VarIdent>,
     call_span: &Span,
@@ -1940,7 +1940,7 @@ fn build_call_substitutions<'a>(
     callee: &FunctionX,
     spec_callee: &FunctionX,
     typ_args: &[Typ],
-    args: &[Validated<'a>],
+    args: &[Validated],
     mut_args_raw: &[(usize, MutTargetRaw<'a>)],
     e: &mut ObligationEmitter,
 ) -> CallSubstitutions<'a> {
@@ -1958,7 +1958,7 @@ fn build_call_substitutions<'a>(
     // arg shapes, so the rendered form is the caller-side variable
     // reference (the pre-call value).
     let arg_lexprs: Vec<LExpr> =
-        args.iter().map(|a| lower_validated(*a)).collect();
+        args.iter().map(|a| lower_validated(a)).collect();
 
     // One MutArgInfo per `&mut` arg — bundles param_idx, target
     // (the L-value shape, post-#87), and the gensym'd fresh post-
@@ -2222,7 +2222,7 @@ fn walk_let<'a>(
     obl: &OblCtx,
     e: &mut ObligationEmitter,
 ) {
-    // `val` was validated upstream: `Wp::Let.value: Validated<'a>`,
+    // `val` was validated upstream: `Wp::Let.value: Validated`,
     // and walk_let's caller (`walk_obligations` Wp::Let arm) extracts
     // `.raw()` from that witness. Sub-expressions (cond / branches /
     // inner_body / binder rhs) are valid by structural induction on
@@ -2404,7 +2404,7 @@ enum Wp<'a> {
     /// walks (with cond as a Hyp frame) so omega sees a clean
     /// goal in each branch instead of an opaque value-position
     /// if.
-    Let(crate::lean_name::LeanName, crate::to_lean_sst_expr::Validated<'a>, Box<Wp<'a>>),
+    Let(crate::lean_name::LeanName, crate::to_lean_sst_expr::Validated, Box<Wp<'a>>),
 
     /// Like `Let`, but the RHS is an already-rendered `LExpr` rather
     /// than an SST `Exp`. Used by `StmX::ClosureInner` to bind the
@@ -2434,11 +2434,11 @@ enum Wp<'a> {
 
     /// Obligation: prove `P`, then `body` proceeds with `P` as a
     /// hypothesis. Walker emits one theorem per `Wp::Assert`.
-    Assert(crate::to_lean_sst_expr::Validated<'a>, Box<Wp<'a>>),
+    Assert(crate::to_lean_sst_expr::Validated, Box<Wp<'a>>),
 
     /// Hypothesis: `body` proceeds with `P` as a hypothesis. No
     /// obligation; walker emits no theorem at this node.
-    Assume(crate::to_lean_sst_expr::Validated<'a>, Box<Wp<'a>>),
+    Assume(crate::to_lean_sst_expr::Validated, Box<Wp<'a>>),
 
     /// User-written Lean tactic inside a `tactus_auto` fn.
     ///
@@ -2453,7 +2453,7 @@ enum Wp<'a> {
     ///   `have h : P := by …` lines propagate as local
     ///   hypotheses to subsequent obligations.
     AssertByTactus {
-        cond: Option<crate::to_lean_sst_expr::Validated<'a>>,
+        cond: Option<crate::to_lean_sst_expr::Validated>,
         tactic_text: String,
         body: Box<Wp<'a>>,
     },
@@ -2463,7 +2463,7 @@ enum Wp<'a> {
     /// on `else_branch` with `¬cond`. No theorem at the branch
     /// node; each branch's sub-Wp produces its own theorems.
     Branch {
-        cond: crate::to_lean_sst_expr::Validated<'a>,
+        cond: crate::to_lean_sst_expr::Validated,
         then_branch: Box<Wp<'a>>,
         else_branch: Box<Wp<'a>>,
     },
@@ -2485,7 +2485,7 @@ enum Wp<'a> {
     /// None` the maintain ctx drops the `cond` hyp and the use
     /// ctx drops the `¬cond` hyp.
     Loop {
-        cond: Option<crate::to_lean_sst_expr::Validated<'a>>,
+        cond: Option<crate::to_lean_sst_expr::Validated>,
         /// The original invariant metadata (span). Iterated in parallel
         /// with `validated_invs` and `inv_kinds` for emission. The
         /// at_entry/at_exit booleans on `LoopInv` are NOT consulted
@@ -2495,7 +2495,7 @@ enum Wp<'a> {
         invs: &'a [LoopInv],
         /// Validated witnesses for each invariant's `inv` expression,
         /// in the same order as `invs`. Built at `build_wp_loop` time.
-        validated_invs: Vec<crate::to_lean_sst_expr::Validated<'a>>,
+        validated_invs: Vec<crate::to_lean_sst_expr::Validated>,
         /// Classification of each invariant — same order as `invs`.
         /// Replaces direct use of `LoopInv.at_entry` / `LoopInv.at_exit`
         /// with a typed enum that makes the meaningful states explicit
@@ -2510,7 +2510,7 @@ enum Wp<'a> {
         ///         ∨ (D2' = D2_old ∧ ... (Dn' < Dn_old)))
         /// which generalises the single-expression case
         /// (`(D1' < D1_old) ∨ (D1' = D1_old ∧ False) ≡ D1' < D1_old`).
-        decrease: Vec<crate::to_lean_sst_expr::Validated<'a>>,
+        decrease: Vec<crate::to_lean_sst_expr::Validated>,
         modified_vars: Vec<(&'a VarIdent, &'a Typ)>,
         body: Box<Wp<'a>>,
         after: Box<Wp<'a>>,
@@ -2549,7 +2549,7 @@ enum Wp<'a> {
         /// `callee.params`. Built at `build_wp_call` time; each
         /// arg is checked once and the witness is held here so
         /// `walk_call`'s lowering is type-system-infallible.
-        args: Vec<crate::to_lean_sst_expr::Validated<'a>>,
+        args: Vec<crate::to_lean_sst_expr::Validated>,
         /// Type arguments from the call site, one per `callee.typ_params`.
         /// `walk_call` uses these to substitute each `TypParam(id)` in
         /// the callee's require/ensure with the call site's concrete
@@ -3160,7 +3160,7 @@ fn build_wp_call<'a>(
     // CheckDecreaseHeight` right before each recursive call
     // (including mutual recursion across an SCC). `build_wp` sees it
     // as a plain `Wp::Assert`; `sst_exp_to_ast_checked` handles the lowering.
-    let validated_args: Vec<Validated<'a>> = args.iter()
+    let validated_args: Vec<Validated> = args.iter()
         .map(|a| Validated::check(a))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Wp::Call {
@@ -3504,18 +3504,44 @@ fn build_wp_loop<'a>(
     // check, so the maintain/use clauses don't need to gate on cond.
     // We accept both forms; break/continue in the body uses
     // `loop_ctx` to find the right leaf.
+    //
+    // **Non-empty cond_setup (#114):** Verus's `expr_to_stm_opt` may
+    // produce a `(setup_stmts, pure_expr)` pair when the user's cond
+    // has function calls, short-circuit `&&`/`||`, or other shapes
+    // that need temporaries. The setup runs at every iteration
+    // boundary (Verus's encoding mirrors this: it runs cond_setup in
+    // both the loop-body and outer SMT queries). We mirror Verus by
+    // walking cond_setup as a wp prefix in BOTH the body's Wp (under
+    // an `assume cond_exp` hyp) and the post-loop `after` Wp (under
+    // an `assume ¬cond_exp` hyp). When this transform fires, we set
+    // `cond_exp_opt = None` so walk_loop doesn't push the cond hyp
+    // again — it's already inside the body's wrapped Wp.
+    //
+    // The synthesised `¬cond_exp` Exp is owned (post-#114
+    // `Validated` no longer ties to a borrow lifetime; it owns the
+    // `Arc<Exp>`).
+    let mut cond_setup_wrap: Option<(&'a Stm, Validated, Validated)> = None;
     let cond_exp_opt = match cond {
         Some((cond_setup, cond_exp)) => {
-            if !matches!(&cond_setup.x, StmX::Block(ss) if ss.is_empty()) {
-                return Err(
-                    "loop condition has a setup-statement prelude (Verus lowers \
-                     complex `while` conditions into a small statement block + \
-                     pure expression). Tactus only handles the pure-expression \
-                     case today. Workaround: extract the condition's side-\
-                     effecting parts into a let-binding before the loop.".to_string()
-                );
+            let cond_validated = crate::to_lean_sst_expr::Validated::check(cond_exp)?;
+            if matches!(&cond_setup.x, StmX::Block(ss) if ss.is_empty()) {
+                // Empty setup — fast path; cond goes straight to walk_loop.
+                Some(cond_validated)
+            } else {
+                // Synthesise ¬cond_exp; build_wp on cond_setup will
+                // be done after we have the body Wp + after Wp to
+                // wrap. Stash the witnesses now.
+                let bool_typ = std::sync::Arc::new(vir::ast::TypX::Bool);
+                let neg_cond_exp = std::sync::Arc::new(vir::ast::SpannedTyped {
+                    span: cond_exp.span.clone(),
+                    typ: bool_typ,
+                    x: ExpX::Unary(UnaryOp::Not, cond_exp.clone()),
+                });
+                let neg_cond_validated =
+                    crate::to_lean_sst_expr::Validated::check(&neg_cond_exp)?;
+                cond_setup_wrap = Some((cond_setup, cond_validated, neg_cond_validated));
+                None  // walk_loop won't add cond hyp; the wrapper does.
             }
-            Some(crate::to_lean_sst_expr::Validated::check(cond_exp)?)
         }
         None => None,
     };
@@ -3543,13 +3569,13 @@ fn build_wp_loop<'a>(
     // asserts at_entry = at_exit = true (see sst_to_air.rs:2655),
     // so the split is trivial. For `cond: None` loops (the
     // break-lowered form), the flags can differ.
-    let validated_invs: Vec<crate::to_lean_sst_expr::Validated<'a>> = invs.iter()
+    let validated_invs: Vec<crate::to_lean_sst_expr::Validated> = invs.iter()
         .map(|inv| crate::to_lean_sst_expr::Validated::check(&inv.inv))
         .collect::<Result<Vec<_>, _>>()?;
     let inv_kinds: Vec<LoopInvKind> = invs.iter()
         .map(LoopInvKind::from_loop_inv)
         .collect::<Result<Vec<_>, _>>()?;
-    let validated_decrease: Vec<crate::to_lean_sst_expr::Validated<'a>> = decrease.iter()
+    let validated_decrease: Vec<crate::to_lean_sst_expr::Validated> = decrease.iter()
         .map(|d| crate::to_lean_sst_expr::Validated::check(d))
         .collect::<Result<Vec<_>, _>>()?;
     for d in decrease.iter() {
@@ -3587,10 +3613,10 @@ fn build_wp_loop<'a>(
     // independently folds into a marked conjunction; an empty list
     // folds to `True` (handled by `and_all`), which is harmless as
     // a hypothesis or trivially-provable as a Done leaf.
-    let inv_marked = |(i, v): (&LoopInv, &crate::to_lean_sst_expr::Validated<'a>)| LExpr::span_mark(
+    let inv_marked = |(i, v): (&LoopInv, &crate::to_lean_sst_expr::Validated)| LExpr::span_mark(
         format_rust_loc(&i.inv.span),
         AssertKind::Obligation(ObligationKind::LoopInvariant),
-        crate::to_lean_sst_expr::lower(*v),
+        crate::to_lean_sst_expr::lower(v),
     );
     let entry_inv_conj = and_all(
         invs.iter().zip(validated_invs.iter()).zip(inv_kinds.iter())
@@ -3639,6 +3665,28 @@ fn build_wp_loop<'a>(
     inner_stack.extend_from_slice(outer_loop_stack);
     let body_wp = build_wp(body, Wp::Done(continue_leaf), ctx, &inner_stack)?;
 
+    // Apply the non-empty cond_setup transform if needed (#114).
+    // Wraps body_wp with `cond_setup; assume cond_exp; ...` and the
+    // post-loop `after` with `cond_setup; assume ¬cond_exp; ...`.
+    // Mirrors Verus's two-query encoding (sst_to_air.rs:2789-2797 +
+    // 2730-2737): cond_setup runs at every iteration boundary AND at
+    // loop exit. Setup obligations (e.g., precondition checks for
+    // calls inside the cond) emit twice — correct per Verus.
+    let (body_wp, after) = match cond_setup_wrap {
+        None => (body_wp, after),
+        Some((cond_setup, cond_validated, neg_cond_validated)) => {
+            let body_with_assume = Wp::Assume(cond_validated, Box::new(body_wp));
+            let body_wp_full = build_wp(
+                cond_setup, body_with_assume, ctx, &inner_stack,
+            )?;
+            let after_with_assume = Wp::Assume(neg_cond_validated, Box::new(after));
+            let after_wp_full = build_wp(
+                cond_setup, after_with_assume, ctx, outer_loop_stack,
+            )?;
+            (body_wp_full, after_wp_full)
+        }
+    };
+
     Ok(Wp::Loop {
         cond: cond_exp_opt,
         invs: &invs[..],
@@ -3658,13 +3706,13 @@ fn build_wp_loop<'a>(
 /// next level. Empty input is a contract violation (rejected upstream
 /// in `build_wp_loop`).
 fn lex_decrease_obligation<'a>(
-    decreases: &[Validated<'a>],
+    decreases: &[Validated],
     d_old_names: &[String],
 ) -> LExpr {
     debug_assert_eq!(decreases.len(), d_old_names.len());
     debug_assert!(!decreases.is_empty(),
         "lex_decrease_obligation needs ≥ 1 level (caller validates)");
-    let cur = lower_validated(decreases[0]);
+    let cur = lower_validated(&decreases[0]);
     let old = LExpr::var_synthetic(d_old_names[0].clone());
     let lt_branch = LExpr::lt(cur.clone(), old.clone());
     if decreases.len() == 1 {

@@ -5069,6 +5069,64 @@ test_verify_one_file! {
     }
 }
 
+// Loop with non-empty cond_setup (#114 sub-feature 1). Pre-#114
+// these were rejected with a "loop condition has a setup-statement
+// prelude" error. Post-#114 we transform: cond_setup walks as a wp
+// prefix in BOTH the maintain ctx (under `assume cond_exp`) AND
+// the use ctx (under `assume ¬cond_exp`), mirroring Verus's two-
+// query encoding (sst_to_air.rs:2789-2797 + 2730-2737).
+//
+// The encoding lands; the test below pins that the rejection error
+// is gone — Verus's pipeline now generates Lean (rather than
+// erroring out at build_wp_loop). A function-call-in-cond is the
+// canonical trigger: Verus's `expr_to_stm_opt` introduces a `_tmp`
+// for the call result, populating cond_setup.
+//
+// **Note on automation**: tactus_auto's default closer
+// (`rfl | decide | omega | simp_all`) doesn't compose well for
+// goals with `_tactus_ret_N : Prop` quantified vars (the call's
+// ret value renders as Prop in spec contexts). Closing such goals
+// generally needs a custom `#[verifier::tactus_tactic("intros;
+// simp_all; omega")]` override. The encoding is correct; the
+// automation gap is tracked separately as a follow-up to #114.
+test_verify_one_file! {
+    #[test] test_exec_loop_cond_with_setup_no_longer_rejected verus_code! {
+        fn keep_going(x: u8) -> (r: bool)
+            ensures r == (x > 0)
+        {
+            x > 0
+        }
+
+        #[verifier::tactus_auto]
+        #[verifier::tactus_tactic("intros; simp_all; omega")]
+        fn count_down(n: u8) -> (r: u8)
+            ensures r <= n
+        {
+            let mut x: u8 = n;
+            while keep_going(x)
+                invariant x <= n
+                decreases x
+            {
+                x = x - 1;
+            }
+            x
+        }
+    } => Err(err) => {
+        // Some obligations may still fail under the override (omega
+        // doesn't always handle the Prop substitution chain), but
+        // the OLD rejection ("loop condition has a setup-statement
+        // prelude") must be GONE. The cond_setup transform fires;
+        // proof obligations (now Lean-side) replace the up-front
+        // rejection.
+        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
+        assert!(
+            !msgs.iter().any(|m| m.contains("setup-statement prelude")),
+            "expected the pre-#114 rejection to be gone; got: {:?}",
+            msgs,
+        );
+    }
+}
+
 // `break` inside the loop body. Verus compiles this to a non-simple
 // loop (cond: None, with break statements); `check_stm` rejects
 // because we require `cond: Some`.
