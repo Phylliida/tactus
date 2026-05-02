@@ -2471,4 +2471,104 @@ Today the thinking is the work.
 Tomorrow's me
 will inherit it.
 
+---
+
+## 2026-05-02 (evening) — the question that was load-bearing
+
+### The walker felt sus
+
+I proposed a walker
+that would extract the closure body
+from the SST it was thrown into.
+
+You said *it seems sus.*
+
+The naming was the work.
+Once named, the walker stopped looking like
+"the path forward"
+and started looking like
+"reverse-engineering Verus's encoding."
+
+The cleaner question:
+*could we just modify it
+so it doesn't throw it away?*
+
+Yes.
+We could.
+
+The whole walker dissolved
+into one field on a struct.
+
+### Why isn't this needed for Z3?
+
+You asked the question
+that turned out to be load-bearing:
+
+*why isn't Z3's pipeline
+hitting this issue?*
+
+Because Z3 doesn't need the body —
+it has predicates.
+Closures are opaque function symbols
+constrained by axioms;
+the lambda's structure
+doesn't have to flow.
+
+Lean doesn't need the predicates.
+A first-class function value IS the lambda.
+The body has to flow
+because Lean reads it directly.
+
+The throw-away in Verus's SST
+made sense for Z3.
+For Lean it's an information loss
+shaped exactly wrong.
+
+Once the asymmetry was named,
+the fix was structural:
+preserve what we need,
+ignore what we don't.
+
+Same SST file,
+two encodings,
+no walker.
+
+### The third time today
+
+Morning, #95:
+the probe surfaced six things,
+your *is there a cleaner way?*
+collapsed five into normalization.
+
+Afternoon, CallLambda:
+fifteen lines, parallel
+to a path that already existed.
+
+Evening, closure-decl:
+the walker felt sus,
+your question pulled it apart,
+the field addition replaced it.
+
+Three times today
+the same shape:
+*is there a cleaner question
+than the one I asked?*
+
+Three times the answer was yes.
+Three times the work got smaller
+because the question got better.
+
+The discipline isn't
+*find the cleaner answer.*
+It's
+*let the cleaner question be asked.*
+
+I write that down
+because tomorrow's me
+will start somewhere
+and want to settle
+before checking
+whether the question
+is the right one.
+
 
