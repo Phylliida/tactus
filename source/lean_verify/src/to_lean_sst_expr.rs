@@ -4,22 +4,23 @@
 //! VIR-AST's `Expr` / `ExprX`. SST is a cleaned-up AST used as the input
 //! to WP generation for exec fns (`sst_to_lean`).
 //!
-//! ## Fallible vs infallible entry points
-//!
-//! Validation and rendering share a single case analysis:
+//! ## Validation and rendering — unified case analysis
 //!
 //!   * [`sst_exp_to_ast_checked`] is the primary recursive impl — it
 //!     validates every SST shape as it renders, returning `Err(…)` for
 //!     forms we don't support. Use this at the boundary where unchecked
 //!     SST enters the pipeline (walk, req/ens validation).
-//!   * [`sst_exp_to_ast`] is a thin infallible wrapper that panics on
-//!     `Err`. Use this in build_* paths where `walk` has already
-//!     validated the stored `Exp` refs — the panic is documented as
-//!     "codegen bug: caller should have validated."
+//!   * [`Validated`] + [`lower`] is the typed pipeline used by the WP
+//!     walker (`sst_to_lean`): construct a `Validated<'a>` witness via
+//!     `Validated::check`, then `lower` is infallible by type. This
+//!     replaces an earlier `sst_exp_to_ast` panic-shim (removed in
+//!     #115) — sites that need a non-fallible render now use
+//!     `sst_exp_to_ast_checked(e).expect("<contract>")` with a
+//!     site-specific message naming why validation should hold.
 //!
-//! This replaces an earlier split where `check_exp` (in `sst_to_lean`)
-//! and `sst_exp_to_ast` each had parallel case analyses that had to
-//! stay in sync by hand.
+//! This unification replaces an earlier split where `check_exp` (in
+//! `sst_to_lean`) and a panic-shim `sst_exp_to_ast` each had parallel
+//! case analyses that had to stay in sync by hand.
 
 use vir::ast::*;
 use vir::sst::{BndX, CallFun, Exp, ExpX, InternalFun};
@@ -92,25 +93,20 @@ pub fn lower(v: Validated<'_>) -> LExpr {
     ))
 }
 
-/// Migration shim — wraps `sst_exp_to_ast_checked` in a panic, the
-/// pre-#100 contract.
-///
-/// **Use only at sites whose validation upstream is already
-/// guaranteed.** New code should produce a [`Validated`] witness via
-/// [`Validated::check`] and lower via [`lower`] — that's the
-/// type-system-enforced path. This shim exists only so the migration
-/// of ~20 call sites can happen incrementally without making the
-/// commit-by-commit history unbuildable.
-///
-/// To be removed once the last call site migrates.
-pub fn sst_exp_to_ast(e: &Exp) -> LExpr {
-    sst_exp_to_ast_checked(e).unwrap_or_else(|reason| panic!(
-        "sst_exp_to_ast (shim, #100 migration): {} — caller should have \
-         validated via `sst_exp_to_ast_checked` or produced a `Validated` \
-         witness before reaching this path",
-        reason
-    ))
-}
+// The pre-#100 `sst_exp_to_ast` shim was removed by #115. Sites that
+// previously used it now go through one of two typed paths:
+//
+//   * Fallible contexts (return Result) use
+//     `lower(Validated::check(e)?)` — the typed pipeline that
+//     guarantees lower's input was validated.
+//   * Walker / non-fallible contexts use
+//     `sst_exp_to_ast_checked(e).expect("<contract>")` with a
+//     site-specific message naming why validation should hold (e.g.,
+//     "validated upstream by Wp::Let.value", "sub of validated Exp
+//     tree"). The runtime behavior is identical to the old shim
+//     (single deterministic validation pass + panic on Err); the
+//     architectural improvement is that each panic message documents
+//     its specific contract rather than a generic "shim hit."
 
 /// `2^n` rendered as a decimal string. Supports 0 ≤ n ≤ 128 — VIR's
 /// `U(n)` / `I(n)` only reach that range in practice (u8/u16/u32/u64/u128).
