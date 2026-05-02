@@ -1121,13 +1121,13 @@ fn walk_obligations<'a>(
                 callee, spec_callee, args, typ_args, *dest, call_span, mut_args, after, ctx, obl, e,
             );
         }
-        Wp::Loop { cond, invs, validated_invs, inv_kinds, decrease, modified_vars, body, after, d_old_names } => {
+        Wp::Loop { cond, invs, validated_invs, inv_kinds, decrease, modified_vars, body, after } => {
             walk_loop(
-                cond.clone(), invs, validated_invs, inv_kinds, decrease, modified_vars, body, after, d_old_names, ctx, obl, e,
+                *cond, invs, validated_invs, inv_kinds, decrease, modified_vars, body, after, ctx, obl, e,
             );
         }
         Wp::AssertByTactus { cond, tactic_text, body } => {
-            walk_assert_by_tactus(cond.clone(), tactic_text, body, ctx, obl, e);
+            walk_assert_by_tactus(*cond, tactic_text, body, ctx, obl, e);
         }
     }
 }
@@ -1304,11 +1304,10 @@ fn walk_loop<'a>(
     invs: &[LoopInv],
     validated_invs: &[Validated<'a>],
     inv_kinds: &[LoopInvKind],
-    decrease: &[Validated<'a>],
+    decrease: &[DecreaseLevel<'a>],
     modified_vars: &[(&'a VarIdent, &'a Typ)],
     body: &Wp<'a>,
     after: &Wp<'a>,
-    d_old_names: &[String],
     ctx: &WpCtx<'a>,
     obl: &OblCtx,
     e: &mut ObligationEmitter,
@@ -1366,8 +1365,8 @@ fn walk_loop<'a>(
     let mut maintain_obl = obl.clone();
     push_mod_var_frames(&mut maintain_obl, modified_vars);
     maintain_obl.frames.push(CtxFrame::Hyp(entry_inv_conj_marked));
-    if let Some(c) = cond.as_ref() {
-        maintain_obl.frames.push(CtxFrame::Hyp(cond_marked(c)));
+    if let Some(c) = cond {
+        maintain_obl.frames.push(CtxFrame::Hyp(cond_marked(&c)));
     }
     // `let _tactus_d_old_<id>_<i> := D_i` — one pre-body snapshot
     // per lex level. Referenced by the body's continue_leaf as
@@ -1376,11 +1375,10 @@ fn walk_loop<'a>(
     // per-level gensym (built in `build_wp_loop` from the loop's id
     // and the level index) avoids any chance of shadowing across
     // nested loops or sibling levels.
-    debug_assert_eq!(decrease.len(), d_old_names.len());
-    for (level, name) in d_old_names.iter().enumerate() {
+    for level in decrease.iter() {
         maintain_obl.frames.push(CtxFrame::Let(
-            crate::lean_name::LeanName::synthetic(name.clone()),
-            lower_validated(&decrease[level]),
+            crate::lean_name::LeanName::synthetic(level.d_old_name.clone()),
+            lower_validated(&level.value),
         ));
     }
     walk_obligations(body, ctx, &maintain_obl, e);
@@ -1400,8 +1398,8 @@ fn walk_loop<'a>(
     let mut use_obl = obl.clone();
     push_mod_var_frames(&mut use_obl, modified_vars);
     use_obl.frames.push(CtxFrame::Hyp(exit_inv_conj_marked));
-    if let Some(c) = cond.as_ref() {
-        use_obl.frames.push(CtxFrame::Hyp(LExpr::not(cond_marked(c))));
+    if let Some(c) = cond {
+        use_obl.frames.push(CtxFrame::Hyp(LExpr::not(cond_marked(&c))));
     }
     walk_obligations(after, ctx, &use_obl, e);
 }
@@ -2396,6 +2394,26 @@ fn build_req_binders(check: &FuncCheckSst, mut_param_names: &HashSet<String>) ->
 // (where it emits theorems). No changes needed to a central
 // dispatcher.
 
+/// One level of a (possibly lexicographic) loop decrease measure.
+/// Bundles the validated decrease expression with its per-level
+/// d_old snapshot name. Single-expression decreases produce a Vec
+/// of length 1; lexicographic `decreases D1, D2, …` produce length
+/// ≥ 2 in source order.
+///
+/// Fusing the two fields here makes the "same length" invariant
+/// structural rather than enforced by a `debug_assert_eq!` on
+/// parallel `Vec<Validated>` + `Vec<String>` arrays. Same #105
+/// MutArgInfo-style pattern.
+#[derive(Clone)]
+pub struct DecreaseLevel<'a> {
+    pub value: crate::to_lean_sst_expr::Validated<'a>,
+    /// The pre-body snapshot name `_tactus_d_old_<loop_id>_<level_idx>`
+    /// — gensymmed in `build_wp_loop` from the loop's id and the
+    /// level index. Per-loop + per-level uniqueness avoids any
+    /// shadowing across nested loops or sibling lex tiers.
+    pub d_old_name: String,
+}
+
 /// A WP program. Each compound node carries its own continuation,
 /// so composition is structural and `Return` is naturally a
 /// terminator.
@@ -2527,28 +2545,22 @@ enum Wp<'a> {
         inv_kinds: Vec<LoopInvKind>,
         /// Loop decrease measures, in source order. `Vec` length 1
         /// for single-expression `decreases D`; length ≥ 2 for
-        /// lexicographic `decreases D1, D2, ...` (#110). The maintain
-        /// obligation is the lex disjunction:
+        /// lexicographic `decreases D1, D2, ...` (#110). Each
+        /// `DecreaseLevel` bundles the validated measure with its
+        /// per-level d_old snapshot name — fusing what were two
+        /// parallel arrays (mirrors the #105 MutArgInfo pattern).
+        ///
+        /// The maintain obligation is the lex disjunction built by
+        /// `lex_decrease_obligation`:
         ///   (D1' < D1_old)
         ///     ∨ (D1' = D1_old ∧ (D2' < D2_old)
         ///         ∨ (D2' = D2_old ∧ ... (Dn' < Dn_old)))
         /// which generalises the single-expression case
         /// (`(D1' < D1_old) ∨ (D1' = D1_old ∧ False) ≡ D1' < D1_old`).
-        decrease: Vec<crate::to_lean_sst_expr::Validated<'a>>,
+        decrease: Vec<DecreaseLevel<'a>>,
         modified_vars: Vec<(&'a VarIdent, &'a Typ)>,
         body: Box<Wp<'a>>,
         after: Box<Wp<'a>>,
-        /// Per-loop, per-decrease-level pre-body snapshot names
-        /// (`let _tactus_d_old_<id>_<i> := D_i` in the maintain ctx).
-        /// Built from Verus's `StmX::Loop::id` + a per-level index in
-        /// `build_wp_loop` so nested loops AND lex levels never share a
-        /// name. `Vec` length matches `decrease`'s. Without gensym, an
-        /// inner loop's `let _tactus_d_old := D_inner` would shadow
-        /// the outer's binding for any references on the same
-        /// scope path — currently impossible (sibling conjuncts),
-        /// but a future refactor that mixes scopes would silently
-        /// miscompile.
-        d_old_names: Vec<String>,
     },
 
     /// Direct function call. `after` is the post-call continuation.
@@ -3549,24 +3561,31 @@ fn build_wp_loop<'a>(
     // Using `LExpr::not(lower(cond_validated))` keeps everything on
     // the borrow side: cond_validated borrows cond_exp, the negation
     // happens at LExpr level (owned), no Arc clones.
-    let mut cond_setup_wrap: Option<(&'a Stm, Validated<'a>, LExpr)> = None;
-    let cond_exp_opt = match cond {
+    //
+    // Returns `(cond_exp_opt, cond_setup_wrap)`:
+    //   * `cond_exp_opt: Option<Validated>` — what walk_loop pushes
+    //     as the loop's cond hyp. `None` when the wrapper handles
+    //     it (so walk_loop doesn't push twice).
+    //   * `cond_setup_wrap: Option<(&Stm, Validated, LExpr)>` —
+    //     `Some` triggers the post-build wrap below.
+    let (cond_exp_opt, cond_setup_wrap): (
+        Option<Validated<'a>>,
+        Option<(&'a Stm, Validated<'a>, LExpr)>,
+    ) = match cond {
+        None => (None, None),
         Some((cond_setup, cond_exp)) => {
             let cond_validated = crate::to_lean_sst_expr::Validated::check(cond_exp)?;
             if matches!(&cond_setup.x, StmX::Block(ss) if ss.is_empty()) {
-                // Empty setup — fast path; cond goes straight to walk_loop.
-                Some(cond_validated)
+                // Empty setup — fast path; walk_loop pushes cond hyp.
+                (Some(cond_validated), None)
             } else {
                 // Render ¬cond at LExpr level (no synthesised SST
-                // Exp needed). build_wp on cond_setup will be done
-                // after we have the body Wp + after Wp to wrap;
-                // stash the witnesses now.
+                // Exp needed). The wrapper below uses Wp::Assume for
+                // cond and Wp::Hyp for ¬cond around the body/after.
                 let neg_cond_lexpr = LExpr::not(lower_validated(&cond_validated));
-                cond_setup_wrap = Some((cond_setup, cond_validated, neg_cond_lexpr));
-                None  // walk_loop won't add cond hyp; the wrapper does.
+                (None, Some((cond_setup, cond_validated, neg_cond_lexpr)))
             }
         }
-        None => None,
     };
     if decrease.is_empty() {
         return Err(
@@ -3574,9 +3593,6 @@ fn build_wp_loop<'a>(
              loop to declare a termination measure".to_string()
         );
     }
-    let d_old_names: Vec<String> = (0..decrease.len())
-        .map(|i| format!("_tactus_d_old_{}_{}", id, i))
-        .collect();
     // Each invariant carries `at_entry: bool` and `at_exit: bool`
     // flags. Three classifications:
     //   * `invariant P` — at_entry = at_exit = true. Holds at every
@@ -3598,12 +3614,18 @@ fn build_wp_loop<'a>(
     let inv_kinds: Vec<LoopInvKind> = invs.iter()
         .map(LoopInvKind::from_loop_inv)
         .collect::<Result<Vec<_>, _>>()?;
-    let validated_decrease: Vec<crate::to_lean_sst_expr::Validated<'a>> = decrease.iter()
-        .map(|d| crate::to_lean_sst_expr::Validated::check(d))
-        .collect::<Result<Vec<_>, _>>()?;
-    for d in decrease.iter() {
-        check_exp(d)?;
-    }
+    let decrease_levels: Vec<DecreaseLevel<'a>> = decrease.iter().enumerate()
+        .map(|(i, d)| {
+            // `_tactus_d_old_<id>_<i>` — per-loop, per-level
+            // gensym; uniqueness in both axes prevents shadowing
+            // across nested loops AND sibling lex tiers.
+            let d_old_name = format!("_tactus_d_old_{}_{}", id, i);
+            Ok(DecreaseLevel {
+                value: crate::to_lean_sst_expr::Validated::check(d)?,
+                d_old_name,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
 
     // Compute modified vars from the body's *non-init* assignments —
     // `let mut x = …` inside the body is local to each iteration.
@@ -3661,10 +3683,7 @@ fn build_wp_loop<'a>(
     // Mirrors Verus's own `recursion::check_decrease` shape (which
     // builds the recursive obligation via CheckDecreaseHeight's
     // `otherwise` field at the fn level).
-    let decrease_lex = lex_decrease_obligation(
-        &validated_decrease,
-        &d_old_names,
-    );
+    let decrease_lex = lex_decrease_obligation(&decrease_levels);
     let decrease_marked = LExpr::span_mark(
         format_rust_loc(&decrease[0].span),
         AssertKind::Obligation(ObligationKind::LoopDecrease),
@@ -3719,30 +3738,24 @@ fn build_wp_loop<'a>(
         invs: &invs[..],
         validated_invs,
         inv_kinds,
-        decrease: validated_decrease,
+        decrease: decrease_levels,
         modified_vars,
         body: Box::new(body_wp),
         after: Box::new(after),
-        d_old_names,
     })
 }
 
-/// Build the lexicographic decrease obligation as one LExpr.
-/// `decreases` and `d_old_names` are parallel (same length); each pair
-/// becomes a `(cur < old)` test, with equality-falls-through to the
-/// next level. Empty input is a contract violation (rejected upstream
-/// in `build_wp_loop`).
-fn lex_decrease_obligation<'a>(
-    decreases: &[Validated<'a>],
-    d_old_names: &[String],
-) -> LExpr {
-    debug_assert_eq!(decreases.len(), d_old_names.len());
-    debug_assert!(!decreases.is_empty(),
+/// Build the lexicographic decrease obligation as one LExpr. Each
+/// level becomes a `(cur < old)` test, with equality-falls-through
+/// to the next level. Empty input is a contract violation (rejected
+/// upstream in `build_wp_loop`).
+fn lex_decrease_obligation(levels: &[DecreaseLevel<'_>]) -> LExpr {
+    debug_assert!(!levels.is_empty(),
         "lex_decrease_obligation needs ≥ 1 level (caller validates)");
-    let cur = lower_validated(&decreases[0]);
-    let old = LExpr::var_synthetic(d_old_names[0].clone());
+    let cur = lower_validated(&levels[0].value);
+    let old = LExpr::var_synthetic(levels[0].d_old_name.clone());
     let lt_branch = LExpr::lt(cur.clone(), old.clone());
-    if decreases.len() == 1 {
+    if levels.len() == 1 {
         // Base case: `cur < old`. The lex tail (eq ∧ False) collapses,
         // so we emit just the lt branch — identical to the pre-#110
         // single-decrease shape.
@@ -3750,7 +3763,7 @@ fn lex_decrease_obligation<'a>(
     }
     let eq_branch = LExpr::and(
         LExpr::eq(cur, old),
-        lex_decrease_obligation(&decreases[1..], &d_old_names[1..]),
+        lex_decrease_obligation(&levels[1..]),
     );
     LExpr::or(lt_branch, eq_branch)
 }
