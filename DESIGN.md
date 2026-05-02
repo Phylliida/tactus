@@ -132,6 +132,8 @@ Several runtime contracts in the codebase have been promoted to type-level enfor
 
 **`MutArgInfo` struct fuses parallel arrays (#105).** Pre-#105, `mut_args: Vec<(usize, &VarIdent)>` and `mut_idx_to_fresh: HashMap<usize, LeanName>` were parallel structures keyed on the same `usize`, with `.expect("fresh name should exist for every &mut param idx")` on every consumer-side lookup. Post-#105: `Vec<MutArgInfo { param_idx, caller_var, fresh }>` bundles the three fields together. The `expect()` is gone; the type guarantees the fresh name is present alongside the rest of the entry. `push_post_call_frames` no longer takes a separate `mut_args` parameter — it iterates `subst.mut_args` directly.
 
+**`DecreaseLevel` struct fuses parallel arrays (#114 review-pass).** Pre-fix (introduced by #110 lex decreases), `Wp::Loop` held `decrease: Vec<Validated<'a>>` and `d_old_names: Vec<String>` as parallel arrays with a `debug_assert_eq!(decrease.len(), d_old_names.len())` and per-level indexing into both. Same anti-pattern #105 already retired for `MutArgInfo`. Post-fix: `Vec<DecreaseLevel { value: Validated<'a>, d_old_name: String }>` bundles the level's measure and its snapshot name. `walk_loop` and `lex_decrease_obligation` take `&[DecreaseLevel<'a>]`; the `debug_assert_eq!` is gone — the "same length" invariant is structural. Surfaced by the 14-lens review pass (lens #13, typed-invariant) on the same day #110 + #114 landed; same-day review caught the regression of the just-retired pattern before it shipped.
+
 **`build_wp_call` / `build_wp_loop` take destructured fields directly (#104).** Pre-#104, both helpers took a `&'a Stm` and immediately re-destructured with `let StmX::Call { … } = &stm.x else { unreachable!("build_wp_call called on non-Call statement"); };` — a runtime panic if the dispatcher ever called them on the wrong variant. Post-#104: `build_wp_call(fun, resolved_method, is_trait_default, typ_args, args, split, dest, call_span, after, ctx)` and `build_wp_loop(loop_isolation, id, label, cond, body, invs, decrease, after, ctx, outer_loop_stack)` take the fields directly. The destructure happens at the `build_wp` dispatch site (an explicit `StmX::Call { … }` / `StmX::Loop { … }` match arm with no `..`), where any Verus-side field addition still causes a compile error — the upstream-robustness defence stays intact, just lifted from inside the helpers to the dispatcher. The wrong-variant case is now structurally unrepresentable: there's no `Stm` parameter to mismatch against.
 
 **The pattern, named.** When a value's type doesn't carry the property the code requires of it, and the requirement is checked at runtime via panic or assertion: introduce a newtype, make its constructors the only path that satisfies the property, and let the type system enforce the rest. Reviewer-visible at every call site (the constructor name documents the source); refactor-resistant (half-finished migrations don't compile); future-proof (new code added in years can't accidentally break the invariant). The cost is a typed wrapper. The benefit is a soundness hole that's structurally unrepresentable.
@@ -1077,6 +1079,7 @@ Accepted via #57: **`cond: None`** loops (the form Verus produces when lowering 
 * **Tactus tactic-text prepending runs at theorem level, not locally.** When a user writes `assert(P) by { tac }` or `proof { have h := by tac }` inside a loop body (or any nested construct), the `have` is prepended to the THEOREM's tactic at theorem-start — before any `intro` of modified-var quantifiers. Variable references in the tactic resolve to the OUTER scope (fn param, not loop-local). For simple cases (e.g., `assert(x < 256) by { omega }` where `x` is a u8 fn param and the tactic only uses fn-level bounds) this works. For tactics that would need a loop invariant as a hypothesis, the invariant isn't in scope at theorem-tactic prefix. Known design limitation; a per-loop-scoped `have` would require per-loop tactic emission, which we don't have. Not tested end-to-end with tactics that depend on loop-local state.
 * **Proof-block goal-modifying tactics affect the outer goal.** `proof { simp_all }` simplifies the entire theorem goal, not just a local sub-proof. Users coming from Verus's self-contained proof blocks may be surprised. Pinned by `test_exec_proof_block_goal_modifying_tactic`; the alternative (wrapping in a local `have _ : True := by <tac>`) breaks the common `have h : P := by tac` propagation case — which is the primary reason users write proof blocks.
 * **`tactus_case_split` tries each user-datatype local in turn.** Takes a `closer` tactic argument and commits the first split where the closer closes ALL subgoals; restores state and tries the next candidate otherwise. Means a fn with multiple datatype locals — e.g., `(a: Foo, b: Bar)` — works regardless of which is the right scrutinee. Cost is O(n_candidates × closer_cost), bounded by the locals in scope. The `.height`-existence gate filters out `Int`/`Nat`/etc. so we don't case-split on primitives. Pinned by `test_exec_match_enum_with_int_args` (mixed enum + int locals).
+* **Loop decrease lacks `0 ≤ cur` lower bound (#129).** Tactus's `lex_decrease_obligation` emits `cur < d_old` (or the lex disjunction over multiple levels), no `0 ≤ cur`. Verus's loop encoding (sst_to_air.rs:2823-2834) goes through `recursion::check_decrease` which produces the CheckDecreaseHeight chain *with* `0 ≤ cur ∧ cur < d_old`. So Tactus is more permissive than Verus: a loop with `int`-typed decrease that descends into negatives forever still verifies. Dormant in practice — Tactus loops use u-typed decreases where `0 ≤ x` comes from the type-bound hypothesis (`h_x_bound`) and `omega` closes both shapes equivalently — but structurally inconsistent. Fix: `lex_decrease_obligation` should emit `(0 ≤ cur ∧ cur < d_old) ∨ (cur = d_old ∧ ...)` matching the fn-level CheckDecreaseHeight encoding (`to_lean_sst_expr.rs`'s arm). See #129.
 
 #### User-facing features not tested (or possibly broken)
 
@@ -1715,23 +1718,30 @@ The earlier `BodyItem` hand-rolled enum + `build_goal_with_terminator(items, res
 
 ```rust
 enum Wp<'a> {
-    Done(LExpr),                                              // terminator
-    Let(&'a str, &'a Exp, Box<Wp<'a>>),                      // continuation wrappers
-    Assert(&'a Exp, Box<Wp<'a>>),
-    Assume(&'a Exp, Box<Wp<'a>>),
-    AssertByTactus { cond: Option<&'a Exp>, tactic_text: String, body: Box<Wp<'a>> },
-    Branch { cond: &'a Exp, then_branch: Box<Wp<'a>>, else_branch: Box<Wp<'a>> },
+    Done(LExpr),                                       // terminator
+    Let(LeanName, Validated<'a>, Box<Wp<'a>>),         // continuation wrappers
+    LetRaw { name, value: LExpr, body },               // (closure cid := lambda)
+    ClosureBody { closure_params, body, after },       // closure body verification scope
+    Assert(Validated<'a>, Box<Wp<'a>>),
+    Assume(Validated<'a>, Box<Wp<'a>>),
+    Hyp { hyp: LExpr, body: Box<Wp<'a>> },             // already-rendered hypothesis
+    AssertByTactus { cond: Option<Validated<'a>>, tactic_text, body },
+    Branch { cond: Validated<'a>, then_branch, else_branch },
     Loop {
-        cond: Option<&'a Exp>, invs, decrease, modified_vars,
-        body: Box<Wp<'a>>, after: Box<Wp<'a>>,
+        cond: Option<Validated<'a>>, invs, validated_invs, inv_kinds,
+        decrease: Vec<DecreaseLevel<'a>>, modified_vars, body, after,
     },
     Call {
-        callee, args: &'a [Exp], typ_args: &'a [Typ],
-        dest: Option<&'a VarIdent>, call_span: &'a Span,
-        after: Box<Wp<'a>>,
+        callee, spec_callee, args: Vec<Validated<'a>>, typ_args,
+        dest, call_span, mut_args, after,
     },
 }
 ```
+
+**`Wp::Assume` vs `Wp::Hyp`** — both walk into a `CtxFrame::Hyp` push, but differ in the source of the LExpr:
+
+* `Wp::Assume(Validated<'a>, _)` carries a validated SST `Exp` (a borrow into the input SST). The walker calls `lower(v)` to render. Used by `StmX::Assume`, the cond hyp inside `build_wp_loop`'s body wrap, etc. — anywhere the hypothesis is *derived from an SST node*.
+* `Wp::Hyp { hyp: LExpr, _ }` carries an already-rendered LExpr. Used for *synthesized* hypotheses with no SST origin — the canonical case is the negated cond_exp from #114's cond_setup transform, which is built via `LExpr::not(lower(cond_validated))` rather than synthesizing a fresh `¬cond_exp` SST `Exp`. Keeping the two variants distinct preserves `Validated`'s borrow contract: the type guarantees its `&'a Exp` came from the input SST, not from a fresh allocation.
 
 `args: &'a [Exp]` borrows directly from the SST's
 `Arc<Vec<Exp>>` — no intermediate `Vec<&Exp>`. `dest` is just the
