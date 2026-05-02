@@ -511,7 +511,15 @@ fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
         }
         ExprNode::Lambda { binders, body } => {
             out.push_str("fun");
-            write_binders(out, binders, lm);
+            if binders.is_empty() {
+                // Zero-arg closure (`||`-syntax in Rust). Lean's `fun`
+                // requires at least one binder; `fun => body` is a
+                // parse error. Emit `fun ()` to match the unit-arg
+                // form a Lean user would write for `Unit → T`.
+                out.push_str(" ()");
+            } else {
+                write_binders(out, binders, lm);
+            }
             out.push_str(" => ");
             write_expr(out, body, 0, lm);
         }

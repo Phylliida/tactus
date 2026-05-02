@@ -484,9 +484,24 @@ fn check_exp(e: &Exp) -> Result<(), String> {
 ///   pushed. If `val` contains a value-position `if`, fork into
 ///   recursive walks (one per branch with the cond as a Hyp
 ///   frame).
+/// * **`Wp::LetRaw(name, lexpr, body)`** — no theorem; let frame
+///   pushed. Same as `Let` but the RHS is an already-rendered
+///   `LExpr` (no SST `Exp` to revalidate). Used by closure-decl
+///   to bind `cid` to the Lean lambda assembled from the AST
+///   `ast_body` field — the lambda doesn't go through SST's
+///   renderer, so there's no `Validated<Exp>` to wrap.
 /// * **`Wp::Branch(cond, t, e)`** — recurse on `t` with `cond`
 ///   as a Hyp frame; recurse on `e` with `¬cond`. No theorem at
 ///   the branch node.
+/// * **`Wp::ClosureBody { closure_params, body, after }`** — the
+///   closure's verification scope. Walks `body` under
+///   `∀ p : T, h_p_bound → ...` for each closure param (via
+///   `push_mod_var_frames`), so theorems emitted from inside the
+///   body (overflow checks, the closure's own ensures-asserting,
+///   etc.) verify against any caller-supplied input satisfying
+///   the type bounds. Then walks `after` under the original obl —
+///   the closure params don't escape the closure scope. No
+///   theorem at the node itself; obligations come from `body`.
 /// * **`Wp::Call(callee, args, dest, after)`** — one theorem
 ///   for the substituted requires (kind=CallPrecondition).
 ///   Continue with `∀ ret, ret_bound → ensures(subst) → let
@@ -687,24 +702,38 @@ fn closure_lambda_from_ast(
     Ok((cid_name, lambda))
 }
 
-/// SST-side equivalent of `is_synthetic_resolution_assume`. The
-/// `Assume` SST statement carries an `Exp` (not an `Expr`) — same
-/// shape, different Rust type — so we mirror the recognition here.
+/// True if the SST `Exp` `e` is the body of a synthetic `StmX::Assume`
+/// that Tactus should drop entirely (rather than render as a Hyp
+/// frame). Two synthetic sources are recognized:
 ///
-/// Also recognizes closure-spec assumes (#93). Verus's `ast_to_sst`
-/// emits an `Assume(forall|x| ClosureReq(cid, x) ↔ ... ∧
-/// ClosureEns(cid, x, body(x)) ↔ ...)` after each `StmX::ClosureInner`
-/// to teach Z3 about the closure's spec via predicates. Tactus binds
-/// `cid` to a Lean lambda directly (see `StmX::ClosureInner` handler),
-/// so the predicate-style assume is structurally redundant. We
-/// recognize it by walking the expression tree for a `ClosureReq` /
-/// `ClosureEns` / `DefaultEns` `InternalFun` reference — these don't
-/// appear in user-written code, so any expression containing one is
-/// synthetic.
-fn is_synthetic_resolution_exp(e: &Exp) -> bool {
+/// * **`UnaryOpr(HasResolved(_), _)` (#95)** — Verus's
+///   `resolution_inference` pass injects `Assume(HasResolved(_))` (or
+///   `Assume(IsVariant_chain → HasResolved(_))` for enum-conditioned
+///   places) in `--V new-mut-ref` mode. Our renderer doesn't model
+///   `HasResolved` semantics — collapsing it to its inner `Var(x)`
+///   would hypothesize a non-Prop, a Lean type error. Drop these.
+///
+/// * **Anything containing `ClosureReq` / `ClosureEns` / `DefaultEns`
+///   `InternalFun` calls (#93)** — `ast_to_sst` emits
+///   `Assume(forall|x| ClosureReq(cid, x) ↔ ... ∧ ClosureEns(cid, x,
+///   body(x)) ↔ ...)` after each `StmX::ClosureInner` so Z3 knows the
+///   closure's spec via predicates. Tactus binds `cid` to a Lean
+///   lambda directly via `Wp::LetRaw`, so the predicate-style assume
+///   is structurally redundant. Recognize via a whole-tree walk for
+///   the InternalFun reference — these don't appear in user-written
+///   code, so any expression containing one is synthetic.
+///
+/// Counterpart: `is_synthetic_resolution_assume` does the same job at
+/// the AST (`Expr`) level — used by `collect_assume_sites` to suppress
+/// the unproved-assumption *warning* on synthetic injections. The two
+/// helpers are independent because AST and SST have separate Rust
+/// types (`Expr` vs `Exp`), and the AST-side filter only needs to
+/// catch HasResolved (closure-spec stuff doesn't reach the AST as
+/// AssertAssume — it's pure SST).
+fn is_synthetic_assume_to_drop(e: &Exp) -> bool {
     match &e.x {
         ExpX::UnaryOpr(UnaryOpr::HasResolved(_), _) => true,
-        ExpX::Binary(BinaryOp::Implies, _lhs, rhs) => is_synthetic_resolution_exp(rhs),
+        ExpX::Binary(BinaryOp::Implies, _lhs, rhs) => is_synthetic_assume_to_drop(rhs),
         _ => contains_closure_internal_fn(e),
     }
 }
@@ -714,6 +743,13 @@ fn is_synthetic_resolution_exp(e: &Exp) -> bool {
 /// predicate — the closure-spec assume is densely shaped around these
 /// calls (and uses `forall` + `Bind(Let)` for synthetic temps), so we
 /// can't easily pattern-match the whole shape.
+///
+/// Implementation note: `map_exp_visitor` is a *transform* function
+/// (returns the rebuilt `Exp`) but we use it as an inspector — the
+/// rebuilt tree is discarded, only the side-effected `found` flag
+/// matters. Same pattern as `collect_assume_sites` (see its docstring
+/// for the rationale: the visitor takes `Fn` not `FnMut`, so interior
+/// mutability is the only path to per-node side-effect collection).
 fn contains_closure_internal_fn(e: &Exp) -> bool {
     let mut found = false;
     let _ = vir::sst_visitor::map_exp_visitor(e, &mut |inner: &Exp| {
@@ -2704,7 +2740,7 @@ fn build_wp<'a>(
             // (a type error in Lean). Drop these statements entirely
             // since they don't carry information our verification
             // relies on.
-            if is_synthetic_resolution_exp(e) {
+            if is_synthetic_assume_to_drop(e) {
                 return Ok(after);
             }
             Ok(Wp::Assume(crate::to_lean_sst_expr::Validated::check(e)?, Box::new(after)))
