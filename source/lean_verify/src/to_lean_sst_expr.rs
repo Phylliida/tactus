@@ -249,6 +249,13 @@ pub fn type_bound_predicate(e: &LExpr, ty: &Typ) -> Option<LExpr> {
     if let TypX::Boxed(inner) = &**ty {
         return type_bound_predicate(e, inner);
     }
+    // `&mut T` params (in new-mut-ref mode after migration) carry
+    // `TypX::MutRef(T)`; the binder type renders as `T` (see
+    // `to_lean_type::typ_to_node`'s `MutRef` arm), so the bound is
+    // for `T`. (#95)
+    if let TypX::MutRef(inner) = &**ty {
+        return type_bound_predicate(e, inner);
+    }
     let range = match &**ty {
         TypX::Int(r) => r,
         _ => return None,

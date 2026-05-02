@@ -5463,45 +5463,28 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// #95 — rejection-pinning probes for new-mut-ref mode.
+// #95 — new-mut-ref mode (callee-side body verification LANDED).
 //
-// Current state: the `--V new-mut-ref` flag plus
-// `deprecated_postcondition_mut_ref_style(true)` (or any path that
-// produces `Unary(MutRefCurrent, _)` / `Unary(MutRefFuture(_), _)` /
-// `Unary(MutRefFinal(_), _)` in the SST) is rejected at the
-// `to_lean_sst_expr.rs` Unary catch-all. The three tests below pin
-// the current rejection across three distinct producers:
+// `--V new-mut-ref` plus `deprecated_postcondition_mut_ref_style(true)`
+// (or any path that produces `Unary(MutRefCurrent, _)` /
+// `Unary(MutRefFuture(_), _)` / `Unary(MutRefFinal(_), _)` in the SST)
+// is now handled for callee-side body verification: a normalization
+// pass at fn entry maps the new-mut-ref shapes into the legacy shape
+// (`Var` / `VarLoc` / `VarAt`) for &mut params, and #94's existing
+// machinery handles the rest. Plus `is_synthetic_resolution_assume`
+// filters the synthetic `Assume(HasResolved(_))` injections from
+// `resolution_inference` so they don't produce false-positive
+// `unproved assumption` warnings or hypothesize a non-Prop.
 //
-//  - **Body assignment** (`*x = *x + 1`): `place_to_exp_simple` /
-//    `place_to_exp_pair_rec` lower `PlaceX::DerefMut` to
-//    `MutRefCurrent`. Both LHS and RHS positions hit it.
-//  - **Postcondition `*x` referencing post-state**: lowered to
-//    `MutRefFuture(MutRefFutureSourceName::Final)` when the fn
-//    inherits `deprecated_postcondition_mut_ref_style`.
-//  - **Caller-side**: when caller is `tactus_auto` and callee is
-//    Verus-Z3-verified with `&mut`, the inlined ensures contain
-//    `MutRefFuture(MutRefFutureSourceName::MutRefFuture)`.
-//
-// What full #95 needs (multi-session):
-//  1. SST-level rewrite (paralleling #94's `rewrite_varat_for_mut_params`):
-//     `MutRefCurrent(Var(x))` → `Var(<x>_at_pre_tactus)`,
-//     `MutRefFuture(Var(x))` / `MutRefFinal(Var(x))` → `Var(x)` for
-//     each `MutRef`-typed param.
-//  2. Initial Let frame `let <x>_at_pre_tactus := x` per MutRef param.
-//  3. Caller-side substitution: `MutRefCurrent` → caller_arg,
-//     `MutRefFuture` → fresh_post (parallel to legacy `varat_pre_name`
-//     / fresh path).
-//  4. Body assignment-LHS encoding for new-mut-ref: `*x = e` lowers
-//     to a place-shape we don't yet handle in `walk_assign`.
-//  5. Suppress false-positive `unproved assumption` warnings from
-//     synthetic `mk_assume` injected by `resolution_inference` for
-//     MutRef tracking (these aren't user-written, but
-//     `collect_assume_sites` matches them today).
-//  6. `MutRefFinal` variant (from `*final(x)` syntax sugar — currently
-//     reaches the renderer as `MutRefFuture(Final)` via the ensures
-//     postcondition-translation path).
+// Caller-side stays deferred: `bump(&mut y)` lowers to a synthetic
+// MutRef-typed local plus assume-pre + assign-post wrappers. The
+// MutRef* ops then wrap synthetic locals (not fn params), so the
+// param-set normalization doesn't reach them. Tracked as the
+// caller-side rejection test below; the path forward is either
+// extending the "MutRef-typed name set" beyond fn params, or a
+// structural Lean encoding of MutRef<T> as a pair.
 test_verify_one_file_with_options! {
-    #[test] test_exec_callee_mut_simple_new_mut_ref_rejected ["new-mut-ref"] => verus_code! {
+    #[test] test_exec_callee_mut_simple_new_mut_ref ["new-mut-ref"] => verus_code! {
         #[verifier::tactus_auto]
         #[verifier::deprecated_postcondition_mut_ref_style(true)]
         fn bump(x: &mut u8)
@@ -5510,39 +5493,35 @@ test_verify_one_file_with_options! {
         {
             *x = *x + 1;
         }
-    } => Err(err) => {
-        assert!(
-            err.errors.iter().any(|e| e.message.contains("MutRef")),
-            "expected MutRef rejection, got: {:?}",
-            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
-        );
-    }
+    } => Ok(())
 }
 
 // Postcondition-only probe (no body mutation). Isolates the
 // MutRefFuture rendering from body-assignment complexity. Currently
 // rejected because postcondition `*x` lowers to MutRefFuture(Final).
 test_verify_one_file_with_options! {
-    #[test] test_exec_callee_mut_noop_new_mut_ref_rejected ["new-mut-ref"] => verus_code! {
+    #[test] test_exec_callee_mut_noop_new_mut_ref ["new-mut-ref"] => verus_code! {
         #[verifier::tactus_auto]
         #[verifier::deprecated_postcondition_mut_ref_style(true)]
         fn noop(x: &mut u8)
             ensures *x == *old(x)
         {
         }
-    } => Err(err) => {
-        assert!(
-            err.errors.iter().any(|e| e.message.contains("MutRef")),
-            "expected MutRef rejection, got: {:?}",
-            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
-        );
-    }
+    } => Ok(())
 }
 
 // Caller-side probe: caller is tactus_auto; callee uses Verus's
 // Z3 path. Currently rejected because the inlined ensures contains
 // MutRefFuture(MutRefFuture) which the caller-side substitution
 // pipeline doesn't yet handle.
+// Caller side stays deferred: in new-mut-ref mode, `bump(&mut y)`
+// lowers to a synthetic MutRef-typed local plus assume-pre + assign-
+// post wrappers. The MutRef* ops then wrap synthetic locals, not fn
+// params, so the param-set normalization (#95 callee-side) doesn't
+// reach them. Caller-side new-mut-ref needs either (a) extending the
+// "MutRef-typed name set" beyond fn params to include synthetic locals
+// of MutRef type, or (b) a structural Lean encoding of MutRef<T> as
+// a pair (which would be a richer follow-up).
 test_verify_one_file_with_options! {
     #[test] test_exec_call_mut_arg_new_mut_ref_rejected ["new-mut-ref"] => verus_code! {
         #[verifier::deprecated_postcondition_mut_ref_style(true)]

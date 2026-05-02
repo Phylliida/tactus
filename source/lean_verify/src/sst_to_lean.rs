@@ -117,7 +117,7 @@ use vir::sst::{
     Par, Stm, StmX,
 };
 use vir::ast::{
-    AssertQueryMode, Expr, ExprX, Fun, FunctionKind, FunctionX, KrateX, SpannedTyped, TactusKind,
+    AssertQueryMode, BinaryOp, Expr, ExprX, Fun, FunctionKind, FunctionX, KrateX, SpannedTyped, TactusKind,
     Typ, UnaryOp, UnaryOpr, VarAt, VarBinder, VarIdent,
 };
 use vir::ast_visitor::map_expr_visitor;
@@ -283,11 +283,27 @@ impl<'a> WpCtx<'a> {
         // fns without `&mut` params (the common case).
         mut_param_names: &HashSet<String>,
     ) -> Result<Self, String> {
+        // Validate the *normalized* expressions — new-mut-ref-mode
+        // shapes (`MutRefCurrent` / `MutRefFuture`) are mapped to the
+        // legacy `Var` / `VarAt` shape via `normalize_mut_ref_in_exp`
+        // before validation. Without this, `check_exp` would reject
+        // any MutRef-wrapped reference in a fn that uses `&mut` params
+        // even though we'd handle it correctly downstream (#95).
         for req in check.reqs.iter() {
-            check_exp(req)?;
+            let normalized = normalize_mut_ref_in_exp(
+                req,
+                mut_param_names,
+                NormalizePhase::CurrentIsLocal,
+            );
+            check_exp(&normalized)?;
         }
         for ens in check.post_condition.ens_exps.iter() {
-            check_exp(ens)?;
+            let normalized = normalize_mut_ref_in_exp(
+                ens,
+                mut_param_names,
+                NormalizePhase::CurrentIsPreState,
+            );
+            check_exp(&normalized)?;
         }
         let fn_map = krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
         let type_map = check.local_decls.iter().map(|d| (&d.ident, &d.typ)).collect();
@@ -307,7 +323,17 @@ impl<'a> WpCtx<'a> {
         // and `sst_exp_to_ast` then sees only Var nodes.
         let ensures_goal = and_all(
             check.post_condition.ens_exps.iter().map(|ens| {
-                let rewritten = rewrite_varat_for_mut_params_in_exp(ens, mut_param_names);
+                // First normalize new-mut-ref shapes (`MutRefCurrent` →
+                // `VarAt(_, Pre)`, `MutRefFuture/Final` → `Var`) so the
+                // existing #94 rewrite step then handles it as if the
+                // input were legacy-shaped. See `normalize_mut_ref_in_exp`
+                // for the rewrite table.
+                let normalized = normalize_mut_ref_in_exp(
+                    ens,
+                    mut_param_names,
+                    NormalizePhase::CurrentIsPreState,
+                );
+                let rewritten = rewrite_varat_for_mut_params_in_exp(&normalized, mut_param_names);
                 LExpr::span_mark(
                     format_rust_loc(&ens.span),
                     AssertKind::Obligation(ObligationKind::Postcondition),
@@ -496,7 +522,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // and the let-shadow would silently make them equal. Empty for
     // fns without `&mut` params (the common case).
     let mut_param_names: HashSet<String> = fn_sst.x.pars.iter()
-        .filter(|p| p.x.is_mut)
+        .filter(|p| is_mut_ref_par(p))
         .map(|p| sanitize(&p.x.name.0))
         .collect();
 
@@ -509,8 +535,15 @@ pub fn exec_fn_theorems_to_ast<'a>(
     //
     // For non-`&mut` fns, `mut_param_names` is empty and the rewrite
     // helper short-circuits to a plain `clone()` — zero overhead.
+    //
+    // First normalize new-mut-ref SST shapes (`MutRefCurrent` /
+    // `MutRefFuture` / `MutRefFinal` ops) back to the legacy shape
+    // (`Var` / `VarLoc` / `VarAt`) for the &mut params (#95). After
+    // this normalization, the SST is shape-equivalent to legacy mode
+    // and the existing rewrite handles it.
+    let normalized_body: Stm = normalize_mut_ref_in_stm(&check.body, &mut_param_names);
     let rewritten_body: Stm = rewrite_varat_for_mut_params_in_stm(
-        &check.body,
+        &normalized_body,
         &mut_param_names,
     );
 
@@ -520,7 +553,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
     let ctx = WpCtx::new(krate, check, &mut_param_names)?;
 
     let mut binders = build_param_binders(fn_sst);
-    binders.extend(build_req_binders(check));
+    binders.extend(build_req_binders(check, &mut_param_names));
 
     // Build the whole WP tree from the (rewritten) body, with the
     // fn's ensures as the natural continuation at the leaves.
@@ -560,7 +593,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // evaluation; the natural VarAt → Var collapse in the renderer
     // gives the right thing for them.
     let mut initial_obl_ctx = OblCtx::new();
-    for par in fn_sst.x.pars.iter().filter(|p| p.x.is_mut) {
+    for par in fn_sst.x.pars.iter().filter(|p| is_mut_ref_par(p)) {
         let raw_name = sanitize(&par.x.name.0);
         let pre_name = crate::lean_name::LeanName::synthetic(
             varat_pre_name(&raw_name),
@@ -596,12 +629,46 @@ pub fn collect_assume_sites(body: &Expr) -> Vec<Span> {
     // shape rebuilds the tree, but we only care about the
     // side-effect collection in `out`.
     let _ = map_expr_visitor(body, &|e: &Expr| {
-        if let ExprX::AssertAssume { is_assume: true, .. } = &e.x {
-            out.borrow_mut().push(e.span.clone());
+        if let ExprX::AssertAssume { is_assume: true, expr, .. } = &e.x {
+            // Filter out synthetic assumes injected by Verus's
+            // `resolution_inference` pass (which runs in
+            // `--V new-mut-ref` mode). They wrap `HasResolved(_)` —
+            // possibly conditioned on enum-variant `IsVariant` checks
+            // via an `Implies` — and aren't user-written, so warning
+            // about them is a false positive (#95). User-written
+            // `assume(P)` has arbitrary `P` shape.
+            if !is_synthetic_resolution_assume(expr) {
+                out.borrow_mut().push(e.span.clone());
+            }
         }
         Ok(e.clone())
     });
     out.into_inner()
+}
+
+/// Recognize the shape that `resolution_inference::mk_assume` produces:
+/// `HasResolved(_)` directly, or `Implies(IsVariant_chain, HasResolved(_))`
+/// for enum-variant-conditioned places. See
+/// `vir/src/resolution_inference.rs::condition_on_enum_variants`.
+fn is_synthetic_resolution_assume(e: &Expr) -> bool {
+    match &e.x {
+        ExprX::UnaryOpr(UnaryOpr::HasResolved(_), _) => true,
+        // `condition_on_enum_variants` wraps `HasResolved` in
+        // `Implies(IsVariant, ...)` chains. Recurse on the conclusion.
+        ExprX::Binary(BinaryOp::Implies, _lhs, rhs) => is_synthetic_resolution_assume(rhs),
+        _ => false,
+    }
+}
+
+/// SST-side equivalent of `is_synthetic_resolution_assume`. The
+/// `Assume` SST statement carries an `Exp` (not an `Expr`) — same
+/// shape, different Rust type — so we mirror the recognition here.
+fn is_synthetic_resolution_exp(e: &Exp) -> bool {
+    match &e.x {
+        ExpX::UnaryOpr(UnaryOpr::HasResolved(_), _) => true,
+        ExpX::Binary(BinaryOp::Implies, _lhs, rhs) => is_synthetic_resolution_exp(rhs),
+        _ => false,
+    }
 }
 
 /// Format a `Span` for a user-facing diagnostic. Prefers the
@@ -1324,6 +1391,187 @@ fn rewrite_one_varat(e: &Exp, mut_param_names: &HashSet<String>) -> Exp {
     e.clone()
 }
 
+/// True if `p` is an `&mut` parameter — covers both legacy mode
+/// (`is_mut: true`, plain `T` typ) and new-mut-ref mode after
+/// migration (`is_mut: false`, `MutRef<T>` typ). Used to populate
+/// `mut_param_names` for both the SST-level rewrite (#94) and the
+/// new-mut-ref normalization (#95).
+fn is_mut_ref_par(p: &Par) -> bool {
+    p.x.is_mut || matches!(&*p.x.typ, vir::ast::TypX::MutRef(_))
+}
+
+/// Phase-of-rendering context for `normalize_mut_ref_*` (#95).
+/// `MutRefCurrent` has different meaning in body vs ensures, and the
+/// normalizer needs to know which phase it's running in.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum NormalizePhase {
+    /// Body or requires position. `MutRefCurrent(Var(x))` reads the
+    /// current dynamic value of `*x` — same as legacy mode's `Var(x)`,
+    /// which the body's let-shadow handles. Just unwrap.
+    CurrentIsLocal,
+    /// Ensures position. `MutRefCurrent(Var(x))` reads pre-state (the
+    /// value at fn entry). Convert to legacy `VarAt(x, Pre)` so the
+    /// existing `rewrite_varat_for_mut_params` step then maps it to
+    /// `Var(<x>_at_pre_tactus)`.
+    CurrentIsPreState,
+}
+
+/// Normalize new-mut-ref-mode SST shapes into the legacy shape that
+/// `rewrite_varat_for_mut_params_*` and `walk_assign` already handle
+/// (#95).
+///
+/// In new-mut-ref mode (`-V new-mut-ref` plus
+/// `deprecated_postcondition_mut_ref_style(true)`), Verus's body /
+/// ensures lowering wraps `*x` reads in `Unary(MutRefCurrent, _)` and
+/// `*x` post-state references in `Unary(MutRefFuture(_), _)`. The
+/// legacy lowering produced bare `Var(x)` and `VarAt(x, Pre)`. Rather
+/// than building a parallel rewrite + Let-frame infrastructure, we
+/// normalize the new-mut-ref SST shapes back to the legacy shape at
+/// fn entry, then the existing #94 machinery does the rest.
+///
+/// **Rewrite table** (for `x` in `mut_param_names`):
+///
+/// | Phase | Op | New body |
+/// |-------|----|----------|
+/// | body | `MutRefCurrent(Var(x))` | `Var(x)` |
+/// | body | `MutRefCurrent(VarLoc(x))` | `VarLoc(x)` |
+/// | ensures | `MutRefCurrent(Var(x))` | `VarAt(x, Pre)` |
+/// | both | `MutRefFuture(_, Var(x))` | `Var(x)` |
+/// | both | `MutRefFinal(_, Var(x))` | `Var(x)` |
+///
+/// `MutRefCurrent(VarLoc(x))` (LHS of `*x = e` in body) becomes
+/// `VarLoc(x)`, which after the outer `Loc(_)` wrapper gives the
+/// legacy assignment shape `Loc(VarLoc(x))` that `walk_assign`
+/// handles directly.
+///
+/// Other shapes — e.g., `MutRefCurrent(Field(...))` for `*x.field`,
+/// or `MutRefCurrent` wrapping non-`Var`/`VarLoc` — are left alone
+/// and will hit the existing renderer's "unsupported unary op" arm.
+/// Those map to deferred follow-ups (`&mut x.f`, `&mut v[i]`, etc.).
+/// Peel transparent wrappers (Box/Unbox/MustBeFinalized) to find an
+/// inner `Var`/`VarLoc`/`VarAt` reference if any. Returns
+/// `(ident, kind)` where `kind` is which of the three.
+///
+/// `VarAt(x, Pre)` shows up as the inner of MutRef* ops in
+/// new-mut-ref postconditions because Verus pairs the post-state
+/// `MutRefFuture` wrapper with a pre-state `VarAt` reference (the
+/// post-state of x's value at fn entry).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum InnerKind {
+    Var,
+    VarLoc,
+    VarAtPre,
+}
+
+fn peel_to_var(e: &Exp) -> Option<(&VarIdent, InnerKind)> {
+    match &e.x {
+        ExpX::Var(id) => Some((id, InnerKind::Var)),
+        ExpX::VarLoc(id) => Some((id, InnerKind::VarLoc)),
+        ExpX::VarAt(id, vir::ast::VarAt::Pre) => Some((id, InnerKind::VarAtPre)),
+        // Transparent wrappers we know about. `MustBeFinalized` shows up
+        // briefly in SST around place-derived Var reads (see
+        // `place_to_exp_pair_rec`'s `PlaceX::Local`); the others are
+        // standard transparent wrappers that `peel_transparent` handles
+        // for non-MutRef-specific contexts.
+        ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner)
+        | ExpX::Unary(UnaryOp::MustBeFinalized | UnaryOp::CoerceMode { .. } | UnaryOp::Trigger(_), inner) => {
+            peel_to_var(inner)
+        }
+        _ => None,
+    }
+}
+
+fn normalize_one_mut_ref(
+    e: &Exp,
+    mut_param_names: &HashSet<String>,
+    phase: NormalizePhase,
+) -> Exp {
+    match &e.x {
+        ExpX::Unary(UnaryOp::MutRefCurrent, inner) => {
+            if let Some((id, kind)) = peel_to_var(inner) {
+                let raw_name = sanitize(&id.0);
+                if mut_param_names.contains(&raw_name) {
+                    return match phase {
+                        // Body: just unwrap to the bare `Var(x)` /
+                        // `VarLoc(x)`. Lean let-shadowing gives the
+                        // current value through `*x = e` body assignments.
+                        NormalizePhase::CurrentIsLocal => {
+                            let new_x = match kind {
+                                InnerKind::VarLoc => ExpX::VarLoc(id.clone()),
+                                InnerKind::Var | InnerKind::VarAtPre => ExpX::Var(id.clone()),
+                            };
+                            SpannedTyped::new(&e.span, &e.typ, new_x)
+                        }
+                        // Ensures: produce `VarAt(x, Pre)` so the outer
+                        // `rewrite_varat_for_mut_params` step then
+                        // produces `Var(<x>_at_pre_tactus)`. VarLoc is
+                        // unexpected here (ensures don't have L-values).
+                        NormalizePhase::CurrentIsPreState => {
+                            assert!(
+                                kind != InnerKind::VarLoc,
+                                "VarLoc shouldn't appear in ensures position"
+                            );
+                            SpannedTyped::new(
+                                &e.span,
+                                &e.typ,
+                                ExpX::VarAt(id.clone(), vir::ast::VarAt::Pre),
+                            )
+                        }
+                    };
+                }
+            }
+        }
+        ExpX::Unary(UnaryOp::MutRefFuture(_) | UnaryOp::MutRefFinal(_), inner) => {
+            // Future / Final: post-state. Same rewrite in body and
+            // ensures phases — just unwrap to `Var(x)`. In legacy
+            // semantics the post-state is the let-shadowed `Var(x)`
+            // at fn exit. The inner can be `Var(x)`, `VarLoc(x)`, or
+            // `VarAt(x, Pre)` — Verus pairs MutRefFuture with a
+            // pre-state inner reference (the post-state of x's
+            // entry value), and `Var(x)` (post-state via let-shadow)
+            // is what the renderer expects.
+            if let Some((id, _)) = peel_to_var(inner) {
+                let raw_name = sanitize(&id.0);
+                if mut_param_names.contains(&raw_name) {
+                    return SpannedTyped::new(
+                        &e.span,
+                        &e.typ,
+                        ExpX::Var(id.clone()),
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    e.clone()
+}
+
+fn normalize_mut_ref_in_exp(
+    exp: &Exp,
+    mut_param_names: &HashSet<String>,
+    phase: NormalizePhase,
+) -> Exp {
+    if mut_param_names.is_empty() {
+        return exp.clone();
+    }
+    vir::sst_visitor::map_exp_visitor(exp, &mut |e: &Exp| {
+        normalize_one_mut_ref(e, mut_param_names, phase)
+    })
+}
+
+fn normalize_mut_ref_in_stm(
+    stm: &Stm,
+    mut_param_names: &HashSet<String>,
+) -> Stm {
+    if mut_param_names.is_empty() {
+        return stm.clone();
+    }
+    // Body is always `CurrentIsLocal` phase.
+    vir::sst_visitor::map_exps_in_stm_visitor(stm, &mut |e: &Exp| {
+        normalize_one_mut_ref(e, mut_param_names, NormalizePhase::CurrentIsLocal)
+    })
+}
+
 /// Per-obligation walker for `Wp::Call`. Splits the call's
 /// obligations across separate theorems and pushes post-call
 /// frames onto the obligation context.
@@ -1914,11 +2162,26 @@ fn build_param_binders(fn_sst: &FunctionSst) -> Vec<LBinder> {
 }
 
 /// `(h_req<i> : <req_i>)` for each requires clause.
-fn build_req_binders(check: &FuncCheckSst) -> Vec<LBinder> {
-    check.reqs.iter().enumerate().map(|(i, req)| LBinder {
-        name: Some(crate::lean_name::LeanName::synthetic(format!("h_req{}", i))),
-        ty: sst_exp_to_ast(req),
-        kind: BinderKind::Explicit,
+///
+/// `mut_param_names` carries the &mut params so we can normalize
+/// new-mut-ref shapes (`MutRefCurrent(Var(x))` → `Var(x)`) for these
+/// params before rendering — at fn entry, x IS the pre-state, so the
+/// natural `Var(x)` is what the renderer needs (#95).
+fn build_req_binders(check: &FuncCheckSst, mut_param_names: &HashSet<String>) -> Vec<LBinder> {
+    check.reqs.iter().enumerate().map(|(i, req)| {
+        // `CurrentIsLocal` phase: unwrap `MutRefCurrent` to `Var` since
+        // `*x` in requires evaluates against the param's entry value,
+        // which the renderer already knows how to emit as `Var(x)`.
+        let normalized = normalize_mut_ref_in_exp(
+            req,
+            mut_param_names,
+            NormalizePhase::CurrentIsLocal,
+        );
+        LBinder {
+            name: Some(crate::lean_name::LeanName::synthetic(format!("h_req{}", i))),
+            ty: sst_exp_to_ast(&normalized),
+            kind: BinderKind::Explicit,
+        }
     }).collect()
 }
 
@@ -2323,6 +2586,18 @@ fn build_wp<'a>(
             Ok(Wp::Assert(crate::to_lean_sst_expr::Validated::check(e)?, Box::new(after)))
         }
         StmX::Assume(e) => {
+            // Skip synthetic resolution-tracking assumes (#95). Verus's
+            // `resolution_inference` pass injects `Assume(HasResolved(...))`
+            // statements in new-mut-ref-mode bodies. We don't model
+            // `HasResolved` semantics — the renderer collapses
+            // `UnaryOpr(HasResolved, _)` to its inner expression,
+            // which would then be hypothesized as a non-Prop value
+            // (a type error in Lean). Drop these statements entirely
+            // since they don't carry information our verification
+            // relies on.
+            if is_synthetic_resolution_exp(e) {
+                return Ok(after);
+            }
             Ok(Wp::Assume(crate::to_lean_sst_expr::Validated::check(e)?, Box::new(after)))
         }
         // `return e` discards the textual continuation (`after`) and
