@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**261 end-to-end tests + 1 coverage test + 121 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**264 end-to-end tests + 1 coverage test + 121 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -1702,6 +1702,100 @@ closed + 1 follow-up created — final 22 pending). 1 poem batch
 (2026-05-03.md: twenty-eight to twenty-two; the threshold; the
 audit as repair).
 
+#### Current session (2026-05-03 afternoon — #115 + #110)
+
+Two more tasks landed continuing the morning's audit-driven push.
+
+**#115 sst_exp_to_ast shim removal** (commit `c218396`). The pre-#100
+panic-shim `sst_exp_to_ast(e)` (literally
+`sst_exp_to_ast_checked(e).unwrap()`) is gone. Each former call site
+now goes through one of two typed paths:
+
+1. **Fallible contexts** use `lower(Validated::check(e)?)` — the
+   typed pipeline guaranteeing lower's input was validated. Site:
+   `WpCtx::new`'s ensures-rendering closure (changed `.collect()`
+   → `.collect::<Result<_, _>>()?` to propagate validation errors
+   from rewrite_varat output).
+2. **Walker / non-fallible contexts** (`walk_let` / `lift_if_value`
+   / `build_req_binders` / test fixture) use
+   `sst_exp_to_ast_checked(e).expect("<contract>")` with site-
+   specific messages naming why validation should hold (e.g.,
+   "validated upstream by Wp::Let.value", "sub of validated Exp
+   tree"). Same runtime behavior as the shim; the architectural
+   improvement is that each panic message documents its specific
+   contract rather than a generic "shim hit".
+
+Doc updates: `to_lean_sst_expr.rs` module docstring rewritten to
+describe the Validated + lower typed pipeline as the new boundary.
+
+**#110 lexicographic decreases** (commit `b148f2a`). Both fn-level
+AND loop-level lex `decreases D1, D2, ...` now work.
+
+*Fn-level worked all along.* Verus's `recursion::check_decrease`
+builds nested CheckDecreaseHeight calls where the outer's `otherwise`
+field IS the inner's CheckDecreaseHeight. Our existing
+`sst_exp_to_ast_checked` arm for CheckDecreaseHeight already
+dispatches `otherwise` recursively through itself, so the lex shape
+composes structurally as:
+
+    ((0 ≤ a' ∧ a' < a_old) ∨
+      (a' = a_old ∧ ((0 ≤ b' ∧ b' < b_old) ∨
+        (b' = b_old ∧ False))))
+
+No code changes needed for fn-level; only tests were missing.
+Surprise discovery: I'd assumed lex would need work everywhere; the
+recursive `otherwise` makes fn-level a no-op.
+
+*Loop-level needed plumbing.* `Wp::Loop::decrease` was a single
+`Validated<'a>`; for lex it becomes `Vec<Validated<'a>>`. New helper
+`lex_decrease_obligation(decreases, d_old_names)` builds the lex
+disjunction recursively. Single-element case reduces to
+`(D1' < D1_old) ∨ False` ≡ `D1' < D1_old`, matching the pre-#110
+shape exactly. Per-loop, per-level d_old gensyms
+`_tactus_d_old_<id>_<i>` keep nested loops AND lex tiers structurally
+distinct.
+
+Tests (4 new, replacing 1 negative):
+- `test_exec_call_recursive_lex_decreases` (positive, fn-level)
+- `test_exec_call_recursive_lex_nondecreasing` (negative, fn-level)
+- `test_exec_loop_lex_decreases` (positive, loop-level — renamed
+  from `_rejected`, flipped to Ok)
+- `test_exec_loop_lex_decreases_nondecreasing` (negative, loop-level)
+
+**#114 probed and deferred.** Loop shape extensions (loop_isolation:
+false, non-empty cond setup) — both have user-side workarounds and
+neither blocks realistic code. Probed scope: loop_isolation: false
+needs a different verification semantics (body sees outer context
+directly, no invariant abstraction); non-empty cond setup needs
+prepending the setup to the body and treating as cond:None (more
+tractable but still non-trivial). Both larger than fits cleanly
+into today's session. Reverted to pending.
+
+**Discipline note worth recording: lex was easier than expected.**
+The fn-level case was a no-op — Verus's recursion pass already
+encodes lex as a recursive CheckDecreaseHeight chain via the
+`otherwise` field, and our existing arm dispatched recursively
+through itself. I'd planned the work assuming both fn AND loop
+needed encoding changes; only loop did. **The structural insight:
+lex's recursive shape composes naturally through CheckDecreaseHeight's
+already-recursive `otherwise` field**, the same way #95's
+new-mut-ref normalization composed through #94's existing rewrite.
+When Verus's encoding is already shape-correct, our renderer just
+has to dispatch — no special case needed. Worth checking before
+designing: "is Verus's pass already producing the shape we need?"
+
+**Net for the afternoon**: 2 commits (`c218396`, `b148f2a`),
+261 → 264 e2e tests (+3 net after a positive-flip rename), 121
+unit tests still pass. vstd verifies 1530/0. Two more tasks
+closed (#115, #110). Down to **20 pending tasks** (was 22 at
+morning end).
+
+**Day total**: 3 commits (morning + 2 afternoon), 264 e2e + 121
+unit tests, 3 closed tasks (#120, #115, #110), 1 split-out
+follow-up (#126), 1 poem batch (3 pieces). The day's arc was
+audit-driven (DESIGN.md → tasks → execution); each task closed
+made the next more obvious.
+
 ## Architecture
 
 ### Full pipeline
@@ -1998,16 +2092,18 @@ See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the f
 
 All major Tier-3 tasks have landed (#55 caller-side `&mut`, #56
 caller-side trait method calls, #93 closures, #95 new-mut-ref
-callee-side). The 2026-05-03 morning audit went through DESIGN.md
-systematically and surfaced ~20 deferred items that hadn't been
-promoted to tasks; final pending count is **22 across 6 themes**.
-None is on the critical path for realistic code today.
+callee-side, #110 lex decreases). The 2026-05-03 morning audit went
+through DESIGN.md systematically and surfaced ~20 deferred items
+that hadn't been promoted to tasks; after the day's closes (#120
+shape-drift partial → #126; #115 shim removal; #110 lex decreases),
+pending count is **20 across 6 themes**. None is on the critical
+path for realistic code today.
 
 The full catalogue lives in DESIGN.md § "Known deferrals, rejected
 cases, and untested edges" — this section summarizes the task
 themes:
 
-### Feature deferrals with clear shape (8 tasks)
+### Feature deferrals with clear shape (7 tasks)
 
 - **#106** &mut at call sites for non-Var L-values (umbrella for
   Index, deeper paths, multi-variant enum, tuple field).
@@ -2015,19 +2111,17 @@ themes:
   locals around exec calls).
 - **#108** non-int decreases for generic datatypes.
 - **#109** non-int decreases for mutually recursive datatype SCCs.
-- **#110** lexicographic decreases (loops + fns).
 - **#111** StmX::AssertBitVector (bit_vector reasoning).
 - **#112** StmX::OpenInvariant (atomic invariants for concurrency).
 - **#113** BinaryOp::StrGetChar + string operations.
 - **#114** loop shape extensions (loop_isolation: false, non-empty
   cond setup).
 
-### Architecture cleanups (7 tasks)
+### Architecture cleanups (6 tasks)
 
 - **#97** `OblCtx::with_frame` O(N²) → `Rc<im::Vector>` (perf,
   unmotivated by realistic code).
 - **#98** `substitute` walk_children helper (pure ergonomics).
-- **#115** `sst_exp_to_ast` shim removal (#100 follow-up; ~10 sites).
 - **#116** `substitute` capture-check alpha-rename (vs panic).
 - **#117** fuse two-pass over loop bodies.
 - **#118** sanity-check allowlist auto-derive from prelude.rs.
@@ -2066,6 +2160,13 @@ themes:
   exec calls deferred → #124.
 - **#120 (partial) shape-drift tests** (2026-05-03). Two of four
   gaps closed; remaining two split → #126.
+- **#115 sst_exp_to_ast shim removal** (2026-05-03). Pre-#100
+  panic-shim gone; sites use either the typed
+  `lower(Validated::check(e)?)` pipeline or `expect("<contract>")`
+  with site-specific messages.
+- **#110 lexicographic decreases** (2026-05-03). Both fn-level
+  (a no-op via Verus's recursive `otherwise`) and loop-level
+  (lex disjunction in `lex_decrease_obligation`) covered.
 
 ### Earlier-deferred items still open
 
@@ -2170,7 +2271,7 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 |---|---|---|
 | `cargo test -p lean_verify --lib` | 118 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking, `format_rust_loc`, lean_process, `LeanName` constructors |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
-| `vargo test -p rust_verify_test --test tactus` | 261 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body + &mut x.f via structure update, trait-method calls with impl-strengthened ensures + default-impl invocation, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression, new-mut-ref callee-side normalization, exec closure declarations + body verification scope + spec-closure calls) |
+| `vargo test -p rust_verify_test --test tactus` | 264 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body + &mut x.f via structure update, trait-method calls with impl-strengthened ensures + default-impl invocation, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression, new-mut-ref callee-side normalization, exec closure declarations + body verification scope + spec-closure calls, lexicographic decreases for fns + loops) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
 | `vargo build --release` (vstd) | 1530 | Regression guard: vstd proof library still verifies |
 
@@ -2284,7 +2385,7 @@ tactus/
       fn_call_to_vir.rs        ← tactus_span_from, enclosing_fn_is_tactus_auto
       rust_to_vir_expr.rs      ← Tactus proof-block synthesis (AssertBy-in-Ghost)
     rust_verify_test/tests/
-      tactus.rs                ← 261 end-to-end tests
+      tactus.rs                ← 264 end-to-end tests
       tactus_coverage.rs       ← coverage matrix test binary
     vir/src/
       ast.rs                   ← FunctionAttrs.tactic_span + tactus_auto;
@@ -2334,7 +2435,7 @@ cd lean_verify && ./scripts/setup-mathlib.sh && cd ..
 # (See DESIGN.md "Putting Lean on PATH" for the long form.)
 
 # ── Full test suite ────────────────────────────────────────────────
-# 261 end-to-end tests
+# 264 end-to-end tests
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Coverage matrix (1 test, asserts walker visits the expected variant set)
