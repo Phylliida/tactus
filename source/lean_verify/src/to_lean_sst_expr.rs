@@ -40,7 +40,7 @@ pub fn sst_exp_to_ast_checked(e: &Exp) -> Result<LExpr, String> {
     exp_to_node_checked(e).map(LExpr::new)
 }
 
-/// An SST expression that has been validated (via
+/// A reference to an SST expression that has been validated (via
 /// [`sst_exp_to_ast_checked`]) and is therefore safe to lower to
 /// `LExpr` without panic risk.
 ///
@@ -51,51 +51,49 @@ pub fn sst_exp_to_ast_checked(e: &Exp) -> Result<LExpr, String> {
 /// runtime-checked contract; now it's a type-system-enforced one.
 ///
 /// Walkers (`walk_obligations` / `walk_loop` / `walk_call` / etc.)
-/// receive `Wp<'a>` whose Exp slots are already `Validated`, so the
-/// inside of the walker never has to think about validation — the
-/// type guarantees it.
+/// receive `Wp<'a>` whose Exp slots are already `Validated<'a>`,
+/// so the inside of the walker never has to think about
+/// validation — the type guarantees it.
 ///
-/// **Ownership: `Validated` owns its `Exp` (via `Arc`).** Pre-#114
-/// it was `Validated<'a> { inner: &'a Exp }`, tying validation to
-/// a specific borrow into the input SST. That conflated two
-/// unrelated things — "this Exp is valid" (the property) and "this
-/// is a borrow into the SST" (a borrow shape). Removing the
-/// lifetime lets `Validated` hold synthesized Exps too (e.g., the
-/// negated cond_exp introduced by build_wp_loop's non-empty
-/// cond_setup transform — #114). `Exp` is already `Arc<...>`, so
-/// owning is essentially free.
+/// **Borrow over ownership.** `Validated` is a borrow into the
+/// input SST, not an owning wrapper. Synthesized hypotheses (not
+/// derived from an SST Exp — e.g., a negated cond from #114's
+/// cond_setup transform) go through [`Wp::Hyp`] instead, which
+/// carries an already-rendered `LExpr` directly. Avoiding the
+/// `Arc<Exp>` clone in `Validated` keeps the validation contract
+/// scoped to genuinely-borrowed SST cases.
 ///
 /// See `lean_name::LeanName` for the same architectural pattern
 /// applied to identifiers; see DESIGN.md "Type-system-enforced
 /// invariants" for the rationale.
-#[derive(Clone)]
-pub struct Validated {
-    inner: Exp,
+#[derive(Clone, Copy)]
+pub struct Validated<'a> {
+    inner: &'a Exp,
 }
 
-impl Validated {
+impl<'a> Validated<'a> {
     /// Run validation by attempting `sst_exp_to_ast_checked`. Returns
     /// a witness on success, or the validation error on failure.
-    /// Clones the `Arc<Exp>` to take ownership; cheap.
-    pub fn check(e: &Exp) -> Result<Self, String> {
+    pub fn check(e: &'a Exp) -> Result<Self, String> {
         sst_exp_to_ast_checked(e)?;
-        Ok(Validated { inner: e.clone() })
+        Ok(Validated { inner: e })
     }
 
-    /// The underlying `Exp`. Use sparingly — most consumers should
-    /// go through [`lower`] which preserves the validated invariant.
-    /// Useful for routing the same Exp through a different lowering
-    /// path (e.g., looking at its `.typ` field or matching on its
-    /// `ExpX` shape).
-    pub fn raw(&self) -> &Exp { &self.inner }
+    /// The underlying `Exp` reference. Use sparingly — most consumers
+    /// should go through [`lower`] which preserves the validated
+    /// invariant. Useful for routing the same Exp through a
+    /// different lowering path (e.g., looking at its `.typ` field
+    /// or matching on its `ExpX` shape).
+    pub fn raw(&self) -> &'a Exp { self.inner }
 }
 
 /// Lower a validated Exp to `LExpr`. Cannot panic — the type system
 /// guarantees the input was already validated by `Validated::check`.
-/// Takes `&Validated` since lowering doesn't need ownership; callers
-/// can keep their witness for further use without cloning.
-pub fn lower(v: &Validated) -> LExpr {
-    sst_exp_to_ast_checked(&v.inner).unwrap_or_else(|reason| panic!(
+/// Takes `&Validated` so callers don't have to deref-copy at call
+/// sites (Validated is Copy, but `*v` is more noise than necessary
+/// when callers usually have a borrow already).
+pub fn lower(v: &Validated<'_>) -> LExpr {
+    sst_exp_to_ast_checked(v.inner).unwrap_or_else(|reason| panic!(
         // Reachable only if `Validated::check` has a bug where it
         // accepted an Exp that fails validation on the second pass.
         // sst_exp_to_ast_checked is deterministic, so this is
