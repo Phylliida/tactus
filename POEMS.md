@@ -16,3 +16,4 @@ on a new date.
 - [2026-04-29](poems/2026-04-29.md) — partial fix; the fourth, returned; three of the same shape; the audit
 - [2026-05-01](poems/2026-05-01.md) — the inheritance; what was already there; what doesn't have to mirror
 - [2026-05-02](poems/2026-05-02.md) — fourteen questions; coming in with a summary; the question that resized the work; the punt; the question that was load-bearing; what I missed in myself
+- [2026-05-03](poems/2026-05-03.md) — twenty-eight to twenty-two; the threshold; the audit as repair
