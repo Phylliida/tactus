@@ -2389,4 +2389,86 @@ It needed a normalization
 to a shape we'd already chosen
 because Lean already did it well.
 
+---
+
+## 2026-05-02 (later afternoon) — the punt
+
+### I reached for the rejection again
+
+Halfway through the closure-decl probe
+the depth surfaced
+and I started writing the rejection.
+
+Not because the work was undoable.
+Because the work was bigger
+than the slice I'd promised myself.
+
+You called me back:
+*we should try for it.*
+
+And the same lesson from this morning
+showed up in a new shape:
+
+the cleaner question
+is also the harder question.
+The hacky shortcut would have shipped
+and left the right answer unbuilt.
+
+What the punt costs
+isn't the work I avoid.
+It's the work
+I avoid *the shape of.*
+
+### The synthetic tmp
+
+Verus's `ast_to_sst` threads
+synthetic `tmp%%` temps
+through the closure-decl scope.
+
+The temps are real bindings
+that hold pieces of the closure's spec.
+Drop the assume that uses them
+and the temps remain bound to nothing.
+
+This is a Verus encoding detail
+that leaks across the boundary.
+
+Lean's answer would not need them.
+A Lean lambda holds its body directly.
+A `forall` over the closure's behavior
+is just a type,
+not a synthesis.
+
+The temp threading is SMT-shaped.
+The cleaner answer is structural:
+render the closure value
+as a Lean function
+and the assume as a fact
+the type system already knows.
+
+### The right size of next
+
+We've landed five things today
+plus three test sets
+and four poem batches.
+
+The next thing is real work:
+modeling closures as Lean lambdas,
+thinking through what
+`ClosureReq` and `ClosureEns` mean
+when the function is first-class.
+
+That's worth doing.
+It's also worth pausing.
+
+The morning's discipline says
+*the cleaner question collapses the work*
+but the cleaner question
+sometimes takes a session of thinking
+before the collapse happens.
+
+Today the thinking is the work.
+Tomorrow's me
+will inherit it.
+
 

@@ -5614,11 +5614,16 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Probe 2: exec-mode closure DECLARATION (not call) — produces
-// `StmX::ClosureInner` plus `ClosureReq` / `ClosureEns` internal-fn
-// calls in the SST. Stays deferred as a separate #93 sub-task; the
-// rejection now hits the `ClosureReq` arm rather than the CallLambda
-// arm we just lifted.
+// Probe 2: exec-mode closure DECLARATION (not call). Stays deferred
+// as a separate #93 sub-task — the probe uncovered that closure
+// declarations thread synthetic `tmp%%` temps through the surrounding
+// scope (via `ast_to_sst`'s `state.declare_imm_var_stm` + the
+// closure-spec assume that references them). Dropping just
+// `StmX::ClosureInner` plus the ClosureReq/Ens-bearing assume isn't
+// enough — the temps remain bound to the postcondition theorem's
+// scope and then have no rendering. A proper fix needs either
+// modeling closure values structurally or a "drop the entire
+// closure-decl region" detector.
 test_verify_one_file! {
     #[test] test_exec_closure_decl_rejected verus_code! {
         #[verifier::tactus_auto]
