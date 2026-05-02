@@ -918,8 +918,14 @@ recursion pass covers all cross-fn calls in the cycle the same way.
     ("expected structure" elaboration error), so a different
     encoding is needed (explicit ctor rebuild, e.g.
     `let t := (v, t.1)`).
-  - **Legacy-mode `VarAt(p, Pre)` only.** New-mut-ref's
-    `MutRefCurrent`/`MutRefFuture` UnaryOps not handled.
+  - **Legacy-mode `VarAt(p, Pre)` AND new-mut-ref-mode
+    `MutRefCurrent`/`MutRefFuture` UnaryOps both handled.**
+    New-mut-ref shapes are normalized back to the legacy shape
+    via `normalize_mut_ref_in_{exp,stm}` (#95) before this slice's
+    rewrite runs, so the same `VarAt(p, Pre) → Var(<p>_at_pre_tactus)`
+    machinery handles both. Caller-side new-mut-ref (synthetic
+    MutRef-typed local around the call) still deferred — see the
+    Tier 3 entry below.
   - **Caller side LANDED in slice 1; callee side LANDED via #94.**
     Fns taking `&mut` params can have their OWN bodies verified
     by `tactus_auto`. Encoding (`exec_fn_theorems_to_ast` in
@@ -972,14 +978,19 @@ recursion pass covers all cross-fn calls in the cycle the same way.
     `&mut a.b.c`, multi-variant enum field mutation (Lean's
     structure-update syntax doesn't compose with multi-variant
     inductives), tuple field mutation `&mut t.0` (structure update
-    doesn't work for `Prod` either — needs ctor rebuild instead),
-    and new-mut-ref mode `MutRefCurrent` /
-    `MutRefFuture` (#95 — separate UnaryOps that don't go through
-    `VarAt`). `&mut x.f` for single-variant structs LANDED via #87
-    using Lean's structure update — the encoding doesn't need
-    havoc-base + assume-other-fields-unchanged because Lean's
-    `{ x with f := … }` syntax structurally preserves all other
-    fields.
+    doesn't work for `Prod` either — needs ctor rebuild instead).
+    `&mut x.f` for single-variant structs LANDED via #87 using
+    Lean's structure update — the encoding doesn't need havoc-base
+    + assume-other-fields-unchanged because Lean's `{ x with f := … }`
+    syntax structurally preserves all other fields.
+
+    **New-mut-ref mode `MutRefCurrent` / `MutRefFuture` LANDED
+    callee-side via #95** through a pre-rewrite normalization step
+    that maps new-mut-ref SST shapes back to the legacy shape so
+    #94's existing rewrite handles them. **Caller-side new-mut-ref
+    still deferred** — synthetic MutRef-typed locals around exec
+    calls don't go through param-set normalization. See the
+    "&mut args on calls" Tier 3 entry for details.
 * **Non-int decreases** — datatype-typed decreases via emitted
   `T.height` companion fn (see #54 in Tier 2). Int decreases work
   via the transparent-identity `height` for ints.
@@ -1078,6 +1089,7 @@ Accepted via #57: **`cond: None`** loops (the form Verus produces when lowering 
 * **Generic calls don't verify trait-bound / where-clause constraints** — `#53`'s substitution accepts any `typ_args` without checking callee-side bounds. For callees whose body only uses type-level references to the type parameter, this is fine. For callees that rely on bounds for operations (e.g., `T: Ord` enabling `<` on T values), the callee's spec might assume properties we can't guarantee for the instantiation. Current generic exec fn tests are identity-like; no bound-dependent exec callees exercised.
 * **`assert forall|v| P by { tac }` via Tactus path** — the #50 / #49 infrastructure goes through `ExprX::AssertBy` which can carry `vars`. Our Tactus short-circuit handles `vars = []` (plain assert-by and proof blocks). The forall variant with non-empty `vars` isn't exercised for Tactus (tactic_span still populated at rust_to_vir, but the SST emission doesn't account for the binders). Untested.
 * **Tactus tactic referencing loop-local variables** — see the "tactic-text prepending runs at theorem level" soundness trade-off. A user's `assert(inv) by { exact h_loop_inv }` inside a loop body wouldn't find `h_loop_inv` at theorem-tactic prefix. Untested directly.
+* **Closures with user-written `requires` / `ensures`** — `|x: u8| requires x < 100 -> u8 { x + 1 }`. Verus's surface syntax for closure specs is finicky; we didn't manage to write a clean test. The body verification scope (Slice C of #93) DOES process inner closure specs via `exec_closure_body_stms` in principle, but no test pins this end-to-end.
 
 #### Tactic / automation limitations
 
@@ -1388,12 +1400,44 @@ exec fns."
     encodings (Index in particular needs a way to express the array
     "one-element-changed" property).
   - **New-mut-ref mode (`UnaryOp::MutRefCurrent` /
-    `MutRefFuture`).** Both the caller-side (#55, #87) and
-    callee-side (#94) rewrites handle legacy-mode `VarAt(p, Pre)`
-    only. Migrated functions (per `migrate_mut_refs.rs`) use
-    `MutRefCurrent`/`MutRefFuture` UnaryOps instead of `VarAt`.
-    Not currently exercised by any test; would need parallel
-    handling at the same rewrite site (#95).
+    `MutRefFuture`) — LANDED via #95 (callee-side body
+    verification).** A pre-rewrite normalization step
+    (`normalize_mut_ref_in_{exp,stm}` in `sst_to_lean.rs`) maps
+    new-mut-ref SST shapes back to the legacy shape (`Var` /
+    `VarLoc` / `VarAt(_, Pre)`) at fn entry, then #94's existing
+    `rewrite_varat_for_mut_params` step handles the rest unchanged.
+    Rewrite table (for `x` in mut_param_names):
+    | Phase | Op | Becomes |
+    |---|---|---|
+    | body | `MutRefCurrent(Var(x))` | `Var(x)` |
+    | body | `MutRefCurrent(VarLoc(x))` | `VarLoc(x)` |
+    | ensures | `MutRefCurrent(Var(x))` | `VarAt(x, Pre)` |
+    | both | `MutRefFuture/Final(Var(x))` | `Var(x)` |
+    `peel_to_var` strips Box/Unbox/MustBeFinalized/CoerceMode/Trigger
+    to find an inner `Var`/`VarLoc`/`VarAt(Pre)`. The
+    `is_mut_ref_par(p)` predicate covers BOTH legacy
+    (`is_mut: true`, plain T typ) and new-mut-ref-migrated
+    (`is_mut: false`, `MutRef<T>` typ) param shapes. Plus
+    `type_bound_predicate` peels `TypX::MutRef` so the binder's
+    bound comes from the inner T. Plus the synthetic
+    `Assume(HasResolved(...))` injections from
+    `resolution_inference` are dropped via
+    `is_synthetic_assume_to_drop`. Pinned by
+    `test_exec_callee_mut_simple_new_mut_ref`,
+    `test_exec_callee_mut_noop_new_mut_ref`.
+
+    **Caller-side new-mut-ref still deferred.** When `bump(&mut y)`
+    is in a `tactus_auto` caller, Verus's encoding produces a
+    synthetic MutRef-typed *local* (not a fn param) plus an assume-
+    pre + assign-post wrapper around the call: `let mut_ref =
+    ...; assume(MutRefCurrent(mut_ref) == y); bump(mut_ref);
+    y = MutRefFuture(mut_ref);`. The MutRef* ops then wrap synthetic
+    locals, not fn params, so the param-set normalization doesn't
+    reach them. Pinned as Err by
+    `test_exec_call_mut_arg_new_mut_ref_rejected`. Forward path:
+    extend the "MutRef-typed name set" beyond fn params to include
+    synthetic locals of MutRef type; or render `MutRef<T>` as a
+    Lean structure (the "what would Lean do?" angle).
 
   **Why `varat_pre_name` lives in `expr_shared.rs`.** Both the
   rewrite (which produces the synthetic name) and the
@@ -1515,6 +1559,91 @@ exec fns."
   invariant classifications (#89; only `at_entry = at_exit = true`
   accepted, which matches what `invariant x <= n;` produces by
   default).
+
+* **Closures (#93) — LANDED.** Three slices delivered:
+
+  **Slice A — Spec-closure calls (`ExpX::CallLambda`).** When a
+  `tactus_auto` exec fn applies a spec-closure parameter
+  (`f(x)` for `f: spec_fn(_) -> _`), the call lowers to Lean
+  `App(f, args)`. Lean's `Int → Int` (the `typ_to_expr` rendering
+  of `spec_fn(int) -> int`) is a first-class function type, so
+  no special encoding needed beyond a normal application. Mirrors
+  the proof-fn path's `CallTarget::FnSpec` handling. Pinned by
+  `test_exec_spec_closure_in_ensures`,
+  `test_exec_spec_closure_in_requires`,
+  `test_exec_spec_closure_in_ensures_wrong_body` (negative).
+
+  **Slice B — Closure declarations via preserved AST body.**
+  Verus's SST normally throws away the closure's `ExprX::NonSpecClosure`
+  body (replacing it with `StmX::ClosureInner.body: Stm` plus a
+  synthetic `Assume(forall|x| ClosureReq(cid, x) ↔ ... ∧
+  ClosureEns(cid, x, body(x)) ↔ ...)`). For Lean we want a
+  first-class function value, so we extended `StmX::ClosureInner`
+  with an `ast_body: Expr` field populated by `ast_to_sst`. Tactus
+  reads it via `closure_lambda_from_ast` and emits a `Wp::LetRaw(cid,
+  fun (p : T) => body, after)` (built via the `closure_decl_wp`
+  helper to assemble the nested Wp shape clearly). The synthetic
+  spec assume is dropped via `is_synthetic_assume_to_drop`'s
+  closure-spec recognizer (`contains_closure_internal_fn`).
+  Synthesized `anonymous_closure%` datatypes are skipped in
+  `generate.rs` — Z3 needs them as opaque types for predicate
+  identities, but Lean uses first-class function types and a
+  zero-variant inductive fails `deriving Inhabited`. Pinned by
+  `test_exec_closure_decl`, `test_exec_closure_decl_wrong_ensures`
+  (negative), `test_exec_closure_zero_args`, `test_exec_closure_nested`,
+  `test_exec_closure_captures_local`, `test_exec_closure_inside_loop`,
+  `test_exec_closure_inside_if`.
+
+  **Slice C — Closure body verification scope.** The closure
+  body's own verification (overflow checks etc. inside the
+  closure body's arithmetic) emits as theorems via `Wp::ClosureBody
+  { closure_params, body, after }`. Walker pushes
+  `∀ p : T, h_p_bound → ...` for each closure param via
+  `push_mod_var_frames` (same helper used for loop modified-vars),
+  then walks `body`'s Wp. Without this slice, `let f = |x: u8|
+  x + 200; ...` was silently accepted even though `x + 200`
+  overflows for `x ≥ 56` — a real soundness gap that's now caught.
+  Pinned by `test_exec_closure_body_overflow_caught` (negative —
+  catches the previously-silent gap), `test_exec_closure_body_safe_arithmetic`
+  (positive — `|x: u8| x / 2` is generically sound),
+  `test_exec_closure_multi_arg_overflow` (negative — `|x, y| x + y`
+  overflows for u8).
+
+  **Why this is structural and not SMT-shaped.** Z3's encoding
+  uses `cid` as an opaque function symbol + axiomatized via
+  `forall|x| ClosureReq(cid, x) ↔ ...` + `ClosureEns(cid, x,
+  body(x)) ↔ ...`. The body's structure isn't visible at call
+  sites — only the predicates. Lean's first-class function types
+  let us bind `cid := lambda` directly, and the predicates
+  collapse: `ClosureReq(cid, x)` becomes "the lambda's requires
+  applied to x"; `ClosureEns(cid, x, output)` becomes
+  `output = cid x`. Same fact, structural rather than asserted.
+  See § "What doesn't have to mirror Verus's encoding".
+
+  **Still deferred (closure follow-ups):**
+  - **Exec-mode closure CALLS (`add_one(5)` for an exec closure)**
+    — Verus translates `f(x)` to
+    `vstd::pervasive::exec_nonstatic_call(f, (x,))`, which Verus's
+    resolution rejects. Even with vstd, the inlined ensures use
+    `BuiltinSpecFun::ClosureReq` / `ClosureEns` in spec position,
+    which Tactus currently treats as synthetic-to-drop (correct
+    for closure-decl scope, would need lifting for call sites).
+    See § "Upstream-blocked deferrals". Pinned by
+    `test_exec_closure_call_unsupported_upstream`.
+  - **Closures with user-written `requires` / `ensures`
+    (`|x: u8| requires x < 100 -> u8 { x + 1 }`).** The body
+    verification scope COULD pick these up via
+    `exec_closure_body_stms` (which already processes them into
+    inner asserts), but no test pins this — the Verus surface
+    syntax is finicky and we didn't get it to parse cleanly in
+    a tactus_auto fn. Untested.
+  - **`StmX::ClosureInner.ast_body` field — no shape-drift unit
+    test.** The contract that `ast_to_sst` always populates this
+    field with the same `expr.clone()` as the SST's
+    `expr.span.clone()` is enforced only by the e2e tests today.
+    A focused unit test constructing a synthetic
+    `StmX::ClosureInner` with a known `ast_body` would be belt-
+    and-suspenders.
 
 ##### Ordering rationale
 
