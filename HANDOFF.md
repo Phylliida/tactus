@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**267 end-to-end tests + 1 coverage test + 125 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**267 end-to-end tests + 1 coverage test + 130 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -1993,6 +1993,76 @@ detour. The right move was the small surgical fix to test
 infra (LEAN_PATH bypass, ~70 lines across two files) that
 pays back every future test run.
 
+#### Current session (2026-05-03 next day cont. — #118 sanity allowlist auto-derive)
+
+Closed #118. The hardcoded prelude-name allowlist in
+`sanity::name_resolves` is now auto-derived from
+`TactusPrelude.lean` text via `extract_prelude_names` (cached
+through `OnceLock`). Adding a new prelude `axiom` / `def` /
+`noncomputable def` / `syntax "name"` / `macro "name"` /
+`elab "name"` automatically flows into the sanity allowlist —
+no separate `sanity.rs` edit needed.
+
+**Why the chore mattered.** Pre-#118: contributor adds
+`tactus_new_helper` to TactusPrelude.lean, codegen emits
+references to it, and sanity check (debug builds) panics with
+"unresolved tactus_new_helper" until someone remembers to
+update the `matches!` arm. The right answer was to remove the
+hand-sync entirely — the prelude is the source of truth, and
+the allowlist follows from parsing it.
+
+**Implementation (sanity.rs ~95 lines added/changed):**
+- `extract_prelude_names(prelude: &str) -> HashSet<String>`:
+  line-based parser. Recognises the five forms (`axiom NAME`,
+  `[noncomputable] def NAME`, `syntax "NAME"`, `macro "NAME"`,
+  `elab "NAME"`). Comments and blank lines skipped. `import`,
+  `set_option`, `attribute`, `open`, `macro_rules` introduce
+  no names so they pass through silently.
+- `cached_prelude_names() -> &'static HashSet<String>`: wraps
+  `extract_prelude_names` in a `OnceLock` so the parse runs at
+  most once per process (sanity checks fire many times in debug
+  builds; cheap to amortise).
+- `name_resolves`: replaced the hardcoded `matches!` arm
+  covering `arch_word_bits | usize_hi | tactus_peel | ...` with
+  `if cached_prelude_names().contains(name) { return true; }`.
+- DESIGN.md "Architecture debts" entry flipped from
+  "maintained by hand" to "auto-derived from
+  `TactusPrelude.lean`". The "Potential future applications"
+  section had one line about this candidate; removed since it
+  landed.
+
+**Tests** (5 new, 125 → 130 unit; 0 e2e changes):
+- `extract_prelude_names_recognises_current_prelude` — pins
+  the 9 names in the actual TactusPrelude.lean (axioms +
+  defs + tactic-syntax names).
+- `extract_prelude_names_skips_non_definition_lines` —
+  imports, set_option, attribute, comments, macro_rules
+  introduce no names.
+- `extract_prelude_names_handles_each_form` — synthetic
+  prelude exercising all five recognised forms.
+- `cached_prelude_names_includes_legacy_allowlist` —
+  regression guard: every name the old hardcoded list had
+  is still in the auto-derived set. Catches a future
+  TactusPrelude.lean refactor that removes one without
+  realising sanity depended on it.
+- `name_resolves_accepts_prelude_name` — pins the wiring
+  between `cached_prelude_names` and `name_resolves`.
+
+**Net for the session**: 1 commit incoming. 125 → 130 unit
+tests (+5). 267 e2e + 1 coverage + 7 integration unchanged
+(the change is internal); vstd 1530/0 unchanged. One pending
+task closed (#118). Down to 17 pending tasks (was 18).
+
+**Discipline note worth recording: source-of-truth lens.**
+The "auto-derive instead of hand-syncing" pattern is the same
+shape as #99 (LeanName), #100 (Validated), #105 (MutArgInfo),
+#114-review (DecreaseLevel) — find a place where two pieces
+of the codebase carry redundant information and let one of
+them be derived from the other. Today's was simpler than
+those (no newtype, just a parser + cache), but the lens that
+finds it is the same: *what's hand-synced that doesn't need
+to be?*
+
 ## Architecture
 
 ### Full pipeline
@@ -2487,7 +2557,7 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 
 | Binary | Count | What it tests |
 |---|---|---|
-| `cargo test -p lean_verify --lib` | 118 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking, `format_rust_loc`, lean_process, `LeanName` constructors |
+| `cargo test -p lean_verify --lib` | 130 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking + prelude-name auto-derivation, `format_rust_loc`, lean_process, `LeanName` constructors |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
 | `vargo test -p rust_verify_test --test tactus` | 267 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body + &mut x.f via structure update, trait-method calls with impl-strengthened ensures + default-impl invocation, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression, new-mut-ref callee-side normalization, exec closure declarations + body verification scope + spec-closure calls, lexicographic decreases for fns + loops with `0 ≤ cur` lower bound) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
