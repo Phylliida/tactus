@@ -2076,6 +2076,143 @@ fn emit_call_precondition_theorem(
     e.emit(theorem_name, obl.wrap(requires_clause), simple_tactic(e));
 }
 
+/// Peel `SpanMark` wrappers, returning the innermost non-SpanMark
+/// expression. Used by the ret-substitution machinery (#128) and the
+/// And-tree walker — SpanMark is a Lean-level no-op (just emits a
+/// `/- @rust:LOC -/` comment) so structural pattern matching should
+/// look through it.
+fn peel_span_marks(e: &LExpr) -> &LExpr {
+    let mut cur = e;
+    while let ExprNode::SpanMark { inner, .. } = &cur.node {
+        cur = inner;
+    }
+    cur
+}
+
+/// Flatten the *top-level* `And`-tree of `e` into its leaf conjuncts.
+///
+/// Recurses through `BinOp::And` only — does NOT descend into `Or`,
+/// `Implies`, `Forall`, `Exists`, `If`, `Let`, `Match`, etc. The
+/// "top-level" notion is what matters for ret-substitution (#128):
+/// a clause `r == E` buried inside `Or(Q, r == E)` is NOT
+/// uniquely-determining, so we don't want to find it. SpanMark
+/// wrappers are peeled at every node since they're transparent at
+/// the Lean level.
+fn collect_top_and_conjuncts<'a>(e: &'a LExpr, out: &mut Vec<&'a LExpr>) {
+    use crate::lean_ast::BinOp;
+    let peeled = peel_span_marks(e);
+    if let ExprNode::BinOp { op: BinOp::And, lhs, rhs } = &peeled.node {
+        collect_top_and_conjuncts(lhs, out);
+        collect_top_and_conjuncts(rhs, out);
+    } else {
+        out.push(e);
+    }
+}
+
+/// Does `e` mention `target` as a free variable anywhere in its
+/// subtree? Recursive walk, peels SpanMark transparently, ignores
+/// binder scope. Used by `extract_top_level_eq_for` to reject
+/// self-referential `r == r + …` patterns from ret-substitution
+/// (#128) — those would either no-op or produce a non-terminating
+/// substitution chain.
+///
+/// The "ignore binder scope" simplification is sound for our use:
+/// if `target` happens to be shadowed by an inner binder, treating
+/// it as "mentioned" still produces a conservative *skip-substitution*
+/// result, which is always safe.
+fn expr_mentions_var(e: &LExpr, target: &crate::lean_name::LeanName) -> bool {
+    match &e.node {
+        ExprNode::Var(n) => n.as_str() == target.as_str(),
+        ExprNode::Lit(_) | ExprNode::LitBool(_) | ExprNode::LitStr(_)
+        | ExprNode::LitChar(_) | ExprNode::Raw(_) => false,
+        ExprNode::BinOp { lhs, rhs, .. } =>
+            expr_mentions_var(lhs, target) || expr_mentions_var(rhs, target),
+        ExprNode::UnOp { arg, .. } => expr_mentions_var(arg, target),
+        ExprNode::App { head, args } =>
+            expr_mentions_var(head, target)
+            || args.iter().any(|a| expr_mentions_var(a, target)),
+        ExprNode::Let { value, body, .. } =>
+            expr_mentions_var(value, target) || expr_mentions_var(body, target),
+        ExprNode::Lambda { body, .. } | ExprNode::Forall { body, .. }
+        | ExprNode::Exists { body, .. } => expr_mentions_var(body, target),
+        ExprNode::If { cond, then_, else_ } =>
+            expr_mentions_var(cond, target)
+            || expr_mentions_var(then_, target)
+            || else_.as_ref().map_or(false, |e| expr_mentions_var(e, target)),
+        ExprNode::Match { scrutinee, arms } =>
+            expr_mentions_var(scrutinee, target)
+            || arms.iter().any(|a| expr_mentions_var(&a.body, target)),
+        ExprNode::TypeAnnot { expr, ty } =>
+            expr_mentions_var(expr, target) || expr_mentions_var(ty, target),
+        ExprNode::FieldProj { expr, .. } => expr_mentions_var(expr, target),
+        ExprNode::StructUpdate { base, updates } =>
+            expr_mentions_var(base, target)
+            || updates.iter().any(|(_, v)| expr_mentions_var(v, target)),
+        ExprNode::ArrayLit(es) | ExprNode::Anon(es) =>
+            es.iter().any(|e| expr_mentions_var(e, target)),
+        ExprNode::Index { base, idx, .. } =>
+            expr_mentions_var(base, target) || expr_mentions_var(idx, target),
+        ExprNode::SpanMark { inner, .. } => expr_mentions_var(inner, target),
+    }
+}
+
+/// Try to find a top-level conjunct of the form `Eq(Var(target), E)`
+/// or `Eq(E, Var(target))` in `conj`. Returns `Some((E, rest))`
+/// where `rest` is the And of all OTHER conjuncts (or `LitBool(true)`
+/// if the eq clause was the only one). Returns `None` if no matching
+/// conjunct exists, or if `E` mentions `target` (self-referential).
+///
+/// The conservative scope (#128): only top-level `And`-tree, never
+/// descending into `Or` / `Implies` / `Forall` / `Exists` / `If` /
+/// `Let` / `Match`. A clause buried inside a disjunction does NOT
+/// uniquely determine `target`, so we don't substitute.
+///
+/// SpanMark is peeled transparently. The matched eq picks the FIRST
+/// conjunct in source order — for trait-method-impl callees (#86),
+/// where the conjunction is `(spec_ensures) ∧ (impl_ensures)`,
+/// `push_post_call_frames` orders spec first then impl. If both
+/// have a `r == E` clause, we pick the spec's; the impl's becomes
+/// part of `rest` and substitutes to `E_impl == E_spec` which Verus
+/// guarantees is consistent (impl ⇒ trait).
+fn extract_top_level_eq_for(
+    conj: &LExpr,
+    target: &crate::lean_name::LeanName,
+) -> Option<(LExpr, LExpr)> {
+    use crate::lean_ast::BinOp;
+    let mut conjuncts: Vec<&LExpr> = Vec::new();
+    collect_top_and_conjuncts(conj, &mut conjuncts);
+
+    for (idx, c) in conjuncts.iter().enumerate() {
+        let peeled = peel_span_marks(c);
+        let ExprNode::BinOp { op: BinOp::Eq, lhs, rhs } = &peeled.node else {
+            continue;
+        };
+        let lhs_p = peel_span_marks(lhs);
+        let rhs_p = peel_span_marks(rhs);
+        let e: Option<&LExpr> = match (&lhs_p.node, &rhs_p.node) {
+            (ExprNode::Var(n), _) if n.as_str() == target.as_str() => Some(rhs_p),
+            (_, ExprNode::Var(n)) if n.as_str() == target.as_str() => Some(lhs_p),
+            _ => None,
+        };
+        let Some(e) = e else { continue };
+        if expr_mentions_var(e, target) {
+            continue;
+        }
+        let rest: Vec<LExpr> = conjuncts.iter().enumerate()
+            .filter(|(i, _)| *i != idx)
+            .map(|(_, c)| (*c).clone())
+            .collect();
+        return Some((e.clone(), and_all(rest)));
+    }
+    None
+}
+
+/// Is `e` syntactically `LitBool(true)` (after peeling SpanMark)?
+/// Used to skip emitting `True →` Hyp frames.
+fn is_trivial_true(e: &LExpr) -> bool {
+    matches!(peel_span_marks(e).node, ExprNode::LitBool(true))
+}
+
 /// Push the post-call frames onto the obligation context. Reading
 /// the resulting goal top-down:
 ///
@@ -2093,6 +2230,32 @@ fn emit_call_precondition_theorem(
 /// Frames pushed only when meaningful — empty ensures / missing
 /// ret_bound is skipped to avoid `True →` clutter on every
 /// downstream goal.
+///
+/// **Ret-substitution path (#128).** When the substituted ensures
+/// contains a top-level conjunct of the form `Eq(Var(fresh_ret), E)`
+/// (or `Eq(E, Var(fresh_ret))`) — i.e., the callee's ensures
+/// uniquely determines the return value — we replace Phases 2/3/5:
+///
+/// ```text
+///   ∀ post_i, type_inv(post_i) →     │ Phase 1 (unchanged)
+///   E_bound →                        │ bound on E (numeric ret only)
+///   rest_ensures(subst, ret := E) → │ remaining clauses, ret-substituted
+///   let caller_var_i := post_i;      │ Phase 4 (unchanged)
+///   let dest := E;                   │ Phase 5 with E directly
+///   <continuation goal>
+/// ```
+///
+/// The `∀ ret` quantifier disappears, eliminating the `∀ (P : Prop),
+/// P = E → …` shape that blocks `tactus_auto`'s default closer
+/// (omega rejects ∀-Prop, simp_all doesn't intro ∀). The bound on
+/// E is preserved as a Hyp because numeric ret types still need the
+/// bound for downstream arithmetic — `type_bound_predicate` returns
+/// `None` for non-numeric (Bool, Prop, structs), so the Hyp is
+/// trivially elided there.
+///
+/// Falls through to the ∀-path when no `r == E` conjunct exists, when
+/// E mentions ret (self-referential), or when ensures has a non-And
+/// top-level shape (Or, Implies, etc.). See `extract_top_level_eq_for`.
 fn push_post_call_frames(
     callee: &FunctionX,
     spec_callee: &FunctionX,
@@ -2118,23 +2281,8 @@ fn push_post_call_frames(
         }
     }
 
-    // Phase 2: return-value binder + bound. Uses fresh_ret_name
-    // (the gensym from build_call_substitutions) — the callee's
-    // source-level ret name could shadow a caller-scope local.
-    let ret = &callee.ret.x;
-    let ret_typ = substitute(&typ_to_expr(&ret.typ), &subst.typ_subst);
-    new_obl.frames.push(CtxFrame::Binder(LBinder {
-        name: Some(subst.fresh_ret_name.clone()),
-        ty: ret_typ,
-        kind: BinderKind::Explicit,
-    }));
-    if let Some(pred) = type_bound_predicate(
-        &LExpr::var(subst.fresh_ret_name.clone()), &ret.typ,
-    ) {
-        new_obl.frames.push(CtxFrame::Hyp(pred));
-    }
-
-    // Phase 3: ensures (post-call assumption). Uses both
+    // Build the substituted ensures conjunction once. Used by both
+    // the substitution path (#128) and the ∀-path. Uses both
     // spec_callee's ensures (the trait method decl's, for trait-
     // method-impl callees; same as callee otherwise) AND the impl's
     // own ensures when they differ (#86 impl-strengthening). Verus
@@ -2153,12 +2301,6 @@ fn push_post_call_frames(
             vir_expr_to_ast(&rewritten)
         })
         .collect();
-    // Add the impl's strengthened ensures only when the call is a
-    // trait-method-impl dispatch (then callee is the impl, spec_callee
-    // is the trait method decl — see `resolve_callee`). For all
-    // other callees, callee == spec_callee structurally, and the
-    // impl-strengthening conjunction would just duplicate the same
-    // clauses.
     let is_trait_method_impl =
         matches!(callee.kind, FunctionKind::TraitMethodImpl { .. });
     if is_trait_method_impl {
@@ -2167,12 +2309,69 @@ fn push_post_call_frames(
             ensures_clauses.push(vir_expr_to_ast(&rewritten));
         }
     }
-    if !ensures_clauses.is_empty() {
-        let ensures_conj = and_all(ensures_clauses);
-        new_obl.frames.push(CtxFrame::Hyp(
-            substitute(&ensures_conj, &subst.ens_subst),
-        ));
-    }
+    let substituted_ensures: Option<LExpr> = if ensures_clauses.is_empty() {
+        None
+    } else {
+        Some(substitute(&and_all(ensures_clauses), &subst.ens_subst))
+    };
+
+    // #128: try ret-substitution. If the substituted ensures has a
+    // top-level conjunct `Eq(Var(fresh_ret), E)` (or commuted), we
+    // can skip the `∀ ret + ret_bound` chain and bind `dest := E`
+    // directly. Falls through to the ∀-path when no such conjunct
+    // exists.
+    let ret = &callee.ret.x;
+    let ret_substitution: Option<(LExpr, LExpr)> = substituted_ensures.as_ref()
+        .and_then(|conj| extract_top_level_eq_for(conj, &subst.fresh_ret_name));
+
+    // The value bound to `dest` differs by path: in the ∀-path,
+    // `dest := fresh_ret_name` (the ∀-bound); in the substitution
+    // path, `dest := E` (the substituted value). Computing it
+    // here lets Phase 5 share one code site between paths.
+    let dest_value: LExpr = match &ret_substitution {
+        Some((ret_value, rest_ensures)) => {
+            // Substitution path: drop `∀ ret + ret_bound`; emit
+            // `E_bound` and `rest_ensures` as Hyps directly.
+            // `type_bound_predicate` returns `None` for non-numeric
+            // ret types (Bool, Prop, structs) so the bound Hyp is
+            // elided there — the cond_setup case (Bool ret).
+            if let Some(pred) = type_bound_predicate(ret_value, &ret.typ) {
+                new_obl.frames.push(CtxFrame::Hyp(pred));
+            }
+            // The eq clause that gave us E has been dropped from
+            // `rest_ensures`. Substitute fresh_ret_name → E in the
+            // remaining clauses so they reference E directly. If the
+            // result simplifies to `True` (e.g., the eq clause was
+            // the only conjunct), skip the Hyp.
+            if !is_trivial_true(rest_ensures) {
+                let mut ret_to_e = std::collections::HashMap::new();
+                ret_to_e.insert(subst.fresh_ret_name.clone(), ret_value.clone());
+                let rest_substituted = substitute(rest_ensures, &ret_to_e);
+                if !is_trivial_true(&rest_substituted) {
+                    new_obl.frames.push(CtxFrame::Hyp(rest_substituted));
+                }
+            }
+            ret_value.clone()
+        }
+        None => {
+            // ∀-path: ret binder + ret_bound + ensures Hyp.
+            let ret_typ_lean = substitute(&typ_to_expr(&ret.typ), &subst.typ_subst);
+            new_obl.frames.push(CtxFrame::Binder(LBinder {
+                name: Some(subst.fresh_ret_name.clone()),
+                ty: ret_typ_lean,
+                kind: BinderKind::Explicit,
+            }));
+            if let Some(pred) = type_bound_predicate(
+                &LExpr::var(subst.fresh_ret_name.clone()), &ret.typ,
+            ) {
+                new_obl.frames.push(CtxFrame::Hyp(pred));
+            }
+            if let Some(conj) = substituted_ensures {
+                new_obl.frames.push(CtxFrame::Hyp(conj));
+            }
+            LExpr::var(subst.fresh_ret_name.clone())
+        }
+    };
 
     // Phase 4: caller-side rebindings for &mut args. Placed AFTER
     // ensures so the ensures Hyp references the fresh existential,
@@ -2202,10 +2401,12 @@ fn push_post_call_frames(
     }
 
     // Phase 5: dest binding for the call's return (`let r = foo(…)`).
+    // `dest_value` is `Var(fresh_ret_name)` in the ∀-path or `E` in
+    // the substitution path (#128).
     if let Some(dest_ident) = dest {
         new_obl.frames.push(CtxFrame::Let(
             crate::lean_name::LeanName::from_var_ident(dest_ident),
-            LExpr::var(subst.fresh_ret_name.clone()),
+            dest_value,
         ));
     }
 

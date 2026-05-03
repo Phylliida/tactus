@@ -5135,17 +5135,22 @@ test_verify_one_file! {
     }
 }
 
-// Loop with non-empty cond_setup (#114 sub-feature 1). A function
-// call in the loop's cond triggers Verus's `expr_to_stm_opt` to
-// produce setup-stmts for the call result. Pre-#114 we rejected;
-// post-#114 the cond_setup walks as a wp prefix in both the maintain
-// and use ctx (mirroring Verus's two-query encoding). Pins that the
-// pre-#114 rejection error is gone. Closing the resulting Lean
-// goals needs a tactus_tactic override (#128) — the encoding is
-// correct; the automation is the gap. See DESIGN.md "Loop-shape
-// restrictions" for full details.
+// Loop with non-empty cond_setup (#114 sub-feature 1) + ret-substitution
+// (#128). A function call in the loop's cond triggers Verus's
+// `expr_to_stm_opt` to produce setup-stmts for the call result. Pre-#114
+// we rejected outright; post-#114 the cond_setup walks as a wp prefix in
+// both the maintain and use ctx (mirroring Verus's two-query encoding),
+// but the resulting Lean goals had `∀ ret : Prop, ret = (x > 0) → …`
+// shapes that tactus_auto's default closer couldn't discharge — users
+// needed `#[verifier::tactus_tactic("intros; simp_all; omega")]` and even
+// then not all obligations closed.
+//
+// Post-#128: when the callee's ensures uniquely determines the return
+// value via `r == E`, codegen substitutes E for r directly (skipping the
+// ∀ quantifier and binding `dest := E`). Tactus_auto closes the resulting
+// goal natively; the override is no longer needed.
 test_verify_one_file! {
-    #[test] test_exec_loop_cond_with_setup_no_longer_rejected verus_code! {
+    #[test] test_exec_loop_cond_with_setup verus_code! {
         fn keep_going(x: u8) -> (r: bool)
             ensures r == (x > 0)
         {
@@ -5153,7 +5158,6 @@ test_verify_one_file! {
         }
 
         #[verifier::tactus_auto]
-        #[verifier::tactus_tactic("intros; simp_all; omega")]
         fn count_down(n: u8) -> (r: u8)
             ensures r <= n
         {
@@ -5166,20 +5170,111 @@ test_verify_one_file! {
             }
             x
         }
+    } => Ok(())
+}
+
+// #128: ret-substitution baseline. Callee with `ensures r == E`; caller's
+// post-call obligation depends on knowing `y == E`. Pre-#128, the goal had
+// `∀ ret, ret = E → …` which omega could close via the `ret = E` hyp; but
+// the substitution path now produces `let y := E; …` with omega seeing the
+// arithmetic directly. Both paths verify; this test pins the substituted
+// shape works.
+test_verify_one_file! {
+    #[test] test_exec_call_ret_eq_substitution verus_code! {
+        fn add_one_uniq(x: u8) -> (r: u8)
+            requires x < 255
+            ensures r == x + 1
+        {
+            x + 1
+        }
+
+        #[verifier::tactus_auto]
+        fn caller_uniq(x: u8) -> (s: u8)
+            requires x < 200
+            ensures s == x + 1
+        {
+            let y = add_one_uniq(x);
+            y
+        }
+    } => Ok(())
+}
+
+// #128: ret-substitution with EXTRA conjunct. Ensures has form
+// `r == E ∧ Q(r)`. After substitution, `Q(r)` becomes `Q(E)` and is
+// emitted as the `rest_ensures` Hyp. Caller relies on Q(E) for the
+// post-call obligation.
+test_verify_one_file! {
+    #[test] test_exec_call_ret_eq_with_extra_conjunct verus_code! {
+        fn double_pos(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == 2 * x, r >= 2 * x
+        {
+            2 * x
+        }
+
+        #[verifier::tactus_auto]
+        fn caller_eq_extra(x: u8) -> (s: u8)
+            requires x < 50
+            ensures s >= 2 * x
+        {
+            let y = double_pos(x);
+            y
+        }
+    } => Ok(())
+}
+
+// #128: ret-substitution NEGATIVE — caller asserts wrong post-call value.
+// Pins that the substitution produces a real obligation, not a permissive
+// pass: substituting `y := x + 1` and asserting `s == x + 2` should fail
+// the postcondition.
+test_verify_one_file! {
+    #[test] test_exec_call_ret_eq_substitution_wrong_post verus_code! {
+        fn add_one_uniq2(x: u8) -> (r: u8)
+            requires x < 255
+            ensures r == x + 1
+        {
+            x + 1
+        }
+
+        #[verifier::tactus_auto]
+        fn caller_wrong_uniq(x: u8) -> (s: u8)
+            requires x < 200
+            ensures s == x + 2
+        {
+            let y = add_one_uniq2(x);
+            y
+        }
     } => Err(err) => {
-        // Some obligations may still fail under the override (omega
-        // doesn't always handle the Prop substitution chain), but
-        // the OLD rejection ("loop condition has a setup-statement
-        // prelude") must be GONE. The cond_setup transform fires;
-        // proof obligations (now Lean-side) replace the up-front
-        // rejection.
         let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
         assert!(
-            !msgs.iter().any(|m| m.contains("setup-statement prelude")),
-            "expected the pre-#114 rejection to be gone; got: {:?}",
+            msgs.iter().any(|m| m.contains("(postcondition)")),
+            "expected (postcondition) failure from wrong post-call assertion. got: {:?}",
             msgs,
         );
     }
+}
+
+// #128: fall-through path. Callee with NO `r == E` clause — ensures only
+// constrains r via inequality (`r > 0`). The ∀-path stays in effect; pin
+// that this still verifies (no regression in the conservative scope).
+test_verify_one_file! {
+    #[test] test_exec_call_no_ret_eq_falls_through verus_code! {
+        fn pos_lt_10(x: u8) -> (r: u8)
+            requires x < 5
+            ensures r > 0, r < 10
+        {
+            x + 1
+        }
+
+        #[verifier::tactus_auto]
+        fn caller_falls_through(x: u8) -> (s: u8)
+            requires x < 5
+            ensures s > 0
+        {
+            let y = pos_lt_10(x);
+            y
+        }
+    } => Ok(())
 }
 
 // `break` inside the loop body. Verus compiles this to a non-simple
