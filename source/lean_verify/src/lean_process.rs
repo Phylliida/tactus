@@ -100,6 +100,18 @@ fn split_goal_state(data: &str) -> Option<(&str, &str)> {
 /// The source is expected to already be on disk at `file_path`; this function
 /// does not write. See `generate::check_proof_fn` / `check_exec_fn` for the
 /// full write-then-check flow.
+///
+/// **Lake bypass when `LEAN_PATH` is already set.** Running `lake env lean`
+/// acquires a per-project configuration lock — fine for one-off invocations,
+/// but parallel test runs hit
+/// `could not acquire an exclusive configuration lock` errors when multiple
+/// processes call `lake env` simultaneously. Once Mathlib's `LEAN_PATH` is
+/// known (e.g., resolved once by the test harness via
+/// `lake env printenv LEAN_PATH`), the parent process can export `LEAN_PATH`
+/// before spawning verification subprocesses, and we run `lean` directly
+/// without going through lake. The subprocess inherits `LEAN_PATH` and
+/// resolves imports via that without acquiring a lock. See
+/// `rust_verify_test/tests/common/mod.rs` for the harness side.
 pub fn check_lean_file(
     file_path: &std::path::Path,
     lake_dir: Option<&std::path::Path>,
@@ -108,17 +120,28 @@ pub fn check_lean_file(
         .unwrap_or_else(|_| file_path.to_path_buf());
     let path_str = abs_path.to_string_lossy().into_owned();
 
-    let (mut command, label) = match lake_dir {
-        Some(dir) => {
+    // If `LEAN_PATH` is already populated in the process environment,
+    // we can skip lake entirely — Lean will resolve imports via the
+    // pre-set path and we avoid lake's configuration lock. See the
+    // doc comment above for the full rationale.
+    let lean_path_set = std::env::var_os("LEAN_PATH")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+
+    let (mut command, label) = match (lake_dir, lean_path_set) {
+        (Some(_), true) | (None, _) => {
+            // No lake_dir means we never had Mathlib intended; or
+            // LEAN_PATH is already set so lake's configuration is
+            // unnecessary. Either way, plain `lean`.
+            let mut c = Command::new("lean");
+            c.args(["--json", &path_str]);
+            (c, "lean")
+        }
+        (Some(dir), false) => {
             let mut c = Command::new("lake");
             c.args(["env", "lean", "--json", &path_str]);
             c.current_dir(dir);
             (c, "lake env lean")
-        }
-        None => {
-            let mut c = Command::new("lean");
-            c.args(["--json", &path_str]);
-            (c, "lean")
         }
     };
     command

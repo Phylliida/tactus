@@ -69,6 +69,69 @@ thread_local! {
     pub static THREAD_LOCAL_TEST_NAME: RefCell<Option<String>> = RefCell::new(None);
 }
 
+/// Process-wide cache of the Tactus lake project's `LEAN_PATH`.
+///
+/// Resolving this once at the test-binary level (via
+/// `lake env printenv LEAN_PATH` in the lake-project dir) and exporting
+/// it on every spawned rust_verify subprocess lets each subprocess'
+/// `lean_verify::lean_process::check_lean_file` skip the
+/// `lake env lean` indirection — `lake env` acquires a per-project
+/// configuration lock and parallel invocations hit
+/// `could not acquire an exclusive configuration lock` errors. With
+/// `LEAN_PATH` already set, lean_process.rs runs bare `lean` and the
+/// lock contention disappears.
+///
+/// First call runs lake once (acquires + releases the lock briefly);
+/// every subsequent test inherits the cached value. Lake updates that
+/// would change the path require a fresh test-binary process.
+fn cached_lean_path_for_lake_project() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        // Resolve the lake project dir the same way
+        // `lean_verify::project::default_project_dir` does — env override
+        // first, then `<repo>/lean-project` relative to source/.
+        let project_dir = if let Ok(d) = std::env::var("TACTUS_LEAN_PROJECT") {
+            std::path::PathBuf::from(d)
+        } else {
+            // CARGO_MANIFEST_DIR for rust_verify_test is
+            // `<repo>/source/rust_verify_test`. ../../lean-project gives
+            // the project dir relative to that.
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(2)
+                .map(|p| p.join("lean-project"))
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+        };
+        if !project_dir.join("lakefile.lean").exists() {
+            // No project — cargo-verus user without Mathlib setup. Tests
+            // that need Mathlib will surface their own errors; harness
+            // doesn't need to participate.
+            return None;
+        }
+        let output = std::process::Command::new("lake")
+            .args(["env", "printenv", "LEAN_PATH"])
+            .current_dir(&project_dir)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let s = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    }).as_deref()
+}
+
+/// Apply the cached `LEAN_PATH` (if available) to a child process about
+/// to spawn rust_verify or cargo-verus. Both code paths need this for
+/// the lake-bypass to take effect; centralised so adding a third
+/// spawn site stays consistent.
+fn inject_cached_lean_path(child: &mut std::process::Command) {
+    if let Some(path) = cached_lean_path_for_lake_project() {
+        child.env("LEAN_PATH", path);
+    }
+}
+
 #[allow(dead_code)]
 pub fn verify_files_vstd(
     name: &str,
@@ -431,6 +494,10 @@ pub fn run_verus(
     // `TACTUS_LEAN_OUT` to a per-test dir gives each test its
     // own output tree.
     child.env("TACTUS_LEAN_OUT", test_dir.join("tactus-lean"));
+    // Inherit the cached LEAN_PATH so the rust_verify subprocess'
+    // `lean_verify::check_lean_file` skips `lake env` (avoids
+    // configuration-lock contention under parallel test runs).
+    inject_cached_lean_path(&mut child);
     let child = child
         .args(&verus_args[..])
         .stdout(std::process::Stdio::piped())
@@ -491,6 +558,10 @@ pub fn run_cargo_verus(args: &[&str], dir: &std::path::Path) -> std::process::Ou
     // the same protection — set it preemptively so adding such a
     // test doesn't silently regress to shared-output races.
     child.env("TACTUS_LEAN_OUT", dir.join("tactus-lean"));
+    // Same lake-bypass setup as `run_verus` — see the doc comment on
+    // `cached_lean_path_for_lake_project` for why this matters under
+    // parallel test runs.
+    inject_cached_lean_path(&mut child);
 
     let child = child
         .args(&args[..])

@@ -5095,6 +5095,46 @@ test_verify_one_file! {
     }
 }
 
+// #129 regression test: pre-fix, Tactus's loop decrease emitted
+// just `cur < d_old` with no `0 ≤ cur` lower bound. For an
+// int-typed decrease that can become negative (here `x as int - 50`
+// with `x: u8` starting small), the bare `cur < prev` obligation
+// trivially succeeds even though `cur` is descending into negatives
+// — the measure is "well-founded" only because Tactus didn't check
+// it stayed ≥ 0. Verus's loop encoding (sst_to_air.rs:2823-2834)
+// goes through `recursion::check_decrease` which produces
+// `0 ≤ cur ∧ cur < d_old`. Post-#129 Tactus matches: this loop
+// fails `(loop decrease)` because we can't establish
+// `0 ≤ x as int - 50` from the loop invariant `x ≤ start ≤ 10`.
+test_verify_one_file! {
+    #[test] test_exec_loop_decrease_int_expression_can_go_negative verus_code! {
+        #[verifier::tactus_auto]
+        fn descending(start: u8) -> (r: u8)
+            requires start <= 10
+            ensures r == 0
+        {
+            let mut x: u8 = start;
+            while x > 0
+                invariant x <= start
+                decreases x as int - 50
+            {
+                x = x - 1;
+            }
+            x
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1,
+            "loop with int decrease that goes negative should fail post-#129");
+        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("(loop decrease)")),
+            "expected (loop decrease) kind label from #129's missing 0 ≤ cur \
+             lower bound. got: {:?}",
+            msgs,
+        );
+    }
+}
+
 // Loop with non-empty cond_setup (#114 sub-feature 1). A function
 // call in the loop's cond triggers Verus's `expr_to_stm_opt` to
 // produce setup-stmts for the call result. Pre-#114 we rejected;
