@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**271 end-to-end tests + 1 coverage test + 130 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**271 end-to-end tests + 1 coverage test + 131 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -2152,6 +2152,65 @@ dual-name issue) and the conservative scope on the And-tree walk
 agent and let it find the holes. Cheaper than the next session
 re-discovering an unsoundness.
 
+#### Current session (2026-05-04 cont. — #119 lift_if_value chain-lift through let chains)
+
+Closed #119. The DESIGN.md entry described `lift_if_value` as
+single-binder-only; investigation showed multi-binder unfolding
+landed via #92 but the chain-lift through the unfolded form was
+incomplete — the OUTERMOST binder's rhs was lifted but inner
+binders' rhs ifs stayed in value position.
+
+**The fix:** when peeling `Bind(Let([name]), inner_body)`, recurse
+into both `rhs` AND `inner_body` (was: render inner_body as-is).
+The recursion lets ifs in any binder's rhs lift to goal level —
+mirroring what `let (a, b) = (val_a, if c then bv else bv2); body`
+should produce after #92's unfold.
+
+**The bug the first attempt surfaced:** unconditional recursion
+broke match-compilation tests. Verus desugars `match k { ... }` to
+`let _disc := proj(k); if _disc = 0 then ... else ...` — the if's
+condition references `_disc`, which IS the let-bound name. Lifting
+the if moves `_disc = 0` outside the `let _disc :=` scope,
+producing an unbound reference. Sanity check caught it as
+"unresolved `tmp__`" / "unresolved `x`".
+
+**The safety guard:** gate the recursion on
+`inner_is_let_chain` — only lift when `inner_body` is itself a
+`Bind(Let, …)` (the multi-binder-unfold case, where ifs are in
+rhs positions, computed before any of the chain's binders take
+effect). When `inner_body` is `If` at top level, fall through
+to render-as-is — matches the pre-#119 behavior, lets
+`tactus_case_split` handle match-style ifs at the obligation
+level.
+
+**Tests** (1 new, 130 → 131 unit; e2e unchanged):
+- `lift_if_value_multi_binder_let_with_if_rhs` — pins the
+  chain-lift through `let a := av; let b := if c then bv else
+  bv2; body` produces `(c → emit_leaf(let a := av; let b := bv;
+  body)) ∧ (¬c → emit_leaf(let a := av; let b := bv2; body))`.
+  Previously fell through to render-as-is.
+
+**Discipline note worth recording: probe-then-revert-then-guard.**
+First attempt (unconditional recursion) failed on match tests.
+Probed the failure (sanity-check unresolved-name errors), traced
+to scoping (`_disc` referenced outside its let scope), added the
+`inner_is_let_chain` gate. The full arc was three iterations:
+draft → fail → fix-with-guard. Without the failing tests, the
+unconditional version would have shipped a real soundness bug.
+The lens worth keeping: when extending a recursive transformation,
+ask "is there a case where the recursion produces an unbound
+reference?" — and trust the existing test suite to catch what
+abstract reasoning misses.
+
+**DESIGN.md updates:**
+- Two stale entries (1078 and 1149 in the deferral catalogue)
+  flipped to LANDED via #119 with cross-references to the safety
+  gate and the pinned test.
+
+**Net for the session**: 1 commit incoming. 130 → 131 unit, 271
+e2e + 1 coverage + 7 integration unchanged. One pending task
+closed (#119). Down to 16 pending tasks.
+
 ## Architecture
 
 ### Full pipeline
@@ -2646,7 +2705,7 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 
 | Binary | Count | What it tests |
 |---|---|---|
-| `cargo test -p lean_verify --lib` | 130 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking + prelude-name auto-derivation, `format_rust_loc`, lean_process, `LeanName` constructors |
+| `cargo test -p lean_verify --lib` | 131 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` (incl. multi-binder chain lift) / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking + prelude-name auto-derivation, `format_rust_loc`, lean_process, `LeanName` constructors |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
 | `vargo test -p rust_verify_test --test tactus` | 271 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body + &mut x.f via structure update, trait-method calls with impl-strengthened ensures + default-impl invocation, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression, new-mut-ref callee-side normalization, exec closure declarations + body verification scope + spec-closure calls, lexicographic decreases for fns + loops with `0 ≤ cur` lower bound, ret-substitution at call sites for `r == E` ensures) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |

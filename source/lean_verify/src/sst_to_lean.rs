@@ -2924,14 +2924,49 @@ fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
                 }
             }
             if let Some((name, rhs, inner_body)) = match_single_let_bind(bnd, body) {
-                // `name` is already an owned `String` from
-                // `match_single_let_bind`; the closure captures
-                // it by reference and clones per leaf invocation.
-                let body_ast = sst_exp_to_ast_checked(inner_body)
-                    .expect("lift_if_value let-body: sub of validated Exp tree");
-                lift_if_value(rhs, &|rhs_leaf| {
-                    emit_leaf(LExpr::let_bind(name.clone(), rhs_leaf, body_ast.clone()))
-                })
+                // Decide whether to recurse into `inner_body` for further
+                // lifting (#119). The recursion is SAFE when `inner_body`
+                // is itself a `Bind(Let, …)` chain — the ifs we'd lift
+                // are in the next level's rhs position, computed before
+                // any of those binders take effect, so lifting their
+                // conditions doesn't move them out of any in-scope let.
+                // This is the multi-binder-unfold case (`let a := av;
+                // let b := if c …; body` → lift `c`).
+                //
+                // It's UNSAFE when `inner_body` is `If` at top level —
+                // its condition may reference the let-bound `name`,
+                // which lifting would move outside the `let name := rhs;`
+                // scope, producing an unbound reference. The match-
+                // compilation shape (`let _disc := proj(k); if _disc = 0
+                // then … else …`) is exactly this case — `_disc = 0`
+                // references `_disc`. For that shape we render inner
+                // body as-is, preserving original behavior; the
+                // tactus_case_split tactic handles match-style ifs
+                // separately at the obligation level.
+                //
+                // Other shapes (Match, Var, applications with if buried
+                // deeper, …) also fall through to render-as-is — we
+                // only apply the lift when we can prove safety
+                // structurally.
+                let peeled_inner = peel_value_position(inner_body);
+                let inner_is_let_chain = matches!(
+                    &peeled_inner.x,
+                    ExpX::Bind(b, _) if matches!(&b.x, BndX::Let(_))
+                );
+                if inner_is_let_chain {
+                    lift_if_value(rhs, &|rhs_leaf| {
+                        let name = name.clone();
+                        lift_if_value(inner_body, &|body_leaf| {
+                            emit_leaf(LExpr::let_bind(name.clone(), rhs_leaf.clone(), body_leaf))
+                        })
+                    })
+                } else {
+                    let body_ast = sst_exp_to_ast_checked(inner_body)
+                        .expect("lift_if_value let-body: sub of validated Exp tree");
+                    lift_if_value(rhs, &|rhs_leaf| {
+                        emit_leaf(LExpr::let_bind(name.clone(), rhs_leaf, body_ast.clone()))
+                    })
+                }
             } else {
                 emit_leaf(sst_exp_to_ast_checked(e)
                     .expect("lift_if_value bind-fallthrough: validated upstream"))
@@ -4465,6 +4500,80 @@ mod tests {
             LExpr::let_bind_synthetic("y", LExpr::var_lit("x"), LExpr::var_lit("y")),
             LExpr::var_lit("done"));
         assert!(pp_eq(&out, &expected));
+    }
+
+    /// Pin that `lift_if_value` correctly handles multi-binder
+    /// `Bind(Let([a, b], …))` shapes — the construction Verus would
+    /// emit for `let (a, b) = (1, if c then 2 else 3); a + b`. The
+    /// inner if must lift to goal level, with both binders in scope
+    /// in each branch.
+    ///
+    /// Code path: `lift_if_value`'s `bs.len() > 1` branch unfolds to
+    /// `Bind(Let([a]), Bind(Let([b]), body))` via `unfold_multi_binder_let`,
+    /// then the existing single-binder logic peels each layer. This
+    /// test exists to lock that pipeline against regression — without
+    /// it, the multi-binder support has no direct unit-level proof
+    /// (e2e tests don't exercise tuple-destructure-with-if patterns).
+    /// Originally landed via #92; pinned by #119 follow-up.
+    #[test]
+    fn lift_if_value_multi_binder_let_with_if_rhs() {
+        use vir::ast::VarBinderX;
+        use vir::def::Spanned;
+
+        let c = var_exp("c", typ_bool());
+        let a_val = var_exp("av", typ_int());
+        let b_val = var_exp("bv", typ_int());
+        let bv_else = var_exp("bv2", typ_int());
+        let body = var_exp("a", typ_int());
+        let if_for_b = if_exp(c, b_val, bv_else);
+        let binders: Vec<Arc<VarBinderX<Exp>>> = vec![
+            Arc::new(VarBinderX { name: var_ident("a"), a: a_val }),
+            Arc::new(VarBinderX { name: var_ident("b"), a: if_for_b }),
+        ];
+        let bnd = Spanned::new(
+            test_span(),
+            BndX::Let(Arc::new(binders)),
+        );
+        let body_typ = body.typ.clone();
+        let e = Arc::new(SpannedTyped {
+            span: test_span(),
+            typ: body_typ,
+            x: ExpX::Bind(bnd, body),
+        });
+
+        let out = lift_if_value(&e, &|leaf| {
+            LExpr::let_bind_synthetic("out", leaf, LExpr::var_lit("done"))
+        });
+
+        // After unfolding to `Bind(Let([a := av]), Bind(Let([b := if c…]), body))`,
+        // the outer single-binder peel recurses into both rhs (av, plain)
+        // and inner_body (which itself is a single-binder let with an if-rhs).
+        // The inner if lifts to goal level. The emit_leaf then wraps EACH
+        // branch with the `let out := …; done` outer scaffold.
+        //
+        //   (c → emit_leaf(let a := av; let b := bv; a))
+        //   ∧ (¬c → emit_leaf(let a := av; let b := bv2; a))
+        //
+        // Equivalent to `let out := let a := av; (c → … ∧ ¬c → …); done` by
+        // distributing the let over the disjunction, but the actual emission
+        // hoists the disjunction to the outermost level since that's where
+        // omega expects it.
+        let make_branch = |b_val: &str| {
+            let inner_let = LExpr::let_bind_synthetic("b",
+                LExpr::var_lit(b_val), LExpr::var_lit("a"));
+            let with_a = LExpr::let_bind_synthetic("a",
+                LExpr::var_lit("av"), inner_let);
+            LExpr::let_bind_synthetic("out", with_a, LExpr::var_lit("done"))
+        };
+        let expected = LExpr::and(
+            LExpr::implies(LExpr::var_lit("c"), make_branch("bv")),
+            LExpr::implies(LExpr::not(LExpr::var_lit("c")), make_branch("bv2")),
+        );
+
+        assert!(pp_eq(&out, &expected),
+            "got: {}\nexpected: {}",
+            crate::lean_pp::pp_expr(&out),
+            crate::lean_pp::pp_expr(&expected));
     }
 
     // ── extract_simple_var ─────────────────────────────────────
