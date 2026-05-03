@@ -272,6 +272,14 @@ fn name_resolves(name: &str, defined: &HashSet<String>, scope: &HashSet<String>)
     // Keyword-quoted names (our sanitizer wraps Lean keywords in `«…»`)
     // always pass — they're not valid raw identifiers anyway.
     if name.starts_with('«') { return true; }
+    // Tactus prelude axioms / defs / macros / tactic-syntax names —
+    // resolved by the `Command::Raw` preamble that ships TactusPrelude.lean,
+    // not by our own emitted declarations. Auto-derived from the prelude
+    // text (#118) so adding a new def/axiom/macro/syntax/elab in
+    // TactusPrelude.lean automatically updates the allowlist — no
+    // hand-sync chore. (Convention 4 in `expr_shared.rs`'s "Reserved
+    // identifier conventions": bare names in TactusPrelude.lean.)
+    if cached_prelude_names().contains(name) { return true; }
     // Lean / Mathlib built-in type and value names we expect callers to
     // reference without an explicit import chain through our command stream.
     matches!(name,
@@ -285,17 +293,82 @@ fn name_resolves(name: &str, defined: &HashSet<String>, scope: &HashSet<String>)
         // accessor functions for multi-variant inductives.
         | "default"
         | "()"
-        // Tactus prelude axioms / defs / macros — resolved by the
-        // `Command::Raw` block in the preamble, not by our own
-        // declarations, so the sanity check needs them explicitly.
-        // (Convention 4 in `expr_shared.rs`'s "Reserved identifier
-        // conventions" section: bare names in TactusPrelude.lean.)
-        // Adding a new prelude def or tactic means updating this
-        // allowlist.
-        | "arch_word_bits" | "arch_word_bits_valid"
-        | "usize_hi" | "isize_hi"
-        | "tactus_peel" | "tactus_usize_bound"
     )
+}
+
+/// Cached set of top-level names defined in `TactusPrelude.lean`.
+///
+/// Resolved lazily on first use via `extract_prelude_names`. Used by
+/// `name_resolves` to allow generated AST nodes to reference prelude
+/// names (axioms, defs, tactic syntaxes/macros/elabs) without each
+/// being explicitly hardcoded — the previous design required a manual
+/// `matches!` arm update every time a prelude def landed.
+fn cached_prelude_names() -> &'static HashSet<String> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<HashSet<String>> = OnceLock::new();
+    CACHE.get_or_init(|| extract_prelude_names(crate::prelude::TACTUS_PRELUDE))
+}
+
+/// Parse `TactusPrelude.lean` text and extract top-level names that
+/// generated code may reference.
+///
+/// Recognised forms (one per line; the prelude has been simple enough
+/// for line-based parsing to suffice):
+/// * `axiom NAME : ...` — e.g., `arch_word_bits`.
+/// * `def NAME ...` / `noncomputable def NAME ...` — e.g., `usize_hi`.
+///   `noncomputable` may also follow other modifiers (`private`, `abbrev`)
+///   if added later; we accept any leading-keyword soup that ends with
+///   `def `.
+/// * `syntax "NAME" ...` — e.g., `tactus_first`. The double-quoted
+///   string literal is the introduced tactic name.
+/// * `macro "NAME" ...` — e.g., `tactus_auto`.
+/// * `elab "NAME" ...` — e.g., `tactus_case_split`.
+///
+/// Lines starting with `--` (comments) are skipped. `attribute`,
+/// `import`, `set_option`, `open`, `macro_rules` introduce no names
+/// of their own and are silently passed over.
+///
+/// **Why parse at runtime instead of build-time?** The prelude is
+/// ~150 lines and the parse runs at most once per process via
+/// `OnceLock`. Build-time codegen (build.rs) would add a dependency
+/// graph entry without saving meaningful work. Robustness: if the
+/// prelude grows enough that line-based parsing misses a form, the
+/// regression surfaces as a sanity-check false positive on the
+/// referenced name — easy to diagnose.
+fn extract_prelude_names(prelude: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for raw in prelude.lines() {
+        let line = raw.trim_start();
+        if line.starts_with("--") || line.is_empty() { continue; }
+
+        // axiom NAME : …  /  def NAME …  /  noncomputable def NAME …
+        let after_kw = line.strip_prefix("axiom ")
+            .or_else(|| line.strip_prefix("noncomputable def "))
+            .or_else(|| line.strip_prefix("def "));
+        if let Some(rest) = after_kw {
+            let name: String = rest.chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                names.insert(name);
+            }
+            continue;
+        }
+
+        // syntax "NAME" …  /  macro "NAME" …  /  elab "NAME" …
+        for prefix in &["syntax \"", "macro \"", "elab \""] {
+            if let Some(rest) = line.strip_prefix(*prefix) {
+                if let Some(end) = rest.find('"') {
+                    let name = &rest[..end];
+                    if !name.is_empty() {
+                        names.insert(name.to_string());
+                    }
+                }
+                break;
+            }
+        }
+    }
+    names
 }
 
 #[cfg(test)]
@@ -427,5 +500,102 @@ mod tests {
             tactic: Tactic::Named("sorry".into()),
         };
         assert!(check_references(&[Command::Theorem(t)]).is_empty());
+    }
+
+    /// Pin the prelude-name extractor against the actual `TactusPrelude.lean`.
+    ///
+    /// If a contributor adds a new top-level def/axiom/macro/syntax/elab
+    /// to TactusPrelude.lean, this test confirms it lands in the allowlist
+    /// without a corresponding `sanity.rs` edit. If a contributor introduces
+    /// a new prelude-form syntax our parser doesn't recognise (e.g.,
+    /// multi-line `def NAME\n  : Ty := …`), this test is the most natural
+    /// place to fail loudly.
+    #[test]
+    fn extract_prelude_names_recognises_current_prelude() {
+        let names = extract_prelude_names(crate::prelude::TACTUS_PRELUDE);
+        // Axioms.
+        assert!(names.contains("arch_word_bits"),
+            "expected `arch_word_bits` in extracted prelude names; got {:?}", names);
+        assert!(names.contains("arch_word_bits_valid"));
+        // noncomputable defs.
+        assert!(names.contains("usize_hi"));
+        assert!(names.contains("isize_hi"));
+        // syntax-introduced tactic names.
+        assert!(names.contains("tactus_first"));
+        assert!(names.contains("tactus_peel"));
+        // macro-introduced tactic names.
+        assert!(names.contains("tactus_auto"));
+        assert!(names.contains("tactus_usize_bound"));
+        // elab-introduced tactic names.
+        assert!(names.contains("tactus_case_split"));
+    }
+
+    #[test]
+    fn extract_prelude_names_skips_non_definition_lines() {
+        // `import`, `set_option`, `attribute`, `open`, comments, blank
+        // lines — none introduces a top-level name we should allowlist.
+        let synthetic = r#"
+            import Lean
+            set_option maxHeartbeats 800000
+            -- This is a comment
+            -- axiom not_a_real_axiom : Nat
+            open Classical in
+            attribute [instance] Classical.propDecidable
+            macro_rules
+              | `(tactic| tactus_first $[| $ts:tacticSeq]*) => `(tactic| skip)
+        "#;
+        let names = extract_prelude_names(synthetic);
+        assert!(names.is_empty(),
+            "non-definition lines shouldn't introduce names; got {:?}", names);
+    }
+
+    #[test]
+    fn extract_prelude_names_handles_each_form() {
+        let synthetic = r#"
+            axiom my_axiom : Nat
+            def my_def : Int := 0
+            noncomputable def my_ncdef : Int := 1
+            syntax "my_syntax" : tactic
+            macro "my_macro" : tactic => `(tactic| skip)
+            elab "my_elab" : tactic => do return
+        "#;
+        let names = extract_prelude_names(synthetic);
+        for expected in &["my_axiom", "my_def", "my_ncdef",
+                          "my_syntax", "my_macro", "my_elab"] {
+            assert!(names.contains(*expected),
+                "expected `{}` in {:?}", expected, names);
+        }
+    }
+
+    /// Regression guard: every name the old hardcoded allowlist had
+    /// should still be accepted via the auto-derived path. Catches any
+    /// future TactusPrelude.lean refactor that removes one of these
+    /// without realising the sanity-check depended on it.
+    #[test]
+    fn cached_prelude_names_includes_legacy_allowlist() {
+        let cached = cached_prelude_names();
+        for legacy in &["arch_word_bits", "arch_word_bits_valid",
+                        "usize_hi", "isize_hi",
+                        "tactus_peel", "tactus_usize_bound"] {
+            assert!(cached.contains(*legacy),
+                "legacy allowlist name `{}` missing from auto-derived set; \
+                 did TactusPrelude.lean change?", legacy);
+        }
+    }
+
+    /// Pin that `name_resolves` accepts a prelude-defined name. Catches
+    /// regressions where the wiring between `cached_prelude_names`
+    /// and `name_resolves` breaks (e.g., someone re-introducing the
+    /// hardcoded `matches!` arm without removing the cache lookup, or
+    /// vice versa).
+    #[test]
+    fn name_resolves_accepts_prelude_name() {
+        let defined = HashSet::new();
+        let scope = HashSet::new();
+        assert!(name_resolves("arch_word_bits", &defined, &scope));
+        assert!(name_resolves("usize_hi", &defined, &scope));
+        assert!(name_resolves("tactus_peel", &defined, &scope));
+        // Sanity: a made-up name is still rejected.
+        assert!(!name_resolves("not_a_prelude_name_xyz", &defined, &scope));
     }
 }
