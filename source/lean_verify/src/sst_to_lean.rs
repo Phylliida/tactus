@@ -2552,11 +2552,14 @@ enum Wp<'a> {
         ///
         /// The maintain obligation is the lex disjunction built by
         /// `lex_decrease_obligation`:
-        ///   (D1' < D1_old)
-        ///     ∨ (D1' = D1_old ∧ (D2' < D2_old)
-        ///         ∨ (D2' = D2_old ∧ ... (Dn' < Dn_old)))
-        /// which generalises the single-expression case
-        /// (`(D1' < D1_old) ∨ (D1' = D1_old ∧ False) ≡ D1' < D1_old`).
+        ///   (0 ≤ D1' ∧ D1' < D1_old)
+        ///     ∨ (D1' = D1_old ∧ ((0 ≤ D2' ∧ D2' < D2_old)
+        ///         ∨ (D2' = D2_old ∧ ... (0 ≤ Dn' ∧ Dn' < Dn_old))))
+        /// which generalises the single-expression case (the eq tail
+        /// collapses against an absent next level). The `0 ≤ Di'`
+        /// lower bound mirrors the fn-level `CheckDecreaseHeight` int
+        /// fast-path; #129 closed the prior gap where Tactus emitted
+        /// just `Di' < Di_old`.
         decrease: Vec<DecreaseLevel<'a>>,
         modified_vars: Vec<(&'a VarIdent, &'a Typ)>,
         body: Box<Wp<'a>>,
@@ -3674,15 +3677,18 @@ fn build_wp_loop<'a>(
             .map(|((i, v), _)| inv_marked((i, v))).collect()
     );
     // Build the lex-shaped decrease obligation for the maintain leaf:
-    //   (D1' < D1_old)
-    //     ∨ (D1' = D1_old ∧ ((D2' < D2_old)
-    //         ∨ (D2' = D2_old ∧ ... (Dn' < Dn_old))))
-    // Single-element decreases reduce to `D' < D_old` because the
-    // recursion's base is `False` (no further levels), and
-    // `(D = D_old) ∧ False = False`, so the second disjunct vanishes.
-    // Mirrors Verus's own `recursion::check_decrease` shape (which
-    // builds the recursive obligation via CheckDecreaseHeight's
-    // `otherwise` field at the fn level).
+    //   (0 ≤ D1' ∧ D1' < D1_old)
+    //     ∨ (D1' = D1_old ∧ ((0 ≤ D2' ∧ D2' < D2_old)
+    //         ∨ (D2' = D2_old ∧ ... (0 ≤ Dn' ∧ Dn' < Dn_old))))
+    // Single-element decreases reduce to `0 ≤ D' ∧ D' < D_old`
+    // because the recursion's base is `False` (no further levels),
+    // and `(D = D_old) ∧ False = False`, so the second disjunct
+    // vanishes. The `0 ≤ Di'` lower bound matches Verus's own
+    // `recursion::check_decrease` shape (which builds the obligation
+    // via CheckDecreaseHeight's `otherwise` field at the fn level —
+    // the int fast-path emits `0 ≤ cur ∧ cur < prev`). #129 closed
+    // the prior gap where Tactus's loop encoding emitted just
+    // `cur < d_old`.
     let decrease_lex = lex_decrease_obligation(&decrease_levels);
     let decrease_marked = LExpr::span_mark(
         format_rust_loc(&decrease[0].span),
@@ -3746,19 +3752,31 @@ fn build_wp_loop<'a>(
 }
 
 /// Build the lexicographic decrease obligation as one LExpr. Each
-/// level becomes a `(cur < old)` test, with equality-falls-through
-/// to the next level. Empty input is a contract violation (rejected
-/// upstream in `build_wp_loop`).
+/// level's lt-branch is `(0 ≤ cur ∧ cur < old)`, with
+/// equality-falls-through to the next level. Empty input is a
+/// contract violation (rejected upstream in `build_wp_loop`).
+///
+/// The `0 ≤ cur` lower bound matches the fn-level `CheckDecreaseHeight`
+/// int fast-path (`to_lean_sst_expr.rs`'s arm — see #129). Verus's
+/// loop encoding (`sst_to_air.rs:2823-2834`) routes through
+/// `recursion::check_decrease` which produces the same shape; without
+/// the lower bound, an `int`-typed loop decrease descending into
+/// negatives would verify in Tactus where Verus rejects. For u-typed
+/// decreases the `0 ≤` is implied by the type-bound hypothesis
+/// (`h_<x>_bound`), so the extra conjunct is dormant in practice but
+/// cheap to omega.
 fn lex_decrease_obligation(levels: &[DecreaseLevel<'_>]) -> LExpr {
     debug_assert!(!levels.is_empty(),
         "lex_decrease_obligation needs ≥ 1 level (caller validates)");
     let cur = lower_validated(&levels[0].value);
     let old = LExpr::var_synthetic(levels[0].d_old_name.clone());
-    let lt_branch = LExpr::lt(cur.clone(), old.clone());
+    let lt_branch = LExpr::and(
+        LExpr::le(LExpr::lit_int("0"), cur.clone()),
+        LExpr::lt(cur.clone(), old.clone()),
+    );
     if levels.len() == 1 {
-        // Base case: `cur < old`. The lex tail (eq ∧ False) collapses,
-        // so we emit just the lt branch — identical to the pre-#110
-        // single-decrease shape.
+        // Base case: `0 ≤ cur ∧ cur < old`. The lex tail (eq ∧ False)
+        // collapses, so we emit just the lt branch.
         return lt_branch;
     }
     let eq_branch = LExpr::and(
@@ -4815,7 +4833,9 @@ mod tests {
     fn lex_decrease_obligation_three_levels_recurses_correctly() {
         // 3-level lex `decreases a, b, c`. Verify the obligation has
         // the expected shape:
-        //   (a < a_old) ∨ (a = a_old ∧ ((b < b_old) ∨ (b = b_old ∧ c < c_old)))
+        //   (0 ≤ a ∧ a < a_old) ∨
+        //     (a = a_old ∧ ((0 ≤ b ∧ b < b_old) ∨
+        //       (b = b_old ∧ (0 ≤ c ∧ c < c_old))))
         let levels = vec![
             mk_decrease_level("a", typ_int(), "a_old_test"),
             mk_decrease_level("b", typ_int(), "b_old_test"),
@@ -4829,25 +4849,26 @@ mod tests {
             assert!(printed.contains(s),
                 "expected `{}` in 3-level lex obligation; got: {}", s, printed);
         }
-        // Two `∨` (one per non-base level — the base just emits `<`).
+        // Two `∨` (one per non-base level — the base just emits the
+        // `0 ≤ cur ∧ cur < old` lt-branch).
         let or_count = printed.matches('∨').count();
         assert_eq!(or_count, 2,
             "3-level lex should have 2 disjunctions (one per non-base level); got {}: {}",
             or_count, printed);
-        // Two `=` from the equality-falls-through arms (one per
-        // non-base level), plus possibly more from sub-expressions.
-        // Just require ≥ 2.
-        let eq_count = printed.matches('=').count();
-        assert!(eq_count >= 2,
-            "3-level lex should have ≥ 2 `=`s (equality-falls-through); got {}: {}",
-            eq_count, printed);
+        // Three `≤` — one per level's `0 ≤ cur` lower bound (#129).
+        let le_count = printed.matches('≤').count();
+        assert_eq!(le_count, 3,
+            "3-level lex should have 3 `0 ≤ cur` lower bounds (one per level); got {}: {}",
+            le_count, printed);
     }
 
     #[test]
-    fn lex_decrease_obligation_single_level_collapses_to_lt() {
-        // Single-level case: just `cur < old`. The lex tail
+    fn lex_decrease_obligation_single_level_emits_lt_with_lower_bound() {
+        // Single-level case: `0 ≤ cur ∧ cur < old`. The lex tail
         // `(cur = old ∧ False)` collapses (recursion's base is
-        // structurally absent for len 1), so we emit just lt.
+        // structurally absent for len 1), so we emit just the
+        // lt-branch — but the lt-branch carries the `0 ≤` lower
+        // bound (#129).
         let levels = vec![
             mk_decrease_level("d", typ_int(), "d_old_test"),
         ];
@@ -4858,5 +4879,8 @@ mod tests {
             printed);
         assert!(!printed.contains('∨'),
             "single-level should have NO disjunction; got: {}", printed);
+        assert!(printed.contains('≤'),
+            "single-level should have `0 ≤ cur` lower bound (#129); got: {}",
+            printed);
     }
 }

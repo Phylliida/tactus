@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**266 end-to-end tests + 1 coverage test + 125 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**267 end-to-end tests + 1 coverage test + 125 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -1890,6 +1890,109 @@ something the level before missed.
 **Down to 19 pending tasks** (was 20 at afternoon end + 1 closed
 #114 + 3 created #127/#128/#129).
 
+#### Current session (2026-05-03 next day — #129 loop decrease 0 ≤ cur lower bound)
+
+Closed #129. The fix is two lines: `lex_decrease_obligation`'s
+lt-branch now emits `0 ≤ cur ∧ cur < old` instead of just
+`cur < old`, mirroring the fn-level `CheckDecreaseHeight` int
+fast-path in `to_lean_sst_expr.rs`. The lex disjunction tail is
+unchanged.
+
+**Why it matters.** Pre-fix, an `int`-typed loop decrease that
+descends into negatives forever still verified — Tactus's
+`cur < d_old` is trivially satisfiable by going negative. Verus's
+loop encoding (`sst_to_air.rs:2823-2834`) routes through
+`recursion::check_decrease` which produces the CheckDecreaseHeight
+chain *with* `0 ≤ cur`, so Tactus was strictly more permissive
+than Verus. Dormant in practice for u-typed decreases (where
+`0 ≤ x` falls out of `h_x_bound`), but structurally inconsistent.
+
+**Surfaced during yesterday's #110 lex work.** The shape-mismatch
+between fn-level CheckDecreaseHeight (`0 ≤ cur ∧ cur < prev`) and
+loop-level lex_decrease_obligation (`cur < old`) was visible
+immediately after writing them next to each other — see
+yesterday's poem "The third bound." Same lens that closed
+yesterday's same-day MutArgInfo regression (#105's pattern coming
+back as Vec<Validated> + Vec<String>): writing one new thing
+makes the shape of an old one visible.
+
+**Tests** (regression for the unsoundness).
+- `test_exec_loop_decrease_int_expression_can_go_negative`
+  (negative): a u8 loop with `decreases x as int - 50` where x
+  starts ≤ 10. Pre-fix verified despite the measure descending
+  into negatives. Post-fix fails `(loop decrease)` because
+  `0 ≤ x as int - 50` isn't establishable from the invariant.
+- Unit tests `lex_decrease_obligation_three_levels_recurses_correctly`
+  and `lex_decrease_obligation_single_level_emits_lt_with_lower_bound`
+  updated to pin the new shape (3 `≤`s for 3 levels; single-level
+  contains `≤` and no `∨`).
+- All existing lex-related tests pass unchanged: existing tests
+  use u-typed decreases where `0 ≤ x` falls out of h_x_bound, so
+  the strengthened obligation discharges via omega's
+  type-bound reasoning.
+
+**DESIGN.md updates:**
+- Removed #129 entry from "Soundness trade-offs accepted" — no
+  longer a trade-off.
+- "Lexicographic `decreases` — LANDED" entry updated with the
+  new lex shape (`0 ≤ Di' ∧ Di' < Di_old` per level) and points
+  at the regression test for #129.
+- `Wp::Loop` docstring + `lex_decrease_obligation` docstring +
+  `build_wp_loop` comment block all updated to the new shape.
+
+**Lake-lock parallel-test-run fix bundled in same session.**
+Multi-threaded `cargo test -p rust_verify_test --test tactus`
+hit a wave of `could not acquire an exclusive configuration lock`
+errors when many subprocesses called `lake env lean`
+simultaneously. Fixed by:
+* `tests/common/mod.rs`: `cached_lean_path_for_lake_project()`
+  resolves `LEAN_PATH` once per test-binary process via
+  `lake env printenv LEAN_PATH` (one lock acquisition).
+  `inject_cached_lean_path` injects it into every spawned
+  subprocess (`run_verus`, `run_cargo_verus`).
+* `lean_verify/src/lean_process.rs`: `check_lean_file` now
+  detects when `LEAN_PATH` is already set and runs bare
+  `lean --json <path>` instead of `lake env lean`. Subprocess
+  inherits `LEAN_PATH`, no lake invocation, no lock contention.
+* HANDOFF.md "Testing infrastructure" gained a new
+  "Lake-bypass under parallel test runs (`LEAN_PATH`)"
+  subsection documenting the fix + regression symptoms.
+
+Multi-threaded full e2e: was failing instantly under load,
+post-fix completes in **30 seconds** (was 25+ minutes
+single-threaded — ~50x speedup). Non-test users (direct
+`cargo verus` invocations without `LEAN_PATH` exported) keep
+the original `lake env lean` path — no behaviour change.
+
+**Net for the session**: 1 commit. 266 → 267 e2e tests (+1
+#129 regression test). Unit count unchanged. One pending task
+closed (#129). Down to 18 pending tasks (was 19 + closed #129).
+Plus a substantial test-infrastructure fix that turns the e2e
+suite from "needs --test-threads=1" into "fully parallel."
+
+**Discipline note worth recording: shape-mismatch as a lens.**
+#129 was visible as a documented "soundness trade-off accepted"
+in DESIGN.md — it had been triaged before, deemed dormant in
+practice (true), and tabled. What flipped it from "documented
+trade-off" to "do it now" was that #110 surfaced the asymmetry
+freshly: writing the loop encoding next to the fn encoding made
+the gap obvious. The lens worth keeping: when one part of the
+codebase emits `X` and a sibling part emits `X ∧ Y`, the gap
+becomes worth closing even if `Y` is dormant — because the
+asymmetry itself is a future-bug surface.
+
+**Discipline note worth recording: fix the test infrastructure
+when it pushes back.** Initial verification of #129 hit
+lake-lock errors under parallel test runs; the natural reach
+was `--test-threads=1` (works, but e2e takes 25+ minutes).
+The user pushed back: *fix it so it can run multi-threaded
+like before*. The lake-lock contention had been latent — it
+might have surfaced for someone else later — and going through
+the suite single-threaded would have been a session-long
+detour. The right move was the small surgical fix to test
+infra (LEAN_PATH bypass, ~70 lines across two files) that
+pays back every future test run.
+
 ## Architecture
 
 ### Full pipeline
@@ -2386,7 +2489,7 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 |---|---|---|
 | `cargo test -p lean_verify --lib` | 118 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking, `format_rust_loc`, lean_process, `LeanName` constructors |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
-| `vargo test -p rust_verify_test --test tactus` | 266 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body + &mut x.f via structure update, trait-method calls with impl-strengthened ensures + default-impl invocation, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression, new-mut-ref callee-side normalization, exec closure declarations + body verification scope + spec-closure calls, lexicographic decreases for fns + loops) |
+| `vargo test -p rust_verify_test --test tactus` | 267 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body + &mut x.f via structure update, trait-method calls with impl-strengthened ensures + default-impl invocation, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression, new-mut-ref callee-side normalization, exec closure declarations + body verification scope + spec-closure calls, lexicographic decreases for fns + loops with `0 ≤ cur` lower bound) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
 | `vargo build --release` (vstd) | 1530 | Regression guard: vstd proof library still verifies |
 
@@ -2395,6 +2498,22 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 `run_verus` in `tests/common/mod.rs` sets `TACTUS_LEAN_OUT` to `<test_input_dir>/tactus-lean` for every spawned subprocess. Without this, generated `.lean` files would land in the shared `<rust_verify_test target>/tactus-lean/test_crate/<fn>.lean` (because cargo's inherited `CARGO_TARGET_DIR` overrides the relative-CWD fallback in `lean_out_root`). Two tests defining a fn with the same name but different content would race in parallel runs, producing flaky failures whose root cause is invisible (one test's output overwrites the other's between Lean spawn and disk read). Per-test `TACTUS_LEAN_OUT` gives each test its own output tree.
 
 Symptom of regression: same test fails on one cargo run and passes on the next; running it alone passes. Likely cause: the env-var setting got lost.
+
+### Lake-bypass under parallel test runs (`LEAN_PATH`)
+
+`lake env lean` acquires a per-project configuration lock when invoked. Parallel rust_verify subprocesses (one per test, default `cargo test` parallelism) all hit the same lock, producing
+`could not acquire an exclusive configuration lock; another process may already be reconfiguring the package` errors that take down the whole test suite.
+
+The fix has two pieces:
+
+* **Test harness side** (`tests/common/mod.rs`): `cached_lean_path_for_lake_project()` resolves `LEAN_PATH` *once* per test-binary process by running `lake env printenv LEAN_PATH` in the lake-project dir (one lock acquisition, brief). `inject_cached_lean_path` injects the cached value into every subprocess via `child.env("LEAN_PATH", ...)`. Both `run_verus` and `run_cargo_verus` call it.
+* **`lean_verify` side** (`lean_process.rs`): `check_lean_file` checks `std::env::var_os("LEAN_PATH")` — if already set, runs bare `lean --json <path>` instead of `lake env lean`. The subprocess inherits `LEAN_PATH` from the harness and resolves Mathlib imports through it without going through lake.
+
+Net: only the FIRST test-binary invocation acquires the lake lock; every subprocess runs `lean` directly. Multi-threaded runs of the full e2e suite go from "fails with lock errors" to "completes in ~5 min instead of 25 min single-threaded."
+
+For non-test users (e.g., direct `cargo verus` invocations) `LEAN_PATH` is unset and the original `lake env lean` path is taken — no behaviour change.
+
+Symptom of regression: parallel `cargo test -p rust_verify_test --test tactus` hits a wave of "could not acquire an exclusive configuration lock" errors. Likely cause: `LEAN_PATH` not being injected, or the `lake env printenv` step failing silently (project moved / not built). Workaround: re-run with `--test-threads=1`.
 
 ### Sanity check (`lean_verify/src/sanity.rs`)
 
@@ -2500,7 +2619,7 @@ tactus/
       fn_call_to_vir.rs        ← tactus_span_from, enclosing_fn_is_tactus_auto
       rust_to_vir_expr.rs      ← Tactus proof-block synthesis (AssertBy-in-Ghost)
     rust_verify_test/tests/
-      tactus.rs                ← 266 end-to-end tests
+      tactus.rs                ← 267 end-to-end tests
       tactus_coverage.rs       ← coverage matrix test binary
     vir/src/
       ast.rs                   ← FunctionAttrs.tactic_span + tactus_auto;
@@ -2550,7 +2669,7 @@ cd lean_verify && ./scripts/setup-mathlib.sh && cd ..
 # (See DESIGN.md "Putting Lean on PATH" for the long form.)
 
 # ── Full test suite ────────────────────────────────────────────────
-# 266 end-to-end tests
+# 267 end-to-end tests
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Coverage matrix (1 test, asserts walker visits the expected variant set)
