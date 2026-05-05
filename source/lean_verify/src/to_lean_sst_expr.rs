@@ -683,16 +683,34 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 );
                 let eq_branch = LExpr::and(LExpr::eq(cur, prev), otherwise);
                 LExpr::or(lt_branch, eq_branch).node
-            } else if let Some(path) = decrease_height_datatype(&args[0].typ) {
+            } else if let (Some(cur_path), Some(prev_path)) = (
+                decrease_height_datatype(&args[0].typ),
+                decrease_height_datatype(&args[1].typ),
+            ) {
                 // Datatype path. `to_lean_fn::height_fn_for_datatype`
                 // emits a companion `<path>.height : T → Nat` def
                 // via structural match. Obligation:
-                //   T.height cur < T.height prev
-                //     ∨ (T.height cur = T.height prev ∧ otherwise)
-                let height_name = format!("{}.height", lean_name(path));
-                let apply_height = |x: LExpr| LExpr::app1(LExpr::var_synthetic(height_name.clone()), x);
-                let cur_h = apply_height(cur);
-                let prev_h = apply_height(prev);
+                //   <cur_T>.height cur < <prev_T>.height prev
+                //     ∨ (<cur_T>.height cur = <prev_T>.height prev ∧ otherwise)
+                //
+                // For mutual-fn-SCC where cur and prev have DIFFERENT
+                // types in the same datatype SCC (#109 stretch), each
+                // side uses its own type's height fn. The comparison
+                // `<cur_T>.height cur < <prev_T>.height prev` typechecks
+                // because both height fns return `Nat`. Semantic
+                // soundness comes from the height fns themselves
+                // (mutual block ensures cross-type recursive calls
+                // resolve, so each height correctly counts the
+                // structural depth of its argument).
+                //
+                // For the common single-type case (cur and prev have
+                // the same type), `cur_path == prev_path` and the
+                // emitted shape matches the pre-#109 single-type
+                // pattern.
+                let cur_height = format!("{}.height", lean_name(cur_path));
+                let prev_height = format!("{}.height", lean_name(prev_path));
+                let cur_h = LExpr::app1(LExpr::var_synthetic(cur_height), cur);
+                let prev_h = LExpr::app1(LExpr::var_synthetic(prev_height), prev);
                 let lt_branch = LExpr::lt(cur_h.clone(), prev_h.clone());
                 let eq_branch = LExpr::and(LExpr::eq(cur_h, prev_h), otherwise);
                 LExpr::or(lt_branch, eq_branch).node
