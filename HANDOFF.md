@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**286 end-to-end tests + 1 coverage test + 155 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**286 end-to-end tests + 1 coverage test + 160 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -2977,21 +2977,16 @@ Closed: #108 (generic datatype decreases), #109 (mutual SCC decreases,
 Closed: #98 (walk_children/map_children helpers, 2026-05-05),
 #116, #118, #119.
 
-### Robustness + test gaps (3 tasks)
+### Robustness + test gaps (1 pending)
 
 - **#121** test coverage: untested-but-possibly-working paths
   (closures with user requires/ensures; `assert forall|v| P by
   { tac }`; return-in-else; multi-var loops; tactic referencing
   loop-local; etc.).
-- **#126** WpCtx::new Err-form req/ensure + direct walk_loop /
-  walk_call tests (split from #120 — both involve `FuncCheckSst`
-  fixtures).
-- **#129** Loop decrease encoding: missing `0 ≤ cur` lower bound.
-  Verus has it (CheckDecreaseHeight chain via
-  `recursion::check_decrease`); Tactus's `lex_decrease_obligation`
-  emits just `cur < d_old`. Dormant in practice (u-typed decreases
-  get `0 ≤ x` from h_x_bound) but inconsistent and unsound for
-  `int` decreases. Surfaced during #110.
+
+Closed: #126 (WpCtx::new + walk_loop direct tests, 2026-05-05;
+walk_call deferred — synthetic FunctionX fixture too heavy, e2e
+covers it), #129 (loop decrease 0 ≤ cur lower bound).
 
 ### Tactic / automation gaps (1 task)
 
