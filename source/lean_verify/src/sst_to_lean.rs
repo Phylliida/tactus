@@ -5215,6 +5215,252 @@ mod tests {
             le_count, printed);
     }
 
+    // ── WpCtx::new direct tests (#126) ────────────────────────────
+    //
+    // Covers the validation contract: passing `Validated::check`-able
+    // reqs/ens_exps succeeds; passing an unsupported SST form returns
+    // `Err` cleanly (no panic, no silent acceptance). The validation
+    // logic is shared with the body-walk path, so a shared regression
+    // here would also surface via e2e — but the focused test gives a
+    // pointed error site if the validation flow drifts.
+
+    /// Build an empty `KrateX` for tests. All collections empty,
+    /// arch set to the architecture-agnostic `Either32Or64`.
+    fn empty_krate() -> KrateX {
+        use vir::ast::{Arch, ArchWordBits};
+        KrateX {
+            functions: vec![],
+            reveal_groups: vec![],
+            datatypes: vec![],
+            opaque_types: vec![],
+            traits: vec![],
+            trait_impls: vec![],
+            assoc_type_impls: vec![],
+            modules: vec![],
+            external_fns: vec![],
+            external_types: vec![],
+            path_as_rust_names: vec![],
+            arch: Arch { word_bits: ArchWordBits::Either32Or64 },
+        }
+    }
+
+    /// Build a minimal `FuncCheckSst` with the given reqs and
+    /// ens_exps. Body is an empty Block; no local decls; no destination.
+    fn empty_func_check(reqs: Vec<Exp>, ens_exps: Vec<Exp>) -> FuncCheckSst {
+        use vir::sst::{PostConditionSst, PostConditionKind, UnwindSst};
+        FuncCheckSst {
+            reqs: Arc::new(reqs),
+            post_condition: Arc::new(PostConditionSst {
+                dest: None,
+                ens_exps: Arc::new(ens_exps),
+                ens_spec_precondition_stms: Arc::new(vec![]),
+                kind: PostConditionKind::Ensures,
+            }),
+            unwind: UnwindSst::NoUnwind,
+            body: block_stm(vec![]),
+            local_decls: Arc::new(vec![]),
+            local_decls_decreases_init: Arc::new(vec![]),
+            statics: Arc::new(vec![]),
+        }
+    }
+
+    /// Construct an `ExpX::Old(snapshot, var)` expression. `Old` is
+    /// rejected by `sst_exp_to_ast_checked` as an internal-bug arm
+    /// (Verus lowers user-syntax `old(x)` to `ExpX::VarAt(x, Pre)`,
+    /// so `Old` shouldn't appear in our SST input). Useful as a
+    /// canonical "unsupported SST form" for negative tests.
+    fn old_exp(snapshot: &str, var: &str) -> Exp {
+        Arc::new(SpannedTyped {
+            span: test_span(),
+            typ: typ_int(),
+            x: ExpX::Old(Arc::new(snapshot.to_string()), var_ident(var)),
+        })
+    }
+
+    #[test]
+    fn wpctx_new_empty_reqs_and_ensures_succeeds() {
+        // Trivial happy path: empty validates, ensures_goal becomes
+        // `and_all([])` = `True`. WpCtx is constructible.
+        let krate = empty_krate();
+        let check = empty_func_check(vec![], vec![]);
+        let mut_param_names = HashSet::new();
+        let result = WpCtx::new(&krate, &check, &mut_param_names);
+        assert!(result.is_ok(), "empty WpCtx should construct: {:?}", result.err());
+        let ctx = result.unwrap();
+        assert!(ctx.fn_map.is_empty(), "fn_map should be empty for empty krate");
+        assert!(ctx.type_map.is_empty(), "type_map should be empty for empty local_decls");
+        assert!(ctx.ret_name.is_none(), "ret_name should be None when dest is None");
+    }
+
+    #[test]
+    fn wpctx_new_rejects_unsupported_form_in_reqs() {
+        // A req with `ExpX::Old` triggers `check_exp` rejection.
+        // WpCtx::new must propagate the Err (not panic, not silently
+        // accept). The Err message references the unsupported form
+        // so a future Verus pipeline change that legitimizes Old in
+        // SST surfaces as a focused failure, not a silent miscompile.
+        let krate = empty_krate();
+        let bad_req = old_exp("snapshot", "x");
+        let check = empty_func_check(vec![bad_req], vec![]);
+        let mut_param_names = HashSet::new();
+        let result = WpCtx::new(&krate, &check, &mut_param_names);
+        assert!(result.is_err(),
+            "WpCtx::new must reject ExpX::Old in reqs; got Ok(_)");
+        let err = result.err().unwrap();
+        assert!(err.contains("Old") || err.contains("internal bug"),
+            "rejection message should reference Old or 'internal bug'; got: {}",
+            err);
+    }
+
+    #[test]
+    fn wpctx_new_rejects_unsupported_form_in_ensures() {
+        // Same as above but for ens_exps. Symmetry test — the
+        // validation iterates both reqs and ens_exps, and a future
+        // refactor that drops one of the loops would silently accept
+        // unsupported ensures.
+        let krate = empty_krate();
+        let bad_ens = old_exp("snapshot", "y");
+        let check = empty_func_check(vec![], vec![bad_ens]);
+        let mut_param_names = HashSet::new();
+        let result = WpCtx::new(&krate, &check, &mut_param_names);
+        assert!(result.is_err(),
+            "WpCtx::new must reject ExpX::Old in ens_exps; got Ok(_)");
+    }
+
+    // ── walk_loop direct tests (#126) ─────────────────────────────
+    //
+    // Construct `Wp::Loop`-like inputs and call `walk_loop` directly,
+    // inspecting the emitted theorems. This pins behaviors that e2e
+    // tests cover incidentally:
+    //
+    // 1. **Init filter on `at_entry`.** Init theorems fire only for
+    //    invariants whose kind has `at_entry = true`. An `Ensures`-
+    //    kind inv (loop `ensures`, `at_entry = false`) must NOT
+    //    produce an init theorem — it only contributes at exit.
+    //
+    // The full walker is heavy to test directly (Wp tree + OblCtx +
+    // emitter all need fixtures); we test the at_entry filter as the
+    // single most-likely-to-regress structural invariant. walk_call
+    // direct tests deferred — see DESIGN.md "User-facing features
+    // not tested" for the cost/benefit analysis.
+
+    /// Construct a synthetic `LoopInv` with given (at_entry, at_exit)
+    /// flags and inv expression. Used to drive `walk_loop` past its
+    /// classification gate.
+    fn loop_inv(at_entry: bool, at_exit: bool, e: Exp) -> LoopInv {
+        LoopInv { at_entry, at_exit, inv: e }
+    }
+
+    #[test]
+    fn walk_loop_skips_init_for_ensures_kind_invariant() {
+        // A loop with one `Ensures`-kind invariant (at_entry=false,
+        // at_exit=true) should produce ZERO init theorems — init is
+        // gated on at_entry. Pre-fix Tactus emitted init for every
+        // inv regardless of kind; #89 added the at_entry filter.
+        // This test pins the gate against future regression.
+        //
+        // Setup: cond=None, decrease=[], no mod_vars, body and after
+        // are both Done(true). Theorems emitted come from:
+        //   * 0 init (the Ensures-kind inv is at_entry=false)
+        //   * 1 maintain (body's Done(true) → emit_done_or_split's
+        //     fallback arm)
+        //   * 1 use (after's Done(true), same)
+        // Total: 2. None should be the init theorem for the inv.
+        use std::collections::HashSet;
+        let p = var_exp("p_loop_test", typ_bool());
+        let p_static: &'static Exp = Box::leak(Box::new(p));
+        let validated_p = crate::to_lean_sst_expr::Validated::check(p_static)
+            .expect("p validates");
+        let invs = vec![loop_inv(false, true, p_static.clone())];
+        let validated_invs = vec![validated_p];
+        let inv_kinds = vec![LoopInvKind::Ensures];
+        let body = Wp::Done(LExpr::lit_true());
+        let after = Wp::Done(LExpr::lit_true());
+
+        let krate = empty_krate();
+        let check = empty_func_check(vec![], vec![]);
+        let mut_param_names = HashSet::new();
+        let ctx = WpCtx::new(&krate, &check, &mut_param_names)
+            .expect("empty ctx");
+        let mut emitter = mk_test_emitter();
+
+        walk_loop(
+            None,
+            &invs,
+            &validated_invs,
+            &inv_kinds,
+            &[],
+            &[],
+            &body,
+            &after,
+            &ctx,
+            &OblCtx::new(),
+            &mut emitter,
+        );
+
+        // No theorem should be tagged as a loop_invariant init —
+        // every emitted theorem here is from body/after's Done leaves
+        // (label "ensures") or a maintain/use clause, not init.
+        let init_count = emitter.out.iter()
+            .filter(|t| t.name.contains("loop_invariant"))
+            .count();
+        assert_eq!(init_count, 0,
+            "Ensures-kind inv (at_entry=false) must not emit init \
+             theorem. Got {} loop_invariant-named theorems out of \
+             {} total. If this fails, walk_loop's at_entry filter \
+             has drifted (#89 regression). Theorems: {:?}",
+            init_count, emitter.out.len(),
+            emitter.out.iter().map(|t| &t.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn walk_loop_emits_init_for_at_entry_invariant() {
+        // Companion test: an `Invariant`-kind inv (at_entry=true,
+        // at_exit=true) DOES produce one init theorem. Together with
+        // the previous test, this pins the at_entry filter as a
+        // discriminator (not a no-op).
+        use std::collections::HashSet;
+        let p = var_exp("p_loop_test", typ_bool());
+        let p_static: &'static Exp = Box::leak(Box::new(p));
+        let validated_p = crate::to_lean_sst_expr::Validated::check(p_static)
+            .expect("p validates");
+        let invs = vec![loop_inv(true, true, p_static.clone())];
+        let validated_invs = vec![validated_p];
+        let inv_kinds = vec![LoopInvKind::Invariant];
+        let body = Wp::Done(LExpr::lit_true());
+        let after = Wp::Done(LExpr::lit_true());
+
+        let krate = empty_krate();
+        let check = empty_func_check(vec![], vec![]);
+        let mut_param_names = HashSet::new();
+        let ctx = WpCtx::new(&krate, &check, &mut_param_names)
+            .expect("empty ctx");
+        let mut emitter = mk_test_emitter();
+
+        walk_loop(
+            None,
+            &invs,
+            &validated_invs,
+            &inv_kinds,
+            &[],
+            &[],
+            &body,
+            &after,
+            &ctx,
+            &OblCtx::new(),
+            &mut emitter,
+        );
+
+        let init_count = emitter.out.iter()
+            .filter(|t| t.name.contains("loop_invariant"))
+            .count();
+        assert_eq!(init_count, 1,
+            "Invariant-kind inv (at_entry=true) should emit exactly \
+             one init theorem; got {} (theorems: {:?})",
+            init_count,
+            emitter.out.iter().map(|t| &t.name).collect::<Vec<_>>());
+    }
+
     #[test]
     fn lex_decrease_obligation_single_level_emits_lt_with_lower_bound() {
         // Single-level case: `0 ≤ cur ∧ cur < old`. The lex tail
