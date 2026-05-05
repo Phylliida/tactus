@@ -1407,18 +1407,20 @@ exec fns."
   - **Lexicographic `decreases a, b` — LANDED via #110.** See
     "Loop-shape restrictions" entry above for the encoding.
 
-  **Edge cases worth knowing for #109:**
-  - **Cross-fn-SCC mutual recursion with cross-type decreases.**
-    Tactus didn't test fns A and B that mutually call each other
-    where A decreases on Tree and B decreases on Forest. Verus's
-    recursion pass would emit a `CheckDecreaseHeight` comparing
-    different types' heights at each cross-call — Tree.height vs
-    Forest.height. The decrease obligation `Forest.height f <
-    Tree.height t` doesn't have a structural relation in our
-    encoding (each height fn is independent). Untested; would
-    likely fail. Workaround: use `decreases (height_unified, …)`
-    over a tuple, or hoist mutual fn pairs into a single fn with
-    a tagged-union arg.
+  **Cross-fn-SCC mutual recursion with cross-type decreases — LANDED via
+  #109 stretch.** When fns A and B mutually call each other and have
+  `decreases` on different SCC members (A on Tree, B on Forest), the
+  CheckDecreaseHeight obligation now correctly emits `<cur_T>.height cur
+  < <prev_T>.height prev` — each side picks its OWN type's height fn
+  rather than reusing `cur`'s for both (the pre-fix bug, which produced
+  `Forest.height` applied to a Tree-typed value and failed Lean's type
+  check). The comparison typechecks because both height fns return Nat;
+  semantic soundness comes from the mutual height block — `Tree.height
+  (Branch f) = 1 + Forest.height f`, so `Forest.height f < Tree.height
+  t` for `t = Tree.Branch f`. Pinned by
+  `test_exec_cross_fn_scc_cross_type_decreases` (positive) and
+  `test_exec_cross_fn_scc_nondecreasing` (negative — same-arg recursion
+  fails as expected).
 
 ##### Tier 3 — bigger slices (~1 week each)
 
