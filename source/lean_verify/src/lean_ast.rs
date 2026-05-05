@@ -672,12 +672,11 @@ pub fn substitute(
 // Pattern walkers, ~370 lines of structurally parallel match arms.
 //
 // `walk_children` and `map_children` (and their Pattern siblings)
-// concentrate that dispatch in one place. Each consumer handles only
-// the variants whose semantics differ from "uniformly recurse" — the
-// leaf cases (Var) for collectors and the binder cases (Let / Lambda /
-// Forall / Exists / Match) for scope-tracking walks. Adding a new
-// `ExprNode` variant becomes a single edit to these helpers; consumers
-// pick it up automatically via their `_ =>` arm.
+// concentrate that dispatch in one place — they walk every direct
+// child Expr without caring about scope. Used by transforms that
+// recurse uniformly (`strip_span_marks_node` for non-SpanMark cases,
+// `substitute_impl` for non-special cases) and by collectors for
+// non-special variants.
 //
 // The split between `walk_*` (read-only) and `map_*` (transforming) is
 // because consumer return types differ — collectors thread a `&mut
@@ -685,28 +684,158 @@ pub fn substitute(
 // visitor trait would force a unified `Out` parameter, which doesn't
 // exist here.
 //
-// **Soundness convention for new binder-introducing variants.** Both
-// `walk_children` and `map_children` match all variants explicitly
-// (no catch-all), so a new `ExprNode` variant is a compile error
-// until added here. If the new variant **introduces a binder** (a
-// name that scopes over a sub-expression), three scope-tracking
-// consumers need their own explicit arm above the `_ =>` fallthrough,
-// in addition to handling here:
+// **Compile-time enforcement of binder semantics: `ScopeKind`.** A
+// secondary risk shows up at scope-tracking consumers
+// (`substitute_impl`, `collect_free_vars`, `collect_all_names`):
+// these need to know which variants introduce binders so they can
+// extend their scope/subst tracking before recursing. A naive
+// "match Let/Lambda/.../Match explicitly, fall through to
+// walk_children for the rest" leaves the door open: a future binder
+// variant added to `ExprNode` would silently slip through the
+// fallthrough, mis-tracking scope.
 //
-// * `substitute_impl` — must remove bound names from `subst` before
-//   recursing, and may need alpha-rename if the binder could capture.
-// * `collect_free_vars` — must extend the `bound` set before walking
-//   the body.
-// * `collect_all_names` — must insert the bound name into `out`
-//   before walking children.
+// The fix is `ScopeKind` (defined below) plus the `scope_kind()`
+// method on `ExprNode`. Every variant categorizes into one of:
 //
-// Forgetting any of these silently mis-tracks scope (free vars get
-// reported where they should be shadowed; substitution captures
-// where it should rename). No compile-time check enforces the
-// convention — only tests that exercise the new variant under
-// substitution / capture-detection will catch it. If the binder
-// surface grows, consider promoting "is_binder" to a structural
-// property on the variant type.
+// * `Var(name)` — substitution leaf;
+// * `Let { … }` — single-name binder;
+// * `Quantified { kind, binders, body }` — Lambda/Forall/Exists
+//   (`kind: QuantifierKind` distinguishes them for transform
+//   consumers that need to rebuild);
+// * `Match { … }` — per-arm pattern-bound names;
+// * `Other` — non-binder compounds and leaves other than `Var`.
+//
+// `scope_kind()` is an exhaustive match on `ExprNode` (no catch-all),
+// so a new variant is a compile error there. The contributor must
+// either pick an existing `ScopeKind` (which propagates correct
+// scope semantics to every consumer automatically) OR add a new
+// `ScopeKind` variant — which compile-errors in every consumer's
+// match, forcing them to decide what scope semantics the new
+// variant has.
+//
+// The structural lock: a new BINDER ExprNode variant cannot ship
+// without the contributor positively claiming a scope category.
+// Implicit inheritance via `_ =>` is gone.
+
+/// Categorization of an `ExprNode` for scope-tracking walks.
+///
+/// Returned by `ExprNode::scope_kind()`. Consumers
+/// (`substitute_impl`, `collect_free_vars`, `collect_all_names`)
+/// match on this exhaustively (no catch-all) so adding a new
+/// scope shape compile-errors at every consumer.
+///
+/// Borrows from the underlying `ExprNode` so the consumer can use
+/// the bound fields without re-matching on the original variant.
+enum ScopeKind<'a> {
+    /// `ExprNode::Var(_)` — substitution leaf. Substitution looks up
+    /// in subst and replaces; collectors check against the bound set.
+    Var(&'a crate::lean_name::LeanName),
+    /// `ExprNode::Let { … }` — single-name binder. `value` is in
+    /// outer scope; `body` is in scope extended by `name`.
+    Let {
+        name: &'a crate::lean_name::LeanName,
+        value: &'a Expr,
+        body: &'a Expr,
+    },
+    /// `ExprNode::Lambda` / `Forall` / `Exists` — quantifier-shaped
+    /// multi-binder. `kind` distinguishes the three for transforms
+    /// that rebuild; collectors don't care which.
+    Quantified {
+        kind: QuantifierKind,
+        binders: &'a [Binder],
+        body: &'a Expr,
+    },
+    /// `ExprNode::Match { … }` — per-arm scope extended by the
+    /// arm's pattern-bound names.
+    Match {
+        scrutinee: &'a Expr,
+        arms: &'a [MatchArm],
+    },
+    /// Non-binder compounds and leaves other than `Var`. Walkers
+    /// delegate to `walk_children` / `map_children` for these — no
+    /// scope tracking required.
+    Other,
+}
+
+/// Discriminator for `ScopeKind::Quantified` so transforms (e.g.,
+/// `substitute_impl`) can rebuild the right `ExprNode` constructor.
+/// Collectors that don't rebuild can ignore this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuantifierKind {
+    Lambda,
+    Forall,
+    Exists,
+}
+
+impl QuantifierKind {
+    /// Build the corresponding `ExprNode` variant from substituted
+    /// binders + body. Used by `substitute_impl`'s `ScopeKind::Quantified`
+    /// arm to dispatch back to the right constructor without
+    /// re-matching on the original ExprNode.
+    fn build(self, binders: Vec<Binder>, body: Box<Expr>) -> ExprNode {
+        match self {
+            QuantifierKind::Lambda => ExprNode::Lambda { binders, body },
+            QuantifierKind::Forall => ExprNode::Forall { binders, body },
+            QuantifierKind::Exists => ExprNode::Exists { binders, body },
+        }
+    }
+}
+
+impl ExprNode {
+    /// Categorize this node for scope-tracking walks. **Exhaustive
+    /// — no catch-all.** A new `ExprNode` variant is a compile error
+    /// here, forcing the contributor to categorize it (or add a new
+    /// `ScopeKind` variant, which then compile-errors in every
+    /// consumer that matches on `ScopeKind`).
+    fn scope_kind(&self) -> ScopeKind<'_> {
+        match self {
+            ExprNode::Var(n) => ScopeKind::Var(n),
+            ExprNode::Let { name, value, body } => ScopeKind::Let {
+                name,
+                value,
+                body,
+            },
+            ExprNode::Lambda { binders, body } => ScopeKind::Quantified {
+                kind: QuantifierKind::Lambda,
+                binders,
+                body,
+            },
+            ExprNode::Forall { binders, body } => ScopeKind::Quantified {
+                kind: QuantifierKind::Forall,
+                binders,
+                body,
+            },
+            ExprNode::Exists { binders, body } => ScopeKind::Quantified {
+                kind: QuantifierKind::Exists,
+                binders,
+                body,
+            },
+            ExprNode::Match { scrutinee, arms } => ScopeKind::Match {
+                scrutinee,
+                arms,
+            },
+            // Non-binder compounds + leaves other than Var.
+            // Listed explicitly (no `_ =>`) so a new variant
+            // compile-errors here, forcing categorization.
+            ExprNode::Lit(_)
+            | ExprNode::LitBool(_)
+            | ExprNode::LitStr(_)
+            | ExprNode::LitChar(_)
+            | ExprNode::Raw(_)
+            | ExprNode::BinOp { .. }
+            | ExprNode::UnOp { .. }
+            | ExprNode::App { .. }
+            | ExprNode::If { .. }
+            | ExprNode::TypeAnnot { .. }
+            | ExprNode::FieldProj { .. }
+            | ExprNode::StructUpdate { .. }
+            | ExprNode::ArrayLit(_)
+            | ExprNode::Index { .. }
+            | ExprNode::Anon(_)
+            | ExprNode::SpanMark { .. } => ScopeKind::Other,
+        }
+    }
+}
 
 /// Call `f` once on each direct child `Expr` of `node`. Recurses into
 /// every Expr-typed field including binder types (`Lambda`/`Forall`/
@@ -973,21 +1102,21 @@ fn substitute_impl(
     expr: &Expr,
     subst: &std::collections::HashMap<crate::lean_name::LeanName, Expr>,
 ) -> Expr {
-    let node = match &expr.node {
+    let node = match expr.node.scope_kind() {
         // Var: substitution leaf — replace if the name is in `subst`,
         // otherwise rebuild as-is. The `replacement.clone()` early-
         // returns because the result type is `Expr`, not `ExprNode`.
-        ExprNode::Var(name) => match subst.get(name) {
+        ScopeKind::Var(name) => match subst.get(name) {
             Some(replacement) => return replacement.clone(),
             None => ExprNode::Var(name.clone()),
         },
         // Let: alpha-rename if the binder would capture a free var
         // from the substitution (#116). Same logic as the
-        // Lambda/Forall/Exists arms (factored into `substitute_quantified`),
+        // Quantified arm (factored into `substitute_quantified`),
         // but `Let` is single-binder and lacks the `ty`/`kind` fields
         // that `Binder` carries — so we open-code rather than synthesize
         // a fake `Binder` for `apply_renames_to_binders`.
-        ExprNode::Let { name, value, body } => {
+        ScopeKind::Let { name, value, body } => {
             let new_value = substitute_impl(value, subst);
             let inner_subst = subst_without(subst, name);
             let renames = compute_alpha_renames(&[name], &inner_subst, body);
@@ -996,7 +1125,7 @@ fn substitute_impl(
                 let renamed_body = substitute_impl(body, &rename_subst);
                 (fresh.clone(), renamed_body)
             } else {
-                (name.clone(), (**body).clone())
+                (name.clone(), body.clone())
             };
             ExprNode::Let {
                 name: final_name,
@@ -1004,29 +1133,26 @@ fn substitute_impl(
                 body: Box::new(substitute_impl(&body_for_subst, &inner_subst)),
             }
         }
-        ExprNode::Lambda { binders, body } => substitute_quantified(
-            binders, body, subst,
-            |bs, body| ExprNode::Lambda { binders: bs, body },
-        ),
-        ExprNode::Forall { binders, body } => substitute_quantified(
-            binders, body, subst,
-            |bs, body| ExprNode::Forall { binders: bs, body },
-        ),
-        ExprNode::Exists { binders, body } => substitute_quantified(
-            binders, body, subst,
-            |bs, body| ExprNode::Exists { binders: bs, body },
+        // Quantified (Lambda/Forall/Exists): unified alpha-rename +
+        // body subst via `substitute_quantified`. `kind.build` rebuilds
+        // the right ExprNode constructor.
+        ScopeKind::Quantified { kind, binders, body } => substitute_quantified(
+            binders,
+            body,
+            subst,
+            |bs, body| kind.build(bs, body),
         ),
         // Match: per-arm alpha-rename + remove pattern-bound names from
         // subst for the arm body. Factored into `substitute_match_arm`
-        // (parallel to `substitute_quantified` for Lambda/Forall/Exists).
-        ExprNode::Match { scrutinee, arms } => ExprNode::Match {
+        // (parallel to `substitute_quantified`).
+        ScopeKind::Match { scrutinee, arms } => ExprNode::Match {
             scrutinee: Box::new(substitute_impl(scrutinee, subst)),
             arms: arms.iter().map(|a| substitute_match_arm(a, subst)).collect(),
         },
-        // All other variants — leaves and non-binder compounds —
-        // uniformly substitute into children. `map_children` preserves
+        // Non-binder compounds + leaves other than Var — uniformly
+        // substitute into children. `map_children` preserves
         // `SpanMark` metadata, op codes, field names, etc.
-        _ => map_children(&expr.node, |c| substitute_impl(c, subst)),
+        ScopeKind::Other => map_children(&expr.node, |c| substitute_impl(c, subst)),
     };
     Expr::new(node)
 }
@@ -1110,17 +1236,15 @@ fn compute_alpha_renames(
 /// with ANY name in `body` (an inner binder named `fresh` would
 /// capture our just-renamed references).
 fn collect_all_names(expr: &Expr, out: &mut std::collections::HashSet<String>) {
-    match &expr.node {
-        ExprNode::Var(n) => {
+    match expr.node.scope_kind() {
+        ScopeKind::Var(n) => {
             out.insert(n.as_str().to_string());
         }
-        ExprNode::Let { name, .. } => {
+        ScopeKind::Let { name, .. } => {
             out.insert(name.as_str().to_string());
             walk_children(&expr.node, |c| collect_all_names(c, out));
         }
-        ExprNode::Lambda { binders, .. }
-        | ExprNode::Forall { binders, .. }
-        | ExprNode::Exists { binders, .. } => {
+        ScopeKind::Quantified { binders, .. } => {
             for b in binders {
                 if let Some(n) = &b.name {
                     out.insert(n.as_str().to_string());
@@ -1128,7 +1252,7 @@ fn collect_all_names(expr: &Expr, out: &mut std::collections::HashSet<String>) {
             }
             walk_children(&expr.node, |c| collect_all_names(c, out));
         }
-        ExprNode::Match { arms, .. } => {
+        ScopeKind::Match { arms, .. } => {
             for arm in arms {
                 for n in pattern_bound_names(&arm.pattern) {
                     out.insert(n);
@@ -1136,7 +1260,7 @@ fn collect_all_names(expr: &Expr, out: &mut std::collections::HashSet<String>) {
             }
             walk_children(&expr.node, |c| collect_all_names(c, out));
         }
-        _ => walk_children(&expr.node, |c| collect_all_names(c, out)),
+        ScopeKind::Other => walk_children(&expr.node, |c| collect_all_names(c, out)),
     }
 }
 
@@ -1318,28 +1442,27 @@ fn collect_free_vars(
     bound: &std::collections::HashSet<String>,
     out: &mut std::collections::HashSet<String>,
 ) {
-    match &expr.node {
-        ExprNode::Var(n) => {
+    match expr.node.scope_kind() {
+        ScopeKind::Var(n) => {
             if !bound.contains(n.as_str()) {
                 out.insert(n.as_str().to_string());
             }
         }
         // Let: value is in outer scope, body is in scope extended with name.
-        ExprNode::Let { name, value, body } => {
+        ScopeKind::Let { name, value, body } => {
             collect_free_vars(value, bound, out);
             let mut inner = bound.clone();
             inner.insert(name.as_str().to_string());
             collect_free_vars(body, &inner, out);
         }
-        // Lambda/Forall/Exists: binder types are in OUTER scope (not yet
-        // bound by their own binder), body is in extended scope. Lean's
-        // dependent types DO let later binder types reference earlier
-        // binders, but this function (used for capture detection in
-        // alpha-renaming) treats binder types conservatively as outer-
-        // scope; the caller scopes them later if needed.
-        ExprNode::Lambda { binders, body }
-        | ExprNode::Forall { binders, body }
-        | ExprNode::Exists { binders, body } => {
+        // Quantified (Lambda/Forall/Exists): binder types are in OUTER
+        // scope (not yet bound by their own binder), body is in
+        // extended scope. Lean's dependent types DO let later binder
+        // types reference earlier binders, but this function (used for
+        // capture detection in alpha-renaming) treats binder types
+        // conservatively as outer-scope; the caller scopes them later
+        // if needed.
+        ScopeKind::Quantified { binders, body, .. } => {
             let mut inner = bound.clone();
             for b in binders {
                 if let Some(n) = &b.name {
@@ -1350,7 +1473,7 @@ fn collect_free_vars(
         }
         // Match: scrutinee in outer scope, each arm body in scope
         // extended with the arm's pattern-bound names.
-        ExprNode::Match { scrutinee, arms } => {
+        ScopeKind::Match { scrutinee, arms } => {
             collect_free_vars(scrutinee, bound, out);
             for arm in arms {
                 let mut inner = bound.clone();
@@ -1361,7 +1484,7 @@ fn collect_free_vars(
             }
         }
         // No-binder variants: walk children with the same scope.
-        _ => walk_children(&expr.node, |c| collect_free_vars(c, bound, out)),
+        ScopeKind::Other => walk_children(&expr.node, |c| collect_free_vars(c, bound, out)),
     }
 }
 
