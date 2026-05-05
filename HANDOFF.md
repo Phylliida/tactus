@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**277 end-to-end tests + 1 coverage test + 146 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**277 end-to-end tests + 1 coverage test + 149 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -2500,6 +2500,78 @@ defensive panic is documented as "alpha-renaming would be the
 proper fix," that's a future-self IOU. Pay it before it accrues
 interest.
 
+#### Current session (2026-05-05 morning — #98 walk_children helpers)
+
+The big "evidence is mounting" task from yesterday's final review
+pass. By 2026-05-04 we were duplicating per-variant ExprNode
+dispatch across **five** walkers (`substitute_impl`,
+`collect_free_vars`, `collect_all_names`, `strip_span_marks_node`,
+`mentions_free_var`) and **two** Pattern walkers
+(`pattern_bound_names_impl`, `rename_in_pattern`) — ~370 lines of
+structurally parallel match arms.
+
+**What landed (`ffa23ac`).** Four new helpers in `lean_ast.rs`:
+* `walk_children<F>(&ExprNode, F)` — read-only iteration over each
+  direct child Expr.
+* `map_children<F>(&ExprNode, F) -> ExprNode` — rebuild a node
+  with each child Expr mapped through `f`.
+* `walk_pattern_children` / `map_pattern_children` — Pattern siblings.
+
+Each consumer now handles only the variants whose semantics differ
+from "uniformly recurse" — Var leaves for collectors, the binder
+cases (Let/Lambda/Forall/Exists/Match) for scope-tracking — and
+delegates everything else via `_ => walk_children(...)` /
+`_ => map_children(...)`.
+
+**Per-walker shrinkage:**
+* `strip_span_marks_node`: 70 → 5 lines (93% reduction)
+* `collect_all_names`: 60 → 25 lines (60%)
+* `collect_free_vars`: 65 → 45 lines (30%)
+* `substitute_impl`: 125 → 75 lines (40%)
+* `pattern_bound_names_impl` / `rename_in_pattern`: similar
+
+**Net file size: +94 lines** because the helpers themselves are
+sizeable (~260 lines including the section-header comment). This
+isn't a line-count win — it's a *structural* win: `walk_children`
+and `map_children` are exhaustive (no `_ =>`), so a new
+ExprNode/Pattern variant becomes a compile error there, forcing
+one edit instead of touching five walkers.
+
+**Soundness convention documented.** Section-header comment
+explicitly notes: if a new ExprNode variant introduces a binder,
+`substitute_impl` / `collect_free_vars` / `collect_all_names`
+need explicit arms above the `_ =>` fallthrough — no compile-time
+check enforces this. Tests that exercise the new variant under
+substitution / capture detection are the catch.
+
+**3 new unit tests** as regression guards:
+* `map_children_identity_roundtrips_all_variants` — locks in that
+  `map_children(identity)` produces structurally-equivalent output
+  for every ExprNode variant. Catches a future contributor
+  swapping `lhs`/`rhs` or forgetting to clone metadata.
+* `walk_children_counts_match_expected` — visit counts per variant.
+* `pattern_helpers_handle_all_variants` — pattern-side analog.
+
+**Test counts:** 146 → 149 unit (+3). 277 e2e + 7 integration + 1
+coverage all green. vstd unchanged.
+
+**One small doc fix.** The `substitute()` doc-comment had a stale
+"not painful enough yet to justify a `walk_children` helper"
+caveat. Updated to reflect the new structure: adding an ExprNode
+variant touches `walk_children` + `map_children` plus the
+pretty-printer; walkers pick up automatically via `_ =>`.
+
+**Net for the session:** 1 substantive commit (the refactor), 1
+poem-break commit, plus a doc + handoff update. ~540 lines diff
+(316 added, 222 removed in the refactor; the rest is doc).
+
+The unifying lens: *yesterday's last commit said "evidence is
+mounting"; today's first commit says "we built the lock."* Each
+new walker had been a small reinforcement that the abstraction
+should exist; collectively they were a future-self IOU. Pay it
+when the evidence is "this is now load-bearing," not when it's
+"this is still bearable."
+
 ## Architecture
 
 ### Full pipeline
@@ -2821,15 +2893,15 @@ themes:
 - **#113** BinaryOp::StrGetChar + string operations.
 - **#127** loop_isolation: false support (#114 sub-feature 2).
 
-### Architecture cleanups (6 tasks)
+### Architecture cleanups (2 pending)
 
 - **#97** `OblCtx::with_frame` O(N²) → `Rc<im::Vector>` (perf,
   unmotivated by realistic code).
-- **#98** `substitute` walk_children helper (pure ergonomics).
-- **#116** `substitute` capture-check alpha-rename (vs panic).
-- **#117** fuse two-pass over loop bodies.
-- **#118** sanity-check allowlist auto-derive from prelude.rs.
-- **#119** `lift_if_value` multi-binder Bind(Let) support.
+- **#117** fuse two-pass over loop bodies (DESIGN says "left
+  alone").
+
+Closed: #98 (walk_children/map_children helpers, 2026-05-05),
+#116, #118, #119.
 
 ### Robustness + test gaps (3 tasks)
 
@@ -2994,7 +3066,7 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 
 | Binary | Count | What it tests |
 |---|---|---|
-| `cargo test -p lean_verify --lib` | 146 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance via alpha-rename for Let/Lambda/Forall/Exists/Match incl. dependent types), `mentions_free_var` (binder-scope tracking), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` (incl. multi-binder chain lift) / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking + prelude-name auto-derivation, `format_rust_loc`, lean_process, `LeanName` constructors |
+| `cargo test -p lean_verify --lib` | 149 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance via alpha-rename for Let/Lambda/Forall/Exists/Match incl. dependent types), `mentions_free_var` (binder-scope tracking), `strip_span_marks`, `walk_children` / `map_children` identity round-trip + visit-count regression guards (#98), `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` (incl. multi-binder chain lift) / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking + prelude-name auto-derivation, `format_rust_loc`, lean_process, `LeanName` constructors |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
 | `vargo test -p rust_verify_test --test tactus` | 277 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes incl. generic `List<A>`-style + multi-param `Tagged<A, B>` with implicit type-param binders, per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body + &mut x.f via structure update, trait-method calls with impl-strengthened ensures + default-impl invocation, bit-width matrix, control-flow combinations incl. return-in-else / multi-var loops / nested-if-with-loops, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression, new-mut-ref callee-side normalization, exec closure declarations + body verification scope + spec-closure calls, lexicographic decreases for fns + loops with `0 ≤ cur` lower bound, ret-substitution at call sites for `r == E` ensures) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
