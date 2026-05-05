@@ -3154,6 +3154,85 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #121: inverse of test_exec_early_return — return in the *else*
+// branch where the then-branch falls through to the tail. Covers
+// the symmetric path that was previously untested per DESIGN.md.
+test_verify_one_file! {
+    #[test] test_exec_return_in_else_branch verus_code! {
+        #[verifier::tactus_auto]
+        fn clip_high(x: u8) -> (r: u8)
+            requires x <= 200
+            ensures r <= 100
+        {
+            if x <= 100 {
+                x
+            } else {
+                return 100;
+            }
+        }
+    } => Ok(())
+}
+
+// #121: loop modifying 3+ vars. Existing tests cover loops that
+// modify at most 2 vars; `quantify_mod_vars` builds ∀-binders
+// from arbitrary-length `modified_vars`, so the multi-var path
+// was supported in principle but never directly exercised.
+test_verify_one_file! {
+    #[test] test_exec_loop_three_modified_vars verus_code! {
+        #[verifier::tactus_auto]
+        fn three_counters(n: u8) -> (r: u8)
+            requires n <= 10
+            ensures r == 0
+        {
+            let mut a: u8 = n;
+            let mut b: u8 = 0;
+            let mut c: u8 = 0;
+            while a > 0
+                invariant a + b + c == n, a <= n, b <= n, c <= n
+                decreases a
+            {
+                a = a - 1;
+                if b < n { b = b + 1; } else { c = c + 1; }
+            }
+            a
+        }
+    } => Ok(())
+}
+
+// #121: nested if with a loop in EACH branch. The combinatorial
+// coverage gap from DESIGN.md — both branches independently exercise
+// the loop machinery, so the post-if continuation walks two distinct
+// loop ctxs.
+test_verify_one_file! {
+    #[test] test_exec_nested_if_with_loops_in_both_branches verus_code! {
+        #[verifier::tactus_auto]
+        fn branch_loops(flag: bool, n: u8) -> (r: u8)
+            requires n <= 10
+            ensures r == 0
+        {
+            if flag {
+                let mut x: u8 = n;
+                while x > 0
+                    invariant x <= n
+                    decreases x
+                {
+                    x = x - 1;
+                }
+                x
+            } else {
+                let mut y: u8 = n;
+                while y > 0
+                    invariant y <= n
+                    decreases y
+                {
+                    y = y - 1;
+                }
+                y
+            }
+        }
+    } => Ok(())
+}
+
 // Usize param: `type_bound_predicate` now emits `0 ≤ e ∧ e < usize_hi`
 // as the refinement, using the prelude `usize_hi` axiom. This
 // trivially-bounded case verifies — the bound check reduces to True
