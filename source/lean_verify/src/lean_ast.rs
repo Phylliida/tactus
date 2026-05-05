@@ -713,9 +713,10 @@ pub fn substitute(
 /// `Exists` ty fields) and match-arm bodies. Does NOT walk binder names,
 /// constructor names, or non-Expr metadata.
 ///
-/// Used by walks that don't need to track scope structurally and just
-/// want to visit every nested Expr (`collect_all_names` for the
-/// non-binder fallthrough, debug walkers, etc.).
+/// Used by `collect_all_names`, `collect_free_vars`, and
+/// `pattern_bound_names_impl` (via `walk_pattern_children`) — walks
+/// that thread state via a `&mut` parameter rather than rebuilding
+/// the tree.
 fn walk_children<F>(node: &ExprNode, mut f: F)
 where
     F: FnMut(&Expr),
@@ -891,6 +892,11 @@ where
     }
 }
 
+/// Helper for `map_children`: rebuild a binder list with each binder's
+/// type mapped through `f`. Names and `kind` stay; only `ty` gets the
+/// transform applied. Takes `&mut F` so a single mutable borrow flows
+/// across the three quantifier arms (Lambda/Forall/Exists) plus the
+/// outer `body` call without lifetime gymnastics.
 fn map_binders<F>(binders: &[Binder], f: &mut F) -> Vec<Binder>
 where
     F: FnMut(&Expr) -> Expr,
@@ -1011,30 +1017,11 @@ fn substitute_impl(
             |bs, body| ExprNode::Exists { binders: bs, body },
         ),
         // Match: per-arm alpha-rename + remove pattern-bound names from
-        // subst for the arm body.
+        // subst for the arm body. Factored into `substitute_match_arm`
+        // (parallel to `substitute_quantified` for Lambda/Forall/Exists).
         ExprNode::Match { scrutinee, arms } => ExprNode::Match {
             scrutinee: Box::new(substitute_impl(scrutinee, subst)),
-            arms: arms.iter().map(|a| {
-                let bound = pattern_bound_names(&a.pattern);
-                let bound_lns: Vec<crate::lean_name::LeanName> = bound.iter()
-                    .map(|n| crate::lean_name::LeanName::synthetic(n.clone()))
-                    .collect();
-                let mut inner = subst.clone();
-                for n in &bound_lns { inner.remove(n); }
-                let bound_refs: Vec<&crate::lean_name::LeanName> = bound_lns.iter().collect();
-                let renames = compute_alpha_renames(&bound_refs, &inner, &a.body);
-                let (final_pattern, body_for_subst) = if renames.is_empty() {
-                    (a.pattern.clone(), a.body.clone())
-                } else {
-                    let rename_subst = rename_map_to_subst(&renames);
-                    let renamed_body = substitute_impl(&a.body, &rename_subst);
-                    (rename_in_pattern(&a.pattern, &renames), renamed_body)
-                };
-                MatchArm {
-                    pattern: final_pattern,
-                    body: substitute_impl(&body_for_subst, &inner),
-                }
-            }).collect(),
+            arms: arms.iter().map(|a| substitute_match_arm(a, subst)).collect(),
         },
         // All other variants — leaves and non-binder compounds —
         // uniformly substitute into children. `map_children` preserves
@@ -1268,6 +1255,42 @@ fn apply_renames_to_binders(
     }).collect();
     let renamed_body = substitute_impl(body, &rename_subst);
     (new_binders, renamed_body)
+}
+
+/// Run alpha-rename + substitution for a single `MatchArm`. Mirrors
+/// `substitute_quantified` for Lambda/Forall/Exists: extract the
+/// arm's pattern-bound names, remove them from the substitution map,
+/// compute alpha-renames if any pattern-bound name would capture a
+/// free var of the live substitution, then recurse on the body.
+///
+/// The pattern is rewritten via `rename_in_pattern` in lockstep with
+/// the body, so a renamed binding (`Pattern::Var(x) → Pattern::Var(x_α1)`)
+/// stays consistent with body references (`Var(x) → Var(x_α1)`).
+fn substitute_match_arm(
+    arm: &MatchArm,
+    subst: &std::collections::HashMap<crate::lean_name::LeanName, Expr>,
+) -> MatchArm {
+    let bound: Vec<crate::lean_name::LeanName> = pattern_bound_names(&arm.pattern)
+        .into_iter()
+        .map(crate::lean_name::LeanName::synthetic)
+        .collect();
+    let mut inner = subst.clone();
+    for n in &bound {
+        inner.remove(n);
+    }
+    let bound_refs: Vec<&crate::lean_name::LeanName> = bound.iter().collect();
+    let renames = compute_alpha_renames(&bound_refs, &inner, &arm.body);
+    let (final_pattern, body_for_subst) = if renames.is_empty() {
+        (arm.pattern.clone(), arm.body.clone())
+    } else {
+        let rename_subst = rename_map_to_subst(&renames);
+        let renamed_body = substitute_impl(&arm.body, &rename_subst);
+        (rename_in_pattern(&arm.pattern, &renames), renamed_body)
+    };
+    MatchArm {
+        pattern: final_pattern,
+        body: substitute_impl(&body_for_subst, &inner),
+    }
 }
 
 fn subst_without(
