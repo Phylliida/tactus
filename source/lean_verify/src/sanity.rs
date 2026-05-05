@@ -126,10 +126,13 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
 
         Command::Mutual(inner) => {
             // Predefine every name in the group so members can reference each other.
+            // Datatypes (#109): same treatment — mutually recursive inductives
+            // reference each other in their variant field types.
             for c in inner {
                 match c {
                     Command::Def(d) => { defined.insert(d.name.clone()); }
                     Command::DefCurried(d) => { defined.insert(d.name.clone()); }
+                    Command::Datatype(dt) => { defined.insert(dt.name.clone()); }
                     _ => {}
                 }
             }

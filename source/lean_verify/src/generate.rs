@@ -103,26 +103,63 @@ fn krate_preamble(
         }
     }
 
-    for dt in &krate.datatypes {
-        if let Dt::Path(p) = &dt.x.name {
-            // Skip Verus's synthesized closure datatypes (#93). Their
-            // names start with `anonymous_closure%` (see
-            // `vir::def::PREFIX_CLOSURE_TYPE`). Z3 needs them as
-            // distinct opaque types so `ClosureReq`/`ClosureEns`
-            // predicates can refer to closure identities; Tactus
-            // renders closures as first-class Lean function values
-            // (`fun (x : T) => body` of type `T → R`), so the
-            // synthesized opaque inductive isn't needed and would
-            // fail Lean's `deriving Inhabited` (zero-variant
-            // inductives are not Inhabited).
-            let short = short_name(p);
-            if short.starts_with("anonymous_closure") {
-                continue;
-            }
-            if refs.datatypes.contains(short) {
-                cmds.extend(to_lean_fn::datatype_to_cmds(&dt.x, emit_accessors));
+    // Filter datatypes to those referenced by the proof/exec fns and
+    // not synthesized closure types (#93). Then group into SCCs so
+    // mutually recursive datatypes (#109) can be emitted in `mutual ...
+    // end` blocks for both their inductive declarations and height fns.
+    //
+    // Transitively close over field-type references: if dt A is
+    // referenced and A has a variant field of type B, B must also be
+    // emitted so A's inductive declaration resolves. `collect_references`
+    // walks fn types/exprs but doesn't recurse into datatype variant
+    // fields — we close that here.
+    let referenced_dts: Vec<&vir::ast::DatatypeX> = {
+        use std::collections::HashSet;
+        let path_to_dt: std::collections::HashMap<&vir::ast::Path, &vir::ast::DatatypeX> =
+            krate.datatypes.iter()
+                .filter_map(|dt| match &dt.x.name {
+                    Dt::Path(p) => {
+                        let short = short_name(p);
+                        if short.starts_with("anonymous_closure") { None }
+                        else { Some((p, &dt.x)) }
+                    }
+                    Dt::Tuple(_) => None,
+                })
+                .collect();
+
+        // Seed: directly-referenced datatypes.
+        let mut seen: HashSet<&vir::ast::Path> = HashSet::new();
+        let mut worklist: Vec<&vir::ast::Path> = path_to_dt.keys()
+            .filter(|p| refs.datatypes.contains(short_name(p)))
+            .copied()
+            .collect();
+
+        // Closure: walk variant field types, add transitively-referenced
+        // datatypes to the set.
+        while let Some(p) = worklist.pop() {
+            if !seen.insert(p) { continue; }
+            let Some(dt) = path_to_dt.get(p) else { continue };
+            for variant in dt.variants.iter() {
+                for field in variant.fields.iter() {
+                    dep_order::walk_typ_paths(&field.a.0, &mut |q| {
+                        if path_to_dt.contains_key(q) && !seen.contains(q) {
+                            worklist.push(q);
+                        }
+                    });
+                }
             }
         }
+
+        // Preserve original krate.datatypes order so output is stable.
+        krate.datatypes.iter()
+            .filter_map(|dt| match &dt.x.name {
+                Dt::Path(p) if seen.contains(p) => Some(&dt.x),
+                _ => None,
+            })
+            .collect()
+    };
+    for group in dep_order::order_datatypes(&referenced_dts) {
+        cmds.extend(to_lean_fn::datatype_group_to_cmds(&group, emit_accessors));
     }
 
     let groups = dep_order::order_spec_fns(&spec_fn_map, &all_fns, root_fns);
