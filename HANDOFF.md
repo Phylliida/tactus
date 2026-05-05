@@ -2406,6 +2406,87 @@ binder + Inhabited bound details. Pinned by the two new tests.
 146 unit unchanged. One pending task closed (#108). Down to
 14 pending tasks.
 
+#### Current session (2026-05-04 cont. — #108 multi-param followup + doc audit)
+
+Two small bookkeeping landings to round out today's arc:
+
+**Multi-param generic test** (`e513352`). Locks #108's
+implicit-binder machinery for >1 type parameter.
+`test_exec_call_recursive_generic_datatype_two_params` exercises
+`enum Tagged<A, B> { Leaf(A, B), Node(A, Box<Tagged<A, B>>) }` —
+two `{A : Type} {B : Type}` implicit binders, `[Inhabited A]
+[Inhabited B]` instance bound chain on accessors, Lean's
+auto-derived `Inhabited (Tagged A B)` from both instances, and
+recursive structural termination across multi-param. Passed on
+first try — the design generalised correctly from single-param.
+The "passed first try" itself is a structural fact about the
+prior fix: the design was *structurally right*, not just
+*barely working* for one case. 276 → 277 e2e (+1).
+
+**Doc audit pass** (this commit). Walked through today's arc
+in the chat context and surfaced edge cases we noticed but
+deliberately deferred. Added six new bullets to DESIGN.md's
+"User-facing features not tested" catalogue:
+
+* Generic datatype with uninhabited type param (#108 edge —
+  `Inhabited (List Empty)` would fail at synthesis).
+* Generic datatype with trait-bounded type params (#108 edge —
+  `dt.typ_bounds` not threaded to height/accessor defs).
+* Generic recursive datatype with cross-instantiation recursion
+  (#108 edge — `enum Mut<A> { Recurse(Mut<u8>) }` should work
+  via implicit inference; untested).
+* `Pattern::Or` with cross-branch capture in alpha-rename (#116
+  edge — handled correctly via shared rename map; untested).
+* Multi-line `def` signatures in `TactusPrelude.lean` (#118
+  edge — line-based parser would miss; pinned tests guard
+  current names).
+* Stale `LEAN_PATH` after `lake update` (lake-bypass edge —
+  cached value won't reflect new packages; process restart
+  clears).
+* `lift_if_value` chain-lift only fires for let chains (#119
+  edge — Match / Var / other inner-body shapes fall through to
+  render-as-is).
+
+Plus three flips of "Untested" → "✅ covered by …" for the
+test additions earlier today (`return_in_else_branch`,
+`loop_three_modified_vars`, `nested_if_with_loops_in_both_branches`).
+
+**Why this matters.** Each edge case is a future-self IOU:
+*we know about this case, and we know why we left it.* The
+distinction from "we don't know about this case" is large —
+the latter is how soundness bugs ship; the former is how a
+project stays honest with itself.
+
+The lens worth keeping: at the end of an arc, walk through
+the chat context one more time looking for *what we saw but
+didn't fix.* The deferral catalogue isn't a TODO list — it's
+a *map of the territory* that future sessions inherit.
+
+**Net for the session**: 2 commits (multi-param test + this
+audit). 276 → 277 e2e (+1). Doc-only update otherwise.
+
+#### Day total (2026-05-04)
+
+15 commits. Eight substantive landings (#129/#118/#128/#119/
+#116/#108 plus lake-bypass and the multi-param followup) plus
+five small additions (simplify-review, #121-partial,
+#108-edge-doc-audit, three poem batches). Test counts:
+261 → 277 e2e (+16), 121 → 146 unit (+25), vstd 1530/0
+unchanged.
+
+The unifying lens, in one sentence: *most of today's work was
+making things that were already conceptually right become
+structurally locked* — auto-derive instead of hand-sync
+(#118), substitute helper instead of duplicate walk (review),
+substitute alpha-rename instead of panic-with-TODO (#116),
+encoding-level fix instead of tactic-level patch (#128),
+chain-lift gate as structural feature (#119), 0 ≤ cur as
+structural mirror of fn-level encoding (#129), implicit
+binders as structural placement (#108), edge cases catalogued
+as structural map (today's audit). Each finding asked the
+same family of question; each answer leaves a structurally
+clearer codebase behind.
+
 **Discipline note worth recording: defensive locks before
 they're needed.** The user explicitly framed this task: "we want
 to make it very robust." The work was purely defensive — no
