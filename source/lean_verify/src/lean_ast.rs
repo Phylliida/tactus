@@ -95,10 +95,19 @@ pub struct Def {
 /// Lean's equation compiler infers WF-recursion from the
 /// pattern shape; works more reliably than the match-on-binder
 /// form (`Def`) for recursive datatypes.
+///
+/// `binders` go BEFORE the `:` in the emitted Lean (e.g.,
+/// `def Name {A : Type} : T A → Nat`). For non-generic curried
+/// defs this is empty and the form is just `def Name : T → Nat`.
+/// For generic recursive defs (#108), the implicit type-param
+/// binder lives here so equations can match only on the value
+/// arg (Lean infers the implicit) — putting `∀ {A : Type}, …`
+/// inside `ty` confuses the equation compiler.
 #[derive(Debug, Clone)]
 pub struct DefCurried {
     pub attrs: Vec<String>,
     pub name: String,
+    pub binders: Vec<Binder>,
     pub ty: Expr,
     pub equations: Vec<MatchArm>,
 }

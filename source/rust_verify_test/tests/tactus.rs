@@ -4180,6 +4180,61 @@ test_verify_one_file! {
     }
 }
 
+// #108: generic datatype `decreases`. Pre-#108 `decrease_height_datatype`
+// rejected generic instantiations (`args.is_empty()` gate). Post-#108,
+// the height fn is parameterized over the type args (implicit binders
+// in Lean) so `List<u8>.height` works as `List.height (l : List u8)` —
+// Lean infers `A`. Recursion is structural on the List shape; A is
+// opaque to the height calculation.
+test_verify_one_file! {
+    #[test] test_exec_call_recursive_generic_datatype verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum List<A> {
+            Nil,
+            Cons(A, Box<List<A>>),
+        }
+
+        #[verifier::tactus_auto]
+        fn count(l: &List<u8>) -> (r: u64)
+            decreases l
+        {
+            match l {
+                List::Nil => 0,
+                List::Cons(_, rest) => count(rest),
+            }
+        }
+    } => Ok(())
+}
+
+// #108 negative: generic-datatype recursion that doesn't decrease.
+// Same shape as `test_exec_call_recursive_datatype_nondecreasing` but
+// with a generic List. Pins that the height-based termination check
+// constrains generics correctly (rather than being permissive).
+test_verify_one_file! {
+    #[test] test_exec_call_recursive_generic_datatype_nondecreasing verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum List<A> {
+            Nil,
+            Cons(A, Box<List<A>>),
+        }
+
+        #[verifier::tactus_auto]
+        fn looper(l: &List<u8>) -> (r: u64)
+            decreases l
+        {
+            match l {
+                List::Nil => 0,
+                List::Cons(_, _rest) => looper(l),
+            }
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1,
+            "non-decreasing recursion on generic datatype should fail");
+    }
+}
+
 // Early return inside a loop body — the WP DSL's `Return` arm writes
 // `ctx.ensures_goal` (the fn's ensures) by construction, regardless
 // of how deeply nested the return is. Pre-DSL code conflated this

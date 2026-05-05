@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**274 end-to-end tests + 1 coverage test + 146 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**276 end-to-end tests + 1 coverage test + 146 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -2323,6 +2323,89 @@ bit width.
 **Net for the session**: 1 commit incoming. 271 → 274 e2e (+3),
 unit unchanged. #121 partially advanced (3/7 items closed).
 
+#### Current session (2026-05-04 cont. — #108 generic datatype decreases)
+
+Closed #108. Pre-#108 `decrease_height_datatype` rejected generic
+instantiations; now `enum List<A> { Nil, Cons(A, Box<List<A>>) }`
+and similar generic recursive datatypes verify end-to-end with
+`decreases l` clauses.
+
+**Implementation:**
+* `decrease_height_datatype` (to_lean_sst_expr.rs): drop the
+  `args.is_empty()` gate. Accept any datatype path; the height
+  fn handles type args at the Lean level via implicit binders.
+* `field_is_self_recursive` (to_lean_fn.rs): drop the
+  `args.is_empty()` gate. A field of type `Tree<A>` inside
+  `enum Tree<A>` matches when `p == self_path` regardless of
+  args; recursion is on the structure, not on A.
+* `height_fn_for_datatype`: emit `def T.height {A : Type} : T A
+  → Nat | …`. The implicit binder goes BEFORE the `:` (via a
+  new `DefCurried.binders` field) so Lean's equation compiler
+  can infer A from the value pattern. Wrapping `∀ {A}` INSIDE
+  the type expression breaks elaboration: equations would try
+  to match the implicit slot first and `List.Nil` would be
+  typed as `A : Type` instead of `List A`.
+* `multi_variant_accessor_defs`: gain implicit type-param
+  binders for both discriminators (`{A : Type}`) and accessors
+  (`{A : Type} [Inhabited A]`). The `[Inhabited A]` instance
+  binder is needed because the unreachable-arm `default`
+  fallback resolves via `Inhabited`. Discriminators don't need
+  it (they return Prop, no `default`).
+* `Datatype.derives`: now unconditionally `["Inhabited"]`
+  instead of being gated on `typ_params.is_empty()`. Lean
+  auto-derives the conditional `[Inhabited A] → Inhabited (List
+  A)` instance, so generic `Cons_val1`'s `default : List A`
+  resolves whenever the caller has `[Inhabited A]`.
+* `lean_ast::DefCurried`: new `binders: Vec<Binder>` field for
+  pre-colon binders. Empty for non-generic curried defs (no
+  behavior change); populated for generics.
+* `lean_pp::write_def_curried`: emits `binders` between the name
+  and the colon.
+* `sanity::check_references`: `DefCurried` arm now starts the
+  scope from `binders` (was: empty scope) so `A` references in
+  the type and equation bodies resolve.
+
+**Tests** (2 new, 274 → 276 e2e):
+* `test_exec_call_recursive_generic_datatype` — `enum List<A> {
+  Nil, Cons(A, Box<List<A>>) }`, recursive `count(l: &List<u8>)`
+  with `decreases l`. End-to-end verification including
+  termination + match + accessors.
+* `test_exec_call_recursive_generic_datatype_nondecreasing` —
+  same shape but recursive call passes the whole list (not a
+  subterm). Confirms the height-based termination check
+  constrains generics correctly (rejects rather than vacuously
+  passes).
+
+**No regressions** in 274 pre-#108 tests. The non-generic
+datatype path (`Stack` etc.) goes through the same code with
+empty `typ_params` — `binders` field stays empty, no change in
+generated Lean.
+
+**Discipline note worth recording: structure-vs-content for
+generics.** The bug-then-fix arc had two false starts:
+1. Wrapped implicit binders inside `∀ {A : Type}, …` in the
+   type expression. Lean's equation compiler tried to match
+   `List.Nil` against the implicit `A` slot. Wrong shape.
+2. Tried with proper pre-colon binders but missed updating
+   `sanity::check_references` — `A` references in body
+   flagged as unresolved.
+
+The fix wasn't *content* (the Lean syntax was always close);
+it was *structure* — implicit binders belong in the def's
+prelude binders, not in the result type, and the sanity
+check needs to know about them. Mirrors the earlier #119
+arc (probe → guard) — the pattern of "first attempt fails,
+the failure points at the structural answer" recurred.
+
+**DESIGN.md update:** "Explicit deferrals" entry for generic
+datatypes flipped from "rejected at decrease_height_datatype
+(requires args.is_empty())" to "LANDED" with the implicit-
+binder + Inhabited bound details. Pinned by the two new tests.
+
+**Net for the session**: 1 commit incoming. 274 → 276 e2e (+2),
+146 unit unchanged. One pending task closed (#108). Down to
+14 pending tasks.
+
 **Discipline note worth recording: defensive locks before
 they're needed.** The user explicitly framed this task: "we want
 to make it very robust." The work was purely defensive — no
@@ -2832,7 +2915,7 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 |---|---|---|
 | `cargo test -p lean_verify --lib` | 146 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance via alpha-rename for Let/Lambda/Forall/Exists/Match incl. dependent types), `mentions_free_var` (binder-scope tracking), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` (incl. multi-binder chain lift) / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking + prelude-name auto-derivation, `format_rust_loc`, lean_process, `LeanName` constructors |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
-| `vargo test -p rust_verify_test --test tactus` | 274 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body + &mut x.f via structure update, trait-method calls with impl-strengthened ensures + default-impl invocation, bit-width matrix, control-flow combinations incl. return-in-else / multi-var loops / nested-if-with-loops, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression, new-mut-ref callee-side normalization, exec closure declarations + body verification scope + spec-closure calls, lexicographic decreases for fns + loops with `0 ≤ cur` lower bound, ret-substitution at call sites for `r == E` ensures) |
+| `vargo test -p rust_verify_test --test tactus` | 276 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes incl. generic `List<A>`-style with implicit type-param binders, per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body + &mut x.f via structure update, trait-method calls with impl-strengthened ensures + default-impl invocation, bit-width matrix, control-flow combinations incl. return-in-else / multi-var loops / nested-if-with-loops, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression, new-mut-ref callee-side normalization, exec closure declarations + body verification scope + spec-closure calls, lexicographic decreases for fns + loops with `0 ≤ cur` lower bound, ret-substitution at call sites for `r == E` ensures) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
 | `vargo build --release` (vstd) | 1530 | Regression guard: vstd proof library still verifies |
 
@@ -2962,7 +3045,7 @@ tactus/
       fn_call_to_vir.rs        ← tactus_span_from, enclosing_fn_is_tactus_auto
       rust_to_vir_expr.rs      ← Tactus proof-block synthesis (AssertBy-in-Ghost)
     rust_verify_test/tests/
-      tactus.rs                ← 274 end-to-end tests
+      tactus.rs                ← 276 end-to-end tests
       tactus_coverage.rs       ← coverage matrix test binary
     vir/src/
       ast.rs                   ← FunctionAttrs.tactic_span + tactus_auto;
@@ -3012,7 +3095,7 @@ cd lean_verify && ./scripts/setup-mathlib.sh && cd ..
 # (See DESIGN.md "Putting Lean on PATH" for the long form.)
 
 # ── Full test suite ────────────────────────────────────────────────
-# 274 end-to-end tests
+# 276 end-to-end tests
 PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Coverage matrix (1 test, asserts walker visits the expected variant set)

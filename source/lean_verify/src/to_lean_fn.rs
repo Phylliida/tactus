@@ -197,19 +197,17 @@ pub fn datatype_to_cmds(dt: &DatatypeX, emit_accessors: bool) -> Vec<Command> {
     };
 
     // Derive `Inhabited` for non-generic datatypes so that auto-
-    // generated accessors' `default` fallback (`Classical.arbitrary`
-    // for the wildcard arm) resolves. This matters most for self-
-    // referential types like `enum Stack { Empty, Push(u8,
-    // Box<Stack>) }` where `Push_val1 : Stack → Stack` needs
-    // `Inhabited Stack`. Generic datatypes skip this — deriving
-    // Inhabited on `T<A>` would require `[Inhabited A]` bounds we
-    // don't thread through, so we defer until a concrete need
-    // forces the plumbing.
-    let derives = if typ_params.is_empty() {
-        vec!["Inhabited".into()]
-    } else {
-        vec![]
-    };
+    // generated accessors' `default` fallback resolves. For
+    // self-referential types like `enum Stack { Empty, Push(u8,
+    // Box<Stack>) }`, `Push_val1 : Stack → Stack` needs
+    // `Inhabited Stack`. For generic datatypes (#108), Lean's
+    // `deriving Inhabited` auto-generates a conditional instance
+    // `[Inhabited A] → Inhabited (List A)`, satisfying
+    // `Cons_val1`'s `default : List A` fallback when the caller
+    // provides `[Inhabited A]` (which the accessor's typeclass
+    // bound now requires — see `accessor_typ_binders` in
+    // `multi_variant_accessor_defs`).
+    let derives = vec!["Inhabited".into()];
     let mut cmds = vec![Command::Datatype(Datatype {
         name: path.clone(),
         typ_params: typ_params.clone(),
@@ -259,29 +257,54 @@ pub fn datatype_to_cmds(dt: &DatatypeX, emit_accessors: bool) -> Vec<Command> {
 /// comparing the underlying path — this matches how `typ_to_expr`
 /// renders field types at the Lean level (Box is transparent).
 fn height_fn_for_datatype(dt: &DatatypeX, path: &str) -> Option<Command> {
+    use crate::lean_ast::{BinOp, ExprNode};
     let dt_path = match &dt.name {
         Dt::Path(p) => p,
         Dt::Tuple(_) => return None,
     };
-    if !dt.typ_params.is_empty() {
-        return None;
-    }
+
+    // Generic datatypes (#108): emit `T.height : {A : Type} → … → T A B …
+    // → Nat`. The implicit type-param binders let callers write just
+    // `T.height x` — Lean infers A from x's type. Recursion is on the
+    // T A structure, not on A itself; the equation compiler handles this
+    // because the recursive arg (e.g. `Tree.Node x rest` → recurse on
+    // `rest : Tree A`) decreases by structure regardless of A.
+    let typ_param_names: Vec<String> = dt.typ_params.iter()
+        .map(|(id, _)| id.to_string())
+        .collect();
+    let typed_input: LExpr = if typ_param_names.is_empty() {
+        LExpr::var_synthetic(path)
+    } else {
+        LExpr::app(
+            LExpr::var_synthetic(path),
+            typ_param_names.iter()
+                .map(|tp| LExpr::var_lit(tp))
+                .collect(),
+        )
+    };
+    let implicit_typ_binders: Vec<LBinder> = typ_param_names.iter().map(|tp| LBinder {
+        name: Some(crate::lean_name::LeanName::lit(tp)),
+        ty: LExpr::var_lit("Type"),
+        kind: BinderKind::Implicit,
+    }).collect();
 
     let has_recursive_field = dt.variants.iter().any(|v|
         v.fields.iter().any(|f| field_is_self_recursive(&f.a.0, dt_path))
     );
 
     if !has_recursive_field {
-        // Non-recursive: simple constant fn. The match-on-binder
-        // form is fine here — there's no WF analysis needed.
+        // Non-recursive: simple constant fn. The match-on-binder form
+        // is fine here — there's no WF analysis needed.
+        let mut binders = implicit_typ_binders;
+        binders.push(LBinder {
+            name: Some(crate::lean_name::LeanName::lit("_")),
+            ty: typed_input,
+            kind: BinderKind::Explicit,
+        });
         return Some(Command::Def(Def {
             attrs: vec!["simp".into()],
             name: format!("{}.height", path),
-            binders: vec![LBinder {
-                name: Some(crate::lean_name::LeanName::lit("_")),
-                ty: LExpr::var_synthetic(path),
-                kind: BinderKind::Explicit,
-            }],
+            binders,
             ret_ty: LExpr::var_lit("Nat"),
             body: LExpr::lit_int("1"),
             termination_by: vec![],
@@ -295,10 +318,18 @@ fn height_fn_for_datatype(dt: &DatatypeX, path: &str) -> Option<Command> {
     // and WF analysis is more reliable when the recursion is
     // expressed as direct equations rather than a match-on-
     // binder.
-    use crate::lean_ast::{BinOp, ExprNode};
+    //
+    // For generics (#108): emit implicit type-param binders BEFORE
+    // the colon (via `DefCurried.binders`), not inside the type as
+    // a `∀`. This produces `def T.height {A : Type} : T A → Nat
+    // | pat => body` — Lean's equation compiler infers A from the
+    // pattern's value position. Wrapping `∀ {A : Type}` inside the
+    // type expression confuses elaboration: the equations end up
+    // matching the implicit slot first, and `List.Nil` gets typed
+    // as the `A` (Type-valued) instead of as the `List A` value.
     let arrow_ty = LExpr::new(ExprNode::BinOp {
         op: BinOp::Implies,
-        lhs: Box::new(LExpr::var_synthetic(path)),
+        lhs: Box::new(typed_input),
         rhs: Box::new(LExpr::var_lit("Nat")),
     });
     let equations: Vec<MatchArm> = dt.variants.iter().map(|v| {
@@ -330,6 +361,7 @@ fn height_fn_for_datatype(dt: &DatatypeX, path: &str) -> Option<Command> {
     Some(Command::DefCurried(DefCurried {
         attrs: vec!["simp".into()],
         name: format!("{}.height", path),
+        binders: implicit_typ_binders,
         ty: arrow_ty,
         equations,
     }))
@@ -341,10 +373,17 @@ fn height_fn_for_datatype(dt: &DatatypeX, path: &str) -> Option<Command> {
 /// handle `Box<Self>`, `&Self`, etc. — these decorate the
 /// pointer shape at the Rust level but render as just `Self`
 /// at the Lean type level.
+///
+/// Generic datatypes (#108): a field of type `Tree<A>` inside
+/// `enum Tree<A> { … }` matches when `p == self_path`, regardless
+/// of how the type-arg list compares. `Tree.height` is generic
+/// over A, so structural recursion on a `Tree<A>`-typed field
+/// is the same as structural recursion on `Tree<U>` — Lean's
+/// equation compiler handles both because the recursion is on
+/// the datatype shape, not on A.
 fn field_is_self_recursive(typ: &Typ, self_path: &Path) -> bool {
     match &**crate::to_lean_type::peel_typ_wrappers(typ) {
-        TypX::Datatype(Dt::Path(p), args, _) if args.is_empty() =>
-            p == self_path,
+        TypX::Datatype(Dt::Path(p), _, _) => p == self_path,
         _ => false,
     }
 }
@@ -369,10 +408,63 @@ fn field_is_self_recursive(typ: &Typ, self_path: &Path) -> bool {
 /// actually reaches (ints, bools, references).
 fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> {
     let mut cmds = Vec::new();
+    // Generic datatypes (#108): the discriminator and accessors need
+    // implicit type-param binders `{A : Type}` so the input `x : T A`
+    // typechecks. For non-generic datatypes the binders list is empty
+    // and `x : T` (no application). Same shape as `height_fn_for_datatype`.
+    let typ_param_names: Vec<String> = dt.typ_params.iter()
+        .map(|(id, _)| id.to_string())
+        .collect();
+    let typed_input: LExpr = if typ_param_names.is_empty() {
+        LExpr::var_synthetic(type_name.to_string())
+    } else {
+        LExpr::app(
+            LExpr::var_synthetic(type_name.to_string()),
+            typ_param_names.iter()
+                .map(|tp| LExpr::var_lit(tp))
+                .collect(),
+        )
+    };
+    let typ_binders = || -> Vec<LBinder> {
+        typ_param_names.iter().map(|tp| LBinder {
+            name: Some(crate::lean_name::LeanName::lit(tp)),
+            ty: LExpr::var_lit("Type"),
+            kind: BinderKind::Implicit,
+        }).collect()
+    };
+    // For accessors specifically: each type param needs `[Inhabited A]`
+    // because the unreachable-arm fallback uses `default` which Lean
+    // resolves via the `Inhabited` typeclass. Discriminators don't need
+    // this (they return `Prop`, no `default` use). The user calling
+    // `Cons_val0 (l : List u8)` automatically satisfies `Inhabited u8`
+    // (primitive types have it derived); for custom types the user
+    // must provide an instance — same precondition as for non-generic
+    // accessors.
+    let accessor_typ_binders = || -> Vec<LBinder> {
+        let mut bs = typ_binders();
+        for tp in typ_param_names.iter() {
+            bs.push(LBinder {
+                name: None,
+                ty: LExpr::app1(LExpr::var_lit("Inhabited"), LExpr::var_lit(tp)),
+                kind: BinderKind::Instance,
+            });
+        }
+        bs
+    };
     let x_binder = || LBinder {
         name: Some(crate::lean_name::LeanName::lit("x")),
-        ty: LExpr::var_synthetic(type_name.to_string()),
+        ty: typed_input.clone(),
         kind: BinderKind::Explicit,
+    };
+    let discriminator_binders = || -> Vec<LBinder> {
+        let mut bs = typ_binders();
+        bs.push(x_binder());
+        bs
+    };
+    let accessor_binders = || -> Vec<LBinder> {
+        let mut bs = accessor_typ_binders();
+        bs.push(x_binder());
+        bs
     };
     let match_on_x = |arms: Vec<MatchArm>| LExpr::new(ExprNode::Match {
         scrutinee: Box::new(LExpr::var_lit("x")),
@@ -403,7 +495,7 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
             // the enum.
             attrs: vec!["simp".into()],
             name: format!("{}.is{}", type_name, var_san),
-            binders: vec![x_binder()],
+            binders: discriminator_binders(),
             ret_ty: LExpr::var_lit("Prop"),
             body: match_on_x(vec![
                 MatchArm {
@@ -447,7 +539,7 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
                 // accessor is opaque and goals involving it get stuck.
                 attrs: vec!["simp".into()],
                 name: format!("{}.{}_{}", type_name, var_san, field_name(&f.name)),
-                binders: vec![x_binder()],
+                binders: accessor_binders(),
                 ret_ty: typ_to_expr(&f.a.0),
                 body: match_on_x(vec![
                     MatchArm {

@@ -1349,11 +1349,27 @@ exec fns."
   `.height` and isn't the old deferrals rejection; when #58
   lands it flips to `=> Ok(())`.
 
+  **Generic datatypes (#108, LANDED).** `enum List<A> { Nil,
+     Cons(A, Box<List<A>>) }` and similar shapes now work end-to-
+     end. `decrease_height_datatype` accepts any `Datatype(Path,
+     args, _)` regardless of `args` length; `field_is_self_recursive`
+     matches when the field's path equals the parent's regardless
+     of args (recursion is on the structure of the datatype, not
+     on A). `height_fn_for_datatype` emits `def T.height {A : Type}
+     : T A → Nat | …` — implicit type-param binders go BEFORE the
+     `:` (via `DefCurried.binders`, new field) so Lean's equation
+     compiler infers A from the value pattern. Wrapping `∀ {A},`
+     INSIDE the type expression breaks elaboration: equations would
+     try to match the implicit slot and `List.Nil` would be typed
+     as `A : Type` instead of `List A`.
+     Accessor defs gain `[Inhabited A]` instance binders per type
+     param so the unreachable-arm `default` fallback resolves;
+     `deriving Inhabited` on the datatype itself becomes
+     unconditional (Lean auto-derives `[Inhabited A] → Inhabited
+     (List A)`). Pinned by `test_exec_call_recursive_generic_datatype`
+     and `test_exec_call_recursive_generic_datatype_nondecreasing`.
+
   **Explicit deferrals (still rejected with clear message):**
-  - **Generic datatypes.** `Tree<A>` would need a `[SizeOf A]`-
-     style height axiom routed through Lean typeclasses.
-     Rejected at `decrease_height_datatype` (requires
-     `args.is_empty()`).
   - **Mutually recursive datatype SCCs.** Height fns would need
     a `mutual` block; currently emitted standalone, which Lean
     rejects for cross-type recursion. Defer until a real user

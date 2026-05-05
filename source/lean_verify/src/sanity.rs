@@ -77,11 +77,15 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
         }
 
         // Curried-form def: name in scope (self-recursion), `ty`
-        // checked, then each equation's body checked under the
-        // pattern's bound names.
+        // and equations checked under the pre-colon binders' scope
+        // (e.g., implicit `{A : Type}` for generic datatypes — #108)
+        // plus each equation's pattern-bound names.
         Command::DefCurried(d) => {
             defined.insert(d.name.clone());
-            let mut scope = HashSet::new();
+            let mut scope = scope_from_binders(&d.binders);
+            for b in &d.binders {
+                check_expr(&b.ty, defined, &mut scope, violations, &d.name);
+            }
             check_expr(&d.ty, defined, &mut scope, violations, &d.name);
             for arm in &d.equations {
                 let mut arm_scope = scope.clone();
