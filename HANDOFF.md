@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**277 end-to-end tests + 1 coverage test + 154 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**279 end-to-end tests + 1 coverage test + 154 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -2572,6 +2572,72 @@ should exist; collectively they were a future-self IOU. Pay it
 when the evidence is "this is now load-bearing," not when it's
 "this is still bearable."
 
+#### Current session (2026-05-05 afternoon — #109 mutual datatype SCCs)
+
+Pre-#109 the deferral catalogue had a clear bullet: "Mutually
+recursive datatype SCCs. Height fns would need a `mutual` block;
+currently emitted standalone, which Lean rejects for cross-type
+recursion." Today closed it.
+
+**What landed (`cee0124`).**
+
+* `dep_order::order_datatypes` — Tarjan's SCC on the field-type
+  reference graph for datatypes. Returns `Vec<DatatypeGroup<'a>>`
+  (`Single | Mutual`). Adapts the existing `tarjan_scc` (originally
+  Fun-keyed) into a path-keyed variant — duplicated rather than
+  genericized because Rust's iter-borrow rules around generic
+  Eq+Hash keys with lifetime params get unwieldy fast for a 60-line
+  algorithm.
+* `to_lean_fn::field_recursive_target` (renamed from
+  `field_is_self_recursive`) — takes the SCC path set and returns
+  the matching path. The height fn's recursive call now uses the
+  FIELD's height fn name (so `Tree.Branch f` calls `Forest.height f`
+  for the SCC case, falling out structurally to `Tree.height` for
+  self-only).
+* `to_lean_fn::datatype_to_cmds` split into per-piece helpers
+  (`datatype_decl_cmd` / `datatype_accessor_cmds` /
+  `datatype_height_cmd`) plus a `datatype_group_to_cmds` composer.
+  For mutual SCCs the composer emits: a `Command::Mutual` of
+  inductive declarations, per-type accessors outside the mutual
+  block (they're not mutually recursive), and a second
+  `Command::Mutual` of height fns.
+* `generate.rs` wires datatype emission through `order_datatypes`
+  and adds a transitive closure step over field-type references.
+  The prior `collect_references` only walked fn types/exprs, so a
+  user fn referencing `Tree` wouldn't surface `Forest` even though
+  Tree's variant referenced it. The closure here picks up every
+  datatype reachable through field types from the seed set.
+* `sanity.rs` Mutual arm: predefine `Datatype` names alongside
+  `Def`/`DefCurried` so cross-type field references inside the
+  mutual block resolve.
+
+**Confirmed via Lean experiment.** Before implementing, ran a
+test Lean file to verify Lean accepts inline `deriving Inhabited`
+on each `inductive` inside a `mutual` block — it does, producing
+conditional instances that satisfy accessor `default` fallbacks.
+
+**Tests** (2 new, 277 → 279 e2e):
+* `test_exec_mutually_recursive_datatypes` — basic SCC inductive
+  emission. Tree references Forest, Forest references Tree.
+  Pinned by Lean elaboration succeeding.
+* `test_exec_call_recursive_over_mutual_datatype` — recursion on
+  Forest with `decreases f`. Forest.height post-#109 calls
+  Tree.height for Tree-typed fields. Decrease obligation
+  `Forest.height rest < 1 + Tree.height _ + Forest.height rest`
+  closes via Tree.height ≥ 1 (Nat type bound).
+
+**Edge case caught and documented.** A scenario this slice
+*doesn't* support: cross-fn-SCC mutual recursion where two fns
+have decreases on different SCC members (e.g., A decreases on
+Tree, B decreases on Forest, A calls B). Verus would emit a
+`CheckDecreaseHeight` comparing `Forest.height vs Tree.height`,
+which doesn't reduce structurally in our encoding. Untested;
+documented as a deferral. Workaround: tuple decreases or
+hoist to single fn with tagged-union arg.
+
+**Net for the session:** 1 substantive commit. Test count
+277 → 279 e2e (+2). vstd unchanged.
+
 ## Architecture
 
 ### Full pipeline
@@ -2880,18 +2946,19 @@ The full catalogue lives in DESIGN.md § "Known deferrals, rejected
 cases, and untested edges" — this section summarizes the task
 themes:
 
-### Feature deferrals with clear shape (7 tasks)
+### Feature deferrals with clear shape (5 pending)
 
 - **#106** &mut at call sites for non-Var L-values (umbrella for
   Index, deeper paths, multi-variant enum, tuple field).
 - **#107** caller-side new-mut-ref mode (synthetic MutRef-typed
   locals around exec calls).
-- **#108** non-int decreases for generic datatypes.
-- **#109** non-int decreases for mutually recursive datatype SCCs.
 - **#111** StmX::AssertBitVector (bit_vector reasoning).
 - **#112** StmX::OpenInvariant (atomic invariants for concurrency).
 - **#113** BinaryOp::StrGetChar + string operations.
 - **#127** loop_isolation: false support (#114 sub-feature 2).
+
+Closed: #108 (generic datatype decreases), #109 (mutual SCC decreases,
+2026-05-05).
 
 ### Architecture cleanups (2 pending)
 
@@ -3068,7 +3135,7 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 |---|---|---|
 | `cargo test -p lean_verify --lib` | 154 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance via alpha-rename for Let/Lambda/Forall/Exists/Match incl. Pattern::Binding + dependent types), `mentions_free_var` (binder-scope tracking), `strip_span_marks` + SpanMark metadata preservation through substitute, `walk_children` / `map_children` identity round-trip + visit-count regression guards + `scope_kind` direct categorization + `QuantifierKind::build` dispatch (#98), `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` (incl. multi-binder chain lift) / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking + prelude-name auto-derivation, `format_rust_loc`, lean_process, `LeanName` constructors |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
-| `vargo test -p rust_verify_test --test tactus` | 277 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes incl. generic `List<A>`-style + multi-param `Tagged<A, B>` with implicit type-param binders, per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body + &mut x.f via structure update, trait-method calls with impl-strengthened ensures + default-impl invocation, bit-width matrix, control-flow combinations incl. return-in-else / multi-var loops / nested-if-with-loops, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression, new-mut-ref callee-side normalization, exec closure declarations + body verification scope + spec-closure calls, lexicographic decreases for fns + loops with `0 ≤ cur` lower bound, ret-substitution at call sites for `r == E` ensures) |
+| `vargo test -p rust_verify_test --test tactus` | 279 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes incl. generic `List<A>`-style + multi-param `Tagged<A, B>` with implicit type-param binders + mutually recursive SCCs via Lean `mutual ... end` blocks (#109), per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body + &mut x.f via structure update, trait-method calls with impl-strengthened ensures + default-impl invocation, bit-width matrix, control-flow combinations incl. return-in-else / multi-var loops / nested-if-with-loops, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression, new-mut-ref callee-side normalization, exec closure declarations + body verification scope + spec-closure calls, lexicographic decreases for fns + loops with `0 ≤ cur` lower bound, ret-substitution at call sites for `r == E` ensures) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
 | `vargo build --release` (vstd) | 1530 | Regression guard: vstd proof library still verifies |
 
