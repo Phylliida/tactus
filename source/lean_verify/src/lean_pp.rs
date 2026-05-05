@@ -230,6 +230,7 @@ fn write_def_curried(out: &mut String, d: &DefCurried, lm: &mut Landmarks) {
     }
     out.push_str("noncomputable def ");
     out.push_str(&d.name);
+    write_binders(out, &d.binders, lm);
     out.push_str(" : ");
     write_expr(out, &d.ty, 0, lm);
     out.push('\n');

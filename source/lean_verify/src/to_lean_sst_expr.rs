@@ -856,13 +856,17 @@ fn is_int_height(typ: &Typ) -> bool {
 
 /// Extract the datatype Path when a decrease measure is a user
 /// datatype (not int). Peels `Boxed` and `Decorate` wrappers via
-/// `peel_typ_wrappers`. Returns None for generic instantiations,
-/// tuples, and anything else that can't anchor a `T.height` fn.
-/// `height_fn_for_datatype` in `to_lean_fn.rs` emits the matching
-/// definition.
+/// `peel_typ_wrappers`. Returns None for tuples and anything else
+/// that can't anchor a `T.height` fn. `height_fn_for_datatype`
+/// in `to_lean_fn.rs` emits the matching definition.
+///
+/// Generic datatype instantiations (`Tree<A>` etc.) are accepted
+/// (#108). The height fn is parameterized by implicit type args
+/// at the Lean level, so callers just write `Tree.height cur` —
+/// Lean infers `A` from `cur`'s type.
 pub(crate) fn decrease_height_datatype(typ: &Typ) -> Option<&Path> {
     match &**crate::to_lean_type::peel_typ_wrappers(typ) {
-        TypX::Datatype(Dt::Path(path), args, _) if args.is_empty() => Some(path),
+        TypX::Datatype(Dt::Path(path), _args, _) => Some(path),
         _ => None,
     }
 }
