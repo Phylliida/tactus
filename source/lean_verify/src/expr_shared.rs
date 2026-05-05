@@ -250,6 +250,21 @@ pub(crate) fn is_variant_node(variant: &Ident, inner: LExpr) -> ExprNode {
 // `sanity::name_resolves`'s allowlist so the post-codegen check
 // doesn't flag them as unresolved.
 //
+// **Convention 5: `<base>_α<N>` suffix** — alpha-rename freshness
+// suffix produced by `lean_ast::fresh_name` (#116). When
+// `substitute` detects that a binder would capture a free variable
+// from the substitution, it generates a fresh name by appending
+// `_α<N>` (smallest N ≥ 1 not in the forbidden set) and rewrites
+// the binder + body in lockstep before applying the main
+// substitution. The Greek letter α makes the alpha-renaming origin
+// obvious in error messages and generated Lean. This is the only
+// convention that uses Unicode — every other reserved name is
+// ASCII. User code can technically produce identifiers containing
+// Unicode α (Lean accepts them), but `<base>_α<N>` specifically is
+// reserved for this purpose; if a user happened to define `x_α1`
+// themselves, our forbidden-set check would skip it and pick `_α2`
+// instead. See `lean_ast::fresh_name`.
+//
 // **Gensym mechanism choice**: when generating a `_tactus_<role>_<id>`
 // name:
 //   * Use Verus's stable identifier (e.g., `StmX::Loop::id`, a
