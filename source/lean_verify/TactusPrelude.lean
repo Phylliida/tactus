@@ -124,6 +124,36 @@ macro "tactus_usize_bound" : tactic => `(tactic|
   rcases arch_word_bits_valid with h | h <;>
     (subst h; simp only [usize_hi, isize_hi]; first | decide | omega))
 
+-- `tactus_bit_vector`: closer for `assert(…) by(bit_vector)` goals
+-- (#111). Verus's `by(bit_vector)` syntax routes to a dedicated
+-- bit-vector decision procedure; in Tactus we emit a chain of
+-- Lean tactics that handle bit-vector reasoning.
+--
+-- The chain is best-effort because Tactus's u-types render as
+-- `Int` (not `BitVec`) — so Lean's full SAT-backed `bv_decide`
+-- doesn't apply directly. The current ladder:
+--
+-- 1. `intros` — strips any `req → ens` implication so the inner
+--    propositional goal is exposed.
+-- 2. `decide` — closes goals over concrete bit-widths and
+--    decidable propositions (the most common simple cases).
+-- 3. `simp_all <;> omega` — handles linear arithmetic mixed
+--    with simp-reducible bitwise ops.
+-- 4. `fail` — explicit failure with a message so users know to
+--    fall back to `assert(P) by { ... }` with their own tactic.
+--
+-- Users who want richer bit-vector reasoning (e.g., proper
+-- BitVec encoding via `bv_decide`) can override per-fn via
+-- `#[verifier::tactus_tactic("…")]`.
+macro "tactus_bit_vector" : tactic => `(tactic|
+  first
+    | (intros <;> decide)
+    | decide
+    | (intros <;> simp_all <;> omega)
+    | (simp_all <;> omega)
+    | fail "tactus_bit_vector: could not discharge — try \
+       `assert(P) by { … }` with a Lean tactic instead")
+
 -- Tactus: the *atomic closer* used at the leaves of the tactics we emit.
 -- Intentionally kept to simple, always-closing tactics — `rfl`,
 -- `decide`, `omega`, `simp_all`, and `tactus_case_split` for goals

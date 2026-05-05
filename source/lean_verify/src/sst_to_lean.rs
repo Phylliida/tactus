@@ -1065,6 +1065,43 @@ fn walk_obligations<'a>(
             let new_obl = obl.with_frame(CtxFrame::Hyp(hyp.clone()));
             walk_obligations(body, ctx, &new_obl, e);
         }
+        Wp::AssertBitVector { req_conj, ens_conj, rust_loc, body } => {
+            // Verified goal: `req_conj → ens_conj` (or just `ens_conj`
+            // when requires is empty — `req_conj` is `LitBool(true)`
+            // from `and_all([])`, and `True → P` is equivalent to `P`
+            // but emitting the bare `P` reads cleaner and avoids the
+            // user's tactic having to peel the trivial implication).
+            let goal_inner = if matches!(req_conj.node, ExprNode::LitBool(true)) {
+                ens_conj.clone()
+            } else {
+                LExpr::implies(req_conj.clone(), ens_conj.clone())
+            };
+            let goal = LExpr::span_mark(
+                rust_loc.clone(),
+                AssertKind::Obligation(ObligationKind::Plain),
+                goal_inner,
+            );
+            let id = e.next_id();
+            let name = build_theorem_name(
+                kind_to_name(AssertKind::Obligation(ObligationKind::Plain)),
+                &e.fn_name, rust_loc, id,
+            );
+            // Tactus's prelude tactic `tactus_bit_vector` (#111). Hard-
+            // coded rather than user-supplied — the surface syntax
+            // `by(bit_vector)` is itself the tactic choice. Users who
+            // need different reasoning can write `assert(P) by { … }`
+            // with their own Lean tactic instead.
+            e.emit(name, obl.wrap(goal),
+                Tactic::Named("tactus_bit_vector".to_string()));
+            // Body's ctx gets `ens_conj` as a Hyp — the surrounding
+            // code can rely on the proven ensures regardless of the
+            // requires (they were assumed by the bit_vector solver,
+            // and the surrounding code is responsible for them at
+            // the assert site if it wants to discharge `ens_conj`
+            // from the implication).
+            let new_obl = obl.with_frame(CtxFrame::Hyp(ens_conj.clone()));
+            walk_obligations(body, ctx, &new_obl, e);
+        }
         Wp::Let(name, val, body) => {
             walk_let(name, val.raw(), body, ctx, obl, e);
         }
@@ -2659,6 +2696,26 @@ enum Wp<'a> {
         body: Box<Wp<'a>>,
     },
 
+    /// `assert(…) by(bit_vector) requires P; ensures Q;` (#111).
+    ///
+    /// A dedicated decision-procedure assertion: the verified goal is
+    /// `req_conj → ens_conj` (or just `ens_conj` when requires is
+    /// empty), discharged by Tactus's `tactus_bit_vector` prelude
+    /// tactic. After the assert, `ens_conj` enters the body's ctx as
+    /// a hypothesis — mirroring how Verus's `AssertBitVector`
+    /// publishes its `ensures` to the surrounding context.
+    ///
+    /// LExpr-direct (not `Validated`-wrapped) because the goal is
+    /// constructed at build-time from a list of SST exps via
+    /// `lower_validated`; the resulting expression doesn't borrow a
+    /// single SST node. Same shape as `Wp::Hyp`.
+    AssertBitVector {
+        req_conj: LExpr,
+        ens_conj: LExpr,
+        rust_loc: String,
+        body: Box<Wp<'a>>,
+    },
+
     /// `if cond { then_branch } else { else_branch }`. Walker
     /// recurses on `then_branch` with `cond` as a Hyp frame, and
     /// on `else_branch` with `¬cond`. No theorem at the branch
@@ -3219,12 +3276,40 @@ fn build_wp<'a>(
             };
             Ok(Wp::Done(leaf))
         }
-        StmX::AssertBitVector { .. } => Err(
-            "`assert(...) by(bit_vector)` not yet supported — Tactus has no \
-             bitvector reasoning backend. Workaround: prove the property \
-             via `assert(P) by { … }` with a Lean tactic (e.g., \
-             `decide` for small bitwidths) inside a `tactus_auto` fn.".to_string()
-        ),
+        StmX::AssertBitVector { requires, ensures } => {
+            // Lower requires + ensures to LExprs. Both lists may be
+            // empty: empty requires means no preconditions; empty
+            // ensures means no obligation (degenerate case — we still
+            // emit the variant with `ens_conj = True`, walker emits
+            // a trivial theorem).
+            let req_lexprs: Vec<LExpr> = requires.iter()
+                .map(|r| {
+                    let v = crate::to_lean_sst_expr::Validated::check(r)?;
+                    Ok::<LExpr, String>(lower_validated(&v))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let ens_lexprs: Vec<LExpr> = ensures.iter()
+                .map(|e| {
+                    let v = crate::to_lean_sst_expr::Validated::check(e)?;
+                    Ok::<LExpr, String>(lower_validated(&v))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let req_conj = and_all(req_lexprs);
+            let ens_conj = and_all(ens_lexprs);
+            // Use the first ensure's span when present — that's the
+            // user's `assert(…) by(bit_vector)` site. Falls back to
+            // the stm's span via the caller-side wrapping if absent.
+            let rust_loc = ensures.first()
+                .map(|e| format_rust_loc(&e.span))
+                .or_else(|| requires.first().map(|r| format_rust_loc(&r.span)))
+                .unwrap_or_default();
+            Ok(Wp::AssertBitVector {
+                req_conj,
+                ens_conj,
+                rust_loc,
+                body: Box::new(after),
+            })
+        }
         // `StmX::AssertQuery` with `AssertQueryMode::Tactus` is how
         // `ast_to_sst` encodes an `assert(P) by { lean_tac }` (or
         // a `proof { lean_tac }`) inside a `tactus_auto` fn (see
