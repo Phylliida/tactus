@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**286 end-to-end tests + 1 coverage test + 160 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**288 end-to-end tests + 1 coverage test + 160 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -2953,18 +2953,18 @@ The full catalogue lives in DESIGN.md § "Known deferrals, rejected
 cases, and untested edges" — this section summarizes the task
 themes:
 
-### Feature deferrals with clear shape (5 pending)
+### Feature deferrals with clear shape (4 pending)
 
 - **#106** &mut at call sites for non-Var L-values (umbrella for
   Index, deeper paths, multi-variant enum, tuple field).
 - **#107** caller-side new-mut-ref mode (synthetic MutRef-typed
   locals around exec calls).
-- **#111** StmX::AssertBitVector (bit_vector reasoning).
 - **#112** StmX::OpenInvariant (atomic invariants for concurrency).
 - **#113** BinaryOp::StrGetChar + string operations.
 - **#127** loop_isolation: false support (#114 sub-feature 2).
 
 Closed: #108 (generic datatype decreases), #109 (mutual SCC decreases,
+2026-05-05), #111 (assert by(bit_vector) via tactus_bit_vector tactic,
 2026-05-05).
 
 ### Architecture cleanups (2 pending)
