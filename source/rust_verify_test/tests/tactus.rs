@@ -4490,6 +4490,36 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #111: `assert(P) by(bit_vector)` routes to Tactus's prelude
+// `tactus_bit_vector` tactic. The goal here is concrete enough that
+// Lean's `decide` (in the tactic ladder) closes it. Pre-#111 Tactus
+// rejected the StmX::AssertBitVector outright.
+test_verify_one_file! {
+    #[test] test_exec_assert_bit_vector_concrete verus_code! {
+        #[verifier::tactus_auto]
+        fn xor_concrete() {
+            assert((5u8 ^ 3) == 6) by(bit_vector);
+        }
+    } => Ok(())
+}
+
+// #111 negative: a clearly-false bit_vector assertion fails — the
+// tactic chain gives up and `tactus_bit_vector`'s explicit `fail`
+// fires. Confirms the routing actually verifies (rather than
+// silently passing every assert through).
+test_verify_one_file! {
+    #[test] test_exec_assert_bit_vector_false verus_code! {
+        #[verifier::tactus_auto]
+        fn xor_wrong(x: u8) {
+            // x ^ x == 0 is the truth; claiming == 1 should fail.
+            assert((x ^ x) == 1u8) by(bit_vector);
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1,
+            "false bit_vector assertion should fail verification");
+    }
+}
+
 // #109 follow-up: recursion over a member of a mutual-SCC datatype.
 // `Forest.height` post-#109 calls `Tree.height` for its Tree fields
 // (cross-type recursion in the height fn, requiring the mutual block).
