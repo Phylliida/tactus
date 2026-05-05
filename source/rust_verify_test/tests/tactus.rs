@@ -4235,6 +4235,33 @@ test_verify_one_file! {
     }
 }
 
+// #108 followup: generic datatype with TWO type parameters. Verifies
+// that the implicit-binder machinery handles >1 type arg correctly
+// (one `{A : Type}` per param, accessor's `[Inhabited A] [Inhabited B]`
+// chain, Lean's auto-derived `Inhabited (Tagged A B)` from both
+// instances). The earlier #108 tests used `List<A>` with one param;
+// this locks the multi-param shape.
+test_verify_one_file! {
+    #[test] test_exec_call_recursive_generic_datatype_two_params verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum Tagged<A, B> {
+            Leaf(A, B),
+            Node(A, Box<Tagged<A, B>>),
+        }
+
+        #[verifier::tactus_auto]
+        fn depth(t: &Tagged<u8, u8>) -> (r: u64)
+            decreases t
+        {
+            match t {
+                Tagged::Leaf(_, _) => 0,
+                Tagged::Node(_, rest) => depth(rest),
+            }
+        }
+    } => Ok(())
+}
+
 // Early return inside a loop body — the WP DSL's `Return` arm writes
 // `ctx.ensures_goal` (the fn's ensures) by construction, regardless
 // of how deeply nested the return is. Pre-DSL code conflated this
