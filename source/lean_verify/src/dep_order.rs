@@ -245,26 +245,18 @@ pub fn order_datatypes<'a>(
     }).collect()
 }
 
-/// Walk a `Typ` and call `f` on each `Path` reached through `TypX::Datatype`.
-/// Peels `Boxed`/`Decorate` to match how `peel_typ_wrappers` resolves field
-/// types — `Box<T>`, `&T`, etc. all reduce to `T` for dependency purposes.
+/// Walk a `Typ` and call `f` on each `Path` reached through
+/// `TypX::Datatype(Dt::Path, …)`. Recurses through every nested
+/// `TypX` (`Boxed`, `Decorate`, `SpecFn`, datatype args, etc.) via
+/// the shared `to_lean_type::walk_typ` helper, then filters on
+/// `Datatype(Path)` — wrapper nodes (Box / Decorate) and tuples
+/// produce no path to call `f` on.
 pub fn walk_typ_paths<'a>(typ: &'a Typ, f: &mut impl FnMut(&'a Path)) {
-    use crate::to_lean_type::peel_typ_wrappers;
-    let peeled = peel_typ_wrappers(typ);
-    match &**peeled {
-        TypX::Datatype(Dt::Path(p), args, _) => {
+    crate::to_lean_type::walk_typ(typ, &mut |t| {
+        if let TypX::Datatype(Dt::Path(p), _, _) = t {
             f(p);
-            for arg in args.iter() { walk_typ_paths(arg, f); }
         }
-        TypX::Datatype(Dt::Tuple(_), args, _) => {
-            for arg in args.iter() { walk_typ_paths(arg, f); }
-        }
-        TypX::SpecFn(params, ret) => {
-            for p in params.iter() { walk_typ_paths(p, f); }
-            walk_typ_paths(ret, f);
-        }
-        _ => {}
-    }
+    });
 }
 
 // ── Coverage instrumentation ───────────────────────────────────────────

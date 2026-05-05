@@ -600,6 +600,25 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
     for v in dt.variants.iter() {
         let var_san = sanitize(&v.name);
         let wildcards: Vec<LPattern> = v.fields.iter().map(|_| LPattern::Wildcard).collect();
+        let mut arms = vec![MatchArm {
+            pattern: LPattern::Ctor {
+                name: format!("{}.{}", type_name, var_san),
+                args: wildcards,
+            },
+            body: LExpr::lit_bool(true),
+        }];
+        // The catch-all false arm is needed for multi-variant inductives
+        // (totality) but redundant for single-variant ones — the single
+        // ctor pattern is already exhaustive, so Lean would warn
+        // "Redundant alternative" and `lean_process` reports that as a
+        // verification error. For a one-variant inductive this
+        // discriminator always returns `true` anyway.
+        if dt.variants.len() > 1 {
+            arms.push(MatchArm {
+                pattern: LPattern::Wildcard,
+                body: LExpr::lit_bool(false),
+            });
+        }
         cmds.push(Command::Def(Def {
             // `@[simp]`: let `simp_all` unfold the discriminator so
             // `tactus_auto` can close exec-fn goals that turn on a
@@ -610,19 +629,7 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
             name: format!("{}.is{}", type_name, var_san),
             binders: discriminator_binders(),
             ret_ty: LExpr::var_lit("Prop"),
-            body: match_on_x(vec![
-                MatchArm {
-                    pattern: LPattern::Ctor {
-                        name: format!("{}.{}", type_name, var_san),
-                        args: wildcards,
-                    },
-                    body: LExpr::lit_bool(true),
-                },
-                MatchArm {
-                    pattern: LPattern::Wildcard,
-                    body: LExpr::lit_bool(false),
-                },
-            ]),
+            body: match_on_x(arms),
             termination_by: vec![],
         }));
     }
@@ -645,6 +652,33 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
                 } else {
                     LPattern::Wildcard
                 }).collect();
+            let mut arms = vec![MatchArm {
+                pattern: LPattern::Ctor {
+                    name: format!("{}.{}", type_name, var_san),
+                    args: binders_pat,
+                },
+                body: LExpr::var_synthetic(field_local),
+            }];
+            // Catch-all `default` arm: needed for multi-variant
+            // inductives (Lean requires totality) but redundant for
+            // single-variant ones — the ctor pattern already covers
+            // every value of the type. Adding the wildcard would
+            // surface as Lean's "Redundant alternative" warning and
+            // fail verification.
+            if dt.variants.len() > 1 {
+                arms.push(MatchArm {
+                    pattern: LPattern::Wildcard,
+                    // `default` resolves via `[Inhabited α]`, which
+                    // Lean derives automatically for primitive
+                    // types (Int, Nat, Bool) — the types exec-fn
+                    // match-desugaring actually reaches. Users
+                    // with custom field types may need a manual
+                    // `instance : Inhabited Foo := ⟨…⟩`.
+                    // Unreachable anyway when call sites guard
+                    // the accessor with a prior isVariant check.
+                    body: LExpr::var_lit("default"),
+                });
+            }
             cmds.push(Command::Def(Def {
                 // `@[simp]` for the same reason as the discriminator:
                 // `simp_all` should unfold the accessor before `omega`
@@ -654,27 +688,7 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
                 name: format!("{}.{}_{}", type_name, var_san, field_name(&f.name)),
                 binders: accessor_binders(),
                 ret_ty: typ_to_expr(&f.a.0),
-                body: match_on_x(vec![
-                    MatchArm {
-                        pattern: LPattern::Ctor {
-                            name: format!("{}.{}", type_name, var_san),
-                            args: binders_pat,
-                        },
-                        body: LExpr::var_synthetic(field_local),
-                    },
-                    MatchArm {
-                        pattern: LPattern::Wildcard,
-                        // `default` resolves via `[Inhabited α]`, which
-                        // Lean derives automatically for primitive
-                        // types (Int, Nat, Bool) — the types exec-fn
-                        // match-desugaring actually reaches. Users
-                        // with custom field types may need a manual
-                        // `instance : Inhabited Foo := ⟨…⟩`.
-                        // Unreachable anyway when call sites guard
-                        // the accessor with a prior isVariant check.
-                        body: LExpr::var_lit("default"),
-                    },
-                ]),
+                body: match_on_x(arms),
                 termination_by: vec![],
             }));
         }
