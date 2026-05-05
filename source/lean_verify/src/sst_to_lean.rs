@@ -4842,6 +4842,91 @@ mod tests {
             "disjunction with `otherwise` branch should be present: {}", printed);
     }
 
+    /// Construct a synthetic local-crate `Path` for tests, e.g.
+    /// `mk_test_path("Tree")` → path with single segment "Tree".
+    fn mk_test_path(name: &str) -> vir::ast::Path {
+        Arc::new(vir::ast::PathX {
+            krate: None,
+            segments: Arc::new(vec![Arc::new(name.to_string())]),
+        })
+    }
+
+    /// Construct a `TypX::Datatype(Dt::Path(name), [], [])` Typ for
+    /// tests. No type args (concrete datatype), no impl paths.
+    fn typ_datatype(name: &str) -> Typ {
+        use vir::ast::{Dt, TypX};
+        Arc::new(TypX::Datatype(
+            Dt::Path(mk_test_path(name)),
+            Arc::new(vec![]),
+            Arc::new(vec![]),
+        ))
+    }
+
+    #[test]
+    fn check_decrease_height_cross_type_shape_pinned() {
+        // #109 stretch: cross-fn-SCC mutual recursion where cur and
+        // prev have DIFFERENT datatype types (e.g., Tree and Forest
+        // in the same SCC). Pre-fix Tactus used cur's type's height
+        // fn for both sides — emitting `Forest.height (Tree-typed)`,
+        // which Lean rejects with a type mismatch.
+        //
+        // This shape-drift test pins that:
+        //   * cur uses <cur_T>.height
+        //   * prev uses <prev_T>.height
+        // independently. If a future refactor accidentally collapses
+        // the dispatch back to a single height fn, this test catches
+        // it before any e2e test would.
+        use vir::sst::{CallFun, ExpX, InternalFun};
+        let tree_typ = typ_datatype("Tree");
+        let forest_typ = typ_datatype("Forest");
+
+        // cur: Bind(Let([(t, branch_field)], t)) at Tree type.
+        let cur_arg = var_exp("branch_field", tree_typ.clone());
+        let cur_dec = var_exp("t", tree_typ.clone());
+        let cur_inner = let_exp("t", cur_arg, cur_dec);
+        let cur = box_exp(cur_inner);
+        // prev: Var(decrease_init0) at Forest type.
+        let prev = box_exp(var_exp("decrease_init0", forest_typ.clone()));
+        let otherwise = Arc::new(SpannedTyped {
+            span: test_span(),
+            typ: typ_bool(),
+            x: ExpX::Const(vir::ast::Constant::Bool(false)),
+        });
+        let args = Arc::new(vec![cur, prev, otherwise]);
+        let typ_args: Arc<Vec<Typ>> = Arc::new(vec![]);
+        let call = Arc::new(SpannedTyped {
+            span: test_span(),
+            typ: typ_bool(),
+            x: ExpX::Call(
+                CallFun::InternalFun(InternalFun::CheckDecreaseHeight),
+                typ_args,
+                args,
+            ),
+        });
+        let rendered = render_via_public(&call);
+        let printed = crate::lean_pp::pp_expr(&rendered);
+
+        // Both type-specific height fns must be referenced. If
+        // `to_lean_sst_expr.rs`'s CheckDecreaseHeight arm
+        // accidentally collapses back to using ONE height fn for both
+        // sides (the pre-fix bug for #109 stretch), only one of these
+        // names would appear and the other side would either reuse it
+        // (type mismatch in real Lean compilation) or sorry.
+        assert!(printed.contains("Tree.height"),
+            "cur side should reference `Tree.height` (cur has type \
+             Tree). If this is missing or reads `Forest.height` instead, \
+             the CheckDecreaseHeight cur-side dispatch in \
+             `to_lean_sst_expr.rs` has drifted — each side must use \
+             `decrease_height_datatype(&args[i].typ)` for its own \
+             type. Got:\n{}", printed);
+        assert!(printed.contains("Forest.height"),
+            "prev side should reference `Forest.height` (prev has type \
+             Forest). If this is missing or reads `Tree.height` instead, \
+             the CheckDecreaseHeight prev-side dispatch in \
+             `to_lean_sst_expr.rs` has drifted (#109 stretch regression). \
+             Got:\n{}", printed);
+    }
+
     // ── #120 shape-drift tests ──────────────────────────────────
     //
     // Belt-and-suspenders against silent breakage from upstream
