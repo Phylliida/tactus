@@ -425,45 +425,41 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
                 .collect(),
         )
     };
-    let typ_binders = || -> Vec<LBinder> {
-        typ_param_names.iter().map(|tp| LBinder {
-            name: Some(crate::lean_name::LeanName::lit(tp)),
-            ty: LExpr::var_lit("Type"),
-            kind: BinderKind::Implicit,
-        }).collect()
-    };
-    // For accessors specifically: each type param needs `[Inhabited A]`
-    // because the unreachable-arm fallback uses `default` which Lean
-    // resolves via the `Inhabited` typeclass. Discriminators don't need
-    // this (they return `Prop`, no `default` use). The user calling
-    // `Cons_val0 (l : List u8)` automatically satisfies `Inhabited u8`
-    // (primitive types have it derived); for custom types the user
-    // must provide an instance — same precondition as for non-generic
-    // accessors.
-    let accessor_typ_binders = || -> Vec<LBinder> {
-        let mut bs = typ_binders();
-        for tp in typ_param_names.iter() {
-            bs.push(LBinder {
-                name: None,
-                ty: LExpr::app1(LExpr::var_lit("Inhabited"), LExpr::var_lit(tp)),
-                kind: BinderKind::Instance,
-            });
-        }
-        bs
-    };
-    let x_binder = || LBinder {
+    // Binder pieces, computed once and cloned per (variant, field).
+    // Each piece is a logical group:
+    //
+    // * `typ_param_pieces`: implicit `{A : Type}` per type param —
+    //   needed by both discriminators and accessors (so the input
+    //   `x : T A` typechecks).
+    // * `inhabited_bound_pieces`: instance `[Inhabited A]` per type
+    //   param — needed by accessors only (the unreachable-arm
+    //   `default` fallback resolves via `Inhabited`). Discriminators
+    //   return `Prop`, no `default` use.
+    // * `x_binder`: the `(x : T A)` value parameter — same for both.
+    let typ_param_pieces: Vec<LBinder> = typ_param_names.iter().map(|tp| LBinder {
+        name: Some(crate::lean_name::LeanName::lit(tp)),
+        ty: LExpr::var_lit("Type"),
+        kind: BinderKind::Implicit,
+    }).collect();
+    let inhabited_bound_pieces: Vec<LBinder> = typ_param_names.iter().map(|tp| LBinder {
+        name: None,
+        ty: LExpr::app1(LExpr::var_lit("Inhabited"), LExpr::var_lit(tp)),
+        kind: BinderKind::Instance,
+    }).collect();
+    let x_binder = LBinder {
         name: Some(crate::lean_name::LeanName::lit("x")),
         ty: typed_input.clone(),
         kind: BinderKind::Explicit,
     };
     let discriminator_binders = || -> Vec<LBinder> {
-        let mut bs = typ_binders();
-        bs.push(x_binder());
+        let mut bs = typ_param_pieces.clone();
+        bs.push(x_binder.clone());
         bs
     };
     let accessor_binders = || -> Vec<LBinder> {
-        let mut bs = accessor_typ_binders();
-        bs.push(x_binder());
+        let mut bs = typ_param_pieces.clone();
+        bs.extend(inhabited_bound_pieces.iter().cloned());
+        bs.push(x_binder.clone());
         bs
     };
     let match_on_x = |arms: Vec<MatchArm>| LExpr::new(ExprNode::Match {
