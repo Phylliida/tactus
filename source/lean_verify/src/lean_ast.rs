@@ -2522,4 +2522,225 @@ mod substitute_tests {
                 "map_pattern_children identity round-trip failed: {:?}", p);
         }
     }
+
+    // ── ScopeKind / scope_kind() coverage (#98 follow-up) ────────────
+
+    /// Direct test of `ExprNode::scope_kind()` — locks in the
+    /// categorization of every variant. If a future contributor
+    /// accidentally puts a binder into `ScopeKind::Other` (the one
+    /// way the structural lock could still be circumvented — by
+    /// positively lying about scope semantics), this test catches
+    /// it for the existing variants. New variants compile-error in
+    /// scope_kind() until categorized; this test then guards their
+    /// stated category against later edits.
+    #[test]
+    fn scope_kind_categorizes_each_variant() {
+        // Var → ScopeKind::Var
+        assert!(matches!(
+            var("x").node.scope_kind(),
+            ScopeKind::Var(_)
+        ), "Var should be ScopeKind::Var");
+
+        // Let → ScopeKind::Let
+        assert!(matches!(
+            let_bind("x", lit(1), var("x")).node.scope_kind(),
+            ScopeKind::Let { .. }
+        ), "Let should be ScopeKind::Let");
+
+        // Lambda → ScopeKind::Quantified { kind: Lambda }
+        match lambda("x", var("x")).node.scope_kind() {
+            ScopeKind::Quantified { kind: QuantifierKind::Lambda, .. } => {}
+            other => panic!("Lambda should be Quantified Lambda; got {:?}",
+                std::mem::discriminant(&other)),
+        }
+
+        // Forall → ScopeKind::Quantified { kind: Forall }
+        match forall("x", var("x")).node.scope_kind() {
+            ScopeKind::Quantified { kind: QuantifierKind::Forall, .. } => {}
+            other => panic!("Forall should be Quantified Forall; got {:?}",
+                std::mem::discriminant(&other)),
+        }
+
+        // Exists → ScopeKind::Quantified { kind: Exists }
+        match exists("x", var("x")).node.scope_kind() {
+            ScopeKind::Quantified { kind: QuantifierKind::Exists, .. } => {}
+            other => panic!("Exists should be Quantified Exists; got {:?}",
+                std::mem::discriminant(&other)),
+        }
+
+        // Match → ScopeKind::Match
+        let match_e = Expr::new(ExprNode::Match {
+            scrutinee: Box::new(var("x")),
+            arms: vec![],
+        });
+        assert!(matches!(
+            match_e.node.scope_kind(),
+            ScopeKind::Match { .. }
+        ), "Match should be ScopeKind::Match");
+
+        // All non-binder variants → ScopeKind::Other
+        let non_binders: Vec<Expr> = vec![
+            lit(1),
+            Expr::new(ExprNode::LitBool(true)),
+            Expr::new(ExprNode::LitStr("s".into())),
+            Expr::new(ExprNode::LitChar('a')),
+            Expr::new(ExprNode::Raw("r".into())),
+            add(var("a"), var("b")),
+            Expr::new(ExprNode::UnOp { op: UnOp::Not, arg: Box::new(var("p")) }),
+            Expr::new(ExprNode::App {
+                head: Box::new(var("f")),
+                args: vec![var("x")],
+            }),
+            Expr::new(ExprNode::If {
+                cond: Box::new(var("c")),
+                then_: Box::new(lit(1)),
+                else_: None,
+            }),
+            Expr::new(ExprNode::TypeAnnot {
+                expr: Box::new(var("x")),
+                ty: Box::new(var("Nat")),
+            }),
+            Expr::new(ExprNode::FieldProj {
+                expr: Box::new(var("p")),
+                field: "x".into(),
+            }),
+            Expr::new(ExprNode::StructUpdate {
+                base: Box::new(var("p")),
+                updates: vec![],
+            }),
+            Expr::new(ExprNode::ArrayLit(vec![])),
+            Expr::new(ExprNode::Index {
+                base: Box::new(var("a")),
+                idx: Box::new(lit(0)),
+                bang: false,
+            }),
+            Expr::new(ExprNode::Anon(vec![])),
+            Expr::new(ExprNode::SpanMark {
+                rust_loc: "loc".into(),
+                kind: AssertKind::Hypothesis(HypothesisKind::BranchCondition),
+                inner: Box::new(var("x")),
+            }),
+        ];
+        for e in &non_binders {
+            assert!(matches!(e.node.scope_kind(), ScopeKind::Other),
+                "expected ScopeKind::Other for {:?}", e.node);
+        }
+    }
+
+    /// `QuantifierKind::build` rebuilds the right `ExprNode` constructor.
+    /// Indirectly tested via substitute on Lambda/Forall/Exists, but a
+    /// direct test pins the dispatch contract.
+    #[test]
+    fn quantifier_kind_build_dispatches_correctly() {
+        let binder = vec![Binder {
+            name: Some(LeanName::lit("x")),
+            ty: var("Int"),
+            kind: BinderKind::Explicit,
+        }];
+        let body = Box::new(var("x"));
+
+        let lam = QuantifierKind::Lambda.build(binder.clone(), body.clone());
+        assert!(matches!(lam, ExprNode::Lambda { .. }));
+        let fa = QuantifierKind::Forall.build(binder.clone(), body.clone());
+        assert!(matches!(fa, ExprNode::Forall { .. }));
+        let ex = QuantifierKind::Exists.build(binder, body);
+        assert!(matches!(ex, ExprNode::Exists { .. }));
+    }
+
+    // ── Pattern::Binding behavior coverage ───────────────────────────
+
+    /// `Pattern::Binding { name, sub }` introduces a name that scopes
+    /// over the arm body. `match_arm_pattern_shadows` covers
+    /// `Pattern::Var` and `Pattern::Ctor`; this test pins
+    /// `Pattern::Binding` shadowing in substitute.
+    #[test]
+    fn match_arm_binding_pattern_shadows() {
+        // match scrut with | b @ Some(x) => b
+        //   with {b: lit(99), x: lit(42)}
+        //   Both b and x are pattern-bound, so substitution should
+        //   leave the body's `b` alone.
+        let e = Expr::new(ExprNode::Match {
+            scrutinee: Box::new(var("scrut")),
+            arms: vec![MatchArm {
+                pattern: Pattern::Binding {
+                    name: LeanName::lit("b"),
+                    sub: Box::new(Pattern::Ctor {
+                        name: "Some".into(),
+                        args: vec![Pattern::Var(LeanName::lit("x"))],
+                    }),
+                },
+                body: var("b"),
+            }],
+        });
+        let s = subst_of(&[("b", lit(99)), ("x", lit(42))]);
+        let out = substitute(&e, &s);
+        let printed = crate::lean_pp::pp_expr(&out);
+        // `b` is pattern-bound by Pattern::Binding, so the body's `b`
+        // should NOT be substituted to 99.
+        assert!(!printed.contains("=> 99"),
+            "b should NOT be substituted (Pattern::Binding shadows): {}", printed);
+        assert!(printed.contains("=> b"),
+            "body should still read `b`: {}", printed);
+    }
+
+    /// `Pattern::Binding`'s name should rename when it would capture
+    /// a free var of the substitution. Pinned to lock alpha-rename
+    /// behavior on Pattern::Binding (rename_in_pattern's Binding arm
+    /// + pattern_bound_names treating the name as bound).
+    #[test]
+    fn capture_alpha_renames_match_binding_pattern() {
+        // match scrut with | b @ _ => b + y
+        //   with {y: var("b")}  — the substitution would capture
+        //   the pattern-bound `b`, so the binding gets alpha-renamed.
+        let e = Expr::new(ExprNode::Match {
+            scrutinee: Box::new(var("scrut")),
+            arms: vec![MatchArm {
+                pattern: Pattern::Binding {
+                    name: LeanName::lit("b"),
+                    sub: Box::new(Pattern::Wildcard),
+                },
+                body: add(var("b"), var("y")),
+            }],
+        });
+        let s = subst_of(&[("y", var("b"))]);
+        let result = substitute(&e, &s);
+        let printed = crate::lean_pp::pp_expr(&result);
+        // The `b` binding renames; substituted-y becomes free `b`.
+        assert!(printed.contains("b_α"),
+            "Pattern::Binding `b` should alpha-rename: {}", printed);
+        // The substituted free `b` (from y → b) survives unrenamed.
+        assert!(mentions_free_var(&result, "b"),
+            "free b (substituted from y) should remain: {}", printed);
+    }
+
+    // ── SpanMark preservation through substitute ─────────────────────
+
+    /// Substitute on a `SpanMark` should preserve `rust_loc` and
+    /// `kind` while substituting through `inner`. After the #98
+    /// refactor, SpanMark falls into the `ScopeKind::Other` →
+    /// `map_children` arm; this test pins that the metadata
+    /// survives the round-trip.
+    #[test]
+    fn substitute_preserves_span_mark_metadata() {
+        let inner = var("x");
+        let span_mark = Expr::new(ExprNode::SpanMark {
+            rust_loc: "test.rs:42:7".into(),
+            kind: AssertKind::Obligation(ObligationKind::Plain),
+            inner: Box::new(inner),
+        });
+        let s = subst_of(&[("x", lit(99))]);
+        let out = substitute(&span_mark, &s);
+
+        match &out.node {
+            ExprNode::SpanMark { rust_loc, kind, inner } => {
+                assert_eq!(rust_loc, "test.rs:42:7", "rust_loc preserved");
+                assert!(matches!(kind, AssertKind::Obligation(ObligationKind::Plain)),
+                    "kind preserved");
+                // Inner should now be 99 (substituted from x).
+                assert!(matches!(&inner.node, ExprNode::Lit(s) if s == "99"),
+                    "inner substituted: {:?}", inner.node);
+            }
+            other => panic!("expected SpanMark, got {:?}", other),
+        }
+    }
 }
