@@ -1380,17 +1380,45 @@ exec fns."
      (List A)`). Pinned by `test_exec_call_recursive_generic_datatype`
      and `test_exec_call_recursive_generic_datatype_nondecreasing`.
 
+  **Mutually recursive datatype SCCs — LANDED via #109.**
+  `enum Tree { Branch(Box<Forest>) }` + `enum Forest { Cons(Box<Tree>) }`
+  now emit correctly: `dep_order::order_datatypes` runs Tarjan's SCC on
+  the field-type reference graph; SCCs of size >1 produce a `mutual ...
+  end` block of inductives, per-type accessors outside the block, and a
+  second `mutual ... end` block of height fns. `field_recursive_target`
+  (renamed from `field_is_self_recursive`) accepts the SCC path set, so
+  `Tree.height` calls `Forest.height` for Forest-typed fields rather than
+  silently treating cross-type fields as non-recursive. `Inhabited` derives
+  inline on each inductive — Lean accepts deriving inside a mutual block
+  and produces conditional instances. Sanity check (`sanity.rs` Mutual
+  arm) predefines `Datatype` names alongside `Def`/`DefCurried` so
+  cross-type field references resolve. Generate.rs adds a transitive
+  closure over field-type refs (`collect_references` doesn't walk into
+  variant fields by itself) before grouping. Pinned by
+  `test_exec_mutually_recursive_datatypes` (basic SCC emission) and
+  `test_exec_call_recursive_over_mutual_datatype` (recursion over an SCC
+  member exercises cross-type height calls in the termination obligation).
+
   **Explicit deferrals (still rejected with clear message):**
-  - **Mutually recursive datatype SCCs.** Height fns would need
-    a `mutual` block; currently emitted standalone, which Lean
-    rejects for cross-type recursion. Defer until a real user
-    case motivates the plumbing.
   - **Recursive function fields** (`struct S { f: FnSpec(int) →
     Option<S> }`). Verus has a special axiom
     (`recursive_function_field` in `datatype_height_axioms`) for
     this; we don't mirror it.
   - **Lexicographic `decreases a, b` — LANDED via #110.** See
     "Loop-shape restrictions" entry above for the encoding.
+
+  **Edge cases worth knowing for #109:**
+  - **Cross-fn-SCC mutual recursion with cross-type decreases.**
+    Tactus didn't test fns A and B that mutually call each other
+    where A decreases on Tree and B decreases on Forest. Verus's
+    recursion pass would emit a `CheckDecreaseHeight` comparing
+    different types' heights at each cross-call — Tree.height vs
+    Forest.height. The decrease obligation `Forest.height f <
+    Tree.height t` doesn't have a structural relation in our
+    encoding (each height fn is independent). Untested; would
+    likely fail. Workaround: use `decreases (height_unified, …)`
+    over a tuple, or hoist mutual fn pairs into a single fn with
+    a tagged-union arg.
 
 ##### Tier 3 — bigger slices (~1 week each)
 
