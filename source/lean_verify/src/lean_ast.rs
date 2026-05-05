@@ -628,11 +628,16 @@ pub enum Tactic {
 /// `compute_alpha_renames` and `apply_renames_to_binders`.
 ///
 /// **Per-variant boilerplate.** Adding a new `ExprNode` variant
-/// requires editing three places: `substitute_impl`, `collect_free_vars`,
-/// and the pretty-printer. Not painful enough yet to justify a
-/// proc-macro `walk_children` helper, but worth documenting as a
-/// smell — if the variant count climbs, a folding abstraction would
-/// collapse ~130 lines of per-arm dispatch to ~30.
+/// touches `walk_children` + `map_children` (both right above this
+/// fn) and the pretty-printer. The walkers (`substitute_impl`,
+/// `collect_free_vars`, `collect_all_names`, `strip_span_marks_node`,
+/// `mentions_free_var`) all delegate non-special variants to
+/// `walk_children` / `map_children` via a `_ =>` arm, so they pick up
+/// the new variant automatically. Pattern walkers
+/// (`pattern_bound_names_impl`, `rename_in_pattern`) similarly
+/// delegate to `walk_pattern_children` / `map_pattern_children`. See
+/// the "Generic structural walkers" section header below for the
+/// design rationale.
 ///
 /// Used by exec-fn codegen to substitute call-site args for callee
 /// params in inlined `require` / `ensure` / `decrease` expressions.
@@ -656,80 +661,305 @@ pub fn substitute(
 /// is transparent at the Lean level — the wrapping affects only
 /// the pp output (a leading `/- @rust:LOC -/` comment) and the
 /// landmark side-channel, never semantics.
-pub fn strip_span_marks(expr: &Expr) -> Expr {
-    Expr::new(strip_span_marks_node(&expr.node))
+// ── Generic structural walkers (#98) ──────────────────────────────────
+//
+// `ExprNode` and `Pattern` have many variants, most of which contain
+// nested sub-expressions or sub-patterns. Walkers that recurse over the
+// whole tree (substitute, collect_free_vars, collect_all_names,
+// strip_span_marks, mentions_free_var, plus pattern_bound_names and
+// rename_in_pattern on the pattern side) used to spell out per-variant
+// dispatch in full — five Expr walkers at ~40-80 lines each plus two
+// Pattern walkers, ~370 lines of structurally parallel match arms.
+//
+// `walk_children` and `map_children` (and their Pattern siblings)
+// concentrate that dispatch in one place. Each consumer handles only
+// the variants whose semantics differ from "uniformly recurse" — the
+// leaf cases (Var) for collectors and the binder cases (Let / Lambda /
+// Forall / Exists / Match) for scope-tracking walks. Adding a new
+// `ExprNode` variant becomes a single edit to these helpers; consumers
+// pick it up automatically via their `_ =>` arm.
+//
+// The split between `walk_*` (read-only) and `map_*` (transforming) is
+// because consumer return types differ — collectors thread a `&mut
+// HashSet`/`&mut Vec` while transforms produce a new node. A single
+// visitor trait would force a unified `Out` parameter, which doesn't
+// exist here.
+//
+// **Soundness convention for new binder-introducing variants.** Both
+// `walk_children` and `map_children` match all variants explicitly
+// (no catch-all), so a new `ExprNode` variant is a compile error
+// until added here. If the new variant **introduces a binder** (a
+// name that scopes over a sub-expression), three scope-tracking
+// consumers need their own explicit arm above the `_ =>` fallthrough,
+// in addition to handling here:
+//
+// * `substitute_impl` — must remove bound names from `subst` before
+//   recursing, and may need alpha-rename if the binder could capture.
+// * `collect_free_vars` — must extend the `bound` set before walking
+//   the body.
+// * `collect_all_names` — must insert the bound name into `out`
+//   before walking children.
+//
+// Forgetting any of these silently mis-tracks scope (free vars get
+// reported where they should be shadowed; substitution captures
+// where it should rename). No compile-time check enforces the
+// convention — only tests that exercise the new variant under
+// substitution / capture-detection will catch it. If the binder
+// surface grows, consider promoting "is_binder" to a structural
+// property on the variant type.
+
+/// Call `f` once on each direct child `Expr` of `node`. Recurses into
+/// every Expr-typed field including binder types (`Lambda`/`Forall`/
+/// `Exists` ty fields) and match-arm bodies. Does NOT walk binder names,
+/// constructor names, or non-Expr metadata.
+///
+/// Used by walks that don't need to track scope structurally and just
+/// want to visit every nested Expr (`collect_all_names` for the
+/// non-binder fallthrough, debug walkers, etc.).
+fn walk_children<F>(node: &ExprNode, mut f: F)
+where
+    F: FnMut(&Expr),
+{
+    match node {
+        ExprNode::Var(_)
+        | ExprNode::Lit(_)
+        | ExprNode::LitBool(_)
+        | ExprNode::LitStr(_)
+        | ExprNode::LitChar(_)
+        | ExprNode::Raw(_) => {}
+        ExprNode::BinOp { lhs, rhs, .. } => {
+            f(lhs);
+            f(rhs);
+        }
+        ExprNode::UnOp { arg, .. } => f(arg),
+        ExprNode::App { head, args } => {
+            f(head);
+            for a in args {
+                f(a);
+            }
+        }
+        ExprNode::Let { value, body, .. } => {
+            f(value);
+            f(body);
+        }
+        ExprNode::Lambda { binders, body }
+        | ExprNode::Forall { binders, body }
+        | ExprNode::Exists { binders, body } => {
+            for b in binders {
+                f(&b.ty);
+            }
+            f(body);
+        }
+        ExprNode::If { cond, then_, else_ } => {
+            f(cond);
+            f(then_);
+            if let Some(e) = else_ {
+                f(e);
+            }
+        }
+        ExprNode::Match { scrutinee, arms } => {
+            f(scrutinee);
+            for arm in arms {
+                f(&arm.body);
+            }
+        }
+        ExprNode::TypeAnnot { expr, ty } => {
+            f(expr);
+            f(ty);
+        }
+        ExprNode::FieldProj { expr, .. } => f(expr),
+        ExprNode::StructUpdate { base, updates } => {
+            f(base);
+            for (_, e) in updates {
+                f(e);
+            }
+        }
+        ExprNode::ArrayLit(es) | ExprNode::Anon(es) => {
+            for e in es {
+                f(e);
+            }
+        }
+        ExprNode::Index { base, idx, .. } => {
+            f(base);
+            f(idx);
+        }
+        ExprNode::SpanMark { inner, .. } => f(inner),
+    }
 }
 
-fn strip_span_marks_node(node: &ExprNode) -> ExprNode {
+/// Rebuild a node by mapping each direct child `Expr` through `f`.
+/// Non-Expr fields (binder names, constructor names, op codes, span-mark
+/// metadata) are cloned/copied as-is. Binder kinds (`Lambda`/`Forall`/
+/// `Exists`) keep their binder list shape — types get mapped, names
+/// stay.
+///
+/// Used by transforms that recurse uniformly into all sub-expressions
+/// (`strip_span_marks_node` for the non-SpanMark fallthrough,
+/// `substitute_impl` for the non-binder, non-Var fallthrough). Binder-
+/// aware consumers (substitute_impl on Let / Lambda / etc.) handle
+/// those variants explicitly before falling through to `map_children`.
+fn map_children<F>(node: &ExprNode, mut f: F) -> ExprNode
+where
+    F: FnMut(&Expr) -> Expr,
+{
     match node {
-        ExprNode::SpanMark { inner, .. } => strip_span_marks_node(&inner.node),
         ExprNode::Var(n) => ExprNode::Var(n.clone()),
         ExprNode::Lit(s) => ExprNode::Lit(s.clone()),
         ExprNode::LitBool(b) => ExprNode::LitBool(*b),
         ExprNode::LitStr(s) => ExprNode::LitStr(s.clone()),
         ExprNode::LitChar(c) => ExprNode::LitChar(*c),
         ExprNode::Raw(s) => ExprNode::Raw(s.clone()),
-        ExprNode::BinOp { op, lhs, rhs } => ExprNode::BinOp {
-            op: *op,
-            lhs: Box::new(strip_span_marks(lhs)),
-            rhs: Box::new(strip_span_marks(rhs)),
-        },
+        ExprNode::BinOp { op, lhs, rhs } => {
+            let lhs = Box::new(f(lhs));
+            let rhs = Box::new(f(rhs));
+            ExprNode::BinOp { op: *op, lhs, rhs }
+        }
         ExprNode::UnOp { op, arg } => ExprNode::UnOp {
             op: *op,
-            arg: Box::new(strip_span_marks(arg)),
+            arg: Box::new(f(arg)),
         },
-        ExprNode::App { head, args } => ExprNode::App {
-            head: Box::new(strip_span_marks(head)),
-            args: args.iter().map(strip_span_marks).collect(),
-        },
-        ExprNode::Let { name, value, body } => ExprNode::Let {
-            name: name.clone(),
-            value: Box::new(strip_span_marks(value)),
-            body: Box::new(strip_span_marks(body)),
-        },
-        ExprNode::Lambda { binders, body } => ExprNode::Lambda {
-            binders: binders.clone(),
-            body: Box::new(strip_span_marks(body)),
-        },
-        ExprNode::Forall { binders, body } => ExprNode::Forall {
-            binders: binders.clone(),
-            body: Box::new(strip_span_marks(body)),
-        },
-        ExprNode::Exists { binders, body } => ExprNode::Exists {
-            binders: binders.clone(),
-            body: Box::new(strip_span_marks(body)),
-        },
-        ExprNode::If { cond, then_, else_ } => ExprNode::If {
-            cond: Box::new(strip_span_marks(cond)),
-            then_: Box::new(strip_span_marks(then_)),
-            else_: else_.as_ref().map(|e| Box::new(strip_span_marks(e))),
-        },
-        ExprNode::Match { scrutinee, arms } => ExprNode::Match {
-            scrutinee: Box::new(strip_span_marks(scrutinee)),
-            arms: arms.iter().map(|a| MatchArm {
-                pattern: a.pattern.clone(),
-                body: strip_span_marks(&a.body),
-            }).collect(),
-        },
-        ExprNode::TypeAnnot { expr, ty } => ExprNode::TypeAnnot {
-            expr: Box::new(strip_span_marks(expr)),
-            ty: Box::new(strip_span_marks(ty)),
-        },
+        ExprNode::App { head, args } => {
+            let head = Box::new(f(head));
+            let args = args.iter().map(|a| f(a)).collect();
+            ExprNode::App { head, args }
+        }
+        ExprNode::Let { name, value, body } => {
+            let value = Box::new(f(value));
+            let body = Box::new(f(body));
+            ExprNode::Let { name: name.clone(), value, body }
+        }
+        ExprNode::Lambda { binders, body } => {
+            let binders = map_binders(binders, &mut f);
+            ExprNode::Lambda { binders, body: Box::new(f(body)) }
+        }
+        ExprNode::Forall { binders, body } => {
+            let binders = map_binders(binders, &mut f);
+            ExprNode::Forall { binders, body: Box::new(f(body)) }
+        }
+        ExprNode::Exists { binders, body } => {
+            let binders = map_binders(binders, &mut f);
+            ExprNode::Exists { binders, body: Box::new(f(body)) }
+        }
+        ExprNode::If { cond, then_, else_ } => {
+            let cond = Box::new(f(cond));
+            let then_ = Box::new(f(then_));
+            let else_ = else_.as_ref().map(|e| Box::new(f(e)));
+            ExprNode::If { cond, then_, else_ }
+        }
+        ExprNode::Match { scrutinee, arms } => {
+            let scrutinee = Box::new(f(scrutinee));
+            let arms = arms
+                .iter()
+                .map(|a| MatchArm {
+                    pattern: a.pattern.clone(),
+                    body: f(&a.body),
+                })
+                .collect();
+            ExprNode::Match { scrutinee, arms }
+        }
+        ExprNode::TypeAnnot { expr, ty } => {
+            let expr = Box::new(f(expr));
+            let ty = Box::new(f(ty));
+            ExprNode::TypeAnnot { expr, ty }
+        }
         ExprNode::FieldProj { expr, field } => ExprNode::FieldProj {
-            expr: Box::new(strip_span_marks(expr)),
+            expr: Box::new(f(expr)),
             field: field.clone(),
         },
-        ExprNode::StructUpdate { base, updates } => ExprNode::StructUpdate {
-            base: Box::new(strip_span_marks(base)),
-            updates: updates.iter().map(|(f, e)| (f.clone(), strip_span_marks(e))).collect(),
+        ExprNode::StructUpdate { base, updates } => {
+            let base = Box::new(f(base));
+            let updates = updates
+                .iter()
+                .map(|(fld, e)| (fld.clone(), f(e)))
+                .collect();
+            ExprNode::StructUpdate { base, updates }
+        }
+        ExprNode::ArrayLit(es) => {
+            ExprNode::ArrayLit(es.iter().map(|e| f(e)).collect())
+        }
+        ExprNode::Index { base, idx, bang } => {
+            let base = Box::new(f(base));
+            let idx = Box::new(f(idx));
+            ExprNode::Index { base, idx, bang: *bang }
+        }
+        ExprNode::Anon(es) => ExprNode::Anon(es.iter().map(|e| f(e)).collect()),
+        ExprNode::SpanMark { rust_loc, kind, inner } => ExprNode::SpanMark {
+            rust_loc: rust_loc.clone(),
+            kind: *kind,
+            inner: Box::new(f(inner)),
         },
-        ExprNode::ArrayLit(es) => ExprNode::ArrayLit(es.iter().map(strip_span_marks).collect()),
-        ExprNode::Index { base, idx, bang } => ExprNode::Index {
-            base: Box::new(strip_span_marks(base)),
-            idx: Box::new(strip_span_marks(idx)),
-            bang: *bang,
+    }
+}
+
+fn map_binders<F>(binders: &[Binder], f: &mut F) -> Vec<Binder>
+where
+    F: FnMut(&Expr) -> Expr,
+{
+    binders
+        .iter()
+        .map(|b| Binder {
+            name: b.name.clone(),
+            ty: f(&b.ty),
+            kind: b.kind,
+        })
+        .collect()
+}
+
+/// Call `f` once on each direct sub-`Pattern` of `pat`. Recurses into
+/// `Ctor` args, `Or` alternatives, and the `sub` of `Binding`. Does
+/// NOT walk pattern-bound names.
+fn walk_pattern_children<F>(pat: &Pattern, mut f: F)
+where
+    F: FnMut(&Pattern),
+{
+    match pat {
+        Pattern::Var(_) | Pattern::Wildcard | Pattern::Lit(_) => {}
+        Pattern::Ctor { args, .. } => {
+            for a in args {
+                f(a);
+            }
+        }
+        Pattern::Or(l, r) => {
+            f(l);
+            f(r);
+        }
+        Pattern::Binding { sub, .. } => f(sub),
+    }
+}
+
+/// Rebuild a `Pattern` by mapping each direct sub-pattern through `f`.
+/// Pattern-bound names and constructor names stay as-is.
+fn map_pattern_children<F>(pat: &Pattern, mut f: F) -> Pattern
+where
+    F: FnMut(&Pattern) -> Pattern,
+{
+    match pat {
+        Pattern::Var(n) => Pattern::Var(n.clone()),
+        Pattern::Wildcard => Pattern::Wildcard,
+        Pattern::Lit(node) => Pattern::Lit(node.clone()),
+        Pattern::Ctor { name, args } => Pattern::Ctor {
+            name: name.clone(),
+            args: args.iter().map(|a| f(a)).collect(),
         },
-        ExprNode::Anon(es) => ExprNode::Anon(es.iter().map(strip_span_marks).collect()),
+        Pattern::Or(l, r) => Pattern::Or(Box::new(f(l)), Box::new(f(r))),
+        Pattern::Binding { name, sub } => Pattern::Binding {
+            name: name.clone(),
+            sub: Box::new(f(sub)),
+        },
+    }
+}
+
+pub fn strip_span_marks(expr: &Expr) -> Expr {
+    Expr::new(strip_span_marks_node(&expr.node))
+}
+
+fn strip_span_marks_node(node: &ExprNode) -> ExprNode {
+    match node {
+        // SpanMark unwraps — recurse into inner without rebuilding the
+        // SpanMark wrapper.
+        ExprNode::SpanMark { inner, .. } => strip_span_marks_node(&inner.node),
+        // All other variants: uniformly recurse into children.
+        _ => map_children(node, |c| strip_span_marks(c)),
     }
 }
 
@@ -738,36 +968,20 @@ fn substitute_impl(
     subst: &std::collections::HashMap<crate::lean_name::LeanName, Expr>,
 ) -> Expr {
     let node = match &expr.node {
+        // Var: substitution leaf — replace if the name is in `subst`,
+        // otherwise rebuild as-is. The `replacement.clone()` early-
+        // returns because the result type is `Expr`, not `ExprNode`.
         ExprNode::Var(name) => match subst.get(name) {
             Some(replacement) => return replacement.clone(),
             None => ExprNode::Var(name.clone()),
         },
-        ExprNode::Lit(s) => ExprNode::Lit(s.clone()),
-        ExprNode::LitBool(b) => ExprNode::LitBool(*b),
-        ExprNode::LitStr(s) => ExprNode::LitStr(s.clone()),
-        ExprNode::LitChar(c) => ExprNode::LitChar(*c),
-        ExprNode::Raw(s) => ExprNode::Raw(s.clone()),
-        ExprNode::BinOp { op, lhs, rhs } => ExprNode::BinOp {
-            op: *op,
-            lhs: Box::new(substitute_impl(lhs, subst)),
-            rhs: Box::new(substitute_impl(rhs, subst)),
-        },
-        ExprNode::UnOp { op, arg } => ExprNode::UnOp {
-            op: *op,
-            arg: Box::new(substitute_impl(arg, subst)),
-        },
-        ExprNode::App { head, args } => ExprNode::App {
-            head: Box::new(substitute_impl(head, subst)),
-            args: args.iter().map(|a| substitute_impl(a, subst)).collect(),
-        },
+        // Let: alpha-rename if the binder would capture a free var
+        // from the substitution (#116). Same logic as the
+        // Lambda/Forall/Exists arms (factored into `substitute_quantified`),
+        // but `Let` is single-binder and lacks the `ty`/`kind` fields
+        // that `Binder` carries — so we open-code rather than synthesize
+        // a fake `Binder` for `apply_renames_to_binders`.
         ExprNode::Let { name, value, body } => {
-            // Alpha-rename if the binder would capture a free var
-            // from the substitution (#116). Same logic as the
-            // Lambda/Forall/Exists arms (factored into
-            // `substitute_quantified`), but `Let` is single-binder
-            // and lacks the `ty`/`kind` fields that `Binder` carries —
-            // so we open-code rather than synthesize a fake `Binder`
-            // for `apply_renames_to_binders`.
             let new_value = substitute_impl(value, subst);
             let inner_subst = subst_without(subst, name);
             let renames = compute_alpha_renames(&[name], &inner_subst, body);
@@ -796,16 +1010,11 @@ fn substitute_impl(
             binders, body, subst,
             |bs, body| ExprNode::Exists { binders: bs, body },
         ),
-        ExprNode::If { cond, then_, else_ } => ExprNode::If {
-            cond: Box::new(substitute_impl(cond, subst)),
-            then_: Box::new(substitute_impl(then_, subst)),
-            else_: else_.as_ref().map(|e| Box::new(substitute_impl(e, subst))),
-        },
+        // Match: per-arm alpha-rename + remove pattern-bound names from
+        // subst for the arm body.
         ExprNode::Match { scrutinee, arms } => ExprNode::Match {
             scrutinee: Box::new(substitute_impl(scrutinee, subst)),
             arms: arms.iter().map(|a| {
-                // Pattern variables are locally bound; remove them from subst
-                // for the arm body.
                 let bound = pattern_bound_names(&a.pattern);
                 let bound_lns: Vec<crate::lean_name::LeanName> = bound.iter()
                     .map(|n| crate::lean_name::LeanName::synthetic(n.clone()))
@@ -827,35 +1036,10 @@ fn substitute_impl(
                 }
             }).collect(),
         },
-        ExprNode::TypeAnnot { expr, ty } => ExprNode::TypeAnnot {
-            expr: Box::new(substitute_impl(expr, subst)),
-            // Type expressions can also reference vars; substitute too.
-            ty: Box::new(substitute_impl(ty, subst)),
-        },
-        ExprNode::FieldProj { expr, field } => ExprNode::FieldProj {
-            expr: Box::new(substitute_impl(expr, subst)),
-            field: field.clone(),
-        },
-        ExprNode::StructUpdate { base, updates } => ExprNode::StructUpdate {
-            base: Box::new(substitute_impl(base, subst)),
-            updates: updates.iter().map(|(f, e)| (f.clone(), substitute_impl(e, subst))).collect(),
-        },
-        ExprNode::ArrayLit(es) => ExprNode::ArrayLit(
-            es.iter().map(|e| substitute_impl(e, subst)).collect()
-        ),
-        ExprNode::Index { base, idx, bang } => ExprNode::Index {
-            base: Box::new(substitute_impl(base, subst)),
-            idx: Box::new(substitute_impl(idx, subst)),
-            bang: *bang,
-        },
-        ExprNode::Anon(es) => ExprNode::Anon(
-            es.iter().map(|e| substitute_impl(e, subst)).collect()
-        ),
-        ExprNode::SpanMark { rust_loc, kind, inner } => ExprNode::SpanMark {
-            rust_loc: rust_loc.clone(),
-            kind: *kind,
-            inner: Box::new(substitute_impl(inner, subst)),
-        },
+        // All other variants — leaves and non-binder compounds —
+        // uniformly substitute into children. `map_children` preserves
+        // `SpanMark` metadata, op codes, field names, etc.
+        _ => map_children(&expr.node, |c| substitute_impl(c, subst)),
     };
     Expr::new(node)
 }
@@ -940,63 +1124,32 @@ fn compute_alpha_renames(
 /// capture our just-renamed references).
 fn collect_all_names(expr: &Expr, out: &mut std::collections::HashSet<String>) {
     match &expr.node {
-        ExprNode::Var(n) => { out.insert(n.as_str().to_string()); }
-        ExprNode::Lit(_) | ExprNode::LitBool(_) | ExprNode::LitStr(_)
-        | ExprNode::LitChar(_) | ExprNode::Raw(_) => {}
-        ExprNode::BinOp { lhs, rhs, .. } => {
-            collect_all_names(lhs, out);
-            collect_all_names(rhs, out);
+        ExprNode::Var(n) => {
+            out.insert(n.as_str().to_string());
         }
-        ExprNode::UnOp { arg, .. } => collect_all_names(arg, out),
-        ExprNode::App { head, args } => {
-            collect_all_names(head, out);
-            for a in args { collect_all_names(a, out); }
-        }
-        ExprNode::Let { name, value, body } => {
+        ExprNode::Let { name, .. } => {
             out.insert(name.as_str().to_string());
-            collect_all_names(value, out);
-            collect_all_names(body, out);
+            walk_children(&expr.node, |c| collect_all_names(c, out));
         }
-        ExprNode::Lambda { binders, body }
-        | ExprNode::Forall { binders, body }
-        | ExprNode::Exists { binders, body } => {
+        ExprNode::Lambda { binders, .. }
+        | ExprNode::Forall { binders, .. }
+        | ExprNode::Exists { binders, .. } => {
             for b in binders {
-                if let Some(n) = &b.name { out.insert(n.as_str().to_string()); }
-                collect_all_names(&b.ty, out);
+                if let Some(n) = &b.name {
+                    out.insert(n.as_str().to_string());
+                }
             }
-            collect_all_names(body, out);
+            walk_children(&expr.node, |c| collect_all_names(c, out));
         }
-        ExprNode::If { cond, then_, else_ } => {
-            collect_all_names(cond, out);
-            collect_all_names(then_, out);
-            if let Some(e) = else_ { collect_all_names(e, out); }
-        }
-        ExprNode::Match { scrutinee, arms } => {
-            collect_all_names(scrutinee, out);
+        ExprNode::Match { arms, .. } => {
             for arm in arms {
                 for n in pattern_bound_names(&arm.pattern) {
                     out.insert(n);
                 }
-                collect_all_names(&arm.body, out);
             }
+            walk_children(&expr.node, |c| collect_all_names(c, out));
         }
-        ExprNode::TypeAnnot { expr, ty } => {
-            collect_all_names(expr, out);
-            collect_all_names(ty, out);
-        }
-        ExprNode::FieldProj { expr, .. } => collect_all_names(expr, out),
-        ExprNode::StructUpdate { base, updates } => {
-            collect_all_names(base, out);
-            for (_, e) in updates { collect_all_names(e, out); }
-        }
-        ExprNode::ArrayLit(es) | ExprNode::Anon(es) => {
-            for e in es { collect_all_names(e, out); }
-        }
-        ExprNode::Index { base, idx, .. } => {
-            collect_all_names(base, out);
-            collect_all_names(idx, out);
-        }
-        ExprNode::SpanMark { inner, .. } => collect_all_names(inner, out),
+        _ => walk_children(&expr.node, |c| collect_all_names(c, out)),
     }
 }
 
@@ -1029,22 +1182,9 @@ fn rename_in_pattern(
 ) -> Pattern {
     match pat {
         Pattern::Var(n) => {
-            if let Some(fresh) = renames.get(n) {
-                Pattern::Var(fresh.clone())
-            } else {
-                Pattern::Var(n.clone())
-            }
+            let new_name = renames.get(n).cloned().unwrap_or_else(|| n.clone());
+            Pattern::Var(new_name)
         }
-        Pattern::Wildcard => Pattern::Wildcard,
-        Pattern::Lit(node) => Pattern::Lit(node.clone()),
-        Pattern::Ctor { name, args } => Pattern::Ctor {
-            name: name.clone(),
-            args: args.iter().map(|a| rename_in_pattern(a, renames)).collect(),
-        },
-        Pattern::Or(l, r) => Pattern::Or(
-            Box::new(rename_in_pattern(l, renames)),
-            Box::new(rename_in_pattern(r, renames)),
-        ),
         Pattern::Binding { name, sub } => {
             let new_name = renames.get(name).cloned().unwrap_or_else(|| name.clone());
             Pattern::Binding {
@@ -1052,6 +1192,9 @@ fn rename_in_pattern(
                 sub: Box::new(rename_in_pattern(sub, renames)),
             }
         }
+        // Wildcard / Lit / Ctor / Or — no name to rewrite at this level;
+        // recurse into sub-patterns.
+        _ => map_pattern_children(pat, |p| rename_in_pattern(p, renames)),
     }
 }
 
@@ -1154,64 +1297,48 @@ fn collect_free_vars(
 ) {
     match &expr.node {
         ExprNode::Var(n) => {
-            if !bound.contains(n.as_str()) { out.insert(n.as_str().to_string()); }
+            if !bound.contains(n.as_str()) {
+                out.insert(n.as_str().to_string());
+            }
         }
-        ExprNode::Lit(_) | ExprNode::LitBool(_) | ExprNode::LitStr(_)
-        | ExprNode::LitChar(_) | ExprNode::Raw(_) => {}
-        ExprNode::BinOp { lhs, rhs, .. } => {
-            collect_free_vars(lhs, bound, out);
-            collect_free_vars(rhs, bound, out);
-        }
-        ExprNode::UnOp { arg, .. } => collect_free_vars(arg, bound, out),
-        ExprNode::App { head, args } => {
-            collect_free_vars(head, bound, out);
-            for a in args { collect_free_vars(a, bound, out); }
-        }
+        // Let: value is in outer scope, body is in scope extended with name.
         ExprNode::Let { name, value, body } => {
             collect_free_vars(value, bound, out);
             let mut inner = bound.clone();
             inner.insert(name.as_str().to_string());
             collect_free_vars(body, &inner, out);
         }
+        // Lambda/Forall/Exists: binder types are in OUTER scope (not yet
+        // bound by their own binder), body is in extended scope. Lean's
+        // dependent types DO let later binder types reference earlier
+        // binders, but this function (used for capture detection in
+        // alpha-renaming) treats binder types conservatively as outer-
+        // scope; the caller scopes them later if needed.
         ExprNode::Lambda { binders, body }
         | ExprNode::Forall { binders, body }
         | ExprNode::Exists { binders, body } => {
             let mut inner = bound.clone();
             for b in binders {
-                if let Some(n) = &b.name { inner.insert(n.as_str().to_string()); }
+                if let Some(n) = &b.name {
+                    inner.insert(n.as_str().to_string());
+                }
             }
             collect_free_vars(body, &inner, out);
         }
-        ExprNode::If { cond, then_, else_ } => {
-            collect_free_vars(cond, bound, out);
-            collect_free_vars(then_, bound, out);
-            if let Some(e) = else_ { collect_free_vars(e, bound, out); }
-        }
+        // Match: scrutinee in outer scope, each arm body in scope
+        // extended with the arm's pattern-bound names.
         ExprNode::Match { scrutinee, arms } => {
             collect_free_vars(scrutinee, bound, out);
             for arm in arms {
                 let mut inner = bound.clone();
-                for n in pattern_bound_names(&arm.pattern) { inner.insert(n); }
+                for n in pattern_bound_names(&arm.pattern) {
+                    inner.insert(n);
+                }
                 collect_free_vars(&arm.body, &inner, out);
             }
         }
-        ExprNode::TypeAnnot { expr, ty } => {
-            collect_free_vars(expr, bound, out);
-            collect_free_vars(ty, bound, out);
-        }
-        ExprNode::FieldProj { expr, .. } => collect_free_vars(expr, bound, out),
-        ExprNode::StructUpdate { base, updates } => {
-            collect_free_vars(base, bound, out);
-            for (_, e) in updates { collect_free_vars(e, bound, out); }
-        }
-        ExprNode::ArrayLit(es) | ExprNode::Anon(es) => {
-            for e in es { collect_free_vars(e, bound, out); }
-        }
-        ExprNode::Index { base, idx, bang: _ } => {
-            collect_free_vars(base, bound, out);
-            collect_free_vars(idx, bound, out);
-        }
-        ExprNode::SpanMark { inner, .. } => collect_free_vars(inner, bound, out),
+        // No-binder variants: walk children with the same scope.
+        _ => walk_children(&expr.node, |c| collect_free_vars(c, bound, out)),
     }
 }
 
@@ -1245,18 +1372,13 @@ fn pattern_bound_names(pat: &Pattern) -> Vec<String> {
 fn pattern_bound_names_impl(pat: &Pattern, out: &mut Vec<String>) {
     match pat {
         Pattern::Var(n) => out.push(n.as_str().to_string()),
-        Pattern::Wildcard | Pattern::Lit(_) => {}
-        Pattern::Ctor { args, .. } => {
-            for a in args { pattern_bound_names_impl(a, out); }
-        }
-        Pattern::Or(l, r) => {
-            pattern_bound_names_impl(l, out);
-            pattern_bound_names_impl(r, out);
-        }
         Pattern::Binding { name, sub } => {
             out.push(name.as_str().to_string());
             pattern_bound_names_impl(sub, out);
         }
+        // Wildcard / Lit / Ctor / Or — no name introduced at this level;
+        // recurse into sub-patterns (Wildcard / Lit have none).
+        _ => walk_pattern_children(pat, |p| pattern_bound_names_impl(p, out)),
     }
 }
 
@@ -2059,5 +2181,199 @@ mod substitute_tests {
         assert!(mentions_free_var(&e, "x"));
         assert!(mentions_free_var(&e, "y"));
         assert!(!mentions_free_var(&e, "z"));
+    }
+
+    // ── walk_children / map_children regression guards (#98) ─────────
+
+    /// `map_children` with the identity function should round-trip
+    /// every variant — locks in that no field is dropped or duplicated
+    /// when adding a variant. If a future contributor adds an
+    /// `ExprNode` variant to `map_children` but accidentally swaps
+    /// `lhs`/`rhs` or forgets to clone a metadata field, this test
+    /// surfaces it as a structural mismatch on the variant.
+    #[test]
+    fn map_children_identity_roundtrips_all_variants() {
+        // A composite expression touching every ExprNode variant —
+        // walk inwards through map_children with the identity mapper
+        // and assert pp equality.
+        let exprs: Vec<Expr> = vec![
+            var("x"),
+            lit(42),
+            Expr::new(ExprNode::LitBool(true)),
+            Expr::new(ExprNode::LitStr("hello".into())),
+            Expr::new(ExprNode::LitChar('a')),
+            Expr::new(ExprNode::Raw("raw_lean".into())),
+            add(var("a"), var("b")),
+            Expr::new(ExprNode::UnOp { op: UnOp::Not, arg: Box::new(var("p")) }),
+            Expr::new(ExprNode::App {
+                head: Box::new(var("f")),
+                args: vec![var("x"), var("y")],
+            }),
+            let_bind("x", lit(1), var("x")),
+            forall("y", var("y")),
+            exists("z", var("z")),
+            lambda("w", var("w")),
+            Expr::new(ExprNode::If {
+                cond: Box::new(var("c")),
+                then_: Box::new(lit(1)),
+                else_: Some(Box::new(lit(2))),
+            }),
+            Expr::new(ExprNode::If {
+                cond: Box::new(var("c")),
+                then_: Box::new(lit(1)),
+                else_: None,
+            }),
+            Expr::new(ExprNode::Match {
+                scrutinee: Box::new(var("x")),
+                arms: vec![MatchArm {
+                    pattern: Pattern::Var(LeanName::lit("a")),
+                    body: var("a"),
+                }],
+            }),
+            Expr::new(ExprNode::TypeAnnot {
+                expr: Box::new(var("x")),
+                ty: Box::new(var("Nat")),
+            }),
+            Expr::new(ExprNode::FieldProj {
+                expr: Box::new(var("p")),
+                field: "x".into(),
+            }),
+            Expr::new(ExprNode::StructUpdate {
+                base: Box::new(var("p")),
+                updates: vec![("x".into(), lit(1))],
+            }),
+            Expr::new(ExprNode::ArrayLit(vec![lit(1), lit(2), lit(3)])),
+            Expr::new(ExprNode::Index {
+                base: Box::new(var("a")),
+                idx: Box::new(lit(0)),
+                bang: true,
+            }),
+            Expr::new(ExprNode::Anon(vec![var("a"), var("b")])),
+            Expr::new(ExprNode::SpanMark {
+                rust_loc: "test.rs:1:1".into(),
+                kind: AssertKind::Hypothesis(HypothesisKind::BranchCondition),
+                inner: Box::new(var("inner")),
+            }),
+        ];
+        for e in &exprs {
+            // Build a structurally-equivalent rebuild via map_children
+            // with identity. Wrapping in `Expr::new` because
+            // map_children returns ExprNode.
+            let rebuilt = Expr::new(map_children(&e.node, |c| c.clone()));
+            assert!(node_eq(e, &rebuilt),
+                "map_children(identity) round-trip failed for variant: {:?}", e.node);
+        }
+    }
+
+    /// `walk_children` visits the expected number of direct children
+    /// per variant. Locks in that the helper doesn't accidentally skip
+    /// or duplicate a child slot.
+    #[test]
+    fn walk_children_counts_match_expected() {
+        fn count(e: &Expr) -> usize {
+            let mut n = 0;
+            walk_children(&e.node, |_| n += 1);
+            n
+        }
+        // Leaves: zero children.
+        assert_eq!(count(&var("x")), 0);
+        assert_eq!(count(&lit(1)), 0);
+        assert_eq!(count(&Expr::new(ExprNode::LitBool(true))), 0);
+        assert_eq!(count(&Expr::new(ExprNode::Raw("r".into()))), 0);
+        // BinOp: 2.
+        assert_eq!(count(&add(var("a"), var("b"))), 2);
+        // UnOp: 1.
+        assert_eq!(count(&Expr::new(
+            ExprNode::UnOp { op: UnOp::Not, arg: Box::new(var("p")) },
+        )), 1);
+        // App: 1 (head) + N (args).
+        assert_eq!(count(&Expr::new(ExprNode::App {
+            head: Box::new(var("f")),
+            args: vec![var("x"), var("y"), var("z")],
+        })), 4);
+        // Let: value + body = 2.
+        assert_eq!(count(&let_bind("x", lit(1), var("x"))), 2);
+        // Lambda/Forall/Exists: 1 ty per binder + body.
+        assert_eq!(count(&forall("y", var("y"))), 2);
+        // If with else: 3; without else: 2.
+        assert_eq!(count(&Expr::new(ExprNode::If {
+            cond: Box::new(var("c")),
+            then_: Box::new(lit(1)),
+            else_: Some(Box::new(lit(2))),
+        })), 3);
+        assert_eq!(count(&Expr::new(ExprNode::If {
+            cond: Box::new(var("c")),
+            then_: Box::new(lit(1)),
+            else_: None,
+        })), 2);
+        // Match: scrutinee + N arm bodies.
+        assert_eq!(count(&Expr::new(ExprNode::Match {
+            scrutinee: Box::new(var("x")),
+            arms: vec![
+                MatchArm { pattern: Pattern::Var(LeanName::lit("a")), body: var("a") },
+                MatchArm { pattern: Pattern::Wildcard, body: lit(0) },
+            ],
+        })), 3);
+        // SpanMark: 1 (inner).
+        assert_eq!(count(&Expr::new(ExprNode::SpanMark {
+            rust_loc: "x".into(),
+            kind: AssertKind::Hypothesis(HypothesisKind::BranchCondition),
+            inner: Box::new(var("y")),
+        })), 1);
+    }
+
+    /// `map_pattern_children`/`walk_pattern_children` regression
+    /// guard — same shape as the Expr-side tests above.
+    #[test]
+    fn pattern_helpers_handle_all_variants() {
+        fn count(p: &Pattern) -> usize {
+            let mut n = 0;
+            walk_pattern_children(p, |_| n += 1);
+            n
+        }
+        // Leaves: zero children.
+        assert_eq!(count(&Pattern::Var(LeanName::lit("a"))), 0);
+        assert_eq!(count(&Pattern::Wildcard), 0);
+        assert_eq!(count(&Pattern::Lit(ExprNode::Lit("0".into()))), 0);
+        // Ctor: N args.
+        assert_eq!(count(&Pattern::Ctor {
+            name: "C".into(),
+            args: vec![Pattern::Wildcard, Pattern::Var(LeanName::lit("x"))],
+        }), 2);
+        // Or: 2.
+        assert_eq!(count(&Pattern::Or(
+            Box::new(Pattern::Wildcard),
+            Box::new(Pattern::Wildcard),
+        )), 2);
+        // Binding: 1 (sub).
+        assert_eq!(count(&Pattern::Binding {
+            name: LeanName::lit("a"),
+            sub: Box::new(Pattern::Wildcard),
+        }), 1);
+        // map_pattern_children identity round-trip.
+        let pats = vec![
+            Pattern::Var(LeanName::lit("x")),
+            Pattern::Wildcard,
+            Pattern::Lit(ExprNode::Lit("42".into())),
+            Pattern::Ctor {
+                name: "Foo".into(),
+                args: vec![Pattern::Var(LeanName::lit("a")), Pattern::Wildcard],
+            },
+            Pattern::Or(
+                Box::new(Pattern::Var(LeanName::lit("a"))),
+                Box::new(Pattern::Var(LeanName::lit("b"))),
+            ),
+            Pattern::Binding {
+                name: LeanName::lit("p"),
+                sub: Box::new(Pattern::Wildcard),
+            },
+        ];
+        for p in &pats {
+            let rebuilt = map_pattern_children(p, |q| q.clone());
+            // Pattern doesn't have a pp wrapper handy; compare debug
+            // strings (deterministic for our shapes).
+            assert_eq!(format!("{:?}", p), format!("{:?}", rebuilt),
+                "map_pattern_children identity round-trip failed: {:?}", p);
+        }
     }
 }
