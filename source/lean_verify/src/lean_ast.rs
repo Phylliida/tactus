@@ -761,11 +761,15 @@ fn substitute_impl(
             args: args.iter().map(|a| substitute_impl(a, subst)).collect(),
         },
         ExprNode::Let { name, value, body } => {
+            // Alpha-rename if the binder would capture a free var
+            // from the substitution (#116). Same logic as the
+            // Lambda/Forall/Exists arms (factored into
+            // `substitute_quantified`), but `Let` is single-binder
+            // and lacks the `ty`/`kind` fields that `Binder` carries —
+            // so we open-code rather than synthesize a fake `Binder`
+            // for `apply_renames_to_binders`.
             let new_value = substitute_impl(value, subst);
             let inner_subst = subst_without(subst, name);
-            // Alpha-rename if the binder would capture a free var
-            // from the substitution (#116). For Let, only one binder
-            // to consider.
             let renames = compute_alpha_renames(&[name], &inner_subst, body);
             let (final_name, body_for_subst) = if let Some(fresh) = renames.get(name) {
                 let rename_subst = rename_map_to_subst(&renames);
@@ -780,48 +784,18 @@ fn substitute_impl(
                 body: Box::new(substitute_impl(&body_for_subst, &inner_subst)),
             }
         }
-        ExprNode::Lambda { binders, body } => {
-            let inner_subst = subst_remove_binders(subst, binders);
-            let binder_names: Vec<&crate::lean_name::LeanName> = binders.iter()
-                .filter_map(|b| b.name.as_ref())
-                .collect();
-            let renames = compute_alpha_renames(&binder_names, &inner_subst, body);
-            let (new_binders, body_for_subst) = apply_renames_to_binders(
-                binders, body, &renames,
-            );
-            ExprNode::Lambda {
-                binders: new_binders,
-                body: Box::new(substitute_impl(&body_for_subst, &inner_subst)),
-            }
-        }
-        ExprNode::Forall { binders, body } => {
-            let inner_subst = subst_remove_binders(subst, binders);
-            let binder_names: Vec<&crate::lean_name::LeanName> = binders.iter()
-                .filter_map(|b| b.name.as_ref())
-                .collect();
-            let renames = compute_alpha_renames(&binder_names, &inner_subst, body);
-            let (new_binders, body_for_subst) = apply_renames_to_binders(
-                binders, body, &renames,
-            );
-            ExprNode::Forall {
-                binders: new_binders,
-                body: Box::new(substitute_impl(&body_for_subst, &inner_subst)),
-            }
-        }
-        ExprNode::Exists { binders, body } => {
-            let inner_subst = subst_remove_binders(subst, binders);
-            let binder_names: Vec<&crate::lean_name::LeanName> = binders.iter()
-                .filter_map(|b| b.name.as_ref())
-                .collect();
-            let renames = compute_alpha_renames(&binder_names, &inner_subst, body);
-            let (new_binders, body_for_subst) = apply_renames_to_binders(
-                binders, body, &renames,
-            );
-            ExprNode::Exists {
-                binders: new_binders,
-                body: Box::new(substitute_impl(&body_for_subst, &inner_subst)),
-            }
-        }
+        ExprNode::Lambda { binders, body } => substitute_quantified(
+            binders, body, subst,
+            |bs, body| ExprNode::Lambda { binders: bs, body },
+        ),
+        ExprNode::Forall { binders, body } => substitute_quantified(
+            binders, body, subst,
+            |bs, body| ExprNode::Forall { binders: bs, body },
+        ),
+        ExprNode::Exists { binders, body } => substitute_quantified(
+            binders, body, subst,
+            |bs, body| ExprNode::Exists { binders: bs, body },
+        ),
         ExprNode::If { cond, then_, else_ } => ExprNode::If {
             cond: Box::new(substitute_impl(cond, subst)),
             then_: Box::new(substitute_impl(then_, subst)),
@@ -1090,6 +1064,28 @@ fn rename_map_to_subst(
     renames.iter()
         .map(|(old, new)| (old.clone(), Expr::new(ExprNode::Var(new.clone()))))
         .collect()
+}
+
+/// Run the full alpha-rename + substitution dance for a multi-binder
+/// `Lambda` / `Forall` / `Exists` shape. The three arms differ only
+/// in their final `ExprNode` constructor; everything else is shared:
+/// remove binders from the inner subst, compute renames, apply renames,
+/// recurse on the body. `mk_node` is the per-arm constructor closure.
+fn substitute_quantified(
+    binders: &[Binder],
+    body: &Expr,
+    subst: &std::collections::HashMap<crate::lean_name::LeanName, Expr>,
+    mk_node: impl FnOnce(Vec<Binder>, Box<Expr>) -> ExprNode,
+) -> ExprNode {
+    let inner_subst = subst_remove_binders(subst, binders);
+    let binder_names: Vec<&crate::lean_name::LeanName> = binders.iter()
+        .filter_map(|b| b.name.as_ref())
+        .collect();
+    let renames = compute_alpha_renames(&binder_names, &inner_subst, body);
+    let (new_binders, body_for_subst) = apply_renames_to_binders(
+        binders, body, &renames,
+    );
+    mk_node(new_binders, Box::new(substitute_impl(&body_for_subst, &inner_subst)))
 }
 
 /// Apply alpha-renames to a multi-binder `Lambda` / `Forall` / `Exists`
