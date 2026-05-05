@@ -598,16 +598,25 @@ pub enum Tactic {
 /// `subst` removes that key from the substitution before recursing
 /// into its body, so shadowing works correctly.
 ///
-/// **Capture avoidance (first-cut).** If a binder would capture a
-/// name appearing free in an active substitution value, we **panic**
-/// with a clear message. The check is *lazy per-scope*: we only
-/// consider names free in the **current** inner substitution at the
-/// binder, not names free in the original top-level substitution.
-/// This avoids false positives like `(∀ y. z) + x` with `{x: y}` —
-/// the outer `∀ y.` can't capture anything because `x` never appears
-/// inside its scope, so no substitution happens there. Alpha-
-/// renaming is the proper fix when a real capture is detected; panic
-/// over silent miscompilation until that's implemented.
+/// **Capture avoidance via alpha-renaming (#116).** If a binder
+/// would capture a name appearing free in an active substitution
+/// value, we **alpha-rename** the colliding binder to a fresh name
+/// (`<base>_α<N>`) and rewrite the body's references in lockstep
+/// before applying the main substitution. Detection is lazy per-
+/// scope: we only consider names free in the **current** inner
+/// substitution at the binder, not names free in the original top-
+/// level substitution. This avoids false positives like
+/// `(∀ y. z) + x` with `{x: y}` — the outer `∀ y.` can't capture
+/// anything because `x` never appears inside its scope, so no
+/// substitution happens there.
+///
+/// The fresh name is chosen to avoid collisions with: every name
+/// (free or bound) in the body, every free name in active
+/// substitution values, and every sibling binder name in the same
+/// multi-binder shape (`∀ x y. ...`). Alpha-rename also walks each
+/// renamed binder's type expression so dependent types like
+/// `∀ (x : Nat) (h : x > 0), ...` stay consistent. See
+/// `compute_alpha_renames` and `apply_renames_to_binders`.
 ///
 /// **Per-variant boilerplate.** Adding a new `ExprNode` variant
 /// requires editing three places: `substitute_impl`, `collect_free_vars`,
@@ -745,11 +754,21 @@ fn substitute_impl(
         ExprNode::Let { name, value, body } => {
             let new_value = substitute_impl(value, subst);
             let inner_subst = subst_without(subst, name);
-            check_capture_lazy(&[name], &inner_subst, body, "let");
+            // Alpha-rename if the binder would capture a free var
+            // from the substitution (#116). For Let, only one binder
+            // to consider.
+            let renames = compute_alpha_renames(&[name], &inner_subst, body);
+            let (final_name, body_for_subst) = if let Some(fresh) = renames.get(name) {
+                let rename_subst = rename_map_to_subst(&renames);
+                let renamed_body = substitute_impl(body, &rename_subst);
+                (fresh.clone(), renamed_body)
+            } else {
+                (name.clone(), (**body).clone())
+            };
             ExprNode::Let {
-                name: name.clone(),
+                name: final_name,
                 value: Box::new(new_value),
-                body: Box::new(substitute_impl(body, &inner_subst)),
+                body: Box::new(substitute_impl(&body_for_subst, &inner_subst)),
             }
         }
         ExprNode::Lambda { binders, body } => {
@@ -757,10 +776,13 @@ fn substitute_impl(
             let binder_names: Vec<&crate::lean_name::LeanName> = binders.iter()
                 .filter_map(|b| b.name.as_ref())
                 .collect();
-            check_capture_lazy(&binder_names, &inner_subst, body, "lambda");
+            let renames = compute_alpha_renames(&binder_names, &inner_subst, body);
+            let (new_binders, body_for_subst) = apply_renames_to_binders(
+                binders, body, &renames,
+            );
             ExprNode::Lambda {
-                binders: binders.clone(),
-                body: Box::new(substitute_impl(body, &inner_subst)),
+                binders: new_binders,
+                body: Box::new(substitute_impl(&body_for_subst, &inner_subst)),
             }
         }
         ExprNode::Forall { binders, body } => {
@@ -768,10 +790,13 @@ fn substitute_impl(
             let binder_names: Vec<&crate::lean_name::LeanName> = binders.iter()
                 .filter_map(|b| b.name.as_ref())
                 .collect();
-            check_capture_lazy(&binder_names, &inner_subst, body, "forall");
+            let renames = compute_alpha_renames(&binder_names, &inner_subst, body);
+            let (new_binders, body_for_subst) = apply_renames_to_binders(
+                binders, body, &renames,
+            );
             ExprNode::Forall {
-                binders: binders.clone(),
-                body: Box::new(substitute_impl(body, &inner_subst)),
+                binders: new_binders,
+                body: Box::new(substitute_impl(&body_for_subst, &inner_subst)),
             }
         }
         ExprNode::Exists { binders, body } => {
@@ -779,10 +804,13 @@ fn substitute_impl(
             let binder_names: Vec<&crate::lean_name::LeanName> = binders.iter()
                 .filter_map(|b| b.name.as_ref())
                 .collect();
-            check_capture_lazy(&binder_names, &inner_subst, body, "exists");
+            let renames = compute_alpha_renames(&binder_names, &inner_subst, body);
+            let (new_binders, body_for_subst) = apply_renames_to_binders(
+                binders, body, &renames,
+            );
             ExprNode::Exists {
-                binders: binders.clone(),
-                body: Box::new(substitute_impl(body, &inner_subst)),
+                binders: new_binders,
+                body: Box::new(substitute_impl(&body_for_subst, &inner_subst)),
             }
         }
         ExprNode::If { cond, then_, else_ } => ExprNode::If {
@@ -802,10 +830,17 @@ fn substitute_impl(
                 let mut inner = subst.clone();
                 for n in &bound_lns { inner.remove(n); }
                 let bound_refs: Vec<&crate::lean_name::LeanName> = bound_lns.iter().collect();
-                check_capture_lazy(&bound_refs, &inner, &a.body, "match pattern");
+                let renames = compute_alpha_renames(&bound_refs, &inner, &a.body);
+                let (final_pattern, body_for_subst) = if renames.is_empty() {
+                    (a.pattern.clone(), a.body.clone())
+                } else {
+                    let rename_subst = rename_map_to_subst(&renames);
+                    let renamed_body = substitute_impl(&a.body, &rename_subst);
+                    (rename_in_pattern(&a.pattern, &renames), renamed_body)
+                };
                 MatchArm {
-                    pattern: a.pattern.clone(),
-                    body: substitute_impl(&a.body, &inner),
+                    pattern: final_pattern,
+                    body: substitute_impl(&body_for_subst, &inner),
                 }
             }).collect(),
         },
@@ -842,49 +877,249 @@ fn substitute_impl(
     Expr::new(node)
 }
 
-/// Per-scope capture check. Precise enough to avoid false positives:
-/// only panics when substitution would actually happen inside this
-/// binder AND the substituted value's free vars would be captured.
+/// Compute an alpha-rename map for binders that would otherwise
+/// capture a free variable from the substitution (#116).
 ///
-/// Walks `body` to see which `inner_subst` keys actually occur free
-/// there — if none, no substitution happens inside so no capture is
-/// possible (early exit). Otherwise checks only the values for the
-/// live keys against the binder names. Cost is two extra traversals
-/// per binder hit (body and live-value free-var collection), both
-/// bounded by expression size.
-fn check_capture_lazy(
+/// Returns an empty map when no rename is needed. Otherwise the map
+/// keys are the colliding binder names; the values are fresh
+/// replacement names that:
+/// * don't appear free OR bound anywhere in `body` (so the rename
+///   substitution itself can't introduce new captures);
+/// * don't appear free in any active substitution value (so the
+///   subsequent main substitution won't re-capture);
+/// * are distinct from all sibling binder names being kept unchanged
+///   (multi-binder cases like `∀ x y, …` where only one collides).
+///
+/// Detection is the same lazy precision as the prior `check_capture_lazy`:
+/// we only consider substitution values for keys that actually appear
+/// free in the body, then check those values' free vars against the
+/// binder names.
+fn compute_alpha_renames(
     binder_names: &[&crate::lean_name::LeanName],
     inner_subst: &std::collections::HashMap<crate::lean_name::LeanName, Expr>,
     body: &Expr,
-    binder_kind: &str,
-) {
-    if inner_subst.is_empty() { return; }
-    let body_free = {
-        let mut out = std::collections::HashSet::new();
-        collect_free_vars(body, &std::collections::HashSet::new(), &mut out);
+) -> std::collections::HashMap<crate::lean_name::LeanName, crate::lean_name::LeanName> {
+    use std::collections::{HashMap, HashSet};
+    if inner_subst.is_empty() {
+        return HashMap::new();
+    }
+    let body_free: HashSet<String> = {
+        let mut out = HashSet::new();
+        collect_free_vars(body, &HashSet::new(), &mut out);
         out
     };
-    // Only keys that actually occur free in the body would trigger
-    // substitution inside this binder's scope.
     let live_keys: Vec<&crate::lean_name::LeanName> = inner_subst.keys()
         .filter(|k| body_free.contains(k.as_str()))
         .collect();
-    if live_keys.is_empty() { return; }
-
-    let mut free_in_live_values = std::collections::HashSet::new();
-    for k in &live_keys {
-        collect_free_vars(&inner_subst[*k], &std::collections::HashSet::new(), &mut free_in_live_values);
+    if live_keys.is_empty() {
+        return HashMap::new();
     }
-    for name in binder_names {
-        if free_in_live_values.contains(name.as_str()) {
-            panic!(
-                "Lean-AST substitute: binder `{}` (kind: {}) would capture a free \
-                 variable of the same name in a substitution value — alpha-\
-                 renaming not yet implemented. See `substitute` in lean_ast.rs.",
-                name.as_str(), binder_kind,
-            );
+    let mut free_in_live_values: HashSet<String> = HashSet::new();
+    for k in &live_keys {
+        collect_free_vars(&inner_subst[*k], &HashSet::new(), &mut free_in_live_values);
+    }
+    // Find which binder names actually collide with a free var in
+    // some live substitution value.
+    let collisions: Vec<&crate::lean_name::LeanName> = binder_names.iter()
+        .copied()
+        .filter(|n| free_in_live_values.contains(n.as_str()))
+        .collect();
+    if collisions.is_empty() {
+        return HashMap::new();
+    }
+    // Build the forbidden set for fresh-name generation:
+    // - all names appearing anywhere in body (including bound ones,
+    //   so the rename's `Var(fresh)` doesn't accidentally hit an
+    //   inner shadow)
+    // - all free vars of live substitution values
+    // - all sibling binder names being kept unchanged (so multi-
+    //   binder ∀x y. doesn't rename x and accidentally pick `y`)
+    let mut forbidden: HashSet<String> = HashSet::new();
+    collect_all_names(body, &mut forbidden);
+    forbidden.extend(free_in_live_values.iter().cloned());
+    for n in binder_names {
+        forbidden.insert(n.as_str().to_string());
+    }
+    let mut renames: HashMap<crate::lean_name::LeanName, crate::lean_name::LeanName> =
+        HashMap::new();
+    for coll in collisions {
+        let fresh = fresh_name(coll.as_str(), &forbidden);
+        forbidden.insert(fresh.clone());  // keep distinctness across multi-collision
+        renames.insert(coll.clone(), crate::lean_name::LeanName::synthetic(fresh));
+    }
+    renames
+}
+
+/// Collect every name (free or bound) that appears anywhere in `expr`.
+/// Distinct from `collect_free_vars` — this includes names introduced
+/// by inner binders, because a rename target `fresh` must not collide
+/// with ANY name in `body` (an inner binder named `fresh` would
+/// capture our just-renamed references).
+fn collect_all_names(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+    match &expr.node {
+        ExprNode::Var(n) => { out.insert(n.as_str().to_string()); }
+        ExprNode::Lit(_) | ExprNode::LitBool(_) | ExprNode::LitStr(_)
+        | ExprNode::LitChar(_) | ExprNode::Raw(_) => {}
+        ExprNode::BinOp { lhs, rhs, .. } => {
+            collect_all_names(lhs, out);
+            collect_all_names(rhs, out);
+        }
+        ExprNode::UnOp { arg, .. } => collect_all_names(arg, out),
+        ExprNode::App { head, args } => {
+            collect_all_names(head, out);
+            for a in args { collect_all_names(a, out); }
+        }
+        ExprNode::Let { name, value, body } => {
+            out.insert(name.as_str().to_string());
+            collect_all_names(value, out);
+            collect_all_names(body, out);
+        }
+        ExprNode::Lambda { binders, body }
+        | ExprNode::Forall { binders, body }
+        | ExprNode::Exists { binders, body } => {
+            for b in binders {
+                if let Some(n) = &b.name { out.insert(n.as_str().to_string()); }
+                collect_all_names(&b.ty, out);
+            }
+            collect_all_names(body, out);
+        }
+        ExprNode::If { cond, then_, else_ } => {
+            collect_all_names(cond, out);
+            collect_all_names(then_, out);
+            if let Some(e) = else_ { collect_all_names(e, out); }
+        }
+        ExprNode::Match { scrutinee, arms } => {
+            collect_all_names(scrutinee, out);
+            for arm in arms {
+                for n in pattern_bound_names(&arm.pattern) {
+                    out.insert(n);
+                }
+                collect_all_names(&arm.body, out);
+            }
+        }
+        ExprNode::TypeAnnot { expr, ty } => {
+            collect_all_names(expr, out);
+            collect_all_names(ty, out);
+        }
+        ExprNode::FieldProj { expr, .. } => collect_all_names(expr, out),
+        ExprNode::StructUpdate { base, updates } => {
+            collect_all_names(base, out);
+            for (_, e) in updates { collect_all_names(e, out); }
+        }
+        ExprNode::ArrayLit(es) | ExprNode::Anon(es) => {
+            for e in es { collect_all_names(e, out); }
+        }
+        ExprNode::Index { base, idx, .. } => {
+            collect_all_names(base, out);
+            collect_all_names(idx, out);
+        }
+        ExprNode::SpanMark { inner, .. } => collect_all_names(inner, out),
+    }
+}
+
+/// Generate a fresh name by appending `_α<N>` to `base`, picking the
+/// smallest N >= 1 such that the result is not in `forbidden`. Naming
+/// uses `α` (Greek alpha) to make the alpha-renaming origin obvious
+/// in error messages and generated Lean — Tactus's other gensym
+/// prefixes use `_tactus_*`, so `_α<N>` is unambiguous.
+fn fresh_name(base: &str, forbidden: &std::collections::HashSet<String>) -> String {
+    for n in 1u64.. {
+        let candidate = format!("{}_α{}", base, n);
+        if !forbidden.contains(&candidate) {
+            return candidate;
         }
     }
+    unreachable!("fresh_name: ran out of u64 candidates");
+}
+
+/// Apply a rename map to a `Pattern`'s `Var` / `Binding` nodes.
+/// Used by Match-arm alpha-renaming: when a pattern binds a name
+/// that would capture, we rewrite both the pattern (so the bound
+/// occurrence reflects the new name) AND the arm body (so the
+/// references are kept consistent).
+///
+/// Pattern's `Ctor.name` is a constructor name (path-derived), not
+/// a value-binding — left unchanged.
+fn rename_in_pattern(
+    pat: &Pattern,
+    renames: &std::collections::HashMap<crate::lean_name::LeanName, crate::lean_name::LeanName>,
+) -> Pattern {
+    match pat {
+        Pattern::Var(n) => {
+            if let Some(fresh) = renames.get(n) {
+                Pattern::Var(fresh.clone())
+            } else {
+                Pattern::Var(n.clone())
+            }
+        }
+        Pattern::Wildcard => Pattern::Wildcard,
+        Pattern::Lit(node) => Pattern::Lit(node.clone()),
+        Pattern::Ctor { name, args } => Pattern::Ctor {
+            name: name.clone(),
+            args: args.iter().map(|a| rename_in_pattern(a, renames)).collect(),
+        },
+        Pattern::Or(l, r) => Pattern::Or(
+            Box::new(rename_in_pattern(l, renames)),
+            Box::new(rename_in_pattern(r, renames)),
+        ),
+        Pattern::Binding { name, sub } => {
+            let new_name = renames.get(name).cloned().unwrap_or_else(|| name.clone());
+            Pattern::Binding {
+                name: new_name,
+                sub: Box::new(rename_in_pattern(sub, renames)),
+            }
+        }
+    }
+}
+
+/// Build a substitution that maps each `old → Var(new)` from a
+/// rename map. Used by all alpha-rename sites to prepare the
+/// rename-pass on the body.
+fn rename_map_to_subst(
+    renames: &std::collections::HashMap<crate::lean_name::LeanName, crate::lean_name::LeanName>,
+) -> std::collections::HashMap<crate::lean_name::LeanName, Expr> {
+    renames.iter()
+        .map(|(old, new)| (old.clone(), Expr::new(ExprNode::Var(new.clone()))))
+        .collect()
+}
+
+/// Apply alpha-renames to a multi-binder `Lambda` / `Forall` / `Exists`
+/// shape. Returns the rewritten binder list (with renamed names where
+/// applicable) and the body cloned (renamed if any binder collided).
+///
+/// **Why also substitute into binder types.** Lean has dependent
+/// types — `∀ (x : Nat) (h : x > 0), …` is legal. If `x` gets renamed
+/// to `x_α1`, the second binder's type `x > 0` must also get its
+/// `x` renamed to `x_α1` to stay consistent. Substituting the rename
+/// map into each binder's type is idempotent for non-dependent types
+/// (they don't reference earlier binders) and correct for dependent
+/// types.
+///
+/// Returns the new binders + the body to feed into the next
+/// substitution pass. When no renames apply, returns the original
+/// binders and a clone of the body — keeps the caller-side code
+/// uniform (always feeds the result back into `substitute_impl`).
+fn apply_renames_to_binders(
+    binders: &[Binder],
+    body: &Expr,
+    renames: &std::collections::HashMap<crate::lean_name::LeanName, crate::lean_name::LeanName>,
+) -> (Vec<Binder>, Expr) {
+    if renames.is_empty() {
+        return (binders.to_vec(), body.clone());
+    }
+    let rename_subst = rename_map_to_subst(renames);
+    let new_binders: Vec<Binder> = binders.iter().map(|b| {
+        let new_name = b.name.as_ref().map(|n| {
+            renames.get(n).cloned().unwrap_or_else(|| n.clone())
+        });
+        // Apply rename map to the binder's type — handles dependent
+        // types where a later binder's type references an earlier
+        // (renamed) binder.
+        let new_ty = substitute_impl(&b.ty, &rename_subst);
+        Binder { name: new_name, ty: new_ty, kind: b.kind }
+    }).collect();
+    let renamed_body = substitute_impl(body, &rename_subst);
+    (new_binders, renamed_body)
 }
 
 fn subst_without(
@@ -1185,14 +1420,26 @@ mod substitute_tests {
     }
 
     #[test]
-    #[should_panic(expected = "would capture a free variable")]
-    fn capture_panics() {
+    fn capture_alpha_renames_forall_binder() {
         // ∀ y. x + y  with {x: y}
         // x is free inside ∀ y.; substituting x→y would capture the
-        // substituted `y` inside the ∀. Panic.
+        // substituted `y` inside the ∀. Post-#116: the binder `y`
+        // alpha-renames to `y_α1` (fresh), the body's bound `y`
+        // becomes `y_α1`, then x → y substitutes cleanly. Result:
+        // ∀ y_α1. y + y_α1.
         let e = forall("y", add(var("x"), var("y")));
         let s = subst_of(&[("x", var("y"))]);
-        let _ = substitute(&e, &s);
+        let result = substitute(&e, &s);
+        let printed = crate::lean_pp::pp_expr(&result);
+        // Binder must have been renamed (no longer just `y`).
+        assert!(printed.contains("y_α1"),
+            "expected alpha-rename suffix in result; got: {}", printed);
+        // Substituted x must still appear as the free `y`.
+        // We check by structural shape: the result should be
+        // ∀ y_α1. y + y_α1
+        let expected = forall("y_α1", add(var("y"), var("y_α1")));
+        assert!(node_eq(&result, &expected),
+            "expected alpha-renamed structure; got: {}", printed);
     }
 
     #[test]
@@ -1486,11 +1733,162 @@ mod substitute_tests {
     }
 
     #[test]
-    #[should_panic(expected = "would capture a free variable")]
-    fn multi_binder_real_capture_does_panic() {
+    fn capture_alpha_renames_let_binder() {
+        // let y := 5; x + y   with {x: y}
+        //   x is free in the body; substituting x→y would capture
+        //   the let's bound y. Alpha-rename: let y_α1 := 5; y + y_α1.
+        let body = add(var("x"), var("y"));
+        let e = let_bind("y", lit(5), body);
+        let s = subst_of(&[("x", var("y"))]);
+        let result = substitute(&e, &s);
+        let expected = let_bind("y_α1", lit(5), add(var("y"), var("y_α1")));
+        let p = crate::lean_pp::pp_expr(&result);
+        assert!(node_eq(&result, &expected),
+            "expected alpha-renamed let; got: {}", p);
+    }
+
+    #[test]
+    fn capture_alpha_renames_lambda_binder() {
+        // (fun y => x + y)   with {x: y}
+        //   Same shape as forall case, lambda flavor.
+        let body = add(var("x"), var("y"));
+        let e = Expr::new(ExprNode::Lambda {
+            binders: vec![Binder {
+                name: Some(LeanName::lit("y")),
+                ty: var("Int"),
+                kind: BinderKind::Explicit,
+            }],
+            body: Box::new(body),
+        });
+        let s = subst_of(&[("x", var("y"))]);
+        let result = substitute(&e, &s);
+        let p = crate::lean_pp::pp_expr(&result);
+        // Lambda's bound y should rename to y_α1; body's reference
+        // becomes y_α1; substituted x becomes free y.
+        assert!(p.contains("y_α1"),
+            "expected lambda binder renamed; got: {}", p);
+        assert!(mentions_free_var(&result, "y"),
+            "expected substituted free y in body; got: {}", p);
+    }
+
+    #[test]
+    fn capture_alpha_renames_exists_binder() {
+        // ∃ y. x + y   with {x: y}
+        let body = add(var("x"), var("y"));
+        let e = Expr::new(ExprNode::Exists {
+            binders: vec![Binder {
+                name: Some(LeanName::lit("y")),
+                ty: var("Int"),
+                kind: BinderKind::Explicit,
+            }],
+            body: Box::new(body),
+        });
+        let s = subst_of(&[("x", var("y"))]);
+        let result = substitute(&e, &s);
+        let p = crate::lean_pp::pp_expr(&result);
+        assert!(p.contains("y_α1"),
+            "expected exists binder renamed; got: {}", p);
+        assert!(mentions_free_var(&result, "y"),
+            "expected free y after substitution; got: {}", p);
+    }
+
+    #[test]
+    fn capture_alpha_renames_match_pattern_var() {
+        // match scr with | Var(y) => x + y    with {x: y}
+        //   Pattern `y` would capture the substituted y. Rename
+        //   pattern to `y_α1` and rewrite arm body.
+        let arm_body = add(var("x"), var("y"));
+        let e = Expr::new(ExprNode::Match {
+            scrutinee: Box::new(var("scr")),
+            arms: vec![MatchArm {
+                pattern: Pattern::Var(LeanName::lit("y")),
+                body: arm_body,
+            }],
+        });
+        let s = subst_of(&[("x", var("y"))]);
+        let result = substitute(&e, &s);
+        let p = crate::lean_pp::pp_expr(&result);
+        assert!(p.contains("y_α1"),
+            "expected match pattern var renamed; got: {}", p);
+        assert!(mentions_free_var(&result, "y"),
+            "expected free y after substitution (the substituted-x value); got: {}", p);
+    }
+
+    #[test]
+    fn capture_alpha_renames_match_ctor_args() {
+        // match scr with | Ctor(y, z) => x + y    with {x: y}
+        //   Pattern's nested `y` binding would capture. Rename y →
+        //   y_α1 in pattern AND body, leave `z` alone.
+        let arm_body = add(var("x"), var("y"));
+        let e = Expr::new(ExprNode::Match {
+            scrutinee: Box::new(var("scr")),
+            arms: vec![MatchArm {
+                pattern: Pattern::Ctor {
+                    name: "MyCtor".into(),
+                    args: vec![
+                        Pattern::Var(LeanName::lit("y")),
+                        Pattern::Var(LeanName::lit("z")),
+                    ],
+                },
+                body: arm_body,
+            }],
+        });
+        let s = subst_of(&[("x", var("y"))]);
+        let result = substitute(&e, &s);
+        let p = crate::lean_pp::pp_expr(&result);
+        assert!(p.contains("y_α1"),
+            "expected ctor pattern arg renamed; got: {}", p);
+        // z should NOT be renamed (no collision).
+        // Pretty-printer prints `MyCtor y_α1 z` so look for ` z`.
+        assert!(p.contains(" z "),
+            "expected non-colliding ctor arg z unchanged; got: {}", p);
+    }
+
+    #[test]
+    fn capture_alpha_renames_dependent_type_in_forall() {
+        // ∀ (x : Nat) (h : x > 0), x + h   with {z: x}
+        //   z doesn't appear in body, so no real substitution. Use
+        //   a different shape: body references z, subst z→x.
+        // ∀ (x : Nat) (h : x > 0), z   with {z: x}
+        //   Binder x would capture substituted x; second binder's
+        //   type `x > 0` references that x. Rename x → x_α1: the
+        //   second binder's type becomes `x_α1 > 0`, the body's
+        //   substituted z becomes the free x. Result: ∀ (x_α1 : Nat)
+        //   (h : x_α1 > 0), x.
+        let e = Expr::new(ExprNode::Forall {
+            binders: vec![
+                Binder {
+                    name: Some(LeanName::lit("x")),
+                    ty: var("Nat"),
+                    kind: BinderKind::Explicit,
+                },
+                Binder {
+                    name: Some(LeanName::lit("h")),
+                    ty: Expr::new(ExprNode::BinOp {
+                        op: BinOp::Gt,
+                        lhs: Box::new(var("x")),
+                        rhs: Box::new(lit(0)),
+                    }),
+                    kind: BinderKind::Explicit,
+                },
+            ],
+            body: Box::new(var("z")),
+        });
+        let s = subst_of(&[("z", var("x"))]);
+        let result = substitute(&e, &s);
+        let p = crate::lean_pp::pp_expr(&result);
+        // x renamed; second binder's type also references the renamed name.
+        assert!(p.contains("x_α1"),
+            "expected x renamed to x_α1; got: {}", p);
+        // The expected dependent-type rewrite: `x_α1 > 0`.
+        assert!(p.contains("x_α1 > 0"),
+            "expected dependent-type to track rename; got: {}", p);
+    }
+
+    #[test]
+    fn capture_alpha_rename_preserves_non_colliding_siblings() {
         // ∀ x y. z + y   with {z: x}
-        //   z occurs free in the body and subst z→x; binder `x` would
-        //   capture the substituted x. Real capture → panic.
+        //   x renames to x_α1; y stays y. Sibling y must NOT also rename.
         let e = Expr::new(ExprNode::Forall {
             binders: vec![
                 Binder {
@@ -1507,7 +1905,96 @@ mod substitute_tests {
             body: Box::new(add(var("z"), var("y"))),
         });
         let s = subst_of(&[("z", var("x"))]);
-        let _ = substitute(&e, &s);
+        let result = substitute(&e, &s);
+        let p = crate::lean_pp::pp_expr(&result);
+        assert!(p.contains("x_α1"),
+            "expected x renamed; got: {}", p);
+        assert!(!p.contains("y_α"),
+            "expected y NOT renamed (no collision); got: {}", p);
+    }
+
+    #[test]
+    fn capture_alpha_rename_avoids_existing_freshness() {
+        // ∀ y. x + y_α1 + y   with {x: y}
+        //   Body already mentions `y_α1` (just a free var); fresh
+        //   should pick `y_α2` instead, not collide.
+        let body = add(add(var("x"), var("y_α1")), var("y"));
+        let e = forall("y", body);
+        let s = subst_of(&[("x", var("y"))]);
+        let result = substitute(&e, &s);
+        let p = crate::lean_pp::pp_expr(&result);
+        assert!(p.contains("y_α2"),
+            "expected fresh to skip taken y_α1; got: {}", p);
+    }
+
+    #[test]
+    fn capture_alpha_rename_multi_binder_collision() {
+        // ∀ x y. z1 + z2   with {z1: x, z2: y}
+        //   Both binders collide. Both should rename.
+        let e = Expr::new(ExprNode::Forall {
+            binders: vec![
+                Binder {
+                    name: Some(LeanName::lit("x")),
+                    ty: var("Int"),
+                    kind: BinderKind::Explicit,
+                },
+                Binder {
+                    name: Some(LeanName::lit("y")),
+                    ty: var("Int"),
+                    kind: BinderKind::Explicit,
+                },
+            ],
+            body: Box::new(add(var("z1"), var("z2"))),
+        });
+        let s = subst_of(&[("z1", var("x")), ("z2", var("y"))]);
+        let result = substitute(&e, &s);
+        let p = crate::lean_pp::pp_expr(&result);
+        assert!(p.contains("x_α1"),
+            "expected x renamed; got: {}", p);
+        assert!(p.contains("y_α1"),
+            "expected y renamed; got: {}", p);
+    }
+
+    #[test]
+    fn multi_binder_real_capture_alpha_renames() {
+        // ∀ x y. z + y   with {z: x}
+        //   z occurs free in the body and subst z→x; binder `x` would
+        //   capture the substituted x. Post-#116: the colliding `x`
+        //   binder alpha-renames to `x_α1`, body's bound `x` becomes
+        //   `x_α1` (no body refs to x except via subst), then z → x
+        //   substitutes. Sibling `y` stays `y` since no collision.
+        //   Result: ∀ x_α1 y. x + y.
+        let e = Expr::new(ExprNode::Forall {
+            binders: vec![
+                Binder {
+                    name: Some(LeanName::lit("x")),
+                    ty: var("Int"),
+                    kind: BinderKind::Explicit,
+                },
+                Binder {
+                    name: Some(LeanName::lit("y")),
+                    ty: var("Int"),
+                    kind: BinderKind::Explicit,
+                },
+            ],
+            body: Box::new(add(var("z"), var("y"))),
+        });
+        let s = subst_of(&[("z", var("x"))]);
+        let result = substitute(&e, &s);
+        let printed = crate::lean_pp::pp_expr(&result);
+        // Result should be ∀ x_α1 y. x + y — x renamed, y unchanged.
+        assert!(printed.contains("x_α1"),
+            "expected x to be alpha-renamed; got: {}", printed);
+        // Pretty-printer prints the binders as `(x_α1 : Int) (y : Int)`,
+        // so we look for both forms.
+        assert!(printed.contains("y : Int"),
+            "expected y binder unchanged; got: {}", printed);
+        // Body should now reference free `x` (the substituted z) and
+        // bound `y`. Verify x is mentioned free post-substitution.
+        // (This is the substituted-z path.)
+        // Free-vars check: result mentions `x` free.
+        assert!(mentions_free_var(&result, "x"),
+            "expected free `x` (substituted from z) in result; got: {}", printed);
     }
 
     // ── mentions_free_var ──────────────────────────────────────────────

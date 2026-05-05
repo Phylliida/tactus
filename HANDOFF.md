@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**271 end-to-end tests + 1 coverage test + 137 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**271 end-to-end tests + 1 coverage test + 146 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -2211,6 +2211,107 @@ abstract reasoning misses.
 e2e + 1 coverage + 7 integration unchanged. One pending task
 closed (#119). Down to 16 pending tasks.
 
+#### Current session (2026-05-04 cont. — #116 substitute alpha-rename)
+
+Closed #116. `substitute`'s capture check used to panic with a
+"would capture a free variable" message when a binder collided
+with a free var in an active substitution value. No realistic
+test triggered it (callee specs are simple arithmetic), so the
+panic was *defensive*. Today's review pass surfaced this as the
+right kind of "make it robust now, before someone trips it" task
+— the user emphasized "we want to make it very robust."
+
+**Encoding:** when capture is detected at a binder site, generate
+a fresh name `<base>_α<N>` (smallest N≥1 not in the forbidden
+set), rewrite the body via `substitute` itself with `{old →
+Var(fresh)}`, then proceed with the original substitution on the
+renamed body. The freshness machinery avoids:
+* every name (free or bound) appearing anywhere in body — so the
+  rename's `Var(fresh)` doesn't accidentally capture an inner shadow;
+* every free name in active substitution values — so subsequent
+  main substitution doesn't re-capture;
+* every sibling binder name — multi-binder shapes like `∀ x y, …`
+  where only one binder collides keep their other names.
+
+For dependent types (`∀ (x : Nat) (h : x > 0), …`), the rename
+also threads through subsequent binder types — the second binder's
+type expression is run through the rename substitution so
+`x > 0` becomes `x_α1 > 0` when `x` renames.
+
+**Implementation in `lean_ast.rs` (~200 lines added, ~30 removed):**
+* `compute_alpha_renames(binders, inner_subst, body)` — replaces
+  `check_capture_lazy`. Returns rename map (empty when no rename
+  needed). Same lazy detection as the prior check, but produces
+  a rename instead of panicking.
+* `collect_all_names(expr, out)` — walks every name appearing in
+  expr (free + bound). Distinct from `collect_free_vars` because
+  fresh-name generation must avoid bound names too.
+* `fresh_name(base, forbidden)` — generates `<base>_α<N>` with
+  smallest N≥1 not in forbidden.
+* `rename_in_pattern(pat, renames)` — applies renames to Pattern's
+  `Var` / `Binding` / nested `Ctor.args` / `Or`. Constructor names
+  themselves (path-derived) untouched.
+* `apply_renames_to_binders(binders, body, renames)` — multi-binder
+  helper that rewrites only colliding binders, leaves siblings,
+  and applies rename map to each binder's type expression
+  (dependent-type case).
+* `rename_map_to_subst(renames)` — small helper turning the rename
+  map into a substitution map for the body-rewrite pass.
+* `substitute_impl`'s `Let`, `Lambda`, `Forall`, `Exists`, `Match`
+  arms updated to compute renames, apply them, then continue
+  substitution.
+
+**Tests** (9 new, 137 → 146 unit):
+* `capture_alpha_renames_let_binder` — simple Let case, expected
+  shape `let y_α1 := 5; y + y_α1`.
+* `capture_alpha_renames_lambda_binder` — Lambda single binder.
+* `capture_alpha_renames_exists_binder` — Exists single binder.
+* `capture_alpha_renames_match_pattern_var` — Match arm with
+  `Pattern::Var` collision.
+* `capture_alpha_renames_match_ctor_args` — nested `Pattern::Ctor`
+  with one colliding arg + one non-colliding sibling arg
+  (verifies sibling preservation in pattern).
+* `capture_alpha_renames_dependent_type_in_forall` — `∀ (x : Nat)
+  (h : x > 0), z` with `{z: x}`. Verifies the rename threads into
+  the second binder's type, producing `(h : x_α1 > 0)`.
+* `capture_alpha_rename_preserves_non_colliding_siblings` — `∀ x
+  y, z + y` with `{z: x}`. Verifies y stays y.
+* `capture_alpha_rename_avoids_existing_freshness` — body already
+  mentions `y_α1` as a free var; verifies fresh picks `y_α2` to
+  skip the taken name.
+* `capture_alpha_rename_multi_binder_collision` — both binders
+  collide (`∀ x y. z1 + z2` with `{z1: x, z2: y}`); verifies both
+  rename without colliding with each other.
+* Two former `#[should_panic]` tests (`capture_panics`,
+  `multi_binder_real_capture_does_panic`) flipped to
+  `_alpha_renames` variants verifying the rename produces correct
+  semantics.
+
+**No regressions** in 271 e2e (the rename only fires on capture,
+which the test suite never triggers in non-test paths).
+
+**DESIGN.md update:** "Architecture debts" entry for substitute's
+panic flipped to "LANDED (#116)" with a paragraph describing the
+fresh-name rules, the dependent-type handling, and the test
+matrix.
+
+**Net for the session**: 1 commit incoming. 137 → 146 unit (+9),
+271 e2e + 1 coverage + 7 integration unchanged. One pending task
+closed (#116). Down to 15 pending tasks.
+
+**Discipline note worth recording: defensive locks before
+they're needed.** The user explicitly framed this task: "we want
+to make it very robust." The work was purely defensive — no
+existing call site triggers capture. But the pattern of
+*panic-with-clear-message* is a known footgun: when a future
+session adds a feature that introduces capture, the panic is
+unhelpful and the fix is non-obvious. Implementing alpha-rename
+proactively means future-future-us inherits a substitute that
+"just works" instead of "panics with a TODO." The lens: when a
+defensive panic is documented as "alpha-renaming would be the
+proper fix," that's a future-self IOU. Pay it before it accrues
+interest.
+
 ## Architecture
 
 ### Full pipeline
@@ -2705,7 +2806,7 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 
 | Binary | Count | What it tests |
 |---|---|---|
-| `cargo test -p lean_verify --lib` | 137 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance), `mentions_free_var` (binder-scope tracking), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` (incl. multi-binder chain lift) / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking + prelude-name auto-derivation, `format_rust_loc`, lean_process, `LeanName` constructors |
+| `cargo test -p lean_verify --lib` | 146 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance via alpha-rename for Let/Lambda/Forall/Exists/Match incl. dependent types), `mentions_free_var` (binder-scope tracking), `strip_span_marks`, `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` (incl. multi-binder chain lift) / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking + prelude-name auto-derivation, `format_rust_loc`, lean_process, `LeanName` constructors |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
 | `vargo test -p rust_verify_test --test tactus` | 271 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes, per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body + &mut x.f via structure update, trait-method calls with impl-strengthened ensures + default-impl invocation, bit-width matrix, control-flow combinations, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression, new-mut-ref callee-side normalization, exec closure declarations + body verification scope + spec-closure calls, lexicographic decreases for fns + loops with `0 ≤ cur` lower bound, ret-substitution at call sites for `r == E` ensures) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
