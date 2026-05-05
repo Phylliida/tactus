@@ -975,6 +975,27 @@ fn collect_free_vars(
     }
 }
 
+/// Does `expr` reference `target` as a *free* variable anywhere?
+///
+/// "Free" means not shadowed by an enclosing `Let` / `Lambda` /
+/// `Forall` / `Exists` / `Match`-pattern binder. Used by callers
+/// that need to detect substitution loops or self-references —
+/// e.g., `sst_to_lean::extract_top_level_eq_for` (#128) rejects
+/// `r == E` clauses where E mentions r as a free variable, because
+/// substituting `r → E` in such patterns would loop.
+///
+/// Implemented as a thin wrapper over the private `collect_free_vars`
+/// — same walk, same scope tracking — to avoid duplicating the
+/// per-variant dispatch. The HashSet allocation is fine at our
+/// call rate (a few times per fn at codegen); a future
+/// allocation-free early-exit variant could be added if profiling
+/// shows it matters.
+pub fn mentions_free_var(expr: &Expr, target: &str) -> bool {
+    let mut found = std::collections::HashSet::new();
+    collect_free_vars(expr, &std::collections::HashSet::new(), &mut found);
+    found.contains(target)
+}
+
 fn pattern_bound_names(pat: &Pattern) -> Vec<String> {
     let mut out = Vec::new();
     pattern_bound_names_impl(pat, &mut out);
@@ -1487,5 +1508,64 @@ mod substitute_tests {
         });
         let s = subst_of(&[("z", var("x"))]);
         let _ = substitute(&e, &s);
+    }
+
+    // ── mentions_free_var ──────────────────────────────────────────────
+
+    #[test]
+    fn mentions_free_var_finds_free_occurrence() {
+        let e = add(var("x"), lit(1));
+        assert!(mentions_free_var(&e, "x"));
+        assert!(!mentions_free_var(&e, "y"));
+    }
+
+    #[test]
+    fn mentions_free_var_skips_let_shadowed() {
+        // `let x := 1; x + 2` — the inner `x` is bound by the let, not free.
+        let body = add(var("x"), lit(2));
+        let e = let_bind("x", lit(1), body);
+        // Outer `x` reference (the let's name) is bound, body's `x` is bound by it.
+        // From outside, `x` is not free anywhere.
+        assert!(!mentions_free_var(&e, "x"));
+    }
+
+    #[test]
+    fn mentions_free_var_finds_free_in_let_value() {
+        // `let y := x; y + 1` — `x` IS free (it's in the let's value position).
+        let val = var("x");
+        let body = add(var("y"), lit(1));
+        let e = let_bind("y", val, body);
+        assert!(mentions_free_var(&e, "x"));
+    }
+
+    #[test]
+    fn mentions_free_var_skips_forall_shadowed() {
+        // `∀ x, x + 1` — `x` is bound by the forall.
+        let body = add(var("x"), lit(1));
+        let e = forall("x", body);
+        assert!(!mentions_free_var(&e, "x"));
+    }
+
+    #[test]
+    fn mentions_free_var_skips_exists_shadowed() {
+        let body = add(var("x"), lit(1));
+        let e = exists("x", body);
+        assert!(!mentions_free_var(&e, "x"));
+    }
+
+    #[test]
+    fn mentions_free_var_finds_through_compound_shapes() {
+        // `if c then x + 1 else y` — both c and x and y are free.
+        let then_e = add(var("x"), lit(1));
+        let else_e = var("y");
+        let e = Expr::new(ExprNode::If {
+            cond: Box::new(var("c")),
+            then_: Box::new(then_e),
+            else_: Some(Box::new(else_e)),
+        });
+        assert!(mentions_free_var(&e, "c"));
+        assert!(mentions_free_var(&e, "x"));
+        assert!(mentions_free_var(&e, "y"));
+        assert!(!mentions_free_var(&e, "z"));
     }
 }

@@ -2109,53 +2109,6 @@ fn collect_top_and_conjuncts<'a>(e: &'a LExpr, out: &mut Vec<&'a LExpr>) {
     }
 }
 
-/// Does `e` mention `target` as a free variable anywhere in its
-/// subtree? Recursive walk, peels SpanMark transparently, ignores
-/// binder scope. Used by `extract_top_level_eq_for` to reject
-/// self-referential `r == r + …` patterns from ret-substitution
-/// (#128) — those would either no-op or produce a non-terminating
-/// substitution chain.
-///
-/// The "ignore binder scope" simplification is sound for our use:
-/// if `target` happens to be shadowed by an inner binder, treating
-/// it as "mentioned" still produces a conservative *skip-substitution*
-/// result, which is always safe.
-fn expr_mentions_var(e: &LExpr, target: &crate::lean_name::LeanName) -> bool {
-    match &e.node {
-        ExprNode::Var(n) => n.as_str() == target.as_str(),
-        ExprNode::Lit(_) | ExprNode::LitBool(_) | ExprNode::LitStr(_)
-        | ExprNode::LitChar(_) | ExprNode::Raw(_) => false,
-        ExprNode::BinOp { lhs, rhs, .. } =>
-            expr_mentions_var(lhs, target) || expr_mentions_var(rhs, target),
-        ExprNode::UnOp { arg, .. } => expr_mentions_var(arg, target),
-        ExprNode::App { head, args } =>
-            expr_mentions_var(head, target)
-            || args.iter().any(|a| expr_mentions_var(a, target)),
-        ExprNode::Let { value, body, .. } =>
-            expr_mentions_var(value, target) || expr_mentions_var(body, target),
-        ExprNode::Lambda { body, .. } | ExprNode::Forall { body, .. }
-        | ExprNode::Exists { body, .. } => expr_mentions_var(body, target),
-        ExprNode::If { cond, then_, else_ } =>
-            expr_mentions_var(cond, target)
-            || expr_mentions_var(then_, target)
-            || else_.as_ref().map_or(false, |e| expr_mentions_var(e, target)),
-        ExprNode::Match { scrutinee, arms } =>
-            expr_mentions_var(scrutinee, target)
-            || arms.iter().any(|a| expr_mentions_var(&a.body, target)),
-        ExprNode::TypeAnnot { expr, ty } =>
-            expr_mentions_var(expr, target) || expr_mentions_var(ty, target),
-        ExprNode::FieldProj { expr, .. } => expr_mentions_var(expr, target),
-        ExprNode::StructUpdate { base, updates } =>
-            expr_mentions_var(base, target)
-            || updates.iter().any(|(_, v)| expr_mentions_var(v, target)),
-        ExprNode::ArrayLit(es) | ExprNode::Anon(es) =>
-            es.iter().any(|e| expr_mentions_var(e, target)),
-        ExprNode::Index { base, idx, .. } =>
-            expr_mentions_var(base, target) || expr_mentions_var(idx, target),
-        ExprNode::SpanMark { inner, .. } => expr_mentions_var(inner, target),
-    }
-}
-
 /// Try to find a top-level conjunct of the form `Eq(Var(target), E)`
 /// or `Eq(E, Var(target))` in `conj`. Returns `Some((E, rest))`
 /// where `rest` is the And of all OTHER conjuncts (or `LitBool(true)`
@@ -2195,7 +2148,12 @@ fn extract_top_level_eq_for(
             _ => None,
         };
         let Some(e) = e else { continue };
-        if expr_mentions_var(e, target) {
+        // Reject self-referential `r == E` where E mentions r —
+        // substituting `r → E` in such patterns would loop. Uses
+        // the shared `lean_ast::mentions_free_var` (which tracks
+        // binder scope correctly) rather than a sst_to_lean-local
+        // walk.
+        if crate::lean_ast::mentions_free_var(e, target.as_str()) {
             continue;
         }
         let rest: Vec<LExpr> = conjuncts.iter().enumerate()
