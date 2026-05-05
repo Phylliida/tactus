@@ -4235,6 +4235,74 @@ test_verify_one_file! {
     }
 }
 
+// #109: mutually recursive datatype SCCs. Two enums that reference
+// each other (Tree → Forest → Tree). Pre-#109 the inductives were
+// emitted standalone — Lean rejected the cross-type field reference
+// because Forest wasn't yet defined when Tree's inductive was emitted.
+// Post-#109 the inductives go in a `mutual ... end` block (and the
+// height fns in a separate one) so cross-type references resolve.
+//
+// The test uses Tree's match for the exec body but doesn't call its
+// recursive partner — the value of the test is that the types compile
+// cleanly. Pinned by enum field references being in scope.
+test_verify_one_file! {
+    #[test] test_exec_mutually_recursive_datatypes verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum Tree {
+            Leaf,
+            Branch(Box<Forest>),
+        }
+
+        enum Forest {
+            Empty,
+            Cons(Box<Tree>, Box<Forest>),
+        }
+
+        #[verifier::tactus_auto]
+        fn use_tree(t: Tree) -> (r: u64)
+            ensures r == 0
+        {
+            match t {
+                Tree::Leaf => 0,
+                Tree::Branch(_) => 0,
+            }
+        }
+    } => Ok(())
+}
+
+// #109 follow-up: recursion over a member of a mutual-SCC datatype.
+// `Forest.height` post-#109 calls `Tree.height` for its Tree fields
+// (cross-type recursion in the height fn, requiring the mutual block).
+// This test exercises the termination obligation: `Forest.height rest <
+// Forest.height (Cons _ rest) = 1 + Tree.height _ + Forest.height rest`.
+// omega closes it because Tree.height is at-least-1 from the Nat type.
+test_verify_one_file! {
+    #[test] test_exec_call_recursive_over_mutual_datatype verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum Tree {
+            Leaf,
+            Branch(Box<Forest>),
+        }
+
+        enum Forest {
+            Empty,
+            Cons(Box<Tree>, Box<Forest>),
+        }
+
+        #[verifier::tactus_auto]
+        fn forest_count(f: &Forest) -> (r: u64)
+            decreases f
+        {
+            match f {
+                Forest::Empty => 0,
+                Forest::Cons(_, rest) => forest_count(rest),
+            }
+        }
+    } => Ok(())
+}
+
 // #108 followup: generic datatype with TWO type parameters. Verifies
 // that the implicit-binder machinery handles >1 type arg correctly
 // (one `{A : Type}` per param, accessor's `[Inhabited A] [Inhabited B]`

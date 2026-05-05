@@ -165,9 +165,86 @@ pub fn proof_fn_to_ast(f: &FunctionX, tactic_body: &str) -> Theorem {
 /// Returns an empty `Vec` for `Dt::Tuple` (no declaration needed —
 /// tuples are rendered as `T × U` products).
 pub fn datatype_to_cmds(dt: &DatatypeX, emit_accessors: bool) -> Vec<Command> {
+    // Single-element SCC. The set's lifetime is tied to `dt`'s name
+    // path; constructed locally because non-mutual datatypes never
+    // cross outside their own SCC.
+    let mut scc_paths: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+    if let Dt::Path(p) = &dt.name {
+        scc_paths.insert(p);
+    }
+    let mut cmds = Vec::new();
+    if let Some(decl) = datatype_decl_cmd(dt) {
+        cmds.push(decl);
+    }
+    cmds.extend(datatype_accessor_cmds(dt, emit_accessors));
+    if let Some(height) = datatype_height_cmd(dt, &scc_paths) {
+        cmds.push(height);
+    }
+    cmds
+}
+
+/// Emit a group of datatypes — `Single` for non-mutual, `Mutual` for
+/// SCCs of size >1 (#109). For mutual SCCs:
+/// 1. Inductive declarations are wrapped in a `mutual ... end` block
+///    so cross-type field references resolve.
+/// 2. Accessors emit OUTSIDE the mutual block — they're per-datatype
+///    structural defs that don't recurse across the SCC.
+/// 3. Height fns are wrapped in a SECOND `mutual ... end` block —
+///    cross-type recursive calls (e.g., `A.height` calling
+///    `B.height`) require the mutual scope to typecheck.
+///
+/// `deriving Inhabited` stays on each `inductive` declaration even
+/// inside the mutual block — Lean accepts inline deriving for
+/// mutually-recursive inductives and produces conditional instances.
+pub fn datatype_group_to_cmds<'a>(
+    group: &crate::dep_order::DatatypeGroup<'a>,
+    emit_accessors: bool,
+) -> Vec<Command> {
+    use crate::dep_order::DatatypeGroup;
+    let dts: Vec<&'a DatatypeX> = match group {
+        DatatypeGroup::Single(dt) => return datatype_to_cmds(dt, emit_accessors),
+        DatatypeGroup::Mutual(dts) => dts.clone(),
+    };
+
+    // Build the SCC path set once for all members of the group.
+    let scc_paths: std::collections::HashSet<&Path> = dts.iter()
+        .filter_map(|dt| match &dt.name {
+            Dt::Path(p) => Some(p),
+            Dt::Tuple(_) => None,
+        })
+        .collect();
+
+    let mut cmds = Vec::new();
+
+    // 1. mutual block of inductives.
+    let inductive_cmds: Vec<Command> = dts.iter()
+        .filter_map(|dt| datatype_decl_cmd(dt))
+        .collect();
+    cmds.push(Command::Mutual(inductive_cmds));
+
+    // 2. accessors per-datatype, outside the mutual block.
+    for dt in &dts {
+        cmds.extend(datatype_accessor_cmds(dt, emit_accessors));
+    }
+
+    // 3. mutual block of height fns. Each height fn reaches the
+    //    others by name; the mutual scope makes those names visible.
+    let height_cmds: Vec<Command> = dts.iter()
+        .filter_map(|dt| datatype_height_cmd(dt, &scc_paths))
+        .collect();
+    if !height_cmds.is_empty() {
+        cmds.push(Command::Mutual(height_cmds));
+    }
+
+    cmds
+}
+
+/// Emit the `inductive` (or `structure`) declaration for a datatype.
+/// Returns None for `Dt::Tuple` (no decl needed; tuples render as products).
+fn datatype_decl_cmd(dt: &DatatypeX) -> Option<Command> {
     let (path, short) = match &dt.name {
         Dt::Path(p) => (lean_name(p), short_name(p).to_string()),
-        Dt::Tuple(_) => return vec![],
+        Dt::Tuple(_) => return None,
     };
     let typ_params: Vec<String> = dt.typ_params.iter()
         .map(|(id, _)| id.to_string())
@@ -196,31 +273,52 @@ pub fn datatype_to_cmds(dt: &DatatypeX, emit_accessors: bool) -> Vec<Command> {
         }
     };
 
-    // Derive `Inhabited` for non-generic datatypes so that auto-
-    // generated accessors' `default` fallback resolves. For
-    // self-referential types like `enum Stack { Empty, Push(u8,
-    // Box<Stack>) }`, `Push_val1 : Stack → Stack` needs
-    // `Inhabited Stack`. For generic datatypes (#108), Lean's
-    // `deriving Inhabited` auto-generates a conditional instance
-    // `[Inhabited A] → Inhabited (List A)`, satisfying
-    // `Cons_val1`'s `default : List A` fallback when the caller
-    // provides `[Inhabited A]` (which the accessor's typeclass
-    // bound now requires — see `accessor_typ_binders` in
-    // `multi_variant_accessor_defs`).
+    // Derive `Inhabited` for every datatype so that auto-generated
+    // accessors' `default` fallback resolves. For self-referential
+    // types like `enum Stack { Empty, Push(u8, Box<Stack>) }`,
+    // `Push_val1 : Stack → Stack` needs `Inhabited Stack`. For generic
+    // datatypes (#108), Lean's `deriving Inhabited` auto-generates a
+    // conditional instance `[Inhabited A] → Inhabited (List A)`. For
+    // mutually recursive SCCs (#109), Lean accepts `deriving Inhabited`
+    // inline even inside a `mutual` block.
     let derives = vec!["Inhabited".into()];
-    let mut cmds = vec![Command::Datatype(Datatype {
-        name: path.clone(),
-        typ_params: typ_params.clone(),
+    Some(Command::Datatype(Datatype {
+        name: path,
+        typ_params,
         kind,
         derives,
-    })];
-    if !is_single_variant_struct && emit_accessors {
-        cmds.extend(multi_variant_accessor_defs(dt, &path));
+    }))
+}
+
+/// Emit per-variant accessor / discriminator defs for a datatype.
+/// Empty for single-variant structs (handled via Lean's auto-generated
+/// `structure` projections) and when `emit_accessors == false` (proof-
+/// fn paths preserve native Lean match instead of routing through
+/// generated accessors).
+fn datatype_accessor_cmds(dt: &DatatypeX, emit_accessors: bool) -> Vec<Command> {
+    let (path, short) = match &dt.name {
+        Dt::Path(p) => (lean_name(p), short_name(p).to_string()),
+        Dt::Tuple(_) => return vec![],
+    };
+    let is_single_variant_struct =
+        dt.variants.len() == 1 && dt.variants[0].name.as_str() == short;
+    if is_single_variant_struct || !emit_accessors {
+        return vec![];
     }
-    if let Some(height) = height_fn_for_datatype(dt, &path) {
-        cmds.push(height);
-    }
-    cmds
+    multi_variant_accessor_defs(dt, &path)
+}
+
+/// Emit the height fn for a datatype, parameterized by the SCC it
+/// belongs to. See `height_fn_for_datatype` for the semantics.
+fn datatype_height_cmd(
+    dt: &DatatypeX,
+    scc_paths: &std::collections::HashSet<&Path>,
+) -> Option<Command> {
+    let path = match &dt.name {
+        Dt::Path(p) => lean_name(p),
+        Dt::Tuple(_) => return None,
+    };
+    height_fn_for_datatype(dt, &path, scc_paths)
 }
 
 /// Emit `def T.height : T → Nat` alongside the datatype so that
@@ -228,40 +326,44 @@ pub fn datatype_to_cmds(dt: &DatatypeX, emit_accessors: bool) -> Vec<Command> {
 /// termination obligation emitted by `sst_exp_to_ast_checked`'s
 /// `CheckDecreaseHeight` arm.
 ///
-/// - **Non-recursive datatype** (no self-referential fields): emit
-///   `fun _ => 1`. Doesn't help termination (there's no structural
-///   subterm), but keeps the Lean symbol resolvable if a user
-///   writes `decreases x` for a non-recursive `x` — the obligation
-///   `1 < 1` is simply false, so the recursion fails verification
-///   with a clear goal.
+/// - **Non-recursive datatype** (no recursive fields w.r.t. the SCC):
+///   emit `fun _ => 1`. Doesn't help termination (there's no
+///   structural subterm), but keeps the Lean symbol resolvable if a
+///   user writes `decreases x` for a non-recursive `x` — the
+///   obligation `1 < 1` is simply false, so the recursion fails
+///   verification with a clear goal.
 /// - **Recursive datatype**: emit a match over variants, summing
-///   `1 + height(f)` for each recursive field `f`, treating non-
-///   recursive fields as 0. Lean's equation compiler proves
-///   termination by structural recursion on the scrutinee.
+///   `1 + height(f)` for each field whose type is in `scc_paths`,
+///   treating other fields as 0. The recursive call uses the
+///   FIELD's height fn, not the parent's — so for an SCC, a
+///   `Tree.Branch f` arm where `f : Forest` calls `Forest.height f`
+///   (rather than the trivial `1` in the pre-#109 code that only
+///   recursed on self).
 ///
-/// Returns `None` for:
-/// - **Tuple datatypes** (`Dt::Tuple`) — rendered as products, no
-///   declaration site for a height fn.
-/// - **Generic datatypes** (non-empty `typ_params`) — per DESIGN.md
-///   "Non-int decreases" deferrals, emitting a parametric height
-///   would require a `[SizeOf α]`-style typeclass. Call sites
-///   reach this via `decrease_height_datatype`, which rejects
-///   generic instantiations at the obligation site.
-/// - **Mutually recursive datatype SCCs** — emitting each height
-///   fn standalone makes Lean's structural recursion fail for
-///   cross-type references (it only recurses on `Self`). Deferred
-///   until we support `mutual` blocks for height fns.
+/// `scc_paths` contains all datatype paths in the SCC the input `dt`
+/// belongs to (always at least `dt`'s own path). For non-mutual
+/// datatypes the set has size 1 and behavior matches the pre-#109
+/// shape. For mutual SCCs (#109) the set has size >1 and the
+/// emitted `def` MUST be wrapped in a `mutual ... end` block
+/// alongside the other SCC members' height fns — Lean otherwise
+/// rejects the cross-type recursive reference.
+///
+/// Returns `None` for **tuple datatypes** (`Dt::Tuple`) — they're
+/// rendered as products with no declaration site.
 ///
 /// The "recursive field" test peels `TypX::Boxed` (poly coercion)
 /// and `TypX::Decorate` (e.g., `Box<Self>`, `&Self`) before
-/// comparing the underlying path — this matches how `typ_to_expr`
-/// renders field types at the Lean level (Box is transparent).
-fn height_fn_for_datatype(dt: &DatatypeX, path: &str) -> Option<Command> {
+/// comparing — this matches how `typ_to_expr` renders field types
+/// at the Lean level (Box is transparent).
+fn height_fn_for_datatype(
+    dt: &DatatypeX,
+    path: &str,
+    scc_paths: &std::collections::HashSet<&Path>,
+) -> Option<Command> {
     use crate::lean_ast::{BinOp, ExprNode};
-    let dt_path = match &dt.name {
-        Dt::Path(p) => p,
-        Dt::Tuple(_) => return None,
-    };
+    if let Dt::Tuple(_) = &dt.name {
+        return None;
+    }
 
     // Generic datatypes (#108): emit `T.height : {A : Type} → … → T A B …
     // → Nat`. The implicit type-param binders let callers write just
@@ -289,7 +391,7 @@ fn height_fn_for_datatype(dt: &DatatypeX, path: &str) -> Option<Command> {
     }).collect();
 
     let has_recursive_field = dt.variants.iter().any(|v|
-        v.fields.iter().any(|f| field_is_self_recursive(&f.a.0, dt_path))
+        v.fields.iter().any(|f| field_recursive_target(&f.a.0, scc_paths).is_some())
     );
 
     if !has_recursive_field {
@@ -336,21 +438,29 @@ fn height_fn_for_datatype(dt: &DatatypeX, path: &str) -> Option<Command> {
         let var_san = sanitize(&v.name);
         let ctor_name = format!("{}.{}", path, var_san);
         let mut pats = Vec::with_capacity(v.fields.len());
-        let mut recursive_binders: Vec<String> = Vec::new();
+        // (binder name, height fn name) for each recursive field.
+        // The height fn name uses the FIELD's datatype (which is in
+        // the SCC), not the parent's. For self-recursion these
+        // match; for mutual recursion across an SCC they differ.
+        let mut recursive_binders: Vec<(String, String)> = Vec::new();
         for (idx, f) in v.fields.iter().enumerate() {
-            if field_is_self_recursive(&f.a.0, dt_path) {
+            if let Some(target_path) = field_recursive_target(&f.a.0, scc_paths) {
                 let name = format!("_rec_{}", idx);
+                let height_fn = format!("{}.height", lean_name(target_path));
                 pats.push(LPattern::Var(crate::lean_name::LeanName::synthetic(name.clone())));
-                recursive_binders.push(name);
+                recursive_binders.push((name, height_fn));
             } else {
                 pats.push(LPattern::Wildcard);
             }
         }
         let mut arm_body = LExpr::lit_int("1");
-        for name in &recursive_binders {
+        for (name, height_fn) in &recursive_binders {
             arm_body = LExpr::add(
                 arm_body,
-                LExpr::app1(LExpr::var_synthetic(format!("{}.height", path)), LExpr::var_synthetic(name.clone())),
+                LExpr::app1(
+                    LExpr::var_synthetic(height_fn.clone()),
+                    LExpr::var_synthetic(name.clone()),
+                ),
             );
         }
         MatchArm {
@@ -368,23 +478,30 @@ fn height_fn_for_datatype(dt: &DatatypeX, path: &str) -> Option<Command> {
 }
 
 
-/// Is `typ` a self-referential occurrence of the datatype at
-/// `self_path`? Peels `TypX::Boxed` and `TypX::Decorate` to
-/// handle `Box<Self>`, `&Self`, etc. — these decorate the
-/// pointer shape at the Rust level but render as just `Self`
-/// at the Lean type level.
+/// If `typ` is a reference to a datatype path that's in `scc_paths`,
+/// returns that path. Otherwise None. Peels `TypX::Boxed` and
+/// `TypX::Decorate` to handle `Box<Self>`, `&Self`, etc.
+///
+/// For non-mutual datatypes, `scc_paths` contains just the datatype's
+/// own path — the result is "is this field self-referential?". For
+/// mutually-recursive SCCs (#109), `scc_paths` contains every path in
+/// the SCC, so a field of type `B` inside datatype `A` matches when
+/// `B` is in the same SCC. The returned path is used by the height fn
+/// emitter to choose `B.height` vs `A.height` for the recursive call.
 ///
 /// Generic datatypes (#108): a field of type `Tree<A>` inside
-/// `enum Tree<A> { … }` matches when `p == self_path`, regardless
-/// of how the type-arg list compares. `Tree.height` is generic
-/// over A, so structural recursion on a `Tree<A>`-typed field
-/// is the same as structural recursion on `Tree<U>` — Lean's
-/// equation compiler handles both because the recursion is on
-/// the datatype shape, not on A.
-fn field_is_self_recursive(typ: &Typ, self_path: &Path) -> bool {
+/// `enum Tree<A> { … }` matches when its path is in `scc_paths`,
+/// regardless of how the type-arg list compares. `Tree.height` is
+/// generic over A, so structural recursion on a `Tree<A>`-typed
+/// field is the same as on `Tree<U>` — Lean's equation compiler
+/// handles both.
+fn field_recursive_target<'a>(
+    typ: &Typ,
+    scc_paths: &'a std::collections::HashSet<&Path>,
+) -> Option<&'a Path> {
     match &**crate::to_lean_type::peel_typ_wrappers(typ) {
-        TypX::Datatype(Dt::Path(p), _, _) => p == self_path,
-        _ => false,
+        TypX::Datatype(Dt::Path(p), _, _) => scc_paths.get(p).copied(),
+        _ => None,
     }
 }
 

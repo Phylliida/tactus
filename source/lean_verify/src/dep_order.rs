@@ -19,6 +19,19 @@ pub enum FnGroup<'a> {
     Mutual(Vec<&'a FunctionX>),
 }
 
+/// A group of datatypes that should be emitted together.
+///
+/// `Mutual(group)` for SCCs with size > 1 — the inductives reference
+/// each other, so Lean requires a `mutual ... end` block for both
+/// the type declarations and the height fns. `Single(dt)` for
+/// non-mutual datatypes (the common case, including self-recursive
+/// types — those handle recursion structurally without needing a
+/// `mutual` block).
+pub enum DatatypeGroup<'a> {
+    Single(&'a DatatypeX),
+    Mutual(Vec<&'a DatatypeX>),
+}
+
 /// All entity names referenced by the proof fns (transitively through spec fns).
 /// Borrows `&str` from VIR's `Arc<String>` — zero allocations.
 pub struct References<'a> {
@@ -164,6 +177,93 @@ fn seed_worklist<'a>(proof_fns: &[&'a FunctionX], worklist: &mut Vec<&'a Fun>) {
         for e in pf.require.iter() { collect_fun_refs(e, worklist); }
         for e in pf.ensure.0.iter() { collect_fun_refs(e, worklist); }
         for e in pf.ensure.1.iter() { collect_fun_refs(e, worklist); }
+    }
+}
+
+/// Order datatypes for emission, grouping mutually-recursive SCCs.
+///
+/// For each datatype in `referenced_datatypes` (subset of `krate.datatypes`
+/// the proof/exec fns transitively touch), build a graph where A → B if
+/// A's variants have a field whose peeled type is `Datatype(B, …)`. Run
+/// Tarjan's SCC. Returns a topologically-ordered list of groups — Single
+/// for self-contained datatypes (including self-recursive ones, which
+/// don't need a `mutual` block), Mutual for SCCs of size > 1.
+///
+/// Used by `generate.rs` to wrap mutually-recursive datatype declarations
+/// (and their height fns) in Lean `mutual ... end` blocks (#109).
+pub fn order_datatypes<'a>(
+    referenced_datatypes: &[&'a DatatypeX],
+) -> Vec<DatatypeGroup<'a>> {
+    // Build a path → DatatypeX lookup. Filter Dt::Tuple — they don't
+    // have declarations to emit; references to them in field types
+    // are skipped during edge collection. Keys are `&Path` (= `&Arc<PathX>`)
+    // so PartialEq/Hash delegate to PathX content.
+    let dt_by_path: HashMap<&'a Path, &'a DatatypeX> = referenced_datatypes
+        .iter()
+        .filter_map(|dt| match &dt.name {
+            Dt::Path(p) => Some((p, *dt)),
+            Dt::Tuple(_) => None,
+        })
+        .collect();
+
+    // Build edges: A → B for every B referenced in A's field types
+    // (including self).
+    let mut edges: HashMap<&'a Path, HashSet<&'a Path>> = HashMap::new();
+    for (a_path, dt) in &dt_by_path {
+        let mut deps: HashSet<&'a Path> = HashSet::new();
+        for variant in dt.variants.iter() {
+            for field in variant.fields.iter() {
+                walk_typ_paths(&field.a.0, &mut |p: &'a Path| {
+                    if dt_by_path.contains_key(p) {
+                        deps.insert(p);
+                    }
+                });
+            }
+        }
+        edges.insert(a_path, deps);
+    }
+
+    // Order datatypes deterministically by their position in the input.
+    // Tarjan's output preserves processing order, so this gives stable
+    // output across runs.
+    let ordered_paths: Vec<&'a Path> = referenced_datatypes
+        .iter()
+        .filter_map(|dt| match &dt.name {
+            Dt::Path(p) => Some(p),
+            Dt::Tuple(_) => None,
+        })
+        .collect();
+
+    let sccs = tarjan_scc_path(&ordered_paths, &edges);
+
+    sccs.into_iter().map(|scc| {
+        if scc.len() == 1 {
+            DatatypeGroup::Single(dt_by_path[scc[0]])
+        } else {
+            DatatypeGroup::Mutual(scc.iter().map(|p| dt_by_path[p]).collect())
+        }
+    }).collect()
+}
+
+/// Walk a `Typ` and call `f` on each `Path` reached through `TypX::Datatype`.
+/// Peels `Boxed`/`Decorate` to match how `peel_typ_wrappers` resolves field
+/// types — `Box<T>`, `&T`, etc. all reduce to `T` for dependency purposes.
+pub fn walk_typ_paths<'a>(typ: &'a Typ, f: &mut impl FnMut(&'a Path)) {
+    use crate::to_lean_type::peel_typ_wrappers;
+    let peeled = peel_typ_wrappers(typ);
+    match &**peeled {
+        TypX::Datatype(Dt::Path(p), args, _) => {
+            f(p);
+            for arg in args.iter() { walk_typ_paths(arg, f); }
+        }
+        TypX::Datatype(Dt::Tuple(_), args, _) => {
+            for arg in args.iter() { walk_typ_paths(arg, f); }
+        }
+        TypX::SpecFn(params, ret) => {
+            for p in params.iter() { walk_typ_paths(p, f); }
+            walk_typ_paths(ret, f);
+        }
+        _ => {}
     }
 }
 
@@ -415,6 +515,75 @@ fn collect_fun_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a Fun>) {
 }
 
 // ── Tarjan's SCC ────────────────────────────────────────────────────────
+
+/// Tarjan's SCC algorithm specialized to `&Path` keys (datatypes).
+/// Same shape as the `&Fun` version below — duplicated rather than
+/// genericized because the Tarjan impl uses `HashMap`/`HashSet`
+/// keyed on the node type, and Rust's iter-borrow rules around
+/// generic Eq+Hash keys with lifetime params get unwieldy fast for
+/// a 60-line algorithm.
+fn tarjan_scc_path<'a>(
+    nodes: &[&'a Path],
+    edges: &HashMap<&'a Path, HashSet<&'a Path>>,
+) -> Vec<Vec<&'a Path>> {
+    struct State<'a> {
+        counter: usize,
+        stack: Vec<&'a Path>,
+        on_stack: HashSet<&'a Path>,
+        index: HashMap<&'a Path, usize>,
+        lowlink: HashMap<&'a Path, usize>,
+        result: Vec<Vec<&'a Path>>,
+    }
+
+    fn visit<'a>(
+        v: &'a Path,
+        edges: &HashMap<&'a Path, HashSet<&'a Path>>,
+        s: &mut State<'a>,
+    ) {
+        s.index.insert(v, s.counter);
+        s.lowlink.insert(v, s.counter);
+        s.counter += 1;
+        s.stack.push(v);
+        s.on_stack.insert(v);
+
+        if let Some(neighbors) = edges.get(v) {
+            for w in neighbors {
+                if !s.index.contains_key(w) {
+                    visit(w, edges, s);
+                    let wl = s.lowlink[w];
+                    let vl = s.lowlink.get_mut(v).unwrap();
+                    *vl = (*vl).min(wl);
+                } else if s.on_stack.contains(w) {
+                    let wi = s.index[w];
+                    let vl = s.lowlink.get_mut(v).unwrap();
+                    *vl = (*vl).min(wi);
+                }
+            }
+        }
+
+        if s.lowlink[v] == s.index[v] {
+            let mut scc = Vec::new();
+            loop {
+                let w = s.stack.pop().unwrap();
+                s.on_stack.remove(w);
+                let done = std::ptr::eq(w, v);
+                scc.push(w);
+                if done { break; }
+            }
+            scc.reverse();
+            s.result.push(scc);
+        }
+    }
+
+    let mut s = State {
+        counter: 0, stack: Vec::new(), on_stack: HashSet::new(),
+        index: HashMap::new(), lowlink: HashMap::new(), result: Vec::new(),
+    };
+    for n in nodes {
+        if !s.index.contains_key(n) { visit(n, edges, &mut s); }
+    }
+    s.result
+}
 
 /// Tarjan's SCC algorithm using borrowed `&Fun` references. Zero Arc clones.
 fn tarjan_scc<'a>(
