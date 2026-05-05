@@ -4441,6 +4441,55 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #109 edge-case: generic mutually recursive datatypes (#109 +
+// #108). Both members carry a type parameter that crosses the SCC
+// boundary. Tests that the implicit-binder machinery from #108
+// composes with the mutual-block emission from #109 — height fns
+// for both members get `{T : Type}` binders before the colon and
+// the mutual block scopes them correctly.
+test_verify_one_file! {
+    #[test] test_exec_generic_mutual_scc verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum GTree<T> { Leaf(T), Branch(Box<GForest<T>>) }
+        enum GForest<T> { Empty, Cons(Box<GTree<T>>, Box<GForest<T>>) }
+
+        #[verifier::tactus_auto]
+        fn use_gtree(t: GTree<u8>) -> (r: u64)
+            ensures r == 0
+        {
+            match t {
+                GTree::Leaf(_) => 0,
+                GTree::Branch(_) => 0,
+            }
+        }
+    } => Ok(())
+}
+
+// #109 edge-case: two INDEPENDENT SCCs in the same crate.
+// `order_datatypes` should produce two `Mutual` groups, each
+// internally consistent. Tests that the SCC ordering doesn't
+// accidentally merge unrelated cycles.
+test_verify_one_file! {
+    #[test] test_exec_two_independent_sccs verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum A1 { Leaf, ToA2(Box<A2>) }
+        enum A2 { Leaf, ToA1(Box<A1>) }
+
+        enum B1 { Leaf, ToB2(Box<B2>) }
+        enum B2 { Leaf, ToB1(Box<B1>) }
+
+        #[verifier::tactus_auto]
+        fn use_both(a: A1, b: B1) -> (r: u64)
+            ensures r == 0
+        {
+            let _ = match a { A1::Leaf => 0u64, A1::ToA2(_) => 0u64 };
+            match b { B1::Leaf => 0, B1::ToB2(_) => 0 }
+        }
+    } => Ok(())
+}
+
 // #109 follow-up: recursion over a member of a mutual-SCC datatype.
 // `Forest.height` post-#109 calls `Tree.height` for its Tree fields
 // (cross-type recursion in the height fn, requiring the mutual block).
