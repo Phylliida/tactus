@@ -4271,6 +4271,95 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #109 stretch: cross-fn-SCC mutual recursion where each fn's
+// `decreases` measure is on a different SCC member. Verus's
+// recursion pass inserts CheckDecreaseHeight at every cross-fn
+// call; the obligation compares the callee's decrease type's
+// height vs the caller's decrease type's height. Pre-fix Tactus
+// emitted `<callee_T>.height` for both sides, producing a type
+// mismatch in Lean. Post-fix each side uses its own type's
+// height fn — the comparison `Forest.height f < Tree.height t`
+// typechecks because both heights return Nat, and the inequality
+// is semantically true because `Tree.height (Branch f) = 1 +
+// Forest.height f > Forest.height f` (the height fns are mutually
+// defined, so their values relate structurally).
+test_verify_one_file! {
+    #[test] test_exec_cross_fn_scc_cross_type_decreases verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum Tree {
+            Leaf,
+            Branch(Box<Forest>),
+        }
+
+        enum Forest {
+            Empty,
+            Cons(Box<Tree>, Box<Forest>),
+        }
+
+        #[verifier::tactus_auto]
+        fn tree_size(t: &Tree) -> (r: u64)
+            decreases t
+        {
+            match t {
+                Tree::Leaf => 0,
+                Tree::Branch(f) => forest_size(f),
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn forest_size(f: &Forest) -> (r: u64)
+            decreases f
+        {
+            match f {
+                Forest::Empty => 0,
+                Forest::Cons(t, _rest) => tree_size(t),
+            }
+        }
+    } => Ok(())
+}
+
+// #109 stretch negative: cross-fn-SCC where the recursive call
+// passes the SAME value back (not a structural subterm). The
+// termination obligation reduces to `Tree.height t < Tree.height t`
+// (or similar), which omega rejects. Confirms the cross-type
+// comparison actually constrains rather than vacuously passing.
+test_verify_one_file! {
+    #[test] test_exec_cross_fn_scc_nondecreasing verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum Tree {
+            Leaf,
+            Branch(Box<Forest>),
+        }
+
+        enum Forest {
+            Empty,
+            Cons(Box<Tree>, Box<Forest>),
+        }
+
+        #[verifier::tactus_auto]
+        fn tree_size(t: &Tree) -> (r: u64)
+            decreases t
+        {
+            match t {
+                Tree::Leaf => 0,
+                Tree::Branch(_) => forest_size_bad(t),
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn forest_size_bad(t: &Tree) -> (r: u64)
+            decreases t
+        {
+            tree_size(t)
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1,
+            "non-decreasing cross-fn-SCC should fail termination");
+    }
+}
+
 // #109 follow-up: recursion over a member of a mutual-SCC datatype.
 // `Forest.height` post-#109 calls `Tree.height` for its Tree fields
 // (cross-type recursion in the height fn, requiring the mutual block).
