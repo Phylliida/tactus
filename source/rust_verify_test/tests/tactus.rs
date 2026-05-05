@@ -4360,6 +4360,87 @@ test_verify_one_file! {
     }
 }
 
+// #109 coverage: SCC of size 3 (A → B → C → A). Pre-#109 tests
+// covered size-2 SCCs only; this exercises the order_datatypes
+// Tarjan output and mutual block emission with three members.
+test_verify_one_file! {
+    #[test] test_exec_three_element_datatype_scc verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum A { ALeaf, AB(Box<B>) }
+        enum B { BLeaf, BC(Box<C>) }
+        enum C { CLeaf, CA(Box<A>) }
+
+        #[verifier::tactus_auto]
+        fn use_a(a: A) -> (r: u64)
+            ensures r == 0
+        {
+            match a {
+                A::ALeaf => 0,
+                A::AB(_) => 0,
+            }
+        }
+    } => Ok(())
+}
+
+// Regression: single-variant non-eponymous enum (variant name ≠
+// type name) goes through the multi-variant accessor path because
+// `is_single_variant_struct` requires the variant name to match the
+// type name. Pre-fix the discriminator and accessor emitted a
+// catch-all `_ => …` wildcard arm; for a one-variant inductive the
+// first arm is exhaustive and Lean reported "Redundant alternative"
+// as a verification error. Fix gates the wildcard on
+// `dt.variants.len() > 1`. Surfaced while writing the SCC + standalone
+// coverage test below.
+test_verify_one_file! {
+    #[test] test_exec_single_variant_non_eponymous_enum verus_code! {
+        enum Pair { Mk(u64) }
+
+        #[verifier::tactus_auto]
+        fn use_pair(p: Pair) -> (r: u64)
+            ensures r == 0
+        {
+            match p {
+                Pair::Mk(_) => 0,
+            }
+        }
+    } => Ok(())
+}
+
+// #109 coverage: SCC + standalone datatype in the same crate.
+// `Tree`/`Forest` are mutually recursive (SCC of 2); `Pair` is
+// independent (Single). `order_datatypes` should produce two
+// groups — one Mutual, one Single — and emission should handle
+// both kinds in the same compilation unit without conflict.
+test_verify_one_file! {
+    #[test] test_exec_scc_plus_standalone_datatype verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum Tree { Leaf, Branch(Box<Forest>) }
+        enum Forest { Empty, Cons(Box<Tree>, Box<Forest>) }
+        enum Pair { Mk(u64) }
+
+        #[verifier::tactus_auto]
+        fn use_pair(p: Pair) -> (r: u64)
+            ensures r == 0
+        {
+            match p {
+                Pair::Mk(_) => 0,
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn use_tree(t: Tree) -> (r: u64)
+            ensures r == 0
+        {
+            match t {
+                Tree::Leaf => 0,
+                Tree::Branch(_) => 0,
+            }
+        }
+    } => Ok(())
+}
+
 // #109 follow-up: recursion over a member of a mutual-SCC datatype.
 // `Forest.height` post-#109 calls `Tree.height` for its Tree fields
 // (cross-type recursion in the height fn, requiring the mutual block).
