@@ -894,3 +894,101 @@ fn const_to_node_checked(c: &Constant) -> Result<ExprNode, String> {
         format!("unsupported constant: {:?}", c)
     )
 }
+
+// ── BitVec-mode rendering for assert by(bit_vector) (#111 / #130) ─────────
+//
+// `assert(P) by(bit_vector)` goals get a different lowering: each
+// fixed-width-int `Var(x : U(n))` renders as `BitVec.ofInt n x`
+// instead of just `x`. The resulting LExpr's bitwise ops resolve to
+// BitVec instances (via Lean's HXor/HAnd/HOr/HShiftLeft/etc.
+// typeclasses), and Lean tactics like `decide` and `simp [BitVec.*]`
+// can reason about the BitVec semantics.
+//
+// Outside `by(bit_vector)` contexts, u-types stay rendered as `Int`
+// (preserving omega-friendly linear-arithmetic semantics for the
+// usual exec-fn proofs). Two encodings switched contextually —
+// matches what Verus does for its bit-vector queries.
+//
+// Scope of this first cut (#130): rendering only. The "real"
+// soundness story for parameterized `BitVec.ofInt n x` terms — where
+// `bv_decide` would prefer free `BitVec n` vars — is left for a
+// follow-up. For now `simp` + `decide` close commutativity / identity
+// laws / concrete cases; richer reasoning needs the bound-hypothesis
+// bridge work (introduce `x_bv : BitVec n` with a tie-back hyp).
+
+/// Render an SST `Exp` in bit-vector mode: variables of fixed-width
+/// unsigned-int types become `BitVec.ofInt n x` wrappings, constants
+/// stay as numeric literals (Lean's `OfNat` instance coerces them to
+/// the surrounding BitVec type), and bitwise/arithmetic operators
+/// route to BitVec instances naturally.
+///
+/// Limited to the shapes a typical `assert by(bit_vector)` uses:
+/// Var, Const, BinaryOp (Eq/Ne, And/Or/Implies, bitwise ops, arith),
+/// UnaryOp (Not). More complex shapes (Calls, structs, lambdas) are
+/// rejected with a clear error — those don't usually appear inside
+/// bit-vector assertions, and routing them through BitVec encoding
+/// has its own design questions.
+pub fn sst_exp_to_bit_vector_ast(e: &Exp) -> Result<LExpr, String> {
+    bv_exp_to_node(e).map(LExpr::new)
+}
+
+fn bv_exp_to_node(e: &Exp) -> Result<ExprNode, String> {
+    use crate::expr_shared::binop_to_ast;
+    use crate::lean_ast::UnOp as LUnOp;
+    match &e.x {
+        ExpX::Var(v) => {
+            let name = crate::lean_name::LeanName::from_var_ident(v);
+            // U(n) → wrap as BitVec.ofInt n x. Other types pass
+            // through (Bool stays Bool, Int stays Int — only the
+            // u-typed vars get the coercion).
+            match &**crate::to_lean_type::peel_typ_wrappers(&e.typ) {
+                TypX::Int(IntRange::U(n)) => {
+                    Ok(ExprNode::App {
+                        head: Box::new(LExpr::var_lit("BitVec.ofInt")),
+                        args: vec![
+                            LExpr::lit_int(n.to_string()),
+                            LExpr::new(ExprNode::Var(name)),
+                        ],
+                    })
+                }
+                _ => Ok(ExprNode::Var(name)),
+            }
+        }
+        ExpX::Const(c) => const_to_node_checked(c),
+        ExpX::Binary(op, lhs, rhs) => {
+            let l = bv_exp_to_node(lhs)?;
+            let r = bv_exp_to_node(rhs)?;
+            if let Some(bop) = binop_to_ast(op) {
+                Ok(ExprNode::BinOp {
+                    op: bop,
+                    lhs: Box::new(LExpr::new(l)),
+                    rhs: Box::new(LExpr::new(r)),
+                })
+            } else {
+                Err(format!(
+                    "binary op {:?} not supported in bit_vector assert — \
+                     fall back to `assert(P) by {{ ... }}` with a custom \
+                     Lean tactic for non-bitwise/non-arithmetic operators",
+                    op
+                ))
+            }
+        }
+        ExpX::Unary(UnaryOp::Not, inner) => {
+            let i = bv_exp_to_node(inner)?;
+            Ok(ExprNode::UnOp {
+                op: LUnOp::Not,
+                arg: Box::new(LExpr::new(i)),
+            })
+        }
+        // Inside bit_vector assertions we don't see complex SST
+        // shapes (calls, ctors, lambdas) — Verus typically rejects
+        // those upstream. If one shows up, return a clear error
+        // pointing the user at a workaround.
+        _ => Err(format!(
+            "expression shape {:?} not yet supported inside `by(bit_vector)` — \
+             use `assert(P) by {{ ... }}` with a custom Lean tactic for \
+             non-trivial shapes (#130)",
+            std::mem::discriminant(&e.x)
+        )),
+    }
+}

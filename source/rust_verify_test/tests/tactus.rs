@@ -4503,6 +4503,34 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #130: BitVec-mode rendering for variable-parameterized
+// bit-vector identities. Pre-#130 the goal `(x : Int) ^^^ y == y ^^^ x`
+// was unprovable by Tactus's tactic ladder (Int.xor doesn't have a
+// `simp`-tagged commutativity lemma in the form the ladder expects).
+// Post-#130 we render `x : u32` as `BitVec.ofInt 32 x`, the goal
+// becomes `BitVec.xor` which IS `@[simp]` commutative — `simp_all`
+// closes it.
+test_verify_one_file! {
+    #[test] test_exec_assert_bit_vector_xor_comm verus_code! {
+        #[verifier::tactus_auto]
+        fn xor_comm(x: u32, y: u32) {
+            assert(x ^ y == y ^ x) by(bit_vector);
+        }
+    } => Ok(())
+}
+
+// #130: identity laws — `x ^ 0 == x` and `x ^ x == 0`. Both
+// close via Mathlib's `BitVec.xor_zero` / `BitVec.xor_self` simp
+// lemmas in BitVec mode. Pre-#130 these would have failed.
+test_verify_one_file! {
+    #[test] test_exec_assert_bit_vector_xor_self verus_code! {
+        #[verifier::tactus_auto]
+        fn xor_self(x: u8) {
+            assert(x ^ x == 0u8) by(bit_vector);
+        }
+    } => Ok(())
+}
+
 // #111 negative: a clearly-false bit_vector assertion fails — the
 // tactic chain gives up and `tactus_bit_vector`'s explicit `fail`
 // fires. Confirms the routing actually verifies (rather than

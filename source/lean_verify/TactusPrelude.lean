@@ -3,6 +3,25 @@ import Lean
 set_option linter.unusedVariables false
 set_option maxHeartbeats 800000
 
+-- Tactus renders Verus's u8/u16/u32/u64/u128 as `Int` (with a
+-- separate `0 ≤ x ∧ x < 2^n` bound hypothesis). The arithmetic
+-- ops on Int have natural typeclass instances; the bitwise ops
+-- (`^^^`, `&&&`, `|||`, `>>>`, `<<<`) do NOT — Lean doesn't have
+-- `HXor Int Int Int` etc. by default.
+--
+-- For files that use `assert(P) by(bit_vector)` (#111), Verus's
+-- ast_to_sst pre-inserts a `StmX::Assume(ens)` before the
+-- `StmX::AssertBitVector` — and `ens` is rendered in Int mode
+-- by the surrounding pipeline, so it contains `x ^^^ y` for
+-- Int operands. Without `HXor Int Int Int` etc., the post-assert
+-- continuation theorems fail to typecheck.
+--
+-- The instances are emitted **conditionally** by `generate.rs`
+-- only for files that contain a `Wp::AssertBitVector`. Other
+-- generated files don't need them (existing tests use bitwise
+-- ops only in spec mode where they're unreachable from theorems
+-- today).
+
 -- Classical logic: Tactus specs are Prop-valued (mirroring Verus's
 -- spec-mode semantics), and exec fn WP goals embed them inside `if
 -- <Prop> then … else …` expressions. The `if/ite` elaborator requires
@@ -125,32 +144,33 @@ macro "tactus_usize_bound" : tactic => `(tactic|
     (subst h; simp only [usize_hi, isize_hi]; first | decide | omega))
 
 -- `tactus_bit_vector`: closer for `assert(…) by(bit_vector)` goals
--- (#111). Verus's `by(bit_vector)` syntax routes to a dedicated
--- bit-vector decision procedure; in Tactus we emit a chain of
--- Lean tactics that handle bit-vector reasoning.
+-- (#111 / #130). The goal is rendered in BitVec mode — u-typed
+-- variables get wrapped as `BitVec.ofInt n x`, and bitwise/
+-- arithmetic ops resolve to BitVec instances. Lean's BitVec
+-- tactics then handle the reasoning.
 --
--- The chain is best-effort because Tactus's u-types render as
--- `Int` (not `BitVec`) — so Lean's full SAT-backed `bv_decide`
--- doesn't apply directly. The current ladder:
+-- Ladder:
+-- 1. `intros` — strip any `req → ens` implication.
+-- 2. `decide` — closes concrete cases like `(5 ^^^ 3 : BitVec 8) = 6`.
+-- 3. `simp_all` with BitVec lemmas — handles commutativity,
+--    associativity, identity (`x ^^^ 0 = x`), x ^^^ x = 0, etc.
+--    Mathlib's `Mathlib.Data.BitVec` has the relevant lemmas
+--    tagged `@[simp]` so plain `simp_all` picks them up.
+-- 4. `fail` with a workaround hint.
 --
--- 1. `intros` — strips any `req → ens` implication so the inner
---    propositional goal is exposed.
--- 2. `decide` — closes goals over concrete bit-widths and
---    decidable propositions (the most common simple cases).
--- 3. `simp_all <;> omega` — handles linear arithmetic mixed
---    with simp-reducible bitwise ops.
--- 4. `fail` — explicit failure with a message so users know to
---    fall back to `assert(P) by { ... }` with their own tactic.
---
--- Users who want richer bit-vector reasoning (e.g., proper
--- BitVec encoding via `bv_decide`) can override per-fn via
--- `#[verifier::tactus_tactic("…")]`.
+-- Future (#130 follow-up): introduce fresh `BitVec n` witnesses
+-- with bound-hypothesis bridges so `bv_decide` (full SAT-backed
+-- decision procedure) becomes viable for parameterized terms.
+-- Today's ladder handles algebraic identities cleanly via simp;
+-- richer reasoning needs the bridge.
 macro "tactus_bit_vector" : tactic => `(tactic|
   first
     | (intros <;> decide)
     | decide
-    | (intros <;> simp_all <;> omega)
-    | (simp_all <;> omega)
+    | (intros <;> simp_all [BitVec.xor_comm, BitVec.and_comm, BitVec.or_comm])
+    | simp_all [BitVec.xor_comm, BitVec.and_comm, BitVec.or_comm]
+    | (intros <;> simp_all)
+    | simp_all
     | fail "tactus_bit_vector: could not discharge — try \
        `assert(P) by { … }` with a Lean tactic instead")
 

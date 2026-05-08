@@ -19,6 +19,35 @@ use crate::sst_to_lean;
 use crate::to_lean_fn::{self, LeanSourceMap};
 use crate::to_lean_type::{lean_name, sanitize, short_name};
 
+// ── BitVec-mode Int instances (#130) ───────────────────────────────────
+//
+// Lean has no `HXor Int Int Int` etc. by default. Tactus needs them
+// only for files that use `assert(P) by(bit_vector)` — Verus's
+// ast_to_sst pre-injects an Int-mode `Assume(ens)` before each
+// AssertBitVector, and the post-assert continuation theorems contain
+// `x ^^^ y` (bitwise xor) for `x, y : Int`. Without these instances,
+// those theorems fail to typecheck.
+//
+// Defined here (not in TactusPrelude) so other generated files don't
+// inherit the wonky-for-negative-Int semantics. Emitted as a single
+// `Command::Raw` block, conditionally per-file based on
+// `ExecFnTheorems::needs_bitvec_instances`.
+//
+// For ACTUAL bitwise reasoning, use `assert(P) by(bit_vector)` —
+// Tactus renders the goal in BitVec mode where `^^^` etc. resolve
+// to BitVec instances with proper bit-vector semantics.
+const BITVEC_INT_INSTANCES: &str = "\
+-- HXor/HAnd/HOr/HShiftLeft/HShiftRight Int instances (#130).
+-- Conditionally emitted for files using `by(bit_vector)`.
+-- Mathlib.Data.BitVec is imported conditionally above (in the
+-- preamble's import section) so it's available here.
+instance : HXor Int Int Int := ⟨fun a b => ((a.toNat ^^^ b.toNat : Nat) : Int)⟩
+instance : HAnd Int Int Int := ⟨fun a b => ((a.toNat &&& b.toNat : Nat) : Int)⟩
+instance : HOr Int Int Int := ⟨fun a b => ((a.toNat ||| b.toNat : Nat) : Int)⟩
+instance : HShiftLeft Int Int Int := ⟨fun a b => ((a.toNat <<< b.toNat : Nat) : Int)⟩
+instance : HShiftRight Int Int Int := ⟨fun a b => ((a.toNat >>> b.toNat : Nat) : Int)⟩
+";
+
 // ── Artifact location ──────────────────────────────────────────────────
 
 /// Where to write generated Lean artifacts.
@@ -80,12 +109,25 @@ fn krate_preamble(
     // and emitting accessors for types with non-Inhabited fields
     // breaks Lean elaboration even when unused.
     emit_accessors: bool,
+    // `true` only for files that use `assert(P) by(bit_vector)`
+    // (#130). Adds `import Mathlib.Data.BitVec` and the
+    // `HXor`/`HAnd`/`HOr`/`HShiftLeft`/`HShiftRight` Int instances.
+    // Kept out of the default prelude so non-bit_vector files
+    // don't pay the cost (Mathlib.Data.BitVec's simp lemmas can
+    // change closing behavior of unrelated proof fns).
+    bitvec_mode: bool,
 ) -> (Vec<Command>, String) {
     let mut cmds: Vec<Command> = Vec::new();
     for imp in imports {
         cmds.push(Command::Import(imp.clone()));
     }
+    if bitvec_mode {
+        cmds.push(Command::Import("Mathlib.Data.BitVec".to_string()));
+    }
     cmds.push(Command::Raw(TACTUS_PRELUDE.to_string()));
+    if bitvec_mode {
+        cmds.push(Command::Raw(BITVEC_INT_INSTANCES.to_string()));
+    }
 
     let ns = sanitize(crate_name);
     cmds.push(Command::NamespaceOpen(ns.clone()));
@@ -180,7 +222,7 @@ pub fn check_proof_fn(
     // preserve match through to VIR-AST), so accessor fns are
     // unnecessary and would fail elaboration for enum types whose
     // field types lack Inhabited.
-    let (mut cmds, ns) = krate_preamble(krate, imports, crate_name, &[proof_fn], false);
+    let (mut cmds, ns) = krate_preamble(krate, imports, crate_name, &[proof_fn], false, false);
     cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body)));
     cmds.push(Command::NamespaceClose(ns));
 
@@ -249,8 +291,8 @@ pub fn check_exec_fn(
         ))
         .collect();
 
-    let theorems = match sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check) {
-        Ok(ts) => ts,
+    let exec_fn = match sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check) {
+        Ok(r) => r,
         Err(reason) => return CheckResult::Failed {
             error: format!(
                 "tactus_auto: {} (first slice supports only straight-line exec fns)",
@@ -263,8 +305,11 @@ pub fn check_exec_fn(
     // Exec fns lower matches to if-chains over `IsVariant` and
     // `Field`, which the SST renderer routes to the synthesised
     // accessor fns — so the preamble must include them.
-    let (mut cmds, ns) = krate_preamble(krate, imports, crate_name, &[vir_fn], true);
-    for theorem in theorems {
+    let (mut cmds, ns) = krate_preamble(
+        krate, imports, crate_name, &[vir_fn], true, exec_fn.needs_bitvec_instances,
+    );
+
+    for theorem in exec_fn.theorems {
         cmds.push(Command::Theorem(theorem));
     }
     cmds.push(Command::NamespaceClose(ns));

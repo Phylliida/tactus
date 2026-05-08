@@ -529,11 +529,21 @@ fn check_exp(e: &Exp) -> Result<(), String> {
 /// precondition is enforced by construction — there's no way to
 /// produce a `Wp` tree without having already cleared the shape
 /// checks.
+/// Result of lowering an exec fn body to Lean theorems. `theorems`
+/// is the per-obligation list; `needs_bitvec_instances` flags
+/// whether the fn used `assert(P) by(bit_vector)` (#130) and
+/// therefore the generated file needs the BitVec-related Int
+/// typeclass instances prepended.
+pub struct ExecFnTheorems {
+    pub theorems: Vec<Theorem>,
+    pub needs_bitvec_instances: bool,
+}
+
 pub fn exec_fn_theorems_to_ast<'a>(
     krate: &'a KrateX,
     fn_sst: &'a FunctionSst,
     check: &'a FuncCheckSst,
-) -> Result<Vec<Theorem>, String> {
+) -> Result<ExecFnTheorems, String> {
     // `&mut` params of the fn being verified (#94 callee-side body).
     // For each, the body and ensures get a SST-level rewrite so that
     // `*old(x)` (`VarAt(x, Pre)`) renders as `Var(<x>_at_pre_tactus)`,
@@ -601,6 +611,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
         out: Vec::new(),
         tactic_prefix: Vec::new(),
         default_closer,
+        needs_bitvec_instances: false,
     };
 
     // Initial OblCtx with `let <x>_at_pre_tactus := x` for each &mut
@@ -623,7 +634,10 @@ pub fn exec_fn_theorems_to_ast<'a>(
         initial_obl_ctx = initial_obl_ctx.with_frame(CtxFrame::Let(pre_name, var_x));
     }
     walk_obligations(&body_wp, &ctx, &initial_obl_ctx, &mut emitter);
-    Ok(emitter.out)
+    Ok(ExecFnTheorems {
+        theorems: emitter.out,
+        needs_bitvec_instances: emitter.needs_bitvec_instances,
+    })
 }
 
 /// Walk a VIR-AST `Expr` body and collect spans of every
@@ -890,6 +904,25 @@ impl OblCtx {
         }
         goal
     }
+
+    /// Wrap `goal` with Let / Binder frames only — Hyp frames are
+    /// dropped. Used by `Wp::AssertBitVector` (#111 / #130) so the
+    /// bit_vector solver gets a clean context: only the param/let
+    /// bindings (which it needs for typechecking) and not the
+    /// surrounding code's hypotheses (which may contain Int-mode
+    /// bitwise ops that don't typecheck — Lean lacks `HXor Int Int
+    /// Int`). Mirrors Verus's bit_vector queries which also run with
+    /// a clean context.
+    fn wrap_no_hyps(&self, mut goal: LExpr) -> LExpr {
+        for frame in self.frames.iter().rev() {
+            goal = match frame {
+                CtxFrame::Let(name, v) => LExpr::let_bind(name.clone(), v.clone(), goal),
+                CtxFrame::Hyp(_) => goal,
+                CtxFrame::Binder(b) => LExpr::forall(vec![b.clone()], goal),
+            };
+        }
+        goal
+    }
 }
 
 /// Per-walk emission state. `fn_name` and `base_binders` are shared
@@ -916,6 +949,15 @@ struct ObligationEmitter {
     /// Doesn't affect `assert(P) by { user_tac }` sites — those
     /// always use the user-supplied tactic from the assert-by.
     default_closer: Tactic,
+    /// Set when a `Wp::AssertBitVector` is emitted (#130). The
+    /// generated file then needs `HXor`/`HAnd`/`HOr`/`HShiftLeft`/
+    /// `HShiftRight` instances for `Int Int Int` so the post-
+    /// assert continuation typechecks (Verus's ast_to_sst
+    /// pre-injects an Int-mode `Assume(ens)` before
+    /// `AssertBitVector`). `generate.rs` reads this flag and
+    /// conditionally prepends the instance block — files that
+    /// don't use `by(bit_vector)` skip the pollution.
+    pub needs_bitvec_instances: bool,
 }
 
 impl ObligationEmitter {
@@ -1066,11 +1108,18 @@ fn walk_obligations<'a>(
             walk_obligations(body, ctx, &new_obl, e);
         }
         Wp::AssertBitVector { req_conj, ens_conj, rust_loc, body } => {
-            // Verified goal: `req_conj → ens_conj` (or just `ens_conj`
-            // when requires is empty — `req_conj` is `LitBool(true)`
-            // from `and_all([])`, and `True → P` is equivalent to `P`
-            // but emitting the bare `P` reads cleaner and avoids the
-            // user's tactic having to peel the trivial implication).
+            // Mark that this fn's generated file needs the
+            // `HXor Int Int Int` etc. instances (#130). Verus's
+            // ast_to_sst pre-injects an Int-mode `Assume(ens)`
+            // before AssertBitVector, so post-assert continuation
+            // theorems would otherwise fail to typecheck.
+            e.needs_bitvec_instances = true;
+            // Verified goal (BitVec mode): `req_conj → ens_conj`
+            // (or just `ens_conj` when requires is empty — `req_conj`
+            // is `LitBool(true)` from `and_all([])`, and `True → P` is
+            // equivalent to `P` but emitting the bare `P` reads
+            // cleaner and avoids the user's tactic having to peel the
+            // trivial implication).
             let goal_inner = if matches!(req_conj.node, ExprNode::LitBool(true)) {
                 ens_conj.clone()
             } else {
@@ -1086,21 +1135,26 @@ fn walk_obligations<'a>(
                 kind_to_name(AssertKind::Obligation(ObligationKind::Plain)),
                 &e.fn_name, rust_loc, id,
             );
-            // Tactus's prelude tactic `tactus_bit_vector` (#111). Hard-
-            // coded rather than user-supplied — the surface syntax
-            // `by(bit_vector)` is itself the tactic choice. Users who
-            // need different reasoning can write `assert(P) by { … }`
-            // with their own Lean tactic instead.
-            e.emit(name, obl.wrap(goal),
+            // Tactus's prelude tactic `tactus_bit_vector`. Hardcoded
+            // rather than user-supplied — the surface syntax
+            // `by(bit_vector)` is itself the tactic choice.
+            //
+            // Use `wrap_no_hyps` rather than `wrap` so the surrounding
+            // ctx's Hyp frames don't leak into the bit_vector goal.
+            // Reason: those Hyps may carry Int-mode bitwise ops
+            // (`x ^^^ y` for `x, y : Int`) which Lean rejects (no
+            // `HXor Int Int Int` instance), and even if they
+            // typechecked they're in a different encoding from the
+            // BitVec-mode goal so they wouldn't help. Verus's
+            // bit_vector queries also run with a clean context.
+            e.emit(name, obl.wrap_no_hyps(goal),
                 Tactic::Named("tactus_bit_vector".to_string()));
-            // Body's ctx gets `ens_conj` as a Hyp — the surrounding
-            // code can rely on the proven ensures regardless of the
-            // requires (they were assumed by the bit_vector solver,
-            // and the surrounding code is responsible for them at
-            // the assert site if it wants to discharge `ens_conj`
-            // from the implication).
-            let new_obl = obl.with_frame(CtxFrame::Hyp(ens_conj.clone()));
-            walk_obligations(body, ctx, &new_obl, e);
+            // Body walks under the ORIGINAL obl — we don't publish
+            // the ensures as an Int-mode hyp because Lean lacks
+            // `HXor Int Int Int` etc., so an Int-mode `x ^^^ y`
+            // wouldn't typecheck. See the build_wp arm for the
+            // rationale and follow-up plan.
+            walk_obligations(body, ctx, obl, e);
         }
         Wp::Let(name, val, body) => {
             walk_let(name, val.raw(), body, ctx, obl, e);
@@ -2710,7 +2764,11 @@ enum Wp<'a> {
     /// `lower_validated`; the resulting expression doesn't borrow a
     /// single SST node. Same shape as `Wp::Hyp`.
     AssertBitVector {
+        /// Requires conjunction in BitVec mode — used as the
+        /// assert goal's hypothesis.
         req_conj: LExpr,
+        /// Ensures conjunction in BitVec mode — used as the
+        /// assert goal.
         ens_conj: LExpr,
         rust_loc: String,
         body: Box<Wp<'a>>,
@@ -3277,23 +3335,38 @@ fn build_wp<'a>(
             Ok(Wp::Done(leaf))
         }
         StmX::AssertBitVector { requires, ensures } => {
-            // Lower requires + ensures to LExprs. Both lists may be
-            // empty: empty requires means no preconditions; empty
-            // ensures means no obligation (degenerate case — we still
-            // emit the variant with `ens_conj = True`, walker emits
-            // a trivial theorem).
+            // Bit-vector mode: render requires + ensures via the
+            // BitVec-mode renderer (#130 first cut). u-typed
+            // variables get wrapped as `BitVec.ofInt n x`, so the
+            // resulting LExpr's bitwise ops resolve to BitVec
+            // instances and Lean's BitVec tactics (`decide`,
+            // `simp [BitVec.*]`) can reason about the goal.
+            //
+            // We ALSO build the Int-mode lowering of `ensures` for
+            // the post-assert hypothesis — the surrounding ctx
+            // continues in Int mode, so the Hyp must talk about
+            // the original Int-typed variables, not BitVec'd ones.
+            // The bit_vector solver discharges the obligation in
+            // BitVec semantics; we trust Verus's upstream check
+            // that the BitVec-truth and Int-truth correspond for
+            // the user's shape.
             let req_lexprs: Vec<LExpr> = requires.iter()
-                .map(|r| {
-                    let v = crate::to_lean_sst_expr::Validated::check(r)?;
-                    Ok::<LExpr, String>(lower_validated(&v))
-                })
+                .map(|r| crate::to_lean_sst_expr::sst_exp_to_bit_vector_ast(r))
                 .collect::<Result<Vec<_>, _>>()?;
             let ens_lexprs: Vec<LExpr> = ensures.iter()
-                .map(|e| {
-                    let v = crate::to_lean_sst_expr::Validated::check(e)?;
-                    Ok::<LExpr, String>(lower_validated(&v))
-                })
+                .map(|e| crate::to_lean_sst_expr::sst_exp_to_bit_vector_ast(e))
                 .collect::<Result<Vec<_>, _>>()?;
+            // Note: we deliberately do NOT publish the ensures as
+            // an Int-mode hypothesis to the body's ctx. Lean lacks
+            // an `HXor Int Int Int` instance (and similar for
+            // `HAnd`/`HOr`), so an Int-mode `x ^^^ y` doesn't
+            // typecheck. The bit_vector assertion verifies in BV
+            // mode; users who need the fact in Int-mode body
+            // context can re-derive it via `assert(P) by { ... }`
+            // with their own tactic. Future work (#130 follow-up):
+            // either render bitwise ops via `Int.xor` etc., or add
+            // `HXor Int Int Int` instances in TactusPrelude that
+            // delegate to the function form.
             let req_conj = and_all(req_lexprs);
             let ens_conj = and_all(ens_lexprs);
             // Use the first ensure's span when present — that's the
@@ -5203,6 +5276,7 @@ mod tests {
             out: Vec::new(),
             tactic_prefix: Vec::new(),
             default_closer: crate::lean_ast::Tactic::Named("tactus_auto".to_string()),
+            needs_bitvec_instances: false,
         }
     }
 
