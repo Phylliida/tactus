@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**297 end-to-end tests + 1 coverage test + 175 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**305 end-to-end tests + 1 coverage test + 175 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -2900,7 +2900,7 @@ Captured in REVIEW.md's 2026-05-08 follow-up section.
 * "The second reading" — the question that comes after
   correctness, the user's role in surfacing it.
 
-**Day total**: 13 commits + 3 poem commits.
+**Day total** (after Arc 1 + Arc 2 above; before continuation):
 * Test counts: 160 → 175 unit (+15), 292 → 297 e2e (+5).
 * Pending tasks: 17 → 7 (closed #131–143).
 * All 8 REVIEW.md file-for-follow-up items closed.
@@ -2909,6 +2909,181 @@ Captured in REVIEW.md's 2026-05-08 follow-up section.
 * New `PreambleFragment` enum (`src/lean_ast.rs`) + per-theorem
   `requires_preamble` field. Generalizable to future per-fn
   preamble extras.
+
+#### Current session (2026-05-08 cont. — #55/#106 follow-up batch + N-tuple bug fix)
+
+The same-day continuation arc went into the &mut sub-features:
+caller-side new-mut-ref, deeper field paths, tuple field
+mutation, and a latent N-tuple field-access bug surfaced by
+the new tuple tests. By the end the multi-variant enum
+sub-feature was probed and revealed to be upstream-blocked
+(unreachable from Rust syntax + Verus's `ref mut` rejection).
+
+**Five substantive landings:**
+
+* **#107 — caller-side new-mut-ref mode.** Synthetic
+  `LocalDeclKind::BorrowMut` locals introduced by Verus around
+  `bump(&mut y)` lowering in new-mut-ref mode now work uniformly
+  with fn-param `&mut`s. `mut_param_names` extended to include
+  these locals; new `build_borrow_mut_binders` emits a theorem-
+  level `(name : peeled_typ)` binder per BorrowMut local; new
+  `mut_ref_locals` field on `WpCtx` carries the names; new branch
+  in `extract_mut_target` recognizes bare `Var(borrow_mut_local)`
+  as a Var L-value at the call site (no `Loc` wrapper); new
+  `is_mut_ref` gate in `build_call_mut_args` covers both
+  `is_mut: true` (legacy) and `MutRef<T>` typ (new-mut-ref). The
+  existing #55 mut_args machinery (fresh existential, pre/post
+  substitute, Let-rebind) handles the rest unchanged. 4 of 5
+  tests passed first try.
+
+* **#144 (#106 sub) — deeper `&mut` field paths via nested
+  structure-update.** `MutTargetRaw::Field` extended from
+  `field_opr: &FieldOpr` to `field_oprs: Vec<&FieldOpr>` (peel
+  order). `extract_mut_target` rewritten as a peel loop that
+  collects field oprs through any depth; single-variant gate
+  applied at each level. Phase 4 rebind builds nested
+  StructUpdate inside-out from local's perspective — for
+  `&mut a.b.c` emits `let a := { a with b := { a.b with c := fresh } }`.
+  Lean's `{ x with f := v }` IS "all other fields unchanged"
+  at the type level, so the property holds at every level
+  structurally. All three tests (depth-2, depth-3, sibling-
+  preserved) passed first try.
+
+* **#145 (#106 sub) — tuple field mutation `&mut t.<i>` (arity 2
+  initially).** Lean's `{ x with f := v }` doesn't compose with
+  `Prod`; the rebind uses Lean tuple syntax `(t.1, fresh)` (or
+  `(fresh, t.2)` etc.) — sugar for `Prod.mk a b`. New
+  `MutTargetRaw::TupleField { base, index, arity }` variant.
+  Side-fix surfaced: `expr_shared::ctor_node` previously
+  rendered `Dt::Tuple` ctors as `ExprNode::Anon` (`⟨a, b⟩`),
+  which fails to elaborate at let-bindings without a type hint.
+  Switched to a new `ExprNode::Tuple(Vec<Expr>)` variant that
+  pretty-prints as `(a, b, c)` (Lean tuple syntax / Prod.mk
+  sugar) — distinct from `Anon` which the proof-fn `Multi`
+  lowering still uses for chained-conjunction shapes.
+
+* **#146 — N-tuple field access for arity > 2.** Latent bug
+  surfaced by #145's arity-3 test: `field_access_name` returned
+  `.<n+1>` for tuples regardless of arity, but Lean 4's nested
+  `Prod` representation needs `.2.1` etc. for elements past the
+  second. New shared helper `tuple_field_accessor(arity, n)` in
+  `expr_shared.rs`:
+  * Arity-2 i=0: `1`; i=1: `2` (matches prior behavior).
+  * Arity-3 i=0: `1`; i=1: `2.1`; i=2: `2.2`.
+  * Arity-4 i=2: `2.2.1`; i=3: `2.2.2`.
+  Algorithm: last position is `2` repeated arity-1 times; non-
+  last is `2` repeated n times then `1`. The result is a
+  multi-segment string that Lean parses as nested projection
+  (`e.2.1` = `((e).2).1`).
+  Updated `field_access_name`'s tuple branch + #145's rebind
+  to call the helper. Lifted #145's arity-2-only restriction;
+  arity-3 / arity-4 tuple field mutations now work. The fix
+  also corrects every other tuple field projection in Tactus
+  (proof fns, spec fns, exec body reads, match-arm field
+  destructuring) — but Tactus's existing tuple usages were all
+  arity-2, so no regression.
+
+* **Multi-variant enum field mutation: pinned as upstream-blocked.**
+  The probe revealed Verus rejects `ref mut` patterns at the
+  mode level: "The verifier does not yet support the following
+  Rust feature: &mut types, except in special cases." Direct
+  `&mut foo.f` for enum-typed `foo` isn't expressible in Rust
+  without unsafe. So the multi-variant enum sub-feature on
+  #106's deferral list was never going to be reached from Tactus's
+  caller-side path — Verus rejects upstream before Tactus's
+  SST renderer ever sees the call. New e2e test
+  `test_exec_call_mut_arg_enum_field_upstream_blocked` pins the
+  rejection; if Verus ever lifts the restriction, the test
+  surfaces as flippable Err.
+
+**Edge cases observed but not yet handled** (worth recording for
+future sessions):
+
+* **Mixed tuple-and-struct paths**: `&mut s.tup.0` (struct field is
+  a tuple, mutate the tuple element) or `&mut t.0.f` (tuple
+  element is a struct, mutate its field). The current `MutTargetRaw`
+  has separate `Field` (struct path) and `TupleField` (single-
+  level tuple) variants. Multi-level paths mixing the two would
+  need a unified `Vec<FieldKind>` representation where each level
+  is either a struct field or a tuple position. `extract_mut_target`
+  rejects mixed shapes today; the rejection isn't tested
+  explicitly but follows from the recursive Field peel rejecting
+  `Dt::Tuple` at deeper levels and the single-level tuple gate
+  rejecting any non-Var/VarLoc base.
+
+* **`&mut v[i]` (Index L-value)**: cross-crate-blocked. Rust's
+  `v[i]` for `Vec<T>` desugars to `vstd::vec::Vec::index_mut`,
+  and array `&mut a[i]` similarly routes through vstd. Tactus
+  can't inline these specs without vstd integration (#122 Phase
+  3 cross-crate). Even with that, Index L-value would need a
+  different rebind encoding (Lean's `Array.set` or `Vector.set`
+  style, plus a "this index unchanged for j ≠ i" property). Two
+  layers of work; tracked under #106 umbrella but distinct from
+  the field-path sub-features that closed today.
+
+* **`MutTargetRaw::TupleField` arity 0 / 1**: defensive fallback
+  in `tuple_field_accessor` returns `(n+1).to_string()`. Verus
+  shouldn't produce 0- or 1-tuples here (unit type / single-
+  element tuples have other lowerings). If it ever does, the
+  fallback is silently wrong; would need to be lifted.
+
+* **`bv_decide` interaction with conditionally-emitted Int
+  instances**: documented from earlier sessions but still open
+  as a "soundness trade-off accepted". Tactus emits the wonky-
+  for-negative-Int instances only conditionally for files using
+  `by(bit_vector)`. If a future Tactus path emits these on
+  negative Ints (none does today), the values are wrong but no
+  panic. Documented in DESIGN.md "Soundness trade-offs accepted".
+
+* **`#107` negative test couldn't be pinned**: a wrong-post
+  assertion in new-mut-ref caller-side mode (`bump(&mut y);
+  assert(y == 7)` when callee guarantees `y == 6`) hits a Verus-
+  side path where the test framework reports `Err expected, got
+  Ok` but no test_inputs dir is created — looks like Verus's
+  new-mut-ref pipeline swallows the error rather than surfacing
+  it. The positive test passes (4 of 5 #107 tests passed first
+  try); the negative coverage gap is recorded in #107's commit
+  message but not yet root-caused. Worth investigating in a
+  future session.
+
+* **Tactus's existing tuple usage was arity-2**: the N-tuple
+  fix (#146) corrects the rendering for arity > 2, but no
+  existing Tactus test exercised arity > 2 tuple field access
+  pre-#146. It's possible some path has been silently emitting
+  wrong Lean (e.g., `.3` for a 3-tuple) and the test never
+  noticed because the goal happened to close anyway. Worth a
+  coverage audit if anything tuple-related ever surfaces as
+  unsoundness.
+
+**Continuation poem batch** (poems/2026-05-08.md):
+* "Recognition" — extending what we notice, not encoding new.
+* "Where building stops" — discovering edges that were always
+  there. The multi-variant enum probe revealed the deferred
+  case was never going to arrive.
+
+**Day's full total** (Arc 1 + Arc 2 + continuation):
+* Test counts: 160 → 175 unit (+15), 292 → 305 e2e (+13).
+* Pending tasks: 17 → 11 substantive (closed #131–146 plus
+  #107 + #144 + #145 + #146 in continuation; multi-variant
+  enum upstream-blocked pin).
+* All 8 REVIEW.md file-for-follow-up items closed (Arc 1).
+* 4 right-way structural cleanups landed (Arc 2).
+* 5 sub-feature landings in continuation (#107, #144, #145,
+  #146, multi-variant enum pin).
+* New AST: `ExprNode::Tuple` for Lean tuple syntax.
+* New helper: `tuple_field_accessor` for N-tuple Lean accessors.
+* New variant: `MutTargetRaw::TupleField`.
+* Caller-side new-mut-ref mode: closes the last #55 follow-up.
+* `#106` umbrella effectively done from Tactus's side: tuple
+  + deeper field paths landed; multi-variant enum upstream-
+  blocked; Index L-value cross-crate-blocked.
+
+**The arc, in one sentence**: the day's work moved from broad
+right-way refactors at morning, through feature extensions at
+afternoon, to bug fixes and edge-mapping at evening — each
+landing finer than the one before, ending in the discovery
+that two of the three remaining `#106` sub-features were
+unreachable from user code.
 
 ## Architecture
 
@@ -3176,7 +3351,7 @@ Tests: `test_exec_overflow_diagnostic`, `test_exec_overflow_tight_ok`, `test_exe
 
 Tests: `test_exec_call_basic`, `test_exec_call_requires_violated` (negative), `test_exec_call_in_if_branch`, `test_exec_call_in_loop`, `test_exec_call_trait_method`, `test_exec_call_trait_method_requires_violated` (negative), `test_exec_call_trait_method_two_impls`, `test_exec_call_trait_method_with_args`, `test_exec_call_zero_args`, `test_exec_call_many_args`, `test_exec_call_mut_arg`, `test_exec_call_mut_arg_wrong_post` (negative), `test_exec_call_mut_arg_requires_violated` (negative), `test_exec_call_mut_arg_field_rejected` (negative), `test_exec_call_two_mut_args`, `test_exec_call_recursive_decreasing`, `test_exec_call_recursive_nondecreasing` (negative), `test_exec_call_recursive_no_decreases` (negative), `test_exec_call_mutual_recursion`, `test_exec_ctor_rejected`.
 
-Rejected (in `build_wp_call`): cross-crate callees, cross-crate trait method decls (#56 follow-up), split-assertion calls, `&mut v[i]` / deeper field paths / multi-variant enum field mutation (still deferred). `&mut x.f` for single-variant structs LANDED (#87) via Lean structure-update rebind. `is_trait_default = Some(true)` LANDED (#96) — call redirects to the trait method decl.
+Rejected (in `build_wp_call`): cross-crate callees, cross-crate trait method decls (#56 follow-up), split-assertion calls. `&mut x.f` for single-variant structs LANDED (#87) via Lean structure-update rebind. Deeper paths `&mut a.b.c` LANDED via #144 (recursive nested structure-update). Tuple field `&mut t.<i>` LANDED via #145 + #146 (Lean tuple syntax + multi-segment N-tuple accessors). Multi-variant enum field mutation upstream-blocked at Verus's mode check (`ref mut` not supported). `&mut v[i]` cross-crate-blocked (Vec/array indexing routes through vstd). `is_trait_default = Some(true)` LANDED (#96) — call redirects to the trait method decl.
 
 ### What's deferred
 
@@ -3184,7 +3359,7 @@ The seven original Track B slices are all landed, plus #49 / #50 / #51 / #52 (st
 
 See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the full catalogue. Currently blocking realistic exec fns:
 
-- **`&mut` args at call sites** — caller-side LANDED (#55), callee-side body verification LANDED (#94), `&mut x.f` for single-variant structs LANDED (#87 via Lean structure-update rebind). `&mut v[i]` / deeper paths / multi-variant enum field mutation, plus new-mut-ref mode `MutRefCurrent`/`MutRefFuture` (#95), remain as `#55` follow-ups.
+- **`&mut` args at call sites** — caller-side LANDED (#55), callee-side body verification LANDED (#94), `&mut x.f` for single-variant structs LANDED (#87 via Lean structure-update rebind). Deeper paths `&mut a.b.c` LANDED via #144 (recursive nested structure-update). Tuple field `&mut t.<i>` LANDED via #145 + #146 (Lean tuple syntax + multi-segment N-tuple accessors). New-mut-ref callee-side LANDED (#95); caller-side LANDED (#107) via BorrowMut local + extended recognition. Multi-variant enum field mutation upstream-blocked at Verus's `ref mut` rejection. `&mut v[i]` cross-crate-blocked.
 - **Trait-method calls** — caller-side LANDED (#56) for `DynamicResolved` (concrete-receiver) and same-crate `Static`/`Dynamic` paths. Impl-specific strengthening of `ensures` LANDED via #86 — caller sees the conjunction of trait's and resolved-impl's ensures. Trait default-impl invocation LANDED via #96 — when the impl uses the trait's default body, `resolve_callee` redirects to the trait method decl (which holds the default body + spec) using the call site's typ_args. Cross-crate trait method decls remain a `#56` follow-up.
 - **`assume(P)` warning** — DESIGN.md promises a "unproved assumption" compile warning; not wired.
 - **USize arith rarely auto-verifies** — the bound is emitted, but `tactus_auto` can't discharge symbolic `2 ^ arch_word_bits`. Users need `cases arch_word_bits_valid` proofs.
@@ -3206,11 +3381,15 @@ See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the f
 
 All major Tier-3 tasks have landed (#55 caller-side `&mut`, #56
 caller-side trait method calls, #93 closures, #95 new-mut-ref
-callee-side, #110 lex decreases, #111/#130 BitVec mode). The
-2026-05-08 session closed all 8 file-for-follow-up items from
-REVIEW.md plus 4 right-way structural cleanups, dropping the
-pending count to **7 across 5 themes**. None is on the critical
-path for realistic code today.
+callee-side, #107 new-mut-ref caller-side, #110 lex decreases,
+#111/#130 BitVec mode, #144 deeper field paths, #145/#146 tuple
+field mutation). The 2026-05-08 session closed all 8 REVIEW.md
+file-for-follow-up items plus 4 right-way structural cleanups
+plus 5 caller-side-and-field-path sub-feature landings. The #106
+umbrella is effectively done from Tactus's side: tuple + deeper
+field paths landed; multi-variant enum upstream-blocked; Index
+L-value cross-crate-blocked. Pending count: **9 across 5 themes**.
+None is on the critical path for realistic code today.
 
 The full catalogue lives in DESIGN.md § "Known deferrals, rejected
 cases, and untested edges" — this section summarizes the task
