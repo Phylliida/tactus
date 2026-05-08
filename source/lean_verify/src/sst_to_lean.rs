@@ -2553,13 +2553,42 @@ fn push_post_call_frames(
         let local_name = crate::lean_name::LeanName::from_var_ident(info.rebind_local());
         let new_value = match &info.target {
             MutTargetRaw::Var(_) => LExpr::var(info.fresh.clone()),
-            MutTargetRaw::Field { field_opr, .. } => LExpr::new(ExprNode::StructUpdate {
-                base: Box::new(LExpr::var(local_name.clone())),
-                updates: vec![(
-                    crate::expr_shared::field_access_name(field_opr),
-                    LExpr::var(info.fresh.clone()),
-                )],
-            }),
+            MutTargetRaw::Field { field_oprs, .. } => {
+                // Build nested structure-update from inside-out.
+                // `field_oprs` is in peel order (outermost-first =
+                // deepest-mutated-first). For `&mut a.b.c`,
+                // field_oprs = [c_opr, b_opr]. We want:
+                //   { a with b := { a.b with c := fresh } }
+                //
+                // Build the bases for each level top-down:
+                //   level 0 (outer update): base = a, field = b
+                //   level 1 (inner update): base = a.b, field = c
+                // Then wrap inside-out.
+                //
+                // Field-name path top-to-bottom (a's perspective):
+                let names_top_to_bottom: Vec<String> = field_oprs
+                    .iter()
+                    .rev()
+                    .map(|opr| crate::expr_shared::field_access_name(opr))
+                    .collect();
+                let local_expr = LExpr::var(local_name.clone());
+                let mut current = LExpr::var(info.fresh.clone());
+                // Build inside-out: at each step, wrap `current` in a
+                // StructUpdate whose base is `local.<names[..i]>` and
+                // whose field is `names[i]`.
+                for i in (0..names_top_to_bottom.len()).rev() {
+                    // Compute the base for this level: local.<names[0..i]>
+                    let mut base = local_expr.clone();
+                    for name in &names_top_to_bottom[..i] {
+                        base = LExpr::field_proj(base, name.clone());
+                    }
+                    current = LExpr::new(ExprNode::StructUpdate {
+                        base: Box::new(base),
+                        updates: vec![(names_top_to_bottom[i].clone(), current)],
+                    });
+                }
+                current
+            }
         };
         new_obl.frames.push(CtxFrame::Let(local_name, new_value));
     }
@@ -3893,29 +3922,40 @@ fn validate_call_arities(
 /// two shapes:
 ///
 /// * `Loc(VarLoc(x))` — simple `&mut x`. Variant: `Var(x)`.
-/// * `Loc(UnaryOpr(Field(field_opr), VarLoc(x)))` — depth-1 field
-///   mutation `&mut x.field` (#87). Variant: `Field { base, field_name }`
-///   where `field_name` is the Lean-renderable field name produced
-///   by `field_access_name`. Restricted to single-variant datatypes
-///   (struct-like) — see check below.
+/// * `Loc(Field(...Field(VarLoc(x))))` — field path mutation
+///   `&mut x.f1.f2.…` (#87 single-level, #144 deeper paths).
+///   Variant: `Field { base, field_oprs }` where `field_oprs` is
+///   the path from outermost-write down to innermost-base —
+///   `field_oprs[0]` is the deepest-mutated field (closest to the
+///   leaf value), `field_oprs[len-1]` is the outermost (closest to
+///   the base local). Each level must be a single-variant datatype
+///   (struct-like).
 ///
 /// Returns `None` for unsupported shapes:
 /// * `&mut v[i]` (Index L-value)
-/// * `&mut x.f.g` (depth ≥ 2)
 /// * `&mut *p` (DerefMut)
-/// * Multi-variant enum field mutation (Lean's structure update
-///   syntax doesn't compose with multi-variant inductives).
+/// * Multi-variant enum field mutation at any level (Lean's
+///   structure update syntax doesn't compose with multi-variant
+///   inductives).
+/// * Tuple field mutation (`&mut t.0`) — Lean's structure update
+///   doesn't compose with `Prod` types.
 #[derive(Clone)]
 enum MutTargetRaw<'a> {
     Var(&'a VarIdent),
-    /// `&mut <base>.<field>` for a single-variant struct. Stores
-    /// the structural references (`base` ident from the L-value's
-    /// VarLoc, `field_opr` from the Field projection) — the Lean-
-    /// rendered field name is computed at emission time via
-    /// `field_access_name(field_opr)`. Symmetric with the `Var`
-    /// variant which also stores a structural reference rather than
-    /// a pre-rendered string.
-    Field { base: &'a VarIdent, field_opr: &'a vir::ast::FieldOpr },
+    /// `&mut <base>.<f1>.<f2>.…` field path. `field_oprs` lists the
+    /// path from peel order — `field_oprs[0]` is the OUTERMOST
+    /// `Field(_, ...)` we encountered when peeling (i.e., the
+    /// deepest-mutated field, closest to the new value). For a
+    /// single-level mutation `&mut x.f`, `field_oprs` is
+    /// `vec![f_opr]`. For `&mut x.f.g`, it's `vec![g_opr, f_opr]`
+    /// (g is outermost in the SST → outermost in the peel sequence
+    /// → first in the Vec).
+    ///
+    /// `base` is the outer-most `VarIdent` (the local being rebound
+    /// at the call site). The Lean-rendered field name for each
+    /// level is computed at emission time via
+    /// `field_access_name(opr)`.
+    Field { base: &'a VarIdent, field_oprs: Vec<&'a vir::ast::FieldOpr> },
 }
 
 fn extract_mut_target<'a>(
@@ -3955,44 +3995,55 @@ fn extract_mut_target<'a>(
     // `peel_transparent` peels everything except the Loc itself
     // (which we already peeled above).
     let inner = peel_transparent(inner);
-    match &inner.x {
-        ExpX::Var(ident) | ExpX::VarLoc(ident) => Some(MutTargetRaw::Var(ident)),
-        ExpX::UnaryOpr(UnaryOpr::Field(field_opr), base_exp) => {
-            // Single-variant gate (#87 MVS). Lean's `{ x with f := v }`
-            // syntax works for `structure` types (single ctor). For
-            // multi-variant inductives a match-and-rebuild encoding
-            // would be needed — deferred.
-            let supported_kind = match &field_opr.datatype {
-                vir::ast::Dt::Path(path) => {
-                    // Single-variant struct: the variant name equals
-                    // the type's short name. Multi-variant enums fall
-                    // through to None (Lean's `{ x with f := v }`
-                    // doesn't compose with multi-variant inductives).
-                    field_opr.variant.as_str()
-                        == crate::to_lean_type::short_name(path)
+    if let ExpX::Var(ident) | ExpX::VarLoc(ident) = &inner.x {
+        return Some(MutTargetRaw::Var(ident));
+    }
+    // Peel Field levels until we hit a Var/VarLoc base. Single-variant
+    // gate per level: Lean's `{ x with f := v }` syntax works for
+    // `structure` types (single ctor); multi-variant enums and tuples
+    // fall through to None at the level they appear.
+    let mut field_oprs: Vec<&'a vir::ast::FieldOpr> = Vec::new();
+    let mut cursor: &'a Exp = inner;
+    loop {
+        match &cursor.x {
+            ExpX::Var(ident) | ExpX::VarLoc(ident) => {
+                if field_oprs.is_empty() {
+                    // Reached the base without seeing any Field —
+                    // already handled by the early return above; this
+                    // arm is unreachable when entering the loop.
+                    return Some(MutTargetRaw::Var(ident));
                 }
-                // Tuple field mutation `&mut t.0` is rejected: Lean's
-                // structure-update syntax doesn't work for `Prod`
-                // types ("expected structure" elaboration error).
-                // Encoding would need explicit ctor rebuild: `let t :=
-                // (v, t.1)` style. Tracked separately — different
-                // from the struct case.
-                vir::ast::Dt::Tuple(_) => false,
-            };
-            if !supported_kind {
-                return None;
+                return Some(MutTargetRaw::Field { base: ident, field_oprs });
             }
-            // The inner of Field(...) — peel transparent wrappers
-            // again, then require a plain VarLoc/Var (depth-1 only
-            // for MVS — `&mut x.f.g` with deeper paths is deferred).
-            let base = peel_transparent(base_exp);
-            let base_ident = match &base.x {
-                ExpX::Var(ident) | ExpX::VarLoc(ident) => ident,
-                _ => return None,
-            };
-            Some(MutTargetRaw::Field { base: base_ident, field_opr })
+            ExpX::UnaryOpr(UnaryOpr::Field(field_opr), base_exp) => {
+                let supported_kind = match &field_opr.datatype {
+                    vir::ast::Dt::Path(path) => {
+                        // Single-variant struct: the variant name
+                        // equals the type's short name. Multi-variant
+                        // enums fall through to None (Lean's
+                        // `{ x with f := v }` doesn't compose with
+                        // multi-variant inductives).
+                        field_opr.variant.as_str()
+                            == crate::to_lean_type::short_name(path)
+                    }
+                    // Tuple field mutation `&mut t.0` rejected: Lean's
+                    // structure-update syntax doesn't work for `Prod`
+                    // types ("expected structure" elaboration error).
+                    // Different encoding (explicit ctor rebuild)
+                    // required.
+                    vir::ast::Dt::Tuple(_) => false,
+                };
+                if !supported_kind {
+                    return None;
+                }
+                field_oprs.push(field_opr);
+                // Peel transparent wrappers (Box/Unbox/CoerceMode/
+                // Trigger) before the next iteration — Verus's SST
+                // sometimes inserts these around the Field's base.
+                cursor = peel_transparent(base_exp);
+            }
+            _ => return None,
         }
-        _ => None,
     }
 }
 

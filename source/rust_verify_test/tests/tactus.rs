@@ -3670,7 +3670,7 @@ test_verify_one_file! {
 // accepts depth-1 field paths; deeper paths would extend the
 // structure-update encoding recursively but aren't wired yet.
 test_verify_one_file! {
-    #[test] test_exec_call_mut_arg_field_deep_rejected verus_code! {
+    #[test] test_exec_call_mut_arg_field_deep verus_code! {
         fn bump(x: &mut u8)
             requires *old(x) < 100
             ensures *x == *old(x) + 1
@@ -3687,18 +3687,71 @@ test_verify_one_file! {
             ensures r == x + 1
         {
             let mut o = Outer { inner: Inner { val: x } };
-            bump(&mut o.inner.val);  // depth-2 — not yet supported
+            bump(&mut o.inner.val);  // depth-2 — closed via #144
             o.inner.val
         }
-    } => Err(err) => {
-        assert!(
-            err.errors.iter().any(|e|
-                e.message.contains("not a supported L-value shape")
-                || e.message.contains("&mut <local>.<field>")),
-            "expected depth-2 path rejection, got: {:?}",
-            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
-        );
-    }
+    } => Ok(())
+}
+
+// #144: depth-3 field path. Pins that the recursive structure-update
+// generalizes beyond depth-2.
+test_verify_one_file! {
+    #[test] test_exec_call_mut_arg_field_depth3 verus_code! {
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        struct L3 { v: u8 }
+        struct L2 { l3: L3 }
+        struct L1 { l2: L2 }
+
+        #[verifier::tactus_auto]
+        fn call_depth3_mut(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            let mut o = L1 { l2: L2 { l3: L3 { v: x } } };
+            bump(&mut o.l2.l3.v);  // depth-3 path
+            o.l2.l3.v
+        }
+    } => Ok(())
+}
+
+// #144: depth-2 with sibling fields preserved. Pins that the
+// nested structure-update preserves all unmodified fields at every
+// level (Lean's `{ x with f := v }` syntax does this structurally).
+test_verify_one_file! {
+    #[test] test_exec_call_mut_arg_field_deep_other_preserved verus_code! {
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        struct Inner { val: u8, tag: u8 }
+        struct Outer { inner: Inner, label: u8 }
+
+        #[verifier::tactus_auto]
+        fn call_deep_preserved(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            let mut o = Outer {
+                inner: Inner { val: x, tag: 7 },
+                label: 99,
+            };
+            bump(&mut o.inner.val);
+            // Verify other fields are preserved — both at the same
+            // level (tag) and at the outer level (label).
+            assert(o.inner.tag == 7);
+            assert(o.label == 99);
+            o.inner.val
+        }
+    } => Ok(())
 }
 
 // #86 + #55 interaction: trait method takes `&mut`, AND trait/impl
