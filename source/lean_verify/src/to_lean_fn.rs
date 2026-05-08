@@ -132,6 +132,7 @@ pub fn proof_fn_to_ast(f: &FunctionX, tactic_body: &str) -> Theorem {
         binders,
         goal,
         tactic: Tactic::Raw(tactic_body.to_string()),
+        requires_preamble: Vec::new(),
     }
 }
 

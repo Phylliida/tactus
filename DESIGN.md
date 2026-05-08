@@ -148,6 +148,16 @@ Candidates noted from prior audits but not yet promoted. Each is a runtime-check
 
 * **`format_rust_loc` returning typed `RustLoc`.** The function returns a `String` formatted as `path:line:col`. Downstream `find_span_mark` parses it back to extract the line. A typed `RustLoc { path, line, col }` struct would eliminate the parse-format roundtrip. Bounded mechanical work; the current shape is small enough that the round-trip cost isn't visible.
 
+### Potential future infrastructure
+
+Pieces of infrastructure that, if built, would simplify or unify existing code. Distinct from the typed-invariant section above — those are patterns to apply at specific sites; these are *new structure* that would replace ad-hoc compositions.
+
+* **`RewritePipeline` for SST→SST passes.** Tactus runs several SST→SST rewrite passes inside `exec_fn_theorems_to_ast` (in `sst_to_lean.rs`): `normalize_mut_ref_in_stm` (#95) maps new-mut-ref shapes back to legacy form; `rewrite_varat_for_mut_params_in_stm` (#94) renames pre-state references; `is_synthetic_assume_to_drop` filters out Verus-internal `Assume(HasResolved(...))` / closure-spec assumes during walk. They compose by being called in sequence in the orchestrator (so the order is implicit in the Rust source).
+
+  A typed pipeline — e.g., `RewritePipeline::new().drop_synthetic_assumes().normalize_mut_ref(&params).rewrite_varat(&params).run(stm)` — would make the data flow explicit, let new passes be added without touching the orchestrator, and surface ordering invariants (e.g., "normalize before rewrite") as compile errors when a new pass is inserted in the wrong place.
+
+  Current cost-benefit: borderline. The three current passes are stable and the orchestrator is one call site. The win shows up when the next rewrite lands (likely a candidate: a pass that strips synthetic `BuiltinSpecFun::ClosureReq` calls at spec position, for #124's exec-mode closure calls if that ever unblocks upstream).
+
 ### Mutual recursion (user-specified)
 
 ```rust

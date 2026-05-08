@@ -19,35 +19,6 @@ use crate::sst_to_lean;
 use crate::to_lean_fn::{self, LeanSourceMap};
 use crate::to_lean_type::{lean_name, sanitize, short_name};
 
-// ── BitVec-mode Int instances (#130) ───────────────────────────────────
-//
-// Lean has no `HXor Int Int Int` etc. by default. Tactus needs them
-// only for files that use `assert(P) by(bit_vector)` — Verus's
-// ast_to_sst pre-injects an Int-mode `Assume(ens)` before each
-// AssertBitVector, and the post-assert continuation theorems contain
-// `x ^^^ y` (bitwise xor) for `x, y : Int`. Without these instances,
-// those theorems fail to typecheck.
-//
-// Defined here (not in TactusPrelude) so other generated files don't
-// inherit the wonky-for-negative-Int semantics. Emitted as a single
-// `Command::Raw` block, conditionally per-file based on
-// `ExecFnTheorems::needs_bitvec_instances`.
-//
-// For ACTUAL bitwise reasoning, use `assert(P) by(bit_vector)` —
-// Tactus renders the goal in BitVec mode where `^^^` etc. resolve
-// to BitVec instances with proper bit-vector semantics.
-const BITVEC_INT_INSTANCES: &str = "\
--- HXor/HAnd/HOr/HShiftLeft/HShiftRight Int instances (#130).
--- Conditionally emitted for files using `by(bit_vector)`.
--- Mathlib.Data.BitVec is imported conditionally above (in the
--- preamble's import section) so it's available here.
-instance : HXor Int Int Int := ⟨fun a b => ((a.toNat ^^^ b.toNat : Nat) : Int)⟩
-instance : HAnd Int Int Int := ⟨fun a b => ((a.toNat &&& b.toNat : Nat) : Int)⟩
-instance : HOr Int Int Int := ⟨fun a b => ((a.toNat ||| b.toNat : Nat) : Int)⟩
-instance : HShiftLeft Int Int Int := ⟨fun a b => ((a.toNat <<< b.toNat : Nat) : Int)⟩
-instance : HShiftRight Int Int Int := ⟨fun a b => ((a.toNat >>> b.toNat : Nat) : Int)⟩
-";
-
 // ── Artifact location ──────────────────────────────────────────────────
 
 /// Where to write generated Lean artifacts.
@@ -88,45 +59,29 @@ fn write_lean_file(path: &Path, source: &str) -> Result<(), String> {
 // ── Preamble builder ───────────────────────────────────────────────────
 
 /// Codegen mode for `krate_preamble` — distinguishes the two entry
-/// points (proof fns vs exec fns) and, for exec fns, whether the
-/// file uses `assert(P) by(bit_vector)`.
+/// points (proof fns vs exec fns). Determines whether to emit
+/// per-variant accessor fns for multi-variant inductives.
 ///
-/// Replaces a pair of correlated `bool` parameters whose valid
-/// combinations were `(false, false)` for proof fns and
-/// `(true, _)` for exec fns. The enum makes the correlation
-/// structural — there's no `(false, true)` to worry about, and
-/// each call site says what it is rather than encoding it as
-/// positional bools.
+/// Bitvec / future per-fn preamble extras come through the
+/// `theorems` parameter's `requires_preamble` (see right-way #4),
+/// not through this enum. The enum is purely about the proof-fn
+/// vs exec-fn structural distinction.
 enum PreambleConfig {
-    /// Proof fns: native match rendering (no accessor fns), no
-    /// bitvec instance emission. Emitting accessors for types
-    /// with non-Inhabited fields breaks Lean elaboration even
-    /// when unused, so the proof-fn path keeps them off.
+    /// Proof fns: native match rendering (no accessor fns).
+    /// Emitting accessors for types with non-Inhabited fields
+    /// breaks Lean elaboration even when unused, so the proof-fn
+    /// path keeps them off.
     ProofFn,
     /// Exec fns: emit accessor fns for desugared match (via
-    /// `IsVariant` / `Field`). `needs_bitvec` is `true` when
-    /// the fn used `assert(P) by(bit_vector)` (#130) — adds
-    /// `import Mathlib.Data.BitVec` and the
-    /// `HXor`/`HAnd`/`HOr`/`HShiftLeft`/`HShiftRight Int Int Int`
-    /// instances. Kept out of the default prelude so non-bitvec
-    /// files don't pay the cost (Mathlib.Data.BitVec's simp
-    /// lemmas can change closing behavior of unrelated proof
-    /// fns).
-    ExecFn { needs_bitvec: bool },
+    /// `IsVariant` / `Field`).
+    ExecFn,
 }
 
 impl PreambleConfig {
     /// Whether the preamble should emit per-variant accessor fns
     /// for multi-variant inductives.
     fn emit_accessors(&self) -> bool {
-        matches!(self, PreambleConfig::ExecFn { .. })
-    }
-
-    /// Whether the preamble should include `Mathlib.Data.BitVec` /
-    /// `Lean.Elab.Tactic.BVDecide` imports plus the Int-bitwise
-    /// instance block.
-    fn bitvec_mode(&self) -> bool {
-        matches!(self, PreambleConfig::ExecFn { needs_bitvec: true })
+        matches!(self, PreambleConfig::ExecFn)
     }
 }
 
@@ -134,6 +89,13 @@ impl PreambleConfig {
 /// declarations transitively referenced by `root_fns`. Returns a (preamble
 /// Vec, namespace) pair. Callers append the theorem command and the matching
 /// `end <ns>` command.
+///
+/// Per-fn preamble fragments (e.g., the BitVec instances #130 needs)
+/// are aggregated from each theorem's `requires_preamble`, deduped,
+/// and emitted at the appropriate spot — `Import` fragments before
+/// the prelude, `PreludeAddendum` fragments after. Callers don't
+/// need to thread feature flags through; the theorems themselves
+/// declare what they need.
 ///
 /// Note: reference collection walks VIR-AST bodies. For exec fns the SST
 /// body may reference spec fns not reachable from the VIR body alone; the
@@ -146,25 +108,43 @@ fn krate_preamble(
     crate_name: &str,
     root_fns: &[&FunctionX],
     config: PreambleConfig,
+    theorems: &[crate::lean_ast::Theorem],
 ) -> (Vec<Command>, String) {
-    let bitvec_mode = config.bitvec_mode();
     let emit_accessors = config.emit_accessors();
+
+    // Aggregate fragments across all theorems. Dedup preserves
+    // first-occurrence order via a HashSet for membership and a
+    // Vec for ordering.
+    let mut seen_fragments: std::collections::HashSet<&crate::lean_ast::PreambleFragment>
+        = std::collections::HashSet::new();
+    let mut ordered_fragments: Vec<&crate::lean_ast::PreambleFragment> = Vec::new();
+    for theorem in theorems {
+        for frag in &theorem.requires_preamble {
+            if seen_fragments.insert(frag) {
+                ordered_fragments.push(frag);
+            }
+        }
+    }
 
     let mut cmds: Vec<Command> = Vec::new();
     for imp in imports {
         cmds.push(Command::Import(imp.clone()));
     }
-    if bitvec_mode {
-        cmds.push(Command::Import("Mathlib.Data.BitVec".to_string()));
-        // Lean core's full SAT-backed bit-vector decision procedure
-        // (#130 follow-up). Lives at `Lean/Elab/Tactic/BVDecide` in
-        // the v4.25.0 toolchain — must be imported explicitly; the
-        // top-level `import Lean` doesn't pull it in.
-        cmds.push(Command::Import("Lean.Elab.Tactic.BVDecide".to_string()));
+    // Theorem-required Imports go before the prelude — Lean's
+    // `import` statements must precede any other commands at file top.
+    for frag in &ordered_fragments {
+        if let crate::lean_ast::PreambleFragment::Import(s) = frag {
+            cmds.push(Command::Import(s.clone()));
+        }
     }
     cmds.push(Command::Raw(TACTUS_PRELUDE.to_string()));
-    if bitvec_mode {
-        cmds.push(Command::Raw(BITVEC_INT_INSTANCES.to_string()));
+    // Theorem-required PreludeAddendums go after the prelude — they
+    // typically declare instances that depend on the prelude's
+    // definitions and on the imports above.
+    for frag in &ordered_fragments {
+        if let crate::lean_ast::PreambleFragment::PreludeAddendum(s) = frag {
+            cmds.push(Command::Raw(s.clone()));
+        }
     }
 
     let ns = sanitize(crate_name);
@@ -260,8 +240,14 @@ pub fn check_proof_fn(
     // preserve match through to VIR-AST), so accessor fns are
     // unnecessary and would fail elaboration for enum types whose
     // field types lack Inhabited.
+    //
+    // Empty theorem slice — proof fns produce a single theorem that
+    // gets appended after the preamble, but it doesn't carry its
+    // own preamble fragments (proof fns don't use `by(bit_vector)`
+    // etc. via the structured path; if they ever need extra
+    // imports, those go through the explicit `imports` parameter).
     let (mut cmds, ns) = krate_preamble(
-        krate, imports, crate_name, &[proof_fn], PreambleConfig::ProofFn,
+        krate, imports, crate_name, &[proof_fn], PreambleConfig::ProofFn, &[],
     );
     cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body)));
     cmds.push(Command::NamespaceClose(ns));
@@ -331,7 +317,7 @@ pub fn check_exec_fn(
         ))
         .collect();
 
-    let exec_fn = match sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check) {
+    let theorems = match sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check) {
         Ok(r) => r,
         Err(reason) => return CheckResult::Failed {
             error: format!(
@@ -344,13 +330,17 @@ pub fn check_exec_fn(
 
     // Exec fns lower matches to if-chains over `IsVariant` and
     // `Field`, which the SST renderer routes to the synthesised
-    // accessor fns — so the preamble must include them.
+    // accessor fns — so the preamble must include them. The
+    // preamble also aggregates each theorem's `requires_preamble`
+    // (e.g., the BitVec instances #130 needs) and emits them once at
+    // file top, deduped.
     let (mut cmds, ns) = krate_preamble(
         krate, imports, crate_name, &[vir_fn],
-        PreambleConfig::ExecFn { needs_bitvec: exec_fn.needs_bitvec_instances },
+        PreambleConfig::ExecFn,
+        &theorems,
     );
 
-    for theorem in exec_fn.theorems {
+    for theorem in theorems {
         cmds.push(Command::Theorem(theorem));
     }
     cmds.push(Command::NamespaceClose(ns));
@@ -488,107 +478,134 @@ fn debug_check(_cmds: &[Command]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lean_ast::{Expr as LExpr, PreambleFragment, Tactic, Theorem};
     use crate::test_fixtures::empty_krate;
 
-    /// REVIEW lens 14: `bitvec_mode = false` must NOT emit any
-    /// BitVec-related preamble. Important because `Mathlib.Data.BitVec`
-    /// brings in simp lemmas that change closing behavior of
-    /// unrelated proof fns; conditional emission means files that
-    /// don't use `by(bit_vector)` keep their previous behavior.
-    #[test]
-    fn krate_preamble_omits_bitvec_when_mode_false() {
-        let krate = empty_krate();
-        let (cmds, _ns) = krate_preamble(
-            &krate, &[], "test_crate", &[], PreambleConfig::ProofFn,
-        );
-
-        // Check imports: no Mathlib.Data.BitVec, no Lean.Elab.Tactic.BVDecide.
-        for cmd in &cmds {
-            if let Command::Import(s) = cmd {
-                assert!(s != "Mathlib.Data.BitVec",
-                    "non-bitvec preamble should not import Mathlib.Data.BitVec");
-                assert!(s != "Lean.Elab.Tactic.BVDecide",
-                    "non-bitvec preamble should not import BVDecide");
-            }
-        }
-        // Check Raw blocks: no actual Int-bitwise instance
-        // *definitions*. Substrings like "HXor Int Int Int" appear
-        // in TACTUS_PRELUDE comments explaining the design — those
-        // are fine; only the executable `instance : HXor ...` lines
-        // would change Lean elaboration behavior.
-        for cmd in &cmds {
-            if let Command::Raw(s) = cmd {
-                assert!(!s.contains("instance : HXor Int Int Int"),
-                    "non-bitvec preamble should not emit HXor Int instance");
-                assert!(!s.contains("instance : HShiftLeft Int Int Int"),
-                    "non-bitvec preamble should not emit HShiftLeft Int instance");
-            }
+    /// Build a stub Theorem with the given preamble fragments.
+    /// Other fields take placeholder values — these tests are only
+    /// about how `krate_preamble` aggregates fragments, not about
+    /// theorem content.
+    fn stub_theorem(name: &str, requires_preamble: Vec<PreambleFragment>) -> Theorem {
+        Theorem {
+            name: name.to_string(),
+            binders: Vec::new(),
+            goal: LExpr::lit_bool(true),
+            tactic: Tactic::Named("tactus_auto".to_string()),
+            requires_preamble,
         }
     }
 
-    /// REVIEW lens 14 companion: `bitvec_mode = true` MUST emit the
-    /// BitVec-related preamble — both imports AND the Int-bitwise
-    /// instance block. Pinpoints the contract from the other side.
+    /// Right-way #4: with no theorems, no per-fn preamble fragments
+    /// are emitted. The default Tactus preamble is still present
+    /// (TACTUS_PRELUDE) but no extra Imports / PreludeAddendums leak
+    /// in. Pins the "files that don't request anything pay nothing"
+    /// contract.
     #[test]
-    fn krate_preamble_emits_bitvec_when_mode_true() {
+    fn krate_preamble_with_no_theorems_emits_no_extra_fragments() {
         let krate = empty_krate();
         let (cmds, _ns) = krate_preamble(
-            &krate, &[], "test_crate", &[],
-            PreambleConfig::ExecFn { needs_bitvec: true },
+            &krate, &[], "test_crate", &[], PreambleConfig::ProofFn, &[],
         );
 
-        let imports: Vec<&String> = cmds.iter()
-            .filter_map(|c| if let Command::Import(s) = c { Some(s) } else { None })
+        // The default preamble has exactly one Import-class chunk
+        // (the `imports` parameter, here empty) and one Raw block
+        // (TACTUS_PRELUDE). No extra Imports or Raws should appear
+        // before the Namespace open from per-fn aggregation.
+        let import_count = cmds.iter()
+            .filter(|c| matches!(c, Command::Import(_)))
+            .count();
+        assert_eq!(import_count, 0,
+            "no theorems → no aggregated imports; got cmds: {:?}",
+            cmds.iter().map(|c| std::mem::discriminant(c)).collect::<Vec<_>>());
+
+        // No Raw command should contain bitvec instance definitions
+        // (substring check on `instance : HXor` skips comments in
+        // the prelude that mention the type name — only executable
+        // instance lines would matter).
+        let bitvec_raw_count = cmds.iter()
+            .filter_map(|c| if let Command::Raw(s) = c { Some(s) } else { None })
+            .filter(|s| s.contains("instance : HXor Int Int Int"))
+            .count();
+        assert_eq!(bitvec_raw_count, 0,
+            "no theorems → no aggregated PreludeAddendums");
+    }
+
+    /// Right-way #4: a theorem requesting an Import fragment causes
+    /// `krate_preamble` to emit that Import (in the import section,
+    /// before TACTUS_PRELUDE).
+    #[test]
+    fn krate_preamble_aggregates_import_fragments_from_theorems() {
+        let krate = empty_krate();
+        let theorems = vec![stub_theorem(
+            "test_thm",
+            vec![PreambleFragment::Import("Mathlib.Tactic.Polyrith".to_string())],
+        )];
+        let (cmds, _ns) = krate_preamble(
+            &krate, &[], "test_crate", &[], PreambleConfig::ExecFn, &theorems,
+        );
+
+        let imports: Vec<&str> = cmds.iter()
+            .filter_map(|c| if let Command::Import(s) = c { Some(s.as_str()) } else { None })
             .collect();
-        assert!(imports.iter().any(|s| s.as_str() == "Mathlib.Data.BitVec"),
-            "bitvec preamble must import Mathlib.Data.BitVec; got imports: {:?}",
-            imports);
-        assert!(imports.iter().any(|s| s.as_str() == "Lean.Elab.Tactic.BVDecide"),
-            "bitvec preamble must import Lean.Elab.Tactic.BVDecide; got imports: {:?}",
-            imports);
+        assert!(imports.contains(&"Mathlib.Tactic.Polyrith"),
+            "theorem-required Import should appear in preamble; got: {:?}", imports);
 
-        let raw_blob: String = cmds.iter()
-            .filter_map(|c| if let Command::Raw(s) = c { Some(s.as_str()) } else { None })
-            .collect::<Vec<_>>().join("\n");
-        assert!(raw_blob.contains("instance : HXor Int Int Int"),
-            "bitvec preamble must emit HXor Int instance");
-        assert!(raw_blob.contains("instance : HShiftLeft Int Int Int"),
-            "bitvec preamble must emit HShiftLeft Int instance");
+        // Sanity check: the Import appears BEFORE the prelude (Lean
+        // requires all imports at file top).
+        let import_idx = cmds.iter().position(|c| matches!(c, Command::Import(s) if s == "Mathlib.Tactic.Polyrith"));
+        let prelude_idx = cmds.iter().position(|c| matches!(c, Command::Raw(s) if s.contains("set_option")));
+        assert!(import_idx < prelude_idx,
+            "imports must come before TACTUS_PRELUDE");
     }
 
-    /// REVIEW lens 4/3: shape-drift guard for the `bv_decide` module
-    /// path. `Lean.Elab.Tactic.BVDecide` is in Lean 4 core (v4.25.0)
-    /// — must be imported explicitly (top-level `import Lean` doesn't
-    /// pull it in). If a future Lean toolchain bump moves this
-    /// module (e.g., to a Mathlib-only path, or splits into a
-    /// renamed submodule), `tactus_bit_vector`'s primary rung
-    /// (`bv_decide`) silently fails to elaborate; `assert by(bit_vector)`
-    /// regresses to the simp/decide fallbacks, losing SAT-backed
-    /// reasoning for parameterized BitVec terms.
-    ///
-    /// The failing assertion's message names the fix site:
-    /// `generate.rs::krate_preamble`'s `bitvec_mode` branch.
+    /// Right-way #4: a theorem requesting a PreludeAddendum fragment
+    /// causes `krate_preamble` to emit that Raw block AFTER the
+    /// prelude (instances typically depend on the prelude's defs).
     #[test]
-    fn bv_decide_import_path_pinned() {
+    fn krate_preamble_aggregates_prelude_addendums_after_prelude() {
         let krate = empty_krate();
+        let addendum = "instance : MyClass Foo := ⟨...⟩\n";
+        let theorems = vec![stub_theorem(
+            "test_thm",
+            vec![PreambleFragment::PreludeAddendum(addendum.to_string())],
+        )];
         let (cmds, _ns) = krate_preamble(
-            &krate, &[], "test_crate", &[],
-            PreambleConfig::ExecFn { needs_bitvec: true },
+            &krate, &[], "test_crate", &[], PreambleConfig::ExecFn, &theorems,
         );
 
-        const EXPECTED: &str = "Lean.Elab.Tactic.BVDecide";
-        let bvdecide_import: Option<&String> = cmds.iter()
-            .filter_map(|c| if let Command::Import(s) = c { Some(s) } else { None })
-            .find(|s| s.contains("BVDecide"));
-        assert_eq!(
-            bvdecide_import.map(|s| s.as_str()),
-            Some(EXPECTED),
-            "BVDecide import path drift detected. Tactus expects \
-             `{}` (Lean core, v4.25.0). Update `krate_preamble`'s \
-             bitvec_mode branch in generate.rs if the toolchain has \
-             moved this module.",
-            EXPECTED,
+        // Find the addendum Raw and confirm it's AFTER the prelude Raw.
+        let addendum_idx = cmds.iter().position(|c|
+            matches!(c, Command::Raw(s) if s.contains("MyClass Foo")));
+        let prelude_idx = cmds.iter().position(|c|
+            matches!(c, Command::Raw(s) if s.contains("set_option")));
+        assert!(addendum_idx.is_some(), "addendum should appear");
+        assert!(addendum_idx > prelude_idx,
+            "PreludeAddendums must come after TACTUS_PRELUDE");
+    }
+
+    /// Right-way #4: when multiple theorems request the same fragment,
+    /// `krate_preamble` emits it once (dedup). Important because the
+    /// common case is N exec-fn theorems all needing the same BitVec
+    /// preamble.
+    #[test]
+    fn krate_preamble_dedups_repeated_fragments() {
+        let krate = empty_krate();
+        let frag = PreambleFragment::Import("Mathlib.Data.BitVec".to_string());
+        let theorems = vec![
+            stub_theorem("thm1", vec![frag.clone()]),
+            stub_theorem("thm2", vec![frag.clone()]),
+            stub_theorem("thm3", vec![frag.clone()]),
+        ];
+        let (cmds, _ns) = krate_preamble(
+            &krate, &[], "test_crate", &[], PreambleConfig::ExecFn, &theorems,
         );
+
+        let bitvec_imports: Vec<&str> = cmds.iter()
+            .filter_map(|c| if let Command::Import(s) = c { Some(s.as_str()) } else { None })
+            .filter(|s| *s == "Mathlib.Data.BitVec")
+            .collect();
+        assert_eq!(bitvec_imports.len(), 1,
+            "duplicate fragments should emit once; got {} copies", bitvec_imports.len());
     }
 
     /// REVIEW lens 4/1: shape-drift guard for the `anonymous_closure`
@@ -623,41 +640,6 @@ mod tests {
              Update the filter substring to match.",
             segment,
         );
-    }
-
-    /// REVIEW lens 3/6: defensive check that `BITVEC_INT_INSTANCES`'
-    /// HXor/HAnd/HOr/HShiftLeft/HShiftRight Int instances use `.toNat`
-    /// in their bodies — which is total on `Int` (returns 0 for
-    /// negatives). Tactus only emits these ops on bounded-non-negative
-    /// u-type Ints, so the negative-Int path is unreachable from
-    /// emitted code; but the *instances themselves* must remain total
-    /// to elaborate without warning, and a future refactor switching
-    /// to a partial function would silently regress this property.
-    ///
-    /// Documented as a soundness trade-off in DESIGN.md: the
-    /// `(-1 : Int).toNat = 0` semantics means `(-1) ^^^ x = x.toNat`
-    /// — wonky but total. If a future Tactus path emits these on
-    /// negative Ints, the values are wrong but no panic; the wonky
-    /// semantics stays a "watch out" item, not a hard error.
-    #[test]
-    fn bitvec_int_instances_use_to_nat_total_form() {
-        // The structural property: each instance's RHS goes through
-        // `.toNat` (which is total). If a maintainer changes one to
-        // (e.g.) `Int.toNat!` — partial, panics on negative — the
-        // test fires.
-        for op in &["HXor", "HAnd", "HOr", "HShiftLeft", "HShiftRight"] {
-            let instance_line: Option<&str> = BITVEC_INT_INSTANCES.lines()
-                .find(|l| l.contains(&format!("instance : {} Int Int Int", op)));
-            let line = instance_line.unwrap_or_else(|| panic!(
-                "BITVEC_INT_INSTANCES missing instance for {}", op
-            ));
-            assert!(line.contains("a.toNat"),
-                "{} instance must use a.toNat (total form) in its body; got: {}",
-                op, line);
-            assert!(line.contains("b.toNat"),
-                "{} instance must use b.toNat (total form) in its body; got: {}",
-                op, line);
-        }
     }
 }
 
