@@ -3684,16 +3684,14 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// #145: arity > 2 stays rejected. Lean's tuple `(a, b, c)` is
-// right-nested `Prod` (`Int × (Int × Int)`), so accessor `.2` on a
-// 3-tuple gives the inner pair, not the second element. The
-// existing `field_access_name` rendering (`.<n+1>`) is correct for
-// arity-2 only. Lifting this needs the broader N-tuple field-access
-// fix (touches every tuple field projection in Tactus, not just
-// &mut). Arity-2 tuples are by far the most common case in Verus
-// code; arity > 2 rejection keeps the slice scoped.
+// #146: arity > 2 tuple field mutation. The shared
+// `tuple_field_accessor` produces multi-segment Lean accessors
+// (`.2.1` etc.) for nested-Prod N-tuples, which are correct
+// regardless of arity. The 3-tuple here mutates the middle slot
+// and reads the unchanged ends — both reads must produce the
+// correct positions.
 test_verify_one_file! {
-    #[test] test_exec_call_mut_arg_tuple3_field_rejected verus_code! {
+    #[test] test_exec_call_mut_arg_tuple3_field verus_code! {
         fn bump(x: &mut u8)
             requires *old(x) < 100
             ensures *x == *old(x) + 1
@@ -3708,16 +3706,38 @@ test_verify_one_file! {
         {
             let mut t: (u8, u8, u8) = (1, x, 99);
             bump(&mut t.1);
+            assert(t.0 == 1);
+            assert(t.2 == 99);
             t.1
         }
-    } => Err(err) => {
-        assert!(
-            err.errors.iter().any(|e|
-                e.message.contains("not a supported L-value shape")),
-            "expected arity > 2 tuple rejection, got: {:?}",
-            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
-        );
-    }
+    } => Ok(())
+}
+
+// #146: 4-tuple, mutate slot index 2. Pins the deeper
+// multi-segment accessor pattern (`.2.2.1` for arity-4 position 2,
+// `.2.2.2` for the last).
+test_verify_one_file! {
+    #[test] test_exec_call_mut_arg_tuple4_field verus_code! {
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        #[verifier::tactus_auto]
+        fn call_tuple4_mut(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            let mut t: (u8, u8, u8, u8) = (1, 2, x, 99);
+            bump(&mut t.2);
+            assert(t.0 == 1);
+            assert(t.1 == 2);
+            assert(t.3 == 99);
+            t.2
+        }
+    } => Ok(())
 }
 
 // #87 rejection: `&mut a.b.c` (depth-2 field path). The MVS only
