@@ -818,6 +818,7 @@ mod tests {
             }],
             goal: bin(BinOp::Eq, var("x"), var("x")),
             tactic: Tactic::Named("rfl".into()),
+            requires_preamble: Vec::new(),
         };
         let out = pp_command(&Command::Theorem(t));
         assert!(out.contains("theorem foo (x : Nat)"));
@@ -845,6 +846,7 @@ mod tests {
             binders: vec![],
             goal: bin(BinOp::Eq, lit(1), lit(1)),
             tactic: Tactic::Raw("omega".into()),
+            requires_preamble: Vec::new(),
         };
         let out = pp_commands(&[Command::Theorem(t)]);
         assert_eq!(out.landmarks.tactic_starts.len(), 1);

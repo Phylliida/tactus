@@ -125,13 +125,64 @@ use vir::messages::Span;
 use crate::lean_ast::{
     and_all, substitute, AssertKind, Binder as LBinder, BinderKind, Expr as LExpr,
     ExprNode, HypothesisKind, ObligationKind,
-    Tactic, Theorem,
+    PreambleFragment, Tactic, Theorem,
 };
 use crate::expr_shared::varat_pre_name;
 use std::sync::Arc;
 use crate::to_lean_expr::vir_expr_to_ast;
 use crate::to_lean_sst_expr::{lower as lower_validated, sst_exp_to_ast_checked, type_bound_predicate, Validated};
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
+
+// ── BitVec-mode preamble fragments (#130 / right-way #4) ───────────────
+//
+// Lean has no `HXor Int Int Int` etc. by default. Tactus needs them
+// only for files that use `assert(P) by(bit_vector)` — Verus's
+// ast_to_sst pre-injects an Int-mode `Assume(ens)` before each
+// AssertBitVector, and the post-assert continuation theorems contain
+// `x ^^^ y` (bitwise xor) for `x, y : Int`. Without these instances,
+// those theorems fail to typecheck.
+//
+// Defined here (not in TactusPrelude) so other generated files don't
+// inherit the wonky-for-negative-Int semantics. The walker arm for
+// `Wp::AssertBitVector` calls `bitvec_preamble_fragments()` and
+// attaches the result to the emitted theorem's `requires_preamble`;
+// `generate.rs::krate_preamble` aggregates fragments across an exec
+// fn's theorems and emits them once at file top.
+//
+// For ACTUAL bitwise reasoning, use `assert(P) by(bit_vector)` —
+// Tactus renders the goal in BitVec mode where `^^^` etc. resolve
+// to BitVec instances with proper bit-vector semantics.
+pub(crate) const BITVEC_INT_INSTANCES: &str = "\
+-- HXor/HAnd/HOr/HShiftLeft/HShiftRight Int instances (#130).
+-- Conditionally emitted for files using `by(bit_vector)`.
+-- Mathlib.Data.BitVec is imported conditionally above (in the
+-- preamble's import section) so it's available here.
+instance : HXor Int Int Int := ⟨fun a b => ((a.toNat ^^^ b.toNat : Nat) : Int)⟩
+instance : HAnd Int Int Int := ⟨fun a b => ((a.toNat &&& b.toNat : Nat) : Int)⟩
+instance : HOr Int Int Int := ⟨fun a b => ((a.toNat ||| b.toNat : Nat) : Int)⟩
+instance : HShiftLeft Int Int Int := ⟨fun a b => ((a.toNat <<< b.toNat : Nat) : Int)⟩
+instance : HShiftRight Int Int Int := ⟨fun a b => ((a.toNat >>> b.toNat : Nat) : Int)⟩
+";
+
+/// Preamble fragments required by an `assert(P) by(bit_vector)`
+/// theorem. Returned to the walker arm for `Wp::AssertBitVector`,
+/// attached to the emitted theorem's `requires_preamble`, and
+/// aggregated by `krate_preamble` for emission at file top.
+///
+/// Three fragments:
+/// * `Mathlib.Data.BitVec` import — provides `BitVec n` type and
+///   the `@[simp]` lemmas (xor_comm / xor_self / etc.) the
+///   `tactus_bit_vector` tactic ladder falls back to.
+/// * `Lean.Elab.Tactic.BVDecide` import — Lean core's full SAT-
+///   backed bit-vector decision procedure (the primary rung).
+/// * Int-bitwise instance block — see `BITVEC_INT_INSTANCES` above.
+pub(crate) fn bitvec_preamble_fragments() -> Vec<PreambleFragment> {
+    vec![
+        PreambleFragment::Import("Mathlib.Data.BitVec".to_string()),
+        PreambleFragment::Import("Lean.Elab.Tactic.BVDecide".to_string()),
+        PreambleFragment::PreludeAddendum(BITVEC_INT_INSTANCES.to_string()),
+    ]
+}
 
 /// Typed view of a loop invariant's classification (#103).
 ///
@@ -457,16 +508,6 @@ fn check_exp(e: &Exp) -> Result<(), String> {
 
 // ── Theorem builder ────────────────────────────────────────────────────
 
-/// Result of lowering an exec fn body to Lean theorems. `theorems`
-/// is the per-obligation list; `needs_bitvec_instances` flags
-/// whether the fn used `assert(P) by(bit_vector)` (#130) and
-/// therefore the generated file needs the BitVec-related Int
-/// typeclass instances prepended.
-pub struct ExecFnTheorems {
-    pub theorems: Vec<Theorem>,
-    pub needs_bitvec_instances: bool,
-}
-
 /// Build the Lean `Theorem`s for an exec fn body check.
 ///
 /// Returns a `Vec` of one theorem per obligation in the body —
@@ -543,7 +584,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
     krate: &'a KrateX,
     fn_sst: &'a FunctionSst,
     check: &'a FuncCheckSst,
-) -> Result<ExecFnTheorems, String> {
+) -> Result<Vec<Theorem>, String> {
     // `&mut` params of the fn being verified (#94 callee-side body).
     // For each, the body and ensures get a SST-level rewrite so that
     // `*old(x)` (`VarAt(x, Pre)`) renders as `Var(<x>_at_pre_tactus)`,
@@ -611,7 +652,6 @@ pub fn exec_fn_theorems_to_ast<'a>(
         out: Vec::new(),
         tactic_prefix: Vec::new(),
         default_closer,
-        needs_bitvec_instances: false,
     };
 
     // Initial OblCtx with `let <x>_at_pre_tactus := x` for each &mut
@@ -634,10 +674,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
         initial_obl_ctx = initial_obl_ctx.with_frame(CtxFrame::Let(pre_name, var_x));
     }
     walk_obligations(&body_wp, &ctx, &initial_obl_ctx, &mut emitter);
-    Ok(ExecFnTheorems {
-        theorems: emitter.out,
-        needs_bitvec_instances: emitter.needs_bitvec_instances,
-    })
+    Ok(emitter.out)
 }
 
 /// Walk a VIR-AST `Expr` body and collect spans of every
@@ -971,15 +1008,6 @@ struct ObligationEmitter {
     /// Doesn't affect `assert(P) by { user_tac }` sites — those
     /// always use the user-supplied tactic from the assert-by.
     default_closer: Tactic,
-    /// Set when a `Wp::AssertBitVector` is emitted (#130). The
-    /// generated file then needs `HXor`/`HAnd`/`HOr`/`HShiftLeft`/
-    /// `HShiftRight` instances for `Int Int Int` so the post-
-    /// assert continuation typechecks (Verus's ast_to_sst
-    /// pre-injects an Int-mode `Assume(ens)` before
-    /// `AssertBitVector`). `generate.rs` reads this flag and
-    /// conditionally prepends the instance block — files that
-    /// don't use `by(bit_vector)` skip the pollution.
-    pub needs_bitvec_instances: bool,
 }
 
 impl ObligationEmitter {
@@ -997,6 +1025,23 @@ impl ObligationEmitter {
     /// case the closer becomes a no-op rather than failing with
     /// "no goals" (which `; tactus_auto` would).
     fn emit(&mut self, name: String, goal: LExpr, closer: Tactic) {
+        self.emit_with_preamble(name, goal, closer, Vec::new());
+    }
+
+    /// Like `emit`, but the theorem also declares preamble fragments
+    /// (imports / instance blocks) that its elaboration depends on.
+    /// `generate.rs::krate_preamble` aggregates these across all
+    /// emitted theorems and emits them once at file top, deduped.
+    /// Used by `Wp::AssertBitVector` (#130) — the only walker arm
+    /// that currently needs extra preamble. Future "this fn needs
+    /// Mathlib.Tactic.X" cases follow the same pattern.
+    fn emit_with_preamble(
+        &mut self,
+        name: String,
+        goal: LExpr,
+        closer: Tactic,
+        requires_preamble: Vec<PreambleFragment>,
+    ) {
         let tactic = if self.tactic_prefix.is_empty() {
             closer
         } else {
@@ -1021,6 +1066,7 @@ impl ObligationEmitter {
             binders: self.base_binders.clone(),
             goal,
             tactic,
+            requires_preamble,
         });
     }
 }
@@ -1130,12 +1176,6 @@ fn walk_obligations<'a>(
             walk_obligations(body, ctx, &new_obl, e);
         }
         Wp::AssertBitVector { req_conj, ens_conj, rust_loc, body } => {
-            // Mark that this fn's generated file needs the
-            // `HXor Int Int Int` etc. instances (#130). Verus's
-            // ast_to_sst pre-injects an Int-mode `Assume(ens)`
-            // before AssertBitVector, so post-assert continuation
-            // theorems would otherwise fail to typecheck.
-            e.needs_bitvec_instances = true;
             // Verified goal (BitVec mode): `req_conj → ens_conj`
             // (or just `ens_conj` when requires is empty — `req_conj`
             // is `LitBool(true)` from `and_all([])`, and `True → P` is
@@ -1169,8 +1209,20 @@ fn walk_obligations<'a>(
             // typechecked they're in a different encoding from the
             // BitVec-mode goal so they wouldn't help. Verus's
             // bit_vector queries also run with a clean context.
-            e.emit(name, obl.wrap_no_hyps(goal),
-                Tactic::Named("tactus_bit_vector".to_string()));
+            //
+            // Attach the BitVec preamble fragments to the theorem's
+            // `requires_preamble`. `generate.rs::krate_preamble`
+            // aggregates fragments across all of an exec fn's
+            // theorems and emits them at file top — Verus's
+            // ast_to_sst pre-injects an Int-mode `Assume(ens)` before
+            // AssertBitVector, so post-assert continuation theorems
+            // need the `HXor Int Int Int` etc. instances to typecheck.
+            e.emit_with_preamble(
+                name,
+                obl.wrap_no_hyps(goal),
+                Tactic::Named("tactus_bit_vector".to_string()),
+                bitvec_preamble_fragments(),
+            );
             // Body walks under the ORIGINAL obl — we don't publish
             // the ensures as an Int-mode hyp because Lean lacks
             // `HXor Int Int Int` etc., so an Int-mode `x ^^^ y`
@@ -5286,7 +5338,6 @@ mod tests {
             out: Vec::new(),
             tactic_prefix: Vec::new(),
             default_closer: crate::lean_ast::Tactic::Named("tactus_auto".to_string()),
-            needs_bitvec_instances: false,
         }
     }
 
@@ -5704,5 +5755,99 @@ mod tests {
              StmX::Assume nodes around ensures. The post-assert \
              ensures-as-hyp behavior depends on this."
         );
+    }
+
+    /// Right-way #4: pin the canonical fragment list returned by
+    /// `bitvec_preamble_fragments`. Three fragments — Mathlib BitVec
+    /// import, BVDecide import, Int instance addendum — covering the
+    /// imports + post-prelude addendum required by an exec fn that
+    /// uses `assert(P) by(bit_vector)`. If a future refactor changes
+    /// what AssertBitVector requires, this test surfaces it as a
+    /// focused failure rather than via a Lean elaboration error.
+    #[test]
+    fn bitvec_preamble_fragments_shape_pinned() {
+        let frags = bitvec_preamble_fragments();
+        assert_eq!(frags.len(), 3,
+            "expected 3 fragments (Mathlib import, BVDecide import, instances); \
+             got {} fragments: {:?}", frags.len(), frags);
+
+        let imports: Vec<&str> = frags.iter()
+            .filter_map(|f| if let PreambleFragment::Import(s) = f { Some(s.as_str()) } else { None })
+            .collect();
+        assert!(imports.contains(&"Mathlib.Data.BitVec"),
+            "fragments should include Mathlib.Data.BitVec import");
+        assert!(imports.contains(&"Lean.Elab.Tactic.BVDecide"),
+            "fragments should include Lean.Elab.Tactic.BVDecide import");
+
+        let addendums: Vec<&str> = frags.iter()
+            .filter_map(|f| if let PreambleFragment::PreludeAddendum(s) = f { Some(s.as_str()) } else { None })
+            .collect();
+        assert_eq!(addendums.len(), 1, "expected exactly one PreludeAddendum");
+        assert!(addendums[0].contains("instance : HXor Int Int Int"),
+            "PreludeAddendum should contain the HXor Int instance");
+    }
+
+    /// REVIEW lens 4/3: shape-drift guard for the `bv_decide` module
+    /// path. `Lean.Elab.Tactic.BVDecide` is in Lean 4 core (v4.25.0)
+    /// — must be imported explicitly (top-level `import Lean` doesn't
+    /// pull it in). If a future Lean toolchain bump moves this
+    /// module (e.g., to a Mathlib-only path, or splits into a
+    /// renamed submodule), `tactus_bit_vector`'s primary rung
+    /// (`bv_decide`) silently fails to elaborate; `assert by(bit_vector)`
+    /// regresses to the simp/decide fallbacks, losing SAT-backed
+    /// reasoning for parameterized BitVec terms.
+    ///
+    /// The failing assertion's message names the fix site:
+    /// `bitvec_preamble_fragments` in sst_to_lean.rs.
+    #[test]
+    fn bv_decide_import_path_pinned() {
+        const EXPECTED: &str = "Lean.Elab.Tactic.BVDecide";
+        let frags = bitvec_preamble_fragments();
+        let bvdecide = frags.iter()
+            .filter_map(|f| if let PreambleFragment::Import(s) = f { Some(s.as_str()) } else { None })
+            .find(|s| s.contains("BVDecide"));
+        assert_eq!(
+            bvdecide,
+            Some(EXPECTED),
+            "BVDecide import path drift detected. Tactus expects \
+             `{}` (Lean core, v4.25.0). Update `bitvec_preamble_fragments` \
+             in sst_to_lean.rs if the toolchain has moved this module.",
+            EXPECTED,
+        );
+    }
+
+    /// REVIEW lens 3/6: defensive check that `BITVEC_INT_INSTANCES`'
+    /// HXor/HAnd/HOr/HShiftLeft/HShiftRight Int instances use `.toNat`
+    /// in their bodies — which is total on `Int` (returns 0 for
+    /// negatives). Tactus only emits these ops on bounded-non-negative
+    /// u-type Ints, so the negative-Int path is unreachable from
+    /// emitted code; but the *instances themselves* must remain total
+    /// to elaborate without warning, and a future refactor switching
+    /// to a partial function would silently regress this property.
+    ///
+    /// Documented as a soundness trade-off in DESIGN.md: the
+    /// `(-1 : Int).toNat = 0` semantics means `(-1) ^^^ x = x.toNat`
+    /// — wonky but total. If a future Tactus path emits these on
+    /// negative Ints, the values are wrong but no panic; the wonky
+    /// semantics stays a "watch out" item, not a hard error.
+    #[test]
+    fn bitvec_int_instances_use_to_nat_total_form() {
+        // The structural property: each instance's RHS goes through
+        // `.toNat` (which is total). If a maintainer changes one to
+        // (e.g.) `Int.toNat!` — partial, panics on negative — the
+        // test fires.
+        for op in &["HXor", "HAnd", "HOr", "HShiftLeft", "HShiftRight"] {
+            let instance_line: Option<&str> = BITVEC_INT_INSTANCES.lines()
+                .find(|l| l.contains(&format!("instance : {} Int Int Int", op)));
+            let line = instance_line.unwrap_or_else(|| panic!(
+                "BITVEC_INT_INSTANCES missing instance for {}", op
+            ));
+            assert!(line.contains("a.toNat"),
+                "{} instance must use a.toNat (total form) in its body; got: {}",
+                op, line);
+            assert!(line.contains("b.toNat"),
+                "{} instance must use b.toNat (total form) in its body; got: {}",
+                op, line);
+        }
     }
 }

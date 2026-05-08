@@ -402,6 +402,7 @@ mod tests {
                 rhs: Box::new(var("Nat")),
             }),
             tactic: Tactic::Named("rfl".into()),
+            requires_preamble: Vec::new(),
         };
         assert!(check_references(&[Command::Theorem(thm)]).is_empty());
     }
@@ -417,6 +418,7 @@ mod tests {
                 args: vec![var("x")],
             }),
             tactic: Tactic::Named("sorry".into()),
+            requires_preamble: Vec::new(),
         };
         let v = check_references(&[Command::Theorem(thm)]);
         assert_eq!(v.len(), 2); // missing_fn + x
@@ -446,6 +448,7 @@ mod tests {
                 args: vec![var("n")],
             }),
             tactic: Tactic::Named("rfl".into()),
+            requires_preamble: Vec::new(),
         };
         let violations = check_references(&[Command::Def(d), Command::Theorem(t)]);
         assert!(violations.is_empty(), "expected no violations, got {:?}", violations);
@@ -485,6 +488,7 @@ mod tests {
         let t = Theorem {
             name: "t".into(), binders: vec![], goal,
             tactic: Tactic::Named("rfl".into()),
+            requires_preamble: Vec::new(),
         };
         assert!(check_references(&[Command::Theorem(t)]).is_empty());
     }
@@ -512,6 +516,7 @@ mod tests {
             name: "t".into(), binders: vec![],
             goal: var("Classical.arbitrary"),
             tactic: Tactic::Named("sorry".into()),
+            requires_preamble: Vec::new(),
         };
         assert!(check_references(&[Command::Theorem(t)]).is_empty());
     }

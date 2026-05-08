@@ -118,6 +118,44 @@ pub struct Theorem {
     pub binders: Vec<Binder>,
     pub goal: Expr,
     pub tactic: Tactic,
+    /// Preamble fragments this theorem needs to elaborate. Aggregated
+    /// across all of an exec fn's theorems by `generate.rs`'s
+    /// `krate_preamble`, then deduped and emitted once at the top of
+    /// the generated file.
+    ///
+    /// Empty for proof fns and for exec-fn theorems that need only the
+    /// default Tactus preamble. Populated by walker arms that emit
+    /// goals requiring extra Lean infrastructure — currently just
+    /// `Wp::AssertBitVector` (#130), which needs `Mathlib.Data.BitVec`
+    /// + `Lean.Elab.Tactic.BVDecide` imports plus the
+    /// `HXor`/`HAnd`/`HOr`/`HShiftLeft`/`HShiftRight Int Int Int`
+    /// instances.
+    ///
+    /// Replaces the prior 4-site bool-flag plumbing
+    /// (`ObligationEmitter::needs_bitvec_instances` →
+    /// `ExecFnTheorems::needs_bitvec_instances` →
+    /// `PreambleConfig::ExecFn { needs_bitvec }` →
+    /// `krate_preamble`'s `bitvec_mode` branch). The
+    /// theorem-as-source-of-truth shape generalizes: future "this fn
+    /// needs Mathlib.Tactic.X" requirements just add a
+    /// `PreambleFragment` constructor + a walker-arm push, without
+    /// threading another bool through the pipeline.
+    pub requires_preamble: Vec<PreambleFragment>,
+}
+
+/// A piece of preamble that some theorem needs in its elaboration
+/// context. `krate_preamble` collects these from all emitted
+/// theorems, dedups, and emits at file top.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PreambleFragment {
+    /// `import <module>` line. Order among multiple imports doesn't
+    /// matter to Lean; dedup is by exact string.
+    Import(String),
+    /// Raw Lean text emitted between the prelude and the namespace
+    /// open. Used for typeclass instance blocks (#130's `HXor Int Int
+    /// Int` etc.) where structured AST representation isn't worth the
+    /// complexity for static text. Dedup is by exact string.
+    PreludeAddendum(String),
 }
 
 #[derive(Debug, Clone)]
