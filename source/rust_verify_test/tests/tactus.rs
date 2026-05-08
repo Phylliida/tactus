@@ -4572,6 +4572,105 @@ test_verify_one_file! {
     }
 }
 
+// REVIEW lens 3/4: AssertBitVector with a non-empty `requires` clause.
+// The walker's BV-mode goal shape is `req_conj → ens_conj` when
+// requires is non-empty (vs. bare `ens_conj` when empty). All
+// previous tests had empty requires; this exercises the implication
+// path. Verus's ast_to_sst emits per-requires-clause Asserts BEFORE
+// the AssertBitVector to check the requires hold at the assert
+// site, so the requires has to actually be establishable — fn-level
+// requires propagate the constraints through tactus_auto's
+// preconditions.
+test_verify_one_file! {
+    #[test] test_exec_assert_bit_vector_with_requires verus_code! {
+        #[verifier::tactus_auto]
+        fn xor_with_requires(x: u8, y: u8)
+            requires x == 5u8, y == 2u8,
+        {
+            assert(x ^ y == 7u8) by(bit_vector)
+                requires x == 5u8, y == 2u8;
+        }
+    } => Ok(())
+}
+
+// REVIEW lens 3/4 negative: a bit_vector assertion whose ensures
+// genuinely does NOT follow from its requires. Tests that the
+// req_conj → ens_conj rendering reaches bv_decide and fails when
+// the implication is false. (As distinct from the per-requires
+// precondition checks failing — those are tested by the "insufficient"
+// case below.)
+test_verify_one_file! {
+    #[test] test_exec_assert_bit_vector_with_requires_fails verus_code! {
+        #[verifier::tactus_auto]
+        fn xor_wrong_with_requires(x: u8, y: u8)
+            requires x == 5u8, y == 2u8,
+        {
+            // x=5, y=2 → x^y=7, NOT 9. The req_conj → ens_conj
+            // shape `(x=5 ∧ y=2) → x^y=9` is false; bv_decide
+            // fails.
+            assert(x ^ y == 9u8) by(bit_vector)
+                requires x == 5u8, y == 2u8;
+        }
+    } => Err(err) => {
+        assert!(err.errors.len() >= 1,
+            "false bit_vector goal should fail even with requires");
+    }
+}
+
+// REVIEW lens 3/3: AssertBitVector inside an if-branch. The branch
+// condition becomes a Hyp frame in OblCtx, but `obl.wrap_no_hyps`
+// drops it for the BV-mode goal — important because Int-mode hyps
+// (e.g., a branch like `x ^ y == 7`) wouldn't typecheck in BV mode
+// without the conditionally-injected `HXor Int Int Int` instances.
+test_verify_one_file! {
+    #[test] test_exec_assert_bit_vector_in_if_branch verus_code! {
+        #[verifier::tactus_auto]
+        fn xor_in_if(x: u8, y: u8) {
+            if x == 5 && y == 2 {
+                assert(x ^ y == 7u8) by(bit_vector)
+                    requires x == 5u8, y == 2u8;
+            }
+        }
+    } => Ok(())
+}
+
+// REVIEW lens 3/3: AssertBitVector inside a loop body. The
+// invariant + cond become Hyp frames; the modified-var quantifier
+// becomes a Binder frame. `wrap_no_hyps` drops the Hyps but keeps
+// the Binder, so the BV goal sees the loop-local `i` as a free
+// variable.
+test_verify_one_file! {
+    #[test] test_exec_assert_bit_vector_in_loop verus_code! {
+        #[verifier::tactus_auto]
+        fn xor_in_loop() {
+            let mut i: u8 = 0;
+            while i < 3
+                invariant i <= 3,
+                decreases (3 - i) as int,
+            {
+                assert((5u8 ^ 3u8) == 6u8) by(bit_vector);
+                i = i + 1;
+            }
+        }
+    } => Ok(())
+}
+
+// REVIEW lens 3/3: AssertBitVector inside a closure body. The
+// closure's params become Binder frames in OblCtx; `wrap_no_hyps`
+// keeps them. The closure body verification scope (#93) walks
+// these obligations under `∀ p : T, h_p_bound → ...`.
+test_verify_one_file! {
+    #[test] test_exec_assert_bit_vector_in_closure verus_code! {
+        #[verifier::tactus_auto]
+        fn xor_in_closure() {
+            let _f = |x: u8| -> u8 {
+                assert((x ^ x) == 0u8) by(bit_vector);
+                x
+            };
+        }
+    } => Ok(())
+}
+
 // #109 follow-up: recursion over a member of a mutual-SCC datatype.
 // `Forest.height` post-#109 calls `Tree.height` for its Tree fields
 // (cross-type recursion in the height fn, requiring the mutual block).
