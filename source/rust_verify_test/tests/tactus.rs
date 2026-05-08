@@ -3713,6 +3713,54 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Multi-variant enum field mutation: documented as upstream-
+// blocked. The DESIGN.md "non-Var L-values" catalogue lists
+// "multi-variant enum field mutation" as needing match-and-rebuild
+// encoding, but Rust doesn't actually let you write `&mut foo.f`
+// for an enum-typed `foo` directly — you go through `if let` /
+// `match` pattern binding (`ref mut val`) which Verus itself
+// rejects at the mode level: "The verifier does not yet support
+// the following Rust feature: &mut types, except in special cases."
+//
+// So multi-variant enum field mutation isn't reachable from Tactus's
+// caller-side path at all — Verus rejects upstream before we see
+// the SST. Pinning the rejection here makes the upstream block
+// concrete; if Verus ever lifts the `ref mut` restriction, this
+// test surfaces as a flippable Err.
+test_verify_one_file! {
+    #[test] test_exec_call_mut_arg_enum_field_upstream_blocked verus_code! {
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        enum Foo {
+            A(u8),
+            B(u8, u8),
+        }
+
+        #[verifier::tactus_auto]
+        fn call_enum_mut(x: u8)
+            requires x < 100
+        {
+            let mut foo = Foo::A(x);
+            if let Foo::A(ref mut val) = foo {
+                bump(val);
+            }
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e|
+                e.message.contains("&mut types")
+                || e.message.contains("does not yet support")),
+            "expected Verus upstream rejection of `ref mut`, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
 // #146: 4-tuple, mutate slot index 2. Pins the deeper
 // multi-segment accessor pattern (`.2.2.1` for arity-4 position 2,
 // `.2.2.2` for the last).
