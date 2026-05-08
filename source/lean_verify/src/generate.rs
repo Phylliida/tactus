@@ -449,3 +449,128 @@ fn debug_check(_cmds: &[Command]) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Empty KrateX for testing the preamble in isolation. No fns,
+    /// no datatypes — preamble just emits its prelude content +
+    /// namespace open.
+    fn empty_krate() -> KrateX {
+        use vir::ast::{Arch, ArchWordBits};
+        KrateX {
+            functions: vec![],
+            reveal_groups: vec![],
+            datatypes: vec![],
+            opaque_types: vec![],
+            traits: vec![],
+            trait_impls: vec![],
+            assoc_type_impls: vec![],
+            modules: vec![],
+            external_fns: vec![],
+            external_types: vec![],
+            path_as_rust_names: vec![],
+            arch: Arch { word_bits: ArchWordBits::Either32Or64 },
+        }
+    }
+
+    /// REVIEW lens 14: `bitvec_mode = false` must NOT emit any
+    /// BitVec-related preamble. Important because `Mathlib.Data.BitVec`
+    /// brings in simp lemmas that change closing behavior of
+    /// unrelated proof fns; conditional emission means files that
+    /// don't use `by(bit_vector)` keep their previous behavior.
+    #[test]
+    fn krate_preamble_omits_bitvec_when_mode_false() {
+        let krate = empty_krate();
+        let (cmds, _ns) = krate_preamble(
+            &krate, &[], "test_crate", &[], false, /*bitvec_mode=*/ false,
+        );
+
+        // Check imports: no Mathlib.Data.BitVec, no Lean.Elab.Tactic.BVDecide.
+        for cmd in &cmds {
+            if let Command::Import(s) = cmd {
+                assert!(s != "Mathlib.Data.BitVec",
+                    "non-bitvec preamble should not import Mathlib.Data.BitVec");
+                assert!(s != "Lean.Elab.Tactic.BVDecide",
+                    "non-bitvec preamble should not import BVDecide");
+            }
+        }
+        // Check Raw blocks: no actual Int-bitwise instance
+        // *definitions*. Substrings like "HXor Int Int Int" appear
+        // in TACTUS_PRELUDE comments explaining the design — those
+        // are fine; only the executable `instance : HXor ...` lines
+        // would change Lean elaboration behavior.
+        for cmd in &cmds {
+            if let Command::Raw(s) = cmd {
+                assert!(!s.contains("instance : HXor Int Int Int"),
+                    "non-bitvec preamble should not emit HXor Int instance");
+                assert!(!s.contains("instance : HShiftLeft Int Int Int"),
+                    "non-bitvec preamble should not emit HShiftLeft Int instance");
+            }
+        }
+    }
+
+    /// REVIEW lens 14 companion: `bitvec_mode = true` MUST emit the
+    /// BitVec-related preamble — both imports AND the Int-bitwise
+    /// instance block. Pinpoints the contract from the other side.
+    #[test]
+    fn krate_preamble_emits_bitvec_when_mode_true() {
+        let krate = empty_krate();
+        let (cmds, _ns) = krate_preamble(
+            &krate, &[], "test_crate", &[], false, /*bitvec_mode=*/ true,
+        );
+
+        let imports: Vec<&String> = cmds.iter()
+            .filter_map(|c| if let Command::Import(s) = c { Some(s) } else { None })
+            .collect();
+        assert!(imports.iter().any(|s| s.as_str() == "Mathlib.Data.BitVec"),
+            "bitvec preamble must import Mathlib.Data.BitVec; got imports: {:?}",
+            imports);
+        assert!(imports.iter().any(|s| s.as_str() == "Lean.Elab.Tactic.BVDecide"),
+            "bitvec preamble must import Lean.Elab.Tactic.BVDecide; got imports: {:?}",
+            imports);
+
+        let raw_blob: String = cmds.iter()
+            .filter_map(|c| if let Command::Raw(s) = c { Some(s.as_str()) } else { None })
+            .collect::<Vec<_>>().join("\n");
+        assert!(raw_blob.contains("instance : HXor Int Int Int"),
+            "bitvec preamble must emit HXor Int instance");
+        assert!(raw_blob.contains("instance : HShiftLeft Int Int Int"),
+            "bitvec preamble must emit HShiftLeft Int instance");
+    }
+
+    /// REVIEW lens 4/3: shape-drift guard for the `bv_decide` module
+    /// path. `Lean.Elab.Tactic.BVDecide` is in Lean 4 core (v4.25.0)
+    /// — must be imported explicitly (top-level `import Lean` doesn't
+    /// pull it in). If a future Lean toolchain bump moves this
+    /// module (e.g., to a Mathlib-only path, or splits into a
+    /// renamed submodule), `tactus_bit_vector`'s primary rung
+    /// (`bv_decide`) silently fails to elaborate; `assert by(bit_vector)`
+    /// regresses to the simp/decide fallbacks, losing SAT-backed
+    /// reasoning for parameterized BitVec terms.
+    ///
+    /// The failing assertion's message names the fix site:
+    /// `generate.rs::krate_preamble`'s `bitvec_mode` branch.
+    #[test]
+    fn bv_decide_import_path_pinned() {
+        let krate = empty_krate();
+        let (cmds, _ns) = krate_preamble(
+            &krate, &[], "test_crate", &[], false, /*bitvec_mode=*/ true,
+        );
+
+        const EXPECTED: &str = "Lean.Elab.Tactic.BVDecide";
+        let bvdecide_import: Option<&String> = cmds.iter()
+            .filter_map(|c| if let Command::Import(s) = c { Some(s) } else { None })
+            .find(|s| s.contains("BVDecide"));
+        assert_eq!(
+            bvdecide_import.map(|s| s.as_str()),
+            Some(EXPECTED),
+            "BVDecide import path drift detected. Tactus expects \
+             `{}` (Lean core, v4.25.0). Update `krate_preamble`'s \
+             bitvec_mode branch in generate.rs if the toolchain has \
+             moved this module.",
+            EXPECTED,
+        );
+    }
+}
+
