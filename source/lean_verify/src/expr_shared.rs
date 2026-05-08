@@ -310,6 +310,61 @@ pub(crate) fn varat_pre_name(name: &str) -> String {
     format!("{}_at_pre_tactus", name)
 }
 
+/// Lean accessor string for the `n`th element of an `arity`-tuple.
+///
+/// Lean 4 represents N-tuples as right-nested `Prod`:
+/// `(a, b, c) : Int × Int × Int = Int × (Int × Int)`. The
+/// auto-derived accessors are `.fst` (= `.1`) and `.snd` (= `.2`)
+/// on each level — for an N-tuple, the j-th element (0-indexed)
+/// requires `.2` (j times) followed by `.1`, except the last
+/// element which is just `.2` repeated (arity-1) times. Examples:
+///
+/// | arity | n | result   | meaning                  |
+/// |-------|---|----------|--------------------------|
+/// | 2     | 0 | `1`      | `.1` (first of pair)     |
+/// | 2     | 1 | `2`      | `.2` (second of pair)    |
+/// | 3     | 0 | `1`      | first element            |
+/// | 3     | 1 | `2.1`    | inner pair's first       |
+/// | 3     | 2 | `2.2`    | inner pair's second      |
+/// | 4     | 0 | `1`      |                          |
+/// | 4     | 1 | `2.1`    |                          |
+/// | 4     | 2 | `2.2.1`  |                          |
+/// | 4     | 3 | `2.2.2`  |                          |
+///
+/// The result is intended to be appended to a base via
+/// `<base>.<result>` — Lean parses `e.2.1` as `((e).2).1`, which
+/// matches the desired projection.
+///
+/// Arity 0 is defensive (Verus shouldn't produce unit tuples
+/// here): falls back to `(n+1).to_string()` to preserve the prior
+/// behavior. Arity 1 is similarly handled — a single-element
+/// "tuple" is a degenerate case not produced by Verus.
+pub(crate) fn tuple_field_accessor(arity: usize, n: usize) -> String {
+    if arity < 2 {
+        // Defensive: Verus shouldn't produce 0- or 1-tuples here
+        // (unit type / single-element tuples have other lowerings).
+        // Fall back to the prior `(n+1)` behavior.
+        return (n + 1).to_string();
+    }
+    if n + 1 >= arity {
+        // Last position: `.2` repeated (arity - 1) times.
+        // Arity-2 i=1 → "2"; arity-3 i=2 → "2.2"; etc.
+        std::iter::repeat("2")
+            .take(arity - 1)
+            .collect::<Vec<_>>()
+            .join(".")
+    } else {
+        // Non-last position: `.2` repeated n times, then `.1`.
+        // Arity-3 i=0 → "1"; arity-3 i=1 → "2.1"; arity-4 i=2 → "2.2.1".
+        let twos: Vec<&str> = std::iter::repeat("2").take(n).collect();
+        if twos.is_empty() {
+            "1".to_string()
+        } else {
+            format!("{}.1", twos.join("."))
+        }
+    }
+}
+
 /// Map a VIR field access to the Lean side's field name.
 ///
 /// * Anonymous tuple (`Dt::Tuple`) uses 0-indexed numeric fields like
@@ -336,7 +391,7 @@ pub(crate) fn field_access_name(field_opr: &FieldOpr) -> String {
     let raw = field_opr.field.as_str();
     let numeric = raw.parse::<usize>().ok();
     match (&field_opr.datatype, numeric) {
-        (Dt::Tuple(_), Some(n)) => (n + 1).to_string(),
+        (Dt::Tuple(arity), Some(n)) => tuple_field_accessor(*arity, n),
         (Dt::Path(path), _) => {
             let type_short = short_name(path);
             let variant = field_opr.variant.as_str();

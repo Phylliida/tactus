@@ -2593,21 +2593,21 @@ fn push_post_call_frames(
             MutTargetRaw::TupleField { index, arity, .. } => {
                 // Tuple ctor rebuild (#145). Lean's structure-update
                 // doesn't compose with `Prod`, so we rebuild the tuple
-                // explicitly via anon-ctor syntax. Each unmodified
-                // slot reads from `local.<j+1>` (Lean's 1-indexed
-                // accessor); the mutated slot at `index` takes
-                // `fresh`.
+                // explicitly via Lean tuple syntax. Each unmodified
+                // slot reads from `local.<accessor>` where accessor
+                // comes from the shared `tuple_field_accessor` —
+                // which produces `.2.1` etc. for arity > 2 (#146).
+                // The mutated slot at `index` takes `fresh`.
                 let local_expr = LExpr::var(local_name.clone());
                 let elems: Vec<LExpr> = (0..*arity)
                     .map(|j| {
                         if j == *index {
                             LExpr::var(info.fresh.clone())
                         } else {
-                            // Lean 4 uses 1-indexed tuple accessors
-                            // (`.1`, `.2`, ...); our SST 0-indexed
-                            // numeric field name `"0"` maps to `.1`,
-                            // matching `field_access_name`'s rule.
-                            LExpr::field_proj(local_expr.clone(), (j + 1).to_string())
+                            LExpr::field_proj(
+                                local_expr.clone(),
+                                crate::expr_shared::tuple_field_accessor(*arity, j),
+                            )
                         }
                     })
                     .collect();
@@ -4043,21 +4043,13 @@ fn extract_mut_target<'a>(
     // level paths involving tuples (e.g., `&mut s.tup.0` or
     // `&mut t.0.f`) need a unified Vec<FieldKind> path representation.
     //
-    // **Arity restriction**: only 2-tuples are supported. Lean's
-    // tuple `(a, b, c)` is right-nested `Prod` (`Int × (Int × Int)`),
-    // so accessor `.2` on a 3-tuple gives the inner pair, not the
-    // second element. The existing `field_access_name` rendering
-    // (`.<n+1>`) is correct for arity-2 only. Arity > 2 needs a
-    // broader fix to tuple field-access rendering — tracked
-    // separately. Tactus's existing tuple tests are all arity-2,
-    // which is why this hasn't surfaced before.
+    // Any arity ≥ 2 supported (#146 lifted the prior arity-2-only
+    // gate). The unmodified-slot reads use the shared
+    // `tuple_field_accessor` so arity > 2 produces the correct
+    // multi-segment Lean accessor (e.g., `.2.1` for the second of
+    // three).
     if let ExpX::UnaryOpr(UnaryOpr::Field(field_opr), base_exp) = &inner.x {
         if let vir::ast::Dt::Tuple(arity) = &field_opr.datatype {
-            if *arity != 2 {
-                // Defer arity > 2 — needs the broader N-tuple
-                // field-access fix.
-                return None;
-            }
             let base = peel_transparent(base_exp);
             if let ExpX::Var(ident) | ExpX::VarLoc(ident) = &base.x {
                 if let Ok(index) = field_opr.field.as_str().parse::<usize>() {
