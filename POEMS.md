@@ -19,4 +19,4 @@ on a new date.
 - [2026-05-03](poems/2026-05-03.md) — twenty-eight to twenty-two; the threshold; the audit as repair; the shape was already right; what I'm scoping; the smaller one was also bigger; saying no on the same day; what the Arc said; same-day regression; calibration; the third bound; what the day was; the hand-sync; the lens, again; two before lunch; the honest pause; six refinements; what Verus needs that Lean doesn't; four landings; the unbound name; the structural condition; the test suite; five before sleep
 - [2026-05-04](poems/2026-05-04.md) — the defensive lock; the machinery was correct; structure, not content; what today taught; the test that passed first try; what we deferred; fourteen commits, one shape
 - [2026-05-05](poems/2026-05-05.md) — morning, after; +94; layers; two-handed; the accidental witness; the silent test; half-built; the half-built, returning; fourteen questions
-- [2026-05-08](poems/2026-05-08.md) — three days; locks; the second reading
+- [2026-05-08](poems/2026-05-08.md) — three days; locks; the second reading; recognition
