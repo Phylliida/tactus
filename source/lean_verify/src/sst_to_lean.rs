@@ -2036,6 +2036,7 @@ impl<'a> MutArgInfo<'a> {
         match &self.target {
             MutTargetRaw::Var(v) => v,
             MutTargetRaw::Field { base, .. } => base,
+            MutTargetRaw::TupleField { base, .. } => base,
         }
     }
 }
@@ -2588,6 +2589,29 @@ fn push_post_call_frames(
                     });
                 }
                 current
+            }
+            MutTargetRaw::TupleField { index, arity, .. } => {
+                // Tuple ctor rebuild (#145). Lean's structure-update
+                // doesn't compose with `Prod`, so we rebuild the tuple
+                // explicitly via anon-ctor syntax. Each unmodified
+                // slot reads from `local.<j+1>` (Lean's 1-indexed
+                // accessor); the mutated slot at `index` takes
+                // `fresh`.
+                let local_expr = LExpr::var(local_name.clone());
+                let elems: Vec<LExpr> = (0..*arity)
+                    .map(|j| {
+                        if j == *index {
+                            LExpr::var(info.fresh.clone())
+                        } else {
+                            // Lean 4 uses 1-indexed tuple accessors
+                            // (`.1`, `.2`, ...); our SST 0-indexed
+                            // numeric field name `"0"` maps to `.1`,
+                            // matching `field_access_name`'s rule.
+                            LExpr::field_proj(local_expr.clone(), (j + 1).to_string())
+                        }
+                    })
+                    .collect();
+                LExpr::tuple(elems)
             }
         };
         new_obl.frames.push(CtxFrame::Let(local_name, new_value));
@@ -3956,6 +3980,19 @@ enum MutTargetRaw<'a> {
     /// level is computed at emission time via
     /// `field_access_name(opr)`.
     Field { base: &'a VarIdent, field_oprs: Vec<&'a vir::ast::FieldOpr> },
+    /// `&mut <base>.<i>` for a tuple `base : (T0, T1, ..., T{n-1})`.
+    /// Lean's `{ x with f := v }` syntax doesn't compose with `Prod`
+    /// types ("expected structure" elaboration error), so the rebind
+    /// uses explicit ctor rebuild via Lean's anon-ctor syntax
+    /// `⟨t.1, ..., fresh, ..., t.n⟩` (with the mutated field's slot
+    /// filled by `fresh` and all others by `t.<j>` accessors).
+    ///
+    /// Stored as the base ident, the 0-indexed field position, and
+    /// the tuple arity. Restricted to single-level (no `&mut t.0.f`
+    /// or `&mut s.tup.0` mixing yet — multi-level paths involving
+    /// tuples need a unified Vec<FieldKind> path that the current
+    /// `Field` variant doesn't model).
+    TupleField { base: &'a VarIdent, index: usize, arity: usize },
 }
 
 fn extract_mut_target<'a>(
@@ -3998,10 +4035,49 @@ fn extract_mut_target<'a>(
     if let ExpX::Var(ident) | ExpX::VarLoc(ident) = &inner.x {
         return Some(MutTargetRaw::Var(ident));
     }
+    // Single-level tuple field shape (#145): `Loc(Field(Tuple(n), Var(t)))`
+    // for `&mut t.<i>`. Tuple field mutation needs ctor rebuild
+    // (Lean's `{ x with f := v }` doesn't compose with `Prod`), so it
+    // gets its own variant rather than threading through the
+    // recursive Field peel below. Restricted to single-level — multi-
+    // level paths involving tuples (e.g., `&mut s.tup.0` or
+    // `&mut t.0.f`) need a unified Vec<FieldKind> path representation.
+    //
+    // **Arity restriction**: only 2-tuples are supported. Lean's
+    // tuple `(a, b, c)` is right-nested `Prod` (`Int × (Int × Int)`),
+    // so accessor `.2` on a 3-tuple gives the inner pair, not the
+    // second element. The existing `field_access_name` rendering
+    // (`.<n+1>`) is correct for arity-2 only. Arity > 2 needs a
+    // broader fix to tuple field-access rendering — tracked
+    // separately. Tactus's existing tuple tests are all arity-2,
+    // which is why this hasn't surfaced before.
+    if let ExpX::UnaryOpr(UnaryOpr::Field(field_opr), base_exp) = &inner.x {
+        if let vir::ast::Dt::Tuple(arity) = &field_opr.datatype {
+            if *arity != 2 {
+                // Defer arity > 2 — needs the broader N-tuple
+                // field-access fix.
+                return None;
+            }
+            let base = peel_transparent(base_exp);
+            if let ExpX::Var(ident) | ExpX::VarLoc(ident) = &base.x {
+                if let Ok(index) = field_opr.field.as_str().parse::<usize>() {
+                    return Some(MutTargetRaw::TupleField {
+                        base: ident,
+                        index,
+                        arity: *arity,
+                    });
+                }
+            }
+            // Tuple field with non-numeric field name or non-Var base —
+            // fall through to None (defensive; Verus shouldn't produce
+            // either shape).
+            return None;
+        }
+    }
     // Peel Field levels until we hit a Var/VarLoc base. Single-variant
     // gate per level: Lean's `{ x with f := v }` syntax works for
     // `structure` types (single ctor); multi-variant enums and tuples
-    // fall through to None at the level they appear.
+    // (above) fall through to None at the level they appear.
     let mut field_oprs: Vec<&'a vir::ast::FieldOpr> = Vec::new();
     let mut cursor: &'a Exp = inner;
     loop {
@@ -4026,11 +4102,11 @@ fn extract_mut_target<'a>(
                         field_opr.variant.as_str()
                             == crate::to_lean_type::short_name(path)
                     }
-                    // Tuple field mutation `&mut t.0` rejected: Lean's
-                    // structure-update syntax doesn't work for `Prod`
-                    // types ("expected structure" elaboration error).
-                    // Different encoding (explicit ctor rebuild)
-                    // required.
+                    // Tuple at a deeper level (e.g., `&mut s.tup.0` or
+                    // `&mut t.0.f`) — handled separately above for the
+                    // single-level case; multi-level paths involving
+                    // tuples need a unified path encoding that this
+                    // recursive peel doesn't support yet.
                     vir::ast::Dt::Tuple(_) => false,
                 };
                 if !supported_kind {

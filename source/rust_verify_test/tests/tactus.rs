@@ -3639,7 +3639,7 @@ test_verify_one_file! {
 // t.1)`). Pinned as a rejection so a future tuple-aware encoding
 // flips the assertion.
 test_verify_one_file! {
-    #[test] test_exec_call_mut_arg_tuple_field_rejected verus_code! {
+    #[test] test_exec_call_mut_arg_tuple_field verus_code! {
         fn bump(x: &mut u8)
             requires *old(x) < 100
             ensures *x == *old(x) + 1
@@ -3656,11 +3656,65 @@ test_verify_one_file! {
             bump(&mut t.0);
             t.0
         }
+    } => Ok(())
+}
+
+// #145: tuple field mutation at index 1, with sibling at index 0
+// preserved. Pins that the anon-ctor rebuild reads `t.1` (Lean-1-
+// indexed) for the unmutated slot at index 0.
+test_verify_one_file! {
+    #[test] test_exec_call_mut_arg_tuple_field_other_preserved verus_code! {
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        #[verifier::tactus_auto]
+        fn call_tuple_idx1_mut(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            let mut t: (u8, u8) = (42, x);
+            bump(&mut t.1);
+            assert(t.0 == 42);  // sibling preserved
+            t.1
+        }
+    } => Ok(())
+}
+
+// #145: arity > 2 stays rejected. Lean's tuple `(a, b, c)` is
+// right-nested `Prod` (`Int × (Int × Int)`), so accessor `.2` on a
+// 3-tuple gives the inner pair, not the second element. The
+// existing `field_access_name` rendering (`.<n+1>`) is correct for
+// arity-2 only. Lifting this needs the broader N-tuple field-access
+// fix (touches every tuple field projection in Tactus, not just
+// &mut). Arity-2 tuples are by far the most common case in Verus
+// code; arity > 2 rejection keeps the slice scoped.
+test_verify_one_file! {
+    #[test] test_exec_call_mut_arg_tuple3_field_rejected verus_code! {
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        #[verifier::tactus_auto]
+        fn call_tuple3_mid_mut(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            let mut t: (u8, u8, u8) = (1, x, 99);
+            bump(&mut t.1);
+            t.1
+        }
     } => Err(err) => {
         assert!(
             err.errors.iter().any(|e|
                 e.message.contains("not a supported L-value shape")),
-            "expected tuple-field rejection, got: {:?}",
+            "expected arity > 2 tuple rejection, got: {:?}",
             err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
         );
     }

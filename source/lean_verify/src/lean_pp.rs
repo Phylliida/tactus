@@ -83,7 +83,7 @@ fn expr_prec(node: &ExprNode) -> u16 {
         ExprNode::Var(_) | ExprNode::Lit(_) | ExprNode::LitBool(_)
         | ExprNode::LitStr(_) | ExprNode::LitChar(_)
         | ExprNode::ArrayLit(_) | ExprNode::StructUpdate { .. }
-        | ExprNode::Anon(_) | ExprNode::Raw(_) => PREC_ATOM,
+        | ExprNode::Anon(_) | ExprNode::Tuple(_) | ExprNode::Raw(_) => PREC_ATOM,
         ExprNode::FieldProj { .. } | ExprNode::Index { .. } => PREC_ATOM,
         // SpanMark is transparent — inherit `inner`'s precedence so
         // wrapping never changes parenthesization.
@@ -613,6 +613,15 @@ fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
                 write_expr(out, e, 0, lm);
             }
             out.push('⟩');
+        }
+
+        ExprNode::Tuple(elts) => {
+            out.push('(');
+            for (i, e) in elts.iter().enumerate() {
+                if i > 0 { out.push_str(", "); }
+                write_expr(out, e, 0, lm);
+            }
+            out.push(')');
         }
 
         // SpanMark: transparent at the value level. Emit a leading
