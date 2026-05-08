@@ -457,6 +457,16 @@ fn check_exp(e: &Exp) -> Result<(), String> {
 
 // ── Theorem builder ────────────────────────────────────────────────────
 
+/// Result of lowering an exec fn body to Lean theorems. `theorems`
+/// is the per-obligation list; `needs_bitvec_instances` flags
+/// whether the fn used `assert(P) by(bit_vector)` (#130) and
+/// therefore the generated file needs the BitVec-related Int
+/// typeclass instances prepended.
+pub struct ExecFnTheorems {
+    pub theorems: Vec<Theorem>,
+    pub needs_bitvec_instances: bool,
+}
+
 /// Build the Lean `Theorem`s for an exec fn body check.
 ///
 /// Returns a `Vec` of one theorem per obligation in the body —
@@ -529,16 +539,6 @@ fn check_exp(e: &Exp) -> Result<(), String> {
 /// precondition is enforced by construction — there's no way to
 /// produce a `Wp` tree without having already cleared the shape
 /// checks.
-/// Result of lowering an exec fn body to Lean theorems. `theorems`
-/// is the per-obligation list; `needs_bitvec_instances` flags
-/// whether the fn used `assert(P) by(bit_vector)` (#130) and
-/// therefore the generated file needs the BitVec-related Int
-/// typeclass instances prepended.
-pub struct ExecFnTheorems {
-    pub theorems: Vec<Theorem>,
-    pub needs_bitvec_instances: bool,
-}
-
 pub fn exec_fn_theorems_to_ast<'a>(
     krate: &'a KrateX,
     fn_sst: &'a FunctionSst,

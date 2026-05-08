@@ -87,6 +87,49 @@ fn write_lean_file(path: &Path, source: &str) -> Result<(), String> {
 
 // ── Preamble builder ───────────────────────────────────────────────────
 
+/// Codegen mode for `krate_preamble` — distinguishes the two entry
+/// points (proof fns vs exec fns) and, for exec fns, whether the
+/// file uses `assert(P) by(bit_vector)`.
+///
+/// Replaces a pair of correlated `bool` parameters whose valid
+/// combinations were `(false, false)` for proof fns and
+/// `(true, _)` for exec fns. The enum makes the correlation
+/// structural — there's no `(false, true)` to worry about, and
+/// each call site says what it is rather than encoding it as
+/// positional bools.
+enum PreambleConfig {
+    /// Proof fns: native match rendering (no accessor fns), no
+    /// bitvec instance emission. Emitting accessors for types
+    /// with non-Inhabited fields breaks Lean elaboration even
+    /// when unused, so the proof-fn path keeps them off.
+    ProofFn,
+    /// Exec fns: emit accessor fns for desugared match (via
+    /// `IsVariant` / `Field`). `needs_bitvec` is `true` when
+    /// the fn used `assert(P) by(bit_vector)` (#130) — adds
+    /// `import Mathlib.Data.BitVec` and the
+    /// `HXor`/`HAnd`/`HOr`/`HShiftLeft`/`HShiftRight Int Int Int`
+    /// instances. Kept out of the default prelude so non-bitvec
+    /// files don't pay the cost (Mathlib.Data.BitVec's simp
+    /// lemmas can change closing behavior of unrelated proof
+    /// fns).
+    ExecFn { needs_bitvec: bool },
+}
+
+impl PreambleConfig {
+    /// Whether the preamble should emit per-variant accessor fns
+    /// for multi-variant inductives.
+    fn emit_accessors(&self) -> bool {
+        matches!(self, PreambleConfig::ExecFn { .. })
+    }
+
+    /// Whether the preamble should include `Mathlib.Data.BitVec` /
+    /// `Lean.Elab.Tactic.BVDecide` imports plus the Int-bitwise
+    /// instance block.
+    fn bitvec_mode(&self) -> bool {
+        matches!(self, PreambleConfig::ExecFn { needs_bitvec: true })
+    }
+}
+
 /// Build the shared preamble: imports, prelude, namespace-open, and entity
 /// declarations transitively referenced by `root_fns`. Returns a (preamble
 /// Vec, namespace) pair. Callers append the theorem command and the matching
@@ -102,21 +145,11 @@ fn krate_preamble(
     imports: &[String],
     crate_name: &str,
     root_fns: &[&FunctionX],
-    // `true` for the exec-fn entry point — exec-fn WPs contain
-    // desugared match expressions (via `IsVariant` / `Field`) that
-    // need accessor fns. `false` for the proof-fn entry point —
-    // proof fns render match natively and don't need accessors,
-    // and emitting accessors for types with non-Inhabited fields
-    // breaks Lean elaboration even when unused.
-    emit_accessors: bool,
-    // `true` only for files that use `assert(P) by(bit_vector)`
-    // (#130). Adds `import Mathlib.Data.BitVec` and the
-    // `HXor`/`HAnd`/`HOr`/`HShiftLeft`/`HShiftRight` Int instances.
-    // Kept out of the default prelude so non-bit_vector files
-    // don't pay the cost (Mathlib.Data.BitVec's simp lemmas can
-    // change closing behavior of unrelated proof fns).
-    bitvec_mode: bool,
+    config: PreambleConfig,
 ) -> (Vec<Command>, String) {
+    let bitvec_mode = config.bitvec_mode();
+    let emit_accessors = config.emit_accessors();
+
     let mut cmds: Vec<Command> = Vec::new();
     for imp in imports {
         cmds.push(Command::Import(imp.clone()));
@@ -227,7 +260,9 @@ pub fn check_proof_fn(
     // preserve match through to VIR-AST), so accessor fns are
     // unnecessary and would fail elaboration for enum types whose
     // field types lack Inhabited.
-    let (mut cmds, ns) = krate_preamble(krate, imports, crate_name, &[proof_fn], false, false);
+    let (mut cmds, ns) = krate_preamble(
+        krate, imports, crate_name, &[proof_fn], PreambleConfig::ProofFn,
+    );
     cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body)));
     cmds.push(Command::NamespaceClose(ns));
 
@@ -311,7 +346,8 @@ pub fn check_exec_fn(
     // `Field`, which the SST renderer routes to the synthesised
     // accessor fns — so the preamble must include them.
     let (mut cmds, ns) = krate_preamble(
-        krate, imports, crate_name, &[vir_fn], true, exec_fn.needs_bitvec_instances,
+        krate, imports, crate_name, &[vir_fn],
+        PreambleConfig::ExecFn { needs_bitvec: exec_fn.needs_bitvec_instances },
     );
 
     for theorem in exec_fn.theorems {
@@ -483,7 +519,7 @@ mod tests {
     fn krate_preamble_omits_bitvec_when_mode_false() {
         let krate = empty_krate();
         let (cmds, _ns) = krate_preamble(
-            &krate, &[], "test_crate", &[], false, /*bitvec_mode=*/ false,
+            &krate, &[], "test_crate", &[], PreambleConfig::ProofFn,
         );
 
         // Check imports: no Mathlib.Data.BitVec, no Lean.Elab.Tactic.BVDecide.
@@ -517,7 +553,8 @@ mod tests {
     fn krate_preamble_emits_bitvec_when_mode_true() {
         let krate = empty_krate();
         let (cmds, _ns) = krate_preamble(
-            &krate, &[], "test_crate", &[], false, /*bitvec_mode=*/ true,
+            &krate, &[], "test_crate", &[],
+            PreambleConfig::ExecFn { needs_bitvec: true },
         );
 
         let imports: Vec<&String> = cmds.iter()
@@ -555,7 +592,8 @@ mod tests {
     fn bv_decide_import_path_pinned() {
         let krate = empty_krate();
         let (cmds, _ns) = krate_preamble(
-            &krate, &[], "test_crate", &[], false, /*bitvec_mode=*/ true,
+            &krate, &[], "test_crate", &[],
+            PreambleConfig::ExecFn { needs_bitvec: true },
         );
 
         const EXPECTED: &str = "Lean.Elab.Tactic.BVDecide";
