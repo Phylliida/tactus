@@ -154,8 +154,12 @@ pub(crate) fn apply_clip_coercion(src_int: bool, dst_int: bool, inner: LExpr) ->
 ///   equals the type's short name) renders as `TypeName.mk` —
 ///   matching Lean's auto-generated `.mk` for single-field-group
 ///   inductives.
-/// * `Dt::Tuple(_)` → Lean anonymous constructor `⟨a, b, c⟩`, which
-///   elaborates against the tuple's product type.
+/// * `Dt::Tuple(_)` → Lean tuple syntax `(a, b, c)` (sugar for
+///   `Prod.mk a (Prod.mk b c)`). Distinct from anon-ctor `⟨a, b, c⟩`
+///   because the bare anon-ctor needs a known expected type — which
+///   isn't available at let-bindings (`let t := ⟨x, 0⟩` fails to
+///   elaborate). Tuple syntax infers `Prod` from the operands and
+///   works without context.
 ///
 /// Both expression renderers (VIR-AST and SST) use this so the ctor
 /// naming convention can't drift between the proof-fn / spec-fn path
@@ -188,7 +192,7 @@ pub(crate) fn ctor_node(
                 }
             }
         }
-        Dt::Tuple(_) => ExprNode::Anon(rendered_fields),
+        Dt::Tuple(_) => ExprNode::Tuple(rendered_fields),
     }
 }
 

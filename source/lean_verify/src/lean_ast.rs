@@ -357,6 +357,7 @@ impl Expr {
     }
 
     pub fn anon(elems: Vec<Expr>) -> Self { Expr::new(ExprNode::Anon(elems)) }
+    pub fn tuple(elems: Vec<Expr>) -> Self { Expr::new(ExprNode::Tuple(elems)) }
 
     /// Wrap `inner` with a source-location marker carrying the
     /// obligation's semantic kind. Transparent at the Lean level;
@@ -432,6 +433,16 @@ pub enum ExprNode {
 
     /// `[a, b, c]` array literal.
     ArrayLit(Vec<Expr>),
+
+    /// `(a, b, c)` Lean tuple syntax — sugar for nested `Prod.mk a (Prod.mk b c)`.
+    /// Distinct from `Anon` (`⟨a, b, c⟩`) because Lean's anon-ctor
+    /// notation requires a known expected type ("expected type of this
+    /// term could not be determined" elaboration error otherwise),
+    /// while `(a, b, c)` infers `Prod` from the operands and works
+    /// without context. Used by `ctor_node` for `Dt::Tuple`
+    /// constructors (which appear in let-bindings without a target
+    /// type) and by `&mut t.<i>` rebind (#145) for the same reason.
+    Tuple(Vec<Expr>),
 
     /// `base[idx]` or `base[idx]!` — array/slice indexing as a dedicated form
     /// so pp can parenthesize the base against application precedence.
@@ -870,6 +881,7 @@ impl ExprNode {
             | ExprNode::ArrayLit(_)
             | ExprNode::Index { .. }
             | ExprNode::Anon(_)
+            | ExprNode::Tuple(_)
             | ExprNode::SpanMark { .. } => ScopeKind::Other,
         }
     }
@@ -942,7 +954,7 @@ where
                 f(e);
             }
         }
-        ExprNode::ArrayLit(es) | ExprNode::Anon(es) => {
+        ExprNode::ArrayLit(es) | ExprNode::Anon(es) | ExprNode::Tuple(es) => {
             for e in es {
                 f(e);
             }
@@ -1051,6 +1063,7 @@ where
             ExprNode::Index { base, idx, bang: *bang }
         }
         ExprNode::Anon(es) => ExprNode::Anon(es.iter().map(|e| f(e)).collect()),
+        ExprNode::Tuple(es) => ExprNode::Tuple(es.iter().map(|e| f(e)).collect()),
         ExprNode::SpanMark { rust_loc, kind, inner } => ExprNode::SpanMark {
             rust_loc: rust_loc.clone(),
             kind: *kind,
