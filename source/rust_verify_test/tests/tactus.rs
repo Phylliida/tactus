@@ -4531,6 +4531,30 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #130 follow-up: associativity. `(x ^ y) ^ z == x ^ (y ^ z)`
+// closes via simp_all + BitVec.xor_assoc. Confirms the enriched
+// simp set handles algebraic identities beyond commutativity.
+test_verify_one_file! {
+    #[test] test_exec_assert_bit_vector_xor_assoc verus_code! {
+        #[verifier::tactus_auto]
+        fn xor_assoc(x: u32, y: u32, z: u32) {
+            assert((x ^ y) ^ z == x ^ (y ^ z)) by(bit_vector);
+        }
+    } => Ok(())
+}
+
+// #130 follow-up: AND/OR commutativity to confirm the symmetric
+// simp lemmas work across operators.
+test_verify_one_file! {
+    #[test] test_exec_assert_bit_vector_and_or_comm verus_code! {
+        #[verifier::tactus_auto]
+        fn and_or_comm(x: u32, y: u32) {
+            assert(x & y == y & x) by(bit_vector);
+            assert(x | y == y | x) by(bit_vector);
+        }
+    } => Ok(())
+}
+
 // #111 negative: a clearly-false bit_vector assertion fails — the
 // tactic chain gives up and `tactus_bit_vector`'s explicit `fail`
 // fires. Confirms the routing actually verifies (rather than
