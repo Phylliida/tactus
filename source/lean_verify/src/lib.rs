@@ -10,6 +10,8 @@ pub mod project;
 pub mod sanity;
 pub mod source_util;
 pub mod sst_to_lean;
+#[cfg(test)]
+pub(crate) mod test_fixtures;
 pub mod to_lean_expr;
 pub mod to_lean_fn;
 pub mod to_lean_sst_expr;
