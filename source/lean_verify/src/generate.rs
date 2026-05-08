@@ -573,6 +573,40 @@ mod tests {
         );
     }
 
+    /// REVIEW lens 4/1: shape-drift guard for the `anonymous_closure`
+    /// path prefix used by Verus to name synthesized closure types.
+    /// `collect_referenced_datatypes` filters these out via
+    /// `short.starts_with("anonymous_closure")` because:
+    ///
+    /// * `Wp::LetRaw` binds the closure as a first-class Lean lambda
+    ///   (#93 slice B), not as an inductive datatype.
+    /// * The synthesized closure datatypes have zero variants — Lean's
+    ///   `deriving Inhabited` rejects zero-variant inductives.
+    ///
+    /// If Verus changes the prefix (e.g., to `closure_anon%` or some
+    /// other shape), our filter silently misses, the synthesized
+    /// types reach `datatype_to_cmds`, and Lean elaboration fails on
+    /// the `deriving Inhabited` synthesis. The error surface (via
+    /// e2e) would be obscure — this test points at the fix site
+    /// directly.
+    ///
+    /// Verus exposes `vir::def::prefix_closure_type(i)` which we use
+    /// as the canonical source of truth.
+    #[test]
+    fn anonymous_closure_prefix_pinned() {
+        let path = vir::def::prefix_closure_type(0);
+        let segment = path.segments[0].as_str();
+        assert!(
+            segment.starts_with("anonymous_closure"),
+            "Verus closure-type prefix drift detected. Tactus's \
+             `collect_referenced_datatypes` filter (in generate.rs) \
+             expects synthesized closure paths to start with \
+             `anonymous_closure`; Verus is now producing `{}`. \
+             Update the filter substring to match.",
+            segment,
+        );
+    }
+
     /// REVIEW lens 3/6: defensive check that `BITVEC_INT_INSTANCES`'
     /// HXor/HAnd/HOr/HShiftLeft/HShiftRight Int instances use `.toNat`
     /// in their bodies — which is total on `Int` (returns 0 for

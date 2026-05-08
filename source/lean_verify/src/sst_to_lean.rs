@@ -5671,4 +5671,78 @@ mod tests {
             "single-level should have `0 ≤ cur` lower bound (#129); got: {}",
             printed);
     }
+
+    /// REVIEW lens 4/2: shape-drift guard for Verus's pre-injection
+    /// of `Assert` (per requires) and `Assume` (per ensures) BEFORE
+    /// the `StmX::AssertBitVector` node. Two Tactus design choices
+    /// are load-bearing on this:
+    ///
+    /// * `obl.wrap_no_hyps` (in `walk_obligations`'s `Wp::AssertBitVector`
+    ///   arm) drops the Hyp frames that come from the pre-injected
+    ///   `Assume(ens)`. Without pre-injection there'd be no hyps to
+    ///   drop, but the BV-mode goal would also lack the soundness-
+    ///   relevant continuation hypothesis.
+    /// * `BITVEC_INT_INSTANCES` (in generate.rs) is emitted because
+    ///   the post-AssertBitVector continuation theorems contain
+    ///   Int-mode `x ^^^ y` from those `Assume(ens)` statements.
+    ///   Without pre-injection, the instances become unused.
+    ///
+    /// If Verus changes the upstream encoding (e.g., drops the
+    /// per-requires Asserts in favor of treating them as free
+    /// assumptions, or drops the per-ensures Assumes now that
+    /// `AssertBitVector` itself publishes ensures), both Tactus
+    /// design choices need re-evaluation.
+    ///
+    /// We grep the upstream source rather than running ast_to_sst
+    /// because constructing a synthetic Ctx is too involved for a
+    /// shape-drift guard. The grep is brittle to phrasing changes
+    /// but robust to semantic-preserving refactors that keep the
+    /// for-loops + StmX::Assert / StmX::Assume push pattern.
+    #[test]
+    fn ast_to_sst_pre_injects_around_assert_bit_vector() {
+        let source = include_str!("../../vir/src/ast_to_sst.rs");
+        let bv_arm_start = source.find("AssertQueryMode::BitVector =>")
+            .expect(
+                "AssertQueryMode::BitVector arm not found in ast_to_sst.rs. \
+                 Either Verus's AssertQueryMode enum was renamed, or the \
+                 BitVector arm was deleted (in which case Tactus's \
+                 StmX::AssertBitVector path may need a different upstream \
+                 entry point)."
+            );
+        // Take a generous window to cover the full arm body.
+        let window_end = (bv_arm_start + 3500).min(source.len());
+        let arm = &source[bv_arm_start..window_end];
+
+        assert!(
+            arm.contains("for r in requires.iter()"),
+            "Verus's AssertQueryMode::BitVector arm no longer iterates \
+             `requires` to push per-clause pre-Asserts. Tactus's \
+             `obl.wrap_no_hyps` design (in walk_obligations's \
+             Wp::AssertBitVector arm) assumes per-requires Asserts are \
+             pre-injected before StmX::AssertBitVector. Update the \
+             design accordingly if upstream encoding has changed."
+        );
+        assert!(
+            arm.contains("for e in ensures.iter()"),
+            "Verus's AssertQueryMode::BitVector arm no longer iterates \
+             `ensures` to push per-clause pre-Assumes. Tactus's \
+             `BITVEC_INT_INSTANCES` emission (in generate.rs) assumes \
+             per-ensures Assumes are pre-injected before \
+             StmX::AssertBitVector (the post-assert continuation \
+             theorems contain Int-mode `x ^^^ y` from these). Update \
+             the design accordingly if upstream encoding has changed."
+        );
+        assert!(
+            arm.contains("StmX::Assert("),
+            "Verus's AssertQueryMode::BitVector arm no longer pushes \
+             StmX::Assert nodes around requires. The per-requires \
+             precondition theorems Tactus emits depend on this."
+        );
+        assert!(
+            arm.contains("StmX::Assume("),
+            "Verus's AssertQueryMode::BitVector arm no longer pushes \
+             StmX::Assume nodes around ensures. The post-assert \
+             ensures-as-hyp behavior depends on this."
+        );
+    }
 }
