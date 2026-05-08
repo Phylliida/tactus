@@ -906,13 +906,35 @@ impl OblCtx {
     }
 
     /// Wrap `goal` with Let / Binder frames only — Hyp frames are
-    /// dropped. Used by `Wp::AssertBitVector` (#111 / #130) so the
-    /// bit_vector solver gets a clean context: only the param/let
-    /// bindings (which it needs for typechecking) and not the
-    /// surrounding code's hypotheses (which may contain Int-mode
-    /// bitwise ops that don't typecheck — Lean lacks `HXor Int Int
-    /// Int`). Mirrors Verus's bit_vector queries which also run with
-    /// a clean context.
+    /// dropped. Used by `Wp::AssertBitVector` (#111 / #130).
+    ///
+    /// **Why dropping is sound for bit_vector:** `assert(P) by(bit_vector)`
+    /// is a self-contained query — its contract is "given the user's
+    /// declared `requires`, prove the `ensures`." Surrounding code's
+    /// hypotheses (from earlier asserts, branch conditions, loop
+    /// invariants, etc.) are incidentally true at the assert site
+    /// but aren't part of the bit_vector query's input. The
+    /// bit_vector solver discharges the obligation in BitVec
+    /// semantics over the user's stated requires alone; the body's
+    /// post-assert continuation walks under the original obl
+    /// (with hyps intact), so nothing is lost downstream. Mirrors
+    /// Verus's bit_vector query encoding which also runs with a
+    /// clean context.
+    ///
+    /// **Why dropping is necessary for typecheck:** the surrounding
+    /// hyps may contain Int-mode bitwise ops (e.g., `x ^^^ y` for
+    /// `x, y : Int`) carried in via `Wp::Assume(ens)` that Verus's
+    /// ast_to_sst pre-injects before `AssertBitVector`. Lean has no
+    /// `HXor Int Int Int` instance unless conditionally added (see
+    /// `BITVEC_INT_INSTANCES`); without `wrap_no_hyps` the
+    /// bit_vector goal's pre-conditions would fail to elaborate
+    /// even when the goal itself typechecks.
+    ///
+    /// Keeps Let / Binder frames because:
+    /// * Let frames may bind names that the bit_vector goal
+    ///   references (e.g., a temp from `let _ret_n := ...; assert by(bit_vector)`).
+    /// * Binder frames carry param types that the goal's `BitVec.ofInt
+    ///   n x` references need for elaboration.
     fn wrap_no_hyps(&self, mut goal: LExpr) -> LExpr {
         for frame in self.frames.iter().rev() {
             goal = match frame {
