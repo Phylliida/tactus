@@ -2645,6 +2645,150 @@ fails as `T.height t < T.height t`).
 277 → 281 e2e (+4 — basic SCC + recursion + cross-type pos +
 cross-type neg). vstd unchanged.
 
+#### Current session (2026-05-05 afternoon cont. — review passes,
+#### #126, #111, #130 + bv_decide)
+
+The afternoon continued with a sequence of refinements and feature
+landings, each expanding what `tactus_auto` exec fns can verify.
+
+**Review pass 1 (#109) — `cfa5fd4`.** Four findings, three fixes
+plus one real bug surfaced:
+* Simplify: `walk_typ_paths` reimplemented `walk_typ`'s
+  recursion. Replaced with delegation + Datatype filter.
+* Reasoning-clarity: 35-line transitive-closure block extracted as
+  `collect_referenced_datatypes` helper.
+* Coverage: 3-element SCC + SCC-plus-standalone tests added.
+* **BUG (caught by coverage test): single-variant non-eponymous
+  enum accessor wildcards.** `enum Pair { Mk(u64) }` (where the
+  variant name doesn't match the type name) goes through
+  `multi_variant_accessor_defs` and emitted catch-all `_ =>
+  default` arms on accessors AND `_ => false` arms on
+  discriminators. For one-variant inductives the first arm is
+  exhaustive — Lean's "Redundant alternative" warning fires and
+  fails verification. Fix: gate wildcards on `variants.len() > 1`.
+  Pinned by `test_exec_single_variant_non_eponymous_enum`. The
+  bug was found because the SCC+standalone coverage test used
+  `enum Pair { Mk(u64) }` for the standalone — an arbitrary
+  choice that walked through code that had been silent forever.
+
+**Review pass 2 (#109) — `70d8eed`.** Two more SCC shapes pinned
+that the prior 4 tests didn't reach: generic mutually-recursive
+(#108/#109 composition) and two independent SCCs in same crate.
+Both passed first try; the abstraction generalized cleanly.
+
+**#109 cross-type shape-drift unit test — `f0e5fa2`.** Closes a
+defer from review pass 2 — synthetic SST with cur:Tree, prev:Forest
+runs through `sst_exp_to_ast_checked` and verifies BOTH `Tree.height`
+and `Forest.height` appear in the rendered output. If a future
+refactor collapses the per-side dispatch back to a single height
+fn, the test fails with a pointed message naming the fix site.
+Two reusable test helpers landed: `mk_test_path`, `typ_datatype`.
+
+**#126: WpCtx::new + walk_loop direct tests — `4dbd451`.** Five
+new unit tests close most of #126:
+* `wpctx_new_empty_reqs_and_ensures_succeeds` (happy path).
+* `wpctx_new_rejects_unsupported_form_in_reqs` (`ExpX::Old` Err).
+* `wpctx_new_rejects_unsupported_form_in_ensures` (symmetry).
+* `walk_loop_skips_init_for_ensures_kind_invariant` (#89 at_entry
+  filter regression guard).
+* `walk_loop_emits_init_for_at_entry_invariant` (companion).
+
+walk_call direct tests deferred — synthetic FunctionX requires
+~30 fields, substantially heavier than the others. DESIGN.md
+"User-facing features not tested" already noted "trust e2e for
+the rest" for this case.
+
+**#111: assert by(bit_vector) routing — `0d7c247`.** Pre-#111
+Tactus rejected `StmX::AssertBitVector` outright. Post-#111 it
+routes through new `Wp::AssertBitVector { req_conj, ens_conj,
+rust_loc, body }` with a hardcoded `tactus_bit_vector` closer.
+First cut: best-effort tactic ladder (`decide` / `simp_all + omega`
+under `intros` / fail). Documented as "half-built" with a
+follow-up plan for proper BitVec encoding.
+
+**#130: BitVec rendering — `50159fd`.** Real bit-vector reasoning.
+* `to_lean_sst_expr::sst_exp_to_bit_vector_ast` — focused renderer
+  that wraps `Var(x : U(n))` as `BitVec.ofInt n x`. Constants stay
+  as numeric literals (Lean's OfNat coerces).
+* `Wp::AssertBitVector` walker uses BV-mode rendering for the
+  goal + `obl.wrap_no_hyps` (new helper) to drop ambient Hyp
+  frames that may carry Int-mode bitwise ops which don't typecheck
+  (Lean has no `HXor Int Int Int` by default).
+* Conditional emission: `ObligationEmitter::needs_bitvec_instances`
+  flag set when `Wp::AssertBitVector` is emitted; `krate_preamble`
+  takes a `bitvec_mode` flag and conditionally injects
+  `import Mathlib.Data.BitVec` + `HXor`/`HAnd`/`HOr`/`HShiftLeft`/
+  `HShiftRight` `Int Int Int` instances. Other generated files
+  stay clean — Mathlib BitVec's simp lemmas affect unrelated
+  proof-fn closing behavior, so isolating them matters.
+
+**bv_decide via Lean core — `b23ea6e`.** Happy surprise: `bv_decide`
+is in Lean 4 core (`Lean.Elab.Tactic.BVDecide`) in the v4.25.0
+toolchain — just wasn't being imported. Adding
+`import Lean.Elab.Tactic.BVDecide` to the conditional bitvec
+preamble unlocks full SAT-backed bit-vector reasoning. Crucially
+`bv_decide` handles BOTH free `BitVec n` vars AND parameterized
+`BitVec.ofInt n x` terms — no bound-hypothesis bridge needed,
+contrary to my earlier diagnosis.
+
+Tactic ladder upgraded: `bv_decide` is now the first rung.
+Identity laws / commutativity / associativity / distributivity all
+close uniformly via the SAT solver.
+
+**The diagnostic loop that mattered.** The user repeatedly asked
+"can't we use the operators directly?" / "we want to do things
+right" — pushing back on the workaround-y prelude pollution. That
+pushback led to (a) conditional emission per-file, and (b)
+discovering bv_decide was already available via the toolchain.
+The workaround-y instances ARE still needed (Verus's ast_to_sst
+pre-injects Int-mode Assume(ens)) but only conditionally for
+files that use `by(bit_vector)`.
+
+**Tests** (288 → 292 e2e total today afternoon-cont):
+* test_exec_single_variant_non_eponymous_enum (regression)
+* test_exec_three_element_datatype_scc
+* test_exec_scc_plus_standalone_datatype
+* test_exec_generic_mutual_scc
+* test_exec_two_independent_sccs
+* test_exec_assert_bit_vector_concrete
+* test_exec_assert_bit_vector_false (negative)
+* test_exec_assert_bit_vector_xor_comm
+* test_exec_assert_bit_vector_xor_self
+* test_exec_assert_bit_vector_xor_assoc
+* test_exec_assert_bit_vector_and_or_comm
+
+Plus 5 unit tests (3 WpCtx::new + 2 walk_loop) and 1 cross-type
+CheckDecreaseHeight shape-drift unit test.
+
+#### Day total (2026-05-05)
+
+22 commits. Eight substantive landings: #98 (walk_children),
+ScopeKind structural lock, #98 coverage tests, #109 (mutual SCCs)
++ stretch (cross-fn-SCC), single-variant enum bug fix, #126
+(WpCtx::new + walk_loop), #111 (assert by(bit_vector) routing),
+#130 (BitVec rendering + bv_decide). Eight poems committed:
+"morning, after", "+94", "Layers", "Two-handed", "The accidental
+witness", "The silent test", "Half-built", "The half-built,
+returning". Test counts: 277 → 292 e2e (+15), 146 → 160 unit
+(+14). vstd 1530/0 unchanged.
+
+The day's unifying lens: *each landing iterated on a structural
+shape from earlier in the day.* Morning's #98 helpers got
+strengthened by ScopeKind. Afternoon #109 surfaced the single-
+variant accessor bug via accidental coverage. #111 shipped half-
+built; #130 made it less half; the bv_decide upgrade closed the
+caveat almost entirely. The user's questions throughout
+("promote it to compile-time?", "can we just use operators
+directly?", "can we add bv_decide to this Mathlib install?")
+kept refining what each task became.
+
+The discipline note: the half-built thing came back. Twice. The
+first poem about it said "we can improve the tactic later
+without changing the surface" — and then we did, but the next
+iteration STILL had a caveat, which was then closed by the next
+iteration after that. None of this was planned. The shape kept
+emerging from the user's pushback.
+
 ## Architecture
 
 ### Full pipeline
@@ -2963,9 +3107,10 @@ themes:
 - **#113** BinaryOp::StrGetChar + string operations.
 - **#127** loop_isolation: false support (#114 sub-feature 2).
 
-Closed: #108 (generic datatype decreases), #109 (mutual SCC decreases,
-2026-05-05), #111 (assert by(bit_vector) via tactus_bit_vector tactic,
-2026-05-05).
+Closed: #108 (generic datatype decreases), #109 (mutual SCC decreases),
+#111 (assert by(bit_vector) routing), #130 (BitVec rendering +
+bv_decide via Lean core import — full SAT-backed bit-vector reasoning).
+All landed 2026-05-05.
 
 ### Architecture cleanups (2 pending)
 
@@ -3137,7 +3282,7 @@ The cleanup pass usually takes 10-30 minutes and catches 3-5 real issues even on
 |---|---|---|
 | `cargo test -p lean_verify --lib` | 154 | AST pp (precedence, tuples, indexing), `substitute` (shadowing, capture avoidance via alpha-rename for Let/Lambda/Forall/Exists/Match incl. Pattern::Binding + dependent types), `mentions_free_var` (binder-scope tracking), `strip_span_marks` + SpanMark metadata preservation through substitute, `walk_children` / `map_children` identity round-trip + visit-count regression guards + `scope_kind` direct categorization + `QuantifierKind::build` dispatch (#98), `Wp` / `walk_obligations` / `contains_loc` / `lift_if_value` (incl. multi-binder chain lift) / `peel_value_position` / `match_single_let_bind`, type translation, sanity check scope tracking + prelude-name auto-derivation, `format_rust_loc`, lean_process, `LeanName` constructors |
 | `cargo test -p lean_verify --test integration` | 7 | Tactus-prelude + Lean invocation end-to-end on hand-written Lean |
-| `vargo test -p rust_verify_test --test tactus` | 286 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes incl. generic `List<A>`-style + multi-param `Tagged<A, B>` with implicit type-param binders + mutually recursive SCCs via Lean `mutual ... end` blocks (#109) including cross-fn-SCC cross-type decreases + 3-element cycles + SCC-plus-standalone mixes + single-variant non-eponymous enums + generic mutual SCCs + multiple independent SCCs in one crate, per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body + &mut x.f via structure update, trait-method calls with impl-strengthened ensures + default-impl invocation, bit-width matrix, control-flow combinations incl. return-in-else / multi-var loops / nested-if-with-loops, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression, new-mut-ref callee-side normalization, exec closure declarations + body verification scope + spec-closure calls, lexicographic decreases for fns + loops with `0 ≤ cur` lower bound, ret-substitution at call sites for `r == E` ensures) |
+| `vargo test -p rust_verify_test --test tactus` | 292 | Full e2e: VIR → AST → Lean for proof fns + exec fns (all slices, source mapping, match automation, recursive datatypes incl. generic `List<A>`-style + multi-param `Tagged<A, B>` with implicit type-param binders + mutually recursive SCCs via Lean `mutual ... end` blocks (#109) including cross-fn-SCC cross-type decreases + 3-element cycles + SCC-plus-standalone mixes + single-variant non-eponymous enums + generic mutual SCCs + multiple independent SCCs in one crate, `assert(P) by(bit_vector)` via BitVec-mode rendering + Lean core `bv_decide` (#111/#130: concrete + commutativity + associativity + AND/OR comm + xor_self + negative), per-obligation theorems with AssertKind labels pinned, &mut at call sites + callee-side &mut body + &mut x.f via structure update, trait-method calls with impl-strengthened ensures + default-impl invocation, bit-width matrix, control-flow combinations incl. return-in-else / multi-var loops / nested-if-with-loops, lossy-accept paths, name-collision regression guard, assume warning, per-fn tactic override, tactus_usize_bound, HeightCompare, labeled break, reveal_with_fuel/unfold workflow, array indexing via array_index, invariant_except_break / loop ensures, chained-compare distinct-temps regression, new-mut-ref callee-side normalization, exec closure declarations + body verification scope + spec-closure calls, lexicographic decreases for fns + loops with `0 ≤ cur` lower bound, ret-substitution at call sites for `r == E` ensures) |
 | `vargo test -p rust_verify_test --test tactus_coverage` | 1 | Coverage assertion: expected VIR variants all hit by `walk_expr`/`walk_place` |
 | `vargo build --release` (vstd) | 1530 | Regression guard: vstd proof library still verifies |
 
