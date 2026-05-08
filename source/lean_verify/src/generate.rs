@@ -572,5 +572,40 @@ mod tests {
             EXPECTED,
         );
     }
+
+    /// REVIEW lens 3/6: defensive check that `BITVEC_INT_INSTANCES`'
+    /// HXor/HAnd/HOr/HShiftLeft/HShiftRight Int instances use `.toNat`
+    /// in their bodies — which is total on `Int` (returns 0 for
+    /// negatives). Tactus only emits these ops on bounded-non-negative
+    /// u-type Ints, so the negative-Int path is unreachable from
+    /// emitted code; but the *instances themselves* must remain total
+    /// to elaborate without warning, and a future refactor switching
+    /// to a partial function would silently regress this property.
+    ///
+    /// Documented as a soundness trade-off in DESIGN.md: the
+    /// `(-1 : Int).toNat = 0` semantics means `(-1) ^^^ x = x.toNat`
+    /// — wonky but total. If a future Tactus path emits these on
+    /// negative Ints, the values are wrong but no panic; the wonky
+    /// semantics stays a "watch out" item, not a hard error.
+    #[test]
+    fn bitvec_int_instances_use_to_nat_total_form() {
+        // The structural property: each instance's RHS goes through
+        // `.toNat` (which is total). If a maintainer changes one to
+        // (e.g.) `Int.toNat!` — partial, panics on negative — the
+        // test fires.
+        for op in &["HXor", "HAnd", "HOr", "HShiftLeft", "HShiftRight"] {
+            let instance_line: Option<&str> = BITVEC_INT_INSTANCES.lines()
+                .find(|l| l.contains(&format!("instance : {} Int Int Int", op)));
+            let line = instance_line.unwrap_or_else(|| panic!(
+                "BITVEC_INT_INSTANCES missing instance for {}", op
+            ));
+            assert!(line.contains("a.toNat"),
+                "{} instance must use a.toNat (total form) in its body; got: {}",
+                op, line);
+            assert!(line.contains("b.toNat"),
+                "{} instance must use b.toNat (total form) in its body; got: {}",
+                op, line);
+        }
+    }
 }
 
