@@ -165,10 +165,22 @@ macro "tactus_usize_bound" : tactic => `(tactic|
 -- richer reasoning needs the bridge.
 macro "tactus_bit_vector" : tactic => `(tactic|
   first
+    -- `bv_decide` is Lean core's full SAT-backed bit-vector
+    -- decision procedure (in `Lean.Elab.Tactic.BVDecide`). It
+    -- handles both free `BitVec n` vars AND parameterized
+    -- `BitVec.ofInt n x` terms — closes general bit-vector
+    -- identities including XOR/AND/OR commutativity,
+    -- associativity, distributivity, identity laws, masking,
+    -- etc. Tactus renders u-typed operands as `BitVec.ofInt n x`
+    -- so users can write any algebraic / decidable bitwise
+    -- assertion and have it close.
+    | (intros <;> bv_decide)
+    | bv_decide
+    -- Fallbacks for goals bv_decide can't (somehow) handle:
+    -- structural equality reduction via decide (concrete cases),
+    -- then simp_all (Mathlib BitVec lemmas).
     | (intros <;> decide)
     | decide
-    | (intros <;> simp_all [BitVec.xor_comm, BitVec.and_comm, BitVec.or_comm])
-    | simp_all [BitVec.xor_comm, BitVec.and_comm, BitVec.or_comm]
     | (intros <;> simp_all)
     | simp_all
     | fail "tactus_bit_vector: could not discharge — try \

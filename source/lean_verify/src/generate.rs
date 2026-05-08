@@ -123,6 +123,11 @@ fn krate_preamble(
     }
     if bitvec_mode {
         cmds.push(Command::Import("Mathlib.Data.BitVec".to_string()));
+        // Lean core's full SAT-backed bit-vector decision procedure
+        // (#130 follow-up). Lives at `Lean/Elab/Tactic/BVDecide` in
+        // the v4.25.0 toolchain — must be imported explicitly; the
+        // top-level `import Lean` doesn't pull it in.
+        cmds.push(Command::Import("Lean.Elab.Tactic.BVDecide".to_string()));
     }
     cmds.push(Command::Raw(TACTUS_PRELUDE.to_string()));
     if bitvec_mode {
