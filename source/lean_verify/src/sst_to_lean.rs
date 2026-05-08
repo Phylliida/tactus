@@ -4246,6 +4246,7 @@ mod tests {
     //! These tests are direct-in-crate rather than integration so
     //! they can exercise private items (`Wp`, `build_wp`, etc.).
     use super::*;
+    use crate::test_fixtures::{empty_krate, mk_path, typ_datatype, typ_int};
     use std::sync::Arc;
     use vir::ast::{
         IntRange, SpannedTyped, TypX, VarIdent, VarIdentDisambiguate,
@@ -4331,7 +4332,6 @@ mod tests {
         assert_eq!(sanitize_loc_for_name("foo_bar.rs:10:20"), "foo_bar_10_20");
     }
 
-    fn typ_int() -> Typ { Arc::new(TypX::Int(IntRange::Int)) }
     fn typ_bool() -> Typ { Arc::new(TypX::Bool) }
 
     fn var_ident(name: &str) -> VarIdent {
@@ -5030,26 +5030,6 @@ mod tests {
             "disjunction with `otherwise` branch should be present: {}", printed);
     }
 
-    /// Construct a synthetic local-crate `Path` for tests, e.g.
-    /// `mk_test_path("Tree")` → path with single segment "Tree".
-    fn mk_test_path(name: &str) -> vir::ast::Path {
-        Arc::new(vir::ast::PathX {
-            krate: None,
-            segments: Arc::new(vec![Arc::new(name.to_string())]),
-        })
-    }
-
-    /// Construct a `TypX::Datatype(Dt::Path(name), [], [])` Typ for
-    /// tests. No type args (concrete datatype), no impl paths.
-    fn typ_datatype(name: &str) -> Typ {
-        use vir::ast::{Dt, TypX};
-        Arc::new(TypX::Datatype(
-            Dt::Path(mk_test_path(name)),
-            Arc::new(vec![]),
-            Arc::new(vec![]),
-        ))
-    }
-
     #[test]
     fn check_decrease_height_cross_type_shape_pinned() {
         // #109 stretch: cross-fn-SCC mutual recursion where cur and
@@ -5412,26 +5392,6 @@ mod tests {
     // logic is shared with the body-walk path, so a shared regression
     // here would also surface via e2e — but the focused test gives a
     // pointed error site if the validation flow drifts.
-
-    /// Build an empty `KrateX` for tests. All collections empty,
-    /// arch set to the architecture-agnostic `Either32Or64`.
-    fn empty_krate() -> KrateX {
-        use vir::ast::{Arch, ArchWordBits};
-        KrateX {
-            functions: vec![],
-            reveal_groups: vec![],
-            datatypes: vec![],
-            opaque_types: vec![],
-            traits: vec![],
-            trait_impls: vec![],
-            assoc_type_impls: vec![],
-            modules: vec![],
-            external_fns: vec![],
-            external_types: vec![],
-            path_as_rust_names: vec![],
-            arch: Arch { word_bits: ArchWordBits::Either32Or64 },
-        }
-    }
 
     /// Build a minimal `FuncCheckSst` with the given reqs and
     /// ens_exps. Body is an empty Block; no local decls; no destination.

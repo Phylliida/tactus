@@ -488,27 +488,7 @@ fn debug_check(_cmds: &[Command]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Empty KrateX for testing the preamble in isolation. No fns,
-    /// no datatypes — preamble just emits its prelude content +
-    /// namespace open.
-    fn empty_krate() -> KrateX {
-        use vir::ast::{Arch, ArchWordBits};
-        KrateX {
-            functions: vec![],
-            reveal_groups: vec![],
-            datatypes: vec![],
-            opaque_types: vec![],
-            traits: vec![],
-            trait_impls: vec![],
-            assoc_type_impls: vec![],
-            modules: vec![],
-            external_fns: vec![],
-            external_types: vec![],
-            path_as_rust_names: vec![],
-            arch: Arch { word_bits: ArchWordBits::Either32Or64 },
-        }
-    }
+    use crate::test_fixtures::empty_krate;
 
     /// REVIEW lens 14: `bitvec_mode = false` must NOT emit any
     /// BitVec-related preamble. Important because `Mathlib.Data.BitVec`

@@ -644,33 +644,9 @@ fn tarjan_scc<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_fixtures::{mk_path, typ_datatype, typ_int};
     use air::ast::BinderX;
     use std::sync::Arc;
-
-    /// Synthetic single-segment Path. `mk_path("Tree")` →
-    /// `crate::Tree`-like path with one segment.
-    fn mk_path(name: &str) -> Path {
-        Arc::new(PathX {
-            krate: None,
-            segments: Arc::new(vec![Arc::new(name.to_string())]),
-        })
-    }
-
-    /// Synthetic Typ for a non-generic concrete datatype reference,
-    /// e.g., `mk_dt_typ("Tree")` → `TypX::Datatype(Dt::Path("Tree"), [], [])`.
-    fn mk_dt_typ(name: &str) -> Typ {
-        Arc::new(TypX::Datatype(
-            Dt::Path(mk_path(name)),
-            Arc::new(vec![]),
-            Arc::new(vec![]),
-        ))
-    }
-
-    /// Synthetic Int Typ — used for non-recursive fields that
-    /// shouldn't produce edges in the SCC graph.
-    fn int_typ() -> Typ {
-        Arc::new(TypX::Int(IntRange::Int))
-    }
 
     /// Build a minimal `DatatypeX` with the given name and one
     /// variant containing `field_types` as positional fields. All
@@ -720,7 +696,7 @@ mod tests {
     /// group. Just one inductive declaration; no `mutual` block needed.
     #[test]
     fn order_datatypes_non_recursive_is_single() {
-        let a = mk_datatype("A", vec![int_typ()]);
+        let a = mk_datatype("A", vec![typ_int()]);
         let groups = order_datatypes(&[&a]);
         assert_eq!(groups.len(), 1);
         match &groups[0] {
@@ -736,7 +712,7 @@ mod tests {
     /// `DatatypeGroup`.
     #[test]
     fn order_datatypes_self_recursive_is_single() {
-        let stack = mk_datatype("Stack", vec![mk_dt_typ("Stack")]);
+        let stack = mk_datatype("Stack", vec![typ_datatype("Stack")]);
         let groups = order_datatypes(&[&stack]);
         assert_eq!(groups.len(), 1);
         match &groups[0] {
@@ -751,8 +727,8 @@ mod tests {
     /// test isolates the SCC algorithm without going through Verus.
     #[test]
     fn order_datatypes_tree_forest_scc_is_mutual() {
-        let tree = mk_datatype("Tree", vec![mk_dt_typ("Forest")]);
-        let forest = mk_datatype("Forest", vec![mk_dt_typ("Tree")]);
+        let tree = mk_datatype("Tree", vec![typ_datatype("Forest")]);
+        let forest = mk_datatype("Forest", vec![typ_datatype("Tree")]);
         let groups = order_datatypes(&[&tree, &forest]);
         assert_eq!(groups.len(), 1);
         match &groups[0] {
@@ -770,9 +746,9 @@ mod tests {
     /// the algorithm scales beyond the 2-element case.
     #[test]
     fn order_datatypes_three_element_scc_is_mutual() {
-        let a = mk_datatype("A", vec![mk_dt_typ("B")]);
-        let b = mk_datatype("B", vec![mk_dt_typ("C")]);
-        let c = mk_datatype("C", vec![mk_dt_typ("A")]);
+        let a = mk_datatype("A", vec![typ_datatype("B")]);
+        let b = mk_datatype("B", vec![typ_datatype("C")]);
+        let c = mk_datatype("C", vec![typ_datatype("A")]);
         let groups = order_datatypes(&[&a, &b, &c]);
         assert_eq!(groups.len(), 1);
         match &groups[0] {
@@ -787,9 +763,9 @@ mod tests {
     /// rather than collapsing everything into one group.
     #[test]
     fn order_datatypes_scc_plus_standalone() {
-        let tree = mk_datatype("Tree", vec![mk_dt_typ("Forest")]);
-        let forest = mk_datatype("Forest", vec![mk_dt_typ("Tree")]);
-        let pair = mk_datatype("Pair", vec![int_typ()]);
+        let tree = mk_datatype("Tree", vec![typ_datatype("Forest")]);
+        let forest = mk_datatype("Forest", vec![typ_datatype("Tree")]);
+        let pair = mk_datatype("Pair", vec![typ_int()]);
         let groups = order_datatypes(&[&tree, &forest, &pair]);
         assert_eq!(groups.len(), 2);
 
