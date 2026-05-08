@@ -3464,7 +3464,15 @@ fn build_wp<'a>(
                     "assert by(nonlinear_arith) not yet supported".to_string()
                 ),
                 AssertQueryMode::BitVector => Err(
-                    "assert by(bit_vector) not yet supported".to_string()
+                    // Defensive: Verus's `ast_to_sst` (vir/src/ast_to_sst.rs:2416)
+                    // converts user-syntax `assert by(bit_vector)` directly into
+                    // `StmX::AssertBitVector`, so this arm should be unreachable.
+                    // Hitting it means the upstream conversion pipeline drifted
+                    // — the dedicated `StmX::AssertBitVector` path (#111 / #130)
+                    // is what actually handles user `by(bit_vector)` asserts.
+                    "internal bug: AssertQueryMode::BitVector reached the SST \
+                     codegen — Verus's ast_to_sst should have already converted \
+                     this to StmX::AssertBitVector. Please open an issue.".to_string()
                 ),
             }
         }
