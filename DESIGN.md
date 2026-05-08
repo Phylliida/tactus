@@ -924,13 +924,20 @@ recursion pass covers all cross-fn calls in the cycle the same way.
     structure-update syntax `let x := { x with f := <fresh> }`
     (no havoc-base + assume-other-fields-unchanged dance — Lean's
     type system enforces other-fields-unchanged structurally).
-    `&mut v[i]` (Index L-value), deeper field paths (`&mut a.b.c`),
-    multi-variant enum field mutation, and tuple field mutation
-    (`&mut t.0`) remain deferred. Tuple specifically: Lean's
-    structure-update syntax doesn't compose with `Prod` types
-    ("expected structure" elaboration error), so a different
-    encoding is needed (explicit ctor rebuild, e.g.
-    `let t := (v, t.1)`).
+    Deeper field paths LANDED via #144 — `extract_mut_target` peels
+    multiple `Field` levels (`MutTargetRaw::Field { field_oprs:
+    Vec<&FieldOpr> }`); rebind builds nested structure-updates inside-
+    out (`let a := { a with b := { a.b with c := <fresh> } }`).
+    Single-variant gate applied at each level. Tuple field mutation
+    (`&mut t.0`) LANDED via #145 + #146 — Lean's structure-update
+    syntax doesn't compose with `Prod`, so the rebind uses Lean tuple
+    syntax `(t.1, fresh)` (sugar for `Prod.mk`) via a new
+    `MutTargetRaw::TupleField` variant + `ExprNode::Tuple` AST node.
+    `tuple_field_accessor` helper produces the correct multi-segment
+    Lean accessor for arity > 2 (`.2.1` etc., since Lean N-tuples are
+    right-nested `Prod`). `&mut v[i]` (Index L-value) and multi-
+    variant enum field mutation remain deferred — different reasons
+    (see "Edge cases observed but not yet handled" below).
   - **Legacy-mode `VarAt(p, Pre)` AND new-mut-ref-mode
     `MutRefCurrent`/`MutRefFuture` UnaryOps both handled.**
     New-mut-ref shapes are normalized back to the legacy shape
@@ -987,23 +994,57 @@ recursion pass covers all cross-fn calls in the cycle the same way.
     active in the same crate — pins the shared `varat_pre_name`
     contract).
 
-    **Still deferred**: `&mut v[i]` (Index L-value), deeper paths
-    `&mut a.b.c`, multi-variant enum field mutation (Lean's
-    structure-update syntax doesn't compose with multi-variant
-    inductives), tuple field mutation `&mut t.0` (structure update
-    doesn't work for `Prod` either — needs ctor rebuild instead).
-    `&mut x.f` for single-variant structs LANDED via #87 using
-    Lean's structure update — the encoding doesn't need havoc-base
-    + assume-other-fields-unchanged because Lean's `{ x with f := … }`
-    syntax structurally preserves all other fields.
+    **Still deferred** (post-#144 / #145 / #146):
+    * `&mut v[i]` (Index L-value) — cross-crate-blocked. Vec/array
+      indexing in Rust desugars to `vstd::vec::Vec::index_mut` /
+      `vstd::array::array_index_get_mut`; Tactus can't inline these
+      specs without vstd integration (#122 Phase 3 cross-crate). Even
+      with that, Index would need a different rebind encoding (Lean's
+      `Array.set` or `Vector.set` style + a "this index unchanged for
+      j ≠ i" property).
+    * Multi-variant enum field mutation — upstream-blocked at Verus's
+      mode check. Verus rejects `ref mut` patterns: "The verifier
+      does not yet support the following Rust feature: &mut types,
+      except in special cases." Direct `&mut foo.f` for enum-typed
+      `foo` isn't expressible in Rust without unsafe; Verus's only
+      viable shape (pattern binding `if let Foo::A { ref mut val }`)
+      is rejected upstream. Pinned by
+      `test_exec_call_mut_arg_enum_field_upstream_blocked`.
+    * Mixed tuple-and-struct paths: `&mut s.tup.0` (struct field is
+      a tuple) and `&mut t.0.f` (tuple element is a struct). The
+      current `MutTargetRaw` separates `Field` (struct path) from
+      `TupleField` (single-level tuple); a unified
+      `Vec<FieldKind>` representation would handle mixed paths but
+      adds complexity proportional to the use case (no realistic
+      Rust code likely produces these shapes).
+    `&mut x.f` for single-variant structs LANDED via #87; deeper
+    paths `&mut a.b.c` LANDED via #144; tuple field mutation
+    `&mut t.<i>` LANDED via #145 (arity-2) + #146 (arity > 2).
+    None of the landed cases need havoc-base + assume-other-fields-
+    unchanged — Lean's structure-update / tuple syntax IS "all
+    other fields unchanged" structurally.
 
-    **New-mut-ref mode `MutRefCurrent` / `MutRefFuture` LANDED
-    callee-side via #95** through a pre-rewrite normalization step
-    that maps new-mut-ref SST shapes back to the legacy shape so
-    #94's existing rewrite handles them. **Caller-side new-mut-ref
-    still deferred** — synthetic MutRef-typed locals around exec
-    calls don't go through param-set normalization. See the
-    "&mut args on calls" Tier 3 entry for details.
+    **New-mut-ref mode `MutRefCurrent` / `MutRefFuture`** —
+    callee-side LANDED via #95 (pre-rewrite normalization step that
+    maps new-mut-ref SST shapes back to the legacy shape so #94's
+    existing rewrite handles them). **Caller-side LANDED via #107**:
+    synthetic `LocalDeclKind::BorrowMut` locals (Verus introduces
+    these around `bump(&mut y)` lowering: `let mut_ref: MutRef<u8>;
+    assume(MutRefCurrent(mut_ref) == y); bump(mut_ref); y =
+    MutRefFuture(mut_ref);`) are now folded into `mut_param_names`
+    so the existing #95 normalization handles them; new
+    `build_borrow_mut_binders` emits a theorem-level binder per
+    BorrowMut local; `extract_mut_target` recognizes bare
+    `Var(borrow_mut_local)` (no surrounding `Loc`) as a Var L-value;
+    `is_mut_ref_par`-equivalent check in `build_call_mut_args`
+    covers both legacy `is_mut: true` and new-mut-ref `MutRef<T>`
+    typ. Pinned by `test_exec_call_mut_arg_new_mut_ref` /
+    `_two_mut_args_new_mut_ref` / `_use_after`. Negative test for
+    wrong-post-call assertion couldn't be pinned — the test
+    framework reports `Err expected, got Ok` but no test_inputs
+    dir is created, suggesting Verus's new-mut-ref pipeline
+    swallows the error rather than surfacing it. Worth a future
+    investigation; positive coverage is solid.
 * **Non-int decreases** — datatype-typed decreases via emitted
   `T.height` companion fn (see #54 in Tier 2). Int decreases work
   via the transparent-identity `height` for ints.
@@ -1501,14 +1542,63 @@ exec fns."
   `MutArgInfo.field_path: Option<String>` carries the field name
   through to `push_post_call_frames` Phase 4.
 
+  **`&mut a.b.c` (deeper field paths) LANDED via #144.**
+  `MutTargetRaw::Field` extended to carry `field_oprs:
+  Vec<&FieldOpr>` (peel order, outermost-first = deepest-mutated-
+  first). `extract_mut_target` rewritten as a peel loop that
+  collects field oprs through any depth; single-variant gate
+  applied at each level. `push_post_call_frames` Phase 4 builds
+  nested structure-updates inside-out — for `&mut a.b.c` emits
+  `let a := { a with b := { a.b with c := <fresh> } }`. Same
+  "no havoc encoding needed" win as #87.
+
+  **`&mut t.<i>` (tuple field) LANDED via #145 + #146.**
+  `MutTargetRaw::TupleField { base, index, arity }` variant. Lean's
+  `{ x with f := v }` syntax doesn't compose with `Prod`, so the
+  rebind uses Lean tuple syntax `(t.1, fresh)` (sugar for
+  `Prod.mk a b`) — distinct from anon-ctor `⟨a, b⟩` which fails to
+  elaborate at let-bindings without a type hint. New
+  `ExprNode::Tuple(Vec<Expr>)` AST variant pretty-prints as
+  `(a, b, c)`; replaces the prior `ExprNode::Anon` rendering for
+  `Dt::Tuple` ctors at `expr_shared::ctor_node` (the latent bug
+  where every tuple let-binding had been failing to elaborate
+  was masked because no exec-mode tuple let-binding test existed
+  pre-#145). #146 added `tuple_field_accessor(arity, n)` helper:
+  arity-2 i=0 → `1`; arity-3 i=1 → `2.1`; arity-4 i=2 → `2.2.1`;
+  arity-N last position → `2` repeated N-1 times. Lean's
+  right-nested `Prod` (`(a, b, c) : Int × (Int × Int)`) needs
+  the multi-segment accessor for elements past the second; the
+  existing `field_access_name` returned `(n+1).to_string()`
+  which was correct for arity-2 only — Tactus had no arity > 2
+  tuple test before #146 to catch it.
+
   **Explicit deferrals (still rejected in `build_wp_call`):**
-  - **`&mut v[i]`** (Index L-value), **deeper paths** (`&mut a.b.c`),
-    **multi-variant enum field mutation**. The single-variant gate
-    in `extract_mut_target` catches the multi-variant case
-    explicitly (Lean's structure-update syntax doesn't compose with
-    multi-variant inductives). Deeper paths and Index need separate
-    encodings (Index in particular needs a way to express the array
-    "one-element-changed" property).
+  - **`&mut v[i]`** (Index L-value) — **cross-crate-blocked**.
+    Vec/array indexing in Rust desugars to
+    `vstd::vec::Vec::index_mut` / `vstd::array::array_index_get_mut`;
+    Tactus can't inline these specs without vstd integration
+    (#122 Phase 3 cross-crate). Even with that, Index would need
+    a different rebind encoding (Lean's `Array.set`/`Vector.set`
+    style + a "this index unchanged for j ≠ i" property).
+  - **Multi-variant enum field mutation** — **upstream-blocked
+    at Verus's mode check**. Verus rejects `ref mut` patterns:
+    "The verifier does not yet support the following Rust feature:
+    &mut types, except in special cases." Direct `&mut foo.f` for
+    enum-typed `foo` isn't expressible in Rust without unsafe;
+    the only viable shape (pattern binding `if let Foo::A { ref
+    mut val }`) is rejected upstream. Pinned by
+    `test_exec_call_mut_arg_enum_field_upstream_blocked`. If Verus
+    ever lifts `ref mut`, the test surfaces as flippable Err and
+    Tactus would need a match-and-rebuild encoding (Lean's
+    `match foo with | Foo.A x y => Foo.A fresh y | other => other`
+    — the wildcard arm keeps the match exhaustive even when
+    semantically unreachable).
+  - **Mixed tuple-and-struct paths** (`&mut s.tup.0`,
+    `&mut t.0.f`). `MutTargetRaw` separates `Field` (struct path)
+    from `TupleField` (single-level tuple); a unified
+    `Vec<FieldKind>` representation would handle mixed paths but
+    no realistic Rust code likely produces these shapes —
+    deferred until motivated.
   - **New-mut-ref mode (`UnaryOp::MutRefCurrent` /
     `MutRefFuture`) — LANDED via #95 (callee-side body
     verification).** A pre-rewrite normalization step
@@ -2283,11 +2373,13 @@ When the target is Lean's dependent type theory, some of these encodings collaps
 
 When the answers differ, the Lean-native shape is usually shorter, tighter, and reduces the unverified surface between Verus and Tactus. The translation table (DESIGN.md § "Expression mapping") leans heavily on this: `=~=` (extensional equality) maps to `=` not because we encode extensionality, but because Lean 4's `=` already IS extensional on functions via funext.
 
-**Where this discipline applies in the deferred queue.**
-* **Deeper field paths** (`&mut a.b.c`) extend #87's structure-update pattern recursively: `let a := { a with b := { a.b with c := <fresh> } }`. No havoc encoding.
-* **Multi-variant enum field mutation** is the one case Lean's structure-update syntax doesn't compose with — it'd need a match-and-rebuild encoding. But that's a specific Lean idiom (`match a with | Variant fs => Variant { fs with f := <fresh> }`), not a havoc.
+**Where this discipline applies (landed and outstanding).**
+* **Deeper field paths** (`&mut a.b.c`) — LANDED via #144. Extends #87's structure-update pattern recursively: `let a := { a with b := { a.b with c := <fresh> } }`. No havoc encoding.
+* **Tuple field mutation** (`&mut t.<i>`) — LANDED via #145 (arity-2) + #146 (arity > 2). Lean's `{ x with f := v }` syntax doesn't compose with `Prod`, but Lean's tuple syntax `(a, b, c)` does — it's `Prod.mk` sugar that infers from operands without a type hint. The rebind reads each unmodified slot via `tuple_field_accessor(arity, j)` (multi-segment for nested-Prod arity > 2: `.2.1`, `.2.2.1`, etc.) and substitutes `fresh` at the mutated slot. New `ExprNode::Tuple` AST variant; the latent rendering bug at let-bindings (`let t := ⟨x, 0⟩` failing to elaborate without context) was masked because no arity > 2 tuple test existed pre-#145.
+* **Multi-variant enum field mutation** — upstream-blocked at Verus. Direct `&mut foo.f` for enum-typed `foo` isn't expressible in Rust without unsafe; the only viable shape (pattern binding `if let Foo::A { ref mut val }`) is rejected by Verus's mode check ("does not yet support &mut types"). If it ever lifts, the encoding is `match foo with | Foo.A x y => Foo.A fresh y | other => other` — a specific Lean idiom, not a havoc.
 * **Closures (#93)** target Lean's first-class function types directly rather than encoding the FnOnce/Fn/FnMut hierarchy as Z3 axioms. Closure declarations bind `cid` to a real Lean lambda (`fun (x : T) => body`) via `Wp::LetRaw`; calls to spec closures lower to `App(f, args)`. Verus's synthesized `Assume(forall|x| ClosureReq(cid, x) ↔ ... ∧ ClosureEns(cid, x, body(x)) ↔ ...)` is dropped because the lambda binding IS the same fact structurally — no axiomatization needed. The only piece this encoding doesn't yet cover is exec-mode closure CALLS (Verus's `exec_nonstatic_call` desugar), which is upstream-blocked rather than encoding-shaped.
-* **Indexed L-values (`&mut v[i]`)** need a `Vector.set i v` style encoding — Lean has it, no havoc needed.
+* **Indexed L-values (`&mut v[i]`)** would use a `Vector.set i v` style encoding — Lean has it, no havoc needed. Currently cross-crate-blocked (Vec/array indexing routes through vstd; #122 Phase 3 dependency).
+* **Caller-side new-mut-ref mode (#107)** — synthetic `LocalDeclKind::BorrowMut` locals from Verus's `bump(&mut y)` lowering are folded into the existing `mut_param_names` set; same architectural pattern as #95 callee-side, applied one layer further. The structural insight: extend recognition rather than build new infrastructure.
 * **Ret-substitution at call sites (#128)** — when a callee's ensures contains `r == E` (uniquely determining the return value), the caller's post-call frames *don't* need a `∀ ret, ret_bound → ensures(ret) → let dest := ret;` chain. Tactus replaces it with `let dest := E; (E_bound) → (ensures with ret := E) → …`, eliminating the ∀-quantifier entirely. Verus's Z3 path emits the ∀ because SMT can't natively substitute a logical variable with a witnessing expression — the ensures clause acts as the substitution glue. Lean substitutes definitionally via `let`. Same fact, structural rather than asserted. Beyond aesthetics: the ∀-Prop shape blocked `tactus_auto`'s default closer (omega rejects ∀-Prop). #128's substitution path makes cond_setup goals (function-call-in-loop-cond) close under the default closer with no override needed — see "Ret-substitution at call sites (#128)" below for the full encoding details.
 
 **When the discipline doesn't apply.** Some obligations are inherently shaped by the source semantics, not the target. Termination via `CheckDecreaseHeight`, fixed-width integer overflow checks, and SSA mutation as let-shadowing are all encodings the SMT path uses that translate cleanly because the property at hand IS first-order arithmetic (or first-order shadowing). The discipline matters most when the property is *higher-order* or *structural* — where Lean's expressivity exceeds SMT's.
