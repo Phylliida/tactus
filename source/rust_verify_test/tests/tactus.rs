@@ -6450,20 +6450,23 @@ test_verify_one_file_with_options! {
     } => Ok(())
 }
 
-// Caller-side probe: caller is tactus_auto; callee uses Verus's
-// Z3 path. Currently rejected because the inlined ensures contains
-// MutRefFuture(MutRefFuture) which the caller-side substitution
-// pipeline doesn't yet handle.
-// Caller side stays deferred: in new-mut-ref mode, `bump(&mut y)`
-// lowers to a synthetic MutRef-typed local plus assume-pre + assign-
-// post wrappers. The MutRef* ops then wrap synthetic locals, not fn
-// params, so the param-set normalization (#95 callee-side) doesn't
-// reach them. Caller-side new-mut-ref needs either (a) extending the
-// "MutRef-typed name set" beyond fn params to include synthetic locals
-// of MutRef type, or (b) a structural Lean encoding of MutRef<T> as
-// a pair (which would be a richer follow-up).
+// Caller-side new-mut-ref (#107): caller is tactus_auto; callee uses
+// Verus's Z3 path. The synthetic `LocalDeclKind::BorrowMut` local
+// Verus introduces around `bump(&mut y)` is now treated as a `&mut`
+// L-value at the call site:
+//   1. `mut_param_names` includes BorrowMut locals (so
+//      `normalize_mut_ref_in_*` rewrites the `MutRefCurrent`/`MutRefFuture`
+//      ops to bare `Var(local)`).
+//   2. `build_borrow_mut_binders` emits a theorem-level binder for
+//      each BorrowMut local (so `Var(local)` resolves).
+//   3. `extract_mut_target` recognizes bare `Var(borrow_mut_local)`
+//      as a Var target (so #55's caller-side mut_args machinery
+//      handles the substitution + Let-rebind).
+//   4. `build_call_mut_args` gates on `is_mut_ref_par`-equivalent
+//      (covers both legacy `is_mut: true` and new-mut-ref `MutRef<T>`
+//      typ).
 test_verify_one_file_with_options! {
-    #[test] test_exec_call_mut_arg_new_mut_ref_rejected ["new-mut-ref"] => verus_code! {
+    #[test] test_exec_call_mut_arg_new_mut_ref ["new-mut-ref"] => verus_code! {
         #[verifier::deprecated_postcondition_mut_ref_style(true)]
         fn bump(x: &mut u8)
             requires *old(x) < 100
@@ -6479,13 +6482,60 @@ test_verify_one_file_with_options! {
             bump(&mut y);
             assert(y == 6);
         }
-    } => Err(err) => {
-        assert!(
-            err.errors.iter().any(|e| e.message.contains("MutRef")),
-            "expected MutRef rejection, got: {:?}",
-            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
-        );
-    }
+    } => Ok(())
+}
+
+// #107: two `&mut` args at the same call site. Each becomes a
+// distinct synthetic `LocalDeclKind::BorrowMut` local; the
+// theorem-level binders + per-arg fresh existentials shouldn't
+// alias.
+test_verify_one_file_with_options! {
+    #[test] test_exec_call_two_mut_args_new_mut_ref ["new-mut-ref"] => verus_code! {
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn bump_both(a: &mut u8, b: &mut u8)
+            requires *old(a) < 100, *old(b) < 100
+            ensures *a == *old(a) + 1, *b == *old(b) + 2
+        {
+            *a = *a + 1;
+            *b = *b + 2;
+        }
+
+        #[verifier::tactus_auto]
+        fn call_mut_two()
+        {
+            let mut x: u8 = 5;
+            let mut y: u8 = 10;
+            bump_both(&mut x, &mut y);
+            assert(x == 6);
+            assert(y == 12);
+        }
+    } => Ok(())
+}
+
+// #107: caller's local is read after the call. Pins that the
+// post-call value (via Let-rebind on the BorrowMut local + the
+// `y = MutRefFuture(mut_ref)` assignment) propagates to subsequent
+// reads.
+test_verify_one_file_with_options! {
+    #[test] test_exec_call_mut_arg_new_mut_ref_use_after ["new-mut-ref"] => verus_code! {
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        #[verifier::tactus_auto]
+        fn call_then_use() -> (r: u8)
+            ensures r == 7
+        {
+            let mut y: u8 = 5;
+            bump(&mut y);
+            bump(&mut y);
+            y
+        }
+    } => Ok(())
 }
 
 // #93 closure probes — characterize what the renderer rejects so a

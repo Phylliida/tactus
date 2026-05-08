@@ -113,8 +113,8 @@
 use std::collections::{HashMap, HashSet};
 
 use vir::sst::{
-    BndX, CallFun, Dest, Exp, ExpX, FuncCheckSst, FunctionSst, InternalFun, LoopInv,
-    Par, Stm, StmX,
+    BndX, CallFun, Dest, Exp, ExpX, FuncCheckSst, FunctionSst, InternalFun, LocalDeclKind,
+    LoopInv, Par, Stm, StmX,
 };
 use vir::ast::{
     AssertQueryMode, BinaryOp, Expr, ExprX, Fun, FunctionKind, FunctionX, KrateX, SpannedTyped, TactusKind,
@@ -280,6 +280,19 @@ pub struct WpCtx<'a> {
     /// explicit `return e` discards its textual continuation and
     /// writes `Done(let ret := e; ensures_goal)`.
     pub ensures_goal: LExpr,
+    /// Names of `MutRef`-typed local declarations that should be
+    /// treated as `&mut` arg L-values at call sites (#107). Two
+    /// sources, both unified into this one set:
+    /// * Fn parameters declared `&mut T` or `MutRef<T>` (legacy and
+    ///   new-mut-ref callee sides). The `&mut` rebind happens via
+    ///   the body's let-shadow.
+    /// * Synthetic `LocalDeclKind::BorrowMut` locals Verus
+    ///   introduces around exec calls in new-mut-ref mode (caller
+    ///   side). The synthetic local IS the L-value at the call.
+    /// `extract_mut_target` uses this set to recognize bare
+    /// `Var(borrow_mut_local)` in arg position (no surrounding
+    /// `Loc`) as a valid mut target.
+    pub mut_ref_locals: HashSet<String>,
 }
 
 /// The break / continue goal leaves in scope inside a loop body.
@@ -398,7 +411,13 @@ impl<'a> WpCtx<'a> {
                 ))
             }).collect::<Result<Vec<_>, String>>()?
         );
-        Ok(Self { fn_map, type_map, ret_name, ensures_goal })
+        Ok(Self {
+            fn_map,
+            type_map,
+            ret_name,
+            ensures_goal,
+            mut_ref_locals: mut_param_names.clone(),
+        })
     }
 }
 
@@ -593,10 +612,31 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // so without the rewrite both would collapse to the same name
     // and the let-shadow would silently make them equal. Empty for
     // fns without `&mut` params (the common case).
-    let mut_param_names: HashSet<String> = fn_sst.x.pars.iter()
+    // Names of every `&mut`/`MutRef<T>` reference whose body / ensures
+    // shapes the new-mut-ref normalization should rewrite. Two sources:
+    //
+    // * `fn_sst.x.pars` — fn parameters declared `&mut T` or `MutRef<T>`.
+    //   Both legacy mode (#55) and new-mut-ref callee-side mode (#95)
+    //   need these.
+    // * `check.local_decls` filtered to `LocalDeclKind::BorrowMut` —
+    //   synthetic locals Verus introduces in caller-side new-mut-ref
+    //   mode (#107). When the caller writes `bump(&mut y)`, Verus
+    //   lowers it to `let mut_ref = ...; assume(MutRefCurrent(mut_ref)
+    //   == y); bump(mut_ref); y = MutRefFuture(mut_ref);`. The
+    //   synthetic `mut_ref` is `MutRef<u8>`-typed and gets
+    //   `LocalDeclKind::BorrowMut`. Without including it here, the
+    //   `MutRefCurrent`/`MutRefFuture` ops wrapping `mut_ref` slip
+    //   past the normalizer and reach the renderer's "unsupported
+    //   unary op" arm.
+    let mut mut_param_names: HashSet<String> = fn_sst.x.pars.iter()
         .filter(|p| is_mut_ref_par(p))
         .map(|p| sanitize(&p.x.name.0))
         .collect();
+    for decl in check.local_decls.iter() {
+        if matches!(decl.kind, LocalDeclKind::BorrowMut) {
+            mut_param_names.insert(sanitize(&decl.ident.0));
+        }
+    }
 
     // Pre-rewrite the body so VarAt(x, Pre) → Var(<x>_at_pre_tactus)
     // for &mut x. The rewritten body is owned by this fn's stack
@@ -625,6 +665,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
     let ctx = WpCtx::new(krate, check, &mut_param_names)?;
 
     let mut binders = build_param_binders(fn_sst);
+    binders.extend(build_borrow_mut_binders(check));
     binders.extend(build_req_binders(check, &mut_param_names));
 
     // Build the whole WP tree from the (rewritten) body, with the
@@ -2663,6 +2704,74 @@ fn build_param_binders(fn_sst: &FunctionSst) -> Vec<LBinder> {
     out
 }
 
+/// `(<name> : <peeled_typ>)` for each `LocalDeclKind::BorrowMut`
+/// local. These are synthetic `MutRef<T>`-typed locals Verus
+/// introduces around exec calls in new-mut-ref mode (#107):
+/// `bump(&mut y)` lowers to
+/// `let mut_ref: MutRef<u8>; assume(MutRefCurrent(mut_ref) == y);
+///  bump(mut_ref); y = MutRefFuture(mut_ref);` — the synthetic
+/// `mut_ref` has no body-level initializer, only the assume
+/// constraining its pre-call value.
+///
+/// Without a binder, `Var(mut_ref)` (after `normalize_mut_ref_in_*`
+/// unwraps the MutRef* ops) reaches the renderer as an unresolved
+/// reference. Binding it at theorem level lets Lean treat it as
+/// an ∀-bound variable, with the assume entering as a hypothesis.
+///
+/// The type rendering peels `MutRef<T>` to `T` (via `typ_to_expr`'s
+/// `MutRef` arm), so the binder's type matches what
+/// `Var(mut_ref)` reads at use sites — both sides see the inner
+/// value type, not the `MutRef` wrapper.
+///
+/// `#55`'s caller-side mut-arg machinery treats `Var(mut_ref)` as
+/// the L-value at the call site (post-#107 extension to
+/// `extract_mut_target`), introducing a fresh existential for the
+/// post-call value and Let-rebinding `mut_ref` to it after the
+/// call's ensures Hyp. So the binder we emit here gives the
+/// PRE-call value; the post-call value comes from the rebind.
+/// Subsequent body code (`y = MutRefFuture(mut_ref)` after
+/// normalization → `y = Var(mut_ref)`) reads the rebound value.
+fn build_borrow_mut_binders(check: &FuncCheckSst) -> Vec<LBinder> {
+    let mut out: Vec<LBinder> = Vec::new();
+    for decl in check.local_decls.iter() {
+        if !matches!(decl.kind, LocalDeclKind::BorrowMut) {
+            continue;
+        }
+        let inner_typ: &Typ = match &*decl.typ {
+            vir::ast::TypX::MutRef(t) => t,
+            // Defensive: `LocalDeclKind::BorrowMut` always pairs
+            // with `MutRef<T>` typ per `borrow_mut_to_sst` in
+            // `vir/src/ast_to_sst.rs:3211`. If Verus ever emits
+            // BorrowMut with a different typ shape, fall back to
+            // the typ as-is rather than panicking — the renderer
+            // will surface the issue at the use site.
+            _ => &decl.typ,
+        };
+        let name = crate::lean_name::LeanName::from_var_ident(&decl.ident);
+        out.push(LBinder {
+            name: Some(name.clone()),
+            ty: typ_to_expr(inner_typ),
+            kind: BinderKind::Explicit,
+        });
+        // Type-bound predicate: synthetic locals don't get a
+        // user-visible bound hypothesis the way fn params do, but
+        // they still need the bound for Lean to typecheck arithmetic
+        // on them. The bound is implicit in `MutRef<u8>`'s inner type
+        // (e.g., u8's 0 ≤ x < 256), and `type_bound_predicate` peels
+        // through `MutRef` (the inner `T`'s bound).
+        if let Some(pred) = type_bound_predicate(&LExpr::var(name.clone()), inner_typ) {
+            out.push(LBinder {
+                name: Some(crate::lean_name::LeanName::synthetic(
+                    format!("h_{}_bound", name.as_str()),
+                )),
+                ty: pred,
+                kind: BinderKind::Explicit,
+            });
+        }
+    }
+    out
+}
+
 /// `(h_req<i> : <req_i>)` for each requires clause.
 ///
 /// `mut_param_names` carries the &mut params so we can normalize
@@ -3622,7 +3731,7 @@ fn build_wp_call<'a>(
 
     validate_call_arities(callee, args, callee_typ_args)?;
 
-    let mut_args = build_call_mut_args(&callee.params, args)?;
+    let mut_args = build_call_mut_args(&callee.params, args, &ctx.mut_ref_locals)?;
 
     let bound_dest: Option<&'a VarIdent> = dest
         .and_then(|d| extract_simple_var_ident(&d.dest));
@@ -3809,7 +3918,10 @@ enum MutTargetRaw<'a> {
     Field { base: &'a VarIdent, field_opr: &'a vir::ast::FieldOpr },
 }
 
-fn extract_mut_target<'a>(e: &'a Exp) -> Option<MutTargetRaw<'a>> {
+fn extract_mut_target<'a>(
+    e: &'a Exp,
+    mut_ref_locals: &HashSet<String>,
+) -> Option<MutTargetRaw<'a>> {
     // Peel transparent wrappers (Box/Unbox/CoerceMode/Trigger) at
     // the outermost level too — for some L-value shapes (e.g.,
     // tuple field mutation, before we reject it) the SST has
@@ -3818,6 +3930,18 @@ fn extract_mut_target<'a>(e: &'a Exp) -> Option<MutTargetRaw<'a>> {
     // (per its semantics), so this just removes any surrounding
     // boxing.
     let e = peel_transparent(e);
+    // New-mut-ref-mode caller side (#107): the call arg is a bare
+    // `Var(synthetic_local)` (no Loc wrapper) where `synthetic_local`
+    // is a `LocalDeclKind::BorrowMut` local Verus introduces around
+    // `bump(&mut y)`. The synthetic local IS the L-value the call
+    // mutates; `mut_ref_locals` carries the names of these
+    // BorrowMut locals so we recognize them. Legacy-mode `&mut y`
+    // still goes through the Loc path below.
+    if let ExpX::Var(ident) = &e.x {
+        if mut_ref_locals.contains(&sanitize(&ident.0)) {
+            return Some(MutTargetRaw::Var(ident));
+        }
+    }
     // Peel the outer Loc.
     let inner = match &e.x {
         ExpX::Loc(inner) => inner,
@@ -3887,11 +4011,23 @@ fn extract_mut_target<'a>(e: &'a Exp) -> Option<MutTargetRaw<'a>> {
 fn build_call_mut_args<'a>(
     callee_params: &vir::ast::Params,
     args: &'a vir::sst::Exps,
+    mut_ref_locals: &HashSet<String>,
 ) -> Result<Vec<(usize, MutTargetRaw<'a>)>, String> {
     let mut mut_args: Vec<(usize, MutTargetRaw<'a>)> = Vec::new();
     for (i, (param, a)) in callee_params.iter().zip(args.iter()).enumerate() {
-        if param.x.is_mut {
-            match extract_mut_target(a) {
+        // Recognize `&mut` params in both legacy mode (`is_mut: true`,
+        // plain T typ) and new-mut-ref mode (`is_mut: false`,
+        // `MutRef<T>` typ). The caller-side encoding for both modes
+        // goes through #55's mut_args machinery — legacy via
+        // Loc(VarLoc(_)) shapes, new-mut-ref via bare
+        // Var(borrow_mut_local) shapes (#107). Inline rather than
+        // calling `is_mut_ref_par` because the latter takes `&Par`
+        // (vir::sst) while callee params here are `&Param`
+        // (vir::ast) — same shape, different type alias.
+        let is_mut_ref =
+            param.x.is_mut || matches!(&*param.x.typ, vir::ast::TypX::MutRef(_));
+        if is_mut_ref {
+            match extract_mut_target(a, mut_ref_locals) {
                 Some(target) => mut_args.push((i, target)),
                 None => return Err(format!(
                     "&mut argument at position {} is not a supported L-value \
@@ -5203,6 +5339,7 @@ mod tests {
             type_map: HashMap::new(),
             ret_name: None,
             ensures_goal: LExpr::lit_true(),
+            mut_ref_locals: HashSet::new(),
         }
     }
 
