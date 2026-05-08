@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**292 end-to-end tests + 1 coverage test + 160 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**297 end-to-end tests + 1 coverage test + 175 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -2789,6 +2789,127 @@ iteration STILL had a caveat, which was then closed by the next
 iteration after that. None of this was planned. The shape kept
 emerging from the user's pushback.
 
+#### Current session (2026-05-08 — review-pass follow-ups + right-way refactors)
+
+Three days off the map (last session 2026-05-05). Returned to find
+the structural locks held — REVIEW.md's 14-lens audit was the trail
+this session followed. **Two arcs**: (a) close the 8 file-for-follow-up
+items that REVIEW.md captured but didn't land, then (b) re-read the
+resulting code with the right-way lens (#10) and fix the structural
+gaps that surfaced.
+
+**Arc 1 — REVIEW.md follow-ups (#131–139, 8 commits):**
+
+| Task | Lens | Type | Action |
+|------|------|------|--------|
+| #131 | 5/3 | Doc | DESIGN entry rewritten — `AssertQueryMode::BitVector` arm in sst_to_lean.rs is structurally unreachable post-#111 (Verus's `ast_to_sst.rs:2416` directly converts user-syntax `assert by(bit_vector)` to `StmX::AssertBitVector`). Reframed as defensive-internal-bug like the FuelConst arm. |
+| #132 | 3/4 | e2e | 2 tests for AssertBitVector with non-empty `requires` clause — exercises the `req_conj → ens_conj` BV-mode goal path. |
+| #133 | 3/3 | e2e | 3 tests — AssertBitVector inside if-branch / loop body / closure body. Confirms `wrap_no_hyps` drops Hyp frames but keeps Binder/Let frames in each ctx. |
+| #134 | 14 | unit | 2 tests in generate::tests — bitvec_mode emit/omit symmetry. |
+| #135 | 4/3 | unit | Shape-drift guard: `Lean.Elab.Tactic.BVDecide` import path pinned. |
+| #136 | 3/8 | unit | 6 direct tests for `dep_order::order_datatypes` — non-recursive / self-recursive / 2/3-element SCC / SCC + standalone / empty. Uses synthetic DatatypeX fixtures. |
+| #137 | 3/6 | unit | Defensive: `BITVEC_INT_INSTANCES` body uses `.toNat` (total form). |
+| #138 | 4/1 | unit | Shape-drift guard: `anonymous_closure` prefix pinned via `vir::def::prefix_closure_type(0)`. |
+| #139 | 4/2 | unit | Shape-drift guard: source-grep `ast_to_sst.rs` for the per-requires-Assert + per-ensures-Assume pre-injection pattern. |
+
+Plus the 3 fix-now items from REVIEW.md (committed earlier as `8317d92`):
+sanity.rs Mutual arm comment explanation, BV variant naming helper,
+`wrap_no_hyps` soundness reasoning sentence.
+
+**Arc 2 — Right-way refactors surfaced by re-reading (#140–143, 4 commits):**
+
+After arc 1 closed, did a second-reading pass with the right-way
+lens (#10). Found 4 items where the code "worked" (lenses 1–14
+ran clean) but had a more direct expression of meaning available:
+
+* **#140 (Linus-hat) — orphaned `ExecFnTheorems` docstring.** The
+  doc block ending "...so the 'validate-first' precondition is
+  enforced by construction..." belonged to
+  `exec_fn_theorems_to_ast`, but the struct definition got inserted
+  between the doc and the fn. Reordered.
+
+* **#141 (Linus-hat / Right-way) — `PreambleConfig` enum.**
+  `krate_preamble` had two correlated `bool` parameters
+  (`emit_accessors`, `bitvec_mode`) whose valid combinations were
+  `(false, false)` for proof fns and `(true, _)` for exec fns —
+  but `(false, true)` (proof fn with bitvec pollution) wasn't
+  ruled out by the type. Replaced with
+  `enum PreambleConfig { ProofFn, ExecFn { needs_bitvec: bool } }`
+  (later simplified to `ExecFn` by #143).
+
+* **#142 (Simplify / Right-way) — shared `test_fixtures` module.**
+  Three test modules (sst_to_lean::tests, dep_order::tests,
+  generate::tests) had grown their own copies of `empty_krate`,
+  `mk_path`/`mk_test_path`, `typ_int`/`int_typ`, `typ_datatype`/
+  `mk_dt_typ`. New `#[cfg(test)] pub(crate) mod test_fixtures`
+  hosts the canonical versions; renamed the dep_order helpers to
+  match sst_to_lean's `typ_*` convention. Per-module-specific
+  helpers (mk_test_emitter, mk_datatype, etc.) stay close to
+  their consumers.
+
+* **#143 (Right-way infra) — per-theorem `requires_preamble`.**
+  The bitvec plumbing previously threaded one bit through 4 sites:
+  walker → ObligationEmitter::needs_bitvec_instances →
+  ExecFnTheorems → check_exec_fn → PreambleConfig → krate_preamble.
+  Replaced with a `requires_preamble: Vec<PreambleFragment>` field
+  on `Theorem`. Walker arms declare what their goals need;
+  `krate_preamble` aggregates from all theorems and emits at
+  file top with dedup. The 4-site flag plumbing collapsed to:
+    * One walker push: `e.emit_with_preamble(name, goal, closer, bitvec_preamble_fragments())`
+    * One aggregator: `let mut seen = HashSet::new(); for theorem in theorems { for frag in &theorem.requires_preamble { ... } }`
+    * `BITVEC_INT_INSTANCES` constant + `bitvec_preamble_fragments()` fn moved to sst_to_lean (where the walker arm that produces them lives).
+    * Removed: `ObligationEmitter::needs_bitvec_instances`, `ExecFnTheorems` struct (collapsed to `Vec<Theorem>`), `PreambleConfig::ExecFn { needs_bitvec }` (now just `ExecFn`).
+  Generalizes to future "this fn needs Mathlib.Tactic.X" — one
+  `PreambleFragment` constructor + one walker push, no bool-through-
+  N-sites plumbing.
+
+  Tests reorganized: generate::tests gets aggregation-focused tests
+  (no-theorems → no fragments; Import goes before prelude;
+  PreludeAddendum goes after; dedup of repeated fragments).
+  sst_to_lean::tests gets the relocated content tests (BVDecide
+  path pinned, .toNat totality, fragments shape).
+
+**DESIGN.md note for future work:** added `RewritePipeline`
+under "Potential future infrastructure" — three SST→SST passes
+(`normalize_mut_ref`, `rewrite_varat_for_mut_params`,
+`is_synthetic_assume_to_drop`) currently compose by sequential
+calls in the orchestrator. A typed pipeline would make data flow
+explicit and let new passes be added without touching the
+orchestrator. Borderline cost-benefit today; documented for the
+next contributor who adds a 4th rewrite pass.
+
+**Process note worth recording: the "second reading" pattern.**
+The right-way landings (#140-143) came from re-reading code that
+had just been reviewed. Lenses 1-14 ran clean — every individual
+site was correct, named well, tested. The structural findings
+only surfaced when the question shifted from *"is this correct?"*
+(closed by the lenses) to *"if I were starting this now, what
+shape would I reach for?"* The second question is what the
+right-way lens (#10) names; running it as a separate pass after
+the regular lens batch is a different question and surfaces
+different findings. ~15 minutes of right-way reading turned up
+4 items the earlier 14-lens pass hadn't seen.
+
+Captured in REVIEW.md's 2026-05-08 follow-up section.
+
+**Three poems** (POEMS.md / poems/2026-05-08.md):
+* "Three days" — returning after the gap, reading past-me's
+  trail.
+* "Locks" — each test as a structural lock, message-to-future-
+  stranger discipline.
+* "The second reading" — the question that comes after
+  correctness, the user's role in surfacing it.
+
+**Day total**: 13 commits + 3 poem commits.
+* Test counts: 160 → 175 unit (+15), 292 → 297 e2e (+5).
+* Pending tasks: 17 → 7 (closed #131–143).
+* All 8 REVIEW.md file-for-follow-up items closed.
+* 4 right-way structural cleanups landed.
+* New shared `test_fixtures` module (`src/test_fixtures.rs`).
+* New `PreambleFragment` enum (`src/lean_ast.rs`) + per-theorem
+  `requires_preamble` field. Generalizable to future per-fn
+  preamble extras.
+
 ## Architecture
 
 ### Full pipeline
@@ -3085,13 +3206,11 @@ See DESIGN.md § "Known deferrals, rejected cases, and untested edges" for the f
 
 All major Tier-3 tasks have landed (#55 caller-side `&mut`, #56
 caller-side trait method calls, #93 closures, #95 new-mut-ref
-callee-side, #110 lex decreases). The 2026-05-03 morning audit went
-through DESIGN.md systematically and surfaced ~20 deferred items
-that hadn't been promoted to tasks; the day closed five tasks
-(#120 partial → #126, #115, #110, #114 sub-feature 1, plus
-review-pass cleanup) and split out three follow-ups (#127, #128,
-#129). Pending count is **19 across 6 themes**. None is on the
-critical path for realistic code today.
+callee-side, #110 lex decreases, #111/#130 BitVec mode). The
+2026-05-08 session closed all 8 file-for-follow-up items from
+REVIEW.md plus 4 right-way structural cleanups, dropping the
+pending count to **7 across 5 themes**. None is on the critical
+path for realistic code today.
 
 The full catalogue lives in DESIGN.md § "Known deferrals, rejected
 cases, and untested edges" — this section summarizes the task
@@ -3107,10 +3226,7 @@ themes:
 - **#113** BinaryOp::StrGetChar + string operations.
 - **#127** loop_isolation: false support (#114 sub-feature 2).
 
-Closed: #108 (generic datatype decreases), #109 (mutual SCC decreases),
-#111 (assert by(bit_vector) routing), #130 (BitVec rendering +
-bv_decide via Lean core import — full SAT-backed bit-vector reasoning).
-All landed 2026-05-05.
+Closed: #108 / #109 / #111 / #130 (2026-05-05).
 
 ### Architecture cleanups (2 pending)
 
@@ -3119,8 +3235,10 @@ All landed 2026-05-05.
 - **#117** fuse two-pass over loop bodies (DESIGN says "left
   alone").
 
-Closed: #98 (walk_children/map_children helpers, 2026-05-05),
-#116, #118, #119.
+Closed: #98 / #116 / #118 / #119 (earlier sessions); plus the
+2026-05-08 right-way batch (#140 orphaned doc / #141 PreambleConfig
+enum / #142 shared test_fixtures module / #143 per-theorem
+preamble requirements).
 
 ### Robustness + test gaps (1 pending)
 
@@ -3129,18 +3247,9 @@ Closed: #98 (walk_children/map_children helpers, 2026-05-05),
   { tac }`; return-in-else; multi-var loops; tactic referencing
   loop-local; etc.).
 
-Closed: #126 (WpCtx::new + walk_loop direct tests, 2026-05-05;
-walk_call deferred — synthetic FunctionX fixture too heavy, e2e
-covers it), #129 (loop decrease 0 ≤ cur lower bound).
-
-### Tactic / automation gaps (1 task)
-
-- **#128** tactus_auto Prop substitution for fn-call-in-cond. The
-  #114 cond_setup encoding is correct; the resulting Lean goals
-  with `_tactus_ret_N : Prop` quantified vars need a
-  `simp_all + omega` composition that tactus_auto's default
-  closer doesn't provide. Users currently need a per-fn
-  `tactus_tactic` override.
+Closed: #126 / #129 (earlier sessions); 2026-05-08 closed all 9
+REVIEW.md follow-ups (#131-139) — full list in REVIEW.md's
+"2026-05-08 follow-up" section.
 
 ### Phase 3 (2 tasks)
 

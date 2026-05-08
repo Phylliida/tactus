@@ -689,3 +689,73 @@ test, plus DESIGN-level documentation. A future session that adds a
 new binder variant should add a corresponding test for that variant's
 scope semantics; the test is the only catch for the wrong-but-explicit
 case.
+
+---
+
+## 2026-05-08 follow-up: all 8 file-for-follow-up items closed
+
+The "file for follow-up" items above all closed in a focused session
+on 2026-05-08, plus four "right-way" landings surfaced by re-reading
+the resulting code:
+
+### Review-follow-up tasks (#131-139)
+
+| # | Lens | Action |
+|---|------|--------|
+| 131 | 5/3 | DESIGN entry rewritten — `AssertQueryMode::BitVector` is structurally unreachable post-#111; arm reframed as defensive-internal-bug per Verus's `ast_to_sst.rs:2416` direct lowering. |
+| 132 | 3/4 | 2 e2e tests (`test_exec_assert_bit_vector_with_requires`/`_fails`) — non-empty `req_conj` path. |
+| 133 | 3/3 | 3 e2e tests — AssertBitVector inside if-branch / loop body / closure body. Confirms `wrap_no_hyps` drops the right frames in each ctx. |
+| 134 | 14 | 2 unit tests in `generate::tests` — emit/omit BitVec preamble per mode. |
+| 135 | 4/3 | 1 unit test — BVDecide module path pinned against `Lean.Elab.Tactic.BVDecide`. |
+| 136 | 3/8 | 6 unit tests for `dep_order::order_datatypes` (non-recursive / self-recursive / 2-element SCC / 3-element SCC / SCC + standalone / empty). |
+| 137 | 3/6 | 1 unit test — `BITVEC_INT_INSTANCES` body uses `.toNat` (total form). |
+| 138 | 4/1 | 1 unit test — `anonymous_closure` prefix pinned against `vir::def::prefix_closure_type`. |
+| 139 | 4/2 | 1 unit test — `ast_to_sst.rs` source-grep guard for the per-requires Assert / per-ensures Assume pre-injection pattern. |
+
+### Right-way landings surfaced by re-reading the new code (#140-143)
+
+The follow-up batch surfaced four items where the code "worked" but
+had a more direct expression of meaning available:
+
+| # | Type | Action |
+|---|------|--------|
+| 140 | Linus-hat | `ExecFnTheorems` doc was orphaned between fn-doc and fn-body; reordered. |
+| 141 | Linus-hat / Right-way | Replaced `(emit_accessors: bool, bitvec_mode: bool)` soup on `krate_preamble` with `enum PreambleConfig { ProofFn, ExecFn { needs_bitvec: bool } }` (then `ExecFn` simplified further by #143). The `(false, true)` invalid combo became unrepresentable. |
+| 142 | Simplify / Right-way | Three test modules' duplicated helpers (`empty_krate`, `mk_path`, `typ_int`, `typ_datatype`) extracted to a new `#[cfg(test)] pub(crate) mod test_fixtures`. |
+| 143 | Right-way (infra) | Per-theorem `requires_preamble: Vec<PreambleFragment>` field on `Theorem`. Walker arms declare what their goals need; `krate_preamble` aggregates from all theorems and emits at file top. Collapsed the prior 4-site bool plumbing for `needs_bitvec_instances` into one walker push + one HashSet aggregator. Generalizes to future "this fn needs Mathlib.Tactic.X" cases. |
+
+### Process: the "second reading" pattern
+
+Worth recording for future sessions: the right-way landings (#140-143)
+came from a *second reading* of code that had just been reviewed.
+Lenses 1-14 ran clean on the bitvec plumbing — every individual site
+was correct, named well, tested. The bool-soup and 4-site-flag-plumbing
+findings only surfaced when the question shifted from *"is this
+correct?"* (closed by the lenses) to *"if I were starting this now,
+what shape would I reach for?"*
+
+The second question is what the right-way lens (#10) names. It's
+worth running deliberately as a separate pass after the regular
+review-lens batch — different question, different findings. The
+right-way pass on 2026-05-08 took ~15 minutes to surface 4 items
+that the prior 14-lens pass hadn't seen, despite being on the same
+code.
+
+### Pattern noted in DESIGN.md as future infra
+
+`RewritePipeline` for SST→SST passes (`normalize_mut_ref`,
+`rewrite_varat_for_mut_params`, `is_synthetic_assume_to_drop`).
+Currently composed by sequential calls in
+`exec_fn_theorems_to_ast`'s orchestrator; a typed pipeline would
+make data flow explicit and let new passes be added without
+touching the orchestrator. Borderline cost-benefit today;
+documented under DESIGN.md "Potential future infrastructure" so
+the next contributor who adds a 4th rewrite pass has the option
+ready.
+
+### Closing state
+
+All 14 review-pass findings (the ones triaged "fix now" or "file
+for follow-up") are addressed. 4 additional right-way landings
+captured the structural cleanups that surfaced from re-reading.
+Test counts: 160 → 175 unit (+15), 292 → 297 e2e (+5).
