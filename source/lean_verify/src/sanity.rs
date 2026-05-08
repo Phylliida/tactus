@@ -125,9 +125,16 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
         }
 
         Command::Mutual(inner) => {
-            // Predefine every name in the group so members can reference each other.
-            // Datatypes (#109): same treatment — mutually recursive inductives
-            // reference each other in their variant field types.
+            // Predefine every declarable name in the group BEFORE
+            // visiting any member, so cross-references inside the
+            // group resolve. For Def / DefCurried this is the usual
+            // self-recursion + mutual-recursion pattern. For
+            // Datatype (#109): an SCC of mutually recursive
+            // inductives references each other in their variants'
+            // field types — `inductive Tree where | Branch (f :
+            // Forest) → Tree` looks up `Forest` mid-declaration,
+            // which fails the sanity check unless `Forest` is
+            // already in `defined` when Tree's body is visited.
             for c in inner {
                 match c {
                     Command::Def(d) => { defined.insert(d.name.clone()); }

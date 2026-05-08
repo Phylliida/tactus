@@ -983,12 +983,41 @@ fn bv_exp_to_node(e: &Exp) -> Result<ExprNode, String> {
         // Inside bit_vector assertions we don't see complex SST
         // shapes (calls, ctors, lambdas) — Verus typically rejects
         // those upstream. If one shows up, return a clear error
-        // pointing the user at a workaround.
-        _ => Err(format!(
-            "expression shape {:?} not yet supported inside `by(bit_vector)` — \
+        // naming the variant so the user can identify which shape
+        // they wrote.
+        other => Err(format!(
+            "expression shape `{}` not yet supported inside `by(bit_vector)` — \
              use `assert(P) by {{ ... }}` with a custom Lean tactic for \
              non-trivial shapes (#130)",
-            std::mem::discriminant(&e.x)
+            bv_unsupported_shape_name(other)
         )),
+    }
+}
+
+/// Human-readable variant name for `ExpX` shapes that
+/// `bv_exp_to_node` rejects. `std::mem::discriminant` produces a
+/// numeric ID; this gives the user the name they can search for.
+fn bv_unsupported_shape_name(x: &ExpX) -> &'static str {
+    match x {
+        ExpX::Call(..) => "ExpX::Call",
+        ExpX::CallLambda(..) => "ExpX::CallLambda",
+        ExpX::Ctor(..) => "ExpX::Ctor",
+        ExpX::Bind(..) => "ExpX::Bind",
+        ExpX::If(..) => "ExpX::If",
+        ExpX::Loc(..) => "ExpX::Loc",
+        ExpX::ArrayLiteral(..) => "ExpX::ArrayLiteral",
+        ExpX::VarAt(..) => "ExpX::VarAt",
+        ExpX::VarLoc(..) => "ExpX::VarLoc",
+        ExpX::StaticVar(..) => "ExpX::StaticVar",
+        ExpX::Old(..) => "ExpX::Old",
+        ExpX::ExecFnByName(..) => "ExpX::ExecFnByName",
+        ExpX::WithTriggers(..) => "ExpX::WithTriggers",
+        ExpX::FuelConst(..) => "ExpX::FuelConst",
+        ExpX::Interp(..) => "ExpX::Interp",
+        ExpX::NullaryOpr(..) => "ExpX::NullaryOpr",
+        ExpX::UnaryOpr(..) => "ExpX::UnaryOpr",
+        // Note: Var, Const, Binary, Unary handled in the main match;
+        // their arms produce LExpr directly, never reach this helper.
+        _ => "<unknown ExpX variant>",
     }
 }
