@@ -510,6 +510,21 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Companion: chained comparison directly inside a proof-fn ensures
+// (a different shape from the requires test above). Pre-fix this also
+// rendered the chained `∧` chain as `⟨...⟩`. Both shapes go through
+// the same Multi arm.
+test_verify_one_file! {
+    #[test] test_chained_compare_in_proof_fn_ensures verus_code! {
+        proof fn chain_ensures(x: int)
+            requires x >= 0, x <= 10
+            ensures 0 <= x <= 10
+        by {
+            omega
+        }
+    } => Ok(())
+}
+
 // === Mathlib: ring tactic for polynomial identity ===
 
 test_verify_one_file! {
