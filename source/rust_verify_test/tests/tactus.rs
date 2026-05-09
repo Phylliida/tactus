@@ -5131,44 +5131,45 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// #130 edge: AssertBitVector with a function call inside the
-// assertion. DESIGN.md catalogue had `sst_exp_to_bit_vector_ast`
-// handling only `Var` / `Const` / `BinaryOp` / `UnaryOp::Not` —
-// "Function calls, struct constructors, lambdas inside the
-// assertion are rejected with a clear error" — but added "Verus
-// typically rejects most of these upstream too, so the rejection
-// is theoretical; no test exercises it." Probe established BOTH
-// claims are wrong:
-//
-// 1. Verus does NOT reject upstream — it passes the call through
-//    to Tactus.
-// 2. Tactus does NOT produce a clean error — the bit-vector
-//    renderer's reject-Call arm IS reached for the BV-mode goal,
-//    but Verus's pre-injected `Assume(ens)` (which DESIGN.md notes
-//    in the BV-mode rendering section) goes through the regular
-//    Int-mode renderer, which renders `id_u8(x)` as a Var
-//    reference — and `dep_order` doesn't walk into that Assume
-//    via the right path, so `id_u8` never gets included in the
-//    Lean preamble. The sanity check then panics in
-//    `lean_verify/src/generate.rs:473` with "Tactus codegen
-//    produced unresolved references: in
-//    `_tactus_ensures_xor_with_call_3`: unresolved `id_u8`."
-//
-// This is a real codegen bug, not a clean rejection. Pinned here
-// as `Err(_)` so a future fix that turns the panic into either a
-// clean rejection or a successful verification surfaces. See the
-// DESIGN.md catalogue entry for the proper fix shape (likely:
-// extend dep_order to walk the SST-side AssertBitVector body, OR
-// reject the call in the Int-mode pre-injection too).
+// #147: AssertBitVector with a function call inside the assertion.
+// DESIGN.md catalogue previously claimed BOTH (a) Verus rejects
+// upstream and (b) Tactus rejects cleanly. Probe established both
+// claims wrong: Verus passes the call through, Tactus's bit-vector
+// renderer's reject-Call arm IS reached for the BV-mode goal, but
+// Verus's pre-injected `Assume(ens)` (Int-mode hyp continuity) goes
+// through the regular Int-mode renderer — and `dep_order` was missing
+// that path. Two latent bugs surfaced: (1) `seed_worklist` walked
+// only require/ensure, never the body, so spec fn calls in body-
+// level asserts (any kind, not just bit_vector) never reached the
+// preamble; (2) `spec_fn_to_ast` reused `fn_binders` which adds
+// u-type bound hyps as binders — wrong for spec-fn defs (changes
+// the type from `Int → Int` to `Int → Bound → Int` and breaks call
+// sites). Both fixed 2026-05-09.
 test_verify_one_file! {
-    #[test] test_exec_assert_bit_vector_with_fn_call_panics verus_code! {
+    #[test] test_exec_assert_bit_vector_with_fn_call verus_code! {
         spec fn id_u8(x: u8) -> u8 { x }
 
         #[verifier::tactus_auto]
         fn xor_with_call(x: u8) {
             assert(id_u8(x) ^ x == 0u8) by(bit_vector);
         }
-    } => Err(_)
+    } => Ok(())
+}
+
+// #147 second pin: same fix surface, plain `assert(P)` shape. The
+// `seed_worklist` body walk benefits any body-level spec fn call
+// not just bit_vector; this test pins the broader fix. Pre-fix:
+// panicked the same way as the bit_vector test above. Post-fix:
+// verifies cleanly.
+test_verify_one_file! {
+    #[test] test_exec_plain_assert_with_spec_call verus_code! {
+        spec fn id_u8(x: u8) -> u8 { x }
+
+        #[verifier::tactus_auto]
+        fn plain_with_call(x: u8) {
+            assert(id_u8(x) == x);
+        }
+    } => Ok(())
 }
 
 // #109 follow-up: recursion over a member of a mutual-SCC datatype.
