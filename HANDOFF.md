@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**315 end-to-end tests + 1 coverage test + 178 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**316 end-to-end tests + 1 coverage test + 178 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -3471,6 +3471,29 @@ holds the same way at 5 as at 4. Very deep cycles (10+) remain
 unpinned — Lean's mutual-block compilation cost is the latent
 concern at extreme depth — but the cheap-test regime now covers
 depths 4 and 5. Test count 314 → 315 e2e (+1).
+
+**Generic datatype with uninhabited type param (#108 edge) —
+upstream-blocked.** DESIGN.md catalogue had this as a Lean-side
+concern: `List<Empty>` would fail `Inhabited (List Empty)` synthesis
+at the call site, with the recommended fix being conditional
+`deriving Inhabited`. Probe established the prediction is moot:
+Verus rejects `enum Empty {}` itself with "datatype must have at
+least one non-recursive variant," so an uninhabited type never
+reaches Tactus. The Lean-side concern is structurally unreachable
+through normal Tactus paths. Pinned by
+`test_exec_generic_datatype_uninhabited_type_param_upstream_blocked`
+(matches the Verus error string). DESIGN.md catalogue entry
+downgraded from "known limitation we should fix" to "upstream-
+blocked, not a Tactus concern." If Verus ever lifts the no-empty-
+enum rule, the test surfaces as a flippable Err and the
+conditional-deriving fix returns to relevance. Test count 315 → 316
+e2e (+1).
+
+The discipline lesson, again: catalogue claims about *what would
+fail and how* are guesses about a counterfactual world. Probing
+moves the claim from "guess" to "known surface" — and sometimes the
+known surface shows the concern was solving a problem that doesn't
+exist.
 
 ## Architecture
 

@@ -4778,6 +4778,35 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #108 edge: generic datatype instantiated with an uninhabited type
+// param. DESIGN.md catalogue predicted Lean would reject `Inhabited
+// (List Empty)` synthesis "at the call site." Probe established this
+// is upstream-blocked: Verus rejects `enum Empty {}` itself with
+// "datatype must have at least one non-recursive variant," so an
+// uninhabited type never reaches Tactus. The Lean-side concern about
+// Inhabited synthesis is therefore structurally unreachable through
+// normal Tactus paths; the catalogue entry can be downgraded from
+// "known limitation we should fix" to "upstream-blocked, not a
+// Tactus concern." If Verus ever lifts the no-empty-enum rule, this
+// test surfaces as a flippable Err and the conditional-deriving fix
+// described in DESIGN becomes relevant again.
+test_verify_one_file! {
+    #[test] test_exec_generic_datatype_uninhabited_type_param_upstream_blocked verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum Empty {}
+        enum L<A> { Nil, Cons(A, Box<L<A>>) }
+
+        #[verifier::tactus_auto]
+        fn id_list(l: L<Empty>) -> L<Empty> {
+            l
+        }
+    } => Err(err) => assert!(
+        err.errors.iter().any(|e| e.rendered.contains("at least one non-recursive variant")),
+        "expected Verus's no-empty-enum rejection; got: {:#?}", err.errors
+    )
+}
+
 // Regression: single-variant non-eponymous enum (variant name ≠
 // type name) goes through the multi-variant accessor path because
 // `is_single_variant_struct` requires the variant name to match the
