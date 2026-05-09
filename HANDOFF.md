@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**317 end-to-end tests + 1 coverage test + 178 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**318 end-to-end tests + 1 coverage test + 178 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -3509,6 +3509,31 @@ The same discipline pattern: a guess about cost ("Lean compilation
 is the latent concern") replaced by a measurement (~6.8s, near-
 flat). Three of today's four probes have shifted catalogue claims
 in the *softer* direction — the worry was bigger than the surface.
+
+**AssertBitVector with fn call — real codegen panic (#147).** The
+day's first probe to shift the catalogue in the *harder* direction.
+DESIGN.md claimed two complementary mitigations: Verus rejects
+upstream, AND Tactus rejects cleanly. Probe established BOTH wrong:
+`assert(spec_fn(x) ^ x == 0) by(bit_vector)` panics in
+`lean_verify/src/generate.rs:473` with "Tactus codegen produced
+unresolved references." Verus's pre-injected `Assume(ens)` goes
+through the regular Int-mode renderer (which supports Calls); that
+renders `id_u8(x)` as a Var reference; dep_order doesn't include
+`id_u8` in the preamble dep set; sanity check panics.
+
+Pinned as `Err(_)` by `test_exec_assert_bit_vector_with_fn_call_panics`
+so a future fix turning the panic into clean rejection or successful
+verification surfaces. Catalogue entry rewritten with the actual
+shape; new task #147 filed with three candidate fix shapes (extend
+dep_order, reject Call in Int-mode pre-injection, or reject upstream).
+Test count 317 → 318 e2e (+1).
+
+The discipline lesson, complemented: probes don't only find
+overstated worry. They sometimes find unstated worry. The worst
+catalogue entries aren't the ones that are pessimistic — they're the
+ones that confidently state both the bug *and* the rejection, and
+neither holds. A guess that two safety nets exist is worse than a
+guess that one does.
 
 ## Architecture
 
