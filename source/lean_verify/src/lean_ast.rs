@@ -179,8 +179,24 @@ pub struct Datatype {
 pub enum DatatypeKind {
     /// Single-variant datatype → Lean `structure`.
     Structure { fields: Vec<Field> },
-    /// Multi-variant datatype → Lean `inductive`.
+    /// Multi-variant datatype → Lean `inductive` in parameter style:
+    /// `inductive T (A : Type) where | Variant (...) | ...`.
+    /// Used for the common case of uniform recursion (or no recursion).
+    /// `deriving Inhabited` works on this shape.
     Inductive { variants: Vec<Variant> },
+    /// Multi-variant datatype → Lean `inductive` in indexed style:
+    /// `inductive T : Type → Type 1 where | Variant : ∀ {A}, ... → T A | ...`.
+    /// Used when the datatype has **non-uniform recursive instantiation** —
+    /// i.e., a variant's recursive field uses a different type-arg from the
+    /// parent's parameter (e.g., `enum Mut<A> { Recurse(Mut<u8>) }`).
+    /// Lean's parameter-style strict-positivity check rejects that shape;
+    /// indexed style allows it.
+    ///
+    /// `deriving Inhabited` does NOT work for indexed-style; the caller
+    /// (`datatype_to_cmds` / `datatype_group_to_cmds`) emits a manual
+    /// `Command::Instance` for `Inhabited (T A)` alongside the indexed
+    /// inductive.
+    IndexedInductive { variants: Vec<Variant> },
 }
 
 #[derive(Debug, Clone)]

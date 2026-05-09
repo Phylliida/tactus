@@ -329,6 +329,44 @@ fn write_datatype(out: &mut String, dt: &Datatype, lm: &mut Landmarks) {
                 out.push('\n');
             }
         }
+        DatatypeKind::IndexedInductive { variants } => {
+            // `inductive T : Type → Type → ... → Type 1 where`
+            // (one `Type → ` for each type parameter, ending in `Type 1`
+            // because Lean's universe rules force the bump for an indexed
+            // inductive whose constructors universally bind type args).
+            out.push_str("inductive ");
+            out.push_str(&dt.name);
+            out.push_str(" : ");
+            for _ in &dt.typ_params {
+                out.push_str("Type → ");
+            }
+            out.push_str("Type 1 where\n");
+            for v in variants {
+                // `| Name : ∀ {A : Type} {B : Type} ..., field_ty1 → ... → T A B`
+                out.push_str("  | ");
+                out.push_str(&v.name);
+                out.push_str(" : ");
+                if !dt.typ_params.is_empty() {
+                    out.push('∀');
+                    for tp in &dt.typ_params {
+                        out.push_str(" {");
+                        out.push_str(tp);
+                        out.push_str(" : Type}");
+                    }
+                    out.push_str(", ");
+                }
+                for f in &v.fields {
+                    write_expr(out, &f.ty, 0, lm);
+                    out.push_str(" → ");
+                }
+                out.push_str(&dt.name);
+                for tp in &dt.typ_params {
+                    out.push(' ');
+                    out.push_str(tp);
+                }
+                out.push('\n');
+            }
+        }
     }
     if !dt.derives.is_empty() {
         out.push_str("  deriving ");
