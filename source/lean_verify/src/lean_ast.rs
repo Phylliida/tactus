@@ -470,8 +470,8 @@ pub enum ExprNode {
     /// (precondition / loop invariant / termination check /
     /// etc.) so error messages can include a label like
     /// "(precondition)" alongside `at <loc>:`. Set by the
-    /// wrapping site in `lower_wp` / `lower_loop` / `lower_call`
-    /// / etc.
+    /// wrapping site in `walk_obligations` / `walk_loop` /
+    /// `walk_call` / `WpCtx::new` (for fn-ensures Postcondition).
     SpanMark {
         rust_loc: String,
         kind: AssertKind,
@@ -701,15 +701,6 @@ pub fn substitute(
     substitute_impl(expr, subst)
 }
 
-/// Recursively strip `ExprNode::SpanMark` wrappers from an
-/// expression tree, returning a structurally-equivalent tree
-/// with all source-mapping metadata removed. Used by tests
-/// (`pp_eq`) to compare semantic-equivalent expressions where
-/// one side carries `SpanMark` wrappers from `lower_wp` and the
-/// other doesn't. Strips are reasonable here because `SpanMark`
-/// is transparent at the Lean level — the wrapping affects only
-/// the pp output (a leading `/- @rust:LOC -/` comment) and the
-/// landmark side-channel, never semantics.
 // ── Generic structural walkers (#98) ──────────────────────────────────
 //
 // `ExprNode` and `Pattern` have many variants, most of which contain
@@ -1135,6 +1126,16 @@ where
     }
 }
 
+/// Recursively strip `ExprNode::SpanMark` wrappers from an
+/// expression tree, returning a structurally-equivalent tree
+/// with all source-mapping metadata removed. Used by tests
+/// (`pp_eq`) to compare semantic-equivalent expressions where
+/// one side carries `SpanMark` wrappers from the WP walker
+/// (`walk_obligations` and friends) and the other doesn't.
+/// Strips are reasonable here because `SpanMark` is transparent
+/// at the Lean level — the wrapping affects only the pp output
+/// (a leading `/- @rust:LOC -/` comment) and the landmark
+/// side-channel, never semantics.
 pub fn strip_span_marks(expr: &Expr) -> Expr {
     Expr::new(strip_span_marks_node(&expr.node))
 }

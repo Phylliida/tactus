@@ -360,7 +360,7 @@ pub fn check_exec_fn(
 
     // Exec fns map errors via `span_marks` populated by the pp's
     // `SpanMark` walker (#51 source mapping) — Rust source
-    // location for each obligation in `lower_wp`'s output.
+    // location for each obligation emitted by `walk_obligations`.
     let source_map = LeanSourceMap::ExecFn {
         fn_name: short_name(&vir_fn.name.path).to_string(),
         span_marks: rendered.landmarks.span_marks.clone(),
