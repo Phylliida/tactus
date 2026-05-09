@@ -4749,6 +4749,35 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #109 coverage extension: 5-element datatype SCC. One step beyond
+// depth 4. Tarjan still generic; this pin extends the structural-
+// correctness confidence linearly. Lean compiles a 5-way `mutual`
+// block of `inductive`s + accessors-out + 5-way `mutual` block of
+// `.height` fns. Catalogue noted "very deep cycles (10+) remain
+// unpinned"; depth 5 closes the gap one step further while staying
+// in the cheap-test regime (~5s for full mutual-block elaboration).
+test_verify_one_file! {
+    #[test] test_exec_five_element_datatype_scc verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum P { PLeaf, PQ(Box<Q>) }
+        enum Q { QLeaf, QR(Box<R>) }
+        enum R { RLeaf, RS(Box<S>) }
+        enum S { SLeaf, ST(Box<T>) }
+        enum T { TLeaf, TP(Box<P>) }
+
+        #[verifier::tactus_auto]
+        fn use_p(p: P) -> (r: u64)
+            ensures r == 0
+        {
+            match p {
+                P::PLeaf => 0,
+                P::PQ(_) => 0,
+            }
+        }
+    } => Ok(())
+}
+
 // Regression: single-variant non-eponymous enum (variant name ≠
 // type name) goes through the multi-variant accessor path because
 // `is_single_variant_struct` requires the variant name to match the
