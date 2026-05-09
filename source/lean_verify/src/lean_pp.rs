@@ -630,7 +630,7 @@ fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
         // the landmarks struct (#51 source mapping). The comment
         // is kept in the output as a debug aid for users
         // inspecting the generated `.lean` file; the structured
-        // landmark is what `LeanSourceMap::find_rust_loc` reads
+        // landmark is what `LeanSourceMap::find_span_mark` reads
         // at error-formatting time. Regular block comments (`/-
         // ... -/`) are valid anywhere whitespace is (unlike
         // `/-!`, which Lean treats as a module docstring and

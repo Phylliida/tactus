@@ -34,8 +34,9 @@ pub enum LeanSourceMap {
     },
     /// Exec fns (#51 source mapping): `span_marks` is a list of
     /// landmarks populated by the pp as it visits
-    /// `ExprNode::SpanMark` nodes. `find_rust_loc` returns the
-    /// closest preceding mark for a given Lean error line.
+    /// `ExprNode::SpanMark` nodes. `find_span_mark` returns the
+    /// closest preceding obligation-kind mark for a given Lean
+    /// error line.
     ExecFn {
         fn_name: String,
         span_marks: Vec<crate::lean_pp::SpanMarkLandmark>,
