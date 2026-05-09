@@ -4719,6 +4719,36 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #109 coverage extension: 4-element datatype SCC. The Tarjan
+// implementation in `dep_order::order_datatypes` is generic over
+// SCC size — a 4-cycle goes through the same mutual-block emission
+// path as the 3-cycle pinned above. Pinning the 4-cycle adds
+// confidence that very deep mutual SCCs work end-to-end (Lean's
+// mutual-block compilation cost is the latent concern; depth 4 is
+// well within tractable). Catalogue had this as "Should work —
+// the Tarjan implementation is generic over SCC size — but
+// unverified for very deep cycles."
+test_verify_one_file! {
+    #[test] test_exec_four_element_datatype_scc verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum A { ALeaf, AB(Box<B>) }
+        enum B { BLeaf, BC(Box<C>) }
+        enum C { CLeaf, CD(Box<D>) }
+        enum D { DLeaf, DA(Box<A>) }
+
+        #[verifier::tactus_auto]
+        fn use_a(a: A) -> (r: u64)
+            ensures r == 0
+        {
+            match a {
+                A::ALeaf => 0,
+                A::AB(_) => 0,
+            }
+        }
+    } => Ok(())
+}
+
 // Regression: single-variant non-eponymous enum (variant name ≠
 // type name) goes through the multi-variant accessor path because
 // `is_single_variant_struct` requires the variant name to match the
