@@ -98,10 +98,13 @@ impl PreambleConfig {
 /// declare what they need.
 ///
 /// Note: reference collection walks VIR-AST bodies. For exec fns the SST
-/// body may reference spec fns not reachable from the VIR body alone; the
-/// first slice only hits pure arithmetic so this isn't an issue yet. When
-/// `sst_to_lean` starts emitting calls into spec code, extend this to also
-/// walk the SST body.
+/// body has additional shapes synthesized by Verus's recursion pass —
+/// notably `CheckDecreaseHeight` — which reference Self (already in the
+/// krate) and the decrease expression (which is itself a VIR-AST `Expr`
+/// reachable via `f.decrease`). So in practice the VIR-AST walk picks up
+/// every entity the SST body references too. If `sst_to_lean` ever starts
+/// referencing a Function or Datatype that ONLY appears in synthesized SST
+/// (not in any VIR-AST shape), extend this to walk the SST body as well.
 fn krate_preamble(
     krate: &KrateX,
     imports: &[String],
@@ -321,7 +324,9 @@ pub fn check_exec_fn(
         Ok(r) => r,
         Err(reason) => return CheckResult::Failed {
             error: format!(
-                "tactus_auto: {} (first slice supports only straight-line exec fns)",
+                "tactus_auto rejected this fn: {} \
+                 (see DESIGN.md \"Known deferrals, rejected cases, and untested edges\" \
+                 for the full catalogue of unsupported SST shapes)",
                 reason,
             ),
             warnings,
