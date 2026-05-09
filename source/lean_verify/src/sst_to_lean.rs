@@ -518,9 +518,13 @@ fn peel_value_position(e: &Exp) -> &Exp {
 /// Validate an SST expression — `sst_exp_to_ast_checked` does both
 /// validation AND rendering in a single pass, so we just call it and
 /// discard the rendered result. Used by `build_wp` at the points
-/// where it encounters expressions that `lower_wp` will later
-/// re-render via the infallible wrapper (at which point validation
-/// is known to have passed).
+/// where the Exp will be held in shapes that don't carry a
+/// `Validated<'a>` witness (e.g., a sub-Exp of a builder helper that
+/// later re-runs `sst_exp_to_ast_checked` itself, or an Exp lifted
+/// via `lift_if_value`). For Exp's stored directly into a `Wp`
+/// variant, prefer `Validated::check(&Exp)?` — that wraps the same
+/// validation in a typestate so the walker's `lower(&Validated<'_>)`
+/// is panic-free by construction (#100).
 fn check_exp(e: &Exp) -> Result<(), String> {
     sst_exp_to_ast_checked(e).map(|_| ())
 }
@@ -3392,6 +3396,12 @@ fn build_wp<'a>(
             ))
         }
         StmX::Assert(_, _, e) | StmX::AssertCompute(_, e, _) => {
+            // `AssertCompute` carries a ComputeMode (Z3 / ComputeOnly)
+            // that tells Verus's Z3 path to discharge via interp
+            // evaluation. We dispatch identically to plain Assert and
+            // drop the mode — `tactus_auto`'s `decide` rung is the
+            // closest Lean analog (computes the value structurally).
+            // Documented under DESIGN.md "Lossy accepted forms".
             Ok(Wp::Assert(crate::to_lean_sst_expr::Validated::check(e)?, Box::new(after)))
         }
         StmX::Assume(e) => {
@@ -4540,15 +4550,17 @@ fn is_synthetic_param(p: &Par) -> bool {
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for the Wp DSL — `needs_peel`, `lower_wp`,
-    //! `contains_loc`, `lift_if_value`, and `build_wp`'s
-    //! right-to-left Block fold.
+    //! Unit tests for the Wp DSL helpers — `peel_transparent` /
+    //! `peel_value_position` / `contains_loc` / `lift_if_value` /
+    //! `match_single_let_bind` / `extract_simple_var_ident` — plus
+    //! `build_wp`'s right-to-left Block fold and shape-drift guards
+    //! for `CheckDecreaseHeight`, `WpCtx::new`, and `walk_loop`.
     //!
     //! Test strategy: construct small `Wp` trees with hand-built SST
-    //! `Exp` values (simple Vars, Consts, Ifs) and check that
-    //! `lower_wp` produces the expected `LExpr` shape. For
-    //! `needs_peel` the Exp leaves don't matter — only the tree
-    //! structure — so we use minimal dummy exprs.
+    //! `Exp` values (simple Vars, Consts, Ifs) and check that the
+    //! walker / helper produces the expected `LExpr` shape. For
+    //! structural-shape tests the Exp leaves don't matter — only the
+    //! tree structure — so we use minimal dummy exprs.
     //!
     //! These tests are direct-in-crate rather than integration so
     //! they can exercise private items (`Wp`, `build_wp`, etc.).
