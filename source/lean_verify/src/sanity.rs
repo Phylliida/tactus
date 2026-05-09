@@ -593,6 +593,54 @@ mod tests {
         }
     }
 
+    /// Pin which multi-line def shapes the parser handles, and which it
+    /// misses. DESIGN.md catalogue flagged the line-based parser as a
+    /// concern for "future prelude growth"; this test makes the actual
+    /// failure surface concrete:
+    ///
+    /// * `def name\n  : Type := body` — works (name is on the same
+    ///   line as `def`, so line-1 extraction succeeds).
+    /// * `def name {A : Type}\n  [Inhabited A] : T A := body` — works
+    ///   (same reason; the implicit-binder section on line 1 doesn't
+    ///   matter because take_while on `name {A : ...` stops at `{`).
+    /// * `def name :=\n  body` — works (name on line 1, body wraps).
+    /// * `noncomputable\ndef name : T := body` — MISSES (line 1 is
+    ///   bare `noncomputable` with no name; line 2 has `def name` but
+    ///   the parser handles `noncomputable def NAME` as a single-line
+    ///   prefix only; on line 2 alone, `def name` does match the bare
+    ///   `def NAME` form, so this case ACTUALLY works through that
+    ///   fallback).
+    /// * `def\n  name : T := body` — MISSES (line 1 is bare `def`, no
+    ///   space-after-def matches; line 2 doesn't match any prefix).
+    ///
+    /// The single failure mode is bare `def\n` separated from the
+    /// name. That's unidiomatic Lean (no one writes it that way), but
+    /// pinning it makes the actual failure surface concrete instead of
+    /// the DESIGN.md guess.
+    #[test]
+    fn extract_prelude_names_multi_line_def_shapes() {
+        // Cases that should work:
+        let works_a = "def my_a\n  : Int := 0";
+        let works_b = "def my_b {A : Type}\n  [Inhabited A] : Int := 0";
+        let works_c = "def my_c :=\n  0";
+        let works_d = "noncomputable\ndef my_d : Int := 0";
+        for (label, src) in &[("a", works_a), ("b", works_b),
+                              ("c", works_c), ("d", works_d)] {
+            let names = extract_prelude_names(src);
+            let expected = format!("my_{}", label);
+            assert!(names.contains(&expected),
+                "case {}: expected `{}` in {:?}", label, expected, names);
+        }
+
+        // The single failure mode: bare `def\n` separated from name.
+        let fails = "def\n  my_e : Int := 0";
+        let names = extract_prelude_names(fails);
+        assert!(!names.contains("my_e"),
+            "bare `def\\n` followed by name on next line is not handled \
+             by the line-based parser; if this case starts working, \
+             update extract_prelude_names docs");
+    }
+
     /// Regression guard: every name the old hardcoded allowlist had
     /// should still be accepted via the auto-derived path. Catches any
     /// future TactusPrelude.lean refactor that removes one of these
