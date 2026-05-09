@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**313 end-to-end tests + 1 coverage test + 177 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**314 end-to-end tests + 1 coverage test + 177 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -3413,6 +3413,33 @@ an audit that grew into a real feature that finished with a small
 probe, and the most important thing wasn't any single landing but
 the user's two-word "pause first" that turned a multi-hour estimate
 into a 30-line fix.
+
+#### Current session (2026-05-09 evening — trait-bounded type param probe)
+
+After the goodnight, a re-arrival. One small probe:
+
+**Generic datatype with trait-bounded type params — pinned.** DESIGN.md
+catalogue had this listed under "User-facing features not tested" as a
+#108 edge: `enum Tree<A: Tag>` with a user-defined trait bound on the
+type param. Prediction was that it would work because `height_fn_for_datatype`
+ignores `dt.typ_bounds` and the structural height path doesn't need them
+— Lean has no encoding of the user trait `Tag` to ask about anyway.
+Confirmed: `test_exec_call_recursive_generic_datatype_trait_bound`
+verifies first try with `enum TBox<A: Tag> { Leaf(A), Node(Box<TBox<A>>) }`
++ a `Marked: Tag` instantiation in the exec fn. One Rust-level wrinkle
+on the way (Rust requires type params to be used non-recursively, so
+`Leaf(A)` instead of `Leaf`); not a Tactus issue.
+
+DESIGN.md catalogue entry flipped from "Untested" to ✅ pinned with a
+note that the success is structural-not-incidental: the user trait has
+no Lean-side encoding, so the bound silently drops and Verus enforces
+it pre-Tactus.
+
+**Net**: 313 → 314 e2e tests (+1). Pending count unchanged (sub-feature
+under #121). Took ~10 minutes including the false-start on Rust's
+recursive-type-param rule. The conservative estimate would have been
+~30 minutes; the actual cost was below the cost of estimating
+carefully.
 
 ## Architecture
 

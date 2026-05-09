@@ -5096,6 +5096,45 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #108 edge: generic recursive datatype with a TRAIT BOUND on the
+// type param. DESIGN.md flagged this as untested — `height_fn_for_datatype`
+// and `multi_variant_accessor_defs` ignore `dt.typ_bounds`. Prediction:
+// works because the height fn is structural and doesn't actually USE
+// the bound; Lean's `def TBox.height {A : Type} : TBox A → Nat | …`
+// has no Lean-level encoding of `Tag`, so the bound is silently
+// dropped during emission. The exec fn instantiates with a concrete
+// type that happens to satisfy the bound on the Rust side; Verus is
+// the one enforcing the bound, Tactus just translates the structure.
+test_verify_one_file! {
+    #[test] test_exec_call_recursive_generic_datatype_trait_bound verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        trait Tag {
+            spec fn tag(&self) -> int;
+        }
+
+        struct Marked { v: int }
+        impl Tag for Marked {
+            spec fn tag(&self) -> int { self.v }
+        }
+
+        enum TBox<A: Tag> {
+            Leaf(A),
+            Node(Box<TBox<A>>),
+        }
+
+        #[verifier::tactus_auto]
+        fn count_tbox(t: &TBox<Marked>) -> (r: u64)
+            decreases t
+        {
+            match t {
+                TBox::Leaf(_) => 0,
+                TBox::Node(rest) => count_tbox(rest),
+            }
+        }
+    } => Ok(())
+}
+
 // Early return inside a loop body — the WP DSL's `Return` arm writes
 // `ctx.ensures_goal` (the fn's ensures) by construction, regardless
 // of how deeply nested the return is. Pre-DSL code conflated this
