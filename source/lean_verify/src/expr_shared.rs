@@ -406,6 +406,16 @@ pub(crate) fn field_access_name(field_opr: &FieldOpr) -> String {
                 format!("{}_{}", sanitize(variant), field_seg)
             }
         }
-        _ => sanitize(raw),
+        // Tuple with non-numeric field name — Verus shouldn't produce
+        // this (tuple fields are positional, named "0", "1", ...). If
+        // it ever does, the previous defensive fallback (`sanitize(raw)`)
+        // would silently produce a wrong field name. Surface it as a
+        // shape-drift signal instead.
+        (Dt::Tuple(_), None) => unreachable!(
+            "field_access_name: tuple with non-numeric field `{}` — Verus's mode \
+             check should reject this upstream. If this fires, please open an \
+             issue (probable Verus rebase shape drift).",
+            raw,
+        ),
     }
 }
