@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**314 end-to-end tests + 1 coverage test + 177 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**314 end-to-end tests + 1 coverage test + 178 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -3440,6 +3440,28 @@ under #121). Took ~10 minutes including the false-start on Rust's
 recursive-type-param rule. The conservative estimate would have been
 ~30 minutes; the actual cost was below the cost of estimating
 carefully.
+
+**Multi-line def signatures probe (#118 edge) — pinned.** DESIGN.md
+catalogue flagged `extract_prelude_names`'s line-based parser as a
+concern for future prelude growth: "a future prelude addition with
+`def name\n  : LongType := body` would not register the name." Probe
+showed that prediction was wrong — the parser handles four multi-line
+shapes (name-on-line-1 with type wrapping, implicit-binder section
+with bracket section wrapping, body wrapping after `:=`, and modifier
+on its own line via the bare-`def NAME` fallback). The single failure
+mode is bare `def\n` separated from the name (e.g., `def\n  my_e :
+Int := 0`), which is unidiomatic Lean. New unit test
+`extract_prelude_names_multi_line_def_shapes` pins both directions —
+what works and what doesn't — so a future parser change either keeps
+working or surfaces clearly. DESIGN.md catalogue entry rewritten to
+reflect actual surface; `worth a parser robustness pass` claim
+softened to "theoretical-not-urgent" because the failure mode is
+unidiomatic. Test count 177 → 178 unit (+1).
+
+The discipline lesson: catalogue claims about *what fails* are also
+catalogue claims, and they drift the same way claims about *what
+works* do. The DESIGN entry was a guess from when the parser was
+younger; the probe replaces the guess with the actual surface.
 
 ## Architecture
 
