@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**318 end-to-end tests + 1 coverage test + 178 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**319 end-to-end tests + 1 coverage test + 178 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -3534,6 +3534,35 @@ catalogue entries aren't the ones that are pessimistic — they're the
 ones that confidently state both the bug *and* the rejection, and
 neither holds. A guess that two safety nets exist is worse than a
 guess that one does.
+
+**#147 — fixed in the same session it was filed.** After landing
+the panic-pin, the user pushed for diagnosis rather than a guess at
+the fix shape. Diagnosis surfaced the actual cause was BIGGER than
+bit_vector: `dep_order::seed_worklist` walked only require/ensure,
+never the function body. *Any* spec fn call in a body-level assert
+(plain `assert(P)` too, not just bit_vector) hit the same bug.
+
+The diagnostic test (`test_exec_plain_assert_with_spec_call`) gave
+a cleaner reproduction without bit_vector noise. After the
+seed_worklist fix landed, the diagnostic surfaced a SECOND latent
+bug: `spec_fn_to_ast` reused `fn_binders` which adds u-type bound
+hyps as binders — wrong for spec-fn defs (changes the type from
+`Int → Int` to `Int → Bound → Int`). Fix: `fn_binders_without_bound_hyps`
+helper for spec-fn defs.
+
+Two latent bugs, three commits, full e2e suite green at 319.
+
+The discipline lesson: when a fix candidate is named, *diagnose
+before patching*. Today's session almost shipped the smaller fix
+(extending dep_order via the bit_vector path specifically) — would
+have left the second latent bug for someone else, plus the broader
+seed_worklist gap to surface again the next time someone called a
+spec fn from a body assert. The user's "diagnose first" turned a
+narrow fix into a structural one.
+
+Test count 318 → 319 e2e (+1 net: pinned the bit_vector test as
+Ok flipped from Err panic-pin, and added the plain-assert diag).
+Task #147 closed.
 
 ## Architecture
 

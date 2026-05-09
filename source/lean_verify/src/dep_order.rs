@@ -177,6 +177,16 @@ fn seed_worklist<'a>(proof_fns: &[&'a FunctionX], worklist: &mut Vec<&'a Fun>) {
         for e in pf.require.iter() { collect_fun_refs(e, worklist); }
         for e in pf.ensure.0.iter() { collect_fun_refs(e, worklist); }
         for e in pf.ensure.1.iter() { collect_fun_refs(e, worklist); }
+        // Body-level spec fn calls (e.g., inside `assert(spec_fn(x) == ...)`
+        // in an exec fn body, or via Verus's pre-injected `Assume(ens)`
+        // before `StmX::AssertBitVector`) need to be added to the
+        // worklist too. Without this, the spec fn def never lands in
+        // the preamble and the sanity check panics with "unresolved"
+        // (#147). For exec fns this matters because most spec fn
+        // references live in body assertions; for proof fns the body
+        // is a tactic block (text) so collect_fun_refs naturally finds
+        // nothing there.
+        if let Some(body) = &pf.body { collect_fun_refs(body, worklist); }
     }
 }
 
