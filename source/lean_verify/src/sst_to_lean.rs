@@ -2567,14 +2567,20 @@ fn push_post_call_frames(
     // ensures so the ensures Hyp references the fresh existential,
     // not the rebound caller name.
     //
-    // Two shapes (#87):
-    // * Simple `&mut <local>`: `let local := fresh`. The local
+    // Three shapes:
+    // * Simple `&mut <local>` (#55): `let local := fresh`. The local
     //   takes on the post-call value directly.
-    // * Field `&mut <local>.<field>`: `let local := { local with
-    //   field := fresh }`. Lean's structure update preserves all
-    //   other fields automatically — no havoc-base + assume-other-
-    //   fields-unchanged dance needed (the syntax IS that
-    //   semantics, in the type system).
+    // * Single-variant struct field `&mut <local>.<f1>.<f2>.…` (#87
+    //   single-level, #144 deeper): `let local := { local with f1 :=
+    //   { local.f1 with f2 := fresh } }`. Lean's structure update
+    //   preserves all other fields automatically — no havoc-base +
+    //   assume-other-fields-unchanged dance needed (the syntax IS
+    //   that semantics, in the type system).
+    // * Tuple field `&mut <local>.<i>` (#145 + #146): `let local :=
+    //   (local.1, …, fresh, …, local.<n>)`. Lean's tuple syntax IS
+    //   `Prod.mk` sugar; the unmodified slots read via the
+    //   multi-segment `tuple_field_accessor` (`.2.1` etc. for the
+    //   nested-Prod representation of arity > 2 tuples).
     for info in &subst.mut_args {
         let local_name = crate::lean_name::LeanName::from_var_ident(info.rebind_local());
         let new_value = match &info.target {
@@ -3974,26 +3980,33 @@ fn validate_call_arities(
 
 /// Raw extraction of an `&mut`-arg's target shape from a call-site
 /// `Exp`. The arg's outer `Loc(...)` wrapper is peeled; we recognise
-/// two shapes:
+/// three shapes:
 ///
-/// * `Loc(VarLoc(x))` — simple `&mut x`. Variant: `Var(x)`.
-/// * `Loc(Field(...Field(VarLoc(x))))` — field path mutation
-///   `&mut x.f1.f2.…` (#87 single-level, #144 deeper paths).
-///   Variant: `Field { base, field_oprs }` where `field_oprs` is
-///   the path from outermost-write down to innermost-base —
+/// * `Loc(VarLoc(x))` — simple `&mut x`. Variant: `Var(x)`. Plus the
+///   new-mut-ref-mode caller-side shape `Var(synthetic_borrow_mut_local)`
+///   (#107) — recognized when `ident` is in `mut_ref_locals`.
+/// * `Loc(Field(...Field(VarLoc(x))))` — single-variant struct field
+///   path mutation `&mut x.f1.f2.…` (#87 single-level, #144 deeper
+///   paths). Variant: `Field { base, field_oprs }` where `field_oprs`
+///   is the path from outermost-write down to innermost-base —
 ///   `field_oprs[0]` is the deepest-mutated field (closest to the
 ///   leaf value), `field_oprs[len-1]` is the outermost (closest to
-///   the base local). Each level must be a single-variant datatype
-///   (struct-like).
+///   the base local). Each level must be a single-variant datatype.
+/// * `Loc(Field(Tuple(arity), Var(t)))` — single-level tuple field
+///   mutation `&mut t.<i>` (#145 + #146). Variant: `TupleField {
+///   base, index, arity }`. Lean's structure-update syntax doesn't
+///   compose with `Prod`, so the post-call rebind uses Lean tuple
+///   syntax `(t.1, …, fresh, …, t.<n>)` instead.
 ///
 /// Returns `None` for unsupported shapes:
-/// * `&mut v[i]` (Index L-value)
-/// * `&mut *p` (DerefMut)
+/// * `&mut v[i]` (Index L-value) — cross-crate-blocked (vstd routing).
+/// * `&mut *p` (DerefMut) — not yet handled.
 /// * Multi-variant enum field mutation at any level (Lean's
 ///   structure update syntax doesn't compose with multi-variant
-///   inductives).
-/// * Tuple field mutation (`&mut t.0`) — Lean's structure update
-///   doesn't compose with `Prod` types.
+///   inductives; also upstream-blocked at Verus's `ref mut` mode
+///   check for the only viable surface syntax).
+/// * Mixed tuple-and-struct paths (`&mut s.tup.0`, `&mut t.0.f`) —
+///   would need a unified `Vec<FieldKind>` path encoding.
 #[derive(Clone)]
 enum MutTargetRaw<'a> {
     Var(&'a VarIdent),
