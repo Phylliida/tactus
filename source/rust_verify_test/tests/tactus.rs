@@ -4778,6 +4778,42 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #109 coverage extension: 10-element datatype SCC. Addresses
+// DESIGN.md's latent concern about Lean's mutual-block compilation
+// cost at extreme depth. Catalogue had "very deep cycles (10+) remain
+// unpinned — Lean's mutual-block compilation cost is the latent
+// concern at extreme depth." Probe extends the linear chain to 10
+// to either confirm or refute. Same emission path as 4/5 cycles;
+// each `enum` member references the next via `Box<Next>`. If this
+// passes in reasonable time, the latent concern was overstated for
+// realistic depths.
+test_verify_one_file! {
+    #[test] test_exec_ten_element_datatype_scc verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum E0 { E0Leaf, E0Next(Box<E1>) }
+        enum E1 { E1Leaf, E1Next(Box<E2>) }
+        enum E2 { E2Leaf, E2Next(Box<E3>) }
+        enum E3 { E3Leaf, E3Next(Box<E4>) }
+        enum E4 { E4Leaf, E4Next(Box<E5>) }
+        enum E5 { E5Leaf, E5Next(Box<E6>) }
+        enum E6 { E6Leaf, E6Next(Box<E7>) }
+        enum E7 { E7Leaf, E7Next(Box<E8>) }
+        enum E8 { E8Leaf, E8Next(Box<E9>) }
+        enum E9 { E9Leaf, E9Next(Box<E0>) }
+
+        #[verifier::tactus_auto]
+        fn use_e0(e: E0) -> (r: u64)
+            ensures r == 0
+        {
+            match e {
+                E0::E0Leaf => 0,
+                E0::E0Next(_) => 0,
+            }
+        }
+    } => Ok(())
+}
+
 // #108 edge: generic datatype instantiated with an uninhabited type
 // param. DESIGN.md catalogue predicted Lean would reject `Inhabited
 // (List Empty)` synthesis "at the call site." Probe established this
