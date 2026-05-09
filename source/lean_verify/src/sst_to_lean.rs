@@ -324,6 +324,56 @@ struct WpLoopCtx {
     continue_leaf: LExpr,
 }
 
+/// Linked-list-style stack of enclosing loop contexts. Threaded
+/// through `build_wp` as `&LoopStack<'p>` (innermost-first); each
+/// nested loop body extends the stack via `LoopStack::Cons` whose
+/// references live on the caller's stack frame, so push is
+/// allocation-free.
+///
+/// Replaces an earlier `&[&WpLoopCtx]` shape that allocated a fresh
+/// `Vec` per nested loop body (`vec![&inner]; extend_from_slice(outer)`).
+/// The persistent linked-list lives entirely on the call stack — no
+/// heap allocation, no copying — and the iteration pattern (innermost-
+/// first via `iter()`) preserves the prior search semantics.
+enum LoopStack<'p> {
+    Empty,
+    Cons(&'p WpLoopCtx, &'p LoopStack<'p>),
+}
+
+impl<'p> LoopStack<'p> {
+    /// The innermost enclosing loop's ctx, or `None` outside any
+    /// loop. Used to resolve unlabeled `break;` / `continue;`.
+    fn first(&self) -> Option<&WpLoopCtx> {
+        match self {
+            LoopStack::Empty => None,
+            LoopStack::Cons(ctx, _) => Some(ctx),
+        }
+    }
+
+    /// Iterate from innermost to outermost. Used to resolve labeled
+    /// `break 'name;` by searching for the matching label.
+    fn iter(&self) -> LoopStackIter<'_> {
+        LoopStackIter { cursor: self }
+    }
+}
+
+struct LoopStackIter<'p> {
+    cursor: &'p LoopStack<'p>,
+}
+
+impl<'p> Iterator for LoopStackIter<'p> {
+    type Item = &'p WpLoopCtx;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.cursor {
+            LoopStack::Empty => None,
+            LoopStack::Cons(ctx, next) => {
+                self.cursor = next;
+                Some(ctx)
+            }
+        }
+    }
+}
+
 impl<'a> WpCtx<'a> {
     /// Build the context for verifying `check` against `krate`.
     ///
@@ -682,7 +732,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
         &rewritten_body,
         Wp::Done(ctx.ensures_goal.clone()),
         &ctx,
-        &[],
+        &LoopStack::Empty,
     )?;
 
     let fn_name = lean_name(&fn_sst.x.name.path);
@@ -940,22 +990,25 @@ enum CtxFrame {
 
 #[derive(Clone)]
 struct OblCtx {
-    frames: Vec<CtxFrame>,
+    /// Persistent immutable vector — `clone()` is O(1) (structural
+    /// sharing via `im` crate's RRB-tree), `push_back` is O(log N).
+    /// The walker pattern `let new_obl = obl.with_frame(f);
+    /// recurse(&new_obl)` thus avoids the O(N) per-push Vec clone
+    /// the original implementation had.
+    frames: im::Vector<CtxFrame>,
 }
 
 impl OblCtx {
-    fn new() -> Self { Self { frames: Vec::new() } }
+    fn new() -> Self { Self { frames: im::Vector::new() } }
 
-    /// Append a frame to a fresh copy. Cloning the whole `frames`
-    /// Vec per call is O(N²) memory across deeply-nested
-    /// recursion (e.g., a chain of asserts with branches inside).
-    /// Realistic exec fns don't go deep enough for this to matter;
-    /// if a future profile says otherwise, switching to
-    /// `Rc<im::Vector<_>>` (structural sharing) would fix it
-    /// without changing the API.
+    /// Append a frame, returning a fresh OblCtx that shares the
+    /// parent's frames structurally. Cheap by construction
+    /// (`im::Vector::clone` is O(1) and `push_back` is O(log N)),
+    /// so deeply-nested recursion no longer pays the O(N²) memory
+    /// cost the prior `Vec` shape did.
     fn with_frame(&self, f: CtxFrame) -> Self {
         let mut new = self.clone();
-        new.frames.push(f);
+        new.frames.push_back(f);
         new
     }
 
@@ -1581,9 +1634,9 @@ fn walk_loop<'a>(
     // they're only required at break.
     let mut maintain_obl = obl.clone();
     push_mod_var_frames(&mut maintain_obl, modified_vars);
-    maintain_obl.frames.push(CtxFrame::Hyp(entry_inv_conj_marked));
+    maintain_obl.frames.push_back(CtxFrame::Hyp(entry_inv_conj_marked));
     if let Some(c) = cond {
-        maintain_obl.frames.push(CtxFrame::Hyp(cond_marked(&c)));
+        maintain_obl.frames.push_back(CtxFrame::Hyp(cond_marked(&c)));
     }
     // `let _tactus_d_old_<id>_<i> := D_i` — one pre-body snapshot
     // per lex level. Referenced by the body's continue_leaf as
@@ -1593,7 +1646,7 @@ fn walk_loop<'a>(
     // and the level index) avoids any chance of shadowing across
     // nested loops or sibling levels.
     for level in decrease.iter() {
-        maintain_obl.frames.push(CtxFrame::Let(
+        maintain_obl.frames.push_back(CtxFrame::Let(
             crate::lean_name::LeanName::synthetic(level.d_old_name.clone()),
             lower_validated(&level.value),
         ));
@@ -1614,9 +1667,9 @@ fn walk_loop<'a>(
     // to fall-through inside the body.
     let mut use_obl = obl.clone();
     push_mod_var_frames(&mut use_obl, modified_vars);
-    use_obl.frames.push(CtxFrame::Hyp(exit_inv_conj_marked));
+    use_obl.frames.push_back(CtxFrame::Hyp(exit_inv_conj_marked));
     if let Some(c) = cond {
-        use_obl.frames.push(CtxFrame::Hyp(LExpr::not(cond_marked(&c))));
+        use_obl.frames.push_back(CtxFrame::Hyp(LExpr::not(cond_marked(&c))));
     }
     walk_obligations(after, ctx, &use_obl, e);
 }
@@ -1634,13 +1687,13 @@ fn push_mod_var_frames<'a>(
         // includes the disambiguator id when needed (synthetic temps),
         // and falls through to plain `sanitize` for user-named locals.
         let name = crate::lean_name::LeanName::from_var_ident(ident);
-        obl.frames.push(CtxFrame::Binder(LBinder {
+        obl.frames.push_back(CtxFrame::Binder(LBinder {
             name: Some(name.clone()),
             ty: typ_to_expr(typ),
             kind: BinderKind::Explicit,
         }));
         if let Some(pred) = type_bound_predicate(&LExpr::var(name), typ) {
-            obl.frames.push(CtxFrame::Hyp(pred));
+            obl.frames.push_back(CtxFrame::Hyp(pred));
         }
     }
 }
@@ -2468,13 +2521,13 @@ fn push_post_call_frames(
     for info in &subst.mut_args {
         let typ = &callee.params[info.param_idx].x.typ;
         let lean_typ = substitute(&typ_to_expr(typ), &subst.typ_subst);
-        new_obl.frames.push(CtxFrame::Binder(LBinder {
+        new_obl.frames.push_back(CtxFrame::Binder(LBinder {
             name: Some(info.fresh.clone()),
             ty: lean_typ,
             kind: BinderKind::Explicit,
         }));
         if let Some(pred) = type_bound_predicate(&LExpr::var(info.fresh.clone()), typ) {
-            new_obl.frames.push(CtxFrame::Hyp(pred));
+            new_obl.frames.push_back(CtxFrame::Hyp(pred));
         }
     }
 
@@ -2533,7 +2586,7 @@ fn push_post_call_frames(
             // ret types (Bool, Prop, structs) so the bound Hyp is
             // elided there — the cond_setup case (Bool ret).
             if let Some(pred) = type_bound_predicate(ret_value, &ret.typ) {
-                new_obl.frames.push(CtxFrame::Hyp(pred));
+                new_obl.frames.push_back(CtxFrame::Hyp(pred));
             }
             // The eq clause that gave us E has been dropped from
             // `rest_ensures`. Substitute fresh_ret_name → E in the
@@ -2545,7 +2598,7 @@ fn push_post_call_frames(
                 ret_to_e.insert(subst.fresh_ret_name.clone(), ret_value.clone());
                 let rest_substituted = substitute(rest_ensures, &ret_to_e);
                 if !is_trivial_true(&rest_substituted) {
-                    new_obl.frames.push(CtxFrame::Hyp(rest_substituted));
+                    new_obl.frames.push_back(CtxFrame::Hyp(rest_substituted));
                 }
             }
             ret_value.clone()
@@ -2553,7 +2606,7 @@ fn push_post_call_frames(
         None => {
             // ∀-path: ret binder + ret_bound + ensures Hyp.
             let ret_typ_lean = substitute(&typ_to_expr(&ret.typ), &subst.typ_subst);
-            new_obl.frames.push(CtxFrame::Binder(LBinder {
+            new_obl.frames.push_back(CtxFrame::Binder(LBinder {
                 name: Some(subst.fresh_ret_name.clone()),
                 ty: ret_typ_lean,
                 kind: BinderKind::Explicit,
@@ -2561,10 +2614,10 @@ fn push_post_call_frames(
             if let Some(pred) = type_bound_predicate(
                 &LExpr::var(subst.fresh_ret_name.clone()), &ret.typ,
             ) {
-                new_obl.frames.push(CtxFrame::Hyp(pred));
+                new_obl.frames.push_back(CtxFrame::Hyp(pred));
             }
             if let Some(conj) = substituted_ensures {
-                new_obl.frames.push(CtxFrame::Hyp(conj));
+                new_obl.frames.push_back(CtxFrame::Hyp(conj));
             }
             LExpr::var(subst.fresh_ret_name.clone())
         }
@@ -2652,14 +2705,14 @@ fn push_post_call_frames(
                 LExpr::tuple(elems)
             }
         };
-        new_obl.frames.push(CtxFrame::Let(local_name, new_value));
+        new_obl.frames.push_back(CtxFrame::Let(local_name, new_value));
     }
 
     // Phase 5: dest binding for the call's return (`let r = foo(…)`).
     // `dest_value` is `Var(fresh_ret_name)` in the ∀-path or `E` in
     // the substitution path (#128).
     if let Some(dest_ident) = dest {
-        new_obl.frames.push(CtxFrame::Let(
+        new_obl.frames.push_back(CtxFrame::Let(
             crate::lean_name::LeanName::from_var_ident(dest_ident),
             dest_value,
         ));
@@ -2715,7 +2768,7 @@ fn walk_let<'a>(
                 if !bs.is_empty() {
                     let mut chain_obl = obl.clone();
                     for b in bs.iter() {
-                        chain_obl.frames.push(CtxFrame::Let(
+                        chain_obl.frames.push_back(CtxFrame::Let(
                             crate::lean_name::LeanName::from_var_ident(&b.name),
                             sst_exp_to_ast_checked(&b.a)
                                 .expect("walk_let binder rhs: sub of validated Exp tree"),
@@ -3396,12 +3449,13 @@ fn build_wp<'a>(
     stm: &'a Stm,
     after: Wp<'a>,
     ctx: &WpCtx<'a>,
-    // Stack of enclosing loops' break/continue leaves, innermost
-    // first. Empty outside any loop (where `StmX::BreakOrContinue`
-    // is rejected). Most recursive calls forward this unchanged;
-    // only `build_wp_loop` constructs a new one (extending the
-    // stack) for the loop body.
-    loop_stack: &[&WpLoopCtx],
+    // Linked-list stack of enclosing loops' break/continue leaves,
+    // innermost first. `LoopStack::Empty` outside any loop (where
+    // `StmX::BreakOrContinue` is rejected). Most recursive calls
+    // forward this unchanged; only `build_wp_loop` constructs a new
+    // one (`Cons(&new_ctx, outer)`) for the loop body, with the
+    // `Cons` cell living on the caller's stack frame — no heap.
+    loop_stack: &LoopStack<'_>,
 ) -> Result<Wp<'a>, String> {
     match &stm.x {
         StmX::Block(stms) => {
@@ -3582,7 +3636,7 @@ fn build_wp<'a>(
         // **Labeled** (`break 'outer;`) — searches `loop_stack` for
         // the entry whose label matches.
         StmX::BreakOrContinue { label, is_break } => {
-            let leaves = match label {
+            let leaves: &WpLoopCtx = match label {
                 None => {
                     let Some(innermost) = loop_stack.first() else {
                         // Should never fire — Verus's mode checker
@@ -3593,7 +3647,7 @@ fn build_wp<'a>(
                              issue.".to_string()
                         );
                     };
-                    *innermost
+                    innermost
                 }
                 Some(target) => {
                     let target_str = target.as_str();
@@ -3609,7 +3663,7 @@ fn build_wp<'a>(
                             target_str,
                         ));
                     };
-                    *matched
+                    matched
                 }
             };
             let leaf = if *is_break {
@@ -4254,7 +4308,7 @@ fn build_wp_loop<'a>(
     decrease: &'a vir::sst::Exps,
     after: Wp<'a>,
     ctx: &WpCtx<'a>,
-    outer_loop_stack: &[&WpLoopCtx],
+    outer_loop_stack: &LoopStack<'_>,
 ) -> Result<Wp<'a>, String> {
     // Per-loop-unique, per-lex-level d_old names. Verus's
     // `StmX::Loop::id` is the upstream-stable identifier per loop
@@ -4452,9 +4506,9 @@ fn build_wp_loop<'a>(
     // Body is built with THIS loop's WpLoopCtx pushed at the front
     // of the stack (innermost-first). Unlabeled break/continue in
     // the body resolves to this loop; labeled break/continue
-    // searches the stack by label.
-    let mut inner_stack: Vec<&WpLoopCtx> = vec![&inner_loop_ctx];
-    inner_stack.extend_from_slice(outer_loop_stack);
+    // searches the stack by label. The `Cons` cell lives on this
+    // function's stack frame — no heap allocation needed.
+    let inner_stack = LoopStack::Cons(&inner_loop_ctx, outer_loop_stack);
     let body_wp = build_wp(body, Wp::Done(continue_leaf), ctx, &inner_stack)?;
 
     // Apply the non-empty cond_setup transform if needed (#114).
@@ -5530,7 +5584,7 @@ mod tests {
         let block = block_stm(vec![assert_stm(p), assume_stm(q)]);
         let ctx = mk_test_ctx();
         let after = Wp::Done(LExpr::lit_true());
-        let wp = build_wp(&block, after, &ctx, &[]).expect("build_wp");
+        let wp = build_wp(&block, after, &ctx, &LoopStack::Empty).expect("build_wp");
 
         match wp {
             Wp::Assert(_, inner1) => match *inner1 {
@@ -5572,7 +5626,7 @@ mod tests {
         ]);
         let ctx = mk_test_ctx();
         let after = Wp::Done(LExpr::lit_true());
-        let wp = build_wp(&block, after, &ctx, &[]).expect("build_wp");
+        let wp = build_wp(&block, after, &ctx, &LoopStack::Empty).expect("build_wp");
 
         match wp {
             Wp::Assert(_, b1) => match *b1 {
