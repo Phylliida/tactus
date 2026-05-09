@@ -97,14 +97,23 @@ spec fn triangle(n: nat) -> nat
 
 ### Spec fn opacity model
 
-All spec fns are **irreducible by default** — Lean tactics cannot see their bodies unless explicitly unfolded. This prevents Lean's elaborator from diverging on recursive functions and gives users full control over what gets unfolded.
+Spec fn opacity follows Verus's `Opaqueness` enum, NOT a Lean-side default. The mapping (in `to_lean_fn::spec_fn_to_ast`):
 
-- `spec fn` → `@[irreducible] noncomputable def` (body hidden, use `unfold f` in tactics)
-- `open spec fn` → `noncomputable def` (body visible to `simp` and other tactics)
+- Default `spec fn` (Verus `Opaqueness::Revealed { visibility }`) → `noncomputable def`
+- `#[verifier::opaque] spec fn` (Verus `Opaqueness::Opaque`) → `@[irreducible] noncomputable def`
+- `open spec fn` is also `Opaqueness::Revealed` (with broader visibility) → `noncomputable def`
 
-The Verus attribute `#[verifier::opaque]` is redundant with the default and is not needed. In Tactus, all spec fns behave like Verus's `opaque` by default. `open` is the opt-in for transparency.
+This means the default is **transparent**, matching Verus's spec semantics: the body is visible within its visibility scope and treated as definitionally equal to its body during VC generation; `@[irreducible]` is only emitted when the user explicitly opts in via `#[verifier::opaque]`.
 
-This matches how well-written Lean code works — you mark definitions `@[irreducible]` and explicitly control unfolding. The `reveal(f)` pattern from Verus maps to `unfold f` in tactic blocks.
+(An earlier draft of this doc claimed "irreducible by default" with the opposite mapping. That was aspirational — the design considered making spec fns implicitly opaque to give users full control over unfolding — but was never implemented. Verus's `Opaqueness` discriminator is the source of truth and the code emits faithfully against it.)
+
+Tactic implications worth knowing:
+
+- `unfold f` in tactic blocks targets occurrences of `f` in the **goal** by default. For occurrences in hypotheses, use `unfold f at h` or `unfold f at *`. Pinned by `test_chained_compare_in_spec_fn_body` (uses `at *` for a hypothesis-position occurrence) and `test_chained_compare_in_spec_fn_body_via_ensures` (the goal-position case where bare `unfold f` works). This is standard Lean behaviour, not a Tactus quirk; flagged here because it's the most common stumble for users coming from Verus's reveal-based mental model.
+- `simp_all` won't unfold `f` even when transparent — Lean's `simp` only unfolds defs marked `@[simp]` or explicitly listed (`simp_all [f]`).
+- `decide` reduces concrete computations; if `f` is irreducible (i.e., the user marked it `#[verifier::opaque]`), `decide` can't reduce through it.
+
+The `reveal(f)` pattern from Verus has no analog in Tactus — Tactus has no fuel concept. The closest equivalent is `proof { unfold f }` in `tactus_auto` exec fns or `unfold f` directly in proof-fn `by { }` blocks. See "reveal_with_fuel and unfold in Tactus" below.
 
 ### reveal_with_fuel and unfold in Tactus
 

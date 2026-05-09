@@ -525,6 +525,49 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Spec fn with chained-compare body, called from a proof fn that
+// `unfold`s it. Probes that the chained-compare expansion in the
+// SPEC FN BODY (not a require/ensure clause) renders correctly into
+// the Lean def. The 2026-05-09 Multi-arm fix made the renderer
+// produce `0 ≤ x ∧ x ≤ 10` for the body; this test pins it from the
+// caller's perspective via `unfold + omega`.
+//
+// Lean tactic note: `unfold f` targets the GOAL by default. When the
+// spec fn appears only in a hypothesis (via `requires`), use
+// `unfold f at *` to also unfold occurrences in hypotheses.
+test_verify_one_file! {
+    #[test] test_chained_compare_in_spec_fn_body verus_code! {
+        spec fn in_range(x: int) -> bool {
+            0 <= x <= 10
+        }
+
+        proof fn lemma_in_range_lower(x: int)
+            requires in_range(x)
+            ensures x >= 0
+        by {
+            unfold in_range at *; omega
+        }
+    } => Ok(())
+}
+
+// Companion: spec fn with chained-compare body in the GOAL position
+// (via `ensures`). `unfold f` in goal context works without `at *`,
+// because the chained-compare-rendered `0 ≤ x ∧ x ≤ 10` appears
+// directly in the goal after unfolding.
+test_verify_one_file! {
+    #[test] test_chained_compare_in_spec_fn_body_via_ensures verus_code! {
+        spec fn in_range(x: int) -> bool {
+            0 <= x <= 10
+        }
+
+        proof fn lemma_5_in_range()
+            ensures in_range(5)
+        by {
+            unfold in_range; omega
+        }
+    } => Ok(())
+}
+
 // === Mathlib: ring tactic for polynomial identity ===
 
 test_verify_one_file! {
