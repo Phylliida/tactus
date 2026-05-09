@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**316 end-to-end tests + 1 coverage test + 178 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**317 end-to-end tests + 1 coverage test + 178 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -3494,6 +3494,21 @@ fail and how* are guesses about a counterfactual world. Probing
 moves the claim from "guess" to "known surface" — and sometimes the
 known surface shows the concern was solving a problem that doesn't
 exist.
+
+**10-element datatype SCC — pinned, latent concern was overstated.**
+Catalogue had "very deep cycles (10+) remain unpinned — Lean's
+mutual-block compilation cost is the latent concern at extreme
+depth." Probe at depth 10 (E0 → E1 → ... → E9 → E0) runs in ~6.8s,
+vs ~5s for the 4 and 5 cycles. Near-flat compile time across 4 → 5
+→ 10 means the concern only kicks in at much larger depths if at
+all. DESIGN.md catalogue entry rewritten to reflect the measured
+surface: depths 4, 5, and 10 confirmed; concern softened from "kicks
+in at extreme depth" to "if at all." Test count 316 → 317 e2e (+1).
+
+The same discipline pattern: a guess about cost ("Lean compilation
+is the latent concern") replaced by a measurement (~6.8s, near-
+flat). Three of today's four probes have shifted catalogue claims
+in the *softer* direction — the worry was bigger than the surface.
 
 ## Architecture
 
