@@ -1208,7 +1208,7 @@ Accepted via #57: **`cond: None`** loops (the form Verus produces when lowering 
 * **Sanity-check allowlist auto-derived from `TactusPrelude.lean` (#118).** `extract_prelude_names` parses the prelude text at first call and caches the result via `OnceLock`. Adding a new `axiom NAME` / `def NAME` / `noncomputable def NAME` / `syntax "NAME"` / `macro "NAME"` / `elab "NAME"` to `TactusPrelude.lean` automatically updates the sanity allowlist — no `sanity.rs` edit required. Pre-#118 the list was a hardcoded `matches!` arm prone to drift. Pinned by `extract_prelude_names_recognises_current_prelude` (the auto-derived set still contains every name the legacy hardcoded arm did) and `extract_prelude_names_handles_each_form` (each prelude declaration form is recognised).
 * **Expected VIR variant list for coverage is hand-maintained.** `tactus_coverage.rs` lists variants we expect to see. Macro-deriving from the enum would need Verus-upstream `strum` derives — not feasible without vendoring changes.
 * **`_tactus_d_old` not gensym'd** — see its dedicated section.
-* **`OblCtx::with_frame` clones the whole `frames` Vec per call** — O(N²) memory across deeply-nested recursion (asserts inside branches inside loops). Realistic exec fns don't go deep enough for this to matter; switching to `Rc<im::Vector<_>>` (structural sharing) would fix it without changing the API. Documented inline at the function site.
+* **`OblCtx::with_frame` uses `im::Vector` (LANDED 2026-05-09).** Originally `Vec<CtxFrame>`, with `clone()` cost O(N) per `with_frame` call → O(N²) total memory across deeply-nested recursion. Switched to `im::Vector<CtxFrame>` (RRB-tree with structural sharing): `clone()` is O(1), `push_back` O(log N). The walker pattern `let new_obl = obl.with_frame(f); recurse(&new_obl)` keeps its API verbatim; the dependency adds `im = "15"`. Same session also closed an adjacent allocation pattern: `loop_stack: &[&WpLoopCtx]` → `&LoopStack<'p>` linked-list (`enum LoopStack { Empty, Cons(&WpLoopCtx, &LoopStack) }`) where each nested loop's `Cons` cell lives on the caller's stack frame, no heap.
 * **`substitute` boilerplate — LANDED via #98 (2026-05-05).** Four helpers in `lean_ast.rs` concentrate per-variant structural recursion: `walk_children`/`map_children` for ExprNode, `walk_pattern_children`/`map_pattern_children` for Pattern. The five Expr walkers (`substitute_impl`, `collect_free_vars`, `collect_all_names`, `strip_span_marks_node`, `mentions_free_var`) and the two Pattern walkers now handle only the variants whose semantics differ from "uniformly recurse." Per-walker shrinkage was significant (strip_span_marks_node 70→5 lines, collect_all_names 60→25, collect_free_vars 65→45, substitute_impl 125→75); net file +94 because the helpers themselves are sizeable, but the structural win dominates: walk_children and map_children are exhaustive (no catch-all), so a new ExprNode/Pattern variant is a compile error there, forcing one edit instead of five walker edits.
 
   **Binder convention promoted to compile-time enforcement (#98 follow-up).** Originally the three scope-tracking consumers (`substitute_impl`, `collect_free_vars`, `collect_all_names`) used `_ => walk_children(...)` fallthroughs for non-special variants. A future binder ExprNode variant could silently slip through and mis-track scope. The fix: a `ScopeKind<'a>` enum (`Var(name) | Let{...} | Quantified{kind, binders, body} | Match{...} | Other`) and an `ExprNode::scope_kind()` method that dispatches every variant. Both `scope_kind()` and the consumer matches are exhaustive (no `_ =>`). The structural lock: a new ExprNode variant compile-errors in `scope_kind()`, forcing categorization; if the contributor adds a new `ScopeKind` variant, every consumer compile-errors, forcing them to decide scope semantics for the new shape. The contributor *could* still mis-categorize a binder as `ScopeKind::Other` (the type system can't tell them they're wrong), but that's a positive lie rather than a forgotten arm. A `QuantifierKind` enum (Lambda/Forall/Exists discriminator) lets the substitute_impl Quantified arm rebuild via `kind.build(bs, body)` instead of three separate arms.
@@ -1902,6 +1902,7 @@ Assumptions about upstream VIR/SST shape or Verus compiler-pass ordering that ar
 * **Verus's `auto_proof_block` pass always wraps non-empty content.** The pass synthesises `proof { ... }` blocks around every `assert(P)` / `assert(P) by { tac }` site so they're parsed as proof-mode. We distinguish user-written `proof { }` (semantically meaningful, routed to `Wp::AssertByTactus` with `cond: None`) from auto-wrapped ones via HIR-body emptiness in `rust_to_vir_expr.rs` — auto-wrapped blocks have non-empty HIR bodies, user-written empty blocks don't. **Guarded by `test_exec_auto_proof_block_not_tactus`** which exercises the auto-wrap path and confirms it doesn't trigger Tactus mode.
 * **`get_ghost_block_opt` returns `Some(GhostBlockAttr::Proof)` for user-written `proof { }` blocks.** Our `enclosing_fn_is_tactus_auto` + ghost-block-attr detection in `fn_call_to_vir.rs` relies on this attribute classification. If Verus changes how it tags ghost blocks (e.g., a new `GhostBlockAttr::TactusProof` variant, or distinguishing wrapped vs unwrapped at this layer), we'd silently stop detecting user-written proof blocks and route them to the wrong path. **No shape-drift test** — would manifest as `test_exec_proof_block_user_tactic` regressing.
 * **`TypX::Boxed` / `TypX::Decorate` are the canonical transparent wrappers for self-referential datatype fields.** Shared via `peel_typ_wrappers` (in `to_lean_type.rs`), used by `is_int_height`, `decrease_height_datatype`, and `field_recursive_target` (the SCC-aware successor to `field_is_self_recursive` per #109). Mirrors `typ_to_expr`'s rendering (which peels both to produce Lean-level types). If Verus adds a new transparent wrapper for Rust `&Self` / `Box<Self>` / `Arc<Self>` / etc., one edit to `peel_typ_wrappers` updates all three call sites — without it, recursive-field detection would fail silently (field treated as non-recursive → `height = 1` for the variant → false termination obligation → recursion verifies where it shouldn't). **No shape-drift test** — would manifest as `test_exec_call_recursive_datatype_termination` regressing past the current "match-case-split" gap into a verified-but-wrong state.
+* **`ExprX::Multi(MultiOp::Chained(ops), [a0, a1, ..., aN])` mirrors `ast_simplify`'s lowering** (LANDED 2026-05-09). The VIR-AST renderer (`to_lean_expr.rs`'s Multi arm) reproduces ast_simplify's expansion locally: pair-up adjacent operands with their op into binary comparisons, conjoin via `and_all`. Pre-fix the arm rendered as `LExpr::anon([a0, ..., aN])` (Lean tuple literal) — the comment said "tuple construction, chained conjunction, etc. — Render as Lean's anonymous constructor `⟨a, b, c⟩` — correct for tuples", and the "etc." was load-bearing. Reachable specifically because proof fns route through the *pre-simplify* krate (per the verifier doc) so Multi is still present at render time; exec-fn callee inlining goes through the simplified krate where ast_simplify has already expanded. Pinned by `test_chained_compare_in_proof_fn` and `test_chained_compare_in_proof_fn_ensures` (both fail loudly with type-mismatch pre-fix). If `ast_simplify` ever changes its Chained-expansion shape (e.g., short-circuiting or different binary-op pairing), the renderer needs to mirror the new shape — no shape-drift test pins the equivalence directly, only the user-facing outcome.
 
 ### `Wp` — WP DSL (landed)
 
@@ -2071,6 +2072,15 @@ duplicated across consumers:
   rendering.
 * `is_int_height` — the int-typed-decrease check for
   `CheckDecreaseHeight`.
+* `is_mut_ref_par(&Par)` (SST) / `is_mut_ref_param(&Param)` (AST) —
+  the AST/SST twins for "is this an `&mut` parameter?" Both check
+  legacy mode (`is_mut: true`, plain T typ) and new-mut-ref mode
+  (`is_mut: false`, `MutRef<T>` typ). Centralising the predicate
+  keeps `walk_call`'s mut_args collection (in `build_call_mut_args`)
+  and the per-param subst-map structure (in `add_param_subst_entries`)
+  in lockstep — divergence would silently miscompile new-mut-ref-
+  shaped callees whose params reach the second consumer as
+  `is_mut: false, typ: MutRef<T>` (extracted 2026-05-09 review pass).
 
 **Shape-drift detection tests.** For implicit shape invariants we
 depend on but can't enforce with types, a test constructs the
@@ -2091,6 +2101,25 @@ this test fails with a message that says:
 
 — turning a future mystery (why do my recursive fns suddenly fail
 verification?) into a focused test failure with a named fix site.
+
+**Fail-loud assertions for unreachable shapes.** A weaker form of
+shape-drift detection: when Verus's pipeline shouldn't produce a
+particular shape (e.g., tuples have positional numeric field names,
+so `(Dt::Tuple, non-numeric field)` is upstream-impossible), the
+renderer uses `unreachable!` / `assert!` with a diagnostic message
+naming the fix site rather than a defensive fallback that would
+silently produce wrong output. Examples (extracted 2026-05-09):
+
+* `field_access_name`'s `(Dt::Tuple(_), None)` arm — was
+  `_ => sanitize(raw)` (would silently produce a wrong field
+  name); now `unreachable!` with a "probable Verus rebase shape
+  drift, please open an issue" message.
+* `tuple_field_accessor`'s `arity < 2` branch — was a defensive
+  `(n + 1).to_string()` fallback; now `assert!(arity >= 2, ...)`.
+
+Same triangle as before (test, helper, destructure) but with the
+"test" leg replaced by an inline runtime assert when no synthesizable
+SST shape exists to construct in a unit test.
 
 The triangle these form:
 * Explicit destructures catch *field additions* at compile time.
