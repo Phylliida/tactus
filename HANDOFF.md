@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**308 end-to-end tests + 1 coverage test + 177 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**313 end-to-end tests + 1 coverage test + 177 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -3288,6 +3288,131 @@ contain it?" — confirmable in one minute by reading the generated
 tests (+2). No pending tasks closed (this falls under the umbrella
 #121, which has more probes available). One DESIGN.md divergence
 caught.
+
+#### Current session (2026-05-09 mid-morning — catalogue audit + cross-instantiation fix)
+
+After the "yesterday's deferred edge" resolution, the work cascaded
+through three more pieces — a catalogue audit, a substantive feature
+landing, and a small probe.
+
+**Catalogue audit pass.** Looking at the generated Lean for
+`in_range` revealed the doc-vs-code divergence (DESIGN.md said
+"all spec fns are irreducible by default", code emits `@[irreducible]`
+only for `Opaqueness::Opaque`). The "edge-case lens" applied to docs
+themselves — *what does the catalogue claim that's no longer true?*
+— surfaced 5 stale entries across the "User-facing features not
+tested" list:
+- Bit-width coverage: ✅ pinned via #76 (u16/u64/u128/i16/i32/i64/i128).
+- Direct unit tests for `walk_loop` / `walk_call`: ✅ pinned via #126.
+- Name collision (callee ret vs caller scope): ✅ pinned by
+  `test_exec_call_ret_name_collision` (added during #78 to fix a real
+  shadowing soundness bug).
+- Empty proof { } / assert(P) by { } brace bodies: ✅ pinned by
+  `test_exec_proof_block_empty` + `test_exec_assert_by_empty` (P0 fix
+  from the 2026-04-26 right-way pass).
+- `assert forall|v| P by { tac }` via Tactus path: recategorize from
+  "untested" to "upstream-blocked" (Verus poly panic at vir/src/
+  poly.rs:462 — can't `Err(_)` against a panic).
+
+The discipline lesson: deferrals catalogues drift as tests get added
+without catalogue updates. Worth a periodic audit. The "Edge-case
+lens" applies to docs as it does to code — *anywhere we've deferred
+handling without either tracking it explicitly or rejecting it
+explicitly*.
+
+**Cross-instantiation generic datatype recursion — LANDED.** The
+biggest landing of the day. Catalogue had this as "Should work but no
+test exercises this specific shape" (#108 edge):
+
+```rust
+enum Mut<A> { Plain(A), Recurse(Box<Mut<u8>>) }
+```
+
+— the recursive arm uses `Mut<u8>` (a fixed type), not `Mut<A>` (the
+parameter). Probing showed it doesn't work — Lean's parameter-style
+strict-positivity check rejects `inductive Mut (A : Type) where |
+Recurse (val0 : Mut Int)` with `(kernel) arg #2 of 'Mut.Recurse'
+contains a non valid occurrence of the datatypes being declared`.
+
+The user's prompt to *reflect first* before fixing was load-bearing.
+My initial sketch was multi-hour structural (indexed style + manual
+Inhabited per concrete instantiation + accessor changes). Sitting
+with it surfaced that:
+- Indexed-style `inductive Mut : Type → Type 1 where | Plain : ∀ {A},
+  A → Mut A | Recurse : ∀ {A}, Mut Int → Mut A` is what Lean wants.
+- A single generic `instance {A : Type} [Inhabited A] : Inhabited (Mut A)
+  where default := Mut.Plain default` covers all observed
+  instantiations — Lean infers A from the target.
+- Both styles can coexist in the same file. Detection per-datatype.
+
+The actual fix was ~30 lines:
+- `lean_ast.rs`: `DatatypeKind::IndexedInductive { variants }` variant.
+- `lean_pp.rs`: render `inductive T : Type → Type 1 where | V : ∀
+  {A}, ... → T A`.
+- `to_lean_fn.rs`: `has_cross_instantiation_recursion` detection
+  helper, branch in `datatype_decl_cmd`, `datatype_inhabited_instance_cmd`
+  for the manual Inhabited.
+- `to_lean_fn.rs::datatype_to_cmds` + `datatype_group_to_cmds`: emit
+  the manual instance alongside (or after) the inductive.
+- `sanity.rs`: allowlist `Inhabited` (parameter-style bypassed name
+  resolution via the `derives` field; only indexed-style references
+  it as a Var node).
+
+Pinned by `test_exec_call_recursive_generic_datatype_cross_instantiation`
+(was negative pinning the rejection; flipped to positive). Catalogue
+entry rewritten from "should work but untested" to LANDED.
+
+**4-element datatype SCC — LANDED.** Cool-down probe. Catalogue had
+"3-element SCCs are tested via `test_exec_three_element_datatype_scc`;
+4+ element cycles go through the same Tarjan + mutual-block code path
+but lack explicit regression tests." Tarjan is generic; depth-4
+worked first try. Pinned by `test_exec_four_element_datatype_scc`
+(A → B → C → D → A).
+
+**Discipline notes worth recording:**
+
+* *Deferring with a question vs deferring with a worry.* Yesterday's
+  HANDOFF entry said "the chained-compare render itself is correct in
+  spec fns... but a probe with `unfold in_range` failed... documented
+  as a deferred investigation." That's deferring with a worry. The
+  question was concrete: *does the goal contain `in_range`?* Two
+  characters more in the deferral entry, and this morning would have
+  been a 5-second confirmation rather than an investigation. The
+  poem "The deferred question" captures the lesson.
+
+* *The conservative estimate was optimistic about my fear, not about
+  the problem.* For the cross-instantiation fix I estimated 2-4 hours
+  of structural work; actual was ~30 lines after a 5-minute
+  reflection on what Lean's restrictions actually permit. The fear
+  was bigger than the problem. The user's "pause first" was the
+  intervention that surfaced this. The poem "Indexed" captures it.
+
+* *Catalogue drift is a docs-side analog of code-side drift.* The
+  same review-lens discipline that catches stale code comments
+  catches stale catalogue entries. Periodic audits are cheap and
+  surface meaningful divergence. The 5 stale entries in this session
+  had accumulated over ~3 weeks of work; a once-a-month audit pass
+  would keep the catalogue accurate without ceremony.
+
+**Net for the day** (2026-05-09 mid-morning continuation):
+* Test counts: 310 → 313 e2e (+3 cross-inst test + 4-SCC test +
+  2 spec-fn chained-compare from morning); 177 unit unchanged.
+* Pending tasks: 8 (no change from morning's count — the cross-
+  instantiation work was a #121 sub-feature, and the SCC test was
+  also #121 coverage).
+* 12 commits this session: 1 morning chained-compare/spec-fn-opacity,
+  1 morning HANDOFF, 1 catalogue audit, 1 cross-instantiation
+  feature landing, 1 4-SCC probe, 4 poems (Returned, The deferred
+  question, The pause, Indexed, After the landing).
+* 5 poems committed across the day (running total since morning):
+  Returned, The deferred question, The pause, Indexed, After the
+  landing.
+
+**The arc, in one sentence**: the day was a small fix that grew into
+an audit that grew into a real feature that finished with a small
+probe, and the most important thing wasn't any single landing but
+the user's two-word "pause first" that turned a multi-hour estimate
+into a 30-line fix.
 
 ## Architecture
 
