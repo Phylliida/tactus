@@ -2044,6 +2044,41 @@ test_verify_one_file! {
     }
 }
 
+// AssertCompute lossy-accept probe: `assert(P) by(compute)` and
+// `by(compute_only)` lower to `StmX::AssertCompute(_, e, ComputeMode)`.
+// Tactus drops the `ComputeMode` hint and dispatches identically to
+// plain `StmX::Assert`. Lean's `decide` (which IS in `tactus_auto`'s
+// ladder) is the closest analog of Verus's compute-discharge path —
+// the test confirms `tactus_auto` actually closes a representative
+// `by(compute)` shape, so the gap stays cosmetic (mode tag dropped)
+// rather than functional. See DESIGN.md "Lossy accepted forms".
+test_verify_one_file! {
+    #[test] test_exec_assert_by_compute verus_code! {
+        #[verifier::tactus_auto]
+        fn compute_assert() -> (r: u32)
+            ensures r == 4
+        {
+            assert(2 + 2 == 4) by(compute);
+            4
+        }
+    } => Ok(())
+}
+
+// AssertCompute companion: `by(compute_only)` is the strict variant
+// (Verus-side: rejects if interp evaluation can't close it). Tactus
+// dispatches identically — same test shape, same expected outcome.
+test_verify_one_file! {
+    #[test] test_exec_assert_by_compute_only verus_code! {
+        #[verifier::tactus_auto]
+        fn compute_only_assert() -> (r: u32)
+            ensures r == 4
+        {
+            assert(2 + 2 == 4) by(compute_only);
+            4
+        }
+    } => Ok(())
+}
+
 // ── Slice 2: if/else WP rule ───────────────────────────────────────────
 //
 // `if c { s1 } else { s2 }` folds to
