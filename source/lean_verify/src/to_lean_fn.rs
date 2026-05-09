@@ -175,8 +175,11 @@ pub fn datatype_to_cmds(dt: &DatatypeX, emit_accessors: bool) -> Vec<Command> {
         scc_paths.insert(p);
     }
     let mut cmds = Vec::new();
-    if let Some(decl) = datatype_decl_cmd(dt) {
+    if let Some(decl) = datatype_decl_cmd(dt, &scc_paths) {
         cmds.push(decl);
+    }
+    if let Some(inst) = datatype_inhabited_instance_cmd(dt, &scc_paths) {
+        cmds.push(inst);
     }
     cmds.extend(datatype_accessor_cmds(dt, emit_accessors));
     if let Some(height) = datatype_height_cmd(dt, &scc_paths) {
@@ -220,9 +223,21 @@ pub fn datatype_group_to_cmds<'a>(
 
     // 1. mutual block of inductives.
     let inductive_cmds: Vec<Command> = dts.iter()
-        .filter_map(|dt| datatype_decl_cmd(dt))
+        .filter_map(|dt| datatype_decl_cmd(dt, &scc_paths))
         .collect();
     cmds.push(Command::Mutual(inductive_cmds));
+
+    // 1b. Manual `Inhabited` instances for any indexed-style members of
+    // the SCC (Lean rejects `deriving Inhabited` on indexed inductives).
+    // Emitted OUTSIDE the mutual block — Lean's instance system can
+    // resolve cross-references to types declared earlier in the file
+    // (the mutual block above) without needing the instance itself to
+    // be inside it.
+    for dt in &dts {
+        if let Some(inst) = datatype_inhabited_instance_cmd(dt, &scc_paths) {
+            cmds.push(inst);
+        }
+    }
 
     // 2. accessors per-datatype, outside the mutual block.
     for dt in &dts {
@@ -241,9 +256,57 @@ pub fn datatype_group_to_cmds<'a>(
     cmds
 }
 
+/// Returns `true` iff `dt` has at least one variant field whose type is a
+/// recursive reference to a datatype in `scc_paths` AND whose type-arguments
+/// don't match the parent's `typ_params` positionally — i.e., the recursive
+/// arm uses a different instantiation than the parent declares.
+///
+/// Example trigger: `enum Mut<A> { Plain(A), Recurse(Mut<u8>) }` — the
+/// `Recurse` arm uses `Mut<u8>` while the parent's typ_params are `[A]`.
+/// Lean's parameter-style strict-positivity check rejects this; we route
+/// to indexed-style emission instead (which Lean accepts).
+///
+/// Counterexample (uniform recursion): `enum List<A> { Cons(A, List<A>) }`
+/// — recursive arm uses `List<A>`, args match parent's params. Returns false.
+///
+/// Counterexample (no generics): `enum Tree { Leaf, Node(Tree, Tree) }` —
+/// no parent params to compare against; recursion is trivially uniform.
+/// Returns false.
+fn has_cross_instantiation_recursion(
+    dt: &DatatypeX,
+    scc_paths: &std::collections::HashSet<&Path>,
+) -> bool {
+    let parent_params: Vec<&str> = dt.typ_params.iter().map(|(id, _)| id.as_str()).collect();
+    if parent_params.is_empty() {
+        return false; // no params → no cross-instantiation possible.
+    }
+    for variant in dt.variants.iter() {
+        for field in variant.fields.iter() {
+            let field_typ = crate::to_lean_type::peel_typ_wrappers(&field.a.0);
+            let TypX::Datatype(Dt::Path(p), args, _) = &**field_typ else { continue; };
+            if !scc_paths.contains(p) { continue; }
+            // Recursive arm. Compare args to parent's typ_params positionally.
+            if args.len() != parent_params.len() { return true; }
+            for (arg, &param_name) in args.iter().zip(parent_params.iter()) {
+                let arg_peeled = crate::to_lean_type::peel_typ_wrappers(arg);
+                let TypX::TypParam(n) = &**arg_peeled else { return true; };
+                if n.as_str() != param_name { return true; }
+            }
+        }
+    }
+    false
+}
+
 /// Emit the `inductive` (or `structure`) declaration for a datatype.
 /// Returns None for `Dt::Tuple` (no decl needed; tuples render as products).
-fn datatype_decl_cmd(dt: &DatatypeX) -> Option<Command> {
+///
+/// Branches on `has_cross_instantiation_recursion` to pick parameter-style
+/// vs indexed-style. Indexed-style requires a companion `Inhabited`
+/// instance — emitted separately by `datatype_inhabited_instance_cmd`.
+fn datatype_decl_cmd(
+    dt: &DatatypeX,
+    scc_paths: &std::collections::HashSet<&Path>,
+) -> Option<Command> {
     let (path, short) = match &dt.name {
         Dt::Path(p) => (lean_name(p), short_name(p).to_string()),
         Dt::Tuple(_) => return None,
@@ -255,6 +318,8 @@ fn datatype_decl_cmd(dt: &DatatypeX) -> Option<Command> {
     let is_single_variant_struct =
         dt.variants.len() == 1 && dt.variants[0].name.as_str() == short;
 
+    let cross_inst = has_cross_instantiation_recursion(dt, scc_paths);
+
     let kind = if is_single_variant_struct {
         let variant = &dt.variants[0];
         DatatypeKind::Structure {
@@ -264,31 +329,118 @@ fn datatype_decl_cmd(dt: &DatatypeX) -> Option<Command> {
             }).collect(),
         }
     } else {
-        DatatypeKind::Inductive {
-            variants: dt.variants.iter().map(|v| Variant {
-                name: sanitize(&v.name),
-                fields: v.fields.iter().map(|f| Field {
-                    name: field_name(&f.name),
-                    ty: typ_to_expr(&f.a.0),
-                }).collect(),
+        let variants: Vec<Variant> = dt.variants.iter().map(|v| Variant {
+            name: sanitize(&v.name),
+            fields: v.fields.iter().map(|f| Field {
+                name: field_name(&f.name),
+                ty: typ_to_expr(&f.a.0),
             }).collect(),
+        }).collect();
+        if cross_inst {
+            DatatypeKind::IndexedInductive { variants }
+        } else {
+            DatatypeKind::Inductive { variants }
         }
     };
 
-    // Derive `Inhabited` for every datatype so that auto-generated
-    // accessors' `default` fallback resolves. For self-referential
+    // Derive `Inhabited` automatically for parameter-style. Lean rejects
+    // `deriving Inhabited` on indexed-style inductives, so we drop the
+    // derive and emit a manual instance via
+    // `datatype_inhabited_instance_cmd` instead. For self-referential
     // types like `enum Stack { Empty, Push(u8, Box<Stack>) }`,
     // `Push_val1 : Stack → Stack` needs `Inhabited Stack`. For generic
     // datatypes (#108), Lean's `deriving Inhabited` auto-generates a
     // conditional instance `[Inhabited A] → Inhabited (List A)`. For
     // mutually recursive SCCs (#109), Lean accepts `deriving Inhabited`
-    // inline even inside a `mutual` block.
-    let derives = vec!["Inhabited".into()];
+    // inline even inside a `mutual` block (parameter-style only).
+    let derives = if cross_inst { vec![] } else { vec!["Inhabited".into()] };
     Some(Command::Datatype(Datatype {
         name: path,
         typ_params,
         kind,
         derives,
+    }))
+}
+
+/// For indexed-style datatypes (cross-instantiation recursion), emit a
+/// manual `Inhabited` instance of shape:
+/// ```text
+/// noncomputable instance {A : Type} [Inhabited A] : Inhabited (T A) where
+///   default := T.<base> default default ...
+/// ```
+/// where `<base>` is a non-recursive variant (one whose fields don't
+/// reference any datatype in the SCC). Each field gets `default` from the
+/// `[Inhabited A]` typeclass param (for type-param fields) or the global
+/// `Inhabited Int` etc. instances (for primitive fields).
+///
+/// Returns `None` for parameter-style datatypes (Lean's `deriving Inhabited`
+/// handles those) and for tuple datatypes (no decl).
+fn datatype_inhabited_instance_cmd(
+    dt: &DatatypeX,
+    scc_paths: &std::collections::HashSet<&Path>,
+) -> Option<Command> {
+    if !has_cross_instantiation_recursion(dt, scc_paths) {
+        return None;
+    }
+    let path = match &dt.name {
+        Dt::Path(p) => lean_name(p),
+        Dt::Tuple(_) => return None,
+    };
+    // Find a base constructor — a variant whose fields don't reference any
+    // datatype in the SCC. Such a variant always exists for any
+    // Rust-constructible enum (otherwise the datatype is uninhabited).
+    let base_variant = dt.variants.iter().find(|v| {
+        v.fields.iter().all(|f| field_recursive_target(&f.a.0, scc_paths).is_none())
+    })?;
+
+    // Build `T.<base> default default ...` — the constructor applied to
+    // `default` for each field. Lean infers the implicit type-args via the
+    // target `Inhabited (T A)` plus the `[Inhabited A]` bound.
+    let ctor_name = format!("{}.{}", path, sanitize(&base_variant.name));
+    let mut body = LExpr::var_lit(&ctor_name);
+    if !base_variant.fields.is_empty() {
+        let args: Vec<LExpr> = base_variant.fields.iter()
+            .map(|_| LExpr::var_lit("default"))
+            .collect();
+        body = LExpr::app(body, args);
+    }
+
+    // Binders: `{A : Type} [Inhabited A]` per type parameter.
+    let mut binders: Vec<LBinder> = Vec::new();
+    for (id, _) in dt.typ_params.iter() {
+        binders.push(LBinder {
+            name: Some(crate::lean_name::LeanName::lit(id.as_str())),
+            ty: LExpr::var_lit("Type"),
+            kind: BinderKind::Implicit,
+        });
+        binders.push(LBinder {
+            name: None,
+            ty: LExpr::app(
+                LExpr::var_lit("Inhabited"),
+                vec![LExpr::var_lit(id.as_str())],
+            ),
+            kind: BinderKind::Instance,
+        });
+    }
+
+    // Target: `Inhabited (T A B ...)`.
+    let parent_applied = if dt.typ_params.is_empty() {
+        LExpr::var_lit(&path)
+    } else {
+        let args: Vec<LExpr> = dt.typ_params.iter()
+            .map(|(id, _)| LExpr::var_lit(id.as_str()))
+            .collect();
+        LExpr::app(LExpr::var_lit(&path), args)
+    };
+    let target = LExpr::app(LExpr::var_lit("Inhabited"), vec![parent_applied]);
+
+    Some(Command::Instance(Instance {
+        binders,
+        target,
+        methods: vec![InstanceMethod {
+            name: "default".into(),
+            body,
+        }],
     }))
 }
 

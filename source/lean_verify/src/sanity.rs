@@ -306,6 +306,13 @@ fn name_resolves(name: &str, defined: &HashSet<String>, scope: &HashSet<String>)
         // for primitive types. Used as the fallback value in synthesized
         // accessor functions for multi-variant inductives.
         | "default"
+        // `Inhabited` typeclass referenced by the manual instance Tactus
+        // emits for indexed-style inductives (cross-instantiation
+        // recursion — see `to_lean_fn::datatype_inhabited_instance_cmd`).
+        // Parameter-style datatypes use `deriving Inhabited` which is
+        // a string in the Datatype's `derives` field and bypasses name
+        // resolution entirely; only the indexed-style path needs this.
+        | "Inhabited"
         | "()"
     )
 }

@@ -4497,6 +4497,52 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #108 edge: generic recursive datatype with cross-instantiation
+// recursion (`Recurse(Box<Mut<u8>>)` regardless of outer `A`).
+//
+// Lean's parameter-style strict-positivity check rejects this shape:
+// `inductive Mut (A : Type) where | Recurse (val0 : Mut Int)` errors
+// with "non valid occurrence of the datatypes being declared" because
+// the recursive arm uses a fixed type `Int` rather than the
+// parameter `A`. Tactus detects cross-instantiation recursion at
+// codegen time and emits indexed-style `inductive Mut : Type →
+// Type 1 where | Plain : ∀ {A}, A → Mut A | Recurse : ∀ {A}, Mut Int
+// → Mut A` plus a manual `Inhabited` instance (since `deriving
+// Inhabited` doesn't work for indexed-style). Both styles coexist
+// in the same .lean — only affected datatypes get the indexed
+// treatment via the `has_cross_instantiation_recursion` predicate
+// in `to_lean_fn::datatype_decl_cmd`.
+test_verify_one_file! {
+    #[test] test_exec_call_recursive_generic_datatype_cross_instantiation verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum Mut<A> {
+            Plain(A),
+            Recurse(Box<Mut<u8>>),
+        }
+
+        #[verifier::tactus_auto]
+        fn count_recurse(m: &Mut<u32>) -> (r: u64)
+            decreases m
+        {
+            match m {
+                Mut::Plain(_) => 0,
+                Mut::Recurse(inner) => count_recurse_u8(inner),
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn count_recurse_u8(m: &Mut<u8>) -> (r: u64)
+            decreases m
+        {
+            match m {
+                Mut::Plain(_) => 0,
+                Mut::Recurse(inner) => count_recurse_u8(inner),
+            }
+        }
+    } => Ok(())
+}
+
 // #108 negative: generic-datatype recursion that doesn't decrease.
 // Same shape as `test_exec_call_recursive_datatype_nondecreasing` but
 // with a generic List. Pins that the height-based termination check
