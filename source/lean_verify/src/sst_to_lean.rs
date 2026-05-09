@@ -1776,6 +1776,21 @@ fn is_mut_ref_par(p: &Par) -> bool {
     p.x.is_mut || matches!(&*p.x.typ, vir::ast::TypX::MutRef(_))
 }
 
+/// VIR-AST counterpart of [`is_mut_ref_par`]. Same logic, different
+/// type alias — `Par` is `vir::sst::Par` (used when iterating the
+/// fn-being-verified's own params), `Param` is `vir::ast::Param` (used
+/// when iterating a callee's params via `FunctionX.params`). Both
+/// detect `&mut` in legacy mode (`is_mut: true`) and new-mut-ref mode
+/// (`MutRef<T>` typ). Centralising the predicate keeps `walk_call`'s
+/// `mut_args` collection (in `build_call_mut_args`) and the
+/// per-param subst-map structure (in `add_param_subst_entries`) in
+/// lockstep — divergence would silently miscompile new-mut-ref-shaped
+/// callees whose params reach `add_param_subst_entries` as
+/// `is_mut: false, typ: MutRef<T>`.
+fn is_mut_ref_param(p: &vir::ast::Param) -> bool {
+    p.x.is_mut || matches!(&*p.x.typ, vir::ast::TypX::MutRef(_))
+}
+
 /// Phase-of-rendering context for `normalize_mut_ref_*` (#95).
 /// `MutRefCurrent` has different meaning in body vs ensures, and the
 /// normalizer needs to know which phase it's running in.
@@ -2122,7 +2137,13 @@ fn add_param_subst_entries<'a>(
         let pname_pre = crate::lean_name::LeanName::synthetic(varat_pre_name(pname.as_str()));
         // Requires: same map for mut and non-mut (only pre-state exists).
         req_subst.insert(pname.clone(), arg_lexprs[i].clone());
-        if p.x.is_mut {
+        // Both legacy mode (`is_mut: true`) and new-mut-ref mode
+        // (`MutRef<T>` typ) need the mut-side subst structure. Going
+        // through the named helper keeps this in lockstep with
+        // `build_call_mut_args` — both consumers ask "is this an
+        // &mut param?" the same way, so a future Verus-side change
+        // updates both sites at once.
+        if is_mut_ref_param(p) {
             mut_param_names.insert(sanitize(&p.x.name.0));
             req_subst.insert(pname_pre.clone(), arg_lexprs[i].clone());
             // Ensures: mut param's `p` → fresh post-state; pre-state via varat_pre_name.
@@ -4149,13 +4170,12 @@ fn build_call_mut_args<'a>(
         // `MutRef<T>` typ). The caller-side encoding for both modes
         // goes through #55's mut_args machinery — legacy via
         // Loc(VarLoc(_)) shapes, new-mut-ref via bare
-        // Var(borrow_mut_local) shapes (#107). Inline rather than
-        // calling `is_mut_ref_par` because the latter takes `&Par`
-        // (vir::sst) while callee params here are `&Param`
-        // (vir::ast) — same shape, different type alias.
-        let is_mut_ref =
-            param.x.is_mut || matches!(&*param.x.typ, vir::ast::TypX::MutRef(_));
-        if is_mut_ref {
+        // Var(borrow_mut_local) shapes (#107). `is_mut_ref_param` is
+        // the AST-side twin of the SST-side `is_mut_ref_par`; using
+        // the named helper keeps this site in lockstep with
+        // `add_param_subst_entries` (the only other consumer of the
+        // same predicate on the AST side).
+        if is_mut_ref_param(param) {
             match extract_mut_target(a, mut_ref_locals) {
                 Some(target) => mut_args.push((i, target)),
                 None => return Err(format!(
