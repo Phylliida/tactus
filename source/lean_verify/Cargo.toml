@@ -9,3 +9,8 @@ air = { path = "../air" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "5"
+# Persistent immutable vector for OblCtx frames — `clone()` is O(1)
+# (structural sharing) and `push_back` is O(log N), so the typical
+# walker pattern of `let new_obl = obl.with_frame(f); recurse(&new_obl)`
+# avoids the O(N) per-push Vec clone that was the prior anti-pattern.
+im = "15"
