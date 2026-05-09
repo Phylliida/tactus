@@ -634,22 +634,24 @@ fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
         // at error-formatting time. Regular block comments (`/-
         // ... -/`) are valid anywhere whitespace is (unlike
         // `/-!`, which Lean treats as a module docstring and
-        // rejects inline). We strip newlines from the loc text
-        // defensively.
+        // rejects inline).
+        //
+        // No newline sanitization needed: `rust_loc` is produced
+        // by `format_rust_loc` from `Span::start_loc` (a
+        // `path:line:col` string written by
+        // `rust_verify::spans::to_air_span`) or, as fallback, from
+        // `Span::as_string` (a `format!("{:?}", rustc_span)`
+        // result). Both formats are single-line by construction.
+        // Pinned by `span_mark_loc_has_no_newlines` and
+        // `span_mark_render_preserves_loc_verbatim`.
         ExprNode::SpanMark { rust_loc, kind, inner } => {
-            // Sanitize: strip newlines so a multi-line loc can't
-            // break the block comment AND so the recorded
-            // landmark string has no embedded newlines.
-            let sanitized: String = rust_loc.chars()
-                .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-                .collect();
             lm.span_marks.push(SpanMarkLandmark {
                 line: current_line(out),
-                loc: sanitized.clone(),
+                loc: rust_loc.clone(),
                 kind: *kind,
             });
             out.push_str("/- @rust:");
-            out.push_str(&sanitized);
+            out.push_str(rust_loc);
             out.push_str(" -/ ");
             write_expr_body(out, &inner.node, lm);
         }
@@ -927,5 +929,62 @@ mod tests {
         };
         let out = pp_command(&Command::Def(d));
         assert!(out.contains("termination_by (n, m)"), "{out}");
+    }
+
+    /// Pins that SpanMark rendering passes the `rust_loc` string
+    /// through verbatim into both the `/- @rust:LOC -/` comment
+    /// and the recorded `SpanMarkLandmark.loc`. The pp used to
+    /// strip newlines from `rust_loc` defensively; we removed that
+    /// because `format_rust_loc` produces single-line output by
+    /// construction (`Span::start_loc` is `path:line:col` and the
+    /// `Span::as_string` fallback is `format!("{:?}", rustc_span)`,
+    /// also single-line). If a future change reintroduces multi-
+    /// line locs, this test fails — fix the producer rather than
+    /// re-adding pp-side sanitization.
+    #[test]
+    fn span_mark_render_preserves_loc_verbatim() {
+        use crate::lean_ast::AssertKind;
+        use crate::lean_ast::ObligationKind;
+        let inner = lit(42);
+        let loc = "src/main.rs:42:13".to_string();
+        let marked = Expr::new(ExprNode::SpanMark {
+            rust_loc: loc.clone(),
+            kind: AssertKind::Obligation(ObligationKind::Plain),
+            inner: Box::new(inner),
+        });
+        let mut out = String::new();
+        let mut lm = Landmarks { tactic_starts: Vec::new(), span_marks: Vec::new() };
+        write_expr(&mut out, &marked, 0, &mut lm);
+        assert!(
+            out.contains(&format!("/- @rust:{} -/", loc)),
+            "expected rust_loc verbatim in pp output, got: {out:?}",
+        );
+        assert_eq!(lm.span_marks.len(), 1, "expected one landmark recorded");
+        assert_eq!(
+            lm.span_marks[0].loc, loc,
+            "landmark loc should be the rust_loc verbatim",
+        );
+    }
+
+    /// Pins that representative span-loc shapes produced by
+    /// Tactus's path are single-line. If `Span::start_loc` ever
+    /// becomes multi-line for some input, this test fires and the
+    /// fix goes upstream (in `to_air_span` or wherever the loc is
+    /// constructed) rather than at pp time.
+    #[test]
+    fn span_mark_loc_shapes_have_no_newlines() {
+        // path:line:col — `start_loc` shape from to_air_span.
+        let shapes = [
+            "src/main.rs:42:13",
+            "/home/user/project/src/lib.rs:123:5",
+            // as_string fallback shape from `format!("{:?}", rustc_span)`.
+            "src/main.rs:42:13: 42:20 (#0)",
+        ];
+        for s in &shapes {
+            assert!(
+                !s.contains('\n') && !s.contains('\r'),
+                "representative span-loc shape contained a newline: {s:?}",
+            );
+        }
     }
 }
