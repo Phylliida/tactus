@@ -2284,8 +2284,18 @@ fn build_call_substitutions<'a>(
     let mut ens_subst: HashMap<crate::lean_name::LeanName, LExpr> = typ_subst.clone();
     let mut mut_param_names: HashSet<String> = HashSet::new();
 
+    // For non-trait-method-impl calls, `spec_callee == callee` (same
+    // `FunctionX` from the same fn_map lookup — see `resolve_callee`),
+    // so the spec-side pass would re-insert identical entries. Skip
+    // it when we know they're the same. The `matches!` discriminator
+    // is the structural predicate from `resolve_callee`'s arms; it's
+    // the same check `push_post_call_frames` uses to gate impl-
+    // strengthening of ensures (#86).
+    let is_trait_method_impl =
+        matches!(callee.kind, FunctionKind::TraitMethodImpl { .. });
+
     // First pass: keys from `callee.params` (the impl's, or the
-    // non-trait callee's — same as spec_callee in that case).
+    // non-trait callee's).
     add_param_subst_entries(
         &callee.params,
         &arg_lexprs,
@@ -2295,35 +2305,38 @@ fn build_call_substitutions<'a>(
         &mut mut_param_names,
     );
     // Second pass: keys from `spec_callee.params` (trait method
-    // decl's). When trait and impl have matching param names this is
-    // a no-op (overwrites entries with identical values). When they
-    // differ — Rust allows this, the names are positionally aligned
-    // but textually independent — both spellings get the same
-    // substitution mapping. Needed by #86 so trait-side ensures
-    // (which use trait param names) substitute correctly even when
-    // we're simultaneously inlining impl-side ensures (which use
-    // impl param names). For non-trait callees `callee == spec_callee`
-    // and the second pass is fully redundant — running it
-    // unconditionally keeps the code simple at zero correctness cost.
-    add_param_subst_entries(
-        &spec_callee.params,
-        &arg_lexprs,
-        &mut_args,
-        &mut req_subst,
-        &mut ens_subst,
-        &mut mut_param_names,
-    );
+    // decl's). Only when trait and impl differ — Rust allows them
+    // to use textually different param names (positionally aligned
+    // but independent), so trait-side ensures (which use trait
+    // names) need their own substitution entries. Needed by #86 so
+    // trait-side ensures substitute correctly when we're
+    // simultaneously inlining impl-side ensures (which use impl
+    // names). For non-trait-impl calls this pass is fully redundant.
+    if is_trait_method_impl {
+        add_param_subst_entries(
+            &spec_callee.params,
+            &arg_lexprs,
+            &mut_args,
+            &mut req_subst,
+            &mut ens_subst,
+            &mut mut_param_names,
+        );
+    }
 
     // Callee's ret name → fresh_ret_name in ensures. Same for
-    // spec_callee's ret name when different — handles the case
-    // where the impl's ret name differs from the trait's.
+    // spec_callee's ret name when trait and impl differ (the impl's
+    // ret name may differ textually from the trait's). For non-
+    // trait-impl callees, `spec_callee == callee` and the second
+    // insert would be identical to the first — skip it.
     let callee_ret = crate::lean_name::LeanName::from_var_ident(&callee.ret.x.name);
     if callee_ret.as_str() != fresh_ret_name.as_str() {
         ens_subst.insert(callee_ret, LExpr::var(fresh_ret_name.clone()));
     }
-    let spec_ret = crate::lean_name::LeanName::from_var_ident(&spec_callee.ret.x.name);
-    if spec_ret.as_str() != fresh_ret_name.as_str() {
-        ens_subst.insert(spec_ret, LExpr::var(fresh_ret_name.clone()));
+    if is_trait_method_impl {
+        let spec_ret = crate::lean_name::LeanName::from_var_ident(&spec_callee.ret.x.name);
+        if spec_ret.as_str() != fresh_ret_name.as_str() {
+            ens_subst.insert(spec_ret, LExpr::var(fresh_ret_name.clone()));
+        }
     }
 
     CallSubstitutions {
