@@ -3235,6 +3235,60 @@ a real bug; the "shape" of an asymmetric check turned out to
 matter; the "defensive fallback" was paranoia at the wrong layer.
 *Correctness is a closed question; shape is an ongoing one.*
 
+#### Current session (2026-05-09 continued — yesterday's deferred edge resolved)
+
+After overnight compaction returned, picked up #121 with a focus on
+yesterday's deferred edge: the spec-fn-with-chained-compare + `unfold`
+probe that failed during the 2026-05-09 third pass with "Tactic
+`unfold` failed to unfold `in_range` in `x ≥ 0`".
+
+**Resolution: not a Tactus bug, just standard Lean tactic semantics.**
+`unfold f` targets occurrences in the GOAL by default; yesterday's
+probe had `in_range` only in a hypothesis (`requires in_range(x);
+ensures x >= 0`). Correct idiom is `unfold f at *` or `unfold f at h0`.
+The renderer's chained-compare fix from yesterday IS correct — the
+generated def reads `noncomputable def in_range (x : Int) : Prop :=
+0 ≤ x ∧ x ≤ 10` as expected. The "deferred investigation" was a
+red herring, not a deferred fix.
+
+Two new e2e tests pin both shapes:
+- `test_chained_compare_in_spec_fn_body` — hypothesis-position via
+  `requires`, uses `unfold at *`.
+- `test_chained_compare_in_spec_fn_body_via_ensures` — goal-position
+  via `ensures`, bare `unfold` works.
+
+**Doc-vs-code divergence surfaced and corrected.** Looking at the
+generated Lean revealed the def lacked `@[irreducible]` despite
+DESIGN.md's "Spec fn opacity model" section claiming "all spec fns
+are irreducible by default" with mapping `spec fn` → `@[irreducible]
+noncomputable def`. Tracing `spec_fn_to_ast` showed reality: the
+`@[irreducible]` attribute is emitted iff `Opaqueness::Opaque` (i.e.,
+`#[verifier::opaque]`), and default spec fns get plain
+`noncomputable def`. The design's claim was aspirational text never
+implemented; the code follows Verus's own `Opaqueness` discriminator
+faithfully (transparent-by-default, opaque-on-explicit-marker).
+
+DESIGN.md section rewritten to match reality plus tactic-usage notes
+(`unfold` is goal-targeting, `simp_all` doesn't unfold transparent
+defs, `decide` can't reduce through irreducible). The "aspirational
+draft never implemented" is documented inline so a future
+contributor reading the section doesn't think the code is buggy.
+
+**Discipline lesson**: yesterday's instinct to defer the probe was
+right (the chained-compare fix was the load-bearing part of the
+session). But "deferred investigation" entries should ideally include
+*one* concrete hypothesis to test next session, not just the failure
+shape — that frames the follow-up as a 5-minute check rather than an
+open-ended investigation. In this case the hypothesis would have been
+"is `unfold` failing to find `in_range` because the goal doesn't
+contain it?" — confirmable in one minute by reading the generated
+.lean. No code-level investigation needed.
+
+**Net for the morning**: 1 commit + this HANDOFF entry. 308 → 310 e2e
+tests (+2). No pending tasks closed (this falls under the umbrella
+#121, which has more probes available). One DESIGN.md divergence
+caught.
+
 ## Architecture
 
 ### Full pipeline
