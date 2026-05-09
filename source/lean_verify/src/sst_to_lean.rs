@@ -1268,11 +1268,18 @@ fn walk_obligations<'a>(
                 Tactic::Named("tactus_bit_vector".to_string()),
                 bitvec_preamble_fragments(),
             );
-            // Body walks under the ORIGINAL obl — we don't publish
-            // the ensures as an Int-mode hyp because Lean lacks
-            // `HXor Int Int Int` etc., so an Int-mode `x ^^^ y`
-            // wouldn't typecheck. See the build_wp arm for the
-            // rationale and follow-up plan.
+            // Body walks under the ORIGINAL obl. We don't push the
+            // ensures as a Hyp here because Verus's `ast_to_sst`
+            // pre-injects an Int-mode `Assume(ens)` *as a separate
+            // statement* right after the AssertBitVector — so the
+            // ensures already enters the body's ctx via the
+            // `Wp::Assume` walker arm a level up. Pushing again here
+            // would duplicate it. (The Int-mode bitwise ops in that
+            // Hyp are typechecked via the `HXor Int Int Int` /
+            // `HAnd` / etc. instances aggregated through
+            // `bitvec_preamble_fragments()`; without those the
+            // post-assert continuation theorems would fail to
+            // elaborate.)
             walk_obligations(body, ctx, obl, e);
         }
         Wp::Let(name, val, body) => {
@@ -3022,9 +3029,14 @@ enum Wp<'a> {
     /// A dedicated decision-procedure assertion: the verified goal is
     /// `req_conj → ens_conj` (or just `ens_conj` when requires is
     /// empty), discharged by Tactus's `tactus_bit_vector` prelude
-    /// tactic. After the assert, `ens_conj` enters the body's ctx as
-    /// a hypothesis — mirroring how Verus's `AssertBitVector`
-    /// publishes its `ensures` to the surrounding context.
+    /// tactic.
+    ///
+    /// **`ensures` propagation**: the walker arm itself does NOT push
+    /// `ens_conj` into the body's ctx. Instead, Verus's `ast_to_sst`
+    /// pre-injects an Int-mode `Assume(ens)` as a separate statement
+    /// after the AssertBitVector, so the ensures naturally enters the
+    /// body's ctx via the next `Wp::Assume` walker arm. Pinned by the
+    /// shape-drift test in #139.
     ///
     /// LExpr-direct (not `Validated`-wrapped) because the goal is
     /// constructed at build-time from a list of SST exps via
