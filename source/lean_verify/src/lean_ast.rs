@@ -165,10 +165,13 @@ pub struct Datatype {
     pub kind: DatatypeKind,
     /// `deriving` clause class names (e.g., `"Inhabited"`). Emitted
     /// as `deriving <cls1>, <cls2>` after the variants/fields.
-    /// `datatype_to_cmds` adds `Inhabited` for non-generic datatypes
+    /// `datatype_to_cmds` unconditionally adds `Inhabited` (post-#108)
     /// so that auto-generated accessors' `default` fallback
     /// resolves — particularly for self-referential types where
-    /// the accessor's return type is the datatype itself.
+    /// the accessor's return type is the datatype itself. For
+    /// generic datatypes, Lean auto-derives the conditional
+    /// `[Inhabited A] → Inhabited (T A)` instance, so the bound
+    /// flows through callers that supply `[Inhabited A]`.
     pub derives: Vec<String>,
 }
 
