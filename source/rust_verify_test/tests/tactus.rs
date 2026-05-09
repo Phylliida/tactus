@@ -492,6 +492,24 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Probe: chained comparison `a < b < c` in a proof-fn require lowers to
+// `ExprX::Multi(MultiOp::Chained(...), [a, b, c])` at the AST level
+// (Verus's `ast_simplify` would expand it to `a < b ∧ b < c`, but proof
+// fns route through the PRE-simplify krate). The renderer in
+// `to_lean_expr.rs`'s `Multi` arm must produce the conjunction shape,
+// not an anon-ctor `⟨a, b, c⟩` (which would be a Lean tuple literal —
+// semantically wrong for a chained comparison).
+test_verify_one_file! {
+    #[test] test_chained_compare_in_proof_fn verus_code! {
+        proof fn chain_works(x: int)
+            requires 0 <= x <= 10
+            ensures x >= 0, x <= 10
+        by {
+            omega
+        }
+    } => Ok(())
+}
+
 // === Mathlib: ring tactic for polynomial identity ===
 
 test_verify_one_file! {

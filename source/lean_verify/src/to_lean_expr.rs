@@ -216,12 +216,35 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
         }
         ExprX::NullaryOpr(_) => ExprNode::LitBool(true),
 
-        ExprX::Multi(_, exprs) => {
-            // VIR's Multi carries a list of operands (tuple construction,
-            // chained conjunction, etc.). Render as Lean's anonymous
-            // constructor `⟨a, b, c⟩` — correct for tuples, works for any
-            // shape where the target type is inferred from context.
-            LExpr::anon(exprs.iter().map(|e| vir_expr_to_ast(e)).collect()).node
+        ExprX::Multi(MultiOp::Chained(ops), exprs) => {
+            // Chained comparison `a0 op0 a1 op1 a2 ...` (e.g.,
+            // `0 <= x <= 10`) → `(a0 op0 a1) ∧ (a1 op1 a2) ∧ ...`.
+            //
+            // Verus's `ast_simplify` rewrites this shape into the same
+            // conjunction for the SST path, but proof fns route through
+            // the PRE-simplify krate (so we see Multi here verbatim) —
+            // the renderer mirrors ast_simplify's logic. Pre-fix this
+            // arm rendered as `⟨a, b, c⟩` (Lean anon-ctor / tuple),
+            // which Lean's elaborator can't unify with the surrounding
+            // Prop-typed context. Pinned by
+            // `test_chained_compare_in_proof_fn`.
+            assert!(
+                exprs.len() == ops.len() + 1,
+                "ExprX::Multi(Chained): expected {} operands for {} ops, got {}",
+                ops.len() + 1, ops.len(), exprs.len(),
+            );
+            let rendered: Vec<LExpr> = exprs.iter().map(|e| vir_expr_to_ast(e)).collect();
+            let pairs: Vec<LExpr> = ops.iter().enumerate().map(|(i, op)| {
+                let l_op = match op {
+                    ChainedOp::Inequality(InequalityOp::Le) => crate::lean_ast::BinOp::Le,
+                    ChainedOp::Inequality(InequalityOp::Lt) => crate::lean_ast::BinOp::Lt,
+                    ChainedOp::Inequality(InequalityOp::Ge) => crate::lean_ast::BinOp::Ge,
+                    ChainedOp::Inequality(InequalityOp::Gt) => crate::lean_ast::BinOp::Gt,
+                    ChainedOp::MultiEq => crate::lean_ast::BinOp::Eq,
+                };
+                LExpr::binop(l_op, rendered[i].clone(), rendered[i + 1].clone())
+            }).collect();
+            crate::lean_ast::and_all(pairs).node
         }
         ExprX::ArrayLiteral(exprs) => {
             ExprNode::ArrayLit(exprs.iter().map(|e| vir_expr_to_ast(e)).collect())
