@@ -20,4 +20,4 @@ on a new date.
 - [2026-05-04](poems/2026-05-04.md) — the defensive lock; the machinery was correct; structure, not content; what today taught; the test that passed first try; what we deferred; fourteen commits, one shape
 - [2026-05-05](poems/2026-05-05.md) — morning, after; +94; layers; two-handed; the accidental witness; the silent test; half-built; the half-built, returning; fourteen questions
 - [2026-05-08](poems/2026-05-08.md) — three days; locks; the second reading; recognition; where building stops
-- [2026-05-09](poems/2026-05-09.md) — choosing; asymmetry as brittleness; coffee work; aged words; etcetera — bugs that live under a word; returned (continuity through summary); the deferred question — worry vs hypothesis
+- [2026-05-09](poems/2026-05-09.md) — choosing; asymmetry as brittleness; coffee work; aged words; etcetera; returned (continuity through summary); the deferred question (worry vs hypothesis); the pause (the break that doesn't try to land); indexed (cross-instantiation, the conservative estimate optimistic about fear); after the landing (not every minute needs to mean something)
