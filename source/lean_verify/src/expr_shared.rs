@@ -335,17 +335,22 @@ pub(crate) fn varat_pre_name(name: &str) -> String {
 /// `<base>.<result>` — Lean parses `e.2.1` as `((e).2).1`, which
 /// matches the desired projection.
 ///
-/// Arity 0 is defensive (Verus shouldn't produce unit tuples
-/// here): falls back to `(n+1).to_string()` to preserve the prior
-/// behavior. Arity 1 is similarly handled — a single-element
-/// "tuple" is a degenerate case not produced by Verus.
+/// Requires `arity >= 2`. Verus doesn't produce 0-tuples (unit type
+/// lowers to no field access) or 1-tuples (degenerate case with
+/// other lowerings); the assert guards against shape drift if a
+/// future Verus rebase changes that.
 pub(crate) fn tuple_field_accessor(arity: usize, n: usize) -> String {
-    if arity < 2 {
-        // Defensive: Verus shouldn't produce 0- or 1-tuples here
-        // (unit type / single-element tuples have other lowerings).
-        // Fall back to the prior `(n+1)` behavior.
-        return (n + 1).to_string();
-    }
+    // Verus shouldn't produce 0- or 1-tuples here (unit type lowers
+    // to no field access; 1-tuples have other lowerings). If one
+    // arrives, the prior fallback `(n + 1).to_string()` would emit a
+    // probably-wrong Lean accessor; surface it as shape drift instead.
+    assert!(
+        arity >= 2,
+        "tuple_field_accessor: arity {} < 2 — 0-tuple (unit) and 1-tuple \
+         shouldn't reach field accessor synthesis. n={n}. If this fires, \
+         please open an issue (probable Verus rebase shape drift).",
+        arity,
+    );
     if n + 1 >= arity {
         // Last position: `.2` repeated (arity - 1) times.
         // Arity-2 i=1 → "2"; arity-3 i=2 → "2.2"; etc.
