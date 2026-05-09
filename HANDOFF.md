@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**319 end-to-end tests + 1 coverage test + 178 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**320 end-to-end tests + 1 coverage test + 178 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -3563,6 +3563,40 @@ narrow fix into a structural one.
 Test count 318 → 319 e2e (+1 net: pinned the bit_vector test as
 Ok flipped from Err panic-pin, and added the plain-assert diag).
 Task #147 closed.
+
+**Review pass for #147** — ran lenses 1, 3, 4, 5, 13, 14 against the
+diff. Findings:
+- *Lens 14 (regression-test):* the bit_vector + plain-assert tests
+  cover top-level body asserts but not nested positions. Probed with
+  `id_u8` in a loop invariant — *codegen* worked (no panic, fix
+  reaches the loop's invs via walk_expr's body recursion), but
+  `tactus_auto` couldn't close `id_u8 (i+1) = (i+1)` in goal
+  position (spec fns are `noncomputable def` and the default toolbox
+  can't unfold them). Reshaped to nested-in-loop body assert
+  (`assert(id_u8(i) == id_u8(i))`, reflexive) which closes via
+  `simp_all`. Pinned by `test_exec_loop_body_assert_with_spec_call`.
+- *Lens 5 (documentation):* documented the auto-tactic limitation
+  (spec fns in goal position need explicit unfold) in DESIGN.md
+  catalogue. Surfaced as a separate concern from #147; the codegen
+  fix is complete, this is the layer below.
+- *Lens 13 (typed-invariant):* the `bool include_bound_hyps` flag
+  on `fn_binders_with_bounds` could be promoted to an enum
+  (`enum BoundHyps { Include, Omit }`). Decided against — only 2
+  internal callers, both via named wrappers (`fn_binders` /
+  `fn_binders_without_bound_hyps`), and the wrappers already encode
+  the choice at the public API. If a third caller appears with
+  different semantics, revisit.
+- *Lens 1 (Linus):* no flag-soup, no defensive code, no orphaned
+  docstrings.
+- *Lens 4 (upstream-brittleness):* the body walk relies on `walk_expr`
+  handling all VIR-AST shapes recursively. Pre-existing pattern —
+  `walk_expr` already covers the broad set used by exec/proof fn
+  bodies. No new brittleness introduced.
+- *Lens 3 (coverage):* nested-in-loop pinned. Other latent shapes
+  (spec fn in proof block, spec fn in if cond) follow from
+  walk_expr's existing coverage; no specific test added.
+
+Test count 319 → 320 e2e (+1 from review-pass regression test).
 
 ## Architecture
 

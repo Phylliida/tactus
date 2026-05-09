@@ -5172,6 +5172,34 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #147 review (lens 14): regression test for the broader bug class
+// — spec fn referenced from a body-level assert nested inside a
+// loop. dep_order's walk_expr covers `ExprX::Loop { body, ... }`
+// recursively, so the body walk reaches assertions inside the loop
+// body. Pre-#147 fix this would have panicked with "unresolved";
+// post-fix, the rfl-shaped assertion closes via tactus_auto. Pins
+// that the fix isn't shape-specific to top-level body asserts —
+// nested positions reachable by walk_expr work too.
+test_verify_one_file! {
+    #[test] test_exec_loop_body_assert_with_spec_call verus_code! {
+        spec fn id_u8(x: u8) -> u8 { x }
+
+        #[verifier::tactus_auto]
+        fn loop_with_inner_assert(n: u8)
+            requires n < 100
+        {
+            let mut i: u8 = 0;
+            while i < n
+                invariant i <= n,
+                decreases (n - i) as int,
+            {
+                assert(id_u8(i) == id_u8(i));
+                i = i + 1;
+            }
+        }
+    } => Ok(())
+}
+
 // #109 follow-up: recursion over a member of a mutual-SCC datatype.
 // `Forest.height` post-#109 calls `Tree.height` for its Tree fields
 // (cross-type recursion in the height fn, requiring the mutual block).
