@@ -1940,7 +1940,11 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// === Track B: exec fn with sst_to_lean (first slice) ===
+// === Track B: exec fn with sst_to_lean ===
+//
+// All seven Track B slices land in this section, in roughly the order
+// they were built: straight-line, if/else, mutation, loops, overflow,
+// calls, closures. The "Slice N" headers below mark the boundary.
 //
 // Simplest straight-line exec fn: constant return, trivial ensures.
 // Verified end-to-end through Lean's `tactus_auto` (→ rfl/decide/omega).
