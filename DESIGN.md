@@ -1889,6 +1889,33 @@ These are deferred by design — the current slice is single-crate exec+proof-fn
 * **Lean version pinning / CI matrix.** `lean-toolchain` is pinned to `v4.25.0`; tactic behaviour could shift on upgrade. No automated regression against multiple Lean versions.
 * **Per-module `.lean` file generation.** Current design emits one file per fn (`target/tactus-lean/{crate}/{fn}.lean`). At scale, per-module would amortize preamble and olean caching; HANDOFF notes it as future work.
 
+#### Considered surface extensions (rejected, with notes for future)
+
+Designs we explored, prototyped to varying depths, and consciously chose not to land. Each entry records what we tried, why we stepped back, and what conditions might justify revisiting. **Not currently planned**; the body-assert pattern + `try unfold` prefix (documented under "Tactic / automation limitations" → "Spec fn calls in goal position need explicit unfolding") cover the same use cases at zero implementation cost.
+
+* **Per-obligation proof attachment via `invariant P by { tac },` syntax** (#148, prototyped + reverted 2026-05-10). User writes the proof inline at the invariant clause; codegen attaches it as the closer for that invariant's INIT and MAINTAIN theorems. Motivating use case: spec fns in invariant goal position (e.g., `invariant id_u8(i) == i` where `id_u8` is `noncomputable def` and `simp_all` can't unfold it without an explicit hint).
+
+  **What we tried:**
+  - **Stage 0 (parser change)** — added `Specification.tactics: Vec<Option<TacticBy>>` parallel array in syn-verus, gated on `Context::Expr` to avoid hijacking fn-signature `proof fn … by { fn_tactic }`. Landed; full e2e suite (322 tests) green. Two sanity tests (`test_exec_invariant_by_tac_parses_stage0`, `test_exec_invariant_by_tac_mixed`) confirmed the syntax parses end-to-end without affecting other code.
+  - **Stage 1 (proc-macro desugaring)** — visit_expr_while_mut / visit_expr_loop_mut would synthesize `assert(P) by { tac };` body-assert stmts (one BEFORE the loop for INIT, one at end of body for MAINTAIN), reusing Tactus's existing `assert(P) by { tac }` machinery. Implementation hit a parser interaction we didn't fully diagnose: simple test cases that worked under Stage 0 alone failed when Stage 1's syntax.rs changes were added. Likely a span-handling subtlety in the synthesized Assert AST nodes; not chased.
+  - **Stages 2+ (pipeline threading alternatives)** — sketched: VIR `LoopInvariant.tactus_proof: Option<TactusSpan>` field threaded through proc-macro → rust_to_vir → SST → sst_to_lean. Estimated ~150-250 lines across 5-6 files including VIR shape change. Cleaner-typed than parallel arrays, but real cross-cutting cost.
+
+  **Why rejected:**
+  - The user-visible win is modest. Body-assert (`assert(invariant_expr) by { simp_all [f] };` placed before the loop and at end of body) achieves the same outcome with two extra lines per spec-fn-using invariant. For realistic exec fn counts this isn't crippling.
+  - Parser-extension friction interacted with Verus's existing `proof fn … by { fn_tactic }` syntax in subtle ways. The `Context::Expr`/`Context::Item` gating worked for the simple cases but the Stage 1 desugaring hit a non-obvious failure mode. Implementation cost was migrating from "easy" to "real engineering" mid-investigation.
+  - Maintenance surface vs reward. Even Stage 0 alone (parser captures `tactics` field, ToTokens drops it) adds upstream-rebase friction: every Verus rebase needs to verify `Specification`'s shape change doesn't conflict, plus the hand-edited `gen/clone.rs` Range<usize> workaround needs to survive. Without a downstream consumer, that's pure cost.
+  - Two complementary workarounds already exist and are documented (see "Spec fn calls in goal position need explicit unfolding"). Users have working paths.
+
+  **Conditions for revisiting** (any one of these would shift the cost-benefit):
+  - Real users report body-assert as a significant UX pain point in a multi-fn / multi-invariant codebase
+  - A clean implementation path emerges that doesn't require pipeline threading (e.g., source-level scanning at codegen time via tree-sitter; proc-macro desugaring with a different shape that avoids the parser interaction)
+  - Verus upstream adds similar syntax for non-Tactus reasons, making the parser change a no-op rebase
+  - Spec fns in goal position become much more common (e.g., a major refactor of vstd that pushes them into more invariants)
+
+  **Don't revisit just to "complete the surface."** The detour through Stage 0/1 confirmed that the body-assert mechanism is fully expressive; the parser-extension's value is purely readability. Until that readability win is genuinely load-bearing for someone, the right answer is the one we have.
+
+  Reverted commits: `a803bd0` (parser), `2d51b32` (sanity tests), `802dbc0` (deferred-doc).
+
 #### Upstream-blocked deferrals
 
 These are deferred not by Tactus design choice but by upstream Verus pipeline state. Lifting any of them depends on Verus-side work first; pinned tests document the current rejection so a future rebase that lifts the upstream limitation surfaces here as a flippable Err.
