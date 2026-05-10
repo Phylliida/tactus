@@ -2524,12 +2524,6 @@ impl Clone for crate::Specification {
     fn clone(&self) -> Self {
         crate::Specification {
             exprs: self.exprs.clone(),
-            // Tactus: hand-edited (not codegen'd) because `Range<usize>`
-            // isn't a type the codegen tool handles. Same workaround as
-            // `SignatureSpec::tactic_by` above.
-            tactics: self.tactics.iter().map(|t| {
-                t.as_ref().map(|(by, ts, range)| (by.clone(), ts.clone(), range.clone()))
-            }).collect(),
         }
     }
 }

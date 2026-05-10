@@ -5251,60 +5251,6 @@ test_verify_one_file! {
 // discipline about WHERE to place it is sufficient. Discoverability
 // is preserved by the existing error UX (failing tactus_auto shows
 // the goal and source location, telling the user what to prove).
-// #148 Stage 0 sanity probe: confirm `invariant P by { tac }`
-// syntax parses end-to-end through Verus's pipeline without Tactus
-// reading the tactic. The trivial invariant (`0u8 == 0u8`) closes
-// regardless of any tactic, so adding `by { rfl }` should be a
-// no-op — but the test still confirms (a) the parser accepts the
-// syntax, (b) ToTokens drops the by-block before Verus sees it,
-// (c) Verus's lowering doesn't choke on the original token stream.
-//
-// Pre-Stage 0 (no parser change): would fail at parse with
-// "expected curly braces" or similar. Post-Stage 0: passes because
-// the parser silently consumes and discards (until Stage 1+2 wire
-// it through).
-test_verify_one_file! {
-    #[test] test_exec_invariant_by_tac_parses_stage0 verus_code! {
-        #[verifier::tactus_auto]
-        fn loop_with_invariant_by(n: u8) {
-            let mut i: u8 = 0;
-            while i < n
-                invariant
-                    i <= n,
-                    0u8 == 0u8 by { rfl },
-                decreases (n - i) as int,
-            {
-                i = i + 1;
-            }
-        }
-    } => Ok(())
-}
-
-// #148 Stage 0 sanity: multiple invariants, mixed by/no-by. Confirms
-// the parallel `tactics` array stays length-aligned with `exprs`
-// when only some invariants have by-attachments. Pre-fix, a length
-// drift would surface when the proc macro tries to read tactics[i]
-// for an exprs[i] that didn't get a corresponding push.
-test_verify_one_file! {
-    #[test] test_exec_invariant_by_tac_mixed verus_code! {
-        #[verifier::tactus_auto]
-        fn loop_mixed_by(n: u8) {
-            let mut i: u8 = 0;
-            while i < n
-                invariant
-                    i <= n,
-                    0u8 == 0u8 by { rfl },
-                    i <= 255,
-                    1u8 == 1u8 by { rfl },
-                    n >= 0,
-                decreases (n - i) as int,
-            {
-                i = i + 1;
-            }
-        }
-    } => Ok(())
-}
-
 test_verify_one_file! {
     #[test] test_exec_body_assert_discharges_invariant verus_code! {
         spec fn id_u8(x: u8) -> u8 { x }
