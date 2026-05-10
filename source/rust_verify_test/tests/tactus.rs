@@ -5236,6 +5236,44 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #147 follow-up: probe whether the body-assert pattern can
+// discharge a loop invariant maintain obligation when the spec fn
+// can't be unfolded by the auto-tactic. The idea: place
+// `assert(invariant_expr) by { user_tac };` at the END of the loop
+// body (post-assignment, so vars match the post-state), and the
+// asserted hypothesis enters the OblCtx for the maintain theorem.
+// The maintain step's goal then matches the asserted hyp directly,
+// closing via `simp_all`.
+//
+// If this works, the parser-extension proposal (`invariant P by
+// { tac }`) becomes a usability question rather than a correctness
+// requirement: the existing `assert(P) by { tac }` mechanism plus
+// discipline about WHERE to place it is sufficient. Discoverability
+// is preserved by the existing error UX (failing tactus_auto shows
+// the goal and source location, telling the user what to prove).
+test_verify_one_file! {
+    #[test] test_exec_body_assert_discharges_invariant verus_code! {
+        spec fn id_u8(x: u8) -> u8 { x }
+
+        #[verifier::tactus_auto]
+        fn loop_with_body_proof(n: u8)
+            requires n < 100
+        {
+            assert(id_u8(0u8) == 0u8) by { simp_all [id_u8] };
+            let mut i: u8 = 0;
+            while i < n
+                invariant
+                    i <= n,
+                    id_u8(i) == i,
+                decreases (n - i) as int,
+            {
+                i = i + 1;
+                assert(id_u8(i) == i) by { simp_all [id_u8] };
+            }
+        }
+    } => Ok(())
+}
+
 // #109 follow-up: recursion over a member of a mutual-SCC datatype.
 // `Forest.height` post-#109 calls `Tree.height` for its Tree fields
 // (cross-type recursion in the height fn, requiring the mutual block).
