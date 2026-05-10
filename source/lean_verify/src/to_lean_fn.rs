@@ -1060,14 +1060,20 @@ fn fn_binders_with_bounds(f: &FunctionX, include_bound_hyps: bool) -> Vec<LBinde
     out.extend(trait_bounds_to_ast(&f.typ_bounds));
 
     // Each param → one binder, and (for fixed-width int types in
-    // proof/exec contexts) one hypothesis binder right after giving
-    // the refinement bounds. Must mirror
-    // `sst_to_lean::exec_fn_theorem_to_ast`: both paths need to agree
-    // on the in-scope refinement for the same param, or proof fns and
-    // the exec fns that call them diverge.
+    // proof/exec contexts, gated by `include_bound_hyps`) one
+    // hypothesis binder right after giving the refinement bounds.
     //
-    // `include_bound_hyps == false` is for spec-fn definitions (see
-    // `fn_binders_without_bound_hyps` for the rationale).
+    // Three callers, two regimes:
+    //   - `fn_binders` (proof fn + exec fn theorem path) → bounds INCLUDED.
+    //     Must mirror `sst_to_lean::exec_fn_theorem_to_ast`'s bound
+    //     emission so proof-fn-callers and exec-fn-callers see the
+    //     same in-scope refinement for shared params.
+    //   - `fn_binders_without_bound_hyps` (spec fn def path) → bounds OMITTED.
+    //     Spec fns are Lean defs, not theorems; bound hyps would change
+    //     the signature from `Int → Int` to `Int → Bound → Int` and
+    //     break call sites. Bounds for spec-fn params are established
+    //     at theorem-call sites (where the corresponding hyps DO exist
+    //     via `fn_binders` on the calling proof/exec fn).
     for p in f.params.iter() {
         let name = crate::lean_name::LeanName::from_var_ident(&p.x.name);
         out.push(LBinder {
