@@ -128,6 +128,24 @@ ast_struct! {
 ast_struct! {
     pub struct Specification {
         pub exprs: Punctuated<Expr, Token![,]>,
+        /// Tactus: per-expr `by { tactic }` proof attachment, parallel to `exprs`.
+        /// `tactics[i]` corresponds to `exprs[i]`. Always populated to the same
+        /// length as `exprs` — the only place this is constructed is
+        /// `Specification::parse_in`, which pushes to both in lockstep.
+        ///
+        /// For Verus's main pipeline, only `exprs` matters — Verus ignores
+        /// `tactics` entirely, treating the Specification as if the field
+        /// weren't there. For Tactus's pipeline, `tactics[i]` (when `Some`)
+        /// overrides the default closer for the obligation produced by
+        /// `exprs[i]`.
+        ///
+        /// Tuple shape mirrors `SignatureSpec::tactic_by`:
+        /// `(by_token, raw_tokens, brace_byte_range)`. `brace_byte_range` is
+        /// the byte offset of `{ ... }` in the source file — the FileLoader
+        /// sanitizes this region (content → spaces) so rustc's lexer doesn't
+        /// choke on Lean syntax, and codegen reads the original tokens off
+        /// disk by range.
+        pub tactics: Vec<Option<(Token![by], proc_macro2::TokenStream, std::ops::Range<usize>)>>,
     }
 }
 
@@ -730,6 +748,7 @@ pub mod parsing {
         /// Parse a `Specification` in a given context.
         pub fn parse_in(ctx: Context, input: ParseStream) -> Result<Self> {
             let mut exprs = Punctuated::new();
+            let mut tactics: Vec<Option<(Token![by], proc_macro2::TokenStream, std::ops::Range<usize>)>> = Vec::new();
             while !input.is_empty() && Self::is_next_condition_valid(ctx, input) {
                 let inner_attrs = input.call(Attribute::parse_inner)?;
                 let mut expr = Expr::parse_without_eager_brace(input)?;
@@ -740,6 +759,28 @@ pub mod parsing {
                     expr.replace_attrs(attrs);
                 }
                 exprs.push(expr);
+                // Tactus: optional `by { tactic }` after each spec expr.
+                // Gated on Context::Expr to avoid hijacking fn-signature
+                // `proof fn ... ensures Q by { fn_tactic }` — in Context::Item
+                // (fn signatures) the `by { }` belongs to SignatureSpec::tactic_by
+                // (fn-level proof attachment, which already serves per-clause
+                // semantics for the singular fn-level case). Context::Expr is
+                // for loop invariants / loop decreases / closure specs, where
+                // there's no enclosing `by { }` to conflict with — that's where
+                // per-expr proof attachment fills a real gap.
+                let tactic = if matches!(ctx, Context::Expr)
+                    && input.peek(Token![by]) && input.peek2(token::Brace)
+                {
+                    let by_token: Token![by] = input.parse()?;
+                    let content;
+                    let brace = braced!(content in input);
+                    let tokens: proc_macro2::TokenStream = content.parse()?;
+                    let byte_range = brace.span.join().byte_range();
+                    Some((by_token, tokens, byte_range))
+                } else {
+                    None
+                };
+                tactics.push(tactic);
                 if !input.peek(Token![,]) {
                     break;
                 }
@@ -767,7 +808,11 @@ pub mod parsing {
                     }
                 }
             }
-            Ok(Specification { exprs })
+            debug_assert_eq!(
+                exprs.len(), tactics.len(),
+                "Specification parse_in invariant: exprs and tactics must have the same length",
+            );
+            Ok(Specification { exprs, tactics })
         }
 
         fn is_next_condition_valid(ctx: Context, input: ParseStream) -> bool {
@@ -1867,6 +1912,12 @@ mod printing {
     #[cfg_attr(doc_cfg, doc(cfg(feature = "printing")))]
     impl ToTokens for Specification {
         fn to_tokens(&self, tokens: &mut TokenStream) {
+            // Tactus's `tactics` field is intentionally NOT round-tripped.
+            // Verus's main pipeline reconstructs Rust source from
+            // `Specification` via this impl; emitting `by { tac }` would
+            // cause Verus to see syntax it doesn't understand. Tactus
+            // captures the tactic at parse time before re-emission, so
+            // dropping it on round-trip is correct.
             self.exprs.to_tokens(tokens);
         }
     }
