@@ -5200,6 +5200,42 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #147 follow-up: pin the workaround for spec fns in goal position.
+// DESIGN.md catalogue (added 2026-05-09) initially recommended
+// `proof { unfold f }`. Probe established that's *incomplete* — the
+// tactic-prefix mechanism applies the prefix to EVERY theorem in
+// the fn, including init theorems whose goals don't mention `f`
+// (e.g., the first invariant init `i ≤ n`). Bare `unfold f` fails
+// with "Tactic unfold failed to unfold f in <goal-without-f>" for
+// those theorems.
+//
+// The actual workaround needs `try unfold f` so the tactic no-ops
+// on theorems where `f` doesn't appear, and unfolds where it does.
+// This test pins the corrected shape — once the catalogue is
+// updated, future users find the right shape, not the incomplete
+// one.
+test_verify_one_file! {
+    #[test] test_exec_loop_invariant_with_spec_call_try_unfold verus_code! {
+        spec fn id_u8(x: u8) -> u8 { x }
+
+        #[verifier::tactus_auto]
+        fn loop_with_inv_unfold(n: u8)
+            requires n < 100
+        {
+            proof { try unfold id_u8 }
+            let mut i: u8 = 0;
+            while i < n
+                invariant
+                    i <= n,
+                    id_u8(i) == i,
+                decreases (n - i) as int,
+            {
+                i = i + 1;
+            }
+        }
+    } => Ok(())
+}
+
 // #109 follow-up: recursion over a member of a mutual-SCC datatype.
 // `Forest.height` post-#109 calls `Tree.height` for its Tree fields
 // (cross-type recursion in the height fn, requiring the mutual block).
