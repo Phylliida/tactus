@@ -2159,6 +2159,21 @@ loc from the leaf's outermost SpanMark, falling back to
 `"ensures"` / empty loc when the leaf is unwrapped (only
 reachable when the fn has zero ensures clauses).
 
+*Audited 2026-05-11 (#152) — keep.* Neither reshape changes
+what's proven: `P1 ∧ P2 ∧ P3` ↔ proving each separately;
+`let x := e; goal` ↔ `goal[x := e]` after `obl.wrap`
+reconstructs. The restructuring buys per-conjunct error
+localization (each conjunct's Postcondition / LoopInvariant /
+LoopDecrease SpanMark drives the theorem name + error label
+independently), per-theorem caching (Verus's hash-per-theorem
+cache hits unchanged conjuncts on edits), and smaller
+individual Z3 obligations (each `simp_all` / `omega` runs on
+one conjunct, not the whole tree). The split IS visible in
+output (user reads the generated `.lean` and sees N theorems
+for an N-clause ensures); same substrate-class category as
+`deriving Inhabited` and accessor synthesis — visible result,
+downstream-justified, not hiding work.
+
 **Tactic-prefix stack.** `Wp::AssertByTactus { cond: None,
 tactic }` (i.e., `proof { tactic }`) pushes `tactic` onto
 `ObligationEmitter::tactic_prefix` and walks body. Every
