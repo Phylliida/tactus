@@ -6934,30 +6934,31 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Free-var bool xor commutativity FAILS — pins the current limitation.
+// Free-var bool xor commutativity. The probe (2026-05-11) initially
+// surfaced this as a real gap and the test was pinned as `Err`. The
+// fix that landed in the same session: add `Bool.xor_comm` to
+// `tactus_auto`'s `simp_all` set (one rung of the ladder now reads
+// `simp_all [Bool.xor_comm]`).
 //
-// Two compounding gaps surface here:
-// (1) **Bool rendered as Prop.** DESIGN.md "Bool vs Prop" promises
-//     context-sensitive rendering (Prop in spec, Bool in exec), but
-//     `to_lean_type.rs::typ_to_node` always emits `Prop`. So an exec
-//     param `b: bool` becomes `b : Prop`, and any `Bool`-typed
-//     operation on it forces Lean to insert `decide` coercions.
-// (2) **`Bool.xor` commutativity isn't a simp lemma in `tactus_auto`.**
-//     `simp_all`'s default set doesn't include `Bool.xor_comm`, and
-//     `omega` / `decide` / `rfl` can't close a free-var commutativity
-//     goal.
+// Background on the goal shape that needed the lemma: Tactus
+// renders `TypX::Bool` as `Prop` in `to_lean_type.rs` regardless of
+// context (DESIGN.md "Bool vs Prop" *promises* context-sensitive
+// rendering but the code doesn't implement it). So exec-bool params
+// `b1, b2` become `Prop`, and any value-flow into `Bool.xor` forces
+// Lean to insert `decide` coercions, producing goals like
+// `(decide b1 ^^ decide b2) = (decide b2 ^^ decide b1)`. Core Lean's
+// `Bool.xor_comm` closes it once it's in the simp set.
 //
-// Generated goal shape: `(decide b1 ^^ decide b2) = (decide b2 ^^ decide b1)`.
-// Workaround for users today: `assert(... == ...) by { simp_all [Bool.xor_comm] }`
-// (assert-by overrides the closer). Proper fix is task-sized (context-
-// sensitive bool rendering or extending `tactus_auto`'s simp set).
+// The deeper context-sensitive-bool fix is task-sized and not in
+// scope; the simp-set extension is the minimal-disturbance fix that
+// closes the user-facing gap.
 test_verify_one_file! {
-    #[test] test_exec_xor_bool_free_vars_commutative_gap verus_code! {
+    #[test] test_exec_xor_bool_free_vars_commutative verus_code! {
         #[verifier::tactus_auto]
         fn check_xor_commute(b1: bool, b2: bool) {
             assert((b1 ^ b2) == (b2 ^ b1));
         }
-    } => Err(e) => assert!(format!("{:?}", e).contains("auto-tactic failed"))
+    } => Ok(())
 }
 
 // Tactic referencing loop-local variable. Catalogue marked this

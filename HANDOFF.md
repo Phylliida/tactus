@@ -3766,19 +3766,20 @@ small compared to the cost of trusting a stale entry.
   didn't actually exercise xor reasoning; this fills the
   reasoning-side gap for concrete operands.
 
-- **`BinaryOp::Xor` free-vars commutativity FAILS**: pinned by
-  `test_exec_xor_bool_free_vars_commutative_gap` as `Err`. Two
-  compounding gaps surface here:
-  (1) `to_lean_type::typ_to_node` always emits `Prop` for
-  `TypX::Bool` regardless of context, so exec-bool params become
-  `Prop` and Lean inserts `decide` coercions when the value flows
-  into `Bool.xor`. The DESIGN.md "Bool vs Prop" section *promises*
-  context-sensitive rendering but the code doesn't implement it.
-  (2) `Bool.xor_comm` isn't in `tactus_auto`'s simp set, so
-  `(decide b1 ^^ decide b2) = (decide b2 ^^ decide b1)` doesn't
-  close under the default closer. Workaround for users today:
-  `assert(... == ...) by { simp_all [Bool.xor_comm] }`. Proper fix
-  is task-sized.
+- **`BinaryOp::Xor` free-vars commutativity** — pinned by
+  `test_exec_xor_bool_free_vars_commutative`. Initial probe surfaced
+  it as a gap (test was briefly `Err`); the minimal-disturbance fix
+  landed in the same session: add `Bool.xor_comm` to `tactus_auto`'s
+  `simp_all` rung (now reads `simp_all [Bool.xor_comm]`). Core Lean
+  has `Bool.xor_comm` and `simp_all` with it closes the goal under
+  both the unboxed-Bool shape AND the `decide`-wrapped Prop shape
+  (which arises because `to_lean_type::typ_to_node` always emits
+  `Prop` for `TypX::Bool` — DESIGN's "Bool vs Prop" *promises*
+  context-sensitive rendering but the code doesn't implement it, so
+  any `Bool`-typed op on an exec-bool param picks up `decide`
+  coercions). The deeper context-sensitive-bool fix remains
+  task-sized and out of scope; the simp-set extension covers the
+  user-facing gap with zero blast radius on existing tests.
 
 - **Tactic referencing loop-local variables**: pinned by
   `test_exec_assert_by_omega_in_loop_body` — `assert(P) by { omega }`
