@@ -4404,48 +4404,35 @@ fn build_wp_loop<'a>(
     //     `Some` triggers the post-build wrap below.
     // For Tactus #127: when `cond` is None but `original_cond` is Some,
     // Verus's break-lowering converted the while loop to a `loop { if
-    // !c { break; } body }` shape. The body still has the if-not-c-
-    // break inserted at body[0..1], but for Tactus's WP encoding we
-    // can use the cond:Some path: walk_loop pushes `c` in maintain
-    // (under which the body's inserted if-not-c-break's then-branch is
+    // !c { break; } body }` shape. For Tactus's WP encoding we can
+    // recover the cond:Some path: walk_loop pushes `c` in maintain
+    // (under which the body's inserted if-not-c-break then-branch is
     // contradictorily unreachable, so its obligation discharges
     // vacuously) and pushes `¬c` in use_obl (recovering the natural-
-    // exit fact). This matches Verus's isolation=false semantics for
+    // exit fact). Matches Verus's isolation=false semantics for
     // post-loop reasoning.
     //
-    // **Soundness gate (single-break check)**: Verus's lowering inserts
-    // exactly one break (the if-not-c-break). If the user's body had
-    // its own break(s), Verus preserves them alongside the inserted
-    // one. In that case, push `¬c` post-loop would be unsound — user
-    // breaks may fire when `c` is still true. We refuse the recovery
-    // when the body has more than one break targeting this loop;
-    // fall through to cond:None encoding (user must encode post-loop
-    // facts via `allow_complex_invariants` + loop `ensures`).
-    //
-    // We also gate on:
-    //   * unlabeled loop (label.is_none()) — labeled loops require
-    //     cross-label break counting, deferred for future work
-    //   * empty cond_setup in `original_cond` — non-empty cond_setup
-    //     (cond with calls/short-circuits) would need scoping work
-    let effective_cond: &'a Option<(Stm, Exp)> = match (cond, original_cond) {
-        (Some(_), _) => cond,
-        (None, Some(orig)) => {
-            let (orig_setup, _orig_exp) = orig;
-            let setup_empty = matches!(&orig_setup.x, StmX::Block(ss) if ss.is_empty());
-            if label.is_none()
-                && setup_empty
-                && count_breaks_targeting_this_loop(body, label.as_deref()) == 1
-            {
-                // Recovery path: use original_cond as if cond:Some.
-                original_cond
-            } else {
-                // Fall through to cond:None encoding. User must
-                // restate post-loop facts in invariants/ensures.
-                cond
-            }
+    // Soundness gates (refuse recovery, fall through to cond:None
+    // encoding — user must encode post-loop facts via
+    // `allow_complex_invariants` + loop `ensures`):
+    //   * **single-break check**: if the user body has its own breaks
+    //     alongside the inserted one, push `¬c` post-loop would be
+    //     unsound (user breaks may fire while `c` is still true).
+    //   * **unlabeled loop**: labeled loops would need cross-label
+    //     break counting, deferred.
+    //   * **empty cond_setup**: non-empty setup (cond with calls /
+    //     short-circuits) would need scoping work for the temp
+    //     bindings.
+    let original_cond_recoverable = match original_cond {
+        Some((orig_setup, _)) if cond.is_none() => {
+            label.is_none()
+                && matches!(&orig_setup.x, StmX::Block(ss) if ss.is_empty())
+                && count_breaks_targeting_this_loop(body, None) == 1
         }
-        (None, None) => cond,
+        _ => false,
     };
+    let effective_cond: &'a Option<(Stm, Exp)> =
+        if original_cond_recoverable { original_cond } else { cond };
 
     let (cond_exp_opt, cond_setup_wrap): (
         Option<Validated<'a>>,

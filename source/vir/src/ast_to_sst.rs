@@ -2675,13 +2675,14 @@ pub(crate) fn expr_to_stm_opt(
             // `cond` (post-conversion) and ignores `original_cond`;
             // Tactus's `sst_to_lean` reads `original_cond` to recover
             // the cond:Some shape its WP encoding handles natively.
-            let mut original_cond: Option<(Stm, Exp)> = None;
+            // `cnd.clone()` is Arc-cheap (Stm and Exp are both Arc-
+            // wrapped); cloning None when no conversion happens is
+            // also free.
+            let original_cond: Option<(Stm, Exp)> =
+                if !simple_while { cnd.clone() } else { None };
             if !simple_while {
                 // must be "loop", not "while"
                 if let Some((c_stm, c_exp)) = cnd {
-                    // Capture the original cond BEFORE we mutate cnd
-                    // and insert the if-not-c-break into the body.
-                    original_cond = Some((c_stm.clone(), c_exp.clone()));
                     // convert while into loop
                     let not_c = c_exp.new_x(ExpX::Unary(UnaryOp::Not, c_exp.clone()));
                     let break_stmx = StmX::BreakOrContinue { label: None, is_break: true };
