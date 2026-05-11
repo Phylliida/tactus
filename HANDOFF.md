@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**322 end-to-end tests + 1 coverage test + 178 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**325 end-to-end tests + 1 coverage test + 178 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -3697,6 +3697,58 @@ expressive; the parser-extension's value was purely readability. The
 detour confirmed it the hard way. The lessons in today's poems and
 DESIGN's #148 rejection note carry the learning forward.
 
+#### Current session (2026-05-11 — #113 BinaryOp::StrGetChar)
+
+Clean landing after yesterday's not-shipping day. `verus_builtin::
+strslice_get_char(s, i)` (Verus surface syntax, VIR `BinaryOp::
+StrGetChar`) now lowers cleanly through both expression renderer
+paths.
+
+**The latent bug.** The shared `non_binop_head` table emitted
+`"String.get"` for `BinaryOp::StrGetChar` — used by both the VIR-AST
+renderer (`to_lean_expr.rs`) and (with my fix) the SST renderer
+(`to_lean_sst_expr.rs`). But Lean's `String.get` is the *wrong*
+function: it takes `String.Pos` (a byte offset) and returns Lean's
+`Char`. Verus's `strslice_get_char(s, i)` is codepoint-indexed and
+returns `char` → Tactus's `Nat`. Either path would have produced
+Lean that failed elaboration. The proof-fn path hadn't been exercised
+by any test, so the bug had sat dormant since `non_binop_head` was
+extracted to `expr_shared.rs`. Pre-existing rejection in the SST
+path meant the symptom never surfaced from exec fns either.
+
+**The fix.** Added `Tactus.strGetChar : String → Int → Nat` to
+`TactusPrelude.lean` with body `(s.data[i.toNat]!).toNat` — `s.data
+: List Char` is the underlying codepoint list, `[i.toNat]!` is the
+panic-on-OOB `GetElem!` indexer (same shape as `array_index`'s `xs[i]!`
+from #91), `.toNat` unwraps the `Char`. Routed `non_binop_head` to
+the new name. Dropped the SST rejection arm — falls through to the
+generic `App(non_binop_head(op), [l, r])` path automatically. Stale
+"only reachable case is Xor" comment updated to enumerate Xor and
+StrGetChar.
+
+**Three tests** pin the rendering surfaces:
+- `test_proof_strslice_get_char` — proof fn ensures `strslice_get_char(s,
+  0) == strslice_get_char(s, 0) by { rfl }`. VIR-AST path via
+  `vir_expr_to_ast`.
+- `test_exec_strslice_get_char_in_assert` — `#[verifier::tactus_auto] fn
+  check(s: &str) { assert(strslice_get_char(s, 0) == strslice_get_char(s,
+  0)); }`. SST body-level path.
+- `test_exec_strslice_get_char_in_ensures` — exec fn ensures using the
+  builtin. SST `ens_exps` path.
+
+All three close via `tactus_auto`'s first rung (`rfl`) — both sides
+substitute identically to `Tactus.strGetChar s 0`.
+
+**Initial implementation hit one Lean-API drift gotcha.** Wrote
+`s.data.get!` initially — Lean 4 no longer has `List.get!` (was
+removed in favor of `GetElem!` notation `[i]!`). Pivoted to `s.data[i.toNat]!`,
+which is the same shape we use for array indexing in `BinaryOp::Index`.
+
+**Net for the session**: 1 commit incoming, ~50 lines of source change
+across 4 files (prelude + 2 renderers + tests), +3 e2e tests. Test
+counts now 325 e2e + 1 coverage + 178 unit + 7 integration. One
+pending task closed (#113).
+
 ## Architecture
 
 ### Full pipeline
@@ -4007,17 +4059,20 @@ The full catalogue lives in DESIGN.md § "Known deferrals, rejected
 cases, and untested edges" — this section summarizes the task
 themes:
 
-### Feature deferrals with clear shape (4 pending)
+### Feature deferrals with clear shape (3 pending)
 
 - **#106** &mut at call sites for non-Var L-values (umbrella for
   Index, deeper paths, multi-variant enum, tuple field).
 - **#107** caller-side new-mut-ref mode (synthetic MutRef-typed
   locals around exec calls).
 - **#112** StmX::OpenInvariant (atomic invariants for concurrency).
-- **#113** BinaryOp::StrGetChar + string operations.
 - **#127** loop_isolation: false support (#114 sub-feature 2).
 
-Closed: #108 / #109 / #111 / #130 (2026-05-05).
+Closed: #108 / #109 / #111 / #130 (2026-05-05); **#113**
+BinaryOp::StrGetChar (2026-05-11) — `Tactus.strGetChar` prelude
+helper replaces the incorrect `String.get` head emitted by
+`non_binop_head`; both VIR-AST and SST renderer paths now lower
+cleanly.
 
 ### Architecture cleanups (1 pending)
 

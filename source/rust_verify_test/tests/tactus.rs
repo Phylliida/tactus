@@ -6871,6 +6871,48 @@ test_verify_one_file! {
 // access through tactus_auto would need either vstd routing
 // or a synthetic same-crate exec wrapper. Tracked as #91 follow-up.
 
+// #113: Verus's `verus_builtin::strslice_get_char(s, i)` (VIR
+// `BinaryOp::StrGetChar`) is spec-mode codepoint lookup on a string.
+// The naive head `String.get` would be wrong — Lean's `String.get`
+// takes a byte position and returns a `Char`, whereas Verus's
+// semantics is codepoint-indexed and the return type is `char`
+// (Tactus's `Nat`). The shared `non_binop_head` table now maps
+// `StrGetChar` to `Tactus.strGetChar`, a prelude helper with the
+// right signature (`String → Int → Nat`) using `s.data.get!`.
+//
+// The three tests cover the rendering surfaces:
+// (1) proof fn — VIR-AST path via `vir_expr_to_ast`.
+// (2) exec fn body assert — SST path via `sst_exp_to_ast_checked`.
+// (3) exec fn ensures — SST path (`ens_exps` is SST).
+test_verify_one_file! {
+    #[test] test_proof_strslice_get_char verus_code! {
+        proof fn use_strslice_get_char(s: &str)
+            ensures strslice_get_char(s, 0) == strslice_get_char(s, 0)
+        by {
+            rfl
+        }
+    } => Ok(())
+}
+
+test_verify_one_file! {
+    #[test] test_exec_strslice_get_char_in_assert verus_code! {
+        #[verifier::tactus_auto]
+        fn check_strslice(s: &str) {
+            assert(strslice_get_char(s, 0) == strslice_get_char(s, 0));
+        }
+    } => Ok(())
+}
+
+test_verify_one_file! {
+    #[test] test_exec_strslice_get_char_in_ensures verus_code! {
+        #[verifier::tactus_auto]
+        fn first_char_equals_itself(s: &str)
+            ensures strslice_get_char(s, 0) == strslice_get_char(s, 0)
+        {
+        }
+    } => Ok(())
+}
+
 // #89: `invariant_except_break P` (at_entry only) — `P` holds at
 // each iteration boundary but is NOT required at break, so the
 // post-loop ctx doesn't get to assume it. The decreases-style
