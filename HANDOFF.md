@@ -3772,14 +3772,15 @@ small compared to the cost of trusting a stale entry.
   landed in the same session: add `Bool.xor_comm` to `tactus_auto`'s
   `simp_all` rung (now reads `simp_all [Bool.xor_comm]`). Core Lean
   has `Bool.xor_comm` and `simp_all` with it closes the goal under
-  both the unboxed-Bool shape AND the `decide`-wrapped Prop shape
-  (which arises because `to_lean_type::typ_to_node` always emits
-  `Prop` for `TypX::Bool` — DESIGN's "Bool vs Prop" *promises*
-  context-sensitive rendering but the code doesn't implement it, so
-  any `Bool`-typed op on an exec-bool param picks up `decide`
-  coercions). The deeper context-sensitive-bool fix remains
-  task-sized and out of scope; the simp-set extension covers the
-  user-facing gap with zero blast radius on existing tests.
+  both the unboxed-Bool shape AND the `decide`-wrapped Prop shape.
+  The `decide`-wrap arises because Tactus renders `TypX::Bool` as
+  `Prop` unconditionally — DESIGN.md's "Bool vs Prop" was updated
+  the same session to document this as the deliberate landed design
+  (see § "Why always-Prop" and § "Considered: context-sensitive
+  bool rendering"). The simp-set extension covers the user-facing
+  gap with zero blast radius on existing tests; the pattern is
+  additive (add new lemmas as new bool-operation gaps surface,
+  rather than refactoring the rendering pipeline).
 
 - **Tactic referencing loop-local variables**: pinned by
   `test_exec_assert_by_omega_in_loop_body` — `assert(P) by { omega }`

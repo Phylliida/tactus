@@ -6941,17 +6941,17 @@ test_verify_one_file! {
 // `simp_all [Bool.xor_comm]`).
 //
 // Background on the goal shape that needed the lemma: Tactus
-// renders `TypX::Bool` as `Prop` in `to_lean_type.rs` regardless of
-// context (DESIGN.md "Bool vs Prop" *promises* context-sensitive
-// rendering but the code doesn't implement it). So exec-bool params
-// `b1, b2` become `Prop`, and any value-flow into `Bool.xor` forces
-// Lean to insert `decide` coercions, producing goals like
+// renders `TypX::Bool` as `Prop` unconditionally — the deliberate
+// landed design, see DESIGN.md § "Bool vs Prop" → "Why always-Prop"
+// for the rationale (spec-first model + Classical.propDecidable +
+// no mode threading). So exec-bool params `b1, b2` are `Prop`, and
+// any value-flow into `Bool.xor` triggers Lean to insert `decide`
+// coercions, producing goals like
 // `(decide b1 ^^ decide b2) = (decide b2 ^^ decide b1)`. Core Lean's
-// `Bool.xor_comm` closes it once it's in the simp set.
-//
-// The deeper context-sensitive-bool fix is task-sized and not in
-// scope; the simp-set extension is the minimal-disturbance fix that
-// closes the user-facing gap.
+// `Bool.xor_comm` closes it once it's in the simp set; the lemma's
+// typed signature unifies with both `decide`-wrapped and unboxed
+// shapes, so adding the lemma is the canonical fix-shape for the
+// always-Prop boundary cases.
 test_verify_one_file! {
     #[test] test_exec_xor_bool_free_vars_commutative verus_code! {
         #[verifier::tactus_auto]
