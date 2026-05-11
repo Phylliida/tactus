@@ -1145,6 +1145,14 @@ The detection helper `extract_top_level_eq_for(conj, target)` walks the **top-le
 
 **Tests** (4 new for the substitution path): `test_exec_call_ret_eq_substitution` (baseline `r == x + 1` ensures), `test_exec_call_ret_eq_with_extra_conjunct` (`r == E ∧ Q(r)` — Q(E) makes it into the rest_ensures Hyp), `test_exec_call_ret_eq_substitution_wrong_post` (negative — substitution doesn't make caller more permissive), `test_exec_call_no_ret_eq_falls_through` (no `r == E` → ∀-path stays).
 
+*Audited 2026-05-11 (#153) — keep.* The substitution doesn't add reasoning — it eliminates a redundant quantifier. `∀ ret. (ret = E) ∧ Q(ret) → P(ret)` ↔ `Q(E) → P(E)` is exact logical equivalence: the antecedent has only one satisfying `ret`, so substituting E for ret loses no information. Same logical content rendered differently, like writing `a` instead of `if true then a else b`.
+
+The transformation IS visible in output: user reads `let dest := E; ...` in the generated `.lean` and sees exactly what was substituted. The 4 pinned tests cover the substitution path; the conservative fallback (no `r == E` → ∀-path stays) is also tested. Bound preservation matches the ∀-path — omega sees the same factual content either way.
+
+What the restructure buys: cond_setup goals (function-call-in-loop-cond from #114) close under `tactus_auto`'s default closer without user override. Pre-#128 users had to write `#[verifier::tactus_tactic("intros; simp_all; omega")]` to handle the ∀-Prop shape; post-#128 the substitution path avoids the quantifier and `omega` handles the rest natively.
+
+Same audit verdict as #150 / #152: substrate-class restructuring, visible in output, downstream-justified. Not hiding work; just rendering the same obligation in the form the default closer can handle.
+
 ### Known deferrals, rejected cases, and untested edges
 
 A flat catalogue of things that don't work yet, organized by where in the pipeline they're rejected or where the gap lives. If a gap has its own detailed section elsewhere in this doc, it's cross-referenced rather than duplicated.
