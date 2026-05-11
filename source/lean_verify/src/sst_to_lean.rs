@@ -3498,7 +3498,8 @@ fn build_wp<'a>(
             check_exp(rhs)?;
             let Some(ident) = extract_simple_var_ident(dest) else {
                 return Err(format!(
-                    "assignment with non-simple LHS (got {:?}) is not yet supported",
+                    "assignment with {} (got {:?}) is not yet supported",
+                    vir::tactus_messages::ASSIGN_NON_SIMPLE_LHS_TAG,
                     dest.x
                 ));
             };
