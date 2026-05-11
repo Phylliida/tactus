@@ -1205,6 +1205,25 @@ Accepted via #57: **`cond: None`** loops (the form Verus produces when lowering 
 * **Tactus tactic-text prepending runs at theorem level, not locally.** When a user writes `assert(P) by { tac }` or `proof { have h := by tac }` inside a loop body (or any nested construct), the `have` is prepended to the THEOREM's tactic at theorem-start — before any `intro` of modified-var quantifiers. Variable references in the tactic resolve to the OUTER scope (fn param, not loop-local). For simple cases (e.g., `assert(x < 256) by { omega }` where `x` is a u8 fn param and the tactic only uses fn-level bounds) this works. For tactics that would need a loop invariant as a hypothesis, the invariant isn't in scope at theorem-tactic prefix. Known design limitation; a per-loop-scoped `have` would require per-loop tactic emission, which we don't have. Not tested end-to-end with tactics that depend on loop-local state.
 * **Proof-block goal-modifying tactics affect the outer goal.** `proof { simp_all }` simplifies the entire theorem goal, not just a local sub-proof. Users coming from Verus's self-contained proof blocks may be surprised. Pinned by `test_exec_proof_block_goal_modifying_tactic`; the alternative (wrapping in a local `have _ : True := by <tac>`) breaks the common `have h : P := by tac` propagation case — which is the primary reason users write proof blocks.
 * **`tactus_case_split` tries each user-datatype local in turn.** Takes a `closer` tactic argument and commits the first split where the closer closes ALL subgoals; restores state and tries the next candidate otherwise. Means a fn with multiple datatype locals — e.g., `(a: Foo, b: Bar)` — works regardless of which is the right scrutinee. Cost is O(n_candidates × closer_cost), bounded by the locals in scope. The `.height`-existence gate filters out `Int`/`Nat`/etc. so we don't case-split on primitives. Pinned by `test_exec_match_enum_with_int_args` (mixed enum + int locals).
+
+  Audited 2026-05-11 (#149). The audit lens: *what makes a proof go through that the user can't see?* For `tactus_case_split`, the structural answer is: this isn't really automation — it's the proof-level counterpart to the user's source-level match/recursive structure. When a user writes `match k { ... }` or a recursive `fn count(s: Stack)`, they're implicitly asking for case analysis on `k` / `s`; the tactic just makes it explicit at the proof level. Tactic name visible in generated `.lean` (already more visible than Verus's Z3 path which subsumes case-splitting into the solver's heuristics with zero user-facing signal). Audit decided: **keep in the default closer**. The opacity-of-choice in multi-candidate scope is real but no current test exercises a case where the choice MATTERS (today all multi-datatype locals have the case-split close on one specific candidate).
+
+  **User-explicit alternative — per-arm proof via `cases ... with`.** When the user wants the case reasoning at the proof level rather than via the closer, Lean's native `cases ... with | Foo x => tac | Bar y => tac` syntax goes through `proof { }` verbatim (FileLoader passes tactic text through). Each arm's tactic discharges only that arm's subgoal — the inline-per-case proof shape. Pinned by `test_exec_match_enum_with_per_arm_proof`. Usage:
+  ```rust
+  #[verifier::tactus_auto]
+  fn kind_value(k: Kind) -> (r: u8) ensures r <= 100 {
+      proof {
+          cases k with
+          | Foo x => simp_all; split <;> omega
+          | Bar y => simp_all; split <;> omega
+      }
+      match k {
+          Kind::Foo(x) => if x <= 100 { x } else { 0 },
+          Kind::Bar(y) => if y <= 100 { y } else { 0 },
+      }
+  }
+  ```
+  Use this shape when: (a) different arms need different tactics (e.g., one needs `simp_all`, another needs `omega [some_lemma]`), or (b) you want the per-case reasoning visible at the proof level rather than hidden in the closer.
 * **`HXor`/`HAnd`/`HOr`/`HShiftLeft`/`HShiftRight Int Int Int` instances are wonky-but-total for negative Ints (#130).** Defined via `Int.toNat` (which returns 0 for negative Ints), so `(-1 : Int) ^^^ x = (0 ^^^ x.toNat : Nat)` rather than the bitwise XOR of the two's-complement representations. Tactus only emits these operators on values it has bounded as non-negative (u-typed Ints with `0 ≤ x` hypotheses), so the wonky path is unreachable from emitted code. The instances are conditionally injected only into files using `assert(P) by(bit_vector)` (#130), so unrelated proof fns aren't exposed to the wonky semantics either. If a future Tactus path emits these on negative Ints, the wrong values would silently pass typecheck — file the issue and either tighten the rendering or define the instances via two's-complement BitVec semantics.
 
 #### User-facing features not tested (or possibly broken)
