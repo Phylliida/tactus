@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**336 end-to-end tests + 1 coverage test + 180 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**346 end-to-end tests + 1 coverage test + 180 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -4012,7 +4012,8 @@ info directly if we just keep the cond around.
 - Non-empty cond_setup in `original_cond`: setup with calls/short-
   circuits needs scoping work for temp bindings.
 
-**Tests** (6 new, all pass):
+**Tests** (10 new, all pass — initial 6 + 4 from review's coverage
+lens):
 - `test_exec_loop_isolation_false_fn_level` / `_loop_level`: basic
   acceptance at both attribute placements.
 - `_natural_exit`: the post-loop `i == n` case — canonical
@@ -4024,8 +4025,32 @@ info directly if we just keep the cond around.
   encoding. Fn still verifies (invariant alone gives `r <= n`).
 - `_invariant_violation`: negative — invariant maintain obligation
   still fires under the recovery encoding.
+- `_labeled_fall_through_ok` / `_labeled_natural_exit_falls_through`:
+  pair pinning the labeled-loop gate. Positive case verifies via
+  invariant alone; negative case is the *flippable Err* — when
+  cross-label break counting is implemented, the Err test turns
+  Ok and tells future-us the limitation is gone.
+- `_complex_cond_fall_through_ok` /
+  `_complex_cond_natural_exit_falls_through`: same shape for the
+  non-empty-cond_setup gate. Flippable when cond_setup scoping is
+  implemented.
 
-**End-to-end**: 336 → 342 e2e + 180 unit + 7 integration + 1
+**Review pass** (lenses 1 + 6, then 3 + 12):
+- Lens 1 (Linus) + 6 (reasoning clarity): the `effective_cond`
+  match was 3 arms but 2 trivially returned `cond`. Refactored to
+  `original_cond_recoverable: bool` + ternary. The soundness-gate
+  logic now reads as a single condition rather than nested if-
+  inside-match. -8 lines, clearer shape.
+- Lens 1 + 6 (ast_to_sst.rs): `original_cond` population was a
+  let-mut + conditional assignment inside the conversion branch.
+  Replaced with `let original_cond = if !simple_while { cnd.clone() }
+  else { None };` before the branch. Removes the implicit "capture
+  before mutating cnd" ordering dependency.
+- Lens 3 (coverage) + 12 (edge-case): added 4 fall-through tests
+  (above) pinning the labeled-loop and non-empty-cond_setup gates,
+  with positive + flippable-Err pairs.
+
+**End-to-end**: 336 → 346 e2e + 180 unit + 7 integration + 1
 coverage tests pass. vstd still verifies (1530, 0 errors). #127
 closed.
 
