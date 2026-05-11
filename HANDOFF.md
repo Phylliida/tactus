@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**325 end-to-end tests + 1 coverage test + 178 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**330 end-to-end tests + 1 coverage test + 178 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -3749,6 +3749,76 @@ across 4 files (prelude + 2 renderers + tests), +3 e2e tests. Test
 counts now 325 e2e + 1 coverage + 178 unit + 7 integration. One
 pending task closed (#113).
 
+#### Current session (2026-05-11 continued — #121 coverage probes)
+
+Probed five catalogue items that DESIGN.md flagged as untested or
+"never managed to write a clean test." Four turned out to already
+work; one found a real automation gap. Lesson echo from earlier
+sessions: *catalogue staleness is real*, and the cost of a probe is
+small compared to the cost of trusting a stale entry.
+
+**What was probed and what landed:**
+
+- **`BinaryOp::Xor` concrete case**: pinned by
+  `test_exec_xor_bool_concrete` (`assert((true ^ false) == true)` —
+  closes via `decide` in `tactus_auto`'s ladder). The existing
+  `test_exec_xor_bool` was a fn-return-equals-body smoke test that
+  didn't actually exercise xor reasoning; this fills the
+  reasoning-side gap for concrete operands.
+
+- **`BinaryOp::Xor` free-vars commutativity FAILS**: pinned by
+  `test_exec_xor_bool_free_vars_commutative_gap` as `Err`. Two
+  compounding gaps surface here:
+  (1) `to_lean_type::typ_to_node` always emits `Prop` for
+  `TypX::Bool` regardless of context, so exec-bool params become
+  `Prop` and Lean inserts `decide` coercions when the value flows
+  into `Bool.xor`. The DESIGN.md "Bool vs Prop" section *promises*
+  context-sensitive rendering but the code doesn't implement it.
+  (2) `Bool.xor_comm` isn't in `tactus_auto`'s simp set, so
+  `(decide b1 ^^ decide b2) = (decide b2 ^^ decide b1)` doesn't
+  close under the default closer. Workaround for users today:
+  `assert(... == ...) by { simp_all [Bool.xor_comm] }`. Proper fix
+  is task-sized.
+
+- **Tactic referencing loop-local variables**: pinned by
+  `test_exec_assert_by_omega_in_loop_body` — `assert(P) by { omega }`
+  inside a loop body actually works for the common case (omega
+  resolves both loop-modified vars and fn-param vars as bound names
+  in the maintain theorem). Catalogue had marked this "Untested
+  directly"; turned out the common-case works fine. What remains
+  untested — and probably never tractable — is a user tactic that
+  references a hypothesis by name like `exact h_inv` (Hyp frames
+  get codegen-internal names, not user-controlled ones).
+
+- **Closure with user-written `requires`**: pinned by
+  `test_exec_closure_with_requires`. Verus syntax: `|x: u8|
+  requires P { body }` (no `->` between params and `requires`).
+
+- **Closure with user-written `ensures`**: pinned by
+  `test_exec_closure_with_ensures`. Verus syntax: `|x: u8| -> (r:
+  u8) ensures P { body }` (return binding `(r: u8)` required).
+
+The catalogue had claimed both closure-spec cases "we didn't manage
+to write a clean test." Both work fine with the right syntax —
+`requires` and `ensures` use different shapes (no `->` before
+`requires`, `->` before `ensures`); the probe found them by looking
+at how vstd / other Verus tests write them.
+
+**The pattern:** four out of five "untested" catalogue items turned
+out to work; one had a real gap. The ratio matches yesterday's
+StrGetChar surfacing — most-things-actually-work, but the rare
+genuine gap is the high-value find. Coverage's job is to schedule
+the first-use that surfaces (or doesn't) the gap.
+
+**DESIGN.md catalogue updates**: three stale entries flipped from
+"untested" to "pinned" with the test names; one entry expanded to
+document the real Xor commutativity gap with the workaround.
+
+**Net for the session**: 5 new e2e tests, 3 catalogue entries
+updated. Test counts 325 → 330 e2e. One pending task closed (#121
+partial — the surfacing-via-probes class. The full task umbrella
+includes any future probes too).
+
 ## Architecture
 
 ### Full pipeline
@@ -4089,12 +4159,17 @@ Closed: #98 / #116 / #118 / #119 (earlier sessions); plus the
 enum / #142 shared test_fixtures module / #143 per-theorem
 preamble requirements).
 
-### Robustness + test gaps (1 pending)
+### Robustness + test gaps (0 pending — open umbrella)
 
-- **#121** test coverage: untested-but-possibly-working paths
-  (closures with user requires/ensures; `assert forall|v| P by
-  { tac }`; return-in-else; multi-var loops; tactic referencing
-  loop-local; etc.).
+Closed: **#121** test coverage probes (2026-05-11) — closures with
+user `requires` ✅ `test_exec_closure_with_requires`; closures with
+user `ensures` ✅ `test_exec_closure_with_ensures`; tactic
+referencing loop-local ✅ `test_exec_assert_by_omega_in_loop_body`;
+`BinaryOp::Xor` reasoning ✅ `test_exec_xor_bool_concrete` + `_gap`
+(found a real automation gap pinned as Err); `assert forall|v| P
+by { tac }` upstream-blocked (Verus poly panic); return-in-else /
+multi-var loops already pinned in earlier sessions. The umbrella
+stays as an open ticket for future surfaces.
 
 Closed: #126 / #129 (earlier sessions); 2026-05-08 closed all 9
 REVIEW.md follow-ups (#131-139) — full list in REVIEW.md's
