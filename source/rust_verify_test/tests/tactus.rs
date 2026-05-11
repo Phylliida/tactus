@@ -2826,8 +2826,8 @@ test_verify_one_file! {
         }
     } => Err(err) => {
         assert!(
-            err.errors.iter().any(|e| e.message.contains("non-simple LHS")
-                || e.message.contains("not yet supported")),
+            err.errors.iter().any(|e|
+                e.message.contains(vir::tactus_messages::ASSIGN_NON_SIMPLE_LHS_TAG)),
             "expected a non-simple-LHS rejection"
         );
     }

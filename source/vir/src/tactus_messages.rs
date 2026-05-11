@@ -37,6 +37,13 @@ pub const TACTUS_TACTIC_EMPTY_ERR: &str =
 /// matching rather than a full message constant.
 pub const ASSUME_WARNING_TAG: &str = "unproved assumption";
 
+/// Stable tag for the `&mut x.f` / `&mut v[i]` rejection in
+/// `sst_to_lean::build_wp_assign` (error format: `"assignment with
+/// non-simple LHS (got {:?}) is not yet supported"`). The Debug
+/// content of the L-value is dynamic; this tag is the
+/// `contains`-stable prefix.
+pub const ASSIGN_NON_SIMPLE_LHS_TAG: &str = "non-simple LHS";
+
 // ── AssertKind labels (Tactus error-format suffix) ───────────────────
 //
 // These appear in Tactus's per-obligation error format `at <loc>
