@@ -728,9 +728,9 @@ If `to_lean_expr.rs` has a bug that translates VIR expression `P` to Lean expres
 - **Keep translations simple**: Prefer direct 1:1 mappings over clever optimizations. Boring code has fewer bugs.
 - **The translation is auditable**: Generated Lean is readable text. Users can inspect it via `tactus translate file.rs`.
 
-## Heartbeat annotations
+## Heartbeat annotations — LANDED (#123)
 
-Lean's deterministic timeout uses `maxHeartbeats`. Reuses Verus's rlimit annotation pattern:
+Lean's deterministic timeout uses `maxHeartbeats` (kernel reduction-step count, reproducible vs Z3's wall-clock-based rlimit). `#[verifier::heartbeats(N)]` provides per-fn override.
 
 ```rust
 #[verifier::heartbeats(1600000)]
@@ -746,7 +746,13 @@ theorem expensive_lemma ... := by
   nlinarith [sq_nonneg a, sq_nonneg b, sq_nonneg c, sq_nonneg d]
 ```
 
-Default: 800000 heartbeats (configurable via `--heartbeats N`).
+**Plumbing.** `Attr::TactusHeartbeats(u32)` parsed in `rust_verify::attributes` (validates positive integer at parse time); `FunctionAttrsX::tactus_heartbeats: Option<u32>` threads to VIR; `Theorem::heartbeats: Option<u32>` carried in lean_ast; `lean_pp::write_theorem` emits `set_option maxHeartbeats N in\n` before the `theorem` keyword when `Some(N)`. The `in` keyword is load-bearing — without it, the option would persist for subsequent declarations in the same file.
+
+**Both fn paths covered.** Proof fns: `to_lean_fn::proof_fn_to_ast` reads from `f.attrs.tactus_heartbeats` and populates one theorem. Exec fns (`tactus_auto`): `ObligationEmitter::heartbeats` is set at construction from `fn_sst.x.attrs.tactus_heartbeats`; every emitted theorem inherits it via `self.heartbeats`.
+
+**Default.** Prelude's `set_option maxHeartbeats 800000` applies globally when the attribute is absent. Pinned by `test_proof_heartbeats_attribute`, `test_exec_heartbeats_attribute`, `test_heartbeats_zero_rejected` (negative — non-positive values rejected at parse), plus unit tests `theorem_with_heartbeats_emits_set_option` / `theorem_without_heartbeats_no_set_option` for pp invariants.
+
+The other two items grouped under #123 — **per-module `.lean` file generation** (currently per-fn — fine at our scale) and **CI matrix** (multi-Lean-version testing — not yet wired) — remain as separate future work.
 
 ## Variable naming in Lean output
 

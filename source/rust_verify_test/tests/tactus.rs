@@ -1331,6 +1331,49 @@ test_verify_one_file! {
 
 // === Complex proofs ===
 
+// #[verifier::heartbeats(N)] sets Lean's deterministic timeout
+// (maxHeartbeats) per theorem this fn emits. Verus has #[verifier::rlimit]
+// for the Z3 path; Tactus mirrors with a more reproducible knob
+// (heartbeats count kernel reduction steps, not wall-clock).
+test_verify_one_file! {
+    #[test] test_proof_heartbeats_attribute verus_code! {
+        #[verifier::heartbeats(1600000)]
+        proof fn lemma_with_heartbeats(x: int)
+            ensures x == x
+        by {
+            rfl
+        }
+    } => Ok(())
+}
+
+// Exec-fn path: every theorem the fn emits gets the heartbeats
+// override. With #[verifier::tactus_auto], the per-obligation
+// theorems all share the same maxHeartbeats setting.
+test_verify_one_file! {
+    #[test] test_exec_heartbeats_attribute verus_code! {
+        #[verifier::tactus_auto]
+        #[verifier::heartbeats(1600000)]
+        fn add_one_with_heartbeats(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            x + 1
+        }
+    } => Ok(())
+}
+
+// Negative test: zero or non-integer heartbeats values are rejected.
+test_verify_one_file! {
+    #[test] test_heartbeats_zero_rejected verus_code! {
+        #[verifier::heartbeats(0)]
+        proof fn lemma_bad_heartbeats()
+            ensures true
+        by {
+            trivial
+        }
+    } => Err(e) => assert!(format!("{:?}", e).contains("heartbeats argument must be a positive integer"))
+}
+
 // Pin that Tactus has access to classical excluded middle.
 // `TactusPrelude.lean` opens `Classical.propDecidable` as an instance,
 // which is the foundational commitment that makes match-on-Prop

@@ -371,6 +371,10 @@ pub(crate) enum Attr {
     // "nlinarith", "(simp_all <;> nlinarith)"). Only meaningful in
     // tactus_auto exec fns.
     TactusTactic(String),
+    // Tactus: per-fn maxHeartbeats override (Lean's deterministic
+    // timeout). Emitted as `set_option maxHeartbeats N in` before each
+    // theorem this fn produces.
+    TactusHeartbeats(u32),
 }
 
 fn get_trigger_arg(span: Span, attr_tree: &AttrTree) -> Result<u64, VirErr> {
@@ -655,6 +659,18 @@ pub(crate) fn parse_attrs(
                             "tactus_tactic argument must be a non-empty Lean tactic string");
                     }
                     v.push(Attr::TactusTactic(tac.clone()));
+                }
+                // Tactus: per-fn maxHeartbeats override. Argument must
+                // be a positive integer; emitted as `set_option
+                // maxHeartbeats N in` before each theorem from this fn.
+                AttrTree::Fun(span, name, Some(box [AttrTree::Lit(LitKind::Integer, text)]))
+                    if name == "heartbeats" =>
+                {
+                    match text.parse::<u32>() {
+                        Ok(n) if n > 0 => v.push(Attr::TactusHeartbeats(n)),
+                        _ => return err_span(*span,
+                            "heartbeats argument must be a positive integer"),
+                    }
                 }
                 AttrTree::Fun(span, name, attrs) if name == "rlimit" => {
                     let number = get_rlimit_arg(*span, attrs)?;
@@ -1189,6 +1205,10 @@ pub(crate) struct VerifierAttrs {
     // `tactus_auto` in generated theorems with the user-supplied Lean
     // tactic. None = use the default closer.
     pub(crate) tactus_tactic: Option<String>,
+    // Tactus: per-fn maxHeartbeats override. When `Some(N)`, every
+    // theorem from this fn gets `set_option maxHeartbeats N in`
+    // prepended. None = prelude default applies.
+    pub(crate) tactus_heartbeats: Option<u32>,
 }
 
 // Check for the `get_field_many_variants` attribute
@@ -1368,6 +1388,7 @@ pub(crate) fn get_verifier_attrs_maybe_check(
         lean_imports: Vec::new(),
         tactus_auto: false,
         tactus_tactic: None,
+        tactus_heartbeats: None,
     };
     let mut unsupported_rustc_attr: Option<(String, Span)> = None;
     for attr in parse_attrs(attrs, diagnostics)? {
@@ -1456,6 +1477,7 @@ pub(crate) fn get_verifier_attrs_maybe_check(
             Attr::LeanImport(path) => vs.lean_imports.push(path.clone()),
             Attr::TactusAuto => vs.tactus_auto = true,
             Attr::TactusTactic(tac) => vs.tactus_tactic = Some(tac.clone()),
+            Attr::TactusHeartbeats(n) => vs.tactus_heartbeats = Some(n),
             _ => {}
         }
     }

@@ -279,6 +279,13 @@ fn write_def(out: &mut String, d: &Def, lm: &mut Landmarks) {
 }
 
 fn write_theorem(out: &mut String, t: &Theorem, lm: &mut Landmarks) {
+    // Per-theorem `maxHeartbeats` override from
+    // `#[verifier::heartbeats(N)]`. The `in` keyword scopes the
+    // option to just this theorem; without it, the option would
+    // apply to all subsequent declarations in the file.
+    if let Some(n) = t.heartbeats {
+        out.push_str(&format!("set_option maxHeartbeats {} in\n", n));
+    }
     out.push_str("theorem ");
     out.push_str(&t.name);
     write_binders(out, &t.binders, lm);
@@ -857,6 +864,38 @@ mod tests {
     }
 
     #[test]
+    fn theorem_with_heartbeats_emits_set_option() {
+        let t = Theorem {
+            name: "expensive".into(),
+            binders: vec![],
+            goal: bin(BinOp::Eq, lit(1), lit(1)),
+            tactic: Tactic::Named("rfl".into()),
+            requires_preamble: Vec::new(),
+            heartbeats: Some(1600000),
+        };
+        let out = pp_command(&Command::Theorem(t));
+        assert!(out.starts_with("set_option maxHeartbeats 1600000 in\ntheorem expensive"),
+            "expected heartbeats option before theorem, got:\n{}", out);
+    }
+
+    #[test]
+    fn theorem_without_heartbeats_no_set_option() {
+        let t = Theorem {
+            name: "cheap".into(),
+            binders: vec![],
+            goal: bin(BinOp::Eq, lit(1), lit(1)),
+            tactic: Tactic::Named("rfl".into()),
+            requires_preamble: Vec::new(),
+            heartbeats: None,
+        };
+        let out = pp_command(&Command::Theorem(t));
+        assert!(!out.contains("set_option maxHeartbeats"),
+            "expected no heartbeats option, got:\n{}", out);
+        assert!(out.starts_with("theorem cheap"),
+            "expected theorem to start the output, got:\n{}", out);
+    }
+
+    #[test]
     fn theorem_with_named_tactic() {
         let t = Theorem {
             name: "foo".into(),
@@ -868,6 +907,7 @@ mod tests {
             goal: bin(BinOp::Eq, var("x"), var("x")),
             tactic: Tactic::Named("rfl".into()),
             requires_preamble: Vec::new(),
+            heartbeats: None,
         };
         let out = pp_command(&Command::Theorem(t));
         assert!(out.contains("theorem foo (x : Nat)"));
@@ -896,6 +936,7 @@ mod tests {
             goal: bin(BinOp::Eq, lit(1), lit(1)),
             tactic: Tactic::Raw("omega".into()),
             requires_preamble: Vec::new(),
+            heartbeats: None,
         };
         let out = pp_commands(&[Command::Theorem(t)]);
         assert_eq!(out.landmarks.tactic_starts.len(), 1);
