@@ -3953,6 +3953,82 @@ prior plumbing (#81 tactus_tactic); the one moment of code-
 change-attempted-then-reverted (Bool.xor_comm simp extension) was
 itself a lesson about not becoming the thing being audited.
 
+#### Current session (2026-05-11 continued — #127 loop_isolation: false)
+
+**The encoding question that drove the design.** Verus lowers
+`while c { body }` with isolation=false to break-lowered form
+(cond:None + inserted `if !c { break; }`). AIR encodes this via its
+`Breakable` primitive — natural-exit fact `¬c` is preserved by AIR's
+state-preservation across `Break`. Lean's kernel has no equivalent
+control-flow primitive (it's pure type theory; no breakable/state-
+preservation constructs).
+
+**Design space explored** (in conversation):
+- Option 1: Lift rejection, document limitation, user uses
+  `allow_complex_invariants` + `ensures` for post-loop facts.
+- Option 2: Pattern-detect `if !c { break; }` at body[0..1] in
+  Tactus, add side-channel hyp for `¬c` post-loop.
+- Option 3: Path-condition tracking on breaks (the truly general
+  encoding for control flow in Lean — disjunction over all
+  break paths). Invasive, touches Wp::Done semantics throughout.
+- Option 4: Pattern-detect + reverse-engineer the conversion at
+  Tactus's SST entry (one transformation, existing cond:Some
+  encoding handles the rest).
+- **Option 5 (landed)**: Don't pattern-detect at all — preserve
+  the pre-conversion cond in an upstream `StmX::Loop` field. AIR
+  ignores the field; Tactus reads it. No shape-detection needed.
+
+The general principle that emerged: when the target IR lacks a
+primitive the source IR uses, the cleanest answer often isn't to
+*re-encode* the primitive but to *preserve the information the
+primitive was reconstructing*. Verus's break-lowering reconstructs
+"how this loop exits"; Tactus's cond:Some encoding can use that
+info directly if we just keep the cond around.
+
+**Implementation**:
+- Added `original_cond: Option<(Stm, Exp)>` to upstream `StmX::Loop`
+  in `vir/src/sst.rs`. Populated by `ast_to_sst.rs` at the break-
+  lowering conversion site (line 2675-2685) with the pre-conversion
+  `(c_stm.clone(), c_exp.clone())` BEFORE mutating cnd to None.
+- AIR's `sst_to_air.rs` binds `original_cond: _` in its
+  `StmX::Loop` destructure — explicit ignore, per the upstream-
+  robustness pattern (no `..` in StmX matches).
+- `poly.rs` and `sst_visitor.rs` walk `original_cond` like `cond`
+  so its embedded Stm/Exp receive the same visitor transformations.
+- `sst_vars.rs` clones `original_cond` through both passes.
+- Tactus's `build_wp_loop` reads `original_cond`. When `cond` is
+  None but `original_cond` is Some AND soundness gates pass, treat
+  the loop as cond:Some(original_cond). The existing cond:Some
+  encoding handles the rest — body's vacuous if-not-c-break
+  obligation discharges under contradictory `c ∧ ¬c` via simp_all's
+  contradiction handling; use_obl gets `¬c` as natural-exit hyp.
+
+**Soundness gates** (refuse recovery, fall through to cond:None):
+- `count_breaks_targeting_this_loop(body, label) > 1`: user has own
+  breaks alongside Verus's inserted one. Multiple exit paths;
+  `¬c` not universally true.
+- `label.is_some()`: labeled loops would need cross-label break
+  counting (deferred).
+- Non-empty cond_setup in `original_cond`: setup with calls/short-
+  circuits needs scoping work for temp bindings.
+
+**Tests** (6 new, all pass):
+- `test_exec_loop_isolation_false_fn_level` / `_loop_level`: basic
+  acceptance at both attribute placements.
+- `_natural_exit`: the post-loop `i == n` case — canonical
+  motivation. Verifies via the original_cond recovery path.
+- `_outer_ctx`: outer fn precondition `n <= 100` flows into both
+  body and after via OblCtx inheritance.
+- `_user_break_falls_through`: soundness gate — multi-break loop
+  has count > 1, recovery refused, falls through to cond:None
+  encoding. Fn still verifies (invariant alone gives `r <= n`).
+- `_invariant_violation`: negative — invariant maintain obligation
+  still fires under the recovery encoding.
+
+**End-to-end**: 336 → 342 e2e + 180 unit + 7 integration + 1
+coverage tests pass. vstd still verifies (1530, 0 errors). #127
+closed.
+
 #### Current session (2026-05-11 continued — #117 fuse two-pass audit)
 
 Same shape as yesterday's #149–#153 audit sweep, applied to the
@@ -4303,13 +4379,18 @@ themes:
 - **#107** caller-side new-mut-ref mode (synthetic MutRef-typed
   locals around exec calls).
 - **#112** StmX::OpenInvariant (atomic invariants for concurrency).
-- **#127** loop_isolation: false support (#114 sub-feature 2).
 
 Closed: #108 / #109 / #111 / #130 (2026-05-05); **#113**
 BinaryOp::StrGetChar (2026-05-11) — `Tactus.strGetChar` prelude
 helper replaces the incorrect `String.get` head emitted by
 `non_binop_head`; both VIR-AST and SST renderer paths now lower
-cleanly.
+cleanly. **#127** loop_isolation: false support (2026-05-11) —
+upstream `StmX::Loop.original_cond` field preserves the pre-
+break-lowering cond; Tactus's `build_wp_loop` recovers the
+cond:Some encoding under single-break + unlabeled + empty-cond-
+setup soundness gates. Natural-exit fact (`¬c` post-loop)
+available without ergonomically-painful `allow_complex_invariants`
++ `ensures` workarounds.
 
 ### Architecture cleanups (0 pending)
 

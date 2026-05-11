@@ -7768,3 +7768,163 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #127: `#[verifier::loop_isolation(false)]` at the fn level. Verus
+// lowers `while c { body }` with isolation=false to
+// `loop { if !c { break; } body }` (cond:None) for AIR's encoding.
+// Tactus preserves the original `(cond_setup, cond_exp)` in
+// `StmX::Loop.original_cond` (upstream addition for #127). When
+// `build_wp_loop` sees cond:None + original_cond:Some + soundness
+// gates pass, it recovers the cond:Some encoding — body obligations
+// get `c` as a hyp under maintain_obl (the inserted if-not-c-break
+// then has contradictory `c ∧ ¬c` at its then-branch, discharging
+// vacuously), and use_obl gets `¬c` (the natural-exit fact).
+test_verify_one_file! {
+    #[test] test_exec_loop_isolation_false_fn_level verus_code! {
+        #[verifier::tactus_auto]
+        #[verifier::loop_isolation(false)]
+        fn count_down(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r == 0
+        {
+            let mut x: u8 = n;
+            while x > 0
+                invariant x <= n
+                decreases x
+            {
+                x = x - 1;
+            }
+            x
+        }
+    } => Ok(())
+}
+
+// #127: `#[verifier::loop_isolation(false)]` directly on the
+// while loop. Same recovery path — Verus threads the flag through
+// to `StmX::Loop.loop_isolation` and populates `original_cond`.
+test_verify_one_file! {
+    #[test] test_exec_loop_isolation_false_loop_level verus_code! {
+        #[verifier::tactus_auto]
+        fn count_down(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r == 0
+        {
+            let mut x: u8 = n;
+            #[verifier::loop_isolation(false)]
+            while x > 0
+                invariant x <= n
+                decreases x
+            {
+                x = x - 1;
+            }
+            x
+        }
+    } => Ok(())
+}
+
+// #127: post-loop fact `i == n` requires the natural-exit `¬c`
+// (== `i >= n`) combined with invariant `i <= n`. This is the
+// canonical case that motivates the original_cond recovery — pre-fix
+// this test failed under Tactus's cond:None encoding (which dropped
+// the natural-exit hyp). The recovery path restores it via the
+// preserved cond.
+test_verify_one_file! {
+    #[test] test_exec_loop_isolation_false_natural_exit verus_code! {
+        #[verifier::tactus_auto]
+        #[verifier::loop_isolation(false)]
+        fn count_to_n(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r == n
+        {
+            let mut i: u8 = 0;
+            while i < n
+                invariant i <= n
+                decreases n - i
+            {
+                i = i + 1;
+            }
+            i
+        }
+    } => Ok(())
+}
+
+// #127: an outer fn precondition (`n <= 100`) combined with the
+// invariant `i <= n` proves `r <= 100`. Tactus's per-obligation
+// encoding gives outer-ctx visibility in both modes; this test pins
+// the attribute-accepted shape with a real outer-ctx dependency in
+// the post-loop fact.
+test_verify_one_file! {
+    #[test] test_exec_loop_isolation_false_outer_ctx verus_code! {
+        #[verifier::tactus_auto]
+        #[verifier::loop_isolation(false)]
+        fn bounded_count(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r <= 100
+        {
+            let mut i: u8 = 0;
+            while i < n
+                invariant i <= n
+                decreases n - i
+            {
+                i = i + 1;
+            }
+            i
+        }
+    } => Ok(())
+}
+
+// #127 soundness gate: when the user's body has its own `break`,
+// Verus's lowering preserves it alongside the inserted if-not-c-
+// break. There are now TWO break paths; the user's break may fire
+// when `c` is still true, so post-loop's `¬c` is NOT a universally
+// true fact. Tactus's single-break check refuses the recovery and
+// falls through to cond:None encoding. The user must use
+// `allow_complex_invariants` + loop `ensures` to encode post-loop
+// facts (or rely on what the invariants alone give).
+//
+// This test verifies the soundness gate works: the fn proves
+// `r <= n` (from the invariant alone, no natural-exit needed), and
+// the user-break does NOT poison the encoding.
+test_verify_one_file! {
+    #[test] test_exec_loop_isolation_false_user_break_falls_through verus_code! {
+        #[verifier::tactus_auto]
+        #[verifier::loop_isolation(false)]
+        fn count_or_stop(n: u8, stop: u8) -> (r: u8)
+            requires n <= 100, stop <= n
+            ensures r <= n
+        {
+            let mut i: u8 = 0;
+            while i < n
+                invariant i <= n
+                decreases n - i
+            {
+                if i == stop { break; }
+                i = i + 1;
+            }
+            i
+        }
+    } => Ok(())
+}
+
+// #127: negative — invariant violation still caught when
+// isolation=false. Pins that the invariant-maintain obligation
+// still fires correctly under the recovery encoding.
+test_verify_one_file! {
+    #[test] test_exec_loop_isolation_false_invariant_violation verus_code! {
+        #[verifier::tactus_auto]
+        #[verifier::loop_isolation(false)]
+        fn bad_loop(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r <= n
+        {
+            let mut x: u8 = 0;
+            while x < n
+                invariant x <= n
+                decreases n - x
+            {
+                x = x + 2;  // breaks the `x <= n` invariant when n is odd
+            }
+            x
+        }
+    } => Err(_)
+}
+

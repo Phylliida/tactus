@@ -228,6 +228,20 @@ pub enum StmX {
         label: Option<String>,
         /// For simple while loops: (condition setup statements, condition expression)
         cond: Option<(Stm, Exp)>,
+        /// Tactus-specific (#127): when `ast_to_sst`'s break-lowering
+        /// converts a `while c { body }` to `loop { if !c { break; } body }`
+        /// (i.e., sets `cond` to None and inserts `if !c { break }` at
+        /// body[0..1]), the original `(cond_setup, cond_exp)` is preserved
+        /// here. `None` for loops that were never converted (genuine
+        /// `loop {}` blocks, or `while c {}` that stayed cond:Some).
+        ///
+        /// AIR's `sst_to_air` path ignores this field — it reads `cond`
+        /// and follows the post-conversion shape. Tactus's `sst_to_lean`
+        /// reads it to recover the original cond:Some shape when the
+        /// body has no user-written breaks, so its existing cond:Some
+        /// encoding can give natural-exit facts post-loop without
+        /// re-pattern-matching the body for the inserted if-not-c-break.
+        original_cond: Option<(Stm, Exp)>,
         body: Stm,
         /// Loop invariants with info about whether they hold at entry/exit/both
         invs: LoopInvs,

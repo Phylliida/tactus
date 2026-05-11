@@ -486,6 +486,7 @@ pub(crate) trait Visitor<R: Returner, Err, Scope: Scoper> {
                 id,
                 label,
                 cond,
+                original_cond,
                 body,
                 invs,
                 decrease,
@@ -494,6 +495,14 @@ pub(crate) trait Visitor<R: Returner, Err, Scope: Scoper> {
                 pre_modified_params,
             } => {
                 let cond = R::map_opt(cond, &mut |(cond_stm, cond_exp)| {
+                    let cond_stm = self.visit_stm(cond_stm)?;
+                    let cond_exp = self.visit_exp(cond_exp)?;
+                    R::ret(|| (R::get(cond_stm), R::get(cond_exp)))
+                })?;
+                // Walk `original_cond` (Tactus #127) like `cond` — its
+                // embedded Stm/Exp must receive the same visitor
+                // transformations so Tactus's path sees consistent SST.
+                let original_cond = R::map_opt(original_cond, &mut |(cond_stm, cond_exp)| {
                     let cond_stm = self.visit_stm(cond_stm)?;
                     let cond_exp = self.visit_exp(cond_exp)?;
                     R::ret(|| (R::get(cond_stm), R::get(cond_exp)))
@@ -511,6 +520,7 @@ pub(crate) trait Visitor<R: Returner, Err, Scope: Scoper> {
                         id: *id,
                         label: label.clone(),
                         cond: R::get_opt(cond),
+                        original_cond: R::get_opt(original_cond),
                         body: R::get(body),
                         invs: R::get_vec_a(invs),
                         decrease: R::get_vec_a(decrease),

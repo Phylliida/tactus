@@ -962,6 +962,7 @@ fn visit_stm(ctx: &Ctx, state: &mut State, stm: &Stm) -> Stm {
             id,
             label,
             cond,
+            original_cond,
             body,
             invs,
             decrease,
@@ -970,6 +971,13 @@ fn visit_stm(ctx: &Ctx, state: &mut State, stm: &Stm) -> Stm {
             pre_modified_params,
         } => {
             let cond = cond
+                .as_ref()
+                .map(|(s, e)| (visit_stm(ctx, state, s), visit_exp_native(ctx, state, e)));
+            // Walk `original_cond` the same way as `cond` — for
+            // Tactus's path it needs the same Poly transformation
+            // applied to its embedded Stm/Exp. Verus's AIR path
+            // ignores the field; the walk is still cheap.
+            let original_cond = original_cond
                 .as_ref()
                 .map(|(s, e)| (visit_stm(ctx, state, s), visit_exp_native(ctx, state, e)));
             let body = visit_stm(ctx, state, body);
@@ -985,6 +993,7 @@ fn visit_stm(ctx: &Ctx, state: &mut State, stm: &Stm) -> Stm {
                 id: *id,
                 label: label.clone(),
                 cond,
+                original_cond,
                 body,
                 invs,
                 decrease,

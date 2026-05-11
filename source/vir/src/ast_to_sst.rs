@@ -2670,9 +2670,18 @@ pub(crate) fn expr_to_stm_opt(
             if ctx.checking_spec_preconditions() {
                 stms1.splice(0..0, check_recommends);
             }
+            // Tactus #127: preserve the original cond across the
+            // break-lowering conversion. AIR's `sst_to_air` reads
+            // `cond` (post-conversion) and ignores `original_cond`;
+            // Tactus's `sst_to_lean` reads `original_cond` to recover
+            // the cond:Some shape its WP encoding handles natively.
+            let mut original_cond: Option<(Stm, Exp)> = None;
             if !simple_while {
                 // must be "loop", not "while"
                 if let Some((c_stm, c_exp)) = cnd {
+                    // Capture the original cond BEFORE we mutate cnd
+                    // and insert the if-not-c-break into the body.
+                    original_cond = Some((c_stm.clone(), c_exp.clone()));
                     // convert while into loop
                     let not_c = c_exp.new_x(ExpX::Unary(UnaryOp::Not, c_exp.clone()));
                     let break_stmx = StmX::BreakOrContinue { label: None, is_break: true };
@@ -2698,6 +2707,7 @@ pub(crate) fn expr_to_stm_opt(
                     id,
                     label: label.clone(),
                     cond: cnd,
+                    original_cond,
                     body: stms_to_one_stm(&body.span, stms1),
                     invs: Arc::new(invs1),
                     decrease: Arc::new(decrease1),
