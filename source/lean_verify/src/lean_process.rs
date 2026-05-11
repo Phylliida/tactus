@@ -43,11 +43,15 @@ pub fn format_error(
         if let Some(mark) = source_map.find_span_mark(pos.line) {
             // `at <loc> (<kind label>):` — kind label only when
             // non-empty (Plain has no extra context worth showing).
+            // `paren_label` lives in `vir::tactus_messages` so the
+            // parens framing has one definition shared with tests
+            // that assert against it (Lens 15).
             let label = mark.kind.label();
             if label.is_empty() {
                 out.push_str(&format!("at {}:\n", mark.loc));
             } else {
-                out.push_str(&format!("at {} ({}):\n", mark.loc, label));
+                out.push_str(&format!("at {} {}:\n",
+                    mark.loc, vir::tactus_messages::paren_label(label)));
             }
         } else if let Some(offset) = source_map.find_tactic_line(pos.line) {
             out.push_str(&format!("tactic line {}: ", offset + 1));

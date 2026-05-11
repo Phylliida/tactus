@@ -676,7 +676,7 @@ pub(crate) fn parse_attrs(
                 {
                     if tac.trim().is_empty() {
                         return err_span(*span,
-                            "tactus_tactic argument must be a non-empty Lean tactic string");
+                            vir::tactus_messages::TACTUS_TACTIC_EMPTY_ERR);
                     }
                     v.push(Attr::TactusTactic(tac.clone()));
                 }
