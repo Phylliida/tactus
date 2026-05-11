@@ -7928,3 +7928,121 @@ test_verify_one_file! {
     } => Err(_)
 }
 
+// #127 soundness gate (labeled loop): a `'label: while c { … }` with
+// isolation=false is accepted, and verifies via the invariant alone
+// (no natural-exit fact needed for `r <= n`). The labeled gate causes
+// recovery to fall through to cond:None encoding without affecting
+// the soundness of what the invariant gives.
+test_verify_one_file! {
+    #[test] test_exec_loop_isolation_false_labeled_fall_through_ok verus_code! {
+        #[verifier::tactus_auto]
+        #[verifier::loop_isolation(false)]
+        #[allow(unused_labels)]
+        fn labeled_count_down(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r <= n
+        {
+            let mut x: u8 = n;
+            'outer: while x > 0
+                invariant x <= n
+                decreases x
+            {
+                x = x - 1;
+            }
+            x
+        }
+    } => Ok(())
+}
+
+// #127 soundness gate (labeled loop, natural-exit needed): pins that
+// the labeled gate prevents recovery. Without recovery, post-loop
+// can't conclude `i == n` (the natural-exit fact). Fn would verify
+// under the unlabeled path (see test_exec_loop_isolation_false_natural_exit);
+// labeling it disables the recovery and the fn fails to verify.
+//
+// If the labeled-loop gate is ever lifted (cross-label break counting
+// implemented), this test flips Err → Ok.
+test_verify_one_file! {
+    #[test] test_exec_loop_isolation_false_labeled_natural_exit_falls_through verus_code! {
+        #[verifier::tactus_auto]
+        #[verifier::loop_isolation(false)]
+        #[allow(unused_labels)]
+        fn labeled_count_to_n(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r == n
+        {
+            let mut i: u8 = 0;
+            'outer: while i < n
+                invariant i <= n
+                decreases n - i
+            {
+                i = i + 1;
+            }
+            i
+        }
+    } => Err(_)
+}
+
+// #127 soundness gate (non-empty cond_setup): a while loop whose
+// condition has a function call gets a non-empty cond_setup in
+// Verus's lowering. Tactus's recovery requires empty cond_setup
+// (the cond expression has to be in scope at maintain ctx entry —
+// non-empty setup would need scoping work for its temp bindings).
+// Verifies via the invariant alone — no natural-exit needed.
+test_verify_one_file! {
+    #[test] test_exec_loop_isolation_false_complex_cond_fall_through_ok verus_code! {
+        fn is_below(i: u8, n: u8) -> (r: bool)
+            ensures r == (i < n)
+        { i < n }
+
+        #[verifier::tactus_auto]
+        #[verifier::loop_isolation(false)]
+        fn complex_cond_loop(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r <= n
+        {
+            let mut i: u8 = 0;
+            while is_below(i, n)
+                invariant i <= n
+                decreases n - i
+            {
+                i = i + 1;
+            }
+            i
+        }
+    } => Ok(())
+}
+
+// #127 soundness gate (non-empty cond_setup, natural-exit needed):
+// pins that the non-empty-cond-setup gate prevents recovery. Like
+// the labeled-loop case, fn would verify under empty cond_setup
+// (see test_exec_loop_isolation_false_natural_exit); using a fn call
+// for cond produces non-empty setup, recovery falls through, and
+// post-loop `i == n` is unavailable.
+//
+// If the cond_setup gate is ever lifted (scoping work for temp
+// bindings implemented), this test flips Err → Ok.
+test_verify_one_file! {
+    #[test] test_exec_loop_isolation_false_complex_cond_natural_exit_falls_through verus_code! {
+        fn is_below(i: u8, n: u8) -> (r: bool)
+            ensures r == (i < n)
+        { i < n }
+
+        #[verifier::tactus_auto]
+        #[verifier::loop_isolation(false)]
+        fn complex_cond_count_to_n(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r == n
+        {
+            let mut i: u8 = 0;
+            while is_below(i, n)
+                invariant i <= n
+                decreases n - i
+            {
+                i = i + 1;
+            }
+            i
+        }
+    } => Err(_)
+}
+
