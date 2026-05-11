@@ -3818,6 +3818,141 @@ updated. Test counts 325 → 330 e2e. One pending task closed (#121
 partial — the surfacing-via-probes class. The full task umbrella
 includes any future probes too).
 
+#### Current session (2026-05-11 continued — xor gap-find / design honesty / audit sweep / #123 heartbeats / lens 15)
+
+After the #121 probe surfaced the bool xor commutativity gap, the
+day spiraled into a substantial design-clarification stretch that
+ended up reshaping the codebase's approach to automation.
+
+**Bool xor commutativity gap → fix → revert.** The probe found
+`assert((b1 ^ b2) == (b2 ^ b1))` couldn't close under
+`tactus_auto`'s default closer. Initial fix: add `Bool.xor_comm`
+to `simp_all`'s lemma set in the prelude. Test flipped Err → Ok.
+Committed. **User pushback** (same session): adding lemmas to the
+default closer rebuilds a tiny version of the thing Tactus was
+built to escape (Z3-style opaque automation). Reverted the simp-
+set extension; rewrote the test to use the user-explicit shape
+`assert(...) by { simp_all [Bool.xor_comm] };`. Saved the
+preference to memory:
+*tactus_auto stays deliberately minimal; prefer transparent user
+proofs over extending the closer's simp set.*
+
+**Bool vs Prop design honesty.** DESIGN.md's "Bool vs Prop"
+section promised context-sensitive rendering (Prop in spec, Bool
+in exec). The code unconditionally renders `TypX::Bool` as `Prop`.
+Audit revealed the design-doc/code mismatch. Rewrote the section
+to document **always-Prop as the deliberate landed design**, with
+a "Why always-Prop" subsection (spec-first model;
+Classical.propDecidable covers coercions; no mode threading
+needed) and a "Considered: context-sensitive bool rendering"
+subsection recording the cost-benefit. Updates the existing entries
+across DESIGN.md / HANDOFF.md / tests that had restated the
+"promises but doesn't implement" framing.
+
+**5-audit transparency sweep.** Inspired by the bool xor moment,
+ran a sweep through five candidate "automation hiding work" sites:
+- **#149 tactus_case_split** — keep in `tactus_auto`. Structural
+  mirror of user code (recursion-on-datatype → case-split-at-proof).
+  Pinned the per-arm proof shape via `proof { cases k with | Foo x
+  => tac | Bar y => tac }` (`test_exec_match_enum_with_per_arm_proof`)
+  using Lean's native syntax through `proof { }` blocks — works
+  today, no codegen change needed.
+- **#150 deriving Inhabited** — keep. The "over-deriving" framing
+  was conservative; `Inhabited` is more broadly load-bearing than
+  accessor fallbacks (GetElem!-style indexing needs it too).
+  Doc framing revised.
+- **#151 Classical.propDecidable** — keep. New DESIGN.md section
+  "Classical-logic commitment" documents what classical gives
+  (excluded middle, epsilon for Choose, Classical.arbitrary for
+  accessor fallbacks, Classical.choice for Seq.index). Substrate
+  not behavior. New e2e test `test_proof_classical_excluded_middle`
+  pins user-visible classical use.
+- **#152 emit_done_or_split** — keep. Restructures (∧-split + Let-
+  peel) without changing what's proven; buys per-conjunct error
+  localization + per-theorem caching. Doc verdict added.
+- **#153 ret-substitution (#128)** — keep. Eliminates a redundant
+  ∀ when callee's ensures contains `r == E`; logical equivalence;
+  visible in output. Doc verdict added.
+
+All five audits returned the same shape: *the design is right; the
+deliverable is doc clarity.* Net 0 code changes from the sweep
+itself; +1 test (Classical EM) + 5 DESIGN.md additions.
+
+**#123 heartbeats attribute** (`#[verifier::heartbeats(N)]`).
+Plumbed through the same pipeline as `tactus_tactic`:
+Attr::TactusHeartbeats(u32) → VerifierAttrs / FunctionAttrsX →
+Theorem::heartbeats: Option<u32> → lean_pp emits
+`set_option maxHeartbeats N in\n` before the theorem when Some(N).
+Works for both proof fns (`to_lean_fn::proof_fn_to_ast`) and exec
+fns (`ObligationEmitter::heartbeats` set at construction; every
+emitted theorem inherits). Per-module .lean generation and CI
+matrix (the other two pieces of #123) deferred as future work.
+
+**14-lens review pass on heartbeats.** Three actionable findings:
+- Lens 7 + 12 (error-message + edge-case): malformed invocations
+  (`heartbeats()`, `heartbeats(1.5)`) fell through to the generic
+  "unrecognized verifier attribute" catch-all. Added
+  `get_heartbeats_arg` helper mirroring `get_rlimit_arg`'s shape.
+- Lens 3 (coverage): added `test_exec_heartbeats_multi_theorem`
+  (loop fn — every per-obligation theorem inherits the override).
+- Lens 5 (doc): DESIGN.md notes on Z3-path interaction (heartbeats
+  is noop for non-Tactus fns) and malformed-invocation handling.
+
+**Lens 15 (magic-string lens) introduced and applied.** User
+pointed out that the heartbeats test used a magic-string substring
+matching the error message verbatim — duplicated between
+`attributes.rs` and the test. I had initially framed this as
+"approach 1 couples tests to phrasing"; user corrected: shared
+constants are exactly what makes phrasing edits percolate to
+tests automatically.
+
+Added new lens to the review framework (DESIGN.md § "Code review
+strategy"). The lens distinguishes three categories:
+- Tactus-controlled strings → extract `pub const`.
+- Upstream-emitted (Lean / Verus) → stable substring (out of our
+  control).
+- Dynamic-content strings → stable tag prefix as `pub const`,
+  used as the search substring.
+
+Applied to the heartbeats landing + extended to the broader
+codebase:
+- New `vir::tactus_messages` module: canonical home for Tactus-
+  controlled user-facing message constants. Reachable from both
+  `rust_verify` and `rust_verify_test` (no link-graph
+  complications around rustc_private).
+- 10 constants extracted: `HEARTBEATS_ARG_ERR`,
+  `TACTUS_TACTIC_EMPTY_ERR`, `ASSUME_WARNING_TAG`,
+  `ASSIGN_NON_SIMPLE_LHS_TAG`, and 7 `ASSERT_LABEL_*` for the
+  Tactus error-format suffix labels (postcondition / loop
+  invariant / loop decrease / precondition / termination / loop
+  condition / branch condition).
+- `paren_label(label) -> String` helper for the `(label)` framing
+  in `at <loc> (<label>):` error format.
+- 14 test sites updated from `m.contains("(<label>)")` to
+  `m.contains(&paren_label(LABEL_X))` (or directly for non-paren
+  matches). `lean_ast::AssertKind::label()` returns the
+  constants; `lean_process::format_error` uses `paren_label`.
+
+**Net for the day** (all sessions on 2026-05-11 combined):
+- 22 commits.
+- 336 e2e + 180 unit + 7 integration + 1 coverage tests pass
+  (322 → 336 e2e, 178 → 180 unit).
+- 13 poems committed (POEMS.md index updated).
+- Major DESIGN.md updates: "Bool vs Prop" rewrite, "Classical-
+  logic commitment" new section, 5 audit verdicts, lens 15 added
+  to review framework, "Heartbeat annotations" promoted to
+  LANDED.
+- 3 feedback memories saved: commit-freely permission, minimal-
+  automation preference, layered-automation principle.
+
+**Closing themes of the day**: the work that mattered most was
+noticing what was already there (audit sweep verdicts) and making
+the rightness legible (doc updates, lens 15 framework). The one
+moment of code-change-required (heartbeats #123) was paved by
+prior plumbing (#81 tactus_tactic); the one moment of code-
+change-attempted-then-reverted (Bool.xor_comm simp extension) was
+itself a lesson about not becoming the thing being audited.
+
 ## Architecture
 
 ### Full pipeline
@@ -4174,12 +4309,15 @@ Closed: #126 / #129 (earlier sessions); 2026-05-08 closed all 9
 REVIEW.md follow-ups (#131-139) — full list in REVIEW.md's
 "2026-05-08 follow-up" section.
 
-### Phase 3 (2 tasks)
+### Phase 3 (1 task + 2 sub-items)
 
 - **#122** cross-crate verification (CrateDecls.lean) — gating
   for everything cross-crate.
-- **#123** heartbeats attribute + per-module .lean + CI matrix
-  (three small Phase-3 polish items grouped).
+- **#123 (partial — heartbeats piece LANDED 2026-05-11)**: the
+  `#[verifier::heartbeats(N)]` attribute plumbs through to
+  `set_option maxHeartbeats N in` per theorem. Remaining
+  sub-items: per-module `.lean` file generation (currently per-fn —
+  fine at our scale), CI matrix for multi-Lean-version testing.
 
 ### Upstream-blocked (2 tasks)
 
