@@ -6934,29 +6934,22 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Free-var bool xor commutativity. The probe (2026-05-11) initially
-// surfaced this as a real gap and the test was pinned as `Err`. The
-// fix that landed in the same session: add `Bool.xor_comm` to
-// `tactus_auto`'s `simp_all` set (one rung of the ladder now reads
-// `simp_all [Bool.xor_comm]`).
-//
-// Background on the goal shape that needed the lemma: Tactus
-// renders `TypX::Bool` as `Prop` unconditionally — the deliberate
-// landed design, see DESIGN.md § "Bool vs Prop" → "Why always-Prop"
-// for the rationale (spec-first model + Classical.propDecidable +
-// no mode threading). So exec-bool params `b1, b2` are `Prop`, and
-// any value-flow into `Bool.xor` triggers Lean to insert `decide`
-// coercions, producing goals like
-// `(decide b1 ^^ decide b2) = (decide b2 ^^ decide b1)`. Core Lean's
-// `Bool.xor_comm` closes it once it's in the simp set; the lemma's
-// typed signature unifies with both `decide`-wrapped and unboxed
-// shapes, so adding the lemma is the canonical fix-shape for the
-// always-Prop boundary cases.
+// Free-var bool xor commutativity — the canonical user-explicit
+// proof shape for "tactus_auto can't close this; user provides a
+// tactic." Tactus renders `TypX::Bool` as `Prop` unconditionally
+// (DESIGN.md § "Bool vs Prop"), so any value flowing into `Bool.xor`
+// gets `decide` coercions. The resulting goal
+// `(decide b1 ^^ decide b2) = (decide b2 ^^ decide b1)` doesn't
+// close under the default closer's set, and per Tactus's design
+// principle #1 (Transparency) and the user UX preference for
+// visible proofs, the right shape is `assert(...) by { simp_all
+// [Bool.xor_comm] };` — the lemma being used is right at the
+// assertion site, not buried in the closer.
 test_verify_one_file! {
     #[test] test_exec_xor_bool_free_vars_commutative verus_code! {
         #[verifier::tactus_auto]
         fn check_xor_commute(b1: bool, b2: bool) {
-            assert((b1 ^ b2) == (b2 ^ b1));
+            assert((b1 ^ b2) == (b2 ^ b1)) by { simp_all [Bool.xor_comm] };
         }
     } => Ok(())
 }
