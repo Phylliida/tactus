@@ -497,6 +497,7 @@ mod tests {
             goal: LExpr::lit_bool(true),
             tactic: Tactic::Named("tactus_auto".to_string()),
             requires_preamble,
+            heartbeats: None,
         }
     }
 

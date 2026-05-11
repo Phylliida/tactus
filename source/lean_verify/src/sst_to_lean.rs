@@ -747,6 +747,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
         out: Vec::new(),
         tactic_prefix: Vec::new(),
         default_closer,
+        heartbeats: fn_sst.x.attrs.tactus_heartbeats,
     };
 
     // Initial OblCtx with `let <x>_at_pre_tactus := x` for each &mut
@@ -1106,6 +1107,11 @@ struct ObligationEmitter {
     /// Doesn't affect `assert(P) by { user_tac }` sites — those
     /// always use the user-supplied tactic from the assert-by.
     default_closer: Tactic,
+    /// Per-fn `maxHeartbeats` override from
+    /// `#[verifier::heartbeats(N)]`. When `Some(N)`, every theorem
+    /// emitted from this fn gets the heartbeats value attached
+    /// (rendered as `set_option maxHeartbeats N in` by the pp).
+    heartbeats: Option<u32>,
 }
 
 impl ObligationEmitter {
@@ -1165,6 +1171,7 @@ impl ObligationEmitter {
             goal,
             tactic,
             requires_preamble,
+            heartbeats: self.heartbeats,
         });
     }
 }
@@ -5714,6 +5721,7 @@ mod tests {
         ObligationEmitter {
             fn_name: "test_fn".to_string(),
             base_binders: Vec::new(),
+            heartbeats: None,
             counter: 0,
             out: Vec::new(),
             tactic_prefix: Vec::new(),

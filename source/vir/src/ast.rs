@@ -1580,6 +1580,15 @@ pub struct FunctionAttrsX {
     /// tactic (e.g., `"ring"`, `"nlinarith"`, `"(simp_all; nlinarith)"`).
     /// Only meaningful in tactus_auto exec fns.
     pub tactus_tactic: Option<String>,
+    /// Tactus: per-fn `maxHeartbeats` override. When `Some(N)`, every
+    /// theorem emitted from this fn gets `set_option maxHeartbeats N
+    /// in` prepended. When `None`, the prelude's global default
+    /// (`set_option maxHeartbeats 800000`) applies. The user-facing
+    /// attribute is `#[verifier::heartbeats(N)]`. Heartbeats are
+    /// Lean's deterministic-timeout knob — analogous to Verus's Z3
+    /// `rlimit` but reproducible (count kernel reduction steps, not
+    /// wall-clock).
+    pub tactus_heartbeats: Option<u32>,
 }
 
 /// Function specification of its invariant mask

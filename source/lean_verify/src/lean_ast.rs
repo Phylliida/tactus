@@ -141,6 +141,18 @@ pub struct Theorem {
     /// `PreambleFragment` constructor + a walker-arm push, without
     /// threading another bool through the pipeline.
     pub requires_preamble: Vec<PreambleFragment>,
+    /// Optional per-theorem `maxHeartbeats` override. Populated from
+    /// the fn's `#[verifier::heartbeats(N)]` attribute. When `Some(N)`,
+    /// the pretty-printer emits `set_option maxHeartbeats N in\n`
+    /// before the `theorem` keyword. When `None`, the prelude's
+    /// global `set_option maxHeartbeats 800000` applies.
+    ///
+    /// Lean's `maxHeartbeats` is the deterministic-timeout knob —
+    /// the equivalent of Verus's Z3 `rlimit` annotation, but
+    /// reproducible (heartbeats count kernel reduction steps, not
+    /// wall-clock). All theorems emitted from a single fn share the
+    /// fn's attribute value.
+    pub heartbeats: Option<u32>,
 }
 
 /// A piece of preamble that some theorem needs in its elaboration

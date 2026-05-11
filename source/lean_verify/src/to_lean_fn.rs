@@ -141,6 +141,7 @@ pub fn proof_fn_to_ast(f: &FunctionX, tactic_body: &str) -> Theorem {
         goal,
         tactic: Tactic::Raw(tactic_body.to_string()),
         requires_preamble: Vec::new(),
+        heartbeats: f.attrs.tactus_heartbeats,
     }
 }
 

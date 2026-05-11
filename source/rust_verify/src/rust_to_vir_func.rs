@@ -263,6 +263,7 @@ fn handle_autospec<'tcx>(
                     lean_imports: Vec::new(),
                     tactus_auto: false,
                     tactus_tactic: None,
+                    tactus_heartbeats: None,
                 }),
                 body: Some(ret_clause.clone()),
                 extra_dependencies: functionx.extra_dependencies.clone(),
@@ -1336,6 +1337,7 @@ fn make_attributes<'tcx>(
         lean_imports: vattrs.lean_imports.clone(),
         tactus_auto: vattrs.tactus_auto,
         tactus_tactic: vattrs.tactus_tactic.clone(),
+        tactus_heartbeats: vattrs.tactus_heartbeats,
     };
     Ok(Arc::new(fattrs))
 }
