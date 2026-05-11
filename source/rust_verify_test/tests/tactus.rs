@@ -6913,6 +6913,122 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Logical xor on bools — Rust's `^` on `(bool, bool)` lowers to
+// `BinaryOp::Xor` in VIR (bitwise xor on ints goes through
+// `BinaryOp::Bitwise(BitXor, _)` — a different SST path entirely).
+// Renders via the shared `non_binop_head(Xor) -> "Bool.xor"`.
+//
+// Concrete xor closes via `decide` in `tactus_auto`'s ladder — this
+// pins that the basic rendering path works end-to-end (existing
+// `test_exec_xor_bool` was a smoke test for fn-return-equals-body, not
+// for the inner xor logic). Commutativity reasoning on FREE bool vars
+// hits an automation gap — see `_free_vars_*_gap` below.
+test_verify_one_file! {
+    #[test] test_exec_xor_bool_concrete verus_code! {
+        #[verifier::tactus_auto]
+        fn check_xor_concrete() {
+            assert((true ^ false) == true);
+            assert((true ^ true) == false);
+            assert((false ^ false) == false);
+        }
+    } => Ok(())
+}
+
+// Free-var bool xor commutativity FAILS — pins the current limitation.
+//
+// Two compounding gaps surface here:
+// (1) **Bool rendered as Prop.** DESIGN.md "Bool vs Prop" promises
+//     context-sensitive rendering (Prop in spec, Bool in exec), but
+//     `to_lean_type.rs::typ_to_node` always emits `Prop`. So an exec
+//     param `b: bool` becomes `b : Prop`, and any `Bool`-typed
+//     operation on it forces Lean to insert `decide` coercions.
+// (2) **`Bool.xor` commutativity isn't a simp lemma in `tactus_auto`.**
+//     `simp_all`'s default set doesn't include `Bool.xor_comm`, and
+//     `omega` / `decide` / `rfl` can't close a free-var commutativity
+//     goal.
+//
+// Generated goal shape: `(decide b1 ^^ decide b2) = (decide b2 ^^ decide b1)`.
+// Workaround for users today: `assert(... == ...) by { simp_all [Bool.xor_comm] }`
+// (assert-by overrides the closer). Proper fix is task-sized (context-
+// sensitive bool rendering or extending `tactus_auto`'s simp set).
+test_verify_one_file! {
+    #[test] test_exec_xor_bool_free_vars_commutative_gap verus_code! {
+        #[verifier::tactus_auto]
+        fn check_xor_commute(b1: bool, b2: bool) {
+            assert((b1 ^ b2) == (b2 ^ b1));
+        }
+    } => Err(e) => assert!(format!("{:?}", e).contains("auto-tactic failed"))
+}
+
+// Tactic referencing loop-local variable. Catalogue marked this
+// untested with the note that the user's tactic runs at theorem-level
+// prefix, so loop-local names might not be in scope. Probing reveals
+// that `assert(P) by { omega }` inside a loop body actually DOES work
+// for the common case of arithmetic over loop-local + fn-param vars:
+// the assert emits its own theorem under the loop's maintain ctx
+// (binders for `mod_vars + bounds + invs + cond + d_old`), so `omega`
+// sees `i` (modified var binder) and `n` (param binder) as bound
+// names in the theorem context.
+//
+// What WOULDN'T work — and remains untested for lack of an idiomatic
+// shape — is a tactic referencing a *hypothesis name* like `h_inv`
+// that the user expects from the invariant. The Hyp frames get
+// codegen-internal names, not user-controlled ones; there's no stable
+// way for a user-written tactic to refer to the invariant hypothesis
+// directly. The omega/simp_all path sidesteps this by name-resolving
+// against the bound vars + auto-iterated hypothesis set.
+test_verify_one_file! {
+    #[test] test_exec_assert_by_omega_in_loop_body verus_code! {
+        #[verifier::tactus_auto]
+        fn iterate_under_bound(n: u8)
+            requires n < 100
+        {
+            let mut i: u8 = 0;
+            while i < n
+                invariant i <= n
+                decreases n - i
+            {
+                assert(i <= n) by { omega };
+                i = i + 1;
+            }
+        }
+    } => Ok(())
+}
+
+// Closures with user-written `requires`. Catalogue marked this
+// untested because Verus's surface syntax is finicky. Verus parses
+// `|x: u8| requires P { body }` (no `->` before `requires`). Inside
+// a `tactus_auto` fn, the closure declaration emits a `Wp::LetRaw`
+// with the lambda value; `Wp::ClosureBody` walks the body's own
+// verification scope, where the requires clause becomes an
+// `Assume(req)` at body entry (Verus's `exec_closure_body_stms`
+// pipeline). So `body` verifies under the assumed precondition —
+// pinning that we can use the requires inside the body to discharge
+// overflow checks that would fail without it.
+test_verify_one_file! {
+    #[test] test_exec_closure_with_requires verus_code! {
+        #[verifier::tactus_auto]
+        fn make_bumper() {
+            let bumper = |x: u8| requires x < 100 { x + 1 };
+        }
+    } => Ok(())
+}
+
+// Closure with user-written `ensures`. Verus syntax: `|x: u8| -> (r:
+// u8) ensures r == x + 1 { x + 1 }`. The closure-body verification
+// scope checks that the body satisfies the ensures; the closure's
+// declaration emits the lambda value bound to the closure id, and any
+// outer reference is to that lambda. Pins the second half of the
+// closure-spec surface area named in the catalogue.
+test_verify_one_file! {
+    #[test] test_exec_closure_with_ensures verus_code! {
+        #[verifier::tactus_auto]
+        fn make_identity() {
+            let id_closure = |x: u8| -> (r: u8) ensures r == x { x };
+        }
+    } => Ok(())
+}
+
 // #89: `invariant_except_break P` (at_entry only) — `P` holds at
 // each iteration boundary but is NOT required at break, so the
 // post-loop ctx doesn't get to assume it. The decreases-style
