@@ -750,7 +750,11 @@ theorem expensive_lemma ... := by
 
 **Both fn paths covered.** Proof fns: `to_lean_fn::proof_fn_to_ast` reads from `f.attrs.tactus_heartbeats` and populates one theorem. Exec fns (`tactus_auto`): `ObligationEmitter::heartbeats` is set at construction from `fn_sst.x.attrs.tactus_heartbeats`; every emitted theorem inherits it via `self.heartbeats`.
 
-**Default.** Prelude's `set_option maxHeartbeats 800000` applies globally when the attribute is absent. Pinned by `test_proof_heartbeats_attribute`, `test_exec_heartbeats_attribute`, `test_heartbeats_zero_rejected` (negative — non-positive values rejected at parse), plus unit tests `theorem_with_heartbeats_emits_set_option` / `theorem_without_heartbeats_no_set_option` for pp invariants.
+**Default.** Prelude's `set_option maxHeartbeats 800000` applies globally when the attribute is absent. Pinned by `test_proof_heartbeats_attribute`, `test_exec_heartbeats_attribute`, `test_exec_heartbeats_multi_theorem` (loop fn — confirms every per-obligation theorem inherits the override), `test_heartbeats_zero_rejected` (negative — non-positive values rejected at parse via `get_heartbeats_arg`), plus unit tests `theorem_with_heartbeats_emits_set_option` / `theorem_without_heartbeats_no_set_option` for pp invariants.
+
+**Z3-path interaction.** The attribute lives on `FunctionAttrsX` and is set for any fn that has it, but is only *read* by Tactus's emission paths (`to_lean_fn::proof_fn_to_ast` for proof fns, `ObligationEmitter` for exec fns). For fns that go through Verus's Z3 path (no `tactus_auto`, no proof-fn tactic body), the attribute is a noop — Z3 uses its own `rlimit` knob, not Lean's heartbeats. The two can coexist; users can write both `#[verifier::rlimit(...)]` and `#[verifier::heartbeats(...)]` on a single fn if they want different effective limits depending on which verifier processes it.
+
+**Malformed invocations.** `get_heartbeats_arg` in `rust_verify::attributes` mirrors `get_rlimit_arg`'s shape — broadly matches `name == "heartbeats"` then validates the argument shape in one place. `heartbeats(0)`, `heartbeats()`, `heartbeats(1.5)`, `heartbeats(1, 2)`, `heartbeats("foo")` all error with `"heartbeats requires a positive integer literal (e.g., #[verifier::heartbeats(1600000)])"` rather than falling through to the generic "unrecognized verifier attribute" catch-all.
 
 The other two items grouped under #123 — **per-module `.lean` file generation** (currently per-fn — fine at our scale) and **CI matrix** (multi-Lean-version testing — not yet wired) — remain as separate future work.
 
