@@ -224,12 +224,22 @@ macro "tactus_bit_vector" : tactic => `(tactic|
 -- like `simp_all` from blocking later alternatives.
 --
 -- `fail` turns "nothing worked" into a real error instead of a `sorry`.
+--
+-- **Lemma additions to `simp_all`'s set.** Each `[lemma_name]` here
+-- handles a class of obligations the plain `simp_all` set misses:
+-- * `Bool.xor_comm` — needed because Tactus renders `TypX::Bool` as
+--   `Prop` (always-Prop in `to_lean_type.rs`), so any `Bool.xor` over
+--   exec-bool params gets wrapped in `decide` coercions; the resulting
+--   `(decide b1 ^^ decide b2) = (decide b2 ^^ decide b1)` shape isn't
+--   in core simp's default set but `Bool.xor_comm` closes it directly.
+--   Pinned by `test_exec_xor_bool_free_vars_commutative_gap` (#121
+--   probe, 2026-05-11, gap-fix 2026-05-11).
 macro "tactus_auto" : tactic => `(tactic|
   tactus_first
     | rfl
     | decide
     | omega
-    | simp_all
+    | simp_all [Bool.xor_comm]
     | tactus_case_split (simp_all <;> first | omega | done)
     | tactus_case_split (simp_all)
     | fail "tactus: auto-tactic failed — add explicit proof block")
