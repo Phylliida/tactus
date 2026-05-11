@@ -2122,7 +2122,6 @@ impl<'a> MutArgInfo<'a> {
         match &self.target {
             MutTargetRaw::Var(v) => v,
             MutTargetRaw::Field { base, .. } => base,
-            MutTargetRaw::TupleField { base, .. } => base,
         }
     }
 }
@@ -2666,63 +2665,54 @@ fn push_post_call_frames(
         let new_value = match &info.target {
             MutTargetRaw::Var(_) => LExpr::var(info.fresh.clone()),
             MutTargetRaw::Field { field_oprs, .. } => {
-                // Build nested structure-update from inside-out.
-                // `field_oprs` is in peel order (outermost-first =
-                // deepest-mutated-first). For `&mut a.b.c`,
-                // field_oprs = [c_opr, b_opr]. We want:
-                //   { a with b := { a.b with c := fresh } }
-                //
-                // Build the bases for each level top-down:
-                //   level 0 (outer update): base = a, field = b
-                //   level 1 (inner update): base = a.b, field = c
-                // Then wrap inside-out.
-                //
-                // Field-name path top-to-bottom (a's perspective):
-                let names_top_to_bottom: Vec<String> = field_oprs
-                    .iter()
-                    .rev()
-                    .map(|opr| crate::expr_shared::field_access_name(opr))
-                    .collect();
+                // Build the nested rebind inside-out. `field_oprs` is
+                // in peel order (`[0]` outermost = deepest-mutated),
+                // so top-to-bottom is the reverse: `oprs_ttb[0]` is
+                // closest to base; `oprs_ttb[len-1]` is the deepest
+                // step (the one whose value is `fresh`). At each
+                // level we dispatch on the step's `Dt`:
+                //   Path → Lean structure update `{ base with f := … }`
+                //   Tuple → explicit ctor `(base.0, …, current, …)`
+                // Steps may interleave (e.g., `&mut s.tup.0` has a
+                // Path step over a Tuple step).
+                let oprs_ttb: Vec<&vir::ast::FieldOpr> =
+                    field_oprs.iter().rev().copied().collect();
                 let local_expr = LExpr::var(local_name.clone());
                 let mut current = LExpr::var(info.fresh.clone());
-                // Build inside-out: at each step, wrap `current` in a
-                // StructUpdate whose base is `local.<names[..i]>` and
-                // whose field is `names[i]`.
-                for i in (0..names_top_to_bottom.len()).rev() {
-                    // Compute the base for this level: local.<names[0..i]>
+                for i in (0..oprs_ttb.len()).rev() {
                     let mut base = local_expr.clone();
-                    for name in &names_top_to_bottom[..i] {
-                        base = LExpr::field_proj(base, name.clone());
+                    for prior in &oprs_ttb[..i] {
+                        base = LExpr::field_proj(
+                            base, crate::expr_shared::field_access_name(prior));
                     }
-                    current = LExpr::new(ExprNode::StructUpdate {
-                        base: Box::new(base),
-                        updates: vec![(names_top_to_bottom[i].clone(), current)],
-                    });
+                    let opr = oprs_ttb[i];
+                    current = match &opr.datatype {
+                        vir::ast::Dt::Path(_) => LExpr::new(ExprNode::StructUpdate {
+                            base: Box::new(base),
+                            updates: vec![(
+                                crate::expr_shared::field_access_name(opr),
+                                current,
+                            )],
+                        }),
+                        vir::ast::Dt::Tuple(arity) => {
+                            let index: usize = opr.field.as_str().parse()
+                                .expect("tuple index validated at extract time");
+                            let new_value = current;
+                            let elems: Vec<LExpr> = (0..*arity)
+                                .map(|j| if j == index {
+                                    new_value.clone()
+                                } else {
+                                    LExpr::field_proj(
+                                        base.clone(),
+                                        crate::expr_shared::tuple_field_accessor(*arity, j),
+                                    )
+                                })
+                                .collect();
+                            LExpr::tuple(elems)
+                        }
+                    };
                 }
                 current
-            }
-            MutTargetRaw::TupleField { index, arity, .. } => {
-                // Tuple ctor rebuild (#145). Lean's structure-update
-                // doesn't compose with `Prod`, so we rebuild the tuple
-                // explicitly via Lean tuple syntax. Each unmodified
-                // slot reads from `local.<accessor>` where accessor
-                // comes from the shared `tuple_field_accessor` —
-                // which produces `.2.1` etc. for arity > 2 (#146).
-                // The mutated slot at `index` takes `fresh`.
-                let local_expr = LExpr::var(local_name.clone());
-                let elems: Vec<LExpr> = (0..*arity)
-                    .map(|j| {
-                        if j == *index {
-                            LExpr::var(info.fresh.clone())
-                        } else {
-                            LExpr::field_proj(
-                                local_expr.clone(),
-                                crate::expr_shared::tuple_field_accessor(*arity, j),
-                            )
-                        }
-                    })
-                    .collect();
-                LExpr::tuple(elems)
             }
         };
         new_obl.frames.push_back(CtxFrame::Let(local_name, new_value));
@@ -4094,38 +4084,22 @@ fn validate_call_arities(
 ///   structure update syntax doesn't compose with multi-variant
 ///   inductives; also upstream-blocked at Verus's `ref mut` mode
 ///   check for the only viable surface syntax).
-/// * Mixed tuple-and-struct paths (`&mut s.tup.0`, `&mut t.0.f`) —
-///   would need a unified `Vec<FieldKind>` path encoding.
 #[derive(Clone)]
 enum MutTargetRaw<'a> {
     Var(&'a VarIdent),
-    /// `&mut <base>.<f1>.<f2>.…` field path. `field_oprs` lists the
-    /// path from peel order — `field_oprs[0]` is the OUTERMOST
-    /// `Field(_, ...)` we encountered when peeling (i.e., the
-    /// deepest-mutated field, closest to the new value). For a
-    /// single-level mutation `&mut x.f`, `field_oprs` is
-    /// `vec![f_opr]`. For `&mut x.f.g`, it's `vec![g_opr, f_opr]`
-    /// (g is outermost in the SST → outermost in the peel sequence
-    /// → first in the Vec).
+    /// `&mut <base>.<f1>.<f2>.…` field path, where each step is
+    /// either a single-variant struct field or a tuple slot. Steps
+    /// may interleave freely — `&mut s.tup.0`, `&mut t.0.f`,
+    /// `&mut a.b.c` all live here. The per-step datatype kind
+    /// (`Dt::Path` vs `Dt::Tuple`) is already carried on each
+    /// `FieldOpr`; the rebind loop dispatches on it.
     ///
-    /// `base` is the outer-most `VarIdent` (the local being rebound
-    /// at the call site). The Lean-rendered field name for each
-    /// level is computed at emission time via
-    /// `field_access_name(opr)`.
+    /// `field_oprs` is in peel order — `field_oprs[0]` is the
+    /// OUTERMOST `Field(_, ...)` we encountered (i.e., the
+    /// deepest-mutated step, closest to the new value);
+    /// `field_oprs[len-1]` is innermost (closest to the base).
+    /// For `&mut a.b.c` it is `[c_opr, b_opr]`.
     Field { base: &'a VarIdent, field_oprs: Vec<&'a vir::ast::FieldOpr> },
-    /// `&mut <base>.<i>` for a tuple `base : (T0, T1, ..., T{n-1})`.
-    /// Lean's `{ x with f := v }` syntax doesn't compose with `Prod`
-    /// types ("expected structure" elaboration error), so the rebind
-    /// uses explicit ctor rebuild via Lean's anon-ctor syntax
-    /// `⟨t.1, ..., fresh, ..., t.n⟩` (with the mutated field's slot
-    /// filled by `fresh` and all others by `t.<j>` accessors).
-    ///
-    /// Stored as the base ident, the 0-indexed field position, and
-    /// the tuple arity. Restricted to single-level (no `&mut t.0.f`
-    /// or `&mut s.tup.0` mixing yet — multi-level paths involving
-    /// tuples need a unified Vec<FieldKind> path that the current
-    /// `Field` variant doesn't model).
-    TupleField { base: &'a VarIdent, index: usize, arity: usize },
 }
 
 fn extract_mut_target<'a>(
@@ -4168,74 +4142,37 @@ fn extract_mut_target<'a>(
     if let ExpX::Var(ident) | ExpX::VarLoc(ident) = &inner.x {
         return Some(MutTargetRaw::Var(ident));
     }
-    // Single-level tuple field shape (#145): `Loc(Field(Tuple(n), Var(t)))`
-    // for `&mut t.<i>`. Tuple field mutation needs ctor rebuild
-    // (Lean's `{ x with f := v }` doesn't compose with `Prod`), so it
-    // gets its own variant rather than threading through the
-    // recursive Field peel below. Restricted to single-level — multi-
-    // level paths involving tuples (e.g., `&mut s.tup.0` or
-    // `&mut t.0.f`) need a unified Vec<FieldKind> path representation.
-    //
-    // Any arity ≥ 2 supported (#146 lifted the prior arity-2-only
-    // gate). The unmodified-slot reads use the shared
-    // `tuple_field_accessor` so arity > 2 produces the correct
-    // multi-segment Lean accessor (e.g., `.2.1` for the second of
-    // three).
-    if let ExpX::UnaryOpr(UnaryOpr::Field(field_opr), base_exp) = &inner.x {
-        if let vir::ast::Dt::Tuple(arity) = &field_opr.datatype {
-            let base = peel_transparent(base_exp);
-            if let ExpX::Var(ident) | ExpX::VarLoc(ident) = &base.x {
-                if let Ok(index) = field_opr.field.as_str().parse::<usize>() {
-                    return Some(MutTargetRaw::TupleField {
-                        base: ident,
-                        index,
-                        arity: *arity,
-                    });
-                }
-            }
-            // Tuple field with non-numeric field name or non-Var base —
-            // fall through to None (defensive; Verus shouldn't produce
-            // either shape).
-            return None;
-        }
-    }
-    // Peel Field levels until we hit a Var/VarLoc base. Single-variant
-    // gate per level: Lean's `{ x with f := v }` syntax works for
-    // `structure` types (single ctor); multi-variant enums and tuples
-    // (above) fall through to None at the level they appear.
+    // Peel `Field` levels until we hit a Var/VarLoc base. Each step
+    // is either a single-variant struct field (`Dt::Path` with
+    // matching variant name) or a tuple slot (`Dt::Tuple` with a
+    // numeric field name); the FieldOpr already carries the
+    // discriminator, so the rebind loop dispatches on it directly.
+    // Multi-variant enums and tuples with non-numeric fields fall
+    // through to None.
     let mut field_oprs: Vec<&'a vir::ast::FieldOpr> = Vec::new();
     let mut cursor: &'a Exp = inner;
     loop {
         match &cursor.x {
             ExpX::Var(ident) | ExpX::VarLoc(ident) => {
                 if field_oprs.is_empty() {
-                    // Reached the base without seeing any Field —
-                    // already handled by the early return above; this
-                    // arm is unreachable when entering the loop.
                     return Some(MutTargetRaw::Var(ident));
                 }
                 return Some(MutTargetRaw::Field { base: ident, field_oprs });
             }
             ExpX::UnaryOpr(UnaryOpr::Field(field_opr), base_exp) => {
-                let supported_kind = match &field_opr.datatype {
+                match &field_opr.datatype {
                     vir::ast::Dt::Path(path) => {
-                        // Single-variant struct: the variant name
-                        // equals the type's short name. Multi-variant
-                        // enums fall through to None (Lean's
-                        // `{ x with f := v }` doesn't compose with
-                        // multi-variant inductives).
-                        field_opr.variant.as_str()
-                            == crate::to_lean_type::short_name(path)
+                        if field_opr.variant.as_str()
+                            != crate::to_lean_type::short_name(path)
+                        {
+                            return None;
+                        }
                     }
-                    // Tuple at a deeper level (e.g., `&mut s.tup.0` or
-                    // `&mut t.0.f`) — handled separately above for the
-                    // single-level case; multi-level paths involving
-                    // tuples need a unified path encoding that this
-                    // recursive peel doesn't support yet.
-                    vir::ast::Dt::Tuple(_) => false,
-                };
-                if !supported_kind {
-                    return None;
+                    vir::ast::Dt::Tuple(_) => {
+                        if field_opr.field.as_str().parse::<usize>().is_err() {
+                            return None;
+                        }
+                    }
                 }
                 field_oprs.push(field_opr);
                 // Peel transparent wrappers (Box/Unbox/CoerceMode/
