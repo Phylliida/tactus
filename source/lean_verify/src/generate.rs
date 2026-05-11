@@ -313,9 +313,10 @@ pub fn check_exec_fn(
         .unwrap_or_default()
         .iter()
         .map(|span| format!(
-            "unproved assumption at {}: backed by an unverified hypothesis (`assume(P)` \
+            "{} at {}: backed by an unverified hypothesis (`assume(P)` \
              enters the spec as fact without a proof). Replace with a proven \
              `assert(P) by {{ ... }}` before relying on this in production.",
+            vir::tactus_messages::ASSUME_WARNING_TAG,
             sst_to_lean::format_span_loc(span),
         ))
         .collect();

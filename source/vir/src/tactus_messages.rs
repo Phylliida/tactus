@@ -30,6 +30,13 @@ pub const HEARTBEATS_ARG_ERR: &str =
 pub const TACTUS_TACTIC_EMPTY_ERR: &str =
     "tactus_tactic argument must be a non-empty Lean tactic string";
 
+/// Stable tag prefix for the `assume(P)` warning emitted by
+/// `lean_verify::generate::check_exec_fn` (warnings format:
+/// `"unproved assumption at <loc>: backed by..."`). The location
+/// portion is dynamic, so this is a *tag* used for `contains`
+/// matching rather than a full message constant.
+pub const ASSUME_WARNING_TAG: &str = "unproved assumption";
+
 // ── AssertKind labels (Tactus error-format suffix) ───────────────────
 //
 // These appear in Tactus's per-obligation error format `at <loc>
