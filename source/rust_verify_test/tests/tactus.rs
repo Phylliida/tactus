@@ -2162,7 +2162,7 @@ test_verify_one_file! {
         // hypothesis frame.
         let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
         assert!(
-            msgs.iter().any(|m| m.contains("(postcondition)")),
+            msgs.iter().any(|m| m.contains(&vir::tactus_messages::paren_label(vir::tactus_messages::ASSERT_LABEL_POSTCONDITION))),
             "expected (postcondition) kind label on the failing \
              obligation. got: {:?}",
             msgs,
@@ -2660,8 +2660,8 @@ test_verify_one_file! {
         { x + 1 }
     } => Err(err) => {
         assert!(
-            err.errors.iter().any(|e| e.message.contains("non-empty")
-                || e.message.contains("tactus_tactic")),
+            err.errors.iter().any(|e|
+                e.message.contains(vir::tactus_messages::TACTUS_TACTIC_EMPTY_ERR)),
             "expected empty-tactic-string rejection, got: {:?}",
             err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
         );
@@ -2943,7 +2943,7 @@ test_verify_one_file! {
         // makes find_span_mark structurally exact for loops.
         let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
         assert!(
-            msgs.iter().any(|m| m.contains("(loop invariant)")),
+            msgs.iter().any(|m| m.contains(&vir::tactus_messages::paren_label(vir::tactus_messages::ASSERT_LABEL_LOOP_INVARIANT))),
             "expected (loop invariant) kind label on the failing \
              obligation. got: {:?}",
             msgs,
@@ -3110,7 +3110,7 @@ test_verify_one_file! {
         // returns the LoopDecrease mark by construction.
         let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
         assert!(
-            msgs.iter().any(|m| m.contains("(loop decrease)")),
+            msgs.iter().any(|m| m.contains(&vir::tactus_messages::paren_label(vir::tactus_messages::ASSERT_LABEL_LOOP_DECREASE))),
             "expected (loop decrease) kind label on the failing \
              obligation. got: {:?}",
             msgs,
@@ -3142,7 +3142,7 @@ test_verify_one_file! {
         assert!(err.errors.len() >= 1, "init-failing invariant must be rejected");
         let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
         assert!(
-            msgs.iter().any(|m| m.contains("(loop invariant)")),
+            msgs.iter().any(|m| m.contains(&vir::tactus_messages::paren_label(vir::tactus_messages::ASSERT_LABEL_LOOP_INVARIANT))),
             "expected (loop invariant) kind label on init failure. got: {:?}",
             msgs,
         );
@@ -3207,7 +3207,7 @@ test_verify_one_file! {
         // not as the goal).
         let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
         assert!(
-            msgs.iter().any(|m| m.contains("(postcondition)")),
+            msgs.iter().any(|m| m.contains(&vir::tactus_messages::paren_label(vir::tactus_messages::ASSERT_LABEL_POSTCONDITION))),
             "expected (postcondition) kind label on use-clause failure. got: {:?}",
             msgs,
         );
@@ -3239,7 +3239,7 @@ test_verify_one_file! {
         assert!(err.errors.len() >= 1, "multi-requires partial-violation must fail");
         let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
         assert!(
-            msgs.iter().any(|m| m.contains("(precondition)")),
+            msgs.iter().any(|m| m.contains(&vir::tactus_messages::paren_label(vir::tactus_messages::ASSERT_LABEL_CALL_PRECONDITION))),
             "expected (precondition) label. got: {:?}",
             msgs,
         );
@@ -3264,7 +3264,7 @@ test_verify_one_file! {
         assert!(err.errors.len() >= 1, "multi-ensures partial-violation must fail");
         let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
         assert!(
-            msgs.iter().any(|m| m.contains("(postcondition)")),
+            msgs.iter().any(|m| m.contains(&vir::tactus_messages::paren_label(vir::tactus_messages::ASSERT_LABEL_POSTCONDITION))),
             "expected (postcondition) label on the failing clause. got: {:?}",
             msgs,
         );
@@ -3548,7 +3548,7 @@ test_verify_one_file! {
         // (rather than confusing it with adjacent obligations
         // like termination checks or call-ensures hyps).
         assert!(
-            msgs.iter().any(|m| m.contains("(precondition)")),
+            msgs.iter().any(|m| m.contains(&vir::tactus_messages::paren_label(vir::tactus_messages::ASSERT_LABEL_CALL_PRECONDITION))),
             "expected (precondition) kind label on the failing \
              obligation. got: {:?}",
             msgs,
@@ -4363,7 +4363,7 @@ test_verify_one_file! {
         assert!(err.errors.len() >= 1, "non-decreasing lex recursion should fail");
         let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
         assert!(
-            msgs.iter().any(|m| m.contains("(termination)")),
+            msgs.iter().any(|m| m.contains(&vir::tactus_messages::paren_label(vir::tactus_messages::ASSERT_LABEL_TERMINATION))),
             "expected (termination) kind label on the failing obligation. got: {:?}",
             msgs,
         );
@@ -4433,7 +4433,7 @@ test_verify_one_file! {
         // is the recursive call's CheckDecreaseHeight, which
         // wraps with kind=Termination.
         assert!(
-            msgs.iter().any(|m| m.contains("(termination)")),
+            msgs.iter().any(|m| m.contains(&vir::tactus_messages::paren_label(vir::tactus_messages::ASSERT_LABEL_TERMINATION))),
             "expected (termination) kind label on the failing \
              obligation. got: {:?}",
             msgs,
@@ -6490,7 +6490,7 @@ test_verify_one_file! {
             "non-decreasing lex loop should fail");
         let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
         assert!(
-            msgs.iter().any(|m| m.contains("(loop decrease)")),
+            msgs.iter().any(|m| m.contains(&vir::tactus_messages::paren_label(vir::tactus_messages::ASSERT_LABEL_LOOP_DECREASE))),
             "expected (loop decrease) kind label on the failing obligation. got: {:?}",
             msgs,
         );
@@ -6529,7 +6529,7 @@ test_verify_one_file! {
             "loop with int decrease that goes negative should fail post-#129");
         let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
         assert!(
-            msgs.iter().any(|m| m.contains("(loop decrease)")),
+            msgs.iter().any(|m| m.contains(&vir::tactus_messages::paren_label(vir::tactus_messages::ASSERT_LABEL_LOOP_DECREASE))),
             "expected (loop decrease) kind label from #129's missing 0 ≤ cur \
              lower bound. got: {:?}",
             msgs,
@@ -6649,7 +6649,7 @@ test_verify_one_file! {
     } => Err(err) => {
         let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
         assert!(
-            msgs.iter().any(|m| m.contains("(postcondition)")),
+            msgs.iter().any(|m| m.contains(&vir::tactus_messages::paren_label(vir::tactus_messages::ASSERT_LABEL_POSTCONDITION))),
             "expected (postcondition) failure from wrong post-call assertion. got: {:?}",
             msgs,
         );

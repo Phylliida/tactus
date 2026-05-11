@@ -15,6 +15,8 @@
 //! are outside our control — tests that match those should use
 //! stable-substring matching against the upstream content.
 
+// ── Attribute parsing errors ─────────────────────────────────────────
+
 /// Error returned by `rust_verify::attributes::get_heartbeats_arg`
 /// for malformed `#[verifier::heartbeats(N)]` invocations
 /// (`heartbeats()`, `heartbeats(1.5)`, `heartbeats(0)`,
@@ -22,3 +24,32 @@
 pub const HEARTBEATS_ARG_ERR: &str =
     "heartbeats requires a positive integer literal \
      (e.g., #[verifier::heartbeats(1600000)])";
+
+/// Error returned by `rust_verify::attributes` for
+/// `#[verifier::tactus_tactic("")]` (empty tactic string).
+pub const TACTUS_TACTIC_EMPTY_ERR: &str =
+    "tactus_tactic argument must be a non-empty Lean tactic string";
+
+// ── AssertKind labels (Tactus error-format suffix) ───────────────────
+//
+// These appear in Tactus's per-obligation error format `at <loc>
+// (<label>):` — emitted by `lean_verify::lean_process::format_error`
+// via `AssertKind::label()`. Both the emission site and many tests
+// reference these; centralizing the labels here keeps the format and
+// the assertions in lockstep through phrasing edits.
+
+pub const ASSERT_LABEL_POSTCONDITION: &str = "postcondition";
+pub const ASSERT_LABEL_LOOP_INVARIANT: &str = "loop invariant";
+pub const ASSERT_LABEL_LOOP_DECREASE: &str = "loop decrease";
+pub const ASSERT_LABEL_CALL_PRECONDITION: &str = "precondition";
+pub const ASSERT_LABEL_TERMINATION: &str = "termination";
+pub const ASSERT_LABEL_LOOP_CONDITION: &str = "loop condition";
+pub const ASSERT_LABEL_BRANCH_CONDITION: &str = "branch condition";
+
+/// Wrap an `AssertKind` label in the parens that Tactus's error
+/// formatter adds — `at <loc> (<label>):`. Both `lean_process` (emit
+/// side) and tests (assertion side) call this helper, so the
+/// `(...)` framing has a single definition.
+pub fn paren_label(label: &str) -> String {
+    format!("({})", label)
+}

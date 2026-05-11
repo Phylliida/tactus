@@ -599,18 +599,19 @@ impl AssertKind {
     /// but `find_span_mark` filters them out so they never
     /// reach the error label path.
     pub fn label(&self) -> &'static str {
+        use vir::tactus_messages::*;
         match self {
             AssertKind::Obligation(o) => match o {
                 ObligationKind::Plain => "",
-                ObligationKind::Postcondition => "postcondition",
-                ObligationKind::LoopInvariant => "loop invariant",
-                ObligationKind::LoopDecrease => "loop decrease",
-                ObligationKind::CallPrecondition => "precondition",
-                ObligationKind::Termination => "termination",
+                ObligationKind::Postcondition => ASSERT_LABEL_POSTCONDITION,
+                ObligationKind::LoopInvariant => ASSERT_LABEL_LOOP_INVARIANT,
+                ObligationKind::LoopDecrease => ASSERT_LABEL_LOOP_DECREASE,
+                ObligationKind::CallPrecondition => ASSERT_LABEL_CALL_PRECONDITION,
+                ObligationKind::Termination => ASSERT_LABEL_TERMINATION,
             },
             AssertKind::Hypothesis(h) => match h {
-                HypothesisKind::LoopCondition => "loop condition",
-                HypothesisKind::BranchCondition => "branch condition",
+                HypothesisKind::LoopCondition => ASSERT_LABEL_LOOP_CONDITION,
+                HypothesisKind::BranchCondition => ASSERT_LABEL_BRANCH_CONDITION,
             },
         }
     }
