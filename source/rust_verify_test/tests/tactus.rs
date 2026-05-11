@@ -8046,3 +8046,425 @@ test_verify_one_file! {
     } => Err(_)
 }
 
+// #127 probe: `continue` in the body doesn't count as a break.
+// Synthetic if-!c break is the only break, count == 1, recovery
+// fires. The continue just skips to the next iteration; natural-
+// exit fact `i >= n` is preserved.
+test_verify_one_file! {
+    #[test] test_exec_loop_isolation_false_continue_recovers verus_code! {
+        #[verifier::tactus_auto]
+        #[verifier::loop_isolation(false)]
+        fn count_with_continue(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r == n
+        {
+            let mut i: u8 = 0;
+            while i < n
+                invariant i <= n
+                decreases n - i
+            {
+                i = i + 1;
+                if i == 50 { continue; }
+            }
+            i
+        }
+    } => Ok(())
+}
+
+// #127 probe: nested loops, BOTH isolation=false, OUTER needs the
+// natural-exit fact. The inner loop's synthetic if-!c break should
+// not poison the outer's break count (count_breaks_targeting_this_loop
+// stops at nested Loop boundaries with inside_nested=true). Both
+// loops should recover independently.
+test_verify_one_file! {
+    #[test] test_exec_loop_isolation_false_nested_both verus_code! {
+        #[verifier::tactus_auto]
+        #[verifier::loop_isolation(false)]
+        fn nested_count(n: u8) -> (r: u8)
+            requires n <= 10
+            ensures r == n
+        {
+            let mut i: u8 = 0;
+            while i < n
+                invariant i <= n
+                decreases n - i
+            {
+                let mut k: u8 = 0;
+                while k < 1
+                    invariant k <= 1
+                    decreases 1 - k
+                {
+                    k = k + 1;
+                }
+                i = i + 1;
+            }
+            i
+        }
+    } => Ok(())
+}
+
+// #127 probe: TWO sequential loops in the same fn, both isolation=
+// false, both needing natural-exit. Recovery is per-loop, so both
+// should independently fire. Post-fn `r == 2*n` requires both
+// `i == n` (from first loop) AND `j == n` (from second).
+test_verify_one_file! {
+    #[test] test_exec_loop_isolation_false_sequential verus_code! {
+        #[verifier::tactus_auto]
+        #[verifier::loop_isolation(false)]
+        fn two_loops_both(n: u8) -> (r: u8)
+            requires n <= 5
+            ensures r == 2 * n
+        {
+            let mut i: u8 = 0;
+            while i < n
+                invariant i <= n
+                decreases n - i
+            {
+                i = i + 1;
+            }
+            let mut j: u8 = 0;
+            while j < n
+                invariant j <= n
+                decreases n - j
+            {
+                j = j + 1;
+            }
+            i + j
+        }
+    } => Ok(())
+}
+
+// #128 probe: COMMUTED form `E == r` (not the canonical `r == E`).
+// `extract_top_level_eq_for` handles both directions; this pins the
+// commuted path. Without commuted support, this would fall through
+// to the ∀-path and likely still verify, but the test asserts the
+// substitution path is exercised.
+test_verify_one_file! {
+    #[test] test_exec_call_ret_eq_commuted verus_code! {
+        fn add_one_commuted(x: u8) -> (r: u8)
+            requires x < 255
+            ensures x + 1 == r
+        {
+            x + 1
+        }
+
+        #[verifier::tactus_auto]
+        fn caller_commuted(x: u8) -> (s: u8)
+            requires x < 200
+            ensures s == x + 1
+        {
+            let y = add_one_commuted(x);
+            y
+        }
+    } => Ok(())
+}
+
+// #128 + #127 interaction probe: function call inside an isolation=
+// false loop body, with the call having a `r == E` ensures. Ret-
+// substitution should work inside the recovered maintain ctx —
+// the maintain ctx provides the outer-ctx hypotheses, and ret-
+// substitution provides `let y := E` in the post-call frames.
+test_verify_one_file! {
+    #[test] test_exec_call_with_ret_eq_inside_isolation_false_loop verus_code! {
+        fn inc(x: u8) -> (r: u8)
+            requires x < 255
+            ensures r == x + 1
+        {
+            x + 1
+        }
+
+        #[verifier::tactus_auto]
+        #[verifier::loop_isolation(false)]
+        fn count_via_call(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r == n
+        {
+            let mut i: u8 = 0;
+            while i < n
+                invariant i <= n
+                decreases n - i
+            {
+                i = inc(i);
+            }
+            i
+        }
+    } => Ok(())
+}
+
+// Mixed path: `&mut s.tup.0` — struct containing a tuple, mutating
+// a tuple slot at depth 2. The path is `[Struct(tup), Tuple(0,2)]`
+// (top-to-bottom); the rebind walks inside-out, building the tuple
+// `(fresh, s.tup.2)` first, then wrapping in `{ s with tup := … }`.
+// Pins that mixed struct-tuple paths work via a single rebind
+// dispatch per step (no separate variant).
+test_verify_one_file! {
+    #[test] test_exec_call_mut_arg_struct_then_tuple verus_code! {
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        struct Holder { tup: (u8, u8) }
+
+        #[verifier::tactus_auto]
+        fn call_struct_tuple_mut(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            let mut h = Holder { tup: (x, 0) };
+            bump(&mut h.tup.0);
+            h.tup.0
+        }
+    } => Ok(())
+}
+
+// Mixed path: `&mut t.0.f` — tuple containing a single-variant
+// struct, mutating a struct field. Path is `[Tuple(0,2), Struct(f)]`
+// (top-to-bottom); rebind builds `{ t.1 with f := fresh }` first
+// then wraps as a tuple `(…, t.2)`.
+test_verify_one_file! {
+    #[test] test_exec_call_mut_arg_tuple_then_struct verus_code! {
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        struct Inner { f: u8 }
+
+        #[verifier::tactus_auto]
+        fn call_tuple_struct_mut(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            let mut t: (Inner, u8) = (Inner { f: x }, 0);
+            bump(&mut t.0.f);
+            t.0.f
+        }
+    } => Ok(())
+}
+
+// Mixed path with sibling preservation: `&mut s.tup.0` where `s`
+// has an extra field `tag` and the tuple has a non-mutated slot.
+// Pins that both the struct's other field AND the tuple's other
+// slot survive the rebind unchanged.
+test_verify_one_file! {
+    #[test] test_exec_call_mut_arg_mixed_path_siblings_preserved verus_code! {
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        struct Holder { tup: (u8, u8), tag: u8 }
+
+        #[verifier::tactus_auto]
+        fn call_mixed_siblings(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1
+        {
+            let mut h = Holder { tup: (x, 99), tag: 7 };
+            bump(&mut h.tup.0);
+            assert(h.tup.1 == 99);  // tuple sibling preserved
+            assert(h.tag == 7);     // struct sibling preserved
+            h.tup.0
+        }
+    } => Ok(())
+}
+
+// #128 probe: `r == E` buried inside disjunction (`P(r) || r == E`).
+// `extract_top_level_eq_for` only walks the top-level And-tree — it
+// does NOT descend into Or. So this should fall through to the ∀-
+// path; the caller verifies via the universally-quantified ret.
+// The disjunction is what the caller uses for the post-call fact.
+test_verify_one_file! {
+    #[test] test_exec_call_ret_eq_in_disjunction_falls_through verus_code! {
+        fn dichotomous(x: u8) -> (r: u8)
+            requires x < 50
+            ensures r == 0 || r == x + 1
+        {
+            x + 1
+        }
+
+        #[verifier::tactus_auto]
+        fn caller_disjunction(x: u8) -> (s: u8)
+            requires x < 50
+            ensures s == 0 || s == x + 1
+        {
+            let y = dichotomous(x);
+            y
+        }
+    } => Ok(())
+}
+
+// #128 probe: TWO `r == E` clauses. `extract_top_level_eq_for` picks
+// the FIRST in source order; the other becomes part of `rest`. Both
+// E1 and E2 are equal in spec semantics (Verus rejects callees whose
+// ensures is inconsistent), but the SUBSTITUTION path picks E1. The
+// remaining clause `r == E2` after substituting becomes `E1 == E2`
+// which is added as a Hyp.
+test_verify_one_file! {
+    #[test] test_exec_call_ret_eq_multiple_first_picked verus_code! {
+        fn duplicate_eq(x: u8) -> (r: u8)
+            requires x < 100
+            ensures r == x + 1, r == 1 + x
+        {
+            x + 1
+        }
+
+        #[verifier::tactus_auto]
+        fn caller_dup_eq(x: u8) -> (s: u8)
+            requires x < 100
+            ensures s == x + 1
+        {
+            let y = duplicate_eq(x);
+            y
+        }
+    } => Ok(())
+}
+
+// Bool-op gap probe (flippable Err): free-var `&&` commutativity.
+// `&&` lowers to Prop `∧` (Tactus renders `bool` as `Prop`
+// unconditionally — see DESIGN.md § "Bool vs Prop"). The goal is
+// `(b1 ∧ b2) = (b2 ∧ b1)` — Prop equality, which needs `propext +
+// And.comm`. `simp_all`'s default set doesn't include `And.comm` (a
+// looping concern for unbounded simp), so this falls through. The
+// transparent user-side fix is to add an explicit tactic — see the
+// `_with_tauto` test below for the canonical shape. Same pattern as
+// `test_exec_xor_bool_free_vars_commutative`; documented additively
+// per DESIGN.md's "canonical pattern for Bool-operation gaps."
+test_verify_one_file! {
+    #[test] test_exec_and_bool_free_vars_commutative_gap verus_code! {
+        #[verifier::tactus_auto]
+        fn check_and_commute(b1: bool, b2: bool) {
+            assert((b1 && b2) == (b2 && b1));
+        }
+    } => Err(_)
+}
+
+// Bool-op recovery probe: the user-side fix for the `_gap` above.
+// `simp_all [And.comm]` closes the Prop equality. `simp_all`'s
+// `=`-to-`↔` reduction strips one layer, and the explicit
+// `And.comm` lemma closes the remaining `b1 ∧ b2 ↔ b2 ∧ b1`. The
+// proof is visible at the assertion site, matching the
+// transparency-over-automation principle. Same shape as the
+// canonical `Bool.xor_comm` pattern (DESIGN.md § "Bool vs Prop").
+test_verify_one_file! {
+    #[test] test_exec_and_bool_free_vars_commutative_with_simp verus_code! {
+        #[verifier::tactus_auto]
+        fn check_and_commute(b1: bool, b2: bool) {
+            assert((b1 && b2) == (b2 && b1)) by { simp_all [And.comm] };
+        }
+    } => Ok(())
+}
+
+// Bool-op gap probe (flippable Err): free-var `||` commutativity.
+// Same shape as the `&&` gap — `Or.comm` not in default simp set.
+test_verify_one_file! {
+    #[test] test_exec_or_bool_free_vars_commutative_gap verus_code! {
+        #[verifier::tactus_auto]
+        fn check_or_commute(b1: bool, b2: bool) {
+            assert((b1 || b2) == (b2 || b1));
+        }
+    } => Err(_)
+}
+
+// Bool-op recovery probe: `||` commutativity via `simp_all [Or.comm]`.
+// Same shape as the `And.comm` recovery — the explicit lemma at the
+// assertion site closes the Prop-equality goal.
+test_verify_one_file! {
+    #[test] test_exec_or_bool_free_vars_commutative_with_simp verus_code! {
+        #[verifier::tactus_auto]
+        fn check_or_commute(b1: bool, b2: bool) {
+            assert((b1 || b2) == (b2 || b1)) by { simp_all [Or.comm] };
+        }
+    } => Ok(())
+}
+
+// Bool-op gap probe (flippable Err): De Morgan's law. Tests the
+// canonical Boolean identity `¬(a ∧ b) = (¬a ∨ ¬b)` for free vars.
+// Same Prop-equality gap as the commutativity probes. No single
+// `simp_all [lemma]` closes this without Mathlib (`not_and_or` is
+// in Mathlib); the user-side recovery uses `by_cases` instead —
+// see `_with_by_cases` below.
+test_verify_one_file! {
+    #[test] test_exec_demorgan_bool_free_vars_gap verus_code! {
+        #[verifier::tactus_auto]
+        fn check_demorgan(b1: bool, b2: bool) {
+            assert(!(b1 && b2) == (!b1 || !b2));
+        }
+    } => Err(_)
+}
+
+// Bool-op recovery probe: De Morgan via `by_cases` on both vars,
+// followed by `simp_all`. Closes via finite case analysis — at
+// each leaf the goal becomes a concrete Prop equality that simp_all
+// reduces. Works in Lean core (no Mathlib needed). Less elegant than
+// `tauto` would be, but transparent.
+test_verify_one_file! {
+    #[test] test_exec_demorgan_bool_free_vars_with_by_cases verus_code! {
+        #[verifier::tactus_auto]
+        fn check_demorgan(b1: bool, b2: bool) {
+            assert(!(b1 && b2) == (!b1 || !b2)) by {
+                by_cases hb1 : b1 <;> by_cases hb2 : b2 <;> simp_all
+            };
+        }
+    } => Ok(())
+}
+
+
+// #128 probe: `r == E` where E itself contains a binder (`r ==
+// (if x > 0 { x } else { 0 })`). The substitution path replaces ret
+// with the whole conditional. The conditional's bound vars should
+// be alpha-renamed by `substitute` if there's a clash; this exercises
+// that mentions_free_var on the bind-bound vars works correctly.
+test_verify_one_file! {
+    #[test] test_exec_call_ret_eq_with_if_rhs verus_code! {
+        fn conditional_val(x: u8) -> (r: u8)
+            ensures r == (if x > 0 { x } else { 0 })
+        {
+            if x > 0 { x } else { 0 }
+        }
+
+        #[verifier::tactus_auto]
+        fn caller_cond_rhs(x: u8) -> (s: u8)
+            ensures s == (if x > 0 { x } else { 0 })
+        {
+            let y = conditional_val(x);
+            y
+        }
+    } => Ok(())
+}
+
+// Whole-tuple-value mutation via struct field: `&mut h.tup` where
+// `tup: (u8, u8)`. The L-value's outer Field is `Dt::Path` (single-
+// variant struct), and the inner is just the Var(h). No tuple at
+// a Field level — should be handled by the single-variant struct
+// path. The callee mutates the whole tuple value.
+test_verify_one_file! {
+    #[test] test_exec_call_mut_arg_whole_tuple_field verus_code! {
+        fn swap_tup(t: &mut (u8, u8))
+            ensures *t == (old(t).1, old(t).0)
+        {
+            let tmp = t.0;
+            t.0 = t.1;
+            t.1 = tmp;
+        }
+
+        struct Holder { tup: (u8, u8) }
+
+        #[verifier::tactus_auto]
+        fn call_whole_tuple_mut(a: u8, b: u8) -> (r: u8)
+            ensures r == a
+        {
+            let mut h = Holder { tup: (a, b) };
+            swap_tup(&mut h.tup);
+            h.tup.1
+        }
+    } => Ok(())
+}
+
