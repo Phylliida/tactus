@@ -397,12 +397,11 @@ fn get_proof_note_label(span: Span, attrs: &Option<Box<[AttrTree]>>) -> Result<&
 /// `get_rlimit_arg`'s shape so malformed invocations (`heartbeats()`,
 /// `heartbeats(1.5)`, `heartbeats(1, 2)`, `heartbeats("foo")`, or
 /// any value that doesn't parse as a positive u32) get a specific
-/// error message rather than falling through to the generic
-/// "unrecognized verifier attribute" catch-all.
+/// error message (the shared constant `vir::tactus_messages::HEARTBEATS_ARG_ERR`)
+/// rather than falling through to the generic "unrecognized verifier
+/// attribute" catch-all.
 fn get_heartbeats_arg(span: Span, attrs: &Option<Box<[AttrTree]>>) -> Result<u32, VirErr> {
-    let err_fn = || err_span(span,
-        "heartbeats requires a positive integer literal \
-         (e.g., #[verifier::heartbeats(1600000)])");
+    let err_fn = || err_span(span, vir::tactus_messages::HEARTBEATS_ARG_ERR);
     match attrs.as_deref() {
         Some([AttrTree::Lit(LitKind::Integer, text)]) => {
             match text.parse::<u32>() {

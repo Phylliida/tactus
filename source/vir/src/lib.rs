@@ -42,6 +42,7 @@ mod closures;
 pub mod context;
 pub mod datatype_to_air;
 pub mod def;
+pub mod tactus_messages;
 mod early_exit_cf;
 pub mod expand_errors;
 pub mod headers;

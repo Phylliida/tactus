@@ -2443,6 +2443,34 @@ this asks about untested BUG CLASSES. *Canonical hit*: `&mut` +
 trait/impl differing-param-names interaction wasn't tested after
 #86's union-key landing — added `test_exec_call_trait_mut_differing_param_names`.
 
+**15. Magic-string lens.** *For every string literal that appears in
+two or more places with shared semantic intent, is it a `pub const`
+referenced from all sites — or duplicated as a magic string?* Tests
+asserting on error-message text are the canonical offender: the
+error site and the test share the *meaning* of the message, so
+phrasing edits should percolate from one to the other automatically.
+The fix is a shared `pub const` (Tactus puts user-facing messages in
+`vir::tactus_messages`); the anti-pattern is `.contains("the exact
+phrasing I wrote in the error site")` in tests, which silently breaks
+or — worse — silently tests something different when the error text
+is edited.
+
+*Categories the lens distinguishes:*
+* **Tactus-controlled strings** (error messages we emit, theorem-name
+  prefixes, attribute names) → extract `pub const`, reference from
+  both emission and assertion.
+* **Upstream-emitted strings** (Lean diagnostics like `"unsolved
+  goals"`, Verus errors like `"postcondition"`) → outside our control;
+  use stable substrings that survive upstream phrasing edits.
+* **Dynamic-content strings** (e.g., `format!("got '{}'...", value)`) →
+  extract a stable tag prefix as a `pub const`, use as the search
+  substring; the dynamic part composes with it.
+
+*Canonical hit*: the heartbeats error message was inline in both
+`get_heartbeats_arg` and the negative test. Extracted to
+`vir::tactus_messages::HEARTBEATS_ARG_ERR` (#123 review-pass,
+2026-05-11) — phrasing edits now percolate to the test automatically.
+
 #### Process
 
 Land the work with tests passing, then run lenses 1–5 minimum.
@@ -2451,7 +2479,7 @@ Triage each finding (fix now / file follow-up / skip), do the
 Update this document for any caveat, deferral, or new lens that
 surfaced.
 
-When time allows, also run lenses 6–14. Even on code that passed
+When time allows, also run lenses 6–15. Even on code that passed
 the core 5, additional lenses surface findings (today's session:
 6 lenses run, 6 cleanup commits, 1 real bug found by the
 edge-case lens). The lens list isn't exhaustive — when a review
