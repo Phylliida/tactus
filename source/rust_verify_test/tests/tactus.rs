@@ -6248,6 +6248,44 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Same shape as `test_exec_match_enum` but with the proof control
+// shifted from `tactus_case_split` (the default closer's rung) to a
+// user-explicit per-arm `proof { cases k with | ... }` block. This
+// is the canonical *inline per-case proof* shape — Lean's native
+// `cases ... with | Foo x => tac | Bar y => tac` syntax goes through
+// `proof { }` verbatim (FileLoader passes tactic text through), so
+// each arm's tactic discharges only that arm's subgoal.
+//
+// Available today without code changes. Use it when:
+// (a) `tactus_auto` can't close the match-fn obligation (often
+//     because branches need different tactics), or
+// (b) you want the per-case reasoning visible at the proof level
+//     rather than hidden inside the default closer.
+//
+// `tactus_case_split` stays in the default closer for the common
+// case (user writes `match k { ... }` and expects it to verify);
+// this test pins the user-explicit alternative as a parallel option.
+test_verify_one_file! {
+    #[test] test_exec_match_enum_with_per_arm_proof verus_code! {
+        enum Kind { Foo(u8), Bar(u8) }
+
+        #[verifier::tactus_auto]
+        fn kind_value_per_arm(k: Kind) -> (r: u8)
+            ensures r <= 100
+        {
+            proof {
+                cases k with
+                | Foo x => simp_all; split <;> omega
+                | Bar y => simp_all; split <;> omega
+            }
+            match k {
+                Kind::Foo(x) => if x <= 100 { x } else { 0 },
+                Kind::Bar(y) => if y <= 100 { y } else { 0 },
+            }
+        }
+    } => Ok(())
+}
+
 // Match with ensures that reason about variant-specific fields.
 // Exercises that `tactus_case_split` composes correctly with a
 // non-trivial post-condition — not just pattern closure.
