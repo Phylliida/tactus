@@ -2623,6 +2623,10 @@ fn stm_to_stmts(ctx: &Ctx, state: &mut State, stm: &Stm) -> Result<Vec<Stmt>, Vi
             id,
             label,
             cond,
+            // Tactus-specific (#127); AIR's encoding reads only the
+            // post-conversion `cond`. Bind explicitly to honor the
+            // upstream-robustness pattern (no `..` in StmX matches).
+            original_cond: _,
             body,
             invs,
             decrease,

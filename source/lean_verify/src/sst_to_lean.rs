@@ -3626,6 +3626,7 @@ fn build_wp<'a>(
             id,
             label,
             cond,
+            original_cond,
             body,
             invs,
             decrease,
@@ -3637,6 +3638,7 @@ fn build_wp<'a>(
             *id,
             label,
             cond,
+            original_cond,
             body,
             invs,
             decrease,
@@ -4324,6 +4326,7 @@ fn build_wp_loop<'a>(
     id: u64,
     label: &'a Option<String>,
     cond: &'a Option<(Stm, Exp)>,
+    original_cond: &'a Option<(Stm, Exp)>,
     body: &'a Stm,
     invs: &'a vir::sst::LoopInvs,
     decrease: &'a vir::sst::Exps,
@@ -4337,19 +4340,28 @@ fn build_wp_loop<'a>(
     // Names finalised once we know `decrease.len()` after validation.
     // See `expr_shared.rs`'s "Reserved identifier conventions" —
     // Convention 1 + the gensym-mechanism-choice note.
-    if !loop_isolation {
-        // `loop_isolation` is set by Verus based on whether the loop
-        // body is verified independently from the outer context.
-        // Users don't control it directly — it's flipped by Verus
-        // when, e.g., the loop appears inside a closure or a context
-        // that would otherwise unsoundly leak invariants.
-        return Err(
-            "this loop's body would need to see outer context directly \
-             (loop_isolation: false) — not yet supported by tactus_auto. \
-             Workaround: refactor to a self-contained loop with explicit \
-             invariants.".to_string()
-        );
-    }
+    // `loop_isolation` defaults to true; users opt out via
+    // `#[verifier::loop_isolation(false)]` on a loop, fn, module, or
+    // crate. The false mode lets the body see the outer function's
+    // context directly without restating it in invariants — useful
+    // when invariants would be tedious to restate.
+    //
+    // Tactus's per-obligation encoding handles both modes uniformly:
+    // every emitted theorem inherits the full accumulated `OblCtx`
+    // (fn params, fn requires, prior lets/hyps), so the body's
+    // obligations always see the outer ctx. The mod_vars are still
+    // quantified-over (havoc'd) inside the body's ctx via
+    // `push_mod_var_frames`, matching both Verus modes' "the
+    // iteration could be any one" treatment.
+    //
+    // For `#127`'s acceptance of isolation=false, no encoding change
+    // is needed — Tactus's body/after ctx is already isolation=false-
+    // shaped. Tactus is therefore strictly more permissive than
+    // Verus's isolation=true (proofs that rely on outer ctx beyond
+    // what invs cover still verify in Tactus). Not unsoundness; the
+    // outer ctx hyps are true facts. See DESIGN.md § "Loop-shape
+    // restrictions".
+    let _ = loop_isolation; // both modes accepted; flag preserved for future divergence
     // `cond: Some` — simple `while c { … }` (no breaks) — the
     // classical form where body re-enters when c holds and exits
     // when ¬c.
@@ -4390,10 +4402,55 @@ fn build_wp_loop<'a>(
     //     it (so walk_loop doesn't push twice).
     //   * `cond_setup_wrap: Option<(&Stm, Validated, LExpr)>` —
     //     `Some` triggers the post-build wrap below.
+    // For Tactus #127: when `cond` is None but `original_cond` is Some,
+    // Verus's break-lowering converted the while loop to a `loop { if
+    // !c { break; } body }` shape. The body still has the if-not-c-
+    // break inserted at body[0..1], but for Tactus's WP encoding we
+    // can use the cond:Some path: walk_loop pushes `c` in maintain
+    // (under which the body's inserted if-not-c-break's then-branch is
+    // contradictorily unreachable, so its obligation discharges
+    // vacuously) and pushes `¬c` in use_obl (recovering the natural-
+    // exit fact). This matches Verus's isolation=false semantics for
+    // post-loop reasoning.
+    //
+    // **Soundness gate (single-break check)**: Verus's lowering inserts
+    // exactly one break (the if-not-c-break). If the user's body had
+    // its own break(s), Verus preserves them alongside the inserted
+    // one. In that case, push `¬c` post-loop would be unsound — user
+    // breaks may fire when `c` is still true. We refuse the recovery
+    // when the body has more than one break targeting this loop;
+    // fall through to cond:None encoding (user must encode post-loop
+    // facts via `allow_complex_invariants` + loop `ensures`).
+    //
+    // We also gate on:
+    //   * unlabeled loop (label.is_none()) — labeled loops require
+    //     cross-label break counting, deferred for future work
+    //   * empty cond_setup in `original_cond` — non-empty cond_setup
+    //     (cond with calls/short-circuits) would need scoping work
+    let effective_cond: &'a Option<(Stm, Exp)> = match (cond, original_cond) {
+        (Some(_), _) => cond,
+        (None, Some(orig)) => {
+            let (orig_setup, _orig_exp) = orig;
+            let setup_empty = matches!(&orig_setup.x, StmX::Block(ss) if ss.is_empty());
+            if label.is_none()
+                && setup_empty
+                && count_breaks_targeting_this_loop(body, label.as_deref()) == 1
+            {
+                // Recovery path: use original_cond as if cond:Some.
+                original_cond
+            } else {
+                // Fall through to cond:None encoding. User must
+                // restate post-loop facts in invariants/ensures.
+                cond
+            }
+        }
+        (None, None) => cond,
+    };
+
     let (cond_exp_opt, cond_setup_wrap): (
         Option<Validated<'a>>,
         Option<(&'a Stm, Validated<'a>, LExpr)>,
-    ) = match cond {
+    ) = match effective_cond {
         None => (None, None),
         Some((cond_setup, cond_exp)) => {
             let cond_validated = crate::to_lean_sst_expr::Validated::check(cond_exp)?;
@@ -4651,6 +4708,60 @@ fn collect_modifications<'a>(
         StmX::Loop { body, .. } => collect_modifications(body, locally_declared, out),
         _ => {}
     }
+}
+
+/// Count `BreakOrContinue { is_break: true }` statements in `body`
+/// that target THIS loop. Used by `build_wp_loop`'s `original_cond`
+/// recovery (Tactus #127) — we can only treat Verus's break-lowered
+/// while as a cond:Some shape if the inserted break (the one Verus's
+/// lowering put at body[0..1]) is the ONLY break targeting this loop.
+///
+/// Targeting rules:
+/// * Unlabeled break inside this loop (not inside a nested loop) →
+///   targets this loop. Counts.
+/// * Unlabeled break inside a nested loop → targets the nested loop.
+///   Does NOT count for the outer.
+/// * Labeled break with this loop's label → targets this loop. Counts.
+/// * Labeled break with a different label → targets some outer loop.
+///   Does NOT count.
+///
+/// `this_loop_label` is the current loop's label (None if unlabeled).
+/// `inside_nested_loop` is the state we track during recursion.
+fn count_breaks_targeting_this_loop(body: &Stm, this_loop_label: Option<&str>) -> usize {
+    fn walk(stm: &Stm, this_label: Option<&str>, inside_nested: bool) -> usize {
+        match &stm.x {
+            StmX::BreakOrContinue { label, is_break } => {
+                if !*is_break {
+                    return 0;
+                }
+                match (label.as_deref(), this_label) {
+                    (None, _) => {
+                        // Unlabeled break targets innermost enclosing
+                        // loop. Counts only if we're not in a nested loop.
+                        if inside_nested { 0 } else { 1 }
+                    }
+                    (Some(l), Some(this_l)) if l == this_l => 1,
+                    _ => 0, // labeled break for some other loop
+                }
+            }
+            StmX::Block(stms) => {
+                stms.iter().map(|s| walk(s, this_label, inside_nested)).sum()
+            }
+            StmX::If(_, t, e) => {
+                let tc = walk(t, this_label, inside_nested);
+                let ec = e.as_ref().map_or(0, |e| walk(e, this_label, inside_nested));
+                tc + ec
+            }
+            StmX::Loop { body, .. } => {
+                // Inside a nested loop: unlabeled breaks target the
+                // nested loop, but labeled ones with `this_label`
+                // still target us.
+                walk(body, this_label, true)
+            }
+            _ => 0,
+        }
+    }
+    walk(body, this_loop_label, false)
 }
 
 fn extract_simple_var_ident<'a>(e: &'a Exp) -> Option<&'a VarIdent> {
