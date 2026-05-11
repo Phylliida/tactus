@@ -2706,8 +2706,8 @@ test_verify_one_file! {
         }
     } => Ok(err) => {
         assert!(
-            err.warnings.iter().any(|w| w.message.contains("unproved assumption")
-                || w.message.contains("assume(P)")),
+            err.warnings.iter().any(|w|
+                w.message.contains(vir::tactus_messages::ASSUME_WARNING_TAG)),
             "expected an unproved-assumption warning, got: {:?}",
             err.warnings.iter().map(|w| &w.message).collect::<Vec<_>>(),
         );
