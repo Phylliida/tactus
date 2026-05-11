@@ -3598,6 +3598,105 @@ diff. Findings:
 
 Test count 319 → 320 e2e (+1 from review-pass regression test).
 
+#### Current session (2026-05-10 — body-assert pattern + #148 prototype rejection)
+
+After yesterday's review pass closed #147, the morning continuation
+followed up on the spec-fns-in-goal-position concern and then ran
+into a meta-question about whether to extend Tactus's surface syntax.
+
+**Try-unfold workaround pinned.** Yesterday's catalogue entry
+recommended `proof { unfold f }` as the workaround for spec fns in
+goal position. Probe established that's incomplete — the tactic-prefix
+mechanism applies to every theorem in the fn, including ones whose
+goals don't mention `f` (e.g., the first invariant init theorem
+`i ≤ n`). Bare `unfold f` fails with "Tactic unfold failed to unfold
+f" on those. The actual workaround needs `try unfold f`. Pinned by
+`test_exec_loop_invariant_with_spec_call_try_unfold`; DESIGN.md
+catalogue entry corrected. Same pattern as yesterday's multi-line def
+probe — workaround shape was a guess, never verified. Test count
+320 → 321 e2e (+1).
+
+**Body-assert pattern as the alternative.** Probed whether the user
+can discharge a loop-invariant maintain obligation by placing
+`assert(invariant_expr) by { simp_all [f] };` at the right point in
+the body. Works — assert at end-of-body (post-assignment, so `i` is
+post-iter value) puts the asserted hypothesis in MAINTAIN's OblCtx;
+the obligation's goal closes via the asserted hyp. `simp_all [f]` is
+the canonical complete-proof shape (intros + unfold + close). Pinned
+by `test_exec_body_assert_discharges_invariant`. DESIGN.md catalogue
+now lists BOTH workarounds (body-assert + try-unfold prefix) with the
+trade-off (targeted vs uniform). Test count 321 → 322 e2e (+1).
+
+**Substrate-vs-surface exploration.** User asked why Lean needs
+per-obligation proof attachment when Z3 didn't. Answer: Z3's
+automation is global+aggressive search (one global `reveal_with_fuel`
+knob, fuel-bounded saturation handles unfolding implicitly); Lean's
+tactics are local+deterministic (one goal at a time, you ask for
+exactly what you want). Per-obligation matters in Lean because every
+obligation is its own little world. Verus's surface has ALWAYS had
+tactic-attachment syntax (`assert(P) by { tac }`, `recommends ... via
+Expr`, etc.) — Z3 just didn't make most of it load-bearing. Captured
+in poem "What Z3 hid."
+
+**#148 prototype and rejection.** User suggested extending the surface
+syntax: `invariant P by { tac },` would attach a tactic directly to
+the invariant clause, more readable than body-assert. Explored four
+implementation paths:
+- **Stage 0 (parser change)** — added `Specification.tactics: Vec<Option<TacticBy>>`
+  parallel array in syn-verus, gated on Context::Expr to avoid hijacking
+  fn-signature `by { fn_tactic }`. Landed cleanly with sanity tests.
+- **Stage 1 (proc-macro desugaring)** — visit_expr_while_mut would
+  synthesize `assert(P) by { tac };` body-assert stmts (before loop
+  for INIT, end of body for MAINTAIN), reusing existing assert-by
+  machinery. Implementation hit a parser interaction we didn't fully
+  diagnose: simple test cases that worked under Stage 0 alone failed
+  when Stage 1's syntax.rs changes were added.
+- **Stages 2+ (pipeline threading)** — sketched: VIR `LoopInvariant`
+  gains a tactic field threaded through proc-macro → rust_to_vir →
+  SST → sst_to_lean. Estimated ~150-250 lines across 5-6 files
+  including VIR shape change.
+- **Roll back to body-assert** — user said "I think you're right that
+  we shouldn't be adding extra syntax, the better thing is not to do
+  it."
+
+Full revert: Stage 0 parser change, sanity tests, defer-doc all
+reverted. Body-assert remains the documented recommendation. DESIGN.md
+gained "Considered surface extensions (rejected)" subsection
+recording what we tried, why we stepped back, and four specific
+conditions that would shift the cost-benefit if revisited.
+
+Captured in poems "Two ways to be minimal" (typed shape vs smallest-
+disturbance — they don't always agree) and "What Z3 hid."
+
+**Session-end review pass.** Ran lenses 1/4/5/14 against the
+surviving session changes:
+- *Lens 5*: `fn_binders_with_bounds` comment said "both paths need to
+  agree" — stale after #147 added a third path (spec_fn) that
+  deliberately diverges. Updated to enumerate all three callers.
+- *Lens 4*: DESIGN.md #148 rejection entry referenced two test names
+  that were reverted; added clarifier noting they're forensic-only.
+- *Lens 14*: #147 bug class 2 (spec_fn_to_ast bound hyps) only tested
+  with u8; structurally generalizes to all fixed-width ints. Not
+  chased — fix is type-uniform; a test wouldn't deepen confidence.
+- *Lens 1*: `seed_worklist`'s parameter is named `proof_fns` but
+  accepts any root fn (proof or exec). Pre-existing misnomer, not
+  introduced by #147. Left for future cleanup.
+
+**Net for the day:**
+- Test count: 320 → 322 e2e (+2: try-unfold, body-assert).
+- Task #148 marked completed (rejected after prototype).
+- Code touched and surviving: only the 2 new tests + DESIGN.md
+  additions (catalogue workarounds + #148 rejection rationale + review
+  doc fixes). Everything else was reverted.
+- 3 poems for the day: "What Z3 hid," "Two ways to be minimal," plus
+  yesterday's "The interventions" referenced.
+
+**The arc:** most of today's "work" was learning that the syntax
+extension wasn't worth doing. The body-assert mechanism is fully
+expressive; the parser-extension's value was purely readability. The
+detour confirmed it the hard way. The lessons in today's poems and
+DESIGN's #148 rejection note carry the learning forward.
+
 ## Architecture
 
 ### Full pipeline
