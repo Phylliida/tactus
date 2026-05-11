@@ -493,6 +493,23 @@ Axioms 3-4 are a configuration parameter — sound as long as `--target` matches
 
 Cross-crate declarations (see below) add axioms for externally-verified theorems. Each is sound assuming the source crate verified correctly and the translation was correct.
 
+### Classical-logic commitment
+
+Tactus is **fully classical**. `TactusPrelude.lean` opens `Classical.propDecidable` as an instance, making every `Prop` decidable. This commits us to a Lean kernel with excluded middle, axiom of choice, and double-negation elimination available — equiconsistent with intuitionistic + classical axioms, no additional soundness risk (Lean's kernel already supports these).
+
+Tactus inherits this commitment from Verus: Verus's Z3 backend reasons classically, and Verus's spec semantics implicitly assume classical logic for `choose`, `exists`, and bounded-quantifier reasoning. Tactus matching Verus's commitment is continuity, not a regression.
+
+**What classical gives users (and Tactus's codegen):**
+* **Excluded middle.** `Classical.em P` proves `P ∨ ¬P` for any spec-level proposition. Pinned by `test_proof_classical_excluded_middle`.
+* **Decidability for if/match.** Match-defined discriminator Props from synthesized `Type.isVariant` decide in `if <prop> then …` contexts. Without `Classical.propDecidable`, the `if` elaborator can't resolve the `[Decidable P]` instance and elaboration fails.
+* **Total epsilon for `Choose`.** `BinaryOp::Bind(BndX::Choose, …)` renders to `Classical.epsilon (fun … => cond ∧ body)`, which returns *some* witness satisfying the predicate without requiring an existence proof. Used by Verus's `choose|x| P(x)` spec idiom.
+* **Total accessor fallbacks.** Multi-variant enum accessors (`Type.Foo_val0 : Type → FieldTy`) use `match x with | Type.Foo v _ => v | _ => Classical.arbitrary _` for the unreachable-other-variant cases. `Classical.arbitrary` requires `[Nonempty α]`, which holds for all primitive types Tactus actually emits accessors on.
+* **`Seq.index` existence.** The prelude's `opaque index` is justified by `Classical.choice` (any total function `List α × Nat → α` agreeing with `List.get` in-bounds satisfies our axioms).
+
+**Cost of classical:** `decide` won't reduce a `Classical.propDecidable`-derived `Decidable P` instance through to a concrete truth value, because the decision procedure is `Classical.choice`-based rather than constructive. `tactus_auto`'s ladder uses `omega` / `simp_all` rather than `decide` for free-var goals, so this rarely bites. When it does, the user can write `by_cases` or `Classical.em` in a `proof { }` block explicitly.
+
+**Why this isn't a transparency violation.** Classical logic is *substrate*, not behavior. It's in the same category as `arch_word_bits` or `Seq.index` — invisible at use sites because it's foundational, not because Tactus is doing something the user can't see. Audited 2026-05-11 (#151); confirmed all four uses are load-bearing and appropriate to Tactus's spec-first model. The audit's deliverable was this section — visibility at the document level rather than at the use site.
+
 All other prelude definitions are `def` (computable, no trust needed).
 
 ### Spec fn translation

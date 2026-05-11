@@ -1331,6 +1331,28 @@ test_verify_one_file! {
 
 // === Complex proofs ===
 
+// Pin that Tactus has access to classical excluded middle.
+// `TactusPrelude.lean` opens `Classical.propDecidable` as an instance,
+// which is the foundational commitment that makes match-on-Prop
+// discriminators, `Classical.epsilon` (Choose's render target), and
+// `Classical.arbitrary` (accessor unreachable-branch fallback) all
+// elaborate. This test makes the commitment visible at the user level:
+// `Classical.em P` proves `P ∨ ¬P` for any spec-level proposition.
+//
+// Tactus inherits classical from Verus (Z3 reasons classically); users
+// coming from Verus's verification model expect this. Audit (#151,
+// 2026-05-11): keep the commitment, document it centrally, pin it with
+// this test.
+test_verify_one_file! {
+    #[test] test_proof_classical_excluded_middle verus_code! {
+        proof fn em_test(P: bool)
+            ensures P || !P
+        by {
+            exact Classical.em P
+        }
+    } => Ok(())
+}
+
 // Multi-step proof with have
 test_verify_one_file! {
     #[test] test_proof_with_have verus_code! {
