@@ -1374,7 +1374,7 @@ test_verify_one_file! {
         by {
             trivial
         }
-    } => Err(e) => assert!(format!("{:?}", e).contains("heartbeats requires a positive integer literal"))
+    } => Err(e) => assert!(format!("{:?}", e).contains(vir::tactus_messages::HEARTBEATS_ARG_ERR))
 }
 
 // Multi-theorem exec fn: loop body emits init / maintain / use
