@@ -1362,7 +1362,10 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Negative test: zero or non-integer heartbeats values are rejected.
+// Negative tests: malformed heartbeats invocations get a heartbeats-
+// specific error message (via the `get_heartbeats_arg` helper) rather
+// than falling through to the generic "unrecognized verifier attribute"
+// catchall.
 test_verify_one_file! {
     #[test] test_heartbeats_zero_rejected verus_code! {
         #[verifier::heartbeats(0)]
@@ -1371,7 +1374,32 @@ test_verify_one_file! {
         by {
             trivial
         }
-    } => Err(e) => assert!(format!("{:?}", e).contains("heartbeats argument must be a positive integer"))
+    } => Err(e) => assert!(format!("{:?}", e).contains("heartbeats requires a positive integer literal"))
+}
+
+// Multi-theorem exec fn: loop body emits init / maintain / use
+// theorems (per-obligation emission, task D). All of them inherit
+// the fn's heartbeats override through `ObligationEmitter::heartbeats`.
+// Pins that the override applies uniformly across every theorem the
+// fn produces, not just the postcondition.
+test_verify_one_file! {
+    #[test] test_exec_heartbeats_multi_theorem verus_code! {
+        #[verifier::tactus_auto]
+        #[verifier::heartbeats(1200000)]
+        fn count_to_n(n: u8) -> (r: u8)
+            requires n <= 100
+            ensures r == n
+        {
+            let mut i: u8 = 0;
+            while i < n
+                invariant i <= n
+                decreases n - i
+            {
+                i = i + 1;
+            }
+            i
+        }
+    } => Ok(())
 }
 
 // Pin that Tactus has access to classical excluded middle.

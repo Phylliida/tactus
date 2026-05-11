@@ -393,6 +393,27 @@ fn get_proof_note_label(span: Span, attrs: &Option<Box<[AttrTree]>>) -> Result<&
     Ok(label)
 }
 
+/// Get the `N` part out of `#[verifier::heartbeats(N)]`. Mirrors
+/// `get_rlimit_arg`'s shape so malformed invocations (`heartbeats()`,
+/// `heartbeats(1.5)`, `heartbeats(1, 2)`, `heartbeats("foo")`, or
+/// any value that doesn't parse as a positive u32) get a specific
+/// error message rather than falling through to the generic
+/// "unrecognized verifier attribute" catch-all.
+fn get_heartbeats_arg(span: Span, attrs: &Option<Box<[AttrTree]>>) -> Result<u32, VirErr> {
+    let err_fn = || err_span(span,
+        "heartbeats requires a positive integer literal \
+         (e.g., #[verifier::heartbeats(1600000)])");
+    match attrs.as_deref() {
+        Some([AttrTree::Lit(LitKind::Integer, text)]) => {
+            match text.parse::<u32>() {
+                Ok(n) if n > 0 => Ok(n),
+                _ => err_fn(),
+            }
+        }
+        _ => err_fn(),
+    }
+}
+
 /// Get the `42` part out of an attribute like `#[rlimit(42)]`
 fn get_rlimit_arg(span: Span, attrs: &Option<Box<[AttrTree]>>) -> Result<f32, VirErr> {
     let err_fn = || err_span(span, "expected number, or `infinity` for rlimit");
@@ -661,16 +682,12 @@ pub(crate) fn parse_attrs(
                     v.push(Attr::TactusTactic(tac.clone()));
                 }
                 // Tactus: per-fn maxHeartbeats override. Argument must
-                // be a positive integer; emitted as `set_option
-                // maxHeartbeats N in` before each theorem from this fn.
-                AttrTree::Fun(span, name, Some(box [AttrTree::Lit(LitKind::Integer, text)]))
-                    if name == "heartbeats" =>
-                {
-                    match text.parse::<u32>() {
-                        Ok(n) if n > 0 => v.push(Attr::TactusHeartbeats(n)),
-                        _ => return err_span(*span,
-                            "heartbeats argument must be a positive integer"),
-                    }
+                // be a positive integer literal; emitted as
+                // `set_option maxHeartbeats N in` before each theorem
+                // from this fn.
+                AttrTree::Fun(span, name, attrs) if name == "heartbeats" => {
+                    let number = get_heartbeats_arg(*span, attrs)?;
+                    v.push(Attr::TactusHeartbeats(number));
                 }
                 AttrTree::Fun(span, name, attrs) if name == "rlimit" => {
                     let number = get_rlimit_arg(*span, attrs)?;
