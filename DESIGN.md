@@ -1486,17 +1486,37 @@ exec fns."
      Generic types skip this — would need `[Inhabited A]`
      bounds we don't thread.
 
-     **Future polish — accuracy:** we currently over-derive,
-     emitting `deriving Inhabited` on every non-generic datatype
-     even when no accessor's `default` fallback is reachable in
-     practice (e.g., a single-variant struct never needs the
-     fallback because its accessor is total). Lean's derive is
-     cheap and over-deriving is harmless, so this hasn't been a
-     problem; if/when we hit a datatype whose Inhabited
-     derivation Lean rejects (zero-variant enums, recursively-
-     uninhabitable shapes), narrow the gate to "emit only when
-     a multi-variant accessor with a non-Inhabited field type
-     exists."
+     **Audited 2026-05-11 (#150) — keep as-is.** The earlier
+     framing called this "over-deriving" with reference to
+     single-variant types not needing the accessor `default`
+     fallback. The audit revised that framing: `Inhabited` is
+     more broadly load-bearing than just accessor synthesis.
+     `GetElem!`-style indexing (`xs[i]!` for `BinaryOp::Index`
+     and `s.data[i.toNat]!` in `Tactus.strGetChar`) also
+     requires `[Inhabited α]` on the element type. Any user
+     datatype that ever flows through panic-on-OOB indexing
+     needs the instance — including single-variant structs.
+     So the "over" in over-deriving was the conservative case,
+     not the necessary case.
+
+     Visibility audit: the `deriving Inhabited` clause IS
+     visible in the generated `.lean` (user can read it). User
+     doesn't write it, but the result isn't hidden — same
+     category as auto-emitted accessor fns or `T.height`
+     companion fns. Substrate-class auto-emission, documented
+     here.
+
+     **If narrowing ever becomes necessary** (e.g., a user
+     datatype whose Inhabited derivation Lean rejects —
+     zero-variant enums are Verus-upstream-blocked; recursively
+     uninhabitable shapes are theoretically possible but
+     would also break the user's exec code that constructs
+     them), the gate would be: emit when (a) multi-variant
+     with non-Inhabited-derivable field types, OR (b) any field
+     position reaches `BinaryOp::Index` / `Tactus.strGetChar`
+     downstream. The (b) gate requires cross-fn analysis
+     making the narrowing non-trivial — another reason the
+     unconditional emit stays.
 
   **Known interaction with #58 (match automation):** pinned by
   `test_exec_call_recursive_datatype_termination` — recursive
