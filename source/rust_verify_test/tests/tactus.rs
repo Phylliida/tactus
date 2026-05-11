@@ -8502,3 +8502,69 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// `assert(P) by(nonlinear_arith);` — multiplicative commutativity.
+// Verus's ast_to_sst lowers this to an outer `assert/assume` block
+// plus `StmX::AssertQuery { mode: NonLinear, body: Block(Assume(req)*,
+// proof_stms*, Assert(ens)*), .. }`. Tactus's build_wp arm recurses
+// `build_wp` on the body to produce `Wp::AssertQuery { closer:
+// nlinarith, preamble: [Mathlib.Tactic.Linarith], body, after }`.
+// The walker enters a new OblCtx scope so theorems emitted inside
+// the body use `nlinarith` (Mathlib's nonlinear-arithmetic tactic)
+// as their closer.
+test_verify_one_file! {
+    #[test] test_exec_assert_nonlinear_commutative verus_code! {
+        #[verifier::tactus_auto]
+        fn check_commute(x: i32, y: i32) {
+            assert(x * y == y * x) by(nonlinear_arith);
+        }
+    } => Ok(())
+}
+
+// `assert by(nonlinear_arith) requires Q;` — pins that user-declared
+// requires are available as hyps inside the NonLinear scope, so
+// `nlinarith` can use them to discharge the assertion. The fn's
+// requires must imply the assert's requires (Verus emits an outer
+// `assert(req)` the caller must satisfy at the assert site).
+test_verify_one_file! {
+    #[test] test_exec_assert_nonlinear_with_requires verus_code! {
+        #[verifier::tactus_auto]
+        fn check_signed_product(x: i32, y: i32)
+            requires x >= 0, y >= 0
+        {
+            assert(x * y >= 0) by(nonlinear_arith) requires x >= 0, y >= 0;
+        }
+    } => Ok(())
+}
+
+// Negative: wrong assertion fails. Pins that the NonLinear scope
+// actually verifies — it's not a permissive pass. `x*y > 0`
+// doesn't follow from `x, y >= 0` (could both be zero), so
+// `nlinarith` fails.
+test_verify_one_file! {
+    #[test] test_exec_assert_nonlinear_wrong verus_code! {
+        #[verifier::tactus_auto]
+        fn check_wrong(x: i32, y: i32)
+            requires x >= 0, y >= 0
+        {
+            assert(x * y > 0) by(nonlinear_arith) requires x >= 0, y >= 0;
+        }
+    } => Err(_)
+}
+
+// NonLinear scope with a proof block: a user-written intermediate
+// `assert` lives in the body's `proof_stms` slot. Each obligation
+// in the body (the intermediate assert AND the final ensures) gets
+// emitted as its own theorem, each closed by `nlinarith` via the
+// scope's closer override. Pins that recursive walking of the body
+// works (proof blocks aren't restricted to empty).
+test_verify_one_file! {
+    #[test] test_exec_assert_nonlinear_with_proof_block verus_code! {
+        #[verifier::tactus_auto]
+        fn check_with_proof(x: i32, y: i32) {
+            assert(x * y == y * x) by(nonlinear_arith) {
+                assert(x * y == y * x);
+            };
+        }
+    } => Ok(())
+}
+

@@ -16,7 +16,7 @@
 //!    SST body right-to-left, producing a `Wp<'a>` tree where each
 //!    compound node carries its own continuation by construction. Any
 //!    unsupported SST form returns `Err` and bubbles up.
-//! 3. `walk_obligations(&body_wp, &ctx, &OblCtx::new(), &mut emitter)`
+//! 3. `walk_obligations(&body_wp, &ctx, &mk_test_obl(), &mut emitter)`
 //!    walks the Wp tree, accumulating `OblCtx` frames (Let / Hyp /
 //!    Binder) at scope-introducing points and emitting one Lean
 //!    theorem per obligation site. Each emitted theorem's goal is
@@ -182,6 +182,16 @@ pub(crate) fn bitvec_preamble_fragments() -> Vec<PreambleFragment> {
         PreambleFragment::Import("Lean.Elab.Tactic.BVDecide".to_string()),
         PreambleFragment::PreludeAddendum(BITVEC_INT_INSTANCES.to_string()),
     ]
+}
+
+/// Preamble fragments required by an `assert(P) by(nonlinear_arith)`
+/// scope. `nlinarith` lives in Mathlib's Linarith module (it's
+/// `linarith` extended with nonlinear preprocessing). Attached to
+/// every theorem emitted inside a `Wp::AssertQuery` scope via
+/// `OblCtx::extra_preamble`; `krate_preamble` aggregates and dedups
+/// across the file.
+pub(crate) fn nonlinear_preamble_fragments() -> Vec<PreambleFragment> {
+    vec![PreambleFragment::Import("Mathlib.Tactic.Linarith".to_string())]
 }
 
 /// Typed view of a loop invariant's classification (#103).
@@ -760,7 +770,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // entry, x IS the pre-state, so `*old(x) ≡ x` for requires
     // evaluation; the natural VarAt → Var collapse in the renderer
     // gives the right thing for them.
-    let mut initial_obl_ctx = OblCtx::new();
+    let mut initial_obl_ctx = OblCtx::new(emitter.default_closer.clone());
     for par in fn_sst.x.pars.iter().filter(|p| is_mut_ref_par(p)) {
         let raw_name = sanitize(&par.x.name.0);
         let pre_name = crate::lean_name::LeanName::synthetic(
@@ -997,10 +1007,29 @@ struct OblCtx {
     /// recurse(&new_obl)` thus avoids the O(N) per-push Vec clone
     /// the original implementation had.
     frames: im::Vector<CtxFrame>,
+    /// The Tactic that closes goals emitted under this context.
+    /// Seeded at the top from the fn-level default (`tactus_auto`
+    /// or whatever `#[verifier::tactus_tactic(...)]` set), then
+    /// overridden by `new_scope()` for AssertQuery modes that
+    /// switch the discharger (e.g., `nlinarith` for `by(nonlinear_arith)`).
+    closer: Tactic,
+    /// Preamble fragments required for `closer` to elaborate (e.g.,
+    /// `Mathlib.Tactic.Linarith` for `nlinarith`). Empty when the
+    /// closer is part of the bundled prelude (`tactus_auto`).
+    /// Every theorem emitted under this context attaches these to
+    /// its `requires_preamble`; `krate_preamble` aggregates +
+    /// dedups so the file picks them up once.
+    extra_preamble: Vec<PreambleFragment>,
 }
 
 impl OblCtx {
-    fn new() -> Self { Self { frames: im::Vector::new() } }
+    /// Top-level OblCtx for an exec fn. Seeds the closer from the
+    /// fn's default (carrying `#[verifier::tactus_tactic(...)]` if
+    /// the user set one); the preamble is empty until a scope
+    /// changes it.
+    fn new(closer: Tactic) -> Self {
+        Self { frames: im::Vector::new(), closer, extra_preamble: Vec::new() }
+    }
 
     /// Append a frame, returning a fresh OblCtx that shares the
     /// parent's frames structurally. Cheap by construction
@@ -1011,6 +1040,25 @@ impl OblCtx {
         let mut new = self.clone();
         new.frames.push_back(f);
         new
+    }
+
+    /// Enter a new verification scope: like Verus's `AssertQuery`,
+    /// the new ctx starts fresh (enclosing-scope Hyps shed — they
+    /// aren't part of the query's input), with `closer` discharging
+    /// and `preamble` attached to every theorem emitted under it.
+    ///
+    /// Let / Binder frames are kept because they bind names the
+    /// scope's body may reference; only Hyp frames are dropped —
+    /// matching Verus's NonLinear/BitVector semantics that the
+    /// query only sees its own declared requires + typ invariants.
+    fn new_scope(&self, closer: Tactic, preamble: Vec<PreambleFragment>) -> Self {
+        let frames: im::Vector<CtxFrame> = self
+            .frames
+            .iter()
+            .filter(|f| !matches!(f, CtxFrame::Hyp(_)))
+            .cloned()
+            .collect();
+        Self { frames, closer, extra_preamble: preamble }
     }
 
     /// Wrap `goal` with all accumulated frames, outermost first
@@ -1120,16 +1168,32 @@ impl ObligationEmitter {
         self.counter
     }
 
-    /// Emit a theorem with the given goal and base closer. Applies
-    /// any active `tactic_prefix` (from enclosing proof blocks) by
-    /// running them as a parenthesised sequence followed by `<;>
-    /// closer`, so the closer applies to whatever subgoals the
-    /// prefix leaves. `<;>` is essential here: a goal-modifying
-    /// prefix like `simp_all` may close the goal entirely, in which
-    /// case the closer becomes a no-op rather than failing with
-    /// "no goals" (which `; tactus_auto` would).
-    fn emit(&mut self, name: String, goal: LExpr, closer: Tactic) {
-        self.emit_with_preamble(name, goal, closer, Vec::new());
+    /// Emit a theorem using the closer and preamble from the
+    /// current `OblCtx`. The closer is normally `tactus_auto` (or
+    /// whatever `#[verifier::tactus_tactic("...")]` set), but is
+    /// overridden inside AssertQuery scopes (`obl.new_scope(...)`)
+    /// to use a different discharger; the preamble carries any
+    /// imports that discharger needs.
+    ///
+    /// Applies any active `tactic_prefix` (from enclosing proof
+    /// blocks) by running them as a parenthesised sequence followed
+    /// by `<;> closer`, so the closer applies to whatever subgoals
+    /// the prefix leaves.
+    fn emit(&mut self, name: String, goal: LExpr, obl: &OblCtx) {
+        self.emit_with_preamble(
+            name, goal, obl.closer.clone(), obl.extra_preamble.clone(),
+        );
+    }
+
+    /// Like `emit` but with an explicit closer override (used by
+    /// `Wp::AssertByTactus` when the user wrote
+    /// `assert(P) by { tac }` — `tac` is the closer, not the obl
+    /// default). Preamble still flows from obl so an enclosing
+    /// scope's imports remain in effect.
+    fn emit_with_closer(
+        &mut self, name: String, goal: LExpr, closer: Tactic, obl: &OblCtx,
+    ) {
+        self.emit_with_preamble(name, goal, closer, obl.extra_preamble.clone());
     }
 
     /// Like `emit`, but the theorem also declares preamble fragments
@@ -1260,7 +1324,7 @@ fn walk_obligations<'a>(
             let name = build_theorem_name(
                 kind_to_name(kind), &e.fn_name, &loc, id,
             );
-            e.emit(name, obl.wrap(goal), simple_tactic(e));
+            e.emit(name, obl.wrap(goal), obl);
             // Reuse cond_ast for the body's hypothesis frame —
             // rendering is deterministic, so re-running it on the
             // same Exp would only repeat work.
@@ -1341,6 +1405,19 @@ fn walk_obligations<'a>(
             // post-assert continuation theorems would fail to
             // elaborate.)
             walk_obligations(body, ctx, obl, e);
+        }
+        Wp::AssertQuery { closer, preamble, body, after } => {
+            // Enter a new verification scope. `new_scope` drops
+            // enclosing-scope Hyps (matching Verus's "separate query"
+            // semantics — only the user's own requires + typ
+            // invariants apply) and installs `closer` + `preamble`
+            // on the obl so every theorem the body's recursive walk
+            // emits picks them up via `obl.closer` / `obl.extra_preamble`.
+            // `after` walks under the ORIGINAL obl — the query's
+            // discharger applies inside the scope only.
+            let inner_obl = obl.new_scope(closer.clone(), preamble.clone());
+            walk_obligations(body, ctx, &inner_obl, e);
+            walk_obligations(after, ctx, obl, e);
         }
         Wp::Let(name, val, body) => {
             walk_let(name, val.raw(), body, ctx, obl, e);
@@ -1459,12 +1536,13 @@ fn walk_assert_by_tactus<'a>(
             let name = build_theorem_name(
                 kind_to_name(AssertKind::Obligation(ObligationKind::Plain)), &e.fn_name, &loc, id,
             );
-            let closer = if user_tactic_present {
-                Tactic::Raw(tactic_text.to_string())
+            if user_tactic_present {
+                e.emit_with_closer(
+                    name, obl.wrap(goal), Tactic::Raw(tactic_text.to_string()), obl,
+                );
             } else {
-                simple_tactic(e)
-            };
-            e.emit(name, obl.wrap(goal), closer);
+                e.emit(name, obl.wrap(goal), obl);
+            }
             // Cond as hypothesis for body theorems (reuse cond_ast).
             let new_obl = obl.with_frame(CtxFrame::Hyp(cond_ast));
             walk_obligations(body, ctx, &new_obl, e);
@@ -1547,7 +1625,7 @@ fn emit_leaf_theorem(
 ) {
     let id = e.next_id();
     let name = build_theorem_name(kind_label, &e.fn_name, loc, id);
-    e.emit(name, obl.wrap(leaf.clone()), simple_tactic(e));
+    e.emit(name, obl.wrap(leaf.clone()), obl);
 }
 
 /// Construct a per-obligation theorem name. Drops the `_at_<loc>`
@@ -1629,7 +1707,7 @@ fn walk_loop<'a>(
         let name = build_theorem_name(
             kind_to_name(AssertKind::Obligation(ObligationKind::LoopInvariant)), &e.fn_name, &loc, id,
         );
-        e.emit(name, obl.wrap(inv_marked((inv, v))), simple_tactic(e));
+        e.emit(name, obl.wrap(inv_marked((inv, v))), obl);
     }
 
     // ── Maintain: walk body with ∀ mod_vars + bounds + at_entry
@@ -2384,7 +2462,7 @@ fn emit_call_precondition_theorem(
     let theorem_name = build_theorem_name(
         kind_to_name(AssertKind::Obligation(ObligationKind::CallPrecondition)), &e.fn_name, &loc, id,
     );
-    e.emit(theorem_name, obl.wrap(requires_clause), simple_tactic(e));
+    e.emit(theorem_name, obl.wrap(requires_clause), obl);
 }
 
 /// Peel `SpanMark` wrappers, returning the innermost non-SpanMark
@@ -2801,21 +2879,6 @@ fn walk_let<'a>(
     walk_obligations(body, ctx, &new_obl, e);
 }
 
-/// Atomic default closer for per-obligation theorems. Each emitted
-/// goal is a single obligation wrapped in let/→/∀ frames from the
-/// `OblCtx`, which `omega` and `simp_all` handle natively (intros
-/// for `∀`/`→`, zeta-reduction for `let`).
-///
-/// Reads the closer from the `ObligationEmitter` so per-fn
-/// overrides via `#[verifier::tactus_tactic("...")]` apply
-/// uniformly across every emitter site (Wp::Assert,
-/// emit_done_or_split, walk_loop's init, walk_call's
-/// precondition, walk_assert_by_tactus's empty-tactic
-/// fallback).
-fn simple_tactic(e: &ObligationEmitter) -> Tactic {
-    e.default_closer.clone()
-}
-
 // ── Binder builders ────────────────────────────────────────────────────
 
 /// Function params + their type-bound hypotheses. Shared across
@@ -3114,6 +3177,26 @@ enum Wp<'a> {
         ens_conj: LExpr,
         rust_loc: String,
         body: Box<Wp<'a>>,
+    },
+
+    /// `assert(P) by(<mode>) requires Q; { proof_stms };` for
+    /// AssertQuery modes that re-use the normal renderer but
+    /// override the discharger — currently `nonlinear_arith`
+    /// (`nlinarith` from Mathlib).
+    ///
+    /// The walker enters a new OblCtx scope (`obl.new_scope(closer,
+    /// preamble)`) for `body`, which sheds the enclosing scope's
+    /// Hyp frames (matching Verus's NonLinear query semantics —
+    /// only requires + typ invariants are available) and sets the
+    /// closer that every theorem emitted inside the scope uses.
+    /// `after` walks under the ORIGINAL obl; Verus's `ast_to_sst`
+    /// already pre-injected the outer `assert(req) / assume(ens)`
+    /// block so the caller-side effect is upstream.
+    AssertQuery {
+        closer: Tactic,
+        preamble: Vec<PreambleFragment>,
+        body: Box<Wp<'a>>,
+        after: Box<Wp<'a>>,
     },
 
     /// `if cond { then_branch } else { else_branch }`. Walker
@@ -3790,9 +3873,48 @@ fn build_wp<'a>(
                         body: Box::new(after),
                     })
                 }
-                AssertQueryMode::NonLinear => Err(
-                    "assert by(nonlinear_arith) not yet supported".to_string()
-                ),
+                AssertQueryMode::NonLinear => {
+                    // Verus's `ast_to_sst` (vir/src/ast_to_sst.rs:2322)
+                    // builds the body as a Block: `[Assume(req)*,
+                    // proof_stms*, Assert(ens)*]`. The body is the
+                    // inner verification query (Verus's "separate query
+                    // for NonLinear" semantics). We recurse `build_wp`
+                    // on it with a `Done(LitBool(true))` terminator
+                    // (proof scope has no return value); the resulting
+                    // Wp tree carries all obligations the body
+                    // generates. The walker enters a new OblCtx scope
+                    // for `body_wp` that switches the closer to
+                    // `nlinarith` and drops enclosing-scope Hyps,
+                    // matching Verus's NonLinear semantics.
+                    let body_wp = build_wp(
+                        body,
+                        Wp::Done(LExpr::new(ExprNode::LitBool(true))),
+                        ctx,
+                        loop_stack,
+                    )?;
+                    // `first | (intros; nlinarith) | tactus_auto` —
+                    // try `nlinarith` (Mathlib's nonlinear-arithmetic
+                    // tactic, the surface choice via
+                    // `by(nonlinear_arith)`) after intro-ing the
+                    // theorem-level binders + Hyps that the OblCtx
+                    // wraps around the goal. `nlinarith` doesn't
+                    // intro on its own. Fall back to `tactus_auto`
+                    // for trivial theorems the recursive walking
+                    // still emits inside the scope (e.g.,
+                    // `True → ... → True` from `Wp::Done` leaves at
+                    // the end of the body block) — `nlinarith` is
+                    // refutation-based and can't close a `True`
+                    // goal.
+                    let closer = Tactic::Raw(
+                        "first | (intros; nlinarith) | tactus_auto".to_string(),
+                    );
+                    Ok(Wp::AssertQuery {
+                        closer,
+                        preamble: nonlinear_preamble_fragments(),
+                        body: Box::new(body_wp),
+                        after: Box::new(after),
+                    })
+                }
                 AssertQueryMode::BitVector => Err(
                     // Defensive: Verus's `ast_to_sst` (vir/src/ast_to_sst.rs:2416)
                     // converts user-syntax `assert by(bit_vector)` directly into
@@ -5765,6 +5887,12 @@ mod tests {
         }
     }
 
+    /// Minimal `OblCtx` for tests. Seeds the closer with `tactus_auto`
+    /// to match `mk_test_emitter`'s default.
+    fn mk_test_obl() -> OblCtx {
+        OblCtx::new(crate::lean_ast::Tactic::Named("tactus_auto".to_string()))
+    }
+
     #[test]
     fn wp_hyp_walker_wraps_done_leaf_with_hyp_frame() {
         // Wp::Hyp { hyp: p, body: Wp::Done(q) }
@@ -5778,7 +5906,7 @@ mod tests {
         };
         let ctx = mk_test_ctx();
         let mut emitter = mk_test_emitter();
-        walk_obligations(&wp, &ctx, &OblCtx::new(), &mut emitter);
+        walk_obligations(&wp, &ctx, &mk_test_obl(), &mut emitter);
 
         assert_eq!(emitter.out.len(), 1,
             "expected exactly one theorem emitted from Wp::Done leaf");
@@ -5809,7 +5937,7 @@ mod tests {
         };
         let ctx = mk_test_ctx();
         let mut emitter = mk_test_emitter();
-        walk_obligations(&wp, &ctx, &OblCtx::new(), &mut emitter);
+        walk_obligations(&wp, &ctx, &mk_test_obl(), &mut emitter);
         assert_eq!(emitter.out.len(), 1,
             "Wp::Hyp wrapping Done(True) emits one theorem (Done's)");
     }
@@ -6018,7 +6146,7 @@ mod tests {
             &body,
             &after,
             &ctx,
-            &OblCtx::new(),
+            &mk_test_obl(),
             &mut emitter,
         );
 
@@ -6071,7 +6199,7 @@ mod tests {
             &body,
             &after,
             &ctx,
-            &OblCtx::new(),
+            &mk_test_obl(),
             &mut emitter,
         );
 
