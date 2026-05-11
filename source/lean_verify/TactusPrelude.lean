@@ -225,24 +225,23 @@ macro "tactus_bit_vector" : tactic => `(tactic|
 --
 -- `fail` turns "nothing worked" into a real error instead of a `sorry`.
 --
--- **Lemma additions to `simp_all`'s set.** Each `[lemma_name]` here
--- handles a class of obligations the plain `simp_all` set misses.
--- The pattern is additive — add a new lemma when a new bool/Bool
--- operation surfaces a missing-simp gap, rather than refactoring the
--- always-Prop rendering pipeline (see DESIGN.md § "Bool vs Prop"
--- for the design rationale).
--- * `Bool.xor_comm` — Tactus renders `TypX::Bool` as `Prop`
---   unconditionally, so `Bool.xor` over exec-bool params gets
---   wrapped in `decide` coercions; the resulting `(decide b1 ^^
---   decide b2) = (decide b2 ^^ decide b1)` shape needs the
---   commutativity lemma. Pinned by
---   `test_exec_xor_bool_free_vars_commutative`.
+-- **Why no extras in `simp_all`'s set.** The closer is intentionally
+-- dumb — `rfl | decide | omega | simp_all | tactus_case_split` with
+-- NO extra simp lemmas. When a real obligation falls through, the
+-- preferred response is for the user to write the proof explicitly:
+-- `assert(P) by { simp_all [SomeLemma] };` or a `proof { ... }`
+-- block. This matches Tactus's design principle #1 (Transparency)
+-- and the user's stated UX preference: a visible proof is a more
+-- pleasant proof. See DESIGN.md § "Bool vs Prop" for the canonical
+-- example (Bool xor commutativity is closable with `simp_all
+-- [Bool.xor_comm]` at the assertion site, NOT by extending the
+-- closer).
 macro "tactus_auto" : tactic => `(tactic|
   tactus_first
     | rfl
     | decide
     | omega
-    | simp_all [Bool.xor_comm]
+    | simp_all
     | tactus_case_split (simp_all <;> first | omega | done)
     | tactus_case_split (simp_all)
     | fail "tactus: auto-tactic failed — add explicit proof block")
