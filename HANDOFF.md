@@ -3953,6 +3953,39 @@ prior plumbing (#81 tactus_tactic); the one moment of code-
 change-attempted-then-reverted (Bool.xor_comm simp extension) was
 itself a lesson about not becoming the thing being audited.
 
+#### Current session (2026-05-11 continued — #117 fuse two-pass audit)
+
+Same shape as yesterday's #149–#153 audit sweep, applied to the
+remaining "Architecture cleanups" pending task. The prior entry
+said "fusing would save a pass but entangles modifications with
+WP construction. Documented; left alone." — short, opinionated,
+no rationale carry-over for a future reader. Audit confirmed the
+verdict and produced the missing rationale:
+
+- `collect_modifications` cares about 4 of ~15 statement variants
+  `build_wp` walks (Assign/Block/If/Loop only). Fusion would mean
+  threading `&mut ModCollector<'a>` through 7 production
+  `build_wp` call sites (entry, Block-sequential, If-then,
+  If-else, ClosureBody, Loop-body, two cond_setup wraps).
+  Every future statement variant would have to consider both
+  concerns.
+- Realistic loop bodies are 10-100 stmts; verification time is
+  dominated by downstream Lean checking, not Rust-side tree
+  walks. The redundancy is also bounded the other way:
+  `collect_modifications` runs only on loop bodies, so non-loopy
+  fns pay nothing.
+- Post-hoc extraction from the built Wp tree was considered:
+  `Wp::Let` conflates mutation-as-shadowing (`is_init: false`
+  assignments) with new-binding lets, so walking the Wp tree
+  post-hoc can't distinguish "external mod" from "local let"
+  without information that the pre-pass already has natively.
+
+DESIGN.md entry updated with the verdict + conditions for
+revisiting (load-bearing profile, upstream `StmX::Loop` mod
+stashing, or a general `WpCtx`-style accumulator that all
+variants already touch). Same audit-sweep shape: net 0 code
+changes, deliverable is doc clarity. #117 closed.
+
 ## Architecture
 
 ### Full pipeline
@@ -4278,10 +4311,17 @@ helper replaces the incorrect `String.get` head emitted by
 `non_binop_head`; both VIR-AST and SST renderer paths now lower
 cleanly.
 
-### Architecture cleanups (1 pending)
+### Architecture cleanups (0 pending)
 
-- **#117** fuse two-pass over loop bodies (DESIGN says "left
-  alone").
+Closed: **#117** fuse two-pass over loop bodies — *audited
+2026-05-11; keep as-is.* Fusion would mean threading
+`&mut ModCollector<'a>` through 7 `build_wp` call sites and
+entangling concerns at every future statement variant; perf
+saving is one tree traversal per loop body (realistic 10-100
+stmts, dominated by Lean checking, not Rust). Conditions for
+revisiting documented inline in DESIGN.md's architecture-debts
+section. Same audit-sweep shape as 2026-05-11's #149–#153 — net
+0 code, deliverable is doc clarity.
 
 Closed: **#97** `OblCtx::with_frame` O(N²) → `im::Vector` (LANDED
 2026-05-09; same session also moved `loop_stack` from `&[&WpLoopCtx]`
