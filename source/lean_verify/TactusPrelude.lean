@@ -226,14 +226,17 @@ macro "tactus_bit_vector" : tactic => `(tactic|
 -- `fail` turns "nothing worked" into a real error instead of a `sorry`.
 --
 -- **Lemma additions to `simp_all`'s set.** Each `[lemma_name]` here
--- handles a class of obligations the plain `simp_all` set misses:
--- * `Bool.xor_comm` — needed because Tactus renders `TypX::Bool` as
---   `Prop` (always-Prop in `to_lean_type.rs`), so any `Bool.xor` over
---   exec-bool params gets wrapped in `decide` coercions; the resulting
---   `(decide b1 ^^ decide b2) = (decide b2 ^^ decide b1)` shape isn't
---   in core simp's default set but `Bool.xor_comm` closes it directly.
---   Pinned by `test_exec_xor_bool_free_vars_commutative_gap` (#121
---   probe, 2026-05-11, gap-fix 2026-05-11).
+-- handles a class of obligations the plain `simp_all` set misses.
+-- The pattern is additive — add a new lemma when a new bool/Bool
+-- operation surfaces a missing-simp gap, rather than refactoring the
+-- always-Prop rendering pipeline (see DESIGN.md § "Bool vs Prop"
+-- for the design rationale).
+-- * `Bool.xor_comm` — Tactus renders `TypX::Bool` as `Prop`
+--   unconditionally, so `Bool.xor` over exec-bool params gets
+--   wrapped in `decide` coercions; the resulting `(decide b1 ^^
+--   decide b2) = (decide b2 ^^ decide b1)` shape needs the
+--   commutativity lemma. Pinned by
+--   `test_exec_xor_bool_free_vars_commutative`.
 macro "tactus_auto" : tactic => `(tactic|
   tactus_first
     | rfl

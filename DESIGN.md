@@ -593,7 +593,41 @@ VIR uses Euclidean division (`ArithOp::EuclideanDiv`). Lean's `Int.div` is T-div
 
 ### Bool vs Prop
 
-VIR's `TypX::Bool` in spec context → Lean `Prop`. In exec context → Lean `Bool`. VIR tracks modes.
+VIR's `TypX::Bool` renders unconditionally as Lean `Prop`, regardless of context. `to_lean_type::typ_to_node` is mode-blind — both spec-position and exec-position `bool` arrive at the renderer the same way and produce the same `Prop` output. An exec fn `fn check(b: bool)` emits a theorem binder `b : Prop`, and bool-typed body expressions inherit the Prop typing.
+
+**An earlier draft of this section** claimed Tactus rendered bool as `Prop` in spec context and `Bool` in exec context. That was aspirational and never implemented; the current behaviour is the deliberate landed choice (see § "Considered: context-sensitive bool rendering" below for why).
+
+#### Why always-Prop
+
+* **Tactus is spec-first.** Verification obligations (`requires`, `ensures`, `assert(P)`, loop invariants) are all Prop by construction. Exec-fn bodies *embed* spec expressions through the WP encoding — so the dominant typing context in generated Lean is Prop. Treating every `bool` as `Prop` keeps the dominant case clean: `assert(flag)` for a bool param renders as just `flag` with no coercion clutter.
+* **`Classical.propDecidable` opens everything.** The prelude's `attribute [instance] Classical.propDecidable` makes every `Prop` decidable, so Lean can insert `decide : Prop → Bool` automatically wherever a `Bool`-typed operation receives a Prop arg. The coercion is total and well-behaved — no soundness risk, just goal-state verbosity.
+* **No mode threading.** `typ_to_expr` has ~55 call sites across `to_lean_type.rs` / `to_lean_fn.rs` / `to_lean_sst_expr.rs` / `sst_to_lean.rs` / `to_lean_expr.rs`. A context-sensitive design would either thread a mode parameter through every one or fork into `typ_to_expr_spec` / `typ_to_expr_exec`. Either choice is invasive without a forcing concrete benefit.
+* **The boundary case (`Bool`-typed operations on bool params) is closable with targeted simp lemmas.** When the `decide` coercions land in a goal that needs structural reasoning (xor commutativity, and/or-associativity, etc.), the fix is to add the relevant lemma to `tactus_auto`'s simp set. Done once for `Bool.xor_comm` (#121 follow-up, 2026-05-11); pattern is small and additive.
+
+#### The trade-off accepted
+
+The cost of always-Prop is **goal-state verbosity** when bool exec params flow into Bool-typed operations: `(decide b1 ^^ decide b2)` instead of `(b1 ^^ b2)`. This is cosmetic in error messages, not a soundness issue. The xor-commutativity-gap probe (`test_exec_xor_bool_free_vars_commutative`, #121) exercises this shape; the fix was one lemma, not a rendering rewrite.
+
+A second cost is **lemmas chosen for the `decide`-wrapped form**: `Bool.xor_comm` works under `decide b` because it's a Bool-Bool equality regardless of whether the operands started as Props. So far no lemma has needed a special-case version for the coerced shape; if one does, that surfaces a real reason to revisit.
+
+#### Considered: context-sensitive bool rendering
+
+Investigated and rejected (2026-05-11). The design would: thread a `mode: SpecOrExec` parameter through `typ_to_expr`, render exec-position `TypX::Bool` as Lean `Bool`, and emit explicit `b = true` coercions wherever a bool flows into a Prop-position spec expression (assertions, ensures clauses, requires clauses).
+
+Cost: invasive (55+ call sites, each needs the new parameter), with the coercion bookkeeping moved from the Lean side (`decide` insertions, automatic) to the Tactus side (explicit `b = true` rendering, manual).
+
+Benefit: less goal-state clutter for the narrow case of bool exec params used in Bool-typed operations.
+
+The benefit is concrete but small. The cost is concrete and large. The pattern that surfaced the gap (`Bool.xor_comm` extension) generalises: whenever a new bool operation needs structural reasoning, add the lemma. This scales additively without touching the rendering pipeline.
+
+**Conditions for revisiting** (any one would shift the cost-benefit):
+* Multiple bool operations needing simp-lemma extensions that don't compose (today's `Bool.xor_comm` is one of perhaps a half-dozen analogous needs; if the list grows past ~5 we'd reconsider).
+* A class of bool reasoning that genuinely can't close under `decide`-wrapped forms even with the right lemma.
+* A user-facing pain point where the `decide`-wrapped goal shape is materially confusing.
+
+None of these apply today; the simp-set extension covers the surface.
+
+In VIR, equality and other Bool operations have the right shape — Verus's mode tracking IS present at the input. We're choosing not to consume the mode information, in favour of uniform Prop. The "ignore the mode" is the design, not a bug.
 
 ### Seq indexing
 
@@ -1136,7 +1170,7 @@ Forms we accept and render, but with semantic information dropped. None of these
 * **`ExpX::WithTriggers(_, inner)` drops the triggers.** We render the inner expression as-is; the attached trigger annotations (used by Z3's quantifier instantiation in Verus's pipeline) are ignored. Lean's tactics don't use them, so no downstream effect.
 * **`BndX::Quant(_, binders, triggers, _)` drops triggers + the trailing param.** Same rationale. Universally-quantified spec clauses render their body correctly; the triggers and whatever the fourth field is get dropped silently.
 * **`ExpX::VarAt(ident, at_label)` treats all VarAt occurrences identically to `Var`.** The `at_label` information (which distinguishes pre-state from post-state references in old-style ensures) is discarded. Acceptable because `ExpX::Old(..)` is already rejected upstream, so at-labels shouldn't arrive with meaning attached. If a future VIR change routes at-state expressions through `VarAt` without going through `Old`, we'd silently conflate them.
-* **`BinaryOp::Xor`** — renders via the shared `non_binop_head(Xor) -> "Bool.xor"`. Pinned at three levels: `test_exec_xor_bool` (fn-return-equals-body smoke), `test_exec_xor_bool_concrete` (concrete `(true ^ false) == true` closes via `decide`), `test_exec_xor_bool_free_vars_commutative` (commutativity on free bool vars — LANDED via the `Bool.xor_comm` simp-set extension below, 2026-05-11). The commutativity goal shape on free vars is `(decide b1 ^^ decide b2) = (decide b2 ^^ decide b1)` because `to_lean_type::typ_to_node` always emits `Prop` for `TypX::Bool` regardless of context (DESIGN's "Bool vs Prop" promises context-sensitive rendering, but the code doesn't implement it). So exec-bool params become `Prop` and any value flowing into `Bool.xor` gets `decide` coercions. The minimal-disturbance fix added `Bool.xor_comm` to `tactus_auto`'s `simp_all` lemma list (one rung of the ladder now reads `simp_all [Bool.xor_comm]`); core Lean's `Bool.xor_comm` closes the goal under both the unboxed-Bool shape and the `decide`-wrapped Prop shape. The deeper context-sensitive-bool fix (always-Prop → mode-aware) remains task-sized and out of scope; the simp-set extension covers the user-facing gap.
+* **`BinaryOp::Xor`** — renders via the shared `non_binop_head(Xor) -> "Bool.xor"`. Pinned at three levels: `test_exec_xor_bool` (fn-return-equals-body smoke), `test_exec_xor_bool_concrete` (concrete `(true ^ false) == true` closes via `decide`), `test_exec_xor_bool_free_vars_commutative` (commutativity on free bool vars — LANDED via the `Bool.xor_comm` simp-set extension below, 2026-05-11). The commutativity goal shape on free vars is `(decide b1 ^^ decide b2) = (decide b2 ^^ decide b1)` because Tactus renders `TypX::Bool` as `Prop` unconditionally (see § "Bool vs Prop" — always-Prop is the deliberate landed design). The simp-set extension `simp_all [Bool.xor_comm]` is the canonical pattern for closing Bool-operation goals through the `decide`-wrapped form; the lemma's typed signature is `(a b : Bool) → (a ^^ b) = (b ^^ a)`, which unifies with both `decide`-wrapped and unboxed-Bool shapes.
 * **`ExpX::Bind(BndX::Choose, ...)` → `Classical.epsilon (fun ... => cond ∧ body)`.** Pinned by `test_exec_choose_in_spec` — Choose inside a spec fn called from an exec fn's ensures. `Classical.epsilon` is total but its behaviour on unsatisfiable `cond` is unspecified; the test uses an ensures-disjunction that doesn't depend on the witness being defined. Direct exec-mode `choose|x| P` outside spec fns isn't exercised but goes through the same renderer arm.
 * **`StmX::AssertCompute(_, e, ComputeMode)`** — Tactus dispatches identically to `StmX::Assert`, dropping the `ComputeMode` (`Z3` vs `ComputeOnly`). The mode is a Verus-side performance hint telling Z3 to discharge `e` via `interp` evaluation rather than full SMT — no direct Lean analog, but `tactus_auto`'s ladder includes `decide` (which IS the Lean equivalent of "compute the value structurally"), so the user-facing behaviour aligns even though the explicit mode tag is lost. `assert(P) by(compute)` and `assert(P) by(compute_only)` from user source aren't tested in tactus_auto fns; if a future test exercises a ComputeMode-shaped assertion that `decide` can't close, the ladder might need a `norm_num` / `simp_arith` rung.
 * **`lift_if_value` chain-lifts through multi-binder `Bind(Let)` (#119).** Multi-binder lets (`let (a, b) = expr; …`) unfold to a single-binder chain via `unfold_multi_binder_let` (#92), and `lift_if_value` recurses through the chain when each binder's `inner_body` is itself a `Bind(Let, …)` — lifting any if-in-rhs along the way. The recursion is gated on `inner_is_let_chain` for soundness: when `inner_body` is `If` at top level (e.g., the match-compilation shape `let _disc := proj(k); if _disc = 0 then …`), lifting would move the if's condition outside the let scope and produce an unbound reference. The case-split tactic handles those match-style ifs at the obligation level instead.
