@@ -8468,3 +8468,37 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Ctor in exec fn (struct): pins that `ExpX::Ctor` in exec bodies
+// renders correctly via `to_lean_sst_expr::ExpX::Ctor` (line 793 —
+// `ctor_node` shared with VIR-AST path). DESIGN.md formerly listed
+// this as rejected with regression test `test_exec_ctor_rejected`;
+// both the claim and the test were stale.
+test_verify_one_file! {
+    #[test] test_exec_ctor_struct_in_body verus_code! {
+        struct Point { x: u8, y: u8 }
+
+        #[verifier::tactus_auto]
+        fn make_point(a: u8, b: u8) -> (r: Point)
+            ensures r.x == a, r.y == b
+        {
+            Point { x: a, y: b }
+        }
+    } => Ok(())
+}
+
+// Ctor in exec fn (enum): single-variant enum constructed and
+// returned. Same code path as struct ctor, exercises the variant-
+// name handling in `ctor_node`.
+test_verify_one_file! {
+    #[test] test_exec_ctor_enum_in_body verus_code! {
+        enum Wrap { V(u8) }
+
+        #[verifier::tactus_auto]
+        fn wrap_it(x: u8) -> (r: Wrap)
+            ensures r == Wrap::V(x)
+        {
+            Wrap::V(x)
+        }
+    } => Ok(())
+}
+
