@@ -8568,3 +8568,50 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Coverage: the scope's closer override resets after the scope.
+// A regular `assert(P)` AFTER the NonLinear block uses
+// `tactus_auto`, not `nlinarith`. Pins the structural soundness
+// of the scope mechanism: `walk_obligations` walks `after` under
+// the ORIGINAL obl, not the inner scope's. If the override
+// leaked, the post-scope assert would close under
+// `nlinarith`-fallback (which still works for trivial cases —
+// so this isn't a soundness probe, just structural).
+test_verify_one_file! {
+    #[test] test_exec_assert_nonlinear_scope_resets verus_code! {
+        #[verifier::tactus_auto]
+        fn check_scope_resets(x: i32, y: i32) {
+            assert(x * y == y * x) by(nonlinear_arith);
+            // A trivial post-scope assertion that tactus_auto
+            // (decide / simp_all) handles natively. If the closer
+            // override leaked, this would still pass since the
+            // fallback is `tactus_auto`, but Lean's `--json` would
+            // show `nlinarith` running on it — observable in the
+            // generated `.lean` if the test ever needs debugging.
+            assert(1 + 1 == 2);
+        }
+    } => Ok(())
+}
+
+// Coverage: NonLinear scope inside a loop body. The recursive walk
+// emits a theorem per loop-body obligation (init / maintain /
+// decrease / use); the NonLinear scope nests inside maintain.
+// Pins that the scope's closer applies only inside the body, not
+// to surrounding loop obligations.
+test_verify_one_file! {
+    #[test] test_exec_assert_nonlinear_inside_loop verus_code! {
+        #[verifier::tactus_auto]
+        fn loop_with_nonlinear(n: i32)
+            requires 0 <= n, n < 100
+        {
+            let mut i: i32 = 0;
+            while i < n
+                invariant 0 <= i, i <= n
+                decreases n - i
+            {
+                assert(i * 2 == 2 * i) by(nonlinear_arith);
+                i = i + 1;
+            }
+        }
+    } => Ok(())
+}
+

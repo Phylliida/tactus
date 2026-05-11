@@ -16,7 +16,7 @@
 //!    SST body right-to-left, producing a `Wp<'a>` tree where each
 //!    compound node carries its own continuation by construction. Any
 //!    unsupported SST form returns `Err` and bubbles up.
-//! 3. `walk_obligations(&body_wp, &ctx, &mk_test_obl(), &mut emitter)`
+//! 3. `walk_obligations(&body_wp, &ctx, &OblCtx::new(closer), &mut emitter)`
 //!    walks the Wp tree, accumulating `OblCtx` frames (Let / Hyp /
 //!    Binder) at scope-introducing points and emitting one Lean
 //!    theorem per obligation site. Each emitted theorem's goal is
@@ -1051,11 +1051,18 @@ impl OblCtx {
     /// scope's body may reference; only Hyp frames are dropped —
     /// matching Verus's NonLinear/BitVector semantics that the
     /// query only sees its own declared requires + typ invariants.
+    ///
+    /// Exhaustive match (not `!matches!(_, Hyp(_))`) so a new
+    /// `CtxFrame` variant must consciously decide "does this
+    /// survive a scope boundary?" rather than silently being kept.
     fn new_scope(&self, closer: Tactic, preamble: Vec<PreambleFragment>) -> Self {
         let frames: im::Vector<CtxFrame> = self
             .frames
             .iter()
-            .filter(|f| !matches!(f, CtxFrame::Hyp(_)))
+            .filter(|f| match f {
+                CtxFrame::Let(..) | CtxFrame::Binder(..) => true,
+                CtxFrame::Hyp(..) => false,
+            })
             .cloned()
             .collect();
         Self { frames, closer, extra_preamble: preamble }
