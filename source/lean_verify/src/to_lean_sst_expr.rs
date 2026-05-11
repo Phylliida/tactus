@@ -572,11 +572,6 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                         bang: true,
                     });
                 }
-                BinaryOp::StrGetChar => {
-                    return Err(
-                        "string character lookup not yet supported in exec fns".to_string()
-                    );
-                }
                 BinaryOp::IeeeFloat(_) => {
                     return Err(
                         "IEEE float comparison not yet supported (Verus rejects \
@@ -606,9 +601,14 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
             let (l, r) = (sst_exp_to_ast_checked(lhs)?, sst_exp_to_ast_checked(rhs)?);
             match binop_to_ast(op) {
                 Some(l_op) => LExpr::binop(l_op, l, r).node,
-                // Non-structural: emit as `head lhs rhs` via App. The
-                // only reachable case in the exec-fn path is `Xor`
-                // (other non-structural ops are rejected above).
+                // Non-structural: emit as `head lhs rhs` via App.
+                // Reachable cases in the exec-fn path:
+                // * `Xor` (logical xor on Bool)
+                // * `StrGetChar` (Verus's `strslice_get_char`, lowering
+                //   to `Tactus.strGetChar` from the prelude)
+                // Other non-structural ops (`HeightCompare`, `IeeeFloat`,
+                // `Index`) are rejected upstream in this arm or via
+                // earlier match guards.
                 // Routed through the shared `non_binop_head` table so
                 // the head string stays in sync with the VIR-AST
                 // renderer.

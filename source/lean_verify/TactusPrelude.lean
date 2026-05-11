@@ -58,6 +58,27 @@ axiom arch_word_bits_valid : arch_word_bits = 32 ∨ arch_word_bits = 64
 noncomputable def usize_hi : Int := (2 : Int) ^ arch_word_bits
 noncomputable def isize_hi : Int := (2 : Int) ^ (arch_word_bits - 1)
 
+-- `Tactus.strGetChar s i` is the i-th Unicode codepoint of `s` as a
+-- `Nat`. The lowering target for Verus's `verus_builtin::strslice_get_char`
+-- (VIR `BinaryOp::StrGetChar`, surface syntax `strslice_get_char(s, i)`).
+--
+-- Verus renders `&str` as Lean `String` and `char` as `Nat` (Verus's
+-- `IntRange::Char` maps to `Nat` in `to_lean_type.rs`). So the
+-- signature must be `String → Int → Nat`.
+--
+-- We can't use Lean's `String.get` directly: that takes a `String.Pos`
+-- (a *byte* offset, not a codepoint index) and returns Lean's `Char`.
+-- Verus's semantics is codepoint-indexed. `s.data : List Char` is the
+-- underlying codepoint list, so `s.data[i.toNat]!` gives the i-th
+-- codepoint (panicking out-of-bounds via the `GetElem!` instance);
+-- `.toNat` unwraps to the integer value.
+--
+-- The panic-on-OOB is fine because Tactus only verifies goals, never
+-- executes the generated Lean. Out-of-bounds is unspecified, matching
+-- Verus's spec semantics.
+def Tactus.strGetChar (s : String) (i : Int) : Nat :=
+  (s.data[i.toNat]!).toNat
+
 -- `tactus_first | t1 | t2 | …` desugars to `first | (t1; done) |
 -- (t2; done) | …`. Each alternative is required to fully close
 -- the goal — without `done`, a tactic that succeeds while

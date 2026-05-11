@@ -81,8 +81,8 @@ pub(crate) fn binop_to_ast(op: &BinaryOp) -> Option<L> {
 /// Head identifier used when a VIR/SST binop is expressed as a 2-arg
 /// function call rather than a structural `BinOp` — i.e., the `None`
 /// return from [`binop_to_ast`]. These render as stand-ins; the exec-fn
-/// SST path only reaches `Xor` because the other cases are rejected
-/// upstream. The spec/proof VIR path reaches all cases.
+/// SST path reaches `Xor` and `StrGetChar`. The spec/proof VIR path
+/// reaches all cases.
 pub(crate) fn non_binop_head(op: &BinaryOp) -> &'static str {
     match op {
         // Lean's `Bool.xor` — dotted so it bypasses the sanity allowlist
@@ -91,7 +91,12 @@ pub(crate) fn non_binop_head(op: &BinaryOp) -> &'static str {
         // which already has a structural `BinOp::BitXor`).
         BinaryOp::Xor => "Bool.xor",
         BinaryOp::HeightCompare { .. } => "Tactus.heightLt",
-        BinaryOp::StrGetChar => "String.get",
+        // Verus's `verus_builtin::strslice_get_char(s, i)` — codepoint-
+        // indexed string lookup. Lean's `String.get` is byte-indexed and
+        // returns Lean's `Char`, while Verus's surface returns `char` →
+        // Tactus's `Nat`. The prelude provides `Tactus.strGetChar` as
+        // the right adapter (see TactusPrelude.lean for semantics).
+        BinaryOp::StrGetChar => "Tactus.strGetChar",
         BinaryOp::Index(_, _) => "Tactus.index",
         BinaryOp::IeeeFloat(_) => "Tactus.floatOp",
         _ => "?",
