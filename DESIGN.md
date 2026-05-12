@@ -545,6 +545,33 @@ spec fn factorial(n: nat) -> nat
 termination_by n
 ```
 
+Body-less spec fns (landed 2026-05-12):
+```rust
+pub uninterp spec fn my_oracle(x: int) -> int;
+```
+→
+```lean
+axiom my_oracle : Int → Int
+```
+
+Used for: `pub uninterp spec fn` (deliberately uninterpreted on the
+Verus side), external-body spec fns (Verus's escape hatch), and
+cross-crate spec fns whose body was stripped at `export_crate` time.
+Lean's `axiom` is the right encoding — declares a constant whose
+value is unspecified, matching Verus's "this is just a symbol with
+a type" semantics. (The pre-2026-05-12 code path emitted
+`def f := sorry` for body=None, but dep_order's `build_spec_fn_map`
+filtered body=None fns out before they reached emission, so the
+sorry branch was dead code. Audit removed the filter and routed
+through `Command::Axiom` instead — see `to_lean_fn::spec_fn_to_ast`.)
+
+Trait method decls (`FunctionKind::TraitMethodDecl`) are excluded
+from this standalone-def emission regardless of body presence:
+their content lives inside the class declaration produced by
+`trait_to_ast`, not as top-level defs. Default bodies on trait
+method decls become class-method defaults (see "Trait class and
+instance emission" below).
+
 ### Proof fn translation
 
 ```rust
@@ -1178,7 +1205,7 @@ Each one returns `Err("… not yet supported")`; users get a clean rejection ins
   - `AssertQueryMode::NonLinear` — LANDED. Lowers to `Wp::AssertQuery { primary: nlinarith, preamble: [Mathlib.Tactic.Linarith], body, after }` carrying just the mode-specific tactic. The walker composes the full closer at scope-entry time: `first | (intros; primary) | (<outer_closer>) | fail "<scope msg>"`. The `<outer_closer>` reads `obl.closer` so fn-level `#[verifier::tactus_tactic(...)]` overrides propagate, and nested AssertQuery scopes compose recursively. The trailing `fail` overrides Lean's last-failure-wins reporting so users see "by(nonlinear_arith) scope: could not close — add an explicit `proof { … }` block" instead of `tactus_auto`'s misdirected fallback message. `obl.new_scope(closer, preamble)` installs the composed closer + preamble and drops enclosing-scope Hyps (matching Verus's NonLinear query semantics — only requires + typ invariants are in scope). Every theorem the body's recursive walk emits picks them up. Generic over `primary` — future query modes (Polyrith etc.) would reuse `Wp::AssertQuery` with a different tactic. (Important: any such future mode is **upstream-blocked**, not Tactus homework. Verus's `AssertQueryMode` enum has three variants today — `Tactus`, `NonLinear`, `BitVector` — and Verus's parser only accepts the corresponding surface syntaxes. Adding a `by(polyrith)` form would require a Verus-side change to the enum + parser; the Tactus side is then ~10 lines: a new `build_wp` match arm constructing a `Wp::AssertQuery` with the new mode's `primary` / `preamble` / `surface_label`.) Pinned by `test_exec_assert_nonlinear_commutative`, `_with_requires`, `_with_proof_block`, `_scope_resets`, `_inside_loop`, `_nested_scopes`, `_wrong` (negative, also pins the scope-named failure message). Shape-drift guards: `ast_to_sst_emits_assume_assert_for_nonlinear_body` (Verus's body shape) + `nonlinear_preamble_fragments_shape_pinned` (Mathlib import path).
   - `AssertQueryMode::BitVector` — defensive arm. Verus's `ast_to_sst` (vir/src/ast_to_sst.rs:2416) converts user-syntax `assert by(bit_vector)` directly into `StmX::AssertBitVector` upstream, so this arm is structurally unreachable. The `StmX::AssertBitVector` path (above) supersedes it. Hitting the rejection would mean an upstream pipeline change worth investigating.
 * **`StmX::DeadEnd`** — markers Verus uses for unreachable code. Usually harmless to skip, but we reject rather than silently strip in case a future pipeline relies on them.
-* **`StmX::OpenInvariant`** — atomic invariant opening for concurrent verification. Out of scope until concurrency support lands.
+* **`StmX::OpenInvariant`** — atomic invariant opening for concurrent verification. Reframed 2026-05-12 from "concurrency-blocked" to "cross-crate-blocked": Verus's `ast_to_sst` already prepares the verification block (`let inner = arb; assume(inv.inv(inner)); body; assert(inv.inv(inner))`) before wrapping in `StmX::OpenInvariant(stm)`. The marker itself signals "no unwinding" (which Tactus doesn't model anyway) plus namespace tracking for nested opens. The actual blocker for exec-mode usage is that the inner block references vstd-side spec fns (`AtomicInvariant::inv`, `LocalInvariant::inv`, `Inv::namespace()`) plus the `InternalFun::OpenInvariantMask` lowering, all of which require Phase-3-style cross-crate spec fn availability (#122). Once cross-crate spec inlining lands for vstd specifically, OpenInvariant should fall out as a near-trivial walker arm: `StmX::OpenInvariant(inner) => build_wp(inner, after, ctx, loop_stack)` — the inner SST is already shaped for verification. Currently kept as Err with the original rejection message.
 * **`StmX::ClosureInner`** — LANDED (#93). The `StmX::ClosureInner` variant gained a `ast_body: Expr` field populated by `ast_to_sst` (see `vir/src/sst.rs`), and Tactus reads it to render the closure as a first-class Lean lambda. The closure body's own verification scope (overflow checks etc.) emits as a separate set of theorems via `Wp::ClosureBody`'s walker, which pushes `∀ p : T, h_p_bound → ...` binders for each closure param. Pinned by `test_exec_closure_decl`, `test_exec_closure_decl_wrong_ensures`, `test_exec_closure_body_overflow_caught` (negative — soundness probe), `test_exec_closure_body_safe_arithmetic`.
 
 #### Expression-level forms rejected by `sst_exp_to_ast_checked`
@@ -1336,6 +1363,8 @@ Accepted via #57: **`cond: None`** loops (the form Verus produces when lowering 
 
   Post-hoc extraction from the built Wp tree was also considered: Wp::Let conflates mutation-as-shadowing (`is_init: false` assignments) with new-binding lets, so walking the Wp tree can't distinguish "external mod" from "local let" without information that the pre-pass already has natively. **Conditions for revisiting**: (a) a profile flags this as load-bearing on a real codebase, or (b) Verus upstream stashes pre-computed mod sets on `StmX::Loop` (orthogonal change, eliminates the pass entirely), or (c) a refactor of `build_wp` makes the threading natural — e.g., a general `WpCtx`-style accumulator that all statement variants already touch. None apply today; clean separation wins.
 * **Sanity-check allowlist auto-derived from `TactusPrelude.lean` (#118).** `extract_prelude_names` parses the prelude text at first call and caches the result via `OnceLock`. Adding a new `axiom NAME` / `def NAME` / `noncomputable def NAME` / `syntax "NAME"` / `macro "NAME"` / `elab "NAME"` to `TactusPrelude.lean` automatically updates the sanity allowlist — no `sanity.rs` edit required. Pre-#118 the list was a hardcoded `matches!` arm prone to drift. Pinned by `extract_prelude_names_recognises_current_prelude` (the auto-derived set still contains every name the legacy hardcoded arm did) and `extract_prelude_names_handles_each_form` (each prelude declaration form is recognised).
+* **Sanity check returns Err, not panic (landed 2026-05-12).** `debug_check` originally panicked on unresolved references, which killed the test harness process and prevented graceful error reporting. Now it returns `Result<(), String>` and callers (`check_proof_fn`, `check_exec_fn`) propagate as `CheckResult::Failed`. Test pinning becomes possible: probe tests can assert specific sanity-error patterns via `=> Err(_)`. Pre-fix, the panic was either masked by accidental cmd ordering or by test harness signal handling — neither was reliable.
+* **Artifact written before sanity check (landed 2026-05-12).** `pp_commands` + `write_lean_file` now run BEFORE `debug_check`, so the generated `.lean` is always on disk for inspection (per the path mentioned in error messages) — even when sanity rejects. Pre-fix, sanity-rejection meant no artifact was written; users couldn't `cat` the file to see what Tactus generated. Inverting the order makes debugging easier without changing the error path.
 * **Expected VIR variant list for coverage is hand-maintained.** `tactus_coverage.rs` lists variants we expect to see. Macro-deriving from the enum would need Verus-upstream `strum` derives — not feasible without vendoring changes.
 * **`_tactus_d_old` not gensym'd** — see its dedicated section.
 * **`OblCtx::with_frame` uses `im::Vector` (LANDED 2026-05-09).** Originally `Vec<CtxFrame>`, with `clone()` cost O(N) per `with_frame` call → O(N²) total memory across deeply-nested recursion. Switched to `im::Vector<CtxFrame>` (RRB-tree with structural sharing): `clone()` is O(1), `push_back` O(log N). The walker pattern `let new_obl = obl.with_frame(f); recurse(&new_obl)` keeps its API verbatim; the dependency adds `im = "15"`. Same session also closed an adjacent allocation pattern: `loop_stack: &[&WpLoopCtx]` → `&LoopStack<'p>` linked-list (`enum LoopStack { Empty, Cons(&WpLoopCtx, &LoopStack) }`) where each nested loop's `Cons` cell lives on the caller's stack frame, no heap.
@@ -2018,7 +2047,17 @@ nlinarith [...] }` once Tier 1 lands.
 
 These are deferred by design — the current slice is single-crate exec+proof-fn verification.
 
-* **Cross-crate verification** — `CrateDecls.lean` files holding signatures for downstream crates. DESIGN.md "Cross-crate spec fn availability".
+* **Cross-crate verification** — narrower than originally framed; see audit results next. The 2026-05-12 audit (#122 probes 1-6) established that Verus's `merge_krates` already brings imported crates' fns into the merged `vir_crate` Tactus receives, and `export_crate` preserves `pub open spec fn` bodies. Most "cross-crate" scenarios work today:
+  - Probe 1-3 (`pub open spec fn` calls from vstd): work end-to-end. The standalone def emits via dep_order's normal walk.
+  - Probe 4 (`Option<u8>` via `vstd::prelude::*`): works.
+  - Probe 6 (local `pub uninterp spec fn`): works after the 2026-05-12 body-less emission fix (now emits as `Command::Axiom`).
+
+  The genuine remaining gap (Probe 5, `vstd::seq::Seq`): external_body types currently emit as empty `structure` rather than as opaque types. See "Trait class+instance emission: deferred edges" above for the soundness concern. The `CrateDecls.lean`-per-crate-file infrastructure originally envisioned is NOT what's blocking — `merge_krates` does the work. The narrower fix (opaque-type emission for external_body) is a more targeted piece of work.
+
+  Tasks still tracked under cross-crate umbrella:
+  - **#125 cross-crate trait method decls** — when the trait method decl's `Fun` isn't in `fn_map` (genuinely cross-crate from a non-vstd-prelude path), `spec_source` returns Err. Currently rare in practice because vstd's traits aren't usually trait_method_impl'd in user crates that Tactus verifies.
+  - **External-body type opaque emission** — see deferred-edges section above.
+  - **Dynamic dispatch via `dyn Trait`** — same cross-crate rejection path as #125.
 * **`#[verifier::heartbeats(N)]` attribute** — per-fn Lean `maxHeartbeats` override. DESIGN.md mentions; not wired through `vir::ast::FunctionAttrsX`.
 * **Lean version pinning / CI matrix.** `lean-toolchain` is pinned to `v4.25.0`; tactic behaviour could shift on upgrade. No automated regression against multiple Lean versions.
 * **Per-module `.lean` file generation.** Current design emits one file per fn (`target/tactus-lean/{crate}/{fn}.lean`). At scale, per-module would amortize preamble and olean caching; HANDOFF notes it as future work.
@@ -2319,6 +2358,205 @@ The triangle these form:
 * Shape-drift tests catch *semantic shifts* at test time.
 
 Each closes a different hole.
+
+### Trait class and instance emission (landed 2026-05-12)
+
+Each Verus trait maps to a Lean `class`; each `impl Tr for T` maps
+to a Lean `instance`. The emission shape is governed by three
+co-dependent decisions: which classes to emit, which instances to
+emit, and what bodies to render for class defaults and instance
+methods.
+
+**Class emission gate** (`generate.rs` trait loop): emit `class Tr`
+if EITHER `refs.traits` contains it (proof body or typ_bound brought
+it into scope) OR any instance of `Tr` will emit
+(`traits_with_emitted_impl`, derived from the trait_impls gate
+below). The OR captures the structural co-dependency: an emitted
+instance references the class, so the class MUST emit too.
+
+**Instance emission gate** (`generate.rs` trait_impls loop): emit
+`instance : Tr T` iff BOTH:
+* `Tr` is in `refs.traits` (something brought the trait into scope —
+  via typ_bound, Dynamic-dispatch call site, or the exec-callee-spec
+  walk that picks up trait method decl typ_bounds).
+* `T` is in `refs.datatypes` (the implementor type is referenced).
+
+For non-Datatype implementors (primitives, generics, tuples), the
+second check is vacuously true.
+
+Pre-2026-05-12 the gate was `refs.traits.contains` alone, which was
+correlated-by-accident with method-reach: traits only entered
+`refs.traits` when an impl method body was walked, so the implicit
+gate was "any impl method reached → emit all impls." Body-less spec
+fn emission (#147 follow-up) broke that correlation, surfacing the
+latent design flaw. The trait+implementor gate makes the structural
+property explicit. An intermediate Rule Y gate ("any method_impl
+reachable from proof fn") was tried and rejected: it failed for
+default-inheriting impls (`impl Foo for Q {}`), where Verus's
+resolution at the call site routes through the trait method decl —
+no specific impl method appears in needed_fn_set.
+
+**Class structure** (`to_lean_fn::trait_to_ast`):
+* `ClassMethod` carries `name`, `ty`, optional `default: Option<Expr>`,
+  and `termination_by: Vec<Expr>`.
+* For spec-mode methods with a trait-side default body, `default`
+  renders the actual body via `vir_expr_to_ast`. Lean unfolds class
+  defaults during typeclass dispatch — the body is load-bearing for
+  spec methods.
+* For exec/proof methods, `default` renders the placeholder
+  `default` (Lean's `Inhabited`-typeclass-provided value). Two
+  reasons: (1) rendering exec bodies via `vir_expr_to_ast` panics
+  on `Assign` / `Loop` / `Return` (exec-mode constructs the spec
+  renderer doesn't handle), (2) the body isn't load-bearing —
+  `walk_call` inlines specs, not bodies via typeclass dispatch.
+* `termination_by` is rendered only for spec methods (exec/proof
+  bodies are placeholders so don't need termination).
+
+**Instance structure** (`to_lean_fn::trait_impl_to_ast`):
+* Methods with `body = None` are filtered entirely — they inherit
+  from the class default. For an empty impl (`impl Tr for T {}`),
+  this yields `instance : Tr T where` with no methods listed; Lean
+  dispatches via the class.
+* For `body = Some` methods: spec methods render actual body via
+  `vir_expr_to_ast` (load-bearing); exec/proof methods render the
+  `default` placeholder.
+
+**Shared `call_inlining` abstraction** (`lean_verify/src/call_inlining.rs`):
+* `spec_source(callee, fn_map) -> Result<&FunctionX, &Fun>`:
+  resolves `TraitMethodImpl → kind.method`. Returns `Err(method)`
+  for the cross-crate case where the trait method decl isn't in
+  the map. `sst_to_lean::resolve_callee` propagates the error
+  (emission can't proceed without spec_callee); `dep_order` falls
+  back to `callee`.
+* `CallInlinedClauses { requires, ensures }` holds the VIR-AST
+  clauses Tactus inlines at every call site. `requires` is
+  `spec_callee.require`; `ensures` is `spec_callee.ensure.0` plus
+  `callee.ensure.0` when `callee` is a `TraitMethodImpl` (#86
+  impl-strengthening — caller gets the conjunction of trait and
+  impl contracts).
+* `collect_inlined_at_call(callee, spec_callee) -> CallInlinedClauses`
+  is the single source of truth. Both `walk_call` (emission) and
+  `collect_references` + `order_spec_fns` (refs collection +
+  ordering) consume this. Adding a new inlined clause kind happens
+  in one place; drift between dep walk and emission is structurally
+  prevented.
+
+**Dep walk follows exec-callee specs**: when the worklist hits an
+exec/proof callee (in `all_fn_map` but not in `spec_fn_map`), walk
+its `require`/`ensure` clauses via `collect_inlined_at_call` for
+transitive spec-fn refs. The body is NOT walked — it's not inlined
+at call sites, only the specs are. For `TraitMethodDecl` entries
+with `has_default: true`, the body IS walked (it becomes a class
+default, which Lean elaborates via typeclass dispatch — refs inside
+must be in the preamble).
+
+**Sanity check predefines class methods in scope**: before checking
+any default body, all class method names are added to the binder
+scope. Class defaults can reference each other (standard typeclass
+self-reference pattern: `main := fun self => self.helper`), so the
+scope must be primed.
+
+**Pinned tests**:
+* `test_trait_two_impls`, `test_assoc_type_basic`, etc. — existing
+  trait tests pass under the new gate.
+* `test_exec_call_trait_default*` — empty impls inheriting defaults
+  verify via class defaults; instances emit with no methods listed.
+* `test_inlined_ensure_references_trait_spec_method` — typeclass
+  dispatch in #86-strengthened inlined ensures (`Foo.predicate b`)
+  resolves via the instance.
+* `test_trait_default_body_references_other_trait_method` — Case A
+  pinned as Err, see deferrals below.
+
+### Trait class+instance emission: deferred edges
+
+* **Case A: trait default body whose ensures references another trait
+  spec method.** Pinned by
+  `test_trait_default_body_references_other_trait_method`. The
+  structural emission is correct — class declaration with default,
+  instance with the impl's spec method body, dep walk reaches the
+  right places. The remaining failure is the closer (`tactus_auto`)
+  can't unfold `Foo.predicate q` in typeclass-method position:
+  `try unfold predicate at *` targets the standalone def name,
+  not the typeclass-method form. Same family as the existing "spec
+  fn in goal position needs unfold" gap (documented under "Tactic /
+  automation limitations") but the unfold-target is different.
+  Forward path: extend `tactus_auto`'s toolbox with a tactic that
+  unfolds typeclass-method calls by rewriting via the resolved
+  instance, OR provide a user-controllable per-trait-method unfold
+  hint.
+
+* **External-body type latent soundness concern.** Types declared
+  with `#[verifier::external_body]` (canonical examples:
+  `vstd::seq::Seq`, `vstd::set::Set`, `vstd::map::Map`) currently
+  emit as empty `structure ... where deriving Inhabited`. Empty
+  structs in Lean's model have a unique inhabitant — this lets
+  users prove `seq.Seq.push s x = s` (which is FALSE in vstd's
+  semantics; `push` produces a sequence with one more element).
+  Currently no test exploits this, but it's a real soundness gap
+  any external_body type with operations is vulnerable to. Forward
+  path: emit external_body types as opaque (`axiom seq.Seq : Type →
+  Type` + companion `axiom seq.Seq.inhabited (A : Type) :
+  Inhabited (seq.Seq A)` for typeclass coherence). Audit pinned
+  during the 2026-05-12 cross-crate probe; not blocking but
+  worth doing before Tactus is used on code that reasons about
+  external types' semantics.
+
+* **Proof-fn trait method defaults — UNTESTED and structurally
+  suspect.** `trait_to_ast` iterates all trait methods regardless of
+  mode, rendering each as a `ClassMethod`. For proof fns:
+  * The class method's `ty` is `Self → ReturnType`, but proof fns
+    produce theorems (`Prop`-valued), not values of that type.
+  * The body is tactic text, not a value expression. With class-
+    defaults landed, the mode check routes proof fn bodies through
+    the `default` placeholder so vir_expr_to_ast doesn't see them —
+    but the class method's TYPE remains wrong.
+
+  Realistic frequency: probably rare. Proof fn trait methods are
+  uncommon in Verus codebases; users typically write
+  `proof fn lemma<T: Trait>(...)` as standalone lemmas.
+
+  Forward path: filter proof-fn methods out of class declarations
+  entirely (emit them as separate top-level theorems with the
+  trait bound + Self typeclass parameter in scope), OR represent
+  proof-fn methods as `ClassMethod` with type `Self → Prop` (the
+  ensures becomes the theorem statement, body the tactic).
+
+* **Recursive default bodies — untested.** A trait default body that
+  calls itself (or another trait method that recurses back). Verus's
+  termination check filters most pathological cases, and `termination_by`
+  IS rendered for spec method defaults. But: no test pins a
+  recursive default. If a recursive default is added, the
+  termination clause may need different handling (Lean's WF
+  analysis vs Verus's height-based termination).
+
+* **Associated-typed default bodies — untested.** A default body whose
+  return type is `Self::Output`. Theoretically works: outParam class
+  type params are emitted, and `typ_maybe_projection_to_expr` renders
+  `Self::Output` as the bare `Output` (class type-param) name. Not
+  pinned by any test; would surface if vstd-style abstract types
+  with default behavior land in the proof surface.
+
+* **Generic impls (`impl<T> Foo for Vec<T>`).** The implementor short
+  name (`Vec`) needs to be in `refs.datatypes` for the gate to
+  fire. For concrete instantiations (`Vec<u8>`), the path's
+  short_name is still `Vec` (Tactus uses short_name throughout, no
+  type-args in the name). Likely works but not pinned by a
+  dedicated test.
+
+* **TraitMethodImpl with body=None and no trait default.**
+  Structurally invalid (Verus rejects "impl missing required method").
+  `trait_impl_to_ast` skips body=None methods silently — if this
+  state ever reaches Tactus (Verus bug, pipeline change), Lean
+  would catch the missing-method-in-instance error directly. No
+  `debug_assert` today; add if/when motivated.
+
+* **Pure exec-call-with-spec-fn-in-ensures probe missing.**
+  `test_inlined_ensure_references_trait_spec_method` exercises the
+  exec-callee-spec walk via the trait method context. A simpler
+  probe (exec fn `A` calling exec fn `B` whose ensures references a
+  free-standing spec fn) would more directly pin the abstraction
+  outside the trait setup. Worth adding if any change to the dep
+  walk is suspected.
 
 ### Code review strategy
 
