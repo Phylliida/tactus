@@ -160,44 +160,29 @@ fn krate_preamble(
         .map(|f| (&f.name, *f))
         .collect();
 
-    // First pass over trait_impls: decide which Instances will emit,
-    // gated on method-impl reachability (the proof actually calls into
-    // this specific impl). Two derived sets fall out:
+    // Emit trait classes (without instances). Tactus's verification
+    // model doesn't use Lean's typeclass dispatch: exec-fn calls inline
+    // the callee's spec via `walk_call`'s existential frames (the
+    // function call doesn't appear in generated Lean); proof-fn calls
+    // render through `vir_expr_to_ast` and reference standalone def
+    // names, not class methods. The trait class declaration is needed
+    // only when a theorem's binders include a `[Class T]` bracket
+    // (abstract typ_bound proofs) — in which case the bracket itself
+    // IS the instance, no Instance command required.
     //
-    // - `instances_to_emit`: which TraitImpls we'll produce Instance
-    //   commands for, paired with their method_impls so the second
-    //   pass doesn't re-filter.
-    // - `traits_with_emitted_impl`: every trait whose Instance is in
-    //   `instances_to_emit`. The class declaration for these traits
-    //   MUST also emit — otherwise the Instance references an
-    //   unresolved class. This is the structural co-dependency that
-    //   the pre-fix `refs.traits`-only gate hid by accident: traits
-    //   only entered `refs.traits` when one of their impls' methods
-    //   was walked, so the two sets were correlated. Body-less
-    //   emission broke the correlation; making it explicit fixes it.
+    // The trait_impls emission loop that previously sat here always
+    // emitted dead code: instances were declared but never referenced.
+    // Worse, for empty impls (`impl Tr for T {}` inheriting defaults),
+    // the impl method body=None rendered as `sorry`, which sanity-
+    // check rejected. Deleting the loop fixes the four
+    // `test_exec_call_trait_default*` failures without adding any
+    // class-default machinery.
     //
-    // Pure-assoc-type impls (no method_impls): not emitted today.
-    // Surface a separate rule (e.g., assoc-type reachability) if
-    // that case starts to bite.
-    let instances_to_emit: Vec<(&TraitImpl, Vec<&FunctionX>)> = krate.trait_impls.iter()
-        .filter_map(|ti| {
-            let method_impls: Vec<&FunctionX> = all_fns.iter()
-                .filter(|f| matches!(&f.kind, FunctionKind::TraitMethodImpl { impl_path, .. }
-                    if impl_path == &ti.x.impl_path))
-                .copied()
-                .collect();
-            let any_method_needed = method_impls.iter()
-                .any(|m| refs.needed_fns.contains(&m.name));
-            if any_method_needed { Some((ti, method_impls)) } else { None }
-        })
-        .collect();
-    let traits_with_emitted_impl: std::collections::HashSet<&str> = instances_to_emit.iter()
-        .map(|(ti, _)| short_name(&ti.x.trait_path))
-        .collect();
-
+    // The Instance AST node + lean_pp + sanity arms are intentionally
+    // kept — re-enabling emission later (if Tactus's model ever uses
+    // typeclass dispatch) is a one-loop reintroduction.
     for tr in &krate.traits {
-        let n = short_name(&tr.x.name);
-        if refs.traits.contains(n) || traits_with_emitted_impl.contains(n) {
+        if refs.traits.contains(short_name(&tr.x.name)) {
             cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup)));
         }
     }
@@ -224,16 +209,6 @@ fn krate_preamble(
                 cmds.push(Command::Mutual(inner));
             }
         }
-    }
-
-    for (ti, method_impls) in &instances_to_emit {
-        let assoc_types: Vec<&AssocTypeImplX> = krate.assoc_type_impls.iter()
-            .filter(|a| a.x.impl_path == ti.x.impl_path)
-            .map(|a| &a.x)
-            .collect();
-        cmds.push(Command::Instance(
-            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types)
-        ));
     }
 
     (cmds, ns)
