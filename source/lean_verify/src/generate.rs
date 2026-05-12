@@ -164,29 +164,50 @@ fn krate_preamble(
         .collect();
     let refs = dep_order::collect_references(&spec_fn_map, &method_lookup, root_fns);
 
-    // Emit trait classes (without instances). Tactus's verification
-    // model doesn't use Lean's typeclass dispatch: exec-fn calls inline
-    // the callee's spec via `walk_call`'s existential frames (the
-    // function call doesn't appear in generated Lean); proof-fn calls
-    // render through `vir_expr_to_ast` and reference standalone def
-    // names, not class methods. The trait class declaration is needed
-    // only when a theorem's binders include a `[Class T]` bracket
-    // (abstract typ_bound proofs) — in which case the bracket itself
-    // IS the instance, no Instance command required.
+    // Decide which trait_impls will emit (method-reach gate, Rule Y):
+    // an impl emits an `Instance` command iff at least one of its
+    // method impls is reachable from the proof fn. Reaching a method
+    // means the proof transitively calls it (the call lands in
+    // `refs.needed_fns`-equivalent via the worklist walk). Impls
+    // whose methods are all unreached are dead weight for this
+    // proof.
     //
-    // The trait_impls emission loop that previously sat here always
-    // emitted dead code: instances were declared but never referenced.
-    // Worse, for empty impls (`impl Tr for T {}` inheriting defaults),
-    // the impl method body=None rendered as `sorry`, which sanity-
-    // check rejected. Deleting the loop fixes the four
-    // `test_exec_call_trait_default*` failures without adding any
-    // class-default machinery.
+    // The set of traits whose Instance will emit is derived next —
+    // those traits' classes MUST also emit (the Instance references
+    // the class). This is the structural co-dependency that the
+    // pre-2026-05-12 `refs.traits`-only gate hid by accident.
     //
-    // The Instance AST node + lean_pp + sanity arms are intentionally
-    // kept — re-enabling emission later (if Tactus's model ever uses
-    // typeclass dispatch) is a one-loop reintroduction.
+    // `needed_fn_set` is the proof's transitive callee set, computed
+    // here from the spec_fn dep walk's output groups. (We don't get
+    // it directly from `refs` because `References` doesn't surface
+    // the visited set; deriving it from `groups` is cheap and keeps
+    // `dep_order`'s public surface minimal.)
+    let groups = dep_order::order_spec_fns(&spec_fn_map, &method_lookup, &all_fns, root_fns);
+    let needed_fn_set: std::collections::HashSet<&Fun> = groups.iter()
+        .flat_map(|g| match g {
+            FnGroup::Single(f) => vec![&f.name],
+            FnGroup::Mutual(fs) => fs.iter().map(|f| &f.name).collect(),
+        })
+        .collect();
+    let instances_to_emit: Vec<(&TraitImpl, Vec<&FunctionX>)> = krate.trait_impls.iter()
+        .filter_map(|ti| {
+            let method_impls: Vec<&FunctionX> = all_fns.iter()
+                .filter(|f| matches!(&f.kind, FunctionKind::TraitMethodImpl { impl_path, .. }
+                    if impl_path == &ti.x.impl_path))
+                .copied()
+                .collect();
+            let any_method_needed = method_impls.iter()
+                .any(|m| needed_fn_set.contains(&m.name));
+            if any_method_needed { Some((ti, method_impls)) } else { None }
+        })
+        .collect();
+    let traits_with_emitted_impl: std::collections::HashSet<&str> = instances_to_emit.iter()
+        .map(|(ti, _)| short_name(&ti.x.trait_path))
+        .collect();
+
     for tr in &krate.traits {
-        if refs.traits.contains(short_name(&tr.x.name)) {
+        let n = short_name(&tr.x.name);
+        if refs.traits.contains(n) || traits_with_emitted_impl.contains(n) {
             cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup)));
         }
     }
@@ -200,7 +221,6 @@ fn krate_preamble(
         cmds.extend(to_lean_fn::datatype_group_to_cmds(&group, emit_accessors));
     }
 
-    let groups = dep_order::order_spec_fns(&spec_fn_map, &method_lookup, &all_fns, root_fns);
     for group in &groups {
         match group {
             FnGroup::Single(f) => {
@@ -213,6 +233,19 @@ fn krate_preamble(
                 cmds.push(Command::Mutual(inner));
             }
         }
+    }
+
+    // Emit the Instance commands chosen above (after spec_fns so
+    // standalone defs that instance method bodies might reference
+    // are already declared).
+    for (ti, method_impls) in &instances_to_emit {
+        let assoc_types: Vec<&AssocTypeImplX> = krate.assoc_type_impls.iter()
+            .filter(|a| a.x.impl_path == ti.x.impl_path)
+            .map(|a| &a.x)
+            .collect();
+        cmds.push(Command::Instance(
+            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types)
+        ));
     }
 
     (cmds, ns)

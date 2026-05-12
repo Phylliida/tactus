@@ -8937,30 +8937,25 @@ test_verify_one_file! {
 //
 // If this test passes: hypothesis confirmed, Instance commands are
 // indeed unnecessary even in this subtle case.
-// Pinned regression test for the interaction between #86 impl-
-// strengthening and trait-method references inside inlined ensures.
+// Regression test for the interaction between #86 impl-strengthening
+// and trait-method references inside inlined ensures. End-to-end
+// verifies the chain:
 //
-// Scenario: exec fn `caller` calls `b.check()`. `walk_call` inlines
-// BOTH the trait method decl's ensures AND the impl's ensures
-// (#86 impl-strengthening — caller sees the conjunction).
+//   1. `collect_inlined_at_call` enumerates BOTH trait and impl
+//      ensures (#86), producing a conjunction at the call site.
+//   2. The dep walk follows into exec-callee specs via the shared
+//      `call_inlining` abstraction so `predicate` (impl's standalone
+//      def) reaches the preamble.
+//   3. The trait class declaration emits because its impl's
+//      methods are reachable (method-reach gate).
+//   4. The `Foo Bar` Instance emits with the impl method bodies,
+//      so Lean's typeclass dispatch resolves `Foo.predicate b`.
+//   5. Class-defaults aren't actually exercised here (no inherited
+//      methods), but the machinery sits alongside.
 //
-// 2026-05-12 progress:
-//   * Originally, the bare `predicate` (from the impl's ensures'
-//     standalone def reference) was unresolved because
-//     `collect_references` didn't follow into exec-callees' specs.
-//   * The `call_inlining` shared abstraction + dep-walk extension
-//     closed that gap. The standalone `Bar::predicate` def now
-//     emits and `predicate b` resolves.
-//
-// Remaining failure: `Foo.predicate b` (from the trait's ensures,
-// typeclass form) requires a `Foo Bar` instance to dispatch in
-// Lean — but instance emission was deleted on the same day, because
-// for the existing tests instances were dead weight. This test
-// reveals the case where they aren't.
-//
-// Forward path: re-add instance emission with the method-reach
-// gate, plus class-defaults for body=None inheritance handling.
-// See DESIGN.md "Trait class+instance emission" (to be written).
+// The `proof { try unfold predicate at * }` is the documented
+// "spec fn in hyp position needs unfolding" workaround — pre-
+// existing gap unrelated to this test's core point.
 test_verify_one_file! {
     #[test] test_inlined_ensure_references_trait_spec_method verus_code! {
         trait Foo {
@@ -8986,15 +8981,51 @@ test_verify_one_file! {
         fn caller(b: &Bar) -> (r: bool)
             ensures r ==> b.v > 0
         {
+            proof { try unfold predicate at * }
             b.check()
         }
-    } => Err(e) => {
-        // Lean elaboration rejects `Foo.predicate b` because no
-        // `Foo Bar` instance is in scope. When class-defaults +
-        // instance re-emission lands, this should flip to Ok(()).
-        let s = format!("{:?}", e);
-        assert!(s.contains("failed to synthesize") || s.contains("Foo Bar"),
-            "expected Lean instance-synthesis error mentioning Foo Bar, got: {}", s);
-    }
+    } => Ok(())
+}
+
+// Case A from the class-defaults design discussion (2026-05-12):
+// trait method default body whose ensures references another trait
+// spec method on Self. The setup itself is tricky to construct in
+// Verus (the default's exec body can't call the spec method, so
+// the ensures must be satisfied trivially), AND the
+// inherited-default case still hits "failed to synthesize Foo Q" —
+// suggesting our class-defaults machinery isn't fully closing the
+// loop for the empty-impl-inherits-default scenario in conjunction
+// with #86 impl strengthening.
+//
+// Pinned as Err for now; the underlying gap is documented in
+// DESIGN.md "Proof-fn trait method defaults" / "Trait class+instance
+// emission". Flip to Ok(()) when the empty-impl-with-default-
+// referencing-trait-method case is fully wired through.
+test_verify_one_file! {
+    #[test] test_trait_default_body_references_other_trait_method verus_code! {
+        trait Foo {
+            spec fn helper(&self) -> bool;
+
+            fn compute(&self) -> (r: bool)
+                ensures r == self.helper()
+            {
+                false
+            }
+        }
+
+        struct Q { v: u8 }
+
+        impl Foo for Q {
+            spec fn helper(&self) -> bool { self.v > 0 }
+        }
+
+        #[verifier::tactus_auto]
+        fn caller(q: &Q) -> (r: bool)
+            ensures r == (q.v > 0)
+        {
+            proof { try unfold helper at * }
+            q.compute()
+        }
+    } => Err(_)
 }
 

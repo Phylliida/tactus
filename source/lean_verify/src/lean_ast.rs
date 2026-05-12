@@ -262,6 +262,23 @@ pub struct Class {
 pub struct ClassMethod {
     pub name: String,
     pub ty: Expr,
+    /// Optional default body for this method, rendered as
+    /// `name : ty := default`. When present, instances may omit
+    /// the method and Lean uses this default. Populated from a
+    /// trait method's body when the trait declaration provides one
+    /// (Verus's `fn method(&self) ensures P { body }` shape — the
+    /// default body is `body`).
+    ///
+    /// For trait methods without a default body (Verus's
+    /// `fn method(&self) ensures P;` — abstract decl), this is `None`
+    /// and the rendering is just `name : ty` (impls must override).
+    pub default: Option<Expr>,
+    /// Termination clause(s) for recursive default bodies — rendered
+    /// as `termination_by d₁` or `termination_by (d₁, d₂, …)` after
+    /// the `:= default`. Populated from the trait method's
+    /// `decrease` field. Empty when the default is non-recursive
+    /// or when there's no default.
+    pub termination_by: Vec<Expr>,
 }
 
 #[derive(Debug, Clone)]

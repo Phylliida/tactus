@@ -87,6 +87,19 @@ pub fn collect_references<'a>(
             for clause in inlined.requires.iter().chain(inlined.ensures.iter()) {
                 collect_fun_refs(clause, &mut worklist);
             }
+            // TraitMethodDecl with a default body: the body becomes
+            // a class default, which Lean inlines via typeclass
+            // dispatch. Refs inside the default body need the same
+            // treatment as spec-fn bodies — they're effectively
+            // inlined at use sites. Without this walk, a default
+            // body referencing another trait spec method (Case A
+            // from the design discussion) would leave that ref
+            // unresolved in the class declaration.
+            if matches!(f.kind, FunctionKind::TraitMethodDecl { has_default: true, .. }) {
+                if let Some(body) = &f.body {
+                    collect_fun_refs(body, &mut worklist);
+                }
+            }
         }
     }
 
@@ -215,6 +228,14 @@ pub fn order_spec_fns<'a>(
             let inlined = crate::call_inlining::collect_inlined_at_call(f, spec_callee);
             for clause in inlined.requires.iter().chain(inlined.ensures.iter()) {
                 collect_fun_refs(clause, &mut worklist);
+            }
+            // TraitMethodDecl with default body: walk it so refs in
+            // the class default land in `needed`. Mirrors the
+            // identical branch in `collect_references`.
+            if matches!(f.kind, FunctionKind::TraitMethodDecl { has_default: true, .. }) {
+                if let Some(body) = &f.body {
+                    collect_fun_refs(body, &mut worklist);
+                }
             }
         }
     }
