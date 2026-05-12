@@ -8834,16 +8834,32 @@ test_verify_one_file! {
 // + `pub uninterp spec fn` for its methods (`empty`, `len`, `push`, etc.).
 // Verus axiomatizes these; bodies are deliberately None.
 //
-// Result (audit 2026-05-12): GENUINE CROSS-CRATE GAP.
-// - `seq.Seq` emits as an empty `structure ... where deriving Inhabited`
-//   (zero fields) — WRONG; should be opaque type.
-// - `seq.Seq.len`, `seq.Seq.push`, `seq.Seq.empty` NOT emitted at all
-//   (dep_order's `build_spec_fn_map` filters to `body.is_some()`).
-// - Generated Lean references `seq.Seq.len Int (seq.Seq.push ...)` which
-//   are unknown constants → Lean elaboration error.
+// Result (audit 2026-05-12): post body-less emission fix, the uninterp
+// spec fns emit as Lean axioms — `axiom seq.Seq.empty (A : Type) :
+// seq.Seq A`, etc. The previously-unresolved `seq.Seq.len/push/empty`
+// references now resolve. The remaining verification failure is
+// expected and correct: the goal `r = seq.Seq.len Int (seq.Seq.push ...
+// (seq.Seq.empty ...) 0)` can't be discharged without semantic info
+// about the axiomatized Seq operations (e.g., the lemma
+// `seq.Seq.len_push : ∀ s x, (s.push x).len = s.len + 1`, which
+// vstd defines but which Tactus doesn't currently emit because it
+// lives in a proof fn that doesn't reach the preamble walk).
 //
-// This is the real #122 work: uninterp spec fn emission as Lean axioms /
-// opaque defs, plus external-body type emission as Lean opaque types.
+// The "no semantic info on opaque types" failure is downstream of
+// #122 proper — once vstd's proof fns participate in the preamble
+// (likely via a CrateDecls-style mechanism), the lemma names would
+// resolve and users could `unfold` + cite them. For now, probe 5
+// is pinned as Err because: (a) the cross-crate spec dispatch
+// works (no more "unknown constant"), (b) the verification still
+// fails on the closer for the documented reason.
+//
+// Latent (separate follow-up): `seq.Seq` itself renders as an empty
+// `structure ... where deriving Inhabited` rather than an opaque type.
+// Empty structs have a unique inhabitant in Lean's model, which lets
+// callers prove `seq.Seq.push A s x = s` (both reduce to `Seq.mk`) —
+// a soundness concern for any external_body type. Tracked as a
+// follow-up audit finding; doesn't bite this probe because we don't
+// try to prove anything about Seq's contents.
 test_verify_one_file! {
     #[test] test_cross_crate_probe_5_seq_in_spec verus_code! {
         use vstd::seq::*;
@@ -8859,31 +8875,26 @@ test_verify_one_file! {
             1
         }
     } => Err(e) => {
-        // Failing as expected: real #122 gap. `seq.Seq` emits as empty
-        // struct (wrong — should be opaque); `seq.Seq.len/push/empty`
-        // not emitted at all (uninterp spec fns have body=None and are
-        // filtered out by `dep_order::build_spec_fn_map`).
+        // Cross-crate names resolve (no "unknown constant"); closer
+        // can't close the axiomatic equality. Both behaviours expected.
         let s = format!("{:?}", e);
-        assert!(s.contains("Unknown constant") || s.contains("unresolved"),
-            "expected Lean unknown-constant or Tactus unresolved-ref error");
+        assert!(s.contains("tactus_auto failed") && !s.contains("Unknown constant"),
+            "expected closer failure (not unknown-constant), got: {}", s);
     }
 }
 
-// Probe 6: isolate the `uninterp spec fn` gap.
-// Same shape as probe 5 but defines the uninterpreted spec fn locally
-// (no cross-crate involved). Same `body: None` shape → same emission
-// gap. Confirms the gap is about `body.is_none()` filtering, NOT
-// cross-crate per se.
+// Probe 6: `uninterp spec fn` body-less emission.
+// `pub uninterp spec fn my_oracle(x: int) -> int;` has `body=None` in
+// VIR. Prior to the audit's body-less emission fix, this hit a
+// "Tactus codegen produced unresolved references: unresolved my_oracle"
+// sanity-check rejection — dep_order's `build_spec_fn_map` filtered
+// body=None fns out, so the symbol was never declared in the preamble.
 //
-// Result (audit 2026-05-12): fails via the sanity check at
-// `lean_verify/src/generate.rs::debug_check` reporting
-// "Tactus codegen produced unresolved references: ... unresolved
-// `my_oracle`". Originally panicked (killing the test process);
-// fixed in the same session to return a normal `CheckResult::Failed`
-// so the rejection flows through Verus's standard error path.
-// Confirms the gap shape (body=None filtering in
-// `dep_order::build_spec_fn_map`); the real fix is "emit Lean
-// axiom/opaque for spec fns with no body".
+// Post-fix (2026-05-12): `to_lean_fn::spec_fn_to_ast` returns
+// `Command::Axiom(...)` instead of `Command::Def(...)` when body is
+// None. The Lean preamble emits `axiom my_oracle : Int → Int`,
+// the call site references resolve, and the closer discharges
+// `2 * x = 2 * my_oracle x` from the hypothesis `my_oracle x = x`.
 test_verify_one_file! {
     #[test] test_cross_crate_probe_6_uninterp_spec_fn_local verus_code! {
         pub uninterp spec fn my_oracle(x: int) -> int;
@@ -8896,12 +8907,6 @@ test_verify_one_file! {
         {
             2 * x
         }
-    } => Err(e) => {
-        // Sanity check now reports unresolved refs through the normal
-        // error path instead of panicking.
-        let s = format!("{:?}", e);
-        assert!(s.contains("unresolved") && s.contains("my_oracle"),
-            "expected Tactus sanity-check error mentioning `my_oracle`, got: {}", s);
-    }
+    } => Ok(())
 }
 

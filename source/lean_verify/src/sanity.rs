@@ -94,6 +94,18 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
             }
         }
 
+        // Axiom: declares a constant. Adds the name to `defined` so
+        // downstream references resolve. Binder types may themselves
+        // reference earlier top-level names; check them.
+        Command::Axiom(a) => {
+            defined.insert(a.name.clone());
+            let mut scope = scope_from_binders(&a.binders);
+            for b in &a.binders {
+                check_expr(&b.ty, defined, &mut scope, violations, &a.name);
+            }
+            check_expr(&a.ret_ty, defined, &mut scope, violations, &a.name);
+        }
+
         Command::Theorem(t) => {
             let mut scope = scope_from_binders(&t.binders);
             for b in &t.binders {
@@ -139,6 +151,7 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
                 match c {
                     Command::Def(d) => { defined.insert(d.name.clone()); }
                     Command::DefCurried(d) => { defined.insert(d.name.clone()); }
+                    Command::Axiom(a) => { defined.insert(a.name.clone()); }
                     Command::Datatype(dt) => { defined.insert(dt.name.clone()); }
                     _ => {}
                 }
