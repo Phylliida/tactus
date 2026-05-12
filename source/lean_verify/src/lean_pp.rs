@@ -224,6 +224,11 @@ fn write_command(out: &mut String, cmd: &Command, lm: &mut Landmarks) {
 }
 
 fn write_axiom(out: &mut String, a: &Axiom, lm: &mut Landmarks) {
+    for attr in &a.attrs {
+        out.push_str("@[");
+        out.push_str(attr);
+        out.push_str("] ");
+    }
     out.push_str("axiom ");
     out.push_str(&a.name);
     write_binders(out, &a.binders, lm);

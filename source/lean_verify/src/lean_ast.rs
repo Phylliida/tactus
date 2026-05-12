@@ -90,7 +90,7 @@ pub struct Def {
 }
 
 /// Axiom: declares a constant whose value is unspecified.
-/// `axiom <name> [binders] : <ret_ty>`.
+/// `[@[attr₁] @[attr₂]] axiom <name> [binders] : <ret_ty>`.
 ///
 /// Used for body-less spec fns (Verus's `pub uninterp spec fn`,
 /// external_body spec fns, cross-crate spec fns whose body was
@@ -98,11 +98,16 @@ pub struct Def {
 /// params + return type via `fn_binders_without_bound_hyps`, so an
 /// uninterp `spec fn f(x: int) -> int` becomes
 /// `axiom f : Int → Int` (the binder + ret_ty currying).
+///
+/// `attrs` carries Lean attribute markers (e.g., `"instance"`) — used
+/// for external_body datatype Inhabited stipulations:
+/// `@[instance] axiom T.instInhabited : Inhabited T`.
 #[derive(Debug, Clone)]
 pub struct Axiom {
     pub name: String,
     pub binders: Vec<Binder>,
     pub ret_ty: Expr,
+    pub attrs: Vec<String>,
 }
 
 /// Curried-form definition with pattern-matched equations.

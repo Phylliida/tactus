@@ -235,8 +235,22 @@ fn krate_preamble(
     // field-type references and group into SCCs so mutually recursive
     // datatypes (#109) emit as `mutual ... end` blocks.
     let referenced_dts = collect_referenced_datatypes(krate, &refs);
+    // Set of paths for external-body datatypes (`transparency == Never`).
+    // Used by `datatype_decl_cmd` to drop `deriving Inhabited` when a
+    // variant field references such a type — Lean's auto-derived
+    // Inhabited produces a *computable* instance that would depend on
+    // the external-body's axiomatic Inhabited (which has no executable
+    // code), failing the compiler IR check. A manual `noncomputable
+    // instance` is emitted instead by `datatype_inhabited_instance_cmd`.
+    let external_body_paths: std::collections::HashSet<&vir::ast::Path> = referenced_dts.iter()
+        .filter(|dt| matches!(dt.transparency, DatatypeTransparency::Never))
+        .filter_map(|dt| match &dt.name {
+            Dt::Path(p) => Some(p),
+            Dt::Tuple(_) => None,
+        })
+        .collect();
     for group in dep_order::order_datatypes(&referenced_dts) {
-        cmds.extend(to_lean_fn::datatype_group_to_cmds(&group, emit_accessors));
+        cmds.extend(to_lean_fn::datatype_group_to_cmds(&group, emit_accessors, &external_body_paths));
     }
 
     for group in &groups {

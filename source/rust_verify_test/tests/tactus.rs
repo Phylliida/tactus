@@ -8853,13 +8853,12 @@ test_verify_one_file! {
 // works (no more "unknown constant"), (b) the verification still
 // fails on the closer for the documented reason.
 //
-// Latent (separate follow-up): `seq.Seq` itself renders as an empty
-// `structure ... where deriving Inhabited` rather than an opaque type.
-// Empty structs have a unique inhabitant in Lean's model, which lets
-// callers prove `seq.Seq.push A s x = s` (both reduce to `Seq.mk`) —
-// a soundness concern for any external_body type. Tracked as a
-// follow-up audit finding; doesn't bite this probe because we don't
-// try to prove anything about Seq's contents.
+// Resolved (2026-05-12): `seq.Seq` now emits as `axiom seq.Seq :
+// Type → Type` + `@[instance] axiom seq.Seq.instInhabited (A : Type)
+// : Inhabited (seq.Seq A)` (rather than an empty structure with
+// unique inhabitant). The empty-struct soundness exploit (`cases s;
+// cases s'; rfl` collapsing distinct Seq ground terms) is closed by
+// construction — axioms have no constructors, `cases` fails.
 test_verify_one_file! {
     #[test] test_cross_crate_probe_5_seq_in_spec verus_code! {
         use vstd::seq::*;
@@ -9032,5 +9031,81 @@ test_verify_one_file! {
             q.compute()
         }
     } => Err(_)
+}
+
+// Soundness probe: external_body types emit as empty `structure` today,
+// which gives them a unique inhabitant. Two distinct ground terms of an
+// external_body type can be propositionally equated via `cases`. This
+// test exploits the gap to prove a statement that is FALSE in vstd's
+// semantics (and FALSE under the intended opaque encoding):
+// "any two opaque values are equal."
+//
+// Pre-fix (today, 2026-05-12): expected to pass verification incorrectly.
+// Post-fix: should fail (no equations between opaque ground terms).
+test_verify_one_file! {
+    #[test] test_external_body_soundness_gap_probe verus_code! {
+        #[verifier::external_body]
+        pub struct Opaque {}
+
+        proof fn any_two_opaques_equal(x: Opaque, y: Opaque)
+            ensures x == y
+        by {
+            cases x
+            cases y
+            rfl
+        }
+    } => Err(_)
+}
+
+// Soundness probe variant: a method-like axiomatization where two
+// distinct applications collapse. Mirrors the vstd `Seq::push s x = s`
+// concern more directly.
+test_verify_one_file! {
+    #[test] test_external_body_distinct_applications_collapse_probe verus_code! {
+        #[verifier::external_body]
+        pub struct Opaque {}
+
+        pub uninterp spec fn make_one() -> Opaque;
+        pub uninterp spec fn make_two() -> Opaque;
+
+        proof fn distinct_constructions_collapse()
+            ensures make_one() == make_two()
+        by {
+            cases (make_one())
+            cases (make_two())
+            rfl
+        }
+    } => Err(_)
+}
+
+// Inhabited probe: external_body type embedded in a multi-variant enum.
+// Tactus emits accessors for multi-variant enums with `| _ => default`
+// for unreachable arms — `default` needs `[Inhabited (Opaque A)]`.
+//
+// Today (empty-struct emission): Inhabited is auto-derived, so this passes.
+// Under fix Option C (axiom only, no Inhabited): would fail with Lean
+//   "failed to synthesize Inhabited (Opaque)".
+// Under fix Option F (axiom + Inhabited axiom): passes.
+//
+// Pinning as Ok() means: whatever we land, must preserve this. If we
+// land C, this test will start failing and we'll know we need the
+// Inhabited follow-up. If we land F, this stays passing.
+test_verify_one_file! {
+    #[test] test_external_body_embedded_in_enum verus_code! {
+        #[verifier::external_body]
+        pub struct Opaque {}
+
+        pub enum Wrapper {
+            Has(Opaque),
+            None,
+        }
+
+        #[verifier::tactus_auto]
+        fn discriminate(w: &Wrapper) -> (r: bool)
+            ensures r == matches!(w, Wrapper::None)
+        {
+            matches!(w, Wrapper::None)
+        }
+    } => Ok(())
 }
 
