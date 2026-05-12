@@ -8327,34 +8327,17 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Bool-op gap probe (flippable Err): free-var `&&` commutativity.
-// `&&` lowers to Prop `∧` (Tactus renders `bool` as `Prop`
-// unconditionally — see DESIGN.md § "Bool vs Prop"). The goal is
-// `(b1 ∧ b2) = (b2 ∧ b1)` — Prop equality, which needs `propext +
-// And.comm`. `simp_all`'s default set doesn't include `And.comm` (a
-// looping concern for unbounded simp), so this falls through. The
-// transparent user-side fix is to add an explicit tactic — see the
-// `_with_tauto` test below for the canonical shape. Same pattern as
-// `test_exec_xor_bool_free_vars_commutative`; documented additively
-// per DESIGN.md's "canonical pattern for Bool-operation gaps."
+// Bool-op pattern: `&&` commutativity. `&&` lowers to Prop `∧`
+// (Tactus renders `bool` as `Prop` unconditionally — see DESIGN.md
+// § "Bool vs Prop"), so the goal is the Prop equality `(b1 ∧ b2) =
+// (b2 ∧ b1)`. `simp_all` reduces `=`-to-`↔` for Props but doesn't
+// have `And.comm` in its default set (a looping concern for
+// unbounded simp). The transparent user-side fix is to name the
+// lemma at the assertion site — same canonical pattern as
+// `test_exec_xor_bool_free_vars_commutative` (DESIGN.md § "Bool vs
+// Prop").
 test_verify_one_file! {
-    #[test] test_exec_and_bool_free_vars_commutative_gap verus_code! {
-        #[verifier::tactus_auto]
-        fn check_and_commute(b1: bool, b2: bool) {
-            assert((b1 && b2) == (b2 && b1));
-        }
-    } => Err(_)
-}
-
-// Bool-op recovery probe: the user-side fix for the `_gap` above.
-// `simp_all [And.comm]` closes the Prop equality. `simp_all`'s
-// `=`-to-`↔` reduction strips one layer, and the explicit
-// `And.comm` lemma closes the remaining `b1 ∧ b2 ↔ b2 ∧ b1`. The
-// proof is visible at the assertion site, matching the
-// transparency-over-automation principle. Same shape as the
-// canonical `Bool.xor_comm` pattern (DESIGN.md § "Bool vs Prop").
-test_verify_one_file! {
-    #[test] test_exec_and_bool_free_vars_commutative_with_simp verus_code! {
+    #[test] test_exec_and_bool_free_vars_commutative verus_code! {
         #[verifier::tactus_auto]
         fn check_and_commute(b1: bool, b2: bool) {
             assert((b1 && b2) == (b2 && b1)) by { simp_all [And.comm] };
@@ -8362,22 +8345,10 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Bool-op gap probe (flippable Err): free-var `||` commutativity.
-// Same shape as the `&&` gap — `Or.comm` not in default simp set.
+// Bool-op pattern: `||` commutativity. Same shape as the `&&`
+// case — `Or.comm` named explicitly at the assertion site.
 test_verify_one_file! {
-    #[test] test_exec_or_bool_free_vars_commutative_gap verus_code! {
-        #[verifier::tactus_auto]
-        fn check_or_commute(b1: bool, b2: bool) {
-            assert((b1 || b2) == (b2 || b1));
-        }
-    } => Err(_)
-}
-
-// Bool-op recovery probe: `||` commutativity via `simp_all [Or.comm]`.
-// Same shape as the `And.comm` recovery — the explicit lemma at the
-// assertion site closes the Prop-equality goal.
-test_verify_one_file! {
-    #[test] test_exec_or_bool_free_vars_commutative_with_simp verus_code! {
+    #[test] test_exec_or_bool_free_vars_commutative verus_code! {
         #[verifier::tactus_auto]
         fn check_or_commute(b1: bool, b2: bool) {
             assert((b1 || b2) == (b2 || b1)) by { simp_all [Or.comm] };
@@ -8385,28 +8356,13 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Bool-op gap probe (flippable Err): De Morgan's law. Tests the
-// canonical Boolean identity `¬(a ∧ b) = (¬a ∨ ¬b)` for free vars.
-// Same Prop-equality gap as the commutativity probes. No single
-// `simp_all [lemma]` closes this without Mathlib (`not_and_or` is
-// in Mathlib); the user-side recovery uses `by_cases` instead —
-// see `_with_by_cases` below.
+// Bool-op pattern: De Morgan's law `¬(a ∧ b) = (¬a ∨ ¬b)`. No
+// single `simp_all [lemma]` closes this without Mathlib
+// (`not_and_or` lives there); the user-side fix uses `by_cases`
+// on both vars, then `simp_all` finishes each leaf. Works in
+// Lean core.
 test_verify_one_file! {
-    #[test] test_exec_demorgan_bool_free_vars_gap verus_code! {
-        #[verifier::tactus_auto]
-        fn check_demorgan(b1: bool, b2: bool) {
-            assert(!(b1 && b2) == (!b1 || !b2));
-        }
-    } => Err(_)
-}
-
-// Bool-op recovery probe: De Morgan via `by_cases` on both vars,
-// followed by `simp_all`. Closes via finite case analysis — at
-// each leaf the goal becomes a concrete Prop equality that simp_all
-// reduces. Works in Lean core (no Mathlib needed). Less elegant than
-// `tauto` would be, but transparent.
-test_verify_one_file! {
-    #[test] test_exec_demorgan_bool_free_vars_with_by_cases verus_code! {
+    #[test] test_exec_demorgan_bool_free_vars verus_code! {
         #[verifier::tactus_auto]
         fn check_demorgan(b1: bool, b2: bool) {
             assert(!(b1 && b2) == (!b1 || !b2)) by {
@@ -8441,24 +8397,12 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Bool-op gap probe (flippable Err): `&&` associativity. `simp_all`
-// doesn't have `and_assoc` in its default set (it's not `@[simp]`-
-// tagged in Lean core because of looping concerns). The
-// associativity identity needs an explicit lemma. Same pattern as
-// `And.comm` / `Bool.xor_comm`.
+// Bool-op pattern: `&&` associativity via `simp_all [and_assoc]`.
+// `and_assoc` isn't `@[simp]`-tagged in Lean core (looping concern
+// for unbounded simp), so it's named explicitly at the assertion
+// site — same canonical pattern as the commutativity tests.
 test_verify_one_file! {
-    #[test] test_exec_and_bool_associative_gap verus_code! {
-        #[verifier::tactus_auto]
-        fn check_and_assoc(b1: bool, b2: bool, b3: bool) {
-            assert(((b1 && b2) && b3) == (b1 && (b2 && b3)));
-        }
-    } => Err(_)
-}
-
-// Bool-op recovery probe: `&&` associativity via `simp_all
-// [and_assoc]`.
-test_verify_one_file! {
-    #[test] test_exec_and_bool_associative_with_simp verus_code! {
+    #[test] test_exec_and_bool_associative verus_code! {
         #[verifier::tactus_auto]
         fn check_and_assoc(b1: bool, b2: bool, b3: bool) {
             assert(((b1 && b2) && b3) == (b1 && (b2 && b3))) by {
@@ -8468,21 +8412,9 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Bool-op gap probe (flippable Err): `||` associativity. Same
-// pattern.
+// Bool-op pattern: `||` associativity via `simp_all [or_assoc]`.
 test_verify_one_file! {
-    #[test] test_exec_or_bool_associative_gap verus_code! {
-        #[verifier::tactus_auto]
-        fn check_or_assoc(b1: bool, b2: bool, b3: bool) {
-            assert(((b1 || b2) || b3) == (b1 || (b2 || b3)));
-        }
-    } => Err(_)
-}
-
-// Bool-op recovery probe: `||` associativity via `simp_all
-// [or_assoc]`.
-test_verify_one_file! {
-    #[test] test_exec_or_bool_associative_with_simp verus_code! {
+    #[test] test_exec_or_bool_associative verus_code! {
         #[verifier::tactus_auto]
         fn check_or_assoc(b1: bool, b2: bool, b3: bool) {
             assert(((b1 || b2) || b3) == (b1 || (b2 || b3))) by {
@@ -8492,23 +8424,12 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Bool-op gap probe (flippable Err): And-Or distributivity. The
-// canonical algebraic distributive identity `a ∧ (b ∨ c) = (a ∧
-// b) ∨ (a ∧ c)`. Needs `and_or_left` explicitly.
+// Bool-op pattern: And-Or distributivity `a ∧ (b ∨ c) = (a ∧ b)
+// ∨ (a ∧ c)` via `simp_all [and_or_left]`. Confirms the same
+// user-side pattern works across the algebraic-rewrite Bool-op
+// family.
 test_verify_one_file! {
-    #[test] test_exec_and_or_bool_distributive_gap verus_code! {
-        #[verifier::tactus_auto]
-        fn check_distrib(b1: bool, b2: bool, b3: bool) {
-            assert((b1 && (b2 || b3)) == ((b1 && b2) || (b1 && b3)));
-        }
-    } => Err(_)
-}
-
-// Bool-op recovery probe: distributivity via `simp_all
-// [and_or_left]`. Confirms the same user-side escape-hatch pattern
-// works across the And-Or-Distrib family.
-test_verify_one_file! {
-    #[test] test_exec_and_or_bool_distributive_with_simp verus_code! {
+    #[test] test_exec_and_or_bool_distributive verus_code! {
         #[verifier::tactus_auto]
         fn check_distrib(b1: bool, b2: bool, b3: bool) {
             assert((b1 && (b2 || b3)) == ((b1 && b2) || (b1 && b3))) by {
