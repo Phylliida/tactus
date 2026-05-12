@@ -403,7 +403,30 @@ fn write_class(out: &mut String, c: &Class, lm: &mut Landmarks) {
         out.push_str(&m.name);
         out.push_str(" : ");
         write_expr(out, &m.ty, 0, lm);
+        if let Some(default) = &m.default {
+            out.push_str(" := ");
+            write_expr(out, default, 0, lm);
+        }
         out.push('\n');
+        // Termination clause for recursive defaults. Empty Vec
+        // means non-recursive default (or no default) — no
+        // `termination_by` emitted.
+        match m.termination_by.as_slice() {
+            [] => {}
+            [single] => {
+                out.push_str("    termination_by ");
+                write_expr(out, single, 0, lm);
+                out.push('\n');
+            }
+            many => {
+                out.push_str("    termination_by (");
+                for (i, t) in many.iter().enumerate() {
+                    if i > 0 { out.push_str(", "); }
+                    write_expr(out, t, 0, lm);
+                }
+                out.push_str(")\n");
+            }
+        }
     }
 }
 

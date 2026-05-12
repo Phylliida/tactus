@@ -912,9 +912,42 @@ pub fn trait_to_ast(
         });
         let short = method_fun.path.segments.last()
             .map(|s| s.as_str()).unwrap_or("_");
+        // Class-method default body, when the trait provides one.
+        // Renders as `fun (p₁ : _) (p₂ : _) … => body` so Lean infers
+        // each param type from the method signature. For zero-param
+        // methods, just the body. Used by empty impls (`impl Tr for
+        // T {}`) which inherit the default — those instances omit
+        // the method, and Lean dispatches via this default.
+        //
+        // Proof-fn trait method defaults are NOT properly handled —
+        // see DESIGN.md "Proof-fn trait method defaults UNTESTED"
+        // entry. The body's tactic text would be rendered as a
+        // value expression here, which is structurally wrong. No
+        // tests exercise this combination today.
+        let default = func.body.as_ref().map(|b| {
+            let body_expr = vir_expr_to_ast(b);
+            if func.params.is_empty() {
+                body_expr
+            } else {
+                let binders: Vec<LBinder> = func.params.iter().map(|p| LBinder {
+                    name: Some(crate::lean_name::LeanName::synthetic(sanitize(p.x.name.0.as_str()))),
+                    ty: LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("_"))),
+                    kind: BinderKind::Explicit,
+                }).collect();
+                LExpr::new(ExprNode::Lambda {
+                    binders,
+                    body: Box::new(body_expr),
+                })
+            }
+        });
+        let termination_by: Vec<LExpr> = func.decrease.iter()
+            .map(|d| vir_expr_to_ast(d))
+            .collect();
         ClassMethod {
             name: sanitize(short),
             ty: method_type(func),
+            default,
+            termination_by,
         }
     }).collect();
 
@@ -994,33 +1027,43 @@ pub fn trait_impl_to_ast(
         })
     };
 
-    let methods = method_impls.iter().map(|func| {
-        let short = func.name.path.segments.last()
-            .map(|s| s.as_str()).unwrap_or("_");
-        let body = match &func.body {
-            Some(b) => {
-                let ast_body = vir_expr_to_ast(b);
-                if func.params.is_empty() {
-                    ast_body
-                } else {
-                    // `fun (p₁ : _) (p₂ : _) … => body`. The `_` lets Lean
-                    // infer each parameter type from the class's method
-                    // signature, which is what we want.
-                    let binders: Vec<LBinder> = func.params.iter().map(|p| LBinder {
-                        name: Some(crate::lean_name::LeanName::synthetic(sanitize(p.x.name.0.as_str()))),
-                        ty: LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("_"))),
-                        kind: BinderKind::Explicit,
-                    }).collect();
-                    LExpr::new(ExprNode::Lambda {
-                        binders,
-                        body: Box::new(ast_body),
-                    })
-                }
-            }
-            None => LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("sorry"))),
-        };
-        InstanceMethod { name: sanitize(short), body }
-    }).collect();
+    // Skip body=None methods — they inherit from the class default.
+    // Lean's typeclass machinery dispatches to the class default
+    // when the instance omits a method. For an empty impl
+    // (`impl Tr for T {}` with all method bodies inherited), the
+    // result is `instance : Tr T where` with no method bodies —
+    // Lean fills in everything from the class.
+    //
+    // Note: if the trait method has NO default body AND the impl
+    // also has body=None, that's a structurally invalid state
+    // (Verus would have rejected the impl as missing a required
+    // method) — skipping is still safe because Lean would catch
+    // the missing-method-in-instance error directly.
+    let methods = method_impls.iter()
+        .filter_map(|func| {
+            let body = func.body.as_ref()?;
+            let short = func.name.path.segments.last()
+                .map(|s| s.as_str()).unwrap_or("_");
+            let ast_body = vir_expr_to_ast(body);
+            let lambda = if func.params.is_empty() {
+                ast_body
+            } else {
+                // `fun (p₁ : _) (p₂ : _) … => body`. The `_` lets Lean
+                // infer each parameter type from the class's method
+                // signature, which is what we want.
+                let binders: Vec<LBinder> = func.params.iter().map(|p| LBinder {
+                    name: Some(crate::lean_name::LeanName::synthetic(sanitize(p.x.name.0.as_str()))),
+                    ty: LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("_"))),
+                    kind: BinderKind::Explicit,
+                }).collect();
+                LExpr::new(ExprNode::Lambda {
+                    binders,
+                    body: Box::new(ast_body),
+                })
+            };
+            Some(InstanceMethod { name: sanitize(short), body: lambda })
+        })
+        .collect();
 
     Instance { binders, target, methods }
 }

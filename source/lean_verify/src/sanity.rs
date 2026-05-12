@@ -120,11 +120,27 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
 
         Command::Class(c) => {
             defined.insert(c.name.clone());
-            // Method type signatures can reference types — check them.
+            // Method type signatures + default bodies can reference
+            // types and other class methods — check them under the
+            // class's typ_params scope.
             let mut scope = scope_from_binders(&c.typ_params);
             for b in &c.bounds { check_expr(&b.ty, defined, &mut scope, violations, &c.name); }
+            // Methods can reference each other in defaults (standard
+            // typeclass-self-reference pattern). Predefine each
+            // method's name in scope before checking any default
+            // body, so cross-method references inside defaults
+            // resolve.
+            for m in &c.methods {
+                scope.insert(m.name.clone());
+            }
             for m in &c.methods {
                 check_expr(&m.ty, defined, &mut scope, violations, &c.name);
+                if let Some(default) = &m.default {
+                    check_expr(default, defined, &mut scope, violations, &c.name);
+                }
+                for t in &m.termination_by {
+                    check_expr(t, defined, &mut scope, violations, &c.name);
+                }
             }
         }
 
