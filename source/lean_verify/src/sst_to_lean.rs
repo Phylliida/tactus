@@ -188,7 +188,7 @@ pub(crate) fn bitvec_preamble_fragments() -> Vec<PreambleFragment> {
 /// scope. `nlinarith` lives in Mathlib's Linarith module (it's
 /// `linarith` extended with nonlinear preprocessing). Attached to
 /// every theorem emitted inside a `Wp::AssertQuery` scope via
-/// `OblCtx::extra_preamble`; `krate_preamble` aggregates and dedups
+/// `OblCtx::closer_preamble`; `krate_preamble` aggregates and dedups
 /// across the file.
 pub(crate) fn nonlinear_preamble_fragments() -> Vec<PreambleFragment> {
     vec![PreambleFragment::Import("Mathlib.Tactic.Linarith".to_string())]
@@ -1031,7 +1031,7 @@ struct OblCtx {
     /// Every theorem emitted under this context attaches these to
     /// its `requires_preamble`; `krate_preamble` aggregates +
     /// dedups so the file picks them up once.
-    extra_preamble: Vec<PreambleFragment>,
+    closer_preamble: Vec<PreambleFragment>,
 }
 
 impl OblCtx {
@@ -1040,7 +1040,7 @@ impl OblCtx {
     /// the user set one); the preamble is empty until a scope
     /// changes it.
     fn new(closer: Tactic) -> Self {
-        Self { frames: im::Vector::new(), closer, extra_preamble: Vec::new() }
+        Self { frames: im::Vector::new(), closer, closer_preamble: Vec::new() }
     }
 
     /// Append a frame, returning a fresh OblCtx that shares the
@@ -1077,7 +1077,7 @@ impl OblCtx {
             })
             .cloned()
             .collect();
-        Self { frames, closer, extra_preamble: preamble }
+        Self { frames, closer, closer_preamble: preamble }
     }
 
     /// Wrap `goal` with all accumulated frames, outermost first
@@ -1200,7 +1200,7 @@ impl ObligationEmitter {
     /// the prefix leaves.
     fn emit(&mut self, name: String, goal: LExpr, obl: &OblCtx) {
         self.emit_with_preamble(
-            name, goal, obl.closer.clone(), obl.extra_preamble.clone(),
+            name, goal, obl.closer.clone(), obl.closer_preamble.clone(),
         );
     }
 
@@ -1212,7 +1212,7 @@ impl ObligationEmitter {
     fn emit_with_closer(
         &mut self, name: String, goal: LExpr, closer: Tactic, obl: &OblCtx,
     ) {
-        self.emit_with_preamble(name, goal, closer, obl.extra_preamble.clone());
+        self.emit_with_preamble(name, goal, closer, obl.closer_preamble.clone());
     }
 
     /// Like `emit`, but the theorem also declares preamble fragments
