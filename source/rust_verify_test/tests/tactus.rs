@@ -8910,3 +8910,91 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Regression test for the "inlined ensure references a trait spec
+// method" case discussed during the trait-instance-deletion design
+// (2026-05-12). I was worried that removing Instance commands could
+// break verification when:
+//
+//   1. A trait has a spec method `helper`.
+//   2. A trait exec method `main` has an `ensures` that calls `helper`
+//      via `self.helper()`.
+//   3. An impl provides `helper` (body=Some) but inherits `main` from
+//      the trait default (body=None).
+//   4. A tactus_auto fn calls `m.main()` and relies on its postcondition.
+//
+// At step 4, `walk_call` inlines `main`'s ensures at the call site.
+// The ensures contains `self.helper()` — a call to a trait spec method.
+// If that call renders in the generated Lean as `Foo.helper t`
+// (i.e., a class-method reference), Lean's typeclass mechanism would
+// need an Instance command to dispatch. Without instance emission,
+// elaboration would fail.
+//
+// The hypothesis being tested: Verus's resolution rewrites
+// `self.helper()` inside the trait method decl's ensures so that
+// when inlined at the call site (with `self = m: Bar`), it becomes a
+// direct call to `Bar::helper` (the impl's standalone def), not
+// `Foo::helper` (the trait method via typeclass dispatch).
+//
+// If this test passes: hypothesis confirmed, Instance commands are
+// indeed unnecessary even in this subtle case.
+// Pinned regression test for the interaction between #86 impl-
+// strengthening and trait-method references inside inlined ensures.
+//
+// Scenario: exec fn `caller` calls `b.check()`. `walk_call` inlines
+// BOTH the trait method decl's ensures AND the impl's ensures
+// (#86 impl-strengthening — caller sees the conjunction).
+//
+// 2026-05-12 progress:
+//   * Originally, the bare `predicate` (from the impl's ensures'
+//     standalone def reference) was unresolved because
+//     `collect_references` didn't follow into exec-callees' specs.
+//   * The `call_inlining` shared abstraction + dep-walk extension
+//     closed that gap. The standalone `Bar::predicate` def now
+//     emits and `predicate b` resolves.
+//
+// Remaining failure: `Foo.predicate b` (from the trait's ensures,
+// typeclass form) requires a `Foo Bar` instance to dispatch in
+// Lean — but instance emission was deleted on the same day, because
+// for the existing tests instances were dead weight. This test
+// reveals the case where they aren't.
+//
+// Forward path: re-add instance emission with the method-reach
+// gate, plus class-defaults for body=None inheritance handling.
+// See DESIGN.md "Trait class+instance emission" (to be written).
+test_verify_one_file! {
+    #[test] test_inlined_ensure_references_trait_spec_method verus_code! {
+        trait Foo {
+            spec fn predicate(&self) -> bool;
+
+            fn check(&self) -> (r: bool)
+                ensures r ==> self.predicate()
+            ;
+        }
+
+        struct Bar { v: u8 }
+
+        impl Foo for Bar {
+            spec fn predicate(&self) -> bool { self.v > 0 }
+            fn check(&self) -> (r: bool)
+                ensures r ==> self.predicate()
+            {
+                self.v > 0
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn caller(b: &Bar) -> (r: bool)
+            ensures r ==> b.v > 0
+        {
+            b.check()
+        }
+    } => Err(e) => {
+        // Lean elaboration rejects `Foo.predicate b` because no
+        // `Foo Bar` instance is in scope. When class-defaults +
+        // instance re-emission lands, this should flip to Ok(()).
+        let s = format!("{:?}", e);
+        assert!(s.contains("failed to synthesize") || s.contains("Foo Bar"),
+            "expected Lean instance-synthesis error mentioning Foo Bar, got: {}", s);
+    }
+}
+

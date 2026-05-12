@@ -2195,12 +2195,18 @@ fn walk_call<'a>(
 
     let subst = build_call_substitutions(callee, spec_callee, typ_args, args, mut_args, e);
 
-    if !spec_callee.require.is_empty() {
-        emit_call_precondition_theorem(spec_callee, &subst, call_span, obl, e);
+    // Canonical "what gets inlined at this call site." Single source
+    // of truth shared with `dep_order::collect_references`; both
+    // sites consult `call_inlining::collect_inlined_at_call` so
+    // emission and ref-collection can't drift.
+    let inlined = crate::call_inlining::collect_inlined_at_call(callee, spec_callee);
+
+    if !inlined.requires.is_empty() {
+        emit_call_precondition_theorem(spec_callee, &inlined.requires, &subst, call_span, obl, e);
     }
 
     let new_obl = push_post_call_frames(
-        callee, spec_callee, &subst, dest, obl,
+        callee, spec_callee, &inlined.ensures, &subst, dest, obl,
     );
     walk_obligations(after, ctx, &new_obl, e);
 }
@@ -2483,6 +2489,7 @@ fn build_call_substitutions<'a>(
 /// in a `CallPrecondition` SpanMark with the call-site span.
 fn emit_call_precondition_theorem(
     spec_callee: &FunctionX,
+    requires: &[&Expr],
     subst: &CallSubstitutions,
     call_span: &Span,
     obl: &OblCtx,
@@ -2490,7 +2497,7 @@ fn emit_call_precondition_theorem(
 ) {
     let loc = format_rust_loc(call_span);
     let requires_conj = and_all(
-        spec_callee.require.iter()
+        requires.iter()
             .map(|expr| {
                 let rewritten = rewrite_varat_for_mut_params(expr, &subst.mut_param_names);
                 vir_expr_to_ast(&rewritten)
@@ -2650,6 +2657,7 @@ fn is_trivial_true(e: &LExpr) -> bool {
 fn push_post_call_frames(
     callee: &FunctionX,
     spec_callee: &FunctionX,
+    ensures: &[&Expr],
     subst: &CallSubstitutions,
     dest: Option<&VarIdent>,
     obl: &OblCtx,
@@ -2673,33 +2681,25 @@ fn push_post_call_frames(
     }
 
     // Build the substituted ensures conjunction once. Used by both
-    // the substitution path (#128) and the ∀-path. Uses both
-    // spec_callee's ensures (the trait method decl's, for trait-
-    // method-impl callees; same as callee otherwise) AND the impl's
-    // own ensures when they differ (#86 impl-strengthening). Verus
-    // enforces impl ⇒ trait, so the conjunction is satisfiable; the
-    // caller gets the strongest contract any specific impl provides
-    // rather than just the trait-level guarantee.
+    // the substitution path (#128) and the ∀-path. The `ensures`
+    // slice was built by the caller via
+    // `call_inlining::collect_inlined_at_call`: spec_callee's
+    // ensures, plus callee's own ensures when callee is a
+    // TraitMethodImpl (#86 impl-strengthening — caller gets the
+    // conjunction of trait and impl contracts). Verus enforces
+    // impl ⇒ trait, so the conjunction is satisfiable.
     //
     // `subst.ens_subst` includes keys for both callee.params and
     // spec_callee.params (built by the two passes in
     // `build_call_substitutions`), plus both ret names → fresh_ret_name.
     // So substituting either the trait's or the impl's clauses
     // works regardless of whether trait/impl param names match.
-    let mut ensures_clauses: Vec<LExpr> = spec_callee.ensure.0.iter()
+    let ensures_clauses: Vec<LExpr> = ensures.iter()
         .map(|expr| {
             let rewritten = rewrite_varat_for_mut_params(expr, &subst.mut_param_names);
             vir_expr_to_ast(&rewritten)
         })
         .collect();
-    let is_trait_method_impl =
-        matches!(callee.kind, FunctionKind::TraitMethodImpl { .. });
-    if is_trait_method_impl {
-        for expr in callee.ensure.0.iter() {
-            let rewritten = rewrite_varat_for_mut_params(expr, &subst.mut_param_names);
-            ensures_clauses.push(vir_expr_to_ast(&rewritten));
-        }
-    }
     let substituted_ensures: Option<LExpr> = if ensures_clauses.is_empty() {
         None
     } else {
@@ -4175,23 +4175,19 @@ fn resolve_callee<'a>(
             callee_fun.path
         ));
     };
-    // Resolve spec_callee structurally. For TraitMethodImpl, redirect
-    // to the trait method decl (Verus rejects impl-side `requires`,
-    // so the impl's spec is empty/inherited). For all other kinds,
-    // specs live on the callee itself.
-    let spec_callee = match &callee.kind {
-        FunctionKind::TraitMethodImpl { method, .. } => {
-            ctx.fn_map.get(method).copied().ok_or_else(|| format!(
-                "trait method decl `{:?}` for resolved impl `{:?}` not found in \
-                 the crate's function map — cross-crate trait calls are not yet \
-                 supported (#56 follow-up)",
-                method.path, callee_fun.path,
-            ))?
-        }
-        FunctionKind::Static
-        | FunctionKind::TraitMethodDecl { .. }
-        | FunctionKind::ForeignTraitMethodImpl { .. } => callee,
-    };
+    // Resolve spec_callee structurally via the shared abstraction:
+    // for TraitMethodImpl, redirect to the trait method decl (Verus
+    // rejects impl-side `requires`, so the impl's spec is
+    // empty/inherited); for all other kinds, specs live on the
+    // callee itself. See `call_inlining` module for the canonical
+    // definition.
+    let spec_callee = crate::call_inlining::spec_source(callee, &ctx.fn_map)
+        .map_err(|method| format!(
+            "trait method decl `{:?}` for resolved impl `{:?}` not found in \
+             the crate's function map — cross-crate trait calls are not yet \
+             supported (#56 follow-up)",
+            method.path, callee_fun.path,
+        ))?;
     Ok((callee, spec_callee, callee_typ_args))
 }
 
