@@ -1427,24 +1427,36 @@ fn walk_obligations<'a>(
         }
         Wp::AssertQuery { primary, preamble, body, after } => {
             // Compose the scope's closer as `first | (intros;
-            // primary) | <outer>` — try the mode-specific tactic
-            // after intros (it doesn't intro on its own), then
-            // fall back to whatever was discharging in the
-            // enclosing scope. The fallback is what closes the
-            // trivial `True` theorems the recursive walk still
-            // emits inside the body (e.g., from `Wp::Done`
-            // leaves at the end of the body block) —
-            // refutation-based tactics like `nlinarith` can't
-            // close `True`.
+            // primary) | <outer> | fail "scope message"` —
             //
-            // Reading the outer closer from `obl.closer` (rather
-            // than hardcoding `tactus_auto`) preserves any
-            // fn-level override (`#[verifier::tactus_tactic("...")]`)
-            // and composes correctly for nested scopes.
+            // * `(intros; primary)` — the mode-specific tactic
+            //   (e.g., `nlinarith`) after intro-ing the
+            //   theorem-level binders + Hyps that the OblCtx
+            //   wraps around the goal. Most refutation-based
+            //   tactics like `nlinarith` don't intro on their
+            //   own.
+            // * `<outer>` — the enclosing scope's closer. Used
+            //   for trivial `True` theorems the recursive walk
+            //   still emits (e.g., from `Wp::Done` leaves at the
+            //   end of the body block) — refutation-based
+            //   tactics can't close `True`. Reading from
+            //   `obl.closer` preserves any fn-level override
+            //   (`#[verifier::tactus_tactic("...")]`) and
+            //   composes correctly for nested scopes.
+            // * Trailing `fail` — overrides Lean's default
+            //   "last-failure" reporting (which would otherwise
+            //   show `<outer>`'s message, e.g., `tactus_auto:
+            //   auto-tactic failed`) with a scope-specific
+            //   message pointing at the surface syntax. Users
+            //   debugging an unprovable goal know to look for
+            //   a `proof { }` block, not a misdirected
+            //   automation failure.
             let outer = tactic_as_str(&obl.closer);
             let primary_str = tactic_as_str(primary);
             let composed = Tactic::Raw(format!(
-                "first | (intros; {}) | ({})",
+                "first | (intros; {}) | ({}) | \
+                 fail \"by(nonlinear_arith) scope: could not close — \
+                 add an explicit `proof {{ … }}` block with a stronger tactic\"",
                 primary_str, outer
             ));
             let inner_obl = obl.new_scope(composed, preamble.clone());

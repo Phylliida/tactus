@@ -8562,7 +8562,9 @@ test_verify_one_file! {
 // Negative: wrong assertion fails. Pins that the NonLinear scope
 // actually verifies — it's not a permissive pass. `x*y > 0`
 // doesn't follow from `x, y >= 0` (could both be zero), so
-// `nlinarith` fails.
+// `nlinarith` fails. Also pins the failure UX: error message
+// mentions `by(nonlinear_arith) scope` (the surface syntax), not
+// the internal `tactus_auto` fallback rung that fires last.
 test_verify_one_file! {
     #[test] test_exec_assert_nonlinear_wrong verus_code! {
         #[verifier::tactus_auto]
@@ -8571,7 +8573,14 @@ test_verify_one_file! {
         {
             assert(x * y > 0) by(nonlinear_arith) requires x >= 0, y >= 0;
         }
-    } => Err(_)
+    } => Err(err) => {
+        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("by(nonlinear_arith) scope")),
+            "expected `by(nonlinear_arith) scope` in failure message; got: {:?}",
+            msgs,
+        );
+    }
 }
 
 // NonLinear scope with a proof block: a user-written intermediate
