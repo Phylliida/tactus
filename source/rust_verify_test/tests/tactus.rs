@@ -9004,26 +9004,31 @@ test_verify_one_file! {
 test_verify_one_file! {
     #[test] test_trait_default_body_references_other_trait_method verus_code! {
         trait Foo {
-            spec fn helper(&self) -> bool;
+            spec fn predicate(&self) -> bool;
 
-            fn compute(&self) -> (r: bool)
-                ensures r == self.helper()
+            // Default body returns 0; ensures vacuously holds (P ==> 0 == 0
+            // for any P). The ensures references `self.predicate()` — the
+            // other trait spec method. At the caller, walk_call inlines
+            // this ensures, and the inlined `self.predicate()` reference
+            // must resolve in the rendered Lean.
+            fn compute(&self) -> (r: u8)
+                ensures self.predicate() ==> r == 0
             {
-                false
+                0
             }
         }
 
         struct Q { v: u8 }
 
         impl Foo for Q {
-            spec fn helper(&self) -> bool { self.v > 0 }
+            spec fn predicate(&self) -> bool { self.v > 0 }
         }
 
         #[verifier::tactus_auto]
-        fn caller(q: &Q) -> (r: bool)
-            ensures r == (q.v > 0)
+        fn caller(q: &Q) -> (r: u8)
+            ensures q.v > 0 ==> r == 0
         {
-            proof { try unfold helper at * }
+            proof { try unfold predicate at * }
             q.compute()
         }
     } => Err(_)

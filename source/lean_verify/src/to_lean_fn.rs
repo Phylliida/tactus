@@ -914,18 +914,32 @@ pub fn trait_to_ast(
             .map(|s| s.as_str()).unwrap_or("_");
         // Class-method default body, when the trait provides one.
         // Renders as `fun (p₁ : _) (p₂ : _) … => body` so Lean infers
-        // each param type from the method signature. For zero-param
-        // methods, just the body. Used by empty impls (`impl Tr for
-        // T {}`) which inherit the default — those instances omit
-        // the method, and Lean dispatches via this default.
+        // each param type from the method signature. Used by empty
+        // impls (`impl Tr for T {}`) which inherit the default —
+        // those instances omit the method, and Lean dispatches via
+        // this default.
         //
-        // Proof-fn trait method defaults are NOT properly handled —
-        // see DESIGN.md "Proof-fn trait method defaults UNTESTED"
-        // entry. The body's tactic text would be rendered as a
-        // value expression here, which is structurally wrong. No
-        // tests exercise this combination today.
+        // Render strategy by mode (mirrors trait_impl_to_ast):
+        // * Spec methods: render actual body via `vir_expr_to_ast`.
+        //   Lean unfolds class defaults during typeclass dispatch,
+        //   so the body is load-bearing.
+        // * Exec/proof methods: render `Classical.arbitrary _` as
+        //   placeholder. Rendering exec bodies via vir_expr_to_ast
+        //   panics on Assign/Loop/Return; and the body isn't
+        //   load-bearing for verification (walk_call inlines
+        //   specs, not bodies).
+        //
+        // Proof-fn trait method defaults still get the placeholder
+        // but the broader concern (class methods being typed as
+        // `Self → ReturnType` doesn't match what proof fns are in
+        // Lean) remains — see DESIGN.md "Proof-fn trait method
+        // defaults" entry.
         let default = func.body.as_ref().map(|b| {
-            let body_expr = vir_expr_to_ast(b);
+            let body_expr = if matches!(func.mode, vir::ast::Mode::Spec) {
+                vir_expr_to_ast(b)
+            } else {
+                LExpr::var_lit("default")
+            };
             if func.params.is_empty() {
                 body_expr
             } else {
@@ -940,9 +954,16 @@ pub fn trait_to_ast(
                 })
             }
         });
-        let termination_by: Vec<LExpr> = func.decrease.iter()
-            .map(|d| vir_expr_to_ast(d))
-            .collect();
+        // Only spec-mode methods get termination clauses rendered —
+        // exec/proof methods would route through vir_expr_to_ast
+        // which might panic on exec constructs in the decrease.
+        // The exec-method body itself is a placeholder anyway, so
+        // termination doesn't apply.
+        let termination_by: Vec<LExpr> = if matches!(func.mode, vir::ast::Mode::Spec) {
+            func.decrease.iter().map(|d| vir_expr_to_ast(d)).collect()
+        } else {
+            Vec::new()
+        };
         ClassMethod {
             name: sanitize(short),
             ty: method_type(func),
@@ -1034,6 +1055,18 @@ pub fn trait_impl_to_ast(
     // result is `instance : Tr T where` with no method bodies —
     // Lean fills in everything from the class.
     //
+    // Render strategy by mode:
+    // * Spec methods (Mode::Spec): render the actual body via
+    //   `vir_expr_to_ast`. Lean's typeclass dispatch may unfold
+    //   the instance's method during proof, so the body is
+    //   load-bearing.
+    // * Exec/proof methods: emit a placeholder
+    //   (`Classical.arbitrary _`). The body is never invoked
+    //   during verification (walk_call inlines specs at call
+    //   sites, not via typeclass dispatch). Rendering exec
+    //   bodies via vir_expr_to_ast would panic on Assign / Loop /
+    //   Return constructs that are exec-mode-only.
+    //
     // Note: if the trait method has NO default body AND the impl
     // also has body=None, that's a structurally invalid state
     // (Verus would have rejected the impl as missing a required
@@ -1041,12 +1074,20 @@ pub fn trait_impl_to_ast(
     // the missing-method-in-instance error directly.
     let methods = method_impls.iter()
         .filter_map(|func| {
-            let body = func.body.as_ref()?;
+            func.body.as_ref()?;
             let short = func.name.path.segments.last()
                 .map(|s| s.as_str()).unwrap_or("_");
-            let ast_body = vir_expr_to_ast(body);
+            let body_expr = if matches!(func.mode, vir::ast::Mode::Spec) {
+                vir_expr_to_ast(func.body.as_ref().unwrap())
+            } else {
+                // Exec/proof placeholder. `Classical.arbitrary _`
+                // produces a value of any type, satisfying Lean's
+                // instance-completeness requirement without needing
+                // to render the (possibly stateful) exec body.
+                LExpr::var_lit("default")
+            };
             let lambda = if func.params.is_empty() {
-                ast_body
+                body_expr
             } else {
                 // `fun (p₁ : _) (p₂ : _) … => body`. The `_` lets Lean
                 // infer each parameter type from the class's method
@@ -1058,7 +1099,7 @@ pub fn trait_impl_to_ast(
                 }).collect();
                 LExpr::new(ExprNode::Lambda {
                     binders,
-                    body: Box::new(ast_body),
+                    body: Box::new(body_expr),
                 })
             };
             Some(InstanceMethod { name: sanitize(short), body: lambda })

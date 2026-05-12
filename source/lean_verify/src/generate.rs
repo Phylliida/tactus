@@ -164,41 +164,59 @@ fn krate_preamble(
         .collect();
     let refs = dep_order::collect_references(&spec_fn_map, &method_lookup, root_fns);
 
-    // Decide which trait_impls will emit (method-reach gate, Rule Y):
-    // an impl emits an `Instance` command iff at least one of its
-    // method impls is reachable from the proof fn. Reaching a method
-    // means the proof transitively calls it (the call lands in
-    // `refs.needed_fns`-equivalent via the worklist walk). Impls
-    // whose methods are all unreached are dead weight for this
-    // proof.
+    // Decide which trait_impls will emit. Two conditions both
+    // must hold:
+    //
+    // 1. The trait itself is reached (refs.traits contains it) —
+    //    something in the proof brought the trait into scope, via
+    //    typ_bounds, Dynamic-dispatch call, or the inlined-spec
+    //    walk through a trait method decl.
+    // 2. The implementor type is reached (refs.datatypes contains
+    //    it) — the proof references the concrete type somewhere
+    //    (Ctor, param type, etc.). For non-datatype implementors
+    //    (primitives, type params), this check is vacuously true.
+    //
+    // Earlier iterations (2026-05-12) tried "any method_impl is in
+    // needed_fn_set" as the gate, but it failed for default-
+    // inheriting impls: when `impl Foo for Q {}` inherits a method
+    // and the proof calls `q.method()`, Verus's resolution goes
+    // through the trait method decl, so no specific impl method
+    // appears in needed_fn_set — the gate would skip emission, but
+    // the inlined ensures would still render `Foo.method q` which
+    // requires the instance for Lean dispatch.
+    //
+    // The (trait ∩ datatype) gate captures the same property
+    // structurally: if the proof reaches both the trait abstraction
+    // AND the concrete implementor, the pairing IS in use, and the
+    // instance is needed to bridge typeclass dispatch from the
+    // trait method decl to the concrete impl.
     //
     // The set of traits whose Instance will emit is derived next —
     // those traits' classes MUST also emit (the Instance references
     // the class). This is the structural co-dependency that the
     // pre-2026-05-12 `refs.traits`-only gate hid by accident.
-    //
-    // `needed_fn_set` is the proof's transitive callee set, computed
-    // here from the spec_fn dep walk's output groups. (We don't get
-    // it directly from `refs` because `References` doesn't surface
-    // the visited set; deriving it from `groups` is cheap and keeps
-    // `dep_order`'s public surface minimal.)
     let groups = dep_order::order_spec_fns(&spec_fn_map, &method_lookup, &all_fns, root_fns);
-    let needed_fn_set: std::collections::HashSet<&Fun> = groups.iter()
-        .flat_map(|g| match g {
-            FnGroup::Single(f) => vec![&f.name],
-            FnGroup::Mutual(fs) => fs.iter().map(|f| &f.name).collect(),
-        })
-        .collect();
     let instances_to_emit: Vec<(&TraitImpl, Vec<&FunctionX>)> = krate.trait_impls.iter()
         .filter_map(|ti| {
+            let trait_short = short_name(&ti.x.trait_path);
+            if !refs.traits.contains(trait_short) { return None; }
+            // Implementor type check: trait_typ_args[0] is Self.
+            // For Dt::Path (a concrete user datatype), require it
+            // to be in refs.datatypes. For anything else (primitive,
+            // generic, tuple), vacuously pass — those don't have
+            // emit-side declarations that could fail to materialize.
+            let implementor_reached = match ti.x.trait_typ_args.first().map(|t| &**t) {
+                Some(TypX::Datatype(Dt::Path(p), _, _)) =>
+                    refs.datatypes.contains(short_name(p)),
+                _ => true,
+            };
+            if !implementor_reached { return None; }
             let method_impls: Vec<&FunctionX> = all_fns.iter()
                 .filter(|f| matches!(&f.kind, FunctionKind::TraitMethodImpl { impl_path, .. }
                     if impl_path == &ti.x.impl_path))
                 .copied()
                 .collect();
-            let any_method_needed = method_impls.iter()
-                .any(|m| needed_fn_set.contains(&m.name));
-            if any_method_needed { Some((ti, method_impls)) } else { None }
+            Some((ti, method_impls))
         })
         .collect();
     let traits_with_emitted_impl: std::collections::HashSet<&str> = instances_to_emit.iter()
