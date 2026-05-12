@@ -95,8 +95,8 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
         }
 
         // Axiom: declares a constant. Adds the name to `defined` so
-        // downstream references resolve. Binder types may themselves
-        // reference earlier top-level names; check them.
+        // downstream references resolve. Binder types may reference
+        // earlier top-level names; check them.
         Command::Axiom(a) => {
             defined.insert(a.name.clone());
             let mut scope = scope_from_binders(&a.binders);

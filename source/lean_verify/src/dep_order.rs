@@ -34,9 +34,16 @@ pub enum DatatypeGroup<'a> {
 
 /// All entity names referenced by the proof fns (transitively through spec fns).
 /// Borrows `&str` from VIR's `Arc<String>` — zero allocations.
+///
+/// `needed_fns` is the set of spec-fn `Fun`s reached by the worklist walk
+/// (the same set `order_spec_fns` re-derives internally as `needed`).
+/// Exposed here so `generate.rs`'s trait_impls loop can gate Instance
+/// emission on whether any of an impl's method_impls is reachable —
+/// the structural rule documented at the trait_impls call site.
 pub struct References<'a> {
     pub datatypes: HashSet<&'a str>,
     pub traits: HashSet<&'a str>,
+    pub needed_fns: HashSet<&'a Fun>,
 }
 
 /// Collect all referenced datatype/trait names from proof fns and their
@@ -45,18 +52,21 @@ pub fn collect_references<'a>(
     spec_fn_map: &HashMap<&Fun, &'a FunctionX>,
     proof_fns: &[&'a FunctionX],
 ) -> References<'a> {
-    let mut refs = References { datatypes: HashSet::new(), traits: HashSet::new() };
+    let mut refs = References {
+        datatypes: HashSet::new(),
+        traits: HashSet::new(),
+        needed_fns: HashSet::new(),
+    };
 
     for pf in proof_fns {
         collect_from_fn(pf, &mut refs);
     }
 
-    let mut visited: HashSet<&Fun> = HashSet::new();
     let mut worklist: Vec<&'a Fun> = Vec::new();
     seed_worklist(proof_fns, &mut worklist);
     while let Some(fun) = worklist.pop() {
-        if visited.contains(fun) { continue; }
-        visited.insert(fun);
+        if refs.needed_fns.contains(fun) { continue; }
+        refs.needed_fns.insert(fun);
         if let Some(f) = spec_fn_map.get(fun) {
             collect_from_fn(f, &mut refs);
             if let Some(body) = &f.body { collect_fun_refs(body, &mut worklist); }
@@ -122,9 +132,21 @@ fn collect_from_fn<'a>(f: &'a FunctionX, refs: &mut References<'a>) {
 /// `f.body.is_some()` themselves), but skipping them here would drop
 /// the name from the preamble entirely and produce an "unresolved"
 /// sanity-check rejection at the call site.
+///
+/// Excludes `FunctionKind::TraitMethodDecl`: those live inside the
+/// `class` declaration produced by `trait_to_ast`, not as standalone
+/// top-level defs. The pre-2026-05-12 `body.is_some()` filter
+/// excluded them as a side effect (trait method decls without default
+/// bodies are body=None). With body-less emission, we make the
+/// exclusion explicit on the structural property (`FunctionKind`)
+/// rather than via the implicit body-presence proxy. A trait method
+/// decl with `has_default: true` (body=Some) is also excluded — its
+/// default body is emitted separately via Verus's
+/// `<trait>%default%<method>` wrapper, a `Static` fn that DOES pass.
 pub fn build_spec_fn_map<'a>(all_fns: &'a [&'a FunctionX]) -> HashMap<&'a Fun, &'a FunctionX> {
     all_fns.iter()
         .filter(|f| matches!(f.mode, Mode::Spec))
+        .filter(|f| !matches!(f.kind, FunctionKind::TraitMethodDecl { .. }))
         .map(|f| (&f.name, *f))
         .collect()
 }
@@ -163,8 +185,15 @@ pub fn order_spec_fns<'a>(
     // `to_lean_fn::spec_fn_to_ast`. Filtering them here would drop the
     // declaration entirely and downstream references would fail the
     // sanity check.
+    //
+    // Exclude `TraitMethodDecl` (see `build_spec_fn_map` rationale).
+    // `needed_fns` is built from `all_fns` directly (not via
+    // `spec_fn_map`), so the map-side filter doesn't propagate here;
+    // we re-apply the structural exclusion.
     let needed_fns: Vec<&'a FunctionX> = all_fns.iter()
-        .filter(|f| needed.contains(&f.name) && matches!(f.mode, Mode::Spec))
+        .filter(|f| needed.contains(&f.name)
+            && matches!(f.mode, Mode::Spec)
+            && !matches!(f.kind, FunctionKind::TraitMethodDecl { .. }))
         .copied()
         .collect();
 

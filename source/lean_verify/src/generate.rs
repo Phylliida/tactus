@@ -160,8 +160,44 @@ fn krate_preamble(
         .map(|f| (&f.name, *f))
         .collect();
 
+    // First pass over trait_impls: decide which Instances will emit,
+    // gated on method-impl reachability (the proof actually calls into
+    // this specific impl). Two derived sets fall out:
+    //
+    // - `instances_to_emit`: which TraitImpls we'll produce Instance
+    //   commands for, paired with their method_impls so the second
+    //   pass doesn't re-filter.
+    // - `traits_with_emitted_impl`: every trait whose Instance is in
+    //   `instances_to_emit`. The class declaration for these traits
+    //   MUST also emit — otherwise the Instance references an
+    //   unresolved class. This is the structural co-dependency that
+    //   the pre-fix `refs.traits`-only gate hid by accident: traits
+    //   only entered `refs.traits` when one of their impls' methods
+    //   was walked, so the two sets were correlated. Body-less
+    //   emission broke the correlation; making it explicit fixes it.
+    //
+    // Pure-assoc-type impls (no method_impls): not emitted today.
+    // Surface a separate rule (e.g., assoc-type reachability) if
+    // that case starts to bite.
+    let instances_to_emit: Vec<(&TraitImpl, Vec<&FunctionX>)> = krate.trait_impls.iter()
+        .filter_map(|ti| {
+            let method_impls: Vec<&FunctionX> = all_fns.iter()
+                .filter(|f| matches!(&f.kind, FunctionKind::TraitMethodImpl { impl_path, .. }
+                    if impl_path == &ti.x.impl_path))
+                .copied()
+                .collect();
+            let any_method_needed = method_impls.iter()
+                .any(|m| refs.needed_fns.contains(&m.name));
+            if any_method_needed { Some((ti, method_impls)) } else { None }
+        })
+        .collect();
+    let traits_with_emitted_impl: std::collections::HashSet<&str> = instances_to_emit.iter()
+        .map(|(ti, _)| short_name(&ti.x.trait_path))
+        .collect();
+
     for tr in &krate.traits {
-        if refs.traits.contains(short_name(&tr.x.name)) {
+        let n = short_name(&tr.x.name);
+        if refs.traits.contains(n) || traits_with_emitted_impl.contains(n) {
             cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup)));
         }
     }
@@ -190,22 +226,14 @@ fn krate_preamble(
         }
     }
 
-    for ti in &krate.trait_impls {
-        if !refs.traits.contains(short_name(&ti.x.trait_path)) { continue; }
-        let method_impls: Vec<&FunctionX> = all_fns.iter()
-            .filter(|f| matches!(&f.kind, FunctionKind::TraitMethodImpl { impl_path, .. }
-                if impl_path == &ti.x.impl_path))
-            .copied()
-            .collect();
+    for (ti, method_impls) in &instances_to_emit {
         let assoc_types: Vec<&AssocTypeImplX> = krate.assoc_type_impls.iter()
             .filter(|a| a.x.impl_path == ti.x.impl_path)
             .map(|a| &a.x)
             .collect();
-        if !method_impls.is_empty() || !assoc_types.is_empty() {
-            cmds.push(Command::Instance(
-                to_lean_fn::trait_impl_to_ast(&ti.x, &method_impls, &assoc_types)
-            ));
-        }
+        cmds.push(Command::Instance(
+            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types)
+        ));
     }
 
     (cmds, ns)
