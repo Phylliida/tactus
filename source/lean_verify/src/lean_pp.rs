@@ -215,11 +215,21 @@ fn write_command(out: &mut String, cmd: &Command, lm: &mut Landmarks) {
         }
         Command::Def(d) => write_def(out, d, lm),
         Command::DefCurried(d) => write_def_curried(out, d, lm),
+        Command::Axiom(a) => write_axiom(out, a, lm),
         Command::Theorem(t) => write_theorem(out, t, lm),
         Command::Datatype(dt) => write_datatype(out, dt, lm),
         Command::Class(c) => write_class(out, c, lm),
         Command::Instance(i) => write_instance(out, i, lm),
     }
+}
+
+fn write_axiom(out: &mut String, a: &Axiom, lm: &mut Landmarks) {
+    out.push_str("axiom ");
+    out.push_str(&a.name);
+    write_binders(out, &a.binders, lm);
+    out.push_str(" : ");
+    write_expr(out, &a.ret_ty, 0, lm);
+    out.push('\n');
 }
 
 fn write_def_curried(out: &mut String, d: &DefCurried, lm: &mut Landmarks) {

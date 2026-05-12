@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use vir::ast::*;
 use crate::lean_ast::{
-    and_all, Binder as LBinder, BinderKind, Class, ClassMethod, Command, Datatype,
+    and_all, Axiom, Binder as LBinder, BinderKind, Class, ClassMethod, Command, Datatype,
     DatatypeKind, Def, DefCurried, Expr as LExpr, ExprNode, Field, Instance,
     InstanceMethod, MatchArm, Pattern as LPattern, Theorem, Tactic, Variant,
 };
@@ -93,32 +93,45 @@ impl LeanSourceMap {
 
 // ── Spec fn ─────────────────────────────────────────────────────────────
 
-/// Build a `Def` AST node for a spec fn.
-pub fn spec_fn_to_ast(f: &FunctionX) -> Def {
-    let attrs = if matches!(f.opaqueness, Opaqueness::Opaque) {
-        vec!["irreducible".into()]
-    } else {
-        vec![]
-    };
-    let body = match &f.body {
-        Some(b) => vir_expr_to_ast(b),
-        None => LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("sorry"))),
-    };
-    let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| vir_expr_to_ast(d)).collect();
-    Def {
-        attrs,
-        name: lean_name(&f.name.path),
-        // Spec fns are Lean defs (mathematical definitions). The
-        // u-type / i-type refinement bounds belong on theorems
-        // (proof fns + exec fn obligations), not on the spec fn's
-        // signature — including them would change the spec fn's
-        // type from `Int → Int` to `Int → Bound → Int` and break
-        // call sites that pass only the value. Surfaced 2026-05-09
-        // by `test_diag_exec_plain_assert_with_spec_call` (#147).
-        binders: fn_binders_without_bound_hyps(f),
-        ret_ty: typ_to_expr(&f.ret.x.typ),
-        body,
-        termination_by,
+/// Build a top-level command for a spec fn. Returns `Command::Def`
+/// when the fn has a body, `Command::Axiom` when it doesn't.
+///
+/// Body-less cases that route through the Axiom branch:
+/// - `pub uninterp spec fn` (deliberately uninterpreted on the Verus side).
+/// - `external_body` spec fns (Verus's escape hatch for FFI/spec gaps).
+/// - Cross-crate spec fns whose body was stripped at `export_crate` time
+///   (private or closed specs from imported crates).
+///
+/// Lean's `axiom` is the right encoding: it declares a constant whose
+/// value is unspecified, matching Verus's "this is just a symbol with
+/// a type" semantics. (The previous `def ... := sorry` shape was dead
+/// code, unreachable because dep_order's `build_spec_fn_map` filtered
+/// body=None fns out — which produced "unresolved" sanity-check
+/// rejections at the call site. Audit 2026-05-12 unfiltered the map
+/// and routes through `Axiom` here.)
+pub fn spec_fn_to_ast(f: &FunctionX) -> Command {
+    // Spec fns are Lean defs (mathematical definitions). The
+    // u-type / i-type refinement bounds belong on theorems
+    // (proof fns + exec fn obligations), not on the spec fn's
+    // signature — including them would change the spec fn's
+    // type from `Int → Int` to `Int → Bound → Int` and break
+    // call sites that pass only the value. Surfaced 2026-05-09
+    // by `test_diag_exec_plain_assert_with_spec_call` (#147).
+    let binders = fn_binders_without_bound_hyps(f);
+    let ret_ty = typ_to_expr(&f.ret.x.typ);
+    let name = lean_name(&f.name.path);
+    match &f.body {
+        Some(b) => {
+            let attrs = if matches!(f.opaqueness, Opaqueness::Opaque) {
+                vec!["irreducible".into()]
+            } else {
+                vec![]
+            };
+            let body = vir_expr_to_ast(b);
+            let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| vir_expr_to_ast(d)).collect();
+            Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by })
+        }
+        None => Command::Axiom(Axiom { name, binders, ret_ty }),
     }
 }
 

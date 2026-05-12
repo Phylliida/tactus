@@ -179,11 +179,11 @@ fn krate_preamble(
     for group in &groups {
         match group {
             FnGroup::Single(f) => {
-                cmds.push(Command::Def(to_lean_fn::spec_fn_to_ast(f)));
+                cmds.push(to_lean_fn::spec_fn_to_ast(f));
             }
             FnGroup::Mutual(fns) => {
                 let inner: Vec<Command> = fns.iter()
-                    .map(|f| Command::Def(to_lean_fn::spec_fn_to_ast(f)))
+                    .map(|f| to_lean_fn::spec_fn_to_ast(f))
                     .collect();
                 cmds.push(Command::Mutual(inner));
             }

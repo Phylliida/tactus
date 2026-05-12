@@ -114,9 +114,17 @@ fn collect_from_fn<'a>(f: &'a FunctionX, refs: &mut References<'a>) {
 }
 
 /// Build the spec fn lookup map (shared between collect_references and order_spec_fns).
+///
+/// Includes body=None spec fns (uninterp / external_body / cross-crate-stripped).
+/// They're emitted as `Command::Axiom` rather than `Command::Def` by
+/// `to_lean_fn::spec_fn_to_ast` — their bodies don't need walking
+/// (collect_references / order_spec_fns gate body iteration on
+/// `f.body.is_some()` themselves), but skipping them here would drop
+/// the name from the preamble entirely and produce an "unresolved"
+/// sanity-check rejection at the call site.
 pub fn build_spec_fn_map<'a>(all_fns: &'a [&'a FunctionX]) -> HashMap<&'a Fun, &'a FunctionX> {
     all_fns.iter()
-        .filter(|f| matches!(f.mode, Mode::Spec) && f.body.is_some())
+        .filter(|f| matches!(f.mode, Mode::Spec))
         .map(|f| (&f.name, *f))
         .collect()
 }
@@ -151,8 +159,12 @@ pub fn order_spec_fns<'a>(
         }
     }
 
+    // Include body=None spec fns: they emit as `Command::Axiom` from
+    // `to_lean_fn::spec_fn_to_ast`. Filtering them here would drop the
+    // declaration entirely and downstream references would fail the
+    // sanity check.
     let needed_fns: Vec<&'a FunctionX> = all_fns.iter()
-        .filter(|f| needed.contains(&f.name) && matches!(f.mode, Mode::Spec) && f.body.is_some())
+        .filter(|f| needed.contains(&f.name) && matches!(f.mode, Mode::Spec))
         .copied()
         .collect();
 
