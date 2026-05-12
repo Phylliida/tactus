@@ -61,13 +61,11 @@ pub enum Command {
     DefCurried(DefCurried),
     /// Axiom declaration: `axiom <name> [binders] : <type>`.
     /// Used for spec fns with `body = None` (Verus's
-    /// `pub uninterp spec fn`, external_body spec fns,
-    /// closed-body cross-crate spec fns whose body was stripped at
-    /// `export_crate` time). Lean's kernel trusts axioms; safe here
-    /// because the Verus side already treats these as axiomatized.
-    /// The Lean type signature mirrors the spec fn's params + return
-    /// type via the same `fn_binders_without_bound_hyps` helper that
-    /// `Def` uses.
+    /// `pub uninterp spec fn`, external_body fns, closed-body
+    /// cross-crate spec fns whose body was stripped at
+    /// `export_crate` time). Lean's kernel trusts axioms; safe
+    /// here because the Verus side already treats these as
+    /// axiomatized.
     Axiom(Axiom),
     Theorem(Theorem),
     Datatype(Datatype),
@@ -76,21 +74,6 @@ pub enum Command {
     /// `mutual … end` wrapping a list of commands. Used for mutually
     /// recursive spec fn groups.
     Mutual(Vec<Command>),
-}
-
-/// Axiom: declares a constant whose value is unspecified.
-/// `axiom <name> [binders] : <ret_ty>`.
-///
-/// Tactus emits these for spec fns whose VIR body is `None`. The
-/// binder set comes from the same helper used for `Def`, so an
-/// uninterp `spec fn f(x: int) -> int` becomes `axiom f : Int → Int`
-/// (since the binder is `(x : Int)` and `ret_ty` is `Int`, the
-/// pretty-printer concatenates them as a curried function type).
-#[derive(Debug, Clone)]
-pub struct Axiom {
-    pub name: String,
-    pub binders: Vec<Binder>,
-    pub ret_ty: Expr,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +87,22 @@ pub struct Def {
     /// `termination_by d₁` if one measure, `termination_by (d₁, d₂, …)` for
     /// lexicographic. Empty `Vec` means no termination clause.
     pub termination_by: Vec<Expr>,
+}
+
+/// Axiom: declares a constant whose value is unspecified.
+/// `axiom <name> [binders] : <ret_ty>`.
+///
+/// Used for body-less spec fns (Verus's `pub uninterp spec fn`,
+/// external_body spec fns, cross-crate spec fns whose body was
+/// stripped at export time). The binder set mirrors the spec fn's
+/// params + return type via `fn_binders_without_bound_hyps`, so an
+/// uninterp `spec fn f(x: int) -> int` becomes
+/// `axiom f : Int → Int` (the binder + ret_ty currying).
+#[derive(Debug, Clone)]
+pub struct Axiom {
+    pub name: String,
+    pub binders: Vec<Binder>,
+    pub ret_ty: Expr,
 }
 
 /// Curried-form definition with pattern-matched equations.
