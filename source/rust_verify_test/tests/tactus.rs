@@ -8666,3 +8666,40 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Coverage (interaction): NonLinear scope after a user-written
+// `proof { … }` block. The proof block pushes its tactic onto
+// `e.tactic_prefix`, which the emitter composes with the
+// theorem's closer via `(prefix) <;> closer`. Inside the NonLinear
+// scope, the closer is the composed `first | (intros; nlinarith)
+// | (outer) | fail "..."` — so the full emit shape becomes
+// `(prefix) <;> first | (intros; nlinarith) | (outer) | fail
+// "..."`. Lean's `<;>` binds tighter than `first`'s `|`, so this
+// parses as `(prefix) <;> (first | …)` which is the right
+// semantic. Pins that the two composition mechanisms (tactic_prefix
+// + scope closer) play together without crashing.
+test_verify_one_file! {
+    #[test] test_exec_assert_nonlinear_after_proof_block verus_code! {
+        #[verifier::tactus_auto]
+        fn check_after_proof(x: i32, y: i32) {
+            proof {
+                have hh : x = x := by rfl
+            }
+            assert(x * y == y * x) by(nonlinear_arith);
+        }
+    } => Ok(())
+}
+
+// Coverage: separate NonLinear scopes in the same fn. Each scope
+// declares its preamble; `krate_preamble` deduplicates so
+// `Mathlib.Tactic.Linarith` appears once at file top. Pins that
+// multiple scopes don't trip preamble emission.
+test_verify_one_file! {
+    #[test] test_exec_assert_nonlinear_two_separate_scopes verus_code! {
+        #[verifier::tactus_auto]
+        fn check_two_scopes(x: i32, y: i32, z: i32) {
+            assert(x * y == y * x) by(nonlinear_arith);
+            assert(y * z == z * y) by(nonlinear_arith);
+        }
+    } => Ok(())
+}
+

@@ -1425,7 +1425,7 @@ fn walk_obligations<'a>(
             // elaborate.)
             walk_obligations(body, ctx, obl, e);
         }
-        Wp::AssertQuery { primary, preamble, body, after } => {
+        Wp::AssertQuery { primary, preamble, surface_label, body, after } => {
             // Compose the scope's closer as `first | (intros;
             // primary) | <outer> | fail "scope message"` —
             //
@@ -1455,9 +1455,9 @@ fn walk_obligations<'a>(
             let primary_str = tactic_as_str(primary);
             let composed = Tactic::Raw(format!(
                 "first | (intros; {}) | ({}) | \
-                 fail \"by(nonlinear_arith) scope: could not close — \
+                 fail \"{} scope: could not close — \
                  add an explicit `proof {{ … }}` block with a stronger tactic\"",
-                primary_str, outer
+                primary_str, outer, surface_label,
             ));
             let inner_obl = obl.new_scope(composed, preamble.clone());
             walk_obligations(body, ctx, &inner_obl, e);
@@ -3230,13 +3230,16 @@ enum Wp<'a> {
     ///
     /// `primary` is the mode-specific tactic (e.g., `nlinarith`).
     /// The walker composes it with the *enclosing scope's* closer
-    /// as a fallback: `first | (intros; primary) | <outer_closer>`.
+    /// + a scope-specific failure message as
+    /// `first | (intros; primary) | (<outer_closer>) | fail "<scope msg>"`.
     /// Falling back to the outer closer (rather than hardcoding
     /// `tactus_auto`) means a fn-level `#[verifier::tactus_tactic(
     /// "...")]` override still applies to the trivial theorems the
     /// recursive walk emits inside the scope (e.g., `True → ... →
     /// True` from `Wp::Done` leaves that `primary` is too strict
-    /// to close).
+    /// to close). The trailing `fail` overrides Lean's
+    /// last-failure-wins reporting so users see "scope: …" instead
+    /// of the misdirected `tactus_auto` message.
     ///
     /// The walker also drops enclosing-scope Hyp frames (matching
     /// Verus's NonLinear query semantics — only requires + typ
@@ -3245,9 +3248,17 @@ enum Wp<'a> {
     /// ORIGINAL obl; Verus's `ast_to_sst` already pre-injected the
     /// outer `assert(req) / assume(ens)` block so the caller-side
     /// effect is upstream.
+    ///
+    /// `surface_label` names the surface-syntax that introduced the
+    /// scope (e.g., `"by(nonlinear_arith)"`) — embedded in the
+    /// composed closer's trailing `fail "<label> scope: could not
+    /// close — …"` so the error names the right form. Set per-mode
+    /// at `build_wp` time so future modes (Polyrith etc.) report
+    /// their own surface syntax without touching the walker.
     AssertQuery {
         primary: Tactic,
         preamble: Vec<PreambleFragment>,
+        surface_label: String,
         body: Box<Wp<'a>>,
         after: Box<Wp<'a>>,
     },
@@ -3948,6 +3959,7 @@ fn build_wp<'a>(
                     Ok(Wp::AssertQuery {
                         primary: Tactic::Named("nlinarith".to_string()),
                         preamble: nonlinear_preamble_fragments(),
+                        surface_label: "by(nonlinear_arith)".to_string(),
                         body: Box::new(body_wp),
                         after: Box::new(after),
                     })
