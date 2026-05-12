@@ -194,6 +194,18 @@ pub(crate) fn nonlinear_preamble_fragments() -> Vec<PreambleFragment> {
     vec![PreambleFragment::Import("Mathlib.Tactic.Linarith".to_string())]
 }
 
+/// Render a `Tactic` as a Lean tactic text snippet. `Named` emits
+/// the bare name; `Raw` wraps in parens to keep precedence stable
+/// when the snippet is embedded inside a `first | ... | ...`
+/// composition. Used by the `Wp::AssertQuery` walker to compose
+/// `first | (intros; primary) | <outer_closer>`.
+fn tactic_as_str(t: &Tactic) -> String {
+    match t {
+        Tactic::Named(s) => s.clone(),
+        Tactic::Raw(s) => format!("({})", s),
+    }
+}
+
 /// Typed view of a loop invariant's classification (#103).
 ///
 /// Verus's `LoopInv` carries `at_entry: bool` + `at_exit: bool` —
@@ -1413,16 +1425,29 @@ fn walk_obligations<'a>(
             // elaborate.)
             walk_obligations(body, ctx, obl, e);
         }
-        Wp::AssertQuery { closer, preamble, body, after } => {
-            // Enter a new verification scope. `new_scope` drops
-            // enclosing-scope Hyps (matching Verus's "separate query"
-            // semantics — only the user's own requires + typ
-            // invariants apply) and installs `closer` + `preamble`
-            // on the obl so every theorem the body's recursive walk
-            // emits picks them up via `obl.closer` / `obl.extra_preamble`.
-            // `after` walks under the ORIGINAL obl — the query's
-            // discharger applies inside the scope only.
-            let inner_obl = obl.new_scope(closer.clone(), preamble.clone());
+        Wp::AssertQuery { primary, preamble, body, after } => {
+            // Compose the scope's closer as `first | (intros;
+            // primary) | <outer>` — try the mode-specific tactic
+            // after intros (it doesn't intro on its own), then
+            // fall back to whatever was discharging in the
+            // enclosing scope. The fallback is what closes the
+            // trivial `True` theorems the recursive walk still
+            // emits inside the body (e.g., from `Wp::Done`
+            // leaves at the end of the body block) —
+            // refutation-based tactics like `nlinarith` can't
+            // close `True`.
+            //
+            // Reading the outer closer from `obl.closer` (rather
+            // than hardcoding `tactus_auto`) preserves any
+            // fn-level override (`#[verifier::tactus_tactic("...")]`)
+            // and composes correctly for nested scopes.
+            let outer = tactic_as_str(&obl.closer);
+            let primary_str = tactic_as_str(primary);
+            let composed = Tactic::Raw(format!(
+                "first | (intros; {}) | ({})",
+                primary_str, outer
+            ));
+            let inner_obl = obl.new_scope(composed, preamble.clone());
             walk_obligations(body, ctx, &inner_obl, e);
             walk_obligations(after, ctx, obl, e);
         }
@@ -3191,16 +3216,25 @@ enum Wp<'a> {
     /// override the discharger — currently `nonlinear_arith`
     /// (`nlinarith` from Mathlib).
     ///
-    /// The walker enters a new OblCtx scope (`obl.new_scope(closer,
-    /// preamble)`) for `body`, which sheds the enclosing scope's
-    /// Hyp frames (matching Verus's NonLinear query semantics —
-    /// only requires + typ invariants are available) and sets the
-    /// closer that every theorem emitted inside the scope uses.
-    /// `after` walks under the ORIGINAL obl; Verus's `ast_to_sst`
-    /// already pre-injected the outer `assert(req) / assume(ens)`
-    /// block so the caller-side effect is upstream.
+    /// `primary` is the mode-specific tactic (e.g., `nlinarith`).
+    /// The walker composes it with the *enclosing scope's* closer
+    /// as a fallback: `first | (intros; primary) | <outer_closer>`.
+    /// Falling back to the outer closer (rather than hardcoding
+    /// `tactus_auto`) means a fn-level `#[verifier::tactus_tactic(
+    /// "...")]` override still applies to the trivial theorems the
+    /// recursive walk emits inside the scope (e.g., `True → ... →
+    /// True` from `Wp::Done` leaves that `primary` is too strict
+    /// to close).
+    ///
+    /// The walker also drops enclosing-scope Hyp frames (matching
+    /// Verus's NonLinear query semantics — only requires + typ
+    /// invariants are available) and attaches `preamble` to every
+    /// theorem emitted under the scope. `after` walks under the
+    /// ORIGINAL obl; Verus's `ast_to_sst` already pre-injected the
+    /// outer `assert(req) / assume(ens)` block so the caller-side
+    /// effect is upstream.
     AssertQuery {
-        closer: Tactic,
+        primary: Tactic,
         preamble: Vec<PreambleFragment>,
         body: Box<Wp<'a>>,
         after: Box<Wp<'a>>,
@@ -3899,24 +3933,8 @@ fn build_wp<'a>(
                         ctx,
                         loop_stack,
                     )?;
-                    // `first | (intros; nlinarith) | tactus_auto` —
-                    // try `nlinarith` (Mathlib's nonlinear-arithmetic
-                    // tactic, the surface choice via
-                    // `by(nonlinear_arith)`) after intro-ing the
-                    // theorem-level binders + Hyps that the OblCtx
-                    // wraps around the goal. `nlinarith` doesn't
-                    // intro on its own. Fall back to `tactus_auto`
-                    // for trivial theorems the recursive walking
-                    // still emits inside the scope (e.g.,
-                    // `True → ... → True` from `Wp::Done` leaves at
-                    // the end of the body block) — `nlinarith` is
-                    // refutation-based and can't close a `True`
-                    // goal.
-                    let closer = Tactic::Raw(
-                        "first | (intros; nlinarith) | tactus_auto".to_string(),
-                    );
                     Ok(Wp::AssertQuery {
-                        closer,
+                        primary: Tactic::Named("nlinarith".to_string()),
                         preamble: nonlinear_preamble_fragments(),
                         body: Box::new(body_wp),
                         after: Box::new(after),

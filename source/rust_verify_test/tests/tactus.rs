@@ -8416,6 +8416,108 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Bool-op probe: `&&` idempotence. `simp_all`'s built-in set
+// includes `and_self`, so this should close under `tactus_auto`
+// natively — no explicit lemma needed. Probe pins that the
+// auto-closer DOES handle some Bool identities, narrowing what
+// counts as a "gap."
+test_verify_one_file! {
+    #[test] test_exec_and_bool_idempotent verus_code! {
+        #[verifier::tactus_auto]
+        fn check_and_idempotent(b : bool) {
+            assert((b && b) == b);
+        }
+    } => Ok(())
+}
+
+// Bool-op probe: `&&` identity with True. `simp_all`'s built-in
+// `and_true` closes this.
+test_verify_one_file! {
+    #[test] test_exec_and_bool_identity_true verus_code! {
+        #[verifier::tactus_auto]
+        fn check_and_true(b: bool) {
+            assert((b && true) == b);
+        }
+    } => Ok(())
+}
+
+// Bool-op gap probe (flippable Err): `&&` associativity. `simp_all`
+// doesn't have `and_assoc` in its default set (it's not `@[simp]`-
+// tagged in Lean core because of looping concerns). The
+// associativity identity needs an explicit lemma. Same pattern as
+// `And.comm` / `Bool.xor_comm`.
+test_verify_one_file! {
+    #[test] test_exec_and_bool_associative_gap verus_code! {
+        #[verifier::tactus_auto]
+        fn check_and_assoc(b1: bool, b2: bool, b3: bool) {
+            assert(((b1 && b2) && b3) == (b1 && (b2 && b3)));
+        }
+    } => Err(_)
+}
+
+// Bool-op recovery probe: `&&` associativity via `simp_all
+// [and_assoc]`.
+test_verify_one_file! {
+    #[test] test_exec_and_bool_associative_with_simp verus_code! {
+        #[verifier::tactus_auto]
+        fn check_and_assoc(b1: bool, b2: bool, b3: bool) {
+            assert(((b1 && b2) && b3) == (b1 && (b2 && b3))) by {
+                simp_all [and_assoc]
+            };
+        }
+    } => Ok(())
+}
+
+// Bool-op gap probe (flippable Err): `||` associativity. Same
+// pattern.
+test_verify_one_file! {
+    #[test] test_exec_or_bool_associative_gap verus_code! {
+        #[verifier::tactus_auto]
+        fn check_or_assoc(b1: bool, b2: bool, b3: bool) {
+            assert(((b1 || b2) || b3) == (b1 || (b2 || b3)));
+        }
+    } => Err(_)
+}
+
+// Bool-op recovery probe: `||` associativity via `simp_all
+// [or_assoc]`.
+test_verify_one_file! {
+    #[test] test_exec_or_bool_associative_with_simp verus_code! {
+        #[verifier::tactus_auto]
+        fn check_or_assoc(b1: bool, b2: bool, b3: bool) {
+            assert(((b1 || b2) || b3) == (b1 || (b2 || b3))) by {
+                simp_all [or_assoc]
+            };
+        }
+    } => Ok(())
+}
+
+// Bool-op gap probe (flippable Err): And-Or distributivity. The
+// canonical algebraic distributive identity `a ∧ (b ∨ c) = (a ∧
+// b) ∨ (a ∧ c)`. Needs `and_or_left` explicitly.
+test_verify_one_file! {
+    #[test] test_exec_and_or_bool_distributive_gap verus_code! {
+        #[verifier::tactus_auto]
+        fn check_distrib(b1: bool, b2: bool, b3: bool) {
+            assert((b1 && (b2 || b3)) == ((b1 && b2) || (b1 && b3)));
+        }
+    } => Err(_)
+}
+
+// Bool-op recovery probe: distributivity via `simp_all
+// [and_or_left]`. Confirms the same user-side escape-hatch pattern
+// works across the And-Or-Distrib family.
+test_verify_one_file! {
+    #[test] test_exec_and_or_bool_distributive_with_simp verus_code! {
+        #[verifier::tactus_auto]
+        fn check_distrib(b1: bool, b2: bool, b3: bool) {
+            assert((b1 && (b2 || b3)) == ((b1 && b2) || (b1 && b3))) by {
+                simp_all [and_or_left]
+            };
+        }
+    } => Ok(())
+}
+
 
 // #128 probe: `r == E` where E itself contains a binder (`r ==
 // (if x > 0 { x } else { 0 })`). The substitution path replaces ret
@@ -8611,6 +8713,25 @@ test_verify_one_file! {
                 assert(i * 2 == 2 * i) by(nonlinear_arith);
                 i = i + 1;
             }
+        }
+    } => Ok(())
+}
+
+// Coverage: nested NonLinear scopes. The inner scope's
+// `Wp::AssertQuery` walker reads `obl.closer` (= outer scope's
+// composed `first | (intros; nlinarith) | <fn_default>`) and
+// composes again — `first | (intros; nlinarith) | (first |
+// (intros; nlinarith) | <fn_default>)`. The composition is
+// idempotent for our purposes — nlinarith is the same primary
+// at each level — but the structural test is that the closer
+// composes without crashing.
+test_verify_one_file! {
+    #[test] test_exec_assert_nonlinear_nested_scopes verus_code! {
+        #[verifier::tactus_auto]
+        fn check_nested(x: i32, y: i32) {
+            assert(x * y == y * x) by(nonlinear_arith) {
+                assert(y * x == x * y) by(nonlinear_arith);
+            };
         }
     } => Ok(())
 }
