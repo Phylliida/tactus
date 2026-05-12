@@ -255,7 +255,9 @@ pub fn check_proof_fn(
     cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body)));
     cmds.push(Command::NamespaceClose(ns));
 
-    debug_check(&cmds);
+    if let Err(reason) = debug_check(&cmds) {
+        return CheckResult::Failed { error: reason, warnings: vec![] };
+    }
 
     let rendered = pp_commands(&cmds);
     let source_map = LeanSourceMap::ProofFn {
@@ -351,7 +353,9 @@ pub fn check_exec_fn(
     }
     cmds.push(Command::NamespaceClose(ns));
 
-    debug_check(&cmds);
+    if let Err(reason) = debug_check(&cmds) {
+        return CheckResult::Failed { error: reason, warnings };
+    }
 
     let rendered = pp_commands(&cmds);
 
@@ -458,12 +462,17 @@ fn collect_referenced_datatypes<'a>(
 /// every `Var` in a theorem goal / def body / instance method body is
 /// either a local binder, an earlier top-level definition, or a known
 /// Lean/Mathlib built-in. A violation means we lost track of a
-/// dependency and Lean would reject the file; panicking here points at
-/// the exact identifier instead of forcing the user to decode a Lean
-/// unknown-identifier error.
+/// dependency and Lean would reject the file; returning a formatted
+/// error here points at the exact identifier instead of forcing the
+/// user to decode a Lean unknown-identifier error.
 ///
-/// Compiled out of release builds.
-fn debug_check(_cmds: &[Command]) {
+/// Returns `Err` listing each unresolved reference and its context.
+/// Callers convert this to `CheckResult::Failed` so the rejection
+/// flows through Verus's normal error path (instead of a panic that
+/// kills the test process).
+///
+/// Compiled out of release builds (returns `Ok(())` unconditionally).
+fn debug_check(_cmds: &[Command]) -> Result<(), String> {
     #[cfg(debug_assertions)]
     {
         let violations = sanity::check_references(_cmds);
@@ -471,14 +480,17 @@ fn debug_check(_cmds: &[Command]) {
             let lines: Vec<String> = violations.iter()
                 .map(|v| format!("  in `{}`: unresolved `{}`", v.context, v.name))
                 .collect();
-            panic!(
+            return Err(format!(
                 "Tactus codegen produced unresolved references:\n{}\n\nThis usually means \
                  `dep_order` missed a fn while walking VIR (check `walk_expr` / `walk_place` \
-                 coverage for any new ExprX/PlaceX variants).",
+                 coverage for any new ExprX/PlaceX variants), or a callee's body is `None` \
+                 (uninterp spec fn / external_body fn) and isn't yet emitted as an opaque/axiom \
+                 — see DESIGN.md \"Cross-crate spec fn availability\".",
                 lines.join("\n")
-            );
+            ));
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
