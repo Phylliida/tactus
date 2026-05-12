@@ -1,3 +1,4 @@
+pub mod call_inlining;
 pub mod dep_order;
 pub mod expr_shared;
 pub mod generate;

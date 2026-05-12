@@ -41,8 +41,18 @@ pub struct References<'a> {
 
 /// Collect all referenced datatype/trait names from proof fns and their
 /// transitive spec fn dependencies.
+///
+/// `all_fn_map` covers spec, proof, and exec fns alike — used to
+/// walk into exec/proof callees' inlined specs (the clauses the
+/// emission path will substitute in via `walk_call`). Without that
+/// walk, the dep walk would miss spec-fn references that appear
+/// only inside an exec callee's `ensures` — see the 2026-05-12
+/// "predicate is unresolved" regression. The shared abstraction in
+/// `call_inlining::collect_inlined_at_call` defines what counts as
+/// "inlined."
 pub fn collect_references<'a>(
     spec_fn_map: &HashMap<&Fun, &'a FunctionX>,
+    all_fn_map: &HashMap<&Fun, &'a FunctionX>,
     proof_fns: &[&'a FunctionX],
 ) -> References<'a> {
     let mut refs = References { datatypes: HashSet::new(), traits: HashSet::new() };
@@ -58,9 +68,25 @@ pub fn collect_references<'a>(
         if visited.contains(fun) { continue; }
         visited.insert(fun);
         if let Some(f) = spec_fn_map.get(fun) {
+            // Spec fn: body gets transparently unfolded at call sites,
+            // so walk its body + decreases + signature.
             collect_from_fn(f, &mut refs);
             if let Some(body) = &f.body { collect_fun_refs(body, &mut worklist); }
             for d in f.decrease.iter() { collect_fun_refs(d, &mut worklist); }
+        } else if let Some(f) = all_fn_map.get(fun) {
+            // Exec/proof callee (also: body-less spec fns and
+            // TraitMethodDecls — both excluded from spec_fn_map but
+            // present in all_fn_map). Their `require` + `ensure`
+            // clauses get inlined at call sites by `walk_call`, so
+            // refs in those clauses must land in the preamble.
+            // Body NOT walked — it's not inlined, only the specs are.
+            collect_from_fn(f, &mut refs);
+            let spec_callee = crate::call_inlining::spec_source(f, all_fn_map)
+                .unwrap_or(f);
+            let inlined = crate::call_inlining::collect_inlined_at_call(f, spec_callee);
+            for clause in inlined.requires.iter().chain(inlined.ensures.iter()) {
+                collect_fun_refs(clause, &mut worklist);
+            }
         }
     }
 
@@ -142,8 +168,18 @@ pub fn build_spec_fn_map<'a>(all_fns: &'a [&'a FunctionX]) -> HashMap<&'a Fun, &
 }
 
 /// Given spec fn map and proof fns, return spec fns in dependency order.
+///
+/// `all_fn_map` provides the same exec/proof-callee-spec-walking that
+/// `collect_references` does: when an exec/proof callee is reached
+/// via the worklist, its inlined `require`/`ensure` clauses (per the
+/// shared `call_inlining::collect_inlined_at_call` abstraction) are
+/// scanned for spec-fn refs. Without this, spec fns referenced only
+/// inside an exec callee's specs would never enter `needed`, their
+/// standalone defs would never emit, and the rendered theorem would
+/// have unresolved references at the call site.
 pub fn order_spec_fns<'a>(
     spec_fn_map: &HashMap<&Fun, &'a FunctionX>,
+    all_fn_map: &HashMap<&Fun, &'a FunctionX>,
     all_fns: &'a [&'a FunctionX],
     proof_fns: &[&'a FunctionX],
 ) -> Vec<FnGroup<'a>> {
@@ -158,6 +194,7 @@ pub fn order_spec_fns<'a>(
         needed.insert(fun);
 
         if let Some(f) = spec_fn_map.get(fun) {
+            // Spec fn: body and decreases get walked for transitive refs.
             let mut callees = Vec::new();
             if let Some(body) = &f.body { collect_fun_refs(body, &mut callees); }
             for d in f.decrease.iter() { collect_fun_refs(d, &mut callees); }
@@ -168,6 +205,17 @@ pub fn order_spec_fns<'a>(
             edges.insert(fun, callees.into_iter()
                 .filter(|c| spec_fn_map.contains_key(c))
                 .collect());
+        } else if let Some(f) = all_fn_map.get(fun) {
+            // Exec/proof callee: walk inlined require/ensure clauses
+            // for spec-fn refs. Mirrors `collect_references`'s branch;
+            // both go through `call_inlining::collect_inlined_at_call`
+            // so emission and ordering can't drift.
+            let spec_callee = crate::call_inlining::spec_source(f, all_fn_map)
+                .unwrap_or(f);
+            let inlined = crate::call_inlining::collect_inlined_at_call(f, spec_callee);
+            for clause in inlined.requires.iter().chain(inlined.ensures.iter()) {
+                collect_fun_refs(clause, &mut worklist);
+            }
         }
     }
 

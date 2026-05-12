@@ -155,10 +155,14 @@ fn krate_preamble(
 
     let all_fns: Vec<&FunctionX> = krate.functions.iter().map(|f| &f.x).collect();
     let spec_fn_map = dep_order::build_spec_fn_map(&all_fns);
-    let refs = dep_order::collect_references(&spec_fn_map, root_fns);
+    // `method_lookup` is the all-fn map (spec + proof + exec, no
+    // filtering). Shared with `collect_references` so the dep walk
+    // can resolve TraitMethodImpl→method redirects and walk into
+    // exec-callee specs via the `call_inlining` abstraction.
     let method_lookup: std::collections::HashMap<&Fun, &FunctionX> = all_fns.iter()
         .map(|f| (&f.name, *f))
         .collect();
+    let refs = dep_order::collect_references(&spec_fn_map, &method_lookup, root_fns);
 
     // Emit trait classes (without instances). Tactus's verification
     // model doesn't use Lean's typeclass dispatch: exec-fn calls inline
@@ -196,7 +200,7 @@ fn krate_preamble(
         cmds.extend(to_lean_fn::datatype_group_to_cmds(&group, emit_accessors));
     }
 
-    let groups = dep_order::order_spec_fns(&spec_fn_map, &all_fns, root_fns);
+    let groups = dep_order::order_spec_fns(&spec_fn_map, &method_lookup, &all_fns, root_fns);
     for group in &groups {
         match group {
             FnGroup::Single(f) => {
@@ -258,10 +262,11 @@ pub fn check_proof_fn(
     cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body)));
     cmds.push(Command::NamespaceClose(ns));
 
-    if let Err(reason) = debug_check(&cmds) {
-        return CheckResult::Failed { error: reason, warnings: vec![] };
-    }
-
+    // Pretty-print and write the .lean file BEFORE the sanity check.
+    // The artifact is always written when codegen produces a command
+    // stream, even if sanity rejects — so error messages can name
+    // the .lean path for inspection and `cat`-style debugging works
+    // regardless of which step fails.
     let rendered = pp_commands(&cmds);
     let source_map = LeanSourceMap::ProofFn {
         fn_name: short_name(&proof_fn.name.path).to_string(),
@@ -273,6 +278,10 @@ pub fn check_proof_fn(
     let file_path = lean_file_path(crate_name, &proof_fn.name.path);
     if let Err(e) = write_lean_file(&file_path, &rendered.text) {
         return CheckResult::Error(e);
+    }
+
+    if let Err(reason) = debug_check(&cmds) {
+        return CheckResult::Failed { error: reason, warnings: vec![] };
     }
 
     let dir = project::default_project_dir();
@@ -356,15 +365,19 @@ pub fn check_exec_fn(
     }
     cmds.push(Command::NamespaceClose(ns));
 
-    if let Err(reason) = debug_check(&cmds) {
-        return CheckResult::Failed { error: reason, warnings };
-    }
-
+    // Pretty-print and write the .lean file BEFORE the sanity check
+    // so the artifact is always available for inspection — even when
+    // sanity rejects, users can `cat` the .lean path mentioned in the
+    // error to see what was emitted.
     let rendered = pp_commands(&cmds);
 
     let file_path = lean_file_path(crate_name, &vir_fn.name.path);
     if let Err(e) = write_lean_file(&file_path, &rendered.text) {
         return CheckResult::Error(e);
+    }
+
+    if let Err(reason) = debug_check(&cmds) {
+        return CheckResult::Failed { error: reason, warnings };
     }
 
     let dir = project::default_project_dir();
