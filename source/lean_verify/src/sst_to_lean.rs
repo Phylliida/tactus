@@ -6427,4 +6427,86 @@ mod tests {
                 op, line);
         }
     }
+
+    /// Shape-drift guard for Verus's `AssertQueryMode::NonLinear` arm
+    /// in `ast_to_sst.rs`. Tactus's `build_wp` arm for NonLinear
+    /// IGNORES the `typ_inv_exps` field on `StmX::AssertQuery` because
+    /// we rely on the body's `Block([Assume(req)*, proof_stms*,
+    /// Assert(ens)*])` structure carrying the same facts. This test
+    /// pins Verus's emission to that structure — if upstream ever
+    /// stops pushing per-clause Assumes/Asserts, or routes facts only
+    /// through `typ_inv_exps`, Tactus's body walk would silently lose
+    /// them.
+    ///
+    /// Mirrors `ast_to_sst_pre_injects_around_assert_bit_vector` —
+    /// grep the upstream source rather than running ast_to_sst, since
+    /// constructing a synthetic Ctx is involved for a shape-drift guard.
+    #[test]
+    fn ast_to_sst_emits_assume_assert_for_nonlinear_body() {
+        let source = include_str!("../../vir/src/ast_to_sst.rs");
+        let nl_arm_start = source.find("AssertQueryMode::NonLinear =>")
+            .expect(
+                "AssertQueryMode::NonLinear arm not found in ast_to_sst.rs. \
+                 Either Verus's AssertQueryMode enum was renamed, or the \
+                 NonLinear arm was deleted (in which case Tactus's \
+                 build_wp NonLinear arm needs a different upstream entry \
+                 point)."
+            );
+        // Take a generous window to cover the full arm body. NonLinear
+        // arm is ~80 lines in ast_to_sst (vs BitVec's ~50).
+        let window_end = (nl_arm_start + 4500).min(source.len());
+        let arm = &source[nl_arm_start..window_end];
+
+        assert!(
+            arm.contains("for r in requires.iter()"),
+            "Verus's AssertQueryMode::NonLinear arm no longer iterates \
+             `requires` to push per-clause Assumes into the inner body. \
+             Tactus's `Wp::AssertQuery` walker assumes the body carries \
+             `Assume(req)*` at the start so the requires enter the \
+             scope's Hyp frames during recursive walking. Update the \
+             design accordingly if upstream encoding has changed."
+        );
+        assert!(
+            arm.contains("for e in ensures.iter()"),
+            "Verus's AssertQueryMode::NonLinear arm no longer iterates \
+             `ensures` to push per-clause Asserts into the inner body. \
+             Tactus's `Wp::AssertQuery` walker assumes the body carries \
+             `Assert(ens)*` at the end so each ensures becomes one \
+             theorem emitted in the scope. Update the design \
+             accordingly if upstream encoding has changed."
+        );
+        assert!(
+            arm.contains("inner_body.push(assume)") || arm.contains("inner_body.push(assume_stm)"),
+            "Verus's AssertQueryMode::NonLinear arm no longer pushes \
+             `assume` nodes for requires into `inner_body` (the body \
+             of the emitted `StmX::AssertQuery`). The Tactus body walk \
+             would lose the requires."
+        );
+        assert!(
+            arm.contains("inner_body.push(assert)") || arm.contains("inner_body.push(assert_stm)"),
+            "Verus's AssertQueryMode::NonLinear arm no longer pushes \
+             `assert` nodes for ensures into `inner_body`. The Tactus \
+             body walk would emit no theorems for the ensures."
+        );
+    }
+
+    /// Pin `nonlinear_preamble_fragments`'s contents — single import
+    /// of `Mathlib.Tactic.Linarith` (where `nlinarith` lives). If a
+    /// future Mathlib refactor moves `nlinarith` to a different
+    /// module, the test surfaces it as a focused failure rather than
+    /// via a Lean elaboration error.
+    #[test]
+    fn nonlinear_preamble_fragments_shape_pinned() {
+        let frags = nonlinear_preamble_fragments();
+        assert_eq!(frags.len(), 1,
+            "expected exactly one fragment (Mathlib.Tactic.Linarith import); \
+             got {} fragments: {:?}", frags.len(), frags);
+        let imports: Vec<&str> = frags.iter()
+            .filter_map(|f| if let PreambleFragment::Import(s) = f { Some(s.as_str()) } else { None })
+            .collect();
+        assert!(imports.contains(&"Mathlib.Tactic.Linarith"),
+            "fragments should include Mathlib.Tactic.Linarith import; \
+             nlinarith lives in that module. Got imports: {:?}",
+            imports);
+    }
 }
