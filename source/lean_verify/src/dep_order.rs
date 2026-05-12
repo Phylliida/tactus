@@ -34,16 +34,9 @@ pub enum DatatypeGroup<'a> {
 
 /// All entity names referenced by the proof fns (transitively through spec fns).
 /// Borrows `&str` from VIR's `Arc<String>` — zero allocations.
-///
-/// `needed_fns` is the set of spec-fn `Fun`s reached by the worklist walk
-/// (the same set `order_spec_fns` re-derives internally as `needed`).
-/// Exposed here so `generate.rs`'s trait_impls loop can gate Instance
-/// emission on whether any of an impl's method_impls is reachable —
-/// the structural rule documented at the trait_impls call site.
 pub struct References<'a> {
     pub datatypes: HashSet<&'a str>,
     pub traits: HashSet<&'a str>,
-    pub needed_fns: HashSet<&'a Fun>,
 }
 
 /// Collect all referenced datatype/trait names from proof fns and their
@@ -52,21 +45,18 @@ pub fn collect_references<'a>(
     spec_fn_map: &HashMap<&Fun, &'a FunctionX>,
     proof_fns: &[&'a FunctionX],
 ) -> References<'a> {
-    let mut refs = References {
-        datatypes: HashSet::new(),
-        traits: HashSet::new(),
-        needed_fns: HashSet::new(),
-    };
+    let mut refs = References { datatypes: HashSet::new(), traits: HashSet::new() };
 
     for pf in proof_fns {
         collect_from_fn(pf, &mut refs);
     }
 
+    let mut visited: HashSet<&Fun> = HashSet::new();
     let mut worklist: Vec<&'a Fun> = Vec::new();
     seed_worklist(proof_fns, &mut worklist);
     while let Some(fun) = worklist.pop() {
-        if refs.needed_fns.contains(fun) { continue; }
-        refs.needed_fns.insert(fun);
+        if visited.contains(fun) { continue; }
+        visited.insert(fun);
         if let Some(f) = spec_fn_map.get(fun) {
             collect_from_fn(f, &mut refs);
             if let Some(body) = &f.body { collect_fun_refs(body, &mut worklist); }
