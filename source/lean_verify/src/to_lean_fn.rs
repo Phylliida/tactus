@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use vir::ast::*;
 use crate::lean_ast::{
-    and_all, Axiom, Binder as LBinder, BinderKind, Class, ClassMethod, Command, Datatype,
+    and_all, Axiom, BinOp, Binder as LBinder, BinderKind, Class, ClassMethod, Command, Datatype,
     DatatypeKind, Def, DefCurried, Expr as LExpr, ExprNode, Field, Instance,
     InstanceMethod, MatchArm, Pattern as LPattern, Theorem, Tactic, Variant,
 };
@@ -131,7 +131,7 @@ pub fn spec_fn_to_ast(f: &FunctionX) -> Command {
             let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| vir_expr_to_ast(d)).collect();
             Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by })
         }
-        None => Command::Axiom(Axiom { name, binders, ret_ty }),
+        None => Command::Axiom(Axiom { name, binders, ret_ty, attrs: vec![] }),
     }
 }
 
@@ -187,7 +187,21 @@ pub fn proof_fn_to_ast(f: &FunctionX, tactic_body: &str) -> Theorem {
 ///
 /// Returns an empty `Vec` for `Dt::Tuple` (no declaration needed —
 /// tuples are rendered as `T × U` products).
-pub fn datatype_to_cmds(dt: &DatatypeX, emit_accessors: bool) -> Vec<Command> {
+pub fn datatype_to_cmds(
+    dt: &DatatypeX,
+    emit_accessors: bool,
+    external_body_paths: &std::collections::HashSet<&Path>,
+) -> Vec<Command> {
+    // External-body types (`#[verifier::external_body] struct Foo {}`,
+    // and the `external_type_specification` proxy variant) have no
+    // user-visible structure; Verus stipulates them as opaque carriers
+    // for axiomatized methods. Emitting them as an empty Lean `structure`
+    // gives them a unique inhabitant (`Foo.mk`), so any two values
+    // collapse via `cases` — a soundness gap. Route to opaque-axiom
+    // emission instead. See `external_body_type_cmds`.
+    if matches!(dt.transparency, DatatypeTransparency::Never) {
+        return external_body_type_cmds(dt);
+    }
     // Single-element SCC. The set's lifetime is tied to `dt`'s name
     // path; constructed locally because non-mutual datatypes never
     // cross outside their own SCC.
@@ -196,10 +210,10 @@ pub fn datatype_to_cmds(dt: &DatatypeX, emit_accessors: bool) -> Vec<Command> {
         scc_paths.insert(p);
     }
     let mut cmds = Vec::new();
-    if let Some(decl) = datatype_decl_cmd(dt, &scc_paths) {
+    if let Some(decl) = datatype_decl_cmd(dt, &scc_paths, external_body_paths) {
         cmds.push(decl);
     }
-    if let Some(inst) = datatype_inhabited_instance_cmd(dt, &scc_paths) {
+    if let Some(inst) = datatype_inhabited_instance_cmd(dt, &scc_paths, external_body_paths) {
         cmds.push(inst);
     }
     cmds.extend(datatype_accessor_cmds(dt, emit_accessors));
@@ -207,6 +221,90 @@ pub fn datatype_to_cmds(dt: &DatatypeX, emit_accessors: bool) -> Vec<Command> {
         cmds.push(height);
     }
     cmds
+}
+
+/// Emit external_body types as opaque axioms:
+/// ```text
+/// axiom T : Type → Type → ... → Type
+/// @[instance] axiom T.instInhabited (A : Type) (B : Type) ... :
+///     Inhabited (T A B ...)
+/// ```
+///
+/// Two axioms per type:
+/// 1. The type itself, curried through its type params. No equations,
+///    no constructors — values are distinguishable only via whatever
+///    axiomatized spec fns the user provides.
+/// 2. An `Inhabited` instance stipulated by axiom. Required because
+///    Tactus emits `| _ => default` fallback arms in multi-variant
+///    enum accessors; an external_body field type needs an Inhabited
+///    instance for the accessor to elaborate. The `@[instance]` attribute
+///    plugs it into Lean's typeclass resolution.
+///
+/// Both shapes are sound under classical+choice: the type stipulator
+/// (e.g., vstd) is claiming "this type is nonempty" and "this is the
+/// signature." Tactus's role is to faithfully encode that stipulation.
+fn external_body_type_cmds(dt: &DatatypeX) -> Vec<Command> {
+    let path = match &dt.name {
+        Dt::Path(p) => lean_name(p),
+        Dt::Tuple(_) => return vec![],
+    };
+    // Type axiom: `axiom T : Type → ... → Type`, currying type params
+    // into the return type so the result is `Type → ... → Type`.
+    let type_ret_ty = curry_type_to_type(dt.typ_params.len());
+    let type_axiom = Axiom {
+        name: path.clone(),
+        binders: vec![],
+        ret_ty: type_ret_ty,
+        attrs: vec![],
+    };
+    // Inhabited axiom: `@[instance] axiom T.instInhabited (A : Type) ... :
+    //   Inhabited (T A ...)`.
+    let inhabited_binders: Vec<LBinder> = dt.typ_params.iter()
+        .map(|(id, _)| LBinder {
+            name: Some(crate::lean_name::LeanName::lit(id.as_str())),
+            ty: LExpr::var_lit("Type"),
+            kind: BinderKind::Explicit,
+        })
+        .collect();
+    let parent_applied = if dt.typ_params.is_empty() {
+        LExpr::var_lit(&path)
+    } else {
+        let args: Vec<LExpr> = dt.typ_params.iter()
+            .map(|(id, _)| LExpr::var_lit(id.as_str()))
+            .collect();
+        LExpr::app(LExpr::var_lit(&path), args)
+    };
+    let inhabited_ret_ty = LExpr::app(LExpr::var_lit("Inhabited"), vec![parent_applied]);
+    let inhabited_axiom = Axiom {
+        name: format!("{}.instInhabited", path),
+        binders: inhabited_binders,
+        ret_ty: inhabited_ret_ty,
+        attrs: vec!["instance".into()],
+    };
+    vec![Command::Axiom(type_axiom), Command::Axiom(inhabited_axiom)]
+}
+
+/// Build `Type → Type → ... → Type` with `arity` arrows. For `arity = 0`,
+/// returns just `Type`. For `arity = 2`, returns `Type → Type → Type`.
+///
+/// Used for external_body type axiom signatures (`axiom T : Type → Type`
+/// for `T<A>`).
+///
+/// Lean's `→` for non-`Prop` types is the same syntactic arrow as the
+/// implication arrow on Props (both render via `BinOp::Implies` which
+/// pretty-prints as `→` — see `to_lean_type::SpecFn` for the same
+/// convention applied to spec fn types).
+fn curry_type_to_type(arity: usize) -> LExpr {
+    let type_ = LExpr::var_lit("Type");
+    let mut result = type_.clone();
+    for _ in 0..arity {
+        result = LExpr::new(ExprNode::BinOp {
+            op: BinOp::Implies,
+            lhs: Box::new(type_.clone()),
+            rhs: Box::new(result),
+        });
+    }
+    result
 }
 
 /// Emit a group of datatypes — `Single` for non-mutual, `Mutual` for
@@ -225,14 +323,34 @@ pub fn datatype_to_cmds(dt: &DatatypeX, emit_accessors: bool) -> Vec<Command> {
 pub fn datatype_group_to_cmds<'a>(
     group: &crate::dep_order::DatatypeGroup<'a>,
     emit_accessors: bool,
+    external_body_paths: &std::collections::HashSet<&Path>,
 ) -> Vec<Command> {
     use crate::dep_order::DatatypeGroup;
-    let dts: Vec<&'a DatatypeX> = match group {
-        DatatypeGroup::Single(dt) => return datatype_to_cmds(dt, emit_accessors),
+    let all_dts: Vec<&'a DatatypeX> = match group {
+        DatatypeGroup::Single(dt) => return datatype_to_cmds(dt, emit_accessors, external_body_paths),
         DatatypeGroup::Mutual(dts) => dts.clone(),
     };
 
-    // Build the SCC path set once for all members of the group.
+    // External-body types in a mutual SCC are exotic — they have no
+    // fields so they can't recurse into other types. If `dep_order` ever
+    // groups one into an SCC (currently it shouldn't), peel them off and
+    // emit as opaque axioms separately; the remaining members go through
+    // the mutual emission path.
+    let mut cmds = Vec::new();
+    let dts: Vec<&'a DatatypeX> = all_dts.iter().copied().filter(|dt| {
+        if matches!(dt.transparency, DatatypeTransparency::Never) {
+            cmds.extend(external_body_type_cmds(dt));
+            false
+        } else {
+            true
+        }
+    }).collect();
+    if dts.is_empty() {
+        return cmds;
+    }
+
+    // Build the SCC path set once for all (non-external-body) members of
+    // the group.
     let scc_paths: std::collections::HashSet<&Path> = dts.iter()
         .filter_map(|dt| match &dt.name {
             Dt::Path(p) => Some(p),
@@ -240,11 +358,9 @@ pub fn datatype_group_to_cmds<'a>(
         })
         .collect();
 
-    let mut cmds = Vec::new();
-
     // 1. mutual block of inductives.
     let inductive_cmds: Vec<Command> = dts.iter()
-        .filter_map(|dt| datatype_decl_cmd(dt, &scc_paths))
+        .filter_map(|dt| datatype_decl_cmd(dt, &scc_paths, external_body_paths))
         .collect();
     cmds.push(Command::Mutual(inductive_cmds));
 
@@ -255,7 +371,7 @@ pub fn datatype_group_to_cmds<'a>(
     // (the mutual block above) without needing the instance itself to
     // be inside it.
     for dt in &dts {
-        if let Some(inst) = datatype_inhabited_instance_cmd(dt, &scc_paths) {
+        if let Some(inst) = datatype_inhabited_instance_cmd(dt, &scc_paths, external_body_paths) {
             cmds.push(inst);
         }
     }
@@ -293,6 +409,40 @@ pub fn datatype_group_to_cmds<'a>(
 /// Counterexample (no generics): `enum Tree { Leaf, Node(Tree, Tree) }` —
 /// no parent params to compare against; recursion is trivially uniform.
 /// Returns false.
+/// Returns `true` iff `typ` peels to a `Dt::Path(p)` reference where `p`
+/// is in `external_body_paths`. Used by the Inhabited-emission gate
+/// (`has_field_referencing_external_body`) to decide whether the parent
+/// datatype's auto-derived Inhabited would fail Lean's compiler IR check.
+///
+/// Only the outermost path is checked — nested generic args don't matter
+/// here because Lean's `deriving Inhabited` constructs the default by
+/// picking a variant and applying `default` to each field's TYPE. A field
+/// of type `Vec<Opaque>` produces `Vec.nil` via Vec's polymorphic
+/// Inhabited (no Opaque value constructed); only a field DIRECTLY typed
+/// `Opaque` forces calling `default : Opaque` which lacks code.
+fn typ_references_external_body(
+    typ: &Typ,
+    external_body_paths: &std::collections::HashSet<&Path>,
+) -> bool {
+    let peeled = crate::to_lean_type::peel_typ_wrappers(typ);
+    match &**peeled {
+        TypX::Datatype(Dt::Path(p), _, _) => external_body_paths.contains(p),
+        _ => false,
+    }
+}
+
+/// Returns `true` iff any variant field of `dt` references an external_body
+/// datatype directly (via `typ_references_external_body`). See that helper's
+/// docstring for why a shallow check suffices.
+fn has_field_referencing_external_body(
+    dt: &DatatypeX,
+    external_body_paths: &std::collections::HashSet<&Path>,
+) -> bool {
+    dt.variants.iter().any(|v|
+        v.fields.iter().any(|f| typ_references_external_body(&f.a.0, external_body_paths))
+    )
+}
+
 fn has_cross_instantiation_recursion(
     dt: &DatatypeX,
     scc_paths: &std::collections::HashSet<&Path>,
@@ -327,6 +477,7 @@ fn has_cross_instantiation_recursion(
 fn datatype_decl_cmd(
     dt: &DatatypeX,
     scc_paths: &std::collections::HashSet<&Path>,
+    external_body_paths: &std::collections::HashSet<&Path>,
 ) -> Option<Command> {
     let (path, short) = match &dt.name {
         Dt::Path(p) => (lean_name(p), short_name(p).to_string()),
@@ -374,7 +525,22 @@ fn datatype_decl_cmd(
     // conditional instance `[Inhabited A] → Inhabited (List A)`. For
     // mutually recursive SCCs (#109), Lean accepts `deriving Inhabited`
     // inline even inside a `mutual` block (parameter-style only).
-    let derives = if cross_inst { vec![] } else { vec!["Inhabited".into()] };
+    //
+    // ALSO drop the derive when any field references an external_body
+    // type: Lean's auto-derived Inhabited is *computable* and depends on
+    // the field's Inhabited.default at code-gen time. External_body
+    // types have axiomatic Inhabited instances with no executable code,
+    // so the compiler IR check fails on the parent's auto-derived
+    // instance. `datatype_inhabited_instance_cmd` emits a manual
+    // `noncomputable instance` in this case (and the cross-instantiation
+    // case above).
+    let has_external_body_field =
+        has_field_referencing_external_body(dt, external_body_paths);
+    let derives = if cross_inst || has_external_body_field {
+        vec![]
+    } else {
+        vec!["Inhabited".into()]
+    };
     Some(Command::Datatype(Datatype {
         name: path,
         typ_params,
@@ -395,12 +561,20 @@ fn datatype_decl_cmd(
 /// `Inhabited Int` etc. instances (for primitive fields).
 ///
 /// Returns `None` for parameter-style datatypes (Lean's `deriving Inhabited`
-/// handles those) and for tuple datatypes (no decl).
+/// handles those) and for tuple datatypes (no decl). Also returns `Some`
+/// when any variant field references an external_body type — the parent
+/// must then have a *noncomputable* Inhabited instance (axiom-backed
+/// child Inhabited instances have no executable code; Lean's auto-derived
+/// computable instance would fail the IR check).
 fn datatype_inhabited_instance_cmd(
     dt: &DatatypeX,
     scc_paths: &std::collections::HashSet<&Path>,
+    external_body_paths: &std::collections::HashSet<&Path>,
 ) -> Option<Command> {
-    if !has_cross_instantiation_recursion(dt, scc_paths) {
+    let cross_inst = has_cross_instantiation_recursion(dt, scc_paths);
+    let has_external_body_field =
+        has_field_referencing_external_body(dt, external_body_paths);
+    if !cross_inst && !has_external_body_field {
         return None;
     }
     let path = match &dt.name {
@@ -408,11 +582,18 @@ fn datatype_inhabited_instance_cmd(
         Dt::Tuple(_) => return None,
     };
     // Find a base constructor — a variant whose fields don't reference any
-    // datatype in the SCC. Such a variant always exists for any
-    // Rust-constructible enum (otherwise the datatype is uninhabited).
-    let base_variant = dt.variants.iter().find(|v| {
-        v.fields.iter().all(|f| field_recursive_target(&f.a.0, scc_paths).is_none())
-    })?;
+    // datatype in the SCC AND don't reference any external_body datatype.
+    // Such a variant exists for most Rust-constructible enums (a unit-like
+    // variant or one with only primitive fields). If none exists (e.g.,
+    // every variant has an external_body field), fall back to the first
+    // variant: `default` for an external_body field type routes to that
+    // type's axiom-backed Inhabited instance, which is valid noncomputable.
+    let base_variant = dt.variants.iter()
+        .find(|v| v.fields.iter().all(|f| {
+            field_recursive_target(&f.a.0, scc_paths).is_none()
+                && !typ_references_external_body(&f.a.0, external_body_paths)
+        }))
+        .or_else(|| dt.variants.first())?;
 
     // Build `T.<base> default default ...` — the constructor applied to
     // `default` for each field. Lean infers the implicit type-args via the

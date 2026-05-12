@@ -2467,6 +2467,85 @@ scope must be primed.
 * `test_trait_default_body_references_other_trait_method` — Case A
   pinned as Err, see deferrals below.
 
+### External-body type opaque emission (landed 2026-05-12)
+
+Types declared `#[verifier::external_body]` (canonical examples:
+`vstd::seq::Seq`, `vstd::set::Set`, `vstd::map::Map`; user-defined
+types follow the same shape) emit as opaque axioms rather than empty
+`structure` declarations. Before this change, the empty-struct
+emission gave every external_body type a unique inhabitant (`T.mk`),
+so any two values collapsed via `cases x; cases y; rfl` — including
+distinct ground terms like `s.push x` and `s`, a real soundness gap.
+
+**Shape**:
+```lean
+axiom seq.Seq : Type → Type
+@[instance] axiom seq.Seq.instInhabited (A : Type) : Inhabited (seq.Seq A)
+```
+
+For non-generic external_body: `axiom Foo : Type` + `@[instance]
+axiom Foo.instInhabited : Inhabited Foo`. Type-arg currying matches
+Lean's idiomatic `List : Type → Type` convention.
+
+**Discriminator**: `dt.transparency == DatatypeTransparency::Never`
+(`rust_to_vir_adts.rs` sets this for direct `external_body` and for
+`external_type_specification` proxies). Empty-fields is implied but
+transparency is the load-bearing signal.
+
+**Why two axioms not one**:
+* Type-only axiom closes the soundness gap (no equations between
+  opaque ground terms; `cases` on an axiom-typed term fails because
+  the type has no constructors).
+* Inhabited axiom is required when an external_body type is a field
+  of another datatype. Tactus emits accessor fallbacks `| _ =>
+  default` for multi-variant enums, which needs `[Inhabited (T A)]`
+  in scope. Without the Inhabited axiom, `enum Wrapper { Has(Opaque),
+  None }` would fail to elaborate.
+
+**Why not `noncomputable instance ...` with a `Classical.choice`
+witness**: the choice-based shape (B in the design pass) reuses the
+existing `Command::Instance` machinery with no AST changes but
+emits 3 commands per type. The chosen `@[instance] axiom` shape
+emits 2 commands and is the most direct expression of "this type
+has an inhabitant by stipulation." Trade-off: one new field
+(`attrs: Vec<String>` on `Axiom`, mirrors `DefCurried`). `@[instance]
+axiom ...` is valid Lean 4 syntax (verified before threading
+through; attributes apply to all declaration kinds).
+
+**Downstream effect: Inhabited noncomputability propagation**.
+External_body Inhabited instances are axioms with no executable
+code. A parent datatype whose `deriving Inhabited` would call
+`Opaque.instInhabited.default` to construct its default value fails
+Lean's compiler IR check. Fix: when any variant field of `dt`
+references an external_body datatype directly,
+`datatype_decl_cmd` drops `Inhabited` from `derives` and
+`datatype_inhabited_instance_cmd` emits a manual
+`noncomputable instance` instead (picking a variant whose fields
+don't reference external_body if one exists, otherwise falling
+back to using `default` for each field — noncomputable instance
+accepts axiom-backed defaults).
+
+**Detection scope: outermost field type only**. Nested generic
+references (e.g., `Vec<Opaque>` as a field) don't trigger the
+gate — Lean's polymorphic Inhabited (`Vec.nil`) doesn't construct
+an Opaque value at this site. Only DIRECT field types matter
+(`Has(Opaque)` does trigger; `Has(Vec<Opaque>)` does not).
+
+**Pinned tests**:
+* `test_external_body_soundness_gap_probe` — empty-struct exploit
+  (`cases x; cases y; rfl` proving `∀ x y : Opaque, x = y`) now
+  fails to verify. Pinned as Err.
+* `test_external_body_distinct_applications_collapse_probe` —
+  spec-fn-axiom-applied terms also don't collapse. Pinned as Err.
+* `test_external_body_embedded_in_enum` — multi-variant enum with
+  Opaque field still elaborates via the manual noncomputable
+  Inhabited path. Pinned as Ok.
+* `test_cross_crate_probe_5_seq_in_spec` — vstd::seq::Seq emits as
+  opaque axiom (no longer empty struct); closer behavior unchanged
+  (still Err for the documented axiomatic-equality reason, not
+  for "unknown constant"). The "latent finding" note in the test
+  comment is now resolved.
+
 ### Trait class+instance emission: deferred edges
 
 * **Case A: trait default body whose ensures references another trait
@@ -2485,21 +2564,8 @@ scope must be primed.
   instance, OR provide a user-controllable per-trait-method unfold
   hint.
 
-* **External-body type latent soundness concern.** Types declared
-  with `#[verifier::external_body]` (canonical examples:
-  `vstd::seq::Seq`, `vstd::set::Set`, `vstd::map::Map`) currently
-  emit as empty `structure ... where deriving Inhabited`. Empty
-  structs in Lean's model have a unique inhabitant — this lets
-  users prove `seq.Seq.push s x = s` (which is FALSE in vstd's
-  semantics; `push` produces a sequence with one more element).
-  Currently no test exploits this, but it's a real soundness gap
-  any external_body type with operations is vulnerable to. Forward
-  path: emit external_body types as opaque (`axiom seq.Seq : Type →
-  Type` + companion `axiom seq.Seq.inhabited (A : Type) :
-  Inhabited (seq.Seq A)` for typeclass coherence). Audit pinned
-  during the 2026-05-12 cross-crate probe; not blocking but
-  worth doing before Tactus is used on code that reasons about
-  external types' semantics.
+* ~~**External-body type latent soundness concern.**~~ **LANDED 2026-05-12.**
+  See "External-body type opaque emission" below for the resolved design.
 
 * **Proof-fn trait method defaults — UNTESTED and structurally
   suspect.** `trait_to_ast` iterates all trait methods regardless of
