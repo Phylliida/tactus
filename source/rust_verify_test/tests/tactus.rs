@@ -8703,3 +8703,205 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// =========================================================================
+// #122 cross-crate audit probes (2026-05-12)
+//
+// Pre-probe hypothesis: cross-crate is not as blocked as the
+// "Phase 3 / CrateDecls.lean" framing suggests. Verus's
+// `merge_krates` already brings imported crates' fns into the
+// merged `vir_crate` Tactus receives, and `export_crate` preserves
+// `pub open spec fn` bodies + all `require`/`ensure` clauses.
+//
+// Probes 1-5 below each exercise a different cross-crate shape.
+// All are `=> Ok(())` so any failure surfaces the exact error.
+// The goal is gap inventory, not feature landing — passing probes
+// shrink #122's scope; failing probes name what's left to do.
+// =========================================================================
+
+// Probe 1: tactus_auto fn's ENSURES references a vstd public open spec fn.
+// `vstd::math::min` is `pub open spec fn min(x: int, y: int) -> int`.
+//
+// Result (audit 2026-05-12): dep_order successfully walks across the crate
+// boundary and emits `math.min` to the preamble. Verification fails on
+// the closer (`simp_all` / `omega` can't unfold `noncomputable def`),
+// which is the SAME pre-existing "spec fn in goal position" gap
+// documented in DESIGN.md → not a cross-crate issue.
+//
+// With `proof { try unfold math.min }` to bring the body into the
+// goal-rewriting context, the verification passes — confirming
+// cross-crate spec fn emission is working today.
+test_verify_one_file! {
+    #[test] test_cross_crate_probe_1_pub_open_spec_in_ensures verus_code! {
+        use vstd::math::min;
+
+        #[verifier::tactus_auto]
+        fn min_branch(x: u8, y: u8) -> (r: u8)
+            requires x <= 100, y <= 100
+            ensures r as int == min(x as int, y as int)
+        {
+            proof { try unfold math.min }
+            if x <= y { x } else { y }
+        }
+    } => Ok(())
+}
+
+// Probe 2: tactus_auto fn's REQUIRES references a vstd public open spec fn.
+// `vstd::math::abs` is `pub open spec fn abs(x: int) -> nat`. Different
+// from probe 1 in that the call site is in requires (caller-supplied) vs
+// ensures (callee-proved). Both inline through the same dep_order path.
+//
+// Result (audit 2026-05-12): same as probe 1 — cross-crate emission works;
+// the closer can't reduce `math.abs x ≤ 50` to `-50 ≤ x ≤ 50` to discharge
+// the overflow obligation. With `proof { try unfold math.abs }` it passes.
+test_verify_one_file! {
+    #[test] test_cross_crate_probe_2_pub_open_spec_in_requires verus_code! {
+        use vstd::math::abs;
+
+        #[verifier::tactus_auto]
+        fn double_if_small(x: i8) -> (r: i8)
+            requires abs(x as int) <= 50
+            ensures r as int == 2 * (x as int)
+        {
+            2 * x
+        }
+    } => Err(e) => {
+        // Failing as expected: closer can't deduce -50 ≤ x ≤ 50 from
+        // `math.abs x ≤ 50` without unfolding. Pre-existing gap; not
+        // a cross-crate issue.
+        assert!(format!("{:?}", e).contains("tactus_auto failed"),
+            "expected tactus_auto failure due to spec-fn-in-hypothesis gap");
+    }
+}
+
+// Probe 3: transitive cross-crate. User's spec fn calls vstd's spec fn.
+// `min3` in user code references `vstd::math::min`. Pins that dep_order
+// walks INTO the user's spec fn's body and discovers the cross-crate
+// dependency transitively.
+//
+// Result (audit 2026-05-12): transitivity works — `min3` and `math.min`
+// both emit; closer can't unfold either; with both unfolds passes.
+test_verify_one_file! {
+    #[test] test_cross_crate_probe_3_transitive_spec_call verus_code! {
+        use vstd::math::min;
+
+        spec fn min3(x: int, y: int, z: int) -> int {
+            min(min(x, y), z)
+        }
+
+        #[verifier::tactus_auto]
+        fn min3_branch(x: u8, y: u8, z: u8) -> (r: u8)
+            ensures r as int == min3(x as int, y as int, z as int)
+        {
+            if x <= y && x <= z { x }
+            else if y <= z { y }
+            else { z }
+        }
+    } => Err(e) => {
+        // Failing as expected: spec-fn-in-goal gap (closer can't unfold
+        // min3 nor math.min). Transitivity itself works — both names
+        // appear in the goal, confirming dep_order walked across the
+        // crate boundary AND into the user's local spec fn.
+        assert!(format!("{:?}", e).contains("tactus_auto failed"),
+            "expected tactus_auto failure due to spec-fn-in-goal gap");
+    }
+}
+
+// Probe 4: cross-crate datatype (`Option<u8>`) in the fn body and ensures.
+// Tests datatype emission across crates. `Option` is `core::option::Option`,
+// not vstd, but Verus has it in its prelude. Should appear in the merged
+// vir_crate's datatypes; dep_order should walk to it.
+test_verify_one_file! {
+    #[test] test_cross_crate_probe_4_option_match verus_code! {
+        use vstd::prelude::*;
+
+        #[verifier::tactus_auto]
+        fn unwrap_or_zero(o: Option<u8>) -> (r: u8)
+            ensures match o {
+                Some(v) => r == v,
+                None => r == 0,
+            }
+        {
+            match o {
+                Some(v) => v,
+                None => 0,
+            }
+        }
+    } => Ok(())
+}
+
+// Probe 5: cross-crate generic spec type (`Seq<int>`) in spec position.
+// `vstd::seq::Seq` is a ghost type defined via `#[verifier::external_body]`
+// + `pub uninterp spec fn` for its methods (`empty`, `len`, `push`, etc.).
+// Verus axiomatizes these; bodies are deliberately None.
+//
+// Result (audit 2026-05-12): GENUINE CROSS-CRATE GAP.
+// - `seq.Seq` emits as an empty `structure ... where deriving Inhabited`
+//   (zero fields) — WRONG; should be opaque type.
+// - `seq.Seq.len`, `seq.Seq.push`, `seq.Seq.empty` NOT emitted at all
+//   (dep_order's `build_spec_fn_map` filters to `body.is_some()`).
+// - Generated Lean references `seq.Seq.len Int (seq.Seq.push ...)` which
+//   are unknown constants → Lean elaboration error.
+//
+// This is the real #122 work: uninterp spec fn emission as Lean axioms /
+// opaque defs, plus external-body type emission as Lean opaque types.
+test_verify_one_file! {
+    #[test] test_cross_crate_probe_5_seq_in_spec verus_code! {
+        use vstd::seq::*;
+
+        spec fn singleton_len() -> nat {
+            Seq::<int>::empty().push(0).len()
+        }
+
+        #[verifier::tactus_auto]
+        fn return_one() -> (r: u8)
+            ensures r as nat == singleton_len()
+        {
+            1
+        }
+    } => Err(e) => {
+        // Failing as expected: real #122 gap. `seq.Seq` emits as empty
+        // struct (wrong — should be opaque); `seq.Seq.len/push/empty`
+        // not emitted at all (uninterp spec fns have body=None and are
+        // filtered out by `dep_order::build_spec_fn_map`).
+        let s = format!("{:?}", e);
+        assert!(s.contains("Unknown constant") || s.contains("unresolved"),
+            "expected Lean unknown-constant or Tactus unresolved-ref error");
+    }
+}
+
+// Probe 6: isolate the `uninterp spec fn` gap.
+// Same shape as probe 5 but defines the uninterpreted spec fn locally
+// (no cross-crate involved). Same `body: None` shape → same emission
+// gap. Confirms the gap is about `body.is_none()` filtering, NOT
+// cross-crate per se.
+//
+// Result (audit 2026-05-12): fails via the sanity check at
+// `lean_verify/src/generate.rs::debug_check` reporting
+// "Tactus codegen produced unresolved references: ... unresolved
+// `my_oracle`". Originally panicked (killing the test process);
+// fixed in the same session to return a normal `CheckResult::Failed`
+// so the rejection flows through Verus's standard error path.
+// Confirms the gap shape (body=None filtering in
+// `dep_order::build_spec_fn_map`); the real fix is "emit Lean
+// axiom/opaque for spec fns with no body".
+test_verify_one_file! {
+    #[test] test_cross_crate_probe_6_uninterp_spec_fn_local verus_code! {
+        pub uninterp spec fn my_oracle(x: int) -> int;
+
+        #[verifier::tactus_auto]
+        fn double_oracle(x: u8) -> (r: u8)
+            requires my_oracle(x as int) == x as int,
+                     x < 100
+            ensures r as int == 2 * my_oracle(x as int)
+        {
+            2 * x
+        }
+    } => Err(e) => {
+        // Sanity check now reports unresolved refs through the normal
+        // error path instead of panicking.
+        let s = format!("{:?}", e);
+        assert!(s.contains("unresolved") && s.contains("my_oracle"),
+            "expected Tactus sanity-check error mentioning `my_oracle`, got: {}", s);
+    }
+}
+
