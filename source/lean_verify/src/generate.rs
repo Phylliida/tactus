@@ -224,9 +224,36 @@ fn krate_preamble(
         .map(|(ti, _)| short_name(&ti.x.trait_path))
         .collect();
 
+    // Split traits-to-emit into two groups by whether any of their
+    // methods are proof-fn (Mode::Proof). Proof-fn class fields render
+    // their ensures INLINE in the class declaration; the ensures can
+    // reference free-standing spec fns, which must be in scope at
+    // emission time. So proof-fn-bearing classes emit AFTER spec fns.
+    //
+    // Classes WITHOUT proof-fn methods emit BEFORE spec fns (old
+    // behavior). This matches the pre-2026-05-15 ordering for the
+    // common case: spec fns can reference class methods via typeclass
+    // dispatch (e.g., `spec fn use_size<T: HasSize>(x: T) -> Nat {
+    // x.size() }`), which requires the class to be in scope at the
+    // spec fn's emission.
+    //
+    // True cyclic dependencies (class A's proof-fn ensures references
+    // free-standing spec fn F, AND F references class A via typeclass
+    // dispatch) would need a topological-sort approach or a `mutual`
+    // emission. No current test exercises this; flag as future work
+    // if it surfaces.
+    let trait_has_proof_method = |tr: &TraitX| -> bool {
+        tr.methods.iter().any(|m| {
+            method_lookup.get(m)
+                .map(|f| matches!(f.mode, vir::ast::Mode::Proof))
+                .unwrap_or(false)
+        })
+    };
     for tr in &krate.traits {
         let n = short_name(&tr.x.name);
-        if refs.traits.contains(n) || traits_with_emitted_impl.contains(n) {
+        if !trait_has_proof_method(&tr.x)
+            && (refs.traits.contains(n) || traits_with_emitted_impl.contains(n))
+        {
             cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies)));
         }
     }
@@ -265,6 +292,17 @@ fn krate_preamble(
                     .collect();
                 cmds.push(Command::Mutual(inner));
             }
+        }
+    }
+
+    // Classes WITH proof-fn methods emit AFTER spec fns (their
+    // Prop-typed class fields reference the spec fns in scope).
+    for tr in &krate.traits {
+        let n = short_name(&tr.x.name);
+        if trait_has_proof_method(&tr.x)
+            && (refs.traits.contains(n) || traits_with_emitted_impl.contains(n))
+        {
+            cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies)));
         }
     }
 

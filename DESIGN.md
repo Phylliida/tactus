@@ -2687,6 +2687,57 @@ an Opaque value at this site. Only DIRECT field types matter
     `have _ := HasZero.val_is_zero t` and `omega` closes the goal.
   * `test_proof_fn_trait_method_non_unit_return_deferral` — Err.
     Pins the non-unit-return case as a deferral; see TODO below.
+  * `test_proof_fn_trait_method_multiple_ensures` — Ok. Trait method
+    with multiple ensures clauses; renders as `∀ params, P ∧ Q`.
+  * `test_proof_fn_trait_method_with_requires` — Ok. Requires clauses
+    render as additional binders (`_h_req_<i> : <req>`); caller
+    discharges by passing a proof.
+  * `test_proof_fn_trait_method_mutual_methods` — Ok. Two proof-fn
+    methods in the same trait, both referencing a sibling spec
+    method. Tests that strip handles multiple Prop-typed fields.
+  * `test_proof_fn_trait_method_free_standing_spec_ref` — Ok. Proof-
+    fn ensures references a free-standing spec fn (not a sibling
+    trait method). Strip helper correctly leaves the reference
+    qualified; ordering puts the spec fn before the class so the
+    reference resolves.
+  * `test_proof_fn_trait_method_other_trait_ref` — Ok. Ensures
+    references methods of a DIFFERENT trait via typ_bound on a
+    generic param. Strip is targeted to current class only.
+
+  **Two supporting fixes landed alongside the main work:**
+
+  * **Dependent binder handling in `sanity.rs`.** Pre-fix, the
+    sanity check's Forall/Lambda/Exists walker treated binders as
+    non-dependent: it checked all binder types under the outer
+    scope, then added all names at once. For `∀ (self : Self)
+    (h : P self), ...`, this failed because `P self` was checked
+    before `self` was in scope. Fixed to check binders left-to-
+    right, adding each name to scope before the next binder's type.
+
+  * **Class ordering in `generate.rs`.** Pre-fix, classes emitted
+    BEFORE spec fns. That worked when classes only had method type
+    signatures (no spec fn refs); the Prop-typed proof-fn class
+    field shape changed this — class fields can reference free-
+    standing spec fns in their ensures. Split-by-mode ordering:
+    classes WITHOUT proof-fn methods emit before spec fns (old
+    behavior, supports spec fn → class typeclass dispatch); classes
+    WITH proof-fn methods emit after spec fns (new requirement,
+    supports class → spec fn ensures references).
+
+  **Limitation: true cyclic class↔spec-fn dependencies.** If a
+  class `C` has a proof-fn ensures referencing spec fn `F`, AND `F`
+  has a body referencing class method `C.method` via typeclass
+  dispatch, there's a true cycle. The split-by-mode ordering can't
+  handle this — `F` needs `C` in scope, `C` needs `F` in scope.
+  And Lean's `mutual` block rejects mixing classes and defs
+  (verified 2026-05-15: `error: invalid mutual block: either all
+  elements of the block must be inductive/structure declarations,
+  or they must all be definitions/theorems/abbrevs`). So even a
+  full topological sort with mutual-block emission can't handle
+  this cycle — the resolution requires source-level restructuring
+  (factor out the cycle, e.g., parameterize the spec fn body with
+  the class method as an explicit argument). No current test
+  exercises this; flag for future work if it surfaces.
 
   **Deferred — non-unit return proof fns.** The class field type for
   `proof fn extract() -> (r: int) ensures r == E` renders as
