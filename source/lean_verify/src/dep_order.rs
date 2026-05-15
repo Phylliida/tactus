@@ -292,14 +292,24 @@ fn seed_worklist<'a>(proof_fns: &[&'a FunctionX], worklist: &mut Vec<&'a Fun>) {
     }
 }
 
-/// Seed the worklist with bodies of impl proof-fn methods that have a
-/// non-unit return type. For these, Tactus's `trait_impl_to_ast`
-/// renders the body as the witness expression of a subtype value (in
-/// the instance method body), so the body's spec-fn references must
-/// be in scope as standalone defs. Without this seed, the body's
-/// references (e.g., the impl's own spec method calls like
-/// `self.target()`) wouldn't reach `needed` via the normal worklist
-/// walk and the instance body would fail Lean elaboration.
+/// Seed the worklist with references from impl proof-fn methods'
+/// ensures + bodies. For these, Tactus's `trait_impl_to_ast` renders
+/// content that may reference spec methods (the impl's own siblings,
+/// or trait-method calls in ensures), and those references must be
+/// in scope as standalone defs at instance-emission time.
+///
+/// Two reference paths matter:
+/// 1. **Ensures (always walked).** The proof fn's ensures appears
+///    inside the class field's type AND, via Verus's
+///    auto-postcondition checking, in proof obligations that need
+///    the referenced spec fns visible. Example: `proof fn val_nonneg
+///    ensures self.val() >= 0` — `val` must emit so the user's
+///    tactic body `simp [val]` resolves.
+/// 2. **Body (only for non-unit return).** For non-unit-return
+///    proof fns, the impl's body is the witness expression in the
+///    instance's subtype value `⟨body, proof⟩`. Body references
+///    (e.g., `self.target()` calling sibling spec method) need
+///    standalone defs in scope.
 ///
 /// Pre-seeded unconditionally — we don't try to predict which trait
 /// impls will emit (that decision happens later in `generate.rs`).
@@ -312,13 +322,17 @@ fn seed_impl_proof_method_bodies<'a>(
     for (_, f) in all_fn_map {
         if !matches!(f.kind, FunctionKind::TraitMethodImpl { .. }) { continue; }
         if !matches!(f.mode, Mode::Proof) { continue; }
-        // Unit return: instance body is `by <tactic>`; no body refs
-        // to worry about. Non-unit: body becomes the witness, refs
-        // must be in scope. Shared with `to_lean_fn`'s emission
+        // Always walk ensures — these reach into the class field
+        // type AND into the tactic body's auto-postcondition scope.
+        for e in f.ensure.0.iter() { collect_fun_refs(e, worklist); }
+        for e in f.ensure.1.iter() { collect_fun_refs(e, worklist); }
+        // Body only for non-unit return — that's where the body
+        // becomes the witness. Shared with `to_lean_fn`'s emission
         // dispatch via `is_unit_typ` so the two stay aligned.
-        if crate::to_lean_type::is_unit_typ(&f.ret.x.typ) { continue; }
-        if let Some(body) = &f.body {
-            collect_fun_refs(body, worklist);
+        if !crate::to_lean_type::is_unit_typ(&f.ret.x.typ) {
+            if let Some(body) = &f.body {
+                collect_fun_refs(body, worklist);
+            }
         }
     }
 }

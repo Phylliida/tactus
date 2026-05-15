@@ -163,7 +163,32 @@ fn krate_preamble(
     let method_lookup: std::collections::HashMap<&Fun, &FunctionX> = all_fns.iter()
         .map(|f| (&f.name, *f))
         .collect();
-    let refs = dep_order::collect_references(&spec_fn_map, &method_lookup, root_fns);
+    let mut refs = dep_order::collect_references(&spec_fn_map, &method_lookup, root_fns);
+
+    // Transitive trait-bound closure: when a trait emits its class
+    // declaration, parent-trait bounds (e.g., `trait Sub: Super`
+    // produces `class Sub (Self : Type) [Super Self]`) reference the
+    // parent trait. The parent must therefore also be in scope. We
+    // iterate to a fixed point: for each trait in refs.traits, add
+    // its own typ_bound traits.
+    //
+    // Bounded by the number of traits in the krate — typically small.
+    loop {
+        let before = refs.traits.len();
+        let new_parents: Vec<&str> = krate.traits.iter()
+            .filter(|tr| refs.traits.contains(short_name(&tr.x.name)))
+            .flat_map(|tr| tr.x.typ_bounds.iter())
+            .filter_map(|bound| match &**bound {
+                vir::ast::GenericBoundX::Trait(vir::ast::TraitId::Path(p), _) =>
+                    Some(short_name(p)),
+                _ => None,
+            })
+            .collect();
+        for n in new_parents {
+            refs.traits.insert(n);
+        }
+        if refs.traits.len() == before { break; }
+    }
 
     // Decide which trait_impls will emit. Two conditions both
     // must hold:

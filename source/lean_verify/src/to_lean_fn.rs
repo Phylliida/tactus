@@ -1100,7 +1100,11 @@ pub fn trait_to_ast(
         });
     }
 
-    let bounds = trait_bounds_to_ast(&tr.typ_bounds);
+    // Use class-context bounds rendering so the trait's Self typ_param
+    // (`Self%`) normalizes to `Self` (the class's outer type variable)
+    // in inherited bounds like `trait Sub: Super` → `class Sub (Self :
+    // Type) [Super Self] where ...`.
+    let bounds = class_bounds_to_ast(&tr.typ_bounds);
 
     // Pre-compute the set of sibling method names. Used by proof-fn
     // method-type rendering: ensures expressions that reference
@@ -1692,14 +1696,34 @@ fn fn_binders_with_bounds(f: &FunctionX, include_bound_hyps: bool) -> Vec<LBinde
 /// Generic bounds → Lean `[Trait T₁ T₂ …]` instance binders, with any
 /// matching `TypEquality` bounds merged in as extra type arguments.
 fn trait_bounds_to_ast(bounds: &GenericBounds) -> Vec<LBinder> {
+    trait_bounds_to_ast_with(bounds, |t| typ_to_expr(t))
+}
+
+/// Class-context variant of `trait_bounds_to_ast` — uses
+/// `typ_maybe_projection_to_expr` for type rendering so the trait's
+/// Self typ_param (`Self%`) normalizes to `Self` (the class's outer
+/// type variable) when it appears in bounds.
+///
+/// Used by `trait_to_ast` when rendering the class declaration's
+/// inherited bounds (e.g., `trait Sub: Super` produces a `[Super Self]`
+/// bound on the Sub class, where `Self` must match the class's outer
+/// `Self : Type` binder, not the disambiguated `Self%` name).
+fn class_bounds_to_ast(bounds: &GenericBounds) -> Vec<LBinder> {
+    trait_bounds_to_ast_with(bounds, |t| typ_maybe_projection_to_expr(t))
+}
+
+fn trait_bounds_to_ast_with<F>(bounds: &GenericBounds, typ_render: F) -> Vec<LBinder>
+where
+    F: Fn(&TypX) -> LExpr,
+{
     let mut out = Vec::new();
     for bound in bounds.iter() {
         if let GenericBoundX::Trait(TraitId::Path(path), typs) = &**bound {
-            let mut args: Vec<LExpr> = typs.iter().map(|t| typ_to_expr(t)).collect();
+            let mut args: Vec<LExpr> = typs.iter().map(|t| typ_render(t)).collect();
             for other in bounds.iter() {
                 if let GenericBoundX::TypEquality(eq_path, _, _, typ) = &**other {
                     if lean_name(eq_path) == lean_name(path) {
-                        args.push(typ_to_expr(typ));
+                        args.push(typ_render(typ));
                     }
                 }
             }
