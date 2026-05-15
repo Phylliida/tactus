@@ -405,6 +405,36 @@ pub(crate) fn read_tactic_from_source(
     lean_verify::source_util::read_tactic_from_source(file_path, start_byte, end_byte)
 }
 
+/// Build a map of `Fun → tactic_body_text` for every proof-fn in the
+/// krate that has a `tactic_span` attribute. Used by Tactus's trait
+/// class+instance emission paths (`to_lean_fn::trait_to_ast` and
+/// `trait_impl_to_ast`) to render proof-fn trait method bodies as
+/// `by <tactic>` proofs instead of `default` placeholders — this is
+/// what makes a trait's proof-fn methods actually load-bearing at the
+/// typeclass level.
+///
+/// Failures to read a tactic body (file gone, byte range out of bounds)
+/// are silently skipped — the map only contains successful reads. The
+/// downstream emission falls back to `sorry` if a Fun isn't in the map,
+/// which Lean accepts with a warning. (In practice every proof-fn with
+/// a tactic_span should be readable; the silent skip is just defensive
+/// against pathological cases.)
+pub(crate) fn build_tactic_bodies_map(
+    vir_krate: &vir::ast::KrateX,
+) -> std::collections::HashMap<vir::ast::Fun, String> {
+    let mut map = std::collections::HashMap::new();
+    for f in vir_krate.functions.iter() {
+        if let Some((ref file_path, start_byte, end_byte)) = f.x.attrs.tactic_span {
+            if matches!(f.x.mode, vir::ast::Mode::Proof) {
+                if let Some(body) = read_tactic_from_source(file_path, start_byte, end_byte) {
+                    map.insert(f.x.name.clone(), body);
+                }
+            }
+        }
+    }
+    map
+}
+
 fn report_chosen_triggers(
     diagnostics: &impl air::messages::Diagnostics,
     chosen: &vir::context::ChosenTriggers,
@@ -1677,12 +1707,14 @@ impl Verifier {
                             }
 
                             let crate_name = self.crate_name.as_deref().unwrap_or("crate");
+                            let tactic_bodies = build_tactic_bodies_map(vir_krate);
                             match lean_verify::check_proof_fn(
                                 vir_krate,
                                 &vir_fn.x,
                                 tactic_text,
                                 &vir_fn.x.attrs.lean_imports,
                                 crate_name,
+                                &tactic_bodies,
                             ) {
                                 lean_verify::CheckResult::Success { warnings } => {
                                     self.count_verified += 1;
@@ -1768,6 +1800,7 @@ impl Verifier {
                                 continue;
                             };
                             let crate_name = self.crate_name.as_deref().unwrap_or("crate");
+                            let tactic_bodies = build_tactic_bodies_map(vir_krate);
                             match lean_verify::check_exec_fn(
                                 vir_krate,
                                 &vir_fn.x,
@@ -1775,6 +1808,7 @@ impl Verifier {
                                 check_sst,
                                 &vir_fn.x.attrs.lean_imports,
                                 crate_name,
+                                &tactic_bodies,
                             ) {
                                 lean_verify::CheckResult::Success { warnings } => {
                                     self.count_verified += 1;

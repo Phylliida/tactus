@@ -9200,30 +9200,19 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Probe: proof-fn trait method's `ensures` is semantically lost in the
-// class emission. The two emission probes above pinned that Lean
-// elaboration succeeds — the class declaration `HasZero (Self : Type)
-// where val_is_zero : Self → Unit` is well-formed. But the ensures
-// content (`self.val() == 0`) is dropped: nothing in `Self → Unit`
-// captures a proof.
+// Probe: proof-fn trait method's lemma IS accessible to callers via
+// typeclass dispatch. After the Prop-typed class field fix (2026-05-15),
+// the trait emits as `class HasZero (Self : Type) where val : Self → Int;
+// val_is_zero : ∀ (self : Self), val self = 0` — the `val_is_zero` slot
+// captures the lemma's full content as a typeclass method.
 //
-// To surface this concretely: a proof fn caller whose goal genuinely
-// requires the lemma's content to discharge. The trait has an abstract
-// `spec fn val()` (no body — opaque from the trait side) and a
-// `proof fn val_is_zero()` that's the ONLY way to know `val() == 0`.
-// The caller has the trait bound (so the class emits) and tries to
-// prove the goal. Whatever Lean tactic the user puts in `by { }`,
-// it can't access the lemma's ensures because the class method
-// emission lost it.
+// Callers with `<T: HasZero>` bound can `have _ := HasZero.val_is_zero t`
+// to extract `HasZero.val t = 0` as a hypothesis. omega then closes.
 //
-// Expected outcome: Err. The tactic body should fail to discharge
-// the goal because the lemma's `ensures` isn't available as a Lean
-// fact anywhere.
-//
-// If this passes (we expect not), something else is bridging the
-// gap and the worry is wrong. If it fails as expected, this pins
-// the limitation as a flippable-Err for the day Tactus learns to
-// emit proof-fn trait methods with proper Prop-valued types.
+// (Earlier draft of this probe pinned the OPPOSITE — expected Err,
+// asserting the lemma was inaccessible. That was the pre-fix state.
+// Flipping to Ok pins the working state and would fail loudly if a
+// regression broke the class-field emission.)
 test_verify_one_file! {
     #[test] test_proof_fn_trait_method_ensures_inaccessible verus_code! {
         trait HasZero {
@@ -9235,14 +9224,56 @@ test_verify_one_file! {
         proof fn use_zero<T: HasZero>(t: &T)
             ensures t.val() == 0
         by {
-            -- Generated Lean has class HasZero with method
-            -- val_is_zero : Self -> Unit. No Lean theorem or axiom
-            -- captures HasZero.val t = 0, so no tactic can succeed.
-            first
-              | decide
-              | omega
-              | simp_all
-              | (have _ := HasZero.val_is_zero t; omega)
+            -- Generated Lean: class HasZero has val_is_zero method
+            -- with Prop-valued type. HasZero.val_is_zero t extracts
+            -- the lemma instantiated at t; have-introducing it as a
+            -- hyp lets omega close HasZero.val t = 0.
+            have _ := HasZero.val_is_zero t
+            omega
+        }
+    } => Ok(())
+}
+
+// Probe: proof-fn trait method with NON-UNIT return type. Verus
+// supports `proof fn extract() -> (r: int) ensures r == E` shapes
+// where the proof fn returns a value satisfying ensures (e.g., a
+// witness extraction). Class-method emission uses subtype:
+// `{ ret : RetTy // ensures }`. The instance must produce a pair
+// of value + proof via Lean's anonymous-constructor syntax.
+//
+// Today this probe is most likely Err because:
+// (1) The subtype rendering uses ExprNode::Raw; pp may or may not
+//     produce well-formed Lean.
+// (2) The instance body needs to construct ⟨value, proof⟩ — but
+//     Tactus's proof fn body is just a tactic, not a value+proof
+//     constructor.
+//
+// Pinning as Err documents the deferral. When Tactus learns to render
+// non-unit-return proof fns properly (subtype rendering + instance
+// body as ⟨value, by tac⟩), this flips to Ok.
+test_verify_one_file! {
+    #[test] test_proof_fn_trait_method_non_unit_return_deferral verus_code! {
+        trait Extract {
+            spec fn target(&self) -> int;
+            proof fn extract(&self) -> (r: int)
+                ensures r == self.target();
+        }
+
+        struct E;
+        impl Extract for E {
+            spec fn target(&self) -> int { 0 }
+            proof fn extract(&self) -> (r: int)
+                ensures r == self.target()
+            by {
+                exact 0
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn touches_extract<T: Extract>(_t: &T, _e: &E) -> (r: u8)
+            ensures r == 0
+        {
+            0
         }
     } => Err(_)
 }

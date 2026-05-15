@@ -112,6 +112,7 @@ fn krate_preamble(
     root_fns: &[&FunctionX],
     config: PreambleConfig,
     theorems: &[crate::lean_ast::Theorem],
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> (Vec<Command>, String) {
     let emit_accessors = config.emit_accessors();
 
@@ -226,7 +227,7 @@ fn krate_preamble(
     for tr in &krate.traits {
         let n = short_name(&tr.x.name);
         if refs.traits.contains(n) || traits_with_emitted_impl.contains(n) {
-            cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup)));
+            cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies)));
         }
     }
 
@@ -276,7 +277,7 @@ fn krate_preamble(
             .map(|a| &a.x)
             .collect();
         cmds.push(Command::Instance(
-            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types)
+            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, tactic_bodies)
         ));
     }
 
@@ -310,6 +311,7 @@ pub fn check_proof_fn(
     tactic_body: &str,
     imports: &[String],
     crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> CheckResult {
     // Proof fns render match expressions natively (spec fns
     // preserve match through to VIR-AST), so accessor fns are
@@ -322,7 +324,7 @@ pub fn check_proof_fn(
     // etc. via the structured path; if they ever need extra
     // imports, those go through the explicit `imports` parameter).
     let (mut cmds, ns) = krate_preamble(
-        krate, imports, crate_name, &[proof_fn], PreambleConfig::ProofFn, &[],
+        krate, imports, crate_name, &[proof_fn], PreambleConfig::ProofFn, &[], tactic_bodies,
     );
     cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body)));
     cmds.push(Command::NamespaceClose(ns));
@@ -378,6 +380,7 @@ pub fn check_exec_fn(
     check: &FuncCheckSst,
     imports: &[String],
     crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> CheckResult {
     // Collect `assume(P)` sites first so warnings surface even when
     // the rest of the codegen rejects the fn. Each `assume` is a
@@ -423,6 +426,7 @@ pub fn check_exec_fn(
         krate, imports, crate_name, &[vir_fn],
         PreambleConfig::ExecFn,
         &theorems,
+        tactic_bodies,
     );
 
     for theorem in theorems {
@@ -605,6 +609,7 @@ mod tests {
         let krate = empty_krate();
         let (cmds, _ns) = krate_preamble(
             &krate, &[], "test_crate", &[], PreambleConfig::ProofFn, &[],
+            &std::collections::HashMap::new(),
         );
 
         // The default preamble has exactly one Import-class chunk
@@ -642,6 +647,7 @@ mod tests {
         )];
         let (cmds, _ns) = krate_preamble(
             &krate, &[], "test_crate", &[], PreambleConfig::ExecFn, &theorems,
+            &std::collections::HashMap::new(),
         );
 
         let imports: Vec<&str> = cmds.iter()
@@ -671,6 +677,7 @@ mod tests {
         )];
         let (cmds, _ns) = krate_preamble(
             &krate, &[], "test_crate", &[], PreambleConfig::ExecFn, &theorems,
+            &std::collections::HashMap::new(),
         );
 
         // Find the addendum Raw and confirm it's AFTER the prelude Raw.
@@ -698,6 +705,7 @@ mod tests {
         ];
         let (cmds, _ns) = krate_preamble(
             &krate, &[], "test_crate", &[], PreambleConfig::ExecFn, &theorems,
+            &std::collections::HashMap::new(),
         );
 
         let bitvec_imports: Vec<&str> = cmds.iter()
