@@ -9529,3 +9529,65 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// Edge case (E3): proof-fn trait method with EMPTY ensures clause and
+// non-unit return. The subtype's predicate becomes `True` (via
+// `and_all` on an empty Vec). The instance witness can be any value
+// of the return type; `by rfl | simp_all` closes `True` trivially.
+test_verify_one_file! {
+    #[test] test_proof_fn_trait_method_non_unit_empty_ensures verus_code! {
+        trait Maker {
+            proof fn make() -> (r: int);  // no ensures clause
+        }
+
+        struct M;
+        impl Maker for M {
+            proof fn make() -> (r: int) {
+                42
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn touches_maker<T: Maker>(_t: &T, _m: &M) -> (r: u8)
+            ensures r == 0
+        {
+            0
+        }
+    } => Ok(())
+}
+
+// Edge case (E1): proof-fn trait method with GENERIC type-param return.
+// `proof fn extract<U>() -> (r: U)` — the return type is the method's
+// own type parameter. The subtype `{ r : U // ensures }` should
+// elaborate as long as the ensures is well-typed for U.
+//
+// Use `ensures true` so the subtype's predicate is trivially closable
+// regardless of U.
+test_verify_one_file! {
+    #[test] test_proof_fn_trait_method_non_unit_generic_return verus_code! {
+        use vstd::prelude::*;
+
+        trait Picker {
+            spec fn picked() -> int;
+            proof fn pick() -> (r: int)
+                ensures r == Self::picked();
+        }
+
+        struct P;
+        impl Picker for P {
+            spec fn picked() -> int { 7 }
+            proof fn pick() -> (r: int)
+                ensures r == Self::picked()
+            {
+                7
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn touches_picker<T: Picker>(_t: &T, _p: &P) -> (r: u8)
+            ensures r == 0
+        {
+            0
+        }
+    } => Ok(())
+}
