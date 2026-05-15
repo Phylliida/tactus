@@ -81,10 +81,8 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
             // would produce a different inlined spec than the callee
             // proved.
             use crate::to_lean_sst_expr::renders_as_lean_int;
-            eprintln!("DBG VIR-AST Clip: inner.typ={:?} range={:?}", inner.typ, range);
             let src_int = matches!(&*inner.typ, TypX::Int(r) if renders_as_lean_int(r));
             let dst_int = renders_as_lean_int(range);
-            eprintln!("DBG VIR-AST Clip: src_int={} dst_int={}", src_int, dst_int);
             apply_clip_coercion(src_int, dst_int, vir_expr_to_ast(inner)).node
         }
         ExprX::Unary(UnaryOp::CoerceMode { .. }, inner)
