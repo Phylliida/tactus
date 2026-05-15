@@ -324,6 +324,25 @@ fn write_theorem(out: &mut String, t: &Theorem, lm: &mut Landmarks) {
     write_expr(out, &t.goal, 0, lm);
     out.push_str(" := by\n");
     write_tactic_block(out, &t.tactic, "  ", lm);
+    // `termination_by` for recursive proof fns (Verus's `decreases` clause).
+    // Renders after the tactic body. Mirrors `Def.termination_by`'s emission
+    // shape: bare for single measure, tuple for lex. Empty Vec → no clause.
+    match t.termination_by.as_slice() {
+        [] => {}
+        [single] => {
+            out.push_str("termination_by ");
+            write_expr(out, single, 0, lm);
+            out.push('\n');
+        }
+        many => {
+            out.push_str("termination_by (");
+            for (i, e) in many.iter().enumerate() {
+                if i > 0 { out.push_str(", "); }
+                write_expr(out, e, 0, lm);
+            }
+            out.push_str(")\n");
+        }
+    }
 }
 
 fn write_datatype(out: &mut String, dt: &Datatype, lm: &mut Landmarks) {
@@ -1020,6 +1039,7 @@ mod tests {
             tactic: Tactic::Named("rfl".into()),
             requires_preamble: Vec::new(),
             heartbeats: Some(1600000),
+            termination_by: Vec::new(),
         };
         let out = pp_command(&Command::Theorem(t));
         assert!(out.starts_with("set_option maxHeartbeats 1600000 in\ntheorem expensive"),
@@ -1035,6 +1055,7 @@ mod tests {
             tactic: Tactic::Named("rfl".into()),
             requires_preamble: Vec::new(),
             heartbeats: None,
+            termination_by: Vec::new(),
         };
         let out = pp_command(&Command::Theorem(t));
         assert!(!out.contains("set_option maxHeartbeats"),
@@ -1056,6 +1077,7 @@ mod tests {
             tactic: Tactic::Named("rfl".into()),
             requires_preamble: Vec::new(),
             heartbeats: None,
+            termination_by: Vec::new(),
         };
         let out = pp_command(&Command::Theorem(t));
         assert!(out.contains("theorem foo (x : Nat)"));
@@ -1085,6 +1107,7 @@ mod tests {
             tactic: Tactic::Raw("omega".into()),
             requires_preamble: Vec::new(),
             heartbeats: None,
+            termination_by: Vec::new(),
         };
         let out = pp_commands(&[Command::Theorem(t)]);
         assert_eq!(out.landmarks.tactic_starts.len(), 1);
@@ -1156,6 +1179,67 @@ mod tests {
         };
         let out = pp_command(&Command::Def(d));
         assert!(out.contains("termination_by (n, m)"), "{out}");
+    }
+
+    /// Recursive proof fn translation — `Theorem.termination_by` is emitted
+    /// after the tactic body. Mirrors `Def.termination_by` rendering.
+    #[test]
+    fn theorem_with_termination_by_single() {
+        let t = Theorem {
+            name: "rec_lemma".into(),
+            binders: vec![Binder {
+                name: Some(crate::lean_name::LeanName::lit("n")),
+                ty: var("Nat"),
+                kind: BinderKind::Explicit,
+            }],
+            goal: bin(BinOp::Ge, var("n"), lit(0)),
+            tactic: Tactic::Named("omega".into()),
+            requires_preamble: Vec::new(),
+            heartbeats: None,
+            termination_by: vec![var("n")],
+        };
+        let out = pp_command(&Command::Theorem(t));
+        assert!(out.contains("termination_by n"),
+            "expected single-measure termination_by, got:\n{}", out);
+        // Must appear AFTER the tactic body, not before/inside it.
+        let tactic_pos = out.find("omega").expect("tactic present");
+        let term_pos = out.find("termination_by").expect("termination_by present");
+        assert!(term_pos > tactic_pos,
+            "termination_by must follow the tactic body; got:\n{}", out);
+    }
+
+    /// Lex decreases for recursive proof fns — tuple rendering.
+    #[test]
+    fn theorem_with_termination_by_lex() {
+        let t = Theorem {
+            name: "lex_lemma".into(),
+            binders: vec![],
+            goal: bin(BinOp::Eq, lit(1), lit(1)),
+            tactic: Tactic::Named("rfl".into()),
+            requires_preamble: Vec::new(),
+            heartbeats: None,
+            termination_by: vec![var("a"), var("b")],
+        };
+        let out = pp_command(&Command::Theorem(t));
+        assert!(out.contains("termination_by (a, b)"),
+            "expected lex-tuple termination_by, got:\n{}", out);
+    }
+
+    /// Non-recursive theorems (the common case) — no termination_by emitted.
+    #[test]
+    fn theorem_without_termination_by_no_clause() {
+        let t = Theorem {
+            name: "trivial".into(),
+            binders: vec![],
+            goal: bin(BinOp::Eq, lit(1), lit(1)),
+            tactic: Tactic::Named("rfl".into()),
+            requires_preamble: Vec::new(),
+            heartbeats: None,
+            termination_by: Vec::new(),
+        };
+        let out = pp_command(&Command::Theorem(t));
+        assert!(!out.contains("termination_by"),
+            "non-recursive theorem should not emit termination_by, got:\n{}", out);
     }
 
     /// Pins that SpanMark rendering passes the `rust_loc` string

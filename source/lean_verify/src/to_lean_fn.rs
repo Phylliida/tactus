@@ -166,6 +166,11 @@ pub fn proof_fn_to_ast(f: &FunctionX, tactic_body: &str) -> Theorem {
         });
     }
     let goal = and_all(f.ensure.0.iter().map(|e| vir_expr_to_ast(e)).collect());
+    // Honor Verus's `decreases` clause for recursive proof fns. Lean often
+    // auto-infers termination for simple structural recursion, but cases
+    // where the measure is non-obvious (Collatz, lex pairs, computed
+    // descent) require the explicit clause. Mirrors `spec_fn_to_ast`.
+    let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| vir_expr_to_ast(d)).collect();
     Theorem {
         name: lean_name(&f.name.path),
         binders,
@@ -173,6 +178,7 @@ pub fn proof_fn_to_ast(f: &FunctionX, tactic_body: &str) -> Theorem {
         tactic: Tactic::Raw(tactic_body.to_string()),
         requires_preamble: Vec::new(),
         heartbeats: f.attrs.tactus_heartbeats,
+        termination_by,
     }
 }
 

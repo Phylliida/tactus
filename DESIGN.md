@@ -2784,17 +2784,33 @@ an Opaque value at this site. Only DIRECT field types matter
     references a sibling spec method (`self.target()`). Exercises
     the dep_order pre-seeding path.
 
-  **Deferred — termination on recursive proof-fn trait methods.**
-  Class methods in Lean don't accept `termination_by` clauses
-  directly. If a proof-fn trait method has `decreases n` and its
-  tactic body recursively invokes the method, Lean can't auto-infer
-  termination. This is a pre-existing Tactus limitation (proof fns
-  in general don't emit `termination_by`), not specific to trait
-  methods. Fix involves either rendering recursive proof fns through
-  Lean's `mutual` block with explicit well-founded measures, or
-  emitting them as separate top-level theorems instead of class
-  fields (which would lose the typeclass-dispatch property the
-  current shape provides). Untested; flag for future work.
+  **Standalone recursive proof fns — LANDED 2026-05-15 (Case 11
+  part 1).** `proof_fn_to_ast` now reads `f.decrease` and populates
+  `Theorem.termination_by` (mirroring `spec_fn_to_ast`); the pp emits
+  `termination_by <expr>` after the tactic body (or `(e1, e2, ...)`
+  for lex). Verus's `decreases n` flows through as a faithful
+  translation — Verus has already certified termination, we just
+  pass the measure to Lean. Pinned by `test_proof_fn_with_decreases_noncrecursive`
+  (decreases on non-recursive proof fn, emission doesn't break trivial
+  case) and `test_proof_fn_recursive_with_decreases` (recursive proof
+  fn whose tactic body invokes itself via `have _ih := rec_trivial
+  (n - 1)`). Generated Lean has `termination_by n` after `:= by` block;
+  Lean's well-foundedness check uses it for the recursive call.
+  Lean often auto-infers for simple structural cases (`n - 1` on Nat),
+  but the explicit clause is required for Collatz-shape or non-obvious
+  measures — and is structurally cleaner regardless.
+
+  **Still deferred — recursive proof-fn TRAIT methods.** Class methods
+  in Lean don't accept `termination_by` clauses directly (verified
+  2026-05-15). If a proof-fn trait method has `decreases n` and its
+  tactic body recursively invokes the method via typeclass dispatch,
+  Lean can't auto-infer termination AND can't accept the explicit
+  clause inside the class declaration. Fix involves either rendering
+  recursive proof-fn trait methods through Lean's `mutual` block with
+  explicit well-founded measures, or emitting them as separate
+  top-level theorems instead of class fields (which would lose the
+  typeclass-dispatch property the current shape provides). Untested;
+  flag for future work.
 
 * **Recursive default bodies — untested.** A trait default body that
   calls itself (or another trait method that recurses back). Verus's

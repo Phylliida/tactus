@@ -1255,6 +1255,10 @@ impl ObligationEmitter {
             tactic,
             requires_preamble,
             heartbeats: self.heartbeats,
+            // Per-obligation theorems are flat — recursion is handled at
+            // the obligation level via `CheckDecreaseHeight`, not at the
+            // theorem level. Exec-fn theorems never need `termination_by`.
+            termination_by: Vec::new(),
         });
     }
 }

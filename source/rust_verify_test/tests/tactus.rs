@@ -9734,3 +9734,45 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// === Recursive proof fn with decreases — termination_by emission (Case 11) ===
+//
+// Verus's `decreases n` on a proof fn flows through `f.decrease` to
+// Tactus's `Theorem.termination_by`. Pre-fix, proof_fn_to_ast didn't
+// consult `f.decrease` at all; recursive proof fns whose tactic bodies
+// called themselves relied on Lean's auto-inference (which handles many
+// simple cases but not Collatz-shape or non-obvious measures).
+//
+// Test A: non-recursive proof fn with an unused `decreases` clause.
+// Verus accepts this; confirms emission doesn't break trivial cases.
+test_verify_one_file! {
+    #[test] test_proof_fn_with_decreases_noncrecursive verus_code! {
+        proof fn nonneg(n: nat)
+            ensures n >= 0
+            decreases n
+        by {
+            omega
+        }
+    } => Ok(())
+}
+
+// Test B: recursive proof fn — body recursively invokes itself in Lean,
+// gated by a case-split. `termination_by n` is what makes the recursive
+// call's measure visible to Lean's well-foundedness check. Lean's
+// auto-inference also handles this simple shape, but the explicit clause
+// is the structural answer; it also unblocks Collatz-shape and lex cases
+// auto-infer can't handle.
+test_verify_one_file! {
+    #[test] test_proof_fn_recursive_with_decreases verus_code! {
+        proof fn rec_trivial(n: nat)
+            ensures n >= 0
+            decreases n
+        by {
+            if h : n = 0 then
+                omega
+            else
+                have _ih := rec_trivial (n - 1)
+                omega
+        }
+    } => Ok(())
+}
