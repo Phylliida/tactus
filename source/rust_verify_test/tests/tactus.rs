@@ -9530,6 +9530,122 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Coverage (C5): empty trait. `trait Marker {}` with no methods —
+// `tr.methods` is empty. Class emits as `class Marker (Self : Type)
+// where` (no body). Instance emits as `instance : Marker M where`
+// (no body). Most code paths iterate `tr.methods`; empty iteration
+// should be a no-op. Marker traits are common in Rust; pin the smoke
+// test.
+test_verify_one_file! {
+    #[test] test_proof_fn_trait_method_empty_trait verus_code! {
+        trait Marker {}
+
+        struct M;
+        impl Marker for M {}
+
+        #[verifier::tactus_auto]
+        fn touches_marker<T: Marker>(_t: &T, _m: &M) -> (r: u8)
+            ensures r == 0
+        {
+            0
+        }
+    } => Ok(())
+}
+
+// Coverage (C1): mixed-mode trait — spec + exec + proof methods all
+// in the same trait. Per-method mode dispatch in trait_to_ast +
+// trait_impl_to_ast must handle interleaved modes correctly: spec →
+// real def signature, exec → Self → Ret with `default` body, proof
+// → Prop-typed field with tactic body. Source order is preserved
+// from `tr.methods`.
+test_verify_one_file! {
+    #[test] test_proof_fn_trait_method_mixed_modes verus_code! {
+        trait MixedModes {
+            spec fn val(&self) -> int;
+            fn double(&self, x: u8) -> (r: u8)
+                requires x < 128
+                ensures r == x + x;
+            proof fn val_nonneg(&self)
+                ensures self.val() >= 0;
+        }
+
+        struct MM;
+        impl MixedModes for MM {
+            spec fn val(&self) -> int { 0 }
+            fn double(&self, x: u8) -> (r: u8)
+                ensures r == x + x
+            {
+                x + x
+            }
+            proof fn val_nonneg(&self)
+                ensures self.val() >= 0
+            by {
+                simp [val]
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn touches_mixed<T: MixedModes>(_t: &T, _mm: &MM) -> (r: u8)
+            ensures r == 0
+        {
+            0
+        }
+    } => Ok(())
+}
+
+// Coverage (C2): trait inheritance — `trait Sub: Super`. Lean's
+// idiomatic emission for this is `class Sub extends Super where`,
+// which brings parent methods into the child class's scope (so
+// the child's method types can reference parent methods unqualified).
+//
+// Tactus's `trait_to_ast` builds bounds via `trait_bounds_to_ast(&tr.typ_bounds)`
+// — emits them as constraint binders, NOT as `extends`. If a child
+// trait's proof-fn method ensures references a parent method, the
+// emission might fail (sibling-style strip can't see parent
+// methods).
+//
+// This probe tests a minimal version: child trait Sub references
+// parent's spec method in its proof-fn ensures. If today's emission
+// works, great. If it doesn't, the test surfaces a real gap.
+test_verify_one_file! {
+    #[test] test_proof_fn_trait_method_extends_super_trait verus_code! {
+        // Parent trait — provides the abstraction the child can use.
+        trait Super {
+            spec fn parent_val(&self) -> int;
+        }
+
+        // Child trait inherits from Super. Tactus must emit the class
+        // declaration with `[Super Self]` (not `[Super Self%]`) so the
+        // outer class type variable matches the inherited bound.
+        // Use a trivial ensures so the tactic resolution doesn't
+        // depend on inner spec-method unfolding — we're testing the
+        // CLASS+INSTANCE emission shape, not the proof obligation.
+        trait Sub: Super {
+            proof fn child_lemma(&self)
+                ensures true;
+        }
+
+        struct SB;
+        impl Super for SB {
+            spec fn parent_val(&self) -> int { 0 }
+        }
+        impl Sub for SB {
+            proof fn child_lemma(&self)
+                ensures true
+            by {
+                trivial
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn touches_sub<T: Sub>(_t: &T, _sb: &SB) -> (r: u8)
+            ensures r == 0
+        {
+            0
+        }
+    } => Ok(())
+}
+
 // Edge case (E3): proof-fn trait method with EMPTY ensures clause and
 // non-unit return. The subtype's predicate becomes `True` (via
 // `and_all` on an empty Vec). The instance witness can be any value
