@@ -64,6 +64,7 @@ pub fn collect_references<'a>(
     let mut visited: HashSet<&Fun> = HashSet::new();
     let mut worklist: Vec<&'a Fun> = Vec::new();
     seed_worklist(proof_fns, &mut worklist);
+    seed_impl_proof_method_bodies(all_fn_map, &mut worklist);
     while let Some(fun) = worklist.pop() {
         if visited.contains(fun) { continue; }
         visited.insert(fun);
@@ -201,6 +202,7 @@ pub fn order_spec_fns<'a>(
     let mut worklist: Vec<&'a Fun> = Vec::new();
 
     seed_worklist(proof_fns, &mut worklist);
+    seed_impl_proof_method_bodies(all_fn_map, &mut worklist);
 
     while let Some(fun) = worklist.pop() {
         if needed.contains(fun) { continue; }
@@ -287,6 +289,36 @@ fn seed_worklist<'a>(proof_fns: &[&'a FunctionX], worklist: &mut Vec<&'a Fun>) {
         // is a tactic block (text) so collect_fun_refs naturally finds
         // nothing there.
         if let Some(body) = &pf.body { collect_fun_refs(body, worklist); }
+    }
+}
+
+/// Seed the worklist with bodies of impl proof-fn methods that have a
+/// non-unit return type. For these, Tactus's `trait_impl_to_ast`
+/// renders the body as the witness expression of a subtype value (in
+/// the instance method body), so the body's spec-fn references must
+/// be in scope as standalone defs. Without this seed, the body's
+/// references (e.g., the impl's own spec method calls like
+/// `self.target()`) wouldn't reach `needed` via the normal worklist
+/// walk and the instance body would fail Lean elaboration.
+///
+/// Pre-seeded unconditionally — we don't try to predict which trait
+/// impls will emit (that decision happens later in `generate.rs`).
+/// Over-emitting spec fn defs is harmless: they're inert dead code
+/// in the preamble if nothing else references them.
+fn seed_impl_proof_method_bodies<'a>(
+    all_fn_map: &HashMap<&Fun, &'a FunctionX>,
+    worklist: &mut Vec<&'a Fun>,
+) {
+    for (_, f) in all_fn_map {
+        if !matches!(f.kind, FunctionKind::TraitMethodImpl { .. }) { continue; }
+        if !matches!(f.mode, Mode::Proof) { continue; }
+        // Unit return: instance body is `by <tactic>`; no body refs
+        // to worry about. Non-unit: body becomes the witness, refs
+        // must be in scope.
+        if matches!(&*f.ret.x.typ, TypX::Datatype(Dt::Tuple(0), _, _)) { continue; }
+        if let Some(body) = &f.body {
+            collect_fun_refs(body, worklist);
+        }
     }
 }
 
