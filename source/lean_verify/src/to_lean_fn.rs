@@ -1238,16 +1238,10 @@ fn typ_maybe_projection_to_expr(typ: &TypX) -> LExpr {
     }
 }
 
-/// True when `typ` is the unit type (`()` in Verus). After
-/// `ast_simplify`, tuple types are represented as `TypX::Datatype(Dt::Tuple(n), ...)`
-/// — the 0-arity tuple is unit.
-///
-/// Used to discriminate unit-return proof fns (the common case
-/// — pure lemma) from value-returning proof fns (the "extract a witness"
-/// shape, which needs subtype rendering for the class method type).
-fn is_unit_typ(typ: &TypX) -> bool {
-    matches!(typ, TypX::Datatype(Dt::Tuple(0), _, _))
-}
+// `is_unit_typ` lives in `to_lean_type.rs` — shared with `dep_order`'s
+// `seed_impl_proof_method_bodies`, which needs the same discrimination
+// to decide whether an impl proof-fn body must be pre-seeded.
+use crate::to_lean_type::is_unit_typ;
 
 /// Build value-level parameter binders for a trait method's class-
 /// method type. Distinct from `fn_binders` (which also emits
@@ -1259,7 +1253,7 @@ fn is_unit_typ(typ: &TypX) -> bool {
 /// For `self`-typed params, renders the type as `Self` (the class
 /// type variable) rather than going through `typ_to_expr` which would
 /// produce the trait's full path.
-fn value_param_binders(func: &FunctionX) -> Vec<LBinder> {
+fn class_method_value_binders(func: &FunctionX) -> Vec<LBinder> {
     let mut out: Vec<LBinder> = Vec::new();
     for p in func.params.iter() {
         let name = crate::lean_name::LeanName::from_var_ident(&p.x.name);
@@ -1318,15 +1312,17 @@ fn proof_fn_method_type(
     // shape: `class Semigroup (G : Type u) extends Mul G where
     //   mul_assoc : ∀ a b c : G, ...` — no `(G : Type)` or `[Mul G]`
     // re-binders inside `mul_assoc`'s type.
-    let mut binders = value_param_binders(func);
+    let mut binders = class_method_value_binders(func);
     for (i, req) in func.require.iter().enumerate() {
         let req_ty = strip_class_qualifier(vir_expr_to_ast(req), class_name, sibling_methods);
-        // Requires render as named hypothesis binders (`_h_req_<i>`)
-        // rather than anonymous — Lean's ∀ chain requires each binder
-        // to have a name (or `_`), and our pp emits `(name : ty)` only
-        // when name is Some.
+        // Requires render as named hypothesis binders following the
+        // `_tactus_<role>_<id>` reserved-name convention (see
+        // expr_shared.rs § "Reserved identifier conventions").
+        // Anonymous binders aren't an option — Lean's ∀ chain
+        // requires each binder to have a name, and our pp only
+        // emits `(name : ty)` when name is Some.
         binders.push(LBinder {
-            name: Some(crate::lean_name::LeanName::synthetic(format!("_h_req_{}", i))),
+            name: Some(crate::lean_name::LeanName::synthetic(format!("_tactus_req_{}", i))),
             ty: req_ty,
             kind: BinderKind::Explicit,
         });
@@ -1440,17 +1436,19 @@ pub fn trait_impl_to_ast(
     // result is `instance : Tr T where` with no method bodies —
     // Lean fills in everything from the class.
     //
-    // Render strategy by mode:
-    // * Spec methods (Mode::Spec): render the actual body via
-    //   `vir_expr_to_ast`. Lean's typeclass dispatch may unfold
-    //   the instance's method during proof, so the body is
-    //   load-bearing.
-    // * Exec/proof methods: emit a placeholder
-    //   (`Classical.arbitrary _`). The body is never invoked
-    //   during verification (walk_call inlines specs at call
-    //   sites, not via typeclass dispatch). Rendering exec
-    //   bodies via vir_expr_to_ast would panic on Assign / Loop /
-    //   Return constructs that are exec-mode-only.
+    // Render strategy is mode-dispatched, see the inner `match`:
+    // * Spec methods: render the actual body via `vir_expr_to_ast`
+    //   (Lean's typeclass dispatch may unfold the instance's
+    //   method during proof, so the body is load-bearing).
+    // * Exec methods: emit `default` placeholder (the body isn't
+    //   load-bearing — walk_call inlines specs at call sites, not
+    //   bodies via typeclass dispatch). Rendering the exec body
+    //   would panic on Assign / Loop / Return constructs.
+    // * Proof methods, two sub-cases:
+    //   - Unit return: instance produces a proof via `by <tactic>`.
+    //   - Non-unit return: instance produces a `⟨value, proof⟩`
+    //     pair (the body is the witness; rfl/simp_all closes the
+    //     subtype equality).
     //
     // Note: if the trait method has NO default body AND the impl
     // also has body=None, that's a structurally invalid state

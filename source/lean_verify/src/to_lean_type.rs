@@ -9,6 +9,21 @@ pub fn typ_to_expr(typ: &TypX) -> Expr {
     Expr::new(typ_to_node(typ))
 }
 
+/// True when `typ` is the unit type (`()` in Verus). After
+/// `ast_simplify`, tuple types are represented as
+/// `TypX::Datatype(Dt::Tuple(n), ...)` — the 0-arity tuple is unit.
+///
+/// Used to discriminate unit-return proof fns (the common case — pure
+/// lemma) from value-returning proof fns (the "extract a witness"
+/// shape, which needs subtype rendering for the class method type).
+/// Lives in `to_lean_type.rs` rather than `to_lean_fn.rs` because both
+/// `to_lean_fn` and `dep_order` need to discriminate the same way; a
+/// shared helper avoids subtle drift in what counts as "unit" across
+/// the two paths.
+pub(crate) fn is_unit_typ(typ: &TypX) -> bool {
+    matches!(typ, TypX::Datatype(Dt::Tuple(0), _, _))
+}
+
 /// Peel `TypX::Boxed` (poly coercion) and `TypX::Decorate` (Rust
 /// decorations like `Box<T>`, `&T`, `&mut T`) to reach the
 /// underlying type. These are transparent at the Lean level —

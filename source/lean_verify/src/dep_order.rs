@@ -314,8 +314,9 @@ fn seed_impl_proof_method_bodies<'a>(
         if !matches!(f.mode, Mode::Proof) { continue; }
         // Unit return: instance body is `by <tactic>`; no body refs
         // to worry about. Non-unit: body becomes the witness, refs
-        // must be in scope.
-        if matches!(&*f.ret.x.typ, TypX::Datatype(Dt::Tuple(0), _, _)) { continue; }
+        // must be in scope. Shared with `to_lean_fn`'s emission
+        // dispatch via `is_unit_typ` so the two stay aligned.
+        if crate::to_lean_type::is_unit_typ(&f.ret.x.typ) { continue; }
         if let Some(body) = &f.body {
             collect_fun_refs(body, worklist);
         }
