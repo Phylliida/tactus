@@ -2567,25 +2567,59 @@ an Opaque value at this site. Only DIRECT field types matter
 * ~~**External-body type latent soundness concern.**~~ **LANDED 2026-05-12.**
   See "External-body type opaque emission" below for the resolved design.
 
-* **Proof-fn trait method defaults — UNTESTED and structurally
-  suspect.** `trait_to_ast` iterates all trait methods regardless of
+* **Proof-fn trait method defaults — emission works, ensures content
+  lost.** `trait_to_ast` iterates all trait methods regardless of
   mode, rendering each as a `ClassMethod`. For proof fns:
-  * The class method's `ty` is `Self → ReturnType`, but proof fns
+  * The class method's `ty` is `Self → ReturnType` (with proof-fn
+    return type rendered as `Unit` when implicit), but proof fns
     produce theorems (`Prop`-valued), not values of that type.
   * The body is tactic text, not a value expression. With class-
     defaults landed, the mode check routes proof fn bodies through
     the `default` placeholder so vir_expr_to_ast doesn't see them —
     but the class method's TYPE remains wrong.
 
-  Realistic frequency: probably rare. Proof fn trait methods are
-  uncommon in Verus codebases; users typically write
-  `proof fn lemma<T: Trait>(...)` as standalone lemmas.
+  **Probed 2026-05-15.** Three pinning tests in `tactus.rs`:
+  * `test_proof_fn_trait_method_emission_probe` — Ok. Trait with
+    proof-fn method decl, impl provides body, tactus_auto fn with
+    `<T: Provable>` bound and `&S` concrete param triggers both
+    refs gates. Generated Lean: `class Provable (Self : Type) where
+    always_true : Self → Unit`, instance body `fun self => default`.
+    Lean elaborates cleanly.
+  * `test_proof_fn_trait_method_default_body_probe` — Ok. Same
+    shape via class-default path (impl inherits trait's default
+    body). The `default` placeholder routes correctly.
+  * `test_proof_fn_trait_method_ensures_inaccessible` — Err. The
+    pointed gap: a proof fn with the trait bound tries to use the
+    lemma's `ensures self.val() == 0` to discharge a goal. Omega
+    fails with a counterexample naming `HasZero.val t` and reporting
+    `a ≤ -1` as a possible value — the lemma's ensures was dropped
+    in the class-method emission, so nothing in the rendered Lean
+    captures the fact `val t = 0`.
+
+  Trigger requirement (learned during probe construction): the
+  `(refs.traits ∩ refs.datatypes)` instance gate
+  (`generate.rs:199-221`) only fires when something brings the
+  trait into scope — a typ_bound on a generic param or a Dynamic-
+  dispatch call. A tactus_auto fn that takes only `&S` for a
+  concrete `S: impl Provable` is NOT sufficient; the trait+impl
+  silently never emit and a probe that doesn't carry the bound
+  passes for the wrong reason.
+
+  Realistic frequency: probably rare in practice. Proof fn trait
+  methods are uncommon in Verus codebases; users typically write
+  `proof fn lemma<T: Trait>(...)` as standalone lemmas. And in
+  Tactus specifically, there's no natural way to invoke a proof-fn
+  trait method's content from a `by { … }` tactic block — the only
+  pattern that would access the lemma's ensures is `walk_call`'s
+  inlining at exec-mode Call SST nodes, which proof fns don't
+  produce.
 
   Forward path: filter proof-fn methods out of class declarations
   entirely (emit them as separate top-level theorems with the
   trait bound + Self typeclass parameter in scope), OR represent
   proof-fn methods as `ClassMethod` with type `Self → Prop` (the
-  ensures becomes the theorem statement, body the tactic).
+  ensures becomes the theorem statement, body the tactic). Both
+  would flip `_ensures_inaccessible` to Ok.
 
 * **Recursive default bodies — untested.** A trait default body that
   calls itself (or another trait method that recurses back). Verus's

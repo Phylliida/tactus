@@ -9109,3 +9109,140 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Probe: proof fn as a trait method — class+instance emission only,
+// no caller invocation. DESIGN.md § "Trait class+instance emission:
+// deferred edges" → "Proof-fn trait method defaults — UNTESTED and
+// structurally suspect" flags this case as:
+//   - `trait_to_ast` iterates `tr.methods` and renders EVERY method
+//     as a `ClassMethod`, regardless of mode.
+//   - For a proof fn the class method's `ty` would be `Self →
+//     ReturnType`, but a proof fn's "return" is a proof of its
+//     ensures, not a value of that type.
+//   - The 2026-05-12 class-defaults work routes exec/proof bodies
+//     through the `default` placeholder so vir_expr_to_ast doesn't
+//     panic — but the class method type shape is still semantically
+//     wrong, and the impl-side body rendering hasn't been exercised.
+//   - DESIGN.md notes "no probe test today — would need a tactus_auto
+//     fn that … surfaces this case."
+//
+// Triggering the gate (learned during probe construction): the
+// instance-emit gate (`generate.rs:199-221`) requires BOTH
+// `refs.traits.contains(Tr)` AND `refs.datatypes.contains(T)` for
+// `impl Tr for T`. `refs.traits` is populated only by typ_bounds on
+// generics OR Dynamic-dispatch calls (`dep_order.rs:113-144`), NOT
+// by a fn parameter typed `&S` for a concrete S that happens to
+// impl the trait. So the tactus_auto fn needs an explicit
+// `<T: Provable>` bound for the trait to enter scope; the concrete
+// `_s: &S` parameter brings S into `refs.datatypes`. Together they
+// fire both gates and the instance for `Provable on S` emits.
+//
+// (An earlier draft of this probe took only `_s: &S` — the trait+impl
+// silently never emitted, so the test passed for the wrong reason.
+// Reading `generate.rs`'s gate comment surfaced the trigger
+// requirement.)
+test_verify_one_file! {
+    #[test] test_proof_fn_trait_method_emission_probe verus_code! {
+        trait Provable {
+            proof fn always_true(&self)
+                ensures 1 == 1;
+        }
+
+        struct S;
+        impl Provable for S {
+            proof fn always_true(&self)
+                ensures 1 == 1
+            by {
+                trivial
+            }
+        }
+
+        // The `<T: Provable>` bound brings `Provable` into refs.traits
+        // (via typ_bound); `_s: &S` brings S into refs.datatypes. Both
+        // gates fire; the Provable→S instance emits.
+        #[verifier::tactus_auto]
+        fn touches_both<T: Provable>(_t: &T, _s: &S) -> (r: u8)
+            ensures r == 0
+        {
+            0
+        }
+    } => Ok(())
+}
+
+// Probe variant: trait with proof fn method DEFAULT body (impl
+// doesn't override). Tests the class-default rendering path
+// specifically — pre-2026-05-12 this would have routed the proof-fn
+// tactic body through vir_expr_to_ast (which can't render tactic
+// text) and panicked. Post-2026-05-12, exec/proof defaults render
+// as the `default` placeholder.
+//
+// Same trigger requirement as the emission probe above.
+test_verify_one_file! {
+    #[test] test_proof_fn_trait_method_default_body_probe verus_code! {
+        trait ProvableDefault {
+            proof fn always_true(&self)
+                ensures 1 == 1
+            {
+                // Default body uses Verus proof syntax (not Lean tactic).
+                // Verus accepts this in proof-fn position; rendering
+                // through Tactus is the question.
+            }
+        }
+
+        struct U;
+        impl ProvableDefault for U {}
+
+        #[verifier::tactus_auto]
+        fn touches_both_default<T: ProvableDefault>(_t: &T, _u: &U) -> (r: u8)
+            ensures r == 0
+        {
+            0
+        }
+    } => Ok(())
+}
+
+// Probe: proof-fn trait method's `ensures` is semantically lost in the
+// class emission. The two emission probes above pinned that Lean
+// elaboration succeeds — the class declaration `HasZero (Self : Type)
+// where val_is_zero : Self → Unit` is well-formed. But the ensures
+// content (`self.val() == 0`) is dropped: nothing in `Self → Unit`
+// captures a proof.
+//
+// To surface this concretely: a proof fn caller whose goal genuinely
+// requires the lemma's content to discharge. The trait has an abstract
+// `spec fn val()` (no body — opaque from the trait side) and a
+// `proof fn val_is_zero()` that's the ONLY way to know `val() == 0`.
+// The caller has the trait bound (so the class emits) and tries to
+// prove the goal. Whatever Lean tactic the user puts in `by { }`,
+// it can't access the lemma's ensures because the class method
+// emission lost it.
+//
+// Expected outcome: Err. The tactic body should fail to discharge
+// the goal because the lemma's `ensures` isn't available as a Lean
+// fact anywhere.
+//
+// If this passes (we expect not), something else is bridging the
+// gap and the worry is wrong. If it fails as expected, this pins
+// the limitation as a flippable-Err for the day Tactus learns to
+// emit proof-fn trait methods with proper Prop-valued types.
+test_verify_one_file! {
+    #[test] test_proof_fn_trait_method_ensures_inaccessible verus_code! {
+        trait HasZero {
+            spec fn val(&self) -> int;
+            proof fn val_is_zero(&self)
+                ensures self.val() == 0;
+        }
+
+        proof fn use_zero<T: HasZero>(t: &T)
+            ensures t.val() == 0
+        by {
+            -- Generated Lean has class HasZero with method
+            -- val_is_zero : Self -> Unit. No Lean theorem or axiom
+            -- captures HasZero.val t = 0, so no tactic can succeed.
+            first
+              | decide
+              | omega
+              | simp_all
+              | (have _ := HasZero.val_is_zero t; omega)
+        }
+    } => Err(_)
+}
