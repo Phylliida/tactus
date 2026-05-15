@@ -310,6 +310,42 @@ tree-sitter-tactus has Lean-aware rules for tactic block content:
 
 The grammar has **184 tests** including 36 tactic-specific tests covering all Lean syntax edge cases.
 
+### TODO: Unicode in `verus_code!` test fixtures
+
+The FileLoader sanitization described above only runs on real `.rs`
+files. The `verus_code!` proc macro used in
+`rust_verify_test/tests/tactus.rs` captures its body as a Rust
+`TokenStream`, which means rustc's tokenizer sees the raw source and
+rejects non-ASCII tokens (`→`, `⟨⟩`, `≤`, `∀`, `—`, etc.) with
+`error: unknown start of token` before the macro ever runs. The
+practical consequence: probes written inline in `verus_code! { … }`
+must use ASCII-only Lean tactic syntax (e.g., `Self -> Unit` instead
+of `Self → Unit`, `<=` instead of `≤`).
+
+This is a test-infrastructure gap, not a user-Tactus gap — real user
+code that lives in `.rs` files on disk goes through the FileLoader
+path and Unicode works correctly there. The end-to-end Mathlib
+tactics tests at `rust_verify_test/tests/tactus.rs` get away with
+ASCII because tactics like `omega`, `ring`, `decide`, `simp_all`, etc.
+don't intrinsically need Unicode.
+
+Plausible fixes when the gap matters (none implemented today):
+- **(a) Route test inputs through a temp file** that DOES go through
+  FileLoader. The macro would write `$body` to a temp file and
+  invoke verus with that path instead of using stdin. Medium effort;
+  matches the production code path more closely. Test isolation
+  already creates per-test temp dirs (`TACTUS_KEEP_TEST_DIR`), so
+  the infrastructure is partly there.
+- **(b) Accept `verus_code!` body as a raw string literal**
+  (`verus_code!(r#" ... "#)`). Strings can contain arbitrary
+  Unicode. Heavy migration — every existing test would need to be
+  rewritten.
+- **(c) Document and accept the constraint.** Tests use ASCII Lean;
+  real `.rs` files use full Unicode. Cheapest, status quo.
+
+Today's pragmatic answer is (c). Revisit if a probe genuinely needs
+Unicode tactic syntax that can't be expressed in ASCII.
+
 ## Keyword handling in tactic blocks
 
 ### The `forall`/`exists` conflict

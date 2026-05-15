@@ -4668,6 +4668,30 @@ cd tactus/lean-project
 lake env lean --json /path/to/foo.lean
 ```
 
+### Debugging Err-expected tests
+
+Tests written with `=> Err(_)` (or `=> Err(err) => { ... }`) match
+*any* verus failure and pass silently in default `cargo test` output —
+useful for pinning deferred functionality, but hides what error
+actually triggered the match. Two ways to see the captured error:
+
+* **`cargo test ... -- --nocapture`** — surfaces the full Lean / verus
+  diagnostic plus a one-line summary line `[test_name] passed matching
+  Err pattern; verus: Err(N error(s); first: "<first line>")` emitted
+  by the test harness macro. The summary line confirms WHICH error the
+  pattern caught, useful when debugging "did my Err probe fail for
+  the right reason?"
+* **`VERUS_KEEP_TEST_DIR=1`** — preserves `target/debug/test_inputs/
+  <test-binary>-<test_name>/` instead of deleting it on pass. Inside,
+  `tactus-lean/test_crate/<fn>.lean` is the generated Lean file — run
+  it through `lake env lean` directly to see the raw Lean error
+  (often more informative than verus's reformatted version).
+
+When `=> Err(_)` doesn't match (i.e., test expected failure but verus
+returned Ok), the pattern-mismatch panic now includes the actual
+result: `[test_name] expected pattern '\`Err(_)\`' but got: Ok(...)`
+— previously a bare "Err(_) does not match $result" with no context.
+
 ## Repository layout
 
 ```
