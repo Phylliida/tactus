@@ -1137,7 +1137,7 @@ pub fn trait_to_ast(
                     let tac = tactic_bodies.get(&func.name)
                         .map(|s| s.as_str())
                         .unwrap_or("sorry");
-                    LExpr::new(ExprNode::Raw(render_by_block(tac)))
+                    LExpr::new(ExprNode::ByBlock { tactic: tac.to_string() })
                 }
             };
             if func.params.is_empty() {
@@ -1226,36 +1226,6 @@ fn typ_maybe_projection_to_expr(typ: &TypX) -> LExpr {
     }
 }
 
-/// Render a tactic body as a Lean `by` block suitable for inline
-/// embedding (e.g., a class default body or instance method body).
-///
-/// Lean's tactic-mode parser requires `by`'s body to be either
-/// (a) on the same line as `by`, or (b) on subsequent lines INDENTED
-/// past `by`'s column. The tactic text we get from `read_tactic_from_source`
-/// is dedented to column 0, so naive `format!("by {}", tac)` produces
-/// `by\n<col-0 tactic>` which Lean rejects ("expected '{' or indented
-/// tactic sequence").
-///
-/// We re-indent: prepend 2 spaces to every non-empty line so the body
-/// is unambiguously indented relative to wherever `by` ends up.
-/// Single-line tactics inline naturally on the same line as `by` after
-/// trimming.
-fn render_by_block(tac: &str) -> String {
-    let trimmed = tac.trim();
-    if trimmed.is_empty() {
-        return "by trivial".to_string();
-    }
-    if !trimmed.contains('\n') {
-        return format!("by {}", trimmed);
-    }
-    // Multi-line: re-indent every non-empty line with two spaces past
-    // `by`. The `by` itself goes on its own line, body follows.
-    let indented: Vec<String> = trimmed.lines()
-        .map(|l| if l.trim().is_empty() { String::new() } else { format!("  {}", l) })
-        .collect();
-    format!("by\n{}", indented.join("\n"))
-}
-
 /// True when `typ` is the unit type (`()` in Verus). After
 /// `ast_simplify`, tuple types are represented as `TypX::Datatype(Dt::Tuple(n), ...)`
 /// — the 0-arity tuple is unit.
@@ -1337,10 +1307,14 @@ fn proof_fn_method_type(
     //   mul_assoc : ∀ a b c : G, ...` — no `(G : Type)` or `[Mul G]`
     // re-binders inside `mul_assoc`'s type.
     let mut binders = value_param_binders(func);
-    for req in func.require.iter() {
+    for (i, req) in func.require.iter().enumerate() {
         let req_ty = strip_class_qualifier(vir_expr_to_ast(req), class_name, sibling_methods);
+        // Requires render as named hypothesis binders (`_h_req_<i>`)
+        // rather than anonymous — Lean's ∀ chain requires each binder
+        // to have a name (or `_`), and our pp emits `(name : ty)` only
+        // when name is Some.
         binders.push(LBinder {
-            name: None,
+            name: Some(crate::lean_name::LeanName::synthetic(format!("_h_req_{}", i))),
             ty: req_ty,
             kind: BinderKind::Explicit,
         });
@@ -1496,7 +1470,7 @@ pub fn trait_impl_to_ast(
                     let tac = tactic_bodies.get(&func.name)
                         .map(|s| s.as_str())
                         .unwrap_or("sorry");
-                    LExpr::new(ExprNode::Raw(render_by_block(tac)))
+                    LExpr::new(ExprNode::ByBlock { tactic: tac.to_string() })
                 }
             };
             let lambda = if func.params.is_empty() {

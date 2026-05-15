@@ -537,6 +537,21 @@ pub enum ExprNode {
     /// goal is to keep this set small; prefer adding a real node.
     Raw(String),
 
+    /// `by <tactic_body>` — a tactic proof in term position. Used for
+    /// proof-fn trait method bodies in class defaults and instance
+    /// methods (where the term must produce a proof of the Prop-valued
+    /// class field type). The pp re-indents `tactic` based on the
+    /// current line's indentation, so the body lines are unambiguously
+    /// past the surrounding context's indent — Lean's tactic parser
+    /// requires the body to be indented strictly past the `by`-block
+    /// start, and inline-Raw emission would put the body at column 0
+    /// which conflicts with sibling field declarations.
+    ///
+    /// `tactic` is the verbatim text from the user's source (read via
+    /// `read_tactic_from_source`, already dedented to column 0). Pp
+    /// adds the right indent for the emission context.
+    ByBlock { tactic: String },
+
     /// Source-span annotation (#51). Transparent at the Lean level —
     /// pp emits a leading `/- @rust:LOC -/` block comment and
     /// records `(line, loc, kind)` in landmarks. `LeanSourceMap`
@@ -940,6 +955,7 @@ impl ExprNode {
             | ExprNode::LitStr(_)
             | ExprNode::LitChar(_)
             | ExprNode::Raw(_)
+            | ExprNode::ByBlock { .. }
             | ExprNode::BinOp { .. }
             | ExprNode::UnOp { .. }
             | ExprNode::App { .. }
@@ -975,7 +991,8 @@ where
         | ExprNode::LitBool(_)
         | ExprNode::LitStr(_)
         | ExprNode::LitChar(_)
-        | ExprNode::Raw(_) => {}
+        | ExprNode::Raw(_)
+        | ExprNode::ByBlock { .. } => {}
         ExprNode::BinOp { lhs, rhs, .. } => {
             f(lhs);
             f(rhs);
@@ -1063,6 +1080,7 @@ where
         ExprNode::LitStr(s) => ExprNode::LitStr(s.clone()),
         ExprNode::LitChar(c) => ExprNode::LitChar(*c),
         ExprNode::Raw(s) => ExprNode::Raw(s.clone()),
+        ExprNode::ByBlock { tactic } => ExprNode::ByBlock { tactic: tactic.clone() },
         ExprNode::BinOp { op, lhs, rhs } => {
             let lhs = Box::new(f(lhs));
             let rhs = Box::new(f(rhs));

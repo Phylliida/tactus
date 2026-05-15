@@ -199,9 +199,12 @@ fn check_expr(
         }
 
         // Literals, strings, etc. are never references.
+        // ByBlock contains opaque tactic text (not LExpr references)
+        // — the sanity check doesn't validate Lean tactic syntax,
+        // matching how `Tactic::Raw` in theorem bodies is treated.
         ExprNode::Lit(_) | ExprNode::LitBool(_)
         | ExprNode::LitStr(_) | ExprNode::LitChar(_)
-        | ExprNode::Raw(_) => {}
+        | ExprNode::Raw(_) | ExprNode::ByBlock { .. } => {}
 
         // Binders introduce local scope.
         ExprNode::Let { name, value, body } => {
@@ -213,14 +216,19 @@ fn check_expr(
         ExprNode::Lambda { binders, body }
         | ExprNode::Forall { binders, body }
         | ExprNode::Exists { binders, body } => {
-            // Check binder types under the outer scope, then push bound names.
-            for b in binders { check_expr(&b.ty, defined, scope, violations, context); }
-            let added: Vec<String> = binders.iter().filter_map(|b| {
-                b.name.as_ref().and_then(|n| {
+            // Dependent binders: check each binder's type under the
+            // scope WITH all prior binders bound, then add this binder
+            // to scope before the next one. Required for shapes like
+            // `∀ (self : Self) (h : P self), ...` where `(h : P self)`
+            // references `self` introduced by the first binder.
+            let mut added: Vec<String> = Vec::new();
+            for b in binders {
+                check_expr(&b.ty, defined, scope, violations, context);
+                if let Some(n) = &b.name {
                     let s = n.as_str().to_string();
-                    if scope.insert(s.clone()) { Some(s) } else { None }
-                })
-            }).collect();
+                    if scope.insert(s.clone()) { added.push(s); }
+                }
+            }
             check_expr(body, defined, scope, violations, context);
             for n in &added { scope.remove(n); }
         }

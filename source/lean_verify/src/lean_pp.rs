@@ -83,7 +83,8 @@ fn expr_prec(node: &ExprNode) -> u16 {
         ExprNode::Var(_) | ExprNode::Lit(_) | ExprNode::LitBool(_)
         | ExprNode::LitStr(_) | ExprNode::LitChar(_)
         | ExprNode::ArrayLit(_) | ExprNode::StructUpdate { .. }
-        | ExprNode::Anon(_) | ExprNode::Tuple(_) | ExprNode::Raw(_) => PREC_ATOM,
+        | ExprNode::Anon(_) | ExprNode::Tuple(_) | ExprNode::Raw(_)
+        | ExprNode::ByBlock { .. } => PREC_ATOM,
         ExprNode::FieldProj { .. } | ExprNode::Index { .. } => PREC_ATOM,
         // SpanMark is transparent — inherit `inner`'s precedence so
         // wrapping never changes parenthesization.
@@ -176,6 +177,21 @@ pub fn pp_pattern(p: &Pattern) -> String {
 /// natural place to maintain a running counter instead.
 fn current_line(out: &str) -> usize {
     1 + out.bytes().filter(|&b| b == b'\n').count()
+}
+
+/// Return the number of leading-space characters on the current
+/// (last, unterminated) line of `out`. Used by `ByBlock` rendering
+/// to compute the body indent relative to the surrounding context
+/// (e.g., inside an instance method whose field declaration sits at
+/// some indent, the `by` body must be indented past that).
+///
+/// Scans back from the end of `out` to the last `\n`; the line is
+/// `out[last_newline+1..]`. Counts leading spaces only — tabs are
+/// not used in Tactus's output.
+fn current_line_indent(out: &str) -> usize {
+    let line_start = out.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line = &out[line_start..];
+    line.bytes().take_while(|&b| b == b' ').count()
 }
 
 // ── Command writers ─────────────────────────────────────────────────────
@@ -547,6 +563,43 @@ fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
             out.push('\'');
         }
         ExprNode::Raw(s) => out.push_str(s),
+
+        ExprNode::ByBlock { tactic } => {
+            // Tactic body in term position. Find the indent of the
+            // current line in `out` (the line `by` lands on), then
+            // emit each non-empty body line at that indent + 2 spaces.
+            // Lean's tactic parser requires body indent strictly
+            // past the surrounding context; since sibling fields in
+            // classes/instances sit at the current line's indent,
+            // +2 spaces is the minimum that unambiguously puts the
+            // body inside the `by` block.
+            //
+            // Single-line tactic: emit on the same line as `by` for
+            // readability (e.g., `by omega`, `by trivial`). Trim
+            // each line independently so leading whitespace from
+            // the dedented source doesn't leak through.
+            let trimmed: Vec<&str> = tactic.lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .collect();
+            if trimmed.is_empty() {
+                out.push_str("by trivial");
+            } else if trimmed.len() == 1 {
+                out.push_str("by ");
+                out.push_str(trimmed[0]);
+            } else {
+                let line_indent = current_line_indent(out);
+                let body_indent: String = std::iter::repeat(' ')
+                    .take(line_indent + 2)
+                    .collect();
+                out.push_str("by");
+                for line in &trimmed {
+                    out.push('\n');
+                    out.push_str(&body_indent);
+                    out.push_str(line);
+                }
+            }
+        }
 
         ExprNode::BinOp { op, lhs, rhs } => {
             let (p, assoc) = binop_info(*op);

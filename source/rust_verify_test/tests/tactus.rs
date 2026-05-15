@@ -9277,3 +9277,172 @@ test_verify_one_file! {
         }
     } => Err(_)
 }
+
+// Probe: proof-fn trait method with MULTIPLE ensures clauses. Verus
+// renders these as a comma-separated list; the class field type
+// should conjoin them with ∧.
+//
+// Caller extracts the conjunction and uses both parts.
+test_verify_one_file! {
+    #[test] test_proof_fn_trait_method_multiple_ensures verus_code! {
+        trait Bounded {
+            spec fn val(&self) -> int;
+            proof fn val_in_range(&self)
+                ensures self.val() >= 0, self.val() <= 100;
+        }
+
+        struct B;
+        impl Bounded for B {
+            spec fn val(&self) -> int { 50 }
+            proof fn val_in_range(&self)
+                ensures self.val() >= 0, self.val() <= 100
+            by {
+                simp [val]
+            }
+        }
+
+        proof fn use_bounded<T: Bounded>(t: &T)
+            ensures 0 <= t.val() && t.val() <= 100
+        by {
+            have h := Bounded.val_in_range t
+            -- h : val t >= 0 AND val t <= 100; omega handles the conjunction.
+            omega
+        }
+    } => Ok(())
+}
+
+// Probe: proof-fn trait method with REQUIRES clauses. The class
+// field type renders the requires as additional binders, so the
+// method becomes a function from preconditions to the ensures.
+//
+// Caller must discharge the precondition when invoking. This tests
+// that the binder ordering and hypothesis types are correct.
+test_verify_one_file! {
+    #[test] test_proof_fn_trait_method_with_requires verus_code! {
+        trait Conditional {
+            spec fn val(&self) -> int;
+            proof fn val_pos_implies_ge_one(&self)
+                requires self.val() > 0
+                ensures self.val() >= 1;
+        }
+
+        struct C;
+        impl Conditional for C {
+            spec fn val(&self) -> int { 5 }
+            proof fn val_pos_implies_ge_one(&self)
+                // Verus rule: impl method inherits trait's requires;
+                // cannot re-declare. Just ensures + body.
+                ensures self.val() >= 1
+            by {
+                simp [val]
+            }
+        }
+
+        proof fn use_conditional<T: Conditional>(t: &T)
+            requires t.val() > 0
+            ensures t.val() >= 1
+        by {
+            -- The class method takes the requires as a hypothesis param.
+            -- Caller provides a proof of the requires from its own
+            -- hypotheses (h0 : val t > 0 is in scope from this fn's requires).
+            have h := Conditional.val_pos_implies_ge_one t h0
+            omega
+        }
+    } => Ok(())
+}
+
+// Probe: MUTUAL proof-fn methods in the same trait — two proof fns
+// both referencing a sibling spec method. Tests that the strip helper
+// correctly rewrites class-qualified references for BOTH methods, and
+// that having multiple Prop-typed fields in one class works.
+test_verify_one_file! {
+    #[test] test_proof_fn_trait_method_mutual_methods verus_code! {
+        trait TwoLemmas {
+            spec fn val(&self) -> int;
+            proof fn val_nonneg(&self) ensures self.val() >= 0;
+            proof fn val_le_max(&self) ensures self.val() <= 1000;
+        }
+
+        struct TL;
+        impl TwoLemmas for TL {
+            spec fn val(&self) -> int { 42 }
+            proof fn val_nonneg(&self) ensures self.val() >= 0 by {
+                simp [val]
+            }
+            proof fn val_le_max(&self) ensures self.val() <= 1000 by {
+                simp [val]
+            }
+        }
+
+        proof fn use_both<T: TwoLemmas>(t: &T)
+            ensures 0 <= t.val() && t.val() <= 1000
+        by {
+            have h1 := TwoLemmas.val_nonneg t
+            have h2 := TwoLemmas.val_le_max t
+            omega
+        }
+    } => Ok(())
+}
+
+// Probe: proof-fn ensures references a FREE-STANDING spec fn (not a
+// sibling trait method). The strip helper should NOT rewrite this —
+// it only targets `<current_class>.` prefixes. Free-standing spec
+// fns are referenced via their full path (`test_crate.doubled` or
+// similar), which doesn't start with the class name.
+test_verify_one_file! {
+    #[test] test_proof_fn_trait_method_free_standing_spec_ref verus_code! {
+        spec fn doubled(x: int) -> int { x * 2 }
+
+        trait Doubler {
+            spec fn val(&self) -> int;
+            proof fn doubled_is_2val(&self)
+                ensures doubled(self.val()) == self.val() * 2;
+        }
+
+        struct D;
+        impl Doubler for D {
+            spec fn val(&self) -> int { 7 }
+            proof fn doubled_is_2val(&self)
+                ensures doubled(self.val()) == self.val() * 2
+            by {
+                unfold doubled; rfl
+            }
+        }
+
+        proof fn use_doubler<T: Doubler>(t: &T)
+            ensures doubled(t.val()) == t.val() * 2
+        by {
+            exact Doubler.doubled_is_2val t
+        }
+    } => Ok(())
+}
+
+// Probe: ensures references a method of a DIFFERENT trait. The
+// strip helper should NOT rewrite OtherTrait.method — it only
+// targets the current class's prefix.
+test_verify_one_file! {
+    #[test] test_proof_fn_trait_method_other_trait_ref verus_code! {
+        trait Inner {
+            spec fn inner_val(&self) -> int;
+        }
+
+        trait Outer {
+            proof fn inner_is_zero<I: Inner>(i: &I)
+                ensures i.inner_val() >= 0;
+        }
+
+        struct InnerImpl;
+        impl Inner for InnerImpl {
+            spec fn inner_val(&self) -> int { 0 }
+        }
+
+        struct OuterImpl;
+        impl Outer for OuterImpl {
+            proof fn inner_is_zero<I: Inner>(i: &I)
+                ensures i.inner_val() >= 0
+            by {
+                admit
+            }
+        }
+    } => Ok(())
+}
