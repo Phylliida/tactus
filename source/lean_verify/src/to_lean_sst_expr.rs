@@ -339,7 +339,6 @@ pub(crate) fn renders_as_lean_int(range: &IntRange) -> bool {
 /// `Int.ofNat` insertion forces subtraction to happen over `Int` so the
 /// lower-bound refinement check (if present) can actually fire.
 fn clip_to_node_checked(src: &Typ, dst: &IntRange, inner: &Exp) -> Result<ExprNode, String> {
-    eprintln!("DBG clip_to_node_checked: src={:?} dst={:?}", src, dst);
     let src_range = match &**src {
         TypX::Int(r) => r,
         // Boxed int? Peel the box; otherwise the inner isn't an int type
@@ -347,10 +346,7 @@ fn clip_to_node_checked(src: &Typ, dst: &IntRange, inner: &Exp) -> Result<ExprNo
         TypX::Boxed(t) => if let TypX::Int(r) = &**t { r } else {
             return exp_to_node_checked(inner);
         },
-        _ => {
-            eprintln!("DBG clip_to_node_checked: fall-through, passing inner unchanged");
-            return exp_to_node_checked(inner);
-        },
+        _ => return exp_to_node_checked(inner),
     };
     let rendered = sst_exp_to_ast_checked(inner)?;
     Ok(match clip_coercion_head(renders_as_lean_int(src_range), renders_as_lean_int(dst)) {
