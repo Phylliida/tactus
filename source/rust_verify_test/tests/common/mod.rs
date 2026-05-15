@@ -670,11 +670,34 @@ macro_rules! test_verify_one_file_with_options {
         $(#[$attrs])*
         fn $name() {
             let result = verify_one_file(::std::stringify!($name), $body, &$options);
+            // Snapshot whether the result is Err and (if so) the first
+            // error line, BEFORE the pattern destructures the result.
+            // Used to surface a passed-via-Err summary (visible with
+            // `--nocapture`) and to make the pattern-mismatch failure
+            // message diagnosable.
+            let _result_is_err = result.is_err();
+            let _result_summary: String = match &result {
+                Ok(_) => "Ok(...)".to_string(),
+                Err(e) if e.errors.is_empty() => "Err(no errors)".to_string(),
+                Err(e) => format!("Err({} error(s); first: {:?})", e.errors.len(),
+                    e.errors[0].message.lines().next().unwrap_or("")),
+            };
             #[allow(irrefutable_let_patterns)]
             if let $result = result {
+                if _result_is_err {
+                    // Test passed by matching an Err pattern. Print a one-line
+                    // summary so `cargo test -- --nocapture` shows what error
+                    // was caught — saves debugging trips to Lean output when
+                    // verifying that an Err-probe failed for the right reason.
+                    eprintln!("[{}] passed matching Err pattern; verus: {}",
+                        ::std::stringify!($name), _result_summary);
+                }
                 $assertions
             } else {
-                assert!(false, "Err(_) does not match $result");
+                panic!("[{}] expected pattern `{}` but got: {}",
+                    ::std::stringify!($name),
+                    ::std::stringify!($result),
+                    _result_summary);
             }
         }
     };
@@ -682,14 +705,28 @@ macro_rules! test_verify_one_file_with_options {
         $(#[$attrs])*
         fn $name() {
             let result = verify_one_file(::std::stringify!($name), $body, &$options);
+            let _result_is_err = result.is_err();
+            let _result_summary: String = match &result {
+                Ok(_) => "Ok(...)".to_string(),
+                Err(e) if e.errors.is_empty() => "Err(no errors)".to_string(),
+                Err(e) => format!("Err({} error(s); first: {:?})", e.errors.len(),
+                    e.errors[0].message.lines().next().unwrap_or("")),
+            };
             let result_unit = result.as_ref().map(|_| ());
             #[allow(irrefutable_let_patterns)]
             if let $result = result_unit {
+                if _result_is_err {
+                    eprintln!("[{}] passed matching Err pattern; verus: {}",
+                        ::std::stringify!($name), _result_summary);
+                }
                 if let Ok(err) = result {
                     assert_eq!(err.warnings.len(), 0);
                 }
             } else {
-                assert!(false, "Err(_) does not match $result");
+                panic!("[{}] expected pattern `{}` but got: {}",
+                    ::std::stringify!($name),
+                    ::std::stringify!($result),
+                    _result_summary);
             }
         }
     };
