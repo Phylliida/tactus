@@ -2632,12 +2632,15 @@ an Opaque value at this site. Only DIRECT field types matter
   1. **`proof_fn_method_type`** in `to_lean_fn.rs` — builds
      `∀ (params...) (req_hyps...), <ensures>` for unit-return proof fns,
      `∀ (params...), { r : RetTy // <ensures> }` for non-unit-return
-     (subtype rendering via Raw escape hatch). Uses
-     `value_param_binders` (not the full `fn_binders`) because the
-     trait's typ_params and bounds are the class's responsibility, not
-     re-introduced per method — mirrors Mathlib's pattern where
-     `mul_assoc : ∀ a b c : G, ...` doesn't re-bind `(G : Type)` or
-     `[Mul G]`.
+     (rendered via the structured `ExprNode::Subtype { name, ty, pred }`
+     AST node; the corresponding `ScopeKind::Subtype` arm in
+     `substitute_impl` / `collect_free_vars` / `collect_all_names` /
+     `sanity::check_expr` handles `name` as a binder over `pred`).
+     Uses `class_method_value_binders` (not the full `fn_binders`)
+     because the trait's typ_params and bounds are the class's
+     responsibility, not re-introduced per method — mirrors Mathlib's
+     pattern where `mul_assoc : ∀ a b c : G, ...` doesn't re-bind
+     `(G : Type)` or `[Mul G]`.
 
   2. **`strip_class_qualifier`** — Lean rejects `ClassName.method`
      references inside the class declaration itself (the class isn't

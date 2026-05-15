@@ -280,6 +280,39 @@ mod tests {
         assert_eq!(render(&TypX::Boxed(Arc::new(TypX::Int(IntRange::Nat)))), "Nat");
     }
 
+    // ── is_unit_typ shape-drift guards ─────────────────────────────
+
+    /// After `ast_simplify`, Verus represents the unit type `()` as
+    /// `TypX::Datatype(Dt::Tuple(0), [], _)`. `is_unit_typ` is used in
+    /// two places (proof_fn_method_type emission dispatch, dep_order
+    /// pre-seeding) — both rely on this exact shape. If Verus ever
+    /// changes how the post-simplify unit type is represented, this
+    /// test fails with a clear pointer to `is_unit_typ` as the fix
+    /// site.
+    #[test]
+    fn is_unit_typ_recognizes_post_simplify_unit() {
+        let unit = TypX::Datatype(
+            Dt::Tuple(0),
+            Arc::new(vec![]),
+            Arc::new(vec![]),
+        );
+        assert!(is_unit_typ(&unit),
+            "Verus's post-simplify unit shape changed; update is_unit_typ");
+    }
+
+    #[test]
+    fn is_unit_typ_rejects_non_unit_types() {
+        assert!(!is_unit_typ(&TypX::Bool));
+        assert!(!is_unit_typ(&TypX::Int(IntRange::Int)));
+        // Non-zero tuple: NOT unit.
+        let pair = TypX::Datatype(
+            Dt::Tuple(2),
+            Arc::new(vec![Arc::new(TypX::Bool), Arc::new(TypX::Bool)]),
+            Arc::new(vec![]),
+        );
+        assert!(!is_unit_typ(&pair));
+    }
+
     #[test]
     fn test_spec_fn_type() {
         let t = TypX::SpecFn(

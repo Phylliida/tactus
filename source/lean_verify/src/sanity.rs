@@ -481,6 +481,56 @@ mod tests {
         assert!(v.iter().any(|vi| vi.name == "missing_fn"));
     }
 
+    /// Regression for the dependent-binder fix (2026-05-15 review pass).
+    /// Pre-fix, `check_expr`'s Forall/Lambda/Exists arm checked all
+    /// binder types under the OUTER scope, then added binder names —
+    /// so `∀ (self : Self) (h : P self), ...` flagged `self` in the
+    /// second binder's type as unresolved. Post-fix: binders are
+    /// checked left-to-right, adding each to scope before the next.
+    /// Surfaced via `test_proof_fn_trait_method_with_requires` e2e —
+    /// this is a focused unit test pinning the same property at the
+    /// sanity-check layer.
+    #[test]
+    fn forall_dependent_binder_resolves() {
+        // ∀ (a : Nat) (h : a = a), Nat
+        // Second binder type `a = a` references `a` from first via the
+        // structural BinOp::Eq node — pre-fix the sanity check flagged
+        // `a` as unresolved because it checked all binder types under
+        // the outer scope. Post-fix: left-to-right, adding each binder
+        // name before checking the next binder's type.
+        let inner_eq = Expr::new(ExprNode::BinOp {
+            op: BinOp::Eq,
+            lhs: Box::new(var("a")),
+            rhs: Box::new(var("a")),
+        });
+        let goal = Expr::new(ExprNode::Forall {
+            binders: vec![
+                Binder {
+                    name: Some(crate::lean_name::LeanName::lit("a")),
+                    ty: var("Nat"),
+                    kind: BinderKind::Explicit,
+                },
+                Binder {
+                    name: Some(crate::lean_name::LeanName::lit("h")),
+                    ty: inner_eq,
+                    kind: BinderKind::Explicit,
+                },
+            ],
+            body: Box::new(var("Nat")),
+        });
+        let thm = Theorem {
+            name: "t".into(),
+            binders: vec![],
+            goal,
+            tactic: Tactic::Named("sorry".into()),
+            requires_preamble: Vec::new(),
+            heartbeats: None,
+        };
+        let v = check_references(&[Command::Theorem(thm)]);
+        assert!(v.is_empty(),
+            "expected dependent binder type to resolve, got violations: {:?}", v);
+    }
+
     #[test]
     fn earlier_def_is_resolved() {
         // Def `f` first, then Theorem references `f`.

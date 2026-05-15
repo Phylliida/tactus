@@ -15,6 +15,24 @@ use crate::lean_ast::{
 use crate::to_lean_expr::vir_expr_to_ast;
 use crate::to_lean_type::{lean_name, sanitize, short_name, typ_to_expr};
 
+// ── Shared constants ────────────────────────────────────────────────────
+
+/// Auto-tactic used for the proof slot of `⟨witness, _⟩` pairs emitted
+/// as instance method bodies for non-unit-return proof-fn trait methods.
+/// `rfl` closes when the witness expression matches the ensures' RHS
+/// literally; `simp_all` handles unfolding through standalone def chains.
+/// Used in both `trait_to_ast` (class default) and `trait_impl_to_ast`
+/// (instance body) — extract here so phrasing changes propagate to
+/// both sites at once.
+const SUBTYPE_WITNESS_AUTO_PROOF: &str = "first | rfl | simp_all";
+
+/// Fallback tactic when `tactic_bodies` lookup misses for a proof-fn
+/// trait method. Lean accepts `sorry` with a warning rather than a
+/// hard error, preserving the "soundness escape hatch with surfaced
+/// signal" model — but in practice every proof fn with `tactic_span`
+/// should be readable, so the fallback is defensive only.
+const TACTIC_BODY_FALLBACK: &str = "sorry";
+
 // ── Source map ──────────────────────────────────────────────────────────
 
 /// Maps Lean line numbers back to the user's source.
@@ -1138,12 +1156,12 @@ pub fn trait_to_ast(
                     if is_unit_typ(&func.ret.x.typ) {
                         let tac = tactic_bodies.get(&func.name)
                             .map(|s| s.as_str())
-                            .unwrap_or("sorry");
+                            .unwrap_or(TACTIC_BODY_FALLBACK);
                         LExpr::new(ExprNode::ByBlock { tactic: tac.to_string() })
                     } else {
                         let value = vir_expr_to_ast(b);
                         let proof = LExpr::new(ExprNode::ByBlock {
-                            tactic: "first | rfl | simp_all".to_string(),
+                            tactic: SUBTYPE_WITNESS_AUTO_PROOF.to_string(),
                         });
                         LExpr::new(ExprNode::Anon(vec![value, proof]))
                     }
@@ -1498,7 +1516,7 @@ pub fn trait_impl_to_ast(
                     if is_unit_typ(&func.ret.x.typ) {
                         let tac = tactic_bodies.get(&func.name)
                             .map(|s| s.as_str())
-                            .unwrap_or("sorry");
+                            .unwrap_or(TACTIC_BODY_FALLBACK);
                         LExpr::new(ExprNode::ByBlock { tactic: tac.to_string() })
                     } else {
                         // Non-unit return: subtype value pair
@@ -1531,7 +1549,7 @@ pub fn trait_impl_to_ast(
                         // literally; `simp_all` handles unfolding
                         // through standalone def chains.
                         let proof = LExpr::new(ExprNode::ByBlock {
-                            tactic: "first | rfl | simp_all".to_string(),
+                            tactic: SUBTYPE_WITNESS_AUTO_PROOF.to_string(),
                         });
                         LExpr::new(ExprNode::Anon(vec![value, proof]))
                     }
