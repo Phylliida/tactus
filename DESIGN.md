@@ -2603,59 +2603,111 @@ an Opaque value at this site. Only DIRECT field types matter
 * ~~**External-body type latent soundness concern.**~~ **LANDED 2026-05-12.**
   See "External-body type opaque emission" below for the resolved design.
 
-* **Proof-fn trait method defaults — emission works, ensures content
-  lost.** `trait_to_ast` iterates all trait methods regardless of
-  mode, rendering each as a `ClassMethod`. For proof fns:
-  * The class method's `ty` is `Self → ReturnType` (with proof-fn
-    return type rendered as `Unit` when implicit), but proof fns
-    produce theorems (`Prop`-valued), not values of that type.
-  * The body is tactic text, not a value expression. With class-
-    defaults landed, the mode check routes proof fn bodies through
-    the `default` placeholder so vir_expr_to_ast doesn't see them —
-    but the class method's TYPE remains wrong.
+* **Proof-fn trait methods — LANDED 2026-05-15.** `trait_to_ast` now
+  mode-dispatches on method kind. For `Mode::Proof`, the class method
+  emits as a **Prop-typed class field** (Mathlib's `mul_assoc`/`one_mul`
+  idiom):
 
-  **Probed 2026-05-15.** Three pinning tests in `tactus.rs`:
-  * `test_proof_fn_trait_method_emission_probe` — Ok. Trait with
-    proof-fn method decl, impl provides body, tactus_auto fn with
-    `<T: Provable>` bound and `&S` concrete param triggers both
-    refs gates. Generated Lean: `class Provable (Self : Type) where
-    always_true : Self → Unit`, instance body `fun self => default`.
-    Lean elaborates cleanly.
-  * `test_proof_fn_trait_method_default_body_probe` — Ok. Same
-    shape via class-default path (impl inherits trait's default
-    body). The `default` placeholder routes correctly.
-  * `test_proof_fn_trait_method_ensures_inaccessible` — Err. The
-    pointed gap: a proof fn with the trait bound tries to use the
-    lemma's `ensures self.val() == 0` to discharge a goal. Omega
-    fails with a counterexample naming `HasZero.val t` and reporting
-    `a ≤ -1` as a possible value — the lemma's ensures was dropped
-    in the class-method emission, so nothing in the rendered Lean
-    captures the fact `val t = 0`.
+  ```lean
+  class HasZero (Self : Type) where
+    val : Self → Int
+    val_is_zero : ∀ (self : Self), val self = 0   -- Prop field
+  ```
 
-  Trigger requirement (learned during probe construction): the
-  `(refs.traits ∩ refs.datatypes)` instance gate
-  (`generate.rs:199-221`) only fires when something brings the
-  trait into scope — a typ_bound on a generic param or a Dynamic-
-  dispatch call. A tactus_auto fn that takes only `&S` for a
+  And the instance provides a tactic proof:
+
+  ```lean
+  noncomputable instance : HasZero S where
+    val := fun (self : _) => 0
+    val_is_zero := fun (self : _) => by
+      <user-provided tactic from the impl's by { ... } body>
+  ```
+
+  Callers with `<T: HasZero>` bound access the lemma via typeclass
+  dispatch: `have _ := HasZero.val_is_zero t` brings the instantiated
+  ensures into scope.
+
+  **Three pieces in the implementation:**
+
+  1. **`proof_fn_method_type`** in `to_lean_fn.rs` — builds
+     `∀ (params...) (req_hyps...), <ensures>` for unit-return proof fns,
+     `∀ (params...), { r : RetTy // <ensures> }` for non-unit-return
+     (subtype rendering via Raw escape hatch). Uses
+     `value_param_binders` (not the full `fn_binders`) because the
+     trait's typ_params and bounds are the class's responsibility, not
+     re-introduced per method — mirrors Mathlib's pattern where
+     `mul_assoc : ∀ a b c : G, ...` doesn't re-bind `(G : Type)` or
+     `[Mul G]`.
+
+  2. **`strip_class_qualifier`** — Lean rejects `ClassName.method`
+     references inside the class declaration itself (the class isn't
+     fully declared at that point). Mathlib uniformly uses unqualified
+     sibling references. The strip pass walks the rendered LExpr via
+     the structural `map_children` walker, replacing `Var("HasZero.val")`
+     with `Var("val")` when `val` is a known sibling method of the
+     current class. Targeted prefix-only strip — `OtherTrait.method`
+     and free-standing fn refs survive correctly.
+
+  3. **`render_by_block`** — handles tactic body indentation for
+     inline `by` blocks. `read_tactic_from_source` dedents the body to
+     column 0, but Lean requires `by`'s body to be on the same line OR
+     indented past `by`'s column. We re-indent every line by 2 spaces
+     to satisfy the indentation rule.
+
+  **Plumbing.** A `tactic_bodies: HashMap<Fun, String>` is built once
+  in `verifier.rs` via `build_tactic_bodies_map` (one pass over all
+  proof fns with `tactic_span`, reading each via the existing
+  `read_tactic_from_source` helper) and threaded through
+  `check_proof_fn` / `check_exec_fn` → `krate_preamble` →
+  `trait_to_ast` / `trait_impl_to_ast`. Five signature additions, one
+  helper.
+
+  **Trigger requirement** for the trait+impl emission gate (learned
+  during probe construction): the `(refs.traits ∩ refs.datatypes)`
+  instance gate (`generate.rs:199-221`) only fires when something
+  brings the trait into scope — a typ_bound on a generic param or a
+  Dynamic-dispatch call. A tactus_auto fn that takes only `&S` for a
   concrete `S: impl Provable` is NOT sufficient; the trait+impl
-  silently never emit and a probe that doesn't carry the bound
-  passes for the wrong reason.
+  silently don't emit and a probe that doesn't carry the bound
+  passes for the wrong reason. This is principled gate behavior (no
+  dead-code emission), not a bug; probes must include a generic with
+  the bound.
 
-  Realistic frequency: probably rare in practice. Proof fn trait
-  methods are uncommon in Verus codebases; users typically write
-  `proof fn lemma<T: Trait>(...)` as standalone lemmas. And in
-  Tactus specifically, there's no natural way to invoke a proof-fn
-  trait method's content from a `by { … }` tactic block — the only
-  pattern that would access the lemma's ensures is `walk_call`'s
-  inlining at exec-mode Call SST nodes, which proof fns don't
-  produce.
+  **Pinned tests** in `tactus.rs`:
+  * `test_proof_fn_trait_method_emission_probe` — Ok. Concrete
+    `impl Provable for S`; tactus_auto fn with `<T: Provable>` bound.
+    Class emits as Prop-typed field; instance body is the tactic.
+  * `test_proof_fn_trait_method_default_body_probe` — Ok. Trait with
+    default tactic body; empty impl inherits via class default.
+    Class default body emits as `by <tactic>` inside lambda.
+  * `test_proof_fn_trait_method_ensures_inaccessible` — Ok (FLIPPED
+    from Err on 2026-05-15). The probe that confirmed the previous
+    "lemma content is lost" gap now confirms the lemma IS accessible.
+    Proof fn caller with `<T: HasZero>` bound extracts the lemma via
+    `have _ := HasZero.val_is_zero t` and `omega` closes the goal.
+  * `test_proof_fn_trait_method_non_unit_return_deferral` — Err.
+    Pins the non-unit-return case as a deferral; see TODO below.
 
-  Forward path: filter proof-fn methods out of class declarations
-  entirely (emit them as separate top-level theorems with the
-  trait bound + Self typeclass parameter in scope), OR represent
-  proof-fn methods as `ClassMethod` with type `Self → Prop` (the
-  ensures becomes the theorem statement, body the tactic). Both
-  would flip `_ensures_inaccessible` to Ok.
+  **Deferred — non-unit return proof fns.** The class field type for
+  `proof fn extract() -> (r: int) ensures r == E` renders as
+  `∀ params, { r : int // ensures }` (subtype). The instance must
+  produce `⟨value, proof⟩` via Lean's anonymous-constructor syntax,
+  but Tactus's proof fn body is a plain tactic — not yet structured
+  to produce the value+proof pair. The pinned Err test
+  (`test_proof_fn_trait_method_non_unit_return_deferral`) flips to
+  Ok when this lands.
+
+  **Deferred — termination on recursive proof-fn trait methods.**
+  Class methods in Lean don't accept `termination_by` clauses
+  directly. If a proof-fn trait method has `decreases n` and its
+  tactic body recursively invokes the method, Lean can't auto-infer
+  termination. This is a pre-existing Tactus limitation (proof fns
+  in general don't emit `termination_by`), not specific to trait
+  methods. Fix involves either rendering recursive proof fns through
+  Lean's `mutual` block with explicit well-founded measures, or
+  emitting them as separate top-level theorems instead of class
+  fields (which would lose the typeclass-dispatch property the
+  current shape provides). Untested; flag for future work.
 
 * **Recursive default bodies — untested.** A trait default body that
   calls itself (or another trait method that recurses back). Verus's

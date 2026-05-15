@@ -1047,7 +1047,12 @@ where
 /// `substitute_impl` for the non-binder, non-Var fallthrough). Binder-
 /// aware consumers (substitute_impl on Let / Lambda / etc.) handle
 /// those variants explicitly before falling through to `map_children`.
-fn map_children<F>(node: &ExprNode, mut f: F) -> ExprNode
+///
+/// `pub(crate)` so `to_lean_fn::strip_class_qualifier` can use the same
+/// exhaustive-walker pattern (every new ExprNode variant must be added
+/// to map_children, which means consumer transforms can't accidentally
+/// miss a new variant — surfaces as a compile error in this file).
+pub(crate) fn map_children<F>(node: &ExprNode, mut f: F) -> ExprNode
 where
     F: FnMut(&Expr) -> Expr,
 {

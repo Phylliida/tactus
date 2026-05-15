@@ -1058,6 +1058,7 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
 pub fn trait_to_ast(
     tr: &TraitX,
     method_lookup: &HashMap<&Fun, &FunctionX>,
+    tactic_bodies: &HashMap<Fun, String>,
 ) -> Class {
     // Positional class binders: `(Self : Type) (T : Type) … (Item : outParam Type)`.
     let mut typ_params: Vec<LBinder> = Vec::new();
@@ -1083,6 +1084,16 @@ pub fn trait_to_ast(
 
     let bounds = trait_bounds_to_ast(&tr.typ_bounds);
 
+    // Pre-compute the set of sibling method names. Used by proof-fn
+    // method-type rendering: ensures expressions that reference
+    // sibling trait methods must render UNQUALIFIED (Lean rejects
+    // `Class.method` inside the class declaration; see
+    // `proof_fn_method_type` docstring).
+    let trait_short_name = short_name(&tr.name).to_string();
+    let sibling_methods: std::collections::HashSet<String> = tr.methods.iter()
+        .filter_map(|m| m.path.segments.last().map(|s| s.to_string()))
+        .collect();
+
     let methods = tr.methods.iter().map(|method_fun| {
         let func = method_lookup.get(method_fun).unwrap_or_else(|| {
             panic!(
@@ -1094,32 +1105,40 @@ pub fn trait_to_ast(
         let short = method_fun.path.segments.last()
             .map(|s| s.as_str()).unwrap_or("_");
         // Class-method default body, when the trait provides one.
-        // Renders as `fun (p₁ : _) (p₂ : _) … => body` so Lean infers
-        // each param type from the method signature. Used by empty
-        // impls (`impl Tr for T {}`) which inherit the default —
-        // those instances omit the method, and Lean dispatches via
-        // this default.
+        // Render strategy by mode:
+        // * Spec methods: render the actual body via `vir_expr_to_ast`,
+        //   wrapped in `fun (p₁ : _) (p₂ : _) … => body`. Lean unfolds
+        //   class defaults during typeclass dispatch, so the body is
+        //   load-bearing.
+        // * Exec methods: render `default` placeholder wrapped in
+        //   lambda. Rendering exec bodies via vir_expr_to_ast panics
+        //   on Assign/Loop/Return; the body isn't load-bearing for
+        //   verification (walk_call inlines specs, not bodies).
+        // * Proof methods: render the tactic body verbatim as
+        //   `by <tactic>` (via Raw escape hatch). Default body in
+        //   the trait provides a proof that holds for any Self
+        //   satisfying the class — Verus enforces this. Wrapped in
+        //   lambda over the proof fn's params so the body's
+        //   references to params (`self`, etc.) resolve correctly.
         //
-        // Render strategy by mode (mirrors trait_impl_to_ast):
-        // * Spec methods: render actual body via `vir_expr_to_ast`.
-        //   Lean unfolds class defaults during typeclass dispatch,
-        //   so the body is load-bearing.
-        // * Exec/proof methods: render `Classical.arbitrary _` as
-        //   placeholder. Rendering exec bodies via vir_expr_to_ast
-        //   panics on Assign/Loop/Return; and the body isn't
-        //   load-bearing for verification (walk_call inlines
-        //   specs, not bodies).
-        //
-        // Proof-fn trait method defaults still get the placeholder
-        // but the broader concern (class methods being typed as
-        // `Self → ReturnType` doesn't match what proof fns are in
-        // Lean) remains — see DESIGN.md "Proof-fn trait method
-        // defaults" entry.
+        // Note for proof-fn class methods: the method's TYPE is a
+        // Prop-valued `∀ params, ensures` (or subtype for non-unit
+        // returns) — see `proof_fn_method_type`. So the default body
+        // must produce a term of that type, which a tactic proof does.
         let default = func.body.as_ref().map(|b| {
-            let body_expr = if matches!(func.mode, vir::ast::Mode::Spec) {
-                vir_expr_to_ast(b)
-            } else {
-                LExpr::var_lit("default")
+            let body_expr = match func.mode {
+                vir::ast::Mode::Spec => vir_expr_to_ast(b),
+                vir::ast::Mode::Exec => LExpr::var_lit("default"),
+                vir::ast::Mode::Proof => {
+                    // Pull tactic body from the resolved map. The
+                    // tactic_body string comes from FileLoader byte
+                    // range reads done by the verifier. If the map
+                    // doesn't have it, fall back to `sorry`.
+                    let tac = tactic_bodies.get(&func.name)
+                        .map(|s| s.as_str())
+                        .unwrap_or("sorry");
+                    LExpr::new(ExprNode::Raw(render_by_block(tac)))
+                }
             };
             if func.params.is_empty() {
                 body_expr
@@ -1135,19 +1154,29 @@ pub fn trait_to_ast(
                 })
             }
         });
-        // Only spec-mode methods get termination clauses rendered —
-        // exec/proof methods would route through vir_expr_to_ast
-        // which might panic on exec constructs in the decrease.
-        // The exec-method body itself is a placeholder anyway, so
-        // termination doesn't apply.
+        // Only spec-mode methods get termination clauses rendered.
+        // Exec methods have placeholder bodies (no termination to
+        // discharge). Proof methods have tactic bodies, but Lean
+        // doesn't accept `termination_by` on class-method defaults
+        // (it's for `def`/`theorem`); recursive proof-fn trait
+        // methods are a documented deferral — see DESIGN.md TODO.
         let termination_by: Vec<LExpr> = if matches!(func.mode, vir::ast::Mode::Spec) {
             func.decrease.iter().map(|d| vir_expr_to_ast(d)).collect()
         } else {
             Vec::new()
         };
+        // Method type: Prop-valued for proof fns, function-typed for
+        // spec/exec. Proof-fn type captures the trait's full semantic
+        // promise (the ensures is the class method type itself, with
+        // sibling references stripped to unqualified form).
+        let ty = if matches!(func.mode, vir::ast::Mode::Proof) {
+            proof_fn_method_type(func, &trait_short_name, &sibling_methods)
+        } else {
+            method_type(func)
+        };
         ClassMethod {
             name: sanitize(short),
-            ty: method_type(func),
+            ty,
             default,
             termination_by,
         }
@@ -1197,12 +1226,201 @@ fn typ_maybe_projection_to_expr(typ: &TypX) -> LExpr {
     }
 }
 
+/// Render a tactic body as a Lean `by` block suitable for inline
+/// embedding (e.g., a class default body or instance method body).
+///
+/// Lean's tactic-mode parser requires `by`'s body to be either
+/// (a) on the same line as `by`, or (b) on subsequent lines INDENTED
+/// past `by`'s column. The tactic text we get from `read_tactic_from_source`
+/// is dedented to column 0, so naive `format!("by {}", tac)` produces
+/// `by\n<col-0 tactic>` which Lean rejects ("expected '{' or indented
+/// tactic sequence").
+///
+/// We re-indent: prepend 2 spaces to every non-empty line so the body
+/// is unambiguously indented relative to wherever `by` ends up.
+/// Single-line tactics inline naturally on the same line as `by` after
+/// trimming.
+fn render_by_block(tac: &str) -> String {
+    let trimmed = tac.trim();
+    if trimmed.is_empty() {
+        return "by trivial".to_string();
+    }
+    if !trimmed.contains('\n') {
+        return format!("by {}", trimmed);
+    }
+    // Multi-line: re-indent every non-empty line with two spaces past
+    // `by`. The `by` itself goes on its own line, body follows.
+    let indented: Vec<String> = trimmed.lines()
+        .map(|l| if l.trim().is_empty() { String::new() } else { format!("  {}", l) })
+        .collect();
+    format!("by\n{}", indented.join("\n"))
+}
+
+/// True when `typ` is the unit type (`()` in Verus). After
+/// `ast_simplify`, tuple types are represented as `TypX::Datatype(Dt::Tuple(n), ...)`
+/// — the 0-arity tuple is unit.
+///
+/// Used to discriminate unit-return proof fns (the common case
+/// — pure lemma) from value-returning proof fns (the "extract a witness"
+/// shape, which needs subtype rendering for the class method type).
+fn is_unit_typ(typ: &TypX) -> bool {
+    matches!(typ, TypX::Datatype(Dt::Tuple(0), _, _))
+}
+
+/// Build value-level parameter binders for a trait method's class-
+/// method type. Distinct from `fn_binders` (which also emits
+/// `(T : Type)` for typ_params and `[Trait T]` for trait bounds — both
+/// of which are the OUTER class's responsibility when we're inside a
+/// class declaration). Mathlib's class method type idiom binds only
+/// value-level params.
+///
+/// For `self`-typed params, renders the type as `Self` (the class
+/// type variable) rather than going through `typ_to_expr` which would
+/// produce the trait's full path.
+fn value_param_binders(func: &FunctionX) -> Vec<LBinder> {
+    let mut out: Vec<LBinder> = Vec::new();
+    for p in func.params.iter() {
+        let name = crate::lean_name::LeanName::from_var_ident(&p.x.name);
+        let ty = if p.x.name.0.as_str() == "self" {
+            LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Self")))
+        } else {
+            typ_maybe_projection_to_expr(&p.x.typ)
+        };
+        out.push(LBinder {
+            name: Some(name.clone()),
+            ty,
+            kind: BinderKind::Explicit,
+        });
+        if let Some(pred) = crate::to_lean_sst_expr::type_bound_predicate(
+            &LExpr::var(name.clone()),
+            &p.x.typ,
+        ) {
+            out.push(LBinder {
+                name: Some(crate::lean_name::LeanName::synthetic(format!("h_{}_bound", name.as_str()))),
+                ty: pred,
+                kind: BinderKind::Explicit,
+            });
+        }
+    }
+    out
+}
+
+/// Build the class-method type for a proof-fn trait method.
+///
+/// Lean's idiom for "typeclass promises lemmas about its types" is
+/// Prop-typed class fields (see Mathlib's `Group.mul_assoc`, etc.).
+/// This helper builds `∀ (params...) (req_hyps...), <ensures>` for the
+/// common unit-return case.
+///
+/// For non-unit return types, the goal becomes a subtype
+/// `{ ret : RetTy // <ensures> }` so the instance must provide a
+/// witnessing value together with a proof. The return name is bound
+/// inside the ensures by Verus's named-return convention.
+///
+/// References to sibling trait methods inside the ensures must render
+/// as UNQUALIFIED names. Lean rejects `ClassName.method` inside the
+/// class declaration itself — the class isn't fully declared at that
+/// point. Mathlib uniformly uses unqualified sibling references; we
+/// post-process the rendered LExpr to strip the class qualifier from
+/// known sibling method names.
+fn proof_fn_method_type(
+    func: &FunctionX,
+    class_name: &str,
+    sibling_methods: &std::collections::HashSet<String>,
+) -> LExpr {
+    // Class methods bind ONLY value-level params (and their refinement
+    // bounds + requires hypotheses). The trait's `Self` is the class's
+    // type variable (already in scope at the method's site); the
+    // trait's bounds are imposed by the class extends mechanism, not
+    // re-introduced on each method. Mathlib's `Semigroup` shows the
+    // shape: `class Semigroup (G : Type u) extends Mul G where
+    //   mul_assoc : ∀ a b c : G, ...` — no `(G : Type)` or `[Mul G]`
+    // re-binders inside `mul_assoc`'s type.
+    let mut binders = value_param_binders(func);
+    for req in func.require.iter() {
+        let req_ty = strip_class_qualifier(vir_expr_to_ast(req), class_name, sibling_methods);
+        binders.push(LBinder {
+            name: None,
+            ty: req_ty,
+            kind: BinderKind::Explicit,
+        });
+    }
+    let ensures = and_all(func.ensure.0.iter()
+        .map(|e| strip_class_qualifier(vir_expr_to_ast(e), class_name, sibling_methods))
+        .collect());
+
+    let goal = if is_unit_typ(&func.ret.x.typ) {
+        ensures
+    } else {
+        // Non-unit return: render as `{ ret : RetTy // <ensures> }`.
+        // No dedicated Subtype ExprNode variant; use the Raw escape
+        // hatch with the type and predicate pp'd via `pp_expr`. The
+        // rendered text composes the type-annotation and predicate
+        // expressions inline.
+        let ret_name = sanitize(func.ret.x.name.0.as_str());
+        let ret_ty = typ_maybe_projection_to_expr(&func.ret.x.typ);
+        let ty_str = crate::lean_pp::pp_expr(&ret_ty);
+        let pred_str = crate::lean_pp::pp_expr(&ensures);
+        LExpr::new(ExprNode::Raw(format!("{{ {} : {} // {} }}", ret_name, ty_str, pred_str)))
+    };
+
+    if binders.is_empty() {
+        goal
+    } else {
+        LExpr::new(ExprNode::Forall { binders, body: Box::new(goal) })
+    }
+}
+
+/// Walk `expr` and rewrite any `Var("<class_name>.<method>")` where
+/// `method` is in `sibling_methods` to `Var("<method>")` (unqualified).
+///
+/// Inside a class declaration, sibling references to other methods of
+/// the same class MUST be unqualified — see `proof_fn_method_type`'s
+/// docstring for why. This helper applies the rewrite to a fully-
+/// rendered LExpr, walking via the existing structural map_children
+/// machinery so we don't have to enumerate every ExprNode variant.
+fn strip_class_qualifier(
+    expr: LExpr,
+    class_name: &str,
+    sibling_methods: &std::collections::HashSet<String>,
+) -> LExpr {
+    let prefix = format!("{}.", class_name);
+    strip_class_qualifier_rec(expr, &prefix, sibling_methods)
+}
+
+fn strip_class_qualifier_rec(
+    expr: LExpr,
+    prefix: &str,
+    sibling_methods: &std::collections::HashSet<String>,
+) -> LExpr {
+    match &expr.node {
+        ExprNode::Var(name) => {
+            let s = name.as_str();
+            if let Some(rest) = s.strip_prefix(prefix) {
+                if sibling_methods.contains(rest) {
+                    return LExpr::new(ExprNode::Var(
+                        crate::lean_name::LeanName::synthetic(rest.to_string()),
+                    ));
+                }
+            }
+            expr
+        }
+        _ => {
+            let node = crate::lean_ast::map_children(&expr.node, |c: &LExpr| {
+                strip_class_qualifier_rec(c.clone(), prefix, sibling_methods)
+            });
+            LExpr::new(node)
+        }
+    }
+}
+
 // ── Trait impl (Lean `instance`) ───────────────────────────────────────
 
 pub fn trait_impl_to_ast(
     ti: &TraitImplX,
     method_impls: &[&FunctionX],
     assoc_types: &[&AssocTypeImplX],
+    tactic_bodies: &HashMap<Fun, String>,
 ) -> Instance {
     let mut binders: Vec<LBinder> = Vec::new();
     for tp in ti.typ_params.iter() {
@@ -1258,14 +1476,28 @@ pub fn trait_impl_to_ast(
             func.body.as_ref()?;
             let short = func.name.path.segments.last()
                 .map(|s| s.as_str()).unwrap_or("_");
-            let body_expr = if matches!(func.mode, vir::ast::Mode::Spec) {
-                vir_expr_to_ast(func.body.as_ref().unwrap())
-            } else {
-                // Exec/proof placeholder. `Classical.arbitrary _`
-                // produces a value of any type, satisfying Lean's
-                // instance-completeness requirement without needing
-                // to render the (possibly stateful) exec body.
-                LExpr::var_lit("default")
+            let body_expr = match func.mode {
+                vir::ast::Mode::Spec => vir_expr_to_ast(func.body.as_ref().unwrap()),
+                vir::ast::Mode::Exec => {
+                    // Exec placeholder. `default` produces a value
+                    // of any type, satisfying Lean's instance-completeness
+                    // requirement without needing to render the
+                    // (stateful) exec body. walk_call inlines specs
+                    // at call sites, not bodies via typeclass dispatch.
+                    LExpr::var_lit("default")
+                }
+                vir::ast::Mode::Proof => {
+                    // Proof methods: render the impl's tactic body
+                    // verbatim. The class method's TYPE (set by
+                    // proof_fn_method_type in trait_to_ast) is the
+                    // Prop-valued ensures, so the instance must
+                    // produce a proof — which is what the user's
+                    // `by { tactic }` body does.
+                    let tac = tactic_bodies.get(&func.name)
+                        .map(|s| s.as_str())
+                        .unwrap_or("sorry");
+                    LExpr::new(ExprNode::Raw(render_by_block(tac)))
+                }
             };
             let lambda = if func.params.is_empty() {
                 body_expr
