@@ -9556,6 +9556,33 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Edge case (E2): proof-fn trait method returning Self (the class
+// type variable itself). Subtype `{ r : Self // ensures }` references
+// `Self` — which IS the class's outer type variable, so it should be
+// in scope at class-field-emission time.
+test_verify_one_file! {
+    #[test] test_proof_fn_trait_method_non_unit_self_return verus_code! {
+        trait Producer {
+            proof fn produce() -> (r: Self) where Self: Sized;
+        }
+
+        struct PR;
+        impl Producer for PR {
+            proof fn produce() -> (r: Self)
+            {
+                PR
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn touches_producer<T: Producer>(_t: &T, _pr: &PR) -> (r: u8)
+            ensures r == 0
+        {
+            0
+        }
+    } => Ok(())
+}
+
 // Edge case (E1): proof-fn trait method with GENERIC type-param return.
 // `proof fn extract<U>() -> (r: U)` — the return type is the method's
 // own type parameter. The subtype `{ r : U // ensures }` should
