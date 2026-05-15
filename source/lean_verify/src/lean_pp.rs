@@ -84,7 +84,7 @@ fn expr_prec(node: &ExprNode) -> u16 {
         | ExprNode::LitStr(_) | ExprNode::LitChar(_)
         | ExprNode::ArrayLit(_) | ExprNode::StructUpdate { .. }
         | ExprNode::Anon(_) | ExprNode::Tuple(_) | ExprNode::Raw(_)
-        | ExprNode::ByBlock { .. } => PREC_ATOM,
+        | ExprNode::ByBlock { .. } | ExprNode::Subtype { .. } => PREC_ATOM,
         ExprNode::FieldProj { .. } | ExprNode::Index { .. } => PREC_ATOM,
         // SpanMark is transparent — inherit `inner`'s precedence so
         // wrapping never changes parenthesization.
@@ -749,6 +749,20 @@ fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
                 write_expr(out, e, 0, lm);
             }
             out.push('⟩');
+        }
+
+        ExprNode::Subtype { name, ty, pred } => {
+            // `{ name : ty // pred }` — Lean's subtype syntax. The
+            // `name` is bound in `pred` (the refinement predicate).
+            // Used for proof-fn trait method types with non-unit
+            // returns: the class field is `{ r : RetTy // ensures }`.
+            out.push_str("{ ");
+            out.push_str(name.as_str());
+            out.push_str(" : ");
+            write_expr(out, ty, 0, lm);
+            out.push_str(" // ");
+            write_expr(out, pred, 0, lm);
+            out.push_str(" }");
         }
 
         ExprNode::Tuple(elts) => {

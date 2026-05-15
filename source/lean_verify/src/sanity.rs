@@ -246,6 +246,16 @@ fn check_expr(
             }
         }
 
+        ExprNode::Subtype { name, ty, pred } => {
+            // `{ name : ty // pred }` — `ty` is in outer scope;
+            // `pred` is in scope extended by `name`.
+            check_expr(ty, defined, scope, violations, context);
+            let n = name.as_str().to_string();
+            let pushed = scope.insert(n.clone());
+            check_expr(pred, defined, scope, violations, context);
+            if pushed { scope.remove(&n); }
+        }
+
         // Compound expressions: recurse into children.
         ExprNode::BinOp { lhs, rhs, .. } => {
             check_expr(lhs, defined, scope, violations, context);
