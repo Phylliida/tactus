@@ -1242,12 +1242,36 @@ fn method_type(func: &FunctionX) -> LExpr {
     out
 }
 
-/// Inside a class definition, a `Self::AssocType` projection renders as the
-/// bare associated-type name (a class type param). Everywhere else, delegate
-/// to the standard type translator.
+/// Inside a class definition:
+/// - `Self::AssocType` projections render as the bare associated-type
+///   name (a class type param).
+/// - The trait's Self typ_param (`TypX::TypParam` with name
+///   matching `vir::def::trait_self_type_param()`) renders as
+///   the outer class's `Self` type variable.
+/// - Everything else delegates to the standard type translator.
+///
+/// **Why the Self normalization.** Verus represents the trait's Self
+/// as a typ_param with a canonical disambiguated name (literally
+/// `"Self%"` per `vir::def::TRAIT_SELF_TYPE_PARAM`). The class
+/// declaration's outer type variable is literally `Self` (no
+/// disambiguator), so a method signature referencing the trait's
+/// Self must normalize to match. Without this, e.g., a `proof fn
+/// produce() -> (r: Self)` class field would render as
+/// `produce : { _return : Self% // True }` — a dangling reference
+/// the sanity check (correctly) rejects.
+///
+/// We match against `trait_self_type_param()` directly rather than
+/// string-parsing the suffix, so a Verus-side rename of the constant
+/// causes a compile error here rather than silent breakage.
 fn typ_maybe_projection_to_expr(typ: &TypX) -> LExpr {
     if let TypX::Projection { name, .. } = typ {
         LExpr::new(ExprNode::Var(crate::lean_name::LeanName::synthetic(sanitize(name))))
+    } else if let TypX::TypParam(name) = typ {
+        if *name == vir::def::trait_self_type_param() {
+            LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Self")))
+        } else {
+            typ_to_expr(typ)
+        }
     } else {
         typ_to_expr(typ)
     }
