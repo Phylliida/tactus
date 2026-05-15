@@ -182,6 +182,23 @@ pub struct Theorem {
     /// wall-clock). All theorems emitted from a single fn share the
     /// fn's attribute value.
     pub heartbeats: Option<u32>,
+    /// Termination measure for recursive theorems. Mirrors `Def.termination_by`:
+    /// empty for non-recursive (most theorems); single-element for plain
+    /// `decreases n`; multi-element for lexicographic `decreases a, b, ...`.
+    /// Populated from the proof fn's `f.decrease` clause; the pretty-printer
+    /// emits `termination_by <expr>` (or `(e1, e2, ...)` for lex) after the
+    /// tactic body.
+    ///
+    /// Lean often auto-infers termination for simple structural recursion
+    /// (`(n - 1) as nat` on a `Nat`), but cases like Collatz-shaped recursion,
+    /// recursion on computed values, or lex measures require the explicit
+    /// clause. Verus has already certified termination via its `decreases`
+    /// check, so passing it to Lean is a faithful translation, not new work.
+    ///
+    /// Currently always empty for exec-fn-emitted theorems (the per-obligation
+    /// theorems are flat in shape; the recursion happens at the obligation-level
+    /// `CheckDecreaseHeight` rather than in the theorem itself).
+    pub termination_by: Vec<Expr>,
 }
 
 /// A piece of preamble that some theorem needs in its elaboration

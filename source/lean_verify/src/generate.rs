@@ -659,6 +659,7 @@ mod tests {
             tactic: Tactic::Named("tactus_auto".to_string()),
             requires_preamble,
             heartbeats: None,
+            termination_by: Vec::new(),
         }
     }
 

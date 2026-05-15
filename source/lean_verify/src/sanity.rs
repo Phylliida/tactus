@@ -458,6 +458,7 @@ mod tests {
             tactic: Tactic::Named("rfl".into()),
             requires_preamble: Vec::new(),
             heartbeats: None,
+            termination_by: Vec::new(),
         };
         assert!(check_references(&[Command::Theorem(thm)]).is_empty());
     }
@@ -475,6 +476,7 @@ mod tests {
             tactic: Tactic::Named("sorry".into()),
             requires_preamble: Vec::new(),
             heartbeats: None,
+            termination_by: Vec::new(),
         };
         let v = check_references(&[Command::Theorem(thm)]);
         assert_eq!(v.len(), 2); // missing_fn + x
@@ -525,6 +527,7 @@ mod tests {
             tactic: Tactic::Named("sorry".into()),
             requires_preamble: Vec::new(),
             heartbeats: None,
+            termination_by: Vec::new(),
         };
         let v = check_references(&[Command::Theorem(thm)]);
         assert!(v.is_empty(),
@@ -556,6 +559,7 @@ mod tests {
             tactic: Tactic::Named("rfl".into()),
             requires_preamble: Vec::new(),
             heartbeats: None,
+            termination_by: Vec::new(),
         };
         let violations = check_references(&[Command::Def(d), Command::Theorem(t)]);
         assert!(violations.is_empty(), "expected no violations, got {:?}", violations);
@@ -597,6 +601,7 @@ mod tests {
             tactic: Tactic::Named("rfl".into()),
             requires_preamble: Vec::new(),
             heartbeats: None,
+            termination_by: Vec::new(),
         };
         assert!(check_references(&[Command::Theorem(t)]).is_empty());
     }
@@ -626,6 +631,7 @@ mod tests {
             tactic: Tactic::Named("sorry".into()),
             requires_preamble: Vec::new(),
             heartbeats: None,
+            termination_by: Vec::new(),
         };
         assert!(check_references(&[Command::Theorem(t)]).is_empty());
     }
