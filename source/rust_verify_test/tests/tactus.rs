@@ -9251,8 +9251,47 @@ test_verify_one_file! {
 // Pinning as Err documents the deferral. When Tactus learns to render
 // non-unit-return proof fns properly (subtype rendering + instance
 // body as ⟨value, by tac⟩), this flips to Ok.
+// Probe: proof-fn trait method with NON-UNIT return type, LITERAL
+// witness. Tactus emits the class method type as a subtype
+// `{ r : RetTy // ensures }` and the instance body as
+// `⟨value, by rfl-or-simp_all⟩`. For a literal value body (no spec
+// method refs), this works cleanly.
 test_verify_one_file! {
-    #[test] test_proof_fn_trait_method_non_unit_return_deferral verus_code! {
+    #[test] test_proof_fn_trait_method_non_unit_return_literal verus_code! {
+        trait Extract {
+            proof fn extract() -> (r: int)
+                ensures r == 5;
+        }
+
+        struct E;
+        impl Extract for E {
+            proof fn extract() -> (r: int)
+                ensures r == 5
+            {
+                5
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn touches_extract<T: Extract>(_t: &T, _e: &E) -> (r: u8)
+            ensures r == 0
+        {
+            0
+        }
+    } => Ok(())
+}
+
+// Probe: proof-fn trait method with non-unit return whose body
+// references a sibling spec method. The witness expression `target self`
+// would (naively) fail Lean elaboration — inside an instance body,
+// sibling field refs aren't accessible (Lean's class elaboration
+// doesn't bring sibling fields into scope mid-instance). Tactus's
+// fix: dep_order pre-seeds impl proof-fn method bodies (non-unit
+// return) into the worklist, so the standalone def for the called
+// spec method gets emitted in the preamble. The instance body's
+// `target self` resolves to that standalone def.
+test_verify_one_file! {
+    #[test] test_proof_fn_trait_method_non_unit_return_sibling_ref verus_code! {
         trait Extract {
             spec fn target(&self) -> int;
             proof fn extract(&self) -> (r: int)
@@ -9264,8 +9303,8 @@ test_verify_one_file! {
             spec fn target(&self) -> int { 0 }
             proof fn extract(&self) -> (r: int)
                 ensures r == self.target()
-            by {
-                exact 0
+            {
+                self.target()
             }
         }
 
@@ -9275,7 +9314,7 @@ test_verify_one_file! {
         {
             0
         }
-    } => Err(_)
+    } => Ok(())
 }
 
 // Probe: proof-fn trait method with MULTIPLE ensures clauses. Verus

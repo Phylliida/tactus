@@ -1130,14 +1130,26 @@ pub fn trait_to_ast(
                 vir::ast::Mode::Spec => vir_expr_to_ast(b),
                 vir::ast::Mode::Exec => LExpr::var_lit("default"),
                 vir::ast::Mode::Proof => {
-                    // Pull tactic body from the resolved map. The
-                    // tactic_body string comes from FileLoader byte
-                    // range reads done by the verifier. If the map
-                    // doesn't have it, fall back to `sorry`.
-                    let tac = tactic_bodies.get(&func.name)
-                        .map(|s| s.as_str())
-                        .unwrap_or("sorry");
-                    LExpr::new(ExprNode::ByBlock { tactic: tac.to_string() })
+                    // Class default for proof-fn method. Mirrors
+                    // `trait_impl_to_ast`'s instance-side logic:
+                    // unit return → `by <tactic>` (the tactic body
+                    // proves the Prop-valued ensures); non-unit
+                    // return → `⟨value, by rfl-or-simp_all⟩` (the
+                    // body expression IS the witness; rfl/simp_all
+                    // closes the equality with the ensures RHS).
+                    if is_unit_typ(&func.ret.x.typ) {
+                        let tac = tactic_bodies.get(&func.name)
+                            .map(|s| s.as_str())
+                            .unwrap_or("sorry");
+                        LExpr::new(ExprNode::ByBlock { tactic: tac.to_string() })
+                    } else {
+                        let value = vir_expr_to_ast(b);
+                        let value_str = crate::lean_pp::pp_expr(&value);
+                        LExpr::new(ExprNode::Raw(format!(
+                            "⟨{}, by first | rfl | simp_all⟩",
+                            value_str
+                        )))
+                    }
                 }
             };
             if func.params.is_empty() {
@@ -1461,16 +1473,68 @@ pub fn trait_impl_to_ast(
                     LExpr::var_lit("default")
                 }
                 vir::ast::Mode::Proof => {
-                    // Proof methods: render the impl's tactic body
-                    // verbatim. The class method's TYPE (set by
-                    // proof_fn_method_type in trait_to_ast) is the
-                    // Prop-valued ensures, so the instance must
-                    // produce a proof — which is what the user's
-                    // `by { tactic }` body does.
-                    let tac = tactic_bodies.get(&func.name)
-                        .map(|s| s.as_str())
-                        .unwrap_or("sorry");
-                    LExpr::new(ExprNode::ByBlock { tactic: tac.to_string() })
+                    // Proof methods. Two cases based on return type:
+                    //
+                    // (a) Unit return: the class method's TYPE is
+                    //     `∀ params, ensures` (a Prop). The instance
+                    //     must produce a proof — the user's `by {
+                    //     tactic }` body. Renders as ByBlock with
+                    //     context-aware indentation.
+                    //
+                    // (b) Non-unit return: the class method's TYPE is
+                    //     `∀ params, { r : RetTy // ensures }` (a
+                    //     subtype). The instance must produce a
+                    //     `⟨value, proof⟩` pair. Verus's `by { }`
+                    //     syntax doesn't fit non-unit returns (the
+                    //     sanitized body fails Rust's type check),
+                    //     so the user writes a regular Verus-style
+                    //     body expression. Tactus renders that body
+                    //     as the WITNESS VALUE and emits `by rfl`
+                    //     as the proof (the canonical case where the
+                    //     body matches the ensures' RHS literally).
+                    //     For non-trivial proofs, the user adds a
+                    //     `proof { }` block in the body — Verus's
+                    //     auto-postcondition-check handles it on the
+                    //     Verus side.
+                    if is_unit_typ(&func.ret.x.typ) {
+                        let tac = tactic_bodies.get(&func.name)
+                            .map(|s| s.as_str())
+                            .unwrap_or("sorry");
+                        LExpr::new(ExprNode::ByBlock { tactic: tac.to_string() })
+                    } else {
+                        // Non-unit return: subtype value pair. The
+                        // body provides the witness expression; we
+                        // wrap it as `⟨body, by rfl-or-simp_all⟩`.
+                        //
+                        // The body's references to sibling spec
+                        // methods (e.g., `self.target()`) render via
+                        // `vir_expr_to_ast` as the UNQUALIFIED
+                        // standalone-def name (`target self`). At
+                        // instance-body emission position, sibling
+                        // class-field refs aren't in scope (Lean's
+                        // instance elaboration doesn't bring fields
+                        // into scope mid-block), AND qualified
+                        // `Class.method` refs fail because the
+                        // typeclass instance is being constructed
+                        // (`failed to synthesize Class E`). The
+                        // standalone def IS in scope — dep_order
+                        // pre-seeds impl proof-fn method bodies for
+                        // non-unit return cases (`seed_impl_proof_method_bodies`)
+                        // so the called spec methods emit as
+                        // standalone defs before the instance. So
+                        // the unqualified form from vir_expr_to_ast
+                        // resolves correctly.
+                        let body = func.body.as_ref().unwrap();
+                        let value = vir_expr_to_ast(body);
+                        let value_str = crate::lean_pp::pp_expr(&value);
+                        // `rfl` closes when body matches ensures
+                        // literally; `simp_all` handles unfolding
+                        // through standalone def chains.
+                        LExpr::new(ExprNode::Raw(format!(
+                            "⟨{}, by first | rfl | simp_all⟩",
+                            value_str
+                        )))
+                    }
                 }
             };
             let lambda = if func.params.is_empty() {

@@ -2739,14 +2739,47 @@ an Opaque value at this site. Only DIRECT field types matter
   the class method as an explicit argument). No current test
   exercises this; flag for future work if it surfaces.
 
-  **Deferred — non-unit return proof fns.** The class field type for
-  `proof fn extract() -> (r: int) ensures r == E` renders as
-  `∀ params, { r : int // ensures }` (subtype). The instance must
-  produce `⟨value, proof⟩` via Lean's anonymous-constructor syntax,
-  but Tactus's proof fn body is a plain tactic — not yet structured
-  to produce the value+proof pair. The pinned Err test
-  (`test_proof_fn_trait_method_non_unit_return_deferral`) flips to
-  Ok when this lands.
+  **Non-unit return proof fns — LANDED 2026-05-15.** The class field
+  type for `proof fn extract() -> (r: int) ensures r == E` renders as
+  `∀ params, { r : int // ensures }` (subtype). The instance body
+  emits as `fun (params...) => ⟨vir_expr_to_ast(body), by first | rfl
+  | simp_all⟩`: the impl's body expression IS the witness; rfl/simp_all
+  closes the equality with the ensures' RHS.
+
+  **Two important constraints + their resolutions:**
+
+  1. **Verus's `by { }` body syntax doesn't fit non-unit returns.**
+     FileLoader sanitizes the brace body to spaces, so for a fn
+     declared as returning `int`, the sanitized body has type `()` and
+     Rust rejects with E0308. So non-unit return proof fns must use
+     regular Verus-style bodies (just an expression). They're verified
+     by Verus's Z3 path; Tactus's class+instance emission picks up the
+     body via `vir_expr_to_ast` for the witness.
+
+  2. **Inside instance bodies, sibling field refs aren't in scope.**
+     Verified 2026-05-15 via `/tmp/test_instance_self_ref.lean` —
+     `val self` inside an instance body errors with "Unknown
+     identifier `val`", and `Foo.val self` errors with "failed to
+     synthesize `Foo E`" (the instance is being constructed, no
+     instance yet to dispatch through). Only the standalone def of
+     the called spec method works.
+
+     Resolution: `dep_order::seed_impl_proof_method_bodies` pre-seeds
+     all impl proof-fn method bodies (non-unit return) into the
+     worklist. This ensures the spec methods called from those bodies
+     emit as standalone defs in the preamble, BEFORE the instance.
+     The unqualified spec method name then resolves to the standalone
+     def at instance-body emission time.
+
+     Over-emit is harmless: standalone defs that nothing else
+     references are inert dead code in the preamble.
+
+  **Pinned tests:**
+  * `test_proof_fn_trait_method_non_unit_return_literal` — body is a
+    literal value with no sibling refs. Simplest case.
+  * `test_proof_fn_trait_method_non_unit_return_sibling_ref` — body
+    references a sibling spec method (`self.target()`). Exercises
+    the dep_order pre-seeding path.
 
   **Deferred — termination on recursive proof-fn trait methods.**
   Class methods in Lean don't accept `termination_by` clauses
