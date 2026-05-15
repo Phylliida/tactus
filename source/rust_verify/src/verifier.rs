@@ -1581,6 +1581,16 @@ impl Verifier {
         let bucket = self.get_bucket(bucket_id);
         let mut opgen = OpGenerator::new(ctx, krate, bucket.clone());
         let mut all_context_ops = vec![];
+        // Build the Tactus tactic_bodies map ONCE per bucket — map
+        // content doesn't change per fn, and `build_tactic_bodies_map`
+        // does a file read per proof-fn-with-tactic-span in the krate.
+        // The original implementation rebuilt the map per Tactus-routed
+        // fn (FP lens, 2026-05-15). Lazy-built via OnceLock so non-
+        // Tactus runs (no proof fns with tactic_span anywhere) pay
+        // zero cost.
+        let tactus_tactic_bodies: std::sync::OnceLock<
+            std::collections::HashMap<vir::ast::Fun, String>
+        > = std::sync::OnceLock::new();
         while let Some(mut function_opgen) = opgen.next()? {
             let diagnostics_to_report: std::cell::RefCell<
                 Option<PanicOnDropVec<(Message, MessageLevel)>>,
@@ -1707,7 +1717,8 @@ impl Verifier {
                             }
 
                             let crate_name = self.crate_name.as_deref().unwrap_or("crate");
-                            let tactic_bodies = build_tactic_bodies_map(vir_krate);
+                            let tactic_bodies = tactus_tactic_bodies
+                                .get_or_init(|| build_tactic_bodies_map(vir_krate));
                             match lean_verify::check_proof_fn(
                                 vir_krate,
                                 &vir_fn.x,
@@ -1800,7 +1811,8 @@ impl Verifier {
                                 continue;
                             };
                             let crate_name = self.crate_name.as_deref().unwrap_or("crate");
-                            let tactic_bodies = build_tactic_bodies_map(vir_krate);
+                            let tactic_bodies = tactus_tactic_bodies
+                                .get_or_init(|| build_tactic_bodies_map(vir_krate));
                             match lean_verify::check_exec_fn(
                                 vir_krate,
                                 &vir_fn.x,

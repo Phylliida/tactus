@@ -9456,6 +9456,50 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Negative probe: proof-fn trait method impl whose tactic body
+// doesn't actually prove the ensures. Verus's mode/type check would
+// not catch this — it's the verification step that matters. With
+// the Prop-typed class field shape, the instance method body is the
+// user's tactic, and Lean must reject when the tactic doesn't close
+// the goal.
+//
+// Pinning this Err ensures: a regression that silently accepts an
+// unproved tactic body (e.g., by emitting `sorry` instead of the
+// user's tactic) would flip this test to Ok unsoundly.
+test_verify_one_file! {
+    #[test] test_proof_fn_trait_method_wrong_ensures_rejected verus_code! {
+        trait Wrong {
+            spec fn val(&self) -> int;
+            proof fn val_is_one(&self)
+                ensures self.val() == 1;
+        }
+
+        struct W;
+        impl Wrong for W {
+            spec fn val(&self) -> int { 0 }
+            proof fn val_is_one(&self)
+                ensures self.val() == 1
+            by {
+                -- Tactic claims val() = 1, but val()'s body is 0.
+                -- omega correctly fails: 0 != 1.
+                omega
+            }
+        }
+    } => Err(err) => {
+        // Either Verus's Z3 path or Tactus's Lean path should reject.
+        // We don't pin the specific message — just that SOME error
+        // surfaces. Soundness guard.
+        assert!(
+            err.errors.iter().any(|e|
+                e.message.contains("postcondition")
+                    || e.message.contains("Lean tactic failed")
+                    || e.message.contains("could not prove")),
+            "expected verification failure for wrong ensures, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
 // Probe: ensures references a method of a DIFFERENT trait. The
 // strip helper should NOT rewrite OtherTrait.method — it only
 // targets the current class's prefix.

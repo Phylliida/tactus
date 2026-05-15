@@ -832,6 +832,49 @@ mod tests {
         Expr::new(ExprNode::BinOp { op, lhs: Box::new(l), rhs: Box::new(r) })
     }
 
+    // ── current_line_indent (helper used by ExprNode::ByBlock pp) ────
+
+    #[test]
+    fn current_line_indent_empty_string() {
+        assert_eq!(current_line_indent(""), 0);
+    }
+
+    #[test]
+    fn current_line_indent_no_indent() {
+        assert_eq!(current_line_indent("foo := bar"), 0);
+    }
+
+    #[test]
+    fn current_line_indent_two_spaces() {
+        assert_eq!(current_line_indent("  foo := bar"), 2);
+    }
+
+    #[test]
+    fn current_line_indent_string_ending_with_newline() {
+        // Last line is empty — indent of empty line is 0.
+        assert_eq!(current_line_indent("foo\n"), 0);
+    }
+
+    #[test]
+    fn current_line_indent_multi_line_uses_last_line() {
+        // Previous lines' indents don't matter — only the current
+        // (last, unterminated) line's indent counts.
+        assert_eq!(current_line_indent("    early\n  current"), 2);
+    }
+
+    #[test]
+    fn current_line_indent_tabs_not_counted() {
+        // Tabs aren't used in Tactus's output; only space-prefix counts.
+        // A line starting with a tab is treated as zero-indent.
+        assert_eq!(current_line_indent("\tfoo"), 0);
+    }
+
+    #[test]
+    fn current_line_indent_only_spaces() {
+        // A "line" that's all spaces — count them all.
+        assert_eq!(current_line_indent("    "), 4);
+    }
+
     #[test]
     fn mul_binds_tighter_than_add() {
         // a + b * c → "a + b * c" (no parens; mul is inside)
