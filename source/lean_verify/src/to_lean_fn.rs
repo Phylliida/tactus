@@ -1132,11 +1132,9 @@ pub fn trait_to_ast(
                 vir::ast::Mode::Proof => {
                     // Class default for proof-fn method. Mirrors
                     // `trait_impl_to_ast`'s instance-side logic:
-                    // unit return → `by <tactic>` (the tactic body
-                    // proves the Prop-valued ensures); non-unit
-                    // return → `⟨value, by rfl-or-simp_all⟩` (the
-                    // body expression IS the witness; rfl/simp_all
-                    // closes the equality with the ensures RHS).
+                    // unit return → `by <tactic>`; non-unit return
+                    // → `⟨value, by first | rfl | simp_all⟩` built
+                    // structurally via Anon + ByBlock.
                     if is_unit_typ(&func.ret.x.typ) {
                         let tac = tactic_bodies.get(&func.name)
                             .map(|s| s.as_str())
@@ -1144,11 +1142,10 @@ pub fn trait_to_ast(
                         LExpr::new(ExprNode::ByBlock { tactic: tac.to_string() })
                     } else {
                         let value = vir_expr_to_ast(b);
-                        let value_str = crate::lean_pp::pp_expr(&value);
-                        LExpr::new(ExprNode::Raw(format!(
-                            "⟨{}, by first | rfl | simp_all⟩",
-                            value_str
-                        )))
+                        let proof = LExpr::new(ExprNode::ByBlock {
+                            tactic: "first | rfl | simp_all".to_string(),
+                        });
+                        LExpr::new(ExprNode::Anon(vec![value, proof]))
                     }
                 }
             };
@@ -1334,16 +1331,20 @@ fn proof_fn_method_type(
     let goal = if is_unit_typ(&func.ret.x.typ) {
         ensures
     } else {
-        // Non-unit return: render as `{ ret : RetTy // <ensures> }`.
-        // No dedicated Subtype ExprNode variant; use the Raw escape
-        // hatch with the type and predicate pp'd via `pp_expr`. The
-        // rendered text composes the type-annotation and predicate
-        // expressions inline.
-        let ret_name = sanitize(func.ret.x.name.0.as_str());
+        // Non-unit return: render as `{ ret : RetTy // <ensures> }`
+        // via the structured Subtype AST node. The node owns its
+        // type and predicate as LExprs — pp handles composition,
+        // sanity check handles scoping (name is bound in pred),
+        // substitute handles alpha-renaming.
+        let ret_name = crate::lean_name::LeanName::synthetic(
+            sanitize(func.ret.x.name.0.as_str())
+        );
         let ret_ty = typ_maybe_projection_to_expr(&func.ret.x.typ);
-        let ty_str = crate::lean_pp::pp_expr(&ret_ty);
-        let pred_str = crate::lean_pp::pp_expr(&ensures);
-        LExpr::new(ExprNode::Raw(format!("{{ {} : {} // {} }}", ret_name, ty_str, pred_str)))
+        LExpr::new(ExprNode::Subtype {
+            name: ret_name,
+            ty: Box::new(ret_ty),
+            pred: Box::new(ensures),
+        })
     };
 
     if binders.is_empty() {
@@ -1500,38 +1501,39 @@ pub fn trait_impl_to_ast(
                             .unwrap_or("sorry");
                         LExpr::new(ExprNode::ByBlock { tactic: tac.to_string() })
                     } else {
-                        // Non-unit return: subtype value pair. The
-                        // body provides the witness expression; we
-                        // wrap it as `⟨body, by rfl-or-simp_all⟩`.
+                        // Non-unit return: subtype value pair
+                        // `⟨body, by first | rfl | simp_all⟩` built
+                        // via structured AST nodes (Anon + ByBlock)
+                        // rather than Raw string formatting — pp
+                        // handles composition, sanity checks the
+                        // value's refs, indentation tracks context
+                        // automatically.
                         //
                         // The body's references to sibling spec
                         // methods (e.g., `self.target()`) render via
                         // `vir_expr_to_ast` as the UNQUALIFIED
-                        // standalone-def name (`target self`). At
-                        // instance-body emission position, sibling
-                        // class-field refs aren't in scope (Lean's
-                        // instance elaboration doesn't bring fields
-                        // into scope mid-block), AND qualified
+                        // standalone-def name. At instance-body
+                        // emission position, sibling class-field
+                        // refs aren't in scope (Lean's instance
+                        // elaboration doesn't bring fields into
+                        // scope mid-block), AND qualified
                         // `Class.method` refs fail because the
-                        // typeclass instance is being constructed
-                        // (`failed to synthesize Class E`). The
-                        // standalone def IS in scope — dep_order
-                        // pre-seeds impl proof-fn method bodies for
-                        // non-unit return cases (`seed_impl_proof_method_bodies`)
-                        // so the called spec methods emit as
-                        // standalone defs before the instance. So
-                        // the unqualified form from vir_expr_to_ast
-                        // resolves correctly.
+                        // typeclass instance is being constructed.
+                        // The standalone def IS in scope —
+                        // dep_order pre-seeds impl proof-fn method
+                        // bodies for non-unit returns
+                        // (`seed_impl_proof_method_bodies`) so the
+                        // called spec methods emit as standalone
+                        // defs before the instance.
                         let body = func.body.as_ref().unwrap();
                         let value = vir_expr_to_ast(body);
-                        let value_str = crate::lean_pp::pp_expr(&value);
                         // `rfl` closes when body matches ensures
                         // literally; `simp_all` handles unfolding
                         // through standalone def chains.
-                        LExpr::new(ExprNode::Raw(format!(
-                            "⟨{}, by first | rfl | simp_all⟩",
-                            value_str
-                        )))
+                        let proof = LExpr::new(ExprNode::ByBlock {
+                            tactic: "first | rfl | simp_all".to_string(),
+                        });
+                        LExpr::new(ExprNode::Anon(vec![value, proof]))
                     }
                 }
             };

@@ -532,6 +532,21 @@ pub enum ExprNode {
     /// inferred data constructors where the target type is unambiguous.
     Anon(Vec<Expr>),
 
+    /// `{ name : ty // pred }` — Lean's subtype (refinement) type.
+    /// `name` is bound in `pred`. Used to render proof-fn trait method
+    /// types with non-unit returns: `∀ (params...), { r : RetTy //
+    /// <ensures> }`. The instance method body provides a value of
+    /// this type as `⟨witness, proof⟩` (via the `Anon` constructor).
+    ///
+    /// `name` is the bound variable's name; the subtype introduces a
+    /// single binder scope. Sanity check treats this as a Forall-like
+    /// scope (the predicate is checked with the bound name in scope).
+    Subtype {
+        name: crate::lean_name::LeanName,
+        ty: Box<Expr>,
+        pred: Box<Expr>,
+    },
+
     /// Escape hatch: verbatim Lean text. Reserved for VIR forms that have
     /// no direct Lean analogue (effectless markers, exotic shapes). The
     /// goal is to keep this set small; prefer adding a real node.
@@ -884,6 +899,17 @@ enum ScopeKind<'a> {
         scrutinee: &'a Expr,
         arms: &'a [MatchArm],
     },
+    /// `ExprNode::Subtype { name, ty, pred }` — single-name binder
+    /// over a refinement predicate. `ty` is in outer scope; `pred`
+    /// is in scope extended by `name`. Semantically Forall-like
+    /// (one binder, body is `pred`), but rebuilds to a distinct
+    /// ExprNode constructor — so it has its own ScopeKind variant
+    /// rather than being smuggled through `Quantified`.
+    Subtype {
+        name: &'a crate::lean_name::LeanName,
+        ty: &'a Expr,
+        pred: &'a Expr,
+    },
     /// Non-binder compounds and leaves other than `Var`. Walkers
     /// delegate to `walk_children` / `map_children` for these — no
     /// scope tracking required.
@@ -946,6 +972,11 @@ impl ExprNode {
             ExprNode::Match { scrutinee, arms } => ScopeKind::Match {
                 scrutinee,
                 arms,
+            },
+            ExprNode::Subtype { name, ty, pred } => ScopeKind::Subtype {
+                name,
+                ty,
+                pred,
             },
             // Non-binder compounds + leaves other than Var.
             // Listed explicitly (no `_ =>`) so a new variant
@@ -1028,6 +1059,10 @@ where
             for arm in arms {
                 f(&arm.body);
             }
+        }
+        ExprNode::Subtype { ty, pred, .. } => {
+            f(ty);
+            f(pred);
         }
         ExprNode::TypeAnnot { expr, ty } => {
             f(expr);
@@ -1128,6 +1163,11 @@ where
                 })
                 .collect();
             ExprNode::Match { scrutinee, arms }
+        }
+        ExprNode::Subtype { name, ty, pred } => {
+            let ty = Box::new(f(ty));
+            let pred = Box::new(f(pred));
+            ExprNode::Subtype { name: name.clone(), ty, pred }
         }
         ExprNode::TypeAnnot { expr, ty } => {
             let expr = Box::new(f(expr));
@@ -1302,6 +1342,27 @@ fn substitute_impl(
             scrutinee: Box::new(substitute_impl(scrutinee, subst)),
             arms: arms.iter().map(|a| substitute_match_arm(a, subst)).collect(),
         },
+        // Subtype `{ name : ty // pred }` — single binder over `pred`.
+        // Same alpha-rename + body subst pattern as Let, just with the
+        // body field renamed (`pred` vs `body`). `ty` is in OUTER
+        // scope (not affected by the binder).
+        ScopeKind::Subtype { name, ty, pred } => {
+            let new_ty = substitute_impl(ty, subst);
+            let inner_subst = subst_without(subst, name);
+            let renames = compute_alpha_renames(&[name], &inner_subst, pred);
+            let (final_name, pred_for_subst) = if let Some(fresh) = renames.get(name) {
+                let rename_subst = rename_map_to_subst(&renames);
+                let renamed_pred = substitute_impl(pred, &rename_subst);
+                (fresh.clone(), renamed_pred)
+            } else {
+                (name.clone(), pred.clone())
+            };
+            ExprNode::Subtype {
+                name: final_name,
+                ty: Box::new(new_ty),
+                pred: Box::new(substitute_impl(&pred_for_subst, &inner_subst)),
+            }
+        }
         // Non-binder compounds + leaves other than Var — uniformly
         // substitute into children. `map_children` preserves
         // `SpanMark` metadata, op codes, field names, etc.
@@ -1411,6 +1472,10 @@ fn collect_all_names(expr: &Expr, out: &mut std::collections::HashSet<String>) {
                     out.insert(n);
                 }
             }
+            walk_children(&expr.node, |c| collect_all_names(c, out));
+        }
+        ScopeKind::Subtype { name, .. } => {
+            out.insert(name.as_str().to_string());
             walk_children(&expr.node, |c| collect_all_names(c, out));
         }
         ScopeKind::Other => walk_children(&expr.node, |c| collect_all_names(c, out)),
@@ -1635,6 +1700,15 @@ fn collect_free_vars(
                 }
                 collect_free_vars(&arm.body, &inner, out);
             }
+        }
+        // Subtype: ty is in outer scope; pred is in scope extended
+        // with `name`. Mirror of Let, with `pred` playing the role
+        // of body.
+        ScopeKind::Subtype { name, ty, pred } => {
+            collect_free_vars(ty, bound, out);
+            let mut inner = bound.clone();
+            inner.insert(name.as_str().to_string());
+            collect_free_vars(pred, &inner, out);
         }
         // No-binder variants: walk children with the same scope.
         ScopeKind::Other => walk_children(&expr.node, |c| collect_free_vars(c, bound, out)),

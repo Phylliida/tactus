@@ -1493,8 +1493,13 @@ fn verus_item_to_vir<'tcx, 'a>(
                         .must_apply_modulo_regions()
             };
             match ((&*source_ty, source_is_integer), &*to_ty) {
-                ((TypX::Int(IntRange::U(_)), _), TypX::Int(IntRange::Nat)) => Ok(source_vir),
-                ((TypX::Int(IntRange::USize), _), TypX::Int(IntRange::Nat)) => Ok(source_vir),
+                // Tactus probe: previously these three arms returned
+                // source_vir unchanged, on the rationale that Verus's Z3
+                // backend treats U/USize/Nat as the same unbounded Int.
+                // Tactus's Lean backend renders u64/usize as `Int` and
+                // nat as `Nat` — distinct types — so the cast is NOT
+                // a no-op there. Emit a Clip so the Lean renderer can
+                // insert `Int.toNat`.
                 ((TypX::Int(IntRange::Nat), _), TypX::Int(IntRange::Nat)) => Ok(source_vir),
                 ((TypX::Int(IntRange::Int), _), TypX::Int(IntRange::Nat)) => {
                     Ok(mk_ty_clip(bctx, &to_ty, &source_vir, true))
