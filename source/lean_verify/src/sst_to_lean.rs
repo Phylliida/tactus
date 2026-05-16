@@ -117,8 +117,8 @@ use vir::sst::{
     LoopInv, Par, Stm, StmX,
 };
 use vir::ast::{
-    AssertQueryMode, BinaryOp, Expr, ExprX, Fun, FunctionKind, FunctionX, KrateX, SpannedTyped, TactusKind,
-    Typ, UnaryOp, UnaryOpr, VarAt, VarBinder, VarIdent,
+    AssertQueryMode, BinaryOp, CallTarget, Expr, ExprX, Fun, FunctionKind, FunctionX, IntRange,
+    KrateX, SpannedTyped, TactusKind, Typ, TypX, UnaryOp, UnaryOpr, VarAt, VarBinder, VarIdent,
 };
 use vir::ast_visitor::map_expr_visitor;
 use vir::messages::Span;
@@ -130,7 +130,7 @@ use crate::lean_ast::{
 use crate::expr_shared::varat_pre_name;
 use std::sync::Arc;
 use crate::to_lean_expr::vir_expr_to_ast;
-use crate::to_lean_sst_expr::{lower as lower_validated, sst_exp_to_ast_checked, type_bound_predicate, Validated};
+use crate::to_lean_sst_expr::{lower as lower_validated, renders_as_lean_int, sst_exp_to_ast_checked, type_bound_predicate, Validated};
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
 
 // ── BitVec-mode preamble fragments (#130 / right-way #4) ───────────────
@@ -470,16 +470,20 @@ impl<'a> WpCtx<'a> {
                     NormalizePhase::CurrentIsPreState,
                 );
                 let rewritten = rewrite_varat_for_mut_params_in_exp(&normalized, mut_param_names);
-                // The rewrite is structural (VarAt(p, Pre) →
-                // Var(<p>_at_pre_tactus)) and preserves ExpX shape, so
-                // validation that succeeded on `normalized` (the
-                // earlier `check_exp` call in this fn) succeeds on
-                // `rewritten`. `Validated::check` is deterministic;
-                // propagating its Err handles any unexpected drift.
+                // Insert Int.toNat coercions at Call sites where needed
+                // (BUG-as-nat-cast.md). Same pass as for the body.
+                let coerced = insert_nat_coercions_in_exp(&rewritten, &fn_map);
+                // The rewrites are structural (VarAt(p, Pre) →
+                // Var(<p>_at_pre_tactus); Call args wrapped in Clip)
+                // and preserve ExpX shape, so validation that succeeded
+                // on `normalized` (the earlier `check_exp` call in this
+                // fn) succeeds on `coerced`. `Validated::check` is
+                // deterministic; propagating its Err handles any
+                // unexpected drift.
                 Ok(LExpr::span_mark(
                     format_rust_loc(&ens.span),
                     AssertKind::Obligation(ObligationKind::Postcondition),
-                    lower_validated(&Validated::check(&rewritten)?),
+                    lower_validated(&Validated::check(&coerced)?),
                 ))
             }).collect::<Result<Vec<_>, String>>()?
         );
@@ -735,23 +739,30 @@ pub fn exec_fn_theorems_to_ast<'a>(
         &mut_param_names,
     );
 
+    // Insert `Clip { range: Nat }` at Call sites where args render as
+    // Lean Int but params render as Lean Nat (BUG-as-nat-cast.md).
+    // Verus's cast lowering drops `U(_)/USize → Nat` casts as no-ops;
+    // we add them back here. See `insert_nat_coercions_in_stm`.
+    let fn_map: FnMap = krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
+    let coerced_body: Stm = insert_nat_coercions_in_stm(&rewritten_body, &fn_map);
+
     // `WpCtx::new` validates reqs / ens_exps before rendering them.
-    // It also applies the same rewrite to each ens_exp so the
+    // It also applies the same rewrites to each ens_exp so the
     // `ensures_goal` LExpr already has the synthetic names baked in.
     let ctx = WpCtx::new(krate, check, &mut_param_names)?;
 
     let mut binders = build_param_binders(fn_sst);
     binders.extend(build_borrow_mut_binders(check));
-    binders.extend(build_req_binders(check, &mut_param_names));
+    binders.extend(build_req_binders(check, &mut_param_names, &fn_map));
 
-    // Build the whole WP tree from the (rewritten) body, with the
-    // fn's ensures as the natural continuation at the leaves.
+    // Build the whole WP tree from the (rewritten + coerced) body,
+    // with the fn's ensures as the natural continuation at the leaves.
     // `Return` statements inside the body replace their local `after`
     // with the same ensures goal (via `ctx.ensures_goal`). Initial
     // loop_stack is empty — break/continue are rejected outside any
     // loop.
     let body_wp = build_wp(
-        &rewritten_body,
+        &coerced_body,
         Wp::Done(ctx.ensures_goal.clone()),
         &ctx,
         &LoopStack::Empty,
@@ -2156,6 +2167,155 @@ fn normalize_mut_ref_in_stm(
     })
 }
 
+// ── Nat coercion insertion (BUG-as-nat-cast.md) ────────────────────────
+//
+// At every `Call` site, insert `Clip { range: Nat }` around args whose
+// Lean type renders as `Int` but whose corresponding callee param
+// renders as `Nat`. Closes the bug where `f(i as nat)` for `i : u64`
+// lowered to `f i` in Lean (Int → Nat type mismatch) because Verus's
+// `fn_call_to_vir.rs` drops `U(_)/USize → Nat` casts as no-ops.
+//
+// The no-op is sound for Z3 (which sees both u_N and nat as `Int` with
+// refinements), but unsound for Lean (distinct types). We can't always-
+// emit Clip in Verus because 7 vstd bit-shift lemmas rely on Z3 silently
+// equating `x` and `clip(Nat, x)` for u-typed x — adding Clip globally
+// breaks their calc-style proofs. So we run a Tactus-side normalization
+// pass that operates only on Lean-bound code.
+//
+// **Pattern.** This is the fourth Tactus-side normalization (sibling
+// to #94 rewrite_varat_for_mut_params, #95 normalize_mut_ref, and
+// #127's original_cond recovery in build_wp_loop): Verus's pipeline
+// produces a shape that's right for SMT but wrong for Lean, so we fix
+// it up at fn entry before rendering.
+//
+// **Cases (`needs_nat_coercion`):**
+//   * U(_)/I(_)/ISize/Int (renders as Lean Int) → Nat/USize/Char
+//     (renders as Lean Nat): insert Clip(Nat). This is the bug fix
+//     surface — primarily `u_N → nat`.
+//   * USize/Char/Nat (renders as Nat) → Nat: skip — both already
+//     render as Nat, no Lean-level coercion needed.
+//   * Same-side or non-Int types: skip.
+//
+// Cross-crate callees aren't in `fn_map`; we skip those (the call
+// would hit cross-crate rejection downstream regardless). Mismatched
+// arity also short-circuits — defensive against trait-method shapes
+// where Verus's resolution may produce arg/param count divergence.
+fn insert_nat_coercions_in_exp(exp: &Exp, fn_map: &FnMap) -> Exp {
+    vir::sst_visitor::map_exp_visitor(exp, &mut |e: &Exp| {
+        rewrite_one_call_for_coercions(e, fn_map)
+    })
+}
+
+fn insert_nat_coercions_in_stm(stm: &Stm, fn_map: &FnMap) -> Stm {
+    vir::sst_visitor::map_exps_in_stm_visitor(stm, &mut |e: &Exp| {
+        rewrite_one_call_for_coercions(e, fn_map)
+    })
+}
+
+/// SST leaf rewrite for the nat-coercion pass. At a Call node, look up
+/// the callee in `fn_map` and wrap each arg that needs `Int.toNat`
+/// coercion in a synthetic `Clip { range: Nat }` node.
+fn rewrite_one_call_for_coercions(e: &Exp, fn_map: &FnMap) -> Exp {
+    let ExpX::Call(callfun, typs, args) = &e.x else { return e.clone() };
+    // Only direct Fun calls (and self-recursion) have a Fun we can look up
+    // in fn_map. InternalFun calls (CheckDecreaseHeight etc.) don't apply.
+    let fun = match callfun {
+        CallFun::Fun(f, _) | CallFun::Recursive(f) => f,
+        CallFun::InternalFun(_) => return e.clone(),
+    };
+    let Some(callee) = fn_map.get(fun) else {
+        // Cross-crate or otherwise unknown callee.
+        return e.clone();
+    };
+    if callee.params.len() != args.len() {
+        // Arity mismatch — bail; the renderer will surface a real
+        // mismatch as a Lean elaboration error if there is one.
+        return e.clone();
+    }
+    let new_args: Vec<Exp> = args.iter().zip(callee.params.iter())
+        .map(|(arg, param)| {
+            if needs_nat_coercion(&arg.typ, &param.x.typ) {
+                wrap_in_nat_clip_exp(arg)
+            } else {
+                arg.clone()
+            }
+        })
+        .collect();
+    SpannedTyped::new(
+        &e.span,
+        &e.typ,
+        ExpX::Call(callfun.clone(), typs.clone(), Arc::new(new_args)),
+    )
+}
+
+/// VIR-AST counterpart of `insert_nat_coercions_in_exp` — applies to
+/// proof fn `require`/`ensure` and spec fn bodies that route through
+/// the VIR-AST renderer (`vir_expr_to_ast`).
+pub fn insert_nat_coercions_in_expr(expr: &Expr, fn_map: &FnMap) -> Expr {
+    map_expr_visitor(expr, &|e: &Expr| {
+        Ok(rewrite_one_call_for_coercions_expr(e, fn_map))
+    })
+    // Leaf only constructs valid Call/Clip nodes — cannot error.
+    .expect("nat-coercion rewrite is structural")
+}
+
+fn rewrite_one_call_for_coercions_expr(e: &Expr, fn_map: &FnMap) -> Expr {
+    let ExprX::Call(target, args, extra) = &e.x else { return e.clone() };
+    let CallTarget::Fun(_, fun, _, _, _, _) = target else { return e.clone() };
+    let Some(callee) = fn_map.get(fun) else {
+        return e.clone();
+    };
+    if callee.params.len() != args.len() {
+        return e.clone();
+    }
+    let new_args: Vec<Expr> = args.iter().zip(callee.params.iter())
+        .map(|(arg, param)| {
+            if needs_nat_coercion(&arg.typ, &param.x.typ) {
+                wrap_in_nat_clip_expr(arg)
+            } else {
+                arg.clone()
+            }
+        })
+        .collect();
+    SpannedTyped::new(
+        &e.span,
+        &e.typ,
+        ExprX::Call(target.clone(), Arc::new(new_args), extra.clone()),
+    )
+}
+
+/// True when `arg_typ` renders as Lean `Int` but `param_typ` renders as
+/// Lean `Nat` — the case where Tactus needs to wrap the arg in a
+/// `Clip { range: Nat }` node so the renderer emits `Int.toNat`.
+///
+/// Both types must be `TypX::Int(_)` after peeling transparent wrappers
+/// (`Boxed`, `Decorate`); non-int types fall through (the renderer
+/// handles them directly). Peeling matches what `typ_to_expr` does at
+/// rendering time — so the predicate's view of "renders as Int/Nat" is
+/// aligned with what the renderer would actually emit.
+fn needs_nat_coercion(arg_typ: &Typ, param_typ: &Typ) -> bool {
+    let arg_peeled = crate::to_lean_type::peel_typ_wrappers(arg_typ);
+    let param_peeled = crate::to_lean_type::peel_typ_wrappers(param_typ);
+    let TypX::Int(arg_range) = &**arg_peeled else { return false };
+    let TypX::Int(param_range) = &**param_peeled else { return false };
+    renders_as_lean_int(arg_range) && !renders_as_lean_int(param_range)
+}
+
+/// Build a synthetic `Clip { range: Nat }` node wrapping `arg`. Same
+/// shape Verus's `mk_ty_clip` would have produced if `fn_call_to_vir.rs`
+/// hadn't taken the no-op shortcut for U/USize → Nat casts.
+fn wrap_in_nat_clip_exp(arg: &Exp) -> Exp {
+    let clip_op = UnaryOp::Clip { range: IntRange::Nat, truncate: true };
+    let nat_typ: Typ = Arc::new(TypX::Int(IntRange::Nat));
+    SpannedTyped::new(&arg.span, &nat_typ, ExpX::Unary(clip_op, arg.clone()))
+}
+
+fn wrap_in_nat_clip_expr(arg: &Expr) -> Expr {
+    let clip_op = UnaryOp::Clip { range: IntRange::Nat, truncate: true };
+    let nat_typ: Typ = Arc::new(TypX::Int(IntRange::Nat));
+    SpannedTyped::new(&arg.span, &nat_typ, ExprX::Unary(clip_op, arg.clone()))
+}
+
 /// Per-obligation walker for `Wp::Call`. Splits the call's
 /// obligations across separate theorems and pushes post-call
 /// frames onto the obligation context.
@@ -3043,7 +3203,11 @@ fn build_borrow_mut_binders(check: &FuncCheckSst) -> Vec<LBinder> {
 /// new-mut-ref shapes (`MutRefCurrent(Var(x))` → `Var(x)`) for these
 /// params before rendering — at fn entry, x IS the pre-state, so the
 /// natural `Var(x)` is what the renderer needs (#95).
-fn build_req_binders(check: &FuncCheckSst, mut_param_names: &HashSet<String>) -> Vec<LBinder> {
+fn build_req_binders(
+    check: &FuncCheckSst,
+    mut_param_names: &HashSet<String>,
+    fn_map: &FnMap,
+) -> Vec<LBinder> {
     check.reqs.iter().enumerate().map(|(i, req)| {
         // `CurrentIsLocal` phase: unwrap `MutRefCurrent` to `Var` since
         // `*x` in requires evaluates against the param's entry value,
@@ -3053,15 +3217,21 @@ fn build_req_binders(check: &FuncCheckSst, mut_param_names: &HashSet<String>) ->
             mut_param_names,
             NormalizePhase::CurrentIsLocal,
         );
+        // Insert Int.toNat coercions at Call sites where args render
+        // as Lean Int but params render as Lean Nat
+        // (BUG-as-nat-cast.md). Same pass as for the body and ensures.
+        let coerced = insert_nat_coercions_in_exp(&normalized, fn_map);
         // The same `normalized` shape was validated in `WpCtx::new`
         // (the same caller that just succeeded earlier in this fn);
-        // `normalize_mut_ref_in_exp` is deterministic, so re-running
-        // here produces the identical Exp. Re-checking is cheap and
-        // would only fail on validator drift between WpCtx::new and
-        // here — which would mean a Verus-side ordering bug.
+        // both `normalize_mut_ref_in_exp` and
+        // `insert_nat_coercions_in_exp` are deterministic, so re-running
+        // here produces an identical (coerced) Exp. Re-checking is
+        // cheap and would only fail on validator drift between
+        // WpCtx::new and here — which would mean a Verus-side
+        // ordering bug.
         LBinder {
             name: Some(crate::lean_name::LeanName::synthetic(format!("h_req{}", i))),
-            ty: sst_exp_to_ast_checked(&normalized)
+            ty: sst_exp_to_ast_checked(&coerced)
                 .expect("build_req_binders: req validated by WpCtx::new"),
             kind: BinderKind::Explicit,
         }

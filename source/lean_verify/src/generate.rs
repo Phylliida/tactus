@@ -306,14 +306,18 @@ fn krate_preamble(
         cmds.extend(to_lean_fn::datatype_group_to_cmds(&group, emit_accessors, &external_body_paths));
     }
 
+    // Build fn_map once for the nat-coercion pre-pass (BUG-as-nat-cast.md)
+    // applied inside spec_fn_to_ast / trait emission / proof_fn_to_ast.
+    let fn_map: crate::sst_to_lean::FnMap =
+        krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
     for group in &groups {
         match group {
             FnGroup::Single(f) => {
-                cmds.push(to_lean_fn::spec_fn_to_ast(f));
+                cmds.push(to_lean_fn::spec_fn_to_ast(f, &fn_map));
             }
             FnGroup::Mutual(fns) => {
                 let inner: Vec<Command> = fns.iter()
-                    .map(|f| to_lean_fn::spec_fn_to_ast(f))
+                    .map(|f| to_lean_fn::spec_fn_to_ast(f, &fn_map))
                     .collect();
                 cmds.push(Command::Mutual(inner));
             }
@@ -389,7 +393,14 @@ pub fn check_proof_fn(
     let (mut cmds, ns) = krate_preamble(
         krate, imports, crate_name, &[proof_fn], PreambleConfig::ProofFn, &[], tactic_bodies,
     );
-    cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body)));
+    // Build fn_map for nat-coercion insertion (BUG-as-nat-cast.md).
+    // The pass at fn entry rewrites Call args so Int → Nat parameter
+    // mismatches get an explicit `Int.toNat`. Built locally here (vs.
+    // threading through krate_preamble) since proof_fn_to_ast is called
+    // outside the preamble.
+    let fn_map: sst_to_lean::FnMap =
+        krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
+    cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body, &fn_map)));
     cmds.push(Command::NamespaceClose(ns));
 
     // Pretty-print and write the .lean file BEFORE the sanity check.

@@ -161,11 +161,11 @@ Candidates noted from prior audits but not yet promoted. Each is a runtime-check
 
 Pieces of infrastructure that, if built, would simplify or unify existing code. Distinct from the typed-invariant section above — those are patterns to apply at specific sites; these are *new structure* that would replace ad-hoc compositions.
 
-* **`RewritePipeline` for SST→SST passes.** Tactus runs several SST→SST rewrite passes inside `exec_fn_theorems_to_ast` (in `sst_to_lean.rs`): `normalize_mut_ref_in_stm` (#95) maps new-mut-ref shapes back to legacy form; `rewrite_varat_for_mut_params_in_stm` (#94) renames pre-state references; `is_synthetic_assume_to_drop` filters out Verus-internal `Assume(HasResolved(...))` / closure-spec assumes during walk. They compose by being called in sequence in the orchestrator (so the order is implicit in the Rust source).
+* **`RewritePipeline` for SST→SST passes.** Tactus runs several SST→SST rewrite passes inside `exec_fn_theorems_to_ast` (in `sst_to_lean.rs`): `normalize_mut_ref_in_stm` (#95) maps new-mut-ref shapes back to legacy form; `rewrite_varat_for_mut_params_in_stm` (#94) renames pre-state references; `insert_nat_coercions_in_stm` (BUG-as-nat-cast.md, 2026-05-15) inserts `Clip(Nat, _)` at Call sites where args render as Lean Int but params render as Lean Nat; `is_synthetic_assume_to_drop` filters out Verus-internal `Assume(HasResolved(...))` / closure-spec assumes during walk. They compose by being called in sequence in the orchestrator (so the order is implicit in the Rust source).
 
-  A typed pipeline — e.g., `RewritePipeline::new().drop_synthetic_assumes().normalize_mut_ref(&params).rewrite_varat(&params).run(stm)` — would make the data flow explicit, let new passes be added without touching the orchestrator, and surface ordering invariants (e.g., "normalize before rewrite") as compile errors when a new pass is inserted in the wrong place.
+  A typed pipeline — e.g., `RewritePipeline::new().drop_synthetic_assumes().normalize_mut_ref(&params).rewrite_varat(&params).insert_nat_coercions(&fn_map).run(stm)` — would make the data flow explicit, let new passes be added without touching the orchestrator, and surface ordering invariants (e.g., "normalize before rewrite") as compile errors when a new pass is inserted in the wrong place.
 
-  Current cost-benefit: borderline. The three current passes are stable and the orchestrator is one call site. The win shows up when the next rewrite lands (likely a candidate: a pass that strips synthetic `BuiltinSpecFun::ClosureReq` calls at spec position, for #124's exec-mode closure calls if that ever unblocks upstream).
+  Current cost-benefit: borderline. The four current passes are stable and the orchestrator is one call site. The win shows up when the next rewrite lands (likely a candidate: a pass that strips synthetic `BuiltinSpecFun::ClosureReq` calls at spec position, for #124's exec-mode closure calls if that ever unblocks upstream).
 
 ### Mutual recursion (user-specified)
 
@@ -1183,6 +1183,27 @@ recursion pass covers all cross-fn calls in the cycle the same way.
 * **Non-int decreases** — datatype-typed decreases via emitted
   `T.height` companion fn (see #54 in Tier 2). Int decreases work
   via the transparent-identity `height` for ints.
+
+### U → Nat coercion at Call sites (BUG-as-nat-cast.md, LANDED 2026-05-15)
+
+Verus's `fn_call_to_vir.rs` cast lowering drops `U(_) → Nat` and `USize → Nat` casts as no-ops. This is sound for Z3 (which treats u_N and `nat` as `Int` with refinements) but unsound for Lean: Tactus renders `u_N` as Lean `Int` and `nat` as Lean `Nat`, so `f(i as nat)` for `i : u64` was lowering to `f i` where `i : Int` — fails Lean's type check.
+
+**Fix**: Tactus-side normalization pass `insert_nat_coercions_in_{exp,stm,expr}` runs at fn entry. At each `Call` node, looks up the callee in `fn_map`; for any arg whose Verus type renders as Lean `Int` but whose callee param type renders as Lean `Nat`, wraps the arg in a synthetic `UnaryOp::Clip { range: Nat }` node. The renderer's existing Clip handler (`clip_to_node_checked` in `to_lean_sst_expr.rs`) then emits `Int.toNat` correctly.
+
+**`needs_nat_coercion` predicate.** Peels transparent wrappers (`Boxed`, `Decorate`) via `peel_typ_wrappers` to match what `typ_to_expr` does at rendering time. Then checks `renders_as_lean_int(arg_range) && !renders_as_lean_int(param_range)`. The wrapper peel matters: SST args often arrive as `Boxed(Int(U(64)))` from Verus's poly encoding pass, and skipping the peel would miss them — surfaced by `test_exec_assert_u64_as_nat` during initial implementation.
+
+**Why a pre-pass, not a Verus-side change.** Always-emitting Clip at fn_call_to_vir.rs breaks 7 vstd lemmas in `vstd/bits.rs` (the bit-shift macros: `lemma_*_shr_is_div`, `lemma_*_shl_is_mul`). Their calc-style proofs rely on Z3 silently equating `x` and `clip(Nat, x)` for u-typed `x`; adding Clip globally changes Z3's view enough to break the proof shape. The pre-pass runs only on Tactus-bound code, so Verus's Z3 path stays untouched and vstd continues to verify 1530/0.
+
+**Sites the pre-pass fires at**:
+* `exec_fn_theorems_to_ast`: body via `insert_nat_coercions_in_stm`; ens_exps and reqs via `insert_nat_coercions_in_exp` (inside `WpCtx::new` and `build_req_binders`).
+* `proof_fn_to_ast`: require / ensure / decrease clauses via `insert_nat_coercions_in_expr` (VIR-AST level).
+* `spec_fn_to_ast`: body + termination_by via `insert_nat_coercions_in_expr`. A spec fn may call another spec fn whose params are nat-typed.
+
+**Pattern symmetry.** This is the fourth Tactus-side normalization (sibling to #94 `rewrite_varat_for_mut_params`, #95 `normalize_mut_ref`, and #127's `original_cond` recovery in `build_wp_loop`). The recurring shape: *Verus's pipeline produces an output that's right for SMT but wrong for Lean; Tactus runs a normalization pass at fn entry to fix it.* Listed under "Potential future infrastructure → RewritePipeline" as a candidate for typed-pipeline refactoring.
+
+**Cross-crate callees** aren't in `fn_map`; they fall through unchanged. This matches existing cross-crate behavior (`build_wp_call`'s `pick_spec_source` rejects cross-crate trait method decls; the same call path also fails the coercion fix). Cross-crate spec fn inlining (#122 Phase 3) would need to extend `fn_map` to cover these.
+
+**Pinned tests**: `test_proof_fn_u64_as_nat_in_ensures` (minimal reproducer from bug doc, VIR-AST path); `test_proof_fn_u_types_as_nat` (u8/u16/u32/u128 all coerce); `test_proof_fn_both_sides_as_nat` (both sides of `==`); `test_exec_assert_u64_as_nat` (SST path via exec assert); `test_exec_loop_invariant_u64_as_nat` (loop invariant via SST visitor).
 
 ### `_tactus_d_old` aliasing across nested loops
 
