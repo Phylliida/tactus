@@ -127,7 +127,7 @@ impl LeanSourceMap {
 /// body=None fns out — which produced "unresolved" sanity-check
 /// rejections at the call site. Audit 2026-05-12 unfiltered the map
 /// and routes through `Axiom` here.)
-pub fn spec_fn_to_ast(f: &FunctionX) -> Command {
+pub fn spec_fn_to_ast(f: &FunctionX, fn_map: &crate::sst_to_lean::FnMap) -> Command {
     // Spec fns are Lean defs (mathematical definitions). The
     // u-type / i-type refinement bounds belong on theorems
     // (proof fns + exec fn obligations), not on the spec fn's
@@ -145,8 +145,16 @@ pub fn spec_fn_to_ast(f: &FunctionX) -> Command {
             } else {
                 vec![]
             };
-            let body = vir_expr_to_ast(b);
-            let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| vir_expr_to_ast(d)).collect();
+            // Insert Int.toNat coercions at Call sites where args render
+            // as Lean Int but params render as Lean Nat
+            // (BUG-as-nat-cast.md). A spec fn body may call other spec
+            // fns whose params are nat-typed.
+            let coerced_body = crate::sst_to_lean::insert_nat_coercions_in_expr(b, fn_map);
+            let body = vir_expr_to_ast(&coerced_body);
+            let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| {
+                let coerced = crate::sst_to_lean::insert_nat_coercions_in_expr(d, fn_map);
+                vir_expr_to_ast(&coerced)
+            }).collect();
             Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by })
         }
         None => Command::Axiom(Axiom { name, binders, ret_ty, attrs: vec![] }),
@@ -156,21 +164,39 @@ pub fn spec_fn_to_ast(f: &FunctionX) -> Command {
 // ── Proof fn ────────────────────────────────────────────────────────────
 
 /// Build a `Theorem` AST node for a proof fn with the given tactic text.
-pub fn proof_fn_to_ast(f: &FunctionX, tactic_body: &str) -> Theorem {
+///
+/// `fn_map` is consulted to insert `Int.toNat` coercions at Call sites
+/// where args render as Lean `Int` but the callee's params render as
+/// Lean `Nat` (BUG-as-nat-cast.md). Pass an empty map if no fn-map
+/// info is available; the only effect is that uncoerced Int → Nat
+/// calls would fail Lean elaboration (matching the pre-fix state).
+pub fn proof_fn_to_ast(
+    f: &FunctionX,
+    tactic_body: &str,
+    fn_map: &crate::sst_to_lean::FnMap,
+) -> Theorem {
     let mut binders = fn_binders(f);
     for (i, req) in f.require.iter().enumerate() {
+        // Insert Int.toNat coercions at Call sites where needed.
+        let coerced = crate::sst_to_lean::insert_nat_coercions_in_expr(req, fn_map);
         binders.push(LBinder {
             name: Some(crate::lean_name::LeanName::synthetic(format!("h{}", i))),
-            ty: vir_expr_to_ast(req),
+            ty: vir_expr_to_ast(&coerced),
             kind: BinderKind::Explicit,
         });
     }
-    let goal = and_all(f.ensure.0.iter().map(|e| vir_expr_to_ast(e)).collect());
+    let goal = and_all(f.ensure.0.iter().map(|e| {
+        let coerced = crate::sst_to_lean::insert_nat_coercions_in_expr(e, fn_map);
+        vir_expr_to_ast(&coerced)
+    }).collect());
     // Honor Verus's `decreases` clause for recursive proof fns. Lean often
     // auto-infers termination for simple structural recursion, but cases
     // where the measure is non-obvious (Collatz, lex pairs, computed
     // descent) require the explicit clause. Mirrors `spec_fn_to_ast`.
-    let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| vir_expr_to_ast(d)).collect();
+    let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| {
+        let coerced = crate::sst_to_lean::insert_nat_coercions_in_expr(d, fn_map);
+        vir_expr_to_ast(&coerced)
+    }).collect();
     Theorem {
         name: lean_name(&f.name.path),
         binders,

@@ -9756,6 +9756,97 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === U → Nat coercion at Call sites (BUG-as-nat-cast.md) ===
+//
+// Verus's `fn_call_to_vir.rs` drops `U(_) → Nat` casts as no-ops
+// (sound for Z3, unsound for Lean where Int and Nat are distinct
+// types). Pre-fix, `f(i as nat)` for `i : u64` lowered to `f i`
+// where `i : Int`, failing Lean type-checking. Post-fix, Tactus's
+// `insert_nat_coercions_in_*` pass at fn entry inserts a synthetic
+// `Clip(Nat, _)` node that the renderer turns into `Int.toNat`.
+
+// Minimal reproducer from BUG-as-nat-cast.md: proof fn ensures
+// passes a u64 to a nat-typed spec fn param.
+test_verify_one_file! {
+    #[test] test_proof_fn_u64_as_nat_in_ensures verus_code! {
+        spec fn id_nat(n: nat) -> nat { n }
+
+        proof fn lemma_u64_as_nat(i: u64)
+            ensures id_nat(i as nat) >= 0
+        by {
+            omega
+        }
+    } => Ok(())
+}
+
+// Same shape with multiple u-types as the source of the cast.
+test_verify_one_file! {
+    #[test] test_proof_fn_u_types_as_nat verus_code! {
+        spec fn id_nat(n: nat) -> nat { n }
+
+        proof fn lemma_u_types(a: u8, b: u16, c: u32, d: u128)
+            ensures id_nat(a as nat) >= 0, id_nat(b as nat) >= 0,
+                    id_nat(c as nat) >= 0, id_nat(d as nat) >= 0
+        by {
+            omega
+        }
+    } => Ok(())
+}
+
+// Both LHS and RHS of `==` cast to nat — the doc notes both are
+// dropped. With the coercion pass, both render as `Int.toNat`.
+// This shape is the canonical "factorial-style spec match" pattern.
+// `subst` + `rfl` closes — `omega` alone can't do congruence over
+// function application (treats `f x` as opaque).
+test_verify_one_file! {
+    #[test] test_proof_fn_both_sides_as_nat verus_code! {
+        spec fn f(n: nat) -> nat { n }
+
+        proof fn lemma_eq(i: u64, j: u64)
+            requires i == j
+            ensures f(i as nat) == f(j as nat)
+        by {
+            subst h0
+            rfl
+        }
+    } => Ok(())
+}
+
+// Cast inside an exec-fn `assert(...)` — exercises the SST path.
+test_verify_one_file! {
+    #[test] test_exec_assert_u64_as_nat verus_code! {
+        spec fn id_nat(n: nat) -> nat { n }
+
+        #[verifier::tactus_auto]
+        fn touches_u64(i: u64) {
+            assert(id_nat(i as nat) >= 0);
+        }
+    } => Ok(())
+}
+
+// Cast inside an exec-fn loop invariant — also SST path, plus
+// per-obligation theorem emission for the invariant.
+test_verify_one_file! {
+    #[test] test_exec_loop_invariant_u64_as_nat verus_code! {
+        spec fn id_nat(n: nat) -> nat { n }
+
+        #[verifier::tactus_auto]
+        fn loop_with_cast(n: u64)
+            requires n <= 100
+        {
+            let mut i: u64 = 0;
+            while i < n
+                invariant
+                    i <= n,
+                    id_nat(i as nat) >= 0,
+                decreases n - i
+            {
+                i = i + 1;
+            }
+        }
+    } => Ok(())
+}
+
 // Test B: recursive proof fn — body recursively invokes itself in Lean,
 // gated by a case-split. `termination_by n` is what makes the recursive
 // call's measure visible to Lean's well-foundedness check. Lean's
