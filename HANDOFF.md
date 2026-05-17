@@ -3009,7 +3009,12 @@ future sessions):
   rejects mixed shapes today; the rejection isn't tested
   explicitly but follows from the recursive Field peel rejecting
   `Dt::Tuple` at deeper levels and the single-level tuple gate
-  rejecting any non-Var/VarLoc base.
+  rejecting any non-Var/VarLoc base. **Closed 2026-05-11**
+  (`73d1dd6`): `MutTargetRaw::TupleField` was retired in favour of
+  per-step `Dt::Path`/`Dt::Tuple` dispatch inside the unified
+  `Field { field_oprs }` rebind. Pinned by
+  `test_exec_call_mut_arg_struct_then_tuple`, `_tuple_then_struct`,
+  `_mixed_path_siblings_preserved`.
 
 * **`&mut v[i]` (Index L-value)**: cross-crate-blocked. Rust's
   `v[i]` for `Vec<T>` desugars to `vstd::vec::Vec::index_mut`,
@@ -4935,24 +4940,32 @@ callee-side, #107 new-mut-ref caller-side, #110 lex decreases,
 field mutation). The 2026-05-08 session closed all 8 REVIEW.md
 file-for-follow-up items plus 4 right-way structural cleanups
 plus 5 caller-side-and-field-path sub-feature landings. The #106
-umbrella is effectively done from Tactus's side: tuple + deeper
-field paths landed; multi-variant enum upstream-blocked; Index
-L-value cross-crate-blocked. Pending count: **8 across 5 themes**.
-None is on the critical path for realistic code today.
+umbrella is now fully done from Tactus's side: tuple + deeper
+field paths LANDED (#144 / #145 / #146); mixed paths LANDED
+(`73d1dd6`); multi-variant enum upstream-blocked; Index L-value
+cross-crate-blocked. Pending count: **6 across 4 themes**. None
+is on the critical path for realistic code today.
 
 The full catalogue lives in DESIGN.md § "Known deferrals, rejected
 cases, and untested edges" — this section summarizes the task
 themes:
 
-### Feature deferrals with clear shape (3 pending)
+### Feature deferrals with clear shape (1 pending)
 
-- **#106** &mut at call sites for non-Var L-values (umbrella for
-  Index, deeper paths, multi-variant enum, tuple field).
-- **#107** caller-side new-mut-ref mode (synthetic MutRef-typed
-  locals around exec calls).
 - **#112** StmX::OpenInvariant (atomic invariants for concurrency).
 
-Closed: #108 / #109 / #111 / #130 (2026-05-05); **#113**
+Closed: **#106** &mut at call sites for non-Var L-values umbrella
+— all Tactus-workable sub-features landed: tuple field LANDED
+(#145 + #146); deeper field paths LANDED (#144); mixed tuple-and-
+struct paths `&mut s.tup.0` / `&mut t.0.f` LANDED (`73d1dd6`,
+2026-05-11); multi-variant enum field mutation upstream-blocked at
+Verus's `ref mut` mode check; `&mut v[i]` Index L-value cross-
+crate-blocked (Vec/array indexing routes through vstd, #122
+dependency). **#107** caller-side new-mut-ref mode LANDED
+(2026-05-08) — BorrowMut locals fold into the existing
+`mut_param_names` set via `build_borrow_mut_binders` +
+`mut_ref_locals` field on `WpCtx`. #108 / #109 / #111 / #130
+(2026-05-05); **#113**
 BinaryOp::StrGetChar (2026-05-11) — `Tactus.strGetChar` prelude
 helper replaces the incorrect `String.get` head emitted by
 `non_binop_head`; both VIR-AST and SST renderer paths now lower
