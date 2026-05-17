@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**346 end-to-end tests + 1 coverage test + 180 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**415 end-to-end tests + 1 coverage test + 195 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -4086,6 +4086,346 @@ revisiting (load-bearing profile, upstream `StmX::Loop` mod
 stashing, or a general `WpCtx`-style accumulator that all
 variants already touch). Same audit-sweep shape: net 0 code
 changes, deliverable is doc clarity. #117 closed.
+
+#### Current session (2026-05-12 — NonLinear, body-less spec fns, cross-crate audit, trait gate, external_body)
+
+Long arc: several substantial landings that reshape how Tactus
+handles spec-fn emission, trait emission, and cross-crate scope.
+
+**`AssertQueryMode::NonLinear` lowering — LANDED.** Verus's
+`assert(P) by(nonlinear_arith)` now routes through a new
+`Wp::AssertQuery { primary, preamble, body, after }` variant
+carrying mode-specific tactic + preamble fragments. The walker
+composes the full closer at scope-entry time:
+`first | (intros; primary) | (<outer_closer>) | fail "<scope msg>"`.
+`obl.new_scope(closer, preamble)` installs the composed closer +
+preamble and drops enclosing-scope Hyps (matching Verus's
+NonLinear query semantics — only requires + typ invariants are
+in scope). Every theorem the body's recursive walk emits picks
+them up. The trailing `fail` overrides Lean's last-failure-wins
+reporting so users see "by(nonlinear_arith) scope: could not
+close" instead of `tactus_auto`'s misdirected fallback. Generic
+over `primary` — future query modes (Polyrith etc.) reuse
+`Wp::AssertQuery` with a different tactic. (Any such future mode
+is **upstream-blocked**, not Tactus homework — Verus's
+`AssertQueryMode` enum only accepts the corresponding surface
+syntaxes.) Pinned by `test_exec_assert_nonlinear_commutative`,
+`_with_requires`, `_with_proof_block`, `_scope_resets`,
+`_inside_loop`, `_nested_scopes`, `_wrong` (negative, also pins
+the scope-named failure message). Shape-drift guards:
+`ast_to_sst_emits_assume_assert_for_nonlinear_body` (Verus's body
+shape) + `nonlinear_preamble_fragments_shape_pinned` (Mathlib
+import path).
+
+**Body-less spec fn emission as Lean axiom — LANDED.** Pre-fix,
+`spec_fn_to_ast` returned `Command::Def(..., body: sorry)` for
+body=None fns (`pub uninterp spec fn`, external_body spec fns,
+cross-crate spec fns whose body was stripped). But dep_order's
+`build_spec_fn_map` filtered body=None fns BEFORE they reached
+emission — so the sorry branch was dead code, and at call sites
+the reference was unresolved. Audit removed the filter and routes
+through `Command::Axiom { name, binders, ret_ty, attrs }`. Lean's
+`axiom` is the right encoding: declares a constant whose value is
+unspecified, matching Verus's "this is just a symbol with a type"
+semantics. Surfaced by #122 cross-crate probe 6 (local
+`pub uninterp spec fn` reference); test name
+`test_uninterp_spec_fn_referenced_from_proof`.
+
+**#122 cross-crate audit (probes 1-6) + sanity check returns Err
+not panic — LANDED.** The cross-crate verification task was
+originally framed as a major Phase 3 feature (CrateDecls.lean
+file generation). Audit 2026-05-12 established that
+`merge_krates` already brings imported crates' fns into the
+merged `vir_crate` Tactus receives, and `export_crate` preserves
+`pub open spec fn` bodies. Probes 1-3 (`pub open spec fn` calls
+from vstd) work end-to-end. Probe 4 (`Option<u8>` via
+`vstd::prelude::*`) works. Probe 6 (local `pub uninterp spec fn`)
+works after the body-less emission fix above. The genuine
+remaining gap is Probe 5 (`vstd::seq::Seq` external_body type
+emission) — see external_body section below. **#122 framing was
+too pessimistic**; the `CrateDecls.lean`-per-file infrastructure
+isn't blocking. Narrower fix items tracked: #125 cross-crate
+trait method decls, external-body type opaque emission, dynamic
+dispatch.
+
+Concurrent **sanity check now returns Err instead of panicking**.
+`debug_check` originally panicked on unresolved references,
+killing the test-harness process and preventing graceful error
+reporting. Now returns `Result<(), String>` propagated as
+`CheckResult::Failed`. Test pinning becomes possible: probe
+tests can assert specific sanity-error patterns via `=> Err(_)`.
+Pre-fix the panic was either masked by accidental cmd ordering or
+by test harness signal handling — neither was reliable. Also
+inverted the order: pp + write to disk BEFORE sanity, so the
+generated `.lean` is always on disk for inspection even when
+sanity rejects.
+
+**Trait class + instance emission rework — LANDED.** Pre-rework,
+the trait Instance emission gate was correlated-by-accident with
+method-reach (traits only entered `refs.traits` when an impl
+method body was walked). Body-less spec fn emission broke that
+correlation, surfacing the latent design flaw. New explicit gate:
+emit `instance : Tr T` iff BOTH `refs.traits.contains(Tr)` AND
+`refs.datatypes.contains(T)`. The class emission gate becomes a
+co-dependent: emit `class Tr` if EITHER `refs.traits` contains it
+OR any instance of `Tr` will emit. Class-defaults work landed
+alongside this: spec-mode methods with a trait-side default body
+get `default` rendered via `vir_expr_to_ast` (load-bearing for
+Lean typeclass dispatch); exec/proof methods get the placeholder
+`default` (their bodies aren't load-bearing — `walk_call` inlines
+specs, not bodies via typeclass dispatch). Shared
+`call_inlining::collect_inlined_at_call` abstraction concentrates
+the trait-method spec-source resolution (handles
+`TraitMethodImpl → kind.method` cross-crate fallback). See
+DESIGN.md § "Trait class and instance emission".
+
+**External-body type opaque emission — LANDED.** Types declared
+`#[verifier::external_body]` (canonical: `vstd::seq::Seq`,
+`vstd::set::Set`, `vstd::map::Map`) emit as opaque axioms
+rather than empty `structure` declarations. Pre-fix, the empty-
+struct emission gave every external_body type a unique inhabitant
+(`T.mk`), so any two values collapsed via `cases x; cases y; rfl`
+— a real soundness gap. Shape: `axiom T : Type` (or
+`axiom T : Type → Type` for generics) plus
+`@[instance] axiom T.instInhabited : Inhabited T`. Inhabited is
+required when an external_body type is a field of another
+datatype (accessor fallbacks `default` need `[Inhabited (T A)]`).
+Downstream: parent datatypes with external_body fields drop
+`deriving Inhabited` (axiom-backed defaults aren't computable)
+and get a manual `noncomputable instance` instead. Pinned by
+`test_external_body_soundness_gap_probe` (empty-struct exploit
+now fails to verify — the canonical hole closed),
+`test_external_body_distinct_applications_collapse_probe`,
+`test_external_body_embedded_in_enum`,
+`test_cross_crate_probe_5_seq_in_spec` (vstd::seq::Seq emits as
+opaque axiom — closer behavior unchanged for the documented
+axiomatic-equality reason, not "unknown constant" anymore).
+
+**Net for the day**: ~25 commits. NonLinear scope + body-less
+axioms + cross-crate audit + trait gate rework + external_body
+opaque + #122 reframing. Test counts 346 → 388 e2e. Three
+real soundness gaps closed (external_body collapse, body-less
+unresolved refs, panic-not-Err). DESIGN.md expanded substantially
+(class emission, external_body, NonLinear scope sections).
+
+#### Current session (2026-05-15 — proof-fn trait methods, non-unit return, C1/C2/C5 probes, termination_by, BUG-as-nat-cast)
+
+Multi-arc day. Started with reading DESIGN/HANDOFF, settled into
+proof-fn trait method work, then closed several follow-ups.
+
+**Proof-fn trait methods — LANDED.** `trait_to_ast` now mode-
+dispatches on method kind. For `Mode::Proof`, the class method
+emits as a **Prop-typed class field** (Mathlib's
+`mul_assoc`/`one_mul` idiom):
+
+```lean
+class HasZero (Self : Type) where
+  val : Self → Int
+  val_is_zero : ∀ (self : Self), val self = 0   -- Prop field
+```
+
+Instance bodies provide a tactic proof; the caller accesses the
+lemma via typeclass dispatch (`have _ := HasZero.val_is_zero t`).
+
+Three pieces: `proof_fn_method_type` builds
+`∀ (params...) (req_hyps...), <ensures>` for unit-return; for
+non-unit-return uses `∀ (params...), { r : RetTy // <ensures> }`
+(structured `ExprNode::Subtype { name, ty, pred }` AST node).
+`strip_class_qualifier` walks the rendered LExpr via
+`map_children`, replacing `ClassName.method` references with the
+unqualified sibling (Lean rejects class-method refs inside the
+class declaration itself; Mathlib uniformly uses unqualified).
+`render_by_block` handles tactic body indentation for inline
+`by` blocks (re-indents every line by 2 spaces past `by`'s
+column).
+
+Plumbing: `tactic_bodies: HashMap<Fun, String>` built once in
+`verifier.rs` via `build_tactic_bodies_map`, threaded through
+`check_proof_fn` / `check_exec_fn` → `krate_preamble` →
+`trait_to_ast` / `trait_impl_to_ast`. Five signature additions,
+one helper. Class ordering split-by-mode: classes WITHOUT proof-
+fn methods emit before spec fns (old behavior), classes WITH
+proof-fn methods emit after spec fns (their Prop-typed fields
+can reference free-standing spec fns).
+
+**Coverage shapes C1/C2/C5.** Additional probes for
+mixed-mode trait (C1), extends super-trait (C2), and empty trait
+(C5). C1 surfaced a real bug: unit-return proof-fn ensures
+weren't walked by `dep_order::seed_impl_proof_method_bodies` —
+fixed by always walking ensures (body walked only for non-unit
+return). C2 surfaced TWO bugs: parent class bound rendered as
+`[Super Self%]` (fixed via `class_bounds_to_ast` helper);
+parent trait didn't transitively reach `refs.traits` (fixed via
+fixed-point closure in `generate.rs`). The "extends" case in C2
+exercised the full transitive-reachability story. C5 (empty
+trait) passed first try.
+
+**Non-unit return proof-fn trait methods — LANDED.** Subtype
+rendering: `proof fn extract() -> (r: int) ensures r == E`
+becomes class field `∀ params, { r : int // ensures }`. Instance
+body emits as `fun (params...) => ⟨vir_expr_to_ast(body), by first
+| rfl | simp_all⟩` — the impl's body expression IS the witness;
+rfl/simp_all closes the equality with the ensures' RHS.
+
+Two constraints + resolutions:
+1. Verus's `by { }` body syntax doesn't fit non-unit returns —
+   FileLoader sanitizes brace body to spaces, type mismatch with
+   non-unit return type. Non-unit return proof fns use regular
+   Verus-style bodies (just an expression).
+2. Inside instance bodies, sibling field refs aren't in scope —
+   verified directly in Lean via `/tmp/test_instance_self_ref.lean`.
+   `dep_order::seed_impl_proof_method_bodies` pre-seeds all impl
+   proof-fn bodies (non-unit return) so the spec methods they call
+   emit as standalone defs in the preamble. Over-emit is harmless
+   (inert dead code).
+
+**Lens 4-15 audit cleanup pass.** Comprehensive review pass
+applied lens 4-15 to the proof-fn trait method work. Findings
+included: stale comments, an opportunity to clean up
+`strip_class_qualifier` (used `map_children` traversal — clean
+delegation), surfacing that the suffix-strip approach for "Self%"
+was wrong (DESIGN-relevant). Replaced with
+`vir::def::trait_self_type_param()` — Verus's documented public
+API constant. The fix lives in `typ_maybe_projection_to_expr`'s
+exact-match check.
+
+**Termination_by for recursive proof fns — LANDED (Case 11 part 1).**
+`Theorem` AST gains `termination_by: Vec<Expr>` field;
+`proof_fn_to_ast` populates from `f.decrease` (mirroring
+`spec_fn_to_ast`); pp emits `termination_by <expr>` after the
+tactic body (or `(e1, e2, ...)` for lex). Verus's `decreases n`
+on a recursive proof fn flows through as faithful translation —
+Verus has already certified termination, we pass the measure to
+Lean. Lean often auto-infers for simple structural cases, but
+the explicit clause is required for Collatz-shape or non-obvious
+measures. Pinned by `test_proof_fn_with_decreases_noncrecursive`
+and `test_proof_fn_recursive_with_decreases`; 3 pp unit tests.
+
+**Recursive proof-fn TRAIT methods still deferred** (Case 11
+part 2): class fields in Lean don't accept `termination_by`
+directly (verified 2026-05-15 via Lean test file). Fix involves
+either rendering recursive proof-fn trait methods through
+`mutual` blocks with WF measures, or emitting them as top-level
+theorems (loses typeclass-dispatch property). Flagged.
+
+**BUG-as-nat-cast.md fix — LANDED.** Verus's `fn_call_to_vir.rs`
+drops `U(_) → Nat` and `USize → Nat` casts as no-ops (sound for
+Z3 which treats both as Int with refinements; unsound for Lean
+which has distinct Int/Nat types). Pre-fix, `f(i as nat)` for
+`i : u64` lowered to `f i` where `i : Int` — failed Lean
+elaboration.
+
+Fix is a Tactus-side normalization pass:
+`insert_nat_coercions_in_{exp,stm,expr}` walks SST/VIR-AST at fn
+entry, looks up each Call's callee in fn_map, and wraps args
+whose Lean type renders as Int (when the corresponding param
+renders as Nat) in synthetic `Clip { range: Nat }`. The
+renderer's existing Clip handler emits `Int.toNat`. Same
+architectural pattern as #94 `rewrite_varat_for_mut_params`,
+#95 `normalize_mut_ref`, #127's `original_cond` recovery.
+
+Always-emitting Clip at Verus's cast lowering would break 7
+vstd lemmas in `vstd/bits.rs` (calc-style proofs relying on Z3
+silently equating `x` and `clip(Nat, x)` for u-typed x). The
+pre-pass runs only on Tactus-bound code so vstd stays
+untouched and verifies 1530/0 under Z3.
+
+`needs_nat_coercion` peels `Boxed`/`Decorate` via
+`peel_typ_wrappers` (SST args often arrive as
+`Boxed(Int(U(64)))` from Verus's poly encoding pass). Pre-pass
+fires at: exec body + ens_exps + reqs (SST); proof fn require
++ ensure + decrease (VIR-AST); spec fn body + termination_by
+(VIR-AST). 5 e2e regression tests:
+`test_proof_fn_u64_as_nat_in_ensures` (minimal reproducer);
+`test_proof_fn_u_types_as_nat` (all u-types coerce);
+`test_proof_fn_both_sides_as_nat` (both sides of ==);
+`test_exec_assert_u64_as_nat` (SST path);
+`test_exec_loop_invariant_u64_as_nat` (loop invariant).
+
+**Net for the day**: ~10 commits, 9 deferrals closed (Prop-typed
+class fields, non-unit return proof-fn trait methods,
+`ExprNode::Subtype` variant, C1/C2/C5 coverage shapes,
+`termination_by` for proof fns, the as-nat-cast bug). Test
+counts 388 → 412 e2e (+24), unit tests 182 → 195 (+13).
+DESIGN.md got new sections: "Trait class and instance emission",
+"External-body type opaque emission", "U → Nat coercion at Call
+sites", "Trait class+instance emission: deferred edges". The
+nat-coercion pre-pass adds ~250 lines to `sst_to_lean.rs`.
+
+#### Current session (2026-05-16 — DESIGN-cast-hygiene.md)
+
+After the BUG-as-nat-cast fix surfaced a "paper cut" — chains of
+`Int.toNat` operations in goals that trip omega — explored three
+options for the underlying rendering choice without committing:
+
+- **Option A**: Cast hygiene lemmas in TactusPrelude.lean + a
+  named simp-set rung in `tactus_auto`. ~1-2 days. Reversible.
+- **Option B**: Render Verus `nat` as Lean `Int` with bound
+  hypothesis (mirroring how u-types already work). ~1-2 weeks.
+  Closes USize subtraction soundness gap as a side effect.
+  Deletes the nat-coercion pre-pass.
+- **Option C**: Emit spec fns as `opaque + axiom` (mirror
+  Verus's Z3 encoding directly). ~1 week. Diverges from standard
+  Lean `unfold` idioms.
+
+Doc lives at `DESIGN-cast-hygiene.md` alongside DESIGN.md and
+HANDOFF.md. Non-committal — design exploration with comparison
+table, open questions, and decision criteria framed by audience
+and priorities. Three real options, each with substrate-vs-user
+complexity trade-offs. The conversation surfaced that Z3 has
+**none** of the relevant costs because Z3's model is
+fundamentally different (untyped Int + axiomatic spec fns); each
+of A/B/C absorbs Z3's "untyped" model into Lean's typed model
+at a different layer.
+
+#### Current session (2026-05-17 — warnings cleanup, trait probes, catalogue sweep)
+
+Small bits day. Closed five maintenance items.
+
+**Warning cleanup**: two pre-existing unused `spec_callee`
+parameter warnings in `sst_to_lean.rs` (at `emit_call_precondition_theorem`
+and `push_post_call_frames`). The parameter was passed by callers
+but the body referenced it only in comments; dropped from both
+signatures (one call site each, mechanical). Clean compile, no
+warnings.
+
+**vstd Nat-pattern probe** (open question #2 from DESIGN-cast-
+hygiene.md): grepped vstd for `Nat.succ`, `match n : Nat with`,
+and recursive nat-typed spec fns. **Audit cost for Option B is
+LOW**: zero `Nat.succ` uses anywhere; the only directly-recursive
+nat-typed spec fn is `arithmetic/power.rs`'s `pow(b: int, e: nat)
+-> int`, whose body uses generic operators (`==`, `-`, `*`, `if`)
+only. Result fed back into DESIGN-cast-hygiene.md.
+
+**Trait emission edge probes** (DESIGN.md "Trait class+instance
+emission: deferred edges"):
+- `test_trait_generic_impl_probe` — ✅ pinned. `impl<T> Container
+  for Wrap<T>` with concrete `Wrap<u8>` reaches the gate via
+  short_name (`Wrap`) correctly.
+- `test_trait_assoc_typed_default_probe` — ✅ pinned. Default
+  method returning `Self::Output` renders cleanly via
+  `typ_maybe_projection_to_expr`'s bare-`Output` translation.
+- `test_trait_recursive_default_upstream_blocked` — Err pin.
+  Verus rejects recursive default bodies with "trait default
+  methods do not yet support recursion and decreases". The
+  Tactus-side `termination_by` question stays untested
+  (unreachable through normal Tactus paths today).
+
+DESIGN.md updated: three edges flipped from "untested" to
+either ✅ pinned or upstream-blocked.
+
+**Catalogue staleness sweep**: flipped the proof-fn-trait-method
+catalogue entry (line 1391) from "UNTESTED, likely needs
+separate handling" to "✅ LANDED 2026-05-15" with cross-reference
+to the new "Trait class and instance emission" section.
+Cross-referenced DESIGN-cast-hygiene.md from the USize
+subtraction trade-off note (the cast-hygiene options B/C close
+the USize gap as a side effect).
+
+**Net for the day**: warnings cleared; 3 new e2e tests
+(412 → 415); DESIGN.md catalogue refreshed; DESIGN-cast-
+hygiene.md updated with the vstd probe finding. No code changes
+beyond the warnings cleanup.
 
 ## Architecture
 

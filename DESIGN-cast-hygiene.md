@@ -291,6 +291,14 @@ These are unresolved enough to warrant probing before committing to any option:
 
 2. **For Option B**: which spec fns in vstd use `Nat.succ` or `match n : Nat with | 0 => ... | k+1 => ...` style? Quick grep would scope the audit.
 
+   *Probed 2026-05-17.* vstd has zero uses of `Nat.succ` / `.succ()` syntax. Spec fns taking `nat` use generic integer operators (`==`, `-`, `*`, `<`, `if`) and route through `as nat` casts. The recursive nat-typed spec fns are minimal:
+   - `arithmetic/power.rs` — `pow(b: int, e: nat) -> int decreases e` (body: `if e == 0 { 1 } else { b * pow(b, (e - 1) as nat) }`). Generic operators only.
+   - `arithmetic/power2.rs` — `pow2(e: nat) -> nat` delegates to `pow` (not directly recursive).
+   - `arithmetic/logarithm.rs` — `log(base: int, pow: int) -> int` takes int, not nat (not affected).
+   - Other vstd files with `nat`-typed spec fn params (`endian.rs`, `bits.rs`, `seq.rs`, etc.) use them as length / count arguments, not in recursive structural-match patterns.
+
+   **Audit cost is LOW.** Under Option B, the `pow` translation would be `if e ≤ 0 then 1 else b * pow b (e - 1)` with `termination_by e.toNat`. No `Nat`-specific machinery to replace; bodies are already generic-operator-clean. The audit pessimism in the original Option B writeup was overestimated.
+
 3. **For Option C**: what's the right `@[simp]` tagging policy? Non-recursive equations can be `@[simp]` safely. Recursive equations need either explicit fuel control or a wrapper lemma that's safe to `@[simp]`. Worth probing.
 
 4. **For Option C**: how does `unfold` semantics on `simp [fact_def]` actually feel in practice? May be cleaner than expected if the equation lemmas are named well.
