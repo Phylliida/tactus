@@ -9847,6 +9847,96 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === Trait deferred edges (DESIGN.md sweep) ===
+//
+// Three edges flagged as "likely works but not pinned" in DESIGN.md's
+// "Trait class+instance emission: deferred edges" section. Probes
+// pin or surface real gaps.
+
+// Edge: generic impl (`impl<T> Foo for Vec<T>` shape via a simpler
+// surrogate — Tactus uses short_name throughout so concrete vs
+// generic instantiations of the same path should both reach the
+// gate via `refs.datatypes` containing the implementor short name).
+test_verify_one_file! {
+    #[test] test_trait_generic_impl_probe verus_code! {
+        use vstd::prelude::*;
+
+        trait Container {
+            spec fn ok(&self) -> bool;
+        }
+
+        struct Wrap<T> { inner: T }
+
+        impl<T> Container for Wrap<T> {
+            spec fn ok(&self) -> bool { true }
+        }
+
+        #[verifier::tactus_auto]
+        fn touches<T: Container>(_t: &T, _w: &Wrap<u8>) -> (r: u8)
+            ensures r == 0
+        {
+            0
+        }
+    } => Ok(())
+}
+
+// Edge: associated-typed default body. Default returns `Self::Output`
+// (renders as bare `Output` class type-param name).
+test_verify_one_file! {
+    #[test] test_trait_assoc_typed_default_probe verus_code! {
+        trait WithType {
+            type Output;
+            spec fn value(&self) -> Self::Output;
+        }
+
+        struct Ctx;
+        impl WithType for Ctx {
+            type Output = int;
+            spec fn value(&self) -> int { 0 }
+        }
+
+        #[verifier::tactus_auto]
+        fn touches<T: WithType>(_t: &T, _c: &Ctx) -> (r: u8)
+            ensures r == 0
+        {
+            0
+        }
+    } => Ok(())
+}
+
+// Edge: recursive default body. Default calls itself via typeclass
+// dispatch. Probed 2026-05-17: upstream-blocked at Verus with
+// "trait default methods do not yet support recursion and decreases".
+// Pinned as Err so a future Verus relaxation surfaces as a flippable
+// test. The Tactus-side `termination_by`-for-class-defaults question
+// remains untested — would need probing if/when Verus lifts the
+// restriction.
+test_verify_one_file! {
+    #[test] test_trait_recursive_default_upstream_blocked verus_code! {
+        trait Counted {
+            spec fn count(&self, n: nat) -> nat
+                decreases n
+            {
+                if n == 0 { 0 } else { 1 + self.count((n - 1) as nat) }
+            }
+        }
+
+        struct C;
+        impl Counted for C {}
+
+        #[verifier::tactus_auto]
+        fn touches<T: Counted>(_t: &T, _c: &C) -> (r: u8)
+            ensures r == 0
+        {
+            0
+        }
+    } => Err(err) => {
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("trait default methods do not yet support recursion"),
+            "Expected Verus upstream rejection for recursive default; got: {}", msg);
+    }
+}
+
 // Test B: recursive proof fn — body recursively invokes itself in Lean,
 // gated by a case-split. `termination_by n` is what makes the recursive
 // call's measure visible to Lean's well-foundedness check. Lean's

@@ -2366,11 +2366,11 @@ fn walk_call<'a>(
     let inlined = crate::call_inlining::collect_inlined_at_call(callee, spec_callee);
 
     if !inlined.requires.is_empty() {
-        emit_call_precondition_theorem(spec_callee, &inlined.requires, &subst, call_span, obl, e);
+        emit_call_precondition_theorem(&inlined.requires, &subst, call_span, obl, e);
     }
 
     let new_obl = push_post_call_frames(
-        callee, spec_callee, &inlined.ensures, &subst, dest, obl,
+        callee, &inlined.ensures, &subst, dest, obl,
     );
     walk_obligations(after, ctx, &new_obl, e);
 }
@@ -2647,12 +2647,13 @@ fn build_call_substitutions<'a>(
     }
 }
 
-/// Emit the precondition theorem for a call. The `spec_callee`'s
-/// `require` clauses are rewritten (VarAt → varat_pre_name) and
-/// rendered, then substituted with `subst.req_subst`, and wrapped
-/// in a `CallPrecondition` SpanMark with the call-site span.
+/// Emit the precondition theorem for a call. The `requires` slice
+/// holds spec_callee's `require` clauses, pre-extracted by the
+/// caller via `call_inlining::collect_inlined_at_call`. Each clause
+/// is rewritten (VarAt → varat_pre_name), rendered, substituted with
+/// `subst.req_subst`, and wrapped in a `CallPrecondition` SpanMark
+/// with the call-site span.
 fn emit_call_precondition_theorem(
-    spec_callee: &FunctionX,
     requires: &[&Expr],
     subst: &CallSubstitutions,
     call_span: &Span,
@@ -2820,7 +2821,6 @@ fn is_trivial_true(e: &LExpr) -> bool {
 /// top-level shape (Or, Implies, etc.). See `extract_top_level_eq_for`.
 fn push_post_call_frames(
     callee: &FunctionX,
-    spec_callee: &FunctionX,
     ensures: &[&Expr],
     subst: &CallSubstitutions,
     dest: Option<&VarIdent>,

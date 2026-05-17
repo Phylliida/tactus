@@ -947,7 +947,7 @@ theorem overflow_check_line_N ... : 0 ≤ result ∧ result < 2^bits := by tactu
 
 **Rendering: `USize` → Lean `Nat`, `ISize` → Lean `Int`**. USize *wants* to be `Int` (same argument as for u-types — `Int` semantics catch subtraction underflow), but Verus elides `as nat` casts from `usize` in spec contexts, so const-generic bodies like `N as nat` render as just `N`. If `USize` rendered as `Int`, those const-generic defs would have body type `Int` and declared return type `Nat` — a mismatch that breaks the translation (`test_const_generic`). ISize has no such constraint and does render as `Int`.
 
-**Trade-off: USize subtraction truncates silently.** Because `USize` → `Nat`, `let r: usize = x - y;` for usize `x`, `y` truncates at zero if `y > x`. The `0 ≤` side of the `usize_hi` refinement is then trivially true and the underflow silently passes. Parallel to the u8-subtraction soundness hole before the u8 → Int change. Proper fix is the same: find a way to make USize render as Int without breaking const-generics. Open.
+**Trade-off: USize subtraction truncates silently.** Because `USize` → `Nat`, `let r: usize = x - y;` for usize `x`, `y` truncates at zero if `y > x`. The `0 ≤` side of the `usize_hi` refinement is then trivially true and the underflow silently passes. Parallel to the u8-subtraction soundness hole before the u8 → Int change. Proper fix is the same: find a way to make USize render as Int without breaking const-generics. Open. **Note**: `DESIGN-cast-hygiene.md`'s Options B and C both close this gap as a side effect — rendering `nat` as Int eliminates the const-generic-body mismatch that currently blocks USize → Int.
 
 **tactus_auto can't discharge `< usize_hi` automatically.** `omega` doesn't reason about `2 ^ arch_word_bits` for unknown `arch_word_bits`. `tactus_auto`'s current toolbox (`rfl | decide | omega | simp_all`) can't either. Non-trivial usize arithmetic needs user-written `proof { … }` blocks that case-split `arch_word_bits_valid` and invoke `Nat.pow_le_pow_right` / `Int.pow`-style lemmas — a significant ergonomics burden. A custom `tactus_usize_bound` tactic that automates this is an obvious future addition; until then, the bound is *present* for soundness but not discharged for usability.
 
@@ -1388,16 +1388,19 @@ Accepted via #57: **`cond: None`** loops (the form Verus produces when lowering 
 * **Datatype SCCs of size > 3** (#109 edge) — ✅ pinned at depths 4, 5, and 10 by `test_exec_four_element_datatype_scc` (A → B → C → D → A), `test_exec_five_element_datatype_scc` (P → Q → R → S → T → P), and `test_exec_ten_element_datatype_scc` (E0 → E1 → ... → E9 → E0). The Tarjan implementation is generic over SCC size; 4+ cycles go through the same `mutual { inductives } end` + accessors-out + `mutual { heights } end` emission path. The 10-cycle test runs in ~6.8s (vs ~5s for 4/5 cycles), so Lean's mutual-block compilation cost at depth 10 is *not* the catalogue's previously-named latent concern. Depths beyond 10 remain unpinned, but the linear progression at 4 → 5 → 10 with near-flat compile time means concern only kicks in at much larger depths if at all.
 * **`ScopeKind::Other` positive mis-categorization** (#98 ScopeKind edge). The structural lock makes adding a new `ExprNode` variant a compile error in `walk_children` / `map_children` / `scope_kind`, forcing the contributor to categorize. But they could still *positively* lie — write `ScopeKind::Other` when the new variant introduces a binder. The type system can't catch a wrong-but-explicit choice. Documented in the section header comment for `ExprNode::scope_kind`. Pinned-by-test for the existing variants via `scope_kind_categorizes_each_variant`; future binder variants only get pinned once tested.
 * **AssertBitVector with non-trivial SST shapes** (#130 edge) — ✅ pinned by `test_exec_assert_bit_vector_with_fn_call`, fixed via #147 (2026-05-09). Probe surfaced a real codegen panic ("unresolved `id_u8`") and diagnosis revealed two latent bugs: (1) `dep_order::seed_worklist` only walked `require` / `ensure`, never the function body — so spec fn calls inside body-level assertions never reached the preamble dep set. Bug applied to *any* body-level spec fn reference, not just bit_vector; bit_vector triggered it via Verus's pre-injected `Assume(ens)`. (2) `spec_fn_to_ast` reused `fn_binders` (the proof/exec helper that adds `h_<name>_bound` refinement hyps as binders), which gave spec-fn defs the wrong type signature (`Int → Bound → Int` instead of `Int → Int`), breaking call sites that pass only the value. Both fixed: `seed_worklist` now also walks `pf.body`; `spec_fn_to_ast` calls a new `fn_binders_without_bound_hyps` helper. Bound checking for spec-fn params still happens at theorem-call sites where the corresponding hyps exist via `fn_binders` on the calling proof/exec fn. Pinned by `test_exec_assert_bit_vector_with_fn_call` (bit_vector path) and `test_exec_plain_assert_with_spec_call` (plain assert path) — same fix surface, two shapes.
-* **Proof-fn trait method defaults — UNTESTED, likely needs separate handling.** Tactus's `trait_to_ast` (in `to_lean_fn.rs`) iterates `tr.methods` and renders EVERY method as a `ClassMethod { name, ty: method_type(func), default }` — no filter by mode. For proof-fn trait methods (rare but legal in Verus: `trait Foo { proof fn lemma(&self) ensures P by { tac } }`), this is structurally wrong:
-  - Proof fns produce theorems, not class methods. Their "body" is tactic text, not an expression renderable as a class default.
-  - The `method_type(func)` rendering for a proof fn would produce `Self → ReturnType`, but a proof fn's "return" is a proof of its ensures clause, not a value — the type doesn't actually make sense as a class method type.
-  - The class-defaults work landed 2026-05-12 emits the proof-fn body as a class default, which would attempt to render tactic text as an expression and likely fail Lean elaboration.
-
-  Realistic frequency: probably rare. Proof fn trait methods are uncommon in Verus codebases; instead, users typically write `proof fn lemma_foo<T: Trait>(...)` as standalone lemmas with trait bounds.
-
-  Forward path when surfaced: filter proof-fn methods out of trait_to_ast's class declaration (emit them as separate top-level theorems with the trait bound + Self typeclass parameter in scope), OR render them as `ClassMethod` with `default: None` (sig only) and have impls override.
-
-  No probe test today — would need a tactus_auto fn that calls a proof-fn trait method to surface. Add a probe and pin the rejection if/when motivated.
+* **Proof-fn trait methods — ✅ LANDED 2026-05-15** (mode-dispatch in
+  `trait_to_ast`). Proof-fn trait methods render as Prop-typed class
+  fields (Mathlib's `mul_assoc`/`one_mul` idiom) rather than as
+  function-typed class methods. The type is `∀ params, <ensures>`
+  for unit-return cases and `∀ params, { r : RetTy // <ensures> }`
+  for non-unit-return. Instance bodies provide a tactic proof; the
+  caller accesses the lemma via typeclass dispatch (`have _ :=
+  HasZero.val_is_zero t`). See "Trait class and instance emission"
+  for the full mechanics, plus "Trait class+instance emission:
+  deferred edges" for what remains. Pinned by
+  `test_proof_fn_trait_method_emission_probe` and 8 sibling tests.
+  Termination on RECURSIVE proof-fn trait methods is still deferred
+  (class fields don't accept `termination_by`).
 
 #### Tactic / automation limitations
 
@@ -2833,27 +2836,27 @@ an Opaque value at this site. Only DIRECT field types matter
   typeclass-dispatch property the current shape provides). Untested;
   flag for future work.
 
-* **Recursive default bodies — untested.** A trait default body that
-  calls itself (or another trait method that recurses back). Verus's
-  termination check filters most pathological cases, and `termination_by`
-  IS rendered for spec method defaults. But: no test pins a
-  recursive default. If a recursive default is added, the
-  termination clause may need different handling (Lean's WF
-  analysis vs Verus's height-based termination).
+* **Recursive default bodies — upstream-blocked.** A trait default
+  body that calls itself. Probed 2026-05-17: Verus rejects with
+  "trait default methods do not yet support recursion and decreases".
+  The Tactus-side question (whether `termination_by` on a class-field
+  default body would be accepted by Lean) is structurally unreachable
+  through normal Tactus paths today. Pinned by
+  `test_trait_recursive_default_upstream_blocked`. If Verus ever
+  lifts this restriction, the Tactus-side handling will need probing
+  (see #148 area for related class-field termination concerns).
 
-* **Associated-typed default bodies — untested.** A default body whose
-  return type is `Self::Output`. Theoretically works: outParam class
-  type params are emitted, and `typ_maybe_projection_to_expr` renders
-  `Self::Output` as the bare `Output` (class type-param) name. Not
-  pinned by any test; would surface if vstd-style abstract types
-  with default behavior land in the proof surface.
+* **Associated-typed default bodies — ✅ pinned.**
+  `test_trait_assoc_typed_default_probe` (2026-05-17) — trait with
+  `type Output`, default method returning `Self::Output`, concrete
+  `int` instantiation. Renders cleanly through
+  `typ_maybe_projection_to_expr`'s bare-`Output` translation. Works.
 
-* **Generic impls (`impl<T> Foo for Vec<T>`).** The implementor short
-  name (`Vec`) needs to be in `refs.datatypes` for the gate to
-  fire. For concrete instantiations (`Vec<u8>`), the path's
-  short_name is still `Vec` (Tactus uses short_name throughout, no
-  type-args in the name). Likely works but not pinned by a
-  dedicated test.
+* **Generic impls (`impl<T> Foo for Vec<T>`) — ✅ pinned.**
+  `test_trait_generic_impl_probe` (2026-05-17) — `impl<T> Container
+  for Wrap<T>` with concrete `Wrap<u8>` in the touches fn. The
+  implementor short_name (`Wrap`) reaches the
+  `refs.datatypes ∩ refs.traits` instance gate correctly. Works.
 
 * **TraitMethodImpl with body=None and no trait default.**
   Structurally invalid (Verus rejects "impl missing required method").
