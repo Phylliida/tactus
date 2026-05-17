@@ -1119,6 +1119,50 @@ impl OblCtx {
         goal
     }
 
+    /// Split: pull leading `Binder` frames out as theorem-level binders,
+    /// leaving the rest of the frames to wrap into the goal via the
+    /// returned `OblCtx`. Used to make loop-modified-var names directly
+    /// accessible at the tactic body's entry point (theorem-level
+    /// binders are in the local context immediately; `∀`-in-goal
+    /// binders require `intros` and Lean's auto-naming uses
+    /// inaccessible `i✝` names that user tactics can't reference).
+    /// See `BUG-loop-local-names-alpha-renamed.md`.
+    ///
+    /// Only LEADING Binders are extracted — Hyp frames immediately
+    /// after the last extracted Binder also extract (they're the
+    /// bounds + invariants + cond that go with the modified-vars).
+    /// Stopping at the first Let preserves the source ordering of
+    /// `_tactus_d_old := D` lets and any other let-bound context.
+    /// Hyps get synthetic names so they're addressable.
+    fn split_leading_binders(&self) -> (Vec<LBinder>, OblCtx) {
+        let mut binders: Vec<LBinder> = Vec::new();
+        let mut remaining = self.clone();
+        let mut hyp_counter: usize = 0;
+        let mut saw_binder = false;
+        loop {
+            match remaining.frames.front() {
+                Some(CtxFrame::Binder(b)) => {
+                    binders.push(b.clone());
+                    remaining.frames.pop_front();
+                    saw_binder = true;
+                }
+                Some(CtxFrame::Hyp(p)) if saw_binder => {
+                    binders.push(LBinder {
+                        name: Some(crate::lean_name::LeanName::synthetic(
+                            format!("_h_ctx_{}", hyp_counter)
+                        )),
+                        ty: p.clone(),
+                        kind: BinderKind::Explicit,
+                    });
+                    hyp_counter += 1;
+                    remaining.frames.pop_front();
+                }
+                _ => break,
+            }
+        }
+        (binders, remaining)
+    }
+
     /// Wrap `goal` with Let / Binder frames only — Hyp frames are
     /// dropped. Used by `Wp::AssertBitVector` (#111 / #130).
     ///
@@ -1221,9 +1265,13 @@ impl ObligationEmitter {
     /// default). Preamble still flows from obl so an enclosing
     /// scope's imports remain in effect.
     fn emit_with_closer(
-        &mut self, name: String, goal: LExpr, closer: Tactic, obl: &OblCtx,
+        &mut self, name: String, leaf: LExpr, closer: Tactic, obl: &OblCtx,
     ) {
-        self.emit_with_preamble(name, goal, closer, obl.closer_preamble.clone());
+        let (extras, remaining) = obl.split_leading_binders();
+        let goal = remaining.wrap(leaf);
+        self.emit_with_extras(
+            name, goal, closer, obl.closer_preamble.clone(), extras,
+        );
     }
 
     /// Like `emit`, but the theorem also declares preamble fragments
@@ -1233,14 +1281,45 @@ impl ObligationEmitter {
     /// Used by `Wp::AssertBitVector` (#130) — the only walker arm
     /// that currently needs extra preamble. Future "this fn needs
     /// Mathlib.Tactic.X" cases follow the same pattern.
-    fn emit_with_preamble(
+    /// Like `emit` but extracts leading Binder + Hyp frames from
+    /// `obl` as theorem-level binders before emitting. Makes the
+    /// names directly accessible at the tactic body's entry point
+    /// (no intros needed). Used by the per-obligation walker so
+    /// user-written tactics in `assert(P) by { ... }` can reference
+    /// loop locals by name without first doing `intros`.
+    /// See `BUG-loop-local-names-alpha-renamed.md`.
+    fn emit_split(&mut self, name: String, leaf: LExpr, obl: &OblCtx) {
+        let (extras, remaining) = obl.split_leading_binders();
+        let goal = remaining.wrap(leaf);
+        self.emit_with_extras(
+            name, goal, obl.closer.clone(), obl.closer_preamble.clone(), extras,
+        );
+    }
+
+    fn emit_with_extras(
         &mut self,
         name: String,
         goal: LExpr,
         closer: Tactic,
         requires_preamble: Vec<PreambleFragment>,
+        extra_binders: Vec<LBinder>,
     ) {
-        let tactic = if self.tactic_prefix.is_empty() {
+        let tactic = self.compose_tactic(closer);
+        let mut binders = self.base_binders.clone();
+        binders.extend(extra_binders);
+        self.out.push(Theorem {
+            name,
+            binders,
+            goal,
+            tactic,
+            requires_preamble,
+            heartbeats: self.heartbeats,
+            termination_by: Vec::new(),
+        });
+    }
+
+    fn compose_tactic(&self, closer: Tactic) -> Tactic {
+        if self.tactic_prefix.is_empty() {
             closer
         } else {
             let mut body = String::new();
@@ -1258,19 +1337,17 @@ impl ObligationEmitter {
                 Tactic::Raw(s) => body.push_str(&format!("({})", s)),
             }
             Tactic::Raw(body)
-        };
-        self.out.push(Theorem {
-            name,
-            binders: self.base_binders.clone(),
-            goal,
-            tactic,
-            requires_preamble,
-            heartbeats: self.heartbeats,
-            // Per-obligation theorems are flat — recursion is handled at
-            // the obligation level via `CheckDecreaseHeight`, not at the
-            // theorem level. Exec-fn theorems never need `termination_by`.
-            termination_by: Vec::new(),
-        });
+        }
+    }
+
+    fn emit_with_preamble(
+        &mut self,
+        name: String,
+        goal: LExpr,
+        closer: Tactic,
+        requires_preamble: Vec<PreambleFragment>,
+    ) {
+        self.emit_with_extras(name, goal, closer, requires_preamble, Vec::new());
     }
 }
 
@@ -1358,7 +1435,7 @@ fn walk_obligations<'a>(
             let name = build_theorem_name(
                 kind_to_name(kind), &e.fn_name, &loc, id,
             );
-            e.emit(name, obl.wrap(goal), obl);
+            e.emit_split(name, goal, obl);
             // Reuse cond_ast for the body's hypothesis frame —
             // rendering is deterministic, so re-running it on the
             // same Exp would only repeat work.
@@ -1597,10 +1674,10 @@ fn walk_assert_by_tactus<'a>(
             );
             if user_tactic_present {
                 e.emit_with_closer(
-                    name, obl.wrap(goal), Tactic::Raw(tactic_text.to_string()), obl,
+                    name, goal, Tactic::Raw(tactic_text.to_string()), obl,
                 );
             } else {
-                e.emit(name, obl.wrap(goal), obl);
+                e.emit_split(name, goal, obl);
             }
             // Cond as hypothesis for body theorems (reuse cond_ast).
             let new_obl = obl.with_frame(CtxFrame::Hyp(cond_ast));
@@ -1684,7 +1761,7 @@ fn emit_leaf_theorem(
 ) {
     let id = e.next_id();
     let name = build_theorem_name(kind_label, &e.fn_name, loc, id);
-    e.emit(name, obl.wrap(leaf.clone()), obl);
+    e.emit_split(name, leaf.clone(), obl);
 }
 
 /// Construct a per-obligation theorem name. Drops the `_at_<loc>`
@@ -1766,7 +1843,7 @@ fn walk_loop<'a>(
         let name = build_theorem_name(
             kind_to_name(AssertKind::Obligation(ObligationKind::LoopInvariant)), &e.fn_name, &loc, id,
         );
-        e.emit(name, obl.wrap(inv_marked((inv, v))), obl);
+        e.emit_split(name, inv_marked((inv, v)), obl);
     }
 
     // ── Maintain: walk body with ∀ mod_vars + bounds + at_entry
@@ -1825,6 +1902,27 @@ fn push_mod_var_frames<'a>(
     obl: &mut OblCtx,
     modified_vars: &[(&'a VarIdent, &'a Typ)],
 ) {
+    // Before pushing ∀-binders for modified vars, drop any prior Let
+    // frames that bind the same names. The Let frames came from the
+    // source (e.g., `let mut i: u64 = 0;` before the loop), and their
+    // initial values are irrelevant to the maintain/use obligations —
+    // those reason about the current iteration's value of `i`, which
+    // the ∀-binder provides. Without this filter, the emitted theorem
+    // looks like `let i := 0; ∀ (i : Int), ... → goal` — Lean lets
+    // the inner `i` shadow inside the goal but tactic-mode `intro` /
+    // `intros` then can't reach the source name `i`, because there
+    // are TWO `i`s and Lean auto-disambiguates the introduced one as
+    // `i✝¹`. Users can't type the dagger character, so naming the
+    // loop variable in tactic bodies becomes impossible.
+    // Per `BUG-loop-local-names-alpha-renamed.md`.
+    let mod_names: std::collections::HashSet<crate::lean_name::LeanName> =
+        modified_vars.iter()
+            .map(|(ident, _)| crate::lean_name::LeanName::from_var_ident(ident))
+            .collect();
+    obl.frames.retain(|frame| match frame {
+        CtxFrame::Let(name, _) => !mod_names.contains(name),
+        _ => true,
+    });
     for (ident, typ) in modified_vars {
         // Modified-var binders carry the user's local-var VarIdent
         // verbatim. `from_var_ident` is the canonical entry point; it
@@ -2678,7 +2776,7 @@ fn emit_call_precondition_theorem(
     let theorem_name = build_theorem_name(
         kind_to_name(AssertKind::Obligation(ObligationKind::CallPrecondition)), &e.fn_name, &loc, id,
     );
-    e.emit(theorem_name, obl.wrap(requires_clause), obl);
+    e.emit_split(theorem_name, requires_clause, obl);
 }
 
 /// Peel `SpanMark` wrappers, returning the innermost non-SpanMark
