@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**418 end-to-end tests + 1 coverage test + 195 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**423 end-to-end tests + 1 coverage test + 195 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -4638,6 +4638,141 @@ is only a tree-sitter GLR fallback.
 vstd 1530/0.
 
 Bug doc removed.
+
+#### Current session (2026-05-17 continued — View trait emission cluster + loop-local fixes)
+
+Long sprint. After yesterday's #106 catalogue audit (mixed-paths
+turned out to be already-done, `c6865c6`), probed `&mut v[i]`
+(`43383f4`) which revealed the catalogue's "needs different rebind
+encoding" claim was wrong — Verus's `vec_index_mut` desugar makes
+the &mut arg Var-shaped and `Seq::update` captures the "j ≠ i
+unchanged" property structurally. The real blockers are a cluster
+of four bugs in cross-crate trait emission (A/B/C/D) plus
+substitution. Closed three of four, plus two adjacent bugs found
+while in the neighbourhood.
+
+**Bug A: class-qualified trait method calls + standalone-def
+helper pattern** (`6c278f7`). Pre-fix, goals mixed `view.View.view`
+(class-qualified, 3-segment) and `view.view` (bare path, 2-segment)
+for the same conceptual call, depending on rendering path
+(`DynamicResolved` rendered bare via `lean_name(&resolved.path)`).
+Made `call_to_node` in `to_lean_expr.rs` route both `Dynamic` and
+`DynamicResolved` through `trait_method_ref(fun)` — always
+class-qualified, takes Self via auto-binding. Then added TypeAnnot
+wrap for generic disambiguation (gated on `typ_contains_param` so
+`Self%` doesn't leak into wraps inside class declarations). The
+"duplicate emission" question: my first instinct was to call it a
+code smell and remove the standalone-def emission, but Danielle
+pushed back ("do u think this is correct?"). Verified directly with
+Lean probes that both bare `target` and `Class.target self` inside
+an `instance` `where`-block fail (Lean's "instances are not
+available for instance synthesis during their own definitions" —
+[reference manual § "Instance Declarations"](https://lean-lang.org/doc/reference/latest/Type-Classes/Instance-Declarations/)).
+The duplicate IS the canonical Lean idiom: helper-in-namespace +
+thin-instance. Added `strip_class_qualifier` to instance method
+bodies so sibling refs resolve to standalone defs. Test rewrites:
+18 tests now use `unfold Trait.method` style. Net 419 / 419 e2e.
+
+**Bug C: synthesized body for uninterp impl methods** (`9f77305`).
+When an impl method has `body = None` (Verus's `uninterp`), the
+standalone def gets emitted as an axiom by `spec_fn_to_ast`, but
+`trait_impl_to_ast`'s `func.body.as_ref()?` filter dropped the
+method from the Instance entirely, leaving a body-less instance.
+Lean rejects. Fix: synthesize a body that dispatches to the
+standalone axiom via `<standalone> typ_args... params...`. Pinned
+by `test_uninterp_impl_method_body_less_instance_probe`. Net 420 /
+420 e2e.
+
+**Bug D (partial): MutRefCurrent / MutRefFuture in caller-side
+ensures inlining** (`42228d9`). When a callee's ensures references
+BOTH `*old(x)` and `*final(x)` (vstd's `vec_index_mut` shape), the
+VIR-AST renderer's catch-all `Unary(_, inner) => expr_to_node(inner)`
+arm aliased both to bare `Var(p)`, and `ens_subst` mapped that to
+the fresh post-state — pre-state distinction lost. Fix in
+`rewrite_varat_for_mut_params`: rewrite `MutRefCurrent(Var(p))` →
+`Var(<p>_at_pre_tactus)` and `MutRefFuture(Var(p))` / `MutRefFinal(_,
+Var(p))` → `Var(p)`. Pinned by
+`test_new_mut_ref_pre_post_substitution_probe` (same-crate). Net
+422 / 422 e2e.
+
+**BUG-loop-local-names-alpha-renamed: extract leading binders to
+theorem-level** (`18d8277`). Loop-local `i` inside an `assert(P)
+by { ... }` was inaccessible to user tactics — Lean's `intros`
+auto-disambiguates to `i✝¹` when the outer `let i := 0` (from
+`let mut i = 0`) is in scope, and user-source `i` resolved to the
+let-bound `0`, not the loop iteration value. Two fixes:
+(a) `push_mod_var_frames` drops Let frames for modified-var names
+(initial-value lets are irrelevant for maintain/use obligations);
+(b) `OblCtx::split_leading_binders` extracts leading Binder + Hyp
+frames to theorem-level binders. User writes `have h : i + 1 ≤ 101
+:= by omega` directly. Net 421 / 421 e2e.
+
+**BUG-multi-var-loop-alpha-rename: inject explicit-named intros
+when extraction blocks** (`465a7ed`). The previous fix worked for
+single-var loops but multi-var loops (with an outer non-modified
+`let a := 0`) blocked extraction — Let(a) became the leading frame,
+`split_leading_binders` stopped immediately. Fix in
+`emit_with_closer` (the user-tactic emission path): if any frames
+remain after extraction, inject `intro <names>;` before the user's
+tactic. Names come from frame types — Let / Binder contribute
+their source name; Hyp contributes `_`. Layered cleanly on the
+extraction logic — same architectural shape as 18d8277 but with
+injection as fallback for the cases extraction couldn't reach.
+Pinned by `test_multi_var_loop_assert_by_probe`. Net 423 / 423 e2e.
+
+**Discipline note: I almost shipped a wrong inversion.** Twice
+during the day I called something a code smell when it was actually
+the canonical pattern. The duplicate emission (Bug A
+investigation). The "loop-local fix is complete" framing (one
+session before the multi-var case surfaced). Each time the
+user-supplied bug report or the user-asked question revised the
+position. The pattern names something I want to remember: confident
+abstract reasoning needs concrete verification — direct Lean
+probes, Lean reference manual checks, or downstream user-supplied
+probes — before being committed to.
+
+**Doc updates**: DESIGN.md "Trait class and instance emission"
+section grew the call-rendering / TypeAnnot-wrap / duplicate-
+emission-is-canonical / strip-in-instance-bodies / user-side-
+unfold paragraphs plus citation links to the Lean reference manual.
+Cross-references added in DESIGN.md for the &mut v[i] probe's
+catalogue correction (`43383f4`'s commit message).
+
+**Today's commits in chronological order**: `c6865c6` (mixed-paths
+catalogue refresh) → `bd902ae` (poems: catalogue / have we) →
+`43383f4` (Vec[i] probe + catalogue correction) → `0946e45` (WIP)
+→ `6c278f7` (Bug A) → `5af4000` (poems: Mathlib / what looked like
+a smell) → `9f77305` (Bug C) → `18d8277` (loop-local) → `70038c8`
+(poems: the work was nearby / what the probe showed) → `42228d9`
+(Bug D partial) → `465a7ed` (multi-var loop).
+
+**Remaining View trait cluster work** (for a future session):
+
+* **Bug B: `view.View.V A` blanket-impl rendering**. vstd has
+  several `View` blanket impls (`&A`, `Box<A>`, `Rc<A>`, `Arc<A>`)
+  each with `type V = A::V`. Tactus renders `<A as View>::V` as
+  `view.View.V A` in `typ_to_expr`'s Projection arm — but `V` is a
+  class type-param, not a field accessor, so `view.View.V` is
+  malformed. The canonical Lean idiom is to bind `V` as a fresh
+  implicit on the blanket impl's instance signature
+  (`{V : Type} [View A V] : View (Ref A) V`), not as an accessor.
+  `trait_impl_to_ast` would need to introduce fresh type-param
+  binders for trait bounds involving assoc types. Bigger refactor
+  — not a `typ_to_expr`-only fix. Pinned (alongside the rest of
+  the cluster) by `test_exec_call_mut_arg_vec_index_probe`'s Err.
+* **Bug D remaining piece: vstd-specific `old(vec)@` shape.** The
+  general MutRefCurrent/Future fix landed in `42228d9`, but vstd's
+  `vec_index_mut` ensures uses `old(vec)@` (without the `*`) — a
+  shape that lowers to something my rewrite doesn't catch. Probably
+  goes through a different VIR-AST construct (maybe a builtin call
+  rather than the Unary op variants). Needs its own probe: write
+  a minimal `pub fn foo(x: &mut T) ... ensures old(x)@.something
+  == final(x)@.something_else` to isolate the lowering shape.
+  Pinned (same Err) as part of the Vec[i] probe.
+
+Both are well-scoped for future sessions. The same-crate version
+of Bug D works now (`test_new_mut_ref_pre_post_substitution_probe`),
+so the architectural direction is validated.
 
 ## Architecture
 
