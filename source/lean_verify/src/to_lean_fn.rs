@@ -1534,13 +1534,32 @@ pub fn trait_impl_to_ast(
     // (Verus would have rejected the impl as missing a required
     // method) — skipping is still safe because Lean would catch
     // the missing-method-in-instance error directly.
+    // Instance method bodies that reference sibling trait methods
+    // must use the BARE standalone-def name, not the class-qualified
+    // `Class.method` form — Lean's `instance` construction can't
+    // forward-reference siblings (the instance isn't available for
+    // synthesis during its own definition). Compute the sibling
+    // method-name set from the impl methods (sufficient for the
+    // common case where impl bodies only reference siblings of the
+    // same impl); pre-collect the trait short_name for the strip
+    // helper. See the doc on `strip_class_qualifier` and the
+    // confirming Lean reference manual § "Instance Declarations".
+    let trait_short = short_name(&ti.trait_path).to_string();
+    let sibling_methods: std::collections::HashSet<String> = method_impls.iter()
+        .filter_map(|f| f.name.path.segments.last().map(|s| s.to_string()))
+        .collect();
+
     let methods = method_impls.iter()
         .filter_map(|func| {
             func.body.as_ref()?;
             let short = func.name.path.segments.last()
                 .map(|s| s.as_str()).unwrap_or("_");
             let body_expr = match func.mode {
-                vir::ast::Mode::Spec => vir_expr_to_ast(func.body.as_ref().unwrap()),
+                vir::ast::Mode::Spec => strip_class_qualifier(
+                    vir_expr_to_ast(func.body.as_ref().unwrap()),
+                    &trait_short,
+                    &sibling_methods,
+                ),
                 vir::ast::Mode::Exec => {
                     // Exec placeholder. `default` produces a value
                     // of any type, satisfying Lean's instance-completeness
@@ -1604,7 +1623,11 @@ pub fn trait_impl_to_ast(
                         // called spec methods emit as standalone
                         // defs before the instance.
                         let body = func.body.as_ref().unwrap();
-                        let value = vir_expr_to_ast(body);
+                        let value = strip_class_qualifier(
+                            vir_expr_to_ast(body),
+                            &trait_short,
+                            &sibling_methods,
+                        );
                         // `rfl` closes when body matches ensures
                         // literally; `simp_all` handles unfolding
                         // through standalone def chains.

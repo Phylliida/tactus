@@ -994,8 +994,8 @@ test_verify_one_file! {
         proof fn converter_works()
             ensures (MyNum { val: 5 }).convert()
         by {
-            unfold convert
-            simp
+            show ((MyNum.mk 5).val > 0)
+            decide
         }
     } => Ok(())
 }
@@ -1084,8 +1084,7 @@ test_verify_one_file! {
         proof fn producer_test()
             ensures (IntMaker { val: 42 }).produce() == 42
         by {
-            unfold produce
-            simp
+            unfold Producer.produce; rfl
         }
     } => Ok(())
 }
@@ -1176,9 +1175,8 @@ test_verify_one_file! {
         proof fn dbl_works()
             ensures (MyVal { v: 3 }).dbl() == 6
         by {
-            unfold dbl
-            unfold double
-            simp
+            show double 3 = 6
+            unfold double; rfl
         }
     } => Ok(())
 }
@@ -1302,8 +1300,7 @@ test_verify_one_file! {
         proof fn pair_fst()
             ensures (IntBoolPair { a: 7, b: true }).fst() == 7
         by {
-            unfold fst
-            simp
+            unfold Pair.fst; rfl
         }
     } => Ok(())
 }
