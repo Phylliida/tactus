@@ -310,16 +310,33 @@ fn krate_preamble(
     // applied inside spec_fn_to_ast / trait emission / proof_fn_to_ast.
     let fn_map: crate::sst_to_lean::FnMap =
         krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
+    // TraitMethodImpl spec fns are emitted as the Instance method
+    // body via `trait_impl_to_ast` — not as standalone defs. Calls
+    // resolve through the class via typeclass dispatch (rendering at
+    // `to_lean_expr::call_to_node` uses `trait_method_ref` for both
+    // Dynamic and DynamicResolved). They stay in `groups`/`spec_fn_map`
+    // upstream so their bodies still get walked for transitive
+    // spec-fn refs (otherwise refs inside an impl body would never
+    // land in the preamble). Filtering here at the emission step
+    // gives us both properties.
+    let is_trait_method_impl = |f: &FunctionX| -> bool {
+        matches!(f.kind, FunctionKind::TraitMethodImpl { .. })
+    };
     for group in &groups {
         match group {
             FnGroup::Single(f) => {
-                cmds.push(to_lean_fn::spec_fn_to_ast(f, &fn_map));
+                if !is_trait_method_impl(f) {
+                    cmds.push(to_lean_fn::spec_fn_to_ast(f, &fn_map));
+                }
             }
             FnGroup::Mutual(fns) => {
                 let inner: Vec<Command> = fns.iter()
+                    .filter(|f| !is_trait_method_impl(f))
                     .map(|f| to_lean_fn::spec_fn_to_ast(f, &fn_map))
                     .collect();
-                cmds.push(Command::Mutual(inner));
+                if !inner.is_empty() {
+                    cmds.push(Command::Mutual(inner));
+                }
             }
         }
     }
