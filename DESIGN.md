@@ -1074,9 +1074,14 @@ recursion pass covers all cross-fn calls in the cycle the same way.
     `MutTargetRaw::TupleField` variant + `ExprNode::Tuple` AST node.
     `tuple_field_accessor` helper produces the correct multi-segment
     Lean accessor for arity > 2 (`.2.1` etc., since Lean N-tuples are
-    right-nested `Prod`). `&mut v[i]` (Index L-value) and multi-
-    variant enum field mutation remain deferred — different reasons
-    (see "Edge cases observed but not yet handled" below).
+    right-nested `Prod`). (The `TupleField` variant was later retired
+    in `73d1dd6` — folded into `MutTargetRaw::Field { field_oprs }`
+    with per-step `Dt::Path`/`Dt::Tuple` dispatch — so mixed paths
+    `&mut s.tup.0` / `&mut t.0.f` compose through the same rebind
+    loop. See "Mixed tuple-and-struct paths" below.) `&mut v[i]`
+    (Index L-value) and multi-variant enum field mutation remain
+    deferred — different reasons (see "Edge cases observed but not
+    yet handled" below).
   - **Legacy-mode `VarAt(p, Pre)` AND new-mut-ref-mode
     `MutRefCurrent`/`MutRefFuture` UnaryOps both handled.**
     New-mut-ref shapes are normalized back to the legacy shape
@@ -1149,16 +1154,17 @@ recursion pass covers all cross-fn calls in the cycle the same way.
       viable shape (pattern binding `if let Foo::A { ref mut val }`)
       is rejected upstream. Pinned by
       `test_exec_call_mut_arg_enum_field_upstream_blocked`.
-    * Mixed tuple-and-struct paths: `&mut s.tup.0` (struct field is
-      a tuple) and `&mut t.0.f` (tuple element is a struct). The
-      current `MutTargetRaw` separates `Field` (struct path) from
-      `TupleField` (single-level tuple); a unified
-      `Vec<FieldKind>` representation would handle mixed paths but
-      adds complexity proportional to the use case (no realistic
-      Rust code likely produces these shapes).
     `&mut x.f` for single-variant structs LANDED via #87; deeper
     paths `&mut a.b.c` LANDED via #144; tuple field mutation
-    `&mut t.<i>` LANDED via #145 (arity-2) + #146 (arity > 2).
+    `&mut t.<i>` LANDED via #145 (arity-2) + #146 (arity > 2);
+    mixed paths `&mut s.tup.0` (struct-then-tuple) and `&mut t.0.f`
+    (tuple-then-struct) LANDED via `73d1dd6` (2026-05-11) — the
+    `TupleField` variant was retired in favour of a unified
+    `MutTargetRaw::Field { field_oprs: Vec<&FieldOpr> }` whose
+    rebind loop dispatches per step on `FieldOpr.datatype`
+    (`Dt::Path` → structure update, `Dt::Tuple` → tuple ctor).
+    Pinned by `test_exec_call_mut_arg_struct_then_tuple`,
+    `_tuple_then_struct`, `_mixed_path_siblings_preserved`.
     None of the landed cases need havoc-base + assume-other-fields-
     unchanged — Lean's structure-update / tuple syntax IS "all
     other fields unchanged" structurally.
@@ -1799,24 +1805,42 @@ exec fns."
   "no havoc encoding needed" win as #87.
 
   **`&mut t.<i>` (tuple field) LANDED via #145 + #146.**
-  `MutTargetRaw::TupleField { base, index, arity }` variant. Lean's
-  `{ x with f := v }` syntax doesn't compose with `Prod`, so the
-  rebind uses Lean tuple syntax `(t.1, fresh)` (sugar for
-  `Prod.mk a b`) — distinct from anon-ctor `⟨a, b⟩` which fails to
-  elaborate at let-bindings without a type hint. New
-  `ExprNode::Tuple(Vec<Expr>)` AST variant pretty-prints as
-  `(a, b, c)`; replaces the prior `ExprNode::Anon` rendering for
-  `Dt::Tuple` ctors at `expr_shared::ctor_node` (the latent bug
-  where every tuple let-binding had been failing to elaborate
-  was masked because no exec-mode tuple let-binding test existed
-  pre-#145). #146 added `tuple_field_accessor(arity, n)` helper:
-  arity-2 i=0 → `1`; arity-3 i=1 → `2.1`; arity-4 i=2 → `2.2.1`;
-  arity-N last position → `2` repeated N-1 times. Lean's
+  Originally a separate `MutTargetRaw::TupleField { base, index,
+  arity }` variant; the variant was retired in `73d1dd6` (see
+  "Mixed tuple-and-struct paths" below) and folded into
+  `MutTargetRaw::Field { field_oprs }` with per-step `Dt::Path`/
+  `Dt::Tuple` dispatch. Lean's `{ x with f := v }` syntax doesn't
+  compose with `Prod`, so the rebind uses Lean tuple syntax
+  `(t.1, fresh)` (sugar for `Prod.mk a b`) — distinct from
+  anon-ctor `⟨a, b⟩` which fails to elaborate at let-bindings
+  without a type hint. New `ExprNode::Tuple(Vec<Expr>)` AST variant
+  pretty-prints as `(a, b, c)`; replaces the prior `ExprNode::Anon`
+  rendering for `Dt::Tuple` ctors at `expr_shared::ctor_node` (the
+  latent bug where every tuple let-binding had been failing to
+  elaborate was masked because no exec-mode tuple let-binding test
+  existed pre-#145). #146 added `tuple_field_accessor(arity, n)`
+  helper: arity-2 i=0 → `1`; arity-3 i=1 → `2.1`; arity-4 i=2 →
+  `2.2.1`; arity-N last position → `2` repeated N-1 times. Lean's
   right-nested `Prod` (`(a, b, c) : Int × (Int × Int)`) needs
   the multi-segment accessor for elements past the second; the
   existing `field_access_name` returned `(n+1).to_string()`
   which was correct for arity-2 only — Tactus had no arity > 2
   tuple test before #146 to catch it.
+
+  **Mixed tuple-and-struct paths LANDED via `73d1dd6` (2026-05-11).**
+  `&mut s.tup.0` (struct field containing a tuple) and `&mut t.0.f`
+  (tuple slot containing a struct) are real shapes that the prior
+  `TupleField`-vs-`Field` split silently rejected — the recursive
+  Field peel ignored `Dt::Tuple` at depth, and the top-level tuple
+  special case required the base to be a bare Var. Fix: drop the
+  `TupleField` variant; `MutTargetRaw::Field { field_oprs }`
+  already carries per-step `FieldOpr.datatype`, so the rebind loop
+  dispatches on it inline (`Dt::Path` → Lean structure update,
+  `Dt::Tuple` → tuple ctor rebuild). Path steps may now interleave
+  freely. Pinned by `test_exec_call_mut_arg_struct_then_tuple`
+  (struct-then-tuple), `_tuple_then_struct` (tuple-then-struct),
+  `_mixed_path_siblings_preserved` (both struct's other field AND
+  tuple's other slot survive the rebind).
 
   **Explicit deferrals (still rejected in `build_wp_call`):**
   - **`&mut v[i]`** (Index L-value) — **cross-crate-blocked**.
@@ -1840,11 +1864,14 @@ exec fns."
     — the wildcard arm keeps the match exhaustive even when
     semantically unreachable).
   - **Mixed tuple-and-struct paths** (`&mut s.tup.0`,
-    `&mut t.0.f`). `MutTargetRaw` separates `Field` (struct path)
-    from `TupleField` (single-level tuple); a unified
-    `Vec<FieldKind>` representation would handle mixed paths but
-    no realistic Rust code likely produces these shapes —
-    deferred until motivated.
+    `&mut t.0.f`) — LANDED via `73d1dd6` (2026-05-11). The
+    earlier `MutTargetRaw::TupleField` variant was retired in
+    favour of `MutTargetRaw::Field { field_oprs: Vec<&FieldOpr> }`
+    whose rebind loop dispatches per step on `FieldOpr.datatype`
+    (`Dt::Path` → Lean structure update; `Dt::Tuple` → tuple
+    ctor). Path steps may now interleave freely. Pinned by
+    `test_exec_call_mut_arg_struct_then_tuple`,
+    `_tuple_then_struct`, `_mixed_path_siblings_preserved`.
   - **New-mut-ref mode (`UnaryOp::MutRefCurrent` /
     `MutRefFuture`) — LANDED via #95 (callee-side body
     verification).** A pre-rewrite normalization step
