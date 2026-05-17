@@ -310,33 +310,29 @@ fn krate_preamble(
     // applied inside spec_fn_to_ast / trait emission / proof_fn_to_ast.
     let fn_map: crate::sst_to_lean::FnMap =
         krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
-    // TraitMethodImpl spec fns are emitted as the Instance method
-    // body via `trait_impl_to_ast` — not as standalone defs. Calls
-    // resolve through the class via typeclass dispatch (rendering at
-    // `to_lean_expr::call_to_node` uses `trait_method_ref` for both
-    // Dynamic and DynamicResolved). They stay in `groups`/`spec_fn_map`
-    // upstream so their bodies still get walked for transitive
-    // spec-fn refs (otherwise refs inside an impl body would never
-    // land in the preamble). Filtering here at the emission step
-    // gives us both properties.
-    let is_trait_method_impl = |f: &FunctionX| -> bool {
-        matches!(f.kind, FunctionKind::TraitMethodImpl { .. })
-    };
+    // TraitMethodImpl spec fns ARE emitted as standalone defs in
+    // addition to their Instance method. This is the canonical Lean
+    // idiom for instance fields with interdependencies: define a
+    // helper in the type's namespace (the standalone def) and have
+    // the instance reference it. Lean's `instance` construction
+    // can't forward-reference siblings (instances aren't available
+    // for synthesis during their own definition — see Lean reference
+    // manual § "Instance Declarations"), so an impl method whose
+    // body references another sibling spec method needs the
+    // standalone form to resolve. Call sites in goals/ensures use
+    // the class-qualified form via typeclass dispatch
+    // (`to_lean_expr::call_to_node`); instance method bodies use
+    // bare standalone-def references via `strip_class_qualifier`.
     for group in &groups {
         match group {
             FnGroup::Single(f) => {
-                if !is_trait_method_impl(f) {
-                    cmds.push(to_lean_fn::spec_fn_to_ast(f, &fn_map));
-                }
+                cmds.push(to_lean_fn::spec_fn_to_ast(f, &fn_map));
             }
             FnGroup::Mutual(fns) => {
                 let inner: Vec<Command> = fns.iter()
-                    .filter(|f| !is_trait_method_impl(f))
                     .map(|f| to_lean_fn::spec_fn_to_ast(f, &fn_map))
                     .collect();
-                if !inner.is_empty() {
-                    cmds.push(Command::Mutual(inner));
-                }
+                cmds.push(Command::Mutual(inner));
             }
         }
     }
