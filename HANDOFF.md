@@ -4506,6 +4506,62 @@ The downstream tutorial chapter 4 (iterative factorial against
 recursive spec) — and any other realistic exec verification
 needing nonlinear arithmetic — is now unblocked.
 
+#### Current session (2026-05-17 continued — nlinarith folklore)
+
+After the import fix landed, downstream user surfaced a tactic-
+intro asymmetry worth recording as folklore (no code change).
+
+**The observation**: `assert(P) by { nlinarith }` fails against
+Tactus's open-form goals (`∀ binders, hyps → goal`) because
+`nlinarith` doesn't auto-intro the way `omega` does. Users have
+to write `intros; nlinarith` to peel the binders first.
+
+**Not a Tactus bug.** This is intentional Lean / Mathlib design.
+`omega` is the OUTLIER in being intro-aware; most Mathlib tactics
+(`nlinarith`, `linarith`, `ring`, `polyrith`, `positivity`,
+`field_simp`) operate on the current goal state and expect the
+caller to have manipulated it into flat form. Tactus's emission
+is correct — we produce standard open-form theorems.
+
+**Possible fix: `tactus_auto` rung for `intros; nlinarith`.**
+Considered and deferred. The `intros;` prefix would be purely
+structural (peeling Tactus's own emission shape), substrate-class
+like cast hygiene. But: `nlinarith` can be slow on goals where
+it doesn't apply (Positivstellensatz search), requires Mathlib
+imported, and the principle of minimal automation pushes against
+default ladder extensions. A conditional rung based on file-level
+Mathlib import (mirroring BitVec preamble fragments) is a real
+option but worth doing deliberately, not as a quick patch.
+
+**Recommended pattern: body-assert.** Move the nonlinear step
+inside the body at its point of friction:
+
+```rust
+while i < n
+    invariant 2 * result == i * (i + 1), ...
+    decreases n - i
+{
+    i = i + 1;
+    result = result + i;
+    assert(2 * result == i * (i + 1)) by { intros; nlinarith };
+}
+```
+
+The assert's OWN obligation is the nonlinear identity (`intros;
+nlinarith` discharges it); the asserted hypothesis enters scope
+for the maintain check, which closes trivially via `simp_all`.
+Same pattern as the spec-fn-unfold body-assert documented under
+"Tactic / automation limitations" → "Spec fn calls in goal
+position need explicit unfolding." One pattern, two surfaces.
+
+**Discipline note worth recording**: the body-assert pattern is
+emerging as the canonical "this obligation needs a specific
+tactic" answer in Tactus. It scales better than per-fn
+`tactus_tactic` overrides (which apply to ALL theorems the fn
+emits, not just the hard one) and stays Lean-idiomatic.
+DESIGN.md updated with the nlinarith folklore note + cross-
+reference to body-assert.
+
 ## Architecture
 
 ### Full pipeline
