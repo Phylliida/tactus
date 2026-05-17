@@ -1261,28 +1261,17 @@ impl ObligationEmitter {
         self.counter
     }
 
-    /// Emit a theorem using the closer and preamble from the
-    /// current `OblCtx`. The closer is normally `tactus_auto` (or
-    /// whatever `#[verifier::tactus_tactic("...")]` set), but is
-    /// overridden inside AssertQuery scopes (`obl.new_scope(...)`)
-    /// to use a different discharger; the preamble carries any
-    /// imports that discharger needs.
-    ///
-    /// Applies any active `tactic_prefix` (from enclosing proof
-    /// blocks) by running them as a parenthesised sequence followed
-    /// by `<;> closer`, so the closer applies to whatever subgoals
-    /// the prefix leaves.
-    fn emit(&mut self, name: String, goal: LExpr, obl: &OblCtx) {
-        self.emit_with_preamble(
-            name, goal, obl.closer.clone(), obl.closer_preamble.clone(),
-        );
-    }
-
-    /// Like `emit` but with an explicit closer override (used by
+    /// Emit a theorem with explicit closer override (used by
     /// `Wp::AssertByTactus` when the user wrote
     /// `assert(P) by { tac }` — `tac` is the closer, not the obl
     /// default). Preamble still flows from obl so an enclosing
-    /// scope's imports remain in effect.
+    /// scope's imports remain in effect. Also extracts leading
+    /// Binder / Hyp frames from `obl` to theorem-level binders
+    /// (via `split_leading_binders`) AND injects explicit-named
+    /// `intro <names>;` for any frames that didn't extract — so
+    /// user tactics can name loop locals directly without daggers.
+    /// See `BUG-loop-local-names-alpha-renamed.md` and
+    /// `BUG-multi-var-loop-alpha-rename.md`.
     fn emit_with_closer(
         &mut self, name: String, leaf: LExpr, closer: Tactic, obl: &OblCtx,
     ) {
@@ -1314,20 +1303,16 @@ impl ObligationEmitter {
         );
     }
 
-    /// Like `emit`, but the theorem also declares preamble fragments
-    /// (imports / instance blocks) that its elaboration depends on.
-    /// `generate.rs::krate_preamble` aggregates these across all
-    /// emitted theorems and emits them once at file top, deduped.
-    /// Used by `Wp::AssertBitVector` (#130) — the only walker arm
-    /// that currently needs extra preamble. Future "this fn needs
-    /// Mathlib.Tactic.X" cases follow the same pattern.
-    /// Like `emit` but extracts leading Binder + Hyp frames from
-    /// `obl` as theorem-level binders before emitting. Makes the
-    /// names directly accessible at the tactic body's entry point
-    /// (no intros needed). Used by the per-obligation walker so
-    /// user-written tactics in `assert(P) by { ... }` can reference
-    /// loop locals by name without first doing `intros`.
-    /// See `BUG-loop-local-names-alpha-renamed.md`.
+    /// Emit a theorem using the closer/preamble from `obl`, with
+    /// leading Binder + Hyp frames extracted from `obl` to theorem-
+    /// level binders. Makes loop-modified-var names directly
+    /// accessible at the tactic body's entry point (no `intros`
+    /// needed). Used by all per-obligation emit sites — assert
+    /// theorems, loop invariants, init obligations, call
+    /// preconditions. The closer is `obl.closer` (typically
+    /// `tactus_auto`, or whatever `#[verifier::tactus_tactic("...")]`
+    /// set; overridden inside `AssertQuery` scopes via
+    /// `obl.new_scope(...)`). See `BUG-loop-local-names-alpha-renamed.md`.
     fn emit_split(&mut self, name: String, leaf: LExpr, obl: &OblCtx) {
         let (extras, remaining) = obl.split_leading_binders();
         let goal = remaining.wrap(leaf);
@@ -1336,6 +1321,13 @@ impl ObligationEmitter {
         );
     }
 
+    /// Emit a theorem with explicit closer + preamble + extra binders.
+    /// Lower-level entry point; callers usually want `emit_split` or
+    /// `emit_with_closer` instead. The `requires_preamble` field carries
+    /// per-theorem preamble fragments (imports / instance blocks) that
+    /// `generate.rs::krate_preamble` aggregates across all theorems and
+    /// emits once at file top, deduped — used by `Wp::AssertBitVector`
+    /// (#130) for BitVec instance Int wrappers.
     fn emit_with_extras(
         &mut self,
         name: String,
