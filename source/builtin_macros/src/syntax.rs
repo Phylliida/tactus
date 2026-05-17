@@ -4798,13 +4798,37 @@ pub(crate) fn rewrite_items(
     }
     visitor.visit_items_post(&mut items.items);
 
-    // Tactus: attach imports to tactic proof fns.
+    // Tactus: attach imports to tactic proof fns AND tactus_auto exec fns.
     // tactic_by survives the visitor (only erase_spec_fields clears it,
     // which is only called for trait methods in syntax_trait.rs).
+    //
+    // BUG-exec-fn-imports.md (2026-05-17): pre-fix, only `tactic_by`
+    // proof fns received the imports — exec fns marked
+    // `#[verifier::tactus_auto]` got nothing, so Mathlib tactics like
+    // `nlinarith` / `ring` used inside their `assert(P) by { ... }`
+    // blocks failed with "unknown tactic." File-level `import` lines
+    // should reach every Tactus-generated Lean file, regardless of
+    // whether the source fn is proof-mode or exec-mode.
     if !items.imports.is_empty() {
         for item in &mut items.items {
             if let Item::Fn(f) = item {
-                if f.sig.spec.tactic_by.is_some() {
+                let is_proof_fn_with_tactic = f.sig.spec.tactic_by.is_some();
+                let is_tactus_auto = f.attrs.iter().any(|attr| {
+                    // verifier::tactus_auto
+                    (attr.path().segments.len() == 2
+                        && attr.path().segments[0].ident == "verifier"
+                        && attr.path().segments[1].ident == "tactus_auto")
+                    // verifier(tactus_auto)
+                    || (attr.path().segments.len() == 1
+                        && attr.path().segments[0].ident == "verifier"
+                        && match &attr.meta {
+                            verus_syn::Meta::List(list) => {
+                                list.tokens.to_string() == "tactus_auto"
+                            }
+                            _ => false,
+                        })
+                });
+                if is_proof_fn_with_tactic || is_tactus_auto {
                     let span = f.sig.fn_token.span;
                     for imp in &items.imports {
                         f.attrs.push(mk_verus_attr(span, quote! { lean_import(#imp) }));

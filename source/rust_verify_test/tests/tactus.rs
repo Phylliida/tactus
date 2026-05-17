@@ -9847,6 +9847,54 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === Imports threaded to exec fn theorem files (BUG-exec-fn-imports.md) ===
+//
+// Pre-fix, `import Mathlib.Tactic.X` at file top reached proof fn
+// generated files but NOT exec fn (tactus_auto) ones — Mathlib tactics
+// like `nlinarith` / `ring` used inside `assert(P) by { ... }` blocks
+// failed with "unknown tactic." Fix in builtin_macros/syntax.rs:
+// `lean_import` attrs now attach to both `tactic_by` proof fns AND
+// `verifier::tactus_auto` exec fns.
+//
+// Bare smoke: confirm `nlinarith` sanitization works inside the
+// assert-by block (regression for the FileLoader path).
+test_verify_one_file! {
+    #[test] test_exec_fn_import_threaded_smoke verus_code! {
+        #[verifier::tactus_auto]
+        fn exec_no_import(x: u64, y: u64) -> (r: u64)
+            requires x <= 100, y <= 100
+            ensures r == 0
+        {
+            assert(x * y <= 10000) by { nlinarith }
+            0
+        }
+    } => Err(err) => {
+        // Without the import, nlinarith is unknown — confirms the
+        // sanitization is working (Rust isn't seeing `nlinarith` as
+        // an identifier) and isolates the failure to "Mathlib tactic
+        // unavailable at Lean elaboration time."
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("Lean") || msg.contains("unknown tactic"),
+            "Expected Lean failure, got: {}", msg);
+    }
+}
+
+// With the import, the Mathlib tactic should be available.
+test_verify_one_file! {
+    #[test] test_exec_fn_import_threaded verus_code! {
+        import Mathlib.Tactic.Linarith
+
+        #[verifier::tactus_auto]
+        fn exec_with_assert(x: u64, y: u64) -> (r: u64)
+            requires x <= 100, y <= 100
+            ensures r == 0
+        {
+            assert(x * y <= 10000) by { nlinarith }
+            0
+        }
+    } => Ok(())
+}
+
 // === Trait deferred edges (DESIGN.md sweep) ===
 //
 // Three edges flagged as "likely works but not pinned" in DESIGN.md's
