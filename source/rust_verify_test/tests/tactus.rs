@@ -10145,6 +10145,32 @@ test_verify_one_file_with_options! {
 //
 // Pinned as Err pending Bug C fix; flips to Ok when the synthesized
 // body lands.
+// Probe (Bug D): pre/post substitution for new-mut-ref ensures
+// inlining. Same-crate version to isolate from vstd shapes.
+test_verify_one_file_with_options! {
+    #[test] test_new_mut_ref_pre_post_substitution_probe ["new-mut-ref"] => verus_code! {
+        // Callee's ensures references BOTH pre and post — same shape
+        // as vstd::vec::vec_index_mut. Verifies that pre/post don't
+        // alias under new-mut-ref caller-side inlining.
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        #[verifier::tactus_auto]
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn caller(y: &mut u8)
+            requires *old(y) < 100
+            ensures *y == *old(y) + 1
+        {
+            bump(y);
+        }
+    } => Ok(())
+}
+
 test_verify_one_file! {
     #[test] test_uninterp_impl_method_body_less_instance_probe verus_code! {
         trait Opaque {

@@ -1970,7 +1970,37 @@ fn rewrite_varat_for_mut_params(
     if mut_param_names.is_empty() {
         return expr.clone();
     }
+    // Helper: extract inner Var from an MutRef* op's argument,
+    // peeling transparent decorations the way `peel_to_var` does
+    // for SST. Returns the inner VarIdent if it's a Var/VarLoc of a
+    // mut param, else None.
+    let extract_mut_var = |inner: &Expr| -> Option<VarIdent> {
+        // Peel transparent VIR-AST decorations (Box/Unbox/Trigger/
+        // CoerceMode wrappers may appear).
+        let mut cursor = inner;
+        loop {
+            match &cursor.x {
+                ExprX::Unary(
+                    vir::ast::UnaryOp::CoerceMode { .. }
+                    | vir::ast::UnaryOp::Trigger(_),
+                    inner,
+                ) => cursor = inner,
+                ExprX::UnaryOpr(
+                    vir::ast::UnaryOpr::Box(_) | vir::ast::UnaryOpr::Unbox(_),
+                    inner,
+                ) => cursor = inner,
+                ExprX::Var(ident) | ExprX::VarLoc(ident) => {
+                    if mut_param_names.contains(&sanitize(&ident.0)) {
+                        return Some(ident.clone());
+                    }
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+    };
     map_expr_visitor(expr, &|e: &Expr| {
+        // Legacy mode: `*old(x)` → `VarAt(x, Pre)` for &mut params.
         if let ExprX::VarAt(ident, VarAt::Pre) = &e.x {
             let raw_name = sanitize(&ident.0);
             if mut_param_names.contains(&raw_name) {
@@ -1988,10 +2018,45 @@ fn rewrite_varat_for_mut_params(
                 ));
             }
         }
+        // New-mut-ref mode: `MutRefCurrent(x)` = pre-state, rewrite
+        // to `Var(<x>_at_pre_tactus)` so caller-side substitution
+        // (in `add_param_subst_entries`) maps it to the caller's
+        // pre-state arg. `MutRefFuture` / `MutRefFinal` are post-
+        // state — they collapse to `Var(x)` which the substitution
+        // map sends to the fresh `_tactus_mut_post_N` existential.
+        // Without this distinction, the bare-pass-through of
+        // `Unary(_, inner)` in `vir_expr_to_ast` aliases both
+        // pre- and post-state to `Var(x)`, mapping them both to
+        // the post-state fresh and producing the substitution bug
+        // observed in `test_exec_call_mut_arg_vec_index_probe`.
+        if let ExprX::Unary(op, inner) = &e.x {
+            match op {
+                vir::ast::UnaryOp::MutRefCurrent => {
+                    if let Some(ident) = extract_mut_var(inner) {
+                        let raw_name = sanitize(&ident.0);
+                        let new_str: vir::ast::Ident =
+                            Arc::new(varat_pre_name(&raw_name));
+                        let new_ident = VarIdent(new_str, ident.1.clone());
+                        return Ok(SpannedTyped::new(
+                            &e.span, &e.typ, ExprX::Var(new_ident),
+                        ));
+                    }
+                }
+                vir::ast::UnaryOp::MutRefFuture(_)
+                | vir::ast::UnaryOp::MutRefFinal(_) => {
+                    if let Some(ident) = extract_mut_var(inner) {
+                        return Ok(SpannedTyped::new(
+                            &e.span, &e.typ, ExprX::Var(ident),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
         Ok(e.clone())
     })
     // The closure only constructs valid Var nodes from existing
-    // VarAt nodes; it cannot fail.
+    // VarAt/MutRef nodes; it cannot fail.
     .expect("rewrite_varat_for_mut_params is structural and shouldn't error")
 }
 
