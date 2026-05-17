@@ -79,7 +79,9 @@ import Mathlib.Tactic.FieldSimp
 
 `import` is a first-class Tactus keyword, not a macro. It mirrors Lean's import syntax exactly because these ARE Lean imports — they control what `import` statements appear in the generated Lean. Users explicitly declare which Mathlib modules they need. No auto-detection.
 
-Tree-sitter-tactus recognizes `import` declarations at the top of files. The proc macro passes them through to the Lean generation layer.
+Tree-sitter-tactus recognizes `import` declarations at the top of files via the `import_declaration` grammar rule: `'import' Ident('.' Ident)*` (no semicolon terminator; matches verus_syn's parser at `builtin_macros/src/syntax.rs:4485-4505`). Without this rule, tree-sitter's error recovery from raw-Rust parse of the `import` line truncates the parse and downstream `assert_expression` / `proof_block` nodes inside exec fn bodies fail to register — FileLoader then sees no brace bodies to sanitize and tactic text reaches rustc as identifier references (BUG-exec-fn-imports.md bug 2, fixed 2026-05-17).
+
+**Attribute propagation**: `builtin_macros/src/syntax.rs:4807` attaches `lean_import` attrs to fns the file's imports should reach. **Both** proof fns with `tactic_by` (`by { ... }` tactic body) **and** exec fns with `#[verifier::tactus_auto]` get attached — file-level imports reach every generated Lean file regardless of fn kind. `rust_to_vir_func` threads these to `FunctionAttrsX.lean_imports`; both `check_proof_fn` and `check_exec_fn` read from `vir_fn.x.attrs.lean_imports` and pass to `krate_preamble`, which emits the imports at the top of every generated `.lean` file. (Pre-2026-05-17 the attachment was gated on `tactic_by`, so exec fn theorem files got no imports — Mathlib tactics inside `assert(P) by { tac }` raised "unknown tactic" at Lean elaboration. BUG-exec-fn-imports.md bug 1.)
 
 ### Spec functions
 
