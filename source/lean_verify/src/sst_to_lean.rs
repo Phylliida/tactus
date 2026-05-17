@@ -1119,6 +1119,25 @@ impl OblCtx {
         goal
     }
 
+    /// Build an explicit-named `intro` list for any frames that did
+    /// NOT extract to theorem level. Each Let / Binder contributes
+    /// its source name; each Hyp contributes `_` (anonymous, gets a
+    /// Lean-side fresh name). Used by `emit_with_closer` to inject
+    /// `intro <names>;` before user-supplied tactic bodies so that
+    /// frames blocked from extraction (typically Let frames for
+    /// outer non-modified vars) still come into the local context
+    /// under their source names rather than as inaccessible `i✝`
+    /// daggers. Empty result means no injection is needed.
+    fn intro_names_for_user_tactic(&self) -> Vec<String> {
+        self.frames.iter().map(|f| match f {
+            CtxFrame::Let(name, _) => name.as_str().to_string(),
+            CtxFrame::Binder(b) => b.name.as_ref()
+                .map(|n| n.as_str().to_string())
+                .unwrap_or_else(|| "_".to_string()),
+            CtxFrame::Hyp(_) => "_".to_string(),
+        }).collect()
+    }
+
     /// Split: pull leading `Binder` frames out as theorem-level binders,
     /// leaving the rest of the frames to wrap into the goal via the
     /// returned `OblCtx`. Used to make loop-modified-var names directly
@@ -1269,8 +1288,29 @@ impl ObligationEmitter {
     ) {
         let (extras, remaining) = obl.split_leading_binders();
         let goal = remaining.wrap(leaf);
+        // For user-tactic emission (assert-by), inject explicit
+        // `intro <names>;` for any frames that COULDN'T extract to
+        // theorem level (typically: Let frames for non-modified outer
+        // vars, plus any Binders/Hyps that came after them and got
+        // blocked). Without injection, those frames stay as `let`/`→`
+        // in the goal, and the user's tactic must `intros` itself —
+        // which produces inaccessible `i✝` dagger names rather than
+        // source names. Injection uses the names we DO have
+        // (Let.name, Binder.name) and `_` for anonymous Hyps. See
+        // `BUG-multi-var-loop-alpha-rename.md`.
+        let intro_names = remaining.intro_names_for_user_tactic();
+        let final_closer = if intro_names.is_empty() {
+            closer
+        } else {
+            let intros = format!("intro {};", intro_names.join(" "));
+            let body = match closer {
+                Tactic::Named(n) => format!("{}\n  {}", intros, n),
+                Tactic::Raw(s) => format!("{}\n  {}", intros, s),
+            };
+            Tactic::Raw(body)
+        };
         self.emit_with_extras(
-            name, goal, closer, obl.closer_preamble.clone(), extras,
+            name, goal, final_closer, obl.closer_preamble.clone(), extras,
         );
     }
 
