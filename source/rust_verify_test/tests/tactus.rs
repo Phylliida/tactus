@@ -10191,6 +10191,31 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Probe (BUG-multi-var-loop-alpha-rename.md): multi-var loop. The
+// outer `let a := 0` blocks my split_leading_binders from reaching
+// the modified-var Binder(i). User can't reference `i` directly.
+test_verify_one_file! {
+    #[test] test_multi_var_loop_assert_by_probe verus_code! {
+        #[verifier::tactus_auto]
+        fn multi_var(n: u64)
+            requires n <= 100
+        {
+            let mut a: u64 = 0;
+            let mut i: u64 = 0;
+            while i < n
+                invariant i <= n, a <= 100
+                decreases n - i
+            {
+                assert(i + 1 <= 101) by {
+                    have h : i + 1 <= 101 := by omega
+                    exact h
+                }
+                i = i + 1;
+            }
+        }
+    } => Ok(())
+}
+
 // Probe (BUG-loop-local-names-alpha-renamed.md): loop-local `i`
 // becomes `i✝¹` inside an `assert(P) by { ... }` inside a loop
 // body. Pinned as Err for now; flips to Ok when the alpha-rename
