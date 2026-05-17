@@ -163,7 +163,40 @@ fn krate_preamble(
     let method_lookup: std::collections::HashMap<&Fun, &FunctionX> = all_fns.iter()
         .map(|f| (&f.name, *f))
         .collect();
-    let mut refs = dep_order::collect_references(&spec_fn_map, &method_lookup, root_fns);
+
+    // Compute helpers_to_emit: proof fns the root might invoke as
+    // lemmas from `proof { have _ := lemma args }` blocks. Skip
+    // root_fns themselves (the fn being checked emits as the file's
+    // main content), proof fns without a tactic body in
+    // `tactic_bodies` (uninterp trait method decls etc.), and
+    // `TraitMethodDecl` / `TraitMethodImpl` (those live inside
+    // class/instance declarations, not as standalone theorems).
+    //
+    // These helpers' dep-walk roots feed into the spec-fn dep walk
+    // alongside `root_fns`, so any spec fn / datatype / trait the
+    // helpers transitively reference also lands in the preamble.
+    // See BUG-no-helper-proof-fn-call-from-exec.md.
+    let root_fn_set: std::collections::HashSet<&Fun> =
+        root_fns.iter().map(|f| &f.name).collect();
+    let helpers_to_emit: Vec<&FunctionX> = krate.functions.iter()
+        .map(|f| &f.x)
+        .filter(|f| matches!(f.mode, vir::ast::Mode::Proof))
+        .filter(|f| !root_fn_set.contains(&f.name))
+        .filter(|f| !matches!(
+            f.kind,
+            FunctionKind::TraitMethodDecl { .. } | FunctionKind::TraitMethodImpl { .. }
+        ))
+        .filter(|f| tactic_bodies.contains_key(&f.name))
+        .collect();
+    // Extended root set for dep walking: root_fns + helpers. The dep
+    // walk will pick up all transitive spec-fn / datatype refs from
+    // both, so helpers can be emitted alongside spec fns without
+    // unresolved-reference errors.
+    let dep_walk_roots: Vec<&FunctionX> = root_fns.iter().copied()
+        .chain(helpers_to_emit.iter().copied())
+        .collect();
+
+    let mut refs = dep_order::collect_references(&spec_fn_map, &method_lookup, &dep_walk_roots);
 
     // Transitive trait-bound closure: when a trait emits its class
     // declaration, parent-trait bounds (e.g., `trait Sub: Super`
@@ -221,7 +254,7 @@ fn krate_preamble(
     // those traits' classes MUST also emit (the Instance references
     // the class). This is the structural co-dependency that the
     // pre-2026-05-12 `refs.traits`-only gate hid by accident.
-    let groups = dep_order::order_spec_fns(&spec_fn_map, &method_lookup, &all_fns, root_fns);
+    let groups = dep_order::order_spec_fns(&spec_fn_map, &method_lookup, &all_fns, &dep_walk_roots);
     let instances_to_emit: Vec<(&TraitImpl, Vec<&FunctionX>)> = krate.trait_impls.iter()
         .filter_map(|ti| {
             let trait_short = short_name(&ti.x.trait_path);
@@ -335,6 +368,42 @@ fn krate_preamble(
                 cmds.push(Command::Mutual(inner));
             }
         }
+    }
+
+    // Emit proof-fn theorems for helper proof fns the root fn might
+    // invoke from `proof { have _ := some_lemma args }` blocks (or
+    // `assert(P) by { have _ := some_lemma args }`). Without this,
+    // exec fn theorems can't reference helper proof fns by name —
+    // "Unknown identifier `some_lemma`". See
+    // BUG-no-helper-proof-fn-call-from-exec.md.
+    //
+    // Their transitive spec-fn deps were already added to the
+    // preamble at dep-walk time (we extended `helpers_to_emit` into
+    // the `proof_fns` arg passed to `collect_references` /
+    // `order_spec_fns` earlier in this fn). So all the spec fns the
+    // helpers need are in scope by the time we emit them here.
+    //
+    // Skip within the loop:
+    // * root_fns themselves (the proof fn we're checking IS its own
+    //   file's main theorem; emitting it twice would conflict)
+    // * proof fns without a tactic body in `tactic_bodies` (these
+    //   are either trait method decls without defaults, or impl
+    //   methods whose body is the user's `by { }` tactic — both
+    //   emit elsewhere)
+    // * `FunctionKind::TraitMethodDecl` / `TraitMethodImpl` — those
+    //   live inside class/instance declarations, not as standalone
+    //   theorems
+    //
+    // Ordering: source order works in the common case (user defines
+    // helpers before callers). True forward-refs between proof fns
+    // would need topological sort; deferred until a case surfaces.
+    for f in &helpers_to_emit {
+        let tactic_body = tactic_bodies.get(&f.name)
+            .expect("helpers_to_emit is built from tactic_bodies — \
+                     every entry has a tactic body");
+        cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(
+            f, tactic_body, &fn_map,
+        )));
     }
 
     // Classes WITH proof-fn methods emit AFTER spec fns (their

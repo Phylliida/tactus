@@ -1389,7 +1389,13 @@ fn proof_fn_method_type(
     // re-binders inside `mul_assoc`'s type.
     let mut binders = class_method_value_binders(func);
     for (i, req) in func.require.iter().enumerate() {
-        let req_ty = strip_class_qualifier(vir_expr_to_ast(req), class_name, sibling_methods);
+        // Inside the class declaration, sibling refs can use bare
+        // names (the class's own scope) — pass empty `impl_prefix`
+        // to get the bare-name rewrite. Instance bodies use a
+        // non-empty prefix to route to impl-specific standalones.
+        let req_ty = strip_class_qualifier(
+            vir_expr_to_ast(req), class_name, "", sibling_methods,
+        );
         // Requires render as named hypothesis binders following the
         // `_tactus_<role>_<id>` reserved-name convention (see
         // expr_shared.rs § "Reserved identifier conventions").
@@ -1403,7 +1409,7 @@ fn proof_fn_method_type(
         });
     }
     let ensures = and_all(func.ensure.0.iter()
-        .map(|e| strip_class_qualifier(vir_expr_to_ast(e), class_name, sibling_methods))
+        .map(|e| strip_class_qualifier(vir_expr_to_ast(e), class_name, "", sibling_methods))
         .collect());
 
     let goal = if is_unit_typ(&func.ret.x.typ) {
@@ -1440,27 +1446,50 @@ fn proof_fn_method_type(
 /// docstring for why. This helper applies the rewrite to a fully-
 /// rendered LExpr, walking via the existing structural map_children
 /// machinery so we don't have to enumerate every ExprNode variant.
+/// Rewrite `Class.method` refs inside an instance body to the
+/// disambiguated standalone-def name (`<impl_prefix>.method`).
+/// Lean's `instance` construction can't forward-reference siblings
+/// via class dispatch (the instance isn't available for synthesis
+/// during its own definition — see Lean reference manual §
+/// "Instance Declarations"). So sibling refs in impl method bodies
+/// must go through the standalone defs that `spec_fn_to_ast` emits,
+/// at their post-disambiguation names (per `lean_name`'s impl-
+/// marker preservation, 2026-05-17 fix for
+/// BUG-no-helper-proof-fn-call-from-exec.md).
+///
+/// `impl_prefix` is the dotted-path prefix shared by all siblings
+/// of THIS impl (computed by dropping the last segment of any
+/// impl method's `lean_name` rendering — e.g., for `MyInt::is_zero`
+/// at full path `test_crate.impl__0.is_zero`, the prefix is
+/// `test_crate.impl__0`). Passed in by `trait_impl_to_ast`.
 fn strip_class_qualifier(
     expr: LExpr,
     class_name: &str,
+    impl_prefix: &str,
     sibling_methods: &std::collections::HashSet<String>,
 ) -> LExpr {
-    let prefix = format!("{}.", class_name);
-    strip_class_qualifier_rec(expr, &prefix, sibling_methods)
+    let class_prefix = format!("{}.", class_name);
+    strip_class_qualifier_rec(expr, &class_prefix, impl_prefix, sibling_methods)
 }
 
 fn strip_class_qualifier_rec(
     expr: LExpr,
-    prefix: &str,
+    class_prefix: &str,
+    impl_prefix: &str,
     sibling_methods: &std::collections::HashSet<String>,
 ) -> LExpr {
     match &expr.node {
         ExprNode::Var(name) => {
             let s = name.as_str();
-            if let Some(rest) = s.strip_prefix(prefix) {
+            if let Some(rest) = s.strip_prefix(class_prefix) {
                 if sibling_methods.contains(rest) {
+                    let disambiguated = if impl_prefix.is_empty() {
+                        rest.to_string()
+                    } else {
+                        format!("{}.{}", impl_prefix, rest)
+                    };
                     return LExpr::new(ExprNode::Var(
-                        crate::lean_name::LeanName::synthetic(rest.to_string()),
+                        crate::lean_name::LeanName::synthetic(disambiguated),
                     ));
                 }
             }
@@ -1468,7 +1497,7 @@ fn strip_class_qualifier_rec(
         }
         _ => {
             let node = crate::lean_ast::map_children(&expr.node, |c: &LExpr| {
-                strip_class_qualifier_rec(c.clone(), prefix, sibling_methods)
+                strip_class_qualifier_rec(c.clone(), class_prefix, impl_prefix, sibling_methods)
             });
             LExpr::new(node)
         }
@@ -1548,6 +1577,20 @@ pub fn trait_impl_to_ast(
     let sibling_methods: std::collections::HashSet<String> = method_impls.iter()
         .filter_map(|f| f.name.path.segments.last().map(|s| s.to_string()))
         .collect();
+    // Compute the impl prefix: drop the last segment from any impl
+    // method's lean_name. All siblings of this impl share the same
+    // prefix (they live in the same impl block). The prefix is what
+    // disambiguates this impl's standalone defs from other impls of
+    // the same trait — e.g., `test_crate.impl__0` for MyInt's impl
+    // vs `test_crate.impl__1` for MyNat's impl. Empty if for some
+    // reason there are no impl methods (shouldn't happen, but
+    // defensive).
+    let impl_prefix: String = method_impls.first()
+        .map(|f| {
+            let full = crate::to_lean_type::lean_name(&f.name.path);
+            full.rfind('.').map(|i| full[..i].to_string()).unwrap_or_default()
+        })
+        .unwrap_or_default();
 
     let methods = method_impls.iter()
         .filter_map(|func| {
@@ -1595,6 +1638,7 @@ pub fn trait_impl_to_ast(
                 (vir::ast::Mode::Spec, Some(body)) => strip_class_qualifier(
                     vir_expr_to_ast(body),
                     &trait_short,
+                    &impl_prefix,
                     &sibling_methods,
                 ),
                 (vir::ast::Mode::Exec, Some(_)) => {
@@ -1663,6 +1707,7 @@ pub fn trait_impl_to_ast(
                         let value = strip_class_qualifier(
                             vir_expr_to_ast(body),
                             &trait_short,
+                            &impl_prefix,
                             &sibling_methods,
                         );
                         // `rfl` closes when body matches ensures
