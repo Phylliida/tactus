@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**As of last green checkpoint (`7db0654`): 424 end-to-end tests + 1 coverage test + 195 unit tests + 7 integration tests pass.** Current HEAD (`5cb4a75`, WIP): 418/425 e2e pass — 7 trait tests fail under in-progress helper-proof-fn + impl-method-disambiguation work. vstd verified at the green checkpoint (1530 functions, 0 errors); not re-verified at HEAD. The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**425 end-to-end tests + 1 coverage test + 195 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -4839,10 +4839,19 @@ refs inside instance bodies (matching the disambiguated standalone
 name) while class declarations still pass empty prefix → bare-name
 rewrite.
 
-**State as of commit (`5cb4a75`)**: 418 / 425 e2e tests pass; 7
-trait tests still fail. Failures are patterns that still rely on
-the old bare-name convention; need either further strip updates,
-test tactic rewrites, or both. vstd not yet re-verified.
+**Completed in `6a936eb`**: 425 / 425 e2e tests pass, vstd 1530/0.
+The remaining 7 fails after the WIP commit were a single ordering
+bug — helpers were emitted between spec fns and classes, but
+helpers may use typeclass dispatch which needs instances declared
+first. Moving helper emission to AFTER instances fixed 6 of 7.
+The last (`test_uninterp_impl_method_body_less_instance_probe`)
+was an inconsistency between `lean_name` (which I'd updated to
+keep impl segments) and `LeanName::from_path` (a duplicate in
+lean_name.rs that still filtered — Bug C's synth body used
+from_path and emitted at the bare name). Updated from_path
+consistently; also extended `sanitize` in BOTH copies
+(to_lean_type.rs and lean_name.rs) to replace `&` along with
+`@ # %`.
 
 Discipline note worth recording: I was zig-zagging earlier on
 this fix — first attempted a global lean_name change (24 fails),
@@ -4851,8 +4860,24 @@ approach), and the user pushed back with "what happened to our
 planned approach? This seems hacky." The right plan was the
 ORIGINAL one: single consistent `lean_name`, propagate the change
 through all consumers. Sticking to it required also fixing
-strip_class_qualifier and sanitize. The hedging cost time and
-muddied the architecture; the user's correction was right.
+strip_class_qualifier and sanitize. Plus catching the duplicate
+filter in `LeanName::from_path` (different file, same logic — the
+type of thing the typed-invariant pattern would prevent if there
+were a single source of truth for path → lean name conversion).
+The hedging cost time and muddied the architecture; the user's
+correction was right.
+
+**Two duplicated bits of logic discovered along the way** (not
+fixed, flagged for future):
+* `lean_name` (to_lean_type.rs) and `LeanName::from_path`
+  (lean_name.rs) both convert VIR paths to Lean dotted names. They
+  had identical (now-changed) impl-segment filtering. Updating one
+  required updating the other. A single source of truth would
+  prevent silent divergence.
+* `sanitize` is duplicated between to_lean_type.rs and lean_name.rs
+  with parallel `needs_sanitization` / character-replacement
+  logic. Same situation — adding `&` to one required adding to the
+  other. Could share one helper.
 
 ## Architecture
 
