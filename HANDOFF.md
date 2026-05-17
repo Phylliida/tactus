@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**415 end-to-end tests + 1 coverage test + 195 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**417 end-to-end tests + 1 coverage test + 195 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -4426,6 +4426,85 @@ the USize gap as a side effect).
 (412 → 415); DESIGN.md catalogue refreshed; DESIGN-cast-
 hygiene.md updated with the vstd probe finding. No code changes
 beyond the warnings cleanup.
+
+#### Current session (2026-05-17 continued — BUG-exec-fn-imports.md fix, two bugs)
+
+Downstream tutorial work hit a gating issue: Mathlib tactics
+(`nlinarith`, `ring`, `linarith`, etc.) raised "unknown tactic"
+inside `assert(P) by { ... }` blocks in `tactus_auto` exec fns,
+even when the user wrote `import Mathlib.Tactic.X` at file top.
+Root-causing surfaced TWO distinct bugs (the user's report only
+captured the symptom of one).
+
+**Bug 1 — syntax.rs attribute attachment.** Pre-fix,
+`builtin_macros/src/syntax.rs:4807` attached `lean_import` attrs
+only to fns with `tactic_by` (proof fns). Exec fns marked
+`#[verifier::tactus_auto]` got nothing. So even when the file's
+tactic bodies were sanitized correctly, the generated `.lean`
+file for an exec fn theorem didn't include the user's imports,
+and Lean rejected unknown tactics. **Fix**: also attach when the
+fn has `verifier::tactus_auto` attr (either `verifier::tactus_auto`
+or `verifier(tactus_auto)` shape), mirroring how `is_external`
+detects the equivalent attr.
+
+**Bug 2 — tree-sitter-tactus grammar.** Surfaced by writing a
+regression test for bug 1: rustc rejected with E0425 "cannot
+find value `nlinarith`" BEFORE Lean even ran. Probing with
+`TACTUS_FILE_LOADER_DEBUG` showed `find_tactic_block_ranges`
+returned `[]` for files containing `import` lines but `[(478, 489)]`
+for the same file without import. Root cause: tree-sitter-tactus
+had no grammar rule for `import Foo.Bar.Baz` declarations.
+tree-sitter's error recovery from raw-Rust parse of the `import`
+line lost track of downstream `assert_expression` /
+`proof_block` brace bodies inside exec fn bodies. FileLoader saw
+no tactic blocks to sanitize.
+
+The reporter's environment apparently didn't surface bug 2 (their
+reproducer had both a proof fn AND exec fn — the proof fn's
+signature-level `by { }` survives the broken parse, perhaps
+because it appears earlier in the parse tree before recovery
+truncates). Our single-fn test triggered it reliably.
+
+**Fix (bug 2)**: in `tree-sitter-tactus` submodule:
+- Added `'import'` to the keyword list in the token_tree special tokens.
+- Added `import_declaration: 'import' Ident('.' Ident)*` rule
+  matching verus_syn's parser at `syntax.rs:4485-4505` (no
+  semicolon terminator; rule ends when next dotted segment fails).
+- Added `$.import_declaration` to `_declaration_statement` choice
+  so it's reachable inside `verus! { ... }` macro body parsed as
+  statements (line 1135's `repeat($._statement)`).
+- Regenerated `parser.c`, `grammar.json`, `node-types.json`.
+- 3 new corpus tests pin the rule.
+
+**Discipline note worth recording: root-causing matters.** Initial
+instinct was to land bug 1's fix (the user's symptom) and call it
+done. The regression test surfaced bug 2 in a way that LOOKED
+like a workaround need ("the FileLoader needs to handle imports
+specially"). The user's pushback — *"this all seems a lil sussy,
+have we root caused the issue?"* — caught the temptation to
+patch over a real grammar gap. Tracing FileLoader's tree-sitter
+output via env-var debug revealed the two-bug structure cleanly.
+The right fix was in the grammar, not in the FileLoader.
+
+**Pinned tests**:
+- `test_exec_fn_import_threaded_smoke` (Err pattern, without
+  import) — confirms FileLoader sanitization works in the
+  baseline case; the rustc-vs-Lean-failure distinction surfaces
+  bug 2 cleanly when imports are present.
+- `test_exec_fn_import_threaded` (Ok, with import) — confirms
+  both bugs are fixed end-to-end; `nlinarith` resolves via the
+  imported `Mathlib.Tactic.Linarith`.
+
+**Submodule pointer bumped** in the parent repo's commit.
+
+**Net**: 415 → 417 e2e (+2), 195 unit, 199 → 202 tree-sitter (+3
+grammar tests), vstd 1530/0. Two commits: tree-sitter submodule
+(grammar + parser regen + corpus tests) and parent (syntax.rs
+fix + submodule pointer + e2e regressions).
+
+The downstream tutorial chapter 4 (iterative factorial against
+recursive spec) — and any other realistic exec verification
+needing nonlinear arithmetic — is now unblocked.
 
 ## Architecture
 
