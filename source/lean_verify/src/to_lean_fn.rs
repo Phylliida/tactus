@@ -1551,16 +1551,53 @@ pub fn trait_impl_to_ast(
 
     let methods = method_impls.iter()
         .filter_map(|func| {
-            func.body.as_ref()?;
             let short = func.name.path.segments.last()
                 .map(|s| s.as_str()).unwrap_or("_");
-            let body_expr = match func.mode {
-                vir::ast::Mode::Spec => strip_class_qualifier(
-                    vir_expr_to_ast(func.body.as_ref().unwrap()),
+            // Body=None impl methods (`uninterp spec fn ...;`) get a
+            // synthesized body that dispatches to the standalone axiom
+            // emitted by `spec_fn_to_ast`. Without this the instance
+            // declares but doesn't provide the method, and Lean rejects.
+            // The standalone axiom has signature `(typ_params...)
+            // [bounds...] (params...) -> RetTy`; partial-applying the
+            // typ_params (which are in scope as implicit binders on the
+            // instance) plus param vars in the lambda body gives a
+            // function matching the class field type via eta-expansion.
+            // Spec-mode only — body=None proof and exec methods are
+            // structurally invalid (Verus would have rejected) so the
+            // filter still drops them.
+            let body_expr = match (func.mode, &func.body) {
+                (vir::ast::Mode::Spec, None) => {
+                    let standalone = LExpr::new(ExprNode::Var(
+                        crate::lean_name::LeanName::from_path(&func.name.path)
+                    ));
+                    let mut args: Vec<LExpr> = func.typ_params.iter().map(|tp| {
+                        LExpr::new(ExprNode::Var(
+                            crate::lean_name::LeanName::lit(tp.as_str())
+                        ))
+                    }).collect();
+                    for p in func.params.iter() {
+                        args.push(LExpr::new(ExprNode::Var(
+                            crate::lean_name::LeanName::synthetic(
+                                sanitize(p.x.name.0.as_str())
+                            )
+                        )));
+                    }
+                    if args.is_empty() {
+                        standalone
+                    } else {
+                        LExpr::new(ExprNode::App {
+                            head: Box::new(standalone),
+                            args,
+                        })
+                    }
+                }
+                (vir::ast::Mode::Proof, None) | (vir::ast::Mode::Exec, None) => return None,
+                (vir::ast::Mode::Spec, Some(body)) => strip_class_qualifier(
+                    vir_expr_to_ast(body),
                     &trait_short,
                     &sibling_methods,
                 ),
-                vir::ast::Mode::Exec => {
+                (vir::ast::Mode::Exec, Some(_)) => {
                     // Exec placeholder. `default` produces a value
                     // of any type, satisfying Lean's instance-completeness
                     // requirement without needing to render the
@@ -1568,7 +1605,7 @@ pub fn trait_impl_to_ast(
                     // at call sites, not bodies via typeclass dispatch.
                     LExpr::var_lit("default")
                 }
-                vir::ast::Mode::Proof => {
+                (vir::ast::Mode::Proof, Some(_)) => {
                     // Proof methods. Two cases based on return type:
                     //
                     // (a) Unit return: the class method's TYPE is
