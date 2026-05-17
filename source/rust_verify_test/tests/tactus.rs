@@ -10128,3 +10128,39 @@ test_verify_one_file_with_options! {
         }
     } => Err(_)
 }
+
+// Probe (2026-05-17): minimal same-crate `uninterp spec fn` impl method.
+//
+// Isolates Bug C from the View-trait emission cluster: when an impl
+// method has `body = None` (Verus's `uninterp` keyword), the impl is
+// emitted with NO method body — `trait_impl_to_ast`'s
+// `func.body.as_ref()?` filter drops it. Lean rejects an instance that
+// declares but doesn't provide all class fields.
+//
+// Same-crate avoids the cross-crate trait+instance emission bugs in
+// the Vec View test, so we can focus on the body-less case in
+// isolation. The standalone def `view.view` (which `spec_fn_to_ast`
+// emits as an axiom when body=None) IS the dispatch target the
+// instance method should reference.
+//
+// Pinned as Err pending Bug C fix; flips to Ok when the synthesized
+// body lands.
+test_verify_one_file! {
+    #[test] test_uninterp_impl_method_body_less_instance_probe verus_code! {
+        trait Opaque {
+            spec fn shadow(&self) -> int;
+        }
+
+        struct Hidden { v: int }
+
+        impl Opaque for Hidden {
+            uninterp spec fn shadow(&self) -> int;
+        }
+
+        proof fn touches_opaque(h: &Hidden)
+            ensures h.shadow() == h.shadow()
+        by {
+            omega
+        }
+    } => Ok(())
+}
