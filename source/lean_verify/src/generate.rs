@@ -370,42 +370,6 @@ fn krate_preamble(
         }
     }
 
-    // Emit proof-fn theorems for helper proof fns the root fn might
-    // invoke from `proof { have _ := some_lemma args }` blocks (or
-    // `assert(P) by { have _ := some_lemma args }`). Without this,
-    // exec fn theorems can't reference helper proof fns by name —
-    // "Unknown identifier `some_lemma`". See
-    // BUG-no-helper-proof-fn-call-from-exec.md.
-    //
-    // Their transitive spec-fn deps were already added to the
-    // preamble at dep-walk time (we extended `helpers_to_emit` into
-    // the `proof_fns` arg passed to `collect_references` /
-    // `order_spec_fns` earlier in this fn). So all the spec fns the
-    // helpers need are in scope by the time we emit them here.
-    //
-    // Skip within the loop:
-    // * root_fns themselves (the proof fn we're checking IS its own
-    //   file's main theorem; emitting it twice would conflict)
-    // * proof fns without a tactic body in `tactic_bodies` (these
-    //   are either trait method decls without defaults, or impl
-    //   methods whose body is the user's `by { }` tactic — both
-    //   emit elsewhere)
-    // * `FunctionKind::TraitMethodDecl` / `TraitMethodImpl` — those
-    //   live inside class/instance declarations, not as standalone
-    //   theorems
-    //
-    // Ordering: source order works in the common case (user defines
-    // helpers before callers). True forward-refs between proof fns
-    // would need topological sort; deferred until a case surfaces.
-    for f in &helpers_to_emit {
-        let tactic_body = tactic_bodies.get(&f.name)
-            .expect("helpers_to_emit is built from tactic_bodies — \
-                     every entry has a tactic body");
-        cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(
-            f, tactic_body, &fn_map,
-        )));
-    }
-
     // Classes WITH proof-fn methods emit AFTER spec fns (their
     // Prop-typed class fields reference the spec fns in scope).
     for tr in &krate.traits {
@@ -428,6 +392,44 @@ fn krate_preamble(
         cmds.push(Command::Instance(
             to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, tactic_bodies)
         ));
+    }
+
+    // Emit proof-fn theorems for helper proof fns the root fn might
+    // invoke from `proof { have _ := some_lemma args }` blocks (or
+    // `assert(P) by { have _ := some_lemma args }`). Without this,
+    // exec fn theorems can't reference helper proof fns by name —
+    // "Unknown identifier `some_lemma`". See
+    // BUG-no-helper-proof-fn-call-from-exec.md.
+    //
+    // Emitted AFTER instances because helper proof fns may use
+    // typeclass dispatch on trait methods (`Trait.method val`) which
+    // requires the corresponding `instance` to be already declared.
+    // Their transitive spec-fn / datatype / trait refs were already
+    // added to the preamble via `dep_walk_roots` extension at the
+    // top of this fn, so all dependencies are in scope by this
+    // point.
+    //
+    // Skip within the loop:
+    // * root_fns themselves (the proof fn we're checking IS its own
+    //   file's main theorem; emitting it twice would conflict)
+    // * proof fns without a tactic body in `tactic_bodies` (these
+    //   are either trait method decls without defaults, or impl
+    //   methods whose body is the user's `by { }` tactic — both
+    //   emit elsewhere)
+    // * `FunctionKind::TraitMethodDecl` / `TraitMethodImpl` — those
+    //   live inside class/instance declarations, not as standalone
+    //   theorems
+    //
+    // Ordering: source order works in the common case (user defines
+    // helpers before callers). True forward-refs between proof fns
+    // would need topological sort; deferred until a case surfaces.
+    for f in &helpers_to_emit {
+        let tactic_body = tactic_bodies.get(&f.name)
+            .expect("helpers_to_emit is built from tactic_bodies — \
+                     every entry has a tactic body");
+        cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(
+            f, tactic_body, &fn_map,
+        )));
     }
 
     (cmds, ns)

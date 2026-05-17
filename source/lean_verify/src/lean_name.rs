@@ -97,18 +97,20 @@ impl LeanName {
     }
 
     /// Convert a VIR `Path` to a Lean dotted name, skipping the crate prefix
-    /// and synthetic impl-block segments.
-    /// `crate::module::name` → `module.name`.
+    /// `crate::module::name` → `module.name`. Keeps synthetic impl
+    /// markers (`impl&%0` → `impl__0` after sanitize) to disambiguate
+    /// impl method names — see `to_lean_type::lean_name` for the
+    /// motivation (BUG-no-helper-proof-fn-call-from-exec.md surfaced
+    /// the collision when the dep walk widened to include multiple
+    /// impls in a single file).
     pub fn from_path(path: &Path) -> Self {
-        // Filter out synthetic impl segments (e.g., "impl&%0") — these are
-        // VIR-internal names for trait impl blocks, not user-visible names.
-        let relevant: Vec<_> = path.segments.iter()
-            .filter(|s| !(s.starts_with("impl") && s.bytes().any(|b| b == b'&' || b == b'%')))
+        let segments: Vec<String> = path.segments.iter()
+            .map(|s| sanitize_string(s))
             .collect();
-        if relevant.len() == 1 && !needs_sanitization(&relevant[0]) {
-            return Self(relevant[0].to_string());
+        if segments.len() == 1 && !needs_sanitization(&path.segments[0]) {
+            return Self(path.segments[0].to_string());
         }
-        Self(relevant.iter().map(|s| sanitize_string(s)).collect::<Vec<_>>().join("."))
+        Self(segments.join("."))
     }
 
     /// Last segment of a VIR `Path`, sanitized. Used where we want just the
@@ -169,12 +171,14 @@ fn sanitize_string(s: &str) -> String {
     if is_lean_keyword(s) {
         format!("«{}»", s)
     } else {
-        s.chars().map(|c| match c { '@' | '#' | '%' => '_', _ => c }).collect()
+        s.chars().map(|c| match c { '@' | '#' | '%' | '&' => '_', _ => c }).collect()
     }
 }
 
 fn needs_sanitization(s: &str) -> bool {
-    is_lean_keyword(s) || s.bytes().any(|b| b == b'@' || b == b'#' || b == b'%')
+    is_lean_keyword(s) || s.bytes().any(|b|
+        b == b'@' || b == b'#' || b == b'%' || b == b'&'
+    )
 }
 
 /// Does the base name need disambiguation? True iff it contained
