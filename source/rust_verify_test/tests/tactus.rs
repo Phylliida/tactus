@@ -10164,3 +10164,28 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// Probe (BUG-loop-local-names-alpha-renamed.md): loop-local `i`
+// becomes `i✝¹` inside an `assert(P) by { ... }` inside a loop
+// body. Pinned as Err for now; flips to Ok when the alpha-rename
+// is fixed.
+test_verify_one_file! {
+    #[test] test_loop_local_name_in_assert_by_probe verus_code! {
+        #[verifier::tactus_auto]
+        fn loop_alpha(n: u64)
+            requires n <= 100
+        {
+            let mut i: u64 = 0;
+            while i < n
+                invariant i <= n
+                decreases n - i
+            {
+                assert(i + 1 <= 101) by {
+                    have h : i + 1 <= 101 := by omega
+                    exact h
+                }
+                i = i + 1;
+            }
+        }
+    } => Ok(())
+}
