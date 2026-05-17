@@ -9847,6 +9847,34 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === FileLoader by-in-comment regression (BUG-fileloader-by-in-comment.md) ===
+//
+// Three-condition trigger: (1) prior `by { ... }` block, (2) `//`
+// comment ending with `by`, (3) next `//` comment starting with `{`.
+// Without the fix, the real downstream `by { ... }` is left
+// unsanitized and rustc rejects tactic names as identifiers.
+test_verify_one_file! {
+    #[test] test_fileloader_by_in_comment_regression verus_code! {
+        proof fn warmup()
+            ensures 1 + 1 == 2
+        by {
+            decide
+        }
+
+        // `assert(P) by
+        // { x }`
+
+        #[verifier::tactus_auto]
+        fn f(x: u64) -> (r: u64)
+            requires x < 100
+            ensures r == 0
+        {
+            assert(x < 100) by { intros; omega };
+            0
+        }
+    } => Ok(())
+}
+
 // === Imports threaded to exec fn theorem files (BUG-exec-fn-imports.md) ===
 //
 // Pre-fix, `import Mathlib.Tactic.X` at file top reached proof fn

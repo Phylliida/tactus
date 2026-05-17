@@ -247,6 +247,47 @@ mod tests {
         assert_eq!(sanitize_tactic_blocks(src), src);
     }
 
+    /// Regression for BUG-fileloader-by-in-comment.md.
+    ///
+    /// A `by` keyword inside a `//` comment followed by `{` on the
+    /// next comment line was being treated by tree-sitter as part of
+    /// a tactic structure, breaking sanitization of the real
+    /// `by { ... }` later in the file. The right fix is in the
+    /// grammar — see tree-sitter-tactus/grammar.js. This test
+    /// pins the file-loader behavior end-to-end: the real tactic
+    /// body's content gets replaced with spaces.
+    #[test]
+    fn test_by_in_comment_does_not_break_sanitization() {
+        let src = "\
+::verus_builtin_macros::verus!{
+proof fn warmup() ensures true by { decide }
+
+// `assert(P) by
+// { x }`
+
+#[verifier::tactus_auto]
+fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
+    assert(x < 100) by { intros; omega };
+    0
+}
+}";
+        let sanitized = sanitize_tactic_blocks(src);
+        // The real `by { intros; omega }` should have its content
+        // replaced with spaces. `intros` and `omega` should not
+        // appear in the sanitized source.
+        let real_assert_idx = sanitized.find("by {").expect("at least one tactic block visible after sanitize");
+        // Find the LAST `by {` — the real assert-by inside f.
+        let last_assert_idx = sanitized.rfind("by {").expect("real assert-by still in source");
+        // Inside the brace body of the last assert-by, no `intros` / `omega`.
+        let close = sanitized[last_assert_idx..].find('}').expect("close brace");
+        let body = &sanitized[last_assert_idx..last_assert_idx + close];
+        assert!(!body.contains("intros"),
+            "real assert-by body should be sanitized; got body: {:?}", body);
+        assert!(!body.contains("omega"),
+            "real assert-by body should be sanitized; got body: {:?}", body);
+        let _ = real_assert_idx;
+    }
+
     #[test]
     fn test_tactic_block_sanitized() {
         let src = "proof fn test() ensures true by { omega }";
