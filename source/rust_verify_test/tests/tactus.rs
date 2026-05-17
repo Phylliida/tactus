@@ -764,7 +764,7 @@ test_verify_one_file! {
         proof fn trait_method_works()
             ensures (MyNum { val: 42 }).value() == 42
         by {
-            unfold value; simp
+            unfold HasValue.value; rfl
         }
     } => Ok(())
 }
@@ -803,7 +803,7 @@ test_verify_one_file! {
         proof fn impl_works()
             ensures (Wrap { inner: 7 }).val() == 7
         by {
-            unfold val; simp
+            unfold HasVal.val; rfl
         }
     } => Ok(())
 }
@@ -827,15 +827,13 @@ test_verify_one_file! {
         proof fn range_lo()
             ensures (Range { start: 1, end: 10 }).lo() == 1
         by {
-            unfold lo
-            simp
+            unfold Bounds.lo; rfl
         }
 
         proof fn range_hi()
             ensures (Range { start: 1, end: 10 }).hi() == 10
         by {
-            unfold hi
-            simp
+            unfold Bounds.hi; rfl
         }
     } => Ok(())
 }
@@ -862,13 +860,13 @@ test_verify_one_file! {
         proof fn int_zero()
             ensures (MyInt { v: 0 }).is_zero()
         by {
-            unfold is_zero; simp
+            unfold IsZero.is_zero; rfl
         }
 
         proof fn nat_zero()
             ensures (MyNat { v: 0 }).is_zero()
         by {
-            unfold is_zero; simp
+            unfold IsZero.is_zero; rfl
         }
     } => Ok(())
 }
@@ -950,8 +948,7 @@ test_verify_one_file! {
         proof fn box_unwrap()
             ensures (Box { val: 42int }).unwrap() == 42
         by {
-            unfold unwrap
-            simp
+            unfold Wrapper.unwrap; rfl
         }
     } => Ok(())
 }
@@ -973,8 +970,7 @@ test_verify_one_file! {
         proof fn add_works()
             ensures (MyVal { v: 10 }).add(5) == 15
         by {
-            unfold add
-            simp
+            unfold Adder.add; rfl
         }
     } => Ok(())
 }
@@ -1064,8 +1060,7 @@ test_verify_one_file! {
         proof fn peek_works()
             ensures (IntBox { val: 7 }).peek() == 7
         by {
-            unfold peek
-            simp
+            unfold Container.peek; rfl
         }
     } => Ok(())
 }
@@ -1157,8 +1152,7 @@ test_verify_one_file! {
         proof fn always_true_holds()
             ensures (AlwaysTrue {}).holds()
         by {
-            unfold holds
-            simp
+            unfold Predicate.holds; trivial
         }
     } => Ok(())
 }
@@ -8980,7 +8974,7 @@ test_verify_one_file! {
         fn caller(b: &Bar) -> (r: bool)
             ensures r ==> b.v > 0
         {
-            proof { try unfold predicate at * }
+            proof { simp_all [Foo.predicate] }
             b.check()
         }
     } => Ok(())
@@ -9336,7 +9330,7 @@ test_verify_one_file! {
             proof fn val_in_range(&self)
                 ensures self.val() >= 0, self.val() <= 100
             by {
-                simp [val]
+                simp [Bounded.val]
             }
         }
 
@@ -9373,7 +9367,7 @@ test_verify_one_file! {
                 // cannot re-declare. Just ensures + body.
                 ensures self.val() >= 1
             by {
-                simp [val]
+                simp [Conditional.val]
             }
         }
 
@@ -9406,10 +9400,10 @@ test_verify_one_file! {
         impl TwoLemmas for TL {
             spec fn val(&self) -> int { 42 }
             proof fn val_nonneg(&self) ensures self.val() >= 0 by {
-                simp [val]
+                simp [TwoLemmas.val]
             }
             proof fn val_le_max(&self) ensures self.val() <= 1000 by {
-                simp [val]
+                simp [TwoLemmas.val]
             }
         }
 
@@ -9580,7 +9574,7 @@ test_verify_one_file! {
             proof fn val_nonneg(&self)
                 ensures self.val() >= 0
             by {
-                simp [val]
+                simp [MixedModes.val]
             }
         }
 

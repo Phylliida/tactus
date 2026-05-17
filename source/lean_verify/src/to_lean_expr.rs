@@ -104,7 +104,66 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
         // Remaining unary ops: transparent annotations/markers/internal ops.
         ExprX::Unary(_, inner) => expr_to_node(inner),
 
-        ExprX::Call(target, args, _) => call_to_node(target, args),
+        ExprX::Call(target, args, _) => {
+            // Class-method calls (Dynamic / DynamicResolved) use Lean's
+            // typeclass-method auto-binding to infer class type params
+            // from value args. For traits with extra type params beyond
+            // Self (`Container<T>`-style generics) or generic impls
+            // (`Wrapper for Box<int>`), auto-binding can't infer the
+            // type params from value args alone; Lean defaults result-
+            // type literals to `Nat` and fails to find the instance.
+            // Two annotations together fix the inference:
+            // (a) annotate each value arg with its known type, so
+            //     inner generic Ctors (`Box.mk 42`) elaborate against
+            //     the concrete `Box Int` rather than `Box Nat`;
+            // (b) annotate the whole call with its return type, so
+            //     the outer equality's RHS literal infers correctly.
+            // For Self-only traits the annotations are harmless
+            // redundancy; for generic traits / generic impls they are
+            // load-bearing for Lean's instance synthesis.
+            let is_class_method = matches!(target,
+                CallTarget::Fun(CallTargetKind::DynamicResolved { .. }, _, _, _, _, _)
+                | CallTarget::Fun(CallTargetKind::Dynamic, _, _, _, _, _));
+            if is_class_method {
+                let head = match target {
+                    CallTarget::Fun(_, fun, _, _, _, _) => trait_method_ref(fun),
+                    _ => unreachable!("guarded by is_class_method"),
+                };
+                // Annotate each arg only when its type is concrete (no
+                // type-param refs); a TypParam-rooted arg type renders
+                // as `Self%` / `T%` which fail the sanity check when
+                // emitted at call sites that aren't inside a class
+                // declaration. Concrete-typed args are where the
+                // disambiguation matters anyway (literals inside
+                // Ctors of generic types).
+                let app_args: Vec<LExpr> = args.iter().map(|a| {
+                    let arg_node = vir_expr_to_ast(a);
+                    if typ_contains_param(&a.typ) {
+                        arg_node
+                    } else {
+                        LExpr::new(ExprNode::TypeAnnot {
+                            expr: Box::new(arg_node),
+                            ty: Box::new(typ_to_expr(&a.typ)),
+                        })
+                    }
+                }).collect();
+                let app = if app_args.is_empty() {
+                    head
+                } else {
+                    LExpr::new(ExprNode::App { head: Box::new(head), args: app_args })
+                };
+                if typ_contains_param(&expr.typ) {
+                    app.node
+                } else {
+                    ExprNode::TypeAnnot {
+                        expr: Box::new(app),
+                        ty: Box::new(typ_to_expr(&expr.typ)),
+                    }
+                }
+            } else {
+                call_to_node(target, args)
+            }
+        }
 
         ExprX::If(cond, then_e, else_e) => ExprNode::If {
             cond: Box::new(vir_expr_to_ast(cond)),
@@ -328,14 +387,48 @@ fn const_to_node(c: &Constant) -> ExprNode {
     }
 }
 
+/// True if `typ` contains a `TypX::TypParam` or `TypX::Projection`
+/// anywhere in its structure (e.g., `Self%`, `T`, `<Self as Tr>::Out`).
+/// Such types render as bare identifiers that the sanity check rejects
+/// when emitted outside a class declaration body. Used to gate type-
+/// annotation injection at class-method call sites — we annotate only
+/// concrete types where the disambiguation matters anyway.
+fn typ_contains_param(typ: &TypX) -> bool {
+    let mut found = false;
+    crate::to_lean_type::walk_typ(typ, &mut |t| {
+        if matches!(t, TypX::TypParam(_) | TypX::Projection { .. }) {
+            found = true;
+        }
+    });
+    found
+}
+
 fn call_to_node(target: &CallTarget, args: &Exprs) -> ExprNode {
     let head = match target {
         CallTarget::Fun(kind, fun, typs, _, _, _) => {
             match kind {
-                CallTargetKind::DynamicResolved { resolved, .. } => {
-                    var(&lean_name(&resolved.path))
+                CallTargetKind::DynamicResolved { .. } | CallTargetKind::Dynamic => {
+                    // Class-qualified head: `Trait.method`. Lean's
+                    // class-method auto-binding infers Self + assoc
+                    // types from value args. For traits with one
+                    // class type param (Self) this works cleanly:
+                    // `HasValue.value (MyNum.mk 42)` infers
+                    // `Self := MyNum`. For traits with multiple
+                    // class type params (e.g., `Container<T>` with
+                    // user-declared generic T), Lean may not infer
+                    // T from value args alone if the result type's
+                    // literal is ambiguous — `Container.peek
+                    // (IntBox.mk 7) = 7` leaves `T` as a metavar
+                    // and defaults wrong. Passing typs positionally
+                    // would conflict with auto-binding (Self gets
+                    // consumed by auto-bind, our explicit arg lands
+                    // in the wrong slot). Fix needs `@`-prefix
+                    // form to disable auto-binding — AST-level
+                    // support, deferred. Pinned by
+                    // `test_generic_trait_impl`,
+                    // `test_parameterized_trait` as Err for now.
+                    trait_method_ref(fun)
                 }
-                CallTargetKind::Dynamic => trait_method_ref(fun),
                 _ => {
                     // Emit explicit type arguments for generic calls by
                     // building an intermediate App head: `fn T1 T2 …`.
