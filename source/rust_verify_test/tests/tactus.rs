@@ -10191,6 +10191,48 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Bug C: same-crate probe with TYPE PARAMS in the impl method. The
+// synthesized body (`9f77305`) passes typ_params from the impl as
+// positional args to the standalone axiom — generated Lean has
+// `peek := fun (self : _) => peek A self`, which is correct.
+//
+// However, the test is pinned as Err for a DIFFERENT reason: the
+// downstream goal `Container.peek w = Container.peek w` for
+// `w : Wrap A` can't be elaborated because Lean's class-method
+// auto-binding can't infer the second class type param (the trait
+// has `Self` + `A`, both type params; auto-binding gets `Self :=
+// Wrap A` from `w` but can't infer `A`). My Bug A fix gates the
+// TypeAnnot disambiguation on `!typ_contains_param`, and `Wrap A`
+// contains a type param so annotation is skipped. Same gap as
+// `test_generic_trait_impl` / `test_parameterized_trait` had
+// before — those flipped to Ok because their types were concrete
+// (`Wrap u8`); this one's `Wrap A` stays Err.
+//
+// What this probe DOES pin: the Bug C synthesis itself is shape-
+// correct (typ_params + params are passed through). If a future
+// regression breaks the synth, the error message would differ —
+// likely "Unknown identifier `peek`" or signature-mismatch rather
+// than this typeclass-stuck message.
+test_verify_one_file! {
+    #[test] test_uninterp_impl_method_with_type_params_probe verus_code! {
+        trait Container<A> {
+            spec fn peek(&self) -> A;
+        }
+
+        struct Wrap<A> { val: A }
+
+        impl<A> Container<A> for Wrap<A> {
+            uninterp spec fn peek(&self) -> A;
+        }
+
+        proof fn touches_wrap<A>(w: &Wrap<A>)
+            ensures w.peek() == w.peek()
+        by {
+            simp
+        }
+    } => Err(_)
+}
+
 // Probe (BUG-multi-var-loop-alpha-rename.md): multi-var loop. The
 // outer `let a := 0` blocks my split_leading_binders from reaching
 // the modified-var Binder(i). User can't reference `i` directly.

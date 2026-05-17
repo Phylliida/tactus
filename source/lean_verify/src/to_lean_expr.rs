@@ -403,45 +403,24 @@ fn typ_contains_param(typ: &TypX) -> bool {
     found
 }
 
+/// Render a call expression. Class-method calls (`Dynamic` /
+/// `DynamicResolved`) are routed away from this helper by
+/// `expr_to_node`'s `ExprX::Call` arm — those need TypeAnnot
+/// wrapping for generic disambiguation (see `expr_to_node`). So
+/// only Static (and FnSpec / BuiltinSpecFun) calls reach here.
 fn call_to_node(target: &CallTarget, args: &Exprs) -> ExprNode {
     let head = match target {
-        CallTarget::Fun(kind, fun, typs, _, _, _) => {
-            match kind {
-                CallTargetKind::DynamicResolved { .. } | CallTargetKind::Dynamic => {
-                    // Class-qualified head: `Trait.method`. Lean's
-                    // class-method auto-binding infers Self + assoc
-                    // types from value args. For traits with one
-                    // class type param (Self) this works cleanly:
-                    // `HasValue.value (MyNum.mk 42)` infers
-                    // `Self := MyNum`. For traits with multiple
-                    // class type params (e.g., `Container<T>` with
-                    // user-declared generic T), Lean may not infer
-                    // T from value args alone if the result type's
-                    // literal is ambiguous — `Container.peek
-                    // (IntBox.mk 7) = 7` leaves `T` as a metavar
-                    // and defaults wrong. Passing typs positionally
-                    // would conflict with auto-binding (Self gets
-                    // consumed by auto-bind, our explicit arg lands
-                    // in the wrong slot). Fix needs `@`-prefix
-                    // form to disable auto-binding — AST-level
-                    // support, deferred. Pinned by
-                    // `test_generic_trait_impl`,
-                    // `test_parameterized_trait` as Err for now.
-                    trait_method_ref(fun)
-                }
-                _ => {
-                    // Emit explicit type arguments for generic calls by
-                    // building an intermediate App head: `fn T1 T2 …`.
-                    let base = var(&lean_name(&fun.path));
-                    if typs.is_empty() {
-                        base
-                    } else {
-                        LExpr::new(ExprNode::App {
-                            head: Box::new(base),
-                            args: typs.iter().map(|t| typ_to_expr(t)).collect(),
-                        })
-                    }
-                }
+        CallTarget::Fun(_, fun, typs, _, _, _) => {
+            // Emit explicit type arguments for generic calls by
+            // building an intermediate App head: `fn T1 T2 …`.
+            let base = var(&lean_name(&fun.path));
+            if typs.is_empty() {
+                base
+            } else {
+                LExpr::new(ExprNode::App {
+                    head: Box::new(base),
+                    args: typs.iter().map(|t| typ_to_expr(t)).collect(),
+                })
             }
         }
         CallTarget::FnSpec(inner) => vir_expr_to_ast(inner),
