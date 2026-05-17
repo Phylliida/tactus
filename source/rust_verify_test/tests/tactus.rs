@@ -10233,6 +10233,32 @@ test_verify_one_file! {
     } => Err(_)
 }
 
+// Probe (BUG-no-helper-proof-fn-call-from-exec.md): helper proof
+// fn invocation from inside an exec fn's `proof { ... }` block.
+// Currently exec fn Lean files don't include proof-fn theorems in
+// their preamble — `Unknown identifier`.
+test_verify_one_file! {
+    #[test] test_helper_proof_fn_call_from_exec_probe verus_code! {
+        spec fn double(n: nat) -> nat {
+            n + n
+        }
+
+        proof fn double_nonneg(n: nat)
+            ensures double(n) >= 0
+        by {
+            simp [double]
+        }
+
+        #[verifier::tactus_auto]
+        fn use_helper(n: u64)
+            requires n <= 10
+        {
+            proof { have _ := double_nonneg n.toNat }
+            assert(double(n as nat) >= 0);
+        }
+    } => Ok(())
+}
+
 // Probe (BUG-multi-var-loop-alpha-rename.md): multi-var loop. The
 // outer `let a := 0` blocks my split_leading_binders from reaching
 // the modified-var Binder(i). User can't reference `i` directly.

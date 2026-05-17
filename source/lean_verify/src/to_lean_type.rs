@@ -194,27 +194,42 @@ pub(crate) fn short_name(path: &Path) -> &str {
 /// `crate::module::name` → `module.name`
 /// Names are sanitized (@ # → _) and keywords are escaped with «».
 pub(crate) fn lean_name(path: &Path) -> String {
-    // Filter out synthetic impl segments (e.g., "impl&%0") — these are VIR-internal
-    // names for trait impl blocks, not user-visible names. They always contain
-    // non-alphanumeric characters like & or %.
-    let relevant: Vec<_> = path.segments.iter()
-        .filter(|s| !(s.starts_with("impl") && s.bytes().any(|b| b == b'&' || b == b'%')))
+    // Sanitize every segment, including synthetic impl markers
+    // (`impl&%0` → `impl__0`). The marker segments are load-bearing:
+    // they disambiguate impl method names so multiple impls of the
+    // same trait method don't collide on the bare method name. Pre-
+    // 2026-05-17 this function filtered them out (a cosmetic
+    // simplification that worked when the dep walk only ever pulled
+    // one impl per file into scope); BUG-no-helper-proof-fn-call-
+    // from-exec.md's helper-proof-fn emission widened the dep walk
+    // and surfaced the underlying naming collision. Keeping the
+    // markers produces names like `impl__0.is_zero` /
+    // `impl__1.is_zero` — uglier but unique. Strip then rewrites
+    // class-qualified sibling refs to these disambiguated forms
+    // (see `strip_class_qualifier`).
+    let segments: Vec<String> = path.segments.iter()
+        .map(|s| sanitize(s))
         .collect();
-    if relevant.len() == 1 && !needs_sanitization(&relevant[0]) {
-        return relevant[0].to_string();
+    if segments.len() == 1 && !needs_sanitization(&path.segments[0]) {
+        return path.segments[0].to_string();
     }
-    relevant.iter().map(|s| sanitize(s)).collect::<Vec<_>>().join(".")
+    segments.join(".")
 }
 
 fn needs_sanitization(s: &str) -> bool {
-    is_lean_keyword(s) || s.bytes().any(|b| b == b'@' || b == b'#' || b == b'%')
+    is_lean_keyword(s) || s.bytes().any(|b|
+        b == b'@' || b == b'#' || b == b'%' || b == b'&'
+    )
 }
 
 /// Make a raw identifier safe to emit as a Lean identifier: keyword-quote
 /// with `«…»` if it collides with a Lean reserved word, otherwise squash
-/// Verus-internal punctuation (`%` from `assert(P)` desugaring, `@`/`#`
-/// from VIR disambiguation) to `_`. No-op fast path for the common case
-/// of already-safe names.
+/// Verus-internal punctuation to `_`:
+/// * `%` from `assert(P)` desugaring
+/// * `@` / `#` from VIR disambiguation
+/// * `&` from synthetic impl markers (`impl&%0` → `impl__0`)
+///
+/// No-op fast path for the common case of already-safe names.
 pub(crate) fn sanitize(s: &str) -> String {
     if !needs_sanitization(s) {
         return s.to_string();
@@ -222,7 +237,7 @@ pub(crate) fn sanitize(s: &str) -> String {
     if is_lean_keyword(s) {
         format!("«{}»", s)
     } else {
-        s.chars().map(|c| match c { '@' | '#' | '%' => '_', _ => c }).collect()
+        s.chars().map(|c| match c { '@' | '#' | '%' | '&' => '_', _ => c }).collect()
     }
 }
 
