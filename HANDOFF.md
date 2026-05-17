@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**423 end-to-end tests + 1 coverage test + 195 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**As of last green checkpoint (`7db0654`): 424 end-to-end tests + 1 coverage test + 195 unit tests + 7 integration tests pass.** Current HEAD (`5cb4a75`, WIP): 418/425 e2e pass — 7 trait tests fail under in-progress helper-proof-fn + impl-method-disambiguation work. vstd verified at the green checkpoint (1530 functions, 0 errors); not re-verified at HEAD. The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -4773,6 +4773,86 @@ a smell) → `9f77305` (Bug C) → `18d8277` (loop-local) → `70038c8`
 Both are well-scoped for future sessions. The same-crate version
 of Bug D works now (`test_new_mut_ref_pre_post_substitution_probe`),
 so the architectural direction is validated.
+
+#### Current session (2026-05-17 continued — review pass + helper-proof-fn WIP)
+
+**Review pass** (`7db0654`): ran the DESIGN.md "Code review strategy"
+5 lenses over today's diff. Findings:
+- **Dead code**: `call_to_node`'s inner `Dynamic | DynamicResolved`
+  arm became unreachable after `6c278f7`'s outer dispatch refactor.
+  Removed plus its misleading deferred-@-prefix comment.
+- **Dead method**: `ObligationEmitter::emit` had no callers after
+  the `emit_split` / `emit_with_closer` / `emit_with_extras`
+  refactor. Removed (was producing dead_code warning).
+- **Orphaned docs**: my refactor of emit_split / emit_with_closer
+  left `emit_with_preamble`'s original doc in a stale position.
+  Reorganized so each emit method has a clear doc.
+- **Coverage gap**: Bug C synth path with typ_params was only
+  exercised by the Err-pinned Vec[i] case. Added
+  `test_uninterp_impl_method_with_type_params_probe` (same-crate,
+  pinned Err for a different downstream issue but verifies the
+  synth shape is correct).
+- **Upstream-brittleness**: added DESIGN.md "Verus-side invariants
+  we depend on" entry for `UnaryOp::MutRefCurrent/Future/Final`
+  variants matched by `42228d9`'s rewrite.
+
+Net: 423 → 424 e2e (+1 probe), no regressions.
+
+#### Current session (2026-05-17 continued — helper proof fn + impl-method disambiguation, WIP)
+
+**BUG-no-helper-proof-fn-call-from-exec.md** surfaced the gating
+limitation for the headline "verify iterative Rust against
+recursive math spec" use case: helper proof fns (e.g., `fib_recurrence`,
+`fact_monotone`) aren't callable from exec fn `proof { }` blocks
+because Tactus emits each proof fn into its own Lean file and exec
+fn files don't include them.
+
+**Fix in progress** (`5cb4a75`): two interlocking pieces.
+
+*Helper proof fn emission.* `krate_preamble` now computes
+`helpers_to_emit` (all non-root, non-trait-method proof fns with
+tactic bodies) and:
+1. Extends `dep_walk_roots` to include them, so their transitive
+   spec-fn / datatype / trait refs land in the preamble alongside
+   the root fn's.
+2. Emits their full `theorem ... := by ...` declarations after
+   spec fns.
+
+Helpers emit in both ExecFn AND ProofFn contexts — the bug report
+flagged proof→proof as lower-severity but the architectural fix
+covers it naturally.
+
+Pinned by `test_helper_proof_fn_call_from_exec_probe`.
+
+*Impl-method name disambiguation.* The widened dep walk surfaced a
+pre-existing name collision in standalone-def emission. Pre-fix
+`lean_name` filtered out synthetic impl segments (`impl&%0`) — fine
+when the dep walk only pulled one impl per file but broken now
+that helpers may pull in additional impls. Both `MyInt::is_zero`
+and `MyNat::is_zero` collapsed to `is_zero` → "already declared".
+
+Fix: `lean_name` keeps the impl segments (sanitized as `impl__0`,
+`impl__1`); `sanitize` extended to also replace `&` (the impl
+marker syntax is `impl&%N`); `strip_class_qualifier` takes an
+`impl_prefix` arg and produces `<impl_prefix>.<method>` for sibling
+refs inside instance bodies (matching the disambiguated standalone
+name) while class declarations still pass empty prefix → bare-name
+rewrite.
+
+**State as of commit (`5cb4a75`)**: 418 / 425 e2e tests pass; 7
+trait tests still fail. Failures are patterns that still rely on
+the old bare-name convention; need either further strip updates,
+test tactic rewrites, or both. vstd not yet re-verified.
+
+Discipline note worth recording: I was zig-zagging earlier on
+this fix — first attempted a global lean_name change (24 fails),
+then a parallel "lean_name_keep_impl_segments" fn (hacky two-fn
+approach), and the user pushed back with "what happened to our
+planned approach? This seems hacky." The right plan was the
+ORIGINAL one: single consistent `lean_name`, propagate the change
+through all consumers. Sticking to it required also fixing
+strip_class_qualifier and sanitize. The hedging cost time and
+muddied the architecture; the user's correction was right.
 
 ## Architecture
 
