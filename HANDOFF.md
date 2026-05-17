@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**417 end-to-end tests + 1 coverage test + 195 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**418 end-to-end tests + 1 coverage test + 195 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -4561,6 +4561,78 @@ tactic" answer in Tactus. It scales better than per-fn
 emits, not just the hard one) and stays Lean-idiomatic.
 DESIGN.md updated with the nlinarith folklore note + cross-
 reference to body-assert.
+
+#### Current session (2026-05-17 continued — BUG-fileloader-by-in-comment.md fix)
+
+Downstream user surfaced a three-condition trigger that caused
+FileLoader to silently fail to sanitize tactic bodies:
+1. A prior `by { ... }` block in the file
+2. A `//` comment whose tail is the `by` keyword
+3. The next line a `//` comment whose head is `{`
+
+Symptom: tactic names like `intros`, `nlinarith` reached rustc as
+identifier references, triggering E0425.
+
+The bug report hypothesized a "Phase 1 / Phase 2 scanner state
+leak" but Tactus's FileLoader uses tree-sitter, not a hand-written
+scanner. The actual root cause turned out to be in tree-sitter's
+GLR conflict resolution.
+
+**The root cause (genuinely):** the grammar declared an explicit
+conflict `[$._statement, $.function_item]` between two valid parses
+of `#[attr]\nfn f(){}`:
+- standalone `attribute_item` followed by sibling `function_item`
+- nested: `function_item` containing `attribute_item` as a child
+
+Tree-sitter picked between them based on parse context. In most
+files it picked the nested form. But specifically when a
+`tactic_block` (proof fn `by { }` body) appeared earlier, plus
+`line_comment` extras intervened between the tactic_block and the
+next attribute, tree-sitter flipped to the standalone-sibling
+parse. FileLoader's `function_has_tactus_auto_attr` walks the
+function_item's CHILDREN looking for the attribute; with the
+attribute as a sibling, the check returned false, and
+`collect_inner_lean_blocks` never ran on the fn's body.
+
+**Debugging discipline note**: the user pushed back twice on
+patch-first approaches (once with "have we root caused?", once
+asking for a grammar fix not a FileLoader workaround). Both
+pushes were correct — the first surfaced that there was a real
+parse issue (not just a FileLoader bug to paper over); the second
+forced the fix at the right layer. A unit test diagnostic
+(`diagnose_function_items_*`, dumping function_item parse output
+for working vs failing cases) cleanly showed the structural
+difference (attribute as child vs sibling) and made the grammar
+locus visible.
+
+**Fix**: `prec.dynamic(-1, $.attribute_item)` in
+`_declaration_statement`'s choice deprioritizes the standalone-
+sibling parse without removing it (some unrelated corpus tests
+legitimately use it — removing it broke "Attributes" and "Derive
+macro helper attributes" tests). Matches Rust semantics: outer
+attributes always attach to a following item; the standalone form
+is only a tree-sitter GLR fallback.
+
+**Probe path that worked (false starts catalogued)**:
+1. Initial instinct: workaround in FileLoader (`mask_import_lines`-
+   style). User pushed back. Reverted.
+2. Grammar fix attempt 1: remove `$.attribute_item` from
+   `_declaration_statement` entirely. Broke 2 corpus tests.
+   Reverted.
+3. Grammar fix attempt 2: `prec.dynamic(1, ...)` on `function_item`
+   to prefer nested. Didn't bias enough. Reverted.
+4. Grammar fix attempt 3: `prec.dynamic(-1, $.attribute_item)` in
+   `_declaration_statement` to deprioritize standalone. **Worked.**
+   All 203 tree-sitter tests + 418 e2e + 195 unit pass.
+
+**Submodule + parent commits**:
+- `5a85969` (submodule): grammar fix + corpus regression test.
+- `835746c` (parent): submodule pointer + unit + e2e regression.
+
+**Net**: 417 → 418 e2e (+1), 195 unit, 202 → 203 tree-sitter (+1),
+vstd 1530/0.
+
+Bug doc removed.
 
 ## Architecture
 
