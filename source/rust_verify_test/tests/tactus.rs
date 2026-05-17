@@ -10033,3 +10033,107 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// Probe (2026-05-17): does `&mut v[i]` work today?
+//
+// Rust+Verus's `rust_to_vir_expr` desugars `&mut v[i]` for
+// `v: Vec<T>` into a call to `vstd::std_specs::vec::vec_index_mut(&mut v, i)`.
+// At the SST level, the call's `&mut` arg should therefore be
+// `&mut v` (Var-shaped L-value), NOT a synthetic `&mut v[i]` L-value
+// — the "indexing" semantics is entirely captured by the callee
+// being `vec_index_mut`, plus its ensures
+// `final(vec)@ == old(vec)@.update(i as int, *final(element))`.
+//
+// If cross-crate spec inlining works for `vec_index_mut` (post the
+// 2026-05-12 #122 audit, most spec fns DO inline), this should
+// "just work" — no new MutTargetRaw variant needed.
+//
+// What we expect to see:
+//   - Ok: cross-crate inlining works, full pipeline succeeds.
+//   - Err mentioning `vec_index_mut` or cross-crate: spec doesn't
+//     inline; need Phase 3 work first.
+//   - Err mentioning `&mut` L-value shape: SST has a shape we
+//     didn't anticipate (e.g., Index inside the Loc).
+// Probe (2026-05-17) — &mut v[i] reaches Lean but cross-crate
+// `View` trait+instance emission has multiple bugs.
+//
+// **What works** (more than the catalogue claimed):
+//   1. `vec_index_mut`'s spec is cross-crate-inlined: the generated
+//      Lean goal contains `seq.Seq.update Int (view _tactus_mut_post_1)
+//      0 (seq.Seq.index ...)` — Verus's `merge_krates` brings the
+//      Vec spec into scope, the inlining substitutes the args.
+//   2. The mut-args machinery treats `&mut v[0]` correctly. Rust's
+//      `&mut v[0]` desugars (in new-mut-ref mode) to a call to
+//      `vec_index_mut(&mut v, 0)`; the `&mut v` is Var-shaped at
+//      the call site, so `extract_mut_target` produces
+//      `MutTargetRaw::Var(v)`. The fresh `_tactus_mut_post_1`
+//      existential + `view post = update(view OLD, 0, ...)`
+//      constraint is the standard ∀-path encoding for `&mut`.
+//      **No new MutTargetRaw variant needed**; no different rebind.
+//
+// **What's actually broken** (real blockers, both cross-crate
+// trait-emission bugs — sub-task of #122, not #106):
+//   A. **`View` typeclass emission is malformed.** The generated
+//      Lean has:
+//        - `class view.View (Self : Type) (V : outParam Type) where
+//           view : Self → V`     — correct.
+//        - `axiom view.view (T A) [Allocator A] (self : Vec T A) :
+//           Seq T`               — wrong: standalone axiom for what
+//           should be an instance method; collides with the class
+//           method's qualified name `view.View.view`.
+//        - 4 duplicate instances `view.View A (view.View.V A) where
+//           view := fun self => View.view self` — `view.View.V` isn't
+//           a field; this is malformed but Lean doesn't reject it
+//           until use.
+//        - The crucial `view.View (Vec T A) (Seq T)` instance is
+//           BODY-LESS (no `view := ...`).
+//        - Goal text uses BOTH `view.View.view ...` AND `view.view ...`
+//           inconsistently for the same conceptual operation.
+//   B. **Pre/post substitution bug.** `vec_index_mut`'s ensures says
+//      `final(vec)@ == old(vec)@.update(i, *final(element))`. The
+//      generated Lean shows
+//        `view _tactus_mut_post_1 = update (view _tactus_mut_post_1) 0 ...`
+//      — both `final(vec)` AND `old(vec)` got substituted to
+//      `_tactus_mut_post_1`. We expect
+//        `view _tactus_mut_post_1 = update (view v) 0 ...`.
+//      So even if (A) were fixed, the substitution is wrong — the
+//      ∀-bound post value is being aliased with the caller's pre
+//      value in one of the inlined positions.
+//
+// **Catalogue corrections to make** (separate from this probe):
+//   - DESIGN.md and HANDOFF.md claim `&mut v[i]` needs "a different
+//     rebind encoding (Lean's `Array.set` or `Vector.set` style + a
+//     'this index unchanged for j ≠ i' property)." That's wrong:
+//     Verus's `vec_index_mut` wrap captures it via `Seq.update`
+//     already, and the ∀-path treats the post-Vec as an existential.
+//   - The real blocker isn't #106 (&mut shape) at all; it's a
+//     cross-crate trait+instance emission bug under #122.
+//
+// Pinned as Err pending fixes (A) and (B). When both fixed this
+// flips to Ok.
+test_verify_one_file_with_options! {
+    #[test] test_exec_call_mut_arg_vec_index_probe ["new-mut-ref"] => verus_code! {
+        use vstd::prelude::*;
+
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        #[verifier::tactus_auto]
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn call_vec_index_mut(v: &mut Vec<u8>)
+            requires
+                old(v)@.len() > 0,
+                old(v)@[0] < 100,
+            ensures
+                v@.len() == old(v)@.len(),
+                v@[0] == old(v)@[0] + 1,
+        {
+            bump(&mut v[0]);
+        }
+    } => Err(_)
+}

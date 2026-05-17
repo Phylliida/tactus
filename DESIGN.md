@@ -1139,13 +1139,26 @@ recursion pass covers all cross-fn calls in the cycle the same way.
     contract).
 
     **Still deferred** (post-#144 / #145 / #146):
-    * `&mut v[i]` (Index L-value) — cross-crate-blocked. Vec/array
-      indexing in Rust desugars to `vstd::vec::Vec::index_mut` /
-      `vstd::array::array_index_get_mut`; Tactus can't inline these
-      specs without vstd integration (#122 Phase 3 cross-crate). Even
-      with that, Index would need a different rebind encoding (Lean's
-      `Array.set` or `Vector.set` style + a "this index unchanged for
-      j ≠ i" property).
+    * `&mut v[i]` (Index L-value) — cross-crate-trait-emission-
+      blocked (NOT spec-inlining-blocked, NOT rebind-shape-blocked).
+      In legacy mode, Verus rejects `&mut v[i]` outright with "index
+      for &mut not supported"; only `new-mut-ref` mode supports it
+      (`rust_to_vir_expr.rs:3140-3267` gated on `bctx.new_mut_ref`).
+      Under new-mut-ref, Rust's `&mut v[i]` desugars to
+      `vec_index_mut(&mut v, i)` — the `&mut` arg is Var-shaped
+      (`&mut v`), so the existing `MutTargetRaw::Var` path handles
+      it; no new variant or rebind encoding needed. `vec_index_mut`'s
+      spec IS cross-crate-inlined (probe 2026-05-17 saw
+      `seq.Seq.update` in the goal), so the obligation reaches Lean.
+      Two real blockers prevent verification today: (A) cross-crate
+      `View` trait+instance emission is malformed — standalone
+      `view.view` axiom collides with `view.View.view` class method,
+      duplicate body-less instances, mixed reference forms in goals;
+      (B) pre/post substitution bug aliases `final(vec)` with
+      `old(vec)` in one position (generates `view post = update
+      (view post) ...` where the second `post` should be `v`). Both
+      are sub-tasks of #122, not #106. Pinned by
+      `test_exec_call_mut_arg_vec_index_probe`.
     * Multi-variant enum field mutation — upstream-blocked at Verus's
       mode check. Verus rejects `ref mut` patterns: "The verifier
       does not yet support the following Rust feature: &mut types,
@@ -1843,13 +1856,23 @@ exec fns."
   tuple's other slot survive the rebind).
 
   **Explicit deferrals (still rejected in `build_wp_call`):**
-  - **`&mut v[i]`** (Index L-value) — **cross-crate-blocked**.
-    Vec/array indexing in Rust desugars to
-    `vstd::vec::Vec::index_mut` / `vstd::array::array_index_get_mut`;
-    Tactus can't inline these specs without vstd integration
-    (#122 Phase 3 cross-crate). Even with that, Index would need
-    a different rebind encoding (Lean's `Array.set`/`Vector.set`
-    style + a "this index unchanged for j ≠ i" property).
+  - **`&mut v[i]`** (Index L-value) — **cross-crate-trait-emission-
+    blocked**, NOT spec-inlining-blocked and NOT rebind-shape-
+    blocked. Probe `test_exec_call_mut_arg_vec_index_probe`
+    (2026-05-17) confirmed: in `new-mut-ref` mode, `&mut v[i]`
+    desugars to `vec_index_mut(&mut v, i)` whose `&mut` arg is
+    Var-shaped, so `MutTargetRaw::Var` handles it with no new
+    variant. `vec_index_mut`'s spec IS cross-crate-inlined (the
+    `seq.Seq.update Int (view ...) i (...)` term appears in the
+    generated goal). What blocks verification is cross-crate
+    `View` trait emission bugs: (A) standalone `view.view` axiom
+    collides with the `view.View.view` class method; (B) the
+    `View (Vec T A) (Seq T)` instance is body-less; (C) a pre/
+    post substitution bug aliases `final(vec)` with the post-
+    state existential in one position. All three sub-tasks of
+    #122 cross-crate trait+instance emission, not #106. In legacy
+    mode `&mut v[i]` is upstream-blocked outright ("index for &mut
+    not supported", `rust_to_vir_expr.rs:3284`).
   - **Multi-variant enum field mutation** — **upstream-blocked
     at Verus's mode check**. Verus rejects `ref mut` patterns:
     "The verifier does not yet support the following Rust feature:
@@ -3214,7 +3237,7 @@ When the answers differ, the Lean-native shape is usually shorter, tighter, and 
 * **Tuple field mutation** (`&mut t.<i>`) — LANDED via #145 (arity-2) + #146 (arity > 2). Lean's `{ x with f := v }` syntax doesn't compose with `Prod`, but Lean's tuple syntax `(a, b, c)` does — it's `Prod.mk` sugar that infers from operands without a type hint. The rebind reads each unmodified slot via `tuple_field_accessor(arity, j)` (multi-segment for nested-Prod arity > 2: `.2.1`, `.2.2.1`, etc.) and substitutes `fresh` at the mutated slot. New `ExprNode::Tuple` AST variant; the latent rendering bug at let-bindings (`let t := ⟨x, 0⟩` failing to elaborate without context) was masked because no arity > 2 tuple test existed pre-#145.
 * **Multi-variant enum field mutation** — upstream-blocked at Verus. Direct `&mut foo.f` for enum-typed `foo` isn't expressible in Rust without unsafe; the only viable shape (pattern binding `if let Foo::A { ref mut val }`) is rejected by Verus's mode check ("does not yet support &mut types"). If it ever lifts, the encoding is `match foo with | Foo.A x y => Foo.A fresh y | other => other` — a specific Lean idiom, not a havoc.
 * **Closures (#93)** target Lean's first-class function types directly rather than encoding the FnOnce/Fn/FnMut hierarchy as Z3 axioms. Closure declarations bind `cid` to a real Lean lambda (`fun (x : T) => body`) via `Wp::LetRaw`; calls to spec closures lower to `App(f, args)`. Verus's synthesized `Assume(forall|x| ClosureReq(cid, x) ↔ ... ∧ ClosureEns(cid, x, body(x)) ↔ ...)` is dropped because the lambda binding IS the same fact structurally — no axiomatization needed. The only piece this encoding doesn't yet cover is exec-mode closure CALLS (Verus's `exec_nonstatic_call` desugar), which is upstream-blocked rather than encoding-shaped.
-* **Indexed L-values (`&mut v[i]`)** would use a `Vector.set i v` style encoding — Lean has it, no havoc needed. Currently cross-crate-blocked (Vec/array indexing routes through vstd; #122 Phase 3 dependency).
+* **Indexed L-values (`&mut v[i]`)** — the rebind story is structural without any Tactus-side work, contrary to the earlier sketch. Verus's `rust_to_vir_expr` already desugars `&mut v[i]` (in new-mut-ref mode) to `vec_index_mut(&mut v, i)`, and `vec_index_mut`'s spec uses `final(vec)@ == old(vec)@.update(i, *final(element))` — `Seq::update` IS the "this index unchanged for j ≠ i" property structurally. The `&mut v` arg is Var-shaped, so `MutTargetRaw::Var` handles it; the ∀-path's existential post-state plus the inlined `Seq.update`-shaped ensures gives exactly the Lean-native encoding we'd want. No `Vector.set` encoding, no havoc, no new `MutTargetRaw` variant. The actual blockers (probed 2026-05-17) are cross-crate `View` trait+instance emission bugs — sub-task of #122. Plus a pre/post substitution bug in the inlined ensures.
 * **Caller-side new-mut-ref mode (#107)** — synthetic `LocalDeclKind::BorrowMut` locals from Verus's `bump(&mut y)` lowering are folded into the existing `mut_param_names` set; same architectural pattern as #95 callee-side, applied one layer further. The structural insight: extend recognition rather than build new infrastructure.
 * **Ret-substitution at call sites (#128)** — when a callee's ensures contains `r == E` (uniquely determining the return value), the caller's post-call frames *don't* need a `∀ ret, ret_bound → ensures(ret) → let dest := ret;` chain. Tactus replaces it with `let dest := E; (E_bound) → (ensures with ret := E) → …`, eliminating the ∀-quantifier entirely. Verus's Z3 path emits the ∀ because SMT can't natively substitute a logical variable with a witnessing expression — the ensures clause acts as the substitution glue. Lean substitutes definitionally via `let`. Same fact, structural rather than asserted. Beyond aesthetics: the ∀-Prop shape blocked `tactus_auto`'s default closer (omega rejects ∀-Prop). #128's substitution path makes cond_setup goals (function-call-in-loop-cond) close under the default closer with no override needed — see "Ret-substitution at call sites (#128)" below for the full encoding details.
 * **loop_isolation=false's natural-exit fact (#127)** — Verus's `ast_to_sst` break-lowers `while c { body }` with isolation=false to cond:None + inserted `if !c { break; }`. AIR's `Breakable` primitive preserves state across the break, giving post-loop access to the natural-exit fact `¬c`. Lean's kernel has no control-flow-with-state-preservation primitive; we can't mirror AIR's encoding directly. Instead: preserve the pre-lowering `(cond_setup, cond_exp)` in upstream `StmX::Loop.original_cond`, and have Tactus's `build_wp_loop` recover the cond:Some shape from it (under single-break and label/setup gates that preserve soundness). The existing cond:Some encoding then gives the natural-exit fact via standard while semantics — Lean-native, not a re-encoding of AIR's primitive. The structural insight: don't reproduce a target-specific primitive; preserve the source-level info that the primitive was reconstructing.
