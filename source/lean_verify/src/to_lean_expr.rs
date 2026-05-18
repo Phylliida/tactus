@@ -393,7 +393,7 @@ fn const_to_node(c: &Constant) -> ExprNode {
 /// when emitted outside a class declaration body. Used to gate type-
 /// annotation injection at class-method call sites — we annotate only
 /// concrete types where the disambiguation matters anyway.
-fn typ_contains_param(typ: &TypX) -> bool {
+pub(crate) fn typ_contains_param(typ: &TypX) -> bool {
     let mut found = false;
     crate::to_lean_type::walk_typ(typ, &mut |t| {
         if matches!(t, TypX::TypParam(_) | TypX::Projection { .. }) {
