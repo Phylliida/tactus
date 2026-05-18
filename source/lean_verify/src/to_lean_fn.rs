@@ -1148,7 +1148,7 @@ pub fn trait_to_ast(
         .filter_map(|m| m.path.segments.last().map(|s| s.to_string()))
         .collect();
 
-    let methods = tr.methods.iter().map(|method_fun| {
+    let methods: Vec<ClassMethod> = tr.methods.iter().map(|method_fun| {
         let func = method_lookup.get(method_fun).unwrap_or_else(|| {
             panic!(
                 "trait method {:?} not found in VIR function list — \
@@ -1592,7 +1592,7 @@ pub fn trait_impl_to_ast(
         })
         .unwrap_or_default();
 
-    let methods = method_impls.iter()
+    let methods: Vec<InstanceMethod> = method_impls.iter()
         .filter_map(|func| {
             let short = func.name.path.segments.last()
                 .map(|s| s.as_str()).unwrap_or("_");
