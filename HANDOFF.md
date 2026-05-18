@@ -4875,6 +4875,123 @@ fixed, flagged for future):
   logic. Same situation — adding `&` to one required adding to the
   other. Could share one helper.
 
+#### Current session (2026-05-18 continued — Bug B exploration, no fix landed)
+
+**Outcome: pinned a same-crate probe (`test_view_blanket_impl_probe`)
+as `Err(_)`, explored two encoding options, reverted to baseline with
+a design sketched for the next session.** No code changes to the
+emission pipeline landed.
+
+**What I tried (and why it didn't work):**
+
+* **V-as-field encoding.** Switched `trait_to_ast` from outParam class
+  indices to structure fields (`class View (Self : Type) where V :
+  Type; view : Self → V`) so `<A as View>::V` would render as a real
+  Lean field accessor. The encoding parsed, but Lean's elaborator
+  *doesn't reduce class field projections during typeclass search* —
+  `OfNat (View.V (Wrap Holder)) 7` failed to synthesize because
+  `View.V (Wrap Holder)` stayed unreduced. **outParam isn't
+  decoration; it makes V available as a unification variable during
+  instance search.** With V-as-field, the projection has to be
+  reduced, and `noncomputable` instances don't unfold during
+  typeclass resolution.
+
+* **Forward-call instance bodies.** Changed `trait_impl_to_ast`'s Spec
+  body emission from "render in place + `strip_class_qualifier`
+  rewrite" to "eta-expanded forward call to the standalone def"
+  (uniform with Bug C's synth body). Conceptually cleaner — it
+  removes `strip_class_qualifier`'s over-eager rewrite (which mis-
+  rewrites blanket impls where `View.view self.0` calls A's instance,
+  not the current impl's). But it broke 5 proof-fn tests because
+  their tactic bodies do `simp_all [Foo.predicate]` expecting one
+  unfold to reach the impl body — with forward-call, the unfold chain
+  is `Foo.predicate → impl__N.predicate → body`, two steps. simp set
+  wasn't autoextended to cover the standalone. Reverted.
+
+**Reverted state**: trait class encoding is back to outParam,
+instance bodies back to `strip_class_qualifier`, dep_order Spec-mode
+seeding removed. 428/428 e2e tests pass with the Bug B probe pinned
+as `Err(_)`.
+
+**Design for next session (the "fake TypEquality bound" insight):**
+
+The cleanest path forward is a *per-impl substitution* built once
+per `impl_path`, applied in two places (instance emission + impl
+method standalone-def emission). Key insight: the augmented bound
+shape `[View A V_a]` can be produced by *synthesizing fake
+`GenericBoundX::TypEquality` entries* and letting the existing
+`trait_bounds_to_ast` machinery (which already appends TypEquality
+typs to matching trait bounds) handle the rendering. No new code
+path in the bounds renderer.
+
+Sketch:
+
+```rust
+struct ImplSubst {
+    // Fresh implicit binders to prepend to the impl's typ_params.
+    fresh_binders: Vec<Ident>,           // e.g., ["A_V"]
+    // Synthesized TypEquality bounds for trait_bounds_to_ast.
+    fake_bounds: Vec<GenericBound>,      // e.g., TypEquality(View, A, _, TypParam("A_V"))
+    // Projection→fresh-binder substitution for typ rewriting.
+    proj_map: HashMap<(Ident, Path, Ident), Ident>,
+}
+
+fn build_impl_subst(
+    impl_typ_params: &[Ident],
+    impl_typ_bounds: &GenericBounds,
+    typs_to_walk: impl Iterator<Item = &Typ>,  // all impl signature typs
+) -> ImplSubst;
+
+fn rewrite_projections_in_typ(typ: &Typ, subst: &HashMap<...>) -> Typ;
+```
+
+Applied at:
+1. **`trait_impl_to_ast`**: extend `ti.typ_params` binders with
+   `subst.fresh_binders`; prepend `subst.fake_bounds` to the bound
+   list passed to `trait_bounds_to_ast`; rewrite each
+   `ti.trait_typ_args` and `assoc_types[i].typ` via
+   `rewrite_projections_in_typ`.
+2. **Impl method standalone def** (emitted via `spec_fn_to_ast` for
+   TraitMethodImpl Spec fns): same — extend typ_params, prepend
+   fake bounds, rewrite ret/param typs. Likely cleanest as a
+   `transform_impl_method(f, subst) -> FunctionX` that clones with
+   modifications, then passes through unchanged `spec_fn_to_ast`.
+
+The subst is *fully determined* by walking impl-signature typs for
+`Projection { trait_typ_args: [TypParam(X)], trait_path: T, name: N }`
+where `X` is in `impl_typ_params` and there's a bound `Trait(T, [..X..])`.
+Build it once at the krate level keyed by impl_path; consume in
+both call sites.
+
+**Scope concerns to mind during implementation:**
+
+* `strip_class_qualifier` over-rewrite (the forward-call problem)
+  is a separate orthogonal bug. The pre-transform doesn't touch
+  instance method bodies — those keep using `strip_class_qualifier`.
+  Blanket impls calling Class.method on a typ-param will still
+  mis-rewrite, but the projection-rendering bug is what the test
+  pin is currently about, so we'd partially fix Bug B and leave
+  the body issue for separate work.
+
+* Body-bug fix idea: rewrite Class.method calls in the impl body
+  *at VIR level* (not LExpr) before vir_expr_to_ast, where the
+  call's first-arg type is available. Only rewrite when the
+  receiver type matches the impl's Self.
+
+* Bug B's blast radius: only affects blanket impls (vstd `View for
+  &A`/`Box<A>`/`Rc<A>`/`Arc<A>`). No current Tactus test uses
+  blanket impls; the new probe is the first. If full vstd
+  consumption isn't urgent, Bug B can stay pinned without
+  blocking anything else.
+
+**The reflection that mattered**: I almost reached for `thread_local`
+as the subst mechanism by reflex. It would have worked, but the
+subst is a *fact about the impl* — passing it explicitly keeps the
+data flow visible. The "fake TypEquality" trick is what makes the
+explicit-pass path tractable (otherwise threading subst through 54
+typ_to_expr call sites is what pushes people toward thread_local
+in the first place).
+
 #### Current session (2026-05-18 — Bug D-remaining: SST trait-method dispatch)
 
 **Bug D-remaining piece** (`old(s).view()` style spec calls in

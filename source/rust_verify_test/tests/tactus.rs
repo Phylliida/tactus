@@ -10178,6 +10178,54 @@ test_verify_one_file_with_options! {
     } => Ok(())
 }
 
+// Probe (Bug B): same-crate trait with associated type + blanket
+// impl over a generic wrapper. Mirrors vstd's `View` shape:
+//
+//   pub trait View { type V; spec fn view(&self) -> Self::V; }
+//   impl<A: View> View for &A { type V = A::V; ... }
+//
+// Current breakage: `<A as View>::V` renders as `View.V A` in the
+// Projection arm of `typ_to_expr`, but `V` is a class type-param,
+// not a field accessor, so `View.V` is unbound. The canonical Lean
+// idiom (per Lean reference manual): bind `V` as a fresh implicit
+// on the blanket impl's instance signature —
+//   instance {A V : Type} [View A V] : View (Wrap A) V where ...
+// — not as an accessor.
+//
+// Pin as Err pending Bug B fix; flips Ok when blanket impl emission
+// introduces fresh implicit binders for assoc-type projections.
+test_verify_one_file! {
+    #[test] test_view_blanket_impl_probe verus_code! {
+        pub trait View {
+            type V;
+            spec fn view(&self) -> Self::V;
+        }
+
+        pub struct Wrap<A>(pub A);
+
+        impl<A: View> View for Wrap<A> {
+            type V = A::V;
+
+            open spec fn view(&self) -> A::V {
+                self.0.view()
+            }
+        }
+
+        pub struct Holder { pub v: u8 }
+
+        impl View for Holder {
+            type V = u8;
+            open spec fn view(&self) -> u8 { self.v }
+        }
+
+        proof fn wrap_view_passes_through()
+            ensures Wrap(Holder { v: 7 }).view() == 7
+        by {
+            omega
+        }
+    } => Err(_)
+}
+
 // Probe (Bug D remaining piece, trait dispatch): same-crate trait
 // `View` with a non-blanket impl on a concrete struct. This is
 // closer to vstd's shape — `old(s).view()` dispatches through a
