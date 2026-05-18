@@ -4760,15 +4760,11 @@ a smell) → `9f77305` (Bug C) → `18d8277` (loop-local) → `70038c8`
   binders for trait bounds involving assoc types. Bigger refactor
   — not a `typ_to_expr`-only fix. Pinned (alongside the rest of
   the cluster) by `test_exec_call_mut_arg_vec_index_probe`'s Err.
-* **Bug D remaining piece: vstd-specific `old(vec)@` shape.** The
-  general MutRefCurrent/Future fix landed in `42228d9`, but vstd's
-  `vec_index_mut` ensures uses `old(vec)@` (without the `*`) — a
-  shape that lowers to something my rewrite doesn't catch. Probably
-  goes through a different VIR-AST construct (maybe a builtin call
-  rather than the Unary op variants). Needs its own probe: write
-  a minimal `pub fn foo(x: &mut T) ... ensures old(x)@.something
-  == final(x)@.something_else` to isolate the lowering shape.
-  Pinned (same Err) as part of the Vec[i] probe.
+* ~~**Bug D remaining piece: vstd-specific `old(vec)@` shape.**~~
+  **CLOSED 2026-05-18** — the actual issue was SST-side trait-method
+  rendering, not a missed VIR-AST construct in
+  `rewrite_varat_for_mut_params`. See the 2026-05-18 session entry
+  below for the real diagnosis and fix.
 
 Both are well-scoped for future sessions. The same-crate version
 of Bug D works now (`test_new_mut_ref_pre_post_substitution_probe`),
@@ -4878,6 +4874,88 @@ fixed, flagged for future):
   with parallel `needs_sanitization` / character-replacement
   logic. Same situation — adding `&` to one required adding to the
   other. Could share one helper.
+
+#### Current session (2026-05-18 — Bug D-remaining: SST trait-method dispatch)
+
+**Bug D-remaining piece** (`old(s).view()` style spec calls in
+`&mut` callee ensures) was NOT what I'd assumed in the prior
+session. The original HANDOFF entry guessed the issue was a
+"different VIR-AST construct (maybe a builtin call)" needing a
+broader `rewrite_varat_for_mut_params`. Wrong guess: the
+MutRefCurrent/Future rewrite caught the shape fine — `old(s)`
+became `Var(s_at_pre_tactus)` correctly. The actual breakage was
+in **`to_lean_sst_expr.rs`'s `ExpX::Call` arm**: it rendered
+trait-method calls with the trait's Self type-arg as a *positional
+value arg*, producing Lean garbage like `View.view Holder z`
+(parses as `(View.view Holder) z` → `Int z` → "Function expected
+at View.view ?m.33 but this term has type Int").
+
+**Fix** (this session): mirror the proof-fn renderer's class-method
+dispatch in the SST renderer. New branch in
+`to_lean_sst_expr.rs:628`:
+
+```rust
+ExpX::Call(CallFun::Fun(fun, Some(_)), _typs, args) => {
+    // `Some(_)` second component corresponds exactly to
+    // `CallTargetKind::DynamicResolved` (see
+    // `CallTargetKind::resolved` in ast_util.rs) — i.e., a
+    // trait-method call that Verus resolved to an impl.
+    // Render as `Trait.method (arg : Self_typ)` for Lean's
+    // class dispatch; drop typs from the head.
+    ...TypeAnnot wrap concrete arg types and return type...
+}
+```
+
+`typ_contains_param` was moved from private to `pub(crate)` in
+`to_lean_expr.rs` so the SST renderer can use the same gate as
+the proof-fn path (annotate only when the type is concrete — a
+`TypParam` would render as `Self%` / `T%`, sanity-rejected outside
+class bodies).
+
+**Detection signal: `CallFun::Fun(_, Some(_))`.** The
+`Option<(Fun, Typs)>` second component is set iff the VIR
+`CallTargetKind` was `DynamicResolved` (see `CallTargetKind::
+resolved` in `ast_util.rs:694`). For `Static`, `ProofFn`,
+`Dynamic`, `ExternalTraitDefault` this is `None`. So `Some(_)`
+is a reliable trait-method-resolved marker in the SST. (The
+`Dynamic` case — unresolved trait method decls, only reachable
+cross-crate today — would still mis-render with the
+None-branch's positional-typs shape, but that's already broken
+under #125's cross-crate work.)
+
+**Probe**: `test_old_view_trait_dispatch_probe` (same-crate
+trait+impl+`&mut`+ensures with `old(s).view()`/`s.view()`) flips
+Ok with the fix. The intermediate inherent-method probe
+(`test_old_view_pre_post_substitution_probe`) was already passing —
+inherent methods route through `Static`, which never had the
+class-dispatch issue.
+
+**Vstd-side probe** (`test_exec_call_mut_arg_vec_index_probe`)
+remains pinned `Err(_)` — but its failure mode has narrowed: it
+now fails at "Unknown identifier `View.view`", which is **Bug B
+(blanket-impl rendering)**, not Bug D anymore. The View trait
+class itself isn't being emitted into the test crate because
+vstd's View is defined cross-crate and gets routed through Bug B's
+malformed `view.View.V A` projection rendering. Confirmed
+Bug D-remaining is independent of Bug B.
+
+**Net**: 427/427 e2e tests (425 prior + 2 new probes), vstd 1530/0,
+lean_verify lib 195/0. Task #172 closed.
+
+**Reflection on the original HANDOFF guess.** The prior entry
+"probably goes through a different VIR-AST construct" wasn't
+falsified by code reading alone — the SST `Call` arm's flat
+"typs as positional args" rendering only fails for trait methods,
+which the same-crate `test_new_mut_ref_pre_post_substitution_probe`
+(plain `*old(x) + 1` on a primitive) wouldn't surface. The bug
+needed a trait-method spec call inside an ensures clause to
+appear. The investigation pattern that worked: write the
+intermediate probe (`old(s).view()` on an inherent method — passes,
+ruling out the rewrite), then the next probe up (trait method —
+fails with the Lean parse error), then read the generated Lean.
+The "guess what AST node" approach the prior session implied
+would have led me astray; the "narrow with probes, read the
+emitted Lean" approach landed the fix in one iteration.
 
 ## Architecture
 

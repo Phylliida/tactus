@@ -625,7 +625,49 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
             else_: Some(Box::new(sst_exp_to_ast_checked(else_e)?)),
         },
 
-        ExpX::Call(CallFun::Fun(fun, _), typs, args)
+        // `CallFun::Fun(decl_fun, Some(_))` is precisely the
+        // `DynamicResolved` (trait-method-resolved) case — the
+        // `Option<(Fun, Typs)>` second component is set iff the VIR
+        // `CallTargetKind` was `DynamicResolved` (see
+        // `CallTargetKind::resolved` in `ast_util.rs`). Render these
+        // through Lean's class-method dispatch — `Trait.method (arg
+        // : Self_typ)` — so Lean infers the instance from the
+        // typed value arg, exactly as the proof-fn renderer
+        // (`to_lean_expr::expr_to_node`'s `is_class_method` branch)
+        // does. The previous pass-through of `typs` as positional
+        // arguments produced `View.view Holder z`, which Lean parses
+        // as `(View.view Holder) z` and rejects (`View.view Holder
+        // : Int`, not a function). Bug D-remaining pin: vstd's
+        // `old(vec)@` shape and any trait-method spec ref inside
+        // a `&mut` callee's pre/post.
+        ExpX::Call(CallFun::Fun(fun, Some(_)), _typs, args) => {
+            let head = LExpr::var(crate::lean_name::LeanName::from_path(&fun.path));
+            let app_args: Result<Vec<LExpr>, String> = args.iter().map(|a| {
+                let arg = sst_exp_to_ast_checked(a)?;
+                if crate::to_lean_expr::typ_contains_param(&a.typ) {
+                    Ok(arg)
+                } else {
+                    Ok(LExpr::new(ExprNode::TypeAnnot {
+                        expr: Box::new(arg),
+                        ty: Box::new(typ_to_expr(&a.typ)),
+                    }))
+                }
+            }).collect();
+            let app = if args.is_empty() {
+                head
+            } else {
+                LExpr::app(head, app_args?)
+            };
+            if crate::to_lean_expr::typ_contains_param(&e.typ) {
+                app.node
+            } else {
+                ExprNode::TypeAnnot {
+                    expr: Box::new(app),
+                    ty: Box::new(typ_to_expr(&e.typ)),
+                }
+            }
+        }
+        ExpX::Call(CallFun::Fun(fun, None), typs, args)
         | ExpX::Call(CallFun::Recursive(fun), typs, args) => {
             let head = LExpr::app(
                 LExpr::var(crate::lean_name::LeanName::from_path(&fun.path)),

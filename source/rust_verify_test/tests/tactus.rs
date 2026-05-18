@@ -10145,6 +10145,74 @@ test_verify_one_file_with_options! {
 //
 // Pinned as Err pending Bug C fix; flips to Ok when the synthesized
 // body lands.
+// Probe (Bug D remaining piece, intermediate): same-crate inherent
+// spec method `view(&self)` on a struct. PASSES — the existing
+// rewrite catches `old(s).view()` shape when it lowers through an
+// inherent method call. This narrows Bug D-remaining: the failing
+// case must be something else (trait-method dispatch through
+// `View`, or the View blanket impls themselves).
+test_verify_one_file_with_options! {
+    #[test] test_old_view_pre_post_substitution_probe ["new-mut-ref"] => verus_code! {
+        struct Holder { v: u8 }
+
+        impl Holder {
+            spec fn view(&self) -> u8 { self.v }
+        }
+
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn bump_holder(h: &mut Holder)
+            requires old(h).view() < 100
+            ensures h.view() == old(h).view() + 1
+        {
+            h.v = h.v + 1;
+        }
+
+        #[verifier::tactus_auto]
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn caller(z: &mut Holder)
+            requires old(z).view() < 100
+            ensures z.view() == old(z).view() + 1
+        {
+            bump_holder(z);
+        }
+    } => Ok(())
+}
+
+// Probe (Bug D remaining piece, trait dispatch): same-crate trait
+// `View` with a non-blanket impl on a concrete struct. This is
+// closer to vstd's shape — `old(s).view()` dispatches through a
+// trait method, not an inherent method.
+test_verify_one_file_with_options! {
+    #[test] test_old_view_trait_dispatch_probe ["new-mut-ref"] => verus_code! {
+        pub trait View {
+            spec fn view(&self) -> u8;
+        }
+
+        pub struct Holder { pub v: u8 }
+
+        impl View for Holder {
+            open spec fn view(&self) -> u8 { self.v }
+        }
+
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn bump_holder(h: &mut Holder)
+            requires old(h).view() < 100
+            ensures h.view() == old(h).view() + 1
+        {
+            h.v = h.v + 1;
+        }
+
+        #[verifier::tactus_auto]
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn caller(z: &mut Holder)
+            requires old(z).view() < 100
+            ensures z.view() == old(z).view() + 1
+        {
+            bump_holder(z);
+        }
+    } => Ok(())
+}
+
 // Probe (Bug D): pre/post substitution for new-mut-ref ensures
 // inlining. Same-crate version to isolate from vstd shapes.
 test_verify_one_file_with_options! {
