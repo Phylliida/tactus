@@ -10368,6 +10368,37 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Probe (realistic): `Container { length; is_empty }` where the
+// impl defines is_empty in terms of length. Classic pattern in
+// real APIs — `is_empty := len() == 0`. Tests whether the
+// `impl__N.method` UX leak actually arises in realistic code (vs.
+// only in the contrived `doubled = raw + raw` probe below).
+test_verify_one_file! {
+    #[test] test_impl_method_realistic_is_empty_probe verus_code! {
+        pub trait Container {
+            spec fn length(&self) -> nat;
+            spec fn is_empty(&self) -> bool;
+        }
+
+        pub struct MyList { pub n: nat }
+
+        impl Container for MyList {
+            open spec fn length(&self) -> nat { self.n }
+            open spec fn is_empty(&self) -> bool { self.length() == 0 }
+        }
+
+        // Note: `impl__0.length` in the tactic is a Tactus-internal
+        // name leaking from the standalone-def emission. A future
+        // rename to `MyList.Container.length` would eliminate the
+        // leak — see DESIGN.md "Known UX limitation".
+        proof fn empty_list_is_empty()
+            ensures (MyList { n: 0 }).is_empty()
+        by {
+            simp_all [Container.is_empty, Container.length, impl__0.length]
+        }
+    } => Ok(())
+}
+
 // Probe (audit follow-up): sibling call from one impl spec method
 // to another. step-1's type-aware rewrite must fire (receiver is
 // Self), redirecting the body's `self.helper()` call from class

@@ -3108,6 +3108,18 @@ can infer which name to add. `impl__0.raw` reads as a black-box
 synthetic name that doesn't suggest any add-target. Same
 ergonomic load as Mathlib's `Foo.bar`-style helpers.
 
+**When this fires in real code:** ANY trait where an impl method
+delegates to a sibling — `Container { length, is_empty }` with
+`is_empty := length() == 0`, `Iterator { next, peek }`,
+`Display { write, write_with_prefix }`, etc. This is a textbook
+Rust API pattern; the issue isn't hypothetical. Pinned by
+`test_impl_method_realistic_is_empty_probe` (Container with
+length/is_empty), which currently passes only because the user's
+tactic lists `impl__0.length` explicitly. After the rename, the
+listing would be `MyList.Container.length` — same number of
+listings, but a name the user can read off the goal state instead
+of having to grep the generated `.lean` to find.
+
 ### Code review strategy
 
 When landing non-trivial work, run review lenses against the diff
