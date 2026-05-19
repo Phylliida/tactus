@@ -1598,12 +1598,17 @@ pub fn trait_impl_to_ast(
     // maps each impl method's short name to its full `Fun`. The
     // rewrite gates on receiver type, leaving cross-instance calls
     // (blanket-impl case) as class dispatch.
-    let method_redirects: HashMap<String, Fun> = method_impls.iter()
-        .filter_map(|f| {
-            let short = f.name.path.segments.last().map(|s| s.to_string())?;
-            Some((short, f.name.clone()))
-        })
-        .collect();
+    //
+    // Source of truth: `subst.method_context.method_redirects`.
+    // That map carries pre-renamed Funs (when the impl-method
+    // natural-name rename applies), so sibling-call rewrites
+    // produce `Bar.Counter.method` instead of `impl__N.method`.
+    // Fallback to empty map when no method context is set (no impl
+    // methods, or method_context absent).
+    let empty_redirects: HashMap<String, Fun> = HashMap::new();
+    let method_redirects: &HashMap<String, Fun> = subst.method_context.as_ref()
+        .map(|c| &c.method_redirects)
+        .unwrap_or(&empty_redirects);
 
     let methods: Vec<InstanceMethod> = method_impls.iter()
         .filter_map(|func| {

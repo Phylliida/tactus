@@ -76,8 +76,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use vir::ast::{
-    CallTarget, CallTargetKind, Expr, ExprX, Fun, GenericBound, GenericBoundX, Ident, Idents,
-    GenericBounds, FunctionKind, FunctionX, Param, ParamX, Params, Path, SpannedTyped, TraitId,
+    CallTarget, CallTargetKind, Expr, ExprX, Fun, FunX, GenericBound, GenericBoundX, Ident, Idents,
+    GenericBounds, FunctionKind, FunctionX, Param, ParamX, Params, Path, PathX, SpannedTyped, TraitId,
     TraitImplX, TraitX, Typ, TypX, Typs,
 };
 use vir::def::Spanned;
@@ -145,11 +145,37 @@ pub struct ImplSubst {
 /// gate the rewrite (only fires when the call's receiver structurally
 /// matches Self); `method_redirects` provides the impl method `Fun`
 /// to swap into the call target.
+///
+/// **Renaming**: if `name_prefix` is `Some("Bar.Counter")`, then
+/// `augment_function` rewrites the standalone def's `f.name` from
+/// `[impl%0, method]` to `[Bar, Counter, method]`. `method_redirects`
+/// values are also pre-renamed so sibling-call rewrites refer to the
+/// natural name. If `None`, the impl method keeps its original
+/// `impl__N.method` path (e.g., collision case — multiple impls
+/// would produce the same natural name).
 #[derive(Debug, Clone)]
 pub struct MethodContext {
     pub trait_path: Path,
     pub impl_self_typ: Typ,
     pub method_redirects: HashMap<String, Fun>,
+    pub name_prefix: Option<Vec<Ident>>,
+}
+
+/// Given an impl method's Fun and the per-impl name prefix
+/// (e.g., `[Bar, Counter]`), construct a renamed Fun with path
+/// `[Bar, Counter, method_short_name]`. Krate is preserved.
+fn rename_impl_method_fun(f: &Fun, prefix: &[Ident]) -> Fun {
+    let method_short = f.path.segments.last()
+        .cloned()
+        .unwrap_or_else(|| Arc::new("_".to_string()));
+    let mut segments: Vec<Ident> = prefix.to_vec();
+    segments.push(method_short);
+    Arc::new(FunX {
+        path: Arc::new(PathX {
+            krate: f.path.krate.clone(),
+            segments: Arc::new(segments),
+        }),
+    })
 }
 
 impl ImplSubst {
@@ -158,20 +184,38 @@ impl ImplSubst {
     }
 
     /// Attach impl-method context (trait_path, Self typ, method
-    /// redirects) so `augment_function` can rewrite self-sibling
-    /// calls in the body. See `MethodContext` for the rationale.
-    pub fn set_method_context(&mut self, ti: &TraitImplX, method_impls: &[&FunctionX]) {
+    /// redirects, optional rename prefix) so `augment_function` can
+    /// rewrite self-sibling calls in the body AND rename the
+    /// standalone def's path.
+    ///
+    /// `name_prefix`: if `Some([Bar, Counter])`, impl method standalones
+    /// are renamed from `impl%N.method` to `Bar.Counter.method`.
+    /// `method_redirects`' values are pre-renamed to match. If `None`,
+    /// the impl method keeps its synthetic `impl__N.method` path
+    /// (collision fallback — multiple impls would produce the same
+    /// natural name).
+    pub fn set_method_context(
+        &mut self,
+        ti: &TraitImplX,
+        method_impls: &[&FunctionX],
+        name_prefix: Option<Vec<Ident>>,
+    ) {
         let Some(self_typ) = ti.trait_typ_args.first() else { return; };
         let method_redirects: HashMap<String, Fun> = method_impls.iter()
             .filter_map(|f| {
                 let short = f.name.path.segments.last().map(|s| s.to_string())?;
-                Some((short, f.name.clone()))
+                let target_fun = match &name_prefix {
+                    Some(prefix) => rename_impl_method_fun(&f.name, prefix),
+                    None => f.name.clone(),
+                };
+                Some((short, target_fun))
             })
             .collect();
         self.method_context = Some(MethodContext {
             trait_path: ti.trait_path.clone(),
             impl_self_typ: self_typ.clone(),
             method_redirects,
+            name_prefix,
         });
     }
 
@@ -331,7 +375,20 @@ impl ImplSubst {
             _ => f.body.clone(),
         };
 
+        // Rename the function's `name` when the impl-method natural
+        // name prefix is set. The renamed `Fun` is consistent with
+        // sibling-call references in the body (which use
+        // `method_redirects`' pre-renamed Funs). See `MethodContext`
+        // docs for the collision-fallback rationale.
+        let name = match &self.method_context {
+            Some(ctx) if ctx.name_prefix.is_some() => {
+                rename_impl_method_fun(&f.name, ctx.name_prefix.as_ref().unwrap())
+            }
+            _ => f.name.clone(),
+        };
+
         FunctionX {
+            name,
             typ_params: Arc::new(typ_params),
             typ_bounds: Arc::new(typ_bounds),
             ret,
