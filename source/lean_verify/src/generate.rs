@@ -295,6 +295,43 @@ fn krate_preamble(
     // for the two-source rationale.
     let trait_lookup: std::collections::HashMap<vir::ast::Path, &vir::ast::TraitX> =
         krate.traits.iter().map(|tr| (tr.x.name.clone(), &tr.x)).collect();
+
+    // Compute per-impl natural-name prefix `[Self, Trait]` for impl
+    // method standalone defs. Count duplicates across impls — when
+    // two impls produce the same prefix (e.g., `impl Foo<int> for
+    // Bar` and `impl Foo<bool> for Bar`), neither gets renamed; both
+    // fall back to `impl__N.method`. The natural name flows through
+    // `impl_subst::set_method_context` → `augment_function` →
+    // `spec_fn_to_ast` so the standalone def's emitted name is
+    // `Bar.Foo.method`. Sibling-call rewrites use the same renamed
+    // Fun via `method_redirects`. See HANDOFF.md "rename" plan and
+    // DESIGN.md "Known UX limitation" for the rationale.
+    let impl_name_prefixes: std::collections::HashMap<vir::ast::Path, Vec<vir::ast::Ident>> = {
+        use std::collections::HashMap;
+        // Step 1: tentative prefix for each impl.
+        let mut tentative: HashMap<vir::ast::Path, Vec<vir::ast::Ident>> = HashMap::new();
+        for (ti, _) in &instances_to_emit {
+            let Some(self_typ) = ti.x.trait_typ_args.first() else { continue; };
+            let Some(self_short) = crate::to_lean_type::type_short_name(self_typ) else { continue; };
+            let trait_short = crate::to_lean_type::short_name(&ti.x.trait_path).to_string();
+            let prefix = vec![
+                std::sync::Arc::new(self_short),
+                std::sync::Arc::new(trait_short),
+            ];
+            tentative.insert(ti.x.impl_path.clone(), prefix);
+        }
+        // Step 2: count duplicate prefixes.
+        let mut counts: HashMap<Vec<vir::ast::Ident>, usize> = HashMap::new();
+        for prefix in tentative.values() {
+            *counts.entry(prefix.clone()).or_insert(0) += 1;
+        }
+        // Step 3: keep only unique prefixes (collision impls fall
+        // back to `impl__N`).
+        tentative.into_iter()
+            .filter(|(_, prefix)| counts.get(prefix).copied().unwrap_or(0) == 1)
+            .collect()
+    };
+
     let impl_substs: std::collections::HashMap<vir::ast::Path, crate::impl_subst::ImplSubst> =
         instances_to_emit.iter().map(|(ti, method_impls)| {
             let assoc_types_for_impl: Vec<&AssocTypeImplX> = krate.assoc_type_impls.iter()
@@ -316,13 +353,8 @@ fn krate_preamble(
                 typs_iter,
                 &trait_lookup,
             );
-            // Attach impl-method context so `augment_function`'s
-            // body rewrite fires on standalone def bodies (sibling
-            // calls in the body need redirecting to impl_method
-            // standalones, otherwise class dispatch forward-references
-            // the not-yet-emitted instance — Bug surfaced by
-            // `test_impl_method_sibling_call_in_body_probe`).
-            subst.set_method_context(&ti.x, method_impls);
+            let name_prefix = impl_name_prefixes.get(&ti.x.impl_path).cloned();
+            subst.set_method_context(&ti.x, method_impls, name_prefix);
             (ti.x.impl_path.clone(), subst)
         }).collect();
 

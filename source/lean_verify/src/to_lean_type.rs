@@ -190,6 +190,45 @@ pub(crate) fn short_name(path: &Path) -> &str {
     path.segments.last().map(|s| s.as_str()).unwrap_or("_")
 }
 
+/// Derive a single-segment "type name" suitable for use as a Lean
+/// namespace prefix, peeling transparent decoration. Returns `None`
+/// for shapes without an obvious type name (closures, anonymous
+/// tuples, primitives without a clean ID), in which case the impl-
+/// method naturalisation should fall back to the synthetic
+/// `impl__N` form.
+///
+/// Used by `impl_subst::set_method_context` to compute the natural
+/// name `<self>.<trait>.<method>` for impl method standalone defs.
+pub(crate) fn type_short_name(typ: &vir::ast::Typ) -> Option<String> {
+    use vir::ast::TypX;
+    let mut cur = typ.clone();
+    loop {
+        match &*cur.clone() {
+            TypX::Decorate(_, _, inner) | TypX::Boxed(inner)
+            | TypX::MutRef(inner) => cur = inner.clone(),
+            TypX::Datatype(dt, _, _) => return match dt {
+                vir::ast::Dt::Path(p) => Some(short_name(p).to_string()),
+                vir::ast::Dt::Tuple(_) => None,
+            },
+            TypX::Primitive(p, _) => return Some(match p {
+                vir::ast::Primitive::Array => "Array".to_string(),
+                vir::ast::Primitive::Slice => "Slice".to_string(),
+                vir::ast::Primitive::StrSlice => "StrSlice".to_string(),
+                vir::ast::Primitive::Ptr => "Ptr".to_string(),
+                vir::ast::Primitive::Global => "Global".to_string(),
+            }),
+            TypX::TypParam(name) => return Some(name.as_str().to_string()),
+            TypX::Dyn(p, _, _) | TypX::Opaque { def_path: p, .. } =>
+                return Some(short_name(p).to_string()),
+            TypX::Int(_) | TypX::Bool | TypX::Real | TypX::Float(_)
+            | TypX::TypeId | TypX::ConstInt(_) | TypX::ConstBool(_)
+            | TypX::SpecFn(..) | TypX::AnonymousClosure(..) | TypX::FnDef(..)
+            | TypX::PointeeMetadata(_) | TypX::Air(_) | TypX::Projection { .. } =>
+                return None,
+        }
+    }
+}
+
 /// Convert a VIR path to a Lean dotted name, skipping the crate prefix.
 /// `crate::module::name` → `module.name`
 /// Names are sanitized (@ # → _) and keywords are escaped with «».

@@ -10387,14 +10387,10 @@ test_verify_one_file! {
             open spec fn is_empty(&self) -> bool { self.length() == 0 }
         }
 
-        // Note: `impl__0.length` in the tactic is a Tactus-internal
-        // name leaking from the standalone-def emission. A future
-        // rename to `MyList.Container.length` would eliminate the
-        // leak — see DESIGN.md "Known UX limitation".
         proof fn empty_list_is_empty()
             ensures (MyList { n: 0 }).is_empty()
         by {
-            simp_all [Container.is_empty, Container.length, impl__0.length]
+            simp_all [Container.is_empty, Container.length, MyList.Container.length]
         }
     } => Ok(())
 }
