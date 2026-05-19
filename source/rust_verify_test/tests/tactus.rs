@@ -10221,9 +10221,9 @@ test_verify_one_file! {
         proof fn wrap_view_passes_through()
             ensures Wrap(Holder { v: 7 }).view() == 7
         by {
-            omega
+            simp_all [View.view]
         }
-    } => Err(_)
+    } => Ok(())
 }
 
 // Probe (Bug D remaining piece, trait dispatch): same-crate trait

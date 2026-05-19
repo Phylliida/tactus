@@ -4875,6 +4875,99 @@ fixed, flagged for future):
   logic. Same situation — adding `&` to one required adding to the
   other. Could share one helper.
 
+#### Current session (2026-05-19 — Bug B step 2: per-impl projection substitution)
+
+**Bug B is CLOSED.** `test_view_blanket_impl_probe` flips from
+`Err(_)` to `Ok(())`. Step 1 (VIR-level type-aware sibling rewrite,
+committed `bbadec0`) plus step 2 (per-impl projection subst, this
+session) form the full fix.
+
+**Step 2 mechanism.** New module `impl_subst.rs` (~250 lines):
+
+```rust
+struct ImplSubst {
+    fresh_binders: Vec<Ident>,           // ["_tactus_assoc_A_V"]
+    fake_bounds: Vec<GenericBound>,      // TypEquality(View, [A], V, TypParam("_tactus_assoc_A_V"))
+    proj_map: HashMap<(Ident, Path, Ident), Ident>,
+}
+
+impl ImplSubst {
+    fn build(impl_typ_params, impl_typ_bounds, typs_iter) -> Self;
+    fn rewrite_typ(&self, typ: &Typ) -> Typ;
+    fn augment_function(&self, f: &FunctionX) -> FunctionX;
+}
+```
+
+The "fake TypEquality bound" insight is the key reuse:
+`trait_bounds_to_ast` already iterates bounds appending matching
+TypEquality typs to rendered args. Synthesising a TypEquality
+bound with `TypParam(fresh)` on the RHS makes the existing
+renderer produce `[View A _tactus_assoc_A_V]` for free, no
+changes to the bound rendering path.
+
+**Where it plugs in.**
+- `generate.rs` builds `impl_substs: HashMap<Path, ImplSubst>`
+  keyed by impl_path, after `instances_to_emit`. Each subst is
+  built from the union of trait_typ_args + assoc_type values +
+  every method's ret/param typs.
+- For impl-method standalone defs (spec_fn_to_ast call site),
+  `maybe_augment_impl_method(f, &impl_substs)` returns either an
+  augmented clone (typ_params extended, typ_bounds extended,
+  ret/param typs rewritten) or `f.clone()` if no subst applies.
+  The augmented `FunctionX` flows unchanged through
+  `spec_fn_to_ast` — no changes needed there.
+- `trait_impl_to_ast` takes `subst: &ImplSubst` directly. Extends
+  binders with `subst.fresh_binders`, prepends `subst.fake_bounds`
+  to `ti.typ_bounds` before `trait_bounds_to_ast`, rewrites
+  trait_typ_args and assoc_types[i].typ via `subst.rewrite_typ`.
+
+**Scope: signature only.** Bodies are NOT walked. The body of
+`view` is `self.0.view()` which renders to `View.view self.val0`
+— no projection in the rendered Lean (Lean infers V from class
+dispatch via the augmented `[View A _tactus_assoc_A_V]` bracket).
+This kept the rewrite localised to `impl_subst.rs` and three
+existing call sites, avoiding invasive changes to
+`vir_expr_to_ast` or the SST renderer.
+
+**Generated Lean for the Wrap blanket impl:**
+
+```lean
+class View (Self : Type) (V : outParam Type) where
+  view : Self → V
+
+noncomputable def impl__0.view (A : Type) (_tactus_assoc_A_V : Type)
+  [View A _tactus_assoc_A_V] (self : Wrap A) : _tactus_assoc_A_V :=
+  View.view self.val0
+
+noncomputable instance {A : Type} {_tactus_assoc_A_V : Type}
+  [View A _tactus_assoc_A_V] : View (Wrap A) _tactus_assoc_A_V where
+  view := fun (self : _) => View.view self.val0
+
+noncomputable instance : View Holder Int where
+  view := fun (self : _) => self.v
+```
+
+The blanket impl's instance + standalone now type-check.
+`test_view_blanket_impl_probe` closes with
+`simp_all [View.view]` (the user's tactic; `omega` alone can't
+reduce class dispatch — see DESIGN.md "Spec fn calls in goal
+position" for the canonical pattern).
+
+**Reflection.** Yesterday's two failed attempts (V-as-field
+encoding; forward-call instance bodies) ruled out the
+"uniformly nice" approaches. Today's fix is targeted: the
+type-aware sibling rewrite (step 1) makes
+`strip_class_qualifier` only fire when correct; the per-impl
+subst (step 2) injects fresh binders for assoc-type
+passthrough exactly where projections appear. Both steps leave
+existing non-blanket-impl behavior untouched. The "fake
+TypEquality" trick is the load-bearing piece — it kept the
+data flow explicit while reusing existing machinery, so no
+thread_local hack and no `@[simp]`-on-standalones (the two
+approaches DESIGN.md principle #1 would have blocked anyway).
+
+Net: 428/428 e2e (probe flips to Ok), 195/195 lib, vstd 1530/0.
+
 #### Current session (2026-05-18 continued — Bug B exploration, no fix landed)
 
 **Outcome: pinned a same-crate probe (`test_view_blanket_impl_probe`)

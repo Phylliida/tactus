@@ -282,6 +282,36 @@ fn krate_preamble(
         .map(|(ti, _)| short_name(&ti.x.trait_path))
         .collect();
 
+    // Per-impl projection substitution (Bug B step 2). One ImplSubst
+    // per `impl_path`, built once from the impl's signature typs
+    // (trait_typ_args + assoc_type_impl values + method ret/param
+    // typs). Consumed by both `trait_impl_to_ast` (instance side)
+    // and `impl_subst::maybe_augment_impl_method` (impl method
+    // standalone side) so both sites see the same fresh-binder
+    // names. See `impl_subst.rs` module docs.
+    let impl_substs: std::collections::HashMap<vir::ast::Path, crate::impl_subst::ImplSubst> =
+        instances_to_emit.iter().map(|(ti, method_impls)| {
+            let assoc_types_for_impl: Vec<&AssocTypeImplX> = krate.assoc_type_impls.iter()
+                .filter(|a| a.x.impl_path == ti.x.impl_path)
+                .map(|a| &a.x)
+                .collect();
+            // Iterator over all typs that may contain projections
+            // worth lifting: instance target args, assoc-type-impl
+            // values, and each impl method's return + param typs.
+            let typs_iter = ti.x.trait_typ_args.iter()
+                .chain(assoc_types_for_impl.iter().map(|a| &a.typ))
+                .chain(method_impls.iter().flat_map(|f| {
+                    std::iter::once(&f.ret.x.typ)
+                        .chain(f.params.iter().map(|p| &p.x.typ))
+                }));
+            let subst = crate::impl_subst::ImplSubst::build(
+                &ti.x.typ_params,
+                &ti.x.typ_bounds,
+                typs_iter,
+            );
+            (ti.x.impl_path.clone(), subst)
+        }).collect();
+
     // Split traits-to-emit into two groups by whether any of their
     // methods are proof-fn (Mode::Proof). Proof-fn class fields render
     // their ensures INLINE in the class declaration; the ensures can
@@ -359,11 +389,15 @@ fn krate_preamble(
     for group in &groups {
         match group {
             FnGroup::Single(f) => {
-                cmds.push(to_lean_fn::spec_fn_to_ast(f, &fn_map));
+                let augmented = crate::impl_subst::maybe_augment_impl_method(f, &impl_substs);
+                cmds.push(to_lean_fn::spec_fn_to_ast(&augmented, &fn_map));
             }
             FnGroup::Mutual(fns) => {
                 let inner: Vec<Command> = fns.iter()
-                    .map(|f| to_lean_fn::spec_fn_to_ast(f, &fn_map))
+                    .map(|f| {
+                        let augmented = crate::impl_subst::maybe_augment_impl_method(f, &impl_substs);
+                        to_lean_fn::spec_fn_to_ast(&augmented, &fn_map)
+                    })
                     .collect();
                 cmds.push(Command::Mutual(inner));
             }
@@ -389,8 +423,10 @@ fn krate_preamble(
             .filter(|a| a.x.impl_path == ti.x.impl_path)
             .map(|a| &a.x)
             .collect();
+        let empty_subst = crate::impl_subst::ImplSubst::default();
+        let subst = impl_substs.get(&ti.x.impl_path).unwrap_or(&empty_subst);
         cmds.push(Command::Instance(
-            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, tactic_bodies)
+            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, tactic_bodies, subst)
         ));
     }
 
