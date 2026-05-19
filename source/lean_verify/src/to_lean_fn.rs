@@ -1995,15 +1995,28 @@ fn trait_bounds_to_ast_with<F>(bounds: &GenericBounds, typ_render: F) -> Vec<LBi
 where
     F: Fn(&TypX) -> LExpr,
 {
+    use vir::ast_util::types_equal;
     let mut out = Vec::new();
     for bound in bounds.iter() {
         if let GenericBoundX::Trait(TraitId::Path(path), typs) = &**bound {
             let mut args: Vec<LExpr> = typs.iter().map(|t| typ_render(t)).collect();
+            // Append TypEquality typs whose (trait_path, trait_typ_args)
+            // match THIS bound. Matching by path alone is too loose when
+            // multiple bounds share a trait but differ on typ_args
+            // (e.g., `impl<A: View, B: View>` produces two separate
+            // bounds, each needing only its own TypEquality entries).
+            // Pre-2026-05-19 this matched on path only and 2-typ-param
+            // blanket impls produced malformed `[View A V_a V_b]`
+            // 3-arg brackets. Pinned by
+            // `test_view_blanket_impl_multi_param_probe`.
             for other in bounds.iter() {
-                if let GenericBoundX::TypEquality(eq_path, _, _, typ) = &**other {
-                    if lean_name(eq_path) == lean_name(path) {
-                        args.push(typ_render(typ));
-                    }
+                if let GenericBoundX::TypEquality(eq_path, eq_typs, _, typ) = &**other {
+                    if lean_name(eq_path) != lean_name(path) { continue; }
+                    if typs.len() != eq_typs.len() { continue; }
+                    let typs_match = typs.iter().zip(eq_typs.iter())
+                        .all(|(a, b)| types_equal(a, b));
+                    if !typs_match { continue; }
+                    args.push(typ_render(typ));
                 }
             }
             let target = LExpr::new(ExprNode::App {

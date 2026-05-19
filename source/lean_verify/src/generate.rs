@@ -289,6 +289,12 @@ fn krate_preamble(
     // and `impl_subst::maybe_augment_impl_method` (impl method
     // standalone side) so both sites see the same fresh-binder
     // names. See `impl_subst.rs` module docs.
+    // Path → &TraitX lookup for `ImplSubst::build` so it can
+    // enumerate each bound trait's assoc types and fill outParam
+    // slots that no projection covers. See `impl_subst::ImplSubst::build`
+    // for the two-source rationale.
+    let trait_lookup: std::collections::HashMap<vir::ast::Path, &vir::ast::TraitX> =
+        krate.traits.iter().map(|tr| (tr.x.name.clone(), &tr.x)).collect();
     let impl_substs: std::collections::HashMap<vir::ast::Path, crate::impl_subst::ImplSubst> =
         instances_to_emit.iter().map(|(ti, method_impls)| {
             let assoc_types_for_impl: Vec<&AssocTypeImplX> = krate.assoc_type_impls.iter()
@@ -308,6 +314,7 @@ fn krate_preamble(
                 &ti.x.typ_params,
                 &ti.x.typ_bounds,
                 typs_iter,
+                &trait_lookup,
             );
             (ti.x.impl_path.clone(), subst)
         }).collect();
