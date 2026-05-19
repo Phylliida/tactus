@@ -551,6 +551,18 @@ fn krate_preamble(
 
 // ── Check results ──────────────────────────────────────────────────────
 
+/// A single rejection record from a Tactus check. The verifier
+/// reports each as its own `MessageLevel::Error`, with `rust_span`
+/// as the primary span when present so the `-->` arrow lands at
+/// the obligation site (rather than the enclosing fn signature).
+/// `help` is the .lean artifact path (attached so users can `cat`
+/// the file even when their terminal has clipped the error body).
+pub struct TactusDiag {
+    pub message: String,
+    pub rust_span: Option<vir::messages::Span>,
+    pub help: Option<String>,
+}
+
 #[must_use]
 pub enum CheckResult {
     /// Lean verified the proof successfully. `warnings` carries
@@ -558,11 +570,13 @@ pub enum CheckResult {
     /// notifications (each `assume` is a soundness escape hatch
     /// backed by `sorry`).
     Success { warnings: Vec<String> },
-    /// Lean rejected the proof. The string is a formatted error
-    /// message. `warnings` carries non-fatal diagnostics from the
-    /// same crate (assume sites, etc.) that are worth surfacing
-    /// even when verification itself fails.
-    Failed { error: String, warnings: Vec<String> },
+    /// Lean rejected the proof. `errors` carries one entry per
+    /// failing obligation; the verifier emits each as a separate
+    /// `MessageLevel::Error` so users get rustc-style per-error
+    /// `-->` arrows pointing at the failing site. `warnings`
+    /// carries non-fatal diagnostics (assume sites, etc.) that are
+    /// worth surfacing even when verification itself fails.
+    Failed { errors: Vec<TactusDiag>, warnings: Vec<String> },
     /// Lean could not be invoked (not installed, project missing, etc.)
     Error(String),
 }
@@ -620,7 +634,14 @@ pub fn check_proof_fn(
     }
 
     if let Err(reason) = debug_check(&cmds) {
-        return CheckResult::Failed { error: reason, warnings: vec![] };
+        return CheckResult::Failed {
+            errors: vec![TactusDiag {
+                message: reason,
+                rust_span: None,
+                help: Some(format!("generated .lean file: {}", file_path.display())),
+            }],
+            warnings: vec![],
+        };
     }
 
     let dir = project::default_project_dir();
@@ -630,15 +651,36 @@ pub fn check_proof_fn(
     match result {
         Ok(r) if r.success => CheckResult::Success { warnings: vec![] },
         Ok(r) => {
-            let errors: Vec<_> = r.diagnostics.iter()
-                .filter(|d| d.severity == "error")
-                .map(|d| lean_process::format_error(d, &source_map))
-                .collect();
             let fn_short = short_name(&proof_fn.name.path);
-            CheckResult::Failed {
-                error: format!("Lean tactic failed for {}:\n\n{}", fn_short, errors.join("\n")),
-                warnings: vec![],
-            }
+            let header = format!("Lean tactic failed for {}", fn_short);
+            let help = Some(format!("generated .lean file: {}", file_path.display()));
+            let errors: Vec<TactusDiag> = r.diagnostics.iter()
+                .filter(|d| d.severity == "error")
+                .map(|d| {
+                    let formatted = lean_process::format_error(d, &source_map);
+                    TactusDiag {
+                        message: format!("{}:\n\n{}", header, formatted.message),
+                        rust_span: formatted.rust_span,
+                        help: help.clone(),
+                    }
+                })
+                .collect();
+            // If Lean reported zero error-severity diagnostics (rare;
+            // either a "no errors but Lean still failed" edge or the
+            // `r.success` check above didn't match), surface a single
+            // pointed-but-vague rejection so we don't silently swallow
+            // the rejection.
+            let errors = if errors.is_empty() {
+                vec![TactusDiag {
+                    message: format!("{}: Lean reported failure but no error-severity diagnostics were captured.\n\
+                                      This is a Tactus pipeline bug — please file an issue with the generated .lean file.", header),
+                    rust_span: None,
+                    help,
+                }]
+            } else {
+                errors
+            };
+            CheckResult::Failed { errors, warnings: vec![] }
         }
         Err(e) => CheckResult::Error(e),
     }
@@ -678,12 +720,16 @@ pub fn check_exec_fn(
     let theorems = match sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check) {
         Ok(r) => r,
         Err(reason) => return CheckResult::Failed {
-            error: format!(
-                "tactus_auto rejected this fn: {} \
-                 (see DESIGN.md \"Known deferrals, rejected cases, and untested edges\" \
-                 for the full catalogue of unsupported SST shapes)",
-                reason,
-            ),
+            errors: vec![TactusDiag {
+                message: format!(
+                    "tactus_auto rejected this fn: {} \
+                     (see DESIGN.md \"Known deferrals, rejected cases, and untested edges\" \
+                     for the full catalogue of unsupported SST shapes)",
+                    reason,
+                ),
+                rust_span: None,
+                help: None,
+            }],
             warnings,
         },
     };
@@ -718,7 +764,14 @@ pub fn check_exec_fn(
     }
 
     if let Err(reason) = debug_check(&cmds) {
-        return CheckResult::Failed { error: reason, warnings };
+        return CheckResult::Failed {
+            errors: vec![TactusDiag {
+                message: reason,
+                rust_span: None,
+                help: Some(format!("generated .lean file: {}", file_path.display())),
+            }],
+            warnings,
+        };
     }
 
     let dir = project::default_project_dir();
@@ -736,20 +789,31 @@ pub fn check_exec_fn(
     match result {
         Ok(r) if r.success => CheckResult::Success { warnings },
         Ok(r) => {
-            let errors: Vec<_> = r.diagnostics.iter()
+            let fn_short = short_name(&vir_fn.name.path);
+            let header = format!("Lean tactus_auto failed for {}", fn_short);
+            let help = Some(format!("generated .lean file: {}", file_path.display()));
+            let errors: Vec<TactusDiag> = r.diagnostics.iter()
                 .filter(|d| d.severity == "error")
-                .map(|d| lean_process::format_error(d, &source_map))
+                .map(|d| {
+                    let formatted = lean_process::format_error(d, &source_map);
+                    TactusDiag {
+                        message: format!("{}:\n\n{}", header, formatted.message),
+                        rust_span: formatted.rust_span,
+                        help: help.clone(),
+                    }
+                })
                 .collect();
-            CheckResult::Failed {
-                error: format!(
-                    "Lean tactus_auto failed for {}:\n\n{}\n\n\
-                     (generated .lean file: {})",
-                    short_name(&vir_fn.name.path),
-                    errors.join("\n"),
-                    file_path.display(),
-                ),
-                warnings,
-            }
+            let errors = if errors.is_empty() {
+                vec![TactusDiag {
+                    message: format!("{}: Lean reported failure but no error-severity diagnostics were captured.\n\
+                                      This is a Tactus pipeline bug — please file an issue with the generated .lean file.", header),
+                    rust_span: None,
+                    help,
+                }]
+            } else {
+                errors
+            };
+            CheckResult::Failed { errors, warnings }
         }
         Err(e) => CheckResult::Error(e),
     }

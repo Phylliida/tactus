@@ -456,11 +456,24 @@ impl Expr {
     /// Wrap `inner` with a source-location marker carrying the
     /// obligation's semantic kind. Transparent at the Lean level;
     /// pp emits a `/- @rust:LOC -/` block before `inner` and
-    /// records `(line, loc, kind)` in landmarks for #51 error
-    /// formatting.
-    pub fn span_mark(rust_loc: impl Into<String>, kind: AssertKind, inner: Expr) -> Self {
+    /// records `(line, loc, rust_span, kind)` in landmarks for
+    /// `#51` error formatting.
+    ///
+    /// `rust_span` carries the obligation's source `Span` so the
+    /// verifier can attach errors directly at the obligation site
+    /// (rustc-style `-->` line pointing at the failing assert /
+    /// invariant / call, rather than at the enclosing fn
+    /// signature). `None` is acceptable for synthetic /
+    /// test-fixture sites that don't have a real source location.
+    pub fn span_mark(
+        rust_loc: impl Into<String>,
+        rust_span: Option<vir::messages::Span>,
+        kind: AssertKind,
+        inner: Expr,
+    ) -> Self {
         Expr::new(ExprNode::SpanMark {
             rust_loc: rust_loc.into(),
+            rust_span,
             kind,
             inner: Box::new(inner),
         })
@@ -598,6 +611,15 @@ pub enum ExprNode {
     /// `walk_call` / `WpCtx::new` (for fn-ensures Postcondition).
     SpanMark {
         rust_loc: String,
+        /// Original Verus `Span` for the obligation (clone of the
+        /// SST/VIR-AST node's span). Used by the rust_verify error
+        /// reporter to emit a diagnostic whose primary span points
+        /// at the obligation site rather than the enclosing fn.
+        /// `None` only when the SpanMark was built from a synthetic
+        /// site without a real source location (test fixtures,
+        /// degenerate `ensures` fallbacks); production codegen paths
+        /// always carry a span.
+        rust_span: Option<vir::messages::Span>,
         kind: AssertKind,
         inner: Box<Expr>,
     },
@@ -1213,8 +1235,9 @@ where
         }
         ExprNode::Anon(es) => ExprNode::Anon(es.iter().map(|e| f(e)).collect()),
         ExprNode::Tuple(es) => ExprNode::Tuple(es.iter().map(|e| f(e)).collect()),
-        ExprNode::SpanMark { rust_loc, kind, inner } => ExprNode::SpanMark {
+        ExprNode::SpanMark { rust_loc, rust_span, kind, inner } => ExprNode::SpanMark {
             rust_loc: rust_loc.clone(),
+            rust_span: rust_span.clone(),
             kind: *kind,
             inner: Box::new(f(inner)),
         },
@@ -2641,6 +2664,7 @@ mod substitute_tests {
             Expr::new(ExprNode::Anon(vec![var("a"), var("b")])),
             Expr::new(ExprNode::SpanMark {
                 rust_loc: "test.rs:1:1".into(),
+                rust_span: None,
                 kind: AssertKind::Hypothesis(HypothesisKind::BranchCondition),
                 inner: Box::new(var("inner")),
             }),
@@ -2707,6 +2731,7 @@ mod substitute_tests {
         // SpanMark: 1 (inner).
         assert_eq!(count(&Expr::new(ExprNode::SpanMark {
             rust_loc: "x".into(),
+            rust_span: None,
             kind: AssertKind::Hypothesis(HypothesisKind::BranchCondition),
             inner: Box::new(var("y")),
         })), 1);
@@ -2861,6 +2886,7 @@ mod substitute_tests {
             Expr::new(ExprNode::Anon(vec![])),
             Expr::new(ExprNode::SpanMark {
                 rust_loc: "loc".into(),
+                rust_span: None,
                 kind: AssertKind::Hypothesis(HypothesisKind::BranchCondition),
                 inner: Box::new(var("x")),
             }),
@@ -2969,6 +2995,7 @@ mod substitute_tests {
         let inner = var("x");
         let span_mark = Expr::new(ExprNode::SpanMark {
             rust_loc: "test.rs:42:7".into(),
+            rust_span: None,
             kind: AssertKind::Obligation(ObligationKind::Plain),
             inner: Box::new(inner),
         });
@@ -2976,7 +3003,7 @@ mod substitute_tests {
         let out = substitute(&span_mark, &s);
 
         match &out.node {
-            ExprNode::SpanMark { rust_loc, kind, inner } => {
+            ExprNode::SpanMark { rust_loc, rust_span: _, kind, inner } => {
                 assert_eq!(rust_loc, "test.rs:42:7", "rust_loc preserved");
                 assert!(matches!(kind, AssertKind::Obligation(ObligationKind::Plain)),
                     "kind preserved");

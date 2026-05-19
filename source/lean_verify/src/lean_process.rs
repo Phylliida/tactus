@@ -24,17 +24,41 @@ pub struct LeanResult {
     pub diagnostics: Vec<LeanDiagnostic>,
 }
 
-/// Format error diagnostics into a user-friendly string.
+/// A single formatted error diagnostic from Lean, paired with the
+/// Verus `Span` of the obligation that failed (when one could be
+/// resolved from the source map). The verifier uses `rust_span` as
+/// the primary span of the rust_verify error, so the `-->` arrow
+/// points at the failing assert / invariant / call rather than at
+/// the enclosing fn signature. `None` falls back to the fn span
+/// (the pre-fix behaviour) — happens for proof-fn diagnostics
+/// where per-obligation spans aren't plumbed yet, and for exec-fn
+/// diagnostics whose `pos.line` precedes every obligation mark
+/// (rare; usually only "no goals" errors at the closing tactic).
+pub struct FormattedDiag {
+    pub message: String,
+    pub rust_span: Option<vir::messages::Span>,
+}
+
+/// Format error diagnostics into a user-friendly string plus the
+/// obligation span (when resolvable).
 ///
 /// Parses Lean's goal state from the error data and formats it clearly:
 /// - Separates the error summary from the goal state
 /// - Indents the goal context (hypotheses + ⊢ goal)
 /// - Includes tactic line info from the source map
+///
+/// The `at <loc>:` prefix is preserved in the message body even when
+/// `rust_span` is `Some(...)` — Verus's diagnostic rendering shows
+/// `-->` for the primary span but doesn't always make the file path
+/// visible to downstream filters; keeping the explicit `at <loc>:`
+/// inside the body means tests and tooling that match on the message
+/// text still see the location.
 pub fn format_error(
     diag: &LeanDiagnostic,
     source_map: &crate::to_lean_fn::LeanSourceMap,
-) -> String {
+) -> FormattedDiag {
     let mut out = String::new();
+    let mut rust_span: Option<vir::messages::Span> = None;
 
     // Source location info: prefer the Rust span (from #51's
     // SpanMark instrumentation, populated for exec fns), fall
@@ -53,6 +77,7 @@ pub fn format_error(
                 out.push_str(&format!("at {} {}:\n",
                     mark.loc, vir::tactus_messages::paren_label(label)));
             }
+            rust_span = mark.rust_span.clone();
         } else if let Some(offset) = source_map.find_tactic_line(pos.line) {
             out.push_str(&format!("tactic line {}: ", offset + 1));
         }
@@ -74,7 +99,7 @@ pub fn format_error(
         out.push('\n');
     }
 
-    out
+    FormattedDiag { message: out, rust_span }
 }
 
 /// Try to split Lean error data into a summary line and goal state.
