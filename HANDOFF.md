@@ -4875,15 +4875,166 @@ fixed, flagged for future):
   logic. Same situation — adding `&` to one required adding to the
   other. Could share one helper.
 
+#### Current session (2026-05-19 continued — impl method rename LANDED)
+
+The plan documented in the prior session's "Rename implementation
+plan" was actually executed in the same arc, across four commits.
+(Disk error wiped the conversation history; reconstructing from
+git log.)
+
+**Commits, in order:**
+
+* `425a8f4` **WIP rename: `impl__N.method` → `<Self>.<Trait>.<method>`.**
+  Standalone def emission + sibling-call rewrite now use
+  `Bar.Counter.method` style. Renaming localised to
+  `impl_subst.rs`:
+  - `MethodContext` gained `name_prefix: Option<Vec<Ident>>`.
+  - `set_method_context` pre-renames `method_redirects` Fun
+    values when prefix is set.
+  - `augment_function` rewrites `f.name` to the renamed Fun.
+  - `to_lean_type::type_short_name` is the new helper that peels
+    Decorate/Boxed and returns a String.
+  - `generate.rs` computes per-impl prefix
+    `[type_short_name(Self), short_name(trait_path)]`, counts
+    collisions, falls back to `None` (no rename) for impls whose
+    natural name would collide.
+
+  Six existing probes failed after this commit because their
+  tactic-text referenced the old `impl__N.method` form.
+  Investigation continued.
+
+* `6a105e9` **Fix: drop trait segment, fix Bug-C synth-body
+  lookup.** Using `Wrap.View.view` as the path created a Lean
+  namespace shadowing conflict: inside `def Wrap.View.view`'s
+  body, a bare `View.view` reference resolves to the def itself
+  (recursive self-ref) instead of the trait class method.
+  Empirically reproduced — Bug B probes failed with
+  "Application type mismatch: self.val0 of type A but expected
+  Type" because Lean treated `View.view self.val0` as a call to
+  `Wrap.View.view` (whose first arg is `A : Type`).
+
+  Switched to `<Self>.<method>` (e.g., `Wrap.view`,
+  `MyList.length`, `Bar.raw`). Removed the View middle segment;
+  collision detection now counts `(Self, method_short)` pairs.
+
+  Also fixed Bug C's synthesised body for body=None Spec
+  methods — the forwarder was using `func.name.path` directly
+  (un-renamed), so the synth produced `impl__0.shadow` while
+  the standalone was at `Hidden.shadow`. Fixed by consulting
+  `method_redirects` (built in `set_method_context` from the
+  same `method_impls` slice, guaranteed lookup; `.expect()` not
+  fallback).
+
+* `0221629` **Re-add trait segment with `impl` marker:
+  `<Self>.<Trait>.impl.<method>`.** The two-segment scheme from
+  `6a105e9` lost multi-trait-same-method-name disambiguation
+  (two traits with `raw` on the same Self both renamed to
+  `Bar.raw`). Putting the trait segment back caused the namespace
+  shadow. Resolution: **insert an `impl` marker between trait
+  and method.**
+
+  ```text
+  def Wrap.View.impl.view's body looking up View.view:
+  - Wrap.View.impl.View.view — not defined
+  - Wrap.View.View.view — namespace `Wrap.View` exists
+    (contains `impl` sub-ns) but no `view` declaration there. Skip.
+  - test_crate.View.view — class method, MATCH. ✓
+  ```
+
+  Without the `impl` marker, `Wrap.View.view` (without the
+  intermediate) would self-reference because Lean's namespace
+  resolution searches `Wrap.View.<x>` and finds the def. The
+  `impl` segment breaks that chain at exactly the right point —
+  Lean doesn't auto-search across the impl marker into the
+  trait's actual class methods.
+
+  Names now disambiguate by construction:
+  `Bar.Counter.impl.raw` vs `Bar.Foo.impl.raw` (two traits with
+  the same method name on the same Self).
+
+  Multi-arg trait edge case still falls back to `impl__N.method`
+  (legal Rust: `impl Foo<int> for Bar` and `impl Foo<bool> for
+  Bar`; both naturally map to `Bar.Foo.impl.raw` and would
+  collide).
+
+* `4c424a7` **Two-traits-same-method probe.** Added
+  `test_two_traits_same_method_name_disambiguated_probe` —
+  `trait Foo { raw }` + `trait Bar2 { raw }` both on `Bar`. The
+  rename distinguishes via the trait segment; both impl renames
+  fire without collision. Regression guard for the disambiguation
+  property.
+
+**Why this matters (user-facing UX).** Pre-rename, goal-state for
+impl methods showed synthetic names like `impl__0.length` — users
+had to grep generated Lean to figure out what to add to their simp
+set. Post-rename, the goal shows the natural name
+`MyList.Container.impl.length`. Users see what's there and can
+add the right thing to their simp call.
+
+The simp-listing requirement itself doesn't go away — DESIGN
+principle #1 still applies (no silent unfolding). But the names
+in the goal state are now **discoverable from the goal state**
+rather than opaque-synthetic.
+
+**Net (final commit `4c424a7`):** 434/434 e2e (+1 disambiguation
+probe), 209/209 lib, vstd 1530/0.
+
+**Reflection.** The deferral note in the prior entry estimated
+"~150 lines + test verification, ballparked half a session" — that
+proved roughly accurate. The unexpected part was the namespace
+shadow in the first naming scheme (`Wrap.View.view`); the `impl`
+marker fix took an additional round of debugging once the symptom
+("self.val0 of type A but expected Type") became reproducible.
+The general pattern continues: each "obvious" naming scheme
+exposes a Lean elaboration constraint, and the right path is
+empirical rather than purely-derived.
+
 #### Current session (2026-05-19 continued — audit follow-up, `@[reducible]` experiment ruled out, rename deferred)
 
 After the Bug B fix landed (commit `df01442`, see below), Danielle
 asked for another audit pass focused on untested edge cases. Two
 more real bugs surfaced from probe writing alone (commit
-`df01442` already covered them — multi-arg trait bounds and
-standalone def body forward-ref). Then a deeper UX issue showed
-up: the `impl__N.method` standalone-def name leaks into the user-
-facing goal state when they `simp_all [Trait.method]`.
+`df01442`):
+
+* **Multi-arg trait bounds drop the fresh binder.** The first audit
+  pass (commit `6a15799`, the day before) tightened
+  `trait_bounds_to_ast`'s TypEquality match from "path only" to
+  "path + typs structural equality". But `ImplSubst::build`
+  synthesised fake `TypEquality(T, [TypParam(X)], N, fresh)` bounds
+  with `typs` always of length 1, regardless of the trait's actual
+  arity. For `impl<A: Converter<u8>>` the bound has typs
+  `[A, u8]` (length 2) — the fake's `[A]` doesn't match under the
+  tightened comparison, so the fresh binder doesn't reach the
+  bracket. Generated Lean had `Converter A Int : outParam Type
+  → Type` (2-arg on 3-arg class). Fix: thread each impl typ-param's
+  matching bound through `param_to_bounds`, capture the bound's
+  full typs, use them as the fake bound's typs.
+
+* **Standalone def bodies use class dispatch (forward-ref).** Step
+  1's `rewrite_self_sibling_calls` fired in `trait_impl_to_ast`
+  (instance method body) but NOT in `spec_fn_to_ast` (standalone
+  def body). The standalone is emitted BEFORE its instance, so any
+  class dispatch in its body forward-references the instance and
+  fails to elaborate. Bug latent until a non-blanket impl had two
+  spec methods where one calls the other (e.g.,
+  `impl Counter for Bar { spec fn doubled() { Counter.raw(self) *
+  2 } }`). Symptom: `failed to synthesize Counter Bar`. Fix:
+  moved `rewrite_self_sibling_calls` from `to_lean_fn.rs` to
+  `impl_subst.rs`, added `MethodContext { trait_path,
+  impl_self_typ, method_redirects }` inside `ImplSubst`, extended
+  `augment_function` to rewrite the body when a method context is
+  set. `generate.rs` calls `subst.set_method_context(ti,
+  method_impls)` before stashing each subst. Single source of
+  truth for per-impl rewrite logic.
+
+  Two new pinned probes (`test_view_blanket_impl_multi_arg_trait_probe`,
+  `test_impl_method_sibling_call_in_body_probe`) and one new unit
+  test (`build_fake_bound_carries_full_typs_for_multi_arg_trait`)
+  guard the regression.
+
+Then a deeper UX issue showed up: the `impl__N.method` standalone-
+def name leaks into the user-facing goal state when they
+`simp_all [Trait.method]`.
 
 **Tried: `@[reducible]` on impl method standalones.** Hypothesis:
 mark forwarders transparent, simp cascades through. Result: simp
@@ -4903,6 +5054,14 @@ simp-listing requirement, but makes the standalone's name
 **discoverable from the goal state** rather than opaque-synthetic.
 Mathlib has the same ergonomic load — user lists `Foo.bar` in
 simp — but the names are natural.
+
+**LANDED 2026-05-19** in the same arc — see the next session entry
+above. Final scheme is `<Self>.<Trait>.impl.<method>` (the `impl`
+marker is load-bearing for Lean namespace resolution). The "naming
+scheme" / "collision case" / "rename implementation plan" notes
+below describe the *originally proposed* `<Self>.<Trait>.<method>`
+shape, kept here for forensic context but superseded by the final
+landed scheme.
 
 **Realistic-case validation** (added 2026-05-19 after a hypothesis
 that the issue might only arise in contrived probes):
