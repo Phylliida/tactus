@@ -482,6 +482,7 @@ impl<'a> WpCtx<'a> {
                 // unexpected drift.
                 Ok(LExpr::span_mark(
                     format_rust_loc(&ens.span),
+                    Some(ens.span.clone()),
                     AssertKind::Obligation(ObligationKind::Postcondition),
                     lower_validated(&Validated::check(&coerced)?),
                 ))
@@ -1462,7 +1463,12 @@ fn walk_obligations<'a>(
             let kind = detect_assert_kind(asserted_exp);
             let loc = format_rust_loc(&asserted_exp.span);
             let cond_ast = lower_validated(asserted);
-            let goal = LExpr::span_mark(loc.clone(), kind, cond_ast.clone());
+            let goal = LExpr::span_mark(
+                loc.clone(),
+                Some(asserted_exp.span.clone()),
+                kind,
+                cond_ast.clone(),
+            );
             let id = e.next_id();
             let name = build_theorem_name(
                 kind_to_name(kind), &e.fn_name, &loc, id,
@@ -1487,7 +1493,7 @@ fn walk_obligations<'a>(
             let new_obl = obl.with_frame(CtxFrame::Hyp(hyp.clone()));
             walk_obligations(body, ctx, &new_obl, e);
         }
-        Wp::AssertBitVector { req_conj, ens_conj, rust_loc, body } => {
+        Wp::AssertBitVector { req_conj, ens_conj, rust_loc, rust_span, body } => {
             // Verified goal (BitVec mode): `req_conj → ens_conj`
             // (or just `ens_conj` when requires is empty — `req_conj`
             // is `LitBool(true)` from `and_all([])`, and `True → P` is
@@ -1501,6 +1507,7 @@ fn walk_obligations<'a>(
             };
             let goal = LExpr::span_mark(
                 rust_loc.clone(),
+                rust_span.clone(),
                 AssertKind::Obligation(ObligationKind::Plain),
                 goal_inner,
             );
@@ -1624,6 +1631,7 @@ fn walk_obligations<'a>(
             // documents the trade-off.
             let cond_marked = LExpr::span_mark(
                 format_rust_loc(&cond.raw().span),
+                Some(cond.raw().span.clone()),
                 AssertKind::Hypothesis(HypothesisKind::BranchCondition),
                 lower_validated(cond),
             );
@@ -1698,7 +1706,10 @@ fn walk_assert_by_tactus<'a>(
             let loc = format_rust_loc(&c.raw().span);
             let cond_ast = lower_validated(&c);
             let goal = LExpr::span_mark(
-                loc.clone(), AssertKind::Obligation(ObligationKind::Plain), cond_ast.clone(),
+                loc.clone(),
+                Some(c.raw().span.clone()),
+                AssertKind::Obligation(ObligationKind::Plain),
+                cond_ast.clone(),
             );
             let id = e.next_id();
             let name = build_theorem_name(
@@ -1846,11 +1857,13 @@ fn walk_loop<'a>(
     // `ensures` (at_exit only) flow into one each.
     let inv_marked = |(i, v): (&LoopInv, &Validated<'a>)| LExpr::span_mark(
         format_rust_loc(&i.inv.span),
+        Some(i.inv.span.clone()),
         AssertKind::Obligation(ObligationKind::LoopInvariant),
         lower_validated(v),
     );
     let cond_marked = |c: &Validated<'a>| LExpr::span_mark(
         format_rust_loc(&c.raw().span),
+        Some(c.raw().span.clone()),
         AssertKind::Hypothesis(HypothesisKind::LoopCondition),
         lower_validated(c),
     );
@@ -2866,6 +2879,7 @@ fn emit_call_precondition_theorem(
     );
     let requires_clause = LExpr::span_mark(
         loc.clone(),
+        Some(call_span.clone()),
         AssertKind::Obligation(ObligationKind::CallPrecondition),
         substitute(&requires_conj, &subst.req_subst),
     );
@@ -3589,6 +3603,11 @@ enum Wp<'a> {
         /// assert goal.
         ens_conj: LExpr,
         rust_loc: String,
+        /// Original Verus `Span` of the assertion site, cloned at
+        /// `build_wp` time from the first ensure / require clause.
+        /// Plumbed through to the emitted theorem's SpanMark so the
+        /// rust_verify reporter attaches errors at the assert site.
+        rust_span: Option<Span>,
         body: Box<Wp<'a>>,
     },
 
@@ -4244,10 +4263,14 @@ fn build_wp<'a>(
                 .map(|e| format_rust_loc(&e.span))
                 .or_else(|| requires.first().map(|r| format_rust_loc(&r.span)))
                 .unwrap_or_default();
+            let rust_span = ensures.first()
+                .map(|e| e.span.clone())
+                .or_else(|| requires.first().map(|r| r.span.clone()));
             Ok(Wp::AssertBitVector {
                 req_conj,
                 ens_conj,
                 rust_loc,
+                rust_span,
                 body: Box::new(after),
             })
         }
@@ -4999,6 +5022,7 @@ fn build_wp_loop<'a>(
     // a hypothesis or trivially-provable as a Done leaf.
     let inv_marked = |(i, v): (&LoopInv, &crate::to_lean_sst_expr::Validated<'a>)| LExpr::span_mark(
         format_rust_loc(&i.inv.span),
+        Some(i.inv.span.clone()),
         AssertKind::Obligation(ObligationKind::LoopInvariant),
         crate::to_lean_sst_expr::lower(v),
     );
@@ -5028,6 +5052,7 @@ fn build_wp_loop<'a>(
     let decrease_lex = lex_decrease_obligation(&decrease_levels);
     let decrease_marked = LExpr::span_mark(
         format_rust_loc(&decrease[0].span),
+        Some(decrease[0].span.clone()),
         AssertKind::Obligation(ObligationKind::LoopDecrease),
         decrease_lex,
     );

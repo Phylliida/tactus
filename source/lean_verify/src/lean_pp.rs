@@ -119,12 +119,16 @@ pub struct Landmarks {
 
 /// Per-`SpanMark`-visit landmark. `line` is the 1-indexed Lean
 /// line where the marked sub-expression starts; `loc` is the
-/// pre-resolved Rust `file:line:col`; `kind` is the obligation's
-/// semantic class for error-message labeling.
+/// pre-resolved Rust `file:line:col`; `rust_span` is the original
+/// Verus `Span` of the obligation (cloned through codegen so the
+/// verifier can attach errors directly at the obligation site
+/// instead of the enclosing fn signature); `kind` is the
+/// obligation's semantic class for error-message labeling.
 #[derive(Debug, Clone)]
 pub struct SpanMarkLandmark {
     pub line: usize,
     pub loc: String,
+    pub rust_span: Option<vir::messages::Span>,
     pub kind: AssertKind,
 }
 
@@ -813,10 +817,11 @@ fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
         // result). Both formats are single-line by construction.
         // Pinned by `span_mark_loc_has_no_newlines` and
         // `span_mark_render_preserves_loc_verbatim`.
-        ExprNode::SpanMark { rust_loc, kind, inner } => {
+        ExprNode::SpanMark { rust_loc, rust_span, kind, inner } => {
             lm.span_marks.push(SpanMarkLandmark {
                 line: current_line(out),
                 loc: rust_loc.clone(),
+                rust_span: rust_span.clone(),
                 kind: *kind,
             });
             out.push_str("/- @rust:");
@@ -1260,6 +1265,7 @@ mod tests {
         let loc = "src/main.rs:42:13".to_string();
         let marked = Expr::new(ExprNode::SpanMark {
             rust_loc: loc.clone(),
+            rust_span: None,
             kind: AssertKind::Obligation(ObligationKind::Plain),
             inner: Box::new(inner),
         });

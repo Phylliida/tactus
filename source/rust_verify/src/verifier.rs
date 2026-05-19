@@ -388,6 +388,33 @@ impl FuncDetails {
     }
 }
 
+/// Emit a single Tactus diagnostic through the verifier's reporter.
+///
+/// Each `lean_verify::TactusDiag` carries one obligation failure;
+/// we surface it as a `MessageLevel::Error` whose primary span is
+/// the obligation site (so rustc's `-->` arrow points at the
+/// failing assert / invariant / call rather than the enclosing fn
+/// signature) and whose `help` carries the generated `.lean` path
+/// for offline inspection. Falls back to `fn_span` when the
+/// diagnostic doesn't carry a span (pre-Lean rejections like
+/// sanity-check failures, and proof-fn diagnostics today).
+fn emit_tactus_diag(
+    reporter: &impl Diagnostics,
+    diag: lean_verify::TactusDiag,
+    fn_span: &vir::messages::Span,
+) {
+    let span = diag.rust_span.unwrap_or_else(|| fn_span.clone());
+    let msg = std::sync::Arc::new(MessageX {
+        level: MessageLevel::Error,
+        note: diag.message,
+        spans: vec![span],
+        labels: Vec::new(),
+        help: diag.help,
+        fancy_note: None,
+    });
+    reporter.report(&msg.to_any());
+}
+
 /// Read the verbatim tactic body from the source file using byte range.
 /// The file path and byte range are stored in VIR `tactic_span` at construction time
 /// (when the SourceMap is available), so this function works on any thread.
@@ -1735,16 +1762,16 @@ impl Verifier {
                                         );
                                     }
                                 }
-                                lean_verify::CheckResult::Failed { error, warnings } => {
-                                    self.count_errors += 1;
+                                lean_verify::CheckResult::Failed { errors, warnings } => {
                                     for w in warnings {
                                         reporter.report(
                                             &message(MessageLevel::Warning, w, fn_span).to_any()
                                         );
                                     }
-                                    reporter.report(
-                                        &message(MessageLevel::Error, error, fn_span).to_any()
-                                    );
+                                    for diag in errors {
+                                        self.count_errors += 1;
+                                        emit_tactus_diag(reporter, diag, fn_span);
+                                    }
                                 }
                                 lean_verify::CheckResult::Error(e) => {
                                     self.count_errors += 1;
@@ -1830,16 +1857,16 @@ impl Verifier {
                                         );
                                     }
                                 }
-                                lean_verify::CheckResult::Failed { error, warnings } => {
-                                    self.count_errors += 1;
+                                lean_verify::CheckResult::Failed { errors, warnings } => {
                                     for w in warnings {
                                         reporter.report(
                                             &message(MessageLevel::Warning, w, fn_span).to_any()
                                         );
                                     }
-                                    reporter.report(
-                                        &message(MessageLevel::Error, error, fn_span).to_any()
-                                    );
+                                    for diag in errors {
+                                        self.count_errors += 1;
+                                        emit_tactus_diag(reporter, diag, fn_span);
+                                    }
                                 }
                                 lean_verify::CheckResult::Error(e) => {
                                     self.count_errors += 1;
