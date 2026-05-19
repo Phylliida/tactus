@@ -1462,6 +1462,126 @@ fn proof_fn_method_type(
 /// impl method's `lean_name` rendering — e.g., for `MyInt::is_zero`
 /// at full path `test_crate.impl__0.is_zero`, the prefix is
 /// `test_crate.impl__0`). Passed in by `trait_impl_to_ast`.
+/// VIR-level rewrite of self-sibling trait method calls in an impl
+/// body. Replaces `Trait::method(self_arg, ...)` with a direct call to
+/// the impl's `impl__N.method` standalone def — but ONLY when the
+/// call's first arg type structurally matches the impl's Self type
+/// (`ti.trait_typ_args[0]`).
+///
+/// Why VIR-level and not LExpr-level: the call's first-arg type is
+/// preserved at VIR level but erased at LExpr level. The prior
+/// LExpr-level `strip_class_qualifier` was type-blind and rewrote
+/// every `Trait.method` ref regardless of receiver — fine for non-
+/// blanket impls (where the only Trait.method call IS on Self), but
+/// wrong for blanket impls. Concretely, `impl<A: View> View for
+/// Wrap<A> { fn view(&self) -> A::V { self.0.view() } }` has a body
+/// that calls `View::view(self.0)` where `self.0 : A` — that's a
+/// dispatch on A's instance (which is in scope via `[View A]`), NOT
+/// a sibling call to Wrap's `view`. The receiver-type check skips
+/// the rewrite, leaving Lean's class machinery to resolve through
+/// `[View A]`.
+///
+/// For non-blanket impls (e.g., `impl Foo for Bar`), the receiver is
+/// always `self : Bar` which matches `ti.trait_typ_args[0] = Bar`,
+/// so the rewrite fires exactly as `strip_class_qualifier` used to.
+/// Backwards-compatible.
+///
+/// Why the rewrite is needed at all: instance method bodies live
+/// inside an `instance` declaration whose own dispatch isn't yet
+/// available — a body that calls `Trait.method` on Self would
+/// forward-reference the instance being defined and loop. Routing
+/// to the standalone def (`impl__N.method`) breaks the cycle. The
+/// standalone is `noncomputable def impl__N.method (self : Self) :=
+/// <body>`, defined alongside the instance.
+///
+/// `trait_path` is `ti.trait_path`; `impl_self_typ` is
+/// `ti.trait_typ_args[0]`; `method_redirects` maps each impl method's
+/// short name (e.g., "view") to its `Fun` (the impl method's full
+/// path Fun like `impl__0.view`).
+fn rewrite_self_sibling_calls(
+    body: &Expr,
+    trait_path: &Path,
+    impl_self_typ: &Typ,
+    method_redirects: &HashMap<String, Fun>,
+) -> Expr {
+    use vir::ast_util::types_equal;
+    // Peel transparent type wrappers (Ref-style Decorate, Boxed) so
+    // `args[0].typ` from `self.method()` (which has shape
+    // `Decorate(Ref, ..., Self)`) compares structurally to the
+    // impl's `Self`. Verus's call-site lowering wraps the receiver
+    // in Ref decoration even though the trait method takes `&self`;
+    // the underlying TypX is the same value type. Other Decorate
+    // variants (Allocator, etc.) and Boxed are similarly transparent
+    // for the receiver-identity check.
+    fn peel(t: &Typ) -> Typ {
+        let mut cur = t.clone();
+        loop {
+            let next = match &*cur {
+                TypX::Decorate(_, _, inner) => inner.clone(),
+                TypX::Boxed(inner) => inner.clone(),
+                _ => return cur,
+            };
+            cur = next;
+        }
+    }
+    let impl_self_peeled = peel(impl_self_typ);
+    vir::ast_visitor::map_expr_visitor(body, &|e: &Expr| {
+        if let ExprX::Call(target, args, post_args) = &e.x {
+            if let CallTarget::Fun(_kind, fun, typs, impl_paths, autospec, const_var) = target {
+                let segs = &fun.path.segments;
+                if segs.len() < 2 { return Ok(e.clone()); }
+                let method_short = segs[segs.len() - 1].as_str().to_string();
+                let trait_segs = &trait_path.segments;
+                if segs.len() != trait_segs.len() + 1 { return Ok(e.clone()); }
+                let head_matches = segs.iter().zip(trait_segs.iter())
+                    .take(trait_segs.len())
+                    .all(|(a, b)| a == b);
+                if !head_matches { return Ok(e.clone()); }
+                let Some(impl_fun) = method_redirects.get(&method_short) else {
+                    return Ok(e.clone());
+                };
+                let Some(first_arg) = args.first() else {
+                    return Ok(e.clone());
+                };
+                // Receiver-type match: peeled `args[0].typ` structurally
+                // equals the peeled impl Self. For blanket impls calling
+                // `Trait.method` on a typ-param (a different instance),
+                // this fails and the call stays as class dispatch (Lean
+                // resolves through the `[Trait A]` bracket in scope).
+                let arg_peeled = peel(&first_arg.typ);
+                if !types_equal(&arg_peeled, &impl_self_peeled) {
+                    return Ok(e.clone());
+                }
+                // Conservative: only rewrite when the trait's typ_args
+                // is exactly `[Self]` — no generic-method or generic-
+                // trait type args. The impl method's standalone def
+                // has Self baked in (no Type binder), so we DROP the
+                // typs when building the call. More elaborate cases
+                // (generic methods, generic traits) fall through and
+                // stay as class dispatch.
+                if typs.len() != 1 {
+                    return Ok(e.clone());
+                }
+                let new_target = CallTarget::Fun(
+                    CallTargetKind::Static,
+                    impl_fun.clone(),
+                    std::sync::Arc::new(vec![]),  // impl method has Self baked in
+                    impl_paths.clone(),
+                    *autospec,
+                    *const_var,
+                );
+                return Ok(SpannedTyped::new(
+                    &e.span,
+                    &e.typ,
+                    ExprX::Call(new_target, args.clone(), post_args.clone()),
+                ));
+            }
+        }
+        Ok(e.clone())
+    })
+    .expect("rewrite_self_sibling_calls is structural and cannot error")
+}
+
 fn strip_class_qualifier(
     expr: LExpr,
     class_name: &str,
@@ -1591,6 +1711,19 @@ pub fn trait_impl_to_ast(
             full.rfind('.').map(|i| full[..i].to_string()).unwrap_or_default()
         })
         .unwrap_or_default();
+    // `method_redirects` maps each impl method's short name to its
+    // full `Fun` (e.g., "view" -> `Fun { path: [impl%0, view] }`).
+    // Used by `rewrite_self_sibling_calls` to swap `Trait::method`
+    // call targets to the impl method's standalone def Fun. The
+    // VIR-level swap (vs the prior LExpr-level name rewrite) lets us
+    // gate on the receiver type, skipping the rewrite when the
+    // dispatch is on a different instance (blanket-impl case).
+    let method_redirects: HashMap<String, Fun> = method_impls.iter()
+        .filter_map(|f| {
+            let short = f.name.path.segments.last().map(|s| s.to_string())?;
+            Some((short, f.name.clone()))
+        })
+        .collect();
 
     let methods: Vec<InstanceMethod> = method_impls.iter()
         .filter_map(|func| {
@@ -1635,12 +1768,21 @@ pub fn trait_impl_to_ast(
                     }
                 }
                 (vir::ast::Mode::Proof, None) | (vir::ast::Mode::Exec, None) => return None,
-                (vir::ast::Mode::Spec, Some(body)) => strip_class_qualifier(
-                    vir_expr_to_ast(body),
-                    &trait_short,
-                    &impl_prefix,
-                    &sibling_methods,
-                ),
+                (vir::ast::Mode::Spec, Some(body)) => {
+                    // VIR-level type-aware redirect of self-sibling
+                    // Class.method calls to impl__N.method standalones.
+                    // For blanket-impl bodies that call Trait.method on
+                    // a typ-param (a different instance), the receiver-
+                    // type check skips the rewrite and the call stays
+                    // as class dispatch. See `rewrite_self_sibling_calls`
+                    // docs for the full rationale (Bug B body fix).
+                    let self_typ = ti.trait_typ_args.first()
+                        .expect("impl's trait_typ_args must include Self");
+                    let rewritten = rewrite_self_sibling_calls(
+                        body, &ti.trait_path, self_typ, &method_redirects,
+                    );
+                    vir_expr_to_ast(&rewritten)
+                }
                 (vir::ast::Mode::Exec, Some(_)) => {
                     // Exec placeholder. `default` produces a value
                     // of any type, satisfying Lean's instance-completeness
@@ -1704,12 +1846,13 @@ pub fn trait_impl_to_ast(
                         // called spec methods emit as standalone
                         // defs before the instance.
                         let body = func.body.as_ref().unwrap();
-                        let value = strip_class_qualifier(
-                            vir_expr_to_ast(body),
-                            &trait_short,
-                            &impl_prefix,
-                            &sibling_methods,
+                        // VIR-level rewrite (same as the Spec case).
+                        let self_typ = ti.trait_typ_args.first()
+                            .expect("impl's trait_typ_args must include Self");
+                        let rewritten = rewrite_self_sibling_calls(
+                            body, &ti.trait_path, self_typ, &method_redirects,
                         );
+                        let value = vir_expr_to_ast(&rewritten);
                         // `rfl` closes when body matches ensures
                         // literally; `simp_all` handles unfolding
                         // through standalone def chains.
