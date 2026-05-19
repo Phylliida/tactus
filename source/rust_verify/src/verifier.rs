@@ -1768,8 +1768,27 @@ impl Verifier {
                                             &message(MessageLevel::Warning, w, fn_span).to_any()
                                         );
                                     }
-                                    for diag in errors {
+                                    // Resolve proof-fn body line offsets to source-line spans
+                                    // before reporting. Each Lean diagnostic inside the tactic
+                                    // body becomes a per-line `-->` arrow instead of all
+                                    // collapsing to the fn signature.
+                                    for mut diag in errors {
                                         self.count_errors += 1;
+                                        if diag.rust_span.is_none() {
+                                            if let Some(offset) = diag.proof_fn_body_line_offset {
+                                                if let Some(parent_data) =
+                                                    crate::spans::raw_span_data(&fn_span.raw_span)
+                                                {
+                                                    diag.rust_span = crate::spans::tactic_body_line_span(
+                                                        parent_data,
+                                                        &fn_span.start_loc,
+                                                        file_path,
+                                                        start_byte,
+                                                        offset,
+                                                    );
+                                                }
+                                            }
+                                        }
                                         emit_tactus_diag(reporter, diag, fn_span);
                                     }
                                 }

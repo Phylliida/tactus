@@ -561,6 +561,14 @@ pub struct TactusDiag {
     pub message: String,
     pub rust_span: Option<vir::messages::Span>,
     pub help: Option<String>,
+    /// For proof-fn diagnostics: 0-indexed line offset within the
+    /// user's `by { ... }` tactic body. The verifier resolves this
+    /// to an absolute source line via the fn's `tactic_span` byte
+    /// range + rustc's `SourceMap` (which `lean_verify` doesn't
+    /// have access to). `None` for exec-fn diags (whose obligation
+    /// span is in `rust_span`) and for sanity-check / pre-Lean
+    /// rejections that don't correspond to any tactic line.
+    pub proof_fn_body_line_offset: Option<usize>,
 }
 
 #[must_use]
@@ -639,6 +647,7 @@ pub fn check_proof_fn(
                 message: reason,
                 rust_span: None,
                 help: Some(format!("generated .lean file: {}", file_path.display())),
+                proof_fn_body_line_offset: None,
             }],
             warnings: vec![],
         };
@@ -662,6 +671,7 @@ pub fn check_proof_fn(
                         message: format!("{}:\n\n{}", header, formatted.message),
                         rust_span: formatted.rust_span,
                         help: help.clone(),
+                        proof_fn_body_line_offset: formatted.proof_fn_body_line_offset,
                     }
                 })
                 .collect();
@@ -676,6 +686,7 @@ pub fn check_proof_fn(
                                       This is a Tactus pipeline bug — please file an issue with the generated .lean file.", header),
                     rust_span: None,
                     help,
+                    proof_fn_body_line_offset: None,
                 }]
             } else {
                 errors
@@ -729,6 +740,7 @@ pub fn check_exec_fn(
                 ),
                 rust_span: None,
                 help: None,
+                proof_fn_body_line_offset: None,
             }],
             warnings,
         },
@@ -769,6 +781,7 @@ pub fn check_exec_fn(
                 message: reason,
                 rust_span: None,
                 help: Some(format!("generated .lean file: {}", file_path.display())),
+                proof_fn_body_line_offset: None,
             }],
             warnings,
         };
@@ -800,6 +813,7 @@ pub fn check_exec_fn(
                         message: format!("{}:\n\n{}", header, formatted.message),
                         rust_span: formatted.rust_span,
                         help: help.clone(),
+                        proof_fn_body_line_offset: formatted.proof_fn_body_line_offset,
                     }
                 })
                 .collect();
@@ -809,6 +823,7 @@ pub fn check_exec_fn(
                                       This is a Tactus pipeline bug — please file an issue with the generated .lean file.", header),
                     rust_span: None,
                     help,
+                    proof_fn_body_line_offset: None,
                 }]
             } else {
                 errors

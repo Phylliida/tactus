@@ -14,6 +14,20 @@ pub(crate) fn to_raw_span(span: Span) -> vir::messages::RawSpan {
     Arc::new(span.data())
 }
 
+/// Worker-thread-safe accessor for the `SpanData` stored inside a
+/// `vir::messages::RawSpan`. Unlike `from_raw_span`, this does NOT
+/// reconstruct the `Span` (which interns via rustc's thread-local
+/// state and warns when called off-thread). Pure downcast + field
+/// read; safe from any thread.
+///
+/// Used by `tactic_body_line_span` to read the parent span's
+/// `BytePos`/`SyntaxContext` without violating the rustc-thread
+/// invariant.
+pub(crate) fn raw_span_data(raw_span: &vir::messages::RawSpan) -> Option<SpanData> {
+    let x = (&(**raw_span)) as &(dyn std::any::Any + Sync + Send);
+    x.downcast_ref::<SpanData>().copied()
+}
+
 // Note: this only returns Some for Spans in the local crate
 // WARNING: this should only be called from rustc's thread, not from a Verus worker thread,
 // because rustc may use its thread-local storage in .span().
@@ -41,6 +55,161 @@ pub(crate) fn err_air_span(span: Span) -> vir::messages::Span {
         // falls back to as_string when start_loc is empty.
         start_loc: String::new(),
     }
+}
+
+/// Construct a `vir::messages::Span` pointing at the source line
+/// that is `body_line_offset` lines past the `{` of a proof fn's
+/// `by { ... }` tactic body.
+///
+/// Used by Tactus's proof-fn error reporter to attach each Lean
+/// diagnostic to the corresponding line in the user's source — so
+/// rustc's `-->` arrow points at the failing tactic line rather
+/// than the enclosing fn signature.
+///
+/// `parent_span` is the rustc Span of the enclosing fn — we reuse
+/// its `ctxt` and parent (so hygiene info matches) and adjust
+/// `lo`/`hi` to the target line. `fn_start_loc` is the fn's
+/// `Span::start_loc` (`file:line:col` of the fn's first byte),
+/// used to derive `parent_span.lo()`'s file-relative position so
+/// we can compute the target byte position globally. `start_byte`
+/// is the file-relative byte offset of the `{` (from VIR's
+/// `FunctionAttrsX.tactic_span`).
+///
+/// Returns `None` when `fn_start_loc` doesn't parse as
+/// `file:line:col`, the source file can't be re-read from disk,
+/// or the target line is past the file's end. Callers fall back
+/// to `fn_span` in that case.
+///
+/// **No SourceMap needed.** We compute global BytePos arithmetic
+/// relative to `parent_span.lo()`: positions in the same file
+/// are contiguous in rustc's global address space, so the delta
+/// between two file-relative offsets equals the delta between
+/// their global positions. This lets the helper work from
+/// worker threads (where `SourceMap` isn't `Sync`) the same as
+/// from the main thread.
+///
+/// **Line correspondence**: `source_util::dedent` strips a
+/// common left indent from non-empty lines but preserves blank
+/// lines, so line N (0-indexed) in the dedented body always
+/// corresponds to line N (0-indexed) of the raw content between
+/// `{` and `}`. Raw content line 0 is on the same source-file
+/// line as `{`; line N (N ≥ 1) is N source-file lines further
+/// down.
+pub(crate) fn tactic_body_line_span(
+    parent_data: SpanData,
+    fn_start_loc: &str,
+    file_path: &str,
+    start_byte: usize,
+    body_line_offset: usize,
+) -> Option<vir::messages::Span> {
+    // Parse `file:line:col` from the right — file paths may
+    // contain `:` (Windows drive letters etc.), but line and col
+    // are always the last two segments.
+    let last_colon = fn_start_loc.rfind(':')?;
+    let fn_col: usize = fn_start_loc[last_colon + 1..].parse().ok()?;
+    let rest = &fn_start_loc[..last_colon];
+    let second_colon = rest.rfind(':')?;
+    let fn_line: usize = rest[second_colon + 1..].parse().ok()?;
+
+    // Re-read the file. Costs one disk read per failing proof-fn
+    // — negligible alongside the Lean check we just ran. Don't
+    // depend on `SourceFile::src` because it's wrapped in
+    // different ways across rustc versions and isn't always
+    // available on worker threads.
+    let src = std::fs::read_to_string(file_path).ok()?;
+    let bytes = src.as_bytes();
+    if start_byte >= bytes.len() { return None; }
+
+    // Find the byte offset (in file) of the fn's first character.
+    // Scan from start counting newlines until we reach `fn_line`,
+    // then add `fn_col - 1` (cols are 1-indexed).
+    let fn_first_byte = {
+        let mut current_line = 1;
+        let mut byte = 0;
+        while current_line < fn_line && byte < bytes.len() {
+            if bytes[byte] == b'\n' { current_line += 1; }
+            byte += 1;
+        }
+        if current_line < fn_line { return None; }
+        if fn_col == 0 { return None; }
+        let pos = byte + fn_col - 1;
+        if pos >= bytes.len() { return None; }
+        pos
+    };
+
+    // Find the target line's byte range within the file. Body
+    // line 0 starts at `start_byte + 1` (immediately after `{`).
+    // Line N starts after the Nth newline.
+    let mut byte = start_byte + 1;
+    let mut newlines_seen = 0;
+    while newlines_seen < body_line_offset && byte < bytes.len() {
+        if bytes[byte] == b'\n' { newlines_seen += 1; }
+        byte += 1;
+    }
+    if newlines_seen < body_line_offset { return None; }
+    let line_lo_file = byte;
+    let mut line_hi_file = line_lo_file;
+    while line_hi_file < bytes.len() && bytes[line_hi_file] != b'\n' {
+        line_hi_file += 1;
+    }
+    // Trim leading whitespace for prettier `^^^^` highlighting —
+    // points the carets at the first non-whitespace token rather
+    // than at indentation.
+    let mut content_lo_file = line_lo_file;
+    while content_lo_file < line_hi_file
+        && matches!(bytes[content_lo_file], b' ' | b'\t')
+    {
+        content_lo_file += 1;
+    }
+
+    // Delta from the fn's first byte to the target line in the
+    // file == delta in global BytePos space (file content is
+    // contiguous in the global address space).
+    let lo_delta = content_lo_file as i64 - fn_first_byte as i64;
+    let hi_delta = line_hi_file as i64 - fn_first_byte as i64;
+    let parent_lo_i = parent_data.lo.0 as i64;
+    if parent_lo_i + lo_delta < 0 || parent_lo_i + hi_delta < 0 { return None; }
+    let target_lo = BytePos((parent_lo_i + lo_delta) as u32);
+    let target_hi = BytePos((parent_lo_i + hi_delta) as u32);
+
+    // Construct a new `SpanData` directly — reusing the parent
+    // span's `ctxt` and `parent` for hygiene continuity. We
+    // deliberately avoid `Span::with_lo`/`with_hi` because those
+    // round-trip through `Span::data()` which uses rustc's
+    // thread-local interner and warns when called off the rustc
+    // thread (verifier worker threads).
+    let target_data = SpanData {
+        lo: target_lo,
+        hi: target_hi,
+        ctxt: parent_data.ctxt,
+        parent: parent_data.parent,
+    };
+    let raw_span: vir::messages::RawSpan = Arc::new(target_data);
+
+    // Build a `start_loc` for lean_verify's `at <loc>:` fallback
+    // formatting. We computed line/col ourselves; no SourceMap
+    // lookup needed.
+    let target_line = fn_line + count_newlines(bytes, fn_first_byte, content_lo_file);
+    let target_col = content_lo_file - line_start_before(bytes, content_lo_file) + 1;
+    let start_loc = format!("{}:{}:{}", file_path, target_line, target_col);
+
+    Some(vir::messages::Span {
+        raw_span,
+        id: 0,
+        data: vec![],
+        as_string: format!("SpanData({:?}..{:?})", target_lo, target_hi),
+        start_loc,
+    })
+}
+
+fn count_newlines(bytes: &[u8], from: usize, to: usize) -> usize {
+    bytes[from..to].iter().filter(|&&b| b == b'\n').count()
+}
+
+fn line_start_before(bytes: &[u8], pos: usize) -> usize {
+    let mut p = pos;
+    while p > 0 && bytes[p - 1] != b'\n' { p -= 1; }
+    p
 }
 
 #[derive(Debug, Clone)]
@@ -352,6 +521,7 @@ impl SpanContextX {
             self.unpack_span(&air_span.data, source_map)
         }
     }
+
 
     pub(crate) fn spanned_new<X>(&self, span: Span, source_map: &SourceMap, x: X)
         -> Arc<Spanned<X>>

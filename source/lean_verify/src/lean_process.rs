@@ -37,6 +37,17 @@ pub struct LeanResult {
 pub struct FormattedDiag {
     pub message: String,
     pub rust_span: Option<vir::messages::Span>,
+    /// For proof-fn diagnostics: 0-indexed line offset within the
+    /// user's `by { ... }` tactic body. `None` for exec-fn diags
+    /// (their span is in `rust_span` directly) or for proof-fn
+    /// diags whose `pos.line` falls outside the body (sanity-check
+    /// rejections at the top of the generated `.lean` etc.).
+    ///
+    /// Consumed by the verifier (which has rustc's `SourceMap` in
+    /// scope) to construct a proper source-line `Span`. We can't
+    /// build the span here because `lean_verify` doesn't depend on
+    /// rustc — the separation keeps the crate dependency-free.
+    pub proof_fn_body_line_offset: Option<usize>,
 }
 
 /// Format error diagnostics into a user-friendly string plus the
@@ -59,6 +70,7 @@ pub fn format_error(
 ) -> FormattedDiag {
     let mut out = String::new();
     let mut rust_span: Option<vir::messages::Span> = None;
+    let mut proof_fn_body_line_offset: Option<usize> = None;
 
     // Source location info: prefer the Rust span (from #51's
     // SpanMark instrumentation, populated for exec fns), fall
@@ -79,7 +91,14 @@ pub fn format_error(
             }
             rust_span = mark.rust_span.clone();
         } else if let Some(offset) = source_map.find_tactic_line(pos.line) {
+            // Proof-fn diag inside the tactic body. The verifier
+            // will translate `offset` to an absolute source line via
+            // the fn's `tactic_span` byte range + rustc's
+            // `SourceMap`. We still emit `tactic line N:` in the
+            // message body as a fallback for tooling / terminals
+            // that don't render `-->` (the JSON test output, etc.).
             out.push_str(&format!("tactic line {}: ", offset + 1));
+            proof_fn_body_line_offset = Some(offset);
         }
     }
 
@@ -99,7 +118,7 @@ pub fn format_error(
         out.push('\n');
     }
 
-    FormattedDiag { message: out, rust_span }
+    FormattedDiag { message: out, rust_span, proof_fn_body_line_offset }
 }
 
 /// Try to split Lean error data into a summary line and goal state.
