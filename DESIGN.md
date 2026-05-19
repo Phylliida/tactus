@@ -3059,6 +3059,55 @@ someone considers a uniformly-nice fix):
 Both alternatives ruled out by Lean semantics + DESIGN.md
 principles before the targeted two-step fix landed.
 
+#### Known UX limitation: `impl__N.method` naming leak
+
+The standalone-def pattern (Tactus + Mathlib both use it) has a
+user-visible cost: when a user's tactic unfolds a class method via
+`simp_all [Trait.method]`, simp unfolds Counter.method via the
+instance to the field body — which references the standalone def
+(`impl__N.method` in Tactus's current naming). simp doesn't
+auto-bridge that further unfold; the user must add
+`impl__N.method` to their simp set.
+
+The leakage surfaces in the goal state: `impl__0.raw { v := 3 } +
+impl__0.raw { v := 3 } = 6`. The user reads the goal, recognises
+the unfamiliar name, and (eventually) realises they need to add it
+to the simp list.
+
+Mathlib has the same problem in principle but with naturalish
+names: `Bar.raw`, `Real.mul`, etc. — the standalones live in the
+type's namespace and read as ordinary library functions. Tactus's
+auto-generated `impl__N.method` reads as an obvious emission
+detail and offers no hint about which trait/method/type it
+belongs to.
+
+**Considered fix: `@[reducible]` on impl method standalones
+(probed 2026-05-19, RULED OUT).** Hypothesis: marking the
+forwarders `@[reducible]` lets simp see through them as
+"transparent aliases" (analogous to how `abbrev` works), so
+`simp_all [Counter.method]` unfolds the class method via the
+instance, lands on `impl__N.method`, and continues through to the
+body. The hypothesis was wrong: Lean 4 `simp` doesn't delta-reduce
+reducible defs by default. `@[reducible]` controls reducibility
+for the *elaborator* and *typeclass search*; `simp`'s
+normalization phase is more conservative and won't unfold a
+reducible def absent an explicit `simp [name]` listing or
+`@[simp]` annotation. Pinned empirically by the
+`test_impl_method_sibling_call_in_body_probe` failing the same
+way pre- and post-`@[reducible]` emission. `@[simp]` would work
+but violates principle #1 (silent rewrite-rule extension); we
+took the lesson and reverted.
+
+**Forward path: rename to `<SelfTypeShortName>.<TraitShortName>.
+<method>`.** Deferred to a future session; HANDOFF.md has the
+detailed plan. The rename doesn't fix the user-side simp-listing
+requirement (they still have to add the standalone to their simp
+set), but it makes the name **discoverable from the goal state**:
+`Bar.Counter.raw { v := 3 }` reads naturally enough that a user
+can infer which name to add. `impl__0.raw` reads as a black-box
+synthetic name that doesn't suggest any add-target. Same
+ergonomic load as Mathlib's `Foo.bar`-style helpers.
+
 ### Code review strategy
 
 When landing non-trivial work, run review lenses against the diff

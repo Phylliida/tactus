@@ -4875,6 +4875,144 @@ fixed, flagged for future):
   logic. Same situation — adding `&` to one required adding to the
   other. Could share one helper.
 
+#### Current session (2026-05-19 continued — audit follow-up, `@[reducible]` experiment ruled out, rename deferred)
+
+After the Bug B fix landed (commit `df01442`, see below), Danielle
+asked for another audit pass focused on untested edge cases. Two
+more real bugs surfaced from probe writing alone (commit
+`df01442` already covered them — multi-arg trait bounds and
+standalone def body forward-ref). Then a deeper UX issue showed
+up: the `impl__N.method` standalone-def name leaks into the user-
+facing goal state when they `simp_all [Trait.method]`.
+
+**Tried: `@[reducible]` on impl method standalones.** Hypothesis:
+mark forwarders transparent, simp cascades through. Result: simp
+doesn't delta-reduce reducible defs absent explicit `simp [name]`
+or `@[simp]` annotations. `@[reducible]` controls
+elaborator/typeclass-search reducibility, not simp's normalization.
+Empirically verified by running the suite both with and without
+the annotation — same probe failure either way. Reverted.
+
+**`@[simp]` would work but violates DESIGN principle #1** (adds
+silent rewrite rule the user didn't ask for). Ruled out.
+
+**Deferred plan: rename `impl__N.method` →
+`<SelfTypeShortName>.<TraitShortName>.<method>`** (e.g.,
+`Bar.Counter.raw`, `Wrap.View.view`). Doesn't fix the user-side
+simp-listing requirement, but makes the standalone's name
+**discoverable from the goal state** rather than opaque-synthetic.
+Mathlib has the same ergonomic load — user lists `Foo.bar` in
+simp — but the names are natural.
+
+##### Rename implementation plan (for a future session)
+
+**Naming scheme.** For each impl method's standalone def, derive
+the path `<SelfTypeShortName>.<TraitShortName>.<MethodShortName>`:
+- `SelfTypeShortName` = `short_name(ti.trait_typ_args[0].path)`
+  for `Datatype` Self. For non-datatype Self (e.g., `&A` =
+  `Decorate(Ref, A)`), peel one layer and recurse OR fall back to
+  a synthetic prefix.
+- `TraitShortName` = `short_name(&ti.trait_path)`.
+- `MethodShortName` = `f.name.path.segments.last()`.
+
+**Collision case to handle**: two impls of the same trait for the
+same Self type with different trait generic args
+(`impl Foo<int> for Bar` and `impl Foo<bool> for Bar` — legal
+Rust). Both map to `Bar.Foo.method`. Disambiguation options:
+- (a) `Bar.Foo_int.method` / `Bar.Foo_bool.method` (encode trait
+  args in the trait segment). Aesthetic concern: `Foo_int_bool_...`
+  for multi-arg cases.
+- (b) Fall back to `impl__N.method` when the natural name would
+  collide. Detect collisions by building the natural-name map and
+  noting duplicates; emit `impl__N` only for those.
+- (c) Append `_v<N>` suffix on the natural name for the Nth impl
+  of the same `(Self, Trait)` pair.
+
+Most likely (b) is the cleanest — keep the readable name when
+unique, fall back to the disambiguator when necessary.
+
+**Edge cases for `SelfTypeShortName`:**
+- `Datatype(p, args, _)` → `short_name(p)`. (`Wrap<A>` → `Wrap`.)
+- `Decorate(Ref, _, inner)` → recurse on `inner`. (`&A` → A's
+  name; for blanket `&A` over typ-param the inner is TypParam.)
+- `Decorate(other, _, inner)` → recurse on `inner` (Allocator
+  decoration etc. is transparent for naming purposes).
+- `Boxed(inner)` → recurse on `inner`. (Boxed is the SMT box,
+  transparent for naming.)
+- `TypParam(name)` → use the typ-param's name (e.g., `A`). Note:
+  this could collide if multiple impls all use `A` — fall back
+  via the collision case handler.
+- `Primitive(p, _)` → some name based on the primitive (e.g.,
+  `Slice`, `Array`). Tactus already renders these specially in
+  `typ_to_expr`.
+- `MutRef(inner)`, `PointeeMetadata(inner)` → recurse on inner.
+- Other variants — fall back to `impl__N`.
+
+The helper would live alongside `short_name` in `to_lean_type.rs`
+or in `impl_subst.rs`.
+
+**Where to apply the rename**:
+
+1. **`impl_subst::augment_function`** rewrites `f.name` to the
+   natural path. The function's identity flows through unchanged
+   to `spec_fn_to_ast`, which uses `lean_name(&f.name.path)` —
+   that becomes the natural name automatically.
+
+2. **`impl_subst::set_method_context`** populates
+   `method_redirects` using the renamed `Fun` so the body's
+   `rewrite_self_sibling_calls` swaps to the natural name in
+   sibling-call rewrites.
+
+3. **Verify: no other path consults the original
+   `impl%N::method` Fun.** The original `Fun` is the FunctionX's
+   `name` field, used as a key in `fn_map`, `dep_order` graphs.
+   After rename, lookups by the ORIGINAL Fun won't find the
+   renamed FunctionX. Need to either:
+   - Keep the original Fun as the lookup key everywhere, only
+     rewriting for rendering (more careful threading).
+   - Or rewrite consistently across all maps (more invasive but
+     uniform).
+
+   I'd lean toward the second — rewrite consistently — by
+   running `maybe_augment_impl_method` BEFORE `fn_map` and
+   `dep_order` are built. The augmented FunctionX becomes the
+   canonical entry.
+
+**Naming sanity-check allowlist.** The renamed names (e.g.,
+`Bar.Counter.raw`) need to be in `sanity::name_resolves`'s
+allowlist OR resolve naturally via the emitted def's existence.
+Currently impl method standalones resolve naturally because
+`spec_fn_to_ast` emits the def with the name. Same should hold
+after rename.
+
+**Tests to update**:
+
+- `test_impl_method_sibling_call_in_body_probe` — tactic body
+  references `impl__0.raw`; update to `Bar.Counter.raw`.
+- The `impl_subst::tests::*` unit tests asserting specific names
+  like `_tactus_assoc_A_View_V` — those are for fresh-binder
+  names, unrelated to impl method names, so should be unaffected.
+- Any test that grep-able by goal-state assertion against
+  `impl__N.method` — should be none currently but worth checking.
+
+**Risk surface**:
+
+- Name collisions across impls (handled by the collision-case
+  scheme).
+- Path uniqueness in `fn_map` / `dep_order` — confirm renamed Fun
+  doesn't clash with anything else.
+- Lean parser may reject some name shapes (e.g., names starting
+  with a digit, names containing reserved characters). Likely
+  fine since we're using sanitised type/trait names.
+
+**Estimated cost**: ~150 lines + test verification. Ballparked
+half a session.
+
+**Probes to add as regression guards** (after rename lands):
+- A test whose tactic does NOT use `impl__N` in its simp set,
+  using the natural name instead — pinning the readability win.
+- A multi-impl-same-trait probe to exercise collision handling.
+
 #### Current session (2026-05-19 — Bug B step 2: per-impl projection substitution)
 
 **Bug B is CLOSED.** `test_view_blanket_impl_probe` flips from
