@@ -10396,6 +10396,39 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Probe (rename design): two different traits both declaring a
+// method with the same name (`raw`), both implemented for the
+// same Self (Bar). The new `<Self>.<Trait>.impl.<method>` scheme
+// distinguishes them via the Trait segment: `Bar.Foo.impl.raw`
+// vs `Bar.Bar2.impl.raw`. No collision; both renames fire.
+test_verify_one_file! {
+    #[test] test_two_traits_same_method_name_disambiguated_probe verus_code! {
+        pub trait Foo {
+            spec fn raw(&self) -> nat;
+        }
+
+        pub trait Bar2 {
+            spec fn raw(&self) -> nat;
+        }
+
+        pub struct Bar { pub v: nat }
+
+        impl Foo for Bar {
+            open spec fn raw(&self) -> nat { self.v }
+        }
+
+        impl Bar2 for Bar {
+            open spec fn raw(&self) -> nat { self.v + 1 }
+        }
+
+        proof fn foo_raw_is_v()
+            ensures Foo::raw(&Bar { v: 7 }) == 7
+        by {
+            simp_all [Foo.raw, Bar.Foo.impl.raw]
+        }
+    } => Ok(())
+}
+
 // Probe (realistic): `Container { length; is_empty }` where the
 // impl defines is_empty in terms of length. Classic pattern in
 // real APIs — `is_empty := len() == 0`. Tests whether the
