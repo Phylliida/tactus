@@ -10267,6 +10267,66 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Probe (Bug B audit follow-up): single typ-param bounded by TWO
+// traits, each with an assoc type that the impl signature uses.
+// `impl<A: View + DeepView> ...` is a common shape in vstd — every
+// `View` blanket impl also has a `DeepView` counterpart. Pins that
+// `ImplSubst::build` allocates distinct fresh binders for each
+// (X, trait, assoc) triple even when the same X carries multiple
+// trait bounds, and that the resulting Lean has both augmented
+// brackets `[View A V_a] [DeepView A V_a_dv]`.
+test_verify_one_file! {
+    #[test] test_view_blanket_impl_multi_trait_bound_probe verus_code! {
+        pub trait View {
+            type V;
+            spec fn view(&self) -> Self::V;
+        }
+
+        pub trait DeepView {
+            type V;
+            spec fn deep_view(&self) -> Self::V;
+        }
+
+        pub struct Wrap<A>(pub A);
+
+        // Single typ-param A bounded by both View and DeepView; impl
+        // exposes both passthroughs. Each assoc-type-impl uses a
+        // distinct projection (`A::V` from View vs `A::V` from
+        // DeepView — same NAME, different TRAIT).
+        impl<A: View + DeepView> View for Wrap<A> {
+            type V = <A as View>::V;
+            open spec fn view(&self) -> <A as View>::V {
+                self.0.view()
+            }
+        }
+
+        impl<A: View + DeepView> DeepView for Wrap<A> {
+            type V = <A as DeepView>::V;
+            open spec fn deep_view(&self) -> <A as DeepView>::V {
+                self.0.deep_view()
+            }
+        }
+
+        pub struct Holder { pub v: u8 }
+
+        impl View for Holder {
+            type V = u8;
+            open spec fn view(&self) -> u8 { self.v }
+        }
+
+        impl DeepView for Holder {
+            type V = u8;
+            open spec fn deep_view(&self) -> u8 { self.v }
+        }
+
+        proof fn wrap_view_passes_through_with_deep_bound()
+            ensures Wrap(Holder { v: 4 }).view() == 4
+        by {
+            simp_all [View.view]
+        }
+    } => Ok(())
+}
+
 // Probe (Bug D remaining piece, trait dispatch): same-crate trait
 // `View` with a non-blanket impl on a concrete struct. This is
 // closer to vstd's shape — `old(s).view()` dispatches through a

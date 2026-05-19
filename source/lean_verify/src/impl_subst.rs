@@ -77,9 +77,21 @@ use std::sync::Arc;
 
 use vir::ast::{
     GenericBound, GenericBoundX, Ident, Idents, GenericBounds, FunctionKind, FunctionX,
-    Param, ParamX, Params, Path, TraitId, Typ, TypX, Typs,
+    Param, ParamX, Params, Path, TraitId, TraitX, Typ, TypX, Typs,
 };
 use vir::def::Spanned;
+
+fn fresh_binder_name(x: &Ident, trait_path: &Path, assoc: &Ident) -> Ident {
+    // Trait short name is the last segment of `trait_path`. Including
+    // it disambiguates `_tactus_assoc_A_V` when the same X is bounded
+    // by two traits that each have an assoc named `V` (e.g.,
+    // `impl<A: View + DeepView>` where both traits have `type V`).
+    let trait_short = trait_path.segments.last()
+        .map(|s| s.as_str()).unwrap_or("_");
+    Arc::new(format!(
+        "_tactus_assoc_{}_{}_{}", x.as_str(), trait_short, assoc.as_str()
+    ))
+}
 
 /// Per-impl substitution: fresh binders + fake bounds + projection
 /// rewrite map. Built once per impl_path from the impl's signature
@@ -122,13 +134,35 @@ impl ImplSubst {
         self.fresh_binders.is_empty()
     }
 
-    /// Build the subst by walking `typs` for projections of the form
-    /// `<X as T>::N` where X is in `impl_typ_params` and there's a
-    /// `Trait(T, [X, ...])` bound in `impl_typ_bounds`.
+    /// Build the subst from the impl's signature.
+    ///
+    /// Two sources of fresh binders:
+    /// 1. **Projections in the signature** (typs iter). For each
+    ///    `<X as T>::N` where X is in `impl_typ_params` and there's
+    ///    a matching `Trait(T, [X])` bound, allocate a fresh binder
+    ///    and a `TypEquality(T, [X], N, TypParam(fresh))` bound. The
+    ///    `proj_map` records the projection→fresh mapping for typ
+    ///    rewriting.
+    /// 2. **Uncovered assoc-type slots on bound traits** (audit fix,
+    ///    2026-05-19). For each `Trait(T, [X])` bound where X is in
+    ///    `impl_typ_params`, enumerate T's `assoc_typs` (consulting
+    ///    `traits`). For each assoc that wasn't already covered by a
+    ///    projection in (1), allocate a fresh binder anyway. This
+    ///    fills the bound's outParam slots so the rendered bracket
+    ///    `[T X V_n …]` has the right arity for the class —
+    ///    otherwise `impl<A: View + DeepView>` (where only View's V
+    ///    is referenced) generates a malformed `[DeepView A]`
+    ///    1-arg bracket on a 2-arg class.
+    ///
+    /// The fresh binder from (2) is "unused" in the strict sense
+    /// (no projection rewrites to it), but Lean's outParam inference
+    /// will compute its value from instance lookup at use sites, so
+    /// the resulting Lean is well-formed.
     pub fn build<'a>(
         impl_typ_params: &Idents,
         impl_typ_bounds: &GenericBounds,
         typs: impl Iterator<Item = &'a Typ>,
+        traits: &HashMap<Path, &TraitX>,
     ) -> Self {
         let impl_params: std::collections::HashSet<&Ident> =
             impl_typ_params.iter().collect();
@@ -149,7 +183,24 @@ impl ImplSubst {
         }
 
         let mut subst = ImplSubst::default();
-        let mut seen: HashMap<(Ident, Path, Ident), ()> = HashMap::new();
+        let mut add_entry = |x: Ident, trait_path: Path, assoc_name: Ident, subst: &mut ImplSubst| {
+            let key = (x.clone(), trait_path.clone(), assoc_name.clone());
+            if subst.proj_map.contains_key(&key) { return; }
+            let fresh = fresh_binder_name(&x, &trait_path, &assoc_name);
+            subst.fresh_binders.push(fresh.clone());
+            let bound_typs: Typs = Arc::new(vec![Arc::new(TypX::TypParam(x.clone()))]);
+            let target_typ: Typ = Arc::new(TypX::TypParam(fresh.clone()));
+            let fake_bound: GenericBound = Arc::new(GenericBoundX::TypEquality(
+                trait_path.clone(),
+                bound_typs,
+                assoc_name.clone(),
+                target_typ,
+            ));
+            subst.fake_bounds.push(fake_bound);
+            subst.proj_map.insert(key, fresh);
+        };
+
+        // Source 1: projections in the signature.
         for typ in typs {
             walk_typ_for_projections(typ, &mut |x, trait_path, assoc_name| {
                 if !impl_params.contains(&x) { return; }
@@ -159,30 +210,25 @@ impl ImplSubst {
                 {
                     return;
                 }
-                let key = (x.clone(), trait_path.clone(), assoc_name.clone());
-                if seen.contains_key(&key) { return; }
-                seen.insert(key.clone(), ());
-
-                let fresh: Ident = Arc::new(format!(
-                    "_tactus_assoc_{}_{}", x.as_str(), assoc_name.as_str()
-                ));
-                subst.fresh_binders.push(fresh.clone());
-
-                let bound_typs: Typs = Arc::new(vec![
-                    Arc::new(TypX::TypParam(x.clone())),
-                ]);
-                let target_typ: Typ = Arc::new(TypX::TypParam(fresh.clone()));
-                let fake_bound: GenericBound = Arc::new(GenericBoundX::TypEquality(
-                    trait_path.clone(),
-                    bound_typs,
-                    assoc_name.clone(),
-                    target_typ,
-                ));
-                subst.fake_bounds.push(fake_bound);
-
-                subst.proj_map.insert(key, fresh);
+                add_entry(x, trait_path.clone(), assoc_name, &mut subst);
             });
         }
+
+        // Source 2: uncovered assoc-type slots on bound traits.
+        for bound in impl_typ_bounds.iter() {
+            if let GenericBoundX::Trait(TraitId::Path(p), bound_typs) = &**bound {
+                let Some(tr) = traits.get(p) else { continue; };
+                for bt in bound_typs.iter() {
+                    if let TypX::TypParam(x) = &**bt {
+                        if !impl_params.contains(x) { continue; }
+                        for assoc_name in tr.assoc_typs.iter() {
+                            add_entry(x.clone(), p.clone(), assoc_name.clone(), &mut subst);
+                        }
+                    }
+                }
+            }
+        }
+
         subst
     }
 
@@ -391,13 +437,17 @@ mod tests {
         })
     }
 
+    fn empty_lookup() -> HashMap<Path, &'static TraitX> {
+        HashMap::new()
+    }
+
     /// Empty inputs → empty subst (no fresh binders, no rewrites).
     #[test]
     fn build_empty_inputs_returns_empty_subst() {
         let typ_params: Idents = Arc::new(vec![]);
         let typ_bounds: GenericBounds = Arc::new(vec![]);
         let typs: Vec<Typ> = vec![];
-        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter());
+        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &empty_lookup());
         assert!(subst.is_empty());
         assert_eq!(subst.fresh_binders.len(), 0);
         assert_eq!(subst.fake_bounds.len(), 0);
@@ -422,7 +472,7 @@ mod tests {
             Arc::new(vec![]),
         ));
         let typs = vec![wrap_a];
-        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter());
+        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &empty_lookup());
         assert!(subst.is_empty());
     }
 
@@ -440,7 +490,7 @@ mod tests {
         ]);
         let proj = mk_proj("A", &["View"], "V");
         let typs = vec![proj];
-        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter());
+        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &empty_lookup());
         assert!(!subst.is_empty());
         assert_eq!(subst.fresh_binders.len(), 1);
         assert_eq!(subst.fake_bounds.len(), 1);
@@ -449,8 +499,8 @@ mod tests {
         let key = (mk_ident("A"), mk_path(&["View"]), mk_ident("V"));
         assert!(subst.proj_map.contains_key(&key));
         let fresh = subst.proj_map.get(&key).unwrap();
-        assert_eq!(fresh.as_str(), "_tactus_assoc_A_V");
-        assert_eq!(subst.fresh_binders[0].as_str(), "_tactus_assoc_A_V");
+        assert_eq!(fresh.as_str(), "_tactus_assoc_A_View_V");
+        assert_eq!(subst.fresh_binders[0].as_str(), "_tactus_assoc_A_View_V");
     }
 
     /// Two impl typ-params each with a passthrough → two fresh
@@ -469,13 +519,13 @@ mod tests {
             )),
         ]);
         let typs = vec![mk_proj("A", &["View"], "V"), mk_proj("B", &["View"], "V")];
-        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter());
+        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &empty_lookup());
         assert_eq!(subst.fresh_binders.len(), 2);
         let names: std::collections::HashSet<String> = subst.fresh_binders.iter()
             .map(|i| i.as_str().to_string())
             .collect();
-        assert!(names.contains("_tactus_assoc_A_V"));
-        assert!(names.contains("_tactus_assoc_B_V"));
+        assert!(names.contains("_tactus_assoc_A_View_V"));
+        assert!(names.contains("_tactus_assoc_B_View_V"));
     }
 
     /// Duplicate projections in the typs iter → single subst entry
@@ -493,7 +543,7 @@ mod tests {
             mk_proj("A", &["View"], "V"),
             mk_proj("A", &["View"], "V"),  // duplicate
         ];
-        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter());
+        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &empty_lookup());
         assert_eq!(subst.fresh_binders.len(), 1);
         assert_eq!(subst.fake_bounds.len(), 1);
         assert_eq!(subst.proj_map.len(), 1);
@@ -515,7 +565,7 @@ mod tests {
         // Projection on `B`, but B isn't in impl_typ_params.
         let proj = mk_proj("B", &["View"], "V");
         let typs = vec![proj];
-        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter());
+        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &empty_lookup());
         assert!(subst.is_empty());
     }
 
@@ -534,7 +584,7 @@ mod tests {
         ]);
         let proj = mk_proj("A", &["View"], "V");
         let typs = vec![proj];
-        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter());
+        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &empty_lookup());
         assert!(subst.is_empty());
     }
 
@@ -604,6 +654,109 @@ mod tests {
                 }
             }
             other => panic!("expected Datatype, got {:?}", other),
+        }
+    }
+
+    /// Audit-fix source 2: a trait bound on a typ-param with an
+    /// assoc type that the impl signature DOESN'T use should still
+    /// get a fresh binder, so the rendered bracket has the right
+    /// arity. Pinned to prevent regression of the `[DeepView A]`
+    /// 1-arg-on-2-arg-class bug surfaced by the multi-trait probe.
+    #[test]
+    fn build_fills_uncovered_assoc_slots_from_trait_bounds() {
+        let typ_params: Idents = Arc::new(vec![mk_ident("A")]);
+        let typ_bounds: GenericBounds = Arc::new(vec![
+            Arc::new(GenericBoundX::Trait(
+                TraitId::Path(mk_path(&["DeepView"])),
+                Arc::new(vec![Arc::new(TypX::TypParam(mk_ident("A")))]),
+            )),
+        ]);
+        // No projection in typs — but DeepView has assoc type V.
+        let typs: Vec<Typ> = vec![];
+        // Construct a fake TraitX with `assoc_typs: [V]`.
+        let trait_decl = make_trait_with_assocs("DeepView", &["V"]);
+        let mut lookup: HashMap<Path, &TraitX> = HashMap::new();
+        lookup.insert(mk_path(&["DeepView"]), &trait_decl);
+
+        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &lookup);
+        assert_eq!(subst.fresh_binders.len(), 1);
+        assert_eq!(subst.fresh_binders[0].as_str(), "_tactus_assoc_A_DeepView_V");
+    }
+
+    /// When both source-1 (projection) AND source-2 (uncovered slot)
+    /// would produce a binder for the SAME (X, T, N), only one
+    /// binder is allocated. The projection's entry wins.
+    #[test]
+    fn build_doesnt_double_count_when_projection_already_covers() {
+        let typ_params: Idents = Arc::new(vec![mk_ident("A")]);
+        let typ_bounds: GenericBounds = Arc::new(vec![
+            Arc::new(GenericBoundX::Trait(
+                TraitId::Path(mk_path(&["View"])),
+                Arc::new(vec![Arc::new(TypX::TypParam(mk_ident("A")))]),
+            )),
+        ]);
+        let typs = vec![mk_proj("A", &["View"], "V")];
+        let trait_decl = make_trait_with_assocs("View", &["V"]);
+        let mut lookup: HashMap<Path, &TraitX> = HashMap::new();
+        lookup.insert(mk_path(&["View"]), &trait_decl);
+
+        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &lookup);
+        // Only ONE binder, not two — the projection's entry already
+        // covered (A, View, V).
+        assert_eq!(subst.fresh_binders.len(), 1);
+    }
+
+    /// Multi-trait bound on one typ-param, where each trait has its
+    /// own assoc type — the audit case that surfaced the bug. Both
+    /// brackets should get filled even when only one is used by a
+    /// projection.
+    #[test]
+    fn build_handles_multi_trait_per_param_with_partial_coverage() {
+        let typ_params: Idents = Arc::new(vec![mk_ident("A")]);
+        let typ_bounds: GenericBounds = Arc::new(vec![
+            Arc::new(GenericBoundX::Trait(
+                TraitId::Path(mk_path(&["View"])),
+                Arc::new(vec![Arc::new(TypX::TypParam(mk_ident("A")))]),
+            )),
+            Arc::new(GenericBoundX::Trait(
+                TraitId::Path(mk_path(&["DeepView"])),
+                Arc::new(vec![Arc::new(TypX::TypParam(mk_ident("A")))]),
+            )),
+        ]);
+        // Only View's V appears as a projection; DeepView's V does
+        // NOT — the audit case.
+        let typs = vec![mk_proj("A", &["View"], "V")];
+        let view_decl = make_trait_with_assocs("View", &["V"]);
+        let deep_decl = make_trait_with_assocs("DeepView", &["V"]);
+        let mut lookup: HashMap<Path, &TraitX> = HashMap::new();
+        lookup.insert(mk_path(&["View"]), &view_decl);
+        lookup.insert(mk_path(&["DeepView"]), &deep_decl);
+
+        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &lookup);
+        assert_eq!(subst.fresh_binders.len(), 2);
+        let names: std::collections::HashSet<String> = subst.fresh_binders.iter()
+            .map(|i| i.as_str().to_string())
+            .collect();
+        assert!(names.contains("_tactus_assoc_A_View_V"));
+        assert!(names.contains("_tactus_assoc_A_DeepView_V"));
+    }
+
+    /// Helper: minimal `TraitX` literal for tests.
+    fn make_trait_with_assocs(name: &str, assocs: &[&str]) -> TraitX {
+        TraitX {
+            name: mk_path(&[name]),
+            proxy: None,
+            visibility: vir::ast::Visibility {
+                restricted_to: None,
+            },
+            typ_params: Arc::new(vec![]),
+            typ_bounds: Arc::new(vec![]),
+            assoc_typs: Arc::new(assocs.iter().map(|s| mk_ident(s)).collect()),
+            assoc_typs_bounds: Arc::new(vec![]),
+            methods: Arc::new(vec![]),
+            is_unsafe: false,
+            external_trait_extension: None,
+            dyn_compatible: None,
         }
     }
 }
