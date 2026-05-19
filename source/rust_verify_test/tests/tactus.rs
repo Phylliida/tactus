@@ -10226,6 +10226,47 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Probe (Bug B coverage extension): blanket impl with TWO typ-params,
+// each carrying its own assoc-type passthrough. Pins that
+// `ImplSubst::build` allocates distinct fresh binders for each
+// (typ_param, trait, assoc) triple, and that `trait_bounds_to_ast`
+// renders both augmented brackets `[View A V_a] [View B V_b]`.
+test_verify_one_file! {
+    #[test] test_view_blanket_impl_multi_param_probe verus_code! {
+        pub trait View {
+            type V;
+            spec fn view(&self) -> Self::V;
+        }
+
+        pub struct Pair<A, B>(pub A, pub B);
+
+        // Blanket impl with two typ-params; Pair's view is the first
+        // half's view (just to exercise the typ-system; the assoc-
+        // type passthrough is what's being tested, not the spec
+        // semantics).
+        impl<A: View, B: View> View for Pair<A, B> {
+            type V = A::V;
+
+            open spec fn view(&self) -> A::V {
+                self.0.view()
+            }
+        }
+
+        pub struct Holder { pub v: u8 }
+
+        impl View for Holder {
+            type V = u8;
+            open spec fn view(&self) -> u8 { self.v }
+        }
+
+        proof fn pair_view_passes_through()
+            ensures Pair(Holder { v: 3 }, Holder { v: 5 }).view() == 3
+        by {
+            simp_all [View.view]
+        }
+    } => Ok(())
+}
+
 // Probe (Bug D remaining piece, trait dispatch): same-crate trait
 // `View` with a non-blanket impl on a concrete struct. This is
 // closer to vstd's shape — `old(s).view()` dispatches through a

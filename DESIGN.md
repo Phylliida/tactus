@@ -171,6 +171,10 @@ Pieces of infrastructure that, if built, would simplify or unify existing code. 
 
   Current cost-benefit: borderline. The four current passes are stable and the orchestrator is one call site. The win shows up when the next rewrite lands (likely a candidate: a pass that strips synthetic `BuiltinSpecFun::ClosureReq` calls at spec position, for #124's exec-mode closure calls if that ever unblocks upstream).
 
+* **Public TypX walker for lean_verify.** `vir::ast_visitor::map_typ_visitor` is `pub(crate)` and not accessible from `lean_verify`. Tactus has two near-duplicate structural TypX walkers today: `to_lean_type::walk_typ` (read-only visitor) and `impl_subst::walk_typ_for_projections` + `impl_subst::rewrite_typ_rec` (visit + transform). They share the same shape — list every TypX variant explicitly, recurse into nested Typs, leave leaves as-is — but each is hand-rolled. Exposing a `pub` `map_typ_visitor` from VIR (or a Tactus-side wrapper that delegates to it) would let both sites share the walker, surfacing a new TypX variant as a compile error in the wrapper alone instead of N matching locations.
+
+  Current cost-benefit: low priority while the walkers are stable. Both are exhaustive-match today (no `_ =>` catch-all), so a new TypX variant fails at compile time in each — the safety property is already there, just duplicated. Worth revisiting if a third TypX walker enters Tactus.
+
 ### Mutual recursion (user-specified)
 
 ```rust
@@ -2942,6 +2946,118 @@ an Opaque value at this site. Only DIRECT field types matter
   free-standing spec fn) would more directly pin the abstraction
   outside the trait setup. Worth adding if any change to the dep
   walk is suspected.
+
+### Blanket-impl assoc-type passthrough (Bug B, LANDED 2026-05-19)
+
+Blanket impls like vstd's
+
+```rust
+impl<A: View> View for &A {
+    type V = A::V;
+    spec fn view(&self) -> A::V { (**self).view() }
+}
+```
+
+express assoc-type passthrough via projections — `<A as View>::V`
+appears in the impl method's return type, the assoc_type_impl's
+value, and the instance's positional V slot. The outParam encoding
+we emit for traits (`class View (Self : Type) (V : outParam Type)`)
+makes V a *unification variable*, not an *accessor* — so a literal
+`View.V A` rendering of the projection is malformed.
+
+**Two-step fix.** Implementation split into orthogonal pieces, each
+small and standalone.
+
+*Step 1 (`bbadec0`): VIR-level type-aware sibling rewrite.* The
+prior LExpr-level `strip_class_qualifier` rewrote every
+`Trait.method` ref in an instance method body regardless of the
+call's receiver. Correct for non-blanket impls (the only call to
+`Trait.method` IS on Self), wrong for blanket impls where the
+body's `View::view(self.0)` dispatches on `self.0 : A` — a
+different instance, NOT a sibling self-reference. New
+`rewrite_self_sibling_calls` walks the body at VIR level and checks
+the call's first-arg type against `ti.trait_typ_args[0]` (peeling
+transparent `Decorate`/`Boxed` wrappers); rewrites only when they
+match. Non-blanket impls render exactly as before — backwards-
+compatible. Blanket impls keep class dispatch for cross-instance
+calls.
+
+*Step 2 (`6f22676`): per-impl projection substitution.* New module
+`impl_subst.rs`. `ImplSubst { fresh_binders, fake_bounds,
+proj_map }` is built once per impl from the union of impl signature
+typs — trait_typ_args, assoc_type_impl values, each method's
+ret/param typs. For each `<X as T>::N` projection where X is in
+`impl_typ_params` and there's a `Trait(T, [X, ...])` bound,
+allocate a fresh `_tactus_assoc_<X>_<N>` binder, synthesise a
+`GenericBoundX::TypEquality(T, [X], N, TypParam(fresh))` bound, and
+record the projection→fresh-binder mapping. Apply at:
+
+- `trait_impl_to_ast` (instance side) — extend binders with
+  `fresh_binders`, prepend `fake_bounds` to `ti.typ_bounds` before
+  `trait_bounds_to_ast`, rewrite `trait_typ_args` and
+  `assoc_types[i].typ` via `rewrite_typ`.
+- Impl method standalone def emission via `maybe_augment_impl_method`
+  in `generate.rs`'s `FnGroup` iteration — augmented `FunctionX`
+  flows unchanged through `spec_fn_to_ast`.
+
+**The "fake TypEquality bound" insight.** `trait_bounds_to_ast`
+already iterates bounds looking for matching `TypEquality` entries
+and appending their typs to the rendered trait-arg list (that's the
+existing mechanism for `where A::V = SomeType` constraints).
+Synthesising a `TypEquality` with `TypParam(fresh)` on the RHS
+piggybacks on that machinery — the fresh-binder TypParam flows
+through the same path as any user-written equality, with no new
+code in the bound renderer. The data flow stays explicit (no
+thread_local, no ambient `@[simp]` on standalones); existing
+machinery does the load-bearing work.
+
+**Scope: signature only.** Bodies are NOT walked. The body of
+`view` is `self.0.view()` which renders to `View.view self.val0`
+— no projection in the rendered Lean (Lean infers V from class
+dispatch via the augmented `[View A _tactus_assoc_A_V]` bracket).
+Signature-only scope kept the rewrite localised to two
+`trait_impl_to_ast` call sites and the spec_fn-impl-method path —
+no invasive changes to `vir_expr_to_ast` or the SST renderer.
+
+**Generated Lean.** For `impl<A: View> View for Wrap<A>`:
+
+```lean
+noncomputable def impl__0.view (A : Type) (_tactus_assoc_A_V : Type)
+  [View A _tactus_assoc_A_V] (self : Wrap A) : _tactus_assoc_A_V :=
+  View.view self.val0
+
+noncomputable instance {A : Type} {_tactus_assoc_A_V : Type}
+  [View A _tactus_assoc_A_V] : View (Wrap A) _tactus_assoc_A_V where
+  view := fun (self : _) => View.view self.val0
+```
+
+Pinned by `test_view_blanket_impl_probe` (same-crate Wrap blanket
+impl). Unit-tested in `impl_subst::tests` (10 tests covering
+`build` for the typical cases, including dedup, multi-typ-param,
+and skip cases for non-typ-param projections and non-matching
+bounds; plus `rewrite_typ` for identity and replacement cases).
+
+**Walked considered alternatives** (documented for the next time
+someone considers a uniformly-nice fix):
+
+* **V-as-field encoding** (switch class to `class View (Self : Type)
+  where V : Type; view : Self → V`). Loses outParam's instance-search
+  behavior — Lean's elaborator doesn't reduce class field projections
+  during typeclass search, so `OfNat (View.V (Wrap Holder)) 7` fails
+  to synthesize even though the projection definitionally equals
+  `Int`. outParam is load-bearing, not decoration.
+
+* **Forward-call instance bodies** (always emit instance method as a
+  thin forward to the standalone def). Broke 5 proof-fn tests whose
+  tactic bodies do `simp_all [Foo.predicate]` and expect one unfold
+  to reach the impl body — forward-call inserts an extra
+  `impl__N.predicate` step that simp_all doesn't chain through.
+  Fixing this with `@[simp]` on standalones would violate DESIGN
+  principle #1 (Transparency) by adding silent unfolding the user
+  can't see.
+
+Both alternatives ruled out by Lean semantics + DESIGN.md
+principles before the targeted two-step fix landed.
 
 ### Code review strategy
 
