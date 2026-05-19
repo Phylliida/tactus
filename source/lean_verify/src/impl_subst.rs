@@ -85,6 +85,22 @@ use vir::def::Spanned;
 /// rewrite map. Built once per impl_path from the impl's signature
 /// typs; consumed by `trait_impl_to_ast` (instance side) and
 /// `augment_function` (impl method standalone side).
+///
+/// **Invariant** (by construction in [`ImplSubst::build`]): the three
+/// fields are populated together for each unique `(X, T, N)` triple
+/// discovered in the impl signature. So:
+/// - `fresh_binders.len() == fake_bounds.len() == proj_map.len()`.
+/// - For each `i`, `fresh_binders[i]` is the binder named in
+///   `fake_bounds[i]`'s RHS `TypParam(_)`, and is also a value in
+///   `proj_map` for some `(X, T, N)` key.
+///
+/// The three fields are parallel arrays in this sense; they're kept
+/// separate because the consumers have genuinely different access
+/// patterns (sequential for binder + bound emission, lookup-by-key
+/// for projection rewrite). A fused `Vec<ImplSubstEntry>` would
+/// force a re-iteration to build the lookup map. The build-site
+/// discipline (one push per push, all in `ImplSubst::build`) keeps
+/// the invariant inexpensive to maintain.
 #[derive(Debug, Clone, Default)]
 pub struct ImplSubst {
     /// Fresh implicit type binders to inject into the impl's typ_params.
@@ -212,9 +228,16 @@ impl ImplSubst {
 
 /// Visit `typ` looking for `Projection { trait_typ_args: [TypParam(X),
 /// ...], trait_path: T, name: N }`. For each match, call `visit(X, T,
-/// N)`. Only the first trait_typ_arg position is inspected (the
-/// projection's "Self" slot); other positions are walked recursively
-/// for nested projections.
+/// N)`. Only the first trait_typ_arg position is inspected for the
+/// (X, T, N) extraction (the projection's "Self" slot); ALL positions
+/// (including the first) are still walked recursively for nested
+/// projections.
+///
+/// **Exhaustive match.** Every TypX variant is listed explicitly,
+/// including leaves. A new TypX variant added in Verus compile-errors
+/// here, forcing categorization (leaf vs composite) — silent miss is
+/// a soundness risk because the missed projection wouldn't get a
+/// fresh binder and the rendered Lean would be malformed.
 fn walk_typ_for_projections<'a>(
     typ: &'a Typ,
     visit: &mut impl FnMut(Ident, &'a Path, Ident),
@@ -225,9 +248,8 @@ fn walk_typ_for_projections<'a>(
                 if let TypX::TypParam(x) = &**first {
                     visit(x.clone(), trait_path, name.clone());
                 }
-                walk_typ_for_projections(first, visit);
             }
-            for t in trait_typ_args.iter().skip(1) {
+            for t in trait_typ_args.iter() {
                 walk_typ_for_projections(t, visit);
             }
         }
@@ -235,22 +257,35 @@ fn walk_typ_for_projections<'a>(
         | TypX::Dyn(_, args, _) | TypX::Opaque { args, .. } => {
             for a in args.iter() { walk_typ_for_projections(a, visit); }
         }
-        TypX::Boxed(inner) | TypX::Decorate(_, _, inner) | TypX::MutRef(inner) => {
+        TypX::Boxed(inner) | TypX::MutRef(inner) | TypX::PointeeMetadata(inner) => {
             walk_typ_for_projections(inner, visit);
+        }
+        TypX::Decorate(_, deco_arg, inner) => {
+            walk_typ_for_projections(inner, visit);
+            if let Some(da) = deco_arg {
+                walk_typ_for_projections(&da.allocator_typ, visit);
+            }
         }
         TypX::SpecFn(params, ret) | TypX::AnonymousClosure(params, ret, _, _) => {
             for p in params.iter() { walk_typ_for_projections(p, visit); }
             walk_typ_for_projections(ret, visit);
         }
-        // Leaves and decoration-less variants — nothing to recurse into.
-        _ => {}
+        // Leaves — no nested Typ to recurse into.
+        TypX::Bool | TypX::Int(_) | TypX::Real | TypX::Float(_)
+        | TypX::TypParam(_) | TypX::TypeId
+        | TypX::ConstInt(_) | TypX::ConstBool(_)
+        | TypX::Air(_) => {}
     }
 }
 
 /// Recursive TypX → Typ rewriter that replaces matching projections
 /// with `TypParam(fresh)`. Structurally identical to `walk_typ_for_
-/// projections` but produces a new typ.
+/// projections` but produces a new typ. **Exhaustive match** for the
+/// same reason as the walker (see above).
 fn rewrite_typ_rec(typ: &Typ, proj_map: &HashMap<(Ident, Path, Ident), Ident>) -> Typ {
+    let rewrite_typs = |args: &Typs| -> Typs {
+        Arc::new(args.iter().map(|t| rewrite_typ_rec(t, proj_map)).collect())
+    };
     match &**typ {
         TypX::Projection { trait_typ_args, trait_path, name } => {
             if let Some(first) = trait_typ_args.first() {
@@ -262,40 +297,56 @@ fn rewrite_typ_rec(typ: &Typ, proj_map: &HashMap<(Ident, Path, Ident), Ident>) -
                 }
             }
             // Non-matching projection: still recurse into args.
-            let new_args: Typs = Arc::new(
-                trait_typ_args.iter().map(|t| rewrite_typ_rec(t, proj_map)).collect()
-            );
             Arc::new(TypX::Projection {
-                trait_typ_args: new_args,
+                trait_typ_args: rewrite_typs(trait_typ_args),
                 trait_path: trait_path.clone(),
                 name: name.clone(),
             })
         }
         TypX::Datatype(p, args, impls) => {
-            let new_args: Typs = Arc::new(
-                args.iter().map(|t| rewrite_typ_rec(t, proj_map)).collect()
-            );
-            Arc::new(TypX::Datatype(p.clone(), new_args, impls.clone()))
+            Arc::new(TypX::Datatype(p.clone(), rewrite_typs(args), impls.clone()))
         }
         TypX::Primitive(prim, args) => {
-            let new_args: Typs = Arc::new(
-                args.iter().map(|t| rewrite_typ_rec(t, proj_map)).collect()
-            );
-            Arc::new(TypX::Primitive(prim.clone(), new_args))
+            Arc::new(TypX::Primitive(prim.clone(), rewrite_typs(args)))
+        }
+        TypX::FnDef(fun, args, resolved) => {
+            Arc::new(TypX::FnDef(fun.clone(), rewrite_typs(args), resolved.clone()))
+        }
+        TypX::Dyn(p, args, impls) => {
+            Arc::new(TypX::Dyn(p.clone(), rewrite_typs(args), impls.clone()))
+        }
+        TypX::Opaque { def_path, args } => {
+            Arc::new(TypX::Opaque { def_path: def_path.clone(), args: rewrite_typs(args) })
         }
         TypX::Boxed(inner) => Arc::new(TypX::Boxed(rewrite_typ_rec(inner, proj_map))),
-        TypX::Decorate(d, a, inner) => {
-            Arc::new(TypX::Decorate(d.clone(), a.clone(), rewrite_typ_rec(inner, proj_map)))
+        TypX::Decorate(d, deco_arg, inner) => {
+            let new_inner = rewrite_typ_rec(inner, proj_map);
+            let new_deco_arg = deco_arg.as_ref().map(|da| {
+                vir::ast::TypDecorationArg {
+                    allocator_typ: rewrite_typ_rec(&da.allocator_typ, proj_map),
+                }
+            });
+            Arc::new(TypX::Decorate(d.clone(), new_deco_arg, new_inner))
         }
         TypX::MutRef(inner) => Arc::new(TypX::MutRef(rewrite_typ_rec(inner, proj_map))),
-        TypX::SpecFn(params, ret) => {
-            let new_params: Typs = Arc::new(
-                params.iter().map(|t| rewrite_typ_rec(t, proj_map)).collect()
-            );
-            Arc::new(TypX::SpecFn(new_params, rewrite_typ_rec(ret, proj_map)))
+        TypX::PointeeMetadata(inner) => {
+            Arc::new(TypX::PointeeMetadata(rewrite_typ_rec(inner, proj_map)))
         }
-        // Variants without nested typs — clone-through.
-        _ => typ.clone(),
+        TypX::SpecFn(params, ret) => {
+            Arc::new(TypX::SpecFn(rewrite_typs(params), rewrite_typ_rec(ret, proj_map)))
+        }
+        TypX::AnonymousClosure(params, ret, kind, id) => {
+            Arc::new(TypX::AnonymousClosure(
+                rewrite_typs(params),
+                rewrite_typ_rec(ret, proj_map),
+                *kind, *id,
+            ))
+        }
+        // Leaves — no nested Typ to rewrite. Cheap clone (Arc bump).
+        TypX::Bool | TypX::Int(_) | TypX::Real | TypX::Float(_)
+        | TypX::TypParam(_) | TypX::TypeId
+        | TypX::ConstInt(_) | TypX::ConstBool(_)
+        | TypX::Air(_) => typ.clone(),
     }
 }
 
@@ -314,4 +365,245 @@ pub fn maybe_augment_impl_method(
         }
     }
     f.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vir::ast::{PathX, TraitId};
+
+    fn mk_ident(s: &str) -> Ident {
+        Arc::new(s.to_string())
+    }
+
+    fn mk_path(segments: &[&str]) -> Path {
+        Arc::new(PathX {
+            krate: None,
+            segments: Arc::new(segments.iter().map(|s| mk_ident(s)).collect()),
+        })
+    }
+
+    fn mk_proj(typ_param: &str, trait_segs: &[&str], assoc: &str) -> Typ {
+        Arc::new(TypX::Projection {
+            trait_typ_args: Arc::new(vec![Arc::new(TypX::TypParam(mk_ident(typ_param)))]),
+            trait_path: mk_path(trait_segs),
+            name: mk_ident(assoc),
+        })
+    }
+
+    /// Empty inputs → empty subst (no fresh binders, no rewrites).
+    #[test]
+    fn build_empty_inputs_returns_empty_subst() {
+        let typ_params: Idents = Arc::new(vec![]);
+        let typ_bounds: GenericBounds = Arc::new(vec![]);
+        let typs: Vec<Typ> = vec![];
+        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter());
+        assert!(subst.is_empty());
+        assert_eq!(subst.fresh_binders.len(), 0);
+        assert_eq!(subst.fake_bounds.len(), 0);
+        assert_eq!(subst.proj_map.len(), 0);
+    }
+
+    /// Walking a typ with no projections → no subst entries even if
+    /// the typ contains typ-params and the bounds reference them.
+    #[test]
+    fn build_skips_non_projection_typs() {
+        let typ_params: Idents = Arc::new(vec![mk_ident("A")]);
+        let typ_bounds: GenericBounds = Arc::new(vec![
+            Arc::new(GenericBoundX::Trait(
+                TraitId::Path(mk_path(&["View"])),
+                Arc::new(vec![Arc::new(TypX::TypParam(mk_ident("A")))]),
+            )),
+        ]);
+        // typ is just `Datatype(Wrap, [A])` — no projection inside.
+        let wrap_a: Typ = Arc::new(TypX::Datatype(
+            vir::ast::Dt::Path(mk_path(&["Wrap"])),
+            Arc::new(vec![Arc::new(TypX::TypParam(mk_ident("A")))]),
+            Arc::new(vec![]),
+        ));
+        let typs = vec![wrap_a];
+        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter());
+        assert!(subst.is_empty());
+    }
+
+    /// A projection `<A as View>::V` where `A: View` is a bound and
+    /// `A` is in typ_params → one fresh binder + one fake bound +
+    /// one proj_map entry.
+    #[test]
+    fn build_lifts_typ_param_projection_to_fresh_binder() {
+        let typ_params: Idents = Arc::new(vec![mk_ident("A")]);
+        let typ_bounds: GenericBounds = Arc::new(vec![
+            Arc::new(GenericBoundX::Trait(
+                TraitId::Path(mk_path(&["View"])),
+                Arc::new(vec![Arc::new(TypX::TypParam(mk_ident("A")))]),
+            )),
+        ]);
+        let proj = mk_proj("A", &["View"], "V");
+        let typs = vec![proj];
+        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter());
+        assert!(!subst.is_empty());
+        assert_eq!(subst.fresh_binders.len(), 1);
+        assert_eq!(subst.fake_bounds.len(), 1);
+        assert_eq!(subst.proj_map.len(), 1);
+        // Invariant check: the three field lengths match.
+        let key = (mk_ident("A"), mk_path(&["View"]), mk_ident("V"));
+        assert!(subst.proj_map.contains_key(&key));
+        let fresh = subst.proj_map.get(&key).unwrap();
+        assert_eq!(fresh.as_str(), "_tactus_assoc_A_V");
+        assert_eq!(subst.fresh_binders[0].as_str(), "_tactus_assoc_A_V");
+    }
+
+    /// Two impl typ-params each with a passthrough → two fresh
+    /// binders, distinct.
+    #[test]
+    fn build_handles_multi_typ_param_passthrough() {
+        let typ_params: Idents = Arc::new(vec![mk_ident("A"), mk_ident("B")]);
+        let typ_bounds: GenericBounds = Arc::new(vec![
+            Arc::new(GenericBoundX::Trait(
+                TraitId::Path(mk_path(&["View"])),
+                Arc::new(vec![Arc::new(TypX::TypParam(mk_ident("A")))]),
+            )),
+            Arc::new(GenericBoundX::Trait(
+                TraitId::Path(mk_path(&["View"])),
+                Arc::new(vec![Arc::new(TypX::TypParam(mk_ident("B")))]),
+            )),
+        ]);
+        let typs = vec![mk_proj("A", &["View"], "V"), mk_proj("B", &["View"], "V")];
+        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter());
+        assert_eq!(subst.fresh_binders.len(), 2);
+        let names: std::collections::HashSet<String> = subst.fresh_binders.iter()
+            .map(|i| i.as_str().to_string())
+            .collect();
+        assert!(names.contains("_tactus_assoc_A_V"));
+        assert!(names.contains("_tactus_assoc_B_V"));
+    }
+
+    /// Duplicate projections in the typs iter → single subst entry
+    /// (dedup by (X, T, N) key).
+    #[test]
+    fn build_dedupes_repeated_projections() {
+        let typ_params: Idents = Arc::new(vec![mk_ident("A")]);
+        let typ_bounds: GenericBounds = Arc::new(vec![
+            Arc::new(GenericBoundX::Trait(
+                TraitId::Path(mk_path(&["View"])),
+                Arc::new(vec![Arc::new(TypX::TypParam(mk_ident("A")))]),
+            )),
+        ]);
+        let typs = vec![
+            mk_proj("A", &["View"], "V"),
+            mk_proj("A", &["View"], "V"),  // duplicate
+        ];
+        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter());
+        assert_eq!(subst.fresh_binders.len(), 1);
+        assert_eq!(subst.fake_bounds.len(), 1);
+        assert_eq!(subst.proj_map.len(), 1);
+    }
+
+    /// Projection on a typ-param NOT in `impl_typ_params` → no
+    /// subst entry. (E.g., `<SomeOtherT as View>::V` where
+    /// SomeOtherT isn't the impl's parameter — typically can't
+    /// arise in practice but the build is defensive.)
+    #[test]
+    fn build_ignores_projections_of_non_impl_typ_params() {
+        let typ_params: Idents = Arc::new(vec![mk_ident("A")]);
+        let typ_bounds: GenericBounds = Arc::new(vec![
+            Arc::new(GenericBoundX::Trait(
+                TraitId::Path(mk_path(&["View"])),
+                Arc::new(vec![Arc::new(TypX::TypParam(mk_ident("A")))]),
+            )),
+        ]);
+        // Projection on `B`, but B isn't in impl_typ_params.
+        let proj = mk_proj("B", &["View"], "V");
+        let typs = vec![proj];
+        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter());
+        assert!(subst.is_empty());
+    }
+
+    /// Projection on a typ-param without a matching trait bound →
+    /// no subst entry. (E.g., `<A as View>::V` but bounds only
+    /// have `A: OtherTrait`.)
+    #[test]
+    fn build_ignores_projections_without_matching_bound() {
+        let typ_params: Idents = Arc::new(vec![mk_ident("A")]);
+        let typ_bounds: GenericBounds = Arc::new(vec![
+            // `A: OtherTrait`, not `A: View`.
+            Arc::new(GenericBoundX::Trait(
+                TraitId::Path(mk_path(&["OtherTrait"])),
+                Arc::new(vec![Arc::new(TypX::TypParam(mk_ident("A")))]),
+            )),
+        ]);
+        let proj = mk_proj("A", &["View"], "V");
+        let typs = vec![proj];
+        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter());
+        assert!(subst.is_empty());
+    }
+
+    /// `rewrite_typ` on a typ with no matching projections returns
+    /// a structurally-identical typ (modulo Arc bumps).
+    #[test]
+    fn rewrite_typ_identity_for_non_matching() {
+        let subst = ImplSubst::default();
+        let typ: Typ = Arc::new(TypX::Datatype(
+            vir::ast::Dt::Path(mk_path(&["Wrap"])),
+            Arc::new(vec![Arc::new(TypX::TypParam(mk_ident("A")))]),
+            Arc::new(vec![]),
+        ));
+        let rewritten = subst.rewrite_typ(&typ);
+        assert!(vir::ast_util::types_equal(&typ, &rewritten));
+    }
+
+    /// `rewrite_typ` replaces a matching `Projection` with the
+    /// fresh `TypParam`.
+    #[test]
+    fn rewrite_typ_replaces_matching_projection() {
+        let mut proj_map = HashMap::new();
+        proj_map.insert(
+            (mk_ident("A"), mk_path(&["View"]), mk_ident("V")),
+            mk_ident("_tactus_assoc_A_V"),
+        );
+        let subst = ImplSubst {
+            fresh_binders: vec![mk_ident("_tactus_assoc_A_V")],
+            fake_bounds: vec![],
+            proj_map,
+        };
+        let proj = mk_proj("A", &["View"], "V");
+        let rewritten = subst.rewrite_typ(&proj);
+        match &*rewritten {
+            TypX::TypParam(name) => assert_eq!(name.as_str(), "_tactus_assoc_A_V"),
+            other => panic!("expected TypParam, got {:?}", other),
+        }
+    }
+
+    /// `rewrite_typ` walks INTO composite typs, replacing nested
+    /// projections.
+    #[test]
+    fn rewrite_typ_walks_into_datatype_args() {
+        let mut proj_map = HashMap::new();
+        proj_map.insert(
+            (mk_ident("A"), mk_path(&["View"]), mk_ident("V")),
+            mk_ident("V_a"),
+        );
+        let subst = ImplSubst {
+            fresh_binders: vec![mk_ident("V_a")],
+            fake_bounds: vec![],
+            proj_map,
+        };
+        // `Datatype(Wrap, [Projection<A as View>::V])`.
+        let typ: Typ = Arc::new(TypX::Datatype(
+            vir::ast::Dt::Path(mk_path(&["Wrap"])),
+            Arc::new(vec![mk_proj("A", &["View"], "V")]),
+            Arc::new(vec![]),
+        ));
+        let rewritten = subst.rewrite_typ(&typ);
+        match &*rewritten {
+            TypX::Datatype(_, args, _) => {
+                assert_eq!(args.len(), 1);
+                match &*args[0] {
+                    TypX::TypParam(name) => assert_eq!(name.as_str(), "V_a"),
+                    other => panic!("expected nested TypParam(V_a), got {:?}", other),
+                }
+            }
+            other => panic!("expected Datatype, got {:?}", other),
+        }
+    }
 }

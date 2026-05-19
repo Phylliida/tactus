@@ -232,6 +232,13 @@ pub(crate) fn is_variant_node(variant: &Ident, inner: LExpr) -> ExprNode {
 //     (`to_lean_fn::datatype_to_cmds`).
 //   * `_tactus_<kind>_<fn>_at_<loc>_<id>` — per-obligation theorem
 //     names (`build_theorem_name`).
+//   * `_tactus_assoc_<X>_<N>` — fresh implicit type binder lifted
+//     from a `<X as T>::N` projection in a blanket impl signature
+//     (`impl_subst::ImplSubst::build`, Bug B step 2). One per
+//     unique (X, T, N) triple discovered in the impl's signature
+//     typs. Mapped to a synthesised `TypEquality` bound so existing
+//     `trait_bounds_to_ast` machinery augments the trait bracket
+//     (`[View A _tactus_assoc_A_V]`) from the same source.
 //
 // **Convention 2: `<x>_at_pre_tactus` SUFFIX** — pre-state references
 // for `&mut` params in callee-spec inlining. The ONLY suffix-style
