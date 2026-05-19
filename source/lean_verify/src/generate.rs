@@ -296,40 +296,49 @@ fn krate_preamble(
     let trait_lookup: std::collections::HashMap<vir::ast::Path, &vir::ast::TraitX> =
         krate.traits.iter().map(|tr| (tr.x.name.clone(), &tr.x)).collect();
 
-    // Compute per-impl natural-name prefix `[Self, Trait]` for impl
-    // method standalone defs. Count duplicates across impls — when
-    // two impls produce the same prefix (e.g., `impl Foo<int> for
-    // Bar` and `impl Foo<bool> for Bar`), neither gets renamed; both
-    // fall back to `impl__N.method`. The natural name flows through
-    // `impl_subst::set_method_context` → `augment_function` →
-    // `spec_fn_to_ast` so the standalone def's emitted name is
-    // `Bar.Foo.method`. Sibling-call rewrites use the same renamed
-    // Fun via `method_redirects`. See HANDOFF.md "rename" plan and
-    // DESIGN.md "Known UX limitation" for the rationale.
+    // Compute per-impl natural-name prefix `[Self, Trait, "impl"]`
+    // for impl method standalone defs. The full def path becomes
+    // `<Self>.<Trait>.impl.<method>` (e.g., `Bar.Counter.impl.raw`,
+    // `Wrap.View.impl.view`).
+    //
+    // The `impl` marker between Trait and method is load-bearing.
+    // Without it, `Wrap.View.view`'s body would have a Lean
+    // namespace-resolution conflict: Lean climbs namespaces looking
+    // for `View.view`, reaches `Wrap.View` namespace (which is the
+    // def's prefix namespace), would find the def itself as the
+    // match, producing a recursive self-reference instead of
+    // resolving to the trait class method `test_crate.View.view`.
+    //
+    // With `Wrap.View.impl.view`, the namespace stack is `Wrap.View
+    // .impl → Wrap.View → Wrap → test_crate`. Lookup of `View.view`
+    // climbs past `Wrap.View.impl` and `Wrap.View` (no `view`
+    // declaration at either), then past `Wrap` (no `Wrap.View.view`
+    // declaration — only the `Wrap.View.impl` namespace exists),
+    // and lands at `test_crate.View.view`. ✓
+    //
+    // Collisions are handled by construction for most cases (different
+    // traits → different paths; inherent vs trait → different paths
+    // since inherent stays at Verus's `impl__N.method` emission).
+    // The remaining edge: `impl Foo<int> for Bar` and `impl Foo<bool>
+    // for Bar` both map to `Bar.Foo.impl.method`. Counted below;
+    // collisions fall back to `impl__N.method`.
     let impl_name_prefixes: std::collections::HashMap<vir::ast::Path, Vec<vir::ast::Ident>> = {
         use std::collections::HashMap;
-        // Naming scheme: `<SelfShortName>.<method>`. We DROP the
-        // trait segment from the middle because using the trait
-        // name there (e.g., `Wrap.View.view`) creates a namespace
-        // conflict — inside `def Wrap.View.view`'s body, Lean
-        // searches the def's namespace path first and resolves a
-        // bare `View.view` reference to the def itself (recursive
-        // self-ref) instead of to the class method. Without the
-        // trait segment, `Wrap.view`'s body's `View.view` resolves
-        // to the class method as intended.
-        //
-        // Cost: two trait impls on the same Self with same-named
-        // methods (e.g., `Self: Foo` with `Foo::view` AND `Self:
-        // Bar` with `Bar::view`) would collide on `Self.view`.
-        // Counted below; collisions fall back to `impl__N.method`.
-        // Collect each impl method's (Self, method_short) pair to
-        // detect collisions across impls.
+        let impl_marker: vir::ast::Ident = std::sync::Arc::new("impl".to_string());
+        // First pass: build tentative `[Self, Trait, "impl"]` prefix
+        // per impl. Collect (prefix, method_short) pairs to detect
+        // multi-impl name collisions.
         let mut per_method: HashMap<(Vec<vir::ast::Ident>, String), usize> = HashMap::new();
         let mut tentative_per_impl: HashMap<vir::ast::Path, Vec<vir::ast::Ident>> = HashMap::new();
         for (ti, method_impls) in &instances_to_emit {
             let Some(self_typ) = ti.x.trait_typ_args.first() else { continue; };
             let Some(self_short) = crate::to_lean_type::type_short_name(self_typ) else { continue; };
-            let prefix = vec![std::sync::Arc::new(self_short)];
+            let trait_short = crate::to_lean_type::short_name(&ti.x.trait_path).to_string();
+            let prefix = vec![
+                std::sync::Arc::new(self_short),
+                std::sync::Arc::new(trait_short),
+                impl_marker.clone(),
+            ];
             for f in method_impls {
                 if let Some(method_short) = f.name.path.segments.last().map(|s| s.to_string()) {
                     *per_method.entry((prefix.clone(), method_short)).or_insert(0) += 1;
@@ -337,9 +346,8 @@ fn krate_preamble(
             }
             tentative_per_impl.insert(ti.x.impl_path.clone(), prefix);
         }
-        // Per-impl: only rename when NONE of its method names
-        // collide with another impl's (same Self + same method
-        // short name).
+        // Second pass: only rename when NONE of the impl's method
+        // names collide with another impl's at the same prefix.
         let mut result: HashMap<vir::ast::Path, Vec<vir::ast::Ident>> = HashMap::new();
         for (ti, method_impls) in &instances_to_emit {
             let Some(prefix) = tentative_per_impl.get(&ti.x.impl_path) else { continue; };

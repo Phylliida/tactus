@@ -10368,6 +10368,34 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Probe: type has BOTH an inherent spec method named `raw` AND
+// a trait impl with a method named `raw`. Tests that the rename
+// scheme doesn't cause a same-Lean-name collision between the
+// inherent's def and the trait impl's standalone def.
+test_verify_one_file! {
+    #[test] test_inherent_and_trait_impl_same_method_name_probe verus_code! {
+        pub trait Counter {
+            spec fn raw(&self) -> nat;
+        }
+
+        pub struct Bar { pub v: nat }
+
+        impl Bar {
+            pub open spec fn raw(&self) -> nat { self.v + 1 }
+        }
+
+        impl Counter for Bar {
+            open spec fn raw(&self) -> nat { self.v }
+        }
+
+        proof fn trait_raw_unwraps_to_v()
+            ensures Counter::raw(&Bar { v: 7 }) == 7
+        by {
+            simp_all [Counter.raw]
+        }
+    } => Ok(())
+}
+
 // Probe (realistic): `Container { length; is_empty }` where the
 // impl defines is_empty in terms of length. Classic pattern in
 // real APIs — `is_empty := len() == 0`. Tests whether the
@@ -10390,7 +10418,7 @@ test_verify_one_file! {
         proof fn empty_list_is_empty()
             ensures (MyList { n: 0 }).is_empty()
         by {
-            simp_all [Container.is_empty, Container.length, MyList.length]
+            simp_all [Container.is_empty, Container.length, MyList.Container.impl.length]
         }
     } => Ok(())
 }
@@ -10417,7 +10445,7 @@ test_verify_one_file! {
         proof fn doubled_of_three_is_six()
             ensures (Bar { v: 3 }).doubled() == 6
         by {
-            simp_all [Counter.doubled, Counter.raw, Bar.raw]
+            simp_all [Counter.doubled, Counter.raw, Bar.Counter.impl.raw]
         }
     } => Ok(())
 }

@@ -3098,27 +3098,62 @@ way pre- and post-`@[reducible]` emission. `@[simp]` would work
 but violates principle #1 (silent rewrite-rule extension); we
 took the lesson and reverted.
 
-**Forward path: rename to `<SelfTypeShortName>.<TraitShortName>.
-<method>`.** Deferred to a future session; HANDOFF.md has the
-detailed plan. The rename doesn't fix the user-side simp-listing
-requirement (they still have to add the standalone to their simp
-set), but it makes the name **discoverable from the goal state**:
-`Bar.Counter.raw { v := 3 }` reads naturally enough that a user
-can infer which name to add. `impl__0.raw` reads as a black-box
-synthetic name that doesn't suggest any add-target. Same
-ergonomic load as Mathlib's `Foo.bar`-style helpers.
+**Landed 2026-05-19: rename impl method standalones to
+`<Self>.<Trait>.impl.<method>`.** The user-side simp-listing
+requirement remains (the chain `Counter.method → standalone-body`
+still needs the standalone in the simp set), but the name is now
+**discoverable from the goal state**: `MyList.Container.impl.length
+{ n := 0 } = 0` reads naturally enough that a user can infer the
+name to add. `impl__0.length` was a black-box synthetic name.
+
+**The `impl` marker is load-bearing**, not aesthetic. Without it
+(`<Self>.<Trait>.<method>`), inside `def Wrap.View.view`'s body
+Lean's namespace resolution finds the def itself before reaching
+the trait class method — `View.view` looked up at namespace
+`Wrap` resolves to the def at `Wrap.View.view` (recursive
+self-reference, wrong type). Adding `impl` as a middle segment
+breaks the namespace chain at exactly the right place. Lean
+climbs past `Wrap.View.impl` and `Wrap.View` (no `view`
+declaration at either), reaches the outer `test_crate` scope,
+and finds the class method.
 
 **When this fires in real code:** ANY trait where an impl method
 delegates to a sibling — `Container { length, is_empty }` with
 `is_empty := length() == 0`, `Iterator { next, peek }`,
-`Display { write, write_with_prefix }`, etc. This is a textbook
-Rust API pattern; the issue isn't hypothetical. Pinned by
-`test_impl_method_realistic_is_empty_probe` (Container with
-length/is_empty), which currently passes only because the user's
-tactic lists `impl__0.length` explicitly. After the rename, the
-listing would be `MyList.Container.length` — same number of
-listings, but a name the user can read off the goal state instead
-of having to grep the generated `.lean` to find.
+`Display { write, write_with_prefix }`, etc. Textbook Rust API
+pattern. Pinned by
+`test_impl_method_realistic_is_empty_probe`: tactic is
+`simp_all [Container.is_empty, Container.length,
+MyList.Container.impl.length]`. The third name is the standalone
+def's path — discoverable from the goal state's
+`MyList.Container.impl.length { n := 0 } = 0`.
+
+**Collisions**: handled by construction for the common cases
+(different traits → different paths; inherent vs trait → distinct
+paths since inherent keeps Verus's `impl__N.method` emission). The
+remaining edge case — `impl Foo<int> for Bar` and `impl Foo<bool>
+for Bar` both mapping to `Bar.Foo.impl.method` — is detected
+and falls back to `impl__N.method` for those impls. Logic in
+`generate.rs::krate_preamble`'s `impl_name_prefixes` computation.
+
+**Implementation locality**: the rename is contained to
+`impl_subst.rs` (no thread_local, no krate-wide path mutation).
+- `MethodContext::name_prefix: Option<Vec<Ident>>` carries the
+  per-impl prefix (or `None` for collision fallback).
+- `set_method_context` pre-renames `method_redirects` values to
+  the renamed `Fun` so sibling-call rewrites produce the natural
+  name without extra plumbing.
+- `augment_function` rewrites the FunctionX's `name` field.
+- `to_lean_fn::trait_impl_to_ast` consumes
+  `subst.method_context.method_redirects` (the pre-renamed map)
+  as its single source of truth for sibling redirects.
+- Bug C's synth body (uninterp impl methods) consults
+  `method_redirects` for the renamed `Fun`'s path.
+- `to_lean_type::type_short_name` peels Decorate/Boxed/MutRef to
+  derive the `<Self>` segment; falls back to `None` for shapes
+  without a clean type name (closures, anonymous tuples), in
+  which case the impl-method's prefix is omitted and it keeps
+  the original `impl__N.method` path.
 
 ### Code review strategy
 
