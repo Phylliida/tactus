@@ -10390,7 +10390,7 @@ test_verify_one_file! {
         proof fn empty_list_is_empty()
             ensures (MyList { n: 0 }).is_empty()
         by {
-            simp_all [Container.is_empty, Container.length, MyList.Container.length]
+            simp_all [Container.is_empty, Container.length, MyList.length]
         }
     } => Ok(())
 }
@@ -10417,7 +10417,7 @@ test_verify_one_file! {
         proof fn doubled_of_three_is_six()
             ensures (Bar { v: 3 }).doubled() == 6
         by {
-            simp_all [Counter.doubled, Counter.raw, impl__0.raw]
+            simp_all [Counter.doubled, Counter.raw, Bar.raw]
         }
     } => Ok(())
 }

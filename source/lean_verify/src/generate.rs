@@ -308,28 +308,52 @@ fn krate_preamble(
     // DESIGN.md "Known UX limitation" for the rationale.
     let impl_name_prefixes: std::collections::HashMap<vir::ast::Path, Vec<vir::ast::Ident>> = {
         use std::collections::HashMap;
-        // Step 1: tentative prefix for each impl.
-        let mut tentative: HashMap<vir::ast::Path, Vec<vir::ast::Ident>> = HashMap::new();
-        for (ti, _) in &instances_to_emit {
+        // Naming scheme: `<SelfShortName>.<method>`. We DROP the
+        // trait segment from the middle because using the trait
+        // name there (e.g., `Wrap.View.view`) creates a namespace
+        // conflict — inside `def Wrap.View.view`'s body, Lean
+        // searches the def's namespace path first and resolves a
+        // bare `View.view` reference to the def itself (recursive
+        // self-ref) instead of to the class method. Without the
+        // trait segment, `Wrap.view`'s body's `View.view` resolves
+        // to the class method as intended.
+        //
+        // Cost: two trait impls on the same Self with same-named
+        // methods (e.g., `Self: Foo` with `Foo::view` AND `Self:
+        // Bar` with `Bar::view`) would collide on `Self.view`.
+        // Counted below; collisions fall back to `impl__N.method`.
+        // Collect each impl method's (Self, method_short) pair to
+        // detect collisions across impls.
+        let mut per_method: HashMap<(Vec<vir::ast::Ident>, String), usize> = HashMap::new();
+        let mut tentative_per_impl: HashMap<vir::ast::Path, Vec<vir::ast::Ident>> = HashMap::new();
+        for (ti, method_impls) in &instances_to_emit {
             let Some(self_typ) = ti.x.trait_typ_args.first() else { continue; };
             let Some(self_short) = crate::to_lean_type::type_short_name(self_typ) else { continue; };
-            let trait_short = crate::to_lean_type::short_name(&ti.x.trait_path).to_string();
-            let prefix = vec![
-                std::sync::Arc::new(self_short),
-                std::sync::Arc::new(trait_short),
-            ];
-            tentative.insert(ti.x.impl_path.clone(), prefix);
+            let prefix = vec![std::sync::Arc::new(self_short)];
+            for f in method_impls {
+                if let Some(method_short) = f.name.path.segments.last().map(|s| s.to_string()) {
+                    *per_method.entry((prefix.clone(), method_short)).or_insert(0) += 1;
+                }
+            }
+            tentative_per_impl.insert(ti.x.impl_path.clone(), prefix);
         }
-        // Step 2: count duplicate prefixes.
-        let mut counts: HashMap<Vec<vir::ast::Ident>, usize> = HashMap::new();
-        for prefix in tentative.values() {
-            *counts.entry(prefix.clone()).or_insert(0) += 1;
+        // Per-impl: only rename when NONE of its method names
+        // collide with another impl's (same Self + same method
+        // short name).
+        let mut result: HashMap<vir::ast::Path, Vec<vir::ast::Ident>> = HashMap::new();
+        for (ti, method_impls) in &instances_to_emit {
+            let Some(prefix) = tentative_per_impl.get(&ti.x.impl_path) else { continue; };
+            let any_collision = method_impls.iter().any(|f| {
+                let Some(ms) = f.name.path.segments.last().map(|s| s.to_string()) else {
+                    return false;
+                };
+                per_method.get(&(prefix.clone(), ms)).copied().unwrap_or(0) > 1
+            });
+            if !any_collision {
+                result.insert(ti.x.impl_path.clone(), prefix.clone());
+            }
         }
-        // Step 3: keep only unique prefixes (collision impls fall
-        // back to `impl__N`).
-        tentative.into_iter()
-            .filter(|(_, prefix)| counts.get(prefix).copied().unwrap_or(0) == 1)
-            .collect()
+        result
     };
 
     let impl_substs: std::collections::HashMap<vir::ast::Path, crate::impl_subst::ImplSubst> =

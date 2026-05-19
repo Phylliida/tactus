@@ -1628,8 +1628,21 @@ pub fn trait_impl_to_ast(
             // filter still drops them.
             let body_expr = match (func.mode, &func.body) {
                 (vir::ast::Mode::Spec, None) => {
+                    // Use the renamed Fun path from `method_redirects`
+                    // — same source of truth as the body-rewrite
+                    // path, carrying the natural-name rename when
+                    // applied. Both `method_redirects` and this
+                    // `method_impls.iter().filter_map(|func| ...)`
+                    // loop iterate the same `method_impls` slice,
+                    // so the lookup is guaranteed.
+                    let method_short = func.name.path.segments.last()
+                        .expect("impl method has at least one path segment")
+                        .as_str();
+                    let standalone_path = method_redirects.get(method_short)
+                        .expect("method_redirects has an entry for every method_impl")
+                        .path.clone();
                     let standalone = LExpr::new(ExprNode::Var(
-                        crate::lean_name::LeanName::from_path(&func.name.path)
+                        crate::lean_name::LeanName::from_path(&standalone_path)
                     ));
                     let mut args: Vec<LExpr> = func.typ_params.iter().map(|tp| {
                         LExpr::new(ExprNode::Var(
