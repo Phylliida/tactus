@@ -76,8 +76,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use vir::ast::{
-    GenericBound, GenericBoundX, Ident, Idents, GenericBounds, FunctionKind, FunctionX,
-    Param, ParamX, Params, Path, TraitId, TraitX, Typ, TypX, Typs,
+    CallTarget, CallTargetKind, Expr, ExprX, Fun, GenericBound, GenericBoundX, Ident, Idents,
+    GenericBounds, FunctionKind, FunctionX, Param, ParamX, Params, Path, SpannedTyped, TraitId,
+    TraitImplX, TraitX, Typ, TypX, Typs,
 };
 use vir::def::Spanned;
 
@@ -127,11 +128,51 @@ pub struct ImplSubst {
     /// `<X as T>::N`. Used by `rewrite_typ` to replace each
     /// matching `Projection` with `TypParam(fresh)`.
     pub proj_map: HashMap<(Ident, Path, Ident), Ident>,
+    /// Context for the body's self-sibling-call rewrite. Populated
+    /// by `set_method_context`; consumed by `augment_function`'s
+    /// body rewrite path. Pre-2026-05-19 (when `rewrite_self_
+    /// sibling_calls` lived only in `trait_impl_to_ast`) the
+    /// standalone def's body was rendered with class dispatch
+    /// (`Trait.method self`), which forward-referenced the
+    /// instance and failed to elaborate. Now the rewrite fires on
+    /// the body too.
+    pub method_context: Option<MethodContext>,
+}
+
+/// Per-impl context for the body's self-sibling-call rewrite.
+/// Captured once per impl in `set_method_context` and consumed by
+/// `augment_function`'s body rewrite. `trait_path` and `impl_self_typ`
+/// gate the rewrite (only fires when the call's receiver structurally
+/// matches Self); `method_redirects` provides the impl method `Fun`
+/// to swap into the call target.
+#[derive(Debug, Clone)]
+pub struct MethodContext {
+    pub trait_path: Path,
+    pub impl_self_typ: Typ,
+    pub method_redirects: HashMap<String, Fun>,
 }
 
 impl ImplSubst {
     pub fn is_empty(&self) -> bool {
-        self.fresh_binders.is_empty()
+        self.fresh_binders.is_empty() && self.method_context.is_none()
+    }
+
+    /// Attach impl-method context (trait_path, Self typ, method
+    /// redirects) so `augment_function` can rewrite self-sibling
+    /// calls in the body. See `MethodContext` for the rationale.
+    pub fn set_method_context(&mut self, ti: &TraitImplX, method_impls: &[&FunctionX]) {
+        let Some(self_typ) = ti.trait_typ_args.first() else { return; };
+        let method_redirects: HashMap<String, Fun> = method_impls.iter()
+            .filter_map(|f| {
+                let short = f.name.path.segments.last().map(|s| s.to_string())?;
+                Some((short, f.name.clone()))
+            })
+            .collect();
+        self.method_context = Some(MethodContext {
+            trait_path: ti.trait_path.clone(),
+            impl_self_typ: self_typ.clone(),
+            method_redirects,
+        });
     }
 
     /// Build the subst from the impl's signature.
@@ -166,16 +207,25 @@ impl ImplSubst {
     ) -> Self {
         let impl_params: std::collections::HashSet<&Ident> =
             impl_typ_params.iter().collect();
-        // Map each typ-param X to the set of trait paths T such that
-        // there's a `Trait(T, [X, ...])` bound. Used to validate that
-        // a discovered projection's (X, T) pair has a matching bound.
-        let mut param_to_traits: HashMap<&Ident, Vec<&Path>> = HashMap::new();
+        // Map each typ-param X to the bounds `Trait(T, full_typs)`
+        // where X appears in full_typs. We store the full bound
+        // (not just the path) so we can later synthesise fake
+        // `TypEquality(T, full_typs, ...)` bounds whose `typs` match
+        // the original Trait bound's `typs` — required by
+        // `trait_bounds_to_ast_with`'s `typs_match` filter (which
+        // pairs each Trait bound with its matching TypEquality
+        // entries by both path AND typ-args). For multi-arg traits
+        // (e.g., `Converter<u8>` whose bound has typs `[A, u8]`),
+        // the fake's `[A]` typs would otherwise not match the
+        // original's `[A, u8]` typs and the fresh binder wouldn't
+        // appear in the rendered bracket.
+        let mut param_to_bounds: HashMap<&Ident, Vec<(&Path, &Typs)>> = HashMap::new();
         for bound in impl_typ_bounds.iter() {
             if let GenericBoundX::Trait(TraitId::Path(p), bound_typs) = &**bound {
                 for bt in bound_typs.iter() {
                     if let TypX::TypParam(x) = &**bt {
                         if impl_params.contains(x) {
-                            param_to_traits.entry(x).or_default().push(p);
+                            param_to_bounds.entry(x).or_default().push((p, bound_typs));
                         }
                     }
                 }
@@ -183,16 +233,16 @@ impl ImplSubst {
         }
 
         let mut subst = ImplSubst::default();
-        let mut add_entry = |x: Ident, trait_path: Path, assoc_name: Ident, subst: &mut ImplSubst| {
+        let mut add_entry = |x: Ident, trait_path: Path, assoc_name: Ident,
+                             full_bound_typs: Typs, subst: &mut ImplSubst| {
             let key = (x.clone(), trait_path.clone(), assoc_name.clone());
             if subst.proj_map.contains_key(&key) { return; }
             let fresh = fresh_binder_name(&x, &trait_path, &assoc_name);
             subst.fresh_binders.push(fresh.clone());
-            let bound_typs: Typs = Arc::new(vec![Arc::new(TypX::TypParam(x.clone()))]);
             let target_typ: Typ = Arc::new(TypX::TypParam(fresh.clone()));
             let fake_bound: GenericBound = Arc::new(GenericBoundX::TypEquality(
                 trait_path.clone(),
-                bound_typs,
+                full_bound_typs,
                 assoc_name.clone(),
                 target_typ,
             ));
@@ -204,13 +254,14 @@ impl ImplSubst {
         for typ in typs {
             walk_typ_for_projections(typ, &mut |x, trait_path, assoc_name| {
                 if !impl_params.contains(&x) { return; }
-                if !param_to_traits.get(&x)
-                    .map(|ts| ts.iter().any(|p| **p == *trait_path))
-                    .unwrap_or(false)
-                {
-                    return;
-                }
-                add_entry(x, trait_path.clone(), assoc_name, &mut subst);
+                // Find a bound `Trait(trait_path, full_typs)` whose
+                // typs include this X. The bound's full typs are
+                // what we record in the fake TypEquality.
+                let bound_typs = param_to_bounds.get(&x).and_then(|bs| {
+                    bs.iter().find(|(p, _)| **p == *trait_path).map(|(_, ts)| (*ts).clone())
+                });
+                let Some(bound_typs) = bound_typs else { return; };
+                add_entry(x, trait_path.clone(), assoc_name, bound_typs, &mut subst);
             });
         }
 
@@ -222,7 +273,8 @@ impl ImplSubst {
                     if let TypX::TypParam(x) = &**bt {
                         if !impl_params.contains(x) { continue; }
                         for assoc_name in tr.assoc_typs.iter() {
-                            add_entry(x.clone(), p.clone(), assoc_name.clone(), &mut subst);
+                            add_entry(x.clone(), p.clone(), assoc_name.clone(),
+                                      bound_typs.clone(), &mut subst);
                         }
                     }
                 }
@@ -241,8 +293,15 @@ impl ImplSubst {
 
     /// Clone `f` with extended typ_params (originals + fresh binders),
     /// extended typ_bounds (originals + fake bounds), and rewritten
-    /// param/return typs. Body is left alone — see module docs for
-    /// the signature-only scope rationale.
+    /// param/return typs. If `method_context` is set, the body is
+    /// also rewritten: self-sibling `Trait.method(self_arg)` calls
+    /// become direct calls to `impl__N.method(self_arg)`. This
+    /// matters for the standalone def's body, which the OLD
+    /// strip_class_qualifier (and step 1's `rewrite_self_sibling_
+    /// calls` in `trait_impl_to_ast`) couldn't reach — the
+    /// standalone is emitted before the instance, so any class
+    /// dispatch in its body forward-references the instance and
+    /// fails to elaborate.
     pub fn augment_function(&self, f: &FunctionX) -> FunctionX {
         let mut typ_params: Vec<Ident> = (*f.typ_params).iter().cloned().collect();
         typ_params.extend(self.fresh_binders.iter().cloned());
@@ -262,11 +321,22 @@ impl ImplSubst {
             Spanned::new(p.span.clone(), new_x)
         }).collect();
 
+        let body = match (&f.body, &self.method_context) {
+            (Some(body), Some(ctx)) => Some(rewrite_self_sibling_calls(
+                body,
+                &ctx.trait_path,
+                &ctx.impl_self_typ,
+                &ctx.method_redirects,
+            )),
+            _ => f.body.clone(),
+        };
+
         FunctionX {
             typ_params: Arc::new(typ_params),
             typ_bounds: Arc::new(typ_bounds),
             ret,
             params: Arc::new(params) as Params,
+            body,
             ..f.clone()
         }
     }
@@ -322,6 +392,100 @@ fn walk_typ_for_projections<'a>(
         | TypX::ConstInt(_) | TypX::ConstBool(_)
         | TypX::Air(_) => {}
     }
+}
+
+/// VIR-level rewrite of self-sibling trait method calls in an impl
+/// method body. Replaces `Trait::method(self_arg, ...)` with a direct
+/// call to the impl's `impl__N.method` standalone def — but ONLY
+/// when the call's first arg type structurally matches the impl's
+/// Self type. For blanket impls where `Trait::method` is called on a
+/// typ-param (a different instance), the rewrite is skipped and the
+/// call stays as class dispatch (Lean resolves through the
+/// `[Trait A]` bracket in scope).
+///
+/// Applied at two sites:
+/// 1. Standalone def body (via `augment_function`'s body field). The
+///    standalone def is emitted BEFORE its instance, so any class
+///    dispatch in its body forward-references the instance and
+///    fails to elaborate.
+/// 2. Instance method body (via `trait_impl_to_ast`'s Spec/Proof
+///    body rendering — see that function's call to
+///    `rewrite_self_sibling_calls` re-exported from this module).
+///
+/// Was previously at LExpr level as `strip_class_qualifier` in
+/// `to_lean_fn.rs`; that pass was type-blind and mis-rewrote
+/// blanket-impl bodies. Moving the rewrite to VIR level (where
+/// receiver types are preserved) and gating on `types_equal` solves
+/// both that bug and the new forward-reference bug for standalone
+/// def bodies.
+pub fn rewrite_self_sibling_calls(
+    body: &Expr,
+    trait_path: &Path,
+    impl_self_typ: &Typ,
+    method_redirects: &HashMap<String, Fun>,
+) -> Expr {
+    use vir::ast_util::types_equal;
+    // Peel transparent type wrappers (Decorate, Boxed) so
+    // `args[0].typ` from `self.method()` (shape `Decorate(Ref, ...,
+    // Self)`) compares structurally to the impl's `Self`.
+    fn peel(t: &Typ) -> Typ {
+        let mut cur = t.clone();
+        loop {
+            let next = match &*cur {
+                TypX::Decorate(_, _, inner) => inner.clone(),
+                TypX::Boxed(inner) => inner.clone(),
+                _ => return cur,
+            };
+            cur = next;
+        }
+    }
+    let impl_self_peeled = peel(impl_self_typ);
+    vir::ast_visitor::map_expr_visitor(body, &|e: &Expr| {
+        if let ExprX::Call(target, args, post_args) = &e.x {
+            if let CallTarget::Fun(_kind, fun, typs, impl_paths, autospec, const_var) = target {
+                let segs = &fun.path.segments;
+                if segs.len() < 2 { return Ok(e.clone()); }
+                let method_short = segs[segs.len() - 1].as_str().to_string();
+                let trait_segs = &trait_path.segments;
+                if segs.len() != trait_segs.len() + 1 { return Ok(e.clone()); }
+                let head_matches = segs.iter().zip(trait_segs.iter())
+                    .take(trait_segs.len())
+                    .all(|(a, b)| a == b);
+                if !head_matches { return Ok(e.clone()); }
+                let Some(impl_fun) = method_redirects.get(&method_short) else {
+                    return Ok(e.clone());
+                };
+                let Some(first_arg) = args.first() else {
+                    return Ok(e.clone());
+                };
+                let arg_peeled = peel(&first_arg.typ);
+                if !types_equal(&arg_peeled, &impl_self_peeled) {
+                    return Ok(e.clone());
+                }
+                // Conservative: typs.len() == 1 (non-generic trait,
+                // non-generic method). More complex cases fall
+                // through to class dispatch.
+                if typs.len() != 1 {
+                    return Ok(e.clone());
+                }
+                let new_target = CallTarget::Fun(
+                    CallTargetKind::Static,
+                    impl_fun.clone(),
+                    Arc::new(vec![]),
+                    impl_paths.clone(),
+                    *autospec,
+                    *const_var,
+                );
+                return Ok(SpannedTyped::new(
+                    &e.span,
+                    &e.typ,
+                    ExprX::Call(new_target, args.clone(), post_args.clone()),
+                ));
+            }
+        }
+        Ok(e.clone())
+    })
+    .expect("rewrite_self_sibling_calls is structural and cannot error")
 }
 
 /// Recursive TypX → Typ rewriter that replaces matching projections
@@ -615,6 +779,7 @@ mod tests {
             fresh_binders: vec![mk_ident("_tactus_assoc_A_V")],
             fake_bounds: vec![],
             proj_map,
+            method_context: None,
         };
         let proj = mk_proj("A", &["View"], "V");
         let rewritten = subst.rewrite_typ(&proj);
@@ -637,6 +802,7 @@ mod tests {
             fresh_binders: vec![mk_ident("V_a")],
             fake_bounds: vec![],
             proj_map,
+            method_context: None,
         };
         // `Datatype(Wrap, [Projection<A as View>::V])`.
         let typ: Typ = Arc::new(TypX::Datatype(
@@ -739,6 +905,52 @@ mod tests {
             .collect();
         assert!(names.contains("_tactus_assoc_A_View_V"));
         assert!(names.contains("_tactus_assoc_A_DeepView_V"));
+    }
+
+    /// Multi-arg trait bounds: when a bound is `Trait(T, [A, Int])`
+    /// (e.g., `A: Converter<u8>`), the synthesised fake `TypEquality`
+    /// must carry the FULL typs `[A, Int]`, not just `[A]`. The
+    /// `trait_bounds_to_ast_with` filter matches by both path AND
+    /// typs structurally; if our fake has `[A]` and the bound has
+    /// `[A, Int]`, the lengths differ and the fresh binder doesn't
+    /// reach the rendered bracket. Pinned by audit follow-up.
+    #[test]
+    fn build_fake_bound_carries_full_typs_for_multi_arg_trait() {
+        let typ_params: Idents = Arc::new(vec![mk_ident("A")]);
+        // Bound: `A: Converter<u8>` → Trait(Converter, [A, U(8)]).
+        let u8_typ: Typ = Arc::new(TypX::Int(vir::ast::IntRange::U(8)));
+        let typ_bounds: GenericBounds = Arc::new(vec![
+            Arc::new(GenericBoundX::Trait(
+                TraitId::Path(mk_path(&["Converter"])),
+                Arc::new(vec![
+                    Arc::new(TypX::TypParam(mk_ident("A"))),
+                    u8_typ.clone(),
+                ]),
+            )),
+        ]);
+        // Projection `<A as Converter<u8>>::Out` — trait_typ_args is
+        // `[TypParam(A), U(8)]`.
+        let proj: Typ = Arc::new(TypX::Projection {
+            trait_typ_args: Arc::new(vec![
+                Arc::new(TypX::TypParam(mk_ident("A"))),
+                u8_typ.clone(),
+            ]),
+            trait_path: mk_path(&["Converter"]),
+            name: mk_ident("Out"),
+        });
+        let typs = vec![proj];
+        let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &empty_lookup());
+        assert_eq!(subst.fake_bounds.len(), 1);
+        match &*subst.fake_bounds[0] {
+            GenericBoundX::TypEquality(_, fake_typs, _, _) => {
+                assert_eq!(fake_typs.len(), 2,
+                    "fake bound typs should match the original bound's arity (2), got {}",
+                    fake_typs.len());
+                // First typ is A, second is U(8).
+                assert!(matches!(&**fake_typs.iter().next().unwrap(), TypX::TypParam(n) if n.as_str() == "A"));
+            }
+            other => panic!("expected TypEquality, got {:?}", other),
+        }
     }
 
     /// Helper: minimal `TraitX` literal for tests.

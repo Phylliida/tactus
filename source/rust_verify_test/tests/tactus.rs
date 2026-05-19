@@ -10327,6 +10327,74 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Probe (audit follow-up): trait with MULTIPLE generic type-args
+// beyond Self. `impl<A: Converter<int>> Foo for Wrap<A>` carries
+// a bound `Converter(A, int)` with typs `[A, int]`. The audit-fix
+// `typs_match` check in `trait_bounds_to_ast` requires the fake
+// TypEquality bound's typs to match the original bound's typs
+// length-wise. `ImplSubst::build` currently synthesises fake
+// bounds with typs `[TypParam(X)]` (1 arg) regardless of the
+// trait's arity, so for multi-arg traits the typs_match filter
+// rejects the fake bound's typ and the rendered bracket misses
+// the Out slot. Pin as Err pending fix.
+test_verify_one_file! {
+    #[test] test_view_blanket_impl_multi_arg_trait_probe verus_code! {
+        pub trait Converter<X> {
+            type Out;
+            spec fn convert(&self, x: X) -> Self::Out;
+        }
+
+        pub struct Wrap<A>(pub A);
+
+        impl<A: Converter<u8>> Converter<u8> for Wrap<A> {
+            type Out = <A as Converter<u8>>::Out;
+            open spec fn convert(&self, x: u8) -> <A as Converter<u8>>::Out {
+                self.0.convert(x)
+            }
+        }
+
+        pub struct Holder { pub v: u8 }
+
+        impl Converter<u8> for Holder {
+            type Out = u8;
+            open spec fn convert(&self, x: u8) -> u8 { x }
+        }
+
+        proof fn wrap_convert_passes_through()
+            ensures Wrap(Holder { v: 1 }).convert(7) == 7
+        by {
+            simp_all [Converter.convert]
+        }
+    } => Ok(())
+}
+
+// Probe (audit follow-up): sibling call from one impl spec method
+// to another. step-1's type-aware rewrite must fire (receiver is
+// Self), redirecting the body's `self.helper()` call from class
+// dispatch to the impl method standalone def. Pinned to catch any
+// regression of step 1.
+test_verify_one_file! {
+    #[test] test_impl_method_sibling_call_in_body_probe verus_code! {
+        pub trait Counter {
+            spec fn raw(&self) -> nat;
+            spec fn doubled(&self) -> nat;
+        }
+
+        pub struct Bar { pub v: nat }
+
+        impl Counter for Bar {
+            open spec fn raw(&self) -> nat { self.v }
+            open spec fn doubled(&self) -> nat { (self.raw() + self.raw()) as nat }
+        }
+
+        proof fn doubled_of_three_is_six()
+            ensures (Bar { v: 3 }).doubled() == 6
+        by {
+            simp_all [Counter.doubled, Counter.raw, impl__0.raw]
+        }
+    } => Ok(())
+}
+
 // Probe (Bug D remaining piece, trait dispatch): same-crate trait
 // `View` with a non-blanket impl on a concrete struct. This is
 // closer to vstd's shape — `old(s).view()` dispatches through a

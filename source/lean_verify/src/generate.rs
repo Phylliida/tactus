@@ -310,12 +310,19 @@ fn krate_preamble(
                     std::iter::once(&f.ret.x.typ)
                         .chain(f.params.iter().map(|p| &p.x.typ))
                 }));
-            let subst = crate::impl_subst::ImplSubst::build(
+            let mut subst = crate::impl_subst::ImplSubst::build(
                 &ti.x.typ_params,
                 &ti.x.typ_bounds,
                 typs_iter,
                 &trait_lookup,
             );
+            // Attach impl-method context so `augment_function`'s
+            // body rewrite fires on standalone def bodies (sibling
+            // calls in the body need redirecting to impl_method
+            // standalones, otherwise class dispatch forward-references
+            // the not-yet-emitted instance — Bug surfaced by
+            // `test_impl_method_sibling_call_in_body_probe`).
+            subst.set_method_context(&ti.x, method_impls);
             (ti.x.impl_path.clone(), subst)
         }).collect();
 
