@@ -4904,6 +4904,21 @@ simp-listing requirement, but makes the standalone's name
 Mathlib has the same ergonomic load — user lists `Foo.bar` in
 simp — but the names are natural.
 
+**Realistic-case validation** (added 2026-05-19 after a hypothesis
+that the issue might only arise in contrived probes):
+`test_impl_method_realistic_is_empty_probe` exercises the textbook
+`Container { length, is_empty }` pattern with `is_empty :=
+length() == 0`. Hits the issue — the user's natural
+`simp_all [Container.is_empty, Container.length]` stalls at
+`impl__0.length { n := 0 } = 0`. They have to add `impl__0.length`
+to the simp list manually. This confirms the rename is warranted
+for real user-written code, not just edge probes — the issue
+fires for any trait with delegating method bodies (a common Rust
+API pattern: `len`/`is_empty`, `next`/`peek`, `read`/
+`read_to_end`, etc.). The probe currently passes only because its
+tactic explicitly lists `impl__0.length`; post-rename it'd list
+`MyList.Container.length` — equally explicit but recognizable.
+
 ##### Rename implementation plan (for a future session)
 
 **Naming scheme.** For each impl method's standalone def, derive
