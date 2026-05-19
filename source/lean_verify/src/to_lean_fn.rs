@@ -1631,6 +1631,7 @@ pub fn trait_impl_to_ast(
     method_impls: &[&FunctionX],
     assoc_types: &[&AssocTypeImplX],
     tactic_bodies: &HashMap<Fun, String>,
+    subst: &crate::impl_subst::ImplSubst,
 ) -> Instance {
     let mut binders: Vec<LBinder> = Vec::new();
     for tp in ti.typ_params.iter() {
@@ -1640,14 +1641,37 @@ pub fn trait_impl_to_ast(
             kind: BinderKind::Implicit,
         });
     }
-    binders.extend(trait_bounds_to_ast(&ti.typ_bounds));
+    // Fresh implicit binders from the projection substitution
+    // (per-impl, Bug B step 2). Each fresh binder corresponds to a
+    // `<X as T>::N` projection appearing in the impl's signature;
+    // see `impl_subst::ImplSubst` for the design.
+    for fresh in subst.fresh_binders.iter() {
+        binders.push(LBinder {
+            name: Some(crate::lean_name::LeanName::lit(fresh.as_str())),
+            ty: LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Type"))),
+            kind: BinderKind::Implicit,
+        });
+    }
+    // Augmented bound list: original bounds + fake TypEquality
+    // bounds that wire fresh binders into the relevant trait
+    // brackets. `trait_bounds_to_ast` already iterates bounds and
+    // appends matching TypEquality typs to the rendered args, so
+    // synthesising fake equalities reuses that machinery.
+    let augmented_bounds: Vec<GenericBound> = (*ti.typ_bounds).iter().cloned()
+        .chain(subst.fake_bounds.iter().cloned())
+        .collect();
+    let augmented_bounds = std::sync::Arc::new(augmented_bounds);
+    binders.extend(trait_bounds_to_ast(&augmented_bounds));
 
     // Build `TraitName arg1 arg2 …` — trait_typ_args are the positional
     // trait type arguments (Self + extras); assoc_types fill the outParam
-    // slots declared by the class.
+    // slots declared by the class. Both are rewritten through `subst`
+    // to replace `<X as T>::N` projections with the fresh binder names.
     let mut target_args: Vec<LExpr> = Vec::new();
-    for t in ti.trait_typ_args.iter() { target_args.push(typ_to_expr(t)); }
-    for a in assoc_types { target_args.push(typ_to_expr(&a.typ)); }
+    for t in ti.trait_typ_args.iter() {
+        target_args.push(typ_to_expr(&subst.rewrite_typ(t)));
+    }
+    for a in assoc_types { target_args.push(typ_to_expr(&subst.rewrite_typ(&a.typ))); }
     let target = if target_args.is_empty() {
         LExpr::new(ExprNode::Var(crate::lean_name::LeanName::from_path(&ti.trait_path)))
     } else {
@@ -1687,37 +1711,12 @@ pub fn trait_impl_to_ast(
     // must use the BARE standalone-def name, not the class-qualified
     // `Class.method` form — Lean's `instance` construction can't
     // forward-reference siblings (the instance isn't available for
-    // synthesis during its own definition). Compute the sibling
-    // method-name set from the impl methods (sufficient for the
-    // common case where impl bodies only reference siblings of the
-    // same impl); pre-collect the trait short_name for the strip
-    // helper. See the doc on `strip_class_qualifier` and the
-    // confirming Lean reference manual § "Instance Declarations".
-    let trait_short = short_name(&ti.trait_path).to_string();
-    let sibling_methods: std::collections::HashSet<String> = method_impls.iter()
-        .filter_map(|f| f.name.path.segments.last().map(|s| s.to_string()))
-        .collect();
-    // Compute the impl prefix: drop the last segment from any impl
-    // method's lean_name. All siblings of this impl share the same
-    // prefix (they live in the same impl block). The prefix is what
-    // disambiguates this impl's standalone defs from other impls of
-    // the same trait — e.g., `test_crate.impl__0` for MyInt's impl
-    // vs `test_crate.impl__1` for MyNat's impl. Empty if for some
-    // reason there are no impl methods (shouldn't happen, but
-    // defensive).
-    let impl_prefix: String = method_impls.first()
-        .map(|f| {
-            let full = crate::to_lean_type::lean_name(&f.name.path);
-            full.rfind('.').map(|i| full[..i].to_string()).unwrap_or_default()
-        })
-        .unwrap_or_default();
-    // `method_redirects` maps each impl method's short name to its
-    // full `Fun` (e.g., "view" -> `Fun { path: [impl%0, view] }`).
-    // Used by `rewrite_self_sibling_calls` to swap `Trait::method`
-    // call targets to the impl method's standalone def Fun. The
-    // VIR-level swap (vs the prior LExpr-level name rewrite) lets us
-    // gate on the receiver type, skipping the rewrite when the
-    // dispatch is on a different instance (blanket-impl case).
+    // synthesis during its own definition; see Lean reference manual
+    // § "Instance Declarations"). The VIR-level
+    // `rewrite_self_sibling_calls` handles the swap; `method_redirects`
+    // maps each impl method's short name to its full `Fun`. The
+    // rewrite gates on receiver type, leaving cross-instance calls
+    // (blanket-impl case) as class dispatch.
     let method_redirects: HashMap<String, Fun> = method_impls.iter()
         .filter_map(|f| {
             let short = f.name.path.segments.last().map(|s| s.to_string())?;

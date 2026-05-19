@@ -2,6 +2,7 @@ pub mod call_inlining;
 pub mod dep_order;
 pub mod expr_shared;
 pub mod generate;
+pub mod impl_subst;
 pub mod lean_ast;
 pub mod lean_name;
 pub mod lean_pp;
