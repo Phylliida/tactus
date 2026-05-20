@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**435 end-to-end tests + 1 coverage test + 209 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**435 end-to-end tests + 1 coverage test + 209 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -5630,6 +5630,84 @@ in tactic bodies (emoji, mathematical symbols above U+FFFF)
 remain a tiny edge case — `multibyte_chars` recompute handles
 them correctly, but they're rare enough that no test exercises
 the path.
+
+#### Current session (2026-05-19 continued — four review passes on the error-span arc)
+
+After the error-span work landed, ran multi-lens review passes
+over the arc. DESIGN.md § "Code review strategy" names the
+discipline ("each pass asks a different question; ~15 minutes
+of right-way reading turns up 4 items the earlier pass hadn't
+seen"). Four passes landed; each surfaced something the prior
+ones missed.
+
+**Pass 1 (`2f6531a`) — shape.** Typed `DiagLocation` enum
+(`Direct(Span)` | `ProofFnBodyLine(usize)` | `Unknown`)
+replacing two parallel `Option` fields on `TactusDiag` and
+`FormattedDiag`. The "both Some" combination was meaningless
+and would have caused the verifier to silently prefer the
+span over the offset; now structurally unrepresentable. Same
+typed-invariant pattern as `MutArgInfo` / `LoopInvKind` /
+`DecreaseLevel`. Also: extracted `parse_file_line_col` helper
+(was duplicated inline in `Reporter::report_as` and
+`tactic_body_line_span`); fixed stale docstring on
+`emit_tactus_diag`; extracted `LEAN_FILE_HELP_PREFIX` and
+`NO_ERROR_DIAGNOSTICS_BODY` to `vir::tactus_messages` (lens 15
+magic-string avoidance); added 12 new unit tests for the
+helpers; added a CRLF-preservation regression test.
+
+**Pass 2 (`93183ba`) — second-reading finish.** Three small
+findings on re-read: (a) test comment on
+`multibyte_chars_two_byte` mentioned `≤` but the test used only
+`é`; (b) `DiagLocation` doc overclaimed what the enum fixed
+(only "both Some" was actually wrong; the other unused-but-
+permitted combos weren't); (c) two consecutive `for sp in
+&msg.spans` loops in `Reporter::report_as` could be fused into
+one.
+
+**Pass 3 (`d8e49fd`) — soundness.** Real finding:
+`swap_source_for_diagnostics` had a TOCTOU between checking
+`SWAPPED_FILES` and the unsafe `*mut SourceFile` write. The
+check held the lock briefly, then released it; the unsafe
+write ran outside the lock. If two threads passed the check
+simultaneously, both could perform the unsafe write — two
+`*mut` writes to the same location without synchronization is
+UB even though they'd produce identical content. Today only
+the main-thread `Reporter::report_as` calls in, so no race in
+practice, but the function was `pub`. Belt-and-suspenders fix:
+hold the lock through the entire critical section (check →
+cache lookup → SourceFile lookup → unsafe write → insert);
+restricted visibility to `pub(crate)` so the safety story
+doesn't depend on caller discipline alone; added a third
+safety invariant to the doc-comment.
+
+**Pass 4 (`b85ac32`) — point-in-time consistency.**
+`tactic_body_line_span` was re-reading the file from disk
+while `swap_source_for_diagnostics` used the
+`TactusFileLoader` cache. If the user edits the file between
+rustc parsing and diagnostic emission, the two helpers would
+see different content — the span would point at line N of new
+content while the rendered preview showed line N of old
+content. Switched the helper to use the same cache. Both
+consistent now (both describe the rustc-parsed snapshot); saves
+one disk syscall per failing proof-fn diagnostic as a side
+effect.
+
+**The pattern across passes.** Each pass asked a different
+question. Pass 1 asked "what's the right shape?" — caught
+shape and helper issues. Pass 2 asked "what reads wrong on a
+re-read?" — caught comment / doc / loop-fusion issues. Pass 3
+asked "what assumptions are baked into the safety story?" —
+caught the TOCTOU. Pass 4 asked "what's the time-axis story?"
+— caught the file-edit-mid-build inconsistency. The DESIGN.md
+framing held: "review passes never reach a fixed point because
+the questions are unbounded; what you do is run enough lenses
+that the *known unknowns* are small."
+
+**Test counts**: 209 lean_verify unit tests (unchanged), 66
+rust_verify unit tests (+14: 13 new spans tests for
+`parse_file_line_col` and `compute_multibyte_chars`, plus the
+CRLF preservation test). 435 e2e + 1 coverage + 7 integration
+unchanged; vstd 1530/0.
 
 ## Architecture
 
