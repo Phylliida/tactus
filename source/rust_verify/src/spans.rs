@@ -14,6 +14,27 @@ pub(crate) fn to_raw_span(span: Span) -> vir::messages::RawSpan {
     Arc::new(span.data())
 }
 
+/// Parse a `"file:line:col"` string into its three components.
+/// Splits from the right because file paths may legitimately
+/// contain `:` (Windows drive letters, etc.) but `line:col` are
+/// always the last two segments. Returns `None` for malformed
+/// input (missing colons, non-numeric line/col, empty path).
+///
+/// Shared by `Reporter::report_as` (which reads `Span::start_loc`
+/// to drive `swap_source_for_diagnostics`) and
+/// `tactic_body_line_span` (which parses a fn's `start_loc` to
+/// derive byte offsets for the per-tactic-line span).
+pub(crate) fn parse_file_line_col(s: &str) -> Option<(&str, usize, usize)> {
+    let last_colon = s.rfind(':')?;
+    let col: usize = s[last_colon + 1..].parse().ok()?;
+    let rest = &s[..last_colon];
+    let second_colon = rest.rfind(':')?;
+    let line: usize = rest[second_colon + 1..].parse().ok()?;
+    let path = &rest[..second_colon];
+    if path.is_empty() { return None; }
+    Some((path, line, col))
+}
+
 /// Worker-thread-safe accessor for the `SpanData` stored inside a
 /// `vir::messages::RawSpan`. Unlike `from_raw_span`, this does NOT
 /// reconstruct the `Span` (which interns via rustc's thread-local
@@ -240,14 +261,7 @@ pub(crate) fn tactic_body_line_span(
     start_byte: usize,
     body_line_offset: usize,
 ) -> Option<vir::messages::Span> {
-    // Parse `file:line:col` from the right — file paths may
-    // contain `:` (Windows drive letters etc.), but line and col
-    // are always the last two segments.
-    let last_colon = fn_start_loc.rfind(':')?;
-    let fn_col: usize = fn_start_loc[last_colon + 1..].parse().ok()?;
-    let rest = &fn_start_loc[..last_colon];
-    let second_colon = rest.rfind(':')?;
-    let fn_line: usize = rest[second_colon + 1..].parse().ok()?;
+    let (_, fn_line, fn_col) = parse_file_line_col(fn_start_loc)?;
 
     // Re-read the file. Costs one disk read per failing proof-fn
     // — negligible alongside the Lean check we just ran. Don't
@@ -660,7 +674,6 @@ impl SpanContextX {
         }
     }
 
-
     pub(crate) fn spanned_new<X>(&self, span: Span, source_map: &SourceMap, x: X)
         -> Arc<Spanned<X>>
     {
@@ -716,4 +729,130 @@ impl<'tcx> crate::context::BodyCtxt<'tcx> {
     pub(crate) fn spanned_typed_new<X>(&self, span: Span, typ: &Typ, x: X) -> Arc<SpannedTyped<X>> {
         self.ctxt.spanned_typed_new(span, typ, x)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_file_line_col ──────────────────────────────────────
+
+    #[test]
+    fn parse_file_line_col_basic() {
+        assert_eq!(
+            parse_file_line_col("test.rs:18:5"),
+            Some(("test.rs", 18, 5)),
+        );
+    }
+
+    #[test]
+    fn parse_file_line_col_path_with_colons() {
+        // Windows-style path with drive letter — leading `:` must
+        // stay in the path, only the trailing line:col gets split.
+        assert_eq!(
+            parse_file_line_col("C:\\foo\\bar.rs:18:5"),
+            Some(("C:\\foo\\bar.rs", 18, 5)),
+        );
+    }
+
+    #[test]
+    fn parse_file_line_col_deep_path() {
+        assert_eq!(
+            parse_file_line_col("/home/user/proj/src/lib.rs:42:13"),
+            Some(("/home/user/proj/src/lib.rs", 42, 13)),
+        );
+    }
+
+    #[test]
+    fn parse_file_line_col_rejects_empty_path() {
+        // `:18:5` — would split to ("", 18, 5) but empty path is
+        // never useful, so we reject.
+        assert_eq!(parse_file_line_col(":18:5"), None);
+    }
+
+    #[test]
+    fn parse_file_line_col_rejects_non_numeric() {
+        assert_eq!(parse_file_line_col("test.rs:eighteen:5"), None);
+        assert_eq!(parse_file_line_col("test.rs:18:five"), None);
+    }
+
+    #[test]
+    fn parse_file_line_col_rejects_no_colons() {
+        assert_eq!(parse_file_line_col("test.rs"), None);
+        assert_eq!(parse_file_line_col(""), None);
+    }
+
+    #[test]
+    fn parse_file_line_col_rejects_single_colon() {
+        // Only one colon — `test.rs:5` doesn't have a line/col
+        // split; reject rather than guess.
+        assert_eq!(parse_file_line_col("test.rs:5"), None);
+    }
+
+    // ── compute_multibyte_chars ──────────────────────────────────
+
+    #[test]
+    fn multibyte_chars_pure_ascii() {
+        assert!(compute_multibyte_chars("omega; simp_all").is_empty());
+        assert!(compute_multibyte_chars("").is_empty());
+        assert!(compute_multibyte_chars("hello\nworld").is_empty());
+    }
+
+    #[test]
+    fn multibyte_chars_two_byte() {
+        // `≤` is U+2264 = 3 bytes, `é` is U+00E9 = 2 bytes.
+        let v = compute_multibyte_chars("aéb");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].pos.0, 1);
+        assert_eq!(v[0].bytes, 2);
+    }
+
+    #[test]
+    fn multibyte_chars_three_byte() {
+        // `≠` is U+2260 = 3 bytes (E2 89 A0).
+        let v = compute_multibyte_chars("a ≠ b");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].pos.0, 2);
+        assert_eq!(v[0].bytes, 3);
+    }
+
+    #[test]
+    fn multibyte_chars_four_byte() {
+        // `𝟙` is U+1D7D9 = 4 bytes (F0 9D 9F 99). 4-byte chars
+        // are rare in tactic bodies but the helper handles them
+        // for correctness.
+        let v = compute_multibyte_chars("a𝟙b");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].pos.0, 1);
+        assert_eq!(v[0].bytes, 4);
+    }
+
+    #[test]
+    fn multibyte_chars_mixed() {
+        // `a ≠ b ↑ c`: `≠` at byte 2 (3 bytes), `↑` at byte 8
+        // (U+2191, 3 bytes — `b ↑` = `b` + space + `↑` starting
+        // 4 bytes after `≠`'s start).
+        let s = "a ≠ b ↑ c";
+        let v = compute_multibyte_chars(s);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].bytes, 3);
+        assert_eq!(v[1].bytes, 3);
+        // Both positions correspond to the start byte of each
+        // multi-byte sequence in the UTF-8 encoding.
+        let bytes = s.as_bytes();
+        assert!(bytes[v[0].pos.0 as usize] >= 0x80);
+        assert!(bytes[v[1].pos.0 as usize] >= 0x80);
+    }
+
+    // Note: a shape-drift test comparing `compute_multibyte_chars`
+    // against rustc's actual `SourceFile.multibyte_chars` would
+    // be the highest-value guard against rustc-version drift,
+    // but constructing a `SourceMap` requires
+    // `create_session_globals_then` + `SourceMapInputs` which
+    // have inconsistent privacy across rustc versions. The unit
+    // tests above pin the behaviour we depend on at the
+    // byte-level instead. If rustc ever widens what it considers
+    // a multi-byte char (e.g., new Unicode categories), e2e
+    // tests with the corresponding char in a tactic body would
+    // fail with mis-aligned carets — the visible failure mode.
 }

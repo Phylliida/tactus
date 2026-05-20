@@ -25,29 +25,14 @@ pub struct LeanResult {
 }
 
 /// A single formatted error diagnostic from Lean, paired with the
-/// Verus `Span` of the obligation that failed (when one could be
-/// resolved from the source map). The verifier uses `rust_span` as
-/// the primary span of the rust_verify error, so the `-->` arrow
-/// points at the failing assert / invariant / call rather than at
-/// the enclosing fn signature. `None` falls back to the fn span
-/// (the pre-fix behaviour) — happens for proof-fn diagnostics
-/// where per-obligation spans aren't plumbed yet, and for exec-fn
-/// diagnostics whose `pos.line` precedes every obligation mark
-/// (rare; usually only "no goals" errors at the closing tactic).
+/// source location the diagnostic points at. The verifier uses
+/// `location` as the primary span of the rust_verify error, so
+/// the `-->` arrow points at the failing assert / invariant /
+/// call rather than at the enclosing fn signature. See
+/// [`crate::generate::DiagLocation`] for the three variants.
 pub struct FormattedDiag {
     pub message: String,
-    pub rust_span: Option<vir::messages::Span>,
-    /// For proof-fn diagnostics: 0-indexed line offset within the
-    /// user's `by { ... }` tactic body. `None` for exec-fn diags
-    /// (their span is in `rust_span` directly) or for proof-fn
-    /// diags whose `pos.line` falls outside the body (sanity-check
-    /// rejections at the top of the generated `.lean` etc.).
-    ///
-    /// Consumed by the verifier (which has rustc's `SourceMap` in
-    /// scope) to construct a proper source-line `Span`. We can't
-    /// build the span here because `lean_verify` doesn't depend on
-    /// rustc — the separation keeps the crate dependency-free.
-    pub proof_fn_body_line_offset: Option<usize>,
+    pub location: crate::generate::DiagLocation,
 }
 
 /// Format error diagnostics into a user-friendly string plus the
@@ -68,9 +53,9 @@ pub fn format_error(
     diag: &LeanDiagnostic,
     source_map: &crate::to_lean_fn::LeanSourceMap,
 ) -> FormattedDiag {
+    use crate::generate::DiagLocation;
     let mut out = String::new();
-    let mut rust_span: Option<vir::messages::Span> = None;
-    let mut proof_fn_body_line_offset: Option<usize> = None;
+    let mut location = DiagLocation::Unknown;
 
     // Source location info: prefer the Rust span (from #51's
     // SpanMark instrumentation, populated for exec fns), fall
@@ -89,7 +74,9 @@ pub fn format_error(
                 out.push_str(&format!("at {} {}:\n",
                     mark.loc, vir::tactus_messages::paren_label(label)));
             }
-            rust_span = mark.rust_span.clone();
+            if let Some(span) = mark.rust_span.clone() {
+                location = DiagLocation::Direct(span);
+            }
         } else if let Some(offset) = source_map.find_tactic_line(pos.line) {
             // Proof-fn diag inside the tactic body. The verifier
             // will translate `offset` to an absolute source line via
@@ -98,7 +85,7 @@ pub fn format_error(
             // message body as a fallback for tooling / terminals
             // that don't render `-->` (the JSON test output, etc.).
             out.push_str(&format!("tactic line {}: ", offset + 1));
-            proof_fn_body_line_offset = Some(offset);
+            location = DiagLocation::ProofFnBodyLine(offset);
         }
     }
 
@@ -118,7 +105,7 @@ pub fn format_error(
         out.push('\n');
     }
 
-    FormattedDiag { message: out, rust_span, proof_fn_body_line_offset }
+    FormattedDiag { message: out, location }
 }
 
 /// Try to split Lean error data into a summary line and goal state.

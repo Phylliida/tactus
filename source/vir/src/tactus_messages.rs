@@ -67,3 +67,20 @@ pub const ASSERT_LABEL_BRANCH_CONDITION: &str = "branch condition";
 pub fn paren_label(label: &str) -> String {
     format!("({})", label)
 }
+
+// ── TactusDiag help / fallback messages ──────────────────────────────
+
+/// Prefix for the `help:` text on Tactus diagnostics pointing users
+/// at the generated `.lean` artifact for offline inspection.
+/// Combined with the file path: `format!("{} {}", LEAN_FILE_HELP_PREFIX, path)`.
+pub const LEAN_FILE_HELP_PREFIX: &str = "generated .lean file:";
+
+/// Body of the defensive fallback emitted by
+/// `lean_verify::generate::check_proof_fn` / `check_exec_fn` when
+/// Lean returns failure but reports zero error-severity diagnostics
+/// (rare; either a pipeline edge or a future Lean output format
+/// change). The full message is built as
+/// `format!("{}: {}", <header>, NO_ERROR_DIAGNOSTICS_BODY)`.
+pub const NO_ERROR_DIAGNOSTICS_BODY: &str =
+    "Lean reported failure but no error-severity diagnostics were captured.\n\
+     This is a Tactus pipeline bug — please file an issue with the generated .lean file.";

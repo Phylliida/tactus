@@ -20,4 +20,4 @@ pub mod to_lean_sst_expr;
 pub mod to_lean_type;
 
 // Re-export the main entry points
-pub use generate::{check_exec_fn, check_proof_fn, CheckResult, TactusDiag};
+pub use generate::{check_exec_fn, check_proof_fn, CheckResult, DiagLocation, TactusDiag};
