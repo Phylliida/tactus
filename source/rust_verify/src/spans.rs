@@ -279,13 +279,23 @@ pub(crate) fn tactic_body_line_span(
 ) -> Option<vir::messages::Span> {
     let (_, fn_line, fn_col) = parse_file_line_col(fn_start_loc)?;
 
-    // Re-read the file. Costs one disk read per failing proof-fn
-    // — negligible alongside the Lean check we just ran. Don't
-    // depend on `SourceFile::src` because it's wrapped in
-    // different ways across rustc versions and isn't always
-    // available on worker threads.
-    let src = std::fs::read_to_string(file_path).ok()?;
-    let bytes = src.as_bytes();
+    // Pull the file content from our FileLoader-side cache (not
+    // from `SourceFile.src`, which is wrapped differently across
+    // rustc versions, and not from a fresh disk read, which
+    // could see a newer version if the user edited mid-build).
+    //
+    // Using the cached content keeps this helper consistent with
+    // `swap_source_for_diagnostics`: both compute against the
+    // same point-in-time snapshot that rustc parsed, so spans
+    // and rendered preview agree on what line N contains.
+    // Cache miss means the file wasn't loaded through
+    // `TactusFileLoader` (vanishingly rare on our pipeline);
+    // return `None` rather than re-reading from disk and getting
+    // potentially-different content.
+    let original_arc = crate::file_loader::original_for_path(
+        std::path::Path::new(file_path),
+    )?;
+    let bytes = original_arc.as_bytes();
     if start_byte >= bytes.len() { return None; }
 
     // Find the byte offset (in file) of the fn's first character.
