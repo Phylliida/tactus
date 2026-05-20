@@ -5709,6 +5709,119 @@ rust_verify unit tests (+14: 13 new spans tests for
 CRLF preservation test). 435 e2e + 1 coverage + 7 integration
 unchanged; vstd 1530/0.
 
+#### Current session (2026-05-20 — investigation: transparent-wrapper peel vs trait dispatch; no code landed)
+
+Began thinking we'd land "filter cross-crate redundant blanket
+impls" to unblock `test_exec_call_mut_arg_vec_index_probe` (the
+vec_index Err pin). Through pushback + investigation, the work
+unfolded into a structural finding that's bigger than the
+immediate symptom. **No code changes landed** beyond a pinned
+regression probe + this doc entry. The deliverable is the
+analysis preserved for a future session that has appetite for
+the multi-session refactor it actually requires.
+
+**What we found** (in order):
+
+1. **Bug B (same-crate blanket-impl assoc-type passthrough) is
+   green**, but the cross-crate vec_index version still fails
+   with multiple structural issues:
+   - vstd's four `View` blanket impls (`View for &A`, `Box<A>`,
+     `Rc<A>`, `Arc<A>`) all emit instance heads with Self peeled
+     to bare typ-param → all four heads are `view.View A V`
+     (duplicates).
+   - Standalone defs for these impl methods aren't emitted (the
+     dep walk doesn't reach them; nothing in the test calls
+     `(&u8).view()` or `Box<u8>.view()`). Instance bodies
+     reference unresolved `view.impl__N.view`.
+   - "Unknown identifier `View.view`" is downstream of those
+     unresolved standalones plus a namespace-prefix-dropping
+     bug in cross-crate inlined ensures rendering.
+
+2. **The probe (`test_non_forwarding_blanket_over_ref_probe`)
+   demonstrates the gap is NOT vstd-specific.** Same-crate user
+   code writing `impl<A: Foo + ?Sized> Foo for &A { spec fn
+   foo(&self) -> int { (**self).foo() + 1 } }` and then asserting
+   `(&h).foo() == 8` fails — Tactus's peel collapses `&Holder →
+   Holder` at the dispatch site, picks the concrete `Foo Holder`
+   instance, returns 7. The blanket's `+1` is silently dropped.
+
+3. **The root cause is Tactus's peel-at-dispatch decision.** For
+   pure-forwarding blanket impls (vstd's case), the peel
+   coincidentally gives the right answer because the inner
+   type's instance produces the same value. For non-forwarding
+   ones (the probe), Tactus silently dispatches wrong.
+
+4. **Verus handles this via separate type-ID encoding.** In
+   `vir::context::DECORATE = true` mode (the default),
+   `sst_to_air::monotyp_to_id` emits a two-component type-ID
+   `(REF, basic A)` for `&A` distinct from `(NIL_SIZED, basic A)`
+   for `A`. The SMT value type is still peeled (both `Poly`), but
+   dispatch axioms key off the type-ID — so the blanket impl
+   provides a real dispatch bridge. **Tactus's peel diverges
+   from Verus's semantics here**; the divergence is silent for
+   forwarding blankets, observable for non-forwarding ones.
+
+5. **A filter (skip redundant cross-crate blanket-over-typ-param
+   instances) is triage, not a fix.** It would unblock the
+   vec_index probe by removing emission noise, but doesn't
+   correct the underlying peel-at-dispatch divergence. User
+   code with non-forwarding blanket impls would remain silently
+   wrong.
+
+**Proper fix shape** (for a future session with appetite):
+
+- Add opaque wrapper types to `TactusPrelude.lean`:
+  `axiom Ref : Type → Type`, plus `MutRef`, `Box`, `Rc`, `Arc`.
+  Inhabited instances. Deref ops (`Ref.deref : Ref A → A`) as
+  axioms.
+- Modify `typ_to_expr` Decorate arm to render reference
+  decorations distinctly (NOT peel them). Keep peeling `Boxed`
+  (Verus's poly encoding, genuinely Lean-transparent) and
+  probably keep peeling `Ghost`/`Tracked` (verification metadata,
+  not runtime types).
+- Modify expression renderer: `*r` for `r: &A` emits
+  `Ref.deref r`; `&x` emits `Ref.mk x` (or equivalent — check
+  what Verus's lowering produces).
+- Audit every use of `peel_typ_wrappers`. Distinguish
+  structural-identity peels (keep — `is_int_height`,
+  `decrease_height_datatype`, `field_recursive_target`) from
+  rendering-equivalence peels (remove — `type_short_name`,
+  `typ_to_expr`).
+- `type_short_name` returning `Ref`/`Box`/etc. for the wrapper
+  cases satisfies the "never `impl__N`" principle as a side
+  effect.
+- Audit `#55`/`#94`/`#107` `&mut` infrastructure for interactions
+  with `MutRef A` as a distinct type.
+- Expect substantial test churn: many existing tests bind
+  `&self` and would see their signatures change. Plan for
+  multi-pass test triage.
+
+**Scope estimate**: 3-5 focused sessions. Phasing in the
+final reply of this conversation (Phase 1 = additive prelude
+behind flag; Phase 2 = un-peel `Ref` only and validate probe;
+Phase 3 = broaden to `Box`/`Rc`/`Arc`/`MutRef` + fix test
+fallout; Phase 4 = cleanup + DESIGN.md update + remove flag).
+
+**Pinned probe**: `test_non_forwarding_blanket_over_ref_probe`
+in `rust_verify_test/tests/tactus.rs` (Err) — flips to Ok when
+the un-peel landing happens. Documents the gap in code so
+future sessions don't rediscover it from scratch.
+
+**Why we stopped here**: I noticed my analysis oscillating
+between recommendations (filter / un-peel / both / track for
+future) — five-ish iterations in one conversation. Danielle
+named the fatigue directly and offered to stop. The
+investigation itself IS a deliverable; pushing through to land
+code in that state would have been the wrong move. The proper
+fix needs a session that begins with it as the priority, not a
+session that ended in it after a long detour through alternate
+options.
+
+**Test counts**: 435 e2e (+1 if probe lands, unchanged otherwise
+since probe is Err-pinned and would have been Err either way).
+209 lean_verify unit, 66 rust_verify unit, 7 integration. vstd
+1530/0.
+
 ## Architecture
 
 ### Full pipeline

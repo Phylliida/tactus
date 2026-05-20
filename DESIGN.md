@@ -3015,6 +3015,169 @@ an Opaque value at this site. Only DIRECT field types matter
   outside the trait setup. Worth adding if any change to the dep
   walk is suspected.
 
+### Transparent-wrapper peel vs trait dispatch (deferred 2026-05-20)
+
+Tactus currently peels reference-like decorations (`&A → A`,
+`Box<A> → A`, `Rc<A> → A`, `Arc<A> → A`) at every site that calls
+`peel_typ_wrappers` / `type_short_name` — including the dispatch
+site for trait method calls. This silently produces the wrong
+answer when a blanket impl over a transparent wrapper has
+*non-forwarding* behaviour. Pinned by
+`test_non_forwarding_blanket_over_ref_probe` (same-crate, Err).
+
+**The gap, concretely.** A user crate writes:
+
+```rust
+impl<A: Foo + ?Sized> Foo for &A {
+    spec fn foo(&self) -> int { (**self).foo() + 1 }
+}
+```
+
+Verus's spec semantics say `(&h).foo() = h.foo() + 1` for any
+`h: Foo`. Tactus peels `&h → h` at the call site, dispatches to
+`Foo h`'s concrete instance, returns `h.foo()` — the `+1` is
+silently dropped. The probe demonstrates this with `(&Holder{v:7}).foo()`
+which should equal 8 but reduces to `7 = 8` (⊢ False).
+
+For *forwarding* blanket impls (every blanket in vstd today —
+`View for &A`, `Box<A>`, `Rc<A>`, `Arc<A>` all have body
+`(**self).view()`), Tactus's peel coincidentally produces the
+right answer: the inner type's instance returns the same value
+the blanket would have. **The gap is silent until someone writes
+a non-forwarding blanket** — which user code is fully able to
+do, no vstd involvement required.
+
+**How Verus avoids this.** `vir::context::DECORATE = true` (the
+default). At the SMT *value* level, decorations are peeled (both
+`&A` and `A` are `Poly`). But at the SMT *type-ID* level
+(`sst_to_air::monotyp_to_id`), decorations are preserved as a
+two-component tag — `&A` gets `(REF, basic A)`, `A` gets
+`(NIL_SIZED, basic A)`. Trait dispatch in Z3 keys off the
+type-ID, so `View (REF A)` and `View A` look up different
+instances. The blanket impl's axiom bridges from the decorated
+type-ID to the inner: `view((REF A), r) = view(A, deref r) + extra`.
+
+In Tactus's Lean target, instance resolution dispatches by
+literal type matching — there's no separate type-ID channel to
+exploit. The analog is real distinct Lean types: emit `Ref`,
+`MutRef`, `Box`, `Rc`, `Arc` as opaque wrapper-type axioms in
+the prelude, render decorations through them at type sites, and
+add deref ops at value sites.
+
+**Why this isn't blocking today.**
+
+- vstd's blanket impls are all pure forwarding — Tactus's peel
+  gives the right answer for everything vstd does.
+- The most visible cross-crate symptom is
+  `test_exec_call_mut_arg_vec_index_probe` (Err), but its
+  immediate failure mode is *emission noise* (unresolved
+  references to standalone defs that never got emitted), not
+  the underlying semantic gap. A targeted filter on cross-crate
+  blanket-over-typ-param instances would unblock vec_index
+  without addressing the semantic gap; that filter would be a
+  documented triage, not a fix.
+- No user-reported issue from a non-forwarding blanket impl in
+  the wild. The gap is real but currently latent.
+
+**The proper fix shape**, captured here so a future session can
+start warm:
+
+1. **Prelude wrapper types.** Add to `TactusPrelude.lean`:
+   ```lean
+   axiom Ref : Type → Type
+   axiom MutRef : Type → Type
+   axiom Box : Type → Type
+   axiom Rc : Type → Type
+   axiom Arc : Type → Type
+   ```
+   Plus `[Inhabited (Ref A)]` etc. (also axioms — opaque). Plus
+   value-level deref ops: `axiom Ref.deref : ∀ {A}, Ref A → A`,
+   similarly for the others.
+
+2. **`typ_to_expr` Decorate arm.** Stop peeling for the
+   reference decorations (`Ref`, `MutRef`, `Box`, `Rc`, `Arc`).
+   Render each as `<WrapperName> <inner>`. Keep peeling `Boxed`
+   (Verus's poly encoding — genuinely transparent in Lean's
+   native polymorphism) and probably keep peeling `Ghost`/
+   `Tracked` (verification metadata, not runtime types).
+
+3. **Expression renderer.** `*r` for `r: &A` emits `Ref.deref r`
+   rather than collapsing to bare `r`. `&x` for `x: A` emits
+   `Ref.mk x` (or whatever Verus's lowering produces — likely a
+   no-op coercion in spec mode that the renderer needs to make
+   explicit). Audit `UnaryOp::Deref` and the new-mut-ref
+   `MutRefCurrent`/`MutRefFuture` rewrite to land on a
+   consistent lowering.
+
+4. **Audit `peel_typ_wrappers` use sites.** Distinguish:
+   - *Structural-identity peels* (keep): `is_int_height`,
+     `decrease_height_datatype`, `field_recursive_target`. These
+     ask "is the underlying datatype recursive / int / etc." —
+     decorations are irrelevant.
+   - *Rendering-equivalence peels* (remove): `type_short_name`,
+     `typ_to_expr`. These determine how the type appears in
+     emitted Lean — decorations matter for dispatch.
+
+5. **`type_short_name` returns clean names for wrappers.** Once
+   un-peel lands, `&A → "Ref"`, `Box<A> → "Box"`, etc. The
+   "never `impl__N`" principle (DESIGN.md "Implementation
+   locality") becomes structurally enforced for blanket impls
+   over references — they get clean `Ref.Foo.impl.foo` etc.
+   names automatically.
+
+6. **`#55`/`#94`/`#107` `&mut` infrastructure audit.** Mut-ref
+   support uses `varat_pre_name` and a normalization pass that
+   maps new-mut-ref shapes to legacy. With `MutRef A` as a
+   distinct type, these passes need re-checking to confirm the
+   pre/post substitution machinery interacts cleanly. Probably
+   the existing rewrite still works (it operates on `Var(p)`
+   structure regardless of whether `p`'s type is `T` or
+   `MutRef T`) but worth verifying.
+
+7. **Test fallout.** Many existing tests bind `&self` and would
+   see their generated Lean signatures change. Plan for
+   multi-pass test triage. Most should still verify (no
+   semantic change for forwarding cases), but the generated
+   Lean shape changes meaningfully.
+
+**Phasing** (suggested for a future session, ~3-5 sessions
+total):
+
+- **Phase 1** (small, additive): add prelude wrapper types
+  behind a feature flag or env var. Don't change rendering yet.
+  Confirm declarations parse, no name conflicts. Low risk.
+- **Phase 2** (validate approach): turn on un-peel for `Ref`
+  only. Confirm `test_non_forwarding_blanket_over_ref_probe`
+  flips Ok. Catalogue all test breakages with the flag on.
+  1-2 sessions.
+- **Phase 3** (broaden): extend to `Box`, `Rc`, `Arc`, `MutRef`.
+  Fix test breakages one decoration at a time. 2-3 sessions.
+- **Phase 4** (cleanup): remove the flag, update this DESIGN.md
+  entry, ensure vstd still verifies 1530/0, the vec_index
+  probe (`test_exec_call_mut_arg_vec_index_probe`) flips Ok.
+
+**Alternatives considered + rejected** (2026-05-20):
+
+- **Filter cross-crate redundant blanket impls** (small
+  triage). Skips instances whose Self peels to bare typ-param
+  and whose body is pure forwarding. Would unblock the
+  vec_index probe by removing emission noise. **Rejected as a
+  standalone landing** because (a) it doesn't address the
+  underlying semantic gap, and (b) the gap surfaces in user
+  code too, not just vstd. If a future session needs the
+  vec_index unblock urgently and the un-peel work hasn't
+  landed, the filter is reasonable as documented triage.
+- **Skip the cross-crate blanket impls entirely** (no filter,
+  just don't emit). Cleaner-looking output but loses the
+  bound-derivability story — emit-time decisions about which
+  instances to declare get coupled to assumptions about which
+  call sites will dispatch through them. Rejected.
+- **Inline forwarding instance bodies** (replace standalone
+  forward-call with direct inline body). Tried for Bug A
+  (2026-05-17 session); broke 5 proof-fn tests whose tactics
+  expected one-step `simp_all [Trait.method]` unfolding.
+  Rejected then; still rejected.
+
 ### Blanket-impl assoc-type passthrough (Bug B, LANDED 2026-05-19)
 
 Blanket impls like vstd's
