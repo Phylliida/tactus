@@ -56,6 +56,10 @@ pub(crate) fn raw_span_data(raw_span: &vir::messages::RawSpan) -> Option<SpanDat
 static SWAPPED_FILES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>> =
     std::sync::OnceLock::new();
 
+fn swapped_files() -> &'static std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>> {
+    SWAPPED_FILES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
 /// Recompute `multibyte_chars` for a source string. Each non-ASCII char
 /// in valid UTF-8 starts at a byte ≥ 128; its length determines the
 /// `MultiByteChar` entry (which records `(pos, byte_length)` for visual
@@ -102,10 +106,16 @@ fn compute_multibyte_chars(s: &str) -> Vec<rustc_span::MultiByteChar> {
 /// prior call). Returns `false` if the file isn't in our cache (e.g.,
 /// loaded outside `TactusFileLoader`) or no `SourceFile` matches.
 ///
+/// **`pub(crate)`** (not `pub`) because the safety argument below
+/// depends on being called from `Reporter::report_as` on the main
+/// thread. Restricting the visibility makes the invariant easier
+/// to enforce — the only call site in the crate is the one
+/// documented here.
+///
 /// ## Safety
 ///
 /// This writes through a raw `*mut SourceFile` derived from
-/// `Arc::as_ptr`. The write is safe under two invariants:
+/// `Arc::as_ptr`. The write is safe under three invariants:
 ///
 /// 1. **Single-threaded reader.** `Reporter::report_as` runs on the
 ///    main thread (the only thread that calls rustc's diagnostic
@@ -120,6 +130,15 @@ fn compute_multibyte_chars(s: &str) -> Vec<rustc_span::MultiByteChar> {
 ///    main thread before any rendering (by virtue of being called
 ///    from `report_as` itself).
 ///
+/// 3. **No concurrent swap.** The "have we swapped this file?"
+///    check and the unsafe write happen inside the same
+///    `SWAPPED_FILES` lock acquisition, so two threads that both
+///    call this for the same file serialize: the first thread
+///    does the write and inserts the entry; the second sees the
+///    entry and returns without writing. Without this, two
+///    `*mut` writes to the same location without synchronization
+///    would be UB even though they'd produce identical content.
+///
 /// We also update `sf.multibyte_chars` because the sanitized content
 /// contains no multi-byte chars (every byte was replaced with ASCII
 /// space) while the original may. Without this update, rustc's visual
@@ -129,7 +148,7 @@ fn compute_multibyte_chars(s: &str) -> Vec<rustc_span::MultiByteChar> {
 /// the sanitizer preserves `\n` and `\r` byte-for-byte, so newline
 /// positions and CRLF normalization match between sanitized and
 /// original.
-pub fn swap_source_for_diagnostics(
+pub(crate) fn swap_source_for_diagnostics(
     source_map: &rustc_span::source_map::SourceMap,
     file_path: &str,
 ) -> bool {
@@ -138,14 +157,14 @@ pub fn swap_source_for_diagnostics(
     let canonical = std::fs::canonicalize(file_path)
         .unwrap_or_else(|_| std::path::PathBuf::from(file_path));
 
-    {
-        let swapped = SWAPPED_FILES
-            .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-            .lock()
-            .unwrap();
-        if swapped.contains(&canonical) {
-            return true;
-        }
+    // Hold the lock through the entire critical section (check →
+    // look up cache → SourceFile lookup → unsafe write → insert)
+    // so concurrent callers can't both pass the not-yet-swapped
+    // check and race on the `*mut` write. See safety invariant
+    // (3) in the doc-comment above.
+    let mut swapped = swapped_files().lock().unwrap();
+    if swapped.contains(&canonical) {
+        return true;
     }
 
     let original = match crate::file_loader::original_for_path(&canonical) {
@@ -171,19 +190,16 @@ pub fn swap_source_for_diagnostics(
 
     // SAFETY: See the doc-comment's safety section above. We take a
     // `*mut SourceFile` from the `Arc::as_ptr` and write `src` +
-    // `multibyte_chars`. Single-threaded reader (`Reporter::report_as`
-    // on main); no concurrent writes.
+    // `multibyte_chars`. The `swapped_files()` lock held across
+    // this block ensures no concurrent swap on this same file;
+    // the main-thread-only invariant ensures no concurrent reader.
     unsafe {
         let sf_ptr = std::sync::Arc::as_ptr(&sf) as *mut rustc_span::SourceFile;
         (*sf_ptr).src = Some(original);
         (*sf_ptr).multibyte_chars = new_multibyte_chars;
     }
 
-    SWAPPED_FILES
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-        .lock()
-        .unwrap()
-        .insert(canonical);
+    swapped.insert(canonical);
     true
 }
 
@@ -787,6 +803,19 @@ mod tests {
         // Only one colon — `test.rs:5` doesn't have a line/col
         // split; reject rather than guess.
         assert_eq!(parse_file_line_col("test.rs:5"), None);
+    }
+
+    #[test]
+    fn parse_file_line_col_path_with_many_colons() {
+        // Real-world weird case: a path that happens to contain
+        // multiple `:` segments. Only the LAST two get parsed as
+        // line:col; the rest stay in the path. Pins the rsplit
+        // semantics (vs. splitting from the left, which would
+        // produce wrong path AND wrong line/col).
+        assert_eq!(
+            parse_file_line_col("a:b:c:42:7"),
+            Some(("a:b:c", 42, 7)),
+        );
     }
 
     // ── compute_multibyte_chars ──────────────────────────────────
