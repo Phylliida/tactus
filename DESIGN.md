@@ -303,6 +303,66 @@ The FileLoader scanner:
 
 Byte offsets are identical between sanitized and original, so `Span::byte_range()` works unchanged.
 
+The sanitizer preserves `\n` AND `\r` (not just `\n`): newline positions matter for `lines`, and `\r` matters for `normalized_pos` (rustc normalizes `\r\n` → `\n` at SourceFile construction; if sanitized had bare `\n` where the original had `\r\n`, the two views' `normalized_pos` tables would disagree, breaking the diagnostic-source swap described below).
+
+### Diagnostic source preview swap (landed 2026-05-19)
+
+The FileLoader sanitization is correct for parsing — rustc lexes blank-space content trivially. But it leaves rustc's `SourceMap` holding sanitized content as the canonical view of the file. When a verification error fires inside a tactic body, rustc's diagnostic renderer pulls the line from `SourceFile.src` and renders something like:
+
+```
+  --> test.rs:18:5
+   |
+18 |          
+   |     ^^^^^
+```
+
+The `-->` line:col is correct for navigation (`vi test.rs +18`), but the inline source preview is blank because the lexer saw spaces where `omega` lives. Compounded across 5–10 failures per proof iteration, this adds a real workflow tax.
+
+**The fix** (small, scoped):
+
+1. `TactusFileLoader::read_file` caches the original content per canonical path in a static `OnceLock<Mutex<HashMap<PathBuf, Arc<String>>>>` before sanitization.
+
+2. At diagnostic emission time, `Reporter::report_as` (which runs on the main thread, the only consumer of `sf.src` via rustc's diagnostic renderer) calls `spans::swap_source_for_diagnostics` for each span's file. The swap:
+   - Looks up the SourceFile via `SourceMap`.
+   - Recomputes `multibyte_chars` from the original content (a ~20-line UTF-8 byte-length iteration; rustc's `analyze_source_file` is `pub(crate)` so we replicate the logic locally).
+   - Writes `sf.src` and `sf.multibyte_chars` through a `*mut SourceFile` derived from `Arc::as_ptr`.
+   - Memoizes per file via a static `SWAPPED_FILES` set.
+
+3. rustc then renders the preview with the original content:
+
+```
+  --> test.rs:18:5
+   |
+18 |     omega
+   |     ^^^^^
+```
+
+`lines` and `normalized_pos` need no recompute because the sanitizer preserves `\n` and `\r` byte-for-byte — the metadata matches between sanitized and original by construction.
+
+**Safety of the `unsafe` swap.** Two invariants:
+
+1. *Single-threaded reader.* Rustc's diagnostic renderer reads `sf.src` only via `SourceMap::span_to_source`, which is called from `Reporter::report_as` on the main thread. Verus's worker threads queue `Message` values over an mpsc channel — they hold vir `Span`s with `BytePos` values, not `Arc<SourceFile>`, and never read `sf.src`.
+
+2. *No concurrent mutation.* rustc creates `SourceFile`s during file load and doesn't mutate them after. Our swap is the only write to `sf.src` post-construction; it happens on the main thread from `Reporter::report_as`, before any rendering, and is idempotent (`SWAPPED_FILES` guard).
+
+**Alternatives rejected.** We explored several before settling on the swap-with-recompute:
+
+- **Selective sanitization** (only blank chars rustc's lexer can't handle, keep ASCII intact). Same fundamental problem documented elsewhere in this section: every Lean syntax that's tokenizable-but-meaning-different in Rust becomes an ongoing maintenance edge case (`'x` as Lean prime vs Rust char literal start, `//` as Lean integer-division vs Rust line-comment, every new Unicode operator). Brittle and unbounded.
+
+- **Tree-sitter-guided selective sanitization** (preserve ASCII tokens, blank only Lean-specific tokens like `--` blocks and Unicode). More principled detection, same underlying brittleness — anything kept still has to lex as valid Rust, which is the unbounded class.
+
+- **Append source preview to the message body** (read original, format `18 |     omega\n   |     ^^^^^` in the error text). Works always, requires no `unsafe`, but renders the redundant blank rustc preview below. Two pseudo-previews per error.
+
+- **Drop the rustc `Span` for proof-fn body errors; hand-render `-->`/`|`/source-line in the message text**. Clean visually, but loses structured-span integration with JSON-mode tooling (rust-analyzer etc.) and depends on text-mode editors parsing `-->` patterns from arbitrary message bodies.
+
+- **Replace multi-byte chars with multi-byte Pattern_White_Space chars (LRM/NEL)** so `multibyte_chars` matches by construction without a recompute. Sanitizer is ~20 lines more complex, plus a quiet dependence on rustc's `Pattern_White_Space` set being stable across versions. The recompute-on-swap approach turned out to be simpler in practice — the UTF-8 byte-length helper is mechanical and version-independent.
+
+- **Fork `rustc_span` to add a `swap_src` API or bypass the hash check on `add_external_src`**. Verus already forks `rustc_hir_typeck` and `rustc_mir_build`, so this is in-scope, but it's a substantial new fork to maintain. The `Arc::as_ptr`-cast swap accomplishes the same thing in ~25 lines with no vendoring.
+
+- **Wrap rustc's emitter to post-process the rendered text** (substitute blank lines with disk content via regex on the output). Possible but tied to rustc's exact output format (would break silently on any format change).
+
+The chosen swap is structurally the smallest change that preserves all editor integration (`-->` text, JSON spans, source navigation) and renders correct content. The `unsafe` is bounded by clear invariants and lives behind a documented helper.
+
 ### `//` in tactic blocks
 
 `//` (Lean's integer division) is **not supported** in tactic blocks. Use `Nat.div` or `Int.div` instead. This avoids a fundamental conflict: Rust's lexer treats `//` as a line comment (consuming the rest of the line including potential `}`), and tree-sitter's extras mechanism makes `//` comments globally unavoidable in the grammar.
