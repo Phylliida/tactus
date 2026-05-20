@@ -552,10 +552,13 @@ fn krate_preamble(
 // ── Check results ──────────────────────────────────────────────────────
 
 /// Where in the user's source a Tactus diagnostic points. Three
-/// mutually-exclusive cases — split as an enum (rather than two
-/// `Option` fields on `TactusDiag`) so the "both Some" /
-/// "exec-fn diag with a line offset" / "proof-fn diag with a
-/// direct span" states are structurally unrepresentable.
+/// mutually-exclusive cases — split as an enum rather than two
+/// `Option` fields on `TactusDiag` so the prior encoding's
+/// permitted-but-meaningless states (notably "both Some") are
+/// structurally unrepresentable. Picking which variant to
+/// construct forces the producer to decide what the diagnostic
+/// is pointing at, rather than setting two Options independently
+/// and hoping the consumer interprets them consistently.
 ///
 /// Same pattern DESIGN.md § "Type-system-enforced invariants"
 /// applies elsewhere (`AssertKind` sum split, `LoopInvKind`,

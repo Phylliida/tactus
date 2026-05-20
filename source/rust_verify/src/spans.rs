@@ -800,7 +800,7 @@ mod tests {
 
     #[test]
     fn multibyte_chars_two_byte() {
-        // `≤` is U+2264 = 3 bytes, `é` is U+00E9 = 2 bytes.
+        // `é` is U+00E9 = 2 bytes in UTF-8 (C3 A9).
         let v = compute_multibyte_chars("aéb");
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].pos.0, 1);

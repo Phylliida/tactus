@@ -81,22 +81,28 @@ impl air::messages::Diagnostics for Reporter<'_> {
         let msg: &MessageX =
             msg.downcast_ref().expect("unexpected value in Any -> Message conversion");
 
-        // Tactus: swap `SourceFile.src` from the FileLoader-sanitized
-        // version (blank spaces inside tactic blocks) to the original
-        // content before rustc renders the source preview, so users see
-        // real tactic text (`omega`, etc.) under the `-->` arrow. Pulls
-        // the file path from each span's pre-resolved `start_loc`
-        // (`file:line:col`). Idempotent — `swap_source_for_diagnostics`
-        // memoizes per file. No-op for non-Tactus paths (files not in
-        // the `TactusFileLoader` cache).
+        // Tactus: while collecting rustc spans for the multispan,
+        // also swap `SourceFile.src` from the FileLoader-sanitized
+        // version (blank spaces inside tactic blocks) to the
+        // original content before rustc renders the source
+        // preview, so users see real tactic text (`omega`, etc.)
+        // under the `-->` arrow. Pulls the file path from each
+        // span's pre-resolved `start_loc` (`file:line:col`).
+        // Idempotent — `swap_source_for_diagnostics` memoizes per
+        // file. No-op for non-Tactus paths (files not in the
+        // `TactusFileLoader` cache).
+        //
+        // Order in the loop body: swap first, then convert. The
+        // swap mutates rustc's cached source content but doesn't
+        // affect `from_air_span` (which reads `BytePos` data, not
+        // file content). The order is semantically equivalent;
+        // we do it first so a future reader sees the swap as the
+        // load-bearing prelude to span conversion.
+        let mut v: Vec<Span> = Vec::new();
         for sp in &msg.spans {
             if let Some((path, _, _)) = crate::spans::parse_file_line_col(&sp.start_loc) {
                 crate::spans::swap_source_for_diagnostics(self.source_map, path);
             }
-        }
-
-        let mut v: Vec<Span> = Vec::new();
-        for sp in &msg.spans {
             if let Some(span) = self.spans.from_air_span(&sp, Some(self.source_map)) {
                 v.push(span);
             }
