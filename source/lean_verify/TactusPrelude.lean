@@ -58,6 +58,57 @@ axiom arch_word_bits_valid : arch_word_bits = 32 ∨ arch_word_bits = 64
 noncomputable def usize_hi : Int := (2 : Int) ^ arch_word_bits
 noncomputable def isize_hi : Int := (2 : Int) ^ (arch_word_bits - 1)
 
+-- Reference-like decorations preserve type identity at the Lean level
+-- so trait dispatch can distinguish `Ref A` from `A`. Verus's Z3 path
+-- handles this via `context::DECORATE = true` + `sst_to_air::monotyp_to_id`,
+-- which emits two-component type-IDs (`(REF, basic A)` vs
+-- `(NIL_SIZED, basic A)`) so trait axioms key off the decoration.
+-- Lean has no separate type-ID channel — instance resolution dispatches
+-- by literal type matching — so we encode each decoration as a real
+-- distinct Lean type via opaque axioms.
+--
+-- Without these, a non-forwarding blanket impl like
+-- `impl<A: Foo> Foo for &A { spec fn foo(&self) -> int { (**self).foo() + 1 } }`
+-- silently miscompiles: `peel_typ_wrappers` collapses `&Holder → Holder`
+-- at the dispatch site, picks the concrete `Foo Holder` instance, and
+-- the blanket's `+1` is dropped. Pinned by
+-- `test_non_forwarding_blanket_over_ref_probe`.
+--
+-- Each wrapper has `mk` (construct from inner) and `deref` (extract
+-- inner) as axioms — the runtime semantics is "the same value boxed
+-- under a different name", which Lean's type system can express via
+-- distinct opaque types but can't compute. `Inhabited` is also an
+-- axiom (mirrors how external_body types get their Inhabited).
+--
+-- Phase 1 of the un-peel refactor (2026-05-20): declarations only,
+-- no rendering changes yet. See DESIGN.md § "Transparent-wrapper peel
+-- vs trait dispatch (deferred 2026-05-20)" for the multi-phase plan.
+
+axiom Tactus.Ref : Type → Type
+axiom Tactus.Ref.mk {A : Type} : A → Tactus.Ref A
+axiom Tactus.Ref.deref {A : Type} : Tactus.Ref A → A
+@[instance] axiom Tactus.Ref.instInhabited {A : Type} [Inhabited A] : Inhabited (Tactus.Ref A)
+
+axiom Tactus.MutRef : Type → Type
+axiom Tactus.MutRef.mk {A : Type} : A → Tactus.MutRef A
+axiom Tactus.MutRef.deref {A : Type} : Tactus.MutRef A → A
+@[instance] axiom Tactus.MutRef.instInhabited {A : Type} [Inhabited A] : Inhabited (Tactus.MutRef A)
+
+axiom Tactus.Box : Type → Type
+axiom Tactus.Box.mk {A : Type} : A → Tactus.Box A
+axiom Tactus.Box.deref {A : Type} : Tactus.Box A → A
+@[instance] axiom Tactus.Box.instInhabited {A : Type} [Inhabited A] : Inhabited (Tactus.Box A)
+
+axiom Tactus.Rc : Type → Type
+axiom Tactus.Rc.mk {A : Type} : A → Tactus.Rc A
+axiom Tactus.Rc.deref {A : Type} : Tactus.Rc A → A
+@[instance] axiom Tactus.Rc.instInhabited {A : Type} [Inhabited A] : Inhabited (Tactus.Rc A)
+
+axiom Tactus.Arc : Type → Type
+axiom Tactus.Arc.mk {A : Type} : A → Tactus.Arc A
+axiom Tactus.Arc.deref {A : Type} : Tactus.Arc A → A
+@[instance] axiom Tactus.Arc.instInhabited {A : Type} [Inhabited A] : Inhabited (Tactus.Arc A)
+
 -- `Tactus.strGetChar s i` is the i-th Unicode codepoint of `s` as a
 -- `Nat`. The lowering target for Verus's `verus_builtin::strslice_get_char`
 -- (VIR `BinaryOp::StrGetChar`, surface syntax `strslice_get_char(s, i)`).
