@@ -74,40 +74,37 @@ noncomputable def isize_hi : Int := (2 : Int) ^ (arch_word_bits - 1)
 -- the blanket's `+1` is dropped. Pinned by
 -- `test_non_forwarding_blanket_over_ref_probe`.
 --
--- Each wrapper has `mk` (construct from inner) and `deref` (extract
--- inner) as axioms — the runtime semantics is "the same value boxed
--- under a different name", which Lean's type system can express via
--- distinct opaque types but can't compute. `Inhabited` is also an
--- axiom (mirrors how external_body types get their Inhabited).
+-- Single-field structures with field name `deref`: the constructor is
+-- `Tactus.X.mk` (taking the inner value), the projection is `.deref`
+-- (or equivalently `Tactus.X.deref`). The equation `(mk x).deref = x`
+-- holds DEFINITIONALLY via Lean's structure-projection rule — no axiom
+-- needed, simp reduces it, rfl closes it.
 --
--- Phase 1 of the un-peel refactor (2026-05-20): declarations only,
--- no rendering changes yet. See DESIGN.md § "Transparent-wrapper peel
--- vs trait dispatch (deferred 2026-05-20)" for the multi-phase plan.
+-- Lean's typeclass dispatch treats `Tactus.Ref A` and `A` as
+-- syntactically distinct heads — exactly what we need to distinguish
+-- instances of `Foo &A` from `Foo A`.
+--
+-- `Inhabited` derives naturally given `[Inhabited A]` of the inner.
 
-axiom Tactus.Ref : Type → Type
-axiom Tactus.Ref.mk {A : Type} : A → Tactus.Ref A
-axiom Tactus.Ref.deref {A : Type} : Tactus.Ref A → A
-@[instance] axiom Tactus.Ref.instInhabited {A : Type} [Inhabited A] : Inhabited (Tactus.Ref A)
+structure Tactus.Ref (A : Type) where
+  deref : A
+  deriving Inhabited
 
-axiom Tactus.MutRef : Type → Type
-axiom Tactus.MutRef.mk {A : Type} : A → Tactus.MutRef A
-axiom Tactus.MutRef.deref {A : Type} : Tactus.MutRef A → A
-@[instance] axiom Tactus.MutRef.instInhabited {A : Type} [Inhabited A] : Inhabited (Tactus.MutRef A)
+structure Tactus.MutRef (A : Type) where
+  deref : A
+  deriving Inhabited
 
-axiom Tactus.Box : Type → Type
-axiom Tactus.Box.mk {A : Type} : A → Tactus.Box A
-axiom Tactus.Box.deref {A : Type} : Tactus.Box A → A
-@[instance] axiom Tactus.Box.instInhabited {A : Type} [Inhabited A] : Inhabited (Tactus.Box A)
+structure Tactus.Box (A : Type) where
+  deref : A
+  deriving Inhabited
 
-axiom Tactus.Rc : Type → Type
-axiom Tactus.Rc.mk {A : Type} : A → Tactus.Rc A
-axiom Tactus.Rc.deref {A : Type} : Tactus.Rc A → A
-@[instance] axiom Tactus.Rc.instInhabited {A : Type} [Inhabited A] : Inhabited (Tactus.Rc A)
+structure Tactus.Rc (A : Type) where
+  deref : A
+  deriving Inhabited
 
-axiom Tactus.Arc : Type → Type
-axiom Tactus.Arc.mk {A : Type} : A → Tactus.Arc A
-axiom Tactus.Arc.deref {A : Type} : Tactus.Arc A → A
-@[instance] axiom Tactus.Arc.instInhabited {A : Type} [Inhabited A] : Inhabited (Tactus.Arc A)
+structure Tactus.Arc (A : Type) where
+  deref : A
+  deriving Inhabited
 
 -- `Tactus.strGetChar s i` is the i-th Unicode codepoint of `s` as a
 -- `Nat`. The lowering target for Verus's `verus_builtin::strslice_get_char`

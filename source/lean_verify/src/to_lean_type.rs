@@ -79,6 +79,12 @@ fn typ_to_node(typ: &TypX) -> ExprNode {
         // emit via `lit` since they're already valid identifiers.
         TypX::TypParam(name) => ExprNode::Var(LeanName::lit(name.as_str())),
         TypX::Boxed(inner) => typ_to_node(inner),
+        TypX::MutRef(inner) => {
+            // New-mut-ref-mode shape (`TypX::MutRef`, distinct from the
+            // legacy `Decorate(MutRef, _, _)`). Render through the same
+            // wrapper as legacy mode for uniformity.
+            applied("Tactus.MutRef", vec![typ_to_expr(inner)])
+        }
         TypX::Datatype(dt, args, _) => match dt {
             Dt::Path(path) => applied(&lean_name(path), args.iter().map(|a| typ_to_expr(a)).collect()),
             // Anonymous Rust tuple → Lean product type `T₁ × T₂ × … × Tₙ`.
@@ -114,7 +120,29 @@ fn typ_to_node(typ: &TypX) -> ExprNode {
             }
             out.node
         }
-        TypX::Decorate(_, _, inner) => typ_to_node(inner),
+        TypX::Decorate(deco, _, inner) => {
+            // Reference-like decorations preserve type identity at the
+            // Lean level so trait dispatch can distinguish `Ref A` from
+            // `A`. Verus's Z3 path handles this via DECORATE=true type-IDs
+            // in `sst_to_air::monotyp_to_id` (two-component `(REF, basic
+            // A)` vs `(NIL_SIZED, basic A)`). Lean has no separate type-
+            // ID channel; we use real distinct opaque types from the
+            // prelude.
+            //
+            // Other decorations (Ghost, Tracked, Never, ConstPtr) stay
+            // transparent — they're verification metadata or zero-cost
+            // markers, not types user code observes at the spec level.
+            use vir::ast::TypDecoration;
+            match deco {
+                TypDecoration::Ref => applied("Tactus.Ref", vec![typ_to_expr(inner)]),
+                TypDecoration::MutRef => applied("Tactus.MutRef", vec![typ_to_expr(inner)]),
+                TypDecoration::Box => applied("Tactus.Box", vec![typ_to_expr(inner)]),
+                TypDecoration::Rc => applied("Tactus.Rc", vec![typ_to_expr(inner)]),
+                TypDecoration::Arc => applied("Tactus.Arc", vec![typ_to_expr(inner)]),
+                TypDecoration::Ghost | TypDecoration::Tracked
+                | TypDecoration::Never | TypDecoration::ConstPtr => typ_to_node(inner),
+            }
+        }
         TypX::Projection { trait_typ_args, trait_path, name } => {
             // <Self as Trait>::AssocType → Trait.AssocType Self …
             let head = format!("{}.{}", lean_name(trait_path), name);
@@ -180,7 +208,6 @@ fn typ_to_node(typ: &TypX) -> ExprNode {
             applied(&lean_name(def_path), args.iter().map(|a| typ_to_expr(a)).collect())
         }
         TypX::PointeeMetadata(_) => lit_var("Nat"),
-        TypX::MutRef(inner) => typ_to_node(inner),
         TypX::Air(_) => panic!("TypX::Air should not appear in Tactus translation"),
     }
 }

@@ -1,5 +1,6 @@
 //! Translate VIR-AST expressions to `lean_ast::Expr`.
 
+use std::collections::HashMap;
 use vir::ast::*;
 use crate::expr_shared::{
     apply_clip_coercion, binop_to_ast, const_to_node_common, ctor_node, field_access_name,
@@ -11,9 +12,177 @@ use crate::lean_ast::{
 };
 use crate::to_lean_type::{lean_name, sanitize, short_name, typ_to_expr};
 
-/// Build a `lean_ast::Expr` from a VIR-AST expression.
+/// Binder context: maps in-scope variable names to their declared types.
+/// Threaded through the renderer so `Var(p)` can compare its tagged
+/// `expr.typ` to `p`'s actual binder type — if they differ in reference
+/// decorations (because Verus's `add_vir_ref_decoration` adjustment
+/// decorated the Var's typ without changing the binder), the renderer
+/// inserts explicit `Tactus.X.mk` wraps to bridge.
+pub(crate) type BinderCtx = HashMap<VarIdent, Typ>;
+
+/// Build a binder context from a function's params. Used by callers
+/// (spec_fn_to_ast, proof_fn_to_ast, trait_impl_to_ast, trait_to_ast)
+/// to seed the renderer with the fn's params as the initial in-scope
+/// binders.
+pub(crate) fn binder_ctx_from_params(params: &Params) -> BinderCtx {
+    let mut out = BinderCtx::new();
+    for p in params.iter() {
+        out.insert(p.x.name.clone(), p.x.typ.clone());
+    }
+    out
+}
+
+/// Build a `lean_ast::Expr` from a VIR-AST expression with no enclosing
+/// binders. Use `vir_expr_to_ast_with_binders` from inside a fn body to
+/// pass the fn's params as initial context.
 pub fn vir_expr_to_ast(expr: &Expr) -> LExpr {
-    LExpr::new(expr_to_node(expr))
+    vir_expr_to_ast_with_binders(expr, &BinderCtx::new())
+}
+
+/// Build a `lean_ast::Expr` from a VIR-AST expression with the given
+/// binder context. Inserts `Tactus.X.mk` wraps where:
+/// * `expr.x` is `Const` / `Ctor` / `ArrayLiteral` (structurally
+///   undecorated kinds) and `expr.typ` has reference decorations.
+/// * `expr.x` is `Var(p)` / `VarLoc(p)` / `VarAt(p, _)` and `p`'s
+///   binder typ has FEWER reference decorations than `expr.typ` (Verus's
+///   auto-`&` adjustment on a Var leaves the binder untouched).
+pub(crate) fn vir_expr_to_ast_with_binders(expr: &Expr, binders: &BinderCtx) -> LExpr {
+    let rendered = LExpr::new(expr_to_node(expr, binders));
+    apply_ref_coercion_if_needed(expr, rendered, binders)
+}
+
+/// Compute the "structural" type of an expression — the type its Lean
+/// rendering naturally produces, ignoring Verus's adjustment-driven
+/// decorations on `expr.typ`. Returns `None` for kinds where we trust
+/// `expr.typ` (e.g., `Call`, `Binary`, `Unary` — Verus's typing for
+/// these matches what the rendering produces).
+///
+/// Used to compute the delta between `expr.typ` and what the rendering
+/// produces, so we can insert explicit `Tactus.X.mk` wraps to bridge.
+fn structural_typ(expr: &Expr, binders: &BinderCtx) -> Option<Typ> {
+    match &expr.x {
+        // Constructors and literals produce undecorated values.
+        ExprX::Const(_) | ExprX::Ctor(..) | ExprX::ArrayLiteral(_) => {
+            // Use the un-decorated form of expr.typ as the structural typ.
+            Some(strip_all_ref_decorations(&expr.typ.clone()))
+        }
+        // Variable references produce the binder's typ.
+        ExprX::Var(v) | ExprX::VarLoc(v) | ExprX::VarAt(v, _) => {
+            binders.get(v).cloned()
+        }
+        // ReadPlace's rendering drops the read kind, producing the
+        // place's typ. (The read kind, e.g., ImmutBor for auto-`&`,
+        // is what decorates expr.typ.)
+        ExprX::ReadPlace(p, _) => Some(p.typ.clone()),
+        // Pass-through expressions: natural typ is the inner's.
+        ExprX::Loc(inner) | ExprX::Ghost { expr: inner, .. }
+        | ExprX::ProofInSpec(inner) => structural_typ(inner, binders),
+        _ => None,
+    }
+}
+
+/// Strip every reference decoration layer from a typ (and `Boxed`/
+/// `MutRef`). Returns the deepest non-decorated `Arc<TypX>`.
+fn strip_all_ref_decorations(typ: &Typ) -> Typ {
+    match &**typ {
+        TypX::Decorate(deco, _, inner) if decoration_wrapper(*deco).is_some() => {
+            strip_all_ref_decorations(inner)
+        }
+        TypX::Boxed(inner) => strip_all_ref_decorations(inner),
+        TypX::MutRef(inner) => strip_all_ref_decorations(inner),
+        _ => typ.clone(),
+    }
+}
+
+/// Wrapper name (e.g., `"Tactus.Ref"`) for a reference-like decoration,
+/// or `None` for transparent ones (Ghost / Tracked / Never / ConstPtr).
+fn decoration_wrapper(deco: TypDecoration) -> Option<&'static str> {
+    match deco {
+        TypDecoration::Ref => Some("Tactus.Ref"),
+        TypDecoration::MutRef => Some("Tactus.MutRef"),
+        TypDecoration::Box => Some("Tactus.Box"),
+        TypDecoration::Rc => Some("Tactus.Rc"),
+        TypDecoration::Arc => Some("Tactus.Arc"),
+        TypDecoration::Ghost | TypDecoration::Tracked
+        | TypDecoration::Never | TypDecoration::ConstPtr => None,
+    }
+}
+
+/// Walk `typ` outermost-in, collecting Tactus wrapper names for each
+/// reference-like `TypX::Decorate` layer. Peels `Boxed` (Verus's poly
+/// encoding — Lean-transparent) and skips non-reference decorations.
+/// Stops at the first non-Decorate-non-Boxed node.
+fn collect_ref_wraps(typ: &TypX) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let mut cur = typ;
+    loop {
+        match cur {
+            TypX::Decorate(deco, _, inner) => {
+                if let Some(w) = decoration_wrapper(*deco) {
+                    out.push(w);
+                }
+                cur = &**inner;
+            }
+            TypX::Boxed(inner) => cur = &**inner,
+            TypX::MutRef(_) => {
+                out.push("Tactus.MutRef");
+                break;
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Apply wraps from innermost to outermost: `wraps[last]` is innermost.
+fn apply_ref_wraps(mut e: LExpr, wraps: &[&'static str]) -> LExpr {
+    for w in wraps.iter().rev() {
+        e = LExpr::app1(LExpr::var_lit(&format!("{}.mk", w)), e);
+    }
+    e
+}
+
+/// Count the number of reference-decoration layers in a typ (peeling
+/// `Boxed` transparently). `TypX::MutRef` counts as one layer too.
+fn count_ref_decorations(typ: &TypX) -> usize {
+    let mut n = 0;
+    let mut cur = typ;
+    loop {
+        match cur {
+            TypX::Decorate(deco, _, inner) => {
+                if decoration_wrapper(*deco).is_some() { n += 1; }
+                cur = &**inner;
+            }
+            TypX::Boxed(inner) => cur = &**inner,
+            TypX::MutRef(_) => { n += 1; break; }
+            _ => break,
+        }
+    }
+    n
+}
+
+fn apply_ref_coercion_if_needed(
+    expr: &Expr,
+    rendered: LExpr,
+    binders: &BinderCtx,
+) -> LExpr {
+    // Compute the "structural" typ — what the rendering naturally
+    // produces. If `expr.typ` has more reference decorations than
+    // structural, wrap with `Tactus.X.mk` for the extra layers.
+    let Some(natural) = structural_typ(expr, binders) else {
+        return rendered;
+    };
+    let natural_n = count_ref_decorations(&natural);
+    let expr_n = count_ref_decorations(&*expr.typ);
+    if expr_n > natural_n {
+        let wraps = collect_ref_wraps(&expr.typ);
+        // Take the outermost (expr_n - natural_n) wraps; the rest are
+        // already accounted for by the structural typ.
+        let extra = expr_n - natural_n;
+        apply_ref_wraps(rendered, &wraps[..extra])
+    } else {
+        rendered
+    }
 }
 
 /// Build `VarBinders<Typ>` → AST binders for proof/spec fn parameters.
@@ -39,7 +208,7 @@ fn apply(head: &str, args: Vec<LExpr>) -> ExprNode {
     LExpr::app(LExpr::var_lit(head), args).node
 }
 
-fn expr_to_node(expr: &Expr) -> ExprNode {
+fn expr_to_node(expr: &Expr, binders: &BinderCtx) -> ExprNode {
     match &expr.x {
         ExprX::Const(c) => const_to_node(c),
         ExprX::Var(ident) => ExprNode::Var(crate::lean_name::LeanName::from_var_ident(ident)),
@@ -57,7 +226,10 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
         ExprX::StaticVar(fun) | ExprX::ExecFnByName(fun) => ExprNode::Var(crate::lean_name::LeanName::from_path(&fun.path)),
 
         ExprX::Binary(op, lhs, rhs) => {
-            let (l, r) = (vir_expr_to_ast(lhs), vir_expr_to_ast(rhs));
+            let (l, r) = (
+                vir_expr_to_ast_with_binders(lhs, binders),
+                vir_expr_to_ast_with_binders(rhs, binders),
+            );
             match binop_to_ast(op) {
                 Some(l_op) => LExpr::binop(l_op, l, r).node,
                 // Non-structural: emit as `head lhs rhs` via App so the pp
@@ -67,10 +239,13 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
         }
 
         ExprX::BinaryOpr(BinaryOpr::ExtEq(_, _), lhs, rhs) => {
-            LExpr::eq(vir_expr_to_ast(lhs), vir_expr_to_ast(rhs)).node
+            LExpr::eq(
+                vir_expr_to_ast_with_binders(lhs, binders),
+                vir_expr_to_ast_with_binders(rhs, binders),
+            ).node
         }
 
-        ExprX::Unary(UnaryOp::Not, inner) => LExpr::not(vir_expr_to_ast(inner)).node,
+        ExprX::Unary(UnaryOp::Not, inner) => LExpr::not(vir_expr_to_ast_with_binders(inner, binders)).node,
         ExprX::Unary(UnaryOp::Clip { range, .. }, inner) => {
             // Shared `renders_as_lean_int` classifier + `clip_coercion_head`
             // from `expr_shared` — the VIR-AST and SST paths must agree on
@@ -83,26 +258,26 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
             use crate::to_lean_sst_expr::renders_as_lean_int;
             let src_int = matches!(&*inner.typ, TypX::Int(r) if renders_as_lean_int(r));
             let dst_int = renders_as_lean_int(range);
-            apply_clip_coercion(src_int, dst_int, vir_expr_to_ast(inner)).node
+            apply_clip_coercion(src_int, dst_int, vir_expr_to_ast_with_binders(inner, binders)).node
         }
         ExprX::Unary(UnaryOp::CoerceMode { .. }, inner)
-        | ExprX::Unary(UnaryOp::Trigger(_), inner) => expr_to_node(inner),
+        | ExprX::Unary(UnaryOp::Trigger(_), inner) => expr_to_node(inner, binders),
 
         ExprX::Unary(UnaryOp::BitNot(_), inner) => apply(
             "Complement.complement",
-            vec![vir_expr_to_ast(inner)],
+            vec![vir_expr_to_ast_with_binders(inner, binders)],
         ),
         ExprX::Unary(UnaryOp::IntToReal, inner) => {
-            LExpr::type_annot(vir_expr_to_ast(inner), LExpr::var_lit("Real")).node
+            LExpr::type_annot(vir_expr_to_ast_with_binders(inner, binders), LExpr::var_lit("Real")).node
         }
         ExprX::Unary(UnaryOp::RealToInt, inner) => apply(
             "Int.floor",
-            vec![vir_expr_to_ast(inner)],
+            vec![vir_expr_to_ast_with_binders(inner, binders)],
         ),
-        ExprX::Unary(UnaryOp::FloatToBits, inner) => expr_to_node(inner),
-        ExprX::Unary(UnaryOp::IeeeFloat(_), inner) => expr_to_node(inner),
+        ExprX::Unary(UnaryOp::FloatToBits, inner) => expr_to_node(inner, binders),
+        ExprX::Unary(UnaryOp::IeeeFloat(_), inner) => expr_to_node(inner, binders),
         // Remaining unary ops: transparent annotations/markers/internal ops.
-        ExprX::Unary(_, inner) => expr_to_node(inner),
+        ExprX::Unary(_, inner) => expr_to_node(inner, binders),
 
         ExprX::Call(target, args, _) => {
             // Class-method calls (Dynamic / DynamicResolved) use Lean's
@@ -137,7 +312,7 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
                 // disambiguation matters anyway (literals inside
                 // Ctors of generic types).
                 let app_args: Vec<LExpr> = args.iter().map(|a| {
-                    let arg_node = vir_expr_to_ast(a);
+                    let arg_node = vir_expr_to_ast_with_binders(a, binders);
                     if typ_contains_param(&a.typ) {
                         arg_node
                     } else {
@@ -161,19 +336,23 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
                     }
                 }
             } else {
-                call_to_node(target, args)
+                call_to_node(target, args, binders)
             }
         }
 
         ExprX::If(cond, then_e, else_e) => ExprNode::If {
-            cond: Box::new(vir_expr_to_ast(cond)),
-            then_: Box::new(vir_expr_to_ast(then_e)),
-            else_: else_e.as_ref().map(|e| Box::new(vir_expr_to_ast(e))),
+            cond: Box::new(vir_expr_to_ast_with_binders(cond, binders)),
+            then_: Box::new(vir_expr_to_ast_with_binders(then_e, binders)),
+            else_: else_e.as_ref().map(|e| Box::new(vir_expr_to_ast_with_binders(e, binders))),
         },
 
-        ExprX::Quant(quant, binders, body) => {
-            let l_binders = vir_var_binders_to_ast(binders);
-            let body = Box::new(vir_expr_to_ast(body));
+        ExprX::Quant(quant, q_binders, body) => {
+            let l_binders = vir_var_binders_to_ast(q_binders);
+            let mut extended = binders.clone();
+            for b in q_binders.iter() {
+                extended.insert(b.name.clone(), b.a.clone());
+            }
+            let body = Box::new(vir_expr_to_ast_with_binders(body, &extended));
             match quant.quant {
                 air::ast::Quant::Forall => ExprNode::Forall { binders: l_binders, body },
                 air::ast::Quant::Exists => ExprNode::Exists { binders: l_binders, body },
@@ -184,21 +363,31 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
             // `Classical.epsilon (fun (x : T) ... => P)` — the epsilon operator
             // returns *some* witness satisfying P if one exists. No existence
             // proof is required because `Classical.epsilon` is total.
+            let mut extended = binders.clone();
+            for b in params.iter() {
+                extended.insert(b.name.clone(), b.a.clone());
+            }
             let lambda = LExpr::new(ExprNode::Lambda {
                 binders: vir_var_binders_to_ast(params),
-                body: Box::new(vir_expr_to_ast(cond)),
+                body: Box::new(vir_expr_to_ast_with_binders(cond, &extended)),
             });
             LExpr::app1(LExpr::var_lit("Classical.epsilon"), lambda).node
         }
 
-        ExprX::WithTriggers { body, .. } => expr_to_node(body),
+        ExprX::WithTriggers { body, .. } => expr_to_node(body, binders),
 
-        ExprX::Block(stmts, final_expr) => block_to_node(stmts, final_expr.as_ref()),
+        ExprX::Block(stmts, final_expr) => block_to_node(stmts, final_expr.as_ref(), binders),
 
-        ExprX::Closure(params, body) => ExprNode::Lambda {
-            binders: vir_var_binders_to_ast(params),
-            body: Box::new(vir_expr_to_ast(body)),
-        },
+        ExprX::Closure(params, body) => {
+            let mut extended = binders.clone();
+            for b in params.iter() {
+                extended.insert(b.name.clone(), b.a.clone());
+            }
+            ExprNode::Lambda {
+                binders: vir_var_binders_to_ast(params),
+                body: Box::new(vir_expr_to_ast_with_binders(body, &extended)),
+            }
+        }
 
         // Exec-mode closure: also a Lean lambda. The closure's
         // requires/ensures aren't part of the lambda VALUE — they
@@ -208,51 +397,55 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
         // `StmX::ClosureInner`'s `ast_body` field; the proof-fn pipeline
         // doesn't see exec closures (its panic arm catches that).
         ExprX::NonSpecClosure { params, body, requires: _, ensures: _, .. } => {
+            let mut extended = binders.clone();
+            for b in params.iter() {
+                extended.insert(b.name.clone(), b.a.clone());
+            }
             ExprNode::Lambda {
                 binders: vir_var_binders_to_ast(params),
-                body: Box::new(vir_expr_to_ast(body)),
+                body: Box::new(vir_expr_to_ast_with_binders(body, &extended)),
             }
         }
 
         ExprX::Ctor(dt, variant, fields, update) => {
             if let Some(tail) = update {
                 ExprNode::StructUpdate {
-                    base: Box::new(place_to_expr(&tail.place.x)),
+                    base: Box::new(place_to_expr(&tail.place.x, binders)),
                     updates: fields.iter().map(|f|
-                        (sanitize(&f.name), vir_expr_to_ast(&f.a))
+                        (sanitize(&f.name), vir_expr_to_ast_with_binders(&f.a, binders))
                     ).collect(),
                 }
             } else {
-                ctor_to_node(dt, variant, fields)
+                ctor_to_node(dt, variant, fields, binders)
             }
         }
 
         ExprX::Match(place, arms) => ExprNode::Match {
-            scrutinee: Box::new(place_to_expr(&place.x)),
+            scrutinee: Box::new(place_to_expr(&place.x, binders)),
             arms: arms.iter().map(|arm| LMatchArm {
                 pattern: pattern_to_ast(&arm.x.pattern.x),
-                body: vir_expr_to_ast(&arm.x.body),
+                body: vir_expr_to_ast_with_binders(&arm.x.body, binders),
             }).collect(),
         },
 
-        ExprX::Ghost { expr, .. } | ExprX::ProofInSpec(expr) => expr_to_node(expr),
-        ExprX::Loc(expr) => expr_to_node(expr),
+        ExprX::Ghost { expr, .. } | ExprX::ProofInSpec(expr) => expr_to_node(expr, binders),
+        ExprX::Loc(expr) => expr_to_node(expr, binders),
 
-        ExprX::ReadPlace(place, _) => place_to_expr(&place.x).node,
+        ExprX::ReadPlace(place, _) => place_to_expr(&place.x, binders).node,
 
-        ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => expr_to_node(inner),
+        ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => expr_to_node(inner, binders),
         ExprX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
-            LExpr::field_proj(vir_expr_to_ast(inner), field_access_name(field_opr)).node
+            LExpr::field_proj(vir_expr_to_ast_with_binders(inner, binders), field_access_name(field_opr)).node
         }
         ExprX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => {
-            is_variant_node(variant, vir_expr_to_ast(inner))
+            is_variant_node(variant, vir_expr_to_ast_with_binders(inner, binders))
         }
         ExprX::UnaryOpr(UnaryOpr::HasType(t), inner) => {
             // Refinement invariant: `e < 2^n` for `U(n)`, `-2^(n-1) ≤ e ∧
             // e < 2^(n-1)` for `I(n)`, etc. Mirrors the `to_lean_sst_expr`
             // version — proof fns and exec fns must agree on what
             // `HasType` means.
-            let e_ast = vir_expr_to_ast(inner);
+            let e_ast = vir_expr_to_ast_with_binders(inner, binders);
             crate::to_lean_sst_expr::type_bound_predicate(&e_ast, t)
                 .map(|pred| pred.node)
                 .unwrap_or(ExprNode::LitBool(true))
@@ -263,8 +456,8 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
             // helper so the two paths can't drift.
             crate::to_lean_sst_expr::integer_type_bound_from_vir(kind, inner).node
         }
-        ExprX::UnaryOpr(UnaryOpr::CustomErr(_), inner) => expr_to_node(inner),
-        ExprX::UnaryOpr(_, inner) => expr_to_node(inner),
+        ExprX::UnaryOpr(UnaryOpr::CustomErr(_), inner) => expr_to_node(inner, binders),
+        ExprX::UnaryOpr(_, inner) => expr_to_node(inner, binders),
 
         ExprX::NullaryOpr(NullaryOpr::ConstGeneric(typ)) => {
             // const generic parameter used as a value — the VIR typ is the
@@ -292,7 +485,7 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
                 "ExprX::Multi(Chained): expected {} operands for {} ops, got {}",
                 ops.len() + 1, ops.len(), exprs.len(),
             );
-            let rendered: Vec<LExpr> = exprs.iter().map(|e| vir_expr_to_ast(e)).collect();
+            let rendered: Vec<LExpr> = exprs.iter().map(|e| vir_expr_to_ast_with_binders(e, binders)).collect();
             let pairs: Vec<LExpr> = ops.iter().enumerate().map(|(i, op)| {
                 let l_op = match op {
                     ChainedOp::Inequality(InequalityOp::Le) => crate::lean_ast::BinOp::Le,
@@ -306,7 +499,7 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
             crate::lean_ast::and_all(pairs).node
         }
         ExprX::ArrayLiteral(exprs) => {
-            ExprNode::ArrayLit(exprs.iter().map(|e| vir_expr_to_ast(e)).collect())
+            ExprNode::ArrayLit(exprs.iter().map(|e| vir_expr_to_ast_with_binders(e, binders)).collect())
         }
 
         // `ExprX::Header` is a requires/ensures marker that VIR
@@ -342,10 +535,10 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
         ExprX::AssertAssume { expr: e, .. }
         | ExprX::AssertAssumeUserDefinedTypeInvariant { expr: e, .. }
         | ExprX::AssertCompute(e, _)
-        | ExprX::NeverToAny(e) => expr_to_node(e),
-        ExprX::AssertBy { ensure, .. } => expr_to_node(ensure),
+        | ExprX::NeverToAny(e) => expr_to_node(e, binders),
+        ExprX::AssertBy { ensure, .. } => expr_to_node(ensure, binders),
         ExprX::AssertQuery { .. } => ExprNode::LitBool(true),
-        ExprX::OpenInvariant(_, _, body, _) => expr_to_node(body),
+        ExprX::OpenInvariant(_, _, body, _) => expr_to_node(body, binders),
 
         // `ExprX::Old(e)` wraps the inner expression for well-
         // formedness checking ("ignored after these checks are
@@ -353,10 +546,10 @@ fn expr_to_node(expr: &Expr) -> ExprNode {
         // reference uses `ExprX::VarAt(x, Pre)`, which we render
         // distinctly via `varat_pre_name` for &mut callee-spec
         // inlining (#55). For this arm: render the inner unchanged.
-        ExprX::Old(e) | ExprX::EvalAndResolve(_, e) => expr_to_node(e),
+        ExprX::Old(e) | ExprX::EvalAndResolve(_, e) => expr_to_node(e, binders),
         ExprX::BorrowMut(_) | ExprX::TwoPhaseBorrowMut(_)
         | ExprX::BorrowMutTracked(_) => ExprNode::Var(crate::lean_name::LeanName::lit("()")),
-        ExprX::ImplicitReborrowOrSpecRead(place, _, _) => place_to_expr(&place.x).node,
+        ExprX::ImplicitReborrowOrSpecRead(place, _, _) => place_to_expr(&place.x, binders).node,
     }
 }
 
@@ -408,7 +601,7 @@ pub(crate) fn typ_contains_param(typ: &TypX) -> bool {
 /// `expr_to_node`'s `ExprX::Call` arm — those need TypeAnnot
 /// wrapping for generic disambiguation (see `expr_to_node`). So
 /// only Static (and FnSpec / BuiltinSpecFun) calls reach here.
-fn call_to_node(target: &CallTarget, args: &Exprs) -> ExprNode {
+fn call_to_node(target: &CallTarget, args: &Exprs, binders: &BinderCtx) -> ExprNode {
     let head = match target {
         CallTarget::Fun(_, fun, typs, _, _, _) => {
             // Emit explicit type arguments for generic calls by
@@ -423,7 +616,7 @@ fn call_to_node(target: &CallTarget, args: &Exprs) -> ExprNode {
                 })
             }
         }
-        CallTarget::FnSpec(inner) => vir_expr_to_ast(inner),
+        CallTarget::FnSpec(inner) => vir_expr_to_ast_with_binders(inner, binders),
         CallTarget::BuiltinSpecFun(_, typs, _) => {
             let base = var("builtinSpecFun");
             if typs.is_empty() {
@@ -441,7 +634,7 @@ fn call_to_node(target: &CallTarget, args: &Exprs) -> ExprNode {
     } else {
         ExprNode::App {
             head: Box::new(head),
-            args: args.iter().map(|a| vir_expr_to_ast(a)).collect(),
+            args: args.iter().map(|a| vir_expr_to_ast_with_binders(a, binders)).collect(),
         }
     }
 }
@@ -458,8 +651,8 @@ fn trait_method_ref(fun: &Fun) -> LExpr {
 }
 
 
-fn ctor_to_node(dt: &Dt, variant: &Ident, fields: &Binders<Expr>) -> ExprNode {
-    let rendered = fields.iter().map(|f| vir_expr_to_ast(&f.a)).collect();
+fn ctor_to_node(dt: &Dt, variant: &Ident, fields: &Binders<Expr>, binders: &BinderCtx) -> ExprNode {
+    let rendered = fields.iter().map(|f| vir_expr_to_ast_with_binders(&f.a, binders)).collect();
     ctor_node(dt, variant, rendered)
 }
 
@@ -471,9 +664,9 @@ fn ctor_to_node(dt: &Dt, variant: &Ident, fields: &Binders<Expr>) -> ExprNode {
 /// * `StmtX::Expr(e)` with a following statement  →  `let _ := e; rest`
 ///   (drops the value like Rust's `;` does).
 /// * Last stmt with no `final_expr` is the body.
-fn block_to_node(stmts: &[Stmt], final_expr: Option<&Expr>) -> ExprNode {
+fn block_to_node(stmts: &[Stmt], final_expr: Option<&Expr>, binders: &BinderCtx) -> ExprNode {
     let body = match final_expr {
-        Some(e) => vir_expr_to_ast(e),
+        Some(e) => vir_expr_to_ast_with_binders(e, binders),
         None if stmts.is_empty() => LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("()"))),
         // No final expression — the last stmt's value is the block's value.
         // In spec mode this is unusual; fall back to unit.
@@ -485,7 +678,7 @@ fn block_to_node(stmts: &[Stmt], final_expr: Option<&Expr>) -> ExprNode {
         folded = match &stmt.x {
             StmtX::Decl { pattern, init, .. } => {
                 let value = match init {
-                    Some(place) => place_to_expr(&place.x),
+                    Some(place) => place_to_expr(&place.x, binders),
                     // No initializer (e.g., `let x;`) — give a placeholder.
                     None => LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("_"))),
                 };
@@ -506,7 +699,7 @@ fn block_to_node(stmts: &[Stmt], final_expr: Option<&Expr>) -> ExprNode {
             }
             StmtX::Expr(e) => LExpr::new(ExprNode::Let {
                 name: crate::lean_name::LeanName::lit("_"),
-                value: Box::new(vir_expr_to_ast(e)),
+                value: Box::new(vir_expr_to_ast_with_binders(e, binders)),
                 body: Box::new(folded),
             }),
         };
@@ -545,13 +738,13 @@ pub(crate) fn pattern_to_ast(pat: &PatternX) -> LPattern {
             name: crate::lean_name::LeanName::from_var_ident(&binding.name),
             sub: Box::new(pattern_to_ast(&sub_pat.x)),
         },
-        PatternX::Expr(e) => LPattern::Lit(expr_to_node(e)),
+        PatternX::Expr(e) => LPattern::Lit(expr_to_node(e, &BinderCtx::new())),
         PatternX::Range(lo, _hi) => {
             // Lean doesn't have numeric range patterns; fall back to the low
             // bound (or wildcard if absent). Range patterns are rare in spec
             // mode (ast_simplify usually eliminates Match).
             match lo {
-                Some(e) => LPattern::Lit(expr_to_node(e)),
+                Some(e) => LPattern::Lit(expr_to_node(e, &BinderCtx::new())),
                 None => LPattern::Wildcard,
             }
         }
@@ -561,21 +754,21 @@ pub(crate) fn pattern_to_ast(pat: &PatternX) -> LPattern {
 
 // ── Places ──────────────────────────────────────────────────────────────
 
-fn place_to_expr(place: &PlaceX) -> LExpr {
+fn place_to_expr(place: &PlaceX, binders: &BinderCtx) -> LExpr {
     LExpr::new(match place {
         PlaceX::Local(ident) => ExprNode::Var(crate::lean_name::LeanName::from_var_ident(ident)),
         PlaceX::Field(field_opr, base) => ExprNode::FieldProj {
-            expr: Box::new(place_to_expr(&base.x)),
+            expr: Box::new(place_to_expr(&base.x, binders)),
             field: field_access_name(field_opr),
         },
         PlaceX::DerefMut(inner) | PlaceX::ModeUnwrap(inner, _) => {
-            return place_to_expr(&inner.x);
+            return place_to_expr(&inner.x, binders);
         }
-        PlaceX::Temporary(expr) => return vir_expr_to_ast(expr),
-        PlaceX::WithExpr(_, place) => return place_to_expr(&place.x),
+        PlaceX::Temporary(expr) => return vir_expr_to_ast_with_binders(expr, binders),
+        PlaceX::WithExpr(_, place) => return place_to_expr(&place.x, binders),
         PlaceX::Index(base, idx, _, _) => ExprNode::Index {
-            base: Box::new(place_to_expr(&base.x)),
-            idx: Box::new(vir_expr_to_ast(idx)),
+            base: Box::new(place_to_expr(&base.x, binders)),
+            idx: Box::new(vir_expr_to_ast_with_binders(idx, binders)),
             // Place-position indexing in proof fns is rare and usually
             // sees the bounds proof in scope (legacy mut-ref code).
             // Keep the plain `[idx]` form here; add `!` only when we
@@ -583,7 +776,7 @@ fn place_to_expr(place: &PlaceX) -> LExpr {
             bang: false,
         },
         PlaceX::UserDefinedTypInvariantObligation(inner, _) => {
-            return place_to_expr(&inner.x);
+            return place_to_expr(&inner.x, binders);
         }
     })
 }
