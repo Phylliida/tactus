@@ -28,6 +28,144 @@ pub(crate) fn raw_span_data(raw_span: &vir::messages::RawSpan) -> Option<SpanDat
     x.downcast_ref::<SpanData>().copied()
 }
 
+/// Track files whose `SourceFile.src` has already been swapped to the
+/// original (un-sanitized) content for diagnostic rendering.
+/// Idempotent — once a file is swapped, subsequent emissions render
+/// against the same original content without needing another swap.
+static SWAPPED_FILES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>> =
+    std::sync::OnceLock::new();
+
+/// Recompute `multibyte_chars` for a source string. Each non-ASCII char
+/// in valid UTF-8 starts at a byte ≥ 128; its length determines the
+/// `MultiByteChar` entry (which records `(pos, byte_length)` for visual
+/// column accounting). Matches rustc's logic in
+/// `rustc_span::analyze_source_file::analyze_source_file_short` —
+/// reproduced here because rustc's helper is `pub(crate)`.
+fn compute_multibyte_chars(s: &str) -> Vec<rustc_span::MultiByteChar> {
+    use rustc_span::{MultiByteChar, RelativeBytePos};
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let len: u8 = if b < 0x80 {
+            1
+        } else if b < 0xE0 {
+            2
+        } else if b < 0xF0 {
+            3
+        } else {
+            4
+        };
+        if len > 1 {
+            out.push(MultiByteChar {
+                pos: RelativeBytePos(i as u32),
+                bytes: len,
+            });
+        }
+        i += len as usize;
+    }
+    out
+}
+
+/// Swap a `SourceFile`'s in-memory source from the FileLoader-sanitized
+/// content (blank spaces inside tactic blocks) to the original content
+/// (real tactic text), so rustc's diagnostic renderer shows what the
+/// user wrote rather than the blank-space lexer view.
+///
+/// Idempotent per `file_path` — once a file is swapped, this is a
+/// no-op for subsequent calls. Tracks swapped files in
+/// [`SWAPPED_FILES`].
+///
+/// Returns `true` if a swap happened (or had already happened on a
+/// prior call). Returns `false` if the file isn't in our cache (e.g.,
+/// loaded outside `TactusFileLoader`) or no `SourceFile` matches.
+///
+/// ## Safety
+///
+/// This writes through a raw `*mut SourceFile` derived from
+/// `Arc::as_ptr`. The write is safe under two invariants:
+///
+/// 1. **Single-threaded reader.** `Reporter::report_as` runs on the
+///    main thread (the only thread that calls rustc's diagnostic
+///    renderer, which is the only reader of `sf.src`). Workers
+///    queue `Message` values over an mpsc channel — they hold vir
+///    `Span`s with `BytePos` values, not `Arc<SourceFile>`, and
+///    never read `sf.src`.
+///
+/// 2. **No concurrent mutation.** rustc creates `SourceFile`s during
+///    file load and doesn't mutate them after. Our swap is the only
+///    write to `sf.src` after construction, and it happens on the
+///    main thread before any rendering (by virtue of being called
+///    from `report_as` itself).
+///
+/// We also update `sf.multibyte_chars` because the sanitized content
+/// contains no multi-byte chars (every byte was replaced with ASCII
+/// space) while the original may. Without this update, rustc's visual
+/// column accounting would treat each byte of a multi-byte char as a
+/// column, drawing 3-wide carets under what visually displays as a
+/// 1-column `≠`. `lines` and `normalized_pos` don't need updating —
+/// the sanitizer preserves `\n` and `\r` byte-for-byte, so newline
+/// positions and CRLF normalization match between sanitized and
+/// original.
+pub fn swap_source_for_diagnostics(
+    source_map: &rustc_span::source_map::SourceMap,
+    file_path: &str,
+) -> bool {
+    use rustc_span::FileName;
+
+    let canonical = std::fs::canonicalize(file_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(file_path));
+
+    {
+        let swapped = SWAPPED_FILES
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+            .lock()
+            .unwrap();
+        if swapped.contains(&canonical) {
+            return true;
+        }
+    }
+
+    let original = match crate::file_loader::original_for_path(&canonical) {
+        Some(c) => c,
+        None => return false,
+    };
+
+    let sf_arc = source_map.files().iter().find(|sf| match &sf.name {
+        FileName::Real(real) => real
+            .local_path()
+            .and_then(|p| p.canonicalize().ok())
+            .map(|p| p == canonical)
+            .unwrap_or(false),
+        _ => false,
+    }).cloned();
+
+    let sf = match sf_arc {
+        Some(sf) => sf,
+        None => return false,
+    };
+
+    let new_multibyte_chars = compute_multibyte_chars(&original);
+
+    // SAFETY: See the doc-comment's safety section above. We take a
+    // `*mut SourceFile` from the `Arc::as_ptr` and write `src` +
+    // `multibyte_chars`. Single-threaded reader (`Reporter::report_as`
+    // on main); no concurrent writes.
+    unsafe {
+        let sf_ptr = std::sync::Arc::as_ptr(&sf) as *mut rustc_span::SourceFile;
+        (*sf_ptr).src = Some(original);
+        (*sf_ptr).multibyte_chars = new_multibyte_chars;
+    }
+
+    SWAPPED_FILES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap()
+        .insert(canonical);
+    true
+}
+
 // Note: this only returns Some for Spans in the local crate
 // WARNING: this should only be called from rustc's thread, not from a Verus worker thread,
 // because rustc may use its thread-local storage in .span().

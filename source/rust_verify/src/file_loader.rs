@@ -4,12 +4,44 @@
 //! and replaces their content with spaces. Byte offsets are preserved so
 //! `Span::byte_range()` still works. The verifier reads the original file
 //! later to recover verbatim tactic text.
+//!
+//! ## Original-content cache for diagnostic rendering
+//!
+//! At file-load time, we also cache the original (un-sanitized) content
+//! in a static map. At Tactus diagnostic emission time, `spans.rs` looks
+//! up the original and swaps it into rustc's `SourceFile.src` so the
+//! rendered `-->` preview shows real tactic content (`omega`, etc.) rather
+//! than the blank spaces the lexer saw. See
+//! `spans::swap_source_for_diagnostics` for the swap mechanics.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// FileLoader that sanitizes tactic blocks before rustc lexes the source.
 pub struct TactusFileLoader;
+
+/// Cache of original (un-sanitized) file contents, populated by `read_file`
+/// and consumed by `spans::swap_source_for_diagnostics`. Keyed by
+/// canonicalized path so loader-side and swap-side agree even when they
+/// observe different relative paths.
+static ORIGINAL_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<String>>>> = OnceLock::new();
+
+fn cache_original(path: PathBuf, content: Arc<String>) {
+    ORIGINAL_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(path, content);
+}
+
+/// Look up the original content for a file. Returns `None` if the file
+/// wasn't loaded through this `FileLoader` (e.g., stdlib crates loaded by
+/// rustc's default mechanism).
+pub fn original_for_path(path: &Path) -> Option<Arc<String>> {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    ORIGINAL_CACHE.get()?.lock().unwrap().get(&canonical).cloned()
+}
 
 impl rustc_span::source_map::FileLoader for TactusFileLoader {
     fn file_exists(&self, path: &Path) -> bool {
@@ -18,6 +50,11 @@ impl rustc_span::source_map::FileLoader for TactusFileLoader {
 
     fn read_file(&self, path: &Path) -> Result<String, std::io::Error> {
         let source = std::fs::read_to_string(path)?;
+        // Cache the original BEFORE sanitization so diagnostic-time swaps
+        // can recover the real tactic content. Key by canonical path to
+        // match what `spans.rs` looks up later.
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        cache_original(canonical, Arc::new(source.clone()));
         Ok(sanitize_tactic_blocks(&source))
     }
 
@@ -41,7 +78,12 @@ fn sanitize_tactic_blocks(source: &str) -> String {
     let mut out = source.as_bytes().to_vec();
     for (start, end) in ranges {
         for i in start..end {
-            if out[i] != b'\n' {
+            // Preserve `\n` (line breaks) and `\r` (so CRLF line endings
+            // survive intact — otherwise rustc's `normalize_src` would see
+            // bare `\n` in sanitized files and CRLF in the original, and
+            // the per-file `normalized_pos` table would differ between
+            // the two views, breaking the diagnostic-time swap).
+            if out[i] != b'\n' && out[i] != b'\r' {
                 out[i] = b' ';
             }
         }

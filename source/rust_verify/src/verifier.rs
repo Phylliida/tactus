@@ -81,6 +81,28 @@ impl air::messages::Diagnostics for Reporter<'_> {
         let msg: &MessageX =
             msg.downcast_ref().expect("unexpected value in Any -> Message conversion");
 
+        // Tactus: swap `SourceFile.src` from the FileLoader-sanitized
+        // version (blank spaces inside tactic blocks) to the original
+        // content before rustc renders the source preview, so users see
+        // real tactic text (`omega`, etc.) under the `-->` arrow. Pulls
+        // the file path from each span's pre-resolved `start_loc`
+        // (`file:line:col`). Idempotent — `swap_source_for_diagnostics`
+        // memoizes per file. No-op for non-Tactus paths (files not in
+        // the `TactusFileLoader` cache).
+        for sp in &msg.spans {
+            if !sp.start_loc.is_empty() {
+                if let Some(last) = sp.start_loc.rfind(':') {
+                    let rest = &sp.start_loc[..last];
+                    if let Some(second) = rest.rfind(':') {
+                        let path = &rest[..second];
+                        if !path.is_empty() {
+                            crate::spans::swap_source_for_diagnostics(self.source_map, path);
+                        }
+                    }
+                }
+            }
+        }
+
         let mut v: Vec<Span> = Vec::new();
         for sp in &msg.spans {
             if let Some(span) = self.spans.from_air_span(&sp, Some(self.source_map)) {
@@ -397,7 +419,15 @@ impl FuncDetails {
 /// signature) and whose `help` carries the generated `.lean` path
 /// for offline inspection. Falls back to `fn_span` when the
 /// diagnostic doesn't carry a span (pre-Lean rejections like
-/// sanity-check failures, and proof-fn diagnostics today).
+/// sanity-check failures).
+///
+/// Before reporting, this also asks `spans::swap_source_for_diagnostics`
+/// to swap the relevant `SourceFile.src` from the FileLoader-sanitized
+/// content (blank spaces inside tactic blocks) to the original content,
+/// so rustc renders the `-->` preview with real tactic text. Idempotent
+/// per file; safe to call on every emission. Falls through silently if
+/// `source_map` is unavailable (worker-thread `QueuedReporter`) or the
+/// file wasn't loaded through `TactusFileLoader`.
 fn emit_tactus_diag(
     reporter: &impl Diagnostics,
     diag: lean_verify::TactusDiag,
