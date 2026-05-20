@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**425 end-to-end tests + 1 coverage test + 195 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**435 end-to-end tests + 1 coverage test + 209 unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -5478,6 +5478,158 @@ fails with the Lean parse error), then read the generated Lean.
 The "guess what AST node" approach the prior session implied
 would have led me astray; the "narrow with probes, read the
 emitted Lean" approach landed the fix in one iteration.
+
+#### Current session (2026-05-19 continued — error-span UX arc: obligation-site `-->`, proof-fn body-lines, source preview swap)
+
+User reported a workflow tax: every `tactus_auto` Lean failure
+emitted a single rust_verify error attached to `fn_span`, so the
+`-->` arrow always pointed at the function signature line (e.g.
+`-->  file.rs:63:1`). The actual obligation location was buried
+in the message body as `at file.rs:104:18:`. Their workflow was
+`verus file.rs 2>&1 | head -30` → mentally extract `104:18` →
+`vi file.rs +104`. Compounded across 5–10 failures per proof
+iteration, real time lost.
+
+Landed across three substantive commits + DESIGN.md
+documentation. Each was scope-disciplined; pushback from user
+twice caught me proposing more invasive options than needed.
+
+**Commit 1 (`a777f9a`) — exec-fn errors point at the obligation
+site.** Each Lean diagnostic gets its own rust_verify error with
+the obligation's `vir::messages::Span` as the primary span;
+rustc renders standard per-error `-->` line:col at the failing
+assert/invariant/call. Plumbing:
+* `ExprNode::SpanMark` and `SpanMarkLandmark` grow
+  `rust_span: Option<vir::messages::Span>` alongside the existing
+  string `loc`. The ~10 construction sites in `sst_to_lean.rs`
+  already had the obligation Span in hand (`&ens.span`,
+  `&inv.span`, `&call_span`, etc.); just clone-through.
+* `format_error` returns `FormattedDiag { message, rust_span }`
+  instead of just `String`.
+* `CheckResult::Failed` carries `Vec<TactusDiag>` (one per
+  failing obligation) instead of a single concatenated
+  `error: String`.
+* `verifier.rs` gets `emit_tactus_diag` helper that reports one
+  `MessageLevel::Error` per diag, used by both proof-fn and
+  exec-fn paths. Each error has `help: Some("generated .lean
+  file: ...")` so users can still `cat` the artifact.
+
+User feedback that shaped this: "I would prefer all errors were
+reported regardless of how noisy" — confirmed per-error reporting
+over collapse.
+
+**Commit 2 (`1ed726b`) — proof-fn errors point at the failing
+tactic line.** Each Lean diagnostic inside a `by { ... }` body
+gets a span pointing at the corresponding line in the user's
+`.rs` file. New plumbing:
+* `FormattedDiag` / `TactusDiag` grow
+  `proof_fn_body_line_offset: Option<usize>` (0-indexed line
+  offset within the user's tactic body).
+* `tactic_body_line_span` in `spans.rs`: takes parent span +
+  fn_start_loc + tactic_body byte range + line offset, computes
+  target `BytePos` via parent.lo + (target_file_byte -
+  fn_first_byte_in_file) delta. No `SourceMap` needed at
+  construction — works from verifier worker threads (where
+  source_map is None).
+* `raw_span_data` (new) reads a `SpanData` out of a `RawSpan`
+  via plain `downcast_ref::<SpanData>().copied()` — sidesteps
+  the rustc-thread warning from `from_raw_span` (which uses
+  `Span::data()`, an interner round-trip). The `unsafe`-free
+  way to get `BytePos` and `SyntaxContext` on a worker thread.
+* Construct a fresh `SpanData` directly (it's pub fields) and
+  `Arc::new(...)` as the RawSpan. No `Span::with_lo` /
+  `Span::data()` calls — those use the rustc thread-local
+  interner.
+
+The same-day chained-compare false-start (Path 1 in DESIGN.md's
+new "Alternatives rejected" list) — multi-byte
+`Pattern_White_Space` replacement (LRM/NEL) — turned out to be
+more complex than just recomputing `multibyte_chars`. User
+pushed back; we picked the simpler path.
+
+**Commit 3 (`68317dd`) — source preview shows original tactic
+content.** The proof-fn `-->` from commit 2 pointed at the right
+line but rustc rendered a blank preview, because
+FileLoader-sanitized content (blank spaces inside tactic
+blocks) is what rustc cached in `SourceFile.src`. Fix: at
+diagnostic emission time, swap `sf.src` back to the original
+content. Mechanism:
+* `TactusFileLoader::read_file` caches the original content per
+  canonical path in a static `OnceLock<Mutex<HashMap<PathBuf,
+  Arc<String>>>>` before sanitization.
+* Sanitizer extended to preserve `\r` (alongside `\n`) so CRLF
+  line endings don't desync `normalized_pos` between sanitized
+  and original.
+* `spans::swap_source_for_diagnostics` looks up the SourceFile,
+  recomputes `multibyte_chars` from original content via a
+  ~20-line UTF-8 byte-length helper (since rustc's
+  `analyze_source_file` is `pub(crate)`), writes both
+  `sf.src` and `sf.multibyte_chars` through a `*mut SourceFile`
+  derived from `Arc::as_ptr`. Memoized per file via static
+  `SWAPPED_FILES` set.
+* `Reporter::report_as` (which runs on the main thread, the
+  only consumer of `sf.src` via rustc's diagnostic renderer)
+  calls the swap helper for each span's file before forwarding
+  to rustc. The threaded path's `QueuedReporter` forwards
+  messages to the main thread which then calls `report_as`, so
+  the swap reliably runs before rendering.
+
+Safety of the `unsafe`: single-threaded reader (main reporter
+thread; workers hold `BytePos` values, not `Arc<SourceFile>`),
+no concurrent mutation (rustc creates SourceFiles at load and
+doesn't mutate after; our swap is the only post-construction
+write).
+
+Result: `--> test.rs:18:5` followed by `18 |     omega` followed
+by `|     ^^^^^`. Carets align correctly even on Unicode lines
+because `multibyte_chars` was recomputed.
+
+**Discipline notes worth recording**:
+
+* *Pushback shaped the design twice.* User's first pushback
+  rejected selective sanitization ("many reasons we listed in
+  DESIGN.md"). Second pushback rejected multi-byte
+  `Pattern_White_Space` replacement chars in favor of the simpler
+  recompute-on-swap. Both pushbacks were right — each time I was
+  reaching for "clever" where "boring" was sufficient.
+
+* *The byte-count-preserving sanitizer was already the right
+  thing.* The whole fix turned out to be "trust what the
+  sanitizer already did (preserve byte offsets), recover the
+  original content for display." Didn't need to fight any
+  existing decision.
+
+* *Avoid `from_raw_span` from worker threads.* It calls
+  `Span::data()` which uses rustc's thread-local interner and
+  prints a backtrace warning when called off-thread. New
+  `raw_span_data` helper does a plain downcast — same access,
+  no warning. Pattern: when a function wraps a simple operation
+  in caution-for-a-specific-case, sometimes the simple operation
+  is enough without the wrapping. (Captured in poem "the
+  wrapping the function did".)
+
+**Commit 4 (`0c39701`) — DESIGN.md documentation.** New
+subsection "Diagnostic source preview swap (landed 2026-05-19)"
+under the Unicode/sanitization chapter. Documents the fix
+mechanism, safety invariants, and six rejected alternatives:
+selective sanitization, tree-sitter-guided variant, append-to-
+message-body, drop-rustc-Span hand-render, multi-byte
+Pattern_White_Space replacement, fork-rustc_span,
+wrap-rustc-emitter. Each with one-paragraph why-not.
+
+**Test counts**: 425 → 435 e2e (+10 across the arc), 195 → 209
+unit. vstd 1530/0 unchanged. Six commits including the lakefile
+tutorial-helper registration (carried in working tree from prior
+tutorial work) and a poems commit ("hollow line" / "the wrapping
+the function did" / "one for one").
+
+**Caveats remaining**: none significant. CRLF handling is a
+pre-existing latent issue (sanitizer used to replace `\r` with
+space) — fixed as a side effect of this work. 4-byte UTF-8 chars
+in tactic bodies (emoji, mathematical symbols above U+FFFF)
+remain a tiny edge case — `multibyte_chars` recompute handles
+them correctly, but they're rare enough that no test exercises
+the path.
 
 ## Architecture
 
