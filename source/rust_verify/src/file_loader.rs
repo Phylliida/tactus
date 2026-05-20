@@ -344,6 +344,25 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
         assert_eq!(sanitized, "proof fn test() ensures true by {\n         \n}");
     }
 
+    /// CRLF preservation: `\r` must survive sanitization
+    /// alongside `\n`. Without this, sanitized files with CRLF
+    /// line endings would have bare `\n` where the original had
+    /// `\r\n`, and rustc's per-file `normalized_pos` table would
+    /// differ between the two views — breaking the diagnostic-
+    /// time `sf.src` swap in `spans::swap_source_for_diagnostics`
+    /// (which assumes `lines` and `normalized_pos` match between
+    /// sanitized and original by construction).
+    #[test]
+    fn test_tactic_block_preserves_cr() {
+        let src = "proof fn test() ensures true by {\r\n    omega\r\n}";
+        let sanitized = sanitize_tactic_blocks(src);
+        // Both `\r` and `\n` survive; only the `omega` content
+        // and surrounding spaces get blanked.
+        assert_eq!(sanitized, "proof fn test() ensures true by {\r\n         \r\n}");
+        // Byte count preserved.
+        assert_eq!(sanitized.len(), src.len());
+    }
+
     #[test]
     fn test_unicode_sanitized() {
         let src = "proof fn test() ensures true\nby {\n    intro ⟨a, b⟩\n}";

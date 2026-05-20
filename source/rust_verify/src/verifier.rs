@@ -90,16 +90,8 @@ impl air::messages::Diagnostics for Reporter<'_> {
         // memoizes per file. No-op for non-Tactus paths (files not in
         // the `TactusFileLoader` cache).
         for sp in &msg.spans {
-            if !sp.start_loc.is_empty() {
-                if let Some(last) = sp.start_loc.rfind(':') {
-                    let rest = &sp.start_loc[..last];
-                    if let Some(second) = rest.rfind(':') {
-                        let path = &rest[..second];
-                        if !path.is_empty() {
-                            crate::spans::swap_source_for_diagnostics(self.source_map, path);
-                        }
-                    }
-                }
+            if let Some((path, _, _)) = crate::spans::parse_file_line_col(&sp.start_loc) {
+                crate::spans::swap_source_for_diagnostics(self.source_map, path);
             }
         }
 
@@ -421,19 +413,36 @@ impl FuncDetails {
 /// diagnostic doesn't carry a span (pre-Lean rejections like
 /// sanity-check failures).
 ///
-/// Before reporting, this also asks `spans::swap_source_for_diagnostics`
-/// to swap the relevant `SourceFile.src` from the FileLoader-sanitized
-/// content (blank spaces inside tactic blocks) to the original content,
-/// so rustc renders the `-->` preview with real tactic text. Idempotent
-/// per file; safe to call on every emission. Falls through silently if
-/// `source_map` is unavailable (worker-thread `QueuedReporter`) or the
-/// file wasn't loaded through `TactusFileLoader`.
+/// The diagnostic-time `SourceFile.src` swap (which makes the
+/// rendered `-->` preview show real tactic content rather than
+/// FileLoader-sanitized spaces) happens later in
+/// `Reporter::report_as`, not here — the swap needs rustc's
+/// `SourceMap` which only the main-thread reporter holds, and
+/// running it once at the report level covers all message paths
+/// (Tactus + non-Tactus) uniformly.
 fn emit_tactus_diag(
     reporter: &impl Diagnostics,
     diag: lean_verify::TactusDiag,
     fn_span: &vir::messages::Span,
 ) {
-    let span = diag.rust_span.unwrap_or_else(|| fn_span.clone());
+    // `Direct` carries the obligation's span verbatim. The other
+    // two variants don't have a span we can use here:
+    //   * `ProofFnBodyLine` is resolved earlier (at the proof-fn
+    //     `Failed` branch in `verify_bucket`) where the fn's
+    //     `tactic_span` is in scope; by the time we reach
+    //     `emit_tactus_diag` it's been promoted to `Direct(span)`
+    //     if resolution succeeded.
+    //   * `Unknown` covers pre-Lean rejections (sanity-check
+    //     failures, codegen rejection of unsupported SST shapes)
+    //     where no span is available.
+    // Both `ProofFnBodyLine` (if resolution failed upstream) and
+    // `Unknown` fall through to `fn_span` so the user still gets
+    // a `-->` to the right ballpark.
+    let span = match diag.location {
+        lean_verify::DiagLocation::Direct(s) => s,
+        lean_verify::DiagLocation::ProofFnBodyLine(_) |
+        lean_verify::DiagLocation::Unknown => fn_span.clone(),
+    };
     let msg = std::sync::Arc::new(MessageX {
         level: MessageLevel::Error,
         note: diag.message,
@@ -1804,18 +1813,18 @@ impl Verifier {
                                     // collapsing to the fn signature.
                                     for mut diag in errors {
                                         self.count_errors += 1;
-                                        if diag.rust_span.is_none() {
-                                            if let Some(offset) = diag.proof_fn_body_line_offset {
-                                                if let Some(parent_data) =
-                                                    crate::spans::raw_span_data(&fn_span.raw_span)
-                                                {
-                                                    diag.rust_span = crate::spans::tactic_body_line_span(
-                                                        parent_data,
-                                                        &fn_span.start_loc,
-                                                        file_path,
-                                                        start_byte,
-                                                        offset,
-                                                    );
+                                        if let lean_verify::DiagLocation::ProofFnBodyLine(offset) = diag.location {
+                                            if let Some(parent_data) =
+                                                crate::spans::raw_span_data(&fn_span.raw_span)
+                                            {
+                                                if let Some(resolved) = crate::spans::tactic_body_line_span(
+                                                    parent_data,
+                                                    &fn_span.start_loc,
+                                                    file_path,
+                                                    start_byte,
+                                                    offset,
+                                                ) {
+                                                    diag.location = lean_verify::DiagLocation::Direct(resolved);
                                                 }
                                             }
                                         }

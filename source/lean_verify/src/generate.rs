@@ -551,24 +551,46 @@ fn krate_preamble(
 
 // ── Check results ──────────────────────────────────────────────────────
 
+/// Where in the user's source a Tactus diagnostic points. Three
+/// mutually-exclusive cases — split as an enum (rather than two
+/// `Option` fields on `TactusDiag`) so the "both Some" /
+/// "exec-fn diag with a line offset" / "proof-fn diag with a
+/// direct span" states are structurally unrepresentable.
+///
+/// Same pattern DESIGN.md § "Type-system-enforced invariants"
+/// applies elsewhere (`AssertKind` sum split, `LoopInvKind`,
+/// etc.): runtime exclusivity → enum, type system carries the
+/// guarantee.
+pub enum DiagLocation {
+    /// Exec-fn obligation: the obligation's own Verus `Span`
+    /// (cloned from the SST node by `sst_to_lean`). The verifier
+    /// uses this directly as the primary span — no further
+    /// resolution needed.
+    Direct(vir::messages::Span),
+    /// Proof-fn diagnostic inside the `by { ... }` tactic body,
+    /// at the given 0-indexed line offset within the body. The
+    /// verifier resolves this to a source-line `Span` at
+    /// emission time via the fn's `tactic_span` byte range
+    /// (which lives in the verifier's `FunctionAttrsX`, not in
+    /// `lean_verify`, so the resolution can't happen here).
+    ProofFnBodyLine(usize),
+    /// No source-position info available — pre-Lean rejections
+    /// (sanity-check failures, codegen-rejected fn shapes), or
+    /// the rare "Lean failed with zero error diagnostics"
+    /// fallback. The verifier emits with the enclosing fn's span
+    /// so the user still gets `-->` to the right ballpark.
+    Unknown,
+}
+
 /// A single rejection record from a Tactus check. The verifier
-/// reports each as its own `MessageLevel::Error`, with `rust_span`
-/// as the primary span when present so the `-->` arrow lands at
-/// the obligation site (rather than the enclosing fn signature).
-/// `help` is the .lean artifact path (attached so users can `cat`
-/// the file even when their terminal has clipped the error body).
+/// reports each as its own `MessageLevel::Error`, with `location`
+/// determining the `-->` arrow's target. `help` is the .lean
+/// artifact path (attached so users can `cat` the file even when
+/// their terminal has clipped the error body).
 pub struct TactusDiag {
     pub message: String,
-    pub rust_span: Option<vir::messages::Span>,
+    pub location: DiagLocation,
     pub help: Option<String>,
-    /// For proof-fn diagnostics: 0-indexed line offset within the
-    /// user's `by { ... }` tactic body. The verifier resolves this
-    /// to an absolute source line via the fn's `tactic_span` byte
-    /// range + rustc's `SourceMap` (which `lean_verify` doesn't
-    /// have access to). `None` for exec-fn diags (whose obligation
-    /// span is in `rust_span`) and for sanity-check / pre-Lean
-    /// rejections that don't correspond to any tactic line.
-    pub proof_fn_body_line_offset: Option<usize>,
 }
 
 #[must_use]
@@ -645,9 +667,9 @@ pub fn check_proof_fn(
         return CheckResult::Failed {
             errors: vec![TactusDiag {
                 message: reason,
-                rust_span: None,
-                help: Some(format!("generated .lean file: {}", file_path.display())),
-                proof_fn_body_line_offset: None,
+                location: DiagLocation::Unknown,
+                help: Some(format!("{} {}",
+                    vir::tactus_messages::LEAN_FILE_HELP_PREFIX, file_path.display())),
             }],
             warnings: vec![],
         };
@@ -662,16 +684,16 @@ pub fn check_proof_fn(
         Ok(r) => {
             let fn_short = short_name(&proof_fn.name.path);
             let header = format!("Lean tactic failed for {}", fn_short);
-            let help = Some(format!("generated .lean file: {}", file_path.display()));
+            let help = Some(format!("{} {}",
+                vir::tactus_messages::LEAN_FILE_HELP_PREFIX, file_path.display()));
             let errors: Vec<TactusDiag> = r.diagnostics.iter()
                 .filter(|d| d.severity == "error")
                 .map(|d| {
                     let formatted = lean_process::format_error(d, &source_map);
                     TactusDiag {
                         message: format!("{}:\n\n{}", header, formatted.message),
-                        rust_span: formatted.rust_span,
+                        location: formatted.location,
                         help: help.clone(),
-                        proof_fn_body_line_offset: formatted.proof_fn_body_line_offset,
                     }
                 })
                 .collect();
@@ -682,11 +704,10 @@ pub fn check_proof_fn(
             // the rejection.
             let errors = if errors.is_empty() {
                 vec![TactusDiag {
-                    message: format!("{}: Lean reported failure but no error-severity diagnostics were captured.\n\
-                                      This is a Tactus pipeline bug — please file an issue with the generated .lean file.", header),
-                    rust_span: None,
+                    message: format!("{}: {}", header,
+                        vir::tactus_messages::NO_ERROR_DIAGNOSTICS_BODY),
+                    location: DiagLocation::Unknown,
                     help,
-                    proof_fn_body_line_offset: None,
                 }]
             } else {
                 errors
@@ -738,9 +759,8 @@ pub fn check_exec_fn(
                      for the full catalogue of unsupported SST shapes)",
                     reason,
                 ),
-                rust_span: None,
+                location: DiagLocation::Unknown,
                 help: None,
-                proof_fn_body_line_offset: None,
             }],
             warnings,
         },
@@ -779,9 +799,9 @@ pub fn check_exec_fn(
         return CheckResult::Failed {
             errors: vec![TactusDiag {
                 message: reason,
-                rust_span: None,
-                help: Some(format!("generated .lean file: {}", file_path.display())),
-                proof_fn_body_line_offset: None,
+                location: DiagLocation::Unknown,
+                help: Some(format!("{} {}",
+                    vir::tactus_messages::LEAN_FILE_HELP_PREFIX, file_path.display())),
             }],
             warnings,
         };
@@ -804,26 +824,25 @@ pub fn check_exec_fn(
         Ok(r) => {
             let fn_short = short_name(&vir_fn.name.path);
             let header = format!("Lean tactus_auto failed for {}", fn_short);
-            let help = Some(format!("generated .lean file: {}", file_path.display()));
+            let help = Some(format!("{} {}",
+                vir::tactus_messages::LEAN_FILE_HELP_PREFIX, file_path.display()));
             let errors: Vec<TactusDiag> = r.diagnostics.iter()
                 .filter(|d| d.severity == "error")
                 .map(|d| {
                     let formatted = lean_process::format_error(d, &source_map);
                     TactusDiag {
                         message: format!("{}:\n\n{}", header, formatted.message),
-                        rust_span: formatted.rust_span,
+                        location: formatted.location,
                         help: help.clone(),
-                        proof_fn_body_line_offset: formatted.proof_fn_body_line_offset,
                     }
                 })
                 .collect();
             let errors = if errors.is_empty() {
                 vec![TactusDiag {
-                    message: format!("{}: Lean reported failure but no error-severity diagnostics were captured.\n\
-                                      This is a Tactus pipeline bug — please file an issue with the generated .lean file.", header),
-                    rust_span: None,
+                    message: format!("{}: {}", header,
+                        vir::tactus_messages::NO_ERROR_DIAGNOSTICS_BODY),
+                    location: DiagLocation::Unknown,
                     help,
-                    proof_fn_body_line_offset: None,
                 }]
             } else {
                 errors
