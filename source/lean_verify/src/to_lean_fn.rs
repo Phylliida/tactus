@@ -33,6 +33,51 @@ const SUBTYPE_WITNESS_AUTO_PROOF: &str = "first | rfl | simp_all";
 /// should be readable, so the fallback is defensive only.
 const TACTIC_BODY_FALLBACK: &str = "sorry";
 
+/// True when `typ` is a reference-like decoration that renders through
+/// one of the `Tactus.X` wrapper structures. These wrappers are opaque
+/// at the dispatch level (so trait resolution distinguishes `Foo &A`
+/// from `Foo A`) but transparent at the value level via the
+/// definitional `.deref` projection (single-field structure).
+///
+/// Mirrors `to_lean_type::typ_to_node`'s decision about which decorations
+/// produce a wrapper. Keep in sync.
+pub(crate) fn is_ref_decorated(typ: &TypX) -> bool {
+    matches!(typ,
+        TypX::Decorate(TypDecoration::Ref | TypDecoration::MutRef
+                       | TypDecoration::Box | TypDecoration::Rc
+                       | TypDecoration::Arc, _, _)
+        | TypX::MutRef(_))
+}
+
+/// Wrap a body expression with `let p := p.deref` (or `p.deref.deref`
+/// for nested decorations) for each reference-decorated param, so the
+/// body sees `p` as the inner type. Lean's shadowing means the binder
+/// `(p : Tactus.Ref T)` survives at the param position (for dispatch)
+/// while the body's references to `p` resolve to the derefed inner.
+///
+/// Non-ref-decorated params pass through unchanged.
+///
+/// Applied at every site that emits a body containing references to
+/// reference-decorated params: spec_fn_to_ast standalone defs,
+/// trait_impl_to_ast instance method bodies, trait_to_ast class default
+/// bodies.
+pub(crate) fn wrap_body_with_param_derefs(body: LExpr, params: &Params) -> LExpr {
+    // Iterate in REVERSE so the FIRST param's let-binding ends up
+    // outermost (after building the wrap by repeatedly prepending).
+    let mut wrapped = body;
+    for p in params.iter().rev() {
+        if is_ref_decorated(&p.x.typ) {
+            let param_name = crate::lean_name::LeanName::from_var_ident(&p.x.name);
+            wrapped = LExpr::let_bind(
+                param_name.clone(),
+                LExpr::field_proj(LExpr::var(param_name), "deref"),
+                wrapped,
+            );
+        }
+    }
+    wrapped
+}
+
 // ── Source map ──────────────────────────────────────────────────────────
 
 /// Maps Lean line numbers back to the user's source.
@@ -150,10 +195,14 @@ pub fn spec_fn_to_ast(f: &FunctionX, fn_map: &crate::sst_to_lean::FnMap) -> Comm
             // (BUG-as-nat-cast.md). A spec fn body may call other spec
             // fns whose params are nat-typed.
             let coerced_body = crate::sst_to_lean::insert_nat_coercions_in_expr(b, fn_map);
-            let body = vir_expr_to_ast(&coerced_body);
+            let binder_ctx = crate::to_lean_expr::binder_ctx_from_params(&f.params);
+            let body = wrap_body_with_param_derefs(
+                crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced_body, &binder_ctx),
+                &f.params,
+            );
             let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| {
                 let coerced = crate::sst_to_lean::insert_nat_coercions_in_expr(d, fn_map);
-                vir_expr_to_ast(&coerced)
+                crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx)
             }).collect();
             Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by })
         }
@@ -176,26 +225,33 @@ pub fn proof_fn_to_ast(
     fn_map: &crate::sst_to_lean::FnMap,
 ) -> Theorem {
     let mut binders = fn_binders(f);
+    let binder_ctx = crate::to_lean_expr::binder_ctx_from_params(&f.params);
     for (i, req) in f.require.iter().enumerate() {
         // Insert Int.toNat coercions at Call sites where needed.
         let coerced = crate::sst_to_lean::insert_nat_coercions_in_expr(req, fn_map);
+        // Wrap with `let p := p.deref` for ref-decorated params so the
+        // hypothesis body sees inner types.
+        let req_ty = wrap_body_with_param_derefs(
+            crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx),
+            &f.params);
         binders.push(LBinder {
             name: Some(crate::lean_name::LeanName::synthetic(format!("h{}", i))),
-            ty: vir_expr_to_ast(&coerced),
+            ty: req_ty,
             kind: BinderKind::Explicit,
         });
     }
-    let goal = and_all(f.ensure.0.iter().map(|e| {
+    let goal_raw = and_all(f.ensure.0.iter().map(|e| {
         let coerced = crate::sst_to_lean::insert_nat_coercions_in_expr(e, fn_map);
-        vir_expr_to_ast(&coerced)
+        crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx)
     }).collect());
+    let goal = wrap_body_with_param_derefs(goal_raw, &f.params);
     // Honor Verus's `decreases` clause for recursive proof fns. Lean often
     // auto-infers termination for simple structural recursion, but cases
     // where the measure is non-obvious (Collatz, lex pairs, computed
     // descent) require the explicit clause. Mirrors `spec_fn_to_ast`.
     let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| {
         let coerced = crate::sst_to_lean::insert_nat_coercions_in_expr(d, fn_map);
-        vir_expr_to_ast(&coerced)
+        crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx)
     }).collect();
     Theorem {
         name: lean_name(&f.name.path),
@@ -1180,8 +1236,11 @@ pub fn trait_to_ast(
         // returns) — see `proof_fn_method_type`. So the default body
         // must produce a term of that type, which a tactic proof does.
         let default = func.body.as_ref().map(|b| {
+            let body_binders = crate::to_lean_expr::binder_ctx_from_params(&func.params);
             let body_expr = match func.mode {
-                vir::ast::Mode::Spec => vir_expr_to_ast(b),
+                vir::ast::Mode::Spec => wrap_body_with_param_derefs(
+                    crate::to_lean_expr::vir_expr_to_ast_with_binders(b, &body_binders),
+                    &func.params),
                 vir::ast::Mode::Exec => LExpr::var_lit("default"),
                 vir::ast::Mode::Proof => {
                     // Class default for proof-fn method. Mirrors
@@ -1195,7 +1254,9 @@ pub fn trait_to_ast(
                             .unwrap_or(TACTIC_BODY_FALLBACK);
                         LExpr::new(ExprNode::ByBlock { tactic: tac.to_string() })
                     } else {
-                        let value = vir_expr_to_ast(b);
+                        let value = wrap_body_with_param_derefs(
+                            crate::to_lean_expr::vir_expr_to_ast_with_binders(b, &body_binders),
+                            &func.params);
                         let proof = LExpr::new(ExprNode::ByBlock {
                             tactic: SUBTYPE_WITNESS_AUTO_PROOF.to_string(),
                         });
@@ -1253,25 +1314,19 @@ pub fn trait_to_ast(
     }
 }
 
-/// Build the method type `Self → P₁ → … → Ret`. Inside a class, associated
-/// types become unqualified identifiers (they're class type params), so a
-/// `TypX::Projection { name, … }` renders as just the projection name.
+/// Build the method type `<self_ty> → P₁ → … → Ret`. Inside a class,
+/// associated types become unqualified identifiers (they're class type
+/// params), and the trait's `Self%` type-param normalizes to the
+/// class's outer `Self`. Reference-like decorations on the receiver
+/// type (`&self`, `&mut self`, `Box<Self>`, etc.) survive as
+/// `Tactus.Ref Self` etc. so that trait dispatch matches the impl
+/// side.
 fn method_type(func: &FunctionX) -> LExpr {
-    let param_type = |p: &vir::ast::Param| -> LExpr {
-        if p.x.name.0.as_str() == "self" {
-            LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Self")))
-        } else {
-            typ_maybe_projection_to_expr(&p.x.typ)
-        }
-    };
-
-    // Fold right-to-left into nested `→`. For zero params, the "arrow
-    // chain" is just the return type.
     let mut out = typ_maybe_projection_to_expr(&func.ret.x.typ);
     for p in func.params.iter().rev() {
         out = LExpr::new(ExprNode::BinOp {
             op: crate::lean_ast::BinOp::Implies,
-            lhs: Box::new(param_type(p)),
+            lhs: Box::new(typ_maybe_projection_to_expr(&p.x.typ)),
             rhs: Box::new(out),
         });
     }
@@ -1300,16 +1355,103 @@ fn method_type(func: &FunctionX) -> LExpr {
 /// string-parsing the suffix, so a Verus-side rename of the constant
 /// causes a compile error here rather than silent breakage.
 fn typ_maybe_projection_to_expr(typ: &TypX) -> LExpr {
-    if let TypX::Projection { name, .. } = typ {
-        LExpr::new(ExprNode::Var(crate::lean_name::LeanName::synthetic(sanitize(name))))
-    } else if let TypX::TypParam(name) = typ {
-        if *name == vir::def::trait_self_type_param() {
-            LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Self")))
+    use vir::ast::TypDecoration;
+    use crate::lean_ast::BinOp;
+
+    fn applied(name: &str, args: Vec<LExpr>) -> LExpr {
+        if args.is_empty() {
+            LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit(name)))
         } else {
-            typ_to_expr(typ)
+            LExpr::new(ExprNode::App {
+                head: Box::new(LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit(name)))),
+                args,
+            })
         }
-    } else {
-        typ_to_expr(typ)
+    }
+
+    match typ {
+        TypX::TypParam(name) if *name == vir::def::trait_self_type_param() => {
+            LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Self")))
+        }
+        TypX::Projection { name, .. } => {
+            // Inside a class declaration, assoc-type projections render
+            // as the bare name (a class type param).
+            LExpr::new(ExprNode::Var(crate::lean_name::LeanName::synthetic(sanitize(name))))
+        }
+        TypX::Decorate(deco, _, inner) => match deco {
+            TypDecoration::Ref => applied("Tactus.Ref", vec![typ_maybe_projection_to_expr(inner)]),
+            TypDecoration::MutRef => applied("Tactus.MutRef", vec![typ_maybe_projection_to_expr(inner)]),
+            TypDecoration::Box => applied("Tactus.Box", vec![typ_maybe_projection_to_expr(inner)]),
+            TypDecoration::Rc => applied("Tactus.Rc", vec![typ_maybe_projection_to_expr(inner)]),
+            TypDecoration::Arc => applied("Tactus.Arc", vec![typ_maybe_projection_to_expr(inner)]),
+            TypDecoration::Ghost | TypDecoration::Tracked
+            | TypDecoration::Never | TypDecoration::ConstPtr =>
+                typ_maybe_projection_to_expr(inner),
+        },
+        TypX::MutRef(inner) => applied("Tactus.MutRef", vec![typ_maybe_projection_to_expr(inner)]),
+        TypX::Boxed(inner) => typ_maybe_projection_to_expr(inner),
+        TypX::Datatype(dt, args, _) => match dt {
+            vir::ast::Dt::Path(path) => {
+                let head = crate::to_lean_type::lean_name(path);
+                let mapped: Vec<LExpr> = args.iter()
+                    .map(|a| typ_maybe_projection_to_expr(a)).collect();
+                if mapped.is_empty() {
+                    LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit(&head)))
+                } else {
+                    LExpr::new(ExprNode::App {
+                        head: Box::new(LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit(&head)))),
+                        args: mapped,
+                    })
+                }
+            }
+            vir::ast::Dt::Tuple(_) => match args.len() {
+                0 => applied("Unit", Vec::new()),
+                1 => typ_maybe_projection_to_expr(&args[0]),
+                _ => {
+                    let mut iter = args.iter().rev();
+                    let mut acc = typ_maybe_projection_to_expr(iter.next().unwrap());
+                    for a in iter {
+                        acc = LExpr::new(ExprNode::BinOp {
+                            op: BinOp::Prod,
+                            lhs: Box::new(typ_maybe_projection_to_expr(a)),
+                            rhs: Box::new(acc),
+                        });
+                    }
+                    acc
+                }
+            },
+        },
+        TypX::SpecFn(params, ret) => {
+            let mut out = typ_maybe_projection_to_expr(ret);
+            for p in params.iter().rev() {
+                out = LExpr::new(ExprNode::BinOp {
+                    op: BinOp::Implies,
+                    lhs: Box::new(typ_maybe_projection_to_expr(p)),
+                    rhs: Box::new(out),
+                });
+            }
+            out
+        }
+        TypX::Primitive(prim, args) => {
+            let head = match prim {
+                vir::ast::Primitive::Array => "Array",
+                vir::ast::Primitive::Slice => "List",
+                vir::ast::Primitive::StrSlice => "String",
+                vir::ast::Primitive::Ptr => "USize",
+                vir::ast::Primitive::Global => "Unit",
+            };
+            let type_args: Vec<_> = match prim {
+                vir::ast::Primitive::Array | vir::ast::Primitive::Slice => {
+                    args.iter().take(1).map(|a| typ_maybe_projection_to_expr(a)).collect()
+                }
+                _ => args.iter().map(|a| typ_maybe_projection_to_expr(a)).collect(),
+            };
+            applied(head, type_args)
+        }
+        // Everything else falls through to the standard renderer; these
+        // shapes don't contain Self% or Projection (or if they do, the
+        // standard renderer's emission is acceptable as-is).
+        _ => typ_to_expr(typ),
     }
 }
 
@@ -1332,11 +1474,7 @@ fn class_method_value_binders(func: &FunctionX) -> Vec<LBinder> {
     let mut out: Vec<LBinder> = Vec::new();
     for p in func.params.iter() {
         let name = crate::lean_name::LeanName::from_var_ident(&p.x.name);
-        let ty = if p.x.name.0.as_str() == "self" {
-            LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Self")))
-        } else {
-            typ_maybe_projection_to_expr(&p.x.typ)
-        };
+        let ty = typ_maybe_projection_to_expr(&p.x.typ);
         out.push(LBinder {
             name: Some(name.clone()),
             ty,
@@ -1388,13 +1526,15 @@ fn proof_fn_method_type(
     //   mul_assoc : ∀ a b c : G, ...` — no `(G : Type)` or `[Mul G]`
     // re-binders inside `mul_assoc`'s type.
     let mut binders = class_method_value_binders(func);
+    let body_binders = crate::to_lean_expr::binder_ctx_from_params(&func.params);
     for (i, req) in func.require.iter().enumerate() {
         // Inside the class declaration, sibling refs can use bare
         // names (the class's own scope) — pass empty `impl_prefix`
         // to get the bare-name rewrite. Instance bodies use a
         // non-empty prefix to route to impl-specific standalones.
         let req_ty = strip_class_qualifier(
-            vir_expr_to_ast(req), class_name, "", sibling_methods,
+            crate::to_lean_expr::vir_expr_to_ast_with_binders(req, &body_binders),
+            class_name, "", sibling_methods,
         );
         // Requires render as named hypothesis binders following the
         // `_tactus_<role>_<id>` reserved-name convention (see
@@ -1409,7 +1549,9 @@ fn proof_fn_method_type(
         });
     }
     let ensures = and_all(func.ensure.0.iter()
-        .map(|e| strip_class_qualifier(vir_expr_to_ast(e), class_name, "", sibling_methods))
+        .map(|e| strip_class_qualifier(
+            crate::to_lean_expr::vir_expr_to_ast_with_binders(e, &body_binders),
+            class_name, "", sibling_methods))
         .collect());
 
     let goal = if is_unit_typ(&func.ret.x.typ) {
@@ -1679,7 +1821,13 @@ pub fn trait_impl_to_ast(
                     let rewritten = crate::impl_subst::rewrite_self_sibling_calls(
                         body, &ti.trait_path, self_typ, &method_redirects,
                     );
-                    vir_expr_to_ast(&rewritten)
+                    // Wrap with `let p := p.deref` for each reference-
+                    // decorated param so the body sees inner types.
+                    let body_binders = crate::to_lean_expr::binder_ctx_from_params(&func.params);
+                    wrap_body_with_param_derefs(
+                        crate::to_lean_expr::vir_expr_to_ast_with_binders(&rewritten, &body_binders),
+                        &func.params,
+                    )
                 }
                 (vir::ast::Mode::Exec, Some(_)) => {
                     // Exec placeholder. `default` produces a value
@@ -1750,7 +1898,11 @@ pub fn trait_impl_to_ast(
                         let rewritten = crate::impl_subst::rewrite_self_sibling_calls(
                             body, &ti.trait_path, self_typ, &method_redirects,
                         );
-                        let value = vir_expr_to_ast(&rewritten);
+                        let body_binders = crate::to_lean_expr::binder_ctx_from_params(&func.params);
+                        let value = wrap_body_with_param_derefs(
+                            crate::to_lean_expr::vir_expr_to_ast_with_binders(&rewritten, &body_binders),
+                            &func.params,
+                        );
                         // `rfl` closes when body matches ensures
                         // literally; `simp_all` handles unfolding
                         // through standalone def chains.
