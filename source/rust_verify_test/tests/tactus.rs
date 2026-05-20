@@ -10681,3 +10681,61 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// Probe (2026-05-20): same-crate, non-forwarding blanket impl
+// `Foo for &A`. Pinned as Err — documents a structural gap that is
+// NOT vstd-specific. See DESIGN.md § "Transparent-wrapper peel vs
+// trait dispatch (deferred)" for the full analysis.
+//
+// Failure mode today (two layered breakages):
+//   1. The blanket's standalone body emits as `A.Foo.impl.foo self
+//      + 1` — `A` is a type variable, you can't dot-access it. Lean
+//      rejects "Invalid field notation".
+//   2. Even if (1) were fixed, Tactus peels `&Holder → Holder` at
+//      the dispatch site. Lean's instance resolution picks the
+//      concrete `Foo Holder` instance, returns 7 (not 8). The
+//      blanket's `+1` is silently dropped. simp_all reduces
+//      `7 = 8` to ⊢ False.
+//
+// Why this matters: any user crate that writes a non-forwarding
+// blanket impl over a transparent wrapper hits this. Tactus
+// silently produces the wrong answer. vstd's blanket impls happen
+// to all be pure forwarding (so Tactus's peel coincidentally gives
+// the right answer there), but the underlying structural gap is
+// not vstd-specific.
+//
+// Proper fix shape: stop peeling transparent wrappers at instance
+// heads AND dispatch sites — emit `Ref`/`MutRef`/`Box`/`Rc`/`Arc`
+// as opaque wrapper types in the prelude, mirroring how Verus's AIR
+// encoding preserves decorations at type-ID level (DECORATE=true in
+// `vir::context`). ~3-5 session refactor; see DESIGN.md.
+//
+// Flips to Ok when the un-peel landing happens.
+test_verify_one_file! {
+    #[test] test_non_forwarding_blanket_over_ref_probe verus_code! {
+        pub trait Foo {
+            spec fn foo(&self) -> int;
+        }
+
+        pub struct Holder { pub v: u8 }
+
+        impl Foo for Holder {
+            open spec fn foo(&self) -> int { self.v as int }
+        }
+
+        // Non-forwarding blanket: adds 1 to inner's foo value.
+        impl<A: Foo + ?Sized> Foo for &A {
+            open spec fn foo(&self) -> int {
+                (**self).foo() + 1
+            }
+        }
+
+        // If Tactus honored the blanket: (&Holder{v:7}).foo() == 8
+        // Today: Tactus drops the +1 silently; assertion fails.
+        proof fn blanket_adds_one_honored()
+            ensures (&Holder { v: 7 }).foo() == 8
+        by {
+            simp_all [Foo.foo]
+        }
+    } => Err(_)
+}
