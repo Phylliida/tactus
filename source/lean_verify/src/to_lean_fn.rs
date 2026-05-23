@@ -921,29 +921,36 @@ fn height_fn_for_datatype(
         let var_san = sanitize(&v.name);
         let ctor_name = format!("{}.{}", path, var_san);
         let mut pats = Vec::with_capacity(v.fields.len());
-        // (binder name, height fn name) for each recursive field.
-        // The height fn name uses the FIELD's datatype (which is in
-        // the SCC), not the parent's. For self-recursion these
-        // match; for mutual recursion across an SCC they differ.
-        let mut recursive_binders: Vec<(String, String)> = Vec::new();
+        // (binder name, height fn name, deref count) for each
+        // recursive field. The height fn name uses the FIELD's
+        // datatype (which is in the SCC), not the parent's. For
+        // self-recursion these match; for mutual recursion across
+        // an SCC they differ. The deref count is the number of
+        // wrapper layers Lean infers on the binder — for
+        // `Box<Stack>` the binder is `Tactus.Box Stack` so we need
+        // `_rec_n.deref` to reach the inner `Stack`. Each layer
+        // (Box / Ref / MutRef / Rc / Arc) contributes one `.deref`.
+        let mut recursive_binders: Vec<(String, String, usize)> = Vec::new();
         for (idx, f) in v.fields.iter().enumerate() {
             if let Some(target_path) = field_recursive_target(&f.a.0, scc_paths) {
                 let name = format!("_rec_{}", idx);
                 let height_fn = format!("{}.height", lean_name(target_path));
+                let n_derefs = crate::expr_shared::count_ref_decorations(&*f.a.0);
                 pats.push(LPattern::Var(crate::lean_name::LeanName::synthetic(name.clone())));
-                recursive_binders.push((name, height_fn));
+                recursive_binders.push((name, height_fn, n_derefs));
             } else {
                 pats.push(LPattern::Wildcard);
             }
         }
         let mut arm_body = LExpr::lit_int("1");
-        for (name, height_fn) in &recursive_binders {
+        for (name, height_fn, n_derefs) in &recursive_binders {
+            let arg = crate::expr_shared::apply_deref_chain(
+                LExpr::var_synthetic(name.clone()),
+                *n_derefs,
+            );
             arm_body = LExpr::add(
                 arm_body,
-                LExpr::app1(
-                    LExpr::var_synthetic(height_fn.clone()),
-                    LExpr::var_synthetic(name.clone()),
-                ),
+                LExpr::app1(LExpr::var_synthetic(height_fn.clone()), arg),
             );
         }
         MatchArm {

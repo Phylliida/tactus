@@ -361,6 +361,73 @@ pub(crate) fn is_mut_ref_typ(typ: &Typ, is_mut: bool) -> bool {
     }
 }
 
+/// Wrapper name (e.g., `"Tactus.Ref"`) for a reference-like decoration,
+/// or `None` for transparent ones (Ghost / Tracked / Never / ConstPtr).
+/// Single source of truth — `to_lean_type::typ_to_node` and
+/// `to_lean_expr`'s coercion machinery agree on this mapping. Adding
+/// a new reference-like decoration is one edit.
+pub(crate) fn decoration_wrapper(deco: TypDecoration) -> Option<&'static str> {
+    match deco {
+        TypDecoration::Ref => Some("Tactus.Ref"),
+        TypDecoration::MutRef => Some("Tactus.MutRef"),
+        TypDecoration::Box => Some("Tactus.Box"),
+        TypDecoration::Rc => Some("Tactus.Rc"),
+        TypDecoration::Arc => Some("Tactus.Arc"),
+        TypDecoration::Ghost | TypDecoration::Tracked
+        | TypDecoration::Never | TypDecoration::ConstPtr => None,
+    }
+}
+
+/// Count the number of reference-decoration layers in a typ. Peels
+/// `Boxed` transparently (Verus's poly encoding, not user-visible).
+/// `TypX::MutRef` counts as one layer (new-mut-ref-mode's
+/// non-Decorate shape).
+///
+/// Used by both `to_lean_expr::apply_ref_coercion_if_needed`
+/// (wrapping with `.mk` for under-decorated rendered exprs) and
+/// `apply_deref_chain` (unwrapping with `.deref` to reach inner T
+/// for height-fn args and exec-fn body shadows).
+pub(crate) fn count_ref_decorations(typ: &TypX) -> usize {
+    let mut n = 0;
+    let mut cur = typ;
+    loop {
+        match cur {
+            TypX::Decorate(deco, _, inner) => {
+                if decoration_wrapper(*deco).is_some() {
+                    n += 1;
+                }
+                cur = &**inner;
+            }
+            TypX::Boxed(inner) => cur = &**inner,
+            TypX::MutRef(_) => {
+                n += 1;
+                break;
+            }
+            _ => break,
+        }
+    }
+    n
+}
+
+/// Apply N `.deref` field-projections to `base`, peeling N wrapper
+/// layers to reach the inner value. Used wherever the rendered Lean
+/// type has more `Tactus.X` wrappers than the call site expects:
+///
+/// * **Exec-fn body shadow**: a fn param `(s : Tactus.Ref Stack)`
+///   needs `let s := s.deref` so body code sees `s : Stack`.
+/// * **Height-fn recursive arg**: a field of type `Box<Stack>` has
+///   binder type `Tactus.Box Stack`, but `Stack.height` expects
+///   `Stack` — pass `_rec_n.deref` instead of `_rec_n`.
+///
+/// `n = 0` returns `base` unchanged.
+pub(crate) fn apply_deref_chain(base: LExpr, n: usize) -> LExpr {
+    let mut out = base;
+    for _ in 0..n {
+        out = LExpr::field_proj(out, "deref");
+    }
+    out
+}
+
 /// Lean accessor string for the `n`th element of an `arity`-tuple.
 ///
 /// Lean 4 represents N-tuples as right-nested `Prod`:

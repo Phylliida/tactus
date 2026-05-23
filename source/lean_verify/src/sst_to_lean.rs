@@ -776,47 +776,59 @@ pub fn exec_fn_theorems_to_ast<'a>(
         heartbeats: fn_sst.x.attrs.tactus_heartbeats,
     };
 
-    // Initial OblCtx frames for each `&mut` param (legacy or
-    // new-mut-ref mode — uniform after the wrapper-architecture
-    // collapse). Two frames per param, in source order so the
-    // pre-state capture lands outermost:
+    // Initial OblCtx frames per wrapper-typed param. The frames are
+    // pushed first (outermost in wrap order) so the body's WP sees
+    // the shadowed-to-inner names in scope.
     //
-    //   let <x>_at_pre_tactus := x.deref;   -- capture pre-state inner value
-    //   let x := x.deref;                    -- shadow x to inner so the
-    //                                            body's `Var(x)` reads inner
+    //   let x := x.deref;                    -- body-shadow: makes Var(x)
+    //                                           in the rewritten body
+    //                                           resolve to inner T.
+    //   let <x>_at_pre_tactus := x.deref;   -- ONLY for `&mut`: captures
+    //                                           pre-state inner before
+    //                                           any body writes shadow x.
     //
-    // The binder `(x : Tactus.MutRef T)` survives at param position
-    // for trait dispatch; the body's WP sees `x : T` through the
-    // shadow, so the rewritten body (where `MutRefCurrent` / `VarAt`
-    // ops have been stripped to bare `Var(x)`) typechecks against
-    // inner T.
+    // The binder `(x : Tactus.Ref T)` / `(x : Tactus.MutRef T)` survives
+    // at param position for trait dispatch; the body's WP sees `x : T`.
     //
-    // BorrowMut locals (#107 synthetic `mut_ref` from
-    // `bump(&mut y)` lowering) get the same treatment — `mut_ref`
-    // is wrapper-typed at the binder (see `build_borrow_mut_binders`)
-    // and needs the shadow to inner T for downstream code.
+    // BorrowMut locals (#107 synthetic `mut_ref` from `bump(&mut y)`
+    // lowering) are MutRef-typed; they get both frames.
+    //
+    // Non-mut wrapper params (`&Stack`, `Box<u8>`, `Rc<T>`, `Arc<T>`)
+    // get only the body-shadow — there's no pre-state vs post-state
+    // distinction for immutable references.
     //
     // The fn's requires stay in theorem-level binders
     // (`build_req_binders` above) and get their own per-req
     // `let x := x.deref` wrapping there.
     let mut initial_obl_ctx = OblCtx::new(emitter.default_closer.clone());
-    let add_pre_and_shadow = |obl: OblCtx, raw_name: &str, lean_name: crate::lean_name::LeanName| -> OblCtx {
+    let add_pre_capture = |obl: OblCtx, raw_name: &str, lean_name: &crate::lean_name::LeanName| -> OblCtx {
         let pre_name = crate::lean_name::LeanName::synthetic(varat_pre_name(raw_name));
-        let wrapper = LExpr::var(lean_name.clone());
-        let inner = LExpr::field_proj(wrapper, "deref");
-        let obl = obl.with_frame(CtxFrame::Let(pre_name, inner.clone()));
+        let inner = LExpr::field_proj(LExpr::var(lean_name.clone()), "deref");
+        obl.with_frame(CtxFrame::Let(pre_name, inner))
+    };
+    let add_body_shadow = |obl: OblCtx, lean_name: crate::lean_name::LeanName| -> OblCtx {
+        let inner = LExpr::field_proj(LExpr::var(lean_name.clone()), "deref");
         obl.with_frame(CtxFrame::Let(lean_name, inner))
     };
-    for par in fn_sst.x.pars.iter().filter(|p| is_mut_ref_typ(&p.x.typ, p.x.is_mut)) {
-        let raw_name = sanitize(&par.x.name.0);
+    for par in fn_sst.x.pars.iter() {
         let lean_name = crate::lean_name::LeanName::from_var_ident(&par.x.name);
-        initial_obl_ctx = add_pre_and_shadow(initial_obl_ctx, &raw_name, lean_name);
+        let raw_name = sanitize(&par.x.name.0);
+        let is_mut_ref = is_mut_ref_typ(&par.x.typ, par.x.is_mut);
+        let is_wrapped = is_mut_ref || crate::to_lean_fn::is_ref_decorated(&*par.x.typ);
+        if !is_wrapped {
+            continue;
+        }
+        if is_mut_ref {
+            initial_obl_ctx = add_pre_capture(initial_obl_ctx, &raw_name, &lean_name);
+        }
+        initial_obl_ctx = add_body_shadow(initial_obl_ctx, lean_name);
     }
     for decl in check.local_decls.iter() {
         if matches!(decl.kind, LocalDeclKind::BorrowMut) {
-            let raw_name = sanitize(&decl.ident.0);
             let lean_name = crate::lean_name::LeanName::from_var_ident(&decl.ident);
-            initial_obl_ctx = add_pre_and_shadow(initial_obl_ctx, &raw_name, lean_name);
+            let raw_name = sanitize(&decl.ident.0);
+            initial_obl_ctx = add_pre_capture(initial_obl_ctx, &raw_name, &lean_name);
+            initial_obl_ctx = add_body_shadow(initial_obl_ctx, lean_name);
         }
     }
     walk_obligations(&body_wp, &ctx, &initial_obl_ctx, &mut emitter);

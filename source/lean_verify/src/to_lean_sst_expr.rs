@@ -751,8 +751,17 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 // pattern.
                 let cur_height = format!("{}.height", lean_name(cur_path));
                 let prev_height = format!("{}.height", lean_name(prev_path));
-                let cur_h = LExpr::app1(LExpr::var_synthetic(cur_height), cur);
-                let prev_h = LExpr::app1(LExpr::var_synthetic(prev_height), prev);
+                // Peel wrapper layers via `.deref` so the height fn
+                // call typechecks. For an arg of type `Box<Stack>` the
+                // rendered LExpr has Lean type `Tactus.Box Stack` but
+                // `Stack.height` expects `Stack` — wrap with `.deref`
+                // once per wrapper layer (matches the body-shadow's
+                // unwrapping convention).
+                use crate::expr_shared::{apply_deref_chain, count_ref_decorations};
+                let cur_n = count_ref_decorations(&*args[0].typ);
+                let prev_n = count_ref_decorations(&*args[1].typ);
+                let cur_h = LExpr::app1(LExpr::var_synthetic(cur_height), apply_deref_chain(cur, cur_n));
+                let prev_h = LExpr::app1(LExpr::var_synthetic(prev_height), apply_deref_chain(prev, prev_n));
                 let lt_branch = LExpr::lt(cur_h.clone(), prev_h.clone());
                 let eq_branch = LExpr::and(LExpr::eq(cur_h, prev_h), otherwise);
                 LExpr::or(lt_branch, eq_branch).node
