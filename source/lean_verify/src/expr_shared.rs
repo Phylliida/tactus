@@ -229,8 +229,11 @@ pub(crate) fn is_variant_node(variant: &Ident, inner: LExpr) -> ExprNode {
 //     (`build_call_substitutions`).
 //   * `_tactus_mut_post_<id>` — post-call existential for a `&mut`
 //     arg (`build_call_substitutions`).
-//   * `_tactus_field_<idx>` — accessor-fn body's field-extract local
-//     (`to_lean_fn::datatype_to_cmds`).
+//   * (`_tactus_field_<idx>` was previously used for accessor-fn body's
+//     field-extract local. Now both accessor-fn bodies and height-fn
+//     pattern binders use the field's declared name directly via
+//     `to_lean_fn::field_name` — same name the inductive's variant
+//     ctor uses — so the synthetic convention is no longer needed.)
 //   * `_tactus_<kind>_<fn>_at_<loc>_<id>` — per-obligation theorem
 //     names (`build_theorem_name`).
 //   * `_tactus_assoc_<X>_<N>` — fresh implicit type binder lifted

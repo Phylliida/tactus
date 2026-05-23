@@ -922,24 +922,33 @@ fn height_fn_for_datatype(
         let ctor_name = format!("{}.{}", path, var_san);
         let mut pats = Vec::with_capacity(v.fields.len());
         // (binder name, height fn name, deref count) for each
-        // recursive field. The height fn name uses the FIELD's
-        // datatype (which is in the SCC), not the parent's. For
-        // self-recursion these match; for mutual recursion across
-        // an SCC they differ. The deref count is the number of
-        // wrapper layers Lean infers on the binder — for
-        // `Box<Stack>` the binder is `Tactus.Box Stack` so we need
-        // `<binder>.deref` to reach the inner `Stack`. Each layer
-        // (Box / Ref / MutRef / Rc / Arc) contributes one `.deref`.
+        // recursive field. The binder name IS the field's declared
+        // name (`val1` for positional fields like `Push(u8,
+        // Box<Stack>)`; user-given names for named fields like
+        // `Tree { left, right }`). This matches the name Lean already
+        // uses for the field in the inductive declaration (see
+        // `datatype_to_cmds`'s variant rendering), so generated
+        // pattern matches read naturally:
         //
-        // Binder names follow the `_tactus_field_<idx>` convention
-        // (see `expr_shared` Convention 1) — same shape as the
-        // accessor-fn field-extract locals in `datatype_to_cmds`,
-        // since the semantic role is identical: a pattern-match
-        // binder for one positional field of a variant.
+        //   | Stack.Push _ val1 => 1 + Stack.height val1.deref
+        //   | Tree.Node left right => 1 + Tree.height left + Tree.height right
+        //
+        // The height fn name uses the FIELD's datatype (which is in
+        // the SCC), not the parent's. For self-recursion these match;
+        // for mutual recursion across an SCC they differ. The deref
+        // count is the number of wrapper layers Lean infers on the
+        // binder — for `Box<Stack>` the binder is `Tactus.Box Stack`
+        // so we need `<binder>.deref` to reach the inner `Stack`.
+        // Each wrapper layer (Box / Ref / MutRef / Rc / Arc)
+        // contributes one `.deref`.
         let mut recursive_binders: Vec<(String, String, usize)> = Vec::new();
-        for (idx, f) in v.fields.iter().enumerate() {
+        for f in v.fields.iter() {
             if let Some(target_path) = field_recursive_target(&f.a.0, scc_paths) {
-                let name = format!("_tactus_field_{}", idx);
+                // `field_name` is the same val-prefix-if-numeric
+                // transform the inductive declaration uses for the
+                // field's declared name — so this pattern binder reads
+                // identically to the inductive's field declaration.
+                let name = field_name(&f.name);
                 let height_fn = format!("{}.height", lean_name(target_path));
                 let n_derefs = crate::expr_shared::count_ref_decorations(&*f.a.0);
                 pats.push(LPattern::Var(crate::lean_name::LeanName::synthetic(name.clone())));
@@ -1141,7 +1150,13 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
     for v in dt.variants.iter() {
         let var_san = sanitize(&v.name);
         for (idx, f) in v.fields.iter().enumerate() {
-            let field_local = format!("_tactus_field_{}", idx);
+            // Bind the field via the field's declared name (`val0` for
+            // positional fields, user-given for named) — matches what
+            // the inductive's variant ctor declares the field as, so
+            // the accessor's pattern reads like
+            // `match x with | Type.Foo val0 _ _ => val0` rather than
+            // a synthetic `_tactus_field_<idx>`.
+            let field_local = field_name(&f.name);
             let binders_pat: Vec<LPattern> =
                 (0..v.fields.len()).map(|i| if i == idx {
                     LPattern::Var(crate::lean_name::LeanName::synthetic(field_local.clone()))
