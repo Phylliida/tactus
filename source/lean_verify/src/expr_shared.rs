@@ -417,7 +417,7 @@ pub(crate) fn count_ref_decorations(typ: &TypX) -> usize {
 ///   needs `let s := s.deref` so body code sees `s : Stack`.
 /// * **Height-fn recursive arg**: a field of type `Box<Stack>` has
 ///   binder type `Tactus.Box Stack`, but `Stack.height` expects
-///   `Stack` — pass `_rec_n.deref` instead of `_rec_n`.
+///   `Stack` — pass `<field_binder>.deref` instead of `<field_binder>`.
 ///
 /// `n = 0` returns `base` unchanged.
 pub(crate) fn apply_deref_chain(base: LExpr, n: usize) -> LExpr {
