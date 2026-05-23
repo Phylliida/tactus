@@ -928,12 +928,18 @@ fn height_fn_for_datatype(
         // an SCC they differ. The deref count is the number of
         // wrapper layers Lean infers on the binder — for
         // `Box<Stack>` the binder is `Tactus.Box Stack` so we need
-        // `_rec_n.deref` to reach the inner `Stack`. Each layer
+        // `<binder>.deref` to reach the inner `Stack`. Each layer
         // (Box / Ref / MutRef / Rc / Arc) contributes one `.deref`.
+        //
+        // Binder names follow the `_tactus_field_<idx>` convention
+        // (see `expr_shared` Convention 1) — same shape as the
+        // accessor-fn field-extract locals in `datatype_to_cmds`,
+        // since the semantic role is identical: a pattern-match
+        // binder for one positional field of a variant.
         let mut recursive_binders: Vec<(String, String, usize)> = Vec::new();
         for (idx, f) in v.fields.iter().enumerate() {
             if let Some(target_path) = field_recursive_target(&f.a.0, scc_paths) {
-                let name = format!("_rec_{}", idx);
+                let name = format!("_tactus_field_{}", idx);
                 let height_fn = format!("{}.height", lean_name(target_path));
                 let n_derefs = crate::expr_shared::count_ref_decorations(&*f.a.0);
                 pats.push(LPattern::Var(crate::lean_name::LeanName::synthetic(name.clone())));
