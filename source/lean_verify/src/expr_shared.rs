@@ -33,6 +33,7 @@
 
 use vir::ast::{
     ArithOp, BinaryOp, BitwiseOp, Constant, Dt, FieldOpr, Ident, InequalityOp, RealArithOp,
+    Typ, TypDecoration, TypX,
 };
 
 use crate::lean_ast::{BinOp as L, Expr as LExpr, ExprNode};
@@ -320,6 +321,44 @@ pub(crate) fn is_variant_node(variant: &Ident, inner: LExpr) -> ExprNode {
 /// fail to match the SST renderer's output for the same VarAt.
 pub(crate) fn varat_pre_name(name: &str) -> String {
     format!("{}_at_pre_tactus", name)
+}
+
+/// True when a parameter (or local) is an `&mut`-like reference whose
+/// Lean binder type should be the `Tactus.MutRef` wrapper.
+///
+/// Covers three Verus shapes that all denote the same semantic thing
+/// (a mutable reference to T):
+/// * **Legacy mode**: `is_mut: true` with `typ` = plain `T`. Verus's
+///   default mode produces this for `fn f(x: &mut T)`.
+/// * **New-mut-ref mode after migration**: `is_mut: false` with
+///   `typ` = `TypX::MutRef(T)`. Produced under `-V new-mut-ref` plus
+///   `deprecated_postcondition_mut_ref_style(true)`.
+/// * **Decorated**: `typ` = `Decorate(MutRef, _, T)`. The decoration-
+///   level shape that appears at some VIR sites.
+///
+/// All three render uniformly as `(x : Tactus.MutRef T)` at the Lean
+/// binder via [`crate::to_lean_type::param_binder_typ`]. The shared
+/// predicate keeps every site that asks "is this an &mut?" in
+/// lockstep — a future Verus-side change to how `&mut` is represented
+/// updates one place rather than several. Used by:
+/// * `to_lean_fn::wrap_body_with_param_derefs` (decides which params
+///   need a body-deref shadow)
+/// * `sst_to_lean::build_param_binders` (decides which binders get
+///   wrapper-typed)
+/// * `sst_to_lean::exec_fn_theorems_to_ast` (decides which params
+///   populate `mut_param_names` for the SST rewrite + the pre-state
+///   capture frames)
+/// * `sst_to_lean::add_param_subst_entries` (decides which callee
+///   params need pre/post substitution split)
+pub(crate) fn is_mut_ref_typ(typ: &Typ, is_mut: bool) -> bool {
+    if is_mut {
+        return true;
+    }
+    match &**typ {
+        TypX::MutRef(_) => true,
+        TypX::Decorate(TypDecoration::MutRef, _, _) => true,
+        _ => false,
+    }
 }
 
 /// Lean accessor string for the `n`th element of an `arity`-tuple.

@@ -41,6 +41,12 @@ const TACTIC_BODY_FALLBACK: &str = "sorry";
 ///
 /// Mirrors `to_lean_type::typ_to_node`'s decision about which decorations
 /// produce a wrapper. Keep in sync.
+///
+/// **Note**: this is the *typ-only* check. For `&mut` params Verus's
+/// legacy mode also produces `is_mut: true` with a non-decorated typ —
+/// use [`crate::expr_shared::is_mut_ref_typ`] when both signals are
+/// available (which is the canonical "is this param wrapper-bound?"
+/// question).
 pub(crate) fn is_ref_decorated(typ: &TypX) -> bool {
     matches!(typ,
         TypX::Decorate(TypDecoration::Ref | TypDecoration::MutRef
@@ -49,24 +55,39 @@ pub(crate) fn is_ref_decorated(typ: &TypX) -> bool {
         | TypX::MutRef(_))
 }
 
-/// Wrap a body expression with `let p := p.deref` (or `p.deref.deref`
-/// for nested decorations) for each reference-decorated param, so the
-/// body sees `p` as the inner type. Lean's shadowing means the binder
-/// `(p : Tactus.Ref T)` survives at the param position (for dispatch)
-/// while the body's references to `p` resolve to the derefed inner.
+/// True when this param's Lean binder is wrapper-typed and so the
+/// body needs a `let p := p.deref` shadow to access the inner value
+/// uniformly. Covers Ref/Box/Rc/Arc decorations plus all three
+/// `&mut`-like shapes (legacy `is_mut: true`, new-mode `MutRef<T>`,
+/// `Decorate(MutRef, _, _)`).
+fn needs_param_deref(p: &Param) -> bool {
+    // Ref-like decorations always wrap.
+    if is_ref_decorated(&p.x.typ) {
+        return true;
+    }
+    // `&mut` in legacy mode (`is_mut: true`, plain typ) also gets
+    // wrapped at the binder via `param_binder_typ`.
+    crate::expr_shared::is_mut_ref_typ(&p.x.typ, p.x.is_mut)
+}
+
+/// Wrap a body expression with `let p := p.deref` for each param whose
+/// Lean binder is wrapper-typed, so the body sees `p` as the inner type.
+/// Lean's shadowing means the binder `(p : Tactus.Ref T)` survives at
+/// the param position (for dispatch) while the body's references to `p`
+/// resolve to the derefed inner.
 ///
-/// Non-ref-decorated params pass through unchanged.
+/// Non-wrapped params pass through unchanged.
 ///
 /// Applied at every site that emits a body containing references to
 /// reference-decorated params: spec_fn_to_ast standalone defs,
 /// trait_impl_to_ast instance method bodies, trait_to_ast class default
-/// bodies.
+/// bodies, proof_fn_to_ast requires/ensures.
 pub(crate) fn wrap_body_with_param_derefs(body: LExpr, params: &Params) -> LExpr {
     // Iterate in REVERSE so the FIRST param's let-binding ends up
     // outermost (after building the wrap by repeatedly prepending).
     let mut wrapped = body;
     for p in params.iter().rev() {
-        if is_ref_decorated(&p.x.typ) {
+        if needs_param_deref(p) {
             let param_name = crate::lean_name::LeanName::from_var_ident(&p.x.name);
             wrapped = LExpr::let_bind(
                 param_name.clone(),
@@ -2003,12 +2024,20 @@ fn fn_binders_with_bounds(f: &FunctionX, include_bound_hyps: bool) -> Vec<LBinde
         let name = crate::lean_name::LeanName::from_var_ident(&p.x.name);
         out.push(LBinder {
             name: Some(name.clone()),
-            ty: typ_to_expr(&p.x.typ),
+            ty: crate::to_lean_type::param_binder_typ(&p.x.typ, p.x.is_mut),
             kind: BinderKind::Explicit,
         });
         if include_bound_hyps {
+            // For wrapper-bound params (`Tactus.Ref`/`MutRef`/...), the
+            // bound applies to the inner value via `.deref` — the wrapper
+            // itself has no order/arithmetic instance.
+            let bound_value = if needs_param_deref(p) {
+                LExpr::field_proj(LExpr::var(name.clone()), "deref")
+            } else {
+                LExpr::var(name.clone())
+            };
             if let Some(pred) = crate::to_lean_sst_expr::type_bound_predicate(
-                &LExpr::var(name.clone()),
+                &bound_value,
                 &p.x.typ,
             ) {
                 out.push(LBinder {

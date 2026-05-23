@@ -1,12 +1,46 @@
 //! Translate VIR types to `lean_ast::Expr` (in Lean, types are expressions).
 
-use vir::ast::{Dt, IntRange, Path, Typ, TypX};
+use vir::ast::{Dt, IntRange, Path, Typ, TypDecoration, TypX};
 use crate::lean_ast::{BinOp, Expr, ExprNode};
 use crate::lean_name::LeanName;
 
 /// Canonical VIR-type → Lean-AST translator.
 pub fn typ_to_expr(typ: &TypX) -> Expr {
     Expr::new(typ_to_node(typ))
+}
+
+/// Render a fn parameter's type at the Lean theorem-binder level,
+/// uniformly wrapping `&mut` references through `Tactus.MutRef`
+/// regardless of which Verus mode produced the param.
+///
+/// Verus represents `&mut T` params in two distinct shapes depending
+/// on mode:
+/// * Legacy mode (default): `is_mut: true`, typ = plain `T`.
+/// * New-mut-ref mode: `is_mut: false`, typ = `TypX::MutRef(T)`.
+///
+/// The new-mode shape's `TypX::MutRef` arm of `typ_to_node` already
+/// emits `Tactus.MutRef T`. For the legacy shape, the plain typ would
+/// emit just `T` — we wrap it here so both modes converge at the
+/// binder level. Downstream machinery (body-deref shadow, pre-state
+/// capture, call-site substitution) then treats both modes uniformly.
+///
+/// `is_mut_ref_typ` (in `expr_shared`) is the canonical predicate.
+pub(crate) fn param_binder_typ(typ: &Typ, is_mut: bool) -> Expr {
+    let rendered = typ_to_expr(typ);
+    // If typ already renders through a MutRef wrapper (new mode or
+    // decorated shape), no extra wrap needed.
+    let already_wrapped = matches!(
+        &**typ,
+        TypX::MutRef(_) | TypX::Decorate(TypDecoration::MutRef, _, _)
+    );
+    if is_mut && !already_wrapped {
+        Expr::new(ExprNode::App {
+            head: Box::new(Expr::new(ExprNode::Var(LeanName::lit("Tactus.MutRef")))),
+            args: vec![rendered],
+        })
+    } else {
+        rendered
+    }
 }
 
 /// True when `typ` is the unit type (`()` in Verus). After
