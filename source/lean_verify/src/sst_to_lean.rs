@@ -429,7 +429,7 @@ impl<'a> WpCtx<'a> {
             let rewritten = rewrite_mut_ref_in_exp(
                 req,
                 mut_param_names,
-                RewritePhase::Body,
+                RewritePhase::Reqs,
             );
             check_exp(&rewritten)?;
         }
@@ -2159,17 +2159,29 @@ fn rewrite_varat_for_mut_params(
 // and will hit the renderer's "unsupported unary op" arm. Those map
 // to deferred follow-ups (`&mut v[i]`, etc.).
 
-/// Phase-of-rendering context for [`rewrite_mut_ref_in_exp`].
-/// `MutRefCurrent` has different meaning in body vs ensures:
-/// * **Body**: reads the current dynamic value of `*x` — semantically
-///   the post-state, which after the body's let-shadow chain is just
-///   `Var(x)`.
-/// * **Ensures**: reads the pre-state (`*old(x)`), captured at fn
-///   entry into the OblCtx frame `let <x>_at_pre_tactus := x.deref`.
+/// Phase-of-rendering context for [`rewrite_mut_ref_in_exp`]. The
+/// canonical destination for `VarAt(x, Pre)` and `MutRefCurrent(Var(x))`
+/// depends on what's in scope at the rendering site:
+/// * **Body**: OblCtx has `let <x>_at_pre_tactus := x.deref` and
+///   `let x := x.deref` in scope. `*x` (current) → `Var(x)` (resolves
+///   to body-shadowed inner T); `*old(x)` (pre-state) →
+///   `Var(<x>_at_pre_tactus)` (resolves to captured pre-state).
+/// * **Ensures**: same OblCtx scope as Body. `*x` (post-state via
+///   let-shadow chain) → `Var(x)`; `*old(x)` (pre-state) →
+///   `Var(<x>_at_pre_tactus)`. The difference from Body is that
+///   `MutRefCurrent(Var(x))` reads pre-state in new-mut-ref mode's
+///   ensures convention (Verus pairs `MutRefCurrent` with pre-state
+///   semantics in ensures).
+/// * **Reqs**: theorem-binder scope — `<x>_at_pre_tactus` is NOT in
+///   scope; only the per-req `let x := x.deref` wrap applies. At fn
+///   entry pre-state IS current state, so `VarAt(x, Pre)` and
+///   `MutRefCurrent(Var(x))` both → `Var(x)` (resolves to inner T
+///   via the per-req shadow).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum RewritePhase {
     Body,
     Ensures,
+    Reqs,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -2220,65 +2232,111 @@ fn mk_pre_state_var(span: &vir::messages::Span, typ: &Typ, id: &VarIdent) -> Exp
     SpannedTyped::new(span, typ, ExpX::Var(new_ident))
 }
 
-fn rewrite_one_mut_ref(
+// The rewrite happens in two ordered sub-passes. The split is forced
+// by Verus's `sst_visitor`, which walks children-then-parent (post-
+// order). Doing both transformations in one closure would race: for
+// `MutRefFuture(_, VarAt(x, Pre))` (Verus's post-state-of-entry-value
+// pattern), the inner `VarAt(x, Pre)` would be rewritten to
+// `Var(<x>_at_pre_tactus)` before the outer `MutRefFuture` closure
+// fires, and the outer would no longer recognize it as a mut-param ref.
+//
+// Splitting into two ordered passes side-steps the ordering issue
+// while keeping each pass simple enough that the bottom-up visitor
+// gives the right answer for it in isolation:
+//
+//   Sub-pass A (`unwrap_mut_ref_ops`): strip MutRefCurrent /
+//     MutRefFuture / MutRefFinal wrappers, leaving inner Var / VarLoc /
+//     VarAt(_, Pre) untouched. This is a structural one-step rewrite —
+//     bottom-up is fine because the inner ident is preserved literally.
+//
+//   Sub-pass B (`rename_varat_pre`): rename any remaining standalone
+//     VarAt(x, Pre) → Var(<x>_at_pre_tactus). After sub-pass A the
+//     only VarAt(_, Pre) sites are the legacy `*old(x)` references,
+//     which need the synthetic-name rewrite uniformly.
+//
+// `rewrite_mut_ref_in_exp` chains them — one external call, two
+// internal passes — so the call sites see a single "make this Exp
+// reference mut-ref state correctly" operation.
+
+/// Sub-pass A: unwrap MutRefCurrent / MutRefFuture / MutRefFinal ops
+/// around mut-param references. Phase determines what each becomes:
+///
+/// | Phase   | Op                                | Result                          |
+/// |---------|-----------------------------------|---------------------------------|
+/// | Body    | `MutRefCurrent(Var(x))`           | `Var(x)`                        |
+/// | Body    | `MutRefCurrent(VarLoc(x))`        | `VarLoc(x)`                     |
+/// | Body    | `MutRefCurrent(VarAt(x, Pre))`    | `VarAt(x, Pre)` (sub-pass B handles)|
+/// | Ensures | `MutRefCurrent(Var(x))`           | `VarAt(x, Pre)` (sub-pass B handles)|
+/// | Ensures | `MutRefCurrent(VarAt(x, Pre))`    | `VarAt(x, Pre)` (sub-pass B handles)|
+/// | Reqs    | `MutRefCurrent(Var(x))`           | `Var(x)`                        |
+/// | Reqs    | `MutRefCurrent(VarAt(x, Pre))`    | `Var(x)` (collapsed by per-req shadow)|
+/// | both    | `MutRefFuture(_, Var(x))`         | `Var(x)`                        |
+/// | both    | `MutRefFuture(_, VarLoc(x))`      | `VarLoc(x)`                     |
+/// | both    | `MutRefFuture(_, VarAt(x, Pre))`  | `Var(x)` (post-state collapse)  |
+/// | both    | `MutRefFinal(_, ...)`             | same as MutRefFuture            |
+///
+/// In ensures phase, `MutRefCurrent` semantically reads pre-state;
+/// rather than producing the synthetic `<x>_at_pre_tactus` here, we
+/// produce `VarAt(x, Pre)` and let sub-pass B handle the rename
+/// uniformly. Same for body's `MutRefCurrent(VarAt(x, Pre))` (rare
+/// shape but Verus's lowering can produce it).
+fn unwrap_one_mut_ref_op(
     e: &Exp,
     mut_param_names: &HashSet<String>,
     phase: RewritePhase,
 ) -> Exp {
-    match &e.x {
-        // Standalone `VarAt(x, Pre)` (legacy ensures shape, or any
-        // `*old(x)` reference). Always maps to pre-state synthetic.
-        ExpX::VarAt(id, vir::ast::VarAt::Pre) => {
-            if mut_param_names.contains(&sanitize(&id.0)) {
-                return mk_pre_state_var(&e.span, &e.typ, id);
-            }
-        }
-        ExpX::Unary(UnaryOp::MutRefCurrent, inner) => {
-            if let Some((id, kind)) = peel_to_var(inner) {
-                if mut_param_names.contains(&sanitize(&id.0)) {
-                    return match (phase, kind) {
-                        // Body, plain Var or already-pre VarAt: in body
-                        // phase the current value IS `Var(x)` (post-
-                        // state via let-shadow chain). VarAt → pre-state.
-                        (RewritePhase::Body, InnerKind::Var) => {
-                            SpannedTyped::new(&e.span, &e.typ, ExpX::Var(id.clone()))
-                        }
-                        (RewritePhase::Body, InnerKind::VarLoc) => {
-                            SpannedTyped::new(&e.span, &e.typ, ExpX::VarLoc(id.clone()))
-                        }
-                        (RewritePhase::Body, InnerKind::VarAtPre) => {
-                            mk_pre_state_var(&e.span, &e.typ, id)
-                        }
-                        // Ensures: `MutRefCurrent` reads pre-state. The
-                        // inner being VarLoc is unexpected (ensures
-                        // don't have L-values) — defensive assert.
-                        (RewritePhase::Ensures, InnerKind::VarLoc) => {
-                            panic!("VarLoc shouldn't appear in ensures position");
-                        }
-                        (RewritePhase::Ensures, InnerKind::Var | InnerKind::VarAtPre) => {
-                            mk_pre_state_var(&e.span, &e.typ, id)
-                        }
-                    };
-                }
-            }
-        }
-        ExpX::Unary(UnaryOp::MutRefFuture(_) | UnaryOp::MutRefFinal(_), inner) => {
-            // Future / Final: post-state in both phases. Same shape as
-            // body's `Var(x)` (after let-shadow chain). Inner may be
-            // `Var(x)`, `VarLoc(x)`, or `VarAt(x, Pre)` (Verus pairs
-            // MutRefFuture with VarAt for the post-state-of-entry-value).
-            if let Some((id, _)) = peel_to_var(inner) {
-                if mut_param_names.contains(&sanitize(&id.0)) {
-                    return SpannedTyped::new(&e.span, &e.typ, ExpX::Var(id.clone()));
-                }
-            }
-        }
-        _ => {}
+    let (inner, is_future_or_final) = match &e.x {
+        ExpX::Unary(UnaryOp::MutRefCurrent, inner) => (inner, false),
+        ExpX::Unary(UnaryOp::MutRefFuture(_) | UnaryOp::MutRefFinal(_), inner) => (inner, true),
+        _ => return e.clone(),
+    };
+    let Some((id, kind)) = peel_to_var(inner) else { return e.clone() };
+    if !mut_param_names.contains(&sanitize(&id.0)) {
+        return e.clone();
     }
-    e.clone()
+    let new_x = if is_future_or_final {
+        // Future/Final = post-state of the wrapper. Body's let-shadow
+        // chain rebinds `x` to inner T; that's the post-state. VarLoc
+        // stays VarLoc (assign LHS); VarAt-inner collapses to Var
+        // (post-state == final-state, no pre-state semantics here).
+        match kind {
+            InnerKind::VarLoc => ExpX::VarLoc(id.clone()),
+            InnerKind::Var | InnerKind::VarAtPre => ExpX::Var(id.clone()),
+        }
+    } else {
+        // MutRefCurrent — phase-dependent.
+        match (phase, kind) {
+            (RewritePhase::Body, InnerKind::Var) => ExpX::Var(id.clone()),
+            (RewritePhase::Body, InnerKind::VarLoc) => ExpX::VarLoc(id.clone()),
+            (RewritePhase::Body, InnerKind::VarAtPre) => {
+                // Leave as VarAt(x, Pre) for sub-pass B to rename to
+                // `<x>_at_pre_tactus`.
+                ExpX::VarAt(id.clone(), vir::ast::VarAt::Pre)
+            }
+            (RewritePhase::Ensures, InnerKind::VarLoc) => {
+                panic!("VarLoc shouldn't appear in ensures position");
+            }
+            (RewritePhase::Ensures, InnerKind::Var | InnerKind::VarAtPre) => {
+                // Ensures MutRefCurrent reads pre-state — leave as
+                // VarAt(x, Pre) for sub-pass B to rename.
+                ExpX::VarAt(id.clone(), vir::ast::VarAt::Pre)
+            }
+            (RewritePhase::Reqs, InnerKind::Var | InnerKind::VarAtPre) => {
+                // Reqs: at fn entry pre = current, both forms → Var(x).
+                ExpX::Var(id.clone())
+            }
+            (RewritePhase::Reqs, InnerKind::VarLoc) => ExpX::VarLoc(id.clone()),
+        }
+    };
+    SpannedTyped::new(&e.span, &e.typ, new_x)
 }
 
-fn rewrite_mut_ref_in_exp(
+/// Sub-pass B: standalone `VarAt(x, Pre)` (any source — legacy
+/// `*old(x)` or sub-pass A's collapsed `MutRefCurrent`/`MutRefFuture`
+/// output) becomes the synthetic pre-state binder in Body/Ensures
+/// scope, or stays as `Var(x)` in Reqs scope (where `<x>_at_pre_tactus`
+/// isn't in scope and pre-state IS current state at fn entry).
+fn rename_varat_pre_in_exp(
     exp: &Exp,
     mut_param_names: &HashSet<String>,
     phase: RewritePhase,
@@ -2287,8 +2345,48 @@ fn rewrite_mut_ref_in_exp(
         return exp.clone();
     }
     vir::sst_visitor::map_exp_visitor(exp, &mut |e: &Exp| {
-        rewrite_one_mut_ref(e, mut_param_names, phase)
+        let ExpX::VarAt(id, vir::ast::VarAt::Pre) = &e.x else { return e.clone() };
+        if !mut_param_names.contains(&sanitize(&id.0)) {
+            return e.clone();
+        }
+        match phase {
+            RewritePhase::Body | RewritePhase::Ensures => {
+                mk_pre_state_var(&e.span, &e.typ, id)
+            }
+            RewritePhase::Reqs => {
+                SpannedTyped::new(&e.span, &e.typ, ExpX::Var(id.clone()))
+            }
+        }
     })
+}
+
+fn unwrap_mut_ref_ops_in_exp(
+    exp: &Exp,
+    mut_param_names: &HashSet<String>,
+    phase: RewritePhase,
+) -> Exp {
+    if mut_param_names.is_empty() {
+        return exp.clone();
+    }
+    vir::sst_visitor::map_exp_visitor(exp, &mut |e: &Exp| {
+        unwrap_one_mut_ref_op(e, mut_param_names, phase)
+    })
+}
+
+/// External entry point: chains sub-pass A (unwrap MutRef* ops) then
+/// sub-pass B (rename standalone VarAt(x, Pre)). One call site → one
+/// canonical destination shape, regardless of which Verus mode produced
+/// the input.
+fn rewrite_mut_ref_in_exp(
+    exp: &Exp,
+    mut_param_names: &HashSet<String>,
+    phase: RewritePhase,
+) -> Exp {
+    if mut_param_names.is_empty() {
+        return exp.clone();
+    }
+    let unwrapped = unwrap_mut_ref_ops_in_exp(exp, mut_param_names, phase);
+    rename_varat_pre_in_exp(&unwrapped, mut_param_names, phase)
 }
 
 fn rewrite_mut_ref_in_stm(
@@ -2298,10 +2396,13 @@ fn rewrite_mut_ref_in_stm(
     if mut_param_names.is_empty() {
         return stm.clone();
     }
-    // Body is always `Body` phase — ensures expressions reach the
-    // rewrite via `rewrite_mut_ref_in_exp` in `WpCtx::new`.
-    vir::sst_visitor::map_exps_in_stm_visitor(stm, &mut |e: &Exp| {
-        rewrite_one_mut_ref(e, mut_param_names, RewritePhase::Body)
+    // Body phase only — ensures expressions reach the rewrite via
+    // `rewrite_mut_ref_in_exp` in `WpCtx::new`.
+    let unwrapped = vir::sst_visitor::map_exps_in_stm_visitor(stm, &mut |e: &Exp| {
+        unwrap_one_mut_ref_op(e, mut_param_names, RewritePhase::Body)
+    });
+    vir::sst_visitor::map_exps_in_stm_visitor(&unwrapped, &mut |e: &Exp| {
+        rename_varat_pre_in_exp(e, mut_param_names, RewritePhase::Body)
     })
 }
 
@@ -3393,14 +3494,16 @@ fn build_req_binders(
         out
     };
     check.reqs.iter().enumerate().map(|(i, req)| {
-        // `Body` phase: at fn entry, `*x` is the pre-state-which-IS-
-        // the-current-state, so `MutRefCurrent(Var(x))` and
-        // `VarAt(x, Pre)` both collapse to `Var(x)` (the let-shadow
-        // we wrap afterward resolves it to inner T).
+        // `Reqs` phase: at fn entry pre IS current, so `VarAt(x, Pre)`
+        // and `MutRefCurrent(Var(x))` both collapse to `Var(x)`. The
+        // per-req `let x := x.deref` shadow (applied below by
+        // `wrap_with_shadows`) then resolves `Var(x)` to inner T at the
+        // theorem-binder position (which is outside the OblCtx that
+        // would otherwise bind `<x>_at_pre_tactus`).
         let rewritten = rewrite_mut_ref_in_exp(
             req,
             mut_param_names,
-            RewritePhase::Body,
+            RewritePhase::Reqs,
         );
         // Insert Int.toNat coercions at Call sites where args render
         // as Lean Int but params render as Lean Nat
