@@ -94,19 +94,10 @@ fn strip_all_ref_decorations(typ: &Typ) -> Typ {
     }
 }
 
-/// Wrapper name (e.g., `"Tactus.Ref"`) for a reference-like decoration,
-/// or `None` for transparent ones (Ghost / Tracked / Never / ConstPtr).
-fn decoration_wrapper(deco: TypDecoration) -> Option<&'static str> {
-    match deco {
-        TypDecoration::Ref => Some("Tactus.Ref"),
-        TypDecoration::MutRef => Some("Tactus.MutRef"),
-        TypDecoration::Box => Some("Tactus.Box"),
-        TypDecoration::Rc => Some("Tactus.Rc"),
-        TypDecoration::Arc => Some("Tactus.Arc"),
-        TypDecoration::Ghost | TypDecoration::Tracked
-        | TypDecoration::Never | TypDecoration::ConstPtr => None,
-    }
-}
+// `decoration_wrapper` moved to `expr_shared` — shared between this
+// renderer's coercion logic, the SST path, and the height-fn /
+// body-shadow machinery.
+use crate::expr_shared::decoration_wrapper;
 
 /// Walk `typ` outermost-in, collecting Tactus wrapper names for each
 /// reference-like `TypX::Decorate` layer. Peels `Boxed` (Verus's poly
@@ -142,24 +133,8 @@ fn apply_ref_wraps(mut e: LExpr, wraps: &[&'static str]) -> LExpr {
     e
 }
 
-/// Count the number of reference-decoration layers in a typ (peeling
-/// `Boxed` transparently). `TypX::MutRef` counts as one layer too.
-fn count_ref_decorations(typ: &TypX) -> usize {
-    let mut n = 0;
-    let mut cur = typ;
-    loop {
-        match cur {
-            TypX::Decorate(deco, _, inner) => {
-                if decoration_wrapper(*deco).is_some() { n += 1; }
-                cur = &**inner;
-            }
-            TypX::Boxed(inner) => cur = &**inner,
-            TypX::MutRef(_) => { n += 1; break; }
-            _ => break,
-        }
-    }
-    n
-}
+// `count_ref_decorations` moved to `expr_shared`.
+use crate::expr_shared::count_ref_decorations;
 
 fn apply_ref_coercion_if_needed(
     expr: &Expr,
