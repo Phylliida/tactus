@@ -3169,6 +3169,72 @@ start warm:
   closed the 6 cluster A failures and recovered 3 strslice/
   inlined_ensure regressions. 419 → 425 tests. See HANDOFF.md.
 
+**Patterns and conventions that emerged from the β refactor**
+(worth carrying forward to future wrapper-aware encoding work):
+
+* **`cases h : <term>` for case-split with propagation.** When
+  case-splitting on a TERM (e.g., `local.deref`) rather than an
+  fvar, the bare `cases <term>` form discharges the variant at the
+  case-split site but does NOT substitute occurrences of `<term>`
+  elsewhere in the goal. The `cases h : <term>` form names the
+  discharged-term equation as a hypothesis (`h : <term> = Variant
+  ...`), enabling subsequent simp_all / rewrite to substitute
+  through aliased let-bindings. Discovered closing cluster A;
+  load-bearing for the wrapper case in `tactus_case_split`.
+
+* **η-reduction as substitution bridge.** When a callee's spec
+  body pre-lifts via `Tactus.X.mk var` (correct for the binder→
+  expr-typ delta at rendering time) and the caller's substituted
+  arg is already wrapper-typed, the over-wrap is corrected by
+  substituting `var → arg.deref` instead of `var → arg`. The
+  pre-lift becomes `Tactus.X.mk arg.deref` which η-reduces to
+  `arg` for single-field structures via Lean's kernel-level
+  structure-η. The mechanism is invisible at the call site but
+  absolutely load-bearing — Lean accepts the form without any
+  explicit rewrite.
+
+* **Selective peel based on callee.kind.** The Piece 3 peel is
+  gated on `FunctionKind::TraitMethodImpl`. The principle: only
+  callees whose spec body uses `ReadPlace`-style auto-`&` lifts
+  need the peel; Static callees use Var directly and would be
+  over-peeled. The kind-discriminator is empirically correlated
+  with the structural property (ReadPlace lift pattern) — a
+  future Static callee that also lifts would break, but no
+  current test exercises that. Documented for the next person
+  who hits the case.
+
+* **Non-structural-only binop peel.** Structural binops (`==`,
+  `+`, `*`, `≤`, ...) apply to wrapper-typed operands directly
+  (Lean infers the operand type from one side). Non-structural
+  binops (those routed via `non_binop_head` to specific head fns
+  like `Tactus.strGetChar`) need inner-typed args and require the
+  peel. Mixing the two — applying the peel uniformly — breaks
+  body/ensures symmetry when Verus's SST collapses auto-derefs
+  into `Var(p)`-with-adjusted-typ form (`test_exec_nested_wrapper_probe`).
+
+**Known follow-up items** (left for future sessions):
+
+* **Shape-drift guard for the wrapper name list in `tactus_case_split`.**
+  The literal `Tactus.Ref / MutRef / Box / Rc / Arc` list in the
+  elab tactic (`TactusPrelude.lean`) parallels `decoration_wrapper`
+  in `expr_shared.rs`. If a contributor adds a new wrapper type to
+  the prelude, both sites need updating. No compile-time check
+  catches divergence. A unit test that scans both lists and asserts
+  agreement would close this gap.
+
+* **Edge probe: `arg_n > 1` for TraitMethodImpl call.** The peel
+  is clamped at 1 (single auto-`&`). A receiver like `&&Box<u8>`
+  (double-wrapped) on a trait method call would peel only once,
+  potentially leaving a residual over-wrap. No test exercises
+  this; unclear if Verus can even produce the shape.
+
+* **Smaller targeted regression probes.** Three structural
+  decisions in the β refactor are pinned only collectively by
+  the 6 cluster A tests + the 3 recovered regressions. Smaller
+  unit probes for each — `cases h :` syntax, non-structural-only
+  binop peel, TraitMethodImpl-only call-site peel — would isolate
+  the failure mode for a future bug.
+
 **Alternatives considered + rejected** (2026-05-20):
 
 - **Filter cross-crate redundant blanket impls** (small
