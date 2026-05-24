@@ -10916,23 +10916,17 @@ test_verify_one_file! {
 //   `test_exec_call_recursive_datatype_termination`'s use of
 //   `Push_val1` on a `&Stack`.
 
-// E1: mut-ref + match — attempt to surface the latent body-shadow
-// conflict for `&mut` that approach 3 (hybrid) doesn't solve.
+// E1: mut-ref + match. The body-shadow conflict for `&mut` is genuinely
+// latent — Verus's lowering of `match *s` for `s : &mut Tag` strips the
+// wrapper at SST level (scrutinee has typ `Tag`, not `MutRef<Tag>`), so
+// `count_ref_decorations(Tag) = 0` and the IsVariant arm doesn't add a
+// spurious deref.
 //
-// Probe result: Verus's lowering of `match *s` for `s : &mut Tag`
-// strips the wrapper at SST level — the match's scrutinee ends up
-// with typ `Tag` (not `MutRef<Tag>`), so `count_ref_decorations(Tag)
-// = 0` and the IsVariant arm doesn't add a spurious deref. The
-// latent conflict doesn't surface here.
-//
-// The test still fails today, but for a different reason: a
-// tactus_auto goal-discharge issue with the enum match's
-// postcondition (`r = 0 ∨ r = 1`). Probably fixable separately;
-// not load-bearing for cluster A.
-//
-// So: mut-ref's latent body-shadow conflict is REALLY latent — we
-// couldn't construct a natural probe that surfaces it via auto-deref
-// shapes. Approach 3 keeping body shadow for `&mut` looks safe.
+// The previously-blocking goal-discharge issue (enum match's
+// postcondition `r = 0 ∨ r = 1` couldn't close) was fixed by β refactor
+// Piece 4 — `tactus_case_split` now recognizes wrapper-typed locals
+// (`s : Tactus.MutRef Tag`) and case-splits on `s.deref`, closing the
+// match-residual postcondition.
 test_verify_one_file! {
     #[test] test_exec_mut_ref_is_variant_probe verus_code! {
         enum Tag { A, B }
@@ -10946,7 +10940,7 @@ test_verify_one_file! {
                 Tag::B => 1,
             }
         }
-    } => Err(_)
+    } => Ok(())
 }
 
 // E11: closure captures a mut-ref param. The outer's body shadow
