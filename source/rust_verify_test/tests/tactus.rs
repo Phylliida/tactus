@@ -10739,3 +10739,66 @@ test_verify_one_file! {
         }
     } => Err(_)
 }
+
+// ── Approach 3 (β refactor) probes ────────────────────────────────────
+//
+// Cluster A's remaining failures share a root cause: with the broad
+// body shadow for `&` params (`let s := s.deref`), the SST typ no
+// longer matches the Lean value type. Sites that count wrappers via
+// SST typ overcounts derefs for shadowed-param refs.
+//
+// Three approaches to fixing:
+//   1. SST pre-pass that peels Var(shadowed).typ — fails on aliased
+//      locals (`let copy = s; ...`).
+//   2. Per-arg renderer awareness at CheckDecreaseHeight — fails on
+//      the same aliased-local probe.
+//   3. Full β refactor: drop body shadow for `&` params, thread
+//      BinderCtx through SST renderer, coerce at every use site.
+//      Keeps body shadow for `&mut` (assignment semantics need it).
+//
+// These probes pin the cases that distinguish the approaches. P1
+// is the clearest counterexample to approaches 1 and 2. P_CLOSURE
+// stresses an approach-3 edge (BinderCtx must extend at closure
+// boundaries).
+
+// P1: Aliased local in recursive call. `copy` is a local let-bound
+// to `rest`, then passed recursively. Approaches 1 and 2 only track
+// shadowing on fn params — `copy` isn't in their set, so they'd
+// apply count_ref_decorations(&Stack) = 1 derefs at CheckDecreaseHeight
+// based on SST typ. With body shadow, `copy` at Lean is inner Stack
+// (because RHS `rest` was inner). One deref too many.
+//
+// Approach 3 handles this naturally: no body shadow, copy stays
+// wrapper-typed at Lean, .deref applies correctly.
+test_verify_one_file! {
+    #[test] test_exec_call_recursive_aliased_arg_probe verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum Stack {
+            Empty,
+            Push(u8, Box<Stack>),
+        }
+
+        #[verifier::tactus_auto]
+        fn shrink(s: &Stack) -> (r: u64)
+            decreases s
+        {
+            match s {
+                Stack::Empty => 0,
+                Stack::Push(_, rest) => {
+                    // Alias the wrapper-typed local before recursing.
+                    let copy = rest;
+                    shrink(copy)
+                }
+            }
+        }
+    } => Ok(())
+}
+
+// P_CLOSURE noted but not pinned with a test: closure captures an
+// outer-scope wrapper-typed param. Approach 3 needs BinderCtx to
+// extend at closure boundaries so the closure body's coercion logic
+// sees the captured wrapper's typ correctly. Hard to construct a
+// minimal exec-mode probe without dragging in vstd or trait methods —
+// will revisit after approach 3 lands and we can see what shapes
+// actually appear in practice.
