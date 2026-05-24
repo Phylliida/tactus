@@ -454,16 +454,30 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
         // desugaring lowers to `Field { field: "0", .. }`. Without the
         // shared mapping the SST side would emit `.0` and Lean would
         // reject it.
+        //
+        // Wrapper coercion (β refactor Piece 2): the receiver may have
+        // SST typ `&T` / `Box<T>` / etc.; the field belongs to T. Peel
+        // wrapper layers via `.deref` so the Lean projection lands on
+        // the inner inductive.
         ExpX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
-            LExpr::field_proj(sst_exp_to_ast_checked(inner)?, field_access_name(field_opr)).node
+            use crate::expr_shared::{apply_deref_chain, count_ref_decorations};
+            let inner_rendered = sst_exp_to_ast_checked(inner)?;
+            let n = count_ref_decorations(&*inner.typ);
+            LExpr::field_proj(apply_deref_chain(inner_rendered, n), field_access_name(field_opr)).node
         }
         // `IsVariant { datatype, variant }` is the desugared form
         // `ast_simplify` produces when lowering `match scrutinee { Variant { … } => … }`
         // into an if-chain (see `vir::ast_simplify::pattern_to_exprs_rec`).
         // Shared with the VIR-AST renderer so the `is<Variant>` naming
         // convention matches the one Lean auto-derives on inductives.
+        //
+        // Wrapper coercion (β refactor Piece 2): same shape as Field —
+        // peel wrapper layers before the `.is<Variant>` projection.
         ExpX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => {
-            is_variant_node(variant, sst_exp_to_ast_checked(inner)?)
+            use crate::expr_shared::{apply_deref_chain, count_ref_decorations};
+            let inner_rendered = sst_exp_to_ast_checked(inner)?;
+            let n = count_ref_decorations(&*inner.typ);
+            is_variant_node(variant, apply_deref_chain(inner_rendered, n))
         }
         // `HasType(e, t)` — the refinement constraint for `e` to inhabit
         // `t`. For fixed-width ints (u8, i32, …) this is the bounds check

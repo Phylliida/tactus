@@ -776,26 +776,32 @@ pub fn exec_fn_theorems_to_ast<'a>(
         heartbeats: fn_sst.x.attrs.tactus_heartbeats,
     };
 
-    // Initial OblCtx frames per wrapper-typed param. The frames are
-    // pushed first (outermost in wrap order) so the body's WP sees
-    // the shadowed-to-inner names in scope.
+    // Initial OblCtx frames per `&mut` param. Two frames per:
     //
     //   let x := x.deref;                    -- body-shadow: makes Var(x)
     //                                           in the rewritten body
-    //                                           resolve to inner T.
-    //   let <x>_at_pre_tactus := x.deref;   -- ONLY for `&mut`: captures
-    //                                           pre-state inner before
-    //                                           any body writes shadow x.
+    //                                           resolve to inner T. Needed
+    //                                           because mutation `*x = e`
+    //                                           lowers to Lean let-shadow.
+    //   let <x>_at_pre_tactus := x.deref;   -- captures pre-state inner
+    //                                           before any body writes
+    //                                           shadow x.
     //
-    // The binder `(x : Tactus.Ref T)` / `(x : Tactus.MutRef T)` survives
-    // at param position for trait dispatch; the body's WP sees `x : T`.
+    // The binder `(x : Tactus.MutRef T)` survives at param position for
+    // trait dispatch; the body's WP sees `x : T`.
     //
     // BorrowMut locals (#107 synthetic `mut_ref` from `bump(&mut y)`
-    // lowering) are MutRef-typed; they get both frames.
+    // lowering) are MutRef-typed; they get the same two frames.
     //
-    // Non-mut wrapper params (`&Stack`, `Box<u8>`, `Rc<T>`, `Arc<T>`)
-    // get only the body-shadow — there's no pre-state vs post-state
-    // distinction for immutable references.
+    // β refactor Piece 1 (LANDED): non-mut wrapper params (`&Stack`,
+    // `Box<u8>`, `Rc<T>`, `Arc<T>`) get NO body-shadow. The wrapper
+    // type stays in scope at Lean level; uses go through use-site
+    // `.deref` coercions in `to_lean_sst_expr.rs`'s IsVariant, Field,
+    // and CheckDecreaseHeight arms (driven by `count_ref_decorations`).
+    // This is what closes cluster A's "Invalid field `deref`" type
+    // errors — pre-Piece-1, the body shadow stripped one wrapper, so
+    // aliased locals derived from the param had Lean type T but SST
+    // typ &T, and count_ref_decorations overcounted by one.
     //
     // The fn's requires stay in theorem-level binders
     // (`build_req_binders` above) and get their own per-req
@@ -814,14 +820,10 @@ pub fn exec_fn_theorems_to_ast<'a>(
         let lean_name = crate::lean_name::LeanName::from_var_ident(&par.x.name);
         let raw_name = sanitize(&par.x.name.0);
         let is_mut_ref = is_mut_ref_typ(&par.x.typ, par.x.is_mut);
-        let is_wrapped = is_mut_ref || crate::to_lean_fn::is_ref_decorated(&*par.x.typ);
-        if !is_wrapped {
-            continue;
-        }
         if is_mut_ref {
             initial_obl_ctx = add_pre_capture(initial_obl_ctx, &raw_name, &lean_name);
+            initial_obl_ctx = add_body_shadow(initial_obl_ctx, lean_name);
         }
-        initial_obl_ctx = add_body_shadow(initial_obl_ctx, lean_name);
     }
     for decl in check.local_decls.iter() {
         if matches!(decl.kind, LocalDeclKind::BorrowMut) {
