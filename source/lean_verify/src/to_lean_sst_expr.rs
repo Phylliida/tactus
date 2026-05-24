@@ -25,8 +25,8 @@
 use vir::ast::*;
 use vir::sst::{BndX, CallFun, Exp, ExpX, InternalFun};
 use crate::expr_shared::{
-    binop_to_ast, clip_coercion_head, const_to_node_common, ctor_node, field_access_name,
-    is_variant_node, non_binop_head,
+    apply_deref_chain, binop_to_ast, clip_coercion_head, const_to_node_common, count_ref_decorations,
+    ctor_node, field_access_name, is_variant_node, non_binop_head,
 };
 use crate::lean_ast::{substitute, Expr as LExpr, ExprNode};
 use crate::to_lean_expr::vir_var_binders_to_ast;
@@ -460,7 +460,6 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
         // wrapper layers via `.deref` so the Lean projection lands on
         // the inner inductive.
         ExpX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
-            use crate::expr_shared::{apply_deref_chain, count_ref_decorations};
             let inner_rendered = sst_exp_to_ast_checked(inner)?;
             let n = count_ref_decorations(&*inner.typ);
             LExpr::field_proj(apply_deref_chain(inner_rendered, n), field_access_name(field_opr)).node
@@ -474,7 +473,6 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
         // Wrapper coercion (β refactor Piece 2): same shape as Field —
         // peel wrapper layers before the `.is<Variant>` projection.
         ExpX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => {
-            use crate::expr_shared::{apply_deref_chain, count_ref_decorations};
             let inner_rendered = sst_exp_to_ast_checked(inner)?;
             let n = count_ref_decorations(&*inner.typ);
             is_variant_node(variant, apply_deref_chain(inner_rendered, n))
@@ -645,7 +643,6 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 // non-structural path because structural binops don't
                 // have this constraint.
                 None => {
-                    use crate::expr_shared::{apply_deref_chain, count_ref_decorations};
                     let l = apply_deref_chain(l, count_ref_decorations(&*lhs.typ));
                     let r = apply_deref_chain(r, count_ref_decorations(&*rhs.typ));
                     LExpr::app(LExpr::var_lit(non_binop_head(op)), vec![l, r]).node
@@ -794,7 +791,6 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 // `Stack.height` expects `Stack` — wrap with `.deref`
                 // once per wrapper layer (matches the body-shadow's
                 // unwrapping convention).
-                use crate::expr_shared::{apply_deref_chain, count_ref_decorations};
                 let cur_n = count_ref_decorations(&*args[0].typ);
                 let prev_n = count_ref_decorations(&*args[1].typ);
                 let cur_h = LExpr::app1(LExpr::var_synthetic(cur_height), apply_deref_chain(cur, cur_n));

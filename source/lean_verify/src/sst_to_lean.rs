@@ -2808,45 +2808,41 @@ fn build_call_substitutions<'a>(
     // arg shapes, so the rendered form is the caller-side variable
     // reference (the pre-call value).
     //
-    // β refactor Piece 3: peel each rendered arg by the wrapper-depth
-    // delta vs its callee param. The trait method spec body's
-    // `Var(self)` may be rendered with a `.mk` lift (via
-    // `apply_ref_coercion_if_needed`: structural_typ on ReadPlace
-    // returns the place's peeled typ, but expr.typ carries the
-    // auto-`&` adjustment, so a `Tactus.X.mk` wrap is added to
-    // bridge). When the caller's arg is already wrapper-typed,
-    // substituting `self → b` would over-wrap. Substituting
-    // `self → b.deref` makes the pre-lift become `Tactus.X.mk b.deref`
-    // which η-reduces to `b` for single-field structures (Lean's
-    // structure-η on the kernel level).
-    let arg_lexprs: Vec<LExpr> =
-        args.iter().map(|a| lower_validated(a)).collect();
-
-    // β refactor Piece 3: peel each rendered arg by the auto-`&` lift
-    // that the spec body's ReadPlace renderer adds to Var(p). This is
-    // selective: trait method (TraitMethodImpl) callees use spec bodies
-    // that consistently apply `apply_ref_coercion_if_needed` lifts via
-    // ReadPlace (self.method()-style). Static/non-trait callees don't
-    // use this pattern, so peeling there over-peels and breaks
-    // (e.g., `Box::deref(b)` where the body is just `*self`, not
-    // `(&self).deref()`).
+    // β refactor Piece 3: for TraitMethodImpl callees, apply ONE
+    // `.deref` to wrapper-typed args. Why this is needed:
     //
-    // Substituting `self → b.deref` makes the spec body's pre-lifted
-    // `Tactus.X.mk self` become `Tactus.X.mk b.deref` which η-reduces
-    // to `b` for single-field structures.
+    // * The trait spec body's `Var(self)` appears wrapped in
+    //   `ReadPlace(Place(self), ImmutBor)` for method-call sites
+    //   (`self.method()`). `apply_ref_coercion_if_needed` sees
+    //   that structural_typ of ReadPlace is the place's peeled typ
+    //   while expr.typ carries the auto-`&` adjustment, and adds a
+    //   `Tactus.X.mk` wrap to bridge. Pre-β this was a no-op
+    //   (`count_ref` returned 0); post-β it produces a real wrap.
+    // * Substituting `self → b` into `Tactus.X.mk self` gives
+    //   `Tactus.X.mk b` which over-wraps when b is already wrapper-
+    //   typed. Substituting `self → b.deref` gives `Tactus.X.mk
+    //   b.deref` which η-reduces to `b` via Lean's structure-η on
+    //   single-field structures.
+    //
+    // The peel is SELECTIVE: only TraitMethodImpl callees apply the
+    // ReadPlace lift pattern in their spec bodies. Static/non-trait
+    // callees use Var directly (no lift), so peeling there would
+    // over-strip (e.g., `Box::deref(b)` where the spec body is
+    // `*self`, not `(&self).deref()`).
+    //
+    // The peel is CLAMPED at 1: the auto-`&` adjustment is single-
+    // layer (one `&self` borrow). Peeling further would over-strip
+    // nested wrappers like `&Box<u8>` whose inner `Box` is part of
+    // the actual type.
     use crate::expr_shared::{apply_deref_chain, count_ref_decorations};
     let should_peel = matches!(callee.kind, FunctionKind::TraitMethodImpl { .. });
-    let arg_lexprs: Vec<LExpr> = arg_lexprs.into_iter().enumerate().map(|(i, lexpr)| {
+    let arg_lexprs: Vec<LExpr> = args.iter().map(|a| {
+        let rendered = lower_validated(a);
         if should_peel {
-            // Clamp at 1: the auto-`&` adjustment that lifts at the spec
-            // body's ReadPlace site is single-layer (one `&self` borrow).
-            // Peeling further would over-strip nested wrappers like
-            // `&Box<u8>` whose inner `Box` is genuinely part of the type.
-            let arg_n = count_ref_decorations(&*args[i].raw().typ);
-            let peel = arg_n.min(1);
-            apply_deref_chain(lexpr, peel)
+            let peel = count_ref_decorations(&*a.raw().typ).min(1);
+            apply_deref_chain(rendered, peel)
         } else {
-            lexpr
+            rendered
         }
     }).collect();
 
