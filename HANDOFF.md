@@ -5822,6 +5822,239 @@ since probe is Err-pinned and would have been Err either way).
 209 lean_verify unit, 66 rust_verify unit, 7 integration. vstd
 1530/0.
 
+#### Current session (2026-05-23 / 2026-05-24 — wrapper-arch follow-on: mut-ref collapse, termination_by sizeOf, cluster A scoped + handoff)
+
+Two sessions of follow-on work after the 2026-05-20 wrapper-type
+architecture (commits `f5362bb` Phase 1, `831a293` Phase 2). Six
+commits landed (`bffaf65`, `6b1f298`, `ca8f979`, `c3d2eda`,
+`da63c45`, `b52b67a`) plus probe additions (`5dc7f13`, `1568d2c`,
+`70a31c7`) and poems (`22aa5ee`).
+
+**Test count moved 376 → 419 (+43).** Most of the gain (+8) came
+from one experiment: `termination_by sizeOf` on the height fn.
+
+##### Landings
+
+1. **Mut-ref collapse** (`bffaf65` + `6b1f298`) — collapsed dual
+   mut-ref handling into a single coherent path. `is_mut_ref_par`
+   and `is_mut_ref_param` (per-type-alias predicates) → shared
+   `is_mut_ref_typ(&typ, is_mut)` in `expr_shared`. Two-pass SST
+   rewrite (`normalize_mut_ref_in_*` then
+   `rewrite_varat_for_mut_params_*`) → single
+   `rewrite_mut_ref_in_*` with `RewritePhase::{Body, Ensures,
+   Reqs}` enum. Legacy `&mut x: T` now renders as `Tactus.MutRef T`
+   at the binder (via new `param_binder_typ` helper) — both Verus
+   modes converge at the Lean level. The split into two ordered
+   sub-passes (`unwrap_mut_ref_ops_in_*` then `rename_varat_pre_in_*`)
+   was the second-attempt fix after a first try with a
+   `strip_suffix("_at_pre_tactus")` defensive hack got pushed back
+   for not being root-cause.
+
+2. **Wrapper-aware height fns** (`ca8f979`) — `height_fn_for_datatype`
+   applies `.deref` chains to recursive-field args based on the
+   field's wrapper depth via `count_ref_decorations`. For
+   `enum Stack { Push(u8, Box<Stack>) }` emits
+   `| Stack.Push _ val1 => 1 + Stack.height val1.deref`.
+   `CheckDecreaseHeight` lowering applies the same chain to cur/prev.
+   Helpers (`decoration_wrapper`, `count_ref_decorations`,
+   `apply_deref_chain`) consolidated into `expr_shared`.
+
+3. **Binder naming cleanup** (`c3d2eda` + `da63c45`) — pattern-match
+   binders for variant fields now use the field's declared name
+   (`val0`, `val1`, or user-given) via the existing `field_name`
+   helper, instead of synthetic `_rec_<idx>` / `_tactus_field_<idx>`.
+   Generated `.lean` reads idiomatically:
+
+   ```lean
+   @[simp] noncomputable def Stack.height : Stack → Nat :=
+     fun s => match s with
+       | Stack.Empty => 1
+       | Stack.Push _ val1 => 1 + Stack.height val1.deref
+   ```
+
+4. **`termination_by sizeOf` + wrapper SizeOf simp lemmas** (`b52b67a`)
+   — Lean's structural-recursion analyzer can't prove
+   `Stack.height val1.deref` decreases when `val1 : Tactus.Box Stack`
+   (the `.deref` projection is opaque to the analyzer; rejects with
+   `invalid projection x✝.2.1`). Switched the recursive-case height
+   fn from `DefCurried` to `Def` (match-in-body) with explicit
+   `termination_by sizeOf s` + `decreasing_by all_goals (simp_all;
+   omega)`. Added five `@[simp]` theorems to `TactusPrelude.lean`
+   so each wrapper's auto-derived `SizeOf` becomes visible to
+   `simp_all`:
+
+   ```lean
+   @[simp] theorem Tactus.Box.sizeOf_deref {A : Type} [SizeOf A]
+     (b : Tactus.Box A) : sizeOf b = 1 + sizeOf b.deref := by cases b; rfl
+   ```
+
+   The `by cases b; rfl` is needed because structure-η for SizeOf
+   isn't rfl directly. New `Def.decreasing_by: Option<String>`
+   field + pp emission. `sanity::name_resolves` allowlists `sizeOf`.
+
+   **+8 newly-passing tests**: all non-generic SCC + mutually-
+   recursive datatype tests (`test_exec_three/four/five/ten_element_
+   datatype_scc`, `test_exec_two_independent_sccs`,
+   `test_exec_mutually_recursive_datatypes`,
+   `test_exec_scc_plus_standalone_datatype`,
+   `test_exec_generic_mutual_scc`).
+
+5. **Edge-case probes for cluster A's remaining failures** (`5dc7f13`
+   + `1568d2c` + `70a31c7`) — 8 probes pinning the design space
+   for the β refactor (see "Cluster A's remaining work" below).
+   Net of probes: 4 actually pass + 2 Err-pinned matching their
+   failure + 2 Ok-pinned actually-failing = +6 in cargo-test
+   accounting, +2 new failures (P1, P_CALL_SITE).
+
+##### Cluster A's remaining work — 6 failing tests, single root cause
+
+All 6 remaining cluster A failures share one root cause: the
+**body-shadow + count_ref_decorations conflict**.
+
+Current state at HEAD:
+- `&` and `&mut` params get a body-shadow OblCtx frame:
+  `let s := s.deref`. This makes `s` at Lean be the inner T (not
+  the wrapper), so body code like `s.method()` works directly.
+- SST use sites (IsVariant, Field receiver, CheckDecreaseHeight
+  cur/prev) apply `.deref` based on `count_ref_decorations(expr.typ)`.
+  Necessary for field-derived wrappers like `rest : Box<Stack>`
+  (which the body shadow doesn't reach).
+
+The conflict: for any value DERIVED from a body-shadowed param
+(e.g., `let decrease_init0 := s` aliases s), the SST typ is still
+`&Stack` but the Lean value is inner `Stack` (because RHS `s` was
+shadowed). count_ref_decorations sees `&Stack` → applies 1 deref →
+`decrease_init0.deref` → "Invalid field deref: Stack doesn't have
+deref" type error.
+
+The 6 failing tests all produce this exact error shape on some
+expression. They are:
+
+- `test_exec_call_recursive_datatype_termination`
+- `test_exec_call_recursive_generic_datatype`
+- `test_exec_call_recursive_generic_datatype_cross_instantiation`
+- `test_exec_call_recursive_generic_datatype_trait_bound`
+- `test_exec_call_recursive_generic_datatype_two_params`
+- `test_exec_call_recursive_over_mutual_datatype`
+- `test_exec_cross_fn_scc_cross_type_decreases`
+
+(Plus P1 from the probe set — `test_exec_call_recursive_aliased_arg_probe`.)
+
+##### The probe set as a contract for the fix
+
+Each probe pins a specific aspect of the design space:
+
+| Probe | Status today | What it pins |
+|---|---|---|
+| `test_exec_call_recursive_aliased_arg_probe` (P1) | failing | counterexamples approaches 1+2 — aliased local in recursive call |
+| `test_exec_call_site_ref_to_bare_probe` (P_CALL_SITE) | failing | req body `*p` for `p: &u8` renders without `.deref` |
+| `test_exec_nested_wrapper_probe` (P_NESTED) | passing | `&Box<u8>` double-deref — `count_ref_decorations` handles multi-layer |
+| `test_exec_generic_with_wrapper_instantiation_probe` | passing | generic `T` opaque to `count_ref_decorations` — correctly doesn't try to peel through |
+| `test_exec_ret_wrapper_value_probe` | passing | returning a wrapper-typed value |
+| `test_exec_wrapper_equality_probe` | passing | `s1 == s2` for wrapper-typed values reduces to inner via Lean structure `=` |
+| `test_exec_mut_ref_is_variant_probe` (E1) | failing (Err-pinned) | mut-ref's body-shadow conflict is really latent — Verus's `match *s` strips wrapper at SST level; couldn't surface the analogous mut-ref bug |
+| `test_exec_closure_captures_mut_ref_probe` (E11) | failing (Err-pinned) | closure capturing mut-ref — upstream-blocked by Verus's `exec_nonstatic_call is not supported` (#124) |
+
+##### The β refactor design (the path forward)
+
+Four pieces:
+
+**Piece 1: Drop body shadow for `&`-only params** (keep for
+`&mut`). In `sst_to_lean::exec_fn_theorems_to_ast`, the
+`initial_obl_ctx` setup loop becomes `is_mut_ref_typ`-filtered
+only — no body shadow for non-mut wrappers. The `&mut` body
+shadow stays because mutation `*x = e` is implemented as Lean
+let-shadowing of x.
+
+**Piece 2: Keep the use-site coercions in `to_lean_sst_expr`** —
+IsVariant, Field receiver, CheckDecreaseHeight cur/prev all
+apply `.deref` based on `count_ref_decorations(inner.typ)`. These
+already work correctly when the body shadow isn't interfering;
+right now the shadow strips a wrapper and these add it back.
+
+**Piece 3: Call-site receiver coercion** (the strslice + inlined-
+ensure regressions). When a callee's first param is a non-wrapper
+type but the call arg has wrapper SST typ (e.g., trait method
+expects `Bar` but the caller has `b: &Bar`), the SST renderer
+needs to apply `.deref` at the call arg. Either:
+
+  - Port `to_lean_expr::apply_ref_coercion_if_needed` to the SST
+    renderer with a BinderCtx parameter, OR
+  - Add a focused Call-arg coercion: at `walk_call` /
+    `sst_exp_to_ast_checked`'s Call arms, compare each arg's SST
+    typ to the callee's param typ via `count_ref_decorations` and
+    apply `.deref` to bridge.
+
+  The focused approach is smaller; the BinderCtx is more uniform.
+
+**Piece 4: Smart case-split tactic** (cluster A's discharge).
+After Piece 1 drops body shadow, cluster A tests' TYPE errors go
+away but discharge errors appear. The remaining obligation looks
+like:
+
+  ```
+  ¬ s.deref.isEmpty →
+    rest.deref.height < decrease_init0.deref.height ∨ ...
+  ```
+
+  Closing this needs `cases s.deref` (knowing `s.deref` is either
+  `Empty` or `Push v rest`). `tactus_case_split` (in
+  `TactusPrelude.lean`) currently only finds locals whose
+  DIRECT type is an inductive with `.height`. For wrapper-typed
+  locals it finds nothing and the closer fails.
+
+  Extend the elaborator tactic: when a local's type is a Tactus
+  wrapper (`Tactus.Ref T` / `Tactus.Box T` / etc.) where T has
+  a `.height` companion, try `cases local.deref` (or
+  `rcases h : local.deref` if we need a named hypothesis).
+
+##### Measured cost when I tried Piece 1 alone
+
+Approach 3 lite (Piece 1 + Piece 2, without 3 or 4) measured at
+**416/28 vs 419/25 baseline — net -3**.
+
+Of the 6 cluster A failures, type errors shift to discharge
+failures (Piece 4 still needed). Of the 3 regressions
+(`test_exec_strslice_get_char_in_assert/ensures`,
+`test_inlined_ensure_references_trait_spec_method`), Piece 3 is
+what they need — trait method dispatch fails because receiver is
+wrapper, expected inner.
+
+So Pieces 1+2+3+4 together is the full β. Each piece is bounded
+but together it's a multi-session refactor.
+
+##### Why I stopped here
+
+The +8 from `termination_by sizeOf` was a clean structural win.
+The β refactor pieces compose into a real architectural change
+(every use site that previously assumed inner T from body shadow
+now needs to assert it via coercion). That's a multi-day task on
+its own.
+
+The probe set gives a concrete contract for the work. The honest
+cost-benefit at session end:
+
+- Cluster A's 6 + P1 = 7 failures need β-refactor pieces 1+2+3+4.
+- Piece 3 alone might recover the 3 regressions that Piece 1
+  causes; that's a useful incremental landing if appetite is
+  low.
+- Piece 4 (smart case-split) is needed regardless if cluster A
+  is to verify; it's a standalone task that could go now.
+
+##### Test counts
+
+| Stage | Passing | Failing | Notes |
+|---|---|---|---|
+| 2026-05-20 baseline (Phase 2 just landed) | 376 | 60 | Cluster A all failing via type errors |
+| After mut-ref collapse | 401 | 35 | |
+| After two-pass rewrite fix | 405 | 31 | |
+| After cluster A WIP (broad body shadow) | 405 | 31 | helper consolidation, no test movement |
+| After height fn `_rec_<idx>` → `val0`/`val1` rename | 405 | 31 | cosmetic |
+| After `termination_by sizeOf` experiment | 413 | 23 | **+8** |
+| After 8 edge-case probes added | 419 | 25 | +6 passing + 2 new failures |
+
+vstd: 1530/0 throughout.
+
 ## Architecture
 
 ### Full pipeline
