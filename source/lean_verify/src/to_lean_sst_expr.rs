@@ -613,16 +613,17 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 }
             }
             let (l, r) = (sst_exp_to_ast_checked(lhs)?, sst_exp_to_ast_checked(rhs)?);
-            // β refactor Piece 3: peel any wrapper decorations from each
-            // operand before applying the binop. Tactus's binop head fns
-            // (`Int.toNat`, `Tactus.strGetChar`, `Bool.xor`, etc.) all
-            // take inner-typed args; if an SST operand has wrapper typ
-            // (post-β refactor, `&T` params keep `Tactus.Ref T` at the
-            // Lean type level), we need `.deref` to bridge.
-            use crate::expr_shared::{apply_deref_chain, count_ref_decorations};
-            let l = apply_deref_chain(l, count_ref_decorations(&*lhs.typ));
-            let r = apply_deref_chain(r, count_ref_decorations(&*rhs.typ));
             match binop_to_ast(op) {
+                // Structural binops (==, +, *, ≤, ...) — pass operands
+                // through as-rendered. NO wrapper peel: structural
+                // binops can apply to wrapper-typed operands directly
+                // (e.g., `r == b` for both : Tactus.Ref T typechecks
+                // when r's type is inferred from a `let r := b`).
+                // Peeling would introduce spurious `.deref`s that
+                // break body/ensures rendering symmetry when Verus's
+                // SST collapses auto-derefs into `Var(p)`-with-
+                // adjusted-typ form (probed by
+                // test_exec_nested_wrapper_probe).
                 Some(l_op) => LExpr::binop(l_op, l, r).node,
                 // Non-structural: emit as `head lhs rhs` via App.
                 // Reachable cases in the exec-fn path:
@@ -635,7 +636,20 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 // Routed through the shared `non_binop_head` table so
                 // the head string stays in sync with the VIR-AST
                 // renderer.
-                None => LExpr::app(LExpr::var_lit(non_binop_head(op)), vec![l, r]).node,
+                //
+                // β refactor Piece 3: peel wrapper decorations from each
+                // operand for these non-structural binops. The head
+                // fns (`Tactus.strGetChar`, `Bool.xor`, etc.) take
+                // inner-typed args; an SST operand with wrapper typ
+                // needs `.deref` to bridge. Restricted to the
+                // non-structural path because structural binops don't
+                // have this constraint.
+                None => {
+                    use crate::expr_shared::{apply_deref_chain, count_ref_decorations};
+                    let l = apply_deref_chain(l, count_ref_decorations(&*lhs.typ));
+                    let r = apply_deref_chain(r, count_ref_decorations(&*rhs.typ));
+                    LExpr::app(LExpr::var_lit(non_binop_head(op)), vec![l, r]).node
+                }
             }
         }
         ExpX::BinaryOpr(BinaryOpr::ExtEq(_, _), lhs, rhs) => {
