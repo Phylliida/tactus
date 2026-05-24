@@ -39,6 +39,43 @@ pub fn vir_expr_to_ast(expr: &Expr) -> LExpr {
     vir_expr_to_ast_with_binders(expr, &BinderCtx::new())
 }
 
+/// Variant for callee-spec inlining contexts. Suppresses the
+/// `apply_ref_coercion_if_needed` lift at `ExprX::ReadPlace` sites
+/// (returns None from `structural_typ` for ReadPlace via the
+/// `READPLACE_LIFT_ENABLED` thread-local).
+///
+/// Why: standalone proof / spec / trait-impl-method bodies need the
+/// lift to bridge from peeled-binder rendering to decorated-expr.typ
+/// (the auto-`&` adjustment from a method call). But callee-spec
+/// inlining substitutes the rendered form with a CALLER-provided arg
+/// — and post-β refactor, that arg is already wrapper-typed. The
+/// lift then over-wraps, requiring a downstream peel (see
+/// `build_call_substitutions` / Piece 3 history).
+///
+/// Disabling the lift at the inlining-render site means the
+/// substituted form matches the caller's wrapper-typed arg directly:
+/// `Foo.predicate self` + `subst self → b` → `Foo.predicate b`
+/// (where b : Tactus.Ref Bar matches the class signature's
+/// `Tactus.Ref Self → Prop`).
+pub fn vir_expr_to_ast_for_inlining(expr: &Expr) -> LExpr {
+    READPLACE_LIFT_ENABLED.with(|cell| {
+        let prior = cell.replace(false);
+        let result = vir_expr_to_ast_with_binders(expr, &BinderCtx::new());
+        cell.set(prior);
+        result
+    })
+}
+
+thread_local! {
+    /// Controls whether `structural_typ` for `ExprX::ReadPlace`
+    /// returns the place's peeled typ (default true → lift fires via
+    /// apply_ref_coercion) or `None` (false → no lift). Toggled
+    /// false during `vir_expr_to_ast_for_inlining` and restored on
+    /// exit. The default is `true` so non-inlining callers keep
+    /// pre-existing behaviour.
+    static READPLACE_LIFT_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
 /// Build a `lean_ast::Expr` from a VIR-AST expression with the given
 /// binder context. Inserts `Tactus.X.mk` wraps where:
 /// * `expr.x` is `Const` / `Ctor` / `ArrayLiteral` (structurally
@@ -73,7 +110,18 @@ fn structural_typ(expr: &Expr, binders: &BinderCtx) -> Option<Typ> {
         // ReadPlace's rendering drops the read kind, producing the
         // place's typ. (The read kind, e.g., ImmutBor for auto-`&`,
         // is what decorates expr.typ.)
-        ExprX::ReadPlace(p, _) => Some(p.typ.clone()),
+        //
+        // Inlining contexts (`vir_expr_to_ast_for_inlining`) flip
+        // `READPLACE_LIFT_ENABLED` to false to suppress the lift —
+        // the substituted-arg provides the correct wrapper-typed
+        // value directly. See the doc on `vir_expr_to_ast_for_inlining`.
+        ExprX::ReadPlace(p, _) => {
+            if READPLACE_LIFT_ENABLED.with(|cell| cell.get()) {
+                Some(p.typ.clone())
+            } else {
+                None
+            }
+        }
         // Pass-through expressions: natural typ is the inner's.
         ExprX::Loc(inner) | ExprX::Ghost { expr: inner, .. }
         | ExprX::ProofInSpec(inner) => structural_typ(inner, binders),

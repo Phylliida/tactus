@@ -129,7 +129,7 @@ use crate::lean_ast::{
 };
 use crate::expr_shared::{is_mut_ref_typ, varat_pre_name};
 use std::sync::Arc;
-use crate::to_lean_expr::vir_expr_to_ast;
+use crate::to_lean_expr::{vir_expr_to_ast, vir_expr_to_ast_for_inlining};
 use crate::to_lean_sst_expr::{lower as lower_validated, renders_as_lean_int, sst_exp_to_ast_checked, type_bound_predicate, Validated};
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
 
@@ -2808,43 +2808,17 @@ fn build_call_substitutions<'a>(
     // arg shapes, so the rendered form is the caller-side variable
     // reference (the pre-call value).
     //
-    // β refactor Piece 3: for TraitMethodImpl callees, apply ONE
-    // `.deref` to wrapper-typed args. Why this is needed:
-    //
-    // * The trait spec body's `Var(self)` appears wrapped in
-    //   `ReadPlace(Place(self), ImmutBor)` for method-call sites
-    //   (`self.method()`). `apply_ref_coercion_if_needed` sees
-    //   that structural_typ of ReadPlace is the place's peeled typ
-    //   while expr.typ carries the auto-`&` adjustment, and adds a
-    //   `Tactus.X.mk` wrap to bridge. Pre-β this was a no-op
-    //   (`count_ref` returned 0); post-β it produces a real wrap.
-    // * Substituting `self → b` into `Tactus.X.mk self` gives
-    //   `Tactus.X.mk b` which over-wraps when b is already wrapper-
-    //   typed. Substituting `self → b.deref` gives `Tactus.X.mk
-    //   b.deref` which η-reduces to `b` via Lean's structure-η on
-    //   single-field structures.
-    //
-    // The peel is SELECTIVE: only TraitMethodImpl callees apply the
-    // ReadPlace lift pattern in their spec bodies. Static/non-trait
-    // callees use Var directly (no lift), so peeling there would
-    // over-strip (e.g., `Box::deref(b)` where the spec body is
-    // `*self`, not `(&self).deref()`).
-    //
-    // The peel is CLAMPED at 1: the auto-`&` adjustment is single-
-    // layer (one `&self` borrow). Peeling further would over-strip
-    // nested wrappers like `&Box<u8>` whose inner `Box` is part of
-    // the actual type.
-    use crate::expr_shared::{apply_deref_chain, count_ref_decorations};
-    let should_peel = matches!(callee.kind, FunctionKind::TraitMethodImpl { .. });
-    let arg_lexprs: Vec<LExpr> = args.iter().map(|a| {
-        let rendered = lower_validated(a);
-        if should_peel {
-            let peel = count_ref_decorations(&*a.raw().typ).min(1);
-            apply_deref_chain(rendered, peel)
-        } else {
-            rendered
-        }
-    }).collect();
+    // Args go through `lower_validated` (the SST renderer); no
+    // wrapper coercion needed here because callee-spec inlining
+    // uses `vir_expr_to_ast_for_inlining` (in `emit_call_precondition_theorem`
+    // and `push_post_call_frames`), which suppresses the
+    // `apply_ref_coercion_if_needed` lift at `ReadPlace` sites. The
+    // substituted-arg flows through unchanged and matches the
+    // callee's expected param type directly. See
+    // `vir_expr_to_ast_for_inlining` in `to_lean_expr.rs` for the
+    // full story (replaces the prior β refactor Piece 3 selective
+    // peel that handled the same gap downstream).
+    let arg_lexprs: Vec<LExpr> = args.iter().map(|a| lower_validated(a)).collect();
 
     // One MutArgInfo per `&mut` arg — bundles param_idx, target
     // (the L-value shape, post-#87), and the gensym'd fresh post-
@@ -2955,7 +2929,7 @@ fn emit_call_precondition_theorem(
         requires.iter()
             .map(|expr| {
                 let rewritten = rewrite_varat_for_mut_params(expr, &subst.mut_param_names);
-                vir_expr_to_ast(&rewritten)
+                vir_expr_to_ast_for_inlining(&rewritten)
             })
             .collect()
     );
@@ -3152,7 +3126,7 @@ fn push_post_call_frames(
     let ensures_clauses: Vec<LExpr> = ensures.iter()
         .map(|expr| {
             let rewritten = rewrite_varat_for_mut_params(expr, &subst.mut_param_names);
-            vir_expr_to_ast(&rewritten)
+            vir_expr_to_ast_for_inlining(&rewritten)
         })
         .collect();
     let substituted_ensures: Option<LExpr> = if ensures_clauses.is_empty() {
