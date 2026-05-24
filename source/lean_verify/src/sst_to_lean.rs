@@ -2807,8 +2807,48 @@ fn build_call_substitutions<'a>(
     // Render each arg once. The lower path peels `Loc` for &mut
     // arg shapes, so the rendered form is the caller-side variable
     // reference (the pre-call value).
+    //
+    // β refactor Piece 3: peel each rendered arg by the wrapper-depth
+    // delta vs its callee param. The trait method spec body's
+    // `Var(self)` may be rendered with a `.mk` lift (via
+    // `apply_ref_coercion_if_needed`: structural_typ on ReadPlace
+    // returns the place's peeled typ, but expr.typ carries the
+    // auto-`&` adjustment, so a `Tactus.X.mk` wrap is added to
+    // bridge). When the caller's arg is already wrapper-typed,
+    // substituting `self → b` would over-wrap. Substituting
+    // `self → b.deref` makes the pre-lift become `Tactus.X.mk b.deref`
+    // which η-reduces to `b` for single-field structures (Lean's
+    // structure-η on the kernel level).
     let arg_lexprs: Vec<LExpr> =
         args.iter().map(|a| lower_validated(a)).collect();
+
+    // β refactor Piece 3: peel each rendered arg by the auto-`&` lift
+    // that the spec body's ReadPlace renderer adds to Var(p). This is
+    // selective: trait method (TraitMethodImpl) callees use spec bodies
+    // that consistently apply `apply_ref_coercion_if_needed` lifts via
+    // ReadPlace (self.method()-style). Static/non-trait callees don't
+    // use this pattern, so peeling there over-peels and breaks
+    // (e.g., `Box::deref(b)` where the body is just `*self`, not
+    // `(&self).deref()`).
+    //
+    // Substituting `self → b.deref` makes the spec body's pre-lifted
+    // `Tactus.X.mk self` become `Tactus.X.mk b.deref` which η-reduces
+    // to `b` for single-field structures.
+    use crate::expr_shared::{apply_deref_chain, count_ref_decorations};
+    let should_peel = matches!(callee.kind, FunctionKind::TraitMethodImpl { .. });
+    let arg_lexprs: Vec<LExpr> = arg_lexprs.into_iter().enumerate().map(|(i, lexpr)| {
+        if should_peel {
+            // Clamp at 1: the auto-`&` adjustment that lifts at the spec
+            // body's ReadPlace site is single-layer (one `&self` borrow).
+            // Peeling further would over-strip nested wrappers like
+            // `&Box<u8>` whose inner `Box` is genuinely part of the type.
+            let arg_n = count_ref_decorations(&*args[i].raw().typ);
+            let peel = arg_n.min(1);
+            apply_deref_chain(lexpr, peel)
+        } else {
+            lexpr
+        }
+    }).collect();
 
     // One MutArgInfo per `&mut` arg — bundles param_idx, target
     // (the L-value shape, post-#87), and the gensym'd fresh post-
