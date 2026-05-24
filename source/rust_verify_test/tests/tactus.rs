@@ -10802,3 +10802,116 @@ test_verify_one_file! {
 // minimal exec-mode probe without dragging in vstd or trait methods —
 // will revisit after approach 3 lands and we can see what shapes
 // actually appear in practice.
+
+// P_NESTED: doubly-wrapped param `&Box<u8>` exercises
+// count_ref_decorations's handling of multiple wrapper layers.
+// `b@` is the spec view of the inner u8; semantically the value
+// is reached via two derefs (peel `&`, peel `Box`). Approach 3's
+// renderer needs to apply 2 .derefs at use sites that expect inner.
+test_verify_one_file! {
+    #[test] test_exec_nested_wrapper_probe verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        #[verifier::tactus_auto]
+        fn read_nested(b: &Box<u8>) -> (r: u8)
+            ensures r == **b
+        {
+            **b
+        }
+    } => Ok(())
+}
+
+// P_GENERIC_WRAPPER: generic fn `fn use<T>(x: &T) -> bool` called
+// with `T = Box<u8>` at one call site. Inside the body, T is
+// opaque to count_ref_decorations — only the outer `&` is peelable.
+// Approach 3 correctly produces 1 deref (the `&`), leaving the
+// inner `T = Box<u8>` un-peeled — which is right because the body
+// only operates at the T level. This probes that approach 3
+// doesn't try to peel through opaque generic params.
+test_verify_one_file! {
+    #[test] test_exec_generic_with_wrapper_instantiation_probe verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        #[verifier::tactus_auto]
+        fn always_true<T>(_x: &T) -> (r: bool)
+            ensures r == true
+        {
+            true
+        }
+
+        #[verifier::tactus_auto]
+        fn caller() -> (r: bool)
+            ensures r == true
+        {
+            let b: Box<u8> = Box::new(7);
+            always_true(&b)
+        }
+    } => Ok(())
+}
+
+// P_RET_WRAPPER: returning a wrapper-typed value. The Return node
+// in WP needs to handle wrapper-typed ret_exp. Approach 3 should
+// pass `s` through directly (binder typ matches expr.typ, no
+// coercion); ret type at theorem level is also wrapper.
+test_verify_one_file! {
+    #[test] test_exec_ret_wrapper_value_probe verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum Tag { A, B }
+
+        #[verifier::tactus_auto]
+        fn passthrough(s: &Tag) -> (r: &Tag)
+            ensures r == s
+        {
+            s
+        }
+    } => Ok(())
+}
+
+// P_CALL_SITE_MISMATCH: callee expects bare `u8`, caller passes
+// `&u8` directly. Verus's auto-deref would normally insert a
+// dereference, but if the SST shape ends up with a wrapper-typed
+// arg flowing to a bare-typed param, approach 3 needs to coerce
+// at the call site (apply .deref). The VIR-AST renderer already
+// has this via apply_ref_coercion_if_needed; the SST renderer
+// would need the analog.
+//
+// This probably either passes today (Verus inserts the deref
+// explicitly) or fails for a reason orthogonal to cluster A.
+// Pinning it as Err — if approach 3 + SST call-site coercion
+// makes it pass, the probe flips.
+test_verify_one_file! {
+    #[test] test_exec_call_site_ref_to_bare_probe verus_code! {
+        #[verifier::tactus_auto]
+        fn double(x: u8) -> (r: u8)
+            requires x <= 100
+            ensures r == 2 * x
+        {
+            x + x
+        }
+
+        #[verifier::tactus_auto]
+        fn caller(p: &u8) -> (r: u8)
+            requires *p <= 100
+            ensures r == 2 * *p
+        {
+            // Explicit deref — should always work.
+            double(*p)
+        }
+    } => Ok(())
+}
+
+// Already-covered cases NOT re-pinned here, with references:
+//
+// * Match on wrapper-typed param + recursive call: covered by
+//   `test_exec_call_recursive_datatype_termination` (failing
+//   today via body-shadow conflict).
+// * Mut-ref body shadow + assignment: covered by
+//   `test_exec_callee_mut_simple` (passing today). Approach 3's
+//   hybrid keeps body shadow for mut-ref.
+// * Recursive generic datatype: covered by
+//   `test_exec_call_recursive_generic_datatype` family (failing
+//   today via body-shadow conflict on `decrease_init0`).
+// * Field access on wrapper receiver: covered by
+//   `test_exec_call_recursive_datatype_termination`'s use of
+//   `Push_val1` on a `&Stack`.
