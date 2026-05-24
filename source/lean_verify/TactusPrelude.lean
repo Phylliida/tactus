@@ -175,6 +175,16 @@ macro_rules
 -- `Option` / core types that have their own automation (omega)
 -- and would explode the subgoal count if case-split.
 --
+-- Two candidate shapes are recognised:
+-- 1. Direct: `local : T` where `T.height` exists. We case-split
+--    on `local`, the standard shape.
+-- 2. Wrapper: `local : Tactus.X T` (where X is Ref/MutRef/Box/Rc/
+--    Arc) and `T.height` exists. We case-split on `local.deref`,
+--    which has type T. Needed for fns taking `&T`/`Box<T>`/etc.
+--    params after the body-shadow drop (β refactor Piece 1) — the
+--    local's Lean type carries the wrapper distinguishability,
+--    but the obligation reasons about the inner T's structure.
+--
 -- Trying each candidate (rather than just the first) means a fn
 -- with multiple datatype locals — e.g., `(a: Foo, b: Bar)` —
 -- works regardless of which one is the right scrutinee. Cost is
@@ -183,25 +193,49 @@ macro_rules
 open Lean Elab Tactic Meta in
 elab "tactus_case_split" closer:tacticSeq : tactic => do
   let goal ← getMainGoal
+  -- Each candidate is (LocalDecl, needsDeref?). needsDeref=true
+  -- means the local has Tactus wrapper type and we case-split on
+  -- `local.deref` instead of `local`.
   let candidates ← goal.withContext do
     let ctx ← getLCtx
-    let mut out : Array LocalDecl := #[]
+    let env ← getEnv
+    let mut out : Array (LocalDecl × Bool) := #[]
     for decl in ctx do
       if decl.isImplementationDetail then continue
       let ty ← whnf decl.type
-      if let .const name _ := ty.getAppFn then
-        let env ← getEnv
-        if let some info := env.find? name then
-          if info matches .inductInfo _ then
-            let heightName := Name.str name "height"
-            if env.find? heightName |>.isSome then
-              out := out.push decl
+      let .const name _ := ty.getAppFn | continue
+      -- Direct case: name itself is an inductive with .height.
+      if let some info := env.find? name then
+        if info matches .inductInfo _ then
+          let heightName := Name.str name "height"
+          if env.find? heightName |>.isSome then
+            out := out.push (decl, false)
+            continue
+      -- Wrapper case: Tactus.X T whose inner T has T.height.
+      let isWrapper :=
+        name == ``Tactus.Ref || name == ``Tactus.MutRef
+          || name == ``Tactus.Box || name == ``Tactus.Rc
+          || name == ``Tactus.Arc
+      if isWrapper then
+        let args := ty.getAppArgs
+        if h : args.size > 0 then
+          let innerTy ← whnf args[0]
+          if let .const innerName _ := innerTy.getAppFn then
+            if let some info := env.find? innerName then
+              if info matches .inductInfo _ then
+                let heightName := Name.str innerName "height"
+                if env.find? heightName |>.isSome then
+                  out := out.push (decl, true)
     return out
-  for decl in candidates do
+  for (decl, needsDeref) in candidates do
     let saved ← saveState
     try
-      let subgoals ← goal.cases decl.fvarId
-      setGoals (subgoals.map (·.mvarId)).toList
+      if needsDeref then
+        let localIdent := mkIdent decl.userName
+        evalTactic (← `(tactic| cases ($localIdent).deref))
+      else
+        let subgoals ← goal.cases decl.fvarId
+        setGoals (subgoals.map (·.mvarId)).toList
       evalTactic (← `(tactic| all_goals ($closer)))
       -- All goals closed if we got here.
       return
