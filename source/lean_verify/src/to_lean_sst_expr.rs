@@ -613,6 +613,15 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 }
             }
             let (l, r) = (sst_exp_to_ast_checked(lhs)?, sst_exp_to_ast_checked(rhs)?);
+            // β refactor Piece 3: peel any wrapper decorations from each
+            // operand before applying the binop. Tactus's binop head fns
+            // (`Int.toNat`, `Tactus.strGetChar`, `Bool.xor`, etc.) all
+            // take inner-typed args; if an SST operand has wrapper typ
+            // (post-β refactor, `&T` params keep `Tactus.Ref T` at the
+            // Lean type level), we need `.deref` to bridge.
+            use crate::expr_shared::{apply_deref_chain, count_ref_decorations};
+            let l = apply_deref_chain(l, count_ref_decorations(&*lhs.typ));
+            let r = apply_deref_chain(r, count_ref_decorations(&*rhs.typ));
             match binop_to_ast(op) {
                 Some(l_op) => LExpr::binop(l_op, l, r).node,
                 // Non-structural: emit as `head lhs rhs` via App.
