@@ -87,6 +87,13 @@ pub struct Def {
     /// `termination_by d₁` if one measure, `termination_by (d₁, d₂, …)` for
     /// lexicographic. Empty `Vec` means no termination clause.
     pub termination_by: Vec<Expr>,
+    /// Optional `decreasing_by <tactic>` clause emitted after
+    /// `termination_by`. Used when Lean's default `decreasing_tactic`
+    /// can't close the obligation — e.g., height fns for recursive
+    /// datatypes whose recursive field is wrapper-typed
+    /// (`Box<Self>` etc.), where the size inequality has a
+    /// `.deref` projection the default tactic doesn't peel.
+    pub decreasing_by: Option<String>,
 }
 
 /// Axiom: declares a constant whose value is unspecified.

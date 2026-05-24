@@ -106,6 +106,26 @@ structure Tactus.Arc (A : Type) where
   deref : A
   deriving Inhabited
 
+-- SizeOf unfolding lemmas for each Tactus wrapper. Lean's auto-derived
+-- `SizeOf (Tactus.X A)` for these single-field structures is
+-- `sizeOf b = sizeOf b.deref + 1`, but the unfolding isn't `@[simp]`
+-- by default — so generated `termination_by sizeOf` clauses for
+-- recursive datatypes whose fields are wrapper-typed (`Box<Self>`,
+-- `Rc<Self>`, etc.) leave the obligation
+-- `sizeOf <field>.deref ≤ sizeOf <wrapper>` stuck. These `@[simp]`
+-- lemmas reduce the wrapper side so the `decreasing_by` tactic
+-- (`simp_all; omega`) can close.
+@[simp] theorem Tactus.Ref.sizeOf_deref {A : Type} [SizeOf A] (b : Tactus.Ref A) :
+  sizeOf b = 1 + sizeOf b.deref := by cases b; rfl
+@[simp] theorem Tactus.MutRef.sizeOf_deref {A : Type} [SizeOf A] (b : Tactus.MutRef A) :
+  sizeOf b = 1 + sizeOf b.deref := by cases b; rfl
+@[simp] theorem Tactus.Box.sizeOf_deref {A : Type} [SizeOf A] (b : Tactus.Box A) :
+  sizeOf b = 1 + sizeOf b.deref := by cases b; rfl
+@[simp] theorem Tactus.Rc.sizeOf_deref {A : Type} [SizeOf A] (b : Tactus.Rc A) :
+  sizeOf b = 1 + sizeOf b.deref := by cases b; rfl
+@[simp] theorem Tactus.Arc.sizeOf_deref {A : Type} [SizeOf A] (b : Tactus.Arc A) :
+  sizeOf b = 1 + sizeOf b.deref := by cases b; rfl
+
 -- `Tactus.strGetChar s i` is the i-th Unicode codepoint of `s` as a
 -- `Nat`. The lowering target for Verus's `verus_builtin::strslice_get_char`
 -- (VIR `BinaryOp::StrGetChar`, surface syntax `strslice_get_char(s, i)`).

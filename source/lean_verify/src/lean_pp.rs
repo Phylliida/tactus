@@ -311,6 +311,11 @@ fn write_def(out: &mut String, d: &Def, lm: &mut Landmarks) {
             out.push_str(")\n");
         }
     }
+    if let Some(tac) = &d.decreasing_by {
+        out.push_str("decreasing_by ");
+        out.push_str(tac);
+        out.push('\n');
+    }
 }
 
 fn write_theorem(out: &mut String, t: &Theorem, lm: &mut Landmarks) {
