@@ -225,7 +225,7 @@ pub fn spec_fn_to_ast(f: &FunctionX, fn_map: &crate::sst_to_lean::FnMap) -> Comm
                 let coerced = crate::sst_to_lean::insert_nat_coercions_in_expr(d, fn_map);
                 crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx)
             }).collect();
-            Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by })
+            Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by, decreasing_by: None })
         }
         None => Command::Axiom(Axiom { name, binders, ret_ty, attrs: vec![] }),
     }
@@ -893,31 +893,39 @@ fn height_fn_for_datatype(
             ret_ty: LExpr::var_lit("Nat"),
             body: LExpr::lit_int("1"),
             termination_by: vec![],
+            decreasing_by: None,
         }));
     }
 
-    // Recursive: emit curried-form `def T.height : T → Nat | pat
-    // => body | ...` rather than the match-on-binder form. The
-    // curried form is the Lean-idiomatic shape for structural
-    // recursion — the equation compiler is designed around it,
-    // and WF analysis is more reliable when the recursion is
-    // expressed as direct equations rather than a match-on-
-    // binder.
+    // Recursive: emit match-on-binder form with explicit
+    // `termination_by sizeOf s` clause. Pre-collapse the height fn
+    // was curried (`| pat => body` form) so Lean's equation compiler
+    // could infer well-founded recursion structurally. That breaks
+    // for wrapper-containing recursive datatypes (`enum Stack {
+    // Push(u8, Box<Stack>) }`): the recursive call `Stack.height
+    // val1.deref` for `val1 : Tactus.Box Stack` has `.deref` as a
+    // definitional projection that Lean's structural-recursion
+    // analyzer doesn't see through, producing "invalid projection"
+    // errors.
     //
-    // For generics (#108): emit implicit type-param binders BEFORE
-    // the colon (via `DefCurried.binders`), not inside the type as
-    // a `∀`. This produces `def T.height {A : Type} : T A → Nat
-    // | pat => body` — Lean's equation compiler infers A from the
-    // pattern's value position. Wrapping `∀ {A : Type}` inside the
-    // type expression confuses elaboration: the equations end up
-    // matching the implicit slot first, and `List.Nil` gets typed
-    // as the `A` (Type-valued) instead of as the `List A` value.
-    let arrow_ty = LExpr::new(ExprNode::BinOp {
-        op: BinOp::Implies,
-        lhs: Box::new(typed_input),
-        rhs: Box::new(LExpr::var_lit("Nat")),
-    });
-    let equations: Vec<MatchArm> = dt.variants.iter().map(|v| {
+    // Switching to match-on-binder + explicit `termination_by sizeOf
+    // s` bypasses the structural analyzer entirely: Lean's auto-
+    // derived `SizeOf` for `Tactus.Box` counts the inner value, so
+    // `sizeOf val1.deref < sizeOf val1 < sizeOf (Stack.Push _ val1)`
+    // holds and well-founded recursion accepts it.
+    //
+    // For generics (#108): the implicit type-param binders + the
+    // explicit value-arg binder go in `Def.binders`; the return type
+    // is `Nat`.
+    let arg_name = "s";
+    let value_binder = LBinder {
+        name: Some(crate::lean_name::LeanName::lit(arg_name)),
+        ty: typed_input,
+        kind: BinderKind::Explicit,
+    };
+    let mut all_binders = implicit_typ_binders;
+    all_binders.push(value_binder);
+    let arms: Vec<MatchArm> = dt.variants.iter().map(|v| {
         let var_san = sanitize(&v.name);
         let ctor_name = format!("{}.{}", path, var_san);
         let mut pats = Vec::with_capacity(v.fields.len());
@@ -973,12 +981,30 @@ fn height_fn_for_datatype(
             body: arm_body,
         }
     }).collect();
-    Some(Command::DefCurried(DefCurried {
+    let body = LExpr::new(ExprNode::Match {
+        scrutinee: Box::new(LExpr::var(crate::lean_name::LeanName::lit(arg_name))),
+        arms,
+    });
+    // `sizeOf s` — Lean's auto-derived size measure. Works through
+    // wrapper structures because their auto-derived SizeOf counts
+    // the inner field.
+    let termination = LExpr::app1(
+        LExpr::var_lit("sizeOf"),
+        LExpr::var(crate::lean_name::LeanName::lit(arg_name)),
+    );
+    // `simp_arith` handles the linear-arithmetic obligation
+    // `sizeOf <field>.deref < sizeOf <ctor>` — Lean's default
+    // `decreasing_tactic` can't see through wrapper `.deref`
+    // projections, but `simp_arith` reduces them via SizeOf's
+    // auto-derived equations and closes the resulting Nat inequality.
+    Some(Command::Def(Def {
         attrs: vec!["simp".into()],
         name: format!("{}.height", path),
-        binders: implicit_typ_binders,
-        ty: arrow_ty,
-        equations,
+        binders: all_binders,
+        ret_ty: LExpr::var_lit("Nat"),
+        body,
+        termination_by: vec![termination],
+        decreasing_by: Some("all_goals (simp_all; omega)".to_string()),
     }))
 }
 
@@ -1136,6 +1162,7 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
             ret_ty: LExpr::var_lit("Prop"),
             body: match_on_x(arms),
             termination_by: vec![],
+            decreasing_by: None,
         }));
     }
 
@@ -1201,6 +1228,7 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
                 ret_ty: typ_to_expr(&f.a.0),
                 body: match_on_x(arms),
                 termination_by: vec![],
+                decreasing_by: None,
             }));
         }
     }

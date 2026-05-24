@@ -360,6 +360,14 @@ fn name_resolves(name: &str, defined: &HashSet<String>, scope: &HashSet<String>)
         // a string in the Datatype's `derives` field and bypasses name
         // resolution entirely; only the indexed-style path needs this.
         | "Inhabited"
+        // `sizeOf` — Lean's auto-derived size measure (`SizeOf`
+        // typeclass). Used in `termination_by sizeOf <arg>` clauses
+        // emitted for recursive height fns where the arg's structural
+        // recursion would otherwise fail Lean's WF inference (e.g.,
+        // recursive datatypes whose recursive field is wrapper-typed
+        // like `Box<Self>` — Lean's structural analyzer doesn't see
+        // through the wrapper's `.deref` projection).
+        | "sizeOf"
         | "()"
     )
 }
