@@ -3015,15 +3015,29 @@ an Opaque value at this site. Only DIRECT field types matter
   outside the trait setup. Worth adding if any change to the dep
   walk is suspected.
 
-### Transparent-wrapper peel vs trait dispatch (deferred 2026-05-20)
+### Transparent-wrapper peel vs trait dispatch (LANDED across Phase 1 + Phase 2 + β refactor)
 
-Tactus currently peels reference-like decorations (`&A → A`,
-`Box<A> → A`, `Rc<A> → A`, `Arc<A> → A`) at every site that calls
-`peel_typ_wrappers` / `type_short_name` — including the dispatch
-site for trait method calls. This silently produces the wrong
-answer when a blanket impl over a transparent wrapper has
-*non-forwarding* behaviour. Pinned by
-`test_non_forwarding_blanket_over_ref_probe` (same-crate, Err).
+Reference-like decorations (`&A`, `Box<A>`, `Rc<A>`, `Arc<A>`) are
+now preserved as distinct Lean types via the `Tactus.Ref` / `Box` /
+etc. wrapper structures in `TactusPrelude.lean`. Phase 1 (`f5362bb`,
+2026-05-20) introduced the opaque wrapper types. Phase 2 (`831a293`,
+2026-05-20) made `typ_to_expr` emit them. The β refactor (six
+commits across 2026-05-24, capped by `d9476e6`) closed the cluster
+of test failures the wrapper architecture surfaced.
+
+Pinned by `test_non_forwarding_blanket_over_ref_probe` (was Err
+pre-Phase-2, flipped Ok post-Phase-2). The β refactor restored
+6 cluster A failures around recursive datatypes + 3 wrapper-aware
+call-site coercions that Phase 2 broke. See the β refactor session
+entry in HANDOFF.md (2026-05-24) for the full mechanics.
+
+#### Original gap (preserved for context)
+
+Pre-Phase-2, Tactus peeled reference-like decorations at every site
+that called `peel_typ_wrappers` / `type_short_name` — including the
+dispatch site for trait method calls. This silently produced the
+wrong answer when a blanket impl over a transparent wrapper had
+*non-forwarding* behaviour.
 
 **The gap, concretely.** A user crate writes:
 
@@ -3140,21 +3154,20 @@ start warm:
    semantic change for forwarding cases), but the generated
    Lean shape changes meaningfully.
 
-**Phasing** (suggested for a future session, ~3-5 sessions
-total):
+**Phasing (LANDED):**
 
-- **Phase 1** (small, additive): add prelude wrapper types
-  behind a feature flag or env var. Don't change rendering yet.
-  Confirm declarations parse, no name conflicts. Low risk.
-- **Phase 2** (validate approach): turn on un-peel for `Ref`
-  only. Confirm `test_non_forwarding_blanket_over_ref_probe`
-  flips Ok. Catalogue all test breakages with the flag on.
-  1-2 sessions.
-- **Phase 3** (broaden): extend to `Box`, `Rc`, `Arc`, `MutRef`.
-  Fix test breakages one decoration at a time. 2-3 sessions.
-- **Phase 4** (cleanup): remove the flag, update this DESIGN.md
-  entry, ensure vstd still verifies 1530/0, the vec_index
-  probe (`test_exec_call_mut_arg_vec_index_probe`) flips Ok.
+- **Phase 1** (`f5362bb`, 2026-05-20): added wrapper type axioms
+  (Tactus.Ref / Box / Rc / Arc / MutRef) to `TactusPrelude.lean`.
+- **Phase 2** (`831a293`, 2026-05-20): `typ_to_expr` Decorate arm
+  emits wrapper types instead of peeling. `test_non_forwarding_blanket_over_ref_probe`
+  flipped Ok.
+- **Wrapper-arch follow-on** (2026-05-23 + 24): mut-ref collapse
+  (`bffaf65` + `6b1f298`), wrapper-aware height fns (`ca8f979`),
+  binder naming cleanup (`c3d2eda` + `da63c45`), termination_by
+  sizeOf for recursive height fns (`b52b67a`). 376 → 419 tests.
+- **β refactor** (2026-05-24, 6 commits capped by `d9476e6`):
+  closed the 6 cluster A failures and recovered 3 strslice/
+  inlined_ensure regressions. 419 → 425 tests. See HANDOFF.md.
 
 **Alternatives considered + rejected** (2026-05-20):
 

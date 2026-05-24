@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**435 end-to-end tests + 1 coverage test + 209 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**425 end-to-end tests + 1 coverage test + 209 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -6054,6 +6054,214 @@ cost-benefit at session end:
 | After 8 edge-case probes added | 419 | 25 | +6 passing + 2 new failures |
 
 vstd: 1530/0 throughout.
+
+#### Current session (2026-05-24 — β refactor: cluster A closed + regressions recovered)
+
+Continuation of the prior session's wrapper-arch follow-on. The β
+refactor's four pieces (documented at the end of the 2026-05-23/24
+entry above) all landed in this session. Six commits, **+6 net
+tests** (419/25 → 425/19), no regressions.
+
+##### Landings (six commits, in order)
+
+1. **Piece 4 — `tactus_case_split` recognizes wrapper-typed locals**
+   (`8a23b79`). Extended the elaborator tactic in `TactusPrelude.lean`
+   so it also recognizes locals whose type is `Tactus.{Ref,MutRef,Box,Rc,Arc}
+   T` where T has a `.height` companion fn. For those, the tactic
+   does `cases local.deref` instead of `cases local` — the wrapper
+   itself has one constructor so case-splitting it gives just `inner`
+   renamed; what we want is to split T's variants.
+
+   Surprise win: `test_exec_mut_ref_is_variant_probe` (E1) flipped
+   Err → Ok. The HANDOFF noted the mut-ref body-shadow conflict
+   was "really latent"; turns out the latent piece was the case-
+   split tactic, not the encoding. Test counts unchanged at 419/25;
+   tactic ready for Pieces 1+2 to surface candidates.
+
+2. **Pieces 1+2 — drop body shadow for `&`-only params, wire
+   use-site coercions** (`ac8aacf`). In
+   `sst_to_lean::exec_fn_theorems_to_ast`, the `initial_obl_ctx`
+   loop now only emits the body-shadow `let x := x.deref` frame
+   for `&mut` params (and BorrowMut locals), not for `&`-only
+   wrapper params. The `&mut` body shadow stays because mutation
+   `*x = e` lowers via Lean let-shadowing.
+
+   In `to_lean_sst_expr.rs`, the IsVariant and Field arms now apply
+   `apply_deref_chain(rendered, count_ref_decorations(inner.typ))`
+   before the projection. Pre-fix only `CheckDecreaseHeight` did this;
+   IsVariant/Field assumed the body shadow had already stripped
+   wrappers.
+
+   Test counts: 419/25 → 416/28 (matches HANDOFF's predicted -3
+   for "approach 3 lite"). Cluster A type errors became discharge
+   errors; 3 expected regressions appeared (strslice ×2 +
+   inlined_ensure_references_trait_spec_method).
+
+3. **Piece 4 — `cases h : term` syntax** (`5fd4693`). The
+   load-bearing insight. The wrapper-case branch added in `8a23b79`
+   used `cases (local).deref` which case-splits the inner
+   inductive but does NOT propagate the discharged variant value
+   to other occurrences of `(local).deref` in the goal. For cluster
+   A's termination shape — `let decrease_init0 := s; let tmp___0
+   := s; ¬tmp___0.deref.isEmpty → ... height tmp___0.deref ...` —
+   the case-split exposed the variant at the discharge point but
+   left aliased occurrences opaque.
+
+   The `cases h : (local).deref` form names the equation
+   `s.deref = Stack.Empty` (etc.) as a hypothesis. simp_all then
+   uses the equation to rewrite all occurrences (including aliased
+   `tmp___0.deref` via the let chain).
+
+   The antiquote `$h_ident:ident` (with explicit `:ident`
+   annotation) is also load-bearing — without it, Lean's parser
+   errors with "Application type mismatch: The argument h_ident
+   has type Ident". Tactic-syntax composition quirk.
+
+   Test counts: 416/28 → 422/22 (**+6 passing**). Six cluster A
+   tests flipped Ok:
+   `test_exec_call_recursive_datatype_termination`,
+   `_generic_datatype`, `_generic_datatype_two_params`,
+   `_generic_datatype_trait_bound`, `_over_mutual_datatype`,
+   `test_exec_cross_fn_scc_cross_type_decreases`.
+
+4. **Piece 3 partial — SST binop arg coercion** (`934710f`). Added
+   `apply_deref_chain(arg, count_ref_decorations(arg.typ))` to both
+   operands in the `ExpX::Binary` arm. Recovered 2 of 3 expected
+   regressions: `test_exec_strslice_get_char_in_assert / _in_ensures`.
+   The binop head fns (`Tactus.strGetChar`, `Bool.xor`, etc.) take
+   inner-typed args; SST operand with wrapper typ needs `.deref`
+   to bridge. Test counts: 422/22 → 423/21.
+
+5. **Piece 3 — selective arg-peel for TraitMethodImpl callees**
+   (`1f5251e`). In `build_call_substitutions`, peel each rendered
+   arg by 1 (clamped) when `callee.kind` is `TraitMethodImpl`.
+
+   First-principles diagnosis: the trait spec body's `Var(self)` is
+   wrapped in `ReadPlace(Place(self), ImmutBor)` for method-call
+   sites (`self.method()`). `structural_typ` for ReadPlace returns
+   the place's peeled typ; `apply_ref_coercion_if_needed` sees
+   expr.typ has 1 more wrapper and lifts via `Tactus.X.mk`. Pre-β
+   this was a no-op (`count_ref` returned 0 for all decorations);
+   post-β it produces real `.mk` wrapping. Substituting `self → b`
+   directly into `Tactus.X.mk self` gives `Tactus.X.mk b` which
+   over-wraps when `b : Tactus.Ref Bar`. Substituting `self →
+   b.deref` gives `Tactus.X.mk b.deref` which η-reduces to `b` via
+   Lean's structure-η for single-field structures.
+
+   The peel is **selective** (only TraitMethodImpl) because Static
+   callees don't use ReadPlace lifts in their spec bodies — peeling
+   there over-strips wrappers and breaks calls like `Box::deref(b)`.
+
+   The peel is **clamped at 1** because the auto-`&` adjustment is
+   single-layer; peeling further would over-strip nested wrappers
+   like `&Box<u8>` whose inner `Box` is part of the actual type.
+
+   Test counts: 423/21 → 424/20. Recovered
+   `test_inlined_ensure_references_trait_spec_method`. Also flipped
+   `test_exec_call_site_ref_to_bare_probe` (was failing in baseline).
+
+6. **Piece 3 polish — non-structural-only binop peel** (`d9476e6`).
+   The Piece 3 partial applied the binop peel to ALL operands of
+   ALL binops. That broke `test_exec_nested_wrapper_probe` — the
+   structural `==` arm peeled the RHS to `b.deref.deref` while the
+   body separately rendered `**b` as just `b` (Verus's SST collapses
+   auto-derefs into `Var(b)` with adjusted typ). Body and ensures
+   went out of sync.
+
+   Moved the peel to the non-structural `None` branch only.
+   Structural binops (`==`, `+`, `*`, `≤`, ...) pass operands
+   through as-rendered; they can apply to wrapper-typed operands
+   directly. Non-structural binops still need the peel (their head
+   fns take inner-typed args).
+
+   Test counts: 424/20 → **425/19**. nested_wrapper recovered. β
+   refactor structurally complete.
+
+##### Final test counts and verdict
+
+| Stage | Passing | Failing |
+|---|---|---|
+| Baseline (per prior session HANDOFF) | 419 | 25 |
+| After Piece 4 alone | 419 | 25 (E1 flipped to Ok, tactic ready) |
+| After Pieces 1+2 | 416 | 28 (cluster A type errors → discharge errors) |
+| After Piece 4 refinement (`cases h :`) | 422 | 22 (**+6** cluster A wins) |
+| After Piece 3 partial (binop peel) | 423 | 21 (+1 strslice) |
+| After Piece 3 (selective trait-method peel) | 424 | 20 (+1 inlined_ensure) |
+| After Piece 3 polish (non-structural only) | **425** | **19** (+1 nested_wrapper recovered) |
+
+vstd: 1530/0 throughout.
+
+##### What's still failing (19 tests, all pre-existing)
+
+None of these are β refactor regressions — they're all baseline
+failures that existed before this session. Categories:
+
+- **#107 caller-side new-mut-ref edge cases** (3 tests):
+  `test_exec_call_mut_arg_new_mut_ref` / `_use_after` / `_two_mut_args`
+- **P1 alias probe**: `test_exec_call_recursive_aliased_arg_probe` —
+  the aliased-recursive-arg counterexample from the prior
+  session's probe set
+- **Cross-instantiation generic datatype**:
+  `test_exec_call_recursive_generic_datatype_cross_instantiation` —
+  separate from the cluster A 6
+- **Pre-existing trait method test gaps** (8 tests under
+  `test_proof_fn_trait_method_*` umbrella)
+- **Various others**: `test_higher_order`,
+  `test_new_mut_ref_pre_post_substitution_probe`,
+  `test_old_view_pre_post_substitution_probe / _trait_dispatch_probe`,
+  `test_spec_closure`, `test_spec_fn_apply`
+
+These were all failing pre-β; β neither fixed nor broke them.
+
+##### Discipline notes worth recording
+
+* **The user's "step back, think from first principles" prompt was
+  load-bearing.** I was about to commit a +4 partial fix and was
+  going to keep iterating with ad-hoc patches. The pause to trace
+  WHERE `.mk` comes from led to the selective TraitMethodImpl
+  insight, which together with the non-structural-only binop
+  refinement closed the gap cleanly with no regressions. **Probes
+  found the real shape; without the trace, the patches would have
+  ping-ponged between fixing one test and breaking another.**
+
+* **The `cases h : term` antiquote-form discovery.** The wrapper
+  case-split was the single biggest piece (closes 6 cluster A
+  tests). The first attempt (`cases (local).deref`) case-split
+  correctly but left aliased occurrences opaque. The fix was named
+  equations — `cases h : ...` — which let simp_all rewrite through
+  the let-aliases. The `:ident` antiquote annotation was a Lean
+  syntax-composition gotcha that cost ~10 minutes to track down;
+  worth noting for the next person quoting tactic syntax in
+  elab code.
+
+* **η-reduction as a substitution-bridge.** The principled fix for
+  the trait method case turned out to be: substitute `self →
+  b.deref` (peeling one wrapper) so the spec body's pre-lifted
+  `Tactus.X.mk self` becomes `Tactus.X.mk b.deref`, which η-reduces
+  to `b` for single-field structures. Lean's kernel-level
+  structure-η handles the reduction without any explicit rewrite.
+  The mechanism is invisible at the call site but absolutely
+  load-bearing — none of this works without it.
+
+* **Selective vs unconditional.** The first attempt peeled args
+  for ALL callees, which broke `Box::deref(b)`-style chains
+  (cluster A wasn't the only place using TraitMethodImpl dispatch).
+  Gating on `FunctionKind::TraitMethodImpl` was a kind-discriminator,
+  but the more precise structural property is "callee's spec body
+  uses `ReadPlace`-style auto-`&` lifts". That's
+  empirically-correlated with TraitMethodImpl in our test corpus
+  but a future Static callee that also lifts would surface this.
+  The selective gate is correct for what we have today; a future
+  failure would tell us to look at the underlying pattern.
+
+* **Restricting binop peel to non-structural-only**. The structural
+  binops (`==`, `+`, etc.) work fine on wrapper-typed operands —
+  Lean infers the operand type from one side. Peeling there
+  introduced spurious `.deref` chains that broke body/ensures
+  rendering symmetry. The non-structural binops have explicit head
+  fns with inner-typed signatures, so peeling there IS necessary.
+  The right level of restriction came from running the suite, not
+  from abstract reasoning.
 
 ## Architecture
 
