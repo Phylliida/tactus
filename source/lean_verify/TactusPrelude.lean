@@ -192,12 +192,6 @@ macro_rules
 -- scope.
 open Lean Elab Tactic Meta in
 elab "tactus_case_split" closer:tacticSeq : tactic => do
-  -- Tactus emits per-obligation theorems whose goal is wrapped in
-  -- a chain of `let` and `→` binders (the OblCtx frames). The
-  -- candidate locals we want to case-split on live INSIDE that
-  -- chain, not at the outer hypothesis context. Run `intros` first
-  -- so they're visible to the LCtx walk below.
-  evalTactic (← `(tactic| intros))
   let goal ← getMainGoal
   -- Each candidate is (LocalDecl, needsDeref?). needsDeref=true
   -- means the local has Tactus wrapper type and we case-split on
@@ -237,8 +231,16 @@ elab "tactus_case_split" closer:tacticSeq : tactic => do
     let saved ← saveState
     try
       if needsDeref then
+        -- `cases h : <local>.deref` names the discharged-term equation
+        -- so subsequent simp_all can substitute occurrences. Without
+        -- the `h :` form, `cases <local>.deref` case-splits but
+        -- doesn't propagate the value into the goal's other
+        -- references to `<local>.deref` (since `<local>.deref` is a
+        -- term, not an fvar).
+        let h_name ← mkFreshUserName `h_split
+        let h_ident := mkIdent h_name
         let localIdent := mkIdent decl.userName
-        evalTactic (← `(tactic| cases ($localIdent).deref))
+        evalTactic (← `(tactic| cases $h_ident:ident : ($localIdent).deref))
       else
         let subgoals ← goal.cases decl.fvarId
         setGoals (subgoals.map (·.mvarId)).toList
