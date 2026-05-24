@@ -10915,3 +10915,101 @@ test_verify_one_file! {
 // * Field access on wrapper receiver: covered by
 //   `test_exec_call_recursive_datatype_termination`'s use of
 //   `Push_val1` on a `&Stack`.
+
+// E1: mut-ref + match — attempt to surface the latent body-shadow
+// conflict for `&mut` that approach 3 (hybrid) doesn't solve.
+//
+// Probe result: Verus's lowering of `match *s` for `s : &mut Tag`
+// strips the wrapper at SST level — the match's scrutinee ends up
+// with typ `Tag` (not `MutRef<Tag>`), so `count_ref_decorations(Tag)
+// = 0` and the IsVariant arm doesn't add a spurious deref. The
+// latent conflict doesn't surface here.
+//
+// The test still fails today, but for a different reason: a
+// tactus_auto goal-discharge issue with the enum match's
+// postcondition (`r = 0 ∨ r = 1`). Probably fixable separately;
+// not load-bearing for cluster A.
+//
+// So: mut-ref's latent body-shadow conflict is REALLY latent — we
+// couldn't construct a natural probe that surfaces it via auto-deref
+// shapes. Approach 3 keeping body shadow for `&mut` looks safe.
+test_verify_one_file! {
+    #[test] test_exec_mut_ref_is_variant_probe verus_code! {
+        enum Tag { A, B }
+
+        #[verifier::tactus_auto]
+        fn check(s: &mut Tag) -> (r: u8)
+            ensures r == 0 || r == 1
+        {
+            match *s {
+                Tag::A => 0,
+                Tag::B => 1,
+            }
+        }
+    } => Err(_)
+}
+
+// E11: closure captures a mut-ref param. The outer's body shadow
+// `let x := x.deref` only applies to the outer body, not inside
+// the closure. The closure body's `Var(x)` would resolve to the
+// un-shadowed wrapper at Lean. Approach 3 inherits this — closure
+// boundaries don't propagate body shadow.
+//
+// **Upstream-blocked**: calling an exec closure (`f(0)`) hits
+// Verus's `exec_nonstatic_call is not supported` (#124 — deferred).
+// So even if approach 3 handled the capture cleanly, the test
+// would fail at Verus before reaching Tactus. Pinned as `Err` to
+// document the marker; not a Tactus concern today.
+test_verify_one_file! {
+    #[test] test_exec_closure_captures_mut_ref_probe verus_code! {
+        #[verifier::tactus_auto]
+        fn bump_via_closure(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            let f = |_dummy: u8| -> u8 { *x + 1 };
+            *x = f(0);
+        }
+    } => Err(_)
+}
+
+// E20: equality on wrapper-typed values. `s1 == s2` for two
+// wrapper-typed params renders as `s1 = s2` (both wrapper-typed
+// at Lean). For single-field structures, Lean's `=` reduces to
+// field-by-field equality, so `s1 = s2 ↔ s1.deref = s2.deref`
+// holds extensionally. Probably fine but worth a probe to confirm
+// the rendering doesn't go through some coercion path that
+// over-peels.
+test_verify_one_file! {
+    #[test] test_exec_wrapper_equality_probe verus_code! {
+        enum Tag { A, B }
+
+        spec fn tag_eq(a: &Tag, b: &Tag) -> bool {
+            a == b
+        }
+
+        proof fn refl(s: &Tag)
+            ensures tag_eq(s, s)
+        by {
+            simp_all [tag_eq]
+        }
+    } => Ok(())
+}
+
+// E2 (ref patterns in match): noted but not added as a test.
+// `match s { Stack::Push(_, ref rest) => ... }` — the `ref` keyword
+// binds rest as `&Box<Stack>` (extra ref layer). Verus likely
+// rejects ref patterns at the mode check; even if it didn't,
+// BinderCtx extension at match arms would need the ref-pattern
+// adjustment. Cross that bridge if/when Verus supports ref patterns
+// in exec mode.
+
+// E12 (cross-renderer call inlining divergence): noted but not
+// pinned. Exec fn calls inline callee specs via the VIR-AST
+// renderer (`to_lean_expr`), which has its own BinderCtx and
+// coercion logic. Approach 3 introduces parallel coercion in the
+// SST renderer. The two renderers must agree on what gets coerced
+// where — divergence would produce a subtly different spec at the
+// inlining point vs the callee's emitted theorem. Hard to construct
+// a minimal probe; address with reviewer discipline + shared
+// helpers.
