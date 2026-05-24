@@ -3182,26 +3182,18 @@ start warm:
   through aliased let-bindings. Discovered closing cluster A;
   load-bearing for the wrapper case in `tactus_case_split`.
 
-* **η-reduction as substitution bridge.** When a callee's spec
-  body pre-lifts via `Tactus.X.mk var` (correct for the binder→
-  expr-typ delta at rendering time) and the caller's substituted
-  arg is already wrapper-typed, the over-wrap is corrected by
-  substituting `var → arg.deref` instead of `var → arg`. The
-  pre-lift becomes `Tactus.X.mk arg.deref` which η-reduces to
-  `arg` for single-field structures via Lean's kernel-level
-  structure-η. The mechanism is invisible at the call site but
-  absolutely load-bearing — Lean accepts the form without any
-  explicit rewrite.
-
-* **Selective peel based on callee.kind.** The Piece 3 peel is
-  gated on `FunctionKind::TraitMethodImpl`. The principle: only
-  callees whose spec body uses `ReadPlace`-style auto-`&` lifts
-  need the peel; Static callees use Var directly and would be
-  over-peeled. The kind-discriminator is empirically correlated
-  with the structural property (ReadPlace lift pattern) — a
-  future Static callee that also lifts would break, but no
-  current test exercises that. Documented for the next person
-  who hits the case.
+* ~~**η-reduction as substitution bridge.**~~ ~~**Selective peel based
+  on callee.kind.**~~ Both patterns are SUPERSEDED by the right-way
+  fix (`7d2a537`, 2026-05-24): callee-spec inlining now suppresses
+  the `apply_ref_coercion_if_needed` lift at `ExprX::ReadPlace`
+  sites via the `vir_expr_to_ast_for_inlining` entry point + the
+  `READPLACE_LIFT_ENABLED` thread-local in `to_lean_expr.rs`. With
+  the lift gone in the inlining context, no peel is needed —
+  substituted-args flow through unchanged and match the callee's
+  expected param type directly. The kind-discriminator (proxy for
+  the structural property) is eliminated. Standalone rendering
+  keeps the lift (default flag value), so proof/spec/trait-impl-
+  method bodies are unchanged.
 
 * **Non-structural-only binop peel.** Structural binops (`==`,
   `+`, `*`, `≤`, ...) apply to wrapper-typed operands directly
@@ -3222,9 +3214,14 @@ start warm:
   catches divergence. A unit test that scans both lists and asserts
   agreement would close this gap.
 
-* **Edge probe: `arg_n > 1` for TraitMethodImpl call.** The peel
-  is clamped at 1 (single auto-`&`). A receiver like `&&Box<u8>`
-  (double-wrapped) on a trait method call would peel only once,
+* ~~**Edge probe: `arg_n > 1` for TraitMethodImpl call.**~~
+  Obsolete — the peel was eliminated by the right-way fix
+  (`7d2a537`). The original concern was that the clamp at 1
+  would under-peel `&&Box<u8>`-style receivers; with no peel,
+  this concern doesn't apply. **Original text preserved**: the
+  peel was clamped at 1 (single auto-`&`). A receiver like
+  `&&Box<u8>` (double-wrapped) on a trait method call would
+  peel only once,
   potentially leaving a residual over-wrap. No test exercises
   this; unclear if Verus can even produce the shape.
 
