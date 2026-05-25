@@ -24,12 +24,38 @@ pub(crate) type BinderCtx = HashMap<VarIdent, Typ>;
 /// (spec_fn_to_ast, proof_fn_to_ast, trait_impl_to_ast, trait_to_ast)
 /// to seed the renderer with the fn's params as the initial in-scope
 /// binders.
+///
+/// For params that will be body-shadowed (post-U2: `&mut`-style
+/// mutation-encoding cases only, see `to_lean_fn::needs_param_deref`),
+/// the recorded typ is stripped of one outer ref decoration to reflect
+/// the post-shadow Lean-level reality. For non-shadowed params (`&`-only
+/// references), the typ is recorded as-declared — the renderer's
+/// bidirectional `apply_ref_coercion_if_needed` handles use-site
+/// coercion against this wrapper-decorated typ.
 pub(crate) fn binder_ctx_from_params(params: &Params) -> BinderCtx {
     let mut out = BinderCtx::new();
     for p in params.iter() {
-        out.insert(p.x.name.clone(), p.x.typ.clone());
+        let typ = if crate::expr_shared::is_mut_ref_typ(&p.x.typ, p.x.is_mut) {
+            strip_one_ref_decoration(&p.x.typ)
+        } else {
+            p.x.typ.clone()
+        };
+        out.insert(p.x.name.clone(), typ);
     }
     out
+}
+
+/// Strip exactly one outer reference decoration layer from a typ.
+/// Mirrors what the body shadow `let p := p.deref;` does at the Lean
+/// level. Returns the typ unchanged if there's no outer ref decoration.
+pub(crate) fn strip_one_ref_decoration(typ: &Typ) -> Typ {
+    match &**typ {
+        TypX::Decorate(deco, _, inner) if decoration_wrapper(*deco).is_some() => {
+            inner.clone()
+        }
+        TypX::MutRef(inner) => inner.clone(),
+        _ => typ.clone(),
+    }
 }
 
 /// Build a `lean_ast::Expr` from a VIR-AST expression with no enclosing
@@ -108,8 +134,15 @@ fn structural_typ(expr: &Expr, binders: &BinderCtx) -> Option<Typ> {
             binders.get(v).cloned()
         }
         // ReadPlace's rendering drops the read kind, producing the
-        // place's typ. (The read kind, e.g., ImmutBor for auto-`&`,
-        // is what decorates expr.typ.)
+        // place's underlying value typ. (The read kind, e.g., ImmutBor
+        // for auto-`&`, is what decorates expr.typ.)
+        //
+        // Binder-aware path (U2 refactor): when the inner Place is
+        // `Local(v)`, return `binders.get(v)` — this reflects the
+        // ACTUAL Lean-level typ of the rendered variable, accounting
+        // for whether a body shadow was applied (BinderCtx records
+        // post-shadow typs at construction time). For non-Local
+        // places, fall back to `p.typ` (the SST place's typ).
         //
         // Inlining contexts (`vir_expr_to_ast_for_inlining`) flip
         // `READPLACE_LIFT_ENABLED` to false to suppress the lift —
@@ -117,7 +150,10 @@ fn structural_typ(expr: &Expr, binders: &BinderCtx) -> Option<Typ> {
         // value directly. See the doc on `vir_expr_to_ast_for_inlining`.
         ExprX::ReadPlace(p, _) => {
             if READPLACE_LIFT_ENABLED.with(|cell| cell.get()) {
-                Some(p.typ.clone())
+                match &p.x {
+                    PlaceX::Local(v) => binders.get(v).cloned().or_else(|| Some(p.typ.clone())),
+                    _ => Some(p.typ.clone()),
+                }
             } else {
                 None
             }
@@ -189,9 +225,18 @@ fn apply_ref_coercion_if_needed(
     rendered: LExpr,
     binders: &BinderCtx,
 ) -> LExpr {
-    // Compute the "structural" typ — what the rendering naturally
-    // produces. If `expr.typ` has more reference decorations than
-    // structural, wrap with `Tactus.X.mk` for the extra layers.
+    // Bidirectional coercion. Compute the "structural" typ — what the
+    // rendering naturally produces — and compare to `expr.typ`:
+    //
+    // * `expr.typ` has MORE wrappers than structural → insert
+    //   `Tactus.X.mk` for the extra layers (e.g., auto-`&` at a call
+    //   site needs to wrap a bare value).
+    // * `expr.typ` has FEWER wrappers than structural → insert
+    //   `.deref` chain for the difference (e.g., Verus's spec-mode
+    //   `**b` collapses to `Var(b)` with expr.typ = bare, but the
+    //   binder is wrapper-typed — we need to project out the inner).
+    //
+    // The equal case renders verbatim.
     let Some(natural) = structural_typ(expr, binders) else {
         return rendered;
     };
@@ -203,6 +248,8 @@ fn apply_ref_coercion_if_needed(
         // already accounted for by the structural typ.
         let extra = expr_n - natural_n;
         apply_ref_wraps(rendered, &wraps[..extra])
+    } else if expr_n < natural_n {
+        crate::expr_shared::apply_deref_chain(rendered, natural_n - expr_n)
     } else {
         rendered
     }

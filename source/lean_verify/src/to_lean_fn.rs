@@ -55,18 +55,25 @@ pub(crate) fn is_ref_decorated(typ: &TypX) -> bool {
         | TypX::MutRef(_))
 }
 
-/// True when this param's Lean binder is wrapper-typed and so the
-/// body needs a `let p := p.deref` shadow to access the inner value
-/// uniformly. Covers Ref/Box/Rc/Arc decorations plus all three
-/// `&mut`-like shapes (legacy `is_mut: true`, new-mode `MutRef<T>`,
-/// `Decorate(MutRef, _, _)`).
+/// True when this param needs a body shadow because the shadow is
+/// load-bearing for the **mutation encoding** — `*x = e` lowers to
+/// `let x := e` in Lean, requiring `x` to be at the inner-typ level
+/// throughout the body.
+///
+/// Post-U2 (wrapper-arch use-site coercion): `&`-only reference
+/// decorations (Ref/Box/Rc/Arc) do NOT need a shadow. The renderer's
+/// bidirectional `apply_ref_coercion_if_needed` inserts `.deref`
+/// chains at use sites that expect inner-typed values, and `Tactus.X.mk`
+/// wraps at use sites that expect wrapper-typed. The shadow was the
+/// "always strip, then re-wrap on demand" approach; the post-U2
+/// renderer handles strip + wrap symmetrically at use sites, so the
+/// shadow is unnecessary clutter for read-only references.
+///
+/// Mutation-encoding cases (legacy `is_mut: true`, new-mode `MutRef<T>`,
+/// `Decorate(MutRef, _, _)`, plus BorrowMut locals) DO need shadow:
+/// the `let x := e` mutation lowering requires `x`'s Lean type to
+/// match `e`'s inner-value type so the shadow composes.
 fn needs_param_deref(p: &Param) -> bool {
-    // Ref-like decorations always wrap.
-    if is_ref_decorated(&p.x.typ) {
-        return true;
-    }
-    // `&mut` in legacy mode (`is_mut: true`, plain typ) also gets
-    // wrapped at the binder via `param_binder_typ`.
     crate::expr_shared::is_mut_ref_typ(&p.x.typ, p.x.is_mut)
 }
 
