@@ -754,7 +754,22 @@ fn call_to_node(target: &CallTarget, args: &Exprs, binders: &BinderCtx) -> ExprN
                 })
             }
         }
-        CallTarget::FnSpec(inner) => vir_expr_to_ast_with_binders(inner, binders),
+        CallTarget::FnSpec(inner) => {
+            // The function value at this position must be at bare
+            // `Int → Int`-style level so `App(head, args)` works at the
+            // Lean level. Verus's spec semantics may decorate the
+            // inner expr's typ with auto-borrow refs (`&spec_fn(...)`
+            // at the call site), which causes `apply_ref_coercion_if_needed`
+            // to wrap with `Tactus.Ref.mk` — producing the wrong
+            // shape (`Tactus.Ref.mk f x` instead of `f x`). Peel back
+            // those wrappers explicitly: render the inner, then strip
+            // its declared wrapper depth via `.deref` chain.
+            let rendered = vir_expr_to_ast_with_binders(inner, binders);
+            crate::expr_shared::apply_deref_chain(
+                rendered,
+                count_ref_decorations(&inner.typ),
+            )
+        }
         CallTarget::BuiltinSpecFun(_, typs, _) => {
             let base = var("builtinSpecFun");
             if typs.is_empty() {
