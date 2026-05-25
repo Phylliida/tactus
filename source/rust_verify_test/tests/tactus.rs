@@ -11007,3 +11007,49 @@ test_verify_one_file! {
 // inlining point vs the callee's emitted theorem. Hard to construct
 // a minimal probe; address with reviewer discipline + shared
 // helpers.
+
+// P_MULTI_PROOF_BODY: probe whether proof-fn body rendering (which
+// already calls `wrap_body_with_param_derefs`) handles a multi-layer
+// wrapper param (`&Box<u8>`, count=2). Uses `ok(**b)` (a spec fn
+// taking bare u8) to FORCE the deref to actually produce a u8 —
+// `*b == *b` would collapse to `b = b` and pass trivially even if
+// derefs are misrendered.
+test_verify_one_file! {
+    #[test] test_proof_fn_multi_layer_wrapper_probe verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        spec fn ok(x: u8) -> bool { x > 0 }
+
+        proof fn double_wrapped(b: &Box<u8>)
+            requires ok(**b)
+            ensures ok(**b)
+        by {
+            simp_all
+        }
+    } => Ok(())
+}
+
+// P_MULTI_TRAIT_NONSELF: probe whether a trait method with a
+// multi-layer wrapper non-self param renders correctly. Same
+// strengthening — use `ok(**b)` to force the inner type to surface.
+test_verify_one_file! {
+    #[test] test_trait_method_multi_layer_param_probe verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        spec fn ok(x: u8) -> bool { x > 0 }
+
+        trait Holds {
+            proof fn double_eq(b: &Box<u8>)
+                requires ok(**b)
+                ensures ok(**b);
+        }
+
+        struct H;
+        impl Holds for H {
+            proof fn double_eq(b: &Box<u8>)
+                ensures ok(**b)
+            by {
+            }
+        }
+    } => Ok(())
+}
