@@ -3214,6 +3214,22 @@ start warm:
   catches divergence. A unit test that scans both lists and asserts
   agreement would close this gap.
 
+* **Typed `non_binop_head` return.** Currently `non_binop_head(op)
+  -> &str` returns just the head fn name. The SST renderer's
+  non-structural binop arm applies `apply_deref_chain` to BOTH
+  operands by `count_ref_decorations(arg.typ)` because all current
+  `non_binop_head` targets (`Tactus.strGetChar`, `Bool.xor`, …)
+  happen to want inner-typed args. The "peel both unconditionally"
+  shape is a heuristic that matches today's table by coincidence.
+  A typed return — e.g., `non_binop_head(op) -> NonBinopHead {
+  name, arg_kinds: [InnerInt|InnerBool|InnerString|Wrapper|...] }`
+  — would let the renderer derive each operand's peel from
+  declared types. A future head fn that wanted wrapper-typed args
+  would express that structurally instead of silently being
+  over-peeled. Small refactor; only ~3 entries in the table today;
+  no current failure mode would flip but adding new entries
+  becomes less error-prone.
+
 * ~~**Edge probe: `arg_n > 1` for TraitMethodImpl call.**~~
   Obsolete — the peel was eliminated by the right-way fix
   (`7d2a537`). The original concern was that the clamp at 1
