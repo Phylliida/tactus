@@ -130,7 +130,7 @@ use crate::lean_ast::{
 use crate::expr_shared::{is_mut_ref_typ, varat_pre_name};
 use std::sync::Arc;
 use crate::to_lean_expr::{vir_expr_to_ast, vir_expr_to_ast_for_inlining};
-use crate::to_lean_sst_expr::{lower as lower_validated, renders_as_lean_int, sst_exp_to_ast_checked, type_bound_predicate, Validated};
+use crate::to_lean_sst_expr::{lower as lower_validated, lower_with_ctx as lower_validated_with_ctx, renders_as_lean_int, sst_exp_to_ast_checked, sst_exp_to_ast_checked_with_ctx, type_bound_predicate, Validated};
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
 
 // ── BitVec-mode preamble fragments (#130 / right-way #4) ───────────────
@@ -441,7 +441,12 @@ impl<'a> WpCtx<'a> {
             );
             check_exp(&rewritten)?;
         }
-        let fn_map = krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
+        let fn_map: FnMap = krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
+        // RenderCtx (Option 1 Phase 1) with the fn_map for class-
+        // method-call coercion at trait dispatch sites in the ensures
+        // rendering below. Cross-crate trait method decls aren't in
+        // fn_map and gracefully fall back to no-coerce.
+        let render_ctx = crate::expr_shared::RenderCtx::with_fn_map(&fn_map);
         let type_map = check.local_decls.iter().map(|d| (&d.ident, &d.typ)).collect();
         let ret_name = check.post_condition.dest.as_ref().map(|v| v.0.as_str());
         // Wrap each ensures clause with a `Postcondition` SpanMark so
@@ -485,7 +490,9 @@ impl<'a> WpCtx<'a> {
                     format_rust_loc(&ens.span),
                     Some(ens.span.clone()),
                     AssertKind::Obligation(ObligationKind::Postcondition),
-                    lower_validated(&Validated::check(&coerced)?),
+                    // Lower with the RenderCtx so trait method calls
+                    // in the ensures get correct receiver coercion.
+                    lower_validated_with_ctx(&Validated::check(&coerced)?, &render_ctx),
                 ))
             }).collect::<Result<Vec<_>, String>>()?
         );
@@ -3593,7 +3600,11 @@ fn build_req_binders(
         // both `rewrite_mut_ref_in_exp` and
         // `insert_nat_coercions_in_exp` are deterministic, so re-running
         // here produces an identical (coerced) Exp.
-        let rendered = sst_exp_to_ast_checked(&coerced)
+        // Use the fn_map-backed RenderCtx so trait method calls in
+        // the requires get correct receiver coercion. The fn_map is
+        // already a parameter of this function.
+        let render_ctx = crate::expr_shared::RenderCtx::with_fn_map(fn_map);
+        let rendered = sst_exp_to_ast_checked_with_ctx(&coerced, &render_ctx)
             .expect("build_req_binders: req validated by WpCtx::new");
         LBinder {
             name: Some(crate::lean_name::LeanName::synthetic(format!("h_req{}", i))),
