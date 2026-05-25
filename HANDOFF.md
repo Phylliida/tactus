@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**434 end-to-end tests + 1 coverage test + 209 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**438 end-to-end tests + 1 coverage test + 219 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -6434,13 +6434,162 @@ gymnastics needed.
   omega + simp_all closer combinators reason about meaning, not
   shape, so they were robust to the structural cleanup.
 
-##### Commits
+##### Commits (morning + early afternoon)
 
 - `6e841f5` WIP wrapper-arch U2 refactor: bidirectional lift + binder-aware ReadPlace (the four-edit core)
 - `9ce1302` U2 follow-up: deref chains at Field/IsVariant + non_binop_head
 - `d9f7944` U2: binder-aware deref insertion at Field/IsVariant + PlaceX::Field (the load-bearing parallel-renderer fix)
 - `3347915` multi-layer wrapper probes: both pass under U2
 - `0ac816d` poems 2026-05-25: U2 landing arc
+- `70760e9` DESIGN + HANDOFF: U2 refactor documented
+
+#### Current session (2026-05-25 cont. — U2 review pass + FnSpec wrapper fix)
+
+After U2 landed clean (434/12), ran the 14-lens review framework
+against the day's diff. Two follow-on landings.
+
+##### Review-pass cleanup (commit `6f577db`)
+
+Lens findings + fixes:
+
+1. **Dead code** (Lens 1): `is_ref_decorated` had zero callers after
+   U2 replaced its use in `needs_param_deref` with `is_mut_ref_typ`.
+   Removed.
+
+2. **Repeated 3-line pattern** (Lens 1, 6, 9): `ExprX::Field` and
+   `ExprX::IsVariant` arms repeated `render + count + apply_chain`.
+   Extracted `render_expr_with_derefs(inner, binders)` helper. Same
+   shape extracted as `render_place_with_derefs(base, binders)` for
+   the parallel `PlaceX::Field` arm.
+
+3. **Duplicate wrap_count helpers** (Lens 9, 10): `lean_level_wrap_count`
+   (Expr-side) and `place_lean_wrap_count` (Place-side) collapsed into
+   a `(var_id, typ)`-based core helper with two thin var-extracting
+   wrappers. Eliminates drift between the parallel paths.
+
+4. **Coverage gaps** (Lens 3, 14): added 10 unit tests in
+   `to_lean_expr::tests` — 5 for `strip_one_ref_decoration` (strips
+   ref, strips MutRef, single-layer only, bare passthrough, doesn't
+   peel Boxed) + 5 for `binder_ctx_from_params` (empty, ref-only
+   keeps wrapper, legacy &mut strips, new-mode MutRef strips, mixed
+   shapes).
+
+5. **Lib test fixture rot** (incidental): 6 pre-existing `Def` literals
+   in `lean_pp.rs` + `sanity.rs` were missing the `decreasing_by`
+   field added by `b52b67a` (wrapper-arch follow-on). Blocked the
+   entire lib test suite from compiling. Added `decreasing_by: None`
+   to each. Unrelated to U2; just blocking the new tests from running.
+
+**Depth-3 wrapper probe** (`test_proof_fn_depth_3_wrapper_probe`):
+exercises `&Box<Box<u8>>` (count=3) via `***b` access. Passes — the
+bidirectional lift's count-based logic handles arbitrary depths
+structurally. Pins the architectural property U2's design predicted.
+
+Test counts: 434/12 → 435/12 + unit 209 → 219.
+
+##### Function-type wrapper cluster fix (commit `1ff6813`)
+
+Quick win on a 3-test cluster (`test_higher_order`, `test_spec_closure`,
+`test_spec_fn_apply`). All three rendered `f(x)` where `f: spec_fn(int)
+-> int` as `Tactus.Ref.mk f x` — over-wrapping `f` then trying to
+apply the wrapped form to `x`.
+
+Diagnosis: at `CallTarget::FnSpec(inner)` rendering, Verus's spec-mode
+auto-borrow decorates the inner expr's typ with `&spec_fn`.
+`apply_ref_coercion_if_needed` sees expr.typ has more wrappers than
+the binder's structural typ → wraps with `Tactus.Ref.mk` (matching
+expr.typ). But the surrounding `App(head, args)` needs the head at
+bare function-type level for Lean's application to work.
+
+Fix: in the `CallTarget::FnSpec` arm of `call_to_node`, peel back any
+wrappers via `.deref` chain matching `count_ref_decorations(inner.typ)`.
+This undoes the lift's wrap, bringing the rendered head to the bare
+function level. One-line fix (plus comment block).
+
+Test counts: 435/12 → 438/9 (+3 wins, 0 regressions).
+
+##### Remaining 9 failures — categorized for next-session work
+
+All 9 remaining failures live in `to_lean_sst_expr.rs` /
+`sst_to_lean.rs` (the SST renderer used by exec fns), not in
+`to_lean_expr.rs` (where U2 landed). The β refactor already added
+use-site coercion to specific SST sites (Field, IsVariant,
+non_binop_head, CheckDecreaseHeight), but other SST sites — call args
+at trait dispatch, recursive args in termination, post-state
+existentials — don't have parallel U2 treatment.
+
+**Cluster A — Mut-ref + trait dispatch (3 tests, medium scope)**:
+- `test_new_mut_ref_pre_post_substitution_probe`
+- `test_old_view_pre_post_substitution_probe`
+- `test_old_view_trait_dispatch_probe`
+
+Failure shape: bare `Holder` passed where `Tactus.Ref Holder` expected
+at trait method call. SST trait-dispatch call-arg rendering needs to
+WRAP bare values to match the class signature's wrapper-typed receiver.
+Mirrors the FnSpec fix but in the opposite direction at the SST level.
+Likely a focused fix at the SST call emission site.
+
+**Cluster B — Wrapper-arch probes (3 tests, medium scope)**:
+- `test_exec_call_recursive_aliased_arg_probe` (P1 from β probe set)
+- `test_exec_call_site_ref_to_bare_probe` (β probe)
+- `test_exec_call_recursive_generic_datatype_cross_instantiation`
+
+The aliased probe shows the SST CheckDecreaseHeight rendering picks up
+`copy.deref` where `copy` is `Tactus.Box Stack` (one deref ok) but then
+tries another `.deref` (`copy.deref.deref` → `.deref` on `Stack` →
+field-not-found). Aliased-local handling in CheckDecreaseHeight arg
+rendering needs U2's binder-aware deref-count logic. The cross-
+instantiation probe has its own issue (generic datatype with cross-
+instantiation, separate from wrapper-arch).
+
+**Cluster C — New-mut-ref edge cases (3 tests, large scope)**:
+- `test_exec_call_mut_arg_new_mut_ref`
+- `test_exec_call_mut_arg_new_mut_ref_use_after`
+- `test_exec_call_two_mut_args_new_mut_ref`
+
+Most complex. The post-state existential is typed as `Tactus.MutRef Int`
+(wrapper) but the substituted ensures uses it in arithmetic positions
+that need inner-typed values. Multiple interacting concerns: post-
+state existential typing, mut-ref encoding's lift interactions,
+caller-side rebinding. Likely needs a focused mini-design pass.
+
+##### The pattern (worth recording)
+
+The "right way" answer for these 9 is **bring U2 to the SST renderer**:
+bidirectional lift at SST call sites, binder-aware structural for SST
+Var renderings, post-state existentials typed at the level the rest of
+the encoding uses. That'd unify the architecture across both renderers
+(same way β unified the body-shadow approach across them). The SST
+renderer doesn't have an exact analog of `apply_ref_coercion_if_needed`
+— would need to build the equivalent or adapt the existing scattered
+`apply_deref_chain` calls into a coherent mechanism.
+
+Scope: 1-3 focused sessions of work, depending on appetite for
+unifying with the VIR-AST renderer architecture vs targeted per-
+cluster fixes.
+
+##### Day total (2026-05-25, all sessions)
+
+- e2e: 425 → **438** (+13 net, **0 regressions across U2 + cleanup + FnSpec**)
+- unit: 209 → **219** (+10 from review-pass coverage tests)
+- vstd: 1530/0 throughout
+- 9 commits + 1 poems commit + 1 doc commit:
+  - `6e841f5` U2 four-edit core
+  - `9ce1302` U2 follow-up (deref chains)
+  - `d9f7944` U2 PlaceX::Field (load-bearing)
+  - `3347915` multi-layer probes pass
+  - `0ac816d` poems
+  - `70760e9` DESIGN + HANDOFF
+  - `6f577db` review-pass cleanup (dead code + helpers + tests + depth-3 probe)
+  - `1ff6813` function-type wrapper cluster fix
+
+The day's arc: morning was about the user's "more general thing"
+question turning A'' into U2; afternoon was review-pass discipline
+that found a dead helper, two patterns ripe for extraction, missing
+unit coverage, and surfaced a clean 3-test win on the function-type
+cluster. The "no regressions" property held across all 8 commits —
+the U2 architecture is robust to refactoring because the test suite
+reasons about goal meaning, not specific rendered shapes.
 
 ## Architecture
 
