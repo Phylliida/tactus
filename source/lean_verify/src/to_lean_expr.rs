@@ -304,7 +304,17 @@ fn expr_to_node(expr: &Expr, binders: &BinderCtx) -> ExprNode {
                 Some(l_op) => LExpr::binop(l_op, l, r).node,
                 // Non-structural: emit as `head lhs rhs` via App so the pp
                 // layer handles precedence and spans flow through normally.
-                None => LExpr::app(LExpr::var_lit(non_binop_head(op)), vec![l, r]).node,
+                // Non-structural heads (e.g., `Tactus.strGetChar`,
+                // `Bool.xor`) expect inner-typed args — apply `.deref`
+                // chains to bridge wrapper-typed operands. Mirrors the
+                // β refactor's SST-side fix at the same arm.
+                None => {
+                    let l_peeled = crate::expr_shared::apply_deref_chain(
+                        l, count_ref_decorations(&lhs.typ));
+                    let r_peeled = crate::expr_shared::apply_deref_chain(
+                        r, count_ref_decorations(&rhs.typ));
+                    LExpr::app(LExpr::var_lit(non_binop_head(op)), vec![l_peeled, r_peeled]).node
+                }
             }
         }
 
@@ -505,10 +515,23 @@ fn expr_to_node(expr: &Expr, binders: &BinderCtx) -> ExprNode {
 
         ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => expr_to_node(inner, binders),
         ExprX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
-            LExpr::field_proj(vir_expr_to_ast_with_binders(inner, binders), field_access_name(field_opr)).node
+            // U2: if `inner` is wrapper-typed (`Tactus.Ref T`, `Box<T>`, etc.)
+            // and the field belongs to the INNER type T, project through the
+            // wrapper layers via `.deref` chain before accessing the field.
+            // Mirrors the SST-side fix landed in the β refactor at
+            // `to_lean_sst_expr::ExpX::UnaryOpr(Field, _)`.
+            let inner_rendered = vir_expr_to_ast_with_binders(inner, binders);
+            let n_derefs = count_ref_decorations(&inner.typ);
+            let inner_dereffed = crate::expr_shared::apply_deref_chain(inner_rendered, n_derefs);
+            LExpr::field_proj(inner_dereffed, field_access_name(field_opr)).node
         }
         ExprX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => {
-            is_variant_node(variant, vir_expr_to_ast_with_binders(inner, binders))
+            // U2: same deref-chain treatment as Field — discriminator
+            // checks operate on the inner inductive type, not the wrapper.
+            let inner_rendered = vir_expr_to_ast_with_binders(inner, binders);
+            let n_derefs = count_ref_decorations(&inner.typ);
+            let inner_dereffed = crate::expr_shared::apply_deref_chain(inner_rendered, n_derefs);
+            is_variant_node(variant, inner_dereffed)
         }
         ExprX::UnaryOpr(UnaryOpr::HasType(t), inner) => {
             // Refinement invariant: `e < 2^n` for `U(n)`, `-2^(n-1) ≤ e ∧
