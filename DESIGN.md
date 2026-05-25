@@ -3015,7 +3015,7 @@ an Opaque value at this site. Only DIRECT field types matter
   outside the trait setup. Worth adding if any change to the dep
   walk is suspected.
 
-### Transparent-wrapper peel vs trait dispatch (LANDED across Phase 1 + Phase 2 + β refactor)
+### Transparent-wrapper peel vs trait dispatch (LANDED across Phase 1 + Phase 2 + β refactor + U2)
 
 Reference-like decorations (`&A`, `Box<A>`, `Rc<A>`, `Arc<A>`) are
 now preserved as distinct Lean types via the `Tactus.Ref` / `Box` /
@@ -3023,13 +3023,20 @@ etc. wrapper structures in `TactusPrelude.lean`. Phase 1 (`f5362bb`,
 2026-05-20) introduced the opaque wrapper types. Phase 2 (`831a293`,
 2026-05-20) made `typ_to_expr` emit them. The β refactor (six
 commits across 2026-05-24, capped by `d9476e6`) closed the cluster
-of test failures the wrapper architecture surfaced.
+of test failures the wrapper architecture surfaced. **U2** (2026-05-25,
+four-edit refactor capped by `d9f7944`) unified the body-shadow + lift
+mechanism into a single bidirectional use-site coercion, closing the
+trait method class field type cluster and the multi-layer wrapper gap
+in one structural change.
 
 Pinned by `test_non_forwarding_blanket_over_ref_probe` (was Err
 pre-Phase-2, flipped Ok post-Phase-2). The β refactor restored
 6 cluster A failures around recursive datatypes + 3 wrapper-aware
-call-site coercions that Phase 2 broke. See the β refactor session
-entry in HANDOFF.md (2026-05-24) for the full mechanics.
+call-site coercions that Phase 2 broke. U2 restored 7 trait method
+class field type failures + closed multi-layer `&Box<u8>`-style
+wrapper handling (pinned by `test_proof_fn_multi_layer_wrapper_probe`
++ `test_trait_method_multi_layer_param_probe`). See the U2 + β
+refactor session entries in HANDOFF.md for the full mechanics.
 
 #### Original gap (preserved for context)
 
@@ -3168,6 +3175,95 @@ start warm:
 - **β refactor** (2026-05-24, 6 commits capped by `d9476e6`):
   closed the 6 cluster A failures and recovered 3 strslice/
   inlined_ensure regressions. 419 → 425 tests. See HANDOFF.md.
+- **U2** (2026-05-25, 4-edit refactor capped by `d9f7944`): unified
+  body-shadow + lift into bidirectional use-site coercion. Closed
+  the 7 trait method class field type failures + multi-layer wrapper
+  gap (`&Box<u8>`-style params). 425 → 434 tests, 0 regressions.
+
+#### U2 mechanism
+
+Four coupled edits in `to_lean_expr.rs` + `to_lean_fn.rs`:
+
+1. **`apply_ref_coercion_if_needed` is bidirectional.** When
+   `expr.typ` has MORE wrappers than structural — insert
+   `Tactus.X.mk` wraps (existing behavior). When `expr.typ` has
+   FEWER wrappers — insert `.deref` chain via `apply_deref_chain`.
+   The two directions are symmetric: use sites bridge in whichever
+   direction is needed.
+
+2. **`structural_typ` for `ReadPlace` is binder-aware.** When the
+   inner Place is `Local(v)`, returns `binders.get(v)` (the
+   binder's typ from BinderCtx) instead of `p.typ`. Reflects the
+   actual Lean-level typ of the rendered variable, accounting for
+   whether a body shadow was applied (BinderCtx records post-shadow
+   typs at construction time).
+
+3. **`needs_param_deref` restricted to `&mut` only.** Mutation-
+   encoding cases (legacy `is_mut: true`, new-mode `MutRef<T>`,
+   `Decorate(MutRef, _, _)`, BorrowMut locals) still need shadow
+   because `*x = e` lowers to `let x := e` in Lean (the shadow IS
+   the mutation encoding). `&`-only references (Ref/Box/Rc/Arc) no
+   longer get the shadow — the bidirectional coercion handles
+   use-site needs at the use sites.
+
+4. **`binder_ctx_from_params` records post-shadow typs.** For
+   params that WILL be shadowed (`&mut`), strip one outer ref
+   decoration via the new `strip_one_ref_decoration` helper so
+   structural_typ reflects the Lean-level reality. For non-shadowed
+   (`&`-only) params, record the typ as-declared.
+
+Plus parallel fixes at projection sites that don't go through the
+lift:
+
+* **`UnaryOpr::Field` / `UnaryOpr::IsVariant`** in
+  `to_lean_expr.rs`: fields belong to the inner type, not the
+  wrapper. Insert `.deref` chain based on `lean_level_wrap_count`
+  (binder-aware for Var-shaped inner).
+
+* **`PlaceX::Field`** in `place_to_expr`: same fix on the parallel
+  Place renderer (reached via ReadPlace → place_to_expr). Uses
+  `place_lean_wrap_count` helper.
+
+* **Non-structural binops** (`Tactus.strGetChar`, `Bool.xor`, etc.):
+  in `to_lean_expr.rs` Binary arm with `binop_to_ast` returning
+  `None`, peel both operands via `count_ref_decorations` — mirrors
+  the SST-side β refactor fix at the same arm.
+
+#### What U2 changed semantically
+
+* **Body context for `&`-only params**: no longer body-shadowed. The
+  binder stays wrapper-typed throughout; use sites apply `.deref` (for
+  field/variant access) or pass through (for method calls expecting
+  wrapper).
+* **Class field type for trait proof methods**: no longer needs the
+  missing shadow site (A''). The bidirectional lift sees binder-typ ==
+  expr-typ for the `ReadPlace(self, ImmutBor)` case and emits `self`
+  directly — no over-wrap.
+* **Multi-layer wrappers** (`&Box<u8>`, etc.): work uniformly. The
+  bidirectional lift counts depth and inserts the right number of
+  derefs/wraps. No special-casing of single vs multi-layer.
+* **Generated Lean is cleaner**: many `let p := p.deref; ... Tactus.Ref.mk p ...`
+  shapes collapse to just `p` because the binder is wrapper-typed
+  and use sites need wrapper-typed args.
+
+#### Why this is the right shape
+
+Pre-U2 the architecture had three asymmetries that needed
+maintenance per case:
+
+1. Body context (shadow stripped, lift restored) vs class field type
+   (no shadow, lift over-wrapped).
+2. Exec fn rendering (post-β: no `&` shadow, use-site coercion) vs
+   proof fn rendering (still has `&` shadow + lift).
+3. Single-layer (covered by current helpers) vs multi-layer (latent
+   gap requiring shadow + structural_typ changes together).
+
+Post-U2 all three collapse to one rule: *the binder records the
+Lean-level wrapper depth; use sites insert derefs or wraps as needed
+to bridge*. The shadow's purpose narrows to "mutation encoding only,"
+which is what the body-shadow `let x := x.deref;` is fundamentally
+for (the mutation form `*x = e` lowers to `let x := e`, and the
+shadow makes x's Lean type match e's inner-value type).
 
 **Patterns and conventions that emerged from the β refactor**
 (worth carrying forward to future wrapper-aware encoding work):
@@ -3204,6 +3300,29 @@ start warm:
   body/ensures symmetry when Verus's SST collapses auto-derefs
   into `Var(p)`-with-adjusted-typ form (`test_exec_nested_wrapper_probe`).
 
+* **Use-site coercion at projection sites** (U2). Fields and
+  IsVariant discriminators belong to the inner type, not the
+  wrapper — so the renderer inserts `.deref` chains based on
+  `lean_level_wrap_count(inner, binders)` before projecting. The
+  helper is binder-aware so it sees the actual Lean-level wrapper
+  depth (which may differ from `inner.typ` when Verus's SST has
+  spec-collapsed derefs). The PARALLEL Place-side fix in
+  `place_to_expr` uses `place_lean_wrap_count` — same shape,
+  different node type. The two parallel renderers (`ExprX` and
+  `PlaceX`) both need their Field arms updated together; a future
+  shared-helper refactor would tighten this. See "Two parallel
+  expression renderers" — they're parallel by construction.
+
+* **Mutation shadow is for mutation, not for wrappers** (U2). Pre-
+  U2 the body shadow `let p := p.deref;` was applied to every
+  wrapper-typed param ("&-only" and `&mut` alike) on the theory that
+  bodies want to operate at inner-typed level. Post-U2 the shadow
+  is reserved for `&mut`-style mutation cases, where `*x = e` lowers
+  to `let x := e` and the shadow makes x's Lean type match e's
+  inner-value type. For read-only references, the shadow was
+  decorative — the bidirectional lift handles the bridge at use
+  sites without changing the binder's Lean-level type.
+
 **Known follow-up items** (left for future sessions):
 
 * **Shape-drift guard for the wrapper name list in `tactus_case_split`.**
@@ -3230,23 +3349,39 @@ start warm:
   no current failure mode would flip but adding new entries
   becomes less error-prone.
 
-* ~~**Edge probe: `arg_n > 1` for TraitMethodImpl call.**~~
-  Obsolete — the peel was eliminated by the right-way fix
-  (`7d2a537`). The original concern was that the clamp at 1
-  would under-peel `&&Box<u8>`-style receivers; with no peel,
-  this concern doesn't apply. **Original text preserved**: the
-  peel was clamped at 1 (single auto-`&`). A receiver like
-  `&&Box<u8>` (double-wrapped) on a trait method call would
-  peel only once,
-  potentially leaving a residual over-wrap. No test exercises
-  this; unclear if Verus can even produce the shape.
+* **Shared Field-projection helper for `ExprX::Field` + `PlaceX::Field`**
+  (U2 follow-up). Both renderers' Field arms now apply binder-aware
+  `.deref` chains via parallel helpers (`lean_level_wrap_count` for
+  ExprX inner, `place_lean_wrap_count` for PlaceX base). The shape
+  is the same; the helpers differ only because the AST node types
+  differ. A shared trait-or-helper would prevent divergence if
+  one site is updated and the other isn't. Discovered during the
+  U2 iteration — the bug initially landed in `ExprX::Field` alone
+  and only after running tests did we discover the parallel
+  `PlaceX::Field` path needed the same fix. Not blocking; flagged
+  for cleanup when a third Field-projection site appears or when
+  a related bug surfaces from divergence.
 
-* **Smaller targeted regression probes.** Three structural
-  decisions in the β refactor are pinned only collectively by
-  the 6 cluster A tests + the 3 recovered regressions. Smaller
-  unit probes for each — `cases h :` syntax, non-structural-only
-  binop peel, TraitMethodImpl-only call-site peel — would isolate
-  the failure mode for a future bug.
+* **Multi-layer wrapper probes pinned but not the only test.**
+  `test_proof_fn_multi_layer_wrapper_probe` and
+  `test_trait_method_multi_layer_param_probe` exercise `&Box<u8>`
+  (2-layer) via `**b` access. Deeper depths (`&&Box<u8>`,
+  `&Box<Box<u8>>`, etc.) are not yet exercised; the bidirectional
+  lift's count-based logic should handle arbitrary depths
+  structurally, but no test pins this. Worth a probe at depth 3+
+  if a real use case surfaces.
+
+* **`vir_expr_to_ast_for_inlining` thread-local still needed**
+  (vs eliminated by U2). The `READPLACE_LIFT_ENABLED` thread-local
+  from the β refactor's right-way fix remains in place. Even with
+  U2's binder-aware structural_typ, the inlining context has an
+  empty BinderCtx (substitution happens post-rendering), so
+  structural would fall back to `p.typ` (bare) and the lift would
+  over-wrap substituted args. The thread-local correctly suppresses
+  this. Removing it would require coordinating the substitution
+  with a synthetic BinderCtx populated from the caller's arg typs —
+  not currently motivated, but a candidate for future cleanup if
+  the inlining pipeline is restructured.
 
 **Alternatives considered + rejected** (2026-05-20):
 

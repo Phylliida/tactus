@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**425 end-to-end tests + 1 coverage test + 209 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**434 end-to-end tests + 1 coverage test + 209 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -6262,6 +6262,185 @@ These were all failing pre-β; β neither fixed nor broke them.
   fns with inner-typed signatures, so peeling there IS necessary.
   The right level of restriction came from running the suite, not
   from abstract reasoning.
+
+#### Current session (2026-05-25 — wrapper-arch U2: bidirectional lift + binder-aware ReadPlace)
+
+Continuation of the wrapper-arch refactor. Yesterday's β closed
+cluster A; today's U2 closed the remaining trait method class field
+type cluster AND multi-layer wrapper handling AND eliminated the
+shadow-vs-class-field architectural asymmetry — all in four coupled
+edits. Four commits, **425/19 → 434/12 (+9 net, 0 regressions)**.
+
+##### The arc
+
+Started reading docs intending to land **A''** — a small mechanical
+fix that adds the missing `wrap_body_with_param_derefs` call site in
+`proof_fn_method_type` for class field type rendering. The helper
+existed; the missing site was documented; the fix would close the 7
+failing trait method tests. Danielle had two pauses that reshaped
+the work:
+
+1. *"are there any cases that A'' doesn't handle?"* — surfaced the
+   multi-layer wrapper gap (`&Box<u8>` style) which A'' inherits from
+   the single-layer shadow helper.
+2. *"could we see if there's a more general thing?"* — surfaced **U2**,
+   the unified use-site coercion approach that fixes single-layer +
+   multi-layer + body-vs-class-field asymmetry in one structural
+   change.
+
+The instinct was *more general thing → bigger refactor → multi-session*.
+After mapping the four coupled edits, scope became *one focused
+session* — not because U2 was small, but because U2 deletes special
+cases rather than adding them, so net code change is minor.
+
+##### Probes that pinned the scope
+
+Before committing to U2, wrote two probes to confirm the multi-layer
+gap was real (not theoretical):
+
+- `test_proof_fn_multi_layer_wrapper_probe`: proof fn body with
+  `&Box<u8>` param + `**b` access. Pre-U2 fail (`ok b` type error
+  after single-layer shadow leaves b at `Tactus.Box Int` but `ok`
+  takes Int).
+- `test_trait_method_multi_layer_param_probe`: same shape via a
+  trait method class field type. Pre-U2 also fail.
+
+Both turned green post-U2 (the bidirectional lift counts depth and
+inserts the right number of derefs structurally).
+
+##### The four coupled edits (commit `6e841f5`)
+
+1. **Bidirectional `apply_ref_coercion_if_needed`**
+   (`to_lean_expr.rs:187`): the existing `expr_n > natural_n`
+   wrap-insertion case stays. New `expr_n < natural_n` case inserts
+   `apply_deref_chain(rendered, natural_n - expr_n)`. Symmetric
+   coercion: insert derefs OR wraps as use sites demand.
+
+2. **Binder-aware `structural_typ` for ReadPlace**
+   (`to_lean_expr.rs:118`): when the inner Place is `PlaceX::Local(v)`,
+   return `binders.get(v).cloned()` (the binder's typ from BinderCtx)
+   instead of `p.typ`. For non-Local places, fall back to `p.typ`.
+   Reflects the actual Lean-level typ of the rendered variable.
+
+3. **`needs_param_deref` restricted to `&mut` only**
+   (`to_lean_fn.rs:63`): mutation-encoding cases still need shadow
+   (`is_mut_ref_typ`). `&`-only references (Ref/Box/Rc/Arc) no longer
+   get the shadow — bidirectional lift handles use-site needs.
+   The shadow's purpose narrows from "make body access bare types
+   convenient" to "make `*x = e` lowering compose."
+
+4. **`binder_ctx_from_params` records post-shadow typs**
+   (`to_lean_expr.rs:27`): for shadowed (`&mut`) params, strip one
+   outer ref decoration via new `strip_one_ref_decoration` helper.
+   For non-shadowed params, record as-declared. Keeps structural_typ
+   matching Lean-level reality.
+
+##### The regression detour + parallel renderer discovery
+
+After the four-edit commit, ran the suite: **412/33 (-13 net)**.
+The trait method tests flipped green as expected — but ~22 other
+tests broke with `Tactus.Ref.<field>` errors (e.g., `self.val0` on
+wrapper-typed self).
+
+Iterated through the failure modes:
+
+* **Field projection in `to_lean_expr.rs`** (`UnaryOpr::Field` arm,
+  commit `9ce1302` + `d9f7944`): fields belong to the inner type, not
+  the wrapper. Insert `.deref` chain via new `lean_level_wrap_count`
+  helper (binder-aware for Var-shaped inner). Same fix for IsVariant.
+
+* **Non-structural binops in `to_lean_expr.rs`** (commit `9ce1302`):
+  `Tactus.strGetChar`, `Bool.xor`, etc. expect inner-typed args.
+  Mirror the β refactor's SST-side fix at the same arm. Closed
+  `test_proof_strslice_get_char`.
+
+* **`PlaceX::Field` parallel renderer** (commit `d9f7944`): the same
+  Field-projection fix needed in `place_to_expr` (reached via
+  ReadPlace → place_to_expr, separate from `UnaryOpr::Field`). New
+  `place_lean_wrap_count` helper. **This was the load-bearing fix**:
+  most of the remaining 22 regressions flipped at once when this
+  landed (412/33 → 433/13).
+
+Final state: **434/12** after fixing my own multi-layer trait probe
+(it needed `simp [always_ok]` rather than `trivial` for the empty-
+hypothesis case — the impl method's standalone def loses the
+inherited requires, separate orthogonal gap).
+
+##### What U2 buys (architecturally)
+
+Three asymmetries collapsed into one rule:
+
+1. *Body context vs class field type*: same uniform rendering. The
+   class field type's missing shadow site (A''s motivation) becomes
+   unnecessary — bidirectional lift handles the case directly.
+2. *Exec fn (β: no `&` shadow, use-site coercion) vs proof fn (still
+   had `&` shadow + lift)*: proof fn joins exec fn in the use-site
+   coercion regime.
+3. *Single-layer vs multi-layer*: both fall out of count-based depth
+   bridging. No special-casing.
+
+Generated Lean is cleaner across the board: `let self := self.deref; ...
+val (Tactus.Ref.mk self) ...` collapses to `val self`. Goals at
+caller sites directly match goals from class field types — no η-bridge
+gymnastics needed.
+
+##### Wins + remaining failures
+
+**Wins** (7 trait method tests + 2 multi-layer probes = 9 net):
+- `test_proof_fn_trait_method_multiple_ensures` and 6 siblings
+  (mutual_methods, ensures_inaccessible, free_standing_spec_ref,
+  mixed_modes, non_unit_return_sibling_ref, with_requires)
+- `test_proof_fn_multi_layer_wrapper_probe` (new probe, pinned green)
+- `test_trait_method_multi_layer_param_probe` (new probe, pinned green)
+
+**Remaining 12 failures** (all pre-existing, none caused by U2):
+- 3 `#107` caller-side new-mut-ref edge cases
+- 4 mut-ref + trait dispatch cases (`old_view_*`, `new_mut_ref_*`)
+- 3 wrapper-arch probes for which U2 isn't the right fix
+  (`call_site_ref_to_bare_probe`, `aliased_arg_probe`,
+  `recursive_generic_datatype_cross_instantiation`)
+- 2 function-type wrapper interactions (`spec_closure`,
+  `spec_fn_apply`, `higher_order`)
+
+##### Process notes worth recording
+
+* **Generalization deletes special cases**. A'' would have added a
+  fourth shadow site to a list of three other special-case sites,
+  each of which needs its own consideration on every future change.
+  U2 deletes the asymmetry by making one mechanism handle every
+  context. The work was bigger, but the architecture got smaller.
+
+* **The second renderer surprise**. The bug took two fixes because
+  `to_lean_expr.rs` has both `ExprX::UnaryOpr(Field, _)` AND
+  `PlaceX::Field` arms (reached via different paths). The
+  duplication isn't new — it's been there since the renderer was
+  written — but the failure mode forced me to see it. A future
+  cleanup would be to share a Field-projection helper across the
+  two parallel renderers.
+
+* **The "for free" win**. The multi-layer probe was pinned as
+  expected-failure infrastructure: a thing A'' wouldn't fix that
+  we'd file as future work. When U2 landed, it turned green
+  automatically. The reason: the generalization that closed the
+  trait method cluster *included* multi-layer structurally. The
+  probe pinned a worry that was a feature of the bad architecture;
+  fixing the architecture deleted the worry.
+
+* **Zero regressions despite touching the lift mechanism**. Expected
+  to spend the session triaging tests that depended on old shapes.
+  The lift mechanism touches every rendered expression. Net result
+  was 0 regressions because the user-visible properties (goal
+  meaning) didn't change — only the syntactic shape (cleaner). The
+  omega + simp_all closer combinators reason about meaning, not
+  shape, so they were robust to the structural cleanup.
+
+##### Commits
+
+- `6e841f5` WIP wrapper-arch U2 refactor: bidirectional lift + binder-aware ReadPlace (the four-edit core)
+- `9ce1302` U2 follow-up: deref chains at Field/IsVariant + non_binop_head
+- `d9f7944` U2: binder-aware deref insertion at Field/IsVariant + PlaceX::Field (the load-bearing parallel-renderer fix)
+- `3347915` multi-layer wrapper probes: both pass under U2
+- `0ac816d` poems 2026-05-25: U2 landing arc
 
 ## Architecture
 
