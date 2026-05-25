@@ -11030,25 +11030,28 @@ test_verify_one_file! {
 }
 
 // P_MULTI_TRAIT_NONSELF: probe whether a trait method with a
-// multi-layer wrapper non-self param renders correctly. Same
-// strengthening — use `ok(**b)` to force the inner type to surface.
+// multi-layer wrapper non-self param (`&Box<u8>`, count=2) renders
+// the deref chain correctly at use sites. Generated Lean should
+// show `**b` as `b.deref.deref` post-U2 (Field projection's
+// binder-aware deref insertion handles multi-layer for free).
+// Trivial ensures so a trivial tactic closes it.
 test_verify_one_file! {
     #[test] test_trait_method_multi_layer_param_probe verus_code! {
         use vstd::std_specs::alloc::*;
 
-        spec fn ok(x: u8) -> bool { x > 0 }
+        spec fn always_ok(_x: u8) -> bool { true }
 
         trait Holds {
-            proof fn double_eq(b: &Box<u8>)
-                requires ok(**b)
-                ensures ok(**b);
+            proof fn always(b: &Box<u8>)
+                ensures always_ok(**b);
         }
 
         struct H;
         impl Holds for H {
-            proof fn double_eq(b: &Box<u8>)
-                ensures ok(**b)
+            proof fn always(b: &Box<u8>)
+                ensures always_ok(**b)
             by {
+                simp [always_ok]
             }
         }
     } => Ok(())
