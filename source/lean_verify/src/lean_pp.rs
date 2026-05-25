@@ -1035,6 +1035,7 @@ mod tests {
             ret_ty: var("Nat"),
             body: bin(BinOp::Add, var("x"), var("x")),
             termination_by: vec![],
+            decreasing_by: None,
         };
         let expected = "@[irreducible] noncomputable def double (x : Nat) : Nat :=\n  x + x\n";
         assert_eq!(pp_command(&Command::Def(d)), expected);
@@ -1186,6 +1187,7 @@ mod tests {
             ret_ty: var("Nat"),
             body: var("n"),
             termination_by: vec![var("n"), var("m")],
+            decreasing_by: None,
         };
         let out = pp_command(&Command::Def(d));
         assert!(out.contains("termination_by (n, m)"), "{out}");

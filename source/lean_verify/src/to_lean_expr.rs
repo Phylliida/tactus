@@ -221,35 +221,50 @@ fn apply_ref_wraps(mut e: LExpr, wraps: &[&'static str]) -> LExpr {
 use crate::expr_shared::count_ref_decorations;
 
 /// Count of wrapper layers (`Tactus.Ref`/`Box`/`Rc`/`Arc`/`MutRef`)
-/// on `inner`'s actual Lean-level rendering. Used at Field /
-/// IsVariant projection sites to know how many `.deref`s to insert
-/// before accessing the inner type's fields/variants.
+/// on the actual Lean-level rendering at this site. Used at
+/// Field / IsVariant projection sites (both `ExprX` and `PlaceX`
+/// arms) to know how many `.deref`s to insert before accessing the
+/// inner type's fields/variants.
 ///
-/// For Var-shaped inner, the actual Lean typ comes from BinderCtx
-/// (which post-U2 records post-shadow types — wrapper for &-only
-/// params since they aren't shadowed, stripped-typ for &mut). For
-/// other shapes, fall back to `inner.typ` directly. This handles
-/// the spec-collapse case where Verus's SST may strip decorations
-/// from `inner.typ` while the rendered Lean value still has them.
-fn lean_level_wrap_count(inner: &Expr, binders: &BinderCtx) -> usize {
-    let lean_typ = match &inner.x {
-        ExprX::Var(v) | ExprX::VarLoc(v) | ExprX::VarAt(v, _) => {
-            binders.get(v).cloned().unwrap_or_else(|| inner.typ.clone())
-        }
-        _ => inner.typ.clone(),
-    };
+/// `var_id` is the VarIdent if the inner is var-shaped (`Var` /
+/// `VarLoc` / `VarAt` for ExprX; `Local` for PlaceX); `None`
+/// otherwise. When var-shaped, the actual Lean typ comes from
+/// BinderCtx (which post-U2 records post-shadow types — wrapper
+/// for &-only params, stripped-typ for &mut). Otherwise we fall
+/// back to the spanned typ. Handles the spec-collapse case where
+/// Verus's SST may strip decorations from the SST typ while the
+/// rendered Lean value still has them.
+fn lean_level_wrap_count(var_id: Option<&VarIdent>, spanned_typ: &Typ, binders: &BinderCtx) -> usize {
+    let lean_typ = var_id
+        .and_then(|v| binders.get(v).cloned())
+        .unwrap_or_else(|| spanned_typ.clone());
     count_ref_decorations(&lean_typ)
 }
 
-/// Place-side version of `lean_level_wrap_count`. For a `PlaceX::Local(v)`
-/// place, the actual Lean-level typ comes from BinderCtx. For other
-/// place shapes, fall back to the place's own typ.
-fn place_lean_wrap_count(place: &PlaceX, place_typ: &Typ, binders: &BinderCtx) -> usize {
-    let lean_typ = match place {
-        PlaceX::Local(v) => binders.get(v).cloned().unwrap_or_else(|| place_typ.clone()),
-        _ => place_typ.clone(),
+/// Render `inner` and apply a `.deref` chain matching its actual
+/// Lean-level wrapper depth. Used at Field / IsVariant projection
+/// sites where the field/variant belongs to the inner type rather
+/// than the wrapper.
+fn render_expr_with_derefs(inner: &Expr, binders: &BinderCtx) -> LExpr {
+    let rendered = vir_expr_to_ast_with_binders(inner, binders);
+    let var_id = match &inner.x {
+        ExprX::Var(v) | ExprX::VarLoc(v) | ExprX::VarAt(v, _) => Some(v),
+        _ => None,
     };
-    count_ref_decorations(&lean_typ)
+    let n_derefs = lean_level_wrap_count(var_id, &inner.typ, binders);
+    crate::expr_shared::apply_deref_chain(rendered, n_derefs)
+}
+
+/// Place-side analog of `render_expr_with_derefs`. Renders the
+/// place's value and applies the matching `.deref` chain.
+fn render_place_with_derefs(base: &Place, binders: &BinderCtx) -> LExpr {
+    let rendered = place_to_expr(&base.x, binders);
+    let var_id = match &base.x {
+        PlaceX::Local(v) => Some(v),
+        _ => None,
+    };
+    let n_derefs = lean_level_wrap_count(var_id, &base.typ, binders);
+    crate::expr_shared::apply_deref_chain(rendered, n_derefs)
 }
 
 fn apply_ref_coercion_if_needed(
@@ -547,25 +562,21 @@ fn expr_to_node(expr: &Expr, binders: &BinderCtx) -> ExprNode {
 
         ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => expr_to_node(inner, binders),
         ExprX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
-            // U2: fields belong to the INNER type, not the wrapper. If
-            // `inner` is wrapper-typed (`Tactus.Ref T`, `Box<T>`, etc.),
-            // project through the wrapper layers via `.deref` chain.
-            // Mirrors the SST-side fix landed in the β refactor at
-            // `to_lean_sst_expr::ExpX::UnaryOpr(Field, _)`. Use the
-            // actual Lean-level typ (binder-aware for Var-shaped inner)
-            // so spec-collapsed inner.typ is accounted for correctly.
-            let inner_rendered = vir_expr_to_ast_with_binders(inner, binders);
-            let n_derefs = lean_level_wrap_count(inner, binders);
-            let inner_dereffed = crate::expr_shared::apply_deref_chain(inner_rendered, n_derefs);
-            LExpr::field_proj(inner_dereffed, field_access_name(field_opr)).node
+            // U2: fields belong to the INNER type, not the wrapper.
+            // `render_expr_with_derefs` peels wrapper layers via
+            // `.deref` chain based on the actual Lean-level depth
+            // (binder-aware for Var-shaped inner). Mirrors the
+            // SST-side fix at `to_lean_sst_expr::ExpX::UnaryOpr(Field, _)`.
+            LExpr::field_proj(
+                render_expr_with_derefs(inner, binders),
+                field_access_name(field_opr),
+            ).node
         }
         ExprX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => {
-            // U2: same deref-chain treatment as Field — discriminator
-            // checks operate on the inner inductive type, not the wrapper.
-            let inner_rendered = vir_expr_to_ast_with_binders(inner, binders);
-            let n_derefs = lean_level_wrap_count(inner, binders);
-            let inner_dereffed = crate::expr_shared::apply_deref_chain(inner_rendered, n_derefs);
-            is_variant_node(variant, inner_dereffed)
+            // U2: discriminator checks operate on the inner inductive
+            // type, not the wrapper — same `.deref` chain treatment as
+            // Field.
+            is_variant_node(variant, render_expr_with_derefs(inner, binders))
         }
         ExprX::UnaryOpr(UnaryOpr::HasType(t), inner) => {
             // Refinement invariant: `e < 2^n` for `U(n)`, `-2^(n-1) ≤ e ∧
@@ -885,14 +896,11 @@ fn place_to_expr(place: &PlaceX, binders: &BinderCtx) -> LExpr {
     LExpr::new(match place {
         PlaceX::Local(ident) => ExprNode::Var(crate::lean_name::LeanName::from_var_ident(ident)),
         PlaceX::Field(field_opr, base) => {
-            // U2: fields belong to the inner type, not the wrapper.
-            // Insert `.deref` chain based on the base's actual Lean-level
-            // wrapper depth (binder-aware for Local-rooted places).
-            let base_rendered = place_to_expr(&base.x, binders);
-            let n_derefs = place_lean_wrap_count(&base.x, &base.typ, binders);
-            let base_dereffed = crate::expr_shared::apply_deref_chain(base_rendered, n_derefs);
+            // U2: fields belong to the inner type, not the wrapper —
+            // `render_place_with_derefs` applies the .deref chain
+            // (binder-aware for Local-rooted bases).
             ExprNode::FieldProj {
-                expr: Box::new(base_dereffed),
+                expr: Box::new(render_place_with_derefs(base, binders)),
                 field: field_access_name(field_opr),
             }
         }
@@ -914,4 +922,174 @@ fn place_to_expr(place: &PlaceX, binders: &BinderCtx) -> LExpr {
             return place_to_expr(&inner.x, binders);
         }
     })
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr_shared::count_ref_decorations;
+    use crate::test_fixtures::typ_int;
+    use std::sync::Arc;
+    use vir::ast::{Mode, ParamX, TypDecoration};
+    use vir::def::Spanned;
+    use vir::messages::Span;
+
+    fn typ_ref(inner: Typ) -> Typ {
+        Arc::new(TypX::Decorate(TypDecoration::Ref, None, inner))
+    }
+
+    fn typ_box(inner: Typ) -> Typ {
+        Arc::new(TypX::Decorate(TypDecoration::Box, None, inner))
+    }
+
+    fn typ_boxed(inner: Typ) -> Typ {
+        Arc::new(TypX::Boxed(inner))
+    }
+
+    fn typ_mut_ref(inner: Typ) -> Typ {
+        Arc::new(TypX::MutRef(inner))
+    }
+
+    fn mk_var_ident(name: &str) -> VarIdent {
+        VarIdent(Arc::new(name.to_string()), vir::ast::VarIdentDisambiguate::NoBodyParam)
+    }
+
+    fn mk_param(name: &str, typ: Typ, is_mut: bool) -> Param {
+        Spanned::new(Span::dummy(), ParamX {
+            name: mk_var_ident(name),
+            typ,
+            mode: Mode::Spec,
+            user_mut: false,
+            is_mut,
+            unwrapped_info: None,
+        })
+    }
+
+    // ── strip_one_ref_decoration ─────────────────────────────────────────
+
+    #[test]
+    fn strip_one_ref_decoration_strips_ref() {
+        let int = typ_int();
+        let r = typ_ref(int.clone());
+        let stripped = strip_one_ref_decoration(&r);
+        // Stripping `&Int` should give `Int` — count drops by 1.
+        assert_eq!(count_ref_decorations(&stripped), 0);
+    }
+
+    #[test]
+    fn strip_one_ref_decoration_strips_mut_ref() {
+        // TypX::MutRef (new mode) is treated like a ref decoration
+        // — strip the outer layer.
+        let int = typ_int();
+        let m = typ_mut_ref(int.clone());
+        let stripped = strip_one_ref_decoration(&m);
+        assert_eq!(count_ref_decorations(&stripped), 0);
+    }
+
+    #[test]
+    fn strip_one_ref_decoration_strips_only_one_layer() {
+        // `&Box<Int>` (count 2) → strip outermost ref → `Box<Int>` (count 1).
+        // Only ONE decoration peeled per call, mirroring the shadow's
+        // single `.deref` step.
+        let int = typ_int();
+        let bx = typ_box(int);
+        let r_bx = typ_ref(bx);
+        assert_eq!(count_ref_decorations(&r_bx), 2);
+        let stripped = strip_one_ref_decoration(&r_bx);
+        assert_eq!(count_ref_decorations(&stripped), 1);
+    }
+
+    #[test]
+    fn strip_one_ref_decoration_passes_through_bare() {
+        // No ref decoration → no change.
+        let int = typ_int();
+        let stripped = strip_one_ref_decoration(&int);
+        assert_eq!(count_ref_decorations(&stripped), 0);
+    }
+
+    #[test]
+    fn strip_one_ref_decoration_does_not_peel_boxed() {
+        // `TypX::Boxed` is Verus's poly-encoding "transparent" marker
+        // (NOT the `Box<T>` decoration). It's Lean-transparent and not
+        // a wrapper. `strip_one_ref_decoration` only peels reference
+        // decorations and MutRef.
+        let int = typ_int();
+        let boxed = typ_boxed(int);
+        let stripped = strip_one_ref_decoration(&boxed);
+        // `Boxed(Int)` returned as-is.
+        assert!(matches!(&*stripped, TypX::Boxed(_)));
+    }
+
+    // ── binder_ctx_from_params ───────────────────────────────────────────
+
+    #[test]
+    fn binder_ctx_empty_params_empty_ctx() {
+        let params: Params = Arc::new(vec![]);
+        let ctx = binder_ctx_from_params(&params);
+        assert!(ctx.is_empty());
+    }
+
+    #[test]
+    fn binder_ctx_ref_only_param_keeps_wrapper() {
+        // `&Int` param (`Decorate(Ref, _, Int)`, is_mut: false) is
+        // NOT shadowed post-U2 — BinderCtx records the wrapper-
+        // decorated typ as-declared.
+        let int = typ_int();
+        let r = typ_ref(int);
+        let params: Params = Arc::new(vec![mk_param("p", r.clone(), false)]);
+        let ctx = binder_ctx_from_params(&params);
+        let recorded = ctx.get(&mk_var_ident("p")).expect("p should be in ctx");
+        assert_eq!(count_ref_decorations(recorded), 1);
+    }
+
+    #[test]
+    fn binder_ctx_legacy_mut_param_strips() {
+        // Legacy `&mut x: Int` is `is_mut: true` with bare typ.
+        // Lean renders the binder as `Tactus.MutRef Int` (via
+        // param_binder_typ wrapping based on is_mut), and the body
+        // shadow strips back to `Int`. BinderCtx records the
+        // post-shadow `Int` (count 0).
+        let int = typ_int();
+        let params: Params = Arc::new(vec![mk_param("p", int, true)]);
+        let ctx = binder_ctx_from_params(&params);
+        let recorded = ctx.get(&mk_var_ident("p")).expect("p should be in ctx");
+        assert_eq!(count_ref_decorations(recorded), 0);
+    }
+
+    #[test]
+    fn binder_ctx_new_mode_mut_ref_param_strips_one() {
+        // New-mode `&mut x: Int` arrives as `TypX::MutRef(Int)`,
+        // `is_mut: false`. Lean renders as `Tactus.MutRef Int`;
+        // shadow strips one layer → BinderCtx records `Int` (count 0).
+        let int = typ_int();
+        let m = typ_mut_ref(int);
+        assert_eq!(count_ref_decorations(&m), 1);
+        let params: Params = Arc::new(vec![mk_param("p", m, false)]);
+        let ctx = binder_ctx_from_params(&params);
+        let recorded = ctx.get(&mk_var_ident("p")).expect("p should be in ctx");
+        assert_eq!(count_ref_decorations(recorded), 0);
+    }
+
+    #[test]
+    fn binder_ctx_mixed_params_strips_only_mut() {
+        // Three params: `&Int` (not shadowed), legacy `&mut Int`
+        // (shadowed, bare typ → still bare), new-mode `MutRef<Int>`
+        // (shadowed, MutRef → bare). Verify each is recorded
+        // correctly.
+        let int = typ_int();
+        let r = typ_ref(int.clone());
+        let m_new = typ_mut_ref(int.clone());
+        let params: Params = Arc::new(vec![
+            mk_param("a", r, false),                  // &-only
+            mk_param("b", int.clone(), true),         // legacy &mut
+            mk_param("c", m_new, false),              // new-mode MutRef
+        ]);
+        let ctx = binder_ctx_from_params(&params);
+        assert_eq!(count_ref_decorations(ctx.get(&mk_var_ident("a")).unwrap()), 1);
+        assert_eq!(count_ref_decorations(ctx.get(&mk_var_ident("b")).unwrap()), 0);
+        assert_eq!(count_ref_decorations(ctx.get(&mk_var_ident("c")).unwrap()), 0);
+    }
+
 }

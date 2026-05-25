@@ -11056,3 +11056,22 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// P_MULTI_DEPTH_3: depth-3 wrapper (`&Box<Box<u8>>`, count=3). Probes
+// that the bidirectional lift's count-based logic handles arbitrary
+// depths uniformly (not special-cased for single/double-layer).
+// Generated Lean should show `***b` as `b.deref.deref.deref` at use
+// sites that need the inner u8.
+test_verify_one_file! {
+    #[test] test_proof_fn_depth_3_wrapper_probe verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        spec fn always_ok(_x: u8) -> bool { true }
+
+        proof fn triple_wrapped(b: &Box<Box<u8>>)
+            ensures always_ok(***b)
+        by {
+            simp [always_ok]
+        }
+    } => Ok(())
+}

@@ -33,28 +33,6 @@ const SUBTYPE_WITNESS_AUTO_PROOF: &str = "first | rfl | simp_all";
 /// should be readable, so the fallback is defensive only.
 const TACTIC_BODY_FALLBACK: &str = "sorry";
 
-/// True when `typ` is a reference-like decoration that renders through
-/// one of the `Tactus.X` wrapper structures. These wrappers are opaque
-/// at the dispatch level (so trait resolution distinguishes `Foo &A`
-/// from `Foo A`) but transparent at the value level via the
-/// definitional `.deref` projection (single-field structure).
-///
-/// Mirrors `to_lean_type::typ_to_node`'s decision about which decorations
-/// produce a wrapper. Keep in sync.
-///
-/// **Note**: this is the *typ-only* check. For `&mut` params Verus's
-/// legacy mode also produces `is_mut: true` with a non-decorated typ —
-/// use [`crate::expr_shared::is_mut_ref_typ`] when both signals are
-/// available (which is the canonical "is this param wrapper-bound?"
-/// question).
-pub(crate) fn is_ref_decorated(typ: &TypX) -> bool {
-    matches!(typ,
-        TypX::Decorate(TypDecoration::Ref | TypDecoration::MutRef
-                       | TypDecoration::Box | TypDecoration::Rc
-                       | TypDecoration::Arc, _, _)
-        | TypX::MutRef(_))
-}
-
 /// True when this param needs a body shadow because the shadow is
 /// load-bearing for the **mutation encoding** — `*x = e` lowers to
 /// `let x := e` in Lean, requiring `x` to be at the inner-typ level

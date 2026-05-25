@@ -554,6 +554,7 @@ mod tests {
             ret_ty: var("Nat"),
             body: var("x"),
             termination_by: vec![],
+            decreasing_by: None,
         };
         let t = Theorem {
             name: "t".into(),
@@ -588,6 +589,7 @@ mod tests {
         let d = Def {
             attrs: vec![], name: "ten".into(), binders: vec![],
             ret_ty: var("Nat"), body, termination_by: vec![],
+            decreasing_by: None,
         };
         assert!(check_references(&[Command::Def(d)]).is_empty());
     }
@@ -620,11 +622,11 @@ mod tests {
         // predefining names across the group.
         let d1 = Def {
             attrs: vec![], name: "f".into(), binders: vec![], ret_ty: var("Nat"),
-            body: var("g"), termination_by: vec![],
+            body: var("g"), termination_by: vec![], decreasing_by: None,
         };
         let d2 = Def {
             attrs: vec![], name: "g".into(), binders: vec![], ret_ty: var("Nat"),
-            body: var("f"), termination_by: vec![],
+            body: var("f"), termination_by: vec![], decreasing_by: None,
         };
         let m = Command::Mutual(vec![Command::Def(d1), Command::Def(d2)]);
         assert!(check_references(&[m]).is_empty());
