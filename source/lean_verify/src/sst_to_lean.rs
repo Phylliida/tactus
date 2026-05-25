@@ -129,7 +129,7 @@ use crate::lean_ast::{
 };
 use crate::expr_shared::{is_mut_ref_typ, varat_pre_name};
 use std::sync::Arc;
-use crate::to_lean_expr::{vir_expr_to_ast, vir_expr_to_ast_for_inlining};
+use crate::to_lean_expr::{vir_expr_to_ast, vir_expr_to_ast_for_inlining, vir_expr_to_ast_for_inlining_with_ctx};
 use crate::to_lean_sst_expr::{lower as lower_validated, lower_with_ctx as lower_validated_with_ctx, renders_as_lean_int, sst_exp_to_ast_checked, sst_exp_to_ast_checked_with_ctx, type_bound_predicate, Validated};
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
 
@@ -2626,12 +2626,16 @@ fn walk_call<'a>(
     // emission and ref-collection can't drift.
     let inlined = crate::call_inlining::collect_inlined_at_call(callee, spec_callee);
 
+    // Build RenderCtx with the WpCtx's fn_map for VIR-AST class-
+    // method-call coercion inside the inlined req/ens rendering.
+    let render_ctx = crate::expr_shared::RenderCtx::with_fn_map(&ctx.fn_map);
+
     if !inlined.requires.is_empty() {
-        emit_call_precondition_theorem(&inlined.requires, &subst, call_span, obl, e);
+        emit_call_precondition_theorem(&inlined.requires, &subst, call_span, obl, &render_ctx, e);
     }
 
     let new_obl = push_post_call_frames(
-        callee, &inlined.ensures, &subst, dest, obl,
+        callee, &inlined.ensures, &subst, dest, obl, &render_ctx,
     );
     walk_obligations(after, ctx, &new_obl, e);
 }
@@ -2942,6 +2946,7 @@ fn emit_call_precondition_theorem(
     subst: &CallSubstitutions,
     call_span: &Span,
     obl: &OblCtx,
+    render_ctx: &crate::expr_shared::RenderCtx,
     e: &mut ObligationEmitter,
 ) {
     let loc = format_rust_loc(call_span);
@@ -2949,7 +2954,7 @@ fn emit_call_precondition_theorem(
         requires.iter()
             .map(|expr| {
                 let rewritten = rewrite_varat_for_mut_params(expr, &subst.mut_param_names);
-                vir_expr_to_ast_for_inlining(&rewritten)
+                vir_expr_to_ast_for_inlining_with_ctx(&rewritten, render_ctx)
             })
             .collect()
     );
@@ -3110,6 +3115,7 @@ fn push_post_call_frames(
     subst: &CallSubstitutions,
     dest: Option<&VarIdent>,
     obl: &OblCtx,
+    render_ctx: &crate::expr_shared::RenderCtx,
 ) -> OblCtx {
     let mut new_obl = obl.clone();
 
@@ -3172,7 +3178,7 @@ fn push_post_call_frames(
     let ensures_clauses: Vec<LExpr> = ensures.iter()
         .map(|expr| {
             let rewritten = rewrite_varat_for_mut_params(expr, &subst.mut_param_names);
-            vir_expr_to_ast_for_inlining(&rewritten)
+            vir_expr_to_ast_for_inlining_with_ctx(&rewritten, render_ctx)
         })
         .collect();
     let substituted_ensures: Option<LExpr> = if ensures_clauses.is_empty() {

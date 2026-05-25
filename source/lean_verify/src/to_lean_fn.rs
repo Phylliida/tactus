@@ -203,12 +203,12 @@ pub fn spec_fn_to_ast(f: &FunctionX, fn_map: &crate::sst_to_lean::FnMap) -> Comm
             let coerced_body = crate::sst_to_lean::insert_nat_coercions_in_expr(b, fn_map);
             let binder_ctx = crate::to_lean_expr::binder_ctx_from_params(&f.params);
             let body = wrap_body_with_param_derefs(
-                crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced_body, &binder_ctx),
+                crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced_body, &binder_ctx, &crate::expr_shared::RenderCtx::empty()),
                 &f.params,
             );
             let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| {
                 let coerced = crate::sst_to_lean::insert_nat_coercions_in_expr(d, fn_map);
-                crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx)
+                crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx, &crate::expr_shared::RenderCtx::empty())
             }).collect();
             Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by, decreasing_by: None })
         }
@@ -238,7 +238,7 @@ pub fn proof_fn_to_ast(
         // Wrap with `let p := p.deref` for ref-decorated params so the
         // hypothesis body sees inner types.
         let req_ty = wrap_body_with_param_derefs(
-            crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx),
+            crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx, &crate::expr_shared::RenderCtx::empty()),
             &f.params);
         binders.push(LBinder {
             name: Some(crate::lean_name::LeanName::synthetic(format!("h{}", i))),
@@ -248,7 +248,7 @@ pub fn proof_fn_to_ast(
     }
     let goal_raw = and_all(f.ensure.0.iter().map(|e| {
         let coerced = crate::sst_to_lean::insert_nat_coercions_in_expr(e, fn_map);
-        crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx)
+        crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx, &crate::expr_shared::RenderCtx::empty())
     }).collect());
     let goal = wrap_body_with_param_derefs(goal_raw, &f.params);
     // Honor Verus's `decreases` clause for recursive proof fns. Lean often
@@ -257,7 +257,7 @@ pub fn proof_fn_to_ast(
     // descent) require the explicit clause. Mirrors `spec_fn_to_ast`.
     let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| {
         let coerced = crate::sst_to_lean::insert_nat_coercions_in_expr(d, fn_map);
-        crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx)
+        crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx, &crate::expr_shared::RenderCtx::empty())
     }).collect();
     Theorem {
         name: lean_name(&f.name.path),
@@ -1301,7 +1301,7 @@ pub fn trait_to_ast(
             let body_binders = crate::to_lean_expr::binder_ctx_from_params(&func.params);
             let body_expr = match func.mode {
                 vir::ast::Mode::Spec => wrap_body_with_param_derefs(
-                    crate::to_lean_expr::vir_expr_to_ast_with_binders(b, &body_binders),
+                    crate::to_lean_expr::vir_expr_to_ast_with_binders(b, &body_binders, &crate::expr_shared::RenderCtx::empty()),
                     &func.params),
                 vir::ast::Mode::Exec => LExpr::var_lit("default"),
                 vir::ast::Mode::Proof => {
@@ -1317,7 +1317,7 @@ pub fn trait_to_ast(
                         LExpr::new(ExprNode::ByBlock { tactic: tac.to_string() })
                     } else {
                         let value = wrap_body_with_param_derefs(
-                            crate::to_lean_expr::vir_expr_to_ast_with_binders(b, &body_binders),
+                            crate::to_lean_expr::vir_expr_to_ast_with_binders(b, &body_binders, &crate::expr_shared::RenderCtx::empty()),
                             &func.params);
                         let proof = LExpr::new(ExprNode::ByBlock {
                             tactic: SUBTYPE_WITNESS_AUTO_PROOF.to_string(),
@@ -1595,7 +1595,7 @@ fn proof_fn_method_type(
         // to get the bare-name rewrite. Instance bodies use a
         // non-empty prefix to route to impl-specific standalones.
         let req_ty = strip_class_qualifier(
-            crate::to_lean_expr::vir_expr_to_ast_with_binders(req, &body_binders),
+            crate::to_lean_expr::vir_expr_to_ast_with_binders(req, &body_binders, &crate::expr_shared::RenderCtx::empty()),
             class_name, "", sibling_methods,
         );
         // Requires render as named hypothesis binders following the
@@ -1612,7 +1612,7 @@ fn proof_fn_method_type(
     }
     let ensures = and_all(func.ensure.0.iter()
         .map(|e| strip_class_qualifier(
-            crate::to_lean_expr::vir_expr_to_ast_with_binders(e, &body_binders),
+            crate::to_lean_expr::vir_expr_to_ast_with_binders(e, &body_binders, &crate::expr_shared::RenderCtx::empty()),
             class_name, "", sibling_methods))
         .collect());
 
@@ -1887,7 +1887,7 @@ pub fn trait_impl_to_ast(
                     // decorated param so the body sees inner types.
                     let body_binders = crate::to_lean_expr::binder_ctx_from_params(&func.params);
                     wrap_body_with_param_derefs(
-                        crate::to_lean_expr::vir_expr_to_ast_with_binders(&rewritten, &body_binders),
+                        crate::to_lean_expr::vir_expr_to_ast_with_binders(&rewritten, &body_binders, &crate::expr_shared::RenderCtx::empty()),
                         &func.params,
                     )
                 }
@@ -1962,7 +1962,7 @@ pub fn trait_impl_to_ast(
                         );
                         let body_binders = crate::to_lean_expr::binder_ctx_from_params(&func.params);
                         let value = wrap_body_with_param_derefs(
-                            crate::to_lean_expr::vir_expr_to_ast_with_binders(&rewritten, &body_binders),
+                            crate::to_lean_expr::vir_expr_to_ast_with_binders(&rewritten, &body_binders, &crate::expr_shared::RenderCtx::empty()),
                             &func.params,
                         );
                         // `rfl` closes when body matches ensures
