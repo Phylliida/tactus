@@ -220,6 +220,38 @@ fn apply_ref_wraps(mut e: LExpr, wraps: &[&'static str]) -> LExpr {
 // `count_ref_decorations` moved to `expr_shared`.
 use crate::expr_shared::count_ref_decorations;
 
+/// Count of wrapper layers (`Tactus.Ref`/`Box`/`Rc`/`Arc`/`MutRef`)
+/// on `inner`'s actual Lean-level rendering. Used at Field /
+/// IsVariant projection sites to know how many `.deref`s to insert
+/// before accessing the inner type's fields/variants.
+///
+/// For Var-shaped inner, the actual Lean typ comes from BinderCtx
+/// (which post-U2 records post-shadow types — wrapper for &-only
+/// params since they aren't shadowed, stripped-typ for &mut). For
+/// other shapes, fall back to `inner.typ` directly. This handles
+/// the spec-collapse case where Verus's SST may strip decorations
+/// from `inner.typ` while the rendered Lean value still has them.
+fn lean_level_wrap_count(inner: &Expr, binders: &BinderCtx) -> usize {
+    let lean_typ = match &inner.x {
+        ExprX::Var(v) | ExprX::VarLoc(v) | ExprX::VarAt(v, _) => {
+            binders.get(v).cloned().unwrap_or_else(|| inner.typ.clone())
+        }
+        _ => inner.typ.clone(),
+    };
+    count_ref_decorations(&lean_typ)
+}
+
+/// Place-side version of `lean_level_wrap_count`. For a `PlaceX::Local(v)`
+/// place, the actual Lean-level typ comes from BinderCtx. For other
+/// place shapes, fall back to the place's own typ.
+fn place_lean_wrap_count(place: &PlaceX, place_typ: &Typ, binders: &BinderCtx) -> usize {
+    let lean_typ = match place {
+        PlaceX::Local(v) => binders.get(v).cloned().unwrap_or_else(|| place_typ.clone()),
+        _ => place_typ.clone(),
+    };
+    count_ref_decorations(&lean_typ)
+}
+
 fn apply_ref_coercion_if_needed(
     expr: &Expr,
     rendered: LExpr,
@@ -515,13 +547,15 @@ fn expr_to_node(expr: &Expr, binders: &BinderCtx) -> ExprNode {
 
         ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => expr_to_node(inner, binders),
         ExprX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
-            // U2: if `inner` is wrapper-typed (`Tactus.Ref T`, `Box<T>`, etc.)
-            // and the field belongs to the INNER type T, project through the
-            // wrapper layers via `.deref` chain before accessing the field.
+            // U2: fields belong to the INNER type, not the wrapper. If
+            // `inner` is wrapper-typed (`Tactus.Ref T`, `Box<T>`, etc.),
+            // project through the wrapper layers via `.deref` chain.
             // Mirrors the SST-side fix landed in the β refactor at
-            // `to_lean_sst_expr::ExpX::UnaryOpr(Field, _)`.
+            // `to_lean_sst_expr::ExpX::UnaryOpr(Field, _)`. Use the
+            // actual Lean-level typ (binder-aware for Var-shaped inner)
+            // so spec-collapsed inner.typ is accounted for correctly.
             let inner_rendered = vir_expr_to_ast_with_binders(inner, binders);
-            let n_derefs = count_ref_decorations(&inner.typ);
+            let n_derefs = lean_level_wrap_count(inner, binders);
             let inner_dereffed = crate::expr_shared::apply_deref_chain(inner_rendered, n_derefs);
             LExpr::field_proj(inner_dereffed, field_access_name(field_opr)).node
         }
@@ -529,7 +563,7 @@ fn expr_to_node(expr: &Expr, binders: &BinderCtx) -> ExprNode {
             // U2: same deref-chain treatment as Field — discriminator
             // checks operate on the inner inductive type, not the wrapper.
             let inner_rendered = vir_expr_to_ast_with_binders(inner, binders);
-            let n_derefs = count_ref_decorations(&inner.typ);
+            let n_derefs = lean_level_wrap_count(inner, binders);
             let inner_dereffed = crate::expr_shared::apply_deref_chain(inner_rendered, n_derefs);
             is_variant_node(variant, inner_dereffed)
         }
@@ -850,10 +884,18 @@ pub(crate) fn pattern_to_ast(pat: &PatternX) -> LPattern {
 fn place_to_expr(place: &PlaceX, binders: &BinderCtx) -> LExpr {
     LExpr::new(match place {
         PlaceX::Local(ident) => ExprNode::Var(crate::lean_name::LeanName::from_var_ident(ident)),
-        PlaceX::Field(field_opr, base) => ExprNode::FieldProj {
-            expr: Box::new(place_to_expr(&base.x, binders)),
-            field: field_access_name(field_opr),
-        },
+        PlaceX::Field(field_opr, base) => {
+            // U2: fields belong to the inner type, not the wrapper.
+            // Insert `.deref` chain based on the base's actual Lean-level
+            // wrapper depth (binder-aware for Local-rooted places).
+            let base_rendered = place_to_expr(&base.x, binders);
+            let n_derefs = place_lean_wrap_count(&base.x, &base.typ, binders);
+            let base_dereffed = crate::expr_shared::apply_deref_chain(base_rendered, n_derefs);
+            ExprNode::FieldProj {
+                expr: Box::new(base_dereffed),
+                field: field_access_name(field_opr),
+            }
+        }
         PlaceX::DerefMut(inner) | PlaceX::ModeUnwrap(inner, _) => {
             return place_to_expr(&inner.x, binders);
         }
