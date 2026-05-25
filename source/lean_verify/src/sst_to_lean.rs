@@ -2767,7 +2767,20 @@ fn add_param_subst_entries<'a>(
             let info = mut_args.iter().find(|m| m.param_idx == i)
                 .expect("MutArgInfo should exist for every &mut param idx — \
                          build_call_mut_args populates one per is_mut param");
-            ens_subst.insert(pname.clone(), LExpr::var(info.fresh.clone()));
+            // Wrapper-arch typing: the fresh post-state existential is
+            // bound at the callee's declared param typ (wrapper-typed
+            // for new-mut-ref `&mut T` = `MutRef T`). The rendered
+            // ensures uses `Var(p)` at slots that expect the inner-
+            // typed view (post body-shadow stripping in the renderer).
+            // Bridge via TypedExpr: coerce the wrapper-typed
+            // existential to the inner typ; the substitution value
+            // becomes `fresh.deref` for new-mut-ref or just `fresh`
+            // for legacy `is_mut: true` (where typ is already bare).
+            let inner_typ = crate::to_lean_expr::strip_one_ref_decoration(&p.x.typ);
+            let coerced_fresh = crate::typed_expr::TypedExpr::var(
+                info.fresh.clone(), p.x.typ.clone(),
+            ).into_slot(&inner_typ);
+            ens_subst.insert(pname.clone(), coerced_fresh);
             ens_subst.insert(pname_pre, arg_lexprs[i].clone());
         } else {
             // Non-mut ensures: param → arg.
@@ -3096,6 +3109,22 @@ fn push_post_call_frames(
     // Phase 1: per-&mut existential binder + type-inv hypothesis.
     // `subst.mut_args` (#105) bundles param_idx, caller_var, and
     // fresh into one struct — no parallel-array lookups.
+    //
+    // **Wrapper-arch typing (TypedExpr migration):** the existential
+    // is bound at the callee's declared param typ — which for
+    // new-mut-ref `&mut T` is `MutRef T` (wrapper-typed). Use sites
+    // (bound predicate, substituted ensures via ens_subst, rebind
+    // frame) want the inner-typed view — they reason about the value
+    // T, not the wrapper.
+    //
+    // Wrap the existential in `TypedExpr` and use `into_slot(inner)`
+    // to produce the deref'd form for each use site. For non-mut args
+    // and legacy `is_mut: true` with bare typ, `into_slot` is a no-op
+    // (wrapper depth already matches inner). For new-mut-ref the
+    // coercion inserts `.deref` to bridge from the wrapper-typed
+    // existential to the inner-typed use slot. Mirrors the pattern
+    // at `fn_binders` line ~3389 where param-level `&mut` binders
+    // emit bounds via `.deref` for the same reason.
     for info in &subst.mut_args {
         let typ = &callee.params[info.param_idx].x.typ;
         let lean_typ = substitute(&typ_to_expr(typ), &subst.typ_subst);
@@ -3104,7 +3133,17 @@ fn push_post_call_frames(
             ty: lean_typ,
             kind: BinderKind::Explicit,
         }));
-        if let Some(pred) = type_bound_predicate(&LExpr::var(info.fresh.clone()), typ) {
+        // Bound predicate: pass the inner-typed view via TypedExpr
+        // coercion. `type_bound_predicate` already recurses through
+        // `MutRef(T)` to emit the bound on T — what was broken was
+        // that the value-side was wrapper-typed; bridging via
+        // `into_slot(&inner)` produces `fresh.deref` for the
+        // wrapper case and `fresh` for the bare case.
+        let inner_typ = crate::to_lean_expr::strip_one_ref_decoration(typ);
+        let inner_form = crate::typed_expr::TypedExpr::var(
+            info.fresh.clone(), typ.clone(),
+        ).into_slot(&inner_typ);
+        if let Some(pred) = type_bound_predicate(&inner_form, typ) {
             new_obl.frames.push_back(CtxFrame::Hyp(pred));
         }
     }
@@ -3213,8 +3252,19 @@ fn push_post_call_frames(
     //   nested-Prod representation of arity > 2 tuples).
     for info in &subst.mut_args {
         let local_name = crate::lean_name::LeanName::from_var_ident(info.rebind_local());
+        // Wrapper-arch typing: the fresh existential is wrapper-typed
+        // for new-mut-ref. The caller's local is body-shadowed to
+        // inner-typed in body scope. Coerce fresh to inner before
+        // rebinding so `let local := fresh.deref` matches local's
+        // body-scope typ. (For legacy is_mut + bare typ, this is a
+        // no-op — wrapper depths already match.)
+        let param_typ = &callee.params[info.param_idx].x.typ;
+        let inner_typ = crate::to_lean_expr::strip_one_ref_decoration(param_typ);
+        let coerced_fresh = crate::typed_expr::TypedExpr::var(
+            info.fresh.clone(), param_typ.clone(),
+        ).into_slot(&inner_typ);
         let new_value = match &info.target {
-            MutTargetRaw::Var(_) => LExpr::var(info.fresh.clone()),
+            MutTargetRaw::Var(_) => coerced_fresh,
             MutTargetRaw::Field { field_oprs, .. } => {
                 // Build the nested rebind inside-out. `field_oprs` is
                 // in peel order (`[0]` outermost = deepest-mutated),
@@ -3229,7 +3279,12 @@ fn push_post_call_frames(
                 let oprs_ttb: Vec<&vir::ast::FieldOpr> =
                     field_oprs.iter().rev().copied().collect();
                 let local_expr = LExpr::var(local_name.clone());
-                let mut current = LExpr::var(info.fresh.clone());
+                // The deepest-level value substituted at the field
+                // slot is the coerced existential — inner-typed to
+                // match the struct field's typ (the rebind path
+                // shares the wrapper-arch coercion with the simple-
+                // Var path above).
+                let mut current = coerced_fresh.clone();
                 for i in (0..oprs_ttb.len()).rev() {
                     let mut base = local_expr.clone();
                     for prior in &oprs_ttb[..i] {
