@@ -108,8 +108,20 @@ impl<'a> Validated<'a> {
 /// Takes `&Validated` so callers don't have to deref-copy at call
 /// sites (Validated is Copy, but `*v` is more noise than necessary
 /// when callers usually have a borrow already).
+///
+/// Uses an empty [`RenderCtx`], so class-method-call rendering falls
+/// back to no-coerce. Use [`lower_with_ctx`] when a ctx is available
+/// to enable wrapper-arch coercion at trait dispatch sites.
 pub fn lower(v: &Validated<'_>) -> LExpr {
-    sst_exp_to_ast_checked(v.inner).unwrap_or_else(|reason| panic!(
+    lower_with_ctx(v, &crate::expr_shared::RenderCtx::empty())
+}
+
+/// Variant of [`lower`] that takes a [`RenderCtx`] for typing info
+/// (currently: class method param typs for `&self` / `&mut self` arg
+/// coercion). Use at codegen entry points where the fn_map is
+/// available.
+pub fn lower_with_ctx(v: &Validated<'_>, ctx: &crate::expr_shared::RenderCtx) -> LExpr {
+    sst_exp_to_ast_checked_with_ctx(v.inner, ctx).unwrap_or_else(|reason| panic!(
         // Reachable only if `Validated::check` has a bug where it
         // accepted an Exp that fails validation on the second pass.
         // sst_exp_to_ast_checked is deterministic, so this is
@@ -354,17 +366,17 @@ pub(crate) fn renders_as_lean_int(range: &IntRange) -> bool {
 /// rendered as `x - y` on `Nat`, which truncates negatives to zero. The
 /// `Int.ofNat` insertion forces subtraction to happen over `Int` so the
 /// lower-bound refinement check (if present) can actually fire.
-fn clip_to_node_checked(src: &Typ, dst: &IntRange, inner: &Exp) -> Result<ExprNode, String> {
+fn clip_to_node_checked(src: &Typ, dst: &IntRange, inner: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<ExprNode, String> {
     let src_range = match &**src {
         TypX::Int(r) => r,
         // Boxed int? Peel the box; otherwise the inner isn't an int type
         // at all (shouldn't happen for Clip) and we pass through.
         TypX::Boxed(t) => if let TypX::Int(r) = &**t { r } else {
-            return exp_to_node_checked(inner);
+            return exp_to_node_checked(inner, ctx);
         },
-        _ => return exp_to_node_checked(inner),
+        _ => return exp_to_node_checked(inner, ctx),
     };
-    let rendered = sst_exp_to_ast_checked(inner)?;
+    let rendered = sst_exp_to_ast_checked_with_ctx(inner, ctx)?;
     Ok(match clip_coercion_head(renders_as_lean_int(src_range), renders_as_lean_int(dst)) {
         Some(head) => LExpr::app1(LExpr::var_lit(head), rendered).node,
         None => rendered.node,
@@ -398,7 +410,7 @@ fn clip_to_node_checked(src: &Typ, dst: &IntRange, inner: &Exp) -> Result<ExprNo
 /// as-is — producing the shadowed form and breaking recursive
 /// `tactus_auto` goals. That would be a caught regression (the
 /// `test_exec_call_recursive_*` suite exercises this path).
-fn render_checked_decrease_arg(e: &Exp) -> Result<LExpr, String> {
+fn render_checked_decrease_arg(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<LExpr, String> {
     use crate::sst_to_lean::peel_transparent;
     let peeled = peel_transparent(e);
     match &peeled.x {
@@ -409,19 +421,19 @@ fn render_checked_decrease_arg(e: &Exp) -> Result<LExpr, String> {
                 for b in binders.iter() {
                     subst.insert(
                         crate::lean_name::LeanName::from_var_ident(&b.name),
-                        sst_exp_to_ast_checked(&b.a)?,
+                        sst_exp_to_ast_checked_with_ctx(&b.a, ctx)?,
                     );
                 }
-                let body_rendered = render_checked_decrease_arg(body)?;
+                let body_rendered = render_checked_decrease_arg(body, ctx)?;
                 Ok(substitute(&body_rendered, &subst))
             }
-            _ => sst_exp_to_ast_checked(e),
+            _ => sst_exp_to_ast_checked_with_ctx(e, ctx),
         },
-        _ => sst_exp_to_ast_checked(e),
+        _ => sst_exp_to_ast_checked_with_ctx(e, ctx),
     }
 }
 
-fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
+fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<ExprNode, String> {
     Ok(match &e.x {
         ExpX::Const(c) => const_to_node_checked(c)?,
         ExpX::Var(ident) | ExpX::VarLoc(ident) | ExpX::VarAt(ident, _) => {
@@ -431,12 +443,12 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
             ExprNode::Var(crate::lean_name::LeanName::from_path(&fun.path))
         }
 
-        ExpX::Unary(UnaryOp::Not, inner) => LExpr::not(sst_exp_to_ast_checked(inner)?).node,
+        ExpX::Unary(UnaryOp::Not, inner) => LExpr::not(sst_exp_to_ast_checked_with_ctx(inner, ctx)?).node,
         ExpX::Unary(UnaryOp::Clip { range, .. }, inner) => {
-            clip_to_node_checked(&inner.typ, range, inner)?
+            clip_to_node_checked(&inner.typ, range, inner, ctx)?
         }
         ExpX::Unary(UnaryOp::CoerceMode { .. }, inner)
-        | ExpX::Unary(UnaryOp::Trigger(_), inner) => exp_to_node_checked(inner)?,
+        | ExpX::Unary(UnaryOp::Trigger(_), inner) => exp_to_node_checked(inner, ctx)?,
         ExpX::Unary(op, _) => {
             // The exec-fn SST path is conservative — we accept Not /
             // Clip / CoerceMode / Trigger directly above, and reject
@@ -461,7 +473,7 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
 
         // Box/Unbox: transparent. Field projection.
         ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => {
-            exp_to_node_checked(inner)?
+            exp_to_node_checked(inner, ctx)?
         }
         // Field projection: `x.name` / `x.0` / `x.val0`. Shared
         // `field_access_name` with the VIR-AST path — for tuple-struct
@@ -476,7 +488,7 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
         // wrapper layers via `.deref` so the Lean projection lands on
         // the inner inductive.
         ExpX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
-            let inner_rendered = sst_exp_to_ast_checked(inner)?;
+            let inner_rendered = sst_exp_to_ast_checked_with_ctx(inner, ctx)?;
             let n = count_ref_decorations(&*inner.typ);
             LExpr::field_proj(apply_deref_chain(inner_rendered, n), field_access_name(field_opr)).node
         }
@@ -489,7 +501,7 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
         // Wrapper coercion (β refactor Piece 2): same shape as Field —
         // peel wrapper layers before the `.is<Variant>` projection.
         ExpX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => {
-            let inner_rendered = sst_exp_to_ast_checked(inner)?;
+            let inner_rendered = sst_exp_to_ast_checked_with_ctx(inner, ctx)?;
             let n = count_ref_decorations(&*inner.typ);
             is_variant_node(variant, apply_deref_chain(inner_rendered, n))
         }
@@ -498,7 +510,7 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
         // Verus emits at every arithmetic site. For unbounded types (Nat,
         // Int, structs) it's vacuous; we emit `True` and let Lean simplify.
         ExpX::UnaryOpr(UnaryOpr::HasType(t), inner) => {
-            let e_ast = sst_exp_to_ast_checked(inner)?;
+            let e_ast = sst_exp_to_ast_checked_with_ctx(inner, ctx)?;
             match type_bound_predicate(&e_ast, t) {
                 Some(pred) => pred.node,
                 None => ExprNode::LitBool(true),
@@ -519,7 +531,7 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
             ))?;
             integer_type_bound_node(kind, bits)
         }
-        ExpX::UnaryOpr(_, inner) => exp_to_node_checked(inner)?,
+        ExpX::UnaryOpr(_, inner) => exp_to_node_checked(inner, ctx)?,
 
         ExpX::Binary(op, lhs, rhs) => {
             // HeightCompare: `is_smaller_than(lhs, rhs)` for decreases-
@@ -537,7 +549,7 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 let r_int = is_int_height(&rhs.typ);
                 let l_dt = decrease_height_datatype(&lhs.typ);
                 let r_dt = decrease_height_datatype(&rhs.typ);
-                let (l, r) = (sst_exp_to_ast_checked(lhs)?, sst_exp_to_ast_checked(rhs)?);
+                let (l, r) = (sst_exp_to_ast_checked_with_ctx(lhs, ctx)?, sst_exp_to_ast_checked_with_ctx(rhs, ctx)?);
                 let (l_h, r_h) = if l_int && r_int {
                     (l, r)
                 } else if let (Some(lp), Some(rp)) = (l_dt, r_dt) {
@@ -592,7 +604,7 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                     // Coerce via `Int.toNat`. For an `Int` index that's
                     // already non-negative (always true under
                     // `BoundsCheck::Allow`), `Int.toNat` is identity.
-                    let (l, r) = (sst_exp_to_ast_checked(lhs)?, sst_exp_to_ast_checked(rhs)?);
+                    let (l, r) = (sst_exp_to_ast_checked_with_ctx(lhs, ctx)?, sst_exp_to_ast_checked_with_ctx(rhs, ctx)?);
                     let r_nat = LExpr::app(LExpr::var_lit("Int.toNat"), vec![r]);
                     return Ok(ExprNode::Index {
                         base: Box::new(l),
@@ -620,13 +632,13 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
             // which is directly decidable.
             if matches!(op, BinaryOp::And) {
                 if let ExpX::Const(Constant::Bool(true)) = &rhs.x {
-                    return exp_to_node_checked(lhs);
+                    return exp_to_node_checked(lhs, ctx);
                 }
                 if let ExpX::Const(Constant::Bool(true)) = &lhs.x {
-                    return exp_to_node_checked(rhs);
+                    return exp_to_node_checked(rhs, ctx);
                 }
             }
-            let (l, r) = (sst_exp_to_ast_checked(lhs)?, sst_exp_to_ast_checked(rhs)?);
+            let (l, r) = (sst_exp_to_ast_checked_with_ctx(lhs, ctx)?, sst_exp_to_ast_checked_with_ctx(rhs, ctx)?);
             match binop_to_ast(op) {
                 // Structural binops (==, +, *, ≤, ...) — pass operands
                 // through as-rendered. NO wrapper peel: structural
@@ -666,13 +678,13 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
             }
         }
         ExpX::BinaryOpr(BinaryOpr::ExtEq(_, _), lhs, rhs) => {
-            LExpr::eq(sst_exp_to_ast_checked(lhs)?, sst_exp_to_ast_checked(rhs)?).node
+            LExpr::eq(sst_exp_to_ast_checked_with_ctx(lhs, ctx)?, sst_exp_to_ast_checked_with_ctx(rhs, ctx)?).node
         }
 
         ExpX::If(cond, then_e, else_e) => ExprNode::If {
-            cond: Box::new(sst_exp_to_ast_checked(cond)?),
-            then_: Box::new(sst_exp_to_ast_checked(then_e)?),
-            else_: Some(Box::new(sst_exp_to_ast_checked(else_e)?)),
+            cond: Box::new(sst_exp_to_ast_checked_with_ctx(cond, ctx)?),
+            then_: Box::new(sst_exp_to_ast_checked_with_ctx(then_e, ctx)?),
+            else_: Some(Box::new(sst_exp_to_ast_checked_with_ctx(else_e, ctx)?)),
         },
 
         // `CallFun::Fun(decl_fun, Some(_))` is precisely the
@@ -692,14 +704,45 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
         // a `&mut` callee's pre/post.
         ExpX::Call(CallFun::Fun(fun, Some(_)), _typs, args) => {
             let head = LExpr::var(crate::lean_name::LeanName::from_path(&fun.path));
-            let app_args: Result<Vec<LExpr>, String> = args.iter().map(|a| {
-                let arg = sst_exp_to_ast_checked(a)?;
-                if crate::to_lean_expr::typ_contains_param(&a.typ) {
-                    Ok(arg)
+            // Wrapper-arch coercion (RenderCtx Option 1 Phase 1):
+            // look up the trait method decl's declared param typs.
+            // The class signature uses wrapper-typed receivers for
+            // `&self` / `&mut self` methods (e.g., `view : Tactus.Ref
+            // Self → Int`), so args arriving at the call site need
+            // to be coerced to match. coerce_lexpr inserts `.mk`
+            // wraps (or `.deref` peels) bridging the local a.typ to
+            // the expected param typ.
+            //
+            // When ctx.class_method_param_typs returns None (cross-
+            // crate fun, or ctx is empty), we fall back to no-coerce
+            // — same as the pre-RenderCtx behavior. Tests for the
+            // cross-crate path still work via the existing fallback.
+            let expected_typs = ctx.class_method_param_typs(fun);
+            let app_args: Result<Vec<LExpr>, String> = args.iter().enumerate().map(|(i, a)| {
+                let arg = sst_exp_to_ast_checked_with_ctx(a, ctx)?;
+                // Apply coercion when we have expected typs AND the
+                // index is valid (defensive — should always be
+                // valid given Verus's arity-matched call lowering).
+                let arg_coerced = match &expected_typs {
+                    Some(typs) if i < typs.len() => {
+                        crate::expr_shared::coerce_lexpr(arg, &a.typ, &typs[i])
+                    }
+                    _ => arg,
+                };
+                // TypeAnnot serves Self / type-param inference at
+                // the Lean elaborator level. Annotate with the
+                // expected param typ (not a.typ) so the receiver's
+                // wrapper-typed form matches the class signature.
+                let annot_typ = match &expected_typs {
+                    Some(typs) if i < typs.len() => typs[i].clone(),
+                    _ => a.typ.clone(),
+                };
+                if crate::to_lean_expr::typ_contains_param(&annot_typ) {
+                    Ok(arg_coerced)
                 } else {
                     Ok(LExpr::new(ExprNode::TypeAnnot {
-                        expr: Box::new(arg),
-                        ty: Box::new(typ_to_expr(&a.typ)),
+                        expr: Box::new(arg_coerced),
+                        ty: Box::new(typ_to_expr(&annot_typ)),
                     }))
                 }
             }).collect();
@@ -724,7 +767,7 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 typs.iter().map(|t| typ_to_expr(t)).collect(),
             );
             let rendered_args: Result<Vec<_>, _> = args.iter()
-                .map(|a| sst_exp_to_ast_checked(a))
+                .map(|a| sst_exp_to_ast_checked_with_ctx(a, ctx))
                 .collect();
             LExpr::app(head, rendered_args?).node
         }
@@ -760,9 +803,9 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
             // encodes parameter substitution via a BndX::Let. Render
             // it with the let zeta-reduced so omega can see the
             // substituted expression directly.
-            let cur = render_checked_decrease_arg(&args[0])?;
-            let prev = render_checked_decrease_arg(&args[1])?;
-            let otherwise = sst_exp_to_ast_checked(&args[2])?;
+            let cur = render_checked_decrease_arg(&args[0], ctx)?;
+            let prev = render_checked_decrease_arg(&args[1], ctx)?;
+            let otherwise = sst_exp_to_ast_checked_with_ctx(&args[2], ctx)?;
             if is_int_height(&args[0].typ) {
                 // Int fast-path. Prelude axiom at prelude.rs:1030-1037
                 // gives `height_lt(height(c), height(p)) ↔ 0 ≤ c ∧ c
@@ -844,10 +887,10 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
                 // flips it into `Result<Vec<_>, String>` which `?`
                 // unwraps to a plain Vec for the fold.
                 let rendered_binders = binders.iter()
-                    .map(|b| sst_exp_to_ast_checked(&b.a)
+                    .map(|b| sst_exp_to_ast_checked_with_ctx(&b.a, ctx)
                         .map(|val| (crate::lean_name::LeanName::from_var_ident(&b.name), val)))
                     .collect::<Result<Vec<_>, _>>()?;
-                let body_rendered = sst_exp_to_ast_checked(body)?;
+                let body_rendered = sst_exp_to_ast_checked_with_ctx(body, ctx)?;
                 // Nest single-variable lets right-to-left so each binder is
                 // in scope for the remainder.
                 let out = rendered_binders.into_iter().rev().fold(body_rendered, |acc, (name, val)| {
@@ -857,7 +900,7 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
             }
             BndX::Quant(quant, binders, _, _) => {
                 let l_binders = vir_var_binders_to_ast(binders);
-                let body = Box::new(sst_exp_to_ast_checked(body)?);
+                let body = Box::new(sst_exp_to_ast_checked_with_ctx(body, ctx)?);
                 match quant.quant {
                     air::ast::Quant::Forall => ExprNode::Forall { binders: l_binders, body },
                     air::ast::Quant::Exists => ExprNode::Exists { binders: l_binders, body },
@@ -865,12 +908,12 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
             }
             BndX::Lambda(binders, _) => ExprNode::Lambda {
                 binders: vir_var_binders_to_ast(binders),
-                body: Box::new(sst_exp_to_ast_checked(body)?),
+                body: Box::new(sst_exp_to_ast_checked_with_ctx(body, ctx)?),
             },
             BndX::Choose(binders, _, cond) => {
                 // `Classical.epsilon (fun (x : T) => cond ∧ body)`
-                let cond_ast = sst_exp_to_ast_checked(cond)?;
-                let body_ast = sst_exp_to_ast_checked(body)?;
+                let cond_ast = sst_exp_to_ast_checked_with_ctx(cond, ctx)?;
+                let body_ast = sst_exp_to_ast_checked_with_ctx(body, ctx)?;
                 let lambda = LExpr::new(ExprNode::Lambda {
                     binders: vir_var_binders_to_ast(binders),
                     body: Box::new(LExpr::and(cond_ast, body_ast)),
@@ -879,7 +922,7 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
             }
         },
 
-        ExpX::WithTriggers(_, inner) | ExpX::Loc(inner) => exp_to_node_checked(inner)?,
+        ExpX::WithTriggers(_, inner) | ExpX::Loc(inner) => exp_to_node_checked(inner, ctx)?,
 
         ExpX::NullaryOpr(_) => ExprNode::LitBool(true),
 
@@ -892,7 +935,7 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
         // `ExprX::Ctor` case.
         ExpX::Ctor(dt, variant, fields) => {
             let rendered = fields.iter()
-                .map(|f| sst_exp_to_ast_checked(&f.a))
+                .map(|f| sst_exp_to_ast_checked_with_ctx(&f.a, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
             ctor_node(dt, variant, rendered)
         }
@@ -906,12 +949,12 @@ fn exp_to_node_checked(e: &Exp) -> Result<ExprNode, String> {
         // (`StmX::ClosureInner`) and exec-mode `FnOnce`/`Fn`/`FnMut`
         // calls remain deferred — see #93.
         ExpX::CallLambda(f, args) => {
-            let f_rendered = sst_exp_to_ast_checked(f)?;
+            let f_rendered = sst_exp_to_ast_checked_with_ctx(f, ctx)?;
             if args.is_empty() {
                 return Ok(f_rendered.node);
             }
             let args_rendered = args.iter()
-                .map(|a| sst_exp_to_ast_checked(a))
+                .map(|a| sst_exp_to_ast_checked_with_ctx(a, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
             ExprNode::App {
                 head: Box::new(f_rendered),
