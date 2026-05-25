@@ -431,6 +431,89 @@ pub(crate) fn apply_deref_chain(base: LExpr, n: usize) -> LExpr {
     out
 }
 
+/// Collect the reference-decoration wrapper names from `typ`,
+/// outermost-first. `Boxed` is transparent (Verus's poly encoding,
+/// not user-visible); peeled silently. `MutRef` counts as one
+/// (terminal — stops the walk).
+///
+/// Companion to [`count_ref_decorations`] — the count tells you "how
+/// many", this tells you "which", in outermost-first order.
+pub(crate) fn collect_ref_wraps(typ: &TypX) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let mut cur = typ;
+    loop {
+        match cur {
+            TypX::Decorate(deco, _, inner) => {
+                if let Some(w) = decoration_wrapper(*deco) {
+                    out.push(w);
+                }
+                cur = &**inner;
+            }
+            TypX::Boxed(inner) => cur = &**inner,
+            TypX::MutRef(_) => {
+                out.push("Tactus.MutRef");
+                break;
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Wrap `base` with N `.mk` constructors. `wraps[0]` is OUTERMOST
+/// (last applied); `wraps[last]` is INNERMOST (first applied). So
+/// `apply_wrap_chain(x, &["Tactus.Ref", "Tactus.Box"])` produces
+/// `Tactus.Ref.mk (Tactus.Box.mk x)` — Box innermost, Ref outermost.
+///
+/// Dual of [`apply_deref_chain`]: deref peels wrappers off, wrap
+/// puts them on. Both compose to identity when `wraps` matches the
+/// peel order.
+pub(crate) fn apply_wrap_chain(base: LExpr, wraps: &[&'static str]) -> LExpr {
+    let mut out = base;
+    for w in wraps.iter().rev() {
+        out = LExpr::app1(LExpr::var_lit(&format!("{}.mk", w)), out);
+    }
+    out
+}
+
+/// Bidirectional wrapper-depth coercion. Bridge `value` (currently at
+/// `from_typ`) to `to_typ` by inserting `.deref` chain or `.mk` chain
+/// based on wrapper depth comparison.
+///
+/// * `from_typ` has MORE wrappers than `to_typ` → insert `.deref`
+///   chain to peel the difference (e.g., `b : Tactus.Box Int` →
+///   `b.deref : Int`).
+/// * `from_typ` has FEWER wrappers than `to_typ` → insert `.mk` chain
+///   matching the outermost wraps of `to_typ` (e.g., `x : Int` →
+///   `Tactus.Ref.mk x : Tactus.Ref Int`).
+/// * Equal depths → no coercion.
+///
+/// This is the shared bidirectional helper that
+/// `to_lean_expr::apply_ref_coercion_if_needed` and the SST-side
+/// typed-composition machinery both delegate to. Centralising it
+/// here means callers across the VIR-AST renderer, SST renderer,
+/// substitution sites, and TypedExpr smart constructors all bridge
+/// wrapper-depth mismatches identically.
+///
+/// Coercion is wrapper-depth-only: we don't model the inner type's
+/// structure. If `from_typ` and `to_typ` have the same wrapper depth
+/// but different inner types (e.g., `Box<Int>` vs `Box<Bool>`),
+/// this returns `value` unchanged — type-level mismatches at the
+/// inner level are Lean's problem, not ours.
+pub(crate) fn coerce_lexpr(value: LExpr, from_typ: &Typ, to_typ: &Typ) -> LExpr {
+    let from_n = count_ref_decorations(&**from_typ);
+    let to_n = count_ref_decorations(&**to_typ);
+    if from_n > to_n {
+        apply_deref_chain(value, from_n - to_n)
+    } else if from_n < to_n {
+        let wraps = collect_ref_wraps(&**to_typ);
+        let extra = to_n - from_n;
+        apply_wrap_chain(value, &wraps[..extra])
+    } else {
+        value
+    }
+}
+
 /// Lean accessor string for the `n`th element of an `arity`-tuple.
 ///
 /// Lean 4 represents N-tuples as right-nested `Prod`:
