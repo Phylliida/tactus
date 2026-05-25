@@ -31,13 +31,82 @@
 //! makes divergence a compile error rather than a runtime
 //! disagreement.
 
+use std::collections::HashMap;
+
 use vir::ast::{
-    ArithOp, BinaryOp, BitwiseOp, Constant, Dt, FieldOpr, Ident, InequalityOp, RealArithOp,
-    Typ, TypDecoration, TypX,
+    ArithOp, BinaryOp, BitwiseOp, Constant, Dt, FieldOpr, Fun, FunctionX, Ident,
+    InequalityOp, RealArithOp, Typ, TypDecoration, TypX,
 };
 
 use crate::lean_ast::{BinOp as L, Expr as LExpr, ExprNode};
 use crate::to_lean_type::{lean_name, sanitize, short_name};
+
+// ── RenderCtx ────────────────────────────────────────────────────────
+//
+// Context passed to expression renderers (VIR-AST and SST). Carries
+// information that comes from OUTSIDE the local expression structure
+// — currently the fn_map for trait-method param-typ lookups, but
+// designed to grow as more typing-from-outside needs surface.
+//
+// The motivation: rendering a class-method-call site needs to know
+// the class signature's expected param typs (so args can be coerced
+// to wrapper-typed receivers for `&self` / `&mut self` methods).
+// Without a context, the renderer only knows the arg's local typ
+// and falls back to TypeAnnot-with-wrong-typ, which is what caused
+// the test_old_view_trait_dispatch_probe failure pre-RenderCtx.
+//
+// Pattern: similar to the existing `BinderCtx` for VIR-AST (which
+// tracks per-binder typs from fn params), `RenderCtx` carries
+// codegen-time-known info that the renderer otherwise lacks.
+
+/// Function lookup borrowed by `RenderCtx`. Same shape as
+/// `sst_to_lean::FnMap` — declared here too so `expr_shared` doesn't
+/// depend on `sst_to_lean`.
+pub type RenderFnMap<'a> = HashMap<&'a Fun, &'a FunctionX>;
+
+/// Render context: typing info available to expression renderers.
+///
+/// Currently holds an optional `fn_map` for class-method-call lookup.
+/// Construct with `RenderCtx::empty()` for tests or rendering paths
+/// without fn_map (e.g., test fixtures, sanity check probes). Use
+/// `RenderCtx::with_fn_map(&fn_map)` for production rendering at
+/// codegen entry points.
+#[derive(Clone, Copy)]
+pub struct RenderCtx<'a> {
+    pub fn_map: Option<&'a RenderFnMap<'a>>,
+}
+
+impl<'a> RenderCtx<'a> {
+    /// Empty context — class-method-call rendering falls back to
+    /// no-coerce. Safe for any rendering path; ideal for tests.
+    pub fn empty() -> Self {
+        Self { fn_map: None }
+    }
+
+    /// Context with fn_map for class-method-call rendering.
+    pub fn with_fn_map(fn_map: &'a RenderFnMap<'a>) -> Self {
+        Self { fn_map: Some(fn_map) }
+    }
+
+    /// Look up a class-method decl's declared param typs. Returns
+    /// `None` when the Fun isn't in fn_map (cross-crate, or no fn_map
+    /// in this RenderCtx). Caller falls back to no-coerce rendering
+    /// when `None` — gracefully degrades for the cross-crate case
+    /// rather than panicking.
+    ///
+    /// The lookup goes to the trait method DECL's params (which is
+    /// what `CallFun::Fun(fun, Some(_))` references in SST and what
+    /// `CallTarget::Fun(DynamicResolved, fun, ...)` references in
+    /// VIR-AST). Trait dispatch happens at the decl's typing; the
+    /// resolved impl might have textually-different param names but
+    /// positionally-aligned typs — the decl's typs are what the class
+    /// signature uses.
+    pub fn class_method_param_typs(&self, fun: &Fun) -> Option<Vec<Typ>> {
+        let fn_map = self.fn_map?;
+        let func = fn_map.get(fun)?;
+        Some(func.params.iter().map(|p| p.x.typ.clone()).collect())
+    }
+}
 
 /// Map a VIR/SST binary op to its structural Lean `BinOp` representation.
 ///

@@ -36,8 +36,24 @@ use crate::to_lean_type::{lean_name, typ_to_expr};
 /// go. Returns `Err(reason)` for any SST form we don't know how to
 /// emit. This is the primary entry point — use it anywhere unchecked
 /// SST enters (walk, req/ens validation).
+///
+/// Uses an empty [`RenderCtx`], so class-method-call rendering falls
+/// back to no-coerce (the pre-RenderCtx behavior). Use
+/// [`sst_exp_to_ast_checked_with_ctx`] when a ctx is available to
+/// enable per-call-site wrapper-arch coercion.
 pub fn sst_exp_to_ast_checked(e: &Exp) -> Result<LExpr, String> {
-    exp_to_node_checked(e).map(LExpr::new)
+    sst_exp_to_ast_checked_with_ctx(e, &crate::expr_shared::RenderCtx::empty())
+}
+
+/// Variant of [`sst_exp_to_ast_checked`] that takes a [`RenderCtx`]
+/// for typing info that comes from outside the local expression
+/// structure (currently: class method param typs for `&self` /
+/// `&mut self` arg coercion).
+pub fn sst_exp_to_ast_checked_with_ctx(
+    e: &Exp,
+    ctx: &crate::expr_shared::RenderCtx,
+) -> Result<LExpr, String> {
+    exp_to_node_checked(e, ctx).map(LExpr::new)
 }
 
 /// A reference to an SST expression that has been validated (via
