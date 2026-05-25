@@ -183,41 +183,9 @@ fn strip_all_ref_decorations(typ: &Typ) -> Typ {
 // body-shadow machinery.
 use crate::expr_shared::decoration_wrapper;
 
-/// Walk `typ` outermost-in, collecting Tactus wrapper names for each
-/// reference-like `TypX::Decorate` layer. Peels `Boxed` (Verus's poly
-/// encoding — Lean-transparent) and skips non-reference decorations.
-/// Stops at the first non-Decorate-non-Boxed node.
-fn collect_ref_wraps(typ: &TypX) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    let mut cur = typ;
-    loop {
-        match cur {
-            TypX::Decorate(deco, _, inner) => {
-                if let Some(w) = decoration_wrapper(*deco) {
-                    out.push(w);
-                }
-                cur = &**inner;
-            }
-            TypX::Boxed(inner) => cur = &**inner,
-            TypX::MutRef(_) => {
-                out.push("Tactus.MutRef");
-                break;
-            }
-            _ => break,
-        }
-    }
-    out
-}
-
-/// Apply wraps from innermost to outermost: `wraps[last]` is innermost.
-fn apply_ref_wraps(mut e: LExpr, wraps: &[&'static str]) -> LExpr {
-    for w in wraps.iter().rev() {
-        e = LExpr::app1(LExpr::var_lit(&format!("{}.mk", w)), e);
-    }
-    e
-}
-
-// `count_ref_decorations` moved to `expr_shared`.
+// `collect_ref_wraps`, `apply_wrap_chain` (formerly `apply_ref_wraps`),
+// and `count_ref_decorations` all moved to `expr_shared` — shared with
+// SST-side typed-composition machinery.
 use crate::expr_shared::count_ref_decorations;
 
 /// Count of wrapper layers (`Tactus.Ref`/`Box`/`Rc`/`Arc`/`MutRef`)
@@ -272,34 +240,25 @@ fn apply_ref_coercion_if_needed(
     rendered: LExpr,
     binders: &BinderCtx,
 ) -> LExpr {
-    // Bidirectional coercion. Compute the "structural" typ — what the
-    // rendering naturally produces — and compare to `expr.typ`:
+    // Thin wrapper around `expr_shared::coerce_lexpr` — compute the
+    // "structural" typ (what the rendering naturally produces, based
+    // on binder ctx for var-shaped exprs) and bridge `expr.typ` →
+    // structural via the shared bidirectional helper.
     //
-    // * `expr.typ` has MORE wrappers than structural → insert
-    //   `Tactus.X.mk` for the extra layers (e.g., auto-`&` at a call
-    //   site needs to wrap a bare value).
-    // * `expr.typ` has FEWER wrappers than structural → insert
-    //   `.deref` chain for the difference (e.g., Verus's spec-mode
-    //   `**b` collapses to `Var(b)` with expr.typ = bare, but the
-    //   binder is wrapper-typed — we need to project out the inner).
+    // * `expr.typ` has MORE wrappers than structural → `.mk` chain
+    //   wraps (e.g., auto-`&` at a call site needs to wrap a bare value).
+    // * `expr.typ` has FEWER wrappers than structural → `.deref`
+    //   chain peels (e.g., Verus's spec-mode `**b` collapses to
+    //   `Var(b)` with expr.typ = bare, but the binder is wrapper-typed).
     //
-    // The equal case renders verbatim.
+    // Equal renders verbatim.
     let Some(natural) = structural_typ(expr, binders) else {
         return rendered;
     };
-    let natural_n = count_ref_decorations(&natural);
-    let expr_n = count_ref_decorations(&*expr.typ);
-    if expr_n > natural_n {
-        let wraps = collect_ref_wraps(&expr.typ);
-        // Take the outermost (expr_n - natural_n) wraps; the rest are
-        // already accounted for by the structural typ.
-        let extra = expr_n - natural_n;
-        apply_ref_wraps(rendered, &wraps[..extra])
-    } else if expr_n < natural_n {
-        crate::expr_shared::apply_deref_chain(rendered, natural_n - expr_n)
-    } else {
-        rendered
-    }
+    // We're bridging from the binder-context's natural typ TO expr.typ
+    // — the natural is the value's current type; expr.typ is what the
+    // surrounding context expects.
+    crate::expr_shared::coerce_lexpr(rendered, &natural, &expr.typ)
 }
 
 /// Build `VarBinders<Typ>` → AST binders for proof/spec fn parameters.
