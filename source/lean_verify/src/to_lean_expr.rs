@@ -293,9 +293,26 @@ fn apply(head: &str, args: Vec<LExpr>) -> ExprNode {
 }
 
 fn expr_to_node(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
+    // Render-time substitution helper: if ctx carries a value_subst
+    // map and `ident` is in it, return the substituted-and-bridged
+    // value. The bridge uses `expr.typ` (the slot's expected typ at
+    // this AST position) so the substituted value coerces toward what
+    // the current context wants — not toward a single direction baked
+    // in at map-build time. Closes the "claimed-typ-lies" gap for
+    // call-site inlining where the value's actual typ differs from
+    // the AST node's claim post-rewrite.
+    let try_subst = |ident: &VarIdent| -> Option<ExprNode> {
+        let lean_name = crate::lean_name::LeanName::from_var_ident(ident);
+        ctx.lookup_subst(&lean_name, &expr.typ).map(|e| e.node)
+    };
     match &expr.x {
         ExprX::Const(c) => const_to_node(c),
-        ExprX::Var(ident) => ExprNode::Var(crate::lean_name::LeanName::from_var_ident(ident)),
+        ExprX::Var(ident) => {
+            if let Some(sub) = try_subst(ident) {
+                return sub;
+            }
+            ExprNode::Var(crate::lean_name::LeanName::from_var_ident(ident))
+        }
         // `VarAt(x, Pre)` collapses to `Var(x)` for the general path
         // (non-mut params, loop ensures' at-entry refs, etc. — these
         // are correct because the AT-entry value equals the current
@@ -304,8 +321,18 @@ fn expr_to_node(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::Rend
         // synthetic distinct name BEFORE this renderer runs, so the
         // substitution map can target pre- and post-state separately.
         // See `walk_call` and `varat_pre_name` for the full picture.
-        ExprX::VarAt(ident, _) => ExprNode::Var(crate::lean_name::LeanName::from_var_ident(ident)),
-        ExprX::VarLoc(ident) => ExprNode::Var(crate::lean_name::LeanName::from_var_ident(ident)),
+        ExprX::VarAt(ident, _) => {
+            if let Some(sub) = try_subst(ident) {
+                return sub;
+            }
+            ExprNode::Var(crate::lean_name::LeanName::from_var_ident(ident))
+        }
+        ExprX::VarLoc(ident) => {
+            if let Some(sub) = try_subst(ident) {
+                return sub;
+            }
+            ExprNode::Var(crate::lean_name::LeanName::from_var_ident(ident))
+        }
         ExprX::ConstVar(fun, _) => ExprNode::Var(crate::lean_name::LeanName::from_path(&fun.path)),
         ExprX::StaticVar(fun) | ExprX::ExecFnByName(fun) => ExprNode::Var(crate::lean_name::LeanName::from_path(&fun.path)),
 

@@ -2626,16 +2626,37 @@ fn walk_call<'a>(
     // emission and ref-collection can't drift.
     let inlined = crate::call_inlining::collect_inlined_at_call(callee, spec_callee);
 
-    // Build RenderCtx with the WpCtx's fn_map for VIR-AST class-
-    // method-call coercion inside the inlined req/ens rendering.
-    let render_ctx = crate::expr_shared::RenderCtx::with_fn_map(&ctx.fn_map);
+    // Two RenderCtxs for the two inlining paths:
+    //
+    // * `render_ctx_req` — used to render the callee's `requires`.
+    //   Requires sees pre-state values, which equal the caller's
+    //   args (Verus enforces param↔arg typ compat). The req_subst
+    //   LExpr map handles `Var(p) ↦ arg_lexprs[i]` post-render.
+    //   No typed bridge needed.
+    //
+    // * `render_ctx_ens` — used to render the callee's `ensures`.
+    //   Ensures sees post-state values for `&mut` params: the fresh
+    //   existential at the wrapper-typed declared param typ. The
+    //   slot's expected typ may differ (e.g., trait dispatch wants
+    //   the auto-borrowed Ref form). The `value_subst` map plus
+    //   `RenderCtx::lookup_subst` bridge per use site.
+    //
+    // Splitting the contexts keeps the substitution domains disjoint:
+    // requires never sees the post-state existential; ensures never
+    // sees a non-existential pre-state through value_subst (those
+    // flow via ens_subst's LExpr-level substitute).
+    let render_ctx_req = crate::expr_shared::RenderCtx::with_fn_map(&ctx.fn_map);
+    let render_ctx_ens = crate::expr_shared::RenderCtx::with_fn_map_and_value_subst(
+        &ctx.fn_map,
+        &subst.value_subst,
+    );
 
     if !inlined.requires.is_empty() {
-        emit_call_precondition_theorem(&inlined.requires, &subst, call_span, obl, &render_ctx, e);
+        emit_call_precondition_theorem(&inlined.requires, &subst, call_span, obl, &render_ctx_req, e);
     }
 
     let new_obl = push_post_call_frames(
-        callee, &inlined.ensures, &subst, dest, obl, &render_ctx,
+        callee, &inlined.ensures, &subst, dest, obl, &render_ctx_ens,
     );
     walk_obligations(after, ctx, &new_obl, e);
 }
@@ -2697,14 +2718,25 @@ struct CallSubstitutions<'a> {
     /// `varat_pre_name(p)` map to the same arg — at requires-time
     /// only the pre-call value exists.
     req_subst: HashMap<crate::lean_name::LeanName, LExpr>,
-    /// `ensures` substitution: non-mut params map to caller args;
-    /// `&mut` params map `p ↦ Var(fresh_post_state)` and
-    /// `varat_pre_name(p) ↦ caller_arg` (pre-state via `*old(x)`).
-    /// Plus `callee.ret.name ↦ Var(fresh_ret_name)` so the
-    /// rendered ensures uses the gensym'd ret instead of the
-    /// callee's source-level ret-name (which could shadow a
-    /// caller-scope local).
+    /// `ensures` substitution at LExpr level — applied via
+    /// `lean_ast::substitute` AFTER the ensures expression has been
+    /// rendered. Carries non-mut param mappings, pre-state aliases
+    /// for mut params (`varat_pre_name(p) ↦ caller_arg`), typ-param
+    /// substitution, and the callee's ret name → `fresh_ret_name`.
+    /// Mut params' post-state `pname ↦ ...` mapping lives in
+    /// `value_subst` (typed, applied at render time) — kept out of
+    /// `ens_subst` to avoid double substitution.
     ens_subst: HashMap<crate::lean_name::LeanName, LExpr>,
+    /// Typed render-time substitution map. Currently used only for
+    /// `&mut` params' post-state mapping: `pname ↦ (Var(fresh),
+    /// p.x.typ)`. The renderer's Var arm consults this via
+    /// `RenderCtx::lookup_subst` at each use site, bridging the
+    /// wrapper-typed existential to whatever the surrounding slot
+    /// expects (bare for numeric uses, wrapper for trait dispatch).
+    /// Closes the "claimed-typ-lies" gap that pre-coerced LExpr
+    /// substitution couldn't address — the bridge happens at use,
+    /// where the slot's typ is locally available from the AST node.
+    value_subst: HashMap<crate::lean_name::LeanName, (LExpr, Typ)>,
     /// Set of `&mut` param names (sanitized) — used by
     /// `rewrite_varat_for_mut_params` to rename `VarAt(p, Pre) →
     /// Var(<p>_at_pre_tactus)` in the VIR-AST spec BEFORE
@@ -2749,6 +2781,7 @@ fn add_param_subst_entries<'a>(
     mut_args: &[MutArgInfo<'a>],
     req_subst: &mut HashMap<crate::lean_name::LeanName, LExpr>,
     ens_subst: &mut HashMap<crate::lean_name::LeanName, LExpr>,
+    value_subst: &mut HashMap<crate::lean_name::LeanName, (LExpr, Typ)>,
     mut_param_names: &mut HashSet<String>,
 ) {
     for (i, p) in params.iter().enumerate() {
@@ -2769,29 +2802,26 @@ fn add_param_subst_entries<'a>(
         if is_mut_ref_typ(&p.x.typ, p.x.is_mut) {
             mut_param_names.insert(sanitize(&p.x.name.0));
             req_subst.insert(pname_pre.clone(), arg_lexprs[i].clone());
-            // Ensures: mut param's `p` → fresh post-state; pre-state via varat_pre_name.
-            // Find the MutArgInfo by matching param_idx — replaces the
-            // pre-#105 `mut_idx_to_fresh.get(idx).expect(...)` lookup.
-            // The `param_idx` is positional, so it works whether the
-            // current pass is over callee.params or spec_callee.params
-            // (Rust requires positional alignment).
+            // Ensures: mut param's `p` is substituted at RENDER TIME
+            // via `value_subst` so the bridge can use the slot's typ
+            // at each use site (numeric uses get `.deref`-to-inner;
+            // trait dispatch sees wrapper-typed values bridged by
+            // kind/depth as needed). The post-state existential's
+            // declared typ is `p.x.typ` — the value enters the map
+            // un-coerced; `coerce_lexpr` bridges per use.
+            //
+            // Pre-state alias `pname_pre ↦ caller_arg` still lives
+            // in ens_subst (LExpr-level post-render substitute):
+            // caller args and pre-state slots have matching typs by
+            // construction (Verus enforces param↔arg typ compat), so
+            // no typed bridge needed.
             let info = mut_args.iter().find(|m| m.param_idx == i)
                 .expect("MutArgInfo should exist for every &mut param idx — \
                          build_call_mut_args populates one per is_mut param");
-            // Wrapper-arch typing: the fresh post-state existential is
-            // bound at the callee's declared param typ (wrapper-typed
-            // for new-mut-ref `&mut T` = `MutRef T`). The rendered
-            // ensures uses `Var(p)` at slots that expect the inner-
-            // typed view (post body-shadow stripping in the renderer).
-            // Bridge via TypedExpr: coerce the wrapper-typed
-            // existential to the inner typ; the substitution value
-            // becomes `fresh.deref` for new-mut-ref or just `fresh`
-            // for legacy `is_mut: true` (where typ is already bare).
-            let inner_typ = crate::to_lean_expr::strip_one_ref_decoration(&p.x.typ);
-            let coerced_fresh = crate::typed_expr::TypedExpr::var(
-                info.fresh.clone(), p.x.typ.clone(),
-            ).into_slot(&inner_typ);
-            ens_subst.insert(pname.clone(), coerced_fresh);
+            value_subst.insert(
+                pname.clone(),
+                (LExpr::var(info.fresh.clone()), p.x.typ.clone()),
+            );
             ens_subst.insert(pname_pre, arg_lexprs[i].clone());
         } else {
             // Non-mut ensures: param → arg.
@@ -2865,9 +2895,10 @@ fn build_call_substitutions<'a>(
     // convention as mut_post above.
     let fresh_ret_name = crate::lean_name::LeanName::synthetic(format!("_tactus_ret_{}", e.next_id()));
 
-    // Build req_subst and ens_subst.
+    // Build req_subst, ens_subst, and value_subst.
     let mut req_subst: HashMap<crate::lean_name::LeanName, LExpr> = typ_subst.clone();
     let mut ens_subst: HashMap<crate::lean_name::LeanName, LExpr> = typ_subst.clone();
+    let mut value_subst: HashMap<crate::lean_name::LeanName, (LExpr, Typ)> = HashMap::new();
     let mut mut_param_names: HashSet<String> = HashSet::new();
 
     // For non-trait-method-impl calls, `spec_callee == callee` (same
@@ -2888,6 +2919,7 @@ fn build_call_substitutions<'a>(
         &mut_args,
         &mut req_subst,
         &mut ens_subst,
+        &mut value_subst,
         &mut mut_param_names,
     );
     // Second pass: keys from `spec_callee.params` (trait method
@@ -2905,6 +2937,7 @@ fn build_call_substitutions<'a>(
             &mut_args,
             &mut req_subst,
             &mut ens_subst,
+            &mut value_subst,
             &mut mut_param_names,
         );
     }
@@ -2929,6 +2962,7 @@ fn build_call_substitutions<'a>(
         typ_subst,
         req_subst,
         ens_subst,
+        value_subst,
         mut_param_names,
         mut_args,
         fresh_ret_name,
