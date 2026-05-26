@@ -213,6 +213,10 @@ mod tests {
         ))
     }
 
+    fn mut_ref_typ(inner: Typ) -> Typ {
+        Arc::new(TypX::MutRef(inner))
+    }
+
     /// Did `expr` end up as `base.deref` (one deref chain)?
     fn is_single_deref(expr: &Expr) -> bool {
         matches!(&expr.node, ExprNode::FieldProj { field, .. } if field == "deref")
@@ -343,5 +347,66 @@ mod tests {
         assert_eq!(args.len(), 2);
         assert!(is_single_deref(&args[0]), "arg1 should be derefed");
         assert!(is_single_wrap(&args[1], "Tactus.Ref"), "arg2 should be wrapped");
+    }
+
+    #[test]
+    fn into_slot_handles_kind_mismatch_at_equal_depth() {
+        // value : Tactus.MutRef Holder; slot : Tactus.Ref Holder.
+        // Equal depth (1), different kinds. Expect peel + wrap:
+        // `Tactus.Ref.mk value.deref`.
+        let typed = TypedExpr::var(LeanName::synthetic("m"), mut_ref_typ(int_typ()));
+        let result = typed.into_slot(&ref_typ(int_typ()));
+        // Outer is Tactus.Ref.mk applied to inner.
+        let ExprNode::App { head, args } = &result.node else {
+            panic!("expected App, got {:?}", result.node);
+        };
+        let ExprNode::Var(head_name) = &head.node else {
+            panic!("expected Var head");
+        };
+        assert_eq!(head_name.as_str(), "Tactus.Ref.mk");
+        assert_eq!(args.len(), 1);
+        // The arg is `value.deref` (peeled MutRef).
+        assert!(is_single_deref(&args[0]),
+            "expected inner to be `value.deref`, got {:?}", args[0].node);
+    }
+
+    #[test]
+    fn into_slot_preserves_common_inner_suffix() {
+        // value : Tactus.Box (Tactus.Ref Int); slot : Tactus.Ref (Tactus.Ref Int).
+        // Common inner suffix [Ref]. Expect: peel outer Box, wrap outer Ref.
+        // Result: `Tactus.Ref.mk value.deref`.
+        let typed = TypedExpr::var(
+            LeanName::synthetic("v"),
+            box_typ(ref_typ(int_typ())),
+        );
+        let result = typed.into_slot(&ref_typ(ref_typ(int_typ())));
+        let ExprNode::App { head, args } = &result.node else {
+            panic!("expected App, got {:?}", result.node);
+        };
+        let ExprNode::Var(head_name) = &head.node else {
+            panic!("expected Var head");
+        };
+        assert_eq!(head_name.as_str(), "Tactus.Ref.mk");
+        // The arg is `value.deref` — only ONE peel (outer Box), not two.
+        // If we peeled fully (two derefs) it'd be `value.deref.deref`.
+        assert!(is_single_deref(&args[0]),
+            "expected single deref (common suffix preserved), got {:?}", args[0].node);
+    }
+
+    #[test]
+    fn into_slot_disjoint_wraps_peels_fully_then_wraps_fully() {
+        // value : Tactus.Box Int; slot : Tactus.Ref Int.
+        // Disjoint wraps (no common suffix). Equal depth 1.
+        // Expect: peel one, wrap one.
+        let typed = TypedExpr::var(LeanName::synthetic("b"), box_typ(int_typ()));
+        let result = typed.into_slot(&ref_typ(int_typ()));
+        let ExprNode::App { head, args } = &result.node else {
+            panic!("expected App");
+        };
+        let ExprNode::Var(head_name) = &head.node else {
+            panic!("expected Var head");
+        };
+        assert_eq!(head_name.as_str(), "Tactus.Ref.mk");
+        assert!(is_single_deref(&args[0]));
     }
 }

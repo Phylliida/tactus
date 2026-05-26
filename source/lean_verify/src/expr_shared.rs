@@ -545,42 +545,55 @@ pub(crate) fn apply_wrap_chain(base: LExpr, wraps: &[&'static str]) -> LExpr {
     out
 }
 
-/// Bidirectional wrapper-depth coercion. Bridge `value` (currently at
-/// `from_typ`) to `to_typ` by inserting `.deref` chain or `.mk` chain
-/// based on wrapper depth comparison.
+/// Bidirectional wrapper-kind-and-depth coercion. Bridge `value`
+/// (currently at `from_typ`) to `to_typ` by inserting `.deref` chain
+/// and/or `.mk` chain to match wrapper sequences.
 ///
-/// * `from_typ` has MORE wrappers than `to_typ` → insert `.deref`
-///   chain to peel the difference (e.g., `b : Tactus.Box Int` →
-///   `b.deref : Int`).
-/// * `from_typ` has FEWER wrappers than `to_typ` → insert `.mk` chain
-///   matching the outermost wraps of `to_typ` (e.g., `x : Int` →
-///   `Tactus.Ref.mk x : Tactus.Ref Int`).
-/// * Equal depths → no coercion.
+/// Compares wrapper sequences (outermost-first) from both types:
+///
+/// * Sequences equal → no coercion.
+/// * Sequences share a common inner suffix → peel only the
+///   non-matching outer wraps of `from`, then wrap with the
+///   non-matching outer wraps of `to`. Examples:
+///   - `from=[Ref]`, `to=[]` → `value.deref` (depth shrink).
+///   - `from=[]`, `to=[Ref]` → `Tactus.Ref.mk value` (depth grow).
+///   - `from=[Box, Ref]`, `to=[Ref, Ref]` → `Tactus.Ref.mk value.deref`
+///     (common suffix `[Ref]`; rewrap outer Box → Ref).
+///   - `from=[MutRef]`, `to=[Ref]` → `Tactus.Ref.mk value.deref`
+///     (kind mismatch at equal depth — peel one, wrap one).
 ///
 /// This is the shared bidirectional helper that
 /// `to_lean_expr::apply_ref_coercion_if_needed` and the SST-side
 /// typed-composition machinery both delegate to. Centralising it
 /// here means callers across the VIR-AST renderer, SST renderer,
 /// substitution sites, and TypedExpr smart constructors all bridge
-/// wrapper-depth mismatches identically.
+/// wrapper mismatches identically.
 ///
-/// Coercion is wrapper-depth-only: we don't model the inner type's
-/// structure. If `from_typ` and `to_typ` have the same wrapper depth
-/// but different inner types (e.g., `Box<Int>` vs `Box<Bool>`),
-/// this returns `value` unchanged — type-level mismatches at the
-/// inner level are Lean's problem, not ours.
+/// Coercion is wrapper-only: we don't model the inner type's
+/// structure. If `from_typ` and `to_typ` have matching wrapper
+/// sequences but different inner types (e.g., `Box<Int>` vs
+/// `Box<Bool>`), this returns `value` unchanged — type-level
+/// mismatches at the inner level are Lean's problem, not ours.
 pub(crate) fn coerce_lexpr(value: LExpr, from_typ: &Typ, to_typ: &Typ) -> LExpr {
-    let from_n = count_ref_decorations(&**from_typ);
-    let to_n = count_ref_decorations(&**to_typ);
-    if from_n > to_n {
-        apply_deref_chain(value, from_n - to_n)
-    } else if from_n < to_n {
-        let wraps = collect_ref_wraps(&**to_typ);
-        let extra = to_n - from_n;
-        apply_wrap_chain(value, &wraps[..extra])
-    } else {
-        value
+    let from_wraps = collect_ref_wraps(&**from_typ);
+    let to_wraps = collect_ref_wraps(&**to_typ);
+    if from_wraps == to_wraps {
+        return value;
     }
+    // Find longest common SUFFIX of the two wrap sequences. The
+    // suffix corresponds to inner wraps that already match — we
+    // leave those untouched. Only the non-matching outer wraps need
+    // peel + rewrap.
+    let suffix_len = from_wraps
+        .iter()
+        .rev()
+        .zip(to_wraps.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let peel_n = from_wraps.len() - suffix_len;
+    let wrap_slice = &to_wraps[..to_wraps.len() - suffix_len];
+    let peeled = apply_deref_chain(value, peel_n);
+    apply_wrap_chain(peeled, wrap_slice)
 }
 
 /// Lean accessor string for the `n`th element of an `arity`-tuple.
