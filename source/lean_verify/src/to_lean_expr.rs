@@ -291,18 +291,10 @@ fn apply_ref_coercion_if_needed(
     let Some(natural) = structural_typ(expr, binders, ctx) else {
         return rendered;
     };
-    let pre = crate::lean_pp::pp_expr(&rendered);
-    let result = crate::expr_shared::coerce_lexpr(rendered, &natural, &expr.typ);
-    let post = crate::lean_pp::pp_expr(&result);
-    if pre != post {
-        eprintln!("APPLY_REF natural={:?} expr.typ={:?} `{}` -> `{}`", &*natural, &*expr.typ, pre, post);
-    } else {
-        // also log no-op when natural and expr.typ differ for diagnostic
-        if format!("{:?}", &*natural) != format!("{:?}", &*expr.typ) {
-            eprintln!("APPLY_REF NO-OP DESPITE DIFF natural={:?} expr.typ={:?} `{}`", &*natural, &*expr.typ, pre);
-        }
-    }
-    result
+    // We're bridging from the binder-context's natural typ TO expr.typ
+    // — the natural is the value's current type; expr.typ is what the
+    // surrounding context expects.
+    crate::expr_shared::coerce_lexpr(rendered, &natural, &expr.typ)
 }
 
 /// Build `VarBinders<Typ>` → AST binders for proof/spec fn parameters.
@@ -891,34 +883,13 @@ fn call_to_node(target: &CallTarget, args: &Exprs, binders: &BinderCtx, ctx: &cr
         // None (cross-crate callee not in fn_map, or FnSpec/
         // BuiltinSpecFun target), falls back to no-coerce.
         let expected_typs = fun_for_lookup.and_then(|f| ctx.fn_param_typs(f));
-        if let Some(f) = fun_for_lookup {
-            eprintln!("CALL_TO_NODE fun={:?} expected_typs={:?}", f.path.segments.last().map(|s| s.as_str()), expected_typs.as_ref().map(|ts| ts.iter().map(|t| format!("{:?}", &**t)).collect::<Vec<_>>()));
-        }
         ExprNode::App {
             head: Box::new(head),
             args: args.iter().enumerate().map(|(i, a)| {
-                let variant_name = match &a.x {
-                    ExprX::Const(_) => "Const", ExprX::Var(_) => "Var",
-                    ExprX::VarLoc(_) => "VarLoc", ExprX::VarAt(_, _) => "VarAt",
-                    ExprX::Loc(_) => "Loc", ExprX::Call(..) => "Call",
-                    ExprX::Ctor(..) => "Ctor", ExprX::NullaryOpr(_) => "NullaryOpr",
-                    ExprX::Unary(..) => "Unary", ExprX::UnaryOpr(..) => "UnaryOpr",
-                    ExprX::Binary(..) => "Binary", ExprX::BinaryOpr(..) => "BinaryOpr",
-                    ExprX::Multi(..) => "Multi", ExprX::Quant(..) => "Quant",
-                    ExprX::Closure(..) => "Closure", ExprX::If(..) => "If",
-                    ExprX::Match(..) => "Match", ExprX::ReadPlace(..) => "ReadPlace",
-                    ExprX::Old(_) => "Old", ExprX::Ghost { .. } => "Ghost",
-                    ExprX::Block(..) => "Block", ExprX::Return(_) => "Return",
-                    _ => "OTHER",
-                };
                 let rendered = vir_expr_to_ast_with_binders(a, binders, ctx);
-                let pp = crate::lean_pp::pp_expr(&rendered);
-                eprintln!("  arg[{}] a.x={} a.typ={:?} rendered=`{}`",
-                    i, variant_name, &*a.typ, pp);
                 match &expected_typs {
                     Some(typs) if i < typs.len() => {
-                        let coerced = crate::expr_shared::coerce_lexpr(rendered, &a.typ, &typs[i]);
-                        coerced
+                        crate::expr_shared::coerce_lexpr(rendered, &a.typ, &typs[i])
                     }
                     _ => rendered,
                 }
