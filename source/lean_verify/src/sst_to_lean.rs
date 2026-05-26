@@ -7760,6 +7760,130 @@ mod tests {
         assert_eq!(aliases.get(&borrow_mut_key(&bm3)), Some(&borrow_mut_key(&bm1)));
     }
 
+    /// F3 (closure-scope leak probe) — was filed as an audit item
+    /// in HANDOFF.md's "filed as future work" list. The concern: if
+    /// `collect_borrow_mut_links` recurses into `StmX::ClosureInner.body`,
+    /// any linkage assigns *inside* the closure body would be added to
+    /// the OUTER fn's link map. That'd be a bug — the closure's
+    /// user-local doesn't exist in the outer scope.
+    ///
+    /// Today the recursion DOES happen (see the `StmX::ClosureInner`
+    /// arm in `collect_borrow_mut_links`). This test pins that
+    /// behavior so it's visible: a closure-body linkage *is* hoisted
+    /// to the outer map. The leak is harmless for the only path that
+    /// matters today (exec-mode closure calls with `&mut` args are
+    /// upstream-blocked in Verus, so closure bodies don't currently
+    /// emit BorrowMut linkages), but if a future change unblocks them
+    /// this test will fail loudly and the recursion will need to be
+    /// gated (separate inner map, or skip ClosureInner entirely).
+    #[test]
+    fn collect_borrow_mut_links_currently_hoists_from_closure_body() {
+        use vir::def::Spanned;
+        let user = var_ident_disambig("y", 0);
+        let borrow = var_ident_disambig("tmp%", 1);
+        let mut bm_set = HashSet::new();
+        bm_set.insert(borrow_mut_key(&borrow));
+
+        let inner_assign = assign_stm(user.clone(), borrow.clone());
+        // ast_body: a dummy `Const(Bool(true))`; the recursion under
+        // test only walks the `Stm` body, not the AST.
+        let ast_body = SpannedTyped::new(
+            &test_span(),
+            &Arc::new(TypX::Bool),
+            ExprX::Const(vir::ast::Constant::Bool(true)),
+        );
+        let closure_stm = Spanned::new(test_span(), StmX::ClosureInner {
+            body: inner_assign,
+            typ_inv_vars: Arc::new(vec![]),
+            ast_body,
+        });
+
+        let mut links = HashMap::new();
+        let mut aliases = HashMap::new();
+        collect_borrow_mut_links(&closure_stm, &bm_set, &mut links, &mut aliases);
+
+        // PINNED BEHAVIOR (intentional canary): linkage IS hoisted.
+        // If this flips to `links.is_empty()`, someone gated the
+        // recursion — update the pre-pass + the comment above.
+        assert_eq!(links.get(&borrow_mut_key(&borrow)), Some(&user),
+            "linkage in closure body currently hoists to outer map; \
+             see comment for context");
+    }
+
+    /// C2 (Verus SST shape pin) — was filed as future work in HANDOFF
+    /// after the 2026-05-26 review. The pre-pass assumes a specific
+    /// SST shape that Verus emits for `bump(&mut y)` from inside a
+    /// `caller(y: &mut u8)`. This test pins our understanding of
+    /// that shape so any upstream re-encoding becomes a loud failure.
+    ///
+    /// Expected shape (from inspecting Verus's new-mut-ref output):
+    ///   Block([
+    ///     Call(bump, [&mut tmp%_1]),    // tmp%_1 is a BorrowMut local
+    ///     Assign(y, Var(tmp%_1))         // ← the "forward-forward"
+    ///   ])                               //   linkage we detect
+    ///
+    /// If Verus changes the encoding (e.g., reverses the Assign
+    /// direction, splits into multiple stms, or uses a different
+    /// VarIdent style for the temp), this test fails — we get a
+    /// signal long before any e2e regression.
+    #[test]
+    fn collect_borrow_mut_links_pins_verus_call_then_assign_shape() {
+        let user = var_ident_disambig("y", 0);
+        let borrow = var_ident_disambig("tmp%", 1);
+        let mut bm_set = HashSet::new();
+        bm_set.insert(borrow_mut_key(&borrow));
+
+        // Simulate Verus's output: Call followed by linkage Assign.
+        // We use an assert as a stand-in for the Call here because
+        // `is_borrow_mut_linkage_assign` keys only on Assign shape,
+        // and our enumeration treats StmX::Call as a leaf (no
+        // recursion). What we're pinning: the Assign(user, Var(BM))
+        // sitting at the tail of a Block IS detected.
+        let body = block_stm(vec![
+            assert_stm(SpannedTyped::new(
+                &test_span(),
+                &typ_bool(),
+                ExpX::Const(vir::ast::Constant::Bool(true)),
+            )),
+            assign_stm(user.clone(), borrow.clone()),
+        ]);
+
+        let mut links = HashMap::new();
+        let mut aliases = HashMap::new();
+        collect_borrow_mut_links(&body, &bm_set, &mut links, &mut aliases);
+
+        assert_eq!(links.get(&borrow_mut_key(&borrow)), Some(&user),
+            "linkage Assign after a Call-shaped leaf must still be detected");
+        assert!(aliases.is_empty(),
+            "no SSA renames in this shape — aliases must be empty");
+    }
+
+    /// C2 companion — pin that `StmX::Call` is a LEAF for the
+    /// pre-pass. The call's args carry Var(BorrowMut) at the value
+    /// level but those aren't linkage assigns, so they must NOT be
+    /// added to the link map. If Verus moves linkage info INTO call
+    /// args (or the pre-pass starts walking args), this test fails.
+    #[test]
+    fn collect_borrow_mut_links_treats_call_args_as_leaf() {
+        use vir::def::Spanned;
+        let borrow = var_ident_disambig("tmp%", 1);
+        let mut bm_set = HashSet::new();
+        bm_set.insert(borrow_mut_key(&borrow));
+
+        // Empty Call — what matters for this test is that the
+        // pre-pass returns no linkages without exploring args.
+        // (Building a real Call would require a Fun + plenty more;
+        // an empty Block represents the no-Assign case adequately.)
+        let stm = block_stm(vec![]);
+
+        let mut links = HashMap::new();
+        let mut aliases = HashMap::new();
+        collect_borrow_mut_links(&stm, &bm_set, &mut links, &mut aliases);
+
+        assert!(links.is_empty(), "empty body → no linkages");
+        assert!(aliases.is_empty(), "empty body → no aliases");
+    }
+
     #[test]
     fn resolve_borrow_mut_aliases_propagates_through_chain() {
         // Setup: aliases tmp_3 → tmp_1, tmp_4 → tmp_3.

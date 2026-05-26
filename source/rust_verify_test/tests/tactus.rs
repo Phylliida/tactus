@@ -10544,6 +10544,40 @@ test_verify_one_file_with_options! {
     } => Ok(())
 }
 
+// Negative regression for the 2026-05-26 soundness audit finding
+// (see DESIGN.md "Historical: new-mut-ref False-hypothesis silent
+// miscompile"). Pre-BorrowMut-elimination, the inlined callee
+// ensures was tested against an unrelated SSA `borrow_mut_*` local
+// rather than the user's `y`, so the equation `*y == *old(y) + 1`
+// never bound — Tactus would happily admit a WRONG caller ensures
+// like `*y == *old(y) + 999` because the inlined hypothesis was
+// vacuous on `y`.
+//
+// Post-fix the inlined ensures correctly mentions `y`, so this
+// (deliberately wrong) ensures must be rejected. If a future
+// regression reintroduces the vacuous-hypothesis path, this flips
+// to Ok — that's the canary.
+test_verify_one_file_with_options! {
+    #[test] test_new_mut_ref_wrong_ensures_is_caught_regression ["new-mut-ref"] => verus_code! {
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        #[verifier::tactus_auto]
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn caller(y: &mut u8)
+            requires *old(y) < 100
+            ensures *y == *old(y) + 999  // WRONG: +1 actual, +999 claimed
+        {
+            bump(y);
+        }
+    } => Err(_)
+}
+
 test_verify_one_file! {
     #[test] test_uninterp_impl_method_body_less_instance_probe verus_code! {
         trait Opaque {
