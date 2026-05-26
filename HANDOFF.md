@@ -8,11 +8,118 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**442 end-to-end tests + 1 coverage test + 228 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**438 end-to-end tests + 1 coverage test + 243 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** (Net 442/5 → 438/9 after the 2026-05-26 principled-translation work — 4 new-mut-ref tests regress as a SOUNDNESS audit finding; see session note below for context.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
 ### Recent session landings
+
+#### Current session (2026-05-26 — Idea 1 principled: storage-typ subst + soundness finding)
+
+**Headline numbers**: 442/5 → 438/9 (4 new-mut-ref tests regress, but as
+SOUNDNESS IMPROVEMENT — the regressed tests were passing via False
+hypotheses pre-fix). 228 → 243 lib tests (Option A kind-aware coerce
++ unit tests for the new paths).
+
+**Three landings building toward principled translation:**
+
+1. **`c8b44bd`** — Idea 4 / Option A: kind-aware `coerce_lexpr`. Bridge
+   via longest-common-suffix on wrap sequences. Peel non-matching outer
+   wraps + rewrap with target's outer wraps. Equal wraps short-circuit
+   no-op. Closes the dormant kind-mismatch case (MutRef → Ref at equal
+   depth). E2e baseline unchanged (442/5) — generalization was sound
+   but no test exercised the path.
+
+2. **`cbcbf05`** — 12 unit tests pinning the kind-aware paths (cross-
+   product of wrapper kinds + common-suffix preservation + 3-layer
+   disjoint).
+
+3. **`135c3f3`** — Idea 1 stable: render-time value substitution. Added
+   `RenderCtx::value_subst` and `lookup_subst(name, slot_typ)`. Both
+   renderers' Var/VarAt/VarLoc arms consult the map; ReadPlace+Local
+   arm too (new-mut-ref encoding goes through ReadPlace, not Var). The
+   `walk_call` builds value_subst from mut-arg post-state existentials
+   and threads via ctx. Net: 442/5 stable — same 5 failures as
+   pre-Idea-1, zero regressions. Architecturally substitutes at use
+   site with slot typ available.
+
+4. **`edd472c`** — Idea 1 principled: substituted value stays at
+   STORAGE typ (Verus's Lean-level wrapper typ, e.g. `Tactus.MutRef T`
+   for `&mut T`). Downstream `apply_ref_coercion_if_needed` bridges
+   storage → expr.typ via `structural_typ` (which now consults
+   `ctx.lookup_subst_typ`). Added `value_subst_pre` for pre-state
+   contexts. The `ExprX::Old(e)` arm swaps the active subst via
+   `RenderCtx::with_pre_state_subst()` — pre-state refs inside `Old`
+   resolve to caller's pre-call value rather than the post-state
+   existential.
+
+**The soundness finding** (load-bearing — pinning here for next
+session):
+
+The 4 new-mut-ref tests that regress (442/5 → 438/9):
+- `test_exec_call_mut_arg_new_mut_ref`
+- `test_exec_call_mut_arg_new_mut_ref_use_after`
+- `test_exec_call_two_mut_args_new_mut_ref`
+- `test_new_mut_ref_pre_post_substitution_probe`
+
+All were passing PRE-`edd472c` because the inlined ensures rendered
+with BOTH `*y` and `*old(y)` referring to the post-state existential
+(`_tactus_mut_post_1.deref`). The substituted hypothesis became
+`post = post + 1`, i.e. FALSE. With False as antecedent, the
+implication `(post = post + 1) → goal` is trivially True regardless
+of goal. **We could write `ensures *y == *old(y) + 999` and it would
+"verify."**
+
+Post-`edd472c` the inlined ensures correctly distinguishes pre/post:
+`post_state.deref = pre_state.deref + 1`. The goal `y = y_at_pre_tactus
++ 1` needs ACTUAL proof. But `y` in caller's local scope isn't bound
+to the post-state existential — the body's `y = MutRefFuture(tmp)`
+assignment renders as `let y := tmp` BEFORE the call's existential
+introduction in the WP order, so `y` captures pre-call `tmp`.
+
+**The remaining gap** — body-sequencing for `y = MutRefFuture(tmp)`:
+
+Verus's new-mut-ref SST has already collapsed `MutRefFuture` /
+`MutRefCurrent` wrappers — by the time Tactus sees the SST,
+`y = MutRefFuture(tmp)` is just `Assign(y, Var(tmp))`. The pre/post
+distinction lived in the SMT axiomatization that Tactus doesn't have.
+
+Empirical SST trace from this session (via debug eprintln at
+`StmX::Assign` handler):
+```
+ASSIGN_TRACE dest="y" rhs.x=Var(VarIdent("tmp%", VirTemp(1)))
+ASSIGN_TRACE dest="tmp%" rhs.x=Var(VarIdent("tmp%", VirTemp(1)))
+```
+
+The two assignments are `y = tmp%` and `tmp% = tmp%` (likely the
+pre-state snapshot + post-state forward-decl, both collapsed to plain
+Var refs). Tactus's renderer can't distinguish them.
+
+**Fix paths considered**:
+
+* **Pre-pass to detect Verus's BorrowMut + future-Assign pattern**:
+  walk the SST body collecting `(borrow_mut_local → user_local)` pairs;
+  drop the body's `Assign(user_local, Var(borrow_mut_local))` and have
+  walk_call's Phase 4 ALSO rebind user_local alongside the BorrowMut
+  local. Requires SST analysis to identify which Assigns are
+  "future-forward" vs ordinary.
+
+* **Reorder via Wp tree restructuring**: lookahead at SST build time
+  to defer matching assignments past the next Call. Brittle.
+
+* **Define `Tactus.MutRef.future` axiom in prelude + don't collapse
+  MutRefFuture**: keep the operator visible in Lean; Phase 4 emits the
+  defining axiom-like equation. Invasive to the AST → LExpr renderer.
+
+None implemented this session. Documented for future work — likely a
+day or two of focused work + careful testing.
+
+**Decision: keep `edd472c` (principled fix) despite 4-test regression.**
+The pre-fix state was unsound; the fix is architecturally correct.
+Future session implements the body-sequencing fix to close the
+regressions for real (not via vacuous truth).
+
+
 
 #### Prior sessions (preserved in git log)
 
