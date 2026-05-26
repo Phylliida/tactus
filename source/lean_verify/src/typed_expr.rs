@@ -217,9 +217,52 @@ mod tests {
         Arc::new(TypX::MutRef(inner))
     }
 
+    fn rc_typ(inner: Typ) -> Typ {
+        Arc::new(TypX::Decorate(TypDecoration::Rc, None, inner))
+    }
+
+    fn arc_typ(inner: Typ) -> Typ {
+        Arc::new(TypX::Decorate(TypDecoration::Arc, None, inner))
+    }
+
     /// Did `expr` end up as `base.deref` (one deref chain)?
     fn is_single_deref(expr: &Expr) -> bool {
         matches!(&expr.node, ExprNode::FieldProj { field, .. } if field == "deref")
+    }
+
+    /// Count consecutive `.deref` projections wrapping `expr`. Returns
+    /// the count and the base (the inner-most non-deref expression).
+    fn count_derefs(expr: &Expr) -> (usize, &Expr) {
+        let mut n = 0;
+        let mut cur = expr;
+        while let ExprNode::FieldProj { expr: inner, field } = &cur.node {
+            if field != "deref" {
+                break;
+            }
+            n += 1;
+            cur = inner;
+        }
+        (n, cur)
+    }
+
+    /// Peel `<Wrapper>.mk` apps off `expr` from the outside in. Returns
+    /// the wrapper names (outermost-first) and the inner-most argument.
+    /// E.g. `Ref.mk (Box.mk x)` → (["Tactus.Ref", "Tactus.Box"], x).
+    fn collect_mk_wraps(expr: &Expr) -> (Vec<String>, &Expr) {
+        let mut wraps = Vec::new();
+        let mut cur = expr;
+        loop {
+            let ExprNode::App { head, args } = &cur.node else { break };
+            let ExprNode::Var(name) = &head.node else { break };
+            let name_str = name.as_str();
+            if !name_str.ends_with(".mk") || args.len() != 1 {
+                break;
+            }
+            let wrapper = name_str.trim_end_matches(".mk").to_string();
+            wraps.push(wrapper);
+            cur = &args[0];
+        }
+        (wraps, cur)
     }
 
     /// Did `expr` end up as `Wrapper.mk arg` (one wrap)?
@@ -408,5 +451,193 @@ mod tests {
         };
         assert_eq!(head_name.as_str(), "Tactus.Ref.mk");
         assert!(is_single_deref(&args[0]));
+    }
+
+    // ── Targeted coverage for the kind-aware coercion path. ─────────
+    // These tests pin behaviour the depth-only version got wrong;
+    // they exercise the full cross-product of wrapper-kind pairs
+    // we emit (Ref, MutRef, Box, Rc, Arc) plus multi-layer + common
+    // suffix preservation.
+
+    #[test]
+    fn into_slot_no_coercion_matching_double_wrappers() {
+        // value : Tactus.Box (Tactus.Ref Int); slot : same.
+        // Both wraps match exactly → no-op even at depth 2.
+        let typed = TypedExpr::var(
+            LeanName::synthetic("v"),
+            box_typ(ref_typ(int_typ())),
+        );
+        let result = typed.into_slot(&box_typ(ref_typ(int_typ())));
+        // Bare Var — no FieldProj, no App.
+        assert!(matches!(&result.node, ExprNode::Var(_)),
+            "expected bare Var (no coercion), got {:?}", result.node);
+    }
+
+    #[test]
+    fn into_slot_kind_mismatch_outer_only_preserves_inner() {
+        // value : Tactus.Box (Tactus.Ref Int); slot : Tactus.Rc (Tactus.Ref Int).
+        // Common inner suffix [Ref] — only outer Box/Rc differs.
+        // Expect: peel one (outer Box), wrap one (outer Rc), preserve inner Ref.
+        // Result: `Tactus.Rc.mk value.deref`. Critically NOT `Tactus.Rc.mk (Tactus.Ref.mk value.deref.deref)`.
+        let typed = TypedExpr::var(
+            LeanName::synthetic("v"),
+            box_typ(ref_typ(int_typ())),
+        );
+        let result = typed.into_slot(&rc_typ(ref_typ(int_typ())));
+        let (wraps, inner) = collect_mk_wraps(&result);
+        assert_eq!(wraps, vec!["Tactus.Rc"], "expected one outer Rc wrap only");
+        let (deref_count, _) = count_derefs(inner);
+        assert_eq!(deref_count, 1, "expected exactly one deref (outer Box peeled)");
+    }
+
+    #[test]
+    fn into_slot_rc_to_arc_at_depth_one() {
+        // value : Tactus.Rc Int; slot : Tactus.Arc Int.
+        // Kind mismatch, disjoint at depth 1. Peel one, wrap one.
+        let typed = TypedExpr::var(LeanName::synthetic("r"), rc_typ(int_typ()));
+        let result = typed.into_slot(&arc_typ(int_typ()));
+        let (wraps, inner) = collect_mk_wraps(&result);
+        assert_eq!(wraps, vec!["Tactus.Arc"]);
+        assert!(is_single_deref(inner));
+    }
+
+    #[test]
+    fn into_slot_mut_ref_to_box_at_depth_one() {
+        // value : Tactus.MutRef Int; slot : Tactus.Box Int.
+        // Different-kind bridge through a non-Ref wrapper pair.
+        let typed = TypedExpr::var(LeanName::synthetic("m"), mut_ref_typ(int_typ()));
+        let result = typed.into_slot(&box_typ(int_typ()));
+        let (wraps, inner) = collect_mk_wraps(&result);
+        assert_eq!(wraps, vec!["Tactus.Box"]);
+        assert!(is_single_deref(inner));
+    }
+
+    #[test]
+    fn into_slot_three_layer_preserve_two_inner() {
+        // value : Tactus.Box (Tactus.Rc (Tactus.Ref Int));
+        // slot  : Tactus.Arc (Tactus.Rc (Tactus.Ref Int)).
+        // Common inner suffix [Rc, Ref] (length 2). Only outermost differs.
+        // Peel 1 (Box), wrap 1 (Arc). Inner two wraps untouched.
+        let typed = TypedExpr::var(
+            LeanName::synthetic("v"),
+            box_typ(rc_typ(ref_typ(int_typ()))),
+        );
+        let result = typed.into_slot(&arc_typ(rc_typ(ref_typ(int_typ()))));
+        let (wraps, inner) = collect_mk_wraps(&result);
+        assert_eq!(wraps, vec!["Tactus.Arc"]);
+        let (deref_count, _) = count_derefs(inner);
+        assert_eq!(deref_count, 1, "expected single deref (one outer peel)");
+    }
+
+    #[test]
+    fn into_slot_three_layer_fully_disjoint() {
+        // value : Tactus.Box (Tactus.Rc (Tactus.Ref Int));
+        // slot  : Tactus.Ref (Tactus.Arc (Tactus.MutRef Int)).
+        // No common suffix. Full peel (3) + full wrap (3).
+        let typed = TypedExpr::var(
+            LeanName::synthetic("v"),
+            box_typ(rc_typ(ref_typ(int_typ()))),
+        );
+        let result = typed.into_slot(&ref_typ(arc_typ(mut_ref_typ(int_typ()))));
+        let (wraps, inner) = collect_mk_wraps(&result);
+        assert_eq!(wraps, vec!["Tactus.Ref", "Tactus.Arc", "Tactus.MutRef"],
+            "expected outer→inner wraps [Ref, Arc, MutRef]");
+        let (deref_count, _) = count_derefs(inner);
+        assert_eq!(deref_count, 3, "expected three derefs (full peel)");
+    }
+
+    #[test]
+    fn into_slot_growing_depth_preserves_existing_inner() {
+        // value : Tactus.Ref Int; slot : Tactus.Box (Tactus.Ref Int).
+        // Common inner suffix [Ref]. Wrap outer Box only.
+        let typed = TypedExpr::var(LeanName::synthetic("r"), ref_typ(int_typ()));
+        let result = typed.into_slot(&box_typ(ref_typ(int_typ())));
+        let (wraps, inner) = collect_mk_wraps(&result);
+        assert_eq!(wraps, vec!["Tactus.Box"]);
+        // Inner is just `r` — no derefs, no further wraps.
+        assert!(matches!(&inner.node, ExprNode::Var(_)),
+            "expected bare Var inner, got {:?}", inner.node);
+    }
+
+    #[test]
+    fn into_slot_shrinking_depth_preserves_existing_inner() {
+        // value : Tactus.Box (Tactus.Ref Int); slot : Tactus.Ref Int.
+        // Common inner suffix [Ref]. Peel outer Box only.
+        let typed = TypedExpr::var(
+            LeanName::synthetic("v"),
+            box_typ(ref_typ(int_typ())),
+        );
+        let result = typed.into_slot(&ref_typ(int_typ()));
+        // Result should be bare `.deref` (no wrap chain).
+        assert!(is_single_deref(&result),
+            "expected single deref, got {:?}", result.node);
+    }
+
+    #[test]
+    fn into_slot_no_coercion_when_wraps_match_with_different_inner_typs() {
+        // value : Tactus.Ref Int; slot : Tactus.Ref Bool.
+        // Wrappers match exactly; inner types differ but we don't
+        // model inner. Returns value unchanged — Lean's type checker
+        // is responsible for the inner-mismatch error at use site.
+        let bool_typ = Arc::new(TypX::Bool);
+        let typed = TypedExpr::var(LeanName::synthetic("r"), ref_typ(int_typ()));
+        let result = typed.into_slot(&ref_typ(bool_typ));
+        assert!(matches!(&result.node, ExprNode::Var(_)),
+            "expected bare Var (no coercion), got {:?}", result.node);
+    }
+
+    #[test]
+    fn coerce_to_updates_typ_after_kind_bridge() {
+        // After coerce_to with kind mismatch, the resulting TypedExpr's
+        // typ field reflects the target — important because callers may
+        // chain further compositions that rely on the new typ.
+        let typed = TypedExpr::var(LeanName::synthetic("m"), mut_ref_typ(int_typ()));
+        let target = ref_typ(int_typ());
+        let coerced = typed.coerce_to(&target);
+        // Typ field updated to Ref.
+        let TypX::Decorate(deco, _, _) = &*coerced.typ else {
+            panic!("expected Decorate typ, got {:?}", coerced.typ);
+        };
+        assert!(matches!(deco, TypDecoration::Ref));
+        // Inner expr has peel + wrap structure.
+        let (wraps, inner) = collect_mk_wraps(&coerced.inner);
+        assert_eq!(wraps, vec!["Tactus.Ref"]);
+        assert!(is_single_deref(inner));
+    }
+
+    #[test]
+    fn apply_handles_kind_mismatch_in_args() {
+        // head : opaque function head; apply with one arg whose typ
+        // mismatches the param typ via wrapper KIND (not just depth).
+        let head = TypedExpr::var(LeanName::synthetic("f"), int_typ());
+        let arg = TypedExpr::var(LeanName::synthetic("m"), mut_ref_typ(int_typ()));
+        let param_typs = vec![ref_typ(int_typ())];
+        let result = head.apply(vec![arg], &param_typs, int_typ());
+        let ExprNode::App { args, .. } = &result.inner.node else {
+            panic!("expected App, got {:?}", result.inner.node);
+        };
+        // The arg should be coerced: MutRef → Ref via peel + wrap.
+        let (wraps, inner) = collect_mk_wraps(&args[0]);
+        assert_eq!(wraps, vec!["Tactus.Ref"]);
+        assert!(is_single_deref(inner));
+    }
+
+    #[test]
+    fn wrap_chain_order_outermost_last_applied() {
+        // Regression guard for apply_wrap_chain's reverse-iteration
+        // detail: wraps slice is outermost-first, but applied
+        // innermost-first to build the right structure.
+        // value : Int; slot : Tactus.Box (Tactus.Ref Int).
+        // Expected: `Tactus.Box.mk (Tactus.Ref.mk val)` —
+        // Box outermost (last applied = outermost in the result tree).
+        let typed = TypedExpr::var(LeanName::synthetic("x"), int_typ());
+        let result = typed.into_slot(&box_typ(ref_typ(int_typ())));
+        let (wraps, inner) = collect_mk_wraps(&result);
+        assert_eq!(wraps, vec!["Tactus.Box", "Tactus.Ref"],
+            "expected outer→inner [Box, Ref]");
+        // No derefs (depth-0 to depth-2 → pure wrap chain).
+        let (deref_count, base) = count_derefs(inner);
+        assert_eq!(deref_count, 0);
+        assert!(matches!(&base.node, ExprNode::Var(_)));
     }
 }
