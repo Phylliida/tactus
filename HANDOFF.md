@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**438 end-to-end tests + 1 coverage test + 243 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** (Net 442/5 → 438/9 after the 2026-05-26 principled-translation work — 4 new-mut-ref tests regress as a SOUNDNESS audit finding; see session note below for context.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**442 end-to-end tests + 1 coverage test + 243 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** (Same numerical baseline as pre-Idea-1 session, but with a real architectural improvement and a fixed soundness audit finding — 4 new-mut-ref tests previously passing via vacuous-truth hypotheses now pass via correct encoding. See 2026-05-26 session notes for the BorrowMut-elimination work.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -118,6 +118,66 @@ day or two of focused work + careful testing.
 The pre-fix state was unsound; the fix is architecturally correct.
 Future session implements the body-sequencing fix to close the
 regressions for real (not via vacuous truth).
+
+**Update (same session)**: principled fix LANDED via BorrowMut
+elimination. Net 442/5 — same numerical baseline, all passes sound.
+
+The principled answer to "why are we patching around Verus's encoding":
+we shouldn't. Verus's BorrowMut indirection (`let tmp = BorrowMut(y);
+y = MutRefFuture(tmp); bump(tmp);`) is SMT-bookkeeping. Lean's
+binding model handles direct mutation natively — the indirection is
+unneeded. Eliminate it at the SST pre-pass and the body-sequencing
+issue goes away because there's no longer a body assignment to
+sequence.
+
+Two commits:
+
+`ffcf5f1` — initial BorrowMut elimination pre-pass:
+* `collect_borrow_mut_links(stm, borrow_mut_locals)` walks the SST
+  body finding `Assign(user_local, Var(borrow_mut_local))` linkage
+  patterns. Returns `HashMap<sanitized_borrow_mut_name, user_local
+  VarIdent>`.
+* `is_borrow_mut_linkage_assign(dest, rhs, ...)` — detection predicate
+  the `StmX::Assign` handler uses to drop linkage Assigns.
+* `WpCtx.borrow_mut_links` carries the map; threaded via
+  `ctx: &'a WpCtx<'a>` (lifetime extended from anonymous).
+* `extract_mut_target` redirects the call's mut-target from the
+  BorrowMut local to the user-local when a linkage exists. Phase 4
+  then rebinds the user-local to the post-state existential —
+  body's linkage Assign was dropped, so no double substitution.
+
+Tests at this stage: 441/6 (recovers 3 of 4 regressions). Remaining
+failure (`test_exec_call_two_mut_args_new_mut_ref`) surfaces a
+disambiguator collision — two BorrowMut locals with the same base
+name "tmp%" collapse under `sanitize`.
+
+`11e164a` — extensions for multi-mut-arg + SSA chains:
+* Linkage map keys switched to `LeanName::from_var_ident` (disambig-
+  aware) so `tmp__1` and `tmp__2` stay distinct.
+* `borrow_mut_only` filter restricted to `LocalDeclKind::BorrowMut |
+  StmCallArg { .. }` — the SMT-bookkeeping intermediates. Fn params
+  with `MutRef` typ are NOT included (they're the targets we link
+  TO, not borrow intermediates).
+* `collect_borrow_mut_links` now also records aliases (Assign
+  between two borrow-equivalent locals). `resolve_borrow_mut_aliases`
+  folds aliases into links via fixed-point propagation so SSA-renamed
+  StmCallArg locals resolve to the same user-local as their
+  BorrowMut origin.
+* Drop pattern narrowed: only forward-forward linkages get dropped.
+  SSA-rename Assigns are KEPT because the inlined ensures references
+  the SSA-renamed local (as the pre-state of the call arg) and the
+  binding must be present at theorem level.
+
+The pattern matches Tactus's existing normalization passes
+(#94 VarAt rewrite, #95 new-mut-ref shape normalization,
+BUG-as-nat-cast Int→Nat insertion). Documented as a candidate for
+future infrastructure: `RewritePipeline` type that composes these.
+
+Final state: 442/5 with all passes sound. Remaining 5 failures are
+real semantic blockers (Cluster A's 2 + Cluster B's 3) — same set
+as pre-Idea-1, but the soundness audit revealed they were never
+sources of false-positives; they were always genuine semantic
+gaps.
 
 
 
