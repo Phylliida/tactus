@@ -82,8 +82,9 @@ pub type RenderValueSubst<'a> = HashMap<LeanName, (LExpr, Typ)>;
 
 /// Render context: typing info available to expression renderers.
 ///
-/// * `fn_map` — function lookup for class-method-call param-typ
-///   inspection (`class_method_param_typs`).
+/// * `fn_map` — function lookup for callee param-typ inspection
+///   (`fn_param_typs`). Used at every call rendering site to bridge
+///   args to the callee's expected param typs.
 /// * `value_subst` — typed substitution map applied during render at
 ///   value sites (Var, VarAt, ReadPlace+Local). Stores values at the
 ///   callee local's **Lean-level storage typ** (e.g., `Tactus.MutRef
@@ -162,20 +163,20 @@ impl<'a> RenderCtx<'a> {
         }
     }
 
-    /// Look up a class-method decl's declared param typs. Returns
-    /// `None` when the Fun isn't in fn_map (cross-crate, or no fn_map
-    /// in this RenderCtx). Caller falls back to no-coerce rendering
-    /// when `None` — gracefully degrades for the cross-crate case
-    /// rather than panicking.
+    /// Look up a callee's declared param typs. Returns `None` when the
+    /// Fun isn't in fn_map (cross-crate, or no fn_map in this RenderCtx).
+    /// Caller falls back to no-coerce rendering when `None` — gracefully
+    /// degrades for the cross-crate case rather than panicking.
     ///
-    /// The lookup goes to the trait method DECL's params (which is
-    /// what `CallFun::Fun(fun, Some(_))` references in SST and what
-    /// `CallTarget::Fun(DynamicResolved, fun, ...)` references in
-    /// VIR-AST). Trait dispatch happens at the decl's typing; the
-    /// resolved impl might have textually-different param names but
-    /// positionally-aligned typs — the decl's typs are what the class
-    /// signature uses.
-    pub fn class_method_param_typs(&self, fun: &Fun) -> Option<Vec<Typ>> {
+    /// Works for ALL fn calls (class methods, inherent methods, regular
+    /// fns), not just trait dispatch — the lookup is structurally the
+    /// same. The renderer's call-site bridge applies `coerce_lexpr` from
+    /// each arg's rendered typ to the corresponding param typ from this
+    /// list, codifying the auto-borrow semantic that Rust applies
+    /// implicitly. For trait-resolved calls the decl's typs are what
+    /// the class signature uses (the resolved impl might have textually-
+    /// different param names but positionally-aligned typs).
+    pub fn fn_param_typs(&self, fun: &Fun) -> Option<Vec<Typ>> {
         let fn_map = self.fn_map?;
         let func = fn_map.get(fun)?;
         Some(func.params.iter().map(|p| p.x.typ.clone()).collect())
