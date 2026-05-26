@@ -773,15 +773,56 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // `mut_param_names` — fn-level &mut params and BorrowMut locals
     // both live in mut_param_names but only the latter have the
     // forward-forward linkage shape we want to detect.
+    // Keys are LeanName-style (disambiguator-aware) so multiple
+    // BorrowMut locals sharing a base name (`tmp%` with `VirTemp(0)`
+    // / `VirTemp(1)` for `bump_both(&mut x, &mut y)`) stay distinct.
+    // The existing `mut_ref_locals` set uses bare `sanitize(...)`
+    // — fine for the single-mut-arg case but collapses multi-arg.
+    // We use a separate disambig-aware set here so the linkage map
+    // doesn't lose entries to key collisions.
+    // Include every local declared with `MutRef T` typ — both
+    // `LocalDeclKind::BorrowMut` (Verus's synthetic for `&mut y`
+    // setup) and `LocalDeclKind::StmCallArg` (the call-argument
+    // temporary that holds the borrow when the call fires). Same
+    // typ check as `is_mut_ref_typ` uses elsewhere.
+    //
+    // We need StmCallArgs too because Verus's SST has:
+    //   Assign(tmp_call_arg, Var(tmp_borrow_mut))  -- alias / copy
+    //   bump_both(tmp_call_arg, ...)               -- call uses StmCallArg
+    //   Assign(user_local, Var(tmp_borrow_mut))    -- forward-forward linkage
+    //
+    // The alias `tmp_call_arg = tmp_borrow_mut` is what `aliases`
+    // captures (both ends in `borrow_mut_only`). The linkage
+    // `Assign(user_local, ...)` is what `links` captures. After
+    // `resolve_borrow_mut_aliases`, tmp_call_arg resolves to the
+    // same user_local that tmp_borrow_mut links to.
+    // `LocalDeclKind` filter: include only Verus-internal mut-ref
+    // intermediates that participate in the BorrowMut indirection
+    // — `BorrowMut` (the synthetic for `&mut y` setup) and
+    // `StmCallArg` (the call-argument temporary that holds the
+    // borrow at the call site). Fn params with MutRef typ are NOT
+    // included: they're the user-level locals we LINK TO; treating
+    // them as part of the borrow-mut-chain would misclassify the
+    // forward-forward `Assign(y, Var(tmp_borrow_mut))` as an alias.
     let borrow_mut_only: HashSet<String> = check.local_decls.iter()
-        .filter(|d| matches!(d.kind, LocalDeclKind::BorrowMut))
-        .map(|d| sanitize(&d.ident.0))
+        .filter(|d| matches!(d.kind,
+            LocalDeclKind::BorrowMut
+            | LocalDeclKind::StmCallArg { .. }
+        ))
+        .filter(|d| crate::expr_shared::is_mut_ref_typ(&d.typ, false))
+        .map(|d| crate::lean_name::LeanName::from_var_ident(&d.ident).as_str().to_string())
         .collect();
     let mut borrow_mut_links: HashMap<String, VarIdent> = HashMap::new();
+    let mut borrow_mut_aliases: HashMap<String, String> = HashMap::new();
     if !borrow_mut_only.is_empty() {
-        collect_borrow_mut_links(&rewritten_body, &borrow_mut_only, &mut borrow_mut_links);
+        collect_borrow_mut_links(
+            &rewritten_body,
+            &borrow_mut_only,
+            &mut borrow_mut_links,
+            &mut borrow_mut_aliases,
+        );
+        resolve_borrow_mut_aliases(&mut borrow_mut_links, &borrow_mut_aliases);
     }
-
     // Insert `Clip { range: Nat }` at Call sites where args render as
     // Lean Int but params render as Lean Nat (BUG-as-nat-cast.md).
     // Verus's cast lowering drops `U(_)/USize → Nat` casts as no-ops;
@@ -2522,60 +2563,114 @@ fn rewrite_mut_ref_in_stm(
 /// peels (through transparent wrappers) to a `Var` / `VarLoc` whose
 /// name IS in `borrow_mut_locals`. Direct linkage — no SMT-specific
 /// shape recognition needed.
+/// Pre-pass output for BorrowMut elimination. `links` maps each
+/// BorrowMut-local key (LeanName-style, disambiguator-aware) to the
+/// user-local VarIdent it bridges. `aliases` maps SSA-renamed
+/// BorrowMut keys to their original BorrowMut key, so a call site's
+/// `Var(tmp__3)` (a renamed SSA version of `tmp__1`) can resolve to
+/// the same user_local that `tmp__1` links to.
+///
+/// After `collect_borrow_mut_links`, `resolve_borrow_mut_aliases`
+/// folds aliases into `links` so every BorrowMut local (including
+/// SSA-renamed versions) maps directly to its user-local.
 fn collect_borrow_mut_links(
     stm: &Stm,
     borrow_mut_locals: &HashSet<String>,
     links: &mut HashMap<String, VarIdent>,
+    aliases: &mut HashMap<String, String>,
 ) {
+    // Keys derive via LeanName::from_var_ident — see the doc on
+    // `borrow_mut_only` for why disambiguator-aware keys matter
+    // (multi-mut-arg calls share basenames between BorrowMut locals).
+    let key = |ident: &VarIdent| -> String {
+        crate::lean_name::LeanName::from_var_ident(ident).as_str().to_string()
+    };
     match &stm.x {
         StmX::Assign { lhs: Dest { dest, is_init: _ }, rhs } => {
             let Some(dest_var) = extract_simple_var_ident(dest) else { return };
-            // dest_var must be a non-borrow-mut local — we're linking
-            // a user local TO a borrow-mut. The reverse direction
-            // (`tmp% = <something>`) isn't a forward-forward linkage.
-            if borrow_mut_locals.contains(&sanitize(&dest_var.0)) {
-                return;
-            }
+            let dest_key = key(dest_var);
             let rhs_peeled = peel_transparent(rhs);
             let rhs_var = match &rhs_peeled.x {
                 ExpX::Var(v) | ExpX::VarLoc(v) => v,
                 _ => return,
             };
-            let rhs_name = sanitize(&rhs_var.0);
-            if borrow_mut_locals.contains(&rhs_name) {
-                // Record the linkage; the latest detected linkage wins
-                // if Verus emits multiple (shouldn't, in practice — one
-                // BorrowMut local per call site).
-                links.insert(rhs_name, dest_var.clone());
+            let rhs_key = key(rhs_var);
+            let dest_is_bm = borrow_mut_locals.contains(&dest_key);
+            let rhs_is_bm = borrow_mut_locals.contains(&rhs_key);
+            match (dest_is_bm, rhs_is_bm) {
+                // Linkage: Assign(user_local, Var(borrow_mut)) —
+                // the forward-forward.
+                (false, true) => {
+                    links.insert(rhs_key, dest_var.clone());
+                }
+                // SSA rename: Assign(borrow_mut_X, Var(borrow_mut_Y))
+                // — both are BorrowMut locals (or sanitized versions
+                // of the same). After SSA propagation, X and Y resolve
+                // to the same user-local.
+                (true, true) => {
+                    aliases.insert(dest_key, rhs_key);
+                }
+                _ => {}
             }
         }
         StmX::Block(stmts) => {
             for s in stmts.iter() {
-                collect_borrow_mut_links(s, borrow_mut_locals, links);
+                collect_borrow_mut_links(s, borrow_mut_locals, links, aliases);
             }
         }
         StmX::If(_, then_branch, else_branch) => {
-            collect_borrow_mut_links(then_branch, borrow_mut_locals, links);
+            collect_borrow_mut_links(then_branch, borrow_mut_locals, links, aliases);
             if let Some(e) = else_branch {
-                collect_borrow_mut_links(e, borrow_mut_locals, links);
+                collect_borrow_mut_links(e, borrow_mut_locals, links, aliases);
             }
         }
         StmX::Loop { body, .. } => {
-            collect_borrow_mut_links(body, borrow_mut_locals, links);
+            collect_borrow_mut_links(body, borrow_mut_locals, links, aliases);
         }
         StmX::DeadEnd(s) | StmX::OpenInvariant(s) => {
-            collect_borrow_mut_links(s, borrow_mut_locals, links);
+            collect_borrow_mut_links(s, borrow_mut_locals, links, aliases);
         }
         StmX::AssertQuery { body, .. } => {
-            collect_borrow_mut_links(body, borrow_mut_locals, links);
+            collect_borrow_mut_links(body, borrow_mut_locals, links, aliases);
         }
         StmX::ClosureInner { body, .. } => {
-            collect_borrow_mut_links(body, borrow_mut_locals, links);
+            collect_borrow_mut_links(body, borrow_mut_locals, links, aliases);
         }
         // Leaf statements without nested Stm: Call, Assert(*),
         // AssertCompute, Assume, Fuel, RevealString, Return,
         // BreakOrContinue, Air.
         _ => {}
+    }
+}
+
+/// Fold SSA aliases into the linkage map. For each `alias_X → Y`
+/// alias, resolve Y's user-local (possibly through more aliases) and
+/// extend `links` so `alias_X` also maps to that user-local.
+///
+/// Bounded by `aliases.len()` rounds — each round either resolves at
+/// least one alias or no progress is made (then we stop). Simple
+/// fixed-point.
+fn resolve_borrow_mut_aliases(
+    links: &mut HashMap<String, VarIdent>,
+    aliases: &HashMap<String, String>,
+) {
+    for (alias_key, original_key) in aliases.iter() {
+        // Follow the alias chain to find the original BorrowMut local
+        // that has a direct linkage entry.
+        let mut cursor = original_key;
+        // Bounded by aliases.len() to avoid infinite loops on
+        // hypothetical cycles (shouldn't happen in well-formed SSA).
+        for _ in 0..=aliases.len() {
+            if links.contains_key(cursor) {
+                let user_local = links[cursor].clone();
+                links.insert(alias_key.clone(), user_local);
+                break;
+            }
+            match aliases.get(cursor) {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
     }
 }
 
@@ -2590,18 +2685,33 @@ fn collect_borrow_mut_links(
 fn is_borrow_mut_linkage_assign(
     dest: &Exp,
     rhs: &Exp,
-    borrow_mut_locals: &HashSet<String>,
+    borrow_mut_links: &HashMap<String, VarIdent>,
 ) -> bool {
+    let key = |ident: &VarIdent| -> String {
+        crate::lean_name::LeanName::from_var_ident(ident).as_str().to_string()
+    };
     let Some(dest_var) = extract_simple_var_ident(dest) else { return false };
-    if borrow_mut_locals.contains(&sanitize(&dest_var.0)) {
-        return false;
-    }
     let rhs_peeled = peel_transparent(rhs);
     let rhs_var = match &rhs_peeled.x {
         ExpX::Var(v) | ExpX::VarLoc(v) => v,
         _ => return false,
     };
-    borrow_mut_locals.contains(&sanitize(&rhs_var.0))
+    let dest_key = key(dest_var);
+    let rhs_key = key(rhs_var);
+    let dest_is_bm = borrow_mut_links.contains_key(&dest_key);
+    let rhs_is_bm = borrow_mut_links.contains_key(&rhs_key);
+    // Only drop the forward-forward linkage: `Assign(user_local,
+    // Var(borrow_mut))` — dest is a non-BM user-local, rhs is a BM
+    // local. Phase 4 of the matching call rebinds the user-local
+    // directly to the post-state existential. Dropping the body's
+    // let here avoids the let frame capturing the pre-call value
+    // of the BorrowMut local.
+    //
+    // SSA renames `Assign(borrow_mut_X, Var(borrow_mut_Y))` stay —
+    // the SSA-renamed local IS referenced in the inlined ensures
+    // hypothesis (as the pre-state value of the call arg), so we
+    // need the binding to be present at theorem level.
+    rhs_is_bm && !dest_is_bm
 }
 
 // ── Nat coercion insertion (BUG-as-nat-cast.md) ────────────────────────
@@ -4438,7 +4548,7 @@ fn build_wp<'a>(
             // existential directly — emitting the let frame here would
             // capture the pre-call value of borrow_mut_local. See
             // `collect_borrow_mut_links` for the linkage discovery.
-            if is_borrow_mut_linkage_assign(dest, rhs, &ctx.mut_ref_locals) {
+            if is_borrow_mut_linkage_assign(dest, rhs, &ctx.borrow_mut_links) {
                 return Ok(after);
             }
             let Some(ident) = extract_simple_var_ident(dest) else {
@@ -5110,9 +5220,17 @@ fn extract_mut_target<'a>(
     // existential, and the body's linkage Assign is dropped — see
     // `collect_borrow_mut_links` / `is_borrow_mut_linkage_assign`.
     if let ExpX::Var(ident) = &e.x {
-        let name = sanitize(&ident.0);
-        if mut_ref_locals.contains(&name) {
-            if let Some(user_local) = borrow_mut_links.get(&name) {
+        let san_name = sanitize(&ident.0);
+        if mut_ref_locals.contains(&san_name) {
+            // Linkage lookup uses disambig-aware key (matches what
+            // `collect_borrow_mut_links` inserts) so multi-mut-arg
+            // calls with same-base-name BorrowMut locals stay
+            // distinct. SSA-renamed BorrowMut locals also resolve via
+            // `resolve_borrow_mut_aliases`.
+            let disambig_key = crate::lean_name::LeanName::from_var_ident(ident)
+                .as_str()
+                .to_string();
+            if let Some(user_local) = borrow_mut_links.get(&disambig_key) {
                 return Some(MutTargetRaw::Var(user_local));
             }
             return Some(MutTargetRaw::Var(ident));
