@@ -184,6 +184,24 @@ fn structural_typ(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::Re
             if let Some(t) = inlining_storage_typ {
                 return Some(t);
             }
+            // Inlining context: when value_subst is configured (i.e.,
+            // we're rendering a callee's spec at a call site), the
+            // outer ReadPlace's bridge needs to fire even for non-
+            // Local Place shapes (DerefMut, Field, Temporary, etc.).
+            // Returning `Some(p.typ.clone())` enables apply_ref_coercion
+            // to bridge from the inner-rendered value typ (p.typ — what
+            // the inner substituted Var's bridge brought it to) up to
+            // the outer expr.typ (e.g., auto-borrow Ref T).
+            //
+            // For nested-Local shapes (DerefMut(Local(h))), the inner
+            // value_subst hit happens inside place_to_expr; the outer
+            // ReadPlace's bridge then wraps with Ref.mk to satisfy
+            // expr.typ. Without this branch, the outer wrap was missing
+            // and Lean rejected with a type mismatch (the
+            // `claimed-typ-lies` case for nested Places).
+            if ctx.value_subst.is_some() {
+                return Some(p.typ.clone());
+            }
             if READPLACE_LIFT_ENABLED.with(|cell| cell.get()) {
                 match &p.x {
                     PlaceX::Local(v) => binders.get(v).cloned().or_else(|| Some(p.typ.clone())),
@@ -615,6 +633,11 @@ fn expr_to_node(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::Rend
             // `apply_ref_coercion_if_needed` bridges to expr.typ via
             // `structural_typ` which reports the storage typ from
             // `ctx.lookup_subst_typ` for this AST shape.
+            //
+            // For nested Place shapes (DerefMut/ModeUnwrap/Field/etc.
+            // wrapping Local), the substitution happens inside
+            // `place_to_expr`'s Local arm — same hit, same value,
+            // different entry point.
             if let PlaceX::Local(ident) = &place.x {
                 let lean_name = crate::lean_name::LeanName::from_var_ident(ident);
                 if let Some(value) = ctx.lookup_subst_raw(&lean_name) {
@@ -1015,7 +1038,21 @@ pub(crate) fn pattern_to_ast(pat: &PatternX) -> LPattern {
 
 fn place_to_expr(place: &PlaceX, binders: &BinderCtx, ctx: &crate::expr_shared::RenderCtx) -> LExpr {
     LExpr::new(match place {
-        PlaceX::Local(ident) => ExprNode::Var(crate::lean_name::LeanName::from_var_ident(ident)),
+        PlaceX::Local(ident) => {
+            // Render-time substitution: same as the ExprX::Var arm.
+            // Reached via place_to_expr when Local is nested inside
+            // DerefMut/ModeUnwrap/Field/etc. — the ReadPlace+Local
+            // early-return only handles the outer-Local case.
+            // Without this, `*h` (ReadPlace(DerefMut(Local(h)))) renders
+            // as bare `h` even when value_subst has an entry, because
+            // DerefMut recurses through place_to_expr which previously
+            // skipped the substitution.
+            let lean_name = crate::lean_name::LeanName::from_var_ident(ident);
+            if let Some(value) = ctx.lookup_subst_raw(&lean_name) {
+                return value;
+            }
+            ExprNode::Var(lean_name)
+        }
         PlaceX::Field(field_opr, base) => {
             // U2: fields belong to the inner type, not the wrapper —
             // `render_place_with_derefs` applies the .deref chain
