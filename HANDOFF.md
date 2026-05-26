@@ -122,6 +122,61 @@ regressions for real (not via vacuous truth).
 **Update (same session)**: principled fix LANDED via BorrowMut
 elimination. Net 442/5 — same numerical baseline, all passes sound.
 
+**Code review pending (this session, pre-merge)** — 10-lens pass on
+today's diff surfaced findings to address before considering today's
+work shipped. Catalogued so they survive session compaction:
+
+* **Fix-now (small cleanups)**:
+  * **F1** — `LocalDeclKind::StmCallArg { .. }` filter uses `..` which
+    silently passes through future Verus-side field additions. Switch
+    to explicit-by-name destructure (`StmCallArg { native: _ }`) per
+    DESIGN.md upstream-robustness pattern.
+  * **F4** — Multi-linkage `links.insert(rhs_key, dest_var.clone())`
+    silently overrides on duplicate keys. Document the
+    single-linkage invariant or assert (defensive).
+  * **A2** — Extract `borrow_mut_key(ident)` helper. The disambig-key
+    derivation `LeanName::from_var_ident(ident).as_str().to_string()`
+    appears in 4 sites (`borrow_mut_only` filter,
+    `collect_borrow_mut_links`'s `key` closure, `is_borrow_mut_linkage_assign`'s
+    `key` closure, `extract_mut_target`'s redirect).
+
+* **Fix-soon (next session)**:
+  * **F2** — `collect_borrow_mut_links`'s `_ => {}` catch-all silently
+    drops linkages in unmatched StmX variants. Either enumerate the
+    non-nesting leaves explicitly OR add a shape-drift unit test.
+  * **C1** — No unit tests for `RenderCtx::with_pre_state_subst`,
+    `lookup_subst_raw`, `lookup_subst_typ`, `collect_borrow_mut_links`,
+    `resolve_borrow_mut_aliases`, `is_borrow_mut_linkage_assign`. All
+    coverage is e2e. Cheap unit tests would catch refactor regressions.
+  * **D1** — DESIGN.md missing the BorrowMut-elimination entry in
+    "Potential future infrastructure → `RewritePipeline`" (it's the
+    latest entry in the normalization-pass pattern).
+  * **D2** — DESIGN.md missing the soundness finding ("4 new-mut-ref
+    tests previously passed via vacuous-truth False hypotheses").
+    Should land in "Soundness trade-offs accepted" as a CLOSED entry
+    documenting the historical bug + fix.
+  * **D3** — DESIGN.md missing the Old context swap pattern (in
+    "What doesn't have to mirror Verus's encoding" — clear example
+    of using Lean-native semantics instead of mirroring Z3's
+    symbolic forward-reference axiomatization).
+
+* **File as future work**:
+  * **F3** — `collect_borrow_mut_links` recurses into
+    `ClosureInner.body` — potentially leaks closure-scope linkages
+    to outer fn's map. Probe whether reachable; pin or fix.
+  * **C2** — Shape-drift unit test on Verus's SST encoding. The
+    pre-pass assumes a specific shape; a synthetic SST + assertion
+    would lock in upstream-brittleness defence.
+  * **C3** — Negative regression test for the soundness finding.
+    Construct a wrong ensures (`*y == *old(y) + 999`); confirm the
+    new architecture rejects it (vs the old vacuous "verify").
+  * **A1** — Two-tier key convention (sanitize-only `mut_ref_locals`
+    + disambig-aware `borrow_mut_links`). Right way: unify to
+    disambig-aware. Invasive — touches existing sites.
+  * **A3**/**A4** — Typed-invariant improvements: `RenderCtx`'s 8-state
+    representational space tightened to a sum type; `borrow_mut_links`
+    keys retyped from `String` to `LeanName`.
+
 The principled answer to "why are we patching around Verus's encoding":
 we shouldn't. Verus's BorrowMut indirection (`let tmp = BorrowMut(y);
 y = MutRefFuture(tmp); bump(tmp);`) is SMT-bookkeeping. Lean's
