@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**442 end-to-end tests + 1 coverage test + 258 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** (Same numerical e2e baseline as pre-Idea-1 session, but with a real architectural improvement and a fixed soundness audit finding — 4 new-mut-ref tests previously passing via vacuous-truth hypotheses now pass via correct encoding. Lib unit tests grew 228 → 258 (+12 kind-aware coerce + 15 BorrowMut-elim/RenderCtx helpers). See 2026-05-26 session notes for the BorrowMut-elimination work + review cleanup batches.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**443 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** (One e2e added — C3 negative regression for the new-mut-ref soundness finding. Lib unit tests grew 258 → 261 (C2 shape pins +2, F3 closure-leak probe +1). vs pre-Idea-1: real architectural improvement + closed soundness audit finding — 4 new-mut-ref tests previously passing via vacuous-truth hypotheses now pass via correct encoding. See 2026-05-26 session notes for the BorrowMut-elimination work + review cleanup batches + test follow-up.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -152,16 +152,28 @@ Catalogued, prioritised, and processed in two cleanup batches:
   * **D3** ✅ — DESIGN.md "What doesn't have to mirror Verus's
     encoding" — new entry on the Old context swap pattern.
 
+* **Test-shaped review residue LANDED in `103b781`**:
+  * **C3** ✅ — Negative regression e2e test (`test_new_mut_ref_
+    wrong_ensures_is_caught_regression`). Caller claims `*y ==
+    *old(y) + 999` while callee actually does `+1`. Tactus must
+    reject. Pre-BorrowMut-elimination this would have falsely
+    verified via vacuous False hypothesis. Canary for the
+    soundness finding.
+  * **C2** ✅ — Two SST shape pins (`collect_borrow_mut_links_pins
+    _verus_call_then_assign_shape`, `_treats_call_args_as_leaf`).
+    Lock in our understanding of Verus's emission so upstream
+    re-encoding breaks loudly at the unit-test layer instead of
+    deep in an e2e.
+  * **F3** ✅ — Closure-scope leak probe
+    (`collect_borrow_mut_links_currently_hoists_from_closure_body`).
+    Currently `collect_borrow_mut_links` recurses into
+    `StmX::ClosureInner.body`, so linkage Assigns inside a closure
+    body hoist to the outer fn's link map. Harmless today (exec-
+    mode closure calls with &mut args are upstream-blocked) but
+    pinned as a canary — if Verus unblocks them this test will
+    fail loudly and the recursion will need gating.
+
 * **Filed as future work** (in DESIGN.md / HANDOFF queue):
-  * **F3** — `collect_borrow_mut_links` recurses into
-    `ClosureInner.body` — potentially leaks closure-scope linkages
-    to outer fn's map. Probe whether reachable; pin or fix.
-  * **C2** — Shape-drift unit test on Verus's SST encoding. The
-    pre-pass assumes a specific shape; a synthetic SST + assertion
-    would lock in upstream-brittleness defence.
-  * **C3** — Negative regression test for the soundness finding.
-    Construct a wrong ensures (`*y == *old(y) + 999`); confirm the
-    new architecture rejects it (vs the old vacuous "verify").
   * **A1** — Two-tier key convention (sanitize-only `mut_ref_locals`
     + disambig-aware `borrow_mut_links`). Right way: unify to
     disambig-aware. Invasive — touches existing sites.
