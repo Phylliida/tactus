@@ -333,6 +333,19 @@ pub struct WpCtx<'a> {
     /// bookkeeping that Lean doesn't need. See HANDOFF.md 2026-05-26
     /// session note "BorrowMut elimination" for the rationale.
     pub borrow_mut_links: HashMap<String, VarIdent>,
+    /// Caller fn's params at their body-shadow Lean typ — used by
+    /// `walk_call` to compute the actual Lean typ of each caller arg
+    /// when building typed value_subst entries. For body-shadowed
+    /// `&mut` params, the stored typ has one outer ref decoration
+    /// stripped (matching what `binder_ctx_from_params` records); for
+    /// other params, the typ is as-declared.
+    ///
+    /// This is the source-of-truth for "what is the rendered LExpr's
+    /// actual Lean typ at this caller site?" — answers the question
+    /// that `a.typ` can't (Verus's AST typ is the spec-level annotation,
+    /// not the body-shadow result). Without this, typed substitution
+    /// at call sites would over-wrap or under-wrap args.
+    pub caller_param_typs: HashMap<VarIdent, Typ>,
 }
 
 /// The break / continue goal leaves in scope inside a loop body.
@@ -442,6 +455,11 @@ impl<'a> WpCtx<'a> {
         // VarIdent it bridges. Empty for fns without BorrowMut
         // indirection (the common case).
         borrow_mut_links: HashMap<String, VarIdent>,
+        // Caller fn's params at body-shadow Lean typ — populated by
+        // the caller (`exec_fn_theorems_to_ast`) from `fn_sst.x.pars`.
+        // Used by `walk_call` to compute caller_arg actual Lean typ
+        // for typed value_subst entries.
+        caller_param_typs: HashMap<VarIdent, Typ>,
     ) -> Result<Self, String> {
         // Validate the *rewritten* expressions — every mut-ref shape
         // Verus might emit (legacy `VarAt(x, Pre)` or new-mode
@@ -527,6 +545,7 @@ impl<'a> WpCtx<'a> {
             ensures_goal,
             mut_ref_locals: mut_param_names.clone(),
             borrow_mut_links,
+            caller_param_typs,
         })
     }
 }
@@ -839,7 +858,24 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // `WpCtx::new` validates reqs / ens_exps before rendering them.
     // It also applies the same rewrites to each ens_exp so the
     // `ensures_goal` LExpr already has the synthetic names baked in.
-    let ctx = WpCtx::new(krate, check, &mut_param_names, borrow_mut_links)?;
+    // Caller's params at body-shadow Lean typ. Mirrors what
+    // `binder_ctx_from_params` records: strip one outer ref decoration
+    // for `&mut`-style mutation params (their bodies get a `let p :=
+    // p.deref;` shadow making p bare); other params stay as-declared.
+    // Threaded into WpCtx so `walk_call` can compute the actual Lean
+    // typ of each caller arg when building typed value_subst entries.
+    let caller_param_typs: HashMap<VarIdent, Typ> = fn_sst.x.pars.iter()
+        .map(|p| {
+            let typ = if is_mut_ref_typ(&p.x.typ, p.x.is_mut) {
+                crate::to_lean_expr::strip_one_ref_decoration(&p.x.typ)
+            } else {
+                p.x.typ.clone()
+            };
+            (p.x.name.clone(), typ)
+        })
+        .collect();
+
+    let ctx = WpCtx::new(krate, check, &mut_param_names, borrow_mut_links, caller_param_typs)?;
 
     let mut binders = build_param_binders(fn_sst);
     binders.extend(build_borrow_mut_binders(check));
@@ -2963,7 +2999,9 @@ fn walk_call<'a>(
     // and threaded through `Wp::Call`. No re-derivation, no `expect()`
     // — the type system guarantees it's present.
 
-    let subst = build_call_substitutions(callee, spec_callee, typ_args, args, mut_args, e);
+    let subst = build_call_substitutions(
+        callee, spec_callee, typ_args, args, mut_args, &ctx.caller_param_typs, e,
+    );
 
     // Canonical "what gets inlined at this call site." Single source
     // of truth shared with `dep_order::collect_references`; both
@@ -2971,35 +3009,34 @@ fn walk_call<'a>(
     // emission and ref-collection can't drift.
     let inlined = crate::call_inlining::collect_inlined_at_call(callee, spec_callee);
 
-    // Two RenderCtxs for the two inlining paths:
+    // Two RenderCtxs for the two inlining paths, each with its own
+    // typed value_subst:
     //
-    // * `render_ctx_req` — used to render the callee's `requires`.
-    //   Requires sees pre-state values, which equal the caller's
-    //   args (Verus enforces param↔arg typ compat). The req_subst
-    //   LExpr map handles `Var(p) ↦ arg_lexprs[i]` post-render.
-    //   No typed bridge needed.
+    // * Requires: every param resolves to the caller's pre-call arg
+    //   (`req_value_subst`). Post-state existentials aren't in scope
+    //   yet, so requires never needs them.
     //
-    // * `render_ctx_ens` — used to render the callee's `ensures`.
-    //   Ensures sees post-state values for `&mut` params: the fresh
-    //   existential at the wrapper-typed declared param typ. The
-    //   slot's expected typ may differ (e.g., trait dispatch wants
-    //   the auto-borrowed Ref form). The `value_subst` map plus
-    //   `RenderCtx::lookup_subst` bridge per use site.
-    //
-    // Splitting the contexts keeps the substitution domains disjoint:
-    // requires never sees the post-state existential; ensures never
-    // sees a non-existential pre-state through value_subst (those
-    // flow via ens_subst's LExpr-level substitute).
-    let render_ctx_req = crate::expr_shared::RenderCtx::with_fn_map(&ctx.fn_map);
-    // Ensures ctx threads BOTH post-state and pre-state substitution
-    // maps. The renderer's `ExprX::Old(_)` arm swaps to pre-state at
-    // the moment we enter an `Old` subtree, so mut-param refs inside
-    // resolve to caller's pre-call args. Outside Old, the post-state
-    // map handles mut-param refs at the existential.
+    // * Ensures: mut params via pname resolve to the post-state
+    //   existential; non-mut params via pname resolve to the caller
+    //   arg; <p>_at_pre_tactus (the rewritten `*old(p)` form) resolves
+    //   to the caller pre-call arg. `ens_value_subst_pre` is used by
+    //   the `ExprX::Old(_)` swap for any surviving Old subtrees.
+    // For requires: value_subst IS the pre-state (only the pre-call
+    // value exists at requires-time). We populate both `value_subst`
+    // and `value_subst_pre` with the same `req_value_subst` so that
+    // any surviving `ExprX::Old(_)` inside the requires (which swaps
+    // to `value_subst_pre`) still finds the substitution. Without
+    // populating both, the swap would drop the substitution and a
+    // reference like `*old(h)` inside requires would render bare.
+    let render_ctx_req = crate::expr_shared::RenderCtx::with_fn_map_and_value_subst_pair(
+        &ctx.fn_map,
+        &subst.req_value_subst,
+        &subst.req_value_subst,
+    );
     let render_ctx_ens = crate::expr_shared::RenderCtx::with_fn_map_and_value_subst_pair(
         &ctx.fn_map,
-        &subst.value_subst,
-        &subst.value_subst_pre,
+        &subst.ens_value_subst,
+        &subst.ens_value_subst_pre,
     );
 
     if !inlined.requires.is_empty() {
@@ -3057,44 +3094,55 @@ impl<'a> MutArgInfo<'a> {
 
 /// Substitution-related state needed to inline a callee's specs at
 /// a call site. Built once by `build_call_substitutions`, used
-/// twice — once for the precondition theorem (via `req_subst`)
-/// and once for the post-call ensures hypothesis (via `ens_subst`).
+/// twice — once for the precondition theorem (via `req_value_subst`)
+/// and once for the post-call ensures hypothesis (via `ens_value_subst`).
+///
+/// **Value substitution is render-time and typed.** Each entry stores
+/// `(rendered LExpr, actual Lean typ)`. At each use site, the renderer's
+/// `RenderCtx::lookup_subst*` returns the value coerced from its storage
+/// typ to the surrounding context's slot typ via `coerce_lexpr`. This
+/// codifies Rust's auto-borrow analog: a caller-arg at bare typ flowing
+/// into a slot expecting `&T` wraps with `Tactus.Ref.mk`; a caller-arg
+/// at `Box T` flowing into a bare slot peels with `.deref`. Both bridges
+/// compose with the call-site arg bridge in the renderer.
+///
+/// Type-arg substitution (`typ_subst`) stays at the LExpr-level post-
+/// render `lean_ast::substitute`; type params render as `Var("T")` and
+/// substitute to typ LExprs (themselves typically `Var`-shaped). No
+/// typed bridge needed for type substitution.
+///
+/// Callee ret-name substitution also stays at LExpr level (`ret_subst`):
+/// it's a name-to-name swap, no typ involved.
 struct CallSubstitutions<'a> {
     /// Type-arg substitution: `TypParam(T) ↦ Var(rendered_typ_arg)`.
     /// Shared between req and ens. `TypParam` renders as `Var("T")`
-    /// so value-level substitution rewrites it.
+    /// so value-level substitution rewrites it. Post-render via
+    /// `lean_ast::substitute`.
     typ_subst: HashMap<crate::lean_name::LeanName, LExpr>,
-    /// `requires` substitution: param names map to caller args
-    /// (pre-call values). For `&mut` params, both `p` and
-    /// `varat_pre_name(p)` map to the same arg — at requires-time
-    /// only the pre-call value exists.
-    req_subst: HashMap<crate::lean_name::LeanName, LExpr>,
-    /// `ensures` substitution at LExpr level — applied via
-    /// `lean_ast::substitute` AFTER the ensures expression has been
-    /// rendered. Carries non-mut param mappings, pre-state aliases
-    /// for mut params (`varat_pre_name(p) ↦ caller_arg`), typ-param
-    /// substitution, and the callee's ret name → `fresh_ret_name`.
-    /// Mut params' post-state `pname ↦ ...` mapping lives in
-    /// `value_subst` (typed, applied at render time) — kept out of
-    /// `ens_subst` to avoid double substitution.
-    ens_subst: HashMap<crate::lean_name::LeanName, LExpr>,
-    /// Typed render-time substitution map for post-state references.
-    /// For mut params: `pname ↦ (Var(fresh), p.x.typ)` — the post-call
-    /// existential at the local's Lean-level storage typ.
-    ///
-    /// Values live at storage typ (e.g., `Tactus.MutRef T` for `&mut
-    /// T`). At each use site, `structural_typ` reports the storage typ
-    /// via `RenderCtx::lookup_subst_typ`, and
-    /// `apply_ref_coercion_if_needed` bridges storage → expr.typ.
-    /// This keeps the substitution faithful to Lean reality —
-    /// downstream lifts compose with their own coercions.
-    value_subst: HashMap<crate::lean_name::LeanName, (LExpr, Typ)>,
+    /// Post-render substitution for the callee's ret name → fresh ret
+    /// name. Only applies to ensures (requires doesn't reference ret).
+    /// Name-to-name swap; no typing involved.
+    ret_subst: HashMap<crate::lean_name::LeanName, LExpr>,
+    /// Typed render-time substitution map for the **requires** path.
+    /// Every param (mut or non-mut) maps to caller's pre-call arg.
+    /// For mut params, both `pname` and `pname_pre` (the rewritten
+    /// `<p>_at_pre_tactus` form) point at the same caller arg.
+    req_value_subst: HashMap<crate::lean_name::LeanName, (LExpr, Typ)>,
+    /// Typed render-time substitution map for the **ensures** path.
+    /// * Non-mut params: `pname → (caller_arg, actual_typ)`.
+    /// * Mut params: `pname → (post-state existential, p.x.typ)` +
+    ///   `pname_pre → (caller_arg, actual_typ)` for the `<p>_at_pre_tactus`
+    ///   form.
+    ens_value_subst: HashMap<crate::lean_name::LeanName, (LExpr, Typ)>,
     /// Typed render-time substitution map for **pre-state** references
-    /// inside Verus `Old(_)` markers. Same shape as `value_subst` but
-    /// maps each mut param to the caller's pre-call value rather than
-    /// the post-state existential. The renderer swaps to this map at
-    /// the `ExprX::Old` arm via `RenderCtx::with_pre_state_subst`.
-    value_subst_pre: HashMap<crate::lean_name::LeanName, (LExpr, Typ)>,
+    /// inside Verus `Old(_)` markers in ensures. Same shape as
+    /// `ens_value_subst` but maps each mut param to the caller's
+    /// pre-call value rather than the post-state existential. The
+    /// renderer swaps to this map at the `ExprX::Old` arm via
+    /// `RenderCtx::with_pre_state_subst`. Typically unused — ensures
+    /// preprocessing rewrites `VarAt(p, Pre)` to `<p>_at_pre_tactus`
+    /// before render, so Old(_) rarely survives.
+    ens_value_subst_pre: HashMap<crate::lean_name::LeanName, (LExpr, Typ)>,
     /// Set of `&mut` param names (sanitized) — used by
     /// `rewrite_varat_for_mut_params` to rename `VarAt(p, Pre) →
     /// Var(<p>_at_pre_tactus)` in the VIR-AST spec BEFORE
@@ -3136,11 +3184,19 @@ struct CallSubstitutions<'a> {
 fn add_param_subst_entries<'a>(
     params: &vir::ast::Params,
     arg_lexprs: &[LExpr],
+    arg_actual_typs: &[Typ],
     mut_args: &[MutArgInfo<'a>],
-    req_subst: &mut HashMap<crate::lean_name::LeanName, LExpr>,
-    ens_subst: &mut HashMap<crate::lean_name::LeanName, LExpr>,
-    value_subst: &mut HashMap<crate::lean_name::LeanName, (LExpr, Typ)>,
-    value_subst_pre: &mut HashMap<crate::lean_name::LeanName, (LExpr, Typ)>,
+    // For requires: pname → caller pre-call arg (for ALL params).
+    // Mut params and non-mut params share the same pre-state value.
+    req_value_subst: &mut HashMap<crate::lean_name::LeanName, (LExpr, Typ)>,
+    // For ensures: pname → post-state existential (mut) or caller arg
+    // (non-mut); pname_pre → caller pre-call arg (mut only).
+    ens_value_subst: &mut HashMap<crate::lean_name::LeanName, (LExpr, Typ)>,
+    // For Old(_) context swap inside ensures: pname → caller pre-call
+    // arg (mut only). Typically unused — ensures preprocessing
+    // rewrites `VarAt(p, Pre)` to `<p>_at_pre_tactus` before render,
+    // so Old(_) rarely survives.
+    ens_value_subst_pre: &mut HashMap<crate::lean_name::LeanName, (LExpr, Typ)>,
     mut_param_names: &mut HashSet<String>,
 ) {
     for (i, p) in params.iter().enumerate() {
@@ -3150,8 +3206,14 @@ fn add_param_subst_entries<'a>(
         // disambiguator id when needed).
         let pname = crate::lean_name::LeanName::from_var_ident(&p.x.name);
         let pname_pre = crate::lean_name::LeanName::synthetic(varat_pre_name(pname.as_str()));
-        // Requires: same map for mut and non-mut (only pre-state exists).
-        req_subst.insert(pname.clone(), arg_lexprs[i].clone());
+        // Requires: every param (mut or non-mut) resolves to the
+        // caller's pre-call arg. For mut params, `*old(p)` refs in
+        // requires would also resolve to the same value (the rewrite
+        // turns them into <p>_at_pre_tactus, which we also key).
+        req_value_subst.insert(
+            pname.clone(),
+            (arg_lexprs[i].clone(), arg_actual_typs[i].clone()),
+        );
         // Both legacy mode (`is_mut: true`) and new-mut-ref mode
         // (`MutRef<T>` typ) need the mut-side subst structure. Going
         // through the named helper keeps this in lockstep with
@@ -3160,40 +3222,42 @@ fn add_param_subst_entries<'a>(
         // updates both sites at once.
         if is_mut_ref_typ(&p.x.typ, p.x.is_mut) {
             mut_param_names.insert(sanitize(&p.x.name.0));
-            req_subst.insert(pname_pre.clone(), arg_lexprs[i].clone());
-            // Ensures: mut param's `p` is substituted at RENDER TIME
-            // via `value_subst` so the bridge can use the slot's typ
-            // at each use site (numeric uses get `.deref`-to-inner;
-            // trait dispatch sees wrapper-typed values bridged by
-            // kind/depth as needed). The post-state existential's
-            // declared typ is `p.x.typ` — the value enters the map
-            // un-coerced; `coerce_lexpr` bridges per use.
-            //
-            // Pre-state alias `pname_pre ↦ caller_arg` still lives
-            // in ens_subst (LExpr-level post-render substitute):
-            // caller args and pre-state slots have matching typs by
-            // construction (Verus enforces param↔arg typ compat), so
-            // no typed bridge needed.
+            // Requires can mention `*old(p)` (rare but legal); the
+            // rewrite turns it into <p>_at_pre_tactus. Key it too.
+            req_value_subst.insert(
+                pname_pre.clone(),
+                (arg_lexprs[i].clone(), arg_actual_typs[i].clone()),
+            );
+            // Ensures: post-state existential at p.x.typ (Verus's
+            // declared wrapper typ; the fresh is bound at this typ).
             let info = mut_args.iter().find(|m| m.param_idx == i)
                 .expect("MutArgInfo should exist for every &mut param idx — \
                          build_call_mut_args populates one per is_mut param");
-            value_subst.insert(
+            ens_value_subst.insert(
                 pname.clone(),
                 (LExpr::var(info.fresh.clone()), p.x.typ.clone()),
             );
-            // Pre-state map: at `Old(_)` markers, the same pname
-            // resolves to the caller's pre-call arg (which equals
-            // `arg_lexprs[i]` since `*old(p)` evaluates BEFORE the
-            // call). Storage typ matches post-state map's entry
-            // (p.x.typ — both at the local's Lean-level wrapper typ).
-            value_subst_pre.insert(
-                pname.clone(),
-                (arg_lexprs[i].clone(), p.x.typ.clone()),
+            // <p>_at_pre_tactus → caller pre-call arg (typed).
+            // The rewrite (VarAt(p, Pre) → Var(<p>_at_pre_tactus))
+            // runs before render; this entry handles the rewritten
+            // form at render time.
+            ens_value_subst.insert(
+                pname_pre.clone(),
+                (arg_lexprs[i].clone(), arg_actual_typs[i].clone()),
             );
-            ens_subst.insert(pname_pre, arg_lexprs[i].clone());
+            // For Old(_) context swap inside ensures (rare — the
+            // preprocessing rewrite typically eliminates these).
+            ens_value_subst_pre.insert(
+                pname.clone(),
+                (arg_lexprs[i].clone(), arg_actual_typs[i].clone()),
+            );
         } else {
-            // Non-mut ensures: param → arg.
-            ens_subst.insert(pname, arg_lexprs[i].clone());
+            // Non-mut params in ensures: same as caller arg (no
+            // post/pre distinction).
+            ens_value_subst.insert(
+                pname.clone(),
+                (arg_lexprs[i].clone(), arg_actual_typs[i].clone()),
+            );
         }
     }
 }
@@ -3208,12 +3272,38 @@ fn add_param_subst_entries<'a>(
 /// callee's and spec_callee's param/ret names — same arg values,
 /// just both spellings of each name, so we can substitute either
 /// the trait's specs or the impl's strengthened specs (#86).
+/// Compute the actual Lean-level typ of a caller arg's rendered LExpr.
+///
+/// For `ExpX::Var(local)` / `VarLoc(local)` where `local` is a caller
+/// fn param: returns the body-shadow typ recorded in `caller_param_typs`
+/// (strip one outer ref for `&mut` params; as-declared otherwise). This
+/// reflects what the SST renderer's binder-aware path emits for refs to
+/// caller-scope locals.
+///
+/// For other expressions: returns `arg.typ` as best effort. The SST
+/// renderer's inner bridges normalize to `arg.typ` for most non-Var
+/// expressions, so the AST claim is reliable there.
+///
+/// Used by `build_call_substitutions` to populate typed `value_subst`
+/// entries with storage typs that match the rendered LExpr's actual
+/// Lean typ. Without this, `coerce_lexpr` at use sites would bridge
+/// from the wrong source typ and produce mis-typed wraps or peels.
+fn caller_arg_actual_typ(arg: &Exp, caller_param_typs: &HashMap<VarIdent, Typ>) -> Typ {
+    match &arg.x {
+        ExpX::Var(v) | ExpX::VarLoc(v) => {
+            caller_param_typs.get(v).cloned().unwrap_or_else(|| arg.typ.clone())
+        }
+        _ => arg.typ.clone(),
+    }
+}
+
 fn build_call_substitutions<'a>(
     callee: &FunctionX,
     spec_callee: &FunctionX,
     typ_args: &[Typ],
     args: &[Validated<'a>],
     mut_args_raw: &[(usize, MutTargetRaw<'a>)],
+    caller_param_typs: &HashMap<VarIdent, Typ>,
     e: &mut ObligationEmitter,
 ) -> CallSubstitutions<'a> {
     // Type-param substitution (shared by req + ens). `TypParam(T)`
@@ -3226,21 +3316,16 @@ fn build_call_substitutions<'a>(
         typ_subst.insert(crate::lean_name::LeanName::lit(tp_name.as_str()), typ_to_expr(tp_arg));
     }
 
-    // Render each arg once. The lower path peels `Loc` for &mut
-    // arg shapes, so the rendered form is the caller-side variable
-    // reference (the pre-call value).
-    //
-    // Args go through `lower_validated` (the SST renderer); no
-    // wrapper coercion needed here because callee-spec inlining
-    // uses `vir_expr_to_ast_for_inlining` (in `emit_call_precondition_theorem`
-    // and `push_post_call_frames`), which suppresses the
-    // `apply_ref_coercion_if_needed` lift at `ReadPlace` sites. The
-    // substituted-arg flows through unchanged and matches the
-    // callee's expected param type directly. See
-    // `vir_expr_to_ast_for_inlining` in `to_lean_expr.rs` for the
-    // full story (replaces the prior β refactor Piece 3 selective
-    // peel that handled the same gap downstream).
+    // Render each arg once + compute its actual Lean typ via
+    // `caller_arg_actual_typ`. The actual-typ is what storage typ
+    // the value_subst entry uses; together with `coerce_lexpr` at
+    // use sites it codifies Rust's auto-borrow analog: the bridge
+    // from caller-supplied (possibly body-shadowed) typ to whatever
+    // typ the inlined spec slot expects.
     let arg_lexprs: Vec<LExpr> = args.iter().map(|a| lower_validated(a)).collect();
+    let arg_actual_typs: Vec<Typ> = args.iter()
+        .map(|a| caller_arg_actual_typ(a.raw(), caller_param_typs))
+        .collect();
 
     // One MutArgInfo per `&mut` arg — bundles param_idx, target
     // (the L-value shape, post-#87), and the gensym'd fresh post-
@@ -3263,11 +3348,11 @@ fn build_call_substitutions<'a>(
     // convention as mut_post above.
     let fresh_ret_name = crate::lean_name::LeanName::synthetic(format!("_tactus_ret_{}", e.next_id()));
 
-    // Build req_subst, ens_subst, and value_subst.
-    let mut req_subst: HashMap<crate::lean_name::LeanName, LExpr> = typ_subst.clone();
-    let mut ens_subst: HashMap<crate::lean_name::LeanName, LExpr> = typ_subst.clone();
-    let mut value_subst: HashMap<crate::lean_name::LeanName, (LExpr, Typ)> = HashMap::new();
-    let mut value_subst_pre: HashMap<crate::lean_name::LeanName, (LExpr, Typ)> = HashMap::new();
+    // Build typed value_subst maps + the LExpr-level ret_subst.
+    let mut req_value_subst: HashMap<crate::lean_name::LeanName, (LExpr, Typ)> = HashMap::new();
+    let mut ens_value_subst: HashMap<crate::lean_name::LeanName, (LExpr, Typ)> = HashMap::new();
+    let mut ens_value_subst_pre: HashMap<crate::lean_name::LeanName, (LExpr, Typ)> = HashMap::new();
+    let mut ret_subst: HashMap<crate::lean_name::LeanName, LExpr> = HashMap::new();
     let mut mut_param_names: HashSet<String> = HashSet::new();
 
     // For non-trait-method-impl calls, `spec_callee == callee` (same
@@ -3285,11 +3370,11 @@ fn build_call_substitutions<'a>(
     add_param_subst_entries(
         &callee.params,
         &arg_lexprs,
+        &arg_actual_typs,
         &mut_args,
-        &mut req_subst,
-        &mut ens_subst,
-        &mut value_subst,
-        &mut value_subst_pre,
+        &mut req_value_subst,
+        &mut ens_value_subst,
+        &mut ens_value_subst_pre,
         &mut mut_param_names,
     );
     // Second pass: keys from `spec_callee.params` (trait method
@@ -3304,11 +3389,11 @@ fn build_call_substitutions<'a>(
         add_param_subst_entries(
             &spec_callee.params,
             &arg_lexprs,
+            &arg_actual_typs,
             &mut_args,
-            &mut req_subst,
-            &mut ens_subst,
-            &mut value_subst,
-            &mut value_subst_pre,
+            &mut req_value_subst,
+            &mut ens_value_subst,
+            &mut ens_value_subst_pre,
             &mut mut_param_names,
         );
     }
@@ -3317,24 +3402,26 @@ fn build_call_substitutions<'a>(
     // spec_callee's ret name when trait and impl differ (the impl's
     // ret name may differ textually from the trait's). For non-
     // trait-impl callees, `spec_callee == callee` and the second
-    // insert would be identical to the first — skip it.
+    // insert would be identical to the first — skip it. Name-to-name
+    // swap, no typing involved — lives in `ret_subst` (LExpr-level
+    // post-render substitute).
     let callee_ret = crate::lean_name::LeanName::from_var_ident(&callee.ret.x.name);
     if callee_ret.as_str() != fresh_ret_name.as_str() {
-        ens_subst.insert(callee_ret, LExpr::var(fresh_ret_name.clone()));
+        ret_subst.insert(callee_ret, LExpr::var(fresh_ret_name.clone()));
     }
     if is_trait_method_impl {
         let spec_ret = crate::lean_name::LeanName::from_var_ident(&spec_callee.ret.x.name);
         if spec_ret.as_str() != fresh_ret_name.as_str() {
-            ens_subst.insert(spec_ret, LExpr::var(fresh_ret_name.clone()));
+            ret_subst.insert(spec_ret, LExpr::var(fresh_ret_name.clone()));
         }
     }
 
     CallSubstitutions {
         typ_subst,
-        req_subst,
-        ens_subst,
-        value_subst,
-        value_subst_pre,
+        ret_subst,
+        req_value_subst,
+        ens_value_subst,
+        ens_value_subst_pre,
         mut_param_names,
         mut_args,
         fresh_ret_name,
@@ -3364,11 +3451,16 @@ fn emit_call_precondition_theorem(
             })
             .collect()
     );
+    // Post-render substitute only handles type-arg substitution
+    // (Var(T) → typ_to_expr(arg_typ)). Value-level param substitution
+    // happens at render time via `req_value_subst` in the active
+    // RenderCtx. The render-time substitution carries typ info, so
+    // wrapper bridges fire correctly at each use site via coerce_lexpr.
     let requires_clause = LExpr::span_mark(
         loc.clone(),
         Some(call_span.clone()),
         AssertKind::Obligation(ObligationKind::CallPrecondition),
-        substitute(&requires_conj, &subst.req_subst),
+        substitute(&requires_conj, &subst.typ_subst),
     );
     let id = e.next_id();
     let theorem_name = build_theorem_name(
@@ -3587,10 +3679,19 @@ fn push_post_call_frames(
             vir_expr_to_ast_for_inlining_with_ctx(&rewritten, render_ctx)
         })
         .collect();
+    // Post-render substitute only handles type-arg substitution and
+    // ret-name swap (Var(callee_ret) → Var(fresh_ret_name)). Value-
+    // level param substitution happened at render time via
+    // `ens_value_subst` in the active RenderCtx — carries typ info,
+    // so wrapper bridges fire correctly at each use site.
+    let post_render_subst: HashMap<crate::lean_name::LeanName, LExpr> = subst.typ_subst.iter()
+        .chain(subst.ret_subst.iter())
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let substituted_ensures: Option<LExpr> = if ensures_clauses.is_empty() {
         None
     } else {
-        Some(substitute(&and_all(ensures_clauses), &subst.ens_subst))
+        Some(substitute(&and_all(ensures_clauses), &post_render_subst))
     };
 
     // #128: try ret-substitution. If the substituted ensures has a
@@ -6794,6 +6895,7 @@ mod tests {
             ensures_goal: LExpr::lit_true(),
             mut_ref_locals: HashSet::new(),
             borrow_mut_links: HashMap::new(),
+            caller_param_typs: HashMap::new(),
         }
     }
 
@@ -7082,7 +7184,7 @@ mod tests {
         let krate = empty_krate();
         let check = empty_func_check(vec![], vec![]);
         let mut_param_names = HashSet::new();
-        let result = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new());
+        let result = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new(), HashMap::new());
         assert!(result.is_ok(), "empty WpCtx should construct: {:?}", result.err());
         let ctx = result.unwrap();
         assert!(ctx.fn_map.is_empty(), "fn_map should be empty for empty krate");
@@ -7101,7 +7203,7 @@ mod tests {
         let bad_req = old_exp("snapshot", "x");
         let check = empty_func_check(vec![bad_req], vec![]);
         let mut_param_names = HashSet::new();
-        let result = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new());
+        let result = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new(), HashMap::new());
         assert!(result.is_err(),
             "WpCtx::new must reject ExpX::Old in reqs; got Ok(_)");
         let err = result.err().unwrap();
@@ -7120,7 +7222,7 @@ mod tests {
         let bad_ens = old_exp("snapshot", "y");
         let check = empty_func_check(vec![], vec![bad_ens]);
         let mut_param_names = HashSet::new();
-        let result = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new());
+        let result = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new(), HashMap::new());
         assert!(result.is_err(),
             "WpCtx::new must reject ExpX::Old in ens_exps; got Ok(_)");
     }
@@ -7178,7 +7280,7 @@ mod tests {
         let krate = empty_krate();
         let check = empty_func_check(vec![], vec![]);
         let mut_param_names = HashSet::new();
-        let ctx = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new())
+        let ctx = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new(), HashMap::new())
             .expect("empty ctx");
         let mut emitter = mk_test_emitter();
 
@@ -7231,7 +7333,7 @@ mod tests {
         let krate = empty_krate();
         let check = empty_func_check(vec![], vec![]);
         let mut_param_names = HashSet::new();
-        let ctx = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new())
+        let ctx = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new(), HashMap::new())
             .expect("empty ctx");
         let mut emitter = mk_test_emitter();
 
