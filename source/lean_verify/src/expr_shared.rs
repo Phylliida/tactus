@@ -84,31 +84,40 @@ pub type RenderValueSubst<'a> = HashMap<LeanName, (LExpr, Typ)>;
 ///
 /// * `fn_map` — function lookup for class-method-call param-typ
 ///   inspection (`class_method_param_typs`).
-/// * `value_subst` — typed substitution map applied during render
-///   (`lookup_subst`). Each Var rendering site consults this before
-///   falling back to plain `Var(name)` rendering, so substituted
-///   values bridge to the slot's typ at use rather than at map-build.
+/// * `value_subst` — typed substitution map applied during render at
+///   value sites (Var, VarAt, ReadPlace+Local). Stores values at the
+///   callee local's **Lean-level storage typ** (e.g., `Tactus.MutRef
+///   T` for `&mut` params). The renderer's `apply_ref_coercion_if_needed`
+///   bridges from storage typ to the surrounding context's slot typ
+///   at each use — driven by `structural_typ` which consults the
+///   inlining `BinderCtx` (populated with mut-param storage typs).
+/// * `value_subst_pre` — alternative substitution map for **pre-state
+///   contexts** (inside Verus `Old(_)` markers). The renderer swaps
+///   to this map when entering an `Old` subtree; same shape and storage
+///   convention as `value_subst`, but maps each callee mut-param to
+///   the caller's pre-call value rather than the post-state existential.
 ///
 /// Construct with `RenderCtx::empty()` for tests or rendering paths
-/// without typing info. Use `RenderCtx::with_fn_map(&fn_map)` or
-/// `RenderCtx::with_fn_map_and_value_subst(&fn_map, &subst)` for
-/// production rendering at codegen entry points.
+/// without typing info. Use `RenderCtx::with_fn_map(&fn_map)` or one
+/// of the value-subst variants for production rendering at codegen
+/// entry points.
 #[derive(Clone, Copy)]
 pub struct RenderCtx<'a> {
     pub fn_map: Option<&'a RenderFnMap<'a>>,
     pub value_subst: Option<&'a RenderValueSubst<'a>>,
+    pub value_subst_pre: Option<&'a RenderValueSubst<'a>>,
 }
 
 impl<'a> RenderCtx<'a> {
     /// Empty context — class-method-call rendering falls back to
     /// no-coerce; Var substitution falls through to plain Var.
     pub fn empty() -> Self {
-        Self { fn_map: None, value_subst: None }
+        Self { fn_map: None, value_subst: None, value_subst_pre: None }
     }
 
     /// Context with fn_map for class-method-call rendering.
     pub fn with_fn_map(fn_map: &'a RenderFnMap<'a>) -> Self {
-        Self { fn_map: Some(fn_map), value_subst: None }
+        Self { fn_map: Some(fn_map), value_subst: None, value_subst_pre: None }
     }
 
     /// Context with both fn_map and a render-time value substitution
@@ -119,7 +128,38 @@ impl<'a> RenderCtx<'a> {
         fn_map: &'a RenderFnMap<'a>,
         value_subst: &'a RenderValueSubst<'a>,
     ) -> Self {
-        Self { fn_map: Some(fn_map), value_subst: Some(value_subst) }
+        Self { fn_map: Some(fn_map), value_subst: Some(value_subst), value_subst_pre: None }
+    }
+
+    /// Context with fn_map + both post-state and pre-state value
+    /// substitution maps. Used by `push_post_call_frames` to set up
+    /// the inlining renderer with everything needed for transparent
+    /// pre/post translation: the value_subst handles post-state refs,
+    /// the value_subst_pre handles refs inside `Old(_)` markers, and
+    /// the renderer swaps between them based on context.
+    pub fn with_fn_map_and_value_subst_pair(
+        fn_map: &'a RenderFnMap<'a>,
+        value_subst: &'a RenderValueSubst<'a>,
+        value_subst_pre: &'a RenderValueSubst<'a>,
+    ) -> Self {
+        Self {
+            fn_map: Some(fn_map),
+            value_subst: Some(value_subst),
+            value_subst_pre: Some(value_subst_pre),
+        }
+    }
+
+    /// Variant of `self` with `value_subst` swapped to `value_subst_pre`.
+    /// Used at the `Old(_)` rendering site to switch the inner expression
+    /// into a pre-state context: every Var/ReadPlace lookup against the
+    /// new active subst returns the pre-state value (caller's pre-call
+    /// arg) rather than the post-state existential.
+    pub fn with_pre_state_subst(&self) -> Self {
+        Self {
+            fn_map: self.fn_map,
+            value_subst: self.value_subst_pre,
+            value_subst_pre: self.value_subst_pre,
+        }
     }
 
     /// Look up a class-method decl's declared param typs. Returns
@@ -157,6 +197,33 @@ impl<'a> RenderCtx<'a> {
         let map = self.value_subst?;
         let (value, value_typ) = map.get(name)?;
         Some(coerce_lexpr(value.clone(), value_typ, slot_typ))
+    }
+
+    /// Look up a Var name in the render-time substitution map and
+    /// return the substituted value **at its storage typ** — no
+    /// bridge applied. The caller is responsible for downstream
+    /// coercion (typically via `apply_ref_coercion_if_needed` with
+    /// `structural_typ` reporting the storage typ from a populated
+    /// BinderCtx).
+    ///
+    /// Use this in the principled "values live at storage typ;
+    /// bridging is the consumer's job" architecture — substitution
+    /// is faithful to Lean reality, downstream lifts handle slot
+    /// mismatches.
+    pub fn lookup_subst_raw(&self, name: &LeanName) -> Option<LExpr> {
+        let map = self.value_subst?;
+        let (value, _value_typ) = map.get(name)?;
+        Some(value.clone())
+    }
+
+    /// Storage typ of a mut-param substitution entry. Used by
+    /// `structural_typ` to report a binder-shaped value's Lean-level
+    /// typ at each use site, so `apply_ref_coercion_if_needed` can
+    /// bridge to the surrounding slot. Falls back to None when no
+    /// substitution map is configured or the name isn't in it.
+    pub fn lookup_subst_typ(&self, name: &LeanName) -> Option<Typ> {
+        let map = self.value_subst?;
+        map.get(name).map(|(_, t)| t.clone())
     }
 }
 

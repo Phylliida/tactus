@@ -136,9 +136,18 @@ fn structural_typ(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::Re
             // Use the un-decorated form of expr.typ as the structural typ.
             Some(strip_all_ref_decorations(&expr.typ.clone()))
         }
-        // Variable references produce the binder's typ.
+        // Variable references produce the binder's typ OR — for
+        // call-site inlining — the storage typ recorded in
+        // `ctx.value_subst`. The latter handles mut-param refs in
+        // the callee's specs: the substituted value is at the
+        // local's Lean-level storage typ (e.g., `Tactus.MutRef T`),
+        // not at Verus's AST claim, so `apply_ref_coercion_if_needed`
+        // can bridge storage → expr.typ at the use site.
         ExprX::Var(v) | ExprX::VarLoc(v) | ExprX::VarAt(v, _) => {
-            binders.get(v).cloned()
+            binders.get(v).cloned().or_else(|| {
+                let lean_name = crate::lean_name::LeanName::from_var_ident(v);
+                ctx.lookup_subst_typ(&lean_name)
+            })
         }
         // ReadPlace's rendering drops the read kind, producing the
         // place's underlying value typ. (The read kind, e.g., ImmutBor
@@ -151,11 +160,30 @@ fn structural_typ(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::Re
         // post-shadow typs at construction time). For non-Local
         // places, fall back to `p.typ` (the SST place's typ).
         //
+        // Inlining-substitution path: when the Local is in
+        // `ctx.value_subst`, report the storage typ from there so
+        // `apply_ref_coercion_if_needed` can bridge to expr.typ even
+        // though the `READPLACE_LIFT_ENABLED` flag is otherwise
+        // suppressed for inlining. The β refactor's suppression was
+        // meant to skip the lift for substituted-non-mut args (whose
+        // typ already matched the AST claim); mut-param substitution
+        // genuinely needs the bridge, so the storage-typ hit wins.
+        //
         // Inlining contexts (`vir_expr_to_ast_for_inlining`) flip
         // `READPLACE_LIFT_ENABLED` to false to suppress the lift —
         // the substituted-arg provides the correct wrapper-typed
         // value directly. See the doc on `vir_expr_to_ast_for_inlining`.
         ExprX::ReadPlace(p, _) => {
+            let inlining_storage_typ = match &p.x {
+                PlaceX::Local(v) => {
+                    let lean_name = crate::lean_name::LeanName::from_var_ident(v);
+                    ctx.lookup_subst_typ(&lean_name)
+                }
+                _ => None,
+            };
+            if let Some(t) = inlining_storage_typ {
+                return Some(t);
+            }
             if READPLACE_LIFT_ENABLED.with(|cell| cell.get()) {
                 match &p.x {
                     PlaceX::Local(v) => binders.get(v).cloned().or_else(|| Some(p.typ.clone())),
@@ -293,17 +321,17 @@ fn apply(head: &str, args: Vec<LExpr>) -> ExprNode {
 }
 
 fn expr_to_node(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
-    // Render-time substitution helper: if ctx carries a value_subst
-    // map and `ident` is in it, return the substituted-and-bridged
-    // value. The bridge uses `expr.typ` (the slot's expected typ at
-    // this AST position) so the substituted value coerces toward what
-    // the current context wants — not toward a single direction baked
-    // in at map-build time. Closes the "claimed-typ-lies" gap for
-    // call-site inlining where the value's actual typ differs from
-    // the AST node's claim post-rewrite.
+    // Render-time substitution: if ctx carries a value_subst map and
+    // `ident` is in it, return the substituted value at its STORAGE
+    // typ — without bridging. Downstream `apply_ref_coercion_if_needed`
+    // bridges storage → expr.typ via `structural_typ` (which reports
+    // the storage typ from `ctx.lookup_subst_typ`). This keeps the
+    // substituted value's Lean reality (the storage typ) visible at
+    // the surrounding lift sites, so they can compose with their own
+    // coercions (e.g., the class-method-call arm's MutRef→Ref bridge).
     let try_subst = |ident: &VarIdent| -> Option<ExprNode> {
         let lean_name = crate::lean_name::LeanName::from_var_ident(ident);
-        ctx.lookup_subst(&lean_name, &expr.typ).map(|e| e.node)
+        ctx.lookup_subst_raw(&lean_name).map(|e| e.node)
     };
     match &expr.x {
         ExprX::Const(c) => const_to_node(c),
@@ -582,28 +610,16 @@ fn expr_to_node(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::Rend
         ExprX::Loc(expr) => expr_to_node(expr, binders, ctx),
 
         ExprX::ReadPlace(place, _) => {
-            // Render-time substitution: in new-mut-ref-encoded ASTs,
-            // a read of a local appears as `ReadPlace(Local(v), _)`
-            // rather than `Var(v)`. Check value_subst here too so
-            // callee-spec inlining can bridge mut params at their
-            // use sites under both encodings.
-            //
-            // The slot typ used for the bridge is `strip_one_ref_decoration
-            // (expr.typ)` — peeling one wrapper layer off the ReadPlace's
-            // claimed typ. Verus encodes `*a` (the spec-mode read of a
-            // mut-ref local) as `ReadPlace(Local(a), ImmutBor)` where
-            // `expr.typ` is the LOCAL's typ (e.g., `MutRef Int`) rather
-            // than the dereffed value's typ (`Int`). The AST claim lies
-            // about the semantic slot: callers expect inner-typed values
-            // (numeric arith, downstream Add/Eq), not wrapper-typed ones.
-            // Bridging to the stripped form gives the inner-typed view
-            // that mirrors pre-Cluster-C's pre-peel behaviour, but at
-            // render time so the slot's typ flows naturally.
+            // Render-time substitution at `ReadPlace(Local(v), _)`
+            // sites — same as the Var/VarAt arm above. Return the
+            // value at its storage typ; the outer
+            // `apply_ref_coercion_if_needed` bridges to expr.typ via
+            // `structural_typ` which reports the storage typ from
+            // `ctx.lookup_subst_typ` for this AST shape.
             if let PlaceX::Local(ident) = &place.x {
                 let lean_name = crate::lean_name::LeanName::from_var_ident(ident);
-                let inner_typ = strip_one_ref_decoration(&expr.typ);
-                if let Some(bridged) = ctx.lookup_subst(&lean_name, &inner_typ) {
-                    return bridged.node;
+                if let Some(value) = ctx.lookup_subst_raw(&lean_name) {
+                    return value.node;
                 }
             }
             place_to_expr(&place.x, binders, ctx).node
@@ -727,13 +743,30 @@ fn expr_to_node(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::Rend
         ExprX::AssertQuery { .. } => ExprNode::LitBool(true),
         ExprX::OpenInvariant(_, _, body, _) => expr_to_node(body, binders, ctx),
 
-        // `ExprX::Old(e)` wraps the inner expression for well-
-        // formedness checking ("ignored after these checks are
-        // complete" per the AST docstring). The actual pre-state
-        // reference uses `ExprX::VarAt(x, Pre)`, which we render
-        // distinctly via `varat_pre_name` for &mut callee-spec
-        // inlining (#55). For this arm: render the inner unchanged.
-        ExprX::Old(e) | ExprX::EvalAndResolve(_, e) => expr_to_node(e, binders, ctx),
+        // `ExprX::Old(e)` is Verus's marker for "evaluate `e` in the
+        // pre-state context." Inside `Old`, references to a callee's
+        // mut-param local resolve to the **pre-state** value (caller's
+        // arg pre-call), NOT the post-state existential.
+        //
+        // We honor this by swapping `ctx.value_subst` with
+        // `ctx.value_subst_pre` for the recursive descent: every Var
+        // / ReadPlace+Local lookup against the active subst returns
+        // the pre-state value. The structural_typ + apply_ref_coercion
+        // machinery composes uniformly — the storage typs match
+        // between post/pre maps (both at the local's wrapper typ),
+        // only the value differs.
+        //
+        // When `ctx.value_subst_pre` is None (no pre-state map in
+        // scope), `with_pre_state_subst` falls back to None for
+        // value_subst — the inner expression renders as if no
+        // substitution exists, which is the right behavior for
+        // non-inlining contexts (proof-fn rendering of fn's own
+        // body, where Old is upstream-stripped).
+        ExprX::Old(e) => {
+            let pre_ctx = ctx.with_pre_state_subst();
+            return vir_expr_to_ast_with_binders(e, binders, &pre_ctx).node;
+        }
+        ExprX::EvalAndResolve(_, e) => expr_to_node(e, binders, ctx),
         ExprX::BorrowMut(_) | ExprX::TwoPhaseBorrowMut(_)
         | ExprX::BorrowMutTracked(_) => ExprNode::Var(crate::lean_name::LeanName::lit("()")),
         ExprX::ImplicitReborrowOrSpecRead(place, _, _) => place_to_expr(&place.x, binders, ctx).node,
