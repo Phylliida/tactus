@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**442 end-to-end tests + 1 coverage test + 243 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** (Same numerical baseline as pre-Idea-1 session, but with a real architectural improvement and a fixed soundness audit finding — 4 new-mut-ref tests previously passing via vacuous-truth hypotheses now pass via correct encoding. See 2026-05-26 session notes for the BorrowMut-elimination work.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**442 end-to-end tests + 1 coverage test + 258 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** (Same numerical e2e baseline as pre-Idea-1 session, but with a real architectural improvement and a fixed soundness audit finding — 4 new-mut-ref tests previously passing via vacuous-truth hypotheses now pass via correct encoding. Lib unit tests grew 228 → 258 (+12 kind-aware coerce + 15 BorrowMut-elim/RenderCtx helpers). See 2026-05-26 session notes for the BorrowMut-elimination work + review cleanup batches.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -122,45 +122,37 @@ regressions for real (not via vacuous truth).
 **Update (same session)**: principled fix LANDED via BorrowMut
 elimination. Net 442/5 — same numerical baseline, all passes sound.
 
-**Code review pending (this session, pre-merge)** — 10-lens pass on
-today's diff surfaced findings to address before considering today's
-work shipped. Catalogued so they survive session compaction:
+**Code review** — 10-lens pass on today's diff surfaced findings.
+Catalogued, prioritised, and processed in two cleanup batches:
 
-* **Fix-now (small cleanups)**:
-  * **F1** — `LocalDeclKind::StmCallArg { .. }` filter uses `..` which
-    silently passes through future Verus-side field additions. Switch
-    to explicit-by-name destructure (`StmCallArg { native: _ }`) per
-    DESIGN.md upstream-robustness pattern.
-  * **F4** — Multi-linkage `links.insert(rhs_key, dest_var.clone())`
-    silently overrides on duplicate keys. Document the
-    single-linkage invariant or assert (defensive).
-  * **A2** — Extract `borrow_mut_key(ident)` helper. The disambig-key
-    derivation `LeanName::from_var_ident(ident).as_str().to_string()`
-    appears in 4 sites (`borrow_mut_only` filter,
-    `collect_borrow_mut_links`'s `key` closure, `is_borrow_mut_linkage_assign`'s
-    `key` closure, `extract_mut_target`'s redirect).
+* **Fix-now batch LANDED in `28d5b1d`**:
+  * **F1** ✅ — `LocalDeclKind::StmCallArg { .. }` → `StmCallArg
+    { native: _ }` explicit destructure. Future Verus-side field
+    additions now compile-error at the filter.
+  * **F4** ✅ — `debug_assert_eq!` on single-linkage invariant in
+    `collect_borrow_mut_links`. Duplicate-linkage shape change
+    surfaces as a focused failure in debug builds.
+  * **A2** ✅ — `borrow_mut_key(ident)` helper extracted, replaces
+    4 inline `LeanName::from_var_ident(...).as_str().to_string()`
+    derivations.
 
-* **Fix-soon (next session)**:
-  * **F2** — `collect_borrow_mut_links`'s `_ => {}` catch-all silently
-    drops linkages in unmatched StmX variants. Either enumerate the
-    non-nesting leaves explicitly OR add a shape-drift unit test.
-  * **C1** — No unit tests for `RenderCtx::with_pre_state_subst`,
-    `lookup_subst_raw`, `lookup_subst_typ`, `collect_borrow_mut_links`,
-    `resolve_borrow_mut_aliases`, `is_borrow_mut_linkage_assign`. All
-    coverage is e2e. Cheap unit tests would catch refactor regressions.
-  * **D1** — DESIGN.md missing the BorrowMut-elimination entry in
-    "Potential future infrastructure → `RewritePipeline`" (it's the
-    latest entry in the normalization-pass pattern).
-  * **D2** — DESIGN.md missing the soundness finding ("4 new-mut-ref
-    tests previously passed via vacuous-truth False hypotheses").
-    Should land in "Soundness trade-offs accepted" as a CLOSED entry
-    documenting the historical bug + fix.
-  * **D3** — DESIGN.md missing the Old context swap pattern (in
-    "What doesn't have to mirror Verus's encoding" — clear example
-    of using Lean-native semantics instead of mirroring Z3's
-    symbolic forward-reference axiomatization).
+* **Fix-soon batch LANDED in `199cf82`**:
+  * **F2** ✅ — `collect_borrow_mut_links`'s catch-all replaced with
+    explicit `StmX` leaf enumeration. Compile error when a future
+    Verus-side Stm variant containing nested statements gets added.
+  * **C1** ✅ — 15 new unit tests covering `borrow_mut_key`,
+    `is_borrow_mut_linkage_assign`, `collect_borrow_mut_links`,
+    `resolve_borrow_mut_aliases`, `RenderCtx::lookup_subst_raw`,
+    `lookup_subst_typ`, `with_pre_state_subst`. 243 → 258 lib tests.
+  * **D1** ✅ — DESIGN.md `RewritePipeline` entry mentions BorrowMut
+    elimination; dedicated bullet on the new pre-pass added.
+  * **D2** ✅ — DESIGN.md "Soundness trade-offs accepted" — new
+    "Historical: new-mut-ref False-hypothesis silent miscompile
+    (CLOSED 2026-05-26)" entry documenting the bug + fix.
+  * **D3** ✅ — DESIGN.md "What doesn't have to mirror Verus's
+    encoding" — new entry on the Old context swap pattern.
 
-* **File as future work**:
+* **Filed as future work** (in DESIGN.md / HANDOFF queue):
   * **F3** — `collect_borrow_mut_links` recurses into
     `ClosureInner.body` — potentially leaks closure-scope linkages
     to outer fn's map. Probe whether reachable; pin or fix.
