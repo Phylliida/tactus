@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**438 end-to-end tests + 1 coverage test + 219 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**442 end-to-end tests + 1 coverage test + 228 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -6590,6 +6590,242 @@ unit coverage, and surfaced a clean 3-test win on the function-type
 cluster. The "no regressions" property held across all 8 commits —
 the U2 architecture is robust to refactoring because the test suite
 reasons about goal meaning, not specific rendered shapes.
+
+#### Current session (2026-05-25 → 2026-05-26 — TypedExpr scaffold + Cluster C closed + RenderCtx Phase 1 infrastructure)
+
+Two-arc session. **Morning** (continuation of 5/25): introduced
+TypedExpr scaffold + closed Cluster C via use-site coercion at the
+post-call existential typing. **Afternoon → 5/26**: pivoted to
+RenderCtx (Option 1) when TypedExpr-only fixes couldn't address
+Cluster A's typing-info-needed-at-rendering-site shape. Phase 1
+RenderCtx infrastructure landed clean across both renderers but
+the test wins didn't materialize for the inlining-context cases —
+those need typed substitution, which is bigger than this session.
+
+##### TypedExpr morning (closed Cluster C, +4 tests)
+
+Added `lean_verify/src/typed_expr.rs` — TypedExpr struct carrying
+(Expr, Typ), with ~7 smart constructors (var, from_untyped,
+into_slot, coerce_to, into_untyped, field, apply). Plus 9 unit
+tests pinning the wrapper-depth bridging behavior.
+
+Extracted `coerce_lexpr(value, from_typ, to_typ)` into
+`expr_shared.rs` as the shared bidirectional bridge helper.
+`collect_ref_wraps` and `apply_wrap_chain` (the wrap-direction
+counterparts of `count_ref_decorations` / `apply_deref_chain`)
+moved there too. `to_lean_expr::apply_ref_coercion_if_needed`
+became a thin wrapper around `coerce_lexpr` supplying the binder-
+aware structural typ.
+
+Migrated Cluster C's three sites in `push_post_call_frames`
+(post-call existential):
+1. Bound predicate uses TypedExpr::var().into_slot(&inner_typ)
+   to produce `.deref` form for &mut params.
+2. Substitution map (`ens_subst`) inserts the coerced fresh
+   (`fresh.deref`) for &mut params via the same coercion.
+3. Phase 4 rebind frame uses the coerced form so local takes
+   the inner-typed value matching its body-shadow.
+
+Used `strip_one_ref_decoration` (which handles both
+TypX::Decorate and TypX::MutRef) rather than `peel_typ_wrappers`
+(which misses TypX::MutRef — a real bug in the latter helper).
+
+**Wins**: all 3 Cluster C tests closed. Bonus:
+`test_new_mut_ref_pre_post_substitution_probe` (Cluster A) also
+closed — the substitution-map coercion applies regardless of
+trait dispatch. **Net: 438/9 → 442/5, zero regressions.**
+
+Commits: `fb8e3cb` (Phase 1 scaffold + extraction), `e0cd2dd`
+(Phase 2 Cluster C migration).
+
+##### RenderCtx afternoon (infrastructure landed; no test wins)
+
+After Cluster C, attempted Cluster A via TypedExpr-only fixes.
+Hit a wall: the SST and VIR-AST renderers don't know the trait
+method's class signature (which uses wrapper-typed receivers
+for `&self` methods). The arg's `a.typ` doesn't carry the
+expected param typ — that info lives at the trait declaration.
+
+Pivoted to **Option 1 (RenderCtx threading)**: thread a render
+context carrying `fn_map`-backed lookup through both renderers,
+expose `class_method_param_typs(fun)` at call sites, coerce args
+to expected typs.
+
+Added `pub struct RenderCtx<'a>` to `expr_shared.rs` with
+`empty()` / `with_fn_map(&fn_map)` constructors and the
+`class_method_param_typs(&Fun) -> Option<Vec<Typ>>` lookup
+that gracefully degrades to None on cross-crate fns.
+
+Threaded `&RenderCtx` through both renderers via the wrapper
+pattern (keep `sst_exp_to_ast_checked(e)` as wrapper using
+empty ctx; add `_with_ctx(e, ctx)` variant; recursive call sites
+use _with_ctx). Same for `vir_expr_to_ast_for_inlining`. ~90
+internal recursive call sites + ~10 external callers updated
+via Python script (mechanical).
+
+Migrated SST class-method-call arm + VIR-AST class-method-call
+arm to use ctx.class_method_param_typs for receiver coercion.
+TypeAnnot uses expected typ. Built real RenderCtx at three
+entry points: WpCtx::new (ensures_goal), build_req_binders
+(requires), walk_call (inlined req/ens via
+emit_call_precondition_theorem + push_post_call_frames).
+
+**Visible effect**: function's own requires/ensures now render
+`View.view (Tactus.Ref.mk z)` correctly — the receiver wraps
+matching the class signature.
+
+**Tests not closed**: the substituted-ensures path (line 414 of
+test_old_view_trait_dispatch_probe's generated Lean) uses values
+that Cluster C peeled from wrapper to inner. At render time,
+`a.typ` says wrapper but the actual rendered (post-substitution)
+value is bare. `coerce_lexpr(arg, a.typ=wrapper, expected=wrapper)`
+is a no-op — same-typ → no coerce. Need to know the substituted
+value's ACTUAL typ, which means typed substitution.
+
+A speculative `READPLACE_LIFT_ENABLED`-based heuristic ("assume
+peeled when in inlining context") was attempted. Closed
+`test_old_view_trait_dispatch_probe` but broke
+`test_inlined_ensure_references_trait_spec_method` (over-wrapped
+when the substituted value was already wrapper-typed). Wash.
+Reverted.
+
+**Commits**: `df6a40f` (WIP scaffold), `8ebe2f7` (SST side full
+migration), `3fa96b0` (VIR-AST side full migration). Net test
+count: **442/5 throughout — Phase 1 infrastructure landed
+without test wins**.
+
+##### Day total
+
+Started 438/9, ended 442/5 (+4 via Cluster C). 5 commits today
+(scaffold, Cluster C, WIP, SST migration, VIR-AST migration) +
+1 poems commit. 228 unit tests (was 219; +9 TypedExpr tests).
+Zero regressions across all commits. 7 documentation tasks
+completed.
+
+The arc was about commitment vs caution: the morning's Cluster
+C close had clean local typing and worked first try; the
+afternoon's Cluster A push hit recurring "info-not-local"
+walls. The RenderCtx infrastructure is correct and durable
+but its closing-Cluster-A-specifically goal didn't land
+without typed substitution that takes another session.
+
+##### Pending work for next session — options brainstormed
+
+The 5 remaining failing tests split into two clusters with
+different shapes:
+
+* **Cluster A** (2 tests: `test_old_view_pre_post_substitution_probe`,
+  `test_old_view_trait_dispatch_probe`) — substituted-ensures path
+  where rendered value's actual typ differs from a.typ post-Cluster-C
+  substitution.
+
+* **Cluster B** (3 tests: `test_exec_call_recursive_aliased_arg_probe`,
+  `test_exec_call_recursive_generic_datatype_cross_instantiation`,
+  `test_exec_call_site_ref_to_bare_probe`) — different shape: SST
+  walker doesn't track let-shadow typs through scope-introducing
+  constructs, so projection sites (CheckDecreaseHeight, Field)
+  compute wrong deref counts on aliased locals.
+
+###### Option A: Generalize `coerce_lexpr` to handle wrapper-kind mismatches
+
+Currently `coerce_lexpr` only counts wrapper depth. If
+`from=Tactus.MutRef Holder` and `to=Tactus.Ref Holder` (both depth
+1, different wrapper KINDS), it's a no-op. But Lean distinguishes
+these.
+
+Fix: when wrapper *kinds* differ, peel-then-wrap.
+`apply_deref_chain` to inner, then `apply_wrap_chain` to the
+target's wraps. Use `collect_ref_wraps` on both sides; if the
+sequences differ, peel-fully-then-wrap-target.
+
+**Cost**: ~30 lines.
+
+**What it closes**: probably
+`test_old_view_trait_dispatch_probe` (MutRef → Ref bridge). Might
+close others as a side effect.
+
+**Risk**: low — strict generalization. Existing depth-only cases
+keep their behavior.
+
+###### Option B: Typed substitution (the big one)
+
+`lean_ast::substitute` becomes type-aware. Substitution map
+values carry their typs. At each `Var(name)` slot, the
+substituter knows the slot's expected typ from surrounding
+context and coerces.
+
+The challenge: the "slot's expected typ" depends on where the
+Var is in the expression. Mini-elaboration to track typing
+context as the walker descends.
+
+**Cost**: 1-2 focused sessions. Real refactor of substitute's
+API; touches every substitution site.
+
+**What it closes**: both Cluster A tests + future
+typing-via-substitution bugs.
+
+**Risk**: medium. Ad-hoc approaches (like today's `in_inlining`
+heuristic) break things; the correct mechanism is bigger.
+
+###### Option C: Scoped SST binder tracking (close Cluster B)
+
+Build a binder context similar to VIR-AST's `BinderCtx` but for
+the SST walker. As the walker descends through scope-introducing
+constructs (Let, Block, If-with-bindings, Match arms), update
+the binder map. At projection sites (CheckDecreaseHeight,
+Field), consult the binder context for the variable's actual
+current typ and compute correct deref counts.
+
+**Cost**: 1 focused session.
+
+**What it closes**: all 3 Cluster B tests. Possibly the
+recursive_generic_datatype_cross_instantiation if its issue is
+binder-tracking-related.
+
+**Risk**: low — same shape as VIR-AST's BinderCtx, which works.
+
+###### Option D: Document + stop
+
+Update HANDOFF.md + DESIGN.md with today's lessons; mark A and B
+as architecturally tracked; pick up when there's appetite for
+the bigger investment.
+
+**Cost**: 30-60 min.
+
+###### Wildcards
+
+* **Lean Coe instances**: register
+  `instance : Coe A (Tactus.Ref A) := ⟨Tactus.Ref.mk⟩` and
+  similar; let Lean's elaborator handle wrapper bridging at
+  every site. Cleaner if it works; risky for trait dispatch
+  (loses control — Lean might silently coerce in unintended
+  positions, e.g., picking the wrong trait instance because Self
+  type was implicitly coerced).
+
+* **Strip `&self` from class signatures**: emit class method
+  param typs with ref decorations stripped. Trait distinguishability
+  preserved via Self type alone. Removes Cluster A's mismatch at
+  source. Trade-off: loses borrow-tracking-visible-in-goal-state
+  (the user noted this as a Verus appeal worth keeping).
+
+###### Suggested sequence for next session(s)
+
+**Two-step warmup**: start with **Option A** as a half-session
+probe (~1-2 hours). Either it surprises us and closes a test or
+two, OR it confirms the typed-substitution diagnosis.
+
+After A: pick between **B** (close Cluster A via typed
+substitution, harder) and **C** (close Cluster B via binder
+tracking, easier and self-contained). Recommended: **C first**
+(smaller, more confident, doesn't depend on A's outcome). Then
+B as the bigger architectural session.
+
+Concrete two-session plan:
+1. **Next session**: Option A probe + Option C (binder tracking
+   for Cluster B). Goal: 442/5 → 442/2 (close all Cluster B +
+   maybe one Cluster A).
+2. **Session after**: Option B (typed substitution for Cluster
+   A). Goal: 442/2 → 442/0.
 
 ## Architecture
 
