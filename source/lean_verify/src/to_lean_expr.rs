@@ -581,7 +581,33 @@ fn expr_to_node(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::Rend
         ExprX::Ghost { expr, .. } | ExprX::ProofInSpec(expr) => expr_to_node(expr, binders, ctx),
         ExprX::Loc(expr) => expr_to_node(expr, binders, ctx),
 
-        ExprX::ReadPlace(place, _) => place_to_expr(&place.x, binders, ctx).node,
+        ExprX::ReadPlace(place, _) => {
+            // Render-time substitution: in new-mut-ref-encoded ASTs,
+            // a read of a local appears as `ReadPlace(Local(v), _)`
+            // rather than `Var(v)`. Check value_subst here too so
+            // callee-spec inlining can bridge mut params at their
+            // use sites under both encodings.
+            //
+            // The slot typ used for the bridge is `strip_one_ref_decoration
+            // (expr.typ)` — peeling one wrapper layer off the ReadPlace's
+            // claimed typ. Verus encodes `*a` (the spec-mode read of a
+            // mut-ref local) as `ReadPlace(Local(a), ImmutBor)` where
+            // `expr.typ` is the LOCAL's typ (e.g., `MutRef Int`) rather
+            // than the dereffed value's typ (`Int`). The AST claim lies
+            // about the semantic slot: callers expect inner-typed values
+            // (numeric arith, downstream Add/Eq), not wrapper-typed ones.
+            // Bridging to the stripped form gives the inner-typed view
+            // that mirrors pre-Cluster-C's pre-peel behaviour, but at
+            // render time so the slot's typ flows naturally.
+            if let PlaceX::Local(ident) = &place.x {
+                let lean_name = crate::lean_name::LeanName::from_var_ident(ident);
+                let inner_typ = strip_one_ref_decoration(&expr.typ);
+                if let Some(bridged) = ctx.lookup_subst(&lean_name, &inner_typ) {
+                    return bridged.node;
+                }
+            }
+            place_to_expr(&place.x, binders, ctx).node
+        }
 
         ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => expr_to_node(inner, binders, ctx),
         ExprX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
