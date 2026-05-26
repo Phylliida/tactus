@@ -315,6 +315,24 @@ pub struct WpCtx<'a> {
     /// `Var(borrow_mut_local)` in arg position (no surrounding
     /// `Loc`) as a valid mut target.
     pub mut_ref_locals: HashSet<String>,
+    /// Map from a BorrowMut local's sanitized name to the user-local
+    /// `VarIdent` it bridges. Populated by walking the SST body
+    /// looking for `Assign(user_local, Var(borrow_mut_local))` —
+    /// Verus's new-mut-ref encoding for `bump(&mut y)` emits this
+    /// assignment as the forward-forward linkage between `y` and
+    /// the synthetic BorrowMut local.
+    ///
+    /// `extract_mut_target` consults this map to redirect the call's
+    /// mut-arg from the BorrowMut local to the user-local directly,
+    /// so Phase 4 rebinds the user-local to the post-state. The
+    /// body's linkage `Assign` is dropped in `build_wp` so the let
+    /// frame doesn't double-bind.
+    ///
+    /// This eliminates Verus's BorrowMut indirection for the simple
+    /// `&mut <local>` case — the indirection exists for SMT
+    /// bookkeeping that Lean doesn't need. See HANDOFF.md 2026-05-26
+    /// session note "BorrowMut elimination" for the rationale.
+    pub borrow_mut_links: HashMap<String, VarIdent>,
 }
 
 /// The break / continue goal leaves in scope inside a loop body.
@@ -418,6 +436,12 @@ impl<'a> WpCtx<'a> {
         // for x in this set, before rendering to LExpr. Empty for
         // fns without `&mut` params (the common case).
         mut_param_names: &HashSet<String>,
+        // BorrowMut elimination map (caller-side new-mut-ref).
+        // Walked from the SST body before WpCtx construction. Maps
+        // each sanitized BorrowMut-local name to the user-local
+        // VarIdent it bridges. Empty for fns without BorrowMut
+        // indirection (the common case).
+        borrow_mut_links: HashMap<String, VarIdent>,
     ) -> Result<Self, String> {
         // Validate the *rewritten* expressions — every mut-ref shape
         // Verus might emit (legacy `VarAt(x, Pre)` or new-mode
@@ -502,6 +526,7 @@ impl<'a> WpCtx<'a> {
             ret_name,
             ensures_goal,
             mut_ref_locals: mut_param_names.clone(),
+            borrow_mut_links,
         })
     }
 }
@@ -739,6 +764,24 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // inside `WpCtx::new`.
     let rewritten_body: Stm = rewrite_mut_ref_in_stm(&check.body, &mut_param_names);
 
+    // BorrowMut elimination: walk the body (post mut-ref rewrites)
+    // collecting `Assign(user_local, Var(borrow_mut_local))` linkage
+    // patterns. The map is consulted at call sites to redirect
+    // mut-args from the BorrowMut local to the user-local (so Phase
+    // 4 rebinds the user-local) and at Assign handling to drop the
+    // linkage statements. Set is the BorrowMut subset of
+    // `mut_param_names` — fn-level &mut params and BorrowMut locals
+    // both live in mut_param_names but only the latter have the
+    // forward-forward linkage shape we want to detect.
+    let borrow_mut_only: HashSet<String> = check.local_decls.iter()
+        .filter(|d| matches!(d.kind, LocalDeclKind::BorrowMut))
+        .map(|d| sanitize(&d.ident.0))
+        .collect();
+    let mut borrow_mut_links: HashMap<String, VarIdent> = HashMap::new();
+    if !borrow_mut_only.is_empty() {
+        collect_borrow_mut_links(&rewritten_body, &borrow_mut_only, &mut borrow_mut_links);
+    }
+
     // Insert `Clip { range: Nat }` at Call sites where args render as
     // Lean Int but params render as Lean Nat (BUG-as-nat-cast.md).
     // Verus's cast lowering drops `U(_)/USize → Nat` casts as no-ops;
@@ -749,7 +792,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // `WpCtx::new` validates reqs / ens_exps before rendering them.
     // It also applies the same rewrites to each ens_exp so the
     // `ensures_goal` LExpr already has the synthetic names baked in.
-    let ctx = WpCtx::new(krate, check, &mut_param_names)?;
+    let ctx = WpCtx::new(krate, check, &mut_param_names, borrow_mut_links)?;
 
     let mut binders = build_param_binders(fn_sst);
     binders.extend(build_borrow_mut_binders(check));
@@ -1475,7 +1518,7 @@ fn sanitize_loc_for_name(loc: &str) -> String {
 /// the per-Wp-variant behaviour.
 fn walk_obligations<'a>(
     wp: &Wp<'a>,
-    ctx: &WpCtx<'a>,
+    ctx: &'a WpCtx<'a>,
     obl: &OblCtx,
     e: &mut ObligationEmitter,
 ) {
@@ -1720,7 +1763,7 @@ fn walk_assert_by_tactus<'a>(
     cond: Option<Validated<'a>>,
     tactic_text: &str,
     body: &Wp<'a>,
-    ctx: &WpCtx<'a>,
+    ctx: &'a WpCtx<'a>,
     obl: &OblCtx,
     e: &mut ObligationEmitter,
 ) {
@@ -1879,7 +1922,7 @@ fn walk_loop<'a>(
     modified_vars: &[(&'a VarIdent, &'a Typ)],
     body: &Wp<'a>,
     after: &Wp<'a>,
-    ctx: &WpCtx<'a>,
+    ctx: &'a WpCtx<'a>,
     obl: &OblCtx,
     e: &mut ObligationEmitter,
 ) {
@@ -2449,6 +2492,118 @@ fn rewrite_mut_ref_in_stm(
     })
 }
 
+// ── BorrowMut indirection elimination ────────────────────────────────
+//
+// Verus's new-mut-ref encoding for `bump(&mut y)` emits a synthetic
+// `LocalDeclKind::BorrowMut` local `tmp%` plus an `Assign(y, Var(tmp%))`
+// statement that establishes the forward-forward linkage between the
+// user-local `y` and the synthetic. The `bump(tmp%)` call then mutates
+// `tmp%`; the post-call value reaches `y` through the linkage.
+//
+// This indirection exists for Z3's borrow-tracking model — it doesn't
+// help Lean. We eliminate it by:
+//   1. Detecting the linkage Assigns and recording `tmp% → y`
+//   2. Redirecting the call's mut-arg target from `tmp%` to `y`
+//      directly (so Phase 4 rebinds `y`)
+//   3. Dropping the linkage Assigns from the body (no `let y := tmp%`
+//      frame emitted)
+//
+// After this pre-pass, the SST renders as if the user had written
+// "bump mutates y directly" — which is what they did, semantically.
+// Same pattern as other Tactus-side normalizations (#94 VarAt rewrite,
+// #95 new-mut-ref shape normalization, BUG-as-nat-cast insertion).
+
+/// Walk the SST body collecting `Assign(user_local, Var(borrow_mut_local))`
+/// patterns. Returns a map from sanitized borrow-mut name to the user
+/// local's `VarIdent`.
+///
+/// Detection rule: the assignment's destination is a simple `Var` /
+/// `VarLoc` whose name is NOT in `borrow_mut_locals`, and the RHS
+/// peels (through transparent wrappers) to a `Var` / `VarLoc` whose
+/// name IS in `borrow_mut_locals`. Direct linkage — no SMT-specific
+/// shape recognition needed.
+fn collect_borrow_mut_links(
+    stm: &Stm,
+    borrow_mut_locals: &HashSet<String>,
+    links: &mut HashMap<String, VarIdent>,
+) {
+    match &stm.x {
+        StmX::Assign { lhs: Dest { dest, is_init: _ }, rhs } => {
+            let Some(dest_var) = extract_simple_var_ident(dest) else { return };
+            // dest_var must be a non-borrow-mut local — we're linking
+            // a user local TO a borrow-mut. The reverse direction
+            // (`tmp% = <something>`) isn't a forward-forward linkage.
+            if borrow_mut_locals.contains(&sanitize(&dest_var.0)) {
+                return;
+            }
+            let rhs_peeled = peel_transparent(rhs);
+            let rhs_var = match &rhs_peeled.x {
+                ExpX::Var(v) | ExpX::VarLoc(v) => v,
+                _ => return,
+            };
+            let rhs_name = sanitize(&rhs_var.0);
+            if borrow_mut_locals.contains(&rhs_name) {
+                // Record the linkage; the latest detected linkage wins
+                // if Verus emits multiple (shouldn't, in practice — one
+                // BorrowMut local per call site).
+                links.insert(rhs_name, dest_var.clone());
+            }
+        }
+        StmX::Block(stmts) => {
+            for s in stmts.iter() {
+                collect_borrow_mut_links(s, borrow_mut_locals, links);
+            }
+        }
+        StmX::If(_, then_branch, else_branch) => {
+            collect_borrow_mut_links(then_branch, borrow_mut_locals, links);
+            if let Some(e) = else_branch {
+                collect_borrow_mut_links(e, borrow_mut_locals, links);
+            }
+        }
+        StmX::Loop { body, .. } => {
+            collect_borrow_mut_links(body, borrow_mut_locals, links);
+        }
+        StmX::DeadEnd(s) | StmX::OpenInvariant(s) => {
+            collect_borrow_mut_links(s, borrow_mut_locals, links);
+        }
+        StmX::AssertQuery { body, .. } => {
+            collect_borrow_mut_links(body, borrow_mut_locals, links);
+        }
+        StmX::ClosureInner { body, .. } => {
+            collect_borrow_mut_links(body, borrow_mut_locals, links);
+        }
+        // Leaf statements without nested Stm: Call, Assert(*),
+        // AssertCompute, Assume, Fuel, RevealString, Return,
+        // BreakOrContinue, Air.
+        _ => {}
+    }
+}
+
+/// Is this Assign the linkage between a user local and a BorrowMut
+/// local? If so, the build_wp handler drops it (no Let frame emitted)
+/// — the rebind happens at the matching call's Phase 4 instead.
+///
+/// Mirrors `collect_borrow_mut_links`'s detection rule. Both sites
+/// must agree on what constitutes a linkage Assign, or the body would
+/// produce a let frame AND Phase 4 would rebind the same user_local
+/// (double substitution).
+fn is_borrow_mut_linkage_assign(
+    dest: &Exp,
+    rhs: &Exp,
+    borrow_mut_locals: &HashSet<String>,
+) -> bool {
+    let Some(dest_var) = extract_simple_var_ident(dest) else { return false };
+    if borrow_mut_locals.contains(&sanitize(&dest_var.0)) {
+        return false;
+    }
+    let rhs_peeled = peel_transparent(rhs);
+    let rhs_var = match &rhs_peeled.x {
+        ExpX::Var(v) | ExpX::VarLoc(v) => v,
+        _ => return false,
+    };
+    borrow_mut_locals.contains(&sanitize(&rhs_var.0))
+}
+
 // ── Nat coercion insertion (BUG-as-nat-cast.md) ────────────────────────
 //
 // At every `Call` site, insert `Clip { range: Nat }` around args whose
@@ -2632,7 +2787,7 @@ fn walk_call<'a>(
     call_span: &Span,
     mut_args: &[(usize, MutTargetRaw<'a>)],
     after: &Wp<'a>,
-    ctx: &WpCtx<'a>,
+    ctx: &'a WpCtx<'a>,
     obl: &OblCtx,
     e: &mut ObligationEmitter,
 ) {
@@ -3445,7 +3600,7 @@ fn walk_let<'a>(
     name: &crate::lean_name::LeanName,
     val: &'a Exp,
     body: &Wp<'a>,
-    ctx: &WpCtx<'a>,
+    ctx: &'a WpCtx<'a>,
     obl: &OblCtx,
     e: &mut ObligationEmitter,
 ) {
@@ -4249,7 +4404,7 @@ fn match_single_let_bind<'a>(
 fn build_wp<'a>(
     stm: &'a Stm,
     after: Wp<'a>,
-    ctx: &WpCtx<'a>,
+    ctx: &'a WpCtx<'a>,
     // Linked-list stack of enclosing loops' break/continue leaves,
     // innermost first. `LoopStack::Empty` outside any loop (where
     // `StmX::BreakOrContinue` is rejected). Most recursive calls
@@ -4277,6 +4432,15 @@ fn build_wp<'a>(
         StmX::Assign { lhs: Dest { dest, is_init: _ }, rhs } => {
             check_exp(dest)?;
             check_exp(rhs)?;
+            // BorrowMut elimination: drop the body's `Assign(user_local,
+            // Var(borrow_mut_local))` linkage Assign. Phase 4 of the
+            // matching call rebinds the user_local to the post-state
+            // existential directly — emitting the let frame here would
+            // capture the pre-call value of borrow_mut_local. See
+            // `collect_borrow_mut_links` for the linkage discovery.
+            if is_borrow_mut_linkage_assign(dest, rhs, &ctx.mut_ref_locals) {
+                return Ok(after);
+            }
             let Some(ident) = extract_simple_var_ident(dest) else {
                 return Err(format!(
                     "assignment with {} (got {:?}) is not yet supported",
@@ -4710,7 +4874,7 @@ fn build_wp_call<'a>(
     dest: Option<&'a Dest>,
     call_span: &'a Span,
     after: Wp<'a>,
-    ctx: &WpCtx<'a>,
+    ctx: &'a WpCtx<'a>,
 ) -> Result<Wp<'a>, String> {
     reject_unsupported_call_shapes(split)?;
 
@@ -4719,7 +4883,7 @@ fn build_wp_call<'a>(
 
     validate_call_arities(callee, args, callee_typ_args)?;
 
-    let mut_args = build_call_mut_args(&callee.params, args, &ctx.mut_ref_locals)?;
+    let mut_args = build_call_mut_args(&callee.params, args, &ctx.mut_ref_locals, &ctx.borrow_mut_links)?;
 
     let bound_dest: Option<&'a VarIdent> = dest
         .and_then(|d| extract_simple_var_ident(&d.dest));
@@ -4794,7 +4958,7 @@ fn resolve_callee<'a>(
     resolved_method: &'a Option<(Fun, vir::ast::Typs)>,
     is_trait_default: &Option<bool>,
     typ_args: &'a vir::ast::Typs,
-    ctx: &WpCtx<'a>,
+    ctx: &'a WpCtx<'a>,
 ) -> Result<(&'a FunctionX, &'a FunctionX, &'a [Typ]), String> {
     // For `is_trait_default = Some(true)` calls (#96): the
     // `resolved_method`'s fn is a synthesized wrapper around the
@@ -4920,6 +5084,7 @@ enum MutTargetRaw<'a> {
 fn extract_mut_target<'a>(
     e: &'a Exp,
     mut_ref_locals: &HashSet<String>,
+    borrow_mut_links: &'a HashMap<String, VarIdent>,
 ) -> Option<MutTargetRaw<'a>> {
     // Peel transparent wrappers (Box/Unbox/CoerceMode/Trigger) at
     // the outermost level too — for some L-value shapes (e.g.,
@@ -4936,8 +5101,20 @@ fn extract_mut_target<'a>(
     // mutates; `mut_ref_locals` carries the names of these
     // BorrowMut locals so we recognize them. Legacy-mode `&mut y`
     // still goes through the Loc path below.
+    //
+    // BorrowMut elimination: when the BorrowMut local has a known
+    // user-local linkage (recorded in `borrow_mut_links` via the
+    // body's `Assign(user_local, Var(borrow_mut_local))` forward-
+    // forward statement), redirect the mut target to the user-local
+    // directly. Phase 4 then rebinds the user-local to the post-state
+    // existential, and the body's linkage Assign is dropped — see
+    // `collect_borrow_mut_links` / `is_borrow_mut_linkage_assign`.
     if let ExpX::Var(ident) = &e.x {
-        if mut_ref_locals.contains(&sanitize(&ident.0)) {
+        let name = sanitize(&ident.0);
+        if mut_ref_locals.contains(&name) {
+            if let Some(user_local) = borrow_mut_links.get(&name) {
+                return Some(MutTargetRaw::Var(user_local));
+            }
             return Some(MutTargetRaw::Var(ident));
         }
     }
@@ -5016,6 +5193,7 @@ fn build_call_mut_args<'a>(
     callee_params: &vir::ast::Params,
     args: &'a vir::sst::Exps,
     mut_ref_locals: &HashSet<String>,
+    borrow_mut_links: &'a HashMap<String, VarIdent>,
 ) -> Result<Vec<(usize, MutTargetRaw<'a>)>, String> {
     let mut mut_args: Vec<(usize, MutTargetRaw<'a>)> = Vec::new();
     for (i, (param, a)) in callee_params.iter().zip(args.iter()).enumerate() {
@@ -5029,7 +5207,7 @@ fn build_call_mut_args<'a>(
         // in lockstep with `add_param_subst_entries` (the other
         // consumer that asks "is this param &mut?").
         if is_mut_ref_typ(&param.x.typ, param.x.is_mut) {
-            match extract_mut_target(a, mut_ref_locals) {
+            match extract_mut_target(a, mut_ref_locals, borrow_mut_links) {
                 Some(target) => mut_args.push((i, target)),
                 None => return Err(format!(
                     "&mut argument at position {} is not a supported L-value \
@@ -5082,7 +5260,7 @@ fn build_wp_loop<'a>(
     invs: &'a vir::sst::LoopInvs,
     decrease: &'a vir::sst::Exps,
     after: Wp<'a>,
-    ctx: &WpCtx<'a>,
+    ctx: &'a WpCtx<'a>,
     outer_loop_stack: &LoopStack<'_>,
 ) -> Result<Wp<'a>, String> {
     // Per-loop-unique, per-lex-level d_old names. Verus's
@@ -6442,6 +6620,7 @@ mod tests {
             ret_name: None,
             ensures_goal: LExpr::lit_true(),
             mut_ref_locals: HashSet::new(),
+            borrow_mut_links: HashMap::new(),
         }
     }
 
@@ -6730,7 +6909,7 @@ mod tests {
         let krate = empty_krate();
         let check = empty_func_check(vec![], vec![]);
         let mut_param_names = HashSet::new();
-        let result = WpCtx::new(&krate, &check, &mut_param_names);
+        let result = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new());
         assert!(result.is_ok(), "empty WpCtx should construct: {:?}", result.err());
         let ctx = result.unwrap();
         assert!(ctx.fn_map.is_empty(), "fn_map should be empty for empty krate");
@@ -6749,7 +6928,7 @@ mod tests {
         let bad_req = old_exp("snapshot", "x");
         let check = empty_func_check(vec![bad_req], vec![]);
         let mut_param_names = HashSet::new();
-        let result = WpCtx::new(&krate, &check, &mut_param_names);
+        let result = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new());
         assert!(result.is_err(),
             "WpCtx::new must reject ExpX::Old in reqs; got Ok(_)");
         let err = result.err().unwrap();
@@ -6768,7 +6947,7 @@ mod tests {
         let bad_ens = old_exp("snapshot", "y");
         let check = empty_func_check(vec![], vec![bad_ens]);
         let mut_param_names = HashSet::new();
-        let result = WpCtx::new(&krate, &check, &mut_param_names);
+        let result = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new());
         assert!(result.is_err(),
             "WpCtx::new must reject ExpX::Old in ens_exps; got Ok(_)");
     }
@@ -6826,7 +7005,7 @@ mod tests {
         let krate = empty_krate();
         let check = empty_func_check(vec![], vec![]);
         let mut_param_names = HashSet::new();
-        let ctx = WpCtx::new(&krate, &check, &mut_param_names)
+        let ctx = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new())
             .expect("empty ctx");
         let mut emitter = mk_test_emitter();
 
@@ -6879,7 +7058,7 @@ mod tests {
         let krate = empty_krate();
         let check = empty_func_check(vec![], vec![]);
         let mut_param_names = HashSet::new();
-        let ctx = WpCtx::new(&krate, &check, &mut_param_names)
+        let ctx = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new())
             .expect("empty ctx");
         let mut emitter = mk_test_emitter();
 
