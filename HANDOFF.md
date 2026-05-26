@@ -8,11 +8,74 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**443 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** (One e2e added — C3 negative regression for the new-mut-ref soundness finding. Lib unit tests grew 258 → 261 (C2 shape pins +2, F3 closure-leak probe +1). vs pre-Idea-1: real architectural improvement + closed soundness audit finding — 4 new-mut-ref tests previously passing via vacuous-truth hypotheses now pass via correct encoding. See 2026-05-26 session notes for the BorrowMut-elimination work + review cleanup batches + test follow-up.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**445 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** (Cluster A's 2 remaining failures closed this session via typed substitution + universal call-arg bridging — see 2026-05-26 session notes "typed substitution closes Cluster A".) vstd still verifies (1530 functions, 0 errors). Remaining 3 e2e failures are Cluster B (SST binder tracking, orthogonal — separate problem). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
 ### Recent session landings
+
+#### Current session (2026-05-26 cont. — typed substitution closes Cluster A)
+
+**Headline numbers**: 443/5 → 445/3 (+2 net, Cluster A both closed),
+zero regressions. 261 lib tests (unchanged). vstd 1530/0.
+
+**The arc.** Started from "Cluster A's 2 old_view tests need typed
+substitution per yesterday's brainstorm." User wanted the principled
+fix, no hacks. The plan grew as the probing surfaced shape:
+
+1. **Universal fn-call arg bridging (`2d85423`)** — extended
+   `class_method_param_typs` → `fn_param_typs` (already general; just
+   rename) and added the coerce_lexpr bridge at non-class-method call
+   sites in both renderers (SST + VIR-AST). Caller's own ensures/
+   requires for inherent-method dispatch now get the explicit
+   `Tactus.Ref.mk z` wrap. No regression, but Cluster A still failed
+   (inlining substitutions lie about typs).
+
+2. **Typed substitution migration (`a02dac1`)** — six coupled
+   changes:
+   * `caller_param_typs: HashMap<VarIdent, Typ>` field on WpCtx,
+     populated from `fn_sst.x.pars` with `strip_one_ref_decoration`
+     for `&mut` params (mirrors `binder_ctx_from_params`).
+   * `caller_arg_actual_typ(arg, caller_param_typs) -> Typ` helper:
+     for `Var(local)` returns the body-shadow typ; otherwise `arg.typ`.
+   * `CallSubstitutions` split: req_subst/ens_subst (LExpr, post-
+     render) → req_value_subst/ens_value_subst/ens_value_subst_pre
+     (typed (LExpr, Typ), render-time). typ_subst and ret_subst stay
+     post-render (no typing concern).
+   * `render_ctx_req` populates BOTH `value_subst` and `value_subst_pre`
+     with the same map — requires sees only pre-state, so the Old(_)
+     swap (which activates value_subst_pre) should find the same
+     entries.
+   * `structural_typ` for ReadPlace+non-Local in inlining context
+     (ctx.value_subst.is_some()) returns `Some(p.typ.clone())`.
+     Enables the outer apply_ref_coercion bridge for nested-Place
+     shapes (DerefMut(Local(h)), Temporary(Var(h)), etc.).
+   * `place_to_expr` Local arm consults `value_subst` — without this,
+     `*h` (ReadPlace(DerefMut(Local(h)))) skipped substitution
+     because the outer ReadPlace's early-return only matched the
+     direct Local case.
+
+**Why this is principled, not a hack.** The two clusters had
+different shapes, both rooted in "the rendered LExpr's actual Lean
+typ ≠ what the AST claims." Universal call-arg bridging (item 1)
+codifies Rust's auto-borrow uniformly — every call, every arg,
+inserts the right `Tactus.X.mk`/`.deref` chain based on a
+declared-vs-rendered typ delta. Typed substitution (item 2)
+preserves the typ info through the substitution boundary so the
+delta is real. Together: every wrap is explicit in generated Lean,
+no special cases for trait vs inherent vs inlined, the bridge
+mechanism is one `coerce_lexpr` applied uniformly.
+
+**Remaining 3 e2e failures (Cluster B).** Different shape:
+* `test_exec_call_recursive_aliased_arg_probe`
+* `test_exec_call_site_ref_to_bare_probe`
+* `test_exec_call_recursive_generic_datatype_cross_instantiation`
+
+SST walker doesn't track let-shadow typs through scope-introducing
+constructs (Let, Block, If-with-bindings, Match arms), so projection
+sites (CheckDecreaseHeight, Field) compute wrong deref counts on
+aliased locals. Orthogonal to typed substitution; needs Option C
+(scoped SST binder tracking). Separate session.
 
 #### Current session (2026-05-26 — Idea 1 principled: storage-typ subst + soundness finding)
 
