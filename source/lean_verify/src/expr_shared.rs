@@ -39,6 +39,7 @@ use vir::ast::{
 };
 
 use crate::lean_ast::{BinOp as L, Expr as LExpr, ExprNode};
+use crate::lean_name::LeanName;
 use crate::to_lean_type::{lean_name, sanitize, short_name};
 
 // ── RenderCtx ────────────────────────────────────────────────────────
@@ -64,28 +65,61 @@ use crate::to_lean_type::{lean_name, sanitize, short_name};
 /// depend on `sst_to_lean`.
 pub type RenderFnMap<'a> = HashMap<&'a Fun, &'a FunctionX>;
 
+/// Render-time value substitution map. Each entry maps a variable
+/// name (as it appears in the source AST being rendered) to a
+/// `(rendered_value, value_typ)` pair: the LExpr to substitute, plus
+/// the Lean-level typ that LExpr has post-substitution.
+///
+/// Used by `RenderCtx::lookup_subst` to bridge the substituted value
+/// to the slot's expected typ at each `Var` rendering site. This
+/// closes the "claimed-typ-lies" gap that LExpr-level substitute
+/// can't address: at the Var site, the AST node carries the slot's
+/// expected typ (`expr.typ`), while the map's entry carries the
+/// value's actual typ — together they let `coerce_lexpr` bridge
+/// per-use-site, instead of pre-coercing at map-build time toward
+/// a single direction.
+pub type RenderValueSubst<'a> = HashMap<LeanName, (LExpr, Typ)>;
+
 /// Render context: typing info available to expression renderers.
 ///
-/// Currently holds an optional `fn_map` for class-method-call lookup.
+/// * `fn_map` — function lookup for class-method-call param-typ
+///   inspection (`class_method_param_typs`).
+/// * `value_subst` — typed substitution map applied during render
+///   (`lookup_subst`). Each Var rendering site consults this before
+///   falling back to plain `Var(name)` rendering, so substituted
+///   values bridge to the slot's typ at use rather than at map-build.
+///
 /// Construct with `RenderCtx::empty()` for tests or rendering paths
-/// without fn_map (e.g., test fixtures, sanity check probes). Use
-/// `RenderCtx::with_fn_map(&fn_map)` for production rendering at
-/// codegen entry points.
+/// without typing info. Use `RenderCtx::with_fn_map(&fn_map)` or
+/// `RenderCtx::with_fn_map_and_value_subst(&fn_map, &subst)` for
+/// production rendering at codegen entry points.
 #[derive(Clone, Copy)]
 pub struct RenderCtx<'a> {
     pub fn_map: Option<&'a RenderFnMap<'a>>,
+    pub value_subst: Option<&'a RenderValueSubst<'a>>,
 }
 
 impl<'a> RenderCtx<'a> {
     /// Empty context — class-method-call rendering falls back to
-    /// no-coerce. Safe for any rendering path; ideal for tests.
+    /// no-coerce; Var substitution falls through to plain Var.
     pub fn empty() -> Self {
-        Self { fn_map: None }
+        Self { fn_map: None, value_subst: None }
     }
 
     /// Context with fn_map for class-method-call rendering.
     pub fn with_fn_map(fn_map: &'a RenderFnMap<'a>) -> Self {
-        Self { fn_map: Some(fn_map) }
+        Self { fn_map: Some(fn_map), value_subst: None }
+    }
+
+    /// Context with both fn_map and a render-time value substitution
+    /// map. Used by call-site inlining paths (`emit_call_precondition_theorem`,
+    /// `push_post_call_frames`) where mut-param substitution needs
+    /// typed bridging at each use site.
+    pub fn with_fn_map_and_value_subst(
+        fn_map: &'a RenderFnMap<'a>,
+        value_subst: &'a RenderValueSubst<'a>,
+    ) -> Self {
+        Self { fn_map: Some(fn_map), value_subst: Some(value_subst) }
     }
 
     /// Look up a class-method decl's declared param typs. Returns
@@ -105,6 +139,24 @@ impl<'a> RenderCtx<'a> {
         let fn_map = self.fn_map?;
         let func = fn_map.get(fun)?;
         Some(func.params.iter().map(|p| p.x.typ.clone()).collect())
+    }
+
+    /// Look up a Var name in the render-time substitution map and,
+    /// if present, return the substituted value bridged to `slot_typ`
+    /// via `coerce_lexpr`. Returns `None` if no substitution is
+    /// configured or the name isn't in the map — callers fall back
+    /// to plain `Var(name)` rendering.
+    ///
+    /// This is the entry point for render-time substitution. By
+    /// taking `slot_typ` from the caller (which holds the current
+    /// AST node's typ), the bridge uses the slot's expectation
+    /// rather than the value's claimed source typ — the architectural
+    /// fix for the "claimed-typ-lies" gap that pre-render coercion
+    /// can't address.
+    pub fn lookup_subst(&self, name: &LeanName, slot_typ: &Typ) -> Option<LExpr> {
+        let map = self.value_subst?;
+        let (value, value_typ) = map.get(name)?;
+        Some(coerce_lexpr(value.clone(), value_typ, slot_typ))
     }
 }
 

@@ -437,7 +437,16 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
     Ok(match &e.x {
         ExpX::Const(c) => const_to_node_checked(c)?,
         ExpX::Var(ident) | ExpX::VarLoc(ident) | ExpX::VarAt(ident, _) => {
-            ExprNode::Var(crate::lean_name::LeanName::from_var_ident(ident))
+            // Render-time substitution: if ctx has a value_subst map
+            // and `ident` is in it, return the bridged value (coerced
+            // to `e.typ`, the slot's expected typ here). Otherwise
+            // fall through to plain Var. See `RenderCtx::lookup_subst`
+            // and `RenderValueSubst` for the design.
+            let lean_name = crate::lean_name::LeanName::from_var_ident(ident);
+            if let Some(bridged) = ctx.lookup_subst(&lean_name, &e.typ) {
+                return Ok(bridged.node);
+            }
+            ExprNode::Var(lean_name)
         }
         ExpX::StaticVar(fun) | ExpX::ExecFnByName(fun) => {
             ExprNode::Var(crate::lean_name::LeanName::from_path(&fun.path))
