@@ -722,11 +722,11 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
             // wraps (or `.deref` peels) bridging the local a.typ to
             // the expected param typ.
             //
-            // When ctx.class_method_param_typs returns None (cross-
-            // crate fun, or ctx is empty), we fall back to no-coerce
-            // — same as the pre-RenderCtx behavior. Tests for the
-            // cross-crate path still work via the existing fallback.
-            let expected_typs = ctx.class_method_param_typs(fun);
+            // When ctx.fn_param_typs returns None (cross-crate fun, or
+            // ctx is empty), we fall back to no-coerce — same as the
+            // pre-RenderCtx behavior. Tests for the cross-crate path
+            // still work via the existing fallback.
+            let expected_typs = ctx.fn_param_typs(fun);
             let app_args: Result<Vec<LExpr>, String> = args.iter().enumerate().map(|(i, a)| {
                 let arg = sst_exp_to_ast_checked_with_ctx(a, ctx)?;
                 // Apply coercion when we have expected typs AND the
@@ -775,9 +775,25 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
                 LExpr::var(crate::lean_name::LeanName::from_path(&fun.path)),
                 typs.iter().map(|t| typ_to_expr(t)).collect(),
             );
-            let rendered_args: Result<Vec<_>, _> = args.iter()
-                .map(|a| sst_exp_to_ast_checked_with_ctx(a, ctx))
-                .collect();
+            // Bridge each arg to the callee's expected param typ — the
+            // auto-borrow analog. For inherent-method calls and regular
+            // fn calls, the receiver / args may arrive at a different
+            // wrapper depth than the callee declares (e.g., `self.view()`
+            // passes a bare local where `view(&self)` expects
+            // `Tactus.Ref T`). `coerce_lexpr` inserts `.mk` wraps or
+            // `.deref` peels structurally. When fn_param_typs returns
+            // None (cross-crate callee not in fn_map), falls back to
+            // no-coerce.
+            let expected_typs = ctx.fn_param_typs(fun);
+            let rendered_args: Result<Vec<LExpr>, String> = args.iter().enumerate().map(|(i, a)| {
+                let arg = sst_exp_to_ast_checked_with_ctx(a, ctx)?;
+                Ok(match &expected_typs {
+                    Some(typs) if i < typs.len() => {
+                        crate::expr_shared::coerce_lexpr(arg, &a.typ, &typs[i])
+                    }
+                    _ => arg,
+                })
+            }).collect();
             LExpr::app(head, rendered_args?).node
         }
         // `CheckDecreaseHeight(cur, prev, otherwise)` is the

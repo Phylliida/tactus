@@ -461,15 +461,14 @@ fn expr_to_node(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::Rend
                 // wrap correctly (`Tactus.Ref.mk z` instead of bare
                 // `z` for &self methods).
                 //
-                // When ctx.class_method_param_typs returns None
-                // (empty ctx, cross-crate fun), falls back to
-                // no-coerce + a.typ annotation — same as the
-                // pre-RenderCtx behavior. Inlining contexts where
-                // substitution produces a typing-mismatched value
-                // benefit when ctx has fn_map; non-inlining proof
-                // fns produce correct shapes either way (binder_ctx
-                // + lift handles them).
-                let expected_typs = ctx.class_method_param_typs(fun_for_lookup);
+                // When ctx.fn_param_typs returns None (empty ctx,
+                // cross-crate fun), falls back to no-coerce + a.typ
+                // annotation — same as the pre-RenderCtx behavior.
+                // Inlining contexts where substitution produces a
+                // typing-mismatched value benefit when ctx has fn_map;
+                // non-inlining proof fns produce correct shapes either
+                // way (binder_ctx + lift handles them).
+                let expected_typs = ctx.fn_param_typs(fun_for_lookup);
                 // Wrapper coercion from a.typ to expected — handles
                 // proof fn cases where binder_ctx + lift produces
                 // arg matching a.typ. Inlining contexts (where
@@ -822,6 +821,13 @@ pub(crate) fn typ_contains_param(typ: &TypX) -> bool {
 /// wrapping for generic disambiguation (see `expr_to_node`). So
 /// only Static (and FnSpec / BuiltinSpecFun) calls reach here.
 fn call_to_node(target: &CallTarget, args: &Exprs, binders: &BinderCtx, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
+    // Extract the callee Fun (for fn_param_typs lookup) when the target
+    // is a CallTarget::Fun. FnSpec and BuiltinSpecFun don't have a Fun
+    // in fn_map; args render without the bridge for those.
+    let fun_for_lookup: Option<&Fun> = match target {
+        CallTarget::Fun(_, fun, _, _, _, _) => Some(fun),
+        _ => None,
+    };
     let head = match target {
         CallTarget::Fun(_, fun, typs, _, _, _) => {
             // Emit explicit type arguments for generic calls by
@@ -867,9 +873,27 @@ fn call_to_node(target: &CallTarget, args: &Exprs, binders: &BinderCtx, ctx: &cr
     if args.is_empty() {
         head.node
     } else {
+        // Bridge each arg to the callee's expected param typ — the
+        // auto-borrow analog. For inherent-method calls and regular
+        // fn calls, the receiver / args may arrive at a different
+        // wrapper depth than the callee declares (e.g., `self.view()`
+        // passes a bare local where `view(&self)` expects
+        // `Tactus.Ref T`). `coerce_lexpr` inserts `.mk` wraps or
+        // `.deref` peels structurally. When fn_param_typs returns
+        // None (cross-crate callee not in fn_map, or FnSpec/
+        // BuiltinSpecFun target), falls back to no-coerce.
+        let expected_typs = fun_for_lookup.and_then(|f| ctx.fn_param_typs(f));
         ExprNode::App {
             head: Box::new(head),
-            args: args.iter().map(|a| vir_expr_to_ast_with_binders(a, binders, ctx)).collect(),
+            args: args.iter().enumerate().map(|(i, a)| {
+                let rendered = vir_expr_to_ast_with_binders(a, binders, ctx);
+                match &expected_typs {
+                    Some(typs) if i < typs.len() => {
+                        crate::expr_shared::coerce_lexpr(rendered, &a.typ, &typs[i])
+                    }
+                    _ => rendered,
+                }
+            }).collect(),
         }
     }
 }
