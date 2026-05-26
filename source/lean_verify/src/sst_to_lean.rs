@@ -2679,10 +2679,28 @@ fn collect_borrow_mut_links(
         StmX::ClosureInner { body, .. } => {
             collect_borrow_mut_links(body, borrow_mut_locals, links, aliases);
         }
-        // Leaf statements without nested Stm: Call, Assert(*),
-        // AssertCompute, Assume, Fuel, RevealString, Return,
-        // BreakOrContinue, Air.
-        _ => {}
+        // Leaf statements — no nested `Stm` to walk into. We
+        // enumerate explicitly (no `_ =>` catch-all) so any
+        // upstream addition of a Stm variant containing nested
+        // statements becomes a compile error here. Mirrors DESIGN.md's
+        // "Upstream-robustness patterns" — the compile-time defence
+        // that prevents silent miscompilation when Verus evolves.
+        //
+        // `StmX::Call` carries Exps (`args`) which CAN contain
+        // BorrowMut refs at the value level, but linkage assigns are
+        // statement-level, so the call's args don't carry them.
+        // Similarly for AssertBitVector's `requires`/`ensures` Exps,
+        // Assert/AssertCompute's Exp, and Assume's Exp.
+        StmX::Call { .. }
+        | StmX::Assert(_, _, _)
+        | StmX::AssertBitVector { .. }
+        | StmX::AssertCompute(_, _, _)
+        | StmX::Assume(_)
+        | StmX::Fuel(_, _)
+        | StmX::RevealString(_)
+        | StmX::Return { .. }
+        | StmX::BreakOrContinue { .. }
+        | StmX::Air(_) => {}
     }
 }
 
@@ -7511,5 +7529,372 @@ mod tests {
             "fragments should include Mathlib.Tactic.Linarith import; \
              nlinarith lives in that module. Got imports: {:?}",
             imports);
+    }
+
+    // ── BorrowMut elimination helpers ────────────────────────────
+    //
+    // Unit tests for `borrow_mut_key`, `is_borrow_mut_linkage_assign`,
+    // `collect_borrow_mut_links` (Assign-pattern detection), and
+    // `resolve_borrow_mut_aliases` (fixed-point alias propagation).
+    // C1 from the 2026-05-26 review pass — fills a gap where these
+    // helpers had only e2e coverage; cheap unit tests catch refactor
+    // regressions that don't trickle through to specific e2e tests.
+
+    /// Construct a `VarIdent` with a numeric disambiguator so two
+    /// `tmp%` locals with different disambig IDs produce different
+    /// `borrow_mut_key` outputs — pinning the disambig-aware property
+    /// the multi-mut-arg case (`test_exec_call_two_mut_args_new_mut_ref`)
+    /// depends on.
+    fn var_ident_disambig(name: &str, id: u64) -> VarIdent {
+        VarIdent(
+            Arc::new(name.to_string()),
+            VarIdentDisambiguate::VirTemp(id),
+        )
+    }
+
+    #[test]
+    fn borrow_mut_key_distinguishes_disambig() {
+        // Two `tmp%` locals with different VirTemp disambig IDs.
+        // Without disambig-awareness they'd collide as "tmp_".
+        let a = var_ident_disambig("tmp%", 1);
+        let b = var_ident_disambig("tmp%", 2);
+        let ka = borrow_mut_key(&a);
+        let kb = borrow_mut_key(&b);
+        assert_ne!(ka, kb, "different disambig IDs must produce different keys: \
+                            a={:?}, b={:?}", ka, kb);
+        assert!(ka.ends_with("1") || ka.contains("__1"),
+            "key for disambig 1 should reflect the id: {:?}", ka);
+    }
+
+    #[test]
+    fn borrow_mut_key_stable_for_same_var() {
+        // Two `VarIdent` values built from the same name + disambig
+        // produce the same key. Pinning: the lookup at the call site
+        // (`extract_mut_target`) matches what `collect_borrow_mut_links`
+        // inserted.
+        let a = var_ident_disambig("y", 0);
+        let b = var_ident_disambig("y", 0);
+        assert_eq!(borrow_mut_key(&a), borrow_mut_key(&b));
+    }
+
+    /// Helper: SST `VarLoc` exp (the L-value form). Mirrors `var_exp`
+    /// but produces a VarLoc node, which is what `Dest::dest` carries
+    /// in normal SST shapes.
+    fn varloc_exp(ident: VarIdent, typ: Typ) -> Exp {
+        Arc::new(SpannedTyped {
+            span: test_span(),
+            typ,
+            x: ExpX::VarLoc(ident),
+        })
+    }
+
+    #[test]
+    fn is_borrow_mut_linkage_assign_detects_forward_forward() {
+        // Forward-forward: `Assign(user_local_y, Var(borrow_mut_tmp))`.
+        // dest is non-BM (`y`), rhs is BM (`tmp`). Should drop.
+        let user = var_ident_disambig("y", 0);
+        let borrow = var_ident_disambig("tmp%", 1);
+        let mut links = HashMap::new();
+        links.insert(borrow_mut_key(&borrow), user.clone());
+
+        let dest = varloc_exp(user, typ_int());
+        let rhs = var_exp("tmp%", typ_int()); // helper uses AirLocal disambig
+        // Adjust rhs to match `borrow`'s disambig — `var_exp`'s helper
+        // produces an AirLocal disambig; we need to match `borrow`'s
+        // VirTemp(1) for the key lookup to fire.
+        let rhs = Arc::new(SpannedTyped {
+            span: test_span(),
+            typ: typ_int(),
+            x: ExpX::Var(var_ident_disambig("tmp%", 1)),
+        });
+        assert!(is_borrow_mut_linkage_assign(&dest, &rhs, &links),
+            "forward-forward Assign(y, Var(tmp%)) should be detected");
+    }
+
+    #[test]
+    fn is_borrow_mut_linkage_assign_rejects_reverse_direction() {
+        // Reverse: `Assign(tmp_borrow_mut, Var(user_local))`. dest is
+        // BM (`tmp`), rhs is non-BM (`y`). Verus's encoding doesn't
+        // emit this shape, but if it did we should NOT drop — the
+        // BorrowMut local needs to retain the let-frame.
+        let user = var_ident_disambig("y", 0);
+        let borrow = var_ident_disambig("tmp%", 1);
+        let mut links = HashMap::new();
+        links.insert(borrow_mut_key(&borrow), user.clone());
+
+        let dest = varloc_exp(borrow, typ_int());
+        let rhs = Arc::new(SpannedTyped {
+            span: test_span(),
+            typ: typ_int(),
+            x: ExpX::Var(var_ident_disambig("y", 0)),
+        });
+        assert!(!is_borrow_mut_linkage_assign(&dest, &rhs, &links),
+            "reverse Assign(tmp, Var(y)) should NOT be detected as linkage");
+    }
+
+    #[test]
+    fn is_borrow_mut_linkage_assign_rejects_ssa_rename() {
+        // SSA rename: `Assign(borrow_mut_X, Var(borrow_mut_Y))`. Both
+        // BM. SSA renames must be KEPT (the inlined ensures hypothesis
+        // references the SSA-renamed local). is_borrow_mut_linkage_assign
+        // returns false.
+        let bm1 = var_ident_disambig("tmp%", 1);
+        let bm2 = var_ident_disambig("tmp%", 2);
+        let user = var_ident_disambig("y", 0);
+        let mut links = HashMap::new();
+        links.insert(borrow_mut_key(&bm1), user.clone());
+        links.insert(borrow_mut_key(&bm2), user.clone());
+
+        let dest = varloc_exp(bm2, typ_int());
+        let rhs = Arc::new(SpannedTyped {
+            span: test_span(),
+            typ: typ_int(),
+            x: ExpX::Var(var_ident_disambig("tmp%", 1)),
+        });
+        assert!(!is_borrow_mut_linkage_assign(&dest, &rhs, &links),
+            "SSA-rename Assign(tmp%_2, Var(tmp%_1)) should NOT be detected — \
+             the SSA-renamed local is referenced in the inlined ensures hyp");
+    }
+
+    #[test]
+    fn is_borrow_mut_linkage_assign_rejects_unrelated_assign() {
+        // Plain user assign: `Assign(x, Var(y))`. Neither is BM. No drop.
+        let x = var_ident_disambig("x", 0);
+        let mut links = HashMap::new();
+        // Empty links — no BMs registered.
+        let _ = links.insert(borrow_mut_key(&x), x.clone()); // populate just to satisfy type
+
+        let mut empty_links = HashMap::new();
+        empty_links.shrink_to(0);
+        let dest = varloc_exp(x.clone(), typ_int());
+        let rhs = Arc::new(SpannedTyped {
+            span: test_span(),
+            typ: typ_int(),
+            x: ExpX::Var(var_ident_disambig("y", 0)),
+        });
+        assert!(!is_borrow_mut_linkage_assign(&dest, &rhs, &empty_links),
+            "plain Assign(x, Var(y)) with no BM registered should not be linkage");
+    }
+
+    /// Helper: build a `StmX::Assign` from dest VarIdent + rhs VarIdent.
+    /// `Stm = Arc<Spanned<StmX>>` (no typ field — different from `Exp`).
+    fn assign_stm(dest_ident: VarIdent, rhs_ident: VarIdent) -> Stm {
+        use vir::def::Spanned;
+        let dest = varloc_exp(dest_ident, typ_int());
+        let rhs = Arc::new(SpannedTyped {
+            span: test_span(),
+            typ: typ_int(),
+            x: ExpX::Var(rhs_ident),
+        });
+        Spanned::new(test_span(), StmX::Assign {
+            lhs: Dest { dest, is_init: false },
+            rhs,
+        })
+    }
+
+    // `block_stm` defined earlier in the test module — reuse.
+
+    #[test]
+    fn collect_borrow_mut_links_records_forward_forward() {
+        // Body: Assign(y, Var(tmp)) with tmp registered as BM.
+        // Expected: links[tmp_key] = y.
+        let user = var_ident_disambig("y", 0);
+        let borrow = var_ident_disambig("tmp%", 1);
+        let mut bm_set = HashSet::new();
+        bm_set.insert(borrow_mut_key(&borrow));
+
+        let stm = assign_stm(user.clone(), borrow.clone());
+
+        let mut links = HashMap::new();
+        let mut aliases = HashMap::new();
+        collect_borrow_mut_links(&stm, &bm_set, &mut links, &mut aliases);
+
+        assert_eq!(links.len(), 1, "expected one linkage, got {:?}", links);
+        assert_eq!(links.get(&borrow_mut_key(&borrow)), Some(&user),
+            "linkage should map tmp_key → y");
+        assert!(aliases.is_empty(), "no aliases expected: {:?}", aliases);
+    }
+
+    #[test]
+    fn collect_borrow_mut_links_records_ssa_alias() {
+        // Body: Assign(tmp_2, Var(tmp_1)) with both registered as BM.
+        // Expected: aliases[tmp_2_key] = tmp_1_key; no links.
+        let bm1 = var_ident_disambig("tmp%", 1);
+        let bm2 = var_ident_disambig("tmp%", 2);
+        let mut bm_set = HashSet::new();
+        bm_set.insert(borrow_mut_key(&bm1));
+        bm_set.insert(borrow_mut_key(&bm2));
+
+        let stm = assign_stm(bm2.clone(), bm1.clone());
+
+        let mut links = HashMap::new();
+        let mut aliases = HashMap::new();
+        collect_borrow_mut_links(&stm, &bm_set, &mut links, &mut aliases);
+
+        assert!(links.is_empty(), "no linkages expected: {:?}", links);
+        assert_eq!(aliases.len(), 1, "expected one alias, got {:?}", aliases);
+        assert_eq!(aliases.get(&borrow_mut_key(&bm2)), Some(&borrow_mut_key(&bm1)));
+    }
+
+    #[test]
+    fn collect_borrow_mut_links_recurses_into_block() {
+        // Body: Block([Assign(tmp_3, Var(tmp_1)), Assign(y, Var(tmp_1))])
+        // Expected: one alias (tmp_3 → tmp_1), one linkage (tmp_1 → y).
+        let bm1 = var_ident_disambig("tmp%", 1);
+        let bm3 = var_ident_disambig("tmp%", 3); // a StmCallArg in real Verus
+        let user = var_ident_disambig("y", 0);
+        let mut bm_set = HashSet::new();
+        bm_set.insert(borrow_mut_key(&bm1));
+        bm_set.insert(borrow_mut_key(&bm3));
+
+        let stm = block_stm(vec![
+            assign_stm(bm3.clone(), bm1.clone()),
+            assign_stm(user.clone(), bm1.clone()),
+        ]);
+
+        let mut links = HashMap::new();
+        let mut aliases = HashMap::new();
+        collect_borrow_mut_links(&stm, &bm_set, &mut links, &mut aliases);
+
+        assert_eq!(links.get(&borrow_mut_key(&bm1)), Some(&user));
+        assert_eq!(aliases.get(&borrow_mut_key(&bm3)), Some(&borrow_mut_key(&bm1)));
+    }
+
+    #[test]
+    fn resolve_borrow_mut_aliases_propagates_through_chain() {
+        // Setup: aliases tmp_3 → tmp_1, tmp_4 → tmp_3.
+        // Linkage: tmp_1 → y.
+        // After resolve: tmp_3 → y AND tmp_4 → y (both via chain).
+        let bm1 = var_ident_disambig("tmp%", 1);
+        let bm3 = var_ident_disambig("tmp%", 3);
+        let bm4 = var_ident_disambig("tmp%", 4);
+        let user = var_ident_disambig("y", 0);
+
+        let mut links = HashMap::new();
+        links.insert(borrow_mut_key(&bm1), user.clone());
+
+        let mut aliases = HashMap::new();
+        aliases.insert(borrow_mut_key(&bm3), borrow_mut_key(&bm1));
+        aliases.insert(borrow_mut_key(&bm4), borrow_mut_key(&bm3));
+
+        resolve_borrow_mut_aliases(&mut links, &aliases);
+
+        assert_eq!(links.get(&borrow_mut_key(&bm1)), Some(&user),
+            "original linkage preserved");
+        assert_eq!(links.get(&borrow_mut_key(&bm3)), Some(&user),
+            "direct alias propagated");
+        assert_eq!(links.get(&borrow_mut_key(&bm4)), Some(&user),
+            "chained alias propagated");
+    }
+
+    #[test]
+    fn resolve_borrow_mut_aliases_no_op_without_chain() {
+        // Aliases that don't terminate in a linked BM remain unresolved.
+        // Defensive: simple fixed-point, no infinite loop.
+        let bm1 = var_ident_disambig("tmp%", 1);
+        let bm2 = var_ident_disambig("tmp%", 2);
+
+        let mut links = HashMap::new();
+        let mut aliases = HashMap::new();
+        aliases.insert(borrow_mut_key(&bm2), borrow_mut_key(&bm1));
+
+        resolve_borrow_mut_aliases(&mut links, &aliases);
+
+        assert!(links.is_empty(),
+            "no linkages should be added when no terminal user-local exists: {:?}",
+            links);
+    }
+
+    // ── RenderCtx substitution helpers ───────────────────────────
+    //
+    // Unit tests for `RenderCtx::with_pre_state_subst`,
+    // `lookup_subst_raw`, `lookup_subst_typ`. The semantic property:
+    // `with_pre_state_subst` swaps `value_subst` with `value_subst_pre`
+    // — used at the Old(_) arm in the renderer to switch into
+    // pre-state evaluation mode.
+
+    #[test]
+    fn render_ctx_lookup_subst_raw_returns_value_at_storage_typ() {
+        let key = crate::lean_name::LeanName::synthetic("x");
+        let value = LExpr::var(crate::lean_name::LeanName::synthetic("fresh"));
+        let storage_typ = typ_int();
+        let mut subst = crate::expr_shared::RenderValueSubst::new();
+        subst.insert(key.clone(), (value.clone(), storage_typ.clone()));
+
+        let fn_map = crate::expr_shared::RenderFnMap::new();
+        let ctx = crate::expr_shared::RenderCtx::with_fn_map_and_value_subst(&fn_map, &subst);
+
+        let got = ctx.lookup_subst_raw(&key).expect("present");
+        // Raw lookup returns the stored LExpr without coercion.
+        let value_repr = format!("{:?}", value);
+        let got_repr = format!("{:?}", got);
+        assert_eq!(got_repr, value_repr,
+            "lookup_subst_raw should return the stored value unchanged");
+    }
+
+    #[test]
+    fn render_ctx_lookup_subst_typ_returns_storage_typ() {
+        let key = crate::lean_name::LeanName::synthetic("x");
+        let value = LExpr::var(crate::lean_name::LeanName::synthetic("fresh"));
+        let storage_typ = typ_int();
+        let mut subst = crate::expr_shared::RenderValueSubst::new();
+        subst.insert(key.clone(), (value, storage_typ.clone()));
+
+        let fn_map = crate::expr_shared::RenderFnMap::new();
+        let ctx = crate::expr_shared::RenderCtx::with_fn_map_and_value_subst(&fn_map, &subst);
+
+        let got_typ = ctx.lookup_subst_typ(&key).expect("present");
+        // structural compare on Arc'd Typ
+        let got_kind = std::mem::discriminant(&*got_typ);
+        let want_kind = std::mem::discriminant(&*storage_typ);
+        assert_eq!(got_kind, want_kind,
+            "lookup_subst_typ should return the stored storage typ");
+    }
+
+    #[test]
+    fn render_ctx_with_pre_state_subst_swaps_value_subst() {
+        // `with_pre_state_subst` returns a ctx where value_subst points
+        // at the previous value_subst_pre. The post map is replaced.
+        let key = crate::lean_name::LeanName::synthetic("x");
+        let post_value = LExpr::var(crate::lean_name::LeanName::synthetic("post"));
+        let pre_value = LExpr::var(crate::lean_name::LeanName::synthetic("pre"));
+        let typ = typ_int();
+
+        let mut post_subst = crate::expr_shared::RenderValueSubst::new();
+        post_subst.insert(key.clone(), (post_value.clone(), typ.clone()));
+        let mut pre_subst = crate::expr_shared::RenderValueSubst::new();
+        pre_subst.insert(key.clone(), (pre_value.clone(), typ.clone()));
+
+        let fn_map = crate::expr_shared::RenderFnMap::new();
+        let ctx = crate::expr_shared::RenderCtx::with_fn_map_and_value_subst_pair(
+            &fn_map, &post_subst, &pre_subst);
+
+        // Before swap: lookup returns post-state.
+        let pre_lookup = ctx.lookup_subst_raw(&key).expect("present");
+        assert_eq!(format!("{:?}", pre_lookup), format!("{:?}", post_value),
+            "before swap, lookup returns post-state value");
+
+        // After swap: lookup returns pre-state.
+        let pre_ctx = ctx.with_pre_state_subst();
+        let post_swap = pre_ctx.lookup_subst_raw(&key).expect("present");
+        assert_eq!(format!("{:?}", post_swap), format!("{:?}", pre_value),
+            "after with_pre_state_subst, lookup returns pre-state value");
+    }
+
+    #[test]
+    fn render_ctx_with_pre_state_subst_falls_back_to_none() {
+        // When value_subst_pre is None, the swap produces a ctx with
+        // value_subst = None. Inner renders see no substitution.
+        let key = crate::lean_name::LeanName::synthetic("x");
+        let post_value = LExpr::var(crate::lean_name::LeanName::synthetic("post"));
+        let mut post_subst = crate::expr_shared::RenderValueSubst::new();
+        post_subst.insert(key.clone(), (post_value, typ_int()));
+
+        let fn_map = crate::expr_shared::RenderFnMap::new();
+        let ctx = crate::expr_shared::RenderCtx::with_fn_map_and_value_subst(&fn_map, &post_subst);
+        // No value_subst_pre — only the post map exists.
+        let swapped = ctx.with_pre_state_subst();
+        assert!(swapped.lookup_subst_raw(&key).is_none(),
+            "with_pre_state_subst with no pre-map should fall back to no substitution");
     }
 }
