@@ -2056,9 +2056,22 @@ fn rewrite_varat_for_mut_params(
     // peeling transparent decorations the way `peel_to_var` does
     // for SST. Returns the inner VarIdent if it's a Var/VarLoc of a
     // mut param, else None.
+    //
+    // Verus emits several semantically-equivalent shapes for "value
+    // of mut-ref local h":
+    //   * `Var(h)` / `VarLoc(h)` — direct (legacy mode)
+    //   * `ReadPlace(Local(h), _)` — new-mut-ref encoding, treats the
+    //     local-read as a place-read with some read kind
+    // plus the transparent Box/Unbox/Trigger/CoerceMode wrappers
+    // that Verus's poly encoding may insert around any of these.
+    //
+    // All these forms are normalized here to the inner `VarIdent`,
+    // and `rewrite_varat_for_mut_params` then maps the whole shape
+    // to canonical `Var(h)` (post-state) or `Var(h_at_pre_tactus)`
+    // (pre-state). Peeling ReadPlace ensures `MutRefCurrent(
+    // ReadPlace(Local(h)))` gets normalized — previously this fell
+    // through the rewrite and aliased pre-state with post-state.
     let extract_mut_var = |inner: &Expr| -> Option<VarIdent> {
-        // Peel transparent VIR-AST decorations (Box/Unbox/Trigger/
-        // CoerceMode wrappers may appear).
         let mut cursor = inner;
         loop {
             match &cursor.x {
@@ -2077,6 +2090,15 @@ fn rewrite_varat_for_mut_params(
                     }
                     return None;
                 }
+                ExprX::ReadPlace(place, _) => match &place.x {
+                    vir::ast::PlaceX::Local(ident) => {
+                        if mut_param_names.contains(&sanitize(&ident.0)) {
+                            return Some(ident.clone());
+                        }
+                        return None;
+                    }
+                    _ => return None,
+                },
                 _ => return None,
             }
         }
