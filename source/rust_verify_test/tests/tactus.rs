@@ -11360,3 +11360,34 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// Regression: default-on-import must DEGRADE, not PANIC, when the
+// default group (group_vstd_default) transitively includes a broadcast
+// lemma bounded on a cross-crate trait whose method decls aren't merged
+// (vstd's `full_set_properties<A: FiniteFull>` in group_set_lib_default;
+// `FiniteFull::full_properties` is stripped). `collect_broadcast_lemma_funs`
+// skips such lemmas, so trait emission never tries to emit the partial
+// `FiniteFull` class (which panicked at to_lean_fn.rs:1317 before the
+// filter). A `Vec`-using fn under `vstd::prelude::*` pulls set_lib into
+// the merged krate, so it exercises the path. The fn still fails — but
+// on the unrelated cross-crate `View` blanket-impl emission gap (Bug B,
+// `view.impl__N.view` unresolved), the genuine cross-crate-exec-callee
+// blocker — gracefully via `tactus_auto failed`, NOT a verifier panic.
+// Asserting `tactus_auto failed` (Lean ran) + no `FiniteFull` pins that
+// codegen completed without the set_lib panic. Flips toward Ok if/when
+// cross-crate View emission lands.
+test_verify_one_file! {
+    #[test] test_cross_crate_default_broadcast_unemittable_trait_skipped verus_code! {
+        use vstd::prelude::*;
+        #[verifier::tactus_auto]
+        fn use_vec(v: &Vec<u8>) -> (r: usize)
+            ensures r == v.len()
+        {
+            v.len()
+        }
+    } => Err(e) => {
+        let s = format!("{:?}", e);
+        assert!(s.contains("tactus_auto failed") && !s.contains("FiniteFull"),
+            "expected graceful Lean failure with set_lib lemma filtered (no panic), got: {}", s);
+    }
+}

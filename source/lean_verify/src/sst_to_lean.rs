@@ -2772,6 +2772,24 @@ pub fn collect_broadcast_lemma_funs<'a>(
     let fn_map: HashMap<&Fun, &FunctionX> =
         krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
 
+    // Traits we can't emit a Lean `class` for: cross-crate traits whose
+    // method decls weren't all merged into the function list (Verus's
+    // `export_crate` strips them). `trait_to_ast` *panics* on a method
+    // not in `method_lookup` ("this is a Tactus bug"). A broadcast
+    // lemma with a bound on such a trait (e.g. vstd's
+    // `full_set_properties<A: FiniteFull>` in `group_set_lib_default`,
+    // pulled in by default-on-import) would render `[FiniteFull A]`,
+    // drag `FiniteFull` into emission, and hit that panic. We skip such
+    // lemmas at collection so they never reach the dep walk or emission
+    // — the lemma's fact is unavailable (graceful: cross-crate Set/laws
+    // reasoning isn't supported yet), but the verifier doesn't crash.
+    // The clean seq/map/set *axiom* lemmas are unbounded (`<A>`, no
+    // trait bound), so they're unaffected.
+    let unemittable_traits: HashSet<vir::ast::Path> = krate.traits.iter()
+        .filter(|t| t.x.methods.iter().any(|m| !fn_map.contains_key(m)))
+        .map(|t| t.x.name.clone())
+        .collect();
+
     let mut targets: Vec<&Fun> = Vec::new();
     // (1) Default-on-import groups: a `pub broadcast group` marked
     // `broadcast_use_by_default_when_this_crate_is_imported(c)` is
@@ -2805,6 +2823,7 @@ pub fn collect_broadcast_lemma_funs<'a>(
         f: &'a Fun,
         group_members: &HashMap<&'a Fun, &'a Vec<Fun>>,
         fn_map: &HashMap<&'a Fun, &'a FunctionX>,
+        unemittable_traits: &HashSet<vir::ast::Path>,
         seen: &mut HashSet<&'a Fun>,
         out: &mut Vec<&'a Fun>,
     ) {
@@ -2813,19 +2832,28 @@ pub fn collect_broadcast_lemma_funs<'a>(
         }
         if let Some(members) = group_members.get(f) {
             for m in members.iter() {
-                expand(m, group_members, fn_map, seen, out);
+                expand(m, group_members, fn_map, unemittable_traits, seen, out);
             }
         } else if let Some(func) = fn_map.get(f) {
-            if func.attrs.broadcast_forall {
+            // Skip a broadcast lemma whose bound references an
+            // un-emittable cross-crate trait (would panic in trait
+            // emission — see `unemittable_traits` above).
+            let bad_bound = func.typ_bounds.iter().any(|b| match &**b {
+                vir::ast::GenericBoundX::Trait(vir::ast::TraitId::Path(p), _) =>
+                    unemittable_traits.contains(p),
+                _ => false,
+            });
+            if func.attrs.broadcast_forall && !bad_bound {
                 out.push(f);
             }
-            // else: plain reveal of a non-broadcast spec fn — skip.
+            // else: plain reveal of a non-broadcast spec fn, or a lemma
+            // we can't emit cleanly — skip.
         }
         // else: f neither a known group nor in fn_map (cross-crate
         // group not merged?) — nothing to emit.
     }
     for t in targets {
-        expand(t, &group_members, &fn_map, &mut seen, &mut out);
+        expand(t, &group_members, &fn_map, &unemittable_traits, &mut seen, &mut out);
     }
     out
 }
