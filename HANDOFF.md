@@ -158,6 +158,57 @@ emission (Bug B, `view.impl__N.view` unresolved) — the genuine
 cross-crate-exec-callee work, larger than billed, in #122/#125
 territory.
 
+##### Scoping note — cross-crate View / exec-callee emission (no code, 2026-05-29)
+
+Probed the canonical case (`fn use_vec(v: &Vec<u8>) -> usize ensures r
+== v.len() { v.len() }` under `vstd::prelude::*`) by reading the
+generated `.lean`. **The verification itself is trivial** — the goal is
+`r = std_specs.vec.spec_vec_len v` where `r := spec_vec_len v` (an
+`r = r` that closes by `rfl`). The spec/broadcast layer all works now:
+`std_specs.vec.axiom_spec_len` / `_vec_has_resolved` /
+`_vec_decreases_to_view` emit as axioms via **default-on-import
+broadcast** (synergy with this session's landing). So the ONLY thing
+blocking is **cross-crate trait/instance emission**, which has ≥4
+distinct, interacting bugs (full `lean --json` error set):
+
+1. **Dangling blanket-impl standalones** — the gate-emitted `View`
+   instances for `Tactus.Ref/Box/Rc/Arc A` (vstd's blanket impls) have
+   bodies referencing `view.impl__0/2/4/6.view` standalone defs that
+   are NOT emitted. Only the *concrete* `Vec.View.impl.view` (line 430)
+   emits — because the dep walk reaches it via the user's `v.len()`,
+   while the blanket standalones are referenced only by gate-emitted
+   instances the dep walk doesn't pull bodies for. Bug C
+   (`9f77305`) already synth-emits body=None cross-crate impl methods
+   as axioms for the *dep-walked* case; the gap is gate-emitted
+   instances' referenced standalones. Fix candidates: emit those
+   standalones as axioms too; OR inline the forwarding dispatch
+   (`view := fun self => view.View.view self.deref`) so no standalone
+   is needed (sound for vstd's all-forwarding blanket impls); OR
+   suppress blanket instances whose standalone isn't available.
+2. **`View.view` bare vs `view.View.view` qualified** — the
+   std_specs.vec axioms render the trait-method call as bare
+   `View.view`, but the class emits as `view.View` (with the vstd
+   `view::` module prefix). `trait_method_ref` / the call-rendering
+   path doesn't carry the cross-crate module qualifier consistently.
+   Same-crate coincides (no prefix); cross-crate diverges.
+3. **`cannot find synthesization order for instAllocatorRc/Box/Arc`** —
+   the blanket instances' `[alloc.Allocator A]`-style instance
+   signatures don't satisfy Lean's instance-synthesis ordering.
+4. `unsolved goals` / `type expected` cascade from 1–3.
+
+**Sizing**: ~3 interacting fixes (instance+standalone emission, trait-
+method qualification, instance-synth ordering), each medium, → a
+realistic **2–3 focused-session arc**, matching DESIGN's estimate. Not
+a quick win. The deeper non-forwarding-blanket soundness question
+(DESIGN § "Transparent-wrapper peel vs trait dispatch") is separate and
+also real, but vstd's View blanket impls are all *forwarding*, so
+opaque-axiom / forwarding-dispatch emission is sound for the realistic
+case. **Recommendation**: worth doing for realistic exec verification,
+but as its own multi-session arc started fresh — not a tail-end. The
+spec layer being done (this session) means the next arc is purely about
+trait/instance emission, which is a more contained target than "all of
+cross-crate."
+
 #### Current session (2026-05-29 — Cluster B Half A: ref_to_bare closed)
 
 **Headline**: 446/3 → 447/2, zero regressions, 261 lib tests green.
