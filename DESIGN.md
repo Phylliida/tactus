@@ -2826,6 +2826,29 @@ crate expands the default group to ≈7 leaf lemmas, not 150. No
 per-fn-inject-everything blowup; the cost scales with what the crate
 actually uses.
 
+**Un-emittable-trait-bound filter (don't drag the cross-crate trait
+swamp in).** Some default-group lemmas carry trait bounds Tactus can't
+emit cross-crate — e.g. `group_set_lib_default`'s
+`full_set_properties<A: FiniteFull>`. Emitting its axiom renders the
+`A: FiniteFull` bound as `[FiniteFull A]`, which drags the trait
+`FiniteFull` into class emission; its `full_properties` method decl is
+stripped cross-crate, so `trait_to_ast` *panics* ("method not in
+function list — Tactus bug"). `collect_broadcast_lemma_funs` therefore
+**skips any broadcast lemma whose `typ_bounds` reference an un-emittable
+trait** — a trait in `krate.traits` with any method absent from the
+function map (precomputed as `unemittable_traits`). The skipped lemma
+never reaches the dep walk or emission, so the trait is never pulled in
+— no panic. The clean seq/map/set axiom lemmas are *unbounded* (`<A>`,
+no trait bound) and unaffected, so the drop-in win holds; only the
+trait-bounded Set/laws lemmas are dropped (their facts unavailable —
+graceful, cross-crate Set/laws reasoning isn't supported yet). The
+`trait_to_ast` panic stays as a tripwire for genuine *same-crate* bugs
+(where all methods should be present). This was a regression-fix: the
+default-on-import landing first turned "verification failure" into
+"panic" for `vstd::prelude::* + Vec/Set` code; the filter restores
+graceful failure. Pinned by
+`test_cross_crate_default_broadcast_unemittable_trait_skipped`.
+
 **The lowering hook (source 2).** `broadcast use G;` lowers (via
 `ExprX::Fuel(group_fun, _, is_broadcast_use=true)`) to
 

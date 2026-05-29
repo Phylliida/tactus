@@ -119,36 +119,44 @@ the framing AND the perf worry. Same shape as the poem from earlier
 today ("the conflict that wasn't"): the dread/principle-tension was the
 shape of not-having-looked-yet.
 
-**⚠️ KNOWN ISSUE discovered while sizing cross-crate exec callees
-(next-to-fix).** A recon probe — a `tactus_auto` fn that uses `Vec`
-under `use vstd::prelude::*` — surfaced a **panic** (not a clean
-rejection) from the default-on-import change I just committed
-(`82015e0`): `to_lean_fn.rs:1317` "trait method `set_lib::FiniteFull::
-full_properties` not found in VIR function list — this is a Tactus
-bug." Diagnosis: `group_vstd_default` transitively includes
-`group_set_lib_default`, so for a crate whose merged krate carries
-set_lib fns, default-on-import collects a set_lib broadcast lemma whose
-spec references a trait method (`FiniteFull::full_properties`) that
-isn't fully emittable cross-crate — and trait emission *panics* rather
-than degrading. A *trivial* prelude-importing fn does NOT panic
-(merge_krates prunes set_lib away when unreferenced), so the existing
-457 tests don't trip it; but realistic `vstd::prelude::*` + Vec/Set
-code can. **This is a robustness regression in `82015e0`** — it turned
-"verification failure" into "panic" for that shape.
+**✅ FIXED (was a regression in `82015e0`): default-on-import panic on
+un-emittable cross-crate trait bounds.** A recon probe — a `tactus_auto`
+fn using `Vec` under `use vstd::prelude::*` — surfaced a **panic** from
+the default-on-import change: `to_lean_fn.rs:1317` "trait method
+`set_lib::FiniteFull::full_properties` not found in VIR function list."
+Diagnosis: `group_vstd_default` transitively includes
+`group_set_lib_default`, so default-on-import collected
+`full_set_properties<A: FiniteFull>`; emitting its axiom renders the
+`A: FiniteFull` bound (`[FiniteFull A]`), dragging the cross-crate trait
+`FiniteFull` into class emission — whose `full_properties` method decl
+is stripped cross-crate, so `trait_to_ast` panicked. The 457 tests
+didn't trip it (a *trivial* prelude fn prunes set_lib away via
+merge_krates), but realistic `vstd::prelude::*` + Vec/Set code did. The
+change had turned "verification failure" into "panic."
 
-Fix direction (next session): default-on-import lemma emission must
-*degrade gracefully* — skip (or cleanly reject) any broadcast lemma
-whose spec references an un-emittable cross-crate trait method, instead
-of panicking. Candidates: (a) make `to_lean_fn.rs:1317` trait-method
-emission return Err instead of `panic!` and have the dep-walk/emit path
-skip that lemma; (b) pre-filter the default-broadcast set to lemmas
-whose transitive refs are all emittable; (c) gate default-on-import to
-groups whose members don't pull in cross-crate trait methods. Likely
-(a) is most robust. Pin with a `vstd::prelude::* + Vec` probe (Err, not
-panic). Separately: the recon ALSO showed cross-crate *exec* callees do
-NOT hit `build_wp_call`'s fn_map rejection (the callee IS merged) — so
-the "cross-crate exec callees rejected" framing was stale too; the real
-blockers are cross-crate trait/View emission (Bug B / #125 territory).
+**Fix (option-b, the targeted one): `collect_broadcast_lemma_funs` now
+skips any broadcast lemma carrying a trait bound on an *un-emittable*
+trait** — a trait in `krate.traits` with any method decl absent from
+the function map. Precomputed as `unemittable_traits`; the `expand`
+leaf branch checks `func.typ_bounds` for `Trait(Path(t), _)` with `t ∈
+unemittable_traits` and skips. The lemma never reaches the dep walk or
+emission, so `FiniteFull` is never pulled in — no panic. The clean
+seq/map/set *axiom* lemmas are unbounded (`<A>`, no trait bound), so
+they're untouched (drop-in still works). Skipped lemmas' facts are
+unavailable (graceful: cross-crate Set/laws reasoning isn't supported
+yet). The `to_lean_fn.rs:1317` panic stays as a tripwire for genuine
+*same-crate* bugs (where all methods should be present). Pinned by
+`test_cross_crate_default_broadcast_unemittable_trait_skipped` (the
+Vec/prelude probe now fails *gracefully* on the unrelated cross-crate
+`View` gap, not a panic).
+
+**Also learned from the recon (framing correction #3 of the day):**
+cross-crate *exec* callees do NOT hit `build_wp_call`'s fn_map rejection
+— the callee IS merged. The "cross-crate exec callees rejected" framing
+was stale. The real blocker is cross-crate trait/**View** blanket-impl
+emission (Bug B, `view.impl__N.view` unresolved) — the genuine
+cross-crate-exec-callee work, larger than billed, in #122/#125
+territory.
 
 #### Current session (2026-05-29 — Cluster B Half A: ref_to_bare closed)
 
