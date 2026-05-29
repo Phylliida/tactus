@@ -670,7 +670,17 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
                 // return-expr coercion in `build_wp`'s `StmX::Return`
                 // arm (both sides now meet at the declared ret typ).
                 // Pinned by test_exec_nested_wrapper_probe (still green)
-                // and test_exec_call_site_ref_to_bare_probe (flips green).
+                // and test_exec_call_site_ref_to_bare_probe (flips green);
+                // soundness pinned by _ref_to_bare_wrong_post (a false
+                // postcondition still fails after reconcile).
+                //
+                // Depth-only (`apply_deref_chain`), not kind-aware: two
+                // operands at the SAME depth but DIFFERENT wrapper kinds
+                // (`Ref u8 ≤ Box u8`) wouldn't reconcile (min == both → no
+                // peel). That shape doesn't arise from real Rust —
+                // structural binops compare like-typed values — so the
+                // depth-only form is sufficient; `coerce_lexpr` (kind-aware)
+                // would be the generalization if it ever surfaces.
                 Some(l_op) => {
                     let dl = count_ref_decorations(&*lhs.typ);
                     let dr = count_ref_decorations(&*rhs.typ);

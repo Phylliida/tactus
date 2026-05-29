@@ -3961,6 +3961,17 @@ fn walk_let<'a>(
                 if !bs.is_empty() {
                     let mut chain_obl = obl.clone();
                     for b in bs.iter() {
+                        // NB: these inner multi-binder binders are pushed
+                        // UN-coerced (no dest-typ coercion like the outer
+                        // let below) — `VarBinder` carries `b.a` (value)
+                        // but not the binder's declared typ, so there's no
+                        // coercion target. Harmless today: multi-binder
+                        // `let (a,b) = …` is a defensive/unreached path
+                        // (Verus destructures via Ctor + projection, not
+                        // `Bind(Let([..]))` — see DESIGN #92). If it ever
+                        // becomes live AND a destructured binder is auto-
+                        // ref'd, it'd need the same coercion the outer let
+                        // gets (would require threading per-binder dest typs).
                         chain_obl.frames.push_back(CtxFrame::Let(
                             crate::lean_name::LeanName::from_var_ident(&b.name),
                             sst_exp_to_ast_checked(&b.a)

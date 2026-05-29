@@ -10860,6 +10860,38 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Negative companion to `_aliased_arg_probe`: Half B's let-binding
+// coercion must not defang the termination check. Here `copy` aliases
+// the WHOLE `s` (height-equal, not the smaller `rest`), so the
+// `decreases s` obligation must still REJECT it. If the let-coerce had
+// broken the CheckDecreaseHeight comparison (rendering `Stack.height
+// copy.deref < Stack.height s.deref` as something vacuously true), this
+// would have falsely verified.
+test_verify_one_file! {
+    #[test] test_exec_call_recursive_aliased_arg_nondecreasing verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum Stack {
+            Empty,
+            Push(u8, Box<Stack>),
+        }
+
+        #[verifier::tactus_auto]
+        fn shrink(s: &Stack) -> (r: u64)
+            decreases s
+        {
+            match s {
+                Stack::Empty => 0,
+                Stack::Push(_, _) => {
+                    // Alias the whole `s` — height-equal, NOT decreasing.
+                    let copy = s;
+                    shrink(copy)
+                }
+            }
+        }
+    } => Err(_)
+}
+
 // P_CLOSURE noted but not pinned with a test: closure captures an
 // outer-scope wrapper-typed param. Approach 3 needs BinderCtx to
 // extend at closure boundaries so the closure body's coercion logic
@@ -10964,6 +10996,33 @@ test_verify_one_file! {
             double(*p)
         }
     } => Ok(())
+}
+
+// Negative companion to `_ref_to_bare_probe`: the structural-binop
+// reconcile + return-coerce (Half A) must not make a FALSE postcondition
+// vacuously pass. `caller` claims `r == 2 * *p + 1` but `double(*p)`
+// returns `2 * *p`. After the coercion the goal renders `r = 2 * p.deref
+// + 1` with `r := 2 * p.deref`, so the postcondition is genuinely false
+// (off by one) — the obligation still has bite. (`+ 1` is spec/ghost
+// `int`, so no overflow ambiguity.)
+test_verify_one_file! {
+    #[test] test_exec_call_site_ref_to_bare_wrong_post verus_code! {
+        #[verifier::tactus_auto]
+        fn double(x: u8) -> (r: u8)
+            requires x <= 100
+            ensures r == 2 * x
+        {
+            x + x
+        }
+
+        #[verifier::tactus_auto]
+        fn caller(p: &u8) -> (r: u8)
+            requires *p <= 100
+            ensures r == 2 * *p + 1
+        {
+            double(*p)
+        }
+    } => Err(_)
 }
 
 // Already-covered cases NOT re-pinned here, with references:
