@@ -1367,7 +1367,7 @@ Each one returns `Err("… not yet supported")`; users get a clean rejection ins
 `sst_exp_to_ast_checked` is the primary validator+renderer for SST expressions; `check_exp` is a thin wrapper (`.map(|_| ())`). Single case analysis for both validation and rendering.
 
 * **`UnaryOp` variants beyond `Not` / `Clip` / `CoerceMode` / `Trigger`** — the spec-fn path (`to_lean_expr`) handles more (BitNot, IntToReal, etc.) but the SST path on exec bodies is conservative; add as needed.
-* **`BinaryOp::HeightCompare { … }`** — VIR's termination-height comparison (the fn-level wrapper; `CheckDecreaseHeight` below is the per-call-site SST form we DO lower).
+* **`BinaryOp::HeightCompare { … }`** — VIR's termination-height comparison (the fn-level wrapper; `CheckDecreaseHeight` below is the per-call-site SST form we DO lower). Rejected on the *SST* path; the *VIR-AST* renderer (used for cross-crate broadcast lemma ensures, e.g. `axiom_seq_index_decreases`) renders it via `non_binop_head → "Tactus.heightLt"`, an uninterpreted prelude relation (added 2026-05-29 — see "Cross-crate broadcast lemmas").
 * **`BinaryOp::Index(_, _)`** — LANDED (#91 closed). SST guarantees `BoundsCheck::Allow` (the bounds obligation is discharged by Verus's mode pass before SST). Tactus emits `lhs[Int.toNat rhs]!` (Lean's `getElem!`-based indexing — total in the type system, panics out-of-bounds; observationally fine because Tactus only verifies the goal and never executes the generated Lean). Requires `[Inhabited α]` for the element type, which holds for primitives and for non-generic user datatypes (we already emit `deriving Inhabited`). Side-effect fix: `Primitive::Array` type rendering drops the const-length argument (Lean's `Array α` is unary). Reachable from spec-mode `array_index(a, i)` (Verus builtin) and from exec-mode `a[i]` after Verus's bounds-check pass lowers `PlaceX::Index(_, _, _, BoundsCheck::Allow)` to `BinaryOp::Index(_, BoundsCheck::Allow)`. **Caveat**: exec-mode `a[i]` for slices/arrays in Rust desugars to `vstd::array::array_index_get` / `vstd::slice::slice_index_get`, which Tactus can't yet inline (cross-crate); user code that wants exec-mode array access through `tactus_auto` either needs vstd routing or a synthetic same-crate exec wrapper.
 * **`BinaryOp::StrGetChar` — LANDED via #113** (2026-05-11). Verus's `verus_builtin::strslice_get_char(s, i)` (surface syntax) now lowers cleanly through both the VIR-AST and SST renderers. Both paths share `non_binop_head(StrGetChar)` which routes to `Tactus.strGetChar`, a `def` in `TactusPrelude.lean` with signature `String → Int → Nat`. Implementation: `Tactus.strGetChar s i = (s.data[i.toNat]!).toNat` — `s.data : List Char` is the underlying codepoint list, `[i.toNat]!` is the panic-on-OOB `GetElem!` indexer, `.toNat` unwraps the `Char` to an integer codepoint. The naive head `String.get` (which the prior `non_binop_head` table emitted) was *wrong* — Lean's `String.get` takes a `String.Pos` (byte offset) and returns Lean's `Char`, whereas Verus's semantics is codepoint-indexed and the return type is Tactus's `Nat`. Out-of-bounds panic is observationally fine (Tactus verifies, never executes). Pinned by `test_proof_strslice_get_char` (VIR-AST path via proof fn), `test_exec_strslice_get_char_in_assert` (SST body-level path via exec-fn assert), `test_exec_strslice_get_char_in_ensures` (SST `ens_exps` path via exec-fn ensures).
 * **`BinaryOp::IeeeFloat(_)`** — IEEE float comparisons. Verus doesn't support `f32`/`f64` at all; this branch exists for completeness.
@@ -2243,12 +2243,14 @@ These are deferred by design — the current slice is single-crate exec+proof-fn
   - Probe 4 (`Option<u8>` via `vstd::prelude::*`): works.
   - Probe 6 (local `pub uninterp spec fn`): works after the 2026-05-12 body-less emission fix (now emits as `Command::Axiom`).
 
-  The genuine remaining gap (Probe 5, `vstd::seq::Seq`): external_body types currently emit as empty `structure` rather than as opaque types. See "Trait class+instance emission: deferred edges" above for the soundness concern. The `CrateDecls.lean`-per-crate-file infrastructure originally envisioned is NOT what's blocking — `merge_krates` does the work. The narrower fix (opaque-type emission for external_body) is a more targeted piece of work.
+  Probe 5 (`vstd::seq::Seq`) is now also closed across two landings: external_body types emit as opaque axioms (2026-05-12, see "External-body type opaque emission"), and the **broadcast lemmas that give those opaque types their semantics** emit + inject on `broadcast use` (2026-05-29, see "Cross-crate broadcast lemmas" below). The `CrateDecls.lean`-per-crate-file infrastructure originally envisioned is NOT what was blocking — `merge_krates` does the work.
 
   Tasks still tracked under cross-crate umbrella:
   - **#125 cross-crate trait method decls** — when the trait method decl's `Fun` isn't in `fn_map` (genuinely cross-crate from a non-vstd-prelude path), `spec_source` returns Err. Currently rare in practice because vstd's traits aren't usually trait_method_impl'd in user crates that Tactus verifies.
-  - **External-body type opaque emission** — see deferred-edges section above.
+  - **Cross-crate exec callees** — `build_wp_call` rejects callees not in `fn_map`. Calling a vstd *exec* fn (e.g. `Vec::push`) from a `tactus_auto` fn is still unsupported (its spec would need inlining + the wrapper/receiver handling). Distinct from the spec-lemma gap, which is closed.
   - **Dynamic dispatch via `dyn Trait`** — same cross-crate rejection path as #125.
+
+  **Module-level / default-on-import broadcast** — `collect_broadcast_lemma_funs` (below) handles fn-body `broadcast use <group>;` (the common explicit case). Module-level `broadcast use` and groups marked `broadcast_use_by_default_when_this_crate_is_imported` don't appear as body `StmX::Fuel` and aren't yet handled. Deferred — needs reading the module's / krate's reveal scope rather than the fn body.
 * **`#[verifier::heartbeats(N)]` attribute** — per-fn Lean `maxHeartbeats` override. DESIGN.md mentions; not wired through `vir::ast::FunctionAttrsX`.
 * **Lean version pinning / CI matrix.** `lean-toolchain` is pinned to `v4.25.0`; tactic behaviour could shift on upgrade. No automated regression against multiple Lean versions.
 * **Per-module `.lean` file generation.** Current design emits one file per fn (`target/tactus-lean/{crate}/{fn}.lean`). At scale, per-module would amortize preamble and olean caching; HANDOFF notes it as future work.
@@ -2291,6 +2293,8 @@ These are deferred not by Tactus design choice but by upstream Verus pipeline st
 #### Verus-side invariants we depend on
 
 Assumptions about upstream VIR/SST shape or Verus compiler-pass ordering that aren't (and can't straightforwardly be) enforced by Rust's type system. If any of these drift in an upstream rebase, our verification silently mis-compiles or panics. Each has either a shape-drift test, a compile-catch, or a documented fix site.
+
+* **`broadcast use G;` lowers to `StmX::Fuel(group_fun, _)`** (#122, 2026-05-29). `collect_broadcast_lemma_funs` reads broadcast directives off the SST body by matching `StmX::Fuel` and looking the target up in `krate.reveal_groups` (group) / `fn_map` + `attrs.broadcast_forall` (single lemma). If Verus changes the lowering (e.g. drops the `is_broadcast_use` flag path, or routes broadcast through a non-Fuel statement), broadcast-use silently stops bringing lemmas into scope — cross-crate Seq/Set/Map code would regress to "closer can't reduce opaque axiom." **No shape-drift test** — would manifest as `test_cross_crate_broadcast_seq_push_len` regressing from Ok to Err. `collect_fuel_targets`'s exhaustive `StmX` match is the compile-catch for a new nested-stmt variant, but not for a change to how `broadcast use` itself lowers. Also depended on: `RevealGroupX.{name, members}` (group identity + member list) and `FunctionAttrsX.broadcast_forall` (the lemma marker) — renames compile-break (good).
 
 * **`vir::recursion` inserts `CheckDecreaseHeight` BEFORE the recursive `StmX::Call`.** Our `Wp::Assert` walk relies on this ordering — the assert must appear in the statement sequence strictly before the Call so `build_wp`'s right-to-left fold produces `Assert(CheckDecreaseHeight, Call(...))` rather than `Call(..., Assert(CheckDecreaseHeight))`. If Verus changes the pass to insert after (or inline the check into the call somehow), recursive fns would verify without the termination obligation. **No compile catch; no shape-drift test.** A regression test that constructs a minimal self-recursive SST and verifies the Assert-Call ordering in the walk output would lock this down.
 * **`CheckDecreaseHeight.args[0]` is `Bind(Let(params → args, decrease))`** — possibly wrapped in Box/Unbox/CoerceMode/Trigger. `render_checked_decrease_arg` peels and substitutes. **Shape-drift test**: `full_check_decrease_height_shape_pinned` asserts the substituted form, with a failure message naming the fix site.
@@ -2776,6 +2780,96 @@ an Opaque value at this site. Only DIRECT field types matter
   (still Err for the documented axiomatic-equality reason, not
   for "unknown constant"). The "latent finding" note in the test
   comment is now resolved.
+
+### Cross-crate broadcast lemmas (landed 2026-05-29)
+
+The headline gap of #122 for realistic cross-crate spec code. vstd's
+`Seq` / `Set` / `Map` operations are `pub uninterp spec fn` — they emit
+as Lean axioms (`axiom seq.Seq.len : …`, body-less) but carry **no
+semantics**. Their meaning lives in separate `broadcast axiom fn` /
+`broadcast proof fn` lemmas: `axiom_seq_push_len` (`(s.push(a)).len()
+== s.len() + 1`), `axiom_seq_empty` (`empty().len() == 0`), etc.,
+collected into `pub broadcast group group_seq_axioms`. Before this
+landing those lemmas never reached the preamble, so a goal like
+`r == Seq::empty().push(0).len()` was unprovable — the opaque `len`/
+`push` axioms gave the closer nothing to reduce. (Pinned then-and-now
+by `test_cross_crate_probe_5_seq_in_spec`, which has no `broadcast use`
+and stays Err.)
+
+**Key fact: broadcast is the user's explicit directive, not ambient
+magic.** `group_seq_axioms` is *not* marked
+`broadcast_use_by_default_when_this_crate_is_imported`, so — exactly as
+in Verus-Z3 — the user must write `broadcast use group_seq_axioms;` to
+bring the lemmas into scope. Honoring that directive is translating an
+explicit opt-in, fully compatible with the minimal-automation principle
+(it is NOT extending `tactus_auto`'s default set).
+
+**The lowering hook.** `broadcast use G;` lowers (via
+`ExprX::Fuel(group_fun, _, is_broadcast_use=true)`) to
+`StmX::Fuel(group_fun, _)` in the SST body — which Tactus had been
+dropping as a transparent no-op. `collect_broadcast_lemma_funs`
+(`sst_to_lean.rs`) walks the body for `StmX::Fuel(f, _)` and resolves
+each target:
+* `f` is a **reveal group** (matches a `RevealGroupX.name` in
+  `krate.reveal_groups`) → expand `members` recursively (members may be
+  subgroups or leaf fns);
+* `f` is a **broadcast lemma fn** directly (`broadcast use
+  single_lemma;`) → `f` is in `fn_map` with `attrs.broadcast_forall` →
+  include;
+* `f` is a **plain `reveal(f)`** of an opaque spec fn → non-broadcast
+  spec fn → skip (Tactus models spec opacity via `@[irreducible]`, not
+  fuel).
+
+The lemmas live in the merged krate (via `merge_krates`) with body=None
+but `require`/`ensure` intact — confirmed by probe: a `use vstd::seq::*`
+crate's merged krate carries `broadcast_forall=7` Seq lemmas + 39
+reveal groups.
+
+**Emission** (`to_lean_fn::broadcast_lemma_axiom_cmd`): each lemma emits
+as `axiom <name> <binders> : <∀ params, reqs → ensures>`, reusing the
+extracted `proof_fn_signature` helper (shared with `proof_fn_to_ast` so
+the deref-wrapping + nat-coercion treatment can't drift). Sound by the
+same argument as DESIGN's "Cross-crate spec fn availability" → axiomatized
+ensures: vstd verified the lemma (`vargo build` → 1530/0); we stipulate
+it. `require` clauses become antecedents (`∀ params (h : req), ens`), so
+nothing is dropped — a conditional lemma stays conditional, the user/
+closer must discharge `req` to use `ens`. The lemma funs are added to
+`krate_preamble`'s `dep_walk_roots`, so the spec fns / datatypes their
+clauses reference (`seq.Seq.len`/`push`, etc.) get emitted too.
+
+**Injection** (`exec_fn_theorems_to_ast`): each collected lemma seeds
+the `tactic_prefix` as `have _tactus_bc_<i> := <axiom>`, so every
+obligation theorem gets `(have _tactus_bc_0 := …; …) <;> closer`. The
+`have := <axiom>` form is the **sound** injection: it *uses* the trusted
+emitted axiom, leaving the goal unchanged — NOT a `lemma → goal`
+antecedent (which would be the False-hypothesis anti-pattern that bit
+the new-mut-ref work — a false lemma would vacuously discharge the
+goal). Equation-shaped lemmas (`len(push s a) = len s + 1`) become simp
+rewrites for `tactus_auto`'s `simp_all`.
+
+**`Tactus.heightLt` prelude axiom** (added alongside). Emitting a whole
+group pulls in `axiom_seq_index_decreases`, whose ensures uses
+`BinaryOp::HeightCompare` (`s[i]` is height-smaller than `s`). The
+VIR-AST renderer special-cases int / datatype operands but falls back to
+`non_binop_head(HeightCompare) → "Tactus.heightLt"` for opaque types —
+which the prelude never defined (a latent gap, unreached until now). Now
+defined as an uninterpreted relation `axiom Tactus.heightLt {α : Type u}
+{β : Type v} (a : α) (b : β) : Prop` — carries the termination fact
+faithfully without committing to a height model for opaque types.
+
+**Scope simplification.** Verus scopes `broadcast use` lexically to the
+enclosing block; Tactus treats any `broadcast use` in the body as
+fn-scoped (all collected lemmas available to every obligation). Sound
+(the lemmas are true everywhere) and matches the common top-of-fn usage.
+Module-level / default-on-import broadcast is deferred (see Phase-3
+cross-crate note).
+
+**Pinned by**: `test_cross_crate_broadcast_seq_push_len` (positive —
+group; `empty().push(0).len() == 1` verifies), `_wrong_ensures`
+(negative soundness — `len + 1` claim fails, so injection isn't vacuous),
+`_required_for_semantics` (without `broadcast use` the same goal fails —
+explicit-opt-in pin), `_single_lemma` (the non-group `broadcast use
+axiom_seq_push_len;` branch).
 
 ### Trait class+instance emission: deferred edges
 

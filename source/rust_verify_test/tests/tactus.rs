@@ -11274,3 +11274,88 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// #122 cross-crate broadcast lemmas. vstd's `Seq` operations are
+// `pub uninterp spec fn` (emitted as Lean axioms — no body), and their
+// SEMANTICS live in `broadcast axiom fn` lemmas (`axiom_seq_push_len`:
+// `(s.push(a)).len() == s.len() + 1`, `axiom_seq_empty`:
+// `empty().len() == 0`, ...) grouped in `group_seq_axioms`. The group
+// is NOT default-on-import, so — exactly as in Verus-Z3 — the user must
+// write `broadcast use group_seq_axioms;` to bring the lemmas into
+// scope. Tactus resolves the directive (`collect_broadcast_lemma_funs`),
+// emits each member lemma as a Lean axiom, and injects `have _bc_i :=
+// <axiom>` so the closer can use them. See DESIGN.md § "Cross-crate
+// broadcast lemmas".
+test_verify_one_file! {
+    #[test] test_cross_crate_broadcast_seq_push_len verus_code! {
+        use vstd::seq::*;
+        #[verifier::tactus_auto]
+        fn one() -> (r: u8)
+            ensures r as nat == Seq::<int>::empty().push(0).len()
+        {
+            broadcast use group_seq_axioms;
+            1
+        }
+    } => Ok(())
+}
+
+// Soundness: `broadcast use` injects the lemmas as facts the closer
+// may USE — it must NOT make a false postcondition verify. Here the
+// claim is `len + 1` (== 2) while the lemmas prove `len == 1`; the
+// obligation must fail. Pins that the injection is `have _bc :=
+// <axiom>` (using the trusted fact), not a False-hypothesis antecedent
+// that would vacuously discharge any goal.
+test_verify_one_file! {
+    #[test] test_cross_crate_broadcast_wrong_ensures verus_code! {
+        use vstd::seq::*;
+        #[verifier::tactus_auto]
+        fn two() -> (r: u8)
+            ensures r as nat == Seq::<int>::empty().push(0).len() + 1
+        {
+            broadcast use group_seq_axioms;
+            1
+        }
+    } => Err(e) => {
+        let s = format!("{:?}", e);
+        assert!(s.contains("tactus_auto failed") && !s.contains("Unknown"),
+            "expected closer failure (lemmas in scope, claim false), got: {}", s);
+    }
+}
+
+// Explicit-opt-in pin: WITHOUT `broadcast use`, the same goal fails —
+// the lemmas aren't emitted/injected, so `len(push(empty,0))` is an
+// opaque axiom application the closer can't reduce. Confirms broadcast
+// is the user's explicit trigger (faithful to Verus), not silent
+// ambient automation.
+test_verify_one_file! {
+    #[test] test_cross_crate_broadcast_required_for_semantics verus_code! {
+        use vstd::seq::*;
+        #[verifier::tactus_auto]
+        fn three() -> (r: u8)
+            ensures r as nat == Seq::<int>::empty().push(0).len()
+        {
+            1
+        }
+    } => Err(e) => {
+        let s = format!("{:?}", e);
+        assert!(s.contains("tactus_auto failed") && !s.contains("Unknown"),
+            "expected closer failure (no broadcast use -> no lemmas), got: {}", s);
+    }
+}
+
+// `broadcast use <single_lemma>;` (not a group) — exercises
+// `collect_broadcast_lemma_funs`'s non-group branch (`f` is a
+// `broadcast_forall` fn directly in fn_map). Goal needs exactly the
+// one named lemma's fact (`len(push s a) == len s + 1`).
+test_verify_one_file! {
+    #[test] test_cross_crate_broadcast_single_lemma verus_code! {
+        use vstd::seq::*;
+        #[verifier::tactus_auto]
+        fn push_grows(s: Seq<u8>) -> (r: bool)
+            ensures r == (s.push(0).len() == s.len() + 1)
+        {
+            broadcast use axiom_seq_push_len;
+            true
+        }
+    } => Ok(())
+}
