@@ -3012,22 +3012,27 @@ fn walk_call<'a>(
     // Two RenderCtxs for the two inlining paths, each with its own
     // typed value_subst:
     //
-    // * Requires: every param resolves to the caller's pre-call arg
-    //   (`req_value_subst`). Post-state existentials aren't in scope
-    //   yet, so requires never needs them.
+    // * Requires (`render_ctx_req`): every param resolves to the
+    //   caller's pre-call arg via `req_value_subst`. Post-state
+    //   existentials aren't in scope yet, so requires never needs
+    //   them. Both `value_subst` and `value_subst_pre` are populated
+    //   with the SAME map — requires only sees pre-state, and a
+    //   surviving `ExprX::Old(_)` inside requires triggers the
+    //   pre-state swap which would otherwise drop the substitution
+    //   (rendering `*old(h)` as bare `h_at_pre_tactus`). Pinned by
+    //   `test_old_view_pre_post_substitution_probe`'s requires clause
+    //   (`old(z).view() < 100` in new-mut-ref mode reaches the
+    //   renderer with `ExprX::Old(...)` after Verus's normalization
+    //   — without populating both maps, the swap drops `z` and the
+    //   sanity check fails with "unresolved `h`").
     //
-    // * Ensures: mut params via pname resolve to the post-state
-    //   existential; non-mut params via pname resolve to the caller
-    //   arg; <p>_at_pre_tactus (the rewritten `*old(p)` form) resolves
-    //   to the caller pre-call arg. `ens_value_subst_pre` is used by
-    //   the `ExprX::Old(_)` swap for any surviving Old subtrees.
-    // For requires: value_subst IS the pre-state (only the pre-call
-    // value exists at requires-time). We populate both `value_subst`
-    // and `value_subst_pre` with the same `req_value_subst` so that
-    // any surviving `ExprX::Old(_)` inside the requires (which swaps
-    // to `value_subst_pre`) still finds the substitution. Without
-    // populating both, the swap would drop the substitution and a
-    // reference like `*old(h)` inside requires would render bare.
+    // * Ensures (`render_ctx_ens`): mut params via `pname` resolve to
+    //   the post-state existential; non-mut params via `pname` resolve
+    //   to the caller arg; `<p>_at_pre_tactus` (the rewritten `*old(p)`
+    //   form) resolves to the caller pre-call arg. The separate
+    //   `ens_value_subst_pre` map handles any surviving `Old(_)`
+    //   subtrees — typically eliminated by the ensures preprocessing
+    //   rewrite, so this path is rarely exercised.
     let render_ctx_req = crate::expr_shared::RenderCtx::with_fn_map_and_value_subst_pair(
         &ctx.fn_map,
         &subst.req_value_subst,
@@ -3274,15 +3279,39 @@ fn add_param_subst_entries<'a>(
 /// the trait's specs or the impl's strengthened specs (#86).
 /// Compute the actual Lean-level typ of a caller arg's rendered LExpr.
 ///
-/// For `ExpX::Var(local)` / `VarLoc(local)` where `local` is a caller
-/// fn param: returns the body-shadow typ recorded in `caller_param_typs`
-/// (strip one outer ref for `&mut` params; as-declared otherwise). This
-/// reflects what the SST renderer's binder-aware path emits for refs to
-/// caller-scope locals.
+/// **For binder-reference shapes** (`Var(local)`, `VarLoc(local)`,
+/// `VarAt(local, _)`) where `local` is a caller fn param: returns the
+/// body-shadow typ recorded in `caller_param_typs` (strip one outer ref
+/// for `&mut` params; as-declared otherwise). This reflects what the SST
+/// renderer's binder-aware path emits for refs to caller-scope locals.
 ///
-/// For other expressions: returns `arg.typ` as best effort. The SST
-/// renderer's inner bridges normalize to `arg.typ` for most non-Var
-/// expressions, so the AST claim is reliable there.
+/// **For `Loc(inner)`**: recurses into the inner expression — `Loc` is
+/// a transparent L-value wrapper at the rendering level (the SST
+/// renderer passes through), so the actual rendered typ is whatever the
+/// inner produces.
+///
+/// **For other expressions** (`Call`, `Const`, `Ctor`, `Unary`, etc.):
+/// returns `arg.typ` as best effort. The SST renderer's inner bridges
+/// normalize to `arg.typ` for most non-binder-ref expressions, so the
+/// AST claim is reliable there.
+///
+/// **Limitations.** The catch-all silently accepts any future binder-
+/// aware ExpX variant added upstream. If Verus introduces a new shape
+/// (e.g., `Reborrow(local)` or similar) whose rendered typ depends on
+/// the caller's binder ctx rather than `arg.typ`, this helper would
+/// produce a stale typ and `coerce_lexpr` at use sites would bridge
+/// from the wrong source. The downstream symptom would be a Lean type
+/// mismatch at the inlined call's arg site, identical in shape to the
+/// pre-typed-substitution `claimed-typ-lies` failures (Cluster A's
+/// `impl__0.view (Tactus.Ref.mk h)` against a bare-typed `h`).
+///
+/// Also doesn't consult caller-scope let-bound locals (only fn params).
+/// Caller args that are body-let-bound vars (e.g., `tmp__2` from
+/// BorrowMut elimination) fall to `arg.typ`. In practice the SST
+/// annotation for these locals matches their rendered typ post-shadow
+/// because the local's `LocalDecl` records the body-shadow result; if
+/// Verus's body-shadow logic diverges from its `LocalDecl` typ, this
+/// helper would need to consult `local_decls` instead.
 ///
 /// Used by `build_call_substitutions` to populate typed `value_subst`
 /// entries with storage typs that match the rendered LExpr's actual
@@ -3290,9 +3319,12 @@ fn add_param_subst_entries<'a>(
 /// from the wrong source typ and produce mis-typed wraps or peels.
 fn caller_arg_actual_typ(arg: &Exp, caller_param_typs: &HashMap<VarIdent, Typ>) -> Typ {
     match &arg.x {
-        ExpX::Var(v) | ExpX::VarLoc(v) => {
+        ExpX::Var(v) | ExpX::VarLoc(v) | ExpX::VarAt(v, _) => {
             caller_param_typs.get(v).cloned().unwrap_or_else(|| arg.typ.clone())
         }
+        // `Loc` is a transparent L-value wrapper — recurse to find the
+        // inner's actual typ (typically a VarLoc / Var / UnaryOpr Field).
+        ExpX::Loc(inner) => caller_arg_actual_typ(inner, caller_param_typs),
         _ => arg.typ.clone(),
     }
 }

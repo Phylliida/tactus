@@ -2505,6 +2505,31 @@ duplicated across consumers:
   shaped callees whose params reach the second consumer as
   `is_mut: false, typ: MutRef<T>` (extracted 2026-05-09 review pass).
 
+**Two-site `value_subst` consultation — sync risk.** Render-time
+substitution at `ReadPlace+Local` happens at TWO entry points in
+`to_lean_expr.rs` that must agree:
+
+1. `expr_to_node`'s `ExprX::ReadPlace(place, _)` arm — early-return
+   when `place.x = PlaceX::Local(v)` and `value_subst` hits. Handles
+   the direct case (`ReadPlace(Local(h), _)`).
+2. `place_to_expr`'s `PlaceX::Local(ident)` arm — same lookup,
+   different entry. Reached when `Local` is nested inside `DerefMut`,
+   `ModeUnwrap`, `Field`, `Index`, etc. — the outer `ReadPlace`'s
+   early-return doesn't match because `place.x` isn't `Local`, so the
+   fallback `place_to_expr(&place.x, …)` recurses through the place
+   structure to reach `Local` inside.
+
+Both sites call `ctx.lookup_subst_raw(name)` and return its value
+verbatim. If a future change updates one consult without the other,
+nested-Place caller args (typical shape: `*h` lowered to
+`ReadPlace(DerefMut(Local(h)))`) would silently skip the
+substitution and render bare — the user-facing symptom is the
+"unresolved `h`" sanity check failure pinned by Cluster A. No
+compile-time check enforces the sync; if a third site emerges
+(e.g., `PlaceX::Field`-rooted-in-Local), it'd need the same lookup.
+A shared helper would centralize this — flagged for cleanup when
+the third site appears.
+
 **Shape-drift detection tests.** For implicit shape invariants we
 depend on but can't enforce with types, a test constructs the
 expected shape and asserts the lowering. If Verus's shape drifts,
@@ -3386,6 +3411,22 @@ shadow makes x's Lean type match e's inner-value type).
   with a synthetic BinderCtx populated from the caller's arg typs —
   not currently motivated, but a candidate for future cleanup if
   the inlining pipeline is restructured.
+
+  **Status update 2026-05-26: typed substitution closed the β
+  over-wrap concern at the architectural level.** Once
+  `value_subst` carries `(LExpr, source_typ)` pairs at call-site
+  inlining and the renderer's `apply_ref_coercion_if_needed`
+  bridges from `source_typ` to `expr.typ`, the over-wrap case the
+  thread-local was suppressing no longer fires: the substituted
+  value is always at its actual Lean typ, and the inner bridge
+  brings it to the inner expected typ regardless of caller typ
+  shape (bare or wrapper-typed). The thread-local remains in place
+  for `READPLACE_LIFT_ENABLED`'s structural purpose (skipping the
+  `ReadPlace` lift when the inlining context's BinderCtx is empty
+  and value_subst doesn't hit), but the over-wrap concern that
+  originally motivated it is gone. Could be removed if a future
+  refactor unifies the inlining and standalone-rendering paths
+  with one BinderCtx convention. Lower priority than it was.
 
 **Alternatives considered + rejected** (2026-05-20):
 

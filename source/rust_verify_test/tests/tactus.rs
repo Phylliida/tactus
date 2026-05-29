@@ -10544,6 +10544,37 @@ test_verify_one_file_with_options! {
     } => Ok(())
 }
 
+// Universal call-arg bridging probe (2026-05-26 typed-sub session).
+// Exercises the case where the callee's spec auto-borrows a NON-MUT
+// param (`h.view()` for `h: Holder` calling an inherent `view(&self)`
+// method) and the caller passes a bare-typed local. Pre-typed-sub,
+// post-render substitution would have substituted `h` → caller's `Var(h)`
+// without preserving the auto-borrow wrap, producing `impl__0.view h`
+// where view expects `Tactus.Ref Holder` → Lean type error. Post-fix,
+// the universal call-arg bridge wraps with `Tactus.Ref.mk` at the call
+// site uniformly for inherent and trait dispatch alike.
+test_verify_one_file! {
+    #[test] test_inherent_method_autoborrow_inlined verus_code! {
+        struct Holder { v: u8 }
+        impl Holder {
+            spec fn view(&self) -> u8 { self.v }
+        }
+
+        fn read_via_view(h: Holder) -> (r: u8)
+            requires h.view() < 100
+            ensures r == h.view()
+        { h.v }
+
+        #[verifier::tactus_auto]
+        fn caller_bare(h: Holder) -> (r: u8)
+            requires h.view() < 100
+            ensures r == h.view()
+        {
+            read_via_view(h)
+        }
+    } => Ok(())
+}
+
 // Negative regression for the 2026-05-26 soundness audit finding
 // (see DESIGN.md "Historical: new-mut-ref False-hypothesis silent
 // miscompile"). Pre-BorrowMut-elimination, the inlined callee
