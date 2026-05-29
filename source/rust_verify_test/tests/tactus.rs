@@ -10889,7 +10889,18 @@ test_verify_one_file! {
                 }
             }
         }
-    } => Err(_)
+    } => Err(err) => {
+        // Must reject AT the termination check — confirms the let-coerce
+        // preserved the decreases obligation's bite, not that it failed
+        // for some unrelated reason.
+        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains(&vir::tactus_messages::paren_label(vir::tactus_messages::ASSERT_LABEL_TERMINATION))),
+            "expected (termination) kind label — let-coerce must preserve the \
+             decreases obligation. got: {:?}",
+            msgs,
+        );
+    }
 }
 
 // P_CLOSURE noted but not pinned with a test: closure captures an
@@ -11022,7 +11033,17 @@ test_verify_one_file! {
         {
             double(*p)
         }
-    } => Err(_)
+    } => Err(err) => {
+        // Must reject AT the postcondition — not pass vacuously, and not
+        // fail for some unrelated (e.g. type) reason.
+        let msgs: Vec<_> = err.errors.iter().map(|e| e.message.clone()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains(&vir::tactus_messages::paren_label(vir::tactus_messages::ASSERT_LABEL_POSTCONDITION))),
+            "expected (postcondition) kind label — reconcile/return-coerce must \
+             reject a false ensures, not pass it. got: {:?}",
+            msgs,
+        );
+    }
 }
 
 // Already-covered cases NOT re-pinned here, with references:
