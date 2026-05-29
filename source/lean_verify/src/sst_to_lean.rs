@@ -346,6 +346,15 @@ pub struct WpCtx<'a> {
     /// not the body-shadow result). Without this, typed substitution
     /// at call sites would over-wrap or under-wrap args.
     pub caller_param_typs: HashMap<VarIdent, Typ>,
+    /// Declared Lean typ of the return value (the `-> (r: T)` `T`), or
+    /// `None` for unit returns / when the dest var has no local decl.
+    /// The `Return` arm coerces the returned expr to this typ before
+    /// the `let r := …` binding — Verus keeps a returned `&`-value at
+    /// its reference typ (e.g. `**b : &Box<u8>`), so without the
+    /// coercion `r` would bind at `Tactus.Ref (Box Int)` while the
+    /// ensures (now binop-reconciled) expects inner `Int`. Coercing
+    /// `let r := <e>.deref.deref` keeps body and ensures symmetric.
+    pub ret_typ: Option<Typ>,
 }
 
 /// The break / continue goal leaves in scope inside a loop body.
@@ -489,8 +498,18 @@ impl<'a> WpCtx<'a> {
         // rendering below. Cross-crate trait method decls aren't in
         // fn_map and gracefully fall back to no-coerce.
         let render_ctx = crate::expr_shared::RenderCtx::with_fn_map(&fn_map);
-        let type_map = check.local_decls.iter().map(|d| (&d.ident, &d.typ)).collect();
+        let type_map: HashMap<&VarIdent, &Typ> =
+            check.local_decls.iter().map(|d| (&d.ident, &d.typ)).collect();
         let ret_name = check.post_condition.dest.as_ref().map(|v| v.0.as_str());
+        // Declared Lean typ of the return value, looked up via the dest
+        // VarIdent (post_condition.dest carries only the name) against
+        // the local-decl type map. `None` for unit returns or when the
+        // dest has no decl entry.
+        let ret_typ: Option<Typ> = check
+            .post_condition
+            .dest
+            .as_ref()
+            .and_then(|dest| type_map.get(dest).map(|t| (*t).clone()));
         // Wrap each ensures clause with a `Postcondition` SpanMark so
         // every Done leaf has an obligation-kind mark — without this,
         // a fn-ensures failure inside an if-branch would leave
@@ -546,6 +565,7 @@ impl<'a> WpCtx<'a> {
             mut_ref_locals: mut_param_names.clone(),
             borrow_mut_links,
             caller_param_typs,
+            ret_typ,
         })
     }
 }
@@ -4796,8 +4816,25 @@ fn build_wp<'a>(
             check_exp(e)?;
             let ensures_goal = ctx.ensures_goal.clone();
             let ret_name = ctx.ret_name;
+            // Coerce the returned value to the declared return typ.
+            // Verus keeps a returned `&`-value at its reference typ
+            // (e.g. `**b : &Box<u8>`), so binding `let r := b` would
+            // give `r : Tactus.Ref (Box Int)` while the ensures —
+            // now reconciled at the structural binops — expects inner
+            // `Int`. `coerce_lexpr(e_ast, e.typ, ret_typ)` peels the
+            // wrapper(s) so body and ensures stay symmetric (no-op
+            // when `e.typ == ret_typ`, the common case). Pairs with the
+            // structural-binop operand reconciliation.
+            let e_typ = e.typ.clone();
+            let ret_typ = ctx.ret_typ.clone();
             let leaf = lift_if_value(e, &|e_ast| match ret_name {
-                Some(name) => LExpr::let_bind_synthetic(sanitize(name), e_ast, ensures_goal.clone()),
+                Some(name) => {
+                    let coerced = match &ret_typ {
+                        Some(rt) => crate::expr_shared::coerce_lexpr(e_ast, &e_typ, rt),
+                        None => e_ast,
+                    };
+                    LExpr::let_bind_synthetic(sanitize(name), coerced, ensures_goal.clone())
+                }
                 None => ensures_goal.clone(),
             });
             Ok(Wp::Done(leaf))
@@ -6928,6 +6965,7 @@ mod tests {
             mut_ref_locals: HashSet::new(),
             borrow_mut_links: HashMap::new(),
             caller_param_typs: HashMap::new(),
+            ret_typ: None,
         }
     }
 

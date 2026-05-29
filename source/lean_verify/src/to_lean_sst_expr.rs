@@ -649,17 +649,36 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
             }
             let (l, r) = (sst_exp_to_ast_checked_with_ctx(lhs, ctx)?, sst_exp_to_ast_checked_with_ctx(rhs, ctx)?);
             match binop_to_ast(op) {
-                // Structural binops (==, +, *, ≤, ...) — pass operands
-                // through as-rendered. NO wrapper peel: structural
-                // binops can apply to wrapper-typed operands directly
-                // (e.g., `r == b` for both : Tactus.Ref T typechecks
-                // when r's type is inferred from a `let r := b`).
-                // Peeling would introduce spurious `.deref`s that
-                // break body/ensures rendering symmetry when Verus's
-                // SST collapses auto-derefs into `Var(p)`-with-
-                // adjusted-typ form (probed by
-                // test_exec_nested_wrapper_probe).
-                Some(l_op) => LExpr::binop(l_op, l, r).node,
+                // Structural binops (==, +, *, ≤, ...) — reconcile the
+                // two operands to a common wrapper depth before applying
+                // the op. Verus keeps `*p` (for a `&T` param) at the
+                // reference typ `&T` with the deref implicit, so the SST
+                // can hand us mismatched depths — e.g. `p : &u8` (depth
+                // 1) `≤` `100 : u8` (depth 0). Without reconciliation
+                // that renders `p ≤ 100`, comparing `Tactus.Ref Int` to
+                // `Int` (a Lean type error).
+                //
+                // Peel the DEEPER operand(s) down to the shallower
+                // (min-depth): equal-depth operands — the common case,
+                // e.g. `s1 == s2` for two `&T` params, or `r == b` after
+                // a `let r := b` — are untouched (min == both depths →
+                // zero peels), so this is a strict refinement of the
+                // previous "never peel structural operands" rule
+                // (commit `d9476e6`). The asymmetry that `d9476e6`
+                // worried about — body renders `let r := b` uncoerced
+                // while ensures peels — is closed by the paired
+                // return-expr coercion in `build_wp`'s `StmX::Return`
+                // arm (both sides now meet at the declared ret typ).
+                // Pinned by test_exec_nested_wrapper_probe (still green)
+                // and test_exec_call_site_ref_to_bare_probe (flips green).
+                Some(l_op) => {
+                    let dl = count_ref_decorations(&*lhs.typ);
+                    let dr = count_ref_decorations(&*rhs.typ);
+                    let m = dl.min(dr);
+                    let l = apply_deref_chain(l, dl - m);
+                    let r = apply_deref_chain(r, dr - m);
+                    LExpr::binop(l_op, l, r).node
+                }
                 // Non-structural: emit as `head lhs rhs` via App.
                 // Reachable cases in the exec-fn path:
                 // * `Xor` (logical xor on Bool)
