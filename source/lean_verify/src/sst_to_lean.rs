@@ -4601,20 +4601,48 @@ fn detect_assert_kind(e: &Exp) -> AssertKind {
 /// the goal the user is writing. For non-if values this is a direct
 /// call to `emit_leaf` with the rendered expression — no overhead.
 fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
+    lift_if_value_coerced(e, None, emit_leaf)
+}
+
+/// `lift_if_value` plus per-leaf return-typ coercion.
+///
+/// `ret_coerce: Some(rt)` coerces each actual returned-VALUE leaf from
+/// its OWN Exp typ to `rt` (the declared return typ) before `emit_leaf`.
+/// This is load-bearing for if-valued returns: `if c { **b } else { 0 }`
+/// has branches of DIFFERENT typ (`&Box<u8>` vs `u8`), so coercing
+/// against the whole-if typ (as an earlier version did) mis-fires — the
+/// `**b` branch stayed `b` while the ensures reconciled to `b.deref.deref`,
+/// a silent mismatch (pinned by `test_exec_return_if_wrapper_value_probe`).
+/// Each leaf must coerce with its own typ. Let-RHS sub-positions pass
+/// `None` (they aren't the return value); the let body / branches carry
+/// `ret_coerce` onward. `None` everywhere reduces to the plain lift.
+fn lift_if_value_coerced(
+    e: &Exp,
+    ret_coerce: Option<&Typ>,
+    emit_leaf: &dyn Fn(LExpr) -> LExpr,
+) -> LExpr {
     // `e` was validated upstream: `Return` checks via `check_exp(e)`
     // before calling lift_if_value (sst_to_lean.rs:2793). Sub-
     // expressions are valid by structural induction; the
     // `sst_exp_to_ast_checked(...).expect(...)` calls below re-run
     // the deterministic validator and would only fire if the
     // validator drifted between the upstream check_exp and here.
+    let coerce_leaf = |lexpr: LExpr, from_typ: &Typ| -> LExpr {
+        match ret_coerce {
+            Some(rt) => crate::expr_shared::coerce_lexpr(lexpr, from_typ, rt),
+            None => lexpr,
+        }
+    };
     let peeled = peel_value_position(e);
     match &peeled.x {
         ExpX::If(cond, then_e, else_e) => {
             let c = sst_exp_to_ast_checked(cond)
                 .expect("lift_if_value if-cond: sub of validated Exp tree");
+            // Both branches are return values → carry `ret_coerce` so
+            // each branch leaf coerces with its own typ.
             LExpr::and(
-                LExpr::implies(c.clone(), lift_if_value(then_e, emit_leaf)),
-                LExpr::implies(LExpr::not(c), lift_if_value(else_e, emit_leaf)),
+                LExpr::implies(c.clone(), lift_if_value_coerced(then_e, ret_coerce, emit_leaf)),
+                LExpr::implies(LExpr::not(c), lift_if_value_coerced(else_e, ret_coerce, emit_leaf)),
             )
         }
         // `let y := e_rhs; body` — if any rhs has an if, lift it out,
@@ -4633,7 +4661,7 @@ fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
                     let unfolded = unfold_multi_binder_let(
                         &bs[..], body, &peeled.span, &peeled.typ,
                     );
-                    return lift_if_value(&unfolded, emit_leaf);
+                    return lift_if_value_coerced(&unfolded, ret_coerce, emit_leaf);
                 }
             }
             if let Some((name, rhs, inner_body)) = match_single_let_bind(bnd, body) {
@@ -4667,26 +4695,39 @@ fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
                     ExpX::Bind(b, _) if matches!(&b.x, BndX::Let(_))
                 );
                 if inner_is_let_chain {
-                    lift_if_value(rhs, &|rhs_leaf| {
+                    // `rhs` is the let-RHS, not the return value → `None`.
+                    // `inner_body` IS the return value → carry `ret_coerce`.
+                    lift_if_value_coerced(rhs, None, &|rhs_leaf| {
                         let name = name.clone();
-                        lift_if_value(inner_body, &|body_leaf| {
+                        lift_if_value_coerced(inner_body, ret_coerce, &|body_leaf| {
                             emit_leaf(LExpr::let_bind(name.clone(), rhs_leaf.clone(), body_leaf))
                         })
                     })
                 } else {
-                    let body_ast = sst_exp_to_ast_checked(inner_body)
-                        .expect("lift_if_value let-body: sub of validated Exp tree");
-                    lift_if_value(rhs, &|rhs_leaf| {
+                    // `inner_body` is the return value (rendered as-is for
+                    // the match-shape) → coerce it to the ret typ.
+                    let body_ast = coerce_leaf(
+                        sst_exp_to_ast_checked(inner_body)
+                            .expect("lift_if_value let-body: sub of validated Exp tree"),
+                        &inner_body.typ,
+                    );
+                    lift_if_value_coerced(rhs, None, &|rhs_leaf| {
                         emit_leaf(LExpr::let_bind(name.clone(), rhs_leaf, body_ast.clone()))
                     })
                 }
             } else {
-                emit_leaf(sst_exp_to_ast_checked(e)
-                    .expect("lift_if_value bind-fallthrough: validated upstream"))
+                emit_leaf(coerce_leaf(
+                    sst_exp_to_ast_checked(e)
+                        .expect("lift_if_value bind-fallthrough: validated upstream"),
+                    &e.typ,
+                ))
             }
         }
-        _ => emit_leaf(sst_exp_to_ast_checked(e)
-            .expect("lift_if_value leaf: validated upstream")),
+        _ => emit_leaf(coerce_leaf(
+            sst_exp_to_ast_checked(e)
+                .expect("lift_if_value leaf: validated upstream"),
+            &e.typ,
+        )),
     }
 }
 
@@ -4848,25 +4889,18 @@ fn build_wp<'a>(
             check_exp(e)?;
             let ensures_goal = ctx.ensures_goal.clone();
             let ret_name = ctx.ret_name;
-            // Coerce the returned value to the declared return typ.
-            // Verus keeps a returned `&`-value at its reference typ
-            // (e.g. `**b : &Box<u8>`), so binding `let r := b` would
-            // give `r : Tactus.Ref (Box Int)` while the ensures —
-            // now reconciled at the structural binops — expects inner
-            // `Int`. `coerce_lexpr(e_ast, e.typ, ret_typ)` peels the
-            // wrapper(s) so body and ensures stay symmetric (no-op
-            // when `e.typ == ret_typ`, the common case). Pairs with the
-            // structural-binop operand reconciliation.
-            let e_typ = e.typ.clone();
-            let ret_typ = ctx.ret_typ.clone();
-            let leaf = lift_if_value(e, &|e_ast| match ret_name {
-                Some(name) => {
-                    let coerced = match &ret_typ {
-                        Some(rt) => crate::expr_shared::coerce_lexpr(e_ast, &e_typ, rt),
-                        None => e_ast,
-                    };
-                    LExpr::let_bind_synthetic(sanitize(name), coerced, ensures_goal.clone())
-                }
+            // Coerce the returned value to the declared return typ via
+            // `lift_if_value_coerced` — PER LEAF. Verus keeps a returned
+            // `&`-value at its reference typ (e.g. `**b : &Box<u8>`), so
+            // binding `let r := b` would give `r : Tactus.Ref (Box Int)`
+            // while the ensures — reconciled at the structural binops —
+            // expects inner `Int`. Doing the coercion at each leaf (not
+            // against the whole expr's typ) is load-bearing for if-valued
+            // returns, whose branches have distinct typs (see
+            // `lift_if_value_coerced` doc + `_return_if_wrapper_value_probe`).
+            // Pairs with the structural-binop operand reconciliation.
+            let leaf = lift_if_value_coerced(e, ctx.ret_typ.as_ref(), &|e_ast| match ret_name {
+                Some(name) => LExpr::let_bind_synthetic(sanitize(name), e_ast, ensures_goal.clone()),
                 None => ensures_goal.clone(),
             });
             Ok(Wp::Done(leaf))

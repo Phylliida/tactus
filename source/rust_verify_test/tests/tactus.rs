@@ -10929,6 +10929,27 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Coverage: return-coercion (Half A) × if-value-lift INTERACTION. The
+// returned value is an `if`, so `lift_if_value` forks and the return
+// coercion runs on EACH branch leaf — the `**b` branch (`&Box<u8>`,
+// depth 2) coerces down to the `u8` ret typ (`b.deref.deref`), the `0`
+// branch is a no-op. The ensures `c ==> r == **b` also exercises the
+// binop reconcile on `r == **b`, so the coerced if-branch value must
+// match the coerced ensures. Distinct path from `nested_wrapper` (plain
+// non-if wrapper return) and `tail_if_expression` (non-wrapper if).
+test_verify_one_file! {
+    #[test] test_exec_return_if_wrapper_value_probe verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        #[verifier::tactus_auto]
+        fn pick(b: &Box<u8>, c: bool) -> (r: u8)
+            ensures c ==> r == **b
+        {
+            if c { **b } else { 0 }
+        }
+    } => Ok(())
+}
+
 // P_GENERIC_WRAPPER: generic fn `fn use<T>(x: &T) -> bool` called
 // with `T = Box<u8>` at one call site. Inside the body, T is
 // opaque to count_ref_decorations — only the outer `&` is peelable.
