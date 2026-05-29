@@ -786,7 +786,7 @@ pub fn check_exec_fn(
     // both `exec_fn_theorems_to_ast` (which injects `have`-bindings)
     // and `krate_preamble` (which emits the lemma axioms + walks their
     // spec-fn deps).
-    let broadcast_lemmas = sst_to_lean::collect_broadcast_lemma_funs(krate, check);
+    let broadcast_lemmas = sst_to_lean::collect_broadcast_lemma_funs(krate, check, crate_name);
 
     let theorems = match sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check, &broadcast_lemmas) {
         Ok(r) => r,

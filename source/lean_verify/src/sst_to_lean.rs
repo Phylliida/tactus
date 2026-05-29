@@ -2727,31 +2727,42 @@ fn collect_fuel_targets<'a>(stm: &'a Stm, out: &mut Vec<&'a Fun>) {
     }
 }
 
-/// Resolve which cross-crate broadcast lemmas a fn's `broadcast use`
-/// directives bring into scope (#122). Returns the leaf lemma `Fun`s
-/// (deduped, source-order-stable) to emit as Lean axioms and inject as
-/// `have`-hypotheses.
+/// Resolve which cross-crate broadcast lemmas are in scope for a fn
+/// (#122). Returns the leaf lemma `Fun`s (deduped, source-order-stable)
+/// to emit as Lean axioms and inject as `have`-hypotheses. Two sources:
 ///
-/// Each `StmX::Fuel(f, _)` target is one of:
-/// * a **reveal group** (`f` matches a `RevealGroupX.name` in
-///   `krate.reveal_groups`) — expand its `members` recursively
-///   (members may be subgroups or leaf fns);
+/// **(1) Default-on-import groups** — a `pub broadcast group` marked
+/// `broadcast_use_by_default_when_this_crate_is_imported(c)` is ambient
+/// for every fn of any crate that imports `c` (`crate_name != c`). This
+/// is the drop-in case: vstd's `group_vstd_default` makes Seq/Set/Map
+/// semantic lemmas available with NO explicit `broadcast use`, matching
+/// Verus-Z3.
+///
+/// **(2) Explicit `broadcast use <group/lemma>;`** in the fn body,
+/// lowered to `StmX::Fuel(f, _)`. Covers non-default groups and
+/// user-defined broadcast groups.
+///
+/// Each target (a default-group name or a `StmX::Fuel` target) is then
+/// expanded:
+/// * a **reveal group** (`f` matches a `RevealGroupX.name`) — expand
+///   its `members` recursively (members may be subgroups or leaf fns);
 /// * a **broadcast lemma fn** directly (`broadcast use single_lemma;`)
 ///   — `f` is in `fn_map` with `attrs.broadcast_forall` — include it;
 /// * a **plain `reveal(f)`** of an opaque spec fn — `f` is a non-
 ///   broadcast spec fn — skip (Tactus models spec opacity via
 ///   `@[irreducible]`, not fuel; not a #122 concern).
 ///
-/// **Scope simplification**: Verus scopes `broadcast use` lexically to
-/// the enclosing block, but we treat any `broadcast use` anywhere in
-/// the body as fn-scoped (all collected lemmas available to every
-/// obligation). Sound — the lemmas are true everywhere — and matches
-/// the common top-of-fn usage. Module-level / default-on-import
-/// broadcast groups are not yet handled (they don't appear as body
-/// `StmX::Fuel`); deferred.
+/// **Scope simplification**: Verus scopes explicit `broadcast use`
+/// lexically to the enclosing block, but we treat any `broadcast use`
+/// anywhere in the body as fn-scoped (all collected lemmas available to
+/// every obligation). Sound — the lemmas are true everywhere — and
+/// matches the common top-of-fn usage. Module-level `broadcast use`
+/// (`ModuleX.reveals`, distinct from default-on-import) is not yet
+/// handled; deferred.
 pub fn collect_broadcast_lemma_funs<'a>(
     krate: &'a KrateX,
     check: &'a FuncCheckSst,
+    crate_name: &str,
 ) -> Vec<&'a Fun> {
     let group_members: HashMap<&Fun, &Vec<Fun>> = krate
         .reveal_groups
@@ -2762,6 +2773,29 @@ pub fn collect_broadcast_lemma_funs<'a>(
         krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
 
     let mut targets: Vec<&Fun> = Vec::new();
+    // (1) Default-on-import groups: a `pub broadcast group` marked
+    // `broadcast_use_by_default_when_this_crate_is_imported(c)` is
+    // ambient for every fn of any crate that imports `c` (Verus's
+    // `context.rs` adds the crate→group edge when `crate_name != c`).
+    // vstd's `group_vstd_default` (which contains `group_seq_axioms`,
+    // `group_map_axioms`, ...) is the canonical case: importing vstd
+    // makes the Seq/Set/Map semantic lemmas ambient with NO explicit
+    // `broadcast use` — so this is what makes Tactus drop-in for
+    // vstd-using spec code (matches Verus-Z3, which also doesn't
+    // require an explicit `broadcast use` for these). `merge_krates`
+    // prunes the group's transitive members to what the crate actually
+    // references, so the leaf set stays small (≈7 seq lemmas for a
+    // Seq-only crate, not all of vstd).
+    for g in krate.reveal_groups.iter() {
+        if let Some(c) = &g.x.broadcast_use_by_default_when_this_crate_is_imported {
+            if c.to_string() != crate_name {
+                targets.push(&g.x.name);
+            }
+        }
+    }
+    // (2) Explicit `broadcast use <group/lemma>;` in the fn body
+    // (lowered to `StmX::Fuel`). Covers non-default groups (e.g.
+    // `group_seq_lemmas_expensive`) and user-defined broadcast groups.
     collect_fuel_targets(&check.body, &mut targets);
 
     let mut seen: HashSet<&Fun> = HashSet::new();

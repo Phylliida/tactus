@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**457 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass — full e2e suite green, 0 failures.** Latest (2026-05-29): **#122 cross-crate broadcast lemmas** — `broadcast use group_seq_axioms;` in a `tactus_auto` fn now brings vstd's `Seq`/`Set`/`Map` semantic lemmas into scope (emit-as-axiom + inject-as-`have`), so cross-crate spec code using those types verifies (+4 tests). Before: Cluster B closed (`ref_to_bare`, `aliased_arg`, `cross_instantiation`); Cluster A closed via typed substitution + universal call-arg bridging. vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**457 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass — full e2e suite green, 0 failures.** Latest (2026-05-29): **#122 cross-crate broadcast lemmas** — vstd's `Seq`/`Set`/`Map` semantic lemmas now reach the closer (emit-as-axiom + inject-as-`have`) from BOTH default-on-import (`group_vstd_default` — so `Seq::empty().push(0).len() == 1` verifies with NO explicit `broadcast use`, drop-in with Verus) AND explicit `broadcast use <group>;`. Cross-crate spec code using those types verifies (+4 tests). Before: Cluster B closed (`ref_to_bare`, `aliased_arg`, `cross_instantiation`); Cluster A closed via typed substitution + universal call-arg bridging. vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -75,6 +75,49 @@ in `build_wp_call`); module-level / default-on-import broadcast (don't
 appear as body `StmX::Fuel`); #125 cross-crate trait method decls +
 `dyn Trait`. See DESIGN.md § "Cross-crate broadcast lemmas" + the
 Phase-3 cross-crate note.
+
+**Continuation (same day) — default-on-import broadcast + a framing
+correction.** Picked up the "module-level / default-on-import" deferral
+and, probing it, caught a real error in the entry just above (and in
+the first commit's framing): I'd claimed `group_seq_axioms` "isn't
+default-on-import, so the user must write `broadcast use` — faithful to
+Verus." **Wrong.** vstd's top-level `group_vstd_default` IS marked
+`broadcast_use_by_default_when_this_crate_is_imported` and *contains*
+`group_seq_axioms` / `group_map_axioms` / … — so importing vstd makes
+the Seq/Set/Map lemmas ambient with no explicit `broadcast use`, and
+Verus-Z3 verifies `empty().push(0).len() == 1` on its own. Tactus was
+*stricter* than Verus, not faithful.
+
+A debug probe grounded the perf worry I'd have guessed wrong too:
+`group_vstd_default` names ~150 lemmas across all of vstd, but
+`merge_krates` prunes the krate to referenced fns, so a Seq-only crate
+expands it to **7** leaf lemmas — bounded by relevance, not 150. So
+default-on-import is tractable.
+
+**Fix**: `collect_broadcast_lemma_funs` gains a `crate_name` param and
+seeds its targets from default-on-import groups (`broadcast_use_by_…
+= Some(c)`, `c != crate_name`) IN ADDITION to body `StmX::Fuel`. One
+expand path serves both. The obsolete `_required_for_semantics` test
+(which asserted "no `broadcast use` → fails") **flipped to
+`_default_on_import` (Ok)** — the headline drop-in test. `_seq_push_len`
+became `_explicit_group_use` (reframed: the explicit path still works,
+redundant-but-accepted for default-group lemmas, load-bearing for
+non-default ones). DESIGN.md "Cross-crate broadcast lemmas" rewritten
+with the two-sources framing + the inline correction note.
+
+457/0 e2e (same count — one test flipped, others reframed), zero
+regressions from injecting default lemmas into every vstd-importing fn.
+**Now the only remaining broadcast deferral is module-level
+`broadcast use` (`ModuleX.reveals`)** — rare for user crates.
+
+**Discipline note worth recording**: the "look closely, my own claims
+go stale too" lesson landed twice in one feature. The first commit's
+"explicit, faithful to Verus" framing felt principled — and was a guess
+I hadn't checked against vstd's actual default-group structure. The
+continuation's probe (count the default-group expansion) overturned BOTH
+the framing AND the perf worry. Same shape as the poem from earlier
+today ("the conflict that wasn't"): the dread/principle-tension was the
+shape of not-having-looked-yet.
 
 #### Current session (2026-05-29 — Cluster B Half A: ref_to_bare closed)
 

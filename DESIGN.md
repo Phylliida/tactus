@@ -2250,7 +2250,7 @@ These are deferred by design — the current slice is single-crate exec+proof-fn
   - **Cross-crate exec callees** — `build_wp_call` rejects callees not in `fn_map`. Calling a vstd *exec* fn (e.g. `Vec::push`) from a `tactus_auto` fn is still unsupported (its spec would need inlining + the wrapper/receiver handling). Distinct from the spec-lemma gap, which is closed.
   - **Dynamic dispatch via `dyn Trait`** — same cross-crate rejection path as #125.
 
-  **Module-level / default-on-import broadcast** — `collect_broadcast_lemma_funs` (below) handles fn-body `broadcast use <group>;` (the common explicit case). Module-level `broadcast use` and groups marked `broadcast_use_by_default_when_this_crate_is_imported` don't appear as body `StmX::Fuel` and aren't yet handled. Deferred — needs reading the module's / krate's reveal scope rather than the fn body.
+  **Broadcast scope** — `collect_broadcast_lemma_funs` (below) handles BOTH default-on-import groups (`broadcast_use_by_default_when_this_crate_is_imported`, e.g. vstd's `group_vstd_default` — the drop-in case) AND fn-body `broadcast use <group>;` (`StmX::Fuel`). Still deferred: **module-level** `broadcast use` (`ModuleX.reveals` — a `broadcast use` at module scope rather than fn-body or default-on-import); needs reading the fn's owning-module reveal list rather than the fn body. Rare for user crates.
 * **`#[verifier::heartbeats(N)]` attribute** — per-fn Lean `maxHeartbeats` override. DESIGN.md mentions; not wired through `vir::ast::FunctionAttrsX`.
 * **Lean version pinning / CI matrix.** `lean-toolchain` is pinned to `v4.25.0`; tactic behaviour could shift on upgrade. No automated regression against multiple Lean versions.
 * **Per-module `.lean` file generation.** Current design emits one file per fn (`target/tactus-lean/{crate}/{fn}.lean`). At scale, per-module would amortize preamble and olean caching; HANDOFF notes it as future work.
@@ -2294,7 +2294,7 @@ These are deferred not by Tactus design choice but by upstream Verus pipeline st
 
 Assumptions about upstream VIR/SST shape or Verus compiler-pass ordering that aren't (and can't straightforwardly be) enforced by Rust's type system. If any of these drift in an upstream rebase, our verification silently mis-compiles or panics. Each has either a shape-drift test, a compile-catch, or a documented fix site.
 
-* **`broadcast use G;` lowers to `StmX::Fuel(group_fun, _)`** (#122, 2026-05-29). `collect_broadcast_lemma_funs` reads broadcast directives off the SST body by matching `StmX::Fuel` and looking the target up in `krate.reveal_groups` (group) / `fn_map` + `attrs.broadcast_forall` (single lemma). If Verus changes the lowering (e.g. drops the `is_broadcast_use` flag path, or routes broadcast through a non-Fuel statement), broadcast-use silently stops bringing lemmas into scope — cross-crate Seq/Set/Map code would regress to "closer can't reduce opaque axiom." **No shape-drift test** — would manifest as `test_cross_crate_broadcast_seq_push_len` regressing from Ok to Err. `collect_fuel_targets`'s exhaustive `StmX` match is the compile-catch for a new nested-stmt variant, but not for a change to how `broadcast use` itself lowers. Also depended on: `RevealGroupX.{name, members}` (group identity + member list) and `FunctionAttrsX.broadcast_forall` (the lemma marker) — renames compile-break (good).
+* **Broadcast scope shape** (#122, 2026-05-29). `collect_broadcast_lemma_funs` depends on two upstream shapes: (a) `broadcast use G;` lowers to `StmX::Fuel(group_fun, _)` in the SST body; (b) default-on-import groups are flagged via `RevealGroupX.broadcast_use_by_default_when_this_crate_is_imported = Some(c)` and ambient when `c != crate_name` (mirrors Verus's `context.rs` crate→group edge). If Verus changes either — drops the `is_broadcast_use` Fuel lowering, or reworks the default-import flag — broadcast lemmas silently stop reaching scope, and cross-crate Seq/Set/Map code regresses to "closer can't reduce opaque axiom." **No shape-drift test** — would manifest as `test_cross_crate_broadcast_default_on_import` (default-import path) or `_explicit_group_use` (Fuel path) regressing from Ok to Err. `collect_fuel_targets`'s exhaustive `StmX` match is the compile-catch for a new nested-stmt variant, but not for a change to how `broadcast use` lowers. Also depended on: `RevealGroupX.{name, members}` and `FunctionAttrsX.broadcast_forall` — renames compile-break (good).
 
 * **`vir::recursion` inserts `CheckDecreaseHeight` BEFORE the recursive `StmX::Call`.** Our `Wp::Assert` walk relies on this ordering — the assert must appear in the statement sequence strictly before the Call so `build_wp`'s right-to-left fold produces `Assert(CheckDecreaseHeight, Call(...))` rather than `Call(..., Assert(CheckDecreaseHeight))`. If Verus changes the pass to insert after (or inline the check into the call somehow), recursive fns would verify without the termination obligation. **No compile catch; no shape-drift test.** A regression test that constructs a minimal self-recursive SST and verifies the Assert-Call ordering in the walk output would lock this down.
 * **`CheckDecreaseHeight.args[0]` is `Bind(Let(params → args, decrease))`** — possibly wrapped in Box/Unbox/CoerceMode/Trigger. `render_checked_decrease_arg` peels and substitutes. **Shape-drift test**: `full_check_decrease_height_shape_pinned` asserts the substituted form, with a failure message naming the fix site.
@@ -2792,17 +2792,42 @@ semantics**. Their meaning lives in separate `broadcast axiom fn` /
 collected into `pub broadcast group group_seq_axioms`. Before this
 landing those lemmas never reached the preamble, so a goal like
 `r == Seq::empty().push(0).len()` was unprovable — the opaque `len`/
-`push` axioms gave the closer nothing to reduce. (Pinned then-and-now
-by `test_cross_crate_probe_5_seq_in_spec`, which has no `broadcast use`
-and stays Err.)
+`push` axioms gave the closer nothing to reduce.
 
-**Key fact: broadcast is the user's explicit directive, not ambient
-magic.** `group_seq_axioms` is *not* marked
-`broadcast_use_by_default_when_this_crate_is_imported`, so — exactly as
-in Verus-Z3 — the user must write `broadcast use group_seq_axioms;` to
-bring the lemmas into scope. Honoring that directive is translating an
-explicit opt-in, fully compatible with the minimal-automation principle
-(it is NOT extending `tactus_auto`'s default set).
+**Two sources of in-scope broadcast lemmas** (`collect_broadcast_lemma_funs`):
+
+1. **Default-on-import (the drop-in case).** vstd's top-level
+   `group_vstd_default` is marked
+   `broadcast_use_by_default_when_this_crate_is_imported`, and it
+   *contains* `group_seq_axioms` / `group_map_axioms` / `group_set_axioms`
+   / … So importing vstd makes the Seq/Set/Map semantic lemmas ambient
+   **with no explicit `broadcast use`** — exactly matching Verus-Z3,
+   where the same default group fires. This is what makes Tactus
+   drop-in for vstd-using spec code: `Seq::empty().push(0).len() == 1`
+   verifies on its own. (An earlier draft of this section claimed
+   `group_seq_axioms` "isn't default-on-import, so the user must write
+   `broadcast use`" — *incomplete*: the group isn't *itself* flagged,
+   but it's a member of the flagged `group_vstd_default`, so it IS
+   ambient on import. Corrected 2026-05-29.) `collect_broadcast_lemma_funs`
+   seeds from every reveal group with
+   `broadcast_use_by_default_when_this_crate_is_imported = Some(c)` where
+   `c != crate_name` (mirrors Verus's `context.rs` crate→group edge).
+2. **Explicit `broadcast use <group/lemma>;`** in the fn body. Still
+   load-bearing for **non-default** groups (`group_seq_lemmas_expensive`)
+   and user-defined broadcast groups — and harmless (idempotent) for
+   default-group lemmas. Honoring it translates an explicit opt-in;
+   neither source extends `tactus_auto`'s default tactic set — they add
+   *facts to the local context*, visible in the generated `.lean`.
+
+**Scope stays small via `merge_krates`.** `group_vstd_default`
+transitively names ~150 lemmas across all of vstd, but the merged krate
+Tactus receives is already pruned to *referenced* fns — so a Seq-only
+crate expands the default group to ≈7 leaf lemmas, not 150. No
+per-fn-inject-everything blowup; the cost scales with what the crate
+actually uses.
+
+**The lowering hook (source 2).** `broadcast use G;` lowers (via
+`ExprX::Fuel(group_fun, _, is_broadcast_use=true)`) to
 
 **The lowering hook.** `broadcast use G;` lowers (via
 `ExprX::Fuel(group_fun, _, is_broadcast_use=true)`) to
@@ -2857,19 +2882,22 @@ defined as an uninterpreted relation `axiom Tactus.heightLt {α : Type u}
 {β : Type v} (a : α) (b : β) : Prop` — carries the termination fact
 faithfully without committing to a height model for opaque types.
 
-**Scope simplification.** Verus scopes `broadcast use` lexically to the
-enclosing block; Tactus treats any `broadcast use` in the body as
-fn-scoped (all collected lemmas available to every obligation). Sound
-(the lemmas are true everywhere) and matches the common top-of-fn usage.
-Module-level / default-on-import broadcast is deferred (see Phase-3
-cross-crate note).
+**Scope simplification.** Verus scopes explicit `broadcast use`
+lexically to the enclosing block; Tactus treats any `broadcast use` in
+the body as fn-scoped (all collected lemmas available to every
+obligation). Sound (the lemmas are true everywhere) and matches the
+common top-of-fn usage. **Module-level** `broadcast use`
+(`ModuleX.reveals`) is the one broadcast source still deferred (see the
+Phase-3 cross-crate note); default-on-import and fn-body `broadcast use`
+are both handled.
 
-**Pinned by**: `test_cross_crate_broadcast_seq_push_len` (positive —
-group; `empty().push(0).len() == 1` verifies), `_wrong_ensures`
-(negative soundness — `len + 1` claim fails, so injection isn't vacuous),
-`_required_for_semantics` (without `broadcast use` the same goal fails —
-explicit-opt-in pin), `_single_lemma` (the non-group `broadcast use
-axiom_seq_push_len;` branch).
+**Pinned by**: `test_cross_crate_broadcast_default_on_import` (headline
+— `empty().push(0).len() == 1` verifies with NO `broadcast use`, via
+`group_vstd_default`), `_wrong_ensures` (negative soundness — `len + 1`
+claim fails, so injection isn't vacuous), `_explicit_group_use` (the
+fn-body `StmX::Fuel` group path still works alongside default-on-import),
+`_explicit_single_lemma` (the non-group `broadcast use axiom_seq_push_len;`
+expand branch).
 
 ### Trait class+instance emission: deferred edges
 
