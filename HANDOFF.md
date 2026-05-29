@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**445 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** (Cluster A's 2 remaining failures closed this session via typed substitution + universal call-arg bridging — see 2026-05-26 session notes "typed substitution closes Cluster A".) vstd still verifies (1530 functions, 0 errors). Remaining 3 e2e failures are Cluster B (SST binder tracking, orthogonal — separate problem). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**446 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** (Cluster A's 2 remaining failures closed via typed substitution + universal call-arg bridging; review batches landed bringing +1 e2e regression test (C1: inherent-method autoborrow inlining). See 2026-05-26 session notes and the 2026-05-29 review follow-up.) vstd still verifies (1530 functions, 0 errors). Remaining 3 e2e failures are Cluster B (SST binder tracking, orthogonal — separate problem). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -76,6 +76,36 @@ constructs (Let, Block, If-with-bindings, Match arms), so projection
 sites (CheckDecreaseHeight, Field) compute wrong deref counts on
 aliased locals. Orthogonal to typed substitution; needs Option C
 (scoped SST binder tracking). Separate session.
+
+**Review follow-up (2026-05-29, `8ff8b25`).** 15-lens review pass
+on the typed-substitution diff surfaced 7 findings; fix-now and
+fix-soon batches both landed:
+* **F1** ✅ — combined two adjacent overlapping comment blocks in
+  `walk_call` describing `render_ctx_req`.
+* **F2** ✅ — `caller_arg_actual_typ` extended to handle `VarAt`
+  (binder-aware like Var/VarLoc) and recurse into `Loc(inner)`.
+  Catch-all rationale documented including the upstream-brittleness
+  story (a future binder-ref ExpX variant would silently fall
+  through and produce mis-bridged typs).
+* **C1** ✅ — new e2e `test_inherent_method_autoborrow_inlined`
+  pins the universal call-arg bridging for inherent-method dispatch
+  with non-mut params (the new path my Call bridge added). 445/3
+  → 446/3.
+* **C2** ✅ — code note added (covered by Cluster A's
+  `test_old_view_pre_post_substitution_probe`).
+* **D1** ✅ — DESIGN.md § "Shared helpers for implicit shape
+  assumptions" gets a "Two-site `value_subst` consultation — sync
+  risk" entry documenting that `ExprX::ReadPlace+Local` and
+  `place_to_expr`'s Local arm both consult `value_subst` and must
+  stay in sync.
+* **D2** ✅ — DESIGN.md status update that typed-substitution
+  closed the β over-wrap concern that originally motivated
+  `READPLACE_LIFT_ENABLED`.
+
+**Filed as future work**:
+* **R1** — `ctx.value_subst.is_some()` as "are we inlining" proxy.
+  Cleaner would be an explicit `ctx.is_inlining_context()` predicate.
+  Substrate concern, not blocking.
 
 #### Current session (2026-05-26 — Idea 1 principled: storage-typ subst + soundness finding)
 
