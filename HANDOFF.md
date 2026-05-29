@@ -119,6 +119,37 @@ the framing AND the perf worry. Same shape as the poem from earlier
 today ("the conflict that wasn't"): the dread/principle-tension was the
 shape of not-having-looked-yet.
 
+**⚠️ KNOWN ISSUE discovered while sizing cross-crate exec callees
+(next-to-fix).** A recon probe — a `tactus_auto` fn that uses `Vec`
+under `use vstd::prelude::*` — surfaced a **panic** (not a clean
+rejection) from the default-on-import change I just committed
+(`82015e0`): `to_lean_fn.rs:1317` "trait method `set_lib::FiniteFull::
+full_properties` not found in VIR function list — this is a Tactus
+bug." Diagnosis: `group_vstd_default` transitively includes
+`group_set_lib_default`, so for a crate whose merged krate carries
+set_lib fns, default-on-import collects a set_lib broadcast lemma whose
+spec references a trait method (`FiniteFull::full_properties`) that
+isn't fully emittable cross-crate — and trait emission *panics* rather
+than degrading. A *trivial* prelude-importing fn does NOT panic
+(merge_krates prunes set_lib away when unreferenced), so the existing
+457 tests don't trip it; but realistic `vstd::prelude::*` + Vec/Set
+code can. **This is a robustness regression in `82015e0`** — it turned
+"verification failure" into "panic" for that shape.
+
+Fix direction (next session): default-on-import lemma emission must
+*degrade gracefully* — skip (or cleanly reject) any broadcast lemma
+whose spec references an un-emittable cross-crate trait method, instead
+of panicking. Candidates: (a) make `to_lean_fn.rs:1317` trait-method
+emission return Err instead of `panic!` and have the dep-walk/emit path
+skip that lemma; (b) pre-filter the default-broadcast set to lemmas
+whose transitive refs are all emittable; (c) gate default-on-import to
+groups whose members don't pull in cross-crate trait methods. Likely
+(a) is most robust. Pin with a `vstd::prelude::* + Vec` probe (Err, not
+panic). Separately: the recon ALSO showed cross-crate *exec* callees do
+NOT hit `build_wp_call`'s fn_map rejection (the callee IS merged) — so
+the "cross-crate exec callees rejected" framing was stale too; the real
+blockers are cross-crate trait/View emission (Bug B / #125 territory).
+
 #### Current session (2026-05-29 — Cluster B Half A: ref_to_bare closed)
 
 **Headline**: 446/3 → 447/2, zero regressions, 261 lib tests green.
