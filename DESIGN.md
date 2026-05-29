@@ -3394,7 +3394,15 @@ shadow makes x's Lean type match e's inner-value type).
   so body and ensures meet at the same depth (`nested_wrapper` now
   renders `r := b.deref.deref` on both sides — type-correct, still
   `rfl`). The two changes are a unit: binop reconciliation needs the
-  return coercion to stay sound. Non-structural binops still peel their
+  return coercion to stay sound. The coercion is applied **per leaf**
+  (`lift_if_value_coerced`), not against the whole returned expr's typ —
+  an if-valued return (`if c { **b } else { 0 }`) has branches of
+  distinct typ, so coercing each branch with its own typ is required
+  (pinned by `test_exec_return_if_wrapper_value_probe`; a coverage probe
+  caught the whole-expr-typ version mis-firing). `walk_let`'s let-binding
+  coercion (Half B) is naturally per-branch — it recurses into each if
+  branch as a fresh `val` — so only the Return path needed the leaf-level
+  fix. Non-structural binops still peel their
   operands fully (their head fns want inner-typed args). Pinned by
   `test_exec_call_site_ref_to_bare_probe` (flipped green) +
   `test_exec_nested_wrapper_probe` (stayed green).

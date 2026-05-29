@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**449 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass — full e2e suite green, 0 failures.** All of Cluster B closed 2026-05-29: `ref_to_bare` (Half A — structural-binop reconcile + return coerce), `aliased_arg` (Half B — let-binding coercion), and `cross_instantiation` (universe-polymorphic wrapper structures). See that session entry. (Earlier: Cluster A closed via typed substitution + universal call-arg bridging.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**452 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass — full e2e suite green, 0 failures.** All of Cluster B closed 2026-05-29: `ref_to_bare` (Half A — structural-binop reconcile + return coerce), `aliased_arg` (Half B — let-binding coercion), and `cross_instantiation` (universe-polymorphic wrapper structures). A review/coverage pass then added soundness negatives + a comprehensive-coverage probe that **found and fixed a real Half-A bug** (return-coercion mis-firing on if-valued returns — see the session entry). (Earlier: Cluster A closed via typed substitution + universal call-arg bridging.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -125,6 +125,34 @@ promise for recursive generics.
 closed in one session — and the design question they raised resolved
 toward *finish the faithful model* (wrappers kept for fidelity; see
 DESIGN.md "Why we keep the wrappers"), not revisit it.
+
+**Review + comprehensive-coverage pass (449 → 452).** Ran the lens
+battery over the three commits. Landings:
+* Two soundness negatives (`_ref_to_bare_wrong_post` → `(postcondition)`,
+  `_aliased_arg_nondecreasing` → `(termination)`), tightened on a
+  second reading from `=> Err(_)` to assert the obligation *kind* (the
+  fixes were positive-pinned only; these confirm the coercions didn't
+  defang the obligation, and reject for the *right* reason).
+* Two edge-case comments (multi-binder let inner binders un-coerced —
+  unreached per #92; min-depth binop reconcile is depth-only).
+* **Coverage probe found a real bug.** `_return_if_wrapper_value_probe`
+  (a wrapper-typed *if*-return) exposed that Half A's return coercion
+  coerced against the WHOLE if-expr's typ, not each branch's — so the
+  `**b` branch bound `let r := b` un-coerced while the ensures
+  reconciled to `b.deref.deref`. No prior test had a wrapper-typed
+  if-return, so the suite hid it. Fixed by coercing PER LEAF:
+  `lift_if_value` impl renamed to `lift_if_value_coerced(e, ret_coerce,
+  emit_leaf)`; a 2-arg wrapper keeps other callers unchanged.
+
+  *Why only the Return path had this* (worth keeping): both the Return
+  arm and `walk_let` (Half B) handle if-valued bindings, but `walk_let`
+  **recurses per-branch** (each branch becomes a fresh `val` with its
+  own `val.typ`, coerced at the plain-let case) — correct by
+  construction, immune to this class. The Return arm captured one
+  whole-expr `e_typ` in its `lift_if_value` closure. The per-leaf fix
+  brings the Return path to `walk_let`'s discipline. So the let-RHS-if
+  twin (`let x = if c {…} else {…}` auto-ref'd) is *not* buggy; no
+  separate test needed (it'd be contrived to construct anyway).
 
 **Discipline note worth recording.** The probe's job was to reveal the
 shape, and it did — overturning the "Cluster B = binder tracking"
