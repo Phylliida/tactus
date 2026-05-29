@@ -85,24 +85,32 @@ noncomputable def isize_hi : Int := (2 : Int) ^ (arch_word_bits - 1)
 -- instances of `Foo &A` from `Foo A`.
 --
 -- `Inhabited` derives naturally given `[Inhabited A]` of the inner.
+--
+-- Universe-polymorphic (`A : Type u`, not `Type`): a faithful Rust→Lean
+-- type map must wrap types of ANY size, including the `Type 1` indexed
+-- inductives Tactus emits for cross-instantiation recursive generics
+-- (e.g. `enum Mut<A> { Recurse(Box<Mut<u8>>) }` → `inductive Mut : Type
+-- → Type 1`). With a monomorphic `Type → Type` wrapper, `Tactus.Box
+-- (Mut Int)` failed to elaborate ("`Mut Int` has type `Type 1` but is
+-- expected to have type `Type`"). `u` is auto-bound per declaration.
 
-structure Tactus.Ref (A : Type) where
+structure Tactus.Ref (A : Type u) where
   deref : A
   deriving Inhabited
 
-structure Tactus.MutRef (A : Type) where
+structure Tactus.MutRef (A : Type u) where
   deref : A
   deriving Inhabited
 
-structure Tactus.Box (A : Type) where
+structure Tactus.Box (A : Type u) where
   deref : A
   deriving Inhabited
 
-structure Tactus.Rc (A : Type) where
+structure Tactus.Rc (A : Type u) where
   deref : A
   deriving Inhabited
 
-structure Tactus.Arc (A : Type) where
+structure Tactus.Arc (A : Type u) where
   deref : A
   deriving Inhabited
 
@@ -115,15 +123,15 @@ structure Tactus.Arc (A : Type) where
 -- `sizeOf <field>.deref ≤ sizeOf <wrapper>` stuck. These `@[simp]`
 -- lemmas reduce the wrapper side so the `decreasing_by` tactic
 -- (`simp_all; omega`) can close.
-@[simp] theorem Tactus.Ref.sizeOf_deref {A : Type} [SizeOf A] (b : Tactus.Ref A) :
+@[simp] theorem Tactus.Ref.sizeOf_deref {A : Type u} [SizeOf A] (b : Tactus.Ref A) :
   sizeOf b = 1 + sizeOf b.deref := by cases b; rfl
-@[simp] theorem Tactus.MutRef.sizeOf_deref {A : Type} [SizeOf A] (b : Tactus.MutRef A) :
+@[simp] theorem Tactus.MutRef.sizeOf_deref {A : Type u} [SizeOf A] (b : Tactus.MutRef A) :
   sizeOf b = 1 + sizeOf b.deref := by cases b; rfl
-@[simp] theorem Tactus.Box.sizeOf_deref {A : Type} [SizeOf A] (b : Tactus.Box A) :
+@[simp] theorem Tactus.Box.sizeOf_deref {A : Type u} [SizeOf A] (b : Tactus.Box A) :
   sizeOf b = 1 + sizeOf b.deref := by cases b; rfl
-@[simp] theorem Tactus.Rc.sizeOf_deref {A : Type} [SizeOf A] (b : Tactus.Rc A) :
+@[simp] theorem Tactus.Rc.sizeOf_deref {A : Type u} [SizeOf A] (b : Tactus.Rc A) :
   sizeOf b = 1 + sizeOf b.deref := by cases b; rfl
-@[simp] theorem Tactus.Arc.sizeOf_deref {A : Type} [SizeOf A] (b : Tactus.Arc A) :
+@[simp] theorem Tactus.Arc.sizeOf_deref {A : Type u} [SizeOf A] (b : Tactus.Arc A) :
   sizeOf b = 1 + sizeOf b.deref := by cases b; rfl
 
 -- `Tactus.strGetChar s i` is the i-th Unicode codepoint of `s` as a
