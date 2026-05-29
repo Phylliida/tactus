@@ -8,11 +8,97 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**446 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** (Cluster A's 2 remaining failures closed via typed substitution + universal call-arg bridging; review batches landed bringing +1 e2e regression test (C1: inherent-method autoborrow inlining). See 2026-05-26 session notes and the 2026-05-29 review follow-up.) vstd still verifies (1530 functions, 0 errors). Remaining 3 e2e failures are Cluster B (SST binder tracking, orthogonal — separate problem). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**447 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** (Cluster B's `ref_to_bare` closed 2026-05-29 via structural-binop reconcile + return coerce — see that session entry. Earlier: Cluster A closed via typed substitution + universal call-arg bridging.) vstd still verifies (1530 functions, 0 errors). **Remaining 2 e2e failures**: `test_exec_call_recursive_aliased_arg_probe` (Cluster B Half B — a `let` alias gains a `&` in its SST typ that the rendered Lean value lacks → CheckDecreaseHeight over-derefs; fix planned, see session entry) and `test_exec_call_recursive_generic_datatype_cross_instantiation` (universe mismatch — wrapper axioms `Type→Type` can't wrap a `Type 1` indexed inductive; separate, riskiest). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
 ### Recent session landings
+
+#### Current session (2026-05-29 — Cluster B Half A: ref_to_bare closed)
+
+**Headline**: 446/3 → 447/2, zero regressions, 261 lib tests green.
+Committed `1852605`.
+
+**The arc.** Started the 3 remaining Cluster B failures with a "probe
+small first, then unify" plan. Probing `ref_to_bare` (the smallest)
+corrected the HANDOFF's framing: **the 3 failures have 3 distinct root
+causes, not one "SST binder tracking" problem.** Grounded in the real
+post-β generated Lean (the pre-β test-file comments were stale):
+
+* **`ref_to_bare`** — `*p` (for `&u8` param `p`) arrives as `Var(p)`
+  carrying the *reference* typ `&u8`, deref implicit. So `*p <= 100`
+  compares `Tactus.Ref Int` to `Int` at the structural `≤`. The
+  requires-binder and ensures-goal paths rendered it bare (`p ≤ 100`)
+  while the call-arg path coerced (`p.deref`) — an *inconsistency*.
+  (`nested_wrapper` passes by accident: `**b` collapses to bare `b` on
+  both sides of `r == **b`, so the dropped derefs cancel.)
+* **`aliased_arg`** — Half B, see below. Different cause (let-alias
+  typ mismatch).
+* **`cross_instantiation`** — universe mismatch (`Tactus.Ref/Box :
+  Type → Type` can't wrap a `Type 1` indexed inductive). Wholly
+  separate; the riskiest.
+
+**Half A fix (closes `ref_to_bare`), commit `1852605`.** Two coupled
+changes — the consistency fix:
+1. **Structural binops reconcile operand wrapper-depths** (peel the
+   deeper operand to the shallower, min-depth) in
+   `to_lean_sst_expr.rs`'s `Binary` arm. Equal-depth operands (the
+   common case: `s1 == s2`, `r == b` after `let r := b`) are untouched
+   → strict refinement of the `d9476e6` "never peel structural
+   operands" rule.
+2. **`StmX::Return` coerces the returned expr to the declared ret typ**
+   (new `WpCtx::ret_typ`, derived from `post_condition.dest` +
+   `local_decls`). This is the *paired* half: it keeps the body's
+   `let r := …` symmetric with the now-reconciled ensures, closing the
+   asymmetry that originally blocked `d9476e6`'s structural peel. So
+   `nested_wrapper` stays green (now `r := b.deref.deref` on both
+   sides — type-correct, still `rfl`).
+
+   *False start worth recording*: I first built a binder-aware `Var`-arm
+   coercion (RenderCtx `binder_typs` map seeded from params). It was
+   **inert** — `*p` is `Var(p)` already at the reference typ, so
+   `coerce(p, &u8, &u8)` is a no-op; the peel must happen at the
+   consuming binop, not the Var. Reverted it (Linus lens: don't commit
+   no-op speculative infra). The lesson: the deref-want isn't visible
+   at the leaf when Verus keeps the value at its reference typ — only
+   at the structural site where the depth mismatch shows.
+
+**Half B (`aliased_arg`) — diagnosed, fix planned (not landed).** From
+CheckDecreaseHeight `cur`-typ dumps: `let copy = rest` adds a `&` to
+`copy`'s SST typ (`rest : Box<Stack>` → `copy : &Box<Stack>`, Rust
+auto-ref for the `shrink(copy)` call), but the renderer binds
+`let copy := rest` *uncoerced* — copy's Lean value stays `Box Stack`
+(1 wrapper) while its typ claims 2, so CheckDecreaseHeight over-derefs
+(`copy.deref.deref` → `Stack.deref` missing). The direct case
+(`count(rest)`) passes because `rest` is consumed directly (measure typ
+`Box<Stack>`, count 1 — no aliasing let to freeze a mismatched typ).
+**Fix**: coerce the let-RHS to the dest's SST typ at the binding
+(`let copy := Tactus.Ref.mk rest`) — the U2 invariant ("local's Lean
+value matches its SST typ") applied at let-bindings. `build_wp`'s
+`StmX::Assign` arm (sst_to_lean.rs ~4772) has both `dest.typ` and
+`rhs.typ`; thread `dest.typ` onto `Wp::Let` (Option<Typ>; None for
+synthetic frames) and `coerce_lexpr(lower(val), rhs.typ, dest.typ)` at
+the `Wp::Let` walk (~1780) + `walk_let` (~3912). Regression-sensitive
+(touches every user let) → full-suite gate + likely iteration; left for
+a fresh focused pass. Only Assign-derived `Wp::Let` needs it; OblCtx
+synthetic lets (`_tactus_d_old`, `_at_pre_tactus`) and `Wp::LetRaw` are
+separate paths.
+
+**`cross_instantiation` — separate universe track.** `Tactus.Ref/Box :
+Type → Type` (universe-monomorphic at `Type 0`) can't wrap a
+`Mut Int : Type 1` (cross-instantiation datatypes emit as indexed
+inductives `inductive Mut : Type → Type 1`). Needs universe-polymorphic
+wrapper axioms (`axiom Ref : Type u → Type u` + poly `.mk`/`.deref`/
+`SizeOf`/`Inhabited`) OR a decision to re-defer. Independent of binder
+tracking.
+
+**Discipline note worth recording.** The probe's job was to reveal the
+shape, and it did — overturning the "Cluster B = binder tracking"
+framing. Each failure needed its own ground-truth read of the generated
+Lean; the stale pre-β test comments would have sent the binder-map
+approach at all three. The probe found that `ref_to_bare` ≈ the
+binop-half of the unify, and that closing it (Half A) is a clean,
+self-contained win independent of the harder Half B.
 
 #### Current session (2026-05-26 cont. — typed substitution closes Cluster A)
 

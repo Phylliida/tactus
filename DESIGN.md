@@ -3320,14 +3320,33 @@ shadow makes x's Lean type match e's inner-value type).
   keeps the lift (default flag value), so proof/spec/trait-impl-
   method bodies are unchanged.
 
-* **Non-structural-only binop peel.** Structural binops (`==`,
-  `+`, `*`, `≤`, ...) apply to wrapper-typed operands directly
-  (Lean infers the operand type from one side). Non-structural
-  binops (those routed via `non_binop_head` to specific head fns
-  like `Tactus.strGetChar`) need inner-typed args and require the
-  peel. Mixing the two — applying the peel uniformly — breaks
-  body/ensures symmetry when Verus's SST collapses auto-derefs
-  into `Var(p)`-with-adjusted-typ form (`test_exec_nested_wrapper_probe`).
+* **Non-structural-only blanket peel → structural min-depth
+  reconciliation (refined 2026-05-29, commit `1852605`).** The
+  original `d9476e6` rule was "never peel structural operands"
+  (`==`, `+`, `*`, `≤`, ...) — peel only non-structural binops
+  (those routed via `non_binop_head` to head fns like
+  `Tactus.strGetChar`, which need inner-typed args). That rule was
+  *too conservative*: Verus keeps `*p` (for a `&T` param) at the
+  reference typ `&T` with the deref implicit, so a structural binop
+  can receive mismatched operand depths — `p : &u8` (depth 1) `≤`
+  `100 : u8` (depth 0) renders `p ≤ 100`, comparing `Tactus.Ref Int`
+  to `Int` (a Lean type error; `test_exec_call_site_ref_to_bare_probe`).
+  Structural binops now **reconcile operands to a common (min) wrapper
+  depth** — peel the deeper operand(s) to the shallower. Equal-depth
+  operands (the common case: `s1 == s2` for two `&T` params, `r == b`
+  after `let r := b`) are untouched (min == both → zero peels), so this
+  is a strict refinement, not a reversal. The body/ensures symmetry that
+  `d9476e6` worried about (it broke `nested_wrapper` when ensures peeled
+  but the body's `let r := b` stayed uncoerced) is preserved by the
+  **paired return-expr coercion**: `build_wp`'s `StmX::Return` arm
+  coerces the returned value to the declared ret typ (`WpCtx::ret_typ`),
+  so body and ensures meet at the same depth (`nested_wrapper` now
+  renders `r := b.deref.deref` on both sides — type-correct, still
+  `rfl`). The two changes are a unit: binop reconciliation needs the
+  return coercion to stay sound. Non-structural binops still peel their
+  operands fully (their head fns want inner-typed args). Pinned by
+  `test_exec_call_site_ref_to_bare_probe` (flipped green) +
+  `test_exec_nested_wrapper_probe` (stayed green).
 
 * **Use-site coercion at projection sites** (U2). Fields and
   IsVariant discriminators belong to the inner type, not the
