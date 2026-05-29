@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**447 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** (Cluster B's `ref_to_bare` closed 2026-05-29 via structural-binop reconcile + return coerce — see that session entry. Earlier: Cluster A closed via typed substitution + universal call-arg bridging.) vstd still verifies (1530 functions, 0 errors). **Remaining 2 e2e failures**: `test_exec_call_recursive_aliased_arg_probe` (Cluster B Half B — a `let` alias gains a `&` in its SST typ that the rendered Lean value lacks → CheckDecreaseHeight over-derefs; fix planned, see session entry) and `test_exec_call_recursive_generic_datatype_cross_instantiation` (universe mismatch — wrapper axioms `Type→Type` can't wrap a `Type 1` indexed inductive; separate, riskiest). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**448 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** (Cluster B's `ref_to_bare` AND `aliased_arg` both closed 2026-05-29 — Half A: structural-binop reconcile + return coerce; Half B: let-binding coercion. See that session entry. Earlier: Cluster A closed via typed substitution + universal call-arg bridging.) vstd still verifies (1530 functions, 0 errors). **Remaining 1 e2e failure**: `test_exec_call_recursive_generic_datatype_cross_instantiation` (universe mismatch — wrapper axioms `Type→Type` can't wrap a `Type 1` indexed inductive; separate track, needs universe-polymorphic wrapper axioms). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -63,7 +63,7 @@ changes — the consistency fix:
    at the leaf when Verus keeps the value at its reference typ — only
    at the structural site where the depth mismatch shows.
 
-**Half B (`aliased_arg`) — diagnosed, fix planned (not landed).** From
+**Half B (`aliased_arg`) — LANDED (`5e3b469`).** From
 CheckDecreaseHeight `cur`-typ dumps: `let copy = rest` adds a `&` to
 `copy`'s SST typ (`rest : Box<Stack>` → `copy : &Box<Stack>`, Rust
 auto-ref for the `shrink(copy)` call), but the renderer binds
@@ -78,11 +78,34 @@ value matches its SST typ") applied at let-bindings. `build_wp`'s
 `StmX::Assign` arm (sst_to_lean.rs ~4772) has both `dest.typ` and
 `rhs.typ`; thread `dest.typ` onto `Wp::Let` (Option<Typ>; None for
 synthetic frames) and `coerce_lexpr(lower(val), rhs.typ, dest.typ)` at
-the `Wp::Let` walk (~1780) + `walk_let` (~3912). Regression-sensitive
-(touches every user let) → full-suite gate + likely iteration; left for
-a fresh focused pass. Only Assign-derived `Wp::Let` needs it; OblCtx
+the `Wp::Let` walk (~1780) + `walk_let` (~3912). Implemented exactly
+that — `Wp::Let` gained a `Typ` field (Assign is its sole construction
+site); `walk_let` threads `dest_typ` through the if-fork + inner-let-
+chain recursion and coerces at the plain-let case. **447/2 → 448/1,
+zero regressions, 261 lib tests pass.** No-op when `val.typ == dest_typ`
+(every existing let), so the regression surface was nil despite touching
+the let path.
+
+**Reframing worth recording (the "U2 retires the peels" claim was
+over-stated).** I'd pitched bringing U2 to the SST renderer as a
+debt-retiring refactor that would collapse the scattered
+Field/IsVariant/CheckDecreaseHeight/binop peels into one mechanism.
+Reading the VIR-AST U2 machinery showed otherwise: U2 unified
+*body-shadow + lift*, NOT the projection peels — VIR-AST keeps its own
+`render_expr_with_derefs` / `lean_level_wrap_count` peels. The peels are
+necessary *unwrap-for-operation* steps (you must `.deref` a `Ref` to
+project a field or call a height fn), present in both renderers, not
+redundant coercion. And VIR-AST's `BinderCtx` is **params-only** — it
+does NOT extend through block lets, so a faithful port wouldn't have
+closed `aliased_arg` anyway. The genuine U2 *principle* for the SST is
+"maintain the value↔typ invariant at binding sites"; the let-binding
+was the one binder not maintaining it. Eager coercion at the binder
+(this fix) realizes that invariant without a binder map — simpler than
+VIR-AST's lazy use-site bridge, same correctness. So Half B is the
+*right-sized* principled fix, not a minor patch and not the big refactor
+I'd imagined. Only `Assign`-derived `Wp::Let` carries the typ; OblCtx
 synthetic lets (`_tactus_d_old`, `_at_pre_tactus`) and `Wp::LetRaw` are
-separate paths.
+separate paths, untouched.
 
 **`cross_instantiation` — separate universe track.** `Tactus.Ref/Box :
 Type → Type` (universe-monomorphic at `Type 0`) can't wrap a
