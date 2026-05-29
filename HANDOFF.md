@@ -160,54 +160,134 @@ territory.
 
 ##### Scoping note — cross-crate View / exec-callee emission (no code, 2026-05-29)
 
-Probed the canonical case (`fn use_vec(v: &Vec<u8>) -> usize ensures r
-== v.len() { v.len() }` under `vstd::prelude::*`) by reading the
-generated `.lean`. **The verification itself is trivial** — the goal is
-`r = std_specs.vec.spec_vec_len v` where `r := spec_vec_len v` (an
-`r = r` that closes by `rfl`). The spec/broadcast layer all works now:
-`std_specs.vec.axiom_spec_len` / `_vec_has_resolved` /
-`_vec_decreases_to_view` emit as axioms via **default-on-import
-broadcast** (synergy with this session's landing). So the ONLY thing
-blocking is **cross-crate trait/instance emission**, which has ≥4
-distinct, interacting bugs (full `lean --json` error set):
+**TL;DR.** "Cross-crate exec callees" turned out to NOT be blocked where
+the old framing said (`build_wp_call`'s fn_map rejection — the callee IS
+merged). The real blocker is **cross-crate trait/instance emission**.
+The good news this session uncovered: the *spec/verification* layer is
+already done — for the canonical `Vec::len` case the obligation is
+trivial and all the needed axioms emit — so the remaining arc is
+**purely about emitting vstd's trait classes + instances cleanly**, a
+more contained target than "all of cross-crate." It's ~3 interacting
+fixes / 2–3 focused sessions. This note enumerates each blocker with its
+exact code site, root cause, and recommended fix so a future session
+starts warm.
 
-1. **Dangling blanket-impl standalones** — the gate-emitted `View`
-   instances for `Tactus.Ref/Box/Rc/Arc A` (vstd's blanket impls) have
-   bodies referencing `view.impl__0/2/4/6.view` standalone defs that
-   are NOT emitted. Only the *concrete* `Vec.View.impl.view` (line 430)
-   emits — because the dep walk reaches it via the user's `v.len()`,
-   while the blanket standalones are referenced only by gate-emitted
-   instances the dep walk doesn't pull bodies for. Bug C
-   (`9f77305`) already synth-emits body=None cross-crate impl methods
-   as axioms for the *dep-walked* case; the gap is gate-emitted
-   instances' referenced standalones. Fix candidates: emit those
-   standalones as axioms too; OR inline the forwarding dispatch
-   (`view := fun self => view.View.view self.deref`) so no standalone
-   is needed (sound for vstd's all-forwarding blanket impls); OR
-   suppress blanket instances whose standalone isn't available.
-2. **`View.view` bare vs `view.View.view` qualified** — the
-   std_specs.vec axioms render the trait-method call as bare
-   `View.view`, but the class emits as `view.View` (with the vstd
-   `view::` module prefix). `trait_method_ref` / the call-rendering
-   path doesn't carry the cross-crate module qualifier consistently.
-   Same-crate coincides (no prefix); cross-crate diverges.
-3. **`cannot find synthesization order for instAllocatorRc/Box/Arc`** —
-   the blanket instances' `[alloc.Allocator A]`-style instance
-   signatures don't satisfy Lean's instance-synthesis ordering.
-4. `unsolved goals` / `type expected` cascade from 1–3.
+###### How it was probed
+Canonical case: `#[verifier::tactus_auto] fn use_vec(v: &Vec<u8>) ->
+(r: usize) ensures r == v.len() { v.len() }` under `use vstd::prelude::*`.
+Method: regenerate with `VERUS_KEEP_TEST_DIR=1`, read the generated
+`.lean`, run `lean --json` and collect the full distinct-error set.
+Pinned as a graceful-failure regression test
+(`test_cross_crate_default_broadcast_unemittable_trait_skipped`) — it
+will FLIP toward Ok as these blockers close.
 
-**Sizing**: ~3 interacting fixes (instance+standalone emission, trait-
-method qualification, instance-synth ordering), each medium, → a
-realistic **2–3 focused-session arc**, matching DESIGN's estimate. Not
-a quick win. The deeper non-forwarding-blanket soundness question
-(DESIGN § "Transparent-wrapper peel vs trait dispatch") is separate and
-also real, but vstd's View blanket impls are all *forwarding*, so
-opaque-axiom / forwarding-dispatch emission is sound for the realistic
-case. **Recommendation**: worth doing for realistic exec verification,
-but as its own multi-session arc started fresh — not a tail-end. The
-spec layer being done (this session) means the next arc is purely about
-trait/instance emission, which is a more contained target than "all of
-cross-crate."
+###### What already works (don't re-investigate)
+* The theorem goal is **trivial**: `r = std_specs.vec.spec_vec_len v`
+  where the body binds `r := spec_vec_len v` → closes by `rfl`/`omega`.
+* The vstd spec axioms all emit (via this session's default-on-import
+  broadcast): `std_specs.vec.spec_vec_len` (sig axiom),
+  `std_specs.vec.axiom_spec_len` (`spec_vec_len v = Seq.len (View.view
+  v)`), `_vec_has_resolved`, `_vec_decreases_to_view`. The seq/set
+  broadcast lemmas inject as `have _tactus_bc_i := …`.
+* The concrete `Vec` View impl method emits fine as
+  `axiom Vec.View.impl.view (T) (A) [Allocator A] (self : Ref (Vec T A))
+  : Seq T` (Bug C synth path, reached by the dep walk).
+
+###### The blockers (full `lean --json` error set, precise)
+
+**B1 — dangling blanket-impl standalones** (`Unknown identifier
+view.impl__0/2/4/6.view`, ×4).
+`generate.rs:274 instances_to_emit` emits a `view.View` instance for
+each of vstd's blanket impls `View for &A / Box<A> / Rc<A> / Arc<A>`,
+because their Self is `Decorate(Ref/Box/…, TypParam(A))` — NOT a
+`Datatype(Dt::Path)`, so it hits the vacuous `_ => true` arm of the
+`implementor_reached` check (generate.rs:283-287). Each emitted instance
+body (Bug-C-synthesized for body=None cross-crate methods) dispatches to
+a standalone `view.impl__N.view` — but that standalone is only emitted
+when the **dep walk** reaches it (true for the concrete `Vec` impl via
+`v.len()`, false for the blanket impls, which are reached only by the
+*gate*, not the dep walk). So the instances dangle.
+*Recommended fix*: when the instance gate (generate.rs:~515 instance
+emission loop) emits an instance with a body=None method, ALSO emit that
+method's standalone as an axiom — i.e. apply Bug C's synth-axiom to
+gate-emitted instances, not just dep-walked methods. (Alternative,
+cleaner long-term: inline the forwarding dispatch `view := fun self =>
+view.View.view self.deref` so no standalone is referenced — sound for
+vstd's all-forwarding blanket impls — but it needs the per-wrapper deref
+depth right and interacts with B2.) Smallest unblock = emit the
+standalones as axioms.
+
+**B2 — `View.view` bare vs `view.View.view` qualified** (`Unknown
+identifier View.view`, ×2).
+`to_lean_expr.rs:924 trait_method_ref` builds the call head from only
+the **last two** path segments: for `vstd::view::View::view` it yields
+`View.view`. But the class is emitted via `to_lean_fn.rs:1418
+lean_name(&tr.name)` = `view.View` (keeps the `view::` module segment).
+So calls render `View.view` while the class is `view.View` → method is
+`view.View.view` → bare `View.view` unresolved. Same-crate traits have
+no module segment so last-2 coincides; cross-crate (vstd's `view`
+module) diverges. The std_specs.vec axioms (`axiom_spec_len` etc.) are
+where the bare `View.view` appears.
+*Recommended fix*: make `trait_method_ref` produce the full
+module-qualified `lean_name(&fun.path)` (= `view.View.view`) instead of
+last-2-segments, matching `lean_name(&tr.name)`. Verify same-crate is
+unchanged (`lean_name` strips the crate but keeps modules; same-crate
+fun paths have no extra module segment, so `Trait.method` is preserved).
+One-liner-ish but test broadly — `trait_method_ref` feeds every trait
+call render.
+
+**B3 — Allocator instance can't synthesize** (`cannot find
+synthesization order for instAllocatorRc/Box/Arc`, ×3).
+vstd's `impl<T, A: Allocator> Allocator for Box<T, A>` renders (lines
+451-453 of the probe `.lean`) as `instance {T} {A} [Allocator T]
+[Allocator A] : Allocator (Tactus.Box T)`. The conclusion `Box T`
+mentions only `T`; `A` (Rust's `Box<T, A>` *allocator* param) is
+unconstrained → Lean can't pick a synthesis order. Root cause: Tactus
+erases the allocator param — `Tactus.Box` is the unary prelude wrapper
+`structure Tactus.Box (A : Type)` — but the impl still carries the
+`A: Allocator` bound + arg, leaving `A` free in the instance head. Same
+for Rc/Arc. (`Tactus.Ref A` at line 449 has only `{A} [Allocator A]` and
+*does* constrain A via `Ref A`, so it's fine — the problem is the
+2-param wrapper types whose 2nd param is dropped.)
+*Recommended fix*: when emitting an instance whose binder type params
+aren't all determined by the instance head (conclusion), drop the
+undetermined ones + their instance-arg bounds. Or, more targeted: in the
+Box/Rc/Arc rendering, recognize that the wrapper is unary and the
+trailing allocator param is erased, so don't emit its `{A} [Allocator
+A]`. Interacts with how `typ_to_expr` maps `Box<T,A>` → `Tactus.Box T`.
+
+**B4 — cascades** (`unsolved goals`, `type expected, got`). Downstream
+of B1–B3; expected to clear once those close. Re-probe after.
+
+###### Recommended phasing
+1. **B2 first** (smallest, unblocks the most): fix `trait_method_ref`
+   qualification. Re-probe — the std_specs axioms should then elaborate.
+2. **B1**: emit gate-emitted instances' body=None standalones as axioms
+   (extend Bug C). Re-probe — blanket instances resolve.
+3. **B3**: drop undetermined instance type-params / erased-allocator
+   bounds. Re-probe.
+4. **B4**: re-probe; the `Vec::len` case should flip to Ok. Then widen
+   to `Vec::push`/`Vec::index`/`Map`/`Set` method calls and triage the
+   next layer.
+Pin each with a probe; flip `test_cross_crate_default_broadcast_unemittable_trait_skipped`
+to Ok when `Vec::len` verifies, and add per-method positives.
+
+###### Soundness caveat (separate, pre-existing)
+vstd's View/Box/Rc/Arc blanket impls are all **forwarding**
+(`(**self).view()`), so emitting them as opaque axioms or
+forwarding-dispatch is sound. The deeper **non-forwarding** user-blanket
+concern (DESIGN § "Transparent-wrapper peel vs trait dispatch" →
+`test_non_forwarding_blanket_over_ref_probe`) is orthogonal and already
+handled at the type level by the wrapper structures; nothing here
+regresses it. Don't conflate the two.
+
+###### Why this is now contained (the session's gift)
+Before this session, a cross-crate `Vec::len` would also have failed in
+the spec layer (Seq lemmas not emittable). Default-on-import broadcast
+(landed today) made the spec axioms emit, so the *only* remaining wall
+is trait/instance emission (B1–B3). That's why the arc is "emit vstd's
+classes+instances cleanly," not "all of cross-crate" — a sharper, more
+achievable target.
 
 #### Current session (2026-05-29 — Cluster B Half A: ref_to_bare closed)
 
