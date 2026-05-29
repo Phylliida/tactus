@@ -1777,8 +1777,8 @@ fn walk_obligations<'a>(
             walk_obligations(body, ctx, &inner_obl, e);
             walk_obligations(after, ctx, obl, e);
         }
-        Wp::Let(name, val, body) => {
-            walk_let(name, val.raw(), body, ctx, obl, e);
+        Wp::Let(name, val, dest_typ, body) => {
+            walk_let(name, val.raw(), dest_typ, body, ctx, obl, e);
         }
         Wp::LetRaw { name, value, body } => {
             // Pre-rendered RHS — push the Let frame directly. No need
@@ -3920,6 +3920,11 @@ fn push_post_call_frames(
 fn walk_let<'a>(
     name: &crate::lean_name::LeanName,
     val: &'a Exp,
+    // Dest local's declared SST typ — the rendered RHS is coerced to
+    // it (see `Wp::Let` doc). Threads unchanged through the if-fork and
+    // inner-let-chain recursion: those rebind the same `name` to a
+    // lifted value, so the coercion target is the same.
+    dest_typ: &Typ,
     body: &Wp<'a>,
     ctx: &'a WpCtx<'a>,
     obl: &OblCtx,
@@ -3938,9 +3943,9 @@ fn walk_let<'a>(
         ExpX::If(cond, then_e, else_e) => {
             let c_ast = sst_exp_to_ast_checked(cond)
                 .expect("walk_let if-cond: sub of validated Exp tree");
-            walk_let(name, then_e, body, ctx,
+            walk_let(name, then_e, dest_typ, body, ctx,
                 &obl.with_frame(CtxFrame::Hyp(c_ast.clone())), e);
-            walk_let(name, else_e, body, ctx,
+            walk_let(name, else_e, dest_typ, body, ctx,
                 &obl.with_frame(CtxFrame::Hyp(LExpr::not(c_ast))), e);
             return;
         }
@@ -3962,7 +3967,7 @@ fn walk_let<'a>(
                                 .expect("walk_let binder rhs: sub of validated Exp tree"),
                         ));
                     }
-                    walk_let(name, inner_body, body, ctx, &chain_obl, e);
+                    walk_let(name, inner_body, dest_typ, body, ctx, &chain_obl, e);
                     return;
                 }
             }
@@ -3970,12 +3975,16 @@ fn walk_let<'a>(
         _ => {}
     }
     // Plain let with no peelable structure — push the let frame
-    // and continue walking the body.
-    let new_obl = obl.with_frame(CtxFrame::Let(
-        name.clone(),
-        sst_exp_to_ast_checked(val)
-            .expect("walk_let val: validated upstream via Wp::Let.value"),
-    ));
+    // and continue walking the body. Coerce the rendered RHS to the
+    // dest's SST typ: when Rust auto-ref'd the binding (`copy : &Box<T>`
+    // bound from `rest : Box<T>`), this inserts the `Tactus.Ref.mk` so
+    // the local's Lean value matches its declared typ — maintaining the
+    // U2 invariant so downstream `count_ref(dest.typ)` deref sites are
+    // correct. No-op when `val.typ == dest_typ` (the common case).
+    let rendered = sst_exp_to_ast_checked(val)
+        .expect("walk_let val: validated upstream via Wp::Let.value");
+    let coerced = crate::expr_shared::coerce_lexpr(rendered, &val.typ, dest_typ);
+    let new_obl = obl.with_frame(CtxFrame::Let(name.clone(), coerced));
     walk_obligations(body, ctx, &new_obl, e);
 }
 
@@ -4239,7 +4248,18 @@ enum Wp<'a> {
     /// walks (with cond as a Hyp frame) so omega sees a clean
     /// goal in each branch instead of an opaque value-position
     /// if.
-    Let(crate::lean_name::LeanName, crate::to_lean_sst_expr::Validated<'a>, Box<Wp<'a>>),
+    /// The third field is the dest local's declared SST typ. At walk
+    /// time the rendered RHS is coerced to it via `coerce_lexpr` — Rust
+    /// can auto-ref a `let` binding (e.g. `let copy = rest` where
+    /// `rest : Box<Stack>` but `copy : &Box<Stack>`, taken so `copy`
+    /// can pass to a `&`-param), and without the coercion `copy`'s Lean
+    /// value would stay at `rest`'s typ while its SST typ claims the
+    /// extra `&` — the over-deref bug behind `aliased_arg`. Coercing at
+    /// the binder maintains the U2 invariant "a local's Lean value
+    /// matches its SST typ", so every downstream `count_ref(copy.typ)`
+    /// site is correct with no binder map. No-op when RHS typ == dest
+    /// typ (the common case).
+    Let(crate::lean_name::LeanName, crate::to_lean_sst_expr::Validated<'a>, Typ, Box<Wp<'a>>),
 
     /// Like `Let`, but the RHS is an already-rendered `LExpr` rather
     /// than an SST `Exp`. Used by `StmX::ClosureInner` to bind the
@@ -4772,6 +4792,7 @@ fn build_wp<'a>(
             Ok(Wp::Let(
                 crate::lean_name::LeanName::from_var_ident(ident),
                 crate::to_lean_sst_expr::Validated::check(rhs)?,
+                dest.typ.clone(),
                 Box::new(after),
             ))
         }
