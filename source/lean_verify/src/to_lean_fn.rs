@@ -225,11 +225,22 @@ pub fn spec_fn_to_ast(f: &FunctionX, fn_map: &crate::sst_to_lean::FnMap) -> Comm
 /// Lean `Nat` (BUG-as-nat-cast.md). Pass an empty map if no fn-map
 /// info is available; the only effect is that uncoerced Int → Nat
 /// calls would fail Lean elaboration (matching the pre-fix state).
-pub fn proof_fn_to_ast(
+/// Build the `(binders, goal)` signature for a proof fn: typ-param +
+/// value-param + bound-hyp binders (`fn_binders`), each `require` as an
+/// explicit `(h<i> : req)` hypothesis binder, and the conjoined
+/// `ensure` clauses as the goal. Both `require` and `ensure` get
+/// nat-coercion insertion + `let p := p.deref` ref-decoration wrapping.
+///
+/// Shared by `proof_fn_to_ast` (wraps it in a `Theorem` with the user's
+/// tactic body) and `broadcast_lemma_axiom_cmd` (wraps it in a
+/// `Command::Axiom` — no proof, the lemma is Verus/Z3-certified
+/// upstream). Keeping the binder/goal construction in one place means
+/// the deref-wrapping + nat-coercion treatment can't drift between the
+/// two emission paths.
+fn proof_fn_signature(
     f: &FunctionX,
-    tactic_body: &str,
     fn_map: &crate::sst_to_lean::FnMap,
-) -> Theorem {
+) -> (Vec<LBinder>, LExpr) {
     let mut binders = fn_binders(f);
     let binder_ctx = crate::to_lean_expr::binder_ctx_from_params(&f.params);
     for (i, req) in f.require.iter().enumerate() {
@@ -251,6 +262,41 @@ pub fn proof_fn_to_ast(
         crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx, &crate::expr_shared::RenderCtx::empty())
     }).collect());
     let goal = wrap_body_with_param_derefs(goal_raw, &f.params);
+    (binders, goal)
+}
+
+/// Emit a cross-crate broadcast lemma (`broadcast axiom fn` /
+/// `broadcast proof fn`) as a Lean `axiom`. The lemma's body is None
+/// in the merged krate (cross-crate-stripped), but its `require` /
+/// `ensure` survive — that's the broadcast fact. We emit
+/// `axiom <name> <binders> : <∀ params, reqs → ensures>` and trust it
+/// the same way DESIGN.md § "Cross-crate spec fn availability"
+/// trusts an axiomatized cross-crate ensures: sound assuming the
+/// source crate (vstd) verified the lemma, which `vargo build` checks
+/// (1530/0). The user opts in explicitly via `broadcast use <group>;`
+/// (#122); `collect_broadcast_lemma_funs` resolves the group to its
+/// member lemmas, this emits them, and `exec_fn_theorems_to_ast`
+/// injects `have _bc_i := <name>` so the closer can use them.
+pub fn broadcast_lemma_axiom_cmd(
+    f: &FunctionX,
+    fn_map: &crate::sst_to_lean::FnMap,
+) -> Command {
+    let (binders, goal) = proof_fn_signature(f, fn_map);
+    Command::Axiom(crate::lean_ast::Axiom {
+        name: lean_name(&f.name.path),
+        binders,
+        ret_ty: goal,
+        attrs: Vec::new(),
+    })
+}
+
+pub fn proof_fn_to_ast(
+    f: &FunctionX,
+    tactic_body: &str,
+    fn_map: &crate::sst_to_lean::FnMap,
+) -> Theorem {
+    let (binders, goal) = proof_fn_signature(f, fn_map);
+    let binder_ctx = crate::to_lean_expr::binder_ctx_from_params(&f.params);
     // Honor Verus's `decreases` clause for recursive proof fns. Lean often
     // auto-infers termination for simple structural recursion, but cases
     // where the measure is non-obvious (Collatz, lex pairs, computed

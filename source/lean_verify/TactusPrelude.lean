@@ -155,6 +155,18 @@ structure Tactus.Arc (A : Type u) where
 def Tactus.strGetChar (s : String) (i : Int) : Nat :=
   (s.data[i.toNat]!).toNat
 
+-- Height-ordering relation for Verus's `BinaryOp::HeightCompare` (the
+-- fn-level termination measure). The VIR-AST renderer special-cases
+-- int operands (direct `<`) and datatype operands (`T.height`
+-- comparison); for opaque / cross-crate types that have no `.height`
+-- companion — notably `vstd::seq::Seq`, whose `axiom_seq_index_decreases`
+-- states `s[i]` is height-smaller than `s` — it falls back to this
+-- relation. Left uninterpreted (an `axiom`, not a `def`): it carries
+-- the termination fact faithfully without committing to a height model
+-- for opaque types. The two operands have distinct types (`s[i] : A`
+-- vs `s : Seq A`), hence the two type parameters.
+axiom Tactus.heightLt {α : Type u} {β : Type v} (a : α) (b : β) : Prop
+
 -- `tactus_first | t1 | t2 | …` desugars to `first | (t1; done) |
 -- (t2; done) | …`. Each alternative is required to fully close
 -- the goal — without `done`, a tactic that succeeds while

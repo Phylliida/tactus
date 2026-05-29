@@ -8,11 +8,73 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**453 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass — full e2e suite green, 0 failures.** All of Cluster B closed 2026-05-29: `ref_to_bare` (Half A — structural-binop reconcile + return coerce), `aliased_arg` (Half B — let-binding coercion), and `cross_instantiation` (universe-polymorphic wrapper structures). A review/coverage pass then added soundness negatives + a comprehensive-coverage probe that **found and fixed a real Half-A bug** (return-coercion mis-firing on if-valued returns — see the session entry). (Earlier: Cluster A closed via typed substitution + universal call-arg bridging.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**457 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass — full e2e suite green, 0 failures.** Latest (2026-05-29): **#122 cross-crate broadcast lemmas** — `broadcast use group_seq_axioms;` in a `tactus_auto` fn now brings vstd's `Seq`/`Set`/`Map` semantic lemmas into scope (emit-as-axiom + inject-as-`have`), so cross-crate spec code using those types verifies (+4 tests). Before: Cluster B closed (`ref_to_bare`, `aliased_arg`, `cross_instantiation`); Cluster A closed via typed substitution + universal call-arg bridging. vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
 ### Recent session landings
+
+#### Current session (2026-05-29 cont. — #122 cross-crate broadcast lemmas)
+
+**Headline**: 453 → 457 e2e, zero regressions, vstd 1530/0. The
+headline gap of #122 for realistic cross-crate spec code is closed.
+
+**The arc.** Asked to "look into #122." Probed (not trusting the
+2.5-week-stale catalogue) and found the real frontier: cross-crate
+*types* (Seq/Set/Map) and *uninterp spec fns* (`len`/`push`/`empty`)
+already emit as Lean axioms, but the **lemmas that give them
+semantics** — vstd's `broadcast axiom fn axiom_seq_push_len` etc.,
+grouped in `group_seq_axioms` — never reached the preamble. A debug
+probe confirmed those lemmas *are* in the merged krate
+(`broadcast_forall=7`, `reveal_groups=39` for a `use vstd::seq::*`
+crate) — so the fix is emission, not Verus export-side work. A second
+probe confirmed `broadcast use group_seq_axioms;` is accepted in a
+`tactus_auto` fn and lowers to `StmX::Fuel(group_fun, _)` — which
+Tactus had been dropping as a no-op.
+
+**Key reframing**: `group_seq_axioms` is NOT default-on-import, so even
+real Verus-Z3 needs an explicit `broadcast use` for these. That
+dissolves the tension with the minimal-automation principle — honoring
+`broadcast use` translates an *explicit user directive*, not ambient
+magic. (User chose "inject as hypotheses" when asked.)
+
+**Implementation** (3 pieces, all in commit-ready state):
+1. `collect_broadcast_lemma_funs` (`sst_to_lean.rs`) — walk the body
+   for `StmX::Fuel`, resolve groups (recursively via
+   `krate.reveal_groups`) / single broadcast fns; return leaf lemma
+   funs. New `collect_fuel_targets` walker (exhaustive `StmX` match,
+   mirrors `collect_borrow_mut_links`).
+2. `broadcast_lemma_axiom_cmd` (`to_lean_fn.rs`) — emit each as
+   `axiom <name> : ∀ params, reqs → ensures`, reusing the extracted
+   `proof_fn_signature` helper (shared with `proof_fn_to_ast`). Added
+   to `krate_preamble`'s `dep_walk_roots` so referenced spec fns get
+   emitted too.
+3. Inject `have _tactus_bc_<i> := <axiom>` via the existing
+   `tactic_prefix` mechanism — the SOUND form (uses the trusted
+   axiom; not a False-hypothesis antecedent).
+
+   Plus `Tactus.heightLt` added to the prelude: emitting a whole group
+   pulls in `axiom_seq_index_decreases` (uses `BinaryOp::HeightCompare`
+   on the opaque `Seq` → `non_binop_head → "Tactus.heightLt"`, a latent
+   undefined symbol). Now an uninterpreted relation axiom.
+
+**Tests** (4 new): `test_cross_crate_broadcast_seq_push_len` (positive,
+group), `_wrong_ensures` (negative soundness — false `len+1` claim
+still fails, so the injection isn't vacuous), `_required_for_semantics`
+(no `broadcast use` → fails; explicit-opt-in pin), `_single_lemma`
+(non-group `broadcast use axiom_seq_push_len;` branch).
+
+**Soundness**: emitting cross-crate lemmas as axioms is the same trust
+model as DESIGN's cross-crate axiomatized ensures — vstd verified them
+(`vargo build` 1530/0); we stipulate. `require` → antecedent (nothing
+dropped). `have := axiom` uses the fact, doesn't weaken the goal (the
+`_wrong_ensures` negative is the canary).
+
+**Deferred** (documented): cross-crate *exec* callees (still rejected
+in `build_wp_call`); module-level / default-on-import broadcast (don't
+appear as body `StmX::Fuel`); #125 cross-crate trait method decls +
+`dyn Trait`. See DESIGN.md § "Cross-crate broadcast lemmas" + the
+Phase-3 cross-crate note.
 
 #### Current session (2026-05-29 — Cluster B Half A: ref_to_bare closed)
 

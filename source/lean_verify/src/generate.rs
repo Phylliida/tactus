@@ -113,6 +113,12 @@ fn krate_preamble(
     config: PreambleConfig,
     theorems: &[crate::lean_ast::Theorem],
     tactic_bodies: &std::collections::HashMap<Fun, String>,
+    // Cross-crate broadcast lemmas (#122) the root fn brings into
+    // scope via `broadcast use <group>;`. Emitted as Lean axioms and
+    // added to the dep-walk roots so the spec fns / datatypes their
+    // require/ensure reference also land in the preamble. Empty for
+    // proof fns and exec fns without `broadcast use`.
+    broadcast_lemmas: &[&Fun],
 ) -> (Vec<Command>, String) {
     let emit_accessors = config.emit_accessors();
 
@@ -188,12 +194,22 @@ fn krate_preamble(
         ))
         .filter(|f| tactic_bodies.contains_key(&f.name))
         .collect();
-    // Extended root set for dep walking: root_fns + helpers. The dep
-    // walk will pick up all transitive spec-fn / datatype refs from
-    // both, so helpers can be emitted alongside spec fns without
-    // unresolved-reference errors.
+    // Resolve broadcast lemma `Fun` identities (#122) to their
+    // `FunctionX` via the all-fn map. Cross-crate lemmas live in the
+    // merged krate (via `merge_krates`) with body=None but
+    // require/ensure intact — that's the broadcast fact we emit.
+    let bc_lemma_funcs: Vec<&FunctionX> = broadcast_lemmas.iter()
+        .filter_map(|f| method_lookup.get(f).copied())
+        .collect();
+    // Extended root set for dep walking: root_fns + helpers +
+    // broadcast lemmas. The dep walk picks up all transitive spec-fn
+    // / datatype refs from each, so they can be emitted (helpers as
+    // theorems, broadcast lemmas as axioms) without unresolved-
+    // reference errors — e.g. `axiom_seq_push_len`'s ensures
+    // references `seq.Seq.len`/`push`, which must be in the preamble.
     let dep_walk_roots: Vec<&FunctionX> = root_fns.iter().copied()
         .chain(helpers_to_emit.iter().copied())
+        .chain(bc_lemma_funcs.iter().copied())
         .collect();
 
     let mut refs = dep_order::collect_references(&spec_fn_map, &method_lookup, &dep_walk_roots);
@@ -546,6 +562,18 @@ fn krate_preamble(
         )));
     }
 
+    // Cross-crate broadcast lemmas (#122), emitted as Lean axioms
+    // LAST in the preamble — they're leaves (only the fn's obligation
+    // theorems reference them, via the injected `have _tactus_bc_i := …`),
+    // and their require/ensure reference spec fns + datatypes already
+    // emitted above (brought in via the `dep_walk_roots` extension).
+    // Sound by the same argument as cross-crate axiomatized ensures:
+    // vstd verified the lemma (`vargo build` → 1530/0); we stipulate
+    // it. The user opted in explicitly with `broadcast use <group>;`.
+    for f in &bc_lemma_funcs {
+        cmds.push(to_lean_fn::broadcast_lemma_axiom_cmd(f, &fn_map));
+    }
+
     (cmds, ns)
 }
 
@@ -637,6 +665,7 @@ pub fn check_proof_fn(
     // imports, those go through the explicit `imports` parameter).
     let (mut cmds, ns) = krate_preamble(
         krate, imports, crate_name, &[proof_fn], PreambleConfig::ProofFn, &[], tactic_bodies,
+        &[],
     );
     // Build fn_map for nat-coercion insertion (BUG-as-nat-cast.md).
     // The pass at fn entry rewrites Call args so Int → Nat parameter
@@ -752,7 +781,14 @@ pub fn check_exec_fn(
         ))
         .collect();
 
-    let theorems = match sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check) {
+    // Cross-crate broadcast lemmas this fn opts into via
+    // `broadcast use <group>;` (#122). Resolved once here and fed to
+    // both `exec_fn_theorems_to_ast` (which injects `have`-bindings)
+    // and `krate_preamble` (which emits the lemma axioms + walks their
+    // spec-fn deps).
+    let broadcast_lemmas = sst_to_lean::collect_broadcast_lemma_funs(krate, check);
+
+    let theorems = match sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check, &broadcast_lemmas) {
         Ok(r) => r,
         Err(reason) => return CheckResult::Failed {
             errors: vec![TactusDiag {
@@ -780,6 +816,7 @@ pub fn check_exec_fn(
         PreambleConfig::ExecFn,
         &theorems,
         tactic_bodies,
+        &broadcast_lemmas,
     );
 
     for theorem in theorems {
@@ -984,6 +1021,7 @@ mod tests {
         let (cmds, _ns) = krate_preamble(
             &krate, &[], "test_crate", &[], PreambleConfig::ProofFn, &[],
             &std::collections::HashMap::new(),
+            &[],
         );
 
         // The default preamble has exactly one Import-class chunk
@@ -1022,6 +1060,7 @@ mod tests {
         let (cmds, _ns) = krate_preamble(
             &krate, &[], "test_crate", &[], PreambleConfig::ExecFn, &theorems,
             &std::collections::HashMap::new(),
+            &[],
         );
 
         let imports: Vec<&str> = cmds.iter()
@@ -1052,6 +1091,7 @@ mod tests {
         let (cmds, _ns) = krate_preamble(
             &krate, &[], "test_crate", &[], PreambleConfig::ExecFn, &theorems,
             &std::collections::HashMap::new(),
+            &[],
         );
 
         // Find the addendum Raw and confirm it's AFTER the prelude Raw.
@@ -1080,6 +1120,7 @@ mod tests {
         let (cmds, _ns) = krate_preamble(
             &krate, &[], "test_crate", &[], PreambleConfig::ExecFn, &theorems,
             &std::collections::HashMap::new(),
+            &[],
         );
 
         let bitvec_imports: Vec<&str> = cmds.iter()

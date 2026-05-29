@@ -756,6 +756,13 @@ pub fn exec_fn_theorems_to_ast<'a>(
     krate: &'a KrateX,
     fn_sst: &'a FunctionSst,
     check: &'a FuncCheckSst,
+    // Cross-crate broadcast lemmas the fn brings into scope via
+    // `broadcast use <group>;` (#122), resolved by
+    // `collect_broadcast_lemma_funs`. Each is emitted as a Lean axiom
+    // in the preamble (by `krate_preamble`) and injected here as a
+    // `have _tactus_bc_<i> := <axiom>` tactic prefix so the closer can use
+    // it. Empty for fns without `broadcast use` (the common case).
+    broadcast_lemmas: &[&'a Fun],
 ) -> Result<Vec<Theorem>, String> {
     // `&mut` params of the fn being verified (#94 callee-side body).
     // For each, the body and ensures get a SST-level rewrite so that
@@ -919,12 +926,30 @@ pub fn exec_fn_theorems_to_ast<'a>(
         Some(tac) => Tactic::Raw(tac.clone()),
         None => Tactic::Named("tactus_auto".to_string()),
     };
+    // Seed the tactic prefix with `have`-bindings for each in-scope
+    // broadcast lemma (#122). The lemma is emitted as a top-level
+    // `axiom` in the preamble; `have _tactus_bc_<i> := <axiom>` brings it
+    // into the obligation's local context so the closer (omega /
+    // simp_all) can use it — equation-shaped lemmas (`len(push s a)
+    // = len s + 1`) become simp rewrites. This is the sound form:
+    // it *uses* the trusted axiom rather than adding the lemma as an
+    // unproven antecedent (which would be the False-hypothesis
+    // anti-pattern). Applies to every theorem the fn emits (fn-scoped
+    // broadcast); unused haves are harmless.
+    let mut tactic_prefix: Vec<String> = Vec::new();
+    if !broadcast_lemmas.is_empty() {
+        let haves: String = broadcast_lemmas.iter().enumerate()
+            .map(|(i, f)| format!("have _tactus_bc_{} := {}", i, lean_name(&f.path)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        tactic_prefix.push(haves);
+    }
     let mut emitter = ObligationEmitter {
         fn_name,
         base_binders: binders,
         counter: 0,
         out: Vec::new(),
-        tactic_prefix: Vec::new(),
+        tactic_prefix,
         default_closer,
         heartbeats: fn_sst.x.attrs.tactus_heartbeats,
     };
@@ -2658,6 +2683,119 @@ fn borrow_mut_key(ident: &VarIdent) -> String {
 /// After `collect_borrow_mut_links`, `resolve_borrow_mut_aliases`
 /// folds aliases into `links` so every BorrowMut local (including
 /// SSA-renamed versions) maps directly to its user-local.
+/// Walk the SST body collecting the target `Fun` of every
+/// `StmX::Fuel(f, _)`. `broadcast use G;` lowers (via
+/// `ExprX::Fuel(group_fun, _, is_broadcast_use=true)`) to
+/// `StmX::Fuel(group_fun, _)`; plain `reveal(f)` also lowers to
+/// `StmX::Fuel(f, _)`. We collect both here and let
+/// `collect_broadcast_lemma_funs` discriminate group / broadcast-fn /
+/// plain-reveal at resolution time.
+///
+/// Exhaustive `StmX` match (no `_ =>`) mirroring
+/// `collect_borrow_mut_links` — a future Verus-side Stm variant
+/// carrying nested statements compile-errors here, forcing a decision
+/// about whether `broadcast use` can appear inside it.
+fn collect_fuel_targets<'a>(stm: &'a Stm, out: &mut Vec<&'a Fun>) {
+    match &stm.x {
+        StmX::Fuel(f, _) => out.push(f),
+        StmX::Block(stmts) => {
+            for s in stmts.iter() {
+                collect_fuel_targets(s, out);
+            }
+        }
+        StmX::If(_, then_branch, else_branch) => {
+            collect_fuel_targets(then_branch, out);
+            if let Some(e) = else_branch {
+                collect_fuel_targets(e, out);
+            }
+        }
+        StmX::Loop { body, .. } => collect_fuel_targets(body, out),
+        StmX::DeadEnd(s) | StmX::OpenInvariant(s) => collect_fuel_targets(s, out),
+        StmX::AssertQuery { body, .. } => collect_fuel_targets(body, out),
+        StmX::ClosureInner { body, .. } => collect_fuel_targets(body, out),
+        // Leaf statements — no nested `Stm`.
+        StmX::Call { .. }
+        | StmX::Assign { .. }
+        | StmX::Assert(_, _, _)
+        | StmX::AssertBitVector { .. }
+        | StmX::AssertCompute(_, _, _)
+        | StmX::Assume(_)
+        | StmX::RevealString(_)
+        | StmX::Return { .. }
+        | StmX::BreakOrContinue { .. }
+        | StmX::Air(_) => {}
+    }
+}
+
+/// Resolve which cross-crate broadcast lemmas a fn's `broadcast use`
+/// directives bring into scope (#122). Returns the leaf lemma `Fun`s
+/// (deduped, source-order-stable) to emit as Lean axioms and inject as
+/// `have`-hypotheses.
+///
+/// Each `StmX::Fuel(f, _)` target is one of:
+/// * a **reveal group** (`f` matches a `RevealGroupX.name` in
+///   `krate.reveal_groups`) — expand its `members` recursively
+///   (members may be subgroups or leaf fns);
+/// * a **broadcast lemma fn** directly (`broadcast use single_lemma;`)
+///   — `f` is in `fn_map` with `attrs.broadcast_forall` — include it;
+/// * a **plain `reveal(f)`** of an opaque spec fn — `f` is a non-
+///   broadcast spec fn — skip (Tactus models spec opacity via
+///   `@[irreducible]`, not fuel; not a #122 concern).
+///
+/// **Scope simplification**: Verus scopes `broadcast use` lexically to
+/// the enclosing block, but we treat any `broadcast use` anywhere in
+/// the body as fn-scoped (all collected lemmas available to every
+/// obligation). Sound — the lemmas are true everywhere — and matches
+/// the common top-of-fn usage. Module-level / default-on-import
+/// broadcast groups are not yet handled (they don't appear as body
+/// `StmX::Fuel`); deferred.
+pub fn collect_broadcast_lemma_funs<'a>(
+    krate: &'a KrateX,
+    check: &'a FuncCheckSst,
+) -> Vec<&'a Fun> {
+    let group_members: HashMap<&Fun, &Vec<Fun>> = krate
+        .reveal_groups
+        .iter()
+        .map(|g| (&g.x.name, &*g.x.members))
+        .collect();
+    let fn_map: HashMap<&Fun, &FunctionX> =
+        krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
+
+    let mut targets: Vec<&Fun> = Vec::new();
+    collect_fuel_targets(&check.body, &mut targets);
+
+    let mut seen: HashSet<&Fun> = HashSet::new();
+    let mut out: Vec<&Fun> = Vec::new();
+    // Recursively expand a target into leaf broadcast-lemma funs.
+    fn expand<'a>(
+        f: &'a Fun,
+        group_members: &HashMap<&'a Fun, &'a Vec<Fun>>,
+        fn_map: &HashMap<&'a Fun, &'a FunctionX>,
+        seen: &mut HashSet<&'a Fun>,
+        out: &mut Vec<&'a Fun>,
+    ) {
+        if !seen.insert(f) {
+            return; // already expanded (cycle-safe + dedup)
+        }
+        if let Some(members) = group_members.get(f) {
+            for m in members.iter() {
+                expand(m, group_members, fn_map, seen, out);
+            }
+        } else if let Some(func) = fn_map.get(f) {
+            if func.attrs.broadcast_forall {
+                out.push(f);
+            }
+            // else: plain reveal of a non-broadcast spec fn — skip.
+        }
+        // else: f neither a known group nor in fn_map (cross-crate
+        // group not merged?) — nothing to emit.
+    }
+    for t in targets {
+        expand(t, &group_members, &fn_map, &mut seen, &mut out);
+    }
+    out
+}
+
 fn collect_borrow_mut_links(
     stm: &Stm,
     borrow_mut_locals: &HashSet<String>,
