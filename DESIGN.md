@@ -3067,6 +3067,50 @@ wrapper handling (pinned by `test_proof_fn_multi_layer_wrapper_probe`
 + `test_trait_method_multi_layer_param_probe`). See the U2 + β
 refactor session entries in HANDOFF.md for the full mechanics.
 
+#### Why we keep the wrappers: faithfulness to Rust types (the primary rationale)
+
+**The wrapper types exist primarily for fidelity and transparency, not
+for the non-forwarding-blanket-impl gap below.** A Rust type maps
+one-to-one to a legible Lean type — `&Box<u8>` → `Tactus.Ref (Tactus.Box
+Nat)`, exactly, no mangling — so the generated Lean *mirrors the source*.
+This is DESIGN principle #1 (Transparency) applied to types: the same
+instinct as "what would Lean do" for tactics, here for the type layer.
+You can read a generated theorem's binders and see the borrows and boxes
+the user actually wrote.
+
+Peeling reference decorations (the pre-2026-05-20 approach: `&A → A`,
+`Box<A> → A`) was tried and **caused dragons** — silent type drift where
+`&A` and `A` quietly conflate, producing hard-to-trace miscompiles and
+goal states that no longer correspond to the Rust types. It is *cleaner
+to be exactly faithful to the Rust types than to mangle them into
+something else*; that was confirmed empirically across the saga that led
+to Phase 1/2.
+
+The coercion cost — the `.deref` / `.mk` bridges the β refactor, U2, and
+typed substitution thread at use sites — is the **honest, visible price
+of fidelity**. The seams show in the generated Lean (you can read exactly
+where a borrow is taken or released); they are not cleverness hidden
+behind the curtain. So the coercion machinery is *finishing a faithful
+model*, not propping up a questionable one. (Same image: the coercions
+are the stairs between two floors of one honest house — Verus peels at
+the value level, Tactus preserves at the type level — not ugliness to be
+eliminated.)
+
+**Consequence for future readers — do not re-litigate "should we peel
+instead?" off the latent-gap framing.** The "Original gap" /
+"Why this isn't blocking today" notes below describe the non-forwarding
+blanket impl as *latent* (no user has hit it). That is true and is *not*
+an argument against the wrappers: the blanket-impl case is one concrete
+instance where peeling is observably wrong, but the wrappers earn their
+keep on faithfulness/transparency **independent of whether anyone ever
+writes a non-forwarding blanket impl**. Peeling was tried; dragons were
+confirmed; faithfulness was the deliberate choice. The forward direction
+is therefore to *finish the faithful model* — complete the SST
+renderer's use-site coercion (bring U2 to the SST renderer; see the
+2026-05-29 HANDOFF entry) and make the wrapper axioms universe-polymorphic
+so they can carry types of any size (the `cross_instantiation` universe
+fix) — not to revisit the foundation.
+
 #### Original gap (preserved for context)
 
 Pre-Phase-2, Tactus peeled reference-like decorations at every site
@@ -3127,7 +3171,11 @@ add deref ops at value sites.
   without addressing the semantic gap; that filter would be a
   documented triage, not a fix.
 - No user-reported issue from a non-forwarding blanket impl in
-  the wild. The gap is real but currently latent.
+  the wild. The gap is real but currently latent. (**Latency here
+  is not a case against the wrappers** — see "Why we keep the
+  wrappers: faithfulness to Rust types" above. The wrappers are
+  load-bearing for fidelity/transparency independent of this gap;
+  this bullet is historical pre-Phase-2 context.)
 
 **The proper fix shape**, captured here so a future session can
 start warm:
