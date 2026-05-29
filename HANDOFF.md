@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**448 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass.** (Cluster B's `ref_to_bare` AND `aliased_arg` both closed 2026-05-29 — Half A: structural-binop reconcile + return coerce; Half B: let-binding coercion. See that session entry. Earlier: Cluster A closed via typed substitution + universal call-arg bridging.) vstd still verifies (1530 functions, 0 errors). **Remaining 1 e2e failure**: `test_exec_call_recursive_generic_datatype_cross_instantiation` (universe mismatch — wrapper axioms `Type→Type` can't wrap a `Type 1` indexed inductive; separate track, needs universe-polymorphic wrapper axioms). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**449 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass — full e2e suite green, 0 failures.** All of Cluster B closed 2026-05-29: `ref_to_bare` (Half A — structural-binop reconcile + return coerce), `aliased_arg` (Half B — let-binding coercion), and `cross_instantiation` (universe-polymorphic wrapper structures). See that session entry. (Earlier: Cluster A closed via typed substitution + universal call-arg bridging.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -107,13 +107,24 @@ I'd imagined. Only `Assign`-derived `Wp::Let` carries the typ; OblCtx
 synthetic lets (`_tactus_d_old`, `_at_pre_tactus`) and `Wp::LetRaw` are
 separate paths, untouched.
 
-**`cross_instantiation` — separate universe track.** `Tactus.Ref/Box :
-Type → Type` (universe-monomorphic at `Type 0`) can't wrap a
-`Mut Int : Type 1` (cross-instantiation datatypes emit as indexed
-inductives `inductive Mut : Type → Type 1`). Needs universe-polymorphic
-wrapper axioms (`axiom Ref : Type u → Type u` + poly `.mk`/`.deref`/
-`SizeOf`/`Inhabited`) OR a decision to re-defer. Independent of binder
-tracking.
+**`cross_instantiation` — LANDED (`2fdb147`).** `Tactus.Ref/Box/…` were
+`structure X (A : Type)` (the prelude uses structures, not axioms —
+real `.mk`/`.deref` + auto-derived `SizeOf`/`Inhabited`), monomorphic at
+`Type 0`, so `Tactus.Box (Mut Int)` failed when `Mut` is the `Type 1`
+indexed inductive Tactus emits for cross-instantiation recursive
+generics (`inductive Mut : Type → Type 1`). Fix: make the five wrapper
+structures universe-polymorphic — `(A : Type u)` (autobound `u`) + `{A :
+Type u}` on the `sizeOf_deref` lemmas. `deriving Inhabited` / auto-`SizeOf`
+follow (poly already). No-op at `Type 0` (every existing use) → zero
+regression surface. Verified standalone (autobound + deriving + wrapping
+a `Type 1` inductive all elaborate) then e2e. **448/1 → 449/0.** A
+faithful Rust→Lean type map must wrap types of any size; this keeps that
+promise for recursive generics.
+
+**End state: full e2e suite green (449/0).** All three Cluster B failures
+closed in one session — and the design question they raised resolved
+toward *finish the faithful model* (wrappers kept for fidelity; see
+DESIGN.md "Why we keep the wrappers"), not revisit it.
 
 **Discipline note worth recording.** The probe's job was to reveal the
 shape, and it did — overturning the "Cluster B = binder tracking"

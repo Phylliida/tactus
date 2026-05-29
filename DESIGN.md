@@ -3104,12 +3104,15 @@ an argument against the wrappers: the blanket-impl case is one concrete
 instance where peeling is observably wrong, but the wrappers earn their
 keep on faithfulness/transparency **independent of whether anyone ever
 writes a non-forwarding blanket impl**. Peeling was tried; dragons were
-confirmed; faithfulness was the deliberate choice. The forward direction
-is therefore to *finish the faithful model* — complete the SST
-renderer's use-site coercion (bring U2 to the SST renderer; see the
-2026-05-29 HANDOFF entry) and make the wrapper axioms universe-polymorphic
-so they can carry types of any size (the `cross_instantiation` universe
-fix) — not to revisit the foundation.
+confirmed; faithfulness was the deliberate choice. The direction was to
+*finish the faithful model*, not revisit the foundation — and as of
+2026-05-29 it is finished: the SST renderer's binding-site coercion
+(`aliased_arg`; let-RHS coerced to the dest typ — the U2 invariant at
+the binder, not the bigger refactor first imagined) and universe-
+polymorphic wrapper structures (`cross_instantiation`; `(A : Type u)` so
+the wrappers carry the `Type 1` indexed inductives of recursive generics)
+both landed. Full e2e suite green. The wrappers carry any Rust type, at
+any size, faithfully.
 
 #### Original gap (preserved for context)
 
