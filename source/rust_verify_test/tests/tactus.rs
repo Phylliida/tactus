@@ -10903,6 +10903,39 @@ test_verify_one_file! {
     }
 }
 
+// Coverage (sweep): walk_let's if-RHS fork (Half B) with WRAPPER-typed
+// branches — the let-coerce twin of the return-coerce if-bug. Here the
+// let-RHS is an `if` whose branches are `&Box<Stack>`; `walk_let` forks
+// and coerces EACH branch to `copy`'s typ. This works correctly (unlike
+// the Return path's earlier whole-expr-typ bug) because `walk_let`
+// recurses PER BRANCH — each branch becomes a fresh `val` with its own
+// `val.typ`, coerced at the plain-let case. Confirms (not just asserts)
+// that immunity. Recurses on `rest` (strictly smaller) so it terminates.
+test_verify_one_file! {
+    #[test] test_exec_let_if_wrapper_rhs_probe verus_code! {
+        use vstd::std_specs::alloc::*;
+
+        enum Stack {
+            Empty,
+            Push(u8, Box<Stack>),
+        }
+
+        #[verifier::tactus_auto]
+        fn shrink(s: &Stack, c: bool) -> (r: u64)
+            decreases s
+        {
+            match s {
+                Stack::Empty => 0,
+                Stack::Push(_, rest) => {
+                    // let-RHS is an `if` with wrapper-typed branches.
+                    let copy = if c { rest } else { rest };
+                    shrink(copy, c)
+                }
+            }
+        }
+    } => Ok(())
+}
+
 // P_CLOSURE noted but not pinned with a test: closure captures an
 // outer-scope wrapper-typed param. Approach 3 needs BinderCtx to
 // extend at closure boundaries so the closure body's coercion logic

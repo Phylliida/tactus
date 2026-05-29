@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**452 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass — full e2e suite green, 0 failures.** All of Cluster B closed 2026-05-29: `ref_to_bare` (Half A — structural-binop reconcile + return coerce), `aliased_arg` (Half B — let-binding coercion), and `cross_instantiation` (universe-polymorphic wrapper structures). A review/coverage pass then added soundness negatives + a comprehensive-coverage probe that **found and fixed a real Half-A bug** (return-coercion mis-firing on if-valued returns — see the session entry). (Earlier: Cluster A closed via typed substitution + universal call-arg bridging.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**453 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass — full e2e suite green, 0 failures.** All of Cluster B closed 2026-05-29: `ref_to_bare` (Half A — structural-binop reconcile + return coerce), `aliased_arg` (Half B — let-binding coercion), and `cross_instantiation` (universe-polymorphic wrapper structures). A review/coverage pass then added soundness negatives + a comprehensive-coverage probe that **found and fixed a real Half-A bug** (return-coercion mis-firing on if-valued returns — see the session entry). (Earlier: Cluster A closed via typed substitution + universal call-arg bridging.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -150,9 +150,28 @@ battery over the three commits. Landings:
   own `val.typ`, coerced at the plain-let case) — correct by
   construction, immune to this class. The Return arm captured one
   whole-expr `e_typ` in its `lift_if_value` closure. The per-leaf fix
-  brings the Return path to `walk_let`'s discipline. So the let-RHS-if
-  twin (`let x = if c {…} else {…}` auto-ref'd) is *not* buggy; no
-  separate test needed (it'd be contrived to construct anyway).
+  brings the Return path to `walk_let`'s discipline.
+
+**Continued sweep (452 → 453).** Applying G1's lesson — probe the paths
+I *asserted* were fine, don't just reason:
+* `test_exec_let_if_wrapper_rhs_probe` — the let-RHS-`if` twin
+  (`let copy = if c { rest } else { rest }`, wrapper branches).
+  CONFIRMS (not asserts) `walk_let`'s immunity: passes, because
+  `walk_let` recurses per-branch (each branch a fresh `val` coerced with
+  its own typ). I'd earlier called this "contrived, no test needed" —
+  but it constructs cleanly via a match arm, and probing beats
+  asserting.
+* Reasoned-low-risk, catalogued (so a future sweep knows they were
+  weighed), not separately probed: `ret_typ = None` with a named return
+  (dest always has a local decl — unreachable); `ret_name = None` with
+  `ret_exp: Some` (unit returns take the `ret_exp: None` arm);
+  both-operands-deep structural binop (`&&x ≤ &y` — doesn't arise from
+  real Rust); `lift_if_value_coerced`'s #119 let-chain path with
+  `ret_coerce = Some` (its inner-leaf coercion is the same mechanism G1
+  pins; a return-expr that is itself `Bind(Let,…)` is a rare desugaring,
+  and the #119 unit tests cover the structural lift with `ret_coerce =
+  None`); `Box`/`Rc`/`Arc` auto-ref at a let (auto-ref adds `&`/`Ref`,
+  not `Box` — `aliased_arg` already covers Ref-over-Box).
 
 **Discipline note worth recording.** The probe's job was to reveal the
 shape, and it did — overturning the "Cluster B = binder tracking"
