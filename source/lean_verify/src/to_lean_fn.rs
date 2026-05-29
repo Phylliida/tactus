@@ -276,7 +276,7 @@ fn proof_fn_signature(
 /// (1530/0). The user opts in explicitly via `broadcast use <group>;`
 /// (#122); `collect_broadcast_lemma_funs` resolves the group to its
 /// member lemmas, this emits them, and `exec_fn_theorems_to_ast`
-/// injects `have _bc_i := <name>` so the closer can use them.
+/// injects `have _tactus_bc_i := <name>` so the closer can use them.
 pub fn broadcast_lemma_axiom_cmd(
     f: &FunctionX,
     fn_map: &crate::sst_to_lean::FnMap,

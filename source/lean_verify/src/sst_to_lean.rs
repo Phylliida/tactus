@@ -2683,6 +2683,139 @@ fn borrow_mut_key(ident: &VarIdent) -> String {
 /// After `collect_borrow_mut_links`, `resolve_borrow_mut_aliases`
 /// folds aliases into `links` so every BorrowMut local (including
 /// SSA-renamed versions) maps directly to its user-local.
+fn collect_borrow_mut_links(
+    stm: &Stm,
+    borrow_mut_locals: &HashSet<String>,
+    links: &mut HashMap<String, VarIdent>,
+    aliases: &mut HashMap<String, String>,
+) {
+    match &stm.x {
+        StmX::Assign { lhs: Dest { dest, is_init: _ }, rhs } => {
+            let Some(dest_var) = extract_simple_var_ident(dest) else { return };
+            let dest_key = borrow_mut_key(dest_var);
+            let rhs_peeled = peel_transparent(rhs);
+            let rhs_var = match &rhs_peeled.x {
+                ExpX::Var(v) | ExpX::VarLoc(v) => v,
+                _ => return,
+            };
+            let rhs_key = borrow_mut_key(rhs_var);
+            let dest_is_bm = borrow_mut_locals.contains(&dest_key);
+            let rhs_is_bm = borrow_mut_locals.contains(&rhs_key);
+            match (dest_is_bm, rhs_is_bm) {
+                // Linkage: Assign(user_local, Var(borrow_mut)) —
+                // the forward-forward.
+                //
+                // Invariant: at most one user-local per BorrowMut
+                // local. Verus's encoding emits one such linkage per
+                // `&mut <local>` call site. A duplicate would mean
+                // Verus aliased the same BorrowMut to two user-locals,
+                // which would be a Verus-side invariant violation
+                // (the post-state existential can only update one
+                // user-local). Debug-assert defensively — release
+                // builds use the second linkage silently rather than
+                // crashing, matching the conservative behaviour of
+                // other Tactus normalization passes.
+                (false, true) => {
+                    if let Some(prior) = links.get(&rhs_key) {
+                        debug_assert_eq!(
+                            prior, dest_var,
+                            "multiple user-locals linked to BorrowMut {:?}: \
+                             prior={:?} new={:?} — Verus encoding-shape \
+                             change worth investigating",
+                            rhs_key, prior, dest_var,
+                        );
+                    }
+                    links.insert(rhs_key, dest_var.clone());
+                }
+                // SSA rename: Assign(borrow_mut_X, Var(borrow_mut_Y))
+                // — both are BorrowMut locals (or sanitized versions
+                // of the same). After SSA propagation, X and Y resolve
+                // to the same user-local.
+                (true, true) => {
+                    aliases.insert(dest_key, rhs_key);
+                }
+                _ => {}
+            }
+        }
+        StmX::Block(stmts) => {
+            for s in stmts.iter() {
+                collect_borrow_mut_links(s, borrow_mut_locals, links, aliases);
+            }
+        }
+        StmX::If(_, then_branch, else_branch) => {
+            collect_borrow_mut_links(then_branch, borrow_mut_locals, links, aliases);
+            if let Some(e) = else_branch {
+                collect_borrow_mut_links(e, borrow_mut_locals, links, aliases);
+            }
+        }
+        StmX::Loop { body, .. } => {
+            collect_borrow_mut_links(body, borrow_mut_locals, links, aliases);
+        }
+        StmX::DeadEnd(s) | StmX::OpenInvariant(s) => {
+            collect_borrow_mut_links(s, borrow_mut_locals, links, aliases);
+        }
+        StmX::AssertQuery { body, .. } => {
+            collect_borrow_mut_links(body, borrow_mut_locals, links, aliases);
+        }
+        StmX::ClosureInner { body, .. } => {
+            collect_borrow_mut_links(body, borrow_mut_locals, links, aliases);
+        }
+        // Leaf statements — no nested `Stm` to walk into. We
+        // enumerate explicitly (no `_ =>` catch-all) so any
+        // upstream addition of a Stm variant containing nested
+        // statements becomes a compile error here. Mirrors DESIGN.md's
+        // "Upstream-robustness patterns" — the compile-time defence
+        // that prevents silent miscompilation when Verus evolves.
+        //
+        // `StmX::Call` carries Exps (`args`) which CAN contain
+        // BorrowMut refs at the value level, but linkage assigns are
+        // statement-level, so the call's args don't carry them.
+        // Similarly for AssertBitVector's `requires`/`ensures` Exps,
+        // Assert/AssertCompute's Exp, and Assume's Exp.
+        StmX::Call { .. }
+        | StmX::Assert(_, _, _)
+        | StmX::AssertBitVector { .. }
+        | StmX::AssertCompute(_, _, _)
+        | StmX::Assume(_)
+        | StmX::Fuel(_, _)
+        | StmX::RevealString(_)
+        | StmX::Return { .. }
+        | StmX::BreakOrContinue { .. }
+        | StmX::Air(_) => {}
+    }
+}
+
+/// Fold SSA aliases into the linkage map. For each `alias_X → Y`
+/// alias, resolve Y's user-local (possibly through more aliases) and
+/// extend `links` so `alias_X` also maps to that user-local.
+///
+/// Bounded by `aliases.len()` rounds — each round either resolves at
+/// least one alias or no progress is made (then we stop). Simple
+/// fixed-point.
+fn resolve_borrow_mut_aliases(
+    links: &mut HashMap<String, VarIdent>,
+    aliases: &HashMap<String, String>,
+) {
+    for (alias_key, original_key) in aliases.iter() {
+        // Follow the alias chain to find the original BorrowMut local
+        // that has a direct linkage entry.
+        let mut cursor = original_key;
+        // Bounded by aliases.len() to avoid infinite loops on
+        // hypothetical cycles (shouldn't happen in well-formed SSA).
+        for _ in 0..=aliases.len() {
+            if links.contains_key(cursor) {
+                let user_local = links[cursor].clone();
+                links.insert(alias_key.clone(), user_local);
+                break;
+            }
+            match aliases.get(cursor) {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+    }
+}
+
 /// Walk the SST body collecting the target `Fun` of every
 /// `StmX::Fuel(f, _)`. `broadcast use G;` lowers (via
 /// `ExprX::Fuel(group_fun, _, is_broadcast_use=true)`) to
@@ -2856,139 +2989,6 @@ pub fn collect_broadcast_lemma_funs<'a>(
         expand(t, &group_members, &fn_map, &unemittable_traits, &mut seen, &mut out);
     }
     out
-}
-
-fn collect_borrow_mut_links(
-    stm: &Stm,
-    borrow_mut_locals: &HashSet<String>,
-    links: &mut HashMap<String, VarIdent>,
-    aliases: &mut HashMap<String, String>,
-) {
-    match &stm.x {
-        StmX::Assign { lhs: Dest { dest, is_init: _ }, rhs } => {
-            let Some(dest_var) = extract_simple_var_ident(dest) else { return };
-            let dest_key = borrow_mut_key(dest_var);
-            let rhs_peeled = peel_transparent(rhs);
-            let rhs_var = match &rhs_peeled.x {
-                ExpX::Var(v) | ExpX::VarLoc(v) => v,
-                _ => return,
-            };
-            let rhs_key = borrow_mut_key(rhs_var);
-            let dest_is_bm = borrow_mut_locals.contains(&dest_key);
-            let rhs_is_bm = borrow_mut_locals.contains(&rhs_key);
-            match (dest_is_bm, rhs_is_bm) {
-                // Linkage: Assign(user_local, Var(borrow_mut)) —
-                // the forward-forward.
-                //
-                // Invariant: at most one user-local per BorrowMut
-                // local. Verus's encoding emits one such linkage per
-                // `&mut <local>` call site. A duplicate would mean
-                // Verus aliased the same BorrowMut to two user-locals,
-                // which would be a Verus-side invariant violation
-                // (the post-state existential can only update one
-                // user-local). Debug-assert defensively — release
-                // builds use the second linkage silently rather than
-                // crashing, matching the conservative behaviour of
-                // other Tactus normalization passes.
-                (false, true) => {
-                    if let Some(prior) = links.get(&rhs_key) {
-                        debug_assert_eq!(
-                            prior, dest_var,
-                            "multiple user-locals linked to BorrowMut {:?}: \
-                             prior={:?} new={:?} — Verus encoding-shape \
-                             change worth investigating",
-                            rhs_key, prior, dest_var,
-                        );
-                    }
-                    links.insert(rhs_key, dest_var.clone());
-                }
-                // SSA rename: Assign(borrow_mut_X, Var(borrow_mut_Y))
-                // — both are BorrowMut locals (or sanitized versions
-                // of the same). After SSA propagation, X and Y resolve
-                // to the same user-local.
-                (true, true) => {
-                    aliases.insert(dest_key, rhs_key);
-                }
-                _ => {}
-            }
-        }
-        StmX::Block(stmts) => {
-            for s in stmts.iter() {
-                collect_borrow_mut_links(s, borrow_mut_locals, links, aliases);
-            }
-        }
-        StmX::If(_, then_branch, else_branch) => {
-            collect_borrow_mut_links(then_branch, borrow_mut_locals, links, aliases);
-            if let Some(e) = else_branch {
-                collect_borrow_mut_links(e, borrow_mut_locals, links, aliases);
-            }
-        }
-        StmX::Loop { body, .. } => {
-            collect_borrow_mut_links(body, borrow_mut_locals, links, aliases);
-        }
-        StmX::DeadEnd(s) | StmX::OpenInvariant(s) => {
-            collect_borrow_mut_links(s, borrow_mut_locals, links, aliases);
-        }
-        StmX::AssertQuery { body, .. } => {
-            collect_borrow_mut_links(body, borrow_mut_locals, links, aliases);
-        }
-        StmX::ClosureInner { body, .. } => {
-            collect_borrow_mut_links(body, borrow_mut_locals, links, aliases);
-        }
-        // Leaf statements — no nested `Stm` to walk into. We
-        // enumerate explicitly (no `_ =>` catch-all) so any
-        // upstream addition of a Stm variant containing nested
-        // statements becomes a compile error here. Mirrors DESIGN.md's
-        // "Upstream-robustness patterns" — the compile-time defence
-        // that prevents silent miscompilation when Verus evolves.
-        //
-        // `StmX::Call` carries Exps (`args`) which CAN contain
-        // BorrowMut refs at the value level, but linkage assigns are
-        // statement-level, so the call's args don't carry them.
-        // Similarly for AssertBitVector's `requires`/`ensures` Exps,
-        // Assert/AssertCompute's Exp, and Assume's Exp.
-        StmX::Call { .. }
-        | StmX::Assert(_, _, _)
-        | StmX::AssertBitVector { .. }
-        | StmX::AssertCompute(_, _, _)
-        | StmX::Assume(_)
-        | StmX::Fuel(_, _)
-        | StmX::RevealString(_)
-        | StmX::Return { .. }
-        | StmX::BreakOrContinue { .. }
-        | StmX::Air(_) => {}
-    }
-}
-
-/// Fold SSA aliases into the linkage map. For each `alias_X → Y`
-/// alias, resolve Y's user-local (possibly through more aliases) and
-/// extend `links` so `alias_X` also maps to that user-local.
-///
-/// Bounded by `aliases.len()` rounds — each round either resolves at
-/// least one alias or no progress is made (then we stop). Simple
-/// fixed-point.
-fn resolve_borrow_mut_aliases(
-    links: &mut HashMap<String, VarIdent>,
-    aliases: &HashMap<String, String>,
-) {
-    for (alias_key, original_key) in aliases.iter() {
-        // Follow the alias chain to find the original BorrowMut local
-        // that has a direct linkage entry.
-        let mut cursor = original_key;
-        // Bounded by aliases.len() to avoid infinite loops on
-        // hypothetical cycles (shouldn't happen in well-formed SSA).
-        for _ in 0..=aliases.len() {
-            if links.contains_key(cursor) {
-                let user_local = links[cursor].clone();
-                links.insert(alias_key.clone(), user_local);
-                break;
-            }
-            match aliases.get(cursor) {
-                Some(next) => cursor = next,
-                None => break,
-            }
-        }
-    }
 }
 
 /// Is this Assign the linkage between a user local and a BorrowMut
