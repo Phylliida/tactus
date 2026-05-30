@@ -8,7 +8,7 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**460 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass — full e2e suite green, 0 failures.** Latest (2026-05-30): **#122 cross-crate View / exec-callee emission.** Four landings (B1–B4 scoping note below, RESOLVED): **B2** trait-method call heads use the full module-qualified path (`view.View.view`, matching the emitted class) instead of the last two segments; **B1** `rewrite_self_sibling_calls` gates on resolved kind (so a blanket impl's cross-instance forward stays class dispatch) plus a forwarding-blanket body synth that faithfully reproduces `(**self).view()` as `view.View.view (Tactus.Ref.mk self.deref.deref)` for Ref/Box/Rc/Arc (recovering the smart-pointer deref Verus leaves opaque); **B3** instance binders the head doesn't determine (the erased `Box<T,A>` allocator param) are dropped so Lean can synthesize; and `has_resolved(x)` renders as an uninterpreted `Tactus.hasResolved` Prop. **This unblocked the whole `v@` (View) dispatch path: `Vec::len`, `Vec::push` (with `&mut` + `old(v)`), and `v[i]` reads all verify soundly under `use vstd::prelude::*`** (probed; wrong-ensures correctly fails). Plus a follow-up: **un-emittable cross-crate trait classes are skipped, not panicked on** — `HashMap` drags in `core::clone::Clone` (methods stripped cross-crate), which used to panic `trait_to_ast`; now such traits + their instances are skipped, so Map/Set code fails gracefully (`tactus_auto failed`) instead of crashing the verifier. (Prior, 2026-05-29: **#122 cross-crate broadcast lemmas** — vstd's `Seq`/`Set`/`Map` semantic lemmas reach the closer from default-on-import + explicit `broadcast use`; default-on-import panic on un-emittable cross-crate trait bounds fixed by skipping such lemmas. Cluster B closed (`ref_to_bare`, `aliased_arg`, `cross_instantiation`); Cluster A closed via typed substitution + universal call-arg bridging.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**460 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass — full e2e suite green, 0 failures.** Latest (2026-05-30): **#122 cross-crate View / exec-callee emission.** Four landings (B1–B4 scoping note below, RESOLVED): **B2** trait-method call heads use the full module-qualified path (`view.View.view`, matching the emitted class) instead of the last two segments; **B1** `rewrite_self_sibling_calls` gates on resolved kind (so a blanket impl's cross-instance forward stays class dispatch) plus a forwarding-blanket body synth that faithfully reproduces `(**self).view()` as `view.View.view (Tactus.Ref.mk self.deref.deref)` for Ref/Box/Rc/Arc (recovering the smart-pointer deref Verus leaves opaque); **B3** instance binders the head doesn't determine (the erased `Box<T,A>` allocator param) are dropped so Lean can synthesize; and `has_resolved(x)` renders as an uninterpreted `Tactus.hasResolved` Prop. **This unblocked the whole `v@` (View) dispatch path: `Vec::len`, `Vec::push` (with `&mut` + `old(v)`), and `v[i]` reads all verify soundly under `use vstd::prelude::*`** (probed; wrong-ensures correctly fails). Plus a follow-up: **un-emittable cross-crate trait classes are skipped, not panicked on** — `HashMap` drags in `core::clone::Clone` (methods stripped cross-crate), which used to panic `trait_to_ast`; now such traits + their instances are skipped, so Map/Set code fails gracefully (`tactus_auto failed`) instead of crashing the verifier. A scoping spike on `&mut v[i]` then landed the **BuiltinSpecFun broadcast filter** (FnMut-axiom-pulling code degrades gracefully too) and corrected the frontier: the remaining `&mut v[i]` work is **returned-mut-ref prophecy composition** (a fresh new-mut-ref arc), not the bounded B1-family fix first guessed. A high-effort code review of the whole arc found **no correctness bugs** (all candidates verified REFUTED) and landed a 6-item zero-behavior-change cleanup/hardening pass. (Prior, 2026-05-29: **#122 cross-crate broadcast lemmas** — vstd's `Seq`/`Set`/`Map` semantic lemmas reach the closer from default-on-import + explicit `broadcast use`; default-on-import panic on un-emittable cross-crate trait bounds fixed by skipping such lemmas. Cluster B closed (`ref_to_bare`, `aliased_arg`, `cross_instantiation`); Cluster A closed via typed substitution + universal call-arg bridging.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
@@ -123,13 +123,23 @@ existing `build_wp_call`. The real wall was the `v@` View dispatch, which
 the four landings above cleared. So **`Vec::len` / `Vec::push` (with `&mut`
 + `old(v)`) / `v[i]` read all verify soundly now** (probed with
 positive + wrong-ensures; the wrong cases fail). What actually remains:
-* **`&mut v[i]` (index *mutation*)** — `Tactus codegen produced unresolved
-  references`. `&mut v[i]` desugars (new-mut-ref) to `vec_index_mut(&mut v,
-  i)`; its spec inlines, but it references impl-method standalones the
-  dep-walk doesn't emit — the **same family as B1** (a cross-crate impl
-  method reached by the call, not the dep-walk), plus the pre/post
-  substitution aliasing in the old note. Bounded; B1-shaped. Pinned Err by
-  `test_exec_call_mut_arg_vec_index_probe`.
+* **`&mut v[i]` (index *mutation*) — bigger than first scoped (spiked
+  2026-05-30).** I'd guessed "B1-family, bounded"; a spike disproved it.
+  It's a TWO-link chain: **Link 1** was the broadcast wall — vstd's FnMut
+  closure axioms (`axiom_fn_mut_call_requires/_ensures`, pulled in by
+  default-on-import, irrelevant to indexing) reference a `BuiltinSpecFun`
+  that renders as an unresolved literal `builtinSpecFun`. That link is
+  now CLEARED (the BuiltinSpecFun broadcast filter landed — see below).
+  **Link 2** is the real cost and is NOT bounded: `&mut v[i]` desugars to
+  `let e = vec_index_mut(&mut v, i); bump(e);` — a callee that *returns* a
+  `&mut`, whose **prophetic** final value the later `bump` sets. The
+  verified goal shows `bump`'s `+1` never threading into `v`'s post-state
+  (`v`'s update inserts the OLD element value, no `+1`). Tactus's
+  new-mut-ref machinery (#107) handles `&mut` *arguments*, not a *returned*
+  `&mut` whose prophecy a chained call resolves — that's a genuine
+  new-mut-ref feature (returned-mut-ref prophecy composition), a fresh
+  arc. Pinned Err by `test_exec_call_mut_arg_vec_index_probe` (now fails
+  at Link 2's `tactus_auto failed`, not Link 1's unresolved refs).
 * **Map/Set actual *verification*** — `HashMap`/`HashSet` ops now fail
   *gracefully* (the un-emittable-trait skip landed this session stopped the
   panic), but don't verify: they dispatch through `Clone`/`PartialEq`/`Copy`
@@ -138,6 +148,44 @@ positive + wrong-ensures; the wrong cases fail). What actually remains:
   routing the specific Map/Set specs around the trait bounds) — a genuine
   feature, larger than the Vec arc. Pinned (graceful failure, no panic) by
   `test_cross_crate_unemittable_trait_degrades_not_panics`.
+
+**BuiltinSpecFun broadcast filter + review-pass cleanup (`2573211`).** The
+`&mut v[i]` spike's Link 1 fix, landed standalone (it's a graceful-
+degradation improvement on its own): `references_builtin_spec_fun`
+(sst_to_lean.rs) skips broadcast lemmas whose require/ensure call a
+`BuiltinSpecFun` (closure `call_requires`/`call_ensures`) — the VIR-AST
+renderer has no faithful fixed-arity Lean form for them (emits an
+unresolved literal `builtinSpecFun`). vstd's `axiom_fn_mut_call_*`, pulled
+in by default-on-import but irrelevant to most code, now skip cleanly.
+Same family as the un-emittable-trait / FiniteFull filters.
+
+Then a high-effort code review (7 finder angles → verifiers) of the whole
+cross-crate View arc. **No correctness bugs** — all three correctness
+candidates verified REFUTED, notably the scary "same-crate trait silently
+dropped" (disproved by whole-crate-prune analysis: Tactus gets the
+whole-crate-pruned krate which force-reaches every same-crate fn, so
+`unemittable_traits` only ever flags cross-crate; backed by passing
+`test_trait_multi_method`). The review produced a 6-item zero-behavior-
+change cleanup (all in `2573211`, 460/0 throughout):
+1. **`recv_reads_local` hardened** — peels only transparent wrappers
+   (Box/Unbox/CoerceMode/Trigger/CustomErr), not a wildcard over all
+   Unary/UnaryOpr. A value-transform between `**self` and `.method()` can
+   no longer be mistaken for a pure forward. Unreachable today (the
+   opaque-TypParam gate blocks it) but a latent silent-soundness hole if
+   ever reached — defense-in-depth for the synth's faithfulness gate,
+   mirroring `expr_to_node`'s explicit-transparent-arms structure.
+2. **`forwarding_blanket_body` gate** excludes `MutRef` (the synth assumes
+   a `Ref Self` `&self` receiver); deref depth is a named const pinned to
+   the single-wrapper gate (shape-drift guard).
+3. **`unemittable_traits` deduped** to one `expr_shared::unemittable_traits`
+   (was byte-identical in generate.rs + sst_to_lean.rs — drift hazard).
+4. `Tactus.Ref.mk` wrap uses `expr_shared::apply_wrap_chain` (the
+   documented dual of the `apply_deref_chain` on the same line).
+5. `references_builtin_spec_fun` uses the read-only `expr_visitor_walk`
+   (early `Stop`) instead of `map_expr_visitor` (which clones the tree to
+   set a bool).
+6. Tidy: re-indented the synth `else` block; hoisted the copy-pasted
+   class-emission guard into a `should_emit_class` closure.
 
 #### Current session (2026-05-29 cont. — #122 cross-crate broadcast lemmas)
 
