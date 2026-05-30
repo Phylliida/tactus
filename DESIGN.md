@@ -2247,7 +2247,8 @@ These are deferred by design — the current slice is single-crate exec+proof-fn
 
   Tasks still tracked under cross-crate umbrella:
   - **#125 cross-crate trait method decls** — when the trait method decl's `Fun` isn't in `fn_map` (genuinely cross-crate from a non-vstd-prelude path), `spec_source` returns Err. Currently rare in practice because vstd's traits aren't usually trait_method_impl'd in user crates that Tactus verifies.
-  - **Cross-crate exec callees** — `build_wp_call` rejects callees not in `fn_map`. Calling a vstd *exec* fn (e.g. `Vec::push`) from a `tactus_auto` fn is still unsupported (its spec would need inlining + the wrapper/receiver handling). Distinct from the spec-lemma gap, which is closed.
+  - **Cross-crate View / `Vec::len` — LANDED 2026-05-30.** `#[verifier::tactus_auto] fn use_vec(v: &Vec<u8>) -> (r: usize) ensures r == v.len() { v.len() }` verifies under `use vstd::prelude::*`. Needed four fixes to vstd's trait-class + instance emission (see § "Cross-crate View blanket-impl emission" below): trait-method call qualification, blanket-impl forwarding (resolved-kind rewrite gate + forwarding-body synth), erased-allocator binder drop, and `has_resolved` as an uninterpreted Prop. Pinned by `test_cross_crate_vec_len` (+ `_wrong_ensures` negative).
+  - **Cross-crate exec callees (push/index/Map/Set) — still deferred.** `build_wp_call` rejects callees not in `fn_map`. `Vec::len` works because its obligation closes via the inlined `spec_vec_len` (the View/instance machinery is the part that landed); but `Vec::push`/`Vec::index`/`Map`/`Set` *method* calls need cross-crate exec-callee spec inlining + the wrapper/receiver handling — a distinct arc from the trait/instance emission above.
   - **Dynamic dispatch via `dyn Trait`** — same cross-crate rejection path as #125.
 
   **Broadcast scope** — `collect_broadcast_lemma_funs` (below) handles BOTH default-on-import groups (`broadcast_use_by_default_when_this_crate_is_imported`, e.g. vstd's `group_vstd_default` — the drop-in case) AND fn-body `broadcast use <group>;` (`StmX::Fuel`). Still deferred: **module-level** `broadcast use` (`ModuleX.reveals` — a `broadcast use` at module scope rather than fn-body or default-on-import); needs reading the fn's owning-module reveal list rather than the fn body. Rare for user crates.
@@ -2921,6 +2922,92 @@ claim fails, so injection isn't vacuous), `_explicit_group_use` (the
 fn-body `StmX::Fuel` group path still works alongside default-on-import),
 `_explicit_single_lemma` (the non-group `broadcast use axiom_seq_push_len;`
 expand branch).
+
+### Cross-crate View blanket-impl emission (landed 2026-05-30)
+
+The canonical cross-crate exec case — `#[verifier::tactus_auto] fn
+use_vec(v: &Vec<u8>) -> (r: usize) ensures r == v.len() { v.len() }` under
+`use vstd::prelude::*` — verifies end-to-end. The obligation itself is
+trivial (`r = std_specs.vec.spec_vec_len v`, closed by `rfl` after the
+body binds `r := spec_vec_len v`); what blocked it was emitting vstd's
+`View` trait class + its blanket/concrete instances cleanly. Four fixes,
+each independently useful:
+
+**1. Trait-method call heads are fully module-qualified.**
+`to_lean_expr::trait_method_ref` built the head from the last two path
+segments (`View.view`). The crate lives in `PathX::krate`, not `segments`,
+so `lean_name(&fun.path)` is the full module path (`view.View.view`) —
+which is exactly what the class is emitted as (`lean_name(&tr.name)` =
+`view.View`). The last-2 form coincided for crate-root traits but dropped
+the module segment for module-nested ones (vstd's `view::View`, and any
+same-crate trait declared inside a module), rendering a bare `View.view`
+against a `view.View` class. `trait_method_ref` now returns
+`lean_name(&fun.path)`.
+
+**2. Blanket-impl forwarding (two parts).** vstd's `View for &A`/`Box`/
+`Rc`/`Arc` all have body `(**self).view()` — a cross-instance forward
+dispatched through the `[View A]` bound, *not* a self-recursive call.
+* **`rewrite_self_sibling_calls` gates on resolved kind.** It rewrote a
+  trait-method call to the impl's own `impl__N.method` standalone whenever
+  the first-arg type *peel-equaled* Self. For Rc/Arc the smart-pointer spec
+  deref doesn't reduce, so `**self` keeps type `Rc<A>` and the receiver is
+  typed `&Self` — type-indistinguishable from a self-call. The reliable
+  discriminator is the resolution kind: a genuine self-sibling call is
+  `DynamicResolved`/`Static` (resolves to a concrete impl method); a
+  bound-dispatched cross-instance forward is `Dynamic`. Gate the rewrite on
+  resolved kinds, leaving `Dynamic` as class dispatch.
+* **Forwarding-body synth** (`to_lean_fn::forwarding_blanket_body`). With
+  the rewrite gated, Ref/Box render correctly (their deref reduces) but
+  Rc/Arc still render `view.View.view self` — circular (`self : Ref (Rc A)`
+  → dispatches `View (Rc A)` = the instance itself). The synth detects the
+  exact forwarding shape — Self is a single reference wrapper over a bare
+  type-param AND the body is a call to the SAME trait method whose sole
+  receiver arg reads the self param — and emits
+  `view.View.view (Tactus.Ref.mk self.deref.deref)`. The class field is
+  `view : Ref Self → V`, so the binder is `self : Ref (Wrapper A)`; the two
+  `.deref`s peel the `&` and the wrapper to the inner value (the prelude
+  wrappers' `.deref` *reduces* where Verus's smart-pointer spec deref
+  didn't), and `Tactus.Ref.mk` re-borrows so the inner's instance
+  dispatches via the `[Trait A]` bound. Uniform and correct for all four
+  wrappers. **Faithfulness gate:** the synth fires only when the body
+  provably reproduces `(**self).method()` — non-forwarding bodies
+  (`(**self).view() + 1`, top-level not a bare call), struct-field forwards
+  (`self.0.view()`, receiver not the self param), and multi-param methods
+  all fall through to literal rendering. So it can't silently rewrite a
+  *non*-forwarding blanket (the `test_non_forwarding_blanket_over_ref_probe`
+  concern stays handled by the wrapper types).
+
+**3. Undetermined instance binders are dropped.** vstd's `impl<T, A:
+Allocator> Allocator for Box<T, A>` rendered `instance {T} {A} [Allocator
+A] : Allocator (Tactus.Box T)` — `typ_to_expr` maps the unary prelude
+wrapper `Tactus.Box` and erases the allocator arg `A`, leaving it free in
+the head ("cannot find synthesization order"). `trait_impl_to_ast`, after
+building the head, drops implicit binders for type-params the head doesn't
+mention (`lean_ast::free_var_names`) plus any bound referencing them. Sound
+— an undetermined binder is unsynthesizable regardless, and `Allocator` is
+an empty marker class (no method to be wrong about). No-op for every
+head-determined instance (the View blanket pins both `A` and the assoc
+`V`), so it's invisible to existing instances.
+
+**4. `has_resolved(x)` renders as an uninterpreted Prop.**
+`UnaryOpr::HasResolved` hit the VIR-AST renderer's catch-all, rendering
+`has_resolved(vec)` as the bare argument `vec` — so
+`axiom_vec_has_resolved`'s ensures `has_resolved(vec) ==> ..` became `vec
+→ ..` (a value in type position). Tactus doesn't model resolution (it drops
+`assume(has_resolved(..))` synthetic statements), so it renders as
+`Tactus.hasResolved : {α} → α → Prop` (prelude axiom, mirrors
+`Tactus.heightLt`) — abstract truth, sound.
+
+**Pinned by** `test_cross_crate_vec_len` (Ok) + `test_cross_crate_vec_len_wrong_ensures`
+(Err — wrong ensures fails gracefully, not via panic; soundness pin). The
+positive test also guards the unemittable-trait (`FiniteFull`) filter from
+the 2026-05-29 broadcast landing.
+
+**Still deferred — cross-crate exec callees.** `Vec::len` works because
+its obligation closes via the inlined `spec_vec_len` (the View/instance
+emission was the blocker). `Vec::push`/`Vec::index`/`Map`/`Set` *method*
+calls go through `build_wp_call`'s cross-crate rejection (callee not in
+`fn_map`) — a distinct arc needing cross-crate exec-callee spec inlining.
 
 ### Trait class+instance emission: deferred edges
 
