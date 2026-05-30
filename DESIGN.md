@@ -2247,8 +2247,9 @@ These are deferred by design — the current slice is single-crate exec+proof-fn
 
   Tasks still tracked under cross-crate umbrella:
   - **#125 cross-crate trait method decls** — when the trait method decl's `Fun` isn't in `fn_map` (genuinely cross-crate from a non-vstd-prelude path), `spec_source` returns Err. Currently rare in practice because vstd's traits aren't usually trait_method_impl'd in user crates that Tactus verifies.
-  - **Cross-crate View / `Vec::len` — LANDED 2026-05-30.** `#[verifier::tactus_auto] fn use_vec(v: &Vec<u8>) -> (r: usize) ensures r == v.len() { v.len() }` verifies under `use vstd::prelude::*`. Needed four fixes to vstd's trait-class + instance emission (see § "Cross-crate View blanket-impl emission" below): trait-method call qualification, blanket-impl forwarding (resolved-kind rewrite gate + forwarding-body synth), erased-allocator binder drop, and `has_resolved` as an uninterpreted Prop. Pinned by `test_cross_crate_vec_len` (+ `_wrong_ensures` negative).
-  - **Cross-crate exec callees (push/index/Map/Set) — still deferred.** `build_wp_call` rejects callees not in `fn_map`. `Vec::len` works because its obligation closes via the inlined `spec_vec_len` (the View/instance machinery is the part that landed); but `Vec::push`/`Vec::index`/`Map`/`Set` *method* calls need cross-crate exec-callee spec inlining + the wrapper/receiver handling — a distinct arc from the trait/instance emission above.
+  - **Cross-crate Vec (`len` / `push` / `v[i]` read) — LANDED 2026-05-30.** All verify soundly under `use vstd::prelude::*` — including `push` with `&mut` + `old(v)` and indexed reads. The blocker was never `build_wp_call`'s fn_map rejection (`merge_krates` brings referenced vstd exec fns in *with specs*, so they're in `fn_map` and inline); it was the `v@` (`View::view`) dispatch, fixed by four trait-class + instance-emission landings (see § "Cross-crate View blanket-impl emission" below): trait-method call qualification, blanket-impl forwarding (resolved-kind rewrite gate + forwarding-body synth), erased-allocator binder drop, and `has_resolved` as an uninterpreted Prop. Pinned by `test_cross_crate_vec_len` (+ `_wrong_ensures`).
+  - **Un-emittable cross-crate trait classes — degrade, don't panic (LANDED 2026-05-30).** A trait whose method decl is stripped cross-crate (e.g. `core::clone::Clone::clone`, dragged in by a `HashMap` bound) can't be rendered as a faithful Lean `class`. `generate.rs` precomputes `unemittable_traits` (any trait with a method absent from the function map) and skips them in both class-emission loops AND the instance gate; code dispatching through them fails gracefully ("tactus_auto failed") instead of panicking in `trait_to_ast`. The panic stays as a same-crate-bug tripwire. Pinned by `test_cross_crate_unemittable_trait_degrades_not_panics`.
+  - **Still deferred: `&mut v[i]` + Map/Set *verification*.** `&mut v[i]` (index mutation) fails with "unresolved references" — `vec_index_mut`'s referenced impl-method standalones aren't dep-walk-emitted (B1-family, bounded). `HashMap`/`HashSet` ops now fail *gracefully* (above) but don't verify — they dispatch through `Clone`/`PartialEq`/`Copy` classes Tactus can't emit cross-crate; verifying them needs a way to model those traits (opaque shells, or routing the Map/Set specs around the bounds) — a genuine feature, larger than the Vec arc.
   - **Dynamic dispatch via `dyn Trait`** — same cross-crate rejection path as #125.
 
   **Broadcast scope** — `collect_broadcast_lemma_funs` (below) handles BOTH default-on-import groups (`broadcast_use_by_default_when_this_crate_is_imported`, e.g. vstd's `group_vstd_default` — the drop-in case) AND fn-body `broadcast use <group>;` (`StmX::Fuel`). Still deferred: **module-level** `broadcast use` (`ModuleX.reveals` — a `broadcast use` at module scope rather than fn-body or default-on-import); needs reading the fn's owning-module reveal list rather than the fn body. Rare for user crates.
@@ -3003,11 +3004,19 @@ head-determined instance (the View blanket pins both `A` and the assoc
 positive test also guards the unemittable-trait (`FiniteFull`) filter from
 the 2026-05-29 broadcast landing.
 
-**Still deferred — cross-crate exec callees.** `Vec::len` works because
-its obligation closes via the inlined `spec_vec_len` (the View/instance
-emission was the blocker). `Vec::push`/`Vec::index`/`Map`/`Set` *method*
-calls go through `build_wp_call`'s cross-crate rejection (callee not in
-`fn_map`) — a distinct arc needing cross-crate exec-callee spec inlining.
+**What this unblocked (probed 2026-05-30).** `Vec::len`, `Vec::push` (with
+`&mut` + `old(v)`), and `v[i]` reads all verify soundly under
+`use vstd::prelude::*` — they were never blocked by `build_wp_call`'s
+fn_map rejection (`merge_krates` brings referenced vstd exec fns in with
+specs); the wall was the `v@` View dispatch, which the four fixes above
+cleared.
+
+**Still deferred.** `&mut v[i]` (index *mutation*) fails with "unresolved
+references" — `vec_index_mut`'s impl-method standalones aren't
+dep-walk-emitted (B1-family, bounded). Map/Set ops fail *gracefully* (the
+un-emittable-trait skip, above) but don't verify — they dispatch through
+cross-crate `Clone`/`PartialEq`/`Copy` classes Tactus can't emit; verifying
+them is a genuine feature (model those traits) larger than the Vec arc.
 
 ### Trait class+instance emission: deferred edges
 
