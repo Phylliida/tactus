@@ -271,10 +271,31 @@ fn krate_preamble(
     // the class). This is the structural co-dependency that the
     // pre-2026-05-12 `refs.traits`-only gate hid by accident.
     let groups = dep_order::order_spec_fns(&spec_fn_map, &method_lookup, &all_fns, &dep_walk_roots);
+
+    // Un-emittable traits: a trait whose `class` we can't render because
+    // at least one method decl is absent from the merged krate's function
+    // map — i.e. stripped cross-crate (e.g. `core::clone::Clone::clone`,
+    // dragged in by a `HashMap` bound). Without the method's `FunctionX`
+    // we can't render its class field faithfully, so we skip the class
+    // AND every instance of it; code that dispatches through such a trait
+    // then fails gracefully (unresolved reference → "tactus_auto failed")
+    // instead of panicking in `trait_to_ast`. That panic stays as a
+    // tripwire for genuine SAME-crate bugs (where every method should be
+    // present). Mirrors `collect_broadcast_lemma_funs`'s `unemittable_traits`
+    // filter for the broadcast path (#122).
+    let unemittable_traits: std::collections::HashSet<vir::ast::Path> = krate.traits.iter()
+        .filter(|tr| tr.x.methods.iter().any(|m| !method_lookup.contains_key(m)))
+        .map(|tr| tr.x.name.clone())
+        .collect();
+
     let instances_to_emit: Vec<(&TraitImpl, Vec<&FunctionX>)> = krate.trait_impls.iter()
         .filter_map(|ti| {
             let trait_short = short_name(&ti.x.trait_path);
             if !refs.traits.contains(trait_short) { return None; }
+            // Skip instances of un-emittable traits — their class won't
+            // emit, so the instance would dangle (and `trait_to_ast`
+            // would panic on the stripped method).
+            if unemittable_traits.contains(&ti.x.trait_path) { return None; }
             // Implementor type check: trait_typ_args[0] is Self.
             // For Dt::Path (a concrete user datatype), require it
             // to be in refs.datatypes. For anything else (primitive,
@@ -434,6 +455,7 @@ fn krate_preamble(
     for tr in &krate.traits {
         let n = short_name(&tr.x.name);
         if !trait_has_proof_method(&tr.x)
+            && !unemittable_traits.contains(&tr.x.name)
             && (refs.traits.contains(n) || traits_with_emitted_impl.contains(n))
         {
             cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies)));
@@ -503,6 +525,7 @@ fn krate_preamble(
     for tr in &krate.traits {
         let n = short_name(&tr.x.name);
         if trait_has_proof_method(&tr.x)
+            && !unemittable_traits.contains(&tr.x.name)
             && (refs.traits.contains(n) || traits_with_emitted_impl.contains(n))
         {
             cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies)));

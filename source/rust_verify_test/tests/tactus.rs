@@ -11414,3 +11414,31 @@ test_verify_one_file! {
             "expected a verification failure (not a panic), got: {}", s);
     }
 }
+
+// Graceful degradation on un-emittable cross-crate traits. A `HashMap`
+// fn drags in `core::clone::Clone` (and `PartialEq`/`Copy`), whose
+// method decls are stripped cross-crate — so Tactus can't render their
+// Lean `class` faithfully. Pre-fix this PANICKED in `trait_to_ast`
+// ("method `clone` not found in VIR function list"). Now those traits
+// (and their instances) are skipped, so the fn fails GRACEFULLY via
+// `tactus_auto failed` (unresolved references to the skipped classes) —
+// Map/Set verification is a separate feature, but ordinary
+// `vstd::prelude::*` + HashMap code must never panic the verifier.
+test_verify_one_file! {
+    #[test] test_cross_crate_unemittable_trait_degrades_not_panics verus_code! {
+        use vstd::prelude::*;
+        #[verifier::tactus_auto]
+        fn use_map(m: &std::collections::HashMap<u8, u8>, k: u8) -> (r: bool)
+            ensures r == m@.contains_key(k)
+        {
+            m.contains_key(&k)
+        }
+    } => Err(e) => {
+        let s = format!("{:?}", e);
+        // `tactus_auto failed` = Lean ran (codegen completed without the
+        // trait_to_ast panic). A panic would instead surface as a Rust
+        // backtrace / "not found in VIR function list".
+        assert!(s.contains("tactus_auto failed") && !s.contains("not found in VIR"),
+            "expected graceful Lean failure (no trait_to_ast panic), got: {}", s);
+    }
+}
