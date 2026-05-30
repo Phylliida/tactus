@@ -682,6 +682,17 @@ fn expr_to_node(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::Rend
             crate::to_lean_sst_expr::integer_type_bound_from_vir(kind, inner).node
         }
         ExprX::UnaryOpr(UnaryOpr::CustomErr(_), inner) => expr_to_node(inner, binders, ctx),
+        // `has_resolved(x)` → uninterpreted Prop. The catch-all below
+        // would render it as the bare argument (`has_resolved vec` →
+        // `vec`), turning vstd's `axiom_vec_has_resolved` ensures
+        // `has_resolved(vec) ==> ..` into `vec → ..` (a value in type
+        // position — "type expected, got"). Tactus doesn't model
+        // resolution, so leave it abstract. See `Tactus.hasResolved` in
+        // the prelude. (#122)
+        ExprX::UnaryOpr(UnaryOpr::HasResolved(_), inner) => apply(
+            "Tactus.hasResolved",
+            vec![vir_expr_to_ast_with_binders(inner, binders, ctx)],
+        ),
         ExprX::UnaryOpr(_, inner) => expr_to_node(inner, binders, ctx),
 
         ExprX::NullaryOpr(NullaryOpr::ConstGeneric(typ)) => {
