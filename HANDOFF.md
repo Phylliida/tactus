@@ -8,11 +8,117 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**458 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass — full e2e suite green, 0 failures.** Latest (2026-05-29): **#122 cross-crate broadcast lemmas** — vstd's `Seq`/`Set`/`Map` semantic lemmas now reach the closer (emit-as-axiom + inject-as-`have`) from BOTH default-on-import (`group_vstd_default` — so `Seq::empty().push(0).len() == 1` verifies with NO explicit `broadcast use`, drop-in with Verus) AND explicit `broadcast use <group>;`; a follow-up fixed a default-on-import panic on un-emittable cross-crate trait bounds (skip such lemmas), and the cross-crate View/exec-callee frontier is scoped precisely (see the scoping note below). Cross-crate spec code using those types verifies (+5 tests). Before: Cluster B closed (`ref_to_bare`, `aliased_arg`, `cross_instantiation`); Cluster A closed via typed substitution + universal call-arg bridging. vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**459 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass — full e2e suite green, 0 failures.** Latest (2026-05-30): **#122 cross-crate View / exec-callee emission — `Vec::len` verifies end-to-end.** The B1–B4 scoping note (below) is RESOLVED across four landings: **B2** trait-method call heads use the full module-qualified path (`view.View.view`, matching the emitted class) instead of the last two segments; **B1** `rewrite_self_sibling_calls` gates on resolved kind (so a blanket impl's cross-instance forward stays class dispatch) plus a forwarding-blanket body synth that faithfully reproduces `(**self).view()` as `view.View.view (Tactus.Ref.mk self.deref.deref)` for Ref/Box/Rc/Arc (recovering the smart-pointer deref Verus leaves opaque); **B3** instance binders the head doesn't determine (the erased `Box<T,A>` allocator param) are dropped so Lean can synthesize; and `has_resolved(x)` renders as an uninterpreted `Tactus.hasResolved` Prop. `#[verifier::tactus_auto] fn use_vec(v: &Vec<u8>) -> (r: usize) ensures r == v.len() { v.len() }` now verifies under `use vstd::prelude::*`; a wrong ensures fails gracefully. (Prior, 2026-05-29: **#122 cross-crate broadcast lemmas** — vstd's `Seq`/`Set`/`Map` semantic lemmas reach the closer from default-on-import + explicit `broadcast use`; default-on-import panic on un-emittable cross-crate trait bounds fixed by skipping such lemmas. Cluster B closed (`ref_to_bare`, `aliased_arg`, `cross_instantiation`); Cluster A closed via typed substitution + universal call-arg bridging.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
 ### Recent session landings
+
+#### Current session (2026-05-30 — #122 cross-crate View / exec-callee emission: Vec::len verifies)
+
+**Headline**: 458 → 459 e2e, zero regressions, lib 261/0, vstd unaffected
+(all changes in `lean_verify`). The B1–B4 scoping note from 2026-05-29
+(below) is CLOSED — the canonical `Vec::len` cross-crate case verifies
+end-to-end (11 Lean errors → 0).
+
+**The arc.** Asked to work on cross-crate View / exec-callee emission.
+Probed first (the scoping note was ~1 day old but probe-don't-trust):
+regenerated the `Vec::len` probe with `VERUS_KEEP_TEST_DIR=1`, ran `lean
+--json`, confirmed the live 11-error set matched the note. Then worked the
+recommended phasing **B2 → B1 → B3 → B4**, testing + committing each.
+
+**Five landings (one commit each):**
+
+1. **B2 — `trait_method_ref` full module-qualified path** (`80e99ec`).
+   It built the call head from the last two path segments (`View.view`),
+   which coincided with `lean_name` for crate-root traits but dropped the
+   module segment for module-nested ones. vstd's View lives under a `view`
+   module, so calls rendered bare `View.view` against a `view.View` class.
+   Switched to `lean_name(&fun.path)` (the crate lives in `PathX::krate`,
+   not segments). Cleared the bare-`View.view` errors in the std_specs.vec
+   axioms + the downstream axiom-unknown cascade (11 → 8 errors).
+
+2. **B1 part 1 — `rewrite_self_sibling_calls` gates on resolved kind**
+   (`cc4c0b8`). The rewrite rewrote a trait-method call to the impl's own
+   `impl__N.method` standalone whenever the first-arg type *peel-equaled*
+   Self. That mis-fired on blanket impls forwarding to the inner type
+   (`(**self).view()`): for Rc/Arc the smart-pointer spec deref doesn't
+   reduce, so `**self` keeps type `Rc<A>` and the receiver is typed
+   `&Self` — type-indistinguishable from a self-call. Discriminator found
+   via debug eprintln: a genuine self-sibling call is `DynamicResolved`
+   (resolves to a concrete impl method), a bound-dispatched cross-instance
+   forward is `Dynamic`. Gate on `DynamicResolved`/`Static`. Fixed Ref/Box
+   (8 → 6; Rc/Arc now class-dispatch but circular — see part 2).
+
+3. **B3 — drop instance binders the head doesn't determine** (`512fcce`).
+   `impl<T, A: Allocator> Allocator for Box<T, A>` rendered `instance {T}
+   {A} [Allocator A] : Allocator (Tactus.Box T)` — `typ_to_expr` erases
+   the allocator arg `A`, leaving it free in the head ("cannot find
+   synthesization order"). In `trait_impl_to_ast`, after building the
+   head, drop implicit binders for type-params the head doesn't mention +
+   bounds referencing them. Sound (an undetermined binder is
+   unsynthesizable anyway; `Allocator` is an empty marker class). No-op for
+   every head-determined instance (tried the general version, full suite
+   confirmed no outParam-determined instance regressed). New
+   `lean_ast::free_var_names` helper (6 → 3 errors).
+
+4. **`has_resolved(x)` → uninterpreted Prop** (`e91097f`).
+   `UnaryOpr::HasResolved` hit the VIR-AST renderer catch-all, which
+   rendered `has_resolved(vec)` as the bare `vec`, turning
+   `axiom_vec_has_resolved`'s `has_resolved(vec) ==> ..` into `vec → ..`
+   ("type expected, got"). Tactus doesn't model resolution (it drops
+   `assume(has_resolved(..))`), so render it as `Tactus.hasResolved :
+   {α} → α → Prop` (new prelude axiom, mirrors `Tactus.heightLt`) —
+   abstract truth, sound (3 → 2 errors).
+
+5. **B1 part 2 — forwarding-blanket body synth** (`4851681`). The last 2
+   (Rc/Arc) were circular: literal render dispatched `View.view` on `Rc A`
+   = the instance under construction. `forwarding_blanket_body` detects the
+   exact pure-forward shape (Self = single ref-wrapper over a bare
+   type-param AND body is a call to the SAME trait method whose sole arg
+   reads the self param) and synthesizes
+   `view.View.view (Tactus.Ref.mk self.deref.deref)` — the class field is
+   `view : Ref Self → V`, so `self : Ref (Wrapper A)`; the two `.deref`s
+   peel the `&` and the wrapper (the prelude wrappers' `.deref` reduces
+   where Verus's smart-pointer deref didn't), `Ref.mk` re-borrows, and the
+   inner instance dispatches via the `[Trait A]` bound. Uniform + correct
+   for all four wrappers. The gate is tight (faithful to Rust): non-
+   forwarding bodies (`(**self).view() + 1`), struct-field forwards
+   (`self.0.view()`), and multi-param methods fall through to literal
+   rendering — the synth only fires when it provably reproduces the source.
+   (2 → 0 errors; `Vec::len` verifies.)
+
+**Tests.** `test_cross_crate_default_broadcast_unemittable_trait_skipped`
+(Err-pinned graceful-failure) → `test_cross_crate_vec_len` (Ok) + new
+`test_cross_crate_vec_len_wrong_ensures` (Err — soundness pin, wrong
+ensures fails gracefully not via panic). The positive test also remains a
+regression guard for the unemittable-trait (`FiniteFull`) filter.
+
+**Discipline notes worth recording.**
+* *Probe overturned the note's framing (faithfully, again).* The B1 scoping
+  note said the blanket-impl methods were "body=None (Bug C synth path)."
+  Probing showed they have bodies (`(**self).view()`); my first B1 attempt
+  (emit gate-only standalones via `spec_fn_to_ast`) emitted broken self-
+  referential `def`s. Reverted, re-grounded in the actual VIR body shape
+  via `eprintln`, and the real fix (resolved-kind gate + forwarding synth)
+  emerged. The note was a good map but ~1 day stale in one spot — the
+  recurring "my own claims go stale" lesson.
+* *The decisive discriminator wasn't type/depth, it was resolution kind.*
+  Two debug rounds (rewrite-kind, then full body shape) replaced three
+  rounds of plausible-but-wrong type/depth reasoning. Rc/Arc's cross-
+  instance receiver is type-identical to a self-call's `&Self`; only the
+  `DynamicResolved` vs `Dynamic` kind distinguishes them.
+* *Faithfulness gate (user's emphasis).* The forwarding synth is gated on
+  the body provably being a pure `(**self).method()` forward, so it
+  reproduces Rust's actual behavior and never silently rewrites a non-
+  forwarding blanket (the `test_non_forwarding_blanket_over_ref_probe`
+  concern stays handled by the wrapper types, untouched).
+
+**Frontier still open (follow-up).** `Vec::len` is the canonical case; the
+note's step 4 ("widen to `Vec::push`/`Vec::index`/`Map`/`Set` method
+calls") is unprobed. Those likely hit the genuine **cross-crate *exec*
+callee** path (`build_wp_call`'s fn_map rejection), which is distinct from
+the trait/instance-emission work landed here — a separate arc.
 
 #### Current session (2026-05-29 cont. — #122 cross-crate broadcast lemmas)
 
@@ -159,6 +265,16 @@ cross-crate-exec-callee work, larger than billed, in #122/#125
 territory.
 
 ##### Scoping note — cross-crate View / exec-callee emission (no code, 2026-05-29)
+
+**✅ RESOLVED 2026-05-30.** B1–B4 below were all closed; `Vec::len`
+verifies (see the 2026-05-30 session entry at the top for the five
+landings). The phasing held exactly (B2 → B1 → B3 → B4). Kept below for
+forensic context — note the one stale spot the probe corrected: B1 framed
+the blanket-impl methods as "body=None (Bug C synth)", but they have
+bodies (`(**self).view()`), so the fix was a resolved-kind rewrite gate +
+forwarding-blanket body synth, not standalone-axiom emission. The
+remaining frontier (`Vec::push`/`Vec::index`/`Map`/`Set`) is the genuine
+cross-crate *exec*-callee path, untouched here.
 
 **TL;DR.** "Cross-crate exec callees" turned out to NOT be blocked where
 the old framing said (`build_wp_call`'s fn_map rejection — the callee IS
