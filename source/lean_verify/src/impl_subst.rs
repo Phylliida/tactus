@@ -499,7 +499,26 @@ pub fn rewrite_self_sibling_calls(
     let impl_self_peeled = peel(impl_self_typ);
     vir::ast_visitor::map_expr_visitor(body, &|e: &Expr| {
         if let ExprX::Call(target, args, post_args) = &e.x {
-            if let CallTarget::Fun(_kind, fun, typs, impl_paths, autospec, const_var) = target {
+            if let CallTarget::Fun(kind, fun, typs, impl_paths, autospec, const_var) = target {
+                // Only rewrite genuinely-resolved self-sibling calls.
+                // A call that dispatches through a `[Trait A]` bound —
+                // a blanket impl forwarding to the inner type, e.g.
+                // vstd's `View for Rc<A>`: `(**self).view()` — is
+                // `Dynamic` (unresolved) and must stay class dispatch
+                // so Lean resolves it via the bound. Its receiver can be
+                // typed `&Self` (a smart-pointer's spec deref doesn't
+                // reduce, so `**self` keeps type `Rc<A>`), making it
+                // indistinguishable from a self-call by type alone — the
+                // resolution kind is the reliable discriminator. A true
+                // self-sibling call resolves to a concrete impl method
+                // (`DynamicResolved`/`Static`). (#122 B1: without this,
+                // blanket Rc/Arc View instances forwarded to a self-
+                // referential `impl__N.view` standalone.)
+                if !matches!(kind,
+                    CallTargetKind::DynamicResolved { .. } | CallTargetKind::Static)
+                {
+                    return Ok(e.clone());
+                }
                 let segs = &fun.path.segments;
                 if segs.len() < 2 { return Ok(e.clone()); }
                 let method_short = segs[segs.len() - 1].as_str().to_string();
