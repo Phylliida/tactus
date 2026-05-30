@@ -1765,7 +1765,18 @@ fn recv_reads_local(e: &Expr, self_name: &str) -> bool {
     match &e.x {
         ExprX::ReadPlace(place, _) =>
             matches!(&place.x, PlaceX::Local(v) if v.0.as_str() == self_name),
-        ExprX::Unary(_, inner) | ExprX::UnaryOpr(_, inner) =>
+        // Peel ONLY transparent wrappers — poly box/unbox, coerce-mode /
+        // trigger markers, custom-err — never value-transforming ops
+        // (Not / Clip / BitNot / Field / IsVariant / HasType / arithmetic
+        // / …). A transform between `**self` and `.method()` means the
+        // body is NOT a pure forward, so the synth must not fire (it would
+        // silently drop the transform, emitting an unfaithful instance).
+        // Mirrors the explicit-transparent-arms-then-reject structure of
+        // `to_lean_expr::expr_to_node`'s unary handling, rather than a
+        // wildcard `_` that would peel transforms too.
+        ExprX::Unary(UnaryOp::CoerceMode { .. } | UnaryOp::Trigger(_), inner) =>
+            recv_reads_local(inner, self_name),
+        ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_) | UnaryOpr::CustomErr(_), inner) =>
             recv_reads_local(inner, self_name),
         _ => false,
     }
@@ -1796,11 +1807,18 @@ fn recv_reads_local(e: &Expr, self_name: &str) -> bool {
 /// rendering — the synth only fires when it provably reproduces the
 /// source. (#122 B1)
 fn forwarding_blanket_body(ti: &TraitImplX, func: &FunctionX) -> Option<LExpr> {
-    // Self: a single ref-wrapper over a bare type-param.
+    // Self: a single SHARED-ref wrapper over a bare type-param. MutRef
+    // is excluded: the synth assumes the class field receiver is
+    // `Tactus.Ref Self` (a `&self` method) and re-wraps with
+    // `Tactus.Ref.mk`; a `&mut self` forwarding method would have a
+    // `MutRef`-typed receiver and need different handling (none exists in
+    // vstd's View blankets, so excluding it is a no-op that removes a
+    // latent wrong-synth).
     let self_typ = ti.trait_typ_args.first()?;
     match &**self_typ {
         TypX::Decorate(deco, _, inner)
             if crate::expr_shared::decoration_wrapper(*deco).is_some()
+                && !matches!(deco, vir::ast::TypDecoration::MutRef)
                 && matches!(&**inner, TypX::TypParam(_)) => {}
         _ => return None,
     }
@@ -1826,12 +1844,21 @@ fn forwarding_blanket_body(ti: &TraitImplX, func: &FunctionX) -> Option<LExpr> {
     // The single receiver arg reads the self param (`(**self)`).
     if args.len() != 1 || !recv_reads_local(&args[0], self_name) { return None; }
     // Build `<Trait.method> (Tactus.Ref.mk (self.deref.deref))`.
+    // Deref depth 2: one `.deref` peels the class field's `&self`
+    // (`view : Tactus.Ref Self → V`), one more peels the single Self
+    // wrapper to the inner type-param. The gate above guarantees Self is
+    // exactly one wrapper over a bare TypParam, so the depth is fixed at
+    // 2 — if that gate ever admits a multi-layer Self, this must change
+    // with it. The outer `.mk` is always `Tactus.Ref` (the class field is
+    // `Ref Self` regardless of whether Self's wrapper is Box/Rc/Arc), so
+    // the inner instance's `Ref inner` receiver matches.
+    const CLASS_FIELD_REF_PLUS_SELF_WRAPPER: usize = 2;
     let method_qualified = format!("{}.{}", lean_name(&ti.trait_path), method_short);
     let self_var = LExpr::new(ExprNode::Var(
         crate::lean_name::LeanName::synthetic(sanitize(self_name))));
-    let inner_arg = LExpr::app1(
-        LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Tactus.Ref.mk"))),
-        crate::expr_shared::apply_deref_chain(self_var, 2),
+    let inner_arg = crate::expr_shared::apply_wrap_chain(
+        crate::expr_shared::apply_deref_chain(self_var, CLASS_FIELD_REF_PLUS_SELF_WRAPPER),
+        &["Tactus.Ref"],
     );
     Some(LExpr::app1(
         LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit(&method_qualified))),
@@ -2050,18 +2077,18 @@ pub fn trait_impl_to_ast(
                     if let Some(synth) = forwarding_blanket_body(ti, func) {
                         synth
                     } else {
-                    let self_typ = ti.trait_typ_args.first()
-                        .expect("impl's trait_typ_args must include Self");
-                    let rewritten = crate::impl_subst::rewrite_self_sibling_calls(
-                        body, &ti.trait_path, self_typ, &method_redirects,
-                    );
-                    // Wrap with `let p := p.deref` for each reference-
-                    // decorated param so the body sees inner types.
-                    let body_binders = crate::to_lean_expr::binder_ctx_from_params(&func.params);
-                    wrap_body_with_param_derefs(
-                        crate::to_lean_expr::vir_expr_to_ast_with_binders(&rewritten, &body_binders, &crate::expr_shared::RenderCtx::empty()),
-                        &func.params,
-                    )
+                        let self_typ = ti.trait_typ_args.first()
+                            .expect("impl's trait_typ_args must include Self");
+                        let rewritten = crate::impl_subst::rewrite_self_sibling_calls(
+                            body, &ti.trait_path, self_typ, &method_redirects,
+                        );
+                        // Wrap with `let p := p.deref` for each reference-
+                        // decorated param so the body sees inner types.
+                        let body_binders = crate::to_lean_expr::binder_ctx_from_params(&func.params);
+                        wrap_body_with_param_derefs(
+                            crate::to_lean_expr::vir_expr_to_ast_with_binders(&rewritten, &body_binders, &crate::expr_shared::RenderCtx::empty()),
+                            &func.params,
+                        )
                     }
                 }
                 (vir::ast::Mode::Exec, Some(_)) => {

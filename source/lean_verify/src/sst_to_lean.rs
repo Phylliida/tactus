@@ -2918,10 +2918,7 @@ pub fn collect_broadcast_lemma_funs<'a>(
     // reasoning isn't supported yet), but the verifier doesn't crash.
     // The clean seq/map/set *axiom* lemmas are unbounded (`<A>`, no
     // trait bound), so they're unaffected.
-    let unemittable_traits: HashSet<vir::ast::Path> = krate.traits.iter()
-        .filter(|t| t.x.methods.iter().any(|m| !fn_map.contains_key(m)))
-        .map(|t| t.x.name.clone())
-        .collect();
+    let unemittable_traits = crate::expr_shared::unemittable_traits(krate, &fn_map);
 
     let mut targets: Vec<&Fun> = Vec::new();
     // (1) Default-on-import groups: a `pub broadcast group` marked
@@ -2952,6 +2949,34 @@ pub fn collect_broadcast_lemma_funs<'a>(
     let mut seen: HashSet<&Fun> = HashSet::new();
     let mut out: Vec<&Fun> = Vec::new();
     // Recursively expand a target into leaf broadcast-lemma funs.
+    // Does any require/ensure clause of `func` call a `BuiltinSpecFun`
+    // (closure `call_requires` / `call_ensures` etc.)? The VIR-AST
+    // renderer emits those as an unresolved literal `builtinSpecFun`
+    // (no faithful, fixed-arity Lean form), so a broadcast lemma that
+    // mentions one can't be emitted cleanly.
+    fn references_builtin_spec_fun(func: &FunctionX) -> bool {
+        use std::cell::Cell;
+        use vir::visitor::VisitorControlFlow;
+        let found = Cell::new(false);
+        // Read-only DFS that stops at the first BuiltinSpecFun — no tree
+        // clone (unlike `map_expr_visitor`, which rebuilds every node) and
+        // short-circuits on first hit. Scans exactly `require` + `ensure.0`,
+        // the slots `proof_fn_signature` emits for a broadcast lemma
+        // (`ensure.1`, the trait-default ensures, is never rendered).
+        let mut visit = |e: &vir::ast::Expr| {
+            if let ExprX::Call(CallTarget::BuiltinSpecFun(..), ..) = &e.x {
+                found.set(true);
+                VisitorControlFlow::Stop(())
+            } else {
+                VisitorControlFlow::Recurse
+            }
+        };
+        for clause in func.require.iter().chain(func.ensure.0.iter()) {
+            if found.get() { break; }
+            vir::ast_visitor::expr_visitor_walk(clause, &mut visit);
+        }
+        found.get()
+    }
     fn expand<'a>(
         f: &'a Fun,
         group_members: &HashMap<&'a Fun, &'a Vec<Fun>>,
@@ -2976,7 +3001,17 @@ pub fn collect_broadcast_lemma_funs<'a>(
                     unemittable_traits.contains(p),
                 _ => false,
             });
-            if func.attrs.broadcast_forall && !bad_bound {
+            // Also skip a lemma whose require/ensure references a
+            // `BuiltinSpecFun` (closure `call_requires`/`call_ensures`):
+            // the VIR-AST renderer has no faithful Lean form for it (it's
+            // variadic), so it would emit an unresolved `builtinSpecFun`.
+            // e.g. vstd's `axiom_fn_mut_call_requires`/`_ensures`, pulled
+            // in by default-on-import broadcast but irrelevant to most
+            // code. Same graceful-skip family as the un-emittable-trait
+            // bound above (#122).
+            if func.attrs.broadcast_forall && !bad_bound
+                && !references_builtin_spec_fun(func)
+            {
                 out.push(f);
             }
             // else: plain reveal of a non-broadcast spec fn, or a lemma

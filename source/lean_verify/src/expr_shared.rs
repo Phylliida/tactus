@@ -665,6 +665,25 @@ pub(crate) fn apply_wrap_chain(base: LExpr, wraps: &[&'static str]) -> LExpr {
     out
 }
 
+/// Traits whose Lean `class` can't be emitted because some method decl
+/// is absent from `fn_map` — i.e. stripped cross-crate (e.g.
+/// `core::clone::Clone::clone`, dragged in by a `HashMap` bound). Both
+/// `generate.rs` (class + instance emission gate) and `sst_to_lean.rs`
+/// (broadcast-lemma bound filter) skip these so `trait_to_ast` never
+/// panics on a missing method; the panic stays a tripwire for genuine
+/// SAME-crate bugs. The whole-crate prune keeps every same-crate
+/// function, so this only flags cross-crate-stripped traits. Single
+/// source of truth for the "un-emittable trait" rule (#122).
+pub(crate) fn unemittable_traits(
+    krate: &vir::ast::KrateX,
+    fn_map: &std::collections::HashMap<&vir::ast::Fun, &vir::ast::FunctionX>,
+) -> std::collections::HashSet<vir::ast::Path> {
+    krate.traits.iter()
+        .filter(|tr| tr.x.methods.iter().any(|m| !fn_map.contains_key(m)))
+        .map(|tr| tr.x.name.clone())
+        .collect()
+}
+
 /// Bidirectional wrapper-kind-and-depth coercion. Bridge `value`
 /// (currently at `from_typ`) to `to_typ` by inserting `.deref` chain
 /// and/or `.mk` chain to match wrapper sequences.
