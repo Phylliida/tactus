@@ -11361,23 +11361,30 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Regression: default-on-import must DEGRADE, not PANIC, when the
-// default group (group_vstd_default) transitively includes a broadcast
-// lemma bounded on a cross-crate trait whose method decls aren't merged
-// (vstd's `full_set_properties<A: FiniteFull>` in group_set_lib_default;
-// `FiniteFull::full_properties` is stripped). `collect_broadcast_lemma_funs`
-// skips such lemmas, so trait emission never tries to emit the partial
-// `FiniteFull` class (which panicked at to_lean_fn.rs:1317 before the
-// filter). A `Vec`-using fn under `vstd::prelude::*` pulls set_lib into
-// the merged krate, so it exercises the path. The fn still fails — but
-// on the unrelated cross-crate `View` blanket-impl emission gap (Bug B,
-// `view.impl__N.view` unresolved), the genuine cross-crate-exec-callee
-// blocker — gracefully via `tactus_auto failed`, NOT a verifier panic.
-// Asserting `tactus_auto failed` (Lean ran) + no `FiniteFull` pins that
-// codegen completed without the set_lib panic. Flips toward Ok if/when
-// cross-crate View emission lands.
+// Cross-crate `Vec::len` verifies end-to-end (#122 View / exec-callee
+// emission). Closing this needed four landings, all exercised here:
+//  * B2 — trait-method call heads use the full module-qualified path
+//    (`view.View.view`, matching the emitted class), not the last two
+//    segments (`View.view`).
+//  * B1 — `rewrite_self_sibling_calls` gates on resolved kind (so a
+//    blanket's cross-instance forward stays class dispatch), plus the
+//    forwarding-blanket body synth reproducing `(**self).view()`
+//    faithfully (`view.View.view (Tactus.Ref.mk self.deref.deref)`) for
+//    Ref/Box/Rc/Arc — the smart-pointer deref Verus leaves opaque is
+//    recovered via the prelude wrappers' reducible `.deref`.
+//  * B3 — instance binders the head doesn't determine (the erased
+//    `Box<T, A>` allocator param) are dropped, so Lean can synthesize.
+//  * `has_resolved(x)` renders as an uninterpreted `Tactus.hasResolved`
+//    Prop (vstd's `axiom_vec_has_resolved` mentions it).
+// Also a regression guard for the unemittable-trait filter: under
+// `vstd::prelude::*`, `group_vstd_default` transitively pulls
+// `group_set_lib_default`'s `full_set_properties<A: FiniteFull>`, whose
+// `FiniteFull::full_properties` decl is stripped cross-crate.
+// `collect_broadcast_lemma_funs` skips such lemmas, so trait emission
+// never tries to emit the partial `FiniteFull` class (which panicked at
+// to_lean_fn.rs before the filter).
 test_verify_one_file! {
-    #[test] test_cross_crate_default_broadcast_unemittable_trait_skipped verus_code! {
+    #[test] test_cross_crate_vec_len verus_code! {
         use vstd::prelude::*;
         #[verifier::tactus_auto]
         fn use_vec(v: &Vec<u8>) -> (r: usize)
@@ -11385,9 +11392,25 @@ test_verify_one_file! {
         {
             v.len()
         }
+    } => Ok(())
+}
+
+// Soundness: a wrong cross-crate postcondition must NOT verify. The goal
+// `r == v.len() + 1` can't close (the body binds `r := v.len()`), so this
+// fails — confirming the cross-crate View/Vec machinery didn't make the
+// caller more permissive (and fails gracefully, not via panic).
+test_verify_one_file! {
+    #[test] test_cross_crate_vec_len_wrong_ensures verus_code! {
+        use vstd::prelude::*;
+        #[verifier::tactus_auto]
+        fn use_vec(v: &Vec<u8>) -> (r: usize)
+            ensures r == (v.len() + 1) as usize
+        {
+            v.len()
+        }
     } => Err(e) => {
         let s = format!("{:?}", e);
-        assert!(s.contains("tactus_auto failed") && !s.contains("FiniteFull"),
-            "expected graceful Lean failure with set_lib lemma filtered (no panic), got: {}", s);
+        assert!(s.contains("tactus_auto failed") || s.contains("postcondition"),
+            "expected a verification failure (not a panic), got: {}", s);
     }
 }

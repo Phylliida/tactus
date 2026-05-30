@@ -1757,6 +1757,88 @@ fn strip_class_qualifier_rec(
 
 // ── Trait impl (Lean `instance`) ───────────────────────────────────────
 
+/// Does `e` read the local variable named `self_name` (peeling
+/// transparent unary wrappers / borrows)? Used to confirm a blanket
+/// impl method's receiver arg is exactly the self param — `(**self)` —
+/// and not a derived expression like `modified(**self)`.
+fn recv_reads_local(e: &Expr, self_name: &str) -> bool {
+    match &e.x {
+        ExprX::ReadPlace(place, _) =>
+            matches!(&place.x, PlaceX::Local(v) if v.0.as_str() == self_name),
+        ExprX::Unary(_, inner) | ExprX::UnaryOpr(_, inner) =>
+            recv_reads_local(inner, self_name),
+        _ => false,
+    }
+}
+
+/// If `func` is a forwarding blanket-impl method — Self is a single
+/// reference wrapper over a bare type-param (`&A` / `Box<A>` / `Rc<A>`
+/// / `Arc<A>`) and the body is exactly `(**self).method()` (a call to
+/// the SAME trait method whose sole receiver arg reads the self
+/// param) — synthesize the faithful instance body.
+///
+/// Verus reduces the `**self` deref for `&`/Box (so literal rendering
+/// dispatches on the inner type correctly), but leaves the smart-
+/// pointer spec deref opaque for Rc/Arc, so the literal render
+/// dispatches `View.view` on `Rc A` = the instance under construction
+/// (circular — "failed to synthesize"). The synth reproduces Rust's
+/// `(**self).view()` directly: the Lean class field is `view : Ref
+/// Self → V`, so the binder `self : Ref (Wrapper A)`; `self.deref`
+/// peels the `&`, `.deref` peels the wrapper to the inner value, and
+/// `Tactus.Ref.mk` re-borrows it so `Trait.method` dispatches the
+/// inner's instance via the `[Trait A]` bound. Uniform and correct
+/// for all four wrappers; the prelude wrappers' `.deref` reduces where
+/// Verus's smart-pointer deref didn't.
+///
+/// Returns None for any other shape (non-forwarding bodies like
+/// `(**self).view() + 1`, struct-field forwards like `self.0.view()`,
+/// multi-param methods), so those fall through to faithful literal
+/// rendering — the synth only fires when it provably reproduces the
+/// source. (#122 B1)
+fn forwarding_blanket_body(ti: &TraitImplX, func: &FunctionX) -> Option<LExpr> {
+    // Self: a single ref-wrapper over a bare type-param.
+    let self_typ = ti.trait_typ_args.first()?;
+    match &**self_typ {
+        TypX::Decorate(deco, _, inner)
+            if crate::expr_shared::decoration_wrapper(*deco).is_some()
+                && matches!(&**inner, TypX::TypParam(_)) => {}
+        _ => return None,
+    }
+    // Exactly the receiver param (no extra args to forward).
+    if func.params.len() != 1 { return None; }
+    let self_name = func.params[0].x.name.0.as_str();
+    let method_short = func.name.path.segments.last()?.as_str();
+    // Body (peeling a trivial wrapping Block) is `Trait::method(recv)`.
+    let body = func.body.as_ref()?;
+    let inner = match &body.x {
+        ExprX::Block(stmts, Some(e)) if stmts.is_empty() => e,
+        _ => body,
+    };
+    let ExprX::Call(CallTarget::Fun(_, fun, _, _, _, _), args, _) = &inner.x
+        else { return None; };
+    // The call targets the SAME trait method:
+    // `fun.path.segments == trait_path.segments ++ [method_short]`.
+    let tsegs = &ti.trait_path.segments;
+    let fsegs = &fun.path.segments;
+    if fsegs.len() != tsegs.len() + 1 { return None; }
+    if !tsegs.iter().zip(fsegs.iter()).all(|(a, b)| a == b) { return None; }
+    if fsegs.last().map(|s| s.as_str()) != Some(method_short) { return None; }
+    // The single receiver arg reads the self param (`(**self)`).
+    if args.len() != 1 || !recv_reads_local(&args[0], self_name) { return None; }
+    // Build `<Trait.method> (Tactus.Ref.mk (self.deref.deref))`.
+    let method_qualified = format!("{}.{}", lean_name(&ti.trait_path), method_short);
+    let self_var = LExpr::new(ExprNode::Var(
+        crate::lean_name::LeanName::synthetic(sanitize(self_name))));
+    let inner_arg = LExpr::app1(
+        LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Tactus.Ref.mk"))),
+        crate::expr_shared::apply_deref_chain(self_var, 2),
+    );
+    Some(LExpr::app1(
+        LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit(&method_qualified))),
+        inner_arg,
+    ))
+}
+
 pub fn trait_impl_to_ast(
     ti: &TraitImplX,
     method_impls: &[&FunctionX],
@@ -1955,6 +2037,19 @@ pub fn trait_impl_to_ast(
                     // type check skips the rewrite and the call stays
                     // as class dispatch. See `rewrite_self_sibling_calls`
                     // docs for the full rationale (Bug B body fix).
+                    // #122 B1: faithful synth for forwarding blanket-impl
+                    // methods (`View for &A`/`Box`/`Rc`/`Arc`, body
+                    // `(**self).view()`). Verus reduces the `**self` deref
+                    // for `&`/Box (literal render works) but leaves the
+                    // smart-pointer spec deref opaque for Rc/Arc, so the
+                    // literal render dispatches `View.view` on `Rc A` =
+                    // the instance itself (circular). The synth reproduces
+                    // `(**self).view()` directly via the prelude wrappers'
+                    // reducible `.deref`. Fires only on the exact
+                    // forwarding shape; everything else falls through.
+                    if let Some(synth) = forwarding_blanket_body(ti, func) {
+                        synth
+                    } else {
                     let self_typ = ti.trait_typ_args.first()
                         .expect("impl's trait_typ_args must include Self");
                     let rewritten = crate::impl_subst::rewrite_self_sibling_calls(
@@ -1967,6 +2062,7 @@ pub fn trait_impl_to_ast(
                         crate::to_lean_expr::vir_expr_to_ast_with_binders(&rewritten, &body_binders, &crate::expr_shared::RenderCtx::empty()),
                         &func.params,
                     )
+                    }
                 }
                 (vir::ast::Mode::Exec, Some(_)) => {
                     // Exec placeholder. `default` produces a value
