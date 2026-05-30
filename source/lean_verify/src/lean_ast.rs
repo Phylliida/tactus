@@ -1702,6 +1702,15 @@ fn subst_remove_binders(
     out
 }
 
+/// The `Var` names `expr` references with no outer binders in scope.
+/// Used by instance emission (`trait_impl_to_ast`) to find which binder
+/// type-params the instance head actually determines (#122 B3).
+pub(crate) fn free_var_names(expr: &Expr) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    collect_free_vars(expr, &std::collections::HashSet::new(), &mut out);
+    out
+}
+
 fn collect_free_vars(
     expr: &Expr,
     bound: &std::collections::HashSet<String>,

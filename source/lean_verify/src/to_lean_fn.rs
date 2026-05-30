@@ -1812,6 +1812,37 @@ pub fn trait_impl_to_ast(
         })
     };
 
+    // #122 B3: drop binders for type-params the instance head doesn't
+    // determine, plus any bound that references such a param. vstd's
+    // `impl<T, A: Allocator> Allocator for Box<T, A>` renders Self as
+    // `Tactus.Box T` — `typ_to_expr` maps the unary prelude wrapper
+    // `Tactus.Box` and erases the allocator arg `A`, so `A` is left
+    // free in the head with `[Allocator A]` unconstrained, and Lean
+    // reports "cannot find synthesization order". An instance binder
+    // not pinned by the head is unsynthesizable regardless; for the
+    // empty marker class `Allocator` dropping it (and its bound) loses
+    // no provable fact. Implicit binders the head determines (the
+    // common case — `View (Tactus.Ref A) _assoc` pins both A and the
+    // assoc V) are untouched, so this is a no-op for every existing
+    // instance.
+    let head_vars = crate::lean_ast::free_var_names(&target);
+    let dropped: std::collections::HashSet<String> = binders.iter()
+        .filter(|b| b.kind == BinderKind::Implicit)
+        .filter_map(|b| b.name.as_ref().map(|n| n.as_str().to_string()))
+        .filter(|name| !head_vars.contains(name))
+        .collect();
+    if !dropped.is_empty() {
+        binders.retain(|b| match b.kind {
+            // Keep a determined type-param binder; drop an undetermined one.
+            BinderKind::Implicit => b.name.as_ref()
+                .map(|n| !dropped.contains(n.as_str())).unwrap_or(true),
+            // Drop a bound that mentions any dropped param.
+            BinderKind::Instance =>
+                crate::lean_ast::free_var_names(&b.ty).is_disjoint(&dropped),
+            _ => true,
+        });
+    }
+
     // Skip body=None methods — they inherit from the class default.
     // Lean's typeclass machinery dispatches to the class default
     // when the instance omits a method. For an empty impl
