@@ -2249,7 +2249,8 @@ These are deferred by design — the current slice is single-crate exec+proof-fn
   - **#125 cross-crate trait method decls** — when the trait method decl's `Fun` isn't in `fn_map` (genuinely cross-crate from a non-vstd-prelude path), `spec_source` returns Err. Currently rare in practice because vstd's traits aren't usually trait_method_impl'd in user crates that Tactus verifies.
   - **Cross-crate Vec (`len` / `push` / `v[i]` read) — LANDED 2026-05-30.** All verify soundly under `use vstd::prelude::*` — including `push` with `&mut` + `old(v)` and indexed reads. The blocker was never `build_wp_call`'s fn_map rejection (`merge_krates` brings referenced vstd exec fns in *with specs*, so they're in `fn_map` and inline); it was the `v@` (`View::view`) dispatch, fixed by four trait-class + instance-emission landings (see § "Cross-crate View blanket-impl emission" below): trait-method call qualification, blanket-impl forwarding (resolved-kind rewrite gate + forwarding-body synth), erased-allocator binder drop, and `has_resolved` as an uninterpreted Prop. Pinned by `test_cross_crate_vec_len` (+ `_wrong_ensures`).
   - **Un-emittable cross-crate trait classes — degrade, don't panic (LANDED 2026-05-30).** A trait whose method decl is stripped cross-crate (e.g. `core::clone::Clone::clone`, dragged in by a `HashMap` bound) can't be rendered as a faithful Lean `class`. `generate.rs` precomputes `unemittable_traits` (any trait with a method absent from the function map) and skips them in both class-emission loops AND the instance gate; code dispatching through them fails gracefully ("tactus_auto failed") instead of panicking in `trait_to_ast`. The panic stays as a same-crate-bug tripwire. Pinned by `test_cross_crate_unemittable_trait_degrades_not_panics`.
-  - **Still deferred: `&mut v[i]` + Map/Set *verification*.** `&mut v[i]` (index mutation) fails with "unresolved references" — `vec_index_mut`'s referenced impl-method standalones aren't dep-walk-emitted (B1-family, bounded). `HashMap`/`HashSet` ops now fail *gracefully* (above) but don't verify — they dispatch through `Clone`/`PartialEq`/`Copy` classes Tactus can't emit cross-crate; verifying them needs a way to model those traits (opaque shells, or routing the Map/Set specs around the bounds) — a genuine feature, larger than the Vec arc.
+  - **Cross-crate broadcast lemmas referencing `BuiltinSpecFun` — skipped (LANDED 2026-05-30).** vstd's FnMut closure axioms (`axiom_fn_mut_call_requires`/`_ensures`), pulled in by default-on-import, reference a `BuiltinSpecFun` (closure `call_requires`/`call_ensures`) which the VIR-AST renderer has no faithful fixed-arity Lean form for (emits an unresolved literal `builtinSpecFun`). `references_builtin_spec_fun` (sst_to_lean.rs) skips such lemmas at collection — same graceful-skip family as the un-emittable-trait / `FiniteFull` filters. Their facts are unavailable (closure-spec reasoning isn't supported), but emission stays clean.
+  - **Still deferred: `&mut v[i]` + Map/Set *verification*.** `&mut v[i]` (index mutation) is **bigger than first scoped** (spiked 2026-05-30): it's a two-link chain. Link 1 (the FnMut `builtinSpecFun` broadcast wall) is cleared by the filter above. Link 2 is the real cost and is NOT bounded — `&mut v[i]` desugars to `let e = vec_index_mut(&mut v, i); bump(e);`, a callee that *returns* a `&mut` whose **prophetic** final value the chained `bump` sets; the verified goal shows `bump`'s mutation never threading into `v`'s post-state. Tactus's new-mut-ref machinery (#107) handles `&mut` *arguments*, not a *returned* `&mut` whose prophecy a later call resolves — a genuine returned-mut-ref-prophecy-composition feature, a fresh arc (NOT B1-family). `HashMap`/`HashSet` ops fail *gracefully* (the un-emittable-trait skip, above) but don't verify — they dispatch through `Clone`/`PartialEq`/`Copy` classes Tactus can't emit cross-crate; verifying them needs a way to model those traits (opaque shells, or routing the Map/Set specs around the bounds) — also larger than the Vec arc.
   - **Dynamic dispatch via `dyn Trait`** — same cross-crate rejection path as #125.
 
   **Broadcast scope** — `collect_broadcast_lemma_funs` (below) handles BOTH default-on-import groups (`broadcast_use_by_default_when_this_crate_is_imported`, e.g. vstd's `group_vstd_default` — the drop-in case) AND fn-body `broadcast use <group>;` (`StmX::Fuel`). Still deferred: **module-level** `broadcast use` (`ModuleX.reveals` — a `broadcast use` at module scope rather than fn-body or default-on-import); needs reading the fn's owning-module reveal list rather than the fn body. Rare for user crates.
@@ -2976,7 +2977,14 @@ dispatched through the `[View A]` bound, *not* a self-recursive call.
   (`self.0.view()`, receiver not the self param), and multi-param methods
   all fall through to literal rendering. So it can't silently rewrite a
   *non*-forwarding blanket (the `test_non_forwarding_blanket_over_ref_probe`
-  concern stays handled by the wrapper types).
+  concern stays handled by the wrapper types). The "receiver arg reads the
+  self param" check (`recv_reads_local`) peels ONLY transparent wrappers
+  (Box/Unbox/CoerceMode/Trigger/CustomErr) — never value-transforming ops
+  (Not/Clip/Field/IsVariant/…) — so a transform between `**self` and
+  `.method()` (`(!**self).view()`) isn't mistaken for a pure forward, the
+  way `expr_to_node` gives transforms explicit arms before its transparent
+  catch-all. (Unreachable today behind the opaque-TypParam gate, but the
+  gate matching its invariant is the point — review-hardened 2026-05-30.)
 
 **3. Undetermined instance binders are dropped.** vstd's `impl<T, A:
 Allocator> Allocator for Box<T, A>` rendered `instance {T} {A} [Allocator
@@ -3011,12 +3019,23 @@ fn_map rejection (`merge_krates` brings referenced vstd exec fns in with
 specs); the wall was the `v@` View dispatch, which the four fixes above
 cleared.
 
-**Still deferred.** `&mut v[i]` (index *mutation*) fails with "unresolved
-references" — `vec_index_mut`'s impl-method standalones aren't
-dep-walk-emitted (B1-family, bounded). Map/Set ops fail *gracefully* (the
-un-emittable-trait skip, above) but don't verify — they dispatch through
-cross-crate `Clone`/`PartialEq`/`Copy` classes Tactus can't emit; verifying
-them is a genuine feature (model those traits) larger than the Vec arc.
+**Still deferred (`&mut v[i]` — bigger than first scoped, spiked
+2026-05-30).** A two-link chain. Link 1 — vstd's FnMut closure axioms
+(`axiom_fn_mut_call_*`), pulled in by default-on-import, reference a
+`BuiltinSpecFun` that renders as an unresolved literal `builtinSpecFun`;
+that's now cleared by `references_builtin_spec_fun` skipping such lemmas
+(same graceful-skip family as the un-emittable-trait filter). Link 2 is
+the real cost and is NOT bounded: `&mut v[i]` desugars to `let e =
+vec_index_mut(&mut v, i); bump(e);` — a callee that *returns* a `&mut`
+whose **prophetic** final value the chained `bump` sets. The verified goal
+shows `bump`'s mutation never threading into `v`'s post-state (the update
+inserts the OLD element value). #107 handles `&mut` *arguments*, not a
+*returned* `&mut` resolved by a later call — returned-mut-ref prophecy
+composition, a fresh new-mut-ref arc (NOT B1-family). Map/Set ops fail
+*gracefully* (the un-emittable-trait skip, above) but don't verify — they
+dispatch through cross-crate `Clone`/`PartialEq`/`Copy` classes Tactus
+can't emit; verifying them is a genuine feature (model those traits)
+larger than the Vec arc.
 
 ### Trait class+instance emission: deferred edges
 
