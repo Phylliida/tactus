@@ -281,12 +281,9 @@ fn krate_preamble(
     // then fails gracefully (unresolved reference → "tactus_auto failed")
     // instead of panicking in `trait_to_ast`. That panic stays as a
     // tripwire for genuine SAME-crate bugs (where every method should be
-    // present). Mirrors `collect_broadcast_lemma_funs`'s `unemittable_traits`
-    // filter for the broadcast path (#122).
-    let unemittable_traits: std::collections::HashSet<vir::ast::Path> = krate.traits.iter()
-        .filter(|tr| tr.x.methods.iter().any(|m| !method_lookup.contains_key(m)))
-        .map(|tr| tr.x.name.clone())
-        .collect();
+    // present). Shared with `collect_broadcast_lemma_funs`'s broadcast-
+    // path filter via `expr_shared::unemittable_traits` (#122).
+    let unemittable_traits = crate::expr_shared::unemittable_traits(krate, &method_lookup);
 
     let instances_to_emit: Vec<(&TraitImpl, Vec<&FunctionX>)> = krate.trait_impls.iter()
         .filter_map(|ti| {
@@ -452,12 +449,18 @@ fn krate_preamble(
                 .unwrap_or(false)
         })
     };
-    for tr in &krate.traits {
-        let n = short_name(&tr.x.name);
-        if !trait_has_proof_method(&tr.x)
-            && !unemittable_traits.contains(&tr.x.name)
+    // Shared emission gate for both class-emission loops (the only
+    // difference between them is the `trait_has_proof_method` polarity +
+    // ordering relative to spec fns). Emit a trait's `class` iff it's
+    // emittable AND something brings it into scope (a typ_bound /
+    // dispatch reference, or an instance of it will emit).
+    let should_emit_class = |tr: &TraitX| -> bool {
+        let n = short_name(&tr.name);
+        !unemittable_traits.contains(&tr.name)
             && (refs.traits.contains(n) || traits_with_emitted_impl.contains(n))
-        {
+    };
+    for tr in &krate.traits {
+        if !trait_has_proof_method(&tr.x) && should_emit_class(&tr.x) {
             cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies)));
         }
     }
@@ -523,11 +526,7 @@ fn krate_preamble(
     // Classes WITH proof-fn methods emit AFTER spec fns (their
     // Prop-typed class fields reference the spec fns in scope).
     for tr in &krate.traits {
-        let n = short_name(&tr.x.name);
-        if trait_has_proof_method(&tr.x)
-            && !unemittable_traits.contains(&tr.x.name)
-            && (refs.traits.contains(n) || traits_with_emitted_impl.contains(n))
-        {
+        if trait_has_proof_method(&tr.x) && should_emit_class(&tr.x) {
             cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies)));
         }
     }
