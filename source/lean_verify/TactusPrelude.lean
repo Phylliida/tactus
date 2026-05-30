@@ -167,6 +167,17 @@ def Tactus.strGetChar (s : String) (i : Int) : Nat :=
 -- vs `s : Seq A`), hence the two type parameters.
 axiom Tactus.heightLt {α : Type u} {β : Type v} (a : α) (b : β) : Prop
 
+-- `has_resolved(x)` — Verus's mutable-reference resolution predicate
+-- (`UnaryOpr::HasResolved`). For `&mut T` it states the prophetic value
+-- equals the current value; for primitives it's trivially true; for
+-- datatypes it's recursive. Tactus doesn't model resolution (it drops
+-- `assume(has_resolved(..))` synthetic statements), so the predicate is
+-- rendered as an uninterpreted Prop rather than collapsed to its bare
+-- argument — leaving its truth abstract keeps cross-crate axioms that
+-- mention it (e.g. vstd's `axiom_vec_has_resolved`) well-typed and sound
+-- (no assumption that it holds or fails). Same pattern as `heightLt`.
+axiom Tactus.hasResolved {α : Type u} (a : α) : Prop
+
 -- `tactus_first | t1 | t2 | …` desugars to `first | (t1; done) |
 -- (t2; done) | …`. Each alternative is required to fully close
 -- the goal — without `done`, a tactic that succeeds while
