@@ -921,15 +921,22 @@ fn call_to_node(target: &CallTarget, args: &Exprs, binders: &BinderCtx, ctx: &cr
     }
 }
 
+/// Render a trait-method call head (`Dynamic` / `DynamicResolved`) so it
+/// matches the emitted class name. The class is `lean_name(&tr.name)` —
+/// the trait's full module-qualified segment path (e.g. vstd's
+/// `view::View` → `view.View`; the crate lives in `PathX::krate`, not in
+/// `segments`, so it's never part of the name). The trait method decl's
+/// `fun.path` extends that with the method segment, so `lean_name(&fun.path)`
+/// yields `view.View.view` — exactly `<class>.<method>`.
+///
+/// An earlier version took only the last two path segments (`View.view`),
+/// which coincided with `lean_name` for crate-root traits but dropped the
+/// module segment for anything nested (`mymod::MyTrait::method` rendered
+/// `MyTrait.method` while the class was `mymod.MyTrait`). Cross-crate vstd
+/// traits live under a module (`view::View`), so last-2 emitted bare
+/// `View.view` against a `view.View` class — unresolved (#122 B2).
 fn trait_method_ref(fun: &Fun) -> LExpr {
-    let segs = &fun.path.segments;
-    if segs.len() >= 2 {
-        let t = sanitize(segs[segs.len() - 2].as_str());
-        let m = sanitize(segs[segs.len() - 1].as_str());
-        var(&format!("{}.{}", t, m))
-    } else {
-        var(&lean_name(&fun.path))
-    }
+    var(&lean_name(&fun.path))
 }
 
 
