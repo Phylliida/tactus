@@ -380,7 +380,19 @@ pub fn order_emission<'a>(
         prereqs[inst].remove(&inst); // never self-depend
     }
 
-    // Kahn's, lowest-id-ready first.
+    kahn_emit(prereqs, n)
+}
+
+/// Kahn's topological sort over a node graph where node ids `0..n_groups`
+/// are spec-fn groups and `n_groups..` are instances. `prereqs[a]` is the
+/// set of nodes that must precede `a`. Ready nodes are emitted
+/// lowest-id-first (the original-position tiebreak), so groups keep their
+/// order and instances stay trailing unless an edge pulls them earlier.
+/// Cycle remnants (no well-formed krate produces them) are appended in id
+/// order so nothing is silently dropped. Pure over the graph — unit-tested
+/// directly without fabricating `FunctionX`.
+fn kahn_emit(prereqs: Vec<HashSet<usize>>, n_groups: usize) -> Vec<EmitStep> {
+    let total = prereqs.len();
     let mut indeg: Vec<usize> = prereqs.iter().map(|p| p.len()).collect();
     let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); total];
     for (a, ps) in prereqs.iter().enumerate() {
@@ -388,7 +400,7 @@ pub fn order_emission<'a>(
     }
     let mut emitted = vec![false; total];
     let mut result = Vec::with_capacity(total);
-    let step = |v: usize| if v < n { EmitStep::Group(v) } else { EmitStep::Instance(v - n) };
+    let step = |v: usize| if v < n_groups { EmitStep::Group(v) } else { EmitStep::Instance(v - n_groups) };
     for _ in 0..total {
         match (0..total).find(|&x| !emitted[x] && indeg[x] == 0) {
             Some(v) => {
@@ -1083,5 +1095,67 @@ mod tests {
     fn order_datatypes_empty_input_returns_empty() {
         let groups = order_datatypes(&[]);
         assert!(groups.is_empty(), "empty input should produce empty output");
+    }
+
+    // ── kahn_emit (spec-fn ↔ instance ordering) ──────────────────────
+    //
+    // Pinned over the pure graph (plain usize prereq sets) rather than
+    // fabricating `FunctionX` bodies — the VIR edge-extraction is covered
+    // e2e by `test_cross_crate_unemittable_trait_degrades_not_panics`.
+
+    /// Render an emit order as ('G'|'I', idx) pairs for assertions.
+    fn tags(order: &[EmitStep]) -> Vec<(char, usize)> {
+        order.iter().map(|s| match s {
+            EmitStep::Group(i) => ('G', *i),
+            EmitStep::Instance(j) => ('I', *j),
+        }).collect()
+    }
+
+    /// Build prereqs for `n` groups + `m` instances from explicit edges,
+    /// pinning the group-order chain (`i` after `i-1`) the same way
+    /// `order_emission` does.
+    fn prereqs(n: usize, m: usize, edges: &[(usize, usize)]) -> Vec<HashSet<usize>> {
+        let mut p = vec![HashSet::new(); n + m];
+        for i in 1..n { p[i].insert(i - 1); }
+        for &(node, before) in edges { p[node].insert(before); }
+        p
+    }
+
+    /// No cross edges: groups stay in order, instances trail by id.
+    #[test]
+    fn kahn_emit_unconstrained_instances_trail() {
+        let order = kahn_emit(prereqs(2, 2, &[]), 2);
+        assert_eq!(tags(&order), vec![('G', 0), ('G', 1), ('I', 0), ('I', 1)]);
+    }
+
+    /// The View shape: group 1 (deep_view) dispatches to instance 0
+    /// (View), which depends on group 0 (its method def). Instance 0 must
+    /// land between group 0 and group 1; instance 1 (DeepView) depends on
+    /// group 1 and trails. Node ids: groups 0,1; instances 2,3.
+    #[test]
+    fn kahn_emit_dispatched_instance_pulled_before_its_group() {
+        // group 1 after instance 0 (node 2); instance 0 (node 2) after group 0;
+        // instance 1 (node 3) after group 1.
+        let order = kahn_emit(prereqs(2, 2, &[(1, 2), (2, 0), (3, 1)]), 2);
+        assert_eq!(tags(&order),
+            vec![('G', 0), ('I', 0), ('G', 1), ('I', 1)],
+            "View pulled between its def-group and its dispatcher; DeepView trails");
+    }
+
+    /// An instance depending on a later group is held until that group.
+    #[test]
+    fn kahn_emit_instance_waits_for_its_dependency() {
+        // instance 0 (node 2) depends on group 1.
+        let order = kahn_emit(prereqs(2, 1, &[(2, 1)]), 2);
+        assert_eq!(tags(&order), vec![('G', 0), ('G', 1), ('I', 0)]);
+    }
+
+    /// A 2-cycle (instance and group each require the other) can't sort;
+    /// remnants append in id order rather than vanish.
+    #[test]
+    fn kahn_emit_cycle_remnants_appended() {
+        // group 0 after instance 0 (node 1), instance 0 after group 0 — cycle.
+        let order = kahn_emit(prereqs(1, 1, &[(0, 1), (1, 0)]), 1);
+        assert_eq!(order.len(), 2, "both nodes still emitted (no silent drop)");
     }
 }
