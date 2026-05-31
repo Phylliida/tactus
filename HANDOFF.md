@@ -14,6 +14,64 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ### Recent session landings
 
+#### Current session (2026-05-30 cont. — deferred-exec probe: returned-mut-ref prophecy scoped + Lean-validated)
+
+**No code landed (460/0 unchanged); deliverable is a fully-scoped,
+de-risked arc + doc.** Asked to probe last session's deferred *exec*
+items (`&mut v[i]`, Map/Set). Probed both via the documented discipline
+(regenerate with `VERUS_KEEP_TEST_DIR=1`, read the generated `.lean`, run
+`lean --json`), then went deeper on the prophecy arc per request.
+
+**`&mut v[i]` — returned-mut-ref prophecy composition (scoped, Lean-validated, SST-confirmed):**
+* **Gap confirmed precisely.** `call_vec_index_mut.lean` elaborates cleanly
+  (the View dispatch works post-2026-05-30) — its *only* failures are 2
+  unsolved goals. vstd's `vec_index_mut` ensures
+  `final(vec)@ == old(vec)@.update(i, *final(element))`, but Tactus renders
+  `*final(element)` as the *current* `old[0]` and `bump`'s `+1` lands on an
+  orphaned fresh existential.
+* **Lean-validated the fix shape (3 standalone theorems, against the real
+  preamble + `seq.axiom_seq_update_same`):** the corrected goal — prophecy
+  var `P` used by vec_index_mut's ensures AND as bump's post-state — closes
+  by `rw [h_ens, hsame, h_bump]`. Sound (wrong `+999` fails; unconstrained
+  `P` leaves `+1` unprovable). Closer caveat: bare `simp_all` does NOT close
+  it (`spec_index`↔`seq.Seq.index` form mismatch); `simp_all [spec_index]` does.
+* **SST confirmed (via `VERUS_EXTRA_ARGS="--log-dir <d> --log vir-sst"`),
+  not inferred:** locals `v`(MutRef Vec,Param) / `tmp%1`(MutRef Vec,BorrowMut)
+  / `tmp%2`(MutRef Int,**TempViaAssign** — the returned ref); body
+  `tmp%2 = vec_index_mut(tmp%1,0); bump(tmp%2)`. Root cause located: the #95
+  mut-ref rewrite collapses both `MutRefCurrent(x)` and `MutRefFinal(x)` to
+  `Var(x)` — fine for `&mut` args, aliases final↔current for the *returned* ref.
+* **Mechanism + estimate + transparency constraints** written to DESIGN.md
+  § "Returned-mut-ref prophecy composition (scoped arc — Lean-validated, NOT
+  landed, 2026-05-30)". Transparency (per Danielle's check): the codegen IS
+  Principle-#1-clean **iff built generally** (any `MutRef`-typed dest, not a
+  `vec_index_mut` sniff) — faithful to Verus's `final()`, `P` visible in the
+  goal, same audited category as #107/#128; and the closer item must be fixed
+  by **rendering consistency, NOT by extending `tactus_auto`'s simp set** (the
+  minimal-automation anti-pattern). ~1–2 focused sessions; #107 sibling.
+
+**Map/Set (HashMap) — bigger than the closer gap I first mis-read.** Full
+`lean --json` on `use_map.lean` shows a multi-bug cross-crate-trait-emission
+cluster: the un-emittable-trait skip removes `Clone`/`PartialEq`/`Copy`/`Eq`
+class *definitions* but leaves dangling *references*
+(`class marker.Copy … [clone.Clone Self]`, axiom binders `[cmp.Eq Q]`), plus
+`view.DeepView` outParam mis-application, `Integer`-as-class, `Hashable…DefaultHasher`
+unknown, and a Box/deref mismatch in `axiom_contains_box`. DESIGN.md Phase-3
+note updated with the enumerated blockers.
+
+**Discipline notes worth recording.**
+* *The "probe don't trust — including my own just-formed read" lesson landed
+  on ME, in real time.* On Map/Set I read the file tail + theorem signature,
+  saw the axioms listed, and confidently called it "just a closer gap." The
+  full `lean --json` came back a wall of unknown-identifier errors. Described
+  the room from the doorway, called it a map. Caught only because I ran the
+  whole file. (Poems: "what I said before I ran it", "two wrong sizes".)
+* *The prophecy probe CONFIRMED my hand-derived shape* (the SST matched
+  `let e = vec_index_mut(...); bump(e)` exactly). The probe's job is to check,
+  not always to surprise — sometimes checking validates. Worth saying plainly
+  alongside the Map/Set over-read: the fear ran small once and large once in
+  the same hour, wrong both times by about the same amount.
+
 #### Current session (2026-05-30 — #122 cross-crate View / exec-callee emission: Vec::len verifies)
 
 **Headline**: 458 → 459 e2e, zero regressions, lib 261/0, vstd unaffected
