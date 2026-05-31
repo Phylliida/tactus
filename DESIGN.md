@@ -2230,11 +2230,11 @@ These are deferred by design — the current slice is single-crate exec+proof-fn
   - **Cross-crate marker traits — shell classes + chokepoint bound-drop (LANDED 2026-05-30, reshaped 2026-05-31).** A trait whose method decl is stripped cross-crate (e.g. `core::clone::Clone`, dragged in by a `HashMap` bound) can't render as a faithful Lean `class`. The 2026-05-30 version *skipped* such traits — but emittable subclasses that bound on them (`marker.Copy : [clone.Clone Self]`) kept dangling superclass binders → a cascade. The 2026-05-31 reshape (#122 RC1): emit them as contentless **marker shells** (drop the stripped methods, keep the header), and drop every bound that *references* a shell trait at the shared `trait_bounds_to_ast_with` chokepoint (a contentless bound loses no provable fact). Shell-trait *instances* are skipped (dead once their bounds are dropped, and they dangle on un-reached traits like `marker.Copy`). The `trait_to_ast` panic stays a same-crate-bug tripwire. Verifies `HashMap::len` + spec/proof fns generic over `<T: Clone>`; Map/Set `contains_key` still degrades gracefully. See § "Cross-crate marker-shell trait emission". Pinned by `test_cross_crate_map_len`, `_spec_fn_clone_bound`, `_proof_fn_clone_bound`, `_unemittable_trait_degrades_not_panics`.
   - **Cross-crate broadcast lemmas referencing `BuiltinSpecFun` — skipped (LANDED 2026-05-30).** vstd's FnMut closure axioms (`axiom_fn_mut_call_requires`/`_ensures`), pulled in by default-on-import, reference a `BuiltinSpecFun` (closure `call_requires`/`call_ensures`) which the VIR-AST renderer has no faithful fixed-arity Lean form for (emits an unresolved literal `builtinSpecFun`). `references_builtin_spec_fun` (sst_to_lean.rs) skips such lemmas at collection — same graceful-skip family as the un-emittable-trait / `FiniteFull` filters. Their facts are unavailable (closure-spec reasoning isn't supported), but emission stays clean.
   - **`&mut v[i]` — LANDED 2026-05-30** via returned-mut-ref prophecy composition (§ "Returned-mut-ref prophecy composition"). Both links cleared: Link 1 (the FnMut `builtinSpecFun` broadcast wall) by the filter above; Link 2 (the returned `&mut`'s prophetic `*final`) by minting a prophecy var `P` at the `vec_index_mut` call and unifying it with the resolving `bump` call. Pinned by `test_exec_call_mut_arg_vec_index` (+ `_wrong_ensures`).
-  - **Map/Set: `len` + `HashSet::contains` verify; `HashMap::contains_key` deferred on RC2 alone (RC4 LANDED 2026-05-31).** `HashMap::len()` verifies (RC1 marker shells + RC3 instance-head opaque-type seeding — both below); `HashSet::contains` verifies (RC4 below). The earlier "dangling references" framing was corrected by a live re-probe: RC1's chokepoint bound-drop dissolved the whole `Clone`/`PartialEq`/`Copy`/`Eq`/`Integer` cascade (it was *bounds* referencing un-emittable traits, not bare references), and RC3 cleared `DefaultHasher`. `HashMap::contains_key` still fails *gracefully*; the residual is now a single map-specific blocker:
+  - **Map/Set: `len` + `HashSet::contains` verify; `HashMap::contains_key` deferred on the deep-view body (RC2 projection mechanism + RC1/RC3/RC4 all LANDED 2026-05-31).** `HashMap::len()` verifies (RC1 marker shells + RC3 instance-head opaque-type seeding — both below); `HashSet::contains` verifies (RC4 below). The earlier "dangling references" framing was corrected by a live re-probe: RC1's chokepoint bound-drop dissolved the whole `Clone`/`PartialEq`/`Copy`/`Eq`/`Integer` cascade (it was *bounds* referencing un-emittable traits, not bare references), and RC3 cleared `DefaultHasher`. `HashMap::contains_key` still fails *gracefully* — its two operation-specific blockers (both since resolved) were:
     - **RC2 — DeepView outParam projection (mechanism LANDED 2026-05-31; see § "Generalized projection-lifting").** `view.DeepView`'s assoc type `V` is an `outParam`, but the standalone spec fn `std_specs.hash.hash_map_deep_view_impl` projected `view.DeepView.V Key` as if `V` were an accessor → "type expected, got". **Landed:** projection-lifting generalized from impl-methods/instance-signatures to *every* generic function, covering signatures, bodies, require/ensure clauses, trait bounds, and broadcast lemmas (with Source-2 coverage) — the entire `view.DeepView.V Key`-as-accessor cascade *and* the `axiom_hashmap_deepview_borrow` broadcast-lemma errors are gone; synthetic assoc binders render implicit so VIR call sites typecheck. **Deferred residual** (now non-projection, inside the `hash_map_deep_view_impl` body): (4) View-instance synthesis — `failed to synthesize View (HashMap …) ?V` in a fully polymorphic context; (5) the body's `Classical.epsilon` needs `[Nonempty Key]`. Map-with-deep-view-specific (HashSet `contains` doesn't hit it — it fully verifies).
     - **RC4 — Box-key cross-crate coercion (LANDED 2026-05-31; see § "Instantiated-param-type call-arg coercion").** Verus's `axiom_contains_box` ensures `contains_borrowed_key(m,k) <==> m.contains_key(Box::new(*k))`. Verus erases `Box::new(*k)` to a bare `*k : Q` at the value level (confirmed by `--log vir-simple`: the surviving VIR arg is `ReadPlace(Local k) : TypParam Q`, no box node), so the key rendered as `k.deref : Q` against `contains_key`'s `K ↦ Box<Q>` key slot. Fix: the call-arg bridge now uses the callee's param type AS INSTANTIATED by the call's typ_args (`K ↦ Box<Q>`), so `coerce_lexpr` inserts the `Q → Box Q` `.mk` wrap, faithfully recovering the erased construction: `contains_key (Box Q) Value m (Tactus.Box.mk k.deref)`. General over any generic call whose param-type-param instantiates to a wrapper (Box/Ref/Rc/Arc/MutRef) — not Box- or contains-specific. Was shared by `contains_key` and `HashSet::contains`; now cleared for both.
 
-    So `HashSet::contains` is fully verified; `HashMap::contains_key` has its RC2 *signature/body* projection errors cleared (via generalized projection-lifting) but still needs the deeper deep-view stack (3)/(4)/(5) above.
+    So `HashSet::contains` is fully verified; `HashMap::contains_key` has *all* its DeepView projection errors cleared (the generalized projection-lifting mechanism is complete — see § "Generalized projection-lifting") and now needs only the two non-projection deep-view-body issues (4)/(5) above.
   - **Dynamic dispatch via `dyn Trait`** — same cross-crate rejection path as #125.
 
   **Broadcast scope** — `collect_broadcast_lemma_funs` (below) handles BOTH default-on-import groups (`broadcast_use_by_default_when_this_crate_is_imported`, e.g. vstd's `group_vstd_default` — the drop-in case) AND fn-body `broadcast use <group>;` (`StmX::Fuel`). Still deferred: **module-level** `broadcast use` (`ModuleX.reveals` — a `broadcast use` at module scope rather than fn-body or default-on-import); needs reading the fn's owning-module reveal list rather than the fn body. Rare for user crates.
@@ -3006,15 +3006,17 @@ cleared.
 **`&mut v[i]` (index *mutation*) — LANDED 2026-05-30** via returned-mut-ref
 prophecy composition; see "Returned-mut-ref prophecy composition" immediately
 below. **Map/Set: `HashMap::len` + `HashSet::contains` verify (2026-05-31);
-`HashMap::contains_key` deferred on RC2 alone.** The 2026-05-30 "multi-bug
+`HashMap::contains_key` deferred on the deep-view body.** The 2026-05-30 "multi-bug
 cluster" framing was largely dissolved by a live re-probe: the
 `Clone`/`PartialEq`/`Copy`/`Eq`/`Integer` errors were *bounds* referencing
 un-emittable traits (not bare references), all cleared by RC1's marker-shell +
 chokepoint bound-drop; `DefaultHasher` cleared by RC3; the Box-key coercion
-cleared by RC4 (§ "Instantiated-param-type call-arg coercion"). The genuine
-residual is now a single map-specific blocker, RC2 (DeepView outParam
-projection) — see § "Cross-crate marker-shell trait emission" and the Phase-3
-Map/Set bullet for the full breakdown.
+cleared by RC4 (§ "Instantiated-param-type call-arg coercion"); and RC2's whole
+DeepView projection cascade cleared by the generalized projection-lift (§
+"Generalized projection-lifting"). The genuine residual is now two *non-projection*
+deep-view-body issues — (4) View-instance synthesis and (5) `Nonempty Key` for
+`Classical.epsilon` — see § "Cross-crate marker-shell trait emission" and the
+Phase-3 Map/Set bullet for the full breakdown.
 
 ### Cross-crate marker-shell trait emission — LANDED 2026-05-31 (#122 RC1/RC3)
 
@@ -3081,9 +3083,11 @@ instances' `trait_typ_args` + assoc-type values.
 graceful Map/Set degradation, no panic), plus unit tests
 `trait_bounds_to_ast_drops_shell_trait_bounds` (chokepoint filter) and
 `collect_referenced_datatypes_honours_extra_seed` (RC3 seed). 468 e2e, 263
-lean_verify lib. Residual for `contains_key` is RC2 (DeepView outParam); RC4
-(Box-key coercion) LANDED 2026-05-31 — see § "Instantiated-param-type call-arg
-coercion" next.
+lean_verify lib (counts as of this section's landing). RC4 (Box-key coercion) and
+RC2 (the whole DeepView projection cascade) both LANDED 2026-05-31 — see §
+"Instantiated-param-type call-arg coercion" and § "Generalized projection-lifting"
+next. `contains_key`'s remaining residual is two non-projection deep-view-body
+issues ((4) View synthesis, (5) `Nonempty Key`).
 
 ### Instantiated-param-type call-arg coercion — LANDED 2026-05-31 (#122 RC4)
 
