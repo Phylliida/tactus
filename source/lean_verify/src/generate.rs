@@ -549,12 +549,25 @@ fn krate_preamble(
     // standalone generic spec fns build their own subst from their own
     // typ_params/bounds (RC2 — e.g. `hash_map_deep_view_impl`). Both are
     // no-ops for fns without projections.
+    // `[Nonempty T]` inference (#122 layer 5): a fn that (transitively)
+    // `choose`s over type-param T renders `Classical.epsilon`, which Lean
+    // requires `[Nonempty T]` for. Computed once over the call graph; the
+    // synthetic bound is appended at augment time so it rides the ordinary
+    // trait-bound rendering and never leaks into class/dep emission.
+    let nonempty_needs = crate::nonempty::compute_nonempty_needs(&all_fns);
+    let add_nonempty = |f: vir::ast::FunctionX, name: &Fun| -> vir::ast::FunctionX {
+        match nonempty_needs.get(name) {
+            Some(idx) => crate::nonempty::add_fn_nonempty_bounds(f, idx),
+            None => f,
+        }
+    };
     let augment = |f: &vir::ast::FunctionX| -> vir::ast::FunctionX {
-        if matches!(f.kind, FunctionKind::TraitMethodImpl { .. }) {
+        let augmented = if matches!(f.kind, FunctionKind::TraitMethodImpl { .. }) {
             crate::impl_subst::maybe_augment_impl_method(f, &impl_substs)
         } else {
             crate::impl_subst::maybe_augment_standalone_fn(f, &trait_lookup)
-        }
+        };
+        add_nonempty(augmented, &f.name)
     };
     // Per-instance / proof-class emit helpers — take `&mut cmds` rather
     // than capturing it, so they coexist with the group-emit borrows.
@@ -566,8 +579,13 @@ fn krate_preamble(
             .collect();
         let empty_subst = crate::impl_subst::ImplSubst::default();
         let subst = impl_substs.get(&ti.x.impl_path).unwrap_or(&empty_subst);
+        // `[Nonempty T]` bounds the instance inherits from its method-impl
+        // fns (e.g. the `DeepView (HashMap …)` instance whose `deep_view`
+        // calls the choosing `hash_map_deep_view_impl`).
+        let ne_bounds = crate::nonempty::instance_nonempty_bounds(
+            &nonempty_needs, method_impls, &ti.x.typ_params);
         cmds.push(Command::Instance(
-            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, tactic_bodies, subst, &unemittable_traits)
+            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, tactic_bodies, subst, &ne_bounds, &unemittable_traits)
         ));
     };
     // Classes WITH proof-fn methods: their Prop-typed fields reference
@@ -676,6 +694,10 @@ fn krate_preamble(
         // generalized projection-lifting as standalone spec fns. No-op for
         // projection-free lemmas (the common case).
         let augmented = crate::impl_subst::maybe_augment_standalone_fn(f, &trait_lookup);
+        // A lemma whose facts dispatch to a `choose`-using fn (e.g.
+        // `axiom_hashmap_deepview_borrow` → `deep_view` → the epsilon in
+        // `hash_map_deep_view_impl`) needs `[Nonempty T]` too.
+        let augmented = add_nonempty(augmented, &f.name);
         cmds.push(to_lean_fn::broadcast_lemma_axiom_cmd(&augmented, &fn_map, &unemittable_traits));
     }
 

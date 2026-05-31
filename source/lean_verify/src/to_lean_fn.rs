@@ -1902,6 +1902,11 @@ pub fn trait_impl_to_ast(
     assoc_types: &[&AssocTypeImplX],
     tactic_bodies: &HashMap<Fun, String>,
     subst: &crate::impl_subst::ImplSubst,
+    // Synthetic `[Nonempty T]` bounds the instance inherits from its
+    // method-impl fns' `choose` usage (#122 layer 5). Merged into the
+    // bound list alongside the impl's own bounds + the subst's fake
+    // bounds, so they render via the same `trait_bounds_to_ast` path.
+    nonempty_bounds: &[GenericBound],
     // Shell trait paths — instance binders that reference one (e.g.
     // `[clone.Clone K]`, `[cmp.PartialEq T T]`) are dropped: a bound on a
     // contentless marker carries no provable fact and would otherwise be
@@ -1935,6 +1940,7 @@ pub fn trait_impl_to_ast(
     // synthesising fake equalities reuses that machinery.
     let augmented_bounds: Vec<GenericBound> = (*ti.typ_bounds).iter().cloned()
         .chain(subst.fake_bounds.iter().cloned())
+        .chain(nonempty_bounds.iter().cloned())
         .collect();
     let augmented_bounds = std::sync::Arc::new(augmented_bounds);
     binders.extend(trait_bounds_to_ast(&augmented_bounds, unemittable));

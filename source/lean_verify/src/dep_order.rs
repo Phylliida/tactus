@@ -613,7 +613,7 @@ fn record(kind: &str) {
 /// When adding a new `ExprX` variant: the match below is exhaustive, so
 /// the compiler will force you to handle it. When doing so, walk **every**
 /// sub-`Expr` and call `walk_place` for every sub-`Place`.
-fn walk_expr<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
+pub(crate) fn walk_expr<'a>(expr: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
     visit(expr);
     record(expr_variant_name(&expr.x));
     match &expr.x {
