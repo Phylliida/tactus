@@ -273,6 +273,139 @@ pub fn order_spec_fns<'a>(
     }).collect()
 }
 
+/// One node in the emission order: a spec-fn `Group` (index into the
+/// caller's `groups`) or a trait `Instance` (index into the caller's
+/// instance list). Returning indices avoids cloning `FnGroup`.
+pub enum EmitStep {
+    Group(usize),
+    Instance(usize),
+}
+
+/// Topologically order spec-fn groups together with trait instances, so
+/// the spec-fn↔instance dependency DAG is respected in one pass:
+///
+/// * a spec-fn BODY that dispatches to an instance (e.g.
+///   `hash_map_deep_view_impl`'s `m@` → `View (HashMap …)`) must follow
+///   that instance — Lean instance resolution only sees earlier decls;
+/// * an instance whose body references a spec-fn def (or dispatches to
+///   another instance) must follow it.
+///
+/// Build the dependency graph, then Kahn's algorithm with an
+/// original-position tiebreak: among ready nodes, emit the lowest id,
+/// where groups own ids `0..n` (their `order_spec_fns` order) and
+/// instances own `n..n+m`. So groups stay in their existing order and an
+/// instance only moves out of the trailing position when an edge forces
+/// it — zero drift for instances nothing dispatches to. The group-order
+/// chain (`i` after `i-1`) pins the spec-fn sequence `order_spec_fns`
+/// already validated; instances slot into the gaps the edges open.
+///
+/// `instances[j] = (impl_path, method_impl_fns)`, index-aligned with the
+/// caller's instance list.
+pub fn order_emission<'a>(
+    groups: &[FnGroup<'a>],
+    instances: &[(&'a Path, Vec<&'a FunctionX>)],
+) -> Vec<EmitStep> {
+    let n = groups.len();
+    let m = instances.len();
+    let total = n + m;
+
+    // fn -> its group node; impl_path -> its instance node.
+    let mut fn_node: HashMap<&Fun, usize> = HashMap::new();
+    for (i, g) in groups.iter().enumerate() {
+        match g {
+            FnGroup::Single(f) => { fn_node.insert(&f.name, i); }
+            FnGroup::Mutual(fs) => { for f in fs { fn_node.insert(&f.name, i); } }
+        }
+    }
+    let mut impl_node: HashMap<&Path, usize> = HashMap::new();
+    for (j, (ip, _)) in instances.iter().enumerate() {
+        impl_node.insert(*ip, n + j);
+    }
+
+    // A trait-method call (`Dynamic` / `DynamicResolved`) carries, in the
+    // `CallTarget::Fun` *call's* `ImplPaths` (4th field — the dispatch
+    // "dictionary"), the impl it resolves through. Map those whose impl is
+    // an emitted instance to that instance node. (NB: the separate
+    // `DynamicResolved.impl_paths` field is the resolved fn's own bound
+    // dictionary and is typically empty here — the call-level field is the
+    // one naming the receiver's instance.)
+    let dispatched_instances = |f: &'a FunctionX, out: &mut HashSet<usize>| {
+        if let Some(body) = &f.body {
+            walk_expr(body, &mut |e| {
+                if let ExprX::Call(CallTarget::Fun(kind, _, _, impl_paths, _, _), _, _) = &e.x {
+                    if matches!(kind,
+                        CallTargetKind::Dynamic | CallTargetKind::DynamicResolved { .. })
+                    {
+                        for ip in impl_paths.iter() {
+                            if let ImplPath::TraitImplPath(p) = ip {
+                                if let Some(&node) = impl_node.get(p) { out.insert(node); }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    };
+
+    // prereqs[a] = nodes that must be emitted before a.
+    let mut prereqs: Vec<HashSet<usize>> = vec![HashSet::new(); total];
+
+    // Pin the spec-fn group sequence.
+    for i in 1..n { prereqs[i].insert(i - 1); }
+
+    // A group follows every instance it dispatches to.
+    for (i, g) in groups.iter().enumerate() {
+        match g {
+            FnGroup::Single(f) => dispatched_instances(f, &mut prereqs[i]),
+            FnGroup::Mutual(fs) => { for f in fs { dispatched_instances(f, &mut prereqs[i]); } }
+        }
+    }
+
+    // An instance follows its method-def groups (its emitted body calls
+    // the standalone defs + whatever those reference) and any instance
+    // it dispatches to.
+    for (j, (_, methods)) in instances.iter().enumerate() {
+        let inst = n + j;
+        for mth in methods {
+            if let Some(&g) = fn_node.get(&mth.name) { prereqs[inst].insert(g); }
+            if let Some(body) = &mth.body {
+                let mut refs = Vec::new();
+                collect_fun_refs(body, &mut refs);
+                for r in &refs {
+                    if let Some(&g) = fn_node.get(r) { prereqs[inst].insert(g); }
+                }
+            }
+            dispatched_instances(mth, &mut prereqs[inst]);
+        }
+        prereqs[inst].remove(&inst); // never self-depend
+    }
+
+    // Kahn's, lowest-id-ready first.
+    let mut indeg: Vec<usize> = prereqs.iter().map(|p| p.len()).collect();
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); total];
+    for (a, ps) in prereqs.iter().enumerate() {
+        for &p in ps { dependents[p].push(a); }
+    }
+    let mut emitted = vec![false; total];
+    let mut result = Vec::with_capacity(total);
+    let step = |v: usize| if v < n { EmitStep::Group(v) } else { EmitStep::Instance(v - n) };
+    for _ in 0..total {
+        match (0..total).find(|&x| !emitted[x] && indeg[x] == 0) {
+            Some(v) => {
+                emitted[v] = true;
+                result.push(step(v));
+                for &d in &dependents[v] { indeg[d] -= 1; }
+            }
+            None => break, // cycle (shouldn't happen for well-formed krates)
+        }
+    }
+    // Append any cycle remnants in id order so nothing is silently dropped.
+    for v in 0..total {
+        if !emitted[v] { result.push(step(v)); }
+    }
+    result
+}
+
 /// Seed a worklist from proof fn requires/ensures.
 fn seed_worklist<'a>(proof_fns: &[&'a FunctionX], worklist: &mut Vec<&'a Fun>) {
     for pf in proof_fns {
