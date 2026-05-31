@@ -76,7 +76,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use vir::ast::{
-    CallTarget, CallTargetKind, Expr, ExprX, Fun, FunX, GenericBound, GenericBoundX, Ident, Idents,
+    CallTarget, CallTargetKind, Expr, ExprX, Exprs, Fun, FunX, GenericBound, GenericBoundX, Ident, Idents,
     GenericBounds, FunctionKind, FunctionX, Param, ParamX, Params, Path, PathX, SpannedTyped, TraitId,
     TraitImplX, TraitX, Typ, TypX, Typs,
 };
@@ -326,7 +326,27 @@ impl ImplSubst {
             });
         }
 
-        // Source 2: uncovered assoc-type slots on bound traits.
+        // Source 2: uncovered assoc-type slots on bound traits. "Uncovered"
+        // is load-bearing: a slot already constrained by an existing
+        // `TypEquality(T, [X, …], N, _)` bound MUST be skipped, or we
+        // synthesise a SECOND fresh binder for the same `<X as T>::N` and
+        // `trait_bounds_to_ast` appends both → an over-arity bracket
+        // (`View Q _ta1 _ta2` for a 2-param class). Surfaced by
+        // `axiom_hashmap_deepview_borrow`, whose `View Q` bound pairs with a
+        // separate `TypEquality(View, [Q], V, <K as DeepView>::V)` already
+        // pinning V. Match by (trait path, the X in slot 0, assoc name).
+        let assoc_already_constrained = |p: &Path, x: &Ident, assoc: &Ident| -> bool {
+            impl_typ_bounds.iter().any(|b| match &**b {
+                GenericBoundX::TypEquality(tp, ts, n, _) => {
+                    **tp == **p
+                        && **n == **assoc
+                        && ts.first().map_or(false, |t| {
+                            matches!(&**t, TypX::TypParam(tx) if **tx == **x)
+                        })
+                }
+                _ => false,
+            })
+        };
         for bound in impl_typ_bounds.iter() {
             if let GenericBoundX::Trait(TraitId::Path(p), bound_typs) = &**bound {
                 let Some(tr) = traits.get(p) else { continue; };
@@ -334,6 +354,7 @@ impl ImplSubst {
                     if let TypX::TypParam(x) = &**bt {
                         if !impl_params.contains(x) { continue; }
                         for assoc_name in tr.assoc_typs.iter() {
+                            if assoc_already_constrained(p, x, assoc_name) { continue; }
                             add_entry(x.clone(), p.clone(), assoc_name.clone(),
                                       bound_typs.clone(), &mut subst);
                         }
@@ -352,6 +373,30 @@ impl ImplSubst {
         rewrite_typ_rec(typ, &self.proj_map)
     }
 
+    /// Rewrite projections embedded in the typs of a single generic bound.
+    /// A bound can carry a projection as a trait type-arg — e.g. the
+    /// `axiom_hashmap_deepview_borrow` lemma's `[View Q <K as DeepView>::V]`
+    /// — which must lift to the fresh binder alongside the signature/body/
+    /// clause projections. Identity when `proj_map` is empty.
+    fn rewrite_bound(&self, bound: &GenericBound) -> GenericBound {
+        let gbx = match &**bound {
+            GenericBoundX::Trait(path, typs) => GenericBoundX::Trait(
+                path.clone(),
+                Arc::new(typs.iter().map(|t| self.rewrite_typ(t)).collect()),
+            ),
+            GenericBoundX::TypEquality(path, typs, name, typ) => GenericBoundX::TypEquality(
+                path.clone(),
+                Arc::new(typs.iter().map(|t| self.rewrite_typ(t)).collect()),
+                name.clone(),
+                self.rewrite_typ(typ),
+            ),
+            GenericBoundX::ConstTyp(t1, t2) => {
+                GenericBoundX::ConstTyp(self.rewrite_typ(t1), self.rewrite_typ(t2))
+            }
+        };
+        Arc::new(gbx)
+    }
+
     /// Clone `f` with extended typ_params (originals + fresh binders),
     /// extended typ_bounds (originals + fake bounds), and rewritten
     /// param/return typs. If `method_context` is set, the body is
@@ -367,7 +412,12 @@ impl ImplSubst {
         let mut typ_params: Vec<Ident> = (*f.typ_params).iter().cloned().collect();
         typ_params.extend(self.fresh_binders.iter().cloned());
 
-        let mut typ_bounds: Vec<GenericBound> = (*f.typ_bounds).iter().cloned().collect();
+        // Rewrite projections in the EXISTING bounds (a bound may carry a
+        // projection as a trait type-arg, e.g. `[View Q <K as DeepView>::V]`),
+        // then append the synthesised fake TypEquality bounds (already in
+        // terms of the fresh binders, so not re-rewritten).
+        let mut typ_bounds: Vec<GenericBound> =
+            f.typ_bounds.iter().map(|b| self.rewrite_bound(b)).collect();
         typ_bounds.extend(self.fake_bounds.iter().cloned());
 
         let ret = {
@@ -413,6 +463,31 @@ impl ImplSubst {
             other => other,
         };
 
+        // Step 3: lift assoc-type projections in the SPEC CLAUSES (require /
+        // ensure / returns). A function's facts that flow to call sites and
+        // theorem goals live here, not in params/ret/body — most visibly a
+        // cross-crate broadcast lemma like `axiom_hashmap_deepview_borrow`,
+        // whose ensure projects `<K as DeepView>::V` (e.g. `contains_key
+        // (DeepView.V K) …`) but whose params/ret carry no projection. No-op
+        // when proj_map is empty (every existing fn's clauses unchanged).
+        let (require, ensure, returns) = if self.proj_map.is_empty() {
+            (f.require.clone(), f.ensure.clone(), f.returns.clone())
+        } else {
+            let rw = |e: &Expr| -> Expr {
+                vir::ast_visitor::map_expr_typ_visitor(e, &|t| {
+                    Ok(rewrite_typ_rec(t, &self.proj_map))
+                })
+                .expect("map_expr_typ_visitor: projection rewrite is total")
+            };
+            let require: Exprs = Arc::new(f.require.iter().map(|e| rw(e)).collect());
+            let ensure: (Exprs, Exprs) = (
+                Arc::new(f.ensure.0.iter().map(|e| rw(e)).collect()),
+                Arc::new(f.ensure.1.iter().map(|e| rw(e)).collect()),
+            );
+            let returns = f.returns.as_ref().map(|e| rw(e));
+            (require, ensure, returns)
+        };
+
         // Rename the function's `name` when the impl-method natural
         // name prefix is set. The renamed `Fun` is consistent with
         // sibling-call references in the body (which use
@@ -431,6 +506,9 @@ impl ImplSubst {
             typ_bounds: Arc::new(typ_bounds),
             ret,
             params: Arc::new(params) as Params,
+            require,
+            ensure,
+            returns,
             body,
             ..f.clone()
         }

@@ -11659,17 +11659,15 @@ test_verify_one_file! {
 }
 
 // Graceful degradation on `HashMap::contains_key`. RC1 (marker shells),
-// RC3 (DefaultHasher), and RC4 (Box-key coercion) are landed; the RC2
-// projection-lift now fixes the DeepView outParam *signature/body* errors
-// on `hash_map_deep_view_impl` (the `view.DeepView.V Key`-as-accessor
-// cascade is gone). What remains is a deeper deep-view-specific stack the
-// projection errors were masking, probed 2026-05-31 (`lean --json`):
-//   (3) the broadcast lemma `axiom_hashmap_deepview_borrow` carries the
-//       same projections in its ENSURE clause (not params/ret/body), which
-//       `augment_function` doesn't yet rewrite;
-//   (4) View-instance synthesis inside the deep_view body —
-//       `failed to synthesize View (HashMap …) ?V` in a fully polymorphic
-//       context;
+// RC3 (DefaultHasher), RC4 (Box-key coercion), and the generalized
+// projection-lift (RC2 — now covering signatures, bodies, require/ensure
+// clauses, trait bounds, and broadcast lemmas, with Source-2 coverage) are
+// all landed: the entire `view.DeepView.V Key`-as-accessor cascade and the
+// `axiom_hashmap_deepview_borrow` broadcast-lemma errors are GONE. What
+// remains (probed 2026-05-31, `lean --json`) is two semantic issues inside
+// the `hash_map_deep_view_impl` BODY, separate from projection-lifting:
+//   (4) View-instance synthesis — `failed to synthesize View (HashMap …) ?V`
+//       in a fully polymorphic context (the body's `View.view (Ref.mk m)`);
 //   (5) `Classical.epsilon` in the body needs `[Nonempty Key]`.
 // Until those land `contains_key` must still fail GRACEFULLY (Lean ran,
 // `tactus_auto failed`) rather than panic in `trait_to_ast`. (`HashSet::
