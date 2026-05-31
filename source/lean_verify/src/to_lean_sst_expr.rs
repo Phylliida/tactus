@@ -740,7 +740,7 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
         // : Int`, not a function). Bug D-remaining pin: vstd's
         // `old(vec)@` shape and any trait-method spec ref inside
         // a `&mut` callee's pre/post.
-        ExpX::Call(CallFun::Fun(fun, Some(_)), _typs, args) => {
+        ExpX::Call(CallFun::Fun(fun, Some(_)), typs, args) => {
             let head = LExpr::var(crate::lean_name::LeanName::from_path(&fun.path));
             // Wrapper-arch coercion (RenderCtx Option 1 Phase 1):
             // look up the trait method decl's declared param typs.
@@ -755,7 +755,7 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
             // ctx is empty), we fall back to no-coerce — same as the
             // pre-RenderCtx behavior. Tests for the cross-crate path
             // still work via the existing fallback.
-            let expected_typs = ctx.fn_param_typs(fun);
+            let expected_typs = ctx.fn_param_typs(fun, &typs[..]);
             let app_args: Result<Vec<LExpr>, String> = args.iter().enumerate().map(|(i, a)| {
                 let arg = sst_exp_to_ast_checked_with_ctx(a, ctx)?;
                 // Apply coercion when we have expected typs AND the
@@ -813,7 +813,7 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
             // `.deref` peels structurally. When fn_param_typs returns
             // None (cross-crate callee not in fn_map), falls back to
             // no-coerce.
-            let expected_typs = ctx.fn_param_typs(fun);
+            let expected_typs = ctx.fn_param_typs(fun, &typs[..]);
             let rendered_args: Result<Vec<LExpr>, String> = args.iter().enumerate().map(|(i, a)| {
                 let arg = sst_exp_to_ast_checked_with_ctx(a, ctx)?;
                 Ok(match &expected_typs {

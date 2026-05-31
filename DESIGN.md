@@ -2230,11 +2230,11 @@ These are deferred by design — the current slice is single-crate exec+proof-fn
   - **Cross-crate marker traits — shell classes + chokepoint bound-drop (LANDED 2026-05-30, reshaped 2026-05-31).** A trait whose method decl is stripped cross-crate (e.g. `core::clone::Clone`, dragged in by a `HashMap` bound) can't render as a faithful Lean `class`. The 2026-05-30 version *skipped* such traits — but emittable subclasses that bound on them (`marker.Copy : [clone.Clone Self]`) kept dangling superclass binders → a cascade. The 2026-05-31 reshape (#122 RC1): emit them as contentless **marker shells** (drop the stripped methods, keep the header), and drop every bound that *references* a shell trait at the shared `trait_bounds_to_ast_with` chokepoint (a contentless bound loses no provable fact). Shell-trait *instances* are skipped (dead once their bounds are dropped, and they dangle on un-reached traits like `marker.Copy`). The `trait_to_ast` panic stays a same-crate-bug tripwire. Verifies `HashMap::len` + spec/proof fns generic over `<T: Clone>`; Map/Set `contains_key` still degrades gracefully. See § "Cross-crate marker-shell trait emission". Pinned by `test_cross_crate_map_len`, `_spec_fn_clone_bound`, `_proof_fn_clone_bound`, `_unemittable_trait_degrades_not_panics`.
   - **Cross-crate broadcast lemmas referencing `BuiltinSpecFun` — skipped (LANDED 2026-05-30).** vstd's FnMut closure axioms (`axiom_fn_mut_call_requires`/`_ensures`), pulled in by default-on-import, reference a `BuiltinSpecFun` (closure `call_requires`/`call_ensures`) which the VIR-AST renderer has no faithful fixed-arity Lean form for (emits an unresolved literal `builtinSpecFun`). `references_builtin_spec_fun` (sst_to_lean.rs) skips such lemmas at collection — same graceful-skip family as the un-emittable-trait / `FiniteFull` filters. Their facts are unavailable (closure-spec reasoning isn't supported), but emission stays clean.
   - **`&mut v[i]` — LANDED 2026-05-30** via returned-mut-ref prophecy composition (§ "Returned-mut-ref prophecy composition"). Both links cleared: Link 1 (the FnMut `builtinSpecFun` broadcast wall) by the filter above; Link 2 (the returned `&mut`'s prophetic `*final`) by minting a prophecy var `P` at the `vec_index_mut` call and unifying it with the resolving `bump` call. Pinned by `test_exec_call_mut_arg_vec_index` (+ `_wrong_ensures`).
-  - **Map/Set: `len` verifies; `contains`/`contains_key` deferred on RC2 + RC4 (2026-05-31).** `HashMap::len()` verifies end-to-end (RC1 marker shells + RC3 instance-head opaque-type seeding — both below). The earlier "dangling references" framing was corrected by a live re-probe: RC1's chokepoint bound-drop dissolved the whole `Clone`/`PartialEq`/`Copy`/`Eq`/`Integer` cascade (it was *bounds* referencing un-emittable traits, not bare references), and RC3 cleared `DefaultHasher`. `contains_key` / `HashSet::contains` still fail *gracefully*; the residual is two operation-specific blockers:
-    - **RC2 — DeepView outParam projection.** `view.DeepView`'s assoc type `V` is an `outParam`, but `std_specs.hash.hash_map_deep_view_impl` projects `view.DeepView.V Key` as if `V` were an accessor → "type expected, got". Bug-B-shaped — extend `impl_subst`'s assoc-type-projection handling (fresh `_tactus_assoc_X_V` binder + fake TypEquality) from instance *signatures* to this standalone *def*. Map-with-deep-view-specific (HashSet `contains` doesn't hit it).
-    - **RC4 — Box-key cross-crate coercion.** Verus's `axiom_contains_box` ensures `contains_borrowed_key(m,k) <==> m.contains_key(Box::new(*k))`. Verus treats `Box::new` as spec-transparent, so the VIR key arg is a bare `Q`-typed value, but `contains_key`'s key param is `Box<Q>` → "Application type mismatch: k.deref" (the wrapper-faithfulness seam — Verus collapses Box at the value level, Tactus keeps `Tactus.Box Q` distinct). Fix needs typ-arg substitution into the callee's generic param types (`K ↦ Box<Q>`) then a `Q → Box Q` bridge — the same machinery family as the Cluster A/B typed-substitution work. Shared by both `contains_key` and `HashSet::contains`.
-    
-    So `HashSet::contains` needs RC4 only (no DeepView); `HashMap::contains_key` needs RC2 + RC4. Each is its own focused arc (RC2 bigger than RC4); larger than the Vec arc but each has a precedent.
+  - **Map/Set: `len` + `HashSet::contains` verify; `HashMap::contains_key` deferred on RC2 alone (RC4 LANDED 2026-05-31).** `HashMap::len()` verifies (RC1 marker shells + RC3 instance-head opaque-type seeding — both below); `HashSet::contains` verifies (RC4 below). The earlier "dangling references" framing was corrected by a live re-probe: RC1's chokepoint bound-drop dissolved the whole `Clone`/`PartialEq`/`Copy`/`Eq`/`Integer` cascade (it was *bounds* referencing un-emittable traits, not bare references), and RC3 cleared `DefaultHasher`. `HashMap::contains_key` still fails *gracefully*; the residual is now a single map-specific blocker:
+    - **RC2 — DeepView outParam projection (still open).** `view.DeepView`'s assoc type `V` is an `outParam`, but `std_specs.hash.hash_map_deep_view_impl` projects `view.DeepView.V Key` as if `V` were an accessor → "type expected, got". Bug-B-shaped — extend `impl_subst`'s assoc-type-projection handling (fresh `_tactus_assoc_X_V` binder + fake TypEquality) from instance *signatures* to this standalone *def*; the def's body also has projection-typed lambda binders (`fun (k : view.DeepView.V Key) => …`), so the body's embedded Typs need the same rewrite too — the one piece beyond `impl_subst`'s current signature-only scope. Map-with-deep-view-specific (HashSet `contains` doesn't hit it).
+    - **RC4 — Box-key cross-crate coercion (LANDED 2026-05-31; see § "Instantiated-param-type call-arg coercion").** Verus's `axiom_contains_box` ensures `contains_borrowed_key(m,k) <==> m.contains_key(Box::new(*k))`. Verus erases `Box::new(*k)` to a bare `*k : Q` at the value level (confirmed by `--log vir-simple`: the surviving VIR arg is `ReadPlace(Local k) : TypParam Q`, no box node), so the key rendered as `k.deref : Q` against `contains_key`'s `K ↦ Box<Q>` key slot. Fix: the call-arg bridge now uses the callee's param type AS INSTANTIATED by the call's typ_args (`K ↦ Box<Q>`), so `coerce_lexpr` inserts the `Q → Box Q` `.mk` wrap, faithfully recovering the erased construction: `contains_key (Box Q) Value m (Tactus.Box.mk k.deref)`. General over any generic call whose param-type-param instantiates to a wrapper (Box/Ref/Rc/Arc/MutRef) — not Box- or contains-specific. Was shared by `contains_key` and `HashSet::contains`; now cleared for both.
+
+    So `HashMap::contains_key` needs only RC2 (DeepView) now that RC4 has landed; `HashSet::contains` is fully verified.
   - **Dynamic dispatch via `dyn Trait`** — same cross-crate rejection path as #125.
 
   **Broadcast scope** — `collect_broadcast_lemma_funs` (below) handles BOTH default-on-import groups (`broadcast_use_by_default_when_this_crate_is_imported`, e.g. vstd's `group_vstd_default` — the drop-in case) AND fn-body `broadcast use <group>;` (`StmX::Fuel`). Still deferred: **module-level** `broadcast use` (`ModuleX.reveals` — a `broadcast use` at module scope rather than fn-body or default-on-import); needs reading the fn's owning-module reveal list rather than the fn body. Rare for user crates.
@@ -3005,14 +3005,15 @@ cleared.
 
 **`&mut v[i]` (index *mutation*) — LANDED 2026-05-30** via returned-mut-ref
 prophecy composition; see "Returned-mut-ref prophecy composition" immediately
-below. **Map/Set: `HashMap::len` verifies (2026-05-31); `contains` deferred
-on RC2 + RC4.** The 2026-05-30 "multi-bug cluster" framing was largely
-dissolved by a live re-probe: the `Clone`/`PartialEq`/`Copy`/`Eq`/`Integer`
-errors were *bounds* referencing un-emittable traits (not bare references),
-all cleared by RC1's marker-shell + chokepoint bound-drop; `DefaultHasher`
-cleared by RC3. The genuine residual is two operation-specific blockers,
-RC2 (DeepView outParam projection) and RC4 (the Box-key wrapper-faithfulness
-coercion) — see § "Cross-crate marker-shell trait emission" and the Phase-3
+below. **Map/Set: `HashMap::len` + `HashSet::contains` verify (2026-05-31);
+`HashMap::contains_key` deferred on RC2 alone.** The 2026-05-30 "multi-bug
+cluster" framing was largely dissolved by a live re-probe: the
+`Clone`/`PartialEq`/`Copy`/`Eq`/`Integer` errors were *bounds* referencing
+un-emittable traits (not bare references), all cleared by RC1's marker-shell +
+chokepoint bound-drop; `DefaultHasher` cleared by RC3; the Box-key coercion
+cleared by RC4 (§ "Instantiated-param-type call-arg coercion"). The genuine
+residual is now a single map-specific blocker, RC2 (DeepView outParam
+projection) — see § "Cross-crate marker-shell trait emission" and the Phase-3
 Map/Set bullet for the full breakdown.
 
 ### Cross-crate marker-shell trait emission — LANDED 2026-05-31 (#122 RC1/RC3)
@@ -3080,8 +3081,76 @@ instances' `trait_typ_args` + assoc-type values.
 graceful Map/Set degradation, no panic), plus unit tests
 `trait_bounds_to_ast_drops_shell_trait_bounds` (chokepoint filter) and
 `collect_referenced_datatypes_honours_extra_seed` (RC3 seed). 468 e2e, 263
-lean_verify lib. Residual for `contains`/`contains_key` is RC2 (DeepView
-outParam) + RC4 (Box-key coercion) — see the Phase-3 Map/Set bullet.
+lean_verify lib. Residual for `contains_key` is RC2 (DeepView outParam); RC4
+(Box-key coercion) LANDED 2026-05-31 — see § "Instantiated-param-type call-arg
+coercion" next.
+
+### Instantiated-param-type call-arg coercion — LANDED 2026-05-31 (#122 RC4)
+
+Brings the first cross-crate `HashSet::contains` to verification, and removes
+the Box-key blocker from `HashMap::contains_key` (leaving RC2 as its sole
+residual). The faithfulness seam: vstd's `axiom_set_contains_box` /
+`axiom_contains_box` ensure `…borrowed_key(m,k) <==> m.contains(Box::new(*k))`,
+and **Verus erases `Box::new(*k)` to a bare `*k : Q` at the value level**
+(confirmed via `--log vir-simple`: the surviving VIR arg is `ReadPlace(Local k)
+: TypParam Q` — no box-construction node at all, the construction is gone before
+Tactus sees anything). Tactus keeps `Tactus.Box Q` distinct at the type level
+(the wrapper-faithfulness commitment), so the bare `k.deref : Q` landed in a
+`Box Q` key slot → "Application type mismatch".
+
+**The fix completes the existing call-arg bridge rather than special-casing.**
+The bridge already coerces each call arg to the callee's expected param type via
+`coerce_lexpr` (the "auto-borrow analog", DESIGN § "Upstream-robustness
+patterns"). The gap: `RenderCtx::fn_param_typs` returned the callee's *declared*
+param types — for a generic callee whose key param is the type-param `K`, that's
+the abstract `TypParam(K)`, and `coerce_lexpr(Q → K)` no-ops. Now `fn_param_typs`
+takes the call's `typ_args` and returns the param types **as instantiated**
+(`{callee.typ_params[i] ↦ typ_args[i]}` via `vir::sst_util::subst_typ`), so the
+target becomes the concrete `Box<Q>` and `coerce_lexpr` inserts the `Q → Box Q`
+`.mk` wrap. Generated: `set.Set.contains (Box Q) m (Tactus.Box.mk k.deref)` —
+the box construction `Box::new(*k)` recovered faithfully and visibly at exactly
+the spot the source wrote it.
+
+**Transparency (evaluated before building, at Danielle's gate).** The `.mk` is
+*faithful reconstruction* of an erased construction, *type-determined* (the
+call's own explicit typ_arg says `K = Box<Q>` — not a heuristic guess),
+*visible* in the goal (where it was a `sorry`), and *conservative*: `coerce_lexpr`
+is wrapper-only, so it can never mask an inner-type mismatch — only insert the
+faithful wrapper stairs. No trust extension (the box wrappers stay opaque axioms;
+no `Box.deref (Box.mk x) = x` axiom, no closer simp-set addition — the broadcast
+axiom and the user goal both carry `Box.mk (…)` in the same form, so `simp_all`
+matches because the forms genuinely agree). Same audited category as the existing
+auto-borrow bridge / U2 / typed substitution.
+
+**Generality + safety.** This is a strict refinement of the bridge:
+* Applied at **every** bridge site — `to_lean_expr::call_to_node` (Static),
+  `expr_to_node`'s class-method arm (Dynamic/DynamicResolved), and both SST-side
+  `CallFun::Fun` arms — so it's correct in exec code, proof fns, and broadcast
+  lemmas uniformly.
+* Plus `to_lean_fn::proof_fn_signature` now renders req/ensure with the fn_map
+  in scope (`RenderCtx::with_fn_map(fn_map)` instead of `::empty()`) — without it
+  `fn_param_typs` returns None and the bridge is a no-op, which is why the
+  broadcast-lemma axioms (rendered through this path) never got the coercion
+  pre-fix. (`FnMap` and `RenderFnMap` are the same `HashMap<&Fun, &FunctionX>`.)
+* Substitution fires **only** when `typ_args.len() == typ_params.len()` (the
+  unambiguous positional alignment Verus's lowering produces — the same the
+  explicit-type-args head application already relies on). On mismatch or empty
+  typ_args (non-generic call) it falls through to declared types → zero behaviour
+  change for concrete-param calls, and no risk of misaligning a substitution.
+* `coerce_lexpr` only acts on wrapper-depth mismatches, so even for a
+  hypothetical misaligned-but-equal-arity case the worst outcome is a wrapper
+  bridge Lean would then reject — never a silently-wrong inner type.
+
+**Pinned by** `test_cross_crate_set_contains` (Ok — the RC4 win; box coercion
+renders `Tactus.Box.mk k.deref`) and `test_cross_crate_unemittable_trait_degrades_not_panics`
+(still Err — `contains_key` now fails only on RC2/DeepView, the RC4 Box-key error
+gone). 469 e2e, 263 lean_verify lib, 0 regressions across the full suite (the
+`with_fn_map` threading touches all proof fns + broadcast lemmas; all green),
+vstd 1530/0. **Known gap (cheap follow-up):** no isolated unit test on
+`fn_param_typs`'s instantiation + arity-guard — fabricating a 26-field synthetic
+`FunctionX` was judged not worth it against the faithful e2e guard; a unit test
+would pin the arity-guard fallback (the bug class) directly if a contributor ever
+drops the guard.
 
 ### Returned-mut-ref prophecy composition — LANDED 2026-05-30
 

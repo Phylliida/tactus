@@ -244,13 +244,22 @@ fn proof_fn_signature(
 ) -> (Vec<LBinder>, LExpr) {
     let mut binders = fn_binders(f, unemittable);
     let binder_ctx = crate::to_lean_expr::binder_ctx_from_params(&f.params);
+    // Render with the fn_map in scope so the call-arg bridge can look up
+    // each callee's param types (instantiated with the call's typ_args)
+    // and coerce — e.g. recovering `Box::new(*k)` (erased by Verus to a
+    // bare `*k : Q`) as `Tactus.Box.mk k.deref` when the callee's key
+    // param instantiates to `Box<Q>`. Without the fn_map, `fn_param_typs`
+    // returns None and the bridge is a no-op (the pre-fix behaviour, which
+    // left a raw `k.deref : Q` in a `Box Q` slot). `FnMap` and
+    // `RenderFnMap` are the same `HashMap<&Fun, &FunctionX>` type.
+    let render_ctx = crate::expr_shared::RenderCtx::with_fn_map(fn_map);
     for (i, req) in f.require.iter().enumerate() {
         // Insert Int.toNat coercions at Call sites where needed.
         let coerced = crate::sst_to_lean::insert_nat_coercions_in_expr(req, fn_map);
         // Wrap with `let p := p.deref` for ref-decorated params so the
         // hypothesis body sees inner types.
         let req_ty = wrap_body_with_param_derefs(
-            crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx, &crate::expr_shared::RenderCtx::empty()),
+            crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx, &render_ctx),
             &f.params);
         binders.push(LBinder {
             name: Some(crate::lean_name::LeanName::synthetic(format!("h{}", i))),
@@ -260,7 +269,7 @@ fn proof_fn_signature(
     }
     let goal_raw = and_all(f.ensure.0.iter().map(|e| {
         let coerced = crate::sst_to_lean::insert_nat_coercions_in_expr(e, fn_map);
-        crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx, &crate::expr_shared::RenderCtx::empty())
+        crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx, &render_ctx)
     }).collect());
     let goal = wrap_body_with_param_derefs(goal_raw, &f.params);
     (binders, goal)

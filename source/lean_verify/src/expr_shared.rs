@@ -176,10 +176,45 @@ impl<'a> RenderCtx<'a> {
     /// implicitly. For trait-resolved calls the decl's typs are what
     /// the class signature uses (the resolved impl might have textually-
     /// different param names but positionally-aligned typs).
-    pub fn fn_param_typs(&self, fun: &Fun) -> Option<Vec<Typ>> {
+    ///
+    /// **Param types are returned AS INSTANTIATED at this call site.**
+    /// `typ_args` is the call's type-argument list (positional, matching
+    /// the callee's `typ_params`). We substitute it into each declared
+    /// param type, so a param typed `K` (a type-param) becomes its actual
+    /// instantiation — e.g. `Box<Q>` when the call passes `K ↦ Box<Q>`.
+    /// This is what lets the call-arg bridge coerce `Q → Box Q` (recovering
+    /// the wrapper construction Verus erases at the value level — `Box::new`
+    /// in spec position collapses to a bare `*k : Q` in VIR, so the only
+    /// surviving signal that a box belongs there is the instantiated param
+    /// type). Without the substitution the target would be the abstract
+    /// `TypParam(K)` and `coerce_lexpr` could not bridge.
+    ///
+    /// Substitution fires only when `typ_args.len() == typ_params.len()`
+    /// (the unambiguous positional case Verus's call lowering produces —
+    /// the same alignment the explicit-type-args head application already
+    /// relies on). On any mismatch — or empty `typ_args` (non-generic
+    /// call) — it falls through to the declared types, so this is a strict
+    /// refinement: zero behaviour change for concrete-param calls, and no
+    /// risk of misaligning a substitution.
+    pub fn fn_param_typs(&self, fun: &Fun, typ_args: &[Typ]) -> Option<Vec<Typ>> {
         let fn_map = self.fn_map?;
         let func = fn_map.get(fun)?;
-        Some(func.params.iter().map(|p| p.x.typ.clone()).collect())
+        if !typ_args.is_empty() && typ_args.len() == func.typ_params.len() {
+            let typ_substs: HashMap<Ident, Typ> = func
+                .typ_params
+                .iter()
+                .cloned()
+                .zip(typ_args.iter().cloned())
+                .collect();
+            Some(
+                func.params
+                    .iter()
+                    .map(|p| vir::sst_util::subst_typ(&typ_substs, &p.x.typ))
+                    .collect(),
+            )
+        } else {
+            Some(func.params.iter().map(|p| p.x.typ.clone()).collect())
+        }
     }
 
     /// Look up a Var name in the render-time substitution map and,

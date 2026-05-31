@@ -467,8 +467,8 @@ fn expr_to_node(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::Rend
                 CallTarget::Fun(CallTargetKind::DynamicResolved { .. }, _, _, _, _, _)
                 | CallTarget::Fun(CallTargetKind::Dynamic, _, _, _, _, _));
             if is_class_method {
-                let fun_for_lookup = match target {
-                    CallTarget::Fun(_, fun, _, _, _, _) => fun,
+                let (fun_for_lookup, typ_args) = match target {
+                    CallTarget::Fun(_, fun, typs, _, _, _) => (fun, typs),
                     _ => unreachable!("guarded by is_class_method"),
                 };
                 let head = trait_method_ref(fun_for_lookup);
@@ -486,7 +486,7 @@ fn expr_to_node(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::Rend
                 // typing-mismatched value benefit when ctx has fn_map;
                 // non-inlining proof fns produce correct shapes either
                 // way (binder_ctx + lift handles them).
-                let expected_typs = ctx.fn_param_typs(fun_for_lookup);
+                let expected_typs = ctx.fn_param_typs(fun_for_lookup, &typ_args[..]);
                 // Wrapper coercion from a.typ to expected — handles
                 // proof fn cases where binder_ctx + lift produces
                 // arg matching a.typ. Inlining contexts (where
@@ -858,8 +858,8 @@ fn call_to_node(target: &CallTarget, args: &Exprs, binders: &BinderCtx, ctx: &cr
     // Extract the callee Fun (for fn_param_typs lookup) when the target
     // is a CallTarget::Fun. FnSpec and BuiltinSpecFun don't have a Fun
     // in fn_map; args render without the bridge for those.
-    let fun_for_lookup: Option<&Fun> = match target {
-        CallTarget::Fun(_, fun, _, _, _, _) => Some(fun),
+    let fun_for_lookup: Option<(&Fun, &Typs)> = match target {
+        CallTarget::Fun(_, fun, typs, _, _, _) => Some((fun, typs)),
         _ => None,
     };
     let head = match target {
@@ -916,7 +916,7 @@ fn call_to_node(target: &CallTarget, args: &Exprs, binders: &BinderCtx, ctx: &cr
         // `.deref` peels structurally. When fn_param_typs returns
         // None (cross-crate callee not in fn_map, or FnSpec/
         // BuiltinSpecFun target), falls back to no-coerce.
-        let expected_typs = fun_for_lookup.and_then(|f| ctx.fn_param_typs(f));
+        let expected_typs = fun_for_lookup.and_then(|(f, typs)| ctx.fn_param_typs(f, &typs[..]));
         ExprNode::App {
             head: Box::new(head),
             args: args.iter().enumerate().map(|(i, a)| {
