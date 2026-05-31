@@ -211,6 +211,20 @@ fn structural_typ(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::Re
                 None
             }
         }
+        // A `Call` renders as a naked `head args` application — the
+        // call renderer materializes NO wrapper decorations, so the
+        // rendered value sits at the callee's (bare) return typ, not at
+        // `expr.typ`. When `expr.typ` carries OUTER ref decorations (an
+        // auto-`&` on a method receiver, e.g. `(self@[k]).deep_view()`
+        // borrows the index result), those decorations are absent from
+        // the rendered value — so report the stripped typ and let
+        // `apply_ref_coercion_if_needed` bridge bare → `expr.typ` with a
+        // `.mk` chain, exactly as it does for a `ReadPlace`/`Var` receiver.
+        // For the common undecorated call (`expr.typ` already bare) the
+        // strip is a no-op and the coercion no-ops too — zero change.
+        // Relies on spec-fn returns being bare value typs; a decorated
+        // return would over-strip and surface as a LOUD Lean type error.
+        ExprX::Call(..) => Some(strip_all_ref_decorations(&expr.typ)),
         // Pass-through expressions: natural typ is the inner's.
         ExprX::Loc(inner) | ExprX::Ghost { expr: inner, .. }
         | ExprX::ProofInSpec(inner) => structural_typ(inner, binders, ctx),
