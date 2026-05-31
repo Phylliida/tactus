@@ -10091,19 +10091,21 @@ test_verify_one_file! {
 //      ∀-bound post value is being aliased with the caller's pre
 //      value in one of the inlined positions.
 //
-// **Catalogue corrections to make** (separate from this probe):
-//   - DESIGN.md and HANDOFF.md claim `&mut v[i]` needs "a different
-//     rebind encoding (Lean's `Array.set` or `Vector.set` style + a
-//     'this index unchanged for j ≠ i' property)." That's wrong:
-//     Verus's `vec_index_mut` wrap captures it via `Seq.update`
-//     already, and the ∀-path treats the post-Vec as an existential.
-//   - The real blocker isn't #106 (&mut shape) at all; it's a
-//     cross-crate trait+instance emission bug under #122.
-//
-// Pinned as Err pending fixes (A) and (B). When both fixed this
-// flips to Ok.
+// LANDED 2026-05-30 (returned-mut-ref prophecy composition). The
+// 2026-05-17 probe's two named blockers both resolved: the cross-crate
+// `View` trait+instance emission bug (A) was fixed by the 2026-05-30 View
+// landings; the "substitution aliases final(vec) with old(vec)" symptom
+// (B) was the deeper gap — `*final(element)` (the RETURNED &mut's
+// prophecy) collapsed to the current value because the #95 mut-ref
+// rewrite aliases `MutRefFinal`/`MutRefCurrent`. The fix mints a prophecy
+// var `P` at the MutRef-returning call, renders `*final(element)` AS `P`
+// in `vec_index_mut`'s ensures, and reuses `P` as the resolving `bump`
+// call's post-state (instead of a fresh existential) — so the `+1`
+// threads through. See DESIGN § "Returned-mut-ref prophecy composition".
+// The earlier "different rebind encoding (Vector.set + index-unchanged)"
+// catalogue claim was indeed wrong: `Seq.update` carries it structurally.
 test_verify_one_file_with_options! {
-    #[test] test_exec_call_mut_arg_vec_index_probe ["new-mut-ref"] => verus_code! {
+    #[test] test_exec_call_mut_arg_vec_index ["new-mut-ref"] => verus_code! {
         use vstd::prelude::*;
 
         #[verifier::deprecated_postcondition_mut_ref_style(true)]
@@ -10126,7 +10128,45 @@ test_verify_one_file_with_options! {
         {
             bump(&mut v[0]);
         }
-    } => Err(_)
+    } => Ok(())
+}
+
+// Soundness pin for the returned-mut-ref prophecy: the `+1` from `bump`
+// threads into `v`'s post-state via the SHARED prophecy var `P` (the goal
+// reads `view(v)@[0] == update(view(old), 0, P)[0] == P == old[0]+1`).
+// A wrong `+2` ensures must NOT verify — confirms the prophecy isn't a
+// vacuous hypothesis (the failure mode the new-mut-ref False-hyp bug had,
+// see DESIGN § "Soundness trade-offs accepted"). Fails gracefully
+// (`tactus_auto failed` / `postcondition`), never a panic.
+test_verify_one_file_with_options! {
+    #[test] test_exec_call_mut_arg_vec_index_wrong_ensures ["new-mut-ref"] => verus_code! {
+        use vstd::prelude::*;
+
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        #[verifier::tactus_auto]
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn call_vec_index_mut(v: &mut Vec<u8>)
+            requires
+                old(v)@.len() > 0,
+                old(v)@[0] < 100,
+            ensures
+                v@.len() == old(v)@.len(),
+                v@[0] == old(v)@[0] + 2,
+        {
+            bump(&mut v[0]);
+        }
+    } => Err(err) => {
+        let s = format!("{:?}", err);
+        assert!(s.contains("tactus_auto failed") || s.contains("postcondition"),
+            "expected a verification failure (not a panic), got: {}", s);
+    }
 }
 
 // Probe (2026-05-17): minimal same-crate `uninterp spec fn` impl method.
