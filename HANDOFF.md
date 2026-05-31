@@ -8,11 +8,92 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**465 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass — full e2e suite green, 0 failures.** Latest (2026-05-30): **returned-mut-ref prophecy composition — `&mut v[i]` verifies.** `bump(&mut v[0])` lands end-to-end: a prophecy var `P` is minted at the `MutRef`-returning `vec_index_mut` call (rendered as `*final(element)` in its ensures) and reused as the resolving `bump` call's post-state, so the `+1` threads into `v`'s post-state (`view(v)@[0] == update(old@,0,P)[0] == P == old[0]+1`). General over any `MutRef`-typed dest (no `vec_index_mut` special-case); no `tactus_auto` simp-set extension (the closer closed the real goal as-is) — both transparency lines held. `test_exec_call_mut_arg_vec_index` (Ok) + `_wrong_ensures` (Err soundness pin). Reviewed clean: a multi-lens soundness pass (mechanism sound by ∀-binding) added an invalidate-on-resolution guard + restricted reuse to whole-ref targets + 4 adversarial pins; a right-way audit then derived-not-stored the reuse flag and named the `ReturnProphecy` struct (461 → 465 e2e). See § "Returned-mut-ref prophecy composition" in DESIGN. Prior (2026-05-30): **#122 cross-crate View / exec-callee emission.** Four landings (B1–B4 scoping note below, RESOLVED): **B2** trait-method call heads use the full module-qualified path (`view.View.view`, matching the emitted class) instead of the last two segments; **B1** `rewrite_self_sibling_calls` gates on resolved kind (so a blanket impl's cross-instance forward stays class dispatch) plus a forwarding-blanket body synth that faithfully reproduces `(**self).view()` as `view.View.view (Tactus.Ref.mk self.deref.deref)` for Ref/Box/Rc/Arc (recovering the smart-pointer deref Verus leaves opaque); **B3** instance binders the head doesn't determine (the erased `Box<T,A>` allocator param) are dropped so Lean can synthesize; and `has_resolved(x)` renders as an uninterpreted `Tactus.hasResolved` Prop. **This unblocked the whole `v@` (View) dispatch path: `Vec::len`, `Vec::push` (with `&mut` + `old(v)`), and `v[i]` reads all verify soundly under `use vstd::prelude::*`** (probed; wrong-ensures correctly fails). Plus a follow-up: **un-emittable cross-crate trait classes are skipped, not panicked on** — `HashMap` drags in `core::clone::Clone` (methods stripped cross-crate), which used to panic `trait_to_ast`; now such traits + their instances are skipped, so Map/Set code fails gracefully (`tactus_auto failed`) instead of crashing the verifier. A scoping spike on `&mut v[i]` then landed the **BuiltinSpecFun broadcast filter** (FnMut-axiom-pulling code degrades gracefully too) and corrected the frontier: the remaining `&mut v[i]` work is **returned-mut-ref prophecy composition** (a fresh new-mut-ref arc), not the bounded B1-family fix first guessed. A high-effort code review of the whole arc found **no correctness bugs** (all candidates verified REFUTED) and landed a 6-item zero-behavior-change cleanup/hardening pass. (Prior, 2026-05-29: **#122 cross-crate broadcast lemmas** — vstd's `Seq`/`Set`/`Map` semantic lemmas reach the closer from default-on-import + explicit `broadcast use`; default-on-import panic on un-emittable cross-crate trait bounds fixed by skipping such lemmas. Cluster B closed (`ref_to_bare`, `aliased_arg`, `cross_instantiation`); Cluster A closed via typed substitution + universal call-arg bridging.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**468 end-to-end tests + 1 coverage test + 263 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass — full e2e suite green, 0 failures.** Latest (2026-05-31): **cross-crate marker-shell trait emission (#122 RC1/RC3) — `HashMap::len` + spec/proof `<T: Clone>` verify.** Un-emittable cross-crate traits (methods stripped, e.g. `core::clone::Clone`) now emit as contentless *marker shells* instead of being skipped (skipping left dangling `[clone.Clone Self]` superclass binders on emittable subclasses → a 22-error cascade); every bound *referencing* a shell trait is dropped at the shared `trait_bounds_to_ast_with` chokepoint (a contentless bound loses no provable fact — same justification as the B3 binder-drop); shell-trait *instances* are skipped (dead once their bounds are dropped, and they dangle on un-reached traits like `marker.Copy`). **RC3**: `collect_referenced_datatypes` also seeds from emitted instance heads so an opaque type reachable only there (`DefaultHasher`) gets its `axiom T : Type`. A review pass centralized the filter at the chokepoint (covering spec/proof-fn generic bounds, not just the class/instance pre-filter sites); a coverage probe then found+fixed a real bug — RC1 had over-emitted shell instances (`{A}[marker.Copy A] : clone.Clone A` dangled on un-reached `marker.Copy`); the bound-drop was the actual fix, the instances were over-build. Map/Set `contains`/`contains_key` still degrade *gracefully* — residual is **RC2** (DeepView outParam projection) + **RC4** (the Box-key wrapper-faithfulness coercion: Verus collapses `Box::new(*k)` to bare `Q` against a `Box<Q>` key param). 465 → 468 e2e, 263 lean_verify lib, 0 regressions, vstd 1530/0. See § "Cross-crate marker-shell trait emission" in DESIGN + the Phase-3 Map/Set bullet. Prior (2026-05-30): **returned-mut-ref prophecy composition — `&mut v[i]` verifies.** `bump(&mut v[0])` lands end-to-end: a prophecy var `P` is minted at the `MutRef`-returning `vec_index_mut` call (rendered as `*final(element)` in its ensures) and reused as the resolving `bump` call's post-state, so the `+1` threads into `v`'s post-state (`view(v)@[0] == update(old@,0,P)[0] == P == old[0]+1`). General over any `MutRef`-typed dest (no `vec_index_mut` special-case); no `tactus_auto` simp-set extension (the closer closed the real goal as-is) — both transparency lines held. `test_exec_call_mut_arg_vec_index` (Ok) + `_wrong_ensures` (Err soundness pin). Reviewed clean: a multi-lens soundness pass (mechanism sound by ∀-binding) added an invalidate-on-resolution guard + restricted reuse to whole-ref targets + 4 adversarial pins; a right-way audit then derived-not-stored the reuse flag and named the `ReturnProphecy` struct (461 → 465 e2e). See § "Returned-mut-ref prophecy composition" in DESIGN. Prior (2026-05-30): **#122 cross-crate View / exec-callee emission.** Four landings (B1–B4 scoping note below, RESOLVED): **B2** trait-method call heads use the full module-qualified path (`view.View.view`, matching the emitted class) instead of the last two segments; **B1** `rewrite_self_sibling_calls` gates on resolved kind (so a blanket impl's cross-instance forward stays class dispatch) plus a forwarding-blanket body synth that faithfully reproduces `(**self).view()` as `view.View.view (Tactus.Ref.mk self.deref.deref)` for Ref/Box/Rc/Arc (recovering the smart-pointer deref Verus leaves opaque); **B3** instance binders the head doesn't determine (the erased `Box<T,A>` allocator param) are dropped so Lean can synthesize; and `has_resolved(x)` renders as an uninterpreted `Tactus.hasResolved` Prop. **This unblocked the whole `v@` (View) dispatch path: `Vec::len`, `Vec::push` (with `&mut` + `old(v)`), and `v[i]` reads all verify soundly under `use vstd::prelude::*`** (probed; wrong-ensures correctly fails). Plus a follow-up: **un-emittable cross-crate trait classes are skipped, not panicked on** — `HashMap` drags in `core::clone::Clone` (methods stripped cross-crate), which used to panic `trait_to_ast`; now such traits + their instances are skipped, so Map/Set code fails gracefully (`tactus_auto failed`) instead of crashing the verifier. A scoping spike on `&mut v[i]` then landed the **BuiltinSpecFun broadcast filter** (FnMut-axiom-pulling code degrades gracefully too) and corrected the frontier: the remaining `&mut v[i]` work is **returned-mut-ref prophecy composition** (a fresh new-mut-ref arc), not the bounded B1-family fix first guessed. A high-effort code review of the whole arc found **no correctness bugs** (all candidates verified REFUTED) and landed a 6-item zero-behavior-change cleanup/hardening pass. (Prior, 2026-05-29: **#122 cross-crate broadcast lemmas** — vstd's `Seq`/`Set`/`Map` semantic lemmas reach the closer from default-on-import + explicit `broadcast use`; default-on-import panic on un-emittable cross-crate trait bounds fixed by skipping such lemmas. Cluster B closed (`ref_to_bare`, `aliased_arg`, `cross_instantiation`); Cluster A closed via typed substitution + universal call-arg bridging.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
 ### Recent session landings
+
+#### Current session (2026-05-31 — cross-crate marker-shell trait emission: HashMap::len verifies, #122 RC1/RC3)
+
+**465 → 468 e2e (+3), 261 → 263 lean_verify lib (+2), 0 regressions, vstd
+1530/0.** Asked to probe Map/Set verification + scope what it'd take; then
+built the first root cause (RC1), holding the transparency line Danielle
+checked; then RC3; review; coverage audit. Commits: `3c64c9c` (RC1),
+`e34d3f0` (RC3), `f5d699d` (review), `c8527fe` (coverage fix) + poems
+`a45caf7` (marker) / `5d872b1` (the third door).
+
+**Probe (deliverable: a root-caused, live-confirmed scoping).** Regenerated
+the `HashMap::contains_key` probe (`VERUS_KEEP_TEST_DIR=1` + `lean --json`):
+34 raw Lean errors. Root-caused into 4 clusters, sharper than the day-old
+note (which had the mechanism slightly wrong — "dangling references" was
+really *bounds referencing* un-emittable traits): **RC1** trait cluster (22
+of 34, universal — type-driven), **RC2** DeepView outParam, **RC3**
+DefaultHasher opaque-type, **RC4** Box-key coercion. Confirming probes
+(HashSet `contains` 30→2, HashMap `len` 34→0-after-RC1) established RC1 is
+the universal unblock and RC2/RC4 are operation-specific add-ons; `len`
+needs only RC1, `contains` needs RC4 (+RC2 for the deep-view map).
+
+**Transparency check (Danielle asked before greenlighting RC1).** The
+marker-shell fix is Principle-#1-clean: a shell asserts no methods/laws →
+can't make any obligation falsely provable (the trait-level analog of
+external-body opaque-type emission); it's visible in the generated Lean;
+and it's *more* transparent than the broken status quo (dangling refs).
+Dropping a bound that references a contentless shell "loses no provable
+fact" — the exact B3 justification already in the codebase.
+
+**RC1 (`3c64c9c`) — marker shells + chokepoint bound-drop.** Two coupled
+pieces: emit un-emittable traits as method-less shell classes
+(`trait_to_ast` `filter_map` drops stripped methods, panic stays a
+same-crate tripwire); drop every bound *referencing* a shell trait
+(`drop_unemittable_trait_bounds`). `HashMap::len` verifies; the 22-error
+cascade clears.
+
+**RC3 (`e34d3f0`) — opaque types in instance heads.**
+`collect_referenced_datatypes` gained an `extra_seed` from the emitted
+instances' `trait_typ_args` + assoc-type values, so `DefaultHasher` (only
+in the `BuildHasher RandomState DefaultHasher` instance head, never a
+fn-body ref) gets its `axiom T : Type`.
+
+**Review (`f5d699d`) — centralize the filter (R-1).** The bound-drop was
+pre-applied at 2 of 3 call sites; `fn_binders` (spec/proof-fn generic
+bounds, via `spec_fn_to_ast` / `proof_fn_signature`) was uncovered. Moved
+the filter INTO the shared `trait_bounds_to_ast_with` chokepoint so every
+bound site is covered uniformly (exec fns don't render bound binders at
+all — `build_param_binders` does only typ_params — so the gap was
+spec/proof, not exec). + unit tests for the chokepoint filter and the RC3
+seed; + the RC3-untested-finding (`map_len` verified pre-RC3, so didn't
+exercise DefaultHasher).
+
+**Coverage audit (`c8527fe`) — found + fixed a real bug.** Probing the
+untested R-1 integration path (a spec/proof fn `<T: Clone>`) surfaced a bug
+RC1 had introduced and the review + 466 tests had missed: RC1 un-skipped
+shell-trait *instances* so `marker.Copy Int` could synthesize its
+`[clone.Clone Self]` superclass — but the chokepoint then *dropped* that
+superclass, making the instances dead AND dangling (`{A}[marker.Copy A] :
+clone.Clone A` bounds on `marker.Copy`, un-emitted in a bare-`Clone`
+crate). The `contains_key` probe had only elaborated past it because
+`marker.Copy` happened to be reached there. Fix: re-skip shell-trait
+instances (the shell *class* stays as a harmless marker). + 2 permanent
+tests (`test_cross_crate_spec_fn_clone_bound`, `_proof_fn_clone_bound`).
+
+**Discipline notes.**
+* *The probe overturned the day-old note again* — "dangling references" was
+  really *bounds referencing* shell traits; the live `lean --json` re-probe
+  corrected it before building. (Recurring "my own claims go stale.")
+* *RC1 was over-built, and the coverage lens caught it — not review, not the
+  green suite.* I emitted shell instances convinced `marker.Copy` needed
+  `clone.Clone` to synthesize; the chokepoint bound-drop (R-1b) was the
+  actual minimal fix all along, and the instance emission only dangled.
+  Caught by *probing an untested path*, the day after I wrote a poem ("the
+  third door") about the lock you set for the self who'll forget. It caught
+  me the same day.
+
+**Still deferred (the `contains` arc).** RC2 (DeepView outParam — Bug-B-
+shaped, extend `impl_subst` to a standalone def) + RC4 (Box-key wrapper
+coercion — typ-arg substitution into the callee's generic param types, then
+a `Q → Box Q` bridge; the Cluster-A/B typed-substitution family). `HashSet::
+contains` needs RC4 only; `HashMap::contains_key` needs RC2 + RC4.
 
 #### Current session (2026-05-30 cont. — returned-mut-ref prophecy composition LANDED: `&mut v[i]` verifies)
 
