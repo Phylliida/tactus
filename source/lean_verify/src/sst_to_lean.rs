@@ -3459,13 +3459,12 @@ struct MutArgInfo<'a> {
     /// already referenced `P` (`final(vec)@ == update(old@, i, P)`), so
     /// reusing it here lets this call's `*final(arg) == *old(arg)+1`
     /// constrain the SAME `P` the earlier call's update used; the chain
-    /// closes. `reused_prophecy` flags this so Phase 1 skips minting a
-    /// binder (P is already ∀-bound at the introducing call's frame).
+    /// closes. Phase 1 detects the reuse — `fresh` equals the prophecy
+    /// registered for this arg's local — and skips minting a binder (P is
+    /// already ∀-bound at the introducing call's frame). Derived at the
+    /// skip site rather than stored as a flag (no `value + bool-saying-
+    /// which-kind` to desync).
     fresh: crate::lean_name::LeanName,
-    /// True when `fresh` is a reused returned-mut-ref prophecy (already
-    /// ∀-bound by the introducing call) rather than a freshly gensym'd
-    /// post-state existential. Phase 1 skips the binder + bound for these.
-    reused_prophecy: bool,
 }
 
 impl<'a> MutArgInfo<'a> {
@@ -3769,22 +3768,17 @@ fn build_call_substitutions<'a>(
                 MutTargetRaw::Var(v) => obl.prophecy_for(v),
                 MutTargetRaw::Field { .. } => None,
             };
-            match reused {
-                Some(p) => MutArgInfo {
-                    param_idx: *idx,
-                    target: target.clone(),
-                    fresh: p.clone(),
-                    reused_prophecy: true,
-                },
-                None => MutArgInfo {
-                    param_idx: *idx,
-                    target: target.clone(),
-                    fresh: crate::lean_name::LeanName::synthetic(
-                        format!("_tactus_mut_post_{}", e.next_id()),
-                    ),
-                    reused_prophecy: false,
-                },
-            }
+            // `fresh` is the registered prophecy `P` (reused) or a new
+            // gensym. Whether it was reused is re-derived at the Phase 1
+            // skip site (`fresh` == the local's registered prophecy), so
+            // there's no stored flag to fall out of sync with `fresh`.
+            let fresh = match reused {
+                Some(p) => p.clone(),
+                None => crate::lean_name::LeanName::synthetic(
+                    format!("_tactus_mut_post_{}", e.next_id()),
+                ),
+            };
+            MutArgInfo { param_idx: *idx, target: target.clone(), fresh }
         })
         .collect();
 
@@ -4051,6 +4045,23 @@ fn is_trivial_true(e: &LExpr) -> bool {
 /// Falls through to the ∀-path when no `r == E` conjunct exists, when
 /// E mentions ret (self-referential), or when ensures has a non-And
 /// top-level shape (Or, Implies, etc.). See `extract_top_level_eq_for`.
+/// A returned-mut-ref prophecy for one call whose dest is `MutRef`-typed.
+/// Named (vs a positional tuple) per the codebase's convention — each field
+/// is read at a different site (`var` at the binder + registration, `final_var`
+/// at the ensures rewrite, both + `inner_typ` at the post-render subst), so
+/// names beat `_`-heavy destructures.
+struct ReturnProphecy {
+    /// The prophecy variable `P` (`*final` of the returned ref), ∀-bound at
+    /// the call's `MutRef T` wrapper typ.
+    var: crate::lean_name::LeanName,
+    /// Synthetic VIR-AST `VarIdent` the ensures rewrite produces for
+    /// `*final(ret)`; its `from_var_ident` LeanName is the post-render subst key.
+    final_var: VarIdent,
+    /// The inner `T` (return typ with one ref decoration stripped) — for the
+    /// `P.deref` bound and the `*final` inner value.
+    inner_typ: Typ,
+}
+
 fn push_post_call_frames(
     callee: &FunctionX,
     ensures: &[&Expr],
@@ -4077,9 +4088,9 @@ fn push_post_call_frames(
     // this, the #95 rewrite collapses `*final(ret)` and `*current(ret)`
     // alike to `Var(ret) → fresh_ret`, so the update inserts the current
     // element and the prophecy is lost.
-    let return_prophecy: Option<(crate::lean_name::LeanName, VarIdent, Typ)> =
+    let return_prophecy: Option<ReturnProphecy> =
         if dest.is_some() && is_mut_ref_typ(&callee.ret.x.typ, false) {
-            let p = crate::lean_name::LeanName::synthetic(
+            let var = crate::lean_name::LeanName::synthetic(
                 format!("_tactus_mut_post_{}", e.next_id()));
             let ret_ident = &callee.ret.x.name;
             // Synthetic VIR-AST VarIdent the ensures rewrite produces for
@@ -4091,7 +4102,7 @@ fn push_post_call_frames(
             );
             let inner_typ =
                 crate::to_lean_expr::strip_one_ref_decoration(&callee.ret.x.typ);
-            Some((p, final_var, inner_typ))
+            Some(ReturnProphecy { var, final_var, inner_typ })
         } else {
             None
         };
@@ -4116,11 +4127,18 @@ fn push_post_call_frames(
     // at `fn_binders` line ~3389 where param-level `&mut` binders
     // emit bounds via `.deref` for the same reason.
     for info in &subst.mut_args {
-        // Reused returned-mut-ref prophecy: `info.fresh` is `P`, already
-        // ∀-bound at the introducing call's frame. Don't re-bind it here
-        // (double binder); the ens_subst still maps this param's
-        // post-state to `P`, and Phase 4 rebinds the local to `P`.
-        if info.reused_prophecy {
+        // Reused returned-mut-ref prophecy: `info.fresh` IS the prophecy `P`
+        // registered for this arg's local (derived here from `obl`, the
+        // unmutated pre-call ctx that `build_call_substitutions` also keyed
+        // off — so they agree). `P` is already ∀-bound at the introducing
+        // call's frame, so don't re-bind it (double binder); the ens_subst
+        // still maps this param's post-state to `P`, and Phase 4 rebinds the
+        // local to `P`.
+        let reused_prophecy = obl
+            .prophecy_for(info.rebind_local())
+            .map(|p| p.as_str())
+            == Some(info.fresh.as_str());
+        if reused_prophecy {
             // Invalidate on resolution (defense-in-depth): a returned ref is
             // resolved at most once — clearing prevents a (frontend-blocked
             // today) double-resolve from reusing `P` and forming `P == P+1`.
@@ -4155,7 +4173,7 @@ fn push_post_call_frames(
     // post-render subst below). The binder lives in `new_obl`, which
     // flows to `after` — so the resolving call (`bump(dest)`) sees `P`
     // in scope and reuses it.
-    if let Some((p, _, inner_typ)) = &return_prophecy {
+    if let Some(rp) = &return_prophecy {
         // Bind `P` at the return's `MutRef T` typ (wrapper) — matching
         // what the resolving call's machinery expects (it `.deref`s the
         // post-state). The bound + the ensures use `P.deref` (the inner
@@ -4164,17 +4182,17 @@ fn push_post_call_frames(
         let ret_typ = &callee.ret.x.typ;
         let lean_typ = substitute(&typ_to_expr(ret_typ), &subst.typ_subst);
         new_obl.frames.push_back(CtxFrame::Binder(LBinder {
-            name: Some(p.clone()),
+            name: Some(rp.var.clone()),
             ty: lean_typ,
             kind: BinderKind::Explicit,
         }));
-        let inner_form = crate::typed_expr::TypedExpr::var(p.clone(), ret_typ.clone())
-            .into_slot(inner_typ);
+        let inner_form = crate::typed_expr::TypedExpr::var(rp.var.clone(), ret_typ.clone())
+            .into_slot(&rp.inner_typ);
         if let Some(pred) = type_bound_predicate(&inner_form, ret_typ) {
             new_obl.frames.push_back(CtxFrame::Hyp(pred));
         }
         if let Some(d) = dest {
-            new_obl.register_prophecy(d, p.clone());
+            new_obl.register_prophecy(d, rp.var.clone());
         }
     }
 
@@ -4200,8 +4218,8 @@ fn push_post_call_frames(
             // `Var(ret) → fresh_ret`). The `final_var → P` post-render
             // subst below sends it to the prophecy var.
             let rewritten = match &return_prophecy {
-                Some((_, final_var, _)) => {
-                    rewrite_return_final_ref(&rewritten, &callee.ret.x.name, final_var)
+                Some(rp) => {
+                    rewrite_return_final_ref(&rewritten, &callee.ret.x.name, &rp.final_var)
                 }
                 None => rewritten,
             };
@@ -4218,14 +4236,14 @@ fn push_post_call_frames(
         .chain(subst.ret_subst.iter())
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    if let Some((p, final_var, inner_typ)) = &return_prophecy {
+    if let Some(rp) = &return_prophecy {
         // `*final(ret)` is the INNER T value — `P.deref` (P is bound at
         // the `MutRef T` wrapper typ). Same `into_slot` coercion the
         // resolving call uses, so both sides agree on `P.deref`.
-        let p_inner = crate::typed_expr::TypedExpr::var(p.clone(), callee.ret.x.typ.clone())
-            .into_slot(inner_typ);
+        let p_inner = crate::typed_expr::TypedExpr::var(rp.var.clone(), callee.ret.x.typ.clone())
+            .into_slot(&rp.inner_typ);
         post_render_subst.insert(
-            crate::lean_name::LeanName::from_var_ident(final_var),
+            crate::lean_name::LeanName::from_var_ident(&rp.final_var),
             p_inner,
         );
     }
