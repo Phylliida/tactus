@@ -3027,8 +3027,10 @@ a bounded #107 sibling in `sst_to_lean.rs`):
   `*final(ret)` AS `P` via `rewrite_return_final_ref` (→ `Var(<ret>_final_tactus)`)
   + a post-render subst (`<ret>_final_tactus → P.deref`), and register `dest → P`.
 * `build_call_substitutions`: a `&mut`-arg whose local has a registered `P`
-  reuses `P` as its post-state (not a fresh existential — `MutArgInfo.reused_prophecy`);
-  Phase 1 skips the binder (P already bound). The resolving call's
+  reuses `P` as its post-state (not a fresh existential); Phase 1 detects the
+  reuse (the arg's `fresh` IS its local's registered prophecy — derived from
+  the unmutated pre-call ctx, not a stored flag) and skips the binder (P
+  already bound). The resolving call's
   `*final == *old+1` then constrains the SAME `P` the introducing call's
   update used. Generated goal: `view(v)@[i] == update(old@, i, P)[i] == P == old[i]+1`.
 * **Transparency held by construction:** GENERAL over any `MutRef`-typed dest
