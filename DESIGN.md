@@ -2231,7 +2231,7 @@ These are deferred by design — the current slice is single-crate exec+proof-fn
   - **Cross-crate broadcast lemmas referencing `BuiltinSpecFun` — skipped (LANDED 2026-05-30).** vstd's FnMut closure axioms (`axiom_fn_mut_call_requires`/`_ensures`), pulled in by default-on-import, reference a `BuiltinSpecFun` (closure `call_requires`/`call_ensures`) which the VIR-AST renderer has no faithful fixed-arity Lean form for (emits an unresolved literal `builtinSpecFun`). `references_builtin_spec_fun` (sst_to_lean.rs) skips such lemmas at collection — same graceful-skip family as the un-emittable-trait / `FiniteFull` filters. Their facts are unavailable (closure-spec reasoning isn't supported), but emission stays clean.
   - **`&mut v[i]` — LANDED 2026-05-30** via returned-mut-ref prophecy composition (§ "Returned-mut-ref prophecy composition"). Both links cleared: Link 1 (the FnMut `builtinSpecFun` broadcast wall) by the filter above; Link 2 (the returned `&mut`'s prophetic `*final`) by minting a prophecy var `P` at the `vec_index_mut` call and unifying it with the resolving `bump` call. Pinned by `test_exec_call_mut_arg_vec_index` (+ `_wrong_ensures`).
   - **Map/Set: `len` + `HashSet::contains` verify; `HashMap::contains_key` deferred on RC2 alone (RC4 LANDED 2026-05-31).** `HashMap::len()` verifies (RC1 marker shells + RC3 instance-head opaque-type seeding — both below); `HashSet::contains` verifies (RC4 below). The earlier "dangling references" framing was corrected by a live re-probe: RC1's chokepoint bound-drop dissolved the whole `Clone`/`PartialEq`/`Copy`/`Eq`/`Integer` cascade (it was *bounds* referencing un-emittable traits, not bare references), and RC3 cleared `DefaultHasher`. `HashMap::contains_key` still fails *gracefully*; the residual is now a single map-specific blocker:
-    - **RC2 — DeepView outParam projection (PARTIAL 2026-05-31; see § "Generalized projection-lifting").** `view.DeepView`'s assoc type `V` is an `outParam`, but the standalone spec fn `std_specs.hash.hash_map_deep_view_impl` projected `view.DeepView.V Key` as if `V` were an accessor → "type expected, got". **Landed:** projection-lifting generalized from impl-methods/instance-signatures to *every* generic function (signature + body) — the `view.DeepView.V Key`-as-accessor errors on `hash_map_deep_view_impl`'s signature and body are gone; synthetic assoc binders now render implicit so VIR call sites still typecheck. **Still open** (a deeper deep-view-specific stack the projection errors were masking): (3) the broadcast lemma `axiom_hashmap_deepview_borrow` carries the same projections in its *ensure clause* (not params/ret/body), which `augment_function` doesn't yet rewrite; (4) View-instance synthesis inside the deep_view body — `failed to synthesize View (HashMap …) ?V` in a fully polymorphic context; (5) the body's `Classical.epsilon` needs `[Nonempty Key]`. Map-with-deep-view-specific (HashSet `contains` doesn't hit it — it fully verifies).
+    - **RC2 — DeepView outParam projection (mechanism LANDED 2026-05-31; see § "Generalized projection-lifting").** `view.DeepView`'s assoc type `V` is an `outParam`, but the standalone spec fn `std_specs.hash.hash_map_deep_view_impl` projected `view.DeepView.V Key` as if `V` were an accessor → "type expected, got". **Landed:** projection-lifting generalized from impl-methods/instance-signatures to *every* generic function, covering signatures, bodies, require/ensure clauses, trait bounds, and broadcast lemmas (with Source-2 coverage) — the entire `view.DeepView.V Key`-as-accessor cascade *and* the `axiom_hashmap_deepview_borrow` broadcast-lemma errors are gone; synthetic assoc binders render implicit so VIR call sites typecheck. **Deferred residual** (now non-projection, inside the `hash_map_deep_view_impl` body): (4) View-instance synthesis — `failed to synthesize View (HashMap …) ?V` in a fully polymorphic context; (5) the body's `Classical.epsilon` needs `[Nonempty Key]`. Map-with-deep-view-specific (HashSet `contains` doesn't hit it — it fully verifies).
     - **RC4 — Box-key cross-crate coercion (LANDED 2026-05-31; see § "Instantiated-param-type call-arg coercion").** Verus's `axiom_contains_box` ensures `contains_borrowed_key(m,k) <==> m.contains_key(Box::new(*k))`. Verus erases `Box::new(*k)` to a bare `*k : Q` at the value level (confirmed by `--log vir-simple`: the surviving VIR arg is `ReadPlace(Local k) : TypParam Q`, no box node), so the key rendered as `k.deref : Q` against `contains_key`'s `K ↦ Box<Q>` key slot. Fix: the call-arg bridge now uses the callee's param type AS INSTANTIATED by the call's typ_args (`K ↦ Box<Q>`), so `coerce_lexpr` inserts the `Q → Box Q` `.mk` wrap, faithfully recovering the erased construction: `contains_key (Box Q) Value m (Tactus.Box.mk k.deref)`. General over any generic call whose param-type-param instantiates to a wrapper (Box/Ref/Rc/Arc/MutRef) — not Box- or contains-specific. Was shared by `contains_key` and `HashSet::contains`; now cleared for both.
 
     So `HashSet::contains` is fully verified; `HashMap::contains_key` has its RC2 *signature/body* projection errors cleared (via generalized projection-lifting) but still needs the deeper deep-view stack (3)/(4)/(5) above.
@@ -3152,7 +3152,7 @@ vstd 1530/0. **Known gap (cheap follow-up):** no isolated unit test on
 would pin the arity-guard fallback (the bug class) directly if a contributor ever
 drops the guard.
 
-### Generalized projection-lifting — LANDED 2026-05-31 (#122 RC2, partial)
+### Generalized projection-lifting — LANDED 2026-05-31 (#122 RC2; mechanism complete, contains_key residual non-projection)
 
 Tactus emits trait associated types as `outParam` class params (`class
 view.DeepView (Self) (V : outParam Type)`), so a projection `<X as Trait>::N`
@@ -3194,6 +3194,19 @@ empty subst → identity (the full 469-test suite stays green).
    matching `impl_subst::is_assoc_binder` (the `_tactus_assoc_` reserved prefix,
    centralized as `ASSOC_BINDER_PREFIX`) as implicit; user typ_params stay explicit.
    This matches the convention instance signatures already used (`{...}`).
+3. **Clauses, bounds, and broadcast lemmas.** A function's projections aren't only
+   in params/ret/body. `augment_function` also rewrites `require` / `ensure` /
+   `returns` Exprs (same `map_expr_typ_visitor` walk) and — via `rewrite_bound` —
+   projections embedded as trait-bound type-args (e.g. `[View Q <K as DeepView>::V]`).
+   `generate.rs` applies `maybe_augment_standalone_fn` to broadcast lemmas too, so a
+   cross-crate lemma like `axiom_hashmap_deepview_borrow` (whose facts + bounds carry
+   the projections, with empty params/ret/body) is lifted. **Source-2 coverage fix:**
+   `ImplSubst::build`'s "uncovered assoc-type slots" pass now actually checks coverage
+   — it skips a `<X as T>::N` slot already pinned by an existing `TypEquality(T, [X,…],
+   N, _)` bound, rather than synthesising a *second* fresh binder that
+   `trait_bounds_to_ast` would append as an over-arity bracket (`View Q _ta1 _ta2` for a
+   2-param class). Surfaced by exactly that lemma's `View Q` bound + its separate
+   `TypEquality(View,[Q],V,<K as DeepView>::V)`.
 
 **Transparency.** Inherits Bug B's audited verdict: the fresh binder *is* `<X as
 Trait>::N`, pinned by the (fake) TypEquality constraint that flows into the
@@ -3201,19 +3214,20 @@ instance bracket; visible in the generated Lean; the alternative (V-as-field) wa
 rejected because outParam is load-bearing for instance search. Generalizing a
 transparency-clean mechanism to more sites inherits its cleanliness.
 
-**Status: partial for `HashMap::contains_key`.** The headline RC2 errors (the
-`view.DeepView.V Key`-as-accessor "type expected, got" on `hash_map_deep_view_impl`'s
-signature + body, and its caller arity mismatches) are **cleared**. A deeper
-deep-view-specific stack the projection errors were masking remains: (3) the
-broadcast lemma `axiom_hashmap_deepview_borrow` projects in its *ensure* clause
-(which `augment_function` doesn't rewrite — it does params/ret/body, and a
-broadcast lemma's facts live in require/ensure); (4) View-instance synthesis in
-the deep_view body (`failed to synthesize View (HashMap …) ?V`); (5) the body's
-`Classical.epsilon` needs `[Nonempty Key]`. These are map-with-deep-view-specific;
-`HashSet::contains` has none of them and fully verifies (RC4). Pinned by
-`test_cross_crate_unemittable_trait_degrades_not_panics` (still Err — now on
-(3)/(4)/(5), the signature/body projection errors gone). 469 e2e, 263 lib, 0
-regressions, vstd 1530/0.
+**Mechanism complete; `HashMap::contains_key` residual is now non-projection.** The
+projection-lifting machinery covers every site — signatures, bodies, require/ensure,
+trait bounds, and broadcast lemmas, with correct Source-2 coverage — and the whole
+`view.DeepView.V Key`-as-accessor cascade *and* the `axiom_hashmap_deepview_borrow`
+broadcast-lemma errors are cleared. What blocks `contains_key` now is two semantic
+issues **inside the `hash_map_deep_view_impl` body**, separate from projection-lifting:
+(4) View-instance synthesis — the body's `View.view (Ref.mk m)` for `m : HashMap …`
+fails to determine the output type V in a fully polymorphic context (`failed to
+synthesize View (HashMap …) ?V`); (5) the body's `Classical.epsilon` needs
+`[Nonempty Key]`. Both are map-with-deep-view-specific; `HashSet::contains` has
+neither and fully verifies (RC4). **Deferred** as their own sub-arc (they're about
+elaborating one vstd spec-fn body, not about projections). Pinned by
+`test_cross_crate_unemittable_trait_degrades_not_panics` (still Err — now on (4)/(5)
+only). 469 e2e, 263 lib, 0 regressions, vstd 1530/0.
 
 ### Returned-mut-ref prophecy composition — LANDED 2026-05-30
 

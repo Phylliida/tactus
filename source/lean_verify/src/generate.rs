@@ -643,8 +643,13 @@ fn krate_preamble(
     // Sound by the same argument as cross-crate axiomatized ensures:
     // vstd verified the lemma (`vargo build` → 1530/0); we stipulate
     // it. The user opted in explicitly with `broadcast use <group>;`.
-    for f in &bc_lemma_funcs {
-        cmds.push(to_lean_fn::broadcast_lemma_axiom_cmd(f, &fn_map, &unemittable_traits));
+    for &f in &bc_lemma_funcs {
+        // Lift assoc-type projections in the lemma's ensure/require (e.g.
+        // `axiom_hashmap_deepview_borrow`'s `<K as DeepView>::V`) — same
+        // generalized projection-lifting as standalone spec fns. No-op for
+        // projection-free lemmas (the common case).
+        let augmented = crate::impl_subst::maybe_augment_standalone_fn(f, &trait_lookup);
+        cmds.push(to_lean_fn::broadcast_lemma_axiom_cmd(&augmented, &fn_map, &unemittable_traits));
     }
 
     (cmds, ns)
