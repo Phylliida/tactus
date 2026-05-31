@@ -10169,6 +10169,155 @@ test_verify_one_file_with_options! {
     }
 }
 
+// ADVERSARIAL PROBE A (concern 2: returned &mut resolved by TWO calls
+// via a NAMED binding). `let e = &mut v[0]; bump(e); bump(e);` would
+// reuse the SAME prophecy P twice; the second call's `*old(arg)` would
+// render as P.deref (e rebound by the first), so its ensures becomes
+// `P.deref == P.deref + 1` — a FALSE hypothesis. EXPECTED: the named
+// `let e = &mut v[0]` is rejected upstream (MutRefCurrent in exec body),
+// so the dangerous codepath is unreachable. We assert it is REJECTED
+// (not silently verified). If a future frontend change lets the named
+// binding through, this test must then check the false-postcondition is
+// not provable.
+test_verify_one_file_with_options! {
+    #[test] adversarial_probe_double_bump_named ["new-mut-ref"] => verus_code! {
+        use vstd::prelude::*;
+
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        #[verifier::tactus_auto]
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn call_double(v: &mut Vec<u8>)
+            requires
+                old(v)@.len() > 0,
+                old(v)@[0] < 50,
+            ensures
+                v@[0] == old(v)@[0] + 100,  // BLATANTLY FALSE if it verified
+        {
+            let e = &mut v[0];
+            bump(e);
+            bump(e);
+        }
+    } => Err(err) => {
+        let s = format!("{:?}", err);
+        // Acceptable: rejected (unsupported MutRefCurrent) OR a genuine
+        // verification failure. NOT acceptable: Ok (would be unsound).
+        assert!(s.contains("rejected") || s.contains("MutRefCurrent")
+                || s.contains("tactus_auto failed") || s.contains("postcondition"),
+            "UNEXPECTED: got {}", s);
+    }
+}
+
+// ADVERSARIAL PROBE A2 (concern 2/5, REACHABLE surface): two separate
+// inline `&mut v[0]` bumps. Each desugars to its OWN vec_index_mut call
+// → two independent prophecies. The TRUE result is +2. This is the
+// supported form; checking it verifies soundly (and that a wrong +3
+// fails) confirms two adjacent prophecy-introducing calls compose right.
+test_verify_one_file_with_options! {
+    #[test] adversarial_probe_two_inline_bumps ["new-mut-ref"] => verus_code! {
+        use vstd::prelude::*;
+
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        #[verifier::tactus_auto]
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn call_two(v: &mut Vec<u8>)
+            requires
+                old(v)@.len() > 0,
+                old(v)@[0] < 50,
+            ensures
+                v@[0] == old(v)@[0] + 3,  // WRONG: true value is +2
+        {
+            bump(&mut v[0]);
+            bump(&mut v[0]);
+        }
+    } => Err(err) => {
+        let s = format!("{:?}", err);
+        assert!(s.contains("tactus_auto failed") || s.contains("postcondition")
+                || s.contains("rejected") || s.contains("MutRefCurrent"),
+            "UNSOUND or panic: wrong +3 over two inline bumps. got: {}", s);
+    }
+}
+
+// ADVERSARIAL PROBE A3 (concern 5): two inline bumps at DIFFERENT
+// indices. Each prophecy must thread to its own slot; cross-talk would
+// be unsound. A wrong postcondition (claiming v@[1] changed by 2 when
+// it changes by 1) must not verify.
+test_verify_one_file_with_options! {
+    #[test] adversarial_probe_two_index_bumps ["new-mut-ref"] => verus_code! {
+        use vstd::prelude::*;
+
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        #[verifier::tactus_auto]
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn call_two_idx(v: &mut Vec<u8>)
+            requires
+                old(v)@.len() > 1,
+                old(v)@[0] < 50,
+                old(v)@[1] < 50,
+            ensures
+                v@[1] == old(v)@[1] + 2,  // WRONG: index 1 bumped once → +1
+        {
+            bump(&mut v[0]);
+            bump(&mut v[1]);
+        }
+    } => Err(err) => {
+        let s = format!("{:?}", err);
+        assert!(s.contains("tactus_auto failed") || s.contains("postcondition")
+                || s.contains("rejected") || s.contains("MutRefCurrent"),
+            "UNSOUND or panic: cross-index prophecy. got: {}", s);
+    }
+}
+
+// ADVERSARIAL PROBE B (concern 1: returned &mut NEVER resolved).
+// The prophecy P is minted and ∀-bound but never constrained. A false
+// postcondition must NOT verify (∀-bound P is the sound direction).
+test_verify_one_file_with_options! {
+    #[test] adversarial_probe_unresolved_prophecy ["new-mut-ref"] => verus_code! {
+        use vstd::prelude::*;
+
+        #[verifier::tactus_auto]
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn get_but_dont_use(v: &mut Vec<u8>)
+            requires
+                old(v)@.len() > 0,
+            ensures
+                v@[0] == old(v)@[0] + 7,  // FALSE: nothing mutated
+        {
+            let _e = &mut v[0];
+        }
+    } => Err(err) => {
+        let s = format!("{:?}", err);
+        assert!(s.contains("tactus_auto failed") || s.contains("postcondition"),
+            "UNSOUND: false postcondition verified with unresolved prophecy, \
+             or panic. got: {}", s);
+    }
+}
+
+// (Positive control for the feature is the existing
+// `test_exec_call_mut_arg_vec_index` above — it pins that the supported
+// single inline `bump(&mut v[0])` with its TRUE +1 postcondition still
+// verifies. The probes above are the soundness/rejection gates.)
+
 // Probe (2026-05-17): minimal same-crate `uninterp spec fn` impl method.
 //
 // Isolates Bug C from the View-trait emission cluster: when an impl

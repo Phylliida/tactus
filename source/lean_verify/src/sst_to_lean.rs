@@ -1266,7 +1266,8 @@ struct OblCtx {
     /// ensures referenced, so the chain `final(vec)@[i] == P == old+1`
     /// closes. Flows with the walk (OblCtx is the accumulating context),
     /// so its scope matches exactly where the returned ref is live.
-    /// Plain `HashMap` (not `im`): typically 0–1 entries, shallow clone.
+    /// Plain `HashMap` (not `im`): `clone()` is a full copy, but the map is
+    /// tiny (typically 0–1 entries), so the per-`with_frame` clone is cheap.
     prophecies: HashMap<String, crate::lean_name::LeanName>,
 }
 
@@ -1297,6 +1298,20 @@ impl OblCtx {
     /// Look up a registered prophecy for a caller-local, if any.
     fn prophecy_for(&self, local: &VarIdent) -> Option<&crate::lean_name::LeanName> {
         self.prophecies.get(&borrow_mut_key(local))
+    }
+
+    /// Invalidate a prophecy once its returned ref has been RESOLVED (passed
+    /// to a `&mut`-arg call). Defense-in-depth (review 2026-05-31): a single
+    /// returned `&mut` must be resolved at most once — resolving it twice
+    /// would reuse the same `P` and produce a `P == P+1` False hypothesis
+    /// (unsound). The frontend already blocks the only triggering surface
+    /// syntax (`let e = &mut v[i]; bump(e); bump(e)` — the named binding is
+    /// rejected as `MutRefCurrent` in an exec body; pinned by
+    /// `adversarial_probe_double_bump_named`). Clearing on resolution makes
+    /// the gate hold by its OWN logic, not by the luck of that upstream
+    /// rejection: a second resolution then mints a fresh existential instead.
+    fn clear_prophecy(&mut self, local: &VarIdent) {
+        self.prophecies.remove(&borrow_mut_key(local));
     }
 
     /// Append a frame, returning a fresh OblCtx that shares the
@@ -3743,11 +3758,18 @@ fn build_call_substitutions<'a>(
     // Otherwise mint a fresh `_tactus_mut_post_<id>` (the common case).
     let mut_args: Vec<MutArgInfo<'a>> = mut_args_raw.iter()
         .map(|(idx, target)| {
-            let rebind: &VarIdent = match target {
-                MutTargetRaw::Var(v) => v,
-                MutTargetRaw::Field { base, .. } => base,
+            // Reuse only applies to a WHOLE returned ref (`MutTargetRaw::Var`):
+            // the registered `P` is `*final(e)`, NOT `*final(e.field)`. A
+            // field-path mutation of a returned ref (`&mut e.field`) must mint
+            // its own existential — reusing `P` there would be wrong-typed
+            // (P : MutRef Struct vs the field's MutRef FieldT) and
+            // wrong-meaning. Sound either way (P stays ∀-bound), but the
+            // restriction keeps it correct, not just safe.
+            let reused = match target {
+                MutTargetRaw::Var(v) => obl.prophecy_for(v),
+                MutTargetRaw::Field { .. } => None,
             };
-            match obl.prophecy_for(rebind) {
+            match reused {
                 Some(p) => MutArgInfo {
                     param_idx: *idx,
                     target: target.clone(),
@@ -4099,6 +4121,10 @@ fn push_post_call_frames(
         // (double binder); the ens_subst still maps this param's
         // post-state to `P`, and Phase 4 rebinds the local to `P`.
         if info.reused_prophecy {
+            // Invalidate on resolution (defense-in-depth): a returned ref is
+            // resolved at most once — clearing prevents a (frontend-blocked
+            // today) double-resolve from reusing `P` and forming `P == P+1`.
+            new_obl.clear_prophecy(info.rebind_local());
             continue;
         }
         let typ = &callee.params[info.param_idx].x.typ;
