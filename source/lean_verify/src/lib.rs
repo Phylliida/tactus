@@ -7,6 +7,7 @@ pub mod lean_ast;
 pub mod lean_name;
 pub mod lean_pp;
 pub mod lean_process;
+pub mod nonempty;
 pub mod prelude;
 pub mod project;
 pub mod sanity;

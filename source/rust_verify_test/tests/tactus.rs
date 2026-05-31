@@ -11716,3 +11716,29 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// `[Nonempty T]` inference (#122 layer 5). Verus's `choose|x: T|` is total
+// (returns some value of T even when nothing satisfies the predicate),
+// sound because every Verus spec type is inhabited; Tactus renders it as
+// `Classical.epsilon`, which Lean requires `[Nonempty T]` for. So a
+// generic spec fn that chooses over its type-param T must declare
+// `[Nonempty T]`, and that requirement propagates to callers that pass
+// their own type-param into the choosing fn — bottoming out at concrete
+// types (`Nonempty u8` resolves on its own). `pick` is the seed; `pick2`
+// exercises one-hop propagation; `use_pick` instantiates at `u8` so the
+// constraint discharges. Without the synthesized binders this fails to
+// elaborate with "failed to synthesize Nonempty T". See `nonempty.rs`.
+test_verify_one_file! {
+    #[test] test_nonempty_choose_over_type_param verus_code! {
+        use vstd::prelude::*;
+        spec fn pick<T>(s: Set<T>) -> T {
+            choose|x: T| s.contains(x)
+        }
+        spec fn pick2<T>(s: Set<T>) -> T {
+            pick(s)
+        }
+        proof fn use_pick(s: Set<u8>)
+            ensures pick2(s) == pick2(s)
+        { }
+    } => Ok(())
+}

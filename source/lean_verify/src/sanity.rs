@@ -360,6 +360,11 @@ fn name_resolves(name: &str, defined: &HashSet<String>, scope: &HashSet<String>)
         // a string in the Datatype's `derives` field and bypasses name
         // resolution entirely; only the indexed-style path needs this.
         | "Inhabited"
+        // `Nonempty` typeclass — the `[Nonempty T]` binder Tactus
+        // synthesises for fns/instances/lemmas that `choose` over a
+        // type-param T (Lean's `Classical.epsilon` requires it). See
+        // `nonempty.rs`.
+        | "Nonempty"
         // `sizeOf` — Lean's auto-derived size measure (`SizeOf`
         // typeclass). Used in `termination_by sizeOf <arg>` clauses
         // emitted for recursive height fns where the arg's structural
