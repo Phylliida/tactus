@@ -11685,3 +11685,29 @@ test_verify_one_file! {
             "expected graceful Lean failure (no trait_to_ast panic), got: {}", s);
     }
 }
+
+// Graceful degradation on `HashSet::contains` — the set sibling of the
+// `contains_key` test above. Probed 2026-05-31 (`lean --json` on the
+// generated `use_set.lean`): the ONLY error is RC4 (the Box-key
+// coercion — `axiom_set_contains_box` renders `set.Set.contains
+// (Tactus.Box Q) m k.deref` with `k.deref : Q` against a `Box Q` slot),
+// with NO DeepView/RC2 error. This isolates the residual: `HashSet::
+// contains` needs only RC4 (a single typ-arg-substituting call-arg
+// bridge), whereas `HashMap::contains_key` needs RC2 + RC4. Until RC4
+// lands it must still fail GRACEFULLY (Lean ran, `tactus_auto failed`)
+// rather than panic.
+test_verify_one_file! {
+    #[test] test_cross_crate_set_contains_degrades_not_panics verus_code! {
+        use vstd::prelude::*;
+        #[verifier::tactus_auto]
+        fn use_set(s: &std::collections::HashSet<u8>, k: u8) -> (r: bool)
+            ensures r == s@.contains(k)
+        {
+            s.contains(&k)
+        }
+    } => Err(e) => {
+        let s = format!("{:?}", e);
+        assert!(s.contains("tactus_auto failed") && !s.contains("not found in VIR"),
+            "expected graceful Lean failure (no trait_to_ast panic), got: {}", s);
+    }
+}
