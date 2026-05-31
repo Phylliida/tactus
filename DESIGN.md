@@ -3036,6 +3036,16 @@ a bounded #107 sibling in `sst_to_lean.rs`):
   (P visible in the goal); and **no `tactus_auto` simp-set extension** — the
   closer closed the real goal as-is, so the `spec_index`↔`seq.Seq.index`
   contingency below was *not needed*.
+* **Sound by ∀-binding (review 2026-05-31).** `P` is universally quantified,
+  so an under-constrained prophecy (e.g. a returned ref never resolved) only
+  makes a goal *harder*, never falsely provable. Two review fixes: reuse is
+  restricted to whole-ref `MutTargetRaw::Var` targets (a `&mut e.field` mints
+  its own existential — `P` is `*final(e)`, not `*final(e.field)`); and
+  `OblCtx::clear_prophecy` invalidates `P` on resolution so a double-resolve
+  (`P == P+1`, unreachable today — the named `let e = &mut v[i]` is rejected
+  upstream) is latched by the gate's own logic, not by the frontend's luck.
+  Soundness pins: `adversarial_probe_{double_bump_named, two_inline_bumps,
+  two_index_bumps, unresolved_prophecy}`.
 
 The original scoping detail (SST shape, root cause, Lean validation) is kept
 below for reference — it landed as written.
