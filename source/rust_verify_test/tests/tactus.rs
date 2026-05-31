@@ -11604,6 +11604,38 @@ test_verify_one_file! {
     }
 }
 
+// #122 coverage: a SPEC fn generic over a cross-crate-stripped trait
+// bound (`<T: Clone>`) verifies. Two mechanisms are exercised together:
+// (1) R-1 drops the `[clone.Clone T]` bound at the shared
+// `trait_bounds_to_ast_with` chokepoint (the fn-binder path, reached via
+// `spec_fn_to_ast` — not covered by the class/instance pre-filters); and
+// (2) the shell-instance skip — `clone.Clone` emits as a shell *class*
+// but its *instances* are skipped, so the `{A}[marker.Copy A] :
+// clone.Clone A` instance (whose `[marker.Copy A]` bound would dangle in
+// a crate that doesn't pull in `marker.Copy`) is never emitted. Surfaced
+// by a coverage probe — before the shell-instance skip this failed with
+// "Unknown identifier marker.Copy".
+test_verify_one_file! {
+    #[test] test_cross_crate_spec_fn_clone_bound verus_code! {
+        use vstd::prelude::*;
+        spec fn pick<T: Clone>(x: T) -> T { x }
+        #[verifier::tactus_auto]
+        fn use_pick(a: u8) -> (r: u8) ensures r == pick(a) { a }
+    } => Ok(())
+}
+
+// #122 coverage twin: same as above for the PROOF-fn binder path (reached
+// via `proof_fn_signature` → `fn_binders`, the same chokepoint, distinct
+// entry point — also shared by `broadcast_lemma_axiom_cmd`).
+test_verify_one_file! {
+    #[test] test_cross_crate_proof_fn_clone_bound verus_code! {
+        use vstd::prelude::*;
+        proof fn refl_clone<T: Clone>(x: T)
+            ensures x == x
+        by { rfl }
+    } => Ok(())
+}
+
 // RC1 (marker-shell emission, #122) — a cross-crate `HashMap` op
 // verifies end-to-end. `HashMap<u8,u8>` drags in `core::clone::Clone`
 // / `cmp::PartialEq` (methods stripped cross-crate). Pre-RC1 those
