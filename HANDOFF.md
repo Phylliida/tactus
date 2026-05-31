@@ -8,11 +8,69 @@ See `DESIGN.md` for the full design rationale and decisions, including a compreh
 
 ## Current state
 
-**460 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass — full e2e suite green, 0 failures.** Latest (2026-05-30): **#122 cross-crate View / exec-callee emission.** Four landings (B1–B4 scoping note below, RESOLVED): **B2** trait-method call heads use the full module-qualified path (`view.View.view`, matching the emitted class) instead of the last two segments; **B1** `rewrite_self_sibling_calls` gates on resolved kind (so a blanket impl's cross-instance forward stays class dispatch) plus a forwarding-blanket body synth that faithfully reproduces `(**self).view()` as `view.View.view (Tactus.Ref.mk self.deref.deref)` for Ref/Box/Rc/Arc (recovering the smart-pointer deref Verus leaves opaque); **B3** instance binders the head doesn't determine (the erased `Box<T,A>` allocator param) are dropped so Lean can synthesize; and `has_resolved(x)` renders as an uninterpreted `Tactus.hasResolved` Prop. **This unblocked the whole `v@` (View) dispatch path: `Vec::len`, `Vec::push` (with `&mut` + `old(v)`), and `v[i]` reads all verify soundly under `use vstd::prelude::*`** (probed; wrong-ensures correctly fails). Plus a follow-up: **un-emittable cross-crate trait classes are skipped, not panicked on** — `HashMap` drags in `core::clone::Clone` (methods stripped cross-crate), which used to panic `trait_to_ast`; now such traits + their instances are skipped, so Map/Set code fails gracefully (`tactus_auto failed`) instead of crashing the verifier. A scoping spike on `&mut v[i]` then landed the **BuiltinSpecFun broadcast filter** (FnMut-axiom-pulling code degrades gracefully too) and corrected the frontier: the remaining `&mut v[i]` work is **returned-mut-ref prophecy composition** (a fresh new-mut-ref arc), not the bounded B1-family fix first guessed. A high-effort code review of the whole arc found **no correctness bugs** (all candidates verified REFUTED) and landed a 6-item zero-behavior-change cleanup/hardening pass. (Prior, 2026-05-29: **#122 cross-crate broadcast lemmas** — vstd's `Seq`/`Set`/`Map` semantic lemmas reach the closer from default-on-import + explicit `broadcast use`; default-on-import panic on un-emittable cross-crate trait bounds fixed by skipping such lemmas. Cluster B closed (`ref_to_bare`, `aliased_arg`, `cross_instantiation`); Cluster A closed via typed substitution + universal call-arg bridging.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
+**461 end-to-end tests + 1 coverage test + 261 lean_verify unit tests + 66 rust_verify unit tests + 7 integration tests pass — full e2e suite green, 0 failures.** Latest (2026-05-30): **returned-mut-ref prophecy composition — `&mut v[i]` verifies.** `bump(&mut v[0])` lands end-to-end: a prophecy var `P` is minted at the `MutRef`-returning `vec_index_mut` call (rendered as `*final(element)` in its ensures) and reused as the resolving `bump` call's post-state, so the `+1` threads into `v`'s post-state (`view(v)@[0] == update(old@,0,P)[0] == P == old[0]+1`). General over any `MutRef`-typed dest (no `vec_index_mut` special-case); no `tactus_auto` simp-set extension (the closer closed the real goal as-is) — both transparency lines held. `test_exec_call_mut_arg_vec_index` (Ok) + `_wrong_ensures` (Err soundness pin). See § "Returned-mut-ref prophecy composition" in DESIGN. Prior (2026-05-30): **#122 cross-crate View / exec-callee emission.** Four landings (B1–B4 scoping note below, RESOLVED): **B2** trait-method call heads use the full module-qualified path (`view.View.view`, matching the emitted class) instead of the last two segments; **B1** `rewrite_self_sibling_calls` gates on resolved kind (so a blanket impl's cross-instance forward stays class dispatch) plus a forwarding-blanket body synth that faithfully reproduces `(**self).view()` as `view.View.view (Tactus.Ref.mk self.deref.deref)` for Ref/Box/Rc/Arc (recovering the smart-pointer deref Verus leaves opaque); **B3** instance binders the head doesn't determine (the erased `Box<T,A>` allocator param) are dropped so Lean can synthesize; and `has_resolved(x)` renders as an uninterpreted `Tactus.hasResolved` Prop. **This unblocked the whole `v@` (View) dispatch path: `Vec::len`, `Vec::push` (with `&mut` + `old(v)`), and `v[i]` reads all verify soundly under `use vstd::prelude::*`** (probed; wrong-ensures correctly fails). Plus a follow-up: **un-emittable cross-crate trait classes are skipped, not panicked on** — `HashMap` drags in `core::clone::Clone` (methods stripped cross-crate), which used to panic `trait_to_ast`; now such traits + their instances are skipped, so Map/Set code fails gracefully (`tactus_auto failed`) instead of crashing the verifier. A scoping spike on `&mut v[i]` then landed the **BuiltinSpecFun broadcast filter** (FnMut-axiom-pulling code degrades gracefully too) and corrected the frontier: the remaining `&mut v[i]` work is **returned-mut-ref prophecy composition** (a fresh new-mut-ref arc), not the bounded B1-family fix first guessed. A high-effort code review of the whole arc found **no correctness bugs** (all candidates verified REFUTED) and landed a 6-item zero-behavior-change cleanup/hardening pass. (Prior, 2026-05-29: **#122 cross-crate broadcast lemmas** — vstd's `Seq`/`Set`/`Map` semantic lemmas reach the closer from default-on-import + explicit `broadcast use`; default-on-import panic on un-emittable cross-crate trait bounds fixed by skipping such lemmas. Cluster B closed (`ref_to_bare`, `aliased_arg`, `cross_instantiation`); Cluster A closed via typed substitution + universal call-arg bridging.) vstd still verifies (1530 functions, 0 errors). The pipeline works: user writes a proof fn with `by { }` or an exec fn with `#[verifier::tactus_auto]`, Tactus generates typed Lean AST, pretty-prints to a real `.lean` file, invokes Lean (with Mathlib if available), and reports results through Verus's diagnostic system.
 
 **Track B status: all seven slices landed.** Exec fns can have: `let`-bindings, mutation (via Lean let-shadowing), if/else, early returns, loops (arbitrary nesting — sequential, nested, inside if-branches), function calls (direct named, including recursion and mutual recursion via Verus's `CheckDecreaseHeight` obligation), break/continue, recursion on user datatypes via generated `T.height` fn, enum match via `tactus_case_split` automation, and arithmetic with overflow checking. Failures cite Rust source positions with semantic kind labels. Most realistic Rust exec fns should verify, modulo documented restrictions (no trait-method calls, no `&mut` args — see DESIGN.md § "Known deferrals").
 
 ### Recent session landings
+
+#### Current session (2026-05-30 cont. — returned-mut-ref prophecy composition LANDED: `&mut v[i]` verifies)
+
+**460 → 461 e2e, 0 regressions; 261 lean_verify lib; vstd unaffected (all
+changes in `lean_verify/src/sst_to_lean.rs` + the test).** Built the arc
+scoped + Lean-validated earlier this session, holding the two transparency
+lines Danielle named.
+
+**The fix (a bounded #107 sibling).** The last `&mut v[i]` blocker was the
+RETURNED `&mut` from `vec_index_mut`: its `*final(element)` (a prophecy
+resolved by the chained `bump`) collapsed to the *current* element value
+(the #95 rewrite aliases `MutRefFinal`↔`MutRefCurrent`, and that only ever
+fired for `&mut` *params*, not *returns*). So the `+1` never threaded into
+`v`'s post-state. Implementation:
+* `OblCtx.prophecies` map (caller-local → prophecy var `P`), keyed
+  disambiguator-aware via `borrow_mut_key`, flowing with the walk so its
+  scope matches where the returned ref is live. `register_prophecy` /
+  `prophecy_for` helpers; survives `new_scope`.
+* `push_post_call_frames` (now takes `e`): when a call's dest is
+  `MutRef`-typed (`is_mut_ref_typ(&callee.ret.x.typ, false)`), mint `P`
+  (∀-bound at the `MutRef T` wrapper typ + inner bound via `into_slot`),
+  rewrite the callee ensures' `*final(ret)` → `Var(<ret>_final_tactus)` (new
+  `rewrite_return_final_ref`, mirrors `rewrite_varat_for_mut_params` but for
+  the return), add a post-render subst `<ret>_final_tactus → P.deref`, and
+  `register_prophecy(dest, P)` in the returned OblCtx.
+* `build_call_substitutions` (now takes `obl`): a `&mut`-arg whose local has
+  a registered `P` reuses `P` as its post-state (`MutArgInfo.reused_prophecy`)
+  instead of a fresh `_tactus_mut_post_<id>`; Phase 1 skips its binder (P
+  already bound). The resolving call's `*final == *old+1` then constrains the
+  SAME `P` the introducing call's update used.
+
+Generated goal (sound, no vacuous hyp): `∀ _mp1 _mp4, view(_mp1) =
+update(view(old), 0, _mp4.deref) ∧ … → … _mp4.deref = old[0]+1 → view(v)@[0]
+= view(old)@[0]+1` — the `+1` threads through the shared `_mp4`.
+
+**Transparency lines held (Danielle's check), by construction:**
+1. *General, not a `vec_index_mut` special-case* — triggers on any
+   `MutRef`-typed dest + any registered-prophecy `&mut`-arg; no name-check.
+   Faithful to Verus's `final()`; `P` visible in the goal. Same audited
+   category as #107/#128.
+2. *No `tactus_auto` simp-set extension* — the closer closed the real goal
+   as-is; the `spec_index`↔`seq.Seq.index` contingency (task #7) turned out
+   **not needed** (bare `tactus_auto` matched). Held by default.
+
+**Probe-then-build discipline notes.**
+* *The artifact resolved a reading contradiction.* My code-read said `tmp%2`
+  (the returned ref, `TempViaAssign`) wasn't in `mut_param_names`, yet the
+  observed goal showed `bump(tmp%2)` getting mut-arg treatment. Reading the
+  generated `.lean` (not reasoning) revealed why: `extract_mut_target`'s
+  bare-Var branch keys on `sanitize(&ident.0)` = `"tmp__"` (base name,
+  disambiguator dropped), colliding with `tmp%1` (BorrowMut). So `tmp%2` is
+  recognized by collision. (I keyed the prophecy map disambig-aware to avoid
+  relying on that.)
+* *First compile flipped the symptom, not the result.* After the core edits
+  the goal threaded `P` but errored `Int.deref` — I'd bound `P` at inner `T`
+  while the resolving machinery `.deref`s the post-state. Fixed by binding at
+  the `MutRef T` wrapper (matching the machinery) + `into_slot` for the inner
+  value. Then it verified. Read the error, said the truer thing next.
 
 #### Current session (2026-05-30 cont. — deferred-exec probe: returned-mut-ref prophecy scoped + Lean-validated)
 

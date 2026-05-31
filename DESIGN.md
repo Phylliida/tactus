@@ -1213,17 +1213,12 @@ recursion pass covers all cross-fn calls in the cycle the same way.
     contract).
 
     **Still deferred** (post-#144 / #145 / #146):
-    * `&mut v[i]` (Index L-value) — **returned-mut-ref prophecy
-      composition** (scoped + Lean-validated 2026-05-30; full mechanism,
-      estimate, and transparency constraints in § "Returned-mut-ref
-      prophecy composition"). The cross-crate `View` blockers an earlier
-      (2026-05-17) note named here are now *cleared* (the 2026-05-30 View
-      landings); the rebind shape is Lean-native (`Seq::update`); the sole
-      remaining work is threading `vec_index_mut`'s returned `&mut`'s
-      `*final` as a prophecy var and unifying it with the resolving `bump`
-      call (today's #95 rewrite collapses `MutRefFinal`↔`MutRefCurrent` for
-      the returned ref). A bounded #107 sibling. Pinned by
-      `test_exec_call_mut_arg_vec_index_probe`.
+    * `&mut v[i]` (Index L-value) — **LANDED 2026-05-30** via
+      returned-mut-ref prophecy composition (a bounded #107 sibling; full
+      mechanism in § "Returned-mut-ref prophecy composition"). `vec_index_mut`'s
+      returned `&mut`'s `*final` is threaded as a prophecy var `P` and unified
+      with the resolving `bump` call. Pinned by `test_exec_call_mut_arg_vec_index`
+      (+ `_wrong_ensures`).
     * Multi-variant enum field mutation — upstream-blocked at Verus's
       mode check. Verus rejects `ref mut` patterns: "The verifier
       does not yet support the following Rust feature: &mut types,
@@ -1923,20 +1918,16 @@ exec fns."
   tuple's other slot survive the rebind).
 
   **Explicit deferrals (still rejected in `build_wp_call`):**
-  - **`&mut v[i]`** (Index L-value) — **returned-mut-ref prophecy
-    composition** (scoped + Lean-validated + SST-confirmed 2026-05-30;
-    see § "Returned-mut-ref prophecy composition" for the mechanism,
-    estimate, and transparency constraints). The cross-crate `View`
-    emission bugs an earlier (2026-05-17) note named here — standalone/
-    class collision, body-less instance — are now *cleared* (the
-    2026-05-30 View landings; `test_cross_crate_vec_len` is green). The
+  - **`&mut v[i]`** (Index L-value) — **LANDED 2026-05-30** via
+    returned-mut-ref prophecy composition (a bounded #107 sibling; see §
+    "Returned-mut-ref prophecy composition" for the mechanism). The
     `&mut v` arg is Var-shaped (`MutTargetRaw::Var`), the rebind is
-    Lean-native (`Seq::update`); the sole remaining work is threading
-    `vec_index_mut`'s returned `&mut`'s `*final` as a prophecy var and
-    unifying it with the resolving `bump` call (a bounded #107 sibling).
-    In legacy mode `&mut v[i]` is upstream-blocked outright ("index for
-    &mut not supported", `rust_to_vir_expr.rs:3284`). Pinned by
-    `test_exec_call_mut_arg_vec_index_probe`.
+    Lean-native (`Seq::update`), and the returned `&mut`'s `*final` is
+    threaded as a prophecy var `P` unified with the resolving `bump` call.
+    In legacy mode `&mut v[i]` is still upstream-blocked outright ("index
+    for &mut not supported", `rust_to_vir_expr.rs:3284`) — the landing is
+    new-mut-ref mode. Pinned by `test_exec_call_mut_arg_vec_index`
+    (+ `_wrong_ensures`).
   - **Multi-variant enum field mutation** — **upstream-blocked
     at Verus's mode check**. Verus rejects `ref mut` patterns:
     "The verifier does not yet support the following Rust feature:
@@ -2238,7 +2229,8 @@ These are deferred by design — the current slice is single-crate exec+proof-fn
   - **Cross-crate Vec (`len` / `push` / `v[i]` read) — LANDED 2026-05-30.** All verify soundly under `use vstd::prelude::*` — including `push` with `&mut` + `old(v)` and indexed reads. The blocker was never `build_wp_call`'s fn_map rejection (`merge_krates` brings referenced vstd exec fns in *with specs*, so they're in `fn_map` and inline); it was the `v@` (`View::view`) dispatch, fixed by four trait-class + instance-emission landings (see § "Cross-crate View blanket-impl emission" below): trait-method call qualification, blanket-impl forwarding (resolved-kind rewrite gate + forwarding-body synth), erased-allocator binder drop, and `has_resolved` as an uninterpreted Prop. Pinned by `test_cross_crate_vec_len` (+ `_wrong_ensures`).
   - **Un-emittable cross-crate trait classes — degrade, don't panic (LANDED 2026-05-30).** A trait whose method decl is stripped cross-crate (e.g. `core::clone::Clone::clone`, dragged in by a `HashMap` bound) can't be rendered as a faithful Lean `class`. `generate.rs` precomputes `unemittable_traits` (any trait with a method absent from the function map) and skips them in both class-emission loops AND the instance gate; code dispatching through them fails gracefully ("tactus_auto failed") instead of panicking in `trait_to_ast`. The panic stays as a same-crate-bug tripwire. Pinned by `test_cross_crate_unemittable_trait_degrades_not_panics`.
   - **Cross-crate broadcast lemmas referencing `BuiltinSpecFun` — skipped (LANDED 2026-05-30).** vstd's FnMut closure axioms (`axiom_fn_mut_call_requires`/`_ensures`), pulled in by default-on-import, reference a `BuiltinSpecFun` (closure `call_requires`/`call_ensures`) which the VIR-AST renderer has no faithful fixed-arity Lean form for (emits an unresolved literal `builtinSpecFun`). `references_builtin_spec_fun` (sst_to_lean.rs) skips such lemmas at collection — same graceful-skip family as the un-emittable-trait / `FiniteFull` filters. Their facts are unavailable (closure-spec reasoning isn't supported), but emission stays clean.
-  - **Still deferred: `&mut v[i]` + Map/Set *verification*.** `&mut v[i]` (index mutation) is a **returned-mut-ref prophecy-composition** arc — scoped + Lean-validated + SST-confirmed 2026-05-30 (mechanism, estimate, and transparency constraints in § "Returned-mut-ref prophecy composition"). Link 1 (the FnMut `builtinSpecFun` broadcast wall) is cleared by the filter above; the remaining Link 2 is a bounded #107 sibling: `vec_index_mut` returns a `&mut` whose `*final` must be threaded as a prophecy var and unified with the resolving `bump` call (today #107 handles `&mut` *args*, not *returned* refs). `HashMap`/`HashSet` ops fail *gracefully* (the un-emittable-trait skip, above) but don't verify — the full `lean --json` (probed 2026-05-30) shows a multi-bug cross-crate-trait-emission cluster: the skip removes `Clone`/`PartialEq`/`Copy`/`Eq` class *definitions* but leaves dangling *references* to them, plus DeepView outParam mis-application, `Integer`-as-class, and a Box/deref mismatch in `axiom_contains_box` — larger than the Vec arc.
+  - **`&mut v[i]` — LANDED 2026-05-30** via returned-mut-ref prophecy composition (§ "Returned-mut-ref prophecy composition"). Both links cleared: Link 1 (the FnMut `builtinSpecFun` broadcast wall) by the filter above; Link 2 (the returned `&mut`'s prophetic `*final`) by minting a prophecy var `P` at the `vec_index_mut` call and unifying it with the resolving `bump` call. Pinned by `test_exec_call_mut_arg_vec_index` (+ `_wrong_ensures`).
+  - **Still deferred: Map/Set *verification*.** `HashMap`/`HashSet` ops fail *gracefully* (the un-emittable-trait skip, above) but don't verify — the full `lean --json` (probed 2026-05-30) shows a multi-bug cross-crate-trait-emission cluster: the skip removes `Clone`/`PartialEq`/`Copy`/`Eq` class *definitions* but leaves dangling *references* to them, plus DeepView outParam mis-application, `Integer`-as-class, and a Box/deref mismatch in `axiom_contains_box` — larger than the Vec arc.
   - **Dynamic dispatch via `dyn Trait`** — same cross-crate rejection path as #125.
 
   **Broadcast scope** — `collect_broadcast_lemma_funs` (below) handles BOTH default-on-import groups (`broadcast_use_by_default_when_this_crate_is_imported`, e.g. vstd's `group_vstd_default` — the drop-in case) AND fn-body `broadcast use <group>;` (`StmX::Fuel`). Still deferred: **module-level** `broadcast use` (`ModuleX.reveals` — a `broadcast use` at module scope rather than fn-body or default-on-import); needs reading the fn's owning-module reveal list rather than the fn body. Rare for user crates.
@@ -3007,9 +2999,9 @@ fn_map rejection (`merge_krates` brings referenced vstd exec fns in with
 specs); the wall was the `v@` View dispatch, which the four fixes above
 cleared.
 
-**Still deferred.** `&mut v[i]` (index *mutation*) is a returned-mut-ref
-prophecy-composition arc — scoped + Lean-validated 2026-05-30; see
-"Returned-mut-ref prophecy composition" immediately below. Map/Set ops fail
+**`&mut v[i]` (index *mutation*) — LANDED 2026-05-30** via returned-mut-ref
+prophecy composition; see "Returned-mut-ref prophecy composition" immediately
+below. **Still deferred: Map/Set verification.** Map/Set ops fail
 *gracefully* (the un-emittable-trait skip, above) but don't verify — they
 dispatch through cross-crate `Clone`/`PartialEq`/`Copy` classes Tactus
 can't emit; the full `lean --json` (probed 2026-05-30) shows the skip
@@ -3019,10 +3011,34 @@ plus DeepView outParam mis-application, `Integer`-as-class, and a Box/deref
 mismatch in `axiom_contains_box` — a multi-bug trait-emission cluster
 larger than the Vec arc.
 
-### Returned-mut-ref prophecy composition (scoped arc — Lean-validated, NOT landed, 2026-05-30)
+### Returned-mut-ref prophecy composition — LANDED 2026-05-30
 
-The remaining `&mut v[i]` work. **Pinned by `test_exec_call_mut_arg_vec_index_probe`**
-(Err today; flips to Ok when landed).
+`&mut v[i]` (index mutation) verifies. The last blocker was the RETURNED
+`&mut` from `vec_index_mut`. **Pinned by `test_exec_call_mut_arg_vec_index`
+(Ok) + `test_exec_call_mut_arg_vec_index_wrong_ensures` (Err soundness pin —
+`+2` fails, not via a vacuous hypothesis).**
+
+**What landed** (the mechanism below was the scoped plan; it landed verbatim,
+a bounded #107 sibling in `sst_to_lean.rs`):
+* `OblCtx.prophecies` (caller-local → prophecy var `P`), keyed
+  disambiguator-aware via `borrow_mut_key`, flowing with the walk.
+* `push_post_call_frames`: when a call's dest is `MutRef`-typed, mint `P`
+  (∀-bound at the `MutRef T` wrapper typ + inner bound), render the callee's
+  `*final(ret)` AS `P` via `rewrite_return_final_ref` (→ `Var(<ret>_final_tactus)`)
+  + a post-render subst (`<ret>_final_tactus → P.deref`), and register `dest → P`.
+* `build_call_substitutions`: a `&mut`-arg whose local has a registered `P`
+  reuses `P` as its post-state (not a fresh existential — `MutArgInfo.reused_prophecy`);
+  Phase 1 skips the binder (P already bound). The resolving call's
+  `*final == *old+1` then constrains the SAME `P` the introducing call's
+  update used. Generated goal: `view(v)@[i] == update(old@, i, P)[i] == P == old[i]+1`.
+* **Transparency held by construction:** GENERAL over any `MutRef`-typed dest
+  (no `vec_index_mut` name-check); faithful to Verus's `final()` semantics
+  (P visible in the goal); and **no `tactus_auto` simp-set extension** — the
+  closer closed the real goal as-is, so the `spec_index`↔`seq.Seq.index`
+  contingency below was *not needed*.
+
+The original scoping detail (SST shape, root cause, Lean validation) is kept
+below for reference — it landed as written.
 
 **SST shape (confirmed via `--log vir-sst`, not inferred).** `bump(&mut v[0])`
 in new-mut-ref mode lowers to three locals + two linked calls:
@@ -4360,7 +4376,7 @@ When the answers differ, the Lean-native shape is usually shorter, tighter, and 
 * **Tuple field mutation** (`&mut t.<i>`) — LANDED via #145 (arity-2) + #146 (arity > 2). Lean's `{ x with f := v }` syntax doesn't compose with `Prod`, but Lean's tuple syntax `(a, b, c)` does — it's `Prod.mk` sugar that infers from operands without a type hint. The rebind reads each unmodified slot via `tuple_field_accessor(arity, j)` (multi-segment for nested-Prod arity > 2: `.2.1`, `.2.2.1`, etc.) and substitutes `fresh` at the mutated slot. New `ExprNode::Tuple` AST variant; the latent rendering bug at let-bindings (`let t := ⟨x, 0⟩` failing to elaborate without context) was masked because no arity > 2 tuple test existed pre-#145.
 * **Multi-variant enum field mutation** — upstream-blocked at Verus. Direct `&mut foo.f` for enum-typed `foo` isn't expressible in Rust without unsafe; the only viable shape (pattern binding `if let Foo::A { ref mut val }`) is rejected by Verus's mode check ("does not yet support &mut types"). If it ever lifts, the encoding is `match foo with | Foo.A x y => Foo.A fresh y | other => other` — a specific Lean idiom, not a havoc.
 * **Closures (#93)** target Lean's first-class function types directly rather than encoding the FnOnce/Fn/FnMut hierarchy as Z3 axioms. Closure declarations bind `cid` to a real Lean lambda (`fun (x : T) => body`) via `Wp::LetRaw`; calls to spec closures lower to `App(f, args)`. Verus's synthesized `Assume(forall|x| ClosureReq(cid, x) ↔ ... ∧ ClosureEns(cid, x, body(x)) ↔ ...)` is dropped because the lambda binding IS the same fact structurally — no axiomatization needed. The only piece this encoding doesn't yet cover is exec-mode closure CALLS (Verus's `exec_nonstatic_call` desugar), which is upstream-blocked rather than encoding-shaped.
-* **Indexed L-values (`&mut v[i]`)** — the *rebind/update* shape is Lean-native (no `Vector.set`, no havoc): Verus desugars `&mut v[i]` to `vec_index_mut(&mut v, i)`, whose spec `final(vec)@ == old(vec)@.update(i, *final(element))` makes `Seq::update` carry the "index j≠i unchanged" property structurally. *But* this is NOT zero-Tactus-side-work, contrary to an earlier sketch (corrected 2026-05-30): the `*final(element)` is a returned-mut-ref prophecy that Tactus must thread (mint a var, unify with the resolving call) — see § "Returned-mut-ref prophecy composition". The cross-crate `View` blockers the 2026-05-17 sketch named are now *cleared* (the 2026-05-30 View landings), so the prophecy threading is the sole remaining Tactus-side work; the SST/Lean shape is otherwise exactly the Lean-native encoding we want.
+* **Indexed L-values (`&mut v[i]`)** — LANDED 2026-05-30. The *rebind/update* shape is Lean-native (no `Vector.set`, no havoc): Verus desugars `&mut v[i]` to `vec_index_mut(&mut v, i)`, whose spec `final(vec)@ == old(vec)@.update(i, *final(element))` makes `Seq::update` carry the "index j≠i unchanged" property structurally. The one Tactus-side piece — `*final(element)` is a returned-mut-ref *prophecy* — is the returned-mut-ref prophecy composition (§ "Returned-mut-ref prophecy composition"): mint a prophecy var `P`, render `*final(element)` as `P`, unify `P` with the resolving `bump` call's post-state. A good example of the discipline: the SMT-style "havoc + index-unchanged conjunction" sketch was wrong; `Seq.update` + a single prophecy variable is the Lean-native shape.
 * **Caller-side new-mut-ref mode (#107)** — synthetic `LocalDeclKind::BorrowMut` locals from Verus's `bump(&mut y)` lowering are folded into the existing `mut_param_names` set; same architectural pattern as #95 callee-side, applied one layer further. The structural insight: extend recognition rather than build new infrastructure.
 * **Ret-substitution at call sites (#128)** — when a callee's ensures contains `r == E` (uniquely determining the return value), the caller's post-call frames *don't* need a `∀ ret, ret_bound → ensures(ret) → let dest := ret;` chain. Tactus replaces it with `let dest := E; (E_bound) → (ensures with ret := E) → …`, eliminating the ∀-quantifier entirely. Verus's Z3 path emits the ∀ because SMT can't natively substitute a logical variable with a witnessing expression — the ensures clause acts as the substitution glue. Lean substitutes definitionally via `let`. Same fact, structural rather than asserted. Beyond aesthetics: the ∀-Prop shape blocked `tactus_auto`'s default closer (omega rejects ∀-Prop). #128's substitution path makes cond_setup goals (function-call-in-loop-cond) close under the default closer with no override needed — see "Ret-substitution at call sites (#128)" below for the full encoding details.
 * **loop_isolation=false's natural-exit fact (#127)** — Verus's `ast_to_sst` break-lowers `while c { body }` with isolation=false to cond:None + inserted `if !c { break; }`. AIR's `Breakable` primitive preserves state across the break, giving post-loop access to the natural-exit fact `¬c`. Lean's kernel has no control-flow-with-state-preservation primitive; we can't mirror AIR's encoding directly. Instead: preserve the pre-lowering `(cond_setup, cond_exp)` in upstream `StmX::Loop.original_cond`, and have Tactus's `build_wp_loop` recover the cond:Some shape from it (under single-break and label/setup gates that preserve soundness). The existing cond:Some encoding then gives the natural-exit fact via standard while semantics — Lean-native, not a re-encoding of AIR's primitive. The structural insight: don't reproduce a target-specific primitive; preserve the source-level info that the primitive was reconstructing.
