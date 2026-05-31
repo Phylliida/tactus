@@ -289,10 +289,13 @@ fn krate_preamble(
         .filter_map(|ti| {
             let trait_short = short_name(&ti.x.trait_path);
             if !refs.traits.contains(trait_short) { return None; }
-            // Skip instances of un-emittable traits — their class won't
-            // emit, so the instance would dangle (and `trait_to_ast`
-            // would panic on the stripped method).
-            if unemittable_traits.contains(&ti.x.trait_path) { return None; }
+            // Un-emittable (shell) traits now emit as marker-shell
+            // classes, so their instances must emit too — a `marker.Copy
+            // Int` instance needs `clone.Clone Int` to synthesize the
+            // `[clone.Clone Self]` superclass field. The instance's
+            // stripped method impls aren't in `all_fns`, so `method_impls`
+            // comes back empty and `trait_impl_to_ast` emits an empty
+            // (contentless) instance body — exactly what a marker needs.
             // Implementor type check: trait_typ_args[0] is Self.
             // For Dt::Path (a concrete user datatype), require it
             // to be in refs.datatypes. For anything else (primitive,
@@ -454,14 +457,21 @@ fn krate_preamble(
     // ordering relative to spec fns). Emit a trait's `class` iff it's
     // emittable AND something brings it into scope (a typ_bound /
     // dispatch reference, or an instance of it will emit).
+    // Un-emittable traits now emit as method-less *marker shells*
+    // (drop the stripped methods, keep the header) rather than being
+    // skipped — see `trait_to_ast`'s `shell` param. Skipping left
+    // dangling `[clone.Clone Self]` superclass binders on emittable
+    // subclasses (`marker.Copy`), which failed to elaborate and
+    // cascaded; the shell makes those binders resolve. The shell
+    // asserts nothing (no methods, no laws), so it's sound and is the
+    // trait-level analog of external-body opaque-type emission (#122).
     let should_emit_class = |tr: &TraitX| -> bool {
         let n = short_name(&tr.name);
-        !unemittable_traits.contains(&tr.name)
-            && (refs.traits.contains(n) || traits_with_emitted_impl.contains(n))
+        refs.traits.contains(n) || traits_with_emitted_impl.contains(n)
     };
     for tr in &krate.traits {
         if !trait_has_proof_method(&tr.x) && should_emit_class(&tr.x) {
-            cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies)));
+            cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies, &unemittable_traits)));
         }
     }
 
@@ -527,7 +537,7 @@ fn krate_preamble(
     // Prop-typed class fields reference the spec fns in scope).
     for tr in &krate.traits {
         if trait_has_proof_method(&tr.x) && should_emit_class(&tr.x) {
-            cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies)));
+            cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies, &unemittable_traits)));
         }
     }
 
@@ -542,7 +552,7 @@ fn krate_preamble(
         let empty_subst = crate::impl_subst::ImplSubst::default();
         let subst = impl_substs.get(&ti.x.impl_path).unwrap_or(&empty_subst);
         cmds.push(Command::Instance(
-            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, tactic_bodies, subst)
+            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, tactic_bodies, subst, &unemittable_traits)
         ));
     }
 
