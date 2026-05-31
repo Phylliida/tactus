@@ -556,36 +556,10 @@ fn krate_preamble(
             crate::impl_subst::maybe_augment_standalone_fn(f, &trait_lookup)
         }
     };
-    for group in &groups {
-        match group {
-            FnGroup::Single(f) => {
-                let augmented = augment(f);
-                cmds.push(to_lean_fn::spec_fn_to_ast(&augmented, &fn_map, &unemittable_traits));
-            }
-            FnGroup::Mutual(fns) => {
-                let inner: Vec<Command> = fns.iter()
-                    .map(|f| {
-                        let augmented = augment(f);
-                        to_lean_fn::spec_fn_to_ast(&augmented, &fn_map, &unemittable_traits)
-                    })
-                    .collect();
-                cmds.push(Command::Mutual(inner));
-            }
-        }
-    }
-
-    // Classes WITH proof-fn methods emit AFTER spec fns (their
-    // Prop-typed class fields reference the spec fns in scope).
-    for tr in &krate.traits {
-        if trait_has_proof_method(&tr.x) && should_emit_class(&tr.x) {
-            cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies, &unemittable_traits)));
-        }
-    }
-
-    // Emit the Instance commands chosen above (after spec_fns so
-    // standalone defs that instance method bodies might reference
-    // are already declared).
-    for (ti, method_impls) in &instances_to_emit {
+    // Per-instance / proof-class emit helpers — take `&mut cmds` rather
+    // than capturing it, so they coexist with the group-emit borrows.
+    let emit_instance = |cmds: &mut Vec<Command>, j: usize| {
+        let (ti, method_impls) = &instances_to_emit[j];
         let assoc_types: Vec<&AssocTypeImplX> = krate.assoc_type_impls.iter()
             .filter(|a| a.x.impl_path == ti.x.impl_path)
             .map(|a| &a.x)
@@ -595,6 +569,59 @@ fn krate_preamble(
         cmds.push(Command::Instance(
             to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, tactic_bodies, subst, &unemittable_traits)
         ));
+    };
+    // Classes WITH proof-fn methods: their Prop-typed fields reference
+    // spec fns, and proof-trait instances reference them — so they sit at
+    // the spec-fn/instance boundary (after the last spec-fn group).
+    let emit_proof_classes = |cmds: &mut Vec<Command>| {
+        for tr in &krate.traits {
+            if trait_has_proof_method(&tr.x) && should_emit_class(&tr.x) {
+                cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies, &unemittable_traits)));
+            }
+        }
+    };
+
+    // Topologically order spec-fn groups and trait instances together so
+    // the spec-fn↔instance dependency DAG is respected in one pass: an
+    // instance a spec-fn body dispatches to (`hash_map_deep_view_impl`'s
+    // `m@` → `View (HashMap …)`) emits BEFORE that spec fn; an instance
+    // whose body references a spec-fn def (`DeepView (HashMap …)` →
+    // `hash_map_deep_view_impl`) emits AFTER it. Instances nothing
+    // dispatches to keep their trailing slot (zero drift). See
+    // `dep_order::order_emission`.
+    let instance_keys: Vec<_> = instances_to_emit.iter()
+        .map(|(ti, methods)| (&ti.x.impl_path, methods.clone()))
+        .collect();
+    let order = dep_order::order_emission(&groups, &instance_keys);
+    let last_group_pos = order.iter()
+        .rposition(|s| matches!(s, dep_order::EmitStep::Group(_)));
+
+    // No spec-fn groups at all: proof classes have nothing to wait on.
+    if last_group_pos.is_none() {
+        emit_proof_classes(&mut cmds);
+    }
+    for (pos, step) in order.iter().enumerate() {
+        match step {
+            dep_order::EmitStep::Group(i) => match &groups[*i] {
+                FnGroup::Single(f) => {
+                    let augmented = augment(f);
+                    cmds.push(to_lean_fn::spec_fn_to_ast(&augmented, &fn_map, &unemittable_traits));
+                }
+                FnGroup::Mutual(fns) => {
+                    let inner: Vec<Command> = fns.iter()
+                        .map(|f| {
+                            let augmented = augment(f);
+                            to_lean_fn::spec_fn_to_ast(&augmented, &fn_map, &unemittable_traits)
+                        })
+                        .collect();
+                    cmds.push(Command::Mutual(inner));
+                }
+            },
+            dep_order::EmitStep::Instance(j) => emit_instance(&mut cmds, *j),
+        }
+        if Some(pos) == last_group_pos {
+            emit_proof_classes(&mut cmds);
+        }
     }
 
     // Emit proof-fn theorems for helper proof fns the root fn might
