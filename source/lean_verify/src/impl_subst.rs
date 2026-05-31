@@ -82,6 +82,23 @@ use vir::ast::{
 };
 use vir::def::Spanned;
 
+/// Prefix for the synthetic associated-type binders `fresh_binder_name`
+/// produces (`_tactus_assoc_<X>_<Trait>_<N>`). Each is constrained via
+/// its trait's outParam instance bracket (`[Trait X _tactus_assoc_X_Trait_N]`),
+/// so Lean infers it at use sites — these binders MUST render as
+/// **implicit**, not explicit. Otherwise VIR-rendered call sites (which
+/// pass only the original typ_args, knowing nothing of the synthetic
+/// params) fail with an arity mismatch. Centralised here so the binder
+/// renderer (`to_lean_fn::fn_binders`) and the generator agree on the
+/// convention rather than duplicating the magic prefix.
+pub const ASSOC_BINDER_PREFIX: &str = "_tactus_assoc_";
+
+/// True iff `name` is a synthetic associated-type binder (see
+/// [`ASSOC_BINDER_PREFIX`]) — i.e. should render as an implicit binder.
+pub fn is_assoc_binder(name: &str) -> bool {
+    name.starts_with(ASSOC_BINDER_PREFIX)
+}
+
 fn fresh_binder_name(x: &Ident, trait_path: &Path, assoc: &Ident) -> Ident {
     // Trait short name is the last segment of `trait_path`. Including
     // it disambiguates `_tactus_assoc_A_V` when the same X is bounded
@@ -90,7 +107,7 @@ fn fresh_binder_name(x: &Ident, trait_path: &Path, assoc: &Ident) -> Ident {
     let trait_short = trait_path.segments.last()
         .map(|s| s.as_str()).unwrap_or("_");
     Arc::new(format!(
-        "_tactus_assoc_{}_{}_{}", x.as_str(), trait_short, assoc.as_str()
+        "{}{}_{}_{}", ASSOC_BINDER_PREFIX, x.as_str(), trait_short, assoc.as_str()
     ))
 }
 
@@ -365,7 +382,8 @@ impl ImplSubst {
             Spanned::new(p.span.clone(), new_x)
         }).collect();
 
-        let body = match (&f.body, &self.method_context) {
+        // Step 1: self-sibling call rewrite (method_context impls only).
+        let sibling_rewritten = match (&f.body, &self.method_context) {
             (Some(body), Some(ctx)) => Some(rewrite_self_sibling_calls(
                 body,
                 &ctx.trait_path,
@@ -373,6 +391,26 @@ impl ImplSubst {
                 &ctx.method_redirects,
             )),
             _ => f.body.clone(),
+        };
+        // Step 2: lift assoc-type projections embedded in the BODY's typs
+        // (lambda binder annotations, call/ctor type-args, …) to the same
+        // fresh binders the signature rewrite uses. The param/ret rewrite
+        // above is signature-only; a standalone generic spec fn like
+        // `hash_map_deep_view_impl` also carries `<X as Trait>::N`
+        // projections in its body (`fun (k : DeepView.V Key) => …`,
+        // `Map.new (DeepView.V Key) …`), which would otherwise render as
+        // the malformed `view.DeepView.V Key` accessor. No-op when there
+        // are no projections (proj_map empty → every existing fn body is
+        // returned unchanged). The rewrite is infallible (rewrite_typ_rec
+        // is total over TypX).
+        let body = match sibling_rewritten {
+            Some(b) if !self.proj_map.is_empty() => Some(
+                vir::ast_visitor::map_expr_typ_visitor(&b, &|t| {
+                    Ok(rewrite_typ_rec(t, &self.proj_map))
+                })
+                .expect("map_expr_typ_visitor: projection rewrite is total"),
+            ),
+            other => other,
         };
 
         // Rename the function's `name` when the impl-method natural
@@ -651,6 +689,42 @@ pub fn maybe_augment_impl_method(
         }
     }
     f.clone()
+}
+
+/// Lift associated-type projections in a STANDALONE generic function
+/// (a spec/proof fn whose `FunctionKind` is not `TraitMethodImpl`, so
+/// it has no enclosing impl in `impl_substs`). Mirrors
+/// [`maybe_augment_impl_method`] but drives [`ImplSubst::build`] from the
+/// fn's OWN `typ_params` / `typ_bounds` + signature typs — no impl, no
+/// `method_context` (so no self-sibling rewrite, no name-prefix rename).
+/// Returns `f` unchanged when it has no liftable projections (empty subst).
+///
+/// This is the RC2 generalization: projection-lifting is a property of
+/// **every** emitted generic function, not just impl methods. The
+/// canonical consumer is vstd's `std_specs::hash::hash_map_deep_view_impl`
+/// — a `pub open spec fn` generic over `<Key: DeepView, Value: DeepView>`
+/// returning `Map<<Key as DeepView>::V, <Value as DeepView>::V>` and
+/// referencing the same projections in its body. `DeepView`'s assoc type
+/// `V` is an `outParam`, so the projection can't render as an accessor;
+/// the lift replaces each with a fresh `_tactus_assoc_X_DeepView_V` binder
+/// constrained via the bound's instance bracket (the Bug-B mechanism).
+///
+/// `build`'s "Source 2" (uncovered assoc-type slots on bound traits)
+/// covers body-only projections too: any `X` with a `DeepView X` bound
+/// gets a fresh binder for each of `DeepView`'s assoc types regardless of
+/// where (signature or body) the projection appears — so the body walk in
+/// `augment_function` always finds the projection in `proj_map`.
+pub fn maybe_augment_standalone_fn(
+    f: &FunctionX,
+    traits: &HashMap<Path, &TraitX>,
+) -> FunctionX {
+    let sig_typs =
+        std::iter::once(&f.ret.x.typ).chain(f.params.iter().map(|p| &p.x.typ));
+    let subst = ImplSubst::build(&f.typ_params, &f.typ_bounds, sig_typs, traits);
+    if subst.is_empty() {
+        return f.clone();
+    }
+    subst.augment_function(f)
 }
 
 #[cfg(test)]

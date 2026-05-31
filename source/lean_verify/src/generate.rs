@@ -542,16 +542,30 @@ fn krate_preamble(
     // the class-qualified form via typeclass dispatch
     // (`to_lean_expr::call_to_node`); instance method bodies use
     // bare standalone-def references via `strip_class_qualifier`.
+    // Lift associated-type projections (`<X as Trait>::N` over an
+    // abstract type-param, un-renderable because Tactus emits assoc types
+    // as `outParam`). TraitMethodImpl methods use the pre-built per-impl
+    // subst (with method_context for sibling rewrites + name prefix);
+    // standalone generic spec fns build their own subst from their own
+    // typ_params/bounds (RC2 — e.g. `hash_map_deep_view_impl`). Both are
+    // no-ops for fns without projections.
+    let augment = |f: &vir::ast::FunctionX| -> vir::ast::FunctionX {
+        if matches!(f.kind, FunctionKind::TraitMethodImpl { .. }) {
+            crate::impl_subst::maybe_augment_impl_method(f, &impl_substs)
+        } else {
+            crate::impl_subst::maybe_augment_standalone_fn(f, &trait_lookup)
+        }
+    };
     for group in &groups {
         match group {
             FnGroup::Single(f) => {
-                let augmented = crate::impl_subst::maybe_augment_impl_method(f, &impl_substs);
+                let augmented = augment(f);
                 cmds.push(to_lean_fn::spec_fn_to_ast(&augmented, &fn_map, &unemittable_traits));
             }
             FnGroup::Mutual(fns) => {
                 let inner: Vec<Command> = fns.iter()
                     .map(|f| {
-                        let augmented = crate::impl_subst::maybe_augment_impl_method(f, &impl_substs);
+                        let augmented = augment(f);
                         to_lean_fn::spec_fn_to_ast(&augmented, &fn_map, &unemittable_traits)
                     })
                     .collect();

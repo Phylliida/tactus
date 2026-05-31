@@ -11658,15 +11658,23 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Graceful degradation on the Map/Set operations RC1 doesn't yet fully
-// unblock. `contains_key` additionally needs DeepView outParam handling
-// (RC2), the `DefaultHasher` opaque-type axiom (RC3), and the Box-key
-// borrow coercion (RC4) — all separate from the RC1 marker-shell
-// cluster. Until those land it must still fail GRACEFULLY (Lean ran,
-// `tactus_auto failed`) rather than panic in `trait_to_ast`. (Pre-RC1
-// the failure was unknown-identifier cascade from the skipped marker
-// classes; post-RC1 those classes emit as shells and the residual is
-// the RC2/RC3/RC4 set.)
+// Graceful degradation on `HashMap::contains_key`. RC1 (marker shells),
+// RC3 (DefaultHasher), and RC4 (Box-key coercion) are landed; the RC2
+// projection-lift now fixes the DeepView outParam *signature/body* errors
+// on `hash_map_deep_view_impl` (the `view.DeepView.V Key`-as-accessor
+// cascade is gone). What remains is a deeper deep-view-specific stack the
+// projection errors were masking, probed 2026-05-31 (`lean --json`):
+//   (3) the broadcast lemma `axiom_hashmap_deepview_borrow` carries the
+//       same projections in its ENSURE clause (not params/ret/body), which
+//       `augment_function` doesn't yet rewrite;
+//   (4) View-instance synthesis inside the deep_view body —
+//       `failed to synthesize View (HashMap …) ?V` in a fully polymorphic
+//       context;
+//   (5) `Classical.epsilon` in the body needs `[Nonempty Key]`.
+// Until those land `contains_key` must still fail GRACEFULLY (Lean ran,
+// `tactus_auto failed`) rather than panic in `trait_to_ast`. (`HashSet::
+// contains` — which has no deep-view map projection — fully verifies; see
+// `test_cross_crate_set_contains`.)
 test_verify_one_file! {
     #[test] test_cross_crate_unemittable_trait_degrades_not_panics verus_code! {
         use vstd::prelude::*;

@@ -1875,6 +1875,37 @@ where
     )
 }
 
+/// Rewrite every `Typ` embedded anywhere in `expr` (binder type
+/// annotations, call type-args, ctor type-args, cast targets, …) via
+/// `ft`, leaving the expression structure otherwise unchanged. The
+/// expr/stmt/place callbacks are identity; only the typ callback fires.
+///
+/// Tactus consumer: `lean_verify::impl_subst` lifts associated-type
+/// projections (`<X as Trait>::N`) to fresh type-param binders in
+/// generic-function bodies (RC2). The body of a spec fn like
+/// `std_specs::hash::hash_map_deep_view_impl` carries projections in
+/// lambda binder annotations and `Map<_,_>` type-args, which the
+/// signature-only rewrite in `ImplSubst::augment_function` doesn't
+/// reach. Exposed `pub` (mirroring `map_expr_visitor` /
+/// `map_expr_place_visitor`) so the fork's `lean_verify` crate can
+/// drive VIR's exhaustive expr walker rather than hand-rolling a
+/// second one — see DESIGN.md § "Potential future infrastructure →
+/// Public TypX walker for lean_verify".
+pub fn map_expr_typ_visitor<FT>(expr: &Expr, ft: &FT) -> Result<Expr, VirErr>
+where
+    FT: Fn(&Typ) -> Result<Typ, VirErr>,
+{
+    map_expr_visitor_env(
+        expr,
+        &mut air::scope_map::ScopeMap::new(),
+        &mut (),
+        &|_state, _, expr| Ok(expr.clone()),
+        &|_state, _, stmt| Ok(vec![stmt.clone()]),
+        &|_state, typ| ft(typ),
+        &|_state, _, place| Ok(place.clone()),
+    )
+}
+
 pub(crate) fn map_param_visitor<E, FT>(param: &Param, env: &mut E, ft: &FT) -> Result<Param, VirErr>
 where
     FT: Fn(&mut E, &Typ) -> Result<Typ, VirErr>,

@@ -2273,10 +2273,20 @@ fn fn_binders_with_bounds(f: &FunctionX, include_bound_hyps: bool, unemittable: 
         } else {
             LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Type")))
         };
+        // Synthetic associated-type binders (from impl_subst's projection
+        // lift) render IMPLICIT — they're determined by their trait's
+        // outParam instance bracket, so Lean infers them and VIR-rendered
+        // call sites (passing only the original typ_args) typecheck. All
+        // user-written typ_params stay explicit.
+        let kind = if crate::impl_subst::is_assoc_binder(tp.as_str()) {
+            BinderKind::Implicit
+        } else {
+            BinderKind::Explicit
+        };
         out.push(LBinder {
             name: Some(crate::lean_name::LeanName::lit(tp.as_str())),
             ty,
-            kind: BinderKind::Explicit,
+            kind,
         });
     }
 
