@@ -479,7 +479,26 @@ fn krate_preamble(
     // not synthesized closure types (#93), then transitively close over
     // field-type references and group into SCCs so mutually recursive
     // datatypes (#109) emit as `mutual ... end` blocks.
-    let referenced_dts = collect_referenced_datatypes(krate, &refs);
+    //
+    // Seed extra datatype roots from the EMITTED instance heads
+    // (trait_typ_args + assoc-type values). An external-body opaque type
+    // that appears ONLY in an instance head — e.g. `DefaultHasher` in
+    // the synthesized `instance : hash.BuildHasher RandomState
+    // DefaultHasher` — is never reached by the fn-body dep-walk, so its
+    // `axiom T : Type` would never emit ("Unknown constant
+    // DefaultHasher"). Walking the instance heads we're about to emit
+    // closes that gap. (#122 RC3)
+    let mut instance_seed_paths: std::collections::HashSet<&vir::ast::Path> =
+        std::collections::HashSet::new();
+    for (ti, _) in &instances_to_emit {
+        for t in ti.x.trait_typ_args.iter() {
+            dep_order::walk_typ_paths(t, &mut |q| { instance_seed_paths.insert(q); });
+        }
+        for a in krate.assoc_type_impls.iter().filter(|a| a.x.impl_path == ti.x.impl_path) {
+            dep_order::walk_typ_paths(&a.x.typ, &mut |q| { instance_seed_paths.insert(q); });
+        }
+    }
+    let referenced_dts = collect_referenced_datatypes(krate, &refs, &instance_seed_paths);
     // Set of paths for external-body datatypes (`transparency == Never`).
     // Used by `datatype_decl_cmd` to drop `deriving Inhabited` when a
     // variant field references such a type — Lean's auto-derived
@@ -943,6 +962,11 @@ pub fn check_exec_fn(
 fn collect_referenced_datatypes<'a>(
     krate: &'a vir::ast::KrateX,
     refs: &dep_order::References<'_>,
+    // Extra root paths beyond `refs.datatypes` — datatypes referenced
+    // only by emitted instance heads (see caller, #122 RC3). Seeded into
+    // the worklist alongside the fn-body refs so their (transitive)
+    // declarations emit.
+    extra_seed: &std::collections::HashSet<&'a vir::ast::Path>,
 ) -> Vec<&'a vir::ast::DatatypeX> {
     use std::collections::{HashMap, HashSet};
     let path_to_dt: HashMap<&'a vir::ast::Path, &'a vir::ast::DatatypeX> =
@@ -959,7 +983,7 @@ fn collect_referenced_datatypes<'a>(
 
     let mut seen: HashSet<&'a vir::ast::Path> = HashSet::new();
     let mut worklist: Vec<&'a vir::ast::Path> = path_to_dt.keys()
-        .filter(|p| refs.datatypes.contains(short_name(p)))
+        .filter(|p| refs.datatypes.contains(short_name(p)) || extra_seed.contains(*p))
         .copied()
         .collect();
     while let Some(p) = worklist.pop() {
