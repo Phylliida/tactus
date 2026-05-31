@@ -2227,10 +2227,14 @@ These are deferred by design — the current slice is single-crate exec+proof-fn
   Tasks still tracked under cross-crate umbrella:
   - **#125 cross-crate trait method decls** — when the trait method decl's `Fun` isn't in `fn_map` (genuinely cross-crate from a non-vstd-prelude path), `spec_source` returns Err. Currently rare in practice because vstd's traits aren't usually trait_method_impl'd in user crates that Tactus verifies.
   - **Cross-crate Vec (`len` / `push` / `v[i]` read) — LANDED 2026-05-30.** All verify soundly under `use vstd::prelude::*` — including `push` with `&mut` + `old(v)` and indexed reads. The blocker was never `build_wp_call`'s fn_map rejection (`merge_krates` brings referenced vstd exec fns in *with specs*, so they're in `fn_map` and inline); it was the `v@` (`View::view`) dispatch, fixed by four trait-class + instance-emission landings (see § "Cross-crate View blanket-impl emission" below): trait-method call qualification, blanket-impl forwarding (resolved-kind rewrite gate + forwarding-body synth), erased-allocator binder drop, and `has_resolved` as an uninterpreted Prop. Pinned by `test_cross_crate_vec_len` (+ `_wrong_ensures`).
-  - **Un-emittable cross-crate trait classes — degrade, don't panic (LANDED 2026-05-30).** A trait whose method decl is stripped cross-crate (e.g. `core::clone::Clone::clone`, dragged in by a `HashMap` bound) can't be rendered as a faithful Lean `class`. `generate.rs` precomputes `unemittable_traits` (any trait with a method absent from the function map) and skips them in both class-emission loops AND the instance gate; code dispatching through them fails gracefully ("tactus_auto failed") instead of panicking in `trait_to_ast`. The panic stays as a same-crate-bug tripwire. Pinned by `test_cross_crate_unemittable_trait_degrades_not_panics`.
+  - **Cross-crate marker traits — shell classes + chokepoint bound-drop (LANDED 2026-05-30, reshaped 2026-05-31).** A trait whose method decl is stripped cross-crate (e.g. `core::clone::Clone`, dragged in by a `HashMap` bound) can't render as a faithful Lean `class`. The 2026-05-30 version *skipped* such traits — but emittable subclasses that bound on them (`marker.Copy : [clone.Clone Self]`) kept dangling superclass binders → a cascade. The 2026-05-31 reshape (#122 RC1): emit them as contentless **marker shells** (drop the stripped methods, keep the header), and drop every bound that *references* a shell trait at the shared `trait_bounds_to_ast_with` chokepoint (a contentless bound loses no provable fact). Shell-trait *instances* are skipped (dead once their bounds are dropped, and they dangle on un-reached traits like `marker.Copy`). The `trait_to_ast` panic stays a same-crate-bug tripwire. Verifies `HashMap::len` + spec/proof fns generic over `<T: Clone>`; Map/Set `contains_key` still degrades gracefully. See § "Cross-crate marker-shell trait emission". Pinned by `test_cross_crate_map_len`, `_spec_fn_clone_bound`, `_proof_fn_clone_bound`, `_unemittable_trait_degrades_not_panics`.
   - **Cross-crate broadcast lemmas referencing `BuiltinSpecFun` — skipped (LANDED 2026-05-30).** vstd's FnMut closure axioms (`axiom_fn_mut_call_requires`/`_ensures`), pulled in by default-on-import, reference a `BuiltinSpecFun` (closure `call_requires`/`call_ensures`) which the VIR-AST renderer has no faithful fixed-arity Lean form for (emits an unresolved literal `builtinSpecFun`). `references_builtin_spec_fun` (sst_to_lean.rs) skips such lemmas at collection — same graceful-skip family as the un-emittable-trait / `FiniteFull` filters. Their facts are unavailable (closure-spec reasoning isn't supported), but emission stays clean.
   - **`&mut v[i]` — LANDED 2026-05-30** via returned-mut-ref prophecy composition (§ "Returned-mut-ref prophecy composition"). Both links cleared: Link 1 (the FnMut `builtinSpecFun` broadcast wall) by the filter above; Link 2 (the returned `&mut`'s prophetic `*final`) by minting a prophecy var `P` at the `vec_index_mut` call and unifying it with the resolving `bump` call. Pinned by `test_exec_call_mut_arg_vec_index` (+ `_wrong_ensures`).
-  - **Still deferred: Map/Set *verification*.** `HashMap`/`HashSet` ops fail *gracefully* (the un-emittable-trait skip, above) but don't verify — the full `lean --json` (probed 2026-05-30) shows a multi-bug cross-crate-trait-emission cluster: the skip removes `Clone`/`PartialEq`/`Copy`/`Eq` class *definitions* but leaves dangling *references* to them, plus DeepView outParam mis-application, `Integer`-as-class, and a Box/deref mismatch in `axiom_contains_box` — larger than the Vec arc.
+  - **Map/Set: `len` verifies; `contains`/`contains_key` deferred on RC2 + RC4 (2026-05-31).** `HashMap::len()` verifies end-to-end (RC1 marker shells + RC3 instance-head opaque-type seeding — both below). The earlier "dangling references" framing was corrected by a live re-probe: RC1's chokepoint bound-drop dissolved the whole `Clone`/`PartialEq`/`Copy`/`Eq`/`Integer` cascade (it was *bounds* referencing un-emittable traits, not bare references), and RC3 cleared `DefaultHasher`. `contains_key` / `HashSet::contains` still fail *gracefully*; the residual is two operation-specific blockers:
+    - **RC2 — DeepView outParam projection.** `view.DeepView`'s assoc type `V` is an `outParam`, but `std_specs.hash.hash_map_deep_view_impl` projects `view.DeepView.V Key` as if `V` were an accessor → "type expected, got". Bug-B-shaped — extend `impl_subst`'s assoc-type-projection handling (fresh `_tactus_assoc_X_V` binder + fake TypEquality) from instance *signatures* to this standalone *def*. Map-with-deep-view-specific (HashSet `contains` doesn't hit it).
+    - **RC4 — Box-key cross-crate coercion.** Verus's `axiom_contains_box` ensures `contains_borrowed_key(m,k) <==> m.contains_key(Box::new(*k))`. Verus treats `Box::new` as spec-transparent, so the VIR key arg is a bare `Q`-typed value, but `contains_key`'s key param is `Box<Q>` → "Application type mismatch: k.deref" (the wrapper-faithfulness seam — Verus collapses Box at the value level, Tactus keeps `Tactus.Box Q` distinct). Fix needs typ-arg substitution into the callee's generic param types (`K ↦ Box<Q>`) then a `Q → Box Q` bridge — the same machinery family as the Cluster A/B typed-substitution work. Shared by both `contains_key` and `HashSet::contains`.
+    
+    So `HashSet::contains` needs RC4 only (no DeepView); `HashMap::contains_key` needs RC2 + RC4. Each is its own focused arc (RC2 bigger than RC4); larger than the Vec arc but each has a precedent.
   - **Dynamic dispatch via `dyn Trait`** — same cross-crate rejection path as #125.
 
   **Broadcast scope** — `collect_broadcast_lemma_funs` (below) handles BOTH default-on-import groups (`broadcast_use_by_default_when_this_crate_is_imported`, e.g. vstd's `group_vstd_default` — the drop-in case) AND fn-body `broadcast use <group>;` (`StmX::Fuel`). Still deferred: **module-level** `broadcast use` (`ModuleX.reveals` — a `broadcast use` at module scope rather than fn-body or default-on-import); needs reading the fn's owning-module reveal list rather than the fn body. Rare for user crates.
@@ -3001,15 +3005,83 @@ cleared.
 
 **`&mut v[i]` (index *mutation*) — LANDED 2026-05-30** via returned-mut-ref
 prophecy composition; see "Returned-mut-ref prophecy composition" immediately
-below. **Still deferred: Map/Set verification.** Map/Set ops fail
-*gracefully* (the un-emittable-trait skip, above) but don't verify — they
-dispatch through cross-crate `Clone`/`PartialEq`/`Copy` classes Tactus
-can't emit; the full `lean --json` (probed 2026-05-30) shows the skip
-removes those class *definitions* but leaves dangling *references*
-(`class marker.Copy … [clone.Clone Self]`, axiom binders `[cmp.Eq Q]`),
-plus DeepView outParam mis-application, `Integer`-as-class, and a Box/deref
-mismatch in `axiom_contains_box` — a multi-bug trait-emission cluster
-larger than the Vec arc.
+below. **Map/Set: `HashMap::len` verifies (2026-05-31); `contains` deferred
+on RC2 + RC4.** The 2026-05-30 "multi-bug cluster" framing was largely
+dissolved by a live re-probe: the `Clone`/`PartialEq`/`Copy`/`Eq`/`Integer`
+errors were *bounds* referencing un-emittable traits (not bare references),
+all cleared by RC1's marker-shell + chokepoint bound-drop; `DefaultHasher`
+cleared by RC3. The genuine residual is two operation-specific blockers,
+RC2 (DeepView outParam projection) and RC4 (the Box-key wrapper-faithfulness
+coercion) — see § "Cross-crate marker-shell trait emission" and the Phase-3
+Map/Set bullet for the full breakdown.
+
+### Cross-crate marker-shell trait emission — LANDED 2026-05-31 (#122 RC1/RC3)
+
+Brings the first cross-crate `HashMap`/`HashSet`-bearing fns to verification:
+`HashMap::len()` and any spec/proof fn generic over a cross-crate-stripped
+trait bound (`<T: Clone>`) verify end-to-end. The arc landed across RC1
+(marker shells + chokepoint bound-drop), RC3 (instance-head opaque-type
+seeding), a review pass (centralize the filter), and a coverage fix
+(skip shell instances). Final shape:
+
+**The cascade.** A `HashMap<u8,u8>` drags in `core::clone::Clone` /
+`core::cmp::PartialEq`, whose method decls are stripped cross-crate, so they
+can't render as faithful Lean classes. The emittable marker traits that
+bound on them (`marker.Copy : [clone.Clone Self]`, `cmp.Eq : [cmp.PartialEq
+Self Self]`) were emitted *with those superclass binders*, referencing
+not-emitted classes → a 22-error unknown-identifier cascade across every
+`[marker.Copy _]` / `[cmp.Eq _]` site. The blocker is type-driven (the
+HashMap *type's* bounds), so it hit every operation uniformly.
+
+**RC1 — marker shells + chokepoint bound-drop.**
+* **Shells (`trait_to_ast`'s `unemittable` param).** An un-emittable trait
+  emits as a contentless `class clone.Clone (Self : Type) where` — the
+  stripped methods dropped (`filter_map`), the header kept. A shell asserts
+  no methods and no laws, so it can't make any obligation falsely provable
+  — the trait-level analog of external-body-type opaque emission. (A missing
+  method on a NON-shell trait still panics: a genuine same-crate bug.)
+* **Chokepoint bound-drop (`drop_unemittable_trait_bounds`).** Every bound
+  that *references* a shell trait (`[clone.Clone Self]` superclass,
+  `[clone.Clone K]` / `[cmp.PartialEq T T]` instance binders, AND fn-level
+  generic bounds on spec/proof fns) is dropped. A bound on a contentless
+  marker carries no provable fact — same justification as the #122 B3
+  head-undetermined-binder drop. The filter lives at the single shared
+  renderer chokepoint `trait_bounds_to_ast_with`, so all bound sites are
+  covered uniformly and a new caller can't miss it (review pass, `f5d699d`).
+  Keeping the bounds instead is *unsatisfiable*: `[clone.Clone X]` over an
+  abstract X has no base instance, and `Copy ↔ Clone` (superclass + blanket)
+  forms a resolution cycle.
+* **Shell *instances* are skipped.** Once the bound-drop removes every
+  `[clone.Clone X]`, nothing synthesizes a shell-trait instance — they're
+  dead. And they DANGLE: `instance {A} [marker.Copy A] : clone.Clone A`
+  bounds on `marker.Copy`, not emitted in a crate without a `HashMap`
+  (surfaced by a coverage probe on a bare `<T: Clone>` fn; the `contains_key`
+  probe had only elaborated past it because `marker.Copy` happened to be
+  reached there). The shell *class* still emits (a harmless marker that
+  resolves any stray reference); only the instances are skipped.
+
+  *Lesson (worth keeping): RC1's first cut emitted shell instances thinking
+  `marker.Copy Int` needed `clone.Clone Int` to satisfy its superclass — but
+  the chokepoint bound-drop then removed that superclass, making the
+  instances both dead and dangerous. The bound-drop was the real fix; the
+  instance emission was over-build, caught by a coverage probe of an untested
+  path (review-by-reading + a green suite had missed it).*
+
+**RC3 — opaque types referenced only by instance heads.**
+`collect_referenced_datatypes` seeded only from fn-body refs + the field-type
+closure. An external-body opaque type appearing ONLY in an emitted instance
+head — `hash.random.DefaultHasher` in `instance : hash.BuildHasher
+RandomState DefaultHasher` — was never reached, so its `axiom T : Type`
+never emitted ("Unknown constant"). Fix: also seed from the emitted
+instances' `trait_typ_args` + assoc-type values.
+
+**Pinned by** `test_cross_crate_map_len` (Ok), `_spec_fn_clone_bound`,
+`_proof_fn_clone_bound`, `_unemittable_trait_degrades_not_panics` (Err —
+graceful Map/Set degradation, no panic), plus unit tests
+`trait_bounds_to_ast_drops_shell_trait_bounds` (chokepoint filter) and
+`collect_referenced_datatypes_honours_extra_seed` (RC3 seed). 468 e2e, 263
+lean_verify lib. Residual for `contains`/`contains_key` is RC2 (DeepView
+outParam) + RC4 (Box-key coercion) — see the Phase-3 Map/Set bullet.
 
 ### Returned-mut-ref prophecy composition — LANDED 2026-05-30
 
