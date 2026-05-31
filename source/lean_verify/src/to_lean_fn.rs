@@ -1273,7 +1273,19 @@ pub fn trait_to_ast(
     tr: &TraitX,
     method_lookup: &HashMap<&Fun, &FunctionX>,
     tactic_bodies: &HashMap<Fun, String>,
+    // Set of un-emittable (shell) trait paths — those with a method decl
+    // stripped cross-crate (e.g. `core::clone::Clone`). A trait in this
+    // set is emitted as a method-less *marker shell* (drop the stripped
+    // methods, keep the class header). The shell carries no methods and
+    // no laws, so it asserts nothing — it can't make any obligation
+    // falsely provable (same category as external-body-type opaque
+    // axioms). For a NON-shell trait a missing method is a genuine
+    // same-crate bug, so we still panic. The set is also used to drop
+    // superclass bounds that REFERENCE a shell trait (a contentless
+    // bound; see `drop_unemittable_trait_bounds`) (#122).
+    unemittable: &std::collections::HashSet<Path>,
 ) -> Class {
+    let shell = unemittable.contains(&tr.name);
     // Positional class binders: `(Self : Type) (T : Type) … (Item : outParam Type)`.
     let mut typ_params: Vec<LBinder> = Vec::new();
     typ_params.push(LBinder {
@@ -1300,7 +1312,7 @@ pub fn trait_to_ast(
     // (`Self%`) normalizes to `Self` (the class's outer type variable)
     // in inherited bounds like `trait Sub: Super` → `class Sub (Self :
     // Type) [Super Self] where ...`.
-    let bounds = class_bounds_to_ast(&tr.typ_bounds);
+    let bounds = class_bounds_to_ast(&drop_unemittable_trait_bounds(&tr.typ_bounds, unemittable));
 
     // Pre-compute the set of sibling method names. Used by proof-fn
     // method-type rendering: ensures expressions that reference
@@ -1312,14 +1324,20 @@ pub fn trait_to_ast(
         .filter_map(|m| m.path.segments.last().map(|s| s.to_string()))
         .collect();
 
-    let methods: Vec<ClassMethod> = tr.methods.iter().map(|method_fun| {
-        let func = method_lookup.get(method_fun).unwrap_or_else(|| {
-            panic!(
+    let methods: Vec<ClassMethod> = tr.methods.iter().filter_map(|method_fun| {
+        let func = match method_lookup.get(method_fun) {
+            Some(f) => *f,
+            // Shell trait: the method decl is stripped cross-crate. Drop
+            // it — the marker shell keeps only its (emittable) header.
+            None if shell => return None,
+            // Non-shell trait with a missing method: genuine same-crate
+            // bug (the whole-crate prune keeps every same-crate fn).
+            None => panic!(
                 "trait method {:?} not found in VIR function list — \
                  this is a Tactus bug, please report it",
                 method_fun.path
-            )
-        });
+            ),
+        };
         let short = method_fun.path.segments.last()
             .map(|s| s.as_str()).unwrap_or("_");
         // Class-method default body, when the trait provides one.
@@ -1406,12 +1424,12 @@ pub fn trait_to_ast(
         } else {
             method_type(func)
         };
-        ClassMethod {
+        Some(ClassMethod {
             name: sanitize(short),
             ty,
             default,
             termination_by,
-        }
+        })
     }).collect();
 
     Class {
@@ -1872,6 +1890,12 @@ pub fn trait_impl_to_ast(
     assoc_types: &[&AssocTypeImplX],
     tactic_bodies: &HashMap<Fun, String>,
     subst: &crate::impl_subst::ImplSubst,
+    // Shell trait paths — instance binders that reference one (e.g.
+    // `[clone.Clone K]`, `[cmp.PartialEq T T]`) are dropped: a bound on a
+    // contentless marker carries no provable fact and would otherwise be
+    // an unsatisfiable synthesis obligation over an abstract type param.
+    // See `drop_unemittable_trait_bounds` (#122).
+    unemittable: &std::collections::HashSet<Path>,
 ) -> Instance {
     let mut binders: Vec<LBinder> = Vec::new();
     for tp in ti.typ_params.iter() {
@@ -1901,6 +1925,7 @@ pub fn trait_impl_to_ast(
         .chain(subst.fake_bounds.iter().cloned())
         .collect();
     let augmented_bounds = std::sync::Arc::new(augmented_bounds);
+    let augmented_bounds = drop_unemittable_trait_bounds(&augmented_bounds, unemittable);
     binders.extend(trait_bounds_to_ast(&augmented_bounds));
 
     // Build `TraitName arg1 arg2 …` — trait_typ_args are the positional
@@ -2291,6 +2316,31 @@ fn fn_binders_with_bounds(f: &FunctionX, include_bound_hyps: bool) -> Vec<LBinde
     }
 
     out
+}
+
+/// Drop `[Trait …]` bounds that reference an un-emittable (shell)
+/// trait. A shell trait is a contentless marker (its method decls are
+/// stripped cross-crate — e.g. `core::clone::Clone`), so a bound on it
+/// carries no provable fact: dropping it loses nothing (the same
+/// justification as the #122 B3 head-undetermined-binder drop —
+/// "an undetermined binder is unsynthesizable anyway; dropping it loses
+/// no provable fact"). Keeping such bounds instead produces unsatisfiable
+/// synthesis: a `marker.Copy : [clone.Clone Self]` superclass plus
+/// `[clone.Clone K]` / `[cmp.PartialEq T T]` instance binders over
+/// abstract type params have no satisfiable base, and the
+/// `Copy ↔ Clone` superclass/blanket pair forms a resolution cycle.
+/// Non-Trait bounds and Trait bounds on emittable traits pass through.
+fn drop_unemittable_trait_bounds(
+    bounds: &GenericBounds,
+    unemittable: &std::collections::HashSet<Path>,
+) -> GenericBounds {
+    std::sync::Arc::new(
+        bounds.iter()
+            .filter(|b| !matches!(&***b,
+                GenericBoundX::Trait(TraitId::Path(p), _) if unemittable.contains(p)))
+            .cloned()
+            .collect()
+    )
 }
 
 /// Generic bounds → Lean `[Trait T₁ T₂ …]` instance binders, with any

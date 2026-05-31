@@ -11604,15 +11604,37 @@ test_verify_one_file! {
     }
 }
 
-// Graceful degradation on un-emittable cross-crate traits. A `HashMap`
-// fn drags in `core::clone::Clone` (and `PartialEq`/`Copy`), whose
-// method decls are stripped cross-crate — so Tactus can't render their
-// Lean `class` faithfully. Pre-fix this PANICKED in `trait_to_ast`
-// ("method `clone` not found in VIR function list"). Now those traits
-// (and their instances) are skipped, so the fn fails GRACEFULLY via
-// `tactus_auto failed` (unresolved references to the skipped classes) —
-// Map/Set verification is a separate feature, but ordinary
-// `vstd::prelude::*` + HashMap code must never panic the verifier.
+// RC1 (marker-shell emission, #122) — a cross-crate `HashMap` op
+// verifies end-to-end. `HashMap<u8,u8>` drags in `core::clone::Clone`
+// / `cmp::PartialEq` (methods stripped cross-crate). Pre-RC1 those
+// traits were skipped, leaving dangling `[clone.Clone Self]` superclass
+// binders on the emitted `marker.Copy` / `cmp.Eq` classes → a cascade
+// of unknown-identifier errors. RC1 emits the stripped traits as
+// contentless *marker shells* (drop the stripped methods, keep the
+// header) and drops the now-contentless superclass bounds that
+// reference them. `len()` touches only the View dispatch + the trait
+// cluster (no DeepView / borrow-key axioms), so RC1 alone unblocks it.
+test_verify_one_file! {
+    #[test] test_cross_crate_map_len verus_code! {
+        use vstd::prelude::*;
+        #[verifier::tactus_auto]
+        fn use_map_len(m: &std::collections::HashMap<u8, u8>) -> (r: usize)
+            ensures r == m@.len()
+        {
+            m.len()
+        }
+    } => Ok(())
+}
+
+// Graceful degradation on the Map/Set operations RC1 doesn't yet fully
+// unblock. `contains_key` additionally needs DeepView outParam handling
+// (RC2), the `DefaultHasher` opaque-type axiom (RC3), and the Box-key
+// borrow coercion (RC4) — all separate from the RC1 marker-shell
+// cluster. Until those land it must still fail GRACEFULLY (Lean ran,
+// `tactus_auto failed`) rather than panic in `trait_to_ast`. (Pre-RC1
+// the failure was unknown-identifier cascade from the skipped marker
+// classes; post-RC1 those classes emit as shells and the residual is
+// the RC2/RC3/RC4 set.)
 test_verify_one_file! {
     #[test] test_cross_crate_unemittable_trait_degrades_not_panics verus_code! {
         use vstd::prelude::*;
