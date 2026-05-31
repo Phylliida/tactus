@@ -289,17 +289,21 @@ fn krate_preamble(
         .filter_map(|ti| {
             let trait_short = short_name(&ti.x.trait_path);
             if !refs.traits.contains(trait_short) { return None; }
-            // Un-emittable (shell) traits now emit as marker-shell
-            // classes, so their instances must emit too — a `marker.Copy
-            // Int` instance needs `clone.Clone Int` to synthesize the
-            // `[clone.Clone Self]` superclass field. A shell trait's
-            // stripped method impls aren't in `all_fns`, so they're absent
-            // from `method_impls`: for a fully-stripped trait (Clone /
-            // PartialEq) it comes back empty → an empty contentless
-            // instance body; a partially-stripped trait keeps its present
-            // methods, matching the shell class which drops only the
-            // stripped ones. Either way the instance stays consistent
-            // with its shell class.
+            // Skip instances of un-emittable (shell) traits. The shell
+            // CLASS still emits (a harmless empty marker that resolves any
+            // stray reference), but its INSTANCES must NOT: now that
+            // `drop_unemittable_trait_bounds` strips every `[clone.Clone
+            // X]` / `[cmp.PartialEq X]` bound at the rendering chokepoint,
+            // nothing ever synthesizes a shell-trait instance — so they're
+            // dead. Worse, they DANGLE: a shell instance like `{A}
+            // [marker.Copy A] : clone.Clone A` carries its own bound on
+            // ANOTHER trait (`marker.Copy`), which may not be emitted in
+            // this crate (it isn't, absent a `HashMap` to pull it in) →
+            // "Unknown identifier marker.Copy". (An earlier RC1 revision
+            // emitted these instances; the HashMap case only elaborated
+            // because marker.Copy happened to be reached there. Surfaced
+            // by a coverage probe on a bare `<T: Clone>` fn — #122.)
+            if unemittable_traits.contains(&ti.x.trait_path) { return None; }
             // Implementor type check: trait_typ_args[0] is Self.
             // For Dt::Path (a concrete user datatype), require it
             // to be in refs.datatypes. For anything else (primitive,
