@@ -292,10 +292,14 @@ fn krate_preamble(
             // Un-emittable (shell) traits now emit as marker-shell
             // classes, so their instances must emit too — a `marker.Copy
             // Int` instance needs `clone.Clone Int` to synthesize the
-            // `[clone.Clone Self]` superclass field. The instance's
-            // stripped method impls aren't in `all_fns`, so `method_impls`
-            // comes back empty and `trait_impl_to_ast` emits an empty
-            // (contentless) instance body — exactly what a marker needs.
+            // `[clone.Clone Self]` superclass field. A shell trait's
+            // stripped method impls aren't in `all_fns`, so they're absent
+            // from `method_impls`: for a fully-stripped trait (Clone /
+            // PartialEq) it comes back empty → an empty contentless
+            // instance body; a partially-stripped trait keeps its present
+            // methods, matching the shell class which drops only the
+            // stripped ones. Either way the instance stays consistent
+            // with its shell class.
             // Implementor type check: trait_typ_args[0] is Self.
             // For Dt::Path (a concrete user datatype), require it
             // to be in refs.datatypes. For anything else (primitive,
@@ -538,13 +542,13 @@ fn krate_preamble(
         match group {
             FnGroup::Single(f) => {
                 let augmented = crate::impl_subst::maybe_augment_impl_method(f, &impl_substs);
-                cmds.push(to_lean_fn::spec_fn_to_ast(&augmented, &fn_map));
+                cmds.push(to_lean_fn::spec_fn_to_ast(&augmented, &fn_map, &unemittable_traits));
             }
             FnGroup::Mutual(fns) => {
                 let inner: Vec<Command> = fns.iter()
                     .map(|f| {
                         let augmented = crate::impl_subst::maybe_augment_impl_method(f, &impl_substs);
-                        to_lean_fn::spec_fn_to_ast(&augmented, &fn_map)
+                        to_lean_fn::spec_fn_to_ast(&augmented, &fn_map, &unemittable_traits)
                     })
                     .collect();
                 cmds.push(Command::Mutual(inner));
@@ -609,7 +613,7 @@ fn krate_preamble(
             .expect("helpers_to_emit is built from tactic_bodies — \
                      every entry has a tactic body");
         cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(
-            f, tactic_body, &fn_map,
+            f, tactic_body, &fn_map, &unemittable_traits,
         )));
     }
 
@@ -622,7 +626,7 @@ fn krate_preamble(
     // vstd verified the lemma (`vargo build` → 1530/0); we stipulate
     // it. The user opted in explicitly with `broadcast use <group>;`.
     for f in &bc_lemma_funcs {
-        cmds.push(to_lean_fn::broadcast_lemma_axiom_cmd(f, &fn_map));
+        cmds.push(to_lean_fn::broadcast_lemma_axiom_cmd(f, &fn_map, &unemittable_traits));
     }
 
     (cmds, ns)
@@ -725,7 +729,11 @@ pub fn check_proof_fn(
     // outside the preamble.
     let fn_map: sst_to_lean::FnMap =
         krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
-    cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body, &fn_map)));
+    // Un-emittable (shell) trait set for shell-bound filtering — computed
+    // here (vs threaded from krate_preamble) since proof_fn_to_ast is
+    // called outside the preamble. Cheap; same derivation as the preamble's.
+    let unemittable_traits = crate::expr_shared::unemittable_traits(krate, &fn_map);
+    cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body, &fn_map, &unemittable_traits)));
     cmds.push(Command::NamespaceClose(ns));
 
     // Pretty-print and write the .lean file BEFORE the sanity check.
@@ -1219,6 +1227,59 @@ mod tests {
              Update the filter substring to match.",
             segment,
         );
+    }
+
+    // RC3 (#122): `collect_referenced_datatypes` honours `extra_seed` —
+    // datatypes referenced only by emitted instance heads (canonically
+    // `DefaultHasher` in `instance : hash.BuildHasher RandomState
+    // DefaultHasher`), reachable by neither fn-body refs nor the
+    // field-type closure. Pins that a seeded path is collected and an
+    // un-seeded one is not, so a regression that drops the seed
+    // (DefaultHasher's `axiom T : Type` vanishing → "Unknown constant")
+    // is caught directly — no Map/Set op verifies a DefaultHasher-pulling
+    // path until RC4 lands, so there's no e2e to lean on yet.
+    #[test]
+    fn collect_referenced_datatypes_honours_extra_seed() {
+        use crate::test_fixtures::{empty_krate, mk_path};
+        use vir::def::Spanned;
+        use vir::messages::Span;
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        // External-body opaque datatype `Foo`, referenced by nothing in
+        // the fn-body ref set — the RC3 instance-head-only shape.
+        let foo_x = DatatypeX {
+            name: Dt::Path(mk_path("Foo")),
+            proxy: None,
+            owning_module: None,
+            visibility: Visibility { restricted_to: None },
+            transparency: DatatypeTransparency::Never,
+            typ_params: Arc::new(vec![]),
+            typ_bounds: Arc::new(vec![]),
+            variants: Arc::new(vec![]),
+            mode: Mode::Exec,
+            ext_equal: false,
+            user_defined_invariant_fn: None,
+            sized_constraint: None,
+            destructor: false,
+        };
+        let mut krate = empty_krate();
+        krate.datatypes = vec![Spanned::new(Span::dummy(), foo_x)];
+
+        let refs = dep_order::References { datatypes: HashSet::new(), traits: HashSet::new() };
+        let foo_path = mk_path("Foo");
+
+        // No seed → Foo is NOT collected (reached only via a seed).
+        let empty_seed: HashSet<&vir::ast::Path> = HashSet::new();
+        assert!(collect_referenced_datatypes(&krate, &refs, &empty_seed).is_empty(),
+            "Foo reached by nothing should not be collected without a seed");
+
+        // Seed = {Foo} → Foo IS collected (the RC3 path).
+        let seed: HashSet<&vir::ast::Path> = std::iter::once(&foo_path).collect();
+        let got = collect_referenced_datatypes(&krate, &refs, &seed);
+        assert_eq!(got.len(), 1, "a seeded datatype must be collected");
+        assert!(matches!(&got[0].name, Dt::Path(p) if short_name(p) == "Foo"),
+            "the collected datatype should be Foo");
     }
 }
 

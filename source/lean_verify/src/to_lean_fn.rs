@@ -178,7 +178,7 @@ impl LeanSourceMap {
 /// body=None fns out — which produced "unresolved" sanity-check
 /// rejections at the call site. Audit 2026-05-12 unfiltered the map
 /// and routes through `Axiom` here.)
-pub fn spec_fn_to_ast(f: &FunctionX, fn_map: &crate::sst_to_lean::FnMap) -> Command {
+pub fn spec_fn_to_ast(f: &FunctionX, fn_map: &crate::sst_to_lean::FnMap, unemittable: &std::collections::HashSet<Path>) -> Command {
     // Spec fns are Lean defs (mathematical definitions). The
     // u-type / i-type refinement bounds belong on theorems
     // (proof fns + exec fn obligations), not on the spec fn's
@@ -186,7 +186,7 @@ pub fn spec_fn_to_ast(f: &FunctionX, fn_map: &crate::sst_to_lean::FnMap) -> Comm
     // type from `Int → Int` to `Int → Bound → Int` and break
     // call sites that pass only the value. Surfaced 2026-05-09
     // by `test_diag_exec_plain_assert_with_spec_call` (#147).
-    let binders = fn_binders_without_bound_hyps(f);
+    let binders = fn_binders_without_bound_hyps(f, unemittable);
     let ret_ty = typ_to_expr(&f.ret.x.typ);
     let name = lean_name(&f.name.path);
     match &f.body {
@@ -240,8 +240,9 @@ pub fn spec_fn_to_ast(f: &FunctionX, fn_map: &crate::sst_to_lean::FnMap) -> Comm
 fn proof_fn_signature(
     f: &FunctionX,
     fn_map: &crate::sst_to_lean::FnMap,
+    unemittable: &std::collections::HashSet<Path>,
 ) -> (Vec<LBinder>, LExpr) {
-    let mut binders = fn_binders(f);
+    let mut binders = fn_binders(f, unemittable);
     let binder_ctx = crate::to_lean_expr::binder_ctx_from_params(&f.params);
     for (i, req) in f.require.iter().enumerate() {
         // Insert Int.toNat coercions at Call sites where needed.
@@ -280,8 +281,9 @@ fn proof_fn_signature(
 pub fn broadcast_lemma_axiom_cmd(
     f: &FunctionX,
     fn_map: &crate::sst_to_lean::FnMap,
+    unemittable: &std::collections::HashSet<Path>,
 ) -> Command {
-    let (binders, goal) = proof_fn_signature(f, fn_map);
+    let (binders, goal) = proof_fn_signature(f, fn_map, unemittable);
     Command::Axiom(crate::lean_ast::Axiom {
         name: lean_name(&f.name.path),
         binders,
@@ -294,8 +296,9 @@ pub fn proof_fn_to_ast(
     f: &FunctionX,
     tactic_body: &str,
     fn_map: &crate::sst_to_lean::FnMap,
+    unemittable: &std::collections::HashSet<Path>,
 ) -> Theorem {
-    let (binders, goal) = proof_fn_signature(f, fn_map);
+    let (binders, goal) = proof_fn_signature(f, fn_map, unemittable);
     let binder_ctx = crate::to_lean_expr::binder_ctx_from_params(&f.params);
     // Honor Verus's `decreases` clause for recursive proof fns. Lean often
     // auto-infers termination for simple structural recursion, but cases
@@ -1312,7 +1315,7 @@ pub fn trait_to_ast(
     // (`Self%`) normalizes to `Self` (the class's outer type variable)
     // in inherited bounds like `trait Sub: Super` → `class Sub (Self :
     // Type) [Super Self] where ...`.
-    let bounds = class_bounds_to_ast(&drop_unemittable_trait_bounds(&tr.typ_bounds, unemittable));
+    let bounds = class_bounds_to_ast(&tr.typ_bounds, unemittable);
 
     // Pre-compute the set of sibling method names. Used by proof-fn
     // method-type rendering: ensures expressions that reference
@@ -1925,8 +1928,7 @@ pub fn trait_impl_to_ast(
         .chain(subst.fake_bounds.iter().cloned())
         .collect();
     let augmented_bounds = std::sync::Arc::new(augmented_bounds);
-    let augmented_bounds = drop_unemittable_trait_bounds(&augmented_bounds, unemittable);
-    binders.extend(trait_bounds_to_ast(&augmented_bounds));
+    binders.extend(trait_bounds_to_ast(&augmented_bounds, unemittable));
 
     // Build `TraitName arg1 arg2 …` — trait_typ_args are the positional
     // trait type arguments (Self + extras); assoc_types fill the outParam
@@ -2228,8 +2230,8 @@ pub fn trait_impl_to_ast(
 /// Function parameter list as AST binders: type params, trait bounds,
 /// then value params. Const generics become explicit `(N : ConstType)`
 /// instead of `(N : Type)`.
-fn fn_binders(f: &FunctionX) -> Vec<LBinder> {
-    fn_binders_with_bounds(f, /* include_bound_hyps */ true)
+fn fn_binders(f: &FunctionX, unemittable: &std::collections::HashSet<Path>) -> Vec<LBinder> {
+    fn_binders_with_bounds(f, /* include_bound_hyps */ true, unemittable)
 }
 
 /// Spec-fn variant of `fn_binders`: omit the `h_<name>_bound` refinement
@@ -2238,11 +2240,11 @@ fn fn_binders(f: &FunctionX) -> Vec<LBinder> {
 /// call sites that only pass values. Bounds for spec-fn params are
 /// instead established at theorem-call sites (where the corresponding
 /// hyps DO exist via `fn_binders` on the calling proof/exec fn).
-fn fn_binders_without_bound_hyps(f: &FunctionX) -> Vec<LBinder> {
-    fn_binders_with_bounds(f, /* include_bound_hyps */ false)
+fn fn_binders_without_bound_hyps(f: &FunctionX, unemittable: &std::collections::HashSet<Path>) -> Vec<LBinder> {
+    fn_binders_with_bounds(f, /* include_bound_hyps */ false, unemittable)
 }
 
-fn fn_binders_with_bounds(f: &FunctionX, include_bound_hyps: bool) -> Vec<LBinder> {
+fn fn_binders_with_bounds(f: &FunctionX, include_bound_hyps: bool, unemittable: &std::collections::HashSet<Path>) -> Vec<LBinder> {
     let mut out: Vec<LBinder> = Vec::new();
 
     let const_typ_for = |name: &str| -> Option<&TypX> {
@@ -2269,7 +2271,7 @@ fn fn_binders_with_bounds(f: &FunctionX, include_bound_hyps: bool) -> Vec<LBinde
         });
     }
 
-    out.extend(trait_bounds_to_ast(&f.typ_bounds));
+    out.extend(trait_bounds_to_ast(&f.typ_bounds, unemittable));
 
     // Each param → one binder, and (for fixed-width int types in
     // proof/exec contexts, gated by `include_bound_hyps`) one
@@ -2345,8 +2347,8 @@ fn drop_unemittable_trait_bounds(
 
 /// Generic bounds → Lean `[Trait T₁ T₂ …]` instance binders, with any
 /// matching `TypEquality` bounds merged in as extra type arguments.
-fn trait_bounds_to_ast(bounds: &GenericBounds) -> Vec<LBinder> {
-    trait_bounds_to_ast_with(bounds, |t| typ_to_expr(t))
+fn trait_bounds_to_ast(bounds: &GenericBounds, unemittable: &std::collections::HashSet<Path>) -> Vec<LBinder> {
+    trait_bounds_to_ast_with(bounds, unemittable, |t| typ_to_expr(t))
 }
 
 /// Class-context variant of `trait_bounds_to_ast` — uses
@@ -2358,15 +2360,27 @@ fn trait_bounds_to_ast(bounds: &GenericBounds) -> Vec<LBinder> {
 /// inherited bounds (e.g., `trait Sub: Super` produces a `[Super Self]`
 /// bound on the Sub class, where `Self` must match the class's outer
 /// `Self : Type` binder, not the disambiguated `Self%` name).
-fn class_bounds_to_ast(bounds: &GenericBounds) -> Vec<LBinder> {
-    trait_bounds_to_ast_with(bounds, |t| typ_maybe_projection_to_expr(t))
+fn class_bounds_to_ast(bounds: &GenericBounds, unemittable: &std::collections::HashSet<Path>) -> Vec<LBinder> {
+    trait_bounds_to_ast_with(bounds, unemittable, |t| typ_maybe_projection_to_expr(t))
 }
 
-fn trait_bounds_to_ast_with<F>(bounds: &GenericBounds, typ_render: F) -> Vec<LBinder>
+fn trait_bounds_to_ast_with<F>(
+    bounds: &GenericBounds,
+    unemittable: &std::collections::HashSet<Path>,
+    typ_render: F,
+) -> Vec<LBinder>
 where
     F: Fn(&TypX) -> LExpr,
 {
     use vir::ast_util::types_equal;
+    // The single chokepoint for bound→binder rendering: drop bounds that
+    // reference an un-emittable (shell) trait here, so EVERY bound site
+    // — class superclass bounds, instance binders, AND fn-level generic
+    // bounds (`fn f<K: Clone>`) — is filtered uniformly. A future caller
+    // of this renderer can't forget the filter. See
+    // `drop_unemittable_trait_bounds` for the soundness rationale (#122).
+    let bounds = drop_unemittable_trait_bounds(bounds, unemittable);
+    let bounds = &bounds;
     let mut out = Vec::new();
     for bound in bounds.iter() {
         if let GenericBoundX::Trait(TraitId::Path(path), typs) = &**bound {
@@ -2405,5 +2419,49 @@ fn field_name(name: &str) -> String {
         format!("val{}", name)
     } else {
         sanitize(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_fixtures::{mk_path, typ_datatype};
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    fn trait_bound(trait_name: &str, arg: &str) -> GenericBound {
+        Arc::new(GenericBoundX::Trait(
+            TraitId::Path(mk_path(trait_name)),
+            Arc::new(vec![typ_datatype(arg)]),
+        ))
+    }
+
+    // R-1 (#122): the shared bound→binder chokepoint
+    // (`trait_bounds_to_ast_with`) drops bounds that reference an
+    // un-emittable (shell) trait. Centralizing the filter here means
+    // EVERY bound site — class superclass bounds, instance binders, AND
+    // fn-level generic bounds (spec/proof fns via `fn_binders`) — is
+    // covered uniformly. This pins the chokepoint behaviour directly so
+    // a future caller of the renderer can't silently regress the
+    // fn-level path (the site the call-site pre-filter missed).
+    #[test]
+    fn trait_bounds_to_ast_drops_shell_trait_bounds() {
+        let bounds: GenericBounds = Arc::new(vec![
+            trait_bound("Clone", "T"),      // shell — should be dropped
+            trait_bound("Emittable", "T"),  // ordinary — should survive
+        ]);
+
+        // With Clone marked un-emittable: only the Emittable bound survives.
+        let mut unemittable: HashSet<Path> = HashSet::new();
+        unemittable.insert(mk_path("Clone"));
+        let binders = trait_bounds_to_ast(&bounds, &unemittable);
+        assert_eq!(binders.len(), 1,
+            "the shell-trait bound (Clone) must be dropped at the chokepoint");
+
+        // Empty un-emittable set: nothing dropped (both bounds render).
+        let none: HashSet<Path> = HashSet::new();
+        let binders = trait_bounds_to_ast(&bounds, &none);
+        assert_eq!(binders.len(), 2,
+            "no shell traits → no bounds dropped");
     }
 }
