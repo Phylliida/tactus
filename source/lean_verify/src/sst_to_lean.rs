@@ -6620,5 +6620,5 @@ fn is_synthetic_param(p: &Par) -> bool {
 }
 
 #[cfg(test)]
-#[path = "sst_to_lean_tests.rs"]
+#[path = "tests/sst_to_lean.rs"]
 mod tests;
