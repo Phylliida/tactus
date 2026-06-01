@@ -4,7 +4,7 @@
 //!
 //! Blanket impls express associated-type passthrough via projections:
 //!
-//! ```rust
+//! ```text
 //! impl<A: View> View for Wrap<A> {
 //!     type V = A::V;
 //!     spec fn view(&self) -> A::V { ... }
