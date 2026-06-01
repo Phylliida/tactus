@@ -62,10 +62,23 @@ class half-handled).
 artifact-minimization.* The 18-regression run was the tell — when a surgical
 "make it look hand-written" rewrite needs escape analysis and still fires
 inconsistently, the honest move is to render faithfully and handle uniformly
-downstream. (Aside: noticed a pre-existing, unrelated doctest failure —
-`impl_subst.rs`'s module-doc ```rust block has pseudo-Rust that `cargo test
---doc` tries to compile; a 1-char ```text fix, from commit `99542fc`, not this
-work.)
+downstream.
+
+**Follow-up cleanup (same session, `b5055cd` + `784c00a`).** Fixed a
+pre-existing, unrelated doctest failure (`impl_subst.rs`'s module-doc ```rust
+block holds pseudo-Rust that `cargo test --doc` tried to compile — from commit
+`99542fc`; switched the fence to ```text), then cleared **all** `lean_verify`
+crate warnings (lib + `--tests` + doctests now zero): dropped unused imports
+(`vir_expr_to_ast_for_inlining`, `DefCurried`, a local `BinOp` re-import, and
+test-only `mk_path` / `IntRange` / `vir::def::Spanned`), `let mut add_entry` →
+`let add_entry` in `impl_subst::build` (the closure mutates via a `&mut` param,
+not captures), `#[cfg(test)]` on `lift_if_value` (a one-line test-only wrapper
+for the `None`-coercion path — production calls `lift_if_value_coerced`
+directly), and a dead shadowed `let rhs` in a borrow-mut test. All
+behaviour-neutral; 475 e2e + 268 lib + 7 integration green. (Scope note: this is
+the `lean_verify` crate — Tactus's code — fully clean; the wider Verus-fork
+workspace carries its own pre-existing warnings, mostly upstream, left as a
+separate pass.)
 
 #### Earlier session (2026-06-01 — #122 layer 7: `#[inline]` inlining on the VIR-AST; `HashMap::contains_key` verifies)
 
