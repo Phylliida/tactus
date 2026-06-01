@@ -1101,7 +1101,7 @@ mod tests {
     //
     // Pinned over the pure graph (plain usize prereq sets) rather than
     // fabricating `FunctionX` bodies — the VIR edge-extraction is covered
-    // e2e by `test_cross_crate_unemittable_trait_degrades_not_panics`.
+    // e2e by `test_cross_crate_map_contains_key`.
 
     /// Render an emit order as ('G'|'I', idx) pairs for assertions.
     fn tags(order: &[EmitStep]) -> Vec<(char, usize)> {
