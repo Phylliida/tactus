@@ -129,7 +129,7 @@ use crate::lean_ast::{
 };
 use crate::expr_shared::{is_mut_ref_typ, varat_pre_name};
 use std::sync::Arc;
-use crate::to_lean_expr::{vir_expr_to_ast, vir_expr_to_ast_for_inlining, vir_expr_to_ast_for_inlining_with_ctx};
+use crate::to_lean_expr::{vir_expr_to_ast, vir_expr_to_ast_for_inlining_with_ctx};
 use crate::to_lean_sst_expr::{lower as lower_validated, lower_with_ctx as lower_validated_with_ctx, renders_as_lean_int, sst_exp_to_ast_checked, sst_exp_to_ast_checked_with_ctx, type_bound_predicate, Validated};
 use crate::to_lean_type::{lean_name, sanitize, typ_to_expr};
 
@@ -5107,6 +5107,12 @@ fn detect_assert_kind(e: &Exp) -> AssertKind {
 /// Exponential in if-nesting depth, but matches the expected size of
 /// the goal the user is writing. For non-if values this is a direct
 /// call to `emit_leaf` with the rendered expression — no overhead.
+///
+/// Test-only: the un-coerced (`ret_coerce: None`) entry point. Production
+/// always has a declared return typ to coerce against, so it calls
+/// `lift_if_value_coerced` directly; this thin wrapper exists for the
+/// unit tests that pin the bare lifting behaviour.
+#[cfg(test)]
 fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
     lift_if_value_coerced(e, None, emit_leaf)
 }
@@ -6630,10 +6636,10 @@ mod tests {
     //! These tests are direct-in-crate rather than integration so
     //! they can exercise private items (`Wp`, `build_wp`, etc.).
     use super::*;
-    use crate::test_fixtures::{empty_krate, mk_path, typ_datatype, typ_int};
+    use crate::test_fixtures::{empty_krate, typ_datatype, typ_int};
     use std::sync::Arc;
     use vir::ast::{
-        IntRange, SpannedTyped, TypX, VarIdent, VarIdentDisambiguate,
+        SpannedTyped, TypX, VarIdent, VarIdentDisambiguate,
     };
     use vir::sst::ExpX;
     use vir::messages::Span;
@@ -8343,10 +8349,9 @@ mod tests {
         links.insert(borrow_mut_key(&borrow), user.clone());
 
         let dest = varloc_exp(user, typ_int());
-        let rhs = var_exp("tmp%", typ_int()); // helper uses AirLocal disambig
-        // Adjust rhs to match `borrow`'s disambig — `var_exp`'s helper
-        // produces an AirLocal disambig; we need to match `borrow`'s
-        // VirTemp(1) for the key lookup to fire.
+        // Build rhs directly with `borrow`'s VirTemp(1) disambig — the
+        // `var_exp` helper would give an AirLocal disambig, but the key
+        // lookup needs VirTemp(1) to fire.
         let rhs = Arc::new(SpannedTyped {
             span: test_span(),
             typ: typ_int(),
@@ -8610,7 +8615,6 @@ mod tests {
     /// args (or the pre-pass starts walking args), this test fails.
     #[test]
     fn collect_borrow_mut_links_treats_call_args_as_leaf() {
-        use vir::def::Spanned;
         let borrow = var_ident_disambig("tmp%", 1);
         let mut bm_set = HashSet::new();
         bm_set.insert(borrow_mut_key(&borrow));

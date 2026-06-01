@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use vir::ast::*;
 use crate::lean_ast::{
     and_all, Axiom, BinOp, Binder as LBinder, BinderKind, Class, ClassMethod, Command, Datatype,
-    DatatypeKind, Def, DefCurried, Expr as LExpr, ExprNode, Field, Instance,
+    DatatypeKind, Def, Expr as LExpr, ExprNode, Field, Instance,
     InstanceMethod, MatchArm, Pattern as LPattern, Theorem, Tactic, Variant,
 };
 use crate::to_lean_expr::vir_expr_to_ast;
@@ -886,7 +886,7 @@ fn height_fn_for_datatype(
     path: &str,
     scc_paths: &std::collections::HashSet<&Path>,
 ) -> Option<Command> {
-    use crate::lean_ast::{BinOp, ExprNode};
+    use crate::lean_ast::ExprNode;
     if let Dt::Tuple(_) = &dt.name {
         return None;
     }
