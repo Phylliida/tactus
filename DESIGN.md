@@ -3374,8 +3374,24 @@ prophecy cleanly; transparent, visible at the fn, no vstd-internal names). The
 `_wrong_ensures` soundness pin still correctly fails. Pinned by
 `test_cross_crate_map_contains_key` (Ok — the win; renamed from the former
 `_unemittable_trait_degrades_not_panics` graceful-degradation pin, now subsumed
-since it verifies) and `inline_spec::tests::inline_okay_matches_verus`. 470 e2e
-+ 268 lib, 0 regressions, vstd 1530/0.
+since it verifies) and `inline_spec::tests::inline_okay_matches_verus`.
+
+**Review-hardened + coverage (2026-06-01).** A review pass found no live bugs
+but turned four *unchecked invariants* Verus enforces (and `inline_spec` had
+left implicit) into fail-loud guards: `assert_eq!` on params↔args / typ_params↔
+typs (Verus's `sst_elaborate` asserts these; the prior `zip` truncated
+silently), an exhaustive `inline_okay` match (a new `FunctionKind` is now a
+compile error), a broadened `body_blocks_inlining` (flags `AssertBy` /
+`OpenInvariant` / `Loop` + any non-empty block, closing the
+guard↔`unwrap_trivial_block` mismatch), and a common-case early-out. A
+comprehensive-coverage cluster then *constructed* cases for the documented
+latent gaps — all handled correctly: `test_inline_fn_field_access` (field
+access on a param inlines, doesn't dangle — it's a projection over a whole-local
+read; disproved an over-cautious comment), `test_inline_fn_nested_chain`
+(recursive inline + chain-drop), `test_inline_fn_trait_impl_method` (the
+`TraitMethodImpl` keep-def branch, previously unexercised), and
+`test_inline_fn_binder_body_kept_folded` (binder body refused → folded → sound).
+474 e2e + 268 lib, 0 regressions, vstd 1530/0.
 
 ### Returned-mut-ref prophecy composition — LANDED 2026-05-30
 
