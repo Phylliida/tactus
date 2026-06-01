@@ -44,7 +44,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use vir::ast::{
     CallTarget, CallTargetKind, Expr, ExprX, Exprs, Fun, Function, FunctionKind, FunctionX, Ident,
-    Idents, KrateX, PlaceX, SpannedTyped, StmtX, Typ, Typs, VirErr,
+    Idents, KrateX, PlaceX, SpannedTyped, Typ, Typs, VirErr,
 };
 use vir::ast_visitor::{map_expr_typ_visitor, map_expr_visitor};
 use vir::def::Spanned;
@@ -52,9 +52,14 @@ use vir::sst_util::subst_typ;
 
 /// Mirror of Verus's `FunctionKind::inline_okay` (`pub(crate)` there): inlining
 /// is only safe for statically-resolved targets, never a trait method *decl*
-/// (whose default body might be overridden by an impl).
+/// (whose default body might be overridden by an impl). Exhaustive (no `_`) so a
+/// new Verus `FunctionKind` variant is a compile error here rather than silently
+/// defaulting to non-inline — the upstream-robustness convention.
 fn inline_okay(kind: &FunctionKind) -> bool {
-    matches!(kind, FunctionKind::Static | FunctionKind::TraitMethodImpl { .. })
+    match kind {
+        FunctionKind::Static | FunctionKind::TraitMethodImpl { .. } => true,
+        FunctionKind::TraitMethodDecl { .. } | FunctionKind::ForeignTraitMethodImpl { .. } => false,
+    }
 }
 
 /// A spec fn whose *calls* we inline: marked `#[verifier::inline]`, inline-okay
@@ -64,7 +69,7 @@ fn inline_okay(kind: &FunctionKind) -> bool {
 /// to close, never falsely pass), as opposed to a naive substitution that could
 /// silently capture.
 fn can_inline_call(f: &FunctionX) -> bool {
-    f.attrs.inline && inline_okay(&f.kind) && f.body.as_ref().map_or(false, |b| !has_binder(b))
+    f.attrs.inline && inline_okay(&f.kind) && f.body.as_ref().map_or(false, |b| !body_blocks_inlining(b))
 }
 
 /// Whether to also *drop* the fn's standalone def. Only `Static` (inherent)
@@ -73,33 +78,50 @@ fn can_inline_call(f: &FunctionX) -> bool {
 /// method field (`view := …`), so dropping it leaves Lean's instance with a
 /// "fields missing" error. Inlining its *calls* is still correct and faithful;
 /// only the emission of its def is preserved.
+///
+/// Drop-safety: the only references this pass doesn't rewrite are ones held
+/// *outside* function clauses/bodies — reveal-group members, datatype
+/// invariant fns, assoc-type-impl values. An `#[inline]` fn appears in none of
+/// these: it's always-transparent (never broadcast/revealed → not a reveal-group
+/// member), it's `Static` (never a `TraitMethodImpl`, so not an instance method
+/// or assoc-type value), and Tactus emits no datatype-invariant fns. A surviving
+/// reference would, regardless, fail *loud* (Lean "unknown constant"), never
+/// silently mis-resolve.
 fn can_drop(f: &FunctionX) -> bool {
     can_inline_call(f) && matches!(f.kind, FunctionKind::Static)
 }
 
-/// Does the expression introduce any bound variables anywhere? Naive
-/// substitution into a binder-bearing body risks capture; we refuse to inline
-/// such bodies (keeping them folded) rather than build full hygienic VIR-AST
-/// substitution for a shape vstd never produces.
-fn has_binder(e: &Expr) -> bool {
+/// Does the body contain anything that makes naive `Var`-substitution unsafe —
+/// a node that binds variables (capture risk) or a non-trivial block (which
+/// `unwrap_trivial_block` can't peel into expression position)? If so we refuse
+/// to inline (keeping the call folded — *sound*: it fails to close, never
+/// falsely passes) rather than build full hygienic VIR-AST substitution for a
+/// shape vstd never produces. The binder list errs conservative: anything that
+/// introduces a scope is flagged, so widening the inline-able set later can't
+/// silently re-open the capture hole.
+fn body_blocks_inlining(e: &Expr) -> bool {
     let found = std::cell::Cell::new(false);
     // Read-only scan via the map visitor; the cloned (tiny) inline body is
     // discarded. `fe` is `Fn`, so interior mutability carries the flag out.
     let _ = map_expr_visitor(e, &|node: &Expr| {
-        let binds = match &node.x {
+        let blocks = match &node.x {
             ExprX::Quant(..)
             | ExprX::Closure(..)
             | ExprX::NonSpecClosure { .. }
             | ExprX::Choose { .. }
-            | ExprX::Match(..) => true,
-            // A `{ … }` block binds only when it declares a local; a spec-fn
-            // body `{ expr }` is `Block([], Some(expr))` — no binder.
-            ExprX::Block(stmts, _) => {
-                stmts.iter().any(|s| matches!(&s.x, StmtX::Decl { .. }))
-            }
+            | ExprX::Match(..)
+            | ExprX::AssertBy { .. }      // binds `vars` (assert-forall)
+            | ExprX::OpenInvariant(..)    // binds the opened invariant value
+            | ExprX::Loop { .. } => true, // not expected in a spec body; refuse if seen
+            // A `{ … }` block: refuse if it carries ANY statement. A `Decl`
+            // binds; and `unwrap_trivial_block` only peels statement-free
+            // blocks, so a `{ s; e }` body can't be safely spliced into
+            // expression position regardless. A spec-fn body `{ expr }` is
+            // `Block([], Some(expr))` — empty, so it inlines.
+            ExprX::Block(stmts, _) => !stmts.is_empty(),
             _ => false,
         };
-        if binds {
+        if blocks {
             found.set(true);
         }
         Ok(node.clone())
@@ -111,6 +133,17 @@ fn has_binder(e: &Expr) -> bool {
 /// function's clauses/body, and the inline-able fns are dropped (no Lean def).
 /// Identity (modulo a clone) for crates with no `#[inline]` fns.
 pub fn inline_marked_in_krate(krate: &KrateX) -> KrateX {
+    // Common case (most crates have no `#[verifier::inline]` fns): skip the deep
+    // per-clause rebuild — a shallow KrateX clone (Arc-sharing the function
+    // bodies) is enough. The `attrs.inline &&` short-circuit in `can_inline_call`
+    // keeps this scan cheap (no body walk for the overwhelming non-inline
+    // majority). (This pass re-runs per checked fn; that's acceptable —
+    // verification is Lean-I/O-bound, and this is pure-Rust work over a pruned
+    // krate. Memoize if a profile ever says otherwise.)
+    if !krate.functions.iter().any(|f| can_inline_call(&f.x)) {
+        return krate.clone();
+    }
+
     let fn_map: HashMap<&Fun, &FunctionX> =
         krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
 
@@ -192,6 +225,15 @@ fn unwrap_trivial_block(e: &Expr) -> &Expr {
 /// `body`. `body` is binder-free (guaranteed by `can_inline`), so direct
 /// `Var`-replacement is capture-free.
 fn substitute_body(body: &Expr, typ_params: &Idents, typs: &Typs, f: &FunctionX, args: &Exprs) -> Expr {
+    // Length invariants Verus's own `sst_elaborate` asserts. They hold for every
+    // call Verus's resolution produces (Static and DynamicResolved alike); a
+    // mismatch would otherwise silently `zip`-truncate, leaving an
+    // un-substituted `TypParam`/`Var` dangling in the goal. Fail loud instead.
+    assert_eq!(typ_params.len(), typs.len(),
+        "inline fn typ_params/typ_args length mismatch — Verus resolution invariant violated");
+    assert_eq!(f.params.len(), args.len(),
+        "inline fn params/args length mismatch — Verus resolution invariant violated");
+
     // 1. Type substitution (`K` ↦ `u8`, …) on every Typ embedded in the body.
     let typ_substs: HashMap<Ident, Typ> =
         typ_params.iter().cloned().zip(typs.iter().cloned()).collect();
@@ -209,12 +251,18 @@ fn substitute_body(body: &Expr, typ_params: &Idents, typs: &Typs, f: &FunctionX,
         .zip(args.iter().cloned())
         .collect();
     map_expr_visitor(&body, &|e: &Expr| -> Result<Expr, VirErr> {
-        // A param is referenced either as a plain `Var` (by-value params,
-        // e.g. `k`) or as a whole-local place read `ReadPlace(Local(p))`
-        // (by-reference receivers, e.g. `self`). Both read the param's value,
-        // so both are replaced wholesale with the corresponding arg expr.
+        // A param is referenced as a plain `Var` (by-value params, e.g. `k`), a
+        // staged `VarAt`, or a whole-local place read `ReadPlace(Local(p))`
+        // (by-reference receivers, e.g. `self`) — each reads the param's value
+        // and is replaced wholesale with the corresponding arg expr. A param
+        // appearing inside a *nested* place (`ReadPlace(Field(Local(p)))`,
+        // `*p`) is NOT substitutable to an arbitrary arg expr at the VIR-AST
+        // Place/Expr boundary; such a body would leave the param dangling →
+        // caught loud by the sanity check (`unresolved p`). No vstd `#[inline]`
+        // fn does field/deref access on a param (all use whole-receiver method
+        // calls), so this doesn't arise today.
         let referenced = match &e.x {
-            ExprX::Var(v) | ExprX::VarLoc(v) => Some(v),
+            ExprX::Var(v) | ExprX::VarLoc(v) | ExprX::VarAt(v, _) => Some(v),
             ExprX::ReadPlace(place, _) => match &place.x {
                 PlaceX::Local(v) => Some(v),
                 _ => None,
