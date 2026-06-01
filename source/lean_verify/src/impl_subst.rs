@@ -294,7 +294,7 @@ impl ImplSubst {
         }
 
         let mut subst = ImplSubst::default();
-        let mut add_entry = |x: Ident, trait_path: Path, assoc_name: Ident,
+        let add_entry = |x: Ident, trait_path: Path, assoc_name: Ident,
                              full_bound_typs: Typs, subst: &mut ImplSubst| {
             let key = (x.clone(), trait_path.clone(), assoc_name.clone());
             if subst.proj_map.contains_key(&key) { return; }
