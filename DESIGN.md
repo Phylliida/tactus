@@ -545,6 +545,28 @@ Lean requires definitions before use within a file. Generated definitions are to
 
 Mutual recursion uses `mutual ... end` blocks (from the user's `mutual ... end mutual` declarations in Tactus source).
 
+### Proof-fn helper emission (2026-06-01)
+
+When verifying a proof fn, its generated `.lean` file must also contain any **helper proof fns** it invokes (`have h := helper args` in its tactic body), declared *before* the theorem that uses them. Two questions: *which* helpers, and in *what order*.
+
+**Which — the textual-scan constraint.** A proof fn's body is raw Lean tactic text (a `TacticBlock` span); Tactus never parses it as VIR. So VIR dep-walking (`collect_references`, which finds spec fns via require/ensure) **cannot see** the `have := helper` calls — there is no VIR edge for a lemma invocation inside a `by { }` block. The reference exists *only as text*. The dependency signal therefore comes from **scanning the tactic body for proof-fn names** (`ident_appears`: word-boundary match, `--`-line-comments stripped). This over-approximates slightly (a name in a non-comment string would false-match; rare) but never under-includes a real call (every normal invocation form — `have := f`, `exact f`, `apply f`, `simp [f]` — contains `f`'s short name literally).
+
+**Order — DFS post-order = topological.** Helpers are emitted in topological order (a dependency before anything referencing it). `collect_referenced_proof_fns` does a DFS from the root, scanning each visited fn's body for further proof-fn references, and pushes each fn **after** its dependencies (post-order). This computes the transitive closure *and* the deps-first order in one pass; the root, being the top of its own dependency DAG, is emitted last (as the file's main theorem).
+
+**Why both halves matter (BUG-proof-fn-dep-walker-over-includes.md).** The original code emitted *every* proof fn into *every* file (it had no signal for "which helpers does this root call"). With the root emitted last, any over-included proof fn that *depended on the root* forward-referenced it:
+
+```lean
+-- double_nonneg.lean (pre-fix) — over-includes use_double_nonneg:
+theorem use_double_nonneg (n : Nat) : double n ≥ 0 := by
+  have h := double_nonneg n   -- ← double_nonneg not declared yet
+  exact h
+theorem double_nonneg (n : Nat) : double n ≥ 0 := by unfold double; omega
+```
+
+Restricting to the root's *downward* closure fixes this structurally: `double_nonneg`'s body references no proof fns, so `use_double_nonneg` (which depends on it) is simply absent from `double_nonneg.lean`. The topological order then handles the genuine case (`use_double_nonneg.lean` gets `double_nonneg` first). Both the over-inclusion fix and the topo sort fall out of the single DFS.
+
+**Scope: proof-fn files only.** Exec-fn files keep the safe over-approximation (all emittable proof fns). An exec root's helper references live in `proof { }` / `assert(..) by { }` blocks read at codegen, not available at preamble time — and crucially, a helper *cannot* forward-reference an exec root (no proof fn depends on an exec fn), so the forward-reference bug doesn't arise there. A true cycle of mutually-referencing proof fns would need a Lean `mutual` block (out of scope, not observed). Pinned by `test_proof_fn_helper_not_over_included` and `test_proof_fn_helper_chain_topo_order` (3-level A←B←C).
+
 ### Prelude (TactusPrelude.lean)
 
 The prelude defines Verus's built-in types. **No `sorry`, no unnecessary axioms.** Values known at compile time use `def`, not `axiom`.

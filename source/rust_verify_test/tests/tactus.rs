@@ -11851,3 +11851,52 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// Regression for BUG-proof-fn-dep-walker-over-includes.md.
+// `use_double_nonneg` calls `double_nonneg`. Pre-fix, the dep walker
+// emitted EVERY proof fn into every file, so `double_nonneg.lean`
+// included `use_double_nonneg` (which references `double_nonneg`)
+// declared BEFORE it — a forward reference that failed to elaborate.
+// Fix: a proof fn's file includes only its transitive downward deps
+// (found by scanning its raw tactic body for proof-fn names), in
+// topological order. `double_nonneg.lean` no longer drags in its caller.
+test_verify_one_file! {
+    #[test] test_proof_fn_helper_not_over_included verus_code! {
+        spec fn double(n: nat) -> nat { n + n }
+
+        proof fn double_nonneg(n: nat)
+            ensures double(n) >= 0
+        by {
+            unfold double
+            omega
+        }
+
+        proof fn use_double_nonneg(n: nat)
+            ensures double(n) >= 0
+        by {
+            have h := double_nonneg n
+            exact h
+        }
+    } => Ok(())
+}
+
+// Three-level chain A <- B <- C pins the topological sort: in C's file,
+// A must precede B must precede C. (Source order here is A,B,C which
+// happens to be correct, but the topo sort is what guarantees it.)
+test_verify_one_file! {
+    #[test] test_proof_fn_helper_chain_topo_order verus_code! {
+        spec fn double(n: nat) -> nat { n + n }
+
+        proof fn lemma_a(n: nat) ensures double(n) >= 0 by { unfold double; omega }
+
+        proof fn lemma_b(n: nat) ensures double(n) >= 0 by {
+            have h := lemma_a n
+            exact h
+        }
+
+        proof fn lemma_c(n: nat) ensures double(n) >= 0 by {
+            have h := lemma_b n
+            exact h
+        }
+    } => Ok(())
+}
