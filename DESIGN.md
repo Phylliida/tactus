@@ -2227,14 +2227,14 @@ These are deferred by design — the current slice is single-crate exec+proof-fn
   Tasks still tracked under cross-crate umbrella:
   - **#125 cross-crate trait method decls** — when the trait method decl's `Fun` isn't in `fn_map` (genuinely cross-crate from a non-vstd-prelude path), `spec_source` returns Err. Currently rare in practice because vstd's traits aren't usually trait_method_impl'd in user crates that Tactus verifies.
   - **Cross-crate Vec (`len` / `push` / `v[i]` read) — LANDED 2026-05-30.** All verify soundly under `use vstd::prelude::*` — including `push` with `&mut` + `old(v)` and indexed reads. The blocker was never `build_wp_call`'s fn_map rejection (`merge_krates` brings referenced vstd exec fns in *with specs*, so they're in `fn_map` and inline); it was the `v@` (`View::view`) dispatch, fixed by four trait-class + instance-emission landings (see § "Cross-crate View blanket-impl emission" below): trait-method call qualification, blanket-impl forwarding (resolved-kind rewrite gate + forwarding-body synth), erased-allocator binder drop, and `has_resolved` as an uninterpreted Prop. Pinned by `test_cross_crate_vec_len` (+ `_wrong_ensures`).
-  - **Cross-crate marker traits — shell classes + chokepoint bound-drop (LANDED 2026-05-30, reshaped 2026-05-31).** A trait whose method decl is stripped cross-crate (e.g. `core::clone::Clone`, dragged in by a `HashMap` bound) can't render as a faithful Lean `class`. The 2026-05-30 version *skipped* such traits — but emittable subclasses that bound on them (`marker.Copy : [clone.Clone Self]`) kept dangling superclass binders → a cascade. The 2026-05-31 reshape (#122 RC1): emit them as contentless **marker shells** (drop the stripped methods, keep the header), and drop every bound that *references* a shell trait at the shared `trait_bounds_to_ast_with` chokepoint (a contentless bound loses no provable fact). Shell-trait *instances* are skipped (dead once their bounds are dropped, and they dangle on un-reached traits like `marker.Copy`). The `trait_to_ast` panic stays a same-crate-bug tripwire. Verifies `HashMap::len` + spec/proof fns generic over `<T: Clone>`; Map/Set `contains_key` still degrades gracefully. See § "Cross-crate marker-shell trait emission". Pinned by `test_cross_crate_map_len`, `_spec_fn_clone_bound`, `_proof_fn_clone_bound`, `_unemittable_trait_degrades_not_panics`.
+  - **Cross-crate marker traits — shell classes + chokepoint bound-drop (LANDED 2026-05-30, reshaped 2026-05-31).** A trait whose method decl is stripped cross-crate (e.g. `core::clone::Clone`, dragged in by a `HashMap` bound) can't render as a faithful Lean `class`. The 2026-05-30 version *skipped* such traits — but emittable subclasses that bound on them (`marker.Copy : [clone.Clone Self]`) kept dangling superclass binders → a cascade. The 2026-05-31 reshape (#122 RC1): emit them as contentless **marker shells** (drop the stripped methods, keep the header), and drop every bound that *references* a shell trait at the shared `trait_bounds_to_ast_with` chokepoint (a contentless bound loses no provable fact). Shell-trait *instances* are skipped (dead once their bounds are dropped, and they dangle on un-reached traits like `marker.Copy`). The `trait_to_ast` panic stays a same-crate-bug tripwire. Verifies `HashMap::len` + spec/proof fns generic over `<T: Clone>` (and, after the full deep-view-body arc + layer 7, `HashMap::contains_key`). See § "Cross-crate marker-shell trait emission". Pinned by `test_cross_crate_map_len`, `_spec_fn_clone_bound`, `_proof_fn_clone_bound`, `test_cross_crate_map_contains_key`.
   - **Cross-crate broadcast lemmas referencing `BuiltinSpecFun` — skipped (LANDED 2026-05-30).** vstd's FnMut closure axioms (`axiom_fn_mut_call_requires`/`_ensures`), pulled in by default-on-import, reference a `BuiltinSpecFun` (closure `call_requires`/`call_ensures`) which the VIR-AST renderer has no faithful fixed-arity Lean form for (emits an unresolved literal `builtinSpecFun`). `references_builtin_spec_fun` (sst_to_lean.rs) skips such lemmas at collection — same graceful-skip family as the un-emittable-trait / `FiniteFull` filters. Their facts are unavailable (closure-spec reasoning isn't supported), but emission stays clean.
   - **`&mut v[i]` — LANDED 2026-05-30** via returned-mut-ref prophecy composition (§ "Returned-mut-ref prophecy composition"). Both links cleared: Link 1 (the FnMut `builtinSpecFun` broadcast wall) by the filter above; Link 2 (the returned `&mut`'s prophetic `*final`) by minting a prophecy var `P` at the `vec_index_mut` call and unifying it with the resolving `bump` call. Pinned by `test_exec_call_mut_arg_vec_index` (+ `_wrong_ensures`).
   - **Map/Set: `len` + `HashSet::contains` verify; `HashMap::contains_key` deferred on the deep-view body (RC2 projection mechanism + RC1/RC3/RC4 all LANDED 2026-05-31).** `HashMap::len()` verifies (RC1 marker shells + RC3 instance-head opaque-type seeding — both below); `HashSet::contains` verifies (RC4 below). The earlier "dangling references" framing was corrected by a live re-probe: RC1's chokepoint bound-drop dissolved the whole `Clone`/`PartialEq`/`Copy`/`Eq`/`Integer` cascade (it was *bounds* referencing un-emittable traits, not bare references), and RC3 cleared `DefaultHasher`. `HashMap::contains_key` still fails *gracefully* — its two operation-specific blockers (both since resolved) were:
     - **RC2 — DeepView outParam projection (mechanism LANDED 2026-05-31; see § "Generalized projection-lifting").** `view.DeepView`'s assoc type `V` is an `outParam`, but the standalone spec fn `std_specs.hash.hash_map_deep_view_impl` projected `view.DeepView.V Key` as if `V` were an accessor → "type expected, got". **Landed:** projection-lifting generalized from impl-methods/instance-signatures to *every* generic function, covering signatures, bodies, require/ensure clauses, trait bounds, and broadcast lemmas (with Source-2 coverage) — the entire `view.DeepView.V Key`-as-accessor cascade *and* the `axiom_hashmap_deepview_borrow` broadcast-lemma errors are gone; synthetic assoc binders render implicit so VIR call sites typecheck.
     - **RC4 — Box-key cross-crate coercion (LANDED 2026-05-31; see § "Instantiated-param-type call-arg coercion").** Verus's `axiom_contains_box` ensures `contains_borrowed_key(m,k) <==> m.contains_key(Box::new(*k))`. Verus erases `Box::new(*k)` to a bare `*k : Q` at the value level (confirmed by `--log vir-simple`: the surviving VIR arg is `ReadPlace(Local k) : TypParam Q`, no box node), so the key rendered as `k.deref : Q` against `contains_key`'s `K ↦ Box<Q>` key slot. Fix: the call-arg bridge now uses the callee's param type AS INSTANTIATED by the call's typ_args (`K ↦ Box<Q>`), so `coerce_lexpr` inserts the `Q → Box Q` `.mk` wrap, faithfully recovering the erased construction: `contains_key (Box Q) Value m (Tactus.Box.mk k.deref)`. General over any generic call whose param-type-param instantiates to a wrapper (Box/Ref/Rc/Arc/MutRef) — not Box- or contains-specific. Was shared by `contains_key` and `HashSet::contains`; now cleared for both.
 
-    So `HashSet::contains` is fully verified. **`HashMap::contains_key`'s deep-view BODY now fully elaborates too (2026-05-31, see § "Cross-crate `HashMap::contains_key` deep-view-body arc")** — the earlier residual framing's "(4) View-instance synthesis + (5) Nonempty" turned out to be an *ordering* fix (layer 4: `dep_order::order_emission` topologically interleaves the `View (HashMap …)` instance before the def that dispatches to it) and a *Nonempty-binder* fix (layer 5: `nonempty.rs` infers `[Nonempty T]` for choose-over-type-param), plus a third *coercion* fix they unmasked (layer 6: `structural_typ` materializes the `.mk` on a ref-decorated `Call` receiver). The probe went from 5 errors to 1. The **sole remaining blocker is layer 7** — the fold/unfold renderer divergence (Verus inlines the open spec fn `Map::contains_key` in the exec/SST goal but Tactus folds it in the proof/VIR-AST bc-lemma; the single bc-lemma can't match both), deferred as a two-renderers-convergence arc. `contains_key` degrades gracefully (only the obligation fails, all elaboration errors cleared).
+    So `HashSet::contains` is fully verified. **`HashMap::contains_key`'s deep-view BODY now fully elaborates too (2026-05-31, see § "Cross-crate `HashMap::contains_key` deep-view-body arc")** — the earlier residual framing's "(4) View-instance synthesis + (5) Nonempty" turned out to be an *ordering* fix (layer 4: `dep_order::order_emission` topologically interleaves the `View (HashMap …)` instance before the def that dispatches to it) and a *Nonempty-binder* fix (layer 5: `nonempty.rs` infers `[Nonempty T]` for choose-over-type-param), plus a third *coercion* fix they unmasked (layer 6: `structural_typ` materializes the `.mk` on a ref-decorated `Call` receiver). The probe went from 5 errors to 1, and **layer 7 then LANDED 2026-06-01** (§ "Cross-crate `HashMap::contains_key` deep-view-body arc" layer 7): `inline_spec` mirrors Verus's `#[verifier::inline]` handling on the VIR-AST so the bc-lemma agrees with the SST-inlined goal. `HashMap::contains_key` now **verifies** under default `tactus_auto`.
   - **Dynamic dispatch via `dyn Trait`** — same cross-crate rejection path as #125.
 
   **Broadcast scope** — `collect_broadcast_lemma_funs` (below) handles BOTH default-on-import groups (`broadcast_use_by_default_when_this_crate_is_imported`, e.g. vstd's `group_vstd_default` — the drop-in case) AND fn-body `broadcast use <group>;` (`StmX::Fuel`). Still deferred: **module-level** `broadcast use` (`ModuleX.reveals` — a `broadcast use` at module scope rather than fn-body or default-on-import); needs reading the fn's owning-module reveal list rather than the fn body. Rare for user crates.
@@ -3082,8 +3082,7 @@ never emitted ("Unknown constant"). Fix: also seed from the emitted
 instances' `trait_typ_args` + assoc-type values.
 
 **Pinned by** `test_cross_crate_map_len` (Ok), `_spec_fn_clone_bound`,
-`_proof_fn_clone_bound`, `_unemittable_trait_degrades_not_panics` (Err —
-graceful Map/Set degradation, no panic), plus unit tests
+`_proof_fn_clone_bound`, plus unit tests
 `trait_bounds_to_ast_drops_shell_trait_bounds` (chokepoint filter) and
 `collect_referenced_datatypes_honours_extra_seed` (RC3 seed). 468 e2e, 263
 lean_verify lib (counts as of this section's landing). RC4 (Box-key coercion) and
@@ -3091,8 +3090,8 @@ RC2 (the whole DeepView projection cascade) both LANDED 2026-05-31 — see §
 "Instantiated-param-type call-arg coercion" and § "Generalized projection-lifting"
 next. `contains_key`'s deep-view body then fully elaborated via layers 4–6
 (ordering / Nonempty / Call-coercion — § "Cross-crate `HashMap::contains_key`
-deep-view-body arc"); the sole remaining blocker is layer 7 (the fold/unfold
-renderer divergence), deferred.
+deep-view-body arc"), and layer 7 (`#[inline]` inlining on the VIR-AST) then
+LANDED 2026-06-01 — `HashMap::contains_key` verifies (`test_cross_crate_map_contains_key`).
 
 ### Instantiated-param-type call-arg coercion — LANDED 2026-05-31 (#122 RC4)
 
@@ -3151,9 +3150,10 @@ auto-borrow bridge / U2 / typed substitution.
   bridge Lean would then reject — never a silently-wrong inner type.
 
 **Pinned by** `test_cross_crate_set_contains` (Ok — the RC4 win; box coercion
-renders `Tactus.Box.mk k.deref`) and `test_cross_crate_unemittable_trait_degrades_not_panics`
-(still Err — `contains_key` now fails only on RC2/DeepView, the RC4 Box-key error
-gone). 469 e2e, 263 lean_verify lib, 0 regressions across the full suite (the
+renders `Tactus.Box.mk k.deref`). (At this landing `contains_key` still failed
+on RC2/DeepView, pinned by the then-`_degrades_not_panics` test; that whole
+residual has since cleared — `test_cross_crate_map_contains_key` now Ok.)
+469 e2e, 263 lean_verify lib, 0 regressions across the full suite (the
 `with_fn_map` threading touches all proof fns + broadcast lemmas; all green),
 vstd 1530/0. **Known gap (cheap follow-up):** no isolated unit test on
 `fn_param_typs`'s instantiation + arity-guard — fabricating a 26-field synthetic
@@ -3232,12 +3232,11 @@ broadcast-lemma errors are cleared. What remained at this point was the
 (§ "Cross-crate `HashMap::contains_key` deep-view-body arc", next) then resolved:
 the two then-visible errors ("View synthesis" / "Nonempty") were an ordering fix
 (layer 4) and a Nonempty-binder fix (layer 5), plus a coercion fix they unmasked
-(layer 6). The body now fully elaborates; the sole remaining blocker is layer 7
-(the fold/unfold renderer divergence). Pinned by
-`test_cross_crate_unemittable_trait_degrades_not_panics` (still Err — now only on
-the layer-7 obligation, all elaboration errors cleared).
+(layer 6). The body fully elaborates, and layer 7 (`#[inline]` inlining on the
+VIR-AST, `inline_spec`) then LANDED 2026-06-01 — `HashMap::contains_key`
+verifies. Pinned by `test_cross_crate_map_contains_key` (Ok).
 
-### Cross-crate `HashMap::contains_key` deep-view-body arc — 3 of 4 layers LANDED 2026-05-31
+### Cross-crate `HashMap::contains_key` deep-view-body arc — all 4 layers LANDED (1–3 on 2026-05-31, layer 7 on 2026-06-01)
 
 `hash_map_deep_view_impl` (the `DeepView for HashMap` impl method) is the
 **first cross-crate spec fn whose BODY Tactus must fully render and
@@ -3325,28 +3324,58 @@ lib, 0 regressions, vstd 1530/0. Each layer is a general improvement
 independent of `contains_key` (emission-ordering correctness, VIR-AST coercion
 faithfulness, the inhabitedness invariant).
 
-**Layer 7 — fold/unfold renderer divergence (DEFERRED, characterized).** The
-obligation `r = set.Set.contains (dom (View.view m)) k` needs
-`map_lib.contains_key` unfolded to `dom.contains` to match the bc-lemma chain
-(`contains_borrowed_key = map_lib.contains_key …`, FOLDED). The root is the
-**two-parallel-renderers divergence** (§ "Two parallel expression renderers"):
-Verus *inlines* the open spec fn `Map::contains_key` in the **exec/SST** path
-(the user's `use_map` goal is unfolded — confirmed in `root-sst.vir`), while
-Tactus *folds* it in the **proof/VIR-AST** path (a proof fn's
-`ensures m.contains_key(k)` renders folded). The single bc-lemma can only
-render one way: unfold it → exec goals close but proof-fn goals break; keep it
-folded → the reverse. So the two sides are fundamentally inconsistent and the
-bc-lemma can't match both. Confirmed: rendering the goal folded → closes under
-*default* `tactus_auto`. A clean fix means **converging the two renderers'
-open-spec-fn-call rendering** (fold both, or unfold both — e.g. rendering exec
-postconditions from the folded VIR-AST ensures rather than Verus's inlined
-SST), a real project with its own design and regression surface across every
-exec+proof test. **Not** closer simp-set extension (Principle #1); and the
-fallback `proof { simp_all [map_lib.impl__0.contains_key] }` is rejected too —
-it would force the user to write a vstd-internal mangled name. Deferred as its
-own arc. `contains_key` still degrades *gracefully* (Lean ran, `tactus_auto
-failed`), pinned by `test_cross_crate_unemittable_trait_degrades_not_panics`
-(now failing only on the layer-7 obligation, all elaboration errors cleared).
+**Layer 7 — `#[verifier::inline]` spec-fn inlining on the VIR-AST (LANDED
+2026-06-01, `inline_spec`).** `HashMap::contains_key` now **verifies** under
+default `tactus_auto`. The obligation `r = set.Set.contains (dom (View.view m))
+k` needed `map_lib.contains_key` unfolded to match the bc-lemma chain
+(`contains_borrowed_key = map_lib.contains_key …`, FOLDED). The probe-time
+framing ("two-parallel-renderers divergence") was *near* the truth but mis-
+scoped the cause and the fix. The precise root: Verus's `sst_elaborate` inlines
+a spec-fn call iff `attrs.inline && kind.inline_okay()` — the
+`#[verifier::inline]` attribute — and that pass runs on the **SST only**. So
+exec-fn goals (rendered from the SST) see `#[inline]` fns *unfolded*, while the
+VIR-AST renderer (proof-fn goals, bc-lemma clauses) leaves them *folded*.
+**`#[inline]` is the entire divergence class**: default/`open`/`closed` spec fns
+stay folded on *both* paths (the documented "spec fn in goal position needs
+`unfold`" workflow), `#[verifier::opaque]` is `@[irreducible]` everywhere, and
+the uninterp vstd primitives (`set.contains`, `dom`, `Seq.len`) have no body.
+So this isn't a `contains_key` point-fix — mirroring `sst_elaborate` closes the
+class entirely.
+
+`inline_spec::inline_marked_in_krate` is one krate-level VIR-AST→VIR-AST pass,
+run before dep_order and all rendering (a single inlined source of truth): it
+inlines every `#[inline]` call in every fn's require/ensure/returns/decrease/
+body (recursively — `#[inline]` fns are non-recursive by Verus's
+well-formedness), and **drops the inherent (`Static`) inline fns' defs** (no
+SMT symbol, matching Verus). A `TraitMethodImpl` inline method keeps its def
+(the trait `instance` references it — dropping it leaves Lean's instance
+"fields missing"). The inlined result is re-stamped with the **call site's
+type** so reference decorations (e.g. a `&V` borrow of a `spec_index` result)
+survive — mirroring `sst_elaborate`'s `SpannedTyped::new(&exp.span, &exp.typ,
+…)`, so use-site `.mk`/`.deref` coercions still fire. The trivial `{ expr }` =
+`Block([], Some(e))` wrapper is peeled, and a param is substituted whether it's
+a by-value `Var` (`k`) or a by-reference `ReadPlace(Local(self))`. Wired by
+shadowing `krate` (+ re-fetching the inlined root) at the top of
+`check_proof_fn` / `check_exec_fn`. This is the second member of the existing
+pattern "replay the Verus AST→SST transforms that affect spec-expression shape"
+(the first: the `ExprX::Multi` chained-compare replay). **NOT** a closer
+simp-set extension (Principle #1 held) — the chain closes because the bc-lemma
+and the goal genuinely agree.
+
+**One consequence, handled.** Making the `Seq` broadcast axioms consistent
+(`index` form, since `Seq::spec_index` is also `#[inline]`) *activates* the seq
+update/extensionality rewrites that were previously **dormant** via the form
+mismatch. That consistency is correct and faithful, but the now-active rewrites
+derail `simp_all` on the returned-mut-ref *prophecy* goal of
+`test_exec_call_mut_arg_vec_index` — a close that had been passing by relying on
+the (non-faithful) dormancy. It gets an explicit `#[verifier::tactus_tactic("intros; grind")]`
+closer (Lean's general-purpose closer reasons through `update`/`index`/the
+prophecy cleanly; transparent, visible at the fn, no vstd-internal names). The
+`_wrong_ensures` soundness pin still correctly fails. Pinned by
+`test_cross_crate_map_contains_key` (Ok — the win; renamed from the former
+`_unemittable_trait_degrades_not_panics` graceful-degradation pin, now subsumed
+since it verifies) and `inline_spec::tests::inline_okay_matches_verus`. 470 e2e
++ 268 lib, 0 regressions, vstd 1530/0.
 
 ### Returned-mut-ref prophecy composition — LANDED 2026-05-30
 
