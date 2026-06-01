@@ -2231,10 +2231,10 @@ These are deferred by design — the current slice is single-crate exec+proof-fn
   - **Cross-crate broadcast lemmas referencing `BuiltinSpecFun` — skipped (LANDED 2026-05-30).** vstd's FnMut closure axioms (`axiom_fn_mut_call_requires`/`_ensures`), pulled in by default-on-import, reference a `BuiltinSpecFun` (closure `call_requires`/`call_ensures`) which the VIR-AST renderer has no faithful fixed-arity Lean form for (emits an unresolved literal `builtinSpecFun`). `references_builtin_spec_fun` (sst_to_lean.rs) skips such lemmas at collection — same graceful-skip family as the un-emittable-trait / `FiniteFull` filters. Their facts are unavailable (closure-spec reasoning isn't supported), but emission stays clean.
   - **`&mut v[i]` — LANDED 2026-05-30** via returned-mut-ref prophecy composition (§ "Returned-mut-ref prophecy composition"). Both links cleared: Link 1 (the FnMut `builtinSpecFun` broadcast wall) by the filter above; Link 2 (the returned `&mut`'s prophetic `*final`) by minting a prophecy var `P` at the `vec_index_mut` call and unifying it with the resolving `bump` call. Pinned by `test_exec_call_mut_arg_vec_index` (+ `_wrong_ensures`).
   - **Map/Set: `len` + `HashSet::contains` verify; `HashMap::contains_key` deferred on the deep-view body (RC2 projection mechanism + RC1/RC3/RC4 all LANDED 2026-05-31).** `HashMap::len()` verifies (RC1 marker shells + RC3 instance-head opaque-type seeding — both below); `HashSet::contains` verifies (RC4 below). The earlier "dangling references" framing was corrected by a live re-probe: RC1's chokepoint bound-drop dissolved the whole `Clone`/`PartialEq`/`Copy`/`Eq`/`Integer` cascade (it was *bounds* referencing un-emittable traits, not bare references), and RC3 cleared `DefaultHasher`. `HashMap::contains_key` still fails *gracefully* — its two operation-specific blockers (both since resolved) were:
-    - **RC2 — DeepView outParam projection (mechanism LANDED 2026-05-31; see § "Generalized projection-lifting").** `view.DeepView`'s assoc type `V` is an `outParam`, but the standalone spec fn `std_specs.hash.hash_map_deep_view_impl` projected `view.DeepView.V Key` as if `V` were an accessor → "type expected, got". **Landed:** projection-lifting generalized from impl-methods/instance-signatures to *every* generic function, covering signatures, bodies, require/ensure clauses, trait bounds, and broadcast lemmas (with Source-2 coverage) — the entire `view.DeepView.V Key`-as-accessor cascade *and* the `axiom_hashmap_deepview_borrow` broadcast-lemma errors are gone; synthetic assoc binders render implicit so VIR call sites typecheck. **Deferred residual** (now non-projection, inside the `hash_map_deep_view_impl` body): (4) View-instance synthesis — `failed to synthesize View (HashMap …) ?V` in a fully polymorphic context; (5) the body's `Classical.epsilon` needs `[Nonempty Key]`. Map-with-deep-view-specific (HashSet `contains` doesn't hit it — it fully verifies).
+    - **RC2 — DeepView outParam projection (mechanism LANDED 2026-05-31; see § "Generalized projection-lifting").** `view.DeepView`'s assoc type `V` is an `outParam`, but the standalone spec fn `std_specs.hash.hash_map_deep_view_impl` projected `view.DeepView.V Key` as if `V` were an accessor → "type expected, got". **Landed:** projection-lifting generalized from impl-methods/instance-signatures to *every* generic function, covering signatures, bodies, require/ensure clauses, trait bounds, and broadcast lemmas (with Source-2 coverage) — the entire `view.DeepView.V Key`-as-accessor cascade *and* the `axiom_hashmap_deepview_borrow` broadcast-lemma errors are gone; synthetic assoc binders render implicit so VIR call sites typecheck.
     - **RC4 — Box-key cross-crate coercion (LANDED 2026-05-31; see § "Instantiated-param-type call-arg coercion").** Verus's `axiom_contains_box` ensures `contains_borrowed_key(m,k) <==> m.contains_key(Box::new(*k))`. Verus erases `Box::new(*k)` to a bare `*k : Q` at the value level (confirmed by `--log vir-simple`: the surviving VIR arg is `ReadPlace(Local k) : TypParam Q`, no box node), so the key rendered as `k.deref : Q` against `contains_key`'s `K ↦ Box<Q>` key slot. Fix: the call-arg bridge now uses the callee's param type AS INSTANTIATED by the call's typ_args (`K ↦ Box<Q>`), so `coerce_lexpr` inserts the `Q → Box Q` `.mk` wrap, faithfully recovering the erased construction: `contains_key (Box Q) Value m (Tactus.Box.mk k.deref)`. General over any generic call whose param-type-param instantiates to a wrapper (Box/Ref/Rc/Arc/MutRef) — not Box- or contains-specific. Was shared by `contains_key` and `HashSet::contains`; now cleared for both.
 
-    So `HashSet::contains` is fully verified; `HashMap::contains_key` has *all* its DeepView projection errors cleared (the generalized projection-lifting mechanism is complete — see § "Generalized projection-lifting") and now needs only the two non-projection deep-view-body issues (4)/(5) above.
+    So `HashSet::contains` is fully verified. **`HashMap::contains_key`'s deep-view BODY now fully elaborates too (2026-05-31, see § "Cross-crate `HashMap::contains_key` deep-view-body arc")** — the earlier residual framing's "(4) View-instance synthesis + (5) Nonempty" turned out to be an *ordering* fix (layer 4: `dep_order::order_emission` topologically interleaves the `View (HashMap …)` instance before the def that dispatches to it) and a *Nonempty-binder* fix (layer 5: `nonempty.rs` infers `[Nonempty T]` for choose-over-type-param), plus a third *coercion* fix they unmasked (layer 6: `structural_typ` materializes the `.mk` on a ref-decorated `Call` receiver). The probe went from 5 errors to 1. The **sole remaining blocker is layer 7** — the fold/unfold renderer divergence (Verus inlines the open spec fn `Map::contains_key` in the exec/SST goal but Tactus folds it in the proof/VIR-AST bc-lemma; the single bc-lemma can't match both), deferred as a two-renderers-convergence arc. `contains_key` degrades gracefully (only the obligation fails, all elaboration errors cleared).
   - **Dynamic dispatch via `dyn Trait`** — same cross-crate rejection path as #125.
 
   **Broadcast scope** — `collect_broadcast_lemma_funs` (below) handles BOTH default-on-import groups (`broadcast_use_by_default_when_this_crate_is_imported`, e.g. vstd's `group_vstd_default` — the drop-in case) AND fn-body `broadcast use <group>;` (`StmX::Fuel`). Still deferred: **module-level** `broadcast use` (`ModuleX.reveals` — a `broadcast use` at module scope rather than fn-body or default-on-import); needs reading the fn's owning-module reveal list rather than the fn body. Rare for user crates.
@@ -3013,10 +3013,13 @@ un-emittable traits (not bare references), all cleared by RC1's marker-shell +
 chokepoint bound-drop; `DefaultHasher` cleared by RC3; the Box-key coercion
 cleared by RC4 (§ "Instantiated-param-type call-arg coercion"); and RC2's whole
 DeepView projection cascade cleared by the generalized projection-lift (§
-"Generalized projection-lifting"). The genuine residual is now two *non-projection*
-deep-view-body issues — (4) View-instance synthesis and (5) `Nonempty Key` for
-`Classical.epsilon` — see § "Cross-crate marker-shell trait emission" and the
-Phase-3 Map/Set bullet for the full breakdown.
+"Generalized projection-lifting"). The deep-view BODY then fully elaborated too
+(2026-05-31, § "Cross-crate `HashMap::contains_key` deep-view-body arc"): the
+"(4) View synthesis + (5) Nonempty" residual resolved into an *ordering* fix
+(`dep_order::order_emission`), a *Nonempty-binder* fix (`nonempty.rs`), and a
+third *coercion* fix they unmasked (`structural_typ` for `Call`). The sole
+remaining blocker is layer 7 — the fold/unfold renderer divergence — deferred
+as a two-renderers-convergence arc.
 
 ### Cross-crate marker-shell trait emission — LANDED 2026-05-31 (#122 RC1/RC3)
 
@@ -3086,8 +3089,10 @@ graceful Map/Set degradation, no panic), plus unit tests
 lean_verify lib (counts as of this section's landing). RC4 (Box-key coercion) and
 RC2 (the whole DeepView projection cascade) both LANDED 2026-05-31 — see §
 "Instantiated-param-type call-arg coercion" and § "Generalized projection-lifting"
-next. `contains_key`'s remaining residual is two non-projection deep-view-body
-issues ((4) View synthesis, (5) `Nonempty Key`).
+next. `contains_key`'s deep-view body then fully elaborated via layers 4–6
+(ordering / Nonempty / Call-coercion — § "Cross-crate `HashMap::contains_key`
+deep-view-body arc"); the sole remaining blocker is layer 7 (the fold/unfold
+renderer divergence), deferred.
 
 ### Instantiated-param-type call-arg coercion — LANDED 2026-05-31 (#122 RC4)
 
@@ -3222,16 +3227,126 @@ transparency-clean mechanism to more sites inherits its cleanliness.
 projection-lifting machinery covers every site — signatures, bodies, require/ensure,
 trait bounds, and broadcast lemmas, with correct Source-2 coverage — and the whole
 `view.DeepView.V Key`-as-accessor cascade *and* the `axiom_hashmap_deepview_borrow`
-broadcast-lemma errors are cleared. What blocks `contains_key` now is two semantic
-issues **inside the `hash_map_deep_view_impl` body**, separate from projection-lifting:
-(4) View-instance synthesis — the body's `View.view (Ref.mk m)` for `m : HashMap …`
-fails to determine the output type V in a fully polymorphic context (`failed to
-synthesize View (HashMap …) ?V`); (5) the body's `Classical.epsilon` needs
-`[Nonempty Key]`. Both are map-with-deep-view-specific; `HashSet::contains` has
-neither and fully verifies (RC4). **Deferred** as their own sub-arc (they're about
-elaborating one vstd spec-fn body, not about projections). Pinned by
-`test_cross_crate_unemittable_trait_degrades_not_panics` (still Err — now on (4)/(5)
-only). 469 e2e, 263 lib, 0 regressions, vstd 1530/0.
+broadcast-lemma errors are cleared. What remained at this point was the
+`hash_map_deep_view_impl` *body's* elaboration — which the **deep-view-body arc**
+(§ "Cross-crate `HashMap::contains_key` deep-view-body arc", next) then resolved:
+the two then-visible errors ("View synthesis" / "Nonempty") were an ordering fix
+(layer 4) and a Nonempty-binder fix (layer 5), plus a coercion fix they unmasked
+(layer 6). The body now fully elaborates; the sole remaining blocker is layer 7
+(the fold/unfold renderer divergence). Pinned by
+`test_cross_crate_unemittable_trait_degrades_not_panics` (still Err — now only on
+the layer-7 obligation, all elaboration errors cleared).
+
+### Cross-crate `HashMap::contains_key` deep-view-body arc — 3 of 4 layers LANDED 2026-05-31
+
+`hash_map_deep_view_impl` (the `DeepView for HashMap` impl method) is the
+**first cross-crate spec fn whose BODY Tactus must fully render and
+elaborate** — everything before was signature-only. Probing it (generate
+the `.lean`, read the live errors, drive them to zero with surgical edits)
+found the body's elaboration needs **three** distinct rendering fixes, plus
+a fourth issue at the obligation level. The earlier residual framing —
+"(4) View-instance synthesis + (5) Nonempty" — was the two errors visible at
+probe time; the full probe revealed they are an *ordering* fix and a
+*Nonempty-binder* fix respectively, plus a third *coercion* fix the first two
+unmasked. Three landed; the fourth is a characterized architectural deferral.
+
+The decision shape (Danielle's gate): **keep the body, don't axiomatize it.**
+Emitting the opaque def body-less (an `axiom` of the same type) is *sound* but
+*incomplete* — it loses Verus's `reveal`-parity (a user could no longer
+`unfold` it to reason about `m.deep_view()`'s definition). So the faithful
+choice is to make the body elaborate, paying the honest (localized,
+Lean-required) cost.
+
+**Layer 6 — VIR-AST call-arg coercion treats a `Call` at its rendered depth
+(`structural_typ` for `ExprX::Call`).** The body's `(self@[k]).deep_view()`
+borrows a `spec_index` *call result*; Verus types it `&Value` but the Call
+renderer materializes no decoration, producing bare `Value`. The coercion
+bridge trusted `expr.typ` (the decorated `&Value`, depth 1 == the `Ref Self`
+param depth) and inserted no `.mk` — while the two bare-Var receivers
+(`orig_k`, `k`) DID get `.mk` (their `ReadPlace(ImmutBor)` returns the bare
+binder typ via `structural_typ`, and the bridge materializes the ref). Fix:
+`structural_typ` reports `strip_all_ref_decorations(expr.typ)` for a `Call`
+(a naked `head args` sits at the callee's bare return typ), so the existing
+bidirectional bridge inserts the `.mk` chain bare → `expr.typ`, matching the
+ReadPlace/Var path. No-op for the common undecorated call (strip is identity).
+The VIR-AST analog of the SST renderer's U2 actual-rendered-depth awareness
+(§ "Two parallel expression renderers"). Relies on spec-fn returns being bare
+value typs; a decorated return would over-strip into a LOUD Lean error.
+
+**Layer 4 — topological emission ordering (`dep_order::order_emission`).**
+Instances were emitted as a fixed phase AFTER all spec fns, but a spec-fn
+*body* can dispatch to an instance: `m@` is a `View (HashMap …)` dispatch, and
+Lean instance resolution only sees earlier declarations — so the `View`
+instance (emitted late) was invisible to the def. Meanwhile `DeepView (HashMap
+…)`'s body references that spec fn, so it must stay AFTER it. A genuine DAG,
+not a phase split. `order_emission` builds the spec-fn↔instance dependency
+graph and runs Kahn's topological sort with an original-position tiebreak
+(groups own ids `0..n` in their `order_spec_fns` order; instances own
+`n..n+m`). The group-order chain pins the spec-fn sequence; instances slot
+into the gaps the edges open. Edges: a group follows every instance it
+dispatches to (read from the trait-method call's `CallTarget::Fun` ImplPaths
+dictionary — the call-level field, **not** `DynamicResolved.impl_paths`, which
+is empty here); an instance follows its method-def groups and any instance it
+dispatches to. The lowest-id tiebreak means an instance only leaves its
+trailing slot when an edge forces it — **zero drift** for instances nothing
+dispatches to. Proof-method classes still emit at the spec-fn/instance
+boundary (after the last group). Replaces the fixed-phase ordering this doc
+previously flagged as needing "a topological-sort approach". The pure Kahn's
+core is extracted as `kahn_emit` and unit-tested over plain `usize` graphs.
+
+**Layer 5 — `[Nonempty T]` inference (`nonempty.rs`).** Verus's `choose|x: T|`
+is total (returns some value of `T` even when nothing satisfies the predicate),
+sound only because every Verus spec type is inhabited; Tactus renders it as
+`Classical.epsilon`, which Lean requires `[Nonempty T]` for. The body chooses
+over `Key`, hence its `failed to synthesize Nonempty Key`. Not a heuristic — it
+emits the *exact* binder Lean itself would force a human writing this Lean to
+add, in the *exact* places, propagated along the call graph and bottoming out
+at concrete types (`Nonempty u8` resolves on its own; Tactus emits `Inhabited`
+⟹ `Nonempty` for every concrete datatype). Mechanism: SEED at a fn that
+`choose`s (`ExprX::Choose`) over its own type-param; PROPAGATE backward to a
+fixpoint — if F calls G with type-args and G needs `[Nonempty G.param_j]` and F
+passes its own type-param for slot j, F needs it too (trait-method calls
+resolve through `DynamicResolved.{resolved, typs}`). The binder is synthesised
+as `GenericBoundX::Trait(Nonempty, [T])` and added at AUGMENT time (after
+`collect_references`), so it rides the existing `trait_bounds_to_ast` rendering
+and never leaks into class/dep emission — the single path segment `Nonempty`
+renders verbatim. Wired in `generate.rs`: spec fns + bc lemmas via the augment
+step, instances via `instance_nonempty_bounds` (inherited from their
+method-impl fns) threaded into `trait_impl_to_ast`. `Nonempty` is on the sanity
+allowlist (beside `Inhabited`). For `contains_key` the cascade is exactly the
+four vstd-internal declarations (def → forwarding def → `DeepView` instance →
+`axiom_hashmap_deepview_borrow`) and stops dead at the user's `Key = u8`; the
+user's `use_map` gets no binder. Pinned by `test_nonempty_choose_over_type_param`
+(same-crate seed + 1-hop propagation + concrete resolution).
+
+**Result of layers 4–6.** The deep-view body **fully elaborates** — only the
+obligation (layer 7) remains; the probe went from 5 errors to 1. 470 e2e + 267
+lib, 0 regressions, vstd 1530/0. Each layer is a general improvement
+independent of `contains_key` (emission-ordering correctness, VIR-AST coercion
+faithfulness, the inhabitedness invariant).
+
+**Layer 7 — fold/unfold renderer divergence (DEFERRED, characterized).** The
+obligation `r = set.Set.contains (dom (View.view m)) k` needs
+`map_lib.contains_key` unfolded to `dom.contains` to match the bc-lemma chain
+(`contains_borrowed_key = map_lib.contains_key …`, FOLDED). The root is the
+**two-parallel-renderers divergence** (§ "Two parallel expression renderers"):
+Verus *inlines* the open spec fn `Map::contains_key` in the **exec/SST** path
+(the user's `use_map` goal is unfolded — confirmed in `root-sst.vir`), while
+Tactus *folds* it in the **proof/VIR-AST** path (a proof fn's
+`ensures m.contains_key(k)` renders folded). The single bc-lemma can only
+render one way: unfold it → exec goals close but proof-fn goals break; keep it
+folded → the reverse. So the two sides are fundamentally inconsistent and the
+bc-lemma can't match both. Confirmed: rendering the goal folded → closes under
+*default* `tactus_auto`. A clean fix means **converging the two renderers'
+open-spec-fn-call rendering** (fold both, or unfold both — e.g. rendering exec
+postconditions from the folded VIR-AST ensures rather than Verus's inlined
+SST), a real project with its own design and regression surface across every
+exec+proof test. **Not** closer simp-set extension (Principle #1); and the
+fallback `proof { simp_all [map_lib.impl__0.contains_key] }` is rejected too —
+it would force the user to write a vstd-internal mangled name. Deferred as its
+own arc. `contains_key` still degrades *gracefully* (Lean ran, `tactus_auto
+failed`), pinned by `test_cross_crate_unemittable_trait_degrades_not_panics`
+(now failing only on the layer-7 obligation, all elaboration errors cleared).
 
 ### Returned-mut-ref prophecy composition — LANDED 2026-05-30
 
