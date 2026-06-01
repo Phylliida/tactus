@@ -11743,3 +11743,73 @@ test_verify_one_file! {
         { }
     } => Ok(())
 }
+
+// #[verifier::inline] coverage cluster (#122 layer 7, `inline_spec`). These
+// probe substitution shapes the contains_key/vec_index e2e tests don't reach,
+// turning the review's "latent" findings into pins. All route through a
+// Lean `by { }` proof fn so the inline runs on the VIR-AST goal (not the
+// SST/exec path).
+
+// Field access on an #[inline] param. The param is read whole
+// (`Field(ReadPlace(Local(p)))` — a projection over a whole-local read), so the
+// `ReadPlace(Local)` substitution handles it; `fst(p)` inlines to `p.a`, not a
+// dangling `p`. (Disproves the conservative "field access dangles" worry.)
+test_verify_one_file! {
+    #[test] test_inline_fn_field_access verus_code! {
+        struct Pair { a: u8, b: u8 }
+        #[verifier::inline]
+        spec fn fst(p: Pair) -> u8 { p.a }
+        proof fn use_fst(p: Pair)
+            ensures fst(p) == p.a
+        by { rfl }
+    } => Ok(())
+}
+
+// Nested #[inline] chain: `outer` inlines to `inner(x) + 1`, then `inner`
+// inlines recursively to `x * 2`. Both are Static → both defs dropped.
+// Exercises inline_calls' recursion + the can_drop chain.
+test_verify_one_file! {
+    #[test] test_inline_fn_nested_chain verus_code! {
+        #[verifier::inline]
+        spec fn inner(x: int) -> int { x * 2 }
+        #[verifier::inline]
+        spec fn outer(x: int) -> int { inner(x) + 1 }
+        proof fn use_chain(x: int)
+            ensures outer(x) == x * 2 + 1
+        by { omega }
+    } => Ok(())
+}
+
+// #[inline] on a TRAIT IMPL method (not inherent). Exercises the
+// can_inline_call(TraitMethodImpl)=true + can_drop=false branch: the call
+// inlines, but the def is KEPT so the trait instance's method field resolves.
+test_verify_one_file! {
+    #[test] test_inline_fn_trait_impl_method verus_code! {
+        pub trait Five { spec fn five(&self) -> u8; }
+        pub struct Z;
+        impl Five for Z {
+            #[verifier::inline]
+            open spec fn five(&self) -> u8 { 5 }
+        }
+        proof fn use_five(z: Z)
+            ensures z.five() == 5
+        by { rfl }
+    } => Ok(())
+}
+
+// Binder-bodied #[inline] fn (a quantifier): body_blocks_inlining refuses it,
+// so its calls stay FOLDED and its def is kept. The proof closes on the folded
+// form (`all_eq s = all_eq s`) — confirming the refuse-to-inline path is sound
+// (it under-proves, never mis-proves).
+test_verify_one_file! {
+    #[test] test_inline_fn_binder_body_kept_folded verus_code! {
+        use vstd::prelude::*;
+        #[verifier::inline]
+        spec fn all_eq(s: Seq<int>) -> bool {
+            forall|i: int| 0 <= i < s.len() ==> s[i] == s[i]
+        }
+        proof fn use_binder(s: Seq<int>)
+            ensures all_eq(s) == all_eq(s)
+        by { rfl }
+    } => Ok(())
+}

@@ -254,13 +254,15 @@ fn substitute_body(body: &Expr, typ_params: &Idents, typs: &Typs, f: &FunctionX,
         // A param is referenced as a plain `Var` (by-value params, e.g. `k`), a
         // staged `VarAt`, or a whole-local place read `ReadPlace(Local(p))`
         // (by-reference receivers, e.g. `self`) — each reads the param's value
-        // and is replaced wholesale with the corresponding arg expr. A param
-        // appearing inside a *nested* place (`ReadPlace(Field(Local(p)))`,
-        // `*p`) is NOT substitutable to an arbitrary arg expr at the VIR-AST
-        // Place/Expr boundary; such a body would leave the param dangling →
-        // caught loud by the sanity check (`unresolved p`). No vstd `#[inline]`
-        // fn does field/deref access on a param (all use whole-receiver method
-        // calls), so this doesn't arise today.
+        // and is replaced wholesale with the corresponding arg expr. Spec-fn
+        // bodies read params this way: a projection like `p.a` is
+        // `Field(ReadPlace(Local(p)))` — a field op OVER a whole-local read, so
+        // the inner read is substituted and `p.a` inlines correctly (pinned by
+        // `test_inline_fn_field_access`); likewise `s[i]`/`s.len()` are method
+        // calls whose receiver is a whole-local read. The only shape this misses
+        // is a param buried in a genuine place l-value (`ReadPlace(Field(Local
+        // (p)))`), which pure spec-fn bodies don't produce; were it to occur it
+        // would dangle → caught loud by the sanity check, never silent.
         let referenced = match &e.x {
             ExprX::Var(v) | ExprX::VarLoc(v) | ExprX::VarAt(v, _) => Some(v),
             ExprX::ReadPlace(place, _) => match &place.x {
