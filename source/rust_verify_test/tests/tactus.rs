@@ -11900,3 +11900,55 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// A `--` comment in a proof fn's body that merely *mentions* its caller
+// must NOT pull the caller into the file (strip_lean_line_comments) —
+// otherwise `caller`, declared before `base`, forward-references it.
+// Pins the comment-strip half of the textual dependency scan.
+test_verify_one_file! {
+    #[test] test_proof_fn_helper_comment_mention_excluded verus_code! {
+        spec fn double(n: nat) -> nat { n + n }
+
+        proof fn base(n: nat)
+            ensures double(n) >= 0
+        by {
+            -- caller uses base; this mention must not over-include caller
+            unfold double
+            omega
+        }
+
+        proof fn caller(n: nat)
+            ensures double(n) >= 0
+        by {
+            have h := base n
+            exact h
+        }
+    } => Ok(())
+}
+
+// Diamond: lem_d -> {lem_b, lem_c} -> lem_a. In lem_d.lean the shared
+// dependency lem_a must be emitted once, before BOTH lem_b and lem_c
+// (DFS post-order dedups via the `visited` set). Pins shared-dep handling.
+test_verify_one_file! {
+    #[test] test_proof_fn_helper_diamond verus_code! {
+        spec fn double(n: nat) -> nat { n + n }
+
+        proof fn lem_a(n: nat) ensures double(n) >= 0 by { unfold double; omega }
+
+        proof fn lem_b(n: nat) ensures double(n) >= 0 by {
+            have h := lem_a n
+            exact h
+        }
+
+        proof fn lem_c(n: nat) ensures double(n) >= 0 by {
+            have h := lem_a n
+            exact h
+        }
+
+        proof fn lem_d(n: nat) ensures double(n) >= 0 by {
+            have hb := lem_b n
+            have hc := lem_c n
+            exact hb
+        }
+    } => Ok(())
+}

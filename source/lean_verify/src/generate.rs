@@ -132,12 +132,12 @@ fn strip_lean_line_comments(body: &str) -> String {
 /// emittable proof fn with the short name it's referenced by in Lean.
 fn collect_referenced_proof_fns<'a>(
     roots: &[&'a FunctionX],
-    candidates: &[(&'a FunctionX, String)],
+    candidates: &[(&'a FunctionX, &'a str)],
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> Vec<&'a FunctionX> {
     fn visit<'a>(
         f: &'a FunctionX,
-        candidates: &[(&'a FunctionX, String)],
+        candidates: &[(&'a FunctionX, &'a str)],
         tactic_bodies: &std::collections::HashMap<Fun, String>,
         root_names: &std::collections::HashSet<&'a Fun>,
         visited: &mut std::collections::HashSet<&'a Fun>,
@@ -288,10 +288,10 @@ fn krate_preamble(
         // proof fn that depended on it. See
         // BUG-proof-fn-dep-walker-over-includes.md.
         PreambleConfig::ProofFn => {
-            let candidates: Vec<(&FunctionX, String)> = krate.functions.iter()
+            let candidates: Vec<(&FunctionX, &str)> = krate.functions.iter()
                 .map(|f| &f.x)
                 .filter(is_emittable_helper)
-                .map(|f| (f, short_name(&f.name.path).to_string()))
+                .map(|f| (f, short_name(&f.name.path)))
                 .collect();
             collect_referenced_proof_fns(root_fns, &candidates, tactic_bodies)
         }
