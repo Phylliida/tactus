@@ -780,6 +780,18 @@ pub fn check_proof_fn(
     crate_name: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> CheckResult {
+    // Layer 7 — inline `#[verifier::inline]` spec fns on the VIR-AST so that
+    // proof-fn goals and broadcast-lemma clauses agree with Verus's
+    // SST-inlined exec goals. One krate-level pass, before any rendering; the
+    // root fn is re-fetched from the inlined krate so its goal inlines too and
+    // dep-walk roots don't reference the dropped inline-fn defs. See
+    // `inline_spec`.
+    let inlined_krate = crate::inline_spec::inline_marked_in_krate(krate);
+    let proof_fn = inlined_krate.functions.iter()
+        .find(|f| f.x.name == proof_fn.name).map(|f| &f.x)
+        .expect("root proof fn present in inlined krate (proof fns are never #[inline])");
+    let krate = &inlined_krate;
+
     // Proof fns render match expressions natively (spec fns
     // preserve match through to VIR-AST), so accessor fns are
     // unnecessary and would fail elaboration for enum types whose
@@ -891,6 +903,18 @@ pub fn check_exec_fn(
     crate_name: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> CheckResult {
+    // Layer 7 — inline `#[verifier::inline]` spec fns on the VIR-AST so the
+    // broadcast-lemma clauses krate_preamble emits agree with Verus's
+    // SST-inlined exec goal. The exec goal itself already arrives inlined (via
+    // the SST in `check`); this brings the VIR-AST side into agreement. The
+    // root is re-fetched from the inlined krate so dep-walk roots don't
+    // reference the dropped inline-fn defs. See `inline_spec`.
+    let inlined_krate = crate::inline_spec::inline_marked_in_krate(krate);
+    let vir_fn = inlined_krate.functions.iter()
+        .find(|f| f.x.name == vir_fn.name).map(|f| &f.x)
+        .expect("root exec fn present in inlined krate (exec fns are never #[inline])");
+    let krate = &inlined_krate;
+
     // Collect `assume(P)` sites first so warnings surface even when
     // the rest of the codegen rejects the fn. Each `assume` is a
     // soundness escape hatch — `assume(P)` enters its expression

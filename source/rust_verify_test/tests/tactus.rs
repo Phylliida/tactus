@@ -10116,7 +10116,16 @@ test_verify_one_file_with_options! {
             *x = *x + 1;
         }
 
+        // Closer override (`grind`) needed since #122 layer 7 (`inline_spec`):
+        // mirroring Verus's `#[verifier::inline]` handling makes the `Seq`
+        // broadcast axioms render in `index` form, consistent with the SST
+        // goal. That consistency is correct/faithful, but it activates the
+        // seq update/extensionality rewrites (previously dormant via a form
+        // mismatch), which derails `simp_all` on this prophecy goal. Lean's
+        // general-purpose `grind` reasons through `update`/`index`/the
+        // prophecy cleanly. Transparent (visible here, no vstd-internal names).
         #[verifier::tactus_auto]
+        #[verifier::tactus_tactic("intros; grind")]
         #[verifier::deprecated_postcondition_mut_ref_style(true)]
         fn call_vec_index_mut(v: &mut Vec<u8>)
             requires
@@ -11658,23 +11667,22 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Graceful degradation on `HashMap::contains_key`. RC1 (marker shells),
-// RC3 (DefaultHasher), RC4 (Box-key coercion), and the generalized
-// projection-lift (RC2 — now covering signatures, bodies, require/ensure
-// clauses, trait bounds, and broadcast lemmas, with Source-2 coverage) are
-// all landed: the entire `view.DeepView.V Key`-as-accessor cascade and the
-// `axiom_hashmap_deepview_borrow` broadcast-lemma errors are GONE. What
-// remains (probed 2026-05-31, `lean --json`) is two semantic issues inside
-// the `hash_map_deep_view_impl` BODY, separate from projection-lifting:
-//   (4) View-instance synthesis — `failed to synthesize View (HashMap …) ?V`
-//       in a fully polymorphic context (the body's `View.view (Ref.mk m)`);
-//   (5) `Classical.epsilon` in the body needs `[Nonempty Key]`.
-// Until those land `contains_key` must still fail GRACEFULLY (Lean ran,
-// `tactus_auto failed`) rather than panic in `trait_to_ast`. (`HashSet::
-// contains` — which has no deep-view map projection — fully verifies; see
-// `test_cross_crate_set_contains`.)
+// Cross-crate `HashMap::contains_key` verifies end-to-end (#122 layer 7,
+// the last deep-view-body blocker). RC1 (marker shells), RC3 (DefaultHasher),
+// RC4 (Box-key coercion), the generalized projection-lift (RC2), and the
+// deep-view-body layers 4-6 (emission ordering / `[Nonempty]` / Call-coercion)
+// cleared every *elaboration* error, leaving one *obligation* failure: the
+// user's postcondition `r == m@.contains_key(k)` rendered (via Verus's SST)
+// with the `#[verifier::inline]` `Map::contains_key` UNFOLDED (`dom.contains`),
+// while the broadcast lemmas characterizing the operation rendered it FOLDED —
+// and `simp_all` can't bridge a `noncomputable def`. Layer 7 (`inline_spec`)
+// mirrors Verus's `sst_elaborate`: it inlines `#[inline]` spec-fn calls on the
+// VIR-AST too, so broadcast-lemma clauses and proof-fn goals agree with the
+// SST-inlined exec goal. The chain then closes under DEFAULT `tactus_auto` (no
+// simp-set extension — Principle #1 held). `HashSet::contains` verifies via the
+// same machinery (see `test_cross_crate_set_contains`).
 test_verify_one_file! {
-    #[test] test_cross_crate_unemittable_trait_degrades_not_panics verus_code! {
+    #[test] test_cross_crate_map_contains_key verus_code! {
         use vstd::prelude::*;
         #[verifier::tactus_auto]
         fn use_map(m: &std::collections::HashMap<u8, u8>, k: u8) -> (r: bool)
@@ -11682,14 +11690,7 @@ test_verify_one_file! {
         {
             m.contains_key(&k)
         }
-    } => Err(e) => {
-        let s = format!("{:?}", e);
-        // `tactus_auto failed` = Lean ran (codegen completed without the
-        // trait_to_ast panic). A panic would instead surface as a Rust
-        // backtrace / "not found in VIR function list".
-        assert!(s.contains("tactus_auto failed") && !s.contains("not found in VIR"),
-            "expected graceful Lean failure (no trait_to_ast panic), got: {}", s);
-    }
+    } => Ok(())
 }
 
 // RC4 (instantiated-param-type call-arg coercion, #122) — a cross-crate
