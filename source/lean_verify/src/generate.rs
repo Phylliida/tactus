@@ -85,6 +85,91 @@ impl PreambleConfig {
     }
 }
 
+/// Word-boundary check: does identifier `word` occur in `text` not as
+/// part of a larger identifier? Byte-level so it's safe across the
+/// Unicode in Lean tactic bodies (`word` is an ASCII identifier, and
+/// ASCII bytes never appear inside a multi-byte UTF-8 sequence; a
+/// continuation byte before/after counts as a boundary, which is
+/// correct).
+fn ident_appears(text: &str, word: &str) -> bool {
+    let (t, w) = (text.as_bytes(), word.as_bytes());
+    if w.is_empty() || w.len() > t.len() {
+        return false;
+    }
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    (0..=t.len() - w.len()).any(|s| {
+        &t[s..s + w.len()] == w
+            && (s == 0 || !is_ident(t[s - 1]))
+            && (s + w.len() == t.len() || !is_ident(t[s + w.len()]))
+    })
+}
+
+/// Drop `--`-to-end-of-line Lean comments so a proof-fn name merely
+/// mentioned in a comment doesn't count as a reference. (A real lemma
+/// reference is tactic code, before any trailing comment; a `--` inside
+/// a string literal would over-strip, but string literals in tactic
+/// proofs are vanishingly rare.)
+fn strip_lean_line_comments(body: &str) -> String {
+    body.lines()
+        .map(|l| match l.find("--") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Proof-fn bodies are raw Lean tactic text (a `TacticBlock` span), so
+/// VIR dep-walking can't see `have := helper` lemma calls — those
+/// references exist only as text. Find the proof fns a root transitively
+/// references by scanning tactic bodies for their names, returned in
+/// TOPOLOGICAL order (a dependency before anything that references it)
+/// via DFS post-order. Roots are excluded — they emit as the file's main
+/// theorem. This fixes BUG-proof-fn-dep-walker-over-includes.md: only the
+/// root's actual downward dependencies land in its file, correctly
+/// ordered, so a proof fn that merely *depends on* the root (and would
+/// forward-reference it) is no longer dragged in. `candidates` pairs each
+/// emittable proof fn with the short name it's referenced by in Lean.
+fn collect_referenced_proof_fns<'a>(
+    roots: &[&'a FunctionX],
+    candidates: &[(&'a FunctionX, String)],
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> Vec<&'a FunctionX> {
+    fn visit<'a>(
+        f: &'a FunctionX,
+        candidates: &[(&'a FunctionX, String)],
+        tactic_bodies: &std::collections::HashMap<Fun, String>,
+        root_names: &std::collections::HashSet<&'a Fun>,
+        visited: &mut std::collections::HashSet<&'a Fun>,
+        ordered: &mut Vec<&'a FunctionX>,
+    ) {
+        if !visited.insert(&f.name) {
+            return;
+        }
+        if let Some(body) = tactic_bodies.get(&f.name) {
+            let code = strip_lean_line_comments(body);
+            for (cand, name) in candidates {
+                if cand.name != f.name && ident_appears(&code, name) {
+                    visit(cand, candidates, tactic_bodies, root_names, visited, ordered);
+                }
+            }
+        }
+        // Post-order: emit `f` after its dependencies. Roots emit
+        // separately as the file's main theorem, so skip them here.
+        if !root_names.contains(&f.name) {
+            ordered.push(f);
+        }
+    }
+    let root_names: std::collections::HashSet<&Fun> =
+        roots.iter().map(|f| &f.name).collect();
+    let mut visited: std::collections::HashSet<&Fun> = std::collections::HashSet::new();
+    let mut ordered: Vec<&FunctionX> = Vec::new();
+    for r in roots {
+        visit(r, candidates, tactic_bodies, &root_names, &mut visited, &mut ordered);
+    }
+    ordered
+}
+
 /// Build the shared preamble: imports, prelude, namespace-open, and entity
 /// declarations transitively referenced by `root_fns`. Returns a (preamble
 /// Vec, namespace) pair. Callers append the theorem command and the matching
@@ -171,12 +256,12 @@ fn krate_preamble(
         .collect();
 
     // Compute helpers_to_emit: proof fns the root might invoke as
-    // lemmas from `proof { have _ := lemma args }` blocks. Skip
-    // root_fns themselves (the fn being checked emits as the file's
-    // main content), proof fns without a tactic body in
-    // `tactic_bodies` (uninterp trait method decls etc.), and
-    // `TraitMethodDecl` / `TraitMethodImpl` (those live inside
-    // class/instance declarations, not as standalone theorems).
+    // lemmas from `have _ := lemma args` in its tactic body. Always
+    // excluded: `root_fns` themselves (each emits as its file's main
+    // theorem), proof fns without a tactic body in `tactic_bodies`
+    // (uninterp trait method decls etc.), and `TraitMethodDecl` /
+    // `TraitMethodImpl` (those live inside class/instance declarations,
+    // not as standalone theorems).
     //
     // These helpers' dep-walk roots feed into the spec-fn dep walk
     // alongside `root_fns`, so any spec fn / datatype / trait the
@@ -184,16 +269,46 @@ fn krate_preamble(
     // See BUG-no-helper-proof-fn-call-from-exec.md.
     let root_fn_set: std::collections::HashSet<&Fun> =
         root_fns.iter().map(|f| &f.name).collect();
-    let helpers_to_emit: Vec<&FunctionX> = krate.functions.iter()
-        .map(|f| &f.x)
-        .filter(|f| matches!(f.mode, vir::ast::Mode::Proof))
-        .filter(|f| !root_fn_set.contains(&f.name))
-        .filter(|f| !matches!(
-            f.kind,
-            FunctionKind::TraitMethodDecl { .. } | FunctionKind::TraitMethodImpl { .. }
-        ))
-        .filter(|f| tactic_bodies.contains_key(&f.name))
-        .collect();
+    let is_emittable_helper = |f: &&FunctionX| {
+        matches!(f.mode, vir::ast::Mode::Proof)
+            && !matches!(
+                f.kind,
+                FunctionKind::TraitMethodDecl { .. } | FunctionKind::TraitMethodImpl { .. }
+            )
+            && tactic_bodies.contains_key(&f.name)
+    };
+    let helpers_to_emit: Vec<&FunctionX> = match config {
+        // Proof-fn file: include ONLY the root's transitive downward
+        // dependencies (proof fns its tactic body references, recursively),
+        // in topological order (deps first). Proof-fn bodies are raw Lean
+        // text so the references are found by textual scan, not VIR
+        // dep-walking. This fixes the over-inclusion that previously
+        // emitted EVERY proof fn into every file — which, combined with
+        // the root emitting last, forward-referenced the root from any
+        // proof fn that depended on it. See
+        // BUG-proof-fn-dep-walker-over-includes.md.
+        PreambleConfig::ProofFn => {
+            let candidates: Vec<(&FunctionX, String)> = krate.functions.iter()
+                .map(|f| &f.x)
+                .filter(is_emittable_helper)
+                .map(|f| (f, short_name(&f.name.path).to_string()))
+                .collect();
+            collect_referenced_proof_fns(root_fns, &candidates, tactic_bodies)
+        }
+        // Exec-fn file: an exec root's helper references live in
+        // `proof { }` / `assert(..) by { }` blocks read at codegen, not
+        // available here, so keep the safe over-approximation (every
+        // emittable proof fn). A helper can't forward-reference an exec
+        // root — no proof fn depends on an exec fn — so the proof-fn
+        // forward-reference bug doesn't arise; among-helper ordering
+        // stays source order (correct in the common helper-before-caller
+        // case).
+        PreambleConfig::ExecFn => krate.functions.iter()
+            .map(|f| &f.x)
+            .filter(is_emittable_helper)
+            .filter(|f| !root_fn_set.contains(&f.name))
+            .collect(),
+    };
     // Resolve broadcast lemma `Fun` identities (#122) to their
     // `FunctionX` via the all-fn map. Cross-crate lemmas live in the
     // merged krate (via `merge_krates`) with body=None but
@@ -668,9 +783,13 @@ fn krate_preamble(
     //   live inside class/instance declarations, not as standalone
     //   theorems
     //
-    // Ordering: source order works in the common case (user defines
-    // helpers before callers). True forward-refs between proof fns
-    // would need topological sort; deferred until a case surfaces.
+    // Ordering: `helpers_to_emit` is already topologically sorted for
+    // proof-fn files (deps first, via `collect_referenced_proof_fns`'s
+    // DFS post-order), so a helper that references another helper sees
+    // it declared first. Exec-fn files keep source order (no helper can
+    // forward-reference the exec root). A true cycle of mutually-
+    // referencing proof fns would still need a Lean `mutual` block —
+    // out of scope and not observed.
     for f in &helpers_to_emit {
         let tactic_body = tactic_bodies.get(&f.name)
             .expect("helpers_to_emit is built from tactic_bodies — \
