@@ -1,6 +1,5 @@
-//! Extracted from `sst_to_lean.rs` to keep the functionality readable;
-//! still a `#[path]`'d `mod tests` child (see the decl there), so
-//! `use super::*` reaches private items exactly as the inline form did.
+//! Unit tests for `sst_to_lean` — extracted to `src/tests/` (a `#[path]`'d
+//! `mod tests` child of `sst_to_lean`, so `use super::*` reaches private items).
 //!
 //! Unit tests for the Wp DSL helpers — `peel_transparent` /
 //! `peel_value_position` / `contains_loc` / `lift_if_value` /
@@ -1441,7 +1440,7 @@ fn lex_decrease_obligation_single_level_emits_lt_with_lower_bound() {
 /// for-loops + StmX::Assert / StmX::Assume push pattern.
 #[test]
 fn ast_to_sst_pre_injects_around_assert_bit_vector() {
-    let source = include_str!("../../vir/src/ast_to_sst.rs");
+    let source = include_str!("../../../vir/src/ast_to_sst.rs");
     let bv_arm_start = source.find("AssertQueryMode::BitVector =>")
         .expect(
             "AssertQueryMode::BitVector arm not found in ast_to_sst.rs. \
@@ -1596,7 +1595,7 @@ fn bitvec_int_instances_use_to_nat_total_form() {
 /// constructing a synthetic Ctx is involved for a shape-drift guard.
 #[test]
 fn ast_to_sst_emits_assume_assert_for_nonlinear_body() {
-    let source = include_str!("../../vir/src/ast_to_sst.rs");
+    let source = include_str!("../../../vir/src/ast_to_sst.rs");
     let nl_arm_start = source.find("AssertQueryMode::NonLinear =>")
         .expect(
             "AssertQueryMode::NonLinear arm not found in ast_to_sst.rs. \
