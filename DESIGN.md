@@ -721,7 +721,7 @@ macro "tactus_auto" : tactic => `(tactic|
     | rfl
     | decide
     | omega
-    | simp_all
+    | (simp_all <;> first | omega | done)
     | tactus_case_split (simp_all <;> first | omega | done)
     | tactus_case_split (simp_all)
     | fail "tactus: auto-tactic failed — add explicit proof block")
@@ -730,6 +730,8 @@ macro "tactus_auto" : tactic => `(tactic|
 Built on two combinators in `TactusPrelude.lean`:
 
 **`tactus_first | t1 | t2 | …`** — variant of `first` that wraps each alternative in `; done`. Without it, a tactic that succeeds while leaving unsolved subgoals (e.g., `simp_all` in some configurations) would commit early and block later alternatives. The closure contract lives at the combinator name rather than relying on every alternative to remember to append `; done`.
+
+**The `(simp_all <;> first | omega | done)` rung** (2026-06-01). `omega` does not substitute a `let`-bound value: a goal guarded by a synthetic binding — most importantly Verus's read-before-write snapshot for a self-assignment, `let tmp% := x; … tmp% * k < 2^n` — leaves `tmp% * k` and an asserted `x * k ≤ B` as DISTINCT opaque atoms, so bare `omega` fails; bare `simp_all` zeta-reduces the `let` (unifying the atoms) but isn't an arithmetic decision procedure, so it fails too. The composition zeta-reduces THEN runs omega, closing the goal. This combo already lived in the ladder but only inside `tactus_case_split`, which throws when there's no user-datatype local to split on — so a plain `Int`-typed let-guarded goal never reached it. Lifting it to a standalone rung is the "layered composition, not exclusive gates" shape; it strictly subsumes the bare `simp_all` rung it replaced (if `simp_all` closes the goal, `<;>` runs on zero goals). It is NOT a simp-set extension — no new lemmas — so design principle #1 holds. See § "Self-assignment snapshot temps" for the bug class it closes.
 
 **`tactus_case_split closer`** (elaborator tactic, #58): tries each user-datatype-typed local in turn, running `closer` on each subgoal produced by `cases`. Commits the first split where `closer` closes ALL subgoals; restores state and tries the next candidate otherwise. Throws if no candidate works — composes with `tactus_first` for fallthrough. "User datatype" is gated on having a companion `.height` fn (which `to_lean_fn::height_fn_for_datatype` emits for every concrete non-generic datatype — see "Non-int decreases"). The gate filters out `Int` / `Nat` / `Bool` / `List` / etc., which have their own automation (omega / simp_all) and would explode the subgoal count if case-split.
 
@@ -4779,6 +4781,30 @@ When the answers differ, the Lean-native shape is usually shorter, tighter, and 
 * **Typed render-time substitution + universal call-arg bridging (2026-05-26 cont.)** — Verus's SMT encoding handles "wrong typ at substitution slot" via Z3's untyped term language: bare values flow into wrapper-typed slots and Z3 just propagates without coercion. Tactus's Lean target uses real distinct types (`Tactus.Ref T` vs `T`), so substituting a bare-typed caller arg into a wrapper-typed callee slot produces a Lean type error. Mirror would mean post-render `lean_ast::substitute` plus an attempt to track types lexically (brittle, lossy at every substitution boundary). **Lean-native answer**: pre-render typed substitution via `RenderCtx::value_subst` (entries are `(LExpr, source_typ)`), where each lookup at a Var/ReadPlace site bridges from source_typ to slot_typ via `coerce_lexpr`. Combined with universal call-arg bridging — every fn call (class method, inherent method, regular fn, recursive call) consults `RenderCtx::fn_param_typs` and bridges each arg to the callee's expected param typ via `coerce_lexpr` — this codifies Rust's auto-borrow semantic explicitly in the generated Lean. The wrap is visible at the call site, no special-casing per dispatch kind. See `caller_arg_actual_typ` in `sst_to_lean.rs` (computes the rendered arg's actual Lean typ from caller's body-shadow context), `add_param_subst_entries` (populates typed `req_value_subst` / `ens_value_subst` maps), and the `coerce_lexpr` call in both renderers' `Call` arms. Closed Cluster A (`test_old_view_pre_post_substitution_probe`, `test_old_view_trait_dispatch_probe`) — generated Lean now reads `impl__0.view (Tactus.Ref.mk z)` instead of bare `impl__0.view z`, with the wrap explicit and identical for both inherent and trait dispatch.
 
 **When the discipline doesn't apply.** Some obligations are inherently shaped by the source semantics, not the target. Termination via `CheckDecreaseHeight`, fixed-width integer overflow checks, and SSA mutation as let-shadowing are all encodings the SMT path uses that translate cleanly because the property at hand IS first-order arithmetic (or first-order shadowing). The discipline matters most when the property is *higher-order* or *structural* — where Lean's expressivity exceeds SMT's.
+
+### Self-assignment snapshot temps — keep them, read through them (2026-06-01)
+
+A counterpoint to the discipline above: sometimes the right move is to NOT remove an SMT-shaped artifact, because removing it costs more transparency than it buys.
+
+**The shape.** For a self-assignment `x = f(x)` (e.g. `x = x * (i+1)`), Verus's `ast_to_sst` snapshots the operand being overwritten into a `VirTemp` local before the write:
+
+```
+let tmp% := x;             -- LocalDeclKind::TempViaAssign, is_init
+assert HasType(f(tmp%));   -- overflow obligation, stated about tmp%
+x = f(tmp%);               -- the assignment
+```
+
+The snapshot sequences the read of `x` before the write — needed by Verus's SMT encoding. In Lean it's redundant (`let x := f(x)` already reads the old `x` in its RHS), and it *blocks* the default closer: a user-asserted bound `f(x) ≤ B` is stated about `x`, but the overflow obligation is stated about `tmp%`, and `omega` treats `tmp% * k` and `x * k` as distinct opaque atoms — it doesn't substitute the `let`-bound value. (BUG-synthetic-temp-let-blocks-asserted-bounds.md; factorial / power / modular-multiply iterative impls all hit it.)
+
+**The fix: handle the `let` in the closer, don't remove it.** A single rung — `simp_all <;> first | omega | done` — zeta-reduces the binding (unifying `tmp% * k` with `x * k`) then runs `omega`. See § "Auto-generated obligations". The `tmp%` stays in the generated Lean, faithful to what Verus emitted.
+
+**Why not remove the temp (the rejected SST→SST pre-pass).** Removing `tmp%` — substituting `tmp% → x` and dropping the decl, recovering the human-written `let x := f(x)` — was prototyped and abandoned. It is *the* tempting "what would Lean do" move (§ "What doesn't have to mirror Verus's encoding"), but here it fails the transparency test it's supposed to serve:
+
+* **Soundness-delicate.** A `VirTemp` snapshot `tmp% := y` is *indistinguishable by shape* from a branch-result merge temp (`tmp%3 := tmp%1`, assigned in both arms of an `if` and read after it) and from call-arg staging. Inlining the merge temp drops its assignment on one path, leaving it unbound on that path (the prototype shipped exactly this — 18 regressions on the first run). Staying sound required three guards — read-before-write (`y` reassigned later in the same block), dead-after-reassign, and escape-confinement (`tmp%`'s every occurrence within the decl's block) — plus a whole-function occurrence count. Escape analysis to keep "cleaner output" sound is the approach fighting the grain.
+* **Inconsistent.** It removes bare-`Var` snapshots but keeps complex-RHS temps (`tmp := x + 1`) and the merge/staging temps. A reader then can't predict when a `tmp%` appears — "why did this one vanish and that one stay?" is a worse question than "what's this `tmp%`?". A temp that *always* appears, faithful to Verus's lowering, is more predictable.
+* **Incomplete.** Complex-RHS temps block `omega` the same way and the pre-pass doesn't touch them — so the closer rung is needed *anyway*. The pre-pass is then extra machinery that doesn't even subsume its own motivation.
+
+**The lesson.** Transparency is faithfulness-and-predictability, not artifact-minimization. When a surgical "make it look hand-written" rewrite needs escape analysis, fires inconsistently, and still doesn't cover the general case, the honest move is to render the source faithfully and absorb it *uniformly* downstream — here, one closer rung that reads through any `let`. This is the dual of § "What doesn't have to mirror Verus's encoding": that section removes SMT encodings when Lean's type system makes the property *structurally* true (e.g. `{ x with f := v }` for `&mut x.f`); this one keeps an SMT artifact when removing it would trade a small cosmetic win for real complexity, inconsistency, and soundness risk. The distinguishing question: does the Lean-native form make a whole *class* uniformly simpler (remove), or does it special-case some instances while leaving the class half-handled (keep + handle downstream)?
 
 ### Scope and difficulty
 

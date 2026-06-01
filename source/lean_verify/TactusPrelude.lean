@@ -366,23 +366,40 @@ macro "tactus_bit_vector" : tactic => `(tactic|
 --
 -- `fail` turns "nothing worked" into a real error instead of a `sorry`.
 --
--- **Why no extras in `simp_all`'s set.** The closer is intentionally
--- dumb — `rfl | decide | omega | simp_all | tactus_case_split` with
--- NO extra simp lemmas. When a real obligation falls through, the
--- preferred response is for the user to write the proof explicitly:
--- `assert(P) by { simp_all [SomeLemma] };` or a `proof { ... }`
--- block. This matches Tactus's design principle #1 (Transparency)
--- and the user's stated UX preference: a visible proof is a more
--- pleasant proof. See DESIGN.md § "Bool vs Prop" for the canonical
--- example (Bool xor commutativity is closable with `simp_all
--- [Bool.xor_comm]` at the assertion site, NOT by extending the
--- closer).
+-- **The `simp_all <;> omega` rung — composition, not a bigger simp set.**
+-- `omega` does not substitute a `let`-bound value: a goal guarded by a
+-- synthetic binding (e.g. Verus's read-before-write snapshot for a
+-- self-assignment, `let tmp% := x; … tmp% * k < 2^n`) leaves `tmp% * k`
+-- and the asserted `x * k ≤ B` as DISTINCT opaque atoms, so bare `omega`
+-- (and bare `simp_all`, which zeta-reduces the `let` but isn't an
+-- arithmetic decision procedure) both fail. `simp_all <;> first | omega
+-- | done` zeta-reduces the binding (unifying the atoms) and THEN runs
+-- `omega`. This combo already existed in the ladder, but only inside
+-- `tactus_case_split`, which throws when there's no user-datatype local
+-- to split on — so a plain `Int`-typed let-guarded goal never reached
+-- it. Lifting it to a standalone rung is the "layered composition, not
+-- exclusive gates" shape; it strictly subsumes the bare `simp_all` rung
+-- it replaces (if `simp_all` closes the goal, `<;>` runs on zero goals).
+-- It is NOT a simp-set extension — no new lemmas — so design principle
+-- #1 holds (it composes tactics already present rather than teaching the
+-- closer new facts). Closes the BUG-synthetic-temp-let-blocks-asserted-
+-- bounds class (factorial / power / modular-multiply iterative impls).
+--
+-- **Why still no extras in `simp_all`'s set.** Beyond that composition,
+-- the closer stays intentionally dumb — NO extra simp lemmas. When a
+-- real obligation falls through, the preferred response is for the user
+-- to write the proof explicitly: `assert(P) by { simp_all [SomeLemma] };`
+-- or a `proof { ... }` block. This matches Tactus's design principle #1
+-- (Transparency) and the user's stated UX preference: a visible proof is
+-- a more pleasant proof. See DESIGN.md § "Bool vs Prop" for the
+-- canonical example (Bool xor commutativity is closable with `simp_all
+-- [Bool.xor_comm]` at the assertion site, NOT by extending the closer).
 macro "tactus_auto" : tactic => `(tactic|
   tactus_first
     | rfl
     | decide
     | omega
-    | simp_all
+    | (simp_all <;> first | omega | done)
     | tactus_case_split (simp_all <;> first | omega | done)
     | tactus_case_split (simp_all)
     | fail "tactus: auto-tactic failed — add explicit proof block")

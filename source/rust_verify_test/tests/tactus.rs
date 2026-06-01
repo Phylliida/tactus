@@ -11813,3 +11813,41 @@ test_verify_one_file! {
         by { rfl }
     } => Ok(())
 }
+
+// Regression for BUG-synthetic-temp-let-blocks-asserted-bounds.md.
+// A self-assignment `x = x * (i+1)` makes Verus snapshot the operand
+// into a `VirTemp` (`let tmp% := x`), and the mul-overflow obligation
+// reads `tmp% * (i+1)` while the user's asserted bound is stated about
+// `x` — so pre-fix the default closer couldn't bridge them (bare `omega`
+// doesn't substitute the `let`-bound value). The fix is the standalone
+// `(simp_all <;> first | omega | done)` rung in `tactus_auto`: `simp_all`
+// zeta-reduces `let tmp% := x` (unifying `tmp% * (i+1)` with the asserted
+// `x * (i+1)`), then `omega` closes. The `tmp%` stays in the generated
+// Lean — faithful to Verus's lowering; the closer reads through it.
+// (`x == 0` keeps the invariant inductive under self-multiply, which is
+// orthogonal to the temp bug; the temp is produced regardless of x's
+// value. See DESIGN § "Self-assignment snapshot temps".)
+test_verify_one_file! {
+    #[test] test_self_assign_mul_overflow_bound verus_code! {
+        import Mathlib.Tactic.Linarith
+
+        #[verifier::tactus_auto]
+        fn f(n: u64) -> (r: u64)
+            requires n <= 10
+            ensures r == 0
+        {
+            let mut x: u64 = 0;
+            let mut i: u64 = 0;
+            while i < n
+                invariant i <= n, n <= 10, x == 0
+                decreases n - i
+            {
+                assert(x * (i + 1) <= 10000) by { nlinarith };
+                assert(0 <= x * (i + 1)) by { nlinarith };
+                x = x * (i + 1);
+                i = i + 1;
+            }
+            0
+        }
+    } => Ok(())
+}
