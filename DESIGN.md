@@ -3017,9 +3017,10 @@ DeepView projection cascade cleared by the generalized projection-lift (§
 (2026-05-31, § "Cross-crate `HashMap::contains_key` deep-view-body arc"): the
 "(4) View synthesis + (5) Nonempty" residual resolved into an *ordering* fix
 (`dep_order::order_emission`), a *Nonempty-binder* fix (`nonempty.rs`), and a
-third *coercion* fix they unmasked (`structural_typ` for `Call`). The sole
-remaining blocker is layer 7 — the fold/unfold renderer divergence — deferred
-as a two-renderers-convergence arc.
+third *coercion* fix they unmasked (`structural_typ` for `Call`). Layer 7 (the
+last blocker) then LANDED 2026-06-01 — `inline_spec` mirrors Verus's
+`#[verifier::inline]` inlining on the VIR-AST so the bc-lemma agrees with the
+SST-inlined goal; `HashMap::contains_key` verifies.
 
 ### Cross-crate marker-shell trait emission — LANDED 2026-05-31 (#122 RC1/RC3)
 
