@@ -78,6 +78,8 @@ struct LeanServer {
     rx: Receiver<Value>,
     next_id: i64,
     files: HashMap<String, FileState>,
+    /// Latest `textDocument/publishDiagnostics` per file URI (full replace).
+    diagnostics: HashMap<String, Vec<Value>>,
 }
 
 impl LeanServer {
@@ -126,7 +128,45 @@ impl LeanServer {
                 }
             }
         });
-        Ok(LeanServer { child, stdin, rx, next_id: 1, files: HashMap::new() })
+        Ok(LeanServer {
+            child,
+            stdin,
+            rx,
+            next_id: 1,
+            files: HashMap::new(),
+            diagnostics: HashMap::new(),
+        })
+    }
+
+    /// Capture `publishDiagnostics` (called on every drained message) so the
+    /// latest errors for a file are available after a query.
+    fn absorb(&mut self, v: &Value) {
+        if v.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics") {
+            if let Some(uri) = v.pointer("/params/uri").and_then(|u| u.as_str()) {
+                let diags = v
+                    .pointer("/params/diagnostics")
+                    .and_then(|d| d.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                self.diagnostics.insert(uri.to_string(), diags);
+            }
+        }
+    }
+
+    /// Error-severity diagnostics for a file, as `"L<lean_line>: <message>"`.
+    fn errors_for(&self, path: &str) -> Vec<String> {
+        let uri = file_uri(path);
+        self.diagnostics
+            .get(&uri)
+            .map(|ds| {
+                ds.iter()
+                    .filter(|d| d.get("severity").and_then(|s| s.as_i64()) == Some(1))
+                    // Just the message — the diagnostic's line is a `.lean` line,
+                    // which would mislead someone reading the `.rs`.
+                    .filter_map(|d| d.get("message").and_then(|m| m.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn send(&mut self, msg: &Value) {
@@ -153,6 +193,7 @@ impl LeanServer {
             let remaining = deadline.checked_duration_since(Instant::now())?;
             match self.rx.recv_timeout(remaining) {
                 Ok(v) => {
+                    self.absorb(&v);
                     if v.get("id").and_then(|i| i.as_i64()) == Some(id) {
                         return Some(v);
                     }
@@ -242,6 +283,7 @@ impl LeanServer {
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             match self.rx.recv_timeout(remaining) {
                 Ok(v) => {
+                    self.absorb(&v);
                     if v.get("method").and_then(|m| m.as_str()) == Some("$/lean/fileProgress") {
                         match v.pointer("/params/processing").and_then(|p| p.as_array()) {
                             Some(a) if !a.is_empty() => saw = true,
@@ -282,6 +324,7 @@ impl LeanServer {
         lean_start: usize,
         raw_body: &str,
         cursor_text: &str,
+        cursor_col: usize,
     ) -> (Option<String>, usize, usize) {
         // Base lines: in-memory if already open, else from disk (the structure
         // around the tactic body — prefix `:= by` + blank, suffix `end <ns>`).
@@ -309,17 +352,23 @@ impl LeanServer {
             self.open_with(lean_file, new_lines);
         }
 
-        // Content-anchor the query to the cursor's line inside the new body.
+        // Content-anchor the query to the cursor's line inside the new body, and
+        // map the cursor's COLUMN precisely: the line content is identical in
+        // `.rs` and `.lean` (only the indent differs — `.rs` dedent vs the 2-space
+        // re-indent), so the cursor's offset within the content carries over. This
+        // gives the "state here" the Lean infoview does: at the start of a tactic →
+        // goal before it; at end of line / past `a;` → goal after.
         let body_end = (lean_start + new_body.len()).min(self.files[lean_file].lines.len());
         let target = cursor_text.trim();
         let updated = &self.files[lean_file].lines;
         let qline = (lean_start..body_end)
             .find(|&i| updated[i].trim() == target && !target.is_empty())
             .unwrap_or(lean_start);
-        let qcol = updated
-            .get(qline)
-            .map(|l| l.len() - l.trim_start().len())
-            .unwrap_or(0);
+        let lean_line = updated.get(qline).cloned().unwrap_or_default();
+        let lean_indent = lean_line.len() - lean_line.trim_start().len();
+        let rs_indent = cursor_text.len() - cursor_text.trim_start().len();
+        let content_col = cursor_col.saturating_sub(rs_indent);
+        let qcol = (lean_indent + content_col).min(lean_line.len());
         let goal = self.plain_goal(lean_file, qline, qcol);
         (goal, qline, qcol)
     }
@@ -580,6 +629,7 @@ fn serve(sidecar_path: &str, rs_path: &str, json: bool) {
                 cmd.get("body").and_then(|v| v.as_str()),
             ) {
                 let cursor_text = cmd.get("cursor").and_then(|v| v.as_str()).unwrap_or("");
+                let cursor_col = cmd.get("col").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let info = sidecar.fns.iter().find_map(|f| match f {
                     SidecarFn::Proof { name, lean_file, lean_tactic_start_line, .. }
                         if name == fname =>
@@ -595,10 +645,12 @@ fn serve(sidecar_path: &str, rs_path: &str, json: bool) {
                 let t = Instant::now();
                 let warm = srv.is_open(&lean_file);
                 let (goal, qline, qcol) =
-                    srv.splice_and_query(&lean_file, lean_start, body, cursor_text);
+                    srv.splice_and_query(&lean_file, lean_start, body, cursor_text, cursor_col);
+                let errors = srv.errors_for(&lean_file);
                 emit_json(&json!({
                     "fn": fname, "lean_file": lean_file, "lean_line": qline, "lean_col": qcol,
-                    "warm": warm, "ms": t.elapsed().as_millis() as u64, "goal": goal,
+                    "warm": warm, "ms": t.elapsed().as_millis() as u64,
+                    "goal": goal, "errors": errors,
                 }));
                 continue;
             }

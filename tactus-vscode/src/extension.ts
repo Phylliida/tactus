@@ -253,6 +253,7 @@ function spliceCommandAt(
     fn: block.name,
     body: text.slice(block.open + 1, block.close),
     cursor: document.lineAt(position.line).text,
+    col: position.character, // for column-precise "state here"
   };
 }
 
@@ -287,7 +288,15 @@ function renderResult(res: any): string {
   const header =
     `<div style="color: var(--vscode-descriptionForeground, #888); margin-bottom: 6px;">` +
     `${esc(res.fn ?? '')} &nbsp;·&nbsp; ${tag} ${res.ms ?? '?'} ms</div>`;
-  return header + esc(goal);
+  let out = header + esc(goal);
+  if (Array.isArray(res.errors) && res.errors.length > 0) {
+    out +=
+      `<div style="color: var(--vscode-errorForeground, #f14c4c); margin-top: 10px; ` +
+      `border-top: 1px solid var(--vscode-panel-border, #444); padding-top: 8px;">` +
+      res.errors.map((e: string) => esc(e)).join('<br>') +
+      `</div>`;
+  }
+  return out;
 }
 
 function esc(s: string): string {
