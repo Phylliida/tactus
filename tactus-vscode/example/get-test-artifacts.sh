@@ -24,6 +24,11 @@ LEANPROJ="$REPO/lean-project"
 
 [ -f "$RS" ] && [ -f "$SIDECAR" ] && [ -x "$BIN" ] || { echo "ERROR: artifacts missing"; exit 1; }
 
+# Resolve LEAN_PATH + the toolchain bin dir so VS Code (which often lacks the
+# Lean toolchain on its PATH) can be configured to pass them directly.
+LEANPATH="$(cd "$LEANPROJ" && lake env printenv LEAN_PATH 2>/dev/null)"
+TOOLBIN="$(dirname "$(command -v lean)")"
+
 cat <<EOF
 
 ========================================================================
@@ -32,9 +37,13 @@ Ready to test. In the Extension Development Host:
   1. File → Open File…           $RS
   2. Open Settings (JSON) and add:
 
-  "tactus.serverPath":  "$BIN",
-  "tactus.sidecarPath": "$SIDECAR",
-  "tactus.leanProject": "$LEANPROJ"
+  "tactus.serverPath":   "$BIN",
+  "tactus.sidecarPath":  "$SIDECAR",
+  "tactus.toolchainBin": "$TOOLBIN",
+  "tactus.leanPath":     "$LEANPATH"
+
+  (leanPath + toolchainBin matter because GUI-launched VS Code usually can't
+   find lean/lake on its PATH; passing them directly avoids that.)
 
   3. Run command  "Tactus: Show Goal (Infoview)"
   4. Move the cursor onto the proof tactic lines, e.g. (1-indexed in the

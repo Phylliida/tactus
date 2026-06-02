@@ -80,7 +80,22 @@ exact settings + cursor positions to try.** Then, in the Extension Development H
 |---|---|---|
 | `tactus.serverPath` | `tactus-lsp` | Path to the `tactus-lsp` binary (PATH or absolute). |
 | `tactus.sidecarPath` | *(empty)* | `sourcemap.json` path; empty → auto-discover in the workspace. |
-| `tactus.leanProject` | *(empty)* | Tactus lean-project dir → `TACTUS_LEAN_PROJECT`; empty → rely on `$LEAN_PATH`. |
+| `tactus.toolchainBin` | *(empty)* | Dir containing `lean`/`lake`; prepended to the server's PATH so it can spawn `lean --server`. `dirname $(which lean)`. |
+| `tactus.leanPath` | *(empty)* | The `LEAN_PATH` value, passed directly so the server doesn't need `lake`. `lake env printenv LEAN_PATH` in the lean-project. **Recommended.** |
+| `tactus.leanProject` | *(empty)* | Lean-project dir → `TACTUS_LEAN_PROJECT` (the server runs `lake` itself); needs `lake` on PATH. Use `leanPath` instead if you can. |
+
+## Troubleshooting
+
+- **Panel shows `tactus-lsp exited (1)`** — the server couldn't resolve `LEAN_PATH`
+  or find `lean`/`lake`. GUI-launched VS Code usually doesn't inherit your shell
+  PATH. Fix: set **`tactus.leanPath`** (the value of `lake env printenv LEAN_PATH`)
+  and **`tactus.toolchainBin`** (`dirname $(which lean)`). `get-test-artifacts.sh`
+  prints both. Reloading: re-run `Tactus: Show Goal` after changing settings.
+- **Check the Debug Console** of the *first* VS Code window (the one you pressed F5
+  in) for `[tactus-lsp] …` stderr lines — they carry the server's own error text.
+- **`(no goals)` or "not inside any proof fn tactic block"** — the cursor isn't in a
+  proof `by { }` block, or you edited the `.rs` structurally and the sidecar's byte
+  ranges drifted (re-run `--emit-lean`).
 
 ## Commands
 
