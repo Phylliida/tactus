@@ -77,10 +77,22 @@ in **~2 ms** (vs ~2.6s cold-open — 1000×+). Two modes: one-shot `goal` and pe
 (line protocol over stdin). Demonstrated: querying `chain`'s three tactic lines in sequence —
 cold-open `⊢ double n > n`, then warm `⊢ n + n > n`, then warm `h : n+n>n ⊢ n+n>n` (the goal
 evolving, `h` entering context), all but the first in ~2 ms. So the whole server *core* now
-works at interactive speed. **Remaining: the editor frontend** — a VS Code extension /
-infoview panel that's a thin client over `tactus-lsp` (best built where there's an editor to
-test in) — plus wiring the splice fast path into `tactus-lsp`, exec-fn goals (`span_marks`),
-and the precise `lean_indent_delta` column refinement.
+works at interactive speed.
+
+**Then the editor face — `tactus-vscode/` (VS Code extension) — WRITTEN.** A thin client
+over `tactus-lsp`: activates on `.rs`, `Tactus: Show Goal` spawns `tactus-lsp serve --json`
+for the active file + opens an infoview webview, and on each cursor move sends the position
+and renders the returned goal (coalescing rapid moves: single in-flight, latest wins). ~200
+lines of glue (a `--json` machine mode was added to `tactus-lsp` for it). Config: serverPath
+/ sidecarPath (auto-discover) / leanProject. **`tsc`-clean**; F5 dev-host launch config;
+`example/get-test-artifacts.sh` regenerates the fixture and prints ready-to-paste settings +
+cursor positions. **NOT yet run in a live VS Code** (no editor in the build env) — but every
+layer it drives is validated end-to-end (release `tactus-lsp` + the exact fixture + the exact
+cursor lines → correct goals, cold ~2.7 s / warm ~2 ms, evolving). So **the full stack now
+exists**; the one unrun piece is the extension's live rendering — Danielle is installing +
+testing it (F5 dev host). Remaining polish after that: wiring the splice fast path into
+`tactus-lsp`, exec-fn goals (`span_marks`), multi-file source mapping, and the precise
+`lean_indent_delta` column refinement.
 
 **Decision shape (Danielle's gate):** de-risk *before* committing to the build; start the
 build with the safe behavior-preserving refactor, verify green at each step, gate the

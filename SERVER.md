@@ -11,11 +11,13 @@ operating directly on Tactus `.rs` source (the `proof fn … by { … }` blocks 
 > `.rs`-cursor → Lean-goal bridge (components 2+3, demonstrated); and **`tactus-lsp/`
 > — a real warm persistent goal server** (Rust): keeps one `lean --server` hot and
 > answers repeat cursor queries in **~2 ms** (vs ~2.6 s cold-open), the goal evolving
-> line-to-line through a proof. No rustc at query time. **What remains is the editor
-> frontend** — a VS Code extension / infoview panel that is a *thin client over
-> `tactus-lsp`* (best built where there's an editor to test in) — plus exec-fn goals
-> via `span_marks`, the tactic-only splice fast path, and the precise
-> `lean_indent_delta` column refinement.
+> line-to-line through a proof. No rustc at query time. And **`tactus-vscode/` — the
+> VS Code infoview extension** (a thin client over `tactus-lsp`): written + `tsc`-clean,
+> with an F5 launch config and a `get-test-artifacts.sh` that prints ready-to-paste
+> settings. The **full stack now exists, end to end**; the only unrun piece is the
+> extension's live rendering (no editor in the build env — first live run is a manual
+> install+test). Remaining polish: exec-fn goals via `span_marks`, the tactic-only
+> splice fast path, multi-file source mapping, and the precise `lean_indent_delta` column.
 
 **Status (2026-06-02).** Investigated against the live codebase. **Verdict:
 doable**, and more tractable than it sounds — because Tactus already generates
@@ -180,10 +182,17 @@ genuine proof-search time (~11s here), the same cost batch verification pays —
 "Lean-speed" is the speed Lean elaborates *that* tactic, just like the VS Code
 Lean4 infoview today. `plainGoal` stays correct across the edit cycle.
 
-### 5. VS Code extension
-- Register `.rs` files in a Tactus mode; an infoview webview (fork the Lean4
-  extension's, or a minimal panel) showing `plainGoal` at cursor.
-- Diagnostics come straight from `tactus emit`/`check` output, already `.rs`-mapped.
+### 5. VS Code extension — ✅ WRITTEN (`tactus-vscode/`), pending live validation
+- Activates on `.rs`; `Tactus: Show Goal` spawns `tactus-lsp serve --json` for the
+  active file and opens an infoview webview beside it; `onDidChangeTextEditorSelection`
+  → send `<line> <col>` → render the returned goal. Coalesces rapid moves (single
+  in-flight, latest wins). Config: `serverPath` / `sidecarPath` (auto-discover) /
+  `leanProject`. `tsc`-clean; F5 dev-host launch config; `example/get-test-artifacts.sh`
+  prints ready-to-paste settings + cursor positions.
+- **Not yet run in a live VS Code** (no editor in the build env) — but the whole data
+  path it drives is validated: the release `tactus-lsp` + the exact fixture + the exact
+  cursor lines return correct goals (cold ~2.7 s, warm ~2 ms, evolving through the proof).
+- Diagnostics from `--emit-lean` / `check` output (already `.rs`-mapped) — a later add.
 
 ---
 
