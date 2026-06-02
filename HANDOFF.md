@@ -66,8 +66,21 @@ line-to-line — cursor on `unfold double` → `⊢ double n > n`; on `have h : 
 (the goal *after* unfold) — exactly the infoview experience. Cursors outside a proof tactic
 block fail cleanly. Proof fns only; exec fns (coarser `span_marks`) are a later pass. Enriched
 `test_emit_lean_codegen_only` with a multi-step `chain` proof fn as the goal-changes-per-line
-fixture. So the whole server *core* now works end-to-end — only the editor frontend (VS Code
-extension / `tactus-lsp` re-host) + the precise `lean_indent_delta` column refinement remain.
+fixture.
+
+**Then the warm persistent server core — `tactus-lsp/` (Rust) — BUILT.** The bridge above
+spawns a fresh `lean --server` per query (paying the ~2.6s open each time). `tactus-lsp` is
+the real thing: a standalone Rust binary (std + serde; a reader thread + channel does the
+`lean --server` LSP plumbing, no async runtime) that spawns ONE `lean --server`, keeps it hot
+(each `.lean` opened/elaborated at most once), and answers repeat `.rs`-cursor → goal queries
+in **~2 ms** (vs ~2.6s cold-open — 1000×+). Two modes: one-shot `goal` and persistent `serve`
+(line protocol over stdin). Demonstrated: querying `chain`'s three tactic lines in sequence —
+cold-open `⊢ double n > n`, then warm `⊢ n + n > n`, then warm `h : n+n>n ⊢ n+n>n` (the goal
+evolving, `h` entering context), all but the first in ~2 ms. So the whole server *core* now
+works at interactive speed. **Remaining: the editor frontend** — a VS Code extension /
+infoview panel that's a thin client over `tactus-lsp` (best built where there's an editor to
+test in) — plus wiring the splice fast path into `tactus-lsp`, exec-fn goals (`span_marks`),
+and the precise `lean_indent_delta` column refinement.
 
 **Decision shape (Danielle's gate):** de-risk *before* committing to the build; start the
 build with the safe behavior-preserving refactor, verify green at each step, gate the
