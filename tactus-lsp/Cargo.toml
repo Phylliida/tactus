@@ -1,0 +1,13 @@
+[package]
+name = "tactus-lsp"
+version = "0.1.0"
+edition = "2021"
+description = "Warm persistent goal server for Tactus — keeps `lean --server` hot and answers .rs-cursor → Lean-goal queries (SERVER.md)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "tactus-lsp"
+path = "src/main.rs"
