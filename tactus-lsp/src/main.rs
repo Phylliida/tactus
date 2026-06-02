@@ -78,8 +78,8 @@ struct LeanServer {
     rx: Receiver<Value>,
     next_id: i64,
     files: HashMap<String, FileState>,
-    /// Latest `textDocument/publishDiagnostics` per file URI (full replace).
-    diagnostics: HashMap<String, Vec<Value>>,
+    /// Latest `textDocument/publishDiagnostics` per file URI: `(version, diags)`.
+    diagnostics: HashMap<String, (i64, Vec<Value>)>,
 }
 
 impl LeanServer {
@@ -139,31 +139,83 @@ impl LeanServer {
     }
 
     /// Capture `publishDiagnostics` (called on every drained message) so the
-    /// latest errors for a file are available after a query.
+    /// latest errors for a file are available after a query, tagged with the
+    /// document version they describe.
     fn absorb(&mut self, v: &Value) {
         if v.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics") {
             if let Some(uri) = v.pointer("/params/uri").and_then(|u| u.as_str()) {
+                let version = v.pointer("/params/version").and_then(|x| x.as_i64()).unwrap_or(0);
                 let diags = v
                     .pointer("/params/diagnostics")
                     .and_then(|d| d.as_array())
                     .cloned()
                     .unwrap_or_default();
-                self.diagnostics.insert(uri.to_string(), diags);
+                self.diagnostics.insert(uri.to_string(), (version, diags));
             }
         }
     }
 
-    /// Error-severity diagnostics for a file, as `"L<lean_line>: <message>"`.
+    /// Block until diagnostics for the file's *current* version have arrived
+    /// (avoids showing a previous edit's error against the new text), then settle
+    /// briefly to catch the complete set (Lean publishes them incrementally).
+    fn ensure_diagnostics(&mut self, path: &str, timeout: Duration) {
+        let uri = file_uri(path);
+        let want = self.files.get(path).map(|f| f.version).unwrap_or(0);
+        // Already fresh (e.g. a cursor move with no edit — version unchanged):
+        // diagnostics are complete from a prior query, so don't wait or settle.
+        if self.diagnostics.get(&uri).map(|(v, _)| *v >= want).unwrap_or(false) {
+            return;
+        }
+        let deadline = Instant::now() + timeout;
+        while self.diagnostics.get(&uri).map(|(v, _)| *v).unwrap_or(-1) < want {
+            let remaining = match deadline.checked_duration_since(Instant::now()) {
+                Some(r) => r,
+                None => return,
+            };
+            match self.rx.recv_timeout(remaining) {
+                Ok(v) => self.absorb(&v),
+                Err(_) => return,
+            }
+        }
+        // Brief settle: drain same-version updates so we report the COMPLETE set.
+        let settle = Instant::now() + Duration::from_millis(150);
+        while let Some(remaining) = settle.checked_duration_since(Instant::now()) {
+            match self.rx.recv_timeout(remaining) {
+                Ok(v) => self.absorb(&v),
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Error-severity diagnostics for a file, made useful for the infoview:
+    /// the redundant "unsolved goals" message is dropped (the goal view already
+    /// shows it), and each remaining error is prefixed with the offending tactic
+    /// text so e.g. a bare "unknown tactic" becomes "`xyz` — unknown tactic".
     fn errors_for(&self, path: &str) -> Vec<String> {
         let uri = file_uri(path);
+        let lines = self.files.get(path).map(|fs| &fs.lines);
         self.diagnostics
             .get(&uri)
-            .map(|ds| {
+            .map(|(_ver, ds)| {
                 ds.iter()
                     .filter(|d| d.get("severity").and_then(|s| s.as_i64()) == Some(1))
-                    // Just the message — the diagnostic's line is a `.lean` line,
-                    // which would mislead someone reading the `.rs`.
-                    .filter_map(|d| d.get("message").and_then(|m| m.as_str()).map(String::from))
+                    .filter_map(|d| {
+                        let msg = d.get("message").and_then(|m| m.as_str())?;
+                        // "unsolved goals … ⊢ …" duplicates the goal view — drop it.
+                        if msg.trim_start().starts_with("unsolved goals") {
+                            return None;
+                        }
+                        let line = d.pointer("/range/start/line").and_then(|l| l.as_i64());
+                        let offending = line
+                            .filter(|&l| l >= 0)
+                            .and_then(|l| lines.and_then(|ls| ls.get(l as usize)))
+                            .map(|l| l.trim())
+                            .filter(|t| !t.is_empty());
+                        Some(match offending {
+                            Some(t) => format!("`{}` — {}", t, msg),
+                            None => msg.to_string(),
+                        })
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -370,6 +422,9 @@ impl LeanServer {
         let content_col = cursor_col.saturating_sub(rs_indent);
         let qcol = (lean_indent + content_col).min(lean_line.len());
         let goal = self.plain_goal(lean_file, qline, qcol);
+        // Make sure diagnostics reflect THIS version before the caller reads them
+        // (the goal query can return before the new diagnostics are published).
+        self.ensure_diagnostics(lean_file, Duration::from_secs(2));
         (goal, qline, qcol)
     }
 
