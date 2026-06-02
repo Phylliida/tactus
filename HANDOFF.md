@@ -112,6 +112,20 @@ tracked). Diagnostic env quirk also fixed: GUI-launched VS Code lacks the toolch
 so the extension gained `tactus.leanPath` (pass LEAN_PATH directly, skip `lake`) +
 `tactus.toolchainBin` (prepend to PATH so `lean --server` spawns).
 
+**Polish from live use (Danielle's feedback):** (1) **cursor-column precision** — the
+position is column-precise, not line-level: the `.rs`/`.lean` line content is identical
+(only the indent differs), so the cursor's offset within the content maps over (`lean_col
+= lean_indent + (col − rs_indent)`). Start of a tactic → goal before it; past `a;` / end
+of line → goal after — like the Lean infoview. (2) **clearer, accurate errors** —
+`tactus-lsp` captures `publishDiagnostics`, drops the redundant "unsolved goals" (the goal
+view shows it), and prefixes each error with the offending tactic text (`` `xyz` — unknown
+tactic ``); the extension renders them red under the goal. Version-gated to avoid a stale-
+diagnostics race (a fast warm query returning before the new version's diagnostics, showing
+a previous edit's error) — `ensure_diagnostics` waits for the current version (+150ms settle)
+but is skipped when the version is unchanged, so cursor moves stay ~2 ms and only edits pause
+~350 ms for fresh errors. Possible next polish: map the error's `.lean` line back to the
+`.rs` line; "did you mean" / related-info for specific diagnostic kinds.
+
 **Decision shape (Danielle's gate):** de-risk *before* committing to the build; start the
 build with the safe behavior-preserving refactor, verify green at each step, gate the
 user-facing surface; then prove the whole chain with a cheap bridge before the heavier
