@@ -128,6 +128,14 @@ On each edit, check whether it's entirely inside a known `rs_tactic_byte_range`:
 - **signature/structural:** re-run `tactus emit` (rustc front-end, ~1–3 s) on save
   → refresh `.lean` + sidecar.
 
+**✅ Confirmed (2026-06-02, `server-spike/livedit_probe.py`).** A `didChange`
+into the open `.lean` re-elaborates incrementally from the changed command with
+imports warm (no Mathlib reload) and no rustc: cheap tactic edits settle in
+~0.5–0.6s with live diagnostics/goal; an expensive tactic (`nlinarith`) costs its
+genuine proof-search time (~11s here), the same cost batch verification pays — i.e.
+"Lean-speed" is the speed Lean elaborates *that* tactic, just like the VS Code
+Lean4 infoview today. `plainGoal` stays correct across the edit cycle.
+
 ### 5. VS Code extension
 - Register `.rs` files in a Tactus mode; an infoview webview (fork the Lean4
   extension's, or a minimal panel) showing `plainGoal` at cursor.
