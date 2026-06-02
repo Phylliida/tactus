@@ -19,7 +19,7 @@
 //! LEAN_PATH resolves from $LEAN_PATH, else `lake env printenv LEAN_PATH` in
 //! $TACTUS_LEAN_PROJECT (or ../lean-project relative to CWD).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
@@ -64,12 +64,20 @@ enum SidecarFn {
 // A `lean --server` client kept warm: spawn once, open files lazily, query.
 // ---------------------------------------------------------------------------
 
+/// In-memory mirror of an open `.lean`: its current lines + LSP version. The
+/// splice fast path edits `lines`, bumps `version`, and `didChange`s — so a
+/// `.rs` tactic edit re-elaborates live without rustc and without re-`didOpen`.
+struct FileState {
+    version: i64,
+    lines: Vec<String>,
+}
+
 struct LeanServer {
     child: Child,
     stdin: ChildStdin,
     rx: Receiver<Value>,
     next_id: i64,
-    opened: HashSet<String>,
+    files: HashMap<String, FileState>,
 }
 
 impl LeanServer {
@@ -118,7 +126,7 @@ impl LeanServer {
                 }
             }
         });
-        Ok(LeanServer { child, stdin, rx, next_id: 1, opened: HashSet::new() })
+        Ok(LeanServer { child, stdin, rx, next_id: 1, files: HashMap::new() })
     }
 
     fn send(&mut self, msg: &Value) {
@@ -171,7 +179,7 @@ impl LeanServer {
     /// Open a `.lean` and block until it is fully elaborated. Idempotent —
     /// a file already open returns immediately (the warmth).
     fn ensure_open(&mut self, path: &str) -> std::io::Result<()> {
-        if self.opened.contains(path) {
+        if self.files.contains_key(path) {
             return Ok(());
         }
         let text = std::fs::read_to_string(path)?;
@@ -181,16 +189,60 @@ impl LeanServer {
             json!({"textDocument": {"uri": uri, "languageId": "lean", "version": 1, "text": text}}),
         );
         self.wait_processed(Duration::from_secs(180));
-        self.opened.insert(path.to_string());
+        self.files.insert(
+            path.to_string(),
+            FileState { version: 1, lines: text.split('\n').map(|s| s.to_string()).collect() },
+        );
         Ok(())
     }
 
-    /// Drain `$/lean/fileProgress` notifications until processing goes empty
-    /// after having been non-empty (the file is done elaborating).
+    fn is_open(&self, path: &str) -> bool {
+        self.files.contains_key(path)
+    }
+
+    /// Replace the open `.lean`'s text and `didChange` it. No-op (returns false)
+    /// if the text is unchanged. We do NOT wait for re-elaboration here: a
+    /// subsequent `$/lean/plainGoal` against the new document version blocks
+    /// until that position is elaborated, so the query itself is the barrier.
+    fn did_change(&mut self, path: &str, new_lines: Vec<String>) -> bool {
+        let Some(fs) = self.files.get_mut(path) else {
+            return false;
+        };
+        if fs.lines == new_lines {
+            return false;
+        }
+        fs.version += 1;
+        fs.lines = new_lines;
+        let version = fs.version;
+        let text = fs.lines.join("\n");
+        let uri = file_uri(path);
+        self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": {"uri": uri, "version": version},
+                "contentChanges": [{"text": text}],
+            }),
+        );
+        true
+    }
+
+    /// Wait until `lean --server` has finished (re)elaborating the file.
+    ///
+    /// Two completion signals, whichever fires first — because `$/lean/fileProgress`
+    /// is very chatty (its `processing` set bounces around and, especially after a
+    /// `didChange`, often never cleanly reports empty before more workspace churn):
+    ///   1. a `fileProgress` with empty `processing` after a non-empty one (clean idle), or
+    ///   2. **quiescence** — once activity has started, no message at all for `QUIET`.
     fn wait_processed(&mut self, timeout: Duration) {
+        use std::sync::mpsc::RecvTimeoutError;
+        const QUIET: Duration = Duration::from_millis(500);
         let deadline = Instant::now() + timeout;
         let mut saw = false;
-        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        loop {
+            let remaining = match deadline.checked_duration_since(Instant::now()) {
+                Some(r) => r.min(QUIET),
+                None => return,
+            };
             match self.rx.recv_timeout(remaining) {
                 Ok(v) => {
                     if v.get("method").and_then(|m| m.as_str()) == Some("$/lean/fileProgress") {
@@ -201,21 +253,73 @@ impl LeanServer {
                         }
                     }
                 }
-                Err(_) => return,
+                // No message for QUIET: if elaboration has started and gone quiet,
+                // it has settled. (If nothing has started yet, keep waiting.)
+                Err(RecvTimeoutError::Timeout) => {
+                    if saw {
+                        return;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => return,
             }
         }
     }
 
     fn plain_goal(&mut self, path: &str, line: usize, col: usize) -> Option<String> {
         let uri = file_uri(path);
+        // 60s ceiling: plainGoal blocks until this position is elaborated, so an
+        // edit to a slow tactic re-elaborates before the goal returns (like the
+        // real Lean infoview). This IS the barrier — no separate wait needed.
         let resp = self.request(
             "$/lean/plainGoal",
             json!({"textDocument": {"uri": uri}, "position": {"line": line, "character": col}}),
-            Duration::from_secs(30),
+            Duration::from_secs(60),
         )?;
         resp.pointer("/result/rendered")
             .and_then(|r| r.as_str())
             .map(|s| s.to_string())
+    }
+
+    /// The splice fast path: replace `lean_file`'s tactic body (the lines from
+    /// `lean_start` up to the `end <ns>` boundary) with the live `.rs` body
+    /// (dedented + re-indented to match `--emit-lean`), `didChange`, then query
+    /// the goal at the `.lean` line whose text matches `cursor_text`
+    /// (content-anchored — robust to the body growing/shrinking). Returns
+    /// `(goal, lean_line, lean_col)`.
+    fn splice_and_query(
+        &mut self,
+        lean_file: &str,
+        lean_start: usize,
+        raw_body: &str,
+        cursor_text: &str,
+    ) -> (Option<String>, usize, usize) {
+        if self.ensure_open(lean_file).is_err() {
+            return (None, 0, 0);
+        }
+        let cur = self.files[lean_file].lines.clone();
+        let lean_start = lean_start.min(cur.len());
+        let suffix_start = (lean_start..cur.len())
+            .find(|&i| cur[i].trim_start().starts_with("end "))
+            .unwrap_or(cur.len());
+        let new_body = transform_body(raw_body);
+        let mut new_lines: Vec<String> = cur[..lean_start].to_vec();
+        new_lines.extend(new_body.iter().cloned());
+        new_lines.extend(cur[suffix_start..].iter().cloned());
+        self.did_change(lean_file, new_lines);
+
+        // Content-anchor the query to the cursor's line inside the new body.
+        let body_end = (lean_start + new_body.len()).min(self.files[lean_file].lines.len());
+        let target = cursor_text.trim();
+        let updated = &self.files[lean_file].lines;
+        let qline = (lean_start..body_end)
+            .find(|&i| updated[i].trim() == target && !target.is_empty())
+            .unwrap_or(lean_start);
+        let qcol = updated
+            .get(qline)
+            .map(|l| l.len() - l.trim_start().len())
+            .unwrap_or(0);
+        let goal = self.plain_goal(lean_file, qline, qcol);
+        (goal, qline, qcol)
     }
 
     fn shutdown(&mut self) {
@@ -245,6 +349,41 @@ fn line_of_byte(rs: &str, byte: usize) -> usize {
         .iter()
         .filter(|&&b| b == b'\n')
         .count()
+}
+
+/// Transform a raw `.rs` tactic body (the text between `by {` and `}`) into the
+/// `.lean` body lines — mirroring `--emit-lean`: dedent by the common leading
+/// whitespace, strip leading/trailing blank lines, re-indent each line by 2
+/// spaces (`render_by_block`). So a spliced edit matches what a re-emit would
+/// have produced.
+fn transform_body(raw: &str) -> Vec<String> {
+    let lines: Vec<&str> = raw.split('\n').collect();
+    let indent = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    let dedented: Vec<String> = lines
+        .iter()
+        .map(|l| {
+            if l.trim().is_empty() {
+                String::new()
+            } else {
+                l.chars().skip(indent).collect()
+            }
+        })
+        .collect();
+    let start = dedented.iter().position(|l| !l.trim().is_empty()).unwrap_or(0);
+    let end = dedented
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|i| i + 1)
+        .unwrap_or(start);
+    dedented[start..end.max(start)]
+        .iter()
+        .map(|l| if l.is_empty() { String::new() } else { format!("  {}", l) })
+        .collect()
 }
 
 /// For a proof fn, find the constant delta D such that lean_line = rs_line + D,
@@ -419,10 +558,61 @@ fn serve(sidecar_path: &str, rs_path: &str, json: bool) {
             Ok(l) => l,
             Err(_) => break,
         };
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
+
+        // `--json`: a JSON object — a splice command `{fn, body, cursor}` (the
+        // live-edit fast path) or a plain query `{line, col}` (snapshot).
+        if json && trimmed.starts_with('{') {
+            let cmd: Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(e) => {
+                    emit_json(&json!({"error": format!("bad JSON: {}", e)}));
+                    continue;
+                }
+            };
+            if let (Some(fname), Some(body)) = (
+                cmd.get("fn").and_then(|v| v.as_str()),
+                cmd.get("body").and_then(|v| v.as_str()),
+            ) {
+                let cursor_text = cmd.get("cursor").and_then(|v| v.as_str()).unwrap_or("");
+                let info = sidecar.fns.iter().find_map(|f| match f {
+                    SidecarFn::Proof { name, lean_file, lean_tactic_start_line, .. }
+                        if name == fname =>
+                    {
+                        Some((lean_file.clone(), *lean_tactic_start_line))
+                    }
+                    _ => None,
+                });
+                let Some((lean_file, lean_start)) = info else {
+                    emit_json(&json!({"fn": fname, "error": "no such proof fn in sidecar"}));
+                    continue;
+                };
+                let t = Instant::now();
+                let warm = srv.is_open(&lean_file);
+                let (goal, qline, qcol) =
+                    srv.splice_and_query(&lean_file, lean_start, body, cursor_text);
+                emit_json(&json!({
+                    "fn": fname, "lean_file": lean_file, "lean_line": qline, "lean_col": qcol,
+                    "warm": warm, "ms": t.elapsed().as_millis() as u64, "goal": goal,
+                }));
+                continue;
+            }
+            if let (Some(l), Some(c)) = (
+                cmd.get("line").and_then(|v| v.as_u64()),
+                cmd.get("col").and_then(|v| v.as_u64()),
+            ) {
+                handle_plain(&mut srv, &sidecar, &rs, l as usize, c as usize, true);
+                continue;
+            }
+            emit_json(&json!({"error": "expected {fn,body,cursor} or {line,col}"}));
+            continue;
+        }
+
+        // Plain `<line> <col>` text protocol (human mode, or `--json` fallback).
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
         let parsed = if parts.len() == 2 {
             match (parts[0].parse::<usize>(), parts[1].parse::<usize>()) {
                 (Ok(a), Ok(b)) => Some((a, b)),
@@ -442,52 +632,55 @@ fn serve(sidecar_path: &str, rs_path: &str, json: bool) {
                 continue;
             }
         };
-        match resolve_cursor(&sidecar, &rs, rl, rc) {
-            Ok((name, lean_file, lline, lcol)) => {
-                let t = Instant::now();
-                let warm = srv.opened.contains(lean_file);
-                if let Err(e) = srv.ensure_open(lean_file) {
-                    if json {
-                        emit_json(&json!({"line": rl, "col": rc, "error": format!("open failed: {}", e)}));
-                    } else {
-                        println!("! open failed: {}", e);
-                    }
-                    continue;
-                }
-                let goal = srv.plain_goal(lean_file, lline, lcol);
-                let ms = t.elapsed().as_millis() as u64;
+        handle_plain(&mut srv, &sidecar, &rs, rl, rc, json);
+    }
+    srv.shutdown();
+}
+
+/// Snapshot cursor query (no splice): map `(rl, rc)` via the original sidecar
+/// + `.rs`, open the `.lean`, and report the goal (JSON or human form).
+fn handle_plain(srv: &mut LeanServer, sidecar: &Sidecar, rs: &str, rl: usize, rc: usize, json: bool) {
+    match resolve_cursor(sidecar, rs, rl, rc) {
+        Ok((name, lean_file, lline, lcol)) => {
+            let t = Instant::now();
+            let warm = srv.is_open(lean_file);
+            if let Err(e) = srv.ensure_open(lean_file) {
                 if json {
-                    emit_json(&json!({
-                        "line": rl, "col": rc, "fn": name,
-                        "lean_file": lean_file, "lean_line": lline, "lean_col": lcol,
-                        "warm": warm, "ms": ms, "goal": goal,
-                    }));
+                    emit_json(&json!({"line": rl, "col": rc, "error": format!("open failed: {}", e)}));
                 } else {
-                    println!(
-                        "--- .rs {}:{} → {} ({}:{}:{})  [{}, {} ms] ---",
-                        rl,
-                        rc,
-                        name,
-                        std::path::Path::new(lean_file)
-                            .file_name()
-                            .unwrap()
-                            .to_string_lossy(),
-                        lline,
-                        lcol,
-                        if warm { "warm" } else { "cold-open" },
-                        ms
-                    );
-                    println!("{}", goal.unwrap_or_else(|| "(no goal)".into()));
+                    println!("! open failed: {}", e);
                 }
+                return;
             }
-            Err(e) => {
-                if json {
-                    emit_json(&json!({"line": rl, "col": rc, "error": e}));
-                } else {
-                    println!("! {}", e);
-                }
+            let goal = srv.plain_goal(lean_file, lline, lcol);
+            let ms = t.elapsed().as_millis() as u64;
+            if json {
+                emit_json(&json!({
+                    "line": rl, "col": rc, "fn": name,
+                    "lean_file": lean_file, "lean_line": lline, "lean_col": lcol,
+                    "warm": warm, "ms": ms, "goal": goal,
+                }));
+            } else {
+                println!(
+                    "--- .rs {}:{} → {} ({}:{}:{})  [{}, {} ms] ---",
+                    rl,
+                    rc,
+                    name,
+                    std::path::Path::new(lean_file).file_name().unwrap().to_string_lossy(),
+                    lline,
+                    lcol,
+                    if warm { "warm" } else { "cold-open" },
+                    ms
+                );
+                println!("{}", goal.unwrap_or_else(|| "(no goal)".into()));
+            }
+        }
+        Err(e) => {
+            if json {
+                emit_json(&json!({"line": rl, "col": rc, "error": e}));
+            } else {
+                println!("! {}", e);
             }
         }
     }
-    srv.shutdown();
 }
