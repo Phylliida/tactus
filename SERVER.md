@@ -9,10 +9,13 @@ operating directly on Tactus `.rs` source (the `proof fn … by { … }` blocks 
 doable**, and more tractable than it sounds — because Tactus already generates
 real per-fn `.lean` files and already has most of the source-mapping machinery.
 Every load-bearing claim below is verified with a `file:line` citation. **The
-Phase-0 de-risk spike is now run and GREEN** (2026-06-02) — `lean --server`
-resolves Mathlib for an out-of-Lake `.lean` via `LEAN_PATH` and returns a real
-goal via `$/lean/plainGoal`. See `server-spike/` and § "De-risk first" below.
-The plan below is otherwise plumbing over existing infra.
+Phase-0 de-risk spike is run and GREEN** (2026-06-02) — `lean --server` resolves
+Mathlib for an out-of-Lake `.lean` via `LEAN_PATH` and returns a real goal via
+`$/lean/plainGoal`. **Component 1 (`--emit-lean` + sidecar) is LANDED, and the
+end-to-end bridge (components 2+3: `.rs` cursor → Lean goal) is DEMONSTRATED
+WORKING** (`server-spike/goal_at_cursor.py`) — the goal even evolves line-to-line
+as you move through a proof. See `server-spike/` and § "De-risk first" below.
+What remains is mostly the editor frontend + productionizing the bridge.
 
 ---
 
@@ -121,7 +124,7 @@ so it needs no Lean/Mathlib at all and is fast. Pinned by
 Remaining for Phase 1: `lean_indent_delta` (de-risk item 3 — column mapping), and
 the extension/bridge that consumes this sidecar.
 
-### 2. Lean-server bridge (in the extension)
+### 2. Lean-server bridge — ✅ DEMONSTRATED (`server-spike/goal_at_cursor.py`)
 - Spawn `lean --server` with `LEAN_PATH` = the cached lake-project path — the same
   env the batch path uses (see `lean_process.rs` and the test harness's
   `cached_lean_path_for_lake_project`).
@@ -129,10 +132,22 @@ the extension/bridge that consumes this sidecar.
 - Goals: `$/lean/plainGoal` with `{ textDocument, position }` → plain-text goal.
   (Phase 2: `$/lean/rpc/call` → `getInteractiveGoals` for rich/structured goals.)
 
-### 3. Position map
-- **Proof fn:** cursor line `L` in the `.rs` block → `.lean` line
-  `lean_tactic_start_line + (L − rs_block_start_line)`, column `+ lean_indent_delta`.
-  (`LeanSourceMap::find_tactic_line` is exactly this in reverse — already in-tree.)
+The Python bridge does exactly this today (proof fns): `.rs` cursor → find the fn
+whose tactic block contains it → map to a `.lean` position → `plainGoal` → goal,
+no rustc. Productionizing = porting this to the extension (TS) or a `tactus-lsp`
+Rust binary. The de-risk + bridge prove the wiring; this is a re-host, not new risk.
+
+### 3. Position map — ✅ DEMONSTRATED (proof fns)
+- **Proof fn:** the tactic body is copied **verbatim line-for-line**, so the map is a
+  constant per-fn delta: `.lean line = .rs line + (lean_tactic_start_line − rs_anchor_line)`.
+  `goal_at_cursor.py` derives the delta **content-anchored** (match `lean_tactic_start_line`'s
+  text to the `.rs` body line) — robust to the leading-blank-after-`{` and the dedent.
+  Confirmed: two `.rs` tactic lines of one proof mapped to consecutive `.lean` lines with
+  the same delta, returning two *different* goals (the goal evolving through the proof).
+  Column: querying at the `.lean` tactic line's first non-space column gives plainGoal's
+  "state here" goal (what the infoview wants); precise `lean_indent_delta` (= Lean indent −
+  `.rs` dedent) is the remaining refinement (de-risk item 3) for exact column placement.
+  (`LeanSourceMap::find_tactic_line` is the same arithmetic in reverse — already in-tree.)
 - **Exec fn:** find the `span_marks` entry whose `rs_loc` is nearest at/before the
   cursor → its `lean_line`. Coarser (obligation granularity) but free from
   existing data.
