@@ -8,8 +8,11 @@ operating directly on Tactus `.rs` source (the `proof fn … by { … }` blocks 
 **Status (2026-06-02).** Investigated against the live codebase. **Verdict:
 doable**, and more tractable than it sounds — because Tactus already generates
 real per-fn `.lean` files and already has most of the source-mapping machinery.
-Every load-bearing claim below is verified with a `file:line` citation. No code
-written yet; this is the plan + the evidence to start from.
+Every load-bearing claim below is verified with a `file:line` citation. **The
+Phase-0 de-risk spike is now run and GREEN** (2026-06-02) — `lean --server`
+resolves Mathlib for an out-of-Lake `.lean` via `LEAN_PATH` and returns a real
+goal via `$/lean/plainGoal`. See `server-spike/` and § "De-risk first" below.
+The plan below is otherwise plumbing over existing infra.
 
 ---
 
@@ -147,23 +150,32 @@ On each edit, check whether it's entirely inside a known `rs_tactic_byte_range`:
 
 ---
 
-## De-risk first (a ~1–2 day Phase-1 spike, before committing to the build)
+## De-risk first — ✅ RUN, GREEN (2026-06-02)
 
-Three unknowns — the only places this could surprise us:
+The spike is done. Driver + full result in `server-spike/` (`plaingoal_probe.py`,
+`README.md`). Summary: drove `lean --server` over LSP/stdio against a real
+Tactus-generated `.lean` (`fib_addition.lean` — imports `Mathlib.Tactic.Linarith`,
+uses `linarith` + `nlinarith`), with rootUri = the file's own dir (no `lakefile.lean`
+in any ancestor → the server can't discover a Lake project, so Mathlib must resolve
+via `LEAN_PATH` from the env). Result: processed in ~16s with **0 error diagnostics**,
+and `$/lean/plainGoal` returned the full proof state at the `nlinarith` line.
 
-1. **Does `lean --server` resolve Mathlib for an out-of-Lake `.lean` with
-   `LEAN_PATH` set?** *The critical one.* Batch `lean --json` does (that's how
-   Tactus checks today), but the server's per-file worker path is slightly
-   different. **Spike:** spawn `lean --server`, `didOpen` one of the `.lean` files
-   Tactus already generated (e.g. under `source/target/debug/test_inputs/…/tactus-lean/…`
-   or `source/target/tactus-lean/…`), send `$/lean/plainGoal` at a position inside
-   the tactic body, confirm a goal comes back. **If this returns a real goal, the
+The three unknowns, resolved:
+
+1. ✅ **RESOLVED (green) — the critical one.** `lean --server` resolves Mathlib for an
+   out-of-Lake `.lean` with `LEAN_PATH` set. The per-file worker behaves like the batch
+   `lean --json` path (same ~16s processing, 0 errors). Had it not resolved, we'd have
+   seen `unknown import` / `unknown tactic nlinarith`. **A real goal came back, so the
    whole project is green** — everything else is plumbing over existing infra.
-2. **`plainGoal` cursor convention** — does it return the goal *before* the tactic
-   at the position (the "state here" semantics users expect)? Confirm.
-3. **`lean_indent_delta`** — `to_lean_fn::render_by_block` re-indents tactic bodies
-   by 2 spaces (for the `by` block). Confirm the exact transform so column mapping
-   is right (it may differ between standalone proof fns and trait-method bodies).
+2. ✅ **RESOLVED — "state here" semantics, as hoped.** `$/lean/plainGoal` with the cursor
+   at the *start* of a tactic returns the goal *before* that tactic; cursor *past* the
+   tactic returns `no goals`. This is exactly the infoview convention users expect.
+3. ⏳ **`lean_indent_delta`** (minor, Phase-1 detail, not a viability risk) —
+   `to_lean_fn::render_by_block` re-indents tactic bodies by 2 spaces (for the `by`
+   block). Confirm the exact transform so *column* mapping is right (it may differ
+   between standalone proof fns and trait-method bodies). The spike used `.lean`-native
+   line/char coordinates directly; the `.rs`→`.lean` column delta is the remaining piece
+   to nail down when wiring the sidecar map.
 
 ---
 
