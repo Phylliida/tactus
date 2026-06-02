@@ -5152,6 +5152,22 @@ When Tactus encounters a `proof fn` with a `by { }` block:
 5. The verifier invokes `lake env lean --stdin --json` (if `~/.tactus/lean-project/` exists) or `lean --stdin --json` (fallback)
 6. Lean's JSON diagnostics are parsed, source map translates line numbers, and errors are reported through Verus's standard diagnostic system
 
+**Once-per-fn gating.** A tactic proof fn is verified by Lean, not Z3, so *every*
+query op for it bypasses Z3 — but the actual Lean check runs exactly **once**, on
+the primary `QueryOp::Body(Style::Normal)` query (the verifier's Tactus proof branch
+gates on it; the exec/`tactus_auto` branch already did). Recommends-check / api-safety
+/ expanded re-runs of the same fn would otherwise redundantly re-invoke Lean (slow) —
+a latent waste surfaced by the `--emit-lean` sidecar duplicating entries.
+
+**Codegen-only mode (`--emit-lean`).** `check_proof_fn` / `check_exec_fn` are factored
+as `emit_* + run-tail`: `emit_proof_fn` / `emit_exec_fn` (`lean_verify::generate`) do
+everything up to and including writing the `.lean` (returning `EmitOutput =
+{file_path, source_map, warnings}`), and the `check_*` wrappers add the Lean run.
+Under `--emit-lean` the verifier calls `emit_*`, skips the Lean run, and writes a
+per-crate `sourcemap.json` sidecar (`lean_verify::sourcemap`) mapping each `.rs`
+tactic region to its `.lean` — the foundation the Tactus server / infoview consumes.
+See `SERVER.md` (the full server design + the LANDED component-1 details).
+
 ## Open questions
 
 1. **Recursive termination**: Simple `decreases n` → `termination_by n`. Complex `decreases` with `via` clauses → `termination_by` + `decreasing_by`. Design when we encounter real examples.
