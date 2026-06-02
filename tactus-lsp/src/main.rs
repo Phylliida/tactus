@@ -176,24 +176,29 @@ impl LeanServer {
         self.notify("initialized", json!({}));
     }
 
-    /// Open a `.lean` and block until it is fully elaborated. Idempotent —
-    /// a file already open returns immediately (the warmth).
+    /// Open a `.lean` from disk and block until elaborated. Idempotent — a file
+    /// already open returns immediately (the warmth).
     fn ensure_open(&mut self, path: &str) -> std::io::Result<()> {
         if self.files.contains_key(path) {
             return Ok(());
         }
-        let text = std::fs::read_to_string(path)?;
+        let lines = std::fs::read_to_string(path)?.split('\n').map(|s| s.to_string()).collect();
+        self.open_with(path, lines);
+        Ok(())
+    }
+
+    /// `didOpen` a `.lean` with the given lines (version 1) and block until it is
+    /// elaborated. The splice path opens with the *spliced* content directly, so
+    /// the first query never does an open-then-immediately-change (which races).
+    fn open_with(&mut self, path: &str, lines: Vec<String>) {
+        let text = lines.join("\n");
         let uri = file_uri(path);
         self.notify(
             "textDocument/didOpen",
             json!({"textDocument": {"uri": uri, "languageId": "lean", "version": 1, "text": text}}),
         );
         self.wait_processed(Duration::from_secs(180));
-        self.files.insert(
-            path.to_string(),
-            FileState { version: 1, lines: text.split('\n').map(|s| s.to_string()).collect() },
-        );
-        Ok(())
+        self.files.insert(path.to_string(), FileState { version: 1, lines });
     }
 
     fn is_open(&self, path: &str) -> bool {
@@ -226,23 +231,15 @@ impl LeanServer {
         true
     }
 
-    /// Wait until `lean --server` has finished (re)elaborating the file.
-    ///
-    /// Two completion signals, whichever fires first — because `$/lean/fileProgress`
-    /// is very chatty (its `processing` set bounces around and, especially after a
-    /// `didChange`, often never cleanly reports empty before more workspace churn):
-    ///   1. a `fileProgress` with empty `processing` after a non-empty one (clean idle), or
-    ///   2. **quiescence** — once activity has started, no message at all for `QUIET`.
+    /// Wait until `lean --server` reports the file idle: a `$/lean/fileProgress`
+    /// with empty `processing` after a non-empty one. Used by `open_with` — a
+    /// `didOpen`'s elaboration reliably reaches this idle state. (The splice
+    /// `didChange` path does NOT wait: `$/lean/plainGoal` blocks until the queried
+    /// position is elaborated, so the query is its own barrier.)
     fn wait_processed(&mut self, timeout: Duration) {
-        use std::sync::mpsc::RecvTimeoutError;
-        const QUIET: Duration = Duration::from_millis(500);
         let deadline = Instant::now() + timeout;
         let mut saw = false;
-        loop {
-            let remaining = match deadline.checked_duration_since(Instant::now()) {
-                Some(r) => r.min(QUIET),
-                None => return,
-            };
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             match self.rx.recv_timeout(remaining) {
                 Ok(v) => {
                     if v.get("method").and_then(|m| m.as_str()) == Some("$/lean/fileProgress") {
@@ -253,14 +250,7 @@ impl LeanServer {
                         }
                     }
                 }
-                // No message for QUIET: if elaboration has started and gone quiet,
-                // it has settled. (If nothing has started yet, keep waiting.)
-                Err(RecvTimeoutError::Timeout) => {
-                    if saw {
-                        return;
-                    }
-                }
-                Err(RecvTimeoutError::Disconnected) => return,
+                Err(_) => return,
             }
         }
     }
@@ -293,19 +283,31 @@ impl LeanServer {
         raw_body: &str,
         cursor_text: &str,
     ) -> (Option<String>, usize, usize) {
-        if self.ensure_open(lean_file).is_err() {
-            return (None, 0, 0);
-        }
-        let cur = self.files[lean_file].lines.clone();
-        let lean_start = lean_start.min(cur.len());
-        let suffix_start = (lean_start..cur.len())
-            .find(|&i| cur[i].trim_start().starts_with("end "))
-            .unwrap_or(cur.len());
+        // Base lines: in-memory if already open, else from disk (the structure
+        // around the tactic body — prefix `:= by` + blank, suffix `end <ns>`).
+        let base: Vec<String> = match self.files.get(lean_file) {
+            Some(fs) => fs.lines.clone(),
+            None => match std::fs::read_to_string(lean_file) {
+                Ok(t) => t.split('\n').map(|s| s.to_string()).collect(),
+                Err(_) => return (None, 0, 0),
+            },
+        };
+        let lean_start = lean_start.min(base.len());
+        let suffix_start = (lean_start..base.len())
+            .find(|&i| base[i].trim_start().starts_with("end "))
+            .unwrap_or(base.len());
         let new_body = transform_body(raw_body);
-        let mut new_lines: Vec<String> = cur[..lean_start].to_vec();
+        let mut new_lines: Vec<String> = base[..lean_start].to_vec();
         new_lines.extend(new_body.iter().cloned());
-        new_lines.extend(cur[suffix_start..].iter().cloned());
-        self.did_change(lean_file, new_lines);
+        new_lines.extend(base[suffix_start..].iter().cloned());
+
+        // First query for this file → open with the spliced content directly
+        // (avoids the open-then-change race). Later → didChange.
+        if self.files.contains_key(lean_file) {
+            self.did_change(lean_file, new_lines);
+        } else {
+            self.open_with(lean_file, new_lines);
+        }
 
         // Content-anchor the query to the cursor's line inside the new body.
         let body_end = (lean_start + new_body.len()).min(self.files[lean_file].lines.len());

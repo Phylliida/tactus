@@ -17,6 +17,7 @@ import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 let server: TactusServer | undefined;
 let panel: vscode.WebviewPanel | undefined;
 let selectionSub: vscode.Disposable | undefined;
+let documentSub: vscode.Disposable | undefined;
 
 /** Wraps the `tactus-lsp serve --json` child. Queries are answered FIFO (the
  *  server emits exactly one JSON line per query, in order), so a queue of
@@ -61,11 +62,13 @@ class TactusServer {
     }
   }
 
-  query(line: number, col: number): Promise<any> {
+  /** Send one command (a JSON object — a splice `{fn, body, cursor}` or a plain
+   *  `{line, col}`) and resolve with the server's JSON reply (FIFO). */
+  send(cmd: object): Promise<any> {
     return new Promise((resolve) => {
       this.pending.push(resolve);
       try {
-        this.proc.stdin.write(`${line} ${col}\n`);
+        this.proc.stdin.write(JSON.stringify(cmd) + '\n');
       } catch (e: any) {
         this.pending.pop();
         resolve({ error: `write failed: ${e.message}` });
@@ -152,40 +155,112 @@ async function showGoal(_context: vscode.ExtensionContext) {
   });
   setPanel('<i style="color:#888">Move the cursor inside a proof tactic block…</i>');
 
-  // Coalescing cursor tracker: single in-flight query, latest position wins.
-  let latest: { line: number; col: number } | undefined;
+  // Coalescing tracker: re-query on cursor move OR edit. Single in-flight; the
+  // latest document+cursor state wins. Each query is a *splice* — the live
+  // tactic body is sent, so editing the proof updates the goal (no rustc).
+  let dirty = false;
   let inFlight = false;
   const pump = async () => {
     if (inFlight) return;
     inFlight = true;
-    while (latest) {
-      const pos = latest;
-      latest = undefined;
-      const res = await server!.query(pos.line, pos.col);
+    while (dirty) {
+      dirty = false;
+      const ed = vscode.window.visibleTextEditors.find((e) => e.document.fileName === rsFile);
+      if (!ed) break;
+      const cmd = spliceCommandAt(ed.document, ed.selection.active);
+      if (!cmd) {
+        setPanel(
+          '<i style="color:var(--vscode-descriptionForeground,#888)">' +
+            'Cursor is not inside a proof tactic block.</i>',
+        );
+        continue;
+      }
+      const res = await server!.send(cmd);
       if (!panel) break;
       setPanel(renderResult(res));
     }
     inFlight = false;
   };
-  const onMove = (line: number, col: number) => {
-    latest = { line, col };
+  const trigger = () => {
+    dirty = true;
     void pump();
   };
 
   selectionSub = vscode.window.onDidChangeTextEditorSelection((e) => {
-    if (e.textEditor.document.fileName !== rsFile) return;
-    const p = e.selections[0].active;
-    onMove(p.line, p.character);
+    if (e.textEditor.document.fileName === rsFile) trigger();
+  });
+  documentSub = vscode.workspace.onDidChangeTextDocument((e) => {
+    if (e.document.fileName === rsFile) trigger();
   });
 
-  // Seed with the current cursor.
-  const p = editor.selection.active;
-  onMove(p.line, p.character);
+  trigger(); // seed with the current cursor
+}
+
+/** A proof fn's `by { … }` tactic block in the live buffer. `open`/`close` are
+ *  the byte offsets of the matching braces. */
+interface TacticBlock {
+  name: string;
+  open: number;
+  close: number;
+}
+
+/** Find every `proof fn NAME … by { … }` block in `text` by regex + brace
+ *  matching. Robust to the body growing/shrinking; ignores strings/comments
+ *  (rare to contain unbalanced braces in a tactic block). */
+function findTacticBlocks(text: string): TacticBlock[] {
+  const blocks: TacticBlock[] = [];
+  const fnRe = /\bproof\s+fn\s+([A-Za-z_][A-Za-z0-9_]*)/g;
+  let m: RegExpExecArray | null;
+  while ((m = fnRe.exec(text)) !== null) {
+    const byRe = /\bby\s*\{/g;
+    byRe.lastIndex = m.index;
+    const bm = byRe.exec(text);
+    if (!bm) continue;
+    const open = text.indexOf('{', bm.index);
+    if (open < 0) continue;
+    let depth = 0;
+    let close = -1;
+    for (let i = open; i < text.length; i++) {
+      const c = text[i];
+      if (c === '{') depth++;
+      else if (c === '}') {
+        depth--;
+        if (depth === 0) {
+          close = i;
+          break;
+        }
+      }
+    }
+    if (close < 0) continue;
+    blocks.push({ name: m[1], open, close });
+    fnRe.lastIndex = close;
+  }
+  return blocks;
+}
+
+/** Build the splice command for the cursor, or `undefined` if it's not inside a
+ *  proof tactic block. Sends the live body + the cursor's line text (tactus-lsp
+ *  splices the body and content-anchors the query to that line). */
+function spliceCommandAt(
+  document: vscode.TextDocument,
+  position: vscode.Position,
+): object | undefined {
+  const text = document.getText();
+  const offset = document.offsetAt(position);
+  const block = findTacticBlocks(text).find((b) => offset > b.open && offset < b.close);
+  if (!block) return undefined;
+  return {
+    fn: block.name,
+    body: text.slice(block.open + 1, block.close),
+    cursor: document.lineAt(position.line).text,
+  };
 }
 
 function stop() {
   selectionSub?.dispose();
   selectionSub = undefined;
+  documentSub?.dispose();
+  documentSub = undefined;
   server?.dispose();
   server = undefined;
 }
