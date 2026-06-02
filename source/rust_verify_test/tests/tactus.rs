@@ -2942,6 +2942,41 @@ test_verify_one_file! {
     }
 }
 
+// Friction 1 (BUG-ch5-pow-iter-lowering-frictions.md): a loop's
+// invariant clauses are pushed as INDIVIDUAL hypothesis frames, not
+// one glued `∧` conjunction. Non-splitting user tactics (`nlinarith`,
+// `linarith`, `assumption`, `exact`) cannot reach a fact buried inside
+// `(P1 ∧ P2 ∧ P3)`. Here the asserted `acc <= i` IS one of the three
+// invariant clauses; `assumption` (a core tactic that does NOT
+// decompose conjunctions — chosen so the test needs no Mathlib) finds
+// it ONLY when the clauses arrive as distinct hypotheses. Pre-fix
+// `intros` produced one `h : (i<=n ∧ n<=100 ∧ acc<=i)` with no
+// standalone `acc <= i`, so `assumption` failed; post-fix it produces
+// `acc <= i` as its own hypothesis.
+test_verify_one_file! {
+    #[test] test_exec_loop_invariant_clauses_split_for_user_tactic verus_code! {
+        #[verifier::tactus_auto]
+        fn buried_invariant_fact(n: u64) -> (r: u64)
+            requires n <= 100,
+        {
+            let mut i: u64 = 0;
+            let mut acc: u64 = 0;
+            while i < n
+                invariant
+                    i <= n,
+                    n <= 100,
+                    acc <= i,
+                decreases n - i
+            {
+                assert(acc <= i) by { intros; assumption };
+                acc = acc + 1;
+                i = i + 1;
+            }
+            acc
+        }
+    } => Ok(())
+}
+
 // Two sequential loops in one fn. Each loop emits its own conjunction
 // in the main goal; the second loop's continuation is nested inside
 // the first's use clause. Structurally:
