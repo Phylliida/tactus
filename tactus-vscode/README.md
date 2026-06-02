@@ -102,12 +102,26 @@ exact settings + cursor positions to try.** Then, in the Extension Development H
 - **Tactus: Show Goal (Infoview)** — start the server for the active `.rs` + open the panel.
 - **Tactus: Stop Infoview Server** — kill the server + close tracking.
 
+## Live editing
+
+The goal updates as you **edit** the proof, not just as you move the cursor — in
+~6–8 ms warm, no rustc. On each cursor move or text change, the extension parses
+the live buffer for the cursor's `proof fn … by { … }` block and sends its current
+tactic body to `tactus-lsp`, which splices it into the warm `.lean` and
+re-elaborates (`didChange`). So you can rename a hypothesis, insert a `have`, etc.,
+and watch the goal track it. (Because it parses the *live* buffer, it's robust to
+`.rs` edits without re-running `--emit-lean` — only structural changes that move a
+`proof fn` to a new file, or rename it, would need a re-emit.)
+
+> After rebuilding the extension (`npm run compile`) or `tactus-lsp`, **reload** the
+> Extension Development Host (`Developer: Reload Window`) and re-run `Tactus: Show Goal`.
+
 ## How it works
 
 `tactus-lsp serve --json <sidecar> <rs>` is spawned once and kept warm. On each
-`onDidChangeTextEditorSelection`, the extension writes `<line> <col>\n` (0-indexed)
-to its stdin and reads one JSON line back (`{fn, lean_line, warm, ms, goal}` or
-`{error}`), coalescing rapid moves to a single in-flight query (latest wins). The
-panel renders the goal (the ```lean fences stripped). All the real work —
-`lean --server` management, the `.rs`↔`.lean` position map — lives in `tactus-lsp`;
-this extension is ~200 lines of glue + a webview.
+cursor move or edit, the extension finds the cursor's tactic block in the live
+buffer and writes `{"fn","body","cursor"}` to the server's stdin, reading one JSON
+line back (`{fn, lean_line, warm, ms, goal}` or `{error}`), coalescing rapid events
+to a single in-flight query (latest wins). The panel renders the goal (the ```lean
+fences stripped). All the real work — `lean --server` management, the splice +
+position map — lives in `tactus-lsp`; this extension is ~250 lines of glue + a webview.

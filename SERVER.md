@@ -10,14 +10,14 @@ operating directly on Tactus `.rs` source (the `proof fn … by { … }` blocks 
 > `sourcemap.json` sidecar (component 1, landed, full e2e suite 480/0); the
 > `.rs`-cursor → Lean-goal bridge (components 2+3, demonstrated); and **`tactus-lsp/`
 > — a real warm persistent goal server** (Rust): keeps one `lean --server` hot and
-> answers repeat cursor queries in **~2 ms** (vs ~2.6 s cold-open), the goal evolving
-> line-to-line through a proof. No rustc at query time. And **`tactus-vscode/` — the
-> VS Code infoview extension** (a thin client over `tactus-lsp`): written + `tsc`-clean,
-> with an F5 launch config and a `get-test-artifacts.sh` that prints ready-to-paste
-> settings. The **full stack now exists, end to end**; the only unrun piece is the
-> extension's live rendering (no editor in the build env — first live run is a manual
-> install+test). Remaining polish: exec-fn goals via `span_marks`, the tactic-only
-> splice fast path, multi-file source mapping, and the precise `lean_indent_delta` column.
+> answers repeat cursor queries in **~2 ms** (vs ~2.6 s cold-open). And **`tactus-vscode/`
+> — the VS Code infoview extension**, a thin client over `tactus-lsp`. The **full stack
+> runs end to end in a real editor** (confirmed by Danielle): point at a proof, the goal
+> appears; **edit the tactics and the goal updates live in ~6–8 ms, no rustc** (the
+> splice fast path is wired — the extension sends the live tactic body, `tactus-lsp`
+> splices + `didChange`s the warm `.lean`). Remaining polish: exec-fn goals via
+> `span_marks`, multi-file source mapping, packaging as a `.vsix`, and the precise
+> `lean_indent_delta` column.
 
 **Status (2026-06-02).** Investigated against the live codebase. **Verdict:
 doable**, and more tractable than it sounds — because Tactus already generates
@@ -181,6 +181,20 @@ imports warm (no Mathlib reload) and no rustc: cheap tactic edits settle in
 genuine proof-search time (~11s here), the same cost batch verification pays — i.e.
 "Lean-speed" is the speed Lean elaborates *that* tactic, just like the VS Code
 Lean4 infoview today. `plainGoal` stays correct across the edit cycle.
+
+**✅ WIRED end-to-end (2026-06-02).** `tactus-lsp serve --json` gained a splice
+command `{fn, body, cursor}`: it replaces the named proof fn's tactic body in the
+warm `.lean` (boundary re-found via `end <ns>`, so robust to the body growing /
+shrinking), `didChange`s, and content-anchors the query to the cursor's line.
+`tactus-vscode` sends it on every cursor move *or edit* — parsing the live buffer
+for the cursor's `proof fn … by { … }` (regex + brace-match), so it's robust to
+`.rs` edits without re-emit (only the stable fn name + `lean_tactic_start_line` are
+needed, not the sidecar's now-stale byte ranges). Verified: editing a proof
+(insert a hypothesis, rename `h`→`bees`, revert) updates the goal in ~6–8 ms warm,
+no rustc. Two implementation notes: the first query for a file opens it with the
+*spliced* content directly (an open-then-immediately-`didChange` raced to None);
+and `plainGoal` blocks until the queried position is elaborated, so it is the
+re-elaboration barrier — no separate wait needed.
 
 ### 5. VS Code extension — ✅ WRITTEN (`tactus-vscode/`), pending live validation
 - Activates on `.rs`; `Tactus: Show Goal` spawns `tactus-lsp serve --json` for the
