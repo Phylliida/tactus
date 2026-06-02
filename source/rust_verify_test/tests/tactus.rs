@@ -9873,6 +9873,27 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Consistent `as nat` materialization on ARITHMETIC OPERANDS (the
+// Friction-2 fix from DECISION-cast-rendering.md). Verus elides a bare
+// `x as nat` (→ `x : U(64)`, Int) but keeps the enclosing op's `IntRange
+// Nat`. The coercion pass materializes the operand under a nat-typed
+// arith op, so `(x as nat) * (x as nat)` renders `Int.toNat x * Int.toNat
+// x` (ℕ) — matching `sq`'s unfolded body `n * n` at `n := x.toNat`. Then
+// `simp only [sq]` unfolds the RHS and closes by `rfl`. WITHOUT the
+// materialization the LHS stays a bare Int product and won't match the ℕ
+// body, so the assert fails to close. `simp only [sq]` is core (no
+// Mathlib), so this discriminates the materialization directly.
+test_verify_one_file! {
+    #[test] test_exec_arith_operand_as_nat_materializes verus_code! {
+        pub open spec fn sq(n: nat) -> nat { n * n }
+
+        #[verifier::tactus_auto]
+        fn probe(x: u64) {
+            assert((x as nat) * (x as nat) == sq(x as nat)) by { intros; simp only [sq] };
+        }
+    } => Ok(())
+}
+
 // === FileLoader by-in-comment regression (BUG-fileloader-by-in-comment.md) ===
 //
 // Three-condition trigger: (1) prior `by { ... }` block, (2) `//`
