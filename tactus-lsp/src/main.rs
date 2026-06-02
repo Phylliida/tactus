@@ -304,6 +304,13 @@ fn resolve_cursor<'a>(
 // Helpers + main.
 // ---------------------------------------------------------------------------
 
+/// Print one compact JSON object and flush — the machine interface the VS Code
+/// extension reads (one object per line over the server's stdout pipe).
+fn emit_json(v: &Value) {
+    println!("{}", v);
+    let _ = std::io::stdout().flush();
+}
+
 fn file_uri(path: &str) -> String {
     let abs = std::fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
@@ -373,11 +380,13 @@ fn main() {
             eprintln!("(fn {}, {}:{}:{})", name, lean_file, lline, lcol);
             println!("{}", goal.unwrap_or_else(|| "(no goal)".into()));
         }
-        Some("serve") if args.len() == 4 => serve(&args[2], &args[3]),
+        Some("serve") if args.len() == 5 && args[2] == "--json" => serve(&args[3], &args[4], true),
+        Some("serve") if args.len() == 4 => serve(&args[2], &args[3], false),
         _ => {
             eprintln!(
                 "usage:\n  tactus-lsp goal  <sourcemap.json> <file.rs> <line> <col>\n  \
-                 tactus-lsp serve <sourcemap.json> <file.rs>   (then `<line> <col>` per stdin line)"
+                 tactus-lsp serve [--json] <sourcemap.json> <file.rs>\n      \
+                 (then `<line> <col>` per stdin line; --json emits one JSON object per query)"
             );
             std::process::exit(2);
         }
@@ -387,7 +396,10 @@ fn main() {
 /// Persistent mode: keep `lean --server` warm; answer `<line> <col>` queries
 /// from stdin. The first query to a given `.lean` pays the open/elaboration
 /// cost; subsequent queries (same file) are a single plainGoal round-trip.
-fn serve(sidecar_path: &str, rs_path: &str) {
+///
+/// `json = true` emits one JSON object per query on stdout (the machine
+/// interface the VS Code extension consumes) — banners stay on stderr.
+fn serve(sidecar_path: &str, rs_path: &str, json: bool) {
     let (sidecar, rs) = load(sidecar_path, rs_path);
     // root for initialize: parent of the first fn's .lean (no lakefile there →
     // LEAN_PATH resolves Mathlib, as the de-risk spike proved).
@@ -411,14 +423,22 @@ fn serve(sidecar_path: &str, rs_path: &str) {
         if parts.is_empty() {
             continue;
         }
-        if parts.len() != 2 {
-            println!("? expected `<line> <col>`");
-            continue;
-        }
-        let (rl, rc): (usize, usize) = match (parts[0].parse(), parts[1].parse()) {
-            (Ok(a), Ok(b)) => (a, b),
-            _ => {
-                println!("? expected two integers");
+        let parsed = if parts.len() == 2 {
+            match (parts[0].parse::<usize>(), parts[1].parse::<usize>()) {
+                (Ok(a), Ok(b)) => Some((a, b)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let (rl, rc) = match parsed {
+            Some(p) => p,
+            None => {
+                if json {
+                    emit_json(&json!({"error": "expected `<line> <col>` (two integers)"}));
+                } else {
+                    println!("? expected `<line> <col>`");
+                }
                 continue;
             }
         };
@@ -427,28 +447,46 @@ fn serve(sidecar_path: &str, rs_path: &str) {
                 let t = Instant::now();
                 let warm = srv.opened.contains(lean_file);
                 if let Err(e) = srv.ensure_open(lean_file) {
-                    println!("! open failed: {}", e);
+                    if json {
+                        emit_json(&json!({"line": rl, "col": rc, "error": format!("open failed: {}", e)}));
+                    } else {
+                        println!("! open failed: {}", e);
+                    }
                     continue;
                 }
                 let goal = srv.plain_goal(lean_file, lline, lcol);
-                let ms = t.elapsed().as_millis();
-                println!(
-                    "--- .rs {}:{} → {} ({}:{}:{})  [{}, {} ms] ---",
-                    rl,
-                    rc,
-                    name,
-                    std::path::Path::new(lean_file)
-                        .file_name()
-                        .unwrap()
-                        .to_string_lossy(),
-                    lline,
-                    lcol,
-                    if warm { "warm" } else { "cold-open" },
-                    ms
-                );
-                println!("{}", goal.unwrap_or_else(|| "(no goal)".into()));
+                let ms = t.elapsed().as_millis() as u64;
+                if json {
+                    emit_json(&json!({
+                        "line": rl, "col": rc, "fn": name,
+                        "lean_file": lean_file, "lean_line": lline, "lean_col": lcol,
+                        "warm": warm, "ms": ms, "goal": goal,
+                    }));
+                } else {
+                    println!(
+                        "--- .rs {}:{} → {} ({}:{}:{})  [{}, {} ms] ---",
+                        rl,
+                        rc,
+                        name,
+                        std::path::Path::new(lean_file)
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy(),
+                        lline,
+                        lcol,
+                        if warm { "warm" } else { "cold-open" },
+                        ms
+                    );
+                    println!("{}", goal.unwrap_or_else(|| "(no goal)".into()));
+                }
             }
-            Err(e) => println!("! {}", e),
+            Err(e) => {
+                if json {
+                    emit_json(&json!({"line": rl, "col": rc, "error": e}));
+                } else {
+                    println!("! {}", e);
+                }
+            }
         }
     }
     srv.shutdown();
