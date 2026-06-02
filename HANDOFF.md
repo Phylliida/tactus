@@ -94,11 +94,31 @@ testing it (F5 dev host). Remaining polish after that: wiring the splice fast pa
 `tactus-lsp`, exec-fn goals (`span_marks`), multi-file source mapping, and the precise
 `lean_indent_delta` column refinement.
 
+**Then the full stack ran in a real editor (Danielle installed + tested it), and the
+live-edit splice fast path got WIRED.** The VS Code extension works: point at a proof, the
+goal appears; **edit the tactics and the goal updates live in ~6–8 ms, no rustc.**
+`tactus-lsp serve --json` gained a splice command `{fn, body, cursor}` — replaces the named
+proof fn's tactic body in the warm `.lean` (boundary re-found via `end <ns>`, robust to the
+body growing/shrinking), `didChange`s, content-anchors the query. The extension sends it on
+every cursor move *or edit*, parsing the live buffer for the cursor's `proof fn … by { … }`
+(regex + brace-match) — so it's robust to `.rs` edits without re-emit (only the stable fn
+name + `lean_tactic_start_line` are used, not the sidecar's byte ranges). Two gotchas
+solved: the first query opens the file with the *spliced* content directly (open-then-
+immediately-`didChange` raced to None); and `$/lean/plainGoal` blocks until the queried
+position is elaborated, so it's the re-elaboration barrier (no separate wait — `wait_processed`'s
+empty-after-non-empty signal is reliable for opens but never cleanly fires after a chatty
+`didChange`). Verified on an edited fixture (rename `h`→`bees`, insert a hyp, revert — all
+tracked). Diagnostic env quirk also fixed: GUI-launched VS Code lacks the toolchain on PATH,
+so the extension gained `tactus.leanPath` (pass LEAN_PATH directly, skip `lake`) +
+`tactus.toolchainBin` (prepend to PATH so `lean --server` spawns).
+
 **Decision shape (Danielle's gate):** de-risk *before* committing to the build; start the
 build with the safe behavior-preserving refactor, verify green at each step, gate the
 user-facing surface; then prove the whole chain with a cheap bridge before the heavier
-editor frontend. Remaining Phase-1: `lean_indent_delta` (column mapping, de-risk item 3) +
-the editor frontend (VS Code extension / `tactus-lsp` binary) that re-hosts the bridge.
+editor frontend; and when the one unverifiable piece (the live UI) was reached, *Danielle
+ran it* — the part I couldn't verify, verified by her. Remaining polish: exec-fn goals
+(`span_marks`), multi-file source mapping, packaging a `.vsix`, the precise `lean_indent_delta`
+column.
 
 #### Earlier 2026-06-02 session (tidy + tooling: tests → `src/tests/`, Tactus-server feasibility)
 
