@@ -1,9 +1,18 @@
-# Tactus Server — feasibility findings + implementation plan
+# Tactus Server — feasibility, plan, and progress
 
 **Goal.** A "Tactus server" that gives the Lean-server / VS Code infoview
 experience — inline proof **goal state** at the cursor, live diagnostics — but
 operating directly on Tactus `.rs` source (the `proof fn … by { … }` blocks and
 `#[verifier::tactus_auto]` exec fns), instead of on `.lean` files.
+
+> **At a glance (2026-06-02).** The server *core* works end-to-end. De-risk:
+> both unknowns GREEN. Built: `--emit-lean` codegen-only mode + `sourcemap.json`
+> sidecar (component 1, landed, full e2e suite 480/0). Demonstrated: the
+> `.rs`-cursor → Lean-goal bridge (components 2+3, `server-spike/goal_at_cursor.py`)
+> — the goal evolves line-to-line as you move through a proof. **What remains is
+> the editor frontend** (a VS Code extension or a `tactus-lsp` Rust binary that
+> re-hosts the proven Python bridge), exec-fn goals via `span_marks`, the
+> tactic-only splice fast path, and the precise `lean_indent_delta` column refinement.
 
 **Status (2026-06-02).** Investigated against the live codebase. **Verdict:
 doable**, and more tractable than it sounds — because Tactus already generates
@@ -50,13 +59,13 @@ modulo that offset — editing the proof body of a `.lean` theorem.
 | Per-fn, self-contained `.lean` at a known path | `lean_file_path = lean_out_root()/{crate}/{fn}.lean` (`generate.rs:44`); root = `$TACTUS_LEAN_OUT` → `$CARGO_TARGET_DIR/tactus-lean` → `./target/tactus-lean` (`generate.rs:26–38`); prelude inlined via `Command::Raw(TACTUS_PRELUDE)` so each file is standalone (modulo Mathlib imports). | ✅ |
 | `.lean → .rs` diagnostics already done | `lean_process::format_error(d, &source_map)` maps Lean diagnostics to `.rs` (`generate.rs:986`); exec fns use `SpanMarkLandmark { line, loc, kind }` (`lean_pp.rs:128`) emitted as `/- @rust:LOC -/` comments. | ✅ (reuse) |
 
-**Two gaps, both minor:**
-- **No emit-only CLI** — codegen is reachable only via the full verify path
-  (`verifier.rs:1794` calls `check_proof_fn`). Need to add a verifier flag.
+**Two gaps that were flagged here — first is now closed:**
+- ~~**No emit-only CLI**~~ — **CLOSED.** `--emit-lean` adds exactly this: codegen +
+  sidecar with the Lean run skipped (component 1, landed). See § "Components → 1".
 - **No verus-analyzer in the workspace** (only `verus-field-extension` /
   `verus-quadratic-extension`, unrelated math crates). Irrelevant for the
   infoview — it needs only cursor position (from the editor) + tactic-block
-  ranges (from codegen). Rust-side IDE features (go-to-def, etc.) are a separate,
+  ranges (from the sidecar). Rust-side IDE features (go-to-def, etc.) are a separate,
   later concern; the user's stock rust-analyzer would choke on the `verus!` macro
   anyway.
 
@@ -175,18 +184,29 @@ Lean4 infoview today. `plainGoal` stays correct across the edit cycle.
 
 ---
 
-## Phasing + rough effort
+## Phasing + progress
 
-- **Phase 0 — ~2–4 days. ~80% of value, almost no new code.**
-  `tactus emit --watch` + an extension command "open the generated `.lean` for the
-  fn at cursor, refresh on save." User runs the **existing** Lean4 infoview on it,
-  correlating position manually. Validates the whole idea immediately.
-- **Phase 1 — ~2–3 weeks. The headline: live proof-fn infoview.**
-  Lean-server bridge, `plainGoal` proxy via the sidecar map, the tactic-only
-  splice fast path, the infoview panel.
-- **Phase 2 — ~3–4 weeks.**
-  Exec-fn obligation goals (via `span_marks`), hover (rendered Lean / spec for an
-  expression), diagnostics polish, optional promotion to a `tactus-lsp` Rust binary.
+The original three-phase plan is kept below with status. In practice we skipped
+the Phase-0 "manual correlation" rung — the de-risk came back green fast enough
+that going straight to the real codegen + bridge was the better bet, and it paid off.
+
+- **Phase 0 — ✅ effectively SUPERSEDED.** The plan was `tactus emit --watch` + an
+  extension command that opens the generated `.lean` and lets the user run the
+  *existing* Lean4 infoview, correlating position by hand. We instead landed the real
+  `--emit-lean` (component 1) and built the position-mapping bridge directly — so the
+  "manual correlation" stepping-stone isn't needed. (`--watch` itself is still a nice
+  ergonomic add for the eventual frontend; cheap.)
+- **Phase 1 — ⏳ core DONE, frontend remains.** The headline (a live proof-fn
+  infoview) breaks into: the Lean-server bridge ✅ demonstrated; the `plainGoal` proxy
+  via the sidecar map ✅ demonstrated (goal evolves line-to-line); the tactic-only
+  splice fast path ✅ de-risked (`livedit_probe.py`: ~0.5s `didChange`, no rustc) but
+  not yet wired into a tool; the **infoview panel itself — still to build** (the editor
+  frontend). So what's left of Phase 1 is the re-host: port the Python bridge into a
+  VS Code extension (TS) or a `tactus-lsp` Rust binary + an infoview webview.
+- **Phase 2 — remaining.** Exec-fn obligation goals (the sidecar already carries the
+  `span_marks`; the bridge just doesn't consume them yet), hover (rendered Lean / spec
+  for an expression), diagnostics polish, the precise `lean_indent_delta` column map,
+  and promotion to the `tactus-lsp` Rust binary if the mapping outgrows the sidecar.
 
 ---
 
@@ -219,32 +239,46 @@ The three unknowns, resolved:
 
 ---
 
-## What exists vs what's new (summary)
+## What exists vs what's built vs what's left
 
-**Exists / reusable (~50–60% of the plumbing):**
+**Exists / reusable (~50–60% of the plumbing — was here before this work):**
 codegen to per-fn `.lean`; the verbatim-tactic offset (`LeanSourceMap::ProofFn`,
 `tactic_start_line`); `.lean → .rs` diagnostics (`format_error`, `SpanMarkLandmark`,
 `/- @rust:LOC -/`); Lean subprocess management (`lean_process.rs`); the managed Lake
 project + `LEAN_PATH` resolution; the FileLoader original-vs-sanitized duality
 (`file_loader.rs`, `ORIGINAL_CACHE`).
 
-**New:**
-the `tactus emit` flag + emit/run split + `sourcemap.json` (small); spawning &
-proxying `lean --server` (`$/lean/plainGoal`); the cursor→position arithmetic
-(tiny, data-driven from the sidecar); the tactic-only splice fast path; the VS
-Code extension/infoview.
+**Built / demonstrated (2026-06-02):**
+the `--emit-lean` flag + emit/run split (`emit_proof_fn`/`emit_exec_fn`) +
+`sourcemap.json` (`lean_verify::sourcemap`) — ✅ landed, in-tree; spawning & proxying
+`lean --server` (`$/lean/plainGoal`) and the cursor→position arithmetic (content-anchored
+delta) — ✅ demonstrated in `server-spike/goal_at_cursor.py`; the tactic-only splice fast
+path — ✅ de-risked in `server-spike/livedit_probe.py` (not yet wired into a tool).
 
-**Key files to know:**
-`lean_verify/src/generate.rs` (`check_proof_fn` `:894`, `check_exec_fn`,
-`krate_preamble`, `lean_file_path` `:44`); `lean_verify/src/to_lean_fn.rs`
-(`LeanSourceMap` `:94`, `render_by_block`); `lean_verify/src/lean_process.rs`
-(`check_lean_file`, `format_error`); `lean_verify/src/lean_pp.rs`
-(`SpanMarkLandmark` `:128`); `rust_verify/src/verifier.rs` (`:1760` read-tactic,
-`:1794` check_proof_fn call); `rust_verify/src/file_loader.rs` (FileLoader +
-`ORIGINAL_CACHE`); `rust_verify/src/attributes.rs` (`tactic_span` `:1214`);
-`rust_verify/src/config.rs` (where to add the flag).
+**Still to build:**
+the editor frontend — a VS Code extension (TS) **or** a `tactus-lsp` Rust binary that
+re-hosts the bridge as a real LSP server + an infoview panel; exec-fn goal lookup (consume
+the sidecar's `span_marks`); the precise `lean_indent_delta` column map; diagnostics/hover
+polish. None carry new risk — the de-risk + bridge proved the wiring.
+
+**Key files to know** (line numbers below are pre-implementation citations and have
+since drifted — the `--emit-lean` work shifted the verifier loop and refactored
+`generate.rs`; treat them as landmarks, not exact):
+`lean_verify/src/generate.rs` (`emit_proof_fn` / `check_proof_fn`, `emit_exec_fn` /
+`check_exec_fn`, `krate_preamble`, `lean_file_path`, `sourcemap_path`);
+`lean_verify/src/sourcemap.rs` (**new** — `Sidecar` / `SidecarFn` serde schema);
+`lean_verify/src/to_lean_fn.rs` (`LeanSourceMap`, `render_by_block`);
+`lean_verify/src/lean_process.rs` (`check_lean_file`, `format_error`);
+`lean_verify/src/lean_pp.rs` (`SpanMarkLandmark`); `rust_verify/src/verifier.rs`
+(read-tactic, the two Tactus branches + `emit_lean` wiring, `Verifier.tactus_sidecar`,
+the `Body(Style::Normal)` proof gate, sidecar write at `verify_crate_inner`'s tail);
+`rust_verify/src/file_loader.rs` (FileLoader + `ORIGINAL_CACHE`);
+`rust_verify/src/attributes.rs` (`tactic_span`); `rust_verify/src/config.rs`
+(`emit_lean` flag). Plus **`server-spike/`** — `plaingoal_probe.py` (de-risk #1),
+`livedit_probe.py` (de-risk #2), `goal_at_cursor.py` (the end-to-end bridge), `README.md`.
 
 ---
 
-*Investigation: 2026-06-02. All `file:line` references were live at that date —
-verify against current code before relying on exact line numbers.*
+*Investigation + first implementation: 2026-06-02. The `file:line` citations were live
+at investigation time but have drifted with the `--emit-lean` landing — verify against
+current code before relying on exact line numbers.*
