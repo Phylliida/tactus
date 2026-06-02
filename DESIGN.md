@@ -4899,7 +4899,26 @@ lean_verify/
     prelude.rs            — TactusPrelude.lean content
     project.rs            — manage ~/.tactus/lean-project/ setup
     builtin_paths.rs      — VIR path → Lean name lookup table (Track C)
+    tests/<stem>.rs       — unit tests, one file per functionality module
 ```
+
+**Unit-test location convention (2026-06-02).** Each functionality file's tests
+live in `src/tests/<stem>.rs`, declared at the bottom of `<stem>.rs` as:
+
+```rust
+#[cfg(test)]
+#[path = "tests/<stem>.rs"]
+mod tests;   // (or the module's original name, e.g. lean_ast's `substitute_tests`)
+```
+
+They are kept as `#[path]`'d `mod` **children** — NOT a single crate-wide test
+file — because the tests exercise **private items** (`Wp`, `build_wp`, etc.) via
+`use super::*`, which only a child module of the functionality module can reach.
+The `#[path]` lets the file sit in `src/tests/` with `src/` flat. This keeps the
+functionality files readable for audit (they were ~40% tests inline; e.g.
+`sst_to_lean.rs` dropped 8774→6624 lines when its tests moved out). Gotcha: a
+test that used a path-relative `include_str!("../../…")` needs one more `../`
+after the move (the file is a directory deeper).
 
 ### New files in `vir/`
 ```
