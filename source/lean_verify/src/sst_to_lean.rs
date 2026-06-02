@@ -2129,16 +2129,24 @@ fn walk_loop<'a>(
         AssertKind::Hypothesis(HypothesisKind::LoopCondition),
         lower_validated(c),
     );
-    let entry_inv_conj_marked = and_all(
+    // Each invariant clause becomes its OWN hypothesis frame, NOT one
+    // glued `∧` conjunction. `split_leading_binders` then names them
+    // `_h_ctx_N` individually, so a user tactic's `intros; nlinarith`
+    // (and `linarith` / `assumption` / `exact`) sees each fact
+    // directly. Those tactics do NOT decompose a conjunction
+    // hypothesis, so gluing the clauses into one `(P1 ∧ P2 ∧ …)` frame
+    // buried facts (e.g. an overflow bound) that were "right there".
+    // (`omega`/`simp_all` in the default closer DO split conjunctions,
+    // so this mainly unblocks user-written closers and asserts.)
+    // See BUG-ch5-pow-iter-lowering-frictions.md (Friction 1).
+    let entry_invs_marked: Vec<LExpr> =
         invs.iter().zip(validated_invs.iter()).zip(inv_kinds.iter())
             .filter(|(_, k)| k.at_entry())
-            .map(|((i, v), _)| inv_marked((i, v))).collect()
-    );
-    let exit_inv_conj_marked = and_all(
+            .map(|((i, v), _)| inv_marked((i, v))).collect();
+    let exit_invs_marked: Vec<LExpr> =
         invs.iter().zip(validated_invs.iter()).zip(inv_kinds.iter())
             .filter(|(_, k)| k.at_exit())
-            .map(|((i, v), _)| inv_marked((i, v))).collect()
-    );
+            .map(|((i, v), _)| inv_marked((i, v))).collect();
 
     // ── Init: one theorem per `at_entry` invariant. These are the
     // ones the user claims hold at loop entry (i.e., before the
@@ -2162,7 +2170,9 @@ fn walk_loop<'a>(
     // they're only required at break.
     let mut maintain_obl = obl.clone();
     push_mod_var_frames(&mut maintain_obl, modified_vars);
-    maintain_obl.frames.push_back(CtxFrame::Hyp(entry_inv_conj_marked));
+    for inv in &entry_invs_marked {
+        maintain_obl.frames.push_back(CtxFrame::Hyp(inv.clone()));
+    }
     if let Some(c) = cond {
         maintain_obl.frames.push_back(CtxFrame::Hyp(cond_marked(&c)));
     }
@@ -2195,7 +2205,9 @@ fn walk_loop<'a>(
     // to fall-through inside the body.
     let mut use_obl = obl.clone();
     push_mod_var_frames(&mut use_obl, modified_vars);
-    use_obl.frames.push_back(CtxFrame::Hyp(exit_inv_conj_marked));
+    for inv in &exit_invs_marked {
+        use_obl.frames.push_back(CtxFrame::Hyp(inv.clone()));
+    }
     if let Some(c) = cond {
         use_obl.frames.push_back(CtxFrame::Hyp(LExpr::not(cond_marked(&c))));
     }
