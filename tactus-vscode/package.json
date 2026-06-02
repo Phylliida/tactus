@@ -1,0 +1,59 @@
+{
+  "name": "tactus-infoview",
+  "displayName": "Tactus Infoview",
+  "description": "Inline Lean goal state at the cursor for Tactus .rs proofs — a thin client over tactus-lsp.",
+  "version": "0.1.0",
+  "publisher": "tactus",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:rust"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "tactus.showGoal",
+        "title": "Tactus: Show Goal (Infoview)"
+      },
+      {
+        "command": "tactus.stop",
+        "title": "Tactus: Stop Infoview Server"
+      }
+    ],
+    "configuration": {
+      "title": "Tactus Infoview",
+      "properties": {
+        "tactus.serverPath": {
+          "type": "string",
+          "default": "tactus-lsp",
+          "description": "Path to the tactus-lsp binary (on PATH, or an absolute path to the built binary)."
+        },
+        "tactus.sidecarPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to sourcemap.json (the `verus --emit-lean` sidecar). If empty, auto-discovers the first `**/tactus-lean/*/sourcemap.json` in the workspace."
+        },
+        "tactus.leanProject": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the Tactus lean-project dir (sets TACTUS_LEAN_PROJECT so tactus-lsp can resolve LEAN_PATH via `lake env`). If empty, relies on $LEAN_PATH in the environment."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.4.0"
+  }
+}
