@@ -5,14 +5,17 @@ experience — inline proof **goal state** at the cursor, live diagnostics — b
 operating directly on Tactus `.rs` source (the `proof fn … by { … }` blocks and
 `#[verifier::tactus_auto]` exec fns), instead of on `.lean` files.
 
-> **At a glance (2026-06-02).** The server *core* works end-to-end. De-risk:
-> both unknowns GREEN. Built: `--emit-lean` codegen-only mode + `sourcemap.json`
-> sidecar (component 1, landed, full e2e suite 480/0). Demonstrated: the
-> `.rs`-cursor → Lean-goal bridge (components 2+3, `server-spike/goal_at_cursor.py`)
-> — the goal evolves line-to-line as you move through a proof. **What remains is
-> the editor frontend** (a VS Code extension or a `tactus-lsp` Rust binary that
-> re-hosts the proven Python bridge), exec-fn goals via `span_marks`, the
-> tactic-only splice fast path, and the precise `lean_indent_delta` column refinement.
+> **At a glance (2026-06-02).** The server *core* is built and works end-to-end.
+> De-risk: both unknowns GREEN. Built: `--emit-lean` codegen-only mode +
+> `sourcemap.json` sidecar (component 1, landed, full e2e suite 480/0); the
+> `.rs`-cursor → Lean-goal bridge (components 2+3, demonstrated); and **`tactus-lsp/`
+> — a real warm persistent goal server** (Rust): keeps one `lean --server` hot and
+> answers repeat cursor queries in **~2 ms** (vs ~2.6 s cold-open), the goal evolving
+> line-to-line through a proof. No rustc at query time. **What remains is the editor
+> frontend** — a VS Code extension / infoview panel that is a *thin client over
+> `tactus-lsp`* (best built where there's an editor to test in) — plus exec-fn goals
+> via `span_marks`, the tactic-only splice fast path, and the precise
+> `lean_indent_delta` column refinement.
 
 **Status (2026-06-02).** Investigated against the live codebase. **Verdict:
 doable**, and more tractable than it sounds — because Tactus already generates
@@ -196,13 +199,15 @@ that going straight to the real codegen + bridge was the better bet, and it paid
   `--emit-lean` (component 1) and built the position-mapping bridge directly — so the
   "manual correlation" stepping-stone isn't needed. (`--watch` itself is still a nice
   ergonomic add for the eventual frontend; cheap.)
-- **Phase 1 — ⏳ core DONE, frontend remains.** The headline (a live proof-fn
-  infoview) breaks into: the Lean-server bridge ✅ demonstrated; the `plainGoal` proxy
-  via the sidecar map ✅ demonstrated (goal evolves line-to-line); the tactic-only
-  splice fast path ✅ de-risked (`livedit_probe.py`: ~0.5s `didChange`, no rustc) but
-  not yet wired into a tool; the **infoview panel itself — still to build** (the editor
-  frontend). So what's left of Phase 1 is the re-host: port the Python bridge into a
-  VS Code extension (TS) or a `tactus-lsp` Rust binary + an infoview webview.
+- **Phase 1 — ⏳ core BUILT, frontend remains.** The headline (a live proof-fn
+  infoview) breaks into: the Lean-server bridge ✅; the `plainGoal` proxy via the
+  sidecar map ✅ (goal evolves line-to-line); a **warm persistent server ✅ built**
+  (`tactus-lsp/` — a real Rust binary, ~2 ms warm queries, not a per-query spike); the
+  tactic-only splice fast path ✅ de-risked (`livedit_probe.py`: ~0.5s `didChange`, no
+  rustc) but not yet wired into `tactus-lsp`; the **infoview panel itself — still to
+  build**. So what's left of Phase 1 is the editor frontend: a VS Code extension (TS)
+  + infoview webview that is a *thin client over `tactus-lsp`* (send cursor positions,
+  render goals), best built where there's an editor to test in.
 - **Phase 2 — remaining.** Exec-fn obligation goals (the sidecar already carries the
   `span_marks`; the bridge just doesn't consume them yet), hover (rendered Lean / spec
   for an expression), diagnostics polish, the precise `lean_indent_delta` column map,
@@ -250,16 +255,20 @@ project + `LEAN_PATH` resolution; the FileLoader original-vs-sanitized duality
 
 **Built / demonstrated (2026-06-02):**
 the `--emit-lean` flag + emit/run split (`emit_proof_fn`/`emit_exec_fn`) +
-`sourcemap.json` (`lean_verify::sourcemap`) — ✅ landed, in-tree; spawning & proxying
-`lean --server` (`$/lean/plainGoal`) and the cursor→position arithmetic (content-anchored
-delta) — ✅ demonstrated in `server-spike/goal_at_cursor.py`; the tactic-only splice fast
-path — ✅ de-risked in `server-spike/livedit_probe.py` (not yet wired into a tool).
+`sourcemap.json` (`lean_verify::sourcemap`) — ✅ landed, in-tree; the `lean --server`
+proxy + content-anchored cursor→position map — ✅ demonstrated in
+`server-spike/goal_at_cursor.py`; **`tactus-lsp/` — a real warm persistent goal server**
+(Rust, std + serde): keeps `lean --server` hot, ~2 ms warm queries — ✅ built; the
+tactic-only splice fast path — ✅ de-risked in `server-spike/livedit_probe.py` (not yet
+wired into `tactus-lsp`).
 
 **Still to build:**
-the editor frontend — a VS Code extension (TS) **or** a `tactus-lsp` Rust binary that
-re-hosts the bridge as a real LSP server + an infoview panel; exec-fn goal lookup (consume
-the sidecar's `span_marks`); the precise `lean_indent_delta` column map; diagnostics/hover
-polish. None carry new risk — the de-risk + bridge proved the wiring.
+the editor frontend — a VS Code extension (TS) + infoview panel that is a *thin client
+over `tactus-lsp`* (send cursor positions, render goals); the splice fast path wired into
+`tactus-lsp` (`didChange` instead of re-`ensure_open` on tactic-only edits); exec-fn goal
+lookup (consume the sidecar's `span_marks`); the precise `lean_indent_delta` column map;
+diagnostics/hover polish. None carry new risk — the de-risk + bridge + server core proved
+the wiring.
 
 **Key files to know** (line numbers below are pre-implementation citations and have
 since drifted — the `--emit-lean` work shifted the verifier loop and refactored
