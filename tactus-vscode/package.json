@@ -41,7 +41,17 @@
         "tactus.leanProject": {
           "type": "string",
           "default": "",
-          "description": "Path to the Tactus lean-project dir (sets TACTUS_LEAN_PROJECT so tactus-lsp can resolve LEAN_PATH via `lake env`). If empty, relies on $LEAN_PATH in the environment."
+          "description": "Path to the Tactus lean-project dir (sets TACTUS_LEAN_PROJECT so tactus-lsp can resolve LEAN_PATH via `lake env`). Needs `lake` on PATH; prefer tactus.leanPath instead if you have the value."
+        },
+        "tactus.leanPath": {
+          "type": "string",
+          "default": "",
+          "description": "The LEAN_PATH value (colon-separated olean dirs), passed directly so tactus-lsp does NOT need to run `lake`. Get it with `lake env printenv LEAN_PATH` in the lean-project. Recommended — GUI-launched VS Code usually can't find `lake`."
+        },
+        "tactus.toolchainBin": {
+          "type": "string",
+          "default": "",
+          "description": "Directory containing the `lean` (and `lake`) binaries; prepended to PATH for the spawned server so it can launch `lean --server`. Required when VS Code's environment lacks the toolchain on PATH (e.g. GUI-launched). Find it with `dirname $(which lean)`."
         }
       }
     }

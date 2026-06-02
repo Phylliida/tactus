@@ -117,10 +117,23 @@ async function showGoal(_context: vscode.ExtensionContext) {
     sidecar = found[0].fsPath;
   }
 
+  // Build the spawned server's environment. GUI-launched VS Code usually does
+  // NOT inherit a shell PATH with the Lean toolchain, so tactus-lsp can't find
+  // `lake` (to resolve LEAN_PATH) or `lean` (to spawn the worker). Two settings
+  // fix that: `leanPath` passes LEAN_PATH directly (skipping `lake`), and
+  // `toolchainBin` is prepended to PATH so `lean --server` is spawnable.
   const env: NodeJS.ProcessEnv = { ...process.env };
   const leanProject = cfg.get<string>('leanProject', '').trim();
   if (leanProject) {
     env.TACTUS_LEAN_PROJECT = leanProject;
+  }
+  const leanPath = cfg.get<string>('leanPath', '').trim();
+  if (leanPath) {
+    env.LEAN_PATH = leanPath;
+  }
+  const toolchainBin = cfg.get<string>('toolchainBin', '').trim();
+  if (toolchainBin) {
+    env.PATH = toolchainBin + (env.PATH ? ':' + env.PATH : '');
   }
 
   // (Re)start the server for this file.
