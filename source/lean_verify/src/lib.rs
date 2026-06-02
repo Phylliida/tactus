@@ -23,4 +23,8 @@ pub mod to_lean_type;
 pub mod typed_expr;
 
 // Re-export the main entry points
-pub use generate::{check_exec_fn, check_proof_fn, CheckResult, DiagLocation, TactusDiag};
+pub use generate::{
+    check_exec_fn, check_proof_fn, emit_exec_fn, emit_proof_fn, CheckResult, DiagLocation,
+    EmitOutput, TactusDiag,
+};
+pub use to_lean_fn::LeanSourceMap;
