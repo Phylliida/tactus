@@ -91,3 +91,37 @@ need a `tactus emit` (rustc) re-run.
 ```bash
 python3 livedit_probe.py
 ```
+
+## The bridge — `.rs` cursor → Lean goal (`goal_at_cursor.py`): 🟢 WORKING
+
+Not a de-risk probe — the actual **end-to-end Tactus-server core** (SERVER.md
+components 2 + 3), built on the `--emit-lean` sidecar. Given a `sourcemap.json`,
+a `.rs` file, and a cursor `(line, col)`, it: finds the proof fn whose tactic
+block contains the cursor, maps the `.rs` line to a `.lean` line (content-anchored
+to `lean_tactic_start_line` — the body is copied verbatim line-for-line, so it's a
+constant per-fn delta), drives `lean --server` (`$/lean/plainGoal`), and returns
+the goal. **No rustc at query time** — the sidecar + `.lean` came from `--emit-lean`.
+
+```bash
+# (sidecar, .rs, line, col)  — 0-indexed line/col (LSP convention)
+python3 goal_at_cursor.py path/to/sourcemap.json path/to/file.rs 38 4
+```
+
+Demonstrated (2026-06-02) against a real `--emit-lean` crate — the goal evolves
+line-to-line, exactly the infoview experience:
+
+| `.rs` cursor | `.lean` (Δ +397) | goal |
+|---|---|---|
+| `unfold double`         | L435 | `⊢ double n > n` |
+| `have h : n + n > n …`   | L436 | `⊢ n + n > n` (after `unfold`) |
+
+Cursors outside any proof tactic block fail cleanly. Proof fns only for now —
+exec fns use coarser `span_marks` (a later pass). Column-precise mapping
+(`lean_indent_delta`) is a refinement; querying at the `.lean` tactic line's
+first non-space column gives plainGoal's "state here" goal, which is what the
+infoview wants.
+
+To generate artifacts to point it at: run the e2e test with the temp dir kept —
+`VERUS_KEEP_TEST_DIR=1 vargo test -p rust_verify_test --test tactus -- test_emit_lean_codegen_only`
+— then look under `source/target/debug/test_inputs/*emit_lean*/` for `test.rs` and
+`tactus-lean/test_crate/sourcemap.json`.

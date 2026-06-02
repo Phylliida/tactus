@@ -11979,5 +11979,17 @@ test_verify_one_file_with_options! {
         {
             x + 1
         }
+
+        // A multi-step proof: the goal changes line-to-line, so the sidecar's
+        // line-for-line map lets a cursor on each tactic line resolve to a
+        // distinct Lean goal (exercised by server-spike/goal_at_cursor.py).
+        proof fn chain(n: nat)
+            requires n > 0
+            ensures double(n) > n
+        by {
+            unfold double
+            have h : n + n > n := by omega
+            exact h
+        }
     } => Ok(())
 }
