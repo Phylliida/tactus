@@ -88,6 +88,9 @@ pub struct ArgsX {
     pub no_erasure_check: bool,
     pub no_auto_recommends_check: bool,
     pub no_cheating: bool,
+    /// Tactus: emit per-fn `.lean` files + a `sourcemap.json` sidecar and
+    /// SKIP running Lean. Codegen-only mode for the Tactus server (SERVER.md).
+    pub emit_lean: bool,
     pub time: bool,
     pub time_expanded: bool,
     pub output_json: bool,
@@ -137,6 +140,7 @@ impl ArgsX {
             no_erasure_check: Default::default(),
             no_auto_recommends_check: Default::default(),
             no_cheating: Default::default(),
+            emit_lean: Default::default(),
             time: Default::default(),
             time_expanded: Default::default(),
             output_json: Default::default(),
@@ -314,6 +318,7 @@ pub fn parse_args_with_imports(
     const OPT_NO_ERASURE_CHECK: &str = "no-erasure-check";
     const OPT_NO_AUTO_RECOMMENDS_CHECK: &str = "no-auto-recommends-check";
     const OPT_NO_CHEATING: &str = "no-cheating";
+    const OPT_EMIT_LEAN: &str = "emit-lean";
     const OPT_TIME: &str = "time";
     const OPT_TIME_EXPANDED: &str = "time-expanded";
     const OPT_OUTPUT_JSON: &str = "output-json";
@@ -480,6 +485,11 @@ pub fn parse_args_with_imports(
     opts.optflag("", OPT_NO_VERIFY, "Do not run verification");
     opts.optflag("", OPT_NO_LIFETIME, "Do not run lifetime checking on proofs");
     opts.optflag("", OPT_NO_ERASURE_CHECK, "Do not run the final erasure check");
+    opts.optflag(
+        "",
+        OPT_EMIT_LEAN,
+        "Tactus: emit per-fn .lean files + a sourcemap.json sidecar without running Lean (for the Tactus server)",
+    );
     opts.optflag(
         "",
         OPT_NO_AUTO_RECOMMENDS_CHECK,
@@ -695,6 +705,7 @@ pub fn parse_args_with_imports(
         no_erasure_check: matches.opt_present(OPT_NO_ERASURE_CHECK),
         no_auto_recommends_check: matches.opt_present(OPT_NO_AUTO_RECOMMENDS_CHECK),
         no_cheating: matches.opt_present(OPT_NO_CHEATING),
+        emit_lean: matches.opt_present(OPT_EMIT_LEAN),
         time: matches.opt_present(OPT_TIME) || matches.opt_present(OPT_TIME_EXPANDED),
         time_expanded: matches.opt_present(OPT_TIME_EXPANDED),
         output_json: matches.opt_present(OPT_OUTPUT_JSON),

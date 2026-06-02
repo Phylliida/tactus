@@ -47,6 +47,13 @@ fn lean_file_path(crate_name: &str, fn_path: &vir::ast::Path) -> PathBuf {
     lean_out_root().join(ns).join(format!("{}.lean", leaf))
 }
 
+/// On-disk path for the `--emit-lean` sidecar: `{root}/{crate}/sourcemap.json`,
+/// alongside the crate's generated `.lean` files (so the Tactus server finds
+/// the map next to the artifacts it indexes).
+pub fn sourcemap_path(crate_name: &str) -> PathBuf {
+    lean_out_root().join(sanitize(crate_name)).join("sourcemap.json")
+}
+
 fn write_lean_file(path: &Path, source: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)

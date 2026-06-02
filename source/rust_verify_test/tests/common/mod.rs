@@ -381,6 +381,8 @@ pub fn run_verus(
             verus_args.push("--no-cheating".to_string());
         } else if *option == "--output-json" {
             verus_args.push("--output-json".to_string());
+        } else if *option == "--emit-lean" {
+            verus_args.push("--emit-lean".to_string());
         } else if *option == "vstd" {
             // ignore
         } else if *option == "-V allow-inline-air" {

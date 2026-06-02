@@ -1646,10 +1646,11 @@ impl ObligationEmitter {
 }
 
 /// Snake-case name fragment for an `AssertKind`, used in theorem
-/// naming. The visible per-error label still goes through
+/// naming (and as the `kind` string in the `--emit-lean` sidecar's
+/// exec span marks). The visible per-error label still goes through
 /// [`AssertKind::label`] — the fragment here is only for unique
 /// identifiers in generated Lean.
-fn kind_to_name(k: AssertKind) -> &'static str {
+pub fn kind_to_name(k: AssertKind) -> &'static str {
     match k {
         AssertKind::Obligation(ObligationKind::Plain) => "assert",
         AssertKind::Obligation(ObligationKind::Postcondition) => "postcondition",

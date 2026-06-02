@@ -79,30 +79,47 @@ later only if the mapping logic outgrows the sidecar.
 
 ## Components (precise)
 
-### 1. `tactus emit <file.rs>` — codegen-only mode + sidecar
-- Add `--emit-lean` (or similar) to `rust_verify::config` (`rust_verify/src/config.rs`).
-- In `verifier.rs`'s per-fn loop (around `:1794`), branch to `emit_*` that runs
-  everything up to `write_lean_file` and **skips** `check_lean_file`.
-- Refactor `lean_verify::check_proof_fn` to split out
-  `emit_proof_fn(vir_krate, proof_fn, tactic_text, …) -> (lean_text, LeanSourceMap)`
-  from the Lean-run tail. **The split is already clean**: emit = `generate.rs:908–958`,
-  run = `generate.rs:972–1012`. Same for `check_exec_fn`.
-- Serialize a `sourcemap.json` (Tactus already computes all of it):
+### 1. `tactus emit <file.rs>` — codegen-only mode + sidecar — ✅ LANDED 2026-06-02
+
+`--emit-lean` runs codegen + writes the sidecar and **skips the Lean run** —
+so it needs no Lean/Mathlib at all and is fast. Pinned by
+`test_emit_lean_codegen_only` (e2e). What landed:
+
+- **Flag** `--emit-lean` in `rust_verify::config` (5-site `bool` like `no_verify`),
+  passed through the test harness allowlist.
+- **emit/run split** (`lean_verify::generate`): `check_proof_fn` / `check_exec_fn`
+  factored into `pub emit_proof_fn` / `emit_exec_fn` returning
+  `Result<EmitOutput, CheckResult>` where `EmitOutput = { file_path, source_map,
+  warnings }`; `check_*` = `emit_* + the lean-run tail`. (The split was as clean
+  as predicted.)
+- **verifier wiring**: at the per-fn loop's two Tactus branches, `if self.args.emit_lean`
+  calls `emit_*`, pushes a `SidecarFn` (built from the `EmitOutput`'s `LeanSourceMap`
+  + the `.rs` `tactic_span` byte range, which is in scope there), and `continue`s.
+  Entries accumulate on `Verifier.tactus_sidecar`, merge across buckets (like
+  `count_verified`), and write once at the tail of `verify_crate_inner` to
+  `lean_verify::sourcemap_path(crate) = {lean_out_root}/{crate}/sourcemap.json`.
+- **schema** (`lean_verify::sourcemap`, serde) — realized form (note `kind` is the
+  serde tag, snake_case; `lean_indent_delta` is NOT emitted yet — see de-risk item 3):
   ```json
-  { "crate": "t",
+  { "crate_name": "test_crate",
     "fns": [
-      { "name": "double_nonneg", "kind": "proof",
-        "lean_file": ".../t/double_nonneg.lean",
-        "rs_tactic_byte_range": [s, e],
-        "lean_tactic_start_line": 433, "lean_tactic_line_count": 2,
-        "lean_indent_delta": 2 },
-      { "name": "use_vec", "kind": "exec",
-        "lean_file": ".../t/use_vec.lean",
-        "span_marks": [ {"lean_line": 470, "rs_loc": "f.rs:25:36", "kind": "LoopInvariant"} ] }
-    ] }
+      { "kind": "proof", "name": "lemma_double_pos",
+        "lean_file": ".../test_crate/lemma_double_pos.lean",
+        "rs_tactic_byte_range": [446, 474],
+        "lean_tactic_start_line": 435, "lean_tactic_line_count": 2 },
+      { "kind": "exec", "name": "add_one",
+        "lean_file": ".../test_crate/add_one.lean",
+        "span_marks": [ { "lean_line": 438, "rs_loc": ".../test.rs:29:5", "kind": "assert" },
+                        { "lean_line": 442, "rs_loc": ".../test.rs:27:13", "kind": "postcondition" } ] } ] }
   ```
-- New code is just: the flag, the emit/run split, and serializing the map.
-  ~95% of the verifier is reused.
+- **Bonus fix the sidecar exposed**: the proof branch fired for *every* query op of
+  a tactic proof fn (Body + recommends-check) — duplicating the sidecar entry AND
+  re-running Lean per query op in normal mode. Gated it on `Body(Style::Normal)`
+  (mirroring the exec branch), so a tactic proof fn is checked/emitted exactly once.
+  Full e2e suite green (480/0), so the normal-mode change regressed nothing.
+
+Remaining for Phase 1: `lean_indent_delta` (de-risk item 3 — column mapping), and
+the extension/bridge that consumes this sidecar.
 
 ### 2. Lean-server bridge (in the extension)
 - Spawn `lean --server` with `LEAN_PATH` = the cached lake-project path — the same
