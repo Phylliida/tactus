@@ -3240,36 +3240,67 @@ fn insert_nat_coercions_in_stm(stm: &Stm, fn_map: &FnMap) -> Stm {
 /// the callee in `fn_map` and wrap each arg that needs `Int.toNat`
 /// coercion in a synthetic `Clip { range: Nat }` node.
 fn rewrite_one_call_for_coercions(e: &Exp, fn_map: &FnMap) -> Exp {
-    let ExpX::Call(callfun, typs, args) = &e.x else { return e.clone() };
-    // Only direct Fun calls (and self-recursion) have a Fun we can look up
-    // in fn_map. InternalFun calls (CheckDecreaseHeight etc.) don't apply.
-    let fun = match callfun {
-        CallFun::Fun(f, _) | CallFun::Recursive(f) => f,
-        CallFun::InternalFun(_) => return e.clone(),
-    };
-    let Some(callee) = fn_map.get(fun) else {
-        // Cross-crate or otherwise unknown callee.
-        return e.clone();
-    };
-    if callee.params.len() != args.len() {
-        // Arity mismatch — bail; the renderer will surface a real
-        // mismatch as a Lean elaboration error if there is one.
-        return e.clone();
-    }
-    let new_args: Vec<Exp> = args.iter().zip(callee.params.iter())
-        .map(|(arg, param)| {
-            if needs_nat_coercion(&arg.typ, &param.x.typ) {
-                wrap_in_nat_clip_exp(arg)
-            } else {
-                arg.clone()
+    match &e.x {
+        ExpX::Call(callfun, typs, args) => {
+            // Only direct Fun calls (and self-recursion) have a Fun we can
+            // look up in fn_map. InternalFun calls (CheckDecreaseHeight etc.)
+            // don't apply.
+            let fun = match callfun {
+                CallFun::Fun(f, _) | CallFun::Recursive(f) => f,
+                CallFun::InternalFun(_) => return e.clone(),
+            };
+            let Some(callee) = fn_map.get(fun) else {
+                // Cross-crate or otherwise unknown callee.
+                return e.clone();
+            };
+            if callee.params.len() != args.len() {
+                // Arity mismatch — bail; the renderer will surface a real
+                // mismatch as a Lean elaboration error if there is one.
+                return e.clone();
             }
-        })
-        .collect();
-    SpannedTyped::new(
-        &e.span,
-        &e.typ,
-        ExpX::Call(callfun.clone(), typs.clone(), Arc::new(new_args)),
-    )
+            let new_args: Vec<Exp> = args.iter().zip(callee.params.iter())
+                .map(|(arg, param)| {
+                    if needs_nat_coercion(&arg.typ, &param.x.typ) {
+                        wrap_in_nat_clip_exp(arg)
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect();
+            SpannedTyped::new(
+                &e.span,
+                &e.typ,
+                ExpX::Call(callfun.clone(), typs.clone(), Arc::new(new_args)),
+            )
+        }
+        // Consistent `as nat` materialization for arithmetic operands.
+        // Verus keeps a nat-typed arith op's `IntRange` (`a * b : nat`)
+        // even when it ELIDES the operands' `uN -> nat` casts (a bare
+        // `x as nat` drops to `x : U(64)`, but the surrounding `Mul` stays
+        // `IntRange Nat`). In Lean `U(_)` renders `Int` and `nat` renders
+        // `Nat` — distinct types — so an Int-rendering operand under a
+        // nat-typed op needs the `Int.toNat` the cast would have produced.
+        // The op's own result type (`e.typ`) IS the operand type for arith
+        // ops, so it's the coercion target. This makes `(x as nat) * pow(…)`
+        // render `Int.toNat x * pow …` uniformly with the compound/call-arg
+        // cases (which Verus already materializes as `Clip{Nat}`). Only
+        // fires for nat-ranged ops (an `IntRange Int`/`U(_)` op no-ops via
+        // `needs_nat_coercion`). See DECISION-cast-rendering.md.
+        ExpX::Binary(op, lhs, rhs) if matches!(op, vir::ast::BinaryOp::Arith(_)) => {
+            let new_lhs = if needs_nat_coercion(&lhs.typ, &e.typ) {
+                wrap_in_nat_clip_exp(lhs)
+            } else {
+                lhs.clone()
+            };
+            let new_rhs = if needs_nat_coercion(&rhs.typ, &e.typ) {
+                wrap_in_nat_clip_exp(rhs)
+            } else {
+                rhs.clone()
+            };
+            SpannedTyped::new(&e.span, &e.typ, ExpX::Binary(op.clone(), new_lhs, new_rhs))
+        }
+        _ => e.clone(),
+    }
 }
 
 /// VIR-AST counterpart of `insert_nat_coercions_in_exp` — applies to
@@ -3284,28 +3315,49 @@ pub fn insert_nat_coercions_in_expr(expr: &Expr, fn_map: &FnMap) -> Expr {
 }
 
 fn rewrite_one_call_for_coercions_expr(e: &Expr, fn_map: &FnMap) -> Expr {
-    let ExprX::Call(target, args, extra) = &e.x else { return e.clone() };
-    let CallTarget::Fun(_, fun, _, _, _, _) = target else { return e.clone() };
-    let Some(callee) = fn_map.get(fun) else {
-        return e.clone();
-    };
-    if callee.params.len() != args.len() {
-        return e.clone();
-    }
-    let new_args: Vec<Expr> = args.iter().zip(callee.params.iter())
-        .map(|(arg, param)| {
-            if needs_nat_coercion(&arg.typ, &param.x.typ) {
-                wrap_in_nat_clip_expr(arg)
-            } else {
-                arg.clone()
+    match &e.x {
+        ExprX::Call(target, args, extra) => {
+            let CallTarget::Fun(_, fun, _, _, _, _) = target else { return e.clone() };
+            let Some(callee) = fn_map.get(fun) else {
+                return e.clone();
+            };
+            if callee.params.len() != args.len() {
+                return e.clone();
             }
-        })
-        .collect();
-    SpannedTyped::new(
-        &e.span,
-        &e.typ,
-        ExprX::Call(target.clone(), Arc::new(new_args), extra.clone()),
-    )
+            let new_args: Vec<Expr> = args.iter().zip(callee.params.iter())
+                .map(|(arg, param)| {
+                    if needs_nat_coercion(&arg.typ, &param.x.typ) {
+                        wrap_in_nat_clip_expr(arg)
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect();
+            SpannedTyped::new(
+                &e.span,
+                &e.typ,
+                ExprX::Call(target.clone(), Arc::new(new_args), extra.clone()),
+            )
+        }
+        // Consistent `as nat` materialization for arithmetic operands —
+        // VIR-AST twin of the SST arm in `rewrite_one_call_for_coercions`.
+        // A nat-typed arith op gets any Int-rendering operand wrapped in
+        // `Clip{Nat}`. See that arm's comment + DECISION-cast-rendering.md.
+        ExprX::Binary(op, lhs, rhs) if matches!(op, vir::ast::BinaryOp::Arith(_)) => {
+            let new_lhs = if needs_nat_coercion(&lhs.typ, &e.typ) {
+                wrap_in_nat_clip_expr(lhs)
+            } else {
+                lhs.clone()
+            };
+            let new_rhs = if needs_nat_coercion(&rhs.typ, &e.typ) {
+                wrap_in_nat_clip_expr(rhs)
+            } else {
+                rhs.clone()
+            };
+            SpannedTyped::new(&e.span, &e.typ, ExprX::Binary(op.clone(), new_lhs, new_rhs))
+        }
+        _ => e.clone(),
+    }
 }
 
 /// True when `arg_typ` renders as Lean `Int` but `param_typ` renders as

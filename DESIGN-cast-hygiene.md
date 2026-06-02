@@ -1,5 +1,16 @@
 # Cast hygiene in Tactus: three options
 
+> **DECIDED 2026-06-02 → see [`DECISION-cast-rendering.md`](DECISION-cast-rendering.md).**
+> This document is the *exploration*; the decision resolves it. In short: **keep
+> `nat → Nat`** — do **not** adopt Option B (`nat → Int`, rejected for `0 ≤ x`
+> bound proliferation + transparency regression) and do **not** auto-extend the
+> closer (Option A's rung, rejected for minimal-automation + it fixes *closing*
+> not *rendering*). The `as nat` *inconsistency* (Friction 2) is instead fixed by
+> rendering `as nat` **consistently** — a nat-typed arith op materializes its
+> Int-rendering operands to `Int.toNat` (a faithful, visible rendering change that
+> keeps `nat → Nat`; LANDED, zero blast radius). The options below remain for
+> context and for the "When to revisit" conditions in the decision doc.
+
 ## Problem
 
 Tactus currently renders Verus integer types as follows:
@@ -320,4 +331,4 @@ Not mutually exclusive in sequence: A as a tactical step, then B or C later if t
 
 ---
 
-*Document written 2026-05-16 as a non-committal design exploration for the Tactus cast-hygiene problem surfaced by tutorial-chapter writing on factorial verification.*
+*Document written 2026-05-16 as a non-committal design exploration for the Tactus cast-hygiene problem surfaced by tutorial-chapter writing on factorial verification. **Resolved 2026-06-02 — see [`DECISION-cast-rendering.md`](DECISION-cast-rendering.md): keep `nat → Nat`; neither B nor an auto closer rung.***
