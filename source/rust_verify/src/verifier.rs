@@ -315,6 +315,10 @@ pub struct Verifier {
     pub count_errors: u64,
     /// Functions that failed to verify
     pub func_fails: HashSet<Fun>,
+    /// Tactus `--emit-lean`: per-fn `.rs`↔`.lean` sidecar entries, accumulated
+    /// across buckets (merged like `count_verified`) and written once to
+    /// `sourcemap.json` at the end of `verify_crate_inner`.
+    pub tactus_sidecar: Vec<lean_verify::SidecarFn>,
     pub args: Args,
     pub user_filter: Option<UserFilter>,
     pub erasure_hints: Option<crate::erase::ErasureHints>,
@@ -458,6 +462,45 @@ fn emit_tactus_diag(
         fancy_note: None,
     });
     reporter.report(&msg.to_any());
+}
+
+/// Report a codegen failure from the `--emit-lean` path (`emit_proof_fn` /
+/// `emit_exec_fn` returned `Err`). Shared by both Tactus branches in
+/// `verify_bucket`. Since `--emit-lean` skips the Lean run, the only failures
+/// here are codegen-side: sanity rejections / unsupported SST shapes
+/// (`Failed`) and write errors (`Error`). `Success` is unreachable (the emit
+/// fns only return it via the `check_*` wrappers).
+fn report_tactus_emit_failure(
+    reporter: &impl Diagnostics,
+    count_errors: &mut u64,
+    cr: lean_verify::CheckResult,
+    fn_name: &Fun,
+    fn_span: &vir::messages::Span,
+) {
+    match cr {
+        lean_verify::CheckResult::Failed { errors, warnings } => {
+            for w in warnings {
+                reporter.report(&message(MessageLevel::Warning, w, fn_span).to_any());
+            }
+            for diag in errors {
+                *count_errors += 1;
+                emit_tactus_diag(reporter, diag, fn_span);
+            }
+        }
+        lean_verify::CheckResult::Error(e) => {
+            *count_errors += 1;
+            let name = vir::ast_util::fun_as_friendly_rust_name(fn_name);
+            reporter.report(
+                &message(
+                    MessageLevel::Error,
+                    format!("Tactus --emit-lean codegen failed for {}: {}", name, e),
+                    fn_span,
+                )
+                .to_any(),
+            );
+        }
+        lean_verify::CheckResult::Success { .. } => {}
+    }
 }
 
 /// Read the verbatim tactic body from the source file using byte range.
@@ -624,6 +667,7 @@ impl Verifier {
             count_verified: 0,
             count_errors: 0,
             func_fails: HashSet::new(),
+            tactus_sidecar: Vec::new(),
             args,
             user_filter: None,
             erasure_hints: None,
@@ -675,6 +719,7 @@ impl Verifier {
             count_verified: 0,
             count_errors: 0,
             func_fails: HashSet::new(),
+            tactus_sidecar: Vec::new(),
             args: self.args.clone(),
             user_filter: self.user_filter.clone(),
             erasure_hints: self.erasure_hints.clone(),
@@ -721,6 +766,7 @@ impl Verifier {
         self.count_errors += other.count_errors;
         self.count_cached += other.count_cached;
         self.func_fails.extend(other.func_fails);
+        self.tactus_sidecar.extend(other.tactus_sidecar);
         self.time_vir += other.time_vir;
         self.time_vir_rust_to_vir += other.time_vir_rust_to_vir;
         self.bucket_stats.extend(other.bucket_stats);
@@ -1737,6 +1783,17 @@ impl Verifier {
 
                         // Tactus: route tactic proof fns to Lean instead of Z3
                         if let Some((ref file_path, start_byte, end_byte)) = function.x.attrs.tactic_span {
+                            // A tactic proof fn is verified by Lean, not Z3, so
+                            // EVERY query op for it bypasses Z3 — but the actual
+                            // Lean check / `--emit-lean` codegen runs exactly
+                            // ONCE, on the primary body query. Recommends-check /
+                            // api-safety / expanded re-runs would otherwise
+                            // redundantly re-invoke Lean (and, under
+                            // `--emit-lean`, emit a duplicate sidecar entry).
+                            // Mirror the exec branch's `Body(Style::Normal)` gate.
+                            if !matches!(query_op, QueryOp::Body(Style::Normal)) {
+                                continue;
+                            }
                             let fn_span = &function.span;
 
                             // Look up the VIR function from the VIR krate
@@ -1791,6 +1848,37 @@ impl Verifier {
                             let crate_name = self.crate_name.as_deref().unwrap_or("crate");
                             let tactic_bodies = tactus_tactic_bodies
                                 .get_or_init(|| build_tactic_bodies_map(vir_krate));
+                            // Tactus `--emit-lean`: codegen the `.lean` + a
+                            // sidecar entry, then SKIP the Lean run (Tactus
+                            // server / infoview path — see SERVER.md).
+                            if self.args.emit_lean {
+                                match lean_verify::emit_proof_fn(
+                                    vir_krate,
+                                    &vir_fn.x,
+                                    tactic_text,
+                                    &vir_fn.x.attrs.lean_imports,
+                                    crate_name,
+                                    &tactic_bodies,
+                                ) {
+                                    Ok(out) => {
+                                        self.count_verified += 1;
+                                        self.tactus_sidecar.push(
+                                            lean_verify::SidecarFn::from_emit(
+                                                &out,
+                                                Some((start_byte, end_byte)),
+                                            ),
+                                        );
+                                    }
+                                    Err(cr) => report_tactus_emit_failure(
+                                        reporter,
+                                        &mut self.count_errors,
+                                        cr,
+                                        &function.x.name,
+                                        fn_span,
+                                    ),
+                                }
+                                continue;
+                            }
                             match lean_verify::check_proof_fn(
                                 vir_krate,
                                 &vir_fn.x,
@@ -1904,6 +1992,36 @@ impl Verifier {
                             let crate_name = self.crate_name.as_deref().unwrap_or("crate");
                             let tactic_bodies = tactus_tactic_bodies
                                 .get_or_init(|| build_tactic_bodies_map(vir_krate));
+                            // Tactus `--emit-lean`: codegen the `.lean` + a
+                            // sidecar entry, then SKIP the Lean run. Exec fns
+                            // carry no single tactic byte range — their `.rs`
+                            // locations live in the per-obligation span marks.
+                            if self.args.emit_lean {
+                                match lean_verify::emit_exec_fn(
+                                    vir_krate,
+                                    &vir_fn.x,
+                                    function,
+                                    check_sst,
+                                    &vir_fn.x.attrs.lean_imports,
+                                    crate_name,
+                                    &tactic_bodies,
+                                ) {
+                                    Ok(out) => {
+                                        self.count_verified += 1;
+                                        self.tactus_sidecar.push(
+                                            lean_verify::SidecarFn::from_emit(&out, None),
+                                        );
+                                    }
+                                    Err(cr) => report_tactus_emit_failure(
+                                        reporter,
+                                        &mut self.count_errors,
+                                        cr,
+                                        &function.x.name,
+                                        fn_span,
+                                    ),
+                                }
+                                continue;
+                            }
                             match lean_verify::check_exec_fn(
                                 vir_krate,
                                 &vir_fn.x,
@@ -3055,6 +3173,34 @@ impl Verifier {
                 pattern specified by one of the quantifier's triggers.)\
                 ";
             reporter.report(&note(&span, msg).to_any());
+        }
+
+        // Tactus `--emit-lean`: write the accumulated `.rs`↔`.lean` sidecar
+        // once, now that every bucket has merged its entries into `self`.
+        if self.args.emit_lean {
+            let crate_name = self.crate_name.clone().unwrap_or_else(|| "crate".to_string());
+            let sidecar = lean_verify::Sidecar {
+                crate_name: crate_name.clone(),
+                fns: std::mem::take(&mut self.tactus_sidecar),
+            };
+            let path = lean_verify::sourcemap_path(&crate_name);
+            match sidecar.write(&path) {
+                Ok(()) => reporter.report_now(
+                    &note_bare(format!(
+                        "tactus: --emit-lean wrote {} ({} fns); Lean run skipped",
+                        path.display(),
+                        sidecar.fns.len(),
+                    ))
+                    .to_any(),
+                ),
+                Err(e) => {
+                    self.count_errors += 1;
+                    reporter.report(
+                        &note_bare(format!("tactus: failed to write --emit-lean sidecar: {}", e))
+                            .to_any(),
+                    );
+                }
+            }
         }
 
         Ok(())

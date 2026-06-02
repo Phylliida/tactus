@@ -11952,3 +11952,32 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// === `--emit-lean`: codegen-only mode for the Tactus server (SERVER.md) ===
+// With `--emit-lean`, both proof fns and `tactus_auto` exec fns go through the
+// `emit_*` codegen path (writing `.lean` + a `sourcemap.json` sidecar) and SKIP
+// the Lean run — so the run "verifies" without ever invoking Lean/Mathlib. This
+// guards that the flag parses, both Tactus branches take the emit path, codegen
+// succeeds for both fn kinds, and the sidecar write succeeds (a write/codegen
+// failure would bump count_errors → Err).
+
+test_verify_one_file_with_options! {
+    #[test] test_emit_lean_codegen_only ["--emit-lean"] => verus_code! {
+        spec fn double(x: nat) -> nat { x + x }
+
+        proof fn lemma_double_pos(x: nat)
+            requires x > 0
+            ensures double(x) > x
+        by {
+            unfold double; omega
+        }
+
+        #[verifier::tactus_auto]
+        fn add_one(x: u32) -> (r: u32)
+            requires x < 100
+            ensures r == x + 1
+        {
+            x + 1
+        }
+    } => Ok(())
+}
