@@ -891,14 +891,29 @@ pub enum CheckResult {
 // ── Entry points ───────────────────────────────────────────────────────
 
 /// Check a tactic proof fn.
-pub fn check_proof_fn(
+/// The codegen-only ("emit") output: the written `.lean` path and its
+/// source map, plus any codegen warnings. Produced by `emit_proof_fn` /
+/// `emit_exec_fn` — the half of `check_*` that stops before running Lean.
+/// `check_*` runs Lean on top of this; the `--emit-lean` path serializes
+/// `source_map` into the sidecar instead of running Lean.
+pub struct EmitOutput {
+    pub file_path: PathBuf,
+    pub source_map: LeanSourceMap,
+    pub warnings: Vec<String>,
+}
+
+/// Codegen-only half of `check_proof_fn`: inline pass → preamble → theorem →
+/// pretty-print → write `.lean` → sanity check. Stops before the Lean run.
+/// `Err(CheckResult)` carries a write error or sanity rejection so callers
+/// surface it uniformly.
+pub fn emit_proof_fn(
     krate: &KrateX,
     proof_fn: &FunctionX,
     tactic_body: &str,
     imports: &[String],
     crate_name: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
-) -> CheckResult {
+) -> Result<EmitOutput, CheckResult> {
     // Layer 7 — inline `#[verifier::inline]` spec fns on the VIR-AST so that
     // proof-fn goals and broadcast-lemma clauses agree with Verus's
     // SST-inlined exec goals. One krate-level pass, before any rendering; the
@@ -954,11 +969,11 @@ pub fn check_proof_fn(
 
     let file_path = lean_file_path(crate_name, &proof_fn.name.path);
     if let Err(e) = write_lean_file(&file_path, &rendered.text) {
-        return CheckResult::Error(e);
+        return Err(CheckResult::Error(e));
     }
 
     if let Err(reason) = debug_check(&cmds) {
-        return CheckResult::Failed {
+        return Err(CheckResult::Failed {
             errors: vec![TactusDiag {
                 message: reason,
                 location: DiagLocation::Unknown,
@@ -966,8 +981,26 @@ pub fn check_proof_fn(
                     vir::tactus_messages::LEAN_FILE_HELP_PREFIX, file_path.display())),
             }],
             warnings: vec![],
-        };
+        });
     }
+
+    Ok(EmitOutput { file_path, source_map, warnings: vec![] })
+}
+
+/// Verify a proof fn: emit its `.lean` (via `emit_proof_fn`), then run Lean.
+pub fn check_proof_fn(
+    krate: &KrateX,
+    proof_fn: &FunctionX,
+    tactic_body: &str,
+    imports: &[String],
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> CheckResult {
+    let EmitOutput { file_path, source_map, .. } =
+        match emit_proof_fn(krate, proof_fn, tactic_body, imports, crate_name, tactic_bodies) {
+            Ok(o) => o,
+            Err(cr) => return cr,
+        };
 
     let dir = project::default_project_dir();
     let lake_dir = if project::project_ready(&dir) { Some(dir.as_path()) } else { None };
@@ -1012,8 +1045,11 @@ pub fn check_proof_fn(
     }
 }
 
-/// Check an exec fn via SST → WP → Lean.
-pub fn check_exec_fn(
+/// Codegen-only half of `check_exec_fn`: inline pass → SST→WP theorems →
+/// preamble → pretty-print → write `.lean` → sanity check. Stops before the
+/// Lean run. `Err(CheckResult)` carries a rejection / write error / sanity
+/// failure (each already carrying any collected warnings).
+pub fn emit_exec_fn(
     krate: &KrateX,
     vir_fn: &FunctionX,
     fn_sst: &FunctionSst,
@@ -1021,7 +1057,7 @@ pub fn check_exec_fn(
     imports: &[String],
     crate_name: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
-) -> CheckResult {
+) -> Result<EmitOutput, CheckResult> {
     // Layer 7 — inline `#[verifier::inline]` spec fns on the VIR-AST so the
     // broadcast-lemma clauses krate_preamble emits agree with Verus's
     // SST-inlined exec goal. The exec goal itself already arrives inlined (via
@@ -1064,7 +1100,7 @@ pub fn check_exec_fn(
 
     let theorems = match sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check, &broadcast_lemmas) {
         Ok(r) => r,
-        Err(reason) => return CheckResult::Failed {
+        Err(reason) => return Err(CheckResult::Failed {
             errors: vec![TactusDiag {
                 message: format!(
                     "tactus_auto rejected this fn: {} \
@@ -1076,7 +1112,7 @@ pub fn check_exec_fn(
                 help: None,
             }],
             warnings,
-        },
+        }),
     };
 
     // Exec fns lower matches to if-chains over `IsVariant` and
@@ -1104,13 +1140,23 @@ pub fn check_exec_fn(
     // error to see what was emitted.
     let rendered = pp_commands(&cmds);
 
+    // Exec fns map errors via `span_marks` populated by the pp's
+    // `SpanMark` walker (#51 source mapping) — Rust source
+    // location for each obligation emitted by `walk_obligations`.
+    // Built here (in the emit half) since it depends only on
+    // `rendered.landmarks`, available before the Lean run.
+    let source_map = LeanSourceMap::ExecFn {
+        fn_name: short_name(&vir_fn.name.path).to_string(),
+        span_marks: rendered.landmarks.span_marks.clone(),
+    };
+
     let file_path = lean_file_path(crate_name, &vir_fn.name.path);
     if let Err(e) = write_lean_file(&file_path, &rendered.text) {
-        return CheckResult::Error(e);
+        return Err(CheckResult::Error(e));
     }
 
     if let Err(reason) = debug_check(&cmds) {
-        return CheckResult::Failed {
+        return Err(CheckResult::Failed {
             errors: vec![TactusDiag {
                 message: reason,
                 location: DiagLocation::Unknown,
@@ -1118,20 +1164,31 @@ pub fn check_exec_fn(
                     vir::tactus_messages::LEAN_FILE_HELP_PREFIX, file_path.display())),
             }],
             warnings,
-        };
+        });
     }
+
+    Ok(EmitOutput { file_path, source_map, warnings })
+}
+
+/// Verify an exec fn: emit its `.lean` (via `emit_exec_fn`), then run Lean.
+pub fn check_exec_fn(
+    krate: &KrateX,
+    vir_fn: &FunctionX,
+    fn_sst: &FunctionSst,
+    check: &FuncCheckSst,
+    imports: &[String],
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> CheckResult {
+    let EmitOutput { file_path, source_map, warnings } =
+        match emit_exec_fn(krate, vir_fn, fn_sst, check, imports, crate_name, tactic_bodies) {
+            Ok(o) => o,
+            Err(cr) => return cr,
+        };
 
     let dir = project::default_project_dir();
     let lake_dir = if project::project_ready(&dir) { Some(dir.as_path()) } else { None };
     let result = lean_process::check_lean_file(&file_path, lake_dir);
-
-    // Exec fns map errors via `span_marks` populated by the pp's
-    // `SpanMark` walker (#51 source mapping) — Rust source
-    // location for each obligation emitted by `walk_obligations`.
-    let source_map = LeanSourceMap::ExecFn {
-        fn_name: short_name(&vir_fn.name.path).to_string(),
-        span_marks: rendered.landmarks.span_marks.clone(),
-    };
 
     match result {
         Ok(r) if r.success => CheckResult::Success { warnings },
