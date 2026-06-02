@@ -56,10 +56,24 @@ Tactus codegen, writes per-fn `.lean` + a sidecar mapping each `.rs` tactic regi
   once. Full e2e 480/0 (incl. new `test_emit_lean_codegen_only`), so the normal-mode change
   regressed nothing. vstd 1530/0. Sidecar inspected; matches SERVER.md's schema.
 
+**Then the end-to-end bridge (SERVER.md components 2+3) — DEMONSTRATED WORKING.**
+`server-spike/goal_at_cursor.py`: given `(sourcemap.json, .rs, line, col)` it finds the
+proof fn whose tactic block contains the cursor, maps the `.rs` line → `.lean` line
+(content-anchored to `lean_tactic_start_line` — the body is copied verbatim line-for-line,
+so a constant per-fn delta), drives `lean --server` (`$/lean/plainGoal`), returns the goal.
+**No rustc at query time.** Demonstrated against a real `--emit-lean` crate: the goal evolves
+line-to-line — cursor on `unfold double` → `⊢ double n > n`; on `have h : n+n>n` → `⊢ n+n>n`
+(the goal *after* unfold) — exactly the infoview experience. Cursors outside a proof tactic
+block fail cleanly. Proof fns only; exec fns (coarser `span_marks`) are a later pass. Enriched
+`test_emit_lean_codegen_only` with a multi-step `chain` proof fn as the goal-changes-per-line
+fixture. So the whole server *core* now works end-to-end — only the editor frontend (VS Code
+extension / `tactus-lsp` re-host) + the precise `lean_indent_delta` column refinement remain.
+
 **Decision shape (Danielle's gate):** de-risk *before* committing to the build; start the
 build with the safe behavior-preserving refactor, verify green at each step, gate the
-user-facing surface. Remaining Phase-1: `lean_indent_delta` (column mapping, de-risk item 3)
-+ the Lean-server bridge / extension that consumes the sidecar.
+user-facing surface; then prove the whole chain with a cheap bridge before the heavier
+editor frontend. Remaining Phase-1: `lean_indent_delta` (column mapping, de-risk item 3) +
+the editor frontend (VS Code extension / `tactus-lsp` binary) that re-hosts the bridge.
 
 #### Earlier 2026-06-02 session (tidy + tooling: tests → `src/tests/`, Tactus-server feasibility)
 
