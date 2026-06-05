@@ -3,6 +3,22 @@
 mod common;
 use common::*;
 
+/// Every test in this file targets the Lean backend, so it needs
+/// `--lean-backend` (Verus then keeps `uN/usize -> nat` casts as
+/// `Clip{Nat}` — see DESIGN § "U → Nat coercion"). The `test_verify_one_file!`
+/// macros call an unqualified `verify_one_file(...)`, which resolves at the
+/// call site (this is why each test file does `use common::*`). Shadowing
+/// it here — once, for the whole file — adds the flag structurally: the
+/// choice is "this file is a Lean suite," not something sniffed from each
+/// test's contents. Other test files keep `common::verify_one_file` (Z3).
+fn verify_one_file(name: &str, code: String, options: &[&str]) -> Result<TestErr, TestErr> {
+    let mut options: Vec<&str> = options.to_vec();
+    if !options.contains(&"--lean-backend") {
+        options.push("--lean-backend");
+    }
+    common::verify_one_file(name, code, &options)
+}
+
 // === Basic: spec fn + proof fn with omega ===
 
 test_verify_one_file! {

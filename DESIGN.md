@@ -1311,7 +1311,7 @@ This **replaced** the prior Tactus-side `insert_nat_coercions_in_{exp,stm,expr}`
 
 **Per-crate wiring (Cargo.toml → cargo-verus).** A crate declares its backend in `Cargo.toml`, the idiomatic Verus way — `[package.metadata.verus] lean-backend = true`. `cargo-verus` reads it (`VerusMetadata.lean_backend` in `cargo-verus/src/metadata.rs`) and forwards `--lean-backend` to that crate's verus invocation, exactly like the existing `no-vstd` / `is-vstd` keys (`subcommands.rs`). vstd's Cargo.toml leaves it false → Z3 path unchanged. This realizes the per-crate invariant directly: the choice lives in the crate manifest, and the build detects it per-package.
 
-The **e2e test snippets** don't go through cargo-verus (the harness invokes verus directly), so they still receive the flag via the test driver: `VERUS_EXTRA_ARGS=--lean-backend vargo test -p rust_verify_test --test tactus`. Making the tactus test harness pass it automatically (without affecting the shared Z3 test files) is a small remaining follow-up.
+The **e2e test snippets** don't go through cargo-verus (the harness invokes verus directly), so the tactus test file gets the flag *structurally*: the `test_verify_one_file!` macros call an unqualified `verify_one_file(...)` resolved at the call site (which is why each test file does `use common::*`), and `tactus.rs` shadows that one function with a one-line wrapper that appends `--lean-backend`. The choice is therefore "this whole file is a Lean suite" — scoped per-file, no per-test annotation, no content-sniffing — and the shared Z3 test files keep `common::verify_one_file` (Z3 default). A plain `vargo test -p rust_verify_test --test tactus` is green with no env var.
 
 **Pattern note.** This is the cleanest member of the "Verus emits an SMT-shaped output Tactus would otherwise normalize" family — and the only one so far that gates away entirely. Siblings: `#127`'s `original_cond` (already solved upstream with a field), `inline_spec` (#122 layer 7 — *replays* Verus's `#[inline]` SST pass rather than undoing one), and the mut-ref normalization (mostly a genuine Lean encoding need + support for Verus's experimental `--new-mut-ref` mode, *not* a gateable artifact — investigated 2026-06-05, not pursued).
 
@@ -5126,14 +5126,11 @@ cargo test -p lean_verify
 
 # End-to-end tests (the tactus suite):
 # - most need Lean 4; a few also need Mathlib (setup-mathlib.sh)
-# `--lean-backend` is required (the gate that keeps `as nat` casts as Clip);
-# supplied here via VERUS_EXTRA_ARGS until the harness passes it automatically.
-VERUS_EXTRA_ARGS="--lean-backend" \
-  PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
+# (tactus.rs shadows `verify_one_file` to pass --lean-backend automatically.)
+PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Run a single test:
-VERUS_EXTRA_ARGS="--lean-backend" \
-  PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus -- test_mathlib_ring
+PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus -- test_mathlib_ring
 
 # vstd verification (1530 functions):
 PATH="../tools/vargo/target/release:$PATH" vargo build --release
