@@ -9036,6 +9036,28 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Inherent impl spec method (`impl Holder { spec fn view }`) referenced in a
+// tactus_auto exec fn's ensures. Pins the inherent-method naming fix: the
+// method is referenceable in a body proof by its type-qualified natural name
+// `Holder.view`, NOT the codegen-internal `impl__0.view`. The visible
+// `proof { simp_all [Holder.view] }` unfolds it (the issue-4 spec-fn pattern,
+// same shape as the trait `caller` above with `Foo.predicate`). No arithmetic
+// on the field, so it closes without the (separate) struct-field-bounds gap.
+test_verify_one_file! {
+    #[test] test_exec_inherent_spec_method_name verus_code! {
+        struct Holder { v: u8 }
+        impl Holder { spec fn view(&self) -> u8 { self.v } }
+
+        #[verifier::tactus_auto]
+        fn get(h: &Holder) -> (r: u8)
+            ensures r == h.view()
+        {
+            proof { simp_all [Holder.view] }
+            h.v
+        }
+    } => Ok(())
+}
+
 // Case A from the class-defaults design discussion (2026-05-12):
 // trait method default body whose ensures references another trait
 // spec method on Self. The setup itself is tricky to construct in
