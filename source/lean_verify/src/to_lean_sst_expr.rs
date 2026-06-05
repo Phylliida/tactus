@@ -454,6 +454,79 @@ fn sst_lean_wrap_count(inner: &Exp, ctx: &crate::expr_shared::RenderCtx) -> usiz
     count_ref_decorations(&lean_typ)
 }
 
+/// Render a trait/class-method call as `Trait.method (arg : Self_typ)` so
+/// Lean infers the instance from the typed value arg — NOT by passing the
+/// `Self` type as a positional argument (the class projection's `Self` is
+/// implicit, so `Foo.predicate Bar self` mis-elaborates: `Bar` lands in
+/// the `Tactus.Ref Self` slot).
+///
+/// Shared by the resolved arm (`Fun(_, Some(_))` = DynamicResolved) and
+/// the unresolved arm (`Fun(_, None)` / `Recursive`) when the callee is a
+/// trait method. The latter is the abstract `<Self as Tr>::m` reference
+/// Verus emits in an *inherited* trait ensures, where `Self` is a
+/// type-param instantiated at the call site; before this was shared, that
+/// path passed `typs` positionally and produced the malformed
+/// `Foo.predicate Bar self`. Routing both through here renders
+/// `Foo.predicate (self : Tactus.Ref Bar)` uniformly.
+fn render_class_method_call(
+    fun: &vir::ast::Fun,
+    typs: &[Typ],
+    args: &[Exp],
+    e_typ: &Typ,
+    ctx: &crate::expr_shared::RenderCtx,
+) -> Result<ExprNode, String> {
+    let head = LExpr::var(crate::lean_name::LeanName::from_path(&fun.path));
+    // Look up the trait method decl's declared param typs (instantiated by
+    // the call's typ_args) so each arg coerces to the wrapper-typed
+    // receiver the class signature expects.
+    let expected_typs = ctx.fn_param_typs(fun, typs);
+    let app_args: Result<Vec<LExpr>, String> = args.iter().enumerate().map(|(i, a)| {
+        let arg = sst_exp_to_ast_checked_with_ctx(a, ctx)?;
+        let arg_coerced = match &expected_typs {
+            Some(ts) if i < ts.len() => crate::expr_shared::coerce_lexpr(arg, &a.typ, &ts[i]),
+            _ => arg,
+        };
+        // TypeAnnot serves Self / type-param inference at the elaborator.
+        // Annotate with the expected param typ (the wrapper-typed form),
+        // unless it still mentions a type-param (then the annotation would
+        // be circular — leave it for unification).
+        let annot_typ = match &expected_typs {
+            Some(ts) if i < ts.len() => ts[i].clone(),
+            _ => a.typ.clone(),
+        };
+        if crate::to_lean_expr::typ_contains_param(&annot_typ) {
+            Ok(arg_coerced)
+        } else {
+            Ok(LExpr::new(ExprNode::TypeAnnot {
+                expr: Box::new(arg_coerced),
+                ty: Box::new(typ_to_expr(&annot_typ)),
+            }))
+        }
+    }).collect();
+    let app = if args.is_empty() { head } else { LExpr::app(head, app_args?) };
+    if crate::to_lean_expr::typ_contains_param(e_typ) {
+        Ok(app.node)
+    } else {
+        Ok(ExprNode::TypeAnnot { expr: Box::new(app), ty: Box::new(typ_to_expr(e_typ)) })
+    }
+}
+
+/// Is `fun` a trait method (decl or impl)? Consulted by the unresolved
+/// call arm to route abstract `<Self as Tr>::m` references through class
+/// dispatch instead of positional type-args. Looks the fn up in the
+/// RenderCtx's fn_map; returns false for cross-crate callees absent from
+/// the map (they fall back to the prior rendering — unchanged behaviour).
+fn fun_is_trait_method(fun: &vir::ast::Fun, ctx: &crate::expr_shared::RenderCtx) -> bool {
+    ctx.fn_map
+        .and_then(|m| m.get(fun))
+        .map(|f| matches!(
+            &f.kind,
+            vir::ast::FunctionKind::TraitMethodDecl { .. }
+                | vir::ast::FunctionKind::TraitMethodImpl { .. }
+        ))
+        .unwrap_or(false)
+}
+
 fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<ExprNode, String> {
     Ok(match &e.x {
         ExpX::Const(c) => const_to_node_checked(c)?,
@@ -761,63 +834,16 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
         // : Int`, not a function). Bug D-remaining pin: vstd's
         // `old(vec)@` shape and any trait-method spec ref inside
         // a `&mut` callee's pre/post.
+        // Trait-method-resolved call (`Some(_)` = DynamicResolved). Render
+        // via class dispatch — see `render_class_method_call`.
         ExpX::Call(CallFun::Fun(fun, Some(_)), typs, args) => {
-            let head = LExpr::var(crate::lean_name::LeanName::from_path(&fun.path));
-            // Wrapper-arch coercion (RenderCtx Option 1 Phase 1):
-            // look up the trait method decl's declared param typs.
-            // The class signature uses wrapper-typed receivers for
-            // `&self` / `&mut self` methods (e.g., `view : Tactus.Ref
-            // Self → Int`), so args arriving at the call site need
-            // to be coerced to match. coerce_lexpr inserts `.mk`
-            // wraps (or `.deref` peels) bridging the local a.typ to
-            // the expected param typ.
-            //
-            // When ctx.fn_param_typs returns None (cross-crate fun, or
-            // ctx is empty), we fall back to no-coerce — same as the
-            // pre-RenderCtx behavior. Tests for the cross-crate path
-            // still work via the existing fallback.
-            let expected_typs = ctx.fn_param_typs(fun, &typs[..]);
-            let app_args: Result<Vec<LExpr>, String> = args.iter().enumerate().map(|(i, a)| {
-                let arg = sst_exp_to_ast_checked_with_ctx(a, ctx)?;
-                // Apply coercion when we have expected typs AND the
-                // index is valid (defensive — should always be
-                // valid given Verus's arity-matched call lowering).
-                let arg_coerced = match &expected_typs {
-                    Some(typs) if i < typs.len() => {
-                        crate::expr_shared::coerce_lexpr(arg, &a.typ, &typs[i])
-                    }
-                    _ => arg,
-                };
-                // TypeAnnot serves Self / type-param inference at
-                // the Lean elaborator level. Annotate with the
-                // expected param typ (not a.typ) so the receiver's
-                // wrapper-typed form matches the class signature.
-                let annot_typ = match &expected_typs {
-                    Some(typs) if i < typs.len() => typs[i].clone(),
-                    _ => a.typ.clone(),
-                };
-                if crate::to_lean_expr::typ_contains_param(&annot_typ) {
-                    Ok(arg_coerced)
-                } else {
-                    Ok(LExpr::new(ExprNode::TypeAnnot {
-                        expr: Box::new(arg_coerced),
-                        ty: Box::new(typ_to_expr(&annot_typ)),
-                    }))
-                }
-            }).collect();
-            let app = if args.is_empty() {
-                head
-            } else {
-                LExpr::app(head, app_args?)
-            };
-            if crate::to_lean_expr::typ_contains_param(&e.typ) {
-                app.node
-            } else {
-                ExprNode::TypeAnnot {
-                    expr: Box::new(app),
-                    ty: Box::new(typ_to_expr(&e.typ)),
-                }
-            }
+            render_class_method_call(fun, &typs[..], args, &e.typ, ctx)?
+        }
+        // Trait method called abstractly (`<Self as Tr>::m` in an inherited
+        // ensures) routes here as `Fun(_, None)` with `Self` a type-param;
+        // render it through class dispatch too, NOT positional type-args.
+        ExpX::Call(CallFun::Fun(fun, None), typs, args) if fun_is_trait_method(fun, ctx) => {
+            render_class_method_call(fun, &typs[..], args, &e.typ, ctx)?
         }
         ExpX::Call(CallFun::Fun(fun, None), typs, args)
         | ExpX::Call(CallFun::Recursive(fun), typs, args) => {

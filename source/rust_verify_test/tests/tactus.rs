@@ -9011,9 +9011,15 @@ test_verify_one_file! {
 
         impl Foo for Bar {
             spec fn predicate(&self) -> bool { self.v > 0 }
+            #[verifier::tactus_auto]
             fn check(&self) -> (r: bool)
                 ensures r ==> self.predicate()
             {
+                // The ensures references the trait spec method `predicate`.
+                // Like `caller` below, unfold it with a visible body proof —
+                // the established, transparent pattern (DESIGN "reveal_with_fuel
+                // and unfold in Tactus"), not a closer change or attribute hack.
+                proof { simp_all [Foo.predicate] }
                 self.v > 0
             }
         }
