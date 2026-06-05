@@ -1025,8 +1025,10 @@ while cond invariant I_1, I_2, ... decreases D { body }
 Per-obligation emission (D, 2026-04-26) generates the following separate Lean theorems:
 
 1. **Init**: one theorem per invariant — `<outer ctx> → I_i` for each `i`. The invariant must hold at loop entry.
-2. **Maintain**: walk `body` in maintain ctx (`∀ mod_vars + bounds + I_1 ∧ ... as hyps + cond as hyp + _tactus_d_old := D` let). The body's `Done(I_1 ∧ ... ∧ I_n ∧ D < d_old)` terminator splits per-conjunct via `emit_done_or_split` — yielding one theorem per invariant (LoopInvariant kind) plus one for the decrease (LoopDecrease kind). User-written assertions inside the body emit their own theorems too.
-3. **Use**: walk `after` in use ctx (`∀ mod_vars + bounds + I_1 ∧ ... as hyps + ¬cond as hyp`). Produces theorems for the post-loop continuation (Postcondition theorems for the fn's ensures, plus any obligations in the post-loop code).
+2. **Maintain**: walk `body` in maintain ctx (`∀ mod_vars + bounds + I_1 → … → I_n as INDIVIDUAL hyps + cond as hyp + _tactus_d_old := D` let). The body's `Done(I_1 ∧ ... ∧ I_n ∧ D < d_old)` terminator splits per-conjunct via `emit_done_or_split` — yielding one theorem per invariant (LoopInvariant kind) plus one for the decrease (LoopDecrease kind). User-written assertions inside the body emit their own theorems too.
+3. **Use**: walk `after` in use ctx (`∀ mod_vars + bounds + I_1 → … → I_n as INDIVIDUAL hyps + ¬cond as hyp`). Produces theorems for the post-loop continuation (Postcondition theorems for the fn's ensures, plus any obligations in the post-loop code).
+
+**Invariant clauses are INDIVIDUAL hypothesis frames, not one glued `∧`** (BUG-ch5-pow-iter Friction 1, fixed 2026-06-02). `walk_loop` pushes one `CtxFrame::Hyp` per `at_entry` invariant into the maintain ctx (and per `at_exit` invariant into the use ctx), so `split_leading_binders` names them as separate binders `_h_ctx_3`, `_h_ctx_4`, … rather than a single `_h_ctx_3 : (P1 ∧ P2 ∧ …)`. This matters for **non-splitting user tactics**: `nlinarith` / `linarith` / `assumption` / `exact` do NOT decompose a conjunction hypothesis, so a fact buried in `(P1 ∧ P2 ∧ …)` was unreachable in `assert(..) by { … }` blocks and `#[verifier::tactus_tactic(..)]` override closers (the canonical case: a recurrence invariant `acc * f(state) == answer` whose bound is needed by an overflow check or a `nlinarith` step). The *default* closer was already fine — core `omega` / `simp_all` DO decompose `∧` hypotheses (verified empirically) — so the split's beneficiaries are user-written closers/asserts. Pre-fix this was one `CtxFrame::Hyp(and_all([…]))`; the per-conjunct SpanMarks already lived inside that `and_all`, so error attribution is unchanged. Pinned by `test_exec_loop_invariant_clauses_split_for_user_tactic` (an `assert(acc <= i) by { intros; assumption }` reading one of three invariant clauses by type — core, no Mathlib, confirmed load-bearing).
 
 Each theorem auto-checked by `tactus_auto`. Failure points the user at `_tactus_loop_invariant_<fn>_at_<loc>_<id>` / `_tactus_loop_decrease_<fn>_at_<loc>_<id>` / `_tactus_postcondition_<fn>_at_<loc>_<id>` etc. with the matching `(loop invariant)` / `(loop decrease)` / `(postcondition)` kind label.
 
@@ -1291,7 +1293,9 @@ recursion pass covers all cross-fn calls in the cycle the same way.
   `T.height` companion fn (see #54 in Tier 2). Int decreases work
   via the transparent-identity `height` for ints.
 
-### U → Nat coercion at Call sites (BUG-as-nat-cast.md, LANDED 2026-05-15)
+### U → Nat coercion (call sites + arith operands) (BUG-as-nat-cast.md + BUG-ch5-pow-iter F2, LANDED 2026-05-15 / 2026-06-02)
+
+> **Cast-rendering policy is recorded in [`DECISION-cast-rendering.md`](DECISION-cast-rendering.md)** (resolving the non-committal `DESIGN-cast-hygiene.md`): keep `nat → Nat`; do **not** render `nat → Int` (Option B — rejected for `0 ≤ x` proliferation + transparency regression); do **not** add an auto cast-folding rung to `tactus_auto` (Option A — minimal-automation, and it fixes *closing* not *rendering*); make `as nat` render **consistently** instead (the arith-operand arm below). This section is the implementation.
 
 Verus's `fn_call_to_vir.rs` cast lowering drops `U(_) → Nat` and `USize → Nat` casts as no-ops. This is sound for Z3 (which treats u_N and `nat` as `Int` with refinements) but unsound for Lean: Tactus renders `u_N` as Lean `Int` and `nat` as Lean `Nat`, so `f(i as nat)` for `i : u64` was lowering to `f i` where `i : Int` — fails Lean's type check.
 
@@ -1311,6 +1315,20 @@ Verus's `fn_call_to_vir.rs` cast lowering drops `U(_) → Nat` and `USize → Na
 **Cross-crate callees** aren't in `fn_map`; they fall through unchanged. This matches existing cross-crate behavior (`build_wp_call`'s `pick_spec_source` rejects cross-crate trait method decls; the same call path also fails the coercion fix). Cross-crate spec fn inlining (#122 Phase 3) would need to extend `fn_map` to cover these.
 
 **Pinned tests**: `test_proof_fn_u64_as_nat_in_ensures` (minimal reproducer from bug doc, VIR-AST path); `test_proof_fn_u_types_as_nat` (u8/u16/u32/u128 all coerce); `test_proof_fn_both_sides_as_nat` (both sides of `==`); `test_exec_assert_u64_as_nat` (SST path via exec assert); `test_exec_loop_invariant_u64_as_nat` (loop invariant via SST visitor).
+
+#### Arith-operand materialization — consistent `as nat` (BUG-ch5-pow-iter Friction 2, LANDED 2026-06-02)
+
+The call-arg pass above closes the *correctness* hole (a `uN` arg into a `nat` param), but it left a *consistency* hole. Verus's `U(_) → Nat` cast-drop is asymmetric: it **elides** the cast on a bare `uN` variable (`result as nat` → `result : U(64)`, since a `u64` value is trivially a nat) but **keeps** it on a *compound* (`(result*b) as nat` → `Clip(Nat, result*b)`, because the inner product is unbounded `Int` in spec mode), and the call-arg pass re-materializes on call args. So the *same* surface `as nat` lands on different sides of the `ℤ`/`ℕ` boundary depending on operand shape — e.g. a loop invariant `(result as nat) * pow(…)` rendered in `ℤ` (`result * ↑(pow …)`) while a structurally-identical assert `(result*b) as nat * pow(…)` rendered in `ℕ`. The two then won't combine with the `ℕ` spec-fn facts a proof naturally produces (Friction 2 of `BUG-ch5-pow-iter-lowering-frictions.md`).
+
+**The signal survives the elision.** A nat-typed arith op keeps its `IntRange` even when its operand's cast is dropped — `--log vir-simple` shows `ArithOp Mul (OverflowBehavior Truncate (IntRange Nat))` over a bare `ReadPlace x : U(64)` operand. So the re-materialization target is right there.
+
+**Fix.** `rewrite_one_call_for_coercions` / `rewrite_one_call_for_coercions_expr` (the SST + VIR-AST leaves of the same pass) gain a `BinaryOp::Arith` arm: for a nat-typed arith op, wrap each operand where `needs_nat_coercion(operand.typ, e.typ)` in `Clip{Nat}`. The op's own result type `e.typ` IS the operand type for arith ops (`Add`/`Sub`/`Mul`/`EuclideanDiv`/`EuclideanMod` share operand=result type), so it's the coercion target — the *same* `needs_nat_coercion` predicate the call-arg arm uses. `(x as nat) * f(…)` now renders `Int.toNat x * f …` uniformly with the compound/call-arg cases; the pow invariant `_h_ctx_5` flips `ℤ → ℕ` (`result.toNat * pow b.toNat e.toNat = pow base.toNat exp.toNat`), so it matches the body asserts' `ℕ` form.
+
+**Why this shape** (vs Options B / A — see the decision doc): it *honors* the written `as nat` instead of dropping it (faithful, and *more* transparent than the elision), it's a rendering choice visible in output (not a closer rung), it keeps `nat → Nat` (no `0 ≤ x` proliferation), and it's sound by construction — `Int.toNat x` with `0 ≤ x` in scope is exactly what `as nat` denotes (same semantics the call-arg arm already relies on). **Zero blast radius**: fires *only* on nat-typed arith ops with Int-rendering operands, which arise only from `as nat`-typed spec arithmetic (an `IntRange Int` / `U(_)`-typed op no-ops via `needs_nat_coercion`). Full e2e suite 482/0, vstd 1530/0 — nothing existing moved.
+
+**Scope (not addressed).** Comparisons and `Eq` are not arith ops and carry no "expected nat operand" signal, so a cast-free `result * b <= pow(…)` (a `ℤ` product compared to a `ℕ` pow, no `as nat`) stays mixed — intentional: the user controls that boundary by writing `(result * b) as nat <= …`, which then materializes consistently. Friction 3 (the `↑e.toNat - 1` vs `e - 1` index noise inside a recursive spec fn's already-materialized body) is a separate normalization, untouched.
+
+**Pinned by** `test_exec_arith_operand_as_nat_materializes`: `(x as nat) * (x as nat) == sq(x as nat)` closes via `simp only [sq]` (core, no Mathlib) only when the LHS materializes to `Int.toNat x * Int.toNat x` to match `sq`'s unfolded `ℕ` body — fails without the change (confirmed by stash-revert).
 
 ### `_tactus_d_old` aliasing across nested loops
 
