@@ -295,32 +295,25 @@ pub fn type_bound_predicate(e: &LExpr, ty: &Typ) -> Option<LExpr> {
         TypX::Int(r) => r,
         _ => return None,
     };
-    match range {
-        IntRange::U(n) => Some(LExpr::and(
+    // Two shapes, parameterized only by the upper bound `hi`:
+    // unsigned `0 ≤ e < hi` (U/USize) and signed `-hi ≤ e < hi` (I/ISize).
+    let unsigned = |hi: LExpr| {
+        Some(LExpr::and(
             LExpr::le(LExpr::lit_int("0"), e.clone()),
-            LExpr::lt(e.clone(), two_pow_lit(*n)),
-        )),
-        IntRange::I(n) => {
-            let hi = two_pow_lit(*n - 1);
-            Some(LExpr::and(
-                LExpr::le(LExpr::neg(hi.clone()), e.clone()),
-                LExpr::lt(e.clone(), hi),
-            ))
-        }
-        IntRange::USize => {
-            let hi = LExpr::var_lit("usize_hi");
-            Some(LExpr::and(
-                LExpr::le(LExpr::lit_int("0"), e.clone()),
-                LExpr::lt(e.clone(), hi),
-            ))
-        }
-        IntRange::ISize => {
-            let hi = LExpr::var_lit("isize_hi");
-            Some(LExpr::and(
-                LExpr::le(LExpr::neg(hi.clone()), e.clone()),
-                LExpr::lt(e.clone(), hi),
-            ))
-        }
+            LExpr::lt(e.clone(), hi),
+        ))
+    };
+    let signed = |hi: LExpr| {
+        Some(LExpr::and(
+            LExpr::le(LExpr::neg(hi.clone()), e.clone()),
+            LExpr::lt(e.clone(), hi),
+        ))
+    };
+    match range {
+        IntRange::U(n) => unsigned(two_pow_lit(*n)),
+        IntRange::USize => unsigned(LExpr::var_lit("usize_hi")),
+        IntRange::I(n) => signed(two_pow_lit(*n - 1)),
+        IntRange::ISize => signed(LExpr::var_lit("isize_hi")),
         // Unicode scalar range: 0 ≤ c ≤ U+10FFFF. `c < 0x110000` covers
         // the upper half; `0 ≤` is free from `Nat`. (Surrogates
         // U+D800..U+DFFF are technically excluded from Unicode scalar
