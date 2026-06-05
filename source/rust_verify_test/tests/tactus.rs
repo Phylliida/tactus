@@ -2814,30 +2814,32 @@ test_verify_one_file! {
     }
 }
 
-// Non-simple LHS assignment used to be silently dropped by `walk`.
-// Now it's rejected upfront by `check_stm` with a clear "not yet
-// supported" error. This uses a struct field assignment, which Verus
-// compiles to `StmX::Assign` with a non-simple `dest`.
+// Field-path LHS assignment (`out.a = …`) lowers to a functional update
+// of the root local — `let out := { out with a := out.b }` (Lean structure
+// update), mutation-as-let-shadowing just like a simple `x = e`. Verus
+// compiles `out.a = …` to `StmX::Assign` with a `Field`-shaped `dest`;
+// `decompose_assign_lvalue` + `build_nested_field_update` handle it.
+// (Previously rejected with a "non-simple LHS not yet supported" error;
+// the rejection is now reserved for genuinely unsupported shapes.)
+//
+// Copy-style (`out.a = out.b`), not arithmetic (`out.a + 1`): a u8 field's
+// `0 ≤ p.a` bound isn't materialized in the goal (only top-level numeric
+// params get a bound hypothesis), so an overflow check on a field read
+// can't close — a separate struct-field-bounds gap, orthogonal to the
+// field-assignment lowering this test pins.
 test_verify_one_file! {
-    #[test] test_exec_field_assign_rejected verus_code! {
+    #[test] test_exec_field_assign verus_code! {
         struct Pair { a: u8, b: u8 }
 
         #[verifier::tactus_auto]
-        fn bump_first(p: Pair) -> (r: Pair)
-            requires p.a < 100
-            ensures r.a == p.a + 1, r.b == p.b
+        fn copy_first(p: Pair) -> (r: Pair)
+            ensures r.a == p.b, r.b == p.b
         {
             let mut out = p;
-            out.a = out.a + 1;  // non-simple LHS — not yet supported
+            out.a = out.b;
             out
         }
-    } => Err(err) => {
-        assert!(
-            err.errors.iter().any(|e|
-                e.message.contains(vir::tactus_messages::ASSIGN_NON_SIMPLE_LHS_TAG)),
-            "expected a non-simple-LHS rejection"
-        );
-    }
+    } => Ok(())
 }
 
 // Proof fn using `u8::MAX` in a precondition. Goes through the VIR-AST
