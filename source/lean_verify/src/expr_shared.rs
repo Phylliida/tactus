@@ -35,7 +35,7 @@ use std::collections::HashMap;
 
 use vir::ast::{
     ArithOp, BinaryOp, BitwiseOp, Constant, Dt, FieldOpr, Fun, FunctionX, Ident,
-    InequalityOp, RealArithOp, Typ, TypDecoration, TypX,
+    InequalityOp, RealArithOp, Typ, TypDecoration, TypX, VarIdent,
 };
 
 use crate::lean_ast::{BinOp as L, Expr as LExpr, ExprNode};
@@ -107,18 +107,40 @@ pub struct RenderCtx<'a> {
     pub fn_map: Option<&'a RenderFnMap<'a>>,
     pub value_subst: Option<&'a RenderValueSubst<'a>>,
     pub value_subst_pre: Option<&'a RenderValueSubst<'a>>,
+    /// In-scope binders' **Lean-level** typs (post-shadow): wrapper-
+    /// decorated for `&`-only params (e.g. `&self` → `&Bar`), stripped
+    /// for body-shadowed `&mut` params. Seeded from the fn's params
+    /// (the `WpCtx::caller_param_typs` map, built identically to the
+    /// Exp path's `binder_ctx_from_params`).
+    ///
+    /// Consulted at Field / IsVariant projection sites so the `.deref`
+    /// count matches the actual Lean wrapper depth of the receiver,
+    /// rather than the SST expression's spanned typ — which Verus may
+    /// have stripped of decorations the Lean binder still carries (the
+    /// `self.v` vs `self.deref.v` case). Mirrors `to_lean_expr`'s
+    /// `BinderCtx` + `lean_level_wrap_count` on the Exp-rendering side.
+    /// `None` outside per-fn body/ensures rendering (falls back to the
+    /// spanned typ — identical to the prior behaviour).
+    pub binder_typs: Option<&'a HashMap<VarIdent, Typ>>,
 }
 
 impl<'a> RenderCtx<'a> {
     /// Empty context — class-method-call rendering falls back to
     /// no-coerce; Var substitution falls through to plain Var.
     pub fn empty() -> Self {
-        Self { fn_map: None, value_subst: None, value_subst_pre: None }
+        Self { fn_map: None, value_subst: None, value_subst_pre: None, binder_typs: None }
     }
 
     /// Context with fn_map for class-method-call rendering.
     pub fn with_fn_map(fn_map: &'a RenderFnMap<'a>) -> Self {
-        Self { fn_map: Some(fn_map), value_subst: None, value_subst_pre: None }
+        Self { fn_map: Some(fn_map), value_subst: None, value_subst_pre: None, binder_typs: None }
+    }
+
+    /// Attach the in-scope binder-typ map (see the `binder_typs` field).
+    /// Builder-style so any constructor above composes with it:
+    /// `RenderCtx::with_fn_map(&m).with_binder_typs(&pars)`.
+    pub fn with_binder_typs(self, binder_typs: &'a HashMap<VarIdent, Typ>) -> Self {
+        Self { binder_typs: Some(binder_typs), ..self }
     }
 
     /// Context with both fn_map and a render-time value substitution
@@ -129,7 +151,7 @@ impl<'a> RenderCtx<'a> {
         fn_map: &'a RenderFnMap<'a>,
         value_subst: &'a RenderValueSubst<'a>,
     ) -> Self {
-        Self { fn_map: Some(fn_map), value_subst: Some(value_subst), value_subst_pre: None }
+        Self { fn_map: Some(fn_map), value_subst: Some(value_subst), value_subst_pre: None, binder_typs: None }
     }
 
     /// Context with fn_map + both post-state and pre-state value
@@ -147,6 +169,7 @@ impl<'a> RenderCtx<'a> {
             fn_map: Some(fn_map),
             value_subst: Some(value_subst),
             value_subst_pre: Some(value_subst_pre),
+            binder_typs: None,
         }
     }
 
@@ -160,6 +183,7 @@ impl<'a> RenderCtx<'a> {
             fn_map: self.fn_map,
             value_subst: self.value_subst_pre,
             value_subst_pre: self.value_subst_pre,
+            binder_typs: self.binder_typs,
         }
     }
 

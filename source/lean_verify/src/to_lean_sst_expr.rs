@@ -426,6 +426,34 @@ fn render_checked_decrease_arg(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> 
     }
 }
 
+/// Lean-level wrapper depth (`Tactus.Ref`/`Box`/`Rc`/`Arc`/`MutRef`
+/// count) of `inner` at a projection site, used to decide how many
+/// `.deref`s precede a Field / IsVariant access. Binder-aware analog of
+/// the Exp path's `lean_level_wrap_count`: when `inner` is a fn-param
+/// Var, the depth comes from the param's **declared Lean typ**
+/// (`ctx.binder_typs`, seeded from `WpCtx::caller_param_typs`), which
+/// preserves the `&self` → `&Bar` wrapper that Verus strips from the SST
+/// expression's spanned typ. For non-var bases — or when no binder map
+/// is in scope (requires rendering, which unwraps via `let x := x.deref`
+/// shadows instead) — it falls back to the spanned typ, identical to the
+/// prior behaviour.
+fn sst_lean_wrap_count(inner: &Exp, ctx: &crate::expr_shared::RenderCtx) -> usize {
+    // The SST wraps a param read in a transparent `Unbox` (and may add
+    // CoerceMode/Trigger) where the Exp path has a bare Var — peel those
+    // to reach the underlying Var before the binder lookup. (These
+    // wrappers emit no Lean code, so the rendered base is just the Var's
+    // binder, whose wrapper depth is what we count.)
+    let peeled = crate::sst_to_lean::peel_transparent(inner);
+    let var_id = match &peeled.x {
+        ExpX::Var(v) | ExpX::VarLoc(v) | ExpX::VarAt(v, _) => Some(v),
+        _ => None,
+    };
+    let lean_typ = var_id
+        .and_then(|v| ctx.binder_typs.and_then(|b| b.get(v)).cloned())
+        .unwrap_or_else(|| inner.typ.clone());
+    count_ref_decorations(&lean_typ)
+}
+
 fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<ExprNode, String> {
     Ok(match &e.x {
         ExpX::Const(c) => const_to_node_checked(c)?,
@@ -491,7 +519,7 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
         // the inner inductive.
         ExpX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
             let inner_rendered = sst_exp_to_ast_checked_with_ctx(inner, ctx)?;
-            let n = count_ref_decorations(&*inner.typ);
+            let n = sst_lean_wrap_count(inner, ctx);
             LExpr::field_proj(apply_deref_chain(inner_rendered, n), field_access_name(field_opr)).node
         }
         // `IsVariant { datatype, variant }` is the desugared form
@@ -504,7 +532,7 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
         // peel wrapper layers before the `.is<Variant>` projection.
         ExpX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => {
             let inner_rendered = sst_exp_to_ast_checked_with_ctx(inner, ctx)?;
-            let n = count_ref_decorations(&*inner.typ);
+            let n = sst_lean_wrap_count(inner, ctx);
             is_variant_node(variant, apply_deref_chain(inner_rendered, n))
         }
         // `HasType(e, t)` — the refinement constraint for `e` to inhabit
