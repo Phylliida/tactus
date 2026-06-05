@@ -1575,6 +1575,10 @@ pub struct FunctionAttrsX {
     /// (via `sst_to_lean` WP generation) instead of Z3. Opt-in for now while
     /// the exec-fn pipeline is incomplete.
     pub tactus_auto: bool,
+    /// Tactus: opt this exec fn OUT of Lean back to Z3, in a `--lean-backend`
+    /// crate that verifies exec fns in Lean by default. The per-fn escape
+    /// hatch (`#[verifier::z3]`).
+    pub tactus_z3: bool,
     /// Tactus: per-fn tactic-closer override. When `Some(tac)`, replaces
     /// `tactus_auto` in generated theorems with the user-supplied Lean
     /// tactic (e.g., `"ring"`, `"nlinarith"`, `"(simp_all; nlinarith)"`).

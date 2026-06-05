@@ -366,6 +366,11 @@ pub(crate) enum Attr {
     LeanImport(String),
     // Tactus: route this exec fn's body through Lean (sst_to_lean + tactus_auto)
     TactusAuto,
+    // Tactus: opt this exec fn OUT of Lean back to Z3, in a crate that
+    // verifies exec fns in Lean by default (`--lean-backend`). The per-fn
+    // escape hatch for fns relying on Z3-only behaviour (spec-fn fuel
+    // auto-unfold, or a construct Tactus doesn't lower yet).
+    TactusZ3,
     // Tactus: per-fn tactic-closer override. Replaces `tactus_auto` in
     // generated theorems with the user-supplied tactic (e.g., "ring",
     // "nlinarith", "(simp_all <;> nlinarith)"). Only meaningful in
@@ -668,6 +673,8 @@ pub(crate) fn parse_attrs(
                 AttrTree::Fun(_, arg, None) if arg == "memoize" => v.push(Attr::Memoize),
                 // Tactus: opt-in to Lean-based exec fn verification
                 AttrTree::Fun(_, arg, None) if arg == "tactus_auto" => v.push(Attr::TactusAuto),
+                // Tactus: opt-out of Lean back to Z3 (under --lean-backend)
+                AttrTree::Fun(_, arg, None) if arg == "z3" => v.push(Attr::TactusZ3),
                 // Tactus: per-fn tactic override. Argument is a string
                 // literal containing a Lean tactic that replaces
                 // `tactus_auto` for this fn's emitted theorems.
@@ -1217,6 +1224,9 @@ pub(crate) struct VerifierAttrs {
     pub(crate) lean_imports: Vec<String>,
     // Tactus: opt-in marker for Lean-based exec fn verification
     pub(crate) tactus_auto: bool,
+    // Tactus: opt-out marker — verify this exec fn with Z3 even in a
+    // `--lean-backend` (Lean-default) crate.
+    pub(crate) tactus_z3: bool,
     // Tactus: per-fn tactic-closer override. When `Some(tac)`, replaces
     // `tactus_auto` in generated theorems with the user-supplied Lean
     // tactic. None = use the default closer.
@@ -1403,6 +1413,7 @@ pub(crate) fn get_verifier_attrs_maybe_check(
         tactic_span: None,
         lean_imports: Vec::new(),
         tactus_auto: false,
+        tactus_z3: false,
         tactus_tactic: None,
         tactus_heartbeats: None,
     };
@@ -1492,6 +1503,7 @@ pub(crate) fn get_verifier_attrs_maybe_check(
             Attr::TacticSpan(start, end) => vs.tactic_span = Some((start, end)),
             Attr::LeanImport(path) => vs.lean_imports.push(path.clone()),
             Attr::TactusAuto => vs.tactus_auto = true,
+            Attr::TactusZ3 => vs.tactus_z3 = true,
             Attr::TactusTactic(tac) => vs.tactus_tactic = Some(tac.clone()),
             Attr::TactusHeartbeats(n) => vs.tactus_heartbeats = Some(n),
             _ => {}
