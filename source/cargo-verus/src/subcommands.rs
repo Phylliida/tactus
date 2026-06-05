@@ -366,6 +366,10 @@ fn make_cargo_command(
                 verus_driver_args_for_package.push("--no-vstd".to_owned());
             }
 
+            if verus_metadata.lean_backend {
+                verus_driver_args_for_package.push("--lean-backend".to_owned());
+            }
+
             if no_verify {
                 verus_driver_args_for_package.push("--no-verify".to_owned());
             }
