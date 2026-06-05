@@ -493,11 +493,15 @@ impl<'a> WpCtx<'a> {
             check_exp(&rewritten)?;
         }
         let fn_map: FnMap = krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
-        // RenderCtx (Option 1 Phase 1) with the fn_map for class-
-        // method-call coercion at trait dispatch sites in the ensures
-        // rendering below. Cross-crate trait method decls aren't in
-        // fn_map and gracefully fall back to no-coerce.
-        let render_ctx = crate::expr_shared::RenderCtx::with_fn_map(&fn_map);
+        // RenderCtx with the fn_map for class-method-call coercion at
+        // trait dispatch sites in the ensures rendering below (cross-crate
+        // trait method decls aren't in fn_map and gracefully fall back to
+        // no-coerce), plus the params' Lean-level typs so a Field access
+        // on a `&self` receiver in the ensures derefs correctly. The
+        // ensures is unshadowed (unlike requires), so it needs the same
+        // binder-aware deref the body does.
+        let render_ctx = crate::expr_shared::RenderCtx::with_fn_map(&fn_map)
+            .with_binder_typs(&caller_param_typs);
         let type_map: HashMap<&VarIdent, &Typ> =
             check.local_decls.iter().map(|d| (&d.ident, &d.typ)).collect();
         let ret_name = check.post_condition.dest.as_ref().map(|v| v.0.as_str());
@@ -562,6 +566,19 @@ impl<'a> WpCtx<'a> {
             caller_param_typs,
             ret_typ,
         })
+    }
+
+    /// The binder-aware `RenderCtx` for rendering THIS fn's body and
+    /// ensures: the `fn_map` (for trait-dispatch receiver coercion) plus
+    /// the params' Lean-level typs (`caller_param_typs`) so Field /
+    /// IsVariant projections deref the receiver to the right depth (the
+    /// `self.v` → `self.deref.v` fix). NOT used for requires rendering,
+    /// which unwraps params via `let x := x.deref` shadows instead — see
+    /// `build_req_binders` — so adding the binder map there would
+    /// double-deref.
+    fn render_ctx(&self) -> crate::expr_shared::RenderCtx<'_> {
+        crate::expr_shared::RenderCtx::with_fn_map(&self.fn_map)
+            .with_binder_typs(&self.caller_param_typs)
     }
 }
 
@@ -1671,7 +1688,7 @@ fn walk_obligations<'a>(
             let asserted_exp = asserted.raw();
             let kind = detect_assert_kind(asserted_exp);
             let loc = format_rust_loc(&asserted_exp.span);
-            let cond_ast = lower_validated(asserted);
+            let cond_ast = lower_validated_with_ctx(asserted, &ctx.render_ctx());
             let goal = LExpr::span_mark(
                 loc.clone(),
                 Some(asserted_exp.span.clone()),
@@ -1691,7 +1708,7 @@ fn walk_obligations<'a>(
         }
         Wp::Assume(p, body) => {
             // No theorem; the assumption just enters the context.
-            let new_obl = obl.with_frame(CtxFrame::Hyp(lower_validated(p)));
+            let new_obl = obl.with_frame(CtxFrame::Hyp(lower_validated_with_ctx(p, &ctx.render_ctx())));
             walk_obligations(body, ctx, &new_obl, e);
         }
         Wp::Hyp { hyp, body } => {
@@ -1842,7 +1859,7 @@ fn walk_obligations<'a>(
                 format_rust_loc(&cond.raw().span),
                 Some(cond.raw().span.clone()),
                 AssertKind::Hypothesis(HypothesisKind::BranchCondition),
-                lower_validated(cond),
+                lower_validated_with_ctx(cond, &ctx.render_ctx()),
             );
             walk_obligations(
                 then_branch, ctx,
@@ -1913,7 +1930,7 @@ fn walk_assert_by_tactus<'a>(
             // `assert(P) by { tac }` — same kind a plain
             // `assert(P)` would get via `detect_assert_kind`.
             let loc = format_rust_loc(&c.raw().span);
-            let cond_ast = lower_validated(&c);
+            let cond_ast = lower_validated_with_ctx(&c, &ctx.render_ctx());
             let goal = LExpr::span_mark(
                 loc.clone(),
                 Some(c.raw().span.clone()),
@@ -3869,7 +3886,7 @@ enum Wp<'a> {
 /// unit tests that pin the bare lifting behaviour.
 #[cfg(test)]
 fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
-    lift_if_value_coerced(e, None, emit_leaf)
+    lift_if_value_coerced(e, None, &crate::expr_shared::RenderCtx::empty(), emit_leaf)
 }
 
 /// `lift_if_value` plus per-leaf return-typ coercion.
@@ -3887,6 +3904,7 @@ fn lift_if_value(e: &Exp, emit_leaf: &dyn Fn(LExpr) -> LExpr) -> LExpr {
 fn lift_if_value_coerced(
     e: &Exp,
     ret_coerce: Option<&Typ>,
+    ctx: &crate::expr_shared::RenderCtx,
     emit_leaf: &dyn Fn(LExpr) -> LExpr,
 ) -> LExpr {
     // `e` was validated upstream: `Return` checks via `check_exp(e)`
@@ -3904,13 +3922,13 @@ fn lift_if_value_coerced(
     let peeled = peel_value_position(e);
     match &peeled.x {
         ExpX::If(cond, then_e, else_e) => {
-            let c = sst_exp_to_ast_checked(cond)
+            let c = sst_exp_to_ast_checked_with_ctx(cond, ctx)
                 .expect("lift_if_value if-cond: sub of validated Exp tree");
             // Both branches are return values → carry `ret_coerce` so
             // each branch leaf coerces with its own typ.
             LExpr::and(
-                LExpr::implies(c.clone(), lift_if_value_coerced(then_e, ret_coerce, emit_leaf)),
-                LExpr::implies(LExpr::not(c), lift_if_value_coerced(else_e, ret_coerce, emit_leaf)),
+                LExpr::implies(c.clone(), lift_if_value_coerced(then_e, ret_coerce, ctx, emit_leaf)),
+                LExpr::implies(LExpr::not(c), lift_if_value_coerced(else_e, ret_coerce, ctx, emit_leaf)),
             )
         }
         // `let y := e_rhs; body` — if any rhs has an if, lift it out,
@@ -3929,7 +3947,7 @@ fn lift_if_value_coerced(
                     let unfolded = unfold_multi_binder_let(
                         &bs[..], body, &peeled.span, &peeled.typ,
                     );
-                    return lift_if_value_coerced(&unfolded, ret_coerce, emit_leaf);
+                    return lift_if_value_coerced(&unfolded, ret_coerce, ctx, emit_leaf);
                 }
             }
             if let Some((name, rhs, inner_body)) = match_single_let_bind(bnd, body) {
@@ -3965,9 +3983,9 @@ fn lift_if_value_coerced(
                 if inner_is_let_chain {
                     // `rhs` is the let-RHS, not the return value → `None`.
                     // `inner_body` IS the return value → carry `ret_coerce`.
-                    lift_if_value_coerced(rhs, None, &|rhs_leaf| {
+                    lift_if_value_coerced(rhs, None, ctx, &|rhs_leaf| {
                         let name = name.clone();
-                        lift_if_value_coerced(inner_body, ret_coerce, &|body_leaf| {
+                        lift_if_value_coerced(inner_body, ret_coerce, ctx, &|body_leaf| {
                             emit_leaf(LExpr::let_bind(name.clone(), rhs_leaf.clone(), body_leaf))
                         })
                     })
@@ -3975,24 +3993,24 @@ fn lift_if_value_coerced(
                     // `inner_body` is the return value (rendered as-is for
                     // the match-shape) → coerce it to the ret typ.
                     let body_ast = coerce_leaf(
-                        sst_exp_to_ast_checked(inner_body)
+                        sst_exp_to_ast_checked_with_ctx(inner_body, ctx)
                             .expect("lift_if_value let-body: sub of validated Exp tree"),
                         &inner_body.typ,
                     );
-                    lift_if_value_coerced(rhs, None, &|rhs_leaf| {
+                    lift_if_value_coerced(rhs, None, ctx, &|rhs_leaf| {
                         emit_leaf(LExpr::let_bind(name.clone(), rhs_leaf, body_ast.clone()))
                     })
                 }
             } else {
                 emit_leaf(coerce_leaf(
-                    sst_exp_to_ast_checked(e)
+                    sst_exp_to_ast_checked_with_ctx(e, ctx)
                         .expect("lift_if_value bind-fallthrough: validated upstream"),
                     &e.typ,
                 ))
             }
         }
         _ => emit_leaf(coerce_leaf(
-            sst_exp_to_ast_checked(e)
+            sst_exp_to_ast_checked_with_ctx(e, ctx)
                 .expect("lift_if_value leaf: validated upstream"),
             &e.typ,
         )),
@@ -4167,7 +4185,7 @@ fn build_wp<'a>(
             // returns, whose branches have distinct typs (see
             // `lift_if_value_coerced` doc + `_return_if_wrapper_value_probe`).
             // Pairs with the structural-binop operand reconciliation.
-            let leaf = lift_if_value_coerced(e, ctx.ret_typ.as_ref(), &|e_ast| match ret_name {
+            let leaf = lift_if_value_coerced(e, ctx.ret_typ.as_ref(), &ctx.render_ctx(), &|e_ast| match ret_name {
                 Some(name) => LExpr::let_bind_synthetic(sanitize(name), e_ast, ensures_goal.clone()),
                 None => ensures_goal.clone(),
             });
