@@ -2267,244 +2267,20 @@ use crate::mut_ref_normalize::{
     rewrite_varat_for_mut_params, RewritePhase,
 };
 
-// ── BorrowMut indirection elimination ────────────────────────────────
-//
-// Verus's new-mut-ref encoding for `bump(&mut y)` emits a synthetic
-// `LocalDeclKind::BorrowMut` local `tmp%` plus an `Assign(y, Var(tmp%))`
-// statement that establishes the forward-forward linkage between the
-// user-local `y` and the synthetic. The `bump(tmp%)` call then mutates
-// `tmp%`; the post-call value reaches `y` through the linkage.
-//
-// This indirection exists for Z3's borrow-tracking model — it doesn't
-// help Lean. We eliminate it by:
-//   1. Detecting the linkage Assigns and recording `tmp% → y`
-//   2. Redirecting the call's mut-arg target from `tmp%` to `y`
-//      directly (so Phase 4 rebinds `y`)
-//   3. Dropping the linkage Assigns from the body (no `let y := tmp%`
-//      frame emitted)
-//
-// After this pre-pass, the SST renders as if the user had written
-// "bump mutates y directly" — which is what they did, semantically.
-// Same pattern as other Tactus-side normalizations (#94 VarAt rewrite,
-// #95 new-mut-ref shape normalization, BUG-as-nat-cast insertion).
-
-/// Disambiguator-aware key derivation for BorrowMut-linkage tracking.
-/// Mirrors `LeanName::from_var_ident`'s convention, so multiple
-/// BorrowMut locals sharing a base name (`tmp%` with `VirTemp(0)` /
-/// `VirTemp(1)` for `bump_both(&mut x, &mut y)`) stay distinct.
-///
-/// Shared between the four sites that need a consistent key:
-/// * The `borrow_mut_only` filter at fn entry (which locals participate
-///   in the indirection)
-/// * `collect_borrow_mut_links`'s key derivation when walking Assigns
-/// * `is_borrow_mut_linkage_assign`'s detection
-/// * `extract_mut_target`'s redirect lookup at the call site
-///
-/// Centralising the derivation here (vs inline `LeanName::from_var_ident(...)
-/// .as_str().to_string()` at each site) makes drift a compile error
-/// rather than a runtime mismatch. The existing `mut_ref_locals`
-/// HashSet uses bare `sanitize(...)` for backwards-compat with sites
-/// that don't need disambiguation; this helper is specifically for the
-/// borrow-mut-links layer where disambiguation is load-bearing
-/// (test_exec_call_two_mut_args_new_mut_ref pinned the collision).
-fn borrow_mut_key(ident: &VarIdent) -> String {
-    crate::lean_name::LeanName::from_var_ident(ident).as_str().to_string()
-}
-
-/// Walk the SST body collecting `Assign(user_local, Var(borrow_mut_local))`
-/// patterns. Returns a map from sanitized borrow-mut name to the user
-/// local's `VarIdent`.
-///
-/// Detection rule: the assignment's destination is a simple `Var` /
-/// `VarLoc` whose name is NOT in `borrow_mut_locals`, and the RHS
-/// peels (through transparent wrappers) to a `Var` / `VarLoc` whose
-/// name IS in `borrow_mut_locals`. Direct linkage — no SMT-specific
-/// shape recognition needed.
-/// Pre-pass output for BorrowMut elimination. `links` maps each
-/// BorrowMut-local key (LeanName-style, disambiguator-aware) to the
-/// user-local VarIdent it bridges. `aliases` maps SSA-renamed
-/// BorrowMut keys to their original BorrowMut key, so a call site's
-/// `Var(tmp__3)` (a renamed SSA version of `tmp__1`) can resolve to
-/// the same user_local that `tmp__1` links to.
-///
-/// After `collect_borrow_mut_links`, `resolve_borrow_mut_aliases`
-/// folds aliases into `links` so every BorrowMut local (including
-/// SSA-renamed versions) maps directly to its user-local.
-fn collect_borrow_mut_links(
-    stm: &Stm,
-    borrow_mut_locals: &HashSet<String>,
-    links: &mut HashMap<String, VarIdent>,
-    aliases: &mut HashMap<String, String>,
-) {
-    match &stm.x {
-        StmX::Assign { lhs: Dest { dest, is_init: _ }, rhs } => {
-            let Some(dest_var) = extract_simple_var_ident(dest) else { return };
-            let dest_key = borrow_mut_key(dest_var);
-            let rhs_peeled = peel_transparent(rhs);
-            let rhs_var = match &rhs_peeled.x {
-                ExpX::Var(v) | ExpX::VarLoc(v) => v,
-                _ => return,
-            };
-            let rhs_key = borrow_mut_key(rhs_var);
-            let dest_is_bm = borrow_mut_locals.contains(&dest_key);
-            let rhs_is_bm = borrow_mut_locals.contains(&rhs_key);
-            match (dest_is_bm, rhs_is_bm) {
-                // Linkage: Assign(user_local, Var(borrow_mut)) —
-                // the forward-forward.
-                //
-                // Invariant: at most one user-local per BorrowMut
-                // local. Verus's encoding emits one such linkage per
-                // `&mut <local>` call site. A duplicate would mean
-                // Verus aliased the same BorrowMut to two user-locals,
-                // which would be a Verus-side invariant violation
-                // (the post-state existential can only update one
-                // user-local). Debug-assert defensively — release
-                // builds use the second linkage silently rather than
-                // crashing, matching the conservative behaviour of
-                // other Tactus normalization passes.
-                (false, true) => {
-                    if let Some(prior) = links.get(&rhs_key) {
-                        debug_assert_eq!(
-                            prior, dest_var,
-                            "multiple user-locals linked to BorrowMut {:?}: \
-                             prior={:?} new={:?} — Verus encoding-shape \
-                             change worth investigating",
-                            rhs_key, prior, dest_var,
-                        );
-                    }
-                    links.insert(rhs_key, dest_var.clone());
-                }
-                // SSA rename: Assign(borrow_mut_X, Var(borrow_mut_Y))
-                // — both are BorrowMut locals (or sanitized versions
-                // of the same). After SSA propagation, X and Y resolve
-                // to the same user-local.
-                (true, true) => {
-                    aliases.insert(dest_key, rhs_key);
-                }
-                _ => {}
-            }
-        }
-        StmX::Block(stmts) => {
-            for s in stmts.iter() {
-                collect_borrow_mut_links(s, borrow_mut_locals, links, aliases);
-            }
-        }
-        StmX::If(_, then_branch, else_branch) => {
-            collect_borrow_mut_links(then_branch, borrow_mut_locals, links, aliases);
-            if let Some(e) = else_branch {
-                collect_borrow_mut_links(e, borrow_mut_locals, links, aliases);
-            }
-        }
-        StmX::Loop { body, .. } => {
-            collect_borrow_mut_links(body, borrow_mut_locals, links, aliases);
-        }
-        StmX::DeadEnd(s) | StmX::OpenInvariant(s) => {
-            collect_borrow_mut_links(s, borrow_mut_locals, links, aliases);
-        }
-        StmX::AssertQuery { body, .. } => {
-            collect_borrow_mut_links(body, borrow_mut_locals, links, aliases);
-        }
-        StmX::ClosureInner { body, .. } => {
-            collect_borrow_mut_links(body, borrow_mut_locals, links, aliases);
-        }
-        // Leaf statements — no nested `Stm` to walk into. We
-        // enumerate explicitly (no `_ =>` catch-all) so any
-        // upstream addition of a Stm variant containing nested
-        // statements becomes a compile error here. Mirrors DESIGN.md's
-        // "Upstream-robustness patterns" — the compile-time defence
-        // that prevents silent miscompilation when Verus evolves.
-        //
-        // `StmX::Call` carries Exps (`args`) which CAN contain
-        // BorrowMut refs at the value level, but linkage assigns are
-        // statement-level, so the call's args don't carry them.
-        // Similarly for AssertBitVector's `requires`/`ensures` Exps,
-        // Assert/AssertCompute's Exp, and Assume's Exp.
-        StmX::Call { .. }
-        | StmX::Assert(_, _, _)
-        | StmX::AssertBitVector { .. }
-        | StmX::AssertCompute(_, _, _)
-        | StmX::Assume(_)
-        | StmX::Fuel(_, _)
-        | StmX::RevealString(_)
-        | StmX::Return { .. }
-        | StmX::BreakOrContinue { .. }
-        | StmX::Air(_) => {}
-    }
-}
-
-/// Fold SSA aliases into the linkage map. For each `alias_X → Y`
-/// alias, resolve Y's user-local (possibly through more aliases) and
-/// extend `links` so `alias_X` also maps to that user-local.
-///
-/// Bounded by `aliases.len()` rounds — each round either resolves at
-/// least one alias or no progress is made (then we stop). Simple
-/// fixed-point.
-fn resolve_borrow_mut_aliases(
-    links: &mut HashMap<String, VarIdent>,
-    aliases: &HashMap<String, String>,
-) {
-    for (alias_key, original_key) in aliases.iter() {
-        // Follow the alias chain to find the original BorrowMut local
-        // that has a direct linkage entry.
-        let mut cursor = original_key;
-        // Bounded by aliases.len() to avoid infinite loops on
-        // hypothetical cycles (shouldn't happen in well-formed SSA).
-        for _ in 0..=aliases.len() {
-            if links.contains_key(cursor) {
-                let user_local = links[cursor].clone();
-                links.insert(alias_key.clone(), user_local);
-                break;
-            }
-            match aliases.get(cursor) {
-                Some(next) => cursor = next,
-                None => break,
-            }
-        }
-    }
-}
+// The BorrowMut indirection-elimination pass lives in
+// `crate::mut_ref_normalize` (sibling to the mut-ref rewrite).
+// Re-export its entry points so this module's call sites + the
+// unit tests (`use super::*`) keep working.
+pub(crate) use crate::mut_ref_normalize::{
+    borrow_mut_key, collect_borrow_mut_links, is_borrow_mut_linkage_assign,
+    resolve_borrow_mut_aliases,
+};
 
 // Cross-crate broadcast-lemma collection lives in
 // `crate::broadcast_collect`; re-export the entry point so
 // `crate::sst_to_lean::collect_broadcast_lemma_funs` (used by `generate`)
 // stays stable.
 pub use crate::broadcast_collect::collect_broadcast_lemma_funs;
-
-/// Is this Assign the linkage between a user local and a BorrowMut
-/// local? If so, the build_wp handler drops it (no Let frame emitted)
-/// — the rebind happens at the matching call's Phase 4 instead.
-///
-/// Mirrors `collect_borrow_mut_links`'s detection rule. Both sites
-/// must agree on what constitutes a linkage Assign, or the body would
-/// produce a let frame AND Phase 4 would rebind the same user_local
-/// (double substitution).
-fn is_borrow_mut_linkage_assign(
-    dest: &Exp,
-    rhs: &Exp,
-    borrow_mut_links: &HashMap<String, VarIdent>,
-) -> bool {
-    let Some(dest_var) = extract_simple_var_ident(dest) else { return false };
-    let rhs_peeled = peel_transparent(rhs);
-    let rhs_var = match &rhs_peeled.x {
-        ExpX::Var(v) | ExpX::VarLoc(v) => v,
-        _ => return false,
-    };
-    let dest_key = borrow_mut_key(dest_var);
-    let rhs_key = borrow_mut_key(rhs_var);
-    let dest_is_bm = borrow_mut_links.contains_key(&dest_key);
-    let rhs_is_bm = borrow_mut_links.contains_key(&rhs_key);
-    // Only drop the forward-forward linkage: `Assign(user_local,
-    // Var(borrow_mut))` — dest is a non-BM user-local, rhs is a BM
-    // local. Phase 4 of the matching call rebinds the user-local
-    // directly to the post-state existential. Dropping the body's
-    // let here avoids the let frame capturing the pre-call value
-    // of the BorrowMut local.
-    //
-    // SSA renames `Assign(borrow_mut_X, Var(borrow_mut_Y))` stay —
-    // the SSA-renamed local IS referenced in the inlined ensures
-    // hypothesis (as the pre-state value of the call arg), so we
-    // need the binding to be present at theorem level.
-    rhs_is_bm && !dest_is_bm
-}
 
 // The nat-coercion insertion pass lives in `crate::nat_coercion`.
 // Re-export the entry points so existing call paths stay stable
@@ -3093,100 +2869,8 @@ fn emit_call_precondition_theorem(
     e.emit_split(theorem_name, requires_clause, obl);
 }
 
-/// Peel `SpanMark` wrappers, returning the innermost non-SpanMark
-/// expression. Used by the ret-substitution machinery (#128) and the
-/// And-tree walker — SpanMark is a Lean-level no-op (just emits a
-/// `/- @rust:LOC -/` comment) so structural pattern matching should
-/// look through it.
-fn peel_span_marks(e: &LExpr) -> &LExpr {
-    let mut cur = e;
-    while let ExprNode::SpanMark { inner, .. } = &cur.node {
-        cur = inner;
-    }
-    cur
-}
-
-/// Flatten the *top-level* `And`-tree of `e` into its leaf conjuncts.
-///
-/// Recurses through `BinOp::And` only — does NOT descend into `Or`,
-/// `Implies`, `Forall`, `Exists`, `If`, `Let`, `Match`, etc. The
-/// "top-level" notion is what matters for ret-substitution (#128):
-/// a clause `r == E` buried inside `Or(Q, r == E)` is NOT
-/// uniquely-determining, so we don't want to find it. SpanMark
-/// wrappers are peeled at every node since they're transparent at
-/// the Lean level.
-fn collect_top_and_conjuncts<'a>(e: &'a LExpr, out: &mut Vec<&'a LExpr>) {
-    use crate::lean_ast::BinOp;
-    let peeled = peel_span_marks(e);
-    if let ExprNode::BinOp { op: BinOp::And, lhs, rhs } = &peeled.node {
-        collect_top_and_conjuncts(lhs, out);
-        collect_top_and_conjuncts(rhs, out);
-    } else {
-        out.push(e);
-    }
-}
-
-/// Try to find a top-level conjunct of the form `Eq(Var(target), E)`
-/// or `Eq(E, Var(target))` in `conj`. Returns `Some((E, rest))`
-/// where `rest` is the And of all OTHER conjuncts (or `LitBool(true)`
-/// if the eq clause was the only one). Returns `None` if no matching
-/// conjunct exists, or if `E` mentions `target` (self-referential).
-///
-/// The conservative scope (#128): only top-level `And`-tree, never
-/// descending into `Or` / `Implies` / `Forall` / `Exists` / `If` /
-/// `Let` / `Match`. A clause buried inside a disjunction does NOT
-/// uniquely determine `target`, so we don't substitute.
-///
-/// SpanMark is peeled transparently. The matched eq picks the FIRST
-/// conjunct in source order — for trait-method-impl callees (#86),
-/// where the conjunction is `(spec_ensures) ∧ (impl_ensures)`,
-/// `push_post_call_frames` orders spec first then impl. If both
-/// have a `r == E` clause, we pick the spec's; the impl's becomes
-/// part of `rest` and substitutes to `E_impl == E_spec` which Verus
-/// guarantees is consistent (impl ⇒ trait).
-fn extract_top_level_eq_for(
-    conj: &LExpr,
-    target: &crate::lean_name::LeanName,
-) -> Option<(LExpr, LExpr)> {
-    use crate::lean_ast::BinOp;
-    let mut conjuncts: Vec<&LExpr> = Vec::new();
-    collect_top_and_conjuncts(conj, &mut conjuncts);
-
-    for (idx, c) in conjuncts.iter().enumerate() {
-        let peeled = peel_span_marks(c);
-        let ExprNode::BinOp { op: BinOp::Eq, lhs, rhs } = &peeled.node else {
-            continue;
-        };
-        let lhs_p = peel_span_marks(lhs);
-        let rhs_p = peel_span_marks(rhs);
-        let e: Option<&LExpr> = match (&lhs_p.node, &rhs_p.node) {
-            (ExprNode::Var(n), _) if n.as_str() == target.as_str() => Some(rhs_p),
-            (_, ExprNode::Var(n)) if n.as_str() == target.as_str() => Some(lhs_p),
-            _ => None,
-        };
-        let Some(e) = e else { continue };
-        // Reject self-referential `r == E` where E mentions r —
-        // substituting `r → E` in such patterns would loop. Uses
-        // the shared `lean_ast::mentions_free_var` (which tracks
-        // binder scope correctly) rather than a sst_to_lean-local
-        // walk.
-        if crate::lean_ast::mentions_free_var(e, target.as_str()) {
-            continue;
-        }
-        let rest: Vec<LExpr> = conjuncts.iter().enumerate()
-            .filter(|(i, _)| *i != idx)
-            .map(|(_, c)| (*c).clone())
-            .collect();
-        return Some((e.clone(), and_all(rest)));
-    }
-    None
-}
-
-/// Is `e` syntactically `LitBool(true)` (after peeling SpanMark)?
-/// Used to skip emitting `True →` Hyp frames.
-fn is_trivial_true(e: &LExpr) -> bool {
-    matches!(peel_span_marks(e).node, ExprNode::LitBool(true))
-}
+// Ret-substitution detection (#128) lives in `crate::ret_subst`.
+use crate::ret_subst::{extract_top_level_eq_for, is_trivial_true};
 
 /// Push the post-call frames onto the obligation context. Reading
 /// the resulting goal top-down:
@@ -5790,7 +5474,7 @@ fn count_breaks_targeting_this_loop(body: &Stm, this_loop_label: Option<&str>) -
     walk(body, this_loop_label, false)
 }
 
-fn extract_simple_var_ident<'a>(e: &'a Exp) -> Option<&'a VarIdent> {
+pub(crate) fn extract_simple_var_ident<'a>(e: &'a Exp) -> Option<&'a VarIdent> {
     match &e.x {
         ExpX::Var(ident) | ExpX::VarLoc(ident) => Some(ident),
         ExpX::Loc(inner) => extract_simple_var_ident(inner),
