@@ -1194,14 +1194,17 @@ fn contains_closure_internal_fn(e: &Exp) -> bool {
     found
 }
 
-/// Format a `Span` for a user-facing diagnostic. Prefers the
-/// pre-resolved `start_loc` (populated by `rust_verify`'s
-/// `to_air_span`); falls back to `as_string` for synthetic spans.
-/// Same logic as the internal `format_rust_loc` but exposed for
-/// `generate.rs`'s warning emission path.
-pub fn format_span_loc(span: &Span) -> String {
-    format_rust_loc(span)
-}
+// Obligation naming/classification helpers live in
+// `crate::obligation_naming`. Re-export the pub entry points used by
+// other modules (format_span_loc by generate, kind_to_name by
+// sourcemap) and import the rest for this module's walkers.
+pub use crate::obligation_naming::{format_span_loc, kind_to_name};
+// `sanitize_loc_for_name` is exercised only by the unit tests (internal
+// code calls `build_theorem_name`, which wraps it); re-export it, gated
+// on test builds, so the tests reach it via `use super::*`.
+#[cfg(test)]
+pub(crate) use crate::obligation_naming::sanitize_loc_for_name;
+use crate::obligation_naming::{build_theorem_name, detect_assert_kind, format_rust_loc};
 
 /// One frame of accumulated context as the obligation walker descends
 /// into a Wp tree. Pushed at scope-introducing points (let bindings,
@@ -1645,56 +1648,6 @@ impl ObligationEmitter {
     }
 }
 
-/// Snake-case name fragment for an `AssertKind`, used in theorem
-/// naming (and as the `kind` string in the `--emit-lean` sidecar's
-/// exec span marks). The visible per-error label still goes through
-/// [`AssertKind::label`] — the fragment here is only for unique
-/// identifiers in generated Lean.
-pub fn kind_to_name(k: AssertKind) -> &'static str {
-    match k {
-        AssertKind::Obligation(ObligationKind::Plain) => "assert",
-        AssertKind::Obligation(ObligationKind::Postcondition) => "postcondition",
-        AssertKind::Obligation(ObligationKind::LoopInvariant) => "loop_invariant",
-        AssertKind::Obligation(ObligationKind::LoopDecrease) => "loop_decrease",
-        AssertKind::Hypothesis(HypothesisKind::LoopCondition) => "loop_condition",
-        AssertKind::Hypothesis(HypothesisKind::BranchCondition) => "branch_condition",
-        AssertKind::Obligation(ObligationKind::CallPrecondition) => "precondition",
-        AssertKind::Obligation(ObligationKind::Termination) => "termination",
-    }
-}
-
-/// Compress a Rust source location like
-/// `"/home/me/project/src/main.rs:42:13"` into a short fragment for
-/// theorem naming: drop the directory path and any extension, then
-/// sanitize remaining non-identifier chars to `_`. The above example
-/// becomes `"main_42_13"`. Result is appended to
-/// `_tactus_<kind>_<fn>_at_<loc>_<id>`; we want it short enough that
-/// a fn with many obligations doesn't produce kilobyte-long
-/// theorem names. The structured `path:line:col` still goes into
-/// `SpanMark` for error messages — this fragment is purely cosmetic.
-fn sanitize_loc_for_name(loc: &str) -> String {
-    // Strip everything before the last `/` (directory) and the
-    // first `.` of the basename (extension).
-    let after_slash = loc.rsplit('/').next().unwrap_or(loc);
-    let mut basename = after_slash.to_string();
-    if let Some(dot) = basename.find('.') {
-        // Replace the extension with the rest (line/col), turning
-        // "main.rs:42:13" into "main:42:13" (extension dropped) —
-        // the `.rs` bit is noise we don't need in identifiers.
-        let after_dot = &basename[dot + 1..];
-        // After the dot, find where the extension ends (next non-
-        // alphanumeric char). Anything from there onward is line/col.
-        let ext_end = after_dot
-            .find(|c: char| !c.is_ascii_alphanumeric())
-            .unwrap_or(after_dot.len());
-        let suffix = &after_dot[ext_end..];
-        basename = format!("{}{}", &basename[..dot], suffix);
-    }
-    basename.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
-        .collect()
-}
-
 /// Walk a `Wp` tree, emitting one Lean theorem per obligation. See
 /// the doc on [`exec_fn_theorems_to_ast`] for the staging plan and
 /// the per-Wp-variant behaviour.
@@ -2067,19 +2020,6 @@ fn emit_leaf_theorem(
     let id = e.next_id();
     let name = build_theorem_name(kind_label, &e.fn_name, loc, id);
     e.emit_split(name, leaf.clone(), obl);
-}
-
-/// Construct a per-obligation theorem name. Drops the `_at_<loc>`
-/// suffix when `loc` is empty (synthetic / unmapped spans) so we
-/// don't produce double-underscore names like
-/// `_tactus_assert_<fn>_at__7`.
-fn build_theorem_name(kind_label: &str, fn_name: &str, loc: &str, id: usize) -> String {
-    if loc.is_empty() {
-        format!("_tactus_{}_{}_{}", kind_label, fn_name, id)
-    } else {
-        let suffix = sanitize_loc_for_name(loc);
-        format!("_tactus_{}_{}_at_{}_{}", kind_label, fn_name, suffix, id)
-    }
 }
 
 /// Per-obligation walker for `Wp::Loop`. Splits the loop's
@@ -3918,45 +3858,6 @@ enum Wp<'a> {
 }
 
 // ── Walker helpers ─────────────────────────────────────────────────────
-
-/// Read the pre-resolved start `file:line:col` from a Verus
-/// `Span` for `/- @rust:LOC -/` markers in the generated Lean
-/// (#51).
-///
-/// `Span::start_loc` is populated by
-/// `rust_verify::spans::to_air_span` at SST construction time.
-/// Spans built without rustc context (test fixtures, the
-/// `err_air_span` diagnostic helper, the verifier's "no
-/// location" placeholder) leave `start_loc` empty; we fall back
-/// to `as_string` so something useful surfaces rather than an
-/// empty marker.
-fn format_rust_loc(span: &Span) -> String {
-    if !span.start_loc.is_empty() {
-        span.start_loc.clone()
-    } else {
-        span.as_string.clone()
-    }
-}
-
-/// Classify an assertion expression for error-message labeling.
-/// `Wp::Assert` is the catch-all for obligations Verus inserts —
-/// most are user `assert(P)` (kind=Plain), but the recursion
-/// pass inserts `CheckDecreaseHeight` calls via `Wp::Assert`
-/// which we recognize as Termination obligations. Other
-/// non-Plain kinds (LoopInvariant / CallPrecondition / etc.) are
-/// set explicitly at their wrapping sites in `walk_loop` /
-/// `walk_call`.
-fn detect_assert_kind(e: &Exp) -> AssertKind {
-    // Peel transparent wrappers (Box / Unbox / CoerceMode /
-    // Trigger / Loc) — Verus may wrap the CheckDecreaseHeight
-    // call in any of these before inserting it as an Assert.
-    let peeled = peel_transparent(e);
-    if let ExpX::Call(CallFun::InternalFun(InternalFun::CheckDecreaseHeight), _, _) = &peeled.x {
-        AssertKind::Obligation(ObligationKind::Termination)
-    } else {
-        AssertKind::Obligation(ObligationKind::Plain)
-    }
-}
 
 /// Lift `ExpX::If` expressions from value-position to goal-level.
 ///

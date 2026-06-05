@@ -12,6 +12,7 @@ pub mod lean_process;
 pub mod mut_ref_normalize;
 pub mod nat_coercion;
 pub mod nonempty;
+pub mod obligation_naming;
 pub mod prelude;
 pub mod project;
 pub mod ret_subst;
