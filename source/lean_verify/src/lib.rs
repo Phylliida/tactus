@@ -1,3 +1,4 @@
+pub mod broadcast_collect;
 pub mod call_inlining;
 pub mod dep_order;
 pub mod expr_shared;
@@ -8,6 +9,7 @@ pub mod lean_ast;
 pub mod lean_name;
 pub mod lean_pp;
 pub mod lean_process;
+pub mod nat_coercion;
 pub mod nonempty;
 pub mod prelude;
 pub mod project;
