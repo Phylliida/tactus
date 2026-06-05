@@ -1315,6 +1315,19 @@ The **e2e test snippets** don't go through cargo-verus (the harness invokes veru
 
 **Pattern note.** This is the cleanest member of the "Verus emits an SMT-shaped output Tactus would otherwise normalize" family — and the only one so far that gates away entirely. Siblings: `#127`'s `original_cond` (already solved upstream with a field), `inline_spec` (#122 layer 7 — *replays* Verus's `#[inline]` SST pass rather than undoing one), and the mut-ref normalization (mostly a genuine Lean encoding need + support for Verus's experimental `--new-mut-ref` mode, *not* a gateable artifact — investigated 2026-06-05, not pursued).
 
+### Exec-fn routing: Lean-default under `--lean-backend` (the inversion)
+
+`--lean-backend` controls **which verifier processes a crate's exec fns**, not just the cast gate. The routing (`verifier.rs`, on the `Body(Normal)` query):
+
+- **`--lean-backend` crate → Lean by default.** Every exec fn's body obligation routes through `sst_to_lean` WP generation. A fn opts back out to Z3 with **`#[verifier::z3]`** — the per-fn escape hatch for fns relying on Z3-only behaviour (spec-fn fuel auto-unfold, or a construct Tactus doesn't lower yet). Pinned by `test_exec_z3_opt_out`.
+- **non-`--lean-backend` crate → Z3 by default,** with `#[verifier::tactus_auto]` as the legacy per-fn opt-IN to Lean (mixed / pre-inversion crates).
+
+This **inverted** the original polarity (per-fn `tactus_auto` opt-in → per-crate Lean-default + opt-out), landed 2026-06-05 once the full tactus suite verified every exec fn in Lean. The trigger was a route-all probe surfacing the last gaps — all real bugs, now fixed: `Self%` type-param sanitization, binder-aware receiver deref (`self.v`→`self.deref.v`), abstract trait-method class dispatch (`Foo.predicate (self : …)`, not `Foo.predicate Bar self`), field-path assignment lowering (`x.f = e` → `let x := { x with f := e }`), inherent-method naming (`impl__0.view`→`Holder.view`, naturalized from the receiver's Self type), and struct-field bounds (`0 ≤ h.v < 256` for a `u8` *field*, via `type_bound_predicate`'s datatype recursion).
+
+**`tactus_auto`'s residual role.** Under `--lean-backend` it's redundant for routing, but it remains the **FileLoader's marker** for which fns' `proof { … }` / `assert(..) by { … }` blocks hold raw Lean tactic text to sanitize (tree-sitter at file-load, before flags are known — see "Attribute-vs-function-item parse disambiguation"). So a Lean-routed fn that carries a Lean-tactic body proof still needs `#[verifier::tactus_auto]` today. Fully retiring `tactus_auto` needs the FileLoader to detect lean-backend (a crate-level marker or env signal) — a follow-up.
+
+**Spec-method unfolds stay explicit.** A Lean-routed exec fn whose req/ensures reference a spec method needs a *visible* body proof to unfold it (`proof { simp_all [Holder.view] }` / `[Foo.predicate]` / `[View.view]`) — Tactus has no fuel, and per design principle #1 the unfold is on screen, not hidden in the closer (see "reveal_with_fuel and unfold in Tactus"). The `#[verifier::z3]` opt-out is the alternative for fns that would rather lean on Z3's fuel-1 auto-unfold.
+
 **Pinned tests** (unchanged; they now exercise the gated Clip rather than the pre-pass): `test_proof_fn_u64_as_nat_in_ensures`, `test_proof_fn_u_types_as_nat`, `test_proof_fn_both_sides_as_nat`, `test_exec_assert_u64_as_nat`, `test_exec_loop_invariant_u64_as_nat`, and `test_exec_arith_operand_as_nat_materializes` (`(x as nat) * (x as nat) == sq(x as nat)` closes via `simp only [sq]` only when the LHS is `ℕ`). Validated: vstd **1530/0** (no flag), e2e **482/0** (with `--lean-backend`, pre-pass deleted).
 
 ### `_tactus_d_old` aliasing across nested loops
