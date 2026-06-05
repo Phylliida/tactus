@@ -3158,60 +3158,11 @@ fn push_post_call_frames(
         ).into_slot(&inner_typ);
         let new_value = match &info.target {
             MutTargetRaw::Var(_) => coerced_fresh,
+            // The deepest-level value substituted at the field slot is the
+            // coerced existential — inner-typed to match the field's typ
+            // (shares the wrapper-arch coercion with the simple-Var path).
             MutTargetRaw::Field { field_oprs, .. } => {
-                // Build the nested rebind inside-out. `field_oprs` is
-                // in peel order (`[0]` outermost = deepest-mutated),
-                // so top-to-bottom is the reverse: `oprs_ttb[0]` is
-                // closest to base; `oprs_ttb[len-1]` is the deepest
-                // step (the one whose value is `fresh`). At each
-                // level we dispatch on the step's `Dt`:
-                //   Path → Lean structure update `{ base with f := … }`
-                //   Tuple → explicit ctor `(base.0, …, current, …)`
-                // Steps may interleave (e.g., `&mut s.tup.0` has a
-                // Path step over a Tuple step).
-                let oprs_ttb: Vec<&vir::ast::FieldOpr> =
-                    field_oprs.iter().rev().copied().collect();
-                let local_expr = LExpr::var(local_name.clone());
-                // The deepest-level value substituted at the field
-                // slot is the coerced existential — inner-typed to
-                // match the struct field's typ (the rebind path
-                // shares the wrapper-arch coercion with the simple-
-                // Var path above).
-                let mut current = coerced_fresh.clone();
-                for i in (0..oprs_ttb.len()).rev() {
-                    let mut base = local_expr.clone();
-                    for prior in &oprs_ttb[..i] {
-                        base = LExpr::field_proj(
-                            base, crate::expr_shared::field_access_name(prior));
-                    }
-                    let opr = oprs_ttb[i];
-                    current = match &opr.datatype {
-                        vir::ast::Dt::Path(_) => LExpr::new(ExprNode::StructUpdate {
-                            base: Box::new(base),
-                            updates: vec![(
-                                crate::expr_shared::field_access_name(opr),
-                                current,
-                            )],
-                        }),
-                        vir::ast::Dt::Tuple(arity) => {
-                            let index: usize = opr.field.as_str().parse()
-                                .expect("tuple index validated at extract time");
-                            let new_value = current;
-                            let elems: Vec<LExpr> = (0..*arity)
-                                .map(|j| if j == index {
-                                    new_value.clone()
-                                } else {
-                                    LExpr::field_proj(
-                                        base.clone(),
-                                        crate::expr_shared::tuple_field_accessor(*arity, j),
-                                    )
-                                })
-                                .collect();
-                            LExpr::tuple(elems)
-                        }
-                    };
-                }
-                current
+                build_nested_field_update(LExpr::var(local_name.clone()), field_oprs, coerced_fresh)
             }
         };
         new_obl.frames.push_back(CtxFrame::Let(local_name, new_value));
@@ -4120,18 +4071,43 @@ fn build_wp<'a>(
             if is_borrow_mut_linkage_assign(dest, rhs, &ctx.borrow_mut_links) {
                 return Ok(after);
             }
-            let Some(ident) = extract_simple_var_ident(dest) else {
-                return Err(format!(
-                    "assignment with {} (got {:?}) is not yet supported",
-                    vir::tactus_messages::ASSIGN_NON_SIMPLE_LHS_TAG,
-                    dest.x
+            // Simple `x = e`: rebind `x` (mutation-as-let-shadowing).
+            if let Some(ident) = extract_simple_var_ident(dest) {
+                return Ok(Wp::Let(
+                    crate::lean_name::LeanName::from_var_ident(ident),
+                    crate::to_lean_sst_expr::Validated::check(rhs)?,
+                    dest.typ.clone(),
+                    Box::new(after),
                 ));
-            };
-            Ok(Wp::Let(
-                crate::lean_name::LeanName::from_var_ident(ident),
-                crate::to_lean_sst_expr::Validated::check(rhs)?,
-                dest.typ.clone(),
-                Box::new(after),
+            }
+            // Field-path `x.f = e` / `t.0 = e`: same let-shadowing, but
+            // rebind the ROOT var to a functional update of itself with the
+            // leaf field replaced by `e` (`let x := { x with f := e }` /
+            // tuple reconstruct). The rhs renders against the pre-rebind
+            // root (the let's RHS sees the outer binding), so a `t.0 = t.1`
+            // reads the old `t.1`. Reuses the same nesting as the
+            // `&mut x.field` call-rebind. `Wp::LetRaw` because the update is
+            // an already-rendered LExpr, not an SST Exp.
+            if let Some((root, field_oprs)) = decompose_assign_lvalue(dest) {
+                let rhs_lexpr = lower_validated_with_ctx(
+                    &crate::to_lean_sst_expr::Validated::check(rhs)?,
+                    &ctx.render_ctx(),
+                );
+                let update = build_nested_field_update(
+                    LExpr::var(crate::lean_name::LeanName::from_var_ident(root)),
+                    &field_oprs,
+                    rhs_lexpr,
+                );
+                return Ok(Wp::LetRaw {
+                    name: crate::lean_name::LeanName::from_var_ident(root),
+                    value: update,
+                    body: Box::new(after),
+                });
+            }
+            Err(format!(
+                "assignment with {} (got {:?}) is not yet supported",
+                vir::tactus_messages::ASSIGN_NON_SIMPLE_LHS_TAG,
+                dest.x
             ))
         }
         StmX::Assert(_, _, e) | StmX::AssertCompute(_, e, _) => {
@@ -5293,7 +5269,13 @@ fn collect_modifications<'a>(
 ) {
     match &stm.x {
         StmX::Assign { lhs: Dest { dest, is_init }, .. } => {
-            if let Some(ident) = extract_simple_var_ident(dest) {
+            // A field-path assignment (`x.f = …`, `t.0 = …`) modifies its
+            // ROOT var — fold it in alongside the simple-LHS case so the
+            // root is tracked as modified (it gets rebound to a functional
+            // update in `build_wp`). A field write is never an init.
+            let ident = extract_simple_var_ident(dest)
+                .or_else(|| decompose_assign_lvalue(dest).map(|(root, _)| root));
+            if let Some(ident) = ident {
                 if *is_init {
                     locally_declared.insert(ident);
                 } else if !locally_declared.contains(&ident) && !out.contains(&ident) {
@@ -5383,6 +5365,97 @@ pub(crate) fn extract_simple_var_ident<'a>(e: &'a Exp) -> Option<&'a VarIdent> {
         ExpX::Loc(inner) => extract_simple_var_ident(inner),
         _ => None,
     }
+}
+
+/// Decompose an assignment L-value `dest` into its root variable and the
+/// field-projection path (peel order, `[0]` = leaf-most field), e.g.
+/// `(*h).v` → `(h, [Holder.v])` and `t.0` → `(t, [Tuple.0])`. Peels the
+/// transparent wrappers Verus inserts around L-values (`Loc` / `Unbox` /
+/// `Box` / `CoerceMode` / `Trigger`). Returns `None` for shapes that
+/// aren't a chain of struct/tuple field accesses bottoming out at a Var
+/// (those stay rejected by `StmX::Assign`). Mirrors `extract_mut_target`'s
+/// field walk — same single-variant-struct / numeric-tuple gate — minus
+/// the call-site BorrowMut handling, since an assignment dest never
+/// carries that indirection.
+fn decompose_assign_lvalue<'a>(dest: &'a Exp) -> Option<(&'a VarIdent, Vec<&'a vir::ast::FieldOpr>)> {
+    let mut oprs: Vec<&'a vir::ast::FieldOpr> = Vec::new();
+    let mut cur = dest;
+    loop {
+        cur = peel_transparent(cur);
+        match &cur.x {
+            ExpX::Loc(inner) => cur = inner,
+            ExpX::UnaryOpr(UnaryOpr::Field(opr), base) => {
+                match &opr.datatype {
+                    vir::ast::Dt::Path(path) => {
+                        if opr.variant.as_str() != crate::to_lean_type::short_name(path) {
+                            return None; // multi-variant enum field — not supported
+                        }
+                    }
+                    vir::ast::Dt::Tuple(_) => {
+                        if opr.field.as_str().parse::<usize>().is_err() {
+                            return None;
+                        }
+                    }
+                }
+                oprs.push(opr);
+                cur = base;
+            }
+            ExpX::Var(ident) | ExpX::VarLoc(ident) => {
+                return if oprs.is_empty() { None } else { Some((ident, oprs)) };
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Build the inside-out functional-update value for a field-path
+/// assignment / rebind: given the root local's expr, the field path
+/// (peel order, `[0]` = leaf-most), and the new value at the leaf,
+/// produce the whole new root value. Each level is a Lean structure
+/// update (`{ base with f := … }`) for a `Dt::Path` step or an explicit
+/// ctor (`(base.0, …, value, …)`) for a `Dt::Tuple` step; steps may
+/// interleave (`&mut s.tup.0`). Shared by the `&mut x.field` call-rebind
+/// (`push_post_call_frames`) and the `x.field = e` assignment
+/// (`build_wp`'s `StmX::Assign`).
+fn build_nested_field_update(
+    local_expr: LExpr,
+    field_oprs: &[&vir::ast::FieldOpr],
+    leaf_value: LExpr,
+) -> LExpr {
+    // `field_oprs[0]` is the leaf-most step; top-to-bottom (base→leaf) is
+    // the reverse.
+    let oprs_ttb: Vec<&vir::ast::FieldOpr> = field_oprs.iter().rev().copied().collect();
+    let mut current = leaf_value;
+    for i in (0..oprs_ttb.len()).rev() {
+        let mut base = local_expr.clone();
+        for prior in &oprs_ttb[..i] {
+            base = LExpr::field_proj(base, crate::expr_shared::field_access_name(prior));
+        }
+        let opr = oprs_ttb[i];
+        current = match &opr.datatype {
+            vir::ast::Dt::Path(_) => LExpr::new(ExprNode::StructUpdate {
+                base: Box::new(base),
+                updates: vec![(crate::expr_shared::field_access_name(opr), current)],
+            }),
+            vir::ast::Dt::Tuple(arity) => {
+                let index: usize = opr.field.as_str().parse()
+                    .expect("tuple index validated at decompose time");
+                let new_value = current;
+                let elems: Vec<LExpr> = (0..*arity)
+                    .map(|j| if j == index {
+                        new_value.clone()
+                    } else {
+                        LExpr::field_proj(
+                            base.clone(),
+                            crate::expr_shared::tuple_field_accessor(*arity, j),
+                        )
+                    })
+                    .collect();
+                LExpr::tuple(elems)
+            }
+        };
+    }
+    current
 }
 
 /// Verus injects synthetic params (`no%param`, etc.) with `%` in the
