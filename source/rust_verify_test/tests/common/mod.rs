@@ -383,6 +383,8 @@ pub fn run_verus(
             verus_args.push("--output-json".to_string());
         } else if *option == "--emit-lean" {
             verus_args.push("--emit-lean".to_string());
+        } else if *option == "--lean-backend" {
+            verus_args.push("--lean-backend".to_string());
         } else if *option == "vstd" {
             // ignore
         } else if *option == "-V allow-inline-air" {
