@@ -1309,7 +1309,9 @@ This **replaced** the prior Tactus-side `insert_nat_coercions_in_{exp,stm,expr}`
 
 **The per-crate invariant + cross-crate boundary (deferred).** A crate is either Lean or Z3, and can only depend on crates of the same choice. The one exception is **vstd** (Z3, can't be Lean-built — its bit-shift lemmas need the drop), which every Tactus crate depends on. So a Lean crate consuming a Z3-built dependency inherits that dep's casts in their *dropped* form — the dep's VIR is frozen at its own build time, and the consumer can't retroactively fix it. This is **latent but unhit**: vstd's spec layer is `nat`/`int`/generic-typed, so vstd spec-fn bodies essentially never carry a `uN→nat` cast that reaches a Lean goal (every cross-crate Seq/Map/Vec case verifies). It's also no worse than before — the old pre-pass *also* skipped cross-crate code (its `fn_map` was single-crate). If a Z3 dep with a breaking cast ever surfaces, the fix lives in Tactus's cross-crate spec-fn inliner (#122) — the one place that knows, per-render, "I'm emitting this for Lean" regardless of how the dep was built — re-enabling a targeted cross-crate coercion there. Deferred until something hits it.
 
-**Interim wiring ("driver passes it").** The flag is currently supplied by the test driver (`VERUS_EXTRA_ARGS=--lean-backend`, picked up by `common/mod.rs`); the vstd build is flag-off. Productionizing *how* the user-facing driver sets `--lean-backend` (default-on + a vstd opt-out, a dedicated Tactus driver entry point, or per-fn+per-crate inference) is open and deferred.
+**Per-crate wiring (Cargo.toml → cargo-verus).** A crate declares its backend in `Cargo.toml`, the idiomatic Verus way — `[package.metadata.verus] lean-backend = true`. `cargo-verus` reads it (`VerusMetadata.lean_backend` in `cargo-verus/src/metadata.rs`) and forwards `--lean-backend` to that crate's verus invocation, exactly like the existing `no-vstd` / `is-vstd` keys (`subcommands.rs`). vstd's Cargo.toml leaves it false → Z3 path unchanged. This realizes the per-crate invariant directly: the choice lives in the crate manifest, and the build detects it per-package.
+
+The **e2e test snippets** don't go through cargo-verus (the harness invokes verus directly), so they still receive the flag via the test driver: `VERUS_EXTRA_ARGS=--lean-backend vargo test -p rust_verify_test --test tactus`. Making the tactus test harness pass it automatically (without affecting the shared Z3 test files) is a small remaining follow-up.
 
 **Pattern note.** This is the cleanest member of the "Verus emits an SMT-shaped output Tactus would otherwise normalize" family — and the only one so far that gates away entirely. Siblings: `#127`'s `original_cond` (already solved upstream with a field), `inline_spec` (#122 layer 7 — *replays* Verus's `#[inline]` SST pass rather than undoing one), and the mut-ref normalization (mostly a genuine Lean encoding need + support for Verus's experimental `--new-mut-ref` mode, *not* a gateable artifact — investigated 2026-06-05, not pursued).
 
@@ -5122,13 +5124,16 @@ RUSTC_BOOTSTRAP=1 cargo check -p rust_verify
 # Unit tests for lean_verify (needs Lean 4 on PATH):
 cargo test -p lean_verify
 
-# End-to-end tests (63 tests):
-# - 57 tests need Lean 4
-# - 6 tests also need Mathlib (setup-mathlib.sh)
-PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
+# End-to-end tests (the tactus suite):
+# - most need Lean 4; a few also need Mathlib (setup-mathlib.sh)
+# `--lean-backend` is required (the gate that keeps `as nat` casts as Clip);
+# supplied here via VERUS_EXTRA_ARGS until the harness passes it automatically.
+VERUS_EXTRA_ARGS="--lean-backend" \
+  PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus
 
 # Run a single test:
-PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus -- test_mathlib_ring
+VERUS_EXTRA_ARGS="--lean-backend" \
+  PATH="../tools/vargo/target/release:$PATH" vargo test -p rust_verify_test --test tactus -- test_mathlib_ring
 
 # vstd verification (1530 functions):
 PATH="../tools/vargo/target/release:$PATH" vargo build --release

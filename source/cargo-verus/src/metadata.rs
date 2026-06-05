@@ -11,6 +11,13 @@ pub struct VerusMetadata {
     pub verify: bool,
     #[serde(rename = "no-vstd", default)]
     pub no_vstd: bool,
+    /// Tactus: this crate targets the Lean backend, so Verus keeps
+    /// `uN/usize -> nat` casts as `Clip{Nat}` (and other Lean-friendly
+    /// lowering) rather than the SMT-shaped forms. A crate is either
+    /// Lean or Z3 and depends only on crates of the same choice; vstd
+    /// (Z3) sets this false. See `--lean-backend` in rust_verify.
+    #[serde(rename = "lean-backend", default)]
+    pub lean_backend: bool,
     #[serde(rename = "is-vstd", default)]
     pub is_vstd: bool,
     #[serde(rename = "is-core", default)]
