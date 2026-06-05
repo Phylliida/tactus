@@ -3259,13 +3259,7 @@ fn rewrite_one_call_for_coercions(e: &Exp, fn_map: &FnMap) -> Exp {
                 return e.clone();
             }
             let new_args: Vec<Exp> = args.iter().zip(callee.params.iter())
-                .map(|(arg, param)| {
-                    if needs_nat_coercion(&arg.typ, &param.x.typ) {
-                        wrap_in_nat_clip_exp(arg)
-                    } else {
-                        arg.clone()
-                    }
-                })
+                .map(|(arg, param)| coerce_arg_to_nat_exp(arg, &param.x.typ))
                 .collect();
             SpannedTyped::new(
                 &e.span,
@@ -3287,16 +3281,8 @@ fn rewrite_one_call_for_coercions(e: &Exp, fn_map: &FnMap) -> Exp {
         // fires for nat-ranged ops (an `IntRange Int`/`U(_)` op no-ops via
         // `needs_nat_coercion`). See DECISION-cast-rendering.md.
         ExpX::Binary(op, lhs, rhs) if matches!(op, vir::ast::BinaryOp::Arith(_)) => {
-            let new_lhs = if needs_nat_coercion(&lhs.typ, &e.typ) {
-                wrap_in_nat_clip_exp(lhs)
-            } else {
-                lhs.clone()
-            };
-            let new_rhs = if needs_nat_coercion(&rhs.typ, &e.typ) {
-                wrap_in_nat_clip_exp(rhs)
-            } else {
-                rhs.clone()
-            };
+            let new_lhs = coerce_arg_to_nat_exp(lhs, &e.typ);
+            let new_rhs = coerce_arg_to_nat_exp(rhs, &e.typ);
             SpannedTyped::new(&e.span, &e.typ, ExpX::Binary(op.clone(), new_lhs, new_rhs))
         }
         _ => e.clone(),
@@ -3325,13 +3311,7 @@ fn rewrite_one_call_for_coercions_expr(e: &Expr, fn_map: &FnMap) -> Expr {
                 return e.clone();
             }
             let new_args: Vec<Expr> = args.iter().zip(callee.params.iter())
-                .map(|(arg, param)| {
-                    if needs_nat_coercion(&arg.typ, &param.x.typ) {
-                        wrap_in_nat_clip_expr(arg)
-                    } else {
-                        arg.clone()
-                    }
-                })
+                .map(|(arg, param)| coerce_arg_to_nat_expr(arg, &param.x.typ))
                 .collect();
             SpannedTyped::new(
                 &e.span,
@@ -3344,16 +3324,8 @@ fn rewrite_one_call_for_coercions_expr(e: &Expr, fn_map: &FnMap) -> Expr {
         // A nat-typed arith op gets any Int-rendering operand wrapped in
         // `Clip{Nat}`. See that arm's comment + DECISION-cast-rendering.md.
         ExprX::Binary(op, lhs, rhs) if matches!(op, vir::ast::BinaryOp::Arith(_)) => {
-            let new_lhs = if needs_nat_coercion(&lhs.typ, &e.typ) {
-                wrap_in_nat_clip_expr(lhs)
-            } else {
-                lhs.clone()
-            };
-            let new_rhs = if needs_nat_coercion(&rhs.typ, &e.typ) {
-                wrap_in_nat_clip_expr(rhs)
-            } else {
-                rhs.clone()
-            };
+            let new_lhs = coerce_arg_to_nat_expr(lhs, &e.typ);
+            let new_rhs = coerce_arg_to_nat_expr(rhs, &e.typ);
             SpannedTyped::new(&e.span, &e.typ, ExprX::Binary(op.clone(), new_lhs, new_rhs))
         }
         _ => e.clone(),
@@ -3390,6 +3362,25 @@ fn wrap_in_nat_clip_expr(arg: &Expr) -> Expr {
     let clip_op = UnaryOp::Clip { range: IntRange::Nat, truncate: true };
     let nat_typ: Typ = Arc::new(TypX::Int(IntRange::Nat));
     SpannedTyped::new(&arg.span, &nat_typ, ExprX::Unary(clip_op, arg.clone()))
+}
+
+/// Nat-coercion leaf: wrap `arg` in `Clip{Nat}` when it renders as Lean
+/// `Int` but `target_typ` renders as `Nat`, else pass through unchanged.
+fn coerce_arg_to_nat_exp(arg: &Exp, target_typ: &Typ) -> Exp {
+    if needs_nat_coercion(&arg.typ, target_typ) {
+        wrap_in_nat_clip_exp(arg)
+    } else {
+        arg.clone()
+    }
+}
+
+/// VIR-AST twin of `coerce_arg_to_nat_exp`.
+fn coerce_arg_to_nat_expr(arg: &Expr, target_typ: &Typ) -> Expr {
+    if needs_nat_coercion(&arg.typ, target_typ) {
+        wrap_in_nat_clip_expr(arg)
+    } else {
+        arg.clone()
+    }
 }
 
 /// Per-obligation walker for `Wp::Call`. Splits the call's
