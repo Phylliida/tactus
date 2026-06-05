@@ -142,6 +142,29 @@ impl LeanName {
         Self(s.into())
     }
 
+    /// Render a generic **type-parameter** name. Almost all type params
+    /// are plain user identifiers (`A`, `T`) that are already valid Lean
+    /// — but the trait `Self` param arrives from VIR as the disambiguated
+    /// `vir::def::trait_self_type_param()` (the literal `"Self%"`), whose
+    /// `%` is not a legal Lean identifier char. The class declaration
+    /// binds the trait's type as the bare `Self` (`to_lean_fn`'s class
+    /// emitter, `LeanName::lit("Self")`), so every *other* rendering of
+    /// that param — exec/proof theorem binders, the param types that
+    /// reference it, and the call-site typ-subst keys that must match
+    /// those rendered types — has to normalize to the same `Self`.
+    ///
+    /// Without this, a trait-method exec body emits `(Self% : Type) … self
+    /// : Tactus.Ref Self%`, which fails to even parse in Lean (surfaced as
+    /// "Lean tactus_auto failed for <method>"). Routing all three render
+    /// sites through this one helper keeps them in lockstep by construction.
+    pub fn typ_param(name: &str) -> Self {
+        if name == vir::def::trait_self_type_param().as_str() {
+            Self("Self".to_string())
+        } else {
+            Self(name.to_string())
+        }
+    }
+
     /// Borrow as `&str` for emission and equality checks.
     pub fn as_str(&self) -> &str {
         &self.0
