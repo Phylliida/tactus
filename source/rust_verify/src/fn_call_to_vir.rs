@@ -1493,8 +1493,21 @@ fn verus_item_to_vir<'tcx, 'a>(
                         .must_apply_modulo_regions()
             };
             match ((&*source_ty, source_is_integer), &*to_ty) {
-                ((TypX::Int(IntRange::U(_)), _), TypX::Int(IntRange::Nat)) => Ok(source_vir),
-                ((TypX::Int(IntRange::USize), _), TypX::Int(IntRange::Nat)) => Ok(source_vir),
+                ((TypX::Int(IntRange::U(_)), _), TypX::Int(IntRange::Nat))
+                | ((TypX::Int(IntRange::USize), _), TypX::Int(IntRange::Nat)) => {
+                    // `uN`/`usize -> nat` is a no-op for Z3 (both are `Int`
+                    // with refinement), so the cast is normally dropped. For
+                    // the Lean backend, `uN` renders as `Int` and `nat` as
+                    // `Nat` (distinct types), so keep the cast as `Clip{Nat}`
+                    // — the renderer emits `Int.toNat`. Gated so the Z3 path
+                    // (vstd) is unchanged. Replaces Tactus's `nat_coercion`
+                    // re-materialization pre-pass. (See DECISION-cast-rendering.)
+                    if bctx.ctxt.cmd_line_args.lean_backend {
+                        Ok(mk_ty_clip(bctx, &to_ty, &source_vir, true))
+                    } else {
+                        Ok(source_vir)
+                    }
+                }
                 ((TypX::Int(IntRange::Nat), _), TypX::Int(IntRange::Nat)) => Ok(source_vir),
                 ((TypX::Int(IntRange::Int), _), TypX::Int(IntRange::Nat)) => {
                     Ok(mk_ty_clip(bctx, &to_ty, &source_vir, true))

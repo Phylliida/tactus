@@ -537,23 +537,18 @@ impl<'a> WpCtx<'a> {
                     mut_param_names,
                     RewritePhase::Ensures,
                 );
-                // Insert Int.toNat coercions at Call sites where needed
-                // (BUG-as-nat-cast.md). Same pass as for the body.
-                let coerced = insert_nat_coercions_in_exp(&rewritten, &fn_map);
-                // The rewrites are structural (VarAt(p, Pre) →
-                // Var(<p>_at_pre_tactus); Call args wrapped in Clip)
-                // and preserve ExpX shape, so validation that succeeded
-                // on `rewritten` (the earlier `check_exp` call in this
-                // fn) succeeds on `coerced`. `Validated::check` is
-                // deterministic; propagating its Err handles any
-                // unexpected drift.
+                // The mut-ref rewrite preserves ExpX shape, so validation
+                // that succeeded on the pre-rewrite Exp succeeds here too;
+                // propagating `Validated::check`'s Err handles any drift.
+                // (`uN -> nat` casts are kept as Clip{Nat} by Verus's
+                // `--lean-backend` lowering — no Tactus coercion needed.)
                 Ok(LExpr::span_mark(
                     format_rust_loc(&ens.span),
                     Some(ens.span.clone()),
                     AssertKind::Obligation(ObligationKind::Postcondition),
                     // Lower with the RenderCtx so trait method calls
                     // in the ensures get correct receiver coercion.
-                    lower_validated_with_ctx(&Validated::check(&coerced)?, &render_ctx),
+                    lower_validated_with_ctx(&Validated::check(&rewritten)?, &render_ctx),
                 ))
             }).collect::<Result<Vec<_>, String>>()?
         );
@@ -875,12 +870,11 @@ pub fn exec_fn_theorems_to_ast<'a>(
         );
         resolve_borrow_mut_aliases(&mut borrow_mut_links, &borrow_mut_aliases);
     }
-    // Insert `Clip { range: Nat }` at Call sites where args render as
-    // Lean Int but params render as Lean Nat (BUG-as-nat-cast.md).
-    // Verus's cast lowering drops `U(_)/USize → Nat` casts as no-ops;
-    // we add them back here. See `insert_nat_coercions_in_stm`.
+    // `fn_map` lets the call-arg bridge look up callee param types
+    // (consumed by `build_req_binders` + `WpCtx::new`). `uN -> nat` casts
+    // are kept as Clip{Nat} upstream by Verus's `--lean-backend` lowering,
+    // so the body needs no Tactus-side coercion pass.
     let fn_map: FnMap = krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
-    let coerced_body: Stm = insert_nat_coercions_in_stm(&rewritten_body, &fn_map);
 
     // `WpCtx::new` validates reqs / ens_exps before rendering them.
     // It also applies the same rewrites to each ens_exp so the
@@ -908,14 +902,14 @@ pub fn exec_fn_theorems_to_ast<'a>(
     binders.extend(build_borrow_mut_binders(check));
     binders.extend(build_req_binders(fn_sst, check, &mut_param_names, &fn_map));
 
-    // Build the whole WP tree from the (rewritten + coerced) body,
+    // Build the whole WP tree from the (mut-ref-rewritten) body,
     // with the fn's ensures as the natural continuation at the leaves.
     // `Return` statements inside the body replace their local `after`
     // with the same ensures goal (via `ctx.ensures_goal`). Initial
     // loop_stack is empty — break/continue are rejected outside any
     // loop.
     let body_wp = build_wp(
-        &coerced_body,
+        &rewritten_body,
         Wp::Done(ctx.ensures_goal.clone()),
         &ctx,
         &LoopStack::Empty,
@@ -2222,13 +2216,6 @@ pub(crate) use crate::mut_ref_normalize::{
 // stays stable.
 pub use crate::broadcast_collect::collect_broadcast_lemma_funs;
 
-// The nat-coercion insertion pass lives in `crate::nat_coercion`.
-// Re-export the entry points so existing call paths stay stable
-// (`crate::sst_to_lean::insert_nat_coercions_in_expr` is used by
-// `to_lean_fn`; the `_in_exp`/`_in_stm` forms by this module).
-pub use crate::nat_coercion::insert_nat_coercions_in_expr;
-use crate::nat_coercion::{insert_nat_coercions_in_exp, insert_nat_coercions_in_stm};
-
 /// Per-obligation walker for `Wp::Call`. Splits the call's
 /// obligations across separate theorems and pushes post-call
 /// frames onto the obligation context.
@@ -3493,20 +3480,16 @@ fn build_req_binders(
             mut_param_names,
             RewritePhase::Reqs,
         );
-        // Insert Int.toNat coercions at Call sites where args render
-        // as Lean Int but params render as Lean Nat
-        // (BUG-as-nat-cast.md). Same pass as for the body and ensures.
-        let coerced = insert_nat_coercions_in_exp(&rewritten, fn_map);
-        // The same `rewritten` shape was validated in `WpCtx::new`
-        // (the same caller that just succeeded earlier in this fn);
-        // both `rewrite_mut_ref_in_exp` and
-        // `insert_nat_coercions_in_exp` are deterministic, so re-running
-        // here produces an identical (coerced) Exp.
-        // Use the fn_map-backed RenderCtx so trait method calls in
-        // the requires get correct receiver coercion. The fn_map is
-        // already a parameter of this function.
+        // The same `rewritten` shape was validated in `WpCtx::new` (the
+        // same caller that just succeeded earlier in this fn), and
+        // `rewrite_mut_ref_in_exp` is deterministic, so re-running here
+        // produces an identical Exp. (`uN -> nat` casts are kept as
+        // Clip{Nat} upstream by Verus's `--lean-backend` lowering.)
+        // Use the fn_map-backed RenderCtx so trait method calls in the
+        // requires get correct receiver coercion; the fn_map is already
+        // a parameter of this function.
         let render_ctx = crate::expr_shared::RenderCtx::with_fn_map(fn_map);
-        let rendered = sst_exp_to_ast_checked_with_ctx(&coerced, &render_ctx)
+        let rendered = sst_exp_to_ast_checked_with_ctx(&rewritten, &render_ctx)
             .expect("build_req_binders: req validated by WpCtx::new");
         LBinder {
             name: Some(crate::lean_name::LeanName::synthetic(format!("h_req{}", i))),
