@@ -291,23 +291,42 @@ pub(crate) fn type_short_name(typ: &vir::ast::Typ) -> Option<String> {
     }
 }
 
-/// Convert a VIR path to a Lean dotted name, skipping the crate prefix.
-/// `crate::module::name` → `module.name`
-/// Names are sanitized (@ # → _) and keywords are escaped with «».
-pub(crate) fn lean_name(path: &Path) -> String {
+thread_local! {
+    /// Naturalized names for inherent impl methods, keyed by their raw
+    /// path-derived name (`impl__0.view`) → the type-qualified form
+    /// (`Holder.view`). Verus gives an inherent method an anonymous
+    /// impl-block path (`impl&%0::view`) with no type segment, so the
+    /// bare `lean_name` of it is the unstable, un-referenceable
+    /// `impl__0.view`. Built once per render from the krate (see
+    /// `generate::install_inherent_method_renames`) — where the
+    /// `FunctionX` is in scope to recover the Self type from the receiver
+    /// — and consulted at the single `lean_name` chokepoint so the
+    /// standalone def AND every call site (VIR + SST) naturalize to the
+    /// same name. Mirrors what trait-impl methods get from
+    /// `set_method_context` (`Bar.Foo.impl.predicate`).
+    static INHERENT_METHOD_RENAMES: std::cell::RefCell<std::collections::HashMap<String, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Install the inherent-method rename table (see `INHERENT_METHOD_RENAMES`).
+/// Called at each per-fn render entry, where the krate is in scope.
+pub(crate) fn set_inherent_method_renames(map: std::collections::HashMap<String, String>) {
+    INHERENT_METHOD_RENAMES.with(|m| *m.borrow_mut() = map);
+}
+
+/// Raw path → Lean dotted name, BEFORE the inherent-method-rename
+/// consult. Used both by `lean_name` (which then consults the table) and
+/// by the table builder (to compute each entry's key without recursing
+/// through the table).
+pub(crate) fn lean_name_raw(path: &Path) -> String {
     // Sanitize every segment, including synthetic impl markers
-    // (`impl&%0` → `impl__0`). The marker segments are load-bearing:
-    // they disambiguate impl method names so multiple impls of the
-    // same trait method don't collide on the bare method name. Pre-
-    // 2026-05-17 this function filtered them out (a cosmetic
-    // simplification that worked when the dep walk only ever pulled
-    // one impl per file into scope); BUG-no-helper-proof-fn-call-
-    // from-exec.md's helper-proof-fn emission widened the dep walk
-    // and surfaced the underlying naming collision. Keeping the
-    // markers produces names like `impl__0.is_zero` /
-    // `impl__1.is_zero` — uglier but unique. Strip then rewrites
-    // class-qualified sibling refs to these disambiguated forms
-    // (see `strip_class_qualifier`).
+    // (`impl&%0` → `impl__0`). The markers are load-bearing for
+    // disambiguation: multiple impls of the same trait method would
+    // otherwise collide on the bare method name (keeping them gives
+    // `impl__0.is_zero` / `impl__1.is_zero` — uglier but unique). The
+    // inherent-method rename in `lean_name` naturalizes the common case
+    // (`impl__0.view` → `Holder.view`); names not in that table keep the
+    // disambiguated marker form.
     let segments: Vec<String> = path.segments.iter()
         .map(|s| sanitize(s))
         .collect();
@@ -315,6 +334,23 @@ pub(crate) fn lean_name(path: &Path) -> String {
         return path.segments[0].to_string();
     }
     segments.join(".")
+}
+
+/// Convert a VIR path to a Lean dotted name, skipping the crate prefix.
+/// `crate::module::name` → `module.name`
+/// Names are sanitized (@ # → _) and keywords are escaped with «».
+/// Inherent impl method names are naturalized (`impl__0.view` →
+/// `Holder.view`) via the `INHERENT_METHOD_RENAMES` table.
+pub(crate) fn lean_name(path: &Path) -> String {
+    let name = lean_name_raw(path);
+    // Only inherent impl methods get a rename; gate the table lookup on
+    // the cheap marker check so the common (non-impl) path stays alloc-free.
+    if name.contains("impl__") {
+        if let Some(nat) = INHERENT_METHOD_RENAMES.with(|m| m.borrow().get(&name).cloned()) {
+            return nat;
+        }
+    }
+    name
 }
 
 fn needs_sanitization(s: &str) -> bool {

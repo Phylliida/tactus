@@ -913,6 +913,32 @@ pub struct EmitOutput {
 /// pretty-print → write `.lean` → sanity check. Stops before the Lean run.
 /// `Err(CheckResult)` carries a write error or sanity rejection so callers
 /// surface it uniformly.
+/// Build + install the inherent-impl-method rename table (consulted by
+/// `to_lean_type::lean_name`). Maps each inherent method's raw path name
+/// (`impl__0.view`) to its type-qualified form (`Holder.view`), recovering
+/// the Self type from the method's receiver (`&self`/`self`, the first
+/// param). Called at the top of each per-fn render entry so the table is
+/// populated before any `lean_name` call for that fn's file — covering the
+/// standalone def AND every call site uniformly. Inherent methods without a
+/// receiver-derived type (e.g. assoc fns) keep the disambiguated marker
+/// form. Idempotent across fns of the same crate.
+fn install_inherent_method_renames(krate: &KrateX) {
+    let mut map = std::collections::HashMap::new();
+    for f in krate.functions.iter() {
+        let fx = &f.x;
+        if !matches!(fx.kind, vir::ast::FunctionKind::Static) { continue; }
+        if !fx.attrs.print_as_method { continue; }
+        if !fx.name.path.segments.iter().any(|s| s.contains("impl&%")) { continue; }
+        let Some(self_short) = fx.params.first()
+            .and_then(|p| crate::to_lean_type::type_short_name(&p.x.typ)) else { continue; };
+        let Some(method) = fx.name.path.segments.last() else { continue; };
+        let key = crate::to_lean_type::lean_name_raw(&fx.name.path);
+        let naturalized = format!("{}.{}", self_short, crate::to_lean_type::sanitize(method));
+        map.insert(key, naturalized);
+    }
+    crate::to_lean_type::set_inherent_method_renames(map);
+}
+
 pub fn emit_proof_fn(
     krate: &KrateX,
     proof_fn: &FunctionX,
@@ -921,6 +947,7 @@ pub fn emit_proof_fn(
     crate_name: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> Result<EmitOutput, CheckResult> {
+    install_inherent_method_renames(krate);
     // Layer 7 — inline `#[verifier::inline]` spec fns on the VIR-AST so that
     // proof-fn goals and broadcast-lemma clauses agree with Verus's
     // SST-inlined exec goals. One krate-level pass, before any rendering; the
@@ -1065,6 +1092,7 @@ pub fn emit_exec_fn(
     crate_name: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> Result<EmitOutput, CheckResult> {
+    install_inherent_method_renames(krate);
     // Layer 7 — inline `#[verifier::inline]` spec fns on the VIR-AST so the
     // broadcast-lemma clauses krate_preamble emits agree with Verus's
     // SST-inlined exec goal. The exec goal itself already arrives inlined (via

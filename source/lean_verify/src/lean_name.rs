@@ -104,13 +104,13 @@ impl LeanName {
     /// the collision when the dep walk widened to include multiple
     /// impls in a single file).
     pub fn from_path(path: &Path) -> Self {
-        let segments: Vec<String> = path.segments.iter()
-            .map(|s| sanitize_string(s))
-            .collect();
-        if segments.len() == 1 && !needs_sanitization(&path.segments[0]) {
-            return Self(path.segments[0].to_string());
-        }
-        Self(segments.join("."))
+        // Delegate to `to_lean_type::lean_name` so the two path→name
+        // renderers stay byte-identical (their `sanitize`/`sanitize_string`
+        // + join logic was duplicated) AND share the inherent-method rename
+        // table — otherwise a call head (`from_path`) would emit
+        // `impl__0.view` while the standalone def (`lean_name`) emits the
+        // naturalized `Holder.view`, leaving the reference unbound.
+        Self(crate::to_lean_type::lean_name(path))
     }
 
     /// Last segment of a VIR `Path`, sanitized. Used where we want just the
