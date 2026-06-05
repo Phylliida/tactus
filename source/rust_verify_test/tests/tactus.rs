@@ -2842,6 +2842,25 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Struct-param field bounds: a u8 FIELD of a struct param carries the same
+// `0 ≤ v < 256` refinement a top-level u8 param does, so an overflow check
+// on a field read (`p.a + 1`) closes. Pins `type_bound_predicate`'s
+// datatype recursion (`install_datatype_field_bounds`). Without it, omega
+// can't prove `0 ≤ p.a + 1` — the field's lower bound is absent.
+test_verify_one_file! {
+    #[test] test_exec_struct_field_bound verus_code! {
+        struct Pair { a: u8, b: u8 }
+
+        #[verifier::tactus_auto]
+        fn bump(p: Pair) -> (r: u8)
+            requires p.a < 100
+            ensures r == p.a + 1
+        {
+            p.a + 1
+        }
+    } => Ok(())
+}
+
 // Proof fn using `u8::MAX` in a precondition. Goes through the VIR-AST
 // path (`to_lean_expr.rs`) rather than SST. Verus typically const-folds
 // `u8::MAX` to 255 at VIR construction, but if it ever doesn't, this
@@ -10459,11 +10478,17 @@ test_verify_one_file_with_options! {
             spec fn view(&self) -> u8 { self.v }
         }
 
+        #[verifier::tactus_auto]
         #[verifier::deprecated_postcondition_mut_ref_style(true)]
         fn bump_holder(h: &mut Holder)
             requires old(h).view() < 100
             ensures h.view() == old(h).view() + 1
         {
+            // Unfold the inherent spec method `view` with a visible body
+            // proof — referenceable by its naturalized name `Holder.view`.
+            // The overflow check (`h.v + 1`) closes via the struct field
+            // bound (`0 ≤ h.deref.v < 256`) now materialized for the param.
+            proof { simp_all [Holder.view] }
             h.v = h.v + 1;
         }
 
@@ -10799,11 +10824,15 @@ test_verify_one_file_with_options! {
             open spec fn view(&self) -> u8 { self.v }
         }
 
+        #[verifier::tactus_auto]
         #[verifier::deprecated_postcondition_mut_ref_style(true)]
         fn bump_holder(h: &mut Holder)
             requires old(h).view() < 100
             ensures h.view() == old(h).view() + 1
         {
+            // Unfold the trait spec method `view` (class projection
+            // `View.view`); the overflow closes via the struct field bound.
+            proof { simp_all [View.view] }
             h.v = h.v + 1;
         }
 

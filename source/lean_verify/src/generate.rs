@@ -939,6 +939,42 @@ fn install_inherent_method_renames(krate: &KrateX) {
     crate::to_lean_type::set_inherent_method_renames(map);
 }
 
+/// Build + install the datatype-field-bounds table (consulted by
+/// `to_lean_sst_expr::type_bound_predicate`). Maps each single-variant
+/// struct datatype to its fields' `(lean accessor, typ)` so a struct param's
+/// fixed-width fields get the same `0 ≤ … < 256` bound a numeric param does.
+/// Enums (multi-variant) are omitted — their field bounds are
+/// variant-conditional, deferred. Called at each per-fn render entry.
+fn install_datatype_field_bounds(krate: &KrateX) {
+    let mut map: std::collections::HashMap<vir::ast::Path, Vec<(String, vir::ast::Typ)>> =
+        std::collections::HashMap::new();
+    for d in krate.datatypes.iter() {
+        let dx = &d.x;
+        if dx.variants.len() != 1 { continue; }
+        let vir::ast::Dt::Path(path) = &dx.name else { continue; };
+        // STRUCTS only: a struct is a single-variant datatype whose variant
+        // is eponymous (named after the type) — its field projection is
+        // `e.<field>` directly. A single-variant ENUM (e.g. `enum Pair {
+        // Mk(u64) }`) has a non-eponymous variant, needs variant-guarded
+        // access (`Mk_val0`), and its field bound is variant-conditional —
+        // excluded here (the field projection would otherwise be malformed).
+        let variant = &dx.variants[0];
+        if variant.name.as_str() != crate::to_lean_type::short_name(path) { continue; }
+        let fields: Vec<(String, vir::ast::Typ)> = variant.fields.iter().map(|f| {
+            // Single-variant accessor: `valN` for numeric (tuple-struct)
+            // fields, sanitized name otherwise — matches `field_access_name`.
+            let raw = f.name.as_str();
+            let accessor = match raw.parse::<usize>() {
+                Ok(n) => format!("val{}", n),
+                Err(_) => crate::to_lean_type::sanitize(raw),
+            };
+            (accessor, f.a.0.clone())
+        }).collect();
+        map.insert(path.clone(), fields);
+    }
+    crate::to_lean_sst_expr::set_datatype_fields(map);
+}
+
 pub fn emit_proof_fn(
     krate: &KrateX,
     proof_fn: &FunctionX,
@@ -948,6 +984,7 @@ pub fn emit_proof_fn(
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> Result<EmitOutput, CheckResult> {
     install_inherent_method_renames(krate);
+    install_datatype_field_bounds(krate);
     // Layer 7 — inline `#[verifier::inline]` spec fns on the VIR-AST so that
     // proof-fn goals and broadcast-lemma clauses agree with Verus's
     // SST-inlined exec goals. One krate-level pass, before any rendering; the
@@ -1093,6 +1130,7 @@ pub fn emit_exec_fn(
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> Result<EmitOutput, CheckResult> {
     install_inherent_method_renames(krate);
+    install_datatype_field_bounds(krate);
     // Layer 7 — inline `#[verifier::inline]` spec fns on the VIR-AST so the
     // broadcast-lemma clauses krate_preamble emits agree with Verus's
     // SST-inlined exec goal. The exec goal itself already arrives inlined (via

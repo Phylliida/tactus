@@ -253,6 +253,24 @@ fn integer_type_bound_lit(kind: IntegerTypeBoundKind, bits: u32) -> LExpr {
     LExpr::new(ExprNode::Lit(s))
 }
 
+thread_local! {
+    /// Per-render map of single-variant struct datatypes → their fields'
+    /// `(lean accessor, typ)`. Lets `type_bound_predicate` recurse into a
+    /// datatype param's fixed-width fields and materialize their bounds
+    /// (`0 ≤ h.v < 256`) — the same `0 ≤ x < 256` a `u8` *param* already
+    /// gets, but for a `u8` *field* of a struct param. Built once from the
+    /// krate (`generate::install_datatype_field_bounds`), where the
+    /// `DatatypeX` field list is in scope. Enums (multi-variant) are
+    /// omitted — their field bounds are variant-conditional, deferred.
+    static DATATYPE_FIELDS: std::cell::RefCell<std::collections::HashMap<vir::ast::Path, Vec<(String, Typ)>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Install the datatype-field-bounds table (see `DATATYPE_FIELDS`).
+pub(crate) fn set_datatype_fields(map: std::collections::HashMap<vir::ast::Path, Vec<(String, Typ)>>) {
+    DATATYPE_FIELDS.with(|m| *m.borrow_mut() = map);
+}
+
 /// Build the Lean predicate expressing the type invariant on `e : ty`
 /// (i.e., the refinement bounds Verus treats as `HasType(e, ty)`).
 ///
@@ -279,17 +297,61 @@ fn integer_type_bound_lit(kind: IntegerTypeBoundKind, bits: u32) -> LExpr {
 ///
 /// For `Char` (rendered as `Nat`): `e < 0x110000`. The `0 ≤` half comes
 /// for free from `Nat`.
+///
+/// For a single-variant **struct** datatype (or a tuple): recurse into the
+/// fields, conjoining each fixed-width field's bound — so a `Holder { v: u8
+/// }` param carries `0 ≤ h.v < 256`. Multi-variant enums and self-recursive
+/// fields contribute nothing (see `type_bound_predicate_rec`).
 pub fn type_bound_predicate(e: &LExpr, ty: &Typ) -> Option<LExpr> {
+    type_bound_predicate_rec(e, ty, &mut std::collections::HashSet::new())
+}
+
+/// Inner recursion for `type_bound_predicate`. `visited` guards against
+/// infinite recursion on recursive datatypes (`List { next: Box<List> }`):
+/// a self-referential field simply contributes no bound rather than looping.
+fn type_bound_predicate_rec(
+    e: &LExpr,
+    ty: &Typ,
+    visited: &mut std::collections::HashSet<vir::ast::Path>,
+) -> Option<LExpr> {
     // Transparent: unbox before examining.
     if let TypX::Boxed(inner) = &**ty {
-        return type_bound_predicate(e, inner);
+        return type_bound_predicate_rec(e, inner, visited);
     }
     // `&mut T` params (in new-mut-ref mode after migration) carry
     // `TypX::MutRef(T)`; the binder type renders as `T` (see
-    // `to_lean_type::typ_to_node`'s `MutRef` arm), so the bound is
-    // for `T`. (#95)
+    // `to_lean_type::typ_to_node`'s `MutRef` arm) and `build_param_binders`
+    // already deref'd `e` to the inner value, so the bound is for `T`. (#95)
     if let TypX::MutRef(inner) = &**ty {
-        return type_bound_predicate(e, inner);
+        return type_bound_predicate_rec(e, inner, visited);
+    }
+    // Datatype params: recurse into fields so a struct's fixed-width fields
+    // carry their bounds (`0 ≤ h.v < 256`), just like numeric params do.
+    if let TypX::Datatype(dt, typ_args, _) = &**ty {
+        return match dt {
+            // Tuple: field typs are the typ_args; project via `.N` accessor.
+            vir::ast::Dt::Tuple(n) => (0..*n)
+                .filter_map(|i| {
+                    let elem = LExpr::field_proj(
+                        e.clone(), crate::expr_shared::tuple_field_accessor(*n, i));
+                    type_bound_predicate_rec(&elem, typ_args.get(i)?, visited)
+                })
+                .reduce(|a, b| LExpr::and(a, b)),
+            // Single-variant struct: look the fields up in the table.
+            vir::ast::Dt::Path(path) => {
+                if visited.contains(path) { return None; }
+                let fields = DATATYPE_FIELDS.with(|m| m.borrow().get(path).cloned())?;
+                visited.insert(path.clone());
+                let result = fields.iter()
+                    .filter_map(|(accessor, ftyp)| {
+                        let fe = LExpr::field_proj(e.clone(), accessor.clone());
+                        type_bound_predicate_rec(&fe, ftyp, visited)
+                    })
+                    .reduce(|a, b| LExpr::and(a, b));
+                visited.remove(path);
+                result
+            }
+        };
     }
     let range = match &**ty {
         TypX::Int(r) => r,
