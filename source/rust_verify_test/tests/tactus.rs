@@ -2861,6 +2861,26 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// `#[verifier::z3]` opts a fn OUT of Lean back to Z3 in a `--lean-backend`
+// crate (the per-fn escape hatch for the inversion). `get`'s ensures
+// references the spec method `view`, which Z3 auto-unfolds (fuel-1) with no
+// proof block — under Lean this fn would need `proof { simp_all [Holder.view]
+// }` (see test_exec_inherent_spec_method_name). So it verifies ONLY because
+// `#[verifier::z3]` routes it away from Lean — a direct check of the opt-out.
+test_verify_one_file! {
+    #[test] test_exec_z3_opt_out verus_code! {
+        struct Holder { v: u8 }
+        impl Holder { spec fn view(&self) -> u8 { self.v } }
+
+        #[verifier::z3]
+        fn get(h: &Holder) -> (r: u8)
+            ensures r == h.view()
+        {
+            h.v
+        }
+    } => Ok(())
+}
+
 // Proof fn using `u8::MAX` in a precondition. Goes through the VIR-AST
 // path (`to_lean_expr.rs`) rather than SST. Verus typically const-folds
 // `u8::MAX` to 255 at VIR construction, but if it ever doesn't, this

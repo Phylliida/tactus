@@ -1938,11 +1938,21 @@ impl Verifier {
                             continue;
                         }
 
-                        // Tactus: route exec fns marked #[verifier(tactus_auto)] through
-                        // sst_to_lean WP generation instead of Z3. Only fires on the
-                        // "Body(Normal)" query (the obligation generated from the body);
-                        // skip for recommends-check / api-safety / expanded re-runs.
-                        if function.x.attrs.tactus_auto
+                        // Tactus routing. A `--lean-backend` crate verifies its
+                        // exec fns in Lean BY DEFAULT (the inversion); a fn opts
+                        // back out to Z3 with `#[verifier::z3]`. A non-lean-backend
+                        // crate keeps the legacy per-fn opt-IN via
+                        // `#[verifier::tactus_auto]` (for mixed / pre-inversion
+                        // crates). Either way, only on the `Body(Normal)` query —
+                        // the obligation from the body — not recommends-check /
+                        // api-safety / expanded re-runs.
+                        let route_to_lean = if self.args.lean_backend {
+                            function.x.mode == vir::ast::Mode::Exec
+                                && !function.x.attrs.tactus_z3
+                        } else {
+                            function.x.attrs.tactus_auto
+                        };
+                        if route_to_lean
                             && matches!(query_op, QueryOp::Body(Style::Normal))
                         {
                             let fn_span = &function.span;

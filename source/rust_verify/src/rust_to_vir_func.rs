@@ -262,6 +262,7 @@ fn handle_autospec<'tcx>(
                     tactic_span: None,
                     lean_imports: Vec::new(),
                     tactus_auto: false,
+                    tactus_z3: false,
                     tactus_tactic: None,
                     tactus_heartbeats: None,
                 }),
@@ -1336,6 +1337,7 @@ fn make_attributes<'tcx>(
         }),
         lean_imports: vattrs.lean_imports.clone(),
         tactus_auto: vattrs.tactus_auto,
+        tactus_z3: vattrs.tactus_z3,
         tactus_tactic: vattrs.tactus_tactic.clone(),
         tactus_heartbeats: vattrs.tactus_heartbeats,
     };
