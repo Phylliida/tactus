@@ -2614,10 +2614,10 @@ fn build_call_substitutions<'a>(
     // renders as `Var("T")` so value-level substitute rewrites it.
     let mut typ_subst: HashMap<crate::lean_name::LeanName, LExpr> = HashMap::new();
     for (tp_name, tp_arg) in callee.typ_params.iter().zip(typ_args.iter()) {
-        // Type parameter names are user-named generics (`T`, `A`).
         // Match what `typ_to_expr` produces for `TypX::TypParam` —
-        // `LeanName::lit(name)`.
-        typ_subst.insert(crate::lean_name::LeanName::lit(tp_name.as_str()), typ_to_expr(tp_arg));
+        // `LeanName::typ_param(name)` (normalizes the trait `Self%` param
+        // to `Self`; identity for ordinary `T`/`A` generics).
+        typ_subst.insert(crate::lean_name::LeanName::typ_param(tp_name.as_str()), typ_to_expr(tp_arg));
     }
 
     // Render each arg once + compute its actual Lean typ via
@@ -3317,9 +3317,10 @@ fn build_param_binders(fn_sst: &FunctionSst) -> Vec<LBinder> {
     // binder shape for the same fn signature.
     for tp in fn_sst.x.typ_params.iter() {
         out.push(LBinder {
-            // Type parameter names are user-named generics (`T`, `A`).
-            // No disambiguator; emit via `lit`.
-            name: Some(crate::lean_name::LeanName::lit(tp.as_str())),
+            // Ordinary generics (`T`, `A`) pass through unchanged; the
+            // trait `Self%` param normalizes to `Self` to match the class
+            // binder and the param types that reference it.
+            name: Some(crate::lean_name::LeanName::typ_param(tp.as_str())),
             ty: LExpr::var_lit("Type"),
             kind: BinderKind::Explicit,
         });

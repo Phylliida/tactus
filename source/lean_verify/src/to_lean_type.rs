@@ -109,9 +109,10 @@ fn typ_to_node(typ: &TypX) -> ExprNode {
             IntRange::Nat | IntRange::USize | IntRange::Char => "Nat",
         }),
         // Type parameter names are user-named generic params (`A`, `T`,
-        // etc.). They come from VIR as plain `Ident`, no disambiguator —
-        // emit via `lit` since they're already valid identifiers.
-        TypX::TypParam(name) => ExprNode::Var(LeanName::lit(name.as_str())),
+        // etc.) — already valid identifiers — EXCEPT the trait `Self`
+        // param, which arrives as `"Self%"` and must normalize to `Self`.
+        // `LeanName::typ_param` handles both.
+        TypX::TypParam(name) => ExprNode::Var(LeanName::typ_param(name.as_str())),
         TypX::Boxed(inner) => typ_to_node(inner),
         TypX::MutRef(inner) => {
             // New-mut-ref-mode shape (`TypX::MutRef`, distinct from the
