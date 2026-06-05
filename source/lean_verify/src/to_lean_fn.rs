@@ -178,7 +178,7 @@ impl LeanSourceMap {
 /// body=None fns out — which produced "unresolved" sanity-check
 /// rejections at the call site. Audit 2026-05-12 unfiltered the map
 /// and routes through `Axiom` here.)
-pub fn spec_fn_to_ast(f: &FunctionX, fn_map: &crate::sst_to_lean::FnMap, unemittable: &std::collections::HashSet<Path>) -> Command {
+pub fn spec_fn_to_ast(f: &FunctionX, unemittable: &std::collections::HashSet<Path>) -> Command {
     // Spec fns are Lean defs (mathematical definitions). The
     // u-type / i-type refinement bounds belong on theorems
     // (proof fns + exec fn obligations), not on the spec fn's
@@ -196,19 +196,16 @@ pub fn spec_fn_to_ast(f: &FunctionX, fn_map: &crate::sst_to_lean::FnMap, unemitt
             } else {
                 vec![]
             };
-            // Insert Int.toNat coercions at Call sites where args render
-            // as Lean Int but params render as Lean Nat
-            // (BUG-as-nat-cast.md). A spec fn body may call other spec
-            // fns whose params are nat-typed.
-            let coerced_body = crate::sst_to_lean::insert_nat_coercions_in_expr(b, fn_map);
+            // `uN -> nat` casts are kept as `Clip{Nat}` by Verus's
+            // `--lean-backend` lowering (replaces the old `nat_coercion`
+            // pre-pass), so the rendered VIR is already Lean-typed.
             let binder_ctx = crate::to_lean_expr::binder_ctx_from_params(&f.params);
             let body = wrap_body_with_param_derefs(
-                crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced_body, &binder_ctx, &crate::expr_shared::RenderCtx::empty()),
+                crate::to_lean_expr::vir_expr_to_ast_with_binders(b, &binder_ctx, &crate::expr_shared::RenderCtx::empty()),
                 &f.params,
             );
             let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| {
-                let coerced = crate::sst_to_lean::insert_nat_coercions_in_expr(d, fn_map);
-                crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx, &crate::expr_shared::RenderCtx::empty())
+                crate::to_lean_expr::vir_expr_to_ast_with_binders(d, &binder_ctx, &crate::expr_shared::RenderCtx::empty())
             }).collect();
             Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by, decreasing_by: None })
         }
@@ -254,12 +251,11 @@ fn proof_fn_signature(
     // `RenderFnMap` are the same `HashMap<&Fun, &FunctionX>` type.
     let render_ctx = crate::expr_shared::RenderCtx::with_fn_map(fn_map);
     for (i, req) in f.require.iter().enumerate() {
-        // Insert Int.toNat coercions at Call sites where needed.
-        let coerced = crate::sst_to_lean::insert_nat_coercions_in_expr(req, fn_map);
         // Wrap with `let p := p.deref` for ref-decorated params so the
-        // hypothesis body sees inner types.
+        // hypothesis body sees inner types. (`uN -> nat` casts are kept
+        // as `Clip{Nat}` upstream by Verus's `--lean-backend` lowering.)
         let req_ty = wrap_body_with_param_derefs(
-            crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx, &render_ctx),
+            crate::to_lean_expr::vir_expr_to_ast_with_binders(req, &binder_ctx, &render_ctx),
             &f.params);
         binders.push(LBinder {
             name: Some(crate::lean_name::LeanName::synthetic(format!("h{}", i))),
@@ -268,8 +264,7 @@ fn proof_fn_signature(
         });
     }
     let goal_raw = and_all(f.ensure.0.iter().map(|e| {
-        let coerced = crate::sst_to_lean::insert_nat_coercions_in_expr(e, fn_map);
-        crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx, &render_ctx)
+        crate::to_lean_expr::vir_expr_to_ast_with_binders(e, &binder_ctx, &render_ctx)
     }).collect());
     let goal = wrap_body_with_param_derefs(goal_raw, &f.params);
     (binders, goal)
@@ -314,8 +309,7 @@ pub fn proof_fn_to_ast(
     // where the measure is non-obvious (Collatz, lex pairs, computed
     // descent) require the explicit clause. Mirrors `spec_fn_to_ast`.
     let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| {
-        let coerced = crate::sst_to_lean::insert_nat_coercions_in_expr(d, fn_map);
-        crate::to_lean_expr::vir_expr_to_ast_with_binders(&coerced, &binder_ctx, &crate::expr_shared::RenderCtx::empty())
+        crate::to_lean_expr::vir_expr_to_ast_with_binders(d, &binder_ctx, &crate::expr_shared::RenderCtx::empty())
     }).collect();
     Theorem {
         name: lean_name(&f.name.path),

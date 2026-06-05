@@ -745,13 +745,13 @@ fn krate_preamble(
             dep_order::EmitStep::Group(i) => match &groups[*i] {
                 FnGroup::Single(f) => {
                     let augmented = augment(f);
-                    cmds.push(to_lean_fn::spec_fn_to_ast(&augmented, &fn_map, &unemittable_traits));
+                    cmds.push(to_lean_fn::spec_fn_to_ast(&augmented, &unemittable_traits));
                 }
                 FnGroup::Mutual(fns) => {
                     let inner: Vec<Command> = fns.iter()
                         .map(|f| {
                             let augmented = augment(f);
-                            to_lean_fn::spec_fn_to_ast(&augmented, &fn_map, &unemittable_traits)
+                            to_lean_fn::spec_fn_to_ast(&augmented, &unemittable_traits)
                         })
                         .collect();
                     cmds.push(Command::Mutual(inner));

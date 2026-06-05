@@ -4,6 +4,17 @@
 "non-committal" framing of [`DESIGN-cast-hygiene.md`](DESIGN-cast-hygiene.md),
 which laid out the options without choosing.
 
+> **Implementation update (2026-06-05).** The *policy* below is unchanged
+> (`nat → Nat`; not Option B; not a closer rung; `as nat` renders as a
+> consistent `ℕ`). The *mechanism* changed: instead of a Tactus-side
+> `insert_nat_coercions` pre-pass re-materializing the `Clip` after Verus
+> dropped it, Verus now **keeps** the `uN/usize → nat` cast as `Clip{Nat}`
+> directly, gated on a `--lean-backend` flag (vstd builds without it, Z3 path
+> unchanged). The ~200-line `nat_coercion.rs` module is deleted; the gate is
+> ~20 lines. This keeps every `as nat` consistently `ℕ` more uniformly than
+> the pre-pass did (it now covers comparisons too). See DESIGN.md
+> § "U → Nat coercion — gated Verus `Clip` for the Lean backend".
+
 **TL;DR:** Tactus keeps rendering Verus `nat` as Lean `Nat`. The `as nat` cast
 *inconsistency* (Friction 2) is fixed by rendering `as nat` **consistently** —
 a nat-typed arithmetic op materializes its Int-rendering operands to `Int.toNat`,

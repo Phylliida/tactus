@@ -91,6 +91,13 @@ pub struct ArgsX {
     /// Tactus: emit per-fn `.lean` files + a `sourcemap.json` sidecar and
     /// SKIP running Lean. Codegen-only mode for the Tactus server (SERVER.md).
     pub emit_lean: bool,
+    /// Tactus: this build targets the Lean backend, so VIR lowering should
+    /// emit Lean-friendly shapes rather than SMT-shaped ones that Tactus
+    /// would otherwise have to normalize back. Currently gates: keeping
+    /// `uN/usize -> nat` casts as `Clip{Nat}` (instead of dropping them as
+    /// no-ops, which is sound for Z3 but wrong for Lean's distinct
+    /// `Int`/`Nat`). vstd builds without this flag (Z3 path unchanged).
+    pub lean_backend: bool,
     pub time: bool,
     pub time_expanded: bool,
     pub output_json: bool,
@@ -141,6 +148,7 @@ impl ArgsX {
             no_auto_recommends_check: Default::default(),
             no_cheating: Default::default(),
             emit_lean: Default::default(),
+            lean_backend: Default::default(),
             time: Default::default(),
             time_expanded: Default::default(),
             output_json: Default::default(),
@@ -319,6 +327,7 @@ pub fn parse_args_with_imports(
     const OPT_NO_AUTO_RECOMMENDS_CHECK: &str = "no-auto-recommends-check";
     const OPT_NO_CHEATING: &str = "no-cheating";
     const OPT_EMIT_LEAN: &str = "emit-lean";
+    const OPT_LEAN_BACKEND: &str = "lean-backend";
     const OPT_TIME: &str = "time";
     const OPT_TIME_EXPANDED: &str = "time-expanded";
     const OPT_OUTPUT_JSON: &str = "output-json";
@@ -489,6 +498,11 @@ pub fn parse_args_with_imports(
         "",
         OPT_EMIT_LEAN,
         "Tactus: emit per-fn .lean files + a sourcemap.json sidecar without running Lean (for the Tactus server)",
+    );
+    opts.optflag(
+        "",
+        OPT_LEAN_BACKEND,
+        "Tactus: target the Lean backend (emit Lean-friendly VIR shapes, e.g. keep uN->nat casts as Clip)",
     );
     opts.optflag(
         "",
@@ -706,6 +720,7 @@ pub fn parse_args_with_imports(
         no_auto_recommends_check: matches.opt_present(OPT_NO_AUTO_RECOMMENDS_CHECK),
         no_cheating: matches.opt_present(OPT_NO_CHEATING),
         emit_lean: matches.opt_present(OPT_EMIT_LEAN),
+        lean_backend: matches.opt_present(OPT_LEAN_BACKEND),
         time: matches.opt_present(OPT_TIME) || matches.opt_present(OPT_TIME_EXPANDED),
         time_expanded: matches.opt_present(OPT_TIME_EXPANDED),
         output_json: matches.opt_present(OPT_OUTPUT_JSON),
