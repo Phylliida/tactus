@@ -352,6 +352,13 @@ fn write_theorem(out: &mut String, t: &Theorem, lm: &mut Landmarks) {
             out.push_str(")\n");
         }
     }
+    // `decreasing_by` for the recursive case, mirroring `Def`. Only ever
+    // `Some` when `termination_by` is non-empty (set by `proof_fn_to_ast`).
+    if let Some(tac) = &t.decreasing_by {
+        out.push_str("decreasing_by ");
+        out.push_str(tac);
+        out.push('\n');
+    }
 }
 
 fn write_datatype(out: &mut String, dt: &Datatype, lm: &mut Landmarks) {

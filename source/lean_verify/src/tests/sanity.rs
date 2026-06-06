@@ -19,6 +19,7 @@ fn known_builtins_pass() {
         requires_preamble: Vec::new(),
         heartbeats: None,
         termination_by: Vec::new(),
+        decreasing_by: None,
     };
     assert!(check_references(&[Command::Theorem(thm)]).is_empty());
 }
@@ -37,6 +38,7 @@ fn undefined_reference_flagged() {
         requires_preamble: Vec::new(),
         heartbeats: None,
         termination_by: Vec::new(),
+        decreasing_by: None,
     };
     let v = check_references(&[Command::Theorem(thm)]);
     assert_eq!(v.len(), 2); // missing_fn + x
@@ -88,6 +90,7 @@ fn forall_dependent_binder_resolves() {
         requires_preamble: Vec::new(),
         heartbeats: None,
         termination_by: Vec::new(),
+        decreasing_by: None,
     };
     let v = check_references(&[Command::Theorem(thm)]);
     assert!(v.is_empty(),
@@ -121,6 +124,7 @@ fn earlier_def_is_resolved() {
         requires_preamble: Vec::new(),
         heartbeats: None,
         termination_by: Vec::new(),
+        decreasing_by: None,
     };
     let violations = check_references(&[Command::Def(d), Command::Theorem(t)]);
     assert!(violations.is_empty(), "expected no violations, got {:?}", violations);
@@ -164,6 +168,7 @@ fn forall_binder_scopes_body() {
         requires_preamble: Vec::new(),
         heartbeats: None,
         termination_by: Vec::new(),
+        decreasing_by: None,
     };
     assert!(check_references(&[Command::Theorem(t)]).is_empty());
 }
@@ -194,6 +199,7 @@ fn dotted_names_pass_through() {
         requires_preamble: Vec::new(),
         heartbeats: None,
         termination_by: Vec::new(),
+        decreasing_by: None,
     };
     assert!(check_references(&[Command::Theorem(t)]).is_empty());
 }

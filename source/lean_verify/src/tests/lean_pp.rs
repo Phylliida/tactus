@@ -185,6 +185,7 @@ fn theorem_with_heartbeats_emits_set_option() {
         requires_preamble: Vec::new(),
         heartbeats: Some(1600000),
         termination_by: Vec::new(),
+        decreasing_by: None,
     };
     let out = pp_command(&Command::Theorem(t));
     assert!(out.starts_with("set_option maxHeartbeats 1600000 in\ntheorem expensive"),
@@ -201,6 +202,7 @@ fn theorem_without_heartbeats_no_set_option() {
         requires_preamble: Vec::new(),
         heartbeats: None,
         termination_by: Vec::new(),
+        decreasing_by: None,
     };
     let out = pp_command(&Command::Theorem(t));
     assert!(!out.contains("set_option maxHeartbeats"),
@@ -223,6 +225,7 @@ fn theorem_with_named_tactic() {
         requires_preamble: Vec::new(),
         heartbeats: None,
         termination_by: Vec::new(),
+        decreasing_by: None,
     };
     let out = pp_command(&Command::Theorem(t));
     assert!(out.contains("theorem foo (x : Nat)"));
@@ -253,6 +256,7 @@ fn pp_records_raw_tactic_start() {
         requires_preamble: Vec::new(),
         heartbeats: None,
         termination_by: Vec::new(),
+        decreasing_by: None,
     };
     let out = pp_commands(&[Command::Theorem(t)]);
     assert_eq!(out.landmarks.tactic_starts.len(), 1);
@@ -343,6 +347,7 @@ fn theorem_with_termination_by_single() {
         requires_preamble: Vec::new(),
         heartbeats: None,
         termination_by: vec![var("n")],
+        decreasing_by: None,
     };
     let out = pp_command(&Command::Theorem(t));
     assert!(out.contains("termination_by n"),
@@ -365,10 +370,36 @@ fn theorem_with_termination_by_lex() {
         requires_preamble: Vec::new(),
         heartbeats: None,
         termination_by: vec![var("a"), var("b")],
+        decreasing_by: None,
     };
     let out = pp_command(&Command::Theorem(t));
     assert!(out.contains("termination_by (a, b)"),
         "expected lex-tuple termination_by, got:\n{}", out);
+}
+
+/// `decreasing_by` renders after `termination_by` for a recursive proof fn
+/// whose measure needs a non-default tactic (the proof-fn twin of the
+/// spec-fn modular-decreases fix).
+#[test]
+fn theorem_with_decreasing_by() {
+    let t = Theorem {
+        name: "rec_mod".into(),
+        binders: vec![],
+        goal: bin(BinOp::Eq, lit(1), lit(1)),
+        tactic: Tactic::Named("rfl".into()),
+        requires_preamble: Vec::new(),
+        heartbeats: None,
+        termination_by: vec![var("b")],
+        decreasing_by: Some("all_goals omega".into()),
+    };
+    let out = pp_command(&Command::Theorem(t));
+    assert!(out.contains("termination_by b"), "{out}");
+    assert!(out.contains("decreasing_by all_goals omega"), "{out}");
+    // `decreasing_by` must follow `termination_by`.
+    let term_pos = out.find("termination_by").expect("termination_by present");
+    let dec_pos = out.find("decreasing_by").expect("decreasing_by present");
+    assert!(dec_pos > term_pos,
+        "decreasing_by must follow termination_by; got:\n{}", out);
 }
 
 /// Non-recursive theorems (the common case) — no termination_by emitted.
@@ -382,6 +413,7 @@ fn theorem_without_termination_by_no_clause() {
         requires_preamble: Vec::new(),
         heartbeats: None,
         termination_by: Vec::new(),
+        decreasing_by: None,
     };
     let out = pp_command(&Command::Theorem(t));
     assert!(!out.contains("termination_by"),

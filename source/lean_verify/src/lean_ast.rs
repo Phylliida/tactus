@@ -206,6 +206,14 @@ pub struct Theorem {
     /// theorems are flat in shape; the recursion happens at the obligation-level
     /// `CheckDecreaseHeight` rather than in the theorem itself).
     pub termination_by: Vec<Expr>,
+    /// Optional `decreasing_by <tactic>` clause emitted after `termination_by`,
+    /// mirroring `Def.decreasing_by`. `Some` only when `termination_by` is
+    /// non-empty (a bare `decreasing_by` on a non-recursive theorem is a Lean
+    /// error). Lets a recursive proof fn with a measure Lean's default
+    /// `decreasing_tactic` can't discharge — notably the modular `a % b < b` —
+    /// still verify. Populated by `proof_fn_to_ast` from the same
+    /// `DECREASING_BY_TACTIC` the spec-fn path uses.
+    pub decreasing_by: Option<String>,
 }
 
 /// A piece of preamble that some theorem needs in its elaboration
