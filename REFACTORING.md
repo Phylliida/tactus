@@ -10,6 +10,12 @@ per-crate flag).
 State at the end: **vstd 1530/0, e2e 482/0** (a plain `vargo test --test tactus`
 is green — no env var). `sst_to_lean.rs` went **6689 → 5378 lines (−20%)**.
 
+> **Continued same day → Part 4 (the trait→inversion arc).** Part 3's two
+> deferred follow-ups (close the Lean coverage gaps, then invert `tactus_auto`)
+> both landed. **Exec fns now verify in Lean by default under `--lean-backend`,
+> with `#[verifier::z3]` as the per-fn opt-out. e2e 485/0 — the full suite
+> verifies every exec fn in Lean.** See Part 4 below.
+
 ---
 
 ## Part 1 — Polish: golf + splitting the megafile
@@ -183,22 +189,142 @@ are test snippets, not user code).
 
 ---
 
+## Part 4 — Closing the gaps, then the inversion (continued 2026-06-05)
+
+Part 3 left two coupled follow-ups: close the Lean coverage gaps the route-all
+probe surfaced (the "7 failures"), then invert the polarity. This arc did both.
+The trigger was Danielle's question — *"don't we support trait-method exec
+verification?"* — and the answer turned out to be **yes, modulo a stack of real
+bugs.** Re-applying the probe and chasing each "is this a gap or a bug?" to the
+bottom found bugs, not gaps.
+
+### The gap-fixes (the "7 failures" decomposed into distinct bugs)
+
+| Commit | Fix | What it was |
+|---|---|---|
+| `03e1591` | `Self%` type-param sanitization | trait `Self` arrives as `"Self%"` (illegal Lean ident); `build_param_binders` / `typ_to_node` / typ-subst keys emitted it raw → unparseable. New `LeanName::typ_param` normalizes `Self%`→`Self` at all three sites. (Fixed the 3 `_default` trait tests.) |
+| `a516a57` | binder-aware receiver deref | SST Field arm counted derefs from the *expression* typ (stripped), not the binder typ → `self.v` where Lean needs `self.deref.v`. Threaded the param typs (`WpCtx::caller_param_typs`) into a `RenderCtx.binder_typs` consulted at Field/IsVariant, mirroring the Exp path's `lean_level_wrap_count`. |
+| `aa66508` | abstract trait-method class dispatch | a `<Self as Tr>::m` call in an inherited ensures passed type-args positionally → `Foo.predicate Bar self` (Self is implicit). Extracted `render_class_method_call`, routed both the resolved arm and the unresolved-but-trait-method arm through it → `Foo.predicate (self : …)`. |
+| `26e6379` | field-path assignment | `x.f = e` / `t.0 = e` hit "non-simple LHS not yet supported". Lower to a functional update of the root var (`let x := { x with f := e }` / tuple reconstruct), reusing the `&mut x.field` call-rebind machinery (extracted `build_nested_field_update` + `decompose_assign_lvalue`). |
+| `76b0218` | inherent-method naming | `impl Holder { spec fn view }` rendered as the codegen-internal `impl__0.view` (no type in the path) — un-referenceable in a proof. Naturalize to `Holder.view` from the receiver's Self type, via a once-built table consulted at the single `lean_name` chokepoint (`from_path` delegates to it, so def + call sites agree). **Danielle's catch** — "why would a proof reference impl__0? That's a bug." |
+| `0856387` | struct-field bounds | a `u8` *field* (`h.v`) carried no `0 ≤ v < 256`, so an overflow on a field read couldn't close. `type_bound_predicate` now recurses into single-variant-struct + tuple fields (with a recursion guard; enums excluded — variant-conditional). |
+
+Two of those (`Self%`, deref, dispatch) were the trait-method-exec gap; field-
+assignment + naming + field-bounds were the `old_view` tests. Every spec-method
+unfold landed as a **visible** body proof (`proof { simp_all [Holder.view] }` /
+`[Foo.predicate]` / `[View.view]`) — never a silent closer rung (rejected an
+`assumption`/defeq rung as hiding the unfold) and never `tactus_tactic("…")`
+(the string-attr hack Danielle wants gone). The transparency bar held.
+
+### The inversion (`41db9bb`)
+
+With the full suite green under the route-all probe, Part 3's "Direction" was no
+longer a probe — it was correct. Productionized:
+- **`--lean-backend` crate → exec fns verify in Lean BY DEFAULT.** Opt back out
+  with **`#[verifier::z3]`** (new attr, full plumbing mirroring `tactus_auto`:
+  `Attr::TactusZ3` → `VerifierAttrs.tactus_z3` → `FunctionAttrs.tactus_z3`, read
+  by `verifier.rs` routing). Pinned by `test_exec_z3_opt_out` (a spec-fn-ensures
+  fn that verifies *only* because z3 routes it to Z3's fuel-1 auto-unfold).
+- **non-lean-backend crate → Z3 default,** `tactus_auto` = legacy opt-IN.
+
+`tactus_auto` is now redundant for routing under lean-backend but **remains the
+FileLoader's proof-block / assert-by marker** (tree-sitter at file-load, before
+flags) — so a Lean-routed fn with a Lean-tactic body proof still needs it today.
+Documented in DESIGN § "Exec-fn routing: Lean-default under --lean-backend".
+
+### Deferred / known-incomplete (Part 4)
+
+Everything knowingly left for later, by area. All of these are **sound**
+(incompleteness, not unsoundness): a missing bound just means a goal that
+*could* close doesn't, never a false goal that does. The full suite is green
+because the current tests don't hit these corners.
+
+**Struct-field bounds (`type_bound_predicate` datatype recursion):**
+- **Multi-variant enums — excluded.** Enum field access is variant-guarded
+  (`Mk_val0`, not `val0`) and the bound is variant-conditional (`is_variant A →
+  …`). `install_datatype_field_bounds` only maps single-variant *eponymous*
+  datatypes (= structs). [Same as follow-up #2.] Including them produced
+  malformed projections — caught by `test_exec_single_variant_non_eponymous_enum`
+  + `_scc_plus_standalone_datatype` during the arc.
+- **`&T` (immutable-ref) datatype params — no field bounds.** Works for
+  by-value and `&mut` params; for `&Holder` the bound would need a `.deref`
+  inserted when peeling the `Decorate(Ref)` (the value is `Tactus.Ref`-wrapped),
+  which `build_param_binders` pre-does only for `&mut` (it deref's `bound_value`),
+  not `&`. So `type_bound_predicate` doesn't peel `Decorate(Ref)` (peeling without
+  the deref would type-mismatch). No current test needs it (`get(h: &Holder)` does
+  no field arithmetic).
+- **Generic struct fields — no bound.** `Pair<T> { a: T }` field typ is a
+  `TypParam` → `None` (no `typ_args` substitution into field typs). Concrete-typed
+  fields (`u8`, etc.) of a generic struct still get bounds; only the type-param
+  fields are skipped.
+- **Recursive / self-referential fields — no bound.** `List { next: Box<List> }`:
+  the `visited` set stops the recursion at the self-reference, so `next`
+  contributes no bound (the leaf scalar fields still do).
+- **Accessor logic duplicated.** The builder replicates `field_access_name`'s
+  single-variant case inline (`valN` / `sanitize(name)`) rather than calling it —
+  fine for eponymous structs, small drift risk if `field_access_name` changes.
+
+**Trait-method class dispatch (`render_class_method_call`):**
+- **Cross-crate abstract trait calls — old behaviour.** `fun_is_trait_method`
+  consults the RenderCtx `fn_map`; a trait method *not* in the map (cross-crate)
+  falls back to the prior positional rendering. Same-crate `<Self as Tr>::m` is
+  fixed; cross-crate is unchanged (latent, as before).
+- **Recursive trait-method calls — not routed.** Only `Fun(_, None)` (and the
+  resolved `Fun(_, Some)`) route through class dispatch; a `CallFun::Recursive`
+  to a trait method keeps positional typs. Edge case, no test.
+
+**Field-path assignment (`decompose_assign_lvalue` + `build_nested_field_update`):**
+- **Enum field assignment — still rejected.** The decomposer accepts single-
+  variant-struct / tuple field paths; a multi-variant enum field LHS returns
+  `None` → the "non-simple LHS" rejection stands.
+- **No rhs coercion at the field slot.** The rhs is rendered as-is (common case:
+  same typ). A wrapper-typed field assignment (e.g. assigning into a `Box<_>`
+  field where the rhs needs a `.mk` wrap) is untested — would need the
+  `coerce_lexpr` bridge the call-rebind path has.
+
+**Routing / `tactus_auto`:**
+- **Full `tactus_auto` retirement** — blocked on the FileLoader [follow-up #3].
+- **`enclosing_fn_is_tactus_auto` not lean-backend-aware.** It still gates
+  assert-by tactic-spans on the `tactus_auto` attr; a Lean-routed fn *without*
+  `tactus_auto` that carries an `assert(..) by { <lean tac> }` wouldn't get the
+  span. Same root as #3 (the FileLoader/attr coupling); no current test hits it
+  (all such fns have `tactus_auto`).
+
+**Considered and rejected (decisions, not deferrals):**
+- **`assumption`/defeq closer rung** for spec-fn unfold — validated it works
+  (defeq unfolds transparent defs, respects `@[irreducible]`), but rejected: it
+  unfolds *invisibly*, the "and then something happened" anti-pattern design
+  principle #1 forbids. The visible body proof is the chosen path.
+- **Codegen auto-emitting `unfold f`** (a transparent fuel-equivalent) —
+  considered as a middle ground; not chosen. The manual `proof { simp_all [f] }`
+  is the established pattern (dozens of `unfold f; omega` tests) and keeps Tactus
+  fuel-free.
+- **`#[verifier::tactus_tactic("…")]`** string-attr for the body proofs — Danielle
+  wants it deprecated ("the string thingy seems like a hack"); used in-body
+  `proof { }` blocks throughout instead.
+
+---
+
 ## Open follow-ups
 
-1. **Invert `tactus_auto` → Lean-default + Z3 opt-out** (Part 3). Needs the
-   trait-method-exec-body Lean gap closed first (or the 4 tests stay on the
-   opt-out). Bounded; not urgent.
-2. **Lean coverage gaps** surfaced by the probe: trait-method exec bodies;
-   field/tuple assignment in exec bodies (already a documented deferral). Closing
-   these shrinks the set of fns that need the Z3 escape hatch.
-3. **Cross-crate cast boundary** (Part 2): a targeted coercion in the #122
+1. ~~Invert `tactus_auto` → Lean-default + Z3 opt-out~~ **DONE (Part 4, `41db9bb`).**
+2. ~~Lean coverage gaps (trait-method exec bodies; field/tuple assignment)~~
+   **DONE (Part 4).** Remaining sub-gap: **multi-variant enum field bounds** —
+   `type_bound_predicate` only recurses into single-variant structs + tuples
+   (enum field access is variant-guarded, so the bound is variant-conditional).
+3. **Fully retire `tactus_auto`.** Redundant for routing, but still the
+   FileLoader's marker for which fns carry Lean-tactic `proof { }` blocks. Needs
+   the FileLoader to detect lean-backend (crate-level marker or env signal) so it
+   can sanitize any Lean-routed fn's proof blocks without the attr.
+4. **Cross-crate cast boundary** (Part 2): a targeted coercion in the #122
    cross-crate inliner, if a Z3 dep with a breaking `uN→nat` spec cast ever
    appears. Latent today.
-4. **End-to-end cargo-verus run** of a real `lean-backend = true` crate (none
+5. **End-to-end cargo-verus run** of a real `lean-backend = true` crate (none
    exist yet — the wiring is validated by compile + pattern-match only).
 
-## Commits this push
+## Commits
 
+**Parts 1–2 (the gate + polish):**
 ```
 359d100 test harness: pass --lean-backend for the tactus suite structurally
 9fea1b8 cargo-verus: per-crate lean-backend via [package.metadata.verus]
@@ -211,5 +337,19 @@ c8e4c6b lean_verify: split mut-ref normalization pass out of sst_to_lean
 cae9e92 lean_verify: tidy — collapse type_bound_predicate shapes + factor nat-coercion leaf
 13daf95 poems: 2026-06-05 — arriving into the pause
 ```
-(Plus the `tactus_auto` probe — reverted, uncommitted — and the mut-ref
-investigation — no change.)
+(Plus the original `tactus_auto` probe — reverted; the mut-ref investigation — no change.)
+
+**Part 4 (gap-fixes + the inversion):**
+```
+1d3eb00 DESIGN: document the exec-fn routing inversion (Lean-default + #[verifier::z3])
+41db9bb verifier: invert exec routing — Lean-default under --lean-backend + #[verifier::z3] opt-out
+0856387 lean_verify: materialize struct-field bounds (0 ≤ h.v < 256 for u8 fields)
+3fe3442 test: pin inherent-method naming via a tactus_auto exec fn (Holder.view)
+76b0218 lean_verify: naturalize inherent impl method names (impl__0.view → Holder.view)
+26e6379 lean_verify: lower field-path LHS assignment to a functional update
+aa66508 lean_verify: render abstract trait-method calls via class dispatch (+ trait-exec-in-Lean test)
+a516a57 lean_verify: binder-aware receiver deref for exec body/ensures field access
+03e1591 lean_verify: sanitize trait `Self%` type-param in exec/proof theorem binders
+```
+(The route-all probe was re-applied to drive Part 4, then retired into the
+committed `41db9bb` routing — no longer uncommitted.)
