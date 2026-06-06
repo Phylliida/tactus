@@ -272,6 +272,31 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === File-level import reaches a plain exec fn's generated file ===
+// Regression for BUG-lean-backend-main-lean-drops-mathlib-import.md. Under
+// `--lean-backend` a plain exec fn (no `tactus_auto`) still routes to Lean,
+// and its generated file's preamble over-approximates to include EVERY
+// emittable proof fn — here `sq_nonneg_lemma`, whose body uses `nlinarith`.
+// The source `import Mathlib.Tactic.Linarith` is attached per-fn at
+// macro-expansion (gated on `tactic_by`/`tactus_auto`), so `plain_exec`'s own
+// `lean_imports` is empty; pre-fix its file dropped the Mathlib import and
+// `nlinarith` was "unknown tactic". `krate_preamble` now emits the krate-wide
+// union of imports into every file.
+test_verify_one_file! {
+    #[test] test_plain_exec_fn_file_gets_file_level_import verus_code! {
+        import Mathlib.Tactic.Linarith
+
+        proof fn sq_nonneg_lemma(x: int)
+            ensures x * x >= 0
+        by {
+            nlinarith [sq_nonneg x]
+        }
+
+        fn plain_exec() {
+        }
+    } => Ok(())
+}
+
 // === Source map: error includes tactic line number ===
 
 test_verify_one_file! {

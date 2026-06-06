@@ -214,54 +214,6 @@ fn krate_preamble(
 ) -> (Vec<Command>, String) {
     let emit_accessors = config.emit_accessors();
 
-    // Aggregate fragments across all theorems. Dedup preserves
-    // first-occurrence order via a HashSet for membership and a
-    // Vec for ordering.
-    let mut seen_fragments: std::collections::HashSet<&crate::lean_ast::PreambleFragment>
-        = std::collections::HashSet::new();
-    let mut ordered_fragments: Vec<&crate::lean_ast::PreambleFragment> = Vec::new();
-    for theorem in theorems {
-        for frag in &theorem.requires_preamble {
-            if seen_fragments.insert(frag) {
-                ordered_fragments.push(frag);
-            }
-        }
-    }
-
-    let mut cmds: Vec<Command> = Vec::new();
-    for imp in imports {
-        cmds.push(Command::Import(imp.clone()));
-    }
-    // Theorem-required Imports go before the prelude — Lean's
-    // `import` statements must precede any other commands at file top.
-    for frag in &ordered_fragments {
-        if let crate::lean_ast::PreambleFragment::Import(s) = frag {
-            cmds.push(Command::Import(s.clone()));
-        }
-    }
-    cmds.push(Command::Raw(TACTUS_PRELUDE.to_string()));
-    // Theorem-required PreludeAddendums go after the prelude — they
-    // typically declare instances that depend on the prelude's
-    // definitions and on the imports above.
-    for frag in &ordered_fragments {
-        if let crate::lean_ast::PreambleFragment::PreludeAddendum(s) = frag {
-            cmds.push(Command::Raw(s.clone()));
-        }
-    }
-
-    let ns = sanitize(crate_name);
-    cmds.push(Command::NamespaceOpen(ns.clone()));
-
-    let all_fns: Vec<&FunctionX> = krate.functions.iter().map(|f| &f.x).collect();
-    let spec_fn_map = dep_order::build_spec_fn_map(&all_fns);
-    // `method_lookup` is the all-fn map (spec + proof + exec, no
-    // filtering). Shared with `collect_references` so the dep walk
-    // can resolve TraitMethodImpl→method redirects and walk into
-    // exec-callee specs via the `call_inlining` abstraction.
-    let method_lookup: std::collections::HashMap<&Fun, &FunctionX> = all_fns.iter()
-        .map(|f| (&f.name, *f))
-        .collect();
-
     // Compute helpers_to_emit: proof fns the root might invoke as
     // lemmas from `have _ := lemma args` in its tactic body. Always
     // excluded: `root_fns` themselves (each emits as its file's main
@@ -273,7 +225,9 @@ fn krate_preamble(
     // These helpers' dep-walk roots feed into the spec-fn dep walk
     // alongside `root_fns`, so any spec fn / datatype / trait the
     // helpers transitively reference also lands in the preamble.
-    // See BUG-no-helper-proof-fn-call-from-exec.md.
+    // See BUG-no-helper-proof-fn-call-from-exec.md. Computed up here
+    // (before the import block) because the file's imports are the union
+    // over exactly the fns emitted into it — root_fns + helpers_to_emit.
     let root_fn_set: std::collections::HashSet<&Fun> =
         root_fns.iter().map(|f| &f.name).collect();
     let is_emittable_helper = |f: &&FunctionX| {
@@ -316,6 +270,75 @@ fn krate_preamble(
             .filter(|f| !root_fn_set.contains(&f.name))
             .collect(),
     };
+
+    // Aggregate fragments across all theorems. Dedup preserves
+    // first-occurrence order via a HashSet for membership and a
+    // Vec for ordering.
+    let mut seen_fragments: std::collections::HashSet<&crate::lean_ast::PreambleFragment>
+        = std::collections::HashSet::new();
+    let mut ordered_fragments: Vec<&crate::lean_ast::PreambleFragment> = Vec::new();
+    for theorem in theorems {
+        for frag in &theorem.requires_preamble {
+            if seen_fragments.insert(frag) {
+                ordered_fragments.push(frag);
+            }
+        }
+    }
+
+    let mut cmds: Vec<Command> = Vec::new();
+    // File-level imports (declared at the top of the source `verus! { }`
+    // block) are attached per-fn at macro-expansion time, gated on
+    // `tactic_by` / `tactus_auto`. Under `--lean-backend` an exec fn routes to
+    // Lean WITHOUT carrying that attr (e.g. a plain `fn main`), so its own
+    // `lean_imports` is empty — yet its preamble emits proof fns whose bodies
+    // may use `nlinarith` / `ring` / … So emit the union of imports over the
+    // fns ACTUALLY emitted into this file: `root_fns` + `helpers_to_emit`.
+    //
+    // This is scoped to the file's content, not the whole krate: a per-fn file
+    // gets the imports of its root + the helper proof fns its preamble actually
+    // contains — NOT a blanket union of every source file's imports in the
+    // crate. (For an exec-fn file the over-approximation puts every emittable
+    // proof fn in the preamble, so its imports legitimately span those fns'
+    // source files; for a proof-fn file it's just the downward closure.) The
+    // passed `imports` (this fn's own) seed the order.
+    let mut seen_imports: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let emitted_fn_imports = root_fns.iter().chain(helpers_to_emit.iter())
+        .flat_map(|f| f.attrs.lean_imports.iter());
+    for imp in imports.iter().chain(emitted_fn_imports) {
+        if seen_imports.insert(imp.as_str()) {
+            cmds.push(Command::Import(imp.clone()));
+        }
+    }
+    // Theorem-required Imports go before the prelude — Lean's
+    // `import` statements must precede any other commands at file top.
+    for frag in &ordered_fragments {
+        if let crate::lean_ast::PreambleFragment::Import(s) = frag {
+            cmds.push(Command::Import(s.clone()));
+        }
+    }
+    cmds.push(Command::Raw(TACTUS_PRELUDE.to_string()));
+    // Theorem-required PreludeAddendums go after the prelude — they
+    // typically declare instances that depend on the prelude's
+    // definitions and on the imports above.
+    for frag in &ordered_fragments {
+        if let crate::lean_ast::PreambleFragment::PreludeAddendum(s) = frag {
+            cmds.push(Command::Raw(s.clone()));
+        }
+    }
+
+    let ns = sanitize(crate_name);
+    cmds.push(Command::NamespaceOpen(ns.clone()));
+
+    let all_fns: Vec<&FunctionX> = krate.functions.iter().map(|f| &f.x).collect();
+    let spec_fn_map = dep_order::build_spec_fn_map(&all_fns);
+    // `method_lookup` is the all-fn map (spec + proof + exec, no
+    // filtering). Shared with `collect_references` so the dep walk
+    // can resolve TraitMethodImpl→method redirects and walk into
+    // exec-callee specs via the `call_inlining` abstraction.
+    let method_lookup: std::collections::HashMap<&Fun, &FunctionX> = all_fns.iter()
+        .map(|f| (&f.name, *f))
+        .collect();
+
     // Resolve broadcast lemma `Fun` identities (#122) to their
     // `FunctionX` via the all-fn map. Cross-crate lemmas live in the
     // merged krate (via `merge_krates`) with body=None but
