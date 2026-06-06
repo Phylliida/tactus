@@ -122,6 +122,51 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === Recursive spec fn with a MODULAR decreases measure (gcd) ===
+// Regression for BUG-spec-fn-decreases-mod-termination.md. The termination
+// goal is `a % b < b`, which Lean's default `decreasing_tactic` (and bare
+// `omega` — the divisor `b` is a variable) can't discharge; the emitted
+// `decreasing_by` reaches `apply Nat.mod_lt <;> omega`. Pre-fix, `gcd`
+// failed to compile and everything downstream cascaded.
+test_verify_one_file! {
+    #[test] test_spec_fn_mod_decreases verus_code! {
+        spec fn gcd(a: nat, b: nat) -> nat
+            decreases b
+        {
+            if b == 0 { a } else { gcd(b, (a % b) as nat) }
+        }
+
+        proof fn gcd_base(a: nat)
+            ensures gcd(a, 0) == a
+        by {
+            unfold gcd; simp
+        }
+    } => Ok(())
+}
+
+// === Recursive spec fn with a Nat-SUBTRACTION measure (subtractive Euclid) ===
+// Regression guard: this verified pre-fix via Lean's *default* decreasing
+// tactic; confirm the now-explicit `decreasing_by` (whose first rung is
+// `omega`) still closes `(a - b) + b < a + b` under the branch guards.
+test_verify_one_file! {
+    #[test] test_spec_fn_sub_decreases verus_code! {
+        spec fn gcd_sub(a: nat, b: nat) -> nat
+            decreases a + b
+        {
+            if b == 0 { a }
+            else if a == 0 { b }
+            else if a >= b { gcd_sub((a - b) as nat, b) }
+            else { gcd_sub(a, (b - a) as nat) }
+        }
+
+        proof fn gcd_sub_base(a: nat)
+            ensures gcd_sub(a, 0) == a
+        by {
+            unfold gcd_sub; simp
+        }
+    } => Ok(())
+}
+
 // === Dependency ordering: helper → double → proof fn ===
 
 test_verify_one_file! {

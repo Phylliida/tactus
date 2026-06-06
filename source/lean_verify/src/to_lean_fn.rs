@@ -33,6 +33,35 @@ const SUBTYPE_WITNESS_AUTO_PROOF: &str = "first | rfl | simp_all";
 /// should be readable, so the fallback is defensive only.
 const TACTIC_BODY_FALLBACK: &str = "sorry";
 
+/// `decreasing_by` tactic for recursive spec/proof fns whose `decreases`
+/// measure produces an obligation Lean's default `decreasing_tactic`
+/// can't discharge on its own.
+///
+/// **This is termination-replay, not verification.** Verus's own
+/// `decreases` checker already certified termination before Tactus ran;
+/// this clause only re-establishes that fact for Lean's kernel so it
+/// accepts the recursive `def`/`theorem`. It is visible in the generated
+/// `.lean` and is the same substrate-class machinery as `termination_by`
+/// itself and the datatype `height` fn's `decreasing_by` (which uses a
+/// `simp_all; omega` variant for its `sizeOf`-with-`.deref` goals).
+///
+/// The three branches, tried in order via `first` (which backtracks
+/// cleanly on a failed branch):
+/// - `omega` — linear-arithmetic measures: `(n - 1) < n` (fact/pow/fib),
+///   Nat-subtraction (`(a - b) + b < a + b`, subtractive Euclid).
+/// - `apply Nat.mod_lt <;> omega` — the **modular** obligation `a % b < b`
+///   (Euclidean gcd), which `omega` *cannot* prove because the divisor
+///   `b` is a variable, not a literal. `apply` leaves the side goal
+///   `b > 0`, which `omega` discharges from the `¬ b = 0` branch guard.
+/// - `decreasing_tactic` — Lean's default, kept as a final fallback so
+///   spec fns recursing on a structural / `sizeOf` / datatype-height
+///   measure (which neither earlier branch handles) terminate exactly as
+///   they do today (those currently pass via the implicit default).
+///
+/// Tested against Lean 4.25.0 (BUG-spec-fn-decreases-mod-termination.md).
+const DECREASING_BY_TACTIC: &str =
+    "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | decreasing_tactic)";
+
 /// True when this param needs a body shadow because the shadow is
 /// load-bearing for the **mutation encoding** — `*x = e` lowers to
 /// `let x := e` in Lean, requiring `x` to be at the inner-typ level
@@ -207,7 +236,14 @@ pub fn spec_fn_to_ast(f: &FunctionX, unemittable: &std::collections::HashSet<Pat
             let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| {
                 crate::to_lean_expr::vir_expr_to_ast_with_binders(d, &binder_ctx, &crate::expr_shared::RenderCtx::empty())
             }).collect();
-            Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by, decreasing_by: None })
+            // Recursive spec fns get an explicit `decreasing_by` so measures
+            // Lean's default tactic can't discharge (notably the modular
+            // `a % b < b` of Euclidean gcd) still verify. Non-recursive defs
+            // (empty `termination_by`) get `None` — a bare `decreasing_by`
+            // without `termination_by` is a Lean error. See DECREASING_BY_TACTIC.
+            let decreasing_by = (!termination_by.is_empty())
+                .then(|| DECREASING_BY_TACTIC.to_string());
+            Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by, decreasing_by })
         }
         None => Command::Axiom(Axiom { name, binders, ret_ty, attrs: vec![] }),
     }
