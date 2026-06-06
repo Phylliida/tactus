@@ -679,7 +679,38 @@ spec fn factorial(n: nat) -> nat
 @[irreducible] noncomputable def factorial (n : Nat) : Nat :=
   if n = 0 then 1 else n * factorial (n - 1)
 termination_by n
+decreasing_by all_goals (first | omega | (apply Nat.mod_lt <;> omega) | decreasing_tactic)
 ```
+
+**`decreasing_by` on recursive spec/proof fns (landed 2026-06-06).** Every
+recursive spec fn (and recursive proof fn — see below) emits the explicit
+`decreasing_by` shown above (the `DECREASING_BY_TACTIC` const in
+`to_lean_fn.rs`), gated on a non-empty `termination_by` (a bare `decreasing_by`
+on a non-recursive def is a Lean error). It's **termination-replay, not
+verification** — Verus's `decreases` checker already certified termination
+before Tactus ran; the clause only re-establishes that fact so Lean's kernel
+accepts the recursive `def`/`theorem`. Same substrate-class machinery as
+`termination_by` itself and the datatype `height` fn's `decreasing_by` (which
+uses a `simp_all; omega` variant for its `sizeOf`-with-`.deref` goals); visible
+in the generated `.lean`, so Principle #1 holds. The three branches, tried in
+order via `first` (backtracks cleanly on a failed branch):
+- `omega` — linear-arithmetic measures (`(n - 1) < n` for fact/pow/fib,
+  Nat-subtraction `(a - b) + b < a + b` for subtractive Euclid). These passed
+  pre-fix via Lean's implicit default, so no regression.
+- `apply Nat.mod_lt <;> omega` — the **modular** obligation `a % b < b`
+  (Euclidean gcd). `omega` *can't* prove it because the divisor `b` is a
+  variable, not a literal; `apply` leaves the side goal `b > 0`, which `omega`
+  discharges from the `¬ b = 0` branch guard. **This is the fix** for
+  BUG-spec-fn-decreases-mod-termination.md — pre-fix `gcd` failed to compile
+  (default `decreasing_tactic` couldn't close `a % b < b`) and everything
+  downstream cascaded.
+- `decreasing_tactic` — Lean's default, kept as the final fallback so spec fns
+  recursing on a structural / `sizeOf` / datatype-height measure (which neither
+  earlier branch handles) terminate exactly as they did before.
+
+Pinned by `test_spec_fn_mod_decreases` (gcd) + `test_spec_fn_sub_decreases`
+(subtractive-Euclid regression guard) + `test_proof_fn_recursive_mod_decreases`
+(proof-fn twin) + the `theorem_with_decreasing_by` pp test.
 
 Body-less spec fns (landed 2026-05-12):
 ```rust
@@ -3762,6 +3793,19 @@ method: `VERUS_EXTRA_ARGS="--log-dir <d> --log vir-sst"` on the probe test
   Lean often auto-infers for simple structural cases (`n - 1` on Nat),
   but the explicit clause is required for Collatz-shape or non-obvious
   measures — and is structurally cleaner regardless.
+
+  **Modular measures — `decreasing_by` added 2026-06-06.** Pre-fix
+  `Theorem` had no `decreasing_by` field, so a recursive proof fn whose
+  measure Lean's default tactic can't discharge (the modular `a % b < b`)
+  failed the same way the spec-fn gcd did. `proof_fn_to_ast` now also
+  populates `Theorem.decreasing_by` from the shared `DECREASING_BY_TACTIC`
+  (gated on non-empty `termination_by`); `write_theorem` renders it after
+  `termination_by`. See the "`decreasing_by` on recursive spec/proof fns"
+  note under § "Spec fn translation" for the tactic and its rationale.
+  Pinned by `test_proof_fn_recursive_mod_decreases` (a `decreases b` proof
+  fn recursing via `mod_rec b (a % b)`, where the `decreasing_by` reads the
+  `¬ b = 0` hypothesis from the dependent-`if` else branch) +
+  `theorem_with_decreasing_by` (pp render order).
 
   **Still deferred — recursive proof-fn TRAIT methods.** Class methods
   in Lean don't accept `termination_by` clauses directly (verified
