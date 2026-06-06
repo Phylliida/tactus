@@ -10211,6 +10211,29 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Test B': recursive proof fn with a MODULAR measure — the proof-fn twin of
+// the spec-fn gcd fix (BUG-spec-fn-decreases-mod-termination.md). The
+// recursive call passes `(a % b)` as the new second param, so Lean's
+// termination obligation is `a % b < b`, which the default `decreasing_tactic`
+// and bare `omega` both fail (variable divisor). The emitted `decreasing_by`'s
+// `apply Nat.mod_lt <;> omega` rung closes it, using the `¬ b = 0` hypothesis
+// the dependent-`if` else branch puts in scope. Pre-fix, `Theorem` had no
+// `decreasing_by` field at all, so this hit the identical wall as gcd.
+test_verify_one_file! {
+    #[test] test_proof_fn_recursive_mod_decreases verus_code! {
+        proof fn mod_rec(a: nat, b: nat)
+            ensures a >= 0
+            decreases b
+        by {
+            if h : b = 0 then
+                omega
+            else
+                have _ih := mod_rec b (a % b)
+                omega
+        }
+    } => Ok(())
+}
+
 // Probe (2026-05-17): does `&mut v[i]` work today?
 //
 // Rust+Verus's `rust_to_vir_expr` desugars `&mut v[i]` for

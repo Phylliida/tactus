@@ -347,6 +347,12 @@ pub fn proof_fn_to_ast(
     let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| {
         crate::to_lean_expr::vir_expr_to_ast_with_binders(d, &binder_ctx, &crate::expr_shared::RenderCtx::empty())
     }).collect();
+    // Recursive proof fns get the same explicit `decreasing_by` as spec fns,
+    // so a measure Lean's default tactic can't discharge (the modular
+    // `a % b < b`) still verifies. Gated on non-empty `termination_by` — a
+    // bare `decreasing_by` on a non-recursive theorem is a Lean error.
+    let decreasing_by = (!termination_by.is_empty())
+        .then(|| DECREASING_BY_TACTIC.to_string());
     Theorem {
         name: lean_name(&f.name.path),
         binders,
@@ -355,6 +361,7 @@ pub fn proof_fn_to_ast(
         requires_preamble: Vec::new(),
         heartbeats: f.attrs.tactus_heartbeats,
         termination_by,
+        decreasing_by,
     }
 }
 

@@ -18,6 +18,7 @@ fn stub_theorem(name: &str, requires_preamble: Vec<PreambleFragment>) -> Theorem
         requires_preamble,
         heartbeats: None,
         termination_by: Vec::new(),
+        decreasing_by: None,
     }
 }
 

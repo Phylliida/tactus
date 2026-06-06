@@ -1622,7 +1622,11 @@ impl ObligationEmitter {
             tactic,
             requires_preamble,
             heartbeats: self.heartbeats,
+            // Exec-fn obligation theorems are flat (recursion lives in the
+            // `CheckDecreaseHeight` obligation, not the theorem), so
+            // `termination_by` is always empty and `decreasing_by` is `None`.
             termination_by: Vec::new(),
+            decreasing_by: None,
         });
     }
 
