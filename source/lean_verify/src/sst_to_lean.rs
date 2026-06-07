@@ -1414,21 +1414,6 @@ impl OblCtx {
         }).collect()
     }
 
-    /// Names of the `Let` frames only (in frame order). Used by
-    /// `emit_with_closer` to `simp only [<these>]` after `intro`-ing
-    /// them, collapsing let-bound fvars to their definitions so the
-    /// user's tactic can reason through tuple-typed alias chains
-    /// (`let tmp := ret; let a := tmp.1; …`) — once intro'd, those
-    /// become opaque `ldecl`s that omega/simp_all can't push
-    /// projections through. Binder/Hyp frames are excluded: they're
-    /// not let-definitions, so naming them as simp lemmas would error.
-    fn let_frame_names(&self) -> Vec<String> {
-        self.frames.iter().filter_map(|f| match f {
-            CtxFrame::Let(name, _) => Some(name.as_str().to_string()),
-            CtxFrame::Binder(_) | CtxFrame::Hyp(_) => None,
-        }).collect()
-    }
-
     /// Split: pull leading `Binder` frames out as theorem-level binders,
     /// leaving the rest of the frames to wrap into the goal via the
     /// returned `OblCtx`. Used to make loop-modified-var names directly
@@ -1579,35 +1564,32 @@ impl ObligationEmitter {
         // (Let.name, Binder.name) and `_` for anonymous Hyps. See
         // `BUG-multi-var-loop-alpha-rename.md`.
         let intro_names = remaining.intro_names_for_user_tactic();
-        let final_closer = if intro_names.is_empty() {
+        // Only inject `intro <names>;` when `remaining` carries a Binder/Hyp
+        // frame that needs a source name. Those are the frames that couldn't
+        // extract to theorem level (a Binder/Hyp blocked behind a Let), and
+        // without the explicit intro they'd get inaccessible `i✝` dagger names
+        // the user's tactic can't reference (BUG-loop-local-names,
+        // BUG-multi-var-loop-alpha-rename).
+        //
+        // When `remaining` is ALL `Let` frames — the common `let (a, b) =
+        // call(..)` tuple-destructure shape — DON'T intro. The let names are
+        // synthetic temps the user never references, so the intro buys nothing;
+        // worse, intro-ing a tuple-typed let turns it into an opaque `ldecl`
+        // that omega can't push the projection through (`let tmp := ret; let b
+        // := tmp.2; b ≤ K` → omega can't reach `ret.2`). Left goal-position,
+        // omega's own zeta reduces the chain and the user's `by { omega }` runs
+        // on the real goal — no injected `simp`, transparency preserved (the
+        // auto-closer path `emit_split` never intros either). See
+        // BUG-tuple-destructure-alias-temps-block-omega.md.
+        let needs_intro = remaining.frames.iter()
+            .any(|f| !matches!(f, CtxFrame::Let(..)));
+        let final_closer = if !needs_intro {
             closer
         } else {
             let intros = format!("intro {};", intro_names.join(" "));
-            let user = match &closer {
-                Tactic::Named(n) => n.clone(),
-                Tactic::Raw(s) => s.clone(),
-            };
-            // Collapse the intro'd `let`-frames before the user's tactic.
-            // Once intro'd, a tuple-typed alias chain (`let tmp := ret;
-            // let a := tmp.1; …`) is an opaque `ldecl` that omega/simp_all
-            // can't push projections through (they zeta only goal-position
-            // lets), so `assert(a <= K) by { omega }` can't connect `a` to
-            // the call's `ensures` (stated over `ret`). `simp only [<lets>]`
-            // rewrites each let-fvar to its definition, restoring the
-            // bridge. Guards: `try` makes it a no-op when no let appears in
-            // the goal; `all_goals` keeps the user tactic valid if `simp
-            // only` happened to close the goal outright. Auto theorems
-            // (`emit_split`) don't intro, so their closer's zeta already
-            // handles this — this restores parity for the assert-by path.
-            // See BUG-tuple-destructure-alias-temps-block-omega.md.
-            let let_names = remaining.let_frame_names();
-            let body = if let_names.is_empty() {
-                format!("{}\n  {}", intros, user)
-            } else {
-                format!(
-                    "{}\n  (try simp only [{}] at *);\n  all_goals ({})",
-                    intros, let_names.join(", "), user,
-                )
+            let body = match closer {
+                Tactic::Named(n) => format!("{}\n  {}", intros, n),
+                Tactic::Raw(s) => format!("{}\n  {}", intros, s),
             };
             Tactic::Raw(body)
         };
