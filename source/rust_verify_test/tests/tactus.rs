@@ -6784,6 +6784,202 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Both destructured elements bridge to the call's ensures — `a` (the
+// first projection) and `b` (the second), each in its own assert.
+//
+// Nuance the comprehensive battery surfaced: bare `by { omega }` works for
+// a SINGLE tuple assert (test_exec_tuple_destructure_assert_omega), but the
+// SECOND assert here carries the first's result (`a <= 49`) forward as a `→`
+// antecedent over the let-bound `a` — and omega's own zeta does NOT reduce
+// goal-position lets that sit before a `→` antecedent referencing them. The
+// robust idiom is `simp_all <;> omega` (the reduction is in the USER's
+// tactic, visible) — the same rung the default closer uses. This works only
+// because the lets stay goal-position (the no-intro fix); WITH the old intro
+// even `simp_all <;> omega` failed.
+test_verify_one_file! {
+    #[test] test_exec_tuple_destructure_assert_both_elements verus_code! {
+        #[verifier::tactus_auto]
+        fn make_pair(x: u64) -> (p: (u64, u64))
+            requires x < 50
+            ensures p.0 == x, p.1 == x + 1
+        { (x, x + 1) }
+
+        #[verifier::tactus_auto]
+        fn use_pair(n: u64) -> (r: u64)
+            requires n < 50
+            ensures true
+        {
+            let (a, b) = make_pair(n);
+            assert(a <= 49) by { simp_all <;> omega };  // a == n <= 49
+            assert(b <= 50) by { simp_all <;> omega };  // b == n+1 <= 50
+            a
+        }
+    } => Ok(())
+}
+
+// Default closer (no `by`): the obligation goes through `emit_split`
+// (tactus_auto), which never intros — its `simp_all <;> omega` rung
+// zeta-reduces the goal-position lets. Confirms the auto path also
+// bridges the tuple alias chain (and was never the bug).
+test_verify_one_file! {
+    #[test] test_exec_tuple_destructure_assert_default_closer verus_code! {
+        #[verifier::tactus_auto]
+        fn make_pair(x: u64) -> (p: (u64, u64))
+            requires x < 50
+            ensures p.0 == x, p.1 == x + 1
+        { (x, x + 1) }
+
+        #[verifier::tactus_auto]
+        fn use_pair(n: u64) -> (r: u64)
+            requires n < 50
+            ensures true
+        {
+            let (a, b) = make_pair(n);
+            assert(b <= 50);                         // default closer, no `by`
+            a
+        }
+    } => Ok(())
+}
+
+// Name-free user tactic `simp_all <;> omega` — the idiom that replaces
+// ch7's brittle `simp only [<hard-coded temp names>]` crutch. Works
+// because the lets stay goal-position (no Tactus intro).
+test_verify_one_file! {
+    #[test] test_exec_tuple_destructure_assert_simp_all verus_code! {
+        #[verifier::tactus_auto]
+        fn make_pair(x: u64) -> (p: (u64, u64))
+            requires x < 50
+            ensures p.0 == x, p.1 == x + 1
+        { (x, x + 1) }
+
+        #[verifier::tactus_auto]
+        fn use_pair(n: u64) -> (r: u64)
+            requires n < 50
+            ensures true
+        {
+            let (a, b) = make_pair(n);
+            assert(b <= 50) by { simp_all <;> omega };
+            a
+        }
+    } => Ok(())
+}
+
+// Soundness negative: the fix must not make a FALSE bound pass. `b ==
+// n+1` and `n < 50` so `b` can be 50 — `assert(b <= 49)` is genuinely
+// unprovable and must fail.
+test_verify_one_file! {
+    #[test] test_exec_tuple_destructure_assert_wrong_bound verus_code! {
+        #[verifier::tactus_auto]
+        fn make_pair(x: u64) -> (p: (u64, u64))
+            requires x < 50
+            ensures p.0 == x, p.1 == x + 1
+        { (x, x + 1) }
+
+        #[verifier::tactus_auto]
+        fn use_pair(n: u64) -> (r: u64)
+            requires n < 50
+            ensures true
+        {
+            let (a, b) = make_pair(n);
+            assert(b <= 49) by { omega };            // FALSE: b can be 50
+            a
+        }
+    } => Err(_)
+}
+
+// Honest consequence (negative): a user's OWN `intros` re-creates the
+// opaque ldecls, so `by { intros; omega }` still fails — visibly, in the
+// user's tactic, not via Tactus hiding a step. The clean idiom is
+// `by { omega }` (test_exec_tuple_destructure_assert_omega).
+test_verify_one_file! {
+    #[test] test_exec_tuple_destructure_assert_user_intros_fails verus_code! {
+        #[verifier::tactus_auto]
+        fn make_pair(x: u64) -> (p: (u64, u64))
+            requires x < 50
+            ensures p.0 == x, p.1 == x + 1
+        { (x, x + 1) }
+
+        #[verifier::tactus_auto]
+        fn use_pair(n: u64) -> (r: u64)
+            requires n < 50
+            ensures true
+        {
+            let (a, b) = make_pair(n);
+            assert(b <= 50) by { intros; omega };    // user's intros breaks it
+            a
+        }
+    } => Err(_)
+}
+
+// Tuple CONSTRUCTION (the ch7 shape): `(d, c + d)` lowers with a
+// construction temp; the auto-generated postconditions `res.0 == d` /
+// `res.1 == c + d` go through `emit_split` (no intro) and close. Probes
+// the claim that the auto path was never affected by the alias bug —
+// distinct from the destructure (read) side.
+test_verify_one_file! {
+    #[test] test_exec_tuple_construction_postcondition verus_code! {
+        #[verifier::tactus_auto]
+        fn pair_with_temp(c: u64, d: u64) -> (res: (u64, u64))
+            requires c < 50, d < 50
+            ensures res.0 == d, res.1 == c + d
+        { (d, c + d) }
+    } => Ok(())
+}
+
+// Deeper chain: a 3-tuple destructure exercises the nested-Prod
+// projection (`.2.1` etc.) through the alias chain.
+test_verify_one_file! {
+    #[test] test_exec_triple_destructure_assert verus_code! {
+        #[verifier::tactus_auto]
+        fn make_triple(x: u64) -> (p: (u64, u64, u64))
+            requires x < 50
+            ensures p.0 == x, p.1 == x + 1, p.2 == x + 2
+        { (x, x + 1, x + 2) }
+
+        #[verifier::tactus_auto]
+        fn use_triple(n: u64) -> (r: u64)
+            requires n < 50
+            ensures true
+        {
+            let (a, b, c) = make_triple(n);
+            assert(c <= 51) by { omega };            // c == n+2 <= 51
+            a
+        }
+    } => Ok(())
+}
+
+// Interaction: the gate is per-assert. A fn with BOTH a tuple-destructure
+// assert (all-Let frames → no intro) AND a loop carrying its own
+// obligations must verify — the no-intro decision for one assert doesn't
+// disturb the loop's (intro-preserving) handling.
+test_verify_one_file! {
+    #[test] test_exec_tuple_destructure_and_loop verus_code! {
+        #[verifier::tactus_auto]
+        fn make_pair(x: u64) -> (p: (u64, u64))
+            requires x < 50
+            ensures p.0 == x, p.1 == x + 1
+        { (x, x + 1) }
+
+        #[verifier::tactus_auto]
+        fn mixed(n: u64) -> (r: u64)
+            requires n < 50
+            ensures true
+        {
+            let (a, b) = make_pair(n);
+            assert(b <= 50) by { omega };            // all-Let → no intro
+            let mut i: u64 = 0;
+            while i < n
+                invariant i <= n,
+                decreases n - i
+            {
+                assert(i < n) by { omega };          // loop-body assert-by
+                i = i + 1;
+            }
+            a
+        }
+    } => Ok(())
+}
+
 // #128: ret-substitution with EXTRA conjunct. Ensures has form
 // `r == E ∧ Q(r)`. After substitution, `Q(r)` becomes `Q(E)` and is
 // emitted as the `rest_ensures` Hyp. Caller relies on Q(E) for the

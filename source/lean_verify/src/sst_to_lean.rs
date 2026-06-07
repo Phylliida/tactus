@@ -1564,25 +1564,31 @@ impl ObligationEmitter {
         // (Let.name, Binder.name) and `_` for anonymous Hyps. See
         // `BUG-multi-var-loop-alpha-rename.md`.
         let intro_names = remaining.intro_names_for_user_tactic();
-        // Only inject `intro <names>;` when `remaining` carries a Binder/Hyp
-        // frame that needs a source name. Those are the frames that couldn't
-        // extract to theorem level (a Binder/Hyp blocked behind a Let), and
-        // without the explicit intro they'd get inaccessible `i✝` dagger names
-        // the user's tactic can't reference (BUG-loop-local-names,
-        // BUG-multi-var-loop-alpha-rename).
+        // WIP — gate under active design discussion (see the three-way tension
+        // below); the comprehensive tuple battery exposed that no single
+        // blanket gate serves every case.
         //
-        // When `remaining` is ALL `Let` frames — the common `let (a, b) =
-        // call(..)` tuple-destructure shape — DON'T intro. The let names are
-        // synthetic temps the user never references, so the intro buys nothing;
-        // worse, intro-ing a tuple-typed let turns it into an opaque `ldecl`
-        // that omega can't push the projection through (`let tmp := ret; let b
-        // := tmp.2; b ≤ K` → omega can't reach `ret.2`). Left goal-position,
-        // omega's own zeta reduces the chain and the user's `by { omega }` runs
-        // on the real goal — no injected `simp`, transparency preserved (the
-        // auto-closer path `emit_split` never intros either). See
-        // BUG-tuple-destructure-alias-temps-block-omega.md.
+        // Inject `intro <names>;` only when `remaining` carries a `Binder`
+        // frame that needs a source name (a Binder blocked behind a Let), which
+        // would otherwise get an inaccessible `i✝` dagger name the user's
+        // tactic can't reference (BUG-loop-local-names, BUG-multi-var-loop-
+        // alpha-rename). `Let`/`Hyp` frames are not a reason to intro: lets are
+        // synthetic temps the user never names (and intro-ing a *tuple*-typed
+        // let makes it an opaque `ldecl` omega can't project through), and Hyps
+        // are anonymous `→` antecedents that omega/simp_all intro themselves.
+        //
+        // The three-way tension this can't resolve alone:
+        // * omega-on-tuple wants NO intro (goal-position lets, zeta works).
+        // * nlinarith/linarith/ring want intro (NOT intro-aware — can't see
+        //   goal-position lets/hyps). `test_self_assign_mul_overflow_bound`
+        //   (`by { nlinarith }`) regresses under this gate: its asserts have
+        //   `Hyp` frames but no `Binder`, so no intro, so nlinarith fails.
+        // * The distinguishing factor is the user tactic's intro-awareness,
+        //   which Tactus can't see. A type-aware variant ("intro everything
+        //   except tuple-typed lets") would need let-type info on the frame.
+        // See BUG-tuple-destructure-alias-temps-block-omega.md.
         let needs_intro = remaining.frames.iter()
-            .any(|f| !matches!(f, CtxFrame::Let(..)));
+            .any(|f| matches!(f, CtxFrame::Binder(..)));
         let final_closer = if !needs_intro {
             closer
         } else {
