@@ -6754,6 +6754,36 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Regression for BUG-tuple-destructure-alias-temps-block-omega.md.
+// `let (a, b) = make_pair(n)` lowers to a tuple-typed let-alias chain
+// (`let tmp := ret; let a := tmp.1; let b := tmp.2`). For an `assert(P)
+// by { tac }`, `emit_with_closer` intros those let-frames before the
+// user tactic — converting them to opaque `ldecl`s that omega can't
+// push the projection through, so `b` never connects to the call's
+// inlined `ensures` (stated over `ret`). The fix collapses the intro'd
+// let-frames (`simp only [<lets>]`) before the user tactic. Auto
+// theorems (postconditions) were never affected — they don't intro, so
+// the closer's zeta handles the goal-position lets.
+test_verify_one_file! {
+    #[test] test_exec_tuple_destructure_assert_omega verus_code! {
+        #[verifier::tactus_auto]
+        fn make_pair(x: u64) -> (p: (u64, u64))
+            requires x < 50
+            ensures p.0 == x, p.1 == x + 1
+        { (x, x + 1) }
+
+        #[verifier::tactus_auto]
+        fn use_pair(n: u64) -> (r: u64)
+            requires n < 50
+            ensures true
+        {
+            let (a, b) = make_pair(n);             // a == n, b == n+1
+            assert(b <= 50) by { omega };           // needs b -> ret.2 -> ensures
+            a
+        }
+    } => Ok(())
+}
+
 // #128: ret-substitution with EXTRA conjunct. Ensures has form
 // `r == E ∧ Q(r)`. After substitution, `Q(r)` becomes `Q(E)` and is
 // emitted as the `rest_ensures` Hyp. Caller relies on Q(E) for the
