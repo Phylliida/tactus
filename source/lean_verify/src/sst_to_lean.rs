@@ -1564,29 +1564,33 @@ impl ObligationEmitter {
         // (Let.name, Binder.name) and `_` for anonymous Hyps. See
         // `BUG-multi-var-loop-alpha-rename.md`.
         let intro_names = remaining.intro_names_for_user_tactic();
-        // WIP — gate under active design discussion (see the three-way tension
-        // below); the comprehensive tuple battery exposed that no single
-        // blanket gate serves every case.
+        // The rule: Tactus injects `intro <names>;` ONLY to give a `Binder`
+        // frame a source name. Everything else is the user tactic's own job.
         //
-        // Inject `intro <names>;` only when `remaining` carries a `Binder`
-        // frame that needs a source name (a Binder blocked behind a Let), which
-        // would otherwise get an inaccessible `i✝` dagger name the user's
-        // tactic can't reference (BUG-loop-local-names, BUG-multi-var-loop-
-        // alpha-rename). `Let`/`Hyp` frames are not a reason to intro: lets are
-        // synthetic temps the user never names (and intro-ing a *tuple*-typed
-        // let makes it an opaque `ldecl` omega can't project through), and Hyps
-        // are anonymous `→` antecedents that omega/simp_all intro themselves.
+        // A `Binder` blocked behind a `Let` couldn't extract to theorem level,
+        // and without an explicit intro it gets an inaccessible `i✝` dagger
+        // name the user's tactic can't reference (BUG-loop-local-names,
+        // BUG-multi-var-loop-alpha-rename) — so a `Binder` in `remaining` is the
+        // one case Tactus MUST intro.
         //
-        // The three-way tension this can't resolve alone:
-        // * omega-on-tuple wants NO intro (goal-position lets, zeta works).
-        // * nlinarith/linarith/ring want intro (NOT intro-aware — can't see
-        //   goal-position lets/hyps). `test_self_assign_mul_overflow_bound`
-        //   (`by { nlinarith }`) regresses under this gate: its asserts have
-        //   `Hyp` frames but no `Binder`, so no intro, so nlinarith fails.
-        // * The distinguishing factor is the user tactic's intro-awareness,
-        //   which Tactus can't see. A type-aware variant ("intro everything
-        //   except tuple-typed lets") would need let-type info on the frame.
-        // See BUG-tuple-destructure-alias-temps-block-omega.md.
+        // `Let` and `Hyp` frames are NOT a reason to intro:
+        // * `Let` frames are synthetic temps the user never names — and
+        //   intro-ing a *tuple*-typed let makes it an opaque `ldecl` omega
+        //   can't project through (`let tmp := ret; let b := tmp.2; b ≤ K` →
+        //   omega can't reach `ret.2`). Left goal-position, omega's own zeta
+        //   reduces it and `by { omega }` runs on the real goal.
+        // * `Hyp` frames are anonymous `→` antecedents (e.g. a prior assert's
+        //   result); omega/simp_all intro them themselves.
+        //
+        // Consequence — the user tactic owns its own intro (matches DESIGN §
+        // "tactic-text prepending" + the `intros; nlinarith` idiom): intro-aware
+        // tactics (omega, simp_all) need nothing; non-intro-aware ones
+        // (nlinarith / linarith / ring — Mathlib tactics that act on the
+        // current goal, not goal-position binders) write `by { intros; tac }`.
+        // This is the deliberate trade chosen over a type-aware "intro all but
+        // tuple lets" gate (general rule > special case; the user's intro is
+        // visible, not a hidden Tactus step). See
+        // BUG-tuple-destructure-alias-temps-block-omega.md.
         let needs_intro = remaining.frames.iter()
             .any(|f| matches!(f, CtxFrame::Binder(..)));
         let final_closer = if !needs_intro {
