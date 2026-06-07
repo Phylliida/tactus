@@ -1414,6 +1414,21 @@ impl OblCtx {
         }).collect()
     }
 
+    /// Names of the `Let` frames only (in frame order). Used by
+    /// `emit_with_closer` to `simp only [<these>]` after `intro`-ing
+    /// them, collapsing let-bound fvars to their definitions so the
+    /// user's tactic can reason through tuple-typed alias chains
+    /// (`let tmp := ret; let a := tmp.1; …`) — once intro'd, those
+    /// become opaque `ldecl`s that omega/simp_all can't push
+    /// projections through. Binder/Hyp frames are excluded: they're
+    /// not let-definitions, so naming them as simp lemmas would error.
+    fn let_frame_names(&self) -> Vec<String> {
+        self.frames.iter().filter_map(|f| match f {
+            CtxFrame::Let(name, _) => Some(name.as_str().to_string()),
+            CtxFrame::Binder(_) | CtxFrame::Hyp(_) => None,
+        }).collect()
+    }
+
     /// Split: pull leading `Binder` frames out as theorem-level binders,
     /// leaving the rest of the frames to wrap into the goal via the
     /// returned `OblCtx`. Used to make loop-modified-var names directly
@@ -1568,9 +1583,31 @@ impl ObligationEmitter {
             closer
         } else {
             let intros = format!("intro {};", intro_names.join(" "));
-            let body = match closer {
-                Tactic::Named(n) => format!("{}\n  {}", intros, n),
-                Tactic::Raw(s) => format!("{}\n  {}", intros, s),
+            let user = match &closer {
+                Tactic::Named(n) => n.clone(),
+                Tactic::Raw(s) => s.clone(),
+            };
+            // Collapse the intro'd `let`-frames before the user's tactic.
+            // Once intro'd, a tuple-typed alias chain (`let tmp := ret;
+            // let a := tmp.1; …`) is an opaque `ldecl` that omega/simp_all
+            // can't push projections through (they zeta only goal-position
+            // lets), so `assert(a <= K) by { omega }` can't connect `a` to
+            // the call's `ensures` (stated over `ret`). `simp only [<lets>]`
+            // rewrites each let-fvar to its definition, restoring the
+            // bridge. Guards: `try` makes it a no-op when no let appears in
+            // the goal; `all_goals` keeps the user tactic valid if `simp
+            // only` happened to close the goal outright. Auto theorems
+            // (`emit_split`) don't intro, so their closer's zeta already
+            // handles this — this restores parity for the assert-by path.
+            // See BUG-tuple-destructure-alias-temps-block-omega.md.
+            let let_names = remaining.let_frame_names();
+            let body = if let_names.is_empty() {
+                format!("{}\n  {}", intros, user)
+            } else {
+                format!(
+                    "{}\n  (try simp only [{}] at *);\n  all_goals ({})",
+                    intros, let_names.join(", "), user,
+                )
             };
             Tactic::Raw(body)
         };
