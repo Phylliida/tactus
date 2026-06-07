@@ -12312,8 +12312,13 @@ test_verify_one_file! {
                 invariant i <= n, n <= 10, x == 0
                 decreases n - i
             {
-                assert(x * (i + 1) <= 10000) by { nlinarith };
-                assert(0 <= x * (i + 1)) by { nlinarith };
+                // `nlinarith` is not intro-aware (it acts on the current goal,
+                // not goal-position binders/lets/hyps), so it owns its own
+                // intro via the documented `intros; nlinarith` idiom — Tactus
+                // injects `intro` only to name a Binder, which these asserts
+                // don't carry. See DESIGN § "Assert-by intro discipline".
+                assert(x * (i + 1) <= 10000) by { intros; nlinarith };
+                assert(0 <= x * (i + 1)) by { intros; nlinarith };
                 x = x * (i + 1);
                 i = i + 1;
             }
