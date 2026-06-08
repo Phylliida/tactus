@@ -2222,9 +2222,25 @@ fn push_mod_var_frames<'a>(
         modified_vars.iter()
             .map(|(ident, _)| crate::lean_name::LeanName::from_var_ident(ident))
             .collect();
+    // Also drop prior `Hyp` frames that MENTION a modified var. Such a hyp is
+    // a fact about the PRE-LOOP state — e.g. a pre-loop `assert(result ==
+    // fact(i))`, or a `let (a,b) = …; assert(..)` result — referencing a
+    // variable the loop changes. Per Hoare logic it isn't an assumption of the
+    // maintain/use obligation (only the invariant + cond are), and the var is
+    // re-quantified by the ∀-binder pushed below — so keeping the hyp dangles
+    // the reference (an UNBOUND `i` in the emitted theorem). The debug sanity
+    // check rejects that ("unresolved i"); release silently rebinds it via
+    // Lean's autoImplicit, masking the bug — the divergence that surfaced this.
+    // Dropping is sound: a maintain proof can't legitimately depend on a
+    // pre-loop fact about a variable the loop mutates. See
+    // BUG-preloop-assert-modvar-unbound.md.
+    let mod_name_strs: std::collections::HashSet<&str> =
+        mod_names.iter().map(|n| n.as_str()).collect();
     obl.frames.retain(|frame| match frame {
         CtxFrame::Let(name, _) => !mod_names.contains(name),
-        _ => true,
+        CtxFrame::Hyp(p) => !mod_name_strs.iter()
+            .any(|n| crate::lean_ast::mentions_free_var(p, n)),
+        CtxFrame::Binder(_) => true,
     });
     for (ident, typ) in modified_vars {
         // Modified-var binders carry the user's local-var VarIdent
