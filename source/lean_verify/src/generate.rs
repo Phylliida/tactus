@@ -328,6 +328,20 @@ fn krate_preamble(
 
     let ns = sanitize(crate_name);
     cmds.push(Command::NamespaceOpen(ns.clone()));
+    // Disable Lean's autoImplicit for the generated user-derived decls (spec
+    // fns + datatypes + theorems). Guardrail: a free identifier in a theorem
+    // signature is ALWAYS a codegen bug (Tactus emits explicit binders,
+    // type-params included), but autoImplicit would silently auto-bind it as
+    // an implicit `{x}` and the broken theorem "verifies" — which is exactly
+    // how the unbound-`i` loop bug (BUG-preloop-assert-modvar-unbound.md)
+    // passed in release while the debug-only sanity check rejected it. With
+    // autoImplicit off, Lean itself rejects any unbound reference in EVERY
+    // build profile, independent of the debug checker. Placed after the
+    // namespace so the hand-written prelude / addendums (which may legitimately
+    // use autobound) are unaffected. Validated zero-false-positive across the
+    // full e2e suite + every tutorial chapter. See DESIGN § "autoImplicit
+    // guardrail".
+    cmds.push(Command::Raw("set_option autoImplicit false".to_string()));
 
     let all_fns: Vec<&FunctionX> = krate.functions.iter().map(|f| &f.x).collect();
     let spec_fn_map = dep_order::build_spec_fn_map(&all_fns);

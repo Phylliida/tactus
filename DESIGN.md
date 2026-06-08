@@ -539,6 +539,31 @@ end my_crate.my_module
 
 This prevents name collisions between modules. Tactic bodies reference function names within the same namespace — `unfold double` works because `double` is in scope.
 
+### autoImplicit guardrail (2026-06-08)
+
+`generate.rs` emits `set_option autoImplicit false` immediately after the
+`namespace` open, so it applies to all generated **user-derived** decls (spec
+fns, datatypes, theorems) but not the hand-written prelude/addendums (which sit
+above the namespace and may legitimately use autobound).
+
+**Why.** A free identifier in a generated theorem signature is *always* a
+codegen bug — Tactus emits explicit binders, type-params included. But Lean's
+default autoImplicit silently auto-binds such a free var as an implicit `{x}`,
+so the broken theorem elaborates and "verifies." That is exactly how
+BUG-preloop-assert-modvar-unbound (a pre-loop assert hyp referencing a
+loop-modified `i`, dangling once the loop re-quantifies `i`) passed in **release**
+while the debug-only sanity check (`sanity.rs`, gated on `debug_assertions`)
+rejected it — a silent debug/release divergence, soundness-adjacent because the
+release theorem carried a spurious extra hypothesis.
+
+`autoImplicit false` makes **Lean itself** reject any unbound reference in
+*every* build profile, closing that sharp edge independent of the debug
+checker. It's purely additive (Lean only gets stricter) and was validated
+zero-false-positive across the full e2e suite + every tutorial chapter — as
+expected, since well-formed generated code never relies on autobound. The
+debug-only sanity check stays as a faster, more specific first line; this is the
+profile-independent backstop.
+
 ### Definition ordering
 
 Lean requires definitions before use within a file. Generated definitions are topologically sorted using VIR's call-graph dependency information.
