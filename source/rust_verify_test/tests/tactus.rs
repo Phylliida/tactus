@@ -6980,6 +6980,130 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === Pre-loop asserts over goal-position init lets (T1/T1-neg/T2) ===
+// From TACTUS-TESTS-TO-PIN-TUTORIAL.md. A fn's init/temp values (`let result
+// := 0; let i := 0;`) lower into GOAL position before a `while`; under the
+// assert-by intro discipline (DESIGN § "Assert-by intro discipline") these are
+// `Let` frames the user names via explicit `intro`/`show`. This is exactly the
+// shape that broke ch2 `fib_iter` / ch4 `factorial` / ch7 `fast_fib`.
+//
+// These also pin BUG-preloop-assert-modvar-unbound: a pre-loop assert whose
+// result mentions a loop-MODIFIED var (`i`) used to be carried into the loop's
+// maintain/use obligations, where `i` is re-quantified by `∀ i` — dangling the
+// reference to an UNBOUND `i`. The debug sanity check rejected it ("unresolved
+// i"); release silently rebound it via Lean's autoImplicit (masking the bug).
+// `push_mod_var_frames` now drops outer Hyp frames mentioning a modified var,
+// so the maintain/use obligations are clean in BOTH build profiles.
+
+// T1 — name the goal-position init lets with an explicit `intro result i`
+// (accessible names), then reason. The fib_iter idiom.
+test_verify_one_file! {
+    #[test] test_preloop_assert_names_init_lets verus_code! {
+        import Mathlib.Tactic.Linarith
+
+        spec fn cnt(n: nat) -> nat
+            decreases n
+        { if n == 0 { 0 } else { cnt((n - 1) as nat) + 1 } }
+
+        #[verifier::tactus_auto]
+        #[verifier::tactus_tactic("first | tactus_auto | (intros; omega)")]
+        fn g(n: u64) -> (r: u64)
+            requires n <= 100
+            ensures r <= 100
+        {
+            let mut result: u64 = 0;
+            let mut i: u64 = 0;
+            assert(result as nat == cnt(i as nat)) by {
+                intro result i
+                have h : i.toNat = 0 := by omega
+                rw [h]; unfold cnt; simp
+            };
+            while i < n
+                invariant result == i, i <= n,
+                decreases n - i
+            {
+                i = i + 1;
+                result = result + 1;
+            }
+            result
+        }
+    } => Ok(())
+}
+
+// T1-neg — plain `intros` (no names) introduces the goal-position lets with
+// INACCESSIBLE auto-names, so referencing `i` by name fails. Pins the
+// convention; a future change that re-enables accessible-name auto-intro for
+// pre-loop lets should flip this Err to Ok and let T1 simplify to `intros`.
+test_verify_one_file! {
+    #[test] test_preloop_assert_plain_intros_inaccessible verus_code! {
+        import Mathlib.Tactic.Linarith
+
+        spec fn cnt(n: nat) -> nat
+            decreases n
+        { if n == 0 { 0 } else { cnt((n - 1) as nat) + 1 } }
+
+        #[verifier::tactus_auto]
+        #[verifier::tactus_tactic("first | tactus_auto | (intros; omega)")]
+        fn g(n: u64) -> (r: u64)
+            requires n <= 100
+            ensures r <= 100
+        {
+            let mut result: u64 = 0;
+            let mut i: u64 = 0;
+            assert(result as nat == cnt(i as nat)) by {
+                intros
+                have h : i.toNat = 0 := by omega
+                rw [h]; unfold cnt; simp
+            };
+            while i < n
+                invariant result == i, i <= n,
+                decreases n - i
+            {
+                i = i + 1;
+                result = result + 1;
+            }
+            result
+        }
+    } => Err(err) => {
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("Unknown identifier"),
+            "expected inaccessible-let error, got: {}", msg);
+    }
+}
+
+// T2 — when the assert goal is a concrete equality, `show` strips the lets by
+// defeq (no naming needed). The factorial idiom.
+test_verify_one_file! {
+    #[test] test_preloop_assert_via_show verus_code! {
+        import Mathlib.Tactic.Linarith
+
+        spec fn fact(n: nat) -> nat
+            decreases n
+        { if n == 0 { 1 } else { n * fact((n - 1) as nat) } }
+
+        #[verifier::tactus_auto]
+        fn g(n: u64) -> (r: u64)
+            requires n <= 1
+            ensures r >= 1
+        {
+            let mut result: u64 = 1;
+            let mut i: u64 = 0;
+            assert(result as nat == fact(i as nat)) by {
+                show Int.toNat 1 = fact (Int.toNat 0)
+                unfold fact
+                simp
+            };
+            while i < n
+                invariant result >= 1, i <= n,
+                decreases n - i
+            {
+                i = i + 1;
+            }
+            result
+        }
+    } => Ok(())
+}
+
 // #128: ret-substitution with EXTRA conjunct. Ensures has form
 // `r == E ∧ Q(r)`. After substitution, `Q(r)` becomes `Q(E)` and is
 // emitted as the `rest_ensures` Hyp. Caller relies on Q(E) for the
