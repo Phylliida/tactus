@@ -6152,6 +6152,76 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// BUG-call-result-let-unnameable-in-assert.md (Approach A). A call
+// result `let x = f(..)` must be NAMEABLE inside an `assert(..) by { }`
+// block so a multi-step proof can reference `x`. Pre-fix, `x` was a
+// goal-position `let x := _tactus_ret_N` (not in the local context) →
+// "Unknown identifier `x`". The fix names the ∀-bound result with the
+// dest's source name and drops the alias let, so `x` is a real binder.
+test_verify_one_file! {
+    #[test] test_exec_call_result_nameable_in_assert verus_code! {
+        struct S { a: u64 }
+        spec fn sview(s: S) -> nat { s.a as nat }
+
+        #[verifier::tactus_auto]
+        fn mk() -> (r: S) ensures sview(r) == 0 { S { a: 0 } }
+
+        #[verifier::tactus_auto]
+        fn use_it() {
+            let x = mk();
+            assert(sview(x) == 0) by {
+                have h : sview x = 0 := by assumption
+                exact h
+            };
+        }
+    } => Ok(())
+}
+
+// The motivating shape: NAME the result, then DERIVE a fact about it
+// (unfold the ensures view, then omega). Impossible pre-fix — a derived
+// (non-`assumption`) goal had no proof when the result couldn't be named.
+test_verify_one_file! {
+    #[test] test_exec_call_result_derive_in_assert verus_code! {
+        struct S { a: u64 }
+        spec fn sview(s: S) -> nat { s.a as nat }
+
+        #[verifier::tactus_auto]
+        fn mk() -> (r: S) ensures sview(r) == 5 { S { a: 5 } }
+
+        #[verifier::tactus_auto]
+        fn use_derive() {
+            let q = mk();
+            assert(q.a == 5) by {
+                have h : sview q = 5 := by assumption
+                unfold sview at h
+                omega
+            };
+        }
+    } => Ok(())
+}
+
+// Self-ref guard: `let x = inc(x)` — the arg `x` survives in the
+// substituted ensures, so renaming the result binder to `x` would
+// capture it. The guard keeps the gensym + goal-position let here
+// (no rename), and it still verifies. Pins that the rename is gated.
+test_verify_one_file! {
+    #[test] test_exec_call_result_self_ref_keeps_gensym verus_code! {
+        #[verifier::tactus_auto]
+        fn inc(a: u64) -> (r: u64)
+            requires a < 100
+            ensures r == a + 1
+        { a + 1 }
+
+        #[verifier::tactus_auto]
+        fn use_selfref(x: u64)
+            requires x < 50
+        {
+            let x = inc(x);
+            assert(x <= 51) by { omega };
+        }
+    } => Ok(())
+}
+
 // NOTE: `assert forall|v: T| P by { tac }` (with non-empty `vars`)
 // inside a tactus_auto fn currently panics in Verus's poly encoding
 // pass (`vir/src/poly.rs:462`). The Tactus AssertBy + Ghost wrap
