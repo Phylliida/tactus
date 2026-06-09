@@ -1333,6 +1333,10 @@ pub fn trait_to_ast(
     // superclass bounds that REFERENCE a shell trait (a contentless
     // bound; see `drop_unemittable_trait_bounds`) (#122).
     unemittable: &std::collections::HashSet<Path>,
+    // Per-trait ordered out-param assoc-type names (own + transitively
+    // inherited), from `compute_trait_outparams`. Drives the inherited
+    // out-param binders + the `extends` out-param threading.
+    trait_outparams: &HashMap<Path, Vec<vir::ast::Ident>>,
 ) -> Class {
     let shell = unemittable.contains(&tr.name);
     // Positional class binders: `(Self : Type) (T : Type) … (Item : outParam Type)`.
@@ -1351,17 +1355,34 @@ pub fn trait_to_ast(
     }
     for assoc_name in tr.assoc_typs.iter() {
         typ_params.push(LBinder {
-            name: Some(crate::lean_name::LeanName::synthetic(sanitize(assoc_name))),
+            name: Some(crate::lean_name::LeanName::typ_param(assoc_name.as_str())),
             ty: LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Type"))),
             kind: BinderKind::OutParam,
         });
     }
+    // INHERITED out-params: a trait carries the (unpinned) out-params of its
+    // superclasses as its own `outParam` binders, so the `extends` clause can
+    // thread them into the parent's out-param slots (Lean can't leave an
+    // out-param a hole at class-declaration time). `compute_trait_outparams`
+    // gives the full ordered list (own + inherited); the own ones are already
+    // emitted above, so add only the inherited tail.
+    if let Some(all_outparams) = trait_outparams.get(&tr.name) {
+        let own: std::collections::HashSet<&str> =
+            tr.assoc_typs.iter().map(|a| a.as_str()).collect();
+        for name in all_outparams.iter() {
+            if own.contains(name.as_str()) { continue; }
+            typ_params.push(LBinder {
+                name: Some(crate::lean_name::LeanName::typ_param(name.as_str())),
+                ty: LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Type"))),
+                kind: BinderKind::OutParam,
+            });
+        }
+    }
 
-    // Use class-context bounds rendering so the trait's Self typ_param
-    // (`Self%`) normalizes to `Self` (the class's outer type variable)
-    // in inherited bounds like `trait Sub: Super` → `class Sub (Self :
-    // Type) [Super Self] where ...`.
-    let bounds = class_bounds_to_ast(&tr.typ_bounds, unemittable);
+    // Superclasses render as Lean's native `extends P₁, P₂, …`, with each
+    // parent's out-param slots threaded (see `class_extends_to_ast`). Lean's
+    // `extends` handles superclass transitivity for us.
+    let extends_parents = class_extends_to_ast(&tr.typ_bounds, unemittable, trait_outparams);
 
     // Pre-compute the set of sibling method names. Used by proof-fn
     // method-type rendering: ensures expressions that reference
@@ -1484,7 +1505,7 @@ pub fn trait_to_ast(
     Class {
         name: lean_name(&tr.name),
         typ_params,
-        bounds,
+        extends_parents,
         methods,
     }
 }
@@ -2424,6 +2445,116 @@ fn trait_bounds_to_ast(bounds: &GenericBounds, unemittable: &std::collections::H
 /// `Self : Type` binder, not the disambiguated `Self%` name).
 fn class_bounds_to_ast(bounds: &GenericBounds, unemittable: &std::collections::HashSet<Path>) -> Vec<LBinder> {
     trait_bounds_to_ast_with(bounds, unemittable, |t| typ_maybe_projection_to_expr(t))
+}
+
+/// For each emittable trait, the ordered list of associated-type out-param
+/// names its Lean `class` carries — its OWN `assoc_typs` followed by those it
+/// inherits (unpinned) through its superclass `extends` chain, deduplicated.
+///
+/// A child trait `extends` a parent whose class has out-params (`FnOnce`'s
+/// `Output`); Lean requires every out-param slot of the parent be supplied in
+/// the `extends` clause, and (unlike a normal positional arg) it can't be a
+/// hole at declaration time — so the child must carry the parent's out-params
+/// as its own `outParam` binders and thread them through. This is the
+/// transitive closure that makes `Fn`/`FnMut`/`FnOnce` (and any user trait
+/// whose superclass has an associated type) elaborate. Memoized; the
+/// superclass relation is a DAG, with a visited guard for safety.
+/// Shell (un-emittable) superclasses are skipped — their bounds are dropped,
+/// so their out-params are never threaded.
+pub fn compute_trait_outparams(
+    trait_map: &HashMap<Path, &TraitX>,
+    unemittable: &std::collections::HashSet<Path>,
+) -> HashMap<Path, Vec<vir::ast::Ident>> {
+    fn go(
+        path: &Path,
+        trait_map: &HashMap<Path, &TraitX>,
+        unemittable: &std::collections::HashSet<Path>,
+        memo: &mut HashMap<Path, Vec<vir::ast::Ident>>,
+        on_stack: &mut std::collections::HashSet<Path>,
+    ) -> Vec<vir::ast::Ident> {
+        if let Some(v) = memo.get(path) { return v.clone(); }
+        if !on_stack.insert(path.clone()) { return Vec::new(); } // cycle guard
+        let mut out: Vec<vir::ast::Ident> = Vec::new();
+        if let Some(tr) = trait_map.get(path) {
+            // Own associated types first (declaration order).
+            for a in tr.assoc_typs.iter() { out.push(a.clone()); }
+            // Then inherited (unpinned) out-params per superclass bound.
+            for bound in tr.typ_bounds.iter() {
+                if let GenericBoundX::Trait(TraitId::Path(sp), _) = &**bound {
+                    if unemittable.contains(sp) { continue; }
+                    // Names this trait pins for sp via a TypEquality are
+                    // concrete, not inherited as params.
+                    let pinned: std::collections::HashSet<&str> = tr.typ_bounds.iter()
+                        .filter_map(|b| match &**b {
+                            GenericBoundX::TypEquality(ep, _, name, _)
+                                if lean_name(ep) == lean_name(sp) => Some(name.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    for name in go(sp, trait_map, unemittable, memo, on_stack) {
+                        if pinned.contains(name.as_str()) { continue; }
+                        if !out.iter().any(|n| n.as_str() == name.as_str()) {
+                            out.push(name);
+                        }
+                    }
+                }
+            }
+        }
+        on_stack.remove(path);
+        memo.insert(path.clone(), out.clone());
+        out
+    }
+    let mut memo = HashMap::new();
+    let mut on_stack = std::collections::HashSet::new();
+    for path in trait_map.keys() {
+        go(path, trait_map, unemittable, &mut memo, &mut on_stack);
+    }
+    memo
+}
+
+/// The `extends P₁, P₂, …` parent list for a trait's class declaration. Each
+/// parent is the fully-applied class App with the parent's out-param slots
+/// threaded — positional typ-args, then for each out-param of the parent
+/// (in declaration order) either the value this trait pins via `TypEquality`,
+/// or a reference to this trait's own (inherited) out-param binder of the
+/// same name. Shell-trait bounds are dropped (`drop_unemittable_trait_bounds`).
+fn class_extends_to_ast(
+    bounds: &GenericBounds,
+    unemittable: &std::collections::HashSet<Path>,
+    trait_outparams: &HashMap<Path, Vec<vir::ast::Ident>>,
+) -> Vec<LExpr> {
+    let bounds = drop_unemittable_trait_bounds(bounds, unemittable);
+    let mut out = Vec::new();
+    for bound in bounds.iter() {
+        if let GenericBoundX::Trait(TraitId::Path(path), typs) = &**bound {
+            let mut args: Vec<LExpr> = typs.iter()
+                .map(|t| typ_maybe_projection_to_expr(t)).collect();
+            // Fill the parent's out-param slots in declaration order.
+            if let Some(parent_outparams) = trait_outparams.get(path) {
+                for name in parent_outparams.iter() {
+                    // A TypEquality on THIS bound pinning `name` → its value.
+                    let pinned = bounds.iter().find_map(|b| match &**b {
+                        GenericBoundX::TypEquality(ep, et, n, typ)
+                            if lean_name(ep) == lean_name(path)
+                                && n.as_str() == name.as_str()
+                                && et.len() == typs.len() => Some(typ),
+                        _ => None,
+                    });
+                    args.push(match pinned {
+                        Some(typ) => typ_maybe_projection_to_expr(typ),
+                        // Inherited: this trait carries an out-param binder of
+                        // the same name (added in `trait_to_ast`).
+                        None => LExpr::var(crate::lean_name::LeanName::typ_param(name.as_str())),
+                    });
+                }
+            }
+            out.push(LExpr::new(ExprNode::App {
+                head: Box::new(LExpr::new(ExprNode::Var(crate::lean_name::LeanName::from_path(path)))),
+                args,
+            }));
+        }
+    }
+    out
 }
 
 fn trait_bounds_to_ast_with<F>(

@@ -452,7 +452,15 @@ fn write_class(out: &mut String, c: &Class, lm: &mut Landmarks) {
     out.push_str("class ");
     out.push_str(&c.name);
     write_binders(out, &c.typ_params, lm);
-    write_binders(out, &c.bounds, lm);
+    // Superclasses via Lean's native `extends P₁, P₂, …` (comma-separated),
+    // which handles superclass transitivity + inherited outParams for us.
+    if !c.extends_parents.is_empty() {
+        out.push_str(" extends ");
+        for (i, p) in c.extends_parents.iter().enumerate() {
+            if i > 0 { out.push_str(", "); }
+            write_expr(out, p, 0, lm);
+        }
+    }
     out.push_str(" where\n");
     for m in &c.methods {
         out.push_str("  ");

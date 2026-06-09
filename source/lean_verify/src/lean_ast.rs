@@ -288,10 +288,16 @@ pub struct Variant {
 pub struct Class {
     pub name: String,
     /// Positional type params, including `Self`, trait-level type params,
-    /// and outParam-marked associated types (via `BinderKind::OutParam`).
+    /// own AND transitively-inherited outParam-marked associated types
+    /// (via `BinderKind::OutParam`).
     pub typ_params: Vec<Binder>,
-    /// Trait-level bounds, emitted as `[Trait T …]` instance binders.
-    pub bounds: Vec<Binder>,
+    /// Superclass parents, emitted as Lean's native `extends P₁, P₂, …`.
+    /// Each is the fully-applied parent class (`Super Self`, `FnOnce Self
+    /// Args Output`). `extends` — rather than `[Super Self]` instance
+    /// binders — handles superclass transitivity and inherited outParams
+    /// natively (a child's bound provides only the parent it directly names;
+    /// Lean threads the grandparents). Empty for traits with no superclass.
+    pub extends_parents: Vec<Expr>,
     pub methods: Vec<ClassMethod>,
 }
 

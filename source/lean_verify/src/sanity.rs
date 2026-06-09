@@ -124,7 +124,8 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
             // types and other class methods — check them under the
             // class's typ_params scope.
             let mut scope = scope_from_binders(&c.typ_params);
-            for b in &c.bounds { check_expr(&b.ty, defined, &mut scope, violations, &c.name); }
+            // Superclass `extends` parents are fully-applied class Apps.
+            for p in &c.extends_parents { check_expr(p, defined, &mut scope, violations, &c.name); }
             // Methods can reference each other in defaults (standard
             // typeclass-self-reference pattern). Predefine each
             // method's name in scope before checking any default
