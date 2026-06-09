@@ -1971,6 +1971,12 @@ pub fn trait_impl_to_ast(
     // an unsatisfiable synthesis obligation over an abstract type param.
     // See `drop_unemittable_trait_bounds` (#122).
     unemittable: &std::collections::HashSet<Path>,
+    // Per-trait ordered out-param assoc-type names (own + transitively
+    // inherited), from `compute_trait_outparams`. Used to fill the instance
+    // head's INHERITED out-param slots (e.g. an `FnMut` instance's `Output`,
+    // inherited from `FnOnce`) — declared assoc types are already supplied
+    // via `assoc_types`.
+    trait_outparams: &HashMap<Path, Vec<vir::ast::Ident>>,
 ) -> Instance {
     let mut binders: Vec<LBinder> = Vec::new();
     for tp in ti.typ_params.iter() {
@@ -2003,15 +2009,45 @@ pub fn trait_impl_to_ast(
     let augmented_bounds = std::sync::Arc::new(augmented_bounds);
     binders.extend(trait_bounds_to_ast(&augmented_bounds, unemittable));
 
-    // Build `TraitName arg1 arg2 …` — trait_typ_args are the positional
-    // trait type arguments (Self + extras); assoc_types fill the outParam
-    // slots declared by the class. Both are rewritten through `subst`
-    // to replace `<X as T>::N` projections with the fresh binder names.
+    // Build `TraitName <positional> <out-params…>`. `trait_typ_args` are the
+    // positional trait type arguments (Self + extras). Then EACH of the class's
+    // out-param slots (own + transitively inherited, in `trait_outparams`
+    // order) is filled with, in priority:
+    //   1. the forwarding fresh binder for that out-param NAME, if Source-1/2
+    //      minted one — shared with the bound that supplies it, so head and
+    //      bound agree (a free binder here → "no concrete values for
+    //      out-params"). This covers BOTH the impl's own out-params (View's V)
+    //      AND inherited ones whose value comes from a stronger bound (the
+    //      `FnMut`/`FnOnce` head reusing the `[Fn F A]` bound's `Output`); it
+    //      also sidesteps a declared `type Output = <F as FnOnce>::Output`
+    //      whose projection trait differs from the bound's and wouldn't rewrite.
+    //   2. else the impl's declared `type N = V` (a concrete assoc), rewritten.
+    //   3. else unfilled — Lean surfaces the under-application.
     let mut target_args: Vec<LExpr> = Vec::new();
     for t in ti.trait_typ_args.iter() {
         target_args.push(typ_to_expr(&subst.rewrite_typ(t)));
     }
-    for a in assoc_types { target_args.push(typ_to_expr(&subst.rewrite_typ(&a.typ))); }
+    if let Some(outparams) = trait_outparams.get(&ti.trait_path) {
+        for name in outparams.iter() {
+            if let Some(a) = assoc_types.iter().find(|a| a.name.as_str() == name.as_str()) {
+                // The impl's OWN out-param: its declared `type N = V`, rewritten
+                // (projections → fresh binders, incl. the transitive fallback
+                // for a `<F as FnOnce>::Output` forwarded via a `Fn` bound, and
+                // compound values like a pair's `(<A as View>::V, <B as
+                // View>::V)`). Declared wins over a by-name fresh so a multi-arg
+                // impl's own compound isn't replaced by one component's binder.
+                target_args.push(typ_to_expr(&subst.rewrite_typ(&a.typ)));
+            } else if let Some(fresh) = subst.outparam_binder(name) {
+                // Genuinely INHERITED out-param (no declared `type N`): the
+                // forwarding fresh binder, by name (the head's trait may be
+                // weaker than the bound's — `FnMut` head reusing the `Fn`
+                // bound's `Output`).
+                target_args.push(LExpr::new(ExprNode::Var(
+                    crate::lean_name::LeanName::typ_param(fresh.as_str()))));
+            }
+            // else: unfilled — Lean surfaces the under-application.
+        }
+    }
     let target = if target_args.is_empty() {
         LExpr::new(ExprNode::Var(crate::lean_name::LeanName::from_path(&ti.trait_path)))
     } else {
@@ -2432,19 +2468,6 @@ fn drop_unemittable_trait_bounds(
 /// matching `TypEquality` bounds merged in as extra type arguments.
 fn trait_bounds_to_ast(bounds: &GenericBounds, unemittable: &std::collections::HashSet<Path>) -> Vec<LBinder> {
     trait_bounds_to_ast_with(bounds, unemittable, |t| typ_to_expr(t))
-}
-
-/// Class-context variant of `trait_bounds_to_ast` — uses
-/// `typ_maybe_projection_to_expr` for type rendering so the trait's
-/// Self typ_param (`Self%`) normalizes to `Self` (the class's outer
-/// type variable) when it appears in bounds.
-///
-/// Used by `trait_to_ast` when rendering the class declaration's
-/// inherited bounds (e.g., `trait Sub: Super` produces a `[Super Self]`
-/// bound on the Sub class, where `Self` must match the class's outer
-/// `Self : Type` binder, not the disambiguated `Self%` name).
-fn class_bounds_to_ast(bounds: &GenericBounds, unemittable: &std::collections::HashSet<Path>) -> Vec<LBinder> {
-    trait_bounds_to_ast_with(bounds, unemittable, |t| typ_maybe_projection_to_expr(t))
 }
 
 /// For each emittable trait, the ordered list of associated-type out-param
