@@ -3129,6 +3129,32 @@ fn push_post_call_frames(
     // `dest := fresh_ret_name` (the ∀-bound); in the substitution
     // path, `dest := E` (the substituted value). Computing it
     // here lets Phase 5 share one code site between paths.
+    //
+    // Approach A (BUG-call-result-let-unnameable-in-assert.md): in the
+    // ∀-path, name the ∀-bound result with the DEST's source name
+    // directly instead of the gensym `_tactus_ret_N`, and skip the
+    // Phase-5 alias `let`. The theorem then reads `(x : S) (h : … x …)
+    // : … x …` — a `by { }` proof can name `x` to apply a lemma to it,
+    // rather than `x` being trapped in a goal-position `let x :=
+    // _tactus_ret_N` that's not in the local context. omega/assumption
+    // both still close (x is a plain binder the ensures references
+    // directly — no goal-`let` to zeta), so this is strictly cleaner
+    // than the gensym+let shape.
+    //
+    // Guard: the gensym exists to dodge the self-referential
+    // `let x = f(x)` collision (the arg `x` survives in the substituted
+    // ensures and would be captured by a `∀ x` binder —
+    // test_exec_call_ret_name_collision). So only rename when the dest
+    // name is NOT free in the substituted ensures; otherwise keep the
+    // gensym + goal-position let. Only the ∀-path (`ret_substitution ==
+    // None`) introduces a binder, so the rename is gated on that too.
+    let dest_lean = dest.map(crate::lean_name::LeanName::from_var_ident);
+    let use_dest_name = ret_substitution.is_none()
+        && dest_lean.as_ref().is_some_and(|d| {
+            substituted_ensures.as_ref().is_none_or(|ens| {
+                !crate::lean_ast::mentions_free_var(ens, d.as_str())
+            })
+        });
     let dest_value: LExpr = match &ret_substitution {
         Some((ret_value, rest_ensures)) => {
             // Substitution path: drop `∀ ret + ret_bound`; emit
@@ -3155,22 +3181,39 @@ fn push_post_call_frames(
             ret_value.clone()
         }
         None => {
-            // ∀-path: ret binder + ret_bound + ensures Hyp.
+            // ∀-path: ret binder + ret_bound + ensures Hyp. The binder
+            // is the dest's source name when `use_dest_name` (Approach
+            // A), else the gensym.
+            let binder_name = if use_dest_name {
+                dest_lean.clone().expect("use_dest_name implies dest is Some")
+            } else {
+                subst.fresh_ret_name.clone()
+            };
             let ret_typ_lean = substitute(&typ_to_expr(&ret.typ), &subst.typ_subst);
             new_obl.frames.push_back(CtxFrame::Binder(LBinder {
-                name: Some(subst.fresh_ret_name.clone()),
+                name: Some(binder_name.clone()),
                 ty: ret_typ_lean,
                 kind: BinderKind::Explicit,
             }));
             if let Some(pred) = type_bound_predicate(
-                &LExpr::var(subst.fresh_ret_name.clone()), &ret.typ,
+                &LExpr::var(binder_name.clone()), &ret.typ,
             ) {
                 new_obl.frames.push_back(CtxFrame::Hyp(pred));
             }
             if let Some(conj) = substituted_ensures {
+                // The ensures references `fresh_ret_name`; when we renamed
+                // the binder to the dest name, rewrite it to match so the
+                // hyp talks about `x`, not the (now-absent) gensym.
+                let conj = if use_dest_name {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert(subst.fresh_ret_name.clone(), LExpr::var(binder_name.clone()));
+                    substitute(&conj, &m)
+                } else {
+                    conj
+                };
                 new_obl.frames.push_back(CtxFrame::Hyp(conj));
             }
-            LExpr::var(subst.fresh_ret_name.clone())
+            LExpr::var(binder_name.clone())
         }
     };
 
@@ -3219,12 +3262,16 @@ fn push_post_call_frames(
 
     // Phase 5: dest binding for the call's return (`let r = foo(…)`).
     // `dest_value` is `Var(fresh_ret_name)` in the ∀-path or `E` in
-    // the substitution path (#128).
+    // the substitution path (#128). Skipped when `use_dest_name`
+    // (Approach A): the ∀-binder already IS the dest, so the alias
+    // `let x := x` is trivial and dropped.
     if let Some(dest_ident) = dest {
-        new_obl.frames.push_back(CtxFrame::Let(
-            crate::lean_name::LeanName::from_var_ident(dest_ident),
-            dest_value,
-        ));
+        if !use_dest_name {
+            new_obl.frames.push_back(CtxFrame::Let(
+                crate::lean_name::LeanName::from_var_ident(dest_ident),
+                dest_value,
+            ));
+        }
     }
 
     new_obl
