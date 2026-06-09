@@ -161,7 +161,12 @@ impl LeanName {
         if name == vir::def::trait_self_type_param().as_str() {
             Self("Self".to_string())
         } else {
-            Self(name.to_string())
+            // Other synthetic type-param names also carry illegal `%`
+            // markers — `impl%1` (closure impl-type params), `T%0`
+            // (desugared generics). `sanitize_string` maps `%`→`_` and
+            // leaves clean names (`T`, `Args`) untouched; binder and every
+            // reference render through `typ_param`, so they stay consistent.
+            Self(sanitize_string(name))
         }
     }
 

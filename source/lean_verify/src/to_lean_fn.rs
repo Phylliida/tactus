@@ -468,7 +468,7 @@ fn external_body_type_cmds(dt: &DatatypeX) -> Vec<Command> {
     //   Inhabited (T A ...)`.
     let inhabited_binders: Vec<LBinder> = dt.typ_params.iter()
         .map(|(id, _)| LBinder {
-            name: Some(crate::lean_name::LeanName::lit(id.as_str())),
+            name: Some(crate::lean_name::LeanName::typ_param(id.as_str())),
             ty: LExpr::var_lit("Type"),
             kind: BinderKind::Explicit,
         })
@@ -477,7 +477,7 @@ fn external_body_type_cmds(dt: &DatatypeX) -> Vec<Command> {
         LExpr::var_lit(&path)
     } else {
         let args: Vec<LExpr> = dt.typ_params.iter()
-            .map(|(id, _)| LExpr::var_lit(id.as_str()))
+            .map(|(id, _)| LExpr::var_tp(id.as_str()))
             .collect();
         LExpr::app(LExpr::var_lit(&path), args)
     };
@@ -818,7 +818,7 @@ fn datatype_inhabited_instance_cmd(
     let mut binders: Vec<LBinder> = Vec::new();
     for (id, _) in dt.typ_params.iter() {
         binders.push(LBinder {
-            name: Some(crate::lean_name::LeanName::lit(id.as_str())),
+            name: Some(crate::lean_name::LeanName::typ_param(id.as_str())),
             ty: LExpr::var_lit("Type"),
             kind: BinderKind::Implicit,
         });
@@ -826,7 +826,7 @@ fn datatype_inhabited_instance_cmd(
             name: None,
             ty: LExpr::app(
                 LExpr::var_lit("Inhabited"),
-                vec![LExpr::var_lit(id.as_str())],
+                vec![LExpr::var_tp(id.as_str())],
             ),
             kind: BinderKind::Instance,
         });
@@ -837,7 +837,7 @@ fn datatype_inhabited_instance_cmd(
         LExpr::var_lit(&path)
     } else {
         let args: Vec<LExpr> = dt.typ_params.iter()
-            .map(|(id, _)| LExpr::var_lit(id.as_str()))
+            .map(|(id, _)| LExpr::var_tp(id.as_str()))
             .collect();
         LExpr::app(LExpr::var_lit(&path), args)
     };
@@ -943,12 +943,12 @@ fn height_fn_for_datatype(
         LExpr::app(
             LExpr::var_synthetic(path),
             typ_param_names.iter()
-                .map(|tp| LExpr::var_lit(tp))
+                .map(|tp| LExpr::var_tp(tp))
                 .collect(),
         )
     };
     let implicit_typ_binders: Vec<LBinder> = typ_param_names.iter().map(|tp| LBinder {
-        name: Some(crate::lean_name::LeanName::lit(tp)),
+        name: Some(crate::lean_name::LeanName::typ_param(tp)),
         ty: LExpr::var_lit("Type"),
         kind: BinderKind::Implicit,
     }).collect();
@@ -1149,7 +1149,7 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
         LExpr::app(
             LExpr::var_synthetic(type_name.to_string()),
             typ_param_names.iter()
-                .map(|tp| LExpr::var_lit(tp))
+                .map(|tp| LExpr::var_tp(tp))
                 .collect(),
         )
     };
@@ -1165,13 +1165,13 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
     //   return `Prop`, no `default` use.
     // * `x_binder`: the `(x : T A)` value parameter — same for both.
     let typ_param_pieces: Vec<LBinder> = typ_param_names.iter().map(|tp| LBinder {
-        name: Some(crate::lean_name::LeanName::lit(tp)),
+        name: Some(crate::lean_name::LeanName::typ_param(tp)),
         ty: LExpr::var_lit("Type"),
         kind: BinderKind::Implicit,
     }).collect();
     let inhabited_bound_pieces: Vec<LBinder> = typ_param_names.iter().map(|tp| LBinder {
         name: None,
-        ty: LExpr::app1(LExpr::var_lit("Inhabited"), LExpr::var_lit(tp)),
+        ty: LExpr::app1(LExpr::var_lit("Inhabited"), LExpr::var_tp(tp)),
         kind: BinderKind::Instance,
     }).collect();
     let x_binder = LBinder {
@@ -1344,7 +1344,7 @@ pub fn trait_to_ast(
     });
     for (tp, _) in tr.typ_params.iter() {
         typ_params.push(LBinder {
-            name: Some(crate::lean_name::LeanName::lit(tp.as_str())),
+            name: Some(crate::lean_name::LeanName::typ_param(tp.as_str())),
             ty: LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Type"))),
             kind: BinderKind::Explicit,
         });
@@ -1954,7 +1954,7 @@ pub fn trait_impl_to_ast(
     let mut binders: Vec<LBinder> = Vec::new();
     for tp in ti.typ_params.iter() {
         binders.push(LBinder {
-            name: Some(crate::lean_name::LeanName::lit(tp.as_str())),
+            name: Some(crate::lean_name::LeanName::typ_param(tp.as_str())),
             ty: LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Type"))),
             kind: BinderKind::Implicit,
         });
@@ -1965,7 +1965,7 @@ pub fn trait_impl_to_ast(
     // see `impl_subst::ImplSubst` for the design.
     for fresh in subst.fresh_binders.iter() {
         binders.push(LBinder {
-            name: Some(crate::lean_name::LeanName::lit(fresh.as_str())),
+            name: Some(crate::lean_name::LeanName::typ_param(fresh.as_str())),
             ty: LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Type"))),
             kind: BinderKind::Implicit,
         });
@@ -2115,7 +2115,7 @@ pub fn trait_impl_to_ast(
                     ));
                     let mut args: Vec<LExpr> = func.typ_params.iter().map(|tp| {
                         LExpr::new(ExprNode::Var(
-                            crate::lean_name::LeanName::lit(tp.as_str())
+                            crate::lean_name::LeanName::typ_param(tp.as_str())
                         ))
                     }).collect();
                     for p in func.params.iter() {
@@ -2327,7 +2327,7 @@ fn fn_binders_with_bounds(f: &FunctionX, include_bound_hyps: bool, unemittable: 
             BinderKind::Explicit
         };
         out.push(LBinder {
-            name: Some(crate::lean_name::LeanName::lit(tp.as_str())),
+            name: Some(crate::lean_name::LeanName::typ_param(tp.as_str())),
             ty,
             kind,
         });

@@ -394,6 +394,14 @@ impl Expr {
     pub fn var_lit(name: &str) -> Self {
         Expr::new(ExprNode::Var(crate::lean_name::LeanName::lit(name)))
     }
+    /// A reference to a VIR **type parameter** by name. Routes through the
+    /// single sanitizing `LeanName::typ_param` constructor so synthetic
+    /// names (`impl%1`, `T%0`, `Self%`) render legally and *identically* to
+    /// the binders that introduce them. Use this — never `var_lit` — for any
+    /// type-param reference.
+    pub fn var_tp(name: &str) -> Self {
+        Expr::new(ExprNode::Var(crate::lean_name::LeanName::typ_param(name)))
+    }
     /// Convenience for already-processed name strings (path-derived
     /// names from `lean_name(&path)`, sanitized synthetic temps, etc.).
     /// Wraps in `LeanName::synthetic` — the caller is asserting the
