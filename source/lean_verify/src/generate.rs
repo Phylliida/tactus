@@ -499,6 +499,9 @@ fn krate_preamble(
     // for the two-source rationale.
     let trait_lookup: std::collections::HashMap<vir::ast::Path, &vir::ast::TraitX> =
         krate.traits.iter().map(|tr| (tr.x.name.clone(), &tr.x)).collect();
+    // Transitive out-param assoc-types each trait's class carries (for the
+    // `extends` superclass threading — Fn/FnMut/FnOnce's inherited `Output`).
+    let trait_outparams = to_lean_fn::compute_trait_outparams(&trait_lookup, &unemittable_traits);
 
     // Compute per-impl natural-name prefix `[Self, Trait, "impl"]`
     // for impl method standalone defs. The full def path becomes
@@ -638,7 +641,7 @@ fn krate_preamble(
     };
     for tr in &krate.traits {
         if !trait_has_proof_method(&tr.x) && should_emit_class(&tr.x) {
-            cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies, &unemittable_traits)));
+            cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies, &unemittable_traits, &trait_outparams)));
         }
     }
 
@@ -753,7 +756,7 @@ fn krate_preamble(
     let emit_proof_classes = |cmds: &mut Vec<Command>| {
         for tr in &krate.traits {
             if trait_has_proof_method(&tr.x) && should_emit_class(&tr.x) {
-                cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies, &unemittable_traits)));
+                cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies, &unemittable_traits, &trait_outparams)));
             }
         }
     };
