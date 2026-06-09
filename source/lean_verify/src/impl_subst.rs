@@ -78,7 +78,7 @@ use std::sync::Arc;
 use vir::ast::{
     CallTarget, CallTargetKind, Expr, ExprX, Exprs, Fun, FunX, GenericBound, GenericBoundX, Ident, Idents,
     GenericBounds, FunctionKind, FunctionX, Param, ParamX, Params, Path, PathX, SpannedTyped, TraitId,
-    TraitImplX, TraitX, Typ, TypX, Typs,
+    TraitImplX, Typ, TypX, Typs,
 };
 use vir::def::Spanned;
 
@@ -264,7 +264,13 @@ impl ImplSubst {
         impl_typ_params: &Idents,
         impl_typ_bounds: &GenericBounds,
         typs: impl Iterator<Item = &'a Typ>,
-        traits: &HashMap<Path, &TraitX>,
+        // Per-trait ordered out-param assoc-type names (own + transitively
+        // inherited), from `to_lean_fn::compute_trait_outparams`. Source 2
+        // uses this — not a trait's DECLARED `assoc_typs` — so a bound on a
+        // trait with an INHERITED out-param (`[FnMut T A]`, FnMut inheriting
+        // FnOnce's `Output`) gets a fresh binder for that slot too. Absent
+        // (shell / out-param-free trait) → nothing synthesised.
+        trait_outparams: &HashMap<Path, Vec<Ident>>,
     ) -> Self {
         let impl_params: std::collections::HashSet<&Ident> =
             impl_typ_params.iter().collect();
@@ -349,16 +355,24 @@ impl ImplSubst {
         };
         for bound in impl_typ_bounds.iter() {
             if let GenericBoundX::Trait(TraitId::Path(p), bound_typs) = &**bound {
-                let Some(tr) = traits.get(p) else { continue; };
-                for bt in bound_typs.iter() {
-                    if let TypX::TypParam(x) = &**bt {
-                        if !impl_params.contains(x) { continue; }
-                        for assoc_name in tr.assoc_typs.iter() {
-                            if assoc_already_constrained(p, x, assoc_name) { continue; }
-                            add_entry(x.clone(), p.clone(), assoc_name.clone(),
-                                      bound_typs.clone(), &mut subst);
-                        }
-                    }
+                // Own + inherited out-params of the bound trait. `trait_outparams`
+                // only holds emittable traits, so absence == non-emittable (shell)
+                // or no out-params → skip, same as the prior `traits.get(p)` guard.
+                let Some(parent_outparams) = trait_outparams.get(p) else { continue; };
+                // An out-param belongs to the bound's SELF — its FIRST typ-arg
+                // (`<Self as T<Args…>>::N`) — so create ONE entry per out-param
+                // keyed on Self, NOT one per impl-param typ-arg. A multi-arg
+                // bound like `[Fn F A]` (Self=F, Args=A) would otherwise mint a
+                // spurious `<A as Fn>::Output` and append a SECOND fresh to the
+                // bracket (over-arity → B3 then drops the whole bound). Single-
+                // arg bounds (`[View A]`) are unaffected (Self IS the only arg).
+                let Some(bt) = bound_typs.first() else { continue; };
+                let TypX::TypParam(x) = &**bt else { continue; };
+                if !impl_params.contains(x) { continue; }
+                for assoc_name in parent_outparams.iter() {
+                    if assoc_already_constrained(p, x, assoc_name) { continue; }
+                    add_entry(x.clone(), p.clone(), assoc_name.clone(),
+                              bound_typs.clone(), &mut subst);
                 }
             }
         }
@@ -371,6 +385,23 @@ impl ImplSubst {
     /// unchanged.
     pub fn rewrite_typ(&self, typ: &Typ) -> Typ {
         rewrite_typ_rec(typ, &self.proj_map)
+    }
+
+    /// The fresh binder Source-2/1 minted for an out-param named `assoc`, by
+    /// NAME (ignoring which trait spells it). Used to fill an out-param slot in
+    /// a forwarding instance's HEAD with the SAME binder the forwarding bound
+    /// uses — so head and bound share it (a free fresh binder there trips
+    /// "instance does not provide concrete values for out-params"). Matched by
+    /// name because the head's trait can be WEAKER than the bound's: vstd's
+    /// blanket `impl FnMut for &F` bounds on the stronger `[Fn F A]`, so the
+    /// `FnMut` head's `Output` must reuse the `Fn` bound's `Output` fresh (they
+    /// ARE the same associated type, shared down the `Fn: FnMut: FnOnce`
+    /// chain). The per-instance proj_map carries one fresh per out-param name,
+    /// so name-keying is unambiguous in practice.
+    pub fn outparam_binder(&self, assoc: &Ident) -> Option<&Ident> {
+        self.proj_map.iter().find_map(|((_, _, an), fresh)| {
+            (**an == **assoc).then_some(fresh)
+        })
     }
 
     /// Rewrite projections embedded in the typs of a single generic bound.
@@ -696,6 +727,19 @@ fn rewrite_typ_rec(typ: &Typ, proj_map: &HashMap<(Ident, Path, Ident), Ident>) -
                     if let Some(fresh) = proj_map.get(&key) {
                         return Arc::new(TypX::TypParam(fresh.clone()));
                     }
+                    // Transitive fallback: same Self + assoc NAME, different
+                    // (super/sub)class. A declared `type Output = <F as
+                    // FnOnce>::Output` forwards via a stronger `[Fn F A]` bound
+                    // whose proj_map entry is keyed on `Fn` — but it's the SAME
+                    // associated type down the `Fn: FnMut: FnOnce` chain. Within
+                    // a per-impl proj_map (Self, name) is unambiguous; multi-arg
+                    // cases (`impl<A: View, B: View>`) stay correct because Self
+                    // (A vs B) disambiguates. Exact match preferred above.
+                    if let Some(fresh) = proj_map.iter().find_map(|((px, _, pn), f)|
+                        (**px == **x && **pn == **name).then_some(f))
+                    {
+                        return Arc::new(TypX::TypParam(fresh.clone()));
+                    }
                 }
             }
             // Non-matching projection: still recurse into args.
@@ -794,11 +838,11 @@ pub fn maybe_augment_impl_method(
 /// `augment_function` always finds the projection in `proj_map`.
 pub fn maybe_augment_standalone_fn(
     f: &FunctionX,
-    traits: &HashMap<Path, &TraitX>,
+    trait_outparams: &HashMap<Path, Vec<Ident>>,
 ) -> FunctionX {
     let sig_typs =
         std::iter::once(&f.ret.x.typ).chain(f.params.iter().map(|p| &p.x.typ));
-    let subst = ImplSubst::build(&f.typ_params, &f.typ_bounds, sig_typs, traits);
+    let subst = ImplSubst::build(&f.typ_params, &f.typ_bounds, sig_typs, trait_outparams);
     if subst.is_empty() {
         return f.clone();
     }

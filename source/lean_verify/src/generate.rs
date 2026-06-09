@@ -590,7 +590,7 @@ fn krate_preamble(
                 &ti.x.typ_params,
                 &ti.x.typ_bounds,
                 typs_iter,
-                &trait_lookup,
+                &trait_outparams,
             );
             let name_prefix = impl_name_prefixes.get(&ti.x.impl_path).cloned();
             subst.set_method_context(&ti.x, method_impls, name_prefix);
@@ -727,7 +727,7 @@ fn krate_preamble(
         let augmented = if matches!(f.kind, FunctionKind::TraitMethodImpl { .. }) {
             crate::impl_subst::maybe_augment_impl_method(f, &impl_substs)
         } else {
-            crate::impl_subst::maybe_augment_standalone_fn(f, &trait_lookup)
+            crate::impl_subst::maybe_augment_standalone_fn(f, &trait_outparams)
         };
         add_nonempty(augmented, &f.name)
     };
@@ -747,7 +747,7 @@ fn krate_preamble(
         let ne_bounds = crate::nonempty::instance_nonempty_bounds(
             &nonempty_needs, method_impls, &ti.x.typ_params);
         cmds.push(Command::Instance(
-            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, tactic_bodies, subst, &ne_bounds, &unemittable_traits)
+            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, tactic_bodies, subst, &ne_bounds, &unemittable_traits, &trait_outparams)
         ));
     };
     // Classes WITH proof-fn methods: their Prop-typed fields reference
@@ -859,7 +859,7 @@ fn krate_preamble(
         // `axiom_hashmap_deepview_borrow`'s `<K as DeepView>::V`) — same
         // generalized projection-lifting as standalone spec fns. No-op for
         // projection-free lemmas (the common case).
-        let augmented = crate::impl_subst::maybe_augment_standalone_fn(f, &trait_lookup);
+        let augmented = crate::impl_subst::maybe_augment_standalone_fn(f, &trait_outparams);
         // A lemma whose facts dispatch to a `choose`-using fn (e.g.
         // `axiom_hashmap_deepview_borrow` → `deep_view` → the epsilon in
         // `hash_map_deep_view_impl`) needs `[Nonempty T]` too.

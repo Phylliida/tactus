@@ -2,7 +2,7 @@
 //! `mod tests` child of `impl_subst`, so `use super::*` reaches private items).
 
 use super::*;
-use vir::ast::{PathX, TraitId};
+use vir::ast::{PathX, TraitId, TraitX};
 
 fn mk_ident(s: &str) -> Ident {
     Arc::new(s.to_string())
@@ -27,13 +27,21 @@ fn empty_lookup() -> HashMap<Path, &'static TraitX> {
     HashMap::new()
 }
 
+/// `build` now takes the per-trait out-param map (own + transitively-inherited
+/// assoc out-params), not the raw trait lookup. Derive it from a test lookup via
+/// the real `compute_trait_outparams` (so these tests also exercise it). Tests
+/// have no shells, so `unemittable` is empty.
+fn outparams(lookup: &HashMap<Path, &TraitX>) -> HashMap<Path, Vec<vir::ast::Ident>> {
+    crate::to_lean_fn::compute_trait_outparams(lookup, &std::collections::HashSet::new())
+}
+
 /// Empty inputs → empty subst (no fresh binders, no rewrites).
 #[test]
 fn build_empty_inputs_returns_empty_subst() {
     let typ_params: Idents = Arc::new(vec![]);
     let typ_bounds: GenericBounds = Arc::new(vec![]);
     let typs: Vec<Typ> = vec![];
-    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &empty_lookup());
+    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &outparams(&empty_lookup()));
     assert!(subst.is_empty());
     assert_eq!(subst.fresh_binders.len(), 0);
     assert_eq!(subst.fake_bounds.len(), 0);
@@ -58,7 +66,7 @@ fn build_skips_non_projection_typs() {
         Arc::new(vec![]),
     ));
     let typs = vec![wrap_a];
-    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &empty_lookup());
+    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &outparams(&empty_lookup()));
     assert!(subst.is_empty());
 }
 
@@ -76,7 +84,7 @@ fn build_lifts_typ_param_projection_to_fresh_binder() {
     ]);
     let proj = mk_proj("A", &["View"], "V");
     let typs = vec![proj];
-    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &empty_lookup());
+    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &outparams(&empty_lookup()));
     assert!(!subst.is_empty());
     assert_eq!(subst.fresh_binders.len(), 1);
     assert_eq!(subst.fake_bounds.len(), 1);
@@ -105,7 +113,7 @@ fn build_handles_multi_typ_param_passthrough() {
         )),
     ]);
     let typs = vec![mk_proj("A", &["View"], "V"), mk_proj("B", &["View"], "V")];
-    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &empty_lookup());
+    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &outparams(&empty_lookup()));
     assert_eq!(subst.fresh_binders.len(), 2);
     let names: std::collections::HashSet<String> = subst.fresh_binders.iter()
         .map(|i| i.as_str().to_string())
@@ -129,7 +137,7 @@ fn build_dedupes_repeated_projections() {
         mk_proj("A", &["View"], "V"),
         mk_proj("A", &["View"], "V"),  // duplicate
     ];
-    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &empty_lookup());
+    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &outparams(&empty_lookup()));
     assert_eq!(subst.fresh_binders.len(), 1);
     assert_eq!(subst.fake_bounds.len(), 1);
     assert_eq!(subst.proj_map.len(), 1);
@@ -151,7 +159,7 @@ fn build_ignores_projections_of_non_impl_typ_params() {
     // Projection on `B`, but B isn't in impl_typ_params.
     let proj = mk_proj("B", &["View"], "V");
     let typs = vec![proj];
-    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &empty_lookup());
+    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &outparams(&empty_lookup()));
     assert!(subst.is_empty());
 }
 
@@ -170,7 +178,7 @@ fn build_ignores_projections_without_matching_bound() {
     ]);
     let proj = mk_proj("A", &["View"], "V");
     let typs = vec![proj];
-    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &empty_lookup());
+    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &outparams(&empty_lookup()));
     assert!(subst.is_empty());
 }
 
@@ -266,7 +274,7 @@ fn build_fills_uncovered_assoc_slots_from_trait_bounds() {
     let mut lookup: HashMap<Path, &TraitX> = HashMap::new();
     lookup.insert(mk_path(&["DeepView"]), &trait_decl);
 
-    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &lookup);
+    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &outparams(&lookup));
     assert_eq!(subst.fresh_binders.len(), 1);
     assert_eq!(subst.fresh_binders[0].as_str(), "_tactus_assoc_A_DeepView_V");
 }
@@ -288,7 +296,7 @@ fn build_doesnt_double_count_when_projection_already_covers() {
     let mut lookup: HashMap<Path, &TraitX> = HashMap::new();
     lookup.insert(mk_path(&["View"]), &trait_decl);
 
-    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &lookup);
+    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &outparams(&lookup));
     // Only ONE binder, not two — the projection's entry already
     // covered (A, View, V).
     assert_eq!(subst.fresh_binders.len(), 1);
@@ -320,7 +328,7 @@ fn build_handles_multi_trait_per_param_with_partial_coverage() {
     lookup.insert(mk_path(&["View"]), &view_decl);
     lookup.insert(mk_path(&["DeepView"]), &deep_decl);
 
-    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &lookup);
+    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &outparams(&lookup));
     assert_eq!(subst.fresh_binders.len(), 2);
     let names: std::collections::HashSet<String> = subst.fresh_binders.iter()
         .map(|i| i.as_str().to_string())
@@ -361,7 +369,7 @@ fn build_fake_bound_carries_full_typs_for_multi_arg_trait() {
             name: mk_ident("Out"),
     });
     let typs = vec![proj];
-    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &empty_lookup());
+    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &outparams(&empty_lookup()));
     assert_eq!(subst.fake_bounds.len(), 1);
     match &*subst.fake_bounds[0] {
         GenericBoundX::TypEquality(_, fake_typs, _, _) => {
