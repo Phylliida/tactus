@@ -5525,13 +5525,19 @@ fn build_nested_field_update(
     for i in (0..oprs_ttb.len()).rev() {
         let mut base = local_expr.clone();
         for prior in &oprs_ttb[..i] {
-            base = LExpr::field_proj(base, crate::expr_shared::field_access_name(prior));
+            base = crate::expr_shared::field_proj_opr(base, prior);
         }
         let opr = oprs_ttb[i];
         current = match &opr.datatype {
             vir::ast::Dt::Path(_) => LExpr::new(ExprNode::StructUpdate {
                 base: Box::new(base),
-                updates: vec![(crate::expr_shared::field_access_name(opr), current)],
+                // `Dt::Path` always yields a field accessor (never the 1-tuple
+                // identity case, which is `Dt::Tuple`).
+                updates: vec![(
+                    crate::expr_shared::field_access_name(opr)
+                        .expect("Dt::Path field always has a Lean accessor"),
+                    current,
+                )],
             }),
             vir::ast::Dt::Tuple(arity) => {
                 let index: usize = opr.field.as_str().parse()

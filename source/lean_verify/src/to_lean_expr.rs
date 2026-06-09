@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use vir::ast::*;
 use crate::expr_shared::{
-    apply_clip_coercion, binop_to_ast, const_to_node_common, ctor_node, field_access_name,
+    apply_clip_coercion, binop_to_ast, const_to_node_common, ctor_node, field_proj_opr,
     is_variant_node, non_binop_head,
 };
 use crate::lean_ast::{
@@ -668,9 +668,9 @@ fn expr_to_node(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::Rend
             // `.deref` chain based on the actual Lean-level depth
             // (binder-aware for Var-shaped inner). Mirrors the
             // SST-side fix at `to_lean_sst_expr::ExpX::UnaryOpr(Field, _)`.
-            LExpr::field_proj(
+            field_proj_opr(
                 render_expr_with_derefs(inner, binders, ctx),
-                field_access_name(field_opr),
+                field_opr,
             ).node
         }
         ExprX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => {
@@ -1089,10 +1089,7 @@ fn place_to_expr(place: &PlaceX, binders: &BinderCtx, ctx: &crate::expr_shared::
             // U2: fields belong to the inner type, not the wrapper —
             // `render_place_with_derefs` applies the .deref chain
             // (binder-aware for Local-rooted bases).
-            ExprNode::FieldProj {
-                expr: Box::new(render_place_with_derefs(base, binders, ctx)),
-                field: field_access_name(field_opr),
-            }
+            field_proj_opr(render_place_with_derefs(base, binders, ctx), field_opr).node
         }
         PlaceX::DerefMut(inner) | PlaceX::ModeUnwrap(inner, _) => {
             return place_to_expr(&inner.x, binders, ctx);

@@ -824,15 +824,17 @@ pub(crate) fn coerce_lexpr(value: LExpr, from_typ: &Typ, to_typ: &Typ) -> LExpr 
 /// other lowerings); the assert guards against shape drift if a
 /// future Verus rebase changes that.
 pub(crate) fn tuple_field_accessor(arity: usize, n: usize) -> String {
-    // Verus shouldn't produce 0- or 1-tuples here (unit type lowers
-    // to no field access; 1-tuples have other lowerings). If one
-    // arrives, the prior fallback `(n + 1).to_string()` would emit a
-    // probably-wrong Lean accessor; surface it as shape drift instead.
+    // Only genuinely-impossible shapes reach here: `field_access_name`
+    // handles the 1-tuple identity case (field 0 of `(x,)`) upstream, and a
+    // 0-tuple (unit) has no fields. So arity < 2 here means a 0-tuple field
+    // access or a 1-tuple field n>0 — both shape drift. The prior fallback
+    // `(n + 1).to_string()` would emit a probably-wrong accessor; surface it.
     assert!(
         arity >= 2,
-        "tuple_field_accessor: arity {} < 2 — 0-tuple (unit) and 1-tuple \
-         shouldn't reach field accessor synthesis. n={n}. If this fires, \
-         please open an issue (probable Verus rebase shape drift).",
+        "tuple_field_accessor: arity {} < 2 — unit (0-tuple) has no fields and \
+         a 1-tuple's field 0 is the identity (handled in field_access_name). \
+         n={n}. If this fires, please open an issue (probable Verus rebase \
+         shape drift).",
         arity,
     );
     if n + 1 >= arity {
@@ -876,11 +878,21 @@ pub(crate) fn tuple_field_accessor(arity: usize, n: usize) -> String {
 /// (exec path) reference a field name that the accessor-fn emission
 /// (preamble path) doesn't define — silent Lean "invalid field"
 /// failure.
-pub(crate) fn field_access_name(field_opr: &FieldOpr) -> String {
+///
+/// Returns `None` when the projection is the **identity** — field 0 of a
+/// 1-tuple `(x,)`. Lean has no 1-tuple type (`(x)` ≡ `x`, `(T,)` ≡ `T`), so
+/// the type renderer already flattens `Dt::Tuple(1)` to its element
+/// (`to_lean_type::typ_to_expr`); the projection is therefore identity, and
+/// callers render the base alone (see `field_proj_opr`). Verus produces
+/// 1-tuples for the single-arg closure ABI (`Fn((a,))`) — e.g. the clone-spec
+/// helpers in `vstd::pervasive` — so this is reachable, not shape drift.
+pub(crate) fn field_access_name(field_opr: &FieldOpr) -> Option<String> {
     let raw = field_opr.field.as_str();
     let numeric = raw.parse::<usize>().ok();
     match (&field_opr.datatype, numeric) {
-        (Dt::Tuple(arity), Some(n)) => tuple_field_accessor(*arity, n),
+        // 1-tuple field 0 → identity (Lean flattens `(x,)` to `x`).
+        (Dt::Tuple(1), Some(0)) => return None,
+        (Dt::Tuple(arity), Some(n)) => return Some(tuple_field_accessor(*arity, n)),
         (Dt::Path(path), _) => {
             let type_short = short_name(path);
             let variant = field_opr.variant.as_str();
@@ -889,11 +901,11 @@ pub(crate) fn field_access_name(field_opr: &FieldOpr) -> String {
                 Some(n) => format!("val{}", n),
                 None => sanitize(raw),
             };
-            if is_single_variant {
+            Some(if is_single_variant {
                 field_seg
             } else {
                 format!("{}_{}", sanitize(variant), field_seg)
-            }
+            })
         }
         // Tuple with non-numeric field name — Verus shouldn't produce
         // this (tuple fields are positional, named "0", "1", ...). If
@@ -906,5 +918,56 @@ pub(crate) fn field_access_name(field_opr: &FieldOpr) -> String {
              issue (probable Verus rebase shape drift).",
             raw,
         ),
+    }
+}
+
+/// Project `field_opr` from an already-rendered `base`, collapsing the
+/// identity case (field 0 of a 1-tuple) to `base` itself. Use at any site
+/// that turns a field access into `base.<accessor>` so the 1-tuple
+/// flattening (Lean has no 1-tuple type) is applied uniformly — mirrors what
+/// the type/ctor renderers already do. See `field_access_name`.
+pub(crate) fn field_proj_opr(base: LExpr, field_opr: &FieldOpr) -> LExpr {
+    match field_access_name(field_opr) {
+        Some(accessor) => LExpr::field_proj(base, accessor),
+        None => base,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use vir::ast::VariantCheck;
+
+    fn opr(dt: Dt, field: &str) -> FieldOpr {
+        FieldOpr {
+            datatype: dt,
+            variant: Arc::new("tuple%1".to_string()),
+            field: Arc::new(field.to_string()),
+            get_variant: false,
+            check: VariantCheck::None,
+        }
+    }
+
+    #[test]
+    fn one_tuple_field0_is_identity() {
+        // Lean has no 1-tuple type (`(x,)` ≡ `x`), so field-0 of a 1-tuple is
+        // identity — `field_access_name` returns None and `field_proj_opr`
+        // collapses to the base. Verus produces 1-tuples for the single-arg
+        // closure ABI (BUG-vec-copy-datatype-index-lean-panic.md).
+        assert_eq!(field_access_name(&opr(Dt::Tuple(1), "0")), None);
+        let base = LExpr::var(crate::lean_name::LeanName::synthetic("t".to_string()));
+        let projected = field_proj_opr(base, &opr(Dt::Tuple(1), "0"));
+        assert!(
+            matches!(projected.node, ExprNode::Var(_)),
+            "1-tuple field-0 must collapse to the base, got {:?}", projected.node,
+        );
+    }
+
+    #[test]
+    fn two_tuple_still_projects() {
+        // Regression guard: arity-2 is unaffected (Prod accessors `.1` / `.2`).
+        assert_eq!(field_access_name(&opr(Dt::Tuple(2), "0")), Some("1".to_string()));
+        assert_eq!(field_access_name(&opr(Dt::Tuple(2), "1")), Some("2".to_string()));
     }
 }
