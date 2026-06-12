@@ -207,7 +207,7 @@ impl LeanSourceMap {
 /// body=None fns out — which produced "unresolved" sanity-check
 /// rejections at the call site. Audit 2026-05-12 unfiltered the map
 /// and routes through `Axiom` here.)
-pub fn spec_fn_to_ast(f: &FunctionX, unemittable: &std::collections::HashSet<Path>) -> Command {
+pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Command {
     // Spec fns are Lean defs (mathematical definitions). The
     // u-type / i-type refinement bounds belong on theorems
     // (proof fns + exec fn obligations), not on the spec fn's
@@ -215,7 +215,7 @@ pub fn spec_fn_to_ast(f: &FunctionX, unemittable: &std::collections::HashSet<Pat
     // type from `Int → Int` to `Int → Bound → Int` and break
     // call sites that pass only the value. Surfaced 2026-05-09
     // by `test_diag_exec_plain_assert_with_spec_call` (#147).
-    let binders = fn_binders_without_bound_hyps(f, unemittable);
+    let binders = fn_binders_without_bound_hyps(f, &ectx.unemittable);
     let ret_ty = typ_to_expr(&f.ret.x.typ);
     let name = lean_name(&f.name.path);
     match &f.body {
@@ -272,10 +272,9 @@ pub fn spec_fn_to_ast(f: &FunctionX, unemittable: &std::collections::HashSet<Pat
 /// two emission paths.
 fn proof_fn_signature(
     f: &FunctionX,
-    fn_map: &crate::sst_to_lean::FnMap,
-    unemittable: &std::collections::HashSet<Path>,
+    ectx: &crate::emit_ctx::EmitCtx,
 ) -> (Vec<LBinder>, LExpr) {
-    let mut binders = fn_binders(f, unemittable);
+    let mut binders = fn_binders(f, &ectx.unemittable);
     let binder_ctx = crate::to_lean_expr::binder_ctx_from_params(&f.params);
     // Render with the fn_map in scope so the call-arg bridge can look up
     // each callee's param types (instantiated with the call's typ_args)
@@ -285,7 +284,7 @@ fn proof_fn_signature(
     // returns None and the bridge is a no-op (the pre-fix behaviour, which
     // left a raw `k.deref : Q` in a `Box Q` slot). `FnMap` and
     // `RenderFnMap` are the same `HashMap<&Fun, &FunctionX>` type.
-    let render_ctx = crate::expr_shared::RenderCtx::with_fn_map(fn_map);
+    let render_ctx = ectx.render_ctx();
     for (i, req) in f.require.iter().enumerate() {
         // Wrap with `let p := p.deref` for ref-decorated params so the
         // hypothesis body sees inner types. (`uN -> nat` casts are kept
@@ -316,10 +315,9 @@ fn proof_fn_signature(
 /// injects `have _tactus_bc_i := <name>` so the closer can use them.
 pub fn broadcast_lemma_axiom_cmd(
     f: &FunctionX,
-    fn_map: &crate::sst_to_lean::FnMap,
-    unemittable: &std::collections::HashSet<Path>,
+    ectx: &crate::emit_ctx::EmitCtx,
 ) -> Command {
-    let (binders, goal) = proof_fn_signature(f, fn_map, unemittable);
+    let (binders, goal) = proof_fn_signature(f, ectx);
     Command::Axiom(crate::lean_ast::Axiom {
         name: lean_name(&f.name.path),
         binders,
@@ -331,10 +329,9 @@ pub fn broadcast_lemma_axiom_cmd(
 pub fn proof_fn_to_ast(
     f: &FunctionX,
     tactic_body: &str,
-    fn_map: &crate::sst_to_lean::FnMap,
-    unemittable: &std::collections::HashSet<Path>,
+    ectx: &crate::emit_ctx::EmitCtx,
 ) -> Theorem {
-    let (binders, goal) = proof_fn_signature(f, fn_map, unemittable);
+    let (binders, goal) = proof_fn_signature(f, ectx);
     let binder_ctx = crate::to_lean_expr::binder_ctx_from_params(&f.params);
     // Honor Verus's `decreases` clause for recursive proof fns. Lean often
     // auto-infers termination for simple structural recursion, but cases
@@ -1268,25 +1265,19 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
 
 pub fn trait_to_ast(
     tr: &TraitX,
-    method_lookup: &HashMap<&Fun, &FunctionX>,
-    tactic_bodies: &HashMap<Fun, String>,
-    // Set of un-emittable (shell) trait paths — those with a method decl
-    // stripped cross-crate (e.g. `core::clone::Clone`). A trait in this
-    // set is emitted as a method-less *marker shell* (drop the stripped
-    // methods, keep the class header). The shell carries no methods and
-    // no laws, so it asserts nothing — it can't make any obligation
-    // falsely provable (same category as external-body-type opaque
-    // axioms). For a NON-shell trait a missing method is a genuine
-    // same-crate bug, so we still panic. The set is also used to drop
-    // superclass bounds that REFERENCE a shell trait (a contentless
-    // bound; see `drop_unemittable_trait_bounds`) (#122).
-    unemittable: &std::collections::HashSet<Path>,
-    // Per-trait ordered out-param assoc-type names (own + transitively
-    // inherited), from `compute_trait_outparams`. Drives the inherited
-    // out-param binders + the `extends` out-param threading.
-    trait_outparams: &HashMap<Path, Vec<vir::ast::Ident>>,
+    ectx: &crate::emit_ctx::EmitCtx,
 ) -> Class {
-    let shell = unemittable.contains(&tr.name);
+    // A trait in the un-emittable set (a method decl stripped
+    // cross-crate, e.g. `core::clone::Clone`) is emitted as a
+    // method-less *marker shell* (drop the stripped methods, keep the
+    // class header). The shell carries no methods and no laws, so it
+    // asserts nothing — it can't make any obligation falsely provable
+    // (same category as external-body-type opaque axioms). For a
+    // NON-shell trait a missing method is a genuine same-crate bug, so
+    // we still panic. The set also drops superclass bounds that
+    // REFERENCE a shell trait (a contentless bound; see
+    // `drop_unemittable_trait_bounds`) (#122).
+    let shell = ectx.unemittable.contains(&tr.name);
     // Positional class binders: `(Self : Type) (T : Type) … (Item : outParam Type)`.
     let mut typ_params: Vec<LBinder> = Vec::new();
     typ_params.push(LBinder::explicit(crate::lean_name::LeanName::lit("Self"), LExpr::var_lit("Type")));
@@ -1302,7 +1293,7 @@ pub fn trait_to_ast(
     // out-param a hole at class-declaration time). `compute_trait_outparams`
     // gives the full ordered list (own + inherited); the own ones are already
     // emitted above, so add only the inherited tail.
-    if let Some(all_outparams) = trait_outparams.get(&tr.name) {
+    if let Some(all_outparams) = ectx.trait_outparams.get(&tr.name) {
         let own: std::collections::HashSet<&str> =
             tr.assoc_typs.iter().map(|a| a.as_str()).collect();
         for name in all_outparams.iter() {
@@ -1314,7 +1305,7 @@ pub fn trait_to_ast(
     // Superclasses render as Lean's native `extends P₁, P₂, …`, with each
     // parent's out-param slots threaded (see `class_extends_to_ast`). Lean's
     // `extends` handles superclass transitivity for us.
-    let extends_parents = class_extends_to_ast(&tr.typ_bounds, unemittable, trait_outparams);
+    let extends_parents = class_extends_to_ast(&tr.typ_bounds, &ectx.unemittable, &ectx.trait_outparams);
 
     // Pre-compute the set of sibling method names. Used by proof-fn
     // method-type rendering: ensures expressions that reference
@@ -1327,7 +1318,7 @@ pub fn trait_to_ast(
         .collect();
 
     let methods: Vec<ClassMethod> = tr.methods.iter().filter_map(|method_fun| {
-        let func = match method_lookup.get(method_fun) {
+        let func = match ectx.fn_map.get(method_fun) {
             Some(f) => *f,
             // Shell trait: the method decl is stripped cross-crate. Drop
             // it — the marker shell keeps only its (emittable) header.
@@ -1377,7 +1368,7 @@ pub fn trait_to_ast(
                     // → `⟨value, by first | rfl | simp_all⟩` built
                     // structurally via Anon + ByBlock.
                     if is_unit_typ(&func.ret.x.typ) {
-                        let tac = tactic_bodies.get(&func.name)
+                        let tac = ectx.tactic_bodies.get(&func.name)
                             .map(|s| s.as_str())
                             .unwrap_or(TACTIC_BODY_FALLBACK);
                         LExpr::by_block(tac)
@@ -1844,30 +1835,13 @@ pub fn trait_impl_to_ast(
     ti: &TraitImplX,
     method_impls: &[&FunctionX],
     assoc_types: &[&AssocTypeImplX],
-    tactic_bodies: &HashMap<Fun, String>,
     subst: &crate::impl_subst::ImplSubst,
     // Synthetic `[Nonempty T]` bounds the instance inherits from its
     // method-impl fns' `choose` usage (#122 layer 5). Merged into the
     // bound list alongside the impl's own bounds + the subst's fake
     // bounds, so they render via the same `trait_bounds_to_ast` path.
     nonempty_bounds: &[GenericBound],
-    // Shell trait paths — instance binders that reference one (e.g.
-    // `[clone.Clone K]`, `[cmp.PartialEq T T]`) are dropped: a bound on a
-    // contentless marker carries no provable fact and would otherwise be
-    // an unsatisfiable synthesis obligation over an abstract type param.
-    // See `drop_unemittable_trait_bounds` (#122).
-    unemittable: &std::collections::HashSet<Path>,
-    // Per-trait ordered out-param assoc-type names (own + transitively
-    // inherited), from `compute_trait_outparams`. Used to fill the instance
-    // head's INHERITED out-param slots (e.g. an `FnMut` instance's `Output`,
-    // inherited from `FnOnce`) — declared assoc types are already supplied
-    // via `assoc_types`.
-    trait_outparams: &HashMap<Path, Vec<vir::ast::Ident>>,
-    // ALL assoc-type impls in the krate (not just this impl's). Used to fill a
-    // CONCRETE instance's inherited out-param slot from the implementor's
-    // sibling superclass impl — `impl Dog for Rex`'s inherited `Sound` =
-    // `Rex`'s `Animal::Sound`. See `find_inherited_assoc`.
-    all_assoc_types: &[&AssocTypeImplX],
+    ectx: &crate::emit_ctx::EmitCtx,
 ) -> Instance {
     let mut binders: Vec<LBinder> = Vec::new();
     for tp in ti.typ_params.iter() {
@@ -1890,7 +1864,7 @@ pub fn trait_impl_to_ast(
         .chain(nonempty_bounds.iter().cloned())
         .collect();
     let augmented_bounds = std::sync::Arc::new(augmented_bounds);
-    binders.extend(trait_bounds_to_ast(&augmented_bounds, unemittable));
+    binders.extend(trait_bounds_to_ast(&augmented_bounds, &ectx.unemittable));
 
     // Build `TraitName <positional> <out-params…>`. `trait_typ_args` are the
     // positional trait type arguments (Self + extras). Then EACH of the class's
@@ -1910,7 +1884,7 @@ pub fn trait_impl_to_ast(
     for t in ti.trait_typ_args.iter() {
         target_args.push(typ_to_expr(&subst.rewrite_typ(t)));
     }
-    if let Some(outparams) = trait_outparams.get(&ti.trait_path) {
+    if let Some(outparams) = ectx.trait_outparams.get(&ti.trait_path) {
         for name in outparams.iter() {
             if let Some(a) = assoc_types.iter().find(|a| a.name.as_str() == name.as_str()) {
                 // The impl's OWN out-param: its declared `type N = V`, rewritten
@@ -1926,7 +1900,7 @@ pub fn trait_impl_to_ast(
                 // weaker than the bound's — `FnMut` head reusing the `Fn`
                 // bound's `Output`).
                 target_args.push(LExpr::var_tp(fresh.as_str()));
-            } else if let Some(typ) = find_inherited_assoc(ti, name, all_assoc_types) {
+            } else if let Some(typ) = find_inherited_assoc(ti, name, &ectx.all_assoc_types) {
                 // INHERITED out-param on a CONCRETE instance (no declared
                 // `type N`, no forwarding bound): its value is the implementor's
                 // sibling superclass-impl assoc — `Dog Rex`'s `Sound` = `Rex`'s
@@ -2139,7 +2113,7 @@ pub fn trait_impl_to_ast(
                     //     auto-postcondition-check handles it on the
                     //     Verus side.
                     if is_unit_typ(&func.ret.x.typ) {
-                        let tac = tactic_bodies.get(&func.name)
+                        let tac = ectx.tactic_bodies.get(&func.name)
                             .map(|s| s.as_str())
                             .unwrap_or(TACTIC_BODY_FALLBACK);
                         LExpr::by_block(tac)

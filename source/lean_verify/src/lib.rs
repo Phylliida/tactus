@@ -2,6 +2,7 @@ pub mod broadcast_collect;
 pub mod call_inlining;
 pub mod dep_order;
 pub mod expr_shared;
+pub mod emit_ctx;
 pub mod generate;
 pub mod impl_subst;
 pub mod inline_spec;
