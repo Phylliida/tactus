@@ -2787,6 +2787,71 @@ scope must be primed.
 * `test_trait_default_body_references_other_trait_method` — Case A
   pinned as Err, see deferrals below.
 
+### Trait superclasses via Lean `extends` (landed 2026-06-09)
+
+Superclass bounds (`trait Sub: Super`, and the cross-crate `Fn: FnMut:
+FnOnce` closure hierarchy) emit as Lean's **native `extends`**, not as
+`[Super Self]` instance-implicit binders. `class_extends_to_ast` replaces the
+old `class_bounds_to_ast`; the `Class` AST carries `extends_parents:
+Vec<Expr>` (was `bounds: Vec<Binder>`), and `lean_pp::write_class` emits
+`class C … extends P₁, P₂, … where`. The pre-2026-06-09 `[Super Self]` form
+worked for simple chains but **broke on out-params + transitivity**: a
+`class FnMut … [FnOnce Self Args] [marker.Tuple Args]` under-applied FnOnce's
+`Output` outParam ("type expected") and couldn't thread it up the chain.
+`extends` gives superclass transitivity for free — a child names only its
+direct parents; Lean threads the grandparents.
+
+**Transitively-inherited outParams.** Lean can't leave a parent's outParam a
+hole at class-declaration time, so each class must carry the outParams it
+inherits (`FnMut`/`Fn` carry `FnOnce`'s `Output`) as its OWN `outParam`
+binders and thread them into the `extends` clause. `compute_trait_outparams`
+(in `to_lean_fn.rs`) is the transitive closure: per trait, OWN `assoc_typs`
+followed by superclasses' (unpinned) outParams, memoized over the superclass
+DAG with a cycle guard. `trait_to_ast` adds the inherited tail as outParam
+binders; `class_extends_to_ast` fills each parent's slots (a `TypEquality`
+pin's value, else the trait's own inherited binder by name). Pinned by
+`compute_trait_outparams_inherits_through_superclass_chain` (unit, the
+`Fn:FnMut:FnOnce` chain) + `test_proof_fn_trait_method_extends_super_trait`
+(e2e, `Sub: Super`).
+
+**Instance side — heads + bounds get the inherited outParams too.** With the
+class now N-ary, a blanket `impl Fn for &F` must render its head AND its
+forwarding bound `[Fn F A]` with the inherited `Output`. Three coupled moves
+in `impl_subst` + `trait_impl_to_ast`:
+* `ImplSubst::build` Source-2 uses `compute_trait_outparams` (own + inherited)
+  instead of a trait's declared `assoc_typs`, and **keys the outparam on the
+  bound's SELF (its first typ-arg), one entry per outparam** — NOT one per
+  impl-param typ-arg. The per-typ-arg shape minted a spurious `<A as
+  Fn>::Output` for `[Fn F A]`, over-applying the bracket to 4 args, which B3
+  then dropped wholesale (the bug that left the bound missing). Pinned by
+  `build_keys_outparam_on_self_not_every_typ_arg`.
+* The instance HEAD fills each outparam slot (class order): the impl's
+  declared `type N = V` rewritten if present (a pair's compound `(<A as
+  View>::V, <B as View>::V)`, or a forwarded `<F as FnOnce>::Output`), else
+  the forwarding fresh binder **by name** via `ImplSubst::outparam_binder`
+  (a `FnMut`/`FnOnce` head reuses the stronger `[Fn F A]` bound's `Output` —
+  same associated type down the chain; a free binder there trips "instance
+  does not provide concrete values for out-params"). Declared wins over
+  by-name so a multi-arg impl's own compound isn't replaced by one
+  component's binder.
+* `rewrite_typ` gains a **transitive fallback** (same Self + assoc name, any
+  class; exact preferred) so a declared `<F as FnOnce>::Output` resolves to
+  the `[Fn F A]` bound's fresh (the projection's trait differs from the
+  bound's, but it's the same assoc down the chain).
+
+Full suite 504/0. The Vec<CopyDatatype>-index repro (the arc that motivated
+this — its derived `Clone` drags in the single-arg closure ABI) now elaborates
+the trait hierarchy and hits a SEPARATE deeper layer (below).
+
+**Deferral — the closure-ABI layer (NOT the trait-hierarchy shape).** With the
+hierarchy elaborating, the repro reaches `failed to synthesize Fn (Int → A)
+Int` — a bare Lean function type (how Tactus renders a closure) doesn't
+implement the vstd `Fn` class; there's no blanket `instance Fn (α→β) γ`. This
+is the exec-mode-closure / closure-as-`Fn`-instance gap (cf. "exec-mode
+closure calls upstream-blocked"), plus a `DeepView.V` projection-as-accessor
+and a `Vec` application mismatch. Distinct problem from superclass emission;
+not attempted.
+
 ### External-body type opaque emission (landed 2026-05-12)
 
 Types declared `#[verifier::external_body]` (canonical examples:

@@ -10194,20 +10194,19 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// Coverage (C2): trait inheritance — `trait Sub: Super`. Lean's
-// idiomatic emission for this is `class Sub extends Super where`,
-// which brings parent methods into the child class's scope (so
-// the child's method types can reference parent methods unqualified).
+// Coverage (C2): trait inheritance — `trait Sub: Super`. Tactus's
+// `trait_to_ast` now emits superclasses via Lean's native `extends`
+// (`class Sub (Self : Type) extends Super Self where …`), built by
+// `class_extends_to_ast` from `tr.typ_bounds` — NOT as `[Super Self]`
+// instance binders. `extends` handles superclass transitivity and the
+// threading of any inherited outParams (the `Fn: FnMut: FnOnce` chain),
+// and brings parent methods into the child class's scope so a child's
+// method types can reference parent methods unqualified.
 //
-// Tactus's `trait_to_ast` builds bounds via `trait_bounds_to_ast(&tr.typ_bounds)`
-// — emits them as constraint binders, NOT as `extends`. If a child
-// trait's proof-fn method ensures references a parent method, the
-// emission might fail (sibling-style strip can't see parent
-// methods).
-//
-// This probe tests a minimal version: child trait Sub references
-// parent's spec method in its proof-fn ensures. If today's emission
-// works, great. If it doesn't, the test surfaces a real gap.
+// This probe pins the minimal shape: child trait Sub references the
+// parent's spec method in its proof-fn ensures, and verifies through
+// the `extends` emission. (Pre-2026-06-09 this was a `[Super Self]`
+// bound; the comment then described that as a potential gap.)
 test_verify_one_file! {
     #[test] test_proof_fn_trait_method_extends_super_trait verus_code! {
         // Parent trait — provides the abstraction the child can use.

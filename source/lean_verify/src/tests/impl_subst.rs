@@ -401,3 +401,72 @@ fn make_trait_with_assocs(name: &str, assocs: &[&str]) -> TraitX {
         dyn_compatible: None,
     }
 }
+
+/// Helper: `TraitX` with own assoc types AND superclass bounds (by trait name).
+/// `compute_trait_outparams` recurses superclasses by PATH (ignoring the
+/// bound's typ-args), so a single `Self` typ-arg suffices.
+fn make_trait(name: &str, assocs: &[&str], supers: &[&str]) -> TraitX {
+    let mut t = make_trait_with_assocs(name, assocs);
+    let bounds: Vec<GenericBound> = supers.iter().map(|s| {
+        Arc::new(GenericBoundX::Trait(
+            TraitId::Path(mk_path(&[s])),
+            Arc::new(vec![Arc::new(TypX::TypParam(mk_ident("Self")))]),
+        ))
+    }).collect();
+    t.typ_bounds = Arc::new(bounds);
+    t
+}
+
+/// `compute_trait_outparams` threads a superclass's out-param down the chain:
+/// `FnMut`/`Fn` inherit `FnOnce`'s `Output` though they declare no assoc of
+/// their own. This transitive closure is what lets the `Fn: FnMut: FnOnce`
+/// hierarchy elaborate under `extends` (each class carries the inherited
+/// out-param as its own `outParam` binder). The e2e closure repro exercises
+/// this but can't pin it (it fails on a deeper closure-ABI layer), so pin it
+/// directly here.
+#[test]
+fn compute_trait_outparams_inherits_through_superclass_chain() {
+    let fnonce = make_trait("FnOnce", &["Output"], &[]);
+    let fnmut = make_trait("FnMut", &[], &["FnOnce"]);
+    let fnfn = make_trait("Fn", &[], &["FnMut"]);
+    let mut lookup: HashMap<Path, &TraitX> = HashMap::new();
+    lookup.insert(mk_path(&["FnOnce"]), &fnonce);
+    lookup.insert(mk_path(&["FnMut"]), &fnmut);
+    lookup.insert(mk_path(&["Fn"]), &fnfn);
+    let out = crate::to_lean_fn::compute_trait_outparams(
+        &lookup, &std::collections::HashSet::new());
+    let names = |p: &[&str]| out.get(&mk_path(p)).unwrap()
+        .iter().map(|i| i.as_str().to_string()).collect::<Vec<_>>();
+    assert_eq!(names(&["FnOnce"]), vec!["Output"]);
+    assert_eq!(names(&["FnMut"]), vec!["Output"], "FnMut inherits FnOnce's Output");
+    assert_eq!(names(&["Fn"]), vec!["Output"], "Fn inherits Output transitively");
+}
+
+/// A multi-arg trait bound `[Fn F A]` (Self=F, Args=A, BOTH impl params)
+/// mints exactly ONE out-param entry, keyed on the bound's Self (F) — NOT one
+/// per impl-param typ-arg. The per-typ-arg shape minted a spurious `<A as
+/// Fn>::Output`, appending a second fresh to the rendered bracket (over-arity
+/// → B3 dropped the whole bound). Regression guard for that exact bug.
+#[test]
+fn build_keys_outparam_on_self_not_every_typ_arg() {
+    let typ_params: Idents = Arc::new(vec![mk_ident("F"), mk_ident("A")]);
+    let typ_bounds: GenericBounds = Arc::new(vec![
+        Arc::new(GenericBoundX::Trait(
+            TraitId::Path(mk_path(&["Fn"])),
+            Arc::new(vec![
+                Arc::new(TypX::TypParam(mk_ident("F"))),
+                Arc::new(TypX::TypParam(mk_ident("A"))),
+            ]),
+        )),
+    ]);
+    // Fn carries an (inherited) `Output` out-param.
+    let mut outparams: HashMap<Path, Vec<vir::ast::Ident>> = HashMap::new();
+    outparams.insert(mk_path(&["Fn"]), vec![mk_ident("Output")]);
+    let typs: Vec<Typ> = vec![];
+    let subst = ImplSubst::build(&typ_params, &typ_bounds, typs.iter(), &outparams);
+    assert_eq!(subst.fresh_binders.len(), 1, "one entry keyed on Self, not per typ-arg");
+    assert!(subst.proj_map.contains_key(&(mk_ident("F"), mk_path(&["Fn"]), mk_ident("Output"))),
+        "keyed on Self (F)");
+    assert!(!subst.proj_map.contains_key(&(mk_ident("A"), mk_path(&["Fn"]), mk_ident("Output"))),
+        "no spurious <A as Fn>::Output entry keyed on Args (A)");
+}
