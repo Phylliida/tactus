@@ -157,6 +157,22 @@ impl<'a> RenderCtx<'a> {
         Self { inlining: true, ..self }
     }
 
+    /// Clear the binder map. Inlining renders start with an empty
+    /// binder scope by construction (the callee's spec is rendered
+    /// against substituted caller values, not the caller's binders) —
+    /// this makes that invariant structural at the entry point rather
+    /// than dependent on which ctx the caller happened to pass.
+    pub fn without_binder_typs(self) -> Self {
+        Self { binder_typs: None, ..self }
+    }
+
+    /// In-scope binder lookup (see the `binder_typs` field). `None`
+    /// when no binder map is attached or the var isn't in scope —
+    /// callers fall back to the expression's spanned typ.
+    pub fn binder(&self, v: &VarIdent) -> Option<&'a Typ> {
+        self.binder_typs.and_then(|m| m.get(v))
+    }
+
     /// Context with both fn_map and a render-time value substitution
     /// map. Used by call-site inlining paths (`emit_call_precondition_theorem`,
     /// `push_post_call_frames`) where mut-param substitution needs
