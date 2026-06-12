@@ -345,20 +345,20 @@ fn krate_preamble(
 
     let all_fns: Vec<&FunctionX> = krate.functions.iter().map(|f| &f.x).collect();
     let spec_fn_map = dep_order::build_spec_fn_map(&all_fns);
-    // `method_lookup` is the all-fn map (spec + proof + exec, no
-    // filtering). Shared with `collect_references` so the dep walk
-    // can resolve TraitMethodImpl→method redirects and walk into
-    // exec-callee specs via the `call_inlining` abstraction.
-    let method_lookup: std::collections::HashMap<&Fun, &FunctionX> = all_fns.iter()
-        .map(|f| (&f.name, *f))
-        .collect();
+    // Krate-level tables (the all-fn map, shell traits, trait
+    // out-params, assoc-type impls), built once. `ectx.fn_map` is the
+    // all-fn map (spec + proof + exec, no filtering) — shared with
+    // `collect_references` so the dep walk can resolve
+    // TraitMethodImpl→method redirects and walk into exec-callee specs
+    // via the `call_inlining` abstraction.
+    let ectx = crate::emit_ctx::EmitCtx::build(krate, tactic_bodies);
 
     // Resolve broadcast lemma `Fun` identities (#122) to their
     // `FunctionX` via the all-fn map. Cross-crate lemmas live in the
     // merged krate (via `merge_krates`) with body=None but
     // require/ensure intact — that's the broadcast fact we emit.
     let bc_lemma_funcs: Vec<&FunctionX> = broadcast_lemmas.iter()
-        .filter_map(|f| method_lookup.get(f).copied())
+        .filter_map(|f| ectx.fn_map.get(f).copied())
         .collect();
     // Extended root set for dep walking: root_fns + helpers +
     // broadcast lemmas. The dep walk picks up all transitive spec-fn
@@ -371,7 +371,7 @@ fn krate_preamble(
         .chain(bc_lemma_funcs.iter().copied())
         .collect();
 
-    let mut refs = dep_order::collect_references(&spec_fn_map, &method_lookup, &dep_walk_roots);
+    let mut refs = dep_order::collect_references(&spec_fn_map, &ectx.fn_map, &dep_walk_roots);
 
     // Transitive trait-bound closure: when a trait emits its class
     // declaration, parent-trait bounds (e.g., `trait Sub: Super`
@@ -429,7 +429,7 @@ fn krate_preamble(
     // those traits' classes MUST also emit (the Instance references
     // the class). This is the structural co-dependency that the
     // pre-2026-05-12 `refs.traits`-only gate hid by accident.
-    let groups = dep_order::order_spec_fns(&spec_fn_map, &method_lookup, &all_fns, &dep_walk_roots);
+    let groups = dep_order::order_spec_fns(&spec_fn_map, &ectx.fn_map, &all_fns, &dep_walk_roots);
 
     // Un-emittable traits: a trait whose `class` we can't render because
     // at least one method decl is absent from the merged krate's function
@@ -442,7 +442,6 @@ fn krate_preamble(
     // tripwire for genuine SAME-crate bugs (where every method should be
     // present). Shared with `collect_broadcast_lemma_funs`'s broadcast-
     // path filter via `expr_shared::unemittable_traits` (#122).
-    let unemittable_traits = crate::expr_shared::unemittable_traits(krate, &method_lookup);
 
     let instances_to_emit: Vec<(&TraitImpl, Vec<&FunctionX>)> = krate.trait_impls.iter()
         .filter_map(|ti| {
@@ -462,7 +461,7 @@ fn krate_preamble(
             // emitted these instances; the HashMap case only elaborated
             // because marker.Copy happened to be reached there. Surfaced
             // by a coverage probe on a bare `<T: Clone>` fn — #122.)
-            if unemittable_traits.contains(&ti.x.trait_path) { return None; }
+            if ectx.unemittable.contains(&ti.x.trait_path) { return None; }
             // Implementor type check: trait_typ_args[0] is Self.
             // For Dt::Path (a concrete user datatype), require it
             // to be in refs.datatypes. For anything else (primitive,
@@ -493,15 +492,6 @@ fn krate_preamble(
     // and `impl_subst::maybe_augment_impl_method` (impl method
     // standalone side) so both sites see the same fresh-binder
     // names. See `impl_subst.rs` module docs.
-    // Path → &TraitX lookup for `ImplSubst::build` so it can
-    // enumerate each bound trait's assoc types and fill outParam
-    // slots that no projection covers. See `impl_subst::ImplSubst::build`
-    // for the two-source rationale.
-    let trait_lookup: std::collections::HashMap<vir::ast::Path, &vir::ast::TraitX> =
-        krate.traits.iter().map(|tr| (tr.x.name.clone(), &tr.x)).collect();
-    // Transitive out-param assoc-types each trait's class carries (for the
-    // `extends` superclass threading — Fn/FnMut/FnOnce's inherited `Output`).
-    let trait_outparams = to_lean_fn::compute_trait_outparams(&trait_lookup, &unemittable_traits);
 
     // Compute per-impl natural-name prefix `[Self, Trait, "impl"]`
     // for impl method standalone defs. The full def path becomes
@@ -590,7 +580,7 @@ fn krate_preamble(
                 &ti.x.typ_params,
                 &ti.x.typ_bounds,
                 typs_iter,
-                &trait_outparams,
+                &ectx.trait_outparams,
             );
             let name_prefix = impl_name_prefixes.get(&ti.x.impl_path).cloned();
             subst.set_method_context(&ti.x, method_impls, name_prefix);
@@ -617,7 +607,7 @@ fn krate_preamble(
     // if it surfaces.
     let trait_has_proof_method = |tr: &TraitX| -> bool {
         tr.methods.iter().any(|m| {
-            method_lookup.get(m)
+            ectx.fn_map.get(m)
                 .map(|f| matches!(f.mode, vir::ast::Mode::Proof))
                 .unwrap_or(false)
         })
@@ -641,7 +631,7 @@ fn krate_preamble(
     };
     for tr in &krate.traits {
         if !trait_has_proof_method(&tr.x) && should_emit_class(&tr.x) {
-            cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies, &unemittable_traits, &trait_outparams)));
+            cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &ectx)));
         }
     }
 
@@ -687,10 +677,6 @@ fn krate_preamble(
         cmds.extend(to_lean_fn::datatype_group_to_cmds(&group, emit_accessors, &external_body_paths));
     }
 
-    // Build fn_map once for the nat-coercion pre-pass (BUG-as-nat-cast.md)
-    // applied inside spec_fn_to_ast / trait emission / proof_fn_to_ast.
-    let fn_map: crate::sst_to_lean::FnMap =
-        krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
     // TraitMethodImpl spec fns ARE emitted as standalone defs in
     // addition to their Instance method. This is the canonical Lean
     // idiom for instance fields with interdependencies: define a
@@ -727,7 +713,7 @@ fn krate_preamble(
         let augmented = if matches!(f.kind, FunctionKind::TraitMethodImpl { .. }) {
             crate::impl_subst::maybe_augment_impl_method(f, &impl_substs)
         } else {
-            crate::impl_subst::maybe_augment_standalone_fn(f, &trait_outparams)
+            crate::impl_subst::maybe_augment_standalone_fn(f, &ectx.trait_outparams)
         };
         add_nonempty(augmented, &f.name)
     };
@@ -739,10 +725,6 @@ fn krate_preamble(
             .filter(|a| a.x.impl_path == ti.x.impl_path)
             .map(|a| &a.x)
             .collect();
-        // ALL assoc-type impls — for filling a concrete instance's inherited
-        // out-param from the implementor's sibling superclass impl.
-        let all_assoc_types: Vec<&AssocTypeImplX> =
-            krate.assoc_type_impls.iter().map(|a| &a.x).collect();
         let empty_subst = crate::impl_subst::ImplSubst::default();
         let subst = impl_substs.get(&ti.x.impl_path).unwrap_or(&empty_subst);
         // `[Nonempty T]` bounds the instance inherits from its method-impl
@@ -751,7 +733,7 @@ fn krate_preamble(
         let ne_bounds = crate::nonempty::instance_nonempty_bounds(
             &nonempty_needs, method_impls, &ti.x.typ_params);
         cmds.push(Command::Instance(
-            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, tactic_bodies, subst, &ne_bounds, &unemittable_traits, &trait_outparams, &all_assoc_types)
+            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, subst, &ne_bounds, &ectx)
         ));
     };
     // Classes WITH proof-fn methods: their Prop-typed fields reference
@@ -760,7 +742,7 @@ fn krate_preamble(
     let emit_proof_classes = |cmds: &mut Vec<Command>| {
         for tr in &krate.traits {
             if trait_has_proof_method(&tr.x) && should_emit_class(&tr.x) {
-                cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &method_lookup, tactic_bodies, &unemittable_traits, &trait_outparams)));
+                cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &ectx)));
             }
         }
     };
@@ -789,13 +771,13 @@ fn krate_preamble(
             dep_order::EmitStep::Group(i) => match &groups[*i] {
                 FnGroup::Single(f) => {
                     let augmented = augment(f);
-                    cmds.push(to_lean_fn::spec_fn_to_ast(&augmented, &unemittable_traits));
+                    cmds.push(to_lean_fn::spec_fn_to_ast(&augmented, &ectx));
                 }
                 FnGroup::Mutual(fns) => {
                     let inner: Vec<Command> = fns.iter()
                         .map(|f| {
                             let augmented = augment(f);
-                            to_lean_fn::spec_fn_to_ast(&augmented, &unemittable_traits)
+                            to_lean_fn::spec_fn_to_ast(&augmented, &ectx)
                         })
                         .collect();
                     cmds.push(Command::Mutual(inner));
@@ -846,7 +828,7 @@ fn krate_preamble(
             .expect("helpers_to_emit is built from tactic_bodies — \
                      every entry has a tactic body");
         cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(
-            f, tactic_body, &fn_map, &unemittable_traits,
+            f, tactic_body, &ectx,
         )));
     }
 
@@ -863,12 +845,12 @@ fn krate_preamble(
         // `axiom_hashmap_deepview_borrow`'s `<K as DeepView>::V`) — same
         // generalized projection-lifting as standalone spec fns. No-op for
         // projection-free lemmas (the common case).
-        let augmented = crate::impl_subst::maybe_augment_standalone_fn(f, &trait_outparams);
+        let augmented = crate::impl_subst::maybe_augment_standalone_fn(f, &ectx.trait_outparams);
         // A lemma whose facts dispatch to a `choose`-using fn (e.g.
         // `axiom_hashmap_deepview_borrow` → `deep_view` → the epsilon in
         // `hash_map_deep_view_impl`) needs `[Nonempty T]` too.
         let augmented = add_nonempty(augmented, &f.name);
-        cmds.push(to_lean_fn::broadcast_lemma_axiom_cmd(&augmented, &fn_map, &unemittable_traits));
+        cmds.push(to_lean_fn::broadcast_lemma_axiom_cmd(&augmented, &ectx));
     }
 
     (cmds, ns)
@@ -1055,18 +1037,12 @@ pub fn emit_proof_fn(
         krate, imports, crate_name, &[proof_fn], PreambleConfig::ProofFn, &[], tactic_bodies,
         &[],
     );
-    // Build fn_map for nat-coercion insertion (BUG-as-nat-cast.md).
-    // The pass at fn entry rewrites Call args so Int → Nat parameter
-    // mismatches get an explicit `Int.toNat`. Built locally here (vs.
-    // threading through krate_preamble) since proof_fn_to_ast is called
-    // outside the preamble.
-    let fn_map: sst_to_lean::FnMap =
-        krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
-    // Un-emittable (shell) trait set for shell-bound filtering — computed
-    // here (vs threaded from krate_preamble) since proof_fn_to_ast is
-    // called outside the preamble. Cheap; same derivation as the preamble's.
-    let unemittable_traits = crate::expr_shared::unemittable_traits(krate, &fn_map);
-    cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body, &fn_map, &unemittable_traits)));
+    // Krate-level tables for proof_fn_to_ast (fn_map for the
+    // nat-coercion call-arg bridge, shell traits for bound filtering).
+    // Built locally here (vs. threaded from krate_preamble) since
+    // proof_fn_to_ast is called outside the preamble.
+    let ectx = crate::emit_ctx::EmitCtx::build(krate, tactic_bodies);
+    cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body, &ectx)));
     cmds.push(Command::NamespaceClose(ns));
 
     // Pretty-print and write the .lean file BEFORE the sanity check.
