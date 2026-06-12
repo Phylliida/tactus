@@ -91,6 +91,12 @@ pub struct ArgsX {
     /// Tactus: emit per-fn `.lean` files + a `sourcemap.json` sidecar and
     /// SKIP running Lean. Codegen-only mode for the Tactus server (SERVER.md).
     pub emit_lean: bool,
+    /// Tactus: share the crate's spec world (datatypes/spec fns/classes/
+    /// instances) via a prebuilt per-crate defs module instead of
+    /// re-rendering it in every per-fn `.lean` (CRATEDEFS.md step 1a).
+    /// Opt-in: pays off for multi-fn crates with a real spec world;
+    /// tiny crates lose on the one-time defs build.
+    pub tactus_crate_defs: bool,
     /// Tactus: this build targets the Lean backend, so VIR lowering should
     /// emit Lean-friendly shapes rather than SMT-shaped ones that Tactus
     /// would otherwise have to normalize back. Currently gates: keeping
@@ -148,6 +154,7 @@ impl ArgsX {
             no_auto_recommends_check: Default::default(),
             no_cheating: Default::default(),
             emit_lean: Default::default(),
+            tactus_crate_defs: Default::default(),
             lean_backend: Default::default(),
             time: Default::default(),
             time_expanded: Default::default(),
@@ -327,6 +334,7 @@ pub fn parse_args_with_imports(
     const OPT_NO_AUTO_RECOMMENDS_CHECK: &str = "no-auto-recommends-check";
     const OPT_NO_CHEATING: &str = "no-cheating";
     const OPT_EMIT_LEAN: &str = "emit-lean";
+    const OPT_TACTUS_CRATE_DEFS: &str = "tactus-crate-defs";
     const OPT_LEAN_BACKEND: &str = "lean-backend";
     const OPT_TIME: &str = "time";
     const OPT_TIME_EXPANDED: &str = "time-expanded";
@@ -498,6 +506,11 @@ pub fn parse_args_with_imports(
         "",
         OPT_EMIT_LEAN,
         "Tactus: emit per-fn .lean files + a sourcemap.json sidecar without running Lean (for the Tactus server)",
+    );
+    opts.optflag(
+        "",
+        OPT_TACTUS_CRATE_DEFS,
+        "Tactus: share the crate's spec world via a prebuilt per-crate defs module (CRATEDEFS.md step 1a)",
     );
     opts.optflag(
         "",
@@ -720,6 +733,7 @@ pub fn parse_args_with_imports(
         no_auto_recommends_check: matches.opt_present(OPT_NO_AUTO_RECOMMENDS_CHECK),
         no_cheating: matches.opt_present(OPT_NO_CHEATING),
         emit_lean: matches.opt_present(OPT_EMIT_LEAN),
+        tactus_crate_defs: matches.opt_present(OPT_TACTUS_CRATE_DEFS),
         lean_backend: matches.opt_present(OPT_LEAN_BACKEND),
         time: matches.opt_present(OPT_TIME) || matches.opt_present(OPT_TIME_EXPANDED),
         time_expanded: matches.opt_present(OPT_TIME_EXPANDED),

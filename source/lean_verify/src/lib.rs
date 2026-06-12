@@ -1,5 +1,6 @@
 pub mod broadcast_collect;
 pub mod call_inlining;
+pub mod crate_defs;
 pub mod dep_order;
 pub mod expr_shared;
 pub mod emit_ctx;

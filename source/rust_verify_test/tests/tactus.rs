@@ -12701,3 +12701,70 @@ test_verify_one_file_with_options! {
         }
     } => Ok(())
 }
+
+// ── CRATEDEFS.md step 1a: shared per-crate defs module ────────────────
+//
+// With `--tactus-crate-defs`, the crate's spec world (datatypes / spec
+// fns / classes / instances) is built once into TactusDefs_{crate}.olean
+// and imported by per-fn files instead of re-rendered per check.
+// Flag-gated; these tests are the e2e coverage for the mode.
+
+test_verify_one_file_with_options! {
+    // Two proof fns sharing a spec fn + datatype; the second invokes the
+    // first as a helper (helper theorems stay per-file, resolving spec
+    // names through the defs import).
+    #[test] test_crate_defs_proof_fns ["--tactus-crate-defs"] => verus_code! {
+        struct Pair { a: nat, b: nat }
+        spec fn psum(p: Pair) -> nat { p.a + p.b }
+        proof fn lemma_psum_mono(p: Pair)
+            ensures psum(p) >= p.a
+            by { simp only [psum]; omega }
+        proof fn lemma_psum_pos(p: Pair)
+            requires p.b > 0
+            ensures psum(p) > p.a
+            by { simp only [psum]; omega }
+    } => Ok(())
+}
+
+test_verify_one_file_with_options! {
+    // Proof + exec mix: the exec root's presence puts datatype
+    // accessors into the defs module; its match lowers to
+    // IsVariant/Field over them, resolved through the import. The
+    // proof fn resolves the spec fn through the import. (The exec
+    // ensures stays within tactus_auto's reach — spec-fn-valued
+    // exec postconditions need explicit proof blocks in either
+    // emission mode.)
+    #[test] test_crate_defs_proof_exec_mix ["--tactus-crate-defs"] => verus_code! {
+        enum Speed { Slow, Fast }
+        spec fn rate(s: Speed) -> nat {
+            match s { Speed::Slow => 1nat, Speed::Fast => 2nat }
+        }
+        proof fn lemma_rate_pos(s: Speed)
+            ensures rate(s) >= 1
+            by { cases s <;> simp only [rate] <;> omega }
+        #[verifier::tactus_auto]
+        fn rate_of(s: &Speed) -> (r: u8)
+            ensures r == 1 || r == 2
+        {
+            match s { Speed::Slow => 1, Speed::Fast => 2 }
+        }
+    } => Ok(())
+}
+
+test_verify_one_file_with_options! {
+    // Failure attribution survives the defs split: the bad proof fn
+    // fails, with per-fn diagnostics, while sharing a defs module.
+    #[test] test_crate_defs_failure_attribution ["--tactus-crate-defs"] => verus_code! {
+        spec fn tripled(x: nat) -> nat { 3 * x }
+        proof fn lemma_good(x: nat)
+            ensures tripled(x) >= x
+            by { simp only [tripled]; omega }
+        proof fn lemma_bad(x: nat)
+            ensures tripled(x) > x
+            by { simp only [tripled]; omega }
+    } => Err(err) => {
+        assert_eq!(err.errors.len(), 1, "exactly the bad lemma fails");
+        let text = format!("{:?}", err.errors[0].message);
+        assert!(text.contains("lemma_bad"), "failure attributed to lemma_bad: {}", text);
+    }
+}

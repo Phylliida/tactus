@@ -150,10 +150,11 @@ fn split_goal_state(data: &str) -> Option<(&str, &str)> {
 pub fn check_lean_file(
     file_path: &std::path::Path,
     lake_dir: Option<&std::path::Path>,
-    // Extra dir to prepend to the child's `LEAN_PATH` — the prebuilt-
-    // prelude cache dir holding `TactusPrelude.olean` (CRATEDEFS.md
-    // step 0). `None` only in tests that check prelude-free fragments.
-    extra_lean_path: Option<&std::path::Path>,
+    // Extra dirs to prepend to the child's `LEAN_PATH`: the prebuilt-
+    // prelude cache dir (CRATEDEFS.md step 0) and, in shared-defs mode,
+    // the crate dir holding `TactusDefs_{crate}.olean` (step 1a).
+    // Empty only in tests that check prelude-free fragments.
+    extra_lean_paths: &[&std::path::Path],
 ) -> Result<LeanResult, String> {
     let abs_path = file_path.canonicalize()
         .unwrap_or_else(|_| file_path.to_path_buf());
@@ -183,14 +184,15 @@ pub fn check_lean_file(
             (c, "lake env lean")
         }
     };
-    if let Some(extra) = extra_lean_path {
-        let existing = std::env::var("LEAN_PATH").unwrap_or_default();
-        let joined = if existing.is_empty() {
-            extra.to_string_lossy().into_owned()
-        } else {
-            format!("{}:{}", extra.to_string_lossy(), existing)
-        };
-        command.env("LEAN_PATH", joined);
+    if !extra_lean_paths.is_empty() {
+        let mut parts: Vec<String> = extra_lean_paths.iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        match std::env::var("LEAN_PATH") {
+            Ok(existing) if !existing.is_empty() => parts.push(existing),
+            _ => {}
+        }
+        command.env("LEAN_PATH", parts.join(":"));
     }
     command
         .stdin(Stdio::null())

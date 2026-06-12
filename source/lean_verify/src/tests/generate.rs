@@ -33,7 +33,7 @@ fn krate_preamble_with_no_theorems_emits_no_extra_fragments() {
     let (cmds, _ns) = krate_preamble(
         &krate, &[], "test_crate", &[], PreambleConfig::ProofFn, &[],
         &std::collections::HashMap::new(),
-        &[],
+        &[], None,
     );
 
     // The default preamble has exactly one Import-class chunk
@@ -72,7 +72,7 @@ fn krate_preamble_aggregates_import_fragments_from_theorems() {
     let (cmds, _ns) = krate_preamble(
         &krate, &[], "test_crate", &[], PreambleConfig::ExecFn, &theorems,
         &std::collections::HashMap::new(),
-        &[],
+        &[], None,
     );
 
     let imports: Vec<&str> = cmds.iter()
@@ -103,7 +103,7 @@ fn krate_preamble_aggregates_prelude_addendums_after_prelude() {
     let (cmds, _ns) = krate_preamble(
         &krate, &[], "test_crate", &[], PreambleConfig::ExecFn, &theorems,
         &std::collections::HashMap::new(),
-        &[],
+        &[], None,
     );
 
     // Find the addendum Raw and confirm it's AFTER the prelude Raw.
@@ -132,7 +132,7 @@ fn krate_preamble_dedups_repeated_fragments() {
     let (cmds, _ns) = krate_preamble(
         &krate, &[], "test_crate", &[], PreambleConfig::ExecFn, &theorems,
         &std::collections::HashMap::new(),
-        &[],
+        &[], None,
     );
 
     let bitvec_imports: Vec<&str> = cmds.iter()
