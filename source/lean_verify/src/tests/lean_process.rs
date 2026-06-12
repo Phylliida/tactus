@@ -15,7 +15,7 @@ fn write_tmp(source: &str, suffix: &str) -> std::path::PathBuf {
 #[test]
 fn test_trivial_lean_check() {
     let path = write_tmp("theorem foo : 1 + 1 = 2 := by omega\n", "pass");
-    let result = check_lean_file(&path, None);
+    let result = check_lean_file(&path, None, None);
     match result {
         Ok(r) => {
             assert!(r.success, "Lean should verify 1+1=2. Diagnostics: {:?}", r.diagnostics);
@@ -30,7 +30,7 @@ fn test_trivial_lean_check() {
 #[test]
 fn test_failing_lean_check() {
     let path = write_tmp("theorem foo : 1 + 1 = 3 := by omega\n", "fail");
-    let result = check_lean_file(&path, None);
+    let result = check_lean_file(&path, None, None);
     match result {
         Ok(r) => {
             assert!(!r.success, "Lean should reject 1+1=3");
