@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use vir::ast::*;
 use crate::lean_ast::{
-    and_all, Axiom, BinOp, Binder as LBinder, BinderKind, Class, ClassMethod, Command, Datatype,
+    and_all, Axiom, Binder as LBinder, BinderKind, Class, ClassMethod, Command, Datatype,
     DatatypeKind, Def, Expr as LExpr, ExprNode, Field, Instance,
     InstanceMethod, MatchArm, Pattern as LPattern, Theorem, Tactic, Variant,
 };
@@ -293,11 +293,7 @@ fn proof_fn_signature(
         let req_ty = wrap_body_with_param_derefs(
             crate::to_lean_expr::vir_expr_to_ast_with_binders(req, &binder_ctx, &render_ctx),
             &f.params);
-        binders.push(LBinder {
-            name: Some(crate::lean_name::LeanName::synthetic(format!("h{}", i))),
-            ty: req_ty,
-            kind: BinderKind::Explicit,
-        });
+        binders.push(LBinder::explicit(crate::lean_name::LeanName::synthetic(format!("h{}", i)), req_ty));
     }
     let goal_raw = and_all(f.ensure.0.iter().map(|e| {
         crate::to_lean_expr::vir_expr_to_ast_with_binders(e, &binder_ctx, &render_ctx)
@@ -467,11 +463,7 @@ fn external_body_type_cmds(dt: &DatatypeX) -> Vec<Command> {
     // Inhabited axiom: `@[instance] axiom T.instInhabited (A : Type) ... :
     //   Inhabited (T A ...)`.
     let inhabited_binders: Vec<LBinder> = dt.typ_params.iter()
-        .map(|(id, _)| LBinder {
-            name: Some(crate::lean_name::LeanName::typ_param(id.as_str())),
-            ty: LExpr::var_lit("Type"),
-            kind: BinderKind::Explicit,
-        })
+        .map(|(id, _)| LBinder::typ_param(id.as_str(), BinderKind::Explicit))
         .collect();
     let parent_applied = if dt.typ_params.is_empty() {
         LExpr::var_lit(&path)
@@ -505,11 +497,7 @@ fn curry_type_to_type(arity: usize) -> LExpr {
     let type_ = LExpr::var_lit("Type");
     let mut result = type_.clone();
     for _ in 0..arity {
-        result = LExpr::new(ExprNode::BinOp {
-            op: BinOp::Implies,
-            lhs: Box::new(type_.clone()),
-            rhs: Box::new(result),
-        });
+        result = LExpr::implies(type_.clone(), result);
     }
     result
 }
@@ -817,19 +805,10 @@ fn datatype_inhabited_instance_cmd(
     // Binders: `{A : Type} [Inhabited A]` per type parameter.
     let mut binders: Vec<LBinder> = Vec::new();
     for (id, _) in dt.typ_params.iter() {
-        binders.push(LBinder {
-            name: Some(crate::lean_name::LeanName::typ_param(id.as_str())),
-            ty: LExpr::var_lit("Type"),
-            kind: BinderKind::Implicit,
-        });
-        binders.push(LBinder {
-            name: None,
-            ty: LExpr::app(
-                LExpr::var_lit("Inhabited"),
-                vec![LExpr::var_tp(id.as_str())],
-            ),
-            kind: BinderKind::Instance,
-        });
+        binders.push(LBinder::typ_param(id.as_str(), BinderKind::Implicit));
+        binders.push(LBinder::instance(
+            LExpr::app1(LExpr::var_lit("Inhabited"), LExpr::var_tp(id.as_str())),
+        ));
     }
 
     // Target: `Inhabited (T A B ...)`.
@@ -923,7 +902,6 @@ fn height_fn_for_datatype(
     path: &str,
     scc_paths: &std::collections::HashSet<&Path>,
 ) -> Option<Command> {
-    use crate::lean_ast::ExprNode;
     if let Dt::Tuple(_) = &dt.name {
         return None;
     }
@@ -947,11 +925,7 @@ fn height_fn_for_datatype(
                 .collect(),
         )
     };
-    let implicit_typ_binders: Vec<LBinder> = typ_param_names.iter().map(|tp| LBinder {
-        name: Some(crate::lean_name::LeanName::typ_param(tp)),
-        ty: LExpr::var_lit("Type"),
-        kind: BinderKind::Implicit,
-    }).collect();
+    let implicit_typ_binders: Vec<LBinder> = typ_param_names.iter().map(|tp| LBinder::typ_param(tp, BinderKind::Implicit)).collect();
 
     let has_recursive_field = dt.variants.iter().any(|v|
         v.fields.iter().any(|f| field_recursive_target(&f.a.0, scc_paths).is_some())
@@ -961,11 +935,7 @@ fn height_fn_for_datatype(
         // Non-recursive: simple constant fn. The match-on-binder form
         // is fine here — there's no WF analysis needed.
         let mut binders = implicit_typ_binders;
-        binders.push(LBinder {
-            name: Some(crate::lean_name::LeanName::lit("_")),
-            ty: typed_input,
-            kind: BinderKind::Explicit,
-        });
+        binders.push(LBinder::explicit(crate::lean_name::LeanName::lit("_"), typed_input));
         return Some(Command::Def(Def {
             attrs: vec!["simp".into()],
             name: format!("{}.height", path),
@@ -998,11 +968,7 @@ fn height_fn_for_datatype(
     // explicit value-arg binder go in `Def.binders`; the return type
     // is `Nat`.
     let arg_name = "s";
-    let value_binder = LBinder {
-        name: Some(crate::lean_name::LeanName::lit(arg_name)),
-        ty: typed_input,
-        kind: BinderKind::Explicit,
-    };
+    let value_binder = LBinder::explicit(crate::lean_name::LeanName::lit(arg_name), typed_input);
     let mut all_binders = implicit_typ_binders;
     all_binders.push(value_binder);
     let arms: Vec<MatchArm> = dt.variants.iter().map(|v| {
@@ -1061,10 +1027,7 @@ fn height_fn_for_datatype(
             body: arm_body,
         }
     }).collect();
-    let body = LExpr::new(ExprNode::Match {
-        scrutinee: Box::new(LExpr::var(crate::lean_name::LeanName::lit(arg_name))),
-        arms,
-    });
+    let body = LExpr::match_expr(LExpr::var_lit(arg_name), arms);
     // `sizeOf s` — Lean's auto-derived size measure. Works through
     // wrapper structures because their auto-derived SizeOf counts
     // the inner field.
@@ -1164,21 +1127,9 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
     //   `default` fallback resolves via `Inhabited`). Discriminators
     //   return `Prop`, no `default` use.
     // * `x_binder`: the `(x : T A)` value parameter — same for both.
-    let typ_param_pieces: Vec<LBinder> = typ_param_names.iter().map(|tp| LBinder {
-        name: Some(crate::lean_name::LeanName::typ_param(tp)),
-        ty: LExpr::var_lit("Type"),
-        kind: BinderKind::Implicit,
-    }).collect();
-    let inhabited_bound_pieces: Vec<LBinder> = typ_param_names.iter().map(|tp| LBinder {
-        name: None,
-        ty: LExpr::app1(LExpr::var_lit("Inhabited"), LExpr::var_tp(tp)),
-        kind: BinderKind::Instance,
-    }).collect();
-    let x_binder = LBinder {
-        name: Some(crate::lean_name::LeanName::lit("x")),
-        ty: typed_input.clone(),
-        kind: BinderKind::Explicit,
-    };
+    let typ_param_pieces: Vec<LBinder> = typ_param_names.iter().map(|tp| LBinder::typ_param(tp, BinderKind::Implicit)).collect();
+    let inhabited_bound_pieces: Vec<LBinder> = typ_param_names.iter().map(|tp| LBinder::instance(LExpr::app1(LExpr::var_lit("Inhabited"), LExpr::var_tp(tp)))).collect();
+    let x_binder = LBinder::explicit(crate::lean_name::LeanName::lit("x"), typed_input.clone());
     let discriminator_binders = || -> Vec<LBinder> {
         let mut bs = typ_param_pieces.clone();
         bs.push(x_binder.clone());
@@ -1190,10 +1141,7 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
         bs.push(x_binder.clone());
         bs
     };
-    let match_on_x = |arms: Vec<MatchArm>| LExpr::new(ExprNode::Match {
-        scrutinee: Box::new(LExpr::var_lit("x")),
-        arms,
-    });
+    let match_on_x = |arms: Vec<MatchArm>| LExpr::match_expr(LExpr::var_lit("x"), arms);
 
     // Discriminators: `def Type.isFoo (x : Type) : Prop := match x with …`.
     // Lean's `inductive` doesn't auto-derive these (only `structure` does);
@@ -1341,24 +1289,12 @@ pub fn trait_to_ast(
     let shell = unemittable.contains(&tr.name);
     // Positional class binders: `(Self : Type) (T : Type) … (Item : outParam Type)`.
     let mut typ_params: Vec<LBinder> = Vec::new();
-    typ_params.push(LBinder {
-        name: Some(crate::lean_name::LeanName::lit("Self")),
-        ty: LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Type"))),
-        kind: BinderKind::Explicit,
-    });
+    typ_params.push(LBinder::explicit(crate::lean_name::LeanName::lit("Self"), LExpr::var_lit("Type")));
     for (tp, _) in tr.typ_params.iter() {
-        typ_params.push(LBinder {
-            name: Some(crate::lean_name::LeanName::typ_param(tp.as_str())),
-            ty: LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Type"))),
-            kind: BinderKind::Explicit,
-        });
+        typ_params.push(LBinder::typ_param(tp.as_str(), BinderKind::Explicit));
     }
     for assoc_name in tr.assoc_typs.iter() {
-        typ_params.push(LBinder {
-            name: Some(crate::lean_name::LeanName::typ_param(assoc_name.as_str())),
-            ty: LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Type"))),
-            kind: BinderKind::OutParam,
-        });
+        typ_params.push(LBinder::typ_param(assoc_name.as_str(), BinderKind::OutParam));
     }
     // INHERITED out-params: a trait carries the (unpinned) out-params of its
     // superclasses as its own `outParam` binders, so the `extends` clause can
@@ -1371,11 +1307,7 @@ pub fn trait_to_ast(
             tr.assoc_typs.iter().map(|a| a.as_str()).collect();
         for name in all_outparams.iter() {
             if own.contains(name.as_str()) { continue; }
-            typ_params.push(LBinder {
-                name: Some(crate::lean_name::LeanName::typ_param(name.as_str())),
-                ty: LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Type"))),
-                kind: BinderKind::OutParam,
-            });
+            typ_params.push(LBinder::typ_param(name.as_str(), BinderKind::OutParam));
         }
     }
 
@@ -1448,30 +1380,24 @@ pub fn trait_to_ast(
                         let tac = tactic_bodies.get(&func.name)
                             .map(|s| s.as_str())
                             .unwrap_or(TACTIC_BODY_FALLBACK);
-                        LExpr::new(ExprNode::ByBlock { tactic: tac.to_string() })
+                        LExpr::by_block(tac)
                     } else {
                         let value = wrap_body_with_param_derefs(
                             crate::to_lean_expr::vir_expr_to_ast_with_binders(b, &body_binders, &crate::expr_shared::RenderCtx::empty()),
                             &func.params);
-                        let proof = LExpr::new(ExprNode::ByBlock {
-                            tactic: SUBTYPE_WITNESS_AUTO_PROOF.to_string(),
-                        });
-                        LExpr::new(ExprNode::Anon(vec![value, proof]))
+                        let proof = LExpr::by_block(SUBTYPE_WITNESS_AUTO_PROOF);
+                        LExpr::anon(vec![value, proof])
                     }
                 }
             };
             if func.params.is_empty() {
                 body_expr
             } else {
-                let binders: Vec<LBinder> = func.params.iter().map(|p| LBinder {
-                    name: Some(crate::lean_name::LeanName::synthetic(sanitize(p.x.name.0.as_str()))),
-                    ty: LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("_"))),
-                    kind: BinderKind::Explicit,
-                }).collect();
-                LExpr::new(ExprNode::Lambda {
-                    binders,
-                    body: Box::new(body_expr),
-                })
+                let binders: Vec<LBinder> = func.params.iter().map(|p| LBinder::explicit(
+                    crate::lean_name::LeanName::synthetic(sanitize(p.x.name.0.as_str())),
+                    LExpr::var_lit("_"),
+                )).collect();
+                LExpr::lambda(binders, body_expr)
             }
         });
         // Only spec-mode methods get termination clauses rendered.
@@ -1520,11 +1446,7 @@ pub fn trait_to_ast(
 fn method_type(func: &FunctionX) -> LExpr {
     let mut out = typ_maybe_projection_to_expr(&func.ret.x.typ);
     for p in func.params.iter().rev() {
-        out = LExpr::new(ExprNode::BinOp {
-            op: crate::lean_ast::BinOp::Implies,
-            lhs: Box::new(typ_maybe_projection_to_expr(&p.x.typ)),
-            rhs: Box::new(out),
-        });
+        out = LExpr::implies(typ_maybe_projection_to_expr(&p.x.typ), out);
     }
     out
 }
@@ -1556,23 +1478,20 @@ fn typ_maybe_projection_to_expr(typ: &TypX) -> LExpr {
 
     fn applied(name: &str, args: Vec<LExpr>) -> LExpr {
         if args.is_empty() {
-            LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit(name)))
+            LExpr::var_lit(name)
         } else {
-            LExpr::new(ExprNode::App {
-                head: Box::new(LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit(name)))),
-                args,
-            })
+            LExpr::app(LExpr::var_lit(name), args)
         }
     }
 
     match typ {
         TypX::TypParam(name) if *name == vir::def::trait_self_type_param() => {
-            LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Self")))
+            LExpr::var_lit("Self")
         }
         TypX::Projection { name, .. } => {
             // Inside a class declaration, assoc-type projections render
             // as the bare name (a class type param).
-            LExpr::new(ExprNode::Var(crate::lean_name::LeanName::synthetic(sanitize(name))))
+            LExpr::var_synthetic(sanitize(name))
         }
         TypX::Decorate(deco, _, inner) => match deco {
             TypDecoration::Ref => applied("Tactus.Ref", vec![typ_maybe_projection_to_expr(inner)]),
@@ -1592,12 +1511,9 @@ fn typ_maybe_projection_to_expr(typ: &TypX) -> LExpr {
                 let mapped: Vec<LExpr> = args.iter()
                     .map(|a| typ_maybe_projection_to_expr(a)).collect();
                 if mapped.is_empty() {
-                    LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit(&head)))
+                    LExpr::var_lit(&head)
                 } else {
-                    LExpr::new(ExprNode::App {
-                        head: Box::new(LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit(&head)))),
-                        args: mapped,
-                    })
+                    LExpr::app(LExpr::var_lit(&head), mapped)
                 }
             }
             vir::ast::Dt::Tuple(_) => match args.len() {
@@ -1607,11 +1523,7 @@ fn typ_maybe_projection_to_expr(typ: &TypX) -> LExpr {
                     let mut iter = args.iter().rev();
                     let mut acc = typ_maybe_projection_to_expr(iter.next().unwrap());
                     for a in iter {
-                        acc = LExpr::new(ExprNode::BinOp {
-                            op: BinOp::Prod,
-                            lhs: Box::new(typ_maybe_projection_to_expr(a)),
-                            rhs: Box::new(acc),
-                        });
+                        acc = LExpr::binop(BinOp::Prod, typ_maybe_projection_to_expr(a), acc);
                     }
                     acc
                 }
@@ -1620,11 +1532,7 @@ fn typ_maybe_projection_to_expr(typ: &TypX) -> LExpr {
         TypX::SpecFn(params, ret) => {
             let mut out = typ_maybe_projection_to_expr(ret);
             for p in params.iter().rev() {
-                out = LExpr::new(ExprNode::BinOp {
-                    op: BinOp::Implies,
-                    lhs: Box::new(typ_maybe_projection_to_expr(p)),
-                    rhs: Box::new(out),
-                });
+                out = LExpr::implies(typ_maybe_projection_to_expr(p), out);
             }
             out
         }
@@ -1671,20 +1579,12 @@ fn class_method_value_binders(func: &FunctionX) -> Vec<LBinder> {
     for p in func.params.iter() {
         let name = crate::lean_name::LeanName::from_var_ident(&p.x.name);
         let ty = typ_maybe_projection_to_expr(&p.x.typ);
-        out.push(LBinder {
-            name: Some(name.clone()),
-            ty,
-            kind: BinderKind::Explicit,
-        });
+        out.push(LBinder::explicit(name.clone(), ty));
         if let Some(pred) = crate::to_lean_sst_expr::type_bound_predicate(
             &LExpr::var(name.clone()),
             &p.x.typ,
         ) {
-            out.push(LBinder {
-                name: Some(crate::lean_name::LeanName::synthetic(format!("h_{}_bound", name.as_str()))),
-                ty: pred,
-                kind: BinderKind::Explicit,
-            });
+            out.push(LBinder::explicit(crate::lean_name::LeanName::synthetic(format!("h_{}_bound", name.as_str())), pred));
         }
     }
     out
@@ -1738,11 +1638,7 @@ fn proof_fn_method_type(
         // Anonymous binders aren't an option — Lean's ∀ chain
         // requires each binder to have a name, and our pp only
         // emits `(name : ty)` when name is Some.
-        binders.push(LBinder {
-            name: Some(crate::lean_name::LeanName::synthetic(format!("_tactus_req_{}", i))),
-            ty: req_ty,
-            kind: BinderKind::Explicit,
-        });
+        binders.push(LBinder::explicit(crate::lean_name::LeanName::synthetic(format!("_tactus_req_{}", i)), req_ty));
     }
     let ensures = and_all(func.ensure.0.iter()
         .map(|e| strip_class_qualifier(
@@ -1762,17 +1658,13 @@ fn proof_fn_method_type(
             sanitize(func.ret.x.name.0.as_str())
         );
         let ret_ty = typ_maybe_projection_to_expr(&func.ret.x.typ);
-        LExpr::new(ExprNode::Subtype {
-            name: ret_name,
-            ty: Box::new(ret_ty),
-            pred: Box::new(ensures),
-        })
+        LExpr::subtype(ret_name, ret_ty, ensures)
     };
 
     if binders.is_empty() {
         goal
     } else {
-        LExpr::new(ExprNode::Forall { binders, body: Box::new(goal) })
+        LExpr::forall(binders, goal)
     }
 }
 
@@ -1827,9 +1719,7 @@ fn strip_class_qualifier_rec(
                     } else {
                         format!("{}.{}", impl_prefix, rest)
                     };
-                    return LExpr::new(ExprNode::Var(
-                        crate::lean_name::LeanName::synthetic(disambiguated),
-                    ));
+                    return LExpr::var_synthetic(disambiguated);
                 }
             }
             expr
@@ -1942,16 +1832,12 @@ fn forwarding_blanket_body(ti: &TraitImplX, func: &FunctionX) -> Option<LExpr> {
     // the inner instance's `Ref inner` receiver matches.
     const CLASS_FIELD_REF_PLUS_SELF_WRAPPER: usize = 2;
     let method_qualified = format!("{}.{}", lean_name(&ti.trait_path), method_short);
-    let self_var = LExpr::new(ExprNode::Var(
-        crate::lean_name::LeanName::synthetic(sanitize(self_name))));
+    let self_var = LExpr::var_synthetic(sanitize(self_name));
     let inner_arg = crate::expr_shared::apply_wrap_chain(
         crate::expr_shared::apply_deref_chain(self_var, CLASS_FIELD_REF_PLUS_SELF_WRAPPER),
         &["Tactus.Ref"],
     );
-    Some(LExpr::app1(
-        LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit(&method_qualified))),
-        inner_arg,
-    ))
+    Some(LExpr::app1(LExpr::var_lit(&method_qualified), inner_arg))
 }
 
 pub fn trait_impl_to_ast(
@@ -1985,22 +1871,14 @@ pub fn trait_impl_to_ast(
 ) -> Instance {
     let mut binders: Vec<LBinder> = Vec::new();
     for tp in ti.typ_params.iter() {
-        binders.push(LBinder {
-            name: Some(crate::lean_name::LeanName::typ_param(tp.as_str())),
-            ty: LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Type"))),
-            kind: BinderKind::Implicit,
-        });
+        binders.push(LBinder::typ_param(tp.as_str(), BinderKind::Implicit));
     }
     // Fresh implicit binders from the projection substitution
     // (per-impl, Bug B step 2). Each fresh binder corresponds to a
     // `<X as T>::N` projection appearing in the impl's signature;
     // see `impl_subst::ImplSubst` for the design.
     for fresh in subst.fresh_binders.iter() {
-        binders.push(LBinder {
-            name: Some(crate::lean_name::LeanName::typ_param(fresh.as_str())),
-            ty: LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Type"))),
-            kind: BinderKind::Implicit,
-        });
+        binders.push(LBinder::typ_param(fresh.as_str(), BinderKind::Implicit));
     }
     // Augmented bound list: original bounds + fake TypEquality
     // bounds that wire fresh binders into the relevant trait
@@ -2047,8 +1925,7 @@ pub fn trait_impl_to_ast(
                 // the forwarding fresh binder, by name (the head's trait may be
                 // weaker than the bound's — `FnMut` head reusing the `Fn`
                 // bound's `Output`).
-                target_args.push(LExpr::new(ExprNode::Var(
-                    crate::lean_name::LeanName::typ_param(fresh.as_str()))));
+                target_args.push(LExpr::var_tp(fresh.as_str()));
             } else if let Some(typ) = find_inherited_assoc(ti, name, all_assoc_types) {
                 // INHERITED out-param on a CONCRETE instance (no declared
                 // `type N`, no forwarding bound): its value is the implementor's
@@ -2061,12 +1938,12 @@ pub fn trait_impl_to_ast(
         }
     }
     let target = if target_args.is_empty() {
-        LExpr::new(ExprNode::Var(crate::lean_name::LeanName::from_path(&ti.trait_path)))
+        LExpr::var(crate::lean_name::LeanName::from_path(&ti.trait_path))
     } else {
-        LExpr::new(ExprNode::App {
-            head: Box::new(LExpr::new(ExprNode::Var(crate::lean_name::LeanName::from_path(&ti.trait_path)))),
-            args: target_args,
-        })
+        LExpr::app(
+            LExpr::var(crate::lean_name::LeanName::from_path(&ti.trait_path)),
+            target_args,
+        )
     };
 
     // #122 B3: drop binders for type-params the instance head doesn't
@@ -2179,28 +2056,18 @@ pub fn trait_impl_to_ast(
                     let standalone_path = method_redirects.get(method_short)
                         .expect("method_redirects has an entry for every method_impl")
                         .path.clone();
-                    let standalone = LExpr::new(ExprNode::Var(
-                        crate::lean_name::LeanName::from_path(&standalone_path)
-                    ));
-                    let mut args: Vec<LExpr> = func.typ_params.iter().map(|tp| {
-                        LExpr::new(ExprNode::Var(
-                            crate::lean_name::LeanName::typ_param(tp.as_str())
-                        ))
-                    }).collect();
+                    let standalone =
+                        LExpr::var(crate::lean_name::LeanName::from_path(&standalone_path));
+                    let mut args: Vec<LExpr> = func.typ_params.iter()
+                        .map(|tp| LExpr::var_tp(tp.as_str()))
+                        .collect();
                     for p in func.params.iter() {
-                        args.push(LExpr::new(ExprNode::Var(
-                            crate::lean_name::LeanName::synthetic(
-                                sanitize(p.x.name.0.as_str())
-                            )
-                        )));
+                        args.push(LExpr::var_synthetic(sanitize(p.x.name.0.as_str())));
                     }
                     if args.is_empty() {
                         standalone
                     } else {
-                        LExpr::new(ExprNode::App {
-                            head: Box::new(standalone),
-                            args,
-                        })
+                        LExpr::app(standalone, args)
                     }
                 }
                 (vir::ast::Mode::Proof, None) | (vir::ast::Mode::Exec, None) => return None,
@@ -2275,7 +2142,7 @@ pub fn trait_impl_to_ast(
                         let tac = tactic_bodies.get(&func.name)
                             .map(|s| s.as_str())
                             .unwrap_or(TACTIC_BODY_FALLBACK);
-                        LExpr::new(ExprNode::ByBlock { tactic: tac.to_string() })
+                        LExpr::by_block(tac)
                     } else {
                         // Non-unit return: subtype value pair
                         // `⟨body, by first | rfl | simp_all⟩` built
@@ -2316,10 +2183,8 @@ pub fn trait_impl_to_ast(
                         // `rfl` closes when body matches ensures
                         // literally; `simp_all` handles unfolding
                         // through standalone def chains.
-                        let proof = LExpr::new(ExprNode::ByBlock {
-                            tactic: SUBTYPE_WITNESS_AUTO_PROOF.to_string(),
-                        });
-                        LExpr::new(ExprNode::Anon(vec![value, proof]))
+                        let proof = LExpr::by_block(SUBTYPE_WITNESS_AUTO_PROOF);
+                        LExpr::anon(vec![value, proof])
                     }
                 }
             };
@@ -2329,15 +2194,11 @@ pub fn trait_impl_to_ast(
                 // `fun (p₁ : _) (p₂ : _) … => body`. The `_` lets Lean
                 // infer each parameter type from the class's method
                 // signature, which is what we want.
-                let binders: Vec<LBinder> = func.params.iter().map(|p| LBinder {
-                    name: Some(crate::lean_name::LeanName::synthetic(sanitize(p.x.name.0.as_str()))),
-                    ty: LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("_"))),
-                    kind: BinderKind::Explicit,
-                }).collect();
-                LExpr::new(ExprNode::Lambda {
-                    binders,
-                    body: Box::new(body_expr),
-                })
+                let binders: Vec<LBinder> = func.params.iter().map(|p| LBinder::explicit(
+                    crate::lean_name::LeanName::synthetic(sanitize(p.x.name.0.as_str())),
+                    LExpr::var_lit("_"),
+                )).collect();
+                LExpr::lambda(binders, body_expr)
             };
             Some(InstanceMethod { name: sanitize(short), body: lambda })
         })
@@ -2383,7 +2244,7 @@ fn fn_binders_with_bounds(f: &FunctionX, include_bound_hyps: bool, unemittable: 
         let ty = if let Some(val_typ) = const_typ_for(tp) {
             typ_to_expr(val_typ)
         } else {
-            LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("Type")))
+            LExpr::var_lit("Type")
         };
         // Synthetic associated-type binders (from impl_subst's projection
         // lift) render IMPLICIT — they're determined by their trait's
@@ -2421,11 +2282,7 @@ fn fn_binders_with_bounds(f: &FunctionX, include_bound_hyps: bool, unemittable: 
     //     via `fn_binders` on the calling proof/exec fn).
     for p in f.params.iter() {
         let name = crate::lean_name::LeanName::from_var_ident(&p.x.name);
-        out.push(LBinder {
-            name: Some(name.clone()),
-            ty: crate::to_lean_type::param_binder_typ(&p.x.typ, p.x.is_mut),
-            kind: BinderKind::Explicit,
-        });
+        out.push(LBinder::explicit(name.clone(), crate::to_lean_type::param_binder_typ(&p.x.typ, p.x.is_mut)));
         if include_bound_hyps {
             // For wrapper-bound params (`Tactus.Ref`/`MutRef`/...), the
             // bound applies to the inner value via `.deref` — the wrapper
@@ -2439,11 +2296,7 @@ fn fn_binders_with_bounds(f: &FunctionX, include_bound_hyps: bool, unemittable: 
                 &bound_value,
                 &p.x.typ,
             ) {
-                out.push(LBinder {
-                    name: Some(crate::lean_name::LeanName::synthetic(format!("h_{}_bound", name.as_str()))),
-                    ty: pred,
-                    kind: BinderKind::Explicit,
-                });
+                out.push(LBinder::explicit(crate::lean_name::LeanName::synthetic(format!("h_{}_bound", name.as_str())), pred));
             }
         }
     }
@@ -2607,10 +2460,10 @@ fn class_extends_to_ast(
                     });
                 }
             }
-            out.push(LExpr::new(ExprNode::App {
-                head: Box::new(LExpr::new(ExprNode::Var(crate::lean_name::LeanName::from_path(path)))),
+            out.push(LExpr::app(
+                LExpr::var(crate::lean_name::LeanName::from_path(path)),
                 args,
-            }));
+            ));
         }
     }
     out
@@ -2656,11 +2509,11 @@ where
                     args.push(typ_render(typ));
                 }
             }
-            let target = LExpr::new(ExprNode::App {
-                head: Box::new(LExpr::new(ExprNode::Var(crate::lean_name::LeanName::from_path(path)))),
+            let target = LExpr::app(
+                LExpr::var(crate::lean_name::LeanName::from_path(path)),
                 args,
-            });
-            out.push(LBinder { name: None, ty: target, kind: BinderKind::Instance });
+            );
+            out.push(LBinder::instance(target));
         }
     }
     out

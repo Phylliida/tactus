@@ -362,6 +362,35 @@ pub enum BinderKind {
     OutParam,
 }
 
+impl Binder {
+    /// `(name : ty)`
+    pub fn explicit(name: crate::lean_name::LeanName, ty: Expr) -> Self {
+        Binder { name: Some(name), ty, kind: BinderKind::Explicit }
+    }
+
+    /// `{name : ty}`
+    pub fn implicit(name: crate::lean_name::LeanName, ty: Expr) -> Self {
+        Binder { name: Some(name), ty, kind: BinderKind::Implicit }
+    }
+
+    /// Anonymous instance bracket: `[ty]`
+    pub fn instance(ty: Expr) -> Self {
+        Binder { name: None, ty, kind: BinderKind::Instance }
+    }
+
+    /// A type-parameter binder `name : Type` with the given bracket
+    /// kind — `{T : Type}` (Implicit) or `(T : Type)` (Explicit). The
+    /// name goes through `LeanName::typ_param` (the sanitization
+    /// chokepoint for `impl%N` / `Self%` forms).
+    pub fn typ_param(name: &str, kind: BinderKind) -> Self {
+        Binder {
+            name: Some(crate::lean_name::LeanName::typ_param(name)),
+            ty: Expr::var_lit("Type"),
+            kind,
+        }
+    }
+}
+
 // ── Expressions / types / propositions ─────────────────────────────────
 //
 // Lean is dependently typed: types *are* expressions. We use one Expr
@@ -520,6 +549,20 @@ impl Expr {
     }
     pub fn lambda(binders: Vec<Binder>, body: Expr) -> Self {
         Expr::new(ExprNode::Lambda { binders, body: Box::new(body) })
+    }
+
+    /// `by <tactic>` proof term.
+    pub fn by_block(tactic: impl Into<String>) -> Self {
+        Expr::new(ExprNode::ByBlock { tactic: tactic.into() })
+    }
+
+    pub fn match_expr(scrutinee: Expr, arms: Vec<MatchArm>) -> Self {
+        Expr::new(ExprNode::Match { scrutinee: Box::new(scrutinee), arms })
+    }
+
+    /// `{ name : ty // pred }` refinement subtype.
+    pub fn subtype(name: crate::lean_name::LeanName, ty: Expr, pred: Expr) -> Self {
+        Expr::new(ExprNode::Subtype { name, ty: Box::new(ty), pred: Box::new(pred) })
     }
 }
 
