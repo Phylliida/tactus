@@ -70,15 +70,47 @@ pub fn for_crate(
         return None;
     }
     let memo = MEMO.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    // Held across the render+build so concurrent first-checks dedupe;
-    // later calls are a map hit.
-    let mut map = memo.lock().unwrap();
+    // Held across the render+build so concurrent bucket threads dedupe;
+    // later calls are a map hit. Poison-tolerant: if a previous holder
+    // panicked, the map is still structurally valid (worst case: a
+    // missing entry that gets rebuilt) — don't cascade the panic to
+    // every other bucket.
+    let mut map = memo.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(cached) = map.get(crate_name) {
         return cached.clone();
     }
-    let result = build_defs(krate, crate_name, tactic_bodies, build);
+    let result = guard_build("defs module", crate_name, || {
+        build_defs(krate, crate_name, tactic_bodies, build)
+    });
     map.insert(crate_name.to_string(), result.clone());
     result
+}
+
+/// Panic firewall for the shared builds: the defs/batch renders walk
+/// MORE of the krate than any per-fn render ever did (roots = all
+/// checkable fns), so they can reach tripwire panics in emission code
+/// that per-fn files never trip. A panic here must degrade to
+/// standalone emission for the crate — today's behavior — not abort
+/// the whole verification run (and certainly not poison the memo for
+/// every other bucket thread).
+fn guard_build<T>(
+    what: &str,
+    crate_name: &str,
+    f: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = payload.downcast_ref::<&str>().map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            eprintln!(
+                "tactus: {} build panicked for crate `{}` — falling back to standalone emission.\n  {}",
+                what, crate_name, msg
+            );
+            None
+        }
+    }
 }
 
 fn build_defs(
@@ -152,7 +184,7 @@ fn build_defs(
     cmds.push(Command::NamespaceOpen(ns.clone()));
     cmds.push(Command::Raw("set_option autoImplicit false".to_string()));
     cmds.extend(crate::generate::spec_world_cmds(
-        &inlined_krate, &ectx, &roots, emit_accessors, &[],
+        &inlined_krate, &ectx, &roots, emit_accessors, &[], true,
     ));
     cmds.push(Command::NamespaceClose(ns));
 
@@ -220,8 +252,15 @@ fn build_olean(
         .map_err(|e| format!("failed to spawn lean: {}", e))?;
     if !output.status.success() {
         let _ = std::fs::remove_dir_all(&build);
+        // The successful-build path writes the source only AFTER the
+        // olean rename (marker ordering) — so on failure, dump it
+        // under a non-marker name or the diagnostics reference a file
+        // that doesn't exist.
+        let failed = lean_path.with_extension("lean.failed");
+        let _ = std::fs::write(&failed, source);
         return Err(format!(
-            "{}{}",
+            "(failing source dumped to {})\n{}{}",
+            failed.display(),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         ));
@@ -313,11 +352,13 @@ pub fn proof_batch(
         return None;
     }
     let memo = BATCH_MEMO.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    let mut map = memo.lock().unwrap();
+    let mut map = memo.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(cached) = map.get(crate_name) {
         return cached.clone();
     }
-    let result = build_batch(krate, crate_name, tactic_bodies, build);
+    let result = guard_build("proofs batch", crate_name, || {
+        build_batch(krate, crate_name, tactic_bodies, build)
+    });
     map.insert(crate_name.to_string(), result.clone());
     result
 }

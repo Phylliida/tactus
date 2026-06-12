@@ -386,7 +386,7 @@ fn krate_preamble(
         .chain(bc_lemma_funcs.iter().copied())
         .collect();
     if defs.is_none() {
-        cmds.extend(spec_world_cmds(krate, &ectx, &dep_walk_roots, emit_accessors, &bc_lemma_funcs));
+        cmds.extend(spec_world_cmds(krate, &ectx, &dep_walk_roots, emit_accessors, &bc_lemma_funcs, false));
     } else {
         debug_assert!(bc_lemma_funcs.is_empty(),
             "broadcast-using fns fall back to standalone emission");
@@ -447,7 +447,34 @@ pub(crate) fn spec_world_cmds(
     dep_walk_roots: &[&FunctionX],
     emit_accessors: bool,
     bc_lemma_funcs: &[&FunctionX],
+    // Shared-defs mode renders with roots = ALL checkable fns — a
+    // strictly wider walk than any per-fn file's, so it can reach
+    // constructs whose renderers carry "unsupported" panic tripwires
+    // that no per-fn render ever trips (e.g. a spec fn used only by
+    // exec fns that get rejected at the SST stage, before their
+    // preamble would walk). Lenient mode skips such items (loudly)
+    // instead of panicking: an item nobody checkable needs costs
+    // nothing — matching baseline reachability — and one somebody
+    // needs produces that fn's per-fn unknown-identifier failure
+    // instead of process death. Standalone renders stay strict so the
+    // tripwires keep guarding per-fn emission.
+    lenient: bool,
 ) -> Vec<Command> {
+    let push_lenient = |cmds: &mut Vec<Command>, what: &str, f: &mut dyn FnMut() -> Vec<Command>| {
+        if !lenient {
+            cmds.extend(f());
+            return;
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f())) {
+            Ok(v) => cmds.extend(v),
+            Err(payload) => {
+                let msg = payload.downcast_ref::<&str>().map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                eprintln!("tactus: skipped un-renderable {} in shared defs: {}", what, msg);
+            }
+        }
+    };
     let mut cmds: Vec<Command> = Vec::new();
     let all_fns: Vec<&FunctionX> = krate.functions.iter().map(|f| &f.x).collect();
     let spec_fn_map = dep_order::build_spec_fn_map(&all_fns);
@@ -711,7 +738,8 @@ pub(crate) fn spec_world_cmds(
     };
     for tr in &krate.traits {
         if !trait_has_proof_method(&tr.x) && should_emit_class(&tr.x) {
-            cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, ectx)));
+            push_lenient(&mut cmds, "trait class",
+                &mut || vec![Command::Class(to_lean_fn::trait_to_ast(&tr.x, ectx))]);
         }
     }
 
@@ -754,7 +782,8 @@ pub(crate) fn spec_world_cmds(
         })
         .collect();
     for group in dep_order::order_datatypes(&referenced_dts) {
-        cmds.extend(to_lean_fn::datatype_group_to_cmds(&group, emit_accessors, &external_body_paths));
+        push_lenient(&mut cmds, "datatype group",
+            &mut || to_lean_fn::datatype_group_to_cmds(&group, emit_accessors, &external_body_paths));
     }
 
     // TraitMethodImpl spec fns ARE emitted as standalone defs in
@@ -844,29 +873,46 @@ pub(crate) fn spec_world_cmds(
 
     // No spec-fn groups at all: proof classes have nothing to wait on.
     if last_group_pos.is_none() {
-        emit_proof_classes(&mut cmds);
+        push_lenient(&mut cmds, "proof-method trait classes", &mut || {
+            let mut tmp = Vec::new();
+            emit_proof_classes(&mut tmp);
+            tmp
+        });
     }
     for (pos, step) in order.iter().enumerate() {
         match step {
             dep_order::EmitStep::Group(i) => match &groups[*i] {
                 FnGroup::Single(f) => {
-                    let augmented = augment(f);
-                    cmds.push(to_lean_fn::spec_fn_to_ast(&augmented, ectx));
+                    push_lenient(&mut cmds, "spec fn", &mut || {
+                        let augmented = augment(f);
+                        vec![to_lean_fn::spec_fn_to_ast(&augmented, ectx)]
+                    });
                 }
                 FnGroup::Mutual(fns) => {
-                    let inner: Vec<Command> = fns.iter()
-                        .map(|f| {
-                            let augmented = augment(f);
-                            to_lean_fn::spec_fn_to_ast(&augmented, ectx)
-                        })
-                        .collect();
-                    cmds.push(Command::Mutual(inner));
+                    push_lenient(&mut cmds, "mutual spec fns", &mut || {
+                        let inner: Vec<Command> = fns.iter()
+                            .map(|f| {
+                                let augmented = augment(f);
+                                to_lean_fn::spec_fn_to_ast(&augmented, ectx)
+                            })
+                            .collect();
+                        vec![Command::Mutual(inner)]
+                    });
                 }
             },
-            dep_order::EmitStep::Instance(j) => emit_instance(&mut cmds, *j),
+            dep_order::EmitStep::Instance(j) =>
+                push_lenient(&mut cmds, "trait instance", &mut || {
+                    let mut tmp = Vec::new();
+                    emit_instance(&mut tmp, *j);
+                    tmp
+                }),
         }
         if Some(pos) == last_group_pos {
-            emit_proof_classes(&mut cmds);
+            push_lenient(&mut cmds, "proof-method trait classes", &mut || {
+                let mut tmp = Vec::new();
+                emit_proof_classes(&mut tmp);
+                tmp
+            });
         }
     }
     // Cross-crate broadcast lemmas (#122), emitted as Lean axioms

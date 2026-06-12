@@ -121,6 +121,39 @@ reports green, the crate still fails. Attribution machinery: per-chunk
 rendering gives exact theorem regions (signatures included); errors
 outside every region poison the batch → per-fn standalone fallback.
 
+**Real-crate shakedown (tactus-group-theory, same session): fallback
+architecture VALIDATED, defs elaboration needs step 1c.** First run
+crashed (root: defs walk reached a `usize::MAX`/`ArchWordBits` tripwire
+in todd_coxeter spec fns that no baseline per-fn walk visits — rejected
+exec fns never preamble; secondary: the panic poisoned the memo mutex
+and every bucket thread unwrapped it). Hardening landed: per-item
+lenient rendering in shared-defs mode (skip un-renderable items loudly
+— matches baseline reachability semantics), panic firewall +
+poison-tolerant memo, dump-on-failure (`.lean.failed` — the marker
+ordering otherwise deletes the file the errors reference). With
+hardening: run completes at baseline timing (627s vs 647s, 846/359
+identical counts) with automatic standalone fallback.
+
+**Step 1c worklist — make the defs module elaborate on real crates**
+(from the dumped artifact, four distinct classes):
+1. Struct-ctor bug in the manual `Inhabited` instance
+   (`datatype_inhabited_instance_cmd`): renders `T.T default …` where
+   Lean structs need `T.mk` — latent (baseline only renders this corner
+   in pre-rejected exec files); adjacent `height : Nat := True` oddity
+   in the same path.
+2. `builtinSpecFun` leak in `pervasive.strictly_cloned` — probably one
+   of baseline's 359 too; per-fn it breaks one file, in defs it poisons
+   the module. Filter builtin-bodied spec fns from defs (axiomatize or
+   skip).
+3. Fragment rehoming (the survey's predicted cost, now concrete):
+   `Seq.new` needs `Fn (Int → T)` instances that per-fn files get via
+   theorem-attached `PreludeAddendum` fragments — defs spec fns have no
+   theorems to ride. Defs needs the union of body-required fragments.
+4. `word.inverse_word` termination fails at defs scope (possibly
+   cascade from 3 — re-check after).
+Until 1c, the flag on this crate = graceful fallback (zero win, zero
+loss); the e2e suite shapes don't hit these corners (510/0).
+
 **1b design (settled at 1a landing — two artifacts, not one):**
 the naive form (theorems inside the defs module) couples failure wrong:
 one bad tactic → no `.olean` → every exec file importing it breaks. So:
