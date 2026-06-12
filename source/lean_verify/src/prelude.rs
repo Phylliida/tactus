@@ -26,24 +26,20 @@ pub const TACTUS_PRELUDE_IMPORT: &str = "import TactusPrelude\n\
 set_option linter.unusedVariables false\n\
 set_option maxHeartbeats 800000";
 
-/// Content-hashed cache dir for the prebuilt prelude module:
-/// `{cache_root}/prelude/{hash16}`. The hash keys the PRELUDE SOURCE,
-/// so editing TactusPrelude.lean lands in a fresh dir and never races
-/// a stale `.olean` (concurrent processes on the same version build
-/// identical artifacts; the rename is per-file atomic).
+/// Fixed cache dir for the prebuilt prelude module:
+/// `{cache_root}/prelude`, where the cache root is USER-LEVEL
+/// (`$TACTUS_PRELUDE_CACHE` → `$XDG_CACHE_HOME/tactus` →
+/// `~/.cache/tactus` → `{lean_out_root}/_prelude_cache` as a last
+/// resort), NOT `lean_out_root()`: the e2e harness isolates each
+/// test's lean-out dir, and a per-test cache would rebuild the
+/// identical olean 505 times per suite run.
 ///
-/// The cache root is USER-LEVEL (`$TACTUS_PRELUDE_CACHE` →
-/// `$XDG_CACHE_HOME/tactus` → `~/.cache/tactus` → `{lean_out_root}/
-/// _prelude_cache` as a last resort), NOT `lean_out_root()`: the e2e
-/// harness isolates each test's lean-out dir, and a per-test cache
-/// would rebuild the identical olean 505 times per suite run. The
-/// artifact is version-keyed and immutable — exactly the semantics of
-/// a global cache (rustup-toolchain-style), warm across runs and
-/// sessions.
+/// ONE dir, no version coexistence: when the prelude changes, the next
+/// check rebuilds in place and artifacts generated against the old
+/// prelude simply fail — regenerate them by re-running tactus. (A
+/// content-hashed multi-version layout was tried first and dropped:
+/// backwards compatibility with stale artifacts isn't worth the code.)
 pub fn prelude_cache_dir() -> PathBuf {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    TACTUS_PRELUDE.hash(&mut h);
     let root = if let Ok(d) = std::env::var("TACTUS_PRELUDE_CACHE") {
         PathBuf::from(d)
     } else if let Ok(d) = std::env::var("XDG_CACHE_HOME") {
@@ -53,50 +49,49 @@ pub fn prelude_cache_dir() -> PathBuf {
     } else {
         crate::generate::lean_out_root().join("_prelude_cache")
     };
-    root.join("prelude").join(format!("{:016x}", h.finish()))
+    root.join("prelude")
 }
 
-/// Ensure `TactusPrelude.olean` exists in the cache dir, building it
-/// with `lean -o` on first use (~2.7s, once per prelude version).
-/// Returns the cache dir to prepend to the child `lean`'s `LEAN_PATH`.
-///
-/// Concurrency: parallel first-checks may race here. Each builds to a
-/// pid-unique temp name and renames into place; same source → same
-/// artifact, so last-writer-wins is correct. Losers do redundant work
-/// exactly once per prelude version.
 pub fn ensure_prelude_olean() -> Result<PathBuf, String> {
     let dir = prelude_cache_dir();
+    let marker = dir.join("TactusPrelude.lean");
     let olean = dir.join("TactusPrelude.olean");
-    if olean.exists() {
+    // The marker records which prelude version the olean was built
+    // from. It is written AFTER the olean rename, so on any crash the
+    // mismatch forces a rebuild (never a stale olean behind a fresh
+    // marker). Concurrent same-version builders produce identical
+    // artifacts; concurrent MIXED-version builders (two different
+    // tactus binaries racing this dir) can interleave badly — accepted
+    // as unrealistic; `rm -rf` the cache dir recovers.
+    if olean.exists() && std::fs::read_to_string(&marker).ok().as_deref() == Some(TACTUS_PRELUDE) {
         return Ok(dir);
     }
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("could not create {}: {}", dir.display(), e))?;
-    let src = dir.join("TactusPrelude.lean");
-    std::fs::write(&src, TACTUS_PRELUDE)
-        .map_err(|e| format!("could not write {}: {}", src.display(), e))?;
-    let tmp_name = format!("TactusPrelude.olean.tmp-{}", std::process::id());
-    let tmp = dir.join(&tmp_name);
-    // Run from inside the cache dir with RELATIVE paths: lean derives
-    // the module name from the source path relative to its root dir
-    // (the cwd) and refuses files outside it ("must be contained in
-    // root directory"). cwd = dir makes the module name exactly
-    // `TactusPrelude`, which is what the generated `import` expects.
+    // Build in a pid-unique subdir: `lean -o` derives the module name
+    // from the source path relative to its root dir (the cwd) and
+    // refuses sources outside it — cwd = the subdir makes the module
+    // exactly `TactusPrelude`.
+    let build = dir.join(format!("build-{}", std::process::id()));
+    std::fs::create_dir_all(&build)
+        .map_err(|e| format!("could not create {}: {}", build.display(), e))?;
+    std::fs::write(build.join("TactusPrelude.lean"), TACTUS_PRELUDE)
+        .map_err(|e| format!("could not write prelude source: {}", e))?;
     let output = std::process::Command::new("lean")
-        .arg("-o").arg(&tmp_name)
-        .arg("TactusPrelude.lean")
-        .current_dir(&dir)
+        .args(["-o", "TactusPrelude.olean", "TactusPrelude.lean"])
+        .current_dir(&build)
         .output()
         .map_err(|e| format!("failed to spawn lean for prelude build: {}. Is Lean 4 installed?", e))?;
     if !output.status.success() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&build);
         return Err(format!(
             "prelude .olean build failed (this is a Tactus bug — the prelude should always elaborate):\n{}{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         ));
     }
-    std::fs::rename(&tmp, &olean)
+    std::fs::rename(build.join("TactusPrelude.olean"), &olean)
         .map_err(|e| format!("could not move prelude olean into place: {}", e))?;
+    std::fs::write(&marker, TACTUS_PRELUDE)
+        .map_err(|e| format!("could not write prelude marker: {}", e))?;
+    let _ = std::fs::remove_dir_all(&build);
     Ok(dir)
 }
