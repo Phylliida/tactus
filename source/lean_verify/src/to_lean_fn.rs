@@ -795,14 +795,16 @@ fn datatype_inhabited_instance_cmd(
     // Build `T.<base> default default ...` — the constructor applied to
     // `default` for each field. Lean infers the implicit type-args via the
     // target `Inhabited (T A)` plus the `[Inhabited A]` bound.
-    let ctor_name = format!("{}.{}", path, sanitize(&base_variant.name));
-    let mut body = LExpr::var_lit(&ctor_name);
-    if !base_variant.fields.is_empty() {
-        let args: Vec<LExpr> = base_variant.fields.iter()
-            .map(|_| LExpr::var_lit("default"))
-            .collect();
-        body = LExpr::app(body, args);
-    }
+    // Naming goes through the shared `ctor_node` rule — a hand-rolled
+    // `format!("{}.{}", path, variant)` here once produced
+    // `T.T default …` for STRUCTS, whose Lean constructor is `T.mk`
+    // (the rule: VIR struct variant name == type short name → `mk`).
+    // Latent until CRATEDEFS step 1c: baseline only renders this
+    // corner inside exec files that get rejected pre-emission.
+    let args: Vec<LExpr> = base_variant.fields.iter()
+        .map(|_| LExpr::var_lit("default"))
+        .collect();
+    let body = LExpr::new(crate::expr_shared::ctor_node(&dt.name, &base_variant.name, args));
 
     // Binders: `{A : Type} [Inhabited A]` per type parameter.
     let mut binders: Vec<LBinder> = Vec::new();

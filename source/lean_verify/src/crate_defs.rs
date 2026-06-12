@@ -35,6 +35,11 @@ use crate::to_lean_type::sanitize;
 pub struct CrateDefs {
     /// Lean module name: `TactusDefs_{sanitized crate name}`.
     pub module_name: String,
+    /// Whether exec-fn dep closures are included. `false` after the
+    /// proof-roots-only retry (see `build_defs`): exec fns then emit
+    /// standalone, while the proofs batch — whose spec needs are a
+    /// subset of the proof closure by construction — keeps the module.
+    pub covers_exec: bool,
     /// The crate's lean-out dir — holds the defs `.lean`/`.olean` and
     /// goes on the per-fn check's `LEAN_PATH` as the import root.
     pub dir: PathBuf,
@@ -138,17 +143,14 @@ fn build_defs(
     crate::generate::install_emit_tables(&inlined_krate);
     let ectx = crate::emit_ctx::EmitCtx::build(&inlined_krate, tactic_bodies);
 
-    // Dep-walk roots: every fn any per-fn file could need spec-world
-    // items for — all tactic proof fns (roots and helpers alike) and
-    // all exec roots.
+    // Dep-walk roots = every fn whose per-fn FILE will import the
+    // defs module — broader than the batch's theorem list: trait-
+    // method-impl proof fns aren't batched (they emit per-fn), but
+    // those files import defs too, so their closures must be present.
     let proof_roots: Vec<&FunctionX> = inlined_krate.functions.iter()
         .map(|f| &f.x)
         .filter(|f| {
             matches!(f.mode, vir::ast::Mode::Proof)
-                && !matches!(
-                    f.kind,
-                    FunctionKind::TraitMethodDecl { .. } | FunctionKind::TraitMethodImpl { .. }
-                )
                 && tactic_bodies.contains_key(&f.name)
         })
         .collect();
@@ -156,14 +158,61 @@ fn build_defs(
         .map(|f| &f.x)
         .filter(|f| matches!(f.mode, vir::ast::Mode::Exec) && f.body.is_some())
         .collect();
-    // Accessors are exec-only machinery (match lowering to
-    // IsVariant/Field) and can legitimately fail elaboration for enums
-    // whose field types lack Inhabited — which is why proof-fn files
-    // skip them. Emit them only when an exec root could need them; a
-    // failure falls back to standalone for the whole crate.
-    let emit_accessors = !exec_roots.is_empty();
-    let roots: Vec<&FunctionX> = proof_roots.into_iter().chain(exec_roots).collect();
 
+    // Attempt 1: full roots (proof + exec; accessors iff exec present).
+    // Attempt 2 (build mode only, on Lean failure): proof roots only —
+    // exec fns' dep closures can contain broken-in-baseline corners
+    // (e.g. the closure-ABI frontier: bare-arrow Fn instances,
+    // builtinSpecFun) that no lenient RENDER skip can catch because
+    // they fail in LEAN, not in codegen. The proof closure is exactly
+    // what the passing per-fn proof files already elaborate, so it is
+    // clean by construction; exec fns fall back to standalone, where a
+    // broken closure breaks only its own file — today's behavior.
+    let full_roots: Vec<&FunctionX> =
+        proof_roots.iter().copied().chain(exec_roots.iter().copied()).collect();
+    for (attempt, (roots, emit_accessors, covers_exec)) in [
+        (&full_roots, !exec_roots.is_empty(), true),
+        (&proof_roots, false, false),
+    ].into_iter().enumerate() {
+        if attempt == 1 && (!build || exec_roots.is_empty()) {
+            // Without a Lean run there's nothing to learn from attempt
+            // 1 (emit-lean mode), and without exec roots the attempts
+            // are identical.
+            break;
+        }
+        match render_and_build(
+            &inlined_krate, &ectx, crate_name, roots,
+            emit_accessors, covers_exec, build,
+        ) {
+            Ok(defs) => return Some(Arc::new(defs)),
+            Err(e) => {
+                eprintln!(
+                    "tactus: defs module build failed for crate `{}` ({}) — {}\n{}",
+                    crate_name,
+                    if covers_exec { "full roots" } else { "proof roots only" },
+                    if covers_exec && build {
+                        "retrying with proof-only roots (exec fns will emit standalone)"
+                    } else {
+                        "falling back to standalone emission"
+                    },
+                    e,
+                );
+            }
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_and_build(
+    inlined_krate: &KrateX,
+    ectx: &crate::emit_ctx::EmitCtx,
+    crate_name: &str,
+    roots: &[&FunctionX],
+    emit_accessors: bool,
+    covers_exec: bool,
+    build: bool,
+) -> Result<CrateDefs, String> {
     let ns = sanitize(crate_name);
     let module_name = format!("TactusDefs_{}", ns);
     let dir = crate::generate::lean_out_root().join(&ns);
@@ -184,7 +233,7 @@ fn build_defs(
     cmds.push(Command::NamespaceOpen(ns.clone()));
     cmds.push(Command::Raw("set_option autoImplicit false".to_string()));
     cmds.extend(crate::generate::spec_world_cmds(
-        &inlined_krate, &ectx, &roots, emit_accessors, &[], true,
+        inlined_krate, ectx, roots, emit_accessors, &[], true,
     ));
     cmds.push(Command::NamespaceClose(ns));
 
@@ -193,34 +242,18 @@ fn build_defs(
     let olean_path = dir.join(format!("{}.olean", module_name));
 
     if !build {
-        // `--emit-lean` codegen-only mode: write the source for
-        // inspection/serving; the consumer builds the olean.
-        if let Err(e) = std::fs::create_dir_all(&dir)
-            .map_err(|e| e.to_string())
-            .and_then(|_| std::fs::write(&lean_path, &rendered.text).map_err(|e| e.to_string()))
-        {
-            eprintln!("tactus: could not write {}: {} — falling back to standalone emission", lean_path.display(), e);
-            return None;
-        }
-        return Some(Arc::new(CrateDefs { module_name, dir, cmds }));
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        std::fs::write(&lean_path, &rendered.text).map_err(|e| e.to_string())?;
+        return Ok(CrateDefs { module_name, covers_exec, dir, cmds });
     }
 
-    // Build, unless the on-disk source already matches (then the olean
-    // beside it was built from exactly this content — the source is
-    // written AFTER a successful build, prelude-cache style, so a
-    // crash can't leave a fresh source over a stale olean).
     let up_to_date = olean_path.exists()
         && std::fs::read_to_string(&lean_path).ok().as_deref() == Some(&rendered.text);
     if !up_to_date {
-        if let Err(e) = build_olean(&dir, &module_name, &rendered.text, &olean_path, &lean_path) {
-            eprintln!(
-                "tactus: defs module build failed for crate `{}` — falling back to standalone emission.\n{}",
-                crate_name, e
-            );
-            return None;
-        }
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        build_olean(&dir, &module_name, &rendered.text, &olean_path, &lean_path)?;
     }
-    Some(Arc::new(CrateDefs { module_name, dir, cmds }))
+    Ok(CrateDefs { module_name, covers_exec, dir, cmds })
 }
 
 fn build_olean(

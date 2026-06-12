@@ -441,6 +441,33 @@ fn krate_preamble(
 /// `krate_preamble` so the shared-defs module (CRATEDEFS.md step 1a)
 /// can render exactly this block once per crate with roots = all
 /// checkable fns, while standalone files keep rendering it per file.
+/// Does this fn's BODY call a `BuiltinSpecFun` (closure
+/// `call_requires`/`call_ensures` etc.)? The renderer has no faithful
+/// Lean form for those (variadic) — it emits a literal
+/// `builtinSpecFun`, which elaborates as an unknown identifier.
+/// Body-slot sibling of `broadcast_collect`'s require/ensure-slot
+/// filter; consulted by the shared-defs render, where one such spec fn
+/// (e.g. vstd's `pervasive.strictly_cloned`, pulled in by clone-impl
+/// exec fns) would poison the whole module. Per-fn standalone files
+/// keep today's behavior (the one referencing file fails in Lean).
+fn body_references_builtin_spec_fun(func: &FunctionX) -> bool {
+    use std::cell::Cell;
+    use vir::visitor::VisitorControlFlow;
+    let found = Cell::new(false);
+    let mut visit = |e: &vir::ast::Expr| {
+        if let ExprX::Call(CallTarget::BuiltinSpecFun(..), ..) = &e.x {
+            found.set(true);
+            VisitorControlFlow::Stop(())
+        } else {
+            VisitorControlFlow::Recurse
+        }
+    };
+    if let Some(body) = &func.body {
+        vir::ast_visitor::expr_visitor_walk(body, &mut visit);
+    }
+    found.get()
+}
+
 pub(crate) fn spec_world_cmds(
     krate: &KrateX,
     ectx: &crate::emit_ctx::EmitCtx,
@@ -883,12 +910,25 @@ pub(crate) fn spec_world_cmds(
         match step {
             dep_order::EmitStep::Group(i) => match &groups[*i] {
                 FnGroup::Single(f) => {
+                    if lenient && body_references_builtin_spec_fun(f) {
+                        // NOT `continue` — the loop tail's proof-class
+                        // emission must still run when this is the
+                        // last group.
+                        eprintln!(
+                            "tactus: skipped builtin-bodied spec fn `{}` in shared defs (no Lean form for BuiltinSpecFun)",
+                            short_name(&f.name.path));
+                    } else {
                     push_lenient(&mut cmds, "spec fn", &mut || {
                         let augmented = augment(f);
                         vec![to_lean_fn::spec_fn_to_ast(&augmented, ectx)]
                     });
+                    }
                 }
                 FnGroup::Mutual(fns) => {
+                    if lenient && fns.iter().any(|f| body_references_builtin_spec_fun(f)) {
+                        eprintln!(
+                            "tactus: skipped builtin-bodied mutual spec-fn group in shared defs (no Lean form for BuiltinSpecFun)");
+                    } else {
                     push_lenient(&mut cmds, "mutual spec fns", &mut || {
                         let inner: Vec<Command> = fns.iter()
                             .map(|f| {
@@ -898,6 +938,7 @@ pub(crate) fn spec_world_cmds(
                             .collect();
                         vec![Command::Mutual(inner)]
                     });
+                    }
                 }
             },
             dep_order::EmitStep::Instance(j) =>
@@ -1363,8 +1404,12 @@ pub fn emit_exec_fn(
     // Shared-defs mode is incompatible with `broadcast use` — the
     // lemma axioms extend the dep walk per-fn, which a once-per-crate
     // defs build can't anticipate. Such fns emit standalone.
+    // `covers_exec: false` = the defs module was rebuilt from proof
+    // roots only (its full-roots attempt failed in Lean) — exec
+    // closures may not be present, so exec fns emit standalone.
     let defs = if broadcast_lemmas.is_empty() {
         crate::crate_defs::for_crate(pre_inline_krate, crate_name, tactic_bodies, false)
+            .filter(|d| d.covers_exec)
     } else {
         None
     };
