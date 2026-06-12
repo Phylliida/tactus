@@ -39,8 +39,11 @@ sources outside it — the build runs from inside the cache dir with
 relative paths; (2) the cache must be USER-LEVEL (`~/.cache/tactus`),
 not under `lean_out_root()` — the e2e harness isolates each test's
 lean-out dir, which would have rebuilt the identical olean 505×/run.
-Open follow-up: `tactus-lsp` needs the cache dir on its `lean --server`
-`LEAN_PATH` (one line).
+Both follow-ups closed same day: `tactus-lsp` prepends the cache dirs
+newest-first (`7af4f04`), and the by-hand checking recipe is documented
+in README § "Checking a generated .lean file by hand" (BUILD.md turned
+out to be the upstream-inherited doc — README's Quick start is where
+the Lean workflow actually lives).
 
 Replace the inline `Command::Raw(TACTUS_PRELUDE)` with
 `import TactusPrelude`, against a `.olean` built once per prelude

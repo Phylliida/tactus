@@ -45,6 +45,23 @@ The pinned Lean version lives in `tactus/lean-project/lean-toolchain`. See
 test commands, and [`lean_verify/scripts/setup-mathlib.sh`](source/lean_verify/scripts/setup-mathlib.sh)
 for Mathlib (needed by `ring` / `nlinarith` / `polyrith` style tactics).
 
+### Checking a generated `.lean` file by hand
+
+Generated artifacts (under `target/tactus-lean/{crate}/`) import the
+prebuilt Tactus prelude rather than inlining it (see
+[`CRATEDEFS.md`](CRATEDEFS.md) step 0), so a bare `lean file.lean` fails
+with `unknown module prefix 'TactusPrelude'`. Put the prelude cache dir
+on `LEAN_PATH` first — it lives in the user-level cache, one
+content-hashed dir per prelude version (newest = current):
+
+```bash
+PRELUDE_DIR=$(ls -td ~/.cache/tactus/prelude/*/ | head -1)
+LEAN_PATH="$PRELUDE_DIR:$LEAN_PATH" lean --json path/to/fn.lean
+```
+
+(Override the cache root with `$TACTUS_PRELUDE_CACHE`; `tactus-lsp` and
+the batch verifier do this wiring automatically.)
+
 ---
 
 ## Status
