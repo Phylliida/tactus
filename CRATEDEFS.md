@@ -110,6 +110,31 @@ Three findings that sharpen the design:
    workers keep imports loaded), and the defs olean then amortizes
    even better there.
 
+**1b design (settled at 1a landing — two artifacts, not one):**
+the naive form (theorems inside the defs module) couples failure wrong:
+one bad tactic → no `.olean` → every exec file importing it breaks. So:
+
+1. `TactusDefs_{crate}.olean` — 1a's module, unchanged (spec world
+   only, always elaborates; exec files and the batch file import it).
+2. `TactusProofs_{crate}.lean` — ALL ordinary proof-fn theorems with
+   tactic bodies, topologically ordered, importing the defs olean.
+   Checked ONCE with `lean --json`; per-fn results attributed by
+   theorem line range (the renderer's `tactic_starts` landmarks, in
+   emission order). Helpers appear once — a root referencing a helper
+   references an earlier theorem in the same file. Per-fn proof files
+   stop existing in this mode (trait-method-impl and broadcast proof
+   fns keep the per-fn path); the helper-collision problem evaporates
+   with them.
+
+Lean runs per crate: 2 + N_exec, instead of N_proof + N_exec — the
+quadratic helper re-verification AND most of the per-check floor go
+together. Intentional semantics change (document at landing): a root
+whose helper fails reports green while the helper reports red (the
+root elaborated against the helper's statement; the error lives in the
+helper's range) — better attribution, crate still fails overall. Defs
+errors OUTSIDE any theorem range → poison the memo → standalone
+fallback for the crate.
+
 *Step-1 revision notes from earlier the same day (the collision
 discovery and the 1a/1b split) follow; the original sketch after them.*
 
