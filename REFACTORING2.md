@@ -5,6 +5,23 @@ records a push that already happened; **this one is a survey written before
 any code moves** — findings, proposed arcs, and sequencing for a "same
 functionality, more maintainable, fewer lines where that's honest" push.
 
+## Progress ledger
+
+| Item | Status | Commit |
+|---|---|---|
+| 1.1 smart-constructor adoption | **DONE** (same day) — raw sites 48→0 in to_lean_fn, LBinder literals 37→3, net −165 lines | `a74ce99` |
+| 1.2 EmitCtx | **DONE** — all-fn map built 3×→1×, trait_impl_to_ast 9→6 params, trait_to_ast 5→2 | `58f5277` |
+| 1.3 trait_emit.rs extraction | **DONE** — pure move, to_lean_fn.rs 2506→1380 lines | `680a6c8` |
+| 1.4 god-function splits | open — krate_preamble split deliberately deferred pending the 2.B decision; build_wp / push_post_call_frames splits unstarted | |
+| 1.5 comment policy | open — owner's call | |
+| 2.A typed-expr unification | open — **recommended opening move of the next session**, before more closure-ABI work | |
+| 2.B shared crate module | open — needs a design pass first | |
+| 2.C persistent Lean worker | open — rides with 2.B or SERVER.md Phase 2 | |
+| EmitCtx follow-ups | open — `RenderCtx::empty()` upgrade sites (behavior changes, one at a time with e2e); thread-local fold-in blocked on 2.A | |
+
+Every step gated on the full e2e suite (505/0 at time of writing) + unit
+tests (275/0). All three landed commits are mechanical/behavior-preserving.
+
 Method: read `REFACTORING.md`, the relevant `DESIGN.md` §§, and the HANDOFF
 history; measured the `lean_verify` crate; read the large files and the
 newest (trait/extends/closure-ABI-adjacent) code directly. Every claim below
