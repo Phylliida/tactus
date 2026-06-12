@@ -1,0 +1,131 @@
+# Shared Lean modules + persistent worker — design pass (REFACTORING2 §§ 2.B/2.C)
+
+*2026-06-12. Design + measurements only — no production code changed. The
+predecessor analysis is REFACTORING2.md § 2.B/2.C; this doc turns it into
+gated, measured steps.*
+
+## The problem, measured
+
+Every generated per-fn `.lean` file re-contains the world: the full
+TactusPrelude (429 lines, inlined verbatim via `Command::Raw` —
+`generate.rs:319`), every transitively referenced spec fn / datatype /
+class / instance (dep-walked and topologically sorted **per file**), and
+every referenced same-crate helper proof fn as a **full theorem with its
+tactic body** (`generate.rs:~830`) — which Lean re-elaborates, i.e.
+**re-verifies, in every file that references it** (quadratic along helper
+chains; the planned group-theory port is exactly the deep-helper-chain
+shape this punishes).
+
+Measured 2026-06-12 (probe in `/tmp/prelude-probe`, same `LEAN_PATH` the
+harness uses, lean v4.25.0, 3-run medians):
+
+| Configuration | per-check wall |
+|---|---|
+| Synthetic file: inline 429-line prelude + small theorem | **~2.6s** |
+| Same theorem, prelude as prebuilt `import TactusPrelude` (.olean) | **~1.3s** |
+| Empty file (pure `lean --json` startup) | ~0.4s |
+| One-time `lean -o TactusPrelude.olean` build | 2.7s |
+
+Decomposition per typical small check: **~0.4s spawn + ~1.3s prelude
+elaboration + ~0.9s imports/theorem**. The e2e suite (505 tests, ~59s
+wall at ~64-way parallelism) pays the prelude term in nearly every check.
+
+## Step 0 — prelude as prebuilt module (small, do first)
+
+Replace the inline `Command::Raw(TACTUS_PRELUDE)` with
+`import TactusPrelude`, against a `.olean` built once per prelude
+version.
+
+* **Build/cache:** at check time, ensure
+  `lean_out_root()/prelude-<content_hash>/TactusPrelude.olean` exists
+  (write the `.lean`, `lean -o`, build-to-temp + atomic rename for
+  concurrent-safety); prepend that dir to the child's `LEAN_PATH`. No
+  lake involvement → no configuration-lock issues; version invalidation
+  is automatic via the content hash in the path. The harness can also
+  pre-build once (same pattern as its one-time `LEAN_PATH` resolution —
+  `rust_verify_test/tests/common/mod.rs`).
+* **set_options:** the prelude's file-scoped `set_option`s
+  (`linter.unusedVariables`, `maxHeartbeats`) don't propagate through
+  `import` — re-emit them per generated file (validated in the probe).
+* **Unchanged:** `sanity.rs` prelude-name extraction (parses the source
+  string); the conditional bit-vector instances stay per-file `Raw`
+  (they're conditional on `Wp::AssertBitVector` — keep that behavior in
+  the first landing).
+* **Knock-ons:** generated files are no longer standalone — `lean
+  file.lean` by hand needs the prelude dir on `LEAN_PATH` (document in
+  BUILD.md); `tactus-lsp` must add the prelude dir to the `LEAN_PATH` it
+  passes `lean --server` (one-line change); some e2e tests may assert on
+  diagnostic line numbers that shift (expect mechanical churn).
+* **Expected win:** ~1.3s × nearly every check; suite CPU roughly
+  halves. Single fastest-payback change in the whole plan.
+
+## Step 1 — `CrateDefs` module per crate (the big deletion)
+
+For crates with ≥ 2 checked fns: emit one
+`lean_out_root()/{crate}/TactusDefs_{crate}.lean` containing the
+prelude import + ALL datatypes / spec fns / classes / instances /
+broadcast axioms / **helper proof fns as theorems** (topologically
+sorted once); build its `.olean` once; per-fn files shrink to
+`import TactusDefs_{crate}` + the root theorem.
+
+* **Kills:** the per-file dep re-walk + re-elaboration, and the
+  quadratic helper re-verification (helpers elaborate once, in the defs
+  module). `krate_preamble`'s per-file collection machinery
+  (`collect_referenced_proof_fns` etc.) mostly deletes — the ~800-line
+  reduction REFACTORING2 § 2.B predicts. (This is why the § 1.4
+  `krate_preamble` phase-split was deliberately deferred.)
+* **Gate on fn-count ≥ 2:** a 1-fn crate pays an extra lean spawn for
+  zero sharing — keep the current single-file shape there. (Most of the
+  505 e2e crates are 1–3 fns; the suite mostly takes the step-0 win and
+  is otherwise neutral. The real beneficiaries are real crates and the
+  interactive single-fn re-check loop, where the per-fn file becomes
+  tiny.)
+* **Module naming:** `TactusDefs_{crate}` (crate name already sanitized
+  for the out-dir) so multiple crates can coexist on one `LEAN_PATH`;
+  alternatively scope `LEAN_PATH` per check to the crate dir.
+* **Incrementality semantics:** a spec/datatype edit rebuilds the defs
+  `.olean` (bounded — Lean is module-incremental), then re-checks
+  affected fns against it. Today the same edit re-elaborates the world
+  inside every re-checked file anyway; net strictly better, but it IS a
+  behavior change from "each file self-contained" — record in DESIGN.md
+  when landing.
+* **Stays per-fn:** `[Nonempty T]` bound inference and signature-level
+  augmentation (they're per-fn obligations, not shared defs);
+  unemittable filtering moves to defs-module emission (computed once).
+* **Open question (decide at landing):** do helper theorems in the defs
+  module keep their `by { … }` tactic bodies (re-verified once per defs
+  build — still sound, still cheap) or become `axiom`s stipulated from
+  the per-fn check's perspective (faster defs builds, but weakens the
+  "everything in the artifact chain is checked" story)? Default: keep
+  them as theorems — verified-once is the point, and the artifact stays
+  fully checked.
+
+## Step 2 — persistent worker pool (measure first; infra exists)
+
+After steps 0–1, the residual per-check cost is ~0.4s spawn + import
+load. **`tactus-lsp` already keeps a warm `lean --server` with ~2ms warm
+queries** (SERVER.md — built and validated for the infoview). The batch
+variant is the same pattern pointed at diagnostics instead of goals:
+
+* `tactus-lsp` (or a thin sibling) gains a `check <file>` command:
+  `didOpen`/`didChange` the file, wait for elaboration, return
+  `publishDiagnostics` — imports stay warm across checks.
+* A pool of N workers replaces process-per-check in `lean_process.rs`
+  behind a flag; the harness opts in.
+* **Gate:** measure after steps 0–1. If the suite lands near the ~0.9s/
+  check floor × parallelism, the pool's complexity may not pay for
+  batch (it's already justified for the infoview). Don't build it on
+  faith.
+
+## Sequencing
+
+```
+Step 0  prelude .olean        — small diff, ~2× suite CPU win, do first
+Step 1  CrateDefs (≥2-fn)     — the big deletion; krate_preamble shrinks
+Step 2  worker pool           — only if post-0/1 measurement justifies
+```
+
+Every step gates on the full e2e suite + unit tests, same protocol as
+the REFACTORING2 tactical bundle. Steps 0 and 1 are independent enough
+to land separately; step 1 builds on step 0's module-build/cache
+plumbing.
