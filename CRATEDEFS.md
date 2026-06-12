@@ -110,6 +110,17 @@ Three findings that sharpen the design:
    workers keep imports loaded), and the defs olean then amortizes
    even better there.
 
+**1b LANDED (same session): batch verification of ordinary proof fns.**
+Suite 510/0 (incl. 2 batch e2e tests); deep-closure miniature (10
+lemmas, 15-deep recursive chain): **25.1s → 5.9s (−76%)** — vs 1a's
+−12% on the identical shape. Ten Lean runs became two (defs build +
+batch); scales as 2 + N_exec runs per crate regardless of proof-fn
+count. The failure-semantics change verified by test: a bad helper
+fails alone (exactly 1 error, attributed to the helper); its caller
+reports green, the crate still fails. Attribution machinery: per-chunk
+rendering gives exact theorem regions (signatures included); errors
+outside every region poison the batch → per-fn standalone fallback.
+
 **1b design (settled at 1a landing — two artifacts, not one):**
 the naive form (theorems inside the defs module) couples failure wrong:
 one bad tactic → no `.olean` → every exec file importing it breaks. So:
