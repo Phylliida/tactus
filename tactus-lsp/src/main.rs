@@ -564,11 +564,25 @@ fn file_uri(path: &str) -> String {
 }
 
 fn resolve_lean_path() -> String {
-    if let Ok(p) = std::env::var("LEAN_PATH") {
-        if !p.is_empty() {
-            return p;
-        }
+    let base = if let Ok(p) = std::env::var("LEAN_PATH") {
+        if !p.is_empty() { p } else { lake_lean_path() }
+    } else {
+        lake_lean_path()
+    };
+    // Generated .lean files import the prebuilt TactusPrelude module
+    // (CRATEDEFS.md step 0) from a user-level content-hashed cache.
+    // Prepend every cached version dir, newest first: the newest
+    // matches what the last tactus run generated; older artifacts
+    // still resolve their own version further down the path.
+    let mut dirs = prelude_cache_dirs();
+    if dirs.is_empty() {
+        return base;
     }
+    dirs.push(base);
+    dirs.join(":")
+}
+
+fn lake_lean_path() -> String {
     let proj = std::env::var("TACTUS_LEAN_PROJECT").unwrap_or_else(|_| "../lean-project".into());
     let out = Command::new("lake")
         .args(["env", "printenv", "LEAN_PATH"])
@@ -584,6 +598,35 @@ fn resolve_lean_path() -> String {
         std::process::exit(1);
     }
     s
+}
+
+/// Cached prebuilt-prelude version dirs (each holds a
+/// TactusPrelude.olean), newest-mtime first. Mirrors
+/// `lean_verify::prelude::prelude_cache_dir`'s root fallbacks.
+fn prelude_cache_dirs() -> Vec<String> {
+    let root = if let Ok(d) = std::env::var("TACTUS_PRELUDE_CACHE") {
+        std::path::PathBuf::from(d)
+    } else if let Ok(d) = std::env::var("XDG_CACHE_HOME") {
+        std::path::PathBuf::from(d).join("tactus")
+    } else if let Ok(h) = std::env::var("HOME") {
+        std::path::PathBuf::from(h).join(".cache").join("tactus")
+    } else {
+        return Vec::new();
+    };
+    let prelude_root = root.join("prelude");
+    let Ok(entries) = std::fs::read_dir(&prelude_root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<(std::time::SystemTime, String)> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().join("TactusPrelude.olean").exists())
+        .filter_map(|e| {
+            let mtime = e.metadata().ok()?.modified().ok()?;
+            Some((mtime, e.path().to_string_lossy().into_owned()))
+        })
+        .collect();
+    dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    dirs.into_iter().map(|(_, d)| d).collect()
 }
 
 fn load(sidecar_path: &str, rs_path: &str) -> (Sidecar, String) {
