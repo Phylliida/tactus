@@ -25,6 +25,7 @@ pub(crate) mod test_fixtures;
 pub mod to_lean_expr;
 pub mod to_lean_fn;
 pub mod to_lean_sst_expr;
+pub mod trait_emit;
 pub mod to_lean_type;
 pub mod typed_expr;
 
