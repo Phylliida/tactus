@@ -1977,6 +1977,11 @@ pub fn trait_impl_to_ast(
     // inherited from `FnOnce`) — declared assoc types are already supplied
     // via `assoc_types`.
     trait_outparams: &HashMap<Path, Vec<vir::ast::Ident>>,
+    // ALL assoc-type impls in the krate (not just this impl's). Used to fill a
+    // CONCRETE instance's inherited out-param slot from the implementor's
+    // sibling superclass impl — `impl Dog for Rex`'s inherited `Sound` =
+    // `Rex`'s `Animal::Sound`. See `find_inherited_assoc`.
+    all_assoc_types: &[&AssocTypeImplX],
 ) -> Instance {
     let mut binders: Vec<LBinder> = Vec::new();
     for tp in ti.typ_params.iter() {
@@ -2038,12 +2043,19 @@ pub fn trait_impl_to_ast(
                 // impl's own compound isn't replaced by one component's binder.
                 target_args.push(typ_to_expr(&subst.rewrite_typ(&a.typ)));
             } else if let Some(fresh) = subst.outparam_binder(name) {
-                // Genuinely INHERITED out-param (no declared `type N`): the
-                // forwarding fresh binder, by name (the head's trait may be
+                // INHERITED out-param via a FORWARDING bound (blanket instance):
+                // the forwarding fresh binder, by name (the head's trait may be
                 // weaker than the bound's — `FnMut` head reusing the `Fn`
                 // bound's `Output`).
                 target_args.push(LExpr::new(ExprNode::Var(
                     crate::lean_name::LeanName::typ_param(fresh.as_str()))));
+            } else if let Some(typ) = find_inherited_assoc(ti, name, all_assoc_types) {
+                // INHERITED out-param on a CONCRETE instance (no declared
+                // `type N`, no forwarding bound): its value is the implementor's
+                // sibling superclass-impl assoc — `Dog Rex`'s `Sound` = `Rex`'s
+                // `Animal::Sound`. A free binder / unfilled slot here would
+                // under-apply the now-N-ary class.
+                target_args.push(typ_to_expr(typ));
             }
             // else: unfilled — Lean surfaces the under-application.
         }
@@ -2468,6 +2480,30 @@ fn drop_unemittable_trait_bounds(
 /// matching `TypEquality` bounds merged in as extra type arguments.
 fn trait_bounds_to_ast(bounds: &GenericBounds, unemittable: &std::collections::HashSet<Path>) -> Vec<LBinder> {
     trait_bounds_to_ast_with(bounds, unemittable, |t| typ_to_expr(t))
+}
+
+/// For a CONCRETE instance whose trait inherits an out-param `name` from a
+/// superclass (`impl Dog for Rex` where `Dog: Animal` and `Animal` has `type
+/// Sound`), the value of that out-param: the implementor's sibling
+/// superclass-impl assoc of the same name — `Rex`'s `Animal::Sound`. Matched by
+/// the implementor Self type (`ti.trait_typ_args[0]`) + assoc name across ALL
+/// the krate's assoc-type impls. Forwarding blanket instances never reach here
+/// (they fill via the forwarding fresh binder); this is the concrete-Self path
+/// where the inherited slot's value is a real type, not a binder. Matched by
+/// (Self, name) — the source superclass isn't tracked, unambiguous when an
+/// implementor has one assoc of a given name (the common case).
+fn find_inherited_assoc<'a>(
+    ti: &TraitImplX,
+    name: &vir::ast::Ident,
+    all_assoc_types: &'a [&AssocTypeImplX],
+) -> Option<&'a Typ> {
+    use vir::ast_util::types_equal;
+    let self_ty = ti.trait_typ_args.first()?;
+    all_assoc_types.iter().find_map(|a| {
+        let a_self = a.trait_typ_args.first()?;
+        (a.name.as_str() == name.as_str() && types_equal(a_self, self_ty))
+            .then_some(&a.typ)
+    })
 }
 
 /// For each emittable trait, the ordered list of associated-type out-param

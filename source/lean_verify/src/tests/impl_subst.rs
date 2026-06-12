@@ -470,3 +470,50 @@ fn build_keys_outparam_on_self_not_every_typ_arg() {
     assert!(!subst.proj_map.contains_key(&(mk_ident("A"), mk_path(&["Fn"]), mk_ident("Output"))),
         "no spurious <A as Fn>::Output entry keyed on Args (A)");
 }
+
+/// `rewrite_typ`'s transitive fallback resolves a projection whose trait
+/// DIFFERS from the proj_map entry's, as long as Self + assoc name match —
+/// a declared `<F as FnOnce>::Output` forwarded via a `[Fn F A]` bound (whose
+/// entry is keyed on `Fn`) is the same assoc down the `Fn: FnMut: FnOnce`
+/// chain. Exact still preferred; a different Self is not rewritten.
+#[test]
+fn rewrite_typ_transitive_fallback_matches_by_self_and_name() {
+    let mut subst = ImplSubst::default();
+    let fresh = mk_ident("_tactus_assoc_F_Fn_Output");
+    subst.proj_map.insert(
+        (mk_ident("F"), mk_path(&["Fn"]), mk_ident("Output")), fresh.clone());
+    let is_fresh = |t: &Typ| matches!(&**t, TypX::TypParam(n) if n.as_str() == fresh.as_str());
+    // exact (F, Fn, Output)
+    assert!(is_fresh(&subst.rewrite_typ(&mk_proj("F", &["Fn"], "Output"))), "exact match");
+    // transitive: (F, FnOnce, Output) → same fresh (Self+name match, trait differs)
+    assert!(is_fresh(&subst.rewrite_typ(&mk_proj("F", &["FnOnce"], "Output"))),
+        "transitive fallback by (Self, name)");
+    // different Self → left as a projection, not rewritten
+    assert!(matches!(&*subst.rewrite_typ(&mk_proj("G", &["FnOnce"], "Output")),
+        TypX::Projection { .. }), "different Self not rewritten");
+}
+
+/// `compute_trait_outparams` does NOT inherit a superclass out-param that this
+/// trait PINS to a concrete type via a `TypEquality` (`Sub: Super<Out = …>`) —
+/// it's a value, threaded by the `extends` clause, not a carried `outParam`.
+#[test]
+fn compute_trait_outparams_skips_pinned_superclass_assoc() {
+    let sup = make_trait("Super", &["Out"], &[]);
+    let mut sub = make_trait("Sub", &[], &["Super"]);
+    let mut bounds = (*sub.typ_bounds).clone();
+    bounds.push(Arc::new(GenericBoundX::TypEquality(
+        mk_path(&["Super"]),
+        Arc::new(vec![Arc::new(TypX::TypParam(mk_ident("Self")))]),
+        mk_ident("Out"),
+        Arc::new(TypX::Bool), // pinned to a concrete type
+    )));
+    sub.typ_bounds = Arc::new(bounds);
+    let mut lookup: HashMap<Path, &TraitX> = HashMap::new();
+    lookup.insert(mk_path(&["Super"]), &sup);
+    lookup.insert(mk_path(&["Sub"]), &sub);
+    let out = crate::to_lean_fn::compute_trait_outparams(
+        &lookup, &std::collections::HashSet::new());
+    assert_eq!(out.get(&mk_path(&["Super"])).unwrap().len(), 1, "Super carries Out");
+    assert!(out.get(&mk_path(&["Sub"])).unwrap().is_empty(),
+        "Sub pins Super's Out → does not inherit it as a param");
+}
