@@ -739,6 +739,10 @@ fn krate_preamble(
             .filter(|a| a.x.impl_path == ti.x.impl_path)
             .map(|a| &a.x)
             .collect();
+        // ALL assoc-type impls — for filling a concrete instance's inherited
+        // out-param from the implementor's sibling superclass impl.
+        let all_assoc_types: Vec<&AssocTypeImplX> =
+            krate.assoc_type_impls.iter().map(|a| &a.x).collect();
         let empty_subst = crate::impl_subst::ImplSubst::default();
         let subst = impl_substs.get(&ti.x.impl_path).unwrap_or(&empty_subst);
         // `[Nonempty T]` bounds the instance inherits from its method-impl
@@ -747,7 +751,7 @@ fn krate_preamble(
         let ne_bounds = crate::nonempty::instance_nonempty_bounds(
             &nonempty_needs, method_impls, &ti.x.typ_params);
         cmds.push(Command::Instance(
-            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, tactic_bodies, subst, &ne_bounds, &unemittable_traits, &trait_outparams)
+            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, tactic_bodies, subst, &ne_bounds, &unemittable_traits, &trait_outparams, &all_assoc_types)
         ));
     };
     // Classes WITH proof-fn methods: their Prop-typed fields reference

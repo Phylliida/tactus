@@ -10246,6 +10246,46 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Coverage: trait inheritance where the parent has an ASSOCIATED TYPE, so the
+// child's `extends`-emitted class carries the inherited outParam. Exercises
+// the whole inherited-out-param path end-to-end:
+//   - `class Animal (Self) (Sound : outParam Type)` — own assoc.
+//   - `class Dog (Self) (Sound : outParam Type) extends Animal Self Sound` —
+//     Dog INHERITS Sound (compute_trait_outparams transitive + the inherited
+//     outParam binder in trait_to_ast + class_extends_to_ast threading).
+//   - `instance : Dog Rex Int` — the CONCRETE instance fills its inherited
+//     `Sound` slot from the implementor's sibling `Animal Rex` impl
+//     (find_inherited_assoc); without it the head was `Dog Rex` (2 args for a
+//     3-ary class). Surfaced by the coverage audit (2026-06-12); the suite had
+//     no concrete impl of an assoc-type-inheriting trait until this.
+test_verify_one_file! {
+    #[test] test_extends_inherited_assoc_concrete_instance verus_code! {
+        trait Animal {
+            type Sound;
+            spec fn noise(&self) -> Self::Sound;
+        }
+        trait Dog: Animal {
+            spec fn legs(&self) -> int;
+        }
+        struct Rex;
+        impl Animal for Rex {
+            type Sound = u8;
+            spec fn noise(&self) -> u8 { 7 }
+        }
+        impl Dog for Rex {
+            spec fn legs(&self) -> int { 4 }
+        }
+        // `<T: Dog>` exercises the inherited-outParam BOUND; `&Rex` forces the
+        // concrete `Dog Rex` / `Animal Rex` instances to emit.
+        #[verifier::tactus_auto]
+        fn check<T: Dog>(_t: &T, _rex: &Rex) -> (r: u8)
+            ensures r == 0
+        {
+            0
+        }
+    } => Ok(())
+}
+
 // Edge case (E3): proof-fn trait method with EMPTY ensures clause and
 // non-unit return. The subtype's predicate becomes `True` (via
 // `and_all` on an empty Vec). The instance witness can be any value
