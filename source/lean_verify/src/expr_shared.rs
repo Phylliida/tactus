@@ -122,18 +122,27 @@ pub struct RenderCtx<'a> {
     /// `None` outside per-fn body/ensures rendering (falls back to the
     /// spanned typ — identical to the prior behaviour).
     pub binder_typs: Option<&'a HashMap<VarIdent, Typ>>,
+    /// Inlining-render mode: suppresses the `apply_ref_coercion_if_needed`
+    /// lift at `ExprX::ReadPlace` sites. Callee-spec inlining substitutes
+    /// the rendered form with a CALLER-provided arg that is already
+    /// wrapper-typed; the lift would over-wrap. Set via
+    /// [`Self::for_inlining`]; read in `to_lean_expr::structural_typ`.
+    /// (Replaces the former `READPLACE_LIFT_ENABLED` thread-local —
+    /// render-mode state belongs on the ctx that already threads through
+    /// the recursion, not in ambient TLS.)
+    pub inlining: bool,
 }
 
 impl<'a> RenderCtx<'a> {
     /// Empty context — class-method-call rendering falls back to
     /// no-coerce; Var substitution falls through to plain Var.
     pub fn empty() -> Self {
-        Self { fn_map: None, value_subst: None, value_subst_pre: None, binder_typs: None }
+        Self { fn_map: None, value_subst: None, value_subst_pre: None, binder_typs: None, inlining: false }
     }
 
     /// Context with fn_map for class-method-call rendering.
     pub fn with_fn_map(fn_map: &'a RenderFnMap<'a>) -> Self {
-        Self { fn_map: Some(fn_map), value_subst: None, value_subst_pre: None, binder_typs: None }
+        Self { fn_map: Some(fn_map), value_subst: None, value_subst_pre: None, binder_typs: None, inlining: false }
     }
 
     /// Attach the in-scope binder-typ map (see the `binder_typs` field).
@@ -141,6 +150,11 @@ impl<'a> RenderCtx<'a> {
     /// `RenderCtx::with_fn_map(&m).with_binder_typs(&pars)`.
     pub fn with_binder_typs(self, binder_typs: &'a HashMap<VarIdent, Typ>) -> Self {
         Self { binder_typs: Some(binder_typs), ..self }
+    }
+
+    /// Inlining-render mode (see the `inlining` field). Builder-style.
+    pub fn for_inlining(self) -> Self {
+        Self { inlining: true, ..self }
     }
 
     /// Context with both fn_map and a render-time value substitution
@@ -151,7 +165,7 @@ impl<'a> RenderCtx<'a> {
         fn_map: &'a RenderFnMap<'a>,
         value_subst: &'a RenderValueSubst<'a>,
     ) -> Self {
-        Self { fn_map: Some(fn_map), value_subst: Some(value_subst), value_subst_pre: None, binder_typs: None }
+        Self { fn_map: Some(fn_map), value_subst: Some(value_subst), value_subst_pre: None, binder_typs: None, inlining: false }
     }
 
     /// Context with fn_map + both post-state and pre-state value
@@ -170,6 +184,7 @@ impl<'a> RenderCtx<'a> {
             value_subst: Some(value_subst),
             value_subst_pre: Some(value_subst_pre),
             binder_typs: None,
+            inlining: false,
         }
     }
 
@@ -184,6 +199,10 @@ impl<'a> RenderCtx<'a> {
             value_subst: self.value_subst_pre,
             value_subst_pre: self.value_subst_pre,
             binder_typs: self.binder_typs,
+            // Mid-render swap — the inlining mode must survive it (the
+            // thread-local this field replaced persisted across the
+            // whole recursive render).
+            inlining: self.inlining,
         }
     }
 

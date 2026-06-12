@@ -4265,7 +4265,8 @@ shadow makes x's Lean type match e's inner-value type).
   fix (`7d2a537`, 2026-05-24): callee-spec inlining now suppresses
   the `apply_ref_coercion_if_needed` lift at `ExprX::ReadPlace`
   sites via the `vir_expr_to_ast_for_inlining` entry point + the
-  `READPLACE_LIFT_ENABLED` thread-local in `to_lean_expr.rs`. With
+  `RenderCtx.inlining` flag (formerly the `READPLACE_LIFT_ENABLED`
+  thread-local, migrated onto the ctx 2026-06-12). With
   the lift gone in the inlining context, no peel is needed —
   substituted-args flow through unchanged and match the callee's
   expected param type directly. The kind-discriminator (proxy for
@@ -4380,17 +4381,21 @@ shadow makes x's Lean type match e's inner-value type).
   structurally, but no test pins this. Worth a probe at depth 3+
   if a real use case surfaces.
 
-* **`vir_expr_to_ast_for_inlining` thread-local still needed**
-  (vs eliminated by U2). The `READPLACE_LIFT_ENABLED` thread-local
-  from the β refactor's right-way fix remains in place. Even with
-  U2's binder-aware structural_typ, the inlining context has an
-  empty BinderCtx (substitution happens post-rendering), so
-  structural would fall back to `p.typ` (bare) and the lift would
-  over-wrap substituted args. The thread-local correctly suppresses
-  this. Removing it would require coordinating the substitution
-  with a synthetic BinderCtx populated from the caller's arg typs —
-  not currently motivated, but a candidate for future cleanup if
-  the inlining pipeline is restructured.
+* **`vir_expr_to_ast_for_inlining` inlining-mode flag still needed**
+  (vs eliminated by U2). The inlining-mode suppression from the β
+  refactor's right-way fix remains in place — as the
+  `RenderCtx.inlining` field since 2026-06-12 (it was the
+  `READPLACE_LIFT_ENABLED` thread-local before that; render-mode
+  state belongs on the ctx that already threads the recursion, not
+  in ambient TLS — the `Old(_)` mid-render ctx swap explicitly
+  propagates it). Even with U2's binder-aware structural_typ, the
+  inlining context has an empty BinderCtx (substitution happens
+  post-rendering), so structural would fall back to `p.typ` (bare)
+  and the lift would over-wrap substituted args. The flag correctly
+  suppresses this. Removing it would require coordinating the
+  substitution with a synthetic BinderCtx populated from the
+  caller's arg typs — not currently motivated, but a candidate for
+  future cleanup if the inlining pipeline is restructured.
 
   **Status update 2026-05-26: typed substitution closed the β
   over-wrap concern at the architectural level.** Once
@@ -4400,11 +4405,11 @@ shadow makes x's Lean type match e's inner-value type).
   thread-local was suppressing no longer fires: the substituted
   value is always at its actual Lean typ, and the inner bridge
   brings it to the inner expected typ regardless of caller typ
-  shape (bare or wrapper-typed). The thread-local remains in place
-  for `READPLACE_LIFT_ENABLED`'s structural purpose (skipping the
-  `ReadPlace` lift when the inlining context's BinderCtx is empty
-  and value_subst doesn't hit), but the over-wrap concern that
-  originally motivated it is gone. Could be removed if a future
+  shape (bare or wrapper-typed). The flag remains in place for its
+  structural purpose (skipping the `ReadPlace` lift when the
+  inlining context's BinderCtx is empty and value_subst doesn't
+  hit), but the over-wrap concern that originally motivated it is
+  gone. Could be removed if a future
   refactor unifies the inlining and standalone-rendering paths
   with one BinderCtx convention. Lower priority than it was.
 
@@ -4429,6 +4434,60 @@ shadow makes x's Lean type match e's inner-value type).
   (2026-05-17 session); broke 5 proof-fn tests whose tactics
   expected one-step `simp_all [Trait.method]` unfolding.
   Rejected then; still rejected.
+
+### TypedExpr-with-smart-ctor (the typed-composition direction)
+
+*(Written 2026-06-12 — this is the section `typed_expr.rs`'s header has
+referenced since 2026-05-25; the analysis previously lived only in the
+HANDOFF session records. See also REFACTORING2.md § 2.A.)*
+
+**The problem.** `lean_ast::Expr` is untyped syntax, but composition
+(apply, field-project, substitute) must know "what Lean type does this
+rendered value have vs. what the slot expects" to insert `.deref` /
+`Tactus.X.mk` wrapper bridges. Historically that knowledge was re-derived
+ad hoc at each composition site — the source of the recurring
+wrapper-arch bug family (β refactor, U2, the three SST clusters of
+2026-05, Cluster A).
+
+**The design.** `TypedExpr` (`typed_expr.rs`) carries `(Expr, Typ)`;
+smart constructors (`var`, `into_slot`, `coerce_to`, `field`, `apply`)
+bridge at composition time via the single shared `coerce_lexpr(value,
+from, to)` in `expr_shared.rs`. The typing claim concentrates at
+construction sites (fewer, reviewable) instead of scattering across
+every composition. Not a full elaborator: no metavariables, no
+typeclass dispatch — only wrapper-depth bridging, the dimension with
+actual bugs. Not type-system-enforced: a site that lies about typ still
+produces wrong coercion.
+
+**Rejected alternatives** (2026-05-25/26 sessions):
+- **Full elaborator in Rust** — modeling Lean's unification to check
+  every composition. Massive scope for one failure dimension. Rejected.
+- **Phantom-typed Expr** (type-state encoding wrapper depth) — wrapper
+  depth is data-dependent (`Typ`-dependent), not statically known at
+  Rust compile time. Rejected.
+- **Lean `Coe` delegation** (emit bare values, register `instance Coe
+  (Tactus.Ref A) A` etc. in the prelude and let Lean's elaborator
+  insert coercions) — hides the bridging from the artifact (the
+  "and then something happened" anti-pattern), degrades error
+  messages, and defeq-vs-syntactic mismatches would surface in user
+  tactic proofs instead of at codegen where we can fix them. Rejected.
+
+**State + direction (2026-06-12).** Three generations of the same idea
+coexist: (1) ad-hoc per-site coercion (~124 sites), (2) `TypedExpr`
+(used at the post-call-existential sites in `push_post_call_frames`),
+(3) `RenderCtx` typed render-time substitution (`value_subst` carrying
+`(LExpr, Typ)` — which closed the original "typed substitution" gap for
+call-site inlining; remaining post-render `substitute` calls are
+type-level or same-typ name swaps, safe untyped). The direction
+(REFACTORING2 § 2.A) is to collapse generations: render-mode state
+moves onto `RenderCtx` (the `inlining` flag, formerly the
+`READPLACE_LIFT_ENABLED` thread-local, landed 2026-06-12), `BinderCtx`
+merges into `RenderCtx` (both are `HashMap<VarIdent, Typ>` threaded in
+parallel through the VIR renderer — note the inlining-context semantics
+trap: inlining renders pass an EMPTY BinderCtx deliberately, so the
+merge must not let `ctx.binder_typs` leak into Var-arm lookups there),
+and the ad-hoc coercion sites migrate to `TypedExpr`/`coerce_lexpr`
+cluster by cluster, each gated on the e2e suite.
 
 ### Blanket-impl assoc-type passthrough (Bug B, LANDED 2026-05-19)
 

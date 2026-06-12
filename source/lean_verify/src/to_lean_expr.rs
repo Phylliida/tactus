@@ -67,8 +67,8 @@ pub fn vir_expr_to_ast(expr: &Expr) -> LExpr {
 
 /// Variant for callee-spec inlining contexts. Suppresses the
 /// `apply_ref_coercion_if_needed` lift at `ExprX::ReadPlace` sites
-/// (returns None from `structural_typ` for ReadPlace via the
-/// `READPLACE_LIFT_ENABLED` thread-local).
+/// (returns None from `structural_typ` for ReadPlace via the ctx's
+/// `inlining` flag).
 ///
 /// Why: standalone proof / spec / trait-impl-method bodies need the
 /// lift to bridge from peeled-binder rendering to decorated-expr.typ
@@ -91,22 +91,7 @@ pub fn vir_expr_to_ast_for_inlining(expr: &Expr) -> LExpr {
 /// for class-method-call coercion at trait dispatch sites. Use at codegen
 /// entry points where the fn_map is available.
 pub fn vir_expr_to_ast_for_inlining_with_ctx(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> LExpr {
-    READPLACE_LIFT_ENABLED.with(|cell| {
-        let prior = cell.replace(false);
-        let result = vir_expr_to_ast_with_binders(expr, &BinderCtx::new(), ctx);
-        cell.set(prior);
-        result
-    })
-}
-
-thread_local! {
-    /// Controls whether `structural_typ` for `ExprX::ReadPlace`
-    /// returns the place's peeled typ (default true → lift fires via
-    /// apply_ref_coercion) or `None` (false → no lift). Toggled
-    /// false during `vir_expr_to_ast_for_inlining` and restored on
-    /// exit. The default is `true` so non-inlining callers keep
-    /// pre-existing behaviour.
-    static READPLACE_LIFT_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    vir_expr_to_ast_with_binders(expr, &BinderCtx::new(), &ctx.for_inlining())
 }
 
 /// Build a `lean_ast::Expr` from a VIR-AST expression with the given
@@ -163,16 +148,16 @@ fn structural_typ(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::Re
         // Inlining-substitution path: when the Local is in
         // `ctx.value_subst`, report the storage typ from there so
         // `apply_ref_coercion_if_needed` can bridge to expr.typ even
-        // though the `READPLACE_LIFT_ENABLED` flag is otherwise
-        // suppressed for inlining. The β refactor's suppression was
+        // though the ReadPlace lift is otherwise suppressed for
+        // inlining (`ctx.inlining`). The β refactor's suppression was
         // meant to skip the lift for substituted-non-mut args (whose
         // typ already matched the AST claim); mut-param substitution
         // genuinely needs the bridge, so the storage-typ hit wins.
         //
-        // Inlining contexts (`vir_expr_to_ast_for_inlining`) flip
-        // `READPLACE_LIFT_ENABLED` to false to suppress the lift —
-        // the substituted-arg provides the correct wrapper-typed
-        // value directly. See the doc on `vir_expr_to_ast_for_inlining`.
+        // Inlining contexts (`vir_expr_to_ast_for_inlining`) set
+        // `ctx.inlining` to suppress the lift — the substituted-arg
+        // provides the correct wrapper-typed value directly. See the
+        // doc on `vir_expr_to_ast_for_inlining`.
         ExprX::ReadPlace(p, _) => {
             let inlining_storage_typ = match &p.x {
                 PlaceX::Local(v) => {
@@ -202,13 +187,13 @@ fn structural_typ(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::Re
             if ctx.value_subst.is_some() {
                 return Some(p.typ.clone());
             }
-            if READPLACE_LIFT_ENABLED.with(|cell| cell.get()) {
+            if ctx.inlining {
+                None
+            } else {
                 match &p.x {
                     PlaceX::Local(v) => binders.get(v).cloned().or_else(|| Some(p.typ.clone())),
                     _ => Some(p.typ.clone()),
                 }
-            } else {
-                None
             }
         }
         // A `Call` renders as a naked `head args` application — the
