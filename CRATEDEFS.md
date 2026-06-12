@@ -79,6 +79,45 @@ version.
 
 ## Step 1 — `CrateDefs` module per crate (the big deletion)
 
+**REVISED at implementation time (same day, post-roll) — three findings
+from reading `krate_preamble` whole:**
+
+1. **Name collision kills helpers-in-defs as designed.** Every checkable
+   proof fn is also a helper candidate. If defs contains `theorem
+   lemma_foo`, then `lemma_foo`'s own check file (`import defs` +
+   `theorem lemma_foo`) redeclares the name — Lean rejects. Renaming
+   breaks verbatim tactic bodies / the sourcemap; skipping the
+   restatement breaks per-fn failure attribution. So step 1 splits:
+   **1a** = defs carries the spec world ONLY (datatypes, spec fns,
+   classes, instances) — helpers stay per-file; **1b** (later) = proof
+   fns move into defs and the per-fn check becomes attribution into the
+   one defs build via per-theorem line ranges. 1b is what kills
+   quadratic helper re-verification; 1a builds all the infrastructure
+   1b needs.
+2. **Broadcast lemmas can't be in defs.** They resolve from the per-fn
+   `FuncCheckSst` (not available crate-level) and extend the dep walk.
+   Fns with `broadcast use` fall back to standalone emission.
+3. **Tiny crates lose.** A defs build (~1.3s+) outweighs its savings
+   when the spec world is a few lines — i.e., most of the 505 e2e
+   crates. So 1a is **flag-gated** (`--tactus-crate-defs`, default
+   off): suite behavior and timing unchanged, dedicated e2e tests
+   exercise the path, real crates (the group-theory port) opt in.
+   Automatic gating by spec-world size can come later with measurement.
+
+Other implementation constraints discovered: defs renders from the same
+`inline_spec`-transformed krate as fn files (deterministic, so
+content-compare stays stable); accessor emission in defs gates on "any
+exec root exists" (accessors can legitimately fail elaboration for
+enums whose fields lack Inhabited — why proof-fn files skip them; a
+failure falls back to standalone for the crate); the sanity checker
+walks command streams, so WithDefs checks pass `defs_cmds ++ fn_cmds`
+— exactly today's semantics; per-fn files keep fragments, bit-vector
+conditional instances, and their own import unions.
+
+*Original step-1 sketch below, kept for the record (the gate-on-≥2-fns
+idea survives inside the flag; the helper-theorems-in-defs idea is
+superseded by the 1a/1b split):*
+
 For crates with ≥ 2 checked fns: emit one
 `lean_out_root()/{crate}/TactusDefs_{crate}.lean` containing the
 prelude import + ALL datatypes / spec fns / classes / instances /
