@@ -7,7 +7,7 @@ use crate::expr_shared::{
     is_variant_node, non_binop_head,
 };
 use crate::lean_ast::{
-    Binder as LBinder, BinderKind, Expr as LExpr,
+    Binder as LBinder, Expr as LExpr,
     ExprNode, MatchArm as LMatchArm, Pattern as LPattern,
 };
 use crate::to_lean_type::{lean_name, sanitize, short_name, typ_to_expr};
@@ -332,11 +332,10 @@ fn apply_ref_coercion_if_needed(
 /// Build `VarBinders<Typ>` → AST binders for proof/spec fn parameters.
 /// Each becomes an explicit `(name : Type)` binder.
 pub(crate) fn vir_var_binders_to_ast(binders: &VarBinders<Typ>) -> Vec<LBinder> {
-    binders.iter().map(|b| LBinder {
-        name: Some(crate::lean_name::LeanName::from_var_ident(&b.name)),
-        ty: typ_to_expr(&b.a),
-        kind: BinderKind::Explicit,
-    }).collect()
+    binders.iter().map(|b| LBinder::explicit(
+        crate::lean_name::LeanName::from_var_ident(&b.name),
+        typ_to_expr(&b.a),
+    )).collect()
 }
 
 // ── Internal: build ExprNode ────────────────────────────────────────────
@@ -525,16 +524,13 @@ fn expr_to_node(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::Rend
                     if typ_contains_param(&annot_typ) {
                         arg_coerced
                     } else {
-                        LExpr::new(ExprNode::TypeAnnot {
-                            expr: Box::new(arg_coerced),
-                            ty: Box::new(typ_to_expr(&annot_typ)),
-                        })
+                        LExpr::type_annot(arg_coerced, typ_to_expr(&annot_typ))
                     }
                 }).collect();
                 let app = if app_args.is_empty() {
                     head
                 } else {
-                    LExpr::new(ExprNode::App { head: Box::new(head), args: app_args })
+                    LExpr::app(head, app_args)
                 };
                 if typ_contains_param(&expr.typ) {
                     app.node
@@ -576,10 +572,10 @@ fn expr_to_node(expr: &Expr, binders: &BinderCtx, ctx: &crate::expr_shared::Rend
             for b in params.iter() {
                 extended.insert(b.name.clone(), b.a.clone());
             }
-            let lambda = LExpr::new(ExprNode::Lambda {
-                binders: vir_var_binders_to_ast(params),
-                body: Box::new(vir_expr_to_ast_with_binders(cond, &extended, ctx)),
-            });
+            let lambda = LExpr::lambda(
+                vir_var_binders_to_ast(params),
+                vir_expr_to_ast_with_binders(cond, &extended, ctx),
+            );
             LExpr::app1(LExpr::var_lit("Classical.epsilon"), lambda).node
         }
 
@@ -884,10 +880,7 @@ fn call_to_node(target: &CallTarget, args: &Exprs, binders: &BinderCtx, ctx: &cr
             if typs.is_empty() {
                 base
             } else {
-                LExpr::new(ExprNode::App {
-                    head: Box::new(base),
-                    args: typs.iter().map(|t| typ_to_expr(t)).collect(),
-                })
+                LExpr::app(base, typs.iter().map(|t| typ_to_expr(t)).collect())
             }
         }
         CallTarget::FnSpec(inner) => {
@@ -911,10 +904,7 @@ fn call_to_node(target: &CallTarget, args: &Exprs, binders: &BinderCtx, ctx: &cr
             if typs.is_empty() {
                 base
             } else {
-                LExpr::new(ExprNode::App {
-                    head: Box::new(base),
-                    args: typs.iter().map(|t| typ_to_expr(t)).collect(),
-                })
+                LExpr::app(base, typs.iter().map(|t| typ_to_expr(t)).collect())
             }
         }
     };
@@ -981,10 +971,10 @@ fn ctor_to_node(dt: &Dt, variant: &Ident, fields: &Binders<Expr>, binders: &Bind
 fn block_to_node(stmts: &[Stmt], final_expr: Option<&Expr>, binders: &BinderCtx, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
     let body = match final_expr {
         Some(e) => vir_expr_to_ast_with_binders(e, binders, ctx),
-        None if stmts.is_empty() => LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("()"))),
+        None if stmts.is_empty() => LExpr::var_lit("()"),
         // No final expression — the last stmt's value is the block's value.
         // In spec mode this is unusual; fall back to unit.
-        None => LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("()"))),
+        None => LExpr::var_lit("()"),
     };
 
     let mut folded = body;
@@ -994,28 +984,25 @@ fn block_to_node(stmts: &[Stmt], final_expr: Option<&Expr>, binders: &BinderCtx,
                 let value = match init {
                     Some(place) => place_to_expr(&place.x, binders, ctx),
                     // No initializer (e.g., `let x;`) — give a placeholder.
-                    None => LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit("_"))),
+                    None => LExpr::var_lit("_"),
                 };
                 match &pattern.x {
-                    PatternX::Var(binding) => LExpr::new(ExprNode::Let {
-                        name: crate::lean_name::LeanName::from_var_ident(&binding.name),
-                        value: Box::new(value),
-                        body: Box::new(folded),
-                    }),
-                    other => LExpr::new(ExprNode::Match {
-                        scrutinee: Box::new(value),
-                        arms: vec![crate::lean_ast::MatchArm {
-                            pattern: pattern_to_ast(other),
-                            body: folded,
-                        }],
-                    }),
+                    PatternX::Var(binding) => LExpr::let_bind(
+                        crate::lean_name::LeanName::from_var_ident(&binding.name),
+                        value,
+                        folded,
+                    ),
+                    other => LExpr::match_expr(value, vec![crate::lean_ast::MatchArm {
+                        pattern: pattern_to_ast(other),
+                        body: folded,
+                    }]),
                 }
             }
-            StmtX::Expr(e) => LExpr::new(ExprNode::Let {
-                name: crate::lean_name::LeanName::lit("_"),
-                value: Box::new(vir_expr_to_ast_with_binders(e, binders, ctx)),
-                body: Box::new(folded),
-            }),
+            StmtX::Expr(e) => LExpr::let_bind(
+                crate::lean_name::LeanName::lit("_"),
+                vir_expr_to_ast_with_binders(e, binders, ctx),
+                folded,
+            ),
         };
     }
     folded.node

@@ -1442,13 +1442,7 @@ impl OblCtx {
                     saw_binder = true;
                 }
                 Some(CtxFrame::Hyp(p)) if saw_binder => {
-                    binders.push(LBinder {
-                        name: Some(crate::lean_name::LeanName::synthetic(
-                            format!("_h_ctx_{}", hyp_counter)
-                        )),
-                        ty: p.clone(),
-                        kind: BinderKind::Explicit,
-                    });
+                    binders.push(LBinder::explicit(crate::lean_name::LeanName::synthetic(format!("_h_ctx_{}", hyp_counter)), p.clone()));
                     hyp_counter += 1;
                     remaining.frames.pop_front();
                 }
@@ -2248,11 +2242,7 @@ fn push_mod_var_frames<'a>(
         // includes the disambiguator id when needed (synthetic temps),
         // and falls through to plain `sanitize` for user-named locals.
         let name = crate::lean_name::LeanName::from_var_ident(ident);
-        obl.frames.push_back(CtxFrame::Binder(LBinder {
-            name: Some(name.clone()),
-            ty: typ_to_expr(typ),
-            kind: BinderKind::Explicit,
-        }));
+        obl.frames.push_back(CtxFrame::Binder(LBinder::explicit(name.clone(), typ_to_expr(typ))));
         if let Some(pred) = type_bound_predicate(&LExpr::var(name), typ) {
             obl.frames.push_back(CtxFrame::Hyp(pred));
         }
@@ -3010,11 +3000,7 @@ fn push_post_call_frames(
         }
         let typ = &callee.params[info.param_idx].x.typ;
         let lean_typ = substitute(&typ_to_expr(typ), &subst.typ_subst);
-        new_obl.frames.push_back(CtxFrame::Binder(LBinder {
-            name: Some(info.fresh.clone()),
-            ty: lean_typ,
-            kind: BinderKind::Explicit,
-        }));
+        new_obl.frames.push_back(CtxFrame::Binder(LBinder::explicit(info.fresh.clone(), lean_typ)));
         // Bound predicate: pass the inner-typed view via TypedExpr
         // coercion. `type_bound_predicate` already recurses through
         // `MutRef(T)` to emit the bound on T — what was broken was
@@ -3044,11 +3030,7 @@ fn push_post_call_frames(
         // wrapper-typed-binder + inner-bound pattern exactly.
         let ret_typ = &callee.ret.x.typ;
         let lean_typ = substitute(&typ_to_expr(ret_typ), &subst.typ_subst);
-        new_obl.frames.push_back(CtxFrame::Binder(LBinder {
-            name: Some(rp.var.clone()),
-            ty: lean_typ,
-            kind: BinderKind::Explicit,
-        }));
+        new_obl.frames.push_back(CtxFrame::Binder(LBinder::explicit(rp.var.clone(), lean_typ)));
         let inner_form = crate::typed_expr::TypedExpr::var(rp.var.clone(), ret_typ.clone())
             .into_slot(&rp.inner_typ);
         if let Some(pred) = type_bound_predicate(&inner_form, ret_typ) {
@@ -3190,11 +3172,7 @@ fn push_post_call_frames(
                 subst.fresh_ret_name.clone()
             };
             let ret_typ_lean = substitute(&typ_to_expr(&ret.typ), &subst.typ_subst);
-            new_obl.frames.push_back(CtxFrame::Binder(LBinder {
-                name: Some(binder_name.clone()),
-                ty: ret_typ_lean,
-                kind: BinderKind::Explicit,
-            }));
+            new_obl.frames.push_back(CtxFrame::Binder(LBinder::explicit(binder_name.clone(), ret_typ_lean)));
             if let Some(pred) = type_bound_predicate(
                 &LExpr::var(binder_name.clone()), &ret.typ,
             ) {
@@ -3380,14 +3358,10 @@ fn build_param_binders(fn_sst: &FunctionSst) -> Vec<LBinder> {
     // ordering so proof fns and exec fns present a consistent
     // binder shape for the same fn signature.
     for tp in fn_sst.x.typ_params.iter() {
-        out.push(LBinder {
-            // Ordinary generics (`T`, `A`) pass through unchanged; the
-            // trait `Self%` param normalizes to `Self` to match the class
-            // binder and the param types that reference it.
-            name: Some(crate::lean_name::LeanName::typ_param(tp.as_str())),
-            ty: LExpr::var_lit("Type"),
-            kind: BinderKind::Explicit,
-        });
+        // Ordinary generics (`T`, `A`) pass through unchanged; the
+        // trait `Self%` param normalizes to `Self` to match the class
+        // binder and the param types that reference it.
+        out.push(LBinder::typ_param(tp.as_str(), BinderKind::Explicit));
     }
     for p in fn_sst.x.pars.iter().filter(|p| !is_synthetic_param(p)) {
         let name = crate::lean_name::LeanName::from_var_ident(&p.x.name);
@@ -3395,11 +3369,7 @@ fn build_param_binders(fn_sst: &FunctionSst) -> Vec<LBinder> {
         // with plain typ) through `Tactus.MutRef`, matching what
         // new-mut-ref-mode params get from `TypX::MutRef`'s arm in
         // `typ_to_node`. Both modes converge at the binder level.
-        out.push(LBinder {
-            name: Some(name.clone()),
-            ty: crate::to_lean_type::param_binder_typ(&p.x.typ, p.x.is_mut),
-            kind: BinderKind::Explicit,
-        });
+        out.push(LBinder::explicit(name.clone(), crate::to_lean_type::param_binder_typ(&p.x.typ, p.x.is_mut)));
         // For wrapper-bound params the bound applies to the inner value
         // via `.deref` (the wrapper itself has no numeric instance).
         let bound_value = if is_mut_ref_typ(&p.x.typ, p.x.is_mut) {
@@ -3408,14 +3378,13 @@ fn build_param_binders(fn_sst: &FunctionSst) -> Vec<LBinder> {
             LExpr::var(name.clone())
         };
         if let Some(pred) = type_bound_predicate(&bound_value, &p.x.typ) {
-            out.push(LBinder {
-                // `h_<name>_bound` is a synthesized hypothesis name —
-                // already a valid Lean identifier, no further
-                // sanitization needed.
-                name: Some(crate::lean_name::LeanName::synthetic(format!("h_{}_bound", name.as_str()))),
-                ty: pred,
-                kind: BinderKind::Explicit,
-            });
+            // `h_<name>_bound` is a synthesized hypothesis name —
+            // already a valid Lean identifier, no further
+            // sanitization needed.
+            out.push(LBinder::explicit(
+                crate::lean_name::LeanName::synthetic(format!("h_{}_bound", name.as_str())),
+                pred,
+            ));
         }
     }
     out
@@ -3467,22 +3436,12 @@ fn build_borrow_mut_binders(check: &FuncCheckSst) -> Vec<LBinder> {
         // Wrapper-typed binder (matches `param_binder_typ` for fn
         // `&mut` params). `decl.typ` is `TypX::MutRef(T)` so
         // `typ_to_expr(&decl.typ)` already renders `Tactus.MutRef T`.
-        out.push(LBinder {
-            name: Some(name.clone()),
-            ty: typ_to_expr(&decl.typ),
-            kind: BinderKind::Explicit,
-        });
+        out.push(LBinder::explicit(name.clone(), typ_to_expr(&decl.typ)));
         // Type-bound predicate on the inner value (`.deref`), not the
         // wrapper — same convention as fn-param `&mut` bounds.
         let bound_value = LExpr::field_proj(LExpr::var(name.clone()), "deref");
         if let Some(pred) = type_bound_predicate(&bound_value, inner_typ) {
-            out.push(LBinder {
-                name: Some(crate::lean_name::LeanName::synthetic(
-                    format!("h_{}_bound", name.as_str()),
-                )),
-                ty: pred,
-                kind: BinderKind::Explicit,
-            });
+            out.push(LBinder::explicit(crate::lean_name::LeanName::synthetic(format!("h_{}_bound", name.as_str())), pred));
         }
     }
     out
@@ -3556,11 +3515,7 @@ fn build_req_binders(
         let render_ctx = crate::expr_shared::RenderCtx::with_fn_map(fn_map);
         let rendered = sst_exp_to_ast_checked_with_ctx(&rewritten, &render_ctx)
             .expect("build_req_binders: req validated by WpCtx::new");
-        LBinder {
-            name: Some(crate::lean_name::LeanName::synthetic(format!("h_req{}", i))),
-            ty: wrap_with_shadows(rendered),
-            kind: BinderKind::Explicit,
-        }
+        LBinder::explicit(crate::lean_name::LeanName::synthetic(format!("h_req{}", i)), wrap_with_shadows(rendered))
     }).collect()
 }
 
@@ -4526,7 +4481,7 @@ fn build_wp<'a>(
                     // matching Verus's NonLinear semantics.
                     let body_wp = build_wp(
                         body,
-                        Wp::Done(LExpr::new(ExprNode::LitBool(true))),
+                        Wp::Done(LExpr::lit_true()),
                         ctx,
                         loop_stack,
                     )?;

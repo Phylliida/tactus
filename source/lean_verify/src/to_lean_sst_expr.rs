@@ -250,7 +250,7 @@ fn integer_type_bound_lit(kind: IntegerTypeBoundKind, bits: u32) -> LExpr {
             "integer_type_bound_lit: ArchWordBits should be handled at the call site"
         ),
     };
-    LExpr::new(ExprNode::Lit(s))
+    LExpr::lit_int(s)
 }
 
 thread_local! {
@@ -559,10 +559,7 @@ fn render_class_method_call(
         if crate::to_lean_expr::typ_contains_param(&annot_typ) {
             Ok(arg_coerced)
         } else {
-            Ok(LExpr::new(ExprNode::TypeAnnot {
-                expr: Box::new(arg_coerced),
-                ty: Box::new(typ_to_expr(&annot_typ)),
-            }))
+            Ok(LExpr::type_annot(arg_coerced, typ_to_expr(&annot_typ)))
         }
     }).collect();
     let app = if args.is_empty() { head } else { LExpr::app(head, app_args?) };
@@ -1077,10 +1074,10 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
                 // `Classical.epsilon (fun (x : T) => cond ∧ body)`
                 let cond_ast = sst_exp_to_ast_checked_with_ctx(cond, ctx)?;
                 let body_ast = sst_exp_to_ast_checked_with_ctx(body, ctx)?;
-                let lambda = LExpr::new(ExprNode::Lambda {
-                    binders: vir_var_binders_to_ast(binders),
-                    body: Box::new(LExpr::and(cond_ast, body_ast)),
-                });
+                let lambda = LExpr::lambda(
+                    vir_var_binders_to_ast(binders),
+                    LExpr::and(cond_ast, body_ast),
+                );
                 LExpr::app1(LExpr::var_lit("Classical.epsilon"), lambda).node
             }
         },
@@ -1253,7 +1250,7 @@ fn bv_exp_to_node(e: &Exp) -> Result<ExprNode, String> {
                         head: Box::new(LExpr::var_lit("BitVec.ofInt")),
                         args: vec![
                             LExpr::lit_int(n.to_string()),
-                            LExpr::new(ExprNode::Var(name)),
+                            LExpr::var(name),
                         ],
                     })
                 }
