@@ -2596,6 +2596,11 @@ impl Verifier {
         compiler: &Compiler,
         spans: &SpanContext,
     ) -> Result<(), VerifyErr> {
+        // Tactus shared-defs mode (CRATEDEFS.md step 1a) — a process
+        // global consulted inside lean_verify's emit/check entry
+        // points, so their signatures and these call sites stay put.
+        lean_verify::crate_defs::set_enabled(self.args.tactus_crate_defs);
+
         let time_verify_sequential_start = Instant::now();
 
         let reporter = Reporter::new(spans, compiler);

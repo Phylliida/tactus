@@ -79,6 +79,40 @@ version.
 
 ## Step 1 — `CrateDefs` module per crate (the big deletion)
 
+**1a LANDED (same day, post-roll): flag-gated `--tactus-crate-defs`.**
+Suite unchanged (508/0 incl. 3 new defs-mode tests, ~35.6s). Measured
+on temporary probe pairs (10 lemmas, flag on vs off):
+
+| Crate shape | defs off | defs on (incl. build) |
+|---|---|---|
+| 30 trivial chained spec fns | 16.7s | 17.5s (wash/negative) |
+| shallow refs (1 spec fn per lemma) | 24.7s | 26.6s (negative) |
+| **deep closures** (15-deep recursive chain, all lemmas) | **25.7s** | **22.7s (−12%)** |
+
+Three findings that sharpen the design:
+
+1. **Correction to this doc's framing:** standalone files never
+   contained the whole spec world — the per-root dep walk already
+   prunes to the root's downward closure (13-line files for
+   shallow-ref lemmas). The defs win is `(root-closure elaboration) ×
+   N fns − build`, not `world × N`. It pays exactly when closures are
+   deep and defs are expensive to elaborate (recursive fns with
+   termination proofs — the group-theory shape), and is ≈ free
+   otherwise (defs-mode per-file overhead measured at ~0: 1.99s vs
+   2.02s).
+2. **Per-fn-file defs-mode shape verified:** 9-line files importing
+   `TactusDefs_{crate}.olean`; helpers and root stay per-file; sanity
+   checks the concatenated command stream; broadcast-using fns fall
+   back to standalone (their axioms extend the dep walk per-fn).
+3. **The floor is the next target:** ~1.3–2s per check is lean spawn
+   + the `import Lean`/prelude olean tree load, paid per process
+   regardless of emission mode. That's step 2's territory (warm
+   workers keep imports loaded), and the defs olean then amortizes
+   even better there.
+
+*Step-1 revision notes from earlier the same day (the collision
+discovery and the 1a/1b split) follow; the original sketch after them.*
+
 **REVISED at implementation time (same day, post-roll) — three findings
 from reading `krate_preamble` whole:**
 

@@ -26,6 +26,12 @@ pub const TACTUS_PRELUDE_IMPORT: &str = "import TactusPrelude\n\
 set_option linter.unusedVariables false\n\
 set_option maxHeartbeats 800000";
 
+/// Just the file-scoped `set_option`s, for files whose prelude arrives
+/// transitively through a defs-module import (CRATEDEFS.md step 1a) —
+/// options never propagate through `import` and must be restated.
+pub const TACTUS_SET_OPTIONS: &str = "set_option linter.unusedVariables false\n\
+set_option maxHeartbeats 800000";
+
 /// Fixed cache dir for the prebuilt prelude module:
 /// `{cache_root}/prelude`, where the cache root is USER-LEVEL
 /// (`$TACTUS_PRELUDE_CACHE` → `$XDG_CACHE_HOME/tactus` →

@@ -211,6 +211,15 @@ fn krate_preamble(
     // require/ensure reference also land in the preamble. Empty for
     // proof fns and exec fns without `broadcast use`.
     broadcast_lemmas: &[&Fun],
+    // Shared-defs mode (CRATEDEFS.md step 1a): when `Some`, the
+    // crate's spec world (datatypes / spec fns / classes / instances)
+    // lives in the prebuilt defs module and this file imports it
+    // instead of re-rendering it. Helper proof-fn theorems and the
+    // root stay per-file in both modes. Callers guarantee
+    // `broadcast_lemmas` is empty in defs mode (broadcast-using fns
+    // fall back to standalone — their axioms extend the dep walk in
+    // ways a once-per-crate defs build can't know).
+    defs: Option<&crate::crate_defs::CrateDefs>,
 ) -> (Vec<Command>, String) {
     let emit_accessors = config.emit_accessors();
 
@@ -270,7 +279,6 @@ fn krate_preamble(
             .filter(|f| !root_fn_set.contains(&f.name))
             .collect(),
     };
-
     // Aggregate fragments across all theorems. Dedup preserves
     // first-occurrence order via a HashSet for membership and a
     // Vec for ordering.
@@ -284,7 +292,6 @@ fn krate_preamble(
             }
         }
     }
-
     let mut cmds: Vec<Command> = Vec::new();
     // File-level imports (declared at the top of the source `verus! { }`
     // block) are attached per-fn at macro-expansion time, gated on
@@ -316,11 +323,20 @@ fn krate_preamble(
             cmds.push(Command::Import(s.clone()));
         }
     }
-    // Prebuilt-prelude import (CRATEDEFS.md step 0): the 429-line
-    // prelude used to be inlined here, re-elaborated in every file
-    // (~1.3s/check). `check_lean_file` puts the cache dir holding
-    // `TactusPrelude.olean` on the child's LEAN_PATH.
-    cmds.push(Command::Raw(crate::prelude::TACTUS_PRELUDE_IMPORT.to_string()));
+    match defs {
+        Some(d) => {
+            cmds.push(Command::Import(d.module_name.clone()));
+            // set_options don't propagate through `import` — restate.
+            cmds.push(Command::Raw(crate::prelude::TACTUS_SET_OPTIONS.to_string()));
+        }
+        None => {
+            // Prebuilt-prelude import (CRATEDEFS.md step 0): the 429-line
+            // prelude used to be inlined here, re-elaborated in every file
+            // (~1.3s/check). `check_lean_file` puts the cache dir holding
+            // `TactusPrelude.olean` on the child's LEAN_PATH.
+            cmds.push(Command::Raw(crate::prelude::TACTUS_PRELUDE_IMPORT.to_string()));
+        }
+    }
     // Theorem-required PreludeAddendums go after the prelude — they
     // typically declare instances that depend on the prelude's
     // definitions and on the imports above.
@@ -329,7 +345,6 @@ fn krate_preamble(
             cmds.push(Command::Raw(s.clone()));
         }
     }
-
     let ns = sanitize(crate_name);
     cmds.push(Command::NamespaceOpen(ns.clone()));
     // Disable Lean's autoImplicit for the generated user-derived decls (spec
@@ -346,9 +361,6 @@ fn krate_preamble(
     // full e2e suite + every tutorial chapter. See DESIGN § "autoImplicit
     // guardrail".
     cmds.push(Command::Raw("set_option autoImplicit false".to_string()));
-
-    let all_fns: Vec<&FunctionX> = krate.functions.iter().map(|f| &f.x).collect();
-    let spec_fn_map = dep_order::build_spec_fn_map(&all_fns);
     // Krate-level tables (the all-fn map, shell traits, trait
     // out-params, assoc-type impls), built once. `ectx.fn_map` is the
     // all-fn map (spec + proof + exec, no filtering) — shared with
@@ -356,7 +368,6 @@ fn krate_preamble(
     // TraitMethodImpl→method redirects and walk into exec-callee specs
     // via the `call_inlining` abstraction.
     let ectx = crate::emit_ctx::EmitCtx::build(krate, tactic_bodies);
-
     // Resolve broadcast lemma `Fun` identities (#122) to their
     // `FunctionX` via the all-fn map. Cross-crate lemmas live in the
     // merged krate (via `merge_krates`) with body=None but
@@ -374,8 +385,73 @@ fn krate_preamble(
         .chain(helpers_to_emit.iter().copied())
         .chain(bc_lemma_funcs.iter().copied())
         .collect();
+    if defs.is_none() {
+        cmds.extend(spec_world_cmds(krate, &ectx, &dep_walk_roots, emit_accessors, &bc_lemma_funcs));
+    } else {
+        debug_assert!(bc_lemma_funcs.is_empty(),
+            "broadcast-using fns fall back to standalone emission");
+    }
+    // Emit proof-fn theorems for helper proof fns the root fn might
+    // invoke from `proof { have _ := some_lemma args }` blocks (or
+    // `assert(P) by { have _ := some_lemma args }`). Without this,
+    // exec fn theorems can't reference helper proof fns by name —
+    // "Unknown identifier `some_lemma`". See
+    // BUG-no-helper-proof-fn-call-from-exec.md.
+    //
+    // Emitted AFTER instances because helper proof fns may use
+    // typeclass dispatch on trait methods (`Trait.method val`) which
+    // requires the corresponding `instance` to be already declared.
+    // Their transitive spec-fn / datatype / trait refs were already
+    // added to the preamble via `dep_walk_roots` extension at the
+    // top of this fn, so all dependencies are in scope by this
+    // point.
+    //
+    // Skip within the loop:
+    // * root_fns themselves (the proof fn we're checking IS its own
+    //   file's main theorem; emitting it twice would conflict)
+    // * proof fns without a tactic body in `tactic_bodies` (these
+    //   are either trait method decls without defaults, or impl
+    //   methods whose body is the user's `by { }` tactic — both
+    //   emit elsewhere)
+    // * `FunctionKind::TraitMethodDecl` / `TraitMethodImpl` — those
+    //   live inside class/instance declarations, not as standalone
+    //   theorems
+    //
+    // Ordering: `helpers_to_emit` is already topologically sorted for
+    // proof-fn files (deps first, via `collect_referenced_proof_fns`'s
+    // DFS post-order), so a helper that references another helper sees
+    // it declared first. Exec-fn files keep source order (no helper can
+    // forward-reference the exec root). A true cycle of mutually-
+    // referencing proof fns would still need a Lean `mutual` block —
+    // out of scope and not observed.
+    for f in &helpers_to_emit {
+        let tactic_body = tactic_bodies.get(&f.name)
+            .expect("helpers_to_emit is built from tactic_bodies — \
+                     every entry has a tactic body");
+        cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(
+            f, tactic_body, &ectx,
+        )));
+    }
+    (cmds, ns)
+}
 
-    let mut refs = dep_order::collect_references(&spec_fn_map, &ectx.fn_map, &dep_walk_roots);
+/// The crate's "spec world": classes, datatypes (with accessors when
+/// `emit_accessors`), spec fns and trait instances in topological
+/// order, plus broadcast-lemma axioms at the end. Extracted from
+/// `krate_preamble` so the shared-defs module (CRATEDEFS.md step 1a)
+/// can render exactly this block once per crate with roots = all
+/// checkable fns, while standalone files keep rendering it per file.
+pub(crate) fn spec_world_cmds(
+    krate: &KrateX,
+    ectx: &crate::emit_ctx::EmitCtx,
+    dep_walk_roots: &[&FunctionX],
+    emit_accessors: bool,
+    bc_lemma_funcs: &[&FunctionX],
+) -> Vec<Command> {
+    let mut cmds: Vec<Command> = Vec::new();
+    let all_fns: Vec<&FunctionX> = krate.functions.iter().map(|f| &f.x).collect();
+    let spec_fn_map = dep_order::build_spec_fn_map(&all_fns);
+    let mut refs = dep_order::collect_references(&spec_fn_map, &ectx.fn_map, dep_walk_roots);
 
     // Transitive trait-bound closure: when a trait emits its class
     // declaration, parent-trait bounds (e.g., `trait Sub: Super`
@@ -433,7 +509,7 @@ fn krate_preamble(
     // those traits' classes MUST also emit (the Instance references
     // the class). This is the structural co-dependency that the
     // pre-2026-05-12 `refs.traits`-only gate hid by accident.
-    let groups = dep_order::order_spec_fns(&spec_fn_map, &ectx.fn_map, &all_fns, &dep_walk_roots);
+    let groups = dep_order::order_spec_fns(&spec_fn_map, &ectx.fn_map, &all_fns, dep_walk_roots);
 
     // Un-emittable traits: a trait whose `class` we can't render because
     // at least one method decl is absent from the merged krate's function
@@ -635,7 +711,7 @@ fn krate_preamble(
     };
     for tr in &krate.traits {
         if !trait_has_proof_method(&tr.x) && should_emit_class(&tr.x) {
-            cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &ectx)));
+            cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, ectx)));
         }
     }
 
@@ -737,7 +813,7 @@ fn krate_preamble(
         let ne_bounds = crate::nonempty::instance_nonempty_bounds(
             &nonempty_needs, method_impls, &ti.x.typ_params);
         cmds.push(Command::Instance(
-            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, subst, &ne_bounds, &ectx)
+            to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, subst, &ne_bounds, ectx)
         ));
     };
     // Classes WITH proof-fn methods: their Prop-typed fields reference
@@ -746,7 +822,7 @@ fn krate_preamble(
     let emit_proof_classes = |cmds: &mut Vec<Command>| {
         for tr in &krate.traits {
             if trait_has_proof_method(&tr.x) && should_emit_class(&tr.x) {
-                cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, &ectx)));
+                cmds.push(Command::Class(to_lean_fn::trait_to_ast(&tr.x, ectx)));
             }
         }
     };
@@ -775,13 +851,13 @@ fn krate_preamble(
             dep_order::EmitStep::Group(i) => match &groups[*i] {
                 FnGroup::Single(f) => {
                     let augmented = augment(f);
-                    cmds.push(to_lean_fn::spec_fn_to_ast(&augmented, &ectx));
+                    cmds.push(to_lean_fn::spec_fn_to_ast(&augmented, ectx));
                 }
                 FnGroup::Mutual(fns) => {
                     let inner: Vec<Command> = fns.iter()
                         .map(|f| {
                             let augmented = augment(f);
-                            to_lean_fn::spec_fn_to_ast(&augmented, &ectx)
+                            to_lean_fn::spec_fn_to_ast(&augmented, ectx)
                         })
                         .collect();
                     cmds.push(Command::Mutual(inner));
@@ -793,49 +869,6 @@ fn krate_preamble(
             emit_proof_classes(&mut cmds);
         }
     }
-
-    // Emit proof-fn theorems for helper proof fns the root fn might
-    // invoke from `proof { have _ := some_lemma args }` blocks (or
-    // `assert(P) by { have _ := some_lemma args }`). Without this,
-    // exec fn theorems can't reference helper proof fns by name —
-    // "Unknown identifier `some_lemma`". See
-    // BUG-no-helper-proof-fn-call-from-exec.md.
-    //
-    // Emitted AFTER instances because helper proof fns may use
-    // typeclass dispatch on trait methods (`Trait.method val`) which
-    // requires the corresponding `instance` to be already declared.
-    // Their transitive spec-fn / datatype / trait refs were already
-    // added to the preamble via `dep_walk_roots` extension at the
-    // top of this fn, so all dependencies are in scope by this
-    // point.
-    //
-    // Skip within the loop:
-    // * root_fns themselves (the proof fn we're checking IS its own
-    //   file's main theorem; emitting it twice would conflict)
-    // * proof fns without a tactic body in `tactic_bodies` (these
-    //   are either trait method decls without defaults, or impl
-    //   methods whose body is the user's `by { }` tactic — both
-    //   emit elsewhere)
-    // * `FunctionKind::TraitMethodDecl` / `TraitMethodImpl` — those
-    //   live inside class/instance declarations, not as standalone
-    //   theorems
-    //
-    // Ordering: `helpers_to_emit` is already topologically sorted for
-    // proof-fn files (deps first, via `collect_referenced_proof_fns`'s
-    // DFS post-order), so a helper that references another helper sees
-    // it declared first. Exec-fn files keep source order (no helper can
-    // forward-reference the exec root). A true cycle of mutually-
-    // referencing proof fns would still need a Lean `mutual` block —
-    // out of scope and not observed.
-    for f in &helpers_to_emit {
-        let tactic_body = tactic_bodies.get(&f.name)
-            .expect("helpers_to_emit is built from tactic_bodies — \
-                     every entry has a tactic body");
-        cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(
-            f, tactic_body, &ectx,
-        )));
-    }
-
     // Cross-crate broadcast lemmas (#122), emitted as Lean axioms
     // LAST in the preamble — they're leaves (only the fn's obligation
     // theorems reference them, via the injected `have _tactus_bc_i := …`),
@@ -844,7 +877,7 @@ fn krate_preamble(
     // Sound by the same argument as cross-crate axiomatized ensures:
     // vstd verified the lemma (`vargo build` → 1530/0); we stipulate
     // it. The user opted in explicitly with `broadcast use <group>;`.
-    for &f in &bc_lemma_funcs {
+    for &f in bc_lemma_funcs {
         // Lift assoc-type projections in the lemma's ensure/require (e.g.
         // `axiom_hashmap_deepview_borrow`'s `<K as DeepView>::V`) — same
         // generalized projection-lifting as standalone spec fns. No-op for
@@ -854,11 +887,20 @@ fn krate_preamble(
         // `axiom_hashmap_deepview_borrow` → `deep_view` → the epsilon in
         // `hash_map_deep_view_impl`) needs `[Nonempty T]` too.
         let augmented = add_nonempty(augmented, &f.name);
-        cmds.push(to_lean_fn::broadcast_lemma_axiom_cmd(&augmented, &ectx));
+        cmds.push(to_lean_fn::broadcast_lemma_axiom_cmd(&augmented, ectx));
     }
-
-    (cmds, ns)
+    cmds
 }
+
+/// Ambient thread-local tables every render path needs installed
+/// first. Wrapped so `crate_defs` (which renders outside the per-fn
+/// emit entry points) installs exactly what `emit_proof_fn` /
+/// `emit_exec_fn` install.
+pub(crate) fn install_emit_tables(krate: &KrateX) {
+    install_inherent_method_renames(krate);
+    install_datatype_field_bounds(krate);
+}
+
 
 // ── Check results ──────────────────────────────────────────────────────
 
@@ -1015,6 +1057,12 @@ pub fn emit_proof_fn(
 ) -> Result<EmitOutput, CheckResult> {
     install_inherent_method_renames(krate);
     install_datatype_field_bounds(krate);
+    // Shared-defs lookup (CRATEDEFS.md step 1a). Memo-consistent with
+    // the `check_proof_fn` build: in check mode the defs were already
+    // built (or poisoned to None) before this runs; in `--emit-lean`
+    // mode this writes the defs source without building. Takes the
+    // pre-inline krate — `for_crate` applies its own inline pass.
+    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, false);
     // Layer 7 — inline `#[verifier::inline]` spec fns on the VIR-AST so that
     // proof-fn goals and broadcast-lemma clauses agree with Verus's
     // SST-inlined exec goals. One krate-level pass, before any rendering; the
@@ -1039,7 +1087,7 @@ pub fn emit_proof_fn(
     // imports, those go through the explicit `imports` parameter).
     let (mut cmds, ns) = krate_preamble(
         krate, imports, crate_name, &[proof_fn], PreambleConfig::ProofFn, &[], tactic_bodies,
-        &[],
+        &[], defs.as_deref(),
     );
     // Krate-level tables for proof_fn_to_ast (fn_map for the
     // nat-coercion call-arg bridge, shell traits for bound filtering).
@@ -1067,7 +1115,17 @@ pub fn emit_proof_fn(
         return Err(CheckResult::Error(e));
     }
 
-    if let Err(reason) = debug_check(&cmds) {
+    #[cfg(debug_assertions)]
+    let cmds_for_sanity: Vec<Command> = match &defs {
+        // Sanity resolves identifiers over the command stream; in defs
+        // mode the spec world arrives via import, so check against the
+        // concatenation — exactly what Lean sees.
+        Some(d) => d.cmds.iter().cloned().chain(cmds.iter().cloned()).collect(),
+        None => cmds.clone(),
+    };
+    #[cfg(not(debug_assertions))]
+    let cmds_for_sanity = &cmds;
+    if let Err(reason) = debug_check(&cmds_for_sanity) {
         return Err(CheckResult::Failed {
             errors: vec![TactusDiag {
                 message: reason,
@@ -1091,6 +1149,11 @@ pub fn check_proof_fn(
     crate_name: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> CheckResult {
+    // Build (or fetch) the shared defs module FIRST: `emit_proof_fn`'s
+    // internal lookup is a memo hit on whatever this call cached, so
+    // the emitted import and the built artifact can't disagree. A
+    // build failure caches `None` → standalone emission, today's path.
+    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true);
     let EmitOutput { file_path, source_map, .. } =
         match emit_proof_fn(krate, proof_fn, tactic_body, imports, crate_name, tactic_bodies) {
             Ok(o) => o,
@@ -1103,7 +1166,11 @@ pub fn check_proof_fn(
         Ok(d) => d,
         Err(e) => return CheckResult::Error(e),
     };
-    let result = lean_process::check_lean_file(&file_path, lake_dir, Some(&prelude_dir));
+    let mut extra_paths: Vec<&std::path::Path> = vec![&prelude_dir];
+    if let Some(d) = &defs {
+        extra_paths.push(&d.dir);
+    }
+    let result = lean_process::check_lean_file(&file_path, lake_dir, &extra_paths);
 
     match result {
         Ok(r) if r.success => CheckResult::Success { warnings: vec![] },
@@ -1159,6 +1226,10 @@ pub fn emit_exec_fn(
 ) -> Result<EmitOutput, CheckResult> {
     install_inherent_method_renames(krate);
     install_datatype_field_bounds(krate);
+    // Pre-inline krate for the shared-defs lookup below (`for_crate`
+    // applies its own inline pass; the lookup happens after
+    // `broadcast_lemmas` resolves, by which point `krate` is shadowed).
+    let pre_inline_krate = krate;
     // Layer 7 — inline `#[verifier::inline]` spec fns on the VIR-AST so the
     // broadcast-lemma clauses krate_preamble emits agree with Verus's
     // SST-inlined exec goal. The exec goal itself already arrives inlined (via
@@ -1222,12 +1293,21 @@ pub fn emit_exec_fn(
     // preamble also aggregates each theorem's `requires_preamble`
     // (e.g., the BitVec instances #130 needs) and emits them once at
     // file top, deduped.
+    // Shared-defs mode is incompatible with `broadcast use` — the
+    // lemma axioms extend the dep walk per-fn, which a once-per-crate
+    // defs build can't anticipate. Such fns emit standalone.
+    let defs = if broadcast_lemmas.is_empty() {
+        crate::crate_defs::for_crate(pre_inline_krate, crate_name, tactic_bodies, false)
+    } else {
+        None
+    };
     let (mut cmds, ns) = krate_preamble(
         krate, imports, crate_name, &[vir_fn],
         PreambleConfig::ExecFn,
         &theorems,
         tactic_bodies,
         &broadcast_lemmas,
+        defs.as_deref(),
     );
 
     for theorem in theorems {
@@ -1256,7 +1336,17 @@ pub fn emit_exec_fn(
         return Err(CheckResult::Error(e));
     }
 
-    if let Err(reason) = debug_check(&cmds) {
+    #[cfg(debug_assertions)]
+    let cmds_for_sanity: Vec<Command> = match &defs {
+        // Sanity resolves identifiers over the command stream; in defs
+        // mode the spec world arrives via import, so check against the
+        // concatenation — exactly what Lean sees.
+        Some(d) => d.cmds.iter().cloned().chain(cmds.iter().cloned()).collect(),
+        None => cmds.clone(),
+    };
+    #[cfg(not(debug_assertions))]
+    let cmds_for_sanity = &cmds;
+    if let Err(reason) = debug_check(&cmds_for_sanity) {
         return Err(CheckResult::Failed {
             errors: vec![TactusDiag {
                 message: reason,
@@ -1281,6 +1371,8 @@ pub fn check_exec_fn(
     crate_name: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> CheckResult {
+    // Same defs-before-emit ordering as `check_proof_fn` (see there).
+    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true);
     let EmitOutput { file_path, source_map, warnings } =
         match emit_exec_fn(krate, vir_fn, fn_sst, check, imports, crate_name, tactic_bodies) {
             Ok(o) => o,
@@ -1293,7 +1385,11 @@ pub fn check_exec_fn(
         Ok(d) => d,
         Err(e) => return CheckResult::Error(e),
     };
-    let result = lean_process::check_lean_file(&file_path, lake_dir, Some(&prelude_dir));
+    let mut extra_paths: Vec<&std::path::Path> = vec![&prelude_dir];
+    if let Some(d) = &defs {
+        extra_paths.push(&d.dir);
+    }
+    let result = lean_process::check_lean_file(&file_path, lake_dir, &extra_paths);
 
     match result {
         Ok(r) if r.success => CheckResult::Success { warnings },
