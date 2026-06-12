@@ -30,7 +30,17 @@ Decomposition per typical small check: **~0.4s spawn + ~1.3s prelude
 elaboration + ~0.9s imports/theorem**. The e2e suite (505 tests, ~59s
 wall at ~64-way parallelism) pays the prelude term in nearly every check.
 
-## Step 0 — prelude as prebuilt module (small, do first)
+## Step 0 — prelude as prebuilt module — ✅ LANDED same day (`5ff8d61`)
+
+**Result: full e2e suite 505/0 in 36.85s, from ~59s baseline (−37% wall).**
+Two implementation realities beyond the design below: (1) `lean -o`
+derives the module name relative to its root dir (cwd) and refuses
+sources outside it — the build runs from inside the cache dir with
+relative paths; (2) the cache must be USER-LEVEL (`~/.cache/tactus`),
+not under `lean_out_root()` — the e2e harness isolates each test's
+lean-out dir, which would have rebuilt the identical olean 505×/run.
+Open follow-up: `tactus-lsp` needs the cache dir on its `lean --server`
+`LEAN_PATH` (one line).
 
 Replace the inline `Command::Raw(TACTUS_PRELUDE)` with
 `import TactusPrelude`, against a `.olean` built once per prelude
