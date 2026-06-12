@@ -27,7 +27,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use vir::ast::{Fun, FunctionKind, FunctionX, KrateX};
 
+use crate::generate::{CheckResult, EmitOutput, TactusDiag};
 use crate::lean_ast::Command;
+use crate::to_lean_fn::LeanSourceMap;
 use crate::to_lean_type::sanitize;
 
 pub struct CrateDefs {
@@ -228,4 +230,289 @@ fn build_olean(
     std::fs::write(lean_path, source).map_err(|e| e.to_string())?;
     let _ = std::fs::remove_dir_all(&build);
     Ok(())
+}
+
+// ── Proof batch (CRATEDEFS.md step 1b) ─────────────────────────────────
+//
+// All ordinary proof fns (Mode::Proof, non-trait-method, with a tactic
+// body) emit as theorems into ONE `TactusProofs_{crate}.lean` that
+// imports the defs module — topologically ordered, so a root
+// referencing a helper references an earlier theorem in the same file
+// and every helper elaborates exactly once. The file is checked with a
+// single `lean --json` run; per-fn results are attributed by theorem
+// line region (regions computed exactly, by rendering the header and
+// each theorem chunk separately and accumulating line counts).
+//
+// Failure semantics (intentional, documented in CRATEDEFS.md): an
+// error inside theorem T's region fails T only — a root whose helper
+// fails reports green while the helper reports red (the root
+// elaborated against the helper's STATEMENT; the crate still fails
+// overall). An error outside every region (header breakage, no
+// position) poisons the batch → per-fn standalone fallback.
+
+struct Region {
+    fun: Fun,
+    fn_short: String,
+    start: usize,
+    end: usize, // exclusive
+    tactic_start_line: usize,
+    tactic_line_count: usize,
+}
+
+pub struct ProofBatch {
+    pub file_path: PathBuf,
+    regions: Vec<Region>,
+    /// Per-fn formatted failures from the one Lean run; fns absent
+    /// from this map passed. Always empty in `build: false` mode.
+    failed: std::collections::HashMap<Fun, Vec<TactusDiag>>,
+}
+
+impl ProofBatch {
+    fn region(&self, f: &Fun) -> Option<&Region> {
+        self.regions.iter().find(|r| &r.fun == f)
+    }
+
+    pub fn covers(&self, f: &Fun) -> bool {
+        self.region(f).is_some()
+    }
+
+    /// The per-fn check result, read off the cached batch run.
+    pub fn result_for(&self, f: &Fun) -> CheckResult {
+        match self.failed.get(f) {
+            Some(errors) => CheckResult::Failed { errors: errors.clone(), warnings: vec![] },
+            None => CheckResult::Success { warnings: vec![] },
+        }
+    }
+
+    /// The `--emit-lean` sidecar view: the batch file plus this fn's
+    /// tactic position within it.
+    pub fn emit_output(&self, f: &Fun) -> Option<EmitOutput> {
+        let r = self.region(f)?;
+        Some(EmitOutput {
+            file_path: self.file_path.clone(),
+            source_map: LeanSourceMap::ProofFn {
+                fn_name: r.fn_short.clone(),
+                tactic_start_line: r.tactic_start_line,
+                tactic_line_count: r.tactic_line_count,
+            },
+            warnings: vec![],
+        })
+    }
+}
+
+type BatchMemo = Mutex<std::collections::HashMap<String, Option<Arc<ProofBatch>>>>;
+static BATCH_MEMO: OnceLock<BatchMemo> = OnceLock::new();
+
+pub fn proof_batch(
+    krate: &KrateX,
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    build: bool,
+) -> Option<Arc<ProofBatch>> {
+    if !ENABLED.load(Ordering::SeqCst) {
+        return None;
+    }
+    let memo = BATCH_MEMO.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut map = memo.lock().unwrap();
+    if let Some(cached) = map.get(crate_name) {
+        return cached.clone();
+    }
+    let result = build_batch(krate, crate_name, tactic_bodies, build);
+    map.insert(crate_name.to_string(), result.clone());
+    result
+}
+
+/// DFS post-order over textual tactic references, ALL nodes emitted
+/// (unlike `collect_referenced_proof_fns`, which excludes roots — here
+/// every fn is both a root and a candidate).
+fn ordered_batch_fns<'a>(
+    fns: &[(&'a FunctionX, &'a str)],
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> Vec<&'a FunctionX> {
+    fn visit<'a>(
+        f: &'a FunctionX,
+        fns: &[(&'a FunctionX, &'a str)],
+        tactic_bodies: &std::collections::HashMap<Fun, String>,
+        visited: &mut std::collections::HashSet<&'a Fun>,
+        ordered: &mut Vec<&'a FunctionX>,
+    ) {
+        if !visited.insert(&f.name) {
+            return;
+        }
+        if let Some(body) = tactic_bodies.get(&f.name) {
+            let code = crate::generate::strip_lean_line_comments(body);
+            for (cand, name) in fns {
+                if cand.name != f.name && crate::generate::ident_appears(&code, name) {
+                    visit(cand, fns, tactic_bodies, visited, ordered);
+                }
+            }
+        }
+        ordered.push(f);
+    }
+    let mut visited = std::collections::HashSet::new();
+    let mut ordered = Vec::new();
+    for (f, _) in fns {
+        visit(f, fns, tactic_bodies, &mut visited, &mut ordered);
+    }
+    ordered
+}
+
+fn build_batch(
+    krate: &KrateX,
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    build: bool,
+) -> Option<Arc<ProofBatch>> {
+    // The batch rides the defs module (its theorems resolve the spec
+    // world through the import) — defs gate/fallback decisions apply.
+    let defs = for_crate(krate, crate_name, tactic_bodies, build)?;
+
+    let inlined_krate = crate::inline_spec::inline_marked_in_krate(krate);
+    crate::generate::install_emit_tables(&inlined_krate);
+    let ectx = crate::emit_ctx::EmitCtx::build(&inlined_krate, tactic_bodies);
+
+    let batched: Vec<(&FunctionX, &str)> = inlined_krate.functions.iter()
+        .map(|f| &f.x)
+        .filter(|f| {
+            matches!(f.mode, vir::ast::Mode::Proof)
+                && !matches!(
+                    f.kind,
+                    FunctionKind::TraitMethodDecl { .. } | FunctionKind::TraitMethodImpl { .. }
+                )
+                && tactic_bodies.contains_key(&f.name)
+        })
+        .map(|f| (f, crate::to_lean_type::short_name(&f.name.path)))
+        .collect();
+    if batched.is_empty() {
+        return None;
+    }
+    let ordered = ordered_batch_fns(&batched, tactic_bodies);
+
+    let ns = sanitize(crate_name);
+    let mut header_cmds: Vec<Command> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (f, _) in &batched {
+        for imp in f.attrs.lean_imports.iter() {
+            if seen.insert(imp.as_str()) {
+                header_cmds.push(Command::Import(imp.clone()));
+            }
+        }
+    }
+    header_cmds.push(Command::Import(defs.module_name.clone()));
+    header_cmds.push(Command::Raw(crate::prelude::TACTUS_SET_OPTIONS.to_string()));
+    header_cmds.push(Command::NamespaceOpen(ns.clone()));
+    header_cmds.push(Command::Raw("set_option autoImplicit false".to_string()));
+
+    // Exact line accounting: render the header and each theorem chunk
+    // separately (write_command is compositional — `pp_commands` just
+    // appends), so every theorem's region INCLUDING its signature is
+    // known, and anything outside all regions is header/footer.
+    let header = crate::lean_pp::pp_commands(&header_cmds);
+    let mut text = header.text;
+    let mut all_cmds = header_cmds;
+    let mut line = text.bytes().filter(|&b| b == b'\n').count() + 1;
+    let mut regions: Vec<Region> = Vec::new();
+    for f in &ordered {
+        let body = tactic_bodies.get(&f.name).expect("batched fns have tactic bodies");
+        let cmd = Command::Theorem(crate::to_lean_fn::proof_fn_to_ast(f, body, &ectx));
+        let chunk = crate::lean_pp::pp_commands(std::slice::from_ref(&cmd));
+        let chunk_lines = chunk.text.bytes().filter(|&b| b == b'\n').count();
+        let rel_tactic_start = chunk.landmarks.tactic_starts.first().copied().unwrap_or(1);
+        regions.push(Region {
+            fun: f.name.clone(),
+            fn_short: crate::to_lean_type::short_name(&f.name.path).to_string(),
+            start: line,
+            end: line + chunk_lines,
+            tactic_start_line: line + rel_tactic_start - 1,
+            tactic_line_count: body.lines().count().max(1),
+        });
+        text.push_str(&chunk.text);
+        all_cmds.push(cmd);
+        line += chunk_lines;
+    }
+    let footer_cmd = Command::NamespaceClose(ns.clone());
+    text.push_str(&crate::lean_pp::pp_commands(std::slice::from_ref(&footer_cmd)).text);
+    all_cmds.push(footer_cmd);
+
+    // Sanity over defs + batch: what Lean sees through the import.
+    #[cfg(debug_assertions)]
+    {
+        let combined: Vec<Command> =
+            defs.cmds.iter().cloned().chain(all_cmds.iter().cloned()).collect();
+        if let Err(reason) = crate::generate::debug_check(&combined) {
+            eprintln!(
+                "tactus: proofs batch failed codegen sanity for crate `{}` — falling back to per-fn emission.\n{}",
+                crate_name, reason
+            );
+            return None;
+        }
+    }
+
+    let file_path = defs.dir.join(format!("TactusProofs_{}.lean", ns));
+    if let Err(e) = std::fs::create_dir_all(&defs.dir)
+        .map_err(|e| e.to_string())
+        .and_then(|_| std::fs::write(&file_path, &text).map_err(|e| e.to_string()))
+    {
+        eprintln!("tactus: could not write {}: {} — falling back to per-fn emission", file_path.display(), e);
+        return None;
+    }
+
+    if !build {
+        return Some(Arc::new(ProofBatch { file_path, regions, failed: Default::default() }));
+    }
+
+    // The one Lean run for every ordinary proof fn in the crate.
+    let prelude_dir = match crate::prelude::ensure_prelude_olean() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("tactus: {} — falling back to per-fn emission", e);
+            return None;
+        }
+    };
+    let proj = crate::project::default_project_dir();
+    let lake_dir = if crate::project::project_ready(&proj) { Some(proj.as_path()) } else { None };
+    let extra: Vec<&std::path::Path> = vec![&prelude_dir, &defs.dir];
+    let run = match crate::lean_process::check_lean_file(&file_path, lake_dir, &extra) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("tactus: proofs batch run failed for crate `{}` — falling back to per-fn emission.\n{}", crate_name, e);
+            return None;
+        }
+    };
+
+    let mut failed: std::collections::HashMap<Fun, Vec<TactusDiag>> = Default::default();
+    for d in run.diagnostics.iter().filter(|d| d.severity == "error") {
+        let Some(region) = d.pos.as_ref()
+            .and_then(|p| regions.iter().find(|r| r.start <= p.line && p.line < r.end))
+        else {
+            // Header/footer breakage or position-less error: not
+            // attributable to one fn — poison the batch so every fn
+            // re-checks standalone (conservative, today's behavior).
+            eprintln!(
+                "tactus: proofs batch error outside any theorem region for crate `{}` — falling back to per-fn emission.\n{}",
+                crate_name, d.data
+            );
+            return None;
+        };
+        let source_map = LeanSourceMap::ProofFn {
+            fn_name: region.fn_short.clone(),
+            tactic_start_line: region.tactic_start_line,
+            tactic_line_count: region.tactic_line_count,
+        };
+        let formatted = crate::lean_process::format_error(d, &source_map);
+        failed.entry(region.fun.clone()).or_default().push(TactusDiag {
+            message: format!("Lean tactic failed for {}:\n\n{}", region.fn_short, formatted.message),
+            location: formatted.location,
+            help: Some(format!("{} {}",
+                vir::tactus_messages::LEAN_FILE_HELP_PREFIX, file_path.display())),
+        });
+    }
+    if !run.success && failed.is_empty() {
+        eprintln!(
+            "tactus: proofs batch failed with no attributable diagnostics for crate `{}` — falling back to per-fn emission",
+            crate_name
+        );
+        return None;
+    }
+    Some(Arc::new(ProofBatch { file_path, regions, failed }))
 }

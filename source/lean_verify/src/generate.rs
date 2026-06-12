@@ -98,7 +98,7 @@ impl PreambleConfig {
 /// ASCII bytes never appear inside a multi-byte UTF-8 sequence; a
 /// continuation byte before/after counts as a boundary, which is
 /// correct).
-fn ident_appears(text: &str, word: &str) -> bool {
+pub(crate) fn ident_appears(text: &str, word: &str) -> bool {
     let (t, w) = (text.as_bytes(), word.as_bytes());
     if w.is_empty() || w.len() > t.len() {
         return false;
@@ -116,7 +116,7 @@ fn ident_appears(text: &str, word: &str) -> bool {
 /// reference is tactic code, before any trailing comment; a `--` inside
 /// a string literal would over-strip, but string literals in tactic
 /// proofs are vanishingly rare.)
-fn strip_lean_line_comments(body: &str) -> String {
+pub(crate) fn strip_lean_line_comments(body: &str) -> String {
     body.lines()
         .map(|l| match l.find("--") {
             Some(i) => &l[..i],
@@ -917,6 +917,7 @@ pub(crate) fn install_emit_tables(krate: &KrateX) {
 /// applies elsewhere (`AssertKind` sum split, `LoopInvKind`,
 /// etc.): runtime exclusivity → enum, type system carries the
 /// guarantee.
+#[derive(Clone)]
 pub enum DiagLocation {
     /// Exec-fn obligation: the obligation's own Verus `Span`
     /// (cloned from the SST node by `sst_to_lean`). The verifier
@@ -943,6 +944,7 @@ pub enum DiagLocation {
 /// determining the `-->` arrow's target. `help` is the .lean
 /// artifact path (attached so users can `cat` the file even when
 /// their terminal has clipped the error body).
+#[derive(Clone)]
 pub struct TactusDiag {
     pub message: String,
     pub location: DiagLocation,
@@ -1063,6 +1065,15 @@ pub fn emit_proof_fn(
     // mode this writes the defs source without building. Takes the
     // pre-inline krate — `for_crate` applies its own inline pass.
     let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, false);
+    // Batch route (step 1b): a batched proof fn's artifact IS the batch
+    // file; return its position within it for the sidecar. (In check
+    // mode `check_proof_fn` returns before reaching here for covered
+    // fns; this path serves `--emit-lean`.)
+    if let Some(b) = crate::crate_defs::proof_batch(krate, crate_name, tactic_bodies, false) {
+        if let Some(out) = b.emit_output(&proof_fn.name) {
+            return Ok(out);
+        }
+    }
     // Layer 7 — inline `#[verifier::inline]` spec fns on the VIR-AST so that
     // proof-fn goals and broadcast-lemma clauses agree with Verus's
     // SST-inlined exec goals. One krate-level pass, before any rendering; the
@@ -1154,6 +1165,16 @@ pub fn check_proof_fn(
     // the emitted import and the built artifact can't disagree. A
     // build failure caches `None` → standalone emission, today's path.
     let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true);
+    // Batch route (CRATEDEFS.md step 1b): ordinary proof fns verify in
+    // ONE Lean run over TactusProofs_{crate}.lean; the first covered fn
+    // builds + runs it, the rest read the cached per-fn attribution.
+    // Trait-method-impl proof fns aren't batched and continue below.
+    let batch = crate::crate_defs::proof_batch(krate, crate_name, tactic_bodies, true);
+    if let Some(b) = &batch {
+        if b.covers(&proof_fn.name) {
+            return b.result_for(&proof_fn.name);
+        }
+    }
     let EmitOutput { file_path, source_map, .. } =
         match emit_proof_fn(krate, proof_fn, tactic_body, imports, crate_name, tactic_bodies) {
             Ok(o) => o,
@@ -1504,7 +1525,7 @@ fn collect_referenced_datatypes<'a>(
 /// kills the test process).
 ///
 /// Compiled out of release builds (returns `Ok(())` unconditionally).
-fn debug_check(_cmds: &[Command]) -> Result<(), String> {
+pub(crate) fn debug_check(_cmds: &[Command]) -> Result<(), String> {
     #[cfg(debug_assertions)]
     {
         let violations = sanity::check_references(_cmds);

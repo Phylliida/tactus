@@ -12768,3 +12768,40 @@ test_verify_one_file_with_options! {
         assert!(text.contains("lemma_bad"), "failure attributed to lemma_bad: {}", text);
     }
 }
+
+test_verify_one_file_with_options! {
+    // Step 1b batch: helper + two roots referencing it — all three
+    // theorems land in ONE TactusProofs file, helper elaborated once.
+    #[test] test_crate_defs_batch_helper_chain ["--tactus-crate-defs"] => verus_code! {
+        spec fn s(x: nat) -> nat { x + 1 }
+        proof fn helper_s_pos(x: nat)
+            ensures s(x) >= 1
+            by { simp only [s]; omega }
+        proof fn root_a(x: nat)
+            ensures s(x) >= 1
+            by { have h := helper_s_pos x; exact h }
+        proof fn root_b(x: nat)
+            ensures s(x) + 1 >= 2
+            by { have h := helper_s_pos x; omega }
+    } => Ok(())
+}
+
+test_verify_one_file_with_options! {
+    // Step 1b failure semantics: the helper's tactic fails → the
+    // helper fails; the root (which elaborated against the helper's
+    // STATEMENT) reports green. Exactly one error, attributed to the
+    // helper. (Standalone mode would fail both — documented change.)
+    #[test] test_crate_defs_batch_helper_failure_attribution ["--tactus-crate-defs"] => verus_code! {
+        spec fn t(x: nat) -> nat { x + 1 }
+        proof fn helper_bad(x: nat)
+            ensures t(x) >= 2
+            by { simp only [t]; omega }
+        proof fn root_uses_bad(x: nat)
+            ensures t(x) >= 2
+            by { have h := helper_bad x; exact h }
+    } => Err(err) => {
+        assert_eq!(err.errors.len(), 1, "exactly the bad helper fails");
+        let text = format!("{:?}", err.errors[0].message);
+        assert!(text.contains("helper_bad"), "attributed to helper_bad: {}", text);
+    }
+}
