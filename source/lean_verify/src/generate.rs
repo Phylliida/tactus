@@ -12,7 +12,7 @@ use crate::dep_order::{self, FnGroup};
 use crate::lean_ast::Command;
 use crate::lean_pp::pp_commands;
 use crate::lean_process;
-use crate::prelude::TACTUS_PRELUDE;
+
 use crate::project;
 use crate::sanity;
 use crate::sst_to_lean;
@@ -28,7 +28,7 @@ use crate::to_lean_type::{lean_name, sanitize, short_name};
 /// invoked from a Cargo project root (cargo's convention) but will scatter
 /// artifacts if invoked from elsewhere. Set `$TACTUS_LEAN_OUT` explicitly
 /// for reproducible builds outside Cargo.
-fn lean_out_root() -> PathBuf {
+pub(crate) fn lean_out_root() -> PathBuf {
     if let Ok(dir) = std::env::var("TACTUS_LEAN_OUT") {
         return PathBuf::from(dir);
     }
@@ -316,7 +316,11 @@ fn krate_preamble(
             cmds.push(Command::Import(s.clone()));
         }
     }
-    cmds.push(Command::Raw(TACTUS_PRELUDE.to_string()));
+    // Prebuilt-prelude import (CRATEDEFS.md step 0): the 429-line
+    // prelude used to be inlined here, re-elaborated in every file
+    // (~1.3s/check). `check_lean_file` puts the cache dir holding
+    // `TactusPrelude.olean` on the child's LEAN_PATH.
+    cmds.push(Command::Raw(crate::prelude::TACTUS_PRELUDE_IMPORT.to_string()));
     // Theorem-required PreludeAddendums go after the prelude — they
     // typically declare instances that depend on the prelude's
     // definitions and on the imports above.
@@ -1095,7 +1099,11 @@ pub fn check_proof_fn(
 
     let dir = project::default_project_dir();
     let lake_dir = if project::project_ready(&dir) { Some(dir.as_path()) } else { None };
-    let result = lean_process::check_lean_file(&file_path, lake_dir);
+    let prelude_dir = match crate::prelude::ensure_prelude_olean() {
+        Ok(d) => d,
+        Err(e) => return CheckResult::Error(e),
+    };
+    let result = lean_process::check_lean_file(&file_path, lake_dir, Some(&prelude_dir));
 
     match result {
         Ok(r) if r.success => CheckResult::Success { warnings: vec![] },
@@ -1281,7 +1289,11 @@ pub fn check_exec_fn(
 
     let dir = project::default_project_dir();
     let lake_dir = if project::project_ready(&dir) { Some(dir.as_path()) } else { None };
-    let result = lean_process::check_lean_file(&file_path, lake_dir);
+    let prelude_dir = match crate::prelude::ensure_prelude_olean() {
+        Ok(d) => d,
+        Err(e) => return CheckResult::Error(e),
+    };
+    let result = lean_process::check_lean_file(&file_path, lake_dir, Some(&prelude_dir));
 
     match result {
         Ok(r) if r.success => CheckResult::Success { warnings },

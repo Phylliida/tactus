@@ -18,7 +18,7 @@ fn run(lean: &str) -> Option<lean_verify::lean_process::LeanResult> {
     let path = std::env::temp_dir()
         .join(format!("tactus_integration_{}_{}.lean", pid, uniq));
     std::fs::write(&path, full).expect("write tmp");
-    let result = check_lean_file(&path, None).ok();
+    let result = check_lean_file(&path, None, None).ok();
     let _ = std::fs::remove_file(&path);
     result
 }
