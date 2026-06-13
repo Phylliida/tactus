@@ -185,17 +185,19 @@ fn build_defs(
     // defs module — broader than the batch's theorem list: trait-
     // method-impl proof fns aren't batched (they emit per-fn), but
     // those files import defs too, so their closures must be present.
-    // Tactic-bodied lemmas AND WP-style proof fns (Verus proof bodies
-    // checked through the exec/WP machinery — the dominant kind in
-    // ported crates like tactus-group-theory, which has ~1000 of them
-    // and ONE tactic lemma). Both kinds' per-fn files import the defs
-    // module. `body.is_some()` marks same-crate fns (cross-crate
-    // merged decls arrive bodyless).
+    // LEAN-PATH fns only: tactic-bodied proof fns (the map's keys) and
+    // exec fns. The Lean backend is OPT-IN per fn — unmarked Verus
+    // proof fns verify via Z3 and never import the defs module, so
+    // including them (one session tried `|| f.body.is_some()`) builds
+    // a defs for a thousand fns that will never read it, and drags in
+    // closures (runtime views, DeepView) that fail elaboration and
+    // waste two olean attempts per cold run. As the port migrates fns
+    // to tactic bodies / tactus_auto they join these roots naturally.
     let proof_roots: Vec<&FunctionX> = inlined_krate.functions.iter()
         .map(|f| &f.x)
         .filter(|f| {
             matches!(f.mode, vir::ast::Mode::Proof)
-                && (tactic_bodies.contains_key(&f.name) || f.body.is_some())
+                && tactic_bodies.contains_key(&f.name)
         })
         .collect();
     let exec_roots: Vec<&FunctionX> = inlined_krate.functions.iter()

@@ -187,6 +187,42 @@ vs 647s baseline (−17%) — 1a's import shrinkage alone. The batch win
 on this crate awaits the two fixes above. Hardening + instrumentation
 (batch size line, poison position+regions) are committed and stay.
 
+**1c RESOLUTION (2026-06-13, fresh-context session) — all three bugs
+fixed; the real-crate reframe.** Fixes landed, each suite-gated:
+(a) `lean_out_root()` always absolute — relative entries on the Lean
+child's LEAN_PATH resolved against lake's cwd, killing defs imports
+(lake EXTENDS caller LEAN_PATH — sentinel-tested; the entry was just
+relative). (b) defs/batch memo keyed by content fingerprint (krate fn
+paths + sorted tactic-bodies keys) — self-adapting to whatever krate
+each bucket thread hands us. (c) THE structural one: the exec/WP
+path's `broadcast_lemmas.is_empty()` gate disabled shared defs for
+EVERY fn of EVERY vstd-importing crate (default-on-import broadcast
+groups are never empty). The defs module now carries the UNION of
+emittable broadcast axioms (`all_emittable_broadcast_lemmas`), any
+per-fn set is a subset by construction, and the gate is lifted
+(covers_exec refined: exec fns need exec coverage; proof fns ride
+proof-roots defs).
+
+**The reframe that ended the chase:** tactus is OPT-IN per fn
+(tactic bodies / tactus_auto). tactus-group-theory has 8 Lean-path
+fns (7 runtime execs + 1 tactic lemma) — its 647s "baseline" is ~98%
+Z3 time, not Lean. Three sessions of group-theory A/B numbers were
+measuring Z3. The lone tactic lemma DOES ride defs+batch now (the
+845→846 flip). Defs roots are accordingly LEAN-PATH fns only — one
+session widened them to all bodied proof fns, which built a defs for
+a thousand Z3-path fns that would never import it (reverted). The
+real-crate showcase arrives as the port migrates lemmas to tactic
+bodies; each migrated lemma joins the roots and batch automatically.
+
+Still-open follow-ups, in likely value order as migration proceeds:
+iterative-repair defs build (drop erroring items by line attribution,
+rebuild, converge — designed, not yet needed at current Lean-path
+populations); batching for tactus_auto WP fns (they get the defs
+IMPORT but stay per-fn; their obligations could batch like 1b);
+fragment rehoming (when defs roots grow fragment-dependent content —
+`Tactus.index`, BitVec instances); per-fn covers check against
+dropped/skipped defs items.
+
 **1b design (settled at 1a landing — two artifacts, not one):**
 the naive form (theorems inside the defs module) couples failure wrong:
 one bad tactic → no `.olean` → every exec file importing it breaks. So:
