@@ -154,6 +154,14 @@ fn build_defs(
     tactic_bodies: &std::collections::HashMap<Fun, String>,
     build: bool,
 ) -> Option<Arc<CrateDefs>> {
+    if std::env::var_os("TACTUS_VERBOSE").is_some() {
+        let execs = krate.functions.iter()
+            .filter(|f| matches!(f.x.mode, vir::ast::Mode::Exec) && f.x.body.is_some())
+            .count();
+        eprintln!(
+            "tactus: build_defs scope `{}`: tactic_bodies {}, exec(with body) {}, krate fns {}",
+            scope, tactic_bodies.len(), execs, krate.functions.len());
+    }
     // Gate: sharing pays only when ≥2 checked fns split the defs cost.
     // Proof fns with tactic bodies are each checked; exec-fn count is
     // an over-approximation (mode + body present) — over-counting just
@@ -177,11 +185,17 @@ fn build_defs(
     // defs module — broader than the batch's theorem list: trait-
     // method-impl proof fns aren't batched (they emit per-fn), but
     // those files import defs too, so their closures must be present.
+    // Tactic-bodied lemmas AND WP-style proof fns (Verus proof bodies
+    // checked through the exec/WP machinery — the dominant kind in
+    // ported crates like tactus-group-theory, which has ~1000 of them
+    // and ONE tactic lemma). Both kinds' per-fn files import the defs
+    // module. `body.is_some()` marks same-crate fns (cross-crate
+    // merged decls arrive bodyless).
     let proof_roots: Vec<&FunctionX> = inlined_krate.functions.iter()
         .map(|f| &f.x)
         .filter(|f| {
             matches!(f.mode, vir::ast::Mode::Proof)
-                && tactic_bodies.contains_key(&f.name)
+                && (tactic_bodies.contains_key(&f.name) || f.body.is_some())
         })
         .collect();
     let exec_roots: Vec<&FunctionX> = inlined_krate.functions.iter()
@@ -264,8 +278,18 @@ fn render_and_build(
     cmds.push(Command::Raw(crate::prelude::TACTUS_PRELUDE_IMPORT.to_string()));
     cmds.push(Command::NamespaceOpen(ns.clone()));
     cmds.push(Command::Raw("set_option autoImplicit false".to_string()));
+    // Union of emittable broadcast axioms (CRATEDEFS 1c fix c): per-fn
+    // files collect a SUBSET of these (default-on-import groups +
+    // fn-specific reveals); with the axioms in the defs module, the
+    // import replaces local re-emission and the broadcast gate on the
+    // exec/WP path can lift. They also join the dep walk — their
+    // ensures reference spec fns (Seq.len etc.) that must be emitted.
+    let bc_union = crate::broadcast_collect::all_emittable_broadcast_lemmas(inlined_krate);
+    let walk_roots: Vec<&FunctionX> = roots.iter().copied()
+        .chain(bc_union.iter().copied())
+        .collect();
     cmds.extend(crate::generate::spec_world_cmds(
-        inlined_krate, ectx, roots, emit_accessors, &[], true,
+        inlined_krate, ectx, &walk_roots, emit_accessors, &bc_union, true,
     ));
     cmds.push(Command::NamespaceClose(ns));
 

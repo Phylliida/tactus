@@ -394,10 +394,9 @@ fn krate_preamble(
         .collect();
     if defs.is_none() {
         cmds.extend(spec_world_cmds(krate, &ectx, &dep_walk_roots, emit_accessors, &bc_lemma_funcs, false));
-    } else {
-        debug_assert!(bc_lemma_funcs.is_empty(),
-            "broadcast-using fns fall back to standalone emission");
     }
+    // (defs mode: bc axioms come from the defs module's import — the
+    // union emitted there is a superset of this fn's collected set.)
     // Emit proof-fn theorems for helper proof fns the root fn might
     // invoke from `proof { have _ := some_lemma args }` blocks (or
     // `assert(P) by { have _ := some_lemma args }`). Without this,
@@ -976,12 +975,14 @@ pub(crate) fn spec_world_cmds(
         // `axiom_hashmap_deepview_borrow`'s `<K as DeepView>::V`) — same
         // generalized projection-lifting as standalone spec fns. No-op for
         // projection-free lemmas (the common case).
-        let augmented = crate::impl_subst::maybe_augment_standalone_fn(f, &ectx.trait_outparams);
-        // A lemma whose facts dispatch to a `choose`-using fn (e.g.
-        // `axiom_hashmap_deepview_borrow` → `deep_view` → the epsilon in
-        // `hash_map_deep_view_impl`) needs `[Nonempty T]` too.
-        let augmented = add_nonempty(augmented, &f.name);
-        cmds.push(to_lean_fn::broadcast_lemma_axiom_cmd(&augmented, ectx));
+        push_lenient(&mut cmds, "broadcast axiom", &mut || {
+            let augmented = crate::impl_subst::maybe_augment_standalone_fn(f, &ectx.trait_outparams);
+            // A lemma whose facts dispatch to a `choose`-using fn (e.g.
+            // `axiom_hashmap_deepview_borrow` → `deep_view` → the epsilon in
+            // `hash_map_deep_view_impl`) needs `[Nonempty T]` too.
+            let augmented = add_nonempty(augmented, &f.name);
+            vec![to_lean_fn::broadcast_lemma_axiom_cmd(&augmented, ectx)]
+        });
     }
     cmds
 }
@@ -1408,18 +1409,20 @@ pub fn emit_exec_fn(
     // preamble also aggregates each theorem's `requires_preamble`
     // (e.g., the BitVec instances #130 needs) and emits them once at
     // file top, deduped.
-    // Shared-defs mode is incompatible with `broadcast use` — the
-    // lemma axioms extend the dep walk per-fn, which a once-per-crate
-    // defs build can't anticipate. Such fns emit standalone.
+    // Broadcast lemmas no longer disable shared-defs (CRATEDEFS 1c
+    // fix c): the defs module carries the UNION of emittable broadcast
+    // axioms, and any per-fn collected set is a subset by construction
+    // — so the import supplies what local emission used to. This is
+    // what unlocks defs sharing for real crates at all: vstd's
+    // default-on-import broadcast groups make `broadcast_lemmas`
+    // non-empty for EVERY fn in a vstd-importing crate.
     // `covers_exec: false` = the defs module was rebuilt from proof
-    // roots only (its full-roots attempt failed in Lean) — exec
-    // closures may not be present, so exec fns emit standalone.
-    let defs = if broadcast_lemmas.is_empty() {
-        crate::crate_defs::for_crate(pre_inline_krate, crate_name, tactic_bodies, false)
-            .filter(|d| d.covers_exec)
-    } else {
-        None
-    };
+    // roots only (its full-roots attempt failed in Lean) — EXEC
+    // closures may be absent, so true exec fns emit standalone; WP-
+    // style PROOF fns (Verus proof bodies routed through this same WP
+    // path) are covered by the proof roots and keep the import.
+    let defs = crate::crate_defs::for_crate(pre_inline_krate, crate_name, tactic_bodies, false)
+        .filter(|d| d.covers_exec || matches!(vir_fn.mode, vir::ast::Mode::Proof));
     let (mut cmds, ns) = krate_preamble(
         krate, imports, crate_name, &[vir_fn],
         PreambleConfig::ExecFn,

@@ -87,6 +87,51 @@ fn collect_fuel_targets<'a>(stm: &'a Stm, out: &mut Vec<&'a Fun>) {
 /// matches the common top-of-fn usage. Module-level `broadcast use`
 /// (`ModuleX.reveals`, distinct from default-on-import) is not yet
 /// handled; deferred.
+/// Krate-level union: every broadcast lemma in the krate that can be
+/// emitted as a Lean axiom — same emit-safety filters as the per-fn
+/// collection below (un-emittable trait bounds, BuiltinSpecFun in the
+/// require/ensure). The shared-defs module (CRATEDEFS 1c) emits this
+/// union so per-fn files can IMPORT the axioms instead of re-emitting
+/// them; any per-fn collected set is a subset by construction (it
+/// resolves through the same krate fn_map with the same filters).
+pub fn all_emittable_broadcast_lemmas<'a>(krate: &'a KrateX) -> Vec<&'a FunctionX> {
+    let fn_map: HashMap<&Fun, &FunctionX> =
+        krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
+    let unemittable_traits = crate::expr_shared::unemittable_traits(krate, &fn_map);
+    krate.functions.iter().map(|f| &f.x)
+        .filter(|func| {
+            func.attrs.broadcast_forall
+                && !func.typ_bounds.iter().any(|b| match &**b {
+                    vir::ast::GenericBoundX::Trait(vir::ast::TraitId::Path(p), _) =>
+                        unemittable_traits.contains(p),
+                    _ => false,
+                })
+                && !module_references_builtin_spec_fun(func)
+        })
+        .collect()
+}
+
+/// Module-scope twin of the collector's nested filter (same slots:
+/// require + ensure.0).
+fn module_references_builtin_spec_fun(func: &FunctionX) -> bool {
+    use std::cell::Cell;
+    use vir::visitor::VisitorControlFlow;
+    let found = Cell::new(false);
+    let mut visit = |e: &vir::ast::Expr| {
+        if let ExprX::Call(CallTarget::BuiltinSpecFun(..), ..) = &e.x {
+            found.set(true);
+            VisitorControlFlow::Stop(())
+        } else {
+            VisitorControlFlow::Recurse
+        }
+    };
+    for clause in func.require.iter().chain(func.ensure.0.iter()) {
+        if found.get() { break; }
+        vir::ast_visitor::expr_visitor_walk(clause, &mut visit);
+    }
+    found.get()
+}
+
 pub fn collect_broadcast_lemma_funs<'a>(
     krate: &'a KrateX,
     check: &'a FuncCheckSst,
