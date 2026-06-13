@@ -154,6 +154,39 @@ identical counts) with automatic standalone fallback.
 Until 1c, the flag on this crate = graceful fallback (zero win, zero
 loss); the e2e suite shapes don't hit these corners (510/0).
 
+**1c continued (instrumented findings, end of 2026-06-12) — two
+confirmed bugs remain, both with clear fixes for the next session:**
+
+1. **Per-bucket krates feed the crate-keyed memo.** Verus verifies in
+   per-module buckets; each bucket thread gets a Verifier clone whose
+   krate handle is bucket-local (instrumented: the batch built with
+   `tactic_bodies 1, krate fns 1155` — the machine_group bucket's
+   pruned closure, one tactic lemma). The defs/batch memo keyed by
+   crate name caches the FIRST bucket's view for everyone. Fix options:
+   key the memo per bucket/module (defs per module — still big sharing
+   within group-theory-sized modules; batch per module matches the
+   bucketing naturally), or thread the truly-unpruned krate + a
+   full-krate tactic-bodies map down from the verifier (one defs, as
+   designed). Decide at implementation; per-module is likely simpler
+   AND matches Verus's own unit of work.
+2. **`lake env lean` clobbers the LEAN_PATH prepend — sometimes.** The
+   batch's run failed `unknown module prefix 'TactusDefs_lib'` with a
+   search path showing ONLY lake's dirs (the step-0 uncertainty, never
+   suite-tested: the harness presets LEAN_PATH; check.sh doesn't).
+   Confusingly, per-fn runs through the same code resolved both
+   imports (845 green) — unresolved inconsistency, possibly relative-
+   vs-absolute extra paths (`lean_out_root()` can be relative;
+   `lake env`'s cwd is the project dir) — `defs.dir` should be
+   canonicalized regardless. Fix: bypass lake entirely — resolve
+   `lake env printenv LEAN_PATH` ONCE per process (the harness's own
+   trick), cache it, always exec plain `lean` with extras prepended.
+   Also kills per-check lake lock overhead for every run.
+
+Wall-time note: even in full fallback the flag-on run is now 529–536s
+vs 647s baseline (−17%) — 1a's import shrinkage alone. The batch win
+on this crate awaits the two fixes above. Hardening + instrumentation
+(batch size line, poison position+regions) are committed and stay.
+
 **1b design (settled at 1a landing — two artifacts, not one):**
 the naive form (theorems inside the defs module) couples failure wrong:
 one bad tactic → no `.olean` → every exec file importing it breaks. So:
