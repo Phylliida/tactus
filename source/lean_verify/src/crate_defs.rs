@@ -216,32 +216,60 @@ fn build_defs(
     // broken closure breaks only its own file — today's behavior.
     let full_roots: Vec<&FunctionX> =
         proof_roots.iter().copied().chain(exec_roots.iter().copied()).collect();
-    for (attempt, (roots, emit_accessors, covers_exec)) in [
-        (&full_roots, !exec_roots.is_empty(), true),
-        (&proof_roots, false, false),
-    ].into_iter().enumerate() {
-        if attempt == 1 && (!build || exec_roots.is_empty()) {
-            // Without a Lean run there's nothing to learn from attempt
-            // 1 (emit-lean mode), and without exec roots the attempts
-            // are identical.
+    // Attempt ladder, narrowing on each Lean failure:
+    //   1. full roots + broadcast union  — execs + everything
+    //   2. proof roots + broadcast union — drops broken exec closures
+    //   3. proof roots, NO union         — drops broken broadcast axioms
+    // The union is KRATE-WIDE (any per-fn collected set is a subset),
+    // so a single un-elaboratable axiom in it (e.g. vstd's array-view
+    // axioms → `array_view` → the `Tactus.index` closure fragment)
+    // sinks attempts 1 AND 2 regardless of roots. Attempt 3 then
+    // yields the minimal clean defs — exactly the pre-(c) proof-roots
+    // module — so tactic lemmas that need NO broadcast axiom (the
+    // common case for migrated arithmetic/structural lemmas) still
+    // ride it. A lemma needing a CLEAN axiom that an UNRELATED broken
+    // axiom dragged down is the case for the iterative-repair build
+    // (drop only the erroring item by line attribution; CRATEDEFS
+    // follow-ups) — not yet needed at current Lean-path populations.
+    let attempts: [(&[&FunctionX], bool, bool, bool); 3] = [
+        (&full_roots, !exec_roots.is_empty(), true, true),
+        (&proof_roots, false, false, true),
+        (&proof_roots, false, false, false),
+    ];
+    let mut prev: Option<(usize, bool, bool)> = None;
+    for (attempt, &(roots, emit_accessors, covers_exec, with_bc_union)) in attempts.iter().enumerate() {
+        // Emit-lean mode never runs Lean, so there's nothing to learn
+        // from later attempts — just emit attempt 1 and return.
+        if attempt > 0 && !build {
             break;
         }
+        // Skip an attempt identical to the previous one (no exec roots
+        // ⇒ full == proof; the union flag is the only remaining axis).
+        if let Some((plen, pcov, punion)) = prev {
+            if roots.len() == plen && covers_exec == pcov && with_bc_union == punion {
+                continue;
+            }
+        }
+        prev = Some((roots.len(), covers_exec, with_bc_union));
         match render_and_build(
             &inlined_krate, &ectx, crate_name, scope, roots,
-            emit_accessors, covers_exec, build,
+            emit_accessors, covers_exec, with_bc_union, build,
         ) {
             Ok(defs) => return Some(Arc::new(defs)),
             Err(e) => {
+                let stage = match (covers_exec, with_bc_union) {
+                    (true, _) => "full roots",
+                    (false, true) => "proof roots + broadcast union",
+                    (false, false) => "proof roots, no union",
+                };
+                let next = if attempt + 1 < attempts.len() && build {
+                    "retrying narrower"
+                } else {
+                    "falling back to standalone emission"
+                };
                 eprintln!(
                     "tactus: defs module build failed for crate `{}` ({}) — {}\n{}",
-                    crate_name,
-                    if covers_exec { "full roots" } else { "proof roots only" },
-                    if covers_exec && build {
-                        "retrying with proof-only roots (exec fns will emit standalone)"
-                    } else {
-                        "falling back to standalone emission"
-                    },
-                    e,
+                    crate_name, stage, next, e,
                 );
             }
         }
@@ -258,6 +286,7 @@ fn render_and_build(
     roots: &[&FunctionX],
     emit_accessors: bool,
     covers_exec: bool,
+    with_bc_union: bool,
     build: bool,
 ) -> Result<CrateDefs, String> {
     let ns = sanitize(crate_name);
@@ -286,7 +315,11 @@ fn render_and_build(
     // import replaces local re-emission and the broadcast gate on the
     // exec/WP path can lift. They also join the dep walk — their
     // ensures reference spec fns (Seq.len etc.) that must be emitted.
-    let bc_union = crate::broadcast_collect::all_emittable_broadcast_lemmas(inlined_krate);
+    let bc_union: Vec<&FunctionX> = if with_bc_union {
+        crate::broadcast_collect::all_emittable_broadcast_lemmas(inlined_krate)
+    } else {
+        Vec::new()
+    };
     let walk_roots: Vec<&FunctionX> = roots.iter().copied()
         .chain(bc_union.iter().copied())
         .collect();
