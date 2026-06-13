@@ -29,13 +29,20 @@ use crate::to_lean_type::{lean_name, sanitize, short_name};
 /// artifacts if invoked from elsewhere. Set `$TACTUS_LEAN_OUT` explicitly
 /// for reproducible builds outside Cargo.
 pub(crate) fn lean_out_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("TACTUS_LEAN_OUT") {
-        return PathBuf::from(dir);
-    }
-    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
-        return PathBuf::from(dir).join("tactus-lean");
-    }
-    PathBuf::from("target").join("tactus-lean")
+    // ALWAYS absolute: these dirs end up on the Lean child's
+    // `LEAN_PATH`, where a relative entry resolves against the CHILD's
+    // cwd — which under `lake env lean` is the lake project dir, not
+    // ours. A relative root here cost a day of debugging on
+    // tactus-group-theory (defs imports failing only on the lake
+    // branch; see CRATEDEFS.md 1c).
+    let root = if let Ok(dir) = std::env::var("TACTUS_LEAN_OUT") {
+        PathBuf::from(dir)
+    } else if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+        PathBuf::from(dir).join("tactus-lean")
+    } else {
+        PathBuf::from("target").join("tactus-lean")
+    };
+    std::path::absolute(&root).unwrap_or(root)
 }
 
 /// Compute the on-disk artifact path for a given function.
