@@ -65,6 +65,34 @@ pub fn set_enabled(on: bool) {
 type Memo = Mutex<std::collections::HashMap<String, Option<Arc<CrateDefs>>>>;
 static MEMO: OnceLock<Memo> = OnceLock::new();
 
+
+/// Memo scope for the shared artifacts. Verus verifies in per-module
+/// BUCKETS; each bucket thread's Verifier clone can hand us a
+/// bucket-locally PRUNED krate and tactic-bodies map (measured on
+/// tactus-group-theory: `krate fns 1155, tactic_bodies 1` for the
+/// machine_group bucket). A memo keyed by crate name alone would cache
+/// the first bucket's view for every other bucket. Keying by content
+/// fingerprint is self-adapting: identical inputs (one full krate) →
+/// one shared defs/batch; per-bucket inputs → per-bucket artifacts,
+/// each self-consistent. The hash also suffixes the Lean module/file
+/// names so bucket artifacts coexist in the crate dir.
+fn scope_key(
+    crate_name: &str,
+    krate: &KrateX,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for f in krate.functions.iter() {
+        f.x.name.path.hash(&mut h);
+    }
+    // HashMap iteration order is nondeterministic — sort first.
+    let mut keys: Vec<String> = tactic_bodies.keys().map(|k| format!("{:?}", k.path)).collect();
+    keys.sort();
+    keys.hash(&mut h);
+    format!("{}_{:08x}", sanitize(crate_name), h.finish() as u32)
+}
+
 pub fn for_crate(
     krate: &KrateX,
     crate_name: &str,
@@ -80,14 +108,15 @@ pub fn for_crate(
     // panicked, the map is still structurally valid (worst case: a
     // missing entry that gets rebuilt) — don't cascade the panic to
     // every other bucket.
+    let scope = scope_key(crate_name, krate, tactic_bodies);
     let mut map = memo.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(cached) = map.get(crate_name) {
+    if let Some(cached) = map.get(&scope) {
         return cached.clone();
     }
     let result = guard_build("defs module", crate_name, || {
-        build_defs(krate, crate_name, tactic_bodies, build)
+        build_defs(krate, crate_name, &scope, tactic_bodies, build)
     });
-    map.insert(crate_name.to_string(), result.clone());
+    map.insert(scope, result.clone());
     result
 }
 
@@ -121,6 +150,7 @@ fn guard_build<T>(
 fn build_defs(
     krate: &KrateX,
     crate_name: &str,
+    scope: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
     build: bool,
 ) -> Option<Arc<CrateDefs>> {
@@ -181,7 +211,7 @@ fn build_defs(
             break;
         }
         match render_and_build(
-            &inlined_krate, &ectx, crate_name, roots,
+            &inlined_krate, &ectx, crate_name, scope, roots,
             emit_accessors, covers_exec, build,
         ) {
             Ok(defs) => return Some(Arc::new(defs)),
@@ -208,13 +238,15 @@ fn render_and_build(
     inlined_krate: &KrateX,
     ectx: &crate::emit_ctx::EmitCtx,
     crate_name: &str,
+    scope: &str,
     roots: &[&FunctionX],
     emit_accessors: bool,
     covers_exec: bool,
     build: bool,
 ) -> Result<CrateDefs, String> {
     let ns = sanitize(crate_name);
-    let module_name = format!("TactusDefs_{}", ns);
+    // Scope-suffixed: per-bucket artifacts coexist (see scope_key).
+    let module_name = format!("TactusDefs_{}", scope);
     let dir = crate::generate::lean_out_root().join(&ns);
     let mut cmds: Vec<Command> = Vec::new();
     // Union of every fn's tactic imports: helper bodies elaborate
@@ -385,14 +417,15 @@ pub fn proof_batch(
         return None;
     }
     let memo = BATCH_MEMO.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let scope = scope_key(crate_name, krate, tactic_bodies);
     let mut map = memo.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(cached) = map.get(crate_name) {
+    if let Some(cached) = map.get(&scope) {
         return cached.clone();
     }
     let result = guard_build("proofs batch", crate_name, || {
-        build_batch(krate, crate_name, tactic_bodies, build)
+        build_batch(krate, crate_name, &scope, tactic_bodies, build)
     });
-    map.insert(crate_name.to_string(), result.clone());
+    map.insert(scope, result.clone());
     result
 }
 
@@ -434,6 +467,7 @@ fn ordered_batch_fns<'a>(
 fn build_batch(
     krate: &KrateX,
     crate_name: &str,
+    scope: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
     build: bool,
 ) -> Option<Arc<ProofBatch>> {
@@ -461,9 +495,15 @@ fn build_batch(
         return None;
     }
     let ordered = ordered_batch_fns(&batched, tactic_bodies);
-    eprintln!(
-        "tactus: proofs batch for crate `{}`: {} theorems (tactic_bodies {}, krate fns {})",
-        crate_name, ordered.len(), tactic_bodies.len(), inlined_krate.functions.len());
+    // Gated: the e2e harness treats unexpected stderr lines as
+    // failures (it parses the child's stderr as diagnostics), and this
+    // is the only ALWAYS-printing line in the module — everything else
+    // prints on failure paths only.
+    if std::env::var_os("TACTUS_VERBOSE").is_some() {
+        eprintln!(
+            "tactus: proofs batch for crate `{}`: {} theorems (tactic_bodies {}, krate fns {})",
+            crate_name, ordered.len(), tactic_bodies.len(), inlined_krate.functions.len());
+    }
 
     let ns = sanitize(crate_name);
     let mut header_cmds: Vec<Command> = Vec::new();
@@ -525,7 +565,7 @@ fn build_batch(
         }
     }
 
-    let file_path = defs.dir.join(format!("TactusProofs_{}.lean", ns));
+    let file_path = defs.dir.join(format!("TactusProofs_{}.lean", scope));
     if let Err(e) = std::fs::create_dir_all(&defs.dir)
         .map_err(|e| e.to_string())
         .and_then(|_| std::fs::write(&file_path, &text).map_err(|e| e.to_string()))
