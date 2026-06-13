@@ -461,6 +461,9 @@ fn build_batch(
         return None;
     }
     let ordered = ordered_batch_fns(&batched, tactic_bodies);
+    eprintln!(
+        "tactus: proofs batch for crate `{}`: {} theorems (tactic_bodies {}, krate fns {})",
+        crate_name, ordered.len(), tactic_bodies.len(), inlined_krate.functions.len());
 
     let ns = sanitize(crate_name);
     let mut header_cmds: Vec<Command> = Vec::new();
@@ -563,8 +566,13 @@ fn build_batch(
             // attributable to one fn — poison the batch so every fn
             // re-checks standalone (conservative, today's behavior).
             eprintln!(
-                "tactus: proofs batch error outside any theorem region for crate `{}` — falling back to per-fn emission.\n{}",
-                crate_name, d.data
+                "tactus: proofs batch error outside any theorem region for crate `{}` (line {:?}, {} regions spanning {}..{}) — falling back to per-fn emission.\n{}",
+                crate_name,
+                d.pos.as_ref().map(|p| p.line),
+                regions.len(),
+                regions.first().map(|r| r.start).unwrap_or(0),
+                regions.last().map(|r| r.end).unwrap_or(0),
+                d.data
             );
             return None;
         };
