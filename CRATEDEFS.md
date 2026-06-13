@@ -214,6 +214,16 @@ a thousand Z3-path fns that would never import it (reverted). The
 real-crate showcase arrives as the port migrates lemmas to tactic
 bodies; each migrated lemma joins the roots and batch automatically.
 
+**Regression caught + fixed by the sanity run (same session):** (c)'s
+broadcast union is KRATE-WIDE, so vstd's array-view axioms (→
+`array_view` → the `Tactus.index` closure fragment) sank defs attempts
+1 AND 2 regardless of roots, knocking lemma_div_mod_id from defs+batch
+back to standalone. Fix: defs attempt ladder gained a 3rd rung —
+proof roots, NO union — the minimal clean module (= pre-(c)). Verified:
+full ✗ → proof+union ✗ → proof-no-union ✓; lemma_div_mod_id batched,
+imports the no-union olean. The "clean axiom dragged down by an
+unrelated broken one" case is exactly the iterative-repair follow-up.
+
 Still-open follow-ups, in likely value order as migration proceeds:
 iterative-repair defs build (drop erroring items by line attribution,
 rebuild, converge — designed, not yet needed at current Lean-path
