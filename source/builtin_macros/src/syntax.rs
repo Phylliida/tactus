@@ -4798,42 +4798,80 @@ pub(crate) fn rewrite_items(
     }
     visitor.visit_items_post(&mut items.items);
 
-    // Tactus: attach imports to tactic proof fns AND tactus_auto exec fns.
-    // tactic_by survives the visitor (only erase_spec_fields clears it,
-    // which is only called for trait methods in syntax_trait.rs).
+    // Tactus: attach file-level `import` lines to every fn that can
+    // generate a Lean file. tactic_by survives the visitor (only
+    // erase_spec_fields clears it, which is only called for trait
+    // methods in syntax_trait.rs).
     //
-    // BUG-exec-fn-imports.md (2026-05-17): pre-fix, only `tactic_by`
-    // proof fns received the imports — exec fns marked
-    // `#[verifier::tactus_auto]` got nothing, so Mathlib tactics like
-    // `nlinarith` / `ring` used inside their `assert(P) by { ... }`
-    // blocks failed with "unknown tactic." File-level `import` lines
-    // should reach every Tactus-generated Lean file, regardless of
-    // whether the source fn is proof-mode or exec-mode.
+    // History of under-attachment bugs at this site:
+    // * BUG-exec-fn-imports.md (2026-05-17): only `tactic_by` proof fns
+    //   received imports — `#[verifier::tactus_auto]` exec fns got
+    //   nothing, so Mathlib tactics inside their `assert(P) by { … }`
+    //   failed with "unknown tactic."
+    // * 2026-07-02: (a) the loop only visited TOP-LEVEL `Item::Fn` —
+    //   impl-block and trait-block methods were never attached, so a
+    //   crate whose only Lean-path fns are methods lost its imports
+    //   entirely (krate_preamble unions imports krate-wide, but a union
+    //   over zero carriers is empty); (b) under "flag decides" a plain
+    //   exec fn routes to Lean with NO attr, so the tactus_auto gate
+    //   went stale. Now: exec-mode fns (Default/Exec) qualify
+    //   unconditionally, and impl/trait items are walked. Attaching in a
+    //   Z3-compiled context is harmless — `items.imports` is only
+    //   non-empty in Tactus sources, and `lean_import` attrs are inert
+    //   outside the Lean emission paths.
     if !items.imports.is_empty() {
+        let imports = &items.imports;
+        let wants_imports =
+            |sig: &verus_syn::Signature, attrs: &[verus_syn::Attribute]| -> bool {
+                matches!(sig.mode, FnMode::Default | FnMode::Exec(_))
+                    || sig.spec.tactic_by.is_some()
+                    || attrs.iter().any(|attr| {
+                        // verifier::tactus_auto
+                        (attr.path().segments.len() == 2
+                            && attr.path().segments[0].ident == "verifier"
+                            && attr.path().segments[1].ident == "tactus_auto")
+                        // verifier(tactus_auto)
+                        || (attr.path().segments.len() == 1
+                            && attr.path().segments[0].ident == "verifier"
+                            && match &attr.meta {
+                                verus_syn::Meta::List(list) => {
+                                    list.tokens.to_string() == "tactus_auto"
+                                }
+                                _ => false,
+                            })
+                    })
+            };
+        let attach = |attrs: &mut Vec<verus_syn::Attribute>, span: proc_macro2::Span| {
+            for imp in imports {
+                attrs.push(mk_verus_attr(span, quote! { lean_import(#imp) }));
+            }
+        };
         for item in &mut items.items {
-            if let Item::Fn(f) = item {
-                let is_proof_fn_with_tactic = f.sig.spec.tactic_by.is_some();
-                let is_tactus_auto = f.attrs.iter().any(|attr| {
-                    // verifier::tactus_auto
-                    (attr.path().segments.len() == 2
-                        && attr.path().segments[0].ident == "verifier"
-                        && attr.path().segments[1].ident == "tactus_auto")
-                    // verifier(tactus_auto)
-                    || (attr.path().segments.len() == 1
-                        && attr.path().segments[0].ident == "verifier"
-                        && match &attr.meta {
-                            verus_syn::Meta::List(list) => {
-                                list.tokens.to_string() == "tactus_auto"
-                            }
-                            _ => false,
-                        })
-                });
-                if is_proof_fn_with_tactic || is_tactus_auto {
-                    let span = f.sig.fn_token.span;
-                    for imp in &items.imports {
-                        f.attrs.push(mk_verus_attr(span, quote! { lean_import(#imp) }));
+            match item {
+                Item::Fn(f) => {
+                    if wants_imports(&f.sig, &f.attrs) {
+                        attach(&mut f.attrs, f.sig.fn_token.span);
                     }
                 }
+                Item::Impl(imp) => {
+                    for ii in &mut imp.items {
+                        if let ImplItem::Fn(m) = ii {
+                            if wants_imports(&m.sig, &m.attrs) {
+                                attach(&mut m.attrs, m.sig.fn_token.span);
+                            }
+                        }
+                    }
+                }
+                Item::Trait(tr) => {
+                    for ti in &mut tr.items {
+                        if let TraitItem::Fn(m) = ti {
+                            if wants_imports(&m.sig, &m.attrs) {
+                                attach(&mut m.attrs, m.sig.fn_token.span);
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
