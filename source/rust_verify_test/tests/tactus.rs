@@ -12549,6 +12549,32 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Typ-param NAME COLLISION between caller and callee
+// (BUG-vstd-preamble-cluster.md bug 4). `wrap::<T, A>` is instantiated
+// {T ↦ A', A ↦ u8} where the CALLER's own param is also named `A` — the
+// shape of vstd's `axiom_vec_index_decreases<A>` inlining
+// `Vec::<T, A>::spec_index`. A deep-recursive substitution callback
+// composed with the per-level `map_expr_typ_visitor` re-runs over its own
+// output and chains T → A → u8 inside NESTED typs (`idp (Pair u8 u8) p`
+// against `p : Pair A u8` — Lean type error); flat TypParam lists get one
+// application and never corrupted, which is why this needs the compound
+// typ arg `Pair<T, A>` on the inner call to bite. The leaf-only callback
+// substitutes simultaneously.
+test_verify_one_file! {
+    #[test] test_inline_typ_param_name_collision verus_code! {
+        struct Pair<T, A> { t: T, a: A }
+
+        spec fn idp<X>(x: X) -> X { x }
+
+        #[verifier::inline]
+        spec fn wrap<T, A>(p: Pair<T, A>) -> Pair<T, A> { idp(p) }
+
+        proof fn use_wrap<A>(p: Pair<A, u8>)
+            ensures wrap(p) == idp(p)
+        by { rfl }
+    } => Ok(())
+}
+
 // #[inline] on a TRAIT IMPL method (not inherent). Exercises the
 // can_inline_call(TraitMethodImpl)=true + can_drop=false branch: the call
 // inlines, but the def is KEPT so the trait instance's method field resolves.
