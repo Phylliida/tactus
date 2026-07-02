@@ -19,7 +19,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// FileLoader that sanitizes tactic blocks before rustc lexes the source.
-pub struct TactusFileLoader;
+pub struct TactusFileLoader {
+    /// Whether the crate under compilation runs `--lean-backend`.
+    /// When true, pass 2 treats plain exec fns (no `proof`/`spec` mode
+    /// keyword, no `#[verifier::z3]` opt-out) like `tactus_auto` fns:
+    /// their `proof { }` / `assert … by { }` brace bodies are Lean
+    /// tactic text and get sanitized. Owner decision 2026-07-02
+    /// ("flag decides"): in a lean-backend crate, block language
+    /// follows the fn's routing — a Lean-routed fn's proof blocks ARE
+    /// Lean; `#[verifier::z3]` keeps a fn (routing AND blocks) on the
+    /// Verus/Z3 side. Must mirror the HIR-side gate
+    /// (`fn_call_to_vir::enclosing_fn_has_lean_tactic_blocks`) and the
+    /// routing rule (`verifier.rs` Body(Normal) dispatch).
+    pub lean_backend: bool,
+}
 
 /// Cache of original (un-sanitized) file contents, populated by `read_file`
 /// and consumed by `spans::swap_source_for_diagnostics`. Keyed by
@@ -55,7 +68,7 @@ impl rustc_span::source_map::FileLoader for TactusFileLoader {
         // match what `spans.rs` looks up later.
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         cache_original(canonical, Arc::new(source.clone()));
-        Ok(sanitize_tactic_blocks(&source))
+        Ok(sanitize_tactic_blocks(&source, self.lean_backend))
     }
 
     fn read_binary_file(&self, path: &Path) -> Result<Arc<[u8]>, std::io::Error> {
@@ -70,8 +83,9 @@ impl rustc_span::source_map::FileLoader for TactusFileLoader {
 
 /// Parse source with tree-sitter-tactus, find tactic block content ranges,
 /// and replace their content with spaces (preserving newlines).
-fn sanitize_tactic_blocks(source: &str) -> String {
-    let ranges = find_tactic_block_ranges(source.as_bytes());
+/// `lean_backend`: see `TactusFileLoader::lean_backend`.
+fn sanitize_tactic_blocks(source: &str, lean_backend: bool) -> String {
+    let ranges = find_tactic_block_ranges(source.as_bytes(), lean_backend);
     if ranges.is_empty() {
         return source.to_string();
     }
@@ -107,16 +121,20 @@ fn sanitize_tactic_blocks(source: &str) -> String {
 /// 2. **`proof_block`** (a `proof { }` statement inside an exec fn
 ///    body) and **`assert_expression` with a brace-body** (`assert(P)
 ///    by { … }` / `assert forall … by { … }`) — conditionally
-///    sanitized, only inside functions marked
-///    `#[verifier::tactus_auto]`. These constructs exist in vstd
-///    carrying Rust-flavoured Verus proof code (calls to lemmas,
-///    nested asserts) rather than Lean tactics; unconditional
-///    sanitization would wipe vstd's proofs. The `tactus_auto`
-///    attribute is the unambiguous signal that the enclosing
-///    function's body routes through the Lean WP pipeline, and thus
-///    that inner `proof { … }` and `assert(…) by { … }` blocks are
-///    meant as Lean tactics.
-fn find_tactic_block_ranges(src: &[u8]) -> Vec<(usize, usize)> {
+///    sanitized, inside fns whose proof blocks are Lean tactic text:
+///    * fns marked `#[verifier::tactus_auto]` (the legacy per-fn
+///      opt-in, any crate), OR
+///    * when `lean_backend` is set ("flag decides", 2026-07-02):
+///      plain exec fns — no `proof`/`spec` mode keyword, no
+///      `#[verifier::z3]` opt-out — i.e. exactly the fns the
+///      verifier routes to Lean.
+///    These constructs exist in vstd and in Z3-path fns carrying
+///    Rust-flavoured Verus proof code (calls to lemmas, nested
+///    asserts) rather than Lean tactics; sanitizing those would wipe
+///    real proofs — hence the per-fn discrimination. Proof fns are
+///    never in scope for pass 2: they stay Z3-routed unless their
+///    whole body is a `by { }` tactic_block (pass 1).
+fn find_tactic_block_ranges(src: &[u8], lean_backend: bool) -> Vec<(usize, usize)> {
     let lang: tree_sitter::Language = tree_sitter_tactus::LANGUAGE.into();
 
     let mut parser = tree_sitter::Parser::new();
@@ -132,9 +150,10 @@ fn find_tactic_block_ranges(src: &[u8]) -> Vec<(usize, usize)> {
     // Pass 1: unconditionally sanitize every tactic_block.
     collect_tactic_block_ranges(&lang, tree.root_node(), src, &mut ranges);
 
-    // Pass 2: inside tactus_auto-marked function_items, sanitize
+    // Pass 2: inside Lean-tactic-bodied function_items (tactus_auto
+    // attr, or Lean-routed exec fns when lean_backend), sanitize
     // proof_block and assert_expression (with brace body) too.
-    walk_tactus_auto_fns(tree.root_node(), src, &mut ranges);
+    walk_lean_tactic_fns(tree.root_node(), src, lean_backend, &mut ranges);
 
     ranges
 }
@@ -186,25 +205,66 @@ fn collect_brace_query<'a>(
 }
 
 /// Pass 2: recursively visit `function_item` nodes; for each one
-/// marked `#[verifier::tactus_auto]`, collect the inner
-/// `proof_block` / `assert_expression` brace-body ranges. Nested
-/// function_items inside are visited on their own (handled by the
-/// outer recursion), so a non-tactus_auto fn nested inside a
-/// tactus_auto one isn't incorrectly sanitized.
-fn walk_tactus_auto_fns<'a>(
+/// whose proof blocks are Lean tactic text — `#[verifier::tactus_auto]`
+/// marked, or (under `lean_backend`) a Lean-routed exec fn — collect
+/// the inner `proof_block` / `assert_expression` brace-body ranges.
+fn walk_lean_tactic_fns<'a>(
     node: tree_sitter::Node<'a>,
     src: &[u8],
+    lean_backend: bool,
     ranges: &mut Vec<(usize, usize)>,
 ) {
-    if node.kind() == "function_item" && function_has_tactus_auto_attr(node, src) {
+    if node.kind() == "function_item"
+        && (function_has_tactus_auto_attr(node, src)
+            || (lean_backend && is_lean_routed_exec_fn(node, src)))
+    {
         collect_inner_lean_blocks(node, ranges);
         // Keep walking to find nested fns (Rust allows `fn f() { fn g() { … } }`),
         // but the outer-fn body is already fully scanned — no double-count.
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_tactus_auto_fns(child, src, ranges);
+        walk_lean_tactic_fns(child, src, lean_backend, ranges);
     }
+}
+
+/// Textual mirror of the verifier's `--lean-backend` routing rule
+/// (`verifier.rs`, `Body(Normal)` dispatch): a plain exec fn — no
+/// `proof` / `spec` mode keyword in `function_modifiers` — that
+/// doesn't opt back out to Z3 with `#[verifier::z3]`. Must agree with
+/// the HIR-side gate (`fn_call_to_vir::enclosing_fn_has_lean_tactic_blocks`)
+/// so the blocks sanitized here are exactly the ones consumed as
+/// tactic spans there. Only immediate children are scanned — the body
+/// is a single `block` child, never descended into.
+fn is_lean_routed_exec_fn<'a>(fn_node: tree_sitter::Node<'a>, src: &[u8]) -> bool {
+    let mut cursor = fn_node.walk();
+    for child in fn_node.children(&mut cursor) {
+        match child.kind() {
+            "function_modifiers" => {
+                let mut mc = child.walk();
+                for m in child.children(&mut mc) {
+                    if matches!(m.kind(), "proof" | "spec") {
+                        return false;
+                    }
+                }
+            }
+            "attribute_item" => {
+                // `#[verifier::z3]` / `#[verifier(z3)]` — substring
+                // match like `function_has_tactus_auto_attr`, but
+                // require both tokens so a stray "z3" in an unrelated
+                // attr (e.g. a cfg feature name) doesn't opt out.
+                if let Some(text) = src.get(child.byte_range()) {
+                    if let Ok(s) = std::str::from_utf8(text) {
+                        if s.contains("verifier") && s.contains("z3") {
+                            return false;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// `true` when any of the fn's leading `attribute_item` children
@@ -286,7 +346,7 @@ mod tests {
     #[test]
     fn test_no_tactic_blocks() {
         let src = "fn main() { let x = 5; }";
-        assert_eq!(sanitize_tactic_blocks(src), src);
+        assert_eq!(sanitize_tactic_blocks(src, false), src);
     }
 
     /// Regression for BUG-fileloader-by-in-comment.md.
@@ -313,7 +373,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     0
 }
 }";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         // The real `by { intros; omega }` should have its content
         // replaced with spaces. `intros` and `omega` should not
         // appear in the sanitized source.
@@ -333,14 +393,14 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     #[test]
     fn test_tactic_block_sanitized() {
         let src = "proof fn test() ensures true by { omega }";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert_eq!(sanitized, "proof fn test() ensures true by {       }");
     }
 
     #[test]
     fn test_tactic_block_multiline_sanitized() {
         let src = "proof fn test() ensures true by {\n    omega\n}";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert_eq!(sanitized, "proof fn test() ensures true by {\n         \n}");
     }
 
@@ -355,7 +415,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     #[test]
     fn test_tactic_block_preserves_cr() {
         let src = "proof fn test() ensures true by {\r\n    omega\r\n}";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         // Both `\r` and `\n` survive; only the `omega` content
         // and surrounding spaces get blanked.
         assert_eq!(sanitized, "proof fn test() ensures true by {\r\n         \r\n}");
@@ -366,7 +426,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     #[test]
     fn test_unicode_sanitized() {
         let src = "proof fn test() ensures true\nby {\n    intro ⟨a, b⟩\n}";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert!(!sanitized.contains("⟨"));
         assert_eq!(sanitized.len(), src.len());
     }
@@ -374,7 +434,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     #[test]
     fn test_preserves_newlines() {
         let src = "proof fn test() ensures true\nby {\n    intro ⟨a⟩\n    omega\n}";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert_eq!(sanitized.matches('\n').count(), src.matches('\n').count());
         assert_eq!(sanitized.len(), src.len());
     }
@@ -382,7 +442,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     #[test]
     fn test_multiple_tactic_blocks() {
         let src = "proof fn a() ensures true by { omega }\nproof fn b() ensures true by { simp }";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert_eq!(
             sanitized,
             "proof fn a() ensures true by {       }\nproof fn b() ensures true by {      }"
@@ -393,31 +453,31 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     fn test_assert_by_not_sanitized() {
         // assert-by contains Verus proof code, not Lean — not sanitized (Phase 2).
         let src = "fn test() { assert(true) by { omega }; }";
-        assert_eq!(sanitize_tactic_blocks(src), src);
+        assert_eq!(sanitize_tactic_blocks(src, false), src);
     }
 
     #[test]
     fn test_plain_assert_not_sanitized() {
         let src = "fn test() { assert(x > 0); }";
-        assert_eq!(sanitize_tactic_blocks(src), src);
+        assert_eq!(sanitize_tactic_blocks(src, false), src);
     }
 
     #[test]
     fn test_regular_fn_not_sanitized() {
         let src = "fn test() { let x = 5; let y = x + 1; }";
-        assert_eq!(sanitize_tactic_blocks(src), src);
+        assert_eq!(sanitize_tactic_blocks(src, false), src);
     }
 
     #[test]
     fn test_spec_fn_not_sanitized() {
         let src = "spec fn double(x: nat) -> nat { x + x }";
-        assert_eq!(sanitize_tactic_blocks(src), src);
+        assert_eq!(sanitize_tactic_blocks(src, false), src);
     }
 
     #[test]
     fn test_byte_length_preserved() {
         let src = "proof fn test() ensures true\nby {\n    intro ⟨a, b⟩\n    /- comment } -/\n    omega\n}";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert_eq!(sanitized.len(), src.len());
     }
 
@@ -426,7 +486,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     #[test]
     fn test_inside_verus_macro() {
         let src = "verus! {\nproof fn test() ensures true\nby {\n    intro ⟨a, b⟩\n}\n}";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert!(!sanitized.contains("⟨"), "Unicode inside verus! macro must be sanitized");
         assert_eq!(sanitized.len(), src.len());
     }
@@ -435,7 +495,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     fn test_inside_scoped_verus_macro() {
         // Real test files use ::verus_builtin_macros::verus!{ }
         let src = "::verus_builtin_macros::verus!{\nproof fn t() ensures true by { omega }\n}";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert!(!sanitized.contains("omega"));
         assert_eq!(sanitized.len(), src.len());
     }
@@ -444,14 +504,14 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     fn test_verus_macro_assert_by_not_sanitized() {
         // assert-by inside verus! must NOT be sanitized — it's Verus proof code
         let src = "verus! {\nfn test() {\n    assert(true) by { lemma_foo(); };\n}\n}";
-        assert_eq!(sanitize_tactic_blocks(src), src);
+        assert_eq!(sanitize_tactic_blocks(src, false), src);
     }
 
     #[test]
     fn test_verus_macro_assert_forall_by_not_sanitized() {
         // assert forall ... by { } inside verus! — Verus proof code, not sanitized
         let src = "verus! {\nfn test() {\n    assert forall|i: int| #[trigger] f(i) by { lemma(i); };\n}\n}";
-        assert_eq!(sanitize_tactic_blocks(src), src);
+        assert_eq!(sanitize_tactic_blocks(src, false), src);
     }
 
     #[test]
@@ -463,7 +523,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
                 assert(true) by { lemma_call(); };\n\
             }\n\
         }";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert!(!sanitized.contains("omega"), "tactic block should be sanitized");
         assert!(sanitized.contains("lemma_call"), "assert-by should NOT be sanitized");
     }
@@ -471,7 +531,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     #[test]
     fn test_verus_macro_spec_fn_not_sanitized() {
         let src = "verus! {\nspec fn double(x: nat) -> nat { x + x }\n}";
-        assert_eq!(sanitize_tactic_blocks(src), src);
+        assert_eq!(sanitize_tactic_blocks(src, false), src);
     }
 
     // --- Paren/bracket macros stay as token trees (not parsed as statements) ---
@@ -479,13 +539,13 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     #[test]
     fn test_paren_macro_not_parsed() {
         let src = "println!(\"by {{ omega }}\");";
-        assert_eq!(sanitize_tactic_blocks(src), src);
+        assert_eq!(sanitize_tactic_blocks(src, false), src);
     }
 
     #[test]
     fn test_bracket_macro_not_parsed() {
         let src = "vec![1, 2, 3];";
-        assert_eq!(sanitize_tactic_blocks(src), src);
+        assert_eq!(sanitize_tactic_blocks(src, false), src);
     }
 
     // --- attributed_expression (#[trigger]) in quantifiers ---
@@ -495,14 +555,14 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
         // #[trigger] before the condition — must parse without errors
         // so the `by { }` is recognized as assert-by, NOT a stray tactic_block
         let src = "verus! {\nfn test() {\n    assert forall|x: int| #[trigger] f(x) by { lem(x); };\n}\n}";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert!(sanitized.contains("lem(x)"), "#[trigger] assert-by must not be sanitized");
     }
 
     #[test]
     fn test_trigger_in_forall_expr() {
         let src = "verus! {\nspec fn p() -> bool { forall|x: int| #[trigger] f(x) }\n}";
-        assert_eq!(sanitize_tactic_blocks(src), src);
+        assert_eq!(sanitize_tactic_blocks(src, false), src);
     }
 
     #[test]
@@ -517,7 +577,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
                 \u{b7} omega\n\
             }\n\
         }";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert!(!sanitized.contains('\u{b7}'), "· must be sanitized: got {sanitized}");
         assert_eq!(sanitized.len(), src.len());
     }
@@ -525,7 +585,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     #[test]
     fn test_trigger_in_exists_expr() {
         let src = "verus! {\nspec fn p() -> bool { exists|x: int| #[trigger] f(x) }\n}";
-        assert_eq!(sanitize_tactic_blocks(src), src);
+        assert_eq!(sanitize_tactic_blocks(src, false), src);
     }
 
     // --- Lean syntax edge cases inside tactic blocks (the whole point of FileLoader) ---
@@ -534,7 +594,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     fn test_lean_line_comment_with_brace_in_verus() {
         // `-- comment }` must not close the tactic block
         let src = "verus! {\nproof fn t() ensures true\nby {\n    -- comment with } brace\n    omega\n}\n}";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert_eq!(sanitized.matches('}').count(), 2); // verus! closing } + tactic closing }
         assert_eq!(sanitized.len(), src.len());
     }
@@ -543,7 +603,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     fn test_lean_block_comment_with_brace_in_verus() {
         // `/- comment } -/` must not close the tactic block
         let src = "verus! {\nproof fn t() ensures true\nby {\n    /- comment } -/\n    omega\n}\n}";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert_eq!(sanitized.matches('}').count(), 2);
         assert_eq!(sanitized.len(), src.len());
     }
@@ -552,7 +612,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     fn test_string_with_brace_in_tactic() {
         // `"}"` inside tactic block must not close the block
         let src = "verus! {\nproof fn t() ensures true\nby {\n    have h := \"}\"\n    omega\n}\n}";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert_eq!(sanitized.matches('}').count(), 2);
         assert_eq!(sanitized.len(), src.len());
     }
@@ -561,7 +621,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     fn test_nested_braces_in_tactic() {
         // Nested { } inside tactic block must balance correctly
         let src = "verus! {\nproof fn t() ensures true\nby {\n    { exact h }\n    omega\n}\n}";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert_eq!(sanitized.matches('}').count(), 2);
         assert_eq!(sanitized.len(), src.len());
     }
@@ -569,7 +629,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     #[test]
     fn test_empty_tactic_block() {
         let src = "verus! {\nproof fn t() ensures true by { }\n}";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert_eq!(sanitized.len(), src.len());
     }
 
@@ -579,7 +639,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
             proof fn a() ensures true by { omega }\n\
             proof fn b() ensures true by { simp }\n\
         }";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert!(!sanitized.contains("omega"));
         assert!(!sanitized.contains("simp"));
         assert_eq!(sanitized.len(), src.len());
@@ -588,7 +648,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     #[test]
     fn test_requires_and_ensures_before_by() {
         let src = "verus! {\nproof fn t(x: nat)\n    requires x > 0\n    ensures x >= 1\nby {\n    omega\n}\n}";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert!(!sanitized.contains("omega"));
         assert!(sanitized.contains("requires"));
         assert!(sanitized.contains("ensures"));
@@ -600,18 +660,18 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
     fn test_garbage_input() {
         // Totally invalid input — tree-sitter should handle gracefully
         let src = "}{][)(🎉🎉🎉 not valid rust at all !!!";
-        assert_eq!(sanitize_tactic_blocks(src), src);
+        assert_eq!(sanitize_tactic_blocks(src, false), src);
     }
 
     #[test]
     fn test_empty_input() {
-        assert_eq!(sanitize_tactic_blocks(""), "");
+        assert_eq!(sanitize_tactic_blocks("", false), "");
     }
 
     #[test]
     fn test_only_comments() {
         let src = "// just a comment\n/* block */";
-        assert_eq!(sanitize_tactic_blocks(src), src);
+        assert_eq!(sanitize_tactic_blocks(src, false), src);
     }
 
     // --- tactus_auto-aware sanitization of proof_block + assert_expression ---
@@ -626,7 +686,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
                 proof { have h : True := by omega }\n\
             }\n\
         }";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert!(!sanitized.contains("omega"), "proof{{}} inside tactus_auto fn should be sanitized");
         assert!(!sanitized.contains("have h"), "proof{{}} content should be wiped");
         assert_eq!(sanitized.len(), src.len());
@@ -642,7 +702,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
                 assert(x >= 0) by { omega }\n\
             }\n\
         }";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert!(!sanitized.contains("omega"), "assert-by inside tactus_auto should be sanitized");
         assert_eq!(sanitized.len(), src.len());
     }
@@ -656,7 +716,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
                 assert forall|i: int| #[trigger] f(i) by { intro i; omega }\n\
             }\n\
         }";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert!(!sanitized.contains("omega"), "assert-forall-by inside tactus_auto should be sanitized");
         assert!(!sanitized.contains("intro i"), "tactic body wiped");
         assert_eq!(sanitized.len(), src.len());
@@ -672,7 +732,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
                 proof { assert(true); lemma_helper(); }\n\
             }\n\
         }";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert!(sanitized.contains("lemma_helper"),
             "proof{{}} in non-tactus_auto fn must stay: got {}", sanitized);
         assert_eq!(sanitized.len(), src.len());
@@ -687,7 +747,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
                 assert(x >= 0) by { lemma_nonneg(x); }\n\
             }\n\
         }";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert!(sanitized.contains("lemma_nonneg"),
             "assert-by in non-tactus_auto fn must stay: got {}", sanitized);
         assert_eq!(sanitized.len(), src.len());
@@ -706,7 +766,7 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
                 proof { assert(true); vstd_lemma(); }\n\
             }\n\
         }";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert!(!sanitized.contains("omega"),
             "tactus_auto fn's proof{{}} sanitized");
         assert!(sanitized.contains("vstd_lemma"),
@@ -724,10 +784,107 @@ fn f(x: u64) -> (r: u64) requires x < 100 ensures r == 0 {
                 assert(x == x) by { exact ⟨rfl, rfl⟩ }\n\
             }\n\
         }";
-        let sanitized = sanitize_tactic_blocks(src);
+        let sanitized = sanitize_tactic_blocks(src, false);
         assert!(!sanitized.contains("⟨"),
             "Unicode inside tactus_auto assert-by must be sanitized");
         assert_eq!(sanitized.len(), src.len());
+    }
+
+    // --- lean_backend "flag decides" sanitization (2026-07-02) ---
+
+    #[test]
+    fn test_lean_backend_execfn_proof_block_sanitized() {
+        // In a --lean-backend crate, a plain exec fn's `proof { }` is
+        // Lean tactic text — sanitized without any attribute.
+        let src = "verus! {\n\
+            fn compute() {\n\
+                proof { have h : True := by omega }\n\
+            }\n\
+        }";
+        let sanitized = sanitize_tactic_blocks(src, true);
+        assert!(!sanitized.contains("omega"),
+            "attr-less exec fn's proof{{}} sanitized under lean_backend");
+        assert_eq!(sanitized.len(), src.len());
+    }
+
+    #[test]
+    fn test_lean_backend_execfn_assert_by_sanitized() {
+        let src = "verus! {\n\
+            fn compute(x: u32) {\n\
+                assert(x >= 0) by { omega }\n\
+            }\n\
+        }";
+        let sanitized = sanitize_tactic_blocks(src, true);
+        assert!(!sanitized.contains("omega"),
+            "attr-less exec fn's assert-by sanitized under lean_backend");
+        assert_eq!(sanitized.len(), src.len());
+    }
+
+    #[test]
+    fn test_lean_backend_z3_optout_preserved() {
+        // `#[verifier::z3]` keeps the fn (routing AND blocks) on the
+        // Verus/Z3 side — its proof blocks are Verus code, untouched.
+        let src = "verus! {\n\
+            #[verifier::z3]\n\
+            fn compute() {\n\
+                proof { assert(true); lemma_helper(); }\n\
+            }\n\
+        }";
+        let sanitized = sanitize_tactic_blocks(src, true);
+        assert!(sanitized.contains("lemma_helper"),
+            "z3-marked fn's proof{{}} preserved under lean_backend: got {}", sanitized);
+        assert_eq!(sanitized.len(), src.len());
+    }
+
+    #[test]
+    fn test_lean_backend_proof_fn_assert_by_preserved() {
+        // Ordinary (non-tactic-bodied) proof fns stay Z3-routed even in
+        // lean-backend crates; their assert-bys are Verus proof code.
+        let src = "verus! {\n\
+            proof fn lem(x: int) ensures x == x {\n\
+                assert(x == x) by { lemma_refl(x); }\n\
+            }\n\
+        }";
+        let sanitized = sanitize_tactic_blocks(src, true);
+        assert!(sanitized.contains("lemma_refl"),
+            "proof fn's assert-by preserved under lean_backend: got {}", sanitized);
+        assert_eq!(sanitized.len(), src.len());
+    }
+
+    #[test]
+    fn test_lean_backend_spec_fn_preserved() {
+        let src = "verus! {\nspec fn double(x: nat) -> nat { x + x }\n}";
+        assert_eq!(sanitize_tactic_blocks(src, true), src);
+    }
+
+    #[test]
+    fn test_lean_backend_mixed_exec_and_proof_fns() {
+        // The per-fn discrimination under the flag: exec fn's block
+        // sanitized, proof fn's block preserved, side by side.
+        let src = "verus! {\n\
+            fn a() {\n\
+                proof { have h : True := by omega }\n\
+            }\n\
+            proof fn b() ensures true {\n\
+                assert(true) by { vstd_lemma(); }\n\
+            }\n\
+        }";
+        let sanitized = sanitize_tactic_blocks(src, true);
+        assert!(!sanitized.contains("omega"), "exec fn's proof{{}} sanitized");
+        assert!(sanitized.contains("vstd_lemma"),
+            "proof fn's assert-by preserved: got {}", sanitized);
+    }
+
+    #[test]
+    fn test_flag_off_execfn_blocks_preserved() {
+        // Without --lean-backend the legacy semantics hold: attr-less
+        // exec fns keep Verus proof blocks (vstd, mixed crates).
+        let src = "verus! {\n\
+            fn compute() {\n\
+                proof { assert(true); lemma_helper(); }\n\
+            }\n\
+        }";
+        assert_eq!(sanitize_tactic_blocks(src, false), src);
     }
 
     // --- read_tactic_from_source edge cases ---

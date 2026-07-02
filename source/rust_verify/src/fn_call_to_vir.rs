@@ -87,10 +87,23 @@ pub(crate) fn tactus_span_from<'tcx>(
 /// fns. Outside them (i.e., vstd and regular Verus exec fns), we leave
 /// `ExprX::AssertBy::tactic_span` as `None` so `ast_to_sst`'s normal
 /// DeadEnd desugaring runs unchanged.
-pub(crate) fn enclosing_fn_is_tactus_auto(bctx: &BodyCtxt<'_>) -> bool {
+/// Whether the enclosing fn's `proof { … }` / `assert(..) by { … }`
+/// blocks are Lean tactic text (so the FileLoader sanitized them and a
+/// `TactusSpan` should be synthesized to recover the verbatim text):
+/// either the legacy per-fn `#[verifier::tactus_auto]` marker, or —
+/// "flag decides" (2026-07-02) — a Lean-routed fn in a `--lean-backend`
+/// crate (exec mode, no `#[verifier::z3]` opt-out). Must mirror both
+/// the FileLoader's textual gate (`file_loader::is_lean_routed_exec_fn`)
+/// and the routing rule (`verifier.rs` `Body(Normal)` dispatch).
+pub(crate) fn enclosing_fn_has_lean_tactic_blocks(bctx: &BodyCtxt<'_>) -> bool {
     let attrs = bctx.ctxt.tcx.get_all_attrs(bctx.fun_id);
     match crate::attributes::get_verifier_attrs(attrs, None) {
-        Ok(v) => v.tactus_auto,
+        Ok(v) => {
+            v.tactus_auto
+                || (bctx.ctxt.cmd_line_args.lean_backend
+                    && bctx.mode == Mode::Exec
+                    && !v.tactus_z3)
+        }
         Err(_) => false,
     }
 }
@@ -1259,7 +1272,7 @@ fn verus_item_to_vir<'tcx, 'a>(
                     // semantics. `args[1].span` covers the `{ … }`
                     // including braces, which is what
                     // `read_tactic_from_source` expects.
-                    let tactus = if enclosing_fn_is_tactus_auto(bctx) {
+                    let tactus = if enclosing_fn_has_lean_tactic_blocks(bctx) {
                         tactus_span_from(bctx.ctxt.tcx, args[1].span, TactusKind::AssertBy)
                     } else {
                         None
@@ -2521,7 +2534,7 @@ fn extract_assert_forall_by<'tcx>(
             // The local `expr` was shadowed to `&body.value` at line
             // 2421 — its span covers the closure body (the `{ … }`
             // after `by`).
-            let tactus = if enclosing_fn_is_tactus_auto(bctx) {
+            let tactus = if enclosing_fn_has_lean_tactic_blocks(bctx) {
                 tactus_span_from(bctx.ctxt.tcx, expr.span, TactusKind::AssertBy)
             } else {
                 None

@@ -297,6 +297,72 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === "Flag decides" (2026-07-02): block language follows routing ===
+// In a `--lean-backend` crate a plain exec fn's `proof { }` /
+// `assert … by { }` blocks ARE Lean tactic text — no
+// `#[verifier::tactus_auto]` needed (the attr remains accepted and
+// redundant here; it is still the opt-in marker for non-lean-backend
+// crates). `#[verifier::z3]` keeps a fn — routing AND block language —
+// on the Verus/Z3 side. These three tests pin both directions.
+
+// Attr-less exec fn, Lean-tactic proof block. The spec-method unfold is
+// load-bearing: without the block the ensures can't see through `view`.
+test_verify_one_file! {
+    #[test] test_lean_backend_execfn_lean_proof_block_no_attr verus_code! {
+        struct Holder { v: u8 }
+        impl Holder { spec fn view(&self) -> u8 { self.v } }
+
+        fn get(h: &Holder) -> (r: u8)
+            ensures r == h.view()
+        {
+            proof { simp_all [Holder.view] }
+            h.v
+        }
+    } => Ok(())
+}
+
+// Attr-less exec fn, Lean-tactic assert-by. `intros; assumption` is not
+// valid Verus proof code — this verifies only if the block is treated
+// as Lean tactic text.
+test_verify_one_file! {
+    #[test] test_lean_backend_execfn_lean_assert_by_no_attr verus_code! {
+        fn buried_invariant_fact(n: u64) -> (r: u64)
+            requires n <= 100,
+        {
+            let mut i: u64 = 0;
+            let mut acc: u64 = 0;
+            while i < n
+                invariant
+                    i <= n,
+                    n <= 100,
+                    acc <= i,
+                decreases n - i
+            {
+                assert(acc <= i) by { intros; assumption };
+                acc = acc + 1;
+                i = i + 1;
+            }
+            acc
+        }
+    } => Ok(())
+}
+
+// `#[verifier::z3]` opt-out: the fn verifies via Z3 and its proof block
+// is Verus ghost code. The `reveal` is load-bearing — if the block were
+// wrongly sanitized away, the assert would fail.
+test_verify_one_file! {
+    #[test] test_lean_backend_z3_optout_verus_proof_block verus_code! {
+        #[verifier::opaque]
+        spec fn secret() -> int { 42 }
+
+        #[verifier::z3]
+        fn g() {
+            proof { reveal(secret); }
+            assert(secret() == 42);
+        }
+    } => Ok(())
+}
+
 // === Source map: error includes tactic line number ===
 
 test_verify_one_file! {
