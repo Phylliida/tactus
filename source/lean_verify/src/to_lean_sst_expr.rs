@@ -499,6 +499,35 @@ fn render_checked_decrease_arg(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> 
 /// is in scope (requires rendering, which unwraps via `let x := x.deref`
 /// shadows instead) — it falls back to the spanned typ, identical to the
 /// prior behaviour.
+/// Extra `.deref`s a TUPLE-slot projection needs to land at its CLAIMED
+/// typ. Tuple typ args keep their ref decorations (`(&Sym, &Sym)` =
+/// `Tuple[Ref(Sym), Ref(Sym)]`) while the SST strips them from the
+/// projection's claimed result typ — see the `Field` arm's comment
+/// (cluster bug 5). Returns `slot_depth − claimed_depth`, saturating
+/// (a claimed typ DEEPER than its slot has not been observed; it would
+/// need a `.mk` wrap, not a deref — if it ever appears, the sanity
+/// check / Lean elaboration fails loud, not silent). Returns 0 for
+/// non-tuple datatypes and any unexpected shape.
+fn tuple_slot_extra_derefs(base: &Exp, field_opr: &FieldOpr, claimed: &Typ) -> usize {
+    if !matches!(field_opr.datatype, Dt::Tuple(_)) {
+        return 0;
+    }
+    let Ok(idx) = field_opr.field.as_str().parse::<usize>() else { return 0 };
+    // Peel outer wrappers/boxing to reach the tuple typ carrying the
+    // slot decorations (the base render already deref'd to the tuple).
+    let mut t = &*base.typ;
+    loop {
+        match t {
+            TypX::Decorate(_, _, inner) | TypX::Boxed(inner) => t = &**inner,
+            _ => break,
+        }
+    }
+    let TypX::Datatype(Dt::Tuple(_), args, _) = t else { return 0 };
+    let Some(slot) = args.get(idx) else { return 0 };
+    crate::expr_shared::count_ref_decorations(slot)
+        .saturating_sub(crate::expr_shared::count_ref_decorations(claimed))
+}
+
 fn sst_lean_wrap_count(inner: &Exp, ctx: &crate::expr_shared::RenderCtx) -> usize {
     // The SST wraps a param read in a transparent `Unbox` (and may add
     // CoerceMode/Trigger) where the Exp path has a bare Var — peel those
@@ -652,7 +681,23 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
         ExpX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
             let inner_rendered = sst_exp_to_ast_checked_with_ctx(inner, ctx)?;
             let n = sst_lean_wrap_count(inner, ctx);
-            field_proj_opr(apply_deref_chain(inner_rendered, n), field_opr).node
+            let projected = field_proj_opr(apply_deref_chain(inner_rendered, n), field_opr);
+            // Tuple slots KEEP their ref decorations in the tuple's typ
+            // args (`(&Sym, &Sym)` is `Tuple[Ref(Sym), Ref(Sym)]`) while
+            // the SST STRIPS them from the projection's claimed result
+            // typ (`tmp.1 : Sym`) — so the rendered projection is
+            // wrapper-typed but every downstream consumer (IsVariant,
+            // nested Field, calls) coerces from the bare claimed typ.
+            // Bridge here: deref the projection down from the slot's
+            // depth to the claimed typ's depth, restoring the invariant
+            // "rendered depth == claimed typ depth" that the rest of the
+            // renderer assumes (BUG-vstd-preamble-cluster.md bug 5 —
+            // `Tactus.Ref.isGen` on a match over a tuple of refs).
+            // Non-tuple datatypes don't exhibit the mismatch (their SST
+            // field typs agree with the declared field typs), so this is
+            // tuple-scoped by evidence.
+            let extra = tuple_slot_extra_derefs(inner, field_opr, &e.typ);
+            apply_deref_chain(projected, extra).node
         }
         // `IsVariant { datatype, variant }` is the desugared form
         // `ast_simplify` produces when lowering `match scrutinee { Variant { … } => … }`
@@ -662,7 +707,15 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
         //
         // Wrapper coercion (β refactor Piece 2): same shape as Field —
         // peel wrapper layers before the `.is<Variant>` projection.
-        ExpX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => {
+        ExpX::UnaryOpr(UnaryOpr::IsVariant { datatype, variant }, inner) => {
+            // A tuple has exactly one "variant" — its test is vacuously
+            // true. The general path would emit `.istuple%2`, a field
+            // that exists on no Lean type (and `%` would leak unsanitized)
+            // — cluster bug 6. Match-desugared tuple patterns produce
+            // these tests routinely.
+            if matches!(datatype, Dt::Tuple(_)) {
+                return Ok(ExprNode::LitBool(true));
+            }
             let inner_rendered = sst_exp_to_ast_checked_with_ctx(inner, ctx)?;
             let n = sst_lean_wrap_count(inner, ctx);
             is_variant_node(variant, apply_deref_chain(inner_rendered, n))

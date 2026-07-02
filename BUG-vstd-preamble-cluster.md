@@ -176,18 +176,31 @@ domain), safe.
 
 ## Fn-specific bugs in the same crates (visible in `is_inverse_pair_exec`)
 
-### (5) Enum variant/field tests through `Tactus.Ref` missing `.deref`
+### (5) Enum variant/field tests through `Tactus.Ref` missing `.deref` — **FIXED 2026-07-02**
 
 `Invalid field isGen: The environment does not contain Tactus.Ref.isGen`
 (likewise `Gen_val0` etc.) — a variant test / field projection applied
-to the wrapper-typed value instead of the deref'd inner. Wrapper-depth
-(U2) family.
+to the wrapper-typed value instead of the deref'd inner.
 
-### (6) `istuple` variant test on Lean `Prod`
+**Root cause (probe: `match (s1, s2)` over `(&Sym, &Sym)`):** tuple typ
+args KEEP their ref decorations (`Tuple[Ref(Sym), Ref(Sym)]`) while the
+SST STRIPS them from a tuple projection's claimed result typ
+(`tmp.1 : Sym`) — so the rendered `.1` is wrapper-typed but every
+downstream consumer coerces from the bare claimed typ, and the deref
+never happens. **Fix:** the SST `Field` arm bridges slot-depth →
+claimed-depth (`tuple_slot_extra_derefs`), restoring the renderer's
+"rendered depth == claimed typ depth" invariant. Tuple-scoped by
+evidence (non-tuple field typs agree between SST and declaration).
 
-`Invalid field istuple: The environment does not contain Prod.istuple` —
-tuple "variant test" should render as trivially `True` (tuples have one
-variant), not as a `.istuple` projection.
+### (6) `istuple` variant test on Lean `Prod` — **FIXED 2026-07-02**
+
+`Invalid field istuple: The environment does not contain Prod.istuple`
+(and the `%` in `istuple%2` leaked unsanitized). A tuple has exactly
+one "variant" — the desugared match's variant test is vacuously true.
+**Fix:** `IsVariant` on `Dt::Tuple` renders `True`, in both renderers.
+Both pinned by `test_exec_match_tuple_of_refs` (the
+`is_inverse_pair_exec` shape, verifying end-to-end with the standard
+explicit spec-unfold proof block).
 
 ## Fix order (each: miniature pin → fix → full e2e + unit gates → commit)
 
