@@ -2855,6 +2855,23 @@ fn emit_call_precondition_theorem(
 // Ret-substitution detection (#128) lives in `crate::ret_subst`.
 use crate::ret_subst::{extract_top_level_eq_for, is_trivial_true};
 
+/// A returned-mut-ref prophecy for one call whose dest is `MutRef`-typed.
+/// Named (vs a positional tuple) per the codebase's convention — each field
+/// is read at a different site (`var` at the binder + registration, `final_var`
+/// at the ensures rewrite, both + `inner_typ` at the post-render subst), so
+/// names beat `_`-heavy destructures.
+struct ReturnProphecy {
+    /// The prophecy variable `P` (`*final` of the returned ref), ∀-bound at
+    /// the call's `MutRef T` wrapper typ.
+    var: crate::lean_name::LeanName,
+    /// Synthetic VIR-AST `VarIdent` the ensures rewrite produces for
+    /// `*final(ret)`; its `from_var_ident` LeanName is the post-render subst key.
+    final_var: VarIdent,
+    /// The inner `T` (return typ with one ref decoration stripped) — for the
+    /// `P.deref` bound and the `*final` inner value.
+    inner_typ: Typ,
+}
+
 /// Push the post-call frames onto the obligation context. Reading
 /// the resulting goal top-down:
 ///
@@ -2898,23 +2915,9 @@ use crate::ret_subst::{extract_top_level_eq_for, is_trivial_true};
 /// Falls through to the ∀-path when no `r == E` conjunct exists, when
 /// E mentions ret (self-referential), or when ensures has a non-And
 /// top-level shape (Or, Implies, etc.). See `extract_top_level_eq_for`.
-/// A returned-mut-ref prophecy for one call whose dest is `MutRef`-typed.
-/// Named (vs a positional tuple) per the codebase's convention — each field
-/// is read at a different site (`var` at the binder + registration, `final_var`
-/// at the ensures rewrite, both + `inner_typ` at the post-render subst), so
-/// names beat `_`-heavy destructures.
-struct ReturnProphecy {
-    /// The prophecy variable `P` (`*final` of the returned ref), ∀-bound at
-    /// the call's `MutRef T` wrapper typ.
-    var: crate::lean_name::LeanName,
-    /// Synthetic VIR-AST `VarIdent` the ensures rewrite produces for
-    /// `*final(ret)`; its `from_var_ident` LeanName is the post-render subst key.
-    final_var: VarIdent,
-    /// The inner `T` (return typ with one ref decoration stripped) — for the
-    /// `P.deref` bound and the `*final` inner value.
-    inner_typ: Typ,
-}
-
+///
+/// This fn is the phase SEQUENCE; each phase's mechanics live in its
+/// own helper directly below.
 fn push_post_call_frames(
     callee: &FunctionX,
     ensures: &[&Expr],
@@ -2925,60 +2928,107 @@ fn push_post_call_frames(
     e: &mut ObligationEmitter,
 ) -> OblCtx {
     let mut new_obl = obl.clone();
+    let return_prophecy = mint_return_prophecy(callee, dest, e);
 
-    // Returned-mut-ref prophecy (general over any `MutRef`-typed return,
-    // not a `vec_index_mut` special-case). When this call returns a
-    // `&mut T` into `dest`, the callee's ensures reference `*final(ret)`
-    // — e.g. vstd's `vec_index_mut`: `final(vec)@ == old(vec)@.update(i,
-    // *final(element))`. That `*final` is a PROPHECY: its value is fixed
-    // by a LATER call on `dest` (`bump(dest)`). We mint a prophecy var
-    // `P`, ∀-bind it here, render the ensures' `*final(ret)` AS `P`
-    // (`rewrite_return_final_ref` → `Var(<ret>_final_tactus)`, then a
-    // post-render subst `<ret>_final_tactus → P`), and register
-    // `dest → P` so the resolving call reuses `P` for its post-state
-    // (`build_call_substitutions`) instead of a fresh existential. The
-    // chain `final(vec)@[i] == P == *old(dest)+1` then closes. Without
-    // this, the #95 rewrite collapses `*final(ret)` and `*current(ret)`
-    // alike to `Var(ret) → fresh_ret`, so the update inserts the current
-    // element and the prophecy is lost.
-    let return_prophecy: Option<ReturnProphecy> =
-        if dest.is_some() && is_mut_ref_typ(&callee.ret.x.typ, false) {
-            let var = crate::lean_name::LeanName::synthetic(
-                format!("_tactus_mut_post_{}", e.next_id()));
-            let ret_ident = &callee.ret.x.name;
-            // Synthetic VIR-AST VarIdent the ensures rewrite produces for
-            // `*final(ret)`; the post-render subst key is
-            // `from_var_ident(final_var)` (same VarIdent → same LeanName).
-            let final_var = VarIdent(
-                Arc::new(format!("{}_final_tactus", sanitize(&ret_ident.0))),
-                ret_ident.1.clone(),
-            );
-            let inner_typ =
-                crate::to_lean_expr::strip_one_ref_decoration(&callee.ret.x.typ);
-            Some(ReturnProphecy { var, final_var, inner_typ })
-        } else {
-            None
-        };
+    // Phase 1, then the prophecy ∀-bind (BEFORE the ensures Hyp, which
+    // references `P`).
+    push_mut_arg_binders(callee, subst, obl, &mut new_obl);
+    push_prophecy_frames(return_prophecy.as_ref(), callee, subst, dest, &mut new_obl);
 
-    // Phase 1: per-&mut existential binder + type-inv hypothesis.
-    // `subst.mut_args` (#105) bundles param_idx, caller_var, and
-    // fresh into one struct — no parallel-array lookups.
-    //
-    // **Wrapper-arch typing (TypedExpr migration):** the existential
-    // is bound at the callee's declared param typ — which for
-    // new-mut-ref `&mut T` is `MutRef T` (wrapper-typed). Use sites
-    // (bound predicate, substituted ensures via ens_subst, rebind
-    // frame) want the inner-typed view — they reason about the value
-    // T, not the wrapper.
-    //
-    // Wrap the existential in `TypedExpr` and use `into_slot(inner)`
-    // to produce the deref'd form for each use site. For non-mut args
-    // and legacy `is_mut: true` with bare typ, `into_slot` is a no-op
-    // (wrapper depth already matches inner). For new-mut-ref the
-    // coercion inserts `.deref` to bridge from the wrapper-typed
-    // existential to the inner-typed use slot. Mirrors the pattern
-    // at `fn_binders` line ~3389 where param-level `&mut` binders
-    // emit bounds via `.deref` for the same reason.
+    // Phases 2/3 — or the #128 substitution path replacing them.
+    let substituted_ensures =
+        render_call_ensures(ensures, subst, return_prophecy.as_ref(), callee, render_ctx);
+    let (dest_value, use_dest_name) =
+        push_ret_frames(substituted_ensures, callee, subst, dest, &mut new_obl);
+
+    // Phase 4.
+    push_mut_rebinds(callee, subst, &mut new_obl);
+
+    // Phase 5: dest binding for the call's return (`let r = foo(…)`).
+    // `dest_value` is `Var(fresh_ret_name)` in the ∀-path or `E` in
+    // the substitution path (#128). Skipped when `use_dest_name`
+    // (Approach A): the ∀-binder already IS the dest, so the alias
+    // `let x := x` is trivial and dropped.
+    if let Some(dest_ident) = dest {
+        if !use_dest_name {
+            new_obl.frames.push_back(CtxFrame::Let(
+                crate::lean_name::LeanName::from_var_ident(dest_ident),
+                dest_value,
+            ));
+        }
+    }
+
+    new_obl
+}
+
+/// Returned-mut-ref prophecy (general over any `MutRef`-typed return,
+/// not a `vec_index_mut` special-case). When this call returns a
+/// `&mut T` into `dest`, the callee's ensures reference `*final(ret)`
+/// — e.g. vstd's `vec_index_mut`: `final(vec)@ == old(vec)@.update(i,
+/// *final(element))`. That `*final` is a PROPHECY: its value is fixed
+/// by a LATER call on `dest` (`bump(dest)`). We mint a prophecy var
+/// `P`, ∀-bind it here, render the ensures' `*final(ret)` AS `P`
+/// (`rewrite_return_final_ref` → `Var(<ret>_final_tactus)`, then a
+/// post-render subst `<ret>_final_tactus → P`), and register
+/// `dest → P` so the resolving call reuses `P` for its post-state
+/// (`build_call_substitutions`) instead of a fresh existential. The
+/// chain `final(vec)@[i] == P == *old(dest)+1` then closes. Without
+/// this, the #95 rewrite collapses `*final(ret)` and `*current(ret)`
+/// alike to `Var(ret) → fresh_ret`, so the update inserts the current
+/// element and the prophecy is lost.
+fn mint_return_prophecy(
+    callee: &FunctionX,
+    dest: Option<&VarIdent>,
+    e: &mut ObligationEmitter,
+) -> Option<ReturnProphecy> {
+    if dest.is_some() && is_mut_ref_typ(&callee.ret.x.typ, false) {
+        let var = crate::lean_name::LeanName::synthetic(
+            format!("_tactus_mut_post_{}", e.next_id()));
+        let ret_ident = &callee.ret.x.name;
+        // Synthetic VIR-AST VarIdent the ensures rewrite produces for
+        // `*final(ret)`; the post-render subst key is
+        // `from_var_ident(final_var)` (same VarIdent → same LeanName).
+        let final_var = VarIdent(
+            Arc::new(format!("{}_final_tactus", sanitize(&ret_ident.0))),
+            ret_ident.1.clone(),
+        );
+        let inner_typ =
+            crate::to_lean_expr::strip_one_ref_decoration(&callee.ret.x.typ);
+        Some(ReturnProphecy { var, final_var, inner_typ })
+    } else {
+        None
+    }
+}
+
+/// Phase 1: per-&mut existential binder + type-inv hypothesis.
+/// `subst.mut_args` (#105) bundles param_idx, caller_var, and
+/// fresh into one struct — no parallel-array lookups.
+///
+/// **Wrapper-arch typing (TypedExpr migration):** the existential
+/// is bound at the callee's declared param typ — which for
+/// new-mut-ref `&mut T` is `MutRef T` (wrapper-typed). Use sites
+/// (bound predicate, substituted ensures via ens_subst, rebind
+/// frame) want the inner-typed view — they reason about the value
+/// T, not the wrapper.
+///
+/// Wrap the existential in `TypedExpr` and use `into_slot(inner)`
+/// to produce the deref'd form for each use site. For non-mut args
+/// and legacy `is_mut: true` with bare typ, `into_slot` is a no-op
+/// (wrapper depth already matches inner). For new-mut-ref the
+/// coercion inserts `.deref` to bridge from the wrapper-typed
+/// existential to the inner-typed use slot. Mirrors the pattern
+/// at `fn_binders` line ~3389 where param-level `&mut` binders
+/// emit bounds via `.deref` for the same reason.
+///
+/// `obl` is the UNMUTATED pre-call ctx (for the reused-prophecy
+/// check, which must key off what `build_call_substitutions` saw);
+/// frames push onto `new_obl`.
+fn push_mut_arg_binders(
+    callee: &FunctionX,
+    subst: &CallSubstitutions,
+    obl: &OblCtx,
+    new_obl: &mut OblCtx,
+) {
     for info in &subst.mut_args {
         // Reused returned-mut-ref prophecy: `info.fresh` IS the prophecy `P`
         // registered for this arg's local (derived here from `obl`, the
@@ -3015,13 +3065,22 @@ fn push_post_call_frames(
             new_obl.frames.push_back(CtxFrame::Hyp(pred));
         }
     }
+}
 
-    // Returned-mut-ref prophecy: ∀-bind `P` at the inner T (e.g. `P :
-    // Int` for `&mut u8`) + its type-inv bound, and register `dest → P`,
-    // BEFORE the ensures Hyp (which references `P` via the rewrite +
-    // post-render subst below). The binder lives in `new_obl`, which
-    // flows to `after` — so the resolving call (`bump(dest)`) sees `P`
-    // in scope and reuses it.
+/// Returned-mut-ref prophecy: ∀-bind `P` at the inner T (e.g. `P :
+/// Int` for `&mut u8`) + its type-inv bound, and register `dest → P`,
+/// BEFORE the ensures Hyp (which references `P` via the rewrite +
+/// post-render subst in `render_call_ensures`). The binder lives in
+/// `new_obl`, which flows to `after` — so the resolving call
+/// (`bump(dest)`) sees `P` in scope and reuses it. No-op when there
+/// is no prophecy.
+fn push_prophecy_frames(
+    return_prophecy: Option<&ReturnProphecy>,
+    callee: &FunctionX,
+    subst: &CallSubstitutions,
+    dest: Option<&VarIdent>,
+    new_obl: &mut OblCtx,
+) {
     if let Some(rp) = &return_prophecy {
         // Bind `P` at the return's `MutRef T` typ (wrapper) — matching
         // what the resolving call's machinery expects (it `.deref`s the
@@ -3040,21 +3099,29 @@ fn push_post_call_frames(
             new_obl.register_prophecy(d, rp.var.clone());
         }
     }
+}
 
-    // Build the substituted ensures conjunction once. Used by both
-    // the substitution path (#128) and the ∀-path. The `ensures`
-    // slice was built by the caller via
-    // `call_inlining::collect_inlined_at_call`: spec_callee's
-    // ensures, plus callee's own ensures when callee is a
-    // TraitMethodImpl (#86 impl-strengthening — caller gets the
-    // conjunction of trait and impl contracts). Verus enforces
-    // impl ⇒ trait, so the conjunction is satisfiable.
-    //
-    // `subst.ens_subst` includes keys for both callee.params and
-    // spec_callee.params (built by the two passes in
-    // `build_call_substitutions`), plus both ret names → fresh_ret_name.
-    // So substituting either the trait's or the impl's clauses
-    // works regardless of whether trait/impl param names match.
+/// Build the substituted ensures conjunction once (`None` when the
+/// callee has no ensures). Used by both the substitution path (#128)
+/// and the ∀-path. The `ensures` slice was built by the caller via
+/// `call_inlining::collect_inlined_at_call`: spec_callee's
+/// ensures, plus callee's own ensures when callee is a
+/// TraitMethodImpl (#86 impl-strengthening — caller gets the
+/// conjunction of trait and impl contracts). Verus enforces
+/// impl ⇒ trait, so the conjunction is satisfiable.
+///
+/// `subst.ens_subst` includes keys for both callee.params and
+/// spec_callee.params (built by the two passes in
+/// `build_call_substitutions`), plus both ret names → fresh_ret_name.
+/// So substituting either the trait's or the impl's clauses
+/// works regardless of whether trait/impl param names match.
+fn render_call_ensures(
+    ensures: &[&Expr],
+    subst: &CallSubstitutions,
+    return_prophecy: Option<&ReturnProphecy>,
+    callee: &FunctionX,
+    render_ctx: &crate::expr_shared::RenderCtx,
+) -> Option<LExpr> {
     let ensures_clauses: Vec<LExpr> = ensures.iter()
         .map(|expr| {
             let rewritten = rewrite_varat_for_mut_params(expr, &subst.mut_param_names);
@@ -3092,17 +3159,32 @@ fn push_post_call_frames(
             p_inner,
         );
     }
-    let substituted_ensures: Option<LExpr> = if ensures_clauses.is_empty() {
+    if ensures_clauses.is_empty() {
         None
     } else {
         Some(substitute(&and_all(ensures_clauses), &post_render_subst))
-    };
+    }
+}
 
-    // #128: try ret-substitution. If the substituted ensures has a
-    // top-level conjunct `Eq(Var(fresh_ret), E)` (or commuted), we
-    // can skip the `∀ ret + ret_bound` chain and bind `dest := E`
-    // directly. Falls through to the ∀-path when no such conjunct
-    // exists.
+/// Phases 2/3 — the ret binder + bound + ensures Hyp — or the #128
+/// substitution path replacing them. Returns `(dest_value,
+/// use_dest_name)` for Phase 5: the value to bind `dest` to
+/// (`Var(fresh_ret_name)` / the dest's own name in the ∀-path, `E` in
+/// the substitution path), and whether the ∀-binder already carries
+/// the dest's name (Approach A — Phase 5's alias `let` is dropped).
+///
+/// #128: try ret-substitution. If the substituted ensures has a
+/// top-level conjunct `Eq(Var(fresh_ret), E)` (or commuted), we
+/// can skip the `∀ ret + ret_bound` chain and bind `dest := E`
+/// directly. Falls through to the ∀-path when no such conjunct
+/// exists.
+fn push_ret_frames(
+    substituted_ensures: Option<LExpr>,
+    callee: &FunctionX,
+    subst: &CallSubstitutions,
+    dest: Option<&VarIdent>,
+    new_obl: &mut OblCtx,
+) -> (LExpr, bool) {
     let ret = &callee.ret.x;
     let ret_substitution: Option<(LExpr, LExpr)> = substituted_ensures.as_ref()
         .and_then(|conj| extract_top_level_eq_for(conj, &subst.fresh_ret_name));
@@ -3194,25 +3276,32 @@ fn push_post_call_frames(
             LExpr::var(binder_name.clone())
         }
     };
+    (dest_value, use_dest_name)
+}
 
-    // Phase 4: caller-side rebindings for &mut args. Placed AFTER
-    // ensures so the ensures Hyp references the fresh existential,
-    // not the rebound caller name.
-    //
-    // Three shapes:
-    // * Simple `&mut <local>` (#55): `let local := fresh`. The local
-    //   takes on the post-call value directly.
-    // * Single-variant struct field `&mut <local>.<f1>.<f2>.…` (#87
-    //   single-level, #144 deeper): `let local := { local with f1 :=
-    //   { local.f1 with f2 := fresh } }`. Lean's structure update
-    //   preserves all other fields automatically — no havoc-base +
-    //   assume-other-fields-unchanged dance needed (the syntax IS
-    //   that semantics, in the type system).
-    // * Tuple field `&mut <local>.<i>` (#145 + #146): `let local :=
-    //   (local.1, …, fresh, …, local.<n>)`. Lean's tuple syntax IS
-    //   `Prod.mk` sugar; the unmodified slots read via the
-    //   multi-segment `tuple_field_accessor` (`.2.1` etc. for the
-    //   nested-Prod representation of arity > 2 tuples).
+/// Phase 4: caller-side rebindings for &mut args. Placed AFTER
+/// ensures so the ensures Hyp references the fresh existential,
+/// not the rebound caller name.
+///
+/// Three shapes:
+/// * Simple `&mut <local>` (#55): `let local := fresh`. The local
+///   takes on the post-call value directly.
+/// * Single-variant struct field `&mut <local>.<f1>.<f2>.…` (#87
+///   single-level, #144 deeper): `let local := { local with f1 :=
+///   { local.f1 with f2 := fresh } }`. Lean's structure update
+///   preserves all other fields automatically — no havoc-base +
+///   assume-other-fields-unchanged dance needed (the syntax IS
+///   that semantics, in the type system).
+/// * Tuple field `&mut <local>.<i>` (#145 + #146): `let local :=
+///   (local.1, …, fresh, …, local.<n>)`. Lean's tuple syntax IS
+///   `Prod.mk` sugar; the unmodified slots read via the
+///   multi-segment `tuple_field_accessor` (`.2.1` etc. for the
+///   nested-Prod representation of arity > 2 tuples).
+fn push_mut_rebinds(
+    callee: &FunctionX,
+    subst: &CallSubstitutions,
+    new_obl: &mut OblCtx,
+) {
     for info in &subst.mut_args {
         let local_name = crate::lean_name::LeanName::from_var_ident(info.rebind_local());
         // Wrapper-arch typing: the fresh existential is wrapper-typed
@@ -3237,22 +3326,6 @@ fn push_post_call_frames(
         };
         new_obl.frames.push_back(CtxFrame::Let(local_name, new_value));
     }
-
-    // Phase 5: dest binding for the call's return (`let r = foo(…)`).
-    // `dest_value` is `Var(fresh_ret_name)` in the ∀-path or `E` in
-    // the substitution path (#128). Skipped when `use_dest_name`
-    // (Approach A): the ∀-binder already IS the dest, so the alias
-    // `let x := x` is trivial and dropped.
-    if let Some(dest_ident) = dest {
-        if !use_dest_name {
-            new_obl.frames.push_back(CtxFrame::Let(
-                crate::lean_name::LeanName::from_var_ident(dest_ident),
-                dest_value,
-            ));
-        }
-    }
-
-    new_obl
 }
 
 /// `Wp::Let` walker with if-RHS lifting. `let x := if c then a
