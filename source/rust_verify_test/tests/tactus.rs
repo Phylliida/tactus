@@ -11189,6 +11189,25 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// `[T; N]` renders as Lean core's length-indexed `Vector T N`
+// (BUG-vstd-preamble-cluster.md bug 2). vstd's `View for [T; N]`
+// instance binds N from the type head (`{N : Nat}`, read off the
+// impl's ConstTyp bound), and `array_view` / `Tactus.index` elaborate
+// over it. Pre-fix the head was `View (Array T)` (length erased), the
+// `{N : Type}`-mistyped binder got B3-dropped, and `N` dangled unbound
+// in the instance body. The trivial rfl goal pins ELABORATION of the
+// whole array-view cluster (`a@` pulls array_view, the View instance,
+// and the array broadcast axioms into the file).
+test_verify_one_file! {
+    #[test] test_array_view_vector_rendering verus_code! {
+        use vstd::prelude::*;
+
+        proof fn arr_elaborates(a: [u8; 3])
+            ensures a@ == a@
+        by { rfl }
+    } => Ok(())
+}
+
 // Fn-family instances at LITERAL ARROW types
 // (BUG-vstd-preamble-cluster.md bug 1, Fn half). A spec closure renders
 // as a Lean arrow (`Int → Int`), and `Seq::new`'s emitted signature

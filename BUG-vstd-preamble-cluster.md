@@ -84,7 +84,7 @@ elaboration before any tactic ran). The `Tactus.index` half is
 exercised by the mini; an e2e array pin lands with bug 2 (whose `N`
 error still poisons any file that pulls the Array View instance).
 
-### (2) `View (Array T)` instance references unbound `N`
+### (2) `View (Array T)` instance references unbound `N` — **FIXED 2026-07-02**
 
 ```lean
 noncomputable instance {T : Type} : view.View (Array T) (seq.Seq T) where
@@ -95,10 +95,25 @@ noncomputable instance {T : Type} : view.View (Array T) (seq.Seq T) where
 Lean's `Array T` erases the const-generic length, so vstd's
 `View for [T; N]` impl cannot render over it — `N` has no binder to
 come from. Verus's `[T; N]` typ DOES carry N (as a `ConstInt` typ arg),
-the rendering drops it. Proper fix is a design decision: render `[T; N]`
-as a length-carrying type (Lean core's `Vector T N`, or a
-`Tactus.Array T N` prelude type) and re-point `array_view` / instances /
-axioms at it. Owner input wanted before building.
+the rendering dropped it deliberately ("Lean has no length-indexed
+Array" — no longer true).
+
+**Fix (owner decision: proper length-carrying type, reuse the toolchain
+over reinventing):** `[T; N]` renders as Lean core's `Vector T N`
+(present in the pinned 4.25 toolchain) — both typ args now render
+(`ConstInt` → literal, const-generic `TypParam` → binder) in
+`typ_to_node` and `trait_emit`'s mirror arm; `Tactus.index` re-pointed
+at `Vector α n` (length implicit, call shape unchanged); "Vector" added
+to the sanity allowlist. Second half: instance binders for
+const-generic typ params now bind at their VALUE type (`{N : Nat}`,
+read off the impl's `GenericBoundX::ConstTyp` bounds, mirroring
+`fn_binders_with_bounds`) — pre-fix they rendered `{N : Type}` and,
+with the length gone from the head, got B3-dropped as undetermined,
+which is exactly how `N` ended up unbound in the body. Pinned by
+`test_array_view_vector_rendering` (`a@ == a@` on `[u8; 3]` — pulls
+array_view + the View instance + the array axioms; pre-fix the file
+failed elaboration). With this, the mini's clone file reached **0
+errors** — the whole preamble cluster clear.
 
 ### (3) Assoc-type projection unlifted inside INSTANCE BODIES — **FIXED 2026-07-02**
 
