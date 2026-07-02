@@ -167,6 +167,19 @@ def Tactus.strGetChar (s : String) (i : Int) : Nat :=
 -- vs `s : Seq A`), hence the two type parameters.
 axiom Tactus.heightLt {α : Type u} {β : Type v} (a : α) (b : β) : Prop
 
+-- Spec-mode array indexing (`BinaryOp::Index` — `a[i]` on `[T; N]` in
+-- spec code, and vstd's `array_view` body `Seq::new(N, |i| a[i])`).
+-- Left uninterpreted: vstd's array axioms (`lemma_array_index`,
+-- `array_view` roundtrips) give it in-range meaning; out-of-range is
+-- unspecified, matching Verus's treatment of spec indexing as a total
+-- but unconstrained function. NOTE on inhabitedness modeling: producing
+-- a `T` from `Array T × Int` global-axiomatizes every such `T` as
+-- inhabited — the SAME modeling the emitted `seq.Seq.index (A) (self)
+-- (i) : A` axiom already commits to (Verus guarantees spec types are
+-- inhabited; Lean-side this is a standing assumption of the encoding,
+-- not introduced here).
+axiom Tactus.index {α : Type u} (a : Array α) (i : Int) : α
+
 -- `has_resolved(x)` — Verus's mutable-reference resolution predicate
 -- (`UnaryOpr::HasResolved`). For `&mut T` it states the prophetic value
 -- equals the current value; for primitives it's trivially true; for

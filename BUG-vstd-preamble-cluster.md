@@ -49,7 +49,7 @@ of first capture; they drift with vstd):
 
 ## The bugs
 
-### (1) Missing fragments for dep-walked defs — `Tactus.index`, `Fn` instances
+### (1) `Tactus.index` undefined + no `Fn` instances at arrow types — **FIXED 2026-07-02**
 
 ```lean
 noncomputable def array.array_view (T : Type) (N : Nat) (a : Array T) : seq.Seq T :=
@@ -58,11 +58,31 @@ noncomputable def array.array_view (T : Type) (N : Nat) (a : Array T) : seq.Seq 
 ```
 
 Plus `failed to synthesize ops.function.Fn (Int → T) Int ?m` at the
-`Seq.new` applications. `Tactus.index` and the arrow-type `Fn` instances
-are per-file FRAGMENTS; the fragment collector doesn't emit them when
-the def needing them arrives via the broadcast-axiom dep walk rather
-than user code. Same root as CRATEDEFS.md's "fragment rehoming"
-follow-up.
+`Seq.new` applications — including in the emitted seq broadcast-axiom
+DECLARATIONS themselves (`axiom_seq_new_len`'s `(f : Int → A)`), so any
+file pulling the seq-axiom family failed.
+
+**Root cause — NOT the suspected "fragment rehoming":** neither thing
+existed anywhere. `Tactus.index` was a dangling name produced by
+`BinaryOp::Index` rendering (`expr_shared::non_binop_head`) with no
+prelude definition; a user-facing miniature (`Seq::new(3, |i| i)` in a
+tactic proof fn) failed the same way — spec closures render as literal
+Lean arrows, and only vstd's Ref/Box blanket `Fn` impls exist as krate
+instances; no Rust type names the arrow itself, so nothing ever
+provided its instance.
+
+**Fix:** (a) `Tactus.index` prelude axiom (uninterpreted; vstd's array
+axioms give in-range meaning — note it shares the emitted `Seq.index`
+axiom's standing "spec types are inhabited" modeling, not a new
+commitment); (b) `spec_world_cmds` synthesizes the compiler-provided
+instances alongside the class emission: blanket `marker.Tuple A`
+(contentless-marker argument, same as shell traits) and
+`FnOnce/FnMut/Fn (A → B) A B` in parents-first order, each gated on its
+class actually being emitted. Pinned by
+`test_seq_new_closure_arrow_fn_instance` (pre-fix the file failed
+elaboration before any tactic ran). The `Tactus.index` half is
+exercised by the mini; an e2e array pin lands with bug 2 (whose `N`
+error still poisons any file that pulls the Array View instance).
 
 ### (2) `View (Array T)` instance references unbound `N`
 

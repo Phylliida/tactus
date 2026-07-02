@@ -11189,6 +11189,23 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Fn-family instances at LITERAL ARROW types
+// (BUG-vstd-preamble-cluster.md bug 1, Fn half). A spec closure renders
+// as a Lean arrow (`Int → Int`), and `Seq::new`'s emitted signature
+// carries an `[ops.function.Fn impl_1 Int Output]` bracket that must
+// synthesize AT that arrow type — pre-fix the FILE failed elaboration
+// ("failed to synthesize ops.function.Fn (Int → Int) Int") before any
+// tactic ran. The trivial rfl goal pins elaboration, not seq reasoning.
+test_verify_one_file! {
+    #[test] test_seq_new_closure_arrow_fn_instance verus_code! {
+        use vstd::prelude::*;
+
+        proof fn seq_new_elaborates()
+            ensures Seq::new(3nat, |i: int| i) == Seq::new(3nat, |i: int| i)
+        by { rfl }
+    } => Ok(())
+}
+
 // Assoc-type projection inside an instance member BODY's embedded typs
 // (BUG-vstd-preamble-cluster.md bug 3). `idp(self.a.get())` carries
 // `<A as Getter>::Out` as `idp`'s typ ARG — the standalone def of this

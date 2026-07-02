@@ -776,6 +776,58 @@ pub(crate) fn spec_world_cmds(
         }
     }
 
+    // Synthetic instances for the Fn-trait family at LITERAL ARROW types
+    // (BUG-vstd-preamble-cluster.md bug 1, Fn half). Verus spec closures
+    // render as Lean arrows (`Int → A`, `TypX::SpecFn`), and vstd
+    // signatures like `Seq::new(len, f: impl Fn(int) -> A)` emit
+    // `[ops.function.Fn impl_1 Int Output]` brackets that must
+    // synthesize AT the arrow type — both in goals applying `Seq.new` to
+    // a closure and in the emitted seq broadcast-axiom DECLARATIONS
+    // themselves (`axiom_seq_new_len`'s `(f : Int → A)`). Rust-side each
+    // closure is a unique anonymous type whose Fn impl the compiler
+    // provides; the Lean rendering collapses closures to arrows, so the
+    // compiler-provided instance is synthesized here (vstd's Ref/Box
+    // blankets arrive as ordinary krate instances; the arrow one can't —
+    // no Rust type names it). The blanket `marker.Tuple` instance is
+    // sound the same way marker shells are: a contentless class asserts
+    // nothing. Each emits only when its class was emitted; ordered
+    // parents-first (FnOnce → FnMut → Fn) so each `extends` field
+    // synthesizes from the previous.
+    {
+        use crate::lean_ast::{BinOp, BinderKind, Expr as LExpr, ExprNode, Binder as LBinder};
+        let emitted: std::collections::HashSet<String> = krate.traits.iter()
+            .filter(|tr| should_emit_class(&tr.x))
+            .map(|tr| lean_name(&tr.x.name))
+            .collect();
+        let tp = |n: &str| LExpr::var_tp(n);
+        let arrow = || LExpr::new(ExprNode::BinOp {
+            op: BinOp::Implies,
+            lhs: Box::new(tp("A")),
+            rhs: Box::new(tp("B")),
+        });
+        if emitted.contains("marker.Tuple") {
+            cmds.push(Command::Instance(crate::lean_ast::Instance {
+                binders: vec![LBinder::typ_param("A", BinderKind::Implicit)],
+                target: LExpr::app(LExpr::var_lit("marker.Tuple"), vec![tp("A")]),
+                methods: vec![],
+            }));
+        }
+        for cls in ["ops.function.FnOnce", "ops.function.FnMut", "ops.function.Fn"] {
+            if emitted.contains(cls) {
+                cmds.push(Command::Instance(crate::lean_ast::Instance {
+                    binders: vec![
+                        LBinder::typ_param("A", BinderKind::Implicit),
+                        LBinder::typ_param("B", BinderKind::Implicit),
+                        LBinder::instance(
+                            LExpr::app(LExpr::var_lit("marker.Tuple"), vec![tp("A")])),
+                    ],
+                    target: LExpr::app(LExpr::var_lit(cls), vec![arrow(), tp("A"), tp("B")]),
+                    methods: vec![],
+                }));
+            }
+        }
+    }
+
     // Filter datatypes to those referenced by the proof/exec fns and
     // not synthesized closure types (#93), then transitively close over
     // field-type references and group into SCCs so mutually recursive
