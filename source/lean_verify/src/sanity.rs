@@ -347,7 +347,7 @@ fn name_resolves(name: &str, defined: &HashSet<String>, scope: &HashSet<String>)
     matches!(name,
         "Type" | "Prop" | "Sort"
         | "Nat" | "Int" | "Bool" | "Real" | "Float" | "String" | "Char"
-        | "List" | "Array" | "Option" | "Prod" | "Sum" | "Unit" | "Empty"
+        | "List" | "Array" | "Vector" | "Option" | "Prod" | "Sum" | "Unit" | "Empty"
         | "And" | "Or" | "Not" | "Iff"
         | "True" | "False"
         // `default` resolves via the `Inhabited` typeclass — auto-derived

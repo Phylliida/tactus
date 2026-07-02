@@ -169,16 +169,18 @@ axiom Tactus.heightLt {α : Type u} {β : Type v} (a : α) (b : β) : Prop
 
 -- Spec-mode array indexing (`BinaryOp::Index` — `a[i]` on `[T; N]` in
 -- spec code, and vstd's `array_view` body `Seq::new(N, |i| a[i])`).
+-- `[T; N]` renders as Lean core's length-indexed `Vector α n`; the
+-- length is implicit here so the rendered call stays `Tactus.index a i`.
 -- Left uninterpreted: vstd's array axioms (`lemma_array_index`,
 -- `array_view` roundtrips) give it in-range meaning; out-of-range is
 -- unspecified, matching Verus's treatment of spec indexing as a total
 -- but unconstrained function. NOTE on inhabitedness modeling: producing
--- a `T` from `Array T × Int` global-axiomatizes every such `T` as
+-- an `α` from `Vector α n × Int` global-axiomatizes every such `α` as
 -- inhabited — the SAME modeling the emitted `seq.Seq.index (A) (self)
 -- (i) : A` axiom already commits to (Verus guarantees spec types are
 -- inhabited; Lean-side this is a standing assumption of the encoding,
 -- not introduced here).
-axiom Tactus.index {α : Type u} (a : Array α) (i : Int) : α
+axiom Tactus.index {α : Type u} {n : Nat} (a : Vector α n) (i : Int) : α
 
 -- `has_resolved(x)` — Verus's mutable-reference resolution predicate
 -- (`UnaryOpr::HasResolved`). For `&mut T` it states the prophetic value

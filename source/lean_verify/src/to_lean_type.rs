@@ -185,20 +185,25 @@ fn typ_to_node(typ: &TypX) -> ExprNode {
         }
         TypX::Primitive(prim, args) => {
             let head = match prim {
-                vir::ast::Primitive::Array => "Array",
+                // Verus's `[T; N]` carries `[T, N]` as args (element
+                // type + const-length). Lean core's `Vector α n`
+                // (4.25) is exactly the length-indexed array, so both
+                // args render — instances like vstd's `View for
+                // [T; N]` (whose `array_view` needs N) bind the
+                // length from the type head
+                // (BUG-vstd-preamble-cluster.md bug 2). The length
+                // slot is a `ConstInt` (literal) or a const-generic
+                // `TypParam` (binder), both of which `typ_to_expr`
+                // renders natively.
+                vir::ast::Primitive::Array => "Vector",
                 vir::ast::Primitive::Slice => "List",
                 vir::ast::Primitive::StrSlice => "String",
                 vir::ast::Primitive::Ptr => "USize",
                 vir::ast::Primitive::Global => "Unit",
             };
-            // Lean's `Array α` and `List α` are unary type
-            // constructors; Verus's `[T; N]` carries `[T, N]` as args
-            // (element type + const-length), and we drop the length
-            // because Lean has no length-indexed Array. Bounds are
-            // tracked separately via spec-level `len()` queries.
-            // Slice has just `[T]`, but applying defensively for both.
+            // Slice carries just `[T]`; take(1) defensively.
             let type_args: Vec<_> = match prim {
-                vir::ast::Primitive::Array | vir::ast::Primitive::Slice => {
+                vir::ast::Primitive::Slice => {
                     args.iter().take(1).map(|a| typ_to_expr(a)).collect()
                 }
                 _ => args.iter().map(|a| typ_to_expr(a)).collect(),
@@ -273,7 +278,7 @@ pub(crate) fn type_short_name(typ: &vir::ast::Typ) -> Option<String> {
                 vir::ast::Dt::Tuple(_) => None,
             },
             TypX::Primitive(p, _) => return Some(match p {
-                vir::ast::Primitive::Array => "Array".to_string(),
+                vir::ast::Primitive::Array => "Vector".to_string(),
                 vir::ast::Primitive::Slice => "Slice".to_string(),
                 vir::ast::Primitive::StrSlice => "StrSlice".to_string(),
                 vir::ast::Primitive::Ptr => "Ptr".to_string(),

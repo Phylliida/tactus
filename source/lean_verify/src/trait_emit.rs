@@ -286,14 +286,16 @@ fn typ_maybe_projection_to_expr(typ: &TypX) -> LExpr {
         }
         TypX::Primitive(prim, args) => {
             let head = match prim {
-                vir::ast::Primitive::Array => "Array",
+                // `[T; N]` → `Vector T N` — mirror `typ_to_node`
+                // (length-indexed, both args render; cluster bug 2).
+                vir::ast::Primitive::Array => "Vector",
                 vir::ast::Primitive::Slice => "List",
                 vir::ast::Primitive::StrSlice => "String",
                 vir::ast::Primitive::Ptr => "USize",
                 vir::ast::Primitive::Global => "Unit",
             };
             let type_args: Vec<_> = match prim {
-                vir::ast::Primitive::Array | vir::ast::Primitive::Slice => {
+                vir::ast::Primitive::Slice => {
                     args.iter().take(1).map(|a| typ_maybe_projection_to_expr(a)).collect()
                 }
                 _ => args.iter().map(|a| typ_maybe_projection_to_expr(a)).collect(),
@@ -601,8 +603,32 @@ pub fn trait_impl_to_ast(
     ectx: &crate::emit_ctx::EmitCtx,
 ) -> Instance {
     let mut binders: Vec<LBinder> = Vec::new();
+    // Const-generic typ params (`impl<T, const N: usize> View for
+    // [T; N]`) bind at their VALUE type (`{N : Nat}`), read off the
+    // impl's `GenericBoundX::ConstTyp` bounds — mirroring
+    // `fn_binders_with_bounds`'s `const_typ_for` on the def side.
+    // Pre-fix they rendered `{N : Type}` and (with the length dropped
+    // from the old `Array T` head) got B3-dropped as undetermined,
+    // leaving `N` unbound in the instance body (cluster bug 2).
+    let const_typ_for = |name: &str| -> Option<&Typ> {
+        for bound in ti.typ_bounds.iter() {
+            if let GenericBoundX::ConstTyp(param_typ, val_typ) = &**bound {
+                if let TypX::TypParam(n) = &**param_typ {
+                    if n.as_str() == name { return Some(val_typ); }
+                }
+            }
+        }
+        None
+    };
     for tp in ti.typ_params.iter() {
-        binders.push(LBinder::typ_param(tp.as_str(), BinderKind::Implicit));
+        match const_typ_for(tp.as_str()) {
+            Some(val_typ) => binders.push(LBinder {
+                name: Some(crate::lean_name::LeanName::typ_param(tp.as_str())),
+                ty: typ_to_expr(val_typ),
+                kind: BinderKind::Implicit,
+            }),
+            None => binders.push(LBinder::typ_param(tp.as_str(), BinderKind::Implicit)),
+        }
     }
     // Fresh implicit binders from the projection substitution
     // (per-impl, Bug B step 2). Each fresh binder corresponds to a
