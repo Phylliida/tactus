@@ -363,6 +363,30 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === File-level import reaches an IMPL-BLOCK method's file ===
+// The macro-expansion attachment loop only visited top-level `Item::Fn`,
+// so impl-block (and trait-block) methods never carried `lean_import`
+// attrs — and since krate_preamble's per-file imports are the UNION of
+// all fns' attrs, a crate whose only Lean-path fns are methods lost its
+// file-level imports entirely (union over zero carriers). This crate
+// deliberately has NO top-level fns, so the method is the only possible
+// carrier.
+test_verify_one_file! {
+    #[test] test_impl_method_gets_file_level_import verus_code! {
+        import Mathlib.Tactic.Linarith
+
+        pub struct W { pub v: u8 }
+
+        impl W {
+            pub proof fn sq_nonneg_method(&self, x: int)
+                ensures x * x >= 0
+            by {
+                nlinarith [sq_nonneg x]
+            }
+        }
+    } => Ok(())
+}
+
 // === Source map: error includes tactic line number ===
 
 test_verify_one_file! {
