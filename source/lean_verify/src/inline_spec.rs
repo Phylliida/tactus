@@ -235,10 +235,32 @@ fn substitute_body(body: &Expr, typ_params: &Idents, typs: &Typs, f: &FunctionX,
         "inline fn params/args length mismatch — Verus resolution invariant violated");
 
     // 1. Type substitution (`K` ↦ `u8`, …) on every Typ embedded in the body.
+    //
+    // The callback replaces exactly `TypParam` nodes — deliberately NOT the
+    // deep-recursive `subst_typ`. `map_expr_typ_visitor` already applies the
+    // callback at EVERY typ level bottom-up (children first, then the rebuilt
+    // parent), so a recursive substitution would run again over its own
+    // output: with callee params [T, A] instantiated as {T ↦ A', A ↦ X}, the
+    // parent-level re-run sends the freshly-inserted A' through the A entry
+    // — `Vec<T, A>` → `Vec<A', X>` → `Vec<X, X>`. Invisible while maps are
+    // collision-free (re-runs are no-ops), wrong the moment a caller's typ
+    // param shares a NAME with a callee typ param — e.g. vstd's
+    // `axiom_vec_index_decreases<A>` inlining `Vec::<T, A>::spec_index`,
+    // where the axiom's element `A` collided with the impl's allocator `A`
+    // (BUG-vstd-preamble-cluster.md bug 4). Leaf-only replacement composed
+    // with the per-level visitor IS simultaneous substitution, exactly once.
     let typ_substs: HashMap<Ident, Typ> =
         typ_params.iter().cloned().zip(typs.iter().cloned()).collect();
-    let body = map_expr_typ_visitor(body, &|t: &Typ| Ok(subst_typ(&typ_substs, t)))
-        .expect("typ subst callback never errors");
+    let body = map_expr_typ_visitor(body, &|t: &Typ| {
+        Ok(match &**t {
+            vir::ast::TypX::TypParam(x) => match typ_substs.get(x) {
+                Some(t2) => t2.clone(),
+                None => t.clone(),
+            },
+            _ => t.clone(),
+        })
+    })
+    .expect("typ subst callback never errors");
 
     // 2. Value substitution (param `Var` → arg). Keyed by the param's name
     //    string, matching Tactus's by-name VarIdent convention; params within a

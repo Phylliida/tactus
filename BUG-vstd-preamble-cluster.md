@@ -96,18 +96,34 @@ The instance HEAD lifts the projection correctly
 body CORRECTLY with the lifted binder — the RC2 projection-lift
 (`impl_subst`) just doesn't reach the instance-member emission path.
 
-### (4) Typ-arg substitution mismap in `axiom_vec_index_decreases`
+### (4) Typ-arg substitution mismap in `axiom_vec_index_decreases` — **FIXED 2026-07-02**
 
 ```lean
 … (view.View.view ((Tactus.Ref.mk v : Tactus.Ref (vec.Vec alloc.Global alloc.Global)) : seq.Seq alloc.Global)) …
                                                           ^^^^^^^^^^^^ should be A (the element type)
 ```
 
-The axiom declares `(A : Type) (v : vec.Vec A alloc.Global)`; the
-class-method ascription around `view(v)` instantiates the Vec's ELEMENT
-slot with `alloc.Global` (and the view result as `seq.Seq alloc.Global`)
-— a T↦allocator mismap when building the ascription's typ args inside a
-broadcast-lemma render.
+**Root cause (found by probe bisection: renderer faithful, VIR corrupted
+post-`inline_spec`):** `substitute_body`'s type substitution composed the
+per-level `map_expr_typ_visitor` (callback fires at EVERY typ node,
+bottom-up, over rebuilt children) with the deep-recursive
+`vir::sst_util::subst_typ` — so the parent-level callback re-substituted
+its own output. With the axiom's element param named `A` colliding with
+the inlined `Vec::<T, A>::spec_index` impl's allocator param `A`, the map
+`{T ↦ A', A ↦ Global}` chained `Vec<T, A>` → `Vec<A', Global>` →
+`Vec<Global, Global>` inside NESTED typs. Flat `TypParam` lists get one
+application (leaf = no second pass) — which is why `DynamicResolved.typs`
+survived and the corruption looked "selective". Invisible for
+collision-free maps (re-runs are no-ops) — every prior test was
+collision-free.
+
+**Fix:** leaf-only callback (replace exactly `TypX::TypParam` nodes);
+composed with the per-level visitor that IS simultaneous substitution,
+exactly once. Pinned by `test_inline_typ_param_name_collision` (needs a
+compound typ arg — `idp::<Pair<T, A>>` — to bite, per the flat-list
+observation). `impl_subst`'s similar `rewrite_typ_rec` composition
+audited: idempotent (its range is fresh synthetic names disjoint from its
+domain), safe.
 
 ## Fn-specific bugs in the same crates (visible in `is_inverse_pair_exec`)
 
