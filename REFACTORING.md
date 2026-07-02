@@ -283,12 +283,15 @@ because the current tests don't hit these corners.
   `coerce_lexpr` bridge the call-rebind path has.
 
 **Routing / `tactus_auto`:**
-- **Full `tactus_auto` retirement** — blocked on the FileLoader [follow-up #3].
-- **`enclosing_fn_is_tactus_auto` not lean-backend-aware.** It still gates
-  assert-by tactic-spans on the `tactus_auto` attr; a Lean-routed fn *without*
-  `tactus_auto` that carries an `assert(..) by { <lean tac> }` wouldn't get the
-  span. Same root as #3 (the FileLoader/attr coupling); no current test hits it
-  (all such fns have `tactus_auto`).
+- **Full `tactus_auto` retirement** — ~~blocked on the FileLoader~~
+  **INVALIDATED 2026-07-02**, see follow-up #3 below.
+- **`enclosing_fn_is_tactus_auto` not lean-backend-aware.** Re-read
+  2026-07-02: **this is correct behavior, not a gap.** Under the settled
+  semantics an attr-less fn's `assert(..) by { }` content IS Verus proof
+  code (the supported group-theory `runtime.rs` pattern); only the attr
+  declares the content to be Lean tactics. The FileLoader and this gate
+  agreeing on the attr is the consistency requirement, not a coupling to
+  delete.
 
 **Considered and rejected (decisions, not deferrals):**
 - **`assumption`/defeq closer rung** for spec-fn unfold — validated it works
@@ -312,10 +315,13 @@ because the current tests don't hit these corners.
    **DONE (Part 4).** Remaining sub-gap: **multi-variant enum field bounds** —
    `type_bound_predicate` only recurses into single-variant structs + tuples
    (enum field access is variant-guarded, so the bound is variant-conditional).
-3. **Fully retire `tactus_auto`.** Redundant for routing, but still the
-   FileLoader's marker for which fns carry Lean-tactic `proof { }` blocks. Needs
-   the FileLoader to detect lean-backend (crate-level marker or env signal) so it
-   can sanitize any Lean-routed fn's proof blocks without the attr.
+3. ~~**Fully retire `tactus_auto`.**~~ **INVALIDATED 2026-07-02** (scoped for
+   implementation — see REFACTORING2.md Part 3). The premise "sanitize any
+   Lean-routed fn's proof blocks" is wrong: attr-less Lean-routed exec fns
+   legitimately carry **Verus**-style proof blocks (tactus-group-theory
+   `runtime.rs` — the WP consumes the ghost statements as SST statements).
+   The attr is per-fn content-language marking, which a crate flag cannot
+   replace. Retirement would need block-level syntax (owner's language call).
 4. **Cross-crate cast boundary** (Part 2): a targeted coercion in the #122
    cross-crate inliner, if a Z3 dep with a breaking `uN→nat` spec cast ever
    appears. Latent today.

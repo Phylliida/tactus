@@ -76,6 +76,11 @@ These were investigated with recorded reasoning that still holds:
   have to reach `lean_name` (called from `typ_to_node` + ~34 direct sites)
   for two idempotent, loud-failing, krate-derived tables. All entry points
   funnel through `generate::install_emit_tables` instead.
+* **`tactus_auto` retirement via lean-backend detection** — rejected
+  2026-07-02: the attr is per-fn content-language marking, not routing.
+  Attr-less Lean-routed exec fns with Verus-style proof blocks are a
+  supported, load-bearing pattern (tactus-group-theory `runtime.rs`);
+  crate-flag-driven sanitization would wipe them. See Part 3.
 
 ---
 
@@ -273,9 +278,25 @@ compound).
 
 ## Part 3 — Smaller items
 
-* **Retire `tactus_auto` fully** — already REFACTORING.md follow-up #3.
-  Deletes the FileLoader/attr coupling once the FileLoader can detect
-  lean-backend itself. Bounded; deletes real plumbing.
+* **Retire `tactus_auto` fully** — **REJECTED 2026-07-02** (scoped for
+  implementation; the premise turned out false). Follow-up #3's plan was
+  "FileLoader detects lean-backend → sanitize any Lean-routed fn's proof
+  blocks without the attr". But in a lean-backend crate, exec-fn
+  `proof { }` / `assert … by { }` blocks legitimately come in BOTH
+  languages, per fn: tactus-group-theory (lean-backend crate-wide via its
+  check.sh) has attr-less Lean-routed exec fns whose proof blocks hold
+  **Verus** ghost code (`runtime.rs` — the WP consumes the ghost
+  statements as ordinary SST statements; these are the "7 runtime execs"
+  that verify in Lean today). Sanitizing them would destroy those proofs.
+  So the attr is not redundant routing info — it is per-fn
+  **content-language marking** ("this fn's proof blocks are Lean tactic
+  text"), information only the user has; a crate flag cannot substitute.
+  What WOULD enable retirement: block-level syntax that marks Lean tactic
+  blocks distinctly (e.g. a `proof lean { … }` form) — a language-design
+  decision for the owner, not a refactor. Possible smaller follow-ups
+  (not scheduled): a friendlier diagnostic when un-sanitized Lean syntax
+  hits rustc's lexer (the forgot-the-attr experience), and/or renaming
+  the attr to say what it means (e.g. `lean_proofs`).
 * **Ambient thread-locals → EmitCtx** — covered in § 1.2; listed here so the
   three sites are findable: `to_lean_type.rs:294`, `to_lean_sst_expr.rs:256`,
   `to_lean_expr.rs:102`.
