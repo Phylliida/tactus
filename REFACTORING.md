@@ -284,14 +284,13 @@ because the current tests don't hit these corners.
 
 **Routing / `tactus_auto`:**
 - **Full `tactus_auto` retirement** — ~~blocked on the FileLoader~~
-  **INVALIDATED 2026-07-02**, see follow-up #3 below.
-- **`enclosing_fn_is_tactus_auto` not lean-backend-aware.** Re-read
-  2026-07-02: **this is correct behavior, not a gap.** Under the settled
-  semantics an attr-less fn's `assert(..) by { }` content IS Verus proof
-  code (the supported group-theory `runtime.rs` pattern); only the attr
-  declares the content to be Lean tactics. The FileLoader and this gate
-  agreeing on the attr is the consistency requirement, not a coupling to
-  delete.
+  **DONE for lean-backend crates 2026-07-02** (via a semantics change,
+  not detection), see follow-up #3 below.
+- **`enclosing_fn_is_tactus_auto` not lean-backend-aware.** **RESOLVED
+  2026-07-02**: renamed `enclosing_fn_has_lean_tactic_blocks` and made
+  routing-aware (`tactus_auto || (lean_backend && Exec && !tactus_z3)`),
+  mirroring the FileLoader's textual gate — the two agreeing is the
+  consistency requirement of the "flag decides" semantics.
 
 **Considered and rejected (decisions, not deferrals):**
 - **`assumption`/defeq closer rung** for spec-fn unfold — validated it works
@@ -315,13 +314,15 @@ because the current tests don't hit these corners.
    **DONE (Part 4).** Remaining sub-gap: **multi-variant enum field bounds** —
    `type_bound_predicate` only recurses into single-variant structs + tuples
    (enum field access is variant-guarded, so the bound is variant-conditional).
-3. ~~**Fully retire `tactus_auto`.**~~ **INVALIDATED 2026-07-02** (scoped for
-   implementation — see REFACTORING2.md Part 3). The premise "sanitize any
-   Lean-routed fn's proof blocks" is wrong: attr-less Lean-routed exec fns
-   legitimately carry **Verus**-style proof blocks (tactus-group-theory
-   `runtime.rs` — the WP consumes the ghost statements as SST statements).
-   The attr is per-fn content-language marking, which a crate flag cannot
-   replace. Retirement would need block-level syntax (owner's language call).
+3. ~~**Fully retire `tactus_auto`.**~~ **DONE for lean-backend crates
+   2026-07-02** — but not the way this item envisioned. Scoping first found
+   the premise wrong (the attr was per-fn content-language marking: attr-less
+   Lean-routed exec fns legitimately carried **Verus**-style proof blocks,
+   e.g. tactus-group-theory `runtime.rs`); the owner then resolved it by
+   CHANGING THE SEMANTICS ("flag decides"): block language follows routing,
+   `#[verifier::z3]` opts a fn (routing and blocks) back to Verus/Z3, and the
+   group-theory runtime fns were z3-marked as the interim. Full story in
+   REFACTORING2.md Part 3.
 4. **Cross-crate cast boundary** (Part 2): a targeted coercion in the #122
    cross-crate inliner, if a Z3 dep with a breaking `uN→nat` spec cast ever
    appears. Latent today.

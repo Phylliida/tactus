@@ -76,11 +76,11 @@ These were investigated with recorded reasoning that still holds:
   have to reach `lean_name` (called from `typ_to_node` + ~34 direct sites)
   for two idempotent, loud-failing, krate-derived tables. All entry points
   funnel through `generate::install_emit_tables` instead.
-* **`tactus_auto` retirement via lean-backend detection** — rejected
-  2026-07-02: the attr is per-fn content-language marking, not routing.
-  Attr-less Lean-routed exec fns with Verus-style proof blocks are a
-  supported, load-bearing pattern (tactus-group-theory `runtime.rs`);
-  crate-flag-driven sanitization would wipe them. See Part 3.
+* **`tactus_auto` retirement via lean-backend DETECTION (inference)** —
+  rejected 2026-07-02: no flag can infer per-fn block language. What
+  landed the same day instead (owner decision) is a SEMANTICS CHANGE —
+  block language follows routing, `#[verifier::z3]` is the combined
+  opt-out. Don't re-attempt inference; the settled rule is in Part 3.
 
 ---
 
@@ -278,25 +278,25 @@ compound).
 
 ## Part 3 — Smaller items
 
-* **Retire `tactus_auto` fully** — **REJECTED 2026-07-02** (scoped for
-  implementation; the premise turned out false). Follow-up #3's plan was
-  "FileLoader detects lean-backend → sanitize any Lean-routed fn's proof
-  blocks without the attr". But in a lean-backend crate, exec-fn
-  `proof { }` / `assert … by { }` blocks legitimately come in BOTH
-  languages, per fn: tactus-group-theory (lean-backend crate-wide via its
-  check.sh) has attr-less Lean-routed exec fns whose proof blocks hold
-  **Verus** ghost code (`runtime.rs` — the WP consumes the ghost
-  statements as ordinary SST statements; these are the "7 runtime execs"
-  that verify in Lean today). Sanitizing them would destroy those proofs.
-  So the attr is not redundant routing info — it is per-fn
-  **content-language marking** ("this fn's proof blocks are Lean tactic
-  text"), information only the user has; a crate flag cannot substitute.
-  What WOULD enable retirement: block-level syntax that marks Lean tactic
-  blocks distinctly (e.g. a `proof lean { … }` form) — a language-design
-  decision for the owner, not a refactor. Possible smaller follow-ups
-  (not scheduled): a friendlier diagnostic when un-sanitized Lean syntax
-  hits rustc's lexer (the forgot-the-attr experience), and/or renaming
-  the attr to say what it means (e.g. `lean_proofs`).
+* **Retire `tactus_auto` fully** — **DONE for lean-backend crates
+  2026-07-02, by owner decision ("flag decides"), same day the refactor-
+  only version was found impossible.** The scoping finding stands: the
+  attr's FileLoader role was per-fn **content-language marking** (exec-fn
+  `proof { }` / `assert … by { }` blocks legitimately came in both Verus
+  and Lean, per fn — tactus-group-theory's `runtime.rs` used attr-less
+  Lean-routed exec fns with Verus ghost blocks), so no crate flag could
+  *infer* the language. Danielle resolved it by **changing the
+  semantics**: in a `--lean-backend` crate, block language now FOLLOWS
+  ROUTING — a Lean-routed exec fn's blocks ARE Lean tactic text, no attr
+  needed; `#[verifier::z3]` keeps a fn (routing and blocks) on the
+  Verus/Z3 side. The Verus-blocks-in-Lean-routed-fns pattern is no longer
+  a supported state; the group-theory runtime fns were `z3`-marked as the
+  migration interim (commit in that crate). `tactus_auto` remains
+  accepted (redundant under the flag; still the per-fn opt-in for
+  non-lean-backend crates). Implementation: `file_loader.rs` pass-2 gate
+  + textual routing mirror, flag threaded through both compiler-callback
+  constructions, `enclosing_fn_has_lean_tactic_blocks` at the three
+  TactusSpan sites, 7 unit + 3 e2e pins | `e1ddfaa`
 * **Ambient thread-locals → EmitCtx** — covered in § 1.2; listed here so the
   three sites are findable: `to_lean_type.rs:294`, `to_lean_sst_expr.rs:256`,
   `to_lean_expr.rs:102`.
