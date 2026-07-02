@@ -336,6 +336,18 @@ pub fn proof_fn_to_ast(
     tactic_body: &str,
     ectx: &crate::emit_ctx::EmitCtx,
 ) -> Theorem {
+    // Lift assoc-type projections in the theorem's OWN clauses/binders —
+    // the same `maybe_augment_standalone_fn` spec fns, helpers, and
+    // broadcast axioms get at their emission sites. Without it a tactic
+    // proof fn generic over `A: Getter` whose ensure carries
+    // `<A as Getter>::Out` rendered the malformed accessor `Getter.Out A`
+    // and an under-applied `[Getter A]` bracket
+    // (BUG-vstd-preamble-cluster.md bug 3, root-clause half). Applied here
+    // (not per-caller) so the standalone, batch (crate_defs), and helper
+    // paths all get it; idempotent when a caller already augmented
+    // (`ImplSubst::build` skips slots covered by an existing TypEquality);
+    // no-op for projection-free fns.
+    let f = &crate::impl_subst::maybe_augment_standalone_fn(f, &ectx.trait_outparams);
     let (binders, goal) = proof_fn_signature(f, ectx);
     let binder_ctx = crate::to_lean_expr::binder_ctx_from_params(&f.params);
     // Honor Verus's `decreases` clause for recursive proof fns. Lean often

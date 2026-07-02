@@ -48,7 +48,6 @@ use vir::ast::{
 };
 use vir::ast_visitor::{map_expr_typ_visitor, map_expr_visitor};
 use vir::def::Spanned;
-use vir::sst_util::subst_typ;
 
 /// Mirror of Verus's `FunctionKind::inline_okay` (`pub(crate)` there): inlining
 /// is only safe for statically-resolved targets, never a trait method *decl*

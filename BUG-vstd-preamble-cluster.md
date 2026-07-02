@@ -80,7 +80,7 @@ as a length-carrying type (Lean core's `Vector T N`, or a
 `Tactus.Array T N` prelude type) and re-point `array_view` / instances /
 axioms at it. Owner input wanted before building.
 
-### (3) Assoc-type projection unlifted inside INSTANCE BODIES
+### (3) Assoc-type projection unlifted inside INSTANCE BODIES — **FIXED 2026-07-02**
 
 ```lean
 noncomputable instance … : view.DeepView (vec.Vec T A) (seq.Seq _tactus_assoc_T_DeepView_V) where
@@ -95,6 +95,20 @@ The instance HEAD lifts the projection correctly
 `Vec.DeepView.impl.deep_view` in the same file renders the identical
 body CORRECTLY with the lifted binder — the RC2 projection-lift
 (`impl_subst`) just doesn't reach the instance-member emission path.
+
+**Fix:** new `ImplSubst::rewrite_expr_typs` (shared with the
+`augment_function` step-2/3 sites, deduped) applied in BOTH
+`trait_impl_to_ast` member-body arms (spec + proof-witness), after
+`rewrite_self_sibling_calls`. Writing the pin exposed the SAME gap at a
+third render path: a tactic proof fn's OWN clauses/binders (a root
+generic over `A: Getter` with `<A as Getter>::Out` in its ensure
+rendered `Getter.Out A` + an under-applied `[Getter A]` bracket) —
+fixed by augmenting at `proof_fn_to_ast` entry, covering the
+standalone, batch, and helper paths at once (idempotent; no-op for
+projection-free fns). Pinned by `test_instance_body_projection_lifted`,
+which exercises both halves. In the mini, the `DeepView.V` unknown
+constants are gone; the residual errors at those lines are bug 1's
+missing `Fn`-instance fragments.
 
 ### (4) Typ-arg substitution mismap in `axiom_vec_index_decreases` — **FIXED 2026-07-02**
 
