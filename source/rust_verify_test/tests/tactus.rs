@@ -11225,6 +11225,41 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Match over a TUPLE OF REFS (BUG-vstd-preamble-cluster.md bugs 5+6,
+// the tactus-group-theory `is_inverse_pair_exec` shape). Two rendering
+// bugs pinned: (5) tuple typ args KEEP ref decorations while the SST
+// strips them from the projection's claimed typ, so `tmp.1.isGen`
+// rendered on a `Tactus.Ref Sym` without `.deref` (fix: the Field arm
+// bridges slot-depth → claimed-depth); (6) the tuple's own variant
+// test rendered as the nonexistent `.istuple%2` (fix: a tuple has one
+// variant — the test is `True`, both renderers). The proof block is
+// the standard explicit spec-unfold, not a workaround.
+test_verify_one_file! {
+    #[test] test_exec_match_tuple_of_refs verus_code! {
+        pub enum Sym {
+            Gen(usize),
+            Inv(usize),
+        }
+
+        pub open spec fn is_pair_spec(s1: Sym, s2: Sym) -> bool {
+            match (s1, s2) {
+                (Sym::Gen(i), Sym::Inv(j)) => i == j,
+                _ => false,
+            }
+        }
+
+        pub fn is_pair_exec(s1: &Sym, s2: &Sym) -> (out: bool)
+            ensures out == is_pair_spec(*s1, *s2),
+        {
+            proof { simp_all [is_pair_spec] }
+            match (s1, s2) {
+                (Sym::Gen(i), Sym::Inv(j)) => *i == *j,
+                _ => false,
+            }
+        }
+    } => Ok(())
+}
+
 // Assoc-type projection inside an instance member BODY's embedded typs
 // (BUG-vstd-preamble-cluster.md bug 3). `idp(self.a.get())` carries
 // `<A as Getter>::Out` as `idp`'s typ ARG — the standalone def of this

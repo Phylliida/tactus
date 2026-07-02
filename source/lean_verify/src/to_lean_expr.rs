@@ -666,11 +666,18 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
                 field_opr,
             ).node
         }
-        ExprX::UnaryOpr(UnaryOpr::IsVariant { variant, .. }, inner) => {
-            // U2: discriminator checks operate on the inner inductive
-            // type, not the wrapper — same `.deref` chain treatment as
-            // Field.
-            is_variant_node(variant, render_expr_with_derefs(inner, ctx))
+        ExprX::UnaryOpr(UnaryOpr::IsVariant { datatype, variant }, inner) => {
+            // A tuple has exactly one "variant" — its test is vacuously
+            // true (the general path would emit the nonexistent
+            // `.istuple%N`; cluster bug 6). Mirrors the SST arm.
+            if matches!(datatype, Dt::Tuple(_)) {
+                ExprNode::LitBool(true)
+            } else {
+                // U2: discriminator checks operate on the inner inductive
+                // type, not the wrapper — same `.deref` chain treatment as
+                // Field.
+                is_variant_node(variant, render_expr_with_derefs(inner, ctx))
+            }
         }
         ExprX::UnaryOpr(UnaryOpr::HasType(t), inner) => {
             // Refinement invariant: `e < 2^n` for `U(n)`, `-2^(n-1) ≤ e ∧
