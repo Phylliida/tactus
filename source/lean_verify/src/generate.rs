@@ -988,9 +988,15 @@ pub(crate) fn spec_world_cmds(
 }
 
 /// Ambient thread-local tables every render path needs installed
-/// first. Wrapped so `crate_defs` (which renders outside the per-fn
-/// emit entry points) installs exactly what `emit_proof_fn` /
-/// `emit_exec_fn` install.
+/// first. The SINGLE install chokepoint: every render entry point
+/// (`emit_proof_fn`, `emit_exec_fn`, `crate_defs::for_crate`) calls
+/// this — never call the individual installers directly, so the pair
+/// can't drift apart. Folding these two tables into EmitCtx/RenderCtx
+/// was considered and REJECTED (REFACTORING2.md "EmitCtx follow-ups"):
+/// ctx would have to reach `lean_name` — called from `typ_to_node` and
+/// ~34 direct sites across 10 files — for two krate-derived, idempotent
+/// tables whose absence fails loudly (unreferenceable names / missing
+/// bound hypotheses), not silently.
 pub(crate) fn install_emit_tables(krate: &KrateX) {
     install_inherent_method_renames(krate);
     install_datatype_field_bounds(krate);
@@ -1152,8 +1158,7 @@ pub fn emit_proof_fn(
     crate_name: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> Result<EmitOutput, CheckResult> {
-    install_inherent_method_renames(krate);
-    install_datatype_field_bounds(krate);
+    install_emit_tables(krate);
     // Shared-defs lookup (CRATEDEFS.md step 1a). Memo-consistent with
     // the `check_proof_fn` build: in check mode the defs were already
     // built (or poisoned to None) before this runs; in `--emit-lean`
@@ -1340,8 +1345,7 @@ pub fn emit_exec_fn(
     crate_name: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> Result<EmitOutput, CheckResult> {
-    install_inherent_method_renames(krate);
-    install_datatype_field_bounds(krate);
+    install_emit_tables(krate);
     // Pre-inline krate for the shared-defs lookup below (`for_crate`
     // applies its own inline pass; the lookup happens after
     // `broadcast_lemmas` resolves, by which point `krate` is shadowed).
