@@ -2036,9 +2036,12 @@ pub(crate) fn expr_to_vir_innermost<'tcx>(
                 // user's own `have`s propagate to theorem level.
                 //
                 // Two guards distinguish this from other Ghost blocks:
-                //   1. `enclosing_fn_is_tactus_auto` — keeps vstd's
-                //      Verus-flavoured proof blocks on the normal
-                //      Ghost path; they don't route through Lean.
+                //   1. `enclosing_fn_has_lean_tactic_blocks` — keeps
+                //      Verus-flavoured proof blocks (vstd, Z3-path fns,
+                //      `#[verifier::z3]` opt-outs) on the normal Ghost
+                //      path; only fns whose blocks the FileLoader
+                //      sanitized (tactus_auto, or Lean-routed exec fns
+                //      under --lean-backend) take this arm.
                 //   2. `hir_body_is_empty` — Verus's `auto_proof_block`
                 //      pass wraps every user `assert(…);` in a
                 //      synthetic `proof { … }`, so this arm also sees
@@ -2049,7 +2052,7 @@ pub(crate) fn expr_to_vir_innermost<'tcx>(
                 let hir_body_is_empty = body.stmts.is_empty() && body.expr.is_none();
                 if matches!(g_attr, GhostBlockAttr::Proof)
                     && hir_body_is_empty
-                    && crate::fn_call_to_vir::enclosing_fn_is_tactus_auto(bctx)
+                    && crate::fn_call_to_vir::enclosing_fn_has_lean_tactic_blocks(bctx)
                 {
                     if let Some(tactus) = crate::fn_call_to_vir::tactus_span_from(
                         bctx.ctxt.tcx, expr.span, vir::ast::TactusKind::ProofBlock,

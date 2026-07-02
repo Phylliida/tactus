@@ -3724,7 +3724,9 @@ impl rustc_driver::Callbacks for VerifierCallbacksEraseMacro {
         // Install the Tactus file loader to sanitize tactic blocks before
         // rustc's lexer sees them. This replaces Lean syntax (Unicode, --
         // comments, /- -/ comments) with spaces so rustc doesn't error.
-        config.file_loader = Some(Box::new(crate::file_loader::TactusFileLoader));
+        config.file_loader = Some(Box::new(crate::file_loader::TactusFileLoader {
+            lean_backend: self.verifier.args.lean_backend,
+        }));
 
         if let Some(mut dep_tracker) = self.verifier.dep_tracker.take() {
             let import_dep_if_present = &self
@@ -3935,6 +3937,7 @@ impl rustc_driver::Callbacks for VerifierCallbacksEraseMacro {
                             self.rustc_args.clone(),
                             false,
                             self.verifier.args.vstd,
+                            self.verifier.args.lean_backend,
                         );
                         if compile_status.is_err() {
                             return rustc_driver::Compilation::Stop;

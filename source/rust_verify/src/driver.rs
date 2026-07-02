@@ -151,12 +151,18 @@ for all functions (it would only be needed for functions with tracked data in pr
 struct CompilerCallbacksEraseMacro {
     pub do_compile: bool,
     pub override_stability: bool,
+    /// Threaded to `TactusFileLoader` so the compile pass sanitizes
+    /// exactly the same blocks the verification pass did (spans and
+    /// lexability must agree between the two views).
+    pub lean_backend: bool,
 }
 
 impl rustc_driver::Callbacks for CompilerCallbacksEraseMacro {
     fn config(&mut self, config: &mut rustc_interface::interface::Config) {
         // Tactus: sanitize tactic blocks in both compilation passes.
-        config.file_loader = Some(Box::new(crate::file_loader::TactusFileLoader));
+        config.file_loader = Some(Box::new(crate::file_loader::TactusFileLoader {
+            lean_backend: self.lean_backend,
+        }));
 
         // Adding `override_stability` and `stable_attr` functions is a hacky solution specifically for verifying core,
         // to fix an issue with stability attributes.
@@ -206,10 +212,12 @@ pub(crate) fn run_with_erase_macro_compile(
     mut rustc_args: Vec<String>,
     compile: bool,
     vstd: Vstd,
+    lean_backend: bool,
 ) -> Result<(), ()> {
     let mut callbacks = CompilerCallbacksEraseMacro {
         do_compile: compile,
         override_stability: matches!(vstd, Vstd::IsCore | Vstd::ImportedViaCore),
+        lean_backend,
     };
     rustc_args.extend(["--cfg", "verus_only", "--cfg", "verus_keep_ghost"].map(|s| s.to_string()));
     if matches!(vstd, Vstd::IsCore | Vstd::ImportedViaCore) {
@@ -371,7 +379,12 @@ pub fn run(
         if !verifier.compile && (verifier.args.no_erasure_check || verifier.args.no_lifetime) {
             Ok(())
         } else {
-            run_with_erase_macro_compile(rustc_args, verifier.compile, verifier.args.vstd)
+            run_with_erase_macro_compile(
+                rustc_args,
+                verifier.compile,
+                verifier.args.vstd,
+                verifier.args.lean_backend,
+            )
         };
 
     let time2 = Instant::now();
