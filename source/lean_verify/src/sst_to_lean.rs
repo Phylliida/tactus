@@ -4431,154 +4431,13 @@ fn build_wp<'a>(
             };
             Ok(Wp::Done(leaf))
         }
-        StmX::AssertBitVector { requires, ensures } => {
-            // Bit-vector mode: render requires + ensures via the
-            // BitVec-mode renderer (#130 first cut). u-typed
-            // variables get wrapped as `BitVec.ofInt n x`, so the
-            // resulting LExpr's bitwise ops resolve to BitVec
-            // instances and Lean's BitVec tactics (`decide`,
-            // `simp [BitVec.*]`) can reason about the goal.
-            //
-            // We ALSO build the Int-mode lowering of `ensures` for
-            // the post-assert hypothesis — the surrounding ctx
-            // continues in Int mode, so the Hyp must talk about
-            // the original Int-typed variables, not BitVec'd ones.
-            // The bit_vector solver discharges the obligation in
-            // BitVec semantics; we trust Verus's upstream check
-            // that the BitVec-truth and Int-truth correspond for
-            // the user's shape.
-            let req_lexprs: Vec<LExpr> = requires.iter()
-                .map(|r| crate::to_lean_sst_expr::sst_exp_to_bit_vector_ast(r))
-                .collect::<Result<Vec<_>, _>>()?;
-            let ens_lexprs: Vec<LExpr> = ensures.iter()
-                .map(|e| crate::to_lean_sst_expr::sst_exp_to_bit_vector_ast(e))
-                .collect::<Result<Vec<_>, _>>()?;
-            // Note: we deliberately do NOT publish the ensures as
-            // an Int-mode hypothesis to the body's ctx. Lean lacks
-            // an `HXor Int Int Int` instance (and similar for
-            // `HAnd`/`HOr`), so an Int-mode `x ^^^ y` doesn't
-            // typecheck. The bit_vector assertion verifies in BV
-            // mode; users who need the fact in Int-mode body
-            // context can re-derive it via `assert(P) by { ... }`
-            // with their own tactic. Future work (#130 follow-up):
-            // either render bitwise ops via `Int.xor` etc., or add
-            // `HXor Int Int Int` instances in TactusPrelude that
-            // delegate to the function form.
-            let req_conj = and_all(req_lexprs);
-            let ens_conj = and_all(ens_lexprs);
-            // Use the first ensure's span when present — that's the
-            // user's `assert(…) by(bit_vector)` site. Falls back to
-            // the stm's span via the caller-side wrapping if absent.
-            let rust_loc = ensures.first()
-                .map(|e| format_rust_loc(&e.span))
-                .or_else(|| requires.first().map(|r| format_rust_loc(&r.span)))
-                .unwrap_or_default();
-            let rust_span = ensures.first()
-                .map(|e| e.span.clone())
-                .or_else(|| requires.first().map(|r| r.span.clone()));
-            Ok(Wp::AssertBitVector {
-                req_conj,
-                ens_conj,
-                rust_loc,
-                rust_span,
-                body: Box::new(after),
-            })
-        }
-        // `StmX::AssertQuery` with `AssertQueryMode::Tactus` is how
-        // `ast_to_sst` encodes an `assert(P) by { lean_tac }` (or
-        // a `proof { lean_tac }`) inside a `tactus_auto` fn (see
-        // `ExprX::AssertBy` handling there). We read the verbatim
-        // Lean tactic text from the original file via the
-        // `tactic_span` and produce a `Wp::AssertByTactus` node;
-        // `walk_assert_by_tactus` then either emits a single
-        // theorem with the user's tactic as the closer
-        // (`assert(P) by` form) or pushes the tactic as a prefix
-        // applied via `<;>` to every body theorem (`proof` form).
-        //
-        // **Shape**: `body` is a single `StmX::Assert(_, _, P)` —
-        // the asserted condition, produced by `ast_to_sst`'s
-        // Tactus-shortcut emission. `typ_inv_*` are intentionally
-        // empty (other AssertQuery modes use them for NonLinear/
-        // BitVector context). Extracting `P` from `body` keeps
-        // `AssertQueryMode::Tactus` itself small — no generic `Exp`
-        // field forcing derive-juggling on the enum.
-        //
-        // Other AssertQuery modes (NonLinear / BitVector) stay
-        // rejected — they're Z3-specific and don't route through
-        // the Lean WP pipeline.
-        StmX::AssertQuery { mode, typ_inv_exps: _, typ_inv_vars: _, body } => {
-            match mode {
-                AssertQueryMode::Tactus { tactic_span, kind } => {
-                    let cond = match &body.x {
-                        StmX::Assert(_, _, c) => c,
-                        _ => return Err(format!(
-                            "AssertQueryMode::Tactus body expected to be a single \
-                             StmX::Assert carrying the asserted condition, got {:?}",
-                            std::mem::discriminant(&body.x)
-                        )),
-                    };
-                    check_exp(cond)?;
-                    let (path, start, end) = tactic_span;
-                    let tactic_text = crate::source_util::read_tactic_from_source(
-                        path, *start, *end,
-                    ).ok_or_else(|| format!(
-                        "failed to read assert-by tactic from {} bytes [{}..{}]",
-                        path, start, end
-                    ))?;
-                    // `kind` distinguishes assert-by (wrap as `have
-                    // h : P := by <tac>`) from proof block (emit
-                    // `<tac>` raw). We encode that in `Wp::AssertByTactus`
-                    // by passing `Some(cond)` vs `None`.
-                    let cond_for_have = match kind {
-                        TactusKind::AssertBy => Some(crate::to_lean_sst_expr::Validated::check(cond)?),
-                        TactusKind::ProofBlock => None,
-                    };
-                    Ok(Wp::AssertByTactus {
-                        cond: cond_for_have,
-                        tactic_text,
-                        body: Box::new(after),
-                    })
-                }
-                AssertQueryMode::NonLinear => {
-                    // Verus's `ast_to_sst` (vir/src/ast_to_sst.rs:2322)
-                    // builds the body as a Block: `[Assume(req)*,
-                    // proof_stms*, Assert(ens)*]`. The body is the
-                    // inner verification query (Verus's "separate query
-                    // for NonLinear" semantics). We recurse `build_wp`
-                    // on it with a `Done(LitBool(true))` terminator
-                    // (proof scope has no return value); the resulting
-                    // Wp tree carries all obligations the body
-                    // generates. The walker enters a new OblCtx scope
-                    // for `body_wp` that switches the closer to
-                    // `nlinarith` and drops enclosing-scope Hyps,
-                    // matching Verus's NonLinear semantics.
-                    let body_wp = build_wp(
-                        body,
-                        Wp::Done(LExpr::lit_true()),
-                        ctx,
-                        loop_stack,
-                    )?;
-                    Ok(Wp::AssertQuery {
-                        primary: Tactic::Named("nlinarith".to_string()),
-                        preamble: nonlinear_preamble_fragments(),
-                        surface_label: "by(nonlinear_arith)".to_string(),
-                        body: Box::new(body_wp),
-                        after: Box::new(after),
-                    })
-                }
-                AssertQueryMode::BitVector => Err(
-                    // Defensive: Verus's `ast_to_sst` (vir/src/ast_to_sst.rs:2416)
-                    // converts user-syntax `assert by(bit_vector)` directly into
-                    // `StmX::AssertBitVector`, so this arm should be unreachable.
-                    // Hitting it means the upstream conversion pipeline drifted
-                    // — the dedicated `StmX::AssertBitVector` path (#111 / #130)
-                    // is what actually handles user `by(bit_vector)` asserts.
-                    "internal bug: AssertQueryMode::BitVector reached the SST \
-                     codegen — Verus's ast_to_sst should have already converted \
-                     this to StmX::AssertBitVector. Please open an issue.".to_string()
-                ),
-            }
-        }
+        // User-syntax `assert(…) by(bit_vector)` — see the helper.
+        StmX::AssertBitVector { requires, ensures } =>
+            build_wp_assert_bit_vector(requires, ensures, after),
+        // `assert(P) by { lean_tac }` / `proof { lean_tac }` /
+        // `assert by(nonlinear_arith)` — dispatch on mode in the helper.
+        StmX::AssertQuery { mode, typ_inv_exps: _, typ_inv_vars: _, body } =>
+            build_wp_assert_query(mode, body, after, ctx, loop_stack),
         StmX::DeadEnd(_) => Err(
             "Verus's internal `DeadEnd` marker reached the SST — this shouldn't \
              appear in user code. If you're seeing this, please open an issue.".to_string()
@@ -4633,6 +4492,158 @@ fn build_wp<'a>(
                 .collect();
             Ok(closure_decl_wp(closure_params, body_wp, cid, lambda, after))
         }
+    }
+}
+
+/// Build the Wp for a `StmX::AssertBitVector` — user-syntax
+/// `assert(…) by(bit_vector)` (#111 / #130).
+///
+/// Bit-vector mode: render requires + ensures via the BitVec-mode
+/// renderer (#130 first cut). u-typed variables get wrapped as
+/// `BitVec.ofInt n x`, so the resulting LExpr's bitwise ops resolve
+/// to BitVec instances and Lean's BitVec tactics (`decide`,
+/// `simp [BitVec.*]`) can reason about the goal.
+///
+/// Note: we deliberately do NOT publish the ensures as an Int-mode
+/// hypothesis to the body's ctx. Lean lacks an `HXor Int Int Int`
+/// instance (and similar for `HAnd`/`HOr`), so an Int-mode `x ^^^ y`
+/// doesn't typecheck. The bit_vector assertion verifies in BV mode;
+/// users who need the fact in Int-mode body context can re-derive it
+/// via `assert(P) by { ... }` with their own tactic. Future work
+/// (#130 follow-up): either render bitwise ops via `Int.xor` etc.,
+/// or add `HXor Int Int Int` instances in TactusPrelude that
+/// delegate to the function form.
+fn build_wp_assert_bit_vector<'a>(
+    requires: &[Exp],
+    ensures: &[Exp],
+    after: Wp<'a>,
+) -> Result<Wp<'a>, String> {
+    let req_lexprs: Vec<LExpr> = requires.iter()
+        .map(|r| crate::to_lean_sst_expr::sst_exp_to_bit_vector_ast(r))
+        .collect::<Result<Vec<_>, _>>()?;
+    let ens_lexprs: Vec<LExpr> = ensures.iter()
+        .map(|e| crate::to_lean_sst_expr::sst_exp_to_bit_vector_ast(e))
+        .collect::<Result<Vec<_>, _>>()?;
+    let req_conj = and_all(req_lexprs);
+    let ens_conj = and_all(ens_lexprs);
+    // Use the first ensure's span when present — that's the
+    // user's `assert(…) by(bit_vector)` site. Falls back to
+    // the stm's span via the caller-side wrapping if absent.
+    let rust_loc = ensures.first()
+        .map(|e| format_rust_loc(&e.span))
+        .or_else(|| requires.first().map(|r| format_rust_loc(&r.span)))
+        .unwrap_or_default();
+    let rust_span = ensures.first()
+        .map(|e| e.span.clone())
+        .or_else(|| requires.first().map(|r| r.span.clone()));
+    Ok(Wp::AssertBitVector {
+        req_conj,
+        ens_conj,
+        rust_loc,
+        rust_span,
+        body: Box::new(after),
+    })
+}
+
+/// Build the Wp for a `StmX::AssertQuery`, dispatching on mode.
+///
+/// `AssertQueryMode::Tactus` is how `ast_to_sst` encodes an
+/// `assert(P) by { lean_tac }` (or a `proof { lean_tac }`) inside a
+/// `tactus_auto` fn (see `ExprX::AssertBy` handling there). We read
+/// the verbatim Lean tactic text from the original file via the
+/// `tactic_span` and produce a `Wp::AssertByTactus` node;
+/// `walk_assert_by_tactus` then either emits a single theorem with
+/// the user's tactic as the closer (`assert(P) by` form) or pushes
+/// the tactic as a prefix applied via `<;>` to every body theorem
+/// (`proof` form).
+///
+/// **Shape**: `body` is a single `StmX::Assert(_, _, P)` — the
+/// asserted condition, produced by `ast_to_sst`'s Tactus-shortcut
+/// emission. `typ_inv_*` are intentionally empty (other AssertQuery
+/// modes use them for NonLinear/BitVector context). Extracting `P`
+/// from `body` keeps `AssertQueryMode::Tactus` itself small — no
+/// generic `Exp` field forcing derive-juggling on the enum.
+///
+/// `AssertQueryMode::NonLinear` is `assert by(nonlinear_arith)`.
+/// `AssertQueryMode::BitVector` should never reach here — `ast_to_sst`
+/// converts user `by(bit_vector)` to `StmX::AssertBitVector` upstream.
+fn build_wp_assert_query<'a>(
+    mode: &AssertQueryMode,
+    body: &'a Stm,
+    after: Wp<'a>,
+    ctx: &'a WpCtx<'a>,
+    loop_stack: &LoopStack<'_>,
+) -> Result<Wp<'a>, String> {
+    match mode {
+        AssertQueryMode::Tactus { tactic_span, kind } => {
+            let cond = match &body.x {
+                StmX::Assert(_, _, c) => c,
+                _ => return Err(format!(
+                    "AssertQueryMode::Tactus body expected to be a single \
+                     StmX::Assert carrying the asserted condition, got {:?}",
+                    std::mem::discriminant(&body.x)
+                )),
+            };
+            check_exp(cond)?;
+            let (path, start, end) = tactic_span;
+            let tactic_text = crate::source_util::read_tactic_from_source(
+                path, *start, *end,
+            ).ok_or_else(|| format!(
+                "failed to read assert-by tactic from {} bytes [{}..{}]",
+                path, start, end
+            ))?;
+            // `kind` distinguishes assert-by (wrap as `have
+            // h : P := by <tac>`) from proof block (emit
+            // `<tac>` raw). We encode that in `Wp::AssertByTactus`
+            // by passing `Some(cond)` vs `None`.
+            let cond_for_have = match kind {
+                TactusKind::AssertBy => Some(crate::to_lean_sst_expr::Validated::check(cond)?),
+                TactusKind::ProofBlock => None,
+            };
+            Ok(Wp::AssertByTactus {
+                cond: cond_for_have,
+                tactic_text,
+                body: Box::new(after),
+            })
+        }
+        AssertQueryMode::NonLinear => {
+            // Verus's `ast_to_sst` (vir/src/ast_to_sst.rs:2322)
+            // builds the body as a Block: `[Assume(req)*,
+            // proof_stms*, Assert(ens)*]`. The body is the
+            // inner verification query (Verus's "separate query
+            // for NonLinear" semantics). We recurse `build_wp`
+            // on it with a `Done(LitBool(true))` terminator
+            // (proof scope has no return value); the resulting
+            // Wp tree carries all obligations the body
+            // generates. The walker enters a new OblCtx scope
+            // for `body_wp` that switches the closer to
+            // `nlinarith` and drops enclosing-scope Hyps,
+            // matching Verus's NonLinear semantics.
+            let body_wp = build_wp(
+                body,
+                Wp::Done(LExpr::lit_true()),
+                ctx,
+                loop_stack,
+            )?;
+            Ok(Wp::AssertQuery {
+                primary: Tactic::Named("nlinarith".to_string()),
+                preamble: nonlinear_preamble_fragments(),
+                surface_label: "by(nonlinear_arith)".to_string(),
+                body: Box::new(body_wp),
+                after: Box::new(after),
+            })
+        }
+        AssertQueryMode::BitVector => Err(
+            // Defensive: Verus's `ast_to_sst` (vir/src/ast_to_sst.rs:2416)
+            // converts user-syntax `assert by(bit_vector)` directly into
+            // `StmX::AssertBitVector`, so this arm should be unreachable.
+            // Hitting it means the upstream conversion pipeline drifted
+            // — the dedicated `StmX::AssertBitVector` path (#111 / #130)
+            // is what actually handles user `by(bit_vector)` asserts.
+            "internal bug: AssertQueryMode::BitVector reached the SST \
+             codegen — Verus's ast_to_sst should have already converted \
+             this to StmX::AssertBitVector. Please open an issue.".to_string()
+        ),
     }
 }
 
