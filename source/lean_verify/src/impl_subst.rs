@@ -387,6 +387,28 @@ impl ImplSubst {
         rewrite_typ_rec(typ, &self.proj_map)
     }
 
+    /// Rewrite every projection inside an EXPR's embedded typs (node typs,
+    /// call typ args, binder annotations) via [`Self::rewrite_typ`]. No-op
+    /// when the impl has no projections. Shared by `augment_function`
+    /// (standalone-def bodies + clauses) and `trait_emit::trait_impl_to_ast`
+    /// (instance member bodies) — the latter previously skipped it, so an
+    /// instance body rendered `<T as DeepView>::V` as the malformed accessor
+    /// `view.DeepView.V T` while the standalone def of the SAME body rendered
+    /// the lifted binder (BUG-vstd-preamble-cluster.md bug 3).
+    ///
+    /// Composing `map_expr_typ_visitor` (callback at every typ level) with
+    /// the deep-recursive `rewrite_typ_rec` is safe HERE, unlike
+    /// `inline_spec`'s substitution (cluster bug 4): this rewrite's range is
+    /// fresh synthetic binder names, disjoint from its domain (projections),
+    /// so re-application over its own output is a no-op.
+    pub fn rewrite_expr_typs(&self, e: &Expr) -> Expr {
+        if self.proj_map.is_empty() {
+            return e.clone();
+        }
+        vir::ast_visitor::map_expr_typ_visitor(e, &|t| Ok(self.rewrite_typ(t)))
+            .expect("map_expr_typ_visitor: projection rewrite is total")
+    }
+
     /// The fresh binder Source-2/1 minted for an out-param named `assoc`, by
     /// NAME (ignoring which trait spells it). Used to fill an out-param slot in
     /// a forwarding instance's HEAD with the SAME binder the forwarding bound
@@ -484,15 +506,7 @@ impl ImplSubst {
         // are no projections (proj_map empty → every existing fn body is
         // returned unchanged). The rewrite is infallible (rewrite_typ_rec
         // is total over TypX).
-        let body = match sibling_rewritten {
-            Some(b) if !self.proj_map.is_empty() => Some(
-                vir::ast_visitor::map_expr_typ_visitor(&b, &|t| {
-                    Ok(rewrite_typ_rec(t, &self.proj_map))
-                })
-                .expect("map_expr_typ_visitor: projection rewrite is total"),
-            ),
-            other => other,
-        };
+        let body = sibling_rewritten.map(|b| self.rewrite_expr_typs(&b));
 
         // Step 3: lift assoc-type projections in the SPEC CLAUSES (require /
         // ensure / returns). A function's facts that flow to call sites and
@@ -504,12 +518,7 @@ impl ImplSubst {
         let (require, ensure, returns) = if self.proj_map.is_empty() {
             (f.require.clone(), f.ensure.clone(), f.returns.clone())
         } else {
-            let rw = |e: &Expr| -> Expr {
-                vir::ast_visitor::map_expr_typ_visitor(e, &|t| {
-                    Ok(rewrite_typ_rec(t, &self.proj_map))
-                })
-                .expect("map_expr_typ_visitor: projection rewrite is total")
-            };
+            let rw = |e: &Expr| -> Expr { self.rewrite_expr_typs(e) };
             let require: Exprs = Arc::new(f.require.iter().map(|e| rw(e)).collect());
             let ensure: (Exprs, Exprs) = (
                 Arc::new(f.ensure.0.iter().map(|e| rw(e)).collect()),

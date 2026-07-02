@@ -11189,6 +11189,39 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Assoc-type projection inside an instance member BODY's embedded typs
+// (BUG-vstd-preamble-cluster.md bug 3). `idp(self.a.get())` carries
+// `<A as Getter>::Out` as `idp`'s typ ARG — the standalone def of this
+// body gets the projection lift via `augment_function` step 2, but the
+// INSTANCE member body render used to skip it, emitting the malformed
+// accessor `Getter.Out A` (the vstd shape: `DeepView (Vec T A)`'s
+// instance body emitting `Seq.new (view.DeepView.V T) …`). Both renders
+// must produce the lifted `_tactus_assoc_*` binder.
+test_verify_one_file! {
+    #[test] test_instance_body_projection_lifted verus_code! {
+        pub trait Getter {
+            type Out;
+            spec fn get(&self) -> Self::Out;
+        }
+
+        pub open spec fn idp<X>(x: X) -> X { x }
+
+        pub struct Both<A, B> { pub a: A, pub b: B }
+
+        impl<A: Getter, B> Getter for Both<A, B> {
+            type Out = A::Out;
+
+            open spec fn get(&self) -> A::Out {
+                idp(self.a.get())
+            }
+        }
+
+        proof fn use_get<A: Getter, B>(x: Both<A, B>)
+            ensures idp(x.get()) == idp(x.get())
+        by { rfl }
+    } => Ok(())
+}
+
 // Probe (Bug B coverage extension): blanket impl with TWO typ-params,
 // each carrying its own assoc-type passthrough. Pins that
 // `ImplSubst::build` allocates distinct fresh binders for each

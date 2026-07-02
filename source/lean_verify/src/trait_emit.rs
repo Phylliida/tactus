@@ -828,6 +828,14 @@ pub fn trait_impl_to_ast(
                         let rewritten = crate::impl_subst::rewrite_self_sibling_calls(
                             body, &ti.trait_path, self_typ, &method_redirects,
                         );
+                        // Lift assoc-type projections in the body's embedded
+                        // typs — same rewrite the standalone def of this body
+                        // got via `augment_function` step 2. Without it, a
+                        // projection typ arg (`Seq.new (<T as DeepView>::V) …`)
+                        // renders as the malformed accessor `view.DeepView.V T`
+                        // (BUG-vstd-preamble-cluster.md bug 3). No-op for
+                        // projection-free impls.
+                        let rewritten = subst.rewrite_expr_typs(&rewritten);
                         // Wrap with `let p := p.deref` for each reference-
                         // decorated param so the body sees inner types.
                         let body_binders = crate::to_lean_expr::binder_ctx_from_params(&func.params);
@@ -900,12 +908,14 @@ pub fn trait_impl_to_ast(
                         // called spec methods emit as standalone
                         // defs before the instance.
                         let body = func.body.as_ref().unwrap();
-                        // VIR-level rewrite (same as the Spec case).
+                        // VIR-level rewrites (same as the Spec case):
+                        // sibling-call redirect + projection lift.
                         let self_typ = ti.trait_typ_args.first()
                             .expect("impl's trait_typ_args must include Self");
                         let rewritten = crate::impl_subst::rewrite_self_sibling_calls(
                             body, &ti.trait_path, self_typ, &method_redirects,
                         );
+                        let rewritten = subst.rewrite_expr_typs(&rewritten);
                         let body_binders = crate::to_lean_expr::binder_ctx_from_params(&func.params);
                         let value = wrap_body_with_param_derefs(
                             crate::to_lean_expr::vir_expr_to_ast_with_binders(&rewritten, &body_binders, &crate::expr_shared::RenderCtx::empty()),
