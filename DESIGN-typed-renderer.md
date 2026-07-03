@@ -1,5 +1,17 @@
 # Typed renderer graduation — survey & plan (2026-07-03)
 
+> **Progress ledger:** P0 DONE (`fb53eca`, unified bridge, 6 pins).
+> P1 DONE (SST typed spine; retired `sst_lean_wrap_count`,
+> `tuple_slot_extra_derefs`, `clip_to_node_checked`; D3 discovered).
+> P2 DONE (WP let-binder typ env on OblCtx, walk_let/chain/if-cond +
+> four walk-time render sites carry it; tuple-ctor slot coercion;
+> pin `test_exec_let_bound_tuple_projection`). All gates green at
+> every step (e2e 521/0, vstd 1530/0, group-theory 2811/32 baseline
+> unchanged). NEXT = P3 (VIR renderer + D3 classification there,
+> retires `render_expr_with_derefs` + `vir_ret_eq_rhs_typ`; also pick
+> up the build-phase render sites walk-time couldn't reach:
+> assign-lvalue rhs, Done leaf).
+
 The "Exhibit B full fix" (REVIEW-2026-07-02 § 2.1): make rendering
 return `(expr, typ)` everywhere so the invariant **rendered type ==
 claimed type** is structural instead of per-site discipline. Survey
