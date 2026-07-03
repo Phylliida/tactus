@@ -948,10 +948,18 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // unproven antecedent (which would be the False-hypothesis
     // anti-pattern). Applies to every theorem the fn emits (fn-scoped
     // broadcast); unused haves are harmless.
+    // `@`-form (N1, DESIGN-nonempty-axioms.md): axioms bracketed with
+    // `[Nonempty A]` make the bare `have h := f` form fail — instance
+    // implicits are maximally inserted, so Lean eagerly creates a
+    // `Nonempty ?A` goal that can't synthesize against a metavar
+    // ("typeclass instance problem is stuck"). `@f` binds the full ∀
+    // without instantiation, and the @-bound hypothesis remains
+    // simp_all-usable at concrete instantiations (N0 probe). Uniform:
+    // harmless for unbracketed axioms.
     let mut tactic_prefix: Vec<String> = Vec::new();
     if !broadcast_lemmas.is_empty() {
         let haves: String = broadcast_lemmas.iter().enumerate()
-            .map(|(i, f)| format!("have _tactus_bc_{} := {}", i, lean_name(&f.path)))
+            .map(|(i, f)| format!("have _tactus_bc_{} := @{}", i, lean_name(&f.path)))
             .collect::<Vec<_>>()
             .join("\n");
         tactic_prefix.push(haves);

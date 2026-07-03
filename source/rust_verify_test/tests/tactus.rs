@@ -2882,10 +2882,14 @@ test_verify_one_file! {
 }
 
 // Surface 2: GENERATED axioms for uninterpreted vstd spec fns —
-// `axiom seq.Seq.index (A : Type) (self : seq.Seq A) (i : Int) : A`,
-// exploitable because the (also unconditional) instInhabited axiom
-// provides `default : seq.Seq Empty`. The requires clause references
-// s@[0] purely to pull Seq.index into the emitted preamble.
+// formerly `axiom seq.Seq.index (A : Type) (self : seq.Seq A)
+// (i : Int) : A`, exploitable because the (also unconditional)
+// instInhabited axiom provides `default : seq.Seq Empty`. CLOSED by
+// N1 (DESIGN-nonempty-axioms.md): body-less spec fns with a
+// param-mentioning ret typ get `[Nonempty A]` brackets, so the
+// exploit's instantiation at Empty fails instance synthesis. The
+// requires clause references s@[0] purely to pull Seq.index into the
+// emitted preamble.
 test_verify_one_file! {
     #[test] test_soundness_hole_generated_seq_index_inhabits_empty verus_code! {
         use vstd::prelude::*;
@@ -2896,7 +2900,13 @@ test_verify_one_file! {
             ensures false,
         {
         }
-    } => Ok(())
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("Nonempty")),
+            "expected Nonempty-synthesis failure blocking the exploit, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
 }
 
 // ── assume(P) warning ─────────────────────────────────────────────
