@@ -221,6 +221,61 @@ pub fn compute_nonempty_needs<'a>(all_fns: &[&'a FunctionX]) -> NonemptyNeeds<'a
         }
     }
 
+    // Seed 4 (DESIGN-nonempty-axioms.md N3): a Prop-valued axiom whose
+    // CONCLUSION asserts `∃ x : T, …` inhabits T via Classical.choice
+    // just as surely as a value-typed axiom returns one. Seed
+    // [Nonempty] for every typ param / projection mentioned in an
+    // Exists binder typ within the ENSURES clauses. Ensures-only:
+    // requires-side ∃ are hypotheses, not productions. Over-
+    // approximates position (an ∃ under negation isn't producing) —
+    // sound, the bracket just narrows instantiation. Known residual
+    // (documented in DESIGN.md): classically-existential shapes with
+    // no Exists node (`¬∀`) are not caught.
+    for f in all_fns {
+        let mut params: HashSet<usize> = HashSet::new();
+        let mut projs: Vec<Typ> = Vec::new();
+        {
+            let scan = &mut |e: &Expr| {
+                let ExprX::Quant(q, binders, _) = &e.x else { return; };
+                if q.quant != air::ast::Quant::Exists {
+                    return;
+                }
+                for b in binders.iter() {
+                    let _ = vir::ast_visitor::typ_visitor_check::<(), _>(&b.a, &mut |t: &Typ| {
+                        match &**t {
+                            TypX::TypParam(name) => {
+                                if let Some(i) = f.typ_params.iter().position(|p| p == name) {
+                                    params.insert(i);
+                                }
+                            }
+                            TypX::Projection { .. } => {
+                                let key = format!("{:?}", t);
+                                if !projs.iter().any(|p| format!("{:?}", p) == key) {
+                                    projs.push(t.clone());
+                                }
+                            }
+                            _ => {}
+                        }
+                        Ok(())
+                    });
+                }
+            };
+            for e in f.ensure.0.iter().chain(f.ensure.1.iter()) {
+                walk_expr(e, scan);
+            }
+        }
+        if !params.is_empty() || !projs.is_empty() {
+            let entry = needs.entry(&f.name).or_default();
+            entry.params.extend(params);
+            for t in projs {
+                let key = format!("{:?}", t);
+                if !entry.projs.iter().any(|p| format!("{:?}", p) == key) {
+                    entry.projs.push(t);
+                }
+            }
+        }
+    }
+
     // Fn lookup for proj-need substitution (callee typ_params).
     let fn_by_name: HashMap<&Fun, &FunctionX> =
         all_fns.iter().map(|f| (&f.name, *f)).collect();

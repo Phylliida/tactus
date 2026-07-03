@@ -5,6 +5,25 @@ emitted Lean axiom environment is INCONSISTENT. Scoped with the N0
 de-risking experiments already run; implementation is a follow-up
 session.
 
+> **ARC COMPLETE (same day).** N0′ pinned both exploits in-harness
+> (they VERIFIED — False derived end-to-end); N1 bracketed generated
+> axioms (Seed 2 + proj-typed needs propagating SUBSTITUTED +
+> order-flip so proj bounds ride the impl_subst rewrite + @-form
+> haves + wrapper Nonempty instances); N2 bracketed `Tactus.index`
+> (Seed 3: index isn't a Call — scan element typs directly); N3
+> covered ∃-conclusions (Seed 4, ensures-only) and wrote the
+> model-existence argument into DESIGN.md § "Axiom-environment
+> consistency". Both exploit pins now assert
+> Err(failed to synthesize Nonempty Empty). Implementation surprises
+> worth remembering: trait method DECLS must be excluded from Seed 2
+> (they emit as class fields; seeding them cascaded premises onto
+> instances and broke typeclass resolution); the broadcast-axiom
+> emission path had its own augment ordering to flip; substituted
+> proj needs that land concrete must be SKIPPED (Lean resolves them;
+> recording renders unrewritable names). Gates at every phase: e2e
+> 524/0, vstd 1530/0, group-theory 2820/32 (error set identical to
+> baseline; verified count +9).
+
 ## The hole (verified)
 
 Value-producing axioms over bare type params globally inhabit every
