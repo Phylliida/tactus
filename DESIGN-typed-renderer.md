@@ -71,6 +71,22 @@ peeled typs). Passthrough guarantee: when actual == slot in both
 dimensions, output is byte-identical to today — this is what keeps
 goal-shape churn near zero during migration.
 
+**D3 — trust classification (discovered during P1, 2026-07-03).**
+Claimed typs LIE in places beyond the known projection cases: VIR's
+poly-boxing claims wrapper-decorated typs at Var uses whose bound
+value is bare (`Box::new` ctor lowering: `Unbox(tmp : Box<u8>) : u8`
+with `tmp` bound to the bare inner value). The old renderer's
+claimed-typ contract silently CANCELED such lies; an actual-typ spine
+that naively propagates them ACTS on them. Rule: an actual typ
+propagates through typ-shifting transparent nodes (Box/Unbox) only
+when it comes from a TRUSTED source — binder lookup, render-time
+substitution, tuple-slot rule, Clip — otherwise reset to the claimed
+contract (`actual_is_trusted`, mirroring `sst_lean_wrap_count`'s old
+trust-binders-distrust-claims semantics). P2's WP let-binder typ
+environment (binder typs recorded from the RHS's rendered actual, not
+the declared SST typ) extends the trusted set and lifts the resets.
+P3 must apply the same classification on the VIR side.
+
 **D2 — actual-typ table.** Write the per-node rule as part of Phase 1
 and pin it in the module doc. The interesting rows (everything else is
 "claimed typ is correct"):
