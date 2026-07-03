@@ -2896,7 +2896,7 @@ fn emit_call_precondition_theorem(
 }
 
 // Ret-substitution detection (#128) lives in `crate::ret_subst`.
-use crate::ret_subst::{extract_top_level_eq_for, is_trivial_true};
+use crate::ret_subst::is_trivial_true;
 
 /// A returned-mut-ref prophecy for one call whose dest is `MutRef`-typed.
 /// Named (vs a positional tuple) per the codebase's convention — each field
@@ -2979,10 +2979,29 @@ fn push_post_call_frames(
     push_prophecy_frames(return_prophecy.as_ref(), callee, subst, dest, &mut new_obl);
 
     // Phases 2/3 — or the #128 substitution path replacing them.
-    let substituted_ensures =
-        render_call_ensures(ensures, subst, return_prophecy.as_ref(), callee, render_ctx);
+    // P3 (DESIGN-typed-renderer.md): single-walk ret-eq extraction on
+    // the VIR side, where the tree is TYPED. On a hit, the eq conjunct
+    // is omitted from the rendered ensures (REST) and E renders
+    // separately through the same pipeline, carrying its VIR typ for
+    // the #128 sort reconciliation — no rendered-side extraction, no
+    // shadow twin, no mirror-matching to keep consistent.
+    let ret_eq = vir_find_ret_eq(ensures, subst);
+    let substituted_ensures = render_call_ensures(
+        ensures,
+        subst,
+        return_prophecy.as_ref(),
+        callee,
+        render_ctx,
+        ret_eq.as_ref().map(|q| (q.clause_idx, q.conjunct_idx)),
+    );
+    let eq_extraction: Option<(LExpr, Typ)> = ret_eq.map(|q| {
+        (
+            render_call_ensure_expr(q.rhs, subst, return_prophecy.as_ref(), callee, render_ctx),
+            q.rhs.typ.clone(),
+        )
+    });
     let (dest_value, use_dest_name) =
-        push_ret_frames(substituted_ensures, ensures, callee, subst, dest, &mut new_obl);
+        push_ret_frames(substituted_ensures, eq_extraction, callee, subst, dest, &mut new_obl);
 
     // Phase 4.
     push_mut_rebinds(callee, subst, &mut new_obl);
@@ -3158,35 +3177,17 @@ fn push_prophecy_frames(
 /// `build_call_substitutions`), plus both ret names → fresh_ret_name.
 /// So substituting either the trait's or the impl's clauses
 /// works regardless of whether trait/impl param names match.
-fn render_call_ensures(
-    ensures: &[&Expr],
+/// Post-render substitution for inlined ensures: type-arg substitution
+/// and ret-name swap (Var(callee_ret) → Var(fresh_ret_name)), plus the
+/// returned-mut-ref `<ret>_final_tactus → P` entry. Value-level param
+/// substitution happened at render time via `ens_value_subst` in the
+/// active RenderCtx — carries typ info, so wrapper bridges fire
+/// correctly at each use site.
+fn build_ens_post_render_subst(
     subst: &CallSubstitutions,
     return_prophecy: Option<&ReturnProphecy>,
     callee: &FunctionX,
-    render_ctx: &crate::expr_shared::RenderCtx,
-) -> Option<LExpr> {
-    let ensures_clauses: Vec<LExpr> = ensures.iter()
-        .map(|expr| {
-            let rewritten = rewrite_varat_for_mut_params(expr, &subst.mut_param_names);
-            // Returned-mut-ref: rewrite `*final(ret)` → `Var(final_var)`
-            // so it renders distinct from `*current(ret)` (which stays
-            // `Var(ret) → fresh_ret`). The `final_var → P` post-render
-            // subst below sends it to the prophecy var.
-            let rewritten = match &return_prophecy {
-                Some(rp) => {
-                    rewrite_return_final_ref(&rewritten, &callee.ret.x.name, &rp.final_var)
-                }
-                None => rewritten,
-            };
-            vir_expr_to_ast_for_inlining_with_ctx(&rewritten, render_ctx)
-        })
-        .collect();
-    // Post-render substitute only handles type-arg substitution and
-    // ret-name swap (Var(callee_ret) → Var(fresh_ret_name)), plus the
-    // returned-mut-ref `<ret>_final_tactus → P` entry. Value-level param
-    // substitution happened at render time via `ens_value_subst` in the
-    // active RenderCtx — carries typ info, so wrapper bridges fire
-    // correctly at each use site.
+) -> HashMap<crate::lean_name::LeanName, LExpr> {
     let mut post_render_subst: HashMap<crate::lean_name::LeanName, LExpr> = subst.typ_subst.iter()
         .chain(subst.ret_subst.iter())
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -3202,72 +3203,201 @@ fn render_call_ensures(
             p_inner,
         );
     }
+    post_render_subst
+}
+
+/// Render ONE ensures expression (a whole clause, a kept conjunct of
+/// the skip clause, or the extracted `E`) through the full inlining
+/// pipeline: mut-param VarAt rewrite, returned-mut-ref final rewrite,
+/// inlining render, post-render substitution. Applying the post-render
+/// substitute per-expression is equivalent to the old whole-conjunction
+/// application (substitution distributes over `And`).
+fn render_call_ensure_expr(
+    expr: &Expr,
+    subst: &CallSubstitutions,
+    return_prophecy: Option<&ReturnProphecy>,
+    callee: &FunctionX,
+    render_ctx: &crate::expr_shared::RenderCtx,
+) -> LExpr {
+    let rewritten = rewrite_varat_for_mut_params(expr, &subst.mut_param_names);
+    // Returned-mut-ref: rewrite `*final(ret)` → `Var(final_var)`
+    // so it renders distinct from `*current(ret)` (which stays
+    // `Var(ret) → fresh_ret`). The `final_var → P` post-render
+    // subst sends it to the prophecy var.
+    let rewritten = match &return_prophecy {
+        Some(rp) => rewrite_return_final_ref(&rewritten, &callee.ret.x.name, &rp.final_var),
+        None => rewritten,
+    };
+    let rendered = vir_expr_to_ast_for_inlining_with_ctx(&rewritten, render_ctx);
+    substitute(
+        &rendered,
+        &build_ens_post_render_subst(subst, return_prophecy, callee),
+    )
+}
+
+/// Render the callee's ensures clauses for call-site inlining. With
+/// `skip_conjunct: Some((clause_idx, conjunct_idx))` (P3 ret-eq
+/// extraction), that conjunct is OMITTED: its clause is flattened via
+/// `vir_top_conjuncts` (the same walk `vir_find_ret_eq` indexed by)
+/// and the kept conjuncts render individually. Returns `None` when
+/// nothing remains.
+fn render_call_ensures(
+    ensures: &[&Expr],
+    subst: &CallSubstitutions,
+    return_prophecy: Option<&ReturnProphecy>,
+    callee: &FunctionX,
+    render_ctx: &crate::expr_shared::RenderCtx,
+    skip_conjunct: Option<(usize, usize)>,
+) -> Option<LExpr> {
+    let mut ensures_clauses: Vec<LExpr> = Vec::new();
+    for (ci, expr) in ensures.iter().enumerate() {
+        match skip_conjunct {
+            Some((sc, sk)) if sc == ci => {
+                let mut cs = Vec::new();
+                vir_top_conjuncts(expr, &mut cs);
+                for (ki, c) in cs.iter().enumerate() {
+                    if ki == sk {
+                        continue;
+                    }
+                    ensures_clauses.push(render_call_ensure_expr(
+                        c, subst, return_prophecy, callee, render_ctx,
+                    ));
+                }
+            }
+            _ => ensures_clauses.push(render_call_ensure_expr(
+                expr, subst, return_prophecy, callee, render_ctx,
+            )),
+        }
+    }
     if ensures_clauses.is_empty() {
         None
     } else {
-        Some(substitute(&and_all(ensures_clauses), &post_render_subst))
+        Some(and_all(ensures_clauses))
     }
 }
 
-/// VIR-side twin of `ret_subst::extract_top_level_eq_for`, recovering
-/// the TYPE of the eq-conjunct's value side. The rendered extraction is
-/// untyped (`LExpr`), but the #128 substitution path needs the value's
-/// numeric render sort to bridge it to the dest's declared typ: an
-/// int-typed ensures (`d == spec_delta(a as int, b as int)`) on a
-/// usize-returning fn otherwise binds `let d := E` with `E : ℤ` while
-/// every downstream use is ℕ-typed — an ill-typed theorem
-/// (BUG 2026-07-03, `torus_dist2` shape; same "rendered type ==
-/// claimed typ" invariant as BUG-vstd-preamble-cluster bug 5, numeric
-/// flavor). Mirrors the rendered walk so both extractions pick the same
-/// conjunct: same clause order, same left-to-right And flattening,
-/// first Eq with a bare ret-Var side wins; peels exactly the wrappers
-/// that render transparently (Trigger / CoerceMode) — a `Clip`-wrapped
-/// ret would NOT render as a bare Var, and correspondingly isn't peeled
-/// here.
-fn vir_ret_eq_rhs_typ(ensures: &[&Expr], subst: &CallSubstitutions) -> Option<Typ> {
-    fn peel(e: &Expr) -> &Expr {
-        match &e.x {
-            ExprX::Unary(UnaryOp::Trigger(_), inner)
-            | ExprX::Unary(UnaryOp::CoerceMode { .. }, inner) => peel(inner),
-            _ => e,
-        }
+/// Peel the VIR wrappers that render transparently (Trigger /
+/// CoerceMode) — a `Clip`-wrapped node would NOT render transparently
+/// and correspondingly isn't peeled. Shared by the ret-eq extraction
+/// and the skip-conjunct rendering so both flatten identically.
+fn vir_peel_transparent(e: &Expr) -> &Expr {
+    match &e.x {
+        ExprX::Unary(UnaryOp::Trigger(_), inner)
+        | ExprX::Unary(UnaryOp::CoerceMode { .. }, inner) => vir_peel_transparent(inner),
+        _ => e,
     }
-    fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
-        let e = peel(e);
-        if let ExprX::Binary(BinaryOp::And, l, r) = &e.x {
-            conjuncts(l, out);
-            conjuncts(r, out);
-        } else {
-            out.push(e);
-        }
+}
+
+/// Flatten the top-level `And`-tree of a VIR ensures clause into its
+/// leaf conjuncts (peeled). Top-level only — a conjunct buried inside
+/// Or / Implies / quantifiers does NOT uniquely determine anything
+/// (#128's conservative scope).
+fn vir_top_conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    let e = vir_peel_transparent(e);
+    if let ExprX::Binary(BinaryOp::And, l, r) = &e.x {
+        vir_top_conjuncts(l, out);
+        vir_top_conjuncts(r, out);
+    } else {
+        out.push(e);
     }
-    // The ret is referenced as a plain `Var` or a whole-local place read
-    // `ReadPlace(Local(d))` — the same reference shapes
-    // `inline_spec::substitute_body` handles for params.
-    let is_ret_var = |e: &Expr| -> bool {
-        let ident = match &peel(e).x {
-            ExprX::Var(v) => Some(v),
-            ExprX::ReadPlace(place, _) => match &place.x {
-                vir::ast::PlaceX::Local(v) => Some(v),
-                _ => None,
-            },
-            _ => None,
-        };
-        ident.is_some_and(|v| {
-            subst.ret_subst.contains_key(&crate::lean_name::LeanName::from_var_ident(v))
-        })
+}
+
+/// A `ret == E` conjunct found in the callee's VIR ensures.
+struct VirRetEq<'a> {
+    /// Index into the `ensures` clause slice.
+    clause_idx: usize,
+    /// Index into that clause's top-level And-flatten
+    /// (`vir_top_conjuncts` order).
+    conjunct_idx: usize,
+    /// E — the value side. TYPED: `rhs.typ` is the VIR typ the #128
+    /// sort reconciliation needs.
+    rhs: &'a Expr,
+}
+
+/// Single-walk ret-eq extraction (#128, P3 DESIGN-typed-renderer.md).
+/// Finds a top-level conjunct `Eq(ret, E)` (or commuted) in the
+/// callee's ensures ON THE VIR SIDE, where the tree is typed — the
+/// successor of the two-walk design (rendered-side
+/// `ret_subst::extract_top_level_eq_for` + a VIR "twin" recovering
+/// E's typ for sort reconciliation), whose mirror-matching had to stay
+/// consistent by hand.
+///
+/// Match scope mirrors the retired rendered extraction: top-level
+/// And-tree only; first match in clause order wins (spec-first for
+/// trait-method impls, #86 — if both spec and impl carry `r == E`,
+/// the spec's is taken and the impl's lands in REST, substituting to
+/// `E_impl == E_spec`, consistent by impl ⇒ trait). Self-referential
+/// candidates (`r == E` where E mentions r) are SKIPPED — substituting
+/// would loop. The mention scan is scope-UNAWARE (a shadowed rebind of
+/// the ret name inside E conservatively rejects that candidate; at
+/// worst we fall to the ∀-path — never wrong). The ret is referenced
+/// as a plain `Var` or a whole-local place read `ReadPlace(Local(d))`
+/// — the same reference shapes `inline_spec::substitute_body` handles
+/// for params.
+fn vir_find_ret_eq<'a>(ensures: &[&'a Expr], subst: &CallSubstitutions) -> Option<VirRetEq<'a>> {
+    let is_ret_ident = |v: &VarIdent| -> bool {
+        subst.ret_subst.contains_key(&crate::lean_name::LeanName::from_var_ident(v))
     };
-    for ens in ensures {
+    // A place whose base local is the ret, peeling DerefMut layers:
+    // the mut-ref current-value read `*ret` is
+    // `ReadPlace(DerefMut(Local(ret)))` (vstd's `&mut`-returning
+    // ensures, e.g. vec_index_mut's `*result == v@[i]`), and it
+    // renders as the BARE fresh-ret binder in the inlining ctx — the
+    // retired rendered-side extraction matched it, so this walk must
+    // too (the raw substitution `dest := E` it produces is the pinned
+    // behavior; the ∀-path would type the binder at `MutRef T` and
+    // ill-type the eq hypothesis against the value-typed E).
+    fn place_ret_local<'p>(place: &'p vir::ast::Place) -> Option<&'p VarIdent> {
+        match &place.x {
+            vir::ast::PlaceX::Local(v) => Some(v),
+            vir::ast::PlaceX::DerefMut(inner) => place_ret_local(inner),
+            _ => None,
+        }
+    }
+    let is_ret_var = |e: &Expr| -> bool {
+        match &vir_peel_transparent(e).x {
+            ExprX::Var(v) => is_ret_ident(v),
+            ExprX::ReadPlace(place, _) => {
+                place_ret_local(place).is_some_and(|v| is_ret_ident(v))
+            }
+            _ => false,
+        }
+    };
+    let mentions_ret = |e: &Expr| -> bool {
+        let mut found = false;
+        vir::ast_visitor::expr_visitor_walk(e, &mut |sub: &Expr| {
+            let hit = match &sub.x {
+                ExprX::Var(v) | ExprX::VarLoc(v) | ExprX::VarAt(v, _) => is_ret_ident(v),
+                ExprX::ReadPlace(place, _) => {
+                    place_ret_local(place).is_some_and(|v| is_ret_ident(v))
+                }
+                _ => false,
+            };
+            if hit {
+                found = true;
+                vir::visitor::VisitorControlFlow::Stop(())
+            } else {
+                vir::visitor::VisitorControlFlow::Recurse
+            }
+        });
+        found
+    };
+    for (clause_idx, ens) in ensures.iter().enumerate() {
         let mut cs = Vec::new();
-        conjuncts(ens, &mut cs);
-        for c in cs {
+        vir_top_conjuncts(ens, &mut cs);
+        for (conjunct_idx, c) in cs.iter().enumerate() {
             if let ExprX::Binary(BinaryOp::Eq(_), lhs, rhs) = &c.x {
-                if is_ret_var(lhs) {
-                    return Some(rhs.typ.clone());
+                let value = if is_ret_var(lhs) {
+                    rhs
+                } else if is_ret_var(rhs) {
+                    lhs
+                } else {
+                    continue;
+                };
+                if mentions_ret(value) {
+                    continue;
                 }
-                if is_ret_var(rhs) {
-                    return Some(lhs.typ.clone());
-                }
+                return Some(VirRetEq { clause_idx, conjunct_idx, rhs: value });
             }
         }
     }
@@ -3281,16 +3411,18 @@ fn vir_ret_eq_rhs_typ(ensures: &[&Expr], subst: &CallSubstitutions) -> Option<Ty
 /// the substitution path), and whether the ∀-binder already carries
 /// the dest's name (Approach A — Phase 5's alias `let` is dropped).
 ///
-/// #128: try ret-substitution. If the substituted ensures has a
-/// top-level conjunct `Eq(Var(fresh_ret), E)` (or commuted), we
-/// can skip the `∀ ret + ret_bound` chain and bind `dest := E`
-/// directly. Falls through to the ∀-path when no such conjunct
-/// exists — or (sort reconciliation, 2026-07-03) when E's numeric
-/// render sort can't be established, so we never bind a ℤ value into
-/// ℕ-typed downstream arithmetic.
+/// #128: ret-substitution. When `eq_extraction` is `Some((E, E_typ))`
+/// — the VIR-side single-walk extraction found `ret == E` (P3) — we
+/// skip the `∀ ret + ret_bound` chain and bind `dest := E` directly;
+/// `substituted_ensures` is then REST (the eq conjunct already
+/// omitted). E's typ is always known (it rode along from the VIR
+/// tree), so the sort reconciliation (2026-07-03) never needs a
+/// conservative fallback: `coerce_lexpr` bridges E to the dest's
+/// declared render sort unconditionally for integer rets. `None` →
+/// the ∀-path, with `substituted_ensures` the full conjunction.
 fn push_ret_frames(
     substituted_ensures: Option<LExpr>,
-    ensures: &[&Expr],
+    eq_extraction: Option<(LExpr, Typ)>,
     callee: &FunctionX,
     subst: &CallSubstitutions,
     dest: Option<&VarIdent>,
@@ -3302,30 +3434,22 @@ fn push_ret_frames(
     // `Int.toNat` bridge); the dest binding and rest-ensures
     // substitution use bridged E (the dest's declared render sort, so
     // downstream slots typecheck).
-    let ret_substitution: Option<(LExpr, LExpr, LExpr)> = substituted_ensures.as_ref()
-        .and_then(|conj| extract_top_level_eq_for(conj, &subst.fresh_ret_name))
-        .and_then(|(e, rest)| {
-            if crate::expr_shared::int_range_of(&ret.typ).is_none() {
-                // Non-integer ret (Bool/Prop/datatype): numeric sorts
-                // don't apply — the cond_setup case; raw is correct.
-                return Some((e.clone(), e, rest));
-            }
-            match vir_ret_eq_rhs_typ(ensures, subst) {
-                // The unified bridge (expr_shared::coerce_lexpr, P0)
-                // reconciles E's render sort — and wrapper depth, if E
-                // ever carries one — to the dest's declared typ.
-                Some(src_typ) => {
-                    let bridged =
-                        crate::expr_shared::coerce_lexpr(e.clone(), &src_typ, &ret.typ);
-                    Some((e, bridged, rest))
-                }
-                // Integer dest but the VIR twin couldn't establish the
-                // value's sort — conservatively take the ∀-path (whose
-                // binder is typed at the dest, always well-typed)
-                // rather than guess.
-                None => None,
-            }
-        });
+    let ret_substitution: Option<(LExpr, LExpr, LExpr)> = eq_extraction.map(|(e, e_typ)| {
+        let rest = substituted_ensures
+            .clone()
+            .unwrap_or_else(|| LExpr::new(crate::lean_ast::ExprNode::LitBool(true)));
+        if crate::expr_shared::int_range_of(&ret.typ).is_none() {
+            // Non-integer ret (Bool/Prop/datatype): numeric sorts
+            // don't apply — the cond_setup case; raw is correct.
+            (e.clone(), e, rest)
+        } else {
+            // The unified bridge (expr_shared::coerce_lexpr, P0)
+            // reconciles E's render sort — and wrapper depth, if E
+            // ever carries one — to the dest's declared typ.
+            let bridged = crate::expr_shared::coerce_lexpr(e.clone(), &e_typ, &ret.typ);
+            (e, bridged, rest)
+        }
+    });
 
     // The value bound to `dest` differs by path: in the ∀-path,
     // `dest := fresh_ret_name` (the ∀-bound); in the substitution
