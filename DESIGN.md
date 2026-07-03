@@ -4491,6 +4491,36 @@ merge must not let `ctx.binder_typs` leak into Var-arm lookups there),
 and the ad-hoc coercion sites migrate to `TypedExpr`/`coerce_lexpr`
 cluster by cluster, each gated on the e2e suite.
 
+**GRADUATED (2026-07-03, the typed-renderer arc —
+DESIGN-typed-renderer.md is the full survey/ledger).** TypedExpr is no
+longer opportunistic polish; it is the SST renderer's internal
+contract:
+
+* **P0**: `coerce_lexpr` unified over BOTH mismatch dimensions —
+  wrapper depth AND numeric render sort (`Int.toNat`/`Int.ofNat` at
+  the bare numeric core, composing with peel/rewrap) — with a
+  passthrough guarantee (byte-identical output when dimensions match).
+* **P1**: `to_lean_sst_expr::exp_to_typed` renders with ACTUAL typs
+  internally; the public entry bridges to the claimed typ at the
+  boundary. Retired: `sst_lean_wrap_count`, `tuple_slot_extra_derefs`,
+  `clip_to_node_checked`. **D3 trust classification**: claimed typs
+  LIE at some Var uses (VIR poly-boxing, `Box::new` ctor lowering), so
+  actual typs propagate through typ-shifting transparent nodes
+  (Box/Unbox) only from TRUSTED sources — binder lookup, render-time
+  subst, tuple-slot rule, Clip (`actual_is_trusted`).
+* **P2**: the WP walker RECORDS every let binding
+  (`OblCtx::let_binder_typs`, typ + trust bit); trusted entries lift
+  the Box/Unbox resets. Tuple-ctor fields coerce into slot typs.
+* **P3**: the VIR renderer was found to already BE a pull-model typed
+  renderer (`structural_typ` = the actual-typ table, `None` = trust
+  claims; `apply_ref_coercion_if_needed` = per-node boundary) — no
+  rebuild. The #128 ret-eq extraction became ONE walk on the typed VIR
+  tree (`vir_find_ret_eq`); the rendered-side extraction and its
+  VIR typ-recovery twin are deleted.
+
+The remaining ad-hoc sites are targeted work items (see the
+DESIGN-typed-renderer.md ledger), not an architecture gap.
+
 ### Blanket-impl assoc-type passthrough (Bug B, LANDED 2026-05-19)
 
 Blanket impls like vstd's
