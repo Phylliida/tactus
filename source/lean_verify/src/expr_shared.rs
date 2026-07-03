@@ -122,6 +122,17 @@ pub struct RenderCtx<'a> {
     /// `None` outside per-fn body/ensures rendering (falls back to the
     /// spanned typ — identical to the prior behaviour).
     pub binder_typs: Option<&'a HashMap<VarIdent, Typ>>,
+    /// Let-bound locals' believed Lean typs, recorded by the WP walker
+    /// as it pushes `Let` frames (P2, DESIGN-typed-renderer.md):
+    /// `name → (typ the binding was coerced into, trusted)`. Keyed by
+    /// [`crate::lean_name::LeanName`] because `Wp::Let` carries the
+    /// rendered name, and the Var arm computes it before lookup anyway.
+    /// `trusted` = whether the RHS's actual typ came from a D3-trusted
+    /// source — untrusted entries behave exactly like claimed typs
+    /// (reset at Box/Unbox in `exp_to_typed`); trusted entries lift
+    /// the resets. `im::HashMap` for O(1) clone in the walker's
+    /// extend-per-frame pattern.
+    pub let_binder_typs: Option<&'a im::HashMap<crate::lean_name::LeanName, (Typ, bool)>>,
     /// Inlining-render mode: suppresses the `apply_ref_coercion_if_needed`
     /// lift at `ExprX::ReadPlace` sites. Callee-spec inlining substitutes
     /// the rendered form with a CALLER-provided arg that is already
@@ -137,12 +148,12 @@ impl<'a> RenderCtx<'a> {
     /// Empty context — class-method-call rendering falls back to
     /// no-coerce; Var substitution falls through to plain Var.
     pub fn empty() -> Self {
-        Self { fn_map: None, value_subst: None, value_subst_pre: None, binder_typs: None, inlining: false }
+        Self { fn_map: None, value_subst: None, value_subst_pre: None, binder_typs: None, let_binder_typs: None, inlining: false }
     }
 
     /// Context with fn_map for class-method-call rendering.
     pub fn with_fn_map(fn_map: &'a RenderFnMap<'a>) -> Self {
-        Self { fn_map: Some(fn_map), value_subst: None, value_subst_pre: None, binder_typs: None, inlining: false }
+        Self { fn_map: Some(fn_map), value_subst: None, value_subst_pre: None, binder_typs: None, let_binder_typs: None, inlining: false }
     }
 
     /// Attach the in-scope binder-typ map (see the `binder_typs` field).
@@ -173,6 +184,20 @@ impl<'a> RenderCtx<'a> {
         self.binder_typs.and_then(|m| m.get(v))
     }
 
+    /// Attach the walker's let-binder typ map (see the
+    /// `let_binder_typs` field). Builder-style.
+    pub fn with_let_binder_typs(
+        self,
+        m: &'a im::HashMap<crate::lean_name::LeanName, (Typ, bool)>,
+    ) -> Self {
+        Self { let_binder_typs: Some(m), ..self }
+    }
+
+    /// Let-binder lookup (see the `let_binder_typs` field).
+    pub fn let_binder(&self, name: &crate::lean_name::LeanName) -> Option<&'a (Typ, bool)> {
+        self.let_binder_typs.and_then(|m| m.get(name))
+    }
+
     /// Context with both fn_map and a render-time value substitution
     /// map. Used by call-site inlining paths (`emit_call_precondition_theorem`,
     /// `push_post_call_frames`) where mut-param substitution needs
@@ -181,7 +206,7 @@ impl<'a> RenderCtx<'a> {
         fn_map: &'a RenderFnMap<'a>,
         value_subst: &'a RenderValueSubst<'a>,
     ) -> Self {
-        Self { fn_map: Some(fn_map), value_subst: Some(value_subst), value_subst_pre: None, binder_typs: None, inlining: false }
+        Self { fn_map: Some(fn_map), value_subst: Some(value_subst), value_subst_pre: None, binder_typs: None, let_binder_typs: None, inlining: false }
     }
 
     /// Context with fn_map + both post-state and pre-state value
@@ -200,6 +225,7 @@ impl<'a> RenderCtx<'a> {
             value_subst: Some(value_subst),
             value_subst_pre: Some(value_subst_pre),
             binder_typs: None,
+            let_binder_typs: None,
             inlining: false,
         }
     }
@@ -215,6 +241,7 @@ impl<'a> RenderCtx<'a> {
             value_subst: self.value_subst_pre,
             value_subst_pre: self.value_subst_pre,
             binder_typs: self.binder_typs,
+            let_binder_typs: self.let_binder_typs,
             // Mid-render swap — the inlining mode must survive it (the
             // thread-local this field replaced persisted across the
             // whole recursive render).

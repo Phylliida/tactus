@@ -1284,6 +1284,14 @@ struct OblCtx {
     /// Plain `HashMap` (not `im`): `clone()` is a full copy, but the map is
     /// tiny (typically 0–1 entries), so the per-`with_frame` clone is cheap.
     prophecies: HashMap<String, crate::lean_name::LeanName>,
+    /// Let-bound locals' believed Lean typs (P2,
+    /// DESIGN-typed-renderer.md): recorded by `walk_let` as it pushes
+    /// `Let` frames, consumed by `exp_to_typed`'s Var arm via
+    /// `RenderCtx::with_let_binder_typs`. Entry = (typ the binding was
+    /// coerced into, D3-trusted bit). `im::HashMap` — O(1) clone in
+    /// the walker's extend-per-frame pattern; inner shadowing
+    /// overrides correctly because the walk descends scope-wise.
+    let_binder_typs: im::HashMap<crate::lean_name::LeanName, (Typ, bool)>,
 }
 
 impl OblCtx {
@@ -1297,6 +1305,7 @@ impl OblCtx {
             closer,
             closer_preamble: Vec::new(),
             prophecies: HashMap::new(),
+            let_binder_typs: im::HashMap::new(),
         }
     }
 
@@ -1340,6 +1349,19 @@ impl OblCtx {
         new
     }
 
+    /// Record a let-bound local's believed Lean typ (see
+    /// `let_binder_typs`). Returns a fresh OblCtx (O(1) via `im`).
+    fn with_let_binder(
+        &self,
+        name: crate::lean_name::LeanName,
+        typ: Typ,
+        trusted: bool,
+    ) -> Self {
+        let mut new = self.clone();
+        new.let_binder_typs.insert(name, (typ, trusted));
+        new
+    }
+
     /// Enter a new verification scope: like Verus's `AssertQuery`,
     /// the new ctx starts fresh (enclosing-scope Hyps shed — they
     /// aren't part of the query's input), with `closer` discharging
@@ -1365,7 +1387,15 @@ impl OblCtx {
             .collect();
         // Prophecies survive a scope boundary like Let/Binder frames:
         // they name a bound variable the scope's body may reference.
-        Self { frames, closer, closer_preamble: preamble, prophecies: self.prophecies.clone() }
+        // The let-binder typ env survives for the same reason: it
+        // describes Let frames, which are kept.
+        Self {
+            frames,
+            closer,
+            closer_preamble: preamble,
+            prophecies: self.prophecies.clone(),
+            let_binder_typs: self.let_binder_typs.clone(),
+        }
     }
 
     /// Wrap `goal` with all accumulated frames, outermost first
@@ -1716,7 +1746,10 @@ fn walk_obligations<'a>(
             let asserted_exp = asserted.raw();
             let kind = detect_assert_kind(asserted_exp);
             let loc = format_rust_loc(&asserted_exp.span);
-            let cond_ast = lower_validated_with_ctx(asserted, &ctx.render_ctx());
+            let cond_ast = lower_validated_with_ctx(
+                asserted,
+                &ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs),
+            );
             let goal = LExpr::span_mark(
                 loc.clone(),
                 Some(asserted_exp.span.clone()),
@@ -1736,7 +1769,10 @@ fn walk_obligations<'a>(
         }
         Wp::Assume(p, body) => {
             // No theorem; the assumption just enters the context.
-            let new_obl = obl.with_frame(CtxFrame::Hyp(lower_validated_with_ctx(p, &ctx.render_ctx())));
+            let new_obl = obl.with_frame(CtxFrame::Hyp(lower_validated_with_ctx(
+                p,
+                &ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs),
+            )));
             walk_obligations(body, ctx, &new_obl, e);
         }
         Wp::Hyp { hyp, body } => {
@@ -1887,7 +1923,10 @@ fn walk_obligations<'a>(
                 format_rust_loc(&cond.raw().span),
                 Some(cond.raw().span.clone()),
                 AssertKind::Hypothesis(HypothesisKind::BranchCondition),
-                lower_validated_with_ctx(cond, &ctx.render_ctx()),
+                lower_validated_with_ctx(
+                    cond,
+                    &ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs),
+                ),
             );
             walk_obligations(
                 then_branch, ctx,
@@ -1958,7 +1997,10 @@ fn walk_assert_by_tactus<'a>(
             // `assert(P) by { tac }` — same kind a plain
             // `assert(P)` would get via `detect_assert_kind`.
             let loc = format_rust_loc(&c.raw().span);
-            let cond_ast = lower_validated_with_ctx(&c, &ctx.render_ctx());
+            let cond_ast = lower_validated_with_ctx(
+                &c,
+                &ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs),
+            );
             let goal = LExpr::span_mark(
                 loc.clone(),
                 Some(c.raw().span.clone()),
@@ -3462,8 +3504,14 @@ fn walk_let<'a>(
     let peeled = peel_value_position(val);
     match &peeled.x {
         ExpX::If(cond, then_e, else_e) => {
-            let c_ast = sst_exp_to_ast_checked(cond)
-                .expect("walk_let if-cond: sub of validated Exp tree");
+            // P2: cond renders with the walk's binder-aware ctx + the
+            // obl's let-binder env (a fork condition can reference
+            // let-bound locals, e.g. `if pair.0 > 5`).
+            let c_ast = sst_exp_to_ast_checked_with_ctx(
+                cond,
+                &ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs),
+            )
+            .expect("walk_let if-cond: sub of validated Exp tree");
             walk_let(name, then_e, dest_typ, body, ctx,
                 &obl.with_frame(CtxFrame::Hyp(c_ast.clone())), e);
             walk_let(name, else_e, dest_typ, body, ctx,
@@ -3482,22 +3530,30 @@ fn walk_let<'a>(
                 if !bs.is_empty() {
                     let mut chain_obl = obl.clone();
                     for b in bs.iter() {
-                        // NB: these inner multi-binder binders are pushed
-                        // UN-coerced (no dest-typ coercion like the outer
-                        // let below) — `VarBinder` carries `b.a` (value)
-                        // but not the binder's declared typ, so there's no
-                        // coercion target. Harmless today: multi-binder
+                        // NB: these inner multi-binder binders bind at
+                        // `b.a.typ` (the claimed contract) — `VarBinder`
+                        // carries `b.a` (value) but not the binder's
+                        // declared typ, so there's no separate coercion
+                        // target. Harmless today: multi-binder
                         // `let (a,b) = …` is a defensive/unreached path
                         // (Verus destructures via Ctor + projection, not
-                        // `Bind(Let([..]))` — see DESIGN #92). If it ever
-                        // becomes live AND a destructured binder is auto-
-                        // ref'd, it'd need the same coercion the outer let
-                        // gets (would require threading per-binder dest typs).
-                        chain_obl.frames.push_back(CtxFrame::Let(
-                            crate::lean_name::LeanName::from_var_ident(&b.name),
-                            sst_exp_to_ast_checked(&b.a)
-                                .expect("walk_let binder rhs: sub of validated Exp tree"),
-                        ));
+                        // `Bind(Let([..]))` — see DESIGN #92).
+                        //
+                        // P2: rendered through the typed spine with the
+                        // walk's ctx and RECORDED in the let-binder env
+                        // at `b.a.typ` with the RHS's D3 trust bit.
+                        let rctx = ctx
+                            .render_ctx()
+                            .with_let_binder_typs(&chain_obl.let_binder_typs);
+                        let b_name = crate::lean_name::LeanName::from_var_ident(&b.name);
+                        let b_typed = crate::to_lean_sst_expr::sst_exp_to_typed(&b.a, &rctx)
+                            .expect("walk_let binder rhs: sub of validated Exp tree");
+                        let b_trusted =
+                            crate::to_lean_sst_expr::sst_actual_is_trusted(&b.a, &rctx);
+                        let b_value = b_typed.into_slot(&b.a.typ);
+                        chain_obl = chain_obl
+                            .with_frame(CtxFrame::Let(b_name.clone(), b_value))
+                            .with_let_binder(b_name, b.a.typ.clone(), b_trusted);
                     }
                     walk_let(name, inner_body, dest_typ, body, ctx, &chain_obl, e);
                     return;
@@ -3513,10 +3569,22 @@ fn walk_let<'a>(
     // the local's Lean value matches its declared typ — maintaining the
     // U2 invariant so downstream `count_ref(dest.typ)` deref sites are
     // correct. No-op when `val.typ == dest_typ` (the common case).
-    let rendered = sst_exp_to_ast_checked(val)
+    //
+    // P2 (DESIGN-typed-renderer.md): the RHS renders through the typed
+    // spine with the walk's binder-aware ctx (was: empty-ctx +
+    // claimed-typ coerce_lexpr — identical output when actual ==
+    // claimed), bridges into the dest typ, and the binding is RECORDED
+    // in the obl's let-binder env at `dest_typ` with its D3 trust bit —
+    // so downstream Var uses know the binder's believed typ, and
+    // trusted entries lift `exp_to_typed`'s Box/Unbox resets.
+    let rctx = ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs);
+    let val_typed = crate::to_lean_sst_expr::sst_exp_to_typed(val, &rctx)
         .expect("walk_let val: validated upstream via Wp::Let.value");
-    let coerced = crate::expr_shared::coerce_lexpr(rendered, &val.typ, dest_typ);
-    let new_obl = obl.with_frame(CtxFrame::Let(name.clone(), coerced));
+    let trusted = crate::to_lean_sst_expr::sst_actual_is_trusted(val, &rctx);
+    let coerced = val_typed.into_slot(dest_typ);
+    let new_obl = obl
+        .with_frame(CtxFrame::Let(name.clone(), coerced))
+        .with_let_binder(name.clone(), dest_typ.clone(), trusted);
     walk_obligations(body, ctx, &new_obl, e);
 }
 

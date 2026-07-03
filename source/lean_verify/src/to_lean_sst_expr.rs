@@ -61,6 +61,23 @@ pub fn sst_exp_to_ast_checked_with_ctx(
     Ok(exp_to_typed(e, ctx)?.into_slot(&e.typ))
 }
 
+/// Typed variant of [`sst_exp_to_ast_checked_with_ctx`]: the rendered
+/// expression WITH its actual Lean-level typ, no boundary bridge.
+/// For consumers that compose further (WP `Let` bindings, call args)
+/// and want to bridge into their own slot via `into_slot` (P2).
+pub(crate) fn sst_exp_to_typed(
+    e: &Exp,
+    ctx: &crate::expr_shared::RenderCtx,
+) -> Result<crate::typed_expr::TypedExpr, String> {
+    exp_to_typed(e, ctx)
+}
+
+/// Public face of [`actual_is_trusted`] for the WP walker (P2): will
+/// this expression's actual typ come from a D3-trusted source?
+pub(crate) fn sst_actual_is_trusted(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> bool {
+    actual_is_trusted(e, ctx)
+}
+
 /// A reference to an SST expression that has been validated (via
 /// [`sst_exp_to_ast_checked`]) and is therefore safe to lower to
 /// `LExpr` without panic risk.
@@ -511,10 +528,13 @@ fn tuple_slot_typ(base_typ: &Typ, field_opr: &FieldOpr) -> Option<Typ> {
 fn actual_is_trusted(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> bool {
     match &e.x {
         ExpX::Var(v) | ExpX::VarLoc(v) | ExpX::VarAt(v, _) => {
+            let lean_name = crate::lean_name::LeanName::from_var_ident(v);
             ctx.binder_typs.is_some_and(|b| b.contains_key(v))
-                || ctx
-                    .lookup_subst(&crate::lean_name::LeanName::from_var_ident(v), &e.typ)
-                    .is_some()
+                // Let-bound locals carry their own per-entry trust bit
+                // (P2): trusted iff the RHS's actual typ was trusted
+                // when the walker recorded the binding.
+                || ctx.let_binder(&lean_name).is_some_and(|(_, trusted)| *trusted)
+                || ctx.lookup_subst(&lean_name, &e.typ).is_some()
         }
         ExpX::Unary(UnaryOp::CoerceMode { .. }, inner)
         | ExpX::Unary(UnaryOp::Trigger(_), inner)
@@ -572,11 +592,14 @@ fn exp_to_typed(
             // Plain var: the rendered Lean value is the binder itself,
             // so the actual typ is the binder's DECLARED typ (the SST
             // may wrap the read in transparent Unbox/CoerceMode that
-            // shift the claimed typ; the render doesn't).
+            // shift the claimed typ; the render doesn't). Params come
+            // from `binder_typs`; let-bound locals from the walker's
+            // `let_binder_typs` env (P2).
             let actual = ctx
                 .binder_typs
                 .and_then(|b| b.get(ident))
                 .cloned()
+                .or_else(|| ctx.let_binder(&lean_name).map(|(t, _)| t.clone()))
                 .unwrap_or_else(|| e.typ.clone());
             TypedExpr::var(lean_name, actual)
         }
@@ -646,6 +669,47 @@ fn exp_to_typed(
             let n = count_ref_decorations(base.typ());
             let node = is_variant_node(variant, apply_deref_chain(base.into_untyped(), n));
             TypedExpr::from_untyped(LExpr::new(node), e.typ.clone())
+        }
+        // Tuple ctor (P2): each field coerces into its SLOT typ (the
+        // tuple's typ args — which KEEP ref decorations the fields'
+        // claimed typs may not carry). The construction dual of the
+        // Field projection rule (cluster bug 5). Named-datatype ctors
+        // stay unmigrated: their declared field typs are generic and
+        // need instantiation by the ctor's typ args (deferred).
+        ExpX::Ctor(dt @ Dt::Tuple(_), variant, fields) => {
+            // Peel boxing/decorations to the tuple datatype carrying
+            // the slot typs (same peel as `tuple_slot_typ`).
+            let mut t = &*e.typ;
+            loop {
+                match t {
+                    TypX::Decorate(_, _, inner) | TypX::Boxed(inner) => t = &**inner,
+                    _ => break,
+                }
+            }
+            let slot_typs: Option<&[Typ]> = match t {
+                TypX::Datatype(Dt::Tuple(_), args, _) => Some(&args[..]),
+                _ => None,
+            };
+            let rendered = fields
+                .iter()
+                .map(|f| {
+                    let slot = f
+                        .name
+                        .as_str()
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| slot_typs.and_then(|ts| ts.get(i)));
+                    let typed = exp_to_typed(&f.a, ctx)?;
+                    Ok(match slot {
+                        Some(slot_typ) => typed.into_slot(slot_typ),
+                        // Shape drift (non-numeric field name / typ-arg
+                        // count mismatch): fall back to the claimed
+                        // contract, today's behavior.
+                        None => typed.into_slot(&f.a.typ),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            TypedExpr::from_untyped(LExpr::new(ctor_node(dt, variant, rendered)), e.typ.clone())
         }
         // Default: unmigrated arms render at the claimed typ.
         _ => TypedExpr::from_untyped(LExpr::new(exp_to_node_checked(e, ctx)?), e.typ.clone()),
