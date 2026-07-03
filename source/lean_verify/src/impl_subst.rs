@@ -431,7 +431,7 @@ impl ImplSubst {
     /// `axiom_hashmap_deepview_borrow` lemma's `[View Q <K as DeepView>::V]`
     /// — which must lift to the fresh binder alongside the signature/body/
     /// clause projections. Identity when `proj_map` is empty.
-    fn rewrite_bound(&self, bound: &GenericBound) -> GenericBound {
+    pub(crate) fn rewrite_bound(&self, bound: &GenericBound) -> GenericBound {
         let gbx = match &**bound {
             GenericBoundX::Trait(path, typs) => GenericBoundX::Trait(
                 path.clone(),

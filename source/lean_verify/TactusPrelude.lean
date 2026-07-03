@@ -114,6 +114,27 @@ structure Tactus.Arc (A : Type u) where
   deref : A
   deriving Inhabited
 
+-- `Nonempty` lifting through the wrapper family (N1,
+-- DESIGN-nonempty-axioms.md). Generated theorems bind `[Nonempty Q]`
+-- for their typ params (so Nonempty-bracketed axioms can instantiate
+-- at Q), but an axiom slot filled with a COMPOSITE typ like
+-- `Tactus.Box Q` needs `Nonempty (Tactus.Box Q)` — these instances
+-- lift the param-level fact through the structure. (The `deriving
+-- Inhabited` above gives `[Inhabited A] → Inhabited (Tactus.X A)`,
+-- which does NOT fire from a bare `Nonempty A` binder — Nonempty
+-- carries no data, so the lift needs `Classical.choice`, fine in the
+-- `Nonempty` Prop.)
+instance {A : Type u} [Nonempty A] : Nonempty (Tactus.Ref A) :=
+  ⟨⟨Classical.choice ‹_›⟩⟩
+instance {A : Type u} [Nonempty A] : Nonempty (Tactus.MutRef A) :=
+  ⟨⟨Classical.choice ‹_›⟩⟩
+instance {A : Type u} [Nonempty A] : Nonempty (Tactus.Box A) :=
+  ⟨⟨Classical.choice ‹_›⟩⟩
+instance {A : Type u} [Nonempty A] : Nonempty (Tactus.Rc A) :=
+  ⟨⟨Classical.choice ‹_›⟩⟩
+instance {A : Type u} [Nonempty A] : Nonempty (Tactus.Arc A) :=
+  ⟨⟨Classical.choice ‹_›⟩⟩
+
 -- SizeOf unfolding lemmas for each Tactus wrapper. Lean's auto-derived
 -- `SizeOf (Tactus.X A)` for these single-field structures is
 -- `sizeOf b = sizeOf b.deref + 1`, but the unfolding isn't `@[simp]`
