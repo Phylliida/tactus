@@ -146,6 +146,81 @@ pub fn compute_nonempty_needs<'a>(all_fns: &[&'a FunctionX]) -> NonemptyNeeds<'a
     //   `_tactus_assoc_*` binder.
     // Concrete typs mentioned nowhere → nothing recorded; Lean
     // synthesizes their `Nonempty` from `Inhabited` instances.
+    // Seed 3 (DESIGN-nonempty-axioms.md N2): array/slice indexing
+    // renders as the prelude's `Tactus.index : Vector α n → Int → α`,
+    // which is `[Nonempty α]`-bracketed (same inhabitedness hole as
+    // generated axioms — the empty vector inhabits `Vector Empty 0`).
+    // Indexing is NOT a call (spec-mode `a[i]` is `BinaryOp::Index`;
+    // exec-mode is `PlaceX::Index`), so the call-graph propagation
+    // can't see it: seed directly from every index site's ELEMENT typ
+    // (the Binary expr's own typ / the Index place node's typ).
+    for f in all_fns {
+        let mut params: HashSet<usize> = HashSet::new();
+        let mut projs: Vec<Typ> = Vec::new();
+        {
+            let mut record_elem_typ = |t: &Typ, params: &mut HashSet<usize>, projs: &mut Vec<Typ>| {
+                let _ = vir::ast_visitor::typ_visitor_check::<(), _>(t, &mut |t: &Typ| {
+                    match &**t {
+                        TypX::TypParam(name) => {
+                            if let Some(i) = f.typ_params.iter().position(|p| p == name) {
+                                params.insert(i);
+                            }
+                        }
+                        TypX::Projection { .. } => {
+                            let key = format!("{:?}", t);
+                            if !projs.iter().any(|p| format!("{:?}", p) == key) {
+                                projs.push(t.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                });
+            };
+            fn scan_place(place: &vir::ast::Place, out: &mut Vec<Typ>) {
+                match &place.x {
+                    vir::ast::PlaceX::Index(inner, _, _, _) => {
+                        out.push(place.typ.clone());
+                        scan_place(inner, out);
+                    }
+                    vir::ast::PlaceX::Field(_, inner)
+                    | vir::ast::PlaceX::DerefMut(inner)
+                    | vir::ast::PlaceX::ModeUnwrap(inner, _)
+                    | vir::ast::PlaceX::WithExpr(_, inner) => scan_place(inner, out),
+                    _ => {}
+                }
+            }
+            let scan = &mut |e: &Expr| {
+                let mut elem_typs: Vec<Typ> = Vec::new();
+                match &e.x {
+                    ExprX::Binary(BinaryOp::Index(..), _, _) => {
+                        elem_typs.push(e.typ.clone());
+                    }
+                    ExprX::ReadPlace(p, _)
+                    | ExprX::AssignToPlace { place: p, .. }
+                    | ExprX::BorrowMut(p)
+                    | ExprX::TwoPhaseBorrowMut(p)
+                    | ExprX::BorrowMutTracked(p) => scan_place(p, &mut elem_typs),
+                    _ => {}
+                }
+                for t in &elem_typs {
+                    record_elem_typ(t, &mut params, &mut projs);
+                }
+            };
+            for e in clauses(f) { walk_expr(e, scan); }
+        }
+        if !params.is_empty() || !projs.is_empty() {
+            let entry = needs.entry(&f.name).or_default();
+            entry.params.extend(params);
+            for t in projs {
+                let key = format!("{:?}", t);
+                if !entry.projs.iter().any(|p| format!("{:?}", p) == key) {
+                    entry.projs.push(t);
+                }
+            }
+        }
+    }
+
     // Fn lookup for proj-need substitution (callee typ_params).
     let fn_by_name: HashMap<&Fun, &FunctionX> =
         all_fns.iter().map(|f| (&f.name, *f)).collect();
