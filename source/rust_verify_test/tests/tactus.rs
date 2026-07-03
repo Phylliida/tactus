@@ -2856,6 +2856,49 @@ test_verify_one_file! {
     }
 }
 
+// ── Nonempty-bracketed axioms (REVIEW-2026-07-02 § 1.1) ────────────
+// Value-producing axioms over bare type params globally inhabit every
+// Lean type — a user tactic can derive False (SMT sorts are always
+// inhabited; Lean types can be empty). These two tests pin the hole,
+// one per emission surface. THE Ok(()) EXPECTATIONS BELOW ARE THE
+// SCANDAL, pinned deliberately pre-fix: N1 (generated axioms) and N2
+// (prelude statics) of DESIGN-nonempty-axioms.md each flip their test
+// to Err(failed to synthesize Nonempty Empty).
+//
+// Surface 1: the PRELUDE static `axiom Tactus.index {α} {n}
+// (a : Vector α n) (i : Int) : α` — exploitable at n=0 where the
+// empty vector inhabits Vector Empty 0. Exec fn: under
+// --lean-backend only exec fns route to Lean (proof fns are still
+// Z3's), and the hole is Lean-side.
+test_verify_one_file! {
+    #[test] test_soundness_hole_prelude_index_inhabits_empty verus_code! {
+        #[verifier::tactus_auto]
+        #[verifier::tactus_tactic("exact ((Tactus.index (α := Empty) (n := 0) (⟨#[], rfl⟩ : Vector Empty 0) 0).elim)")]
+        fn exploit()
+            ensures false,
+        {
+        }
+    } => Ok(())
+}
+
+// Surface 2: GENERATED axioms for uninterpreted vstd spec fns —
+// `axiom seq.Seq.index (A : Type) (self : seq.Seq A) (i : Int) : A`,
+// exploitable because the (also unconditional) instInhabited axiom
+// provides `default : seq.Seq Empty`. The requires clause references
+// s@[0] purely to pull Seq.index into the emitted preamble.
+test_verify_one_file! {
+    #[test] test_soundness_hole_generated_seq_index_inhabits_empty verus_code! {
+        use vstd::prelude::*;
+        #[verifier::tactus_auto]
+        #[verifier::tactus_tactic("exact ((seq.Seq.index Empty Inhabited.default 0).elim)")]
+        fn exploit(s: Ghost<Seq<int>>)
+            requires s@[0] == s@[0],
+            ensures false,
+        {
+        }
+    } => Ok(())
+}
+
 // ── assume(P) warning ─────────────────────────────────────────────
 // `assume(P)` enters P as a hypothesis without a proof — a soundness
 // escape hatch for incremental development. Tactus surfaces a
