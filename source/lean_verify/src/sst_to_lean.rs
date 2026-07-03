@@ -118,7 +118,8 @@ use vir::sst::{
 };
 use vir::ast::{
     AssertQueryMode, BinaryOp, Expr, ExprX, Fun, FunctionKind, FunctionX,
-    KrateX, SpannedTyped, TactusKind, Typ, UnaryOp, UnaryOpr, VarBinder, VarIdent,
+    IntRange, KrateX, SpannedTyped, TactusKind, Typ, TypX, UnaryOp, UnaryOpr,
+    VarBinder, VarIdent,
 };
 use vir::ast_visitor::map_expr_visitor;
 use vir::messages::Span;
@@ -2939,7 +2940,7 @@ fn push_post_call_frames(
     let substituted_ensures =
         render_call_ensures(ensures, subst, return_prophecy.as_ref(), callee, render_ctx);
     let (dest_value, use_dest_name) =
-        push_ret_frames(substituted_ensures, callee, subst, dest, &mut new_obl);
+        push_ret_frames(substituted_ensures, ensures, callee, subst, dest, &mut new_obl);
 
     // Phase 4.
     push_mut_rebinds(callee, subst, &mut new_obl);
@@ -3166,6 +3167,84 @@ fn render_call_ensures(
     }
 }
 
+/// The `IntRange` of a typ, peeling boxing / decorations. `None` for
+/// non-integer typs (Bool, Prop, datatypes, …).
+fn int_range_of(typ: &Typ) -> Option<IntRange> {
+    let mut t = &**typ;
+    loop {
+        match t {
+            TypX::Boxed(inner) | TypX::Decorate(_, _, inner) => t = &**inner,
+            TypX::Int(r) => return Some(*r),
+            _ => return None,
+        }
+    }
+}
+
+/// VIR-side twin of `ret_subst::extract_top_level_eq_for`, recovering
+/// the TYPE of the eq-conjunct's value side. The rendered extraction is
+/// untyped (`LExpr`), but the #128 substitution path needs the value's
+/// numeric render sort to bridge it to the dest's declared typ: an
+/// int-typed ensures (`d == spec_delta(a as int, b as int)`) on a
+/// usize-returning fn otherwise binds `let d := E` with `E : ℤ` while
+/// every downstream use is ℕ-typed — an ill-typed theorem
+/// (BUG 2026-07-03, `torus_dist2` shape; same "rendered type ==
+/// claimed typ" invariant as BUG-vstd-preamble-cluster bug 5, numeric
+/// flavor). Mirrors the rendered walk so both extractions pick the same
+/// conjunct: same clause order, same left-to-right And flattening,
+/// first Eq with a bare ret-Var side wins; peels exactly the wrappers
+/// that render transparently (Trigger / CoerceMode) — a `Clip`-wrapped
+/// ret would NOT render as a bare Var, and correspondingly isn't peeled
+/// here.
+fn vir_ret_eq_rhs_typ(ensures: &[&Expr], subst: &CallSubstitutions) -> Option<Typ> {
+    fn peel(e: &Expr) -> &Expr {
+        match &e.x {
+            ExprX::Unary(UnaryOp::Trigger(_), inner)
+            | ExprX::Unary(UnaryOp::CoerceMode { .. }, inner) => peel(inner),
+            _ => e,
+        }
+    }
+    fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        let e = peel(e);
+        if let ExprX::Binary(BinaryOp::And, l, r) = &e.x {
+            conjuncts(l, out);
+            conjuncts(r, out);
+        } else {
+            out.push(e);
+        }
+    }
+    // The ret is referenced as a plain `Var` or a whole-local place read
+    // `ReadPlace(Local(d))` — the same reference shapes
+    // `inline_spec::substitute_body` handles for params.
+    let is_ret_var = |e: &Expr| -> bool {
+        let ident = match &peel(e).x {
+            ExprX::Var(v) => Some(v),
+            ExprX::ReadPlace(place, _) => match &place.x {
+                vir::ast::PlaceX::Local(v) => Some(v),
+                _ => None,
+            },
+            _ => None,
+        };
+        ident.is_some_and(|v| {
+            subst.ret_subst.contains_key(&crate::lean_name::LeanName::from_var_ident(v))
+        })
+    };
+    for ens in ensures {
+        let mut cs = Vec::new();
+        conjuncts(ens, &mut cs);
+        for c in cs {
+            if let ExprX::Binary(BinaryOp::Eq(_), lhs, rhs) = &c.x {
+                if is_ret_var(lhs) {
+                    return Some(rhs.typ.clone());
+                }
+                if is_ret_var(rhs) {
+                    return Some(lhs.typ.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Phases 2/3 — the ret binder + bound + ensures Hyp — or the #128
 /// substitution path replacing them. Returns `(dest_value,
 /// use_dest_name)` for Phase 5: the value to bind `dest` to
@@ -3177,17 +3256,46 @@ fn render_call_ensures(
 /// top-level conjunct `Eq(Var(fresh_ret), E)` (or commuted), we
 /// can skip the `∀ ret + ret_bound` chain and bind `dest := E`
 /// directly. Falls through to the ∀-path when no such conjunct
-/// exists.
+/// exists — or (sort reconciliation, 2026-07-03) when E's numeric
+/// render sort can't be established, so we never bind a ℤ value into
+/// ℕ-typed downstream arithmetic.
 fn push_ret_frames(
     substituted_ensures: Option<LExpr>,
+    ensures: &[&Expr],
     callee: &FunctionX,
     subst: &CallSubstitutions,
     dest: Option<&VarIdent>,
     new_obl: &mut OblCtx,
 ) -> (LExpr, bool) {
     let ret = &callee.ret.x;
-    let ret_substitution: Option<(LExpr, LExpr)> = substituted_ensures.as_ref()
-        .and_then(|conj| extract_top_level_eq_for(conj, &subst.fresh_ret_name));
+    // `(raw E, bridged E, rest)`: the BOUND hyp goes on raw E (faithful
+    // and strongest — `0 ≤ E` over ℤ is exactly what justifies the
+    // `Int.toNat` bridge); the dest binding and rest-ensures
+    // substitution use bridged E (the dest's declared render sort, so
+    // downstream slots typecheck).
+    let ret_substitution: Option<(LExpr, LExpr, LExpr)> = substituted_ensures.as_ref()
+        .and_then(|conj| extract_top_level_eq_for(conj, &subst.fresh_ret_name))
+        .and_then(|(e, rest)| {
+            let Some(dst_range) = int_range_of(&ret.typ) else {
+                // Non-integer ret (Bool/Prop/datatype): numeric sorts
+                // don't apply — the cond_setup case; raw is correct.
+                return Some((e.clone(), e, rest));
+            };
+            let dst_int = crate::to_lean_sst_expr::renders_as_lean_int(&dst_range);
+            match vir_ret_eq_rhs_typ(ensures, subst).as_ref().and_then(int_range_of) {
+                Some(src_range) => {
+                    let src_int = crate::to_lean_sst_expr::renders_as_lean_int(&src_range);
+                    let bridged =
+                        crate::expr_shared::apply_clip_coercion(src_int, dst_int, e.clone());
+                    Some((e, bridged, rest))
+                }
+                // Integer dest but the VIR twin couldn't establish the
+                // value's sort — conservatively take the ∀-path (whose
+                // binder is typed at the dest, always well-typed)
+                // rather than guess.
+                None => None,
+            }
+        });
 
     // The value bound to `dest` differs by path: in the ∀-path,
     // `dest := fresh_ret_name` (the ∀-bound); in the substitution
@@ -3220,29 +3328,35 @@ fn push_ret_frames(
             })
         });
     let dest_value: LExpr = match &ret_substitution {
-        Some((ret_value, rest_ensures)) => {
+        Some((raw_e, bridged_e, rest_ensures)) => {
             // Substitution path: drop `∀ ret + ret_bound`; emit
             // `E_bound` and `rest_ensures` as Hyps directly.
             // `type_bound_predicate` returns `None` for non-numeric
             // ret types (Bool, Prop, structs) so the bound Hyp is
             // elided there — the cond_setup case (Bool ret).
-            if let Some(pred) = type_bound_predicate(ret_value, &ret.typ) {
+            // The bound goes on RAW E: `0 ≤ E ∧ E < hi` over E's own
+            // sort is faithful and strongest (for a ℤ-valued E bound
+            // into a ℕ dest, `0 ≤ E` is exactly the fact that makes
+            // the `Int.toNat E` bridge lossless).
+            if let Some(pred) = type_bound_predicate(raw_e, &ret.typ) {
                 new_obl.frames.push_back(CtxFrame::Hyp(pred));
             }
             // The eq clause that gave us E has been dropped from
             // `rest_ensures`. Substitute fresh_ret_name → E in the
-            // remaining clauses so they reference E directly. If the
-            // result simplifies to `True` (e.g., the eq clause was
-            // the only conjunct), skip the Hyp.
+            // remaining clauses so they reference E directly (at the
+            // dest's render sort — occurrences of ret sit in slots
+            // typed by the dest). If the result simplifies to `True`
+            // (e.g., the eq clause was the only conjunct), skip the
+            // Hyp.
             if !is_trivial_true(rest_ensures) {
                 let mut ret_to_e = std::collections::HashMap::new();
-                ret_to_e.insert(subst.fresh_ret_name.clone(), ret_value.clone());
+                ret_to_e.insert(subst.fresh_ret_name.clone(), bridged_e.clone());
                 let rest_substituted = substitute(rest_ensures, &ret_to_e);
                 if !is_trivial_true(&rest_substituted) {
                     new_obl.frames.push_back(CtxFrame::Hyp(rest_substituted));
                 }
             }
-            ret_value.clone()
+            bridged_e.clone()
         }
         None => {
             // ∀-path: ret binder + ret_bound + ensures Hyp. The binder

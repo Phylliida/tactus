@@ -11249,6 +11249,43 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// #128 ret-substitution SORT RECONCILIATION (2026-07-03, the
+// `torus_dist2` shape). An int-typed ensures (`d == spec_abs_delta(a as
+// int, b as int)`) on a usize-returning fn used to bind
+// `let dx := spec_abs_delta a b` RAW at E's ℤ type while usize renders
+// ℕ — every downstream ℕ-typed use (`dx as u32`, usize arithmetic)
+// made the theorem ill-typed ("has type ℤ but is expected to have type
+// ℕ"). Now the VIR-side eq twin recovers E's typ and the binding
+// bridges sorts (`let dx := Int.toNat E`, justified by the adjacent
+// `0 ≤ E` bound hyp); when E's sort can't be established the ∀-path
+// (always well-typed) is taken instead. Same "rendered type == claimed
+// typ" invariant as cluster bug 5, numeric flavor.
+test_verify_one_file! {
+    #[test] test_ret_subst_int_ensures_nat_dest verus_code! {
+        use vstd::prelude::*;
+
+        pub open spec fn spec_abs_delta(a: int, b: int) -> int {
+            if a >= b { a - b } else { b - a }
+        }
+
+        pub fn abs_delta(a: usize, b: usize) -> (d: usize)
+            ensures d == spec_abs_delta(a as int, b as int),
+        {
+            proof { simp_all [spec_abs_delta] }
+            if a >= b { a - b } else { b - a }
+        }
+
+        pub fn sum_deltas(a: usize, b: usize) -> (r: u32)
+            requires a < 100, b < 100,
+        {
+            let dx = abs_delta(a, b);
+            let dy = abs_delta(b, a);
+            proof { simp_all [spec_abs_delta] }
+            (dx as u32) + (dy as u32)
+        }
+    } => Ok(())
+}
+
 // Match over a TUPLE OF REFS (BUG-vstd-preamble-cluster.md bugs 5+6,
 // the tactus-group-theory `is_inverse_pair_exec` shape). Two rendering
 // bugs pinned: (5) tuple typ args KEEP ref decorations while the SST
