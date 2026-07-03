@@ -118,7 +118,7 @@ use vir::sst::{
 };
 use vir::ast::{
     AssertQueryMode, BinaryOp, Expr, ExprX, Fun, FunctionKind, FunctionX,
-    IntRange, KrateX, SpannedTyped, TactusKind, Typ, TypX, UnaryOp, UnaryOpr,
+    KrateX, SpannedTyped, TactusKind, Typ, UnaryOp, UnaryOpr,
     VarBinder, VarIdent,
 };
 use vir::ast_visitor::map_expr_visitor;
@@ -3167,19 +3167,6 @@ fn render_call_ensures(
     }
 }
 
-/// The `IntRange` of a typ, peeling boxing / decorations. `None` for
-/// non-integer typs (Bool, Prop, datatypes, …).
-fn int_range_of(typ: &Typ) -> Option<IntRange> {
-    let mut t = &**typ;
-    loop {
-        match t {
-            TypX::Boxed(inner) | TypX::Decorate(_, _, inner) => t = &**inner,
-            TypX::Int(r) => return Some(*r),
-            _ => return None,
-        }
-    }
-}
-
 /// VIR-side twin of `ret_subst::extract_top_level_eq_for`, recovering
 /// the TYPE of the eq-conjunct's value side. The rendered extraction is
 /// untyped (`LExpr`), but the #128 substitution path needs the value's
@@ -3276,17 +3263,18 @@ fn push_ret_frames(
     let ret_substitution: Option<(LExpr, LExpr, LExpr)> = substituted_ensures.as_ref()
         .and_then(|conj| extract_top_level_eq_for(conj, &subst.fresh_ret_name))
         .and_then(|(e, rest)| {
-            let Some(dst_range) = int_range_of(&ret.typ) else {
+            if crate::expr_shared::int_range_of(&ret.typ).is_none() {
                 // Non-integer ret (Bool/Prop/datatype): numeric sorts
                 // don't apply — the cond_setup case; raw is correct.
                 return Some((e.clone(), e, rest));
-            };
-            let dst_int = crate::to_lean_sst_expr::renders_as_lean_int(&dst_range);
-            match vir_ret_eq_rhs_typ(ensures, subst).as_ref().and_then(int_range_of) {
-                Some(src_range) => {
-                    let src_int = crate::to_lean_sst_expr::renders_as_lean_int(&src_range);
+            }
+            match vir_ret_eq_rhs_typ(ensures, subst) {
+                // The unified bridge (expr_shared::coerce_lexpr, P0)
+                // reconciles E's render sort — and wrapper depth, if E
+                // ever carries one — to the dest's declared typ.
+                Some(src_typ) => {
                     let bridged =
-                        crate::expr_shared::apply_clip_coercion(src_int, dst_int, e.clone());
+                        crate::expr_shared::coerce_lexpr(e.clone(), &src_typ, &ret.typ);
                     Some((e, bridged, rest))
                 }
                 // Integer dest but the VIR twin couldn't establish the

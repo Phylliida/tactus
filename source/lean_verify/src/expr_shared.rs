@@ -35,7 +35,7 @@ use std::collections::HashMap;
 
 use vir::ast::{
     ArithOp, BinaryOp, BitwiseOp, Constant, Dt, FieldOpr, Fun, FunctionX, Ident,
-    InequalityOp, RealArithOp, Typ, TypDecoration, TypX, VarIdent,
+    InequalityOp, IntRange, RealArithOp, Typ, TypDecoration, TypX, VarIdent,
 };
 
 use crate::lean_ast::{BinOp as L, Expr as LExpr, ExprNode};
@@ -403,9 +403,42 @@ pub(crate) fn const_to_node_common(c: &Constant) -> Option<ExprNode> {
     })
 }
 
+/// `true` iff VIR's `IntRange` renders as Lean `Int` (the signed side
+/// plus unbounded `Int`, and also fixed-width u-types — their spec-mode
+/// subtraction is mathematical rather than truncating). The complement
+/// — `Nat`, `USize`, `Char` — renders as `Nat`. Keep in sync with
+/// `to_lean_type::typ_to_expr`.
+///
+/// Shared between the SST path (`clip_to_node_checked`), the VIR-AST
+/// path (`to_lean_expr.rs`), and `coerce_lexpr`'s sort reconciliation,
+/// so numeric-sort decisions stay consistent across both renderers —
+/// relevant because exec-fn callees inline their `require`/`ensure`
+/// via the VIR path while their own theorems render via the SST path.
+/// Divergence would produce a different inlined spec than the callee
+/// actually proved (silent soundness hole).
+pub(crate) fn renders_as_lean_int(range: &IntRange) -> bool {
+    matches!(
+        range,
+        IntRange::Int | IntRange::I(_) | IntRange::ISize | IntRange::U(_)
+    )
+}
+
+/// The `IntRange` of a typ, peeling boxing / decorations. `None` for
+/// non-integer typs (Bool, Prop, datatypes, …).
+pub(crate) fn int_range_of(typ: &Typ) -> Option<IntRange> {
+    let mut t = &**typ;
+    loop {
+        match t {
+            TypX::Boxed(inner) | TypX::Decorate(_, _, inner) => t = &**inner,
+            TypX::Int(r) => return Some(*r),
+            _ => return None,
+        }
+    }
+}
+
 /// Resolve a `Clip` coercion to its Lean wrapper name, given whether
 /// the source and destination types render as Lean `Int` (per
-/// `to_lean_sst_expr::renders_as_lean_int`).
+/// [`renders_as_lean_int`]).
 ///
 ///   * `(Int, Nat)` → `Some("Int.toNat")`
 ///   * `(Nat, Int)` → `Some("Int.ofNat")`
@@ -802,21 +835,58 @@ pub(crate) fn unemittable_traits(
 /// substitution sites, and TypedExpr smart constructors all bridge
 /// wrapper mismatches identically.
 ///
-/// Coercion is wrapper-only: we don't model the inner type's
-/// structure. If `from_typ` and `to_typ` have matching wrapper
-/// sequences but different inner types (e.g., `Box<Int>` vs
-/// `Box<Bool>`), this returns `value` unchanged — type-level
-/// mismatches at the inner level are Lean's problem, not ours.
+/// Coercion covers TWO dimensions (DESIGN-typed-renderer.md § D1):
+///
+/// * **Wrapper depth** — mismatched `Tactus.Ref`/`Box`/… chains bridge
+///   via `.deref` (peel) / `.mk` (rewrap) chains.
+/// * **Numeric render sort** — when both typs peel to integer ranges
+///   whose Lean renderings differ (ℤ vs ℕ per
+///   [`renders_as_lean_int`]), bridge via `Int.toNat`/`Int.ofNat`.
+///   `Int.toNat` is faithful only for nonneg values — which the VIR
+///   type system guarantees for any value flowing into a Nat-rendered
+///   slot (and call-site bound hyps state explicitly; see
+///   `push_ret_frames`).
+///
+/// Passthrough guarantee: when both dimensions already match, `value`
+/// is returned byte-identical — migration to the unified bridge cannot
+/// change output where today's output is right.
+///
+/// Beyond those two dimensions we don't model the inner type's
+/// structure. If `from_typ` and `to_typ` have matching wrappers and
+/// sorts but different inner types (e.g., `Box<MyS>` vs `Box<MyT>`),
+/// this returns `value` unchanged — such mismatches at the inner
+/// level are Lean's problem, not ours.
 pub(crate) fn coerce_lexpr(value: LExpr, from_typ: &Typ, to_typ: &Typ) -> LExpr {
     let from_wraps = collect_ref_wraps(&**from_typ);
     let to_wraps = collect_ref_wraps(&**to_typ);
+    // Numeric-sort reconciliation decision (int_range_of peels ALL
+    // decorations, so this classifies the numeric core under any
+    // wrappers).
+    let sort_bridge: Option<(bool, bool)> =
+        match (int_range_of(from_typ), int_range_of(to_typ)) {
+            (Some(f), Some(t)) => {
+                let (fi, ti) = (renders_as_lean_int(&f), renders_as_lean_int(&t));
+                if fi != ti { Some((fi, ti)) } else { None }
+            }
+            _ => None,
+        };
+    if let Some((fi, ti)) = sort_bridge {
+        // The numeric core needs an Int.toNat / Int.ofNat, which must
+        // apply at the BARE value — full peel, bridge, full rewrap.
+        // (The common case is no wrappers at all: spec-int values
+        // flowing into nat/usize slots and vice versa.) The shared-
+        // suffix optimization below can't apply a coercion under a
+        // shared wrapper suffix, so it doesn't apply here.
+        let peeled = apply_deref_chain(value, from_wraps.len());
+        return apply_wrap_chain(apply_clip_coercion(fi, ti, peeled), &to_wraps);
+    }
     if from_wraps == to_wraps {
         return value;
     }
-    // Find longest common SUFFIX of the two wrap sequences. The
-    // suffix corresponds to inner wraps that already match — we
-    // leave those untouched. Only the non-matching outer wraps need
-    // peel + rewrap.
+    // Wrapper-only mismatch. Find longest common SUFFIX of the two
+    // wrap sequences. The suffix corresponds to inner wraps that
+    // already match — we leave those untouched. Only the non-matching
+    // outer wraps need peel + rewrap.
     let suffix_len = from_wraps
         .iter()
         .rev()
@@ -1004,5 +1074,99 @@ mod tests {
         // Regression guard: arity-2 is unaffected (Prod accessors `.1` / `.2`).
         assert_eq!(field_access_name(&opr(Dt::Tuple(2), "0")), Some("1".to_string()));
         assert_eq!(field_access_name(&opr(Dt::Tuple(2), "1")), Some("2".to_string()));
+    }
+
+    // ── coerce_lexpr numeric-sort reconciliation (P0, D1) ───────────
+
+    fn t_int() -> Typ {
+        Arc::new(TypX::Int(IntRange::Int))
+    }
+    fn t_usize() -> Typ {
+        Arc::new(TypX::Int(IntRange::USize))
+    }
+    fn t_nat() -> Typ {
+        Arc::new(TypX::Int(IntRange::Nat))
+    }
+    fn t_u32() -> Typ {
+        Arc::new(TypX::Int(IntRange::U(32)))
+    }
+    fn t_bool() -> Typ {
+        Arc::new(TypX::Bool)
+    }
+    fn t_ref(inner: Typ) -> Typ {
+        Arc::new(TypX::Decorate(TypDecoration::Ref, None, inner))
+    }
+    fn v() -> LExpr {
+        LExpr::var(crate::lean_name::LeanName::synthetic("v".to_string()))
+    }
+    fn rendered(e: LExpr) -> String {
+        format!("{:?}", e.node)
+    }
+
+    #[test]
+    fn sort_bridge_int_to_nat_side() {
+        // ℤ value into a ℕ-rendered slot (usize / nat) → Int.toNat.
+        // The Exhibit B shape (DESIGN-typed-renderer.md).
+        for dst in [t_usize(), t_nat()] {
+            let out = coerce_lexpr(v(), &t_int(), &dst);
+            assert!(
+                rendered(out).contains("Int.toNat"),
+                "int → {dst:?} must insert Int.toNat",
+            );
+        }
+    }
+
+    #[test]
+    fn sort_bridge_nat_side_to_int() {
+        // ℕ-rendered value into an ℤ slot → Int.ofNat.
+        let out = coerce_lexpr(v(), &t_usize(), &t_int());
+        assert!(rendered(out).contains("Int.ofNat"));
+    }
+
+    #[test]
+    fn sort_passthrough_same_side() {
+        // Passthrough guarantee: same render sort in both dimensions →
+        // byte-identical value. u32 renders Int, so u32↔int is
+        // sort-transparent; usize↔nat both render Nat.
+        for (from, to) in [
+            (t_int(), t_int()),
+            (t_u32(), t_int()),
+            (t_int(), t_u32()),
+            (t_usize(), t_nat()),
+            (t_usize(), t_usize()),
+            (t_bool(), t_bool()),
+        ] {
+            let out = coerce_lexpr(v(), &from, &to);
+            assert!(
+                matches!(out.node, ExprNode::Var(_)),
+                "{from:?} → {to:?} must be passthrough, got {:?}", out.node,
+            );
+        }
+    }
+
+    #[test]
+    fn sort_bridge_composes_with_wrapper_peel() {
+        // `&int` value into a bare usize slot: peel the Ref wrapper,
+        // THEN Int.toNat at the numeric core.
+        let out = coerce_lexpr(v(), &t_ref(t_int()), &t_usize());
+        let s = rendered(out);
+        assert!(s.contains("Int.toNat") && s.contains("deref"), "got {s}");
+    }
+
+    #[test]
+    fn sort_bridge_composes_with_rewrap() {
+        // Bare ℤ value into a `&usize` slot: Int.toNat, then rewrap.
+        let out = coerce_lexpr(v(), &t_int(), &t_ref(t_usize()));
+        let s = rendered(out);
+        assert!(s.contains("Int.toNat") && s.contains(".mk"), "got {s}");
+    }
+
+    #[test]
+    fn wrapper_only_path_unchanged() {
+        // Sorts match → the wrapper-only suffix-optimized path is
+        // untouched (deref, no clip head).
+        let out = coerce_lexpr(v(), &t_ref(t_int()), &t_int());
+        let s = rendered(out);
+        assert!(s.contains("deref") && !s.contains("toNat") && !s.contains("ofNat"));
     }
 }
