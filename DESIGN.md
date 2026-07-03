@@ -949,6 +949,48 @@ If `to_lean_expr.rs` has a bug that translates VIR expression `P` to Lean expres
 - **Keep translations simple**: Prefer direct 1:1 mappings over clever optimizations. Boring code has fewer bugs.
 - **The translation is auditable**: Generated Lean is readable text. Users can inspect it via `tactus translate file.rs`.
 
+### Axiom-environment consistency (the Nonempty brackets)
+
+*(N1–N3 2026-07-03, DESIGN-nonempty-axioms.md; REVIEW-2026-07-02
+§ 1.1.)* SMT sorts are always inhabited; Lean types can be empty. An
+unbracketed value-producing axiom over a bare type param
+(`axiom f : … → A`) therefore inhabits EVERY type — `(f … : Empty).elim
+: False` — making the whole emitted environment inconsistent for any
+user-written tactic (the auto ladder never exploited it, but proofs
+are adversarial input in the long game). The remedy is `[Nonempty]`
+brackets, inferred by `nonempty.rs` and enforced by Lean's instance
+synthesis; the `test_soundness_hole_*` e2e pins hold the door shut.
+
+**Model-existence argument** (why the bracketed environment is
+consistent): interpret every abstract type former (`axiom T : Type →
+Type`) as `fun _ => Unit`. Then:
+1. The unconditional `instInhabited` axioms (`Inhabited (T …)`) hold —
+   `Unit` is inhabited.
+2. Every value-producing axiom (`… → A` with A a bare param) carries
+   `[Nonempty A]` (nonempty.rs Seeds 2/3): under the bracket, "some
+   value of A" exists by assumption, so an interpretation exists
+   (e.g., `Classical.choice`); at abstract-typ results the value is
+   `()`.
+3. `∃ x : T`-concluding Prop axioms carry the same bracket (Seed 4) —
+   under it the existential is satisfiable.
+4. All remaining Prop axioms are cross-crate stipulations Verus
+   verified over inhabited sorts — satisfiable over any inhabitedness-
+   respecting model by the same trust argument as before (they carry
+   `[Nonempty]` on whatever they instantiate value-producing axioms
+   with, via the propagation).
+
+**Known residuals** (accepted, documented):
+- Classically-existential conclusions with no `Exists` node (`¬∀ x : T,
+  P x` implies T inhabited when the ∀ would be vacuous) are not seeded.
+  No vstd axiom has this shape; a new one would need manual review.
+- Trait CLASS fields are not axioms — an instance is a constructed
+  value, so obtaining `Out` from `[Getter X Out]` is sound. If a future
+  emission path ever axiomatizes an INSTANCE (rather than defining it
+  with a body), that axiom needs the same bracket analysis.
+- The brackets narrow instantiation but don't verify the axiom
+  STATEMENTS' mutual consistency beyond inhabitedness — that remains
+  the cross-crate trust stipulation it always was.
+
 ## Heartbeat annotations — LANDED (#123)
 
 Lean's deterministic timeout uses `maxHeartbeats` (kernel reduction-step count, reproducible vs Z3's wall-clock-based rlimit). `#[verifier::heartbeats(N)]` provides per-fn override.
