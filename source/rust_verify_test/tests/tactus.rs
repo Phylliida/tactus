@@ -11295,6 +11295,92 @@ test_verify_one_file! {
 // test rendered as the nonexistent `.istuple%2` (fix: a tuple has one
 // variant — the test is `True`, both renderers). The proof block is
 // the standard explicit spec-unfold, not a workaround.
+// Adversarial probes for the typed-renderer arc (2026-07-03 second
+// self-review pass — attack via tests instead of code-reading). Four
+// shapes in one crate: (A) multi-clause ensures with the ret-eq in the
+// MIDDLE and a later clause referencing ret — exercises P3's
+// clause-granular REST assembly (the eq conjunct is dropped from its
+// clause; other clauses render whole and the fresh→E substitution
+// reaches them); (B) COMMUTED eq (`spec == out`) — the value-side
+// selection; (C) NESTED tuple of refs — the tuple-slot actual rule
+// composing with itself; (D) tuple CTOR from projections of another
+// tuple — P2's slot coercion consuming P1's slot-typ actuals (swap
+// then re-match). All consumed through downstream exec arithmetic so
+// the substitution path feeds real slots.
+test_verify_one_file! {
+    #[test] test_typed_renderer_adversarial_probes verus_code! {
+        pub enum Sym {
+            Gen(usize),
+            Inv(usize),
+        }
+
+        pub open spec fn sym_val(s: Sym) -> usize {
+            match s {
+                Sym::Gen(i) => i,
+                Sym::Inv(i) => i,
+            }
+        }
+
+        pub fn get_val(s: &Sym) -> (out: usize)
+            ensures
+                out >= 0,
+                out == sym_val(*s),
+                out == sym_val(*s) || out == 0,
+        {
+            proof { simp_all [sym_val] }
+            match s {
+                Sym::Gen(i) => *i,
+                Sym::Inv(i) => *i,
+            }
+        }
+
+        pub fn get_val_commuted(s: &Sym) -> (out: usize)
+            ensures sym_val(*s) == out,
+        {
+            proof { simp_all [sym_val] }
+            match s {
+                Sym::Gen(i) => *i,
+                Sym::Inv(i) => *i,
+            }
+        }
+
+        pub fn sum_vals(s1: &Sym, s2: &Sym) -> (r: u32)
+            requires sym_val(*s1) < 100, sym_val(*s2) < 100,
+        {
+            let a = get_val(s1);
+            let b = get_val_commuted(s2);
+            proof { simp_all [sym_val] }
+            (a as u32) + (b as u32)
+        }
+
+        pub open spec fn is_gen(s: Sym) -> bool {
+            match s { Sym::Gen(_) => true, Sym::Inv(_) => false }
+        }
+
+        pub fn nested_pair(s1: &Sym, s2: &Sym, s3: &Sym) -> (out: bool)
+            ensures out == is_gen(*s3),
+        {
+            proof { simp_all [is_gen] }
+            match ((s1, s2), s3) {
+                ((_, _), Sym::Gen(_)) => true,
+                _ => false,
+            }
+        }
+
+        pub fn swap_and_check(s1: &Sym, s2: &Sym) -> (out: bool)
+            ensures out == is_gen(*s2),
+        {
+            proof { simp_all [is_gen] }
+            let p = (s1, s2);
+            let q = (p.1, p.0);
+            match q {
+                (Sym::Gen(_), _) => true,
+                _ => false,
+            }
+        }
+    } => Ok(())
+}
+
 test_verify_one_file! {
     #[test] test_exec_match_tuple_of_refs verus_code! {
         pub enum Sym {
