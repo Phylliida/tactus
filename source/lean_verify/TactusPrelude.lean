@@ -195,13 +195,16 @@ axiom Tactus.heightLt {α : Type u} {β : Type v} (a : α) (b : β) : Prop
 -- Left uninterpreted: vstd's array axioms (`lemma_array_index`,
 -- `array_view` roundtrips) give it in-range meaning; out-of-range is
 -- unspecified, matching Verus's treatment of spec indexing as a total
--- but unconstrained function. NOTE on inhabitedness modeling: producing
--- an `α` from `Vector α n × Int` global-axiomatizes every such `α` as
--- inhabited — the SAME modeling the emitted `seq.Seq.index (A) (self)
--- (i) : A` axiom already commits to (Verus guarantees spec types are
--- inhabited; Lean-side this is a standing assumption of the encoding,
--- not introduced here).
-axiom Tactus.index {α : Type u} {n : Nat} (a : Vector α n) (i : Int) : α
+-- but unconstrained function. `[Nonempty α]`-bracketed (N2,
+-- DESIGN-nonempty-axioms.md): an unbracketed version inhabits EVERY
+-- α (the empty vector inhabits `Vector Empty 0`, so `Tactus.index
+-- (α := Empty) ⟨#[], rfl⟩ 0 : Empty` derived False — the
+-- test_soundness_hole_prelude exploit pin). Under the bracket the
+-- axiom is satisfiable, matching Verus's spec-types-are-inhabited
+-- guarantee where it actually holds instead of globally axiomatizing
+-- it. Generated theorems that index at a typ param carry the matching
+-- `[Nonempty]` binder (nonempty.rs Seed 3).
+axiom Tactus.index {α : Type u} [Nonempty α] {n : Nat} (a : Vector α n) (i : Int) : α
 
 -- `has_resolved(x)` — Verus's mutable-reference resolution predicate
 -- (`UnaryOpr::HasResolved`). For `&mut T` it states the prophetic value

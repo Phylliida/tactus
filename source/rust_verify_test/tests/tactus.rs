@@ -2866,10 +2866,12 @@ test_verify_one_file! {
 // to Err(failed to synthesize Nonempty Empty).
 //
 // Surface 1: the PRELUDE static `axiom Tactus.index {α} {n}
-// (a : Vector α n) (i : Int) : α` — exploitable at n=0 where the
-// empty vector inhabits Vector Empty 0. Exec fn: under
-// --lean-backend only exec fns route to Lean (proof fns are still
-// Z3's), and the hole is Lean-side.
+// (a : Vector α n) (i : Int) : α` — formerly exploitable at n=0 where
+// the empty vector inhabits Vector Empty 0. CLOSED by N2
+// (DESIGN-nonempty-axioms.md): the axiom is `[Nonempty α]`-bracketed,
+// so the instantiation at Empty fails instance synthesis. Exec fn:
+// under --lean-backend only exec fns route to Lean (proof fns are
+// still Z3's), and the hole was Lean-side.
 test_verify_one_file! {
     #[test] test_soundness_hole_prelude_index_inhabits_empty verus_code! {
         #[verifier::tactus_auto]
@@ -2878,7 +2880,13 @@ test_verify_one_file! {
             ensures false,
         {
         }
-    } => Ok(())
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("Nonempty")),
+            "expected Nonempty-synthesis failure blocking the exploit, got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
 }
 
 // Surface 2: GENERATED axioms for uninterpreted vstd spec fns —
