@@ -25,7 +25,7 @@
 use vir::ast::*;
 use vir::sst::{BndX, CallFun, Exp, ExpX, InternalFun};
 use crate::expr_shared::{
-    apply_deref_chain, binop_to_ast, clip_coercion_head, const_to_node_common, count_ref_decorations,
+    apply_deref_chain, binop_to_ast, const_to_node_common, count_ref_decorations,
     ctor_node, field_proj_opr, is_variant_node, non_binop_head,
 };
 use crate::lean_ast::{substitute, Expr as LExpr, ExprNode};
@@ -53,7 +53,12 @@ pub fn sst_exp_to_ast_checked_with_ctx(
     e: &Exp,
     ctx: &crate::expr_shared::RenderCtx,
 ) -> Result<LExpr, String> {
-    exp_to_node_checked(e, ctx).map(LExpr::new)
+    // Typed spine boundary (P1, DESIGN-typed-renderer.md): internal
+    // rendering carries ACTUAL typs; the public contract is "rendered
+    // == claimed", restored here by bridging to `e.typ`. Passthrough
+    // when actual == claimed (the unmigrated default), so this is
+    // bit-for-bit the old behavior for unmigrated arms.
+    Ok(exp_to_typed(e, ctx)?.into_slot(&e.typ))
 }
 
 /// A reference to an SST expression that has been validated (via
@@ -389,40 +394,12 @@ fn type_bound_predicate_rec(
 // `renders_as_lean_int` moved to `expr_shared` (P0,
 // DESIGN-typed-renderer.md § D1) — it now also feeds `coerce_lexpr`'s
 // numeric-sort reconciliation, so the shared-rules file is its home.
-use crate::expr_shared::renders_as_lean_int;
-
-/// Lower a `Clip { range: dst }` applied to an expression of type `src`.
-///
-/// Verus's Clip is a value-preserving coercion *if* the source value
-/// actually fits in `dst` — overflow is guarded by a neighbouring
-/// `HasType(inner, dst)` assertion. So our job is just to keep Lean's
-/// types aligned:
-///
-///   * Int-rendered source, Nat-rendered dst → `Int.toNat`
-///   * Nat-rendered source, Int-rendered dst → `Int.ofNat`
-///   * Same-side → transparent (Lean accepts the value as-is)
-///
-/// Dropping the coercion in the mixed case (the old behaviour) caused a
-/// soundness hole in exec-fn WP: `x as int - y as int` for `x, y : u8`
-/// rendered as `x - y` on `Nat`, which truncates negatives to zero. The
-/// `Int.ofNat` insertion forces subtraction to happen over `Int` so the
-/// lower-bound refinement check (if present) can actually fire.
-fn clip_to_node_checked(src: &Typ, dst: &IntRange, inner: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<ExprNode, String> {
-    let src_range = match &**src {
-        TypX::Int(r) => r,
-        // Boxed int? Peel the box; otherwise the inner isn't an int type
-        // at all (shouldn't happen for Clip) and we pass through.
-        TypX::Boxed(t) => if let TypX::Int(r) = &**t { r } else {
-            return exp_to_node_checked(inner, ctx);
-        },
-        _ => return exp_to_node_checked(inner, ctx),
-    };
-    let rendered = sst_exp_to_ast_checked_with_ctx(inner, ctx)?;
-    Ok(match clip_coercion_head(renders_as_lean_int(src_range), renders_as_lean_int(dst)) {
-        Some(head) => LExpr::app1(LExpr::var_lit(head), rendered).node,
-        None => rendered.node,
-    })
-}
+// `clip_to_node_checked` retired (P1): the Clip arm of `exp_to_typed`
+// is exactly "coerce the value to the clipped range" via the unified
+// `coerce_lexpr` — same Int.toNat/Int.ofNat table (which guards the
+// `x as int - y as int` underflow soundness hole; see coerce_lexpr's
+// doc), but keyed on the value's ACTUAL typ instead of the claimed
+// `inner.typ`.
 
 /// Render a `CheckDecreaseHeight` arg with Verus's param-substitution
 /// `Bind(Let)` wrapper zeta-reduced.
@@ -494,41 +471,185 @@ fn render_checked_decrease_arg(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> 
 /// need a `.mk` wrap, not a deref — if it ever appears, the sanity
 /// check / Lean elaboration fails loud, not silent). Returns 0 for
 /// non-tuple datatypes and any unexpected shape.
-fn tuple_slot_extra_derefs(base: &Exp, field_opr: &FieldOpr, claimed: &Typ) -> usize {
+/// The typ of tuple slot `field_opr.field` in `base_typ`'s tuple typ
+/// args, peeling boxing/decorations to reach the tuple datatype. `None`
+/// for non-tuple bases/fields.
+///
+/// P1 successor of `tuple_slot_extra_derefs` (cluster bug 5): tuple
+/// slots KEEP their ref decorations in the tuple's typ args
+/// (`(&Sym, &Sym)` is `Tuple[Ref(Sym), Ref(Sym)]`) while the SST
+/// STRIPS them from the projection's claimed result typ. Instead of
+/// computing a repair deref count against the claimed typ, the typed
+/// spine reports the SLOT typ as the projection's ACTUAL typ and lets
+/// the composition boundary bridge.
+fn tuple_slot_typ(base_typ: &Typ, field_opr: &FieldOpr) -> Option<Typ> {
     if !matches!(field_opr.datatype, Dt::Tuple(_)) {
-        return 0;
+        return None;
     }
-    let Ok(idx) = field_opr.field.as_str().parse::<usize>() else { return 0 };
-    // Peel outer wrappers/boxing to reach the tuple typ carrying the
-    // slot decorations (the base render already deref'd to the tuple).
-    let mut t = &*base.typ;
+    let idx = field_opr.field.as_str().parse::<usize>().ok()?;
+    let mut t = &**base_typ;
     loop {
         match t {
             TypX::Decorate(_, _, inner) | TypX::Boxed(inner) => t = &**inner,
             _ => break,
         }
     }
-    let TypX::Datatype(Dt::Tuple(_), args, _) = t else { return 0 };
-    let Some(slot) = args.get(idx) else { return 0 };
-    crate::expr_shared::count_ref_decorations(slot)
-        .saturating_sub(crate::expr_shared::count_ref_decorations(claimed))
+    let TypX::Datatype(Dt::Tuple(_), args, _) = t else { return None };
+    args.get(idx).cloned()
 }
 
-fn sst_lean_wrap_count(inner: &Exp, ctx: &crate::expr_shared::RenderCtx) -> usize {
-    // The SST wraps a param read in a transparent `Unbox` (and may add
-    // CoerceMode/Trigger) where the Exp path has a bare Var — peel those
-    // to reach the underlying Var before the binder lookup. (These
-    // wrappers emit no Lean code, so the rendered base is just the Var's
-    // binder, whose wrapper depth is what we count.)
-    let peeled = crate::sst_to_lean::peel_transparent(inner);
-    let var_id = match &peeled.x {
-        ExpX::Var(v) | ExpX::VarLoc(v) | ExpX::VarAt(v, _) => Some(v),
-        _ => None,
-    };
-    let lean_typ = var_id
-        .and_then(|v| ctx.binder_typs.and_then(|b| b.get(v)).cloned())
-        .unwrap_or_else(|| inner.typ.clone());
-    count_ref_decorations(&lean_typ)
+/// Will `exp_to_typed(e)`'s actual typ come from a TRUSTED source —
+/// one that describes the rendered Lean value definitionally — rather
+/// than from the claimed-typ default? Trusted sources: a binder lookup
+/// (the Lean binder's declared type IS the value's type), a render-time
+/// substitution (bridged to claimed by construction), the tuple-slot
+/// rule (the projection's Lean type is the slot's type), and Clip (the
+/// arm coerces to its range definitionally). Claimed typs at arbitrary
+/// nodes are NOT trusted — VIR's poly-boxing lies at some Var uses
+/// (see the Box/Unbox arm of `exp_to_typed`). Mirrors `exp_to_typed`'s
+/// arm structure; keep the two in sync.
+fn actual_is_trusted(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> bool {
+    match &e.x {
+        ExpX::Var(v) | ExpX::VarLoc(v) | ExpX::VarAt(v, _) => {
+            ctx.binder_typs.is_some_and(|b| b.contains_key(v))
+                || ctx
+                    .lookup_subst(&crate::lean_name::LeanName::from_var_ident(v), &e.typ)
+                    .is_some()
+        }
+        ExpX::Unary(UnaryOp::CoerceMode { .. }, inner)
+        | ExpX::Unary(UnaryOp::Trigger(_), inner)
+        | ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner)
+        | ExpX::WithTriggers(_, inner)
+        | ExpX::Loc(inner) => actual_is_trusted(inner, ctx),
+        // Tuple projections report the slot typ (truthful); non-tuple
+        // Field actuals are the claimed typ (not trusted, but the
+        // reset is an identity there anyway).
+        ExpX::UnaryOpr(UnaryOpr::Field(fo), _) => matches!(fo.datatype, Dt::Tuple(_)),
+        ExpX::Unary(UnaryOp::Clip { .. }, _) => true,
+        _ => false,
+    }
+}
+
+/// Typed rendering spine (P1, DESIGN-typed-renderer.md). Returns the
+/// rendered expression TOGETHER with its actual Lean-level typ — which
+/// for migrated arms may legitimately differ from the node's claimed
+/// SST typ (`e.typ`). The public entry bridges back to the claimed typ
+/// at the boundary via `into_slot`, so external consumers keep the
+/// "rendered == claimed" contract while internal composition uses
+/// actual typs. Unmigrated arms render through `exp_to_node_checked`
+/// at the claimed typ — bit-for-bit today's behavior (the boundary
+/// bridge is passthrough when actual == claimed).
+///
+/// Migrated so far (each replaced a per-site repair helper):
+/// * Var family — actual typ is the BINDER's declared typ where
+///   binder-backed; replaces `sst_lean_wrap_count`'s re-derivation
+///   through transparent wrappers (the typed value carries its truth
+///   through them).
+/// * Transparent wrappers (CoerceMode/Trigger/WithTriggers/Loc) —
+///   actual typ flows through. Box/Unbox flow the child's actual only
+///   when binder-backed (see the arm — VIR poly-boxing claims lie at
+///   some Var uses).
+/// * Clip — exactly "coerce the value to the clipped range" via the
+///   unified `coerce_lexpr`; replaces `clip_to_node_checked`.
+/// * Field/IsVariant — deref count from the base's ACTUAL typ; tuple
+///   projections report the slot typ as actual (replaces
+///   `tuple_slot_extra_derefs`).
+fn exp_to_typed(
+    e: &Exp,
+    ctx: &crate::expr_shared::RenderCtx,
+) -> Result<crate::typed_expr::TypedExpr, String> {
+    use crate::typed_expr::TypedExpr;
+    Ok(match &e.x {
+        ExpX::Var(ident) | ExpX::VarLoc(ident) | ExpX::VarAt(ident, _) => {
+            // Render-time substitution: if ctx has a value_subst map
+            // and `ident` is in it, `lookup_subst` returns the value
+            // already bridged to `e.typ` (the slot's claimed typ) —
+            // actual == claimed by construction.
+            let lean_name = crate::lean_name::LeanName::from_var_ident(ident);
+            if let Some(bridged) = ctx.lookup_subst(&lean_name, &e.typ) {
+                return Ok(TypedExpr::from_untyped(bridged, e.typ.clone()));
+            }
+            // Plain var: the rendered Lean value is the binder itself,
+            // so the actual typ is the binder's DECLARED typ (the SST
+            // may wrap the read in transparent Unbox/CoerceMode that
+            // shift the claimed typ; the render doesn't).
+            let actual = ctx
+                .binder_typs
+                .and_then(|b| b.get(ident))
+                .cloned()
+                .unwrap_or_else(|| e.typ.clone());
+            TypedExpr::var(lean_name, actual)
+        }
+        // Transparent wrappers that DON'T shift the typ (mode/trigger
+        // markers): no Lean code — the value's actual typ flows
+        // through unchanged.
+        ExpX::Unary(UnaryOp::CoerceMode { .. }, inner)
+        | ExpX::Unary(UnaryOp::Trigger(_), inner)
+        | ExpX::WithTriggers(_, inner)
+        | ExpX::Loc(inner) => exp_to_typed(inner, ctx)?,
+        // Box/Unbox: transparent in Lean but typ-SHIFTING in VIR — and
+        // VIR's poly-boxing can claim wrapper-decorated typs at Var
+        // uses whose bound value is actually bare (Box::new's ctor
+        // lowering produces `Unbox(tmp : Box<u8>) : u8` where the WP
+        // bound `tmp` to the bare inner value — the
+        // wrapper-instantiation probe). The old renderer's claimed-typ
+        // contract silently canceled that lie; propagating the child's
+        // actual typ would ACT on it (spurious `.deref`). Rule
+        // (matching `sst_lean_wrap_count`'s old semantics exactly):
+        // propagate the child's actual only when it's BINDER-backed
+        // (params — trustworthy); otherwise reset to the claimed
+        // contract. A trustworthy let-binder typ environment (P2)
+        // lifts this.
+        ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => {
+            let child = exp_to_typed(inner, ctx)?;
+            if actual_is_trusted(inner, ctx) {
+                child
+            } else {
+                TypedExpr::from_untyped(child.into_untyped(), e.typ.clone())
+            }
+        }
+        // Clip is exactly "coerce the value to the clipped range":
+        // wrapper peel + Int.toNat/Int.ofNat sort bridge, both via the
+        // unified coerce_lexpr. Verus's Clip is value-preserving *if*
+        // the source fits in dst — overflow is guarded by a
+        // neighbouring HasType assertion, so our job is just keeping
+        // Lean's types aligned.
+        ExpX::Unary(UnaryOp::Clip { range, .. }, inner) => {
+            let dst: Typ = std::sync::Arc::new(TypX::Int(*range));
+            exp_to_typed(inner, ctx)?.coerce_to(&dst)
+        }
+        // Field projection: `x.name` / `x.0` / `x.val0`. Shared
+        // `field_access_name` with the VIR-AST path. The field belongs
+        // to the inner inductive — peel ALL rendered wrappers of the
+        // base's ACTUAL typ (β refactor Piece 2, now actual-typ-driven).
+        ExpX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
+            let base = exp_to_typed(inner, ctx)?;
+            let n = count_ref_decorations(base.typ());
+            let actual =
+                tuple_slot_typ(base.typ(), field_opr).unwrap_or_else(|| e.typ.clone());
+            let projected =
+                field_proj_opr(apply_deref_chain(base.into_untyped(), n), field_opr);
+            TypedExpr::from_untyped(projected, actual)
+        }
+        // `IsVariant` from match-desugared patterns. A tuple has
+        // exactly one "variant" — its test is vacuously true (the
+        // general path would emit `.istuple%2`, a field that exists on
+        // no Lean type — cluster bug 6).
+        ExpX::UnaryOpr(UnaryOpr::IsVariant { datatype, variant }, inner) => {
+            if matches!(datatype, Dt::Tuple(_)) {
+                return Ok(TypedExpr::from_untyped(
+                    LExpr::new(ExprNode::LitBool(true)),
+                    e.typ.clone(),
+                ));
+            }
+            let base = exp_to_typed(inner, ctx)?;
+            let n = count_ref_decorations(base.typ());
+            let node = is_variant_node(variant, apply_deref_chain(base.into_untyped(), n));
+            TypedExpr::from_untyped(LExpr::new(node), e.typ.clone())
+        }
+        // Default: unmigrated arms render at the claimed typ.
+        _ => TypedExpr::from_untyped(LExpr::new(exp_to_node_checked(e, ctx)?), e.typ.clone()),
+    })
 }
 
 /// Render a trait/class-method call as `Trait.method (arg : Self_typ)` so
@@ -558,10 +679,12 @@ fn render_class_method_call(
     // receiver the class signature expects.
     let expected_typs = ctx.fn_param_typs(fun, typs);
     let app_args: Result<Vec<LExpr>, String> = args.iter().enumerate().map(|(i, a)| {
-        let arg = sst_exp_to_ast_checked_with_ctx(a, ctx)?;
+        // Typed spine (P1): bridge from the arg's ACTUAL rendered typ
+        // to the declared param typ, not from the claimed `a.typ`.
+        let arg_typed = exp_to_typed(a, ctx)?;
         let arg_coerced = match &expected_typs {
-            Some(ts) if i < ts.len() => crate::expr_shared::coerce_lexpr(arg, &a.typ, &ts[i]),
-            _ => arg,
+            Some(ts) if i < ts.len() => arg_typed.into_slot(&ts[i]),
+            _ => arg_typed.into_slot(&a.typ),
         };
         // TypeAnnot serves Self / type-param inference at the elaborator.
         // Annotate with the expected param typ (the wrapper-typed form),
@@ -604,28 +727,23 @@ fn fun_is_trait_method(fun: &vir::ast::Fun, ctx: &crate::expr_shared::RenderCtx)
 fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<ExprNode, String> {
     Ok(match &e.x {
         ExpX::Const(c) => const_to_node_checked(c)?,
-        ExpX::Var(ident) | ExpX::VarLoc(ident) | ExpX::VarAt(ident, _) => {
-            // Render-time substitution: if ctx has a value_subst map
-            // and `ident` is in it, return the bridged value (coerced
-            // to `e.typ`, the slot's expected typ here). Otherwise
-            // fall through to plain Var. See `RenderCtx::lookup_subst`
-            // and `RenderValueSubst` for the design.
-            let lean_name = crate::lean_name::LeanName::from_var_ident(ident);
-            if let Some(bridged) = ctx.lookup_subst(&lean_name, &e.typ) {
-                return Ok(bridged.node);
-            }
-            ExprNode::Var(lean_name)
+        // Migrated to the typed spine (P1) — delegation keeps this
+        // match total and direct callers safe; `exp_to_typed` handles
+        // these patterns specifically (no bounce-back cycle).
+        ExpX::Var(..) | ExpX::VarLoc(..) | ExpX::VarAt(..) => {
+            return Ok(exp_to_typed(e, ctx)?.into_slot(&e.typ).node);
         }
         ExpX::StaticVar(fun) | ExpX::ExecFnByName(fun) => {
             ExprNode::Var(crate::lean_name::LeanName::from_path(&fun.path))
         }
 
         ExpX::Unary(UnaryOp::Not, inner) => LExpr::not(sst_exp_to_ast_checked_with_ctx(inner, ctx)?).node,
-        ExpX::Unary(UnaryOp::Clip { range, .. }, inner) => {
-            clip_to_node_checked(&inner.typ, range, inner, ctx)?
+        // Migrated to the typed spine (P1).
+        ExpX::Unary(UnaryOp::Clip { .. }, _)
+        | ExpX::Unary(UnaryOp::CoerceMode { .. }, _)
+        | ExpX::Unary(UnaryOp::Trigger(_), _) => {
+            return Ok(exp_to_typed(e, ctx)?.into_slot(&e.typ).node);
         }
-        ExpX::Unary(UnaryOp::CoerceMode { .. }, inner)
-        | ExpX::Unary(UnaryOp::Trigger(_), inner) => exp_to_node_checked(inner, ctx)?,
         ExpX::Unary(op, _) => {
             // The exec-fn SST path is conservative — we accept Not /
             // Clip / CoerceMode / Trigger directly above, and reject
@@ -648,63 +766,14 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
             ));
         }
 
-        // Box/Unbox: transparent. Field projection.
-        ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => {
-            exp_to_node_checked(inner, ctx)?
-        }
-        // Field projection: `x.name` / `x.0` / `x.val0`. Shared
-        // `field_access_name` with the VIR-AST path — for tuple-struct
-        // variants (`Dt::Path` + numeric field names) Lean's inductive
-        // emits fields as `val0` / `val1` etc., and VIR's match-arm
-        // desugaring lowers to `Field { field: "0", .. }`. Without the
-        // shared mapping the SST side would emit `.0` and Lean would
-        // reject it.
-        //
-        // Wrapper coercion (β refactor Piece 2): the receiver may have
-        // SST typ `&T` / `Box<T>` / etc.; the field belongs to T. Peel
-        // wrapper layers via `.deref` so the Lean projection lands on
-        // the inner inductive.
-        ExpX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
-            let inner_rendered = sst_exp_to_ast_checked_with_ctx(inner, ctx)?;
-            let n = sst_lean_wrap_count(inner, ctx);
-            let projected = field_proj_opr(apply_deref_chain(inner_rendered, n), field_opr);
-            // Tuple slots KEEP their ref decorations in the tuple's typ
-            // args (`(&Sym, &Sym)` is `Tuple[Ref(Sym), Ref(Sym)]`) while
-            // the SST STRIPS them from the projection's claimed result
-            // typ (`tmp.1 : Sym`) — so the rendered projection is
-            // wrapper-typed but every downstream consumer (IsVariant,
-            // nested Field, calls) coerces from the bare claimed typ.
-            // Bridge here: deref the projection down from the slot's
-            // depth to the claimed typ's depth, restoring the invariant
-            // "rendered depth == claimed typ depth" that the rest of the
-            // renderer assumes (BUG-vstd-preamble-cluster.md bug 5 —
-            // `Tactus.Ref.isGen` on a match over a tuple of refs).
-            // Non-tuple datatypes don't exhibit the mismatch (their SST
-            // field typs agree with the declared field typs), so this is
-            // tuple-scoped by evidence.
-            let extra = tuple_slot_extra_derefs(inner, field_opr, &e.typ);
-            apply_deref_chain(projected, extra).node
-        }
-        // `IsVariant { datatype, variant }` is the desugared form
-        // `ast_simplify` produces when lowering `match scrutinee { Variant { … } => … }`
-        // into an if-chain (see `vir::ast_simplify::pattern_to_exprs_rec`).
-        // Shared with the VIR-AST renderer so the `is<Variant>` naming
-        // convention matches the one Lean auto-derives on inductives.
-        //
-        // Wrapper coercion (β refactor Piece 2): same shape as Field —
-        // peel wrapper layers before the `.is<Variant>` projection.
-        ExpX::UnaryOpr(UnaryOpr::IsVariant { datatype, variant }, inner) => {
-            // A tuple has exactly one "variant" — its test is vacuously
-            // true. The general path would emit `.istuple%2`, a field
-            // that exists on no Lean type (and `%` would leak unsanitized)
-            // — cluster bug 6. Match-desugared tuple patterns produce
-            // these tests routinely.
-            if matches!(datatype, Dt::Tuple(_)) {
-                return Ok(ExprNode::LitBool(true));
-            }
-            let inner_rendered = sst_exp_to_ast_checked_with_ctx(inner, ctx)?;
-            let n = sst_lean_wrap_count(inner, ctx);
-            is_variant_node(variant, apply_deref_chain(inner_rendered, n))
+        // Box/Unbox, Field, IsVariant: migrated to the typed spine (P1)
+        // — the base's deref count comes from its ACTUAL typ, and tuple
+        // projections report the slot typ as actual (cluster bugs 5/6
+        // rules live in `exp_to_typed`).
+        ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), _)
+        | ExpX::UnaryOpr(UnaryOpr::Field(_), _)
+        | ExpX::UnaryOpr(UnaryOpr::IsVariant { .. }, _) => {
+            return Ok(exp_to_typed(e, ctx)?.into_slot(&e.typ).node);
         }
         // `HasType(e, t)` — the refinement constraint for `e` to inhabit
         // `t`. For fixed-width ints (u8, i32, …) this is the bounds check
@@ -960,12 +1029,12 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
             // no-coerce.
             let expected_typs = ctx.fn_param_typs(fun, &typs[..]);
             let rendered_args: Result<Vec<LExpr>, String> = args.iter().enumerate().map(|(i, a)| {
-                let arg = sst_exp_to_ast_checked_with_ctx(a, ctx)?;
+                // Typed spine (P1): bridge from the arg's ACTUAL
+                // rendered typ, not the claimed `a.typ`.
+                let arg_typed = exp_to_typed(a, ctx)?;
                 Ok(match &expected_typs {
-                    Some(typs) if i < typs.len() => {
-                        crate::expr_shared::coerce_lexpr(arg, &a.typ, &typs[i])
-                    }
-                    _ => arg,
+                    Some(typs) if i < typs.len() => arg_typed.into_slot(&typs[i]),
+                    _ => arg_typed.into_slot(&a.typ),
                 })
             }).collect();
             LExpr::app(head, rendered_args?).node
@@ -1121,7 +1190,10 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
             }
         },
 
-        ExpX::WithTriggers(_, inner) | ExpX::Loc(inner) => exp_to_node_checked(inner, ctx)?,
+        // Migrated to the typed spine (P1) — transparent passthrough.
+        ExpX::WithTriggers(..) | ExpX::Loc(_) => {
+            return Ok(exp_to_typed(e, ctx)?.into_slot(&e.typ).node);
+        }
 
         ExpX::NullaryOpr(_) => ExprNode::LitBool(true),
 
