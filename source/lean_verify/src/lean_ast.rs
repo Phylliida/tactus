@@ -1841,9 +1841,9 @@ fn collect_free_vars(
 /// "Free" means not shadowed by an enclosing `Let` / `Lambda` /
 /// `Forall` / `Exists` / `Match`-pattern binder. Used by callers
 /// that need to detect substitution loops or self-references —
-/// e.g., `sst_to_lean::extract_top_level_eq_for` (#128) rejects
-/// `r == E` clauses where E mentions r as a free variable, because
-/// substituting `r → E` in such patterns would loop.
+/// e.g., `push_ret_frames`' Approach-A dest-rename guard (#128)
+/// keeps the gensym when the dest name is free in the substituted
+/// ensures, because a `∀ x` binder would capture the caller arg.
 ///
 /// Implemented as a thin wrapper over the private `collect_free_vars`
 /// — same walk, same scope tracking — to avoid duplicating the
