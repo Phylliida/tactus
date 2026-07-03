@@ -115,15 +115,21 @@ the high-risk arm clusters to return ACTUAL typs per D2: projections
 claimed≠actual divergence found during migration is a latent bug —
 the migration doubles as the family's terminal bug-hunt.
 
-**P2 — SST consumers (~1 session).** WP `Let` bindings, ctor fields,
-binder bounds, and `push_ret_frames` consume `TypedExpr` and bridge
-via `into_slot` — **retires `vir_ret_eq_rhs_typ`** (the extraction
-walks a typed tree that knows E's sort) and the post-render
-`ret_subst` becomes a typed substitution.
+**P2 — SST consumers (~1 session).** The centerpiece is the **WP
+let-binder typ environment**: `walk_let` records each let-bound temp
+at its RHS's rendered ACTUAL typ in an owned, evolving binder env
+(today `binder_typs` is a borrowed, params-only map) — this extends
+the D3 trusted set to let-bound temps and lifts the Box/Unbox resets.
+Plus: ctor fields and binder bounds consume `TypedExpr` via
+`into_slot`. (`vir_ret_eq_rhs_typ` retirement moved to P3 — the
+ensures extraction walks the VIR-rendered tree, so it needs the VIR
+renderer typed, not the SST consumers.)
 
 **P3 — VIR renderer (~1–2 sessions).** Same treatment for
-`to_lean_expr` (goals/clauses/instance bodies) — **retires
-`render_expr_with_derefs`** and the remaining `RenderCtx::empty()`
+`to_lean_expr` (goals/clauses/instance bodies), applying the same D3
+trust classification — **retires `render_expr_with_derefs` AND
+`vir_ret_eq_rhs_typ`** (the ensures eq-extraction then walks a typed
+tree that knows E's sort), and the remaining `RenderCtx::empty()`
 hazards lose their teeth (a typed value carries its own truth even
 when ctx is thin).
 
