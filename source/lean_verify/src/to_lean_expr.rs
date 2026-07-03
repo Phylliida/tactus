@@ -432,7 +432,7 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
             // their own theorems render via the SST path; divergence here
             // would produce a different inlined spec than the callee
             // proved.
-            use crate::to_lean_sst_expr::renders_as_lean_int;
+            use crate::expr_shared::renders_as_lean_int;
             let src_int = matches!(&*inner.typ, TypX::Int(r) if renders_as_lean_int(r));
             let dst_int = renders_as_lean_int(range);
             apply_clip_coercion(src_int, dst_int, expr_to_ast(inner, ctx)).node

@@ -386,24 +386,10 @@ fn type_bound_predicate_rec(
     }
 }
 
-/// `true` iff VIR's `IntRange` renders as Lean `Int` (the signed side
-/// plus unbounded `Int`, and also fixed-width u-types — their spec-mode
-/// subtraction is mathematical rather than truncating). The complement
-/// — `Nat`, `USize`, `Char` — renders as `Nat`. Keep in sync with
-/// `to_lean_type::typ_to_expr`.
-///
-/// Shared between the SST path (`clip_to_node` below) and the VIR-AST
-/// path (`to_lean_expr.rs`) so Clip coercions stay consistent across
-/// both renderers — relevant because exec-fn callees inline their
-/// `require`/`ensure` via the VIR path while their own theorems render
-/// via the SST path. Divergence would produce a different inlined
-/// spec than the callee actually proved (silent soundness hole).
-pub(crate) fn renders_as_lean_int(range: &IntRange) -> bool {
-    matches!(
-        range,
-        IntRange::Int | IntRange::I(_) | IntRange::ISize | IntRange::U(_)
-    )
-}
+// `renders_as_lean_int` moved to `expr_shared` (P0,
+// DESIGN-typed-renderer.md § D1) — it now also feeds `coerce_lexpr`'s
+// numeric-sort reconciliation, so the shared-rules file is its home.
+use crate::expr_shared::renders_as_lean_int;
 
 /// Lower a `Clip { range: dst }` applied to an expression of type `src`.
 ///
