@@ -5,12 +5,26 @@
 > `tuple_slot_extra_derefs`, `clip_to_node_checked`; D3 discovered).
 > P2 DONE (WP let-binder typ env on OblCtx, walk_let/chain/if-cond +
 > four walk-time render sites carry it; tuple-ctor slot coercion;
-> pin `test_exec_let_bound_tuple_projection`). All gates green at
+> pin `test_exec_let_bound_tuple_projection`). P3 SURVEY FINDING: the
+> VIR renderer already IS a pull-model typed renderer —
+> `structural_typ` is the actual-typ table (its `None` = D3
+> trust-claims) and `apply_ref_coercion_if_needed` is a per-node
+> boundary — so no architectural rebuild is needed there. P3
+> CENTERPIECE DONE: single-walk typed ret-eq extraction
+> (`vir_find_ret_eq` on the typed VIR tree; rendered-side
+> `extract_top_level_eq_for` + the Exhibit-B shadow twin DELETED; the
+> sort reconciliation's conservative fallback gone — E's typ always
+> known; mut-ref current-value reads `ReadPlace(DerefMut(Local(ret)))`
+> match, the pinned raw-substitution behavior). All gates green at
 > every step (e2e 521/0, vstd 1530/0, group-theory 2811/32 baseline
-> unchanged). NEXT = P3 (VIR renderer + D3 classification there,
-> retires `render_expr_with_derefs` + `vir_ret_eq_rhs_typ`; also pick
-> up the build-phase render sites walk-time couldn't reach:
-> assign-lvalue rhs, Done leaf).
+> unchanged). REMAINING (P4-ish targeted, not architectural):
+> `render_expr_with_derefs` var-only peel could consult the full
+> `structural_typ` table (ReadPlace-shaped receivers currently fall to
+> claimed — load-bearing subtlety, study before touching: expr_to_ast
+> already bridges structural→claimed at every boundary, so the peel
+> interacts); build-phase render sites (assign-lvalue rhs, Done leaf)
+> have no let-binder env; named-datatype ctor slot coercion needs
+> generic instantiation.
 
 The "Exhibit B full fix" (REVIEW-2026-07-02 § 2.1): make rendering
 return `(expr, typ)` everywhere so the invariant **rendered type ==
