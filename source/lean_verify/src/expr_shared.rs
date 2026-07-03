@@ -1196,4 +1196,20 @@ mod tests {
         let s = rendered(out);
         assert!(s.contains("deref") && !s.contains("toNat") && !s.contains("ofNat"));
     }
+
+    #[test]
+    fn sort_bridge_under_equal_wraps() {
+        // EQUAL, NONEMPTY wrap chains with differing inner sorts
+        // (`&int` value into a `&usize` slot): the shared-suffix
+        // optimization can't apply a coercion under a shared wrapper,
+        // so the bridge must full-peel, sort-coerce at the bare core,
+        // and rewrap (2026-07-03 self-review: this path was
+        // implemented in P0 but unpinned).
+        let out = coerce_lexpr(v(), &t_ref(t_int()), &t_ref(t_usize()));
+        let s = rendered(out);
+        assert!(
+            s.contains("deref") && s.contains("Int.toNat") && s.contains(".mk"),
+            "expected peel + toNat + rewrap, got {s}",
+        );
+    }
 }

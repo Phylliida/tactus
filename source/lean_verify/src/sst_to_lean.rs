@@ -2957,7 +2957,8 @@ struct ReturnProphecy {
 ///
 /// Falls through to the ∀-path when no `r == E` conjunct exists, when
 /// E mentions ret (self-referential), or when ensures has a non-And
-/// top-level shape (Or, Implies, etc.). See `extract_top_level_eq_for`.
+/// top-level shape (Or, Implies, etc.). See `vir_find_ret_eq` (P3 —
+/// the single-walk typed extraction).
 ///
 /// This fn is the phase SEQUENCE; each phase's mechanics live in its
 /// own helper directly below.
@@ -3338,19 +3339,40 @@ fn vir_find_ret_eq<'a>(ensures: &[&'a Expr], subst: &CallSubstitutions) -> Optio
     let is_ret_ident = |v: &VarIdent| -> bool {
         subst.ret_subst.contains_key(&crate::lean_name::LeanName::from_var_ident(v))
     };
-    // A place whose base local is the ret, peeling DerefMut layers:
-    // the mut-ref current-value read `*ret` is
-    // `ReadPlace(DerefMut(Local(ret)))` (vstd's `&mut`-returning
-    // ensures, e.g. vec_index_mut's `*result == v@[i]`), and it
-    // renders as the BARE fresh-ret binder in the inlining ctx — the
-    // retired rendered-side extraction matched it, so this walk must
-    // too (the raw substitution `dest := E` it produces is the pinned
-    // behavior; the ∀-path would type the binder at `MutRef T` and
-    // ill-type the eq hypothesis against the value-typed E).
+    // MATCHER peel — a place whose base local is the ret through
+    // BARE-RENDERING layers only (Local, DerefMut): the mut-ref
+    // current-value read `*ret` is `ReadPlace(DerefMut(Local(ret)))`
+    // (vstd's `&mut`-returning ensures, e.g. vec_index_mut's
+    // `*result == v@[i]`), and it renders as the BARE fresh-ret binder
+    // in the inlining ctx — the retired rendered-side extraction
+    // matched it, so this walk must too (the raw substitution
+    // `dest := E` it produces is the pinned behavior; the ∀-path
+    // would type the binder at `MutRef T` and ill-type the eq
+    // hypothesis against the value-typed E). Field/Index layers do
+    // NOT render bare, so they deliberately don't match here.
     fn place_ret_local<'p>(place: &'p vir::ast::Place) -> Option<&'p VarIdent> {
         match &place.x {
             vir::ast::PlaceX::Local(v) => Some(v),
             vir::ast::PlaceX::DerefMut(inner) => place_ret_local(inner),
+            _ => None,
+        }
+    }
+    // MENTION-SCAN base walk — TOTAL over place layers (Field /
+    // DerefMut / ModeUnwrap / Index / Local): the self-reference
+    // guard must catch a ret hiding under ANY projection (`ret.f`,
+    // `ret[i]`), not just the bare-rendering shapes, or a
+    // self-referential eq substitutes and leaves `fresh_ret` unbound
+    // (a loud Lean unknown-identifier, but the guard should be total
+    // — 2026-07-03 self-review finding). `Temporary(expr)`'s inner
+    // expr is walked by the visitor's own recursion, so `None` here
+    // is complete, not a gap.
+    fn place_base_local<'p>(place: &'p vir::ast::Place) -> Option<&'p VarIdent> {
+        match &place.x {
+            vir::ast::PlaceX::Local(v) => Some(v),
+            vir::ast::PlaceX::Field(_, inner)
+            | vir::ast::PlaceX::DerefMut(inner)
+            | vir::ast::PlaceX::ModeUnwrap(inner, _)
+            | vir::ast::PlaceX::Index(inner, _, _, _) => place_base_local(inner),
             _ => None,
         }
     }
@@ -3369,7 +3391,7 @@ fn vir_find_ret_eq<'a>(ensures: &[&'a Expr], subst: &CallSubstitutions) -> Optio
             let hit = match &sub.x {
                 ExprX::Var(v) | ExprX::VarLoc(v) | ExprX::VarAt(v, _) => is_ret_ident(v),
                 ExprX::ReadPlace(place, _) => {
-                    place_ret_local(place).is_some_and(|v| is_ret_ident(v))
+                    place_base_local(place).is_some_and(|v| is_ret_ident(v))
                 }
                 _ => false,
             };
