@@ -11321,6 +11321,42 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Let-bound tuple-projection INTERMEDIATE (P2 guard,
+// DESIGN-typed-renderer.md): `let pair = (s1, s2); let x = pair.0;
+// match x { … }` exercises the WP let-binder typ environment — the
+// walker records `pair` and `x` at their coerced typs (x's RHS is a
+// trusted tuple-slot projection), and the downstream IsVariant derefs
+// from the env-recorded typ. Passes pre-P2 too (claimed-contract
+// cancellation); pinned so env-recording changes can't regress the
+// shape.
+test_verify_one_file! {
+    #[test] test_exec_let_bound_tuple_projection verus_code! {
+        pub enum Sym {
+            Gen(usize),
+            Inv(usize),
+        }
+
+        pub open spec fn is_gen_spec(s: Sym) -> bool {
+            match s {
+                Sym::Gen(_) => true,
+                Sym::Inv(_) => false,
+            }
+        }
+
+        pub fn first_is_gen(s1: &Sym, s2: &Sym) -> (out: bool)
+            ensures out == is_gen_spec(*s1),
+        {
+            proof { simp_all [is_gen_spec] }
+            let pair = (s1, s2);
+            let x = pair.0;
+            match x {
+                Sym::Gen(_) => true,
+                Sym::Inv(_) => false,
+            }
+        }
+    } => Ok(())
+}
+
 // Assoc-type projection inside an instance member BODY's embedded typs
 // (BUG-vstd-preamble-cluster.md bug 3). `idp(self.a.get())` carries
 // `<A as Getter>::Out` as `idp`'s typ ARG — the standalone def of this
