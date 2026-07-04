@@ -223,7 +223,10 @@ pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Command
     let binders = fn_binders_without_bound_hyps(f, &ectx.unemittable);
     let ret_ty = typ_to_expr(&f.ret.x.typ);
     let name = lean_name(&f.name.path);
-    match &f.body {
+    // Bodies containing `CallTarget::BuiltinSpecFun` fall back to the
+    // Axiom branch — see `expr_shared::spec_fn_emits_as_axiom`.
+    let body = if crate::expr_shared::spec_fn_emits_as_axiom(f) { &None } else { &f.body };
+    match body {
         Some(b) => {
             let attrs = if matches!(f.opaqueness, Opaqueness::Opaque) {
                 vec!["irreducible".into()]
@@ -250,7 +253,16 @@ pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Command
                 .then(|| DECREASING_BY_TACTIC.to_string());
             Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by, decreasing_by })
         }
-        None => Command::Axiom(Axiom { name, binders, ret_ty, attrs: vec![] }),
+        None => {
+            // Transparency: when the fallback DROPPED a body (vs. the fn
+            // being genuinely bodyless), the artifact says so — the
+            // reader should never have to guess why a def is an axiom.
+            let comment = (f.body.is_some()).then(|| format!(
+                "body contains `call_ensures`/`call_requires` (no Lean encoding); \
+                 axiomatized signature — see expr_shared::spec_fn_emits_as_axiom"
+            ));
+            Command::Axiom(Axiom { name, binders, ret_ty, attrs: vec![], comment })
+        }
     }
 }
 
@@ -324,6 +336,7 @@ pub fn broadcast_lemma_axiom_cmd(
 ) -> Command {
     let (binders, goal) = proof_fn_signature(f, ectx);
     Command::Axiom(crate::lean_ast::Axiom {
+        comment: None,
         name: lean_name(&f.name.path),
         binders,
         ret_ty: goal,
@@ -469,6 +482,7 @@ fn external_body_type_cmds(dt: &DatatypeX) -> Vec<Command> {
     // into the return type so the result is `Type → ... → Type`.
     let type_ret_ty = curry_type_to_type(dt.typ_params.len());
     let type_axiom = Axiom {
+        comment: None,
         name: path.clone(),
         binders: vec![],
         ret_ty: type_ret_ty,
@@ -489,6 +503,7 @@ fn external_body_type_cmds(dt: &DatatypeX) -> Vec<Command> {
     };
     let inhabited_ret_ty = LExpr::app(LExpr::var_lit("Inhabited"), vec![parent_applied]);
     let inhabited_axiom = Axiom {
+        comment: None,
         name: format!("{}.instInhabited", path),
         binders: inhabited_binders,
         ret_ty: inhabited_ret_ty,

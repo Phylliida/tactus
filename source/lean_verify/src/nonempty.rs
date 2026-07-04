@@ -110,7 +110,7 @@ pub fn compute_nonempty_needs<'a>(all_fns: &[&'a FunctionX]) -> NonemptyNeeds<'a
     // constructs; axiom-valued instances are N3's ∃-audit).
     for f in all_fns {
         if f.mode != Mode::Spec
-            || f.body.is_some()
+            || !crate::expr_shared::spec_fn_emits_as_axiom(f)
             || matches!(f.kind, FunctionKind::TraitMethodDecl { .. })
         {
             continue;

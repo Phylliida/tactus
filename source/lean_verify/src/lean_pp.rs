@@ -244,6 +244,11 @@ fn write_command(out: &mut String, cmd: &Command, lm: &mut Landmarks) {
 }
 
 fn write_axiom(out: &mut String, a: &Axiom, lm: &mut Landmarks) {
+    if let Some(c) = &a.comment {
+        out.push_str("-- ");
+        out.push_str(c);
+        out.push('\n');
+    }
     for attr in &a.attrs {
         out.push_str("@[");
         out.push_str(attr);

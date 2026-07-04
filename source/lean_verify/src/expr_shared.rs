@@ -828,6 +828,31 @@ pub(crate) fn apply_wrap_chain(base: LExpr, wraps: &[&'static str]) -> LExpr {
 /// SAME-crate bugs. The whole-crate prune keeps every same-crate
 /// function, so this only flags cross-crate-stripped traits. Single
 /// source of truth for the "un-emittable trait" rule (#122).
+/// Does this spec fn emit as a Lean AXIOM rather than a def? True
+/// when it has no body (uninterp / external_body / cross-crate-
+/// stripped) — OR when the body contains a `CallTarget::BuiltinSpecFun`
+/// (`call_ensures` / `call_requires` over a function value), which the
+/// renderer has no encoding for (it would emit the unresolvable
+/// placeholder literal `builtinSpecFun` — vstd's `strictly_cloned`
+/// poisoned every artifact whose dep set pulled it, found via
+/// tactus-group-theory's apply_hom_symbol_exec). Dropping the body and
+/// axiomatizing the SIGNATURE is sound — the constant becomes
+/// uninterpreted, consumers elaborate, and reasoning that needed the
+/// body's meaning simply isn't available (same trust shape as any
+/// uninterp spec fn). Shared between `spec_fn_to_ast` (the emission
+/// decision) and `nonempty::compute_nonempty_needs` Seed 2 (axioms
+/// with param-mentioning ret typs need `[Nonempty]`).
+pub(crate) fn spec_fn_emits_as_axiom(f: &vir::ast::FunctionX) -> bool {
+    let Some(body) = &f.body else { return true };
+    let mut found = false;
+    crate::dep_order::walk_expr(body, &mut |e: &vir::ast::Expr| {
+        if let vir::ast::ExprX::Call(vir::ast::CallTarget::BuiltinSpecFun(..), _, _) = &e.x {
+            found = true;
+        }
+    });
+    found
+}
+
 pub(crate) fn unemittable_traits(
     krate: &vir::ast::KrateX,
     fn_map: &std::collections::HashMap<&vir::ast::Fun, &vir::ast::FunctionX>,

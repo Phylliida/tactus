@@ -221,6 +221,27 @@ pub fn integer_type_bound_node(kind: &IntegerTypeBoundKind, bits: u32) -> ExprNo
     }
 }
 
+/// `IntegerTypeBound(kind, _)` at the ARCH word width — the inner
+/// expr is `IntegerTypeBound(ArchWordBits, _)` rather than a literal
+/// (`usize::MAX`, `isize::MAX`, `isize::MIN`). Rendered over the
+/// prelude's `usize_hi : Int := 2 ^ arch_word_bits` / `isize_hi`
+/// defs, so the same `cases arch_word_bits_valid` idiom that
+/// discharges refinement bounds reaches these too:
+///   * `UnsignedMax` → `usize_hi - 1`
+///   * `SignedMax`   → `isize_hi - 1`
+///   * `SignedMin`   → `-isize_hi`
+fn integer_type_bound_arch(kind: &IntegerTypeBoundKind) -> Option<LExpr> {
+    use crate::lean_ast::BinOp;
+    let hi = |name: &str| LExpr::var_lit(name);
+    let minus_one = |e: LExpr| LExpr::binop(BinOp::Sub, e, LExpr::lit_int("1".to_string()));
+    match kind {
+        IntegerTypeBoundKind::UnsignedMax => Some(minus_one(hi("usize_hi"))),
+        IntegerTypeBoundKind::SignedMax => Some(minus_one(hi("isize_hi"))),
+        IntegerTypeBoundKind::SignedMin => Some(LExpr::neg(hi("isize_hi"))),
+        IntegerTypeBoundKind::ArchWordBits => None,
+    }
+}
+
 /// Entry point for the VIR-AST rendering path (`to_lean_expr.rs`).
 pub fn integer_type_bound_from_vir(
     kind: &IntegerTypeBoundKind,
@@ -230,6 +251,11 @@ pub fn integer_type_bound_from_vir(
         // Fall through to the shared helper's panic so the message
         // matches regardless of which pipeline tripped it.
         return LExpr::new(integer_type_bound_node(kind, 0));
+    }
+    if let ExprX::UnaryOpr(vir::ast::UnaryOpr::IntegerTypeBound(IntegerTypeBoundKind::ArchWordBits, _), _) = &inner.x {
+        if let Some(e) = integer_type_bound_arch(kind) {
+            return e;
+        }
     }
     let bits = const_u32_from_vir(inner).unwrap_or_else(|| panic!(
         "IntegerTypeBound({:?}): non-constant bit width is not supported \
@@ -853,10 +879,22 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
         // `IntegerTypeBound(kind, _)` returns the numeric bound of a
         // fixed-width int type. The inner expression is the bit width
         // (a literal like 8, 32, …) — we evaluate at codegen time and
-        // emit the decimal literal directly.
+        // emit the decimal literal directly. Arch-width bounds
+        // (`usize::MAX` — inner is the ArchWordBits expr, not a
+        // literal) render symbolically over the prelude's
+        // `usize_hi`/`isize_hi` (see `integer_type_bound_arch`).
         ExpX::UnaryOpr(UnaryOpr::IntegerTypeBound(kind, _), inner) => {
             if matches!(kind, IntegerTypeBoundKind::ArchWordBits) {
                 return Ok(integer_type_bound_node(kind, 0));
+            }
+            if let ExpX::UnaryOpr(
+                UnaryOpr::IntegerTypeBound(IntegerTypeBoundKind::ArchWordBits, _),
+                _,
+            ) = &inner.x
+            {
+                if let Some(e) = integer_type_bound_arch(kind) {
+                    return Ok(e.node);
+                }
             }
             let bits = const_u32_from_sst(inner).ok_or_else(|| format!(
                 "IntegerTypeBound({:?}): non-constant bit width is not supported \
