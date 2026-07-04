@@ -2321,9 +2321,17 @@ fn push_mod_var_frames<'a>(
         // and falls through to plain `sanitize` for user-named locals.
         let name = crate::lean_name::LeanName::from_var_ident(ident);
         obl.frames.push_back(CtxFrame::Binder(LBinder::explicit(name.clone(), typ_to_expr(typ))));
-        if let Some(pred) = type_bound_predicate(&LExpr::var(name), typ) {
+        if let Some(pred) = type_bound_predicate(&LExpr::var(name.clone()), typ) {
             obl.frames.push_back(CtxFrame::Hyp(pred));
         }
+        // Ledger the binder's typ (the ∀-binder IS the storage truth):
+        // without an entry, typed-spine Var lookups inside the loop's
+        // invariant/body render at per-use CLAIMS — a borrow of a
+        // modified local claims Ref while the binder holds the bare
+        // value, and the identity-coerce emits ill-typed Lean (bare
+        // Vec at View.view's Ref slot — copy_word's invariants,
+        // BUG-call-arg-temp-claimed-typ.md family).
+        *obl = obl.with_let_binder(name, (*typ).clone(), true);
     }
 }
 
@@ -2446,7 +2454,7 @@ fn walk_call<'a>(
     }
 
     let new_obl = push_post_call_frames(
-        callee, &inlined.ensures, &subst, dest, obl, &render_ctx_ens, e,
+        callee, &inlined.ensures, &subst, dest, typ_args, obl, &render_ctx_ens, e,
     );
     walk_obligations(after, ctx, &new_obl, e);
 }
@@ -3036,6 +3044,7 @@ fn push_post_call_frames(
     ensures: &[&Expr],
     subst: &CallSubstitutions,
     dest: Option<&VarIdent>,
+    typ_args: &[Typ],
     obl: &OblCtx,
     render_ctx: &crate::expr_shared::RenderCtx,
     e: &mut ObligationEmitter,
@@ -3081,12 +3090,26 @@ fn push_post_call_frames(
     // the substitution path (#128). Skipped when `use_dest_name`
     // (Approach A): the ∀-binder already IS the dest, so the alias
     // `let x := x` is trivial and dropped.
+    // Ledger the dest's storage typ — the (typ-substituted) declared
+    // ret typ, which the #128 bridge / ∀-binder make TRUE by
+    // construction (U2). Without this entry, downstream typed-spine
+    // Var lookups fall back to per-use claims and the old
+    // bare-assumption compensators double-wrap
+    // (BUG-call-arg-temp-claimed-typ.md).
     if let Some(dest_ident) = dest {
+        let dest_lean = crate::lean_name::LeanName::from_var_ident(dest_ident);
+        let ret_typ_subst: Typ = if callee.typ_params.len() == typ_args.len() {
+            let map: HashMap<vir::ast::Ident, Typ> = callee.typ_params.iter()
+                .cloned()
+                .zip(typ_args.iter().cloned())
+                .collect();
+            vir::sst_util::subst_typ(&map, &callee.ret.x.typ)
+        } else {
+            callee.ret.x.typ.clone()
+        };
+        new_obl = new_obl.with_let_binder(dest_lean.clone(), ret_typ_subst, true);
         if !use_dest_name {
-            new_obl.frames.push_back(CtxFrame::Let(
-                crate::lean_name::LeanName::from_var_ident(dest_ident),
-                dest_value,
-            ));
+            new_obl.frames.push_back(CtxFrame::Let(dest_lean, dest_value));
         }
     }
 
@@ -3529,17 +3552,21 @@ fn push_ret_frames(
         let rest = substituted_ensures
             .clone()
             .unwrap_or_else(|| LExpr::new(crate::lean_ast::ExprNode::LitBool(true)));
-        if crate::expr_shared::int_range_of(&ret.typ).is_none() {
-            // Non-integer ret (Bool/Prop/datatype): numeric sorts
-            // don't apply — the cond_setup case; raw is correct.
-            (e.clone(), e, rest)
-        } else {
-            // The unified bridge (expr_shared::coerce_lexpr, P0)
-            // reconciles E's render sort — and wrapper depth, if E
-            // ever carries one — to the dest's declared typ.
-            let bridged = crate::expr_shared::coerce_lexpr(e.clone(), &e_typ, &ret.typ);
-            (e, bridged, rest)
-        }
+        // The unified bridge (expr_shared::coerce_lexpr, P0) reconciles
+        // E's render sort (numeric rets, #128) AND wrapper depth to the
+        // dest's declared typ — BOTH ret families. Pre-2026-07-04 the
+        // non-integer branch skipped the bridge ("numeric sorts don't
+        // apply — raw is correct"), conflating sort-bridging with
+        // wrapper-bridging: an E rendered bare (vec index's `self@[i]`
+        // extraction, typ `T`) bound into a Ref-decorated dest (`&T`
+        // return) needs the `Tactus.Ref.mk` to maintain U2, else every
+        // downstream use of the dest at a Ref-typed slot is ill-typed
+        // (BUG-call-arg-temp-claimed-typ.md, pinned by
+        // test_exec_vec_field_index_clone). Identity when sort and
+        // wrappers already match — the Bool/Prop cond_setup case is
+        // unaffected.
+        let bridged = crate::expr_shared::coerce_lexpr(e.clone(), &e_typ, &ret.typ);
+        (e, bridged, rest)
     });
 
     // The value bound to `dest` differs by path: in the ∀-path,

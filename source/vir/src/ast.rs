@@ -1579,6 +1579,12 @@ pub struct FunctionAttrsX {
     /// crate that verifies exec fns in Lean by default. The per-fn escape
     /// hatch (`#[verifier::z3]`).
     pub tactus_z3: bool,
+    /// Tactus: emit this spec fn as an uninterpreted axiom PLUS a
+    /// defining-equation axiom, instead of a Lean def — for recursive
+    /// spec fns whose termination Lean's decreasing_by can't discharge
+    /// (Verus verified termination Z3-side; the equation is stipulated
+    /// with the same trust shape as broadcast axioms).
+    pub tactus_lean_axiom_eq: bool,
     /// Tactus: per-fn tactic-closer override. When `Some(tac)`, replaces
     /// `tactus_auto` in generated theorems with the user-supplied Lean
     /// tactic (e.g., `"ring"`, `"nlinarith"`, `"(simp_all; nlinarith)"`).

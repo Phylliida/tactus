@@ -857,8 +857,41 @@ pub(crate) fn unemittable_traits(
     krate: &vir::ast::KrateX,
     fn_map: &std::collections::HashMap<&vir::ast::Fun, &vir::ast::FunctionX>,
 ) -> std::collections::HashSet<vir::ast::Path> {
+    // Class/instance CONSISTENCY (2026-07-04): a class must be a
+    // shell if ANY of its impls-to-be-emitted can't provide ALL its
+    // method fields — else those instances elaborate as "Fields
+    // missing" against the full class (vstd's Clone: extern
+    // assume_specification impls for Vec/primitives have no bodied
+    // TraitMethodImpl fns, while a user derive elsewhere in the
+    // krate may be bodied — the MIXED case). Spec trait methods are
+    // unaffected (impls provide spec bodies); user traits with real
+    // Verus impl bodies stay full. Over-approximates across
+    // krate.trait_impls (an impl that never emits still shells the
+    // class) — safe, shells assert nothing.
+    let impl_lacks_method = |tr: &vir::ast::TraitX| -> bool {
+        krate.trait_impls.iter()
+            .filter(|ti| ti.x.trait_path == tr.name)
+            .any(|ti| {
+                tr.methods.iter().any(|m| {
+                    let decl_is_exec = fn_map.get(m)
+                        .map(|d| matches!(d.mode, vir::ast::Mode::Exec))
+                        .unwrap_or(false);
+                    decl_is_exec
+                        && !krate.functions.iter().any(|f| match &f.x.kind {
+                            vir::ast::FunctionKind::TraitMethodImpl { method, impl_path, .. } =>
+                                method == m
+                                    && *impl_path == ti.x.impl_path
+                                    && f.x.body.is_some(),
+                            _ => false,
+                        })
+                })
+            })
+    };
     krate.traits.iter()
-        .filter(|tr| tr.x.methods.iter().any(|m| !fn_map.contains_key(m)))
+        .filter(|tr| {
+            tr.x.methods.iter().any(|m| !fn_map.contains_key(m))
+                || impl_lacks_method(&tr.x)
+        })
         .map(|tr| tr.x.name.clone())
         .collect()
 }

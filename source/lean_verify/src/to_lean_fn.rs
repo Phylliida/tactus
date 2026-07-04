@@ -212,7 +212,7 @@ impl LeanSourceMap {
 /// body=None fns out — which produced "unresolved" sanity-check
 /// rejections at the call site. Audit 2026-05-12 unfiltered the map
 /// and routes through `Axiom` here.)
-pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Command {
+pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Vec<Command> {
     // Spec fns are Lean defs (mathematical definitions). The
     // u-type / i-type refinement bounds belong on theorems
     // (proof fns + exec fn obligations), not on the spec fn's
@@ -223,6 +223,61 @@ pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Command
     let binders = fn_binders_without_bound_hyps(f, &ectx.unemittable);
     let ret_ty = typ_to_expr(&f.ret.x.typ);
     let name = lean_name(&f.name.path);
+    // `#[verifier::tactus_lean_axiom_eq]`: emit an uninterpreted value
+    // axiom PLUS a defining-equation axiom named `<f>.eq_def`, instead
+    // of a Lean def. For recursive spec fns whose termination goal
+    // Lean's decreasing_by can't discharge (e.g. Seq-recursion via
+    // `drop_first`, whose measure fact `len (subrange s 1 len) < len s`
+    // is a broadcast axiom emitted AFTER the def in the preamble
+    // layout). SOUND: Verus verified the fn's termination Z3-side
+    // (SpecTermination query), so the defining equation has a model —
+    // the same stipulation shape as broadcast axioms. The `.eq_def`
+    // name matches Lean's auto-generated equation for real defs, so
+    // proof-block tactics (`rw [f.eq_def]`) are uniform across both
+    // emissions. The value axiom rides nonempty.rs Seed 2 like any
+    // bodyless spec fn (via `spec_fn_emits_as_axiom`).
+    if f.attrs.tactus_lean_axiom_eq {
+        if let Some(b) = &f.body {
+            let binder_ctx = crate::to_lean_expr::binder_ctx_from_params(&f.params);
+            let body = wrap_body_with_param_derefs(
+                crate::to_lean_expr::vir_expr_to_ast_with_binders(b, &binder_ctx, &crate::expr_shared::RenderCtx::empty()),
+                &f.params,
+            );
+            let value_axiom = Command::Axiom(Axiom {
+                name: name.clone(),
+                binders: binders.clone(),
+                ret_ty: ret_ty.clone(),
+                attrs: vec![],
+                comment: Some(
+                    "#[verifier::tactus_lean_axiom_eq]: value axiom + defining equation below; \
+                     termination was verified by Verus (Z3) — see the attribute's doc"
+                        .to_string(),
+                ),
+            });
+            // LHS: f applied to every named non-instance binder (typ
+            // params + value params, in binder order). Instance binders
+            // ([Nonempty A]) resolve implicitly at the application.
+            let applied = crate::lean_ast::Expr::app(
+                crate::lean_ast::Expr::var(crate::lean_name::LeanName::synthetic(name.clone())),
+                binders.iter()
+                    .filter(|bi| !matches!(bi.kind, crate::lean_ast::BinderKind::Instance))
+                    .filter_map(|bi| bi.name.clone())
+                    .map(crate::lean_ast::Expr::var)
+                    .collect(),
+            );
+            let eq_body = crate::lean_ast::Expr::binop(
+                crate::lean_ast::BinOp::Eq, applied, body,
+            );
+            let eq_axiom = Command::Axiom(Axiom {
+                name: format!("{}.eq_def", name),
+                binders,
+                ret_ty: eq_body,
+                attrs: vec![],
+                comment: None,
+            });
+            return vec![value_axiom, eq_axiom];
+        }
+    }
     // Bodies containing `CallTarget::BuiltinSpecFun` fall back to the
     // Axiom branch — see `expr_shared::spec_fn_emits_as_axiom`.
     let body = if crate::expr_shared::spec_fn_emits_as_axiom(f) { &None } else { &f.body };
@@ -251,7 +306,7 @@ pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Command
             // without `termination_by` is a Lean error. See DECREASING_BY_TACTIC.
             let decreasing_by = (!termination_by.is_empty())
                 .then(|| DECREASING_BY_TACTIC.to_string());
-            Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by, decreasing_by })
+            vec![Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by, decreasing_by })]
         }
         None => {
             // Transparency: when the fallback DROPPED a body (vs. the fn
@@ -261,7 +316,7 @@ pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Command
                 "body contains `call_ensures`/`call_requires` (no Lean encoding); \
                  axiomatized signature — see expr_shared::spec_fn_emits_as_axiom"
             ));
-            Command::Axiom(Axiom { name, binders, ret_ty, attrs: vec![], comment })
+            vec![Command::Axiom(Axiom { name, binders, ret_ty, attrs: vec![], comment })]
         }
     }
 }
