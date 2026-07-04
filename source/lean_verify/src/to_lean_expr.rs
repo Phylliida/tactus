@@ -508,9 +508,26 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
                 // beyond Phase 1).
                 let app_args: Vec<LExpr> = args.iter().enumerate().map(|(i, a)| {
                     let arg_node = expr_to_ast(a, ctx);
+                    // Coerce from the arg's ACTUAL Lean typ, not the
+                    // claimed `a.typ`. For a bare `Var` whose binder
+                    // typ the ctx knows (a loop-modified local like
+                    // `out : Vec`), VIR's `out@` auto-ref makes `a.typ`
+                    // claim `&Vec` while the Lean binder is bare — so
+                    // coercing from the claim is an identity where a
+                    // `Tactus.Ref.mk` was needed. `binder_typs` carries
+                    // the truth (BUG-call-arg-temp-claimed-typ.md).
+                    // Falls back to `a.typ` when the arg isn't a
+                    // ctx-known Var — unchanged for every other case.
+                    let src_typ = match &a.x {
+                        ExprX::Var(ident) => ctx.binder_typs
+                            .and_then(|b| b.get(ident))
+                            .cloned()
+                            .unwrap_or_else(|| a.typ.clone()),
+                        _ => a.typ.clone(),
+                    };
                     let arg_coerced = match &expected_typs {
                         Some(typs) if i < typs.len() => {
-                            crate::expr_shared::coerce_lexpr(arg_node, &a.typ, &typs[i])
+                            crate::expr_shared::coerce_lexpr(arg_node, &src_typ, &typs[i])
                         }
                         _ => arg_node,
                     };
