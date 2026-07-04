@@ -1629,10 +1629,17 @@ impl ObligationEmitter {
         let final_closer = if !needs_intro {
             closer
         } else {
+            // No indent on the continuation: `compose_tactic` re-indents
+            // every line of a Raw closer uniformly inside its paren
+            // block. A DEEPER-indented continuation here rendered as
+            // `(intro …;\n  <text>)` with the text SHALLOWER than the
+            // intro — Lean's column-sensitive tactic parser reads that
+            // as a dedent and errors "expected ')'"
+            // (found via find_cancellation_exec's in-loop assert-by).
             let intros = format!("intro {};", intro_names.join(" "));
             let body = match closer {
-                Tactic::Named(n) => format!("{}\n  {}", intros, n),
-                Tactic::Raw(s) => format!("{}\n  {}", intros, s),
+                Tactic::Named(n) => format!("{}\n{}", intros, n),
+                Tactic::Raw(s) => format!("{}\n{}", intros, s),
             };
             Tactic::Raw(body)
         };
@@ -1708,7 +1715,27 @@ impl ObligationEmitter {
             body.push_str(") <;> ");
             match closer {
                 Tactic::Named(n) => body.push_str(&n),
-                Tactic::Raw(s) => body.push_str(&format!("({})", s)),
+                // Block-render raw closers — `(\n  <lines at uniform
+                // col>\n)` — instead of inlining `({})`. Inlined
+                // multi-line raw text puts its first line at the
+                // paren's column and later lines wherever the user
+                // wrote them; any line shallower than the first is a
+                // dedent to Lean's tactic parser ("expected ')'").
+                // The uniform re-indent makes every line, including
+                // an `intro …;` prefix line, column-consistent.
+                Tactic::Raw(s) => {
+                    body.push_str("(\n");
+                    for line in s.lines() {
+                        if line.trim().is_empty() {
+                            body.push('\n');
+                        } else {
+                            body.push_str("  ");
+                            body.push_str(line.trim_end());
+                            body.push('\n');
+                        }
+                    }
+                    body.push(')');
+                }
             }
             Tactic::Raw(body)
         }
