@@ -621,8 +621,22 @@ pub(crate) fn spec_world_cmds(
             Some((ti, method_impls))
         })
         .collect();
+    // Includes each emitted instance's PREMISE-bound traits alongside
+    // its own trait: a blanket instance like vstd's Copy→Clone
+    // (`instance [marker.Copy A] : clone.Clone A`) references the
+    // premise class in its binder list, so the class must emit or the
+    // instance is an unknown-identifier error (found via
+    // tactus-group-theory's apply_hom_symbol_exec). Marker shells are
+    // contentless, so over-pulling is sound and cheap.
     let traits_with_emitted_impl: std::collections::HashSet<&str> = instances_to_emit.iter()
-        .map(|(ti, _)| short_name(&ti.x.trait_path))
+        .flat_map(|(ti, _)| {
+            std::iter::once(short_name(&ti.x.trait_path)).chain(
+                ti.x.typ_bounds.iter().filter_map(|b| match &**b {
+                    GenericBoundX::Trait(vir::ast::TraitId::Path(p), _) => Some(short_name(p)),
+                    _ => None,
+                }),
+            )
+        })
         .collect();
 
     // Per-impl projection substitution (Bug B step 2). One ImplSubst

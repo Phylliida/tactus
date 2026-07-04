@@ -115,6 +115,13 @@ pub struct Axiom {
     pub binders: Vec<Binder>,
     pub ret_ty: Expr,
     pub attrs: Vec<String>,
+    /// Emitted as a `-- …` line above the axiom. Transparency device:
+    /// when the pipeline axiomatizes something it would normally
+    /// define (e.g. a spec fn whose body contains un-renderable
+    /// `call_ensures`), the artifact must SAY so — the reader of the
+    /// generated Lean should never have to guess why a def became an
+    /// axiom.
+    pub comment: Option<String>,
 }
 
 /// Curried-form definition with pattern-matched equations.
