@@ -3569,21 +3569,24 @@ fn push_ret_frames(
         let rest = substituted_ensures
             .clone()
             .unwrap_or_else(|| LExpr::new(crate::lean_ast::ExprNode::LitBool(true)));
-        // The unified bridge (expr_shared::coerce_lexpr, P0) reconciles
-        // E's render sort (numeric rets, #128) AND wrapper depth to the
-        // dest's declared typ — BOTH ret families. Pre-2026-07-04 the
-        // non-integer branch skipped the bridge ("numeric sorts don't
-        // apply — raw is correct"), conflating sort-bridging with
-        // wrapper-bridging: an E rendered bare (vec index's `self@[i]`
-        // extraction, typ `T`) bound into a Ref-decorated dest (`&T`
-        // return) needs the `Tactus.Ref.mk` to maintain U2, else every
-        // downstream use of the dest at a Ref-typed slot is ill-typed
-        // (BUG-call-arg-temp-claimed-typ.md, pinned by
-        // test_exec_vec_field_index_clone). Identity when sort and
-        // wrappers already match — the Bool/Prop cond_setup case is
-        // unaffected.
-        let bridged = crate::expr_shared::coerce_lexpr(e.clone(), &e_typ, &ret.typ);
-        (e, bridged, rest)
+        // Bridge E's render sort (numeric rets, #128) AND wrapper
+        // depth to the dest's declared typ — EXCEPT for `&mut T`
+        // returns. A mut-ref return (Vec::index_mut → &mut T) is owned
+        // by the prophecy / MutArgInfo machinery; bridging E to the
+        // MutRef ret.typ would `MutRef.mk`-WRAP it, so `*old(x)` on the
+        // substituted mut arg renders undereferenced (`tmp < 100` on a
+        // `MutRef Int` — regressed test_exec_call_mut_arg_vec_index).
+        // Every OTHER ret — datatype (`Vec` from copy_word /
+        // apply_hom, needing the wrapper `.mk` to maintain U2, pinned
+        // by test_exec_vec_field_index_clone), Bool/Prop, and integer
+        // (needing `Int.toNat`) — DOES get the bridge; coerce_lexpr is
+        // an identity when sort and wrappers already match.
+        if crate::expr_shared::is_mut_ref_typ(&ret.typ, ret.is_mut) {
+            (e.clone(), e, rest)
+        } else {
+            let bridged = crate::expr_shared::coerce_lexpr(e.clone(), &e_typ, &ret.typ);
+            (e, bridged, rest)
+        }
     });
 
     // The value bound to `dest` differs by path: in the ∀-path,

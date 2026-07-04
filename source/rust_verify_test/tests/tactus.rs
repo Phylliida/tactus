@@ -2818,8 +2818,13 @@ test_verify_one_file! {
             h.imgs[i].clone()
         }
     } => Err(err) => {
+        // Matches both "Type mismatch" and "Application type mismatch"
+        // (the exact Lean wording shifted once the `lookup_subst_typ`
+        // deref fix corrected the `h.deref.imgs` base — the residual
+        // failure is the clone's strictly_cloned axiomatization, still
+        // a `Tactus.Ref`-slot mismatch + `sorry`).
         assert!(
-            err.errors.iter().any(|e| e.message.contains("type mismatch")),
+            err.errors.iter().any(|e| e.message.contains("ismatch")),
             "expected the KNOWN ill-typed-artifact failure (fixed? flip this pin to Ok!), got: {:?}",
             err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
         );
