@@ -990,6 +990,16 @@ Type`) as `fun _ => Unit`. Then:
 - The brackets narrow instantiation but don't verify the axiom
   STATEMENTS' mutual consistency beyond inhabitedness — that remains
   the cross-crate trust stipulation it always was.
+- **Blanket shell instances** (observed 2026-07-03): the preamble can
+  contain premise-free blanket instances like
+  `instance {A : Type} : clone.Clone A` (from vstd's
+  `external_trait_specification` shim machinery — `ExCopy: Clone`
+  supertraits and friends). SOUND TODAY because such classes are
+  method-stripped SHELLS — the instance asserts nothing; it exists so
+  rustc-vouched trait bounds elaborate. TRIPWIRE: if a shell class
+  ever gains real methods/laws in the emission, any premise-free
+  blanket instance of it becomes an unbacked universal claim — audit
+  blanket instances whenever a trait graduates from shell to real.
 
 ## Heartbeat annotations — LANDED (#123)
 

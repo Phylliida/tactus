@@ -1004,7 +1004,7 @@ pub(crate) fn spec_world_cmds(
                     } else {
                     push_lenient(&mut cmds, "spec fn", &mut || {
                         let augmented = augment(f);
-                        vec![to_lean_fn::spec_fn_to_ast(&augmented, ectx)]
+                        to_lean_fn::spec_fn_to_ast(&augmented, ectx)
                     });
                     }
                 }
@@ -1015,7 +1015,7 @@ pub(crate) fn spec_world_cmds(
                     } else {
                     push_lenient(&mut cmds, "mutual spec fns", &mut || {
                         let inner: Vec<Command> = fns.iter()
-                            .map(|f| {
+                            .flat_map(|f| {
                                 let augmented = augment(f);
                                 to_lean_fn::spec_fn_to_ast(&augmented, ectx)
                             })
