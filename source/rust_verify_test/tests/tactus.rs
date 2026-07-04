@@ -2791,6 +2791,41 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// ── KNOWN BUG (pinned as Err): clone of a Vec element loses the ref
+// wrap in call-substitution entries. Cloning an element of a nested
+// Vec (`h.imgs[i].clone()` with `imgs: Vec<Vec<u8>>`) generates
+// obligation exps where the clone-callee's `self` substitutes to an
+// SST temp (`tmp__1`) whose Var reference CLAIMS the autoref'd
+// Ref-decorated typ while the rendered binding holds the bare value.
+// The substitution entry records the claim, so the use-site
+// `coerce_lexpr` is an identity and the artifact is ill-typed
+// ("Application type mismatch ... expected Tactus.Ref" at
+// spec_vec_len's slot). Diagnosed 2026-07-04 (see
+// BUG-call-arg-temp-claimed-typ.md); groundwork landed (walker temps
+// now consult the let-binder ledger + args render through the typed
+// spine) but THIS temp's binding is minted outside walk_let, so its
+// storage typ is recorded nowhere yet. FLIP THIS PIN TO Ok WHEN
+// FIXED. Blocks tactus-group-theory's apply_hom_symbol_exec.
+test_verify_one_file! {
+    #[test] test_exec_vec_field_index_clone verus_code! {
+        use vstd::prelude::*;
+        struct Holder { imgs: Vec<Vec<u8>> }
+        #[verifier::tactus_auto]
+        fn clone_field_index(h: &Holder, i: usize) -> (out: Vec<u8>)
+            requires (i as int) < h.imgs@.len(),
+            ensures out@ == h.imgs@[i as int]@,
+        {
+            h.imgs[i].clone()
+        }
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("type mismatch")),
+            "expected the KNOWN ill-typed-artifact failure (fixed? flip this pin to Ok!), got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
 // ── Arch-width integer bounds (usize::MAX in specs) ───────────────
 // `usize::MAX` is `IntegerTypeBound(UnsignedMax)` at the ArchWordBits
 // width — formerly a hard renderer rejection ("non-constant bit width
