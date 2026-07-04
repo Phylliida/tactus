@@ -600,7 +600,7 @@ fn actual_is_trusted(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> bool {
 /// * Field/IsVariant — deref count from the base's ACTUAL typ; tuple
 ///   projections report the slot typ as actual (replaces
 ///   `tuple_slot_extra_derefs`).
-fn exp_to_typed(
+pub(crate) fn exp_to_typed(
     e: &Exp,
     ctx: &crate::expr_shared::RenderCtx,
 ) -> Result<crate::typed_expr::TypedExpr, String> {

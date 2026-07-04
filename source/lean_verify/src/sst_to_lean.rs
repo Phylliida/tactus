@@ -2391,8 +2391,13 @@ fn walk_call<'a>(
     // and threaded through `Wp::Call`. No re-derivation, no `expect()`
     // — the type system guarantees it's present.
 
+    // Binder-aware render ctx for the call args (typed spine): params
+    // from `caller_param_typs`, WP temps from the walk's
+    // `let_binder_typs` ledger — so substitution entries record the
+    // typ the rendered LExpr ACTUALLY has, not the arg exp's claim.
+    let arg_rctx = ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs);
     let subst = build_call_substitutions(
-        callee, spec_callee, typ_args, args, mut_args, &ctx.caller_param_typs, obl, e,
+        callee, spec_callee, typ_args, args, mut_args, &ctx.caller_param_typs, &arg_rctx, obl, e,
     );
 
     // Canonical "what gets inlined at this call site." Single source
@@ -2722,14 +2727,30 @@ fn add_param_subst_entries<'a>(
 /// entries with storage typs that match the rendered LExpr's actual
 /// Lean typ. Without this, `coerce_lexpr` at use sites would bridge
 /// from the wrong source typ and produce mis-typed wraps or peels.
-fn caller_arg_actual_typ(arg: &Exp, caller_param_typs: &HashMap<VarIdent, Typ>) -> Typ {
+fn caller_arg_actual_typ(
+    arg: &Exp,
+    caller_param_typs: &HashMap<VarIdent, Typ>,
+    // WP-temp storage typs (`OblCtx::let_binder_typs` — "typ the
+    // binding was coerced into"). A temp's Var reference can CLAIM an
+    // autoref'd (Ref-decorated) typ while its goal-position `let`
+    // bound the bare value; recording the claim makes the use-site
+    // `coerce_lexpr` an identity and emits ill-typed Lean (bare Vec at
+    // a `Tactus.Ref` slot — test_exec_vec_field_index_clone /
+    // apply_hom_symbol_exec).
+    let_binder_typs: &im::HashMap<crate::lean_name::LeanName, (Typ, bool)>,
+) -> Typ {
     match &arg.x {
         ExpX::Var(v) | ExpX::VarLoc(v) | ExpX::VarAt(v, _) => {
-            caller_param_typs.get(v).cloned().unwrap_or_else(|| arg.typ.clone())
+            caller_param_typs.get(v).cloned()
+                .or_else(|| {
+                    let name = crate::lean_name::LeanName::from_var_ident(v);
+                    let_binder_typs.get(&name).map(|(t, _)| t.clone())
+                })
+                .unwrap_or_else(|| arg.typ.clone())
         }
         // `Loc` is a transparent L-value wrapper — recurse to find the
         // inner's actual typ (typically a VarLoc / Var / UnaryOpr Field).
-        ExpX::Loc(inner) => caller_arg_actual_typ(inner, caller_param_typs),
+        ExpX::Loc(inner) => caller_arg_actual_typ(inner, caller_param_typs, let_binder_typs),
         _ => arg.typ.clone(),
     }
 }
@@ -2741,6 +2762,7 @@ fn build_call_substitutions<'a>(
     args: &[Validated<'a>],
     mut_args_raw: &[(usize, MutTargetRaw<'a>)],
     caller_param_typs: &HashMap<VarIdent, Typ>,
+    arg_rctx: &crate::expr_shared::RenderCtx,
     obl: &OblCtx,
     e: &mut ObligationEmitter,
 ) -> CallSubstitutions<'a> {
@@ -2760,10 +2782,22 @@ fn build_call_substitutions<'a>(
     // use sites it codifies Rust's auto-borrow analog: the bridge
     // from caller-supplied (possibly body-shadowed) typ to whatever
     // typ the inlined spec slot expects.
-    let arg_lexprs: Vec<LExpr> = args.iter().map(|a| lower_validated(a)).collect();
-    let arg_actual_typs: Vec<Typ> = args.iter()
-        .map(|a| caller_arg_actual_typ(a.raw(), caller_param_typs))
-        .collect();
+    // Typed spine: render each arg ONCE through the binder-aware ctx,
+    // yielding the value AND the typ the rendered LExpr actually has
+    // (a borrow-of-place renders transparent/bare even when the arg
+    // exp CLAIMS the Ref-decorated typ — recording the claim made the
+    // use-site coerce_lexpr an identity and emitted ill-typed Lean;
+    // see test_exec_vec_field_index_clone). Falls back to the old
+    // claimed-typ path for exp shapes exp_to_typed rejects.
+    let (arg_lexprs, arg_actual_typs): (Vec<LExpr>, Vec<Typ>) = args.iter().map(|a| {
+        match crate::to_lean_sst_expr::exp_to_typed(a.raw(), arg_rctx) {
+            Ok(t) => (t.inner, t.typ),
+            Err(_) => (
+                lower_validated(a),
+                caller_arg_actual_typ(a.raw(), caller_param_typs, &obl.let_binder_typs),
+            ),
+        }
+    }).unzip();
 
     // One MutArgInfo per `&mut` arg — bundles param_idx, target
     // (the L-value shape, post-#87), and the gensym'd fresh post-
