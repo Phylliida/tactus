@@ -45,6 +45,7 @@ pub(crate) fn binder_ctx_from_params(params: &Params) -> BinderCtx {
     out
 }
 
+
 /// Strip exactly one outer reference decoration layer from a typ.
 /// Mirrors what the body shadow `let p := p.deref;` does at the Lean
 /// level. Returns the typ unchanged if there's no outer ref decoration.
@@ -268,8 +269,22 @@ use crate::expr_shared::count_ref_decorations;
 /// Verus's SST may strip decorations from the SST typ while the
 /// rendered Lean value still has them.
 fn lean_level_wrap_count(var_id: Option<&VarIdent>, spanned_typ: &Typ, ctx: &crate::expr_shared::RenderCtx) -> usize {
+    // Mirror `structural_typ`'s Var arm: binder typ if known, else the
+    // inlined-call substitution's storage typ (records the caller
+    // arg's actual wrapper depth), else the spanned AST typ. The
+    // subst step fixes a Field access on a substituted immutable-ref
+    // arg (`h.generator_images` where the callee's `h : &RuntimeHomData`
+    // is substituted by the caller's `Tactus.Ref` value) whose spanned
+    // typ is bare (Verus auto-derefs the `&self` base) — without it the
+    // deref count is 0 and Lean gets `h.generator_images` (un-elaborable
+    // → `sorry`; found via apply_hom_symbol_exec).
     let lean_typ = var_id
-        .and_then(|v| ctx.binder(v).cloned())
+        .and_then(|v| {
+            ctx.binder(v).cloned().or_else(|| {
+                let lean_name = crate::lean_name::LeanName::from_var_ident(v);
+                ctx.lookup_subst_typ(&lean_name)
+            })
+        })
         .unwrap_or_else(|| spanned_typ.clone());
     count_ref_decorations(&lean_typ)
 }
