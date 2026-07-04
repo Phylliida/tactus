@@ -2791,6 +2791,29 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// ── Arch-width integer bounds (usize::MAX in specs) ───────────────
+// `usize::MAX` is `IntegerTypeBound(UnsignedMax)` at the ArchWordBits
+// width — formerly a hard renderer rejection ("non-constant bit width
+// is not supported"), now rendered symbolically as `usize_hi - 1`
+// over the prelude defs (2026-07-03, the group-theory error-class
+// fixes). The overflow obligation needs the symbolic-exponent case
+// split, hence the layered `tactus_usize_bound` closer — the same
+// migration idiom tactus-group-theory's todd_coxeter_rt uses. Pinned
+// here so the e2e suite guards the rendering, not just the external
+// crate.
+test_verify_one_file! {
+    #[test] test_exec_usize_max_arch_width_bound verus_code! {
+        #[verifier::tactus_auto]
+        #[verifier::tactus_tactic("first | tactus_auto | tactus_usize_bound")]
+        fn double_bounded(x: usize) -> (r: usize)
+            requires 2 * x < usize::MAX,
+            ensures r == 2 * x,
+        {
+            2 * x
+        }
+    } => Ok(())
+}
+
 // ── Per-fn tactic override ────────────────────────────────────────
 // `#[verifier::tactus_tactic("ring")]` replaces `tactus_auto` in
 // generated theorems with the user-supplied Lean tactic. Useful for
