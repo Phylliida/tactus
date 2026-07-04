@@ -2173,17 +2173,34 @@ fn walk_loop<'a>(
     // Plain `invariant P` (at_entry = at_exit = true) flows into
     // both. `invariant_except_break` (at_entry only) and loop
     // `ensures` (at_exit only) flow into one each.
+    // Render ctx for invariants/cond: the fn's params PLUS the loop-
+    // modified locals, at their Lean binder typs. A modified local
+    // (`out : Vec`, built in-loop) is bound BARE at binder frames, but
+    // a spec `out@` auto-refs it in VIR (claims `&Vec`) — so the
+    // class-method receiver coercion must know `out`'s ACTUAL bare typ
+    // to insert the `Tactus.Ref.mk` for `View::view`. Without the
+    // modified vars in `binder_typs`, the coercion runs off the lying
+    // `a.typ` claim and emits ill-typed Lean (bare Vec at View::view's
+    // Ref slot — copy_word's invariants,
+    // BUG-call-arg-temp-claimed-typ.md family). Params keep whatever
+    // `caller_param_typs` recorded (ref-decorated for `&`-only).
+    let mut inv_binder_typs: HashMap<VarIdent, Typ> = ctx.caller_param_typs.clone();
+    for (ident, typ) in modified_vars {
+        inv_binder_typs.entry((*ident).clone()).or_insert_with(|| (*typ).clone());
+    }
+    let inv_rctx = crate::expr_shared::RenderCtx::with_fn_map(&ctx.fn_map)
+        .with_binder_typs(&inv_binder_typs);
     let inv_marked = |(i, v): (&LoopInv, &Validated<'a>)| LExpr::span_mark(
         format_rust_loc(&i.inv.span),
         Some(i.inv.span.clone()),
         AssertKind::Obligation(ObligationKind::LoopInvariant),
-        lower_validated(v),
+        lower_validated_with_ctx(v, &inv_rctx),
     );
     let cond_marked = |c: &Validated<'a>| LExpr::span_mark(
         format_rust_loc(&c.raw().span),
         Some(c.raw().span.clone()),
         AssertKind::Hypothesis(HypothesisKind::LoopCondition),
-        lower_validated(c),
+        lower_validated_with_ctx(c, &inv_rctx),
     );
     // Each invariant clause becomes its OWN hypothesis frame, NOT one
     // glued `∧` conjunction. `split_leading_binders` then names them
@@ -5671,11 +5688,24 @@ fn build_wp_loop<'a>(
     // independently folds into a marked conjunction; an empty list
     // folds to `True` (handled by `and_all`), which is harmless as
     // a hypothesis or trivially-provable as a Done leaf.
+    // Render invariants (the continue/break-leaf GOALS the body must
+    // re-establish) with the fn's params PLUS the loop-modified locals
+    // in `binder_typs` — so `out@` on a bare-bound modified local
+    // wraps to `View::view (Tactus.Ref.mk out)` instead of coercing
+    // off the lying auto-ref `a.typ`. Mirrors `walk_loop`'s `inv_rctx`
+    // for the init/hyp side; both must agree
+    // (BUG-call-arg-temp-claimed-typ.md).
+    let mut inv_binder_typs: HashMap<VarIdent, Typ> = ctx.caller_param_typs.clone();
+    for (ident, typ) in &modified_vars {
+        inv_binder_typs.entry((*ident).clone()).or_insert_with(|| (*typ).clone());
+    }
+    let inv_rctx = crate::expr_shared::RenderCtx::with_fn_map(&ctx.fn_map)
+        .with_binder_typs(&inv_binder_typs);
     let inv_marked = |(i, v): (&LoopInv, &crate::to_lean_sst_expr::Validated<'a>)| LExpr::span_mark(
         format_rust_loc(&i.inv.span),
         Some(i.inv.span.clone()),
         AssertKind::Obligation(ObligationKind::LoopInvariant),
-        crate::to_lean_sst_expr::lower(v),
+        crate::to_lean_sst_expr::lower_with_ctx(v, &inv_rctx),
     );
     let entry_inv_conj = and_all(
         invs.iter().zip(validated_invs.iter()).zip(inv_kinds.iter())
