@@ -1946,8 +1946,15 @@ impl Verifier {
                         // crates). Either way, only on the `Body(Normal)` query —
                         // the obligation from the body — not recommends-check /
                         // api-safety / expanded re-runs.
+                        // `--lean-all-proofs` (experimental): also route plain
+                        // proof fns (no tactic block — those already `continue`d
+                        // above) through the Lean WP path. `#[verifier::z3]`
+                        // remains the per-fn opt-out for shapes the WP
+                        // translator can't handle yet.
                         let route_to_lean = if self.args.lean_backend {
-                            function.x.mode == vir::ast::Mode::Exec
+                            (function.x.mode == vir::ast::Mode::Exec
+                                || (self.args.lean_all_proofs
+                                    && function.x.mode == vir::ast::Mode::Proof))
                                 && !function.x.attrs.tactus_z3
                         } else {
                             function.x.attrs.tactus_auto
