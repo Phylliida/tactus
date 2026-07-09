@@ -3264,10 +3264,15 @@ impl Verifier {
                     )).to_any());
                 }
                 if report.failures.is_empty() {
+                    let reuse = if report.reused > 0 {
+                        format!(" ({} reused from per-fn checks)", report.reused)
+                    } else {
+                        String::new()
+                    };
                     reporter.report_now(&note_bare(format!(
-                        "tactus: package gate: {} modules elaborated; composition + \
+                        "tactus: package gate: {} modules elaborated{}; composition + \
                          axiom closures kernel-verified",
-                        report.modules,
+                        report.modules, reuse,
                     )).to_any());
                 } else {
                     for (module, output) in &report.failures {
