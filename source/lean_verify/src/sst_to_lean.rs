@@ -933,7 +933,10 @@ pub fn exec_fn_theorems_to_ast<'a>(
         &LoopStack::Empty,
     )?;
 
-    let fn_name = lean_name(&fn_sst.x.name.path);
+    // `lean_name_relative`: `fn_name` only feeds `build_theorem_name`
+    // (synthetic obligation-theorem names) — a naming key, not a Lean
+    // reference. The root-anchor prefix must not appear mid-name.
+    let fn_name = crate::to_lean_type::lean_name_relative(&fn_sst.x.name.path);
     let default_closer = match &fn_sst.x.attrs.tactus_tactic {
         Some(tac) => Tactic::Raw(tac.clone()),
         None => Tactic::Named("tactus_auto".to_string()),
