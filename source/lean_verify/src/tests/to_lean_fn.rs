@@ -41,3 +41,58 @@ fn trait_bounds_to_ast_drops_shell_trait_bounds() {
     assert_eq!(binders.len(), 2,
         "no shell traits → no bounds dropped");
 }
+
+// ── Statement defs (emit-module Stmts layer, DESIGN-emit-module.md) ────
+
+/// The full binder-kind spread in one statement: implicit type param,
+/// anonymous instance bracket, explicit value param, hypothesis binder.
+/// Pins the exact `@[reducible] noncomputable def … : Prop := ∀ …`
+/// shape the M0 probe validated (finding F2: reducibility is what
+/// makes intro/application/link-unification work without `unfold`).
+#[test]
+fn stmt_cmd_renders_reducible_forall_prop() {
+    let binders = vec![
+        LBinder::typ_param("A", BinderKind::Implicit),
+        LBinder::instance(LExpr::app(
+            LExpr::var_lit("Nonempty"),
+            vec![LExpr::var_lit("A")],
+        )),
+        LBinder::explicit(
+            crate::lean_name::LeanName::synthetic("x".to_string()),
+            LExpr::var_lit("Int"),
+        ),
+        LBinder::explicit(
+            crate::lean_name::LeanName::synthetic("h0".to_string()),
+            LExpr::var_lit("True"),
+        ),
+    ];
+    let cmd = stmt_cmd("lemma_a_stmt".to_string(), binders, LExpr::var_lit("True"));
+    let out = crate::lean_pp::pp_command(&cmd);
+    assert_eq!(
+        out,
+        "@[reducible] noncomputable def lemma_a_stmt : Prop :=\n  \
+         ∀ {A : Type} [Nonempty A] (x : Int) (h0 : True), True\n",
+        "statement def shape drifted; got:\n{out}"
+    );
+}
+
+/// Zero binders: a nullary lemma's statement is the bare ensures —
+/// no vacuous `∀ ,` wrapper.
+#[test]
+fn stmt_cmd_zero_binders_is_bare_goal() {
+    let cmd = stmt_cmd("nullary_stmt".to_string(), vec![], LExpr::var_lit("True"));
+    let out = crate::lean_pp::pp_command(&cmd);
+    assert_eq!(
+        out,
+        "@[reducible] noncomputable def nullary_stmt : Prop :=\n  True\n",
+        "nullary statement shape drifted; got:\n{out}"
+    );
+}
+
+/// `stmt_name` is the single chokepoint for the `_stmt` naming
+/// convention shared by the Stmts renderer, consumer hypothesis
+/// binders (M2), and the Link module (M3).
+#[test]
+fn stmt_name_appends_suffix_to_lean_name() {
+    assert_eq!(stmt_name(&mk_path("lemma_a")), "lemma_a_stmt");
+}
