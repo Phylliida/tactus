@@ -103,20 +103,19 @@ proof fn lemma_b(x: nat) ensures x + 0 + 0 == x { proof { lemma_a(x); } … }
 Emitted package:
 
 ```lean
--- Tgt/Stmts/M.lean
+-- Tgt/Stmts/M.lean            (abbrev, not def — see M0 finding F2)
 import Tgt.Defs.M
-def lemma_a_stmt : Prop := ∀ (x : Int), 0 ≤ x → x + 0 = x
-def lemma_b_stmt : Prop := ∀ (x : Int), 0 ≤ x → x + 0 + 0 = x
+abbrev lemma_a_stmt : Prop := ∀ (x : Int), 0 ≤ x → x + 0 = x
+abbrev lemma_b_stmt : Prop := ∀ (x : Int), 0 ≤ x → x + 0 + 0 = x
 
--- Tgt/Proofs/M_lemma_a.lean
+-- Tgt/Proofs/M_lemma_a.lean   (reducibility ⇒ no unfold gymnastics)
 import Tgt.Stmts.M
 theorem lemma_a_thm : lemma_a_stmt := by
-  unfold lemma_a_stmt; omega
+  intro x hx; omega
 
 -- Tgt/Proofs/M_lemma_b.lean
 import Tgt.Stmts.M
 theorem lemma_b_thm (h_a : lemma_a_stmt) : lemma_b_stmt := by
-  unfold lemma_a_stmt at h_a; unfold lemma_b_stmt
   intro x hx; have := h_a x hx; omega
 
 -- Tgt/Link.lean
@@ -201,6 +200,12 @@ Mutually recursive proof fns (dep_order `FnGroup::Mutual`) go in one Proofs
 module as a `mutual` theorem block with the existing `termination_by`/
 `decreasing_by` emission; the linker closes the whole SCC as a unit. Their
 *statements* are ordinary separate defs — no mutuality at the Stmts layer.
+Two sharpenings from M0 (F3/F4): recursive/mutual theorems must keep the
+**parameterized** type (real binders for `termination_by` — a bare
+`theorem f_thm : f_stmt` has nothing to recurse on); the linker bridges to
+the stmt-typed closed form by direct reference (definitional eta makes
+`theorem f_closed : f_stmt := f_thm` typecheck). Within-SCC references are
+direct (same mutual block) — only SCC-external callees become hypotheses.
 
 ### 4.4 Exec fns
 
@@ -264,7 +269,58 @@ surprises (olean trace behavior under byte-identical rebuilds, `unfold`
 ergonomics of stmt defs in tactic bodies, mutual-block linking) while the
 design is still cheap to change — CRATEDEFS's probe-first methodology, kept.
 
-## 7. Open questions
+## 7. M0 findings (2026-07-09, `probe-m0/` — hand-written package, lean 4.25.0)
+
+The §6 spike ran same-day. The probe (13 modules: Defs, Stmts, 8 per-fn Proofs
+covering every checklist shape, Link, root) **builds green, cold, in ~1.4s**;
+pure Lean core, no Mathlib needed for any architectural question.
+
+- **F1 — every shape elaborates**: hypothesis-passing, broadcast-as-hypothesis
+  (consumed from local context exactly like env axioms — parity confirmed),
+  generic stmt with `∀ (A : Type) [Nonempty A]` inside the abbrev (Prop
+  impredicativity + instance binders fine), shared `incr_req`/`incr_ens`
+  contract defs used by both the exec WP theorem and a caller's WP goal.
+- **F2 — Stmts must be `abbrev`, not `def`**: reducibility makes `intro` peel
+  the stmt name, `h_a x hx` elaborate, and linker applications unify — zero
+  `unfold` gymnastics anywhere in the probe. (§2.2 example updated.)
+- **F3/F4 — mutual/recursive form**: parameterized theorem type +
+  `termination_by`, linker bridges to stmt-typed closed forms via definitional
+  eta; within-SCC references stay direct. Consequence for M2: the *current*
+  theorem rendering is reused as-is — the only delta is prepended hypothesis
+  binders and the stmt-abbrev layer. (§4.3 updated.)
+- **F5 — invalidation validated, sha256-verified**: body edit → exactly
+  {edited Proofs module, Link, root} rebuild; consumer modules untouched
+  (olean byte-identical, not re-elaborated); Stmts olean byte-stable. At a
+  generated 300-fn chain: cold 8.4s (305 modules, parallel), **body-edit
+  cycle 1.6s with 299 modules untouched** — flat in crate size except Link.
+  No-op build 0.17s.
+- **F6 — Link cost measured**: 300 closure lines = 593ms ≈ 0.4s process floor
+  + ~0.6ms/line → ~2.2s monolithic at a 2800-fn crate. Two easy mitigations
+  when it matters: per-module link files under a root aggregator (only the
+  touched module's link rebuilds), and/or dev loop skips linking entirely
+  (checking the one Proofs module is the verification; the verus cache
+  already tracks per-fn green — Link is a gate artifact).
+- **F7 — statement-edit fanout is per-module-coarse** (O1's concrete data):
+  editing one stmt rebuilt all 8 Proofs modules importing `Stmts.M`, vs. the
+  verus cache's callers-only invalidation. Per-fn (or per-SCC-cluster) stmt
+  files would recover exact-caller granularity at the cost of file count.
+- **F8 — axiom closure demonstrated**: `#print axioms` on every `_closed`
+  theorem reports ⊆ {propext, Quot.sound, Classical.choice} — the package-mode
+  gate claim, kernel-confirmed, zero domain axioms.
+- **F9 — translator note**: `simp [isOdd]` does *not* unfold mutual-structural
+  defs at constructor patterns (`isOdd 0`); defeq-based closers (`rfl`,
+  `decide`, bare `exact` at defeq type) work. Emitted proofs touching mutual
+  spec fns should prefer defeq forms / `.eq_def` lemmas.
+- **F10 — island vs package at toy scale**: 0.47s vs 0.42s for a 3-lemma
+  closure (island re-elaborates all helper bodies; package elaborates one
+  theorem against oleans). The real-scale version of this measurement is
+  CRATEDEFS's (−76% batch on deep chains); the probe confirms the structure,
+  not the magnitude.
+
+Net: **no blockers found; two design corrections (F2, F3) folded into §2.2 and
+§4.3.** M1 can start on this shape directly.
+
+## 8. Open questions
 
 - **O1 — Proofs granularity**: per-fn (finest invalidation, ~2800 files/oleans
   for tgt-sized crates) vs per-Verus-module (fewer files, module-wide proof
