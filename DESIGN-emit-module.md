@@ -1,0 +1,279 @@
+# Emit-module: whole-crate package emission — design
+
+**Date:** 2026-07-09
+**Status:** spec, on branch `emit-module` (worktree, isolated from main-line dev)
+**Builds on:** CRATEDEFS.md steps 0/1a/1b/1c (prelude olean, `--tactus-crate-defs`,
+batch verification), DESIGN-axiom-closure-check.md, DESIGN-transparent-automation.md
+**Scope:** emit each crate as one Lean *package* whose composition is
+kernel-checked — zero same-crate axioms, circularity structurally impossible,
+statement drift impossible — while keeping (likely improving) per-fn iteration
+speed. The architecture is hypothesis-passing proof modules + a generated linker.
+
+---
+
+## TL;DR
+
+- **Four layers per crate**: `Defs` (spec fns, datatypes, instances — *exists
+  today* as the crate-defs module), `Stmts` (NEW: each proof fn's ∀-closed
+  requires→ensures as a named `def : Prop`), `Proofs` (one module per fn:
+  `theorem f_thm (h_g : g_stmt) … : f_stmt`, importing only *statement* modules),
+  and `Link` (NEW, generated: `theorem f_closed : f_stmt := f_thm g_closed …` —
+  pure applications, fast, plus the crate-level axiom-closure check).
+- **Why hypotheses instead of importing callee theorems directly**: Lake
+  invalidates by olean hash and proofs live in oleans — direct theorem imports
+  mean every proof-body edit re-elaborates all transitive dependents (Mathlib's
+  daily pain). With hypothesis-passing, dependents import only `Stmts` oleans,
+  which are byte-stable under body edits. The resulting invalidation semantics
+  **exactly match the verus-dev cache**: body edit → that fn + relink; signature
+  edit → that fn + callers; defs edit → wide. Kernel-checked composition with
+  cache-shaped incrementality.
+- **This kills two documented problems with one mechanism**: the trust problem
+  (broadcast/helper lemmas as axioms; cross-file circularity and statement drift
+  Rust-trusted) and the cost problem CRATEDEFS measured (same-crate helper
+  theorems re-elaborated in every citing file — quadratic on deep chains).
+- **Iteration speed should improve, not regress**: today an island file
+  re-elaborates its dependency closure's *proof bodies*; a package-mode per-fn
+  check elaborates one theorem against prebuilt oleans. Batch mode's −76% on
+  deep chains is the cold-gate bound; single-fn warm checks beat islands.
+- **Honest scope**: exec-call contract inlining stays a WP-calculus argument
+  (that's the verified-WP arc's job) — but `Stmts` gives req/ens *named defs
+  used by both sides*, so contract drift becomes impossible by construction
+  even before the WP calculus is verified.
+- Entry brick **M0 is a hand-written spike**: author the target Lean shape for a
+  toy crate by hand, validate elaboration + invalidation behavior, measure. No
+  tactus code changes.
+
+---
+
+## 1. Problem restatement (what today's emission trusts and re-pays)
+
+Island emission (per-fn `.lean`), even with crate-defs + batch landed:
+
+| Issue | Kind | Where documented |
+|---|---|---|
+| Same-crate helper proof fns re-elaborated as full theorems in every citing file — quadratic along helper chains | cost | CRATEDEFS "problem, measured" |
+| Broadcast lemmas + cross-crate ensures emitted as `axiom`s; "separately discharged" is a Rust-side claim | trust | generate.rs #122 comments; DESIGN-axiom-closure-check §1 |
+| Cross-file circular axiomatization undetectable by any per-file check | trust | DESIGN-axiom-closure-check "what it does NOT catch" |
+| Axiom statement vs. discharged theorem drift (impl_subst specialization) | trust | same |
+| Batch mode: any edit re-elaborates the whole batch file; error attribution needs region machinery + poison fallback | cost/complexity | CRATEDEFS 1b |
+
+Package emission addresses all five with one structure.
+
+---
+
+## 2. Architecture
+
+### 2.1 The four layers
+
+```
+Tgt/Defs/<M>.lean      -- per Verus module M: datatypes (+height), spec fn defs,
+                       --   instances; imports Defs of dep modules + TactusDefs
+Tgt/Stmts/<M>.lean     -- per Verus module M: for each proof fn f,
+                       --   def f_stmt : Prop := ∀ …, requires → ensures
+                       --   for each exec fn g: def g_req …, def g_ens …
+                       --   imports Defs only
+Tgt/Proofs/<fn>.lean   -- per fn: theorem f_thm (h₁ : g_stmt) … : f_stmt := by …
+                       --   imports Stmts of own + direct callees; NEVER Proofs
+Tgt/Link.lean          -- theorem f_closed : f_stmt := f_thm g_closed h_closed …
+                       --   in dep_order topological order; SCCs linked as units;
+                       --   crate axiom-closure check at the end
+Tgt/Boundary.lean      -- cross-crate axioms (vstd ensures, broadcast), explicit
+                       --   and whitelisted; shrinks to imports when vstd itself
+                       --   is emitted as a package (M6)
+```
+
+- `Defs` is the existing crate-defs module, split per Verus module for finer
+  invalidation — which also resolves CRATEDEFS 1c's bucket-alignment finding
+  (per-module defs "matches Verus's own unit of work").
+- `Stmts` is small and cheap: `Prop`-valued defs, no proofs, no tactics. Its
+  olean is byte-stable under any proof-body edit anywhere.
+- `Proofs` modules contain exactly one theorem (or one mutual block, §4.3).
+- `Link` is machine-generated applications — each line's type check is a defeq
+  between syntactically identical terms. Thousands of lines elaborate in seconds.
+
+### 2.2 Worked example (target shape, hand-writable today)
+
+Verus source:
+
+```rust
+proof fn lemma_a(x: nat) ensures x + 0 == x { }
+proof fn lemma_b(x: nat) ensures x + 0 + 0 == x { proof { lemma_a(x); } … }
+```
+
+Emitted package:
+
+```lean
+-- Tgt/Stmts/M.lean
+import Tgt.Defs.M
+def lemma_a_stmt : Prop := ∀ (x : Int), 0 ≤ x → x + 0 = x
+def lemma_b_stmt : Prop := ∀ (x : Int), 0 ≤ x → x + 0 + 0 = x
+
+-- Tgt/Proofs/M_lemma_a.lean
+import Tgt.Stmts.M
+theorem lemma_a_thm : lemma_a_stmt := by
+  unfold lemma_a_stmt; omega
+
+-- Tgt/Proofs/M_lemma_b.lean
+import Tgt.Stmts.M
+theorem lemma_b_thm (h_a : lemma_a_stmt) : lemma_b_stmt := by
+  unfold lemma_a_stmt at h_a; unfold lemma_b_stmt
+  intro x hx; have := h_a x hx; omega
+
+-- Tgt/Link.lean
+import Tgt.Proofs.M_lemma_a
+import Tgt.Proofs.M_lemma_b
+theorem lemma_a_closed : lemma_a_stmt := lemma_a_thm
+theorem lemma_b_closed : lemma_b_stmt := lemma_b_thm lemma_a_closed
+#tactus_check_axioms lemma_b_closed []   -- closure ⊆ core ∪ prelude
+```
+
+Editing `lemma_a`'s *body* re-elaborates `M_lemma_a` + `Link` only.
+Editing `lemma_a`'s *ensures* changes `Stmts/M` → `M_lemma_a`, `M_lemma_b`
+(imports the stmt), and `Link` re-elaborate. Exactly the verus-dev cache table.
+
+### 2.3 Invalidation semantics (the answer to "does iteration stay fast")
+
+| Edit | verus-dev cache re-verifies | package mode re-elaborates |
+|---|---|---|
+| fn body only | just that fn | that fn's Proofs module + Link |
+| fn requires/ensures | fn + transitive callers | Stmts module → fn + *direct* importers (callers) + Link |
+| datatype / spec fn / new fn in module | whole module's functions | Defs/⟨M⟩ → its import cone |
+| nothing | nothing (all cache hits) | nothing (all olean traces valid) |
+
+Two notes. First, "direct importers" is *finer* than the cache's transitive
+invalidation — a caller whose proof re-elaborates green against the new
+statement doesn't propagate further unless its own Stmts changed. Second, the
+per-fn dev check gets *faster* than islands: an island re-elaborates its dep
+closure's definitions and helper-theorem bodies every run (CRATEDEFS: this is
+the quadratic term); a package check elaborates one theorem against oleans.
+
+---
+
+## 3. Why not the two simpler variants
+
+**(A) Import callee Proofs directly, cite `g_thm`.** No Stmts layer, no
+hypotheses, no linker. But proofs live in oleans, Lake invalidates by olean
+hash → every body edit cascades through all transitive dependents. On
+group-theory-shaped helper chains that's most of the crate per edit. Rejected
+for the same reason Mathlib suffers: Lean has no proof-irrelevant interface
+hashing, so we build the interface layer ourselves — that's what Stmts is.
+
+**(B) One batch file (status quo maximalist).** Already landed for the cold
+gate and it's good there (−76% deep-chain). But any edit re-elaborates the
+file, error attribution needs region machinery, and axioms remain for
+broadcast. Package mode subsumes batch: the gate is `lake build` (parallel
+over Proofs modules — same parallelism, no attribution machinery: errors land
+in the right file natively).
+
+---
+
+## 4. Emission details
+
+### 4.1 Statements
+
+The `f_stmt` renderer is not new machinery: it is exactly the ∀-closure of
+requires→ensures that `broadcast_lemma_axiom_cmd` renders today — the target
+changes from `axiom f_ax : ⟨stmt⟩` to `def f_stmt : Prop := ⟨stmt⟩` plus
+`theorem f_thm (…) : f_stmt`. Prop impredicativity covers generic fns
+(`∀ (A : Type u), …` is a `Prop`); `[Nonempty A]`-bracketing (nonempty.rs)
+carries over unchanged as binders inside the stmt.
+
+### 4.2 Proofs with hypotheses
+
+- Hypothesis list = direct proof-fn callees + broadcast lemmas the fn uses
+  (`broadcast_collect.rs` already computes this per fn). Same-crate broadcast
+  lemmas thereby stop being axioms.
+- Where the island proof cited a global axiom, the package proof cites a local
+  hypothesis — for the tactic layer this is *at worst* neutral and often
+  better: `simp_all`/`omega` consume local hypotheses natively, whereas env
+  axioms need explicit mention. Pins (DESIGN-transparent-automation) are
+  keyed on obligation ids and are unaffected.
+- **impl_subst interaction (open question O3):** where today's emission
+  specializes a callee's axiom per call site, the hypothesis can either be the
+  general statement (proof instantiates it) or one hypothesis per
+  specialization (mirrors current terms exactly). Start with
+  per-specialization — it's term-identical to what tactic bodies already
+  expect — and generalize later if hypothesis lists get long.
+
+### 4.3 Mutual recursion
+
+Mutually recursive proof fns (dep_order `FnGroup::Mutual`) go in one Proofs
+module as a `mutual` theorem block with the existing `termination_by`/
+`decreasing_by` emission; the linker closes the whole SCC as a unit. Their
+*statements* are ordinary separate defs — no mutuality at the Stmts layer.
+
+### 4.4 Exec fns
+
+Exec fns' WP theorems stay self-contained in their Proofs module (nobody cites
+an exec fn's theorem; callers consume its *contract*). What moves to Stmts is
+`f_req`/`f_ens` as named defs, **used by both** the fn's own WP theorem and
+every caller's WP goal (today the contract is textually inlined per call site
+via inline_spec). Result: contract drift between definition site and call
+sites becomes impossible by construction. The WP call rule itself — "assuming
+`g_ens` for the returned value is sound because g's body was verified" — is a
+semantics-level argument that only the verified-WP arc (tactus-core) can
+discharge; this design deliberately does not pretend to close it, it just
+removes the textual-copy failure mode and hands R2 a cleaner target.
+
+### 4.5 Trust accounting after M5
+
+| Surface | Island mode | Package mode |
+|---|---|---|
+| same-crate helper lemmas | re-elaborated per file (sound, quadratic) | theorems, elaborated once |
+| same-crate broadcast lemmas | axioms (Rust-trusted discharge) | theorems + hypotheses |
+| cross-file circularity | Rust-trusted (dep_order) | impossible (import DAG + Link) |
+| statement drift | Rust-trusted (impl_subst) | impossible (shared defs) |
+| cross-crate / vstd | axioms | Boundary module (explicit, closure-whitelisted) → imports at M6 |
+| exec call rule, frontend, prelude | trusted | unchanged (R2 / documented) |
+
+---
+
+## 5. Build orchestration
+
+- **Package layout**: a real lake project under
+  `target/tactus-lean/<crate>-pkg/`, lakefile generated. The gate runs
+  `lake build` — incremental + parallel natively, replacing batch-mode's
+  bespoke chunking/attribution.
+- **Single-fn dev check bypasses lake** (CRATEDEFS 1c's resolved-LEAN_PATH
+  trick): plain `lean` on the one Proofs file with the package's olean dirs
+  prepended — no lake lock, ~spawn + olean-load + one-theorem cost. Rebuilding
+  stale Defs/Stmts oleans on demand reuses the step-0 atomic-rename pattern.
+- **Verus-cache coupling**: the existing SST-hash cache decides *whether* a fn
+  needs re-verification; package mode adds nothing to decide — a cache hit
+  skips the Lean run exactly as today. Lake's traces are a second, coarser
+  guard underneath.
+- `lean_out_root()` absoluteness, prelude olean cache, `set_option`
+  re-emission: all inherited as-is from CRATEDEFS step 0/1c.
+
+---
+
+## 6. Migration path
+
+| Brick | Content | Validates | Size |
+|---|---|---|---|
+| **M0** | **Hand-written spike**: author the §2.2 shape for a toy crate (3 chained lemmas, 1 mutual pair, 1 broadcast use, 1 generic fn, 1 exec fn) directly in Lean; confirm elaboration, measure single-module re-elaboration + relink wall-time vs. an equivalent island set; touch a body vs. a statement and watch what rebuilds | the whole concept, zero tactus changes | small |
+| M1 | Stmts renderer (retarget the broadcast-axiom statement machinery to `def : Prop` + theorem headers) | §4.1 | medium |
+| M2 | Proofs-module emission behind `--tactus-emit-module`; hypothesis plumbing; islands untouched | §4.2–4.4 | large |
+| M3 | Link + Boundary generation; `#tactus_check_axioms` integration (closure ⊆ core ∪ prelude ∪ Boundary) | §2.1, trust table | medium |
+| M4 | Build orchestration: lakefile gen, single-fn fast path, on-demand olean refresh | §5 | medium |
+| M5 | Real-crate cutover (gate crate runs package mode; A/B vs islands+batch; retire batch if subsumed) | everything | medium |
+| M6 | vstd as a package; Boundary shrinks to imports | trust table last row | later |
+
+M0 is genuinely load-bearing, not ceremony: it will surface the Lean-side
+surprises (olean trace behavior under byte-identical rebuilds, `unfold`
+ergonomics of stmt defs in tactic bodies, mutual-block linking) while the
+design is still cheap to change — CRATEDEFS's probe-first methodology, kept.
+
+## 7. Open questions
+
+- **O1 — Proofs granularity**: per-fn (finest invalidation, ~2800 files/oleans
+  for tgt-sized crates) vs per-Verus-module (fewer files, module-wide proof
+  re-elaboration on any body edit). Proposal: per-fn; Mathlib proves the file
+  count is fine. Revisit at M5 with data.
+- **O2 — lake vs plain-lean for the gate**: lakefile gen assumed above;
+  fallback is a generated topo-order driver using plain `lean` if lake
+  overhead/locking annoys (1c precedent).
+- **O3 — hypothesis form**: per-specialization vs general (§4.2). Start
+  specialized.
+- **O4 — do islands survive** as a debugging view ("give me one self-contained
+  file for this fn")? Cheap to keep behind the existing flag; decide at M5.
