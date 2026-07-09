@@ -320,6 +320,22 @@ pure Lean core, no Mathlib needed for any architectural question.
 Net: **no blockers found; two design corrections (F2, F3) folded into §2.2 and
 §4.3.** M1 can start on this shape directly.
 
+**Code review (same day, /code-review high):** 7 finder angles + verify
+pass over the branch. NO soundness bugs; one correctness finding —
+warning diagnostics dropped by the package fast path AND (pre-existing)
+by islands — FIXED at the shared chokepoint via a single `--json -o`
+pass, deliberately narrowed to sorry/admit warnings (blanket surfacing
+fights Lean hints on generated shapes; broader policy = future arc).
+The fix immediately exposed a real silent escape: an explicit `admit`
+in a suite trait-method test had passed with zero signal — now pinned
+as Ok-with-warning. Gate skip-note for below-defs-gate crates. Remaining
+review findings folded into M5d/M5e where they're on the natural path:
+hoist per-fn inline+dep-graph (O(n²), blocks tgt scale), don't hold memo
+locks across lean spawns, one lean-spawn helper + one source-map
+constructor + one scope-name constructor, HashSet dedups, env-derived
+prelude axiom allowlist (currently fail-closed on rename), unwrap_or(0)
+1-index fallback at the shared constructor. Suite 532/0.
+
 **M5a status (same day): package-check routing LIVE — and mutual fns
 verify for the first time.** `--tactus-package-check` routes tactic
 proof fns through `check_proof_fn_via_package`: defs olean (memoized) →
