@@ -1514,11 +1514,20 @@ fn package_check_enabled() -> bool {
     PACKAGE_CHECK_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Mutual-module verdict memo (M5a interim): the first member's check
-/// elaborates the SCC's module; every member shares the verdict.
-/// Per-member line-region attribution lands in M5b.
+/// Module-level verdict for a mutual module: success, or Lean's
+/// parsed `--json` diagnostics for per-member region attribution.
+struct MutualVerdict {
+    success: bool,
+    diagnostics: Vec<lean_process::LeanDiagnostic>,
+}
+
+/// Mutual-module verdict memo: the first member's check elaborates the
+/// SCC's module (fast `lean -o` path; on failure, a `--json` re-run
+/// captures diagnostics); every member reads the shared verdict and
+/// formats its OWN region's errors (M5b).
 static MUTUAL_CHECK_MEMO: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Result<(), String>>>,
+    std::sync::Mutex<std::collections::HashMap<
+        std::path::PathBuf, std::sync::Arc<MutualVerdict>>>,
 > = std::sync::OnceLock::new();
 
 /// Stmts-olean memo for the package-check path: the `.lean` is written
@@ -1607,7 +1616,7 @@ fn check_proof_fn_via_package(
             let result = lean_process::check_lean_file(&path, lake_dir, &extra_paths);
             Some(format_lean_check_result(result, proof_fn, &path, &source_map))
         }
-        Ok(PkgEmitOutcome::Mutual { leaf, path }) => {
+        Ok(PkgEmitOutcome::Mutual { leaf, path, members }) => {
             let memo = MUTUAL_CHECK_MEMO.get_or_init(Default::default);
             let verdict = {
                 let mut m = memo.lock().unwrap_or_else(|p| p.into_inner());
@@ -1615,27 +1624,75 @@ fn check_proof_fn_via_package(
                     let pkg_dir = path.parent().expect("pkg file has a parent");
                     let mut failures: Vec<(String, String)> = Vec::new();
                     run_lean(pkg_dir, &leaf, true, &base_path, &mut failures);
-                    match failures.pop() {
-                        None => Ok(()),
-                        Some((_, out)) => Err(out),
+                    if failures.is_empty() {
+                        return std::sync::Arc::new(MutualVerdict {
+                            success: true, diagnostics: vec![],
+                        });
                     }
+                    // Diagnostic pass — capture parsed --json output for
+                    // region attribution.
+                    let dir = project::default_project_dir();
+                    let lake_dir = if project::project_ready(&dir) { Some(dir.as_path()) } else { None };
+                    let extra: Vec<&Path> = vec![&prelude_dir, &defs.dir];
+                    let diagnostics = match lean_process::check_lean_file(&path, lake_dir, &extra) {
+                        Ok(r) => r.diagnostics,
+                        Err(_) => vec![],
+                    };
+                    std::sync::Arc::new(MutualVerdict { success: false, diagnostics })
                 }).clone()
             };
-            Some(match verdict {
-                Ok(()) => CheckResult::Success { warnings: vec![] },
-                Err(out) => CheckResult::Failed {
+            if verdict.success {
+                return Some(CheckResult::Success { warnings: vec![] });
+            }
+            // Verdict is module-level — mutual members are an
+            // INSEPARABLE unit (each cites the other), so every member
+            // fails when the module does. Attribution is region-based:
+            // an error belongs to the member whose tactic region
+            // contains it; errors before the first region (imports /
+            // preamble) belong to everyone.
+            let me = members.iter().find(|m| m.fun == proof_fn.name)
+                .expect("proof fn is a member of its own SCC module");
+            let owner_start = |line: usize| members.iter()
+                .filter(|m| m.tactic_start <= line)
+                .map(|m| m.tactic_start)
+                .max();
+            let own: Vec<lean_process::LeanDiagnostic> = verdict.diagnostics.iter()
+                .filter(|d| d.severity == "error")
+                .filter(|d| match d.pos.as_ref().map(|p| owner_start(p.line)) {
+                    Some(Some(start)) => start == me.tactic_start,
+                    // No position / before first region → module-level,
+                    // attributed to every member.
+                    _ => true,
+                })
+                .cloned()
+                .collect();
+            Some(if own.is_empty() {
+                // Own region clean — the failure lives in a partner.
+                let partners: Vec<&str> = members.iter()
+                    .filter(|m| m.fun != proof_fn.name)
+                    .map(|m| m.short.as_str())
+                    .collect();
+                CheckResult::Failed {
                     errors: vec![TactusDiag {
                         message: format!(
-                            "Lean mutual module `{}` failed (member `{}`; per-member \
-                             attribution lands in M5b):\n{}",
-                            leaf, short_name(&proof_fn.name.path), out
+                            "Lean mutual module `{}` failed: `{}`'s own proof region is \
+                             clean, but mutual members verify as a unit and partner(s) \
+                             {} have errors (see their diagnostics)",
+                            leaf, me.short, partners.join(", ")
                         ),
                         location: DiagLocation::Unknown,
                         help: Some(format!("{} {}",
                             vir::tactus_messages::LEAN_FILE_HELP_PREFIX, path.display())),
                     }],
                     warnings: vec![],
-                },
+                }
+            } else {
+                // Own-region errors through the shared chokepoint with
+                // this member's OWN source map — same spans as islands.
+                format_lean_check_result(
+                    Ok(lean_process::LeanResult { success: false, diagnostics: own }),
+                    proof_fn, &path, &me.source_map,
+                )
             })
         }
         Ok(PkgEmitOutcome::UnsupportedScc(reason)) => Some(CheckResult::Failed {
@@ -1774,8 +1831,13 @@ pub enum PkgEmitOutcome {
         source_map: to_lean_fn::LeanSourceMap,
     },
     /// Fn is a member of a supported mutual SCC; leaf/path name the
-    /// SCC's canonical module (same for every member).
-    Mutual { leaf: String, path: std::path::PathBuf },
+    /// SCC's canonical module (same for every member); `members`
+    /// carries per-member attribution maps (M5b).
+    Mutual {
+        leaf: String,
+        path: std::path::PathBuf,
+        members: std::sync::Arc<Vec<MutualMember>>,
+    },
     /// Fn is on a cycle with SCC-external helper deps — not
     /// package-expressible; payload = human-readable reason.
     UnsupportedScc(String),
@@ -1833,10 +1895,10 @@ fn emit_package_proof_fn_inner(
             )));
         }
         let leaf = mutual_module_leaf(&scc);
-        let path = emit_package_mutual_scc(
+        let (path, members) = emit_package_mutual_scc(
             inlined_krate, &scc, imports, crate_name, tactic_bodies, defs, &stmts,
         )?;
-        return Ok(PkgEmitOutcome::Mutual { leaf, path });
+        return Ok(PkgEmitOutcome::Mutual { leaf, path, members });
     }
     let mut file_imports: Vec<String> = imports.to_vec();
     file_imports.push(stmts_module_name(defs));
@@ -1885,11 +1947,22 @@ fn emit_package_proof_fn_inner(
     Ok(PkgEmitOutcome::Single { leaf, path, source_map })
 }
 
+/// Per-member attribution info for one theorem inside a mutual
+/// module: where its tactic body starts in the emitted file (region
+/// boundary for diagnostic ownership) and its own source map.
+pub struct MutualMember {
+    pub fun: Fun,
+    pub short: String,
+    pub tactic_start: usize,
+    pub source_map: to_lean_fn::LeanSourceMap,
+}
+
 /// Mutual-SCC-module memo: written once per canonical path per
-/// process (every member's emission call routes here; first writes,
-/// the rest skip).
+/// process; the value carries the per-member maps so memo-hit callers
+/// (every member after the first) can still attribute diagnostics.
 static MUTUAL_MEMO: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+    std::sync::Mutex<std::collections::HashMap<
+        std::path::PathBuf, std::sync::Arc<Vec<MutualMember>>>>,
 > = std::sync::OnceLock::new();
 
 /// Package module for a mutual tactic SCC: one file, all members'
@@ -1908,13 +1981,13 @@ fn emit_package_mutual_scc(
     tactic_bodies: &std::collections::HashMap<Fun, String>,
     defs: &crate::crate_defs::CrateDefs,
     stmts: &std::sync::Arc<Vec<Command>>,
-) -> Result<std::path::PathBuf, String> {
+) -> Result<(std::path::PathBuf, std::sync::Arc<Vec<MutualMember>>), String> {
     let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
         .join(format!("{}.lean", mutual_module_leaf(scc)));
     {
         let memo = MUTUAL_MEMO.get_or_init(Default::default);
-        if !memo.lock().unwrap_or_else(|p| p.into_inner()).insert(path.clone()) {
-            return Ok(path); // already written by another member's call
+        if let Some(members) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&path) {
+            return Ok((path, members.clone())); // written by another member's call
         }
     }
     let mut file_imports: Vec<String> = imports.to_vec();
@@ -1945,7 +2018,31 @@ fn emit_package_mutual_scc(
     let _ = &stmts;
     let rendered = pp_commands(&cmds);
     write_lean_file(&path, &rendered.text)?;
-    Ok(path)
+    // One tactic_starts entry per Tactic::Raw in emission order = one
+    // per SCC member. A member's diagnostic REGION starts at its
+    // tactic start; theorem-header errors land in the preceding
+    // region (or pre-first = module-level) — rare, and module-level
+    // errors are attributed to every member anyway.
+    let members: Vec<MutualMember> = scc.iter().zip(rendered.landmarks.tactic_starts.iter())
+        .map(|(f, start)| {
+            let body = tactic_bodies.get(&f.name).map(|s| s.as_str()).unwrap_or("");
+            MutualMember {
+                fun: f.name.clone(),
+                short: short_name(&f.name.path).to_string(),
+                tactic_start: *start,
+                source_map: LeanSourceMap::ProofFn {
+                    fn_name: short_name(&f.name.path).to_string(),
+                    tactic_start_line: *start,
+                    tactic_line_count: body.lines().count().max(1),
+                },
+            }
+        })
+        .collect();
+    let members = std::sync::Arc::new(members);
+    MUTUAL_MEMO.get_or_init(Default::default)
+        .lock().unwrap_or_else(|p| p.into_inner())
+        .insert(path.clone(), members.clone());
+    Ok((path, members))
 }
 
 // ── Package gate (M4) ───────────────────────────────────────────────

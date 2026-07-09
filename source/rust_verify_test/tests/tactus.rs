@@ -13186,6 +13186,46 @@ test_verify_one_file_with_options! {
     } => Ok(())
 }
 
+// M5b: per-member attribution inside a failing mutual module. The
+// broken member's error is region-attributed and span-mapped through
+// the shared diagnostics chokepoint ("Lean tactic failed for
+// lemma_odd"); the clean member fails too (mutual members verify as a
+// unit) but with an explicit partner-attribution message.
+test_verify_one_file_with_options! {
+    #[test] test_proof_fn_package_check_mutual_attribution ["tactus-package-check"] => verus_code! {
+        spec fn dbl(n: nat) -> nat { n + n }
+
+        proof fn lemma_even(n: nat)
+            ensures dbl(n) >= 0
+            decreases n
+        by {
+            match n with
+            | 0 => omega
+            | k + 1 =>
+              have h := lemma_odd k
+              omega
+        }
+
+        proof fn lemma_odd(n: nat)
+            ensures dbl(n) >= 1  // false for n = 0 — this member breaks
+            decreases n
+        by {
+            match n with
+            | 0 => omega
+            | k + 1 =>
+              have h := lemma_even k
+              omega
+        }
+    } => Err(err) => {
+        let msgs: Vec<&String> = err.errors.iter().map(|d| &d.message).collect();
+        assert!(msgs.iter().any(|m| m.contains("Lean tactic failed for lemma_odd")),
+            "broken member must get region-attributed diagnostics; got: {:?}", msgs);
+        assert!(msgs.iter().any(|m| m.contains("mutual members verify as a unit")
+                && m.contains("lemma_odd")),
+            "clean member must get the partner-attribution message; got: {:?}", msgs);
+    }
+}
+
 // Package-check must REJECT a failing tactic (errors can't slip
 // through the package route) and the diagnostic goes through the
 // same source-map pipeline as islands.
