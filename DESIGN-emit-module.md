@@ -320,6 +320,32 @@ pure Lean core, no Mathlib needed for any architectural question.
 Net: **no blockers found; two design corrections (F2, F3) folded into §2.2 and
 §4.3.** M1 can start on this shape directly.
 
+**M3 status (same day): Link + Boundary + axiom-closure check LANDED, e2e-validated.**
+`TactusLink_<scope>.lean` (in `pkg/`, memoized per scope like Stmts) closes
+every tactic proof fn in dependency order:
+`noncomputable def <name>_closed : <name>_stmt := <name> <dep>_closed …`,
+each followed by `#tactus_check_axioms <name>_closed [<Boundary>]`.
+Argument order is guaranteed identical to M2's hypothesis binder order by
+the shared `direct_helper_deps` chokepoint. Cycles in the direct-reference
+graph (mutual tactic lemmas — unsupported by islands too) are detected via
+tri-state DFS and skipped with a loud artifact comment + eprintln.
+Boundary = the `Command::Axiom` names in the defs module (the crate's
+entire declared trust surface beyond the prelude). **The
+`#tactus_check_axioms` elab command now EXISTS in TactusPrelude**
+(DESIGN-axiom-closure-check.md B2): allowed = classical core 3 + the
+prelude's own 5 axioms (hardcoded in the same file, versioning together
+by the olean content-hash rebuild) + ofReduceBool/trustCompiler
+(allowed-but-inventoried) + the explicit list; `sorryAx` always fatal;
+subset check. Hand-validated: positives (incl. namespace-relative
+resolution), undeclared-axiom rejection with actionable message, sorry
+rejection. Full-package e2e on the chain crate: prelude+defs+stmts+pkg
+oleans built, **Link elaborates and all closure checks pass**. NOTE: the
+prelude olean cache is user-level and shared across checkouts — branch
+runs use `TACTUS_PRELUDE_CACHE` to avoid ping-ponging the main checkout's
+cache until the branch merges. Remaining for M4: check-mode wiring +
+LEAN_PATH orchestration so the package (incl. Link) is elaborated by the
+harness rather than by hand.
+
 **M2 status (same day): package emission LANDED on this branch, e2e-validated.**
 `--tactus-emit-module` (implies `--tactus-crate-defs` at parse time) emits,
 alongside untouched islands: the per-scope Stmts module

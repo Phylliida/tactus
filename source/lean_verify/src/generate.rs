@@ -1267,6 +1267,10 @@ pub fn emit_proof_fn(
                         short_name(&proof_fn.name.path), e
                     );
                 }
+                // Link module (M3): once per scope; content is fully
+                // determined by the krate, so any fn's emission can
+                // trigger the build.
+                link_for_crate(krate, crate_name, tactic_bodies, d);
             }
             None => eprintln!(
                 "tactus: --tactus-emit-module requires the shared-defs module \
@@ -1606,15 +1610,14 @@ fn emit_package_proof_fn(
     // Direct helper references: same textual scan the island helper
     // walk uses (`collect_referenced_proof_fns`), but non-recursive —
     // each helper's own Proofs module carries its own hypotheses, and
-    // the Link module (M3) composes the closed forms.
-    let code = strip_lean_line_comments(tactic_body);
-    let hyps: Vec<crate::lean_ast::Binder> = inlined_krate.functions.iter()
-        .map(|f| &f.x)
-        .filter(|f| is_emittable_tactic_proof_fn(f, tactic_bodies))
-        .filter(|f| f.name != proof_fn.name
-            && ident_appears(&code, short_name(&f.name.path)))
-        .map(|f| to_lean_fn::helper_hyp_binder(&f.name.path))
-        .collect();
+    // the Link module (M3) composes the closed forms. The shared
+    // `direct_helper_deps` enumeration is load-bearing: Link applies
+    // closed forms in exactly this order.
+    let hyps: Vec<crate::lean_ast::Binder> =
+        direct_helper_deps(proof_fn, tactic_body, &inlined_krate, tactic_bodies)
+            .into_iter()
+            .map(|f| to_lean_fn::helper_hyp_binder(&f.name.path))
+            .collect();
     thm.binders.splice(0..0, hyps);
     cmds.push(Command::Theorem(thm));
     cmds.push(Command::NamespaceClose(ns));
@@ -1634,6 +1637,213 @@ fn emit_package_proof_fn(
     let leaf = lean_name(&proof_fn.name.path).replace('.', "__");
     let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
         .join(format!("{}.lean", leaf));
+    write_lean_file(&path, &rendered.text)
+}
+
+/// A fn's DIRECT tactic-referenced helper lemmas, in krate order —
+/// the single enumeration shared by `emit_package_proof_fn` (hypothesis
+/// binder order) and `link_for_crate` (closed-form application order).
+/// One chokepoint so the theorem's binders and Link's arguments cannot
+/// disagree.
+fn direct_helper_deps<'a>(
+    root: &FunctionX,
+    tactic_body: &str,
+    krate: &'a KrateX,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> Vec<&'a FunctionX> {
+    let code = strip_lean_line_comments(tactic_body);
+    krate.functions.iter()
+        .map(|f| &f.x)
+        .filter(|f| is_emittable_tactic_proof_fn(f, tactic_bodies))
+        .filter(|f| f.name != root.name
+            && ident_appears(&code, short_name(&f.name.path)))
+        .collect()
+}
+
+/// Lean module name of the crate's Link module, scope-consistent with
+/// defs/stmts naming.
+fn link_module_name(defs: &crate::crate_defs::CrateDefs) -> String {
+    defs.module_name.replacen("TactusDefs_", "TactusLink_", 1)
+}
+
+/// Link-module memo — same keying and poisoned-`None` semantics as
+/// `STMTS_MEMO`.
+static LINK_MEMO: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Option<()>>>,
+> = std::sync::OnceLock::new();
+
+/// Build + write the crate's Link module (DESIGN-emit-module.md §2.1
+/// M3): the machine-generated closure that turns per-fn
+/// hypothesis-passing theorems into stmt-typed CLOSED theorems —
+///
+///   noncomputable def <name>_closed : <name>_stmt := <name> <dep>_closed …
+///
+/// in dependency order, each followed by
+/// `#tactus_check_axioms <name>_closed [<Boundary>]`, where Boundary =
+/// the axiom names the defs module declares (broadcast lemmas, uninterp
+/// spec fns, external-body Inhabited stipulations — the crate's entire
+/// declared trust surface beyond the prelude). This is where the
+/// composition argument becomes kernel-checked: circular dependencies
+/// cannot elaborate, statement drift cannot typecheck, and the axiom
+/// closure of every closed theorem is machine-verified against the
+/// declared set.
+///
+/// Cycles in the direct-reference graph (mutual tactic lemmas — which
+/// island emission cannot express either) are skipped with a loud
+/// comment in the artifact and an eprintln.
+///
+/// No `debug_check` here: Link's references live in the imported pkg
+/// modules, whose command streams are per-call and not retained. Its
+/// names are derived from the same krate enumeration that emitted
+/// those modules (`direct_helper_deps`, `stmt_name`), and Lean
+/// elaboration of the package is the authoritative check.
+fn link_for_crate(
+    krate: &KrateX,
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    defs: &crate::crate_defs::CrateDefs,
+) {
+    let key = link_module_name(defs);
+    let memo = LINK_MEMO.get_or_init(Default::default);
+    if memo.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&key) {
+        return;
+    }
+    let result = build_link_module(krate, crate_name, tactic_bodies, defs)
+        .map_err(|e| {
+            eprintln!(
+                "tactus: Link module build failed for crate `{}` ({})",
+                crate_name, e
+            );
+        })
+        .ok();
+    memo.lock().unwrap_or_else(|p| p.into_inner()).insert(key, result);
+}
+
+fn build_link_module(
+    krate: &KrateX,
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    defs: &crate::crate_defs::CrateDefs,
+) -> Result<(), String> {
+    use crate::lean_ast::{Def, Expr as LExpr};
+    let inlined_krate = crate::inline_spec::inline_marked_in_krate(krate);
+    let fns: Vec<&FunctionX> = inlined_krate.functions.iter()
+        .map(|f| &f.x)
+        .filter(|f| is_emittable_tactic_proof_fn(f, tactic_bodies))
+        .collect();
+    // Dependency order via DFS post-order over direct refs, with
+    // tri-state marks for cycle detection. Cycle members are excluded
+    // (their pkg theorems exist but cannot be closed acyclically —
+    // exactly the mutual-tactic-lemma shape islands can't express).
+    let deps_of: std::collections::HashMap<&Fun, Vec<&FunctionX>> = fns.iter()
+        .map(|f| {
+            let body = tactic_bodies.get(&f.name).map(|s| s.as_str()).unwrap_or("");
+            (&f.name, direct_helper_deps(f, body, &inlined_krate, tactic_bodies))
+        })
+        .collect();
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mark { White, Gray, Black }
+    fn visit<'a>(
+        f: &'a FunctionX,
+        deps_of: &std::collections::HashMap<&Fun, Vec<&'a FunctionX>>,
+        marks: &mut std::collections::HashMap<&'a Fun, Mark>,
+        ordered: &mut Vec<&'a FunctionX>,
+        cyclic: &mut Vec<String>,
+    ) -> bool {
+        match marks.get(&f.name).copied().unwrap_or(Mark::White) {
+            Mark::Black => return true,
+            Mark::Gray => return false, // back-edge: cycle
+            Mark::White => {}
+        }
+        marks.insert(&f.name, Mark::Gray);
+        let mut ok = true;
+        for d in deps_of.get(&f.name).into_iter().flatten() {
+            if !visit(d, deps_of, marks, ordered, cyclic) {
+                ok = false;
+            }
+        }
+        if ok {
+            marks.insert(&f.name, Mark::Black);
+            ordered.push(f);
+        } else {
+            // Leave Gray→cyclic: everything on the path through a
+            // back-edge stays unclosed.
+            marks.insert(&f.name, Mark::White);
+            cyclic.push(short_name(&f.name.path).to_string());
+        }
+        ok
+    }
+    let mut marks = std::collections::HashMap::new();
+    let mut ordered: Vec<&FunctionX> = Vec::new();
+    let mut cyclic: Vec<String> = Vec::new();
+    for f in &fns {
+        visit(f, &deps_of, &mut marks, &mut ordered, &mut cyclic);
+    }
+    cyclic.sort();
+    cyclic.dedup();
+    if !cyclic.is_empty() {
+        eprintln!(
+            "tactus: Link for `{}` skips {} fn(s) with cyclic tactic references \
+             (mutual tactic lemmas are unsupported, matching island emission): {}",
+            crate_name, cyclic.len(), cyclic.join(", ")
+        );
+    }
+    // Boundary: every axiom the defs module declares. The closure
+    // check whitelists exactly these (plus core + prelude, hardcoded
+    // in the prelude's elab command).
+    let boundary: Vec<String> = defs.cmds.iter()
+        .filter_map(|c| match c {
+            Command::Axiom(a) => Some(a.name.clone()),
+            _ => None,
+        })
+        .collect();
+    let boundary_list = boundary.join(", ");
+
+    let mut cmds: Vec<Command> = Vec::new();
+    cmds.push(Command::Import(defs.module_name.clone()));
+    cmds.push(Command::Import(stmts_module_name(defs)));
+    for f in &ordered {
+        cmds.push(Command::Import(lean_name(&f.name.path).replace('.', "__")));
+    }
+    cmds.push(Command::Raw(crate::prelude::TACTUS_SET_OPTIONS.to_string()));
+    let ns = sanitize(crate_name);
+    cmds.push(Command::NamespaceOpen(ns.clone()));
+    if !cyclic.is_empty() {
+        cmds.push(Command::Raw(format!(
+            "-- SKIPPED (cyclic tactic references, cannot close acyclically): {}\n",
+            cyclic.join(", ")
+        )));
+    }
+    for f in &ordered {
+        let name = lean_name(&f.name.path);
+        let body_head = LExpr::var_lit(&name);
+        let body = tactic_bodies.get(&f.name).map(|s| s.as_str()).unwrap_or("");
+        let args: Vec<LExpr> = direct_helper_deps(f, body, &inlined_krate, tactic_bodies)
+            .into_iter()
+            .map(|d| LExpr::var_lit(&format!("{}_closed", lean_name(&d.name.path))))
+            .collect();
+        let closed_body = if args.is_empty() {
+            body_head
+        } else {
+            LExpr::app(body_head, args)
+        };
+        cmds.push(Command::Def(Def {
+            attrs: Vec::new(),
+            name: format!("{}_closed", name),
+            binders: Vec::new(),
+            ret_ty: LExpr::var_lit(&to_lean_fn::stmt_name(&f.name.path)),
+            body: closed_body,
+            termination_by: Vec::new(),
+            decreasing_by: None,
+        }));
+        cmds.push(Command::Raw(format!(
+            "#tactus_check_axioms {}_closed [{}]\n", name, boundary_list
+        )));
+    }
+    cmds.push(Command::NamespaceClose(ns));
+    let rendered = pp_commands(&cmds);
+    let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
+        .join(format!("{}.lean", link_module_name(defs)));
     write_lean_file(&path, &rendered.text)
 }
 
