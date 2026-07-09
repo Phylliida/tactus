@@ -266,3 +266,50 @@ grep "rejected this fn" /tmp/allproofs.log \
 | `DeadEnd` origin (assert-by desugar) | `vir/src/ast_to_sst.rs:2296`; def `vir/src/sst.rs:203` |
 | Output dir resolution | `lean_verify/src/generate.rs` (`lean_out_root`) |
 | Solver enum (Z3/Cvc5 only) | `air/src/context.rs` |
+
+---
+
+## 10. Real-run results (2026-07-09) — the codegen numbers were the wrong bottleneck
+
+Full non-emit run on tactus-group-theory (`--lean-backend --lean-all-proofs -V cache`, run
+from the crate dir, no `TACTUS_LEAN_OUT`, so Lean output lands in `target/tactus-lean/lib/`):
+**229 verified, 24817 errors, 8 cached; ~91 min wall; 93 MB log** (`/tmp/tactus-gt-allproofs-real.log`).
+
+Of the 1338 fns that codegen: **214 pass a real Lean run (16%), 1124 fail.** But the error mass
+decomposes almost entirely into a handful of *translator bugs*, each amplified crate-wide — not
+into proof-power failures:
+
+| Family | Error blocks | Distinct fns | Root cause |
+|---|---:|---:|---|
+| Codegen rejections | 1,409 | 1,409 | Known: `DeadEnd` (1267) + `seq![a,b]` (142), §4 |
+| `auto-tactic failed` | 5,666 | 1,024 | Closer can't close — the *real* migration bucket |
+| Choose-body type mismatch | 2,596 | 440 | ONE renderer bug: `choose\|j\| P(j)` in hypothesis position renders as `(P j) ∧ j` (an `Int` conjunct). Epsilon form (`Classical.epsilon`) is emitted elsewhere in the same file, so it's the Bind(Choose)-with-body statement path |
+| Termination of recursive defs | 2,131 | 841 | TWO missing decreasing facts: `len (drop_first w) < len w` (+`drop_last`) ≈ 93% of goals; `a / m < a` (Nat div) the rest. Hits recursive spec-fn *preamble defs* and recursive proof fns alike |
+| Namespace shadow / missing def | 2,235 | 552 | Locals named `symbol` shadow the `symbol` *module* under Lean dot-notation → `symbol.generator_index` resolves as field lookup on `lib.symbol.Symbol` (2,203); missing `Option.deref` std spec def (28) |
+| `Inhabited T` synthesis | 713 | 569 | Typeclass gap in generic contexts |
+| Lean keyword collision | 182 | (in tail) | Verus locals named `prefix` hit Lean's reserved keyword — same identifier-hygiene family as the shadowing bug |
+| Heartbeats timeouts | ~26 | ~11 | **Perf cliffs are NOT the story** at this stage |
+
+(Families overlap per-fn; a fn typically hits several.)
+
+**Consequences for §7's rollout order.** Codegen coverage (`DeadEnd`, `seq!`) is no longer the
+top unlock. By leverage on *verified* fns:
+
+1. **Identifier hygiene** — sanitize binder names that collide with module namespaces or Lean
+   keywords (or emit `_root_.`-qualified names). Pure bug, mechanical, kills the
+   namespace-shadow + `prefix` families (~550 fns' spurious errors).
+2. **Choose-body rendering** — fix the `(P j) ∧ j` statement-path lowering (440 fns). Note:
+   until fixed, downstream `auto-tactic failed` goals in those fns are *undercounted victims* —
+   the choose witness fact arrives malformed, so goals that should close don't.
+3. **Two decreasing facts** — teach the emitted `decreasing_by` (or preamble `@[simp]` set)
+   `len (drop_first w) < len w` / `drop_last` / `Nat.div_lt_self` (841 fns).
+4. **`Inhabited`/`Nonempty` synthesis** in generic contexts (569 fns).
+5. *Then* re-run: the `auto-tactic failed` bucket (5,666 goals / 1,024 fns) is the true
+   closer-vs-Z3-idiom migration workload, and it will shrink once (1)–(4) stop corrupting
+   hypotheses. Only after that is the §7 `DeadEnd`/`seq!` codegen work the frontier again.
+
+**Gate hygiene note.** The working-tree `check.sh` (uncommitted edit) passes `--emit-lean`
+unconditionally, which *skips the Lean run* — it currently reports `3116 verified, 0 errors —
+Lean run skipped`, i.e. the standing gate is codegen-only for every Lean-routed fn. The
+`-V cache` + tee-to-log additions are keepers; the `--emit-lean` should be dropped from the
+default line (still passable via `"$@"`) once experimentation settles.
