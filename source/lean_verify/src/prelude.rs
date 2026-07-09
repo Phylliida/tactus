@@ -55,7 +55,17 @@ pub fn prelude_cache_dir() -> PathBuf {
     } else {
         crate::generate::lean_out_root().join("_prelude_cache")
     };
-    root.join("prelude")
+    // Content-addressed: one dir PER PRELUDE VERSION, so two tactus
+    // binaries with different preludes (e.g. two checkouts on one
+    // machine) coexist instead of rebuilding the same dir back and
+    // forth — the "concurrent mixed-version builders" race below was
+    // observed for real once a branch changed the prelude while the
+    // main checkout kept running. Old version dirs linger (~4MB each);
+    // `rm -rf` the cache root recovers.
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    TACTUS_PRELUDE.hash(&mut h);
+    root.join(format!("prelude-{:016x}", h.finish()))
 }
 
 pub fn ensure_prelude_olean() -> Result<PathBuf, String> {
@@ -65,10 +75,9 @@ pub fn ensure_prelude_olean() -> Result<PathBuf, String> {
     // The marker records which prelude version the olean was built
     // from. It is written AFTER the olean rename, so on any crash the
     // mismatch forces a rebuild (never a stale olean behind a fresh
-    // marker). Concurrent same-version builders produce identical
-    // artifacts; concurrent MIXED-version builders (two different
-    // tactus binaries racing this dir) can interleave badly — accepted
-    // as unrealistic; `rm -rf` the cache dir recovers.
+    // marker). Mixed-version races are structurally gone now that the
+    // dir is content-addressed (`prelude_cache_dir`); the marker stays
+    // as belt-and-suspenders against partial writes.
     if olean.exists() && std::fs::read_to_string(&marker).ok().as_deref() == Some(TACTUS_PRELUDE) {
         return Ok(dir);
     }

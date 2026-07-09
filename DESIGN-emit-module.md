@@ -320,6 +320,27 @@ pure Lean core, no Mathlib needed for any architectural question.
 Net: **no blockers found; two design corrections (F2, F3) folded into §2.2 and
 §4.3.** M1 can start on this shape directly.
 
+**M5a status (same day): package-check routing LIVE — and mutual fns
+verify for the first time.** `--tactus-package-check` routes tactic
+proof fns through `check_proof_fn_via_package`: defs olean (memoized) →
+stmts olean (new `ensure_stmts_olean`, memoized) → emit pkg module →
+`lean -o` (fast path; the olean is what Link needs) → on failure only,
+re-run through `check_lean_file --json` + the NEW shared
+`format_lean_check_result` chokepoint, so package failures carry the
+SAME span-mapped diagnostics as island failures (verified: failing
+tactic points at the same Rust line). Mutual SCC members share a
+module-level verdict via memo (per-member line regions = M5b).
+Unsupported SCCs fail with the reason. Defs-unavailable falls back to
+the island path with a warning. The even/odd crate: **3 verified, 0
+errors** — the first shape package-check verifies that islands cannot.
+Suite 530/0 with three new tests (smoke, mutual-green, failing-tactic
+diagnostics). Drive-by, structural: the prelude olean cache is now
+CONTENT-ADDRESSED (`prelude-<hash>/`) — the "mixed-version builders
+race" the old comment called unrealistic became real the moment this
+branch changed the prelude while the main checkout kept running
+(observed as timing-dependent `unexpected token '#'` failures);
+versions now coexist, no more TACTUS_PRELUDE_CACHE juggling needed.
+
 **M4 status (same day): the package gate is LIVE — packages are a checked
 claim, not a checkable artifact.** In check mode, `--tactus-emit-module`
 now runs a crate-level gate after per-fn verification (`verify_crate`
@@ -343,6 +364,65 @@ one inline transform + one dep-graph scan. Deferred: parallel pkg olean
 builds; sourcemap mapping of gate diagnostics onto Rust spans; a
 harness-level negative test for gate failure (the closure-check command's
 negative behaviors are hand-pinned in /tmp-level tests only).
+
+## M5 design (agreed with Danielle, 2026-07-09 evening)
+
+**Goal: packages REPLACE islands as the verification path for tactic
+proof fns** (worktree-only until trust is established). New flag
+`--tactus-package-check` — deliberately easy to rename: one OPT const in
+config.rs, one config field, one harness-whitelist line in
+rust_verify_test/tests/common/mod.rs, one setter call in verifier.rs.
+Implies `--tactus-crate-defs`. `--tactus-emit-module` (gate mode)
+remains as the A/B reference; `--emit-lean` stays codegen-only for
+island debugging.
+
+**Invalidation architecture** (driven by Danielle's workload: validated
+things rarely change; new lemmas and new spec fns are appended
+constantly — tactus-group-theory's spec world is huge and growing):
+
+- **Stmts: per-fn stmt modules** (structural append-safety — a new
+  lemma creates new files only; nothing existing changes). A stmt
+  module imports only the defs modules its statement references; a pkg
+  module imports its direct deps' stmt modules. The import list of a
+  module IS its dependency manifest — trust surface readable off the
+  artifact.
+- **Defs: one module per source (.rs) module**, partitioned by
+  `owning_module`, import-wired from the dep_order item graph projected
+  to modules; module-level cycles SCC-merged with a note; orphan floor
+  module for unowned decls. Appending a spec fn to `britton.rs` rebuilds
+  `Defs_britton.olean` only.
+- **Stable, hash-free module names** (`TactusDefs_<crate>__<module>`) —
+  a prerequisite for incrementality: content-hashed names (the gate
+  mode's fingerprint suffix) rename modules on any append and
+  invalidate the world through import lines. Package-check always runs
+  full-krate single-scope, so it doesn't need the bucket-disambiguation
+  hash. (Danielle: the fingerprint was "pretty sus anyway".)
+- **Uniform skip rule, layered on top** (deterministic artifacts;
+  history only affects work saved — the verus-cache shape): module
+  byte-identical → skip; changed-but-superset (structural cmds
+  set-inclusion — the within-module append) → rebuild that olean only,
+  consumers stay valid; genuinely edited → invalidate consumers
+  transitively at module granularity. Soundness invariant, load-bearing:
+  emitted names are unique (Verus paths, sanitized), so a superset
+  environment can never re-resolve an existing reference — appends
+  cannot shadow.
+- Rejected: epoch-layered defs (history-dependent artifact layout —
+  breaks determinism); per-decl defs modules (wrong granularity: mutual
+  spec SCCs, datatypes+accessors, instances travel in groups);
+  lake-owned invalidation (hash-transitive — can't know appends are
+  safe).
+
+The end state is a package shaped like an ordinary Lean library — one
+module per file, explicit import DAG, minimal rebuilds. The
+transparency goal arriving via the perf door.
+
+**Ladder:** M5a routing (authority for single fns, on today's
+monolithic defs — correct first, incremental later) → M5b mutual
+modules green with per-member line-region verdicts (batch-style) → M5c
+crate-end Link pass reusing the oleans M5a built (kills the M4 gate's
+re-elaboration) → M5d defs partitioning + per-fn stmts + stable names →
+M5e uniform skip cache + parallel builds, measured on
+tactus-group-theory.
 
 **M3.5 status (same day): mutual tactic SCCs SUPPORTED in package mode —
 a capability islands don't have.** Empirically established first: mutual
