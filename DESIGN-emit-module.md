@@ -320,6 +320,30 @@ pure Lean core, no Mathlib needed for any architectural question.
 Net: **no blockers found; two design corrections (F2, F3) folded into §2.2 and
 §4.3.** M1 can start on this shape directly.
 
+**M4 status (same day): the package gate is LIVE — packages are a checked
+claim, not a checkable artifact.** In check mode, `--tactus-emit-module`
+now runs a crate-level gate after per-fn verification (`verify_crate`
+tail → `run_package_gate` → `generate::check_package`): regenerate the
+FULL-krate package — one scope, deliberately independent of verification
+bucketing, with the fingerprint-keyed memos keeping bucket-scope
+artifacts from colliding — then elaborate bottom-up: defs + stmts oleans,
+every pkg/mutual module (`lean -o` is its elaboration), Link last. The
+run output becomes e.g. `package gate: 6 modules elaborated; composition
++ axiom closures kernel-verified`; gate failures are verification errors
+(the user asked for the package in the verdict); the gate is skipped
+with a note when per-fn verification already failed (report causes, not
+cascades) and silently when nothing routed to Lean. The whole-crate pass
+also closes M2's scope cut (batch-covered fns skipped the per-fn hook in
+check mode — the gate enumerates everything itself). Unsupported mutual
+SCCs surface as per-run notes. Perf note: the gate pays one extra
+elaboration of every proof fn (island + package); acceptable while
+islands remain authority, revisited when packages take over (M5) —
+`emit_package_proof_fn_inner` already exists so the crate pass shares
+one inline transform + one dep-graph scan. Deferred: parallel pkg olean
+builds; sourcemap mapping of gate diagnostics onto Rust spans; a
+harness-level negative test for gate failure (the closure-check command's
+negative behaviors are hand-pinned in /tmp-level tests only).
+
 **M3.5 status (same day): mutual tactic SCCs SUPPORTED in package mode —
 a capability islands don't have.** Empirically established first: mutual
 tactic-body proof fns FAIL island emission today (8 errors on an

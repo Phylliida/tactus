@@ -20,7 +20,8 @@ use rustc_interface::interface::Compiler;
 use rustc_session::config::ErrorOutputType;
 
 use vir::messages::{
-    Message, MessageLabel, MessageLevel, MessageX, ToAny, message, note, note_bare, warning_bare,
+    Message, MessageLabel, MessageLevel, MessageX, ToAny, error_bare, message, note, note_bare,
+    warning_bare,
 };
 
 use num_format::{Locale, ToFormattedString};
@@ -3231,6 +3232,61 @@ impl Verifier {
         Ok(())
     }
 
+    /// M4 package gate: regenerate + elaborate the full-krate package
+    /// (defs, stmts, per-fn/mutual Proofs modules, Link with
+    /// `#tactus_check_axioms`). Skipped when per-fn verification had
+    /// errors (the package would fail derivatively — report the real
+    /// failures, not the cascade). Gate failures count as verification
+    /// errors: the user asked for the package to be part of the
+    /// verdict.
+    fn run_package_gate(&mut self, compiler: &Compiler, spans: &SpanContext) {
+        let reporter = Reporter::new(spans, compiler);
+        if self.count_errors > 0 {
+            reporter.report_now(&note_bare(
+                "tactus: package gate skipped (per-fn verification had errors)",
+            ).to_any());
+            return;
+        }
+        let Some(krate) = self.vir_crate.clone() else {
+            return;
+        };
+        let tactic_bodies = build_tactic_bodies_map(&krate);
+        if tactic_bodies.is_empty() {
+            return; // nothing routed to Lean → no package to check
+        }
+        let crate_name = self.crate_name.clone().unwrap_or_else(|| "crate".to_string());
+        match lean_verify::check_package(&krate, &crate_name, &tactic_bodies) {
+            Ok(report) => {
+                for s in &report.skipped_sccs {
+                    reporter.report_now(&note_bare(format!(
+                        "tactus: package gate: skipped {}", s
+                    )).to_any());
+                }
+                if report.failures.is_empty() {
+                    reporter.report_now(&note_bare(format!(
+                        "tactus: package gate: {} modules elaborated; composition + \
+                         axiom closures kernel-verified",
+                        report.modules,
+                    )).to_any());
+                } else {
+                    for (module, output) in &report.failures {
+                        self.count_errors += 1;
+                        reporter.report_now(&error_bare(format!(
+                            "tactus: package gate: module `{}` failed:\n{}",
+                            module, output,
+                        )).to_any());
+                    }
+                }
+            }
+            Err(e) => {
+                self.count_errors += 1;
+                reporter.report_now(&error_bare(format!(
+                    "tactus: package gate could not run: {}", e
+                )).to_any());
+            }
+        }
+    }
+
     pub(crate) fn verify_crate<'tcx>(
         &mut self,
         compiler: &Compiler,
@@ -3241,6 +3297,19 @@ impl Verifier {
 
         let result =
             if !self.args.no_verify { self.verify_crate_inner(&compiler, spans) } else { Ok(()) };
+
+        // Tactus package gate (M4, DESIGN-emit-module.md): after per-fn
+        // verification, regenerate the FULL-krate package (one scope —
+        // independent of bucketing) and elaborate it, making the
+        // kernel-checked composition + axiom-closure claims part of the
+        // run's verdict. `--emit-lean` stays codegen-only.
+        if result.is_ok()
+            && self.args.tactus_emit_module
+            && !self.args.emit_lean
+            && !self.args.no_verify
+        {
+            self.run_package_gate(compiler, spans);
+        }
 
         let time_verify_crate_end = Instant::now();
         self.time_verify_crate = time_verify_crate_end - time_verify_crate_start;

@@ -1259,13 +1259,18 @@ pub fn emit_proof_fn(
     if package_enabled() {
         match &defs {
             Some(d) => {
-                if let Err(e) = emit_package_proof_fn(
+                match emit_package_proof_fn(
                     krate, proof_fn, tactic_body, imports, crate_name, tactic_bodies, d,
                 ) {
-                    eprintln!(
+                    Ok(PkgEmitOutcome::Single(_)) | Ok(PkgEmitOutcome::Mutual(_)) => {}
+                    Ok(PkgEmitOutcome::UnsupportedScc(reason)) => eprintln!(
+                        "tactus: package emission skipped for `{}`: {}",
+                        short_name(&proof_fn.name.path), reason
+                    ),
+                    Err(e) => eprintln!(
                         "tactus: package emission failed for `{}` ({}); island artifact unaffected",
                         short_name(&proof_fn.name.path), e
-                    );
+                    ),
                 }
                 // Link module (M3): once per scope; content is fully
                 // determined by the krate, so any fn's emission can
@@ -1584,6 +1589,19 @@ fn build_stmts_module(
 /// elaborates unchanged), importing the Stmts module instead of
 /// re-elaborating helper theorems. Written under `pkg/` next to the
 /// island files.
+/// What package emission did for one fn — the emit-hook logs
+/// `UnsupportedScc`, the M4 gate collects module leafs to elaborate.
+pub enum PkgEmitOutcome {
+    /// Single-fn Proofs module written; payload = module leaf name.
+    Single(String),
+    /// Fn is a member of a supported mutual SCC; payload = the SCC's
+    /// canonical module leaf (same for every member).
+    Mutual(String),
+    /// Fn is on a cycle with SCC-external helper deps — not
+    /// package-expressible; payload = human-readable reason.
+    UnsupportedScc(String),
+}
+
 fn emit_package_proof_fn(
     krate: &KrateX,
     proof_fn: &FunctionX,
@@ -1592,10 +1610,30 @@ fn emit_package_proof_fn(
     crate_name: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
     defs: &crate::crate_defs::CrateDefs,
-) -> Result<(), String> {
-    let stmts = stmts_for_crate(krate, crate_name, tactic_bodies, defs)
-        .ok_or("Stmts module unavailable")?;
+) -> Result<PkgEmitOutcome, String> {
     let inlined_krate = crate::inline_spec::inline_marked_in_krate(krate);
+    let graph = package_dep_graph(&inlined_krate, tactic_bodies);
+    emit_package_proof_fn_inner(
+        &inlined_krate, &graph, proof_fn, tactic_body, imports, crate_name,
+        tactic_bodies, defs,
+    )
+}
+
+/// Inner emission over an ALREADY-INLINED krate + dep graph — the M4
+/// gate calls this directly so a whole-crate pass pays the inline
+/// transform and the tactic-body dependency scan once, not per fn.
+fn emit_package_proof_fn_inner(
+    inlined_krate: &KrateX,
+    (fns, deps_of): &(Vec<&FunctionX>, std::collections::HashMap<&Fun, Vec<&FunctionX>>),
+    proof_fn: &FunctionX,
+    tactic_body: &str,
+    imports: &[String],
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    defs: &crate::crate_defs::CrateDefs,
+) -> Result<PkgEmitOutcome, String> {
+    let stmts = stmts_for_crate(inlined_krate, crate_name, tactic_bodies, defs)
+        .ok_or("Stmts module unavailable")?;
     let proof_fn = inlined_krate.functions.iter()
         .find(|f| f.x.name == proof_fn.name).map(|f| &f.x)
         .expect("root proof fn present in inlined krate");
@@ -1604,31 +1642,30 @@ fn emit_package_proof_fn(
     // references stay direct (same block), `termination_by` comes from
     // each member's `decreases`. Only supported when the SCC has no
     // EXTERNAL helper deps (see `scc_external_deps`).
-    {
-        let (fns, deps_of) = package_dep_graph(&inlined_krate, tactic_bodies);
-        if let Some(scc) = package_scc_of(proof_fn, &fns, &deps_of) {
-            let ext = scc_external_deps(&scc, &deps_of);
-            if !ext.is_empty() {
-                return Err(format!(
-                    "mutual tactic SCC {{{}}} has helper deps outside the SCC ({}) — \
-                     unsupported: external deps arrive as hypothesis binders, which \
-                     verbatim mutual references cannot pass",
-                    scc.iter().map(|f| short_name(&f.name.path)).collect::<Vec<_>>().join(", "),
-                    ext.iter().map(|f| short_name(&f.name.path)).collect::<Vec<_>>().join(", "),
-                ));
-            }
-            return emit_package_mutual_scc(
-                &inlined_krate, &scc, imports, crate_name, tactic_bodies, defs, &stmts,
-            );
+    if let Some(scc) = package_scc_of(proof_fn, fns, deps_of) {
+        let ext = scc_external_deps(&scc, deps_of);
+        if !ext.is_empty() {
+            return Ok(PkgEmitOutcome::UnsupportedScc(format!(
+                "mutual tactic SCC {{{}}} has helper deps outside the SCC ({}) — \
+                 unsupported: external deps arrive as hypothesis binders, which \
+                 verbatim mutual references cannot pass",
+                scc.iter().map(|f| short_name(&f.name.path)).collect::<Vec<_>>().join(", "),
+                ext.iter().map(|f| short_name(&f.name.path)).collect::<Vec<_>>().join(", "),
+            )));
         }
+        let leaf = mutual_module_leaf(&scc);
+        emit_package_mutual_scc(
+            inlined_krate, &scc, imports, crate_name, tactic_bodies, defs, &stmts,
+        )?;
+        return Ok(PkgEmitOutcome::Mutual(leaf));
     }
     let mut file_imports: Vec<String> = imports.to_vec();
     file_imports.push(stmts_module_name(defs));
     let (mut cmds, ns) = krate_preamble(
-        &inlined_krate, &file_imports, crate_name, &[proof_fn],
+        inlined_krate, &file_imports, crate_name, &[proof_fn],
         PreambleConfig::ProofFnPackage, &[], tactic_bodies, &[], Some(defs),
     );
-    let ectx = crate::emit_ctx::EmitCtx::build(&inlined_krate, tactic_bodies);
+    let ectx = crate::emit_ctx::EmitCtx::build(inlined_krate, tactic_bodies);
     let mut thm = to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body, &ectx);
     // Direct helper references: same textual scan the island helper
     // walk uses (`collect_referenced_proof_fns`), but non-recursive —
@@ -1637,7 +1674,7 @@ fn emit_package_proof_fn(
     // `direct_helper_deps` enumeration is load-bearing: Link applies
     // closed forms in exactly this order.
     let hyps: Vec<crate::lean_ast::Binder> =
-        direct_helper_deps(proof_fn, tactic_body, &inlined_krate, tactic_bodies)
+        direct_helper_deps(proof_fn, tactic_body, inlined_krate, tactic_bodies)
             .into_iter()
             .map(|f| to_lean_fn::helper_hyp_binder(&f.name.path))
             .collect();
@@ -1660,7 +1697,8 @@ fn emit_package_proof_fn(
     let leaf = lean_name(&proof_fn.name.path).replace('.', "__");
     let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
         .join(format!("{}.lean", leaf));
-    write_lean_file(&path, &rendered.text)
+    write_lean_file(&path, &rendered.text)?;
+    Ok(PkgEmitOutcome::Single(leaf))
 }
 
 /// Mutual-SCC-module memo: written once per canonical path per
@@ -1723,6 +1761,132 @@ fn emit_package_mutual_scc(
     let _ = &stmts;
     let rendered = pp_commands(&cmds);
     write_lean_file(&path, &rendered.text)
+}
+
+// ── Package gate (M4) ───────────────────────────────────────────────
+
+/// Result of the crate-level package gate.
+pub struct PackageGateReport {
+    /// Modules elaborated (defs + stmts + pkg modules + Link).
+    pub modules: usize,
+    /// Mutual SCCs that could not be package-expressed (reasons).
+    pub skipped_sccs: Vec<String>,
+    /// (module leaf, lean output) per failed elaboration.
+    pub failures: Vec<(String, String)>,
+}
+
+/// Crate-level package gate (DESIGN-emit-module.md M4): regenerate the
+/// FULL-krate package — one scope, independent of verification
+/// bucketing (the fingerprint-keyed memos keep bucket-scope artifacts
+/// from colliding) — then elaborate it bottom-up: defs and stmts
+/// oleans, every pkg Proofs/mutual module (`lean -o` IS its
+/// elaboration), and finally Link, whose elaboration is the
+/// kernel-checked composition + axiom-closure verdict. Islands remain
+/// the per-fn authority; the gate turns the package from a checkable
+/// artifact into a checked claim.
+pub fn check_package(
+    krate: &KrateX,
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> Result<PackageGateReport, String> {
+    install_emit_tables(krate);
+    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true)
+        .ok_or("shared-defs module unavailable (defs build failed or gate unmet)")?;
+    let inlined_krate = crate::inline_spec::inline_marked_in_krate(krate);
+    let graph = package_dep_graph(&inlined_krate, tactic_bodies);
+    let mut leafs: Vec<String> = Vec::new();
+    let mut skipped_sccs: Vec<String> = Vec::new();
+    let mut failures: Vec<(String, String)> = Vec::new();
+    for f in graph.0.clone() {
+        let body = match tactic_bodies.get(&f.name) {
+            Some(b) => b.clone(),
+            None => continue,
+        };
+        match emit_package_proof_fn_inner(
+            &inlined_krate, &graph, f, &body, &f.attrs.lean_imports, crate_name,
+            tactic_bodies, &defs,
+        ) {
+            Ok(PkgEmitOutcome::Single(leaf)) => leafs.push(leaf),
+            Ok(PkgEmitOutcome::Mutual(leaf)) => {
+                if !leafs.contains(&leaf) {
+                    leafs.push(leaf);
+                }
+            }
+            Ok(PkgEmitOutcome::UnsupportedScc(reason)) => {
+                if !skipped_sccs.contains(&reason) {
+                    skipped_sccs.push(reason);
+                }
+            }
+            Err(e) => failures.push((short_name(&f.name.path).to_string(), e)),
+        }
+    }
+    link_for_crate(krate, crate_name, tactic_bodies, &defs);
+    // Elaborate bottom-up. defs.olean was built by `for_crate(build =
+    // true)`; stmts + pkg modules build here; Link elaborates last.
+    let prelude_dir = crate::prelude::ensure_prelude_olean()?;
+    let base_path = format!("{}:{}", prelude_dir.display(), defs.dir.display());
+    let stmts_mod = stmts_module_name(&defs);
+    run_lean(&defs.dir, &stmts_mod, true, &base_path, &mut failures);
+    if !failures.is_empty() {
+        // stmts (or an emission) failed — every pkg module would fail
+        // derivatively; report the root cause, not the cascade.
+        return Ok(PackageGateReport { modules: 2, skipped_sccs, failures });
+    }
+    let pkg_dir = lean_out_root().join(sanitize(crate_name)).join("pkg");
+    for leaf in &leafs {
+        run_lean(&pkg_dir, leaf, true, &base_path, &mut failures);
+    }
+    let link_path = format!("{}:{}", base_path, pkg_dir.display());
+    let link_mod = link_module_name(&defs);
+    run_lean(&pkg_dir, &link_mod, false, &link_path, &mut failures);
+    Ok(PackageGateReport {
+        modules: 2 + leafs.len() + 1,
+        skipped_sccs,
+        failures,
+    })
+}
+
+/// Run `lean` on `<module>.lean` with cwd `dir` (so `-o` derives the
+/// module name from the bare file name — same constraint as
+/// `crate_defs::build_olean`), optionally producing the olean.
+/// `lean_path` is prepended to any inherited `LEAN_PATH` (the harness
+/// presets one; check.sh doesn't — CRATEDEFS 1c).
+fn run_lean(
+    dir: &Path,
+    module: &str,
+    produce_olean: bool,
+    lean_path: &str,
+    failures: &mut Vec<(String, String)>,
+) {
+    let mut args: Vec<String> = Vec::new();
+    if produce_olean {
+        args.push("-o".to_string());
+        args.push(format!("{}.olean", module));
+    }
+    args.push(format!("{}.lean", module));
+    let existing = std::env::var("LEAN_PATH").unwrap_or_default();
+    let env = if existing.is_empty() {
+        lean_path.to_string()
+    } else {
+        format!("{}:{}", lean_path, existing)
+    };
+    match std::process::Command::new("lean")
+        .args(&args)
+        .current_dir(dir)
+        .env("LEAN_PATH", env)
+        .output()
+    {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => failures.push((
+            module.to_string(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )),
+        Err(e) => failures.push((module.to_string(), format!("failed to spawn lean: {}", e))),
+    }
 }
 
 /// A fn's DIRECT tactic-referenced helper lemmas, in krate order —
