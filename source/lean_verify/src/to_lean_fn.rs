@@ -125,6 +125,7 @@ pub(crate) fn wrap_body_with_param_derefs(body: LExpr, params: &Params) -> LExpr
 /// Proof fns and exec fns use different mapping mechanisms — the
 /// enum split makes the dichotomy explicit instead of having one
 /// struct with conditionally-meaningful fields.
+#[derive(Clone)]
 pub enum LeanSourceMap {
     /// Proof fns: the user-written tactic body starts at
     /// `tactic_start_line` and runs `tactic_line_count` lines.
