@@ -1281,14 +1281,26 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
                 body: Box::new(sst_exp_to_ast_checked_with_ctx(body, ctx)?),
             },
             BndX::Choose(binders, _, cond) => {
-                // `Classical.epsilon (fun (x : T) => cond ∧ body)`
+                // See `expr_shared::choose_node` for the semantics and the
+                // shape (ε-skolemization). `body: None` = the single-binder
+                // `choose|x| P(x)` form where the body is the bound var.
                 let cond_ast = sst_exp_to_ast_checked_with_ctx(cond, ctx)?;
-                let body_ast = sst_exp_to_ast_checked_with_ctx(body, ctx)?;
-                let lambda = LExpr::lambda(
-                    vir_var_binders_to_ast(binders),
-                    LExpr::and(cond_ast, body_ast),
-                );
-                LExpr::app1(LExpr::var_lit("Classical.epsilon"), lambda).node
+                let body_is_the_var = binders.len() == 1
+                    && matches!(&body.x, ExpX::Var(v) if v == &binders[0].name);
+                let body_ast = if body_is_the_var {
+                    None
+                } else {
+                    Some(sst_exp_to_ast_checked_with_ctx(body, ctx)?)
+                };
+                let names: Vec<crate::lean_name::LeanName> = binders.iter()
+                    .map(|b| crate::lean_name::LeanName::from_var_ident(&b.name))
+                    .collect();
+                crate::expr_shared::choose_node(
+                    &vir_var_binders_to_ast(binders),
+                    &names,
+                    cond_ast,
+                    body_ast,
+                )
             }
         },
 
@@ -1536,4 +1548,84 @@ fn bv_unsupported_shape_name(x: &ExpX) -> &'static str {
         // their arms produce LExpr directly, never reach this helper.
         _ => "<unknown ExpX variant>",
     }
+}
+
+/// Collect the witness-fact hypotheses for every `choose` reachable in
+/// `exp` WITHOUT crossing a binder (a choose under a quantifier/lambda/let
+/// binder would leave the hypothesis with free variables). One `LExpr` per
+/// choose — see `expr_shared::choose_witness_hyp` for the shape and the
+/// soundness argument (it's `Classical.epsilon_spec` at the value's exact
+/// ε-terms, mirroring the conditional witness axiom Verus's Z3 path gets
+/// from AIR's `BindX::Choose`).
+///
+/// Callers (the Wp walk arms: Let / Assert / Assume / Branch in
+/// `sst_to_lean`) push these as `CtxFrame::Hyp`s. Chooses nested under
+/// binders are skipped — their witness fact would need the enclosing
+/// quantifier prefix; the (rare) proof that needs one can supply an
+/// explicit tactic. A missed container variant below only loses proof
+/// help, never soundness.
+pub(crate) fn collect_choose_witness_hyps(
+    exp: &Exp,
+    ctx: &crate::expr_shared::RenderCtx,
+) -> Result<Vec<LExpr>, String> {
+    let mut out = Vec::new();
+    collect_choose_rec(exp, ctx, &mut out)?;
+    Ok(out)
+}
+
+fn collect_choose_rec(
+    exp: &Exp,
+    ctx: &crate::expr_shared::RenderCtx,
+    out: &mut Vec<LExpr>,
+) -> Result<(), String> {
+    use vir::sst::ExpX as X;
+    match &exp.x {
+        X::Bind(bnd, _body) => {
+            if let BndX::Choose(binders, _, cond) = &bnd.x {
+                let cond_ast = sst_exp_to_ast_checked_with_ctx(cond, ctx)?;
+                let names: Vec<crate::lean_name::LeanName> = binders
+                    .iter()
+                    .map(|b| crate::lean_name::LeanName::from_var_ident(&b.name))
+                    .collect();
+                out.push(crate::expr_shared::choose_witness_hyp(
+                    &vir_var_binders_to_ast(binders),
+                    &names,
+                    &cond_ast,
+                ));
+            }
+            // Never descend into a Bind: its sub-exps sit under binders.
+        }
+        X::Loc(e) | X::Unary(_, e) | X::UnaryOpr(_, e) | X::WithTriggers(_, e) => {
+            collect_choose_rec(e, ctx, out)?;
+        }
+        X::Binary(_, e1, e2) | X::BinaryOpr(_, e1, e2) => {
+            collect_choose_rec(e1, ctx, out)?;
+            collect_choose_rec(e2, ctx, out)?;
+        }
+        X::If(c, t, f) => {
+            collect_choose_rec(c, ctx, out)?;
+            collect_choose_rec(t, ctx, out)?;
+            collect_choose_rec(f, ctx, out)?;
+        }
+        X::Call(_, _, exps) | X::ArrayLiteral(exps) => {
+            for e in exps.iter() {
+                collect_choose_rec(e, ctx, out)?;
+            }
+        }
+        X::CallLambda(f, exps) => {
+            collect_choose_rec(f, ctx, out)?;
+            for e in exps.iter() {
+                collect_choose_rec(e, ctx, out)?;
+            }
+        }
+        X::Ctor(_, _, bs) => {
+            for b in bs.iter() {
+                collect_choose_rec(&b.a, ctx, out)?;
+            }
+        }
+        // Leaves (Const / Var / StaticVar / VarLoc / VarAt / Old /
+        // NullaryOpr / ExecFnByName / Interp / FuelConst): no children.
+        _ => {}
+    }
+    Ok(())
 }

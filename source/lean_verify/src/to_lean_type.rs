@@ -394,6 +394,49 @@ pub(crate) fn install_crate_decls(decls: std::collections::HashSet<String>) {
     CRATE_DECLS.with(|d| *d.borrow_mut() = Some(decls));
 }
 
+thread_local! {
+    /// Relative names of the decl group whose bodies are currently being
+    /// rendered. A recursive def's SELF-reference (and a `mutual` block
+    /// member's reference to its siblings) must render relatively: during
+    /// elaboration the decl is not yet a global constant, and `_root_.…`
+    /// forces global lookup — `Unknown identifier` (verified empirically).
+    /// Lean resolves the relative form through its local self-reference /
+    /// mutual-group mechanism. For datatype `.height` defs the set holds
+    /// the datatype's relative name (the `.height` suffix is appended
+    /// after `lean_name` returns). Residual risk, accepted: a local binder
+    /// shadowing a self-name's head segment inside its own recursive def —
+    /// vanishingly rare vs. the systematic breakage.
+    static CURRENT_DECL_SELF: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Render `f` with `rel_names` ADDED to the current self-decl set (see
+/// `CURRENT_DECL_SELF`), restoring the previous set afterwards. Union
+/// scoping: `spec_fn_to_ast` pushes its own singleton inside the mutual
+/// group's wrapper — member bodies must still resolve their siblings.
+pub(crate) fn with_self_decls<T>(
+    rel_names: impl IntoIterator<Item = String>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let added: Vec<String> = CURRENT_DECL_SELF.with(|s| {
+        let mut set = s.borrow_mut();
+        rel_names.into_iter().filter(|n| set.insert(n.clone())).collect()
+    });
+    let out = f();
+    CURRENT_DECL_SELF.with(|s| {
+        let mut set = s.borrow_mut();
+        for n in &added {
+            set.remove(n);
+        }
+    });
+    out
+}
+
+/// Single-name convenience for `with_self_decls`.
+pub(crate) fn with_self_decl<T>(rel_name: String, f: impl FnOnce() -> T) -> T {
+    with_self_decls(std::iter::once(rel_name), f)
+}
+
 /// Convert a VIR path to a Lean dotted name, skipping the crate prefix.
 /// `crate::module::name` → `module.name`
 /// Names are sanitized (@ # → _) and keywords are escaped with «».
@@ -403,6 +446,13 @@ pub(crate) fn install_crate_decls(decls: std::collections::HashSet<String>) {
 /// `_root_.{ns}.module.name` (see `CRATE_NS`).
 pub(crate) fn lean_name(path: &Path) -> String {
     let name = lean_name_relative(path);
+    // Self-reference inside the decl group's own bodies: must stay
+    // relative (see CURRENT_DECL_SELF — root-anchoring a not-yet-defined
+    // global is `Unknown identifier`).
+    let is_self = CURRENT_DECL_SELF.with(|s| s.borrow().contains(name.as_str()));
+    if is_self {
+        return name;
+    }
     CRATE_NS.with(|ns| match &*ns.borrow() {
         Some(ns) => {
             let in_crate = CRATE_DECLS.with(|d| match &*d.borrow() {

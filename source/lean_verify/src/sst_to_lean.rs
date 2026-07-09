@@ -1758,6 +1758,23 @@ impl ObligationEmitter {
 /// Walk a `Wp` tree, emitting one Lean theorem per obligation. See
 /// the doc on [`exec_fn_theorems_to_ast`] for the staging plan and
 /// the per-Wp-variant behaviour.
+/// Push the witness-fact hypothesis for every binder-free `choose` in
+/// `exp` onto a copy of `obl` (B2b — see
+/// `to_lean_sst_expr::collect_choose_witness_hyps`). Identity when the exp
+/// has no such choose — the overwhelmingly common case.
+fn obl_with_choose_hyps(exp: &Exp, ctx: &WpCtx, obl: &OblCtx) -> OblCtx {
+    let hyps = crate::to_lean_sst_expr::collect_choose_witness_hyps(
+        exp,
+        &ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs),
+    )
+    .expect("choose-witness collect: sub of validated Exp tree");
+    let mut out = obl.clone();
+    for h in hyps {
+        out = out.with_frame(CtxFrame::Hyp(h));
+    }
+    out
+}
+
 fn walk_obligations<'a>(
     wp: &Wp<'a>,
     ctx: &'a WpCtx<'a>,
@@ -1782,6 +1799,8 @@ fn walk_obligations<'a>(
             // body — its proof sits in this theorem, the body's
             // theorems can assume it.
             let asserted_exp = asserted.raw();
+            // B2b: witness facts for chooses inline in the goal.
+            let obl = &obl_with_choose_hyps(asserted_exp, ctx, obl);
             let kind = detect_assert_kind(asserted_exp);
             let loc = format_rust_loc(&asserted_exp.span);
             let cond_ast = lower_validated_with_ctx(
@@ -1807,6 +1826,8 @@ fn walk_obligations<'a>(
         }
         Wp::Assume(p, body) => {
             // No theorem; the assumption just enters the context.
+            // B2b: witness facts for chooses inline in the assumption.
+            let obl = &obl_with_choose_hyps(p.raw(), ctx, obl);
             let new_obl = obl.with_frame(CtxFrame::Hyp(lower_validated_with_ctx(
                 p,
                 &ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs),
@@ -1923,7 +1944,11 @@ fn walk_obligations<'a>(
             walk_obligations(after, ctx, obl, e);
         }
         Wp::Let(name, val, dest_typ, body) => {
-            walk_let(name, val.raw(), dest_typ, body, ctx, obl, e);
+            // B2b: a choose in the RHS carries its witness fact — push it
+            // before the let frame so every downstream obligation sees it
+            // (mirrors AIR's per-choose skolem axiom on the Z3 path).
+            let obl = obl_with_choose_hyps(val.raw(), ctx, obl);
+            walk_let(name, val.raw(), dest_typ, body, ctx, &obl, e);
         }
         Wp::LetRaw { name, value, body } => {
             // Pre-rendered RHS — push the Let frame directly. No need
@@ -1957,6 +1982,8 @@ fn walk_obligations<'a>(
             // that fall through to the same `after`. Same exponential-
             // in-nested-if behaviour as the pre-D codegen — DESIGN.md
             // documents the trade-off.
+            // B2b: witness facts for chooses inline in the branch cond.
+            let obl = &obl_with_choose_hyps(cond.raw(), ctx, obl);
             let cond_marked = LExpr::span_mark(
                 format_rust_loc(&cond.raw().span),
                 Some(cond.raw().span.clone()),
