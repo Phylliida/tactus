@@ -96,3 +96,31 @@ fn stmt_cmd_zero_binders_is_bare_goal() {
 fn stmt_name_appends_suffix_to_lean_name() {
     assert_eq!(stmt_name(&mk_path("lemma_a")), "lemma_a_stmt");
 }
+
+/// Package-mode hypothesis binder (M2): named by the SHORT name (what
+/// raw tactic text references — binder shadowing keeps the body
+/// unchanged), typed by the statement def (lean_name-based, matching
+/// the Stmts module declaration).
+#[test]
+fn helper_hyp_binder_uses_short_name_and_stmt_type() {
+    let b = helper_hyp_binder(&mk_path("lemma_a"));
+    assert_eq!(b.name.as_ref().map(|n| n.as_str().to_string()),
+        Some("lemma_a".to_string()));
+    assert_eq!(crate::lean_pp::pp_expr(&b.ty), "lemma_a_stmt");
+    assert!(matches!(b.kind, BinderKind::Explicit));
+
+    // Multi-segment path: binder name stays SHORT (tactic text says
+    // `helper`), stmt type is the dotted lean_name form (declared that
+    // way in the Stmts module, resolvable under the same namespace).
+    let p = Arc::new(vir::ast::PathX {
+        krate: None,
+        segments: Arc::new(vec![
+            Arc::new("word".to_string()),
+            Arc::new("helper".to_string()),
+        ]),
+    });
+    let b = helper_hyp_binder(&p);
+    assert_eq!(b.name.as_ref().map(|n| n.as_str().to_string()),
+        Some("helper".to_string()));
+    assert_eq!(crate::lean_pp::pp_expr(&b.ty), "word.helper_stmt");
+}

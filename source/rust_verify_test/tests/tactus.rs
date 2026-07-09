@@ -13112,6 +13112,30 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Package emission smoke (DESIGN-emit-module.md M2): the same helper
+// chain with `--tactus-emit-module` on. Islands stay the checking
+// authority (this asserts the chain still verifies); the flag
+// additionally writes the Stmts module + per-fn pkg/ Proofs modules
+// with hypothesis binders — a panic anywhere in that path fails this
+// test. Artifact-level assertions land with M4's check wiring.
+test_verify_one_file_with_options! {
+    #[test] test_proof_fn_package_emission_smoke ["tactus-emit-module"] => verus_code! {
+        spec fn double(n: nat) -> nat { n + n }
+
+        proof fn lemma_a(n: nat) ensures double(n) >= 0 by { unfold double; omega }
+
+        proof fn lemma_b(n: nat) ensures double(n) >= 0 by {
+            have h := lemma_a n
+            exact h
+        }
+
+        proof fn lemma_c(n: nat) ensures double(n) >= 0 by {
+            have h := lemma_b n
+            exact h
+        }
+    } => Ok(())
+}
+
 // A `--` comment in a proof fn's body that merely *mentions* its caller
 // must NOT pull the caller into the file (strip_lean_line_comments) —
 // otherwise `caller`, declared before `base`, forward-references it.

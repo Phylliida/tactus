@@ -89,6 +89,12 @@ enum PreambleConfig {
     /// Exec fns: emit accessor fns for desugared match (via
     /// `IsVariant` / `Field`).
     ExecFn,
+    /// Package emission (DESIGN-emit-module.md M2): proof-fn rendering
+    /// (no accessors) with NO helper theorems — helpers arrive as
+    /// hypothesis binders typed by their statement defs, and the
+    /// statement defs arrive via the Stmts module import. Only valid
+    /// in shared-defs mode (callers guarantee `defs` is `Some`).
+    ProofFnPackage,
 }
 
 impl PreambleConfig {
@@ -246,14 +252,8 @@ fn krate_preamble(
     // over exactly the fns emitted into it — root_fns + helpers_to_emit.
     let root_fn_set: std::collections::HashSet<&Fun> =
         root_fns.iter().map(|f| &f.name).collect();
-    let is_emittable_helper = |f: &&FunctionX| {
-        matches!(f.mode, vir::ast::Mode::Proof)
-            && !matches!(
-                f.kind,
-                FunctionKind::TraitMethodDecl { .. } | FunctionKind::TraitMethodImpl { .. }
-            )
-            && tactic_bodies.contains_key(&f.name)
-    };
+    let is_emittable_helper =
+        |f: &&FunctionX| is_emittable_tactic_proof_fn(f, tactic_bodies);
     let helpers_to_emit: Vec<&FunctionX> = match config {
         // Proof-fn file: include ONLY the root's transitive downward
         // dependencies (proof fns its tactic body references, recursively),
@@ -285,6 +285,10 @@ fn krate_preamble(
             .filter(is_emittable_helper)
             .filter(|f| !root_fn_set.contains(&f.name))
             .collect(),
+        // Package mode: helpers are hypothesis binders on the root
+        // theorem (typed by statement defs from the Stmts module
+        // import), never inline theorems.
+        PreambleConfig::ProofFnPackage => Vec::new(),
     };
     // Aggregate fragments across all theorems. Dedup preserves
     // first-occurrence order via a HashSet for membership and a
@@ -1247,6 +1251,30 @@ pub fn emit_proof_fn(
     // mode this writes the defs source without building. Takes the
     // pre-inline krate — `for_crate` applies its own inline pass.
     let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, false);
+    // Package emission (M2, --tactus-emit-module): additive artifact
+    // under pkg/; islands (and the batch) remain the checking
+    // authority, so failures warn loudly but never fail the fn. Hooked
+    // BEFORE the batch early-return so batched fns get package
+    // artifacts too.
+    if package_enabled() {
+        match &defs {
+            Some(d) => {
+                if let Err(e) = emit_package_proof_fn(
+                    krate, proof_fn, tactic_body, imports, crate_name, tactic_bodies, d,
+                ) {
+                    eprintln!(
+                        "tactus: package emission failed for `{}` ({}); island artifact unaffected",
+                        short_name(&proof_fn.name.path), e
+                    );
+                }
+            }
+            None => eprintln!(
+                "tactus: --tactus-emit-module requires the shared-defs module \
+                 (build failed or gate unmet); package emission skipped for `{}`",
+                short_name(&proof_fn.name.path)
+            ),
+        }
+    }
     // Batch route (step 1b): a batched proof fn's artifact IS the batch
     // file; return its position within it for the sidecar. (In check
     // mode `check_proof_fn` returns before reaching here for covered
@@ -1418,6 +1446,197 @@ pub fn check_proof_fn(
 /// preamble → pretty-print → write `.lean` → sanity check. Stops before the
 /// Lean run. `Err(CheckResult)` carries a rejection / write error / sanity
 /// failure (each already carrying any collected warnings).
+// ── Package emission (emit-module, DESIGN-emit-module.md M2) ───────────
+//
+// Additive artifact stream behind `--tactus-emit-module`: alongside each
+// island file, write the package-mode layers — a per-crate Stmts module
+// (every tactic proof fn's contract as a reducible statement def, M1's
+// renderer) and a per-fn Proofs module whose theorem takes its direct
+// tactic-referenced helpers as hypothesis binders instead of
+// re-elaborating them. Islands remain the checking authority; package
+// files are emission-only until M4 wires build orchestration (olean
+// builds + LEAN_PATH). Requires shared-defs mode (the Stmts module
+// imports the defs module for the spec world).
+
+static PACKAGE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Called once from the verifier with `args.tactus_emit_module`.
+pub fn set_package_enabled(on: bool) {
+    PACKAGE_ENABLED.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+fn package_enabled() -> bool {
+    PACKAGE_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The population that gets statement defs in the Stmts module and can
+/// arrive as hypothesis binders at use sites — identical to the island
+/// preamble's `helpers_to_emit` filter (proof mode, not a trait method,
+/// has a tactic body), so the package and island views of "what is a
+/// helper lemma" cannot diverge.
+fn is_emittable_tactic_proof_fn(
+    f: &FunctionX,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> bool {
+    matches!(f.mode, vir::ast::Mode::Proof)
+        && !matches!(
+            f.kind,
+            FunctionKind::TraitMethodDecl { .. } | FunctionKind::TraitMethodImpl { .. }
+        )
+        && tactic_bodies.contains_key(&f.name)
+}
+
+/// Lean module name of the crate's Stmts module, derived from the defs
+/// module name so the two scope-naming schemes cannot drift.
+fn stmts_module_name(defs: &crate::crate_defs::CrateDefs) -> String {
+    defs.module_name.replacen("TactusDefs_", "TactusStmts_", 1)
+}
+
+/// Stmts-module memo: one build + write per scope per process. `None`
+/// = a previous attempt failed (poisoned — fail once, warn once), the
+/// same semantics as the defs memo. Keyed by the stmts MODULE NAME,
+/// which embeds the defs scope fingerprint (`scope_key`) — so
+/// per-bucket pruned krates get per-bucket stmts artifacts, each
+/// self-consistent with its bucket's defs (the CRATEDEFS 1c
+/// crate-keyed-memo bug, avoided by construction).
+static STMTS_MEMO: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Option<std::sync::Arc<Vec<Command>>>>>,
+> = std::sync::OnceLock::new();
+
+/// Build + write the crate's Stmts module: `import <defs module>` plus a
+/// statement def for every emittable tactic proof fn. Written into
+/// `defs.dir` so one directory serves as the import root for both
+/// modules. Returns the command stream (for per-fn sanity
+/// concatenation — identifier resolution must see what Lean will see).
+///
+/// The krate gets the same `inline_spec` pass the theorem path applies,
+/// so statement defs and theorem goals agree — the statement-identity
+/// property (§4.1).
+fn stmts_for_crate(
+    krate: &KrateX,
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    defs: &crate::crate_defs::CrateDefs,
+) -> Option<std::sync::Arc<Vec<Command>>> {
+    let key = stmts_module_name(defs);
+    let memo = STMTS_MEMO.get_or_init(Default::default);
+    if let Some(cached) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return cached.clone();
+    }
+    let built = build_stmts_module(krate, crate_name, tactic_bodies, defs)
+        .map(std::sync::Arc::new);
+    let entry = match built {
+        Ok(cmds) => Some(cmds),
+        Err(e) => {
+            eprintln!(
+                "tactus: Stmts module build failed for crate `{}` ({}); \
+                 package emission disabled for this scope",
+                crate_name, e
+            );
+            None
+        }
+    };
+    memo.lock().unwrap_or_else(|p| p.into_inner()).insert(key, entry.clone());
+    entry
+}
+
+fn build_stmts_module(
+    krate: &KrateX,
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    defs: &crate::crate_defs::CrateDefs,
+) -> Result<Vec<Command>, String> {
+    let inlined_krate = crate::inline_spec::inline_marked_in_krate(krate);
+    let (mut cmds, ns) = krate_preamble(
+        &inlined_krate, &[], crate_name, &[], PreambleConfig::ProofFnPackage, &[],
+        tactic_bodies, &[], Some(defs),
+    );
+    let ectx = crate::emit_ctx::EmitCtx::build(&inlined_krate, tactic_bodies);
+    for f in inlined_krate.functions.iter().map(|f| &f.x) {
+        if is_emittable_tactic_proof_fn(f, tactic_bodies) {
+            cmds.push(to_lean_fn::proof_fn_stmt_cmd(f, &ectx));
+        }
+    }
+    cmds.push(Command::NamespaceClose(ns));
+    // Sanity over what Lean will see: defs stream + this module.
+    // (debug builds only — debug_check is a release no-op, so don't
+    // pay the concat clone there.)
+    #[cfg(debug_assertions)]
+    {
+        let concat: Vec<Command> =
+            defs.cmds.iter().cloned().chain(cmds.iter().cloned()).collect();
+        debug_check(&concat)?;
+    }
+    let rendered = pp_commands(&cmds);
+    let path = defs.dir.join(format!("{}.lean", stmts_module_name(defs)));
+    write_lean_file(&path, &rendered.text)?;
+    Ok(cmds)
+}
+
+/// Package-mode Proofs module for one tactic proof fn: the island's
+/// theorem with direct tactic-referenced helpers prepended as
+/// hypothesis binders (`(<short name> : <name>_stmt)` — the binder name
+/// is exactly what the raw tactic text references, so the body
+/// elaborates unchanged), importing the Stmts module instead of
+/// re-elaborating helper theorems. Written under `pkg/` next to the
+/// island files.
+fn emit_package_proof_fn(
+    krate: &KrateX,
+    proof_fn: &FunctionX,
+    tactic_body: &str,
+    imports: &[String],
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    defs: &crate::crate_defs::CrateDefs,
+) -> Result<(), String> {
+    let stmts = stmts_for_crate(krate, crate_name, tactic_bodies, defs)
+        .ok_or("Stmts module unavailable")?;
+    let inlined_krate = crate::inline_spec::inline_marked_in_krate(krate);
+    let proof_fn = inlined_krate.functions.iter()
+        .find(|f| f.x.name == proof_fn.name).map(|f| &f.x)
+        .expect("root proof fn present in inlined krate");
+    let mut file_imports: Vec<String> = imports.to_vec();
+    file_imports.push(stmts_module_name(defs));
+    let (mut cmds, ns) = krate_preamble(
+        &inlined_krate, &file_imports, crate_name, &[proof_fn],
+        PreambleConfig::ProofFnPackage, &[], tactic_bodies, &[], Some(defs),
+    );
+    let ectx = crate::emit_ctx::EmitCtx::build(&inlined_krate, tactic_bodies);
+    let mut thm = to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body, &ectx);
+    // Direct helper references: same textual scan the island helper
+    // walk uses (`collect_referenced_proof_fns`), but non-recursive —
+    // each helper's own Proofs module carries its own hypotheses, and
+    // the Link module (M3) composes the closed forms.
+    let code = strip_lean_line_comments(tactic_body);
+    let hyps: Vec<crate::lean_ast::Binder> = inlined_krate.functions.iter()
+        .map(|f| &f.x)
+        .filter(|f| is_emittable_tactic_proof_fn(f, tactic_bodies))
+        .filter(|f| f.name != proof_fn.name
+            && ident_appears(&code, short_name(&f.name.path)))
+        .map(|f| to_lean_fn::helper_hyp_binder(&f.name.path))
+        .collect();
+    thm.binders.splice(0..0, hyps);
+    cmds.push(Command::Theorem(thm));
+    cmds.push(Command::NamespaceClose(ns));
+    // Sanity over the full import concatenation: defs + stmts + this.
+    // (debug builds only — see build_stmts_module.)
+    #[cfg(debug_assertions)]
+    {
+        let concat: Vec<Command> = defs.cmds.iter()
+            .chain(stmts.iter())
+            .chain(cmds.iter())
+            .cloned().collect();
+        debug_check(&concat)?;
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = &stmts;
+    let rendered = pp_commands(&cmds);
+    let leaf = lean_name(&proof_fn.name.path).replace('.', "__");
+    let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
+        .join(format!("{}.lean", leaf));
+    write_lean_file(&path, &rendered.text)
+}
+
 pub fn emit_exec_fn(
     krate: &KrateX,
     vir_fn: &FunctionX,

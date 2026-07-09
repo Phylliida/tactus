@@ -406,6 +406,8 @@ pub fn run_verus(
         } else if *option == "no-bv-simplify" {
             verus_args.push("-V".to_string());
             verus_args.push("no-bv-simplify".to_string());
+        } else if *option == "tactus-emit-module" {
+            verus_args.push("--tactus-emit-module".to_string());
         } else {
             panic!("option '{}' not recognized by test harness", option);
         }
