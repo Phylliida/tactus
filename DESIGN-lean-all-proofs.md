@@ -313,3 +313,33 @@ unconditionally, which *skips the Lean run* — it currently reports `3116 verif
 Lean run skipped`, i.e. the standing gate is codegen-only for every Lean-routed fn. The
 `-V cache` + tee-to-log additions are keepers; the `--emit-lean` should be dropped from the
 default line (still passable via `"$@"`) once experimentation settles.
+
+### 10.1 Post-fix re-measurement (2026-07-09, same day — after B1–B4 of the bugs doc)
+
+Same command, after `DESIGN-lean-all-proofs-bugs.md` B1–B4 landed (`dbc77e5`,
+`00534c9`): **8,950 errors (was 24,817 — −64%); 253 of 1,338 codegen'd fns pass
+(was 214)**. Exec gate green throughout (24 verified, 0 errors — better than its
+own pre-existing baseline: `apply_hom_symbol_exec` came unstuck).
+
+| Family | Before | After | Notes |
+|---|---:|---:|---|
+| Codegen rejections | 1,409 | 1,409 | §7 features (`DeadEnd`, `seq![a,b]`) — untouched by design |
+| auto-tactic failed | 5,666 | 5,987 | GREW because walls fell — goals that never elaborated now reach the closer. This is the honest migration bucket. |
+| Type mismatch | 2,596 | 1,145 | Choose family = **0**. Residual is a DIFFERENT family: multi-element seq literals rendered as `List` where `Vector n` is expected (`{ deref := [a, b, c] }`) — §7-adjacent, previously hidden behind rejections. |
+| Namespace shadow / unknown ident | 2,235 | **0** | |
+| Termination | 2,131 | 81 | 68/81 are `drop_first` goals in files whose dep-walk lacks `axiom_seq_subrange_len`, so the measure companion can't emit — fix = extend the dep-walk to pull the axiom in whenever `Seq.drop_first` emits. Rest: `sizeOf (if …)` Int-abs measures. |
+| Inhabited synthesis | 713 | 3 | |
+| Keyword collisions | 182 | 0 | 39 NEW `unexpected token '('` parse errors — a structural renderer shape, not identifier collisions; small, untriaged. |
+| Heartbeats timeouts | ~26 | 71 | More fns reach real proving — expected growth. |
+
+**Reading the fn-level pass number correctly:** +39 fns looks modest because a fn
+passes only when EVERY goal closes, and the auto bucket (5,987 goals across ~1,000
+fns) now gates almost everything — exactly the measurement the bug-fixes were
+supposed to make honest. The error-mass collapse (−64%, with translator-bug
+families down from ~60% of errors to ~15%) is the real before/after.
+
+**Next frontiers, in order of leverage:** (1) the auto bucket — closer-vs-explicit-
+tactic migration policy (per-goal, this is now genuine proof work, not bugs);
+(2) §7 codegen: `StmX::DeadEnd` lowering (1,267 rejections) + multi-element seq
+literals (142 rejections + the 1,145 List/Vector mistypes); (3) the small residuals
+above (companion dep-walk, `'('` parse shape, B5 typed-spine deref).
