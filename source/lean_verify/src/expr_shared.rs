@@ -1123,6 +1123,100 @@ pub(crate) fn field_proj_opr(base: LExpr, field_opr: &FieldOpr) -> LExpr {
     }
 }
 
+/// Assemble the Lean value of a Verus `choose` — the VIR (`ExprX::Choose`)
+/// and SST (`BndX::Choose`) renderers both route here so the two paths
+/// can't drift (DESIGN-lean-all-proofs-bugs.md B2).
+///
+/// Semantics (mirrors AIR `BindX::Choose`, `vir/src/sst_to_air.rs`): the
+/// value of `body` at SOME binding of `binders` satisfying `cond`;
+/// arbitrary when no witness exists — `Classical.epsilon` is total, the
+/// Lean analog of AIR's `as_type` coercion on an unsatisfiable choose.
+///
+/// * `body: None` — the dominant `choose|x| P(x)` form (single binder,
+///   body IS the bound var): `Classical.epsilon (fun x => cond)`.
+/// * `body: Some(b)` — general form (multi-binder and/or compound body);
+///   skolemize binder-by-binder, then evaluate the body:
+///   `let x₁ := Classical.epsilon (fun x₁ => ∃ x₂ … xₙ, cond);
+///    …
+///    let xₙ := Classical.epsilon (fun xₙ => cond);
+///    b`
+///   Each εᵢ references the previously-chosen x₁…xᵢ₋₁ through the
+///   enclosing lets — ordinary ∃-witness extraction. The let names are
+///   the binder names, so `cond`/`b` rendered with the standard binder
+///   naming reference them directly.
+///
+/// (The previous SST rendering, `epsilon (fun x => cond ∧ body)`,
+/// conjoined a non-Prop body — ill-typed for every `choose` whose body
+/// isn't a Prop: 2,596 errors / 440 fns on tactus-group-theory. The VIR
+/// rendering ignored `body` entirely — correct only for the `body: None`
+/// form here.)
+///
+/// `l_binders` and `names` run in parallel (same order); callers derive
+/// both from the same VarBinders.
+pub(crate) fn choose_node(
+    l_binders: &[crate::lean_ast::Binder],
+    names: &[LeanName],
+    cond: LExpr,
+    body: Option<LExpr>,
+) -> ExprNode {
+    let Some(body) = body else {
+        debug_assert!(l_binders.len() == 1, "body: None is the single-binder form");
+        return LExpr::app1(
+            LExpr::var_lit("Classical.epsilon"),
+            LExpr::lambda(l_binders.to_vec(), cond),
+        )
+        .node;
+    };
+    skolem_lets(l_binders, names, &cond, body).node
+}
+
+/// The ε-skolemization let-chain shared by `choose_node` and
+/// `choose_witness_hyp`:
+/// `let x₁ := ε(fun x₁ => ∃ x₂ … xₙ, cond); … let xₙ := ε(fun xₙ => cond);
+///  inner`.
+fn skolem_lets(
+    l_binders: &[crate::lean_ast::Binder],
+    names: &[LeanName],
+    cond: &LExpr,
+    inner: LExpr,
+) -> LExpr {
+    let mut out = inner;
+    for i in (0..l_binders.len()).rev() {
+        let eps_cond = if i + 1 < l_binders.len() {
+            LExpr::exists_(l_binders[i + 1..].to_vec(), cond.clone())
+        } else {
+            cond.clone()
+        };
+        let eps = LExpr::app1(
+            LExpr::var_lit("Classical.epsilon"),
+            LExpr::lambda(vec![l_binders[i].clone()], eps_cond),
+        );
+        out = LExpr::let_bind(names[i].clone(), eps, out);
+    }
+    out
+}
+
+/// The witness fact a `choose` carries (DESIGN-lean-all-proofs-bugs.md B2):
+/// `(∃ bs, cond) → (let x₁ := ε₁; …; let xₙ := εₙ; cond)`.
+///
+/// This is `Classical.epsilon_spec` instantiated at the exact ε-terms
+/// `choose_node` renders (single binder: `(∃ x, cond) → cond[ε/x]` up to
+/// zeta-reduction), so assuming it as an obligation hypothesis adds no
+/// axiomatic strength — it mirrors the conditional witness axiom Verus's
+/// Z3 path gets from AIR's `BindX::Choose` skolemization. The ∃'s binders
+/// scope over the antecedent only; the lets rebuild the same skolem terms
+/// in the consequent, closed.
+pub(crate) fn choose_witness_hyp(
+    l_binders: &[crate::lean_ast::Binder],
+    names: &[LeanName],
+    cond: &LExpr,
+) -> LExpr {
+    LExpr::implies(
+        LExpr::exists_(l_binders.to_vec(), cond.clone()),
+        skolem_lets(l_binders, names, cond, cond.clone()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1269,5 +1363,64 @@ mod tests {
             s.contains("deref") && s.contains("Int.toNat") && s.contains(".mk"),
             "expected peel + toNat + rewrap, got {s}",
         );
+    }
+}
+
+#[cfg(test)]
+mod choose_tests {
+    use super::*;
+
+    fn bind(name: &str) -> crate::lean_ast::Binder {
+        crate::lean_ast::Binder::explicit(
+            crate::lean_name::LeanName::synthetic(name.to_string()),
+            LExpr::var_lit("Int"),
+        )
+    }
+    fn nm(name: &str) -> LeanName {
+        crate::lean_name::LeanName::synthetic(name.to_string())
+    }
+    fn cond() -> LExpr {
+        // stand-in for `P x` — an application, definitely a Prop shape
+        LExpr::app1(LExpr::var_lit("P"), LExpr::var_lit("x"))
+    }
+
+    #[test]
+    fn choose_single_var_body_is_bare_epsilon() {
+        // `choose|x| P(x)` (body IS the bound var → passed as None):
+        // `Classical.epsilon (fun x => cond)`. The pre-B2 rendering
+        // conjoined the (Int-typed!) body onto the condition —
+        // `epsilon (fun x => cond ∧ x)` — ill-typed for every choose
+        // whose body isn't a Prop (2,596 errors on tactus-group-theory).
+        let out = LExpr::new(choose_node(&[bind("x")], &[nm("x")], cond(), None));
+        let s = format!("{:?}", out.node);
+        assert!(s.contains("Classical.epsilon"), "epsilon head: {s}");
+        assert!(!s.contains("And"), "no body conjunction: {s}");
+    }
+
+    #[test]
+    fn choose_multi_binder_skolemizes() {
+        // `choose|a, b| P` with compound body: nested epsilons via
+        // `let a := ε(fun a => ∃ b, cond); let b := ε(fun b => cond); body`.
+        let out = LExpr::new(choose_node(
+            &[bind("a"), bind("b")],
+            &[nm("a"), nm("b")],
+            cond(),
+            Some(LExpr::var_lit("body")),
+        ));
+        let s = format!("{:?}", out.node);
+        assert_eq!(s.matches("Classical.epsilon").count(), 2, "one ε per binder: {s}");
+        assert!(s.contains("Exists"), "inner ∃ for later binders: {s}");
+        assert!(s.contains("Let"), "skolem lets: {s}");
+    }
+
+    #[test]
+    fn choose_witness_hyp_shape() {
+        // `(∃ x, cond) → (let x := ε(fun x => cond); cond)` — B2b's
+        // hypothesis; Classical.epsilon_spec at the value's exact ε-term.
+        let out = choose_witness_hyp(&[bind("x")], &[nm("x")], &cond());
+        let s = format!("{:?}", out.node);
+        assert!(s.contains("Exists"), "antecedent ∃: {s}");
+        assert!(s.contains("Classical.epsilon"), "ε in consequent: {s}");
+        assert!(s.contains("Implies") || s.contains("Imp"), "implication: {s}");
     }
 }

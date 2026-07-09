@@ -180,9 +180,20 @@ core Lean).
 
 ## B5. Small families
 
-- **`Option::deref` std spec missing (28 errors):** dot-notation lookup expects
-  `option.Option.deref` to exist; add the std_specs def alongside the existing Option
-  mappings. XS.
+- **`Option` `.deref` emission (28 errors) — REDIAGNOSED during implementation
+  (2026-07-09):** not a missing std-spec def. The receiver of an inlined
+  `&self` spec method (`Option::is_some` → `option is Some`) carries a
+  `Decorate(Ref, …)` on its SST **claimed** typ; the IsVariant arm of
+  `exp_to_typed` (`to_lean_sst_expr.rs` ~687) counts ref-decorations off that
+  claim and emits `.deref` — but the **actual** rendered value (a spec-fn
+  call) is unwrapped, so `.deref` lands on a bare `option.Option` and fails
+  dot-notation lookup. Note the adjacent variant-field access
+  (`.Some_val0`, via `field_proj_opr`) does NOT peel and works — the two
+  arms disagree on claimed-vs-actual. Fix belongs in the typed-spine
+  (P1/P2, DESIGN-typed-renderer.md): the Call arm should report the
+  ACTUAL rendered typ, or the IsVariant arm should count off actual like
+  the Field arm claims to. Small blast radius but touches shared
+  machinery — its own focused arc, NOT a quick patch. S→M.
 - **`Invalid projection … kl has type Int` (10 errors, prop_v.rs):** tuple projection rendered
   against an Int-typed value — likely a let-bound tuple element already substituted by the
   time projection renders. Investigate during B2 (adjacent machinery). P2.

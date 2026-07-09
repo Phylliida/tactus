@@ -61,8 +61,55 @@ fn clauses(f: &FunctionX) -> impl Iterator<Item = &Expr> {
 
 /// Compute, for every function in `all_fns`, which of its type-param
 /// indices need a `[Nonempty T]` binder. See module docs for the model.
-pub fn compute_nonempty_needs<'a>(all_fns: &[&'a FunctionX]) -> NonemptyNeeds<'a> {
+pub fn compute_nonempty_needs<'a>(
+    all_fns: &[&'a FunctionX],
+    // True for datatype paths with >1 variant — their variant-field
+    // accesses render as generated accessors whose unreachable-arm
+    // fallback demands `[Nonempty A]` (Seed 3). Single-variant structs
+    // use Lean's structure projections (no fallback, no bound).
+    is_multi_variant: &dyn Fn(&Path) -> bool,
+) -> NonemptyNeeds<'a> {
     let mut needs: NonemptyNeeds<'a> = HashMap::new();
+
+    // Seed 3 (B4, DESIGN-lean-all-proofs-bugs.md): a fn whose body /
+    // clauses access a VARIANT FIELD of a multi-variant datatype
+    // instantiated over its own type params. The access renders as the
+    // generated accessor (`Option.Some_val0`), whose unreachable-arm
+    // fallback is `Classical.ofNonempty` — an instance-implicit
+    // `[Nonempty A]` per datatype typ param. Seed every own typ param
+    // mentioned in the receiver's typ; the backward call-graph
+    // propagation below and `instance_nonempty_bounds` carry it onto
+    // callers and trait instances (the original failure: vstd's
+    // `DeepView for Option<T>` instance body uses `Some_val0` with no
+    // `[Nonempty T]` on the instance binders).
+    for f in all_fns {
+        let mut seed: HashSet<usize> = HashSet::new();
+        let scan = &mut |e: &Expr| {
+            if let ExprX::UnaryOpr(
+                vir::ast::UnaryOpr::Field(vir::ast::FieldOpr { datatype: Dt::Path(p), .. }),
+                inner,
+            ) = &e.x
+            {
+                if is_multi_variant(p) {
+                    let _ = vir::ast_visitor::typ_visitor_check::<(), _>(
+                        &inner.typ,
+                        &mut |t: &Typ| {
+                            if let TypX::TypParam(name) = &**t {
+                                if let Some(i) = f.typ_params.iter().position(|q| q == name) {
+                                    seed.insert(i);
+                                }
+                            }
+                            Ok(())
+                        },
+                    );
+                }
+            }
+        };
+        for e in clauses(f) { walk_expr(e, scan); }
+        if !seed.is_empty() {
+            needs.entry(&f.name).or_default().params.extend(seed);
+        }
+    }
 
     // Seed 1: a fn that chooses over one of its own type-params.
     for f in all_fns {

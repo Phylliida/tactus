@@ -50,22 +50,36 @@ pub(crate) const TACTIC_BODY_FALLBACK: &str = "sorry";
 /// itself and the datatype `height` fn's `decreasing_by` (which uses a
 /// `simp_all; omega` variant for its `sizeOf`-with-`.deref` goals).
 ///
-/// The three branches, tried in order via `first` (which backtracks
-/// cleanly on a failed branch):
+/// The branches, tried in order via `first` (which backtracks cleanly on
+/// a failed branch — including branches whose head *name doesn't exist*
+/// in this crate's emission, verified empirically, so the seq-companion
+/// branches are safe to include unconditionally):
 /// - `omega` — linear-arithmetic measures: `(n - 1) < n` (fact/pow/fib),
 ///   Nat-subtraction (`(a - b) + b < a + b`, subtractive Euclid).
 /// - `apply Nat.mod_lt <;> omega` — the **modular** obligation `a % b < b`
 ///   (Euclidean gcd), which `omega` *cannot* prove because the divisor
 ///   `b` is a variable, not a literal. `apply` leaves the side goal
 ///   `b > 0`, which `omega` discharges from the `¬ b = 0` branch guard.
+/// - `apply Nat.div_lt_self <;> omega` — the **division** obligation
+///   `a / b < a` (base-conversion loops); side goals `0 < a`, `1 < b`
+///   close from the branch guards.
+/// - `apply Seq.drop_{first,last}_len_lt <;> …` — vstd **seq measures**
+///   `len (drop_first w) < len w`: dispatches to the measure-companion
+///   theorem emitted next to the corresponding def (see
+///   `seq_measure_companion_cmd` in `generate.rs`; B3 in
+///   DESIGN-lean-all-proofs-bugs.md). The side goal `¬ len w = 0` closes
+///   from the branch guard via `assumption`/`simp_all`. In a crate that
+///   never emits the def/companion the `apply` head is unknown and the
+///   branch just fails over.
 /// - `decreasing_tactic` — Lean's default, kept as a final fallback so
 ///   spec fns recursing on a structural / `sizeOf` / datatype-height
-///   measure (which neither earlier branch handles) terminate exactly as
+///   measure (which no earlier branch handles) terminate exactly as
 ///   they do today (those currently pass via the implicit default).
 ///
-/// Tested against Lean 4.25.0 (BUG-spec-fn-decreases-mod-termination.md).
+/// Tested against Lean 4.25.0 (BUG-spec-fn-decreases-mod-termination.md;
+/// div + seq branches: /tmp-prototype validation 2026-07-09, B3).
 const DECREASING_BY_TACTIC: &str =
-    "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | decreasing_tactic)";
+    "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Seq.drop_first_len_lt <;> (first | assumption | simp_all)) | (apply Seq.drop_last_len_lt <;> (first | assumption | simp_all)) | decreasing_tactic)";
 
 /// True when this param needs a body shadow because the shadow is
 /// load-bearing for the **mutation encoding** — `*x = e` lowers to
@@ -292,13 +306,20 @@ pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Vec<Com
             // `--lean-backend` lowering (replaces the old `nat_coercion`
             // pre-pass), so the rendered VIR is already Lean-typed.
             let binder_ctx = crate::to_lean_expr::binder_ctx_from_params(&f.params);
-            let body = wrap_body_with_param_derefs(
-                crate::to_lean_expr::vir_expr_to_ast_with_binders(b, &binder_ctx, &crate::expr_shared::RenderCtx::empty()),
-                &f.params,
-            );
-            let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| {
-                crate::to_lean_expr::vir_expr_to_ast_with_binders(d, &binder_ctx, &crate::expr_shared::RenderCtx::empty())
-            }).collect();
+            // `with_self_decl`: a recursive def's self-call must render
+            // relatively — root-anchoring a not-yet-elaborated global is
+            // `Unknown identifier` (see `to_lean_type::CURRENT_DECL_SELF`).
+            let self_rel = crate::to_lean_type::lean_name_relative(&f.name.path);
+            let (body, termination_by) = crate::to_lean_type::with_self_decl(self_rel, || {
+                let body = wrap_body_with_param_derefs(
+                    crate::to_lean_expr::vir_expr_to_ast_with_binders(b, &binder_ctx, &crate::expr_shared::RenderCtx::empty()),
+                    &f.params,
+                );
+                let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| {
+                    crate::to_lean_expr::vir_expr_to_ast_with_binders(d, &binder_ctx, &crate::expr_shared::RenderCtx::empty())
+                }).collect();
+                (body, termination_by)
+            });
             // Recursive spec fns get an explicit `decreasing_by` so measures
             // Lean's default tactic can't discharge (notably the modular
             // `a % b < b` of Euclidean gcd) still verify. Non-recursive defs
@@ -942,11 +963,23 @@ fn datatype_height_cmd(
     dt: &DatatypeX,
     scc_paths: &std::collections::HashSet<&Path>,
 ) -> Option<Command> {
-    let path = match &dt.name {
-        Dt::Path(p) => lean_name(p),
+    let p = match &dt.name {
+        Dt::Path(p) => p,
         Dt::Tuple(_) => return None,
     };
-    height_fn_for_datatype(dt, &path, scc_paths)
+    // `with_self_decl`: a self-recursive datatype's height def calls
+    // `{Self}.height` in its own body — the self-name must render
+    // relatively (root-anchoring a not-yet-elaborated global is
+    // `Unknown identifier`; see `to_lean_type::CURRENT_DECL_SELF`).
+    // The def's declared name goes relative too — inside the file's
+    // namespace wrapper that declares the same full name.
+    crate::to_lean_type::with_self_decl(
+        crate::to_lean_type::lean_name_relative(p),
+        || {
+            let path = lean_name(p);
+            height_fn_for_datatype(dt, &path, scc_paths)
+        },
+    )
 }
 
 /// Emit `def T.height : T → Nat` alongside the datatype so that
@@ -1208,13 +1241,20 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
     // * `typ_param_pieces`: implicit `{A : Type}` per type param —
     //   needed by both discriminators and accessors (so the input
     //   `x : T A` typechecks).
-    // * `inhabited_bound_pieces`: instance `[Inhabited A]` per type
+    // * `inhabited_bound_pieces`: instance `[Nonempty A]` per type
     //   param — needed by accessors only (the unreachable-arm
-    //   `default` fallback resolves via `Inhabited`). Discriminators
-    //   return `Prop`, no `default` use.
+    //   `Classical.ofNonempty` fallback resolves via `Nonempty`).
+    //   Discriminators return `Prop`, no fallback use. `Nonempty` (not
+    //   `Inhabited`): it's what tactus threads through every generic
+    //   context ([Nonempty A] on broadcast axioms, choose bounds), and
+    //   core's `instNonemptyOfInhabited` lets every Inhabited provider
+    //   (deriving, manual instances) keep satisfying it — strictly wider
+    //   applicability (B4, DESIGN-lean-all-proofs-bugs.md: 713 `failed
+    //   to synthesize Inhabited T` errors from accessors instantiated in
+    //   Nonempty-only generic contexts).
     // * `x_binder`: the `(x : T A)` value parameter — same for both.
     let typ_param_pieces: Vec<LBinder> = typ_param_names.iter().map(|tp| LBinder::typ_param(tp, BinderKind::Implicit)).collect();
-    let inhabited_bound_pieces: Vec<LBinder> = typ_param_names.iter().map(|tp| LBinder::instance(LExpr::app1(LExpr::var_lit("Inhabited"), LExpr::var_tp(tp)))).collect();
+    let inhabited_bound_pieces: Vec<LBinder> = typ_param_names.iter().map(|tp| LBinder::instance(LExpr::app1(LExpr::var_lit("Nonempty"), LExpr::var_tp(tp)))).collect();
     let x_binder = LBinder::explicit(crate::lean_name::LeanName::lit("x"), typed_input.clone());
     let discriminator_binders = || -> Vec<LBinder> {
         let mut bs = typ_param_pieces.clone();
@@ -1320,15 +1360,14 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
             if dt.variants.len() > 1 {
                 arms.push(MatchArm {
                     pattern: LPattern::Wildcard,
-                    // `default` resolves via `[Inhabited α]`, which
-                    // Lean derives automatically for primitive
-                    // types (Int, Nat, Bool) — the types exec-fn
-                    // match-desugaring actually reaches. Users
-                    // with custom field types may need a manual
-                    // `instance : Inhabited Foo := ⟨…⟩`.
-                    // Unreachable anyway when call sites guard
-                    // the accessor with a prior isVariant check.
-                    body: LExpr::var_lit("default"),
+                    // `Classical.ofNonempty` resolves via `[Nonempty α]`
+                    // — the bound tactus threads everywhere (see the
+                    // accessor-binder comment above; B4). The accessor
+                    // is already `noncomputable`, so the classical
+                    // fallback costs nothing. Unreachable anyway when
+                    // call sites guard the accessor with a prior
+                    // isVariant check.
+                    body: LExpr::var_lit("Classical.ofNonempty"),
                 });
             }
             cmds.push(Command::Def(Def {
