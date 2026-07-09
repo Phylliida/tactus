@@ -390,6 +390,8 @@ fn is_lean_keyword(s: &str) -> bool {
         | "if" | "then" | "else" | "let" | "have" | "show" | "by" | "at" | "fun"
         | "forall" | "exists" | "Type" | "Prop" | "Sort" | "import" | "open"
         | "namespace" | "section" | "end" | "variable" | "universe"
+        | "mutual" | "axiom" | "opaque" | "macro" | "syntax" | "notation"
+        | "deriving" | "extends" | "calc" | "from" | "in" | "set_option"
     )
 }
 
