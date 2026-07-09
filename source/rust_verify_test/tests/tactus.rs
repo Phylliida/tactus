@@ -10342,7 +10342,15 @@ test_verify_one_file! {
                 admit
             }
         }
-    } => Ok(())
+    } => Ok(err) => {
+        // `admit` lowers to Lean `sorry` — a soundness escape hatch.
+        // Until the warning-surfacing fix (M5 review arc) it passed
+        // with ZERO signal; now the warning is pinned so escapes stay
+        // visible.
+        assert!(err.warnings.iter().any(|d| d.message.contains("sorry")),
+            "admit/sorry must surface a warning; got: {:?}",
+            err.warnings.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
 }
 
 // Coverage (C5): empty trait. `trait Marker {}` with no methods —
@@ -13184,6 +13192,28 @@ test_verify_one_file_with_options! {
               omega
         }
     } => Ok(())
+}
+
+// Review finding (warning-surfacing): `sorry` in a tactic body under
+// package-check elaborates (Lean treats it as a warning) but must not
+// pass silently — the fn-level check surfaces the warning, and the
+// Link gate's #tactus_check_axioms makes sorryAx FATAL, failing the
+// run. Layered defense, both layers pinned here.
+test_verify_one_file_with_options! {
+    #[test] test_proof_fn_package_check_sorry_caught ["tactus-package-check"] => verus_code! {
+        spec fn double(n: nat) -> nat { n + n }
+
+        proof fn lemma_a(n: nat) ensures double(n) >= 0 by { unfold double; omega }
+
+        proof fn lemma_sneaky(n: nat) ensures double(n) >= n by { sorry }
+    } => Err(err) => {
+        assert!(err.errors.iter().any(|d| d.message.contains("contains sorry")),
+            "the Link gate must reject sorryAx in the closure; got: {:?}",
+            err.errors.iter().map(|d| &d.message).collect::<Vec<_>>());
+        assert!(err.warnings.iter().any(|d| d.message.contains("declaration uses 'sorry'")),
+            "the fn-level check must surface the sorry warning; got: {:?}",
+            err.warnings.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
 }
 
 // M5b: per-member attribution inside a failing mutual module. The

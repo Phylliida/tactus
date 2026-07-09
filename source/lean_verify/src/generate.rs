@@ -1434,8 +1434,28 @@ fn format_lean_check_result(
     file_path: &Path,
     source_map: &LeanSourceMap,
 ) -> CheckResult {
+    // Deliberately narrowed to `sorry` (the soundness escape hatch):
+    // generic Lean warnings are dominated by lints/hints on GENERATED
+    // shapes (defensive termination_by on non-recursive fns, emitted
+    // simp lists) — surfacing them all fights the emitter's own noise.
+    // A broader warning policy is future work (review follow-up).
+    let lean_warnings = |r: &lean_process::LeanResult| -> Vec<String> {
+        r.diagnostics.iter()
+            .filter(|d| d.severity == "warning" && d.data.contains("sorry"))
+            .map(|d| {
+                let formatted = lean_process::format_error(d, source_map);
+                format!("Lean warning in {}: {}",
+                    short_name(&proof_fn.name.path), formatted.message)
+            })
+            .collect()
+    };
     match result {
-        Ok(r) if r.success => CheckResult::Success { warnings: vec![] },
+        // Warning-severity diagnostics (e.g. `declaration uses 'sorry'`)
+        // surface on success — previously dropped by island AND package
+        // paths alike (review finding). The soundness backstop for
+        // sorry stays the Link gate's fatal sorryAx check; this is the
+        // fn-level signal.
+        Ok(r) if r.success => CheckResult::Success { warnings: lean_warnings(&r) },
         Ok(r) => {
             let fn_short = short_name(&proof_fn.name.path);
             let header = format!("Lean tactic failed for {}", fn_short);
@@ -1467,7 +1487,7 @@ fn format_lean_check_result(
             } else {
                 errors
             };
-            CheckResult::Failed { errors, warnings: vec![] }
+            CheckResult::Failed { errors, warnings: lean_warnings(&r) }
         }
         Err(e) => CheckResult::Error(e),
     }
@@ -1622,18 +1642,13 @@ fn check_proof_fn_via_package(
         krate, proof_fn, tactic_body, imports, crate_name, tactic_bodies, &defs,
     ) {
         Ok(PkgEmitOutcome::Single { leaf, path, source_map }) => {
+            // One `--json -o` pass: olean for the Link gate AND parsed
+            // diagnostics, so warnings survive the fast path.
             let pkg_dir = path.parent().expect("pkg file has a parent").to_path_buf();
-            let mut failures: Vec<(String, String)> = Vec::new();
-            run_lean(&pkg_dir, &leaf, true, &base_path, &mut failures);
-            if failures.is_empty() {
+            let result = run_lean_json(&pkg_dir, &leaf, true, &base_path);
+            if matches!(&result, Ok(r) if r.success) {
                 record_pkg_olean_built(&path);
-                return Some(CheckResult::Success { warnings: vec![] });
             }
-            // Diagnostic pass — identical pipeline to the island path.
-            let dir = project::default_project_dir();
-            let lake_dir = if project::project_ready(&dir) { Some(dir.as_path()) } else { None };
-            let extra_paths: Vec<&Path> = vec![&prelude_dir, &defs.dir];
-            let result = lean_process::check_lean_file(&path, lake_dir, &extra_paths);
             Some(format_lean_check_result(result, proof_fn, &path, &source_map))
         }
         Ok(PkgEmitOutcome::Mutual { leaf, path, members }) => {
@@ -1642,28 +1657,42 @@ fn check_proof_fn_via_package(
                 let mut m = memo.lock().unwrap_or_else(|p| p.into_inner());
                 m.entry(path.clone()).or_insert_with(|| {
                     let pkg_dir = path.parent().expect("pkg file has a parent");
-                    let mut failures: Vec<(String, String)> = Vec::new();
-                    run_lean(pkg_dir, &leaf, true, &base_path, &mut failures);
-                    if failures.is_empty() {
-                        return std::sync::Arc::new(MutualVerdict {
-                            success: true, diagnostics: vec![],
-                        });
+                    // One `--json -o` pass; diagnostics stored on
+                    // success too, so members can surface own-region
+                    // WARNINGS (sorry etc.), not just errors.
+                    match run_lean_json(pkg_dir, &leaf, true, &base_path) {
+                        Ok(r) => std::sync::Arc::new(MutualVerdict {
+                            success: r.success, diagnostics: r.diagnostics,
+                        }),
+                        Err(_) => std::sync::Arc::new(MutualVerdict {
+                            success: false, diagnostics: vec![],
+                        }),
                     }
-                    // Diagnostic pass — capture parsed --json output for
-                    // region attribution.
-                    let dir = project::default_project_dir();
-                    let lake_dir = if project::project_ready(&dir) { Some(dir.as_path()) } else { None };
-                    let extra: Vec<&Path> = vec![&prelude_dir, &defs.dir];
-                    let diagnostics = match lean_process::check_lean_file(&path, lake_dir, &extra) {
-                        Ok(r) => r.diagnostics,
-                        Err(_) => vec![],
-                    };
-                    std::sync::Arc::new(MutualVerdict { success: false, diagnostics })
                 }).clone()
+            };
+            let me_early = members.iter().find(|m| m.fun == proof_fn.name)
+                .expect("proof fn is a member of its own SCC module");
+            let owner_start_of = |line: usize| members.iter()
+                .filter(|m| m.tactic_start <= line)
+                .map(|m| m.tactic_start)
+                .max();
+            let own_region = |d: &lean_process::LeanDiagnostic| {
+                match d.pos.as_ref().map(|p| owner_start_of(p.line)) {
+                    Some(Some(start)) => start == me_early.tactic_start,
+                    _ => true, // module-level: attributed to everyone
+                }
             };
             if verdict.success {
                 record_pkg_olean_built(&path);
-                return Some(CheckResult::Success { warnings: vec![] });
+                let warnings: Vec<String> = verdict.diagnostics.iter()
+                    .filter(|d| d.severity == "warning" && d.data.contains("sorry"))
+                    .filter(|d| own_region(d))
+                    .map(|d| {
+                        let formatted = lean_process::format_error(d, &me_early.source_map);
+                        format!("Lean warning in {}: {}", me_early.short, formatted.message)
+                    })
+                    .collect();
+                return Some(CheckResult::Success { warnings });
             }
             // Verdict is module-level — mutual members are an
             // INSEPARABLE unit (each cites the other), so every member
@@ -1671,20 +1700,10 @@ fn check_proof_fn_via_package(
             // an error belongs to the member whose tactic region
             // contains it; errors before the first region (imports /
             // preamble) belong to everyone.
-            let me = members.iter().find(|m| m.fun == proof_fn.name)
-                .expect("proof fn is a member of its own SCC module");
-            let owner_start = |line: usize| members.iter()
-                .filter(|m| m.tactic_start <= line)
-                .map(|m| m.tactic_start)
-                .max();
+            let me = me_early;
             let own: Vec<lean_process::LeanDiagnostic> = verdict.diagnostics.iter()
                 .filter(|d| d.severity == "error")
-                .filter(|d| match d.pos.as_ref().map(|p| owner_start(p.line)) {
-                    Some(Some(start)) => start == me.tactic_start,
-                    // No position / before first region → module-level,
-                    // attributed to every member.
-                    _ => true,
-                })
+                .filter(|d| own_region(d))
                 .cloned()
                 .collect();
             Some(if own.is_empty() {
@@ -2170,6 +2189,55 @@ pub fn check_package(
     })
 }
 
+/// Prepend `lean_path` to any inherited `LEAN_PATH` — one definition
+/// shared by the plain and `--json` lean runners (review finding:
+/// this merge was drifting toward four inline copies).
+fn merged_lean_path(lean_path: &str) -> String {
+    match std::env::var("LEAN_PATH") {
+        Ok(existing) if !existing.is_empty() => format!("{}:{}", lean_path, existing),
+        _ => lean_path.to_string(),
+    }
+}
+
+/// Run `lean --json` on `<module>.lean` with cwd `dir` (same cwd /
+/// module-name constraint as `run_lean`), optionally producing the
+/// olean, and parse the diagnostics — success is exit-ok AND no
+/// error-severity diagnostic, mirroring `check_lean_file`. One pass
+/// gives the package-check path both its olean and its warnings
+/// (review finding: the exit-code-only fast path silently dropped
+/// warning diagnostics, `sorry`'s included — on BOTH this path and,
+/// historically, islands).
+fn run_lean_json(
+    dir: &Path,
+    module: &str,
+    produce_olean: bool,
+    lean_path: &str,
+) -> Result<lean_process::LeanResult, String> {
+    let mut args: Vec<String> = vec!["--json".to_string()];
+    if produce_olean {
+        args.push("-o".to_string());
+        args.push(format!("{}.olean", module));
+    }
+    args.push(format!("{}.lean", module));
+    let output = std::process::Command::new("lean")
+        .args(&args)
+        .current_dir(dir)
+        .env("LEAN_PATH", merged_lean_path(lean_path))
+        .output()
+        .map_err(|e| format!("failed to spawn lean: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let diagnostics = lean_process::parse_diagnostics(&stdout);
+    let has_error = diagnostics.iter().any(|d| d.severity == "error");
+    let success = output.status.success() && !has_error;
+    if !success && diagnostics.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            return Err(format!("Lean failed: {}", stderr.trim()));
+        }
+    }
+    Ok(lean_process::LeanResult { success, diagnostics })
+}
+
 /// Run `lean` on `<module>.lean` with cwd `dir` (so `-o` derives the
 /// module name from the bare file name — same constraint as
 /// `crate_defs::build_olean`), optionally producing the olean.
@@ -2188,16 +2256,10 @@ fn run_lean(
         args.push(format!("{}.olean", module));
     }
     args.push(format!("{}.lean", module));
-    let existing = std::env::var("LEAN_PATH").unwrap_or_default();
-    let env = if existing.is_empty() {
-        lean_path.to_string()
-    } else {
-        format!("{}:{}", lean_path, existing)
-    };
     match std::process::Command::new("lean")
         .args(&args)
         .current_dir(dir)
-        .env("LEAN_PATH", env)
+        .env("LEAN_PATH", merged_lean_path(lean_path))
         .output()
     {
         Ok(out) if out.status.success() => {}
