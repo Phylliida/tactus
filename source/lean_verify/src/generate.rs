@@ -1599,6 +1599,29 @@ fn emit_package_proof_fn(
     let proof_fn = inlined_krate.functions.iter()
         .find(|f| f.x.name == proof_fn.name).map(|f| &f.x)
         .expect("root proof fn present in inlined krate");
+    // Mutual SCC route (M3.5): fns on a direct-reference cycle emit as
+    // ONE canonical module holding a `mutual … end` block — within-SCC
+    // references stay direct (same block), `termination_by` comes from
+    // each member's `decreases`. Only supported when the SCC has no
+    // EXTERNAL helper deps (see `scc_external_deps`).
+    {
+        let (fns, deps_of) = package_dep_graph(&inlined_krate, tactic_bodies);
+        if let Some(scc) = package_scc_of(proof_fn, &fns, &deps_of) {
+            let ext = scc_external_deps(&scc, &deps_of);
+            if !ext.is_empty() {
+                return Err(format!(
+                    "mutual tactic SCC {{{}}} has helper deps outside the SCC ({}) — \
+                     unsupported: external deps arrive as hypothesis binders, which \
+                     verbatim mutual references cannot pass",
+                    scc.iter().map(|f| short_name(&f.name.path)).collect::<Vec<_>>().join(", "),
+                    ext.iter().map(|f| short_name(&f.name.path)).collect::<Vec<_>>().join(", "),
+                ));
+            }
+            return emit_package_mutual_scc(
+                &inlined_krate, &scc, imports, crate_name, tactic_bodies, defs, &stmts,
+            );
+        }
+    }
     let mut file_imports: Vec<String> = imports.to_vec();
     file_imports.push(stmts_module_name(defs));
     let (mut cmds, ns) = krate_preamble(
@@ -1640,6 +1663,68 @@ fn emit_package_proof_fn(
     write_lean_file(&path, &rendered.text)
 }
 
+/// Mutual-SCC-module memo: written once per canonical path per
+/// process (every member's emission call routes here; first writes,
+/// the rest skip).
+static MUTUAL_MEMO: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+> = std::sync::OnceLock::new();
+
+/// Package module for a mutual tactic SCC: one file, all members'
+/// theorems in a `mutual … end` block (the M0 probe's `MutualEO`
+/// shape). No hypothesis binders — the SCC has no external deps
+/// (caller checked) and within-SCC references resolve inside the
+/// block. Known limitation: fn-level Mathlib imports are taken from
+/// whichever member's emission call writes first; a member-specific
+/// import missing from the first writer surfaces as a Lean error at
+/// package elaboration (M4), not silently.
+fn emit_package_mutual_scc(
+    inlined_krate: &KrateX,
+    scc: &[&FunctionX],
+    imports: &[String],
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    defs: &crate::crate_defs::CrateDefs,
+    stmts: &std::sync::Arc<Vec<Command>>,
+) -> Result<(), String> {
+    let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
+        .join(format!("{}.lean", mutual_module_leaf(scc)));
+    {
+        let memo = MUTUAL_MEMO.get_or_init(Default::default);
+        if !memo.lock().unwrap_or_else(|p| p.into_inner()).insert(path.clone()) {
+            return Ok(()); // already written by another member's call
+        }
+    }
+    let mut file_imports: Vec<String> = imports.to_vec();
+    file_imports.push(stmts_module_name(defs));
+    let (mut cmds, ns) = krate_preamble(
+        inlined_krate, &file_imports, crate_name, scc,
+        PreambleConfig::ProofFnPackage, &[], tactic_bodies, &[], Some(defs),
+    );
+    let ectx = crate::emit_ctx::EmitCtx::build(inlined_krate, tactic_bodies);
+    let block: Vec<Command> = scc.iter()
+        .map(|f| {
+            let body = tactic_bodies.get(&f.name)
+                .ok_or_else(|| format!("no tactic body for SCC member {}", short_name(&f.name.path)))?;
+            Ok(Command::Theorem(to_lean_fn::proof_fn_to_ast(f, body, &ectx)))
+        })
+        .collect::<Result<_, String>>()?;
+    cmds.push(Command::Mutual(block));
+    cmds.push(Command::NamespaceClose(ns));
+    #[cfg(debug_assertions)]
+    {
+        let concat: Vec<Command> = defs.cmds.iter()
+            .chain(stmts.iter())
+            .chain(cmds.iter())
+            .cloned().collect();
+        debug_check(&concat)?;
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = &stmts;
+    let rendered = pp_commands(&cmds);
+    write_lean_file(&path, &rendered.text)
+}
+
 /// A fn's DIRECT tactic-referenced helper lemmas, in krate order —
 /// the single enumeration shared by `emit_package_proof_fn` (hypothesis
 /// binder order) and `link_for_crate` (closed-form application order).
@@ -1658,6 +1743,94 @@ fn direct_helper_deps<'a>(
         .filter(|f| f.name != root.name
             && ident_appears(&code, short_name(&f.name.path)))
         .collect()
+}
+
+/// The direct-reference graph over all emittable tactic proof fns:
+/// (nodes in krate order, node → direct deps). Shared by the SCC
+/// detection in `emit_package_proof_fn` and the topo walk in
+/// `build_link_module` so the two views of the graph cannot diverge.
+fn package_dep_graph<'a>(
+    krate: &'a KrateX,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> (Vec<&'a FunctionX>, std::collections::HashMap<&'a Fun, Vec<&'a FunctionX>>) {
+    let fns: Vec<&FunctionX> = krate.functions.iter()
+        .map(|f| &f.x)
+        .filter(|f| is_emittable_tactic_proof_fn(f, tactic_bodies))
+        .collect();
+    let deps_of = fns.iter()
+        .map(|f| {
+            let body = tactic_bodies.get(&f.name).map(|s| s.as_str()).unwrap_or("");
+            (&f.name, direct_helper_deps(f, body, krate, tactic_bodies))
+        })
+        .collect();
+    (fns, deps_of)
+}
+
+/// The mutual SCC containing `root`, if any: members (in krate order)
+/// that both reach and are reached by `root` in the direct-reference
+/// graph. `None` for the common non-mutual case (singleton SCC —
+/// self-recursion is handled by `termination_by` on the single
+/// theorem, not by a mutual block).
+fn package_scc_of<'a>(
+    root: &FunctionX,
+    fns: &[&'a FunctionX],
+    deps_of: &std::collections::HashMap<&'a Fun, Vec<&'a FunctionX>>,
+) -> Option<Vec<&'a FunctionX>> {
+    fn reach<'a>(
+        from: &Fun,
+        edges: impl Fn(&Fun) -> Vec<&'a Fun>,
+    ) -> std::collections::HashSet<&'a Fun> {
+        let mut seen: std::collections::HashSet<&Fun> = Default::default();
+        let mut stack: Vec<&Fun> = edges(from);
+        while let Some(n) = stack.pop() {
+            if seen.insert(n) {
+                stack.extend(edges(n));
+            }
+        }
+        seen
+    }
+    let fwd = reach(&root.name, |n| {
+        deps_of.get(n).into_iter().flatten().map(|f| &f.name).collect()
+    });
+    if !fwd.contains(&root.name) {
+        return None; // root not on any cycle
+    }
+    let bwd = reach(&root.name, |n| {
+        deps_of.iter()
+            .filter(|(_, ds)| ds.iter().any(|d| &d.name == n))
+            .map(|(k, _)| *k)
+            .collect()
+    });
+    let members: Vec<&FunctionX> = fns.iter()
+        .filter(|f| fwd.contains(&f.name) && bwd.contains(&f.name))
+        .copied()
+        .collect();
+    (members.len() > 1).then_some(members)
+}
+
+/// A mutual SCC's helper deps OUTSIDE the SCC (union over members,
+/// deduped, krate order). Must be EMPTY for the SCC to be package-
+/// emittable: external deps arrive as hypothesis binders, and a
+/// mutual reference in verbatim tactic text (`lemma_odd k`) cannot
+/// pass hypothesis arguments the user never wrote.
+fn scc_external_deps<'a>(
+    scc: &[&'a FunctionX],
+    deps_of: &std::collections::HashMap<&'a Fun, Vec<&'a FunctionX>>,
+) -> Vec<&'a FunctionX> {
+    let member_names: std::collections::HashSet<&Fun> =
+        scc.iter().map(|f| &f.name).collect();
+    let mut seen: std::collections::HashSet<&Fun> = Default::default();
+    scc.iter()
+        .flat_map(|f| deps_of.get(&f.name).into_iter().flatten().copied())
+        .filter(|d| !member_names.contains(&d.name) && seen.insert(&d.name))
+        .collect()
+}
+
+/// Canonical pkg module leaf for a mutual SCC: `mutual__<first member
+/// leaf>` (krate order — deterministic, and cannot collide with a
+/// single-fn leaf).
+fn mutual_module_leaf(scc: &[&FunctionX]) -> String {
+    format!("mutual__{}", lean_name(&scc[0].name.path).replace('.', "__"))
 }
 
 /// Lean module name of the crate's Link module, scope-consistent with
@@ -1727,20 +1900,31 @@ fn build_link_module(
 ) -> Result<(), String> {
     use crate::lean_ast::{Def, Expr as LExpr};
     let inlined_krate = crate::inline_spec::inline_marked_in_krate(krate);
-    let fns: Vec<&FunctionX> = inlined_krate.functions.iter()
-        .map(|f| &f.x)
-        .filter(|f| is_emittable_tactic_proof_fn(f, tactic_bodies))
-        .collect();
+    let (fns, deps_of) = package_dep_graph(&inlined_krate, tactic_bodies);
+    // Partition mutual SCCs: SUPPORTED (no external deps — emitted as
+    // one mutual-block module, M3.5) get eta-closed FIRST and their
+    // members pre-marked Black; UNSUPPORTED (external deps) fall
+    // through to the cycle-poisoning DFS below, matching the emission
+    // side's rejection.
+    let mut supported_sccs: Vec<Vec<&FunctionX>> = Vec::new();
+    let mut in_supported: std::collections::HashSet<&Fun> = Default::default();
+    for f in &fns {
+        if in_supported.contains(&f.name) {
+            continue;
+        }
+        if let Some(scc) = package_scc_of(f, &fns, &deps_of) {
+            if scc_external_deps(&scc, &deps_of).is_empty() {
+                for m in &scc {
+                    in_supported.insert(&m.name);
+                }
+                supported_sccs.push(scc);
+            }
+        }
+    }
     // Dependency order via DFS post-order over direct refs, with
-    // tri-state marks for cycle detection. Cycle members are excluded
-    // (their pkg theorems exist but cannot be closed acyclically —
-    // exactly the mutual-tactic-lemma shape islands can't express).
-    let deps_of: std::collections::HashMap<&Fun, Vec<&FunctionX>> = fns.iter()
-        .map(|f| {
-            let body = tactic_bodies.get(&f.name).map(|s| s.as_str()).unwrap_or("");
-            (&f.name, direct_helper_deps(f, body, &inlined_krate, tactic_bodies))
-        })
-        .collect();
+    // tri-state marks for cycle detection. Remaining cycle members
+    // (unsupported SCCs) are excluded — their pkg theorems were
+    // rejected at emission for the same reason.
     #[derive(Clone, Copy, PartialEq)]
     enum Mark { White, Gray, Black }
     fn visit<'a>(
@@ -1774,6 +1958,14 @@ fn build_link_module(
         ok
     }
     let mut marks = std::collections::HashMap::new();
+    // Supported-SCC members are pre-marked Black (already closed via
+    // their mutual module, emitted before the ordered loop) so
+    // dependents pass straight through them.
+    for scc in &supported_sccs {
+        for m in scc {
+            marks.insert(&m.name, Mark::Black);
+        }
+    }
     let mut ordered: Vec<&FunctionX> = Vec::new();
     let mut cyclic: Vec<String> = Vec::new();
     for f in &fns {
@@ -1802,6 +1994,9 @@ fn build_link_module(
     let mut cmds: Vec<Command> = Vec::new();
     cmds.push(Command::Import(defs.module_name.clone()));
     cmds.push(Command::Import(stmts_module_name(defs)));
+    for scc in &supported_sccs {
+        cmds.push(Command::Import(mutual_module_leaf(scc)));
+    }
     for f in &ordered {
         cmds.push(Command::Import(lean_name(&f.name.path).replace('.', "__")));
     }
@@ -1810,9 +2005,30 @@ fn build_link_module(
     cmds.push(Command::NamespaceOpen(ns.clone()));
     if !cyclic.is_empty() {
         cmds.push(Command::Raw(format!(
-            "-- SKIPPED (cyclic tactic references, cannot close acyclically): {}\n",
+            "-- SKIPPED (cyclic tactic references with SCC-external helper deps, \
+             cannot close): {}\n",
             cyclic.join(", ")
         )));
+    }
+    // Mutual SCC members close by eta (parameterized theorem type is
+    // definitionally the stmt abbrev — M0 finding F3); no deps by
+    // construction, so they precede everything.
+    for scc in &supported_sccs {
+        for f in scc {
+            let name = lean_name(&f.name.path);
+            cmds.push(Command::Def(Def {
+                attrs: Vec::new(),
+                name: format!("{}_closed", name),
+                binders: Vec::new(),
+                ret_ty: LExpr::var_lit(&to_lean_fn::stmt_name(&f.name.path)),
+                body: LExpr::var_lit(&name),
+                termination_by: Vec::new(),
+                decreasing_by: None,
+            }));
+            cmds.push(Command::Raw(format!(
+                "#tactus_check_axioms {}_closed [{}]\n", name, boundary_list
+            )));
+        }
     }
     for f in &ordered {
         let name = lean_name(&f.name.path);

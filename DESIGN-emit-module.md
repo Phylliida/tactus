@@ -320,6 +320,26 @@ pure Lean core, no Mathlib needed for any architectural question.
 Net: **no blockers found; two design corrections (F2, F3) folded into §2.2 and
 §4.3.** M1 can start on this shape directly.
 
+**M3.5 status (same day): mutual tactic SCCs SUPPORTED in package mode —
+a capability islands don't have.** Empirically established first: mutual
+tactic-body proof fns FAIL island emission today (8 errors on an
+even/odd pair — each island emits its helper before the root, and the
+helper cites the root; the existing `Command::Mutual` machinery serves
+spec fns only). Package mode fixes this: fns on a direct-reference cycle
+emit as ONE canonical module (`pkg/mutual__<first-leaf>.lean`) holding a
+`mutual … end` block — verbatim tactic bodies, within-SCC references
+direct, `termination_by` from each member's `decreases` (the M0 probe's
+`MutualEO` shape, now generator-emitted). Link eta-closes each member
+(F3) with closure checks. **Supported iff the SCC has no external helper
+deps**: external deps arrive as hypothesis binders, and a verbatim
+mutual reference (`lemma_odd k`) cannot pass hypothesis arguments the
+user never wrote — such SCCs are rejected at emission with a message
+saying exactly that, and Link skips them with an artifact comment.
+E2e: even/odd crate → mutual module + Link elaborate green, closure
+checks pass. Drive-by fix: `is_lean_keyword` was missing `mutual` (and
+`axiom`/`opaque`/`macro`/…) — a crate literally named `mutual` produced
+an unescaped `namespace mutual`; pre-existing, affects islands too.
+
 **M3 status (same day): Link + Boundary + axiom-closure check LANDED, e2e-validated.**
 `TactusLink_<scope>.lean` (in `pkg/`, memoized per scope like Stmts) closes
 every tactic proof fn in dependency order:
