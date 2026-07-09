@@ -2611,6 +2611,7 @@ impl Verifier {
         // Package emission (DESIGN-emit-module.md M2) — same process-
         // global pattern; consulted inside `emit_proof_fn`.
         lean_verify::generate::set_package_enabled(self.args.tactus_emit_module);
+        lean_verify::generate::set_package_check_enabled(self.args.tactus_package_check);
 
         let time_verify_sequential_start = Instant::now();
 
@@ -3304,7 +3305,7 @@ impl Verifier {
         // kernel-checked composition + axiom-closure claims part of the
         // run's verdict. `--emit-lean` stays codegen-only.
         if result.is_ok()
-            && self.args.tactus_emit_module
+            && (self.args.tactus_emit_module || self.args.tactus_package_check)
             && !self.args.emit_lean
             && !self.args.no_verify
         {

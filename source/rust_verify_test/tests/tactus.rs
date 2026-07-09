@@ -13136,6 +13136,69 @@ test_verify_one_file_with_options! {
     } => Ok(())
 }
 
+// Package-check smoke (M5a, DESIGN-emit-module.md §M5): tactic proof
+// fns verify via their package modules instead of islands. Same chain
+// as the emission smoke; a failure anywhere in the package route
+// (emission, olean build, Link gate) fails this test.
+test_verify_one_file_with_options! {
+    #[test] test_proof_fn_package_check_smoke ["tactus-package-check"] => verus_code! {
+        spec fn double(n: nat) -> nat { n + n }
+
+        proof fn lemma_a(n: nat) ensures double(n) >= 0 by { unfold double; omega }
+
+        proof fn lemma_b(n: nat) ensures double(n) >= 0 by {
+            have h := lemma_a n
+            exact h
+        }
+    } => Ok(())
+}
+
+// M5 headline: mutual tactic proof fns FAIL island verification
+// (forward references — pinned by the 8-error observation in
+// DESIGN-emit-module.md §M3.5) but VERIFY under package-check, where
+// the SCC emits as one `mutual … end` module. This is the first shape
+// package-check verifies that islands cannot.
+test_verify_one_file_with_options! {
+    #[test] test_proof_fn_package_check_mutual_green ["tactus-package-check"] => verus_code! {
+        spec fn dbl(n: nat) -> nat { n + n }
+
+        proof fn lemma_even(n: nat)
+            ensures dbl(n) >= 0
+            decreases n
+        by {
+            match n with
+            | 0 => omega
+            | k + 1 =>
+              have h := lemma_odd k
+              omega
+        }
+
+        proof fn lemma_odd(n: nat)
+            ensures dbl(n) + 1 >= 1
+            decreases n
+        by {
+            match n with
+            | 0 => omega
+            | k + 1 =>
+              have h := lemma_even k
+              omega
+        }
+    } => Ok(())
+}
+
+// Package-check must REJECT a failing tactic (errors can't slip
+// through the package route) and the diagnostic goes through the
+// same source-map pipeline as islands.
+test_verify_one_file_with_options! {
+    #[test] test_proof_fn_package_check_failing_tactic ["tactus-package-check"] => verus_code! {
+        proof fn bogus(n: nat) ensures n >= 1 by { omega }
+    } => Err(err) => {
+        assert!(err.errors.iter().any(|d| d.message.contains("Lean tactic failed for bogus")),
+            "package-check failure must go through the shared diagnostics pipeline; got: {:?}",
+            err.errors.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+}
+
 // A `--` comment in a proof fn's body that merely *mentions* its caller
 // must NOT pull the caller into the file (strip_lean_line_comments) —
 // otherwise `caller`, declared before `base`, forward-references it.

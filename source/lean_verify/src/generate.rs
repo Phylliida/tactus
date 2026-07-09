@@ -1262,7 +1262,7 @@ pub fn emit_proof_fn(
                 match emit_package_proof_fn(
                     krate, proof_fn, tactic_body, imports, crate_name, tactic_bodies, d,
                 ) {
-                    Ok(PkgEmitOutcome::Single(_)) | Ok(PkgEmitOutcome::Mutual(_)) => {}
+                    Ok(PkgEmitOutcome::Single { .. }) | Ok(PkgEmitOutcome::Mutual { .. }) => {}
                     Ok(PkgEmitOutcome::UnsupportedScc(reason)) => eprintln!(
                         "tactus: package emission skipped for `{}`: {}",
                         short_name(&proof_fn.name.path), reason
@@ -1379,6 +1379,17 @@ pub fn check_proof_fn(
     crate_name: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> CheckResult {
+    // Package-check route (M5a, --tactus-package-check): tactic proof
+    // fns verify via their PACKAGE module instead of an island. `None`
+    // = the route can't run (defs unavailable) — fall through to the
+    // island path below.
+    if package_check_enabled() {
+        if let Some(result) = check_proof_fn_via_package(
+            krate, proof_fn, tactic_body, imports, crate_name, tactic_bodies,
+        ) {
+            return result;
+        }
+    }
     // Build (or fetch) the shared defs module FIRST: `emit_proof_fn`'s
     // internal lookup is a memo hit on whatever this call cached, so
     // the emitted import and the built artifact can't disagree. A
@@ -1411,7 +1422,18 @@ pub fn check_proof_fn(
         extra_paths.push(&d.dir);
     }
     let result = lean_process::check_lean_file(&file_path, lake_dir, &extra_paths);
+    format_lean_check_result(result, proof_fn, &file_path, &source_map)
+}
 
+/// Shared diagnostics chokepoint for island AND package-check proof-fn
+/// failures: format Lean's `--json` diagnostics through the source map
+/// so both paths point at identical Rust spans.
+fn format_lean_check_result(
+    result: Result<lean_process::LeanResult, String>,
+    proof_fn: &FunctionX,
+    file_path: &Path,
+    source_map: &LeanSourceMap,
+) -> CheckResult {
     match result {
         Ok(r) if r.success => CheckResult::Success { warnings: vec![] },
         Ok(r) => {
@@ -1422,7 +1444,7 @@ pub fn check_proof_fn(
             let errors: Vec<TactusDiag> = r.diagnostics.iter()
                 .filter(|d| d.severity == "error")
                 .map(|d| {
-                    let formatted = lean_process::format_error(d, &source_map);
+                    let formatted = lean_process::format_error(d, source_map);
                     TactusDiag {
                         message: format!("{}:\n\n{}", header, formatted.message),
                         location: formatted.location,
@@ -1476,6 +1498,156 @@ pub fn set_package_enabled(on: bool) {
 }
 fn package_enabled() -> bool {
     PACKAGE_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+static PACKAGE_CHECK_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Called once from the verifier with `args.tactus_package_check`
+/// (M5a). Package-check subsumes package EMISSION for the fns it
+/// covers, but the emit-hook flag stays independent — gate mode and
+/// check mode are separate dials.
+pub fn set_package_check_enabled(on: bool) {
+    PACKAGE_CHECK_ENABLED.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+fn package_check_enabled() -> bool {
+    PACKAGE_CHECK_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Mutual-module verdict memo (M5a interim): the first member's check
+/// elaborates the SCC's module; every member shares the verdict.
+/// Per-member line-region attribution lands in M5b.
+static MUTUAL_CHECK_MEMO: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Result<(), String>>>,
+> = std::sync::OnceLock::new();
+
+/// Stmts-olean memo for the package-check path: the `.lean` is written
+/// by `stmts_for_crate`; this builds its olean once per scope per
+/// process (pkg modules import it). `Err` is cached — fail once, not
+/// once per fn.
+static STMTS_OLEAN_MEMO: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Result<(), String>>>,
+> = std::sync::OnceLock::new();
+
+fn ensure_stmts_olean(
+    krate: &KrateX,
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    defs: &crate::crate_defs::CrateDefs,
+    prelude_dir: &Path,
+) -> Result<(), String> {
+    let key = stmts_module_name(defs);
+    let memo = STMTS_OLEAN_MEMO.get_or_init(Default::default);
+    let mut m = memo.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(v) = m.get(&key) {
+        return v.clone();
+    }
+    let result = (|| {
+        stmts_for_crate(krate, crate_name, tactic_bodies, defs)
+            .ok_or("Stmts module build failed")?;
+        let base_path = format!("{}:{}", prelude_dir.display(), defs.dir.display());
+        let mut failures: Vec<(String, String)> = Vec::new();
+        run_lean(&defs.dir, &key, true, &base_path, &mut failures);
+        match failures.pop() {
+            None => Ok(()),
+            Some((_, out)) => Err(format!("stmts olean build failed:\n{}", out)),
+        }
+    })();
+    m.insert(key, result.clone());
+    result
+}
+
+/// Verify one tactic proof fn via its package module (M5a). Two-phase:
+/// `lean -o` builds the olean — the fast path, and the olean is
+/// exactly what the crate-end Link pass needs — and only on failure do
+/// we re-run through `check_lean_file --json` for span-mapped
+/// diagnostics (failures are the rare case; the double elaboration
+/// prices in only where a human is about to read output).
+fn check_proof_fn_via_package(
+    krate: &KrateX,
+    proof_fn: &FunctionX,
+    tactic_body: &str,
+    imports: &[String],
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> Option<CheckResult> {
+    install_emit_tables(krate);
+    let defs = match crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true) {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "tactus: package-check: shared defs unavailable; island check for `{}`",
+                short_name(&proof_fn.name.path)
+            );
+            return None;
+        }
+    };
+    let prelude_dir = match crate::prelude::ensure_prelude_olean() {
+        Ok(d) => d,
+        Err(e) => return Some(CheckResult::Error(e)),
+    };
+    if let Err(e) = ensure_stmts_olean(krate, crate_name, tactic_bodies, &defs, &prelude_dir) {
+        return Some(CheckResult::Error(e));
+    }
+    let base_path = format!("{}:{}", prelude_dir.display(), defs.dir.display());
+    match emit_package_proof_fn(
+        krate, proof_fn, tactic_body, imports, crate_name, tactic_bodies, &defs,
+    ) {
+        Ok(PkgEmitOutcome::Single { leaf, path, source_map }) => {
+            let pkg_dir = path.parent().expect("pkg file has a parent").to_path_buf();
+            let mut failures: Vec<(String, String)> = Vec::new();
+            run_lean(&pkg_dir, &leaf, true, &base_path, &mut failures);
+            if failures.is_empty() {
+                return Some(CheckResult::Success { warnings: vec![] });
+            }
+            // Diagnostic pass — identical pipeline to the island path.
+            let dir = project::default_project_dir();
+            let lake_dir = if project::project_ready(&dir) { Some(dir.as_path()) } else { None };
+            let extra_paths: Vec<&Path> = vec![&prelude_dir, &defs.dir];
+            let result = lean_process::check_lean_file(&path, lake_dir, &extra_paths);
+            Some(format_lean_check_result(result, proof_fn, &path, &source_map))
+        }
+        Ok(PkgEmitOutcome::Mutual { leaf, path }) => {
+            let memo = MUTUAL_CHECK_MEMO.get_or_init(Default::default);
+            let verdict = {
+                let mut m = memo.lock().unwrap_or_else(|p| p.into_inner());
+                m.entry(path.clone()).or_insert_with(|| {
+                    let pkg_dir = path.parent().expect("pkg file has a parent");
+                    let mut failures: Vec<(String, String)> = Vec::new();
+                    run_lean(pkg_dir, &leaf, true, &base_path, &mut failures);
+                    match failures.pop() {
+                        None => Ok(()),
+                        Some((_, out)) => Err(out),
+                    }
+                }).clone()
+            };
+            Some(match verdict {
+                Ok(()) => CheckResult::Success { warnings: vec![] },
+                Err(out) => CheckResult::Failed {
+                    errors: vec![TactusDiag {
+                        message: format!(
+                            "Lean mutual module `{}` failed (member `{}`; per-member \
+                             attribution lands in M5b):\n{}",
+                            leaf, short_name(&proof_fn.name.path), out
+                        ),
+                        location: DiagLocation::Unknown,
+                        help: Some(format!("{} {}",
+                            vir::tactus_messages::LEAN_FILE_HELP_PREFIX, path.display())),
+                    }],
+                    warnings: vec![],
+                },
+            })
+        }
+        Ok(PkgEmitOutcome::UnsupportedScc(reason)) => Some(CheckResult::Failed {
+            errors: vec![TactusDiag {
+                message: format!("tactus: package-check: {}", reason),
+                location: DiagLocation::Unknown,
+                help: None,
+            }],
+            warnings: vec![],
+        }),
+        Err(e) => Some(CheckResult::Error(e)),
+    }
 }
 
 /// The population that gets statement defs in the Stmts module and can
@@ -1592,11 +1764,18 @@ fn build_stmts_module(
 /// What package emission did for one fn — the emit-hook logs
 /// `UnsupportedScc`, the M4 gate collects module leafs to elaborate.
 pub enum PkgEmitOutcome {
-    /// Single-fn Proofs module written; payload = module leaf name.
-    Single(String),
-    /// Fn is a member of a supported mutual SCC; payload = the SCC's
-    /// canonical module leaf (same for every member).
-    Mutual(String),
+    /// Single-fn Proofs module written.
+    Single {
+        leaf: String,
+        path: std::path::PathBuf,
+        /// Tactic-line → Rust-span mapping, same mechanism as island
+        /// emission — package-check failures point at the same source
+        /// locations island failures do.
+        source_map: to_lean_fn::LeanSourceMap,
+    },
+    /// Fn is a member of a supported mutual SCC; leaf/path name the
+    /// SCC's canonical module (same for every member).
+    Mutual { leaf: String, path: std::path::PathBuf },
     /// Fn is on a cycle with SCC-external helper deps — not
     /// package-expressible; payload = human-readable reason.
     UnsupportedScc(String),
@@ -1654,10 +1833,10 @@ fn emit_package_proof_fn_inner(
             )));
         }
         let leaf = mutual_module_leaf(&scc);
-        emit_package_mutual_scc(
+        let path = emit_package_mutual_scc(
             inlined_krate, &scc, imports, crate_name, tactic_bodies, defs, &stmts,
         )?;
-        return Ok(PkgEmitOutcome::Mutual(leaf));
+        return Ok(PkgEmitOutcome::Mutual { leaf, path });
     }
     let mut file_imports: Vec<String> = imports.to_vec();
     file_imports.push(stmts_module_name(defs));
@@ -1698,7 +1877,12 @@ fn emit_package_proof_fn_inner(
     let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
         .join(format!("{}.lean", leaf));
     write_lean_file(&path, &rendered.text)?;
-    Ok(PkgEmitOutcome::Single(leaf))
+    let source_map = LeanSourceMap::ProofFn {
+        fn_name: short_name(&proof_fn.name.path).to_string(),
+        tactic_start_line: rendered.landmarks.tactic_starts.first().copied().unwrap_or(0),
+        tactic_line_count: tactic_body.lines().count().max(1),
+    };
+    Ok(PkgEmitOutcome::Single { leaf, path, source_map })
 }
 
 /// Mutual-SCC-module memo: written once per canonical path per
@@ -1724,13 +1908,13 @@ fn emit_package_mutual_scc(
     tactic_bodies: &std::collections::HashMap<Fun, String>,
     defs: &crate::crate_defs::CrateDefs,
     stmts: &std::sync::Arc<Vec<Command>>,
-) -> Result<(), String> {
+) -> Result<std::path::PathBuf, String> {
     let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
         .join(format!("{}.lean", mutual_module_leaf(scc)));
     {
         let memo = MUTUAL_MEMO.get_or_init(Default::default);
         if !memo.lock().unwrap_or_else(|p| p.into_inner()).insert(path.clone()) {
-            return Ok(()); // already written by another member's call
+            return Ok(path); // already written by another member's call
         }
     }
     let mut file_imports: Vec<String> = imports.to_vec();
@@ -1760,7 +1944,8 @@ fn emit_package_mutual_scc(
     #[cfg(not(debug_assertions))]
     let _ = &stmts;
     let rendered = pp_commands(&cmds);
-    write_lean_file(&path, &rendered.text)
+    write_lean_file(&path, &rendered.text)?;
+    Ok(path)
 }
 
 // ── Package gate (M4) ───────────────────────────────────────────────
@@ -1806,8 +1991,8 @@ pub fn check_package(
             &inlined_krate, &graph, f, &body, &f.attrs.lean_imports, crate_name,
             tactic_bodies, &defs,
         ) {
-            Ok(PkgEmitOutcome::Single(leaf)) => leafs.push(leaf),
-            Ok(PkgEmitOutcome::Mutual(leaf)) => {
+            Ok(PkgEmitOutcome::Single { leaf, .. }) => leafs.push(leaf),
+            Ok(PkgEmitOutcome::Mutual { leaf, .. }) => {
                 if !leafs.contains(&leaf) {
                     leafs.push(leaf);
                 }
