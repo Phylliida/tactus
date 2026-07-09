@@ -1,7 +1,11 @@
 # Fixing the `--lean-all-proofs` real-run bug families — plan
 
 **Date:** 2026-07-09
-**Status:** planned; no code changes yet.
+**Status:** B1–B4 IMPLEMENTED & COMMITTED same day (`dbc77e5` B1, `00534c9` B2–B4);
+B5 rediagnosed below, own arc pending. Validated per-fix on the britton module
+(195 → 86 errors; type-mismatch / unknown-identifier / termination / Inhabited
+families all at zero) with the exec gate green throughout (24 verified, 0 errors).
+Implementation notes folded into each section; full-crate re-measurement pending.
 **Scope:** companion to `DESIGN-lean-all-proofs.md` §10. That section measured the crate-wide
 real Lean run on tactus-group-theory (229 verified / 24,817 errors; 214 of 1,338 codegen'd fns
 pass) and found the error mass is ~5 translator bug families, not proof-power. This doc specs
