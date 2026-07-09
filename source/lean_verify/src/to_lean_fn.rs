@@ -399,6 +399,64 @@ pub fn broadcast_lemma_axiom_cmd(
     })
 }
 
+/// The Lean name of a proof fn's statement def in package emission:
+/// `<lean name>_stmt`. Shared by the Stmts renderer (below), the
+/// hypothesis binders consumers take (M2), and the Link module (M3) —
+/// one chokepoint so the three sites can't disagree on the name.
+pub fn stmt_name(path: &Path) -> String {
+    format!("{}_stmt", lean_name(path))
+}
+
+/// Fold a proof fn's `(binders, goal)` signature into one ∀-closed
+/// Prop. Zero binders → the bare goal (a nullary lemma's statement is
+/// just its conjoined ensures).
+fn forall_close(binders: Vec<LBinder>, goal: LExpr) -> LExpr {
+    if binders.is_empty() { goal } else { LExpr::forall(binders, goal) }
+}
+
+/// Assemble a statement def from an already-built signature:
+/// `@[reducible] noncomputable def <name> : Prop := ∀ <binders>, <goal>`.
+/// Split from `proof_fn_stmt_cmd` so unit tests can drive it with
+/// synthetic binders/goals without constructing a full `FunctionX`.
+///
+/// `@[reducible]` is load-bearing (DESIGN-emit-module.md M0 finding
+/// F2, the `abbrev` form): it lets `intro` peel the stmt name inside
+/// the prover, lets a hypothesis `(h : <name>)` be applied to
+/// arguments at use sites, and lets the Link module's direct
+/// application unify — no `unfold` anywhere. (`noncomputable` is the
+/// always-on `write_def` default; harmless on a Prop def.)
+fn stmt_cmd(name: String, binders: Vec<LBinder>, goal: LExpr) -> Command {
+    Command::Def(Def {
+        attrs: vec!["reducible".to_string()],
+        name,
+        binders: Vec::new(),
+        ret_ty: LExpr::var_lit("Prop"),
+        body: forall_close(binders, goal),
+        termination_by: Vec::new(),
+        decreasing_by: None,
+    })
+}
+
+/// Emit a proof fn's contract as its statement def — the Stmts layer
+/// of package emission (DESIGN-emit-module.md §2.1/§4.1). Consumers
+/// take the def as a hypothesis binder instead of citing an axiom or
+/// re-elaborating the helper's theorem; the fn's own theorem proves
+/// it; the Link module applies one to the other.
+///
+/// Built on the same `proof_fn_signature` as `proof_fn_to_ast` and
+/// `broadcast_lemma_axiom_cmd` (including the same standalone
+/// augmentation), so the statement def and the theorem that proves it
+/// cannot drift — the statement-identity property the emit-module
+/// trust argument rests on.
+pub fn proof_fn_stmt_cmd(
+    f: &FunctionX,
+    ectx: &crate::emit_ctx::EmitCtx,
+) -> Command {
+    let f = &crate::impl_subst::maybe_augment_standalone_fn(f, &ectx.trait_outparams);
+    let (binders, goal) = proof_fn_signature(f, ectx);
+    stmt_cmd(stmt_name(&f.name.path), binders, goal)
+}
+
 pub fn proof_fn_to_ast(
     f: &FunctionX,
     tactic_body: &str,

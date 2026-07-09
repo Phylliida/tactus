@@ -320,6 +320,19 @@ pure Lean core, no Mathlib needed for any architectural question.
 Net: **no blockers found; two design corrections (F2, F3) folded into §2.2 and
 §4.3.** M1 can start on this shape directly.
 
+**M1 status (same day): Stmts renderer LANDED on this branch.**
+`to_lean_fn::proof_fn_stmt_cmd` emits `@[reducible] noncomputable def
+<name>_stmt : Prop := ∀ <binders>, <ensures>` — built on the same
+`proof_fn_signature` chokepoint as `proof_fn_to_ast` and
+`broadcast_lemma_axiom_cmd`, so statement/theorem drift is impossible by
+construction; `stmt_name` is the naming chokepoint shared with M2/M3. Zero
+pp changes were needed (`Def.attrs` + `write_binders`' Instance/Implicit
+kinds already cover the form). Unit tests pin the exact rendered shape
+(285/0 suite). The probe's Stmts layer was rewritten from `abbrev` to the
+exact emitted form and rebuilds green — `@[reducible] noncomputable def`
+has the full abbrev ergonomics (F2) end-to-end. FunctionX-level exercise
+against real crates lands with M2's flag wiring.
+
 ## 8. Open questions
 
 - **O1 — Proofs granularity**: per-fn (finest invalidation, ~2800 files/oleans
