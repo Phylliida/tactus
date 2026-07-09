@@ -2607,6 +2607,9 @@ impl Verifier {
         // global consulted inside lean_verify's emit/check entry
         // points, so their signatures and these call sites stay put.
         lean_verify::crate_defs::set_enabled(self.args.tactus_crate_defs);
+        // Package emission (DESIGN-emit-module.md M2) — same process-
+        // global pattern; consulted inside `emit_proof_fn`.
+        lean_verify::generate::set_package_enabled(self.args.tactus_emit_module);
 
         let time_verify_sequential_start = Instant::now();
 

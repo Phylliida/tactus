@@ -320,6 +320,26 @@ pure Lean core, no Mathlib needed for any architectural question.
 Net: **no blockers found; two design corrections (F2, F3) folded into §2.2 and
 §4.3.** M1 can start on this shape directly.
 
+**M2 status (same day): package emission LANDED on this branch, e2e-validated.**
+`--tactus-emit-module` (implies `--tactus-crate-defs` at parse time) emits,
+alongside untouched islands: the per-scope Stmts module
+(`TactusStmts_<crate>_<fingerprint>.lean`, written next to the defs
+artifacts, memo keyed by the scope-fingerprinted module name — the
+CRATEDEFS 1c bucket bug avoided by construction) and per-fn `pkg/` Proofs
+modules. **The load-bearing trick: hypothesis binders are named by the
+helper's SHORT name — exactly the identifier raw tactic text references —
+so binder shadowing makes every existing tactic body elaborate unchanged.**
+The translator delta was near-zero: `proof_fn_to_ast` output + spliced
+binders. Emission hooks before the batch early-return; failures warn and
+never fail the island result. E2e on a real chain crate: emitted
+`theorem lemma_b (lemma_a : lemma_a_stmt) (n : Nat) : …` with verbatim
+body `have h := lemma_a n`; defs+stmts oleans built by hand; **all three
+pkg modules elaborate green**. No-flag runs are byte-identical to pre-M2.
+Known scope cuts (for M4+): emission-only (no check wiring); in check
+mode, batch-covered fns short-circuit before the hook (only `--emit-lean`
+covers all fns); exec fns not yet packaged (§4.4 named req/ens defs);
+cross-crate broadcast stays axiomatic via the defs union.
+
 **M1 status (same day): Stmts renderer LANDED on this branch.**
 `to_lean_fn::proof_fn_stmt_cmd` emits `@[reducible] noncomputable def
 <name>_stmt : Prop := ∀ <binders>, <ensures>` — built on the same

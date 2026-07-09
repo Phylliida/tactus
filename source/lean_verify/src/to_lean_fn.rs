@@ -407,6 +407,21 @@ pub fn stmt_name(path: &Path) -> String {
     format!("{}_stmt", lean_name(path))
 }
 
+/// The hypothesis binder a package-mode consumer takes for helper
+/// lemma `path` (DESIGN-emit-module.md §4.2): the binder is named by
+/// the helper's SHORT name — exactly the identifier raw tactic text
+/// references (`have := lemma_a x hx`) — so binder shadowing makes the
+/// tactic body elaborate unchanged against the local hypothesis where
+/// the island file had a global theorem. The type is the helper's
+/// statement def, whose reducibility (M0 finding F2) lets the
+/// application elaborate without `unfold`.
+pub fn helper_hyp_binder(path: &Path) -> LBinder {
+    LBinder::explicit(
+        crate::lean_name::LeanName::lit(short_name(path)),
+        LExpr::var_lit(&stmt_name(path)),
+    )
+}
+
 /// Fold a proof fn's `(binders, goal)` signature into one ∀-closed
 /// Prop. Zero binders → the bare goal (a nullary lemma's statement is
 /// just its conjoined ensures).
