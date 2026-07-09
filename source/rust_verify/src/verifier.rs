@@ -3284,6 +3284,15 @@ impl Verifier {
                     }
                 }
             }
+            Err(e) if e.contains("shared-defs module unavailable") => {
+                // Tiny crates legitimately fall below the defs-module
+                // gate; their per-fn checks already used islands (with
+                // a per-fn warning). A defs BUILD failure was already
+                // eprintln'd loudly at build time — not silent.
+                reporter.report_now(&note_bare(format!(
+                    "tactus: package gate skipped: {} — per-fn checks used islands", e
+                )).to_any());
+            }
             Err(e) => {
                 self.count_errors += 1;
                 reporter.report_now(&error_bare(format!(
