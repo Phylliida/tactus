@@ -1514,6 +1514,25 @@ fn package_check_enabled() -> bool {
     PACKAGE_CHECK_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Package oleans built by per-fn checks THIS PROCESS (M5c): the
+/// crate-end gate consults this to skip re-elaborating modules the
+/// per-fn path already built — same-process writes, so no staleness
+/// question. Keyed by the module's `.lean` path.
+static PKG_OLEAN_BUILT: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+> = std::sync::OnceLock::new();
+
+fn record_pkg_olean_built(path: &Path) {
+    PKG_OLEAN_BUILT.get_or_init(Default::default)
+        .lock().unwrap_or_else(|p| p.into_inner())
+        .insert(path.to_path_buf());
+}
+fn pkg_olean_built(path: &Path) -> bool {
+    PKG_OLEAN_BUILT.get_or_init(Default::default)
+        .lock().unwrap_or_else(|p| p.into_inner())
+        .contains(path)
+}
+
 /// Module-level verdict for a mutual module: success, or Lean's
 /// parsed `--json` diagnostics for per-member region attribution.
 struct MutualVerdict {
@@ -1607,6 +1626,7 @@ fn check_proof_fn_via_package(
             let mut failures: Vec<(String, String)> = Vec::new();
             run_lean(&pkg_dir, &leaf, true, &base_path, &mut failures);
             if failures.is_empty() {
+                record_pkg_olean_built(&path);
                 return Some(CheckResult::Success { warnings: vec![] });
             }
             // Diagnostic pass — identical pipeline to the island path.
@@ -1642,6 +1662,7 @@ fn check_proof_fn_via_package(
                 }).clone()
             };
             if verdict.success {
+                record_pkg_olean_built(&path);
                 return Some(CheckResult::Success { warnings: vec![] });
             }
             // Verdict is module-level — mutual members are an
@@ -2051,6 +2072,9 @@ fn emit_package_mutual_scc(
 pub struct PackageGateReport {
     /// Modules elaborated (defs + stmts + pkg modules + Link).
     pub modules: usize,
+    /// Of `modules`, how many were reused from per-fn package checks
+    /// (oleans built earlier this process — M5c).
+    pub reused: usize,
     /// Mutual SCCs that could not be package-expressed (reasons).
     pub skipped_sccs: Vec<String>,
     /// (module leaf, lean output) per failed elaboration.
@@ -2107,22 +2131,40 @@ pub fn check_package(
     // true)`; stmts + pkg modules build here; Link elaborates last.
     let prelude_dir = crate::prelude::ensure_prelude_olean()?;
     let base_path = format!("{}:{}", prelude_dir.display(), defs.dir.display());
+    let mut reused = 0usize;
     let stmts_mod = stmts_module_name(&defs);
-    run_lean(&defs.dir, &stmts_mod, true, &base_path, &mut failures);
+    // Skip work the per-fn package checks already did this process
+    // (M5c): stmts olean via its memo, pkg modules via the built-set.
+    let stmts_already = STMTS_OLEAN_MEMO.get()
+        .map(|m| matches!(
+            m.lock().unwrap_or_else(|p| p.into_inner()).get(&stmts_mod),
+            Some(Ok(()))
+        ))
+        .unwrap_or(false);
+    if stmts_already {
+        reused += 1;
+    } else {
+        run_lean(&defs.dir, &stmts_mod, true, &base_path, &mut failures);
+    }
     if !failures.is_empty() {
         // stmts (or an emission) failed — every pkg module would fail
         // derivatively; report the root cause, not the cascade.
-        return Ok(PackageGateReport { modules: 2, skipped_sccs, failures });
+        return Ok(PackageGateReport { modules: 2, reused, skipped_sccs, failures });
     }
     let pkg_dir = lean_out_root().join(sanitize(crate_name)).join("pkg");
     for leaf in &leafs {
-        run_lean(&pkg_dir, leaf, true, &base_path, &mut failures);
+        if pkg_olean_built(&pkg_dir.join(format!("{}.lean", leaf))) {
+            reused += 1;
+        } else {
+            run_lean(&pkg_dir, leaf, true, &base_path, &mut failures);
+        }
     }
     let link_path = format!("{}:{}", base_path, pkg_dir.display());
     let link_mod = link_module_name(&defs);
     run_lean(&pkg_dir, &link_mod, false, &link_path, &mut failures);
     Ok(PackageGateReport {
         modules: 2 + leafs.len() + 1,
+        reused,
         skipped_sccs,
         failures,
     })
