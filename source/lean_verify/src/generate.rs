@@ -50,7 +50,9 @@ pub(crate) fn lean_out_root() -> PathBuf {
 /// Dots in Lean names (module separators) become `__` so the file name stays flat.
 fn lean_file_path(crate_name: &str, fn_path: &vir::ast::Path) -> PathBuf {
     let ns = sanitize(crate_name);
-    let leaf = lean_name(fn_path).replace('.', "__");
+    // `lean_name_relative`: the filename is an artifact key, not Lean text —
+    // the root-anchor prefix (`_root_.{ns}.`) must not leak into it.
+    let leaf = crate::to_lean_type::lean_name_relative(fn_path).replace('.', "__");
     lean_out_root().join(ns).join(format!("{}.lean", leaf))
 }
 
@@ -809,9 +811,12 @@ pub(crate) fn spec_world_cmds(
     // synthesizes from the previous.
     {
         use crate::lean_ast::{BinOp, BinderKind, Expr as LExpr, ExprNode, Binder as LBinder};
+        // `lean_name_relative`: this set is keyed against literal names
+        // below (`emitted.contains("marker.Tuple")`) — a key set, not Lean
+        // text, so it must not carry the root-anchor prefix.
         let emitted: std::collections::HashSet<String> = krate.traits.iter()
             .filter(|tr| should_emit_class(&tr.x))
-            .map(|tr| lean_name(&tr.x.name))
+            .map(|tr| crate::to_lean_type::lean_name_relative(&tr.x.name))
             .collect();
         let tp = |n: &str| LExpr::var_tp(n);
         let arrow = || LExpr::new(ExprNode::BinOp {
@@ -1079,9 +1084,37 @@ pub(crate) fn spec_world_cmds(
 /// ~34 direct sites across 10 files — for two krate-derived, idempotent
 /// tables whose absence fails loudly (unreferenceable names / missing
 /// bound hypotheses), not silently.
-pub(crate) fn install_emit_tables(krate: &KrateX) {
+pub(crate) fn install_emit_tables(krate: &KrateX, crate_name: &str) {
+    // Crate namespace first: if a future table builder renders names via
+    // `lean_name`, it must see the CURRENT crate's root-anchor, not a
+    // stale one from a previous emission on this thread.
+    crate::to_lean_type::install_crate_ns(crate_name);
     install_inherent_method_renames(krate);
     install_datatype_field_bounds(krate);
+    // Decl set AFTER the rename table: it stores naturalized relative
+    // names (`Seq.first`, not `impl__3.first`), so the renames must be
+    // consultable while building it.
+    install_crate_decls(krate);
+}
+
+/// Build the set of relative Lean names this krate's emission can declare —
+/// fns, datatypes, traits (variants/fields ride on their datatype's name;
+/// constructor heads render as `{datatype}.{variant}` whose head segment is
+/// what reference-anchoring keys on). See `to_lean_type::CRATE_DECLS`.
+fn install_crate_decls(krate: &KrateX) {
+    let mut decls = std::collections::HashSet::new();
+    for f in krate.functions.iter() {
+        decls.insert(crate::to_lean_type::lean_name_relative(&f.x.name.path));
+    }
+    for d in krate.datatypes.iter() {
+        if let vir::ast::Dt::Path(p) = &d.x.name {
+            decls.insert(crate::to_lean_type::lean_name_relative(p));
+        }
+    }
+    for tr in krate.traits.iter() {
+        decls.insert(crate::to_lean_type::lean_name_relative(&tr.x.name));
+    }
+    crate::to_lean_type::install_crate_decls(decls);
 }
 
 
@@ -1240,7 +1273,7 @@ pub fn emit_proof_fn(
     crate_name: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> Result<EmitOutput, CheckResult> {
-    install_emit_tables(krate);
+    install_emit_tables(krate, crate_name);
     // Shared-defs lookup (CRATEDEFS.md step 1a). Memo-consistent with
     // the `check_proof_fn` build: in check mode the defs were already
     // built (or poisoned to None) before this runs; in `--emit-lean`
@@ -1427,7 +1460,7 @@ pub fn emit_exec_fn(
     crate_name: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> Result<EmitOutput, CheckResult> {
-    install_emit_tables(krate);
+    install_emit_tables(krate, crate_name);
     // Pre-inline krate for the shared-defs lookup below (`for_crate`
     // applies its own inline pass; the lookup happens after
     // `broadcast_lemmas` resolves, by which point `krate` is shadowed).

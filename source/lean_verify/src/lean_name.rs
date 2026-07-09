@@ -187,26 +187,14 @@ impl std::fmt::Display for LeanName {
     }
 }
 
-/// Make a raw identifier safe to emit as a Lean identifier: keyword-quote
-/// with `«…»` if it collides with a Lean reserved word, otherwise squash
-/// Verus-internal punctuation (`%` from `assert(P)` desugaring, `@`/`#`
-/// from VIR disambiguation) to `_`. No-op fast path for the common case of
-/// already-safe names.
+/// Make a raw identifier safe to emit as a Lean identifier. Delegates to
+/// `to_lean_type::sanitize` — the single canonical sanitizer (keyword-quote
+/// with `«…»`, squash Verus-internal `%`/`@`/`#`/`&` to `_`). This module
+/// previously carried a byte-identical private copy; the two drifted on the
+/// keyword list (BUG: locals named `prefix` emitted raw → parse error), so
+/// the copy was removed in favor of one source of truth.
 fn sanitize_string(s: &str) -> String {
-    if !needs_sanitization(s) {
-        return s.to_string();
-    }
-    if is_lean_keyword(s) {
-        format!("«{}»", s)
-    } else {
-        s.chars().map(|c| match c { '@' | '#' | '%' | '&' => '_', _ => c }).collect()
-    }
-}
-
-fn needs_sanitization(s: &str) -> bool {
-    is_lean_keyword(s) || s.bytes().any(|b|
-        b == b'@' || b == b'#' || b == b'%' || b == b'&'
-    )
+    crate::to_lean_type::sanitize(s)
 }
 
 /// Does the base name need disambiguation? True iff it contained
@@ -216,16 +204,6 @@ fn needs_sanitization(s: &str) -> bool {
 /// them distinct base strings.
 fn needs_disambiguation(s: &str) -> bool {
     s.bytes().any(|b| b == b'@' || b == b'#' || b == b'%')
-}
-
-fn is_lean_keyword(s: &str) -> bool {
-    matches!(s,
-        "def" | "theorem" | "lemma" | "example" | "abbrev" | "instance" | "class"
-        | "structure" | "inductive" | "where" | "with" | "match" | "do" | "return"
-        | "if" | "then" | "else" | "let" | "have" | "show" | "by" | "at" | "fun"
-        | "forall" | "exists" | "Type" | "Prop" | "Sort" | "import" | "open"
-        | "namespace" | "section" | "end" | "variable" | "universe"
-    )
 }
 
 #[cfg(test)]
