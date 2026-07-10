@@ -321,6 +321,26 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// Exec islands previously DROPPED Lean sorry warnings entirely
+// (`Success {{ warnings }}` carried only emission warnings) — a sorry
+// in an exec fn's tactic body verified with zero signal in every
+// mode, and exec fns are never covered by the Link gate. Now fatal,
+// same rule as proof islands.
+test_verify_one_file! {
+    #[test] test_exec_island_sorry_fatal verus_code! {
+        fn get_one() -> (r: u64)
+            ensures r >= 1
+        {
+            proof { sorry }
+            1
+        }
+    } => Err(err) => {
+        assert!(err.errors.iter().any(|d| d.message.contains("sorry is fatal on the island path")),
+            "exec island sorry must be fatal; got: {:?}",
+            err.errors.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+}
+
 // Attr-less exec fn, Lean-tactic assert-by. `intros; assumption` is not
 // valid Verus proof code — this verifies only if the block is treated
 // as Lean tactic text.
@@ -10342,14 +10362,14 @@ test_verify_one_file! {
                 admit
             }
         }
-    } => Ok(err) => {
+    } => Err(err) => {
         // `admit` lowers to Lean `sorry` — a soundness escape hatch.
-        // Until the warning-surfacing fix (M5 review arc) it passed
-        // with ZERO signal; now the warning is pinned so escapes stay
-        // visible.
-        assert!(err.warnings.iter().any(|d| d.message.contains("sorry")),
-            "admit/sorry must surface a warning; got: {:?}",
-            err.warnings.iter().map(|d| &d.message).collect::<Vec<_>>());
+        // History: silent pass → warning (M5 review arc) → FATAL on
+        // the island path (island cache arc): islands have no Link
+        // gate behind them, so the warning layer was the ONLY layer.
+        assert!(err.errors.iter().any(|d| d.message.contains("sorry is fatal on the island path")),
+            "admit/sorry must fail on the island path; got: {:?}",
+            err.errors.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 }
 

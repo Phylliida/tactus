@@ -1245,6 +1245,10 @@ pub struct EmitOutput {
     pub file_path: PathBuf,
     pub source_map: LeanSourceMap,
     pub warnings: Vec<String>,
+    /// Line of the island's first `theorem` head (pp landmark).
+    /// Everything before it is emitter preamble; the island sorry
+    /// gate treats sorry warnings at/after it as user-written.
+    pub first_theorem_line: Option<usize>,
 }
 
 /// Codegen-only half of `check_proof_fn`: inline pass → preamble → theorem →
@@ -1441,7 +1445,10 @@ pub fn emit_proof_fn(
         });
     }
 
-    Ok(EmitOutput { file_path, source_map, warnings: vec![] })
+    Ok(EmitOutput {
+        file_path, source_map, warnings: vec![],
+        first_theorem_line: rendered.landmarks.theorem_heads.first().copied(),
+    })
 }
 
 /// Verify a proof fn: emit its `.lean` (via `emit_proof_fn`), then run Lean.
@@ -1479,7 +1486,7 @@ pub fn check_proof_fn(
             return b.result_for(&proof_fn.name);
         }
     }
-    let EmitOutput { file_path, source_map, .. } =
+    let EmitOutput { file_path, source_map, first_theorem_line, .. } =
         match emit_proof_fn(krate, proof_fn, tactic_body, imports, crate_name, tactic_bodies) {
             Ok(o) => o,
             Err(cr) => return cr,
@@ -1496,7 +1503,66 @@ pub fn check_proof_fn(
         extra_paths.push(&d.dir);
     }
     let result = lean_process::check_lean_file(&file_path, lake_dir, &extra_paths);
+    if let Ok(r) = &result {
+        if r.success {
+            if let Some(fail) = island_sorry_failure(
+                r, first_theorem_line, &proof_fn.name.path, &file_path, &source_map)
+            {
+                return fail;
+            }
+        }
+    }
     format_lean_check_result(result, proof_fn, &file_path, &source_map)
+}
+
+/// Islands have no Link gate behind them — package-mode fallback fns
+/// are cycle-poisoned out of the Link closure, and exec fns are never
+/// in it — so a `sorry`/`admit` that elaborates (a warning to Lean)
+/// would verify with no fatal layer anywhere. On the island path it
+/// is therefore FATAL. The package path keeps warning-at-fn-level +
+/// fatal Link sorryAx backstop (layered defense; both test-pinned).
+/// Lean positions `declaration uses 'sorry'` at the DECLARATION HEAD
+/// (not the sorry literal), and re-warns per declaration whose term
+/// contains it — so neither tactic-region membership nor counting
+/// emitted placeholders can discriminate. Structure can: islands are
+/// emitter preamble (classes / instances / spec defs — where the
+/// TACTIC_BODY_FALLBACK placeholders for trait-method defaults live,
+/// their obligations Verus-checked) followed by theorems (where user
+/// tactic text lives). Sorry warnings at/after the FIRST theorem head
+/// are user-written and fatal; earlier ones warn. No position or no
+/// theorem landmark → fatal (unknown provenance).
+fn island_sorry_failure(
+    r: &lean_process::LeanResult,
+    first_theorem_line: Option<usize>,
+    fn_path: &vir::ast::Path,
+    file_path: &Path,
+    source_map: &LeanSourceMap,
+) -> Option<CheckResult> {
+    let user_written = |d: &lean_process::LeanDiagnostic| -> bool {
+        match (&d.pos, first_theorem_line) {
+            (Some(p), Some(t)) => p.line >= t,
+            _ => true,
+        }
+    };
+    let errors: Vec<TactusDiag> = r.diagnostics.iter()
+        .filter(|d| d.severity == "warning" && d.data.contains("sorry") && user_written(d))
+        .map(|d| {
+            let formatted = lean_process::format_error(d, source_map);
+            TactusDiag {
+                message: format!(
+                    "sorry is fatal on the island path (no Link gate covers {}): {}",
+                    short_name(fn_path), formatted.message),
+                location: formatted.location,
+                help: Some(format!("{} {}",
+                    vir::tactus_messages::LEAN_FILE_HELP_PREFIX, file_path.display())),
+            }
+        })
+        .collect();
+    if errors.is_empty() {
+        None
+    } else {
+        Some(CheckResult::Failed { errors, warnings: vec![] })
+    }
 }
 
 /// Shared diagnostics chokepoint for island AND package-check proof-fn
@@ -3038,7 +3104,10 @@ pub fn emit_exec_fn(
         });
     }
 
-    Ok(EmitOutput { file_path, source_map, warnings })
+    Ok(EmitOutput {
+        file_path, source_map, warnings,
+        first_theorem_line: rendered.landmarks.theorem_heads.first().copied(),
+    })
 }
 
 /// Verify an exec fn: emit its `.lean` (via `emit_exec_fn`), then run Lean.
@@ -3053,7 +3122,7 @@ pub fn check_exec_fn(
 ) -> CheckResult {
     // Same defs-before-emit ordering as `check_proof_fn` (see there).
     let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true, crate::crate_defs::ScopeKind::Exec);
-    let EmitOutput { file_path, source_map, warnings } =
+    let EmitOutput { file_path, source_map, warnings, first_theorem_line } =
         match emit_exec_fn(krate, vir_fn, fn_sst, check, imports, crate_name, tactic_bodies) {
             Ok(o) => o,
             Err(cr) => return cr,
@@ -3072,7 +3141,14 @@ pub fn check_exec_fn(
     let result = lean_process::check_lean_file(&file_path, lake_dir, &extra_paths);
 
     match result {
-        Ok(r) if r.success => CheckResult::Success { warnings },
+        Ok(r) if r.success => {
+            if let Some(fail) = island_sorry_failure(
+                &r, first_theorem_line, &vir_fn.name.path, &file_path, &source_map)
+            {
+                return fail;
+            }
+            CheckResult::Success { warnings }
+        }
         Ok(r) => {
             let fn_short = short_name(&vir_fn.name.path);
             let header = format!("Lean tactus_auto failed for {}", fn_short);
