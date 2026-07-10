@@ -524,3 +524,16 @@ fn let_column_counts_chars_not_bytes() {
     // yielded 7.
     assert_eq!(pp_expr(&e), "p ∧ (let i := 1;\n     i)");
 }
+
+// ── ExprNode::VectorLit (F3, DESIGN-lean-all-proofs-followons.md) ──
+
+/// Vector literals print with Lean core's `#v[…]` syntax; List
+/// literals keep plain `[…]`. The dispatch lives in
+/// `expr_shared::array_literal_node`; here we pin the two print shapes.
+#[test]
+fn vector_lit_prints_hash_v() {
+    let v = Expr::new(ExprNode::VectorLit(vec![lit(1), lit(2), lit(3)]));
+    assert_eq!(pp_expr(&v), "#v[1, 2, 3]");
+    let l = Expr::new(ExprNode::ArrayLit(vec![lit(1), lit(2)]));
+    assert_eq!(pp_expr(&l), "[1, 2]");
+}

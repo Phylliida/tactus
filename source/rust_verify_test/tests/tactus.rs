@@ -9699,6 +9699,45 @@ test_verify_one_file! {
     }
 }
 
+// === Multi-element seq! literals (F3, DESIGN-lean-all-proofs-followons.md) ===
+// `seq![a, b]` lowers through vstd's `View for [T; N]` over an ARRAY
+// literal (single-element `seq![x]` is a push chain and never did).
+// Verus `[T; N]` maps to Lean core `Vector T N`, so the literal must
+// render `#v[a, b]` wrapped `Tactus.Ref.mk … : Tactus.Ref (Vector T N)`
+// — pre-F3 the SST path rejected the fn outright ("array literal not
+// yet supported") and the VIR path emitted a List literal that
+// mistyped (`{ deref := [a, b] }` family).
+
+// SST path: multi-element seq! inline in an obligation expression.
+// The closer discharges len via the seq.new axioms end-to-end.
+test_verify_one_file! {
+    #[test] test_seq_literal_multi_sst_obligation verus_code! {
+        use vstd::seq::*;
+
+        #[verifier::tactus_auto]
+        fn noop(v: u8) -> (r: u8)
+            ensures r == v, seq![1int, 2int].len() == 2, seq![1int, 2int, 3int].len() == 3
+        { v }
+    } => Ok(())
+}
+
+// VIR path: multi-element seq! in a spec fn BODY. The def must
+// elaborate (that's the F3 fix); the theorem's goal is a syntactic
+// self-equality the closer's rfl rung handles without needing seq
+// semantics.
+test_verify_one_file! {
+    #[test] test_seq_literal_multi_spec_fn_body verus_code! {
+        use vstd::seq::*;
+
+        spec fn pair() -> Seq<int> { seq![10int, 20int] }
+
+        #[verifier::tactus_auto]
+        fn noop(v: u8) -> (r: u8)
+            ensures r == v, pair() == pair()
+        { v }
+    } => Ok(())
+}
+
 // Probe 6: `uninterp spec fn` body-less emission.
 // `pub uninterp spec fn my_oracle(x: int) -> int;` has `body=None` in
 // VIR. Prior to the audit's body-less emission fix, this hit a

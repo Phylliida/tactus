@@ -796,7 +796,13 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
             crate::lean_ast::and_all(pairs).node
         }
         ExprX::ArrayLiteral(exprs) => {
-            ExprNode::ArrayLit(exprs.iter().map(|e| expr_to_ast(e, ctx)).collect())
+            // Shared typ-dispatched literal: Array-typed → `#v[…]`
+            // (Vector), Slice-typed → `[…]` (List). See
+            // `expr_shared::array_literal_node` (F3).
+            crate::expr_shared::array_literal_node(
+                exprs.iter().map(|e| expr_to_ast(e, ctx)).collect(),
+                &expr.typ,
+            ).node
         }
 
         // `ExprX::Header` is a requires/ensures marker that VIR

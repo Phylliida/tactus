@@ -1346,11 +1346,28 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
                 args: args_rendered,
             }
         }
-        ExpX::ArrayLiteral(_) => return Err(
-            "array literal `[a, b, c]` not yet supported in exec fns (Verus \
-             rejects these upstream when slice indexing is unwired, so this is \
-             usually unreachable)".to_string()
-        ),
+        // Shared typ-dispatched literal: Array-typed → `#v[…]` (Vector),
+        // Slice-typed → `[…]` (List). Reaches this arm via `seq![a, b]`
+        // in obligation position — vstd's multi-element `seq!` lowers
+        // through `View for [T; N]` over an array literal (single-element
+        // `seq![x]` is a push chain and never gets here). See
+        // `expr_shared::array_literal_node` (F3).
+        ExpX::ArrayLiteral(exps) => {
+            let rendered = exps.iter()
+                .map(|x| sst_exp_to_ast_checked_with_ctx(x, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            let lit = crate::expr_shared::array_literal_node(rendered, &e.typ);
+            // The SST typ folds `&`-decorations into the literal's typ
+            // (no separate `&` node here, unlike VIR — and no coercion
+            // layer on this legacy arm): the value must wear the
+            // matching `Tactus.Ref.mk`/`Box.mk` chain itself, or the
+            // caller's ascription yields `(#v[…] : Tactus.Ref (…))`,
+            // which doesn't elaborate.
+            crate::expr_shared::apply_wrap_chain(
+                lit,
+                &crate::expr_shared::collect_ref_wraps(&e.typ),
+            ).node
+        }
         // Internal-bug rejection (see ExpX::Old's `Snapshot reference for
         // generating AIR Old expressions; only used during sst_to_air`
         // docstring in `vir/sst.rs`). User-syntax `old(x)` lowers to
