@@ -118,6 +118,44 @@ Per the sibling doc's "real fix" paragraph, in `sst_to_lean.rs`:
 **Size: M.** Riskier than B5a (exec gate is the crown jewel); its own validation
 cycle.
 
+## 3.5 Resolved uncertainties (pre-implementation reconnaissance, 2026-07-10)
+
+All read-only findings; each removes a "verify at implementation time" from §3.
+
+1. **The inliner is Verus's own `vir/src/sst_elaborate.rs:26-53`** (`attrs.inline`
+   fns expand at SST): `subst_exp` splices the receiver ARG exp into the body, and
+   the pass's own comment says the result keeps the outer typ "so that poly.rs can
+   perform the proper box/unbox" — poly then wraps pieces in Box/Unbox carrying
+   claims. Confirmed source shape: britton.rs:270 is literally
+   `apply_step(...).is_some()` (vstd `#[verifier::inline]`).
+2. **`resolved_method` selection is mandatory:** SST calls are
+   `CallFun::Fun(fun, resolved_method)`; sst_elaborate dispatches on
+   `if let Some((f, ts)) = resolved_method { (f, ts) } else { (fun, typs) }`.
+   The migrated Call arm must mirror this or trait-dispatched callees get the
+   wrong declared ret / wrong substitution basis.
+3. **`actual_is_trusted` (to_lean_sst_expr.rs:554) must also trust migrated
+   Calls** — it trusts only Vars today, and the Box/Unbox arm RESETS untrusted
+   children to the claimed typ. Since poly wraps inlined receivers in Box/Unbox,
+   migrating the Call arm alone would be silently undone in exactly the failing
+   shapes. Two coordinated edits, not one.
+4. **No plumbing needed:** the obligation path's `render_ctx()`
+   (sst_to_lean.rs:580) already installs `with_fn_map` (all krate fns, vstd
+   included); `RenderFnMap = HashMap<&Fun, &FunctionX>` and `FunctionX.ret`
+   carries the declared ret Par. Paths constructing `RenderCtx` without fn_map
+   fall back to claim = status quo.
+5. **Substitution pattern to copy:** sst_elaborate builds
+   `typ_substs: HashMap<Ident, Typ>` from `typ_params.zip(typs)` then
+   `sst_util::subst_typ` — same construction on the declared ret typ. Assert
+   the length invariants loudly (inline_spec.rs:231 precedent).
+6. **VIR-path parity resolved as probe-only:** `to_lean_expr.rs` counts derefs
+   from the claimed typ too (`lean_level_wrap_count`, lines 302/314, var_id=None
+   for call receivers) — but `inline_spec.rs` substitutes at pre-poly VIR-AST
+   (plain Var-replacement, no re-typing pass after) and the defs gate is green,
+   so the lying claims likely never materialize there. Add the census probe to
+   both paths; fix the VIR side only if the census shows lies.
+7. **B5b pin verified:** `rust_verify_test/tests/tactus.rs:2837`, still
+   Err-asserted with the flip-to-Ok comment intact.
+
 ## 4. Sequencing & validation
 
 **B5a first** — small, self-contained, kills a complete error family. **B5b
