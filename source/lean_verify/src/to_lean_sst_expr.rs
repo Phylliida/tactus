@@ -562,6 +562,21 @@ fn actual_is_trusted(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> bool {
                 || ctx.let_binder(&lean_name).is_some_and(|(_, trusted)| *trusted)
                 || ctx.lookup_subst(&lean_name, &e.typ).is_some()
         }
+        // Plain/recursive spec-fn calls (B5a): the migrated Call arm
+        // reports the declared-instantiated ret typ — ground truth by
+        // construction — so Box/Unbox must NOT reset it to a claim
+        // (poly wraps inlined receivers in Box/Unbox; without this,
+        // the reset silently undoes the Call migration in exactly the
+        // failing shapes). Mirrors the render arm's guard: class-
+        // dispatch renders stay claim-typed and untrusted.
+        ExpX::Call(CallFun::Fun(fun, None), _, _)
+            if !fun_is_trait_method(fun, ctx) =>
+        {
+            ctx.fn_map.is_some_and(|m| m.contains_key(fun))
+        }
+        ExpX::Call(CallFun::Recursive(fun), _, _) => {
+            ctx.fn_map.is_some_and(|m| m.contains_key(fun))
+        }
         ExpX::Unary(UnaryOp::CoerceMode { .. }, inner)
         | ExpX::Unary(UnaryOp::Trigger(_), inner)
         | ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner)
@@ -779,23 +794,31 @@ pub(crate) fn exp_to_typed(
             TypedExpr::from_untyped(LExpr::new(ctor_node(dt, variant, rendered)), e.typ.clone())
         }
         // Default: unmigrated arms render at the claimed typ.
-        // Plain spec-fn calls (B5a census stage — behavior-neutral):
-        // still reports the CLAIM like the fallback, but classifies
-        // claim-vs-declared divergence under TACTUS_B5_CENSUS. The
-        // next commit flips the report to the declared-instantiated
-        // typ (see DESIGN-B5-typed-spine-calls.md §3.6 — one rule,
-        // loud census). Class-dispatch renders (trait methods /
-        // resolved methods) type-annotate their result at the claim
-        // and are excluded here to match render behavior.
+        // Plain spec-fn calls (B5a, DESIGN-B5-typed-spine-calls.md):
+        // a rendered application's Lean type is the callee's DECLARED
+        // return typ (instantiated) by construction — the emitted
+        // def's return type is typ_to_expr of exactly that — so that
+        // is the actual this arm reports. The SST claim can lie by a
+        // ref-decoration when the call sits in an inlined `&self`
+        // receiver position (sst_elaborate splices the receiver arg
+        // with its call-site claim, which poly.rs needs — the lie is
+        // Lean-perspective-only). Same rule the ARGS already follow
+        // (bridged to declared param typs). Class-dispatch renders
+        // (trait methods / resolved methods) are excluded to match
+        // render behavior: they type-ANNOTATE their result at the
+        // claim. Callee absent from fn_map → claim (status quo).
+        // TACTUS_B5_CENSUS=1 logs the claim-vs-declared class.
         ExpX::Call(CallFun::Fun(fun, None), typs, _)
             if !fun_is_trait_method(fun, ctx) =>
         {
             b5_census(fun, typs, &e.typ, ctx);
-            TypedExpr::from_untyped(LExpr::new(exp_to_node_checked(e, ctx)?), e.typ.clone())
+            let actual = ctx.fn_ret_typ(fun, &typs[..]).unwrap_or_else(|| e.typ.clone());
+            TypedExpr::from_untyped(LExpr::new(exp_to_node_checked(e, ctx)?), actual)
         }
         ExpX::Call(CallFun::Recursive(fun), typs, _) => {
             b5_census(fun, typs, &e.typ, ctx);
-            TypedExpr::from_untyped(LExpr::new(exp_to_node_checked(e, ctx)?), e.typ.clone())
+            let actual = ctx.fn_ret_typ(fun, &typs[..]).unwrap_or_else(|| e.typ.clone());
+            TypedExpr::from_untyped(LExpr::new(exp_to_node_checked(e, ctx)?), actual)
         }
         _ => TypedExpr::from_untyped(LExpr::new(exp_to_node_checked(e, ctx)?), e.typ.clone()),
     })

@@ -405,6 +405,8 @@ pub fn run_verus(
         } else if *option == "new-mut-ref" {
             verus_args.push("-V".to_string());
             verus_args.push("new-mut-ref".to_string());
+        } else if *option == "lean-all-proofs" {
+            verus_args.push("--lean-all-proofs".to_string());
         } else if *option == "no-bv-simplify" {
             verus_args.push("-V".to_string());
             verus_args.push("no-bv-simplify".to_string());

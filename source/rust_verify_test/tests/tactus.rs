@@ -2861,33 +2861,33 @@ test_verify_one_file! {
     }
 }
 
-// ── KNOWN BUG B5a (pinned as Err): a spec-fn CALL in an inlined
-// `&self` receiver position carries a Ref-decorated CLAIMED typ (the
-// vstd `#[verifier::inline]` method's self param; sst_elaborate keeps
-// call-site claims for poly.rs) while the rendered application is
-// bare — the typed spine's Field/IsVariant deref count, taken off the
-// claim, emits `.deref` on a bare value: Lean "Invalid field deref".
-// All 55 crate-wide Invalid-field errors in the 2026-07-09 gt run are
-// this shape (e.g. `apply_step(...).is_some()`, britton.rs:270).
-// DESIGN-B5-typed-spine-calls.md. FLIP THIS PIN TO Ok WHEN B5a LANDS.
-test_verify_one_file! {
-    #[test] test_spec_call_receiver_deref_claim verus_code! {
+// ── B5a regression (DESIGN-B5-typed-spine-calls.md): a spec-fn CALL
+// in an inlined `&self` receiver position (vstd's `#[verifier::inline]`
+// `is_some(option: &Option<T>)`) carries a Ref-decorated CLAIMED typ —
+// sst_elaborate splices the receiver arg with its call-site claim for
+// poly.rs — while the rendered application is bare; pre-B5a the
+// IsVariant deref count off the claim emitted `.deref` on a bare
+// Option ("Invalid field deref", all 55 crate-wide Invalid-field
+// errors in the 2026-07-09 gt run). Reproduces ONLY on the
+// --lean-all-proofs SST/WP pipeline — the tactus_auto-attribute path
+// renders proof fns elsewhere and never lied (red capture: this exact
+// source vs the pre-fix binary → 2× "Invalid field `deref`"). The
+// migrated Call arm reports the declared-instantiated ret typ, so the
+// requires binder renders `(wrap s).isSome` bare and the fn verifies.
+test_verify_one_file_with_options! {
+    #[test] test_spec_call_receiver_deref_claim ["lean-all-proofs"] => verus_code! {
         use vstd::prelude::*;
-        spec fn wrap(x: int) -> Option<int> {
-            Some(x)
+        pub enum Sym { A, B }
+        pub open spec fn wrap(s: Seq<Sym>, i: int) -> Option<Seq<Sym>> {
+            if i > 0 { Some(s) } else { None }
         }
-        #[verifier::tactus_auto]
-        proof fn uses_receiver_call(x: int)
-            requires wrap(x).is_some(),
-            ensures wrap(x).is_some(),
+        pub proof fn uses_receiver_call(s: Seq<Sym>, i: int)
+            requires
+                wrap(s, i).is_some(),
+                wrap(s, i).unwrap().len() >= 0,
+            ensures wrap(s, i).is_some(),
         {}
-    } => Err(err) => {
-        assert!(
-            err.errors.iter().any(|e| e.message.contains("Invalid field")),
-            "expected the B5a Invalid-field-deref failure (fixed? flip this pin to Ok!), got: {:?}",
-            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
-        );
-    }
+    } => Ok(())
 }
 
 // ── Arch-width integer bounds (usize::MAX in specs) ───────────────
