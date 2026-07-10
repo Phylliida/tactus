@@ -363,6 +363,23 @@ Follow-ups noted: trait-default placeholder → named axiom (kills the
 sorry-discrimination need); M6 exec packages (blocked on Tactus.Ref
 closure ABI).
 
+**SYMBOL INVESTIGATION (2026-07-10 evening) — dragon map.**
+Fixed (`63005a2`): exec-scope ladder rungs keep accessors (simplified
+bodies render accessor calls at every rung; symbol part failed narrow
+rungs). Pinned, not fixed: (A) accessor `[Inhabited]` vs nonempty-arc
+`[Nonempty]` — two currencies, no instance path; blocks exec
+full-roots coverage; unify via accessors-take-Nonempty +
+Classical.ofNonempty + a NonemptyNeeds accessor-use seed (own arc —
+invalidates every island text). (B) inline helper theorems' tactics
+are coupled to the imported defs' spec-fn RENDER SHAPE (vir match vs
+simplified if-isVariant); both authoring worlds are pinned in the
+wild; a per-kind ladder/scope split was built, caught by
+test_crate_defs_proof_exec_mix (whose green depends on a scope-key
+COLLISION serving vir-shaped defs to an exec island), and reverted.
+Stmt-style helpers (M6) is the real resolution, and also removes the
+rung-1 dead-weight exec defs (covers_exec=false, filtered at the
+consumer) = the precise "double defs family" cost.
+
 **M5e MEASURED ON TGT (2026-07-10) — M5 COMPLETE.**
 tactus-group-theory (3116 fns, release binary, isolated TACTUS_LEAN_OUT):
 - COLD (no Z3 cache): 225s, **3116 verified / 0 errors, ZERO island
