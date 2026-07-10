@@ -687,11 +687,26 @@ fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
         }
 
         ExprNode::Let { name, value, body } => {
+            // Continuation column: align the body exactly under this
+            // `let`'s own keyword. Any enclosing column guard
+            // (colGt/colGe against a saved position P) that admitted
+            // the `let` token at column C has P ≤ C, so a continuation
+            // at C passes it too. The old fixed 4-space indent dedented
+            // the bodies of mid-line lets (`… then let i := v;`) below
+            // their enclosing guard — Lean cut the term at the next
+            // non-atom token: `unexpected token '('; expected 'else'`
+            // (F1, DESIGN-lean-all-proofs-followons.md). Repro: a
+            // let-chain in the RHS of an enclosing `let` inside a
+            // parenthesized `∀`. Chars, not bytes — Lean columns are
+            // codepoints and the prefix may hold `∀`/`∧`/`→`.
+            let line_start = out.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let let_col = out[line_start..].chars().count();
             out.push_str("let ");
             out.push_str(name.as_str());
             out.push_str(" := ");
             write_expr(out, value, 0, lm);
-            out.push_str(";\n    ");
+            out.push_str(";\n");
+            out.extend(std::iter::repeat(' ').take(let_col));
             write_expr(out, body, 0, lm);
         }
         ExprNode::Lambda { binders, body } => {
