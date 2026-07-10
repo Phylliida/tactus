@@ -297,6 +297,35 @@ fn build_defs(
     } else {
         None
     };
+    // Total-failure record: `FAILED <h1> <h2> <h3> <fp>` — per-attempt
+    // render hashes from the run where every attempt failed. Renders
+    // are cheap and deterministic; when they all match, re-running the
+    // ladder would fail identically, so skip it (islands fall back to
+    // standalone emission exactly as they did that run). Any changed
+    // render → full retry (broader coverage might now elaborate).
+    let render_hash_only = |roots: &[&FunctionX], emit_accessors: bool,
+                            covers_exec: bool, with_bc_union: bool| -> Option<String> {
+        render_and_build(
+            &inlined_krate, &ectx, crate_name, scope, roots,
+            emit_accessors, covers_exec, with_bc_union, false, true,
+        ).ok().map(|(_, h)| h)
+    };
+    if build {
+        if let Some(t) = std::fs::read_to_string(&ladder_path).ok() {
+            let parts: Vec<&str> = t.split_whitespace().collect();
+            if parts.len() == 2 + attempts.len()
+                && parts[0] == "FAILED"
+                && parts[parts.len() - 1] == fp
+            {
+                let all_match = attempts.iter().enumerate().all(|(i, &(r, ea, ce, bu))| {
+                    render_hash_only(r, ea, ce, bu).as_deref() == Some(parts[1 + i])
+                });
+                if all_match {
+                    return None;
+                }
+            }
+        }
+    }
     'ladder: loop {
         let mut prev: Option<(usize, bool, bool)> = None;
         for (attempt, &(roots, emit_accessors, covers_exec, with_bc_union)) in attempts.iter().enumerate() {
@@ -320,7 +349,7 @@ fn build_defs(
             prev = Some((roots.len(), covers_exec, with_bc_union));
             match render_and_build(
                 &inlined_krate, &ectx, crate_name, scope, roots,
-                emit_accessors, covers_exec, with_bc_union, build,
+                emit_accessors, covers_exec, with_bc_union, build, false,
             ) {
                 Ok((defs, content_hash)) => {
                     if let Some((win, h)) = &recorded {
@@ -354,6 +383,17 @@ fn build_defs(
                     );
                 }
             }
+        }
+        if build {
+            let hashes: Vec<String> = attempts.iter()
+                .map(|&(r, ea, ce, bu)| {
+                    render_hash_only(r, ea, ce, bu).unwrap_or_else(|| "render-error".to_string())
+                })
+                .collect();
+            let _ = std::fs::create_dir_all(
+                ladder_path.parent().expect("ladder path has a parent"));
+            let _ = std::fs::write(
+                &ladder_path, format!("FAILED {} {}\n", hashes.join(" "), fp));
         }
         return None;
     }
@@ -618,6 +658,10 @@ fn render_and_build(
     covers_exec: bool,
     with_bc_union: bool,
     build: bool,
+    // Render + hash WITHOUT touching the filesystem (ladder failure-
+    // record checks). The returned CrateDefs is unbuilt scaffolding —
+    // callers use only the hash.
+    hash_only: bool,
 ) -> Result<(CrateDefs, String), String> {
     let ns = sanitize(crate_name);
     // Scope-suffixed: per-bucket artifacts coexist (see scope_key).
@@ -673,6 +717,12 @@ fn render_and_build(
         rendered.text.hash(&mut h);
         format!("{:016x}", h.finish())
     };
+    if hash_only {
+        return Ok((CrateDefs {
+            module_name, scope: scope.to_string(), covers_exec, dir, cmds,
+            breaking: false,
+        }, content_hash));
+    }
 
     // Partitioned defs (M5d-3) in package modes: same commands, same
     // per-chain order, split per source module — `cmds` stays the full
