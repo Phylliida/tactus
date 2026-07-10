@@ -1809,6 +1809,7 @@ fn walk_obligations<'a>(
     e: &mut ObligationEmitter,
 ) {
     match wp {
+        Wp::DoneEmpty => {}
         Wp::Done(leaf) => {
             // Terminal goal: the fn's ensures conjunction (top-level
             // Done) or a loop body's `I ∧ D < d_old` (loop-body Done
@@ -4186,6 +4187,16 @@ enum Wp<'a> {
     /// statement's `let <ret> := e; ensures`.
     Done(LExpr),
 
+    /// Terminal leaf with NO goal — the walker emits nothing. Used as
+    /// the `Wp::Scope` body terminator (F4 follow-up): the scope's own
+    /// `Assert` nodes carry its real obligations and there is no
+    /// flow-through goal, so a `Done(True)` leaf would only add one
+    /// trivially-true theorem per assert-by (~1,267 crate-wide) to
+    /// every Lean run. Scoped to Scope terminators ONLY — empty-ensures
+    /// fns keep their existing `Done(True)` theorem, so per-fn theorem
+    /// bookkeeping is unchanged elsewhere.
+    DoneEmpty,
+
     /// `let x := e; <body>`. If `e` contains a value-position
     /// `if c then a else b`, `walk_let` forks into two recursive
     /// walks (with cond as a Hyp frame) so omega sees a clean
@@ -5018,8 +5029,7 @@ fn build_wp<'a>(
         // DESIGN-lean-all-proofs-followons.md.)
         StmX::DeadEnd(block) => {
             let scope_vars = collect_assert_by_vars(block, ctx);
-            let body =
-                build_wp(block, Wp::Done(LExpr::lit_bool(true)), ctx, &LoopStack::Empty)?;
+            let body = build_wp(block, Wp::DoneEmpty, ctx, &LoopStack::Empty)?;
             Ok(Wp::Scope { scope_vars, body: Box::new(body), after: Box::new(after) })
         }
         StmX::OpenInvariant(_) => Err(

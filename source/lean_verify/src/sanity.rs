@@ -70,6 +70,46 @@ fn insert_defined(defined: &mut HashSet<String>, name: &str) {
     }
 }
 
+/// Preventive check (DESIGN-lean-all-proofs-followons.md, "Preventive
+/// check — the B1a-regression class"): inside a declaration's OWN
+/// components, a root-anchored reference to the declaration itself can
+/// never resolve — during elaboration the decl is not yet a global
+/// constant. Three same-day instances of this class (2026-07-10):
+/// recursive datatype ctor fields, IndexedInductive ctor result types,
+/// trait sibling-method refs — each failing only at lake time. Flags
+/// `Var` names equal to the decl's anchored name or under its
+/// dot-prefix (`_root_.ns.HasZero.val` inside `class _root_.ns.HasZero`).
+/// Targeted walk, no resolution-set consultation — zero false-positive
+/// surface; only fires on names that MUST fail elaboration.
+fn check_no_anchored_self_ref(
+    e: &Expr,
+    decl_anchored: &str,
+    violations: &mut Vec<Violation>,
+) {
+    if !decl_anchored.starts_with("_root_.") {
+        return;
+    }
+    let prefix = format!("{}.", decl_anchored);
+    if let ExprNode::Var(name) = &e.node {
+        let n = name.as_str();
+        if n == decl_anchored || n.starts_with(&prefix) {
+            violations.push(Violation {
+                context: decl_anchored.to_string(),
+                name: format!(
+                    "{} (root-anchored self-reference inside its own declaration — \
+                     cannot resolve during elaboration; render it relative, see \
+                     CURRENT_DECL_SELF)",
+                    n
+                ),
+            });
+        }
+    }
+    let _ = map_children(&e.node, |c: &Expr| {
+        check_no_anchored_self_ref(c, decl_anchored, violations);
+        c.clone()
+    });
+}
+
 fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Violation>) {
     match cmd {
         // Commands that introduce no term references and add no names we need to track:
@@ -86,8 +126,10 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
             let mut scope = scope_from_binders(&d.binders);
             check_expr(&d.ret_ty, defined, &mut scope, violations, &d.name);
             check_expr(&d.body, defined, &mut scope, violations, &d.name);
+            check_no_anchored_self_ref(&d.body, &d.name, violations);
             for t in &d.termination_by {
                 check_expr(t, defined, &mut scope, violations, &d.name);
+                check_no_anchored_self_ref(t, &d.name, violations);
             }
         }
 
@@ -131,6 +173,20 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
 
         Command::Datatype(dt) => {
             insert_defined(defined, &dt.name);
+            // Field types were previously unchecked entirely; the
+            // targeted self-ref rule needs no resolution context, so
+            // it runs here without false-positive risk (would have
+            // caught the 2026-07-10 recursive-datatype regression at
+            // codegen time instead of lake time).
+            let fields: Vec<&Field> = match &dt.kind {
+                DatatypeKind::Structure { fields } => fields.iter().collect(),
+                DatatypeKind::Inductive { variants }
+                | DatatypeKind::IndexedInductive { variants } =>
+                    variants.iter().flat_map(|v| v.fields.iter()).collect(),
+            };
+            for f in fields {
+                check_no_anchored_self_ref(&f.ty, &dt.name, violations);
+            }
         }
 
         Command::Class(c) => {
@@ -151,8 +207,15 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
             }
             for m in &c.methods {
                 check_expr(&m.ty, defined, &mut scope, violations, &c.name);
+                // Method TYPES must not reference the class (or a
+                // sibling via `Class.method`) root-anchored — the
+                // class isn't a global yet (the 2026-07-10 trait
+                // sibling-ref regression; strip_class_qualifier is
+                // the fix-side, this is the tripwire).
+                check_no_anchored_self_ref(&m.ty, &c.name, violations);
                 if let Some(default) = &m.default {
                     check_expr(default, defined, &mut scope, violations, &c.name);
+                    check_no_anchored_self_ref(default, &c.name, violations);
                 }
                 for t in &m.termination_by {
                     check_expr(t, defined, &mut scope, violations, &c.name);

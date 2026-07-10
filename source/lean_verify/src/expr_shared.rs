@@ -555,6 +555,32 @@ pub(crate) fn ctor_node(
 /// at `Vector`). Anything else (`Primitive::Slice` → `List`) keeps the
 /// List literal. `#v[…]` + the `Tactus.Ref.mk` wrapper validated
 /// empirically on the pinned toolchain (Lean 4.25.0).
+/// F2b (DESIGN-lean-all-proofs-followons.md): a Verus `decreases`
+/// measure of Int-rendered type (`int`, `iN`, `isize`) becomes a
+/// `termination_by` value that Lean wraps in `sizeOf` — for `Int`
+/// that unfolds to a raw `Int.rec` omega cannot see through, so
+/// every such decreasing goal was stuck. Verus's decreases semantics
+/// for int measures IS "a nonnegative ordinal" (nonnegativity is part
+/// of the Z3-side decreases obligation), and `Int.toNat` is the
+/// canonical embedding of that semantics — the same kind of type-level
+/// mapping as the standing `uN → Nat` clip policy. Wrapping makes the
+/// decreasing goals Nat `<`: omega-native, with the branch guards
+/// supplying nonnegativity. Uniform on every Int-rendered measure and
+/// visible in the emitted `termination_by`; Nat-rendered (`nat`, `uN`,
+/// `usize`) and non-numeric (datatype height / sizeOf) measures pass
+/// through unchanged.
+pub(crate) fn wrap_int_measure(rendered: LExpr, d: &vir::ast::Expr) -> LExpr {
+    let peeled = crate::to_lean_type::peel_typ_wrappers(&d.typ);
+    match &**peeled {
+        TypX::Int(
+            vir::ast::IntRange::Int
+            | vir::ast::IntRange::I(_)
+            | vir::ast::IntRange::ISize,
+        ) => LExpr::app1(LExpr::var_lit("Int.toNat"), rendered),
+        _ => rendered,
+    }
+}
+
 /// Dispatches on the PEELED typ only — decoration handling is the
 /// caller's job and differs per path: the VIR renderer's
 /// `apply_ref_coercion_if_needed` bridges decorations for literals
