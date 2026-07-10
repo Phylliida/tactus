@@ -13,7 +13,25 @@ DEFERRED (see section). Along the way: fixed a pre-existing B1a-era regression �
 datatype declarations rendered their self/sibling references root-anchored (`Unknown
 identifier` during elaboration; 8 e2e tests failing at HEAD before today's arcs) — via
 `with_self_decls` over the SCC in `datatype_decl_cmd` + a `self_name` field on the
-`Datatype` AST for IndexedInductive ctor result types. F3–F7 still spec-only.
+`Datatype` AST for IndexedInductive ctor result types.
+
+**Same-day follow-up: F3 IMPLEMENTED & COMMITTED (`8171498`), F4 IMPLEMENTED & COMMITTED
+(`95c5b1b`).** F3: `seq![a, b]` pins — multi-element lowers through `View for [T; N]`
+over an array literal (single-element is a push chain, hence always worked); the mistype
+is a List literal ascribed at `Vector` inside `Tactus.Ref.mk` (whose anon-struct display
+is the `{ deref := … }`); fix = new `ExprNode::VectorLit` (`#v[…]`, validated on 4.25.0)
+via a shared typ-dispatched `expr_shared::array_literal_node` on BOTH paths; decoration
+handling stays per-path (VIR's `apply_ref_coercion_if_needed` already bridges — the SST
+legacy arm wraps explicitly via `collect_ref_wraps`). m4_qpow: rejections 6 → 0, files
+2 → 8. F4: `Wp::Scope` per the spec, plus two sub-fixes the repros surfaced — zero-binder
+`∀`/`∃` printed as the parse error `∀, P` (plain assert-by's re-assumed
+`Quant(FORALL, [], …)`; now print the body alone), and assert-forall skolems
+(`LocalDeclKind::AssertByVar`, no `Wp::Let`) are ∀-bound on scope theorems (occurrence-
+collected per block, minus names an enclosing scope already bound). The trivial-True
+terminator theorem per scope is KEPT for now (closure precedent) — the skip in
+`emit_done_or_split` is a deferred follow-up. **Crate-wide codegen rejections 1,409 → 0;
+2,747 of 2,747 proof-obligation fns emit (100% codegen coverage).** e2e suite 532/0.
+F5–F7 remain as spec'd; next milestone = the full-crate REAL Lean re-measure, then F7.
 **Scope:** everything left on the board after `DESIGN-lean-all-proofs-bugs.md` B1–B4 landed
 (`dbc77e5`, `00534c9`, review round `2e43a39`), **except B5** (typed-spine `.deref` arc —
 its own doc/arc, per the bugs doc) and except the closer/tactic changes themselves
