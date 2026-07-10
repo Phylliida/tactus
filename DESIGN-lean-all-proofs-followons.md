@@ -118,6 +118,19 @@ goal true; Verus proved the measure nonneg + decreasing on the Z3 side). Touches
 termination_by emission (`to_lean_fn.rs` / `lean_pp.rs:303–352`), so it's a small focused
 arc, not a companion to F2a. 13 goals; P2.
 
+### F2c. Recursion under Prop connectives (pinned 2026-07-10 during F2a validation, deferred)
+
+A drop_first-termination sub-family the companion can NOT close: spec fns whose recursive
+call sits under `||`/`&&` rather than an `if` — e.g. `m3_blinker.no_sym`:
+`len w = 0 ∨ (¬(index w 0 = t) ∧ no_sym (drop_first w) t)`. Verus's spec `||`/`&&` are
+short-circuit (the recursive arm is guarded), but Lean's `Or`/`And` are plain
+applications — the termination checker provides **no branch hypothesis**, so
+`len (drop_first w) < len w` arrives without `¬ len w = 0` in context and is genuinely
+unprovable. Fix shape (deferred): lower spec `||`/`&&` whose RHS contains a self-call to
+the `if-then-else` form (semantically identical by short-circuit definition) — a
+rendering change, not a tactic. Size of family: the post-F4 full-crate re-run measures it
+(≤ 68 goals; at least 2 attested in m3_blinker).
+
 ---
 
 ## F3. Multi-element `seq![a, b]` / array literals (142 rejections + 1,145 List/Vector mistypes)
