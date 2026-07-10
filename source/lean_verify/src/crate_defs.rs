@@ -875,6 +875,9 @@ impl ProofBatch {
     pub fn emit_output(&self, f: &Fun) -> Option<EmitOutput> {
         let r = self.region(f)?;
         Some(EmitOutput {
+            // --emit-lean sidecar: no Lean run follows, the gate
+            // threshold is never consulted.
+            first_theorem_line: None,
             file_path: self.file_path.clone(),
             source_map: LeanSourceMap::ProofFn {
                 fn_name: r.fn_short.clone(),

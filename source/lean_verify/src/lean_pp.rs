@@ -115,6 +115,12 @@ pub struct Landmarks {
     /// order. Used by `LeanSourceMap` to map Lean error lines
     /// back to Rust source positions and obligation kinds (#51).
     pub span_marks: Vec<SpanMarkLandmark>,
+    /// For every `Command::Theorem` (in source order): the 1-indexed
+    /// line of its `theorem` keyword. Islands are structured preamble
+    /// (classes/instances/defs) THEN theorems, so the FIRST entry
+    /// splits emitter territory from user-proof territory — the
+    /// island sorry gate keys on it (decl-head warning positions).
+    pub theorem_heads: Vec<usize>,
 }
 
 /// Per-`SpanMark`-visit landmark. `line` is the 1-indexed Lean
@@ -134,7 +140,7 @@ pub struct SpanMarkLandmark {
 
 impl Landmarks {
     fn new() -> Self {
-        Landmarks { tactic_starts: Vec::new(), span_marks: Vec::new() }
+        Landmarks { tactic_starts: Vec::new(), span_marks: Vec::new(), theorem_heads: Vec::new() }
     }
 }
 
@@ -236,7 +242,10 @@ fn write_command(out: &mut String, cmd: &Command, lm: &mut Landmarks) {
         Command::Def(d) => write_def(out, d, lm),
         Command::DefCurried(d) => write_def_curried(out, d, lm),
         Command::Axiom(a) => write_axiom(out, a, lm),
-        Command::Theorem(t) => write_theorem(out, t, lm),
+        Command::Theorem(t) => {
+            lm.theorem_heads.push(current_line(out));
+            write_theorem(out, t, lm)
+        }
         Command::Datatype(dt) => write_datatype(out, dt, lm),
         Command::Class(c) => write_class(out, c, lm),
         Command::Instance(i) => write_instance(out, i, lm),
