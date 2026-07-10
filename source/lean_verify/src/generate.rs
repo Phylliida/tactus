@@ -1333,12 +1333,9 @@ pub fn emit_proof_fn(
     // the .lean path for inspection and `cat`-style debugging works
     // regardless of which step fails.
     let rendered = pp_commands(&cmds);
-    let source_map = LeanSourceMap::ProofFn {
-        fn_name: short_name(&proof_fn.name.path).to_string(),
-        // One proof fn per file → exactly one `Tactic::Raw` emission.
-        tactic_start_line: rendered.landmarks.tactic_starts.first().copied().unwrap_or(0),
-        tactic_line_count: tactic_body.lines().count().max(1),
-    };
+    // One proof fn per file → exactly one `Tactic::Raw` emission.
+    let source_map = proof_fn_source_map(
+        &proof_fn.name, rendered.landmarks.tactic_starts.first().copied(), tactic_body);
 
     let file_path = lean_file_path(crate_name, &proof_fn.name.path);
     if let Err(e) = write_lean_file(&file_path, &rendered.text) {
@@ -1538,6 +1535,97 @@ fn package_check_enabled() -> bool {
 /// crate-end gate consults this to skip re-elaborating modules the
 /// per-fn path already built — same-process writes, so no staleness
 /// question. Keyed by the module's `.lean` path.
+/// One constructor for proof-fn source maps (review finding: this was
+/// hand-built at 3 sites, and it's load-bearing for diagnostic
+/// attribution). `tactic_start` fallback is 1 — Lean lines are
+/// 1-indexed; the fallback is unreachable for these modules (they
+/// exist to hold a tactic) but a 0 would misattribute by one.
+fn proof_fn_source_map(
+    fn_name: &Fun,
+    tactic_start: Option<usize>,
+    tactic_body: &str,
+) -> to_lean_fn::LeanSourceMap {
+    to_lean_fn::LeanSourceMap::ProofFn {
+        fn_name: short_name(&fn_name.path).to_string(),
+        tactic_start_line: tactic_start.unwrap_or(1),
+        tactic_line_count: tactic_body.lines().count().max(1),
+    }
+}
+
+/// Per-key once-cell dedup (review finding: memo locks were held
+/// across lean subprocess spawns, serializing unrelated bucket
+/// threads). The global lock is held only for the entry lookup;
+/// same-key callers serialize on the CELL (correct dedup), different
+/// keys proceed in parallel.
+fn memo_cell<K: Eq + std::hash::Hash + Clone, V>(
+    memo: &'static std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<K, std::sync::Arc<std::sync::OnceLock<V>>>>>,
+    key: &K,
+) -> std::sync::Arc<std::sync::OnceLock<V>> {
+    let m = memo.get_or_init(Default::default);
+    let mut map = m.lock().unwrap_or_else(|p| p.into_inner());
+    map.entry(key.clone()).or_default().clone()
+}
+
+/// Per-scope package graph (M5d-0, review finding): the inline
+/// transform and the tactic-body dependency scan are scope-wide and
+/// deterministic, but the per-fn check path re-paid them PER FN
+/// (full krate clone + O(fns²·body) ident scans). Owned form so it
+/// memoizes; consumers build a cheap borrowed view per call.
+pub(crate) struct PkgGraph {
+    inlined: std::sync::Arc<KrateX>,
+    /// Emittable tactic proof fns, krate order (names).
+    fns: Vec<Fun>,
+    /// Direct helper deps by name.
+    deps_of: std::collections::HashMap<Fun, Vec<Fun>>,
+}
+
+impl PkgGraph {
+    /// Borrowed view in the shape the emitters consume — O(krate)
+    /// hash lookups; the expensive work happened once at memo fill.
+    fn view(&self) -> (Vec<&FunctionX>, std::collections::HashMap<&Fun, Vec<&FunctionX>>) {
+        let by_name: std::collections::HashMap<&Fun, &FunctionX> =
+            self.inlined.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
+        let fns: Vec<&FunctionX> =
+            self.fns.iter().filter_map(|n| by_name.get(n).copied()).collect();
+        let deps_of = self.fns.iter()
+            .filter_map(|n| {
+                let fx = *by_name.get(n)?;
+                let deps: Vec<&FunctionX> = self.deps_of.get(n)?
+                    .iter().filter_map(|d| by_name.get(d).copied()).collect();
+                Some((&fx.name, deps))
+            })
+            .collect();
+        (fns, deps_of)
+    }
+}
+
+static PKG_GRAPH_MEMO: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<
+        String, std::sync::Arc<std::sync::OnceLock<std::sync::Arc<PkgGraph>>>>>,
+> = std::sync::OnceLock::new();
+
+fn package_graph_for(
+    krate: &KrateX,
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> std::sync::Arc<PkgGraph> {
+    let key = crate::crate_defs::scope_key(crate_name, krate, tactic_bodies);
+    let cell = memo_cell(&PKG_GRAPH_MEMO, &key);
+    cell.get_or_init(|| {
+        let inlined = std::sync::Arc::new(crate::inline_spec::inline_marked_in_krate(krate));
+        let (fns, deps_of) = {
+            let (fns_b, deps_b) = package_dep_graph(&inlined, tactic_bodies);
+            let fns: Vec<Fun> = fns_b.iter().map(|f| f.name.clone()).collect();
+            let deps_of: std::collections::HashMap<Fun, Vec<Fun>> = deps_b.iter()
+                .map(|(k, v)| ((*k).clone(), v.iter().map(|f| f.name.clone()).collect()))
+                .collect();
+            (fns, deps_of)
+        };
+        std::sync::Arc::new(PkgGraph { inlined, fns, deps_of })
+    }).clone()
+}
+
 static PKG_OLEAN_BUILT: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
 > = std::sync::OnceLock::new();
@@ -1566,7 +1654,8 @@ struct MutualVerdict {
 /// formats its OWN region's errors (M5b).
 static MUTUAL_CHECK_MEMO: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<
-        std::path::PathBuf, std::sync::Arc<MutualVerdict>>>,
+        std::path::PathBuf,
+        std::sync::Arc<std::sync::OnceLock<std::sync::Arc<MutualVerdict>>>>>,
 > = std::sync::OnceLock::new();
 
 /// Stmts-olean memo for the package-check path: the `.lean` is written
@@ -1574,7 +1663,8 @@ static MUTUAL_CHECK_MEMO: std::sync::OnceLock<
 /// process (pkg modules import it). `Err` is cached — fail once, not
 /// once per fn.
 static STMTS_OLEAN_MEMO: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, Result<(), String>>>,
+    std::sync::Mutex<std::collections::HashMap<
+        String, std::sync::Arc<std::sync::OnceLock<Result<(), String>>>>>,
 > = std::sync::OnceLock::new();
 
 fn ensure_stmts_olean(
@@ -1585,12 +1675,8 @@ fn ensure_stmts_olean(
     prelude_dir: &Path,
 ) -> Result<(), String> {
     let key = stmts_module_name(defs);
-    let memo = STMTS_OLEAN_MEMO.get_or_init(Default::default);
-    let mut m = memo.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(v) = m.get(&key) {
-        return v.clone();
-    }
-    let result = (|| {
+    let cell = memo_cell(&STMTS_OLEAN_MEMO, &key);
+    cell.get_or_init(|| {
         stmts_for_crate(krate, crate_name, tactic_bodies, defs)
             .ok_or("Stmts module build failed")?;
         let base_path = format!("{}:{}", prelude_dir.display(), defs.dir.display());
@@ -1600,9 +1686,7 @@ fn ensure_stmts_olean(
             None => Ok(()),
             Some((_, out)) => Err(format!("stmts olean build failed:\n{}", out)),
         }
-    })();
-    m.insert(key, result.clone());
-    result
+    }).clone()
 }
 
 /// Verify one tactic proof fn via its package module (M5a). Two-phase:
@@ -1652,24 +1736,21 @@ fn check_proof_fn_via_package(
             Some(format_lean_check_result(result, proof_fn, &path, &source_map))
         }
         Ok(PkgEmitOutcome::Mutual { leaf, path, members }) => {
-            let memo = MUTUAL_CHECK_MEMO.get_or_init(Default::default);
-            let verdict = {
-                let mut m = memo.lock().unwrap_or_else(|p| p.into_inner());
-                m.entry(path.clone()).or_insert_with(|| {
-                    let pkg_dir = path.parent().expect("pkg file has a parent");
-                    // One `--json -o` pass; diagnostics stored on
-                    // success too, so members can surface own-region
-                    // WARNINGS (sorry etc.), not just errors.
-                    match run_lean_json(pkg_dir, &leaf, true, &base_path) {
-                        Ok(r) => std::sync::Arc::new(MutualVerdict {
-                            success: r.success, diagnostics: r.diagnostics,
-                        }),
-                        Err(_) => std::sync::Arc::new(MutualVerdict {
-                            success: false, diagnostics: vec![],
-                        }),
-                    }
-                }).clone()
-            };
+            let cell = memo_cell(&MUTUAL_CHECK_MEMO, &path);
+            let verdict = cell.get_or_init(|| {
+                let pkg_dir = path.parent().expect("pkg file has a parent");
+                // One `--json -o` pass; diagnostics stored on success
+                // too, so members can surface own-region WARNINGS
+                // (sorry etc.), not just errors.
+                match run_lean_json(pkg_dir, &leaf, true, &base_path) {
+                    Ok(r) => std::sync::Arc::new(MutualVerdict {
+                        success: r.success, diagnostics: r.diagnostics,
+                    }),
+                    Err(_) => std::sync::Arc::new(MutualVerdict {
+                        success: false, diagnostics: vec![],
+                    }),
+                }
+            }).clone();
             let me_early = members.iter().find(|m| m.fun == proof_fn.name)
                 .expect("proof fn is a member of its own SCC module");
             let owner_start_of = |line: usize| members.iter()
@@ -1766,8 +1847,15 @@ fn is_emittable_tactic_proof_fn(
 
 /// Lean module name of the crate's Stmts module, derived from the defs
 /// module name so the two scope-naming schemes cannot drift.
+/// Sibling-module name from the defs SCOPE (not string surgery on the
+/// defs module name — review finding: `replacen` breaks silently if
+/// defs naming ever changes).
+fn scope_module_name(kind: &str, defs: &crate::crate_defs::CrateDefs) -> String {
+    format!("Tactus{}_{}", kind, defs.scope)
+}
+
 fn stmts_module_name(defs: &crate::crate_defs::CrateDefs) -> String {
-    defs.module_name.replacen("TactusDefs_", "TactusStmts_", 1)
+    scope_module_name("Stmts", defs)
 }
 
 /// Stmts-module memo: one build + write per scope per process. `None`
@@ -1892,10 +1980,10 @@ fn emit_package_proof_fn(
     tactic_bodies: &std::collections::HashMap<Fun, String>,
     defs: &crate::crate_defs::CrateDefs,
 ) -> Result<PkgEmitOutcome, String> {
-    let inlined_krate = crate::inline_spec::inline_marked_in_krate(krate);
-    let graph = package_dep_graph(&inlined_krate, tactic_bodies);
+    let g = package_graph_for(krate, crate_name, tactic_bodies);
+    let view = g.view();
     emit_package_proof_fn_inner(
-        &inlined_krate, &graph, proof_fn, tactic_body, imports, crate_name,
+        &g.inlined, &view, proof_fn, tactic_body, imports, crate_name,
         tactic_bodies, defs,
     )
 }
@@ -1979,11 +2067,8 @@ fn emit_package_proof_fn_inner(
     let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
         .join(format!("{}.lean", leaf));
     write_lean_file(&path, &rendered.text)?;
-    let source_map = LeanSourceMap::ProofFn {
-        fn_name: short_name(&proof_fn.name.path).to_string(),
-        tactic_start_line: rendered.landmarks.tactic_starts.first().copied().unwrap_or(0),
-        tactic_line_count: tactic_body.lines().count().max(1),
-    };
+    let source_map = proof_fn_source_map(
+        &proof_fn.name, rendered.landmarks.tactic_starts.first().copied(), tactic_body);
     Ok(PkgEmitOutcome::Single { leaf, path, source_map })
 }
 
@@ -2070,11 +2155,7 @@ fn emit_package_mutual_scc(
                 fun: f.name.clone(),
                 short: short_name(&f.name.path).to_string(),
                 tactic_start: *start,
-                source_map: LeanSourceMap::ProofFn {
-                    fn_name: short_name(&f.name.path).to_string(),
-                    tactic_start_line: *start,
-                    tactic_line_count: body.lines().count().max(1),
-                },
+                source_map: proof_fn_source_map(&f.name, Some(*start), body),
             }
         })
         .collect();
@@ -2117,10 +2198,12 @@ pub fn check_package(
     install_emit_tables(krate);
     let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true)
         .ok_or("shared-defs module unavailable (defs build failed or gate unmet)")?;
-    let inlined_krate = crate::inline_spec::inline_marked_in_krate(krate);
-    let graph = package_dep_graph(&inlined_krate, tactic_bodies);
+    let g = package_graph_for(krate, crate_name, tactic_bodies);
+    let graph = g.view();
     let mut leafs: Vec<String> = Vec::new();
+    let mut seen_leafs: std::collections::HashSet<String> = Default::default();
     let mut skipped_sccs: Vec<String> = Vec::new();
+    let mut seen_skips: std::collections::HashSet<String> = Default::default();
     let mut failures: Vec<(String, String)> = Vec::new();
     for f in graph.0.clone() {
         let body = match tactic_bodies.get(&f.name) {
@@ -2128,17 +2211,17 @@ pub fn check_package(
             None => continue,
         };
         match emit_package_proof_fn_inner(
-            &inlined_krate, &graph, f, &body, &f.attrs.lean_imports, crate_name,
+            &g.inlined, &graph, f, &body, &f.attrs.lean_imports, crate_name,
             tactic_bodies, &defs,
         ) {
             Ok(PkgEmitOutcome::Single { leaf, .. }) => leafs.push(leaf),
             Ok(PkgEmitOutcome::Mutual { leaf, .. }) => {
-                if !leafs.contains(&leaf) {
+                if seen_leafs.insert(leaf.clone()) {
                     leafs.push(leaf);
                 }
             }
             Ok(PkgEmitOutcome::UnsupportedScc(reason)) => {
-                if !skipped_sccs.contains(&reason) {
+                if seen_skips.insert(reason.clone()) {
                     skipped_sccs.push(reason);
                 }
             }
@@ -2156,7 +2239,8 @@ pub fn check_package(
     // (M5c): stmts olean via its memo, pkg modules via the built-set.
     let stmts_already = STMTS_OLEAN_MEMO.get()
         .map(|m| matches!(
-            m.lock().unwrap_or_else(|p| p.into_inner()).get(&stmts_mod),
+            m.lock().unwrap_or_else(|p| p.into_inner())
+                .get(&stmts_mod).and_then(|c| c.get()),
             Some(Ok(()))
         ))
         .unwrap_or(false);
@@ -2386,7 +2470,7 @@ fn mutual_module_leaf(scc: &[&FunctionX]) -> String {
 /// Lean module name of the crate's Link module, scope-consistent with
 /// defs/stmts naming.
 fn link_module_name(defs: &crate::crate_defs::CrateDefs) -> String {
-    defs.module_name.replacen("TactusDefs_", "TactusLink_", 1)
+    scope_module_name("Link", defs)
 }
 
 /// Link-module memo — same keying and poisoned-`None` semantics as
@@ -2449,8 +2533,9 @@ fn build_link_module(
     defs: &crate::crate_defs::CrateDefs,
 ) -> Result<(), String> {
     use crate::lean_ast::{Def, Expr as LExpr};
-    let inlined_krate = crate::inline_spec::inline_marked_in_krate(krate);
-    let (fns, deps_of) = package_dep_graph(&inlined_krate, tactic_bodies);
+    let g = package_graph_for(krate, crate_name, tactic_bodies);
+    let (fns, deps_of) = g.view();
+    let inlined_krate: &KrateX = &g.inlined;
     // Partition mutual SCCs: SUPPORTED (no external deps — emitted as
     // one mutual-block module, M3.5) get eta-closed FIRST and their
     // members pre-marked Black; UNSUPPORTED (external deps) fall
