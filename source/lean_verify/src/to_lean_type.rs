@@ -382,7 +382,7 @@ thread_local! {
     /// Both forms are capture-proof against local binders; the second
     /// preserves what namespace-climbing used to resolve, minus the capture
     /// risk.
-    static CRATE_DECLS: std::cell::RefCell<Option<std::collections::HashSet<String>>> =
+    static CRATE_DECLS: std::cell::RefCell<Option<std::sync::Arc<std::collections::HashSet<String>>>> =
         std::cell::RefCell::new(None);
 }
 
@@ -390,7 +390,7 @@ thread_local! {
 /// `generate::install_emit_tables` AFTER the inherent-method rename table —
 /// the set stores naturalized names, so it must be built with the renames
 /// already in place.
-pub(crate) fn install_crate_decls(decls: std::collections::HashSet<String>) {
+pub(crate) fn install_crate_decls(decls: std::sync::Arc<std::collections::HashSet<String>>) {
     CRATE_DECLS.with(|d| *d.borrow_mut() = Some(decls));
 }
 
@@ -414,22 +414,45 @@ thread_local! {
 /// `CURRENT_DECL_SELF`), restoring the previous set afterwards. Union
 /// scoping: `spec_fn_to_ast` pushes its own singleton inside the mutual
 /// group's wrapper — member bodies must still resolve their siblings.
+///
+/// Restore is a Drop guard: renders DO panic and ARE recovered
+/// (`push_lenient` / `guard_build` catch_unwind) — without the guard, a
+/// panic inside `f` would leak the names into the thread-local for the
+/// rest of the thread's life, making later same-thread renders emit
+/// those names relative and silently resurrecting the B1a capture bug.
+/// `clear_self_decls` in `install_emit_tables` is the belt to this
+/// suspenders.
 pub(crate) fn with_self_decls<T>(
     rel_names: impl IntoIterator<Item = String>,
     f: impl FnOnce() -> T,
 ) -> T {
-    let added: Vec<String> = CURRENT_DECL_SELF.with(|s| {
-        let mut set = s.borrow_mut();
-        rel_names.into_iter().filter(|n| set.insert(n.clone())).collect()
-    });
-    let out = f();
-    CURRENT_DECL_SELF.with(|s| {
-        let mut set = s.borrow_mut();
-        for n in &added {
-            set.remove(n);
+    struct Restore {
+        added: Vec<String>,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURRENT_DECL_SELF.with(|s| {
+                let mut set = s.borrow_mut();
+                for n in &self.added {
+                    set.remove(n);
+                }
+            });
         }
-    });
-    out
+    }
+    let _restore = Restore {
+        added: CURRENT_DECL_SELF.with(|s| {
+            let mut set = s.borrow_mut();
+            rel_names.into_iter().filter(|n| set.insert(n.clone())).collect()
+        }),
+    };
+    f()
+}
+
+/// Reset the self-decl set. Called by `generate::install_emit_tables` at
+/// every emission entry point — a fresh emission must never inherit
+/// leaked self-names from a panicked-and-recovered render on this thread.
+pub(crate) fn clear_self_decls() {
+    CURRENT_DECL_SELF.with(|s| s.borrow_mut().clear());
 }
 
 /// Single-name convenience for `with_self_decls`.

@@ -55,6 +55,21 @@ pub fn check_references(cmds: &[Command]) -> Vec<Violation> {
     violations
 }
 
+/// Insert a declared name into `defined` — and, for root-anchored names
+/// (`_root_.{ns}.rel`), ALSO the relative form (`rel`): a recursive decl's
+/// SELF-reference renders relatively (see `to_lean_type::CURRENT_DECL_SELF`),
+/// so a crate-root recursive fn's bare self-call must resolve against the
+/// anchored decl name (2026-07-09 review, finding #9 — debug builds
+/// rejected crate-root self-recursion the emitted Lean accepts).
+fn insert_defined(defined: &mut HashSet<String>, name: &str) {
+    defined.insert(name.to_string());
+    if let Some(rest) = name.strip_prefix("_root_.") {
+        if let Some((_ns, rel)) = rest.split_once('.') {
+            defined.insert(rel.to_string());
+        }
+    }
+}
+
 fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Violation>) {
     match cmd {
         // Commands that introduce no term references and add no names we need to track:
@@ -67,7 +82,7 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
         // A Def adds its own name (supports self-recursion) and checks its
         // body against that name + params.
         Command::Def(d) => {
-            defined.insert(d.name.clone());
+            insert_defined(defined, &d.name);
             let mut scope = scope_from_binders(&d.binders);
             check_expr(&d.ret_ty, defined, &mut scope, violations, &d.name);
             check_expr(&d.body, defined, &mut scope, violations, &d.name);
@@ -81,7 +96,7 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
         // (e.g., implicit `{A : Type}` for generic datatypes — #108)
         // plus each equation's pattern-bound names.
         Command::DefCurried(d) => {
-            defined.insert(d.name.clone());
+            insert_defined(defined, &d.name);
             let mut scope = scope_from_binders(&d.binders);
             for b in &d.binders {
                 check_expr(&b.ty, defined, &mut scope, violations, &d.name);
@@ -98,7 +113,7 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
         // downstream references resolve. Binder types may reference
         // earlier top-level names; check them.
         Command::Axiom(a) => {
-            defined.insert(a.name.clone());
+            insert_defined(defined, &a.name);
             let mut scope = scope_from_binders(&a.binders);
             for b in &a.binders {
                 check_expr(&b.ty, defined, &mut scope, violations, &a.name);
@@ -115,11 +130,11 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
         }
 
         Command::Datatype(dt) => {
-            defined.insert(dt.name.clone());
+            insert_defined(defined, &dt.name);
         }
 
         Command::Class(c) => {
-            defined.insert(c.name.clone());
+            insert_defined(defined, &c.name);
             // Method type signatures + default bodies can reference
             // types and other class methods — check them under the
             // class's typ_params scope.
@@ -166,10 +181,10 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
             // already in `defined` when Tree's body is visited.
             for c in inner {
                 match c {
-                    Command::Def(d) => { defined.insert(d.name.clone()); }
-                    Command::DefCurried(d) => { defined.insert(d.name.clone()); }
-                    Command::Axiom(a) => { defined.insert(a.name.clone()); }
-                    Command::Datatype(dt) => { defined.insert(dt.name.clone()); }
+                    Command::Def(d) => { insert_defined(defined, &d.name); }
+                    Command::DefCurried(d) => { insert_defined(defined, &d.name); }
+                    Command::Axiom(a) => { insert_defined(defined, &a.name); }
+                    Command::Datatype(dt) => { insert_defined(defined, &dt.name); }
                     _ => {}
                 }
             }

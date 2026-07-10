@@ -51,8 +51,11 @@ pub(crate) fn lean_out_root() -> PathBuf {
 fn lean_file_path(crate_name: &str, fn_path: &vir::ast::Path) -> PathBuf {
     let ns = sanitize(crate_name);
     // `lean_name_relative`: the filename is an artifact key, not Lean text —
-    // the root-anchor prefix (`_root_.{ns}.`) must not leak into it.
-    let leaf = crate::to_lean_type::lean_name_relative(fn_path).replace('.', "__");
+    // the root-anchor prefix (`_root_.{ns}.`) must not leak into it, and
+    // neither should «»-quoting of reserved-word fn names (finding #8).
+    let leaf = crate::to_lean_type::lean_name_relative(fn_path)
+        .replace(['«', '»'], "")
+        .replace('.', "__");
     lean_out_root().join(ns).join(format!("{}.lean", leaf))
 }
 
@@ -495,18 +498,26 @@ pub(crate) fn spec_world_cmds(
     // tripwires keep guarding per-fn emission.
     lenient: bool,
 ) -> Vec<Command> {
-    let push_lenient = |cmds: &mut Vec<Command>, what: &str, f: &mut dyn FnMut() -> Vec<Command>| {
+    // Returns whether the commands were actually pushed — lenient mode can
+    // swallow a panic and skip; emissions that DEPEND on a prior item
+    // having landed (the seq measure companion) consult the result
+    // (2026-07-09 review, finding #7).
+    let push_lenient = |cmds: &mut Vec<Command>, what: &str, f: &mut dyn FnMut() -> Vec<Command>| -> bool {
         if !lenient {
             cmds.extend(f());
-            return;
+            return true;
         }
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f())) {
-            Ok(v) => cmds.extend(v),
+            Ok(v) => {
+                cmds.extend(v);
+                true
+            }
             Err(payload) => {
                 let msg = payload.downcast_ref::<&str>().map(|s| s.to_string())
                     .or_else(|| payload.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "<non-string panic payload>".to_string());
                 eprintln!("tactus: skipped un-renderable {} in shared defs: {}", what, msg);
+                false
             }
         }
     };
@@ -1029,11 +1040,23 @@ pub(crate) fn spec_world_cmds(
             let mut gdeps = std::collections::HashSet::new();
             let mut ideps = std::collections::HashSet::new();
             for spec in f.require.iter().chain(f.ensure.0.iter()).chain(f.ensure.1.iter()) {
+                // Fun-level deps via dep_order's OWN collector — it covers
+                // ConstVar / StaticVar / ExecFnByName / Fuel / the
+                // DynamicResolved target, which a hand-rolled Call-only
+                // match missed (2026-07-09 review, finding #5: a broadcast
+                // lemma mentioning a spec const flushed before the const's
+                // def — reproduced as a forward reference in the defs
+                // module).
+                let mut funs: Vec<&vir::ast::Fun> = Vec::new();
+                dep_order::collect_fun_refs(spec, &mut funs);
+                for fun in funs {
+                    if let Some(&gi) = fn_group_of.get(fun) {
+                        gdeps.insert(gi);
+                    }
+                }
+                // Instance deps: the dispatch dictionaries on calls.
                 dep_order::walk_expr(spec, &mut |e| {
-                    if let ExprX::Call(CallTarget::Fun(_, fun, _, impl_paths, _, _), _, _) = &e.x {
-                        if let Some(&gi) = fn_group_of.get(fun) {
-                            gdeps.insert(gi);
-                        }
+                    if let ExprX::Call(CallTarget::Fun(_, _, _, impl_paths, _, _), _, _) = &e.x {
                         for ip in impl_paths.iter() {
                             if let ImplPath::TraitImplPath(p) = ip {
                                 if let Some(&j) = instance_of.get(p) {
@@ -1046,7 +1069,16 @@ pub(crate) fn spec_world_cmds(
             }
             (gdeps, ideps)
         }).collect();
+    // Index of the subrange-len axiom among the broadcast axioms — the
+    // seq measure companion cites it, so its successful emission gates
+    // the companion (finding #7).
+    let subrange_ax_idx: Option<usize> = bc_lemma_funcs.iter().position(|a| {
+        crate::to_lean_type::lean_name_relative(&a.name.path) == "seq.axiom_seq_subrange_len"
+    });
     let mut axiom_done: Vec<bool> = vec![false; bc_lemma_funcs.len()];
+    // Whether each axiom's push actually landed (vs lenient-skipped) —
+    // consulted by the seq measure companion gate (finding #7).
+    let mut axiom_ok: Vec<bool> = vec![false; bc_lemma_funcs.len()];
     let mut processed_groups: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut processed_instances: std::collections::HashSet<usize> = std::collections::HashSet::new();
     // `force`: final flush — emit stragglers even if a dep was never
@@ -1054,6 +1086,7 @@ pub(crate) fn spec_world_cmds(
     // matching the old always-at-the-end behavior).
     let flush_ready_axioms = |cmds: &mut Vec<Command>,
                               done: &mut Vec<bool>,
+                              ok: &mut Vec<bool>,
                               pg: &std::collections::HashSet<usize>,
                               pi: &std::collections::HashSet<usize>,
                               force: bool| {
@@ -1068,7 +1101,7 @@ pub(crate) fn spec_world_cmds(
                 // (e.g. `axiom_hashmap_deepview_borrow`'s `<K as DeepView>::V`)
                 // — same generalized projection-lifting as standalone spec
                 // fns. No-op for projection-free lemmas (the common case).
-                push_lenient(cmds, "broadcast axiom", &mut || {
+                ok[ai] = push_lenient(cmds, "broadcast axiom", &mut || {
                     // A lemma whose facts dispatch to a `choose`-using fn
                     // needs `[Nonempty T]` too. Nonempty bounds FIRST,
                     // augmentation second (same order as `augment`) —
@@ -1084,7 +1117,7 @@ pub(crate) fn spec_world_cmds(
             }
         }
     };
-    flush_ready_axioms(&mut cmds, &mut axiom_done, &processed_groups, &processed_instances, false);
+    flush_ready_axioms(&mut cmds, &mut axiom_done, &mut axiom_ok, &processed_groups, &processed_instances, false);
 
     // No spec-fn groups at all: proof classes have nothing to wait on.
     if last_group_pos.is_none() {
@@ -1095,6 +1128,9 @@ pub(crate) fn spec_world_cmds(
         });
     }
     for (pos, step) in order.iter().enumerate() {
+        // Whether this step's own emission landed (vs lenient-skipped) —
+        // gates dependent follow-ups (the seq measure companion).
+        let mut step_pushed = false;
         match step {
             dep_order::EmitStep::Group(i) => match &groups[*i] {
                 FnGroup::Single(f) => {
@@ -1106,7 +1142,7 @@ pub(crate) fn spec_world_cmds(
                             "tactus: skipped builtin-bodied spec fn `{}` in shared defs (no Lean form for BuiltinSpecFun)",
                             short_name(&f.name.path));
                     } else {
-                    push_lenient(&mut cmds, "spec fn", &mut || {
+                    step_pushed = push_lenient(&mut cmds, "spec fn", &mut || {
                         let augmented = augment(f);
                         to_lean_fn::spec_fn_to_ast(&augmented, ectx)
                     });
@@ -1139,12 +1175,13 @@ pub(crate) fn spec_world_cmds(
                     }
                 }
             },
-            dep_order::EmitStep::Instance(j) =>
-                push_lenient(&mut cmds, "trait instance", &mut || {
+            dep_order::EmitStep::Instance(j) => {
+                step_pushed = push_lenient(&mut cmds, "trait instance", &mut || {
                     let mut tmp = Vec::new();
                     emit_instance(&mut tmp, *j);
                     tmp
-                }),
+                });
+            }
         }
         // Mark the step processed (even when lenient mode SKIPPED its
         // body — a waiting axiom must not wait forever) and flush any
@@ -1153,7 +1190,7 @@ pub(crate) fn spec_world_cmds(
             dep_order::EmitStep::Group(i) => { processed_groups.insert(*i); }
             dep_order::EmitStep::Instance(j) => { processed_instances.insert(*j); }
         }
-        flush_ready_axioms(&mut cmds, &mut axiom_done, &processed_groups, &processed_instances, false);
+        flush_ready_axioms(&mut cmds, &mut axiom_done, &mut axiom_ok, &processed_groups, &processed_instances, false);
         // vstd seq measure companions (B3): right after `Seq.drop_first`/
         // `Seq.drop_last` emits (and after the axiom flush above — the
         // subrange-len axiom's deps precede this def's group, so the
@@ -1163,10 +1200,18 @@ pub(crate) fn spec_world_cmds(
             if let FnGroup::Single(f) = &groups[*i] {
                 let rel = crate::to_lean_type::lean_name_relative(&f.name.path);
                 if rel == "Seq.drop_first" || rel == "Seq.drop_last" {
-                    if let Some(cmd) =
-                        seq_measure_companion_cmd(f, &rel, &all_fns, bc_lemma_funcs)
-                    {
-                        cmds.push(cmd);
+                    // Gates (finding #7): the def itself AND the subrange
+                    // axiom the canned proof cites must have actually
+                    // landed — lenient mode can skip either, and an
+                    // unguarded companion referencing a never-declared
+                    // name would poison the whole shared-defs file.
+                    let ax_landed = subrange_ax_idx.map_or(false, |i| axiom_ok[i]);
+                    if step_pushed && ax_landed {
+                        if let Some(cmd) =
+                            seq_measure_companion_cmd(f, &rel, &all_fns, bc_lemma_funcs)
+                        {
+                            push_lenient(&mut cmds, "seq measure companion", &mut || vec![cmd.clone()]);
+                        }
                     }
                 }
             }
@@ -1185,7 +1230,7 @@ pub(crate) fn spec_world_cmds(
     // cross-crate axiomatized ensures: vstd verified the lemma
     // (`vargo build` → 0 errors); we stipulate it. The user opted in
     // explicitly with `broadcast use <group>;` (#122).
-    flush_ready_axioms(&mut cmds, &mut axiom_done, &processed_groups, &processed_instances, true);
+    flush_ready_axioms(&mut cmds, &mut axiom_done, &mut axiom_ok, &processed_groups, &processed_instances, true);
     cmds
 }
 
@@ -1267,6 +1312,10 @@ pub(crate) fn install_emit_tables(krate: &KrateX, crate_name: &str) {
     // `lean_name`, it must see the CURRENT crate's root-anchor, not a
     // stale one from a previous emission on this thread.
     crate::to_lean_type::install_crate_ns(crate_name);
+    // Belt to with_self_decls' drop-guard suspenders: a panicked-and-
+    // recovered render (push_lenient / guard_build) must never leak
+    // self-names into a fresh emission (2026-07-09 review, finding #3).
+    crate::to_lean_type::clear_self_decls();
     install_inherent_method_renames(krate);
     install_datatype_field_bounds(krate);
     // Decl set AFTER the rename table: it stores naturalized relative
@@ -1280,18 +1329,48 @@ pub(crate) fn install_emit_tables(krate: &KrateX, crate_name: &str) {
 /// constructor heads render as `{datatype}.{variant}` whose head segment is
 /// what reference-anchoring keys on). See `to_lean_type::CRATE_DECLS`.
 fn install_crate_decls(krate: &KrateX) {
-    let mut decls = std::collections::HashSet::new();
-    for f in krate.functions.iter() {
-        decls.insert(crate::to_lean_type::lean_name_relative(&f.x.name.path));
+    // Fingerprint cache: install_emit_tables runs once per emitted fn and
+    // this set costs O(krate) String renders to build — O(N²) per crate
+    // uncached (2026-07-09 review, finding #10). Keyed on the krate's
+    // address plus shape counts; a false hit would need the allocator to
+    // reuse the exact address for a different krate with identical
+    // fn/datatype/trait counts on the same thread, and the failure mode
+    // is loud (wrong anchoring → Lean unknown identifier), not silent.
+    type Fp = (usize, usize, usize, usize);
+    thread_local! {
+        static DECLS_CACHE: std::cell::RefCell<
+            Option<(Fp, std::sync::Arc<std::collections::HashSet<String>>)>,
+        > = std::cell::RefCell::new(None);
     }
-    for d in krate.datatypes.iter() {
-        if let vir::ast::Dt::Path(p) = &d.x.name {
-            decls.insert(crate::to_lean_type::lean_name_relative(p));
+    let fp: Fp = (
+        krate as *const KrateX as usize,
+        krate.functions.len(),
+        krate.datatypes.len(),
+        krate.traits.len(),
+    );
+    let cached = DECLS_CACHE.with(|c| {
+        c.borrow().as_ref().filter(|(k, _)| *k == fp).map(|(_, v)| v.clone())
+    });
+    let decls = match cached {
+        Some(d) => d,
+        None => {
+            let mut decls = std::collections::HashSet::new();
+            for f in krate.functions.iter() {
+                decls.insert(crate::to_lean_type::lean_name_relative(&f.x.name.path));
+            }
+            for d in krate.datatypes.iter() {
+                if let vir::ast::Dt::Path(p) = &d.x.name {
+                    decls.insert(crate::to_lean_type::lean_name_relative(p));
+                }
+            }
+            for tr in krate.traits.iter() {
+                decls.insert(crate::to_lean_type::lean_name_relative(&tr.x.name));
+            }
+            let decls = std::sync::Arc::new(decls);
+            DECLS_CACHE.with(|c| *c.borrow_mut() = Some((fp, decls.clone())));
+            decls
         }
-    }
-    for tr in krate.traits.iter() {
-        decls.insert(crate::to_lean_type::lean_name_relative(&tr.x.name));
-    }
+    };
     crate::to_lean_type::install_crate_decls(decls);
 }
 
