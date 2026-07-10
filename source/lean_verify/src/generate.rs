@@ -478,6 +478,36 @@ fn body_references_builtin_spec_fun(func: &FunctionX) -> bool {
     found.get()
 }
 
+/// Segment tag for defs partitioning (M5d-3): commands from a
+/// segment's start index up to the next segment's start carry its tag.
+/// `Base` = the entangled machinery (datatypes, classes, instances,
+/// instance-prereq spec fns) that stays in one part; `FnGroup` = the
+/// partitionable bulk; `ProofClasses`/`BcAxiom` are emitted last and
+/// referenced only from OUTSIDE defs — they ride the umbrella.
+#[derive(Clone)]
+pub(crate) enum DefsSeg {
+    Base,
+    /// One spec-fn group (single or mutual): the fns it defines and the
+    /// fn-level references its bodies/signatures make (edge source for
+    /// the module graph; datatype refs resolve to Base implicitly).
+    FnGroup { fns: Vec<Fun>, refs: Vec<Fun> },
+    /// A trait instance: the spec fns it needs emitted first — these
+    /// get pulled into Base (transitively) so instances can stay there.
+    Instance { prereq_fns: Vec<Fun> },
+    ProofClasses,
+    BcAxiom,
+}
+
+/// Fn-level references of one spec fn: body call refs + nothing else
+/// (signature datatype refs point at Base, which every part imports).
+fn spec_fn_refs(f: &FunctionX) -> Vec<Fun> {
+    let mut refs: Vec<&Fun> = Vec::new();
+    if let Some(body) = &f.body {
+        dep_order::collect_fun_refs(body, &mut refs);
+    }
+    refs.into_iter().cloned().collect()
+}
+
 pub(crate) fn spec_world_cmds(
     krate: &KrateX,
     ectx: &crate::emit_ctx::EmitCtx,
@@ -497,6 +527,17 @@ pub(crate) fn spec_world_cmds(
     // tripwires keep guarding per-fn emission.
     lenient: bool,
 ) -> Vec<Command> {
+    spec_world_cmds_tagged(krate, ectx, dep_walk_roots, emit_accessors, bc_lemma_funcs, lenient).0
+}
+
+pub(crate) fn spec_world_cmds_tagged(
+    krate: &KrateX,
+    ectx: &crate::emit_ctx::EmitCtx,
+    dep_walk_roots: &[&FunctionX],
+    emit_accessors: bool,
+    bc_lemma_funcs: &[&FunctionX],
+    lenient: bool,
+) -> (Vec<Command>, Vec<(usize, DefsSeg)>) {
     let push_lenient = |cmds: &mut Vec<Command>, what: &str, f: &mut dyn FnMut() -> Vec<Command>| {
         if !lenient {
             cmds.extend(f());
@@ -513,6 +554,7 @@ pub(crate) fn spec_world_cmds(
         }
     };
     let mut cmds: Vec<Command> = Vec::new();
+    let mut segs: Vec<(usize, DefsSeg)> = vec![(0, DefsSeg::Base)];
     let all_fns: Vec<&FunctionX> = krate.functions.iter().map(|f| &f.x).collect();
     let spec_fn_map = dep_order::build_spec_fn_map(&all_fns);
     let mut refs = dep_order::collect_references(&spec_fn_map, &ectx.fn_map, dep_walk_roots);
@@ -988,11 +1030,13 @@ pub(crate) fn spec_world_cmds(
 
     // No spec-fn groups at all: proof classes have nothing to wait on.
     if last_group_pos.is_none() {
+        segs.push((cmds.len(), DefsSeg::ProofClasses));
         push_lenient(&mut cmds, "proof-method trait classes", &mut || {
             let mut tmp = Vec::new();
             emit_proof_classes(&mut tmp);
             tmp
         });
+        segs.push((cmds.len(), DefsSeg::Base));
     }
     for (pos, step) in order.iter().enumerate() {
         match step {
@@ -1006,10 +1050,14 @@ pub(crate) fn spec_world_cmds(
                             "tactus: skipped builtin-bodied spec fn `{}` in shared defs (no Lean form for BuiltinSpecFun)",
                             short_name(&f.name.path));
                     } else {
+                    segs.push((cmds.len(), DefsSeg::FnGroup {
+                        fns: vec![f.name.clone()], refs: spec_fn_refs(f),
+                    }));
                     push_lenient(&mut cmds, "spec fn", &mut || {
                         let augmented = augment(f);
                         to_lean_fn::spec_fn_to_ast(&augmented, ectx)
                     });
+                    segs.push((cmds.len(), DefsSeg::Base));
                     }
                 }
                 FnGroup::Mutual(fns) => {
@@ -1017,6 +1065,10 @@ pub(crate) fn spec_world_cmds(
                         eprintln!(
                             "tactus: skipped builtin-bodied mutual spec-fn group in shared defs (no Lean form for BuiltinSpecFun)");
                     } else {
+                    segs.push((cmds.len(), DefsSeg::FnGroup {
+                        fns: fns.iter().map(|f| f.name.clone()).collect(),
+                        refs: fns.iter().flat_map(|f| spec_fn_refs(f)).collect(),
+                    }));
                     push_lenient(&mut cmds, "mutual spec fns", &mut || {
                         let inner: Vec<Command> = fns.iter()
                             .flat_map(|f| {
@@ -1026,22 +1078,36 @@ pub(crate) fn spec_world_cmds(
                             .collect();
                         vec![Command::Mutual(inner)]
                     });
+                    segs.push((cmds.len(), DefsSeg::Base));
                     }
                 }
             },
-            dep_order::EmitStep::Instance(j) =>
+            dep_order::EmitStep::Instance(j) => {
+                let prereq_fns: Vec<Fun> = instance_keys.get(*j)
+                    .map(|(_, methods)| methods.iter()
+                        .flat_map(|m| {
+                            std::iter::once(m.name.clone())
+                                .chain(spec_fn_refs(m))
+                        })
+                        .collect())
+                    .unwrap_or_default();
+                segs.push((cmds.len(), DefsSeg::Instance { prereq_fns }));
                 push_lenient(&mut cmds, "trait instance", &mut || {
                     let mut tmp = Vec::new();
                     emit_instance(&mut tmp, *j);
                     tmp
-                }),
+                });
+                segs.push((cmds.len(), DefsSeg::Base));
+            }
         }
         if Some(pos) == last_group_pos {
+            segs.push((cmds.len(), DefsSeg::ProofClasses));
             push_lenient(&mut cmds, "proof-method trait classes", &mut || {
                 let mut tmp = Vec::new();
                 emit_proof_classes(&mut tmp);
                 tmp
             });
+            segs.push((cmds.len(), DefsSeg::Base));
         }
     }
     // Cross-crate broadcast lemmas (#122), emitted as Lean axioms
@@ -1052,6 +1118,7 @@ pub(crate) fn spec_world_cmds(
     // Sound by the same argument as cross-crate axiomatized ensures:
     // vstd verified the lemma (`vargo build` → 1530/0); we stipulate
     // it. The user opted in explicitly with `broadcast use <group>;`.
+    segs.push((cmds.len(), DefsSeg::BcAxiom));
     for &f in bc_lemma_funcs {
         // Lift assoc-type projections in the lemma's ensure/require (e.g.
         // `axiom_hashmap_deepview_borrow`'s `<K as DeepView>::V`) — same
@@ -1070,7 +1137,7 @@ pub(crate) fn spec_world_cmds(
             vec![to_lean_fn::broadcast_lemma_axiom_cmd(&augmented, ectx)]
         });
     }
-    cmds
+    (cmds, segs)
 }
 
 /// Ambient thread-local tables every render path needs installed
@@ -1513,7 +1580,7 @@ static PACKAGE_ENABLED: std::sync::atomic::AtomicBool =
 pub fn set_package_enabled(on: bool) {
     PACKAGE_ENABLED.store(on, std::sync::atomic::Ordering::SeqCst);
 }
-fn package_enabled() -> bool {
+pub(crate) fn package_enabled() -> bool {
     PACKAGE_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
@@ -1527,7 +1594,7 @@ static PACKAGE_CHECK_ENABLED: std::sync::atomic::AtomicBool =
 pub fn set_package_check_enabled(on: bool) {
     PACKAGE_CHECK_ENABLED.store(on, std::sync::atomic::Ordering::SeqCst);
 }
-fn package_check_enabled() -> bool {
+pub(crate) fn package_check_enabled() -> bool {
     PACKAGE_CHECK_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
 }
 

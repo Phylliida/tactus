@@ -788,7 +788,7 @@ fn place_variant_name(p: &PlaceX) -> &'static str {
 }
 
 /// Collect all `&Fun` references from an expression. Zero Arc clones.
-fn collect_fun_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a Fun>) {
+pub(crate) fn collect_fun_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a Fun>) {
     walk_expr(expr, &mut |e| {
         match &e.x {
             ExprX::Call(target, _, _) => match target {
