@@ -320,6 +320,48 @@ pure Lean core, no Mathlib needed for any architectural question.
 Net: **no blockers found; two design corrections (F2, F3) folded into §2.2 and
 §4.3.** M1 can start on this shape directly.
 
+**M5d status (2026-07-10): d-0/d-1/d-2 DONE; d-3 designed, build pending.**
+- **M5d-0** (`80482fe`): consolidation — PkgGraph memo (inline+dep-scan
+  once per scope, owned form + borrowed view), scope field on CrateDefs
+  + scope_module_name (replacen surgery gone), proof_fn_source_map
+  (3 sites, 1-indexed fallback), memo_cell per-key once-cells (no locks
+  across lean spawns), HashSet dedups.
+- **M5d-1** (folded into d-3): stable names VERIFIED FEASIBLE — per-fn
+  checks always receive self.vir_crate (verifier.rs:1801), one scope per
+  process. HAZARD pinned: the exec path uses simplified_krate
+  (verifier.rs:1976) — a second legitimate scope; naive stable names
+  would collide. Design the naming once, with partitioned defs.
+- **M5d-2** (`9d9a223`): per-fn stmt modules. build_stmt_partition
+  (one preamble + one EmitCtx per scope, N files); pkg modules import
+  exactly self+direct-dep stmt modules — the import list IS the
+  dependency manifest; outcomes carry stmt_modules; per-module olean
+  ensure with reuse counting; Link drops the monolithic stmts import
+  (transitive via pkg imports). chain = 8 modules (6 reused).
+- **M5d-3 design findings** (from the read, for the build session):
+  (1) `render_and_build` already has an `up_to_date` content-compare
+  per file — partitioning MULTIPLIES existing cross-run caching, no new
+  cache mechanism needed at this stage. (2) TRAP: chain-imports by
+  first-appearance order break on interleaved modules (item a2∈M1
+  depending on b1∈M2 while a1∈M1 precedes b1 — genuine module-level
+  cycles); TRAP: partition-by-contiguous-runs gives unstable run
+  numbers (kills append-stability). The designed SCC-merge over the
+  item graph projected to modules is UNAVOIDABLE. (3) Therefore
+  dep_order must expose item→item EDGES (today collect_references
+  accumulates reachable sets only) and spec_world_cmds must tag
+  emitted commands with their owning item (rider rule: unnamed/Raw
+  commands attach to the preceding named item, keeping
+  datatype+accessors together). (4) Pre-M5e cross-run semantics must
+  stay conservative: rebuild a module if its content changed OR any
+  imported defs module was rebuilt (Lean trusts LEAN_PATH at load — no
+  import-hash check — so skipping a consumer after a dependency
+  changed is only sound under M5e's superset waiver, not by default).
+  (5) The build_defs attempt LADDER (full roots → proof+union → proof)
+  interacts with partitioning: attempt selection stays whole-scope
+  (one ladder verdict), partitioning applies to the winning render.
+  (6) Stable names: TactusDefs_<crate>__<module> for the vir_crate
+  scope; the exec/simplified_krate scope keeps its fingerprint (or
+  gains a distinct `__exec` tag) until unified.
+
 **Code review (same day, /code-review high):** 7 finder angles + verify
 pass over the branch. NO soundness bugs; one correctness finding —
 warning diagnostics dropped by the package fast path AND (pre-existing)
