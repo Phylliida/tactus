@@ -340,6 +340,29 @@ Net: **no blockers found; two design corrections (F2, F3) folded into §2.2 and
 - **M5e-2 (parallel part/stmt builds) deliberately deferred** until the
   tgt numbers say where the wall-clock actually goes.
 
+**ISLAND CACHE ARC (2026-07-10, post-M5) — warm tgt at the floor.**
+5 commits (`19cb850`..`e4d9932`), suite 533/0: (1) sorry FATAL on
+island paths — structural discrimination via the `theorem_heads` pp
+landmark (Lean warns at decl heads, re-warns per inheriting decl, so
+neither region tests nor placeholder counting works); admit on islands
+now fails, test-pinned. (2) `toolchain_fingerprint()` shared helper;
+prelude marker hardened (stale-olean-after-toolchain-bump gap closed).
+(3) `.verified` island markers (fingerprint content; removed before
+any live run; failures never cache) + stable exec defs scope
+(`{crate}_exec`). (4) `<scope>.ladder` success sidecar — skip straight
+to the winning attempt. (5) FAILED ladder record with per-attempt
+render hashes (hash_only render mode, zero filesystem effects) — the
+tgt exec family fails ALL attempts and previously re-ran the whole
+failing ladder every run.
+
+tgt (release, -V cache, package-check): warm 201s → **88s = the
+emit-only floor (89s)**. Lean-side warm waste ~112s → ~0s. The floor
+is VERUS-SIDE (rustc + VIR + emission machinery over 3116 fns) — the
+next frontier, needs profiling, unrelated to Lean elaboration.
+Follow-ups noted: trait-default placeholder → named axiom (kills the
+sorry-discrimination need); M6 exec packages (blocked on Tactus.Ref
+closure ABI).
+
 **M5e MEASURED ON TGT (2026-07-10) — M5 COMPLETE.**
 tactus-group-theory (3116 fns, release binary, isolated TACTUS_LEAN_OUT):
 - COLD (no Z3 cache): 225s, **3116 verified / 0 errors, ZERO island
