@@ -303,6 +303,32 @@ impl<'a> RenderCtx<'a> {
         }
     }
 
+    /// Sibling of [`Self::fn_param_typs`] for the RESULT side: the
+    /// callee's declared return typ, instantiated with the call-site
+    /// typ args. Ground truth for a rendered application's Lean type —
+    /// the emitted def's return type is `typ_to_expr` of exactly this
+    /// typ — so the typed spine's Call arm reports it as the actual
+    /// (B5a, DESIGN-B5-typed-spine-calls.md). The SST claim can differ
+    /// by a ref-decoration when the call sits in an inlined `&self`
+    /// receiver position: `sst_elaborate` splices the receiver arg
+    /// with its call-site claim, which poly.rs needs — the lie is
+    /// Lean-perspective-only, so the renderer is the seam.
+    pub fn fn_ret_typ(&self, fun: &Fun, typ_args: &[Typ]) -> Option<Typ> {
+        let fn_map = self.fn_map?;
+        let func = fn_map.get(fun)?;
+        if !typ_args.is_empty() && typ_args.len() == func.typ_params.len() {
+            let typ_substs: HashMap<Ident, Typ> = func
+                .typ_params
+                .iter()
+                .cloned()
+                .zip(typ_args.iter().cloned())
+                .collect();
+            Some(vir::sst_util::subst_typ(&typ_substs, &func.ret.x.typ))
+        } else {
+            Some(func.ret.x.typ.clone())
+        }
+    }
+
     /// Look up a Var name in the render-time substitution map and,
     /// if present, return the substituted value bridged to `slot_typ`
     /// via `coerce_lexpr`. Returns `None` if no substitution is

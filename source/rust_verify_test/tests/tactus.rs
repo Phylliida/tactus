@@ -2861,6 +2861,35 @@ test_verify_one_file! {
     }
 }
 
+// ── KNOWN BUG B5a (pinned as Err): a spec-fn CALL in an inlined
+// `&self` receiver position carries a Ref-decorated CLAIMED typ (the
+// vstd `#[verifier::inline]` method's self param; sst_elaborate keeps
+// call-site claims for poly.rs) while the rendered application is
+// bare — the typed spine's Field/IsVariant deref count, taken off the
+// claim, emits `.deref` on a bare value: Lean "Invalid field deref".
+// All 55 crate-wide Invalid-field errors in the 2026-07-09 gt run are
+// this shape (e.g. `apply_step(...).is_some()`, britton.rs:270).
+// DESIGN-B5-typed-spine-calls.md. FLIP THIS PIN TO Ok WHEN B5a LANDS.
+test_verify_one_file! {
+    #[test] test_spec_call_receiver_deref_claim verus_code! {
+        use vstd::prelude::*;
+        spec fn wrap(x: int) -> Option<int> {
+            Some(x)
+        }
+        #[verifier::tactus_auto]
+        proof fn uses_receiver_call(x: int)
+            requires wrap(x).is_some(),
+            ensures wrap(x).is_some(),
+        {}
+    } => Err(err) => {
+        assert!(
+            err.errors.iter().any(|e| e.message.contains("Invalid field")),
+            "expected the B5a Invalid-field-deref failure (fixed? flip this pin to Ok!), got: {:?}",
+            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+        );
+    }
+}
+
 // ── Arch-width integer bounds (usize::MAX in specs) ───────────────
 // `usize::MAX` is `IntegerTypeBound(UnsignedMax)` at the ArchWordBits
 // width — formerly a hard renderer rejection ("non-constant bit width
