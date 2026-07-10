@@ -82,7 +82,7 @@ fn expr_prec(node: &ExprNode) -> u16 {
     match node {
         ExprNode::Var(_) | ExprNode::Lit(_) | ExprNode::LitBool(_)
         | ExprNode::LitStr(_) | ExprNode::LitChar(_)
-        | ExprNode::ArrayLit(_) | ExprNode::StructUpdate { .. }
+        | ExprNode::ArrayLit(_) | ExprNode::VectorLit(_) | ExprNode::StructUpdate { .. }
         | ExprNode::Anon(_) | ExprNode::Tuple(_) | ExprNode::Raw(_)
         | ExprNode::ByBlock { .. } | ExprNode::Subtype { .. } => PREC_ATOM,
         ExprNode::FieldProj { .. } | ExprNode::Index { .. } => PREC_ATOM,
@@ -792,6 +792,15 @@ fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
 
         ExprNode::ArrayLit(elts) => {
             out.push('[');
+            for (i, e) in elts.iter().enumerate() {
+                if i > 0 { out.push_str(", "); }
+                write_expr(out, e, 0, lm);
+            }
+            out.push(']');
+        }
+
+        ExprNode::VectorLit(elts) => {
+            out.push_str("#v[");
             for (i, e) in elts.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
                 write_expr(out, e, 0, lm);

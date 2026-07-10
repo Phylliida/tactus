@@ -545,6 +545,32 @@ pub(crate) fn ctor_node(
     }
 }
 
+/// Array-literal rendering, shared by the VIR-AST and SST paths (F3,
+/// DESIGN-lean-all-proofs-followons.md). Verus's `[T; N]` maps to Lean
+/// core `Vector T N` (`to_lean_type`), so a literal in Array-typed
+/// position must render `#v[a, b, c]` — a bare `[a, b, c]` is a `List`
+/// and mistypes everywhere the array type is expected (the
+/// `{ deref := [a, b, c] }` family: `seq![a, b]` lowers through vstd's
+/// `View for [T; N]`, wrapping the literal in `Tactus.Ref.mk` ascribed
+/// at `Vector`). Anything else (`Primitive::Slice` → `List`) keeps the
+/// List literal. `#v[…]` + the `Tactus.Ref.mk` wrapper validated
+/// empirically on the pinned toolchain (Lean 4.25.0).
+/// Dispatches on the PEELED typ only — decoration handling is the
+/// caller's job and differs per path: the VIR renderer's
+/// `apply_ref_coercion_if_needed` bridges decorations for literals
+/// already (its `structural_typ` treats `ArrayLiteral` as producing an
+/// undecorated value), while the SST arm must wrap explicitly (see the
+/// `ExpX::ArrayLiteral` arm) — wrapping here would double-wrap the VIR
+/// side.
+pub(crate) fn array_literal_node(rendered_elems: Vec<LExpr>, typ: &Typ) -> LExpr {
+    let peeled = crate::to_lean_type::peel_typ_wrappers(typ);
+    match &**peeled {
+        TypX::Primitive(vir::ast::Primitive::Array, _) =>
+            LExpr::new(ExprNode::VectorLit(rendered_elems)),
+        _ => LExpr::new(ExprNode::ArrayLit(rendered_elems)),
+    }
+}
+
 /// Render the `is_<variant>` discriminator for a `UnaryOpr::IsVariant`
 /// applied to an already-rendered receiver expression. Lean's inductive
 /// derivation provides these accessors automatically: `x.isSome` for
