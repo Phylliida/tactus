@@ -880,6 +880,14 @@ fn write_pattern(out: &mut String, p: &Pattern, lm: &mut Landmarks) {
                 if needs { out.push(')'); }
             }
         }
+        Pattern::Tuple(args) => {
+            out.push('(');
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 { out.push_str(", "); }
+                write_pattern(out, a, lm);
+            }
+            out.push(')');
+        }
         Pattern::Or(l, r) => {
             write_pattern(out, l, lm);
             out.push_str(" | ");

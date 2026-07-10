@@ -5114,6 +5114,22 @@ fn build_wp_call<'a>(
     let (callee, spec_callee, callee_typ_args) =
         resolve_callee(fun, resolved_method, is_trait_default, typ_args, ctx)?;
 
+    // M6.1 drop-dummy rule (DESIGN-exec-packages.md): the spec world
+    // renders from the UNSIMPLIFIED vir krate, where zero-arg fns
+    // carry no `no%param` dummy — but the SSTs are post-ast_simplify,
+    // whose call sites pass an injected `Const 0` dummy arg.
+    // `vir::ast_simplify::injects_zero_arg_dummy` is the injector's
+    // own predicate (same file as the injection), so recognizer and
+    // injector cannot drift. Trait-impl callees never get the
+    // injection; the SST arg count distinguishes them anyway, so
+    // `is_trait_impl=false` + the arity check is exact here.
+    let args: &'a [Exp] =
+        if vir::ast_simplify::injects_zero_arg_dummy(callee, false) && args.len() == 1 {
+            &args[..0]
+        } else {
+            &args[..]
+        };
+
     validate_call_arities(callee, args, callee_typ_args)?;
 
     let mut_args = build_call_mut_args(&callee.params, args, &ctx.mut_ref_locals, &ctx.borrow_mut_links)?;
@@ -5429,7 +5445,7 @@ fn extract_mut_target<'a>(
 /// but if it does we error rather than silently encode wrong.
 fn build_call_mut_args<'a>(
     callee_params: &vir::ast::Params,
-    args: &'a vir::sst::Exps,
+    args: &'a [Exp],
     mut_ref_locals: &HashSet<String>,
     borrow_mut_links: &'a HashMap<String, VarIdent>,
 ) -> Result<Vec<(usize, MutTargetRaw<'a>)>, String> {

@@ -1964,29 +1964,19 @@ impl Verifier {
                             && matches!(query_op, QueryOp::Body(Style::Normal))
                         {
                             let fn_span = &function.span;
-                            // Use the post-simplify krate so dummy-param
-                            // injection aligns with what SST call sites
-                            // see — the pre-simplify `vir_crate` would
-                            // desynchronise on zero-arg fns. The
-                            // `None` branch can't fire in the current
-                            // pipeline (`verify_crate_inner` populates
-                            // this before calling `verify_bucket`), but
-                            // the Option in the type signature forces
-                            // future callers to acknowledge the timing.
-                            let vir_krate = match self.simplified_krate() {
-                                Some(k) => k,
-                                None => {
-                                    self.count_errors += 1;
-                                    reporter.report(&message(
-                                        MessageLevel::Error,
-                                        "tactus_auto: simplified krate not available — \
-                                         pipeline ordering bug (verify_crate_inner should \
-                                         run before verify_bucket)".to_string(),
-                                        fn_span,
-                                    ).to_any());
-                                    continue;
-                                }
-                            };
+                            // M6.1 dual-krate (DESIGN-exec-packages.md):
+                            // the exec spec-world/defs renders from the
+                            // UNSIMPLIFIED vir krate — the same render
+                            // world proof fns use (match-style bodies,
+                            // one authoring world, no cross-render trust
+                            // seam). The fn's own obligations still come
+                            // from the SST params below, which are
+                            // post-simplify; the dummy-param arity gap on
+                            // zero-arg fns is reconciled at the SST
+                            // render boundary (drop-dummy rule), not by
+                            // rendering the simplified krate.
+                            let vir_krate = self.vir_crate.as_ref()
+                                .expect("vir_crate should be initialized");
                             let vir_fn = match vir_krate.functions.iter()
                                 .find(|f| f.x.name == function.x.name)
                             {

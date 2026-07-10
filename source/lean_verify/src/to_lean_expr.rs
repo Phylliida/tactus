@@ -1060,7 +1060,19 @@ pub(crate) fn pattern_to_ast(pat: &PatternX) -> LPattern {
                     };
                     format!("{}.{}", lean_name(path), v)
                 }
-                Dt::Tuple(_) => sanitize(variant),
+                // Verus tuples render as Lean pair patterns, matching
+                // the expr side (`ExprNode::Tuple`) — the tuple%N
+                // constructor name has no Lean counterpart. 1-tuples
+                // flatten to their element (the type renderer does the
+                // same), so the sub-pattern stands alone.
+                Dt::Tuple(1) => {
+                    return pattern_to_ast(&pats[0].a.x);
+                }
+                Dt::Tuple(_) => {
+                    return LPattern::Tuple(
+                        pats.iter().map(|p| pattern_to_ast(&p.a.x)).collect(),
+                    );
+                }
             };
             LPattern::Ctor {
                 name,
