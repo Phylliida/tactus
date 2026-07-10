@@ -167,6 +167,36 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === Recursive spec fn through Seq::drop_first with NO broadcast use ===
+// Regression for DESIGN-lean-all-proofs-followons.md F2a. The emitted
+// `decreasing_by`'s seq rung cites the proven companion
+// `Seq.drop_first_len_lt`, whose canned proof cites
+// `seq.axiom_seq_subrange_len` — but the axiom reached the emission
+// schedule only when some `broadcast use` group carried it. A file like
+// this one (no `broadcast use` at all) emitted the recursive def with no
+// companion, and its termination goal `len (drop_first s) < len s`
+// failed (68/81 residual termination errors in the §10.1 crate run).
+// Post-fix the axiom is force-scheduled whenever drop_first/drop_last
+// emits.
+test_verify_one_file! {
+    #[test] test_spec_fn_drop_first_decreases_no_broadcast verus_code! {
+        use vstd::seq::*;
+
+        spec fn count_all(s: Seq<int>) -> nat
+            decreases s.len()
+        {
+            if s.len() == 0 { 0 } else { (1 + count_all(s.drop_first())) as nat }
+        }
+
+        proof fn count_all_zero(s: Seq<int>)
+            requires s.len() == 0
+            ensures count_all(s) == 0
+        by {
+            unfold count_all; simp_all
+        }
+    } => Ok(())
+}
+
 // === Dependency ordering: helper → double → proof fn ===
 
 test_verify_one_file! {

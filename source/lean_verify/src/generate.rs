@@ -584,6 +584,44 @@ pub(crate) fn spec_world_cmds(
     // pre-2026-05-12 `refs.traits`-only gate hid by accident.
     let groups = dep_order::order_spec_fns(&spec_fn_map, &ectx.fn_map, &all_fns, dep_walk_roots);
 
+    // F2a (DESIGN-lean-all-proofs-followons.md): the seq measure
+    // companion below cites `seq.axiom_seq_subrange_len` by name, but
+    // the axiom reaches `bc_lemma_funcs` only when some `broadcast use`
+    // group happens to carry it — a file that emits `Seq.drop_first`/
+    // `drop_last` without it silently lost the companion, and every
+    // recursion through the drop defs failed termination (68/81
+    // residual errors, DESIGN-lean-all-proofs.md §10.1). Force the
+    // axiom into the schedule exactly when a drop def will emit.
+    // Closure-safe: the trigger means the drop def is in `groups`, and
+    // its body IS `subrange`/`len` — every name in the axiom's ensures
+    // is already dep-walked. Sound by the same stipulation argument as
+    // the final forced flush (vstd verified the lemma; #122). The
+    // landed-gate at the companion site stays as a backstop.
+    let bc_lemma_funcs: Vec<&FunctionX> = {
+        let mut v = bc_lemma_funcs.to_vec();
+        let drop_def_emits = groups.iter().any(|g| match g {
+            dep_order::FnGroup::Single(f) => {
+                let rel = crate::to_lean_type::lean_name_relative(&f.name.path);
+                rel == "Seq.drop_first" || rel == "Seq.drop_last"
+            }
+            dep_order::FnGroup::Mutual(_) => false,
+        });
+        let ax_present = v.iter().any(|a| {
+            crate::to_lean_type::lean_name_relative(&a.name.path)
+                == "seq.axiom_seq_subrange_len"
+        });
+        if drop_def_emits && !ax_present {
+            if let Some(ax) = all_fns.iter().find(|a| {
+                crate::to_lean_type::lean_name_relative(&a.name.path)
+                    == "seq.axiom_seq_subrange_len"
+            }) {
+                v.push(ax);
+            }
+        }
+        v
+    };
+    let bc_lemma_funcs: &[&FunctionX] = &bc_lemma_funcs;
+
     // Un-emittable traits: a trait whose `class` we can't render because
     // at least one method decl is absent from the merged krate's function
     // map — i.e. stripped cross-crate (e.g. `core::clone::Clone::clone`,
@@ -1287,11 +1325,21 @@ fn seq_measure_companion_cmd(
     } else {
         format!("{} A s", len)
     };
+    // The axiom's hypothesis (`0 <= j <= k <= s.len()`, a chained
+    // comparison) has TWO attested renderings — a let-bound left-assoc
+    // conjunction (VIR chained-op desugar with lets) and a bare
+    // right-assoc `∧` chain (`Multi(Chained)` via `and_all`) — and the
+    // old anonymous-ctor proof `⟨⟨_, _⟩, _⟩` only elaborated against
+    // the first (F2a follow-up; the divergence itself is a two-paths
+    // rendering split worth unifying, DESIGN-lean-all-proofs-followons
+    // F6 neighborhood). Bare `omega` closes every attested shape —
+    // conjunction goals split natively and lets zeta-reduce (validated
+    // empirically on all three forms, Lean 4.25.0).
     Some(Command::Raw(format!(
         "theorem {df}_len_lt (A : Type) [_root_.Nonempty A] (s : {seq_t} A)\n    \
          (h : ¬ {len} A s = 0) :\n    \
          {len} A ({df} A s) < {len} A s := by\n  \
-         have hx := {ax_n} A s {j_arg} ({k_expr}) (by exact ⟨⟨by omega, by omega⟩, by omega⟩)\n  \
+         have hx := {ax_n} A s {j_arg} ({k_expr}) (by omega)\n  \
          simp only [{df}]\n  \
          omega",
     )))

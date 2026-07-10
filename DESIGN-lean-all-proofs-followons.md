@@ -90,16 +90,22 @@ fold it in when F6-1 happens. Note the special case in a comment pointing here.
 a theorem; the axiom being force-added is one the crate's vstd surface already stipulates
 — confirm it appears in the axiom-closure report unchanged, `DESIGN-axiom-closure-check.md`).
 
-### F2b. `sizeOf (if …)` / Int-abs measures (13)
+### F2b. `sizeOf (if …)` / Int-abs measures (13) — PINNED 2026-07-10, deferred
 
-`decreases` clauses whose measure is an if-expression (Int-abs style:
-`if x >= 0 { x } else { -x }`). `DECREASING_BY_TACTIC` (`to_lean_fn.rs:82`) has no rung
-for a goal with a value-position `if`. **Step 1 is pinning the actual goal shapes from the
-log** — 13 goals is small enough to read all of them. Likely fix: one enumerated rung,
-`(split <;> omega)`, appended to the `first | …` chain — no open-ended simp set, per the
-transparent-automation policy. If the shapes turn out exotic (nested ifs over datatypes),
-leave them and note the count; P2 either way. Do alongside F2a (same tactic string, same
-test module).
+Shapes pinned from the post-fix log — exactly two, both `sizeOf` over an **Int-typed
+measure** (Lean wraps non-Nat `termination_by` values in `sizeOf`):
+`sizeOf (↑(len w) - (from + 1)) < sizeOf (↑(len w) - from)` (Int subtraction) and
+`sizeOf (if 0 ≤ t then t else -t)` (Int-abs). A rung can't close these: `sizeOf (t : Int)`
+unfolds to raw `Int.rec` (opaque to omega, verified in scratch), and the natAbs bridge is
+asymmetric (`sizeOf = natAbs + 1` for nonneg, `= natAbs` for negSucc) — a bespoke bridging
+lemma, not a tactic.
+
+**Right fix (deferred, not a rung):** emit Int-typed `termination_by` measures wrapped in
+`.toNat` — goals become `(e').toNat < (e).toNat`, which omega closes natively given the
+branch guards already in the decreasing_by context (the same guards that make the sizeOf
+goal true; Verus proved the measure nonneg + decreasing on the Z3 side). Touches the
+termination_by emission (`to_lean_fn.rs` / `lean_pp.rs:303–352`), so it's a small focused
+arc, not a companion to F2a. 13 goals; P2.
 
 ---
 
