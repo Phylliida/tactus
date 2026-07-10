@@ -33,8 +33,12 @@ use crate::to_lean_fn::LeanSourceMap;
 use crate::to_lean_type::sanitize;
 
 pub struct CrateDefs {
-    /// Lean module name: `TactusDefs_{sanitized crate name}`.
+    /// Lean module name: `TactusDefs_{scope}`.
     pub module_name: String,
+    /// The scope string (`{crate}_{fingerprint}`) the module name is
+    /// built from — sibling modules (Stmts/Link) derive their names
+    /// from this instead of string surgery on `module_name` (M5d-0).
+    pub scope: String,
     /// Whether exec-fn dep closures are included. `false` after the
     /// proof-roots-only retry (see `build_defs`): exec fns then emit
     /// standalone, while the proofs batch — whose spec needs are a
@@ -76,7 +80,7 @@ static MEMO: OnceLock<Memo> = OnceLock::new();
 /// one shared defs/batch; per-bucket inputs → per-bucket artifacts,
 /// each self-consistent. The hash also suffixes the Lean module/file
 /// names so bucket artifacts coexist in the crate dir.
-fn scope_key(
+pub(crate) fn scope_key(
     crate_name: &str,
     krate: &KrateX,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
@@ -335,7 +339,7 @@ fn render_and_build(
     if !build {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         std::fs::write(&lean_path, &rendered.text).map_err(|e| e.to_string())?;
-        return Ok(CrateDefs { module_name, covers_exec, dir, cmds });
+        return Ok(CrateDefs { scope: scope.to_string(), module_name, covers_exec, dir, cmds });
     }
 
     let up_to_date = olean_path.exists()
@@ -344,7 +348,7 @@ fn render_and_build(
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         build_olean(&dir, &module_name, &rendered.text, &olean_path, &lean_path)?;
     }
-    Ok(CrateDefs { module_name, covers_exec, dir, cmds })
+    Ok(CrateDefs { module_name, scope: scope.to_string(), covers_exec, dir, cmds })
 }
 
 fn build_olean(
