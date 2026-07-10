@@ -1008,6 +1008,17 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // (`build_req_binders` above) and get their own per-req
     // `let x := x.deref` wrapping there.
     let mut initial_obl_ctx = OblCtx::new(emitter.default_closer.clone());
+    // B2b (finding #6): witness facts for chooses inline in the fn's
+    // OWN requires / ensures — Wp::Done leaves (postcondition theorems,
+    // Return-replaced leaves, loop-body ensures conjuncts) inherit them
+    // through the root context, mirroring the per-choose skolem axiom
+    // Verus's Z3 path gets regardless of position.
+    for req in check.reqs.iter() {
+        initial_obl_ctx = obl_with_choose_hyps(req, &ctx, &initial_obl_ctx);
+    }
+    for ens in check.post_condition.ens_exps.iter() {
+        initial_obl_ctx = obl_with_choose_hyps(ens, &ctx, &initial_obl_ctx);
+    }
     let add_pre_capture = |obl: OblCtx, raw_name: &str, lean_name: &crate::lean_name::LeanName| -> OblCtx {
         let pre_name = crate::lean_name::LeanName::synthetic(varat_pre_name(raw_name));
         let inner = LExpr::field_proj(LExpr::var(lean_name.clone()), "deref");
@@ -1763,11 +1774,15 @@ impl ObligationEmitter {
 /// `to_lean_sst_expr::collect_choose_witness_hyps`). Identity when the exp
 /// has no such choose — the overwhelmingly common case.
 fn obl_with_choose_hyps(exp: &Exp, ctx: &WpCtx, obl: &OblCtx) -> OblCtx {
+    // Best-effort: the hypothesis is optional proof HELP — a cond that
+    // fails to re-render (e.g. root-level ensures shapes that aren't
+    // Validated-witnessed) must not panic the emission; the goal just
+    // proceeds without the witness fact, as it did pre-B2b.
     let hyps = crate::to_lean_sst_expr::collect_choose_witness_hyps(
         exp,
         &ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs),
     )
-    .expect("choose-witness collect: sub of validated Exp tree");
+    .unwrap_or_default();
     let mut out = obl.clone();
     for h in hyps {
         out = out.with_frame(CtxFrame::Hyp(h));
@@ -2005,17 +2020,41 @@ fn walk_obligations<'a>(
             );
         }
         Wp::Call { callee, spec_callee, args, typ_args, dest, call_span, mut_args, after } => {
+            // B2b (2026-07-09 review, finding #6): witness facts for
+            // chooses inline in call ARGUMENTS — the precondition
+            // theorem and everything after the call see them.
+            let mut obl_c = obl.clone();
+            for a in args.iter() {
+                obl_c = obl_with_choose_hyps(a.raw(), ctx, &obl_c);
+            }
             walk_call(
-                callee, spec_callee, args, typ_args, *dest, call_span, mut_args, after, ctx, obl, e,
+                callee, spec_callee, args, typ_args, *dest, call_span, mut_args, after, ctx, &obl_c, e,
             );
         }
         Wp::Loop { cond, invs, validated_invs, inv_kinds, decrease, modified_vars, body, after } => {
+            // B2b (finding #6): witness facts for chooses inline in the
+            // loop invariants / condition — entry, preservation, and
+            // after-loop obligations all see them.
+            let mut obl_c = obl.clone();
+            for iv in validated_invs.iter() {
+                obl_c = obl_with_choose_hyps(iv.raw(), ctx, &obl_c);
+            }
+            if let Some(c) = cond {
+                obl_c = obl_with_choose_hyps(c.raw(), ctx, &obl_c);
+            }
             walk_loop(
-                *cond, invs, validated_invs, inv_kinds, decrease, modified_vars, body, after, ctx, obl, e,
+                *cond, invs, validated_invs, inv_kinds, decrease, modified_vars, body, after, ctx, &obl_c, e,
             );
         }
         Wp::AssertByTactus { cond, tactic_text, body } => {
-            walk_assert_by_tactus(*cond, tactic_text, body, ctx, obl, e);
+            // B2b (finding #6): a choose inline in a raw-tactic assert's
+            // cond still gets its witness fact — the user tactic can
+            // then use it instead of hand-applying epsilon_spec.
+            let obl_c = match cond {
+                Some(c) => obl_with_choose_hyps(c.raw(), ctx, obl),
+                None => obl.clone(),
+            };
+            walk_assert_by_tactus(*cond, tactic_text, body, ctx, &obl_c, e);
         }
     }
 }

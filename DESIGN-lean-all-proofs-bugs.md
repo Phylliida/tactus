@@ -251,3 +251,44 @@ experimentation settles.
 | Inhabited instance emission | `lean_verify/src/lean_ast.rs:110–111, 246–254` |
 | Namespace wrapper (`namespace lib`) | emitted file header; `lean_verify/src/generate.rs` |
 | Real-run taxonomy | `DESIGN-lean-all-proofs.md` §10 |
+
+---
+
+## Review round (2026-07-09/10, high-effort multi-angle review of `dbc77e5` + `00534c9`)
+
+Ten findings, all fixed same session. Correctness (6): **mutual-datatype SCC height
+defs** root-anchored sibling refs inside the `mutual` block (fixed: `with_self_decls`
+over the whole SCC, mirroring the mutual spec-fn arm); **accessor `Nonempty (Inner A)`
+not synthesizable** from bare `[Nonempty A]` when the field type is a generic user
+datatype — B4 was NOT strictly wider there (fixed: per-generic-datatype
+`@[instance] def T.instNonempty [Nonempty A…] : Nonempty (T A…)`, emitted as a Def
+because `Nonempty` is an inductive Prop, validated empirically); **`with_self_decls`
+panic leak** — restore skipped on panic while push_lenient/guard_build recover panics,
+and `install_emit_tables` never cleared the set (fixed: Drop-guard restore +
+`clear_self_decls` in the installer); **single-variant-enum accessors** demanded a
+`[Nonempty A]` their exhaustive match never needs and no caller is seeded to supply
+(fixed: binder gated on `variants.len() > 1`, the fallback arm's own condition);
+**axiom-scheduling dep walk** missed `ConstVar`/`StaticVar`/`ExecFnByName`/`Fuel`
+(reproduced: spec-const-referencing broadcast lemma flushed before the const's def;
+fixed: reuse `dep_order::collect_fun_refs`); **B2b witness-hyp coverage** stopped at
+four walker arms (fixed: root requires/ensures + `Wp::Call` args + `Wp::Loop`
+invariants/cond + `AssertByTactus` cond; collector downgraded to best-effort so a
+non-renderable cond can't panic emission). Robustness/latent (2): the seq measure
+companion now emits under `push_lenient` and gated on BOTH its def and the subrange
+axiom having actually landed; theorem names / artifact filenames strip `«»` (a fn
+NAMED a reserved token produced parse-error theorem headers — pre-existing for the
+old list's Rust-legal entries, widened by the generated list; verified empirically).
+Debug-only (1): the reference sanity checker now also registers the de-anchored
+relative form of root-anchored decls, so crate-root self-recursion passes debug
+builds. Efficiency (1): the crate-decls set is fingerprint-cached per krate
+(was O(N²) string builds per crate; `CRATE_DECLS` now holds an `Arc`).
+
+**Deferred altitude items** (right depth, wrong day): broadcast axioms as real
+`EmitStep`s inside `dep_order::order_emission` instead of the parallel greedy flush;
+the seq companion through `lean_ast::Theorem` instead of `Command::Raw`; one `EmitEnv`
+struct for the three ambient thread-locals; `choose_node` deriving names from binders
+instead of the parallel `names` slice; hyp attachment at Wp-build chokepoints instead
+of walker arms. Also on the backlog, NOT from these commits: the pre-existing
+pretty-printer line-wrap bug (`unexpected token '('; expected 'else'` — application
+continuation dedented below its enclosing `let` in an if-branch; 136 occurrences
+pre-fix, 39 post).

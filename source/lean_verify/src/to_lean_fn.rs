@@ -522,6 +522,9 @@ pub fn datatype_to_cmds(
     if let Some(inst) = datatype_inhabited_instance_cmd(dt, &scc_paths, external_body_paths) {
         cmds.push(inst);
     }
+    if let Some(inst) = datatype_nonempty_instance_cmd(dt, &scc_paths, external_body_paths) {
+        cmds.push(inst);
+    }
     cmds.extend(datatype_accessor_cmds(dt, emit_accessors));
     if let Some(height) = datatype_height_cmd(dt, &scc_paths) {
         cmds.push(height);
@@ -674,6 +677,9 @@ pub fn datatype_group_to_cmds<'a>(
         if let Some(inst) = datatype_inhabited_instance_cmd(dt, &scc_paths, external_body_paths) {
             cmds.push(inst);
         }
+        if let Some(inst) = datatype_nonempty_instance_cmd(dt, &scc_paths, external_body_paths) {
+            cmds.push(inst);
+        }
     }
 
     // 2. accessors per-datatype, outside the mutual block.
@@ -683,9 +689,22 @@ pub fn datatype_group_to_cmds<'a>(
 
     // 3. mutual block of height fns. Each height fn reaches the
     //    others by name; the mutual scope makes those names visible.
-    let height_cmds: Vec<Command> = dts.iter()
-        .filter_map(|dt| datatype_height_cmd(dt, &scc_paths))
+    //    `with_self_decls` over the WHOLE SCC: a sibling `.height`
+    //    reference inside the mutual block must render relatively —
+    //    the sibling is not yet a global constant, so a root-anchored
+    //    `_root_.{ns}.Sibling.height` is `Unknown identifier` (same
+    //    rule as mutual spec-fn groups; 2026-07-09 review, finding #1).
+    let group_names: Vec<String> = dts.iter()
+        .filter_map(|dt| match &dt.name {
+            Dt::Path(p) => Some(crate::to_lean_type::lean_name_relative(p)),
+            Dt::Tuple(_) => None,
+        })
         .collect();
+    let height_cmds: Vec<Command> = crate::to_lean_type::with_self_decls(group_names, || {
+        dts.iter()
+            .filter_map(|dt| datatype_height_cmd(dt, &scc_paths))
+            .collect()
+    });
     if !height_cmds.is_empty() {
         cmds.push(Command::Mutual(height_cmds));
     }
@@ -866,6 +885,73 @@ fn datatype_decl_cmd(
 /// must then have a *noncomputable* Inhabited instance (axiom-backed
 /// child Inhabited instances have no executable code; Lean's auto-derived
 /// computable instance would fail the IR check).
+/// Conditional `Nonempty` instance for a GENERIC datatype:
+/// `@[instance] noncomputable def T.instNonempty {A…} [Nonempty A…] :
+///  Nonempty (T A…) := Nonempty.intro (T.<base> Classical.ofNonempty …)`.
+///
+/// Needed because B4's accessors fall back to `Classical.ofNonempty` at
+/// the FIELD type: for a field typed `Inner A`, `Nonempty (Inner A)` is
+/// not synthesizable from a bare `[Nonempty A]` — `deriving Inhabited`'s
+/// conditional instance needs `Inhabited A`, and core's
+/// `instNonemptyOfInhabited` bridge is one-way (2026-07-09 review,
+/// finding #2). Emitting the Nonempty analog per generic datatype closes
+/// the chain: param fields use the binder, concrete fields use the
+/// Inhabited bridge, generic-datatype fields use the field type's own
+/// instNonempty (datatype emission is dep-ordered). Parameterless
+/// datatypes need nothing — their derived/axiom `Inhabited` bridges to
+/// `Nonempty` unconditionally. Base-variant selection mirrors
+/// `datatype_inhabited_instance_cmd`. Emitted as an `@[instance]` Def
+/// (not `Command::Instance`) because `Nonempty` is an inductive Prop
+/// with an anonymous constructor, not a structure with fields — the
+/// `where`-methods form doesn't apply.
+fn datatype_nonempty_instance_cmd(
+    dt: &DatatypeX,
+    scc_paths: &std::collections::HashSet<&Path>,
+    external_body_paths: &std::collections::HashSet<&Path>,
+) -> Option<Command> {
+    if dt.typ_params.is_empty() {
+        return None;
+    }
+    let path = match &dt.name {
+        Dt::Path(p) => lean_name(p),
+        Dt::Tuple(_) => return None,
+    };
+    let base_variant = dt.variants.iter()
+        .find(|v| v.fields.iter().all(|f| {
+            field_recursive_target(&f.a.0, scc_paths).is_none()
+                && !typ_references_external_body(&f.a.0, external_body_paths)
+        }))
+        .or_else(|| dt.variants.first())?;
+    let args: Vec<LExpr> = base_variant.fields.iter()
+        .map(|_| LExpr::var_lit("Classical.ofNonempty"))
+        .collect();
+    let ctor = LExpr::new(crate::expr_shared::ctor_node(&dt.name, &base_variant.name, args));
+    let body = LExpr::app1(LExpr::var_lit("Nonempty.intro"), ctor);
+    let mut binders: Vec<LBinder> = Vec::new();
+    for (id, _) in dt.typ_params.iter() {
+        binders.push(LBinder::typ_param(id.as_str(), BinderKind::Implicit));
+        binders.push(LBinder::instance(
+            LExpr::app1(LExpr::var_lit("Nonempty"), LExpr::var_tp(id.as_str())),
+        ));
+    }
+    let applied_args: Vec<LExpr> = dt.typ_params.iter()
+        .map(|(id, _)| LExpr::var_tp(id.as_str()))
+        .collect();
+    let ret_ty = LExpr::app1(
+        LExpr::var_lit("Nonempty"),
+        LExpr::app(LExpr::var_lit(&path), applied_args),
+    );
+    Some(Command::Def(Def {
+        attrs: vec!["instance".into()],
+        name: format!("{}.instNonempty", path),
+        binders,
+        ret_ty,
+        body,
+        termination_by: Vec::new(),
+        decreasing_by: None,
+    }))
+}
+
 fn datatype_inhabited_instance_cmd(
     dt: &DatatypeX,
     scc_paths: &std::collections::HashSet<&Path>,
@@ -1263,7 +1349,17 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
     };
     let accessor_binders = || -> Vec<LBinder> {
         let mut bs = typ_param_pieces.clone();
-        bs.extend(inhabited_bound_pieces.iter().cloned());
+        // The `[Nonempty A]` bounds exist solely for the wildcard-arm
+        // `Classical.ofNonempty` fallback, which is only emitted when
+        // variants.len() > 1 (single-variant ENUMS get accessors with an
+        // exhaustive one-ctor match). Demanding the bound without the
+        // arm made single-variant-enum accessors unusable from generic
+        // contexts — no caller is ever seeded to supply it (2026-07-09
+        // review, finding #4; keeps the gate aligned with Seed 3's
+        // multi-variant filter in compute_nonempty_needs).
+        if dt.variants.len() > 1 {
+            bs.extend(inhabited_bound_pieces.iter().cloned());
+        }
         bs.push(x_binder.clone());
         bs
     };
