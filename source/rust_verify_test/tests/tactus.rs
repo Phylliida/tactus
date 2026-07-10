@@ -11550,7 +11550,7 @@ test_verify_one_file! {
         pub fn is_pair_exec(s1: &Sym, s2: &Sym) -> (out: bool)
             ensures out == is_pair_spec(*s1, *s2),
         {
-            proof { simp_all [is_pair_spec] }
+            proof { cases h1 : s1.deref <;> cases h2 : s2.deref <;> simp_all [is_pair_spec] }
             match (s1, s2) {
                 (Sym::Gen(i), Sym::Inv(j)) => *i == *j,
                 _ => false,
