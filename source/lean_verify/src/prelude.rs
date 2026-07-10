@@ -78,7 +78,13 @@ pub fn ensure_prelude_olean() -> Result<PathBuf, String> {
     // marker). Mixed-version races are structurally gone now that the
     // dir is content-addressed (`prelude_cache_dir`); the marker stays
     // as belt-and-suspenders against partial writes.
-    if olean.exists() && std::fs::read_to_string(&marker).ok().as_deref() == Some(TACTUS_PRELUDE) {
+    // Marker = prelude source + toolchain fingerprint: a toolchain
+    // bump with unchanged prelude source previously reused a stale
+    // olean (latent gap — nothing later necessarily elaborates against
+    // it to notice).
+    let marker_content = format!(
+        "{}\n-- toolchain: {}\n", TACTUS_PRELUDE, crate::project::toolchain_fingerprint());
+    if olean.exists() && std::fs::read_to_string(&marker).ok().as_deref() == Some(&marker_content) {
         return Ok(dir);
     }
     // Build in a pid-unique subdir: `lean -o` derives the module name
@@ -105,7 +111,7 @@ pub fn ensure_prelude_olean() -> Result<PathBuf, String> {
     }
     std::fs::rename(build.join("TactusPrelude.olean"), &olean)
         .map_err(|e| format!("could not move prelude olean into place: {}", e))?;
-    std::fs::write(&marker, TACTUS_PRELUDE)
+    std::fs::write(&marker, &marker_content)
         .map_err(|e| format!("could not write prelude marker: {}", e))?;
     let _ = std::fs::remove_dir_all(&build);
     Ok(dir)
