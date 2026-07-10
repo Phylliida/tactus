@@ -156,6 +156,65 @@ All read-only findings; each removes a "verify at implementation time" from §3.
 7. **B5b pin verified:** `rust_verify_test/tests/tactus.rs:2837`, still
    Err-asserted with the flip-to-Ok comment intact.
 
+## 3.6 Design review round (same day) — minimality / rightness / transparency pass
+
+Reviewed against: can this be smaller, cleaner, more principled, more
+transparency-respecting (transparency = faithfulness + predictability)? Three
+changes to §3, each a simplification:
+
+**1. DROP the decoration-only trust guard.** The guard was fear-inheritance from
+the sibling's reverted spot-fix — but that failure had a CLAIM on the bridge's
+input side; here the instantiated declared ret is ground truth **by
+construction**: the emitted Lean def's return type IS `typ_to_expr(declared
+ret)`, so a rendered application's Lean type is exactly lean(declared-inst) —
+reporting anything else (conditionally!) is the impure move. Boxing divergences
+are harmless to consumers (`count_ref_decorations` doesn't count `Boxed`;
+coerce paths peel it). One unconditional rule — *a call's actual is its
+callee's declared return, instantiated* — is also the rule the ARGS already
+follow (`render_class_method_call` and the plain arm both bridge args to
+declared param typs via the typed spine, explicitly "not from the claimed
+`a.typ`"). B5a is the symmetric completion of an existing convention, not a
+new policy. The census probe (§3) stays as VALIDATION — log loudly when a
+claim diverges from declared by more than decorations+boxing — instead of
+gating behavior.
+
+**2. SHRINK scope to the two lying shapes.** New arm covers
+`CallFun::Fun(fun, None)` and `CallFun::Recursive(fun)` only (vir/sst.rs:59).
+`Fun(_, Some(_))` (class-method dispatch) already type-ANNOTATES its result
+with the claim (`TypeAnnot(app, e_typ)`, render_class_method_call tail) — those
+are claim-consistent by construction or they'd already fail; leave them, note
+as follow-up if the census disagrees. `InternalFun`: claim (status quo).
+`CallLambda`: DEFERRED out of B5a v1 — all 55 errors are named spec-fn calls;
+the census will say whether lambda applications ever lie.
+
+**3. REUSE the existing helper family.** `ctx.fn_param_typs(fun, typs)` already
+does lookup + instantiation for params; add the sibling `fn_ret_typ(fun, typs)`
+beside it (same lookup, same subst, the ret Par instead of the params). The new
+arm is then ~6 lines, and `fn_ret_typ` is exactly what B5b's typed
+`render_call_ensure_expr` needs too — one helper, both halves of the arc.
+
+**Layer confirmed right** (alternatives considered and rejected): fixing VIR/
+sst_elaborate is the wrong layer — poly and the Z3 path NEED the claims; the lie
+is a lie only from Lean's perspective, so the renderer is the correct seam.
+Consumer-side skepticism (count 0 derefs for non-Var bases at Field/IsVariant)
+would break legitimate `&`-returning spec fns and still needs the
+actual_is_trusted change once poly's Unbox wrapping is accounted — same size,
+less principled. Count-source-only patching duplicates declared-ret logic at
+two consumer sites instead of one producer site and leaves the spine lying to
+every other consumer.
+
+**New risk surfaced (named, accepted):** consumers that bridge `actual →
+claimed` (`into_slot(&e.typ)`, tuple-slot coercion) may now insert
+`Tactus.Ref.mk` wraps where the old claim==claim identity did nothing; paired
+with downstream claim-derived derefs these are sound round-trips (wrap then
+peel), just noisy. The census quantifies; if the britton run shows new
+mismatches rather than noise, the relocation is real and the guard comes back —
+that's the falsifiable bet, stated up front.
+
+**Sharper acceptance for B5a:** britton `Invalid field` 25 → 0; census log
+shows no divergence class other than decorations(+boxing); no new families; no
+count change in auto/timeout buckets beyond the freed goals.
+
 ## 4. Sequencing & validation
 
 **B5a first** — small, self-contained, kills a complete error family. **B5b
