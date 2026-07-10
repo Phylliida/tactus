@@ -340,6 +340,30 @@ Net: **no blockers found; two design corrections (F2, F3) folded into §2.2 and
 - **M5e-2 (parallel part/stmt builds) deliberately deferred** until the
   tgt numbers say where the wall-clock actually goes.
 
+**M5e MEASURED ON TGT (2026-07-10) — M5 COMPLETE.**
+tactus-group-theory (3116 fns, release binary, isolated TACTUS_LEAN_OUT):
+- COLD (no Z3 cache): 225s, **3116 verified / 0 errors, ZERO island
+  fallbacks** — full defs partition (8 proof-scope parts + exec family)
+  built through the attempt ladder at crate scale; 5 tactic proof fns
+  routed via packages (the migration cohort: lemma_fcf_*,
+  lemma_exact_div, lemma_div_mod_id); gate 12 modules / 10 reused.
+- WARM (no Z3 cache): 207s — ALL package artifacts skip (defs/stmt/pkg
+  olean mtimes unchanged across three subsequent runs).
+- WARM + -V cache (the dev-iteration shape): 201s — 6350 Z3 queries
+  cached, 14 lean fns re-checked of which the 5 package-routed return
+  cached Success with NO lean invocation.
+- Warm floor decomposition: ~25s rustc/VIR + Link + **the dominant
+  chunk = ~9 exec/island lean fns re-elaborating every run (no
+  cross-run cache on the island path)** — the next optimization target,
+  outside M5 scope (island verdict cache, same content-compare
+  pattern; or M6 exec packages).
+- Findings: (1) the exec defs family (fingerprinted) is PRE-EXISTING
+  double cost, made visible by stable proof-scope names; (2) both
+  families pay a failed ladder attempt-1 — ScopeKind::Proof could
+  start at attempt 2 (cheap future win); (3) parallel part builds
+  (planned M5e-2) DEFERRED BY DATA: cold defs is a small share of
+  225s at current migration scale.
+
 **M5d status (2026-07-10): d-0/d-1/d-2 DONE; d-3 designed, build pending.**
 - **M5d-0** (`80482fe`): consolidation — PkgGraph memo (inline+dep-scan
   once per scope, owned form + borrowed view), scope field on CrateDefs
