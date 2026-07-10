@@ -320,6 +320,26 @@ pure Lean core, no Mathlib needed for any architectural question.
 Net: **no blockers found; two design corrections (F2, F3) folded into §2.2 and
 §4.3.** M1 can start on this shape directly.
 
+**M5e status (2026-07-10): e-1 DONE (`b70f92d`); tgt measurement in flight.**
+- **M5e-1 cross-run incrementality**: defs parts carry MANIFESTS (one
+  hash per item command); rebuild-as-append (old manifest an
+  order-preserving subsequence of new) = SUPERSET, non-breaking —
+  consumer oleans stay valid (kernel weakening + top-down elaboration);
+  anything else = BREAKING, propagates transitively through imports.
+  CrateDefs.breaking gates consumer skips: stmt oleans skip when
+  content-unchanged + non-breaking; pkg modules return cached Success
+  when own text + stmt imports + defs all unchanged and olean exists.
+  Link ALWAYS re-elaborates (sorry can't ride the cache; closure
+  re-checked every run). Island fallback for UnsupportedScc/emission
+  failures in check mode (islands = proven route, packages = upgrade;
+  Link's cycle-poisoning already excludes fallback fns).
+- Measured (two-module crate, debug): cold 12.9s / warm 3.6s / append
+  lemma 6.0s / append SPEC FN 7.0s rebuilding exactly the one defs part
+  (superset → umbrella + all consumers skip) / breaking edit 13.9s
+  (correct full cascade).
+- **M5e-2 (parallel part/stmt builds) deliberately deferred** until the
+  tgt numbers say where the wall-clock actually goes.
+
 **M5d status (2026-07-10): d-0/d-1/d-2 DONE; d-3 designed, build pending.**
 - **M5d-0** (`80482fe`): consolidation — PkgGraph memo (inline+dep-scan
   once per scope, owned form + borrowed view), scope field on CrateDefs

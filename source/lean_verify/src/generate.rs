@@ -1934,15 +1934,26 @@ fn check_proof_fn_via_package(
                 )
             })
         }
-        Ok(PkgEmitOutcome::UnsupportedScc(reason)) => Some(CheckResult::Failed {
-            errors: vec![TactusDiag {
-                message: format!("tactus: package-check: {}", reason),
-                location: DiagLocation::Unknown,
-                help: None,
-            }],
-            warnings: vec![],
-        }),
-        Err(e) => Some(CheckResult::Error(e)),
+        // Unsupported shapes and emission failures FALL BACK to the
+        // island path (`None` — check_proof_fn continues): islands are
+        // the proven route, packages the upgrade. The Link builder
+        // excludes these fns via its cycle-poisoning pass, so the gate
+        // still covers everything that DID take the package route; the
+        // fallback is reported, not silent.
+        Ok(PkgEmitOutcome::UnsupportedScc(reason)) => {
+            eprintln!(
+                "tactus: package-check falling back to island for `{}`: {}",
+                short_name(&proof_fn.name.path), reason
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "tactus: package-check falling back to island for `{}` (emission failed: {})",
+                short_name(&proof_fn.name.path), e
+            );
+            None
+        }
     }
 }
 
