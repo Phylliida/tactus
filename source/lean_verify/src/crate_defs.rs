@@ -132,8 +132,16 @@ pub fn for_crate(
     // panicked, the map is still structurally valid (worst case: a
     // missing entry that gets rebuilt) — don't cascade the panic to
     // every other bucket.
-    let scope = if kind == ScopeKind::Proof && crate::generate::package_check_enabled() {
-        sanitize(crate_name)
+    let scope = if crate::generate::package_check_enabled() {
+        // Stable names for BOTH scopes (M5d-3 gave Proof; the exec
+        // family joining makes island .lean text append-stable too —
+        // fingerprint scopes rename the defs dir on any crate change,
+        // churning every island's import line). `_exec` suffix keeps
+        // the two families from colliding on one module name.
+        match kind {
+            ScopeKind::Proof => sanitize(crate_name),
+            ScopeKind::Exec => format!("{}_exec", sanitize(crate_name)),
+        }
     } else {
         scope_key(crate_name, krate, tactic_bodies)
     };
@@ -876,8 +884,9 @@ impl ProofBatch {
         let r = self.region(f)?;
         Some(EmitOutput {
             // --emit-lean sidecar: no Lean run follows, the gate
-            // threshold is never consulted.
+            // threshold is never consulted and nothing may cache.
             first_theorem_line: None,
+            changed: true,
             file_path: self.file_path.clone(),
             source_map: LeanSourceMap::ProofFn {
                 fn_name: r.fn_short.clone(),

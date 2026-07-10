@@ -1249,6 +1249,9 @@ pub struct EmitOutput {
     /// Everything before it is emitter preamble; the island sorry
     /// gate treats sorry warnings at/after it as user-written.
     pub first_theorem_line: Option<usize>,
+    /// Whether the island's `.lean` content changed this run
+    /// (tracked write) — the cross-run cache skip signal.
+    pub changed: bool,
 }
 
 /// Codegen-only half of `check_proof_fn`: inline pass → preamble → theorem →
@@ -1419,9 +1422,10 @@ pub fn emit_proof_fn(
         &proof_fn.name, rendered.landmarks.tactic_starts.first().copied(), tactic_body);
 
     let file_path = lean_file_path(crate_name, &proof_fn.name.path);
-    if let Err(e) = write_lean_file(&file_path, &rendered.text) {
-        return Err(CheckResult::Error(e));
-    }
+    let changed = match write_lean_file_tracked(&file_path, &rendered.text) {
+        Ok(c) => c,
+        Err(e) => return Err(CheckResult::Error(e)),
+    };
 
     #[cfg(debug_assertions)]
     let cmds_for_sanity: Vec<Command> = match &defs {
@@ -1446,7 +1450,7 @@ pub fn emit_proof_fn(
     }
 
     Ok(EmitOutput {
-        file_path, source_map, warnings: vec![],
+        file_path, source_map, warnings: vec![], changed,
         first_theorem_line: rendered.landmarks.theorem_heads.first().copied(),
     })
 }
@@ -1486,11 +1490,18 @@ pub fn check_proof_fn(
             return b.result_for(&proof_fn.name);
         }
     }
-    let EmitOutput { file_path, source_map, first_theorem_line, .. } =
+    let EmitOutput { file_path, source_map, first_theorem_line, changed, .. } =
         match emit_proof_fn(krate, proof_fn, tactic_body, imports, crate_name, tactic_bodies) {
             Ok(o) => o,
             Err(cr) => return cr,
         };
+    let marker = file_path.with_extension("verified");
+    if island_cache_ok(&marker, changed, &defs) {
+        // Live-path parity: success warnings are the sorry-filtered
+        // set, which is empty by construction (sorry is fatal here).
+        return CheckResult::Success { warnings: vec![] };
+    }
+    let _ = std::fs::remove_file(&marker);
 
     let dir = project::default_project_dir();
     let lake_dir = if project::project_ready(&dir) { Some(dir.as_path()) } else { None };
@@ -1510,6 +1521,7 @@ pub fn check_proof_fn(
             {
                 return fail;
             }
+            let _ = std::fs::write(&marker, crate::project::toolchain_fingerprint());
         }
     }
     format_lean_check_result(result, proof_fn, &file_path, &source_map)
@@ -1521,6 +1533,37 @@ pub fn check_proof_fn(
 /// would verify with no fatal layer anywhere. On the island path it
 /// is therefore FATAL. The package path keeps warning-at-fn-level +
 /// fatal Link sorryAx backstop (layered defense; both test-pinned).
+/// Island verdict cache (cross-run). Marker = `<island>.verified`
+/// holding the toolchain fingerprint; it exists IFF the last completed
+/// Lean run on exactly this island text, against this toolchain,
+/// succeeded. Skip additionally requires the imported defs family had
+/// no breaking rebuild this run (superset appends keep consumer
+/// validity — same kernel-weakening argument as the package cache;
+/// with fingerprint-scoped defs, any crate change renames the defs
+/// module and thus changes the island text itself). Sorry can't hide
+/// in a cached verdict: it is FATAL on island paths, so no marker is
+/// ever written over one. The marker is REMOVED before any live run —
+/// a crashed or failed run leaves no stale trust behind.
+fn island_cache_ok(
+    marker: &Path,
+    changed: bool,
+    defs: &Option<std::sync::Arc<crate::crate_defs::CrateDefs>>,
+) -> bool {
+    if changed || defs.as_ref().is_some_and(|d| d.breaking) {
+        return false;
+    }
+    let hit = std::fs::read_to_string(marker).ok().as_deref()
+        == Some(crate::project::toolchain_fingerprint());
+    if hit {
+        static NOTE: std::sync::Once = std::sync::Once::new();
+        NOTE.call_once(|| {
+            eprintln!("note: tactus: island cache: reusing prior verdicts \
+for unchanged islands (`.verified` markers)");
+        });
+    }
+    hit
+}
+
 /// Lean positions `declaration uses 'sorry'` at the DECLARATION HEAD
 /// (not the sorry literal), and re-warns per declaration whose term
 /// contains it — so neither tactic-region membership nor counting
@@ -3078,9 +3121,10 @@ pub fn emit_exec_fn(
     };
 
     let file_path = lean_file_path(crate_name, &vir_fn.name.path);
-    if let Err(e) = write_lean_file(&file_path, &rendered.text) {
-        return Err(CheckResult::Error(e));
-    }
+    let changed = match write_lean_file_tracked(&file_path, &rendered.text) {
+        Ok(c) => c,
+        Err(e) => return Err(CheckResult::Error(e)),
+    };
 
     #[cfg(debug_assertions)]
     let cmds_for_sanity: Vec<Command> = match &defs {
@@ -3105,7 +3149,7 @@ pub fn emit_exec_fn(
     }
 
     Ok(EmitOutput {
-        file_path, source_map, warnings,
+        file_path, source_map, warnings, changed,
         first_theorem_line: rendered.landmarks.theorem_heads.first().copied(),
     })
 }
@@ -3122,11 +3166,19 @@ pub fn check_exec_fn(
 ) -> CheckResult {
     // Same defs-before-emit ordering as `check_proof_fn` (see there).
     let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true, crate::crate_defs::ScopeKind::Exec);
-    let EmitOutput { file_path, source_map, warnings, first_theorem_line } =
+    let EmitOutput { file_path, source_map, warnings, first_theorem_line, changed } =
         match emit_exec_fn(krate, vir_fn, fn_sst, check, imports, crate_name, tactic_bodies) {
             Ok(o) => o,
             Err(cr) => return cr,
         };
+    let marker = file_path.with_extension("verified");
+    if island_cache_ok(&marker, changed, &defs) {
+        // Emission warnings are recomputed each run (emit always
+        // runs); lean-side success warnings are the sorry-filtered
+        // set, empty by construction on this path.
+        return CheckResult::Success { warnings };
+    }
+    let _ = std::fs::remove_file(&marker);
 
     let dir = project::default_project_dir();
     let lake_dir = if project::project_ready(&dir) { Some(dir.as_path()) } else { None };
@@ -3147,6 +3199,7 @@ pub fn check_exec_fn(
             {
                 return fail;
             }
+            let _ = std::fs::write(&marker, crate::project::toolchain_fingerprint());
             CheckResult::Success { warnings }
         }
         Ok(r) => {
