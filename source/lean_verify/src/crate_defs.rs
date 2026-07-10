@@ -143,7 +143,18 @@ pub fn for_crate(
             ScopeKind::Exec => format!("{}_exec", sanitize(crate_name)),
         }
     } else {
-        scope_key(crate_name, krate, tactic_bodies)
+        // The kind is part of the scope identity in EVERY mode: the
+        // two kinds build different content with different ladders,
+        // and on small crates the proof/exec krates can hash
+        // identically — a shared memo entry would serve one kind a
+        // defs the other's consumers must reject (covers_exec
+        // filter), starving exec islands of accessors.
+        match kind {
+            ScopeKind::Proof => scope_key(crate_name, krate, tactic_bodies),
+            ScopeKind::Exec => {
+                format!("{}_exec", scope_key(crate_name, krate, tactic_bodies))
+            }
+        }
     };
     let mut map = memo.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(cached) = map.get(&scope) {
@@ -268,31 +279,30 @@ fn build_defs(
     // axiom dragged down is the case for the iterative-repair build
     // (drop only the erroring item by line attribution; CRATEDEFS
     // follow-ups) — not yet needed at current Lean-path populations.
-    // Accessors: the Exec scope renders SIMPLIFIED-krate bodies, whose
-    // isVariant/getField ops emit as accessor calls (`.isGen`,
-    // `.Gen_val0`) no matter which roots are in play — narrowing roots
-    // must NOT drop the accessor defs there (tgt's symbol part failed
-    // every narrow rung on exactly this). The Proof scope renders vir
-    // bodies (match-based) and keeps the original exec-presence rule.
+    // Kind-specific ladders (M6.1b — re-landed after the dual-krate
+    // change unified the render worlds; the shape-coupling hazard that
+    // reverted the first attempt is gone because BOTH scopes now
+    // render spec fns from the vir krate):
     //
-    // NOTE (symbol investigation, 2026-07-10): do NOT restructure this
-    // ladder per-kind or suffix the non-package scope key by kind —
-    // inline helper theorems' user tactics are semantically coupled to
-    // the spec-fn RENDER SHAPE of whatever defs the island imports
-    // (vir `match` vs simplified `if .isVariant`), and both authoring
-    // worlds exist in the wild (test_crate_defs_proof_exec_mix pins
-    // the vir-shaped world; tgt's migrated exec tactics pin the
-    // simplified inline world). Shape-portable helpers = stmt-style
-    // imports = M6.
-    let acc = |on_full: bool| match kind {
-        ScopeKind::Exec => true,
-        ScopeKind::Proof => on_full,
+    // Exec scope: exec coverage or nothing. A narrower rung renders
+    // proof-roots content the consumer gate (`covers_exec` filter in
+    // check_exec_fn) can never import — building it was the
+    // "double defs family" dead weight. Accessors stay ON when exec
+    // roots exist: obligation bodies are SST/accessor-shaped even
+    // though spec-fn bodies are match-shaped.
+    //
+    // Proof scope: consumers never need exec coverage, so the old
+    // full-roots attempt was a guaranteed-wasted elaboration on every
+    // cold run — start at the proof rung.
+    let attempts: Vec<(&[&FunctionX], bool, bool, bool)> = match kind {
+        ScopeKind::Exec => vec![
+            (&full_roots, !exec_roots.is_empty(), true, true),
+        ],
+        ScopeKind::Proof => vec![
+            (&proof_roots, false, false, true),
+            (&proof_roots, false, false, false),
+        ],
     };
-    let attempts: [(&[&FunctionX], bool, bool, bool); 3] = [
-        (&full_roots, acc(!exec_roots.is_empty()), true, true),
-        (&proof_roots, acc(false), false, true),
-        (&proof_roots, acc(false), false, false),
-    ];
     // Ladder sidecar (`<scope>.ladder`): which attempt won last run,
     // the winner's content hash, and the toolchain fingerprint. A
     // failing attempt is EXPENSIVE (a full defs elaboration that
