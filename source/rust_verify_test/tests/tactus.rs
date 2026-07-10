@@ -13377,3 +13377,79 @@ test_verify_one_file_with_options! {
         assert!(text.contains("helper_bad"), "attributed to helper_bad: {}", text);
     }
 }
+
+// === StmX::DeadEnd lowering (F4, DESIGN-lean-all-proofs-followons.md) ===
+// `assert(P) by { <verus proof> }` — the Verus-proof-body form, as
+// written for the Z3 backend — desugars to `DeadEnd(Block([
+// Assume(require), …proof…, Assert(ensure)]))` + a following `Assume`
+// that re-introduces the fact. Such fns reach the Lean translator only
+// under `--lean-all-proofs` (in tactus_auto fns, by-blocks are raw Lean
+// tactics — the `AssertQuery` form). Pre-F4 the translator rejected
+// them outright (1,267 codegen rejections crate-wide); now the block
+// lowers as `Wp::Scope` — a scoped sub-proof whose effects are
+// discarded.
+
+// Plain assert-by with a lemma call in the proof body; the re-assumed
+// fact then carries the fn's ensures.
+test_verify_one_file_with_options! {
+    #[test] test_deadend_assert_by_lemma_call ["--lean-all-proofs"] => verus_code! {
+        spec fn triple(x: nat) -> nat { 3 * x }
+
+        proof fn lemma_triple_ge(x: nat)
+            ensures triple(x) >= x
+        by { unfold triple; omega }
+
+        proof fn uses_assert_by(x: nat)
+            ensures triple(x) >= x
+        {
+            assert(triple(x) >= x) by {
+                lemma_triple_ge(x);
+            }
+        }
+    } => Ok(())
+}
+
+// assert-forall-by: the quantified form re-assumes
+// `forall vars, require ==> ensure` after the scope.
+test_verify_one_file_with_options! {
+    #[test] test_deadend_assert_forall_by ["--lean-all-proofs"] => verus_code! {
+        spec fn double(x: nat) -> nat { 2 * x }
+
+        proof fn lemma_double_ge(x: nat)
+            ensures double(x) >= x
+        by { unfold double; omega }
+
+        proof fn uses_forall_by(y: nat)
+            ensures forall|x: nat| x <= 10 ==> double(x) >= x
+        {
+            assert forall|x: nat| x <= 10 implies double(x) >= x by {
+                lemma_double_ge(x);
+            }
+        }
+    } => Ok(())
+}
+
+// Nested assert-by (DeadEnd inside DeadEnd) + the proof body must see
+// OUTER context facts (the fn's requires and the ghost let).
+test_verify_one_file_with_options! {
+    #[test] test_deadend_nested_with_outer_context ["--lean-all-proofs"] => verus_code! {
+        spec fn triple(x: nat) -> nat { 3 * x }
+
+        proof fn lemma_triple_ge(x: nat)
+            ensures triple(x) >= x
+        by { unfold triple; omega }
+
+        proof fn nested(v: nat)
+            requires v < 100
+            ensures triple(v + 1) >= v + 1
+        {
+            let w = v + 1;
+            assert(triple(w) >= w) by {
+                assert(w <= 100) by {
+                    // closes from the outer `requires v < 100` + the let
+                }
+                lemma_triple_ge(w);
+            }
+        }
+    } => Ok(())
+}

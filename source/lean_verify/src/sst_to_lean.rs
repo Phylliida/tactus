@@ -293,6 +293,13 @@ pub type FnMap<'a> = HashMap<&'a Fun, &'a FunctionX>;
 pub struct WpCtx<'a> {
     pub fn_map: FnMap<'a>,
     pub type_map: HashMap<&'a VarIdent, &'a Typ>,
+    /// Locals of kind `LocalDeclKind::AssertByVar` — the skolem
+    /// variables of `assert forall |x| … by { … }` proof bodies. The
+    /// `StmX::DeadEnd` arm binds the ones its block references as
+    /// ∀-binders on the scope's theorems (they have no `Wp::Let` —
+    /// Verus declares them fn-wide and scopes them syntactically;
+    /// F4, DESIGN-lean-all-proofs-followons.md).
+    pub assert_by_var_typs: HashMap<&'a VarIdent, &'a Typ>,
     /// Declared return-var name (`-> (r: T)`), or `None` for unit
     /// returns. Used by `Wp::Done` leaves produced from `Return`
     /// statements to bind the returned value before jumping to the
@@ -505,6 +512,10 @@ impl<'a> WpCtx<'a> {
             .with_binder_typs(&caller_param_typs);
         let type_map: HashMap<&VarIdent, &Typ> =
             check.local_decls.iter().map(|d| (&d.ident, &d.typ)).collect();
+        let assert_by_var_typs: HashMap<&VarIdent, &Typ> = check.local_decls.iter()
+            .filter(|d| matches!(d.kind, vir::sst::LocalDeclKind::AssertByVar { .. }))
+            .map(|d| (&d.ident, &d.typ))
+            .collect();
         let ret_name = check.post_condition.dest.as_ref().map(|v| v.0.as_str());
         // Declared Lean typ of the return value, looked up via the dest
         // VarIdent (post_condition.dest carries only the name) against
@@ -560,6 +571,7 @@ impl<'a> WpCtx<'a> {
         Ok(Self {
             fn_map,
             type_map,
+            assert_by_var_typs,
             ret_name,
             ensures_goal,
             mut_ref_locals: mut_param_names.clone(),
@@ -1985,6 +1997,32 @@ fn walk_obligations<'a>(
             walk_obligations(body, ctx, &closure_obl, e);
             // Continue with `after` under the original obl — the
             // closure params don't escape the closure scope.
+            walk_obligations(after, ctx, obl, e);
+        }
+        Wp::Scope { scope_vars, body, after } => {
+            // Body obligations verify under the CURRENT context —
+            // outer hypotheses and lets stay visible inside the proof
+            // body — plus ∀-binders for this scope's assert-forall
+            // skolems (minus names an enclosing scope already bound;
+            // see the variant docstring). Effects are discarded:
+            // `after` walks under the SAME original obl (the proven
+            // fact re-enters via the `Assume` statement Verus emits
+            // after the DeadEnd, which lives in `after`'s tree).
+            let already_bound: std::collections::HashSet<&crate::lean_name::LeanName> =
+                obl.frames.iter().filter_map(|f| match f {
+                    CtxFrame::Binder(b) => b.name.as_ref(),
+                    _ => None,
+                }).collect();
+            let fresh: Vec<(&VarIdent, &Typ)> = scope_vars.iter()
+                .filter(|(v, _)| {
+                    !already_bound.contains(
+                        &crate::lean_name::LeanName::from_var_ident(v))
+                })
+                .cloned()
+                .collect();
+            let mut scope_obl = obl.clone();
+            push_mod_var_frames(&mut scope_obl, &fresh);
+            walk_obligations(body, ctx, &scope_obl, e);
             walk_obligations(after, ctx, obl, e);
         }
         Wp::Branch { cond, then_branch, else_branch } => {
@@ -4192,6 +4230,31 @@ enum Wp<'a> {
         after: Box<Wp<'a>>,
     },
 
+    /// Scoped proof block whose state effects are discarded —
+    /// `StmX::DeadEnd`, Verus's desugar of `assert(P) by { <verus
+    /// proof> }` / `assert forall … by { … }` (`vir/ast_to_sst.rs`
+    /// ~2270): `DeadEnd(Block([Assume(require), …proof…,
+    /// Assert(ensure)]))` followed by a separate
+    /// `Assume(∀ vars, require ⇒ ensure)` that re-introduces the
+    /// proven fact into the main flow — so this node needs no fact
+    /// plumbing of its own. The body's obligations are emitted under
+    /// the CURRENT context (outer lets/hyps stay visible inside the
+    /// proof body); `after` continues under the original obl
+    /// unchanged. Same discard shape as `ClosureBody` minus the param
+    /// binders — a dedicated variant keeps `ClosureBody`'s contract
+    /// closure-specific (F4, DESIGN-lean-all-proofs-followons.md).
+    Scope {
+        /// The `AssertByVar` skolems this block references — bound as
+        /// ∀-binders on the scope's theorems by the walker (minus any
+        /// already bound by an enclosing scope; nested assert-forall
+        /// proof bodies legally reference outer skolems, and rebinding
+        /// would shadow the hypothesis-carrying binder with a fresh
+        /// unconstrained one).
+        scope_vars: Vec<(&'a VarIdent, &'a Typ)>,
+        body: Box<Wp<'a>>,
+        after: Box<Wp<'a>>,
+    },
+
     /// Obligation: prove `P`, then `body` proceeds with `P` as a
     /// hypothesis. Walker emits one theorem per `Wp::Assert`.
     Assert(crate::to_lean_sst_expr::Validated<'a>, Box<Wp<'a>>),
@@ -4939,10 +5002,26 @@ fn build_wp<'a>(
         // `assert by(nonlinear_arith)` — dispatch on mode in the helper.
         StmX::AssertQuery { mode, typ_inv_exps: _, typ_inv_vars: _, body } =>
             build_wp_assert_query(mode, body, after, ctx, loop_stack),
-        StmX::DeadEnd(_) => Err(
-            "Verus's internal `DeadEnd` marker reached the SST — this shouldn't \
-             appear in user code. If you're seeing this, please open an issue.".to_string()
-        ),
+        // Scoped proof block, effects discarded — `assert(P) by { … }`
+        // / `assert forall … by { … }` in their Verus-proof-body form
+        // (the raw-Lean-tactic form is `AssertQuery` above). The
+        // block's own `Assert(ensure)` node carries the real
+        // obligation, so the inner terminator is a trivially-true
+        // leaf — there is no flow-through goal, and the enclosing
+        // flow re-acquires the proven fact via the `Assume` statement
+        // Verus emits AFTER the DeadEnd (part of `after`'s tree).
+        // Matches the `StmX::ClosureInner` construction below.
+        // `loop_stack`: EMPTY — break/continue can't legally cross an
+        // assert-by boundary (mode checker), so a leak becomes
+        // build_wp's existing clean error instead of silently jumping
+        // to an outer loop's leaf. (F4,
+        // DESIGN-lean-all-proofs-followons.md.)
+        StmX::DeadEnd(block) => {
+            let scope_vars = collect_assert_by_vars(block, ctx);
+            let body =
+                build_wp(block, Wp::Done(LExpr::lit_bool(true)), ctx, &LoopStack::Empty)?;
+            Ok(Wp::Scope { scope_vars, body: Box::new(body), after: Box::new(after) })
+        }
         StmX::OpenInvariant(_) => Err(
             "`open_atomic_invariant!` (atomic invariant opening) not yet supported \
              in tactus_auto fns — out of scope until Tactus's concurrency story \
@@ -5014,6 +5093,39 @@ fn build_wp<'a>(
 /// (#130 follow-up): either render bitwise ops via `Int.xor` etc.,
 /// or add `HXor Int Int Int` instances in TactusPrelude that
 /// delegate to the function form.
+/// Collect the `AssertByVar`-kind locals (assert-forall skolems) that
+/// `stm` references, in deterministic (name-sorted) order. Used by the
+/// `StmX::DeadEnd` arm: these vars have no `Wp::Let` (Verus declares
+/// them fn-wide, scoped syntactically to the assert-by block), so the
+/// scope's theorems must ∀-bind them explicitly. Read-only use of the
+/// map visitors — the `let _ =` discards the rebuilt trees (same idiom
+/// as the synthetic-assume scan above).
+fn collect_assert_by_vars<'a>(
+    stm: &Stm,
+    ctx: &WpCtx<'a>,
+) -> Vec<(&'a VarIdent, &'a Typ)> {
+    use vir::sst::ExpX as X;
+    let mut used: std::collections::HashSet<VarIdent> = std::collections::HashSet::new();
+    let _ = vir::sst_visitor::map_exps_in_stm_visitor(stm, &mut |e: &Exp| {
+        let _ = vir::sst_visitor::map_exp_visitor(e, &mut |inner: &Exp| {
+            match &inner.x {
+                X::Var(v) | X::VarLoc(v) | X::VarAt(v, _) => {
+                    used.insert(v.clone());
+                }
+                _ => {}
+            }
+            inner.clone()
+        });
+        e.clone()
+    });
+    let mut out: Vec<(&'a VarIdent, &'a Typ)> = ctx.assert_by_var_typs.iter()
+        .filter(|(v, _)| used.contains(**v))
+        .map(|(v, t)| (*v, *t))
+        .collect();
+    out.sort_by_key(|(v, _)| format!("{:?}", v));
+    out
+}
+
 fn build_wp_assert_bit_vector<'a>(
     requires: &[Exp],
     ensures: &[Exp],
