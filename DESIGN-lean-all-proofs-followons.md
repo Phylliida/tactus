@@ -353,3 +353,100 @@ starts from an honest population.
 | Trivial-leaf emission | `lean_verify/src/sst_to_lean.rs:2164` (`emit_done_or_split`) |
 | Witness-hyp sprinkle (F6-5) | `lean_verify/src/sst_to_lean.rs:1817,1844,1962,2001,2028` |
 | Baseline numbers | `DESIGN-lean-all-proofs.md` §10.1 |
+
+---
+
+## Deferred-item specs (2026-07-10 second pass) — root-cause clustering
+
+Question prompting this pass (Danielle): are the deferred items independent chores, or do
+they share underlying causes that infra work would address together? Answer: they cluster
+into four causes plus a preventive check. Two "items" dissolve entirely into their
+cluster's fix.
+
+### Cluster 1 — termination fidelity (F2b + F2c, one small arc)
+
+**Shared cause:** Lean's termination checker derives its goals from the def's *syntactic*
+structure, which sees strictly less than Verus's VC generator: it wraps non-Nat measures
+in opaque `sizeOf` (F2b) and provides branch hypotheses only for control flow it
+recognizes — `if`/`match`, not Prop `∨`/`∧` (F2c). Verus's own SpecTermination VC has
+both right, but its proof cannot be transplanted: the guard hypotheses must exist *in the
+decreasing goal's context*, which only the def's syntax provides. (Checked: no
+tactic-side fix exists for F2c — the hypothesis is genuinely absent and the goal false
+without it.)
+
+**Fix, both halves at recursive-def emission** (`spec_fn_to_ast` + termination_by
+rendering):
+- F2b: wrap Int-typed `termination_by` measures in `.toNat` (omega handles `Int.toNat`;
+  Nat measures unchanged). Closer rung if needed: `(split <;> omega)` for measure-position
+  ifs — settle empirically.
+- F2c: render spec `&&`/`||` **whose RHS subtree contains a self-call** as
+  `if a then b else False` / `if a then True else b` — propositionally identical, and
+  if-on-Prop is already pervasive in emitted code (Classical decidability is ambient in
+  the prelude). Scope tightly: recursive spec-fn def bodies only, only the connectives on
+  the path to a self-call — everything else keeps `∧`/`∨` (better for simp and for
+  humans).
+
+Pin targets: m3_blinker's `no_sym`/`drop_base_run`/`no_sub3` (F2c, attested) + a synthetic
+Int-abs measure (F2b). One arc, S–M total.
+
+### Cluster 2 — two renderers, one language (F6f; the B5 umbrella)
+
+**Shared cause:** the VIR and SST paths render overlapping expression forms with separate
+code, and every divergence becomes a bug family eventually (B2 choose, F3 literals, F2a's
+companion, B5's claimed-vs-actual). The standing remedy is the one B2/F3 followed —
+shared node builders in `expr_shared` — and, long-term, the typed-renderer migration
+(DESIGN-typed-renderer.md, B5's arc, running in a parallel session).
+
+**F6f specifically** (chained-op associativity: `0<=j<=k<=len` renders let-bound
+LEFT-assoc via the SST desugar but bare RIGHT-assoc via `Multi(Chained)`/`and_all`): the
+inputs differ (ast_to_sst desugars chained ops before the SST path ever sees them), so
+full unification means desugaring on the VIR path too — but the *cheap* fix is a
+fold-direction change in `and_all` to match the SST shape, plus the suite. Likely ~1 line
++ tests. Do it opportunistically; anything pattern-matching conjunction shape (the
+companion was the first casualty) is exposed until then.
+
+### Cluster 3 — scheduling as a real graph (F6a + F6b; F2a's special case dissolves)
+
+**Shared cause:** broadcast axioms (and now the seq companion) are emitted by a parallel
+greedy flusher (`flush_ready_axioms` + a final forced flush + F2a's forced-add special
+case) instead of being nodes in `dep_order::order_emission`'s graph. Making them real
+`EmitStep`s with real edges: the F2a special case becomes an ordinary edge
+(companion → axiom → defs), the final-flush soundness comment localizes, and the
+companion can go through `lean_ast::Theorem` (F6b) instead of `Command::Raw` in the same
+touch. One self-contained M refactor in `generate.rs`/`dep_order.rs`; the e2e suite +
+britton emission diff are the gate.
+
+### Cluster 4 — ambient thread-local state (F6c)
+
+**Cause:** five-ish install/restore thread-locals with per-site Drop-guard discipline;
+the class already produced one real bug (the `with_self_decls` panic leak, review finding
+#3). One `EmitEnv` struct — either passed explicitly or a single thread-local holding the
+whole struct with one guard — kills the class. Compiler-guided churn, M, no behavior
+change; ride any emission-layer arc.
+
+### Preventive check — the B1a-regression class (NEW, recommended soon)
+
+Three same-class bugs in one day (datatype ctor fields, IndexedInductive ctor results,
+trait sibling refs): **a reference to a declaration-in-progress rendered root-anchored**,
+each failing only at lake time. The debug reference sanity checker already registers
+decls and references — add the rule: *flag any `_root_.…X` reference emitted inside the
+declaration of `X`* (it knows the current decl from the self-decls set / command
+structure). Catches the whole class at codegen time, including any not-yet-discovered
+sites (structure field types? instance heads?). XS–S, high leverage. A one-shot audit of
+remaining declaration-body renderers (instances, classes, defs with where-clauses) rides
+along.
+
+### Independent smalls (no shared cause)
+
+- **Trivial-True scope terminators** (F4 leftover, ~1,267 extra goals/run): simplest safe
+  form is a `Wp::DoneEmpty` terminator variant whose walker arm emits nothing — used ONLY
+  by the Scope arm, so empty-ensures fns keep today's `True` theorem and no bookkeeping
+  changes (fns always retain ≥1 theorem from their own ensures). XS once the crate re-run
+  quantifies the lake-time cost; skip if negligible.
+- **F6d** (`choose_node` names from binders): pure API tightening, ride the next
+  expr_shared touch.
+- **F6e** (hyp attachment at Wp-build chokepoints): F4's Scope arm turned out not to need
+  the witness-hyp sprinkle (body/after arms handle their own), so the motivating risk
+  didn't materialize — downgraded to pure altitude; ride a future Wp-arm change.
+- **F5** (check.sh `--emit-lean` drop): one line, gated on Danielle (uncommitted
+  working-tree edit is hers).
