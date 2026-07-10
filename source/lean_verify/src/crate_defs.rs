@@ -272,45 +272,91 @@ fn build_defs(
         (&proof_roots, false, false, true),
         (&proof_roots, false, false, false),
     ];
-    let mut prev: Option<(usize, bool, bool)> = None;
-    for (attempt, &(roots, emit_accessors, covers_exec, with_bc_union)) in attempts.iter().enumerate() {
-        // Emit-lean mode never runs Lean, so there's nothing to learn
-        // from later attempts — just emit attempt 1 and return.
-        if attempt > 0 && !build {
-            break;
-        }
-        // Skip an attempt identical to the previous one (no exec roots
-        // ⇒ full == proof; the union flag is the only remaining axis).
-        if let Some((plen, pcov, punion)) = prev {
-            if roots.len() == plen && covers_exec == pcov && with_bc_union == punion {
-                continue;
+    // Ladder sidecar (`<scope>.ladder`): which attempt won last run,
+    // the winner's content hash, and the toolchain fingerprint. A
+    // failing attempt is EXPENSIVE (a full defs elaboration that
+    // errors) and was re-paid every run — with the sidecar, warm runs
+    // jump straight to the recorded winner; its unchanged render then
+    // rides the content-compare skip, so nothing elaborates at all.
+    // If the winner's render CHANGED, the krate changed: restart the
+    // full ladder (an earlier, broader attempt might now succeed).
+    let ladder_path = crate::generate::lean_out_root()
+        .join(sanitize(crate_name))
+        .join(format!("{}.ladder", scope));
+    let fp = crate::project::toolchain_fingerprint();
+    let mut recorded: Option<(usize, String)> = if build {
+        std::fs::read_to_string(&ladder_path).ok().and_then(|t| {
+            let mut it = t.split_whitespace();
+            match (it.next(), it.next(), it.next()) {
+                (Some(a), Some(h), Some(f)) if f == fp => {
+                    a.parse::<usize>().ok().map(|a| (a, h.to_string()))
+                }
+                _ => None,
+            }
+        })
+    } else {
+        None
+    };
+    'ladder: loop {
+        let mut prev: Option<(usize, bool, bool)> = None;
+        for (attempt, &(roots, emit_accessors, covers_exec, with_bc_union)) in attempts.iter().enumerate() {
+            // Emit-lean mode never runs Lean, so there's nothing to learn
+            // from later attempts — just emit attempt 1 and return.
+            if attempt > 0 && !build {
+                break;
+            }
+            if let Some((win, _)) = &recorded {
+                if attempt < *win {
+                    continue; // known-failing attempt from last run
+                }
+            }
+            // Skip an attempt identical to the previous one (no exec roots
+            // ⇒ full == proof; the union flag is the only remaining axis).
+            if let Some((plen, pcov, punion)) = prev {
+                if roots.len() == plen && covers_exec == pcov && with_bc_union == punion {
+                    continue;
+                }
+            }
+            prev = Some((roots.len(), covers_exec, with_bc_union));
+            match render_and_build(
+                &inlined_krate, &ectx, crate_name, scope, roots,
+                emit_accessors, covers_exec, with_bc_union, build,
+            ) {
+                Ok((defs, content_hash)) => {
+                    if let Some((win, h)) = &recorded {
+                        if attempt == *win && *win > 0 && *h != content_hash {
+                            recorded = None;
+                            continue 'ladder;
+                        }
+                    }
+                    if build {
+                        let _ = std::fs::create_dir_all(
+                            ladder_path.parent().expect("ladder path has a parent"));
+                        let _ = std::fs::write(
+                            &ladder_path, format!("{} {} {}\n", attempt, content_hash, fp));
+                    }
+                    return Some(Arc::new(defs));
+                }
+                Err(e) => {
+                    let stage = match (covers_exec, with_bc_union) {
+                        (true, _) => "full roots",
+                        (false, true) => "proof roots + broadcast union",
+                        (false, false) => "proof roots, no union",
+                    };
+                    let next = if attempt + 1 < attempts.len() && build {
+                        "retrying narrower"
+                    } else {
+                        "falling back to standalone emission"
+                    };
+                    eprintln!(
+                        "tactus: defs module build failed for crate `{}` ({}) — {}\n{}",
+                        crate_name, stage, next, e,
+                    );
+                }
             }
         }
-        prev = Some((roots.len(), covers_exec, with_bc_union));
-        match render_and_build(
-            &inlined_krate, &ectx, crate_name, scope, roots,
-            emit_accessors, covers_exec, with_bc_union, build,
-        ) {
-            Ok(defs) => return Some(Arc::new(defs)),
-            Err(e) => {
-                let stage = match (covers_exec, with_bc_union) {
-                    (true, _) => "full roots",
-                    (false, true) => "proof roots + broadcast union",
-                    (false, false) => "proof roots, no union",
-                };
-                let next = if attempt + 1 < attempts.len() && build {
-                    "retrying narrower"
-                } else {
-                    "falling back to standalone emission"
-                };
-                eprintln!(
-                    "tactus: defs module build failed for crate `{}` ({}) — {}\n{}",
-                    crate_name, stage, next, e,
-                );
-            }
-        }
+        return None;
     }
-    None
 }
 
 /// M5d-3 partition plan over the tagged spec-world stream. Pure and
@@ -572,7 +618,7 @@ fn render_and_build(
     covers_exec: bool,
     with_bc_union: bool,
     build: bool,
-) -> Result<CrateDefs, String> {
+) -> Result<(CrateDefs, String), String> {
     let ns = sanitize(crate_name);
     // Scope-suffixed: per-bucket artifacts coexist (see scope_key).
     let module_name = format!("TactusDefs_{}", scope);
@@ -616,6 +662,18 @@ fn render_and_build(
     cmds.extend(item_cmds.iter().cloned());
     cmds.push(Command::NamespaceClose(ns.clone()));
 
+    // Content hash of the full rendered stream — the ladder sidecar's
+    // change detector (build_defs): stable across runs because the
+    // render is deterministic. Computed on the SAME text either
+    // render path elaborates (partition is a pure function of it).
+    let rendered = crate::lean_pp::pp_commands(&cmds);
+    let content_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        rendered.text.hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+
     // Partitioned defs (M5d-3) in package modes: same commands, same
     // per-chain order, split per source module — `cmds` stays the full
     // monolith stream so every consumer (sanity concat, debuggers)
@@ -624,20 +682,19 @@ fn render_and_build(
         return render_partitioned(
             &module_name, scope, &dir, &ns, covers_exec,
             cmds, &head, &item_cmds, &segs, build,
-        );
+        ).map(|d| (d, content_hash));
     }
 
-    let rendered = crate::lean_pp::pp_commands(&cmds);
     let lean_path = dir.join(format!("{}.lean", module_name));
     let olean_path = dir.join(format!("{}.olean", module_name));
 
     if !build {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         std::fs::write(&lean_path, &rendered.text).map_err(|e| e.to_string())?;
-        return Ok(CrateDefs {
+        return Ok((CrateDefs {
             scope: scope.to_string(), module_name, covers_exec, dir, cmds,
             breaking: false,
-        });
+        }, content_hash));
     }
 
     let up_to_date = olean_path.exists()
@@ -647,10 +704,10 @@ fn render_and_build(
         build_olean(&dir, &module_name, &rendered.text, &olean_path, &lean_path)?;
     }
     // Monolith: any rebuild is conservatively breaking (no manifest).
-    Ok(CrateDefs {
+    Ok((CrateDefs {
         module_name, scope: scope.to_string(), covers_exec, dir, cmds,
         breaking: !up_to_date,
-    })
+    }, content_hash))
 }
 
 /// Partitioned defs render + build (M5d-3). Files, in build order:
