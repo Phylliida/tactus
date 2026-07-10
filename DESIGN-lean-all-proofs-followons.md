@@ -251,6 +251,7 @@ the arc that next touches its machinery:
 | One `EmitEnv` struct for the ambient thread-locals (`install_emit_tables`'s renames / `CRATE_NS` / `CRATE_DECLS`, plus self-decls) | any emission-layer arc | Kills the with-restore/Drop-guard panic-leak *class* the review found an instance of |
 | `choose_node` deriving names from binders instead of the parallel `names` slice | next B2-adjacent touch (`expr_shared.rs:1156`) | Pure API tightening |
 | Hyp attachment at Wp-build chokepoints instead of walker arms | **F4** | F4 adds a walker arm; the `obl_with_choose_hyps` sprinkle (6+ sites: `sst_to_lean.rs:1817,1844,1962,2001,2028,…`) is exactly the pattern a new arm can forget. Doing this refactor first (or with F4) means the scope arm can't miss witness hyps by construction |
+| Chained-op rendering divergence (found during F2a) | F3 (same unify-the-paths move) | The same chained comparison (`0 <= j <= k <= len`) renders let-bound **left-assoc** on one path and bare **right-assoc** (`Multi(Chained)`/`and_all`) on the other. F2a's companion proof was the first casualty (fixed by shape-robust `omega`); any consumer pattern-matching conjunction structure is exposed until the paths agree |
 
 ---
 
