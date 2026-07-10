@@ -39,6 +39,12 @@ pub struct CrateDefs {
     /// built from — sibling modules (Stmts/Link) derive their names
     /// from this instead of string surgery on `module_name` (M5d-0).
     pub scope: String,
+    /// Whether any defs part was rebuilt NON-superset this run (M5e):
+    /// consumers (stmt/pkg oleans) may skip re-elaboration across runs
+    /// only when this is false — a pure append (old declarations all
+    /// present, identical, in order) cannot invalidate a consumer
+    /// olean, but any other change can.
+    pub breaking: bool,
     /// Whether exec-fn dep closures are included. `false` after the
     /// proof-roots-only retry (see `build_defs`): exec fns then emit
     /// standalone, while the proofs batch — whose spec needs are a
@@ -620,7 +626,10 @@ fn render_and_build(
     if !build {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         std::fs::write(&lean_path, &rendered.text).map_err(|e| e.to_string())?;
-        return Ok(CrateDefs { scope: scope.to_string(), module_name, covers_exec, dir, cmds });
+        return Ok(CrateDefs {
+            scope: scope.to_string(), module_name, covers_exec, dir, cmds,
+            breaking: false,
+        });
     }
 
     let up_to_date = olean_path.exists()
@@ -629,7 +638,11 @@ fn render_and_build(
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         build_olean(&dir, &module_name, &rendered.text, &olean_path, &lean_path)?;
     }
-    Ok(CrateDefs { module_name, scope: scope.to_string(), covers_exec, dir, cmds })
+    // Monolith: any rebuild is conservatively breaking (no manifest).
+    Ok(CrateDefs {
+        module_name, scope: scope.to_string(), covers_exec, dir, cmds,
+        breaking: !up_to_date,
+    })
 }
 
 /// Partitioned defs render + build (M5d-3). Files, in build order:
@@ -689,24 +702,60 @@ one part per source module, SCC-merged; umbrella = interface)", header)));
         all_parts,
     ));
 
-    let mut rebuilt: std::collections::HashSet<String> = Default::default();
+    // M5e superset waiver: per part, a MANIFEST of one hash per item
+    // command (DefaultHasher — key-stable across runs of one binary).
+    // A rebuild whose old manifest is an order-preserving subsequence
+    // of the new one is an APPEND: old declarations all present,
+    // identical, before any new ones — existing consumer oleans stay
+    // valid (kernel weakening; Lean elaborates top-down, so the old
+    // prefix elaborates in an identical environment). Anything else is
+    // BREAKING, and breaking propagates through imports (Lean imports
+    // are transitive).
+    let cmd_hash = |c: &Command| -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        crate::lean_pp::pp_commands(std::slice::from_ref(c)).text.hash(&mut h);
+        h.finish()
+    };
+    let is_subsequence = |old: &[u64], new: &[u64]| -> bool {
+        let mut it = new.iter();
+        old.iter().all(|o| it.any(|n| n == o))
+    };
+    let mut breaking: std::collections::HashSet<String> = Default::default();
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     for (name, cmds, imports) in &files {
         let rendered = crate::lean_pp::pp_commands(cmds);
         let lean_path = dir.join(format!("{}.lean", name));
         let olean_path = dir.join(format!("{}.olean", name));
+        let manifest_path = dir.join(format!("{}.manifest", name));
+        let new_manifest: Vec<u64> = cmds.iter().map(&cmd_hash).collect();
+        let write_manifest = || -> Result<(), String> {
+            let text: String = new_manifest.iter()
+                .map(|h| format!("{:016x}\n", h)).collect();
+            std::fs::write(&manifest_path, text).map_err(|e| e.to_string())
+        };
         if !build {
             std::fs::write(&lean_path, &rendered.text).map_err(|e| e.to_string())?;
+            write_manifest()?;
             continue;
         }
-        let deps_stable = imports.iter().all(|i| !rebuilt.contains(i));
-        let up_to_date = deps_stable
-            && olean_path.exists()
+        let import_breaking = imports.iter().any(|i| breaking.contains(i));
+        let content_same = olean_path.exists()
             && std::fs::read_to_string(&lean_path).ok().as_deref() == Some(&rendered.text);
-        if !up_to_date {
-            build_olean(dir, name, &rendered.text, &olean_path, &lean_path)
-                .map_err(|e| format!("defs part `{}`: {}", name, e))?;
-            rebuilt.insert(name.clone());
+        if content_same && !import_breaking {
+            continue; // unchanged, or upstream changes were pure appends
+        }
+        let old_manifest: Option<Vec<u64>> = std::fs::read_to_string(&manifest_path)
+            .ok()
+            .map(|t| t.lines().filter_map(|l| u64::from_str_radix(l, 16).ok()).collect());
+        build_olean(dir, name, &rendered.text, &olean_path, &lean_path)
+            .map_err(|e| format!("defs part `{}`: {}", name, e))?;
+        write_manifest()?;
+        let own_superset = old_manifest
+            .map(|o| is_subsequence(&o, &new_manifest))
+            .unwrap_or(false); // no manifest = first build = breaking
+        if import_breaking || !own_superset {
+            breaking.insert(name.clone());
         }
     }
     Ok(CrateDefs {
@@ -715,6 +764,7 @@ one part per source module, SCC-merged; umbrella = interface)", header)));
         covers_exec,
         dir: dir.to_path_buf(),
         cmds: full_cmds,
+        breaking: !breaking.is_empty(),
     })
 }
 

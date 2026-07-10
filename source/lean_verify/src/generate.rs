@@ -61,6 +61,16 @@ pub fn sourcemap_path(crate_name: &str) -> PathBuf {
     lean_out_root().join(sanitize(crate_name)).join("sourcemap.json")
 }
 
+/// Like `write_lean_file`, returning whether the content CHANGED
+/// (file absent or different) — the cross-run skip signal (M5e).
+fn write_lean_file_tracked(path: &Path, source: &str) -> Result<bool, String> {
+    let changed = std::fs::read_to_string(path).ok().as_deref() != Some(source);
+    if changed {
+        write_lean_file(path, source)?;
+    }
+    Ok(changed)
+}
+
 fn write_lean_file(path: &Path, source: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -1737,15 +1747,24 @@ static STMTS_OLEAN_MEMO: std::sync::OnceLock<
 /// Ensure ONE stmt module's olean exists (M5d-2; the `.lean` was
 /// written by the partition build, which emission always runs first).
 /// Returns whether the olean was already built this process (reused).
+/// `may_skip` (M5e): the module's `.lean` content is unchanged AND
+/// the defs it imports had no breaking rebuild — its existing olean
+/// is still valid, so priming the memo without a lean run is sound.
 fn ensure_stmt_olean(
     module: &str,
     defs: &crate::crate_defs::CrateDefs,
     prelude_dir: &Path,
+    may_skip: bool,
 ) -> Result<bool, String> {
     let key = module.to_string();
     let cell = memo_cell(&STMTS_OLEAN_MEMO, &key);
-    let reused = cell.get().is_some();
+    let pre = cell.get().is_some();
+    let skipped = std::cell::Cell::new(false);
     cell.get_or_init(|| {
+        if may_skip && defs.dir.join(format!("{}.olean", module)).exists() {
+            skipped.set(true);
+            return Ok(());
+        }
         let base_path = format!("{}:{}", prelude_dir.display(), defs.dir.display());
         let mut failures: Vec<(String, String)> = Vec::new();
         run_lean(&defs.dir, module, true, &base_path, &mut failures);
@@ -1753,7 +1772,7 @@ fn ensure_stmt_olean(
             None => Ok(()),
             Some((_, out)) => Err(format!("stmt olean build failed ({}):\n{}", module, out)),
         }
-    }).clone().map(|()| reused)
+    }).clone().map(|()| pre || skipped.get())
 }
 
 /// Verify one tactic proof fn via its package module (M5a). Two-phase:
@@ -1789,9 +1808,24 @@ fn check_proof_fn_via_package(
     match emit_package_proof_fn(
         krate, proof_fn, tactic_body, imports, crate_name, tactic_bodies, &defs,
     ) {
-        Ok(PkgEmitOutcome::Single { leaf, path, source_map, stmt_modules }) => {
-            for m in &stmt_modules {
-                if let Err(e) = ensure_stmt_olean(m, &defs, &prelude_dir) {
+        Ok(PkgEmitOutcome::Single { leaf, path, source_map, stmt_modules, changed }) => {
+            // Cross-run cache (M5e): everything this module sees is
+            // unchanged (own text, stmt imports, defs non-breaking) and
+            // its olean exists — the prior verdict stands. Sorry
+            // remains gated: the Link pass re-checks the closure every
+            // run, so a cached fn can't smuggle one through.
+            let olean = path.with_extension("olean");
+            let cacheable = !changed
+                && stmt_modules.iter().all(|(_, ch)| !ch)
+                && !defs.breaking
+                && olean.exists();
+            if cacheable {
+                record_pkg_olean_built(&path);
+                return Some(CheckResult::Success { warnings: vec![] });
+            }
+            for (m, ch) in &stmt_modules {
+                let may_skip = !ch && !defs.breaking;
+                if let Err(e) = ensure_stmt_olean(m, &defs, &prelude_dir, may_skip) {
                     return Some(CheckResult::Error(e));
                 }
             }
@@ -1804,14 +1838,24 @@ fn check_proof_fn_via_package(
             }
             Some(format_lean_check_result(result, proof_fn, &path, &source_map))
         }
-        Ok(PkgEmitOutcome::Mutual { leaf, path, members, stmt_modules }) => {
-            for m in &stmt_modules {
-                if let Err(e) = ensure_stmt_olean(m, &defs, &prelude_dir) {
+        Ok(PkgEmitOutcome::Mutual { leaf, path, members, stmt_modules, changed }) => {
+            for (m, ch) in &stmt_modules {
+                let may_skip = !ch && !defs.breaking;
+                if let Err(e) = ensure_stmt_olean(m, &defs, &prelude_dir, may_skip) {
                     return Some(CheckResult::Error(e));
                 }
             }
+            let cacheable = !changed
+                && stmt_modules.iter().all(|(_, ch)| !ch)
+                && !defs.breaking
+                && path.with_extension("olean").exists();
             let cell = memo_cell(&MUTUAL_CHECK_MEMO, &path);
             let verdict = cell.get_or_init(|| {
+                if cacheable {
+                    return std::sync::Arc::new(MutualVerdict {
+                        success: true, diagnostics: vec![],
+                    });
+                }
                 let pkg_dir = path.parent().expect("pkg file has a parent");
                 // One `--json -o` pass; diagnostics stored on success
                 // too, so members can surface own-region WARNINGS
@@ -1944,8 +1988,9 @@ fn stmt_fn_module_name(defs: &crate::crate_defs::CrateDefs, f: &Fun) -> String {
 /// The per-fn stmt partition: for each emittable proof fn, its stmt
 /// module name + the module's full command stream (for per-fn sanity
 /// concatenation — identifier resolution must see what Lean will see).
+/// name, module cmds (sanity concat), content-changed-this-run (M5e).
 type StmtPartition =
-    std::collections::HashMap<Fun, (String, std::sync::Arc<Vec<Command>>)>;
+    std::collections::HashMap<Fun, (String, std::sync::Arc<Vec<Command>>, bool)>;
 
 /// Partition memo: one build + N file writes per scope per process.
 /// `None` = a previous attempt failed (fail once, warn once), same
@@ -2024,8 +2069,8 @@ fn build_stmt_partition(
         let rendered = pp_commands(&cmds);
         let name = stmt_fn_module_name(defs, &f.name);
         let path = defs.dir.join(format!("{}.lean", name));
-        write_lean_file(&path, &rendered.text)?;
-        out.insert(f.name.clone(), (name, std::sync::Arc::new(cmds)));
+        let changed = write_lean_file_tracked(&path, &rendered.text)?;
+        out.insert(f.name.clone(), (name, std::sync::Arc::new(cmds), changed));
     }
     Ok(out)
 }
@@ -2049,8 +2094,11 @@ pub enum PkgEmitOutcome {
         /// locations island failures do.
         source_map: to_lean_fn::LeanSourceMap,
         /// Stmt modules this pkg module imports (self + direct deps,
-        /// M5d-2) — the check path ensures exactly these oleans.
-        stmt_modules: Vec<String>,
+        /// M5d-2), with each one's content-changed flag (M5e) — the
+        /// check path ensures exactly these oleans.
+        stmt_modules: Vec<(String, bool)>,
+        /// Whether this pkg module's own content changed this run.
+        changed: bool,
     },
     /// Fn is a member of a supported mutual SCC; leaf/path name the
     /// SCC's canonical module (same for every member); `members`
@@ -2059,8 +2107,10 @@ pub enum PkgEmitOutcome {
         leaf: String,
         path: std::path::PathBuf,
         members: std::sync::Arc<Vec<MutualMember>>,
-        /// Stmt modules of all SCC members (M5d-2).
-        stmt_modules: Vec<String>,
+        /// Stmt modules of all SCC members (M5d-2), with changed flags.
+        stmt_modules: Vec<(String, bool)>,
+        /// Whether the mutual module's own content changed this run.
+        changed: bool,
     },
     /// Fn is on a cycle with SCC-external helper deps — not
     /// package-expressible; payload = human-readable reason.
@@ -2119,12 +2169,13 @@ fn emit_package_proof_fn_inner(
             )));
         }
         let leaf = mutual_module_leaf(&scc);
-        let stmt_modules: Vec<String> = scc.iter()
-            .map(|f| stmt_fn_module_name(defs, &f.name)).collect();
-        let (path, members) = emit_package_mutual_scc(
+        let stmt_modules: Vec<(String, bool)> = scc.iter()
+            .filter_map(|f| stmts.get(&f.name).map(|(n, _, ch)| (n.clone(), *ch)))
+            .collect();
+        let (path, members, changed) = emit_package_mutual_scc(
             inlined_krate, &scc, imports, crate_name, tactic_bodies, defs, &stmts,
         )?;
-        return Ok(PkgEmitOutcome::Mutual { leaf, path, members, stmt_modules });
+        return Ok(PkgEmitOutcome::Mutual { leaf, path, members, stmt_modules, changed });
     }
     // Direct helper references: same textual scan the island helper
     // walk uses (`collect_referenced_proof_fns`), but non-recursive —
@@ -2138,15 +2189,17 @@ fn emit_package_proof_fn_inner(
     let needed: Vec<&FunctionX> = std::iter::once(proof_fn)
         .chain(deps.iter().copied())
         .collect();
-    let stmt_modules: Vec<String> = {
+    // (name, content-changed) — dedup preserves first occurrence.
+    let stmt_modules: Vec<(String, bool)> = {
         let mut seen = std::collections::HashSet::new();
         needed.iter()
-            .map(|f| stmt_fn_module_name(defs, &f.name))
-            .filter(|n| seen.insert(n.clone()))
+            .filter_map(|f| stmts.get(&f.name)
+                .map(|(n, _, ch)| (n.clone(), *ch)))
+            .filter(|(n, _)| seen.insert(n.clone()))
             .collect()
     };
     let mut file_imports: Vec<String> = imports.to_vec();
-    file_imports.extend(stmt_modules.iter().cloned());
+    file_imports.extend(stmt_modules.iter().map(|(n, _)| n.clone()));
     let (mut cmds, ns) = krate_preamble(
         inlined_krate, &file_imports, crate_name, &[proof_fn],
         PreambleConfig::ProofFnPackage, &[], tactic_bodies, &[], Some(defs),
@@ -2166,7 +2219,7 @@ fn emit_package_proof_fn_inner(
         let concat: Vec<Command> = defs.cmds.iter()
             .chain(needed.iter()
                 .filter_map(|f| stmts.get(&f.name))
-                .flat_map(|(_, c)| c.iter()))
+                .flat_map(|(_, c, _)| c.iter()))
             .chain(cmds.iter())
             .cloned().collect();
         debug_check(&concat)?;
@@ -2177,10 +2230,10 @@ fn emit_package_proof_fn_inner(
     let leaf = lean_name(&proof_fn.name.path).replace('.', "__");
     let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
         .join(format!("{}.lean", leaf));
-    write_lean_file(&path, &rendered.text)?;
+    let changed = write_lean_file_tracked(&path, &rendered.text)?;
     let source_map = proof_fn_source_map(
         &proof_fn.name, rendered.landmarks.tactic_starts.first().copied(), tactic_body);
-    Ok(PkgEmitOutcome::Single { leaf, path, source_map, stmt_modules })
+    Ok(PkgEmitOutcome::Single { leaf, path, source_map, stmt_modules, changed })
 }
 
 /// Per-member attribution info for one theorem inside a mutual
@@ -2198,7 +2251,7 @@ pub struct MutualMember {
 /// (every member after the first) can still attribute diagnostics.
 static MUTUAL_MEMO: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<
-        std::path::PathBuf, std::sync::Arc<Vec<MutualMember>>>>,
+        std::path::PathBuf, (std::sync::Arc<Vec<MutualMember>>, bool)>>,
 > = std::sync::OnceLock::new();
 
 /// Package module for a mutual tactic SCC: one file, all members'
@@ -2217,13 +2270,13 @@ fn emit_package_mutual_scc(
     tactic_bodies: &std::collections::HashMap<Fun, String>,
     defs: &crate::crate_defs::CrateDefs,
     stmts: &std::sync::Arc<StmtPartition>,
-) -> Result<(std::path::PathBuf, std::sync::Arc<Vec<MutualMember>>), String> {
+) -> Result<(std::path::PathBuf, std::sync::Arc<Vec<MutualMember>>, bool), String> {
     let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
         .join(format!("{}.lean", mutual_module_leaf(scc)));
     {
         let memo = MUTUAL_MEMO.get_or_init(Default::default);
-        if let Some(members) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&path) {
-            return Ok((path, members.clone())); // written by another member's call
+        if let Some((members, changed)) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&path) {
+            return Ok((path, members.clone(), *changed)); // written by another member's call
         }
     }
     let mut file_imports: Vec<String> = imports.to_vec();
@@ -2247,7 +2300,7 @@ fn emit_package_mutual_scc(
         let concat: Vec<Command> = defs.cmds.iter()
             .chain(scc.iter()
                 .filter_map(|f| stmts.get(&f.name))
-                .flat_map(|(_, c)| c.iter()))
+                .flat_map(|(_, c, _)| c.iter()))
             .chain(cmds.iter())
             .cloned().collect();
         debug_check(&concat)?;
@@ -2255,7 +2308,7 @@ fn emit_package_mutual_scc(
     #[cfg(not(debug_assertions))]
     let _ = &stmts;
     let rendered = pp_commands(&cmds);
-    write_lean_file(&path, &rendered.text)?;
+    let changed = write_lean_file_tracked(&path, &rendered.text)?;
     // One tactic_starts entry per Tactic::Raw in emission order = one
     // per SCC member. A member's diagnostic REGION starts at its
     // tactic start; theorem-header errors land in the preceding
@@ -2275,8 +2328,8 @@ fn emit_package_mutual_scc(
     let members = std::sync::Arc::new(members);
     MUTUAL_MEMO.get_or_init(Default::default)
         .lock().unwrap_or_else(|p| p.into_inner())
-        .insert(path.clone(), members.clone());
-    Ok((path, members))
+        .insert(path.clone(), (members.clone(), changed));
+    Ok((path, members, changed))
 }
 
 // ── Package gate (M4) ───────────────────────────────────────────────
@@ -2315,7 +2368,7 @@ pub fn check_package(
     let graph = g.view();
     let mut leafs: Vec<String> = Vec::new();
     let mut seen_leafs: std::collections::HashSet<String> = Default::default();
-    let mut stmt_mods: Vec<String> = Vec::new();
+    let mut stmt_mods: Vec<(String, bool)> = Vec::new();
     let mut seen_stmts: std::collections::HashSet<String> = Default::default();
     let mut skipped_sccs: Vec<String> = Vec::new();
     let mut seen_skips: std::collections::HashSet<String> = Default::default();
@@ -2331,9 +2384,9 @@ pub fn check_package(
         ) {
             Ok(PkgEmitOutcome::Single { leaf, stmt_modules, .. }) => {
                 leafs.push(leaf);
-                for m in stmt_modules {
+                for (m, ch) in stmt_modules {
                     if seen_stmts.insert(m.clone()) {
-                        stmt_mods.push(m);
+                        stmt_mods.push((m, ch));
                     }
                 }
             }
@@ -2341,9 +2394,9 @@ pub fn check_package(
                 if seen_leafs.insert(leaf.clone()) {
                     leafs.push(leaf);
                 }
-                for m in stmt_modules {
+                for (m, ch) in stmt_modules {
                     if seen_stmts.insert(m.clone()) {
-                        stmt_mods.push(m);
+                        stmt_mods.push((m, ch));
                     }
                 }
             }
@@ -2365,8 +2418,9 @@ pub fn check_package(
     // (M5c): stmts olean via its memo, pkg modules via the built-set.
     // Per-fn stmt oleans (M5d-2): ensure each collected module, reusing
     // whatever the per-fn checks already built this process.
-    for m in &stmt_mods {
-        match ensure_stmt_olean(m, &defs, &prelude_dir) {
+    for (m, ch) in &stmt_mods {
+        let may_skip = !ch && !defs.breaking;
+        match ensure_stmt_olean(m, &defs, &prelude_dir, may_skip) {
             Ok(true) => reused += 1,
             Ok(false) => {}
             Err(e) => failures.push((m.clone(), e)),
