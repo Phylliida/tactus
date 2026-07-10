@@ -728,16 +728,29 @@ fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
             write_expr(out, body, 0, lm);
         }
         ExprNode::Forall { binders, body } => {
-            out.push('∀');
-            write_binders(out, binders, lm);
-            out.push_str(", ");
-            write_expr(out, body, 0, lm);
+            // Zero binders: `∀, P` is a parse error and a zero-binder
+            // quantifier IS its body — print the body alone. Reached
+            // via plain (non-forall) `assert … by { }`: the desugar's
+            // re-assumed fact is `Quant(FORALL, vars=[], req ⇒ ens)`
+            // (F4). Same guard family as Lambda's `fun ()` arm.
+            if binders.is_empty() {
+                write_expr(out, body, 0, lm);
+            } else {
+                out.push('∀');
+                write_binders(out, binders, lm);
+                out.push_str(", ");
+                write_expr(out, body, 0, lm);
+            }
         }
         ExprNode::Exists { binders, body } => {
-            out.push('∃');
-            write_binders(out, binders, lm);
-            out.push_str(", ");
-            write_expr(out, body, 0, lm);
+            if binders.is_empty() {
+                write_expr(out, body, 0, lm);
+            } else {
+                out.push('∃');
+                write_binders(out, binders, lm);
+                out.push_str(", ");
+                write_expr(out, body, 0, lm);
+            }
         }
 
         ExprNode::If { cond, then_, else_ } => {

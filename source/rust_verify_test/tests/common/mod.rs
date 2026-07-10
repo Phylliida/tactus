@@ -387,6 +387,8 @@ pub fn run_verus(
             verus_args.push("--tactus-crate-defs".to_string());
         } else if *option == "--lean-backend" {
             verus_args.push("--lean-backend".to_string());
+        } else if *option == "--lean-all-proofs" {
+            verus_args.push("--lean-all-proofs".to_string());
         } else if *option == "vstd" {
             // ignore
         } else if *option == "-V allow-inline-air" {
