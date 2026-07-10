@@ -150,7 +150,7 @@ pub fn for_crate(
         return cached.clone();
     }
     let result = guard_build("defs module", crate_name, || {
-        build_defs(krate, crate_name, &scope, tactic_bodies, build)
+        build_defs(krate, crate_name, &scope, tactic_bodies, build, kind)
     });
     map.insert(scope, result.clone());
     result
@@ -189,6 +189,7 @@ fn build_defs(
     scope: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
     build: bool,
+    kind: ScopeKind,
 ) -> Option<Arc<CrateDefs>> {
     if std::env::var_os("TACTUS_VERBOSE").is_some() {
         let execs = krate.functions.iter()
@@ -267,10 +268,30 @@ fn build_defs(
     // axiom dragged down is the case for the iterative-repair build
     // (drop only the erroring item by line attribution; CRATEDEFS
     // follow-ups) — not yet needed at current Lean-path populations.
+    // Accessors: the Exec scope renders SIMPLIFIED-krate bodies, whose
+    // isVariant/getField ops emit as accessor calls (`.isGen`,
+    // `.Gen_val0`) no matter which roots are in play — narrowing roots
+    // must NOT drop the accessor defs there (tgt's symbol part failed
+    // every narrow rung on exactly this). The Proof scope renders vir
+    // bodies (match-based) and keeps the original exec-presence rule.
+    //
+    // NOTE (symbol investigation, 2026-07-10): do NOT restructure this
+    // ladder per-kind or suffix the non-package scope key by kind —
+    // inline helper theorems' user tactics are semantically coupled to
+    // the spec-fn RENDER SHAPE of whatever defs the island imports
+    // (vir `match` vs simplified `if .isVariant`), and both authoring
+    // worlds exist in the wild (test_crate_defs_proof_exec_mix pins
+    // the vir-shaped world; tgt's migrated exec tactics pin the
+    // simplified inline world). Shape-portable helpers = stmt-style
+    // imports = M6.
+    let acc = |on_full: bool| match kind {
+        ScopeKind::Exec => true,
+        ScopeKind::Proof => on_full,
+    };
     let attempts: [(&[&FunctionX], bool, bool, bool); 3] = [
-        (&full_roots, !exec_roots.is_empty(), true, true),
-        (&proof_roots, false, false, true),
-        (&proof_roots, false, false, false),
+        (&full_roots, acc(!exec_roots.is_empty()), true, true),
+        (&proof_roots, acc(false), false, true),
+        (&proof_roots, acc(false), false, false),
     ];
     // Ladder sidecar (`<scope>.ladder`): which attempt won last run,
     // the winner's content hash, and the toolchain fingerprint. A
