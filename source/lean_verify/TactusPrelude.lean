@@ -155,6 +155,34 @@ instance {A : Type u} [Nonempty A] : Nonempty (Tactus.Arc A) :=
 @[simp] theorem Tactus.Arc.sizeOf_deref {A : Type u} [SizeOf A] (b : Tactus.Arc A) :
   sizeOf b = 1 + sizeOf b.deref := by cases b; rfl
 
+-- Guard hypotheses through Prop `∨`/`∧` for termination proofs (F2c,
+-- DESIGN-lean-all-proofs-followons.md). Verus's spec `||`/`&&` are
+-- short-circuit for well-definedness — a recursive call in the RHS is
+-- checked under the LHS guard — but Lean's termination elaborator
+-- provides hypotheses only for control flow it recognizes (core's
+-- `wf_preprocess` set rewrites `ite → dite` and nothing else), so
+-- `A ∨ (B ∧ f (shrink x))` yields a decreasing goal with NO `¬A`/`B`
+-- in context, unprovable however smart the tactic. These two proved
+-- rewrites extend the same sanctioned mechanism core uses: during
+-- termination elaboration only, `∨`/`∧` become the equivalent `dite`
+-- so the elaborator threads the guards. Definitional equations
+-- (`f.eq_def`, `unfold f`, simp) keep the user's original `∨`/`∧`
+-- shape — verified empirically — so closers and humans see exactly
+-- what was written. `binderNameHint` keeps the hypothesis anonymous
+-- (inaccessible), matching core's `ite_eq_dite` behavior; the
+-- `decreasing_by` rungs use `simp_all`/`omega`, which read
+-- inaccessibles fine. Classical decidability is already ambient in
+-- generated code (if-on-Prop is pervasive).
+open Classical in
+@[wf_preprocess] theorem Tactus.or_eq_dite {a b : Prop} :
+    (a ∨ b) = (dite a (fun _ => True) (fun h => binderNameHint h () b)) := by
+  by_cases h : a <;> simp [h, binderNameHint]
+
+open Classical in
+@[wf_preprocess] theorem Tactus.and_eq_dite {a b : Prop} :
+    (a ∧ b) = (dite a (fun h => binderNameHint h () b) (fun _ => False)) := by
+  by_cases h : a <;> simp [h, binderNameHint]
+
 -- `Tactus.strGetChar s i` is the i-th Unicode codepoint of `s` as a
 -- `Nat`. The lowering target for Verus's `verus_builtin::strslice_get_char`
 -- (VIR `BinaryOp::StrGetChar`, surface syntax `strslice_get_char(s, i)`).

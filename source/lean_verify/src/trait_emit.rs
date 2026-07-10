@@ -160,7 +160,9 @@ pub fn trait_to_ast(
         // (it's for `def`/`theorem`); recursive proof-fn trait
         // methods are a documented deferral — see DESIGN.md TODO.
         let termination_by: Vec<LExpr> = if matches!(func.mode, vir::ast::Mode::Spec) {
-            func.decrease.iter().map(|d| vir_expr_to_ast(d)).collect()
+            func.decrease.iter().map(|d| {
+                crate::expr_shared::wrap_int_measure(vir_expr_to_ast(d), d)
+            }).collect()
         } else {
             Vec::new()
         };

@@ -71,6 +71,12 @@ pub(crate) const TACTIC_BODY_FALLBACK: &str = "sorry";
 ///   from the branch guard via `assumption`/`simp_all`. In a crate that
 ///   never emits the def/companion the `apply` head is unknown and the
 ///   branch just fails over.
+/// - `(repeat split) <;> omega` — **Int-typed measures** (F2b,
+///   DESIGN-lean-all-proofs-followons.md): with `wrap_int_measure`'s
+///   `Int.toNat` embedding, an Int-abs measure (`if 0 ≤ t then t else
+///   -t`) yields goals with value-position ifs on both sides; `split`
+///   is deterministic (ite/match only) and bounded by the ifs present,
+///   then `omega` closes over the branch guards + `Int.toNat`.
 /// - `decreasing_tactic` — Lean's default, kept as a final fallback so
 ///   spec fns recursing on a structural / `sizeOf` / datatype-height
 ///   measure (which no earlier branch handles) terminate exactly as
@@ -79,7 +85,7 @@ pub(crate) const TACTIC_BODY_FALLBACK: &str = "sorry";
 /// Tested against Lean 4.25.0 (BUG-spec-fn-decreases-mod-termination.md;
 /// div + seq branches: /tmp-prototype validation 2026-07-09, B3).
 const DECREASING_BY_TACTIC: &str =
-    "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Seq.drop_first_len_lt <;> (first | assumption | simp_all)) | (apply Seq.drop_last_len_lt <;> (first | assumption | simp_all)) | decreasing_tactic)";
+    "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Seq.drop_first_len_lt <;> (first | assumption | simp_all)) | (apply Seq.drop_last_len_lt <;> (first | assumption | simp_all)) | ((repeat split) <;> omega) | decreasing_tactic)";
 
 /// True when this param needs a body shadow because the shadow is
 /// load-bearing for the **mutation encoding** — `*x = e` lowers to
@@ -316,7 +322,10 @@ pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Vec<Com
                     &f.params,
                 );
                 let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| {
-                    crate::to_lean_expr::vir_expr_to_ast_with_binders(d, &binder_ctx, &crate::expr_shared::RenderCtx::empty())
+                    crate::expr_shared::wrap_int_measure(
+                        crate::to_lean_expr::vir_expr_to_ast_with_binders(d, &binder_ctx, &crate::expr_shared::RenderCtx::empty()),
+                        d,
+                    )
                 }).collect();
                 (body, termination_by)
             });
@@ -444,7 +453,10 @@ pub fn proof_fn_to_ast(
     // where the measure is non-obvious (Collatz, lex pairs, computed
     // descent) require the explicit clause. Mirrors `spec_fn_to_ast`.
     let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| {
-        crate::to_lean_expr::vir_expr_to_ast_with_binders(d, &binder_ctx, &crate::expr_shared::RenderCtx::empty())
+        crate::expr_shared::wrap_int_measure(
+            crate::to_lean_expr::vir_expr_to_ast_with_binders(d, &binder_ctx, &crate::expr_shared::RenderCtx::empty()),
+            d,
+        )
     }).collect();
     // Recursive proof fns get the same explicit `decreasing_by` as spec fns,
     // so a measure Lean's default tactic can't discharge (the modular
