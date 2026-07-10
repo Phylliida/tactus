@@ -97,11 +97,25 @@ pub(crate) fn scope_key(
     format!("{}_{:08x}", sanitize(crate_name), h.finish() as u32)
 }
 
+/// Which verification path is asking for defs. Proof-path callers
+/// always receive the verifier's full `vir_crate` (verified:
+/// verifier.rs check_proof_fn), so in package-check mode their scope
+/// can be the STABLE crate name — file names survive appends, and the
+/// `up_to_date` compare turns into real cross-run incrementality. The
+/// exec path receives `simplified_krate` (a second legitimate scope)
+/// and keeps the content fingerprint so the two can never collide.
+#[derive(Clone, Copy, PartialEq)]
+pub enum ScopeKind {
+    Proof,
+    Exec,
+}
+
 pub fn for_crate(
     krate: &KrateX,
     crate_name: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
     build: bool,
+    kind: ScopeKind,
 ) -> Option<Arc<CrateDefs>> {
     if !ENABLED.load(Ordering::SeqCst) {
         return None;
@@ -112,7 +126,11 @@ pub fn for_crate(
     // panicked, the map is still structurally valid (worst case: a
     // missing entry that gets rebuilt) — don't cascade the panic to
     // every other bucket.
-    let scope = scope_key(crate_name, krate, tactic_bodies);
+    let scope = if kind == ScopeKind::Proof && crate::generate::package_check_enabled() {
+        sanitize(crate_name)
+    } else {
+        scope_key(crate_name, krate, tactic_bodies)
+    };
     let mut map = memo.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(cached) = map.get(&scope) {
         return cached.clone();
@@ -887,7 +905,7 @@ fn build_batch(
 ) -> Option<Arc<ProofBatch>> {
     // The batch rides the defs module (its theorems resolve the spec
     // world through the import) — defs gate/fallback decisions apply.
-    let defs = for_crate(krate, crate_name, tactic_bodies, build)?;
+    let defs = for_crate(krate, crate_name, tactic_bodies, build, ScopeKind::Proof)?;
 
     let inlined_krate = crate::inline_spec::inline_marked_in_krate(krate);
     crate::generate::install_emit_tables(&inlined_krate);

@@ -1317,7 +1317,7 @@ pub fn emit_proof_fn(
     // built (or poisoned to None) before this runs; in `--emit-lean`
     // mode this writes the defs source without building. Takes the
     // pre-inline krate — `for_crate` applies its own inline pass.
-    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, false);
+    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, false, crate::crate_defs::ScopeKind::Proof);
     // Package emission (M2, --tactus-emit-module): additive artifact
     // under pkg/; islands (and the batch) remain the checking
     // authority, so failures warn loudly but never fail the fn. Hooked
@@ -1458,7 +1458,7 @@ pub fn check_proof_fn(
     // internal lookup is a memo hit on whatever this call cached, so
     // the emitted import and the built artifact can't disagree. A
     // build failure caches `None` → standalone emission, today's path.
-    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true);
+    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true, crate::crate_defs::ScopeKind::Proof);
     // Batch route (CRATEDEFS.md step 1b): ordinary proof fns verify in
     // ONE Lean run over TactusProofs_{crate}.lean; the first covered fn
     // builds + runs it, the rest read the cached per-fn attribution.
@@ -1771,7 +1771,7 @@ fn check_proof_fn_via_package(
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> Option<CheckResult> {
     install_emit_tables(krate);
-    let defs = match crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true) {
+    let defs = match crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true, crate::crate_defs::ScopeKind::Proof) {
         Some(d) => d,
         None => {
             eprintln!(
@@ -2309,7 +2309,7 @@ pub fn check_package(
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> Result<PackageGateReport, String> {
     install_emit_tables(krate);
-    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true)
+    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true, crate::crate_defs::ScopeKind::Proof)
         .ok_or("shared-defs module unavailable (defs build failed or gate unmet)")?;
     let g = package_graph_for(krate, crate_name, tactic_bodies);
     let graph = g.view();
@@ -2914,7 +2914,7 @@ pub fn emit_exec_fn(
     // closures may be absent, so true exec fns emit standalone; WP-
     // style PROOF fns (Verus proof bodies routed through this same WP
     // path) are covered by the proof roots and keep the import.
-    let defs = crate::crate_defs::for_crate(pre_inline_krate, crate_name, tactic_bodies, false)
+    let defs = crate::crate_defs::for_crate(pre_inline_krate, crate_name, tactic_bodies, false, crate::crate_defs::ScopeKind::Exec)
         .filter(|d| d.covers_exec || matches!(vir_fn.mode, vir::ast::Mode::Proof));
     let (mut cmds, ns) = krate_preamble(
         krate, imports, crate_name, &[vir_fn],
@@ -2987,7 +2987,7 @@ pub fn check_exec_fn(
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> CheckResult {
     // Same defs-before-emit ordering as `check_proof_fn` (see there).
-    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true);
+    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true, crate::crate_defs::ScopeKind::Exec);
     let EmitOutput { file_path, source_map, warnings } =
         match emit_exec_fn(krate, vir_fn, fn_sst, check, imports, crate_name, tactic_bodies) {
             Ok(o) => o,
