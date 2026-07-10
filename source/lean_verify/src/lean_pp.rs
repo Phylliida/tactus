@@ -437,7 +437,11 @@ fn write_datatype(out: &mut String, dt: &Datatype, lm: &mut Landmarks) {
                     write_expr(out, &f.ty, 0, lm);
                     out.push_str(" → ");
                 }
-                out.push_str(&dt.name);
+                // Ctor result type: the RELATIVE self-name — the
+                // root-anchored `dt.name` doesn't resolve while the
+                // inductive is still being elaborated (see
+                // `Datatype::self_name`).
+                out.push_str(&dt.self_name);
                 for tp in &dt.typ_params {
                     out.push(' ');
                     out.push_str(tp);

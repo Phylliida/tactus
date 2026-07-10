@@ -1,8 +1,19 @@
 # `--lean-all-proofs` follow-on arcs (post B1–B4) — spec
 
 **Date:** 2026-07-10
-**Status:** SPEC ONLY — nothing here is implemented. Written while other work is in flight;
-sequencing below assumes it lands after that settles.
+**Status:** F1 IMPLEMENTED & COMMITTED (`25970a5`) — validated on the worst-offender file
+(12 error blocks → 0 parse errors) + unit tests + both gates. F2a IMPLEMENTED & COMMITTED
+(`2e203dc`) — scheduling half pinned by disable-repro (`failed to prove termination`),
+plus a second half found during implementation: the companion's canned `⟨⟨_,_⟩,_⟩` proof
+only matched one of TWO attested renderings of the axiom's chained-comparison hypothesis
+(let-bound left-assoc vs bare right-assoc via `Multi(Chained)`/`and_all`) — replaced with
+bare `omega`, which closes every attested shape. The associativity divergence between the
+two chained-op rendering paths is a new F6-family unification candidate. F2b PINNED &
+DEFERRED (see section). Along the way: fixed a pre-existing B1a-era regression — recursive
+datatype declarations rendered their self/sibling references root-anchored (`Unknown
+identifier` during elaboration; 8 e2e tests failing at HEAD before today's arcs) — via
+`with_self_decls` over the SCC in `datatype_decl_cmd` + a `self_name` field on the
+`Datatype` AST for IndexedInductive ctor result types. F3–F7 still spec-only.
 **Scope:** everything left on the board after `DESIGN-lean-all-proofs-bugs.md` B1–B4 landed
 (`dbc77e5`, `00534c9`, review round `2e43a39`), **except B5** (typed-spine `.deref` arc —
 its own doc/arc, per the bugs doc) and except the closer/tactic changes themselves

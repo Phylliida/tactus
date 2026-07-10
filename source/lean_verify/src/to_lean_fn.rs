@@ -798,8 +798,12 @@ fn datatype_decl_cmd(
     scc_paths: &std::collections::HashSet<&Path>,
     external_body_paths: &std::collections::HashSet<&Path>,
 ) -> Option<Command> {
-    let (path, short) = match &dt.name {
-        Dt::Path(p) => (lean_name(p), short_name(p).to_string()),
+    let (path, self_rel, short) = match &dt.name {
+        Dt::Path(p) => (
+            lean_name(p),
+            crate::to_lean_type::lean_name_relative(p),
+            short_name(p).to_string(),
+        ),
         Dt::Tuple(_) => return None,
     };
     let typ_params: Vec<String> = dt.typ_params.iter()
@@ -811,28 +815,39 @@ fn datatype_decl_cmd(
 
     let cross_inst = has_cross_instantiation_recursion(dt, scc_paths);
 
-    let kind = if is_single_variant_struct {
-        let variant = &dt.variants[0];
-        DatatypeKind::Structure {
-            fields: variant.fields.iter().map(|f| Field {
-                name: field_name(&f.name),
-                ty: typ_to_expr(&f.a.0),
-            }).collect(),
-        }
-    } else {
-        let variants: Vec<Variant> = dt.variants.iter().map(|v| Variant {
-            name: sanitize(&v.name),
-            fields: v.fields.iter().map(|f| Field {
-                name: field_name(&f.name),
-                ty: typ_to_expr(&f.a.0),
-            }).collect(),
-        }).collect();
-        if cross_inst {
-            DatatypeKind::IndexedInductive { variants }
+    // `with_self_decls` over the SCC: a recursive field type (`Push(…,
+    // Box<Stack>)`, or a mutual sibling) must render RELATIVE inside the
+    // declaration — during elaboration the inductive is not yet a global
+    // constant and a root-anchored `_root_.{ns}.Stack` is `Unknown
+    // identifier` (verified empirically; bare `Stack` and de-anchored
+    // `{ns}.Stack` both resolve). Same mechanism as the height defs and
+    // mutual spec fns; the decl HEAD stays root-anchored (computed above,
+    // outside the wrap), matching every other emitted decl.
+    let kind = crate::to_lean_type::with_self_decls(
+        scc_paths.iter().map(|p| crate::to_lean_type::lean_name_relative(p)),
+        || if is_single_variant_struct {
+            let variant = &dt.variants[0];
+            DatatypeKind::Structure {
+                fields: variant.fields.iter().map(|f| Field {
+                    name: field_name(&f.name),
+                    ty: typ_to_expr(&f.a.0),
+                }).collect(),
+            }
         } else {
-            DatatypeKind::Inductive { variants }
-        }
-    };
+            let variants: Vec<Variant> = dt.variants.iter().map(|v| Variant {
+                name: sanitize(&v.name),
+                fields: v.fields.iter().map(|f| Field {
+                    name: field_name(&f.name),
+                    ty: typ_to_expr(&f.a.0),
+                }).collect(),
+            }).collect();
+            if cross_inst {
+                DatatypeKind::IndexedInductive { variants }
+            } else {
+                DatatypeKind::Inductive { variants }
+            }
+        },
+    );
 
     // Derive `Inhabited` automatically for parameter-style. Lean rejects
     // `deriving Inhabited` on indexed-style inductives, so we drop the
@@ -862,6 +877,7 @@ fn datatype_decl_cmd(
     };
     Some(Command::Datatype(Datatype {
         name: path,
+        self_name: self_rel,
         typ_params,
         kind,
         derives,

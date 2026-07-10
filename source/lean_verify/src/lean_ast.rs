@@ -241,6 +241,13 @@ pub enum PreambleFragment {
 #[derive(Debug, Clone)]
 pub struct Datatype {
     pub name: String,
+    /// The name SELF-references inside the declaration render as — the
+    /// relative (non-root-anchored) form. `IndexedInductive` constructor
+    /// result types (`| Plain : ∀ {A}, A → Mut A`) must use it: during
+    /// elaboration the inductive is not yet a global constant, so the
+    /// root-anchored `name` is `Unknown identifier` there (verified
+    /// empirically — same rule as `CURRENT_DECL_SELF` for field types).
+    pub self_name: String,
     pub typ_params: Vec<String>,
     pub kind: DatatypeKind,
     /// `deriving` clause class names (e.g., `"Inhabited"`). Emitted
