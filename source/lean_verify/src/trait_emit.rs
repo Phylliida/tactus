@@ -70,6 +70,11 @@ pub fn trait_to_ast(
     // `Class.method` inside the class declaration; see
     // `proof_fn_method_type` docstring).
     let trait_short_name = short_name(&tr.name).to_string();
+    // The FULL rendered name too: post-B1a root-anchoring, a sibling
+    // reference renders as `_root_.{ns}.HasZero.val`, not `HasZero.val`
+    // — the stripper must recognize both prefixes (the short form kept
+    // for ns-less renders and defense in depth).
+    let trait_full_name = lean_name(&tr.name);
     let sibling_methods: std::collections::HashSet<String> = tr.methods.iter()
         .filter_map(|m| m.path.segments.last().map(|s| s.to_string()))
         .collect();
@@ -164,7 +169,11 @@ pub fn trait_to_ast(
         // promise (the ensures is the class method type itself, with
         // sibling references stripped to unqualified form).
         let ty = if matches!(func.mode, vir::ast::Mode::Proof) {
-            proof_fn_method_type(func, &trait_short_name, &sibling_methods)
+            proof_fn_method_type(
+                func,
+                &[trait_short_name.as_str(), trait_full_name.as_str()],
+                &sibling_methods,
+            )
         } else {
             method_type(func)
         };
@@ -360,7 +369,7 @@ fn class_method_value_binders(func: &FunctionX) -> Vec<LBinder> {
 /// known sibling method names.
 fn proof_fn_method_type(
     func: &FunctionX,
-    class_name: &str,
+    class_names: &[&str],
     sibling_methods: &std::collections::HashSet<String>,
 ) -> LExpr {
     // Class methods bind ONLY value-level params (and their refinement
@@ -380,7 +389,7 @@ fn proof_fn_method_type(
         // non-empty prefix to route to impl-specific standalones.
         let req_ty = strip_class_qualifier(
             crate::to_lean_expr::vir_expr_to_ast_with_binders(req, &body_binders, &crate::expr_shared::RenderCtx::empty()),
-            class_name, "", sibling_methods,
+            class_names, "", sibling_methods,
         );
         // Requires render as named hypothesis binders following the
         // `_tactus_<role>_<id>` reserved-name convention (see
@@ -393,7 +402,7 @@ fn proof_fn_method_type(
     let ensures = and_all(func.ensure.0.iter()
         .map(|e| strip_class_qualifier(
             crate::to_lean_expr::vir_expr_to_ast_with_binders(e, &body_binders, &crate::expr_shared::RenderCtx::empty()),
-            class_name, "", sibling_methods))
+            class_names, "", sibling_methods))
         .collect());
 
     let goal = if is_unit_typ(&func.ret.x.typ) {
@@ -445,38 +454,45 @@ fn proof_fn_method_type(
 
 fn strip_class_qualifier(
     expr: LExpr,
-    class_name: &str,
+    class_names: &[&str],
     impl_prefix: &str,
     sibling_methods: &std::collections::HashSet<String>,
 ) -> LExpr {
-    let class_prefix = format!("{}.", class_name);
-    strip_class_qualifier_rec(expr, &class_prefix, impl_prefix, sibling_methods)
+    // One prefix per accepted rendering of the class name: the short
+    // form (`HasZero.`) and the root-anchored full form
+    // (`_root_.{ns}.HasZero.`) — see `trait_full_name` in
+    // `trait_to_ast`.
+    let class_prefixes: Vec<String> =
+        class_names.iter().map(|n| format!("{}.", n)).collect();
+    strip_class_qualifier_rec(expr, &class_prefixes, impl_prefix, sibling_methods)
 }
 
 fn strip_class_qualifier_rec(
     expr: LExpr,
-    class_prefix: &str,
+    class_prefixes: &[String],
     impl_prefix: &str,
     sibling_methods: &std::collections::HashSet<String>,
 ) -> LExpr {
     match &expr.node {
         ExprNode::Var(name) => {
             let s = name.as_str();
-            if let Some(rest) = s.strip_prefix(class_prefix) {
-                if sibling_methods.contains(rest) {
-                    let disambiguated = if impl_prefix.is_empty() {
-                        rest.to_string()
-                    } else {
-                        format!("{}.{}", impl_prefix, rest)
-                    };
-                    return LExpr::var_synthetic(disambiguated);
+            for class_prefix in class_prefixes {
+                if let Some(rest) = s.strip_prefix(class_prefix.as_str()) {
+                    if sibling_methods.contains(rest) {
+                        let disambiguated = if impl_prefix.is_empty() {
+                            rest.to_string()
+                        } else {
+                            format!("{}.{}", impl_prefix, rest)
+                        };
+                        return LExpr::var_synthetic(disambiguated);
+                    }
                 }
             }
             expr
         }
         _ => {
             let node = crate::lean_ast::map_children(&expr.node, |c: &LExpr| {
-                strip_class_qualifier_rec(c.clone(), class_prefix, impl_prefix, sibling_methods)
+                strip_class_qualifier_rec(c.clone(), class_prefixes, impl_prefix, sibling_methods)
             });
             LExpr::new(node)
         }
