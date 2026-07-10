@@ -1,7 +1,16 @@
 # B5: Calls report actual — completing the typed spine at call nodes
 
 **Date:** 2026-07-10
-**Status:** SPEC ONLY — nothing implemented. Written for a fresh session to execute.
+**Status:** **B5a DONE** on branch `b5-typed-spine-calls` (`4f5b3dc` census stage,
+`66a55d2` flip): britton `Invalid field` 25 → 0 (total 108 → 83, auto unchanged, no
+new families), exec gate 3114/0 (cold-cache full verify), 299 unit tests + green
+pin test. Census result: 2 decor-only / 0 OTHER — the §3.6 bet held; guard stays
+dropped. NEW FACT from the repro hunt: the lie reproduces ONLY on the
+--lean-all-proofs SST/WP pipeline — tactus_auto-attribute proof fns render via a
+different path that never lied; the pin test (harness option `lean-all-proofs`,
+added to common/mod.rs) is the suite's first on that pipeline. `no-fnmap` census
+lines = ctxs without fn_map or callees pruned from it — those fall back to claim
+(status quo); benign for the corpus (0 residual errors). B5b remains.
 **Scope:** the `Invalid field deref` family (55 errors crate-wide, ~25 in britton —
 **every single `Invalid field` error in the post-fix run is this one bug**) plus its
 exec-path sibling `BUG-call-arg-temp-claimed-typ.md`. Companion to
