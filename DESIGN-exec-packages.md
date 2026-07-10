@@ -29,119 +29,143 @@ scope's narrow-rung builds are consumer-filtered at generate.rs's
 `covers_exec` gate — pure waste, measured as the "double defs family"
 finding).
 
+## Decisions (2026-07-10, Danielle)
+
+- **Render unification: YES** (option ii below). Bridge lemmas only if
+  migration friction demands.
+- **Granularity: per-fn** pkg modules (all of a fn's obligations in
+  one module/olean, matching islands).
+- **Flow: staged** — each step below lands green and is valuable
+  alone; implementation begins in a fresh session.
+
 ## The trust seam (the load-bearing design issue)
 
 Today, inlining = re-proving: an island that contains
 `lemma_rate_pos` re-elaborates its proof against the render in scope.
 No cross-render trust is ever needed.
 
-Under M6, an exec pkg module would import the helper as a STATEMENT
+Under M6, an exec pkg module imports the helper as a STATEMENT
 (hypothesis binder typed by a stmt def), whose proof happened in the
-PROOF world against vir-rendered spec fns. The exec obligation world
-renders the same spec fns from the SIMPLIFIED krate. Same Verus
-definitions, two Lean renders — **semantically equal, but Lean does
-not know it.** Binding the vir-proven fact against the
-simplified-rendered name is a new trust seam that re-proving never
-had.
+PROOF world. If the two worlds render spec fns differently
+(vir `match` vs simplified `if .isVariant`), the imported fact is
+typed against a render Lean cannot connect to the local one —
+**semantically equal, but not Lean-known-equal.** Axiom-bridging that
+seam (option i) fails the transparency bar. Render unification
+(option ii, DECIDED) removes the seam by construction; generated
+`vir_x = simpl_x` bridge lemmas (option iii, kernel-checked) remain
+the fallback device only.
 
-Options:
+## M6.1 — render unification via DUAL-KRATE (resolved mechanism)
 
-- **(i) Accept the seam as an axiom-class bridge.** Rejected:
-  fails the transparency bar; grows the TCB for convenience.
-- **(ii) Unify the renders.** Make the defs module render spec-fn
-  bodies ONE way for both worlds (vir-style `match` is the natural
-  candidate — it's what tactics like `cases s <;> simp only [rate]`
-  want, and accessors remain available for exec OBLIGATION bodies,
-  which are emitter-generated and shape-flexible). Existing
-  simplified-authored tactics (tgt's migrated exec fns) would need
-  re-touching. ⚑ Gate: Danielle's appetite for a one-time tactic
-  migration pass (the 10s scratch loop makes this tractable; the
-  population is currently ~9 fns).
-- **(iii) Generated bridge lemmas.** For each spec fn with two
-  renders, emit `theorem rate_bridge : vir_rate = simpl_rate := by
-  cases ... <;> rfl` (mechanically generatable, kernel-checked).
-  Closes the seam soundly without touching user tactics, at the cost
-  of a generated-lemma population and name-doubling in the defs.
-  Viable as a TRANSITION device under (ii), or a fallback if (ii)'s
-  migration is unwanted.
+The accessor-shaped render is NOT a lean_verify rendering knob: 
+`check_exec_fn` receives Verus's post-`ast_simplify` krate, where
+matches are already lowered to `isVariant`/field chains CRATE-WIDE —
+spec fns and vstd instances included. The fn's own obligations come
+from separate SST params (`fn_sst`, `check`).
 
-**Recommendation: (ii) as the destination, (iii) only if migration
-friction demands it.** Render unification also collapses the two defs
-families into one (proof and exec worlds import the same spec-world
-module; only accessors/obligation machinery differ), which is the
-full resolution of the double-defs cost.
+Mechanism: the exec path's spec-world/defs renders from the
+**unsimplified vir krate** (same as the proof world — match-style),
+while obligations keep their SSTs (accessor-style, as WP output
+genuinely is). Plumbing: a second krate param through
+`check_exec_fn`/`emit_exec_fn` feeding `for_crate` and
+`krate_preamble`; the verifier holds both krates.
 
-## Prerequisites (must land first)
+Consequences, all good:
+- The vstd `DeepView (Option T)` instance renders `match`-style — the
+  `Inhabited T` synthesis failure at exec base:168 VANISHES, shrinking
+  M6.0 (below) to a residue.
+- Spec-fn renders are identical across worlds → the trust seam never
+  exists; helper statements are shape-neutral by construction.
+- The shape-coupling hazard (dragon B) dissolves: there is ONE
+  authoring world. tgt's ~9 migrated exec tactics (authored against
+  accessor-shaped spec fns) get a one-time retouch — the 10s scratch
+  loop makes this tractable, and it is the LAST such migration.
+- **Unlocks re-landing the kind-specific ladders + kind-suffixed
+  scope keys** (built and reverted in `63005a2` — the revert reason
+  was exactly the shape coupling). With one render world, the exec
+  scope becomes "full roots or nothing," the dead-weight duplicate
+  defs family dies, and the scope-key collision hazard closes.
+- Accessor DEFS stay emitted for the exec scope (obligation bodies
+  need them); only spec-fn/instance BODY renders change.
 
-- **M6.0 — Nonempty/Inhabited currency unification (dragon A).**
-  Accessors take `[Nonempty V]` + `Classical.ofNonempty` (already
-  noncomputable); `compute_nonempty_needs` gains a seed: body uses a
-  field projection whose type involves a type param ⇒ Nonempty need
-  (flows to instance `ne_bounds` via existing machinery). Without
-  this, full-roots defs elaboration dies on vstd's Option DeepView
-  instance (base:168) and exec packages have no defs to import.
-  Blast radius: every island text changes (one-time global
-  re-elaboration; the `.verified` cache absorbs it after one run).
-  The design comment at PreambleConfig ("accessors for types with
-  non-Inhabited fields break elaboration even when unused") is
-  precisely what this lifts.
-- **M6.0b — remaining full-roots breakage census.** Behind Inhabited
-  sits at least the Tactus.Ref closure-ABI corner (bare-arrow Fn
-  instances, builtinSpecFun — seen in the M5e cold logs). Run the
-  ladder's attempt-0 on tgt after M6.0 and taxonomize what still
-  fails. If closures remain broken: iterative-repair build (drop only
-  the erroring item by line attribution — the CRATEDEFS follow-up)
-  keeps defs coverage maximal without blocking on a full ABI fix.
+Named risk (checked empirically at this step): obligations may
+reference simplified-only synthetic fns (tuple ctors etc.) that the
+vir spec-world doesn't emit — the suite + a tgt run flush these out;
+any stragglers get vir-side emission or a targeted synthetic-fn
+whitelist.
 
-## Architecture (mirrors M5, per-obligation)
+## M6.0 — Nonempty/Inhabited currency unification (now a residue)
 
-- **Exec stmt modules**: one per exec fn — its obligations' statements
-  as defs (statements only; span-mark landmarks preserved for
-  attribution). Helper proof fns' stmt modules ALREADY exist (M5d-2);
-  exec pkg modules import them for helper facts.
-- **Exec pkg modules**: per exec fn, importing defs + own stmt module
-  + helper stmt modules; obligations as theorems with the fn's tactic
-  text; helper facts as hypothesis binders typed by stmt defs
-  (identical to the proof-fn package pattern, M5a).
-- **Link**: exec closed forms join the composition + sorryAx/axiom
-  closure. Attribution stays per-obligation via span marks (M5b
-  machinery).
-- **Cache**: pkg-module cross-run cache (M5e) covers exec pkg modules
-  with zero new code — the whole island-cache arc remains as the
-  fallback path's cache.
-- **Fallback**: UnsupportedScc-style graceful degradation to islands
-  (which keep their `.verified` cache and sorry gate). Islands never
-  disappear; they stop being the default.
+After M6.1, accessor applications survive only in OBLIGATION bodies.
+Generated accessors demand `[Inhabited V]`; a generic exec fn whose
+obligation projects a type-param-typed field needs that premise on
+the obligation theorem. Islands already handle this today (generic
+exec fns verify on tgt), and packages REUSE the island theorem
+builder, so existing behavior carries over unchanged. The residue:
+swap the accessor signature to `[Nonempty V]` + `Classical.ofNonempty`
+(accessors are already noncomputable) so the whole "type has a value"
+economy is single-currency with the nonempty arc — smaller premises,
+uniform machinery, and the PreambleConfig caveat ("accessors for
+types with non-Inhabited fields break elaboration even when unused")
+lifts. Blast radius after M6.1 is small: accessor defs + obligation
+binder sites; island texts change once (the `.verified` cache absorbs
+it in one run).
 
-## Sequencing
+## M6.2 — exec stmt + pkg emission (per-fn)
 
-| Step | Content | Gate |
+- Exec stmt module per fn: its obligations' statements as defs
+  (span-mark landmarks preserved for attribution).
+- Exec pkg module per fn: imports defs + own stmt module + helper
+  stmt modules (helper stmt defs ALREADY exist, M5d-2); obligations
+  as theorems with the fn's tactic text; helper facts as hypothesis
+  binders typed by stmt defs — identical to the proof-fn pattern.
+- Flag-gated; islands remain the graceful-degradation fallback (with
+  their `.verified` cache and fatal-sorry gate) — they stop being the
+  default, they never disappear.
+- Cache: the M5e pkg cross-run cache covers exec pkg modules with
+  zero new code.
+- Fold-ins while touching this code (right-way housekeeping):
+  tracked-write for the Link module (stop rewriting identical bytes),
+  numeric island/pkg cache-hit counts in the gate note, and a `v1 `
+  version prefix on the `.ladder` sidecar format while it is young.
+
+## M6.3 — Link integration
+
+Exec closed forms join the composition + sorryAx/axiom closure — the
+soundness headline: exec obligations become Link-gated for the first
+time. Attribution stays per-obligation via span marks (M5b).
+
+## M6.4 / M6.5 — tgt validation, then default
+
+Retouch the ~9 tgt tactics (M6.1), validate 3116/0 cold + warm at the
+floor, flip exec packages to default with islands as fallback,
+measure and record.
+
+## Sequencing (each step lands green alone)
+
+| Step | Content | Session-sized? |
 |---|---|---|
-| M6.0 | Nonempty unification | suite + tgt green |
-| M6.0b | full-roots census on tgt | taxonomy in doc |
-| M6.1 | render unification decision | ⚑ co-design |
-| M6.2 | exec stmt + pkg emission, flag-gated | suite parity |
-| M6.3 | Link integration (exec closed forms) | gate green on tgt |
-| M6.4 | tgt migration validation (the ~9 fns; retouch tactics per M6.1) | 3116/0 |
-| M6.5 | exec packages become default; islands = fallback | measure |
+| M6.1 | dual-krate render unification + tgt tactic retouch | yes |
+| M6.1b | re-land kind ladders + scope suffix (dead-weight removal) | small, same session |
+| M6.0 | accessor Nonempty residue + full-roots census on tgt | yes |
+| M6.2 | exec stmt/pkg emission, flag-gated + housekeeping fold-ins | yes |
+| M6.3 | Link integration | small |
+| M6.4/5 | tgt validation → default | yes |
 
-## Open questions ⚑
+## Artifact ledger (transparency — every sidecar and its key)
 
-1. Render unification appetite (option ii) vs bridge lemmas (iii) —
-   who pays: a one-time tactic retouch, or permanent generated-lemma
-   population?
-2. Should M6.0's accessor change land alone first (it independently
-   unblocks exec defs coverage and is the only piece with global
-   island churn)?
-3. Exec obligations with loops produce multiple theorems per fn —
-   one pkg module per fn (all obligations together, one olean) or
-   per obligation (finer cache, more modules)? Default proposal:
-   per fn, matching islands.
+| Artifact | Meaning | Invalidated by |
+|---|---|---|
+| `<part>.lean`/`.olean` | defs part + build | content compare vs disk |
+| `<part>.manifest` | per-command hashes | superset check (append = non-breaking) |
+| `<scope>.ladder` | winning attempt (or FAILED + per-attempt hashes) + toolchain fp | winner render hash change; fp change |
+| `<island>.verified` | last completed run on this text succeeded | text change; defs breaking; fp change; removed before every live run |
+| `TactusPrelude.lean` marker | prelude source + toolchain fp | either changes |
 
 ## Expected end state
 
-Exec fns verify like proof fns: shared defs, statement-typed helper
-facts, Link-gated composition, cross-run cached. The 19s-per-island
-cost, the double defs family, the shape-coupling fragility, and the
-exec-outside-Link gap all close with the same structure. tgt cold
-should drop well under 200s and warm stays at the verus-side floor.
+Exec fns verify like proof fns: one render world, shared defs,
+statement-typed helper facts, Link-gated composition, cross-run
+cached. The 19s islands, the double defs family, the shape-coupling
+fragility, and the exec-outside-Link gap close together. tgt cold
+drops well under 200s; warm stays at the verus-side floor.
