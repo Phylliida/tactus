@@ -600,6 +600,47 @@ fn actual_is_trusted(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> bool {
 /// * Field/IsVariant — deref count from the base's ACTUAL typ; tuple
 ///   projections report the slot typ as actual (replaces
 ///   `tuple_slot_extra_derefs`).
+/// B5a census (TACTUS_B5_CENSUS=1): classify how a plain call's SST
+/// claimed typ relates to the callee's declared-instantiated ret typ.
+/// Behavior-neutral telemetry; drives (and validates) the Call-arm
+/// migration per DESIGN-B5-typed-spine-calls.md §3.6.
+fn b5_census(
+    fun: &vir::ast::Fun,
+    typs: &[Typ],
+    claim: &Typ,
+    ctx: &crate::expr_shared::RenderCtx,
+) {
+    if std::env::var_os("TACTUS_B5_CENSUS").is_none() {
+        return;
+    }
+    let Some(declared) = ctx.fn_ret_typ(fun, typs) else {
+        eprintln!("B5-CENSUS no-fnmap {}", crate::to_lean_type::lean_name_relative(&fun.path));
+        return;
+    };
+    use crate::expr_shared::count_ref_decorations;
+    let class = if vir::ast_util::types_equal(&declared, claim) {
+        "equal"
+    } else if vir::ast_util::types_equal(
+        &crate::to_lean_type::peel_typ_wrappers(&declared).clone(),
+        &crate::to_lean_type::peel_typ_wrappers(claim).clone(),
+    ) {
+        if count_ref_decorations(&declared) != count_ref_decorations(claim) {
+            "decor-only"
+        } else {
+            "boxing-only"
+        }
+    } else {
+        "OTHER"
+    };
+    eprintln!(
+        "B5-CENSUS {} {} claim={:?} declared={:?}",
+        class,
+        crate::to_lean_type::lean_name_relative(&fun.path),
+        claim,
+        declared,
+    );
+}
+
 pub(crate) fn exp_to_typed(
     e: &Exp,
     ctx: &crate::expr_shared::RenderCtx,
@@ -738,6 +779,24 @@ pub(crate) fn exp_to_typed(
             TypedExpr::from_untyped(LExpr::new(ctor_node(dt, variant, rendered)), e.typ.clone())
         }
         // Default: unmigrated arms render at the claimed typ.
+        // Plain spec-fn calls (B5a census stage — behavior-neutral):
+        // still reports the CLAIM like the fallback, but classifies
+        // claim-vs-declared divergence under TACTUS_B5_CENSUS. The
+        // next commit flips the report to the declared-instantiated
+        // typ (see DESIGN-B5-typed-spine-calls.md §3.6 — one rule,
+        // loud census). Class-dispatch renders (trait methods /
+        // resolved methods) type-annotate their result at the claim
+        // and are excluded here to match render behavior.
+        ExpX::Call(CallFun::Fun(fun, None), typs, _)
+            if !fun_is_trait_method(fun, ctx) =>
+        {
+            b5_census(fun, typs, &e.typ, ctx);
+            TypedExpr::from_untyped(LExpr::new(exp_to_node_checked(e, ctx)?), e.typ.clone())
+        }
+        ExpX::Call(CallFun::Recursive(fun), typs, _) => {
+            b5_census(fun, typs, &e.typ, ctx);
+            TypedExpr::from_untyped(LExpr::new(exp_to_node_checked(e, ctx)?), e.typ.clone())
+        }
         _ => TypedExpr::from_untyped(LExpr::new(exp_to_node_checked(e, ctx)?), e.typ.clone()),
     })
 }
