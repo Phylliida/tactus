@@ -530,6 +530,19 @@ pub fn proof_fn_stmt_cmd(
     stmt_cmd(stmt_name(&f.name.path), binders, goal)
 }
 
+/// Statement def for one EXEC obligation theorem (M6.2): the
+/// theorem's ∀-closed goal as a `@[reducible] Prop` def, named
+/// `<theorem name>_stmt` (obligation theorem names are already unique
+/// per fn). Same `stmt_cmd` shape as proof-fn statement defs, so the
+/// M6.3 Link composition treats both uniformly.
+pub fn exec_obligation_stmt_cmd(thm: &Theorem) -> Command {
+    stmt_cmd(
+        format!("{}_stmt", thm.name),
+        thm.binders.clone(),
+        thm.goal.clone(),
+    )
+}
+
 pub fn proof_fn_to_ast(
     f: &FunctionX,
     tactic_body: &str,
