@@ -135,6 +135,7 @@ def main():
     ap.add_argument("--sample", type=int, default=40)
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--out", default="/tmp/rung-attrib-fast")
+    ap.add_argument("--csv", help="also write per-theorem results (file,theorem,minimal_rung)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -152,24 +153,29 @@ def main():
     sample = eligible[::step][:args.sample]
     print(f"eligible files: {len(eligible)}, sampled: {len(sample)}")
 
+    def minimal(failedv):
+        for vk, label in [("v1_rfl", "rfl"), ("v2_decide", "decide"),
+                          ("v3_omega", "omega"), ("v4_peel", "peel∘T1"),
+                          ("v5_auto", "T2 (simp_all/case_split)")]:
+            if vk not in failedv:
+                return label
+        return "fails even tactus_auto"
+
     hist = Counter()
     total = 0
+    rows = []
     with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
         for name, results in ex.map(lambda p: run_one(args, p), sample):
             for base, failedv in results.items():
                 total += 1
-                if "v1_rfl" not in failedv:
-                    hist["rfl"] += 1
-                elif "v2_decide" not in failedv:
-                    hist["decide"] += 1
-                elif "v3_omega" not in failedv:
-                    hist["omega"] += 1
-                elif "v4_peel" not in failedv:
-                    hist["peel∘T1"] += 1
-                elif "v5_auto" not in failedv:
-                    hist["T2 (simp_all/case_split)"] += 1
-                else:
-                    hist["fails even tactus_auto"] += 1
+                label = minimal(failedv)
+                hist[label] += 1
+                rows.append((name, base, label))
+    if args.csv:
+        with open(args.csv, "w") as f:
+            f.write("file,theorem,minimal_rung\n")
+            for r in sorted(rows):
+                f.write(",".join(r) + "\n")
     print(f"\ntheorems analyzed: {total}")
     for k, v in hist.most_common():
         print(f"  {v:4d}  ({100 * v / max(total, 1):5.1f}%)  {k}")
