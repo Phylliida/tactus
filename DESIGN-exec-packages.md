@@ -246,6 +246,9 @@ in the PROOF-family Link. One Lean module cannot import both families
   full-roots ladder REGRESSES must degrade proof fns gracefully back
   to the proof family).
 
+LANDED 2026-07-11 same session (C-1 + C-2 both green: suite 543/0,
+tgt 82s at baseline, exec closed forms kernel-checked in the Link).
+
 DECIDED 2026-07-11 (Danielle): **C — the right way first.** Key
 implementation observation shrinking C: the proof pkg/stmt/Link
 machinery is already family-parametric (everything takes `defs`), so
