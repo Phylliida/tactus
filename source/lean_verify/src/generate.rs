@@ -1649,7 +1649,6 @@ pub fn emit_proof_fn(
         return Err(CheckResult::Error(e));
     }
 
-    #[cfg(debug_assertions)]
     let cmds_for_sanity: Vec<Command> = match &defs {
         // Sanity resolves identifiers over the command stream; in defs
         // mode the spec world arrives via import, so check against the
@@ -1657,8 +1656,6 @@ pub fn emit_proof_fn(
         Some(d) => d.cmds.iter().cloned().chain(cmds.iter().cloned()).collect(),
         None => cmds.clone(),
     };
-    #[cfg(not(debug_assertions))]
-    let cmds_for_sanity = &cmds;
     if let Err(reason) = debug_check(&cmds_for_sanity) {
         return Err(CheckResult::Failed {
             errors: vec![TactusDiag {
@@ -1885,7 +1882,6 @@ pub fn emit_exec_fn(
         return Err(CheckResult::Error(e));
     }
 
-    #[cfg(debug_assertions)]
     let cmds_for_sanity: Vec<Command> = match &defs {
         // Sanity resolves identifiers over the command stream; in defs
         // mode the spec world arrives via import, so check against the
@@ -1893,8 +1889,6 @@ pub fn emit_exec_fn(
         Some(d) => d.cmds.iter().cloned().chain(cmds.iter().cloned()).collect(),
         None => cmds.clone(),
     };
-    #[cfg(not(debug_assertions))]
-    let cmds_for_sanity = &cmds;
     if let Err(reason) = debug_check(&cmds_for_sanity) {
         return Err(CheckResult::Failed {
             errors: vec![TactusDiag {
@@ -2053,8 +2047,14 @@ fn collect_referenced_datatypes<'a>(
 /// kills the test process).
 ///
 /// Compiled out of release builds (returns `Ok(())` unconditionally).
+/// Codegen sanity: unconditional in ALL build profiles (2026-07-11,
+/// Danielle: "same behavior in release builds"). Users run release
+/// binaries; the checks that guard USER input (the reserved-binder
+/// rule) and emitted-reference resolution must not be debug-only —
+/// a violation surfacing as a clear codegen diagnostic beats the same
+/// bug surfacing as a baffling lake-time resolution error. Cost is an
+/// AST walk per emitted fn — negligible next to the Lean run.
 pub(crate) fn debug_check(_cmds: &[Command]) -> Result<(), String> {
-    #[cfg(debug_assertions)]
     {
         let violations = sanity::check_references(_cmds);
         if !violations.is_empty() {

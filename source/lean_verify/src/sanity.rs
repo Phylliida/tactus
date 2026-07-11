@@ -1,6 +1,8 @@
 //! AST-level sanity checks on the generated command stream.
 //!
-//! These run in debug builds only (gated via `debug_assertions`) and catch
+//! These run in ALL build profiles (release included — users run release
+//! binaries, and a clear codegen diagnostic beats a baffling lake error;
+//! 2026-07-11) and catch
 //! classes of codegen bug that would otherwise only surface as cryptic
 //! Lean errors — or, worse, ship silently if the test proof happens to
 //! paper over them.
@@ -90,8 +92,8 @@ fn check_no_anchored_self_ref(
                 context: decl_anchored.to_string(),
                 name: format!(
                     "{} (root-anchored self-reference inside its own declaration — \
-                     cannot resolve during elaboration; render it relative, see \
-                     CURRENT_DECL_SELF)",
+                     cannot resolve during elaboration; under Option B naming \
+                     nothing should emit `_root_.` at all — regression tripwire)",
                     n
                 ),
             });
@@ -270,8 +272,7 @@ fn check_reserved_binder(name: &str, context: &str, violations: &mut Vec<Violati
     }
 }
 
-/// Top-level command binders also pass through the reserved-name rule
-/// — callers pass `violations`; `None` context skips (never used).
+/// Top-level command binders also pass through the reserved-name rule.
 fn scope_from_binders_checked(
     binders: &[Binder],
     context: &str,
