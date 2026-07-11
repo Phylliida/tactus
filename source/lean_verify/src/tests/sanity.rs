@@ -348,3 +348,90 @@ fn name_resolves_accepts_prelude_name() {
     // Sanity: a made-up name is still rejected.
     assert!(!name_resolves("not_a_prelude_name_xyz", &defined, &scope));
 }
+
+// ── Anchored-self-reference rule (preventive check, ──
+// ── DESIGN-lean-all-proofs-followons.md "Preventive check") ──
+
+/// A datatype whose field references the datatype ITSELF root-anchored
+/// must be flagged: during elaboration the inductive is not yet a
+/// global, so `_root_.ns.Stack` inside `inductive _root_.ns.Stack` is
+/// `Unknown identifier` at lake time — the 2026-07-10 regression class,
+/// now caught at codegen time.
+#[test]
+fn anchored_self_ref_in_datatype_field_flagged() {
+    let dt = Datatype {
+        name: "_root_.test.Stack".into(),
+        self_name: "Stack".into(),
+        typ_params: vec![],
+        kind: DatatypeKind::Inductive {
+            variants: vec![Variant {
+                name: "Push".into(),
+                fields: vec![Field {
+                    name: "val0".into(),
+                    // The bug shape: root-anchored self-reference.
+                    ty: var("_root_.test.Stack"),
+                }],
+            }],
+        },
+        derives: vec![],
+    };
+    let v = check_references(&[Command::Datatype(dt)]);
+    assert!(
+        v.iter().any(|x| x.name.contains("root-anchored self-reference")),
+        "expected anchored-self-ref violation, got {:?}", v,
+    );
+}
+
+/// The RELATIVE self-reference (what `with_self_decls` produces) is the
+/// correct form and must NOT be flagged.
+#[test]
+fn relative_self_ref_in_datatype_field_ok() {
+    let dt = Datatype {
+        name: "_root_.test.Stack".into(),
+        self_name: "Stack".into(),
+        typ_params: vec![],
+        kind: DatatypeKind::Inductive {
+            variants: vec![Variant {
+                name: "Push".into(),
+                fields: vec![Field { name: "val0".into(), ty: var("Stack") }],
+            }],
+        },
+        derives: vec![],
+    };
+    assert!(check_references(&[Command::Datatype(dt)]).is_empty());
+}
+
+/// A class method TYPE referencing a sibling via the anchored
+/// `_root_.ns.Class.method` form must be flagged (the trait
+/// sibling-ref regression); a DIFFERENT decl's anchored name (already
+/// declared above) must not.
+#[test]
+fn anchored_class_sibling_ref_flagged() {
+    let c = Class {
+        name: "_root_.test.HasZero".into(),
+        typ_params: vec![],
+        extends_parents: vec![],
+        methods: vec![
+            ClassMethod {
+                name: "val".into(),
+                ty: var("Int"),
+                default: None,
+                termination_by: vec![],
+            },
+            ClassMethod {
+                name: "val_is_zero".into(),
+                ty: Expr::new(ExprNode::App {
+                    head: Box::new(var("_root_.test.HasZero.val")),
+                    args: vec![var("Int")],
+                }),
+                default: None,
+                termination_by: vec![],
+            },
+        ],
+    };
+    let v = check_references(&[Command::Class(c)]);
+    assert!(
+        v.iter().any(|x| x.name.contains("root-anchored self-reference")),
+        "expected anchored sibling-ref violation, got {:?}", v,
+    );
+}
