@@ -3259,10 +3259,18 @@ impl Verifier {
                     } else {
                         String::new()
                     };
+                    let cached = if report.pkg_cached + report.island_cached > 0 {
+                        format!(
+                            "; cached verdicts: {} pkg, {} island",
+                            report.pkg_cached, report.island_cached,
+                        )
+                    } else {
+                        String::new()
+                    };
                     reporter.report_now(&note_bare(format!(
-                        "tactus: package gate: {} modules elaborated{}; composition + \
+                        "tactus: package gate: {} modules elaborated{}{}; composition + \
                          axiom closures kernel-verified",
-                        report.modules, reuse,
+                        report.modules, reuse, cached,
                     )).to_any());
                 } else {
                     for (module, output) in &report.failures {
