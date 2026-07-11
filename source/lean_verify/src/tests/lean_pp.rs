@@ -443,7 +443,7 @@ fn span_mark_render_preserves_loc_verbatim() {
         inner: Box::new(inner),
     });
     let mut out = String::new();
-    let mut lm = Landmarks { tactic_starts: Vec::new(), span_marks: Vec::new() };
+    let mut lm = Landmarks { tactic_starts: Vec::new(), span_marks: Vec::new(), theorem_heads: Vec::new() };
     write_expr(&mut out, &marked, 0, &mut lm);
     assert!(
         out.contains(&format!("/- @rust:{} -/", loc)),
