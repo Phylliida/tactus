@@ -13348,6 +13348,91 @@ test_verify_one_file_with_options! {
     }
 }
 
+// M6.2 headline: EXEC fns verify via package modules. The crate has a
+// tactic proof fn helper + two exec fns (one citing the helper from a
+// bare assert-by); under package-check the exec obligations emit as
+// pkg/ modules importing the exec defs family + stmt modules, with the
+// helper arriving as a hypothesis binder (named by short name, typed
+// by its statement def) — the island's global theorem becomes a local
+// hypothesis and the tactic text elaborates unchanged.
+test_verify_one_file_with_options! {
+    #[test] test_exec_package_check_smoke ["tactus-package-check"] => verus_code! {
+        use vstd::prelude::*;
+
+        pub open spec fn sum_all(s: Seq<u8>) -> nat
+            decreases s.len(),
+        {
+            if s.len() == 0 {
+                0
+            } else {
+                s.first() as nat + sum_all(s.drop_first())
+            }
+        }
+
+        pub proof fn lemma_sum_nonneg(s: Seq<u8>)
+            ensures sum_all(s) >= 0
+            by { exact Nat.zero_le _ }
+
+        #[verifier::tactus_auto]
+        pub fn first_or_zero(v: &Vec<u8>) -> (r: u8)
+            ensures v@.len() > 0 ==> r == v@[0],
+        {
+            if v.len() > 0 { v[0] } else { 0 }
+        }
+
+        #[verifier::tactus_auto]
+        pub fn sum_is_small(v: &Vec<u8>) -> (r: bool)
+            ensures r,
+        {
+            assert(sum_all(v@) >= 0) by { exact lemma_sum_nonneg _ };
+            // Option B fully-qualified citation: island texts must use
+            // the global dotted name; the package emitter bridges it
+            // onto the short-named hypothesis binder.
+            assert(sum_all(v@) + 1 >= 1) by {
+                have h := test_crate.lemma_sum_nonneg (test_crate.view.View.view v)
+                omega
+            };
+            true
+        }
+    } => Ok(())
+}
+
+// M6.2 soundness pin: sorry is FATAL on the exec package path. Exec
+// closed forms do not join the Link composition until M6.3, so there
+// is no sorryAx backstop behind the route — the fn-level check itself
+// must reject, exactly as on the exec island path.
+test_verify_one_file_with_options! {
+    #[test] test_exec_package_check_sorry_fatal ["tactus-package-check"] => verus_code! {
+        use vstd::prelude::*;
+
+        pub open spec fn sum_all(s: Seq<u8>) -> nat
+            decreases s.len(),
+        {
+            if s.len() == 0 {
+                0
+            } else {
+                s.first() as nat + sum_all(s.drop_first())
+            }
+        }
+
+        pub proof fn lemma_sum_nonneg(s: Seq<u8>)
+            ensures sum_all(s) >= 0
+            by { exact Nat.zero_le _ }
+
+        #[verifier::tactus_auto]
+        pub fn sum_is_small(v: &Vec<u8>) -> (r: bool)
+            ensures r,
+        {
+            assert(sum_all(v@) >= 0) by { sorry };
+            true
+        }
+    } => Err(err) => {
+        assert!(err.errors.iter().any(|d| d.message.contains("sorry is fatal")),
+            "sorry must be fatal on the exec package path (no Link gate yet); got: {:?}",
+            err.errors.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+}
+
 // M5b: per-member attribution inside a failing mutual module. The
 // broken member's error is region-attributed and span-mapped through
 // the shared diagnostics chokepoint ("Lean tactic failed for
