@@ -18,6 +18,7 @@ pub mod prelude;
 pub mod project;
 pub mod ret_subst;
 pub mod sanity;
+pub mod tactic_select;
 pub mod source_util;
 pub mod sourcemap;
 pub mod sst_to_lean;
