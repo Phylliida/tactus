@@ -671,9 +671,23 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
 
         ExprX::Match(place, arms) => ExprNode::Match {
             scrutinee: Box::new(place_to_expr(&place.x, ctx)),
-            arms: arms.iter().map(|arm| LMatchArm {
-                pattern: pattern_to_ast(&arm.x.pattern.x),
-                body: expr_to_ast(&arm.x.body, ctx),
+            arms: arms.iter().map(|arm| {
+                // Pattern-bound vars enter the binder map for the arm
+                // body (same idiom as the Quant arm above). Their
+                // PatternBinding typs carry the Box/Rc/Arc decorations
+                // that Verus STRIPS on spec-mode use sites (`esize(*a)`
+                // stamps the arg bare while `a` is bound at
+                // `Tactus.Box PExpr`); with the entry present,
+                // `structural_typ`'s Var arm reports the decorated typ
+                // and `apply_ref_coercion_if_needed` re-materializes
+                // the `.deref`. Without it, the use renders bare and
+                // the island fails elaboration (probe-w0 P8).
+                let mut extended = ctx.binder_typs.cloned().unwrap_or_default();
+                collect_pattern_binding_typs(&arm.x.pattern.x, &mut extended);
+                LMatchArm {
+                    pattern: pattern_to_ast(&arm.x.pattern.x),
+                    body: expr_to_ast(&arm.x.body, &ctx.with_binder_typs(&extended)),
+                }
             }).collect(),
         },
 
@@ -1066,6 +1080,40 @@ fn block_to_node(stmts: &[Stmt], final_expr: Option<&Expr>, ctx: &crate::expr_sh
 }
 
 // ── Patterns ────────────────────────────────────────────────────────────
+
+/// Collect every pattern-bound variable's DECLARED typ (`PatternBinding
+/// .typ` — decoration-carrying, e.g. `Decorate(Box, PExpr)` for a
+/// `Box<T>`-typed constructor field) into a binder map. See the
+/// `ExprX::Match` arm for why: spec-mode VIR strips decorations on use
+/// sites of pattern-bound vars, and the use-site coercion can only
+/// bridge binder-typ → stamped-typ if it knows the binder typ.
+fn collect_pattern_binding_typs(
+    pat: &PatternX,
+    out: &mut std::collections::HashMap<vir::ast::VarIdent, Typ>,
+) {
+    match pat {
+        PatternX::Wildcard(_) | PatternX::Expr(_) | PatternX::Range(..) => {}
+        PatternX::Var(binding) => {
+            out.insert(binding.name.clone(), binding.typ.clone());
+        }
+        PatternX::Constructor(_, _, pats) => {
+            for p in pats.iter() {
+                collect_pattern_binding_typs(&p.a.x, out);
+            }
+        }
+        PatternX::Or(l, r) => {
+            collect_pattern_binding_typs(&l.x, out);
+            collect_pattern_binding_typs(&r.x, out);
+        }
+        PatternX::Binding { binding, sub_pat } => {
+            out.insert(binding.name.clone(), binding.typ.clone());
+            collect_pattern_binding_typs(&sub_pat.x, out);
+        }
+        PatternX::MutRef(inner) | PatternX::ImmutRef(inner) => {
+            collect_pattern_binding_typs(&inner.x, out);
+        }
+    }
+}
 
 pub(crate) fn pattern_to_ast(pat: &PatternX) -> LPattern {
     match pat {

@@ -555,3 +555,15 @@ fn's own obligations (O4's ids), never on file contents.
   Nat-arith recursion keeps WF + simp-eq-lemma bridging.
 - W1 constraint: mirror types must use own cons-lists, never `Seq` fields
   (opaque axiom type — no match, no reduction).
+
+**FIX LANDED on this branch (same day):** match-arm pattern binders now enter
+`ctx.binder_typs` (`to_lean_expr.rs`, Quant-arm idiom + recursive
+`collect_pattern_binding_typs`), so spec-mode uses of Box/Rc-decorated
+pattern vars re-materialize `.deref` via the existing use-site coercion.
+w15_probe island elaborates green vs the real prelude; **full e2e suite
+533/0**; P8 regenerated on the fixed emission: `termination_by structural`
+flip on real emitted esize/lsize = kernel decide/rfl, zero axioms — the
+W1.5 authoring loop validated end to end. (Explains the old asymmetry:
+generated height fns always emitted `.deref`; only user match bodies
+lacked it.) Residue noted: `block_to_node` Decl-bound pattern vars share
+the hazard class in principle — same map-extension fix if a repro appears.
