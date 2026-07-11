@@ -257,7 +257,10 @@ copies, preamble elaborated once, bare `lean`, 8-way parallel; ~2 min a run):
 
 Full-pool re-run after harness adoption (`tools/rung-attrib/`, composed
 `first | tactus_auto | fallback` sites excluded by design — they carry explicit
-user proofs already): zero unexplained failures, stable shares.
+user proofs already): zero unexplained failures, stable shares. **Full findings &
+analysis: `MEASUREMENT-brick1-rung-attribution.md`** (kind/module breakdowns —
+preconditions are 81% T2; pred-twin halving; 8/45 modules already pure-T1 —
+plus squeeze-and-pin sizing recommendations).
 
 **Decision-table read (§6): the `simp_all` share is LARGE** — outright removal of T2
 from the default ladder would be a usability cliff. The indicated path is
