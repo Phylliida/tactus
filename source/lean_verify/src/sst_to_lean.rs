@@ -3206,7 +3206,7 @@ fn push_post_call_frames(
         // ill-typed artifact is fixed by the unified bridge; this census
         // watches for residual lie shapes before any behavior change
         // (DESIGN-B5-typed-spine-calls.md, B5b).
-        if std::env::var_os("TACTUS_B5_CENSUS").is_some() {
+        if crate::to_lean_sst_expr::b5_census_enabled() {
             match vir_ret_eq_actual_typ(q.rhs, render_ctx) {
                 Some(derived) => eprintln!(
                     "B5B-CENSUS {} callee={} claim={:?} derived={:?}",

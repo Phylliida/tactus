@@ -2863,7 +2863,11 @@ test_verify_one_file! {
             !err.errors.iter().any(|e| {
                 e.message.contains("ismatch")
                     || e.message.contains("Invalid field")
-                    || e.message.contains("unexpected")
+                    // Anchored forms only — the message embeds the whole
+                    // goal text, so a bare "unexpected" could false-trip
+                    // on hypothesis/identifier names.
+                    || e.message.contains("unexpected token")
+                    || e.message.contains("unexpected identifier")
             }),
             "RENDERING REGRESSION — ill-typed artifact is back: {:?}",
             msgs,
