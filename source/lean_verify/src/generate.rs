@@ -1746,6 +1746,31 @@ fn install_datatype_field_bounds(krate: &KrateX) {
         map.insert(path.clone(), fields);
     }
     crate::to_lean_sst_expr::set_datatype_fields(map);
+
+    // Sibling table, ALL datatypes ALL variants, raw field names:
+    // declared ctor-slot typs for the Box::new-erasure re-wrap
+    // (expr_shared::CTOR_FIELD_TYPS).
+    let mut ctor_map: std::collections::HashMap<
+        vir::ast::Path,
+        (Vec<vir::ast::Ident>, std::collections::HashMap<String, Vec<(String, vir::ast::Typ)>>),
+    > = std::collections::HashMap::new();
+    for d in krate.datatypes.iter() {
+        let dx = &d.x;
+        let vir::ast::Dt::Path(path) = &dx.name else { continue; };
+        let tps: Vec<vir::ast::Ident> = dx.typ_params.iter().map(|(id, _)| id.clone()).collect();
+        let variants: std::collections::HashMap<String, Vec<(String, vir::ast::Typ)>> = dx
+            .variants
+            .iter()
+            .map(|v| {
+                (
+                    v.name.as_str().to_string(),
+                    v.fields.iter().map(|f| (f.name.as_str().to_string(), f.a.0.clone())).collect(),
+                )
+            })
+            .collect();
+        ctor_map.insert(path.clone(), (tps, variants));
+    }
+    crate::expr_shared::set_ctor_field_typs(ctor_map);
 }
 
 pub fn emit_proof_fn(

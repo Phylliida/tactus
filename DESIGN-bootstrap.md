@@ -601,3 +601,15 @@ Still-open review items: attribute silently ignored on mutual spec fns and
 proof/exec fns (document-or-warn, W5); SST-path (exec obligation) match
 binders unaudited for the same class — accessor-based, likely fine, worth a
 probe when M6.2 lands; fixture not yet exercising --tactus-package-check.
+
+**CTOR-ARG BUG FIXED (same day):** `Box::new` erasure at constructor slots
+now re-wraps via declared-slot coercion — new ambient table `CTOR_FIELD_TYPS`
+(all datatypes, all variants, raw field names + typ params) installed by
+`install_datatype_field_bounds` alongside `DATATYPE_FIELDS` (the blessed
+ambient-table idiom pending the typed-renderer migration); `ctor_to_node` +
+StructUpdate values coerce each rendered field to the instantiated declared
+typ via `coerce_lexpr` (wrapper-only, identity on agreement, skip on unknown
+datatypes). Typ args from `expr.typ` (decoration-stripped). The kernel_computes
+e2e is now the COMPOUND pin: Box ctor coercion + structural emission + kernel
+`decide` in one goal. Battery 544/0. SST-path ctor sites remain unaudited for
+the same class (M6.2-era probe).
