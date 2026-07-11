@@ -345,7 +345,7 @@ test_verify_one_file! {
         fn get(h: &Holder) -> (r: u8)
             ensures r == h.view()
         {
-            proof { simp_all [Holder.view] }
+            proof { simp_all [test_crate.Holder.view] }
             h.v
         }
     } => Ok(())
@@ -3058,7 +3058,7 @@ test_verify_one_file! {
     #[test] test_soundness_hole_generated_seq_index_inhabits_empty verus_code! {
         use vstd::prelude::*;
         #[verifier::tactus_auto]
-        #[verifier::tactus_tactic("exact ((seq.Seq.index Empty Inhabited.default 0).elim)")]
+        #[verifier::tactus_tactic("exact ((test_crate.seq.Seq.index Empty Inhabited.default 0).elim)")]
         fn exploit(s: Ghost<Seq<int>>)
             requires s@[0] == s@[0],
             ensures false,
@@ -5775,7 +5775,7 @@ test_verify_one_file! {
         fn loop_with_inv_unfold(n: u8)
             requires n < 100
         {
-            proof { try unfold id_u8 }
+            proof { try unfold test_crate.id_u8 }
             let mut i: u8 = 0;
             while i < n
                 invariant
@@ -5812,7 +5812,7 @@ test_verify_one_file! {
         fn loop_with_body_proof(n: u8)
             requires n < 100
         {
-            assert(id_u8(0u8) == 0u8) by { simp_all [id_u8] };
+            assert(id_u8(0u8) == 0u8) by { simp_all [test_crate.id_u8] };
             let mut i: u8 = 0;
             while i < n
                 invariant
@@ -5821,7 +5821,7 @@ test_verify_one_file! {
                 decreases (n - i) as int,
             {
                 i = i + 1;
-                assert(id_u8(i) == i) by { simp_all [id_u8] };
+                assert(id_u8(i) == i) by { simp_all [test_crate.id_u8] };
             }
         }
     } => Ok(())
@@ -6477,7 +6477,7 @@ test_verify_one_file! {
         fn use_it() {
             let x = mk();
             assert(sview(x) == 0) by {
-                have h : sview x = 0 := by assumption
+                have h : test_crate.sview x = 0 := by assumption
                 exact h
             };
         }
@@ -6499,8 +6499,8 @@ test_verify_one_file! {
         fn use_derive() {
             let q = mk();
             assert(q.a == 5) by {
-                have h : sview q = 5 := by assumption
-                unfold sview at h
+                have h : test_crate.sview q = 5 := by assumption
+                unfold test_crate.sview at h
                 omega
             };
         }
@@ -7393,7 +7393,7 @@ test_verify_one_file! {
             assert(result as nat == cnt(i as nat)) by {
                 intro result i
                 have h : i.toNat = 0 := by omega
-                rw [h]; unfold cnt; simp
+                rw [h]; unfold test_crate.cnt; simp
             };
             while i < n
                 invariant result == i, i <= n,
@@ -7466,8 +7466,8 @@ test_verify_one_file! {
             let mut result: u64 = 1;
             let mut i: u64 = 0;
             assert(result as nat == fact(i as nat)) by {
-                show Int.toNat 1 = fact (Int.toNat 0)
-                unfold fact
+                show Int.toNat 1 = test_crate.fact (Int.toNat 0)
+                unfold test_crate.fact
                 simp
             };
             while i < n
@@ -8202,7 +8202,7 @@ test_verify_one_file! {
         fn use_double() -> (r: u32)
             ensures double(3 as nat) == 6
         {
-            proof { unfold double }
+            proof { unfold test_crate.double }
             0
         }
     } => Ok(())
@@ -9619,7 +9619,7 @@ test_verify_one_file! {
             requires x <= 100, y <= 100
             ensures r as int == min(x as int, y as int)
         {
-            proof { try unfold math.min }
+            proof { try unfold test_crate.math.min }
             if x <= y { x } else { y }
         }
     } => Ok(())
@@ -9896,7 +9896,7 @@ test_verify_one_file! {
                 // Like `caller` below, unfold it with a visible body proof —
                 // the established, transparent pattern (DESIGN "reveal_with_fuel
                 // and unfold in Tactus"), not a closer change or attribute hack.
-                proof { simp_all [Foo.predicate] }
+                proof { simp_all [test_crate.Foo.predicate] }
                 self.v > 0
             }
         }
@@ -9905,7 +9905,7 @@ test_verify_one_file! {
         fn caller(b: &Bar) -> (r: bool)
             ensures r ==> b.v > 0
         {
-            proof { simp_all [Foo.predicate] }
+            proof { simp_all [test_crate.Foo.predicate] }
             b.check()
         }
     } => Ok(())
@@ -9927,7 +9927,7 @@ test_verify_one_file! {
         fn get(h: &Holder) -> (r: u8)
             ensures r == h.view()
         {
-            proof { simp_all [Holder.view] }
+            proof { simp_all [test_crate.Holder.view] }
             h.v
         }
     } => Ok(())
@@ -10283,7 +10283,7 @@ test_verify_one_file! {
             proof fn val_in_range(&self)
                 ensures self.val() >= 0, self.val() <= 100
             by {
-                simp [Bounded.val]
+                simp [test_crate.Bounded.val]
             }
         }
 
@@ -10320,7 +10320,7 @@ test_verify_one_file! {
                 // cannot re-declare. Just ensures + body.
                 ensures self.val() >= 1
             by {
-                simp [Conditional.val]
+                simp [test_crate.Conditional.val]
             }
         }
 
@@ -10353,10 +10353,10 @@ test_verify_one_file! {
         impl TwoLemmas for TL {
             spec fn val(&self) -> int { 42 }
             proof fn val_nonneg(&self) ensures self.val() >= 0 by {
-                simp [TwoLemmas.val]
+                simp [test_crate.TwoLemmas.val]
             }
             proof fn val_le_max(&self) ensures self.val() <= 1000 by {
-                simp [TwoLemmas.val]
+                simp [test_crate.TwoLemmas.val]
             }
         }
 
@@ -10391,7 +10391,7 @@ test_verify_one_file! {
             proof fn doubled_is_2val(&self)
                 ensures doubled(self.val()) == self.val() * 2
             by {
-                unfold doubled; rfl
+                unfold test_crate.doubled; rfl
             }
         }
 
@@ -10535,7 +10535,7 @@ test_verify_one_file! {
             proof fn val_nonneg(&self)
                 ensures self.val() >= 0
             by {
-                simp [MixedModes.val]
+                simp [test_crate.MixedModes.val]
             }
         }
 
@@ -10857,7 +10857,7 @@ test_verify_one_file! {
 
         #[verifier::tactus_auto]
         fn probe(x: u64) {
-            assert((x as nat) * (x as nat) == sq(x as nat)) by { intros; simp only [sq] };
+            assert((x as nat) * (x as nat) == sq(x as nat)) by { intros; simp only [test_crate.sq] };
         }
     } => Ok(())
 }
@@ -11414,7 +11414,7 @@ test_verify_one_file_with_options! {
             // proof — referenceable by its naturalized name `Holder.view`.
             // The overflow check (`h.v + 1`) closes via the struct field
             // bound (`0 ≤ h.deref.v < 256`) now materialized for the param.
-            proof { simp_all [Holder.view] }
+            proof { simp_all [test_crate.Holder.view] }
             h.v = h.v + 1;
         }
 
@@ -11535,7 +11535,7 @@ test_verify_one_file! {
         pub fn abs_delta(a: usize, b: usize) -> (d: usize)
             ensures d == spec_abs_delta(a as int, b as int),
         {
-            proof { simp_all [spec_abs_delta] }
+            proof { simp_all [test_crate.spec_abs_delta] }
             if a >= b { a - b } else { b - a }
         }
 
@@ -11544,7 +11544,7 @@ test_verify_one_file! {
         {
             let dx = abs_delta(a, b);
             let dy = abs_delta(b, a);
-            proof { simp_all [spec_abs_delta] }
+            proof { simp_all [test_crate.spec_abs_delta] }
             (dx as u32) + (dy as u32)
         }
     } => Ok(())
@@ -11591,7 +11591,7 @@ test_verify_one_file! {
                 out == sym_val(*s),
                 out == sym_val(*s) || out == 0,
         {
-            proof { simp_all [sym_val] }
+            proof { simp_all [test_crate.sym_val] }
             match s {
                 Sym::Gen(i) => *i,
                 Sym::Inv(i) => *i,
@@ -11601,7 +11601,7 @@ test_verify_one_file! {
         pub fn get_val_commuted(s: &Sym) -> (out: usize)
             ensures sym_val(*s) == out,
         {
-            proof { simp_all [sym_val] }
+            proof { simp_all [test_crate.sym_val] }
             match s {
                 Sym::Gen(i) => *i,
                 Sym::Inv(i) => *i,
@@ -11613,7 +11613,7 @@ test_verify_one_file! {
         {
             let a = get_val(s1);
             let b = get_val_commuted(s2);
-            proof { simp_all [sym_val] }
+            proof { simp_all [test_crate.sym_val] }
             (a as u32) + (b as u32)
         }
 
@@ -11624,7 +11624,7 @@ test_verify_one_file! {
         pub fn nested_pair(s1: &Sym, s2: &Sym, s3: &Sym) -> (out: bool)
             ensures out == is_gen(*s3),
         {
-            proof { simp_all [is_gen] }
+            proof { simp_all [test_crate.is_gen] }
             match ((s1, s2), s3) {
                 ((_, _), Sym::Gen(_)) => true,
                 _ => false,
@@ -11634,7 +11634,7 @@ test_verify_one_file! {
         pub fn swap_and_check(s1: &Sym, s2: &Sym) -> (out: bool)
             ensures out == is_gen(*s2),
         {
-            proof { simp_all [is_gen] }
+            proof { simp_all [test_crate.is_gen] }
             let p = (s1, s2);
             let q = (p.1, p.0);
             match q {
@@ -11662,7 +11662,7 @@ test_verify_one_file! {
         pub fn is_pair_exec(s1: &Sym, s2: &Sym) -> (out: bool)
             ensures out == is_pair_spec(*s1, *s2),
         {
-            proof { cases h1 : s1.deref <;> cases h2 : s2.deref <;> simp_all [is_pair_spec] }
+            proof { cases h1 : s1.deref <;> cases h2 : s2.deref <;> simp_all [test_crate.is_pair_spec] }
             match (s1, s2) {
                 (Sym::Gen(i), Sym::Inv(j)) => *i == *j,
                 _ => false,
@@ -11696,7 +11696,7 @@ test_verify_one_file! {
         pub fn first_is_gen(s1: &Sym, s2: &Sym) -> (out: bool)
             ensures out == is_gen_spec(*s1),
         {
-            proof { simp_all [is_gen_spec] }
+            proof { simp_all [test_crate.is_gen_spec] }
             let pair = (s1, s2);
             let x = pair.0;
             match x {
@@ -12021,7 +12021,7 @@ test_verify_one_file_with_options! {
         {
             // Unfold the trait spec method `view` (class projection
             // `View.view`); the overflow closes via the struct field bound.
-            proof { simp_all [View.view] }
+            proof { simp_all [test_crate.View.view] }
             h.v = h.v + 1;
         }
 
@@ -12209,7 +12209,7 @@ test_verify_one_file! {
         fn use_helper(n: u64)
             requires n <= 10
         {
-            proof { have _ := double_nonneg n.toNat }
+            proof { have _ := test_crate.double_nonneg n.toNat }
             assert(double(n as nat) >= 0);
         }
     } => Ok(())
@@ -13533,7 +13533,7 @@ test_verify_one_file_with_options! {
         }
         proof fn lemma_rate_pos(s: Speed)
             ensures rate(s) >= 1
-            by { cases s <;> simp only [rate] <;> omega }
+            by { cases s <;> simp only [test_crate.rate] <;> omega }
         #[verifier::tactus_auto]
         fn rate_of(s: &Speed) -> (r: u8)
             ensures r == 1 || r == 2
@@ -13670,6 +13670,33 @@ test_verify_one_file_with_options! {
                 }
                 lemma_triple_ge(w);
             }
+        }
+    } => Ok(())
+}
+
+// === Option B naming: full dotted names at root scope ===
+// References render as `test_crate.word.f` with NO namespace wrapper, so
+// a binder sharing a MODULE's first segment cannot capture (pre-B1a this
+// exact shape silently resolved `word.empty_val` against the local
+// binder; post-B1a it was defended by `_root_.` anchoring; under Option
+// B the leading `test_crate.` segment makes capture impossible — only a
+// binder named like the CRATE could collide, which the sanity checker's
+// reserved-name rule rejects).
+test_verify_one_file! {
+    #[test] test_binder_shadows_module_name verus_code! {
+        mod word {
+            use vstd::prelude::*;
+            verus! {
+            pub open spec fn empty_val() -> int { 7 }
+            }
+        }
+
+        #[verifier::tactus_auto]
+        fn shadowed(v: u8) -> (r: u8)
+            ensures r == v, crate::word::empty_val() == 7
+        {
+            let word = v; // binder named exactly like the module
+            word
         }
     } => Ok(())
 }
