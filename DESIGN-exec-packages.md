@@ -323,7 +323,14 @@ with non-Inhabited fields break elaboration even when unused") lifts
   green over the full crate. (tactus-computability-theory dropped
   from the protocol — Danielle 2026-07-11: tgt is the validation
   crate.)
-- **M6.5 default flip:** package-check becomes the --lean-backend
+- **M6.5 default flip — DONE 2026-07-11.** Package-check is the
+  --lean-backend default; --tactus-islands opts out; old flag forces
+  on. tgt default run 82s at baseline; opt-out verifies identically;
+  tgt check.sh inherits the default unchanged. The flip surfaced and
+  fixed two latent issues: per-fn fallback noise (now silent — the
+  gate note summarizes) and ProofClasses umbrella-routing (now Base
+  with prereq hoist, consumer-routing principle). **M6 COMPLETE.**
+- Original spec: package-check becomes the --lean-backend
   default (islands remain automatic fallback per-fn); flag inverts to
   an opt-out (--tactus-islands). Update tgt/ct check.sh, tutorial
   docs, and the artifact ledger. Only after M6.3 (exec fns must not
