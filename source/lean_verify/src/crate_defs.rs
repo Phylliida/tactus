@@ -314,7 +314,7 @@ fn build_defs(
     let ladder_path = crate::generate::lean_out_root()
         .join(sanitize(crate_name))
         .join(format!("{}.ladder", scope));
-    let fp = crate::project::toolchain_fingerprint();
+    let fp = crate::project::ladder_fingerprint();
     let mut recorded: Option<(usize, String)> = if build {
         std::fs::read_to_string(&ladder_path).ok().and_then(|t| {
             let mut it = t.split_whitespace();
@@ -746,6 +746,20 @@ fn render_and_build(
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         rendered.text.hash(&mut h);
+        // The PARTITION is part of the content identity: a seg-tagging
+        // change moves commands between parts without touching the
+        // monolith text (e.g. the mid-stream axiom-flush placement
+        // fix), and the ladder's success/failure records must not
+        // fast-path over it. Hash the seg boundaries + tags.
+        for (pos, seg) in &segs {
+            pos.hash(&mut h);
+            std::mem::discriminant(seg).hash(&mut h);
+            if let crate::generate::DefsSeg::FnGroup { fns, .. } = seg {
+                for f in fns {
+                    format!("{:?}", f.path).hash(&mut h);
+                }
+            }
+        }
         format!("{:016x}", h.finish())
     };
     if hash_only {
@@ -827,7 +841,8 @@ one part per source module, SCC-merged; umbrella = interface)", header)));
         cmds.extend(extra_imports.iter().map(|m| Command::Import(m.clone())));
         cmds.extend(head.iter().cloned());
         cmds.extend(items.iter().map(|&i| item_cmds[i].clone()));
-        cmds.push(Command::NamespaceClose(ns.to_string()));
+        // Option B: no namespace wrapper (decls carry full dotted
+        // names), so no close either.
         cmds
     };
 

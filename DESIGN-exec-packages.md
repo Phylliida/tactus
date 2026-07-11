@@ -171,6 +171,24 @@ What the day proved:
   housekeeping item: tracked-write it). Clean re-measure deferred to
   an idle host.
 
+## M6.0b + Option B STATUS: CENSUS COMPLETE, MERGED, GREEN (2026-07-11)
+
+Exec full-roots defs PASSES on tgt; islands import the shared exec
+defs module. Census fixes: Match-scrutinee Ref bridge, builtin
+signature axioms (Prop-returning), Nat-sorted integer bounds, 3
+lean_axiom_eq attributes in tgt. Option B (fully-qualified names)
+merged; pkg/stmt/link machinery adapted (no namespace wrappers).
+Structural fixes from the integration: consumer-routed bc-axiom
+placement (umbrella; subrange axiom at the companion site in-part),
+partition-aware ladder content hashes, binary-aware ladder record
+fingerprints. Fast iteration: /tmp/defs_repro.rs shape (Vec exec fn +
+drop_first spec fn) exercises the full defs ladder in ~20s on the
+debug binary.
+
+Remaining M6 sequence: M6.0 accessor [Nonempty] residue (hygiene) →
+M6.2 exec stmt/pkg emission (per-fn) → M6.3 Link integration → M6.4/5
+tgt validation + default flip.
+
 ## Sequencing (each step lands green alone)
 
 | Step | Content | Session-sized? |
