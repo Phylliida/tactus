@@ -96,10 +96,12 @@ fn write_lean_file(path: &Path, source: &str) -> Result<(), String> {
 /// not through this enum. The enum is purely about the proof-fn
 /// vs exec-fn structural distinction.
 enum PreambleConfig {
-    /// Proof fns: native match rendering (no accessor fns).
-    /// Emitting accessors for types with non-Inhabited fields
-    /// breaks Lean elaboration even when unused, so the proof-fn
-    /// path keeps them off.
+    /// Proof fns: native match rendering (no accessor fns). The
+    /// historical caveat ("accessors for types with non-Inhabited
+    /// fields break elaboration even when unused") is LIFTED — M6.0
+    /// moved accessors to `[Nonempty]` + `Classical.ofNonempty`, so
+    /// they elaborate for any field type. Proof fns keep native match
+    /// purely as the better rendering.
     ProofFn,
     /// Exec fns: emit accessor fns for desugared match (via
     /// `IsVariant` / `Field`).
@@ -1938,6 +1940,7 @@ pub fn check_proof_fn(
         };
     let marker = file_path.with_extension("verified");
     if island_cache_ok(&marker, changed, &defs) {
+        ISLAND_CACHED_VERDICTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Live-path parity: success warnings are the sorry-filtered
         // set, which is empty by construction (sorry is fatal here).
         return CheckResult::Success { warnings: vec![] };
@@ -2285,6 +2288,14 @@ fn record_exec_link_entry(scope: &str, entry: ExecLinkEntry) {
     entries.push(entry);
 }
 
+/// Cached-verdict observability (M6.2 fold-in): how many fns skipped
+/// Lean entirely this run on a cross-run cached verdict. Reported in
+/// the package gate note.
+static PKG_CACHED_VERDICTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static ISLAND_CACHED_VERDICTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 static PKG_OLEAN_BUILT: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
 > = std::sync::OnceLock::new();
@@ -2423,6 +2434,7 @@ fn check_proof_fn_via_package(
                 && olean.exists();
             if cacheable {
                 record_pkg_olean_built(&path);
+                PKG_CACHED_VERDICTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(CheckResult::Success { warnings: vec![] });
             }
             for (m, ch) in &stmt_modules {
@@ -2951,6 +2963,10 @@ pub struct PackageGateReport {
     /// Of `modules`, how many were reused from per-fn package checks
     /// (oleans built earlier this process — M5c).
     pub reused: usize,
+    /// Cross-run cached verdicts this process (M6.2 fold-in): fns that
+    /// skipped Lean entirely on a pkg / island cached verdict.
+    pub pkg_cached: usize,
+    pub island_cached: usize,
     /// Mutual SCCs that could not be package-expressed (reasons).
     pub skipped_sccs: Vec<String>,
     /// (module leaf, lean output) per failed elaboration.
@@ -3040,7 +3056,10 @@ pub fn check_package(
         // stmts (or an emission) failed — every pkg module would fail
         // derivatively; report the root cause, not the cascade.
         return Ok(PackageGateReport {
-            modules: 1 + stmt_mods.len(), reused, skipped_sccs, failures,
+            modules: 1 + stmt_mods.len(), reused,
+            pkg_cached: PKG_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
+            island_cached: ISLAND_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
+            skipped_sccs, failures,
         });
     }
     let pkg_dir = lean_out_root().join(sanitize(crate_name)).join("pkg");
@@ -3057,6 +3076,8 @@ pub fn check_package(
     Ok(PackageGateReport {
         modules: 1 + stmt_mods.len() + leafs.len() + 1,
         reused,
+        pkg_cached: PKG_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
+        island_cached: ISLAND_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
         skipped_sccs,
         failures,
     })
@@ -3525,7 +3546,10 @@ fn build_link_module(
     let rendered = pp_commands(&cmds);
     let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
         .join(format!("{}.lean", link_module_name(defs)));
-    write_lean_file(&path, &rendered.text)
+    // Tracked: identical bytes → no rewrite (mtime churn poisoned
+    // downstream freshness checks every run). The gate still
+    // elaborates the Link each run — that's the sorry backstop.
+    write_lean_file_tracked(&path, &rendered.text).map(|_| ())
 }
 
 /// The raw text a theorem's tactic elaborates — the scan surface for
@@ -3801,6 +3825,7 @@ fn check_exec_fn_via_package(
                 && olean.exists();
             if cacheable {
                 record_pkg_olean_built(&path);
+                PKG_CACHED_VERDICTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(CheckResult::Success { warnings: vec![] });
             }
             for (m, ch) in &stmt_modules {
