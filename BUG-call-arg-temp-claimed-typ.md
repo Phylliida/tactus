@@ -1,9 +1,19 @@
 # BUG: call-arg SST temps record claimed (Ref-decorated) typ, emit ill-typed artifacts
 
-**Status:** OPEN, diagnosed 2026-07-04. Pinned by
-`test_exec_vec_field_index_clone` (currently `=> Err`; flip to `Ok` when
-fixed). Blocks tactus-group-theory's `apply_hom_symbol_exec` (the last
-un-migrated fn besides its dependents).
+**Status:** **RENDERING RESOLVED** (re-verified 2026-07-11, branch
+`b5-typed-spine-calls` — see DESIGN-B5-typed-spine-calls.md B5b): the "real
+fix" below landed as the typed `eq_extraction` + unified `coerce_lexpr`
+bridge in `push_ret_frames` (mut-ref carve-out documented in situ); the
+pin's artifact now elaborates cleanly (`tmp__1 := { deref := … }`, every
+slot typechecks) and `apply_hom_symbol_exec` passes (gate 3114/0). The pin
+test now asserts the artifact-correctness BOUNDARY (auto-tactic failure
+only, no mismatch/Invalid-field/parse markers) — the residual is
+tactus_auto lacking a seq-extensionality-from-pointwise-`cloned` rung,
+which is closer-policy territory (DESIGN-transparent-automation.md), not
+a renderer bug. One latent input remains census-watched (TACTUS_B5_CENSUS):
+`eq_extraction` feeds `q.rhs.typ` (a claim) to the bridge — flips to the
+derived actual (`vir_ret_eq_actual_typ`) only if the census ever shows a
+decor-only line there.
 
 ## Symptom
 

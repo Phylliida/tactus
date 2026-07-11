@@ -82,7 +82,7 @@ fn expr_prec(node: &ExprNode) -> u16 {
     match node {
         ExprNode::Var(_) | ExprNode::Lit(_) | ExprNode::LitBool(_)
         | ExprNode::LitStr(_) | ExprNode::LitChar(_)
-        | ExprNode::ArrayLit(_) | ExprNode::StructUpdate { .. }
+        | ExprNode::ArrayLit(_) | ExprNode::VectorLit(_) | ExprNode::StructUpdate { .. }
         | ExprNode::Anon(_) | ExprNode::Tuple(_) | ExprNode::Raw(_)
         | ExprNode::ByBlock { .. } | ExprNode::Subtype { .. } => PREC_ATOM,
         ExprNode::FieldProj { .. } | ExprNode::Index { .. } => PREC_ATOM,
@@ -446,7 +446,11 @@ fn write_datatype(out: &mut String, dt: &Datatype, lm: &mut Landmarks) {
                     write_expr(out, &f.ty, 0, lm);
                     out.push_str(" → ");
                 }
-                out.push_str(&dt.name);
+                // Ctor result type: the RELATIVE self-name — the
+                // root-anchored `dt.name` doesn't resolve while the
+                // inductive is still being elaborated (see
+                // `Datatype::self_name`).
+                out.push_str(&dt.self_name);
                 for tp in &dt.typ_params {
                     out.push(' ');
                     out.push_str(tp);
@@ -696,11 +700,26 @@ fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
         }
 
         ExprNode::Let { name, value, body } => {
+            // Continuation column: align the body exactly under this
+            // `let`'s own keyword. Any enclosing column guard
+            // (colGt/colGe against a saved position P) that admitted
+            // the `let` token at column C has P ≤ C, so a continuation
+            // at C passes it too. The old fixed 4-space indent dedented
+            // the bodies of mid-line lets (`… then let i := v;`) below
+            // their enclosing guard — Lean cut the term at the next
+            // non-atom token: `unexpected token '('; expected 'else'`
+            // (F1, DESIGN-lean-all-proofs-followons.md). Repro: a
+            // let-chain in the RHS of an enclosing `let` inside a
+            // parenthesized `∀`. Chars, not bytes — Lean columns are
+            // codepoints and the prefix may hold `∀`/`∧`/`→`.
+            let line_start = out.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let let_col = out[line_start..].chars().count();
             out.push_str("let ");
             out.push_str(name.as_str());
             out.push_str(" := ");
             write_expr(out, value, 0, lm);
-            out.push_str(";\n    ");
+            out.push_str(";\n");
+            out.extend(std::iter::repeat(' ').take(let_col));
             write_expr(out, body, 0, lm);
         }
         ExprNode::Lambda { binders, body } => {
@@ -718,16 +737,29 @@ fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
             write_expr(out, body, 0, lm);
         }
         ExprNode::Forall { binders, body } => {
-            out.push('∀');
-            write_binders(out, binders, lm);
-            out.push_str(", ");
-            write_expr(out, body, 0, lm);
+            // Zero binders: `∀, P` is a parse error and a zero-binder
+            // quantifier IS its body — print the body alone. Reached
+            // via plain (non-forall) `assert … by { }`: the desugar's
+            // re-assumed fact is `Quant(FORALL, vars=[], req ⇒ ens)`
+            // (F4). Same guard family as Lambda's `fun ()` arm.
+            if binders.is_empty() {
+                write_expr(out, body, 0, lm);
+            } else {
+                out.push('∀');
+                write_binders(out, binders, lm);
+                out.push_str(", ");
+                write_expr(out, body, 0, lm);
+            }
         }
         ExprNode::Exists { binders, body } => {
-            out.push('∃');
-            write_binders(out, binders, lm);
-            out.push_str(", ");
-            write_expr(out, body, 0, lm);
+            if binders.is_empty() {
+                write_expr(out, body, 0, lm);
+            } else {
+                out.push('∃');
+                write_binders(out, binders, lm);
+                out.push_str(", ");
+                write_expr(out, body, 0, lm);
+            }
         }
 
         ExprNode::If { cond, then_, else_ } => {
@@ -782,6 +814,15 @@ fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
 
         ExprNode::ArrayLit(elts) => {
             out.push('[');
+            for (i, e) in elts.iter().enumerate() {
+                if i > 0 { out.push_str(", "); }
+                write_expr(out, e, 0, lm);
+            }
+            out.push(']');
+        }
+
+        ExprNode::VectorLit(elts) => {
+            out.push_str("#v[");
             for (i, e) in elts.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
                 write_expr(out, e, 0, lm);

@@ -167,6 +167,36 @@ test_verify_one_file! {
     } => Ok(())
 }
 
+// === Recursive spec fn through Seq::drop_first with NO broadcast use ===
+// Regression for DESIGN-lean-all-proofs-followons.md F2a. The emitted
+// `decreasing_by`'s seq rung cites the proven companion
+// `Seq.drop_first_len_lt`, whose canned proof cites
+// `seq.axiom_seq_subrange_len` — but the axiom reached the emission
+// schedule only when some `broadcast use` group carried it. A file like
+// this one (no `broadcast use` at all) emitted the recursive def with no
+// companion, and its termination goal `len (drop_first s) < len s`
+// failed (68/81 residual termination errors in the §10.1 crate run).
+// Post-fix the axiom is force-scheduled whenever drop_first/drop_last
+// emits.
+test_verify_one_file! {
+    #[test] test_spec_fn_drop_first_decreases_no_broadcast verus_code! {
+        use vstd::seq::*;
+
+        spec fn count_all(s: Seq<int>) -> nat
+            decreases s.len()
+        {
+            if s.len() == 0 { 0 } else { (1 + count_all(s.drop_first())) as nat }
+        }
+
+        proof fn count_all_zero(s: Seq<int>)
+            requires s.len() == 0
+            ensures count_all(s) == 0
+        by {
+            unfold count_all; simp_all
+        }
+    } => Ok(())
+}
+
 // === Dependency ordering: helper → double → proof fn ===
 
 test_verify_one_file! {
@@ -2811,21 +2841,23 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// ── KNOWN BUG (pinned as Err): clone of a Vec element loses the ref
-// wrap in call-substitution entries. Cloning an element of a nested
-// Vec (`h.imgs[i].clone()` with `imgs: Vec<Vec<u8>>`) generates
-// obligation exps where the clone-callee's `self` substitutes to an
-// SST temp (`tmp__1`) whose Var reference CLAIMS the autoref'd
-// Ref-decorated typ while the rendered binding holds the bare value.
-// The substitution entry records the claim, so the use-site
-// `coerce_lexpr` is an identity and the artifact is ill-typed
-// ("Application type mismatch ... expected Tactus.Ref" at
-// spec_vec_len's slot). Diagnosed 2026-07-04 (see
-// BUG-call-arg-temp-claimed-typ.md); groundwork landed (walker temps
-// now consult the let-binder ledger + args render through the typed
-// spine) but THIS temp's binding is minted outside walk_let, so its
-// storage typ is recorded nowhere yet. FLIP THIS PIN TO Ok WHEN
-// FIXED. Blocks tactus-group-theory's apply_hom_symbol_exec.
+// ── RESOLVED RENDERING / PENDING PROOF-POWER (B5b,
+// DESIGN-B5-typed-spine-calls.md + BUG-call-arg-temp-claimed-typ.md):
+// the ill-typed-artifact bug this test originally pinned (call dest
+// bound bare where a Tactus.Ref-typed slot expected it — the skipped
+// non-integer bridge in push_ret_frames) is FIXED: the typed
+// eq_extraction + unified coerce_lexpr bridge wrap the dest
+// (`tmp__1 := { deref := … }`) and the artifact elaborates cleanly
+// (re-verified 2026-07-11). What remains is that tactus_auto cannot
+// CLOSE the correct goal — seq extensionality from pointwise
+// `cloned` facts — which is auto-bucket / closer-policy territory
+// (DESIGN-transparent-automation.md), NOT a renderer bug. The Err
+// assertion below pins exactly that boundary: the failure must be
+// the auto-tactic class with NO type-mismatch / Invalid-field /
+// parse-error markers. FLIP TO Ok when a site-proof idiom or closer
+// rung covers extensionality. (A `=~=` site-assert attempt surfaced
+// an unrelated parse bug — 'unexpected identifier; expected ]' —
+// filed in the B5 doc for the F-series.)
 test_verify_one_file! {
     #[test] test_exec_vec_field_index_clone verus_code! {
         use vstd::prelude::*;
@@ -2838,17 +2870,58 @@ test_verify_one_file! {
             h.imgs[i].clone()
         }
     } => Err(err) => {
-        // Matches both "Type mismatch" and "Application type mismatch"
-        // (the exact Lean wording shifted once the `lookup_subst_typ`
-        // deref fix corrected the `h.deref.imgs` base — the residual
-        // failure is the clone's strictly_cloned axiomatization, still
-        // a `Tactus.Ref`-slot mismatch + `sorry`).
+        // Artifact-correctness pin: the ONLY acceptable failure class
+        // is the auto-tactic one. Any mismatch / Invalid field / parse
+        // marker = the rendering regressed.
+        let msgs: Vec<_> = err.errors.iter().map(|e| &e.message).collect();
         assert!(
-            err.errors.iter().any(|e| e.message.contains("ismatch")),
-            "expected the KNOWN ill-typed-artifact failure (fixed? flip this pin to Ok!), got: {:?}",
-            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+            err.errors.iter().any(|e| e.message.contains("auto-tactic failed")),
+            "expected the auto-tactic-only failure (closer grew? flip to Ok!), got: {:?}",
+            msgs,
+        );
+        assert!(
+            !err.errors.iter().any(|e| {
+                e.message.contains("ismatch")
+                    || e.message.contains("Invalid field")
+                    // Anchored forms only — the message embeds the whole
+                    // goal text, so a bare "unexpected" could false-trip
+                    // on hypothesis/identifier names.
+                    || e.message.contains("unexpected token")
+                    || e.message.contains("unexpected identifier")
+            }),
+            "RENDERING REGRESSION — ill-typed artifact is back: {:?}",
+            msgs,
         );
     }
+}
+
+// ── B5a regression (DESIGN-B5-typed-spine-calls.md): a spec-fn CALL
+// in an inlined `&self` receiver position (vstd's `#[verifier::inline]`
+// `is_some(option: &Option<T>)`) carries a Ref-decorated CLAIMED typ —
+// sst_elaborate splices the receiver arg with its call-site claim for
+// poly.rs — while the rendered application is bare; pre-B5a the
+// IsVariant deref count off the claim emitted `.deref` on a bare
+// Option ("Invalid field deref", all 55 crate-wide Invalid-field
+// errors in the 2026-07-09 gt run). Reproduces ONLY on the
+// --lean-all-proofs SST/WP pipeline — the tactus_auto-attribute path
+// renders proof fns elsewhere and never lied (red capture: this exact
+// source vs the pre-fix binary → 2× "Invalid field `deref`"). The
+// migrated Call arm reports the declared-instantiated ret typ, so the
+// requires binder renders `(wrap s).isSome` bare and the fn verifies.
+test_verify_one_file_with_options! {
+    #[test] test_spec_call_receiver_deref_claim ["lean-all-proofs"] => verus_code! {
+        use vstd::prelude::*;
+        pub enum Sym { A, B }
+        pub open spec fn wrap(s: Seq<Sym>, i: int) -> Option<Seq<Sym>> {
+            if i > 0 { Some(s) } else { None }
+        }
+        pub proof fn uses_receiver_call(s: Seq<Sym>, i: int)
+            requires
+                wrap(s, i).is_some(),
+                wrap(s, i).unwrap().len() >= 0,
+            ensures wrap(s, i).is_some(),
+        {}
+    } => Ok(())
 }
 
 // ── Arch-width integer bounds (usize::MAX in specs) ───────────────
@@ -9689,6 +9762,45 @@ test_verify_one_file! {
     }
 }
 
+// === Multi-element seq! literals (F3, DESIGN-lean-all-proofs-followons.md) ===
+// `seq![a, b]` lowers through vstd's `View for [T; N]` over an ARRAY
+// literal (single-element `seq![x]` is a push chain and never did).
+// Verus `[T; N]` maps to Lean core `Vector T N`, so the literal must
+// render `#v[a, b]` wrapped `Tactus.Ref.mk … : Tactus.Ref (Vector T N)`
+// — pre-F3 the SST path rejected the fn outright ("array literal not
+// yet supported") and the VIR path emitted a List literal that
+// mistyped (`{ deref := [a, b] }` family).
+
+// SST path: multi-element seq! inline in an obligation expression.
+// The closer discharges len via the seq.new axioms end-to-end.
+test_verify_one_file! {
+    #[test] test_seq_literal_multi_sst_obligation verus_code! {
+        use vstd::seq::*;
+
+        #[verifier::tactus_auto]
+        fn noop(v: u8) -> (r: u8)
+            ensures r == v, seq![1int, 2int].len() == 2, seq![1int, 2int, 3int].len() == 3
+        { v }
+    } => Ok(())
+}
+
+// VIR path: multi-element seq! in a spec fn BODY. The def must
+// elaborate (that's the F3 fix); the theorem's goal is a syntactic
+// self-equality the closer's rfl rung handles without needing seq
+// semantics.
+test_verify_one_file! {
+    #[test] test_seq_literal_multi_spec_fn_body verus_code! {
+        use vstd::seq::*;
+
+        spec fn pair() -> Seq<int> { seq![10int, 20int] }
+
+        #[verifier::tactus_auto]
+        fn noop(v: u8) -> (r: u8)
+            ensures r == v, pair() == pair()
+        { v }
+    } => Ok(())
+}
+
 // Probe 6: `uninterp spec fn` body-less emission.
 // `pub uninterp spec fn my_oracle(x: int) -> int;` has `body=None` in
 // VIR. Prior to the audit's body-less emission fix, this hit a
@@ -13484,4 +13596,80 @@ test_verify_one_file_with_options! {
         let text = format!("{:?}", err.errors[0].message);
         assert!(text.contains("helper_bad"), "attributed to helper_bad: {}", text);
     }
+}
+
+// === StmX::DeadEnd lowering (F4, DESIGN-lean-all-proofs-followons.md) ===
+// `assert(P) by { <verus proof> }` — the Verus-proof-body form, as
+// written for the Z3 backend — desugars to `DeadEnd(Block([
+// Assume(require), …proof…, Assert(ensure)]))` + a following `Assume`
+// that re-introduces the fact. Such fns reach the Lean translator only
+// under `--lean-all-proofs` (in tactus_auto fns, by-blocks are raw Lean
+// tactics — the `AssertQuery` form). Pre-F4 the translator rejected
+// them outright (1,267 codegen rejections crate-wide); now the block
+// lowers as `Wp::Scope` — a scoped sub-proof whose effects are
+// discarded.
+
+// Plain assert-by with a lemma call in the proof body; the re-assumed
+// fact then carries the fn's ensures.
+test_verify_one_file_with_options! {
+    #[test] test_deadend_assert_by_lemma_call ["--lean-all-proofs"] => verus_code! {
+        spec fn triple(x: nat) -> nat { 3 * x }
+
+        proof fn lemma_triple_ge(x: nat)
+            ensures triple(x) >= x
+        by { unfold triple; omega }
+
+        proof fn uses_assert_by(x: nat)
+            ensures triple(x) >= x
+        {
+            assert(triple(x) >= x) by {
+                lemma_triple_ge(x);
+            }
+        }
+    } => Ok(())
+}
+
+// assert-forall-by: the quantified form re-assumes
+// `forall vars, require ==> ensure` after the scope.
+test_verify_one_file_with_options! {
+    #[test] test_deadend_assert_forall_by ["--lean-all-proofs"] => verus_code! {
+        spec fn double(x: nat) -> nat { 2 * x }
+
+        proof fn lemma_double_ge(x: nat)
+            ensures double(x) >= x
+        by { unfold double; omega }
+
+        proof fn uses_forall_by(y: nat)
+            ensures forall|x: nat| x <= 10 ==> double(x) >= x
+        {
+            assert forall|x: nat| x <= 10 implies double(x) >= x by {
+                lemma_double_ge(x);
+            }
+        }
+    } => Ok(())
+}
+
+// Nested assert-by (DeadEnd inside DeadEnd) + the proof body must see
+// OUTER context facts (the fn's requires and the ghost let).
+test_verify_one_file_with_options! {
+    #[test] test_deadend_nested_with_outer_context ["--lean-all-proofs"] => verus_code! {
+        spec fn triple(x: nat) -> nat { 3 * x }
+
+        proof fn lemma_triple_ge(x: nat)
+            ensures triple(x) >= x
+        by { unfold triple; omega }
+
+        proof fn nested(v: nat)
+            requires v < 100
+            ensures triple(v + 1) >= v + 1
+        {
+            let w = v + 1;
+            assert(triple(w) >= w) by {
+                assert(w <= 100) by {
+                    // closes from the outer `requires v < 100` + the let
+                }
+                lemma_triple_ge(w);
+            }
+        }
+    } => Ok(())
 }

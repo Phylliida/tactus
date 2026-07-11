@@ -93,6 +93,14 @@ pub(crate) fn sanitize_loc_for_name(loc: &str) -> String {
 /// don't produce double-underscore names like
 /// `_tactus_assert_<fn>_at__7`.
 pub(crate) fn build_theorem_name(kind_label: &str, fn_name: &str, loc: &str, id: usize) -> String {
+    // A guillemet-quoted component («prefix» — a fn NAMED a Lean reserved
+    // word) cannot appear mid-identifier: `_tactus_ensures_«prefix»_0` is
+    // a parse error (verified empirically, 2026-07-09 review, finding #8;
+    // pre-existing for the old keyword list's Rust-legal entries, widened
+    // by the generated list). Theorem names are fresh decls, never
+    // references — strip the quoting; uniqueness still comes from
+    // fn_name + loc + id.
+    let fn_name = fn_name.replace(['«', '»'], "");
     if loc.is_empty() {
         format!("_tactus_{}_{}_{}", kind_label, fn_name, id)
     } else {

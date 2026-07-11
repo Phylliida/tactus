@@ -1,0 +1,280 @@
+# B5: Calls report actual — completing the typed spine at call nodes
+
+**Date:** 2026-07-10
+**Status:** **B5a DONE** on branch `b5-typed-spine-calls` (`4f5b3dc` census stage,
+`66a55d2` flip): britton `Invalid field` 25 → 0 (total 108 → 83, auto unchanged, no
+new families), exec gate 3114/0 (cold-cache full verify), 299 unit tests + green
+pin test. Census result: 2 decor-only / 0 OTHER — the §3.6 bet held; guard stays
+dropped. NEW FACT from the repro hunt: the lie reproduces ONLY on the
+--lean-all-proofs SST/WP pipeline — tactus_auto-attribute proof fns render via a
+different path that never lied; the pin test (harness option `lean-all-proofs`,
+added to common/mod.rs) is the suite's first on that pipeline. `no-fnmap` census
+lines = ctxs without fn_map or callees pruned from it — those fall back to claim
+(status quo); benign for the corpus (0 residual errors). B5b remains.
+**Scope:** the `Invalid field deref` family (55 errors crate-wide, ~25 in britton —
+**every single `Invalid field` error in the post-fix run is this one bug**) plus its
+exec-path sibling `BUG-call-arg-temp-claimed-typ.md`. Companion to
+`DESIGN-lean-all-proofs-bugs.md` (B5 entry, rediagnosis 2026-07-09) and
+`DESIGN-typed-renderer.md` (P1/P2 program — this is the natural P3).
+**Disjoint from** `DESIGN-lean-all-proofs-followons.md` F1–F7 (deliberately not
+covered there).
+
+---
+
+## 1. Problem
+
+Live example (post-fix full-crate run, `lemma_t_free_step_is_base_step`, britton.rs:262):
+
+```
+Invalid field `deref`: The environment does not contain `lib.option.Option.deref`
+  presentation.apply_step (hnn.hnn_presentation data) w step
+has type
+  option.Option (seq.Seq symbol.Symbol)
+```
+
+**Mechanism.** `exp_to_typed` (`to_lean_sst_expr.rs:603`) is the typed spine: each
+migrated arm returns `(rendered value, ACTUAL typ)`, and the Field / IsVariant arms
+count `.deref`s from the base's actual typ (`count_ref_decorations(base.typ())`).
+`ExpX::Call` is **unmigrated** — it falls to the catch-all (`to_lean_sst_expr.rs:741`):
+
+```rust
+_ => TypedExpr::from_untyped(LExpr::new(exp_to_node_checked(e, ctx)?), e.typ.clone()),
+```
+
+i.e. calls report their SST **claimed** typ. The claim lies by one ref-decoration
+when the call sits in an inlined `&self` receiver position: Verus inlines
+`opt.is_some()` to `opt is Some` and re-types the receiver exp at the method's
+`self` param typ — `Decorate(Ref, Option<T>)` — while the rendered spec-fn call
+has the callee's declared return typ, bare `Option T`. IsVariant counts 1
+ref-decoration off the claim → `.deref` lands on a bare `option.Option` →
+"Invalid field". A Var receiver doesn't hit this (the Var arm reports the
+binder's DECLARED typ — actual); only call-valued receivers do.
+
+**Two sub-items from the original B5 list are already closed:** the
+`Invalid projection … has type Int` family (prop_v.rs, 10 errors) is **0** in the
+post-fix run — B2's choose rework fixed it, as the plan predicted ("investigate
+during B2"). Heartbeats timeouts stay parked (perf is noise until the families are
+done). What remains of B5 is exactly the deref family + the exec sibling.
+
+## 2. The exec-path sibling (same root, different site)
+
+`BUG-call-arg-temp-claimed-typ.md` (OPEN since 2026-07-04, probe-verified) is the
+same claimed-vs-actual lie on the **exec obligation** path: a call's return dest
+(`tmp__1`) binds via `push_ret_frames`, whose non-integer branch SKIPS the
+`coerce_lexpr` bridge ("numeric sorts don't apply" — conflating sort-bridging with
+wrapper-bridging), so a bare `TypParam(T)` value flows into `Decorate(Ref, T)` slots
+un-wrapped. Its doc already names the real fix: **a typed
+`render_call_ensure_expr`** returning value + actual typ, then a unified
+`push_ret_frames` bridge. That is this same design — the spine extended through
+calls — landing on the call-ENSURES path instead of the call-EXPRESSION path.
+
+Pinned by `test_exec_vec_field_index_clone` (currently asserted `Err`; flip to `Ok`
+when fixed). ⚠️ Re-baseline before starting: the exec gate is now 24/0 and
+`apply_hom_symbol_exec` passes (post B1–B4), so the bug's gt manifestation may have
+shifted; the unit test is the stable pin.
+
+## 3. Fix design
+
+### B5a — spec side: migrate `ExpX::Call` (+ `CallLambda`) in `exp_to_typed`
+
+**The rule:** a call's actual typ is the callee's **declared return typ,
+instantiated with the call-site typ args**.
+
+- Callee lookup: `ctx.fn_map` — **already present on `RenderCtx`**
+  (`expr_shared.rs:107`), no new threading. (Verify `RenderFnMap` exposes the
+  declared ret typ; if a caller constructs `RenderCtx` without fn_map on a path
+  that renders calls, fall back to claim — status quo.)
+- Instantiation: `vir::sst_util::subst_typ` (`sst_util.rs:92`) with the map
+  `callee.typ_params ↦ call-site typs` (the `ExpX::Call`'s typ args).
+- **Trust guard (Box/Unbox precedent, same file):** only override the claim when
+  the instantiated declared typ and the claim differ **by decorations only**
+  (equal after `peel_typ_wrappers`/strip-decorations on both). Poly/boxing
+  discrepancies are the Box arm's domain — overriding on those would relocate
+  lies, which is exactly how the reverted spot-fix in the sibling bug doc failed
+  (apply_hom 9→5 but find_cancellation 0→4). When the guard fails: keep the
+  claim, unchanged behavior.
+- `ExpX::CallLambda`: same rule; declared ret = the head's `TypX::SpecFn` return.
+- Interaction check: inlined bodies render receivers via `ctx.value_subst`
+  ("actual == claimed by construction" per the Var arm) and `ctx.inlining`
+  suppresses ReadPlace lifts — confirm a Call INSIDE an inlined body isn't
+  double-bridged (probe, don't reason).
+
+**Empirical-first probes (before any behavior change):**
+1. Minimal repro in the test suite: spec fn returning `Option<T>` + a use of
+   `f(x).is_some()` (or `matches`) — should emit `.deref` on bare Option today.
+2. A probe `eprintln` at the Call fallback comparing claim vs instantiated-declared
+   across a britton `--lean-all-proofs` run: measures the lie population and the
+   guard's coverage before the fix flips anything.
+
+**Size: S→M.** One arm + a small shared helper; the helper may also serve the VIR
+path (`to_lean_expr.rs` `structural_typ` — check parity; the same inlined-receiver
+shape exists there).
+
+### B5b — exec side: typed call-ensures path
+
+Per the sibling doc's "real fix" paragraph, in `sst_to_lean.rs`:
+- `render_call_ensure_expr` gets a typed variant returning `(LExpr, Typ /*actual*/)`
+  — the eq-extraction carries the actual typ of what it rendered.
+- `push_ret_frames` unifies its two ret families through `coerce_lexpr(actual →
+  ret.typ)` — wrapper-bridging AND sort-bridging, no non-integer skip.
+- Expected fallout (pre-diagnosed in the bug doc): gt's `find_cancellation_exec`
+  site tactics re-tuned to correctly-wrapped shapes; the "blanket shell instances"
+  tripwire (`Fields missing: clone`) needs its own small fix — emit the class as
+  shell iff its instances will be shells (one predicate, two consumers).
+- Debug aids listed at the bottom of the bug doc (TACTUS_DEBUG_ARGS/WP eprintln
+  sites) — re-add temporarily while working.
+
+**Size: M.** Riskier than B5a (exec gate is the crown jewel); its own validation
+cycle.
+
+## 3.5 Resolved uncertainties (pre-implementation reconnaissance, 2026-07-10)
+
+All read-only findings; each removes a "verify at implementation time" from §3.
+
+1. **The inliner is Verus's own `vir/src/sst_elaborate.rs:26-53`** (`attrs.inline`
+   fns expand at SST): `subst_exp` splices the receiver ARG exp into the body, and
+   the pass's own comment says the result keeps the outer typ "so that poly.rs can
+   perform the proper box/unbox" — poly then wraps pieces in Box/Unbox carrying
+   claims. Confirmed source shape: britton.rs:270 is literally
+   `apply_step(...).is_some()` (vstd `#[verifier::inline]`).
+2. **`resolved_method` selection is mandatory:** SST calls are
+   `CallFun::Fun(fun, resolved_method)`; sst_elaborate dispatches on
+   `if let Some((f, ts)) = resolved_method { (f, ts) } else { (fun, typs) }`.
+   The migrated Call arm must mirror this or trait-dispatched callees get the
+   wrong declared ret / wrong substitution basis.
+3. **`actual_is_trusted` (to_lean_sst_expr.rs:554) must also trust migrated
+   Calls** — it trusts only Vars today, and the Box/Unbox arm RESETS untrusted
+   children to the claimed typ. Since poly wraps inlined receivers in Box/Unbox,
+   migrating the Call arm alone would be silently undone in exactly the failing
+   shapes. Two coordinated edits, not one.
+4. **No plumbing needed:** the obligation path's `render_ctx()`
+   (sst_to_lean.rs:580) already installs `with_fn_map` (all krate fns, vstd
+   included); `RenderFnMap = HashMap<&Fun, &FunctionX>` and `FunctionX.ret`
+   carries the declared ret Par. Paths constructing `RenderCtx` without fn_map
+   fall back to claim = status quo.
+5. **Substitution pattern to copy:** sst_elaborate builds
+   `typ_substs: HashMap<Ident, Typ>` from `typ_params.zip(typs)` then
+   `sst_util::subst_typ` — same construction on the declared ret typ. Assert
+   the length invariants loudly (inline_spec.rs:231 precedent).
+6. **VIR-path parity resolved as probe-only:** `to_lean_expr.rs` counts derefs
+   from the claimed typ too (`lean_level_wrap_count`, lines 302/314, var_id=None
+   for call receivers) — but `inline_spec.rs` substitutes at pre-poly VIR-AST
+   (plain Var-replacement, no re-typing pass after) and the defs gate is green,
+   so the lying claims likely never materialize there. Add the census probe to
+   both paths; fix the VIR side only if the census shows lies.
+7. **B5b pin verified:** `rust_verify_test/tests/tactus.rs:2837`, still
+   Err-asserted with the flip-to-Ok comment intact.
+
+## 3.6 Design review round (same day) — minimality / rightness / transparency pass
+
+Reviewed against: can this be smaller, cleaner, more principled, more
+transparency-respecting (transparency = faithfulness + predictability)? Three
+changes to §3, each a simplification:
+
+**1. DROP the decoration-only trust guard.** The guard was fear-inheritance from
+the sibling's reverted spot-fix — but that failure had a CLAIM on the bridge's
+input side; here the instantiated declared ret is ground truth **by
+construction**: the emitted Lean def's return type IS `typ_to_expr(declared
+ret)`, so a rendered application's Lean type is exactly lean(declared-inst) —
+reporting anything else (conditionally!) is the impure move. Boxing divergences
+are harmless to consumers (`count_ref_decorations` doesn't count `Boxed`;
+coerce paths peel it). One unconditional rule — *a call's actual is its
+callee's declared return, instantiated* — is also the rule the ARGS already
+follow (`render_class_method_call` and the plain arm both bridge args to
+declared param typs via the typed spine, explicitly "not from the claimed
+`a.typ`"). B5a is the symmetric completion of an existing convention, not a
+new policy. The census probe (§3) stays as VALIDATION — log loudly when a
+claim diverges from declared by more than decorations+boxing — instead of
+gating behavior.
+
+**2. SHRINK scope to the two lying shapes.** New arm covers
+`CallFun::Fun(fun, None)` and `CallFun::Recursive(fun)` only (vir/sst.rs:59).
+`Fun(_, Some(_))` (class-method dispatch) already type-ANNOTATES its result
+with the claim (`TypeAnnot(app, e_typ)`, render_class_method_call tail) — those
+are claim-consistent by construction or they'd already fail; leave them, note
+as follow-up if the census disagrees. `InternalFun`: claim (status quo).
+`CallLambda`: DEFERRED out of B5a v1 — all 55 errors are named spec-fn calls;
+the census will say whether lambda applications ever lie.
+
+**3. REUSE the existing helper family.** `ctx.fn_param_typs(fun, typs)` already
+does lookup + instantiation for params; add the sibling `fn_ret_typ(fun, typs)`
+beside it (same lookup, same subst, the ret Par instead of the params). The new
+arm is then ~6 lines, and `fn_ret_typ` is exactly what B5b's typed
+`render_call_ensure_expr` needs too — one helper, both halves of the arc.
+
+**Layer confirmed right** (alternatives considered and rejected): fixing VIR/
+sst_elaborate is the wrong layer — poly and the Z3 path NEED the claims; the lie
+is a lie only from Lean's perspective, so the renderer is the correct seam.
+Consumer-side skepticism (count 0 derefs for non-Var bases at Field/IsVariant)
+would break legitimate `&`-returning spec fns and still needs the
+actual_is_trusted change once poly's Unbox wrapping is accounted — same size,
+less principled. Count-source-only patching duplicates declared-ret logic at
+two consumer sites instead of one producer site and leaves the spine lying to
+every other consumer.
+
+**New risk surfaced (named, accepted):** consumers that bridge `actual →
+claimed` (`into_slot(&e.typ)`, tuple-slot coercion) may now insert
+`Tactus.Ref.mk` wraps where the old claim==claim identity did nothing; paired
+with downstream claim-derived derefs these are sound round-trips (wrap then
+peel), just noisy. The census quantifies; if the britton run shows new
+mismatches rather than noise, the relocation is real and the guard comes back —
+that's the falsifiable bet, stated up front.
+
+**Sharper acceptance for B5a:** britton `Invalid field` 25 → 0; census log
+shows no divergence class other than decorations(+boxing); no new families; no
+count change in auto/timeout buckets beyond the freed goals.
+
+## 3.7 B5b outcome (2026-07-11) — reframed on contact
+
+The bug doc's "real fix" was ALREADY LANDED by post-doc groundwork (typed
+`eq_extraction: Option<(LExpr, Typ)>` + unified `coerce_lexpr` bridge in
+`push_ret_frames`, with a documented mut-ref carve-out). Re-baselining the pin
+showed the artifact now elaborates cleanly — the residual failure is
+`tactus_auto` unable to close a CORRECT goal (seq extensionality from pointwise
+`cloned` facts): auto-bucket, out of B5 scope. B5b therefore shipped as:
+(1) the pin re-asserted on the artifact-correctness boundary (must be
+auto-tactic class; any mismatch/Invalid-field/parse marker = rendering
+regression); (2) B5B-CENSUS on the one latent lie (`q.rhs.typ` claim feeding
+the bridge) with `vir_ret_eq_actual_typ` (B5a's rule on the VIR side: calls →
+declared-instantiated ret via the DynamicResolved selection, vars → the
+substitution entry's recorded value typ) ready to flip in if the census ever
+shows decor-only; (3) BUG-call-arg-temp-claimed-typ.md status updated.
+
+**Surfaced, filed for the F-series (NOT chased):** `assert(a@ =~= b@)` inside
+an exec fn's proof block renders to Lean that fails parsing with `unexpected
+identifier; expected ']'`, and the assert's fact reaches the postcondition
+goal as literal `True` — two independent smells (ext-eq rendering; assert-fact
+propagation for exec-site proof blocks). Repro = the pin test body with the
+site assert (see git history of test_exec_vec_field_index_clone).
+
+## 4. Sequencing & validation
+
+**B5a first** — small, self-contained, kills a complete error family. **B5b
+second**, separate commit(s), possibly a separate session. Independent of F1–F7
+(any order); B5a is the highest value-per-risk item left in the bug families.
+
+Per-step gates (the standard loop from the bugs doc):
+1. `cargo test -p lean_verify` + the new repro tests.
+2. Britton module `--lean-all-proofs`: expect `Invalid field` 25 → **0**, no new
+   families, auto/deref-adjacent counts otherwise stable.
+3. Exec gate (committed check.sh path): 24 verified / 0 errors — compare
+   **locations not counts** (`reference_tgt_gate_baseline_errors`).
+4. Tutorial gates.
+5. Full-crate measurement only rides the F7 measurement (after F3/F4 too — they
+   change the population more than B5 does).
+
+## 5. Risks
+
+- **Guard too loose** (override where declared also lies): decoration-only
+  comparison + probe-first keeps this bounded; worst case is status quo per node.
+- **Direction symmetry**: claims usually ADD a decoration vs declared (receiver
+  inlining), but a spec fn declared `-> &T` would invert it; the rule as stated
+  handles both directions identically (it just reports declared).
+- **Double-peel with pre-B5 workarounds**: if any site already compensates
+  (hand-inserted deref counts against claims — e.g. `binder_typs` consultation at
+  Field/IsVariant per its doc comment), fixing the base typ could over-correct
+  there. The britton re-run catches this class immediately (family would go
+  negative-to-positive, not to zero).
+- **B5b relocation risk**: the reverted spot-fix showed partial bridges MOVE the
+  lie. B5b must land the typed ensure-render and the unified bridge together, with
+  `test_exec_vec_field_index_clone` + gt gate as the pins.

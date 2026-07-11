@@ -562,6 +562,16 @@ fn actual_is_trusted(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> bool {
                 || ctx.let_binder(&lean_name).is_some_and(|(_, trusted)| *trusted)
                 || ctx.lookup_subst(&lean_name, &e.typ).is_some()
         }
+        // Plain/recursive spec-fn calls (B5a): the migrated Call path
+        // reports the declared-instantiated ret typ — ground truth by
+        // construction — so Box/Unbox must NOT reset it to a claim
+        // (poly wraps inlined receivers in Box/Unbox; without this,
+        // the reset silently undoes the Call migration in exactly the
+        // failing shapes). `plain_spec_call` is the same gate the
+        // render path uses; class-dispatch/internal calls fall out as
+        // None → untrusted (claim-typed), matching their render.
+        ExpX::Call(..) => plain_spec_call(e, ctx)
+            .is_some_and(|(fun, _)| ctx.fn_map.is_some_and(|m| m.contains_key(fun))),
         ExpX::Unary(UnaryOp::CoerceMode { .. }, inner)
         | ExpX::Unary(UnaryOp::Trigger(_), inner)
         | ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner)
@@ -600,11 +610,110 @@ fn actual_is_trusted(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> bool {
 /// * Field/IsVariant — deref count from the base's ACTUAL typ; tuple
 ///   projections report the slot typ as actual (replaces
 ///   `tuple_slot_extra_derefs`).
+/// Cached TACTUS_B5_CENSUS flag — `env::var_os` scans the process
+/// environment linearly, and the census hook sits on the hottest
+/// render path (every plain call node); pay the lookup once.
+pub(crate) fn b5_census_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("TACTUS_B5_CENSUS").is_some())
+}
+
+/// The call shapes the typed spine treats as PLAIN spec-fn calls
+/// (B5a): `Fun(_, None)` that is NOT a trait method (trait methods
+/// render via class dispatch, which type-ANNOTATES the result at the
+/// claim) and `Recursive`. Single source of truth for the exp_to_typed
+/// arm and actual_is_trusted — and the one edit site if CallLambda or
+/// the class-dispatch shapes ever earn their way in (census first).
+fn plain_spec_call<'a>(
+    e: &'a Exp,
+    ctx: &crate::expr_shared::RenderCtx,
+) -> Option<(&'a vir::ast::Fun, &'a [Typ])> {
+    match &e.x {
+        ExpX::Call(CallFun::Fun(fun, None), typs, _)
+            if !fun_is_trait_method(fun, ctx) =>
+        {
+            Some((fun, &typs[..]))
+        }
+        ExpX::Call(CallFun::Recursive(fun), typs, _) => Some((fun, &typs[..])),
+        _ => None,
+    }
+}
+
+/// B5a census (TACTUS_B5_CENSUS=1): classify how a plain call's SST
+/// claimed typ relates to the callee's declared-instantiated ret typ.
+/// Behavior-neutral telemetry; drives (and validates) the Call-arm
+/// migration per DESIGN-B5-typed-spine-calls.md §3.6.
+fn b5_census(
+    fun: &vir::ast::Fun,
+    typs: &[Typ],
+    claim: &Typ,
+    ctx: &crate::expr_shared::RenderCtx,
+) {
+    if !b5_census_enabled() {
+        return;
+    }
+    let Some(declared) = ctx.fn_ret_typ(fun, typs) else {
+        eprintln!("B5-CENSUS no-fnmap {}", crate::to_lean_type::lean_name_relative(&fun.path));
+        return;
+    };
+    let class = classify_typ_divergence(claim, &declared);
+    eprintln!(
+        "B5-CENSUS {} {} claim={:?} declared={:?}",
+        class,
+        crate::to_lean_type::lean_name_relative(&fun.path),
+        claim,
+        declared,
+    );
+}
+
+/// Shared claim-vs-derived classifier for the B5 census probes
+/// (TACTUS_B5_CENSUS): how does a claimed typ relate to the derived
+/// ground-truth typ? "decor-only" is the B5 lie class; "OTHER" is the
+/// class that would send a fix back to the drawing board.
+pub(crate) fn classify_typ_divergence(claim: &Typ, derived: &Typ) -> &'static str {
+    use crate::expr_shared::count_ref_decorations;
+    if vir::ast_util::types_equal(derived, claim) {
+        "equal"
+    } else if vir::ast_util::types_equal(
+        &crate::to_lean_type::peel_typ_wrappers(derived).clone(),
+        &crate::to_lean_type::peel_typ_wrappers(claim).clone(),
+    ) {
+        if count_ref_decorations(derived) != count_ref_decorations(claim) {
+            "decor-only"
+        } else {
+            "boxing-only"
+        }
+    } else {
+        "OTHER"
+    }
+}
+
 pub(crate) fn exp_to_typed(
     e: &Exp,
     ctx: &crate::expr_shared::RenderCtx,
 ) -> Result<crate::typed_expr::TypedExpr, String> {
     use crate::typed_expr::TypedExpr;
+    // Plain spec-fn calls (B5a, DESIGN-B5-typed-spine-calls.md): a
+    // rendered application's Lean type is the callee's DECLARED return
+    // typ (instantiated) by construction — the emitted def's return
+    // type is typ_to_expr of exactly that — so that is the actual
+    // reported here. The SST claim can lie by a ref-decoration when
+    // the call sits in an inlined `&self` receiver position
+    // (sst_elaborate splices the receiver arg with its call-site
+    // claim, which poly.rs needs — the lie is Lean-perspective-only).
+    // Same rule the ARGS already follow (bridged to declared param
+    // typs). Callee absent from fn_map → claim (status quo).
+    // Handled before the match: no other arm matches ExpX::Call, and
+    // `plain_spec_call` is the shared gate with actual_is_trusted.
+    if let Some((fun, typs)) = plain_spec_call(e, ctx) {
+        b5_census(fun, typs, &e.typ, ctx);
+        let actual = ctx.fn_ret_typ(fun, typs).unwrap_or_else(|| e.typ.clone());
+        return Ok(TypedExpr::from_untyped(
+            LExpr::new(exp_to_node_checked(e, ctx)?),
+            actual,
+        ));
+    }
     Ok(match &e.x {
         ExpX::Var(ident) | ExpX::VarLoc(ident) | ExpX::VarAt(ident, _) => {
             // Render-time substitution: if ctx has a value_subst map
@@ -1289,14 +1398,26 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
                 body: Box::new(sst_exp_to_ast_checked_with_ctx(body, ctx)?),
             },
             BndX::Choose(binders, _, cond) => {
-                // `Classical.epsilon (fun (x : T) => cond ∧ body)`
+                // See `expr_shared::choose_node` for the semantics and the
+                // shape (ε-skolemization). `body: None` = the single-binder
+                // `choose|x| P(x)` form where the body is the bound var.
                 let cond_ast = sst_exp_to_ast_checked_with_ctx(cond, ctx)?;
-                let body_ast = sst_exp_to_ast_checked_with_ctx(body, ctx)?;
-                let lambda = LExpr::lambda(
-                    vir_var_binders_to_ast(binders),
-                    LExpr::and(cond_ast, body_ast),
-                );
-                LExpr::app1(LExpr::var_lit("Classical.epsilon"), lambda).node
+                let body_is_the_var = binders.len() == 1
+                    && matches!(&body.x, ExpX::Var(v) if v == &binders[0].name);
+                let body_ast = if body_is_the_var {
+                    None
+                } else {
+                    Some(sst_exp_to_ast_checked_with_ctx(body, ctx)?)
+                };
+                let names: Vec<crate::lean_name::LeanName> = binders.iter()
+                    .map(|b| crate::lean_name::LeanName::from_var_ident(&b.name))
+                    .collect();
+                crate::expr_shared::choose_node(
+                    &vir_var_binders_to_ast(binders),
+                    &names,
+                    cond_ast,
+                    body_ast,
+                )
             }
         },
 
@@ -1342,11 +1463,28 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
                 args: args_rendered,
             }
         }
-        ExpX::ArrayLiteral(_) => return Err(
-            "array literal `[a, b, c]` not yet supported in exec fns (Verus \
-             rejects these upstream when slice indexing is unwired, so this is \
-             usually unreachable)".to_string()
-        ),
+        // Shared typ-dispatched literal: Array-typed → `#v[…]` (Vector),
+        // Slice-typed → `[…]` (List). Reaches this arm via `seq![a, b]`
+        // in obligation position — vstd's multi-element `seq!` lowers
+        // through `View for [T; N]` over an array literal (single-element
+        // `seq![x]` is a push chain and never gets here). See
+        // `expr_shared::array_literal_node` (F3).
+        ExpX::ArrayLiteral(exps) => {
+            let rendered = exps.iter()
+                .map(|x| sst_exp_to_ast_checked_with_ctx(x, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            let lit = crate::expr_shared::array_literal_node(rendered, &e.typ);
+            // The SST typ folds `&`-decorations into the literal's typ
+            // (no separate `&` node here, unlike VIR — and no coercion
+            // layer on this legacy arm): the value must wear the
+            // matching `Tactus.Ref.mk`/`Box.mk` chain itself, or the
+            // caller's ascription yields `(#v[…] : Tactus.Ref (…))`,
+            // which doesn't elaborate.
+            crate::expr_shared::apply_wrap_chain(
+                lit,
+                &crate::expr_shared::collect_ref_wraps(&e.typ),
+            ).node
+        }
         // Internal-bug rejection (see ExpX::Old's `Snapshot reference for
         // generating AIR Old expressions; only used during sst_to_air`
         // docstring in `vir/sst.rs`). User-syntax `old(x)` lowers to
@@ -1544,4 +1682,84 @@ fn bv_unsupported_shape_name(x: &ExpX) -> &'static str {
         // their arms produce LExpr directly, never reach this helper.
         _ => "<unknown ExpX variant>",
     }
+}
+
+/// Collect the witness-fact hypotheses for every `choose` reachable in
+/// `exp` WITHOUT crossing a binder (a choose under a quantifier/lambda/let
+/// binder would leave the hypothesis with free variables). One `LExpr` per
+/// choose — see `expr_shared::choose_witness_hyp` for the shape and the
+/// soundness argument (it's `Classical.epsilon_spec` at the value's exact
+/// ε-terms, mirroring the conditional witness axiom Verus's Z3 path gets
+/// from AIR's `BindX::Choose`).
+///
+/// Callers (the Wp walk arms: Let / Assert / Assume / Branch in
+/// `sst_to_lean`) push these as `CtxFrame::Hyp`s. Chooses nested under
+/// binders are skipped — their witness fact would need the enclosing
+/// quantifier prefix; the (rare) proof that needs one can supply an
+/// explicit tactic. A missed container variant below only loses proof
+/// help, never soundness.
+pub(crate) fn collect_choose_witness_hyps(
+    exp: &Exp,
+    ctx: &crate::expr_shared::RenderCtx,
+) -> Result<Vec<LExpr>, String> {
+    let mut out = Vec::new();
+    collect_choose_rec(exp, ctx, &mut out)?;
+    Ok(out)
+}
+
+fn collect_choose_rec(
+    exp: &Exp,
+    ctx: &crate::expr_shared::RenderCtx,
+    out: &mut Vec<LExpr>,
+) -> Result<(), String> {
+    use vir::sst::ExpX as X;
+    match &exp.x {
+        X::Bind(bnd, _body) => {
+            if let BndX::Choose(binders, _, cond) = &bnd.x {
+                let cond_ast = sst_exp_to_ast_checked_with_ctx(cond, ctx)?;
+                let names: Vec<crate::lean_name::LeanName> = binders
+                    .iter()
+                    .map(|b| crate::lean_name::LeanName::from_var_ident(&b.name))
+                    .collect();
+                out.push(crate::expr_shared::choose_witness_hyp(
+                    &vir_var_binders_to_ast(binders),
+                    &names,
+                    &cond_ast,
+                ));
+            }
+            // Never descend into a Bind: its sub-exps sit under binders.
+        }
+        X::Loc(e) | X::Unary(_, e) | X::UnaryOpr(_, e) | X::WithTriggers(_, e) => {
+            collect_choose_rec(e, ctx, out)?;
+        }
+        X::Binary(_, e1, e2) | X::BinaryOpr(_, e1, e2) => {
+            collect_choose_rec(e1, ctx, out)?;
+            collect_choose_rec(e2, ctx, out)?;
+        }
+        X::If(c, t, f) => {
+            collect_choose_rec(c, ctx, out)?;
+            collect_choose_rec(t, ctx, out)?;
+            collect_choose_rec(f, ctx, out)?;
+        }
+        X::Call(_, _, exps) | X::ArrayLiteral(exps) => {
+            for e in exps.iter() {
+                collect_choose_rec(e, ctx, out)?;
+            }
+        }
+        X::CallLambda(f, exps) => {
+            collect_choose_rec(f, ctx, out)?;
+            for e in exps.iter() {
+                collect_choose_rec(e, ctx, out)?;
+            }
+        }
+        X::Ctor(_, _, bs) => {
+            for b in bs.iter() {
+                collect_choose_rec(&b.a, ctx, out)?;
+            }
+        }
+        // Leaves (Const / Var / StaticVar / VarLoc / VarAt / Old /
+        // NullaryOpr / ExecFnByName / Interp / FuelConst): no children.
+        _ => {}
+    }
+    Ok(())
 }

@@ -477,3 +477,63 @@ fn span_mark_loc_shapes_have_no_newlines() {
         );
     }
 }
+
+// ── ExprNode::Let continuation column (F1, DESIGN-lean-all-proofs-followons.md) ──
+
+/// A `let` starting at column 0: its body continues at column 0.
+#[test]
+fn let_body_aligns_at_column_zero() {
+    let e = Expr::let_bind_synthetic("x", lit(1), var("x"));
+    assert_eq!(pp_expr(&e), "let x := 1;\nx");
+}
+
+/// Chained lets stay flat: the inner let is the outer's body, printed
+/// at the outer `let`'s column, so its own body aligns there too.
+#[test]
+fn let_chain_stays_flat() {
+    let inner = Expr::let_bind_synthetic("y", lit(2), var("y"));
+    let e = Expr::let_bind_synthetic("x", lit(1), inner);
+    assert_eq!(pp_expr(&e), "let x := 1;\nlet y := 2;\ny");
+}
+
+/// The F1 bug shape: a `let` in an if-branch starts mid-line; its body
+/// must align under the `let` keyword, NOT at the old fixed 4-space
+/// indent (which dedented the body below enclosing column guards —
+/// `unexpected token '('; expected 'else'`).
+#[test]
+fn let_body_aligns_under_midline_let() {
+    let then_ = Expr::let_bind_synthetic("i", lit(1), var("i"));
+    let e = Expr::new(ExprNode::If {
+        cond: Box::new(var("c")),
+        then_: Box::new(then_),
+        else_: Some(Box::new(var("z"))),
+    });
+    // `if c then ` is 10 chars, so `let` sits at column 10 and the
+    // body gets 10 spaces of continuation indent.
+    assert_eq!(pp_expr(&e), "if c then let i := 1;\n          i else z");
+}
+
+/// Column counting is in codepoints, not bytes: a multibyte `∧` before
+/// the `let` must not inflate the continuation indent.
+#[test]
+fn let_column_counts_chars_not_bytes() {
+    let rhs = Expr::let_bind_synthetic("i", lit(1), var("i"));
+    let e = bin(BinOp::And, var("p"), rhs);
+    // The let parenthesizes under `∧`; `p ∧ (` is 5 chars (7 bytes),
+    // so `let` sits at column 5 → 5 spaces. Byte-counting would have
+    // yielded 7.
+    assert_eq!(pp_expr(&e), "p ∧ (let i := 1;\n     i)");
+}
+
+// ── ExprNode::VectorLit (F3, DESIGN-lean-all-proofs-followons.md) ──
+
+/// Vector literals print with Lean core's `#v[…]` syntax; List
+/// literals keep plain `[…]`. The dispatch lives in
+/// `expr_shared::array_literal_node`; here we pin the two print shapes.
+#[test]
+fn vector_lit_prints_hash_v() {
+    let v = Expr::new(ExprNode::VectorLit(vec![lit(1), lit(2), lit(3)]));
+    assert_eq!(pp_expr(&v), "#v[1, 2, 3]");
+    let l = Expr::new(ExprNode::ArrayLit(vec![lit(1), lit(2)]));
+    assert_eq!(pp_expr(&l), "[1, 2]");
+}

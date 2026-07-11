@@ -919,6 +919,7 @@ fn mk_test_ctx() -> WpCtx<'static> {
     WpCtx {
         fn_map: HashMap::new(),
         type_map: HashMap::new(),
+        assert_by_var_typs: HashMap::new(),
         ret_name: None,
         ensures_goal: LExpr::lit_true(),
         mut_ref_locals: HashSet::new(),

@@ -241,6 +241,13 @@ pub enum PreambleFragment {
 #[derive(Debug, Clone)]
 pub struct Datatype {
     pub name: String,
+    /// The name SELF-references inside the declaration render as — the
+    /// relative (non-root-anchored) form. `IndexedInductive` constructor
+    /// result types (`| Plain : ∀ {A}, A → Mut A`) must use it: during
+    /// elaboration the inductive is not yet a global constant, so the
+    /// root-anchored `name` is `Unknown identifier` there (verified
+    /// empirically — same rule as `CURRENT_DECL_SELF` for field types).
+    pub self_name: String,
     pub typ_params: Vec<String>,
     pub kind: DatatypeKind,
     /// `deriving` clause class names (e.g., `"Inhabited"`). Emitted
@@ -619,6 +626,14 @@ pub enum ExprNode {
 
     /// `[a, b, c]` array literal.
     ArrayLit(Vec<Expr>),
+
+    /// `#v[a, b, c]` Lean core Vector literal. Verus `[T; N]` maps to
+    /// `Vector T N` (to_lean_type), so array literals in Array-typed
+    /// position must render as Vector literals — a bare `[a, b, c]` is
+    /// a `List` and mistypes (the `{ deref := [a, b, c] }` family; F3,
+    /// DESIGN-lean-all-proofs-followons.md). Slice-typed literals keep
+    /// `ArrayLit`. Dispatch: `expr_shared::array_literal_node`.
+    VectorLit(Vec<Expr>),
 
     /// `(a, b, c)` Lean tuple syntax — sugar for nested `Prod.mk a (Prod.mk b c)`.
     /// Distinct from `Anon` (`⟨a, b, c⟩`) because Lean's anon-ctor
@@ -1119,6 +1134,7 @@ impl ExprNode {
             | ExprNode::FieldProj { .. }
             | ExprNode::StructUpdate { .. }
             | ExprNode::ArrayLit(_)
+            | ExprNode::VectorLit(_)
             | ExprNode::Index { .. }
             | ExprNode::Anon(_)
             | ExprNode::Tuple(_)
@@ -1199,7 +1215,8 @@ where
                 f(e);
             }
         }
-        ExprNode::ArrayLit(es) | ExprNode::Anon(es) | ExprNode::Tuple(es) => {
+        ExprNode::ArrayLit(es) | ExprNode::VectorLit(es)
+        | ExprNode::Anon(es) | ExprNode::Tuple(es) => {
             for e in es {
                 f(e);
             }
@@ -1312,6 +1329,9 @@ where
         }
         ExprNode::ArrayLit(es) => {
             ExprNode::ArrayLit(es.iter().map(|e| f(e)).collect())
+        }
+        ExprNode::VectorLit(es) => {
+            ExprNode::VectorLit(es.iter().map(|e| f(e)).collect())
         }
         ExprNode::Index { base, idx, bang } => {
             let base = Box::new(f(base));

@@ -226,7 +226,7 @@ fn build_defs(
     // apply — the defs render must agree with the fn files that import
     // it. Deterministic, so the content-compare below is stable.
     let inlined_krate = crate::inline_spec::inline_marked_in_krate(krate);
-    crate::generate::install_emit_tables(&inlined_krate);
+    crate::generate::install_emit_tables(&inlined_krate, crate_name);
     let ectx = crate::emit_ctx::EmitCtx::build(&inlined_krate, tactic_bodies);
 
     // Dep-walk roots = every fn whose per-fn FILE will import the
@@ -1108,7 +1108,7 @@ fn build_batch(
     let defs = for_crate(krate, crate_name, tactic_bodies, build, ScopeKind::Proof)?;
 
     let inlined_krate = crate::inline_spec::inline_marked_in_krate(krate);
-    crate::generate::install_emit_tables(&inlined_krate);
+    crate::generate::install_emit_tables(&inlined_krate, crate_name);
     let ectx = crate::emit_ctx::EmitCtx::build(&inlined_krate, tactic_bodies);
 
     let batched: Vec<(&FunctionX, &str)> = inlined_krate.functions.iter()

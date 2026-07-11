@@ -293,6 +293,13 @@ pub type FnMap<'a> = HashMap<&'a Fun, &'a FunctionX>;
 pub struct WpCtx<'a> {
     pub fn_map: FnMap<'a>,
     pub type_map: HashMap<&'a VarIdent, &'a Typ>,
+    /// Locals of kind `LocalDeclKind::AssertByVar` — the skolem
+    /// variables of `assert forall |x| … by { … }` proof bodies. The
+    /// `StmX::DeadEnd` arm binds the ones its block references as
+    /// ∀-binders on the scope's theorems (they have no `Wp::Let` —
+    /// Verus declares them fn-wide and scopes them syntactically;
+    /// F4, DESIGN-lean-all-proofs-followons.md).
+    pub assert_by_var_typs: HashMap<&'a VarIdent, &'a Typ>,
     /// Declared return-var name (`-> (r: T)`), or `None` for unit
     /// returns. Used by `Wp::Done` leaves produced from `Return`
     /// statements to bind the returned value before jumping to the
@@ -505,6 +512,10 @@ impl<'a> WpCtx<'a> {
             .with_binder_typs(&caller_param_typs);
         let type_map: HashMap<&VarIdent, &Typ> =
             check.local_decls.iter().map(|d| (&d.ident, &d.typ)).collect();
+        let assert_by_var_typs: HashMap<&VarIdent, &Typ> = check.local_decls.iter()
+            .filter(|d| matches!(d.kind, vir::sst::LocalDeclKind::AssertByVar { .. }))
+            .map(|d| (&d.ident, &d.typ))
+            .collect();
         let ret_name = check.post_condition.dest.as_ref().map(|v| v.0.as_str());
         // Declared Lean typ of the return value, looked up via the dest
         // VarIdent (post_condition.dest carries only the name) against
@@ -560,6 +571,7 @@ impl<'a> WpCtx<'a> {
         Ok(Self {
             fn_map,
             type_map,
+            assert_by_var_typs,
             ret_name,
             ensures_goal,
             mut_ref_locals: mut_param_names.clone(),
@@ -933,7 +945,10 @@ pub fn exec_fn_theorems_to_ast<'a>(
         &LoopStack::Empty,
     )?;
 
-    let fn_name = lean_name(&fn_sst.x.name.path);
+    // `lean_name_relative`: `fn_name` only feeds `build_theorem_name`
+    // (synthetic obligation-theorem names) — a naming key, not a Lean
+    // reference. The root-anchor prefix must not appear mid-name.
+    let fn_name = crate::to_lean_type::lean_name_relative(&fn_sst.x.name.path);
     let default_closer = match &fn_sst.x.attrs.tactus_tactic {
         Some(tac) => Tactic::Raw(tac.clone()),
         None => Tactic::Named("tactus_auto".to_string()),
@@ -1005,6 +1020,17 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // (`build_req_binders` above) and get their own per-req
     // `let x := x.deref` wrapping there.
     let mut initial_obl_ctx = OblCtx::new(emitter.default_closer.clone());
+    // B2b (finding #6): witness facts for chooses inline in the fn's
+    // OWN requires / ensures — Wp::Done leaves (postcondition theorems,
+    // Return-replaced leaves, loop-body ensures conjuncts) inherit them
+    // through the root context, mirroring the per-choose skolem axiom
+    // Verus's Z3 path gets regardless of position.
+    for req in check.reqs.iter() {
+        initial_obl_ctx = obl_with_choose_hyps(req, &ctx, &initial_obl_ctx);
+    }
+    for ens in check.post_condition.ens_exps.iter() {
+        initial_obl_ctx = obl_with_choose_hyps(ens, &ctx, &initial_obl_ctx);
+    }
     let add_pre_capture = |obl: OblCtx, raw_name: &str, lean_name: &crate::lean_name::LeanName| -> OblCtx {
         let pre_name = crate::lean_name::LeanName::synthetic(varat_pre_name(raw_name));
         let inner = LExpr::field_proj(LExpr::var(lean_name.clone()), "deref");
@@ -1755,6 +1781,27 @@ impl ObligationEmitter {
 /// Walk a `Wp` tree, emitting one Lean theorem per obligation. See
 /// the doc on [`exec_fn_theorems_to_ast`] for the staging plan and
 /// the per-Wp-variant behaviour.
+/// Push the witness-fact hypothesis for every binder-free `choose` in
+/// `exp` onto a copy of `obl` (B2b — see
+/// `to_lean_sst_expr::collect_choose_witness_hyps`). Identity when the exp
+/// has no such choose — the overwhelmingly common case.
+fn obl_with_choose_hyps(exp: &Exp, ctx: &WpCtx, obl: &OblCtx) -> OblCtx {
+    // Best-effort: the hypothesis is optional proof HELP — a cond that
+    // fails to re-render (e.g. root-level ensures shapes that aren't
+    // Validated-witnessed) must not panic the emission; the goal just
+    // proceeds without the witness fact, as it did pre-B2b.
+    let hyps = crate::to_lean_sst_expr::collect_choose_witness_hyps(
+        exp,
+        &ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs),
+    )
+    .unwrap_or_default();
+    let mut out = obl.clone();
+    for h in hyps {
+        out = out.with_frame(CtxFrame::Hyp(h));
+    }
+    out
+}
+
 fn walk_obligations<'a>(
     wp: &Wp<'a>,
     ctx: &'a WpCtx<'a>,
@@ -1762,6 +1809,7 @@ fn walk_obligations<'a>(
     e: &mut ObligationEmitter,
 ) {
     match wp {
+        Wp::DoneEmpty => {}
         Wp::Done(leaf) => {
             // Terminal goal: the fn's ensures conjunction (top-level
             // Done) or a loop body's `I ∧ D < d_old` (loop-body Done
@@ -1779,6 +1827,8 @@ fn walk_obligations<'a>(
             // body — its proof sits in this theorem, the body's
             // theorems can assume it.
             let asserted_exp = asserted.raw();
+            // B2b: witness facts for chooses inline in the goal.
+            let obl = &obl_with_choose_hyps(asserted_exp, ctx, obl);
             let kind = detect_assert_kind(asserted_exp);
             let loc = format_rust_loc(&asserted_exp.span);
             let cond_ast = lower_validated_with_ctx(
@@ -1804,6 +1854,8 @@ fn walk_obligations<'a>(
         }
         Wp::Assume(p, body) => {
             // No theorem; the assumption just enters the context.
+            // B2b: witness facts for chooses inline in the assumption.
+            let obl = &obl_with_choose_hyps(p.raw(), ctx, obl);
             let new_obl = obl.with_frame(CtxFrame::Hyp(lower_validated_with_ctx(
                 p,
                 &ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs),
@@ -1920,7 +1972,11 @@ fn walk_obligations<'a>(
             walk_obligations(after, ctx, obl, e);
         }
         Wp::Let(name, val, dest_typ, body) => {
-            walk_let(name, val.raw(), dest_typ, body, ctx, obl, e);
+            // B2b: a choose in the RHS carries its witness fact — push it
+            // before the let frame so every downstream obligation sees it
+            // (mirrors AIR's per-choose skolem axiom on the Z3 path).
+            let obl = obl_with_choose_hyps(val.raw(), ctx, obl);
+            walk_let(name, val.raw(), dest_typ, body, ctx, &obl, e);
         }
         Wp::LetRaw { name, value, body } => {
             // Pre-rendered RHS — push the Let frame directly. No need
@@ -1944,6 +2000,32 @@ fn walk_obligations<'a>(
             // closure params don't escape the closure scope.
             walk_obligations(after, ctx, obl, e);
         }
+        Wp::Scope { scope_vars, body, after } => {
+            // Body obligations verify under the CURRENT context —
+            // outer hypotheses and lets stay visible inside the proof
+            // body — plus ∀-binders for this scope's assert-forall
+            // skolems (minus names an enclosing scope already bound;
+            // see the variant docstring). Effects are discarded:
+            // `after` walks under the SAME original obl (the proven
+            // fact re-enters via the `Assume` statement Verus emits
+            // after the DeadEnd, which lives in `after`'s tree).
+            let already_bound: std::collections::HashSet<&crate::lean_name::LeanName> =
+                obl.frames.iter().filter_map(|f| match f {
+                    CtxFrame::Binder(b) => b.name.as_ref(),
+                    _ => None,
+                }).collect();
+            let fresh: Vec<(&VarIdent, &Typ)> = scope_vars.iter()
+                .filter(|(v, _)| {
+                    !already_bound.contains(
+                        &crate::lean_name::LeanName::from_var_ident(v))
+                })
+                .cloned()
+                .collect();
+            let mut scope_obl = obl.clone();
+            push_mod_var_frames(&mut scope_obl, &fresh);
+            walk_obligations(body, ctx, &scope_obl, e);
+            walk_obligations(after, ctx, obl, e);
+        }
         Wp::Branch { cond, then_branch, else_branch } => {
             // Each branch walks under its own hypothesis (cond / ¬cond).
             // The Wp tree clones `after` into both branches at build
@@ -1954,6 +2036,8 @@ fn walk_obligations<'a>(
             // that fall through to the same `after`. Same exponential-
             // in-nested-if behaviour as the pre-D codegen — DESIGN.md
             // documents the trade-off.
+            // B2b: witness facts for chooses inline in the branch cond.
+            let obl = &obl_with_choose_hyps(cond.raw(), ctx, obl);
             let cond_marked = LExpr::span_mark(
                 format_rust_loc(&cond.raw().span),
                 Some(cond.raw().span.clone()),
@@ -1975,17 +2059,41 @@ fn walk_obligations<'a>(
             );
         }
         Wp::Call { callee, spec_callee, args, typ_args, dest, call_span, mut_args, after } => {
+            // B2b (2026-07-09 review, finding #6): witness facts for
+            // chooses inline in call ARGUMENTS — the precondition
+            // theorem and everything after the call see them.
+            let mut obl_c = obl.clone();
+            for a in args.iter() {
+                obl_c = obl_with_choose_hyps(a.raw(), ctx, &obl_c);
+            }
             walk_call(
-                callee, spec_callee, args, typ_args, *dest, call_span, mut_args, after, ctx, obl, e,
+                callee, spec_callee, args, typ_args, *dest, call_span, mut_args, after, ctx, &obl_c, e,
             );
         }
         Wp::Loop { cond, invs, validated_invs, inv_kinds, decrease, modified_vars, body, after } => {
+            // B2b (finding #6): witness facts for chooses inline in the
+            // loop invariants / condition — entry, preservation, and
+            // after-loop obligations all see them.
+            let mut obl_c = obl.clone();
+            for iv in validated_invs.iter() {
+                obl_c = obl_with_choose_hyps(iv.raw(), ctx, &obl_c);
+            }
+            if let Some(c) = cond {
+                obl_c = obl_with_choose_hyps(c.raw(), ctx, &obl_c);
+            }
             walk_loop(
-                *cond, invs, validated_invs, inv_kinds, decrease, modified_vars, body, after, ctx, obl, e,
+                *cond, invs, validated_invs, inv_kinds, decrease, modified_vars, body, after, ctx, &obl_c, e,
             );
         }
         Wp::AssertByTactus { cond, tactic_text, body } => {
-            walk_assert_by_tactus(*cond, tactic_text, body, ctx, obl, e);
+            // B2b (finding #6): a choose inline in a raw-tactic assert's
+            // cond still gets its witness fact — the user tactic can
+            // then use it instead of hand-applying epsilon_spec.
+            let obl_c = match cond {
+                Some(c) => obl_with_choose_hyps(c.raw(), ctx, obl),
+                None => obl.clone(),
+            };
+            walk_assert_by_tactus(*cond, tactic_text, body, ctx, &obl_c, e);
         }
     }
 }
@@ -3091,6 +3199,29 @@ fn push_post_call_frames(
         ret_eq.as_ref().map(|q| (q.clause_idx, q.conjunct_idx)),
     );
     let eq_extraction: Option<(LExpr, Typ)> = ret_eq.map(|q| {
+        // B5b census (TACTUS_B5_CENSUS=1, behavior-neutral): `q.rhs.typ`
+        // is the CLAIM; where the rhs head is derivable (call → declared
+        // ret, var → substitution entry's recorded value typ) compare —
+        // the bug doc's relocation warning was exactly that this input
+        // is a claim with no typed render variant. The pin's original
+        // ill-typed artifact is fixed by the unified bridge; this census
+        // watches for residual lie shapes before any behavior change
+        // (DESIGN-B5-typed-spine-calls.md, B5b).
+        if crate::to_lean_sst_expr::b5_census_enabled() {
+            match vir_ret_eq_actual_typ(q.rhs, render_ctx) {
+                Some(derived) => eprintln!(
+                    "B5B-CENSUS {} callee={} claim={:?} derived={:?}",
+                    crate::to_lean_sst_expr::classify_typ_divergence(&q.rhs.typ, &derived),
+                    crate::to_lean_type::lean_name_relative(&callee.name.path),
+                    q.rhs.typ,
+                    derived,
+                ),
+                None => eprintln!(
+                    "B5B-CENSUS underivable callee={}",
+                    crate::to_lean_type::lean_name_relative(&callee.name.path),
+                ),
+            }
+        }
         (
             render_call_ensure_expr(q.rhs, subst, return_prophecy.as_ref(), callee, render_ctx),
             q.rhs.typ.clone(),
@@ -3422,6 +3553,40 @@ struct VirRetEq<'a> {
     /// E — the value side. TYPED: `rhs.typ` is the VIR typ the #128
     /// sort reconciliation needs.
     rhs: &'a Expr,
+}
+
+/// B5b: the derivable ACTUAL typ of a ret-eq rhs — B5a's rule on the
+/// VIR side, for the head shapes whose truth is constructible: calls
+/// report the callee's declared-instantiated ret typ (mirroring the
+/// DynamicResolved selection); vars report the substitution entry's
+/// recorded value typ (the caller-side actual). None = underivable.
+/// Census-only for now — flips into the eq_extraction input if the
+/// census ever shows a decor-only line here.
+fn vir_ret_eq_actual_typ(
+    expr: &Expr,
+    ctx: &crate::expr_shared::RenderCtx,
+) -> Option<Typ> {
+    use vir::ast::{CallTarget, CallTargetKind};
+    match &expr.x {
+        ExprX::Call(CallTarget::Fun(kind, fun, typs, _, _, _), _, _) => {
+            let (fun, typs) = match kind {
+                CallTargetKind::DynamicResolved { resolved, typs, .. } => (resolved, typs),
+                _ => (fun, typs),
+            };
+            ctx.fn_ret_typ(fun, &typs[..])
+        }
+        ExprX::Var(v) => {
+            let name = crate::lean_name::LeanName::from_var_ident(v);
+            ctx.value_subst.and_then(|m| m.get(&name)).map(|(_, t)| t.clone())
+        }
+        ExprX::Unary(vir::ast::UnaryOp::CoerceMode { .. }, inner)
+        | ExprX::Unary(vir::ast::UnaryOp::Trigger(_), inner)
+        | ExprX::UnaryOpr(vir::ast::UnaryOpr::Box(_), inner)
+        | ExprX::UnaryOpr(vir::ast::UnaryOpr::Unbox(_), inner) => {
+            vir_ret_eq_actual_typ(inner, ctx)
+        }
+        _ => None,
+    }
 }
 
 /// Single-walk ret-eq extraction (#128, P3 DESIGN-typed-renderer.md).
@@ -4079,6 +4244,16 @@ enum Wp<'a> {
     /// statement's `let <ret> := e; ensures`.
     Done(LExpr),
 
+    /// Terminal leaf with NO goal — the walker emits nothing. Used as
+    /// the `Wp::Scope` body terminator (F4 follow-up): the scope's own
+    /// `Assert` nodes carry its real obligations and there is no
+    /// flow-through goal, so a `Done(True)` leaf would only add one
+    /// trivially-true theorem per assert-by (~1,267 crate-wide) to
+    /// every Lean run. Scoped to Scope terminators ONLY — empty-ensures
+    /// fns keep their existing `Done(True)` theorem, so per-fn theorem
+    /// bookkeeping is unchanged elsewhere.
+    DoneEmpty,
+
     /// `let x := e; <body>`. If `e` contains a value-position
     /// `if c then a else b`, `walk_let` forks into two recursive
     /// walks (with cond as a Hyp frame) so omega sees a clean
@@ -4119,6 +4294,31 @@ enum Wp<'a> {
     /// `StmX::ClosureInner` in `build_wp`.
     ClosureBody {
         closure_params: Vec<(&'a VarIdent, &'a Typ)>,
+        body: Box<Wp<'a>>,
+        after: Box<Wp<'a>>,
+    },
+
+    /// Scoped proof block whose state effects are discarded —
+    /// `StmX::DeadEnd`, Verus's desugar of `assert(P) by { <verus
+    /// proof> }` / `assert forall … by { … }` (`vir/ast_to_sst.rs`
+    /// ~2270): `DeadEnd(Block([Assume(require), …proof…,
+    /// Assert(ensure)]))` followed by a separate
+    /// `Assume(∀ vars, require ⇒ ensure)` that re-introduces the
+    /// proven fact into the main flow — so this node needs no fact
+    /// plumbing of its own. The body's obligations are emitted under
+    /// the CURRENT context (outer lets/hyps stay visible inside the
+    /// proof body); `after` continues under the original obl
+    /// unchanged. Same discard shape as `ClosureBody` minus the param
+    /// binders — a dedicated variant keeps `ClosureBody`'s contract
+    /// closure-specific (F4, DESIGN-lean-all-proofs-followons.md).
+    Scope {
+        /// The `AssertByVar` skolems this block references — bound as
+        /// ∀-binders on the scope's theorems by the walker (minus any
+        /// already bound by an enclosing scope; nested assert-forall
+        /// proof bodies legally reference outer skolems, and rebinding
+        /// would shadow the hypothesis-carrying binder with a fresh
+        /// unconstrained one).
+        scope_vars: Vec<(&'a VarIdent, &'a Typ)>,
         body: Box<Wp<'a>>,
         after: Box<Wp<'a>>,
     },
@@ -4870,10 +5070,25 @@ fn build_wp<'a>(
         // `assert by(nonlinear_arith)` — dispatch on mode in the helper.
         StmX::AssertQuery { mode, typ_inv_exps: _, typ_inv_vars: _, body } =>
             build_wp_assert_query(mode, body, after, ctx, loop_stack),
-        StmX::DeadEnd(_) => Err(
-            "Verus's internal `DeadEnd` marker reached the SST — this shouldn't \
-             appear in user code. If you're seeing this, please open an issue.".to_string()
-        ),
+        // Scoped proof block, effects discarded — `assert(P) by { … }`
+        // / `assert forall … by { … }` in their Verus-proof-body form
+        // (the raw-Lean-tactic form is `AssertQuery` above). The
+        // block's own `Assert(ensure)` node carries the real
+        // obligation, so the inner terminator is a trivially-true
+        // leaf — there is no flow-through goal, and the enclosing
+        // flow re-acquires the proven fact via the `Assume` statement
+        // Verus emits AFTER the DeadEnd (part of `after`'s tree).
+        // Matches the `StmX::ClosureInner` construction below.
+        // `loop_stack`: EMPTY — break/continue can't legally cross an
+        // assert-by boundary (mode checker), so a leak becomes
+        // build_wp's existing clean error instead of silently jumping
+        // to an outer loop's leaf. (F4,
+        // DESIGN-lean-all-proofs-followons.md.)
+        StmX::DeadEnd(block) => {
+            let scope_vars = collect_assert_by_vars(block, ctx);
+            let body = build_wp(block, Wp::DoneEmpty, ctx, &LoopStack::Empty)?;
+            Ok(Wp::Scope { scope_vars, body: Box::new(body), after: Box::new(after) })
+        }
         StmX::OpenInvariant(_) => Err(
             "`open_atomic_invariant!` (atomic invariant opening) not yet supported \
              in tactus_auto fns — out of scope until Tactus's concurrency story \
@@ -4945,6 +5160,39 @@ fn build_wp<'a>(
 /// (#130 follow-up): either render bitwise ops via `Int.xor` etc.,
 /// or add `HXor Int Int Int` instances in TactusPrelude that
 /// delegate to the function form.
+/// Collect the `AssertByVar`-kind locals (assert-forall skolems) that
+/// `stm` references, in deterministic (name-sorted) order. Used by the
+/// `StmX::DeadEnd` arm: these vars have no `Wp::Let` (Verus declares
+/// them fn-wide, scoped syntactically to the assert-by block), so the
+/// scope's theorems must ∀-bind them explicitly. Read-only use of the
+/// map visitors — the `let _ =` discards the rebuilt trees (same idiom
+/// as the synthetic-assume scan above).
+fn collect_assert_by_vars<'a>(
+    stm: &Stm,
+    ctx: &WpCtx<'a>,
+) -> Vec<(&'a VarIdent, &'a Typ)> {
+    use vir::sst::ExpX as X;
+    let mut used: std::collections::HashSet<VarIdent> = std::collections::HashSet::new();
+    let _ = vir::sst_visitor::map_exps_in_stm_visitor(stm, &mut |e: &Exp| {
+        let _ = vir::sst_visitor::map_exp_visitor(e, &mut |inner: &Exp| {
+            match &inner.x {
+                X::Var(v) | X::VarLoc(v) | X::VarAt(v, _) => {
+                    used.insert(v.clone());
+                }
+                _ => {}
+            }
+            inner.clone()
+        });
+        e.clone()
+    });
+    let mut out: Vec<(&'a VarIdent, &'a Typ)> = ctx.assert_by_var_typs.iter()
+        .filter(|(v, _)| used.contains(**v))
+        .map(|(v, t)| (*v, *t))
+        .collect();
+    out.sort_by_key(|(v, _)| format!("{:?}", v));
+    out
+}
+
 fn build_wp_assert_bit_vector<'a>(
     requires: &[Exp],
     ensures: &[Exp],
