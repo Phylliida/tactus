@@ -280,7 +280,11 @@ path and pin with a test that a sorry FAILS via the gate instead).
 source map; `#tactus_check_axioms` failures name the closed form,
 which embeds the obligation theorem name → same Rust span.
 
-## M6.0 spec — accessor [Nonempty] residue (hygiene, small)
+## M6.0 spec — accessor [Nonempty] residue — DONE 2026-07-11 (was
+already substantively landed: accessors take [Nonempty] +
+Classical.ofNonempty; datatypes stay Inhabited PROVIDERS for getElem!;
+instNonemptyOfInhabited bridges. Remaining work was the stale ProofFn
+caveat comment, now lifted.)
 
 Swap generated accessor signatures from `[Inhabited V]` +
 `default` to `[Nonempty V]` + `Classical.ofNonempty` (accessors are
@@ -292,7 +296,7 @@ smaller premises, and the ProofFn-config caveat ("accessors for types
 with non-Inhabited fields break elaboration even when unused") lifts
 — which may let the config distinction itself collapse post-C.
 
-## M6.2 fold-ins (right-way housekeeping, deferred from the land)
+## M6.2 fold-ins — DONE 2026-07-11 (all three below)
 
 - Tracked-write for the Link module (stop rewriting identical bytes —
   today it invalidates downstream mtimes every run).
