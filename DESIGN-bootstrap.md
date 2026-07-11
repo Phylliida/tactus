@@ -537,3 +537,21 @@ x < 2^64`), not `Nat` — the TGoal sort story is Int-with-hyps on the exec side
 Nat on the spec side; and exec island files still over-include unrelated proof
 fns (the documented safe over-approximation) — bridge pairing must key on the
 fn's own obligations (O4's ids), never on file contents.
+
+## 11.2 W1.5/W1 pre-probes (P8, same day)
+
+- **P8 FOUND A REAL EMITTER BUG**: a recursive spec fn over an own Box-carrying
+  datatype (`bootstrap-fixture/w15_probe.rs`) emits `esize a` at type
+  `Tactus.Box PExpr` — the `.deref` is dropped on match-bound Box fields; the
+  island (`probe-w0/probe8_authoring_loop.lean` context) fails elaboration.
+  Never seen live because `--emit-lean` skips the Lean run. Exactly the W3
+  bug class, caught by a probe. Fix belongs with W1.5 (same rendering area).
+- **P8b (`probe8b_box_structural.lean`)**: the post-fix shape — recursion via
+  `Box.deref` projections — IS accepted by `termination_by structural` and
+  kernel-reduces (decide + rfl, zero axioms). W1.5 works for the real
+  mirror-type authoring idiom.
+- Scope pin for W1.5: `tri`-style `Int.toNat (n - 1)` recursion is NOT
+  structural — the feature applies to datatype-subterm recursion (+ the fix);
+  Nat-arith recursion keeps WF + simp-eq-lemma bridging.
+- W1 constraint: mirror types must use own cons-lists, never `Seq` fields
+  (opaque axiom type — no match, no reduction).
