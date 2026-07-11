@@ -412,6 +412,11 @@ every run, not trusted.
 - **O8:** does the W3 corpus run write divergences into the F-taxonomy doc
   (`DESIGN-lean-all-proofs-followons.md`) or a fresh `DESIGN-bridge-divergences.md`?
   (Bookkeeping, decide when the first one lands.)
+- **O9 (W1/W2, from P6):** tactus datatypes are non-indexed, so the tactus-authored
+  goal language is *extrinsically* typed — `refWp` outputs plain data; the hand-Lean
+  denotation layer sort-checks (partial `toProp : TGoal → Option Prop`, bridge
+  asserts `= some rendered`, or a total default-False form). Decide the partiality
+  convention with the first real telescope.
 
 ---
 
@@ -473,7 +478,25 @@ deliberately fails) standalone with no Mathlib.
   (-3)`). This validates the §4.3 authorship split: the denotation layer (returns
   `Prop`/`Type`) is hand-Lean; everything data-level stays tactus-authored.
 
+- **P6 (`probe6_real_goal.lean`) — a REAL emitted goal bridges.** The assert obligation
+  of tgt's `find_cancellation_exec` (island output preserved in `/tmp/fcx_scratch.lean`,
+  M6.1-era), goal copied **verbatim** — `Tactus.Ref` decoration with type ascription,
+  `view.View.view` instance dispatch (instance resolved by the elaborator on the
+  rendered side, carried as a plain function in `SymEnv` on the reference side —
+  defeq agrees), **`let tmp__1 := …` bindings inside the Prop** (zeta closes both
+  sides), `usize_hi`, the `0 ≤ len ∧ len < usize_hi` overflow guard, opaque axiom
+  types (`vec.Vec`, `seq.Seq`), and a WF-compiled recursive user spec fn
+  (`find_cancellation_from`) appearing as an opaque symbol — `rfl` closes the bridge
+  in 0.9s. Two corollaries: (a) **the P3 constraint scopes to tactus-core's own
+  defs only** — user spec fns in goals are named, never evaluated, so their WF
+  compilation is irrelevant to the bridge; (b) the probe's sort-indexed `TExpr`
+  worked well in hand-Lean, but **tactus datatypes are non-indexed** — the
+  tactus-authored `refWp` must output *extrinsically*-typed data with Lean-side
+  sort-checking in the denotation layer (new O9).
+
 Net: **no blockers; one real constraint (P3) with a confirmed small mitigation (P3c →
-W1.5); both bridge forms mechanically validated; cost in budget.** The remaining W0
-work is realism, not mechanics: one genuine emitted goal (casts, decorations, loop
-triple, `SymEnv` call) hand-bridged end to end.
+W1.5); both bridge forms mechanically validated on toy AND real goals; cost in
+budget.** Remaining W0 residue, now small: a loop init/maintain/use triple goal
+(same connective vocabulary + nested ∀, both probed separately — P4 has nested
+binders; compose them on a real loop fn), an `Int.ofNat` coercion site, and the
+general binder-telescope scheme (engineering, not risk).
