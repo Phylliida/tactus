@@ -3,6 +3,15 @@
 > **Progress ledger:** P0 DONE (`fb53eca`, unified bridge, 6 pins).
 > P1 DONE (SST typed spine; retired `sst_lean_wrap_count`,
 > `tuple_slot_extra_derefs`, `clip_to_node_checked`; D3 discovered).
+> P3 DONE (2026-07-10/11, branch b5-typed-spine-calls, DESIGN-B5-typed-
+> spine-calls.md): CALLS report actual — plain/recursive spec-fn calls in
+> exp_to_typed return the callee's declared-instantiated ret typ
+> (fn_ret_typ, fn_param_typs' result-side sibling); actual_is_trusted
+> trusts the same shapes via the shared plain_spec_call gate. Killed the
+> whole `Invalid field deref` family (55 crate-wide → 0). Class-dispatch
+> renders stay claim-annotated (correct-by-construction); eq_extraction's
+> claim input is census-watched (B5B-CENSUS), not flipped — zero lies
+> observed in the wild.
 > P2 DONE (WP let-binder typ env on OblCtx, walk_let/chain/if-cond +
 > four walk-time render sites carry it; tuple-ctor slot coercion;
 > pin `test_exec_let_bound_tuple_projection`). P3 SURVEY FINDING: the

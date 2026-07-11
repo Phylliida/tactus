@@ -3199,6 +3199,29 @@ fn push_post_call_frames(
         ret_eq.as_ref().map(|q| (q.clause_idx, q.conjunct_idx)),
     );
     let eq_extraction: Option<(LExpr, Typ)> = ret_eq.map(|q| {
+        // B5b census (TACTUS_B5_CENSUS=1, behavior-neutral): `q.rhs.typ`
+        // is the CLAIM; where the rhs head is derivable (call → declared
+        // ret, var → substitution entry's recorded value typ) compare —
+        // the bug doc's relocation warning was exactly that this input
+        // is a claim with no typed render variant. The pin's original
+        // ill-typed artifact is fixed by the unified bridge; this census
+        // watches for residual lie shapes before any behavior change
+        // (DESIGN-B5-typed-spine-calls.md, B5b).
+        if crate::to_lean_sst_expr::b5_census_enabled() {
+            match vir_ret_eq_actual_typ(q.rhs, render_ctx) {
+                Some(derived) => eprintln!(
+                    "B5B-CENSUS {} callee={} claim={:?} derived={:?}",
+                    crate::to_lean_sst_expr::classify_typ_divergence(&q.rhs.typ, &derived),
+                    crate::to_lean_type::lean_name_relative(&callee.name.path),
+                    q.rhs.typ,
+                    derived,
+                ),
+                None => eprintln!(
+                    "B5B-CENSUS underivable callee={}",
+                    crate::to_lean_type::lean_name_relative(&callee.name.path),
+                ),
+            }
+        }
         (
             render_call_ensure_expr(q.rhs, subst, return_prophecy.as_ref(), callee, render_ctx),
             q.rhs.typ.clone(),
@@ -3530,6 +3553,40 @@ struct VirRetEq<'a> {
     /// E — the value side. TYPED: `rhs.typ` is the VIR typ the #128
     /// sort reconciliation needs.
     rhs: &'a Expr,
+}
+
+/// B5b: the derivable ACTUAL typ of a ret-eq rhs — B5a's rule on the
+/// VIR side, for the head shapes whose truth is constructible: calls
+/// report the callee's declared-instantiated ret typ (mirroring the
+/// DynamicResolved selection); vars report the substitution entry's
+/// recorded value typ (the caller-side actual). None = underivable.
+/// Census-only for now — flips into the eq_extraction input if the
+/// census ever shows a decor-only line here.
+fn vir_ret_eq_actual_typ(
+    expr: &Expr,
+    ctx: &crate::expr_shared::RenderCtx,
+) -> Option<Typ> {
+    use vir::ast::{CallTarget, CallTargetKind};
+    match &expr.x {
+        ExprX::Call(CallTarget::Fun(kind, fun, typs, _, _, _), _, _) => {
+            let (fun, typs) = match kind {
+                CallTargetKind::DynamicResolved { resolved, typs, .. } => (resolved, typs),
+                _ => (fun, typs),
+            };
+            ctx.fn_ret_typ(fun, &typs[..])
+        }
+        ExprX::Var(v) => {
+            let name = crate::lean_name::LeanName::from_var_ident(v);
+            ctx.value_subst.and_then(|m| m.get(&name)).map(|(_, t)| t.clone())
+        }
+        ExprX::Unary(vir::ast::UnaryOp::CoerceMode { .. }, inner)
+        | ExprX::Unary(vir::ast::UnaryOp::Trigger(_), inner)
+        | ExprX::UnaryOpr(vir::ast::UnaryOpr::Box(_), inner)
+        | ExprX::UnaryOpr(vir::ast::UnaryOpr::Unbox(_), inner) => {
+            vir_ret_eq_actual_typ(inner, ctx)
+        }
+        _ => None,
+    }
 }
 
 /// Single-walk ret-eq extraction (#128, P3 DESIGN-typed-renderer.md).

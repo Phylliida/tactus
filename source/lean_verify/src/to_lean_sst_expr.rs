@@ -562,6 +562,16 @@ fn actual_is_trusted(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> bool {
                 || ctx.let_binder(&lean_name).is_some_and(|(_, trusted)| *trusted)
                 || ctx.lookup_subst(&lean_name, &e.typ).is_some()
         }
+        // Plain/recursive spec-fn calls (B5a): the migrated Call path
+        // reports the declared-instantiated ret typ — ground truth by
+        // construction — so Box/Unbox must NOT reset it to a claim
+        // (poly wraps inlined receivers in Box/Unbox; without this,
+        // the reset silently undoes the Call migration in exactly the
+        // failing shapes). `plain_spec_call` is the same gate the
+        // render path uses; class-dispatch/internal calls fall out as
+        // None → untrusted (claim-typed), matching their render.
+        ExpX::Call(..) => plain_spec_call(e, ctx)
+            .is_some_and(|(fun, _)| ctx.fn_map.is_some_and(|m| m.contains_key(fun))),
         ExpX::Unary(UnaryOp::CoerceMode { .. }, inner)
         | ExpX::Unary(UnaryOp::Trigger(_), inner)
         | ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner)
@@ -600,11 +610,110 @@ fn actual_is_trusted(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> bool {
 /// * Field/IsVariant — deref count from the base's ACTUAL typ; tuple
 ///   projections report the slot typ as actual (replaces
 ///   `tuple_slot_extra_derefs`).
+/// Cached TACTUS_B5_CENSUS flag — `env::var_os` scans the process
+/// environment linearly, and the census hook sits on the hottest
+/// render path (every plain call node); pay the lookup once.
+pub(crate) fn b5_census_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("TACTUS_B5_CENSUS").is_some())
+}
+
+/// The call shapes the typed spine treats as PLAIN spec-fn calls
+/// (B5a): `Fun(_, None)` that is NOT a trait method (trait methods
+/// render via class dispatch, which type-ANNOTATES the result at the
+/// claim) and `Recursive`. Single source of truth for the exp_to_typed
+/// arm and actual_is_trusted — and the one edit site if CallLambda or
+/// the class-dispatch shapes ever earn their way in (census first).
+fn plain_spec_call<'a>(
+    e: &'a Exp,
+    ctx: &crate::expr_shared::RenderCtx,
+) -> Option<(&'a vir::ast::Fun, &'a [Typ])> {
+    match &e.x {
+        ExpX::Call(CallFun::Fun(fun, None), typs, _)
+            if !fun_is_trait_method(fun, ctx) =>
+        {
+            Some((fun, &typs[..]))
+        }
+        ExpX::Call(CallFun::Recursive(fun), typs, _) => Some((fun, &typs[..])),
+        _ => None,
+    }
+}
+
+/// B5a census (TACTUS_B5_CENSUS=1): classify how a plain call's SST
+/// claimed typ relates to the callee's declared-instantiated ret typ.
+/// Behavior-neutral telemetry; drives (and validates) the Call-arm
+/// migration per DESIGN-B5-typed-spine-calls.md §3.6.
+fn b5_census(
+    fun: &vir::ast::Fun,
+    typs: &[Typ],
+    claim: &Typ,
+    ctx: &crate::expr_shared::RenderCtx,
+) {
+    if !b5_census_enabled() {
+        return;
+    }
+    let Some(declared) = ctx.fn_ret_typ(fun, typs) else {
+        eprintln!("B5-CENSUS no-fnmap {}", crate::to_lean_type::lean_name_relative(&fun.path));
+        return;
+    };
+    let class = classify_typ_divergence(claim, &declared);
+    eprintln!(
+        "B5-CENSUS {} {} claim={:?} declared={:?}",
+        class,
+        crate::to_lean_type::lean_name_relative(&fun.path),
+        claim,
+        declared,
+    );
+}
+
+/// Shared claim-vs-derived classifier for the B5 census probes
+/// (TACTUS_B5_CENSUS): how does a claimed typ relate to the derived
+/// ground-truth typ? "decor-only" is the B5 lie class; "OTHER" is the
+/// class that would send a fix back to the drawing board.
+pub(crate) fn classify_typ_divergence(claim: &Typ, derived: &Typ) -> &'static str {
+    use crate::expr_shared::count_ref_decorations;
+    if vir::ast_util::types_equal(derived, claim) {
+        "equal"
+    } else if vir::ast_util::types_equal(
+        &crate::to_lean_type::peel_typ_wrappers(derived).clone(),
+        &crate::to_lean_type::peel_typ_wrappers(claim).clone(),
+    ) {
+        if count_ref_decorations(derived) != count_ref_decorations(claim) {
+            "decor-only"
+        } else {
+            "boxing-only"
+        }
+    } else {
+        "OTHER"
+    }
+}
+
 pub(crate) fn exp_to_typed(
     e: &Exp,
     ctx: &crate::expr_shared::RenderCtx,
 ) -> Result<crate::typed_expr::TypedExpr, String> {
     use crate::typed_expr::TypedExpr;
+    // Plain spec-fn calls (B5a, DESIGN-B5-typed-spine-calls.md): a
+    // rendered application's Lean type is the callee's DECLARED return
+    // typ (instantiated) by construction — the emitted def's return
+    // type is typ_to_expr of exactly that — so that is the actual
+    // reported here. The SST claim can lie by a ref-decoration when
+    // the call sits in an inlined `&self` receiver position
+    // (sst_elaborate splices the receiver arg with its call-site
+    // claim, which poly.rs needs — the lie is Lean-perspective-only).
+    // Same rule the ARGS already follow (bridged to declared param
+    // typs). Callee absent from fn_map → claim (status quo).
+    // Handled before the match: no other arm matches ExpX::Call, and
+    // `plain_spec_call` is the shared gate with actual_is_trusted.
+    if let Some((fun, typs)) = plain_spec_call(e, ctx) {
+        b5_census(fun, typs, &e.typ, ctx);
+        let actual = ctx.fn_ret_typ(fun, typs).unwrap_or_else(|| e.typ.clone());
+        return Ok(TypedExpr::from_untyped(
+            LExpr::new(exp_to_node_checked(e, ctx)?),
+            actual,
+        ));
+    }
     Ok(match &e.x {
         ExpX::Var(ident) | ExpX::VarLoc(ident) | ExpX::VarAt(ident, _) => {
             // Render-time substitution: if ctx has a value_subst map
