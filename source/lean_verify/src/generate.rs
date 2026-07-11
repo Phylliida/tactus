@@ -522,7 +522,12 @@ pub(crate) enum DefsSeg {
     /// A trait instance: the spec fns it needs emitted first — these
     /// get pulled into Base (transitively) so instances can stay there.
     Instance { prereq_fns: Vec<Fun> },
-    ProofClasses,
+    /// Proof-method trait class decls: consumed by INSTANCES (which
+    /// live in Base), so they route to Base too — and like instances,
+    /// the spec fns their method signatures reference must be pulled
+    /// into Base first (M6.5 finding: umbrella routing broke every
+    /// crate whose ladder reached a proof-trait impl).
+    ProofClasses { prereq_fns: Vec<Fun> },
     BcAxiom,
 }
 
@@ -1100,6 +1105,27 @@ pub(crate) fn spec_world_cmds_tagged(
             to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, subst, &ne_bounds, ectx)
         ));
     };
+    // Spec fns the proof-class method SIGNATURES reference (requires/
+    // ensures exprs of TraitMethodDecl fns of qualifying traits) — the
+    // Base pull for ProofClasses segs, mirroring Instance prereqs.
+    let proof_class_prereq_fns: Vec<Fun> = {
+        let qualifying: std::collections::HashSet<&vir::ast::Path> = krate.traits.iter()
+            .filter(|tr| trait_has_proof_method(&tr.x) && should_emit_class(&tr.x))
+            .map(|tr| &tr.x.name)
+            .collect();
+        let mut refs: Vec<&Fun> = Vec::new();
+        for f in krate.functions.iter().map(|f| &f.x) {
+            if let FunctionKind::TraitMethodDecl { trait_path, .. } = &f.kind {
+                if qualifying.contains(trait_path) {
+                    for e in f.require.iter().chain(f.ensure.0.iter()) {
+                        dep_order::collect_fun_refs(e, &mut refs);
+                    }
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        refs.into_iter().filter(|f| seen.insert((*f).clone())).cloned().collect()
+    };
     // Classes WITH proof-fn methods: their Prop-typed fields reference
     // spec fns, and proof-trait instances reference them — so they sit at
     // the spec-fn/instance boundary (after the last spec-fn group).
@@ -1254,7 +1280,9 @@ pub(crate) fn spec_world_cmds_tagged(
 
     // No spec-fn groups at all: proof classes have nothing to wait on.
     if last_group_pos.is_none() {
-        segs.push((cmds.len(), DefsSeg::ProofClasses));
+        segs.push((cmds.len(), DefsSeg::ProofClasses {
+            prereq_fns: proof_class_prereq_fns.clone(),
+        }));
         push_lenient(&mut cmds, "proof-method trait classes", &mut || {
             let mut tmp = Vec::new();
             emit_proof_classes(&mut tmp);
@@ -1430,7 +1458,9 @@ pub(crate) fn spec_world_cmds_tagged(
             }
         }
         if Some(pos) == last_group_pos {
-            segs.push((cmds.len(), DefsSeg::ProofClasses));
+            segs.push((cmds.len(), DefsSeg::ProofClasses {
+                prereq_fns: proof_class_prereq_fns.clone(),
+            }));
             push_lenient(&mut cmds, "proof-method trait classes", &mut || {
                 let mut tmp = Vec::new();
                 emit_proof_classes(&mut tmp);
@@ -2403,16 +2433,10 @@ fn check_proof_fn_via_package(
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> Option<CheckResult> {
     install_emit_tables(krate, crate_name);
-    let defs = match unified_package_defs(krate, crate_name, tactic_bodies) {
-        Some(d) => d,
-        None => {
-            eprintln!(
-                "tactus: package-check: shared defs unavailable; island check for `{}`",
-                short_name(&proof_fn.name.path)
-            );
-            return None;
-        }
-    };
+    // Silent fallback: tiny crates below the defs gate (and defs build
+    // failures, which `guard_build` already reported loudly) verify via
+    // islands exactly as pre-M6.5; the crate-end gate note summarizes.
+    let defs = unified_package_defs(krate, crate_name, tactic_bodies)?;
     let prelude_dir = match crate::prelude::ensure_prelude_olean() {
         Ok(d) => d,
         Err(e) => return Some(CheckResult::Error(e)),
@@ -3801,13 +3825,9 @@ fn check_exec_fn_via_package(
         krate, crate_name, tactic_bodies, true, crate::crate_defs::ScopeKind::Exec,
     ) {
         Some(d) if d.covers_exec => d,
-        _ => {
-            eprintln!(
-                "tactus: package-check: exec defs unavailable; island check for `{}`",
-                short_name(&vir_fn.name.path)
-            );
-            return None;
-        }
+        // Silent fallback (see check_proof_fn_via_package): below-gate
+        // crates and failed ladders verify via islands, as pre-M6.5.
+        _ => return None,
     };
     let prelude_dir = match crate::prelude::ensure_prelude_olean() {
         Ok(d) => d,

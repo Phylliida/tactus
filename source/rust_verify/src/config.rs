@@ -358,6 +358,17 @@ pub fn parse_args_with_imports(
     const OPT_TACTUS_CRATE_DEFS: &str = "tactus-crate-defs";
     const OPT_TACTUS_EMIT_MODULE: &str = "tactus-emit-module";
     const OPT_TACTUS_PACKAGE_CHECK: &str = "tactus-package-check";
+    const OPT_TACTUS_ISLANDS: &str = "tactus-islands";
+
+    /// M6.5 default flip: package-check is the default under
+    /// --lean-backend (islands remain the automatic per-fn fallback);
+    /// --tactus-islands opts out; the old --tactus-package-check flag
+    /// still forces it on (and wins over --tactus-islands).
+    fn tactus_package_check_resolved(matches: &getopts::Matches) -> bool {
+        matches.opt_present(OPT_TACTUS_PACKAGE_CHECK)
+            || (matches.opt_present(OPT_LEAN_BACKEND)
+                && !matches.opt_present(OPT_TACTUS_ISLANDS))
+    }
     const OPT_LEAN_BACKEND: &str = "lean-backend";
     const OPT_LEAN_ALL_PROOFS: &str = "lean-all-proofs";
     const OPT_TIME: &str = "time";
@@ -544,7 +555,12 @@ pub fn parse_args_with_imports(
     opts.optflag(
         "",
         OPT_TACTUS_PACKAGE_CHECK,
-        "Tactus: verify tactic proof fns via their package modules instead of islands (DESIGN-emit-module.md M5); implies --tactus-crate-defs",
+        "Tactus: verify via package modules (the default under --lean-backend since M6.5; this flag forces it on even with --tactus-islands)",
+    );
+    opts.optflag(
+        "",
+        OPT_TACTUS_ISLANDS,
+        "Tactus: verify via standalone island files instead of package modules (the pre-M6.5 default; islands also remain the automatic per-fn fallback in package mode)",
     );
     opts.optflag(
         "",
@@ -774,9 +790,9 @@ pub fn parse_args_with_imports(
         emit_lean: matches.opt_present(OPT_EMIT_LEAN),
         tactus_crate_defs: matches.opt_present(OPT_TACTUS_CRATE_DEFS)
             || matches.opt_present(OPT_TACTUS_EMIT_MODULE)
-            || matches.opt_present(OPT_TACTUS_PACKAGE_CHECK),
+            || tactus_package_check_resolved(&matches),
         tactus_emit_module: matches.opt_present(OPT_TACTUS_EMIT_MODULE),
-        tactus_package_check: matches.opt_present(OPT_TACTUS_PACKAGE_CHECK),
+        tactus_package_check: tactus_package_check_resolved(&matches),
         lean_backend: matches.opt_present(OPT_LEAN_BACKEND),
         lean_all_proofs: matches.opt_present(OPT_LEAN_ALL_PROOFS),
         time: matches.opt_present(OPT_TIME) || matches.opt_present(OPT_TIME_EXPANDED),

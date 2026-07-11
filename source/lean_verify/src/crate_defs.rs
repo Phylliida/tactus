@@ -504,7 +504,7 @@ fn plan_partition(
     let mut base_groups: HashSet<usize> = HashSet::new();
     let mut work: Vec<&Fun> = Vec::new();
     for (_, tag) in &ranges {
-        if let DefsSeg::Instance { prereq_fns } = tag {
+        if let DefsSeg::Instance { prereq_fns } | DefsSeg::ProofClasses { prereq_fns } = tag {
             work.extend(prereq_fns.iter());
         }
     }
@@ -582,8 +582,9 @@ fn plan_partition(
     let mut umbrella: Vec<usize> = Vec::new();
     for (range, tag) in &ranges {
         match tag {
-            DefsSeg::Base | DefsSeg::Instance { .. } => base.extend(range.clone()),
-            DefsSeg::ProofClasses | DefsSeg::BcAxiom => umbrella.extend(range.clone()),
+            DefsSeg::Base | DefsSeg::Instance { .. }
+            | DefsSeg::ProofClasses { .. } => base.extend(range.clone()),
+            DefsSeg::BcAxiom => umbrella.extend(range.clone()),
             DefsSeg::FnGroup { fns, .. } => {
                 let gid = fns.first().and_then(|f| fn_group.get(f)).copied();
                 if gid.map(|g| base_groups.contains(&g)).unwrap_or(true) {
