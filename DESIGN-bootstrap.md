@@ -5,6 +5,8 @@
 real constraint found (WF-compiled spec fns don't kernel-reduce) with a confirmed mitigation
 **Branch:** all bootstrap work lives on `bootstrap` (worktree `tactus-bootstrap/`), keeping
 main clear for the in-flight F6/B5 arcs
+**Orientation:** `VERIFICATION-PATH.md` is the top-level map (end-state
+claim, claim ladder, permanent residue, failure modes) — read it first.
 **Supersedes:** the ladder framing scattered across session notes. Component docs remain
 authoritative for their components: `DESIGN-axiom-closure-check.md` (R0b),
 `DESIGN-lean-all-proofs.md` + followons (R0a), `DESIGN-emit-module.md` /
