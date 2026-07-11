@@ -74,14 +74,13 @@ test_verify_one_file! {
             }
         }
 
-        // NOTE: constructing `Expr::Add(Box::new(..), ..)` in spec
-        // position hits a SEPARATE latent bug (Box::new erasure at
-        // ctor-arg slots misses the `.mk` wrap — the ctor-position
-        // sibling of the RC4 call-arg bridge; DESIGN-bootstrap.md
-        // §11.2). Lit-only still discriminates: a WF-compiled esize
-        // is kernel-inert even on `Expr::Lit`.
-        proof fn esize_lit_computes()
-            ensures esize(Expr::Lit(3)) == 1
+        // Compound pin: the Box::new-erasure ctor coercion (the arg
+        // renders `Tactus.Box.mk (Expr.Lit 3)` against the declared
+        // slot) AND structural emission AND kernel computation — the
+        // `decide` closer reduces esize through the Box literal, which
+        // requires all three.
+        proof fn esize_add_computes()
+            ensures esize(Expr::Add(Box::new(Expr::Lit(3)), Box::new(Expr::Lit(4)))) == 2
         by {
             decide
         }

@@ -657,15 +657,23 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
         }
 
         ExprX::Ctor(dt, variant, fields, update) => {
+            // Declared-slot coercion needs the instantiation: the ctor's
+            // typ args live on expr.typ (strip decorations first — a
+            // ctor in reference position can be stamped decorated).
+            let typ_args: Vec<Typ> =
+                match &*strip_all_ref_decorations(&expr.typ) {
+                    TypX::Datatype(_, targs, _) => targs.iter().cloned().collect(),
+                    _ => Vec::new(),
+                };
             if let Some(tail) = update {
                 ExprNode::StructUpdate {
                     base: Box::new(place_to_expr(&tail.place.x, ctx)),
                     updates: fields.iter().map(|f|
-                        (sanitize(&f.name), expr_to_ast(&f.a, ctx))
+                        (sanitize(&f.name), coerce_ctor_field(dt, variant, f, &typ_args, expr_to_ast(&f.a, ctx)))
                     ).collect(),
                 }
             } else {
-                ctor_to_node(dt, variant, fields, ctx)
+                ctor_to_node(dt, variant, fields, &typ_args, ctx)
             }
         }
 
@@ -1044,9 +1052,40 @@ fn trait_method_ref(fun: &Fun) -> LExpr {
 }
 
 
-fn ctor_to_node(dt: &Dt, variant: &Ident, fields: &Binders<Expr>, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
-    let rendered = fields.iter().map(|f| expr_to_ast(&f.a, ctx)).collect();
+fn ctor_to_node(
+    dt: &Dt,
+    variant: &Ident,
+    fields: &Binders<Expr>,
+    typ_args: &[Typ],
+    ctx: &crate::expr_shared::RenderCtx,
+) -> ExprNode {
+    let rendered = fields
+        .iter()
+        .map(|f| coerce_ctor_field(dt, variant, f, typ_args, expr_to_ast(&f.a, ctx)))
+        .collect();
     ctor_node(dt, variant, rendered)
+}
+
+/// Bridge a rendered ctor argument to its DECLARED slot typ. Verus
+/// erases `Box::new`/`Rc::new` at ctor argument positions in spec mode
+/// (the arg is stamped bare while the slot is `Decorate(Box, …)`), so
+/// without this the emitted term applies e.g. `Expr.Add (Expr.Lit 3)`
+/// where `Tactus.Box Expr` is expected. `coerce_lexpr` is wrapper-only
+/// (`.mk` wraps / `.deref` peels), identity when the typs agree — the
+/// exact RC4 call-arg-bridge shape, at ctor sites. Unknown datatypes
+/// (no table entry) skip coercion, preserving today's rendering.
+fn coerce_ctor_field(
+    dt: &Dt,
+    variant: &Ident,
+    f: &vir::ast::Binder<Expr>,
+    typ_args: &[Typ],
+    rendered: LExpr,
+) -> LExpr {
+    let Dt::Path(path) = dt else { return rendered };
+    match crate::expr_shared::ctor_field_typ(path, variant.as_str(), f.name.as_str(), typ_args) {
+        Some(declared) => crate::expr_shared::coerce_lexpr(rendered, &f.a.typ, &declared),
+        None => rendered,
+    }
 }
 
 /// Fold a VIR `Block` into nested Lean lets.
