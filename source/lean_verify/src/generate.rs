@@ -3584,6 +3584,7 @@ fn build_link_module(
                 ret_ty: LExpr::var_lit(&format!("{}_stmt", thm_name)),
                 body: closed_body,
                 termination_by: Vec::new(),
+                termination_structural: false,
                 decreasing_by: None,
             }));
             cmds.push(Command::Raw(format!(
