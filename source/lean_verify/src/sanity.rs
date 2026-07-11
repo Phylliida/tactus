@@ -55,19 +55,12 @@ pub fn check_references(cmds: &[Command]) -> Vec<Violation> {
     violations
 }
 
-/// Insert a declared name into `defined` — and, for root-anchored names
-/// (`_root_.{ns}.rel`), ALSO the relative form (`rel`): a recursive decl's
-/// SELF-reference renders relatively (see `to_lean_type::CURRENT_DECL_SELF`),
-/// so a crate-root recursive fn's bare self-call must resolve against the
-/// anchored decl name (2026-07-09 review, finding #9 — debug builds
-/// rejected crate-root self-recursion the emitted Lean accepts).
+/// Insert a declared name into `defined`. Under Option B naming
+/// (no namespace wrapper, full dotted names everywhere) declarations
+/// and references use the same literal form, so no de-anchoring is
+/// needed (the former `_root_.`-strip died with the anchor).
 fn insert_defined(defined: &mut HashSet<String>, name: &str) {
     defined.insert(name.to_string());
-    if let Some(rest) = name.strip_prefix("_root_.") {
-        if let Some((_ns, rel)) = rest.split_once('.') {
-            defined.insert(rel.to_string());
-        }
-    }
 }
 
 /// Preventive check (DESIGN-lean-all-proofs-followons.md, "Preventive
@@ -123,7 +116,7 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
         // body against that name + params.
         Command::Def(d) => {
             insert_defined(defined, &d.name);
-            let mut scope = scope_from_binders(&d.binders);
+            let mut scope = scope_from_binders_checked(&d.binders, &d.name, violations);
             check_expr(&d.ret_ty, defined, &mut scope, violations, &d.name);
             check_expr(&d.body, defined, &mut scope, violations, &d.name);
             check_no_anchored_self_ref(&d.body, &d.name, violations);
@@ -139,7 +132,7 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
         // plus each equation's pattern-bound names.
         Command::DefCurried(d) => {
             insert_defined(defined, &d.name);
-            let mut scope = scope_from_binders(&d.binders);
+            let mut scope = scope_from_binders_checked(&d.binders, &d.name, violations);
             for b in &d.binders {
                 check_expr(&b.ty, defined, &mut scope, violations, &d.name);
             }
@@ -156,7 +149,7 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
         // earlier top-level names; check them.
         Command::Axiom(a) => {
             insert_defined(defined, &a.name);
-            let mut scope = scope_from_binders(&a.binders);
+            let mut scope = scope_from_binders_checked(&a.binders, &a.name, violations);
             for b in &a.binders {
                 check_expr(&b.ty, defined, &mut scope, violations, &a.name);
             }
@@ -164,7 +157,7 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
         }
 
         Command::Theorem(t) => {
-            let mut scope = scope_from_binders(&t.binders);
+            let mut scope = scope_from_binders_checked(&t.binders, &t.name, violations);
             for b in &t.binders {
                 check_expr(&b.ty, defined, &mut scope, violations, &t.name);
             }
@@ -194,7 +187,7 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
             // Method type signatures + default bodies can reference
             // types and other class methods — check them under the
             // class's typ_params scope.
-            let mut scope = scope_from_binders(&c.typ_params);
+            let mut scope = scope_from_binders_checked(&c.typ_params, &c.name, violations);
             // Superclass `extends` parents are fully-applied class Apps.
             for p in &c.extends_parents { check_expr(p, defined, &mut scope, violations, &c.name); }
             // Methods can reference each other in defaults (standard
@@ -224,7 +217,7 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
         }
 
         Command::Instance(i) => {
-            let mut scope = scope_from_binders(&i.binders);
+            let mut scope = scope_from_binders_checked(&i.binders, "instance", violations);
             check_expr(&i.target, defined, &mut scope, violations, "instance");
             for m in &i.methods {
                 check_expr(&m.body, defined, &mut scope, violations, "instance");
@@ -254,6 +247,42 @@ fn visit(cmd: &Command, defined: &mut HashSet<String>, violations: &mut Vec<Viol
             for c in inner { visit(c, defined, violations); }
         }
     }
+}
+
+/// Option B's reserved-name rule: with no namespace wrapper, the ONLY
+/// name that could capture a crate-internal reference's leading segment
+/// (`lib.word.f`) is a binder named exactly the crate namespace. Verus
+/// code virtually never names a variable after its own crate; if it
+/// does, this violation surfaces at codegen (debug builds) instead of
+/// as a bizarre lake-time resolution error.
+fn check_reserved_binder(name: &str, context: &str, violations: &mut Vec<Violation>) {
+    if let Some(ns) = crate::to_lean_type::crate_ns() {
+        if name == ns {
+            violations.push(Violation {
+                context: context.to_string(),
+                name: format!(
+                    "{} (binder shadows the crate namespace — it would capture \
+                     every crate-internal reference; rename the variable)",
+                    name
+                ),
+            });
+        }
+    }
+}
+
+/// Top-level command binders also pass through the reserved-name rule
+/// — callers pass `violations`; `None` context skips (never used).
+fn scope_from_binders_checked(
+    binders: &[Binder],
+    context: &str,
+    violations: &mut Vec<Violation>,
+) -> HashSet<String> {
+    for b in binders {
+        if let Some(n) = &b.name {
+            check_reserved_binder(n.as_str(), context, violations);
+        }
+    }
+    scope_from_binders(binders)
 }
 
 fn scope_from_binders(binders: &[Binder]) -> HashSet<String> {
@@ -288,6 +317,7 @@ fn check_expr(
         // Binders introduce local scope.
         ExprNode::Let { name, value, body } => {
             check_expr(value, defined, scope, violations, context);
+            check_reserved_binder(name.as_str(), context, violations);
             let shadowed = !scope.insert(name.as_str().to_string());
             check_expr(body, defined, scope, violations, context);
             if !shadowed { scope.remove(name.as_str()); }
@@ -304,6 +334,7 @@ fn check_expr(
             for b in binders {
                 check_expr(&b.ty, defined, scope, violations, context);
                 if let Some(n) = &b.name {
+                    check_reserved_binder(n.as_str(), context, violations);
                     let s = n.as_str().to_string();
                     if scope.insert(s.clone()) { added.push(s); }
                 }
@@ -316,6 +347,7 @@ fn check_expr(
             check_expr(scrutinee, defined, scope, violations, context);
             for arm in arms {
                 let added = pattern_binds(&arm.pattern);
+                for n in &added { check_reserved_binder(n, context, violations); }
                 let pushed: Vec<String> = added.iter()
                     .filter(|n| scope.insert((*n).clone()))
                     .cloned()
@@ -329,6 +361,7 @@ fn check_expr(
             // `{ name : ty // pred }` — `ty` is in outer scope;
             // `pred` is in scope extended by `name`.
             check_expr(ty, defined, scope, violations, context);
+            check_reserved_binder(name.as_str(), context, violations);
             let n = name.as_str().to_string();
             let pushed = scope.insert(n.clone());
             check_expr(pred, defined, scope, violations, context);

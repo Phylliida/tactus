@@ -358,7 +358,9 @@ fn krate_preamble(
         }
     }
     let ns = sanitize(crate_name);
-    cmds.push(Command::NamespaceOpen(ns.clone()));
+    // Option B naming: no `namespace` wrapper — decls carry their full
+    // dotted names at root scope (see `lean_name`).
+    let _ = &ns;
     // Disable Lean's autoImplicit for the generated user-derived decls (spec
     // fns + datatypes + theorems). Guardrail: a free identifier in a theorem
     // signature is ALWAYS a codegen bug (Tactus emits explicit binders,
@@ -1192,23 +1194,18 @@ pub(crate) fn spec_world_cmds(
                             "tactus: skipped builtin-bodied mutual spec-fn group in shared defs (no Lean form for BuiltinSpecFun)");
                     } else {
                     push_lenient(&mut cmds, "mutual spec fns", &mut || {
-                        // `with_self_decls` over the WHOLE group: a mutual
-                        // member's reference to a sibling must render
-                        // relatively — inside the `mutual` block the
-                        // sibling is not yet a global constant (same rule
-                        // as a def's self-reference).
-                        let group_names: Vec<String> = fns.iter()
-                            .map(|f| crate::to_lean_type::lean_name_relative(&f.name.path))
+                        // Sibling references inside the `mutual` block
+                        // render as full dotted names like everything
+                        // else — Lean resolves mutual-group cross-refs
+                        // by declared name (Option B; the former
+                        // relative-rendering machinery is retired).
+                        let inner: Vec<Command> = fns.iter()
+                            .flat_map(|f| {
+                                let augmented = augment(f);
+                                to_lean_fn::spec_fn_to_ast(&augmented, ectx)
+                            })
                             .collect();
-                        crate::to_lean_type::with_self_decls(group_names, || {
-                            let inner: Vec<Command> = fns.iter()
-                                .flat_map(|f| {
-                                    let augmented = augment(f);
-                                    to_lean_fn::spec_fn_to_ast(&augmented, ectx)
-                                })
-                                .collect();
-                            vec![Command::Mutual(inner)]
-                        })
+                        vec![Command::Mutual(inner)]
                     });
                     }
                 }
@@ -1336,7 +1333,7 @@ fn seq_measure_companion_cmd(
     // conjunction goals split natively and lets zeta-reduce (validated
     // empirically on all three forms, Lean 4.25.0).
     Some(Command::Raw(format!(
-        "theorem {df}_len_lt (A : Type) [_root_.Nonempty A] (s : {seq_t} A)\n    \
+        "theorem {df}_len_lt (A : Type) [Nonempty A] (s : {seq_t} A)\n    \
          (h : ¬ {len} A s = 0) :\n    \
          {len} A ({df} A s) < {len} A s := by\n  \
          have hx := {ax_n} A s {j_arg} ({k_expr}) (by omega)\n  \
@@ -1360,10 +1357,7 @@ pub(crate) fn install_emit_tables(krate: &KrateX, crate_name: &str) {
     // `lean_name`, it must see the CURRENT crate's root-anchor, not a
     // stale one from a previous emission on this thread.
     crate::to_lean_type::install_crate_ns(crate_name);
-    // Belt to with_self_decls' drop-guard suspenders: a panicked-and-
-    // recovered render (push_lenient / guard_build) must never leak
-    // self-names into a fresh emission (2026-07-09 review, finding #3).
-    crate::to_lean_type::clear_self_decls();
+
     install_inherent_method_renames(krate);
     install_datatype_field_bounds(krate);
     // Decl set AFTER the rename table: it stores naturalized relative
@@ -1626,7 +1620,7 @@ pub fn emit_proof_fn(
     // proof_fn_to_ast is called outside the preamble.
     let ectx = crate::emit_ctx::EmitCtx::build(krate, tactic_bodies);
     cmds.push(Command::Theorem(to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body, &ectx)));
-    cmds.push(Command::NamespaceClose(ns));
+    let _ = ns;
 
     // Pretty-print and write the .lean file BEFORE the sanity check.
     // The artifact is always written when codegen produces a command
@@ -1859,7 +1853,7 @@ pub fn emit_exec_fn(
     for theorem in theorems {
         cmds.push(Command::Theorem(theorem));
     }
-    cmds.push(Command::NamespaceClose(ns));
+    let _ = ns;
 
     // Pretty-print and write the .lean file BEFORE the sanity check
     // so the artifact is always available for inspection — even when

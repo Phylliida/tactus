@@ -314,23 +314,19 @@ pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Vec<Com
             // `--lean-backend` lowering (replaces the old `nat_coercion`
             // pre-pass), so the rendered VIR is already Lean-typed.
             let binder_ctx = crate::to_lean_expr::binder_ctx_from_params(&f.params);
-            // `with_self_decl`: a recursive def's self-call must render
-            // relatively — root-anchoring a not-yet-elaborated global is
-            // `Unknown identifier` (see `to_lean_type::CURRENT_DECL_SELF`).
-            let self_rel = crate::to_lean_type::lean_name_relative(&f.name.path);
-            let (body, termination_by) = crate::to_lean_type::with_self_decl(self_rel, || {
-                let body = wrap_body_with_param_derefs(
-                    crate::to_lean_expr::vir_expr_to_ast_with_binders(b, &binder_ctx, &crate::expr_shared::RenderCtx::empty()),
-                    &f.params,
-                );
-                let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| {
-                    crate::expr_shared::wrap_int_measure(
-                        crate::to_lean_expr::vir_expr_to_ast_with_binders(d, &binder_ctx, &crate::expr_shared::RenderCtx::empty()),
-                        d,
-                    )
-                }).collect();
-                (body, termination_by)
-            });
+            // Self-calls render as the full dotted name (Option B —
+            // resolves fine mid-declaration at root scope, the
+            // `List.myLen` idiom; relative-rendering machinery retired).
+            let body = wrap_body_with_param_derefs(
+                crate::to_lean_expr::vir_expr_to_ast_with_binders(b, &binder_ctx, &crate::expr_shared::RenderCtx::empty()),
+                &f.params,
+            );
+            let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| {
+                crate::expr_shared::wrap_int_measure(
+                    crate::to_lean_expr::vir_expr_to_ast_with_binders(d, &binder_ctx, &crate::expr_shared::RenderCtx::empty()),
+                    d,
+                )
+            }).collect();
             // Recursive spec fns get an explicit `decreasing_by` so measures
             // Lean's default tactic can't discharge (notably the modular
             // `a % b < b` of Euclidean gcd) still verify. Non-recursive defs
@@ -703,22 +699,14 @@ pub fn datatype_group_to_cmds<'a>(
 
     // 3. mutual block of height fns. Each height fn reaches the
     //    others by name; the mutual scope makes those names visible.
-    //    `with_self_decls` over the WHOLE SCC: a sibling `.height`
+    //    full-name rendering over the WHOLE SCC: a sibling `.height`
     //    reference inside the mutual block must render relatively —
     //    the sibling is not yet a global constant, so a root-anchored
     //    `_root_.{ns}.Sibling.height` is `Unknown identifier` (same
     //    rule as mutual spec-fn groups; 2026-07-09 review, finding #1).
-    let group_names: Vec<String> = dts.iter()
-        .filter_map(|dt| match &dt.name {
-            Dt::Path(p) => Some(crate::to_lean_type::lean_name_relative(p)),
-            Dt::Tuple(_) => None,
-        })
+    let height_cmds: Vec<Command> = dts.iter()
+        .filter_map(|dt| datatype_height_cmd(dt, &scc_paths))
         .collect();
-    let height_cmds: Vec<Command> = crate::to_lean_type::with_self_decls(group_names, || {
-        dts.iter()
-            .filter_map(|dt| datatype_height_cmd(dt, &scc_paths))
-            .collect()
-    });
     if !height_cmds.is_empty() {
         cmds.push(Command::Mutual(height_cmds));
     }
@@ -829,17 +817,11 @@ fn datatype_decl_cmd(
 
     let cross_inst = has_cross_instantiation_recursion(dt, scc_paths);
 
-    // `with_self_decls` over the SCC: a recursive field type (`Push(…,
-    // Box<Stack>)`, or a mutual sibling) must render RELATIVE inside the
-    // declaration — during elaboration the inductive is not yet a global
-    // constant and a root-anchored `_root_.{ns}.Stack` is `Unknown
-    // identifier` (verified empirically; bare `Stack` and de-anchored
-    // `{ns}.Stack` both resolve). Same mechanism as the height defs and
-    // mutual spec fns; the decl HEAD stays root-anchored (computed above,
-    // outside the wrap), matching every other emitted decl.
-    let kind = crate::to_lean_type::with_self_decls(
-        scc_paths.iter().map(|p| crate::to_lean_type::lean_name_relative(p)),
-        || if is_single_variant_struct {
+    // Recursive/sibling field types render as full dotted names —
+    // resolves fine mid-declaration at root scope (Option B, verified
+    // empirically for single and mutual inductives; the former
+    // relative-rendering machinery is retired).
+    let kind = if is_single_variant_struct {
             let variant = &dt.variants[0];
             DatatypeKind::Structure {
                 fields: variant.fields.iter().map(|f| Field {
@@ -860,8 +842,7 @@ fn datatype_decl_cmd(
             } else {
                 DatatypeKind::Inductive { variants }
             }
-        },
-    );
+        };
 
     // Derive `Inhabited` automatically for parameter-style. Lean rejects
     // `deriving Inhabited` on indexed-style inductives, so we drop the
@@ -1083,19 +1064,10 @@ fn datatype_height_cmd(
         Dt::Path(p) => p,
         Dt::Tuple(_) => return None,
     };
-    // `with_self_decl`: a self-recursive datatype's height def calls
-    // `{Self}.height` in its own body — the self-name must render
-    // relatively (root-anchoring a not-yet-elaborated global is
-    // `Unknown identifier`; see `to_lean_type::CURRENT_DECL_SELF`).
-    // The def's declared name goes relative too — inside the file's
-    // namespace wrapper that declares the same full name.
-    crate::to_lean_type::with_self_decl(
-        crate::to_lean_type::lean_name_relative(p),
-        || {
-            let path = lean_name(p);
-            height_fn_for_datatype(dt, &path, scc_paths)
-        },
-    )
+    // The height def's self-calls render as the full dotted name —
+    // resolves fine mid-declaration at root scope (Option B).
+    let path = lean_name(p);
+    height_fn_for_datatype(dt, &path, scc_paths)
 }
 
 /// Emit `def T.height : T → Nat` alongside the datatype so that
