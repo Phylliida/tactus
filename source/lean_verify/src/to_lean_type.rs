@@ -371,6 +371,14 @@ pub(crate) fn install_crate_ns(crate_name: &str) {
     CRATE_NS.with(|n| *n.borrow_mut() = Some(sanitize(crate_name)));
 }
 
+/// The installed crate namespace, if any. Option B's ONE reserved name:
+/// a binder named exactly this could capture the leading segment of
+/// every crate-internal reference (`lib.word.f`), so the sanity
+/// checker rejects it (`check_reserved_binder`).
+pub(crate) fn crate_ns() -> Option<String> {
+    CRATE_NS.with(|n| n.borrow().clone())
+}
+
 thread_local! {
     /// Relative Lean names (`lean_name_relative` form) of every decl this
     /// crate's emission can produce — fns, datatypes, traits. Decides which
@@ -394,72 +402,6 @@ pub(crate) fn install_crate_decls(decls: std::sync::Arc<std::collections::HashSe
     CRATE_DECLS.with(|d| *d.borrow_mut() = Some(decls));
 }
 
-thread_local! {
-    /// Relative names of the decl group whose bodies are currently being
-    /// rendered. A recursive def's SELF-reference (and a `mutual` block
-    /// member's reference to its siblings) must render relatively: during
-    /// elaboration the decl is not yet a global constant, and `_root_.…`
-    /// forces global lookup — `Unknown identifier` (verified empirically).
-    /// Lean resolves the relative form through its local self-reference /
-    /// mutual-group mechanism. For datatype `.height` defs the set holds
-    /// the datatype's relative name (the `.height` suffix is appended
-    /// after `lean_name` returns). Residual risk, accepted: a local binder
-    /// shadowing a self-name's head segment inside its own recursive def —
-    /// vanishingly rare vs. the systematic breakage.
-    static CURRENT_DECL_SELF: std::cell::RefCell<std::collections::HashSet<String>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
-}
-
-/// Render `f` with `rel_names` ADDED to the current self-decl set (see
-/// `CURRENT_DECL_SELF`), restoring the previous set afterwards. Union
-/// scoping: `spec_fn_to_ast` pushes its own singleton inside the mutual
-/// group's wrapper — member bodies must still resolve their siblings.
-///
-/// Restore is a Drop guard: renders DO panic and ARE recovered
-/// (`push_lenient` / `guard_build` catch_unwind) — without the guard, a
-/// panic inside `f` would leak the names into the thread-local for the
-/// rest of the thread's life, making later same-thread renders emit
-/// those names relative and silently resurrecting the B1a capture bug.
-/// `clear_self_decls` in `install_emit_tables` is the belt to this
-/// suspenders.
-pub(crate) fn with_self_decls<T>(
-    rel_names: impl IntoIterator<Item = String>,
-    f: impl FnOnce() -> T,
-) -> T {
-    struct Restore {
-        added: Vec<String>,
-    }
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            CURRENT_DECL_SELF.with(|s| {
-                let mut set = s.borrow_mut();
-                for n in &self.added {
-                    set.remove(n);
-                }
-            });
-        }
-    }
-    let _restore = Restore {
-        added: CURRENT_DECL_SELF.with(|s| {
-            let mut set = s.borrow_mut();
-            rel_names.into_iter().filter(|n| set.insert(n.clone())).collect()
-        }),
-    };
-    f()
-}
-
-/// Reset the self-decl set. Called by `generate::install_emit_tables` at
-/// every emission entry point — a fresh emission must never inherit
-/// leaked self-names from a panicked-and-recovered render on this thread.
-pub(crate) fn clear_self_decls() {
-    CURRENT_DECL_SELF.with(|s| s.borrow_mut().clear());
-}
-
-/// Single-name convenience for `with_self_decls`.
-pub(crate) fn with_self_decl<T>(rel_name: String, f: impl FnOnce() -> T) -> T {
-    with_self_decls(std::iter::once(rel_name), f)
-}
-
 /// Convert a VIR path to a Lean dotted name, skipping the crate prefix.
 /// `crate::module::name` → `module.name`
 /// Names are sanitized (@ # → _) and keywords are escaped with «».
@@ -469,13 +411,19 @@ pub(crate) fn with_self_decl<T>(rel_name: String, f: impl FnOnce() -> T) -> T {
 /// `_root_.{ns}.module.name` (see `CRATE_NS`).
 pub(crate) fn lean_name(path: &Path) -> String {
     let name = lean_name_relative(path);
-    // Self-reference inside the decl group's own bodies: must stay
-    // relative (see CURRENT_DECL_SELF — root-anchoring a not-yet-defined
-    // global is `Unknown identifier`).
-    let is_self = CURRENT_DECL_SELF.with(|s| s.borrow().contains(name.as_str()));
-    if is_self {
-        return name;
-    }
+    // Option B naming (2026-07-11, Danielle): artifacts have NO
+    // `namespace` wrapper and every crate-internal global renders as its
+    // bare full path (`{ns}.module.name`) at root scope — one form,
+    // everywhere, no context sensitivity. The former `_root_.` anchor
+    // existed to defeat binder capture INSIDE `namespace {ns}`; with no
+    // namespace there is no relative resolution to capture (a binder
+    // `word` cannot capture `lib.word.f` — only a binder named exactly
+    // `{ns}` could, which the sanity checker's reserved-name rule
+    // rejects). Empirically validated at root scope (Lean 4.25):
+    // full-name SELF-references resolve fine mid-declaration for defs,
+    // inductives, and mutual groups — which retired the
+    // CURRENT_DECL_SELF machinery (`_root_.`-anchored self-refs were
+    // the thing that didn't resolve; bare full names do).
     CRATE_NS.with(|ns| match &*ns.borrow() {
         Some(ns) => {
             let in_crate = CRATE_DECLS.with(|d| match &*d.borrow() {
@@ -485,9 +433,9 @@ pub(crate) fn lean_name(path: &Path) -> String {
                 None => true,
             });
             if in_crate {
-                format!("_root_.{}.{}", ns, name)
+                format!("{}.{}", ns, name)
             } else {
-                format!("_root_.{}", name)
+                name
             }
         }
         None => name,
