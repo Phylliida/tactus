@@ -13570,3 +13570,25 @@ test_verify_one_file! {
         { v }
     } => Ok(())
 }
+
+// === S1 deterministic floor: arithmetic goals emit omega, not tactus_auto ===
+// The classifier (tactic_select) must select `omega` for in-fragment
+// obligations and leave out-of-fragment ones (Seq-dependent post-
+// condition) on the default closer — both within one fn. Verifies
+// end-to-end; the emitted-text shape is asserted by unit tests.
+test_verify_one_file! {
+    #[test] test_deterministic_floor_arith_obligations verus_code! {
+        use vstd::seq::*;
+
+        spec fn tail_len(s: Seq<int>) -> int { s.len() as int - 1 }
+
+        #[verifier::tactus_auto]
+        fn clamp(x: u8) -> (r: u8)
+            requires x < 200
+            ensures r <= 201, tail_len(Seq::<int>::empty()) == tail_len(Seq::<int>::empty())
+        {
+            let r = x + 1;  // overflow obligation: pure arithmetic → omega
+            r
+        }
+    } => Ok(())
+}

@@ -1707,9 +1707,26 @@ impl ObligationEmitter {
         requires_preamble: Vec<PreambleFragment>,
         extra_binders: Vec<LBinder>,
     ) {
-        let tactic = self.compose_tactic(closer);
         let mut binders = self.base_binders.clone();
         binders.extend(extra_binders);
+        // Deterministic floor (S1, tactic_select): when the DEFAULT
+        // closer would run and the goal (hypotheses included — they
+        // are binder types and wrapped implications) lies in the
+        // linear-arithmetic fragment, select `omega` /
+        // `tactus_peel <;> omega` directly. omega is complete for the
+        // fragment, so this can only replace a search with its
+        // certain answer — never lose a pass. User-supplied closers
+        // (`tactus_tactic`, bit_vector) are never overridden.
+        let closer = match &closer {
+            Tactic::Named(n) if n == "tactus_auto" => {
+                match crate::tactic_select::select_deterministic(&goal, &binders) {
+                    Some(sel) => Tactic::Raw(sel.tactic_text().to_string()),
+                    None => closer,
+                }
+            }
+            _ => closer,
+        };
+        let tactic = self.compose_tactic(closer);
         self.out.push(Theorem {
             name,
             binders,
