@@ -13397,10 +13397,10 @@ test_verify_one_file_with_options! {
     } => Ok(())
 }
 
-// M6.2 soundness pin: sorry is FATAL on the exec package path. Exec
-// closed forms do not join the Link composition until M6.3, so there
-// is no sorryAx backstop behind the route — the fn-level check itself
-// must reject, exactly as on the exec island path.
+// C-2/M6.3 soundness pin: exec obligations are Link-gated. A sorry in
+// an exec tactic text is a WARNING at fn level (proof-fn parity) and
+// the package gate's #tactus_check_axioms closure — which now contains
+// the exec closed forms — rejects it fatally.
 test_verify_one_file_with_options! {
     #[test] test_exec_package_check_sorry_fatal ["tactus-package-check"] => verus_code! {
         use vstd::prelude::*;
@@ -13427,9 +13427,12 @@ test_verify_one_file_with_options! {
             true
         }
     } => Err(err) => {
-        assert!(err.errors.iter().any(|d| d.message.contains("sorry is fatal")),
-            "sorry must be fatal on the exec package path (no Link gate yet); got: {:?}",
+        assert!(err.errors.iter().any(|d| d.message.contains("sorry")),
+            "the Link gate must reject sorryAx in the exec closure; got: {:?}",
             err.errors.iter().map(|d| &d.message).collect::<Vec<_>>());
+        assert!(err.warnings.iter().any(|d| d.message.contains("declaration uses 'sorry'")),
+            "the fn-level check must surface the sorry warning; got: {:?}",
+            err.warnings.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 }
 
