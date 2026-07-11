@@ -642,7 +642,12 @@ emit-module/package-check flags are the future default.
   pinning the covered `vir::sst` variant list (fails loudly when vir::sst
   grows — the manual-sync tripwire).
 
-- **N3 (medium-large): the serializer (`sst_serialize.rs`) — THE new TCB.**
+- **N3 (medium-large): the serializer — SPEC'D in `DESIGN-N3-serializer.md`
+  (2026-07-12): snapshot at `exec_fn_theorems_to_ast` inputs; faithfulness
+  contract table; leaf interning via production renderer (structure-only
+  stage-A claim, leaves cancel); goal-side via Wp provenance marks (N3b, the
+  one production touch); `--tactus-emit-cert`; acceptance incl. N5 smoke +
+  golden file + determinism. Sub-bricks N3a/b/c.**
   Rust, boring, 1:1, target <1k lines: from `build_wp`'s inputs (fn_sst body
   Stm tree + the WpCtx spec context: params/typs, requires, ensures,
   invariants, decrease) to Lean literals in the N2 vocabulary. Enumerate the
