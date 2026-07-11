@@ -1,7 +1,10 @@
 # Bootstrap: verifying tactus in tactus — master plan
 
-**Date:** 2026-07-11
-**Status:** proposed (consolidates + updates the R-ladder from 2026-07-09; details R2 for the first time)
+**Date:** 2026-07-11 (rev 2, same day: W0 pre-probes RUN — §11; bridge roles sharpened — §4.3)
+**Status:** proposed; five load-bearing mechanics empirically validated (`probe-w0/`), one
+real constraint found (WF-compiled spec fns don't kernel-reduce) with a confirmed mitigation
+**Branch:** all bootstrap work lives on `bootstrap` (worktree `tactus-bootstrap/`), keeping
+main clear for the in-flight F6/B5 arcs
 **Supersedes:** the ladder framing scattered across session notes. Component docs remain
 authoritative for their components: `DESIGN-axiom-closure-check.md` (R0b),
 `DESIGN-lean-all-proofs.md` + followons (R0a), `DESIGN-emit-module.md` /
@@ -227,11 +230,35 @@ example : f_goal_rendered = Tactus.refWpProp f_sst 0 := by rfl
   etc.); kernel cost scales with WP size; intrinsically-typed syntax or a
   type-checking denotation is real design work.
 
-**Decision by probe (W0):** if Bridge-R's `rfl` holds naturally on the toy and costs
-tolerably, prefer it for statements while keeping Bridge-D for the goal *list*
-structure. Expected outcome: Bridge-D everywhere first (it also IS the W3 differential
-gate, run in-kernel); Bridge-R adopted opportunistically per goal family; W8 flip makes
-the residual pp question moot.
+**Division of labor (sharpened after the §11 pre-probes; the two bridges are
+COMPLEMENTARY, not alternatives):**
+
+- **Bridge-D is the drift gate.** It is cheap, robust, and catches emitter bugs — but
+  it cannot carry the soundness chain alone, because connecting a *data* GoalAst to
+  the *Prop* the user actually proved requires a denotation, and a denotation of full
+  untyped `LExpr` syntax would be an elaborator-in-Lean (infeasible).
+- **The denotation is therefore load-bearing on the soundness path**, and it must be
+  over `refWp`'s own *typed* goal language, not over LExpr: `refWp : Sst → List TGoal`,
+  `TGoal.toProp : SymEnv → TGoal → Prop` where `SymEnv` carries the crate's actual
+  types and spec fns (a generated per-crate environment literal grounding fn symbols
+  in the emitted Defs). §11 P4/P5 validate that this denotation `rfl`-bridges to the
+  production-rendered Prop — through binders, environment lookups, opaque user-type
+  quantifiers, and named user spec fns.
+- **Authorship split, honestly:** `refWp` and `SstSem` (data → data) are tactus spec
+  fns. `toProp`/`SymEnv`/`interpTyp` return `Prop`/`Type` — outside tactus's spec
+  language — so the denotation layer is **hand-written Lean in tactus-core**: small,
+  audited-once, and *not trusted* (it is the statement of soundness; spec-adequacy
+  covers it, §8.5). The W5 soundness proof relates `refWp` to `SstSem` at the data/Val
+  level in tactus; a thin hand-Lean **adequacy spine** (structural induction over
+  `TGoal` relating the typed denotation to the Val-level one, with generated per-datatype
+  embedding lemmas) connects it to the user-facing Props. Staging: W5 v1 may state
+  soundness at the Val level only — already the full drift-detector — with the adequacy
+  spine as W5f.
+- Both bridges consume the same reference output: Bridge-D compares
+  `TGoal.render : TGoal → GoalAst` against the serialized production LExpr; Bridge-R
+  checks `rendered-stmt = toProp env g` by `rfl`. Run Bridge-D everywhere first (it IS
+  the W3 differential gate, in-kernel); adopt Bridge-R per goal family as W4 matures;
+  the W8 flip retires the residual pp trust.
 
 ### 4.4 Where the bridge lives
 
@@ -258,7 +285,8 @@ one.
 
 | Stage | Content | Validates / buys | Size |
 |---|---|---|---|
-| **W0** | **Hand-written Lean spike** (`probe-w0/`): mini-`Sst` (≤8 constructors: Let, If, Assert, Assume, Loop, Call, Return + an expr leaf), mini-`GoalAst`, mini-`refWp`; hand-serialize ONE real toy exec fn (the CRATEDEFS chain-crate style); write both bridges; measure kernel time; d1: does `decide`/`rfl` on data equality scale in the kernel? d2: does Bridge-R defeq survive `Int.toNat`/instance unfolding? d3: the `toProp`-connection lemma shape; d4: is emitted-spec-fn `refWp` computable in the kernel (no `Classical` in its body) or does it need `native_decide` (= `ofReduceBool` knob — avoid)? | the whole concept, zero tactus changes | small, days |
+| **W0** | **Hand-written Lean spike** (`probe-w0/`). **Pre-probes P1–P5 DONE — §11** (d1 ✓, d3 shape ✓, d4 ANSWERED: structural yes / WF no). Remaining W0: hand-serialize ONE real emitted island goal (not a toy) and bridge it — exercising `Int.toNat` materialization, `Tactus.Box.mk` decorations, a loop init/maintain/use triple, and a spec-fn call through `SymEnv`; measure a realistic per-fn bridge at real goal sizes; pick Bridge-D pairing granularity (per goal vs per fn). | the whole concept, zero tactus changes | small, days |
+| **W1.5** | **Emitter brick (prerequisite for W2, benefits everyone):** emit `termination_by structural x` when a recursive spec fn's decreases measure is a bare structurally-decreasing param (datatype or Nat) — §11 P3 shows plain `termination_by` (WF) makes emitted spec fns kernel-INERT (`decide`/`rfl` stuck, `unseal` no rescue), while `structural` restores full reduction with an EMPTY axiom closure (no `Tactus.heightLt`). Fallback ladder rung: keep WF emission when structural elaboration fails. Independent win outside R2: user goals over such spec fns become `decide`-closable. | refWp's Lean form actually computes; also a T1-automation win | small |
 | **W1** | **Mirror types + serializer.** `Tactus.Sst`/`GoalAst` inductives (Lean, generated-or-checked against a single Rust source of truth); Rust serializer `sst_serialize.rs` from `build_wp` input + from produced `LExpr`s. Boring, 1:1, no cleverness — **this is the new trusted code; target <1k lines, reviewed as TCB.** Subset = what tactus supports today (documented deferrals excluded, serializer *fails loudly* on anything else). | the data pipeline; corpus coverage numbers (what % of tgt/suite fns serialize) | medium |
 | **W2** | **Reference WP, stage A** — deep *statements*, opaque expression leaves (leaves carried as already-rendered `GoalAst` subtrees, same on both sides). Authored as tactus spec fns in `tactus-core`, lean-only-clean, emitted via crate-defs. Mirrors the `Wp` walk: Done/DoneEmpty/Let/LetRaw/ClosureBody/Scope, CtxFrame assembly, loop init/maintain/use with havoc sets, overflow/bounds obligation placement, decreases obligations. | the WP *logic* — where the structured bugs live (loop rules, context frames, prophecy plumbing) | large |
 | **W3** | **Differential gate over the corpus.** Compare production goals vs. reference goals for every serializable fn in the suite + tgt (3116 fns) + tutorial. Run as a Lean batch (`decide` per fn, no Rust execution of spec fns needed). Divergence = bug on one side; drive to zero; keep as CI mode. | finds real bugs *now* (the F-taxonomy shows the class is populated); calibrates reference completeness before any proof | medium |
@@ -280,8 +308,10 @@ proven; W8 last. R1-merge gates W4's package home; R0a gates nothing before W5's
 What checks what, in the end state:
 
 ```
-.rs of tactus-core (reference WP spec fns + SstSem + refWp_sound proof fns)
+.rs of tactus-core (refWp + SstSem spec fns, refWp_sound proof fns)
         │  authored in tactus, verified by the tactus binary (lean-only routing)
+        │  + a small hand-Lean layer (toProp/SymEnv/adequacy spine — §4.3):
+        │    part of the SPEC, audited once, kernel-checked like everything else
         ▼
 Lean package: TactusCore/{Defs,Stmts,Proofs,Link} + #tactus_check_axioms
         │  checked by the Lean KERNEL — closure ⊆ core ∪ prelude
@@ -352,16 +382,23 @@ every run, not trusted.
 
 ## 9. Open questions
 
-- **O1 (W0):** Bridge-R defeq feasibility + kernel cost; Bridge-D `decide` cost at
-  tgt scale (3116 fns × avg obligations — batch per fn? per module?).
+- **O1 (W0):** ~~Bridge-R defeq feasibility + kernel cost~~ **answered at toy scale
+  (§11)**: denotation `rfl` works incl. binders/SymEnv; Bridge-D `decide` on a
+  600-statement fn ≈ 2.8s wall incl. ~1s process floor. Remaining: real-goal-shape
+  cost, and batching (per-Verus-module bridge files to amortize the floor; generated
+  bridge modules must `set_option maxRecDepth` — kernel recursion depth scales with
+  WP chain depth, §11 P2).
 - **O2 (W1):** mirror-type single-source-of-truth: generate the Lean inductives from
   the Rust types (build.rs) or hand-write + golden-test? Lean-side generation is less
   trusted code; hand-written is more auditable. Lean-side wins if the subset is stable.
-- **O3 (W2):** spec-fn `refWp` computability in the kernel — `Classical.epsilon`
-  anywhere in the emitted defs (via `choose`-like constructs) breaks `decide`; keep
-  tactus-core's source in the choice-free fragment (enforced by a lint or by the
-  emitted-defs closure check listing no `Classical.choice`… note: `Decidable` instances
-  themselves are fine).
+- **O3 (W2):** spec-fn `refWp` computability in the kernel — TWO constraints, one per
+  probe: (a) choice-freedom: `Classical.epsilon` anywhere in the emitted defs (via
+  `choose`-like constructs) breaks `decide`; keep tactus-core's source in the
+  choice-free fragment (lintable via the defs' axiom closure). (b) **recursion
+  compilation (§11 P3, the sharper one):** tactus emits every recursive spec fn with
+  `termination_by` ⇒ WF-compiled ⇒ kernel-inert. W1.5 (structural emission) is the
+  fix; simp-with-equation-lemmas is the proven fallback bridge tactic if any
+  tactus-core fn genuinely needs a non-structural measure.
 - **O4 (W2):** obligation *identity* — bridge per goal needs stable pairing between
   production goals and reference goals; `obligation_naming.rs` ids on one side, `refWp`
   output order on the other; make `refWp` emit ids too and pair by id, not position.
@@ -388,3 +425,55 @@ stage A) → **W3** (differential gate — first real payoff: bug-finding) → [
 Independent of all of it, still-open bricks from the sibling docs that this plan
 *leans on*: T/B1 histogram (now nearly free via ladder sidecars), closure-doc §4
 prelude hygiene, R1/M6.0b Ref-ABI, R0a tactic-strength (Danielle's).
+
+---
+
+## 11. W0 pre-probe findings (2026-07-11, `probe-w0/`, lean 4.25.0, pure core)
+
+Run the same day as rev 1, before any implementation. Five files, each answering one
+load-bearing unknown; every claim below is pinned by a probe file that elaborates (or
+deliberately fails) standalone with no Mathlib.
+
+- **P1 (`probe1_structural.lean`) — Bridge-D mechanics work.** A structurally-compiled
+  `refWp` over a 5-constructor mini-SST kernel-evaluates on concrete data under both
+  `decide` (derived `DecidableEq`) and `rfl`; `#print axioms refWp` = none. 0.9s incl.
+  process start.
+- **P2 (`probe2_cost.lean`) — Bridge-D cost is fine, with one emission detail.** A
+  generated 600-statement program (150 assign/assert/ite units) bridge-checks by
+  `decide` in **2.8s wall** (≈1s of that is process floor). First attempt hit
+  `maximum recursion depth` — kernel/elaborator recursion scales with WP chain depth,
+  so generated bridge modules must emit `set_option maxRecDepth`. Consequence for
+  W4: batch bridges per Verus module to amortize the floor; typical fns are far
+  smaller than this probe.
+- **P3 (`probe3_wf.lean` + `probe3b_unseal.lean`) — THE CONSTRAINT: WF-compiled defs
+  are kernel-inert.** The same `refWp` with explicit `termination_by <Nat measure>`
+  (exactly what `to_lean_fn.rs:324` emits for every recursive spec fn with a
+  `decreases` clause): `decide` gets stuck at the derived `DecidableEq` instance
+  application (`did not reduce to isTrue/isFalse`), and `unseal … in` does **not**
+  rescue `rfl`. `simp [refWpWF, …]` (equation lemmas) DOES close it — the deterministic
+  fallback. Direct consequence: **a tactus-authored refWp is kernel-inert under
+  today's emission** — hence brick W1.5.
+- **P3c (`probe3c_structural_tb.lean`) — the mitigation works.** The same def with
+  `termination_by structural s` restores full `decide`/`rfl` evaluation with an
+  **empty axiom closure** (the current datatype-measure emission would additionally
+  drag `Tactus.heightLt` into every recursive spec fn's closure — structural emission
+  is a trust-hygiene win independent of R2).
+- **P4 (`probe4_denote.lean`) — the denotation rfl-bridge works.** A typed goal
+  language (`TGoal` with de Bruijn `tforall`/`timpLe`/`tconj`/`teq` over Int
+  expressions) with a structural denotation `gdenote : List Int → TGoal → Prop`
+  satisfies `gdenote [] g = (∀ x : Int, 0 ≤ x → (x + 0 = x ∧ ∀ y, …)) := by rfl` —
+  nested binders, env lookups under bound variables (`(x :: env).getD 0` iota-reduces
+  with x still abstract), and Int-literal elaboration all agree definitionally. This
+  is the W5 soundness path's load-bearing mechanic, validated.
+- **P5 (`probe5_symenv.lean`) — the dependent symbol environment survives the
+  bridge.** Goals referencing *user spec fns* and quantifying over *user datatypes*
+  denote through a `SymEnv` structure (`U : Type`, `ifns : Nat → (Int → Int)`, …)
+  instantiated by a generated per-crate match-literal — and still `rfl`-bridge to the
+  production-rendered Prop naming the real fns (`∀ c : Color, colorRank c = myAbs
+  (-3)`). This validates the §4.3 authorship split: the denotation layer (returns
+  `Prop`/`Type`) is hand-Lean; everything data-level stays tactus-authored.
+
+Net: **no blockers; one real constraint (P3) with a confirmed small mitigation (P3c →
+W1.5); both bridge forms mechanically validated; cost in budget.** The remaining W0
+work is realism, not mechanics: one genuine emitted goal (casts, decorations, loop
+triple, `SymEnv` call) hand-bridged end to end.
