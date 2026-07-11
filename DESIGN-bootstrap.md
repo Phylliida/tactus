@@ -285,7 +285,7 @@ one.
 
 | Stage | Content | Validates / buys | Size |
 |---|---|---|---|
-| **W0** | **Hand-written Lean spike** (`probe-w0/`). **Pre-probes P1–P5 DONE — §11** (d1 ✓, d3 shape ✓, d4 ANSWERED: structural yes / WF no). Remaining W0: hand-serialize ONE real emitted island goal (not a toy) and bridge it — exercising `Int.toNat` materialization, `Tactus.Box.mk` decorations, a loop init/maintain/use triple, and a spec-fn call through `SymEnv`; measure a realistic per-fn bridge at real goal sizes; pick Bridge-D pairing granularity (per goal vs per fn). | the whole concept, zero tactus changes | small, days |
+| **W0** | **COMPLETE (§11, `probe-w0/` P1–P7 + `bootstrap-fixture/`).** Both bridge mechanics validated (toy + two real goals: P6 assert w/ decorations+instances+let-in-Prop, P7 loop-maintain w/ telescope+shadowing+casts); WF constraint found + mitigation confirmed (→ W1.5); costs measured; goal-language sort story pinned (Int-with-bound-hyps exec / Nat spec); fixture corpus built (18 fns, emits 20/0). | the whole concept — validated with zero tactus changes | done |
 | **W1.5** | **Emitter brick (prerequisite for W2, benefits everyone):** emit `termination_by structural x` when a recursive spec fn's decreases measure is a bare structurally-decreasing param (datatype or Nat) — §11 P3 shows plain `termination_by` (WF) makes emitted spec fns kernel-INERT (`decide`/`rfl` stuck, `unseal` no rescue), while `structural` restores full reduction with an EMPTY axiom closure (no `Tactus.heightLt`). Fallback ladder rung: keep WF emission when structural elaboration fails. Independent win outside R2: user goals over such spec fns become `decide`-closable. | refWp's Lean form actually computes; also a T1-automation win | small |
 | **W1** | **Mirror types + serializer.** `Tactus.Sst`/`GoalAst` inductives (Lean, generated-or-checked against a single Rust source of truth); Rust serializer `sst_serialize.rs` from `build_wp` input + from produced `LExpr`s. Boring, 1:1, no cleverness — **this is the new trusted code; target <1k lines, reviewed as TCB.** Subset = what tactus supports today (documented deferrals excluded, serializer *fails loudly* on anything else). | the data pipeline; corpus coverage numbers (what % of tgt/suite fns serialize) | medium |
 | **W2** | **Reference WP, stage A** — deep *statements*, opaque expression leaves (leaves carried as already-rendered `GoalAst` subtrees, same on both sides). Authored as tactus spec fns in `tactus-core`, lean-only-clean, emitted via crate-defs. Mirrors the `Wp` walk: Done/DoneEmpty/Let/LetRaw/ClosureBody/Scope, CtxFrame assembly, loop init/maintain/use with havoc sets, overflow/bounds obligation placement, decreases obligations. | the WP *logic* — where the structured bugs live (loop rules, context frames, prophecy plumbing) | large |
@@ -500,6 +500,19 @@ budget.** Remaining W0 residue, now small: a loop init/maintain/use triple goal
 (same connective vocabulary + nested ∀, both probed separately — P4 has nested
 binders; compose them on a real loop fn), an `Int.ofNat` coercion site, and the
 general binder-telescope scheme (engineering, not risk).
+
+- **P7 (`probe7_loop_triple.lean`) — the real LOOP-MAINTAIN goal bridges. W0 COMPLETE.**
+  The fixture's `sum_to` invariant-3 maintain obligation
+  (`_tactus_loop_invariant_sum_to_at_lib_113_13_9`), verbatim: the loop-state ∀ is a
+  telescope of **signature binders with hypothesis binders interleaved** (the
+  CtxFrame architecture — no nested quantifiers; the M1 stmt ∀-closure IS the goal),
+  Int-typed lets including **let-shadowing of binders** (`let i := i + 1`, the
+  SSA-via-shadowing idiom — defeq is insensitive to shadowing, both sides zeta-reduce),
+  the `_tactus_d_old_0_0` decrease snapshot, duplicated overflow guards (faithful),
+  `Int.toNat` materialization sites, and the WF-emitted `lib.tri` as an opaque symbol.
+  Two-sorted goal language (Int exec side with bound-hyps + Nat spec side, per the
+  §11.1 census) — `rfl` closes in 0.6s. One idiom note for W2: build deep goal terms
+  as named layers, not one paren tower.
 
 ### 11.1 The fixture crate (`bootstrap-fixture/`)
 
