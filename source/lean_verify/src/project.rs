@@ -38,6 +38,34 @@ pub fn project_ready(project_dir: &Path) -> bool {
 /// gate; the prelude marker had the same latent gap). Memoized per
 /// process; a failed `lean --version` yields a nonce-free constant
 /// that still changes when the project files do.
+/// Toolchain fingerprint EXTENDED with the verus binary's own identity
+/// (exe mtime + size). For the defs ladder's success/FAILURE records:
+/// a FAILED record means "this BINARY failed on this render" — emitter
+/// changes that only alter partition ASSEMBLY (not the hashed monolith
+/// render) must not fast-path over a recorded failure. One ladder
+/// retry per rebuilt binary is the honest price. Island `.verified`
+/// markers deliberately do NOT use this (they key on the emitted text,
+/// which the emitter always regenerates — already correct).
+pub fn ladder_fingerprint() -> &'static str {
+    static FP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    FP.get_or_init(|| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        toolchain_fingerprint().hash(&mut h);
+        if let Ok(exe) = std::env::current_exe() {
+            if let Ok(md) = std::fs::metadata(&exe) {
+                md.len().hash(&mut h);
+                if let Ok(t) = md.modified() {
+                    if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                        d.as_secs().hash(&mut h);
+                    }
+                }
+            }
+        }
+        format!("{:016x}", h.finish())
+    })
+}
+
 pub fn toolchain_fingerprint() -> &'static str {
     static FP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     FP.get_or_init(|| {

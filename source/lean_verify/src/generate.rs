@@ -1199,6 +1199,14 @@ pub(crate) fn spec_world_cmds_tagged(
             if done[ai] {
                 continue;
             }
+            // The subrange-len axiom is cited by the seq measure
+            // companion FROM ITS OWN PART (parts cannot import the
+            // umbrella) — the companion site emits it in-part. Only
+            // the final forced flush may emit it here (crates whose
+            // closure never reaches drop_first/drop_last).
+            if !force && Some(ai) == subrange_ax_idx {
+                continue;
+            }
             let (gd, id) = &axiom_deps[ai];
             if force || (gd.iter().all(|g| pg.contains(g)) && id.iter().all(|j| pi.contains(j))) {
                 done[ai] = true;
@@ -1222,7 +1230,16 @@ pub(crate) fn spec_world_cmds_tagged(
             }
         }
     };
+    // Partition placement (M6 defs): every mid-stream axiom flush is
+    // bracketed as DefsSeg::BcAxiom so the axioms land in the UMBRELLA
+    // (which imports every part). Without the bracket they ride the
+    // enclosing Base-tagged gap — and all Base ranges concatenate into
+    // the FIRST part, physically placing axioms before their deps'
+    // declarations in later parts (post-merge census regression:
+    // `Unknown constant Seq.empty` in TactusDefs_lib__base).
+    segs.push((cmds.len(), DefsSeg::BcAxiom));
     flush_ready_axioms(&mut cmds, &mut axiom_done, &mut axiom_ok, &processed_groups, &processed_instances, false);
+    segs.push((cmds.len(), DefsSeg::Base));
 
     // No spec-fn groups at all: proof classes have nothing to wait on.
     if last_group_pos.is_none() {
@@ -1338,7 +1355,19 @@ pub(crate) fn spec_world_cmds_tagged(
             dep_order::EmitStep::Group(i) => { processed_groups.insert(*i); }
             dep_order::EmitStep::Instance(j) => { processed_instances.insert(*j); }
         }
+        // Partition placement follows CONSUMERS, not stream position:
+        // flushed axioms are consumed by pkg/island theorems, which
+        // import the UMBRELLA — so tag BcAxiom (umbrella). Stream
+        // position can't work per-part: dep-order and module-partition
+        // disagree (a hoisted-early `Seq.empty` group is tagged into
+        // the seq part while a flush after an instance step would sit
+        // in base — base imports nothing). The one IN-PART consumer
+        // (the seq measure companion citing axiom_seq_subrange_len) is
+        // handled at the companion site below, and mid-stream flushes
+        // SKIP that axiom.
+        segs.push((cmds.len(), DefsSeg::BcAxiom));
         flush_ready_axioms(&mut cmds, &mut axiom_done, &mut axiom_ok, &processed_groups, &processed_instances, false);
+        segs.push((cmds.len(), DefsSeg::Base));
         // vstd seq measure companions (B3): right after `Seq.drop_first`/
         // `Seq.drop_last` emits (and after the axiom flush above — the
         // subrange-len axiom's deps precede this def's group, so the
@@ -1353,13 +1382,38 @@ pub(crate) fn spec_world_cmds_tagged(
                     // landed — lenient mode can skip either, and an
                     // unguarded companion referencing a never-declared
                     // name would poison the whole shared-defs file.
-                    let ax_landed = subrange_ax_idx.map_or(false, |i| axiom_ok[i]);
-                    if step_pushed && ax_landed {
-                        if let Some(cmd) =
-                            seq_measure_companion_cmd(f, &rel, &all_fns, bc_lemma_funcs)
-                        {
-                            push_lenient(&mut cmds, "seq measure companion", &mut || vec![cmd.clone()]);
+                    // Emit the subrange axiom HERE, in this fn's part
+                    // (mid-stream flushes skip it): the companion cites
+                    // it and parts cannot import the umbrella. Both ride
+                    // the fn's own group seg so later parts' decreasing_by
+                    // (which cites the companion) resolves via the part
+                    // import chain.
+                    if step_pushed {
+                        segs.push((cmds.len(), DefsSeg::FnGroup {
+                            fns: vec![f.name.clone()], refs: spec_fn_refs(f),
+                        }));
+                        if let Some(ai) = subrange_ax_idx {
+                            if !axiom_done[ai] {
+                                axiom_done[ai] = true;
+                                let ax = bc_lemma_funcs[ai];
+                                axiom_ok[ai] = push_lenient(&mut cmds, "broadcast axiom", &mut || {
+                                    let with_ne = add_nonempty(ax.clone(), &ax.name);
+                                    let augmented = crate::impl_subst::maybe_augment_standalone_fn(
+                                        &with_ne, &ectx.trait_outparams,
+                                    );
+                                    vec![to_lean_fn::broadcast_lemma_axiom_cmd(&augmented, ectx)]
+                                });
+                            }
                         }
+                        let ax_landed = subrange_ax_idx.map_or(false, |i| axiom_ok[i]);
+                        if ax_landed {
+                            if let Some(cmd) =
+                                seq_measure_companion_cmd(f, &rel, &all_fns, bc_lemma_funcs)
+                            {
+                                push_lenient(&mut cmds, "seq measure companion", &mut || vec![cmd.clone()]);
+                            }
+                        }
+                        segs.push((cmds.len(), DefsSeg::Base));
                     }
                 }
             }
@@ -2552,7 +2606,6 @@ fn build_stmt_partition(
         }
         let mut cmds = preamble.clone();
         cmds.push(to_lean_fn::proof_fn_stmt_cmd(f, &ectx));
-        cmds.push(Command::NamespaceClose(ns.clone()));
         // Sanity over what Lean will see: defs stream + this module.
         #[cfg(debug_assertions)]
         {
@@ -2705,7 +2758,6 @@ fn emit_package_proof_fn_inner(
         .collect();
     thm.binders.splice(0..0, hyps);
     cmds.push(Command::Theorem(thm));
-    cmds.push(Command::NamespaceClose(ns));
     // Sanity over the full import concatenation: defs + the imported
     // stmt modules + this. (debug builds only.)
     #[cfg(debug_assertions)]
@@ -2788,7 +2840,6 @@ fn emit_package_mutual_scc(
         })
         .collect::<Result<_, String>>()?;
     cmds.push(Command::Mutual(block));
-    cmds.push(Command::NamespaceClose(ns));
     #[cfg(debug_assertions)]
     {
         let concat: Vec<Command> = defs.cmds.iter()
@@ -3311,8 +3362,9 @@ fn build_link_module(
         cmds.push(Command::Import(lean_name(&f.name.path).replace('.', "__")));
     }
     cmds.push(Command::Raw(crate::prelude::TACTUS_SET_OPTIONS.to_string()));
+    // Option B: no namespace wrapper — decl names are fully qualified.
     let ns = sanitize(crate_name);
-    cmds.push(Command::NamespaceOpen(ns.clone()));
+    let _ = &ns;
     if !cyclic.is_empty() {
         cmds.push(Command::Raw(format!(
             "-- SKIPPED (cyclic tactic references with SCC-external helper deps, \
@@ -3366,7 +3418,6 @@ fn build_link_module(
             "#tactus_check_axioms {}_closed [{}]\n", name, boundary_list
         )));
     }
-    cmds.push(Command::NamespaceClose(ns));
     let rendered = pp_commands(&cmds);
     let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
         .join(format!("{}.lean", link_module_name(defs)));
