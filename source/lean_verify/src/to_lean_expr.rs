@@ -593,19 +593,34 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
             }
         }
 
-        ExprX::Choose { params, cond, body: _ } => {
-            // `Classical.epsilon (fun (x : T) ... => P)` — the epsilon operator
-            // returns *some* witness satisfying P if one exists. No existence
-            // proof is required because `Classical.epsilon` is total.
+        ExprX::Choose { params, cond, body } => {
+            // See `expr_shared::choose_node` for the semantics and the
+            // shape (ε-skolemization). `body: None` = the single-binder
+            // `choose|x| P(x)` form where the body is the bound var.
+            // (This arm previously ignored `body` entirely — correct only
+            // for that form; compound bodies rendered as the raw witness.)
             let mut extended = ctx.binder_typs.cloned().unwrap_or_default();
             for b in params.iter() {
                 extended.insert(b.name.clone(), b.a.clone());
             }
-            let lambda = LExpr::lambda(
-                vir_var_binders_to_ast(params),
-                expr_to_ast(cond, &ctx.with_binder_typs(&extended)),
-            );
-            LExpr::app1(LExpr::var_lit("Classical.epsilon"), lambda).node
+            let inner_ctx = ctx.with_binder_typs(&extended);
+            let cond_ast = expr_to_ast(cond, &inner_ctx);
+            let body_is_the_var = params.len() == 1
+                && matches!(&body.x, ExprX::Var(v) if v == &params[0].name);
+            let body_ast = if body_is_the_var {
+                None
+            } else {
+                Some(expr_to_ast(body, &inner_ctx))
+            };
+            let names: Vec<crate::lean_name::LeanName> = params.iter()
+                .map(|b| crate::lean_name::LeanName::from_var_ident(&b.name))
+                .collect();
+            crate::expr_shared::choose_node(
+                &vir_var_binders_to_ast(params),
+                &names,
+                cond_ast,
+                body_ast,
+            )
         }
 
         ExprX::WithTriggers { body, .. } => expr_to_node(body, ctx),
@@ -799,7 +814,13 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
             crate::lean_ast::and_all(pairs).node
         }
         ExprX::ArrayLiteral(exprs) => {
-            ExprNode::ArrayLit(exprs.iter().map(|e| expr_to_ast(e, ctx)).collect())
+            // Shared typ-dispatched literal: Array-typed → `#v[…]`
+            // (Vector), Slice-typed → `[…]` (List). See
+            // `expr_shared::array_literal_node` (F3).
+            crate::expr_shared::array_literal_node(
+                exprs.iter().map(|e| expr_to_ast(e, ctx)).collect(),
+                &expr.typ,
+            ).node
         }
 
         // `ExprX::Header` is a requires/ensures marker that VIR

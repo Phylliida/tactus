@@ -341,12 +341,163 @@ pub(crate) fn lean_name_raw(path: &Path) -> String {
     segments.join(".")
 }
 
+thread_local! {
+    /// Namespace of the crate currently being emitted — `sanitize(crate_name)`,
+    /// the same string `NamespaceOpen` wraps every emitted file in. Installed
+    /// by `generate::install_emit_tables` (all emission entry points route
+    /// through it). When set, `lean_name` renders **root-anchored** names
+    /// (`_root_.{ns}.{name}`) so a local binder can never capture an emitted
+    /// global — a Verus local named `symbol` used to turn every reference
+    /// `symbol.generator_index` into a dot-notation field lookup on the
+    /// binder's type ("Invalid field", 2,203 errors crate-wide on
+    /// tactus-group-theory; DESIGN-lean-all-proofs-bugs.md B1a).
+    ///
+    /// Root-anchoring is valid in *declaration* position too (`def
+    /// _root_.lib.foo.bar` inside `namespace lib` declares `lib.foo.bar`,
+    /// same as the relative form — verified empirically for def / inductive
+    /// + deriving / axiom / match-pattern positions), so `lean_name` applies
+    /// it uniformly. Non-Lean-text uses of the name (the `.lean` filename)
+    /// use `lean_name_relative`.
+    ///
+    /// `None` (unit tests, prelude-free fragments) falls back to relative
+    /// names — the pre-B1a behavior.
+    static CRATE_NS: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+}
+
+/// Install the current crate namespace for root-anchored name rendering.
+/// Called by `generate::install_emit_tables` — never call directly, so the
+/// ambient emit state can't be half-installed.
+pub(crate) fn install_crate_ns(crate_name: &str) {
+    CRATE_NS.with(|n| *n.borrow_mut() = Some(sanitize(crate_name)));
+}
+
+thread_local! {
+    /// Relative Lean names (`lean_name_relative` form) of every decl this
+    /// crate's emission can produce — fns, datatypes, traits. Decides which
+    /// root-anchor a reference gets: declared here → `_root_.{ns}.{name}`
+    /// (it lives inside the file's `namespace` wrapper); NOT declared here →
+    /// `_root_.{name}` (a Lean-core / prelude name such as `Nonempty`,
+    /// which a synthetic VIR path renders — path shape alone can't
+    /// distinguish it from a crate-root fn, so membership is the criterion).
+    /// Both forms are capture-proof against local binders; the second
+    /// preserves what namespace-climbing used to resolve, minus the capture
+    /// risk.
+    static CRATE_DECLS: std::cell::RefCell<Option<std::sync::Arc<std::collections::HashSet<String>>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Install the crate-declared name set (see `CRATE_DECLS`). Called by
+/// `generate::install_emit_tables` AFTER the inherent-method rename table —
+/// the set stores naturalized names, so it must be built with the renames
+/// already in place.
+pub(crate) fn install_crate_decls(decls: std::sync::Arc<std::collections::HashSet<String>>) {
+    CRATE_DECLS.with(|d| *d.borrow_mut() = Some(decls));
+}
+
+thread_local! {
+    /// Relative names of the decl group whose bodies are currently being
+    /// rendered. A recursive def's SELF-reference (and a `mutual` block
+    /// member's reference to its siblings) must render relatively: during
+    /// elaboration the decl is not yet a global constant, and `_root_.…`
+    /// forces global lookup — `Unknown identifier` (verified empirically).
+    /// Lean resolves the relative form through its local self-reference /
+    /// mutual-group mechanism. For datatype `.height` defs the set holds
+    /// the datatype's relative name (the `.height` suffix is appended
+    /// after `lean_name` returns). Residual risk, accepted: a local binder
+    /// shadowing a self-name's head segment inside its own recursive def —
+    /// vanishingly rare vs. the systematic breakage.
+    static CURRENT_DECL_SELF: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Render `f` with `rel_names` ADDED to the current self-decl set (see
+/// `CURRENT_DECL_SELF`), restoring the previous set afterwards. Union
+/// scoping: `spec_fn_to_ast` pushes its own singleton inside the mutual
+/// group's wrapper — member bodies must still resolve their siblings.
+///
+/// Restore is a Drop guard: renders DO panic and ARE recovered
+/// (`push_lenient` / `guard_build` catch_unwind) — without the guard, a
+/// panic inside `f` would leak the names into the thread-local for the
+/// rest of the thread's life, making later same-thread renders emit
+/// those names relative and silently resurrecting the B1a capture bug.
+/// `clear_self_decls` in `install_emit_tables` is the belt to this
+/// suspenders.
+pub(crate) fn with_self_decls<T>(
+    rel_names: impl IntoIterator<Item = String>,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Restore {
+        added: Vec<String>,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURRENT_DECL_SELF.with(|s| {
+                let mut set = s.borrow_mut();
+                for n in &self.added {
+                    set.remove(n);
+                }
+            });
+        }
+    }
+    let _restore = Restore {
+        added: CURRENT_DECL_SELF.with(|s| {
+            let mut set = s.borrow_mut();
+            rel_names.into_iter().filter(|n| set.insert(n.clone())).collect()
+        }),
+    };
+    f()
+}
+
+/// Reset the self-decl set. Called by `generate::install_emit_tables` at
+/// every emission entry point — a fresh emission must never inherit
+/// leaked self-names from a panicked-and-recovered render on this thread.
+pub(crate) fn clear_self_decls() {
+    CURRENT_DECL_SELF.with(|s| s.borrow_mut().clear());
+}
+
+/// Single-name convenience for `with_self_decls`.
+pub(crate) fn with_self_decl<T>(rel_name: String, f: impl FnOnce() -> T) -> T {
+    with_self_decls(std::iter::once(rel_name), f)
+}
+
 /// Convert a VIR path to a Lean dotted name, skipping the crate prefix.
 /// `crate::module::name` → `module.name`
 /// Names are sanitized (@ # → _) and keywords are escaped with «».
 /// Inherent impl method names are naturalized (`impl__0.view` →
 /// `Holder.view`) via the `INHERENT_METHOD_RENAMES` table.
+/// With a crate namespace installed, the result is root-anchored:
+/// `_root_.{ns}.module.name` (see `CRATE_NS`).
 pub(crate) fn lean_name(path: &Path) -> String {
+    let name = lean_name_relative(path);
+    // Self-reference inside the decl group's own bodies: must stay
+    // relative (see CURRENT_DECL_SELF — root-anchoring a not-yet-defined
+    // global is `Unknown identifier`).
+    let is_self = CURRENT_DECL_SELF.with(|s| s.borrow().contains(name.as_str()));
+    if is_self {
+        return name;
+    }
+    CRATE_NS.with(|ns| match &*ns.borrow() {
+        Some(ns) => {
+            let in_crate = CRATE_DECLS.with(|d| match &*d.borrow() {
+                Some(decls) => decls.contains(&name),
+                // Set not installed but ns is — shouldn't happen (same
+                // installer); treat as crate-internal, the common case.
+                None => true,
+            });
+            if in_crate {
+                format!("_root_.{}.{}", ns, name)
+            } else {
+                format!("_root_.{}", name)
+            }
+        }
+        None => name,
+    })
+}
+
+/// `lean_name` without the root-anchor — the name relative to the emitted
+/// file's `namespace` wrapper. For uses where the name is an artifact key,
+/// not Lean text: the per-fn `.lean` filename (`generate::lean_file_path`).
+pub(crate) fn lean_name_relative(path: &Path) -> String {
     let name = lean_name_raw(path);
     // Only inherent impl methods get a rename; gate the table lookup on
     // the cheap marker check so the common (non-impl) path stays alloc-free.
@@ -383,16 +534,74 @@ pub(crate) fn sanitize(s: &str) -> String {
     }
 }
 
-fn is_lean_keyword(s: &str) -> bool {
-    matches!(s,
-        "def" | "theorem" | "lemma" | "example" | "abbrev" | "instance" | "class"
-        | "structure" | "inductive" | "where" | "with" | "match" | "do" | "return"
-        | "if" | "then" | "else" | "let" | "have" | "show" | "by" | "at" | "fun"
-        | "forall" | "exists" | "Type" | "Prop" | "Sort" | "import" | "open"
-        | "namespace" | "section" | "end" | "variable" | "universe"
-        | "mutual" | "axiom" | "opaque" | "macro" | "syntax" | "notation"
-        | "deriving" | "extends" | "calc" | "from" | "in" | "set_option"
-    )
+/// Identifier-like reserved tokens of the Lean environment that emitted
+/// files see (`import TactusPrelude`, Lean v4.25.0 toolchain). An
+/// identifier-like string in Lean's token table is lexed as a keyword atom,
+/// not an identifier, so any of these appearing raw in binder/reference
+/// position is a parse error — `sanitize` «»-quotes them.
+///
+/// GENERATED — do not hand-edit beyond the documented exceptions. Regenerate
+/// with `tactus/source/lean_verify/dump_reserved_tokens.lean` (usage in its
+/// header) after a toolchain bump or new identifier-like syntax in
+/// TactusPrelude. Exceptions to the raw dump:
+/// * `_` (in the token table) is EXCLUDED: quoting «_» would turn a
+///   wildcard binder into a named binder.
+/// * `lemma` (Mathlib-only, not in TactusPrelude's import closure) is
+///   INCLUDED defensively — it was quoted historically and Mathlib-importing
+///   contexts (tutorial helpers) may see it reserved.
+///
+/// Sorted for `binary_search`; a unit test in `tests/lean_name.rs` enforces
+/// sortedness.
+pub(crate) const LEAN_RESERVED_TOKENS: &[&str] = &[
+    "Prop", "Sort", "StateRefT", "Type",
+    "abbrev", "add_decl_doc", "at", "attribute",
+    "axiom", "bif", "binder_predicate", "break",
+    "builtin_dsimproc", "builtin_dsimproc_decl", "builtin_grind_propagator", "builtin_initialize",
+    "builtin_simproc", "builtin_simproc_decl", "by", "by_elab",
+    "calc", "catch", "class", "coinductive",
+    "coinductive_fixpoint", "continue", "dbg_trace", "declare_bitwise_int_theorems",
+    "declare_bitwise_uint_theorems", "declare_command_config_elab", "declare_config_elab", "declare_int_theorems",
+    "declare_simp_like_tactic", "declare_sint_simprocs", "declare_syntax_cat", "declare_uint_simprocs",
+    "declare_uint_theorems", "decreasing_by", "def", "deriving",
+    "do", "docs_to_verso", "dsimproc", "dsimproc_decl",
+    "elab", "elab_rules", "elab_stx_quot", "else",
+    "end", "eval_prec", "eval_prio", "example",
+    "exists", "export", "extends", "finally",
+    "for", "forall", "from", "fun",
+    "generalizing", "grind_pattern", "grind_propagator", "have",
+    "haveI", "hiding", "if", "import",
+    "in", "include", "include_str", "inductive",
+    "inductive_fixpoint", "infix", "infixl", "infixr",
+    "init_grind_norm", "init_quot", "initialize", "instance",
+    "leading_parser", "lemma", "let", "letI",
+    "let_delayed", "let_expr", "let_fun", "let_tmp",
+    "local", "logNamedError", "logNamedErrorAt", "logNamedWarning",
+    "logNamedWarningAt", "macro", "macro_rules", "match",
+    "match_expr", "matches", "max_prec", "meta",
+    "mod_cast", "mut", "mutual", "namespace",
+    "nat_lit", "no_index", "nofun", "nomatch",
+    "noncomputable", "nonrec", "norm_cast_add_elim", "notation",
+    "omit", "opaque", "open", "partial",
+    "partial_fixpoint", "postfix", "prefix", "private",
+    "protected", "public", "recommended_spelling", "register_builtin_option",
+    "register_error_explanation", "register_label_attr", "register_linter_set", "register_option",
+    "register_parser_alias", "register_simp_attr", "register_tactic_tag", "renaming",
+    "repeat", "reprove", "return", "run_cmd",
+    "run_elab", "run_meta", "scoped", "seal",
+    "section", "set_option", "set_premise_selector", "show",
+    "show_panel_widgets", "show_term", "show_term_elab", "simproc",
+    "simproc_decl", "sorry", "structure", "suffices",
+    "syntax", "tactic_alt", "tactic_extension", "tactic_tag",
+    "termination_by", "test_extern", "then", "theorem",
+    "throwError", "throwErrorAt", "throwNamedError", "throwNamedErrorAt",
+    "trailing_parser", "try", "unif_hint", "universe",
+    "unless", "unsafe", "unseal", "until",
+    "using", "variable", "where", "while",
+    "with", "with_annotate_term", "without_expected_type",
+];
+
+pub(crate) fn is_lean_keyword(s: &str) -> bool {
+    LEAN_RESERVED_TOKENS.binary_search(&s).is_ok()
 }
 
 /// Walk a TypX recursively, calling `visit` at each node.

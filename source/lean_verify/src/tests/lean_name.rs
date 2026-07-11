@@ -42,3 +42,35 @@ fn lit_unchanged() {
     let n = LeanName::lit("Int.toNat");
     assert_eq!(n.as_str(), "Int.toNat");
 }
+
+#[test]
+fn reserved_tokens_sorted_and_deduped() {
+    // `is_lean_keyword` binary-searches LEAN_RESERVED_TOKENS — the list
+    // must stay strictly sorted (also catches duplicates).
+    let toks = crate::to_lean_type::LEAN_RESERVED_TOKENS;
+    for w in toks.windows(2) {
+        assert!(w[0] < w[1], "LEAN_RESERVED_TOKENS out of order: {:?} >= {:?}", w[0], w[1]);
+    }
+}
+
+#[test]
+fn full_reserved_token_set_quoted() {
+    // Real-corpus failure (tactus-group-theory): locals named `prefix`
+    // emitted raw and hit Lean's reserved token — parse error. The old
+    // ~30-word hand list missed it; the list is now generated from the
+    // toolchain's token table (dump_reserved_tokens.lean).
+    for kw in ["prefix", "calc", "matches", "suffices", "using", "lemma"] {
+        let n = LeanName::from_var_ident(&vid(kw, VarIdentDisambiguate::VirParam));
+        assert_eq!(n.as_str(), format!("«{}»", kw), "{} must be «»-quoted", kw);
+    }
+    // Empirically NOT reserved (verified against the toolchain,
+    // 2026-07-09): tactic macro heads and `.`-scoped `rec`.
+    for ok in ["tactus_auto", "rec", "this", "symbol"] {
+        let n = LeanName::from_var_ident(&vid(ok, VarIdentDisambiguate::VirParam));
+        assert_eq!(n.as_str(), ok, "{} must stay raw", ok);
+    }
+    // `_` is in Lean's token table but deliberately NOT quoted: a
+    // generated wildcard binder must stay a wildcard.
+    let n = LeanName::from_var_ident(&vid("_", VarIdentDisambiguate::VirParam));
+    assert_eq!(n.as_str(), "_");
+}

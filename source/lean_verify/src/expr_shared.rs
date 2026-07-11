@@ -316,6 +316,32 @@ impl<'a> RenderCtx<'a> {
         }
     }
 
+    /// Sibling of [`Self::fn_param_typs`] for the RESULT side: the
+    /// callee's declared return typ, instantiated with the call-site
+    /// typ args. Ground truth for a rendered application's Lean type —
+    /// the emitted def's return type is `typ_to_expr` of exactly this
+    /// typ — so the typed spine's Call arm reports it as the actual
+    /// (B5a, DESIGN-B5-typed-spine-calls.md). The SST claim can differ
+    /// by a ref-decoration when the call sits in an inlined `&self`
+    /// receiver position: `sst_elaborate` splices the receiver arg
+    /// with its call-site claim, which poly.rs needs — the lie is
+    /// Lean-perspective-only, so the renderer is the seam.
+    pub fn fn_ret_typ(&self, fun: &Fun, typ_args: &[Typ]) -> Option<Typ> {
+        let fn_map = self.fn_map?;
+        let func = fn_map.get(fun)?;
+        if !typ_args.is_empty() && typ_args.len() == func.typ_params.len() {
+            let typ_substs: HashMap<Ident, Typ> = func
+                .typ_params
+                .iter()
+                .cloned()
+                .zip(typ_args.iter().cloned())
+                .collect();
+            Some(vir::sst_util::subst_typ(&typ_substs, &func.ret.x.typ))
+        } else {
+            Some(func.ret.x.typ.clone())
+        }
+    }
+
     /// Look up a Var name in the render-time substitution map and,
     /// if present, return the substituted value bridged to `slot_typ`
     /// via `coerce_lexpr`. Returns `None` if no substitution is
@@ -555,6 +581,58 @@ pub(crate) fn ctor_node(
             }
         }
         Dt::Tuple(_) => ExprNode::Tuple(rendered_fields),
+    }
+}
+
+/// Array-literal rendering, shared by the VIR-AST and SST paths (F3,
+/// DESIGN-lean-all-proofs-followons.md). Verus's `[T; N]` maps to Lean
+/// core `Vector T N` (`to_lean_type`), so a literal in Array-typed
+/// position must render `#v[a, b, c]` — a bare `[a, b, c]` is a `List`
+/// and mistypes everywhere the array type is expected (the
+/// `{ deref := [a, b, c] }` family: `seq![a, b]` lowers through vstd's
+/// `View for [T; N]`, wrapping the literal in `Tactus.Ref.mk` ascribed
+/// at `Vector`). Anything else (`Primitive::Slice` → `List`) keeps the
+/// List literal. `#v[…]` + the `Tactus.Ref.mk` wrapper validated
+/// empirically on the pinned toolchain (Lean 4.25.0).
+/// F2b (DESIGN-lean-all-proofs-followons.md): a Verus `decreases`
+/// measure of Int-rendered type (`int`, `iN`, `isize`) becomes a
+/// `termination_by` value that Lean wraps in `sizeOf` — for `Int`
+/// that unfolds to a raw `Int.rec` omega cannot see through, so
+/// every such decreasing goal was stuck. Verus's decreases semantics
+/// for int measures IS "a nonnegative ordinal" (nonnegativity is part
+/// of the Z3-side decreases obligation), and `Int.toNat` is the
+/// canonical embedding of that semantics — the same kind of type-level
+/// mapping as the standing `uN → Nat` clip policy. Wrapping makes the
+/// decreasing goals Nat `<`: omega-native, with the branch guards
+/// supplying nonnegativity. Uniform on every Int-rendered measure and
+/// visible in the emitted `termination_by`; Nat-rendered (`nat`, `uN`,
+/// `usize`) and non-numeric (datatype height / sizeOf) measures pass
+/// through unchanged.
+pub(crate) fn wrap_int_measure(rendered: LExpr, d: &vir::ast::Expr) -> LExpr {
+    let peeled = crate::to_lean_type::peel_typ_wrappers(&d.typ);
+    match &**peeled {
+        TypX::Int(
+            vir::ast::IntRange::Int
+            | vir::ast::IntRange::I(_)
+            | vir::ast::IntRange::ISize,
+        ) => LExpr::app1(LExpr::var_lit("Int.toNat"), rendered),
+        _ => rendered,
+    }
+}
+
+/// Dispatches on the PEELED typ only — decoration handling is the
+/// caller's job and differs per path: the VIR renderer's
+/// `apply_ref_coercion_if_needed` bridges decorations for literals
+/// already (its `structural_typ` treats `ArrayLiteral` as producing an
+/// undecorated value), while the SST arm must wrap explicitly (see the
+/// `ExpX::ArrayLiteral` arm) — wrapping here would double-wrap the VIR
+/// side.
+pub(crate) fn array_literal_node(rendered_elems: Vec<LExpr>, typ: &Typ) -> LExpr {
+    let peeled = crate::to_lean_type::peel_typ_wrappers(typ);
+    match &**peeled {
+        TypX::Primitive(vir::ast::Primitive::Array, _) =>
+            LExpr::new(ExprNode::VectorLit(rendered_elems)),
+        _ => LExpr::new(ExprNode::ArrayLit(rendered_elems)),
     }
 }
 
@@ -1136,6 +1214,100 @@ pub(crate) fn field_proj_opr(base: LExpr, field_opr: &FieldOpr) -> LExpr {
     }
 }
 
+/// Assemble the Lean value of a Verus `choose` — the VIR (`ExprX::Choose`)
+/// and SST (`BndX::Choose`) renderers both route here so the two paths
+/// can't drift (DESIGN-lean-all-proofs-bugs.md B2).
+///
+/// Semantics (mirrors AIR `BindX::Choose`, `vir/src/sst_to_air.rs`): the
+/// value of `body` at SOME binding of `binders` satisfying `cond`;
+/// arbitrary when no witness exists — `Classical.epsilon` is total, the
+/// Lean analog of AIR's `as_type` coercion on an unsatisfiable choose.
+///
+/// * `body: None` — the dominant `choose|x| P(x)` form (single binder,
+///   body IS the bound var): `Classical.epsilon (fun x => cond)`.
+/// * `body: Some(b)` — general form (multi-binder and/or compound body);
+///   skolemize binder-by-binder, then evaluate the body:
+///   `let x₁ := Classical.epsilon (fun x₁ => ∃ x₂ … xₙ, cond);
+///    …
+///    let xₙ := Classical.epsilon (fun xₙ => cond);
+///    b`
+///   Each εᵢ references the previously-chosen x₁…xᵢ₋₁ through the
+///   enclosing lets — ordinary ∃-witness extraction. The let names are
+///   the binder names, so `cond`/`b` rendered with the standard binder
+///   naming reference them directly.
+///
+/// (The previous SST rendering, `epsilon (fun x => cond ∧ body)`,
+/// conjoined a non-Prop body — ill-typed for every `choose` whose body
+/// isn't a Prop: 2,596 errors / 440 fns on tactus-group-theory. The VIR
+/// rendering ignored `body` entirely — correct only for the `body: None`
+/// form here.)
+///
+/// `l_binders` and `names` run in parallel (same order); callers derive
+/// both from the same VarBinders.
+pub(crate) fn choose_node(
+    l_binders: &[crate::lean_ast::Binder],
+    names: &[LeanName],
+    cond: LExpr,
+    body: Option<LExpr>,
+) -> ExprNode {
+    let Some(body) = body else {
+        debug_assert!(l_binders.len() == 1, "body: None is the single-binder form");
+        return LExpr::app1(
+            LExpr::var_lit("Classical.epsilon"),
+            LExpr::lambda(l_binders.to_vec(), cond),
+        )
+        .node;
+    };
+    skolem_lets(l_binders, names, &cond, body).node
+}
+
+/// The ε-skolemization let-chain shared by `choose_node` and
+/// `choose_witness_hyp`:
+/// `let x₁ := ε(fun x₁ => ∃ x₂ … xₙ, cond); … let xₙ := ε(fun xₙ => cond);
+///  inner`.
+fn skolem_lets(
+    l_binders: &[crate::lean_ast::Binder],
+    names: &[LeanName],
+    cond: &LExpr,
+    inner: LExpr,
+) -> LExpr {
+    let mut out = inner;
+    for i in (0..l_binders.len()).rev() {
+        let eps_cond = if i + 1 < l_binders.len() {
+            LExpr::exists_(l_binders[i + 1..].to_vec(), cond.clone())
+        } else {
+            cond.clone()
+        };
+        let eps = LExpr::app1(
+            LExpr::var_lit("Classical.epsilon"),
+            LExpr::lambda(vec![l_binders[i].clone()], eps_cond),
+        );
+        out = LExpr::let_bind(names[i].clone(), eps, out);
+    }
+    out
+}
+
+/// The witness fact a `choose` carries (DESIGN-lean-all-proofs-bugs.md B2):
+/// `(∃ bs, cond) → (let x₁ := ε₁; …; let xₙ := εₙ; cond)`.
+///
+/// This is `Classical.epsilon_spec` instantiated at the exact ε-terms
+/// `choose_node` renders (single binder: `(∃ x, cond) → cond[ε/x]` up to
+/// zeta-reduction), so assuming it as an obligation hypothesis adds no
+/// axiomatic strength — it mirrors the conditional witness axiom Verus's
+/// Z3 path gets from AIR's `BindX::Choose` skolemization. The ∃'s binders
+/// scope over the antecedent only; the lets rebuild the same skolem terms
+/// in the consequent, closed.
+pub(crate) fn choose_witness_hyp(
+    l_binders: &[crate::lean_ast::Binder],
+    names: &[LeanName],
+    cond: &LExpr,
+) -> LExpr {
+    LExpr::implies(
+        LExpr::exists_(l_binders.to_vec(), cond.clone()),
+        skolem_lets(l_binders, names, cond, cond.clone()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1282,5 +1454,64 @@ mod tests {
             s.contains("deref") && s.contains("Int.toNat") && s.contains(".mk"),
             "expected peel + toNat + rewrap, got {s}",
         );
+    }
+}
+
+#[cfg(test)]
+mod choose_tests {
+    use super::*;
+
+    fn bind(name: &str) -> crate::lean_ast::Binder {
+        crate::lean_ast::Binder::explicit(
+            crate::lean_name::LeanName::synthetic(name.to_string()),
+            LExpr::var_lit("Int"),
+        )
+    }
+    fn nm(name: &str) -> LeanName {
+        crate::lean_name::LeanName::synthetic(name.to_string())
+    }
+    fn cond() -> LExpr {
+        // stand-in for `P x` — an application, definitely a Prop shape
+        LExpr::app1(LExpr::var_lit("P"), LExpr::var_lit("x"))
+    }
+
+    #[test]
+    fn choose_single_var_body_is_bare_epsilon() {
+        // `choose|x| P(x)` (body IS the bound var → passed as None):
+        // `Classical.epsilon (fun x => cond)`. The pre-B2 rendering
+        // conjoined the (Int-typed!) body onto the condition —
+        // `epsilon (fun x => cond ∧ x)` — ill-typed for every choose
+        // whose body isn't a Prop (2,596 errors on tactus-group-theory).
+        let out = LExpr::new(choose_node(&[bind("x")], &[nm("x")], cond(), None));
+        let s = format!("{:?}", out.node);
+        assert!(s.contains("Classical.epsilon"), "epsilon head: {s}");
+        assert!(!s.contains("And"), "no body conjunction: {s}");
+    }
+
+    #[test]
+    fn choose_multi_binder_skolemizes() {
+        // `choose|a, b| P` with compound body: nested epsilons via
+        // `let a := ε(fun a => ∃ b, cond); let b := ε(fun b => cond); body`.
+        let out = LExpr::new(choose_node(
+            &[bind("a"), bind("b")],
+            &[nm("a"), nm("b")],
+            cond(),
+            Some(LExpr::var_lit("body")),
+        ));
+        let s = format!("{:?}", out.node);
+        assert_eq!(s.matches("Classical.epsilon").count(), 2, "one ε per binder: {s}");
+        assert!(s.contains("Exists"), "inner ∃ for later binders: {s}");
+        assert!(s.contains("Let"), "skolem lets: {s}");
+    }
+
+    #[test]
+    fn choose_witness_hyp_shape() {
+        // `(∃ x, cond) → (let x := ε(fun x => cond); cond)` — B2b's
+        // hypothesis; Classical.epsilon_spec at the value's exact ε-term.
+        let out = choose_witness_hyp(&[bind("x")], &[nm("x")], &cond());
+        let s = format!("{:?}", out.node);
+        assert!(s.contains("Exists"), "antecedent ∃: {s}");
+        assert!(s.contains("Classical.epsilon"), "ε in consequent: {s}");
+        assert!(s.contains("Implies") || s.contains("Imp"), "implication: {s}");
     }
 }

@@ -266,3 +266,110 @@ grep "rejected this fn" /tmp/allproofs.log \
 | `DeadEnd` origin (assert-by desugar) | `vir/src/ast_to_sst.rs:2296`; def `vir/src/sst.rs:203` |
 | Output dir resolution | `lean_verify/src/generate.rs` (`lean_out_root`) |
 | Solver enum (Z3/Cvc5 only) | `air/src/context.rs` |
+
+---
+
+## 10. Real-run results (2026-07-09) — the codegen numbers were the wrong bottleneck
+
+Full non-emit run on tactus-group-theory (`--lean-backend --lean-all-proofs -V cache`, run
+from the crate dir, no `TACTUS_LEAN_OUT`, so Lean output lands in `target/tactus-lean/lib/`):
+**229 verified, 24817 errors, 8 cached; ~91 min wall; 93 MB log** (`/tmp/tactus-gt-allproofs-real.log`).
+
+Of the 1338 fns that codegen: **214 pass a real Lean run (16%), 1124 fail.** But the error mass
+decomposes almost entirely into a handful of *translator bugs*, each amplified crate-wide — not
+into proof-power failures:
+
+| Family | Error blocks | Distinct fns | Root cause |
+|---|---:|---:|---|
+| Codegen rejections | 1,409 | 1,409 | Known: `DeadEnd` (1267) + `seq![a,b]` (142), §4 |
+| `auto-tactic failed` | 5,666 | 1,024 | Closer can't close — the *real* migration bucket |
+| Choose-body type mismatch | 2,596 | 440 | ONE renderer bug: `choose\|j\| P(j)` in hypothesis position renders as `(P j) ∧ j` (an `Int` conjunct). Epsilon form (`Classical.epsilon`) is emitted elsewhere in the same file, so it's the Bind(Choose)-with-body statement path |
+| Termination of recursive defs | 2,131 | 841 | TWO missing decreasing facts: `len (drop_first w) < len w` (+`drop_last`) ≈ 93% of goals; `a / m < a` (Nat div) the rest. Hits recursive spec-fn *preamble defs* and recursive proof fns alike |
+| Namespace shadow / missing def | 2,235 | 552 | Locals named `symbol` shadow the `symbol` *module* under Lean dot-notation → `symbol.generator_index` resolves as field lookup on `lib.symbol.Symbol` (2,203); missing `Option.deref` std spec def (28) |
+| `Inhabited T` synthesis | 713 | 569 | Typeclass gap in generic contexts |
+| Lean keyword collision | 182 | (in tail) | Verus locals named `prefix` hit Lean's reserved keyword — same identifier-hygiene family as the shadowing bug |
+| Heartbeats timeouts | ~26 | ~11 | **Perf cliffs are NOT the story** at this stage |
+
+(Families overlap per-fn; a fn typically hits several.)
+
+**Consequences for §7's rollout order.** Codegen coverage (`DeadEnd`, `seq!`) is no longer the
+top unlock. By leverage on *verified* fns:
+
+1. **Identifier hygiene** — sanitize binder names that collide with module namespaces or Lean
+   keywords (or emit `_root_.`-qualified names). Pure bug, mechanical, kills the
+   namespace-shadow + `prefix` families (~550 fns' spurious errors).
+2. **Choose-body rendering** — fix the `(P j) ∧ j` statement-path lowering (440 fns). Note:
+   until fixed, downstream `auto-tactic failed` goals in those fns are *undercounted victims* —
+   the choose witness fact arrives malformed, so goals that should close don't.
+3. **Two decreasing facts** — teach the emitted `decreasing_by` (or preamble `@[simp]` set)
+   `len (drop_first w) < len w` / `drop_last` / `Nat.div_lt_self` (841 fns).
+4. **`Inhabited`/`Nonempty` synthesis** in generic contexts (569 fns).
+5. *Then* re-run: the `auto-tactic failed` bucket (5,666 goals / 1,024 fns) is the true
+   closer-vs-Z3-idiom migration workload, and it will shrink once (1)–(4) stop corrupting
+   hypotheses. Only after that is the §7 `DeadEnd`/`seq!` codegen work the frontier again.
+
+**Gate hygiene note.** The working-tree `check.sh` (uncommitted edit) passes `--emit-lean`
+unconditionally, which *skips the Lean run* — it currently reports `3116 verified, 0 errors —
+Lean run skipped`, i.e. the standing gate is codegen-only for every Lean-routed fn. The
+`-V cache` + tee-to-log additions are keepers; the `--emit-lean` should be dropped from the
+default line (still passable via `"$@"`) once experimentation settles.
+
+### 10.1 Post-fix re-measurement (2026-07-09, same day — after B1–B4 of the bugs doc)
+
+Same command, after `DESIGN-lean-all-proofs-bugs.md` B1–B4 landed (`dbc77e5`,
+`00534c9`): **8,950 errors (was 24,817 — −64%); 253 of 1,338 codegen'd fns pass
+(was 214)**. Exec gate green throughout (24 verified, 0 errors — better than its
+own pre-existing baseline: `apply_hom_symbol_exec` came unstuck).
+
+| Family | Before | After | Notes |
+|---|---:|---:|---|
+| Codegen rejections | 1,409 | 1,409 | §7 features (`DeadEnd`, `seq![a,b]`) — untouched by design |
+| auto-tactic failed | 5,666 | 5,987 | GREW because walls fell — goals that never elaborated now reach the closer. This is the honest migration bucket. |
+| Type mismatch | 2,596 | 1,145 | Choose family = **0**. Residual is a DIFFERENT family: multi-element seq literals rendered as `List` where `Vector n` is expected (`{ deref := [a, b, c] }`) — §7-adjacent, previously hidden behind rejections. |
+| Namespace shadow / unknown ident | 2,235 | **0** | |
+| Termination | 2,131 | 81 | 68/81 are `drop_first` goals in files whose dep-walk lacks `axiom_seq_subrange_len`, so the measure companion can't emit — fix = extend the dep-walk to pull the axiom in whenever `Seq.drop_first` emits. Rest: `sizeOf (if …)` Int-abs measures. |
+| Inhabited synthesis | 713 | 3 | |
+| Keyword collisions | 182 | 0 | 39 NEW `unexpected token '('` parse errors — a structural renderer shape, not identifier collisions; small, untriaged. |
+| Heartbeats timeouts | ~26 | 71 | More fns reach real proving — expected growth. |
+
+**Reading the fn-level pass number correctly:** +39 fns looks modest because a fn
+passes only when EVERY goal closes, and the auto bucket (5,987 goals across ~1,000
+fns) now gates almost everything — exactly the measurement the bug-fixes were
+supposed to make honest. The error-mass collapse (−64%, with translator-bug
+families down from ~60% of errors to ~15%) is the real before/after.
+
+**Next frontiers, in order of leverage:** (1) the auto bucket — closer-vs-explicit-
+tactic migration policy (per-goal, this is now genuine proof work, not bugs);
+(2) §7 codegen: `StmX::DeadEnd` lowering (1,267 rejections) + multi-element seq
+literals (142 rejections + the 1,145 List/Vector mistypes); (3) the small residuals
+above (companion dep-walk, `'('` parse shape, B5 typed-spine deref).
+
+### 10.2 Post-F1–F4 re-measurement (2026-07-11, overnight)
+
+Same command, after `DESIGN-lean-all-proofs-followons.md` F1–F4 landed (`25970a5`,
+`2e203dc`, `8171498`, `95c5b1b` + the two B1a-regression fixes `1d88162`/`719733e`).
+Binary = F1–F4 exactly; the follow-on batch (`62f8bb0`: F2b/F2c/DoneEmpty) is NOT in this
+measurement (committed mid-run, deliberately not rebuilt). Wall: ~14 h across two legs
+(6 h timeout + `-V cache` resume) — the crate now emits 2,747 files (was 1,338), and
+F4-unlocked assert-by proofs multiply goals per fn.
+
+**Results: 0 codegen rejections (was 1,409) — 100% of 2,953 proof-obligation fns attempt
+Lean. 723 fns pass fully (24.5%, was 253/8.6%) — 2.9× the §10.1 pass count. Error blocks
+26,216 (was 8,950) — the predicted walls-fell growth: 1,409 formerly-silent fns now
+contribute goals.**
+
+| Family | §10.1 | Now | Notes |
+|---|---:|---:|---|
+| Codegen rejections | 1,409 | **0** | F3 + F4 |
+| Parse errors (`unexpected token`) | 39 | **0** | F1 |
+| Namespace/unknown-identifier | 0 | **0** | holds (incl. 2 regression fixes) |
+| Type mismatch | 1,145 | **61** | F3 killed List/Vector. Residual = the `tmp__ : Int` tuple-projection family (B5-adjacent, was 10 pre-F4; concentrated in 3 fns) |
+| Termination | 81 | 199 | 120 = drop_first goals of the F2c Prop-connective family + Int-abs (F2b) — **both addressed by the `62f8bb0` batch pending validation**; growth = F4-unlocked recursive proof fns |
+| `Invalid field deref` | 55 | 122 | B5's typed-spine family, more visible now (its arc is specced + in progress separately) |
+| Heartbeats (`maxHeartbeats`) | 71 | 998 | more fns reach real proving + more goals per fn; perf triage after the bug families |
+| **auto-tactic failed** | 5,987 | **24,080** | **the honest F7 workload** across ~2,230 fns — taxonomy next |
+
+**Reading it:** every structural translator family we targeted is at zero; what remains
+is (a) the two termination families the already-drafted batch addresses, (b) B5's deref
+family, (c) a 61-error B5-adjacent tuple residual, and (d) the auto bucket — now finally
+an honest, complete number. F7's taxonomy starts from these 24,080 goals.
