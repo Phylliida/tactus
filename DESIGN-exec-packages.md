@@ -185,9 +185,168 @@ fingerprints. Fast iteration: /tmp/defs_repro.rs shape (Vec exec fn +
 drop_first spec fn) exercises the full defs ladder in ~20s on the
 debug binary.
 
-Remaining M6 sequence: M6.0 accessor [Nonempty] residue (hygiene) →
-M6.2 exec stmt/pkg emission (per-fn) → M6.3 Link integration → M6.4/5
-tgt validation + default flip.
+Remaining M6 sequence: M6.3 Link integration → M6.0 accessor residue
+→ M6.2 fold-ins → M6.4/5 tgt validation + default flip. Detailed
+specs below (written 2026-07-11 while M6.2 validated).
+
+## M6.2 STATUS: LANDED (2026-07-11)
+
+Exec fns verify via package modules under --tactus-package-check:
+`emit_package_exec_fn` (own stmt module with per-obligation statement
+defs, PRECISE per-obligation helper scan over the SST-derived tactic
+texts — the ExecFn every-proof-fn over-approximation is dead on this
+path), `check_exec_fn_via_package` (M5e cacheable rule, fatal sorry,
+island fallback on any inexpressibility). One integration finding:
+Option B island texts cite helpers by GLOBAL dotted name, but package
+binders can only carry short names — `bridge_qualified_helper_refs`
+rewrites qualified helper references inside machine-generated pkg
+modules only (islands keep the verbatim text; one source serves both
+routes), with a short-name-collision guard that bails to islands.
+Suite pins: smoke (short + qualified citations), sorry-fatal.
+
+## M6.3 spec — Link integration for exec (the soundness headline)
+
+Exec obligations become Link-gated: closed forms join the composition
++ sorryAx/axiom closure. Post-M6.2 state: exec pkg oleans verify
+per-fn but are NOT registered (`record_pkg_olean_built` deliberately
+skipped) because two things are missing.
+
+**(1) Obligation registry.** `build_link_module` runs from the
+AST-level package graph; exec obligations only exist in the SST,
+available per-fn at check time. So: each `check_exec_fn_via_package`
+success records `(fn, obligation thm names, per-obligation dep lists,
+stmt module, pkg olean path)` into a registry (same pattern as
+`record_pkg_olean_built`); the Link/gate pass — which already runs
+after all per-fn checks — reads it. Exec obligations are LEAVES in
+the dependency graph (nothing references them), so they append after
+the proof-fn ordered loop; per obligation:
+`noncomputable def <thm>_closed : <thm>_stmt := <thm> <dep>_closed …`
+followed by `#tactus_check_axioms <thm>_closed [<Boundary>]` with the
+EXEC defs family's declared axiom set as Boundary.
+
+**(2) The two-family problem — DECISION NEEDED.** Exec pkg modules
+import EXEC-family stmt modules; helper proof fns' closed forms live
+in the PROOF-family Link. One Lean module cannot import both families
+(two copies of the spec world = duplicate decls). Options:
+
+- **A. Cross-family import** — collides; not viable.
+- **B. Exec-family pkg copies of cited helpers.** Helpers cited by
+  exec tactic texts get a second pkg module built against the exec
+  family; the exec Link is then self-contained. Incremental, small
+  (tgt cites ~5 helpers from exec texts), double-elaborates only
+  those helpers. Ships the soundness headline in one session.
+- **C. Family unification.** When full-roots defs pass
+  (`covers_exec`), verify PROOF fns against the exec defs module too:
+  one family, one stmt partition, one Link holding both proof closed
+  forms and exec obligations. Halves ladder cost, kills the dual-
+  family maintenance surface. Proof-only family survives solely as
+  degradation for `covers_exec == false` crates. Bigger churn: proof
+  islands/pkg re-key to the exec defs name (one-time marker/olean
+  invalidation), and the fallback matrix needs care (a crate whose
+  full-roots ladder REGRESSES must degrade proof fns gracefully back
+  to the proof family).
+
+LANDED 2026-07-11 same session (C-1 + C-2 both green: suite 543/0,
+tgt 82s at baseline, exec closed forms kernel-checked in the Link).
+
+DECIDED 2026-07-11 (Danielle): **C — the right way first.** Key
+implementation observation shrinking C: the proof pkg/stmt/Link
+machinery is already family-parametric (everything takes `defs`), so
+C is a defs-SELECTION change at the check chokepoints, not new
+machinery. Sequenced as:
+
+- **C-1 (unification):** in package-check mode, both proof and exec
+  checks first try the full-roots family
+  (`for_crate(Exec).filter(covers_exec)`); proof fns fall back to the
+  proof family when unavailable (today's path — the degradation
+  matrix), exec fns fall back to islands. On success the proof ladder
+  is never even attempted (the halving). Family choice is memoized
+  per scope → deterministic within a run, no mid-run flips. One-time
+  cache re-key (stmt/pkg modules rename to the exec-family scope).
+  Non-package modes untouched (islands are standalone).
+- **C-2 (= M6.3 core):** obligation registry recorded by
+  `check_exec_fn_via_package` successes; Link appends exec closed
+  forms after the proof-fn ordered loop (obligations are leaves);
+  `#tactus_check_axioms` per closed form against the exec-family
+  Boundary; exec pkg oleans registered; sorry relaxes to Link-backstop
+  parity (flip the sorry-fatal pin to expect the GATE catch).
+
+**(3) Sorry relaxation.** Once exec closed forms are Link-gated,
+exec pkg sorry drops from fatal-at-fn to warning + fatal Link sorryAx
+backstop (proof-fn parity; flip `island_sorry_failure` off the pkg
+path and pin with a test that a sorry FAILS via the gate instead).
+
+**Attribution:** per-obligation span marks already ride the pkg
+source map; `#tactus_check_axioms` failures name the closed form,
+which embeds the obligation theorem name → same Rust span.
+
+## M6.0 spec — accessor [Nonempty] residue — DONE 2026-07-11 (was
+already substantively landed: accessors take [Nonempty] +
+Classical.ofNonempty; datatypes stay Inhabited PROVIDERS for getElem!;
+instNonemptyOfInhabited bridges. Remaining work was the stale ProofFn
+caveat comment, now lifted.)
+
+Swap generated accessor signatures from `[Inhabited V]` +
+`default` to `[Nonempty V]` + `Classical.ofNonempty` (accessors are
+already noncomputable). Blast radius: accessor defs (crate_defs
+emission) + obligation binder sites that thread the instance. Island
+texts change once; `.verified` + ladder caches absorb it in one run.
+Payoff: single type-has-a-value currency with the nonempty axiom arc,
+smaller premises, and the ProofFn-config caveat ("accessors for types
+with non-Inhabited fields break elaboration even when unused") lifts
+— which may let the config distinction itself collapse post-C.
+
+## M6.2 fold-ins — DONE 2026-07-11 (all three below)
+
+- Tracked-write for the Link module (stop rewriting identical bytes —
+  today it invalidates downstream mtimes every run).
+- Numeric island/pkg cache-hit counts in the package gate note
+  (observability: "N pkg cached, M islands cached, K elaborated").
+- `v1 ` version prefix on the `.ladder` sidecar while the format is
+  young (forward-compat for record-shape changes like the fp fix).
+
+## M6.4/M6.5 spec — validation, then default
+
+- **M6.4 validation — DONE 2026-07-11** (loadavg ~10-14 during the
+  measurement, so these are conservative): COLD 186s (every Lean
+  artifact wiped: defs ladder + stmts + pkg + Link rebuilt from
+  nothing), WARM 80s/82s — matching the island-era best (82s) with
+  the composition gate in the loop. Errors = apply_hom baseline (2)
+  on all three runs; exec ladder `v1 0`; 27 pkg modules (Link builds
+  on gate runs — skipped here because the baseline failure skips the
+  gate, pre-existing behavior).
+- Original protocol: tgt cold run (wiped TACTUS_LEAN_OUT) + two
+  warm runs under package-check; record cold/warm wall-clock and the
+  gate note counts vs the pre-M6.2 island baseline (82s steady).
+  Cross-check: zero islands emitted for pkg-covered fns, exec ladder
+  `0`, errors = apply_hom baseline, `#tactus_check_axioms` closure
+  green over the full crate. (tactus-computability-theory dropped
+  from the protocol — Danielle 2026-07-11: tgt is the validation
+  crate.)
+- **M6.5 default flip — DONE 2026-07-11.** Package-check is the
+  --lean-backend default; --tactus-islands opts out; old flag forces
+  on. tgt default run 82s at baseline; opt-out verifies identically;
+  tgt check.sh inherits the default unchanged. The flip surfaced and
+  fixed two latent issues: per-fn fallback noise (now silent — the
+  gate note summarizes) and ProofClasses umbrella-routing (now Base
+  with prereq hoist, consumer-routing principle). **M6 COMPLETE.**
+- Original spec: package-check becomes the --lean-backend
+  default (islands remain automatic fallback per-fn); flag inverts to
+  an opt-out (--tactus-islands). Update tgt/ct check.sh, tutorial
+  docs, and the artifact ledger. Only after M6.3 (exec fns must not
+  LOSE their soundness gate by moving off islands) and one clean
+  M6.4.
+
+## Post-M6 horizon (recorded, not scheduled)
+
+- **C follow-through:** delete the proof-family ladder when unified
+  (keep degradation path); measure the ladder-cost halving.
+- **tgt check.sh flip** to package-check default once M6.5 lands.
+- **Mutual exec SCCs:** not applicable (obligation theorems never
+  mutually reference); documented here so nobody goes looking.
+- **apply_hom_symbol_exec:** still blocked on
+  tactus BUG-call-arg-temp-claimed-typ.md — unrelated to packages,
+  the 2-error tgt baseline until fixed.
 
 ## Sequencing (each step lands green alone)
 
