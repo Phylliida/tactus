@@ -1207,7 +1207,7 @@ fn build_batch(
     let _ = &ns;
 
     // Sanity over defs + batch: what Lean sees through the import.
-    #[cfg(debug_assertions)]
+    // Unconditional in all build profiles (see `generate::debug_check`).
     {
         let combined: Vec<Command> =
             defs.cmds.iter().cloned().chain(all_cmds.iter().cloned()).collect();

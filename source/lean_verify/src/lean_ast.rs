@@ -253,7 +253,8 @@ pub struct Datatype {
     /// result types (`| Plain : ∀ {A}, A → Mut A`) must use it: during
     /// elaboration the inductive is not yet a global constant, so the
     /// root-anchored `name` is `Unknown identifier` there (verified
-    /// empirically — same rule as `CURRENT_DECL_SELF` for field types).
+    /// empirically; the render-time relative-name machinery this rule
+    /// once shared is retired — Option B full names resolve mid-decl).
     pub self_name: String,
     pub typ_params: Vec<String>,
     pub kind: DatatypeKind,

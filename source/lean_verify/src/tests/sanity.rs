@@ -439,3 +439,53 @@ fn anchored_class_sibling_ref_flagged() {
         "expected anchored sibling-ref violation, got {:?}", v,
     );
 }
+
+/// The reserved-name rule (Option B's ONE reserved name): a binder equal
+/// to the crate namespace would capture the leading segment of every
+/// crate-internal reference. Runs in ALL build profiles.
+#[test]
+fn reserved_crate_ns_binder_flagged() {
+    crate::to_lean_type::install_crate_ns("resv_test_ns");
+    let t = Theorem {
+        name: "t".into(),
+        binders: vec![Binder {
+            name: Some(crate::lean_name::LeanName::lit("resv_test_ns")),
+            ty: var("Nat"),
+            kind: BinderKind::Explicit,
+        }],
+        goal: var("True"),
+        tactic: Tactic::Named("trivial".into()),
+        requires_preamble: Vec::new(),
+        heartbeats: None,
+        termination_by: Vec::new(),
+        decreasing_by: None,
+    };
+    let v = check_references(&[Command::Theorem(t)]);
+    assert!(
+        v.iter().any(|x| x.name.contains("shadows the crate namespace")),
+        "expected reserved-binder violation, got {:?}", v,
+    );
+    // A ∀-bound occurrence is flagged too (check_expr arm wiring).
+    let t2 = Theorem {
+        name: "t2".into(),
+        binders: vec![],
+        goal: Expr::new(ExprNode::Forall {
+            binders: vec![Binder {
+                name: Some(crate::lean_name::LeanName::lit("resv_test_ns")),
+                ty: var("Nat"),
+                kind: BinderKind::Explicit,
+            }],
+            body: Box::new(var("True")),
+        }),
+        tactic: Tactic::Named("trivial".into()),
+        requires_preamble: Vec::new(),
+        heartbeats: None,
+        termination_by: Vec::new(),
+        decreasing_by: None,
+    };
+    let v2 = check_references(&[Command::Theorem(t2)]);
+    assert!(
+        v2.iter().any(|x| x.name.contains("shadows the crate namespace")),
+        "expected forall-binder violation, got {:?}", v2,
+    );
+}
