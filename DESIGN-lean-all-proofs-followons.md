@@ -463,3 +463,26 @@ along.
   didn't materialize — downgraded to pure altitude; ride a future Wp-arm change.
 - **F5** (check.sh `--emit-lean` drop): one line, gated on Danielle (uncommitted
   working-tree edit is hers).
+
+---
+
+## Naming: Option B — no namespace wrapper, full dotted names (2026-07-11)
+
+Danielle flagged the post-B1a `_root_.{ns}.…` anchoring as clutter; a shadow-gated
+print-time de-anchor was proposed and REJECTED (context-sensitive display = the ite-
+rewrite mistake in display form). Two predictable alternatives were weighed — B: full
+path always, no `namespace` wrapper (`lib.word.empty_word` uniformly, zero context
+sensitivity, zero source impact); C: relative always + deterministic binder-suffix on
+module-segment collisions (~25 sites in gt: `symbol`×8, `h1`×8, `h2`×8). **Danielle
+picked B as most transparent.**
+
+Implementation (same day): `lean_name` drops the `_root_.` anchor (in-crate →
+`{ns}.{rel}`, cross-crate → bare); no `NamespaceOpen`/`Close` emission; the
+`CURRENT_DECL_SELF` machinery is RETIRED ENTIRELY — empirically at root scope (4.25),
+full-name self-references resolve fine mid-declaration for defs, inductives, and mutual
+groups (the `_root_.` prefix was what broke them, not mid-decl-ness; the `List.myLen`
+idiom generalizes). Class sibling refs keep strip-to-bare (only bare resolves in class
+bodies — unchanged empirics). One reserved name: a binder equal to the crate namespace
+would capture every crate-internal reference's leading segment — the sanity checker
+rejects it at every scope-insertion point (`check_reserved_binder`). The anchored-self-
+ref preventive rule stays as a regression tripwire.
