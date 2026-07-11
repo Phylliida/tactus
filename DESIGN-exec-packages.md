@@ -141,6 +141,36 @@ Retouch the ~9 tgt tactics (M6.1), validate 3116/0 cold + warm at the
 floor, flip exec packages to default with islands as fallback,
 measure and record.
 
+## M6.1 + M6.1b STATUS: DONE (2026-07-11)
+
+Landed: `5c4e3c9` (dual-krate), `fcddbea` (kind ladders + scope
+suffix re-land), tgt retouch `05e0bc7`. Suite 533/0; tgt errors =
+exactly the pre-existing apply_hom_symbol_exec baseline.
+
+What the day proved:
+- Dummy-param seam closed the right way: `injects_zero_arg_dummy`
+  exported from vir (injector's own predicate, used by the injector),
+  drop-dummy applied at both SST render boundaries.
+- A real vir-render gap surfaced and fixed: tuple patterns emitted
+  `tuple%N` ctor names; `Pattern::Tuple` now renders `(p, q)`.
+- The retouch surface on tgt was ONE fn (find_cancellation_exec,
+  4 occurrences of one cast-discharge pattern — the new match-world
+  axioms are CLEANER, without simplify's let-tmp chains).
+- The Inhabited dragon (old base:168) died as predicted: vstd
+  instances render match-style. Census: the next full-roots blocker
+  is a `Tactus.Ref (option.Option T)` type mismatch at base:167 —
+  the Ref-ABI corner (M6.0b item).
+- Timing note: a large apparent floor regression (~89s → ~300s
+  emit-only) was investigated with perf + a pre-M6.1 worktree A/B and
+  attributed to HOST LOAD (load average ~208 on 64 cores during all
+  measurements; baseline binary measured 250s under the same load =
+  yesterday's 85s × oversubscription). Relative A/B: M6.1 floor delta
+  ≤ ~20%, possibly noise. The churn diagnostic (touch/find-newer)
+  confirmed steady-state runs re-elaborate NOTHING (only the proof
+  `.ladder` sidecar rewrites — an untracked write, mtime-only;
+  housekeeping item: tracked-write it). Clean re-measure deferred to
+  an idle host.
+
 ## Sequencing (each step lands green alone)
 
 | Step | Content | Session-sized? |
