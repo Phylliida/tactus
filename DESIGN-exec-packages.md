@@ -307,13 +307,22 @@ with non-Inhabited fields break elaboration even when unused") lifts
 
 ## M6.4/M6.5 spec — validation, then default
 
-- **M6.4 validation:** tgt cold run (wiped TACTUS_LEAN_OUT) + two
+- **M6.4 validation — DONE 2026-07-11** (loadavg ~10-14 during the
+  measurement, so these are conservative): COLD 186s (every Lean
+  artifact wiped: defs ladder + stmts + pkg + Link rebuilt from
+  nothing), WARM 80s/82s — matching the island-era best (82s) with
+  the composition gate in the loop. Errors = apply_hom baseline (2)
+  on all three runs; exec ladder `v1 0`; 27 pkg modules (Link builds
+  on gate runs — skipped here because the baseline failure skips the
+  gate, pre-existing behavior).
+- Original protocol: tgt cold run (wiped TACTUS_LEAN_OUT) + two
   warm runs under package-check; record cold/warm wall-clock and the
   gate note counts vs the pre-M6.2 island baseline (82s steady).
   Cross-check: zero islands emitted for pkg-covered fns, exec ladder
   `0`, errors = apply_hom baseline, `#tactus_check_axioms` closure
-  green over the full crate. Also run tactus-computability-theory
-  (the second real crate) via its crate-local check.sh.
+  green over the full crate. (tactus-computability-theory dropped
+  from the protocol — Danielle 2026-07-11: tgt is the validation
+  crate.)
 - **M6.5 default flip:** package-check becomes the --lean-backend
   default (islands remain automatic fallback per-fn); flag inverts to
   an opt-out (--tactus-islands). Update tgt/ct check.sh, tutorial
