@@ -68,7 +68,9 @@ pub(crate) const TACTIC_BODY_FALLBACK: &str = "sorry";
 ///   theorem emitted next to the corresponding def (see
 ///   `seq_measure_companion_cmd` in `generate.rs`; B3 in
 ///   DESIGN-lean-all-proofs-bugs.md). The side goal `¬ len w = 0` closes
-///   from the branch guard via `assumption`/`simp_all`. In a crate that
+///   from the branch guard via `assumption`/`omega`/`simp_all` — `omega`
+///   for arithmetic guards (`3 ≤ len w` under F2c's wf_preprocess
+///   threading, which assumption/simp_all can't bridge). In a crate that
 ///   never emits the def/companion the `apply` head is unknown and the
 ///   branch just fails over.
 /// - `(repeat split) <;> omega` — **Int-typed measures** (F2b,
@@ -85,7 +87,7 @@ pub(crate) const TACTIC_BODY_FALLBACK: &str = "sorry";
 /// Tested against Lean 4.25.0 (BUG-spec-fn-decreases-mod-termination.md;
 /// div + seq branches: /tmp-prototype validation 2026-07-09, B3).
 const DECREASING_BY_TACTIC: &str =
-    "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Seq.drop_first_len_lt <;> (first | assumption | simp_all)) | (apply Seq.drop_last_len_lt <;> (first | assumption | simp_all)) | ((repeat split) <;> omega) | decreasing_tactic)";
+    "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Seq.drop_first_len_lt <;> (first | assumption | omega | simp_all)) | (apply Seq.drop_last_len_lt <;> (first | assumption | omega | simp_all)) | ((repeat split) <;> omega) | decreasing_tactic)";
 
 /// True when this param needs a body shadow because the shadow is
 /// load-bearing for the **mutation encoding** — `*x = e` lowers to
