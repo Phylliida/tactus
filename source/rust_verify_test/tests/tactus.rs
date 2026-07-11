@@ -13508,7 +13508,10 @@ test_verify_one_file_with_options! {
 test_verify_one_file! {
     #[test] test_binder_shadows_module_name verus_code! {
         mod word {
+            use vstd::prelude::*;
+            verus! {
             pub open spec fn empty_val() -> int { 7 }
+            }
         }
 
         #[verifier::tactus_auto]
