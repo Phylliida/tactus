@@ -1,0 +1,241 @@
+// Bootstrap fixture crate — the canonical minimal module covering every
+// SST/goal shape the R2 bridge must handle (DESIGN-bootstrap.md W0/W1/W3).
+// Each item is labeled with the feature it pins. Deliberately tiny fns:
+// one shape each. This crate is the differential-gate seed corpus (W3)
+// and the hand-bridge target set (W0 residue).
+//
+// Emit with (from the repo root, main checkout binary is fine read-only):
+//   TACTUS_LEAN_OUT=$PWD/bootstrap-fixture/out \
+//   <tactus>/source/target-verus/release/verus --crate-type=lib \
+//     --lean-backend --emit-lean --lean-all-proofs bootstrap-fixture/lib.rs
+
+use vstd::prelude::*;
+
+verus! {
+
+// ── Defs-layer shapes (W7 targets, referenced by goals below) ──────────────
+
+// F1: plain spec fn
+pub open spec fn sq(x: nat) -> nat { x * x }
+
+// F2: recursive spec fn, bare-Nat-param decreases (the W1.5 structural target)
+pub open spec fn tri(n: nat) -> nat
+    decreases n
+{
+    if n == 0 { 0 } else { n + tri((n - 1) as nat) }
+}
+
+// F3: user datatype + match + datatype-decreases recursive spec fn
+//     (height-measure emission; accessors; Box decoration)
+pub enum Tree {
+    Leaf(u64),
+    Node(Box<Tree>, Box<Tree>),
+}
+
+pub open spec fn sum_tree(t: Tree) -> nat
+    decreases t
+{
+    match t {
+        Tree::Leaf(v) => v as nat,
+        Tree::Node(l, r) => sum_tree(*l) + sum_tree(*r),
+    }
+}
+
+pub open spec fn tree_head(t: Tree) -> u64 {
+    match t {
+        Tree::Leaf(v) => v,
+        Tree::Node(_l, _r) => 0,
+    }
+}
+
+// ── proof-fn shapes ─────────────────────────────────────────────────────────
+
+// F4: plain proof fn, no tactic block (the --lean-all-proofs route; fuel unfold)
+proof fn tri_one()
+    ensures tri(1) == 1,
+{
+    assert(tri(0) == 0);
+}
+
+// F5: tactic-block proof fn (verbatim pass-through)
+proof fn add_comm_t(a: int, b: int)
+    ensures a + b == b + a
+by { omega }
+
+// F6: assert-by with a user tactic inside an exec fn (Wp::Scope / DeadEnd)
+//     — see also F9's invariant asserts. (Verus-style assert-by in plain
+//     proof fns is the StmX::DeadEnd family from the F4 arc.)
+proof fn scope_shape(n: nat)
+    ensures tri(n) >= 0,
+{
+    assert(tri(n) >= 0);
+}
+
+// F14: the cast-shape pins (DECISION-cast-rendering): elided var cast vs
+//      compound materialization — (x as nat) * (x as nat) vs sq
+proof fn cast_shapes(x: u64)
+    ensures (x as nat) * (x as nat) == sq(x as nat)
+by { simp only [sq] }
+
+// ── exec-fn shapes ──────────────────────────────────────────────────────────
+
+// F7: let-binding, mutation, overflow obligation, inline assert
+pub fn add_capped(x: u64, y: u64) -> (r: u64)
+    requires x < 1000, y < 1000,
+    ensures r == x + y,
+{
+    let mut s = x + y;
+    assert(s < 2000);
+    s = s + 0;
+    s
+}
+
+// F8: value-position if (walk_let fork)
+pub fn max_u64(x: u64, y: u64) -> (r: u64)
+    ensures r >= x, r >= y,
+{
+    let m = if x < y { y } else { x };
+    m
+}
+
+// F9: while loop — invariant init/maintain/use triple, havoc, decreases,
+//     cast in invariant ((acc as nat) == tri(...)), user assert-by-tactic
+pub fn sum_to(n: u64) -> (r: u64)
+    requires n <= 1000,
+    ensures r as nat == tri(n as nat),
+{
+    let mut i: u64 = 0;
+    let mut acc: u64 = 0;
+    while i < n
+        invariant
+            i <= n,
+            n <= 1000,
+            acc as nat == tri(i as nat),
+            acc <= 1000 * 1000,
+        decreases n - i,
+    {
+        i = i + 1;
+        acc = acc + i;
+    }
+    acc
+}
+
+// F10: nested loop + early `return` (early-exit control flow)
+pub fn find_square(limit: u64) -> (r: u64)
+    requires limit < 100,
+    ensures true,
+{
+    let mut a: u64 = 0;
+    while a < limit
+        invariant a <= limit, limit < 100,
+        decreases limit - a,
+    {
+        let mut b: u64 = 0;
+        while b < limit
+            invariant b <= limit, a < limit, limit < 100,
+            decreases limit - b,
+        {
+            if a * b == 36 {
+                return a;
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    0
+}
+
+// F12a: exec call with contract inlining at the call site
+pub fn double_exec(x: u64) -> (r: u64)
+    requires x < 1000,
+    ensures r == 2 * x,
+{
+    x + x
+}
+
+pub fn quad_exec(x: u64) -> (r: u64)
+    requires x < 500,
+    ensures r == 4 * x,
+{
+    let a = double_exec(x);
+    double_exec(a / 2) + a
+}
+
+// F12b: exec recursion with decreases (CheckDecreaseHeight family)
+pub fn count_down(n: u64) -> (r: u64)
+    ensures r == 0,
+    decreases n,
+{
+    if n == 0 { 0 } else { count_down(n - 1) }
+}
+
+// F13: Vec — view dispatch (v@), index bounds obligation, &mut + old()
+pub fn vec_read(v: &Vec<u64>, i: usize) -> (r: u64)
+    requires i < v@.len(),
+    ensures r == v@[i as int],
+{
+    v[i]
+}
+
+pub fn vec_push7(v: &mut Vec<u64>)
+    requires old(v)@.len() < 100,
+    ensures v@.len() == old(v)@.len() + 1, v@[old(v)@.len() as int] == 7,
+{
+    v.push(7);
+}
+
+// F15: generic fn (type param; Nonempty-bracket plumbing on the spec side)
+pub fn id_generic<T>(t: T) -> (r: T)
+    ensures r == t,
+{
+    t
+}
+
+// F17: match on user enum in exec (case split), Box deref, accessor shapes
+pub fn head_exec(t: &Tree) -> (r: u64)
+    ensures r == tree_head(*t),
+{
+    match t {
+        Tree::Leaf(v) => *v,
+        Tree::Node(_l, _r) => 0,
+    }
+}
+
+// F18: forall in ensures + invariant (quantified goal shapes)
+pub fn fill_zeros(n: usize) -> (v: Vec<u64>)
+    requires n < 100,
+    ensures
+        v@.len() == n as nat,
+        forall|k: int| 0 <= k < n as int ==> v@[k] == 0,
+{
+    let mut v: Vec<u64> = Vec::new();
+    let mut i: usize = 0;
+    while i < n
+        invariant
+            i <= n,
+            v@.len() == i as nat,
+            forall|k: int| 0 <= k < i as int ==> v@[k] == 0,
+        decreases n - i,
+    {
+        v.push(0);
+        i = i + 1;
+    }
+    v
+}
+
+// F19: struct + tuple shapes
+pub struct Point { pub x: u64, pub y: u64 }
+
+pub fn mk_point(a: u64, b: u64) -> (p: Point)
+    ensures p.x == a, p.y == b,
+{
+    Point { x: a, y: b }
+}
+
+pub fn swap_pair(a: u64, b: u64) -> (r: (u64, u64))
+    ensures r.0 == b, r.1 == a,
+{
+    (b, a)
+}
+
+} // verus!
