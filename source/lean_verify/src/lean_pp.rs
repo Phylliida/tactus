@@ -312,7 +312,11 @@ fn write_def(out: &mut String, d: &Def, lm: &mut Landmarks) {
     match d.termination_by.as_slice() {
         [] => {}
         [single] => {
-            out.push_str("termination_by ");
+            out.push_str(if d.termination_structural {
+                "termination_by structural "
+            } else {
+                "termination_by "
+            });
             write_expr(out, single, 0, lm);
             out.push('\n');
         }

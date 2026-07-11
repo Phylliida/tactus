@@ -233,7 +233,7 @@ fn structural_typ(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> Option<Ty
 
 /// Strip every reference decoration layer from a typ (and `Boxed`/
 /// `MutRef`). Returns the deepest non-decorated `Arc<TypX>`.
-fn strip_all_ref_decorations(typ: &Typ) -> Typ {
+pub(crate) fn strip_all_ref_decorations(typ: &Typ) -> Typ {
     match &**typ {
         TypX::Decorate(deco, _, inner) if decoration_wrapper(*deco).is_some() => {
             strip_all_ref_decorations(inner)

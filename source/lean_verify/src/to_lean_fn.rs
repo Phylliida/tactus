@@ -123,6 +123,34 @@ pub(crate) fn needs_param_deref(p: &Param) -> bool {
 /// reference-decorated params: spec_fn_to_ast standalone defs,
 /// trait_impl_to_ast instance method bodies, trait_to_ast class default
 /// bodies, proof_fn_to_ast requires/ensures.
+/// True iff the decreases measure is exactly one bare parameter whose
+/// (decoration-stripped) typ is a user datatype — the shape Lean's
+/// `termination_by structural` accepts: structural (subterm) recursion
+/// on that param, with Lean itself checking each recursive call. Nat/
+/// Int measures (`decreases n` with `(n-1) as nat` recursion) and
+/// computed measures (`decreases len(s) - i`) are NOT structural and
+/// keep WF emission.
+fn structural_measure_is_bare_datatype_param(decrease: &Exprs, params: &Params) -> bool {
+    if decrease.len() != 1 {
+        return false;
+    }
+    let v = match &decrease[0].x {
+        ExprX::ReadPlace(place, _) => match &place.x {
+            PlaceX::Local(v) => v,
+            _ => return false,
+        },
+        ExprX::Var(v) => v,
+        _ => return false,
+    };
+    params.iter().any(|p| {
+        p.x.name == *v
+            && matches!(
+                &*crate::to_lean_expr::strip_all_ref_decorations(&p.x.typ),
+                TypX::Datatype(..)
+            )
+    })
+}
+
 pub(crate) fn wrap_body_with_param_derefs(body: LExpr, params: &Params) -> LExpr {
     // Iterate in REVERSE so the FIRST param's let-binding ends up
     // outermost (after building the wrap by repeatedly prepending).
@@ -357,14 +385,24 @@ pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Vec<Com
                     d,
                 )
             }).collect();
+            // `#[verifier::structural_decreases]`: emit
+            // `termination_by structural <param>` (kernel-computable,
+            // axiom-free) when the measure is a bare datatype-typed
+            // param; Lean itself checks that every recursive call
+            // passes a subterm. Unsupported measure shapes fall back
+            // to WF emission with a note — never a hard failure
+            // (DESIGN-bootstrap.md W1.5).
+            let termination_structural = f.attrs.tactus_structural_decreases
+                && !termination_by.is_empty()
+                && structural_measure_is_bare_datatype_param(&f.decrease, &f.params);
             // Recursive spec fns get an explicit `decreasing_by` so measures
             // Lean's default tactic can't discharge (notably the modular
             // `a % b < b` of Euclidean gcd) still verify. Non-recursive defs
             // (empty `termination_by`) get `None` — a bare `decreasing_by`
             // without `termination_by` is a Lean error. See DECREASING_BY_TACTIC.
-            let decreasing_by = (!termination_by.is_empty())
+            let decreasing_by = (!termination_by.is_empty() && !termination_structural)
                 .then(|| DECREASING_BY_TACTIC.to_string());
-            vec![Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by, decreasing_by })]
+            vec![Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by, termination_structural, decreasing_by })]
         }
         None => {
             // Transparency: when the fallback DROPPED a body (vs. the fn
@@ -506,6 +544,7 @@ fn stmt_cmd(name: String, binders: Vec<LBinder>, goal: LExpr) -> Command {
         ret_ty: LExpr::var_lit("Prop"),
         body: forall_close(binders, goal),
         termination_by: Vec::new(),
+        termination_structural: false,
         decreasing_by: None,
     })
 }
@@ -1062,6 +1101,7 @@ fn datatype_nonempty_instance_cmd(
         ret_ty,
         body,
         termination_by: Vec::new(),
+        termination_structural: false,
         decreasing_by: None,
     }))
 }
@@ -1253,6 +1293,7 @@ fn height_fn_for_datatype(
             ret_ty: LExpr::var_lit("Nat"),
             body: LExpr::lit_int("1"),
             termination_by: vec![],
+            termination_structural: false,
             decreasing_by: None,
         }));
     }
@@ -1357,6 +1398,7 @@ fn height_fn_for_datatype(
         ret_ty: LExpr::var_lit("Nat"),
         body,
         termination_by: vec![termination],
+        termination_structural: false,
         decreasing_by: Some("all_goals (simp_all; omega)".to_string()),
     }))
 }
@@ -1517,6 +1559,7 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
             ret_ty: LExpr::var_lit("Prop"),
             body: match_on_x(arms),
             termination_by: vec![],
+            termination_structural: false,
             decreasing_by: None,
         }));
     }
@@ -1582,6 +1625,7 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
                 ret_ty: typ_to_expr(&f.a.0),
                 body: match_on_x(arms),
                 termination_by: vec![],
+                termination_structural: false,
                 decreasing_by: None,
             }));
         }
