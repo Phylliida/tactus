@@ -613,3 +613,56 @@ datatypes). Typ args from `expr.typ` (decoration-stripped). The kernel_computes
 e2e is now the COMPOUND pin: Box ctor coercion + structural emission + kernel
 `decide` in one goal. Battery 544/0. SST-path ctor sites remain unaudited for
 the same class (M6.2-era probe).
+
+---
+
+## 12. Next steps — post-roll execution order (planned 2026-07-11, evening)
+
+Session-sized bricks, in order. Everything below assumes the `bootstrap`
+worktree, `vargo test --release` for e2e, and Danielle's guidance that
+emit-module/package-check flags are the future default.
+
+- **N1 (small, warm-up): close today's residue.**
+  (a) Fixture emission commands gain `--tactus-package-check` (island fallback
+  stays); record any package-path surprises. (b) Annotate `w15_probe.rs`'s
+  `esize`/`lsize` with `#[verifier::structural_decreases]`; regenerate probe8
+  from the emission with NO manual flip — the W1.5 loop becomes emitter-native.
+  (c) SST-path probes for today's two bug classes on exec obligations: an exec
+  fn constructing `Expr::Add(Box::new(..), ..)` + one matching on Box-field
+  datatypes; fix-or-pin (the SST renderer stamps differently — unaudited).
+
+- **N2 (medium): tactus-core skeleton = the mirror types, AS TACTUS CODE.**
+  New crate `tactus-core`: `SstData`/`ExprLeaf`/`GoalData` datatypes covering
+  the Wp-input subset, with OWN CONS-LISTS (never Seq — P8's kernel-inertness
+  constraint), extrinsically typed (O9: tactus datatypes are non-indexed),
+  `structural_decreases` on every recursive spec fn from day one, verified
+  lean-only-clean. **The crate-defs emission of these datatypes IS the Lean
+  mirror vocabulary** — the serializer targets those emitted names; hand-Lean
+  is reserved for the denotation glue (§4.3). Include a golden unit test
+  pinning the covered `vir::sst` variant list (fails loudly when vir::sst
+  grows — the manual-sync tripwire).
+
+- **N3 (medium-large): the serializer (`sst_serialize.rs`) — THE new TCB.**
+  Rust, boring, 1:1, target <1k lines: from `build_wp`'s inputs (fn_sst body
+  Stm tree + the WpCtx spec context: params/typs, requires, ensures,
+  invariants, decrease) to Lean literals in the N2 vocabulary. Enumerate the
+  captured WpCtx fields explicitly in a doc comment — that list is the
+  faithfulness contract. FAIL LOUDLY outside the subset. Acceptance: the
+  fixture serializes 100%, literals written next to islands.
+
+- **N4 (small): corpus census.** Run the serializer over tgt (3116 fns):
+  % serializable + a ranked table of unsupported constructs — this sets W2's
+  coverage roadmap and is the first honest measure of subset size.
+
+- **N5 (small): literal smoke.** Every fixture literal elaborates against the
+  tactus-core defs olean (`lean` with LEAN_PATH, or package-check if N1a made
+  that natural). Cold + warm timing noted.
+
+- **Then W2 (multi-session): refWp stage A** per §5 — after N2 stabilizes the
+  `SstData` shape. Obligation ids emitted by refWp, pairing by id (O4).
+
+Standing coordination notes: the branch contains emit-module wholesale — when
+emit-module merges to main, sync this branch promptly (the three bug fixes +
+W1.5 may be wanted on main earlier; cherry-pick is clean, Danielle's call).
+The F6 fable's work overlaps `to_lean_expr.rs` — mention the Match-arm merge
+resolution (`e61d4d8`) to whoever merges next.
