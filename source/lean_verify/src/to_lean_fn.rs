@@ -142,12 +142,13 @@ fn structural_measure_is_bare_datatype_param(decrease: &Exprs, params: &Params) 
         ExprX::Var(v) => v,
         _ => return false,
     };
+    // UNDECORATED datatype only: a `&Tree`-typed param binds at
+    // `Tactus.Ref Tree` in Lean, and structural inference on a
+    // one-field-structure-wrapped binder is not a shape we've
+    // validated — decorated params keep WF emission (silent, like
+    // every other unsupported measure).
     params.iter().any(|p| {
-        p.x.name == *v
-            && matches!(
-                &*crate::to_lean_expr::strip_all_ref_decorations(&p.x.typ),
-                TypX::Datatype(..)
-            )
+        p.x.name == *v && matches!(&*p.x.typ, TypX::Datatype(..))
     })
 }
 

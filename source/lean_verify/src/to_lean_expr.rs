@@ -1057,44 +1057,54 @@ fn ctor_to_node(dt: &Dt, variant: &Ident, fields: &Binders<Expr>, ctx: &crate::e
 /// * `StmtX::Expr(e)` with a following statement  →  `let _ := e; rest`
 ///   (drops the value like Rust's `;` does).
 /// * Last stmt with no `final_expr` is the body.
+/// Recurses FORWARD (not a reverse fold) so each `Decl`'s pattern
+/// bindings extend `ctx.binder_typs` for the REST of the block — the
+/// same binder-map discipline as the `ExprX::Match` arm. Without it, a
+/// `let b = boxed;` binder renders its uses bare where spec-mode VIR
+/// stripped the Box decoration (the Decl-position sibling of the
+/// pattern-binder fix; caught by review, pinned by
+/// `test_spec_let_box_use_derefs`).
 fn block_to_node(stmts: &[Stmt], final_expr: Option<&Expr>, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
-    let body = match final_expr {
-        Some(e) => expr_to_ast(e, ctx),
-        None if stmts.is_empty() => LExpr::var_lit("()"),
-        // No final expression — the last stmt's value is the block's value.
-        // In spec mode this is unusual; fall back to unit.
-        None => LExpr::var_lit("()"),
-    };
-
-    let mut folded = body;
-    for stmt in stmts.iter().rev() {
-        folded = match &stmt.x {
-            StmtX::Decl { pattern, init, .. } => {
-                let value = match init {
-                    Some(place) => place_to_expr(&place.x, ctx),
-                    // No initializer (e.g., `let x;`) — give a placeholder.
-                    None => LExpr::var_lit("_"),
-                };
-                match &pattern.x {
-                    PatternX::Var(binding) => LExpr::let_bind(
-                        crate::lean_name::LeanName::from_var_ident(&binding.name),
-                        value,
-                        folded,
-                    ),
-                    other => LExpr::match_expr(value, vec![crate::lean_ast::MatchArm {
-                        pattern: pattern_to_ast(other),
-                        body: folded,
-                    }]),
-                }
-            }
-            StmtX::Expr(e) => LExpr::let_bind(
-                crate::lean_name::LeanName::lit("_"),
-                expr_to_ast(e, ctx),
-                folded,
-            ),
+    let Some((stmt, rest)) = stmts.split_first() else {
+        return match final_expr {
+            Some(e) => expr_to_ast(e, ctx).node,
+            // No final expression — the last stmt's value is the block's
+            // value. In spec mode this is unusual; fall back to unit.
+            None => LExpr::var_lit("()").node,
         };
+    };
+    match &stmt.x {
+        StmtX::Decl { pattern, init, .. } => {
+            // The initializer renders under the OUTER ctx (it can only
+            // reference earlier binders); the rest renders under the
+            // pattern-extended ctx.
+            let value = match init {
+                Some(place) => place_to_expr(&place.x, ctx),
+                // No initializer (e.g., `let x;`) — give a placeholder.
+                None => LExpr::var_lit("_"),
+            };
+            let mut extended = ctx.binder_typs.cloned().unwrap_or_default();
+            collect_pattern_binding_typs(&pattern.x, &mut extended);
+            let ctx_rest = ctx.with_binder_typs(&extended);
+            let rest_body = LExpr::new(block_to_node(rest, final_expr, &ctx_rest));
+            match &pattern.x {
+                PatternX::Var(binding) => LExpr::let_bind(
+                    crate::lean_name::LeanName::from_var_ident(&binding.name),
+                    value,
+                    rest_body,
+                ).node,
+                other => LExpr::match_expr(value, vec![crate::lean_ast::MatchArm {
+                    pattern: pattern_to_ast(other),
+                    body: rest_body,
+                }]).node,
+            }
+        }
+        StmtX::Expr(e) => LExpr::let_bind(
+            crate::lean_name::LeanName::lit("_"),
+            expr_to_ast(e, ctx),
+            LExpr::new(block_to_node(rest, final_expr, ctx)),
+        ).node,
     }
-    folded.node
 }
 
 // ── Patterns ────────────────────────────────────────────────────────────

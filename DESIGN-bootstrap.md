@@ -587,3 +587,17 @@ expected ("Application type mismatch" at elaboration). Fix needs declared
 field typs at ctor render sites (RenderCtx has no datatype map — real
 plumbing, own brick). Repro = the commented construction in
 test_structural_decreases_kernel_computes.
+
+**REVIEW PASS (same day):** (a) crate-defs/package spec-world emission goes
+through the SAME `spec_fn_to_ast` — structural_decreases renders identically
+in islands and defs modules, no render divergence (DefCurried has no
+production constructor — vestigial). (b) The documented Decl-let residue was
+A LIVE BUG (review probe: `let b = l; tsize(*b)` rendered bare, island RED)
+— `block_to_node` rewritten to forward recursion threading pattern bindings
+through `ctx.binder_typs`; pinned by `test_spec_let_box_use_derefs`.
+(c) structural helper tightened: decorated (`&Tree`) params now keep WF
+(structural on a `Tactus.Ref`-wrapped binder is unvalidated). Suite 544/0.
+Still-open review items: attribute silently ignored on mutual spec fns and
+proof/exec fns (document-or-warn, W5); SST-path (exec obligation) match
+binders unaudited for the same class — accessor-based, likely fine, worth a
+probe when M6.2 lands; fixture not yet exercising --tactus-package-check.
