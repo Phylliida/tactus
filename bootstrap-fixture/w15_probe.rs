@@ -5,8 +5,13 @@
 // does `termination_by structural` accept recursion through Box.deref,
 // and does the def then kernel-reduce (decide/rfl)?
 //
-//   TACTUS_LEAN_OUT=$PWD/out <tactus>/source/target-verus/release/verus \
-//     --crate-type=lib --lean-backend --emit-lean --lean-all-proofs w15_probe.rs
+//   Canonical check (live Lean, package gate — N1a validated: 5/0,
+//   composition + axiom closures kernel-verified):
+//     TACTUS_LEAN_OUT=$PWD/out ../source/target-verus/release/verus \
+//       --crate-type=lib --lean-backend --lean-all-proofs \
+//       --tactus-package-check w15_probe.rs
+//   Emission-only corpus dump (islands into out/, no Lean run):
+//     add --emit-lean, drop --tactus-package-check
 
 use vstd::prelude::*;
 
@@ -22,6 +27,7 @@ pub enum PList {
     Cons(Box<PExpr>, Box<PList>),
 }
 
+#[verifier::structural_decreases]
 pub open spec fn esize(e: PExpr) -> nat
     decreases e
 {
@@ -31,6 +37,7 @@ pub open spec fn esize(e: PExpr) -> nat
     }
 }
 
+#[verifier::structural_decreases]
 pub open spec fn lsize(l: PList) -> nat
     decreases l
 {
@@ -63,6 +70,7 @@ pub open spec fn head_size(t: Tree2) -> nat {
 
 pub enum Tree2 { Leaf2(u64), Node2(Box<Tree2>, Box<Tree2>) }
 
+#[verifier::structural_decreases]
 pub open spec fn tsize(t: Tree2) -> nat
     decreases t
 {
@@ -70,5 +78,44 @@ pub open spec fn tsize(t: Tree2) -> nat
 }
 
 proof fn use_head_size(t: Tree2) ensures head_size(t) >= 0 by { simp }
+
+} // verus!
+
+verus! {
+
+// N1c probe 1 (SST ctor class): exec body CONSTRUCTS a Box-field datatype;
+// the ensures compares against the spec-side ctor (VIR-AST path, fixed).
+// Exercises whether the SST renderer re-wraps erased Box::new at ctor slots.
+pub fn mk_node(a: u64, b: u64) -> (r: Tree2)
+    ensures r == Tree2::Node2(Box::new(Tree2::Leaf2(a)), Box::new(Tree2::Leaf2(b)))
+{
+    Tree2::Node2(Box::new(Tree2::Leaf2(a)), Box::new(Tree2::Leaf2(b)))
+}
+
+// N1c probe 2 (SST match-binder class): exec match BINDS a Box-typed field
+// and uses it at inner type (deref through the binder), mirrored by a
+// spec fn with the same shape.
+pub open spec fn spec_left_val(t: Tree2) -> u64 {
+    match t {
+        Tree2::Leaf2(v) => v,
+        Tree2::Node2(l, _r) => match *l {
+            Tree2::Leaf2(v) => v,
+            Tree2::Node2(_, _) => 0,
+        },
+    }
+}
+
+#[verifier::tactus_tactic("simp only [w15_probe.spec_left_val]; split <;> cases ht : t.deref <;> simp_all <;> (try (split <;> simp_all)) <;> (try (split <;> simp_all))")]
+pub fn left_val(t: &Tree2) -> (r: u64)
+    ensures r == spec_left_val(*t)
+{
+    match t {
+        Tree2::Leaf2(v) => *v,
+        Tree2::Node2(l, _r) => match &**l {
+            Tree2::Leaf2(v) => *v,
+            Tree2::Node2(_, _) => 0,
+        },
+    }
+}
 
 } // verus!

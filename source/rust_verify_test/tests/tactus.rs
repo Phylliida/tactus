@@ -19,6 +19,26 @@ fn verify_one_file(name: &str, code: String, options: &[&str]) -> Result<TestErr
     common::verify_one_file(name, code, &options)
 }
 
+// === SST-path ctor: exec ensures comparing against Box-field ctor ===
+// The exec-obligation twin of the ctor-arg fix: the ensures renders
+// through the SST expr renderer, where erased spec-side Box::new ctor
+// args gain the declared-slot `.mk` wrap, while exec-body atomized
+// locals (var-like under poly wrappers, storage already Box) are left
+// untouched. Both directions pinned by this one contract.
+test_verify_one_file! {
+    #[test] test_sst_ctor_box_slot_coercion verus_code! {
+        use vstd::prelude::*;
+
+        pub enum Tree { Leaf(u64), Node(Box<Tree>, Box<Tree>) }
+
+        pub fn mk_node(a: u64, b: u64) -> (r: Tree)
+            ensures r == Tree::Node(Box::new(Tree::Leaf(a)), Box::new(Tree::Leaf(b)))
+        {
+            Tree::Node(Box::new(Tree::Leaf(a)), Box::new(Tree::Leaf(b)))
+        }
+    } => Ok(())
+}
+
 // === spec-mode let of a Box-typed value: uses re-materialize .deref ===
 // The Decl-position sibling of the match-arm pattern-binder fix: a plain
 // `let b = l;` where l : Box<T> binds b at `Tactus.Box T`, while spec-mode

@@ -1436,8 +1436,68 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
         // brought into the Lean preamble by `dep_order::walk_expr`'s
         // `ExprX::Ctor` case.
         ExpX::Ctor(dt, variant, fields) => {
+            // Declared-slot coercion (the SST twin of the VIR-AST
+            // `coerce_ctor_field`): Verus erases `Box::new`/`Rc::new`
+            // at ctor argument slots in SPEC exprs, so a rendered arg
+            // can sit bare where the constructor declares
+            // `Tactus.Box T`. Fields render through the TYPED spine
+            // and bridge into the declared slot via `into_slot` —
+            // actual-aware, so exec-body values already at storage
+            // depth (a local holding a real Box) coerce by identity
+            // while erased spec-side ctors gain the `.mk` wrap. Slot
+            // typs from the shared `CTOR_FIELD_TYPS` table; typ args
+            // from the ctor typ peeled of Decorate AND Boxed (the SST
+            // poly wrapper — same peel as the tuple arm above).
+            // Unknown datatypes bridge to the claim (status quo).
+            let typ_args: Vec<Typ> = {
+                let mut t = &*e.typ;
+                loop {
+                    match t {
+                        TypX::Decorate(_, _, inner) | TypX::Boxed(inner) => t = &**inner,
+                        _ => break,
+                    }
+                }
+                match t {
+                    TypX::Datatype(_, targs, _) => targs.iter().cloned().collect(),
+                    _ => Vec::new(),
+                }
+            };
+            // Shape gate: only NON-VAR-LIKE fields take the declared
+            // slot. Exec bodies atomize ctor args to locals (vars,
+            // possibly under transparent CoerceMode/Loc wrappers)
+            // whose Lean storage already matches the slot — but whose
+            // SST CLAIM can lie bare for Box::new temporaries (outside
+            // the walker's let-binder env), so a claim-based bridge
+            // would double-wrap them. Erased spec-side Box::new ctors
+            // are always non-var nested exprs. Residual edge (pinned,
+            // doc §12): a spec-side `let x = e;` used in a Box slot
+            // whose binder is env-invisible would still render bare.
+            fn is_var_like(e: &Exp) -> bool {
+                match &e.x {
+                    ExpX::Var(_) | ExpX::VarLoc(_) | ExpX::VarAt(..) => true,
+                    // Peel ALL unary wrappers: poly Box/Unbox, mode
+                    // coercions, clips — a place-read under any of
+                    // these renders at storage depth (claims can lie
+                    // bare); and for non-ref-typed results the skipped
+                    // coercion is identity anyway.
+                    ExpX::Unary(_, inner) => is_var_like(inner),
+                    ExpX::UnaryOpr(_, inner) => is_var_like(inner),
+                    ExpX::Loc(inner) => is_var_like(inner),
+                    _ => false,
+                }
+            }
             let rendered = fields.iter()
-                .map(|f| sst_exp_to_ast_checked_with_ctx(&f.a, ctx))
+                .map(|f| -> Result<LExpr, String> {
+                    let typed = exp_to_typed(&f.a, ctx)?;
+                    let slot = match dt {
+                        _ if is_var_like(&f.a) => None,
+                        Dt::Path(path) => crate::expr_shared::ctor_field_typ(
+                            path, variant.as_str(), f.name.as_str(), &typ_args,
+                        ),
+                        Dt::Tuple(_) => None,
+                    };
+                    Ok(typed.into_slot(slot.as_ref().unwrap_or(&f.a.typ)))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             ctor_node(dt, variant, rendered)
         }

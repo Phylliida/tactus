@@ -666,3 +666,24 @@ emit-module merges to main, sync this branch promptly (the three bug fixes +
 W1.5 may be wanted on main earlier; cherry-pick is clean, Danielle's call).
 The F6 fable's work overlaps `to_lean_expr.rs` — mention the Match-arm merge
 resolution (`e61d4d8`) to whoever merges next.
+
+**N1 COMPLETE (post-roll session):**
+(a) `--tactus-package-check` VALIDATED live on w15_probe (7/0, package gate:
+composition + axiom closures kernel-verified; canonical command now in the
+file header). lib.rs runs the gate too but carries 12 pre-existing unclosed
+proofs (identical set in island mode — closure debt, not package surprises;
+fixture-debt item for the W3 era). Package artifacts ride the lean-project
+workspace, not TACTUS_LEAN_OUT.
+(b) probe8 regenerated EMITTER-NATIVE: attribute on esize/lsize, verbatim
+emitted text, decide/rfl, zero axioms, zero manual edits.
+(c) SST-path probes: **ctor class = REAL BUG, FIXED** — exec-obligation
+ensures rendered erased Box::new ctors bare; the SST ExpX::Ctor arm now
+bridges NON-VAR-LIKE fields into declared slots via the typed spine
+(into_slot; var-like fields — locals under poly/mode wrappers — stay at
+storage depth, where claims can lie bare for Box::new temporaries). Pinned
+by test_sst_ctor_box_slot_coercion. **Match-binder class = NO BUG** (SST
+accessor rendering derefs correctly); left_val closed with an explicit
+split/cases closer. Residual pinned: spec-side let-bound/field-read vars in
+Box slots with env-invisible binders would still render bare — the honest
+wide fix is truthful claims (upstream U2 work).
+Battery: e2e 545/0, lean_verify 299+7/0.
