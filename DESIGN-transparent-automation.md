@@ -237,3 +237,32 @@ distribution should be watched, not guessed.
 
 B1, B4, B5 are mutually independent. B1's histogram may shrink B2/B3 to
 "suggestions only" (§6 decision table) — measure first.
+
+---
+
+## Brick 1 result (2026-07-11): rung-winner histogram
+
+Measured per-THEOREM via minimal-prefix chains (`rfl` → `+decide` → `+omega` →
+`+tactus_peel∘T1` → full `tactus_auto`) over a stratified sample of currently-passing
+fns' emitted artifacts (post Option-B naming; 75 theorems / 38 fns; harness =
+`/tmp/fast_attrib.py` pattern — combined file per fn with variant-suffixed theorem
+copies, preamble elaborated once, bare `lean`, 8-way parallel; ~2 min a run):
+
+| minimal closer | share |
+|---|---:|
+| `rfl` | 4.0% |
+| `omega` | 18.7% |
+| `tactus_peel` ∘ {rfl,decide,omega} | 12.0% |
+| **T2 (`simp_all`/`tactus_case_split`)** | **64.0%** |
+
+**Decision-table read (§6): the `simp_all` share is LARGE** — outright removal of T2
+from the default ladder would be a usability cliff. The indicated path is
+**squeeze-and-pin (§3)**: the ladder stays dev-time-only, `simp_all` winners minimize to
+named-lemma `simp only [...]` pins, artifacts replay deterministically. ~35% of passing
+goals already need nothing beyond T1(+peel), and the F7 taxonomy suggests peel∘omega
+additionally closes a large slice of the currently-FAILING bucket (46% of 24k goals are
+quantified/let-wrapped shapes validated against peel∘omega in scratch) — so the
+deterministic floor is substantially higher than today's default suggests. Danielle's
+standing direction: `tactus_auto` disappears from artifacts; with `tactus_tactic("...")`
+also being removed, the end state is two surfaces — emitter-derived tactics + inline
+proofs.
