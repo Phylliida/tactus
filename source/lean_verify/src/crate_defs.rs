@@ -317,7 +317,13 @@ fn build_defs(
     let fp = crate::project::ladder_fingerprint();
     let mut recorded: Option<(usize, String)> = if build {
         std::fs::read_to_string(&ladder_path).ok().and_then(|t| {
+            // `v1 ` format version prefix (M6.2 fold-in): unversioned
+            // or future-versioned records read as absent → full
+            // ladder retry, which is always safe.
             let mut it = t.split_whitespace();
+            if it.next() != Some("v1") {
+                return None;
+            }
             match (it.next(), it.next(), it.next()) {
                 (Some(a), Some(h), Some(f)) if f == fp => {
                     a.parse::<usize>().ok().map(|a| (a, h.to_string()))
@@ -344,12 +350,13 @@ fn build_defs(
     if build {
         if let Some(t) = std::fs::read_to_string(&ladder_path).ok() {
             let parts: Vec<&str> = t.split_whitespace().collect();
-            if parts.len() == 2 + attempts.len()
-                && parts[0] == "FAILED"
+            if parts.len() == 3 + attempts.len()
+                && parts[0] == "v1"
+                && parts[1] == "FAILED"
                 && parts[parts.len() - 1] == fp
             {
                 let all_match = attempts.iter().enumerate().all(|(i, &(r, ea, ce, bu))| {
-                    render_hash_only(r, ea, ce, bu).as_deref() == Some(parts[1 + i])
+                    render_hash_only(r, ea, ce, bu).as_deref() == Some(parts[2 + i])
                 });
                 if all_match {
                     return None;
@@ -393,7 +400,7 @@ fn build_defs(
                         let _ = std::fs::create_dir_all(
                             ladder_path.parent().expect("ladder path has a parent"));
                         let _ = std::fs::write(
-                            &ladder_path, format!("{} {} {}\n", attempt, content_hash, fp));
+                            &ladder_path, format!("v1 {} {} {}\n", attempt, content_hash, fp));
                     }
                     return Some(Arc::new(defs));
                 }
@@ -424,7 +431,7 @@ fn build_defs(
             let _ = std::fs::create_dir_all(
                 ladder_path.parent().expect("ladder path has a parent"));
             let _ = std::fs::write(
-                &ladder_path, format!("FAILED {} {}\n", hashes.join(" "), fp));
+                &ladder_path, format!("v1 FAILED {} {}\n", hashes.join(" "), fp));
         }
         return None;
     }
