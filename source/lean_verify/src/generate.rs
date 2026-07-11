@@ -1771,6 +1771,10 @@ pub fn emit_proof_fn(
     // built (or poisoned to None) before this runs; in `--emit-lean`
     // mode this writes the defs source without building. Takes the
     // pre-inline krate — `for_crate` applies its own inline pass.
+    // TODO(M6.5): emit-module mode still writes proof-family artifacts;
+    // unify with `unified_package_defs` once build=false covers_exec
+    // semantics are settled (the ladder decides covers_exec, and this
+    // path deliberately skips the build).
     let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, false, crate::crate_defs::ScopeKind::Proof);
     // Package emission (M2, --tactus-emit-module): additive artifact
     // under pkg/; islands (and the batch) remain the checking
@@ -2249,6 +2253,38 @@ fn package_graph_for(
     }).clone()
 }
 
+/// C-2 (M6.3) exec obligation registry: what the Link module needs to
+/// close exec obligations — recorded at pkg-emission time because the
+/// obligations exist only in the SST (per-fn, at check time), while
+/// `build_link_module` runs from the AST-level graph. Keyed by defs
+/// scope; in package-check mode the Link builds exactly once, at the
+/// crate gate, AFTER all per-fn checks — so the registry is complete
+/// when read. Only `Ok(Single)` emissions record (island-fallback fns
+/// have no pkg module to compose); Link elaboration re-checks every
+/// imported module, so recording at emit (not verify) time keeps the
+/// same semantics as the proof-fn side's krate enumeration.
+struct ExecLinkEntry {
+    /// pkg module leaf (import name).
+    leaf: String,
+    /// (obligation theorem name, helper deps in BINDER ORDER — the
+    /// closed form applies `<dep>_closed` in exactly this order).
+    obligations: Vec<(String, Vec<vir::ast::Path>)>,
+}
+
+static EXEC_LINK_REGISTRY: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<ExecLinkEntry>>>,
+> = std::sync::OnceLock::new();
+
+fn record_exec_link_entry(scope: &str, entry: ExecLinkEntry) {
+    let map = EXEC_LINK_REGISTRY.get_or_init(Default::default);
+    let mut map = map.lock().unwrap_or_else(|p| p.into_inner());
+    let entries = map.entry(scope.to_string()).or_default();
+    // Re-emission of the same fn (memo miss across bucket threads)
+    // replaces its entry — obligations are derived deterministically.
+    entries.retain(|e| e.leaf != entry.leaf);
+    entries.push(entry);
+}
+
 static PKG_OLEAN_BUILT: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
 > = std::sync::OnceLock::new();
@@ -2327,6 +2363,26 @@ fn ensure_stmt_olean(
 /// we re-run through `check_lean_file --json` for span-mapped
 /// diagnostics (failures are the rare case; the double elaboration
 /// prices in only where a human is about to read output).
+/// C-1 family unification (DESIGN-exec-packages.md M6.3/C): the ONE
+/// defs family package machinery verifies against — the FULL-ROOTS
+/// (exec) family when it covers exec, else the proof family as
+/// degradation. One family means one stmt partition and one Link for
+/// the whole crate; on the happy path the proof-only ladder is never
+/// attempted. Selection is memoized per scope inside `for_crate`, so
+/// the choice is stable within a run.
+fn unified_package_defs(
+    krate: &KrateX,
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> Option<std::sync::Arc<crate::crate_defs::CrateDefs>> {
+    crate::crate_defs::for_crate(
+        krate, crate_name, tactic_bodies, true, crate::crate_defs::ScopeKind::Exec,
+    ).filter(|d| d.covers_exec)
+    .or_else(|| crate::crate_defs::for_crate(
+        krate, crate_name, tactic_bodies, true, crate::crate_defs::ScopeKind::Proof,
+    ))
+}
+
 fn check_proof_fn_via_package(
     krate: &KrateX,
     proof_fn: &FunctionX,
@@ -2336,7 +2392,7 @@ fn check_proof_fn_via_package(
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> Option<CheckResult> {
     install_emit_tables(krate, crate_name);
-    let defs = match crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true, crate::crate_defs::ScopeKind::Proof) {
+    let defs = match unified_package_defs(krate, crate_name, tactic_bodies) {
         Some(d) => d,
         None => {
             eprintln!(
@@ -2916,7 +2972,7 @@ pub fn check_package(
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> Result<PackageGateReport, String> {
     install_emit_tables(krate, crate_name);
-    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true, crate::crate_defs::ScopeKind::Proof)
+    let defs = unified_package_defs(krate, crate_name, tactic_bodies)
         .ok_or("shared-defs module unavailable (defs build failed or gate unmet)")?;
     let g = package_graph_for(krate, crate_name, tactic_bodies);
     let graph = g.view();
@@ -3370,6 +3426,18 @@ fn build_link_module(
     for f in &ordered {
         cmds.push(Command::Import(lean_name(&f.name.path).replace('.', "__")));
     }
+    // C-2 (M6.3): exec obligation entries — imports join the header,
+    // closed forms append after the proof-fn loop (obligations are
+    // LEAVES: nothing references them, their deps are proof fns whose
+    // closed forms precede them).
+    let exec_entries: Vec<ExecLinkEntry> = EXEC_LINK_REGISTRY
+        .get_or_init(Default::default)
+        .lock().unwrap_or_else(|p| p.into_inner())
+        .remove(&defs.scope)
+        .unwrap_or_default();
+    for e in &exec_entries {
+        cmds.push(Command::Import(e.leaf.clone()));
+    }
     cmds.push(Command::Raw(crate::prelude::TACTUS_SET_OPTIONS.to_string()));
     // Option B: no namespace wrapper — decl names are fully qualified.
     let ns = sanitize(crate_name);
@@ -3426,6 +3494,33 @@ fn build_link_module(
         cmds.push(Command::Raw(format!(
             "#tactus_check_axioms {}_closed [{}]\n", name, boundary_list
         )));
+    }
+    // Exec obligation closed forms (C-2/M6.3): the soundness headline —
+    // exec obligations join the composition + sorryAx/axiom closure.
+    for e in &exec_entries {
+        for (thm_name, dep_paths) in &e.obligations {
+            let args: Vec<LExpr> = dep_paths.iter()
+                .map(|p| LExpr::var_lit(&format!("{}_closed", lean_name(p))))
+                .collect();
+            let body_head = LExpr::var_lit(thm_name);
+            let closed_body = if args.is_empty() {
+                body_head
+            } else {
+                LExpr::app(body_head, args)
+            };
+            cmds.push(Command::Def(Def {
+                attrs: Vec::new(),
+                name: format!("{}_closed", thm_name),
+                binders: Vec::new(),
+                ret_ty: LExpr::var_lit(&format!("{}_stmt", thm_name)),
+                body: closed_body,
+                termination_by: Vec::new(),
+                decreasing_by: None,
+            }));
+            cmds.push(Command::Raw(format!(
+                "#tactus_check_axioms {}_closed [{}]\n", thm_name, boundary_list
+            )));
+        }
     }
     let rendered = pp_commands(&cmds);
     let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
@@ -3607,6 +3702,7 @@ fn emit_package_exec_fn(
         &broadcast_lemmas, Some(defs),
     );
     let _ = ns;
+    let thm_names: Vec<String> = theorems.iter().map(|t| t.name.clone()).collect();
     for (thm, thm_deps) in theorems.into_iter().zip(per_thm_deps.iter()) {
         let mut thm = thm;
         if !thm_deps.is_empty() {
@@ -3647,6 +3743,13 @@ fn emit_package_exec_fn(
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let changed = write_lean_file_tracked(&path, &rendered.text)?;
+    record_exec_link_entry(&defs.scope, ExecLinkEntry {
+        leaf: leaf.clone(),
+        obligations: thm_names.into_iter()
+            .zip(per_thm_deps.iter())
+            .map(|(n, ds)| (n, ds.iter().map(|f| f.name.path.clone()).collect()))
+            .collect(),
+    });
     Ok(PkgEmitOutcome::Single { leaf, path, source_map, stmt_modules, changed })
 }
 
@@ -3697,6 +3800,7 @@ fn check_exec_fn_via_package(
                 && !defs.breaking
                 && olean.exists();
             if cacheable {
+                record_pkg_olean_built(&path);
                 return Some(CheckResult::Success { warnings: vec![] });
             }
             for (m, ch) in &stmt_modules {
@@ -3707,14 +3811,14 @@ fn check_exec_fn_via_package(
             }
             let pkg_dir = path.parent().expect("pkg file has a parent").to_path_buf();
             let result = run_lean_json(&pkg_dir, &leaf, true, &base_path);
-            if let Ok(r) = &result {
-                if r.success {
-                    if let Some(fail) = island_sorry_failure(
-                        r, None, &vir_fn.name.path, &path, &source_map)
-                    {
-                        return Some(fail);
-                    }
-                }
+            // Sorry parity with the proof-fn package path (C-2/M6.3):
+            // warning at fn level; the Link gate's #tactus_check_axioms
+            // closure is the fatal backstop — exec closed forms are in
+            // it now. (A gate skipped by an UNRELATED fn error still
+            // fails the run via that error, so no green run can carry
+            // an ungated sorry.)
+            if matches!(&result, Ok(r) if r.success) {
+                record_pkg_olean_built(&path);
             }
             Some(format_lean_check_result(result, vir_fn, &path, &source_map))
         }
