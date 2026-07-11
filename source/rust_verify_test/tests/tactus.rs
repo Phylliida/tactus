@@ -13496,3 +13496,27 @@ test_verify_one_file_with_options! {
         }
     } => Ok(())
 }
+
+// === Option B naming: full dotted names at root scope ===
+// References render as `test_crate.word.f` with NO namespace wrapper, so
+// a binder sharing a MODULE's first segment cannot capture (pre-B1a this
+// exact shape silently resolved `word.empty_val` against the local
+// binder; post-B1a it was defended by `_root_.` anchoring; under Option
+// B the leading `test_crate.` segment makes capture impossible — only a
+// binder named like the CRATE could collide, which the sanity checker's
+// reserved-name rule rejects).
+test_verify_one_file! {
+    #[test] test_binder_shadows_module_name verus_code! {
+        mod word {
+            pub open spec fn empty_val() -> int { 7 }
+        }
+
+        #[verifier::tactus_auto]
+        fn shadowed(v: u8) -> (r: u8)
+            ensures r == v, crate::word::empty_val() == 7
+        {
+            let word = v; // binder named exactly like the module
+            word
+        }
+    } => Ok(())
+}
