@@ -870,6 +870,12 @@ pub enum Pattern {
     /// `MyType.Variant`), path-derived and not subject to VarIdent
     /// shadowing.
     Ctor { name: String, args: Vec<Pattern> },
+    /// Lean anonymous-constructor tuple pattern `(p1, p2, …)` — the
+    /// pattern-side render of `Dt::Tuple` (the expr side is
+    /// `ExprNode::Tuple`). `Tuple(1)` never reaches here: the type
+    /// renderer flattens 1-tuples to their element, so
+    /// `pattern_to_ast` flattens the pattern too.
+    Tuple(Vec<Pattern>),
     Or(Box<Pattern>, Box<Pattern>),
     /// `name@pattern`.
     Binding { name: crate::lean_name::LeanName, sub: Box<Pattern> },
@@ -1376,6 +1382,11 @@ where
                 f(a);
             }
         }
+        Pattern::Tuple(args) => {
+            for a in args {
+                f(a);
+            }
+        }
         Pattern::Or(l, r) => {
             f(l);
             f(r);
@@ -1398,6 +1409,7 @@ where
             name: name.clone(),
             args: args.iter().map(|a| f(a)).collect(),
         },
+        Pattern::Tuple(args) => Pattern::Tuple(args.iter().map(|a| f(a)).collect()),
         Pattern::Or(l, r) => Pattern::Or(Box::new(f(l)), Box::new(f(r))),
         Pattern::Binding { name, sub } => Pattern::Binding {
             name: name.clone(),

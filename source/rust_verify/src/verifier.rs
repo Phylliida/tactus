@@ -20,7 +20,8 @@ use rustc_interface::interface::Compiler;
 use rustc_session::config::ErrorOutputType;
 
 use vir::messages::{
-    Message, MessageLabel, MessageLevel, MessageX, ToAny, message, note, note_bare, warning_bare,
+    Message, MessageLabel, MessageLevel, MessageX, ToAny, error_bare, message, note, note_bare,
+    warning_bare,
 };
 
 use num_format::{Locale, ToFormattedString};
@@ -1963,29 +1964,19 @@ impl Verifier {
                             && matches!(query_op, QueryOp::Body(Style::Normal))
                         {
                             let fn_span = &function.span;
-                            // Use the post-simplify krate so dummy-param
-                            // injection aligns with what SST call sites
-                            // see — the pre-simplify `vir_crate` would
-                            // desynchronise on zero-arg fns. The
-                            // `None` branch can't fire in the current
-                            // pipeline (`verify_crate_inner` populates
-                            // this before calling `verify_bucket`), but
-                            // the Option in the type signature forces
-                            // future callers to acknowledge the timing.
-                            let vir_krate = match self.simplified_krate() {
-                                Some(k) => k,
-                                None => {
-                                    self.count_errors += 1;
-                                    reporter.report(&message(
-                                        MessageLevel::Error,
-                                        "tactus_auto: simplified krate not available — \
-                                         pipeline ordering bug (verify_crate_inner should \
-                                         run before verify_bucket)".to_string(),
-                                        fn_span,
-                                    ).to_any());
-                                    continue;
-                                }
-                            };
+                            // M6.1 dual-krate (DESIGN-exec-packages.md):
+                            // the exec spec-world/defs renders from the
+                            // UNSIMPLIFIED vir krate — the same render
+                            // world proof fns use (match-style bodies,
+                            // one authoring world, no cross-render trust
+                            // seam). The fn's own obligations still come
+                            // from the SST params below, which are
+                            // post-simplify; the dummy-param arity gap on
+                            // zero-arg fns is reconciled at the SST
+                            // render boundary (drop-dummy rule), not by
+                            // rendering the simplified krate.
+                            let vir_krate = self.vir_crate.as_ref()
+                                .expect("vir_crate should be initialized");
                             let vir_fn = match vir_krate.functions.iter()
                                 .find(|f| f.x.name == function.x.name)
                             {
@@ -2607,6 +2598,10 @@ impl Verifier {
         // global consulted inside lean_verify's emit/check entry
         // points, so their signatures and these call sites stay put.
         lean_verify::crate_defs::set_enabled(self.args.tactus_crate_defs);
+        // Package emission (DESIGN-emit-module.md M2) — same process-
+        // global pattern; consulted inside `emit_proof_fn`.
+        lean_verify::generate::set_package_enabled(self.args.tactus_emit_module);
+        lean_verify::generate::set_package_check_enabled(self.args.tactus_package_check);
 
         let time_verify_sequential_start = Instant::now();
 
@@ -3228,6 +3223,75 @@ impl Verifier {
         Ok(())
     }
 
+    /// M4 package gate: regenerate + elaborate the full-krate package
+    /// (defs, stmts, per-fn/mutual Proofs modules, Link with
+    /// `#tactus_check_axioms`). Skipped when per-fn verification had
+    /// errors (the package would fail derivatively — report the real
+    /// failures, not the cascade). Gate failures count as verification
+    /// errors: the user asked for the package to be part of the
+    /// verdict.
+    fn run_package_gate(&mut self, compiler: &Compiler, spans: &SpanContext) {
+        let reporter = Reporter::new(spans, compiler);
+        if self.count_errors > 0 {
+            reporter.report_now(&note_bare(
+                "tactus: package gate skipped (per-fn verification had errors)",
+            ).to_any());
+            return;
+        }
+        let Some(krate) = self.vir_crate.clone() else {
+            return;
+        };
+        let tactic_bodies = build_tactic_bodies_map(&krate);
+        if tactic_bodies.is_empty() {
+            return; // nothing routed to Lean → no package to check
+        }
+        let crate_name = self.crate_name.clone().unwrap_or_else(|| "crate".to_string());
+        match lean_verify::check_package(&krate, &crate_name, &tactic_bodies) {
+            Ok(report) => {
+                for s in &report.skipped_sccs {
+                    reporter.report_now(&note_bare(format!(
+                        "tactus: package gate: skipped {}", s
+                    )).to_any());
+                }
+                if report.failures.is_empty() {
+                    let reuse = if report.reused > 0 {
+                        format!(" ({} reused from per-fn checks)", report.reused)
+                    } else {
+                        String::new()
+                    };
+                    reporter.report_now(&note_bare(format!(
+                        "tactus: package gate: {} modules elaborated{}; composition + \
+                         axiom closures kernel-verified",
+                        report.modules, reuse,
+                    )).to_any());
+                } else {
+                    for (module, output) in &report.failures {
+                        self.count_errors += 1;
+                        reporter.report_now(&error_bare(format!(
+                            "tactus: package gate: module `{}` failed:\n{}",
+                            module, output,
+                        )).to_any());
+                    }
+                }
+            }
+            Err(e) if e.contains("shared-defs module unavailable") => {
+                // Tiny crates legitimately fall below the defs-module
+                // gate; their per-fn checks already used islands (with
+                // a per-fn warning). A defs BUILD failure was already
+                // eprintln'd loudly at build time — not silent.
+                reporter.report_now(&note_bare(format!(
+                    "tactus: package gate skipped: {} — per-fn checks used islands", e
+                )).to_any());
+            }
+            Err(e) => {
+                self.count_errors += 1;
+                reporter.report_now(&error_bare(format!(
+                    "tactus: package gate could not run: {}", e
+                )).to_any());
+            }
+        }
+    }
+
     pub(crate) fn verify_crate<'tcx>(
         &mut self,
         compiler: &Compiler,
@@ -3238,6 +3302,19 @@ impl Verifier {
 
         let result =
             if !self.args.no_verify { self.verify_crate_inner(&compiler, spans) } else { Ok(()) };
+
+        // Tactus package gate (M4, DESIGN-emit-module.md): after per-fn
+        // verification, regenerate the FULL-krate package (one scope —
+        // independent of bucketing) and elaborate it, making the
+        // kernel-checked composition + axiom-closure claims part of the
+        // run's verdict. `--emit-lean` stays codegen-only.
+        if result.is_ok()
+            && (self.args.tactus_emit_module || self.args.tactus_package_check)
+            && !self.args.emit_lean
+            && !self.args.no_verify
+        {
+            self.run_package_gate(compiler, spans);
+        }
 
         let time_verify_crate_end = Instant::now();
         self.time_verify_crate = time_verify_crate_end - time_verify_crate_start;

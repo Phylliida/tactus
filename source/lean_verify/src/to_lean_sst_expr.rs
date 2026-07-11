@@ -1239,6 +1239,14 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
             // None (cross-crate callee not in fn_map), falls back to
             // no-coerce.
             let expected_typs = ctx.fn_param_typs(fun, &typs[..]);
+            // M6.1 drop-dummy rule: nullary callees are rendered
+            // dummy-less from the vir krate; drop the SST call's
+            // injected `Const 0` arg (see RenderCtx::callee_injects_dummy).
+            let args: &[Exp] = if ctx.callee_injects_dummy(fun) && args.len() == 1 {
+                &args[..0]
+            } else {
+                &args[..]
+            };
             let rendered_args: Result<Vec<LExpr>, String> = args.iter().enumerate().map(|(i, a)| {
                 // Typed spine (P1): bridge from the arg's ACTUAL
                 // rendered typ, not the claimed `a.typ`.
