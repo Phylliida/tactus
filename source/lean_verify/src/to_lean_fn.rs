@@ -86,8 +86,27 @@ pub(crate) const TACTIC_BODY_FALLBACK: &str = "sorry";
 ///
 /// Tested against Lean 4.25.0 (BUG-spec-fn-decreases-mod-termination.md;
 /// div + seq branches: /tmp-prototype validation 2026-07-09, B3).
-const DECREASING_BY_TACTIC: &str =
-    "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Seq.drop_first_len_lt <;> (first | assumption | omega | simp_all)) | (apply Seq.drop_last_len_lt <;> (first | assumption | omega | simp_all)) | ((repeat split) <;> omega) | decreasing_tactic)";
+/// Built per-call rather than a const: the seq companion names must be
+/// FULLY QUALIFIED (`{ns}.Seq.drop_first_len_lt`) under Option B naming.
+/// The bare `Seq.drop_first_len_lt` form only resolved via Lean's
+/// declaration-namespace walk (a decl named `lib.m.f` elaborates as-if
+/// inside `namespace lib.m`, so relative names try `lib.m.Seq.…` then
+/// `lib.Seq.…`) — verified empirically 2026-07-11. That implicit walk is
+/// a capture surface (a crate module named `Seq` would shadow the
+/// companion), so the rung cites the absolute name like every other
+/// emitted reference. `crate_ns() == None` (ns-less unit-test renders)
+/// keeps the bare form.
+fn decreasing_by_tactic() -> String {
+    let q = |n: &str| match crate::to_lean_type::crate_ns() {
+        Some(ns) => format!("{}.{}", ns, n),
+        None => n.to_string(),
+    };
+    format!(
+        "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply {df} <;> (first | assumption | omega | simp_all)) | (apply {dl} <;> (first | assumption | omega | simp_all)) | ((repeat split) <;> omega) | decreasing_tactic)",
+        df = q("Seq.drop_first_len_lt"),
+        dl = q("Seq.drop_last_len_lt"),
+    )
+}
 
 /// True when this param needs a body shadow because the shadow is
 /// load-bearing for the **mutation encoding** — `*x = e` lowers to
@@ -333,7 +352,7 @@ pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Vec<Com
             // (empty `termination_by`) get `None` — a bare `decreasing_by`
             // without `termination_by` is a Lean error. See DECREASING_BY_TACTIC.
             let decreasing_by = (!termination_by.is_empty())
-                .then(|| DECREASING_BY_TACTIC.to_string());
+                .then(decreasing_by_tactic);
             vec![Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by, decreasing_by })]
         }
         None => {
@@ -461,7 +480,7 @@ pub fn proof_fn_to_ast(
     // `a % b < b`) still verifies. Gated on non-empty `termination_by` — a
     // bare `decreasing_by` on a non-recursive theorem is a Lean error.
     let decreasing_by = (!termination_by.is_empty())
-        .then(|| DECREASING_BY_TACTIC.to_string());
+        .then(decreasing_by_tactic);
     Theorem {
         name: lean_name(&f.name.path),
         binders,

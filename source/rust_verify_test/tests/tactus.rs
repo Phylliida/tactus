@@ -13523,3 +13523,50 @@ test_verify_one_file! {
         }
     } => Ok(())
 }
+
+// === F2c: recursion under Prop connectives (wf_preprocess prelude lemmas) ===
+// A spec fn whose self-call sits under `||`/`&&` gets its decreasing
+// goal the branch guards ONLY via the prelude's proved @[wf_preprocess]
+// theorems (Tactus.or_eq_dite/and_eq_dite) — Lean's own set rewrites
+// just ite→dite. Without them: `failed to prove termination` (the
+// guard `len != 0` is absent from context and the goal is unprovable).
+// Guards the prelude lemmas + the seq-companion rung's side-goal omega.
+test_verify_one_file! {
+    #[test] test_spec_fn_recursion_under_prop_connectives verus_code! {
+        use vstd::seq::*;
+
+        spec fn no_zero(s: Seq<int>) -> bool
+            decreases s.len()
+        {
+            s.len() == 0 || (s[0] != 0 && no_zero(s.drop_first()))
+        }
+
+        #[verifier::tactus_auto]
+        fn noop(v: u8) -> (r: u8)
+            ensures r == v, no_zero(Seq::<int>::empty()) == no_zero(Seq::<int>::empty())
+        { v }
+    } => Ok(())
+}
+
+// === F2b: Int-typed decreases measures (Int.toNat wrap) ===
+// `decreases (if t >= 0 { t } else { -t })` is Int-typed; Lean would
+// wrap it in sizeOf whose Int unfolding is an opaque Int.rec omega
+// can't see through. wrap_int_measure emits `Int.toNat (...)` instead,
+// and the `(repeat split) <;> omega` rung closes the value-position-if
+// goals. Without either half: `failed to prove termination`.
+test_verify_one_file! {
+    #[test] test_spec_fn_int_abs_decreases_measure verus_code! {
+        spec fn count_steps(t: int) -> int
+            decreases (if t >= 0 { t } else { -t })
+        {
+            if t == 0 { 0 }
+            else if t > 0 { count_steps(t - 1) + 1 }
+            else { count_steps(t + 1) + 1 }
+        }
+
+        #[verifier::tactus_auto]
+        fn noop(v: u8) -> (r: u8)
+            ensures r == v, count_steps(0) == count_steps(0)
+        { v }
+    } => Ok(())
+}
