@@ -307,7 +307,8 @@ fn render_and_build(
         }
     }
     cmds.push(Command::Raw(crate::prelude::TACTUS_PRELUDE_IMPORT.to_string()));
-    cmds.push(Command::NamespaceOpen(ns.clone()));
+    // Option B: no namespace wrapper (decls carry full dotted names).
+    let _ = &ns;
     cmds.push(Command::Raw("set_option autoImplicit false".to_string()));
     // Union of emittable broadcast axioms (CRATEDEFS 1c fix c): per-fn
     // files collect a SUBSET of these (default-on-import groups +
@@ -326,7 +327,7 @@ fn render_and_build(
     cmds.extend(crate::generate::spec_world_cmds(
         inlined_krate, ectx, &walk_roots, emit_accessors, &bc_union, true,
     ));
-    cmds.push(Command::NamespaceClose(ns));
+    let _ = ns;
 
     let rendered = crate::lean_pp::pp_commands(&cmds);
     let lean_path = dir.join(format!("{}.lean", module_name));
@@ -576,7 +577,8 @@ fn build_batch(
     }
     header_cmds.push(Command::Import(defs.module_name.clone()));
     header_cmds.push(Command::Raw(crate::prelude::TACTUS_SET_OPTIONS.to_string()));
-    header_cmds.push(Command::NamespaceOpen(ns.clone()));
+    // Option B: no namespace wrapper (decls carry full dotted names).
+    let _ = &ns;
     header_cmds.push(Command::Raw("set_option autoImplicit false".to_string()));
 
     // Exact line accounting: render the header and each theorem chunk
@@ -606,9 +608,8 @@ fn build_batch(
         all_cmds.push(cmd);
         line += chunk_lines;
     }
-    let footer_cmd = Command::NamespaceClose(ns.clone());
-    text.push_str(&crate::lean_pp::pp_commands(std::slice::from_ref(&footer_cmd)).text);
-    all_cmds.push(footer_cmd);
+    // Option B: no namespace wrapper — nothing to close.
+    let _ = &ns;
 
     // Sanity over defs + batch: what Lean sees through the import.
     #[cfg(debug_assertions)]
