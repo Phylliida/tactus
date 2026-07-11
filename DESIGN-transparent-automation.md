@@ -245,7 +245,7 @@ B1, B4, B5 are mutually independent. B1's histogram may shrink B2/B3 to
 Measured per-THEOREM via minimal-prefix chains (`rfl` → `+decide` → `+omega` →
 `+tactus_peel∘T1` → full `tactus_auto`) over a stratified sample of currently-passing
 fns' emitted artifacts (post Option-B naming; 75 theorems / 38 fns; harness =
-`/tmp/fast_attrib.py` pattern — combined file per fn with variant-suffixed theorem
+`tools/rung-attrib/fast_attrib.py` — combined file per fn with variant-suffixed theorem
 copies, preamble elaborated once, bare `lean`, 8-way parallel; ~2 min a run):
 
 | minimal closer | share |
