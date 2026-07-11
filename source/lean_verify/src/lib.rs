@@ -37,3 +37,9 @@ pub use generate::{
 };
 pub use to_lean_fn::LeanSourceMap;
 pub use sourcemap::{Sidecar, SidecarFn};
+
+// Golden tripwire for the bootstrap mirror types (N2) — see the
+// test file header.
+#[cfg(test)]
+#[path = "tests/bootstrap_coverage.rs"]
+mod bootstrap_coverage_tests;

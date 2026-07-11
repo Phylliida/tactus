@@ -10,9 +10,12 @@
 //! resolve from the per-fn SST; fns using `broadcast use` fall back to
 //! standalone emission entirely).
 //!
-//! Flag-gated because tiny crates LOSE: the defs build (~1.3s+)
-//! outweighs its savings when the spec world is a few lines — i.e.,
-//! most e2e test crates. Real multi-fn crates opt in.
+//! Always on, whatever the crate size: tiny crates pay a defs build
+//! (~1.3s cold) that sharing doesn't strictly repay, but every crate
+//! goes through the SAME pipeline — no size heuristic silently
+//! switching behavior underfoot. Warm runs hit the content-keyed
+//! defs memo and cross-run caches, so the cost is a cold-run-only
+//! constant.
 //!
 //! One process verifies one crate; the defs render/build is memoized
 //! per crate name. `check_*` calls [`for_crate`] with `build: true`
@@ -69,7 +72,7 @@ pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::SeqCst);
 }
 
-/// `None` = standalone emission (flag off, gate not met, or defs build
+/// `None` = standalone emission (flag off, or defs build
 /// failed — every caller treats `None` as "emit the full preamble per
 /// file", today's behavior).
 type Memo = Mutex<std::collections::HashMap<String, Option<Arc<CrateDefs>>>>;
@@ -210,18 +213,13 @@ fn build_defs(
             "tactus: build_defs scope `{}`: tactic_bodies {}, exec(with body) {}, krate fns {}",
             scope, tactic_bodies.len(), execs, krate.functions.len());
     }
-    // Gate: sharing pays only when ≥2 checked fns split the defs cost.
-    // Proof fns with tactic bodies are each checked; exec-fn count is
-    // an over-approximation (mode + body present) — over-counting just
-    // risks one unprofitable defs build, never incorrectness.
-    let exec_roots: Vec<&FunctionX> = krate.functions.iter()
-        .map(|f| &f.x)
-        .filter(|f| matches!(f.mode, vir::ast::Mode::Exec) && f.body.is_some())
-        .collect();
-    if tactic_bodies.len() + exec_roots.len() < 2 {
-        return None;
-    }
-
+    // No size gate: every crate builds its defs module, however small.
+    // A ≥2-checked-fns threshold used to skip the build for tiny crates
+    // (the ~1.3s defs build outweighs sharing there), but a heuristic
+    // that silently switches which pipeline a crate gets is worse than
+    // the second it saves — predictability over the micro-win
+    // (2026-07-12, Danielle). Cross-run content-keyed caching keeps the
+    // repeated cost near zero anyway.
     // Same krate transform + ambient tables the per-fn emit paths
     // apply — the defs render must agree with the fn files that import
     // it. Deterministic, so the content-compare below is stable.
@@ -245,7 +243,17 @@ fn build_defs(
         .map(|f| &f.x)
         .filter(|f| {
             matches!(f.mode, vir::ast::Mode::Proof)
-                && tactic_bodies.contains_key(&f.name)
+                && (tactic_bodies.contains_key(&f.name)
+                    // WP-routed proof fns: a Verus-code body with no
+                    // tactic block still lowers to WP obligations whose
+                    // stmt defs reference the fn's spec world — it must
+                    // be a dep-walk root like any tactic fn (surfaced
+                    // when the defs size gate was removed: an
+                    // empty-body proof fn's contract referenced spec
+                    // fns absent from the defs module). Over-inclusion
+                    // only widens the walk; bodyless externals stay
+                    // out.
+                    || f.body.is_some())
         })
         .collect();
     let exec_roots: Vec<&FunctionX> = inlined_krate.functions.iter()
@@ -294,12 +302,22 @@ fn build_defs(
     // Proof scope: consumers never need exec coverage, so the old
     // full-roots attempt was a guaranteed-wasted elaboration on every
     // cold run — start at the proof rung.
+    // WP-routed proof fns (Verus-code body, no tactic block) lower
+    // through the SAME SST/accessor-shaped path as exec obligations —
+    // their stmt defs reference `isSome`/`<Variant>_valN` accessors,
+    // so accessor emission must not key on exec roots alone (surfaced
+    // when the defs size gate was removed).
+    let wp_routed_proof_present = inlined_krate.functions.iter().any(|f| {
+        matches!(f.x.mode, vir::ast::Mode::Proof)
+            && f.x.body.is_some()
+            && !tactic_bodies.contains_key(&f.x.name)
+    });
     let attempts: Vec<(&[&FunctionX], bool, bool, bool)> = match kind {
         ScopeKind::Exec => vec![
-            (&full_roots, !exec_roots.is_empty(), true, true),
+            (&full_roots, !exec_roots.is_empty() || wp_routed_proof_present, true, true),
         ],
         ScopeKind::Proof => vec![
-            (&proof_roots, false, false, true),
+            (&proof_roots, wp_routed_proof_present, false, true),
             (&proof_roots, false, false, false),
         ],
     };
@@ -1044,8 +1062,8 @@ impl ProofBatch {
     pub fn emit_output(&self, f: &Fun) -> Option<EmitOutput> {
         let r = self.region(f)?;
         Some(EmitOutput {
-            // --emit-lean sidecar: no Lean run follows, the gate
-            // threshold is never consulted and nothing may cache.
+            // --emit-lean sidecar: no Lean run follows and nothing
+            // may cache.
             first_theorem_line: None,
             changed: true,
             file_path: self.file_path.clone(),

@@ -687,3 +687,26 @@ split/cases closer. Residual pinned: spec-side let-bound/field-read vars in
 Box slots with env-invisible binders would still render bare — the honest
 wide fix is truthful claims (upstream U2 work).
 Battery: e2e 545/0, lean_verify 299+7/0.
+
+**GATE REMOVAL + N2 (post-roll session 2):** Danielle: defs size gate (<2
+checked fns → islands) removed for predictability. Removal EXPOSED 5 real
+gaps the gate hid, ALL FIXED: (1) stmt modules lacked theorems'
+requires_preamble (BitVec Int instances) — threaded; (2) pkg exec failure
+header said "tactic" where islands say "tactus_auto" — mode-keyed parity;
+(3) **soundness**: exec-only crates get no Link gate, so pkg-path sorry was
+warning-only → sorry now FATAL on every per-fn path (Link stays the
+cached-verdict backstop); (4) assume(P) warnings dropped by the pkg exec
+route — threaded; (5) WP-routed proof fns (Verus body, no tactic block)
+were neither defs-walk roots nor accessor triggers — both widened. Suite
+549/0; cost of uniformity: suite 131.7s vs 71.6s (every crate builds defs).
+
+**N2 SKELETON LANDED: `tactus-core/lib.rs`** — LeafList/StmData/GoalData/
+GoalList mirror types (stage-A StmX subset, opaque u64 leaves), sequencing
+via Seq/Skip (NO mutual recursion — structural_decreases is single-fn),
+structural on all 4 recursive spec fns, in-crate `decide` sanity proofs =
+kernel-computation validated live; 6/0 under the package gate (defs module
+= the Lean vocabulary exists). Golden tripwire
+`lean_verify/src/tests/bootstrap_coverage.rs`: exhaustive StmX match, 9
+covered / 9 deliberately-uncovered — compile-fails when vir::sst grows.
+N2 residue: probe9 (extract emitted vocabulary, decide against it) — fold
+into N3 acceptance.

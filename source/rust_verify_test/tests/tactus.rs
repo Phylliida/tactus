@@ -474,7 +474,7 @@ test_verify_one_file! {
             1
         }
     } => Err(err) => {
-        assert!(err.errors.iter().any(|d| d.message.contains("sorry is fatal on the island path")),
+        assert!(err.errors.iter().any(|d| d.message.contains("sorry is fatal on the per-fn path")),
             "exec island sorry must be fatal; got: {:?}",
             err.errors.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -10588,7 +10588,7 @@ test_verify_one_file! {
         // History: silent pass → warning (M5 review arc) → FATAL on
         // the island path (island cache arc): islands have no Link
         // gate behind them, so the warning layer was the ONLY layer.
-        assert!(err.errors.iter().any(|d| d.message.contains("sorry is fatal on the island path")),
+        assert!(err.errors.iter().any(|d| d.message.contains("sorry is fatal on the per-fn path")),
             "admit/sorry must fail on the island path; got: {:?}",
             err.errors.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -13448,10 +13448,16 @@ test_verify_one_file_with_options! {
 
         proof fn lemma_sneaky(n: nat) ensures double(n) >= n by { sorry }
     } => Err(err) => {
-        assert!(err.errors.iter().any(|d| d.message.contains("contains sorry")),
+        // Per-fn sorry fatality (uniform island/pkg rule) preempts the
+        // Link gate on the live path; the gate remains the CACHED-verdict
+        // backstop (a warm-cache e2e pin for that is future work).
+        assert!(err.errors.iter().any(|d| d.message.contains("sorry is fatal") || d.message.contains("contains sorry")),
             "the Link gate must reject sorryAx in the closure; got: {:?}",
             err.errors.iter().map(|d| &d.message).collect::<Vec<_>>());
-        assert!(err.warnings.iter().any(|d| d.message.contains("declaration uses 'sorry'")),
+        // The fn-level signal is now the FATAL error itself (uniform
+        // per-fn sorry rule) — the formatted message carries Lean's
+        // "declaration uses 'sorry'" text.
+        assert!(err.errors.iter().any(|d| d.message.contains("declaration uses 'sorry'")),
             "the fn-level check must surface the sorry warning; got: {:?}",
             err.warnings.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -13539,7 +13545,10 @@ test_verify_one_file_with_options! {
         assert!(err.errors.iter().any(|d| d.message.contains("sorry")),
             "the Link gate must reject sorryAx in the exec closure; got: {:?}",
             err.errors.iter().map(|d| &d.message).collect::<Vec<_>>());
-        assert!(err.warnings.iter().any(|d| d.message.contains("declaration uses 'sorry'")),
+        // The fn-level signal is now the FATAL error itself (uniform
+        // per-fn sorry rule) — the formatted message carries Lean's
+        // "declaration uses 'sorry'" text.
+        assert!(err.errors.iter().any(|d| d.message.contains("declaration uses 'sorry'")),
             "the fn-level check must surface the sorry warning; got: {:?}",
             err.warnings.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
