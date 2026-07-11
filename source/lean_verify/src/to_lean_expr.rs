@@ -655,7 +655,13 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
         }
 
         ExprX::Match(place, arms) => ExprNode::Match {
-            scrutinee: Box::new(place_to_expr(&place.x, ctx)),
+            // The scrutinee must sit at VALUE depth — patterns match
+            // datatype constructors, but a place rooted at a
+            // Ref-typed binder (e.g. `self` in an instance method,
+            // where the class field type is `Tactus.Ref Self → V`)
+            // renders at storage depth. Same binder-aware deref
+            // bridging as Field projection bases (U2).
+            scrutinee: Box::new(render_place_with_derefs(place, ctx)),
             arms: arms.iter().map(|arm| LMatchArm {
                 pattern: pattern_to_ast(&arm.x.pattern.x),
                 body: expr_to_ast(&arm.x.body, ctx),
@@ -725,7 +731,19 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
             // Same handling as the SST path: evaluate the bit width at
             // codegen and emit the literal bound. Split out to a shared
             // helper so the two paths can't drift.
-            crate::to_lean_sst_expr::integer_type_bound_from_vir(kind, inner).node
+            let bound = crate::to_lean_sst_expr::integer_type_bound_from_vir(kind, inner);
+            // The prelude bounds (`usize_hi` etc.) are Int-sorted, but
+            // the expr's own typ may render Nat (e.g. `usize::MAX`
+            // typed usize in a spec fn returning usize) — bridge with
+            // `Int.toNat`, which is exact here (the bounds are
+            // non-negative).
+            let nat_sorted = crate::expr_shared::int_range_of(&expr.typ)
+                .map_or(false, |r| !crate::expr_shared::renders_as_lean_int(&r));
+            if nat_sorted {
+                LExpr::app1(LExpr::var_lit("Int.toNat"), bound).node
+            } else {
+                bound.node
+            }
         }
         ExprX::UnaryOpr(UnaryOpr::CustomErr(_), inner) => expr_to_node(inner, ctx),
         // `has_resolved(x)` → uninterpreted Prop. The catch-all below

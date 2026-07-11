@@ -1053,12 +1053,24 @@ pub(crate) fn spec_world_cmds_tagged(
             dep_order::EmitStep::Group(i) => match &groups[*i] {
                 FnGroup::Single(f) => {
                     if lenient && body_references_builtin_spec_fun(f) {
-                        // NOT `continue` — the loop tail's proof-class
+                        // Prop-returning: emit an uninterpreted
+                        // signature axiom so dependents (e.g. vstd's
+                        // `cloned` → `strictly_cloned`) stay
+                        // renderable. Others: skip as before. NOT
+                        // `continue` — the loop tail's proof-class
                         // emission must still run when this is the
                         // last group.
-                        eprintln!(
-                            "tactus: skipped builtin-bodied spec fn `{}` in shared defs (no Lean form for BuiltinSpecFun)",
-                            short_name(&f.name.path));
+                        if let Some(ax) = to_lean_fn::builtin_spec_fn_signature_axiom(f, ectx) {
+                            segs.push((cmds.len(), DefsSeg::FnGroup {
+                                fns: vec![f.name.clone()], refs: spec_fn_refs(f),
+                            }));
+                            cmds.push(ax);
+                            segs.push((cmds.len(), DefsSeg::Base));
+                        } else {
+                            eprintln!(
+                                "tactus: skipped builtin-bodied spec fn `{}` in shared defs (no Lean form for BuiltinSpecFun)",
+                                short_name(&f.name.path));
+                        }
                     } else {
                     segs.push((cmds.len(), DefsSeg::FnGroup {
                         fns: vec![f.name.clone()], refs: spec_fn_refs(f),
@@ -1072,8 +1084,23 @@ pub(crate) fn spec_world_cmds_tagged(
                 }
                 FnGroup::Mutual(fns) => {
                     if lenient && fns.iter().any(|f| body_references_builtin_spec_fun(f)) {
-                        eprintln!(
-                            "tactus: skipped builtin-bodied mutual spec-fn group in shared defs (no Lean form for BuiltinSpecFun)");
+                        // Signature axioms don't need the mutual
+                        // block (no bodies); all-or-nothing per group
+                        // so intra-group references stay resolvable.
+                        let axioms: Vec<_> = fns.iter()
+                            .filter_map(|f| to_lean_fn::builtin_spec_fn_signature_axiom(f, ectx))
+                            .collect();
+                        if axioms.len() == fns.len() {
+                            segs.push((cmds.len(), DefsSeg::FnGroup {
+                                fns: fns.iter().map(|f| f.name.clone()).collect(),
+                                refs: fns.iter().flat_map(|f| spec_fn_refs(f)).collect(),
+                            }));
+                            cmds.extend(axioms);
+                            segs.push((cmds.len(), DefsSeg::Base));
+                        } else {
+                            eprintln!(
+                                "tactus: skipped builtin-bodied mutual spec-fn group in shared defs (no Lean form for BuiltinSpecFun)");
+                        }
                     } else {
                     segs.push((cmds.len(), DefsSeg::FnGroup {
                         fns: fns.iter().map(|f| f.name.clone()).collect(),

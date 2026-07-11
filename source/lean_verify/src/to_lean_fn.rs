@@ -213,6 +213,35 @@ impl LeanSourceMap {
 /// body=None fns out — which produced "unresolved" sanity-check
 /// rejections at the call site. Audit 2026-05-12 unfiltered the map
 /// and routes through `Axiom` here.)
+/// Uninterpreted signature axiom for a spec fn whose BODY has no Lean
+/// form (`BuiltinSpecFun` — closure `call_requires`/`call_ensures`
+/// etc.). Emitting the signature keeps DEPENDENT spec fns renderable
+/// (e.g. vstd's `cloned` references `strictly_cloned`; skipping the
+/// def poisons every reference with unknown-identifier). Restricted
+/// to Prop-returning fns: a Prop-valued function type is inhabited by
+/// `fun … => True`, so the axiom is unconditionally conservative — no
+/// Nonempty premise needed. Non-Prop builtin-bodied fns keep the skip
+/// (their value axiom would need the nonempty machinery's premises).
+pub fn builtin_spec_fn_signature_axiom(
+    f: &FunctionX,
+    ectx: &crate::emit_ctx::EmitCtx,
+) -> Option<Command> {
+    if !matches!(&*f.ret.x.typ, vir::ast::TypX::Bool) {
+        return None;
+    }
+    Some(Command::Axiom(Axiom {
+        name: lean_name(&f.name.path),
+        binders: fn_binders_without_bound_hyps(f, &ectx.unemittable),
+        ret_ty: typ_to_expr(&f.ret.x.typ),
+        attrs: vec![],
+        comment: Some(
+            "uninterpreted: body is a BuiltinSpecFun with no Lean form; \
+             Prop-valued fn types are inhabited, so this is conservative"
+                .to_string(),
+        ),
+    }))
+}
+
 pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Vec<Command> {
     // Spec fns are Lean defs (mathematical definitions). The
     // u-type / i-type refinement bounds belong on theorems
