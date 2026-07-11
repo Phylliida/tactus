@@ -2089,7 +2089,7 @@ fn island_sorry_failure(
             let formatted = lean_process::format_error(d, source_map);
             TactusDiag {
                 message: format!(
-                    "sorry is fatal on the island path (no Link gate covers {}): {}",
+                    "sorry is fatal on the per-fn path (no Link gate covers {}): {}",
                     short_name(fn_path), formatted.message),
                 location: formatted.location,
                 help: Some(format!("{} {}",
@@ -2134,10 +2134,46 @@ fn format_lean_check_result(
         // paths alike (review finding). The soundness backstop for
         // sorry stays the Link gate's fatal sorryAx check; this is the
         // fn-level signal.
-        Ok(r) if r.success => CheckResult::Success { warnings: lean_warnings(&r) },
+        Ok(r) if r.success => {
+            // Sorry is fatal on EVERY per-fn path (island and package
+            // alike). The Link gate's sorryAx check remains the
+            // backstop for cached verdicts, but it only runs when a
+            // crate HAS a Link module — an exec-only crate below that
+            // bar (surfaced when the defs size gate was removed) would
+            // otherwise verify a user-written `sorry` with nothing but
+            // a warning. Generated shapes never emit sorry, so any
+            // sorry diagnostic here is user tactic text.
+            let sorries: Vec<TactusDiag> = r.diagnostics.iter()
+                .filter(|d| d.severity == "warning" && d.data.contains("sorry"))
+                .map(|d| {
+                    let formatted = lean_process::format_error(d, source_map);
+                    TactusDiag {
+                        message: format!(
+                            "sorry is fatal on the per-fn path (no Link gate covers {}): {}",
+                            short_name(&proof_fn.name.path), formatted.message),
+                        location: formatted.location,
+                        help: Some(format!("{} {}",
+                            vir::tactus_messages::LEAN_FILE_HELP_PREFIX, file_path.display())),
+                    }
+                })
+                .collect();
+            if !sorries.is_empty() {
+                return CheckResult::Failed { errors: sorries, warnings: vec![] };
+            }
+            CheckResult::Success { warnings: lean_warnings(&r) }
+        }
         Ok(r) => {
             let fn_short = short_name(&proof_fn.name.path);
-            let header = format!("Lean tactic failed for {}", fn_short);
+            // Header parity with the island paths: exec islands say
+            // "tactus_auto failed" (check_exec_fn), proof islands say
+            // "tactic failed" — this formatter serves BOTH via the
+            // package routes, so choose by mode (e2e tests pin the
+            // phrasing; surfaced when the defs size gate was removed).
+            let header = if matches!(proof_fn.mode, vir::ast::Mode::Exec) {
+                format!("Lean tactus_auto failed for {}", fn_short)
+            } else {
+                format!("Lean tactic failed for {}", fn_short)
+            };
             let help = Some(format!("{} {}",
                 vir::tactus_messages::LEAN_FILE_HELP_PREFIX, file_path.display()));
             let errors: Vec<TactusDiag> = r.diagnostics.iter()
@@ -2455,9 +2491,9 @@ fn check_proof_fn_via_package(
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> Option<CheckResult> {
     install_emit_tables(krate, crate_name);
-    // Silent fallback: tiny crates below the defs gate (and defs build
-    // failures, which `guard_build` already reported loudly) verify via
-    // islands exactly as pre-M6.5; the crate-end gate note summarizes.
+    // Silent fallback: defs build failures (already reported loudly by
+    // `guard_build`) verify via islands exactly as pre-M6.5; the
+    // crate-end gate note summarizes.
     let defs = unified_package_defs(krate, crate_name, tactic_bodies)?;
     let prelude_dir = match crate::prelude::ensure_prelude_olean() {
         Ok(d) => d,
@@ -3035,7 +3071,7 @@ pub fn check_package(
 ) -> Result<PackageGateReport, String> {
     install_emit_tables(krate, crate_name);
     let defs = unified_package_defs(krate, crate_name, tactic_bodies)
-        .ok_or("shared-defs module unavailable (defs build failed or gate unmet)")?;
+        .ok_or("shared-defs module unavailable (defs build failed)")?;
     let g = package_graph_for(krate, crate_name, tactic_bodies);
     let graph = g.view();
     let mut leafs: Vec<String> = Vec::new();
@@ -3736,8 +3772,13 @@ fn emit_package_exec_fn(
     // `ensure_stmt_olean` covers it unchanged.
     let own_stmt_name = stmt_fn_module_name(defs, &vir_fn.name);
     let own_changed = {
+        // Pass the fn's theorems so their `requires_preamble`
+        // fragments (e.g. the #130 BitVec Int instances) are
+        // aggregated at file top — the stmt defs re-render the same
+        // obligation exprs and need the same instances (below-gate
+        // shape surfaced when the defs size gate was removed).
         let (mut cmds, _ns) = krate_preamble(
-            krate, &[], crate_name, &[], PreambleConfig::ExecFnPackage, &[],
+            krate, &[], crate_name, &[], PreambleConfig::ExecFnPackage, &theorems,
             tactic_bodies, &[], Some(defs),
         );
         for thm in &theorems {
@@ -3890,7 +3931,26 @@ fn check_exec_fn_via_package(
             if matches!(&result, Ok(r) if r.success) {
                 record_pkg_olean_built(&path);
             }
-            Some(format_lean_check_result(result, vir_fn, &path, &source_map))
+            // assume(P)-site warnings: same collection as the island
+            // path (`emit_exec_fn`) — the pkg route previously dropped
+            // them (surfaced when the defs size gate was removed).
+            let assume_warnings: Vec<String> = vir_fn.body.as_ref()
+                .map(|body| sst_to_lean::collect_assume_sites(body))
+                .unwrap_or_default()
+                .iter()
+                .map(|span| format!(
+                    "{} at {}: backed by an unverified hypothesis (`assume(P)`                      enters the spec as fact without a proof). Replace with a proven                      `assert(P) by {{ ... }}` before relying on this in production.",
+                    vir::tactus_messages::ASSUME_WARNING_TAG,
+                    sst_to_lean::format_span_loc(span),
+                ))
+                .collect();
+            Some(match format_lean_check_result(result, vir_fn, &path, &source_map) {
+                CheckResult::Success { mut warnings } => {
+                    warnings.extend(assume_warnings);
+                    CheckResult::Success { warnings }
+                }
+                other => other,
+            })
         }
         Ok(other) => {
             let reason = match other {
