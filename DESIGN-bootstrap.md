@@ -567,3 +567,23 @@ W1.5 authoring loop validated end to end. (Explains the old asymmetry:
 generated height fns always emitted `.deref`; only user match bodies
 lacked it.) Residue noted: `block_to_node` Decl-bound pattern vars share
 the hazard class in principle — same map-extension fix if a repro appears.
+
+**W1.5 LANDED (this branch): `#[verifier::structural_decreases]`.** Opt-in
+per-fn attribute (heartbeats-pattern plumbing: attributes.rs → VerifierAttrs →
+vir FunctionAttrs → to_lean_fn); when the decreases measure is a bare
+datatype-typed param, spec fns emit `termination_by structural <param>` with
+no decreasing_by (kernel-computable, no heightLt in closure); any other
+measure shape falls back silently to WF emission — visible in the artifact
+termination_by line, never a hard failure. Def gains `termination_structural`;
+pp renders the `structural` keyword. Proof-fn structural emission deferred to
+W5 (Theorem struct, recursive proof fns). Pinned by two e2e tests, incl. the
+discriminating `decide` closer (passes ONLY under structural emission).
+Suite 543/0.
+
+**NEW BUG PINNED while testing (ctor-arg sibling of RC4):** `Box::new`
+erasure at CONSTRUCTOR argument slots misses the `.mk` wrap —
+`Expr.Add (Expr.Lit 3)` renders unwrapped where `Tactus.Box Expr` is
+expected ("Application type mismatch" at elaboration). Fix needs declared
+field typs at ctor render sites (RenderCtx has no datatype map — real
+plumbing, own brick). Repro = the commented construction in
+test_structural_decreases_kernel_computes.

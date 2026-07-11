@@ -19,6 +19,67 @@ fn verify_one_file(name: &str, code: String, options: &[&str]) -> Result<TestErr
     common::verify_one_file(name, code, &options)
 }
 
+// === structural_decreases: kernel-computable recursive spec fns ===
+// (DESIGN-bootstrap.md W1.5.) The `decide` closer DISCRIMINATES: a
+// WF-compiled def is kernel-inert (decide gets stuck at the derived
+// DecidableEq instance), so this test passes only if the attribute
+// actually emits `termination_by structural` — pinning behavior, not
+// output text.
+
+test_verify_one_file! {
+    #[test] test_structural_decreases_kernel_computes verus_code! {
+        use vstd::prelude::*;
+
+        pub enum Expr {
+            Lit(u64),
+            Add(Box<Expr>, Box<Expr>),
+        }
+
+        #[verifier::structural_decreases]
+        pub open spec fn esize(e: Expr) -> nat
+            decreases e
+        {
+            match e {
+                Expr::Lit(_v) => 1,
+                Expr::Add(a, b) => esize(*a) + esize(*b),
+            }
+        }
+
+        // NOTE: constructing `Expr::Add(Box::new(..), ..)` in spec
+        // position hits a SEPARATE latent bug (Box::new erasure at
+        // ctor-arg slots misses the `.mk` wrap — the ctor-position
+        // sibling of the RC4 call-arg bridge; DESIGN-bootstrap.md
+        // §11.2). Lit-only still discriminates: a WF-compiled esize
+        // is kernel-inert even on `Expr::Lit`.
+        proof fn esize_lit_computes()
+            ensures esize(Expr::Lit(3)) == 1
+        by {
+            decide
+        }
+    } => Ok(())
+}
+
+// Unsupported measure shape (Nat-arith recursion is not structural):
+// the attribute silently falls back to WF emission — visible in the
+// artifact's termination_by line — and the fn still verifies; never a
+// hard failure.
+test_verify_one_file! {
+    #[test] test_structural_decreases_nat_fallback verus_code! {
+        #[verifier::structural_decreases]
+        pub open spec fn tri(n: nat) -> nat
+            decreases n
+        {
+            if n == 0 { 0 } else { n + tri((n - 1) as nat) }
+        }
+
+        proof fn tri_zero()
+            ensures tri(0) == 0
+        by {
+            simp [tri]
+        }
+    } => Ok(())
+}
+
 // === Basic: spec fn + proof fn with omega ===
 
 test_verify_one_file! {

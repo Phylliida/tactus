@@ -1599,6 +1599,17 @@ pub struct FunctionAttrsX {
     /// `rlimit` but reproducible (count kernel reduction steps, not
     /// wall-clock).
     pub tactus_heartbeats: Option<u32>,
+    /// Tactus: emit `termination_by structural <param>` (structural
+    /// recursion) instead of the WF `termination_by <measure>` +
+    /// `decreasing_by`. Requires the decreases measure to be a bare
+    /// datatype-typed parameter and every recursive call to pass a
+    /// subterm (Lean checks the latter). Why: WF-compiled defs are
+    /// kernel-inert (`decide`/`rfl` cannot reduce them), structural
+    /// defs compute — load-bearing for the bootstrap bridge
+    /// (DESIGN-bootstrap.md W1.5) and axiom-free (no `Tactus.heightLt`
+    /// in the closure). User-facing attribute:
+    /// `#[verifier::structural_decreases]`.
+    pub tactus_structural_decreases: bool,
 }
 
 /// Function specification of its invariant mask

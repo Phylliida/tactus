@@ -87,6 +87,13 @@ pub struct Def {
     /// `termination_by d₁` if one measure, `termination_by (d₁, d₂, …)` for
     /// lexicographic. Empty `Vec` means no termination clause.
     pub termination_by: Vec<Expr>,
+    /// When true (and `termination_by` has exactly one measure), render
+    /// `termination_by structural <measure>` — Lean's structural
+    /// (subterm) recursion, which kernel-reduces, vs. the WF default,
+    /// which is kernel-inert. `decreasing_by` must be `None` (structural
+    /// recursion has no decreasing goals). See vir
+    /// `FunctionAttrs::tactus_structural_decreases`.
+    pub termination_structural: bool,
     /// Optional `decreasing_by <tactic>` clause emitted after
     /// `termination_by`. Used when Lean's default `decreasing_tactic`
     /// can't close the obligation — e.g., height fns for recursive

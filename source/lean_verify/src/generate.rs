@@ -3385,6 +3385,7 @@ fn build_link_module(
                 ret_ty: LExpr::var_lit(&to_lean_fn::stmt_name(&f.name.path)),
                 body: LExpr::var_lit(&name),
                 termination_by: Vec::new(),
+                termination_structural: false,
                 decreasing_by: None,
             }));
             cmds.push(Command::Raw(format!(
@@ -3412,6 +3413,7 @@ fn build_link_module(
             ret_ty: LExpr::var_lit(&to_lean_fn::stmt_name(&f.name.path)),
             body: closed_body,
             termination_by: Vec::new(),
+            termination_structural: false,
             decreasing_by: None,
         }));
         cmds.push(Command::Raw(format!(
