@@ -870,6 +870,15 @@ pub(crate) fn spec_world_cmds(
             .map(|tr| crate::to_lean_type::lean_name_relative(&tr.x.name))
             .collect();
         let tp = |n: &str| LExpr::var_tp(n);
+        // These names are literals (no VIR path to route through
+        // `lean_name`), so qualify with the crate namespace by hand —
+        // Option B renders every crate-internal global as its full
+        // dotted name at root scope (no namespace wrapper to resolve
+        // the relative form anymore).
+        let qual = |n: &str| match crate::to_lean_type::crate_ns() {
+            Some(ns) => format!("{}.{}", ns, n),
+            None => n.to_string(),
+        };
         let arrow = || LExpr::new(ExprNode::BinOp {
             op: BinOp::Implies,
             lhs: Box::new(tp("A")),
@@ -878,7 +887,7 @@ pub(crate) fn spec_world_cmds(
         if emitted.contains("marker.Tuple") {
             cmds.push(Command::Instance(crate::lean_ast::Instance {
                 binders: vec![LBinder::typ_param("A", BinderKind::Implicit)],
-                target: LExpr::app(LExpr::var_lit("marker.Tuple"), vec![tp("A")]),
+                target: LExpr::app(LExpr::var_lit(&qual("marker.Tuple")), vec![tp("A")]),
                 methods: vec![],
             }));
         }
@@ -889,9 +898,9 @@ pub(crate) fn spec_world_cmds(
                         LBinder::typ_param("A", BinderKind::Implicit),
                         LBinder::typ_param("B", BinderKind::Implicit),
                         LBinder::instance(
-                            LExpr::app(LExpr::var_lit("marker.Tuple"), vec![tp("A")])),
+                            LExpr::app(LExpr::var_lit(&qual("marker.Tuple")), vec![tp("A")])),
                     ],
-                    target: LExpr::app(LExpr::var_lit(cls), vec![arrow(), tp("A"), tp("B")]),
+                    target: LExpr::app(LExpr::var_lit(&qual(cls)), vec![arrow(), tp("A"), tp("B")]),
                     methods: vec![],
                 }));
             }
