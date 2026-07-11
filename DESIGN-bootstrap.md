@@ -655,6 +655,12 @@ emit-module/package-check flags are the future default.
   faithfulness contract. FAIL LOUDLY outside the subset. Acceptance: the
   fixture serializes 100%, literals written next to islands.
 
+- **N2.1 (NEW, small, BEFORE N3a): mirror-type amendments** — writing refWp's
+  equations exposed missing StmData fields (If neg-cond leaf, Loop binder
+  list + neg-cond, Call dest, Ret ens-leaf-list, param bound-hyp leaves).
+  Spec'd in `DESIGN-W2-refwp.md` §0; must land before the literal shape
+  freezes.
+
 - **N4 (small): corpus census.** Run the serializer over tgt (3116 fns):
   % serializable + a ranked table of unsupported constructs — this sets W2's
   coverage roadmap and is the first honest measure of subset size.
@@ -663,8 +669,10 @@ emit-module/package-check flags are the future default.
   tactus-core defs olean (`lean` with LEAN_PATH, or package-check if N1a made
   that natural). Cold + warm timing noted.
 
-- **Then W2 (multi-session): refWp stage A** per §5 — after N2 stabilizes the
-  `SstData` shape. Obligation ids emitted by refWp, pairing by id (O4).
+- **Then W2 (multi-session): refWp stage A — SPEC'D in `DESIGN-W2-refwp.md`**
+  (first-order worker wpStm/frameAfter, no spec_fn continuations; goal_eq
+  Bool equality for decide; mutation-kill acceptance; honest stage-A scope
+  statement; W3 gate mechanics + triage discipline; open-question ledger).
 
 Standing coordination notes: the branch contains emit-module wholesale — when
 emit-module merges to main, sync this branch promptly (the three bug fixes +
