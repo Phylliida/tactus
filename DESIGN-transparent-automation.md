@@ -248,12 +248,16 @@ fns' emitted artifacts (post Option-B naming; 75 theorems / 38 fns; harness =
 `tools/rung-attrib/fast_attrib.py` — combined file per fn with variant-suffixed theorem
 copies, preamble elaborated once, bare `lean`, 8-way parallel; ~2 min a run):
 
-| minimal closer | share |
-|---|---:|
-| `rfl` | 4.0% |
-| `omega` | 18.7% |
-| `tactus_peel` ∘ {rfl,decide,omega} | 12.0% |
-| **T2 (`simp_all`/`tactus_case_split`)** | **64.0%** |
+| minimal closer | share (full pool: 215 thms / 114 fns) | (first sample: 75 thms) |
+|---|---:|---:|
+| `rfl` | 6.0% | 4.0% |
+| `omega` | 18.1% | 18.7% |
+| `tactus_peel` ∘ {rfl,decide,omega} | 8.4% | 12.0% |
+| **T2 (`simp_all`/`tactus_case_split`)** | **67.4%** | 64.0% |
+
+Full-pool re-run after harness adoption (`tools/rung-attrib/`, composed
+`first | tactus_auto | fallback` sites excluded by design — they carry explicit
+user proofs already): zero unexplained failures, stable shares.
 
 **Decision-table read (§6): the `simp_all` share is LARGE** — outright removal of T2
 from the default ladder would be a usability cliff. The indicated path is
