@@ -632,21 +632,7 @@ fn b5_census(
         eprintln!("B5-CENSUS no-fnmap {}", crate::to_lean_type::lean_name_relative(&fun.path));
         return;
     };
-    use crate::expr_shared::count_ref_decorations;
-    let class = if vir::ast_util::types_equal(&declared, claim) {
-        "equal"
-    } else if vir::ast_util::types_equal(
-        &crate::to_lean_type::peel_typ_wrappers(&declared).clone(),
-        &crate::to_lean_type::peel_typ_wrappers(claim).clone(),
-    ) {
-        if count_ref_decorations(&declared) != count_ref_decorations(claim) {
-            "decor-only"
-        } else {
-            "boxing-only"
-        }
-    } else {
-        "OTHER"
-    };
+    let class = classify_typ_divergence(claim, &declared);
     eprintln!(
         "B5-CENSUS {} {} claim={:?} declared={:?}",
         class,
@@ -654,6 +640,28 @@ fn b5_census(
         claim,
         declared,
     );
+}
+
+/// Shared claim-vs-derived classifier for the B5 census probes
+/// (TACTUS_B5_CENSUS): how does a claimed typ relate to the derived
+/// ground-truth typ? "decor-only" is the B5 lie class; "OTHER" is the
+/// class that would send a fix back to the drawing board.
+pub(crate) fn classify_typ_divergence(claim: &Typ, derived: &Typ) -> &'static str {
+    use crate::expr_shared::count_ref_decorations;
+    if vir::ast_util::types_equal(derived, claim) {
+        "equal"
+    } else if vir::ast_util::types_equal(
+        &crate::to_lean_type::peel_typ_wrappers(derived).clone(),
+        &crate::to_lean_type::peel_typ_wrappers(claim).clone(),
+    ) {
+        if count_ref_decorations(derived) != count_ref_decorations(claim) {
+            "decor-only"
+        } else {
+            "boxing-only"
+        }
+    } else {
+        "OTHER"
+    }
 }
 
 pub(crate) fn exp_to_typed(

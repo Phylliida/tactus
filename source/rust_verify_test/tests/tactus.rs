@@ -2821,21 +2821,23 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// ── KNOWN BUG (pinned as Err): clone of a Vec element loses the ref
-// wrap in call-substitution entries. Cloning an element of a nested
-// Vec (`h.imgs[i].clone()` with `imgs: Vec<Vec<u8>>`) generates
-// obligation exps where the clone-callee's `self` substitutes to an
-// SST temp (`tmp__1`) whose Var reference CLAIMS the autoref'd
-// Ref-decorated typ while the rendered binding holds the bare value.
-// The substitution entry records the claim, so the use-site
-// `coerce_lexpr` is an identity and the artifact is ill-typed
-// ("Application type mismatch ... expected Tactus.Ref" at
-// spec_vec_len's slot). Diagnosed 2026-07-04 (see
-// BUG-call-arg-temp-claimed-typ.md); groundwork landed (walker temps
-// now consult the let-binder ledger + args render through the typed
-// spine) but THIS temp's binding is minted outside walk_let, so its
-// storage typ is recorded nowhere yet. FLIP THIS PIN TO Ok WHEN
-// FIXED. Blocks tactus-group-theory's apply_hom_symbol_exec.
+// ── RESOLVED RENDERING / PENDING PROOF-POWER (B5b,
+// DESIGN-B5-typed-spine-calls.md + BUG-call-arg-temp-claimed-typ.md):
+// the ill-typed-artifact bug this test originally pinned (call dest
+// bound bare where a Tactus.Ref-typed slot expected it — the skipped
+// non-integer bridge in push_ret_frames) is FIXED: the typed
+// eq_extraction + unified coerce_lexpr bridge wrap the dest
+// (`tmp__1 := { deref := … }`) and the artifact elaborates cleanly
+// (re-verified 2026-07-11). What remains is that tactus_auto cannot
+// CLOSE the correct goal — seq extensionality from pointwise
+// `cloned` facts — which is auto-bucket / closer-policy territory
+// (DESIGN-transparent-automation.md), NOT a renderer bug. The Err
+// assertion below pins exactly that boundary: the failure must be
+// the auto-tactic class with NO type-mismatch / Invalid-field /
+// parse-error markers. FLIP TO Ok when a site-proof idiom or closer
+// rung covers extensionality. (A `=~=` site-assert attempt surfaced
+// an unrelated parse bug — 'unexpected identifier; expected ]' —
+// filed in the B5 doc for the F-series.)
 test_verify_one_file! {
     #[test] test_exec_vec_field_index_clone verus_code! {
         use vstd::prelude::*;
@@ -2848,15 +2850,23 @@ test_verify_one_file! {
             h.imgs[i].clone()
         }
     } => Err(err) => {
-        // Matches both "Type mismatch" and "Application type mismatch"
-        // (the exact Lean wording shifted once the `lookup_subst_typ`
-        // deref fix corrected the `h.deref.imgs` base — the residual
-        // failure is the clone's strictly_cloned axiomatization, still
-        // a `Tactus.Ref`-slot mismatch + `sorry`).
+        // Artifact-correctness pin: the ONLY acceptable failure class
+        // is the auto-tactic one. Any mismatch / Invalid field / parse
+        // marker = the rendering regressed.
+        let msgs: Vec<_> = err.errors.iter().map(|e| &e.message).collect();
         assert!(
-            err.errors.iter().any(|e| e.message.contains("ismatch")),
-            "expected the KNOWN ill-typed-artifact failure (fixed? flip this pin to Ok!), got: {:?}",
-            err.errors.iter().map(|e| &e.message).collect::<Vec<_>>(),
+            err.errors.iter().any(|e| e.message.contains("auto-tactic failed")),
+            "expected the auto-tactic-only failure (closer grew? flip to Ok!), got: {:?}",
+            msgs,
+        );
+        assert!(
+            !err.errors.iter().any(|e| {
+                e.message.contains("ismatch")
+                    || e.message.contains("Invalid field")
+                    || e.message.contains("unexpected")
+            }),
+            "RENDERING REGRESSION — ill-typed artifact is back: {:?}",
+            msgs,
         );
     }
 }
