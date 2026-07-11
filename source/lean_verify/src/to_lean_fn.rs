@@ -147,6 +147,7 @@ pub(crate) fn wrap_body_with_param_derefs(body: LExpr, params: &Params) -> LExpr
 /// Proof fns and exec fns use different mapping mechanisms — the
 /// enum split makes the dichotomy explicit instead of having one
 /// struct with conditionally-meaningful fields.
+#[derive(Clone)]
 pub enum LeanSourceMap {
     /// Proof fns: the user-written tactic body starts at
     /// `tactic_start_line` and runs `tactic_line_count` lines.
@@ -234,6 +235,35 @@ impl LeanSourceMap {
 /// body=None fns out — which produced "unresolved" sanity-check
 /// rejections at the call site. Audit 2026-05-12 unfiltered the map
 /// and routes through `Axiom` here.)
+/// Uninterpreted signature axiom for a spec fn whose BODY has no Lean
+/// form (`BuiltinSpecFun` — closure `call_requires`/`call_ensures`
+/// etc.). Emitting the signature keeps DEPENDENT spec fns renderable
+/// (e.g. vstd's `cloned` references `strictly_cloned`; skipping the
+/// def poisons every reference with unknown-identifier). Restricted
+/// to Prop-returning fns: a Prop-valued function type is inhabited by
+/// `fun … => True`, so the axiom is unconditionally conservative — no
+/// Nonempty premise needed. Non-Prop builtin-bodied fns keep the skip
+/// (their value axiom would need the nonempty machinery's premises).
+pub fn builtin_spec_fn_signature_axiom(
+    f: &FunctionX,
+    ectx: &crate::emit_ctx::EmitCtx,
+) -> Option<Command> {
+    if !matches!(&*f.ret.x.typ, vir::ast::TypX::Bool) {
+        return None;
+    }
+    Some(Command::Axiom(Axiom {
+        name: lean_name(&f.name.path),
+        binders: fn_binders_without_bound_hyps(f, &ectx.unemittable),
+        ret_ty: typ_to_expr(&f.ret.x.typ),
+        attrs: vec![],
+        comment: Some(
+            "uninterpreted: body is a BuiltinSpecFun with no Lean form; \
+             Prop-valued fn types are inhabited, so this is conservative"
+                .to_string(),
+        ),
+    }))
+}
+
 pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Vec<Command> {
     // Spec fns are Lean defs (mathematical definitions). The
     // u-type / i-type refinement bounds belong on theorems
@@ -314,23 +344,19 @@ pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Vec<Com
             // `--lean-backend` lowering (replaces the old `nat_coercion`
             // pre-pass), so the rendered VIR is already Lean-typed.
             let binder_ctx = crate::to_lean_expr::binder_ctx_from_params(&f.params);
-            // `with_self_decl`: a recursive def's self-call must render
-            // relatively — root-anchoring a not-yet-elaborated global is
-            // `Unknown identifier` (see `to_lean_type::CURRENT_DECL_SELF`).
-            let self_rel = crate::to_lean_type::lean_name_relative(&f.name.path);
-            let (body, termination_by) = crate::to_lean_type::with_self_decl(self_rel, || {
-                let body = wrap_body_with_param_derefs(
-                    crate::to_lean_expr::vir_expr_to_ast_with_binders(b, &binder_ctx, &crate::expr_shared::RenderCtx::empty()),
-                    &f.params,
-                );
-                let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| {
-                    crate::expr_shared::wrap_int_measure(
-                        crate::to_lean_expr::vir_expr_to_ast_with_binders(d, &binder_ctx, &crate::expr_shared::RenderCtx::empty()),
-                        d,
-                    )
-                }).collect();
-                (body, termination_by)
-            });
+            // Self-calls render as the full dotted name (Option B —
+            // resolves fine mid-declaration at root scope, the
+            // `List.myLen` idiom; relative-rendering machinery retired).
+            let body = wrap_body_with_param_derefs(
+                crate::to_lean_expr::vir_expr_to_ast_with_binders(b, &binder_ctx, &crate::expr_shared::RenderCtx::empty()),
+                &f.params,
+            );
+            let termination_by: Vec<LExpr> = f.decrease.iter().map(|d| {
+                crate::expr_shared::wrap_int_measure(
+                    crate::to_lean_expr::vir_expr_to_ast_with_binders(d, &binder_ctx, &crate::expr_shared::RenderCtx::empty()),
+                    d,
+                )
+            }).collect();
             // Recursive spec fns get an explicit `decreasing_by` so measures
             // Lean's default tactic can't discharge (notably the modular
             // `a % b < b` of Euclidean gcd) still verify. Non-recursive defs
@@ -429,6 +455,79 @@ pub fn broadcast_lemma_axiom_cmd(
         ret_ty: goal,
         attrs: Vec::new(),
     })
+}
+
+/// The Lean name of a proof fn's statement def in package emission:
+/// `<lean name>_stmt`. Shared by the Stmts renderer (below), the
+/// hypothesis binders consumers take (M2), and the Link module (M3) —
+/// one chokepoint so the three sites can't disagree on the name.
+pub fn stmt_name(path: &Path) -> String {
+    format!("{}_stmt", lean_name(path))
+}
+
+/// The hypothesis binder a package-mode consumer takes for helper
+/// lemma `path` (DESIGN-emit-module.md §4.2): the binder is named by
+/// the helper's SHORT name — exactly the identifier raw tactic text
+/// references (`have := lemma_a x hx`) — so binder shadowing makes the
+/// tactic body elaborate unchanged against the local hypothesis where
+/// the island file had a global theorem. The type is the helper's
+/// statement def, whose reducibility (M0 finding F2) lets the
+/// application elaborate without `unfold`.
+pub fn helper_hyp_binder(path: &Path) -> LBinder {
+    LBinder::explicit(
+        crate::lean_name::LeanName::lit(short_name(path)),
+        LExpr::var_lit(&stmt_name(path)),
+    )
+}
+
+/// Fold a proof fn's `(binders, goal)` signature into one ∀-closed
+/// Prop. Zero binders → the bare goal (a nullary lemma's statement is
+/// just its conjoined ensures).
+fn forall_close(binders: Vec<LBinder>, goal: LExpr) -> LExpr {
+    if binders.is_empty() { goal } else { LExpr::forall(binders, goal) }
+}
+
+/// Assemble a statement def from an already-built signature:
+/// `@[reducible] noncomputable def <name> : Prop := ∀ <binders>, <goal>`.
+/// Split from `proof_fn_stmt_cmd` so unit tests can drive it with
+/// synthetic binders/goals without constructing a full `FunctionX`.
+///
+/// `@[reducible]` is load-bearing (DESIGN-emit-module.md M0 finding
+/// F2, the `abbrev` form): it lets `intro` peel the stmt name inside
+/// the prover, lets a hypothesis `(h : <name>)` be applied to
+/// arguments at use sites, and lets the Link module's direct
+/// application unify — no `unfold` anywhere. (`noncomputable` is the
+/// always-on `write_def` default; harmless on a Prop def.)
+fn stmt_cmd(name: String, binders: Vec<LBinder>, goal: LExpr) -> Command {
+    Command::Def(Def {
+        attrs: vec!["reducible".to_string()],
+        name,
+        binders: Vec::new(),
+        ret_ty: LExpr::var_lit("Prop"),
+        body: forall_close(binders, goal),
+        termination_by: Vec::new(),
+        decreasing_by: None,
+    })
+}
+
+/// Emit a proof fn's contract as its statement def — the Stmts layer
+/// of package emission (DESIGN-emit-module.md §2.1/§4.1). Consumers
+/// take the def as a hypothesis binder instead of citing an axiom or
+/// re-elaborating the helper's theorem; the fn's own theorem proves
+/// it; the Link module applies one to the other.
+///
+/// Built on the same `proof_fn_signature` as `proof_fn_to_ast` and
+/// `broadcast_lemma_axiom_cmd` (including the same standalone
+/// augmentation), so the statement def and the theorem that proves it
+/// cannot drift — the statement-identity property the emit-module
+/// trust argument rests on.
+pub fn proof_fn_stmt_cmd(
+    f: &FunctionX,
+    ectx: &crate::emit_ctx::EmitCtx,
+) -> Command {
+    let f = &crate::impl_subst::maybe_augment_standalone_fn(f, &ectx.trait_outparams);
+    let (binders, goal) = proof_fn_signature(f, ectx);
+    stmt_cmd(stmt_name(&f.name.path), binders, goal)
 }
 
 pub fn proof_fn_to_ast(
@@ -703,22 +802,14 @@ pub fn datatype_group_to_cmds<'a>(
 
     // 3. mutual block of height fns. Each height fn reaches the
     //    others by name; the mutual scope makes those names visible.
-    //    `with_self_decls` over the WHOLE SCC: a sibling `.height`
+    //    full-name rendering over the WHOLE SCC: a sibling `.height`
     //    reference inside the mutual block must render relatively —
     //    the sibling is not yet a global constant, so a root-anchored
     //    `_root_.{ns}.Sibling.height` is `Unknown identifier` (same
     //    rule as mutual spec-fn groups; 2026-07-09 review, finding #1).
-    let group_names: Vec<String> = dts.iter()
-        .filter_map(|dt| match &dt.name {
-            Dt::Path(p) => Some(crate::to_lean_type::lean_name_relative(p)),
-            Dt::Tuple(_) => None,
-        })
+    let height_cmds: Vec<Command> = dts.iter()
+        .filter_map(|dt| datatype_height_cmd(dt, &scc_paths))
         .collect();
-    let height_cmds: Vec<Command> = crate::to_lean_type::with_self_decls(group_names, || {
-        dts.iter()
-            .filter_map(|dt| datatype_height_cmd(dt, &scc_paths))
-            .collect()
-    });
     if !height_cmds.is_empty() {
         cmds.push(Command::Mutual(height_cmds));
     }
@@ -829,17 +920,11 @@ fn datatype_decl_cmd(
 
     let cross_inst = has_cross_instantiation_recursion(dt, scc_paths);
 
-    // `with_self_decls` over the SCC: a recursive field type (`Push(…,
-    // Box<Stack>)`, or a mutual sibling) must render RELATIVE inside the
-    // declaration — during elaboration the inductive is not yet a global
-    // constant and a root-anchored `_root_.{ns}.Stack` is `Unknown
-    // identifier` (verified empirically; bare `Stack` and de-anchored
-    // `{ns}.Stack` both resolve). Same mechanism as the height defs and
-    // mutual spec fns; the decl HEAD stays root-anchored (computed above,
-    // outside the wrap), matching every other emitted decl.
-    let kind = crate::to_lean_type::with_self_decls(
-        scc_paths.iter().map(|p| crate::to_lean_type::lean_name_relative(p)),
-        || if is_single_variant_struct {
+    // Recursive/sibling field types render as full dotted names —
+    // resolves fine mid-declaration at root scope (Option B, verified
+    // empirically for single and mutual inductives; the former
+    // relative-rendering machinery is retired).
+    let kind = if is_single_variant_struct {
             let variant = &dt.variants[0];
             DatatypeKind::Structure {
                 fields: variant.fields.iter().map(|f| Field {
@@ -860,8 +945,7 @@ fn datatype_decl_cmd(
             } else {
                 DatatypeKind::Inductive { variants }
             }
-        },
-    );
+        };
 
     // Derive `Inhabited` automatically for parameter-style. Lean rejects
     // `deriving Inhabited` on indexed-style inductives, so we drop the
@@ -1083,19 +1167,10 @@ fn datatype_height_cmd(
         Dt::Path(p) => p,
         Dt::Tuple(_) => return None,
     };
-    // `with_self_decl`: a self-recursive datatype's height def calls
-    // `{Self}.height` in its own body — the self-name must render
-    // relatively (root-anchoring a not-yet-elaborated global is
-    // `Unknown identifier`; see `to_lean_type::CURRENT_DECL_SELF`).
-    // The def's declared name goes relative too — inside the file's
-    // namespace wrapper that declares the same full name.
-    crate::to_lean_type::with_self_decl(
-        crate::to_lean_type::lean_name_relative(p),
-        || {
-            let path = lean_name(p);
-            height_fn_for_datatype(dt, &path, scc_paths)
-        },
-    )
+    // The height def's self-calls render as the full dotted name —
+    // resolves fine mid-declaration at root scope (Option B).
+    let path = lean_name(p);
+    height_fn_for_datatype(dt, &path, scc_paths)
 }
 
 /// Emit `def T.height : T → Nat` alongside the datatype so that

@@ -282,6 +282,19 @@ impl<'a> RenderCtx<'a> {
     /// call) — it falls through to the declared types, so this is a strict
     /// refinement: zero behaviour change for concrete-param calls, and no
     /// risk of misaligning a substitution.
+    /// M6.1 drop-dummy rule: does `ast_simplify` inject the zero-arg
+    /// `Const 0` dummy for calls to this callee? (The spec world
+    /// renders from the unsimplified vir krate, so the injected arg
+    /// must be dropped wherever post-simplify SSTs are rendered —
+    /// same predicate as the injector, `injects_zero_arg_dummy`.)
+    /// Unknown callees (not in fn_map) answer false — their calls
+    /// render as-is and any real mismatch surfaces in elaboration.
+    pub fn callee_injects_dummy(&self, fun: &Fun) -> bool {
+        self.fn_map
+            .and_then(|m| m.get(fun))
+            .map_or(false, |f| vir::ast_simplify::injects_zero_arg_dummy(f, false))
+    }
+
     pub fn fn_param_typs(&self, fun: &Fun, typ_args: &[Typ]) -> Option<Vec<Typ>> {
         let fn_map = self.fn_map?;
         let func = fn_map.get(fun)?;
