@@ -343,3 +343,33 @@ tactic migration policy (per-goal, this is now genuine proof work, not bugs);
 (2) §7 codegen: `StmX::DeadEnd` lowering (1,267 rejections) + multi-element seq
 literals (142 rejections + the 1,145 List/Vector mistypes); (3) the small residuals
 above (companion dep-walk, `'('` parse shape, B5 typed-spine deref).
+
+### 10.2 Post-F1–F4 re-measurement (2026-07-11, overnight)
+
+Same command, after `DESIGN-lean-all-proofs-followons.md` F1–F4 landed (`25970a5`,
+`2e203dc`, `8171498`, `95c5b1b` + the two B1a-regression fixes `1d88162`/`719733e`).
+Binary = F1–F4 exactly; the follow-on batch (`62f8bb0`: F2b/F2c/DoneEmpty) is NOT in this
+measurement (committed mid-run, deliberately not rebuilt). Wall: ~14 h across two legs
+(6 h timeout + `-V cache` resume) — the crate now emits 2,747 files (was 1,338), and
+F4-unlocked assert-by proofs multiply goals per fn.
+
+**Results: 0 codegen rejections (was 1,409) — 100% of 2,953 proof-obligation fns attempt
+Lean. 723 fns pass fully (24.5%, was 253/8.6%) — 2.9× the §10.1 pass count. Error blocks
+26,216 (was 8,950) — the predicted walls-fell growth: 1,409 formerly-silent fns now
+contribute goals.**
+
+| Family | §10.1 | Now | Notes |
+|---|---:|---:|---|
+| Codegen rejections | 1,409 | **0** | F3 + F4 |
+| Parse errors (`unexpected token`) | 39 | **0** | F1 |
+| Namespace/unknown-identifier | 0 | **0** | holds (incl. 2 regression fixes) |
+| Type mismatch | 1,145 | **61** | F3 killed List/Vector. Residual = the `tmp__ : Int` tuple-projection family (B5-adjacent, was 10 pre-F4; concentrated in 3 fns) |
+| Termination | 81 | 199 | 120 = drop_first goals of the F2c Prop-connective family + Int-abs (F2b) — **both addressed by the `62f8bb0` batch pending validation**; growth = F4-unlocked recursive proof fns |
+| `Invalid field deref` | 55 | 122 | B5's typed-spine family, more visible now (its arc is specced + in progress separately) |
+| Heartbeats (`maxHeartbeats`) | 71 | 998 | more fns reach real proving + more goals per fn; perf triage after the bug families |
+| **auto-tactic failed** | 5,987 | **24,080** | **the honest F7 workload** across ~2,230 fns — taxonomy next |
+
+**Reading it:** every structural translator family we targeted is at zero; what remains
+is (a) the two termination families the already-drafted batch addresses, (b) B5's deref
+family, (c) a 61-error B5-adjacent tuple residual, and (d) the auto bucket — now finally
+an honest, complete number. F7's taxonomy starts from these 24,080 goals.
