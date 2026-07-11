@@ -31,7 +31,20 @@ collected per block, minus names an enclosing scope already bound). The trivial-
 terminator theorem per scope is KEPT for now (closure precedent) — the skip in
 `emit_done_or_split` is a deferred follow-up. **Crate-wide codegen rejections 1,409 → 0;
 2,747 of 2,747 proof-obligation fns emit (100% codegen coverage).** e2e suite 532/0.
-F5–F7 remain as spec'd; next milestone = the full-crate REAL Lean re-measure, then F7.
+
+**Overnight re-measure DONE (2026-07-11, §10.2 of the parent doc):** 723/2,953 fns pass
+(was 253) — 2.9×; every targeted structural family at 0; honest auto bucket = 24,080
+goals across ~2,230 fns. **Deferred batch IMPLEMENTED & VALIDATED (`62f8bb0` + rung fix):
+F2c via two proved @[wf_preprocess] prelude theorems (Tactus.or_eq_dite/and_eq_dite —
+the transparent replacement for the rejected ite-rewrite; guards thread during
+termination elaboration only, eq_def keeps user shape; m3_blinker termination 2 → 0),
+F2b via expr_shared::wrap_int_measure Int.toNat (both pinned shapes close in
+m4_defect_flow), Wp::DoneEmpty (no trivial-True scope theorems), and the preventive
+sanity-checker rule (anchored self-refs inside declarations; 3 unit tests).** Remaining:
+F5 one-liner (Danielle's call), F6 altitude items (ride adjacent arcs; chained-op
+divergence → B5), F7 auto-bucket taxonomy (NOW unblocked with honest numbers), B5
+(parallel session), heartbeats triage (998 blocks), the 61-error tuple-Int residual
+(B5-adjacent), trivial-True... done. Next = F7.
 **Scope:** everything left on the board after `DESIGN-lean-all-proofs-bugs.md` B1–B4 landed
 (`dbc77e5`, `00534c9`, review round `2e43a39`), **except B5** (typed-spine `.deref` arc —
 its own doc/arc, per the bugs doc) and except the closer/tactic changes themselves
