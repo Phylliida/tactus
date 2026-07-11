@@ -500,3 +500,27 @@ budget.** Remaining W0 residue, now small: a loop init/maintain/use triple goal
 (same connective vocabulary + nested ∀, both probed separately — P4 has nested
 binders; compose them on a real loop fn), an `Int.ofNat` coercion site, and the
 general binder-telescope scheme (engineering, not risk).
+
+### 11.1 The fixture crate (`bootstrap-fixture/`)
+
+The canonical minimal module covering the goal-shape matrix — one tiny fn per
+shape, F1–F19 labels in-source. Emits clean today (**20 verified / 0 errors, 18
+fns**, via `--lean-backend --emit-lean --lean-all-proofs`; command in the file
+header; `out/` regenerable, gitignored). Roles: the W0 hand-bridge target set
+(its `sum_to.lean` has the loop triple with casts in invariants — 13
+`toNat`/`Int.ofNat` sites; `find_square.lean` the nested-loop/early-return worst
+case, 19 obligations; `fill_zeros.lean` quantified invariants), the W1 serializer's
+first corpus, and the W3 differential gate's smoke set before tgt. Coverage:
+spec fns (plain / Nat-recursive / datatype-recursive with match+Box), proof fns
+(plain route, tactic block, assert, cast shapes), exec fns (overflow,
+value-position if, loop triple, nested loops + early return, call contracts,
+exec recursion/decreases, Vec view + `&mut` + `old()`, generic `T`, enum match,
+quantified ensures/invariants, struct/tuple). Recorded residue: closures and
+break/continue (add when W2 reaches their `Wp` arms).
+
+Two shape facts the census surfaced, for the goal-language design: **exec
+integer params render as `Int` plus a bound hypothesis** (`h_x_bound : 0 ≤ x ∧
+x < 2^64`), not `Nat` — the TGoal sort story is Int-with-hyps on the exec side,
+Nat on the spec side; and exec island files still over-include unrelated proof
+fns (the documented safe over-approximation) — bridge pairing must key on the
+fn's own obligations (O4's ids), never on file contents.
