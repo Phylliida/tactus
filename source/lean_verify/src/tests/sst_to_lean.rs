@@ -925,6 +925,7 @@ fn mk_test_ctx() -> WpCtx<'static> {
         mut_ref_locals: HashSet::new(),
         borrow_mut_links: HashMap::new(),
         caller_param_typs: HashMap::new(),
+        assert_by_var_typs: HashMap::new(),
         ret_typ: None,
     }
 }

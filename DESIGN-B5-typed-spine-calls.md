@@ -1,7 +1,16 @@
 # B5: Calls report actual — completing the typed spine at call nodes
 
 **Date:** 2026-07-10
-**Status:** SPEC ONLY — nothing implemented. Written for a fresh session to execute.
+**Status:** **B5a DONE** on branch `b5-typed-spine-calls` (`4f5b3dc` census stage,
+`66a55d2` flip): britton `Invalid field` 25 → 0 (total 108 → 83, auto unchanged, no
+new families), exec gate 3114/0 (cold-cache full verify), 299 unit tests + green
+pin test. Census result: 2 decor-only / 0 OTHER — the §3.6 bet held; guard stays
+dropped. NEW FACT from the repro hunt: the lie reproduces ONLY on the
+--lean-all-proofs SST/WP pipeline — tactus_auto-attribute proof fns render via a
+different path that never lied; the pin test (harness option `lean-all-proofs`,
+added to common/mod.rs) is the suite's first on that pipeline. `no-fnmap` census
+lines = ctxs without fn_map or callees pruned from it — those fall back to claim
+(status quo); benign for the corpus (0 residual errors). B5b remains.
 **Scope:** the `Invalid field deref` family (55 errors crate-wide, ~25 in britton —
 **every single `Invalid field` error in the post-fix run is this one bug**) plus its
 exec-path sibling `BUG-call-arg-temp-claimed-typ.md`. Companion to
@@ -214,6 +223,29 @@ that's the falsifiable bet, stated up front.
 **Sharper acceptance for B5a:** britton `Invalid field` 25 → 0; census log
 shows no divergence class other than decorations(+boxing); no new families; no
 count change in auto/timeout buckets beyond the freed goals.
+
+## 3.7 B5b outcome (2026-07-11) — reframed on contact
+
+The bug doc's "real fix" was ALREADY LANDED by post-doc groundwork (typed
+`eq_extraction: Option<(LExpr, Typ)>` + unified `coerce_lexpr` bridge in
+`push_ret_frames`, with a documented mut-ref carve-out). Re-baselining the pin
+showed the artifact now elaborates cleanly — the residual failure is
+`tactus_auto` unable to close a CORRECT goal (seq extensionality from pointwise
+`cloned` facts): auto-bucket, out of B5 scope. B5b therefore shipped as:
+(1) the pin re-asserted on the artifact-correctness boundary (must be
+auto-tactic class; any mismatch/Invalid-field/parse marker = rendering
+regression); (2) B5B-CENSUS on the one latent lie (`q.rhs.typ` claim feeding
+the bridge) with `vir_ret_eq_actual_typ` (B5a's rule on the VIR side: calls →
+declared-instantiated ret via the DynamicResolved selection, vars → the
+substitution entry's recorded value typ) ready to flip in if the census ever
+shows decor-only; (3) BUG-call-arg-temp-claimed-typ.md status updated.
+
+**Surfaced, filed for the F-series (NOT chased):** `assert(a@ =~= b@)` inside
+an exec fn's proof block renders to Lean that fails parsing with `unexpected
+identifier; expected ']'`, and the assert's fact reaches the postcondition
+goal as literal `True` — two independent smells (ext-eq rendering; assert-fact
+propagation for exec-site proof blocks). Repro = the pin test body with the
+site assert (see git history of test_exec_vec_field_index_clone).
 
 ## 4. Sequencing & validation
 
