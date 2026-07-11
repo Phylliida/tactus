@@ -49,3 +49,26 @@ proof fn use_sizes(e: PExpr, l: PList)
 by { constructor <;> omega }
 
 } // verus!
+
+verus! {
+
+// Review probe: plain `let` of a Box-typed value in a spec body — the
+// block_to_node Decl path (documented residue of the pattern-binder fix).
+pub open spec fn head_size(t: Tree2) -> nat {
+    match t {
+        Tree2::Leaf2(_v) => 0,
+        Tree2::Node2(l, _r) => { let b = l; tsize(*b) }
+    }
+}
+
+pub enum Tree2 { Leaf2(u64), Node2(Box<Tree2>, Box<Tree2>) }
+
+pub open spec fn tsize(t: Tree2) -> nat
+    decreases t
+{
+    match t { Tree2::Leaf2(_v) => 1, Tree2::Node2(a, b) => tsize(*a) + tsize(*b) }
+}
+
+proof fn use_head_size(t: Tree2) ensures head_size(t) >= 0 by { simp }
+
+} // verus!

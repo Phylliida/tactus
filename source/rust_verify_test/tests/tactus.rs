@@ -19,6 +19,35 @@ fn verify_one_file(name: &str, code: String, options: &[&str]) -> Result<TestErr
     common::verify_one_file(name, code, &options)
 }
 
+// === spec-mode let of a Box-typed value: uses re-materialize .deref ===
+// The Decl-position sibling of the match-arm pattern-binder fix: a plain
+// `let b = l;` where l : Box<T> binds b at `Tactus.Box T`, while spec-mode
+// VIR strips the decoration on b's uses. block_to_node threads the pattern
+// bindings through ctx.binder_typs so the use-site coercion inserts the
+// `.deref`. (Found in review; previously failed elaboration.)
+test_verify_one_file! {
+    #[test] test_spec_let_box_use_derefs verus_code! {
+        use vstd::prelude::*;
+
+        pub enum Tree { Leaf(u64), Node(Box<Tree>, Box<Tree>) }
+
+        pub open spec fn tsize(t: Tree) -> nat
+            decreases t
+        {
+            match t { Tree::Leaf(_v) => 1, Tree::Node(a, b) => tsize(*a) + tsize(*b) }
+        }
+
+        pub open spec fn head_size(t: Tree) -> nat {
+            match t {
+                Tree::Leaf(_v) => 0,
+                Tree::Node(l, _r) => { let b = l; tsize(*b) }
+            }
+        }
+
+        proof fn use_head_size(t: Tree) ensures head_size(t) >= 0 by { simp }
+    } => Ok(())
+}
+
 // === structural_decreases: kernel-computable recursive spec fns ===
 // (DESIGN-bootstrap.md W1.5.) The `decide` closer DISCRIMINATES: a
 // WF-compiled def is kernel-inert (decide gets stuck at the derived
