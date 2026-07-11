@@ -169,6 +169,7 @@ fn simple_def_renders() {
         ret_ty: var("Nat"),
         body: bin(BinOp::Add, var("x"), var("x")),
         termination_by: vec![],
+        termination_structural: false,
         decreasing_by: None,
     };
     let expected = "@[irreducible] noncomputable def double (x : Nat) : Nat :=\n  x + x\n";
@@ -325,6 +326,7 @@ fn termination_by_tuple() {
         ret_ty: var("Nat"),
         body: var("n"),
         termination_by: vec![var("n"), var("m")],
+        termination_structural: false,
         decreasing_by: None,
     };
     let out = pp_command(&Command::Def(d));
