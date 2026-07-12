@@ -17,7 +17,7 @@ use crate::project;
 use crate::sanity;
 use crate::sst_to_lean;
 use crate::to_lean_fn::{self, LeanSourceMap};
-use crate::to_lean_type::{sanitize, short_name};
+use crate::to_lean_type::{lean_name, sanitize, short_name};
 
 // ── Artifact location ──────────────────────────────────────────────────
 
@@ -66,6 +66,16 @@ pub fn sourcemap_path(crate_name: &str) -> PathBuf {
     lean_out_root().join(sanitize(crate_name)).join("sourcemap.json")
 }
 
+/// Like `write_lean_file`, returning whether the content CHANGED
+/// (file absent or different) — the cross-run skip signal (M5e).
+fn write_lean_file_tracked(path: &Path, source: &str) -> Result<bool, String> {
+    let changed = std::fs::read_to_string(path).ok().as_deref() != Some(source);
+    if changed {
+        write_lean_file(path, source)?;
+    }
+    Ok(changed)
+}
+
 fn write_lean_file(path: &Path, source: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -86,14 +96,28 @@ fn write_lean_file(path: &Path, source: &str) -> Result<(), String> {
 /// not through this enum. The enum is purely about the proof-fn
 /// vs exec-fn structural distinction.
 enum PreambleConfig {
-    /// Proof fns: native match rendering (no accessor fns).
-    /// Emitting accessors for types with non-Inhabited fields
-    /// breaks Lean elaboration even when unused, so the proof-fn
-    /// path keeps them off.
+    /// Proof fns: native match rendering (no accessor fns). The
+    /// historical caveat ("accessors for types with non-Inhabited
+    /// fields break elaboration even when unused") is LIFTED — M6.0
+    /// moved accessors to `[Nonempty]` + `Classical.ofNonempty`, so
+    /// they elaborate for any field type. Proof fns keep native match
+    /// purely as the better rendering.
     ProofFn,
     /// Exec fns: emit accessor fns for desugared match (via
     /// `IsVariant` / `Field`).
     ExecFn,
+    /// Package emission (DESIGN-emit-module.md M2): proof-fn rendering
+    /// (no accessors) with NO helper theorems — helpers arrive as
+    /// hypothesis binders typed by their statement defs, and the
+    /// statement defs arrive via the Stmts module import. Only valid
+    /// in shared-defs mode (callers guarantee `defs` is `Some`).
+    ProofFnPackage,
+    /// Exec package emission (DESIGN-exec-packages.md M6.2): like
+    /// ProofFnPackage — no helper theorems (hypothesis binders), no
+    /// LOCAL accessors either: the full-roots exec defs module carries
+    /// the accessor fns (M6.0b census), and callers gate on
+    /// `defs.covers_exec` before choosing this config.
+    ExecFnPackage,
 }
 
 impl PreambleConfig {
@@ -251,14 +275,8 @@ fn krate_preamble(
     // over exactly the fns emitted into it — root_fns + helpers_to_emit.
     let root_fn_set: std::collections::HashSet<&Fun> =
         root_fns.iter().map(|f| &f.name).collect();
-    let is_emittable_helper = |f: &&FunctionX| {
-        matches!(f.mode, vir::ast::Mode::Proof)
-            && !matches!(
-                f.kind,
-                FunctionKind::TraitMethodDecl { .. } | FunctionKind::TraitMethodImpl { .. }
-            )
-            && tactic_bodies.contains_key(&f.name)
-    };
+    let is_emittable_helper =
+        |f: &&FunctionX| is_emittable_tactic_proof_fn(f, tactic_bodies);
     let helpers_to_emit: Vec<&FunctionX> = match config {
         // Proof-fn file: include ONLY the root's transitive downward
         // dependencies (proof fns its tactic body references, recursively),
@@ -290,6 +308,13 @@ fn krate_preamble(
             .filter(is_emittable_helper)
             .filter(|f| !root_fn_set.contains(&f.name))
             .collect(),
+        // Package mode: helpers are hypothesis binders on the root
+        // theorem (typed by statement defs from the Stmts module
+        // import), never inline theorems. Exec package mode kills the
+        // ExecFn over-approximation above for good: at package-emit
+        // time the obligations' tactic texts ARE available (from the
+        // SST), so the emitter scans them for the precise helper set.
+        PreambleConfig::ProofFnPackage | PreambleConfig::ExecFnPackage => Vec::new(),
     };
     // Aggregate fragments across all theorems. Dedup preserves
     // first-occurrence order via a HashSet for membership and a
@@ -481,6 +506,41 @@ fn body_references_builtin_spec_fun(func: &FunctionX) -> bool {
     found.get()
 }
 
+/// Segment tag for defs partitioning (M5d-3): commands from a
+/// segment's start index up to the next segment's start carry its tag.
+/// `Base` = the entangled machinery (datatypes, classes, instances,
+/// instance-prereq spec fns) that stays in one part; `FnGroup` = the
+/// partitionable bulk; `ProofClasses`/`BcAxiom` are emitted last and
+/// referenced only from OUTSIDE defs — they ride the umbrella.
+#[derive(Clone)]
+pub(crate) enum DefsSeg {
+    Base,
+    /// One spec-fn group (single or mutual): the fns it defines and the
+    /// fn-level references its bodies/signatures make (edge source for
+    /// the module graph; datatype refs resolve to Base implicitly).
+    FnGroup { fns: Vec<Fun>, refs: Vec<Fun> },
+    /// A trait instance: the spec fns it needs emitted first — these
+    /// get pulled into Base (transitively) so instances can stay there.
+    Instance { prereq_fns: Vec<Fun> },
+    /// Proof-method trait class decls: consumed by INSTANCES (which
+    /// live in Base), so they route to Base too — and like instances,
+    /// the spec fns their method signatures reference must be pulled
+    /// into Base first (M6.5 finding: umbrella routing broke every
+    /// crate whose ladder reached a proof-trait impl).
+    ProofClasses { prereq_fns: Vec<Fun> },
+    BcAxiom,
+}
+
+/// Fn-level references of one spec fn: body call refs + nothing else
+/// (signature datatype refs point at Base, which every part imports).
+fn spec_fn_refs(f: &FunctionX) -> Vec<Fun> {
+    let mut refs: Vec<&Fun> = Vec::new();
+    if let Some(body) = &f.body {
+        dep_order::collect_fun_refs(body, &mut refs);
+    }
+    refs.into_iter().cloned().collect()
+}
+
 pub(crate) fn spec_world_cmds(
     krate: &KrateX,
     ectx: &crate::emit_ctx::EmitCtx,
@@ -500,6 +560,17 @@ pub(crate) fn spec_world_cmds(
     // tripwires keep guarding per-fn emission.
     lenient: bool,
 ) -> Vec<Command> {
+    spec_world_cmds_tagged(krate, ectx, dep_walk_roots, emit_accessors, bc_lemma_funcs, lenient).0
+}
+
+pub(crate) fn spec_world_cmds_tagged(
+    krate: &KrateX,
+    ectx: &crate::emit_ctx::EmitCtx,
+    dep_walk_roots: &[&FunctionX],
+    emit_accessors: bool,
+    bc_lemma_funcs: &[&FunctionX],
+    lenient: bool,
+) -> (Vec<Command>, Vec<(usize, DefsSeg)>) {
     // Returns whether the commands were actually pushed — lenient mode can
     // swallow a panic and skip; emissions that DEPEND on a prior item
     // having landed (the seq measure companion) consult the result
@@ -524,6 +595,7 @@ pub(crate) fn spec_world_cmds(
         }
     };
     let mut cmds: Vec<Command> = Vec::new();
+    let mut segs: Vec<(usize, DefsSeg)> = vec![(0, DefsSeg::Base)];
     let all_fns: Vec<&FunctionX> = krate.functions.iter().map(|f| &f.x).collect();
     let spec_fn_map = dep_order::build_spec_fn_map(&all_fns);
     let mut refs = dep_order::collect_references(&spec_fn_map, &ectx.fn_map, dep_walk_roots);
@@ -1033,6 +1105,27 @@ pub(crate) fn spec_world_cmds(
             to_lean_fn::trait_impl_to_ast(&ti.x, method_impls, &assoc_types, subst, &ne_bounds, ectx)
         ));
     };
+    // Spec fns the proof-class method SIGNATURES reference (requires/
+    // ensures exprs of TraitMethodDecl fns of qualifying traits) — the
+    // Base pull for ProofClasses segs, mirroring Instance prereqs.
+    let proof_class_prereq_fns: Vec<Fun> = {
+        let qualifying: std::collections::HashSet<&vir::ast::Path> = krate.traits.iter()
+            .filter(|tr| trait_has_proof_method(&tr.x) && should_emit_class(&tr.x))
+            .map(|tr| &tr.x.name)
+            .collect();
+        let mut refs: Vec<&Fun> = Vec::new();
+        for f in krate.functions.iter().map(|f| &f.x) {
+            if let FunctionKind::TraitMethodDecl { trait_path, .. } = &f.kind {
+                if qualifying.contains(trait_path) {
+                    for e in f.require.iter().chain(f.ensure.0.iter()) {
+                        dep_order::collect_fun_refs(e, &mut refs);
+                    }
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        refs.into_iter().filter(|f| seen.insert((*f).clone())).cloned().collect()
+    };
     // Classes WITH proof-fn methods: their Prop-typed fields reference
     // spec fns, and proof-trait instances reference them — so they sit at
     // the spec-fn/instance boundary (after the last spec-fn group).
@@ -1143,6 +1236,14 @@ pub(crate) fn spec_world_cmds(
             if done[ai] {
                 continue;
             }
+            // The subrange-len axiom is cited by the seq measure
+            // companion FROM ITS OWN PART (parts cannot import the
+            // umbrella) — the companion site emits it in-part. Only
+            // the final forced flush may emit it here (crates whose
+            // closure never reaches drop_first/drop_last).
+            if !force && Some(ai) == subrange_ax_idx {
+                continue;
+            }
             let (gd, id) = &axiom_deps[ai];
             if force || (gd.iter().all(|g| pg.contains(g)) && id.iter().all(|j| pi.contains(j))) {
                 done[ai] = true;
@@ -1166,15 +1267,28 @@ pub(crate) fn spec_world_cmds(
             }
         }
     };
+    // Partition placement (M6 defs): every mid-stream axiom flush is
+    // bracketed as DefsSeg::BcAxiom so the axioms land in the UMBRELLA
+    // (which imports every part). Without the bracket they ride the
+    // enclosing Base-tagged gap — and all Base ranges concatenate into
+    // the FIRST part, physically placing axioms before their deps'
+    // declarations in later parts (post-merge census regression:
+    // `Unknown constant Seq.empty` in TactusDefs_lib__base).
+    segs.push((cmds.len(), DefsSeg::BcAxiom));
     flush_ready_axioms(&mut cmds, &mut axiom_done, &mut axiom_ok, &processed_groups, &processed_instances, false);
+    segs.push((cmds.len(), DefsSeg::Base));
 
     // No spec-fn groups at all: proof classes have nothing to wait on.
     if last_group_pos.is_none() {
+        segs.push((cmds.len(), DefsSeg::ProofClasses {
+            prereq_fns: proof_class_prereq_fns.clone(),
+        }));
         push_lenient(&mut cmds, "proof-method trait classes", &mut || {
             let mut tmp = Vec::new();
             emit_proof_classes(&mut tmp);
             tmp
         });
+        segs.push((cmds.len(), DefsSeg::Base));
     }
     for (pos, step) in order.iter().enumerate() {
         // Whether this step's own emission landed (vs lenient-skipped) —
@@ -1184,24 +1298,59 @@ pub(crate) fn spec_world_cmds(
             dep_order::EmitStep::Group(i) => match &groups[*i] {
                 FnGroup::Single(f) => {
                     if lenient && body_references_builtin_spec_fun(f) {
-                        // NOT `continue` — the loop tail's proof-class
+                        // Prop-returning: emit an uninterpreted
+                        // signature axiom so dependents (e.g. vstd's
+                        // `cloned` → `strictly_cloned`) stay
+                        // renderable. Others: skip as before. NOT
+                        // `continue` — the loop tail's proof-class
                         // emission must still run when this is the
                         // last group.
-                        eprintln!(
-                            "tactus: skipped builtin-bodied spec fn `{}` in shared defs (no Lean form for BuiltinSpecFun)",
-                            short_name(&f.name.path));
+                        if let Some(ax) = to_lean_fn::builtin_spec_fn_signature_axiom(f, ectx) {
+                            segs.push((cmds.len(), DefsSeg::FnGroup {
+                                fns: vec![f.name.clone()], refs: spec_fn_refs(f),
+                            }));
+                            cmds.push(ax);
+                            segs.push((cmds.len(), DefsSeg::Base));
+                        } else {
+                            eprintln!(
+                                "tactus: skipped builtin-bodied spec fn `{}` in shared defs (no Lean form for BuiltinSpecFun)",
+                                short_name(&f.name.path));
+                        }
                     } else {
+                    segs.push((cmds.len(), DefsSeg::FnGroup {
+                        fns: vec![f.name.clone()], refs: spec_fn_refs(f),
+                    }));
                     step_pushed = push_lenient(&mut cmds, "spec fn", &mut || {
                         let augmented = augment(f);
                         to_lean_fn::spec_fn_to_ast(&augmented, ectx)
                     });
+                    segs.push((cmds.len(), DefsSeg::Base));
                     }
                 }
                 FnGroup::Mutual(fns) => {
                     if lenient && fns.iter().any(|f| body_references_builtin_spec_fun(f)) {
-                        eprintln!(
-                            "tactus: skipped builtin-bodied mutual spec-fn group in shared defs (no Lean form for BuiltinSpecFun)");
+                        // Signature axioms don't need the mutual
+                        // block (no bodies); all-or-nothing per group
+                        // so intra-group references stay resolvable.
+                        let axioms: Vec<_> = fns.iter()
+                            .filter_map(|f| to_lean_fn::builtin_spec_fn_signature_axiom(f, ectx))
+                            .collect();
+                        if axioms.len() == fns.len() {
+                            segs.push((cmds.len(), DefsSeg::FnGroup {
+                                fns: fns.iter().map(|f| f.name.clone()).collect(),
+                                refs: fns.iter().flat_map(|f| spec_fn_refs(f)).collect(),
+                            }));
+                            cmds.extend(axioms);
+                            segs.push((cmds.len(), DefsSeg::Base));
+                        } else {
+                            eprintln!(
+                                "tactus: skipped builtin-bodied mutual spec-fn group in shared defs (no Lean form for BuiltinSpecFun)");
+                        }
                     } else {
+                    segs.push((cmds.len(), DefsSeg::FnGroup {
+                        fns: fns.iter().map(|f| f.name.clone()).collect(),
+                        refs: fns.iter().flat_map(|f| spec_fn_refs(f)).collect(),
+                    }));
                     push_lenient(&mut cmds, "mutual spec fns", &mut || {
                         // Sibling references inside the `mutual` block
                         // render as full dotted names like everything
@@ -1216,15 +1365,26 @@ pub(crate) fn spec_world_cmds(
                             .collect();
                         vec![Command::Mutual(inner)]
                     });
+                    segs.push((cmds.len(), DefsSeg::Base));
                     }
                 }
             },
             dep_order::EmitStep::Instance(j) => {
+                let prereq_fns: Vec<Fun> = instance_keys.get(*j)
+                    .map(|(_, methods)| methods.iter()
+                        .flat_map(|m| {
+                            std::iter::once(m.name.clone())
+                                .chain(spec_fn_refs(m))
+                        })
+                        .collect())
+                    .unwrap_or_default();
+                segs.push((cmds.len(), DefsSeg::Instance { prereq_fns }));
                 step_pushed = push_lenient(&mut cmds, "trait instance", &mut || {
                     let mut tmp = Vec::new();
                     emit_instance(&mut tmp, *j);
                     tmp
                 });
+                segs.push((cmds.len(), DefsSeg::Base));
             }
         }
         // Mark the step processed (even when lenient mode SKIPPED its
@@ -1234,7 +1394,19 @@ pub(crate) fn spec_world_cmds(
             dep_order::EmitStep::Group(i) => { processed_groups.insert(*i); }
             dep_order::EmitStep::Instance(j) => { processed_instances.insert(*j); }
         }
+        // Partition placement follows CONSUMERS, not stream position:
+        // flushed axioms are consumed by pkg/island theorems, which
+        // import the UMBRELLA — so tag BcAxiom (umbrella). Stream
+        // position can't work per-part: dep-order and module-partition
+        // disagree (a hoisted-early `Seq.empty` group is tagged into
+        // the seq part while a flush after an instance step would sit
+        // in base — base imports nothing). The one IN-PART consumer
+        // (the seq measure companion citing axiom_seq_subrange_len) is
+        // handled at the companion site below, and mid-stream flushes
+        // SKIP that axiom.
+        segs.push((cmds.len(), DefsSeg::BcAxiom));
         flush_ready_axioms(&mut cmds, &mut axiom_done, &mut axiom_ok, &processed_groups, &processed_instances, false);
+        segs.push((cmds.len(), DefsSeg::Base));
         // vstd seq measure companions (B3): right after `Seq.drop_first`/
         // `Seq.drop_last` emits (and after the axiom flush above — the
         // subrange-len axiom's deps precede this def's group, so the
@@ -1249,25 +1421,62 @@ pub(crate) fn spec_world_cmds(
                     // landed — lenient mode can skip either, and an
                     // unguarded companion referencing a never-declared
                     // name would poison the whole shared-defs file.
-                    let ax_landed = subrange_ax_idx.map_or(false, |i| axiom_ok[i]);
-                    if step_pushed && ax_landed {
-                        if let Some(cmd) =
-                            seq_measure_companion_cmd(f, &rel, &all_fns, bc_lemma_funcs)
-                        {
-                            push_lenient(&mut cmds, "seq measure companion", &mut || vec![cmd.clone()]);
+                    // Emit the subrange axiom HERE, in this fn's part
+                    // (mid-stream flushes skip it): the companion cites
+                    // it and parts cannot import the umbrella. Both ride
+                    // the fn's own group seg so later parts' decreasing_by
+                    // (which cites the companion) resolves via the part
+                    // import chain.
+                    if step_pushed {
+                        segs.push((cmds.len(), DefsSeg::FnGroup {
+                            fns: vec![f.name.clone()], refs: spec_fn_refs(f),
+                        }));
+                        if let Some(ai) = subrange_ax_idx {
+                            if !axiom_done[ai] {
+                                axiom_done[ai] = true;
+                                let ax = bc_lemma_funcs[ai];
+                                axiom_ok[ai] = push_lenient(&mut cmds, "broadcast axiom", &mut || {
+                                    let with_ne = add_nonempty(ax.clone(), &ax.name);
+                                    let augmented = crate::impl_subst::maybe_augment_standalone_fn(
+                                        &with_ne, &ectx.trait_outparams,
+                                    );
+                                    vec![to_lean_fn::broadcast_lemma_axiom_cmd(&augmented, ectx)]
+                                });
+                            }
                         }
+                        let ax_landed = subrange_ax_idx.map_or(false, |i| axiom_ok[i]);
+                        if ax_landed {
+                            if let Some(cmd) =
+                                seq_measure_companion_cmd(f, &rel, &all_fns, bc_lemma_funcs)
+                            {
+                                push_lenient(&mut cmds, "seq measure companion", &mut || vec![cmd.clone()]);
+                            }
+                        }
+                        segs.push((cmds.len(), DefsSeg::Base));
                     }
                 }
             }
         }
         if Some(pos) == last_group_pos {
+            segs.push((cmds.len(), DefsSeg::ProofClasses {
+                prereq_fns: proof_class_prereq_fns.clone(),
+            }));
             push_lenient(&mut cmds, "proof-method trait classes", &mut || {
                 let mut tmp = Vec::new();
                 emit_proof_classes(&mut tmp);
                 tmp
             });
+            segs.push((cmds.len(), DefsSeg::Base));
         }
     }
+    // Broadcast axioms now emit INCREMENTALLY via flush_ready_axioms
+    // (dependency-ordered, main's B-series fix) — mid-stream axioms
+    // ride whatever DefsSeg is current, which is sound for the
+    // partition (they land after their deps, and the umbrella
+    // re-exports every part). The final forced flush below catches
+    // stragglers; tag it BcAxiom so those land in the umbrella like
+    // the old always-at-the-end position.
+    segs.push((cmds.len(), DefsSeg::BcAxiom));
     // Final forced flush: any broadcast axiom not yet emitted (a dep that
     // never appeared in `order`, or lenient-mode edge cases) lands here —
     // the old always-at-the-end position. Sound by the same argument as
@@ -1275,7 +1484,7 @@ pub(crate) fn spec_world_cmds(
     // (`vargo build` → 0 errors); we stipulate it. The user opted in
     // explicitly with `broadcast use <group>;` (#122).
     flush_ready_axioms(&mut cmds, &mut axiom_done, &mut axiom_ok, &processed_groups, &processed_instances, true);
-    cmds
+    (cmds, segs)
 }
 
 /// vstd seq measure companion (B3, DESIGN-lean-all-proofs-bugs.md): when
@@ -1505,6 +1714,13 @@ pub struct EmitOutput {
     pub file_path: PathBuf,
     pub source_map: LeanSourceMap,
     pub warnings: Vec<String>,
+    /// Line of the island's first `theorem` head (pp landmark).
+    /// Everything before it is emitter preamble; the island sorry
+    /// gate treats sorry warnings at/after it as user-written.
+    pub first_theorem_line: Option<usize>,
+    /// Whether the island's `.lean` content changed this run
+    /// (tracked write) — the cross-run cache skip signal.
+    pub changed: bool,
 }
 
 /// Codegen-only half of `check_proof_fn`: inline pass → preamble → theorem →
@@ -1571,6 +1787,31 @@ fn install_datatype_field_bounds(krate: &KrateX) {
         map.insert(path.clone(), fields);
     }
     crate::to_lean_sst_expr::set_datatype_fields(map);
+
+    // Sibling table, ALL datatypes ALL variants, raw field names:
+    // declared ctor-slot typs for the Box::new-erasure re-wrap
+    // (expr_shared::CTOR_FIELD_TYPS).
+    let mut ctor_map: std::collections::HashMap<
+        vir::ast::Path,
+        (Vec<vir::ast::Ident>, std::collections::HashMap<String, Vec<(String, vir::ast::Typ)>>),
+    > = std::collections::HashMap::new();
+    for d in krate.datatypes.iter() {
+        let dx = &d.x;
+        let vir::ast::Dt::Path(path) = &dx.name else { continue; };
+        let tps: Vec<vir::ast::Ident> = dx.typ_params.iter().map(|(id, _)| id.clone()).collect();
+        let variants: std::collections::HashMap<String, Vec<(String, vir::ast::Typ)>> = dx
+            .variants
+            .iter()
+            .map(|v| {
+                (
+                    v.name.as_str().to_string(),
+                    v.fields.iter().map(|f| (f.name.as_str().to_string(), f.a.0.clone())).collect(),
+                )
+            })
+            .collect();
+        ctor_map.insert(path.clone(), (tps, variants));
+    }
+    crate::expr_shared::set_ctor_field_typs(ctor_map);
 }
 
 pub fn emit_proof_fn(
@@ -1587,7 +1828,44 @@ pub fn emit_proof_fn(
     // built (or poisoned to None) before this runs; in `--emit-lean`
     // mode this writes the defs source without building. Takes the
     // pre-inline krate — `for_crate` applies its own inline pass.
-    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, false);
+    // TODO(M6.5): emit-module mode still writes proof-family artifacts;
+    // unify with `unified_package_defs` once build=false covers_exec
+    // semantics are settled (the ladder decides covers_exec, and this
+    // path deliberately skips the build).
+    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, false, crate::crate_defs::ScopeKind::Proof);
+    // Package emission (M2, --tactus-emit-module): additive artifact
+    // under pkg/; islands (and the batch) remain the checking
+    // authority, so failures warn loudly but never fail the fn. Hooked
+    // BEFORE the batch early-return so batched fns get package
+    // artifacts too.
+    if package_enabled() {
+        match &defs {
+            Some(d) => {
+                match emit_package_proof_fn(
+                    krate, proof_fn, tactic_body, imports, crate_name, tactic_bodies, d,
+                ) {
+                    Ok(PkgEmitOutcome::Single { .. }) | Ok(PkgEmitOutcome::Mutual { .. }) => {}
+                    Ok(PkgEmitOutcome::UnsupportedScc(reason)) => eprintln!(
+                        "tactus: package emission skipped for `{}`: {}",
+                        short_name(&proof_fn.name.path), reason
+                    ),
+                    Err(e) => eprintln!(
+                        "tactus: package emission failed for `{}` ({}); island artifact unaffected",
+                        short_name(&proof_fn.name.path), e
+                    ),
+                }
+                // Link module (M3): once per scope; content is fully
+                // determined by the krate, so any fn's emission can
+                // trigger the build.
+                link_for_crate(krate, crate_name, tactic_bodies, d);
+            }
+            None => eprintln!(
+                "tactus: --tactus-emit-module requires the shared-defs module \
+                 (build failed or gate unmet); package emission skipped for `{}`",
+                short_name(&proof_fn.name.path)
+            ),
+        }
+    }
     // Batch route (step 1b): a batched proof fn's artifact IS the batch
     // file; return its position within it for the sidecar. (In check
     // mode `check_proof_fn` returns before reaching here for covered
@@ -1637,17 +1915,15 @@ pub fn emit_proof_fn(
     // the .lean path for inspection and `cat`-style debugging works
     // regardless of which step fails.
     let rendered = pp_commands(&cmds);
-    let source_map = LeanSourceMap::ProofFn {
-        fn_name: short_name(&proof_fn.name.path).to_string(),
-        // One proof fn per file → exactly one `Tactic::Raw` emission.
-        tactic_start_line: rendered.landmarks.tactic_starts.first().copied().unwrap_or(0),
-        tactic_line_count: tactic_body.lines().count().max(1),
-    };
+    // One proof fn per file → exactly one `Tactic::Raw` emission.
+    let source_map = proof_fn_source_map(
+        &proof_fn.name, rendered.landmarks.tactic_starts.first().copied(), tactic_body);
 
     let file_path = lean_file_path(crate_name, &proof_fn.name.path);
-    if let Err(e) = write_lean_file(&file_path, &rendered.text) {
-        return Err(CheckResult::Error(e));
-    }
+    let changed = match write_lean_file_tracked(&file_path, &rendered.text) {
+        Ok(c) => c,
+        Err(e) => return Err(CheckResult::Error(e)),
+    };
 
     let cmds_for_sanity: Vec<Command> = match &defs {
         // Sanity resolves identifiers over the command stream; in defs
@@ -1668,7 +1944,10 @@ pub fn emit_proof_fn(
         });
     }
 
-    Ok(EmitOutput { file_path, source_map, warnings: vec![] })
+    Ok(EmitOutput {
+        file_path, source_map, warnings: vec![], changed,
+        first_theorem_line: rendered.landmarks.theorem_heads.first().copied(),
+    })
 }
 
 /// Verify a proof fn: emit its `.lean` (via `emit_proof_fn`), then run Lean.
@@ -1680,11 +1959,22 @@ pub fn check_proof_fn(
     crate_name: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> CheckResult {
+    // Package-check route (M5a, --tactus-package-check): tactic proof
+    // fns verify via their PACKAGE module instead of an island. `None`
+    // = the route can't run (defs unavailable) — fall through to the
+    // island path below.
+    if package_check_enabled() {
+        if let Some(result) = check_proof_fn_via_package(
+            krate, proof_fn, tactic_body, imports, crate_name, tactic_bodies,
+        ) {
+            return result;
+        }
+    }
     // Build (or fetch) the shared defs module FIRST: `emit_proof_fn`'s
     // internal lookup is a memo hit on whatever this call cached, so
     // the emitted import and the built artifact can't disagree. A
     // build failure caches `None` → standalone emission, today's path.
-    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true);
+    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true, crate::crate_defs::ScopeKind::Proof);
     // Batch route (CRATEDEFS.md step 1b): ordinary proof fns verify in
     // ONE Lean run over TactusProofs_{crate}.lean; the first covered fn
     // builds + runs it, the rest read the cached per-fn attribution.
@@ -1695,11 +1985,19 @@ pub fn check_proof_fn(
             return b.result_for(&proof_fn.name);
         }
     }
-    let EmitOutput { file_path, source_map, .. } =
+    let EmitOutput { file_path, source_map, first_theorem_line, changed, .. } =
         match emit_proof_fn(krate, proof_fn, tactic_body, imports, crate_name, tactic_bodies) {
             Ok(o) => o,
             Err(cr) => return cr,
         };
+    let marker = file_path.with_extension("verified");
+    if island_cache_ok(&marker, changed, &defs) {
+        ISLAND_CACHED_VERDICTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Live-path parity: success warnings are the sorry-filtered
+        // set, which is empty by construction (sorry is fatal here).
+        return CheckResult::Success { warnings: vec![] };
+    }
+    let _ = std::fs::remove_file(&marker);
 
     let dir = project::default_project_dir();
     let lake_dir = if project::project_ready(&dir) { Some(dir.as_path()) } else { None };
@@ -1712,18 +2010,176 @@ pub fn check_proof_fn(
         extra_paths.push(&d.dir);
     }
     let result = lean_process::check_lean_file(&file_path, lake_dir, &extra_paths);
+    if let Ok(r) = &result {
+        if r.success {
+            if let Some(fail) = island_sorry_failure(
+                r, first_theorem_line, &proof_fn.name.path, &file_path, &source_map)
+            {
+                return fail;
+            }
+            let _ = std::fs::write(&marker, crate::project::toolchain_fingerprint());
+        }
+    }
+    format_lean_check_result(result, proof_fn, &file_path, &source_map)
+}
 
+/// Islands have no Link gate behind them — package-mode fallback fns
+/// are cycle-poisoned out of the Link closure, and exec fns are never
+/// in it — so a `sorry`/`admit` that elaborates (a warning to Lean)
+/// would verify with no fatal layer anywhere. On the island path it
+/// is therefore FATAL. The package path keeps warning-at-fn-level +
+/// fatal Link sorryAx backstop (layered defense; both test-pinned).
+/// Island verdict cache (cross-run). Marker = `<island>.verified`
+/// holding the toolchain fingerprint; it exists IFF the last completed
+/// Lean run on exactly this island text, against this toolchain,
+/// succeeded. Skip additionally requires the imported defs family had
+/// no breaking rebuild this run (superset appends keep consumer
+/// validity — same kernel-weakening argument as the package cache;
+/// with fingerprint-scoped defs, any crate change renames the defs
+/// module and thus changes the island text itself). Sorry can't hide
+/// in a cached verdict: it is FATAL on island paths, so no marker is
+/// ever written over one. The marker is REMOVED before any live run —
+/// a crashed or failed run leaves no stale trust behind.
+fn island_cache_ok(
+    marker: &Path,
+    changed: bool,
+    defs: &Option<std::sync::Arc<crate::crate_defs::CrateDefs>>,
+) -> bool {
+    if changed || defs.as_ref().is_some_and(|d| d.breaking) {
+        return false;
+    }
+    let hit = std::fs::read_to_string(marker).ok().as_deref()
+        == Some(crate::project::toolchain_fingerprint());
+    if hit {
+        static NOTE: std::sync::Once = std::sync::Once::new();
+        NOTE.call_once(|| {
+            eprintln!("note: tactus: island cache: reusing prior verdicts \
+for unchanged islands (`.verified` markers)");
+        });
+    }
+    hit
+}
+
+/// Lean positions `declaration uses 'sorry'` at the DECLARATION HEAD
+/// (not the sorry literal), and re-warns per declaration whose term
+/// contains it — so neither tactic-region membership nor counting
+/// emitted placeholders can discriminate. Structure can: islands are
+/// emitter preamble (classes / instances / spec defs — where the
+/// TACTIC_BODY_FALLBACK placeholders for trait-method defaults live,
+/// their obligations Verus-checked) followed by theorems (where user
+/// tactic text lives). Sorry warnings at/after the FIRST theorem head
+/// are user-written and fatal; earlier ones warn. No position or no
+/// theorem landmark → fatal (unknown provenance).
+fn island_sorry_failure(
+    r: &lean_process::LeanResult,
+    first_theorem_line: Option<usize>,
+    fn_path: &vir::ast::Path,
+    file_path: &Path,
+    source_map: &LeanSourceMap,
+) -> Option<CheckResult> {
+    let user_written = |d: &lean_process::LeanDiagnostic| -> bool {
+        match (&d.pos, first_theorem_line) {
+            (Some(p), Some(t)) => p.line >= t,
+            _ => true,
+        }
+    };
+    let errors: Vec<TactusDiag> = r.diagnostics.iter()
+        .filter(|d| d.severity == "warning" && d.data.contains("sorry") && user_written(d))
+        .map(|d| {
+            let formatted = lean_process::format_error(d, source_map);
+            TactusDiag {
+                message: format!(
+                    "sorry is fatal on the per-fn path (no Link gate covers {}): {}",
+                    short_name(fn_path), formatted.message),
+                location: formatted.location,
+                help: Some(format!("{} {}",
+                    vir::tactus_messages::LEAN_FILE_HELP_PREFIX, file_path.display())),
+            }
+        })
+        .collect();
+    if errors.is_empty() {
+        None
+    } else {
+        Some(CheckResult::Failed { errors, warnings: vec![] })
+    }
+}
+
+/// Shared diagnostics chokepoint for island AND package-check proof-fn
+/// failures: format Lean's `--json` diagnostics through the source map
+/// so both paths point at identical Rust spans.
+fn format_lean_check_result(
+    result: Result<lean_process::LeanResult, String>,
+    proof_fn: &FunctionX,
+    file_path: &Path,
+    source_map: &LeanSourceMap,
+) -> CheckResult {
+    // Deliberately narrowed to `sorry` (the soundness escape hatch):
+    // generic Lean warnings are dominated by lints/hints on GENERATED
+    // shapes (defensive termination_by on non-recursive fns, emitted
+    // simp lists) — surfacing them all fights the emitter's own noise.
+    // A broader warning policy is future work (review follow-up).
+    let lean_warnings = |r: &lean_process::LeanResult| -> Vec<String> {
+        r.diagnostics.iter()
+            .filter(|d| d.severity == "warning" && d.data.contains("sorry"))
+            .map(|d| {
+                let formatted = lean_process::format_error(d, source_map);
+                format!("Lean warning in {}: {}",
+                    short_name(&proof_fn.name.path), formatted.message)
+            })
+            .collect()
+    };
     match result {
-        Ok(r) if r.success => CheckResult::Success { warnings: vec![] },
+        // Warning-severity diagnostics (e.g. `declaration uses 'sorry'`)
+        // surface on success — previously dropped by island AND package
+        // paths alike (review finding). The soundness backstop for
+        // sorry stays the Link gate's fatal sorryAx check; this is the
+        // fn-level signal.
+        Ok(r) if r.success => {
+            // Sorry is fatal on EVERY per-fn path (island and package
+            // alike). The Link gate's sorryAx check remains the
+            // backstop for cached verdicts, but it only runs when a
+            // crate HAS a Link module — an exec-only crate below that
+            // bar (surfaced when the defs size gate was removed) would
+            // otherwise verify a user-written `sorry` with nothing but
+            // a warning. Generated shapes never emit sorry, so any
+            // sorry diagnostic here is user tactic text.
+            let sorries: Vec<TactusDiag> = r.diagnostics.iter()
+                .filter(|d| d.severity == "warning" && d.data.contains("sorry"))
+                .map(|d| {
+                    let formatted = lean_process::format_error(d, source_map);
+                    TactusDiag {
+                        message: format!(
+                            "sorry is fatal on the per-fn path (no Link gate covers {}): {}",
+                            short_name(&proof_fn.name.path), formatted.message),
+                        location: formatted.location,
+                        help: Some(format!("{} {}",
+                            vir::tactus_messages::LEAN_FILE_HELP_PREFIX, file_path.display())),
+                    }
+                })
+                .collect();
+            if !sorries.is_empty() {
+                return CheckResult::Failed { errors: sorries, warnings: vec![] };
+            }
+            CheckResult::Success { warnings: lean_warnings(&r) }
+        }
         Ok(r) => {
             let fn_short = short_name(&proof_fn.name.path);
-            let header = format!("Lean tactic failed for {}", fn_short);
+            // Header parity with the island paths: exec islands say
+            // "tactus_auto failed" (check_exec_fn), proof islands say
+            // "tactic failed" — this formatter serves BOTH via the
+            // package routes, so choose by mode (e2e tests pin the
+            // phrasing; surfaced when the defs size gate was removed).
+            let header = if matches!(proof_fn.mode, vir::ast::Mode::Exec) {
+                format!("Lean tactus_auto failed for {}", fn_short)
+            } else {
+                format!("Lean tactic failed for {}", fn_short)
+            };
             let help = Some(format!("{} {}",
                 vir::tactus_messages::LEAN_FILE_HELP_PREFIX, file_path.display()));
             let errors: Vec<TactusDiag> = r.diagnostics.iter()
                 .filter(|d| d.severity == "error")
                 .map(|d| {
-                    let formatted = lean_process::format_error(d, &source_map);
+                    let formatted = lean_process::format_error(d, source_map);
                     TactusDiag {
                         message: format!("{}:\n\n{}", header, formatted.message),
                         location: formatted.location,
@@ -1746,7 +2202,7 @@ pub fn check_proof_fn(
             } else {
                 errors
             };
-            CheckResult::Failed { errors, warnings: vec![] }
+            CheckResult::Failed { errors, warnings: lean_warnings(&r) }
         }
         Err(e) => CheckResult::Error(e),
     }
@@ -1756,6 +2212,1767 @@ pub fn check_proof_fn(
 /// preamble → pretty-print → write `.lean` → sanity check. Stops before the
 /// Lean run. `Err(CheckResult)` carries a rejection / write error / sanity
 /// failure (each already carrying any collected warnings).
+// ── Package emission (emit-module, DESIGN-emit-module.md M2) ───────────
+//
+// Additive artifact stream behind `--tactus-emit-module`: alongside each
+// island file, write the package-mode layers — a per-crate Stmts module
+// (every tactic proof fn's contract as a reducible statement def, M1's
+// renderer) and a per-fn Proofs module whose theorem takes its direct
+// tactic-referenced helpers as hypothesis binders instead of
+// re-elaborating them. Islands remain the checking authority; package
+// files are emission-only until M4 wires build orchestration (olean
+// builds + LEAN_PATH). Requires shared-defs mode (the Stmts module
+// imports the defs module for the spec world).
+
+static PACKAGE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Called once from the verifier with `args.tactus_emit_module`.
+pub fn set_package_enabled(on: bool) {
+    PACKAGE_ENABLED.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+pub(crate) fn package_enabled() -> bool {
+    PACKAGE_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+static PACKAGE_CHECK_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Called once from the verifier with `args.tactus_package_check`
+/// (M5a). Package-check subsumes package EMISSION for the fns it
+/// covers, but the emit-hook flag stays independent — gate mode and
+/// check mode are separate dials.
+pub fn set_package_check_enabled(on: bool) {
+    PACKAGE_CHECK_ENABLED.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+pub(crate) fn package_check_enabled() -> bool {
+    PACKAGE_CHECK_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Package oleans built by per-fn checks THIS PROCESS (M5c): the
+/// crate-end gate consults this to skip re-elaborating modules the
+/// per-fn path already built — same-process writes, so no staleness
+/// question. Keyed by the module's `.lean` path.
+/// One constructor for proof-fn source maps (review finding: this was
+/// hand-built at 3 sites, and it's load-bearing for diagnostic
+/// attribution). `tactic_start` fallback is 1 — Lean lines are
+/// 1-indexed; the fallback is unreachable for these modules (they
+/// exist to hold a tactic) but a 0 would misattribute by one.
+fn proof_fn_source_map(
+    fn_name: &Fun,
+    tactic_start: Option<usize>,
+    tactic_body: &str,
+) -> to_lean_fn::LeanSourceMap {
+    to_lean_fn::LeanSourceMap::ProofFn {
+        fn_name: short_name(&fn_name.path).to_string(),
+        tactic_start_line: tactic_start.unwrap_or(1),
+        tactic_line_count: tactic_body.lines().count().max(1),
+    }
+}
+
+/// Per-key once-cell dedup (review finding: memo locks were held
+/// across lean subprocess spawns, serializing unrelated bucket
+/// threads). The global lock is held only for the entry lookup;
+/// same-key callers serialize on the CELL (correct dedup), different
+/// keys proceed in parallel.
+fn memo_cell<K: Eq + std::hash::Hash + Clone, V>(
+    memo: &'static std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<K, std::sync::Arc<std::sync::OnceLock<V>>>>>,
+    key: &K,
+) -> std::sync::Arc<std::sync::OnceLock<V>> {
+    let m = memo.get_or_init(Default::default);
+    let mut map = m.lock().unwrap_or_else(|p| p.into_inner());
+    map.entry(key.clone()).or_default().clone()
+}
+
+/// Per-scope package graph (M5d-0, review finding): the inline
+/// transform and the tactic-body dependency scan are scope-wide and
+/// deterministic, but the per-fn check path re-paid them PER FN
+/// (full krate clone + O(fns²·body) ident scans). Owned form so it
+/// memoizes; consumers build a cheap borrowed view per call.
+pub(crate) struct PkgGraph {
+    inlined: std::sync::Arc<KrateX>,
+    /// Emittable tactic proof fns, krate order (names).
+    fns: Vec<Fun>,
+    /// Direct helper deps by name.
+    deps_of: std::collections::HashMap<Fun, Vec<Fun>>,
+}
+
+impl PkgGraph {
+    /// Borrowed view in the shape the emitters consume — O(krate)
+    /// hash lookups; the expensive work happened once at memo fill.
+    fn view(&self) -> (Vec<&FunctionX>, std::collections::HashMap<&Fun, Vec<&FunctionX>>) {
+        let by_name: std::collections::HashMap<&Fun, &FunctionX> =
+            self.inlined.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
+        let fns: Vec<&FunctionX> =
+            self.fns.iter().filter_map(|n| by_name.get(n).copied()).collect();
+        let deps_of = self.fns.iter()
+            .filter_map(|n| {
+                let fx = *by_name.get(n)?;
+                let deps: Vec<&FunctionX> = self.deps_of.get(n)?
+                    .iter().filter_map(|d| by_name.get(d).copied()).collect();
+                Some((&fx.name, deps))
+            })
+            .collect();
+        (fns, deps_of)
+    }
+}
+
+static PKG_GRAPH_MEMO: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<
+        String, std::sync::Arc<std::sync::OnceLock<std::sync::Arc<PkgGraph>>>>>,
+> = std::sync::OnceLock::new();
+
+fn package_graph_for(
+    krate: &KrateX,
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> std::sync::Arc<PkgGraph> {
+    let key = crate::crate_defs::scope_key(crate_name, krate, tactic_bodies);
+    let cell = memo_cell(&PKG_GRAPH_MEMO, &key);
+    cell.get_or_init(|| {
+        let inlined = std::sync::Arc::new(crate::inline_spec::inline_marked_in_krate(krate));
+        let (fns, deps_of) = {
+            let (fns_b, deps_b) = package_dep_graph(&inlined, tactic_bodies);
+            let fns: Vec<Fun> = fns_b.iter().map(|f| f.name.clone()).collect();
+            let deps_of: std::collections::HashMap<Fun, Vec<Fun>> = deps_b.iter()
+                .map(|(k, v)| ((*k).clone(), v.iter().map(|f| f.name.clone()).collect()))
+                .collect();
+            (fns, deps_of)
+        };
+        std::sync::Arc::new(PkgGraph { inlined, fns, deps_of })
+    }).clone()
+}
+
+/// C-2 (M6.3) exec obligation registry: what the Link module needs to
+/// close exec obligations — recorded at pkg-emission time because the
+/// obligations exist only in the SST (per-fn, at check time), while
+/// `build_link_module` runs from the AST-level graph. Keyed by defs
+/// scope; in package-check mode the Link builds exactly once, at the
+/// crate gate, AFTER all per-fn checks — so the registry is complete
+/// when read. Only `Ok(Single)` emissions record (island-fallback fns
+/// have no pkg module to compose); Link elaboration re-checks every
+/// imported module, so recording at emit (not verify) time keeps the
+/// same semantics as the proof-fn side's krate enumeration.
+struct ExecLinkEntry {
+    /// pkg module leaf (import name).
+    leaf: String,
+    /// (obligation theorem name, helper deps in BINDER ORDER — the
+    /// closed form applies `<dep>_closed` in exactly this order).
+    obligations: Vec<(String, Vec<vir::ast::Path>)>,
+}
+
+static EXEC_LINK_REGISTRY: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<ExecLinkEntry>>>,
+> = std::sync::OnceLock::new();
+
+fn record_exec_link_entry(scope: &str, entry: ExecLinkEntry) {
+    let map = EXEC_LINK_REGISTRY.get_or_init(Default::default);
+    let mut map = map.lock().unwrap_or_else(|p| p.into_inner());
+    let entries = map.entry(scope.to_string()).or_default();
+    // Re-emission of the same fn (memo miss across bucket threads)
+    // replaces its entry — obligations are derived deterministically.
+    entries.retain(|e| e.leaf != entry.leaf);
+    entries.push(entry);
+}
+
+/// Cached-verdict observability (M6.2 fold-in): how many fns skipped
+/// Lean entirely this run on a cross-run cached verdict. Reported in
+/// the package gate note.
+static PKG_CACHED_VERDICTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static ISLAND_CACHED_VERDICTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+static PKG_OLEAN_BUILT: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+> = std::sync::OnceLock::new();
+
+fn record_pkg_olean_built(path: &Path) {
+    PKG_OLEAN_BUILT.get_or_init(Default::default)
+        .lock().unwrap_or_else(|p| p.into_inner())
+        .insert(path.to_path_buf());
+}
+fn pkg_olean_built(path: &Path) -> bool {
+    PKG_OLEAN_BUILT.get_or_init(Default::default)
+        .lock().unwrap_or_else(|p| p.into_inner())
+        .contains(path)
+}
+
+/// Module-level verdict for a mutual module: success, or Lean's
+/// parsed `--json` diagnostics for per-member region attribution.
+struct MutualVerdict {
+    success: bool,
+    diagnostics: Vec<lean_process::LeanDiagnostic>,
+}
+
+/// Mutual-module verdict memo: the first member's check elaborates the
+/// SCC's module (fast `lean -o` path; on failure, a `--json` re-run
+/// captures diagnostics); every member reads the shared verdict and
+/// formats its OWN region's errors (M5b).
+static MUTUAL_CHECK_MEMO: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<
+        std::path::PathBuf,
+        std::sync::Arc<std::sync::OnceLock<std::sync::Arc<MutualVerdict>>>>>,
+> = std::sync::OnceLock::new();
+
+/// Stmts-olean memo for the package-check path: the `.lean` is written
+/// by `stmts_for_crate`; this builds its olean once per scope per
+/// process (pkg modules import it). `Err` is cached — fail once, not
+/// once per fn.
+static STMTS_OLEAN_MEMO: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<
+        String, std::sync::Arc<std::sync::OnceLock<Result<(), String>>>>>,
+> = std::sync::OnceLock::new();
+
+/// Ensure ONE stmt module's olean exists (M5d-2; the `.lean` was
+/// written by the partition build, which emission always runs first).
+/// Returns whether the olean was already built this process (reused).
+/// `may_skip` (M5e): the module's `.lean` content is unchanged AND
+/// the defs it imports had no breaking rebuild — its existing olean
+/// is still valid, so priming the memo without a lean run is sound.
+fn ensure_stmt_olean(
+    module: &str,
+    defs: &crate::crate_defs::CrateDefs,
+    prelude_dir: &Path,
+    may_skip: bool,
+) -> Result<bool, String> {
+    let key = module.to_string();
+    let cell = memo_cell(&STMTS_OLEAN_MEMO, &key);
+    let pre = cell.get().is_some();
+    let skipped = std::cell::Cell::new(false);
+    cell.get_or_init(|| {
+        if may_skip && defs.dir.join(format!("{}.olean", module)).exists() {
+            skipped.set(true);
+            return Ok(());
+        }
+        let base_path = format!("{}:{}", prelude_dir.display(), defs.dir.display());
+        let mut failures: Vec<(String, String)> = Vec::new();
+        run_lean(&defs.dir, module, true, &base_path, &mut failures);
+        match failures.pop() {
+            None => Ok(()),
+            Some((_, out)) => Err(format!("stmt olean build failed ({}):\n{}", module, out)),
+        }
+    }).clone().map(|()| pre || skipped.get())
+}
+
+/// Verify one tactic proof fn via its package module (M5a). Two-phase:
+/// `lean -o` builds the olean — the fast path, and the olean is
+/// exactly what the crate-end Link pass needs — and only on failure do
+/// we re-run through `check_lean_file --json` for span-mapped
+/// diagnostics (failures are the rare case; the double elaboration
+/// prices in only where a human is about to read output).
+/// C-1 family unification (DESIGN-exec-packages.md M6.3/C): the ONE
+/// defs family package machinery verifies against — the FULL-ROOTS
+/// (exec) family when it covers exec, else the proof family as
+/// degradation. One family means one stmt partition and one Link for
+/// the whole crate; on the happy path the proof-only ladder is never
+/// attempted. Selection is memoized per scope inside `for_crate`, so
+/// the choice is stable within a run.
+fn unified_package_defs(
+    krate: &KrateX,
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> Option<std::sync::Arc<crate::crate_defs::CrateDefs>> {
+    crate::crate_defs::for_crate(
+        krate, crate_name, tactic_bodies, true, crate::crate_defs::ScopeKind::Exec,
+    ).filter(|d| d.covers_exec)
+    .or_else(|| crate::crate_defs::for_crate(
+        krate, crate_name, tactic_bodies, true, crate::crate_defs::ScopeKind::Proof,
+    ))
+}
+
+fn check_proof_fn_via_package(
+    krate: &KrateX,
+    proof_fn: &FunctionX,
+    tactic_body: &str,
+    imports: &[String],
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> Option<CheckResult> {
+    install_emit_tables(krate, crate_name);
+    // Silent fallback: defs build failures (already reported loudly by
+    // `guard_build`) verify via islands exactly as pre-M6.5; the
+    // crate-end gate note summarizes.
+    let defs = unified_package_defs(krate, crate_name, tactic_bodies)?;
+    let prelude_dir = match crate::prelude::ensure_prelude_olean() {
+        Ok(d) => d,
+        Err(e) => return Some(CheckResult::Error(e)),
+    };
+    let base_path = format!("{}:{}", prelude_dir.display(), defs.dir.display());
+    match emit_package_proof_fn(
+        krate, proof_fn, tactic_body, imports, crate_name, tactic_bodies, &defs,
+    ) {
+        Ok(PkgEmitOutcome::Single { leaf, path, source_map, stmt_modules, changed }) => {
+            // Cross-run cache (M5e): everything this module sees is
+            // unchanged (own text, stmt imports, defs non-breaking) and
+            // its olean exists — the prior verdict stands. Sorry
+            // remains gated: the Link pass re-checks the closure every
+            // run, so a cached fn can't smuggle one through.
+            let olean = path.with_extension("olean");
+            let cacheable = !changed
+                && stmt_modules.iter().all(|(_, ch)| !ch)
+                && !defs.breaking
+                && olean.exists();
+            if cacheable {
+                record_pkg_olean_built(&path);
+                PKG_CACHED_VERDICTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(CheckResult::Success { warnings: vec![] });
+            }
+            for (m, ch) in &stmt_modules {
+                let may_skip = !ch && !defs.breaking;
+                if let Err(e) = ensure_stmt_olean(m, &defs, &prelude_dir, may_skip) {
+                    return Some(CheckResult::Error(e));
+                }
+            }
+            // One `--json -o` pass: olean for the Link gate AND parsed
+            // diagnostics, so warnings survive the fast path.
+            let pkg_dir = path.parent().expect("pkg file has a parent").to_path_buf();
+            let result = run_lean_json(&pkg_dir, &leaf, true, &base_path);
+            if matches!(&result, Ok(r) if r.success) {
+                record_pkg_olean_built(&path);
+            }
+            Some(format_lean_check_result(result, proof_fn, &path, &source_map))
+        }
+        Ok(PkgEmitOutcome::Mutual { leaf, path, members, stmt_modules, changed }) => {
+            for (m, ch) in &stmt_modules {
+                let may_skip = !ch && !defs.breaking;
+                if let Err(e) = ensure_stmt_olean(m, &defs, &prelude_dir, may_skip) {
+                    return Some(CheckResult::Error(e));
+                }
+            }
+            let cacheable = !changed
+                && stmt_modules.iter().all(|(_, ch)| !ch)
+                && !defs.breaking
+                && path.with_extension("olean").exists();
+            let cell = memo_cell(&MUTUAL_CHECK_MEMO, &path);
+            let verdict = cell.get_or_init(|| {
+                if cacheable {
+                    return std::sync::Arc::new(MutualVerdict {
+                        success: true, diagnostics: vec![],
+                    });
+                }
+                let pkg_dir = path.parent().expect("pkg file has a parent");
+                // One `--json -o` pass; diagnostics stored on success
+                // too, so members can surface own-region WARNINGS
+                // (sorry etc.), not just errors.
+                match run_lean_json(pkg_dir, &leaf, true, &base_path) {
+                    Ok(r) => std::sync::Arc::new(MutualVerdict {
+                        success: r.success, diagnostics: r.diagnostics,
+                    }),
+                    Err(_) => std::sync::Arc::new(MutualVerdict {
+                        success: false, diagnostics: vec![],
+                    }),
+                }
+            }).clone();
+            let me_early = members.iter().find(|m| m.fun == proof_fn.name)
+                .expect("proof fn is a member of its own SCC module");
+            let owner_start_of = |line: usize| members.iter()
+                .filter(|m| m.tactic_start <= line)
+                .map(|m| m.tactic_start)
+                .max();
+            let own_region = |d: &lean_process::LeanDiagnostic| {
+                match d.pos.as_ref().map(|p| owner_start_of(p.line)) {
+                    Some(Some(start)) => start == me_early.tactic_start,
+                    _ => true, // module-level: attributed to everyone
+                }
+            };
+            if verdict.success {
+                record_pkg_olean_built(&path);
+                let warnings: Vec<String> = verdict.diagnostics.iter()
+                    .filter(|d| d.severity == "warning" && d.data.contains("sorry"))
+                    .filter(|d| own_region(d))
+                    .map(|d| {
+                        let formatted = lean_process::format_error(d, &me_early.source_map);
+                        format!("Lean warning in {}: {}", me_early.short, formatted.message)
+                    })
+                    .collect();
+                return Some(CheckResult::Success { warnings });
+            }
+            // Verdict is module-level — mutual members are an
+            // INSEPARABLE unit (each cites the other), so every member
+            // fails when the module does. Attribution is region-based:
+            // an error belongs to the member whose tactic region
+            // contains it; errors before the first region (imports /
+            // preamble) belong to everyone.
+            let me = me_early;
+            let own: Vec<lean_process::LeanDiagnostic> = verdict.diagnostics.iter()
+                .filter(|d| d.severity == "error")
+                .filter(|d| own_region(d))
+                .cloned()
+                .collect();
+            Some(if own.is_empty() {
+                // Own region clean — the failure lives in a partner.
+                let partners: Vec<&str> = members.iter()
+                    .filter(|m| m.fun != proof_fn.name)
+                    .map(|m| m.short.as_str())
+                    .collect();
+                CheckResult::Failed {
+                    errors: vec![TactusDiag {
+                        message: format!(
+                            "Lean mutual module `{}` failed: `{}`'s own proof region is \
+                             clean, but mutual members verify as a unit and partner(s) \
+                             {} have errors (see their diagnostics)",
+                            leaf, me.short, partners.join(", ")
+                        ),
+                        location: DiagLocation::Unknown,
+                        help: Some(format!("{} {}",
+                            vir::tactus_messages::LEAN_FILE_HELP_PREFIX, path.display())),
+                    }],
+                    warnings: vec![],
+                }
+            } else {
+                // Own-region errors through the shared chokepoint with
+                // this member's OWN source map — same spans as islands.
+                format_lean_check_result(
+                    Ok(lean_process::LeanResult { success: false, diagnostics: own }),
+                    proof_fn, &path, &me.source_map,
+                )
+            })
+        }
+        // Unsupported shapes and emission failures FALL BACK to the
+        // island path (`None` — check_proof_fn continues): islands are
+        // the proven route, packages the upgrade. The Link builder
+        // excludes these fns via its cycle-poisoning pass, so the gate
+        // still covers everything that DID take the package route; the
+        // fallback is reported, not silent.
+        Ok(PkgEmitOutcome::UnsupportedScc(reason)) => {
+            eprintln!(
+                "tactus: package-check falling back to island for `{}`: {}",
+                short_name(&proof_fn.name.path), reason
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "tactus: package-check falling back to island for `{}` (emission failed: {})",
+                short_name(&proof_fn.name.path), e
+            );
+            None
+        }
+    }
+}
+
+/// The population that gets statement defs in the Stmts module and can
+/// arrive as hypothesis binders at use sites — identical to the island
+/// preamble's `helpers_to_emit` filter (proof mode, not a trait method,
+/// has a tactic body), so the package and island views of "what is a
+/// helper lemma" cannot diverge.
+fn is_emittable_tactic_proof_fn(
+    f: &FunctionX,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> bool {
+    matches!(f.mode, vir::ast::Mode::Proof)
+        && !matches!(
+            f.kind,
+            FunctionKind::TraitMethodDecl { .. } | FunctionKind::TraitMethodImpl { .. }
+        )
+        && tactic_bodies.contains_key(&f.name)
+}
+
+/// Lean module name of the crate's Stmts module, derived from the defs
+/// module name so the two scope-naming schemes cannot drift.
+/// Sibling-module name from the defs SCOPE (not string surgery on the
+/// defs module name — review finding: `replacen` breaks silently if
+/// defs naming ever changes).
+fn scope_module_name(kind: &str, defs: &crate::crate_defs::CrateDefs) -> String {
+    format!("Tactus{}_{}", kind, defs.scope)
+}
+
+fn stmts_module_name(defs: &crate::crate_defs::CrateDefs) -> String {
+    scope_module_name("Stmts", defs)
+}
+
+/// Per-fn stmt module name: `TactusStmts_<scope>__<fn>` (M5d-2). A new
+/// lemma creates a NEW file; nothing existing changes — the structural
+/// append-safety the M5 design asks for. A pkg module's import list of
+/// these IS its dependency manifest.
+fn stmt_fn_module_name(defs: &crate::crate_defs::CrateDefs, f: &Fun) -> String {
+    format!("{}__{}", stmts_module_name(defs),
+        lean_name(&f.path).replace('.', "__"))
+}
+
+/// The per-fn stmt partition: for each emittable proof fn, its stmt
+/// module name + the module's full command stream (for per-fn sanity
+/// concatenation — identifier resolution must see what Lean will see).
+/// name, module cmds (sanity concat), content-changed-this-run (M5e).
+type StmtPartition =
+    std::collections::HashMap<Fun, (String, std::sync::Arc<Vec<Command>>, bool)>;
+
+/// Partition memo: one build + N file writes per scope per process.
+/// `None` = a previous attempt failed (fail once, warn once), same
+/// semantics as the defs memo. Keyed by the scope-bearing stmts name.
+static STMT_PARTITION_MEMO: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<
+        String, Option<std::sync::Arc<StmtPartition>>>>,
+> = std::sync::OnceLock::new();
+
+/// Build + write the crate's Stmts module: `import <defs module>` plus a
+/// statement def for every emittable tactic proof fn. Written into
+/// `defs.dir` so one directory serves as the import root for both
+/// modules. Returns the command stream (for per-fn sanity
+/// concatenation — identifier resolution must see what Lean will see).
+///
+/// The krate gets the same `inline_spec` pass the theorem path applies,
+/// so statement defs and theorem goals agree — the statement-identity
+/// property (§4.1).
+fn stmt_partition_for(
+    krate: &KrateX,
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    defs: &crate::crate_defs::CrateDefs,
+) -> Option<std::sync::Arc<StmtPartition>> {
+    let key = stmts_module_name(defs);
+    let memo = STMT_PARTITION_MEMO.get_or_init(Default::default);
+    if let Some(hit) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return hit.clone();
+    }
+    let entry = match build_stmt_partition(krate, crate_name, tactic_bodies, defs) {
+        Ok(part) => Some(std::sync::Arc::new(part)),
+        Err(e) => {
+            eprintln!(
+                "tactus: Stmts partition build failed for crate `{}` ({}); \
+                 package emission disabled for this scope",
+                crate_name, e
+            );
+            None
+        }
+    };
+    memo.lock().unwrap_or_else(|p| p.into_inner()).insert(key, entry.clone());
+    entry
+}
+
+/// Build + write ONE stmt module per emittable proof fn (M5d-2): each
+/// contains `import <defs>` + that fn's statement def. The preamble is
+/// identical across modules (roots are empty in ProofFnPackage mode) —
+/// built once, cloned per fn.
+fn build_stmt_partition(
+    krate: &KrateX,
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    defs: &crate::crate_defs::CrateDefs,
+) -> Result<StmtPartition, String> {
+    let inlined_krate = crate::inline_spec::inline_marked_in_krate(krate);
+    let (preamble, ns) = krate_preamble(
+        &inlined_krate, &[], crate_name, &[], PreambleConfig::ProofFnPackage, &[],
+        tactic_bodies, &[], Some(defs),
+    );
+    let ectx = crate::emit_ctx::EmitCtx::build(&inlined_krate, tactic_bodies);
+    let mut out: StmtPartition = Default::default();
+    for f in inlined_krate.functions.iter().map(|f| &f.x) {
+        if !is_emittable_tactic_proof_fn(f, tactic_bodies) {
+            continue;
+        }
+        let mut cmds = preamble.clone();
+        cmds.push(to_lean_fn::proof_fn_stmt_cmd(f, &ectx));
+        // Sanity over what Lean will see: defs stream + this module.
+        #[cfg(debug_assertions)]
+        {
+            let concat: Vec<Command> =
+                defs.cmds.iter().cloned().chain(cmds.iter().cloned()).collect();
+            debug_check(&concat)?;
+        }
+        let rendered = pp_commands(&cmds);
+        let name = stmt_fn_module_name(defs, &f.name);
+        let path = defs.dir.join(format!("{}.lean", name));
+        let changed = write_lean_file_tracked(&path, &rendered.text)?;
+        out.insert(f.name.clone(), (name, std::sync::Arc::new(cmds), changed));
+    }
+    Ok(out)
+}
+
+/// Package-mode Proofs module for one tactic proof fn: the island's
+/// theorem with direct tactic-referenced helpers prepended as
+/// hypothesis binders (`(<short name> : <name>_stmt)` — the binder name
+/// is exactly what the raw tactic text references, so the body
+/// elaborates unchanged), importing the Stmts module instead of
+/// re-elaborating helper theorems. Written under `pkg/` next to the
+/// island files.
+/// What package emission did for one fn — the emit-hook logs
+/// `UnsupportedScc`, the M4 gate collects module leafs to elaborate.
+pub enum PkgEmitOutcome {
+    /// Single-fn Proofs module written.
+    Single {
+        leaf: String,
+        path: std::path::PathBuf,
+        /// Tactic-line → Rust-span mapping, same mechanism as island
+        /// emission — package-check failures point at the same source
+        /// locations island failures do.
+        source_map: to_lean_fn::LeanSourceMap,
+        /// Stmt modules this pkg module imports (self + direct deps,
+        /// M5d-2), with each one's content-changed flag (M5e) — the
+        /// check path ensures exactly these oleans.
+        stmt_modules: Vec<(String, bool)>,
+        /// Whether this pkg module's own content changed this run.
+        changed: bool,
+    },
+    /// Fn is a member of a supported mutual SCC; leaf/path name the
+    /// SCC's canonical module (same for every member); `members`
+    /// carries per-member attribution maps (M5b).
+    Mutual {
+        leaf: String,
+        path: std::path::PathBuf,
+        members: std::sync::Arc<Vec<MutualMember>>,
+        /// Stmt modules of all SCC members (M5d-2), with changed flags.
+        stmt_modules: Vec<(String, bool)>,
+        /// Whether the mutual module's own content changed this run.
+        changed: bool,
+    },
+    /// Fn is on a cycle with SCC-external helper deps — not
+    /// package-expressible; payload = human-readable reason.
+    UnsupportedScc(String),
+}
+
+fn emit_package_proof_fn(
+    krate: &KrateX,
+    proof_fn: &FunctionX,
+    tactic_body: &str,
+    imports: &[String],
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    defs: &crate::crate_defs::CrateDefs,
+) -> Result<PkgEmitOutcome, String> {
+    let g = package_graph_for(krate, crate_name, tactic_bodies);
+    let view = g.view();
+    emit_package_proof_fn_inner(
+        &g.inlined, &view, proof_fn, tactic_body, imports, crate_name,
+        tactic_bodies, defs,
+    )
+}
+
+/// Inner emission over an ALREADY-INLINED krate + dep graph — the M4
+/// gate calls this directly so a whole-crate pass pays the inline
+/// transform and the tactic-body dependency scan once, not per fn.
+fn emit_package_proof_fn_inner(
+    inlined_krate: &KrateX,
+    (fns, deps_of): &(Vec<&FunctionX>, std::collections::HashMap<&Fun, Vec<&FunctionX>>),
+    proof_fn: &FunctionX,
+    tactic_body: &str,
+    imports: &[String],
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    defs: &crate::crate_defs::CrateDefs,
+) -> Result<PkgEmitOutcome, String> {
+    let stmts = stmt_partition_for(inlined_krate, crate_name, tactic_bodies, defs)
+        .ok_or("Stmts partition unavailable")?;
+    let proof_fn = inlined_krate.functions.iter()
+        .find(|f| f.x.name == proof_fn.name).map(|f| &f.x)
+        .expect("root proof fn present in inlined krate");
+    // Mutual SCC route (M3.5): fns on a direct-reference cycle emit as
+    // ONE canonical module holding a `mutual … end` block — within-SCC
+    // references stay direct (same block), `termination_by` comes from
+    // each member's `decreases`. Only supported when the SCC has no
+    // EXTERNAL helper deps (see `scc_external_deps`).
+    if let Some(scc) = package_scc_of(proof_fn, fns, deps_of) {
+        let ext = scc_external_deps(&scc, deps_of);
+        if !ext.is_empty() {
+            return Ok(PkgEmitOutcome::UnsupportedScc(format!(
+                "mutual tactic SCC {{{}}} has helper deps outside the SCC ({}) — \
+                 unsupported: external deps arrive as hypothesis binders, which \
+                 verbatim mutual references cannot pass",
+                scc.iter().map(|f| short_name(&f.name.path)).collect::<Vec<_>>().join(", "),
+                ext.iter().map(|f| short_name(&f.name.path)).collect::<Vec<_>>().join(", "),
+            )));
+        }
+        let leaf = mutual_module_leaf(&scc);
+        let stmt_modules: Vec<(String, bool)> = scc.iter()
+            .filter_map(|f| stmts.get(&f.name).map(|(n, _, ch)| (n.clone(), *ch)))
+            .collect();
+        let (path, members, changed) = emit_package_mutual_scc(
+            inlined_krate, &scc, imports, crate_name, tactic_bodies, defs, &stmts,
+        )?;
+        return Ok(PkgEmitOutcome::Mutual { leaf, path, members, stmt_modules, changed });
+    }
+    // Direct helper references: same textual scan the island helper
+    // walk uses (`collect_referenced_proof_fns`), but non-recursive —
+    // each helper's own Proofs module carries its own hypotheses, and
+    // the Link module (M3) composes the closed forms. The shared
+    // `direct_helper_deps` enumeration is load-bearing: Link applies
+    // closed forms in exactly this order.
+    let deps = direct_helper_deps(proof_fn, tactic_body, inlined_krate, tactic_bodies);
+    // Imports = stmt modules of self + direct deps (M5d-2): the import
+    // list IS the dependency manifest, readable off the artifact.
+    let needed: Vec<&FunctionX> = std::iter::once(proof_fn)
+        .chain(deps.iter().copied())
+        .collect();
+    // (name, content-changed) — dedup preserves first occurrence.
+    let stmt_modules: Vec<(String, bool)> = {
+        let mut seen = std::collections::HashSet::new();
+        needed.iter()
+            .filter_map(|f| stmts.get(&f.name)
+                .map(|(n, _, ch)| (n.clone(), *ch)))
+            .filter(|(n, _)| seen.insert(n.clone()))
+            .collect()
+    };
+    let mut file_imports: Vec<String> = imports.to_vec();
+    file_imports.extend(stmt_modules.iter().map(|(n, _)| n.clone()));
+    let (mut cmds, ns) = krate_preamble(
+        inlined_krate, &file_imports, crate_name, &[proof_fn],
+        PreambleConfig::ProofFnPackage, &[], tactic_bodies, &[], Some(defs),
+    );
+    let ectx = crate::emit_ctx::EmitCtx::build(inlined_krate, tactic_bodies);
+    let mut thm = to_lean_fn::proof_fn_to_ast(proof_fn, tactic_body, &ectx);
+    let hyps: Vec<crate::lean_ast::Binder> = deps.iter()
+        .map(|f| to_lean_fn::helper_hyp_binder(&f.name.path))
+        .collect();
+    thm.binders.splice(0..0, hyps);
+    cmds.push(Command::Theorem(thm));
+    // Sanity over the full import concatenation: defs + the imported
+    // stmt modules + this. (debug builds only.)
+    #[cfg(debug_assertions)]
+    {
+        let concat: Vec<Command> = defs.cmds.iter()
+            .chain(needed.iter()
+                .filter_map(|f| stmts.get(&f.name))
+                .flat_map(|(_, c, _)| c.iter()))
+            .chain(cmds.iter())
+            .cloned().collect();
+        debug_check(&concat)?;
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = &stmts;
+    let rendered = pp_commands(&cmds);
+    let leaf = lean_name(&proof_fn.name.path).replace('.', "__");
+    let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
+        .join(format!("{}.lean", leaf));
+    let changed = write_lean_file_tracked(&path, &rendered.text)?;
+    let source_map = proof_fn_source_map(
+        &proof_fn.name, rendered.landmarks.tactic_starts.first().copied(), tactic_body);
+    Ok(PkgEmitOutcome::Single { leaf, path, source_map, stmt_modules, changed })
+}
+
+/// Per-member attribution info for one theorem inside a mutual
+/// module: where its tactic body starts in the emitted file (region
+/// boundary for diagnostic ownership) and its own source map.
+pub struct MutualMember {
+    pub fun: Fun,
+    pub short: String,
+    pub tactic_start: usize,
+    pub source_map: to_lean_fn::LeanSourceMap,
+}
+
+/// Mutual-SCC-module memo: written once per canonical path per
+/// process; the value carries the per-member maps so memo-hit callers
+/// (every member after the first) can still attribute diagnostics.
+static MUTUAL_MEMO: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<
+        std::path::PathBuf, (std::sync::Arc<Vec<MutualMember>>, bool)>>,
+> = std::sync::OnceLock::new();
+
+/// Package module for a mutual tactic SCC: one file, all members'
+/// theorems in a `mutual … end` block (the M0 probe's `MutualEO`
+/// shape). No hypothesis binders — the SCC has no external deps
+/// (caller checked) and within-SCC references resolve inside the
+/// block. Known limitation: fn-level Mathlib imports are taken from
+/// whichever member's emission call writes first; a member-specific
+/// import missing from the first writer surfaces as a Lean error at
+/// package elaboration (M4), not silently.
+fn emit_package_mutual_scc(
+    inlined_krate: &KrateX,
+    scc: &[&FunctionX],
+    imports: &[String],
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    defs: &crate::crate_defs::CrateDefs,
+    stmts: &std::sync::Arc<StmtPartition>,
+) -> Result<(std::path::PathBuf, std::sync::Arc<Vec<MutualMember>>, bool), String> {
+    let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
+        .join(format!("{}.lean", mutual_module_leaf(scc)));
+    {
+        let memo = MUTUAL_MEMO.get_or_init(Default::default);
+        if let Some((members, changed)) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&path) {
+            return Ok((path, members.clone(), *changed)); // written by another member's call
+        }
+    }
+    let mut file_imports: Vec<String> = imports.to_vec();
+    file_imports.extend(scc.iter().map(|f| stmt_fn_module_name(defs, &f.name)));
+    let (mut cmds, ns) = krate_preamble(
+        inlined_krate, &file_imports, crate_name, scc,
+        PreambleConfig::ProofFnPackage, &[], tactic_bodies, &[], Some(defs),
+    );
+    let ectx = crate::emit_ctx::EmitCtx::build(inlined_krate, tactic_bodies);
+    let block: Vec<Command> = scc.iter()
+        .map(|f| {
+            let body = tactic_bodies.get(&f.name)
+                .ok_or_else(|| format!("no tactic body for SCC member {}", short_name(&f.name.path)))?;
+            Ok(Command::Theorem(to_lean_fn::proof_fn_to_ast(f, body, &ectx)))
+        })
+        .collect::<Result<_, String>>()?;
+    cmds.push(Command::Mutual(block));
+    #[cfg(debug_assertions)]
+    {
+        let concat: Vec<Command> = defs.cmds.iter()
+            .chain(scc.iter()
+                .filter_map(|f| stmts.get(&f.name))
+                .flat_map(|(_, c, _)| c.iter()))
+            .chain(cmds.iter())
+            .cloned().collect();
+        debug_check(&concat)?;
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = &stmts;
+    let rendered = pp_commands(&cmds);
+    let changed = write_lean_file_tracked(&path, &rendered.text)?;
+    // One tactic_starts entry per Tactic::Raw in emission order = one
+    // per SCC member. A member's diagnostic REGION starts at its
+    // tactic start; theorem-header errors land in the preceding
+    // region (or pre-first = module-level) — rare, and module-level
+    // errors are attributed to every member anyway.
+    let members: Vec<MutualMember> = scc.iter().zip(rendered.landmarks.tactic_starts.iter())
+        .map(|(f, start)| {
+            let body = tactic_bodies.get(&f.name).map(|s| s.as_str()).unwrap_or("");
+            MutualMember {
+                fun: f.name.clone(),
+                short: short_name(&f.name.path).to_string(),
+                tactic_start: *start,
+                source_map: proof_fn_source_map(&f.name, Some(*start), body),
+            }
+        })
+        .collect();
+    let members = std::sync::Arc::new(members);
+    MUTUAL_MEMO.get_or_init(Default::default)
+        .lock().unwrap_or_else(|p| p.into_inner())
+        .insert(path.clone(), (members.clone(), changed));
+    Ok((path, members, changed))
+}
+
+// ── Package gate (M4) ───────────────────────────────────────────────
+
+/// Result of the crate-level package gate.
+pub struct PackageGateReport {
+    /// Modules elaborated (defs + stmts + pkg modules + Link).
+    pub modules: usize,
+    /// Of `modules`, how many were reused from per-fn package checks
+    /// (oleans built earlier this process — M5c).
+    pub reused: usize,
+    /// Cross-run cached verdicts this process (M6.2 fold-in): fns that
+    /// skipped Lean entirely on a pkg / island cached verdict.
+    pub pkg_cached: usize,
+    pub island_cached: usize,
+    /// Mutual SCCs that could not be package-expressed (reasons).
+    pub skipped_sccs: Vec<String>,
+    /// (module leaf, lean output) per failed elaboration.
+    pub failures: Vec<(String, String)>,
+}
+
+/// Crate-level package gate (DESIGN-emit-module.md M4): regenerate the
+/// FULL-krate package — one scope, independent of verification
+/// bucketing (the fingerprint-keyed memos keep bucket-scope artifacts
+/// from colliding) — then elaborate it bottom-up: defs and stmts
+/// oleans, every pkg Proofs/mutual module (`lean -o` IS its
+/// elaboration), and finally Link, whose elaboration is the
+/// kernel-checked composition + axiom-closure verdict. Islands remain
+/// the per-fn authority; the gate turns the package from a checkable
+/// artifact into a checked claim.
+pub fn check_package(
+    krate: &KrateX,
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> Result<PackageGateReport, String> {
+    install_emit_tables(krate, crate_name);
+    let defs = unified_package_defs(krate, crate_name, tactic_bodies)
+        .ok_or("shared-defs module unavailable (defs build failed)")?;
+    let g = package_graph_for(krate, crate_name, tactic_bodies);
+    let graph = g.view();
+    let mut leafs: Vec<String> = Vec::new();
+    let mut seen_leafs: std::collections::HashSet<String> = Default::default();
+    let mut stmt_mods: Vec<(String, bool)> = Vec::new();
+    let mut seen_stmts: std::collections::HashSet<String> = Default::default();
+    let mut skipped_sccs: Vec<String> = Vec::new();
+    let mut seen_skips: std::collections::HashSet<String> = Default::default();
+    let mut failures: Vec<(String, String)> = Vec::new();
+    for f in graph.0.clone() {
+        let body = match tactic_bodies.get(&f.name) {
+            Some(b) => b.clone(),
+            None => continue,
+        };
+        match emit_package_proof_fn_inner(
+            &g.inlined, &graph, f, &body, &f.attrs.lean_imports, crate_name,
+            tactic_bodies, &defs,
+        ) {
+            Ok(PkgEmitOutcome::Single { leaf, stmt_modules, .. }) => {
+                leafs.push(leaf);
+                for (m, ch) in stmt_modules {
+                    if seen_stmts.insert(m.clone()) {
+                        stmt_mods.push((m, ch));
+                    }
+                }
+            }
+            Ok(PkgEmitOutcome::Mutual { leaf, stmt_modules, .. }) => {
+                if seen_leafs.insert(leaf.clone()) {
+                    leafs.push(leaf);
+                }
+                for (m, ch) in stmt_modules {
+                    if seen_stmts.insert(m.clone()) {
+                        stmt_mods.push((m, ch));
+                    }
+                }
+            }
+            Ok(PkgEmitOutcome::UnsupportedScc(reason)) => {
+                if seen_skips.insert(reason.clone()) {
+                    skipped_sccs.push(reason);
+                }
+            }
+            Err(e) => failures.push((short_name(&f.name.path).to_string(), e)),
+        }
+    }
+    link_for_crate(krate, crate_name, tactic_bodies, &defs);
+    // Elaborate bottom-up. defs.olean was built by `for_crate(build =
+    // true)`; stmts + pkg modules build here; Link elaborates last.
+    let prelude_dir = crate::prelude::ensure_prelude_olean()?;
+    let base_path = format!("{}:{}", prelude_dir.display(), defs.dir.display());
+    let mut reused = 0usize;
+    // Skip work the per-fn package checks already did this process
+    // (M5c): stmts olean via its memo, pkg modules via the built-set.
+    // Per-fn stmt oleans (M5d-2): ensure each collected module, reusing
+    // whatever the per-fn checks already built this process.
+    for (m, ch) in &stmt_mods {
+        let may_skip = !ch && !defs.breaking;
+        match ensure_stmt_olean(m, &defs, &prelude_dir, may_skip) {
+            Ok(true) => reused += 1,
+            Ok(false) => {}
+            Err(e) => failures.push((m.clone(), e)),
+        }
+    }
+    if !failures.is_empty() {
+        // stmts (or an emission) failed — every pkg module would fail
+        // derivatively; report the root cause, not the cascade.
+        return Ok(PackageGateReport {
+            modules: 1 + stmt_mods.len(), reused,
+            pkg_cached: PKG_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
+            island_cached: ISLAND_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
+            skipped_sccs, failures,
+        });
+    }
+    let pkg_dir = lean_out_root().join(sanitize(crate_name)).join("pkg");
+    for leaf in &leafs {
+        if pkg_olean_built(&pkg_dir.join(format!("{}.lean", leaf))) {
+            reused += 1;
+        } else {
+            run_lean(&pkg_dir, leaf, true, &base_path, &mut failures);
+        }
+    }
+    let link_path = format!("{}:{}", base_path, pkg_dir.display());
+    let link_mod = link_module_name(&defs);
+    run_lean(&pkg_dir, &link_mod, false, &link_path, &mut failures);
+    Ok(PackageGateReport {
+        modules: 1 + stmt_mods.len() + leafs.len() + 1,
+        reused,
+        pkg_cached: PKG_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
+        island_cached: ISLAND_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
+        skipped_sccs,
+        failures,
+    })
+}
+
+/// Prepend `lean_path` to any inherited `LEAN_PATH` — one definition
+/// shared by the plain and `--json` lean runners (review finding:
+/// this merge was drifting toward four inline copies).
+fn merged_lean_path(lean_path: &str) -> String {
+    match std::env::var("LEAN_PATH") {
+        Ok(existing) if !existing.is_empty() => format!("{}:{}", lean_path, existing),
+        _ => lean_path.to_string(),
+    }
+}
+
+/// Run `lean --json` on `<module>.lean` with cwd `dir` (same cwd /
+/// module-name constraint as `run_lean`), optionally producing the
+/// olean, and parse the diagnostics — success is exit-ok AND no
+/// error-severity diagnostic, mirroring `check_lean_file`. One pass
+/// gives the package-check path both its olean and its warnings
+/// (review finding: the exit-code-only fast path silently dropped
+/// warning diagnostics, `sorry`'s included — on BOTH this path and,
+/// historically, islands).
+fn run_lean_json(
+    dir: &Path,
+    module: &str,
+    produce_olean: bool,
+    lean_path: &str,
+) -> Result<lean_process::LeanResult, String> {
+    let mut args: Vec<String> = vec!["--json".to_string()];
+    if produce_olean {
+        args.push("-o".to_string());
+        args.push(format!("{}.olean", module));
+    }
+    args.push(format!("{}.lean", module));
+    let output = std::process::Command::new("lean")
+        .args(&args)
+        .current_dir(dir)
+        .env("LEAN_PATH", merged_lean_path(lean_path))
+        .output()
+        .map_err(|e| format!("failed to spawn lean: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let diagnostics = lean_process::parse_diagnostics(&stdout);
+    let has_error = diagnostics.iter().any(|d| d.severity == "error");
+    let success = output.status.success() && !has_error;
+    if !success && diagnostics.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            return Err(format!("Lean failed: {}", stderr.trim()));
+        }
+    }
+    Ok(lean_process::LeanResult { success, diagnostics })
+}
+
+/// Run `lean` on `<module>.lean` with cwd `dir` (so `-o` derives the
+/// module name from the bare file name — same constraint as
+/// `crate_defs::build_olean`), optionally producing the olean.
+/// `lean_path` is prepended to any inherited `LEAN_PATH` (the harness
+/// presets one; check.sh doesn't — CRATEDEFS 1c).
+fn run_lean(
+    dir: &Path,
+    module: &str,
+    produce_olean: bool,
+    lean_path: &str,
+    failures: &mut Vec<(String, String)>,
+) {
+    let mut args: Vec<String> = Vec::new();
+    if produce_olean {
+        args.push("-o".to_string());
+        args.push(format!("{}.olean", module));
+    }
+    args.push(format!("{}.lean", module));
+    match std::process::Command::new("lean")
+        .args(&args)
+        .current_dir(dir)
+        .env("LEAN_PATH", merged_lean_path(lean_path))
+        .output()
+    {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => failures.push((
+            module.to_string(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )),
+        Err(e) => failures.push((module.to_string(), format!("failed to spawn lean: {}", e))),
+    }
+}
+
+/// A fn's DIRECT tactic-referenced helper lemmas, in krate order —
+/// the single enumeration shared by `emit_package_proof_fn` (hypothesis
+/// binder order) and `link_for_crate` (closed-form application order).
+/// One chokepoint so the theorem's binders and Link's arguments cannot
+/// disagree.
+fn direct_helper_deps<'a>(
+    root: &FunctionX,
+    tactic_body: &str,
+    krate: &'a KrateX,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> Vec<&'a FunctionX> {
+    let code = strip_lean_line_comments(tactic_body);
+    krate.functions.iter()
+        .map(|f| &f.x)
+        .filter(|f| is_emittable_tactic_proof_fn(f, tactic_bodies))
+        .filter(|f| f.name != root.name
+            && ident_appears(&code, short_name(&f.name.path)))
+        .collect()
+}
+
+/// The direct-reference graph over all emittable tactic proof fns:
+/// (nodes in krate order, node → direct deps). Shared by the SCC
+/// detection in `emit_package_proof_fn` and the topo walk in
+/// `build_link_module` so the two views of the graph cannot diverge.
+fn package_dep_graph<'a>(
+    krate: &'a KrateX,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> (Vec<&'a FunctionX>, std::collections::HashMap<&'a Fun, Vec<&'a FunctionX>>) {
+    let fns: Vec<&FunctionX> = krate.functions.iter()
+        .map(|f| &f.x)
+        .filter(|f| is_emittable_tactic_proof_fn(f, tactic_bodies))
+        .collect();
+    let deps_of = fns.iter()
+        .map(|f| {
+            let body = tactic_bodies.get(&f.name).map(|s| s.as_str()).unwrap_or("");
+            (&f.name, direct_helper_deps(f, body, krate, tactic_bodies))
+        })
+        .collect();
+    (fns, deps_of)
+}
+
+/// The mutual SCC containing `root`, if any: members (in krate order)
+/// that both reach and are reached by `root` in the direct-reference
+/// graph. `None` for the common non-mutual case (singleton SCC —
+/// self-recursion is handled by `termination_by` on the single
+/// theorem, not by a mutual block).
+fn package_scc_of<'a>(
+    root: &FunctionX,
+    fns: &[&'a FunctionX],
+    deps_of: &std::collections::HashMap<&'a Fun, Vec<&'a FunctionX>>,
+) -> Option<Vec<&'a FunctionX>> {
+    fn reach<'a>(
+        from: &Fun,
+        edges: impl Fn(&Fun) -> Vec<&'a Fun>,
+    ) -> std::collections::HashSet<&'a Fun> {
+        let mut seen: std::collections::HashSet<&Fun> = Default::default();
+        let mut stack: Vec<&Fun> = edges(from);
+        while let Some(n) = stack.pop() {
+            if seen.insert(n) {
+                stack.extend(edges(n));
+            }
+        }
+        seen
+    }
+    let fwd = reach(&root.name, |n| {
+        deps_of.get(n).into_iter().flatten().map(|f| &f.name).collect()
+    });
+    if !fwd.contains(&root.name) {
+        return None; // root not on any cycle
+    }
+    let bwd = reach(&root.name, |n| {
+        deps_of.iter()
+            .filter(|(_, ds)| ds.iter().any(|d| &d.name == n))
+            .map(|(k, _)| *k)
+            .collect()
+    });
+    let members: Vec<&FunctionX> = fns.iter()
+        .filter(|f| fwd.contains(&f.name) && bwd.contains(&f.name))
+        .copied()
+        .collect();
+    (members.len() > 1).then_some(members)
+}
+
+/// A mutual SCC's helper deps OUTSIDE the SCC (union over members,
+/// deduped, krate order). Must be EMPTY for the SCC to be package-
+/// emittable: external deps arrive as hypothesis binders, and a
+/// mutual reference in verbatim tactic text (`lemma_odd k`) cannot
+/// pass hypothesis arguments the user never wrote.
+fn scc_external_deps<'a>(
+    scc: &[&'a FunctionX],
+    deps_of: &std::collections::HashMap<&'a Fun, Vec<&'a FunctionX>>,
+) -> Vec<&'a FunctionX> {
+    let member_names: std::collections::HashSet<&Fun> =
+        scc.iter().map(|f| &f.name).collect();
+    let mut seen: std::collections::HashSet<&Fun> = Default::default();
+    scc.iter()
+        .flat_map(|f| deps_of.get(&f.name).into_iter().flatten().copied())
+        .filter(|d| !member_names.contains(&d.name) && seen.insert(&d.name))
+        .collect()
+}
+
+/// Canonical pkg module leaf for a mutual SCC: `mutual__<first member
+/// leaf>` (krate order — deterministic, and cannot collide with a
+/// single-fn leaf).
+fn mutual_module_leaf(scc: &[&FunctionX]) -> String {
+    format!("mutual__{}", lean_name(&scc[0].name.path).replace('.', "__"))
+}
+
+/// Lean module name of the crate's Link module, scope-consistent with
+/// defs/stmts naming.
+fn link_module_name(defs: &crate::crate_defs::CrateDefs) -> String {
+    scope_module_name("Link", defs)
+}
+
+/// Link-module memo — same keying and poisoned-`None` semantics as
+/// `STMTS_MEMO`.
+static LINK_MEMO: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Option<()>>>,
+> = std::sync::OnceLock::new();
+
+/// Build + write the crate's Link module (DESIGN-emit-module.md §2.1
+/// M3): the machine-generated closure that turns per-fn
+/// hypothesis-passing theorems into stmt-typed CLOSED theorems —
+///
+///   noncomputable def <name>_closed : <name>_stmt := <name> <dep>_closed …
+///
+/// in dependency order, each followed by
+/// `#tactus_check_axioms <name>_closed [<Boundary>]`, where Boundary =
+/// the axiom names the defs module declares (broadcast lemmas, uninterp
+/// spec fns, external-body Inhabited stipulations — the crate's entire
+/// declared trust surface beyond the prelude). This is where the
+/// composition argument becomes kernel-checked: circular dependencies
+/// cannot elaborate, statement drift cannot typecheck, and the axiom
+/// closure of every closed theorem is machine-verified against the
+/// declared set.
+///
+/// Cycles in the direct-reference graph (mutual tactic lemmas — which
+/// island emission cannot express either) are skipped with a loud
+/// comment in the artifact and an eprintln.
+///
+/// No `debug_check` here: Link's references live in the imported pkg
+/// modules, whose command streams are per-call and not retained. Its
+/// names are derived from the same krate enumeration that emitted
+/// those modules (`direct_helper_deps`, `stmt_name`), and Lean
+/// elaboration of the package is the authoritative check.
+fn link_for_crate(
+    krate: &KrateX,
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    defs: &crate::crate_defs::CrateDefs,
+) {
+    let key = link_module_name(defs);
+    let memo = LINK_MEMO.get_or_init(Default::default);
+    if memo.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&key) {
+        return;
+    }
+    let result = build_link_module(krate, crate_name, tactic_bodies, defs)
+        .map_err(|e| {
+            eprintln!(
+                "tactus: Link module build failed for crate `{}` ({})",
+                crate_name, e
+            );
+        })
+        .ok();
+    memo.lock().unwrap_or_else(|p| p.into_inner()).insert(key, result);
+}
+
+fn build_link_module(
+    krate: &KrateX,
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    defs: &crate::crate_defs::CrateDefs,
+) -> Result<(), String> {
+    use crate::lean_ast::{Def, Expr as LExpr};
+    let g = package_graph_for(krate, crate_name, tactic_bodies);
+    let (fns, deps_of) = g.view();
+    let inlined_krate: &KrateX = &g.inlined;
+    // Partition mutual SCCs: SUPPORTED (no external deps — emitted as
+    // one mutual-block module, M3.5) get eta-closed FIRST and their
+    // members pre-marked Black; UNSUPPORTED (external deps) fall
+    // through to the cycle-poisoning DFS below, matching the emission
+    // side's rejection.
+    let mut supported_sccs: Vec<Vec<&FunctionX>> = Vec::new();
+    let mut in_supported: std::collections::HashSet<&Fun> = Default::default();
+    for f in &fns {
+        if in_supported.contains(&f.name) {
+            continue;
+        }
+        if let Some(scc) = package_scc_of(f, &fns, &deps_of) {
+            if scc_external_deps(&scc, &deps_of).is_empty() {
+                for m in &scc {
+                    in_supported.insert(&m.name);
+                }
+                supported_sccs.push(scc);
+            }
+        }
+    }
+    // Dependency order via DFS post-order over direct refs, with
+    // tri-state marks for cycle detection. Remaining cycle members
+    // (unsupported SCCs) are excluded — their pkg theorems were
+    // rejected at emission for the same reason.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mark { White, Gray, Black }
+    fn visit<'a>(
+        f: &'a FunctionX,
+        deps_of: &std::collections::HashMap<&Fun, Vec<&'a FunctionX>>,
+        marks: &mut std::collections::HashMap<&'a Fun, Mark>,
+        ordered: &mut Vec<&'a FunctionX>,
+        cyclic: &mut Vec<String>,
+    ) -> bool {
+        match marks.get(&f.name).copied().unwrap_or(Mark::White) {
+            Mark::Black => return true,
+            Mark::Gray => return false, // back-edge: cycle
+            Mark::White => {}
+        }
+        marks.insert(&f.name, Mark::Gray);
+        let mut ok = true;
+        for d in deps_of.get(&f.name).into_iter().flatten() {
+            if !visit(d, deps_of, marks, ordered, cyclic) {
+                ok = false;
+            }
+        }
+        if ok {
+            marks.insert(&f.name, Mark::Black);
+            ordered.push(f);
+        } else {
+            // Leave Gray→cyclic: everything on the path through a
+            // back-edge stays unclosed.
+            marks.insert(&f.name, Mark::White);
+            cyclic.push(short_name(&f.name.path).to_string());
+        }
+        ok
+    }
+    let mut marks = std::collections::HashMap::new();
+    // Supported-SCC members are pre-marked Black (already closed via
+    // their mutual module, emitted before the ordered loop) so
+    // dependents pass straight through them.
+    for scc in &supported_sccs {
+        for m in scc {
+            marks.insert(&m.name, Mark::Black);
+        }
+    }
+    let mut ordered: Vec<&FunctionX> = Vec::new();
+    let mut cyclic: Vec<String> = Vec::new();
+    for f in &fns {
+        visit(f, &deps_of, &mut marks, &mut ordered, &mut cyclic);
+    }
+    cyclic.sort();
+    cyclic.dedup();
+    if !cyclic.is_empty() {
+        eprintln!(
+            "tactus: Link for `{}` skips {} fn(s) with cyclic tactic references \
+             (mutual tactic lemmas are unsupported, matching island emission): {}",
+            crate_name, cyclic.len(), cyclic.join(", ")
+        );
+    }
+    // Boundary: every axiom the defs module declares. The closure
+    // check whitelists exactly these (plus core + prelude, hardcoded
+    // in the prelude's elab command).
+    let boundary: Vec<String> = defs.cmds.iter()
+        .filter_map(|c| match c {
+            Command::Axiom(a) => Some(a.name.clone()),
+            _ => None,
+        })
+        .collect();
+    let boundary_list = boundary.join(", ");
+
+    let mut cmds: Vec<Command> = Vec::new();
+    cmds.push(Command::Import(defs.module_name.clone()));
+    // Stmt names arrive transitively via the pkg module imports below
+    // (Lean imports are transitive) — no monolithic stmts module
+    // exists anymore (M5d-2).
+    for scc in &supported_sccs {
+        cmds.push(Command::Import(mutual_module_leaf(scc)));
+    }
+    for f in &ordered {
+        cmds.push(Command::Import(lean_name(&f.name.path).replace('.', "__")));
+    }
+    // C-2 (M6.3): exec obligation entries — imports join the header,
+    // closed forms append after the proof-fn loop (obligations are
+    // LEAVES: nothing references them, their deps are proof fns whose
+    // closed forms precede them).
+    let exec_entries: Vec<ExecLinkEntry> = EXEC_LINK_REGISTRY
+        .get_or_init(Default::default)
+        .lock().unwrap_or_else(|p| p.into_inner())
+        .remove(&defs.scope)
+        .unwrap_or_default();
+    for e in &exec_entries {
+        cmds.push(Command::Import(e.leaf.clone()));
+    }
+    cmds.push(Command::Raw(crate::prelude::TACTUS_SET_OPTIONS.to_string()));
+    // Option B: no namespace wrapper — decl names are fully qualified.
+    let ns = sanitize(crate_name);
+    let _ = &ns;
+    if !cyclic.is_empty() {
+        cmds.push(Command::Raw(format!(
+            "-- SKIPPED (cyclic tactic references with SCC-external helper deps, \
+             cannot close): {}\n",
+            cyclic.join(", ")
+        )));
+    }
+    // Mutual SCC members close by eta (parameterized theorem type is
+    // definitionally the stmt abbrev — M0 finding F3); no deps by
+    // construction, so they precede everything.
+    for scc in &supported_sccs {
+        for f in scc {
+            let name = lean_name(&f.name.path);
+            cmds.push(Command::Def(Def {
+                attrs: Vec::new(),
+                name: format!("{}_closed", name),
+                binders: Vec::new(),
+                ret_ty: LExpr::var_lit(&to_lean_fn::stmt_name(&f.name.path)),
+                body: LExpr::var_lit(&name),
+                termination_by: Vec::new(),
+                termination_structural: false,
+                decreasing_by: None,
+            }));
+            cmds.push(Command::Raw(format!(
+                "#tactus_check_axioms {}_closed [{}]\n", name, boundary_list
+            )));
+        }
+    }
+    for f in &ordered {
+        let name = lean_name(&f.name.path);
+        let body_head = LExpr::var_lit(&name);
+        let body = tactic_bodies.get(&f.name).map(|s| s.as_str()).unwrap_or("");
+        let args: Vec<LExpr> = direct_helper_deps(f, body, &inlined_krate, tactic_bodies)
+            .into_iter()
+            .map(|d| LExpr::var_lit(&format!("{}_closed", lean_name(&d.name.path))))
+            .collect();
+        let closed_body = if args.is_empty() {
+            body_head
+        } else {
+            LExpr::app(body_head, args)
+        };
+        cmds.push(Command::Def(Def {
+            attrs: Vec::new(),
+            name: format!("{}_closed", name),
+            binders: Vec::new(),
+            ret_ty: LExpr::var_lit(&to_lean_fn::stmt_name(&f.name.path)),
+            body: closed_body,
+            termination_by: Vec::new(),
+            termination_structural: false,
+            decreasing_by: None,
+        }));
+        cmds.push(Command::Raw(format!(
+            "#tactus_check_axioms {}_closed [{}]\n", name, boundary_list
+        )));
+    }
+    // Exec obligation closed forms (C-2/M6.3): the soundness headline —
+    // exec obligations join the composition + sorryAx/axiom closure.
+    for e in &exec_entries {
+        for (thm_name, dep_paths) in &e.obligations {
+            let args: Vec<LExpr> = dep_paths.iter()
+                .map(|p| LExpr::var_lit(&format!("{}_closed", lean_name(p))))
+                .collect();
+            let body_head = LExpr::var_lit(thm_name);
+            let closed_body = if args.is_empty() {
+                body_head
+            } else {
+                LExpr::app(body_head, args)
+            };
+            cmds.push(Command::Def(Def {
+                attrs: Vec::new(),
+                name: format!("{}_closed", thm_name),
+                binders: Vec::new(),
+                ret_ty: LExpr::var_lit(&format!("{}_stmt", thm_name)),
+                body: closed_body,
+                termination_by: Vec::new(),
+                termination_structural: false,
+                decreasing_by: None,
+            }));
+            cmds.push(Command::Raw(format!(
+                "#tactus_check_axioms {}_closed [{}]\n", thm_name, boundary_list
+            )));
+        }
+    }
+    let rendered = pp_commands(&cmds);
+    let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
+        .join(format!("{}.lean", link_module_name(defs)));
+    // Tracked: identical bytes → no rewrite (mtime churn poisoned
+    // downstream freshness checks every run). The gate still
+    // elaborates the Link each run — that's the sorry backstop.
+    write_lean_file_tracked(&path, &rendered.text).map(|_| ())
+}
+
+/// The raw text a theorem's tactic elaborates — the scan surface for
+/// helper references. `Named` bodies (`tactus_auto`, `omega`) can't
+/// reference user lemmas, but scanning the name is harmless and keeps
+/// this total.
+fn tactic_scan_text(t: &crate::lean_ast::Tactic) -> &str {
+    match t {
+        crate::lean_ast::Tactic::Raw(s) => s,
+        crate::lean_ast::Tactic::Named(s) => s,
+    }
+}
+
+/// Bridge Option B tactic references onto package binders: replace each
+/// helper's fully-qualified dotted name (`lib.runtime.lemma_fcf_end` —
+/// what ISLAND texts must cite, since islands declare helpers as global
+/// dotted theorems) with its short name (`lemma_fcf_end` — the only
+/// name a local hypothesis binder can carry). Word-boundary-aware so
+/// `lib.runtime.lemma_fcf_end2` survives. The island path embeds the
+/// user's text verbatim; only machine-generated package modules get the
+/// rewrite, so one source text serves both routes.
+fn bridge_qualified_helper_refs(text: &str, deps: &[&FunctionX]) -> String {
+    let mut out = text.to_string();
+    for f in deps {
+        let qualified = lean_name(&f.name.path);
+        let short = short_name(&f.name.path);
+        if qualified == short || !out.contains(&qualified) {
+            continue;
+        }
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut res = String::with_capacity(out.len());
+        let mut rest: &str = &out;
+        while let Some(i) = rest.find(&qualified) {
+            let before_ok = i == 0 || {
+                let b = rest.as_bytes()[i - 1];
+                !is_ident(b) && b != b'.'
+            };
+            let end = i + qualified.len();
+            let after_ok = end >= rest.len() || {
+                let b = rest.as_bytes()[end];
+                !is_ident(b) && b != b'.'
+            };
+            res.push_str(&rest[..i]);
+            if before_ok && after_ok {
+                res.push_str(short);
+            } else {
+                res.push_str(&qualified);
+            }
+            rest = &rest[end..];
+        }
+        res.push_str(rest);
+        out = res;
+    }
+    out
+}
+
+/// Package-mode emission for one EXEC fn (DESIGN-exec-packages.md
+/// M6.2). Same architecture as `emit_package_proof_fn`, with two
+/// differences: an exec fn carries N obligation theorems (not one),
+/// and its helper set is PRECISE — the obligations' tactic texts are
+/// available here (from the SST), so no ExecFn over-approximation.
+///
+/// Artifacts:
+/// - own stmt module `TactusStmts_<scope>__<fn>` in `defs.dir`: one
+///   `@[reducible] def <thm>_stmt : Prop` per obligation (statement
+///   defs for M6.3 Link composition; the import list doubles as the
+///   dependency manifest).
+/// - pkg module `pkg/<fn>.lean`: imports defs + own stmt + helper stmt
+///   modules; each obligation theorem gets the helpers ITS tactic text
+///   references as hypothesis binders (named by short name, typed by
+///   the helper's stmt def — the island's global theorem becomes a
+///   local hypothesis and the tactic body elaborates unchanged).
+///
+/// Exec fns are never in tactic-level mutual SCCs (obligation theorems
+/// don't reference each other), so the outcome is always
+/// `PkgEmitOutcome::Single`.
+fn emit_package_exec_fn(
+    krate: &KrateX,
+    vir_fn: &FunctionX,
+    fn_sst: &FunctionSst,
+    check: &FuncCheckSst,
+    imports: &[String],
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    defs: &crate::crate_defs::CrateDefs,
+) -> Result<PkgEmitOutcome, String> {
+    install_emit_tables(krate, crate_name);
+    // Same front half as `emit_exec_fn` (inline pass + broadcast
+    // resolution + WP theorems); duplicated because the island path
+    // remains the graceful-degradation fallback and must stay
+    // self-contained. Divergence risk is bounded: both feed
+    // `exec_fn_theorems_to_ast`, the single source of obligation
+    // shape.
+    let inlined_krate = crate::inline_spec::inline_marked_in_krate(krate);
+    let vir_fn = inlined_krate.functions.iter()
+        .find(|f| f.x.name == vir_fn.name).map(|f| &f.x)
+        .ok_or("root exec fn absent from inlined krate")?;
+    let krate = &inlined_krate;
+    let broadcast_lemmas = sst_to_lean::collect_broadcast_lemma_funs(krate, check, crate_name);
+    let theorems = sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check, &broadcast_lemmas)
+        .map_err(|reason| format!("tactus_auto rejected this fn: {}", reason))?;
+
+    let stmts = stmt_partition_for(krate, crate_name, tactic_bodies, defs)
+        .ok_or("Stmts partition unavailable")?;
+    let ectx = crate::emit_ctx::EmitCtx::build(krate, tactic_bodies);
+    let _ = &ectx;
+
+    // Precise per-obligation helper scan (the same textual mechanism
+    // as `direct_helper_deps`, over each obligation's tactic text).
+    let candidates: Vec<(&FunctionX, &str)> = krate.functions.iter()
+        .map(|f| &f.x)
+        .filter(|f| is_emittable_tactic_proof_fn(f, tactic_bodies))
+        .map(|f| (f, short_name(&f.name.path)))
+        .collect();
+    let per_thm_deps: Vec<Vec<&FunctionX>> = theorems.iter()
+        .map(|thm| {
+            let code = strip_lean_line_comments(tactic_scan_text(&thm.tactic));
+            candidates.iter()
+                .filter(|(_, name)| ident_appears(&code, name))
+                .map(|(f, _)| *f)
+                .collect()
+        })
+        .collect();
+    let deps: Vec<&FunctionX> = {
+        let mut seen = std::collections::HashSet::new();
+        per_thm_deps.iter().flatten()
+            .filter(|f| seen.insert(&f.name))
+            .copied()
+            .collect()
+    };
+
+    // Own stmt module: per-obligation statement defs. Same file head
+    // as the proof-fn stmt partition (package preamble over empty
+    // roots), written tracked into the defs dir so
+    // `ensure_stmt_olean` covers it unchanged.
+    let own_stmt_name = stmt_fn_module_name(defs, &vir_fn.name);
+    let own_changed = {
+        // Pass the fn's theorems so their `requires_preamble`
+        // fragments (e.g. the #130 BitVec Int instances) are
+        // aggregated at file top — the stmt defs re-render the same
+        // obligation exprs and need the same instances (below-gate
+        // shape surfaced when the defs size gate was removed).
+        let (mut cmds, _ns) = krate_preamble(
+            krate, &[], crate_name, &[], PreambleConfig::ExecFnPackage, &theorems,
+            tactic_bodies, &[], Some(defs),
+        );
+        for thm in &theorems {
+            cmds.push(to_lean_fn::exec_obligation_stmt_cmd(thm));
+        }
+        let rendered = pp_commands(&cmds);
+        let path = defs.dir.join(format!("{}.lean", own_stmt_name));
+        write_lean_file_tracked(&path, &rendered.text)?
+    };
+
+    // Import manifest: own stmt module first, then helpers' (M5d-2).
+    let mut stmt_modules: Vec<(String, bool)> = vec![(own_stmt_name, own_changed)];
+    stmt_modules.extend(deps.iter()
+        .filter_map(|f| stmts.get(&f.name).map(|(n, _, ch)| (n.clone(), *ch))));
+    let mut file_imports: Vec<String> = imports.to_vec();
+    file_imports.extend(stmt_modules.iter().map(|(n, _)| n.clone()));
+
+    // Binder names are SHORT names — two helpers sharing one short
+    // name would collide as hypotheses and make the qualified-ref
+    // bridge ambiguous. Bail to the island path (which has no such
+    // constraint: its helpers are global dotted theorems).
+    {
+        let mut shorts = std::collections::HashSet::new();
+        for f in &deps {
+            if !shorts.insert(short_name(&f.name.path)) {
+                return Ok(PkgEmitOutcome::UnsupportedScc(format!(
+                    "helpers share the short name `{}` — hypothesis binders \
+                     cannot disambiguate", short_name(&f.name.path))));
+            }
+        }
+    }
+    let (mut cmds, ns) = krate_preamble(
+        krate, &file_imports, crate_name, &[vir_fn],
+        PreambleConfig::ExecFnPackage, &theorems, tactic_bodies,
+        &broadcast_lemmas, Some(defs),
+    );
+    let _ = ns;
+    let thm_names: Vec<String> = theorems.iter().map(|t| t.name.clone()).collect();
+    for (thm, thm_deps) in theorems.into_iter().zip(per_thm_deps.iter()) {
+        let mut thm = thm;
+        if !thm_deps.is_empty() {
+            if let crate::lean_ast::Tactic::Raw(body) = &thm.tactic {
+                thm.tactic = crate::lean_ast::Tactic::Raw(
+                    bridge_qualified_helper_refs(body, thm_deps));
+            }
+        }
+        let hyps: Vec<crate::lean_ast::Binder> = thm_deps.iter()
+            .map(|f| to_lean_fn::helper_hyp_binder(&f.name.path))
+            .collect();
+        thm.binders.splice(0..0, hyps);
+        cmds.push(Command::Theorem(thm));
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        let concat: Vec<Command> = defs.cmds.iter()
+            .chain(deps.iter()
+                .filter_map(|f| stmts.get(&f.name))
+                .flat_map(|(_, c, _)| c.iter()))
+            .chain(cmds.iter())
+            .cloned().collect();
+        debug_check(&concat)?;
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = &stmts;
+
+    let rendered = pp_commands(&cmds);
+    let source_map = LeanSourceMap::ExecFn {
+        fn_name: short_name(&vir_fn.name.path).to_string(),
+        span_marks: rendered.landmarks.span_marks.clone(),
+    };
+    let leaf = lean_name(&vir_fn.name.path).replace('.', "__");
+    let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
+        .join(format!("{}.lean", leaf));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let changed = write_lean_file_tracked(&path, &rendered.text)?;
+    record_exec_link_entry(&defs.scope, ExecLinkEntry {
+        leaf: leaf.clone(),
+        obligations: thm_names.into_iter()
+            .zip(per_thm_deps.iter())
+            .map(|(n, ds)| (n, ds.iter().map(|f| f.name.path.clone()).collect()))
+            .collect(),
+    });
+    Ok(PkgEmitOutcome::Single { leaf, path, source_map, stmt_modules, changed })
+}
+
+/// Verify an exec fn via its package module (M6.2). `None` = the
+/// route can't run (defs unavailable, defs don't cover exec, or the
+/// emission is package-inexpressible) — the caller falls through to
+/// the island path, which remains fully self-contained.
+///
+/// Sorry is FATAL here, exactly as on the exec island path: exec
+/// closed forms don't join the Link composition until M6.3, so there
+/// is no sorryAx backstop behind this route yet — which is also why
+/// the built olean is NOT registered with `record_pkg_olean_built`
+/// (the M4 gate would try to compose it into the Link closure).
+fn check_exec_fn_via_package(
+    krate: &KrateX,
+    vir_fn: &FunctionX,
+    fn_sst: &FunctionSst,
+    check: &FuncCheckSst,
+    imports: &[String],
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+) -> Option<CheckResult> {
+    install_emit_tables(krate, crate_name);
+    let defs = match crate::crate_defs::for_crate(
+        krate, crate_name, tactic_bodies, true, crate::crate_defs::ScopeKind::Exec,
+    ) {
+        Some(d) if d.covers_exec => d,
+        // Silent fallback (see check_proof_fn_via_package): below-gate
+        // crates and failed ladders verify via islands, as pre-M6.5.
+        _ => return None,
+    };
+    let prelude_dir = match crate::prelude::ensure_prelude_olean() {
+        Ok(d) => d,
+        Err(e) => return Some(CheckResult::Error(e)),
+    };
+    let base_path = format!("{}:{}", prelude_dir.display(), defs.dir.display());
+    match emit_package_exec_fn(
+        krate, vir_fn, fn_sst, check, imports, crate_name, tactic_bodies, &defs,
+    ) {
+        Ok(PkgEmitOutcome::Single { leaf, path, source_map, stmt_modules, changed }) => {
+            let olean = path.with_extension("olean");
+            let cacheable = !changed
+                && stmt_modules.iter().all(|(_, ch)| !ch)
+                && !defs.breaking
+                && olean.exists();
+            if cacheable {
+                record_pkg_olean_built(&path);
+                PKG_CACHED_VERDICTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(CheckResult::Success { warnings: vec![] });
+            }
+            for (m, ch) in &stmt_modules {
+                let may_skip = !ch && !defs.breaking;
+                if let Err(e) = ensure_stmt_olean(m, &defs, &prelude_dir, may_skip) {
+                    return Some(CheckResult::Error(e));
+                }
+            }
+            let pkg_dir = path.parent().expect("pkg file has a parent").to_path_buf();
+            let result = run_lean_json(&pkg_dir, &leaf, true, &base_path);
+            // Sorry parity with the proof-fn package path (C-2/M6.3):
+            // warning at fn level; the Link gate's #tactus_check_axioms
+            // closure is the fatal backstop — exec closed forms are in
+            // it now. (A gate skipped by an UNRELATED fn error still
+            // fails the run via that error, so no green run can carry
+            // an ungated sorry.)
+            if matches!(&result, Ok(r) if r.success) {
+                record_pkg_olean_built(&path);
+            }
+            // assume(P)-site warnings: same collection as the island
+            // path (`emit_exec_fn`) — the pkg route previously dropped
+            // them (surfaced when the defs size gate was removed).
+            let assume_warnings: Vec<String> = vir_fn.body.as_ref()
+                .map(|body| sst_to_lean::collect_assume_sites(body))
+                .unwrap_or_default()
+                .iter()
+                .map(|span| format!(
+                    "{} at {}: backed by an unverified hypothesis (`assume(P)`                      enters the spec as fact without a proof). Replace with a proven                      `assert(P) by {{ ... }}` before relying on this in production.",
+                    vir::tactus_messages::ASSUME_WARNING_TAG,
+                    sst_to_lean::format_span_loc(span),
+                ))
+                .collect();
+            Some(match format_lean_check_result(result, vir_fn, &path, &source_map) {
+                CheckResult::Success { mut warnings } => {
+                    warnings.extend(assume_warnings);
+                    CheckResult::Success { warnings }
+                }
+                other => other,
+            })
+        }
+        Ok(other) => {
+            let reason = match other {
+                PkgEmitOutcome::UnsupportedScc(r) => r,
+                _ => "unexpected mutual outcome for exec fn".to_string(),
+            };
+            eprintln!(
+                "tactus: package-check: `{}` not package-expressible ({}); island check",
+                short_name(&vir_fn.name.path), reason
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "tactus: package-check: exec package emission failed for `{}` ({}); island check",
+                short_name(&vir_fn.name.path), e
+            );
+            None
+        }
+    }
+}
+
 pub fn emit_exec_fn(
     krate: &KrateX,
     vir_fn: &FunctionX,
@@ -1845,7 +4062,7 @@ pub fn emit_exec_fn(
     // closures may be absent, so true exec fns emit standalone; WP-
     // style PROOF fns (Verus proof bodies routed through this same WP
     // path) are covered by the proof roots and keep the import.
-    let defs = crate::crate_defs::for_crate(pre_inline_krate, crate_name, tactic_bodies, false)
+    let defs = crate::crate_defs::for_crate(pre_inline_krate, crate_name, tactic_bodies, false, crate::crate_defs::ScopeKind::Exec)
         .filter(|d| d.covers_exec || matches!(vir_fn.mode, vir::ast::Mode::Proof));
     let (mut cmds, ns) = krate_preamble(
         krate, imports, crate_name, &[vir_fn],
@@ -1878,9 +4095,10 @@ pub fn emit_exec_fn(
     };
 
     let file_path = lean_file_path(crate_name, &vir_fn.name.path);
-    if let Err(e) = write_lean_file(&file_path, &rendered.text) {
-        return Err(CheckResult::Error(e));
-    }
+    let changed = match write_lean_file_tracked(&file_path, &rendered.text) {
+        Ok(c) => c,
+        Err(e) => return Err(CheckResult::Error(e)),
+    };
 
     let cmds_for_sanity: Vec<Command> = match &defs {
         // Sanity resolves identifiers over the command stream; in defs
@@ -1901,7 +4119,10 @@ pub fn emit_exec_fn(
         });
     }
 
-    Ok(EmitOutput { file_path, source_map, warnings })
+    Ok(EmitOutput {
+        file_path, source_map, warnings, changed,
+        first_theorem_line: rendered.landmarks.theorem_heads.first().copied(),
+    })
 }
 
 /// Verify an exec fn: emit its `.lean` (via `emit_exec_fn`), then run Lean.
@@ -1914,13 +4135,31 @@ pub fn check_exec_fn(
     crate_name: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
 ) -> CheckResult {
+    // Package-check route (M6.2): exec fns verify via their PACKAGE
+    // module when the exec defs cover them. `None` = fall through to
+    // the island path below (graceful degradation, same as proof fns).
+    if package_check_enabled() {
+        if let Some(result) = check_exec_fn_via_package(
+            krate, vir_fn, fn_sst, check, imports, crate_name, tactic_bodies,
+        ) {
+            return result;
+        }
+    }
     // Same defs-before-emit ordering as `check_proof_fn` (see there).
-    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true);
-    let EmitOutput { file_path, source_map, warnings } =
+    let defs = crate::crate_defs::for_crate(krate, crate_name, tactic_bodies, true, crate::crate_defs::ScopeKind::Exec);
+    let EmitOutput { file_path, source_map, warnings, first_theorem_line, changed } =
         match emit_exec_fn(krate, vir_fn, fn_sst, check, imports, crate_name, tactic_bodies) {
             Ok(o) => o,
             Err(cr) => return cr,
         };
+    let marker = file_path.with_extension("verified");
+    if island_cache_ok(&marker, changed, &defs) {
+        // Emission warnings are recomputed each run (emit always
+        // runs); lean-side success warnings are the sorry-filtered
+        // set, empty by construction on this path.
+        return CheckResult::Success { warnings };
+    }
+    let _ = std::fs::remove_file(&marker);
 
     let dir = project::default_project_dir();
     let lake_dir = if project::project_ready(&dir) { Some(dir.as_path()) } else { None };
@@ -1935,7 +4174,15 @@ pub fn check_exec_fn(
     let result = lean_process::check_lean_file(&file_path, lake_dir, &extra_paths);
 
     match result {
-        Ok(r) if r.success => CheckResult::Success { warnings },
+        Ok(r) if r.success => {
+            if let Some(fail) = island_sorry_failure(
+                &r, first_theorem_line, &vir_fn.name.path, &file_path, &source_map)
+            {
+                return fail;
+            }
+            let _ = std::fs::write(&marker, crate::project::toolchain_fingerprint());
+            CheckResult::Success { warnings }
+        }
         Ok(r) => {
             let fn_short = short_name(&vir_fn.name.path);
             let header = format!("Lean tactus_auto failed for {}", fn_short);

@@ -371,6 +371,9 @@ pub(crate) enum Attr {
     // escape hatch for fns relying on Z3-only behaviour (spec-fn fuel
     // auto-unfold, or a construct Tactus doesn't lower yet).
     TactusZ3,
+    // Tactus: structural (subterm) recursion emission for this fn's
+    // Lean def — see vir FunctionAttrs::tactus_structural_decreases.
+    TactusStructuralDecreases,
     TactusLeanAxiomEq,
     // Tactus: per-fn tactic-closer override. Replaces `tactus_auto` in
     // generated theorems with the user-supplied tactic (e.g., "ring",
@@ -676,6 +679,9 @@ pub(crate) fn parse_attrs(
                 AttrTree::Fun(_, arg, None) if arg == "tactus_auto" => v.push(Attr::TactusAuto),
                 // Tactus: opt-out of Lean back to Z3 (under --lean-backend)
                 AttrTree::Fun(_, arg, None) if arg == "z3" => v.push(Attr::TactusZ3),
+                AttrTree::Fun(_, arg, None) if arg == "structural_decreases" => {
+                    v.push(Attr::TactusStructuralDecreases)
+                }
                 AttrTree::Fun(_, arg, None) if arg == "lean_axiom_eq" => {
                     v.push(Attr::TactusLeanAxiomEq)
                 }
@@ -1240,6 +1246,8 @@ pub(crate) struct VerifierAttrs {
     // theorem from this fn gets `set_option maxHeartbeats N in`
     // prepended. None = prelude default applies.
     pub(crate) tactus_heartbeats: Option<u32>,
+    // Tactus: structural recursion emission (see Attr::TactusStructuralDecreases).
+    pub(crate) tactus_structural_decreases: bool,
 }
 
 // Check for the `get_field_many_variants` attribute
@@ -1422,6 +1430,7 @@ pub(crate) fn get_verifier_attrs_maybe_check(
         tactus_lean_axiom_eq: false,
         tactus_tactic: None,
         tactus_heartbeats: None,
+        tactus_structural_decreases: false,
     };
     let mut unsupported_rustc_attr: Option<(String, Span)> = None;
     for attr in parse_attrs(attrs, diagnostics)? {
@@ -1513,6 +1522,7 @@ pub(crate) fn get_verifier_attrs_maybe_check(
             Attr::TactusLeanAxiomEq => vs.tactus_lean_axiom_eq = true,
             Attr::TactusTactic(tac) => vs.tactus_tactic = Some(tac.clone()),
             Attr::TactusHeartbeats(n) => vs.tactus_heartbeats = Some(n),
+            Attr::TactusStructuralDecreases => vs.tactus_structural_decreases = true,
             _ => {}
         }
     }

@@ -33,8 +33,14 @@ pub mod typed_expr;
 
 // Re-export the main entry points
 pub use generate::{
-    check_exec_fn, check_proof_fn, emit_exec_fn, emit_proof_fn, sourcemap_path, CheckResult,
-    DiagLocation, EmitOutput, TactusDiag,
+    check_exec_fn, check_package, check_proof_fn, emit_exec_fn, emit_proof_fn, sourcemap_path,
+    CheckResult, DiagLocation, EmitOutput, PackageGateReport, TactusDiag,
 };
 pub use to_lean_fn::LeanSourceMap;
 pub use sourcemap::{Sidecar, SidecarFn};
+
+// Golden tripwire for the bootstrap mirror types (N2) — see the
+// test file header.
+#[cfg(test)]
+#[path = "tests/bootstrap_coverage.rs"]
+mod bootstrap_coverage_tests;

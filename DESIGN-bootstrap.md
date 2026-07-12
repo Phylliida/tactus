@@ -1,7 +1,12 @@
 # Bootstrap: verifying tactus in tactus — master plan
 
-**Date:** 2026-07-11
-**Status:** proposed (consolidates + updates the R-ladder from 2026-07-09; details R2 for the first time)
+**Date:** 2026-07-11 (rev 2, same day: W0 pre-probes RUN — §11; bridge roles sharpened — §4.3)
+**Status:** proposed; five load-bearing mechanics empirically validated (`probe-w0/`), one
+real constraint found (WF-compiled spec fns don't kernel-reduce) with a confirmed mitigation
+**Branch:** all bootstrap work lives on `bootstrap` (worktree `tactus-bootstrap/`), keeping
+main clear for the in-flight F6/B5 arcs
+**Orientation:** `VERIFICATION-PATH.md` is the top-level map (end-state
+claim, claim ladder, permanent residue, failure modes) — read it first.
 **Supersedes:** the ladder framing scattered across session notes. Component docs remain
 authoritative for their components: `DESIGN-axiom-closure-check.md` (R0b),
 `DESIGN-lean-all-proofs.md` + followons (R0a), `DESIGN-emit-module.md` /
@@ -227,11 +232,35 @@ example : f_goal_rendered = Tactus.refWpProp f_sst 0 := by rfl
   etc.); kernel cost scales with WP size; intrinsically-typed syntax or a
   type-checking denotation is real design work.
 
-**Decision by probe (W0):** if Bridge-R's `rfl` holds naturally on the toy and costs
-tolerably, prefer it for statements while keeping Bridge-D for the goal *list*
-structure. Expected outcome: Bridge-D everywhere first (it also IS the W3 differential
-gate, run in-kernel); Bridge-R adopted opportunistically per goal family; W8 flip makes
-the residual pp question moot.
+**Division of labor (sharpened after the §11 pre-probes; the two bridges are
+COMPLEMENTARY, not alternatives):**
+
+- **Bridge-D is the drift gate.** It is cheap, robust, and catches emitter bugs — but
+  it cannot carry the soundness chain alone, because connecting a *data* GoalAst to
+  the *Prop* the user actually proved requires a denotation, and a denotation of full
+  untyped `LExpr` syntax would be an elaborator-in-Lean (infeasible).
+- **The denotation is therefore load-bearing on the soundness path**, and it must be
+  over `refWp`'s own *typed* goal language, not over LExpr: `refWp : Sst → List TGoal`,
+  `TGoal.toProp : SymEnv → TGoal → Prop` where `SymEnv` carries the crate's actual
+  types and spec fns (a generated per-crate environment literal grounding fn symbols
+  in the emitted Defs). §11 P4/P5 validate that this denotation `rfl`-bridges to the
+  production-rendered Prop — through binders, environment lookups, opaque user-type
+  quantifiers, and named user spec fns.
+- **Authorship split, honestly:** `refWp` and `SstSem` (data → data) are tactus spec
+  fns. `toProp`/`SymEnv`/`interpTyp` return `Prop`/`Type` — outside tactus's spec
+  language — so the denotation layer is **hand-written Lean in tactus-core**: small,
+  audited-once, and *not trusted* (it is the statement of soundness; spec-adequacy
+  covers it, §8.5). The W5 soundness proof relates `refWp` to `SstSem` at the data/Val
+  level in tactus; a thin hand-Lean **adequacy spine** (structural induction over
+  `TGoal` relating the typed denotation to the Val-level one, with generated per-datatype
+  embedding lemmas) connects it to the user-facing Props. Staging: W5 v1 may state
+  soundness at the Val level only — already the full drift-detector — with the adequacy
+  spine as W5f.
+- Both bridges consume the same reference output: Bridge-D compares
+  `TGoal.render : TGoal → GoalAst` against the serialized production LExpr; Bridge-R
+  checks `rendered-stmt = toProp env g` by `rfl`. Run Bridge-D everywhere first (it IS
+  the W3 differential gate, in-kernel); adopt Bridge-R per goal family as W4 matures;
+  the W8 flip retires the residual pp trust.
 
 ### 4.4 Where the bridge lives
 
@@ -258,7 +287,8 @@ one.
 
 | Stage | Content | Validates / buys | Size |
 |---|---|---|---|
-| **W0** | **Hand-written Lean spike** (`probe-w0/`): mini-`Sst` (≤8 constructors: Let, If, Assert, Assume, Loop, Call, Return + an expr leaf), mini-`GoalAst`, mini-`refWp`; hand-serialize ONE real toy exec fn (the CRATEDEFS chain-crate style); write both bridges; measure kernel time; d1: does `decide`/`rfl` on data equality scale in the kernel? d2: does Bridge-R defeq survive `Int.toNat`/instance unfolding? d3: the `toProp`-connection lemma shape; d4: is emitted-spec-fn `refWp` computable in the kernel (no `Classical` in its body) or does it need `native_decide` (= `ofReduceBool` knob — avoid)? | the whole concept, zero tactus changes | small, days |
+| **W0** | **COMPLETE (§11, `probe-w0/` P1–P7 + `bootstrap-fixture/`).** Both bridge mechanics validated (toy + two real goals: P6 assert w/ decorations+instances+let-in-Prop, P7 loop-maintain w/ telescope+shadowing+casts); WF constraint found + mitigation confirmed (→ W1.5); costs measured; goal-language sort story pinned (Int-with-bound-hyps exec / Nat spec); fixture corpus built (18 fns, emits 20/0). | the whole concept — validated with zero tactus changes | done |
+| **W1.5** | **Emitter brick (prerequisite for W2, benefits everyone):** emit `termination_by structural x` when a recursive spec fn's decreases measure is a bare structurally-decreasing param (datatype or Nat) — §11 P3 shows plain `termination_by` (WF) makes emitted spec fns kernel-INERT (`decide`/`rfl` stuck, `unseal` no rescue), while `structural` restores full reduction with an EMPTY axiom closure (no `Tactus.heightLt`). Fallback ladder rung: keep WF emission when structural elaboration fails. Independent win outside R2: user goals over such spec fns become `decide`-closable. | refWp's Lean form actually computes; also a T1-automation win | small |
 | **W1** | **Mirror types + serializer.** `Tactus.Sst`/`GoalAst` inductives (Lean, generated-or-checked against a single Rust source of truth); Rust serializer `sst_serialize.rs` from `build_wp` input + from produced `LExpr`s. Boring, 1:1, no cleverness — **this is the new trusted code; target <1k lines, reviewed as TCB.** Subset = what tactus supports today (documented deferrals excluded, serializer *fails loudly* on anything else). | the data pipeline; corpus coverage numbers (what % of tgt/suite fns serialize) | medium |
 | **W2** | **Reference WP, stage A** — deep *statements*, opaque expression leaves (leaves carried as already-rendered `GoalAst` subtrees, same on both sides). Authored as tactus spec fns in `tactus-core`, lean-only-clean, emitted via crate-defs. Mirrors the `Wp` walk: Done/DoneEmpty/Let/LetRaw/ClosureBody/Scope, CtxFrame assembly, loop init/maintain/use with havoc sets, overflow/bounds obligation placement, decreases obligations. | the WP *logic* — where the structured bugs live (loop rules, context frames, prophecy plumbing) | large |
 | **W3** | **Differential gate over the corpus.** Compare production goals vs. reference goals for every serializable fn in the suite + tgt (3116 fns) + tutorial. Run as a Lean batch (`decide` per fn, no Rust execution of spec fns needed). Divergence = bug on one side; drive to zero; keep as CI mode. | finds real bugs *now* (the F-taxonomy shows the class is populated); calibrates reference completeness before any proof | medium |
@@ -280,8 +310,10 @@ proven; W8 last. R1-merge gates W4's package home; R0a gates nothing before W5's
 What checks what, in the end state:
 
 ```
-.rs of tactus-core (reference WP spec fns + SstSem + refWp_sound proof fns)
+.rs of tactus-core (refWp + SstSem spec fns, refWp_sound proof fns)
         │  authored in tactus, verified by the tactus binary (lean-only routing)
+        │  + a small hand-Lean layer (toProp/SymEnv/adequacy spine — §4.3):
+        │    part of the SPEC, audited once, kernel-checked like everything else
         ▼
 Lean package: TactusCore/{Defs,Stmts,Proofs,Link} + #tactus_check_axioms
         │  checked by the Lean KERNEL — closure ⊆ core ∪ prelude
@@ -352,16 +384,23 @@ every run, not trusted.
 
 ## 9. Open questions
 
-- **O1 (W0):** Bridge-R defeq feasibility + kernel cost; Bridge-D `decide` cost at
-  tgt scale (3116 fns × avg obligations — batch per fn? per module?).
+- **O1 (W0):** ~~Bridge-R defeq feasibility + kernel cost~~ **answered at toy scale
+  (§11)**: denotation `rfl` works incl. binders/SymEnv; Bridge-D `decide` on a
+  600-statement fn ≈ 2.8s wall incl. ~1s process floor. Remaining: real-goal-shape
+  cost, and batching (per-Verus-module bridge files to amortize the floor; generated
+  bridge modules must `set_option maxRecDepth` — kernel recursion depth scales with
+  WP chain depth, §11 P2).
 - **O2 (W1):** mirror-type single-source-of-truth: generate the Lean inductives from
   the Rust types (build.rs) or hand-write + golden-test? Lean-side generation is less
   trusted code; hand-written is more auditable. Lean-side wins if the subset is stable.
-- **O3 (W2):** spec-fn `refWp` computability in the kernel — `Classical.epsilon`
-  anywhere in the emitted defs (via `choose`-like constructs) breaks `decide`; keep
-  tactus-core's source in the choice-free fragment (enforced by a lint or by the
-  emitted-defs closure check listing no `Classical.choice`… note: `Decidable` instances
-  themselves are fine).
+- **O3 (W2):** spec-fn `refWp` computability in the kernel — TWO constraints, one per
+  probe: (a) choice-freedom: `Classical.epsilon` anywhere in the emitted defs (via
+  `choose`-like constructs) breaks `decide`; keep tactus-core's source in the
+  choice-free fragment (lintable via the defs' axiom closure). (b) **recursion
+  compilation (§11 P3, the sharper one):** tactus emits every recursive spec fn with
+  `termination_by` ⇒ WF-compiled ⇒ kernel-inert. W1.5 (structural emission) is the
+  fix; simp-with-equation-lemmas is the proven fallback bridge tactic if any
+  tactus-core fn genuinely needs a non-structural measure.
 - **O4 (W2):** obligation *identity* — bridge per goal needs stable pairing between
   production goals and reference goals; `obligation_naming.rs` ids on one side, `refWp`
   output order on the other; make `refWp` emit ids too and pair by id, not position.
@@ -375,6 +414,11 @@ every run, not trusted.
 - **O8:** does the W3 corpus run write divergences into the F-taxonomy doc
   (`DESIGN-lean-all-proofs-followons.md`) or a fresh `DESIGN-bridge-divergences.md`?
   (Bookkeeping, decide when the first one lands.)
+- **O9 (W1/W2, from P6):** tactus datatypes are non-indexed, so the tactus-authored
+  goal language is *extrinsically* typed — `refWp` outputs plain data; the hand-Lean
+  denotation layer sort-checks (partial `toProp : TGoal → Option Prop`, bridge
+  asserts `= some rendered`, or a total default-False form). Decide the partiality
+  convention with the first real telescope.
 
 ---
 
@@ -388,3 +432,296 @@ stage A) → **W3** (differential gate — first real payoff: bug-finding) → [
 Independent of all of it, still-open bricks from the sibling docs that this plan
 *leans on*: T/B1 histogram (now nearly free via ladder sidecars), closure-doc §4
 prelude hygiene, R1/M6.0b Ref-ABI, R0a tactic-strength (Danielle's).
+
+---
+
+## 11. W0 pre-probe findings (2026-07-11, `probe-w0/`, lean 4.25.0, pure core)
+
+Run the same day as rev 1, before any implementation. Five files, each answering one
+load-bearing unknown; every claim below is pinned by a probe file that elaborates (or
+deliberately fails) standalone with no Mathlib.
+
+- **P1 (`probe1_structural.lean`) — Bridge-D mechanics work.** A structurally-compiled
+  `refWp` over a 5-constructor mini-SST kernel-evaluates on concrete data under both
+  `decide` (derived `DecidableEq`) and `rfl`; `#print axioms refWp` = none. 0.9s incl.
+  process start.
+- **P2 (`probe2_cost.lean`) — Bridge-D cost is fine, with one emission detail.** A
+  generated 600-statement program (150 assign/assert/ite units) bridge-checks by
+  `decide` in **2.8s wall** (≈1s of that is process floor). First attempt hit
+  `maximum recursion depth` — kernel/elaborator recursion scales with WP chain depth,
+  so generated bridge modules must emit `set_option maxRecDepth`. Consequence for
+  W4: batch bridges per Verus module to amortize the floor; typical fns are far
+  smaller than this probe.
+- **P3 (`probe3_wf.lean` + `probe3b_unseal.lean`) — THE CONSTRAINT: WF-compiled defs
+  are kernel-inert.** The same `refWp` with explicit `termination_by <Nat measure>`
+  (exactly what `to_lean_fn.rs:324` emits for every recursive spec fn with a
+  `decreases` clause): `decide` gets stuck at the derived `DecidableEq` instance
+  application (`did not reduce to isTrue/isFalse`), and `unseal … in` does **not**
+  rescue `rfl`. `simp [refWpWF, …]` (equation lemmas) DOES close it — the deterministic
+  fallback. Direct consequence: **a tactus-authored refWp is kernel-inert under
+  today's emission** — hence brick W1.5.
+- **P3c (`probe3c_structural_tb.lean`) — the mitigation works.** The same def with
+  `termination_by structural s` restores full `decide`/`rfl` evaluation with an
+  **empty axiom closure** (the current datatype-measure emission would additionally
+  drag `Tactus.heightLt` into every recursive spec fn's closure — structural emission
+  is a trust-hygiene win independent of R2).
+- **P4 (`probe4_denote.lean`) — the denotation rfl-bridge works.** A typed goal
+  language (`TGoal` with de Bruijn `tforall`/`timpLe`/`tconj`/`teq` over Int
+  expressions) with a structural denotation `gdenote : List Int → TGoal → Prop`
+  satisfies `gdenote [] g = (∀ x : Int, 0 ≤ x → (x + 0 = x ∧ ∀ y, …)) := by rfl` —
+  nested binders, env lookups under bound variables (`(x :: env).getD 0` iota-reduces
+  with x still abstract), and Int-literal elaboration all agree definitionally. This
+  is the W5 soundness path's load-bearing mechanic, validated.
+- **P5 (`probe5_symenv.lean`) — the dependent symbol environment survives the
+  bridge.** Goals referencing *user spec fns* and quantifying over *user datatypes*
+  denote through a `SymEnv` structure (`U : Type`, `ifns : Nat → (Int → Int)`, …)
+  instantiated by a generated per-crate match-literal — and still `rfl`-bridge to the
+  production-rendered Prop naming the real fns (`∀ c : Color, colorRank c = myAbs
+  (-3)`). This validates the §4.3 authorship split: the denotation layer (returns
+  `Prop`/`Type`) is hand-Lean; everything data-level stays tactus-authored.
+
+- **P6 (`probe6_real_goal.lean`) — a REAL emitted goal bridges.** The assert obligation
+  of tgt's `find_cancellation_exec` (island output preserved in `/tmp/fcx_scratch.lean`,
+  M6.1-era), goal copied **verbatim** — `Tactus.Ref` decoration with type ascription,
+  `view.View.view` instance dispatch (instance resolved by the elaborator on the
+  rendered side, carried as a plain function in `SymEnv` on the reference side —
+  defeq agrees), **`let tmp__1 := …` bindings inside the Prop** (zeta closes both
+  sides), `usize_hi`, the `0 ≤ len ∧ len < usize_hi` overflow guard, opaque axiom
+  types (`vec.Vec`, `seq.Seq`), and a WF-compiled recursive user spec fn
+  (`find_cancellation_from`) appearing as an opaque symbol — `rfl` closes the bridge
+  in 0.9s. Two corollaries: (a) **the P3 constraint scopes to tactus-core's own
+  defs only** — user spec fns in goals are named, never evaluated, so their WF
+  compilation is irrelevant to the bridge; (b) the probe's sort-indexed `TExpr`
+  worked well in hand-Lean, but **tactus datatypes are non-indexed** — the
+  tactus-authored `refWp` must output *extrinsically*-typed data with Lean-side
+  sort-checking in the denotation layer (new O9).
+
+Net: **no blockers; one real constraint (P3) with a confirmed small mitigation (P3c →
+W1.5); both bridge forms mechanically validated on toy AND real goals; cost in
+budget.** Remaining W0 residue, now small: a loop init/maintain/use triple goal
+(same connective vocabulary + nested ∀, both probed separately — P4 has nested
+binders; compose them on a real loop fn), an `Int.ofNat` coercion site, and the
+general binder-telescope scheme (engineering, not risk).
+
+- **P7 (`probe7_loop_triple.lean`) — the real LOOP-MAINTAIN goal bridges. W0 COMPLETE.**
+  The fixture's `sum_to` invariant-3 maintain obligation
+  (`_tactus_loop_invariant_sum_to_at_lib_113_13_9`), verbatim: the loop-state ∀ is a
+  telescope of **signature binders with hypothesis binders interleaved** (the
+  CtxFrame architecture — no nested quantifiers; the M1 stmt ∀-closure IS the goal),
+  Int-typed lets including **let-shadowing of binders** (`let i := i + 1`, the
+  SSA-via-shadowing idiom — defeq is insensitive to shadowing, both sides zeta-reduce),
+  the `_tactus_d_old_0_0` decrease snapshot, duplicated overflow guards (faithful),
+  `Int.toNat` materialization sites, and the WF-emitted `lib.tri` as an opaque symbol.
+  Two-sorted goal language (Int exec side with bound-hyps + Nat spec side, per the
+  §11.1 census) — `rfl` closes in 0.6s. One idiom note for W2: build deep goal terms
+  as named layers, not one paren tower.
+
+### 11.1 The fixture crate (`bootstrap-fixture/`)
+
+The canonical minimal module covering the goal-shape matrix — one tiny fn per
+shape, F1–F19 labels in-source. Emits clean today (**20 verified / 0 errors, 18
+fns**, via `--lean-backend --emit-lean --lean-all-proofs`; command in the file
+header; `out/` regenerable, gitignored). Roles: the W0 hand-bridge target set
+(its `sum_to.lean` has the loop triple with casts in invariants — 13
+`toNat`/`Int.ofNat` sites; `find_square.lean` the nested-loop/early-return worst
+case, 19 obligations; `fill_zeros.lean` quantified invariants), the W1 serializer's
+first corpus, and the W3 differential gate's smoke set before tgt. Coverage:
+spec fns (plain / Nat-recursive / datatype-recursive with match+Box), proof fns
+(plain route, tactic block, assert, cast shapes), exec fns (overflow,
+value-position if, loop triple, nested loops + early return, call contracts,
+exec recursion/decreases, Vec view + `&mut` + `old()`, generic `T`, enum match,
+quantified ensures/invariants, struct/tuple). Recorded residue: closures and
+break/continue (add when W2 reaches their `Wp` arms).
+
+Two shape facts the census surfaced, for the goal-language design: **exec
+integer params render as `Int` plus a bound hypothesis** (`h_x_bound : 0 ≤ x ∧
+x < 2^64`), not `Nat` — the TGoal sort story is Int-with-hyps on the exec side,
+Nat on the spec side; and exec island files still over-include unrelated proof
+fns (the documented safe over-approximation) — bridge pairing must key on the
+fn's own obligations (O4's ids), never on file contents.
+
+## 11.2 W1.5/W1 pre-probes (P8, same day)
+
+- **P8 FOUND A REAL EMITTER BUG**: a recursive spec fn over an own Box-carrying
+  datatype (`bootstrap-fixture/w15_probe.rs`) emits `esize a` at type
+  `Tactus.Box PExpr` — the `.deref` is dropped on match-bound Box fields; the
+  island (`probe-w0/probe8_authoring_loop.lean` context) fails elaboration.
+  Never seen live because `--emit-lean` skips the Lean run. Exactly the W3
+  bug class, caught by a probe. Fix belongs with W1.5 (same rendering area).
+- **P8b (`probe8b_box_structural.lean`)**: the post-fix shape — recursion via
+  `Box.deref` projections — IS accepted by `termination_by structural` and
+  kernel-reduces (decide + rfl, zero axioms). W1.5 works for the real
+  mirror-type authoring idiom.
+- Scope pin for W1.5: `tri`-style `Int.toNat (n - 1)` recursion is NOT
+  structural — the feature applies to datatype-subterm recursion (+ the fix);
+  Nat-arith recursion keeps WF + simp-eq-lemma bridging.
+- W1 constraint: mirror types must use own cons-lists, never `Seq` fields
+  (opaque axiom type — no match, no reduction).
+
+**FIX LANDED on this branch (same day):** match-arm pattern binders now enter
+`ctx.binder_typs` (`to_lean_expr.rs`, Quant-arm idiom + recursive
+`collect_pattern_binding_typs`), so spec-mode uses of Box/Rc-decorated
+pattern vars re-materialize `.deref` via the existing use-site coercion.
+w15_probe island elaborates green vs the real prelude; **full e2e suite
+533/0**; P8 regenerated on the fixed emission: `termination_by structural`
+flip on real emitted esize/lsize = kernel decide/rfl, zero axioms — the
+W1.5 authoring loop validated end to end. (Explains the old asymmetry:
+generated height fns always emitted `.deref`; only user match bodies
+lacked it.) Residue noted: `block_to_node` Decl-bound pattern vars share
+the hazard class in principle — same map-extension fix if a repro appears.
+
+**W1.5 LANDED (this branch): `#[verifier::structural_decreases]`.** Opt-in
+per-fn attribute (heartbeats-pattern plumbing: attributes.rs → VerifierAttrs →
+vir FunctionAttrs → to_lean_fn); when the decreases measure is a bare
+datatype-typed param, spec fns emit `termination_by structural <param>` with
+no decreasing_by (kernel-computable, no heightLt in closure); any other
+measure shape falls back silently to WF emission — visible in the artifact
+termination_by line, never a hard failure. Def gains `termination_structural`;
+pp renders the `structural` keyword. Proof-fn structural emission deferred to
+W5 (Theorem struct, recursive proof fns). Pinned by two e2e tests, incl. the
+discriminating `decide` closer (passes ONLY under structural emission).
+Suite 543/0.
+
+**NEW BUG PINNED while testing (ctor-arg sibling of RC4):** `Box::new`
+erasure at CONSTRUCTOR argument slots misses the `.mk` wrap —
+`Expr.Add (Expr.Lit 3)` renders unwrapped where `Tactus.Box Expr` is
+expected ("Application type mismatch" at elaboration). Fix needs declared
+field typs at ctor render sites (RenderCtx has no datatype map — real
+plumbing, own brick). Repro = the commented construction in
+test_structural_decreases_kernel_computes.
+
+**REVIEW PASS (same day):** (a) crate-defs/package spec-world emission goes
+through the SAME `spec_fn_to_ast` — structural_decreases renders identically
+in islands and defs modules, no render divergence (DefCurried has no
+production constructor — vestigial). (b) The documented Decl-let residue was
+A LIVE BUG (review probe: `let b = l; tsize(*b)` rendered bare, island RED)
+— `block_to_node` rewritten to forward recursion threading pattern bindings
+through `ctx.binder_typs`; pinned by `test_spec_let_box_use_derefs`.
+(c) structural helper tightened: decorated (`&Tree`) params now keep WF
+(structural on a `Tactus.Ref`-wrapped binder is unvalidated). Suite 544/0.
+Still-open review items: attribute silently ignored on mutual spec fns and
+proof/exec fns (document-or-warn, W5); SST-path (exec obligation) match
+binders unaudited for the same class — accessor-based, likely fine, worth a
+probe when M6.2 lands; fixture not yet exercising --tactus-package-check.
+
+**CTOR-ARG BUG FIXED (same day):** `Box::new` erasure at constructor slots
+now re-wraps via declared-slot coercion — new ambient table `CTOR_FIELD_TYPS`
+(all datatypes, all variants, raw field names + typ params) installed by
+`install_datatype_field_bounds` alongside `DATATYPE_FIELDS` (the blessed
+ambient-table idiom pending the typed-renderer migration); `ctor_to_node` +
+StructUpdate values coerce each rendered field to the instantiated declared
+typ via `coerce_lexpr` (wrapper-only, identity on agreement, skip on unknown
+datatypes). Typ args from `expr.typ` (decoration-stripped). The kernel_computes
+e2e is now the COMPOUND pin: Box ctor coercion + structural emission + kernel
+`decide` in one goal. Battery 544/0. SST-path ctor sites remain unaudited for
+the same class (M6.2-era probe).
+
+---
+
+## 12. Next steps — post-roll execution order (planned 2026-07-11, evening)
+
+Session-sized bricks, in order. Everything below assumes the `bootstrap`
+worktree, `vargo test --release` for e2e, and Danielle's guidance that
+emit-module/package-check flags are the future default.
+
+- **N1 (small, warm-up): close today's residue.**
+  (a) Fixture emission commands gain `--tactus-package-check` (island fallback
+  stays); record any package-path surprises. (b) Annotate `w15_probe.rs`'s
+  `esize`/`lsize` with `#[verifier::structural_decreases]`; regenerate probe8
+  from the emission with NO manual flip — the W1.5 loop becomes emitter-native.
+  (c) SST-path probes for today's two bug classes on exec obligations: an exec
+  fn constructing `Expr::Add(Box::new(..), ..)` + one matching on Box-field
+  datatypes; fix-or-pin (the SST renderer stamps differently — unaudited).
+
+- **N2 (medium): tactus-core skeleton = the mirror types, AS TACTUS CODE.**
+  New crate `tactus-core`: `SstData`/`ExprLeaf`/`GoalData` datatypes covering
+  the Wp-input subset, with OWN CONS-LISTS (never Seq — P8's kernel-inertness
+  constraint), extrinsically typed (O9: tactus datatypes are non-indexed),
+  `structural_decreases` on every recursive spec fn from day one, verified
+  lean-only-clean. **The crate-defs emission of these datatypes IS the Lean
+  mirror vocabulary** — the serializer targets those emitted names; hand-Lean
+  is reserved for the denotation glue (§4.3). Include a golden unit test
+  pinning the covered `vir::sst` variant list (fails loudly when vir::sst
+  grows — the manual-sync tripwire).
+
+- **N3 (medium-large): the serializer — SPEC'D in `DESIGN-N3-serializer.md`
+  (2026-07-12): snapshot at `exec_fn_theorems_to_ast` inputs; faithfulness
+  contract table; leaf interning via production renderer (structure-only
+  stage-A claim, leaves cancel); goal-side via Wp provenance marks (N3b, the
+  one production touch); `--tactus-emit-cert`; acceptance incl. N5 smoke +
+  golden file + determinism. Sub-bricks N3a/b/c.**
+  Rust, boring, 1:1, target <1k lines: from `build_wp`'s inputs (fn_sst body
+  Stm tree + the WpCtx spec context: params/typs, requires, ensures,
+  invariants, decrease) to Lean literals in the N2 vocabulary. Enumerate the
+  captured WpCtx fields explicitly in a doc comment — that list is the
+  faithfulness contract. FAIL LOUDLY outside the subset. Acceptance: the
+  fixture serializes 100%, literals written next to islands.
+
+- **N2.1 (NEW, small, BEFORE N3a): mirror-type amendments** — writing refWp's
+  equations exposed missing StmData fields (If neg-cond leaf, Loop binder
+  list + neg-cond, Call dest, Ret ens-leaf-list, param bound-hyp leaves).
+  Spec'd in `DESIGN-W2-refwp.md` §0; must land before the literal shape
+  freezes.
+
+- **N4 (small): corpus census.** Run the serializer over tgt (3116 fns):
+  % serializable + a ranked table of unsupported constructs — this sets W2's
+  coverage roadmap and is the first honest measure of subset size.
+
+- **N5 (small): literal smoke.** Every fixture literal elaborates against the
+  tactus-core defs olean (`lean` with LEAN_PATH, or package-check if N1a made
+  that natural). Cold + warm timing noted.
+
+- **Then W2 (multi-session): refWp stage A — SPEC'D in `DESIGN-W2-refwp.md`**
+  (first-order worker wpStm/frameAfter, no spec_fn continuations; goal_eq
+  Bool equality for decide; mutation-kill acceptance; honest stage-A scope
+  statement; W3 gate mechanics + triage discipline; open-question ledger).
+
+Standing coordination notes: the branch contains emit-module wholesale — when
+emit-module merges to main, sync this branch promptly (the three bug fixes +
+W1.5 may be wanted on main earlier; cherry-pick is clean, Danielle's call).
+The F6 fable's work overlaps `to_lean_expr.rs` — mention the Match-arm merge
+resolution (`e61d4d8`) to whoever merges next.
+
+**N1 COMPLETE (post-roll session):**
+(a) `--tactus-package-check` VALIDATED live on w15_probe (7/0, package gate:
+composition + axiom closures kernel-verified; canonical command now in the
+file header). lib.rs runs the gate too but carries 12 pre-existing unclosed
+proofs (identical set in island mode — closure debt, not package surprises;
+fixture-debt item for the W3 era). Package artifacts ride the lean-project
+workspace, not TACTUS_LEAN_OUT.
+(b) probe8 regenerated EMITTER-NATIVE: attribute on esize/lsize, verbatim
+emitted text, decide/rfl, zero axioms, zero manual edits.
+(c) SST-path probes: **ctor class = REAL BUG, FIXED** — exec-obligation
+ensures rendered erased Box::new ctors bare; the SST ExpX::Ctor arm now
+bridges NON-VAR-LIKE fields into declared slots via the typed spine
+(into_slot; var-like fields — locals under poly/mode wrappers — stay at
+storage depth, where claims can lie bare for Box::new temporaries). Pinned
+by test_sst_ctor_box_slot_coercion. **Match-binder class = NO BUG** (SST
+accessor rendering derefs correctly); left_val closed with an explicit
+split/cases closer. Residual pinned: spec-side let-bound/field-read vars in
+Box slots with env-invisible binders would still render bare — the honest
+wide fix is truthful claims (upstream U2 work).
+Battery: e2e 545/0, lean_verify 299+7/0.
+
+**GATE REMOVAL + N2 (post-roll session 2):** Danielle: defs size gate (<2
+checked fns → islands) removed for predictability. Removal EXPOSED 5 real
+gaps the gate hid, ALL FIXED: (1) stmt modules lacked theorems'
+requires_preamble (BitVec Int instances) — threaded; (2) pkg exec failure
+header said "tactic" where islands say "tactus_auto" — mode-keyed parity;
+(3) **soundness**: exec-only crates get no Link gate, so pkg-path sorry was
+warning-only → sorry now FATAL on every per-fn path (Link stays the
+cached-verdict backstop); (4) assume(P) warnings dropped by the pkg exec
+route — threaded; (5) WP-routed proof fns (Verus body, no tactic block)
+were neither defs-walk roots nor accessor triggers — both widened. Suite
+549/0; cost of uniformity: suite 131.7s vs 71.6s (every crate builds defs).
+
+**N2 SKELETON LANDED: `tactus-core/lib.rs`** — LeafList/StmData/GoalData/
+GoalList mirror types (stage-A StmX subset, opaque u64 leaves), sequencing
+via Seq/Skip (NO mutual recursion — structural_decreases is single-fn),
+structural on all 4 recursive spec fns, in-crate `decide` sanity proofs =
+kernel-computation validated live; 6/0 under the package gate (defs module
+= the Lean vocabulary exists). Golden tripwire
+`lean_verify/src/tests/bootstrap_coverage.rs`: exhaustive StmX match, 9
+covered / 9 deliberately-uncovered — compile-fails when vir::sst grows.
+N2 residue: probe9 (extract emitted vocabulary, decide against it) — fold
+into N3 acceptance.

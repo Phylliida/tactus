@@ -19,6 +19,115 @@ fn verify_one_file(name: &str, code: String, options: &[&str]) -> Result<TestErr
     common::verify_one_file(name, code, &options)
 }
 
+// === SST-path ctor: exec ensures comparing against Box-field ctor ===
+// The exec-obligation twin of the ctor-arg fix: the ensures renders
+// through the SST expr renderer, where erased spec-side Box::new ctor
+// args gain the declared-slot `.mk` wrap, while exec-body atomized
+// locals (var-like under poly wrappers, storage already Box) are left
+// untouched. Both directions pinned by this one contract.
+test_verify_one_file! {
+    #[test] test_sst_ctor_box_slot_coercion verus_code! {
+        use vstd::prelude::*;
+
+        pub enum Tree { Leaf(u64), Node(Box<Tree>, Box<Tree>) }
+
+        pub fn mk_node(a: u64, b: u64) -> (r: Tree)
+            ensures r == Tree::Node(Box::new(Tree::Leaf(a)), Box::new(Tree::Leaf(b)))
+        {
+            Tree::Node(Box::new(Tree::Leaf(a)), Box::new(Tree::Leaf(b)))
+        }
+    } => Ok(())
+}
+
+// === spec-mode let of a Box-typed value: uses re-materialize .deref ===
+// The Decl-position sibling of the match-arm pattern-binder fix: a plain
+// `let b = l;` where l : Box<T> binds b at `Tactus.Box T`, while spec-mode
+// VIR strips the decoration on b's uses. block_to_node threads the pattern
+// bindings through ctx.binder_typs so the use-site coercion inserts the
+// `.deref`. (Found in review; previously failed elaboration.)
+test_verify_one_file! {
+    #[test] test_spec_let_box_use_derefs verus_code! {
+        use vstd::prelude::*;
+
+        pub enum Tree { Leaf(u64), Node(Box<Tree>, Box<Tree>) }
+
+        pub open spec fn tsize(t: Tree) -> nat
+            decreases t
+        {
+            match t { Tree::Leaf(_v) => 1, Tree::Node(a, b) => tsize(*a) + tsize(*b) }
+        }
+
+        pub open spec fn head_size(t: Tree) -> nat {
+            match t {
+                Tree::Leaf(_v) => 0,
+                Tree::Node(l, _r) => { let b = l; tsize(*b) }
+            }
+        }
+
+        proof fn use_head_size(t: Tree) ensures head_size(t) >= 0 by { simp }
+    } => Ok(())
+}
+
+// === structural_decreases: kernel-computable recursive spec fns ===
+// (DESIGN-bootstrap.md W1.5.) The `decide` closer DISCRIMINATES: a
+// WF-compiled def is kernel-inert (decide gets stuck at the derived
+// DecidableEq instance), so this test passes only if the attribute
+// actually emits `termination_by structural` — pinning behavior, not
+// output text.
+
+test_verify_one_file! {
+    #[test] test_structural_decreases_kernel_computes verus_code! {
+        use vstd::prelude::*;
+
+        pub enum Expr {
+            Lit(u64),
+            Add(Box<Expr>, Box<Expr>),
+        }
+
+        #[verifier::structural_decreases]
+        pub open spec fn esize(e: Expr) -> nat
+            decreases e
+        {
+            match e {
+                Expr::Lit(_v) => 1,
+                Expr::Add(a, b) => esize(*a) + esize(*b),
+            }
+        }
+
+        // Compound pin: the Box::new-erasure ctor coercion (the arg
+        // renders `Tactus.Box.mk (Expr.Lit 3)` against the declared
+        // slot) AND structural emission AND kernel computation — the
+        // `decide` closer reduces esize through the Box literal, which
+        // requires all three.
+        proof fn esize_add_computes()
+            ensures esize(Expr::Add(Box::new(Expr::Lit(3)), Box::new(Expr::Lit(4)))) == 2
+        by {
+            decide
+        }
+    } => Ok(())
+}
+
+// Unsupported measure shape (Nat-arith recursion is not structural):
+// the attribute silently falls back to WF emission — visible in the
+// artifact's termination_by line — and the fn still verifies; never a
+// hard failure.
+test_verify_one_file! {
+    #[test] test_structural_decreases_nat_fallback verus_code! {
+        #[verifier::structural_decreases]
+        pub open spec fn tri(n: nat) -> nat
+            decreases n
+        {
+            if n == 0 { 0 } else { n + tri((n - 1) as nat) }
+        }
+
+        proof fn tri_zero()
+            ensures tri(0) == 0
+        by {
+            simp [tri]
+        }
+    } => Ok(())
+}
+
 // === Basic: spec fn + proof fn with omega ===
 
 test_verify_one_file! {
@@ -349,6 +458,26 @@ test_verify_one_file! {
             h.v
         }
     } => Ok(())
+}
+
+// Exec islands previously DROPPED Lean sorry warnings entirely
+// (`Success {{ warnings }}` carried only emission warnings) — a sorry
+// in an exec fn's tactic body verified with zero signal in every
+// mode, and exec fns are never covered by the Link gate. Now fatal,
+// same rule as proof islands.
+test_verify_one_file! {
+    #[test] test_exec_island_sorry_fatal verus_code! {
+        fn get_one() -> (r: u64)
+            ensures r >= 1
+        {
+            proof { sorry }
+            1
+        }
+    } => Err(err) => {
+        assert!(err.errors.iter().any(|d| d.message.contains("sorry is fatal on the per-fn path")),
+            "exec island sorry must be fatal; got: {:?}",
+            err.errors.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
 }
 
 // Attr-less exec fn, Lean-tactic assert-by. `intros; assumption` is not
@@ -10454,7 +10583,15 @@ test_verify_one_file! {
                 admit
             }
         }
-    } => Ok(())
+    } => Err(err) => {
+        // `admit` lowers to Lean `sorry` — a soundness escape hatch.
+        // History: silent pass → warning (M5 review arc) → FATAL on
+        // the island path (island cache arc): islands have no Link
+        // gate behind them, so the warning layer was the ONLY layer.
+        assert!(err.errors.iter().any(|d| d.message.contains("sorry is fatal on the per-fn path")),
+            "admit/sorry must fail on the island path; got: {:?}",
+            err.errors.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
 }
 
 // Coverage (C5): empty trait. `trait Marker {}` with no methods —
@@ -11634,7 +11771,7 @@ test_verify_one_file! {
         pub fn is_pair_exec(s1: &Sym, s2: &Sym) -> (out: bool)
             ensures out == is_pair_spec(*s1, *s2),
         {
-            proof { simp_all [test_crate.is_pair_spec] }
+            proof { cases h1 : s1.deref <;> cases h2 : s2.deref <;> simp_all [test_crate.is_pair_spec] }
             match (s1, s2) {
                 (Sym::Gen(i), Sym::Inv(j)) => *i == *j,
                 _ => false,
@@ -13222,6 +13359,252 @@ test_verify_one_file! {
             exact h
         }
     } => Ok(())
+}
+
+// Package emission smoke (DESIGN-emit-module.md M2): the same helper
+// chain with `--tactus-emit-module` on. Islands stay the checking
+// authority (this asserts the chain still verifies); the flag
+// additionally writes the Stmts module + per-fn pkg/ Proofs modules
+// with hypothesis binders — a panic anywhere in that path fails this
+// test. Artifact-level assertions land with M4's check wiring.
+test_verify_one_file_with_options! {
+    #[test] test_proof_fn_package_emission_smoke ["tactus-emit-module"] => verus_code! {
+        spec fn double(n: nat) -> nat { n + n }
+
+        proof fn lemma_a(n: nat) ensures double(n) >= 0 by { unfold double; omega }
+
+        proof fn lemma_b(n: nat) ensures double(n) >= 0 by {
+            have h := lemma_a n
+            exact h
+        }
+
+        proof fn lemma_c(n: nat) ensures double(n) >= 0 by {
+            have h := lemma_b n
+            exact h
+        }
+    } => Ok(())
+}
+
+// Package-check smoke (M5a, DESIGN-emit-module.md §M5): tactic proof
+// fns verify via their package modules instead of islands. Same chain
+// as the emission smoke; a failure anywhere in the package route
+// (emission, olean build, Link gate) fails this test.
+test_verify_one_file_with_options! {
+    #[test] test_proof_fn_package_check_smoke ["tactus-package-check"] => verus_code! {
+        spec fn double(n: nat) -> nat { n + n }
+
+        proof fn lemma_a(n: nat) ensures double(n) >= 0 by { unfold double; omega }
+
+        proof fn lemma_b(n: nat) ensures double(n) >= 0 by {
+            have h := lemma_a n
+            exact h
+        }
+    } => Ok(())
+}
+
+// M5 headline: mutual tactic proof fns FAIL island verification
+// (forward references — pinned by the 8-error observation in
+// DESIGN-emit-module.md §M3.5) but VERIFY under package-check, where
+// the SCC emits as one `mutual … end` module. This is the first shape
+// package-check verifies that islands cannot.
+test_verify_one_file_with_options! {
+    #[test] test_proof_fn_package_check_mutual_green ["tactus-package-check"] => verus_code! {
+        spec fn dbl(n: nat) -> nat { n + n }
+
+        proof fn lemma_even(n: nat)
+            ensures dbl(n) >= 0
+            decreases n
+        by {
+            match n with
+            | 0 => omega
+            | k + 1 =>
+              have h := lemma_odd k
+              omega
+        }
+
+        proof fn lemma_odd(n: nat)
+            ensures dbl(n) + 1 >= 1
+            decreases n
+        by {
+            match n with
+            | 0 => omega
+            | k + 1 =>
+              have h := lemma_even k
+              omega
+        }
+    } => Ok(())
+}
+
+// Review finding (warning-surfacing): `sorry` in a tactic body under
+// package-check elaborates (Lean treats it as a warning) but must not
+// pass silently — the fn-level check surfaces the warning, and the
+// Link gate's #tactus_check_axioms makes sorryAx FATAL, failing the
+// run. Layered defense, both layers pinned here.
+test_verify_one_file_with_options! {
+    #[test] test_proof_fn_package_check_sorry_caught ["tactus-package-check"] => verus_code! {
+        spec fn double(n: nat) -> nat { n + n }
+
+        proof fn lemma_a(n: nat) ensures double(n) >= 0 by { unfold double; omega }
+
+        proof fn lemma_sneaky(n: nat) ensures double(n) >= n by { sorry }
+    } => Err(err) => {
+        // Per-fn sorry fatality (uniform island/pkg rule) preempts the
+        // Link gate on the live path; the gate remains the CACHED-verdict
+        // backstop (a warm-cache e2e pin for that is future work).
+        assert!(err.errors.iter().any(|d| d.message.contains("sorry is fatal") || d.message.contains("contains sorry")),
+            "the Link gate must reject sorryAx in the closure; got: {:?}",
+            err.errors.iter().map(|d| &d.message).collect::<Vec<_>>());
+        // The fn-level signal is now the FATAL error itself (uniform
+        // per-fn sorry rule) — the formatted message carries Lean's
+        // "declaration uses 'sorry'" text.
+        assert!(err.errors.iter().any(|d| d.message.contains("declaration uses 'sorry'")),
+            "the fn-level check must surface the sorry warning; got: {:?}",
+            err.warnings.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+}
+
+// M6.2 headline: EXEC fns verify via package modules. The crate has a
+// tactic proof fn helper + two exec fns (one citing the helper from a
+// bare assert-by); under package-check the exec obligations emit as
+// pkg/ modules importing the exec defs family + stmt modules, with the
+// helper arriving as a hypothesis binder (named by short name, typed
+// by its statement def) — the island's global theorem becomes a local
+// hypothesis and the tactic text elaborates unchanged.
+test_verify_one_file_with_options! {
+    #[test] test_exec_package_check_smoke ["tactus-package-check"] => verus_code! {
+        use vstd::prelude::*;
+
+        pub open spec fn sum_all(s: Seq<u8>) -> nat
+            decreases s.len(),
+        {
+            if s.len() == 0 {
+                0
+            } else {
+                s.first() as nat + sum_all(s.drop_first())
+            }
+        }
+
+        pub proof fn lemma_sum_nonneg(s: Seq<u8>)
+            ensures sum_all(s) >= 0
+            by { exact Nat.zero_le _ }
+
+        #[verifier::tactus_auto]
+        pub fn first_or_zero(v: &Vec<u8>) -> (r: u8)
+            ensures v@.len() > 0 ==> r == v@[0],
+        {
+            if v.len() > 0 { v[0] } else { 0 }
+        }
+
+        #[verifier::tactus_auto]
+        pub fn sum_is_small(v: &Vec<u8>) -> (r: bool)
+            ensures r,
+        {
+            assert(sum_all(v@) >= 0) by { exact lemma_sum_nonneg _ };
+            // Option B fully-qualified citation: island texts must use
+            // the global dotted name; the package emitter bridges it
+            // onto the short-named hypothesis binder.
+            assert(sum_all(v@) + 1 >= 1) by {
+                have h := test_crate.lemma_sum_nonneg (test_crate.view.View.view v)
+                omega
+            };
+            true
+        }
+    } => Ok(())
+}
+
+// C-2/M6.3 soundness pin: exec obligations are Link-gated. A sorry in
+// an exec tactic text is a WARNING at fn level (proof-fn parity) and
+// the package gate's #tactus_check_axioms closure — which now contains
+// the exec closed forms — rejects it fatally.
+test_verify_one_file_with_options! {
+    #[test] test_exec_package_check_sorry_fatal ["tactus-package-check"] => verus_code! {
+        use vstd::prelude::*;
+
+        pub open spec fn sum_all(s: Seq<u8>) -> nat
+            decreases s.len(),
+        {
+            if s.len() == 0 {
+                0
+            } else {
+                s.first() as nat + sum_all(s.drop_first())
+            }
+        }
+
+        pub proof fn lemma_sum_nonneg(s: Seq<u8>)
+            ensures sum_all(s) >= 0
+            by { exact Nat.zero_le _ }
+
+        #[verifier::tactus_auto]
+        pub fn sum_is_small(v: &Vec<u8>) -> (r: bool)
+            ensures r,
+        {
+            assert(sum_all(v@) >= 0) by { sorry };
+            true
+        }
+    } => Err(err) => {
+        assert!(err.errors.iter().any(|d| d.message.contains("sorry")),
+            "the Link gate must reject sorryAx in the exec closure; got: {:?}",
+            err.errors.iter().map(|d| &d.message).collect::<Vec<_>>());
+        // The fn-level signal is now the FATAL error itself (uniform
+        // per-fn sorry rule) — the formatted message carries Lean's
+        // "declaration uses 'sorry'" text.
+        assert!(err.errors.iter().any(|d| d.message.contains("declaration uses 'sorry'")),
+            "the fn-level check must surface the sorry warning; got: {:?}",
+            err.warnings.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+}
+
+// M5b: per-member attribution inside a failing mutual module. The
+// broken member's error is region-attributed and span-mapped through
+// the shared diagnostics chokepoint ("Lean tactic failed for
+// lemma_odd"); the clean member fails too (mutual members verify as a
+// unit) but with an explicit partner-attribution message.
+test_verify_one_file_with_options! {
+    #[test] test_proof_fn_package_check_mutual_attribution ["tactus-package-check"] => verus_code! {
+        spec fn dbl(n: nat) -> nat { n + n }
+
+        proof fn lemma_even(n: nat)
+            ensures dbl(n) >= 0
+            decreases n
+        by {
+            match n with
+            | 0 => omega
+            | k + 1 =>
+              have h := lemma_odd k
+              omega
+        }
+
+        proof fn lemma_odd(n: nat)
+            ensures dbl(n) >= 1  // false for n = 0 — this member breaks
+            decreases n
+        by {
+            match n with
+            | 0 => omega
+            | k + 1 =>
+              have h := lemma_even k
+              omega
+        }
+    } => Err(err) => {
+        let msgs: Vec<&String> = err.errors.iter().map(|d| &d.message).collect();
+        assert!(msgs.iter().any(|m| m.contains("Lean tactic failed for lemma_odd")),
+            "broken member must get region-attributed diagnostics; got: {:?}", msgs);
+        assert!(msgs.iter().any(|m| m.contains("mutual members verify as a unit")
+                && m.contains("lemma_odd")),
+            "clean member must get the partner-attribution message; got: {:?}", msgs);
+    }
+}
+
+// Package-check must REJECT a failing tactic (errors can't slip
+// through the package route) and the diagnostic goes through the
+// same source-map pipeline as islands.
+test_verify_one_file_with_options! {
+    #[test] test_proof_fn_package_check_failing_tactic ["tactus-package-check"] => verus_code! {
+        proof fn bogus(n: nat) ensures n >= 1 by { omega }
+    } => Err(err) => {
+        assert!(err.errors.iter().any(|d| d.message.contains("Lean tactic failed for bogus")),
+            "package-check failure must go through the shared diagnostics pipeline; got: {:?}",
+            err.errors.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
 }
 
 // A `--` comment in a proof fn's body that merely *mentions* its caller

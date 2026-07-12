@@ -10,9 +10,12 @@
 //! resolve from the per-fn SST; fns using `broadcast use` fall back to
 //! standalone emission entirely).
 //!
-//! Flag-gated because tiny crates LOSE: the defs build (~1.3s+)
-//! outweighs its savings when the spec world is a few lines — i.e.,
-//! most e2e test crates. Real multi-fn crates opt in.
+//! Always on, whatever the crate size: tiny crates pay a defs build
+//! (~1.3s cold) that sharing doesn't strictly repay, but every crate
+//! goes through the SAME pipeline — no size heuristic silently
+//! switching behavior underfoot. Warm runs hit the content-keyed
+//! defs memo and cross-run caches, so the cost is a cold-run-only
+//! constant.
 //!
 //! One process verifies one crate; the defs render/build is memoized
 //! per crate name. `check_*` calls [`for_crate`] with `build: true`
@@ -33,8 +36,18 @@ use crate::to_lean_fn::LeanSourceMap;
 use crate::to_lean_type::sanitize;
 
 pub struct CrateDefs {
-    /// Lean module name: `TactusDefs_{sanitized crate name}`.
+    /// Lean module name: `TactusDefs_{scope}`.
     pub module_name: String,
+    /// The scope string (`{crate}_{fingerprint}`) the module name is
+    /// built from — sibling modules (Stmts/Link) derive their names
+    /// from this instead of string surgery on `module_name` (M5d-0).
+    pub scope: String,
+    /// Whether any defs part was rebuilt NON-superset this run (M5e):
+    /// consumers (stmt/pkg oleans) may skip re-elaboration across runs
+    /// only when this is false — a pure append (old declarations all
+    /// present, identical, in order) cannot invalidate a consumer
+    /// olean, but any other change can.
+    pub breaking: bool,
     /// Whether exec-fn dep closures are included. `false` after the
     /// proof-roots-only retry (see `build_defs`): exec fns then emit
     /// standalone, while the proofs batch — whose spec needs are a
@@ -59,7 +72,7 @@ pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::SeqCst);
 }
 
-/// `None` = standalone emission (flag off, gate not met, or defs build
+/// `None` = standalone emission (flag off, or defs build
 /// failed — every caller treats `None` as "emit the full preamble per
 /// file", today's behavior).
 type Memo = Mutex<std::collections::HashMap<String, Option<Arc<CrateDefs>>>>;
@@ -76,7 +89,7 @@ static MEMO: OnceLock<Memo> = OnceLock::new();
 /// one shared defs/batch; per-bucket inputs → per-bucket artifacts,
 /// each self-consistent. The hash also suffixes the Lean module/file
 /// names so bucket artifacts coexist in the crate dir.
-fn scope_key(
+pub(crate) fn scope_key(
     crate_name: &str,
     krate: &KrateX,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
@@ -93,11 +106,25 @@ fn scope_key(
     format!("{}_{:08x}", sanitize(crate_name), h.finish() as u32)
 }
 
+/// Which verification path is asking for defs. Proof-path callers
+/// always receive the verifier's full `vir_crate` (verified:
+/// verifier.rs check_proof_fn), so in package-check mode their scope
+/// can be the STABLE crate name — file names survive appends, and the
+/// `up_to_date` compare turns into real cross-run incrementality. The
+/// exec path receives `simplified_krate` (a second legitimate scope)
+/// and keeps the content fingerprint so the two can never collide.
+#[derive(Clone, Copy, PartialEq)]
+pub enum ScopeKind {
+    Proof,
+    Exec,
+}
+
 pub fn for_crate(
     krate: &KrateX,
     crate_name: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
     build: bool,
+    kind: ScopeKind,
 ) -> Option<Arc<CrateDefs>> {
     if !ENABLED.load(Ordering::SeqCst) {
         return None;
@@ -108,13 +135,36 @@ pub fn for_crate(
     // panicked, the map is still structurally valid (worst case: a
     // missing entry that gets rebuilt) — don't cascade the panic to
     // every other bucket.
-    let scope = scope_key(crate_name, krate, tactic_bodies);
+    let scope = if crate::generate::package_check_enabled() {
+        // Stable names for BOTH scopes (M5d-3 gave Proof; the exec
+        // family joining makes island .lean text append-stable too —
+        // fingerprint scopes rename the defs dir on any crate change,
+        // churning every island's import line). `_exec` suffix keeps
+        // the two families from colliding on one module name.
+        match kind {
+            ScopeKind::Proof => sanitize(crate_name),
+            ScopeKind::Exec => format!("{}_exec", sanitize(crate_name)),
+        }
+    } else {
+        // The kind is part of the scope identity in EVERY mode: the
+        // two kinds build different content with different ladders,
+        // and on small crates the proof/exec krates can hash
+        // identically — a shared memo entry would serve one kind a
+        // defs the other's consumers must reject (covers_exec
+        // filter), starving exec islands of accessors.
+        match kind {
+            ScopeKind::Proof => scope_key(crate_name, krate, tactic_bodies),
+            ScopeKind::Exec => {
+                format!("{}_exec", scope_key(crate_name, krate, tactic_bodies))
+            }
+        }
+    };
     let mut map = memo.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(cached) = map.get(&scope) {
         return cached.clone();
     }
     let result = guard_build("defs module", crate_name, || {
-        build_defs(krate, crate_name, &scope, tactic_bodies, build)
+        build_defs(krate, crate_name, &scope, tactic_bodies, build, kind)
     });
     map.insert(scope, result.clone());
     result
@@ -153,6 +203,7 @@ fn build_defs(
     scope: &str,
     tactic_bodies: &std::collections::HashMap<Fun, String>,
     build: bool,
+    kind: ScopeKind,
 ) -> Option<Arc<CrateDefs>> {
     if std::env::var_os("TACTUS_VERBOSE").is_some() {
         let execs = krate.functions.iter()
@@ -162,18 +213,13 @@ fn build_defs(
             "tactus: build_defs scope `{}`: tactic_bodies {}, exec(with body) {}, krate fns {}",
             scope, tactic_bodies.len(), execs, krate.functions.len());
     }
-    // Gate: sharing pays only when ≥2 checked fns split the defs cost.
-    // Proof fns with tactic bodies are each checked; exec-fn count is
-    // an over-approximation (mode + body present) — over-counting just
-    // risks one unprofitable defs build, never incorrectness.
-    let exec_roots: Vec<&FunctionX> = krate.functions.iter()
-        .map(|f| &f.x)
-        .filter(|f| matches!(f.mode, vir::ast::Mode::Exec) && f.body.is_some())
-        .collect();
-    if tactic_bodies.len() + exec_roots.len() < 2 {
-        return None;
-    }
-
+    // No size gate: every crate builds its defs module, however small.
+    // A ≥2-checked-fns threshold used to skip the build for tiny crates
+    // (the ~1.3s defs build outweighs sharing there), but a heuristic
+    // that silently switches which pipeline a crate gets is worse than
+    // the second it saves — predictability over the micro-win
+    // (2026-07-12, Danielle). Cross-run content-keyed caching keeps the
+    // repeated cost near zero anyway.
     // Same krate transform + ambient tables the per-fn emit paths
     // apply — the defs render must agree with the fn files that import
     // it. Deterministic, so the content-compare below is stable.
@@ -197,7 +243,17 @@ fn build_defs(
         .map(|f| &f.x)
         .filter(|f| {
             matches!(f.mode, vir::ast::Mode::Proof)
-                && tactic_bodies.contains_key(&f.name)
+                && (tactic_bodies.contains_key(&f.name)
+                    // WP-routed proof fns: a Verus-code body with no
+                    // tactic block still lowers to WP obligations whose
+                    // stmt defs reference the fn's spec world — it must
+                    // be a dep-walk root like any tactic fn (surfaced
+                    // when the defs size gate was removed: an
+                    // empty-body proof fn's contract referenced spec
+                    // fns absent from the defs module). Over-inclusion
+                    // only widens the walk; bodyless externals stay
+                    // out.
+                    || f.body.is_some())
         })
         .collect();
     let exec_roots: Vec<&FunctionX> = inlined_krate.functions.iter()
@@ -231,50 +287,421 @@ fn build_defs(
     // axiom dragged down is the case for the iterative-repair build
     // (drop only the erroring item by line attribution; CRATEDEFS
     // follow-ups) — not yet needed at current Lean-path populations.
-    let attempts: [(&[&FunctionX], bool, bool, bool); 3] = [
-        (&full_roots, !exec_roots.is_empty(), true, true),
-        (&proof_roots, false, false, true),
-        (&proof_roots, false, false, false),
-    ];
-    let mut prev: Option<(usize, bool, bool)> = None;
-    for (attempt, &(roots, emit_accessors, covers_exec, with_bc_union)) in attempts.iter().enumerate() {
-        // Emit-lean mode never runs Lean, so there's nothing to learn
-        // from later attempts — just emit attempt 1 and return.
-        if attempt > 0 && !build {
-            break;
-        }
-        // Skip an attempt identical to the previous one (no exec roots
-        // ⇒ full == proof; the union flag is the only remaining axis).
-        if let Some((plen, pcov, punion)) = prev {
-            if roots.len() == plen && covers_exec == pcov && with_bc_union == punion {
-                continue;
+    // Kind-specific ladders (M6.1b — re-landed after the dual-krate
+    // change unified the render worlds; the shape-coupling hazard that
+    // reverted the first attempt is gone because BOTH scopes now
+    // render spec fns from the vir krate):
+    //
+    // Exec scope: exec coverage or nothing. A narrower rung renders
+    // proof-roots content the consumer gate (`covers_exec` filter in
+    // check_exec_fn) can never import — building it was the
+    // "double defs family" dead weight. Accessors stay ON when exec
+    // roots exist: obligation bodies are SST/accessor-shaped even
+    // though spec-fn bodies are match-shaped.
+    //
+    // Proof scope: consumers never need exec coverage, so the old
+    // full-roots attempt was a guaranteed-wasted elaboration on every
+    // cold run — start at the proof rung.
+    // WP-routed proof fns (Verus-code body, no tactic block) lower
+    // through the SAME SST/accessor-shaped path as exec obligations —
+    // their stmt defs reference `isSome`/`<Variant>_valN` accessors,
+    // so accessor emission must not key on exec roots alone (surfaced
+    // when the defs size gate was removed).
+    let wp_routed_proof_present = inlined_krate.functions.iter().any(|f| {
+        matches!(f.x.mode, vir::ast::Mode::Proof)
+            && f.x.body.is_some()
+            && !tactic_bodies.contains_key(&f.x.name)
+    });
+    let attempts: Vec<(&[&FunctionX], bool, bool, bool)> = match kind {
+        ScopeKind::Exec => vec![
+            (&full_roots, !exec_roots.is_empty() || wp_routed_proof_present, true, true),
+        ],
+        ScopeKind::Proof => vec![
+            (&proof_roots, wp_routed_proof_present, false, true),
+            (&proof_roots, false, false, false),
+        ],
+    };
+    // Ladder sidecar (`<scope>.ladder`): which attempt won last run,
+    // the winner's content hash, and the toolchain fingerprint. A
+    // failing attempt is EXPENSIVE (a full defs elaboration that
+    // errors) and was re-paid every run — with the sidecar, warm runs
+    // jump straight to the recorded winner; its unchanged render then
+    // rides the content-compare skip, so nothing elaborates at all.
+    // If the winner's render CHANGED, the krate changed: restart the
+    // full ladder (an earlier, broader attempt might now succeed).
+    let ladder_path = crate::generate::lean_out_root()
+        .join(sanitize(crate_name))
+        .join(format!("{}.ladder", scope));
+    let fp = crate::project::ladder_fingerprint();
+    let mut recorded: Option<(usize, String)> = if build {
+        std::fs::read_to_string(&ladder_path).ok().and_then(|t| {
+            // `v1 ` format version prefix (M6.2 fold-in): unversioned
+            // or future-versioned records read as absent → full
+            // ladder retry, which is always safe.
+            let mut it = t.split_whitespace();
+            if it.next() != Some("v1") {
+                return None;
             }
-        }
-        prev = Some((roots.len(), covers_exec, with_bc_union));
-        match render_and_build(
+            match (it.next(), it.next(), it.next()) {
+                (Some(a), Some(h), Some(f)) if f == fp => {
+                    a.parse::<usize>().ok().map(|a| (a, h.to_string()))
+                }
+                _ => None,
+            }
+        })
+    } else {
+        None
+    };
+    // Total-failure record: `FAILED <h1> <h2> <h3> <fp>` — per-attempt
+    // render hashes from the run where every attempt failed. Renders
+    // are cheap and deterministic; when they all match, re-running the
+    // ladder would fail identically, so skip it (islands fall back to
+    // standalone emission exactly as they did that run). Any changed
+    // render → full retry (broader coverage might now elaborate).
+    let render_hash_only = |roots: &[&FunctionX], emit_accessors: bool,
+                            covers_exec: bool, with_bc_union: bool| -> Option<String> {
+        render_and_build(
             &inlined_krate, &ectx, crate_name, scope, roots,
-            emit_accessors, covers_exec, with_bc_union, build,
-        ) {
-            Ok(defs) => return Some(Arc::new(defs)),
-            Err(e) => {
-                let stage = match (covers_exec, with_bc_union) {
-                    (true, _) => "full roots",
-                    (false, true) => "proof roots + broadcast union",
-                    (false, false) => "proof roots, no union",
-                };
-                let next = if attempt + 1 < attempts.len() && build {
-                    "retrying narrower"
-                } else {
-                    "falling back to standalone emission"
-                };
-                eprintln!(
-                    "tactus: defs module build failed for crate `{}` ({}) — {}\n{}",
-                    crate_name, stage, next, e,
-                );
+            emit_accessors, covers_exec, with_bc_union, false, true,
+        ).ok().map(|(_, h)| h)
+    };
+    if build {
+        if let Some(t) = std::fs::read_to_string(&ladder_path).ok() {
+            let parts: Vec<&str> = t.split_whitespace().collect();
+            if parts.len() == 3 + attempts.len()
+                && parts[0] == "v1"
+                && parts[1] == "FAILED"
+                && parts[parts.len() - 1] == fp
+            {
+                let all_match = attempts.iter().enumerate().all(|(i, &(r, ea, ce, bu))| {
+                    render_hash_only(r, ea, ce, bu).as_deref() == Some(parts[2 + i])
+                });
+                if all_match {
+                    return None;
+                }
             }
         }
     }
-    None
+    'ladder: loop {
+        let mut prev: Option<(usize, bool, bool)> = None;
+        for (attempt, &(roots, emit_accessors, covers_exec, with_bc_union)) in attempts.iter().enumerate() {
+            // Emit-lean mode never runs Lean, so there's nothing to learn
+            // from later attempts — just emit attempt 1 and return.
+            if attempt > 0 && !build {
+                break;
+            }
+            if let Some((win, _)) = &recorded {
+                if attempt < *win {
+                    continue; // known-failing attempt from last run
+                }
+            }
+            // Skip an attempt identical to the previous one (no exec roots
+            // ⇒ full == proof; the union flag is the only remaining axis).
+            if let Some((plen, pcov, punion)) = prev {
+                if roots.len() == plen && covers_exec == pcov && with_bc_union == punion {
+                    continue;
+                }
+            }
+            prev = Some((roots.len(), covers_exec, with_bc_union));
+            match render_and_build(
+                &inlined_krate, &ectx, crate_name, scope, roots,
+                emit_accessors, covers_exec, with_bc_union, build, false,
+            ) {
+                Ok((defs, content_hash)) => {
+                    if let Some((win, h)) = &recorded {
+                        if attempt == *win && *win > 0 && *h != content_hash {
+                            recorded = None;
+                            continue 'ladder;
+                        }
+                    }
+                    if build {
+                        let _ = std::fs::create_dir_all(
+                            ladder_path.parent().expect("ladder path has a parent"));
+                        let _ = std::fs::write(
+                            &ladder_path, format!("v1 {} {} {}\n", attempt, content_hash, fp));
+                    }
+                    return Some(Arc::new(defs));
+                }
+                Err(e) => {
+                    let stage = match (covers_exec, with_bc_union) {
+                        (true, _) => "full roots",
+                        (false, true) => "proof roots + broadcast union",
+                        (false, false) => "proof roots, no union",
+                    };
+                    let next = if attempt + 1 < attempts.len() && build {
+                        "retrying narrower"
+                    } else {
+                        "falling back to standalone emission"
+                    };
+                    eprintln!(
+                        "tactus: defs module build failed for crate `{}` ({}) — {}\n{}",
+                        crate_name, stage, next, e,
+                    );
+                }
+            }
+        }
+        if build {
+            let hashes: Vec<String> = attempts.iter()
+                .map(|&(r, ea, ce, bu)| {
+                    render_hash_only(r, ea, ce, bu).unwrap_or_else(|| "render-error".to_string())
+                })
+                .collect();
+            let _ = std::fs::create_dir_all(
+                ladder_path.parent().expect("ladder path has a parent"));
+            let _ = std::fs::write(
+                &ladder_path, format!("v1 FAILED {} {}\n", hashes.join(" "), fp));
+        }
+        return None;
+    }
+}
+
+/// M5d-3 partition plan over the tagged spec-world stream. Pure and
+/// deterministic: same stream -> same plan -> byte-same files (the
+/// `up_to_date` content-compare depends on this).
+///
+/// The rule (stated here once, and in every generated file header):
+/// - BASE: datatypes, classes, instances, and every spec fn an
+///   instance transitively needs (so instances never reach forward).
+/// - One part per source module (SCC-merged when module-level cycles
+///   arise from the projection): the remaining spec-fn groups.
+/// - UMBRELLA (keeps the `TactusDefs_<scope>` name, so consumers are
+///   untouched): imports every part, then carries proof-method
+///   classes + broadcast axioms — both emitted last and referenced
+///   only from outside defs.
+struct DefsPartition {
+    /// Command indices (into the item stream) per destination.
+    base: Vec<usize>,
+    /// (part name suffix, item indices, imported part suffixes) in
+    /// build (topological) order.
+    parts: Vec<(String, Vec<usize>, Vec<String>)>,
+    umbrella: Vec<usize>,
+}
+
+fn module_suffix(f: &Fun) -> String {
+    let segs = &f.path.segments;
+    if segs.len() <= 1 {
+        return "root".to_string();
+    }
+    segs[..segs.len() - 1].iter()
+        .map(|s| sanitize(s))
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn plan_partition(
+    n_cmds: usize,
+    segs: &[(usize, crate::generate::DefsSeg)],
+) -> DefsPartition {
+    use crate::generate::DefsSeg;
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+    // Expand segments into (range, tag) pairs.
+    let mut ranges: Vec<(std::ops::Range<usize>, &DefsSeg)> = Vec::new();
+    for (i, (start, tag)) in segs.iter().enumerate() {
+        let end = segs.get(i + 1).map(|(s, _)| *s).unwrap_or(n_cmds);
+        ranges.push((*start..end, tag));
+    }
+
+    // fn -> group id, per-group data (module, refs, indices).
+    let mut fn_group: HashMap<&Fun, usize> = HashMap::new();
+    let mut groups: Vec<(String, &Vec<Fun>, &Vec<Fun>, Vec<usize>)> = Vec::new();
+    for (range, tag) in &ranges {
+        if let DefsSeg::FnGroup { fns, refs } = tag {
+            let gid = groups.len();
+            for f in fns.iter() {
+                fn_group.insert(f, gid);
+            }
+            let module = fns.first().map(module_suffix)
+                .unwrap_or_else(|| "root".to_string());
+            groups.push((module, fns, refs, range.clone().collect()));
+        }
+    }
+
+    // Base pull: fns any instance needs, transitively closed over
+    // group refs. Simple worklist — stated rule, no hidden fixpoint.
+    let mut base_groups: HashSet<usize> = HashSet::new();
+    let mut work: Vec<&Fun> = Vec::new();
+    for (_, tag) in &ranges {
+        if let DefsSeg::Instance { prereq_fns } | DefsSeg::ProofClasses { prereq_fns } = tag {
+            work.extend(prereq_fns.iter());
+        }
+    }
+    while let Some(f) = work.pop() {
+        if let Some(&gid) = fn_group.get(f) {
+            if base_groups.insert(gid) {
+                work.extend(groups[gid].2.iter());
+            }
+        }
+    }
+
+    // Module graph over non-base groups (BTree for determinism).
+    let mut module_first_seen: Vec<String> = Vec::new();
+    let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (gid, (module, _, refs, _)) in groups.iter().enumerate() {
+        if base_groups.contains(&gid) {
+            continue;
+        }
+        if !module_first_seen.contains(module) {
+            module_first_seen.push(module.clone());
+        }
+        let e = edges.entry(module.clone()).or_default();
+        for r in refs.iter() {
+            if let Some(&tgid) = fn_group.get(r) {
+                if !base_groups.contains(&tgid) {
+                    let tm = &groups[tgid].0;
+                    if tm != module {
+                        e.insert(tm.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // SCC-merge module cycles (iterative DFS Tarjan, deterministic
+    // over first-appearance order). Merged part name = members joined
+    // in sorted order — visible in the filename, no hidden state.
+    let sccs = tarjan_sccs(&module_first_seen, &edges);
+    let mut module_part: HashMap<String, usize> = HashMap::new();
+    let mut part_names: Vec<String> = Vec::new();
+    for scc in &sccs {
+        let mut names = scc.clone();
+        names.sort();
+        let pname = names.join("__and__");
+        let pid = part_names.len();
+        part_names.push(pname);
+        for m in scc {
+            module_part.insert(m.clone(), pid);
+        }
+    }
+
+    // Part-level imports + item assignment (original order preserved).
+    let mut part_items: Vec<Vec<usize>> = vec![Vec::new(); part_names.len()];
+    let mut part_imports: Vec<BTreeSet<String>> = vec![BTreeSet::new(); part_names.len()];
+    for (gid, (module, _, refs, idxs)) in groups.iter().enumerate() {
+        if base_groups.contains(&gid) {
+            continue;
+        }
+        let pid = module_part[module];
+        part_items[pid].extend(idxs.iter().copied());
+        for r in refs.iter() {
+            if let Some(&tgid) = fn_group.get(r) {
+                if !base_groups.contains(&tgid) {
+                    let tpid = module_part[&groups[tgid].0];
+                    if tpid != pid {
+                        part_imports[pid].insert(part_names[tpid].clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Route the remaining ranges.
+    let mut base: Vec<usize> = Vec::new();
+    let mut umbrella: Vec<usize> = Vec::new();
+    for (range, tag) in &ranges {
+        match tag {
+            DefsSeg::Base | DefsSeg::Instance { .. }
+            | DefsSeg::ProofClasses { .. } => base.extend(range.clone()),
+            DefsSeg::BcAxiom => umbrella.extend(range.clone()),
+            DefsSeg::FnGroup { fns, .. } => {
+                let gid = fns.first().and_then(|f| fn_group.get(f)).copied();
+                if gid.map(|g| base_groups.contains(&g)).unwrap_or(true) {
+                    base.extend(range.clone());
+                }
+                // non-base group indices were assigned above
+            }
+        }
+    }
+
+    // Faithfulness check (transparency = faithfulness): the partition
+    // is a SPLIT — every item command routed exactly once, none
+    // invented, none dropped. Debug builds assert it.
+    #[cfg(debug_assertions)]
+    {
+        let mut seen = vec![0usize; n_cmds];
+        for &i in base.iter().chain(umbrella.iter())
+            .chain(part_items.iter().flatten()) {
+            seen[i] += 1;
+        }
+        assert!(seen.iter().all(|&c| c == 1),
+            "defs partition must route every command exactly once");
+    }
+
+    DefsPartition {
+        base,
+        parts: part_names.into_iter()
+            .zip(part_items)
+            .zip(part_imports)
+            .map(|((n, i), imp)| (n, i, imp.into_iter().collect()))
+            .collect(),
+        umbrella,
+    }
+}
+
+/// Tarjan SCCs over the module graph; result in reverse-topological
+/// order (dependencies first) — exactly the build order we need.
+/// Iterative, deterministic (nodes in first-appearance order, edge
+/// sets are BTreeSets).
+fn tarjan_sccs(
+    nodes: &[String],
+    edges: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+) -> Vec<Vec<String>> {
+    use std::collections::HashMap;
+    let idx_of: HashMap<&str, usize> =
+        nodes.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+    let succ: Vec<Vec<usize>> = nodes.iter()
+        .map(|n| edges.get(n).map(|es| {
+            es.iter().filter_map(|t| idx_of.get(t.as_str()).copied()).collect()
+        }).unwrap_or_default())
+        .collect();
+    let n = nodes.len();
+    let (mut index, mut low, mut on_stack) =
+        (vec![usize::MAX; n], vec![0usize; n], vec![false; n]);
+    let (mut stack, mut sccs): (Vec<usize>, Vec<Vec<String>>) = (Vec::new(), Vec::new());
+    let mut counter = 0usize;
+    for root in 0..n {
+        if index[root] != usize::MAX {
+            continue;
+        }
+        // (node, next-successor position)
+        let mut call: Vec<(usize, usize)> = vec![(root, 0)];
+        while let Some(&mut (v, ref mut pi)) = call.last_mut() {
+            if *pi == 0 {
+                index[v] = counter;
+                low[v] = counter;
+                counter += 1;
+                stack.push(v);
+                on_stack[v] = true;
+            }
+            if let Some(&w) = succ[v].get(*pi) {
+                *pi += 1;
+                if index[w] == usize::MAX {
+                    call.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+            } else {
+                if low[v] == index[v] {
+                    let mut scc = Vec::new();
+                    while let Some(w) = stack.pop() {
+                        on_stack[w] = false;
+                        scc.push(nodes[w].clone());
+                        if w == v {
+                            break;
+                        }
+                    }
+                    scc.reverse();
+                    sccs.push(scc);
+                }
+                let done_low = low[v];
+                call.pop();
+                if let Some(&mut (u, _)) = call.last_mut() {
+                    low[u] = low[u].min(done_low);
+                }
+            }
+        }
+    }
+    sccs
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -288,7 +715,11 @@ fn render_and_build(
     covers_exec: bool,
     with_bc_union: bool,
     build: bool,
-) -> Result<CrateDefs, String> {
+    // Render + hash WITHOUT touching the filesystem (ladder failure-
+    // record checks). The returned CrateDefs is unbuilt scaffolding —
+    // callers use only the hash.
+    hash_only: bool,
+) -> Result<(CrateDefs, String), String> {
     let ns = sanitize(crate_name);
     // Scope-suffixed: per-bucket artifacts coexist (see scope_key).
     let module_name = format!("TactusDefs_{}", scope);
@@ -324,19 +755,67 @@ fn render_and_build(
     let walk_roots: Vec<&FunctionX> = roots.iter().copied()
         .chain(bc_union.iter().copied())
         .collect();
-    cmds.extend(crate::generate::spec_world_cmds(
+    // `head` = everything before the item stream (imports, prelude,
+    // namespace open, options) — replicated per partition part.
+    let head: Vec<Command> = cmds.clone();
+    let (item_cmds, segs) = crate::generate::spec_world_cmds_tagged(
         inlined_krate, ectx, &walk_roots, emit_accessors, &bc_union, true,
-    ));
-    let _ = ns;
+    );
+    cmds.extend(item_cmds.iter().cloned());
 
+    // Content hash of the full rendered stream — the ladder sidecar's
+    // change detector (build_defs): stable across runs because the
+    // render is deterministic. Computed on the SAME text either
+    // render path elaborates (partition is a pure function of it).
     let rendered = crate::lean_pp::pp_commands(&cmds);
+    let content_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        rendered.text.hash(&mut h);
+        // The PARTITION is part of the content identity: a seg-tagging
+        // change moves commands between parts without touching the
+        // monolith text (e.g. the mid-stream axiom-flush placement
+        // fix), and the ladder's success/failure records must not
+        // fast-path over it. Hash the seg boundaries + tags.
+        for (pos, seg) in &segs {
+            pos.hash(&mut h);
+            std::mem::discriminant(seg).hash(&mut h);
+            if let crate::generate::DefsSeg::FnGroup { fns, .. } = seg {
+                for f in fns {
+                    format!("{:?}", f.path).hash(&mut h);
+                }
+            }
+        }
+        format!("{:016x}", h.finish())
+    };
+    if hash_only {
+        return Ok((CrateDefs {
+            module_name, scope: scope.to_string(), covers_exec, dir, cmds,
+            breaking: false,
+        }, content_hash));
+    }
+
+    // Partitioned defs (M5d-3) in package modes: same commands, same
+    // per-chain order, split per source module — `cmds` stays the full
+    // monolith stream so every consumer (sanity concat, debuggers)
+    // sees the SAME world either way.
+    if crate::generate::package_enabled() || crate::generate::package_check_enabled() {
+        return render_partitioned(
+            &module_name, scope, &dir, &ns, covers_exec,
+            cmds, &head, &item_cmds, &segs, build,
+        ).map(|d| (d, content_hash));
+    }
+
     let lean_path = dir.join(format!("{}.lean", module_name));
     let olean_path = dir.join(format!("{}.olean", module_name));
 
     if !build {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         std::fs::write(&lean_path, &rendered.text).map_err(|e| e.to_string())?;
-        return Ok(CrateDefs { module_name, covers_exec, dir, cmds });
+        return Ok((CrateDefs {
+            scope: scope.to_string(), module_name, covers_exec, dir, cmds,
+            breaking: false,
+        }, content_hash));
     }
 
     let up_to_date = olean_path.exists()
@@ -345,7 +824,135 @@ fn render_and_build(
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         build_olean(&dir, &module_name, &rendered.text, &olean_path, &lean_path)?;
     }
-    Ok(CrateDefs { module_name, covers_exec, dir, cmds })
+    // Monolith: any rebuild is conservatively breaking (no manifest).
+    Ok((CrateDefs {
+        module_name, scope: scope.to_string(), covers_exec, dir, cmds,
+        breaking: !up_to_date,
+    }, content_hash))
+}
+
+/// Partitioned defs render + build (M5d-3). Files, in build order:
+/// `<name>__base` (machinery), one `<name>__<module>` per source
+/// module (SCC-merged), and the UMBRELLA under the original
+/// `TactusDefs_<scope>` name (imports all parts + proof classes +
+/// broadcast axioms) — consumers import the umbrella and see the
+/// monolith's exact environment.
+///
+/// Rebuild rule (conservative pre-M5e): a file rebuilds when its
+/// content changed OR any file it imports rebuilt this run — Lean
+/// trusts LEAN_PATH at load time, so a consumer must never pair a
+/// stale olean with a rebuilt dependency.
+#[allow(clippy::too_many_arguments)]
+fn render_partitioned(
+    umbrella_name: &str,
+    scope: &str,
+    dir: &std::path::Path,
+    ns: &str,
+    covers_exec: bool,
+    full_cmds: Vec<Command>,
+    head: &[Command],
+    item_cmds: &[Command],
+    segs: &[(usize, crate::generate::DefsSeg)],
+    build: bool,
+) -> Result<CrateDefs, String> {
+    let plan = plan_partition(item_cmds.len(), segs);
+    // Extra imports go FIRST: the head's prelude block is a multi-line
+    // Raw (import + set_options), so anything after it is no longer in
+    // Lean's import section. Import order is irrelevant; position isn't.
+    let make_file = |header: &str, extra_imports: &[String], items: &[usize]| -> Vec<Command> {
+        let mut cmds: Vec<Command> = Vec::new();
+        cmds.push(Command::Raw(format!(
+            "-- tactus defs part: {} (base = machinery + instance closure; \
+one part per source module, SCC-merged; umbrella = interface)", header)));
+        cmds.extend(extra_imports.iter().map(|m| Command::Import(m.clone())));
+        cmds.extend(head.iter().cloned());
+        cmds.extend(items.iter().map(|&i| item_cmds[i].clone()));
+        // Option B: no namespace wrapper (decls carry full dotted
+        // names), so no close either.
+        cmds
+    };
+
+    let base_name = format!("{}__base", umbrella_name);
+    // (module name, file cmds, imported module names) in build order.
+    let mut files: Vec<(String, Vec<Command>, Vec<String>)> = Vec::new();
+    files.push((base_name.clone(), make_file("base", &[], &plan.base), Vec::new()));
+    for (suffix, items, imports) in &plan.parts {
+        let name = format!("{}__{}", umbrella_name, suffix);
+        let mut imp: Vec<String> = vec![base_name.clone()];
+        imp.extend(imports.iter().map(|i| format!("{}__{}", umbrella_name, i)));
+        files.push((name, make_file(suffix, &imp, items), imp));
+    }
+    let all_parts: Vec<String> = files.iter().map(|(n, _, _)| n.clone()).collect();
+    files.push((
+        umbrella_name.to_string(),
+        make_file("umbrella", &all_parts, &plan.umbrella),
+        all_parts,
+    ));
+
+    // M5e superset waiver: per part, a MANIFEST of one hash per item
+    // command (DefaultHasher — key-stable across runs of one binary).
+    // A rebuild whose old manifest is an order-preserving subsequence
+    // of the new one is an APPEND: old declarations all present,
+    // identical, before any new ones — existing consumer oleans stay
+    // valid (kernel weakening; Lean elaborates top-down, so the old
+    // prefix elaborates in an identical environment). Anything else is
+    // BREAKING, and breaking propagates through imports (Lean imports
+    // are transitive).
+    let cmd_hash = |c: &Command| -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        crate::lean_pp::pp_commands(std::slice::from_ref(c)).text.hash(&mut h);
+        h.finish()
+    };
+    let is_subsequence = |old: &[u64], new: &[u64]| -> bool {
+        let mut it = new.iter();
+        old.iter().all(|o| it.any(|n| n == o))
+    };
+    let mut breaking: std::collections::HashSet<String> = Default::default();
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    for (name, cmds, imports) in &files {
+        let rendered = crate::lean_pp::pp_commands(cmds);
+        let lean_path = dir.join(format!("{}.lean", name));
+        let olean_path = dir.join(format!("{}.olean", name));
+        let manifest_path = dir.join(format!("{}.manifest", name));
+        let new_manifest: Vec<u64> = cmds.iter().map(&cmd_hash).collect();
+        let write_manifest = || -> Result<(), String> {
+            let text: String = new_manifest.iter()
+                .map(|h| format!("{:016x}\n", h)).collect();
+            std::fs::write(&manifest_path, text).map_err(|e| e.to_string())
+        };
+        if !build {
+            std::fs::write(&lean_path, &rendered.text).map_err(|e| e.to_string())?;
+            write_manifest()?;
+            continue;
+        }
+        let import_breaking = imports.iter().any(|i| breaking.contains(i));
+        let content_same = olean_path.exists()
+            && std::fs::read_to_string(&lean_path).ok().as_deref() == Some(&rendered.text);
+        if content_same && !import_breaking {
+            continue; // unchanged, or upstream changes were pure appends
+        }
+        let old_manifest: Option<Vec<u64>> = std::fs::read_to_string(&manifest_path)
+            .ok()
+            .map(|t| t.lines().filter_map(|l| u64::from_str_radix(l, 16).ok()).collect());
+        build_olean(dir, name, &rendered.text, &olean_path, &lean_path)
+            .map_err(|e| format!("defs part `{}`: {}", name, e))?;
+        write_manifest()?;
+        let own_superset = old_manifest
+            .map(|o| is_subsequence(&o, &new_manifest))
+            .unwrap_or(false); // no manifest = first build = breaking
+        if import_breaking || !own_superset {
+            breaking.insert(name.clone());
+        }
+    }
+    Ok(CrateDefs {
+        module_name: umbrella_name.to_string(),
+        scope: scope.to_string(),
+        covers_exec,
+        dir: dir.to_path_buf(),
+        cmds: full_cmds,
+        breaking: !breaking.is_empty(),
+    })
 }
 
 fn build_olean(
@@ -364,11 +971,13 @@ fn build_olean(
     let out_name = format!("{}.olean", module_name);
     std::fs::write(build.join(&src_name), source).map_err(|e| e.to_string())?;
     let existing = std::env::var("LEAN_PATH").unwrap_or_default();
-    let lean_path_env = if existing.is_empty() {
-        prelude_dir.to_string_lossy().into_owned()
-    } else {
-        format!("{}:{}", prelude_dir.to_string_lossy(), existing)
-    };
+    // `dir` is on the path so partitioned defs parts resolve their
+    // sibling imports (base / other parts) — harmless for monoliths.
+    let mut lean_path_env = format!("{}:{}",
+        prelude_dir.to_string_lossy(), dir.to_string_lossy());
+    if !existing.is_empty() {
+        lean_path_env = format!("{}:{}", lean_path_env, existing);
+    }
     let output = std::process::Command::new("lean")
         .args(["-o", &out_name, &src_name])
         .current_dir(&build)
@@ -453,6 +1062,10 @@ impl ProofBatch {
     pub fn emit_output(&self, f: &Fun) -> Option<EmitOutput> {
         let r = self.region(f)?;
         Some(EmitOutput {
+            // --emit-lean sidecar: no Lean run follows and nothing
+            // may cache.
+            first_theorem_line: None,
+            changed: true,
             file_path: self.file_path.clone(),
             source_map: LeanSourceMap::ProofFn {
                 fn_name: r.fn_short.clone(),
@@ -533,7 +1146,7 @@ fn build_batch(
 ) -> Option<Arc<ProofBatch>> {
     // The batch rides the defs module (its theorems resolve the spec
     // world through the import) — defs gate/fallback decisions apply.
-    let defs = for_crate(krate, crate_name, tactic_bodies, build)?;
+    let defs = for_crate(krate, crate_name, tactic_bodies, build, ScopeKind::Proof)?;
 
     let inlined_krate = crate::inline_spec::inline_marked_in_krate(krate);
     crate::generate::install_emit_tables(&inlined_krate, crate_name);

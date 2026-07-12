@@ -216,7 +216,7 @@ pub fn check_lean_file(
 }
 
 /// Parse Lean's JSON diagnostic output (one JSON object per line).
-fn parse_diagnostics(output: &str) -> Vec<LeanDiagnostic> {
+pub(crate) fn parse_diagnostics(output: &str) -> Vec<LeanDiagnostic> {
     output.lines()
         .filter_map(|line| serde_json::from_str(line.trim()).ok())
         .collect()

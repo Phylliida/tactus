@@ -109,6 +109,7 @@ fn earlier_def_is_resolved() {
         ret_ty: var("Nat"),
         body: var("x"),
         termination_by: vec![],
+        termination_structural: false,
         decreasing_by: None,
     };
     let t = Theorem {
@@ -143,6 +144,7 @@ fn let_binder_shadows_reference() {
         })),
     });
     let d = Def {
+        termination_structural: false,
         attrs: vec![], name: "ten".into(), binders: vec![],
         ret_ty: var("Nat"), body, termination_by: vec![],
         decreasing_by: None,
@@ -178,10 +180,12 @@ fn mutual_group_resolves_cross_references() {
     // `mutual def f := g   def g := f end` — would fail without
     // predefining names across the group.
     let d1 = Def {
+        termination_structural: false,
         attrs: vec![], name: "f".into(), binders: vec![], ret_ty: var("Nat"),
         body: var("g"), termination_by: vec![], decreasing_by: None,
     };
     let d2 = Def {
+        termination_structural: false,
         attrs: vec![], name: "g".into(), binders: vec![], ret_ty: var("Nat"),
         body: var("f"), termination_by: vec![], decreasing_by: None,
     };

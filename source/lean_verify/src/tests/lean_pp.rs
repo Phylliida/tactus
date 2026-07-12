@@ -169,6 +169,7 @@ fn simple_def_renders() {
         ret_ty: var("Nat"),
         body: bin(BinOp::Add, var("x"), var("x")),
         termination_by: vec![],
+        termination_structural: false,
         decreasing_by: None,
     };
     let expected = "@[irreducible] noncomputable def double (x : Nat) : Nat :=\n  x + x\n";
@@ -325,6 +326,7 @@ fn termination_by_tuple() {
         ret_ty: var("Nat"),
         body: var("n"),
         termination_by: vec![var("n"), var("m")],
+        termination_structural: false,
         decreasing_by: None,
     };
     let out = pp_command(&Command::Def(d));
@@ -443,7 +445,7 @@ fn span_mark_render_preserves_loc_verbatim() {
         inner: Box::new(inner),
     });
     let mut out = String::new();
-    let mut lm = Landmarks { tactic_starts: Vec::new(), span_marks: Vec::new() };
+    let mut lm = Landmarks { tactic_starts: Vec::new(), span_marks: Vec::new(), theorem_heads: Vec::new() };
     write_expr(&mut out, &marked, 0, &mut lm);
     assert!(
         out.contains(&format!("/- @rust:{} -/", loc)),
