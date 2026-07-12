@@ -115,6 +115,12 @@ Stated up front so nobody discovers it later:
   upstream Verus. Mitigation, not elimination: the snapshot point is LATE
   (post all Verus transforms), so everything after the snapshot is
   certified; everything before is shared, heavily-exercised infrastructure.
+  Additional cheap evidence available whenever wanted: DUAL-BACKEND
+  agreement — the same crate through Verus-Z3 and tactus should produce
+  identical verdicts fn-by-fn; systematic disagreement localizes a frontend
+  or backend fault. (Not a proof — two consumers of one wrong SST agree —
+  but it bounds the single-backend failure class, and the machinery exists
+  today.)
 * **Spec adequacy**: that the written SstSem is the semantics you meant, and
   that the mirror types mean what the SST means (W5f documents this
   judgment; math can't discharge it).
