@@ -21,8 +21,10 @@ before the serializer exists, or the literal shape churns:
 | `Call` | add `dest: u64` binder id + typ leaf | ensures-hypotheses bind the call result |
 | `Ret` | becomes `Ret(Box<LeafList>)` | the obligation is each ensures INSTANTIATED at the returned value — instantiated texts are leaves rendered at the return site |
 | params (FnCtx, §2.1) | each param carries an optional bound-hyp leaf | int-typed params get `h_x_bound` hypotheses (P6/P7); they are leaves, not structure refWp invents |
+| GoalData spine | interleave-faithful: goals fold a SINGLE ordered frame (see §2.1) | three-parallel-lists loses `∀x, h → let y, h2` ordering |
+| typ params | `FnCtxData.typ_params`: (binder id, kind leaf) list; instance binders (`[Nonempty A]`) as ordinary entries with distinguished leaves | polymorphic fns open with `∀ (A : Type) [inst : Nonempty A]` telescopes (P8 island evidence); tgt is generics-heavy — without this the census dies on arrival |
 
-Also new: `FnCtxData` (§2.1) and `BinderList`. Same rules as N2: no mutual
+Also new: `FnCtxData` (§2.1), `BinderList`, and `FrameList`. Same rules as N2: no mutual
 recursion (all new lists are leaf-only or one-way), `structural_decreases`
 everywhere, `decide` sanity proofs extended, tripwire table note updated.
 Estimated: small, one sitting, re-run the N2 acceptance (pkg gate 0 errors).
@@ -58,15 +60,23 @@ FnCtxData = { params: BinderList, param_bounds: LeafList(optional per param),
 
 refWp    : FnCtxData → StmData → GoalList     -- the certificate's LHS
 wpStm    : CtxFrame → StmData → GoalList      -- worker
-CtxFrame = { binders: BinderList, hyps: LeafList, lets: LetList }
+CtxFrame  = FrameList                          -- ONE ordered list
+FrameList = FNil | FBind(id, typ_leaf, tail) | FHyp(leaf, tail)
+          | FLet(id, val_leaf, tail)
 ```
 
-`CtxFrame` mirrors the production walker's frame: the binder telescope,
-accumulated hypothesis leaves, and let-bindings, in order. Every emitted goal
-is the frame folded around an obligation leaf:
-`All*(binders, Imp*(hyps, Let*(lets, Leaf(e))))` — one `GoalData` per
-obligation site, appended in walk order (production theorem order = O4
-pairing).
+`CtxFrame` is a SINGLE ordered entry list, not three parallel lists — the
+production telescope INTERLEAVES binders, hypotheses, and lets (P7's
+loop-maintain and P6's let-in-Prop goals both show `∀ x, h → let y := e;
+h2 → …`), and three separate lists cannot reproduce the interleave order.
+(Review fix 2026-07-12: the first draft of this spec had `{binders, hyps,
+lets}` — a defect caught on inspection, recorded here as a warning to
+future spec-writers: the frame IS the goal spine, so its type must be
+order-faithful.) Every emitted goal is the frame folded entry-by-entry
+around an obligation leaf; one `GoalData` per obligation site, appended in
+walk order (production theorem order = O4 pairing). Binder-id discipline
+under shadowing: every binding OCCURRENCE gets a fresh id (P7's SSA
+shadowing), assigned in walk order by the serializer.
 
 **No higher-order continuations.** spec_fn closures are trigger- and
 kernel-hostile (memory: closure-identity arc). The walker is first-order:
@@ -157,10 +167,17 @@ bug-FINDING deliverable, independent of the W5 soundness proof.
   needs W3's cost numbers and a cache story (cert files content-keyed like
   islands). Not spec'd further here.
 * **W5**: the soundness loop (refWp ⟹ SstSem, authored in tactus) — master
-  plan §5 owns the ladder (W5a fuel big-step semantics first). The W2
-  artifacts it consumes (refWp, mirror types) are exactly what this doc
-  builds; no W5 design debt is created here beyond keeping refWp's equations
-  first-order and structural (already required for kernel computation).
+  plan §5 owns the ladder (W5a fuel big-step semantics first). One design
+  question this review surfaces that the master plan glosses: **a fuel
+  evaluator cannot evaluate opaque leaves**, so W5 over stage-A shapes needs
+  either (a) stage B (deep expressions) landed first — serializing W5 behind
+  W6 and losing the planned parallelism — or (b) a VALUATION-PARAMETRIC
+  semantics: `SstSem` takes a leaf oracle (`LeafId → State → Value`) and
+  `refWp_sound` quantifies over all oracles consistent with the leaf table's
+  typing. (b) preserves parallelism and is the natural reading of "leaves
+  cancel" at the semantic level; it also front-loads the leaf-typing
+  discipline stage B needs anyway. Decide at W5a kickoff; recorded as open
+  question §5.5.
 
 ## 5. Open questions (answer during W2, record here)
 
@@ -176,6 +193,11 @@ bug-FINDING deliverable, independent of the W5 soundness proof.
 4. Overflow-guard asserts: present as SST `Assert` nodes at the snapshot
    (then free) or walker-injected (then refWp must mirror the injection —
    preferably argue for serializing post-injection instead).
+5. W5 leaf semantics: valuation-parametric SstSem vs. deep-exprs-first —
+   see §4; decide at W5a kickoff.
+6. Mutual/SCC exec fns and non-default loop flavors
+   (`invariant_except_break`, `no_unwind` interplay): stage-A exclusions —
+   confirm the serializer rejects them loudly rather than mis-capturing.
 
 ## 6. Sequencing
 
