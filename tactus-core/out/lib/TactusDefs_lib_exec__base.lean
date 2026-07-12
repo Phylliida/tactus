@@ -1,0 +1,47 @@
+-- tactus defs part: base (base = machinery + instance closure; one part per source module, SCC-merged; umbrella = interface)
+import TactusPrelude
+set_option linter.unusedVariables false
+set_option maxHeartbeats 800000
+set_option autoImplicit false
+inductive lib.LeafList where
+  | Nil
+  | Cons (val0 : Int) (val1 : Tactus.Box lib.LeafList)
+  deriving Inhabited
+@[simp] noncomputable def lib.LeafList.height (s : lib.LeafList) : Nat :=
+  match s with | lib.LeafList.Nil => 1 | lib.LeafList.Cons _ val1 => 1 + lib.LeafList.height val1.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
+inductive lib.StmData where
+  | Assert (val0 : Int)
+  | Assume (val0 : Int)
+  | Assign (val0 : Int) (val1 : Int)
+  | Call (reqs : Tactus.Box lib.LeafList) (enss : Tactus.Box lib.LeafList)
+  | DeadEnd (val0 : Tactus.Box lib.StmData)
+  | Ret (val0 : Int)
+  | If (val0 : Int) (val1 : Tactus.Box lib.StmData) (val2 : Tactus.Box lib.StmData)
+  | Loop (invs : Tactus.Box lib.LeafList) (cond : Int) (body : Tactus.Box lib.StmData)
+  | Skip
+  | Seq (val0 : Tactus.Box lib.StmData) (val1 : Tactus.Box lib.StmData)
+  deriving Inhabited
+@[simp] noncomputable def lib.StmData.height (s : lib.StmData) : Nat :=
+  match s with | lib.StmData.Assert _ => 1 | lib.StmData.Assume _ => 1 | lib.StmData.Assign _ _ => 1 | lib.StmData.Call _ _ => 1 | lib.StmData.DeadEnd val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Ret _ => 1 | lib.StmData.If _ val1 val2 => 1 + lib.StmData.height val1.deref + lib.StmData.height val2.deref | lib.StmData.Loop _ _ body => 1 + lib.StmData.height body.deref | lib.StmData.Skip => 1 | lib.StmData.Seq val0 val1 => 1 + lib.StmData.height val0.deref + lib.StmData.height val1.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
+inductive lib.GoalData where
+  | Leaf (val0 : Int)
+  | Imp (val0 : Int) (val1 : Tactus.Box lib.GoalData)
+  | All (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.GoalData)
+  | Let (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.GoalData)
+  deriving Inhabited
+@[simp] noncomputable def lib.GoalData.height (s : lib.GoalData) : Nat :=
+  match s with | lib.GoalData.Leaf _ => 1 | lib.GoalData.Imp _ val1 => 1 + lib.GoalData.height val1.deref | lib.GoalData.All _ _ val2 => 1 + lib.GoalData.height val2.deref | lib.GoalData.Let _ _ val2 => 1 + lib.GoalData.height val2.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
+inductive lib.GoalList where
+  | Nil
+  | Cons (val0 : Tactus.Box lib.GoalData) (val1 : Tactus.Box lib.GoalList)
+  deriving Inhabited
+@[simp] noncomputable def lib.GoalList.height (s : lib.GoalList) : Nat :=
+  match s with | lib.GoalList.Nil => 1 | lib.GoalList.Cons _ val1 => 1 + lib.GoalList.height val1.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)

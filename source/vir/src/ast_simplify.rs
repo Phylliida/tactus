@@ -1252,6 +1252,21 @@ fn add_fndef_axioms_to_function(
     Ok(Spanned::new(function.span.clone(), functionx))
 }
 
+/// True iff `simplify_function` injects the zero-arg `no%param` dummy
+/// for this fn (and the call-site rewrite injects the matching
+/// `Const 0` arg). Exported so downstream renderers that consume the
+/// UNSIMPLIFIED krate (the tactus Lean backend's spec world) can
+/// recognize and drop the injected arg in post-simplify SSTs —
+/// recognizer and injector are the same predicate in the same file.
+pub fn injects_zero_arg_dummy(f: &crate::ast::FunctionX, is_trait_impl: bool) -> bool {
+    f.typ_params.len() == 0
+        && f.params.len() == 0
+        && !matches!(f.item_kind, ItemKind::Const)
+        && !matches!(f.item_kind, ItemKind::Static)
+        && !f.attrs.broadcast_forall
+        && !is_trait_impl
+}
+
 fn simplify_function(
     ctx: &GlobalCtx,
     state: &mut State,
@@ -1321,13 +1336,7 @@ fn simplify_function(
     }
 
     // To simplify the AIR/SMT encoding, add a dummy argument to any function with 0 arguments
-    if functionx.typ_params.len() == 0
-        && functionx.params.len() == 0
-        && !matches!(functionx.item_kind, ItemKind::Const)
-        && !matches!(functionx.item_kind, ItemKind::Static)
-        && !functionx.attrs.broadcast_forall
-        && !is_trait_impl
-    {
+    if injects_zero_arg_dummy(&functionx, is_trait_impl) {
         let paramx = crate::ast::ParamX {
             name: dummy_param_name(),
             typ: Arc::new(TypX::Int(IntRange::Int)),

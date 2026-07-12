@@ -142,6 +142,35 @@ pub(crate) fn needs_param_deref(p: &Param) -> bool {
 /// reference-decorated params: spec_fn_to_ast standalone defs,
 /// trait_impl_to_ast instance method bodies, trait_to_ast class default
 /// bodies, proof_fn_to_ast requires/ensures.
+/// True iff the decreases measure is exactly one bare parameter whose
+/// (decoration-stripped) typ is a user datatype — the shape Lean's
+/// `termination_by structural` accepts: structural (subterm) recursion
+/// on that param, with Lean itself checking each recursive call. Nat/
+/// Int measures (`decreases n` with `(n-1) as nat` recursion) and
+/// computed measures (`decreases len(s) - i`) are NOT structural and
+/// keep WF emission.
+fn structural_measure_is_bare_datatype_param(decrease: &Exprs, params: &Params) -> bool {
+    if decrease.len() != 1 {
+        return false;
+    }
+    let v = match &decrease[0].x {
+        ExprX::ReadPlace(place, _) => match &place.x {
+            PlaceX::Local(v) => v,
+            _ => return false,
+        },
+        ExprX::Var(v) => v,
+        _ => return false,
+    };
+    // UNDECORATED datatype only: a `&Tree`-typed param binds at
+    // `Tactus.Ref Tree` in Lean, and structural inference on a
+    // one-field-structure-wrapped binder is not a shape we've
+    // validated — decorated params keep WF emission (silent, like
+    // every other unsupported measure).
+    params.iter().any(|p| {
+        p.x.name == *v && matches!(&*p.x.typ, TypX::Datatype(..))
+    })
+}
+
 pub(crate) fn wrap_body_with_param_derefs(body: LExpr, params: &Params) -> LExpr {
     // Iterate in REVERSE so the FIRST param's let-binding ends up
     // outermost (after building the wrap by repeatedly prepending).
@@ -166,6 +195,7 @@ pub(crate) fn wrap_body_with_param_derefs(body: LExpr, params: &Params) -> LExpr
 /// Proof fns and exec fns use different mapping mechanisms — the
 /// enum split makes the dichotomy explicit instead of having one
 /// struct with conditionally-meaningful fields.
+#[derive(Clone)]
 pub enum LeanSourceMap {
     /// Proof fns: the user-written tactic body starts at
     /// `tactic_start_line` and runs `tactic_line_count` lines.
@@ -253,6 +283,35 @@ impl LeanSourceMap {
 /// body=None fns out — which produced "unresolved" sanity-check
 /// rejections at the call site. Audit 2026-05-12 unfiltered the map
 /// and routes through `Axiom` here.)
+/// Uninterpreted signature axiom for a spec fn whose BODY has no Lean
+/// form (`BuiltinSpecFun` — closure `call_requires`/`call_ensures`
+/// etc.). Emitting the signature keeps DEPENDENT spec fns renderable
+/// (e.g. vstd's `cloned` references `strictly_cloned`; skipping the
+/// def poisons every reference with unknown-identifier). Restricted
+/// to Prop-returning fns: a Prop-valued function type is inhabited by
+/// `fun … => True`, so the axiom is unconditionally conservative — no
+/// Nonempty premise needed. Non-Prop builtin-bodied fns keep the skip
+/// (their value axiom would need the nonempty machinery's premises).
+pub fn builtin_spec_fn_signature_axiom(
+    f: &FunctionX,
+    ectx: &crate::emit_ctx::EmitCtx,
+) -> Option<Command> {
+    if !matches!(&*f.ret.x.typ, vir::ast::TypX::Bool) {
+        return None;
+    }
+    Some(Command::Axiom(Axiom {
+        name: lean_name(&f.name.path),
+        binders: fn_binders_without_bound_hyps(f, &ectx.unemittable),
+        ret_ty: typ_to_expr(&f.ret.x.typ),
+        attrs: vec![],
+        comment: Some(
+            "uninterpreted: body is a BuiltinSpecFun with no Lean form; \
+             Prop-valued fn types are inhabited, so this is conservative"
+                .to_string(),
+        ),
+    }))
+}
+
 pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Vec<Command> {
     // Spec fns are Lean defs (mathematical definitions). The
     // u-type / i-type refinement bounds belong on theorems
@@ -346,14 +405,24 @@ pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Vec<Com
                     d,
                 )
             }).collect();
+            // `#[verifier::structural_decreases]`: emit
+            // `termination_by structural <param>` (kernel-computable,
+            // axiom-free) when the measure is a bare datatype-typed
+            // param; Lean itself checks that every recursive call
+            // passes a subterm. Unsupported measure shapes fall back
+            // to WF emission with a note — never a hard failure
+            // (DESIGN-bootstrap.md W1.5).
+            let termination_structural = f.attrs.tactus_structural_decreases
+                && !termination_by.is_empty()
+                && structural_measure_is_bare_datatype_param(&f.decrease, &f.params);
             // Recursive spec fns get an explicit `decreasing_by` so measures
             // Lean's default tactic can't discharge (notably the modular
             // `a % b < b` of Euclidean gcd) still verify. Non-recursive defs
             // (empty `termination_by`) get `None` — a bare `decreasing_by`
             // without `termination_by` is a Lean error. See DECREASING_BY_TACTIC.
-            let decreasing_by = (!termination_by.is_empty())
+            let decreasing_by = (!termination_by.is_empty() && !termination_structural)
                 .then(decreasing_by_tactic);
-            vec![Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by, decreasing_by })]
+            vec![Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by, termination_structural, decreasing_by })]
         }
         None => {
             // Transparency: when the fallback DROPPED a body (vs. the fn
@@ -444,6 +513,93 @@ pub fn broadcast_lemma_axiom_cmd(
         ret_ty: goal,
         attrs: Vec::new(),
     })
+}
+
+/// The Lean name of a proof fn's statement def in package emission:
+/// `<lean name>_stmt`. Shared by the Stmts renderer (below), the
+/// hypothesis binders consumers take (M2), and the Link module (M3) —
+/// one chokepoint so the three sites can't disagree on the name.
+pub fn stmt_name(path: &Path) -> String {
+    format!("{}_stmt", lean_name(path))
+}
+
+/// The hypothesis binder a package-mode consumer takes for helper
+/// lemma `path` (DESIGN-emit-module.md §4.2): the binder is named by
+/// the helper's SHORT name — exactly the identifier raw tactic text
+/// references (`have := lemma_a x hx`) — so binder shadowing makes the
+/// tactic body elaborate unchanged against the local hypothesis where
+/// the island file had a global theorem. The type is the helper's
+/// statement def, whose reducibility (M0 finding F2) lets the
+/// application elaborate without `unfold`.
+pub fn helper_hyp_binder(path: &Path) -> LBinder {
+    LBinder::explicit(
+        crate::lean_name::LeanName::lit(short_name(path)),
+        LExpr::var_lit(&stmt_name(path)),
+    )
+}
+
+/// Fold a proof fn's `(binders, goal)` signature into one ∀-closed
+/// Prop. Zero binders → the bare goal (a nullary lemma's statement is
+/// just its conjoined ensures).
+fn forall_close(binders: Vec<LBinder>, goal: LExpr) -> LExpr {
+    if binders.is_empty() { goal } else { LExpr::forall(binders, goal) }
+}
+
+/// Assemble a statement def from an already-built signature:
+/// `@[reducible] noncomputable def <name> : Prop := ∀ <binders>, <goal>`.
+/// Split from `proof_fn_stmt_cmd` so unit tests can drive it with
+/// synthetic binders/goals without constructing a full `FunctionX`.
+///
+/// `@[reducible]` is load-bearing (DESIGN-emit-module.md M0 finding
+/// F2, the `abbrev` form): it lets `intro` peel the stmt name inside
+/// the prover, lets a hypothesis `(h : <name>)` be applied to
+/// arguments at use sites, and lets the Link module's direct
+/// application unify — no `unfold` anywhere. (`noncomputable` is the
+/// always-on `write_def` default; harmless on a Prop def.)
+fn stmt_cmd(name: String, binders: Vec<LBinder>, goal: LExpr) -> Command {
+    Command::Def(Def {
+        attrs: vec!["reducible".to_string()],
+        name,
+        binders: Vec::new(),
+        ret_ty: LExpr::var_lit("Prop"),
+        body: forall_close(binders, goal),
+        termination_by: Vec::new(),
+        termination_structural: false,
+        decreasing_by: None,
+    })
+}
+
+/// Emit a proof fn's contract as its statement def — the Stmts layer
+/// of package emission (DESIGN-emit-module.md §2.1/§4.1). Consumers
+/// take the def as a hypothesis binder instead of citing an axiom or
+/// re-elaborating the helper's theorem; the fn's own theorem proves
+/// it; the Link module applies one to the other.
+///
+/// Built on the same `proof_fn_signature` as `proof_fn_to_ast` and
+/// `broadcast_lemma_axiom_cmd` (including the same standalone
+/// augmentation), so the statement def and the theorem that proves it
+/// cannot drift — the statement-identity property the emit-module
+/// trust argument rests on.
+pub fn proof_fn_stmt_cmd(
+    f: &FunctionX,
+    ectx: &crate::emit_ctx::EmitCtx,
+) -> Command {
+    let f = &crate::impl_subst::maybe_augment_standalone_fn(f, &ectx.trait_outparams);
+    let (binders, goal) = proof_fn_signature(f, ectx);
+    stmt_cmd(stmt_name(&f.name.path), binders, goal)
+}
+
+/// Statement def for one EXEC obligation theorem (M6.2): the
+/// theorem's ∀-closed goal as a `@[reducible] Prop` def, named
+/// `<theorem name>_stmt` (obligation theorem names are already unique
+/// per fn). Same `stmt_cmd` shape as proof-fn statement defs, so the
+/// M6.3 Link composition treats both uniformly.
+pub fn exec_obligation_stmt_cmd(thm: &Theorem) -> Command {
+    stmt_cmd(
+        format!("{}_stmt", thm.name),
+        thm.binders.clone(),
+        thm.goal.clone(),
+    )
 }
 
 pub fn proof_fn_to_ast(
@@ -978,6 +1134,7 @@ fn datatype_nonempty_instance_cmd(
         ret_ty,
         body,
         termination_by: Vec::new(),
+        termination_structural: false,
         decreasing_by: None,
     }))
 }
@@ -1169,6 +1326,7 @@ fn height_fn_for_datatype(
             ret_ty: LExpr::var_lit("Nat"),
             body: LExpr::lit_int("1"),
             termination_by: vec![],
+            termination_structural: false,
             decreasing_by: None,
         }));
     }
@@ -1273,6 +1431,7 @@ fn height_fn_for_datatype(
         ret_ty: LExpr::var_lit("Nat"),
         body,
         termination_by: vec![termination],
+        termination_structural: false,
         decreasing_by: Some("all_goals (simp_all; omega)".to_string()),
     }))
 }
@@ -1433,6 +1592,7 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
             ret_ty: LExpr::var_lit("Prop"),
             body: match_on_x(arms),
             termination_by: vec![],
+            termination_structural: false,
             decreasing_by: None,
         }));
     }
@@ -1498,6 +1658,7 @@ fn multi_variant_accessor_defs(dt: &DatatypeX, type_name: &str) -> Vec<Command> 
                 ret_ty: typ_to_expr(&f.a.0),
                 body: match_on_x(arms),
                 termination_by: vec![],
+                termination_structural: false,
                 decreasing_by: None,
             }));
         }

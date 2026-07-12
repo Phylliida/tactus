@@ -233,7 +233,7 @@ fn structural_typ(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> Option<Ty
 
 /// Strip every reference decoration layer from a typ (and `Boxed`/
 /// `MutRef`). Returns the deepest non-decorated `Arc<TypX>`.
-fn strip_all_ref_decorations(typ: &Typ) -> Typ {
+pub(crate) fn strip_all_ref_decorations(typ: &Typ) -> Typ {
     match &**typ {
         TypX::Decorate(deco, _, inner) if decoration_wrapper(*deco).is_some() => {
             strip_all_ref_decorations(inner)
@@ -657,23 +657,51 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
         }
 
         ExprX::Ctor(dt, variant, fields, update) => {
+            // Declared-slot coercion needs the instantiation: the ctor's
+            // typ args live on expr.typ (strip decorations first — a
+            // ctor in reference position can be stamped decorated).
+            let typ_args: Vec<Typ> =
+                match &*strip_all_ref_decorations(&expr.typ) {
+                    TypX::Datatype(_, targs, _) => targs.iter().cloned().collect(),
+                    _ => Vec::new(),
+                };
             if let Some(tail) = update {
                 ExprNode::StructUpdate {
                     base: Box::new(place_to_expr(&tail.place.x, ctx)),
                     updates: fields.iter().map(|f|
-                        (sanitize(&f.name), expr_to_ast(&f.a, ctx))
+                        (sanitize(&f.name), coerce_ctor_field(dt, variant, f, &typ_args, expr_to_ast(&f.a, ctx)))
                     ).collect(),
                 }
             } else {
-                ctor_to_node(dt, variant, fields, ctx)
+                ctor_to_node(dt, variant, fields, &typ_args, ctx)
             }
         }
 
         ExprX::Match(place, arms) => ExprNode::Match {
-            scrutinee: Box::new(place_to_expr(&place.x, ctx)),
-            arms: arms.iter().map(|arm| LMatchArm {
-                pattern: pattern_to_ast(&arm.x.pattern.x),
-                body: expr_to_ast(&arm.x.body, ctx),
+            // The scrutinee must sit at VALUE depth — patterns match
+            // datatype constructors, but a place rooted at a
+            // Ref-typed binder (e.g. `self` in an instance method,
+            // where the class field type is `Tactus.Ref Self → V`)
+            // renders at storage depth. Same binder-aware deref
+            // bridging as Field projection bases (U2).
+            scrutinee: Box::new(render_place_with_derefs(place, ctx)),
+            arms: arms.iter().map(|arm| {
+                // Pattern-bound vars enter the binder map for the arm
+                // body (same idiom as the Quant arm above). Their
+                // PatternBinding typs carry the Box/Rc/Arc decorations
+                // that Verus STRIPS on spec-mode use sites (`esize(*a)`
+                // stamps the arg bare while `a` is bound at
+                // `Tactus.Box PExpr`); with the entry present,
+                // `structural_typ`'s Var arm reports the decorated typ
+                // and `apply_ref_coercion_if_needed` re-materializes
+                // the `.deref`. Without it, the use renders bare and
+                // the island fails elaboration (probe-w0 P8).
+                let mut extended = ctx.binder_typs.cloned().unwrap_or_default();
+                collect_pattern_binding_typs(&arm.x.pattern.x, &mut extended);
+                LMatchArm {
+                    pattern: pattern_to_ast(&arm.x.pattern.x),
+                    body: expr_to_ast(&arm.x.body, &ctx.with_binder_typs(&extended)),
+                }
             }).collect(),
         },
 
@@ -740,7 +768,19 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
             // Same handling as the SST path: evaluate the bit width at
             // codegen and emit the literal bound. Split out to a shared
             // helper so the two paths can't drift.
-            crate::to_lean_sst_expr::integer_type_bound_from_vir(kind, inner).node
+            let bound = crate::to_lean_sst_expr::integer_type_bound_from_vir(kind, inner);
+            // The prelude bounds (`usize_hi` etc.) are Int-sorted, but
+            // the expr's own typ may render Nat (e.g. `usize::MAX`
+            // typed usize in a spec fn returning usize) — bridge with
+            // `Int.toNat`, which is exact here (the bounds are
+            // non-negative).
+            let nat_sorted = crate::expr_shared::int_range_of(&expr.typ)
+                .map_or(false, |r| !crate::expr_shared::renders_as_lean_int(&r));
+            if nat_sorted {
+                LExpr::app1(LExpr::var_lit("Int.toNat"), bound).node
+            } else {
+                bound.node
+            }
         }
         ExprX::UnaryOpr(UnaryOpr::CustomErr(_), inner) => expr_to_node(inner, ctx),
         // `has_resolved(x)` → uninterpreted Prop. The catch-all below
@@ -1012,9 +1052,40 @@ fn trait_method_ref(fun: &Fun) -> LExpr {
 }
 
 
-fn ctor_to_node(dt: &Dt, variant: &Ident, fields: &Binders<Expr>, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
-    let rendered = fields.iter().map(|f| expr_to_ast(&f.a, ctx)).collect();
+fn ctor_to_node(
+    dt: &Dt,
+    variant: &Ident,
+    fields: &Binders<Expr>,
+    typ_args: &[Typ],
+    ctx: &crate::expr_shared::RenderCtx,
+) -> ExprNode {
+    let rendered = fields
+        .iter()
+        .map(|f| coerce_ctor_field(dt, variant, f, typ_args, expr_to_ast(&f.a, ctx)))
+        .collect();
     ctor_node(dt, variant, rendered)
+}
+
+/// Bridge a rendered ctor argument to its DECLARED slot typ. Verus
+/// erases `Box::new`/`Rc::new` at ctor argument positions in spec mode
+/// (the arg is stamped bare while the slot is `Decorate(Box, …)`), so
+/// without this the emitted term applies e.g. `Expr.Add (Expr.Lit 3)`
+/// where `Tactus.Box Expr` is expected. `coerce_lexpr` is wrapper-only
+/// (`.mk` wraps / `.deref` peels), identity when the typs agree — the
+/// exact RC4 call-arg-bridge shape, at ctor sites. Unknown datatypes
+/// (no table entry) skip coercion, preserving today's rendering.
+fn coerce_ctor_field(
+    dt: &Dt,
+    variant: &Ident,
+    f: &vir::ast::Binder<Expr>,
+    typ_args: &[Typ],
+    rendered: LExpr,
+) -> LExpr {
+    let Dt::Path(path) = dt else { return rendered };
+    match crate::expr_shared::ctor_field_typ(path, variant.as_str(), f.name.as_str(), typ_args) {
+        Some(declared) => crate::expr_shared::coerce_lexpr(rendered, &f.a.typ, &declared),
+        None => rendered,
+    }
 }
 
 /// Fold a VIR `Block` into nested Lean lets.
@@ -1025,47 +1096,91 @@ fn ctor_to_node(dt: &Dt, variant: &Ident, fields: &Binders<Expr>, ctx: &crate::e
 /// * `StmtX::Expr(e)` with a following statement  →  `let _ := e; rest`
 ///   (drops the value like Rust's `;` does).
 /// * Last stmt with no `final_expr` is the body.
+/// Recurses FORWARD (not a reverse fold) so each `Decl`'s pattern
+/// bindings extend `ctx.binder_typs` for the REST of the block — the
+/// same binder-map discipline as the `ExprX::Match` arm. Without it, a
+/// `let b = boxed;` binder renders its uses bare where spec-mode VIR
+/// stripped the Box decoration (the Decl-position sibling of the
+/// pattern-binder fix; caught by review, pinned by
+/// `test_spec_let_box_use_derefs`).
 fn block_to_node(stmts: &[Stmt], final_expr: Option<&Expr>, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
-    let body = match final_expr {
-        Some(e) => expr_to_ast(e, ctx),
-        None if stmts.is_empty() => LExpr::var_lit("()"),
-        // No final expression — the last stmt's value is the block's value.
-        // In spec mode this is unusual; fall back to unit.
-        None => LExpr::var_lit("()"),
-    };
-
-    let mut folded = body;
-    for stmt in stmts.iter().rev() {
-        folded = match &stmt.x {
-            StmtX::Decl { pattern, init, .. } => {
-                let value = match init {
-                    Some(place) => place_to_expr(&place.x, ctx),
-                    // No initializer (e.g., `let x;`) — give a placeholder.
-                    None => LExpr::var_lit("_"),
-                };
-                match &pattern.x {
-                    PatternX::Var(binding) => LExpr::let_bind(
-                        crate::lean_name::LeanName::from_var_ident(&binding.name),
-                        value,
-                        folded,
-                    ),
-                    other => LExpr::match_expr(value, vec![crate::lean_ast::MatchArm {
-                        pattern: pattern_to_ast(other),
-                        body: folded,
-                    }]),
-                }
-            }
-            StmtX::Expr(e) => LExpr::let_bind(
-                crate::lean_name::LeanName::lit("_"),
-                expr_to_ast(e, ctx),
-                folded,
-            ),
+    let Some((stmt, rest)) = stmts.split_first() else {
+        return match final_expr {
+            Some(e) => expr_to_ast(e, ctx).node,
+            // No final expression — the last stmt's value is the block's
+            // value. In spec mode this is unusual; fall back to unit.
+            None => LExpr::var_lit("()").node,
         };
+    };
+    match &stmt.x {
+        StmtX::Decl { pattern, init, .. } => {
+            // The initializer renders under the OUTER ctx (it can only
+            // reference earlier binders); the rest renders under the
+            // pattern-extended ctx.
+            let value = match init {
+                Some(place) => place_to_expr(&place.x, ctx),
+                // No initializer (e.g., `let x;`) — give a placeholder.
+                None => LExpr::var_lit("_"),
+            };
+            let mut extended = ctx.binder_typs.cloned().unwrap_or_default();
+            collect_pattern_binding_typs(&pattern.x, &mut extended);
+            let ctx_rest = ctx.with_binder_typs(&extended);
+            let rest_body = LExpr::new(block_to_node(rest, final_expr, &ctx_rest));
+            match &pattern.x {
+                PatternX::Var(binding) => LExpr::let_bind(
+                    crate::lean_name::LeanName::from_var_ident(&binding.name),
+                    value,
+                    rest_body,
+                ).node,
+                other => LExpr::match_expr(value, vec![crate::lean_ast::MatchArm {
+                    pattern: pattern_to_ast(other),
+                    body: rest_body,
+                }]).node,
+            }
+        }
+        StmtX::Expr(e) => LExpr::let_bind(
+            crate::lean_name::LeanName::lit("_"),
+            expr_to_ast(e, ctx),
+            LExpr::new(block_to_node(rest, final_expr, ctx)),
+        ).node,
     }
-    folded.node
 }
 
 // ── Patterns ────────────────────────────────────────────────────────────
+
+/// Collect every pattern-bound variable's DECLARED typ (`PatternBinding
+/// .typ` — decoration-carrying, e.g. `Decorate(Box, PExpr)` for a
+/// `Box<T>`-typed constructor field) into a binder map. See the
+/// `ExprX::Match` arm for why: spec-mode VIR strips decorations on use
+/// sites of pattern-bound vars, and the use-site coercion can only
+/// bridge binder-typ → stamped-typ if it knows the binder typ.
+fn collect_pattern_binding_typs(
+    pat: &PatternX,
+    out: &mut std::collections::HashMap<vir::ast::VarIdent, Typ>,
+) {
+    match pat {
+        PatternX::Wildcard(_) | PatternX::Expr(_) | PatternX::Range(..) => {}
+        PatternX::Var(binding) => {
+            out.insert(binding.name.clone(), binding.typ.clone());
+        }
+        PatternX::Constructor(_, _, pats) => {
+            for p in pats.iter() {
+                collect_pattern_binding_typs(&p.a.x, out);
+            }
+        }
+        PatternX::Or(l, r) => {
+            collect_pattern_binding_typs(&l.x, out);
+            collect_pattern_binding_typs(&r.x, out);
+        }
+        PatternX::Binding { binding, sub_pat } => {
+            out.insert(binding.name.clone(), binding.typ.clone());
+            collect_pattern_binding_typs(&sub_pat.x, out);
+        }
+        PatternX::MutRef(inner) | PatternX::ImmutRef(inner) => {
+            collect_pattern_binding_typs(&inner.x, out);
+        }
+    }
+}
 
 pub(crate) fn pattern_to_ast(pat: &PatternX) -> LPattern {
     match pat {
@@ -1081,7 +1196,19 @@ pub(crate) fn pattern_to_ast(pat: &PatternX) -> LPattern {
                     };
                     format!("{}.{}", lean_name(path), v)
                 }
-                Dt::Tuple(_) => sanitize(variant),
+                // Verus tuples render as Lean pair patterns, matching
+                // the expr side (`ExprNode::Tuple`) — the tuple%N
+                // constructor name has no Lean counterpart. 1-tuples
+                // flatten to their element (the type renderer does the
+                // same), so the sub-pattern stands alone.
+                Dt::Tuple(1) => {
+                    return pattern_to_ast(&pats[0].a.x);
+                }
+                Dt::Tuple(_) => {
+                    return LPattern::Tuple(
+                        pats.iter().map(|p| pattern_to_ast(&p.a.x)).collect(),
+                    );
+                }
             };
             LPattern::Ctor {
                 name,

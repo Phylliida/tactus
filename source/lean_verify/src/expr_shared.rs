@@ -63,6 +63,53 @@ use crate::to_lean_type::{lean_name, sanitize, short_name};
 /// Function lookup borrowed by `RenderCtx`. Same shape as
 /// `sst_to_lean::FnMap` — declared here too so `expr_shared` doesn't
 /// depend on `sst_to_lean`.
+thread_local! {
+    /// Per-datatype constructor-field DECLARED typs, all variants:
+    /// Path → (typ params, variant name → [(raw field name, typ)]).
+    /// Installed by `generate::install_datatype_field_bounds` alongside
+    /// `DATATYPE_FIELDS` (same ambient-table idiom, see emit_ctx.rs).
+    /// Why: spec-mode VIR ERASES `Box::new`/`Rc::new` at constructor
+    /// argument slots — the arg expr is stamped BARE while the declared
+    /// slot is `Decorate(Box, …)` — so the renderer needs the declared
+    /// typ to re-materialize the `.mk` wrap. The ctor-position sibling
+    /// of the RC4 call-arg bridge (`fn_param_typs`).
+    static CTOR_FIELD_TYPS: std::cell::RefCell<
+        HashMap<vir::ast::Path, (Vec<Ident>, HashMap<String, Vec<(String, Typ)>>)>,
+    > = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Install the ctor-field-typs table (see `CTOR_FIELD_TYPS`).
+pub(crate) fn set_ctor_field_typs(
+    map: HashMap<vir::ast::Path, (Vec<Ident>, HashMap<String, Vec<(String, Typ)>>)>,
+) {
+    CTOR_FIELD_TYPS.with(|m| *m.borrow_mut() = map);
+}
+
+/// The DECLARED typ of constructor field `field` of `path::variant`,
+/// instantiated with the ctor's typ args. `None` when the datatype is
+/// unknown (cross-crate opaque) — callers skip coercion, preserving
+/// today's rendering.
+pub(crate) fn ctor_field_typ(
+    path: &vir::ast::Path,
+    variant: &str,
+    field: &str,
+    typ_args: &[Typ],
+) -> Option<Typ> {
+    CTOR_FIELD_TYPS.with(|m| {
+        let m = m.borrow();
+        let (tps, variants) = m.get(path)?;
+        let fields = variants.get(variant)?;
+        let (_, ftyp) = fields.iter().find(|(n, _)| n == field)?;
+        if !typ_args.is_empty() && typ_args.len() == tps.len() {
+            let substs: HashMap<Ident, Typ> =
+                tps.iter().cloned().zip(typ_args.iter().cloned()).collect();
+            Some(vir::sst_util::subst_typ(&substs, ftyp))
+        } else {
+            Some(ftyp.clone())
+        }
+    })
+}
+
 pub type RenderFnMap<'a> = HashMap<&'a Fun, &'a FunctionX>;
 
 /// Render-time value substitution map. Each entry maps a variable
@@ -282,6 +329,19 @@ impl<'a> RenderCtx<'a> {
     /// call) — it falls through to the declared types, so this is a strict
     /// refinement: zero behaviour change for concrete-param calls, and no
     /// risk of misaligning a substitution.
+    /// M6.1 drop-dummy rule: does `ast_simplify` inject the zero-arg
+    /// `Const 0` dummy for calls to this callee? (The spec world
+    /// renders from the unsimplified vir krate, so the injected arg
+    /// must be dropped wherever post-simplify SSTs are rendered —
+    /// same predicate as the injector, `injects_zero_arg_dummy`.)
+    /// Unknown callees (not in fn_map) answer false — their calls
+    /// render as-is and any real mismatch surfaces in elaboration.
+    pub fn callee_injects_dummy(&self, fun: &Fun) -> bool {
+        self.fn_map
+            .and_then(|m| m.get(fun))
+            .map_or(false, |f| vir::ast_simplify::injects_zero_arg_dummy(f, false))
+    }
+
     pub fn fn_param_typs(&self, fun: &Fun, typ_args: &[Typ]) -> Option<Vec<Typ>> {
         let fn_map = self.fn_map?;
         let func = fn_map.get(fun)?;

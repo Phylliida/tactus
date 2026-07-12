@@ -426,6 +426,9 @@ fn collect_pattern_binders(p: &Pattern, out: &mut Vec<String>) {
         Pattern::Ctor { args, .. } => {
             for a in args { collect_pattern_binders(a, out); }
         }
+        Pattern::Tuple(args) => {
+            for a in args { collect_pattern_binders(a, out); }
+        }
         Pattern::Or(l, r) => {
             collect_pattern_binders(l, out);
             collect_pattern_binders(r, out);

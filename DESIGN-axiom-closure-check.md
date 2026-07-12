@@ -1,7 +1,16 @@
 # Axiom-closure checking — design
 
 **Date:** 2026-07-09
-**Status:** proposed (design only; no implementation yet)
+**Status:** B2 IMPLEMENTED (branch `emit-module`, alongside M3 of
+DESIGN-emit-module.md): the `#tactus_check_axioms` elab command lives in
+`TactusPrelude.lean` and is emitted by the package Link module after every
+closed theorem. Base allowed set = classical core + the prelude's own 5
+axioms (hardcoded in the same file — they version together via the olean
+content-hash rebuild) + `Lean.ofReduceBool`/`Lean.trustCompiler` (§3
+option-2 per-theorem tracking is TODO — currently allowed globally);
+`sorryAx` fatal; subset semantics; namespace-relative name resolution.
+Hand-validated: positives, undeclared-axiom rejection, sorry rejection.
+Island-mode emission (B1/B3/B4) and always-on sanity (B6) remain open.
 **Scope:** make "this theorem's proof rests on exactly the axioms we think it does" a
 machine-checked, per-theorem fact on every Lean run — instead of a belief about the
 generator.

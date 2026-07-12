@@ -71,6 +71,22 @@ fn spec_fn_application_rejected() {
 }
 
 #[test]
+fn nullary_spec_fn_bare_var_rejected_regression() {
+    // `test_crate.pair = test_crate.pair` — a nullary spec fn renders
+    // as a BARE Var (not an App). It is NOT a local integer, so the
+    // equality must fall out of the fragment (the goal wants rfl, not
+    // omega). Regression exposed by the bootstrap package-check path,
+    // which emits this obligation as `theorem := by <closer>` that S1
+    // classifies (the islands path emitted a Prop def selection never
+    // saw). Pre-fix, frag_term admitted any bare Var as an int atom.
+    let goal = bin(BinOp::Eq, var("test_crate.pair"), var("test_crate.pair"));
+    // Even with an unrelated Int binder in scope (the real failing
+    // case was `noop(v: u8)`), the global must not be admitted.
+    assert_eq!(select_deterministic(&goal, &[binder("v", var("Int"))]), None);
+    assert_eq!(select_deterministic(&goal, &[]), None);
+}
+
+#[test]
 fn used_opaque_binder_rejected_unused_ok() {
     // (r : Tactus.Ref T) used in the goal → reject.
     let goal = bin(BinOp::Eq, var("r"), var("r"));

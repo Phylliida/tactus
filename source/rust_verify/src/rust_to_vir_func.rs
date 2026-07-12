@@ -266,6 +266,7 @@ fn handle_autospec<'tcx>(
                     tactus_lean_axiom_eq: false,
                     tactus_tactic: None,
                     tactus_heartbeats: None,
+                    tactus_structural_decreases: false,
                 }),
                 body: Some(ret_clause.clone()),
                 extra_dependencies: functionx.extra_dependencies.clone(),
@@ -1342,6 +1343,7 @@ fn make_attributes<'tcx>(
         tactus_lean_axiom_eq: vattrs.tactus_lean_axiom_eq,
         tactus_tactic: vattrs.tactus_tactic.clone(),
         tactus_heartbeats: vattrs.tactus_heartbeats,
+        tactus_structural_decreases: vattrs.tactus_structural_decreases,
     };
     Ok(Arc::new(fattrs))
 }

@@ -494,3 +494,45 @@ macro_rules
         | (intro ⟨_, _⟩; tactus_peel)
         | (intro _; tactus_peel)
         | skip)
+
+-- ── Axiom-closure enforcement (DESIGN-axiom-closure-check.md) ────────
+-- `#tactus_check_axioms thm [ax₁, …]` computes `thm`'s axiom closure
+-- (the same walk `#print axioms` uses) and FAILS ELABORATION if the
+-- closure contains anything outside:
+--   • Lean's classical core (propext, Classical.choice, Quot.sound),
+--   • this prelude's own axioms (hardcoded HERE so they version with
+--     this file — the olean content-hash rebuild keeps the command
+--     and the axiom set in sync by construction),
+--   • compiled-execution licenses (Lean.ofReduceBool /
+--     Lean.trustCompiler — what bv_decide's native LRAT check needs;
+--     allowed-but-inventoried, the design doc's §3 policy knob),
+--   • the explicit per-call expected list (the crate's Boundary set —
+--     dependency axioms the generator itself emitted).
+-- `sorryAx` in the closure is ALWAYS fatal. Subset check, not
+-- equality: a proof that doesn't use a declared dependency is fine.
+open Lean Elab Command in
+elab "#tactus_check_axioms" thm:ident "[" expected:ident,* "]" : command => do
+  liftTermElabM do
+    let name ← realizeGlobalConstNoOverloadWithInfo thm
+    let axioms ← collectAxioms name
+    let base : List Name :=
+      [``propext, ``Classical.choice, ``Quot.sound,
+       `arch_word_bits, `arch_word_bits_valid,
+       `Tactus.heightLt, `Tactus.index, `Tactus.hasResolved,
+       ``Lean.ofReduceBool, ``Lean.trustCompiler]
+    let mut allowed : NameSet := {}
+    for n in base do
+      allowed := allowed.insert n
+    for e in expected.getElems do
+      -- Expected names may be namespace-relative (the generator emits
+      -- the check inside the crate namespace) — resolve like the thm.
+      let n ← realizeGlobalConstNoOverloadWithInfo e
+      allowed := allowed.insert n
+    for ax in axioms do
+      if ax == ``sorryAx then
+        throwErrorAt thm "tactus: proof of {name} contains sorry"
+      unless allowed.contains ax do
+        throwErrorAt thm
+          "tactus: proof of {name} rests on undeclared axiom {ax} — \
+           if this is a deliberate trust extension, it must be declared \
+           in the expected list (see DESIGN-axiom-closure-check.md)"
