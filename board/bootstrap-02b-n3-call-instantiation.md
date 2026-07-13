@@ -43,4 +43,34 @@ after N3b (goal provenance), since the bridge is what pins the instantiation.
 
 ## Progress
 
+- (2026-07-13, opus) **Considered and deliberately DEFERRED this turn** — a
+  sequencing call, recorded so it isn't re-litigated blind. The Call arm is
+  the one place the serializer does non-transcription work: it must reproduce
+  `build_wp_call` + `resolve_callee` + the simple-case subset of
+  `build_call_substitutions` (~150 lines of walker internals) *inside the
+  TCB*. Facts confirmed from source:
+    - Callee specs are VIR-AST `Expr`s (`spec_callee.require` /
+      `spec_callee.ensure.0` via `call_inlining::collect_inlined_at_call`),
+      NOT SST `Exp`s — so they render through `to_lean_expr::vir_expr_to_ast`
+      / `vir_expr_to_ast_for_inlining_with_ctx`, not the serializer's
+      `sst_exp_to_ast_checked`.
+    - The param→arg instantiation happens at RENDER time via a `RenderCtx`
+      `value_subst` map (`build_call_substitutions`, `sst_to_lean.rs:2891`),
+      with distinct req/ens/pre maps and a whole mut-ref post-state /
+      prophecy sub-machinery. `quad_exec` (the fixture target) is the easy
+      subset: two Static, same-crate, no-`&mut`, no-generic, no-zero-arg
+      calls.
+    - `krate` is already threaded to `emit_cert` (currently `_krate`), so the
+      fn_map is reachable at the snapshot point.
+  **Why defer:** the task itself says "the bridge (W2) is what pins the
+  instantiation," and W2 doesn't exist yet. Writing an unvalidated ~150-line
+  substitution mirror into the *trusted* serializer, with no bridge to check
+  it against the walker, cuts against the architecture's core discipline
+  (TCB stays small + auditable; everything else is kernel-checked). Correct
+  order: land N3b (goal side) → W2a/b (the bridge) → then this Call arm, whose
+  faithfulness the bridge's `decide` immediately validates. Do it as a
+  RESTRICTED arm (Static + same-crate + no-&mut only; keep trait/`&mut`/
+  cross-crate fail-loud with sharper census tags) so the TCB addition stays
+  small.
+
 ## Writeup
