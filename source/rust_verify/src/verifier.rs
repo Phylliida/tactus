@@ -2602,6 +2602,10 @@ impl Verifier {
         // global pattern; consulted inside `emit_proof_fn`.
         lean_verify::generate::set_package_enabled(self.args.tactus_emit_module);
         lean_verify::generate::set_package_check_enabled(self.args.tactus_package_check);
+        // Bootstrap N3: per-fn certificate emission (serialized SST
+        // literal). Emission-only; consulted inside `emit_cert` at the
+        // `exec_fn_theorems_to_ast` snapshot point.
+        lean_verify::sst_serialize::set_cert_emit_enabled(self.args.tactus_emit_cert);
 
         let time_verify_sequential_start = Instant::now();
 
@@ -3322,6 +3326,18 @@ impl Verifier {
             && !self.args.no_verify
         {
             self.run_package_gate(compiler, spans);
+        }
+
+        // Bootstrap N3/N4: crate-end certificate census (`certified M/N`
+        // + per-construct rejection table). Runs unconditionally at crate
+        // end so it reports even when per-fn verification had errors (the
+        // census is emission coverage, independent of verdicts).
+        if self.args.tactus_emit_cert {
+            let report = lean_verify::sst_serialize::census_report();
+            if !report.is_empty() {
+                let reporter = Reporter::new(spans, compiler);
+                reporter.report_now(&note_bare(report).to_any());
+            }
         }
 
         let time_verify_crate_end = Instant::now();
