@@ -273,3 +273,32 @@ deterministic floor is substantially higher than today's default suggests. Danie
 standing direction: `tactus_auto` disappears from artifacts; with `tactus_tactic("...")`
 also being removed, the end state is two surfaces — emitter-derived tactics + inline
 proofs.
+
+---
+
+## S1 landed (2026-07-11): deterministic-floor tactic selection
+
+First squeeze-and-pin step shipped — `lean_verify/src/tactic_select.rs`. The emitter
+selects `omega` / `tactus_peel <;> omega` in place of `tactus_auto` when an obligation's
+whole goal (hypotheses included) is in the linear-integer-arithmetic fragment. Two-layer
+term/prop classifier; sound-and-total (opaque atoms fall out of the fragment).
+
+**Preservation:** per-file pre/post error-count diff over the 114 known-passing gt
+artifacts = **0 regressions** (error sums 9=9, unchanged). Suite 537/0, gt exec gate 0
+errors, tutorial 9/9. Soundness rests on omega being a *decision procedure* for the
+fragment.
+
+**Impact (honest, corpus-dependent):** 24 selections across 2744 gt proof-fn files
+(~0.06%) — concentrated in the real arithmetic obligations (overflow/index/bounds).
+gt is group theory, so most goals correctly fall outside the arithmetic fragment; S1's
+value scales with arithmetic-heavy exec crates. For gt specifically the dominant lever
+stays squeeze-and-pin (T2 = 67%). The recall gap vs the harness's `omega`-closable
+count (37) is the price of soundness — omega treats opaque atoms (`Seq.len s`) as free
+vars, which is unsafe to assume syntactically (cross-atom equality trap). **v2 option:**
+admit single-/consistent-occurrence opaque atoms as free integer vars, gated on a
+0-regression re-diff (measure, don't assume).
+
+**Next in the arc:** S2 pin machinery (the 67% T2) — needs the pin-storage design
+decision (source annotation vs regenerate-at-emit) settled first. S3 precondition
+pin-seeding. Per-measure `decreasing_by` dispatch reuses this classify-then-select
+machinery (the emitter knows the measure shape it built).
