@@ -1202,7 +1202,7 @@ fn closure_decl_wp<'a>(
 /// types (`Expr` vs `Exp`), and the AST-side filter only needs to
 /// catch HasResolved (closure-spec stuff doesn't reach the AST as
 /// AssertAssume — it's pure SST).
-fn is_synthetic_assume_to_drop(e: &Exp) -> bool {
+pub(crate) fn is_synthetic_assume_to_drop(e: &Exp) -> bool {
     match &e.x {
         ExpX::UnaryOpr(UnaryOpr::HasResolved(_), _) => true,
         ExpX::Binary(BinaryOp::Implies, _lhs, rhs) => is_synthetic_assume_to_drop(rhs),

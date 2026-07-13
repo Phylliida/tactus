@@ -3734,6 +3734,10 @@ fn emit_package_exec_fn(
         .ok_or("root exec fn absent from inlined krate")?;
     let krate = &inlined_krate;
     let broadcast_lemmas = sst_to_lean::collect_broadcast_lemma_funs(krate, check, crate_name);
+    // Bootstrap N3 snapshot: serialize the fn's SST literal at the inputs
+    // of `exec_fn_theorems_to_ast` (the single source of obligation shape).
+    // No-op unless `--tactus-emit-cert`; never perturbs verification.
+    crate::sst_serialize::emit_cert(krate, fn_sst, check, crate_name);
     let theorems = sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check, &broadcast_lemmas)
         .map_err(|reason| format!("tactus_auto rejected this fn: {}", reason))?;
 
@@ -4026,6 +4030,11 @@ pub fn emit_exec_fn(
     // and `krate_preamble` (which emits the lemma axioms + walks their
     // spec-fn deps).
     let broadcast_lemmas = sst_to_lean::collect_broadcast_lemma_funs(krate, check, crate_name);
+
+    // Bootstrap N3 snapshot: serialize the fn's SST literal at the inputs
+    // of `exec_fn_theorems_to_ast`. No-op unless `--tactus-emit-cert`;
+    // never perturbs verification.
+    crate::sst_serialize::emit_cert(krate, fn_sst, check, crate_name);
 
     let theorems = match sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check, &broadcast_lemmas) {
         Ok(r) => r,

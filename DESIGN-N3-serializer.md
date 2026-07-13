@@ -169,14 +169,48 @@ pass.
 
 ## 9. Open questions (decide during N3a, record here)
 
-* `FuncCheckSst` field inventory: exact names/shapes to be transcribed into
-  the contract table on first read of the struct (§3 is the intent, the code
-  is the truth).
-* Loop desugaring: does `check` present loops as `StmX::Loop` or already
-  split (P7 saw loop-triple obligations)? The mirror follows whatever the
-  snapshot point sees; if pre-split, `StmData::Loop` may be dead in practice
-  and the tripwire note should say so.
-* Call contract view: whether instantiated req/ens exps are directly present
-  at the snapshot point or need the same instantiation the walker performs —
-  if the latter, that instantiation becomes part of the trusted surface and
-  must be flagged in the contract table.
+**ANSWERED 2026-07-13 (N3a first contact — `source/vir/src/sst.rs` +
+`sst_to_lean.rs::build_wp`):**
+
+* `FuncCheckSst` field inventory (sst.rs:356): `reqs: Exps`,
+  `post_condition: Arc<PostConditionSst>` (`dest: Option<VarIdent>`,
+  `ens_exps: Exps`, `ens_spec_precondition_stms`, `kind`), `unwind: UnwindSst`,
+  `body: Stm`, `local_decls: Arc<Vec<LocalDecl>>`,
+  `local_decls_decreases_init: Stms`, `statics`. **The serializer transcribes
+  raw `check.body`** (a single `Stm`) — the mut-ref rewrite and WpCtx build
+  happen INSIDE `exec_fn_theorems_to_ast`, downstream of the snapshot, so they
+  are not the serializer's input. `FnCtxData` reads: params/typ_params from
+  `fn_sst.x` (`pars` filtered by `!is_synthetic_param`, `typ_params`), req
+  leaves from `check.reqs`, ens leaves + ens-binder from `check.post_condition`.
+
+* Loop desugaring: **NOT pre-split.** `StmX::Loop` arrives whole —
+  `cond: Option<(Stm,Exp)>`, Tactus's `original_cond: Option<(Stm,Exp)>`,
+  `invs: LoopInvs` (`LoopInv{at_entry, at_exit, inv}`), `decrease: Exps`,
+  `modified_vars: Option<Arc<HavocSet>>`. `StmData::Loop` is LIVE. The
+  init/maintain/use obligation TRIPLE is walker-synthesized (`build_wp_loop`),
+  not distinct SST Assert nodes (confirms §5-Q3's P7 guess) — refWp will
+  synthesize them identically from the Loop literal. Serializer recovers
+  `cond`/`neg_cond` from `cond`-or-`original_cond`, loop-state binders from
+  `modified_vars`. **CAVEAT found in N3a e2e (W2 must handle):** on the
+  fixture's `sum_to`, `modified_vars` is `None` at the RAW `check.body`
+  snapshot (the havoc set is populated by a later pass, not present
+  pre-walker), so the emitted `Loop` literal has `binders = Nil` — the
+  maintain/use telescope binders (i, acc) are absent. Faithful to the
+  snapshot, but refWp will need the modified set: either consult a
+  later-populated havoc source at the snapshot, or compute the modified set
+  inside refWp from the loop body's assigns. Decide at W2.
+
+* Call contract view: **the latter — instantiation IS part of the trusted
+  surface.** `StmX::Call` at the snapshot carries only the callee `Fun`,
+  `typ_args`, `args`, `dest: Option<Dest>` — NOT instantiated req/ens exps.
+  `build_wp_call` performs the instantiation (callee lookup in `fn_map` + arg
+  substitution). The serializer must do the same substitution to render the
+  `Call{reqs, enss}` leaves, and this is flagged in the contract doc-comment as
+  a trusted-surface item (the one non-transcription step). [N3a status: Call is
+  captured STRUCTURALLY with placeholder-instantiation deferred — see writeup;
+  the substitution helper is the sharpest remaining N3a/N3b edge.]
+
+* Overflow-guard asserts: **present verbatim** as `StmX::Assert` at the
+  snapshot (Verus's overflow pass precedes SST hand-off). No walker-injection to
+  mirror. `AssertCompute` folds to `StmData::Assert` (walker dispatches them
+  identically).
