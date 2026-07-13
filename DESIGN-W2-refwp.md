@@ -185,7 +185,14 @@ bug-FINDING deliverable, independent of the W5 soundness proof.
    under each branch, or join? Mirror must match; discover empirically from
    a two-branch fixture cert diff (§2.2).
 2. Fall-through postcondition: where the production emits the ens obligation
-   when the body doesn't end in explicit `Ret`.
+   when the body doesn't end in explicit `Ret`. Related shape question
+   (raised in N2.1 review): the explicit `Ret(LeafList)` bakes the returned
+   value into each leaf at render time, so no frame return-binder is needed
+   for explicit returns. If the fall-through path instead binds the return
+   value as a frame `∀`/`let` (rather than rendering a closed instantiated
+   leaf), `FnCtxData` will need a `return_var: (id, typ)` field — deliberately
+   NOT added in N2.1 (the amendment table omits it). Confirm empirically
+   before adding, so the literal shape doesn't churn.
 3. Loop-body post: are body-end invariant obligations distinct Assert nodes
    in the SST at the snapshot point (in which case `Loop` handling shrinks),
    or walker-synthesized (in which case refWp synthesizes identically)?
