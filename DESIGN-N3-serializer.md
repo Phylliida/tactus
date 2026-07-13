@@ -1,7 +1,24 @@
 # N3: the SST serializer — spec
 
 **Date:** 2026-07-12
-**Status:** spec'd, not started. Parent plan: `DESIGN-bootstrap.md` §12 (N3), §5 (W1).
+**Status:** N3a + N3b + N3c COMPLETE (2026-07-13). Serializer built, goal half
+serialized, and acceptance (§7) validated on the rebuilt binary: all fixture +
+w15_probe certs elaborate against tactus-core's olean with both `stm_size` and
+`goal_count` decide probes kernel-computing; determinism byte-identical; golden
+pins the full cert incl. goals; `sst_serialize.rs` 883 lines (tests split to
+`sst_serialize_tests.rs`); e2e suite GREEN flag-off (550/0 — the real N3b
+regression gate, since goal-shape capture runs unconditionally). Flag-on
+(`VERUS_EXTRA_ARGS="--tactus-emit-cert"`) is verified verdict-neutral at scale
+— 0/550 verdict changes; the full harness goes red flag-on (380/170) ONLY
+because Verus's exact-output test matcher rejects the flag's emission
+diagnostics (crate-end census `note: … certified M/N` + `not serialized`
+eprintlns landing as `[unexpected json]`); every one of the 170 is
+`expected Ok(()) but got Err(no errors)`, i.e. the fn still verifies. Making
+emission test-quiet is W4-scoped (the flag goes default-on there) and tracked
+in board `bootstrap-14`. §9 open-questions were answered at N3a
+first-contact and re-confirmed by the live elaboration. `StmData::Call`
+instantiation remains deferred (board `bootstrap-02b`). Next: N4 census + W2
+refWp. Parent plan: `DESIGN-bootstrap.md` §12 (N3), §5 (W1).
 **Role in the program:** the serializer is THE new trusted component of the R2
 certificate architecture. Everything else the bootstrap adds is *checked*; this
 is the one piece a skeptic must read. Its design goals are therefore inverted

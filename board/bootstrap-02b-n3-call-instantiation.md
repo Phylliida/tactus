@@ -73,4 +73,14 @@ after N3b (goal provenance), since the bridge is what pins the instantiation.
   cross-crate fail-loud with sharper census tags) so the TCB addition stays
   small.
 
+- (2026-07-13, opus-n3c) **Deferral re-confirmed while closing N3c** (a second,
+  independent read agrees). Settles the one dangling sub-question — *"do we need
+  a restricted Call arm landed BEFORE W2a, so the bridge has a real call-bearing
+  cert to audit on day one?"* → **No.** W2a bring-up only needs a hand-written,
+  manually-verified fixture cert (a known-good Reference/WP pair) to exercise
+  the bridge mechanism; you don't need a *generated* Call cert to test a bridge.
+  Landing the Call arm pre-bridge would make the TCB the *source* of truth
+  rather than the *subject* of the check — exactly backwards. So this stays
+  todo behind W2 (see bootstrap-06/07); no change to the sequencing.
+
 ## Writeup
