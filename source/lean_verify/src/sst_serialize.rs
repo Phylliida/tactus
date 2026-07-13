@@ -757,4 +757,63 @@ mod tests {
         let term = "(lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assert 0)) (Tactus.Box.mk (lib.StmData.If 1 2 (Tactus.Box.mk lib.StmData.Skip) (Tactus.Box.mk (lib.StmData.Ret (Tactus.Box.mk lib.LeafList.Nil))))))";
         assert_eq!(stm_size_of(term), 5);
     }
+
+    /// Golden-file pin (N3c §7.5). This module is the TCB — its emitted
+    /// output shape is what a skeptic audits, so it must not drift
+    /// silently. `GOLDEN` is the verbatim cert file the rebuilt binary
+    /// emitted for the real fixture fn `add_capped` over
+    /// `bootstrap-fixture/lib.rs`; the test re-renders and asserts
+    /// byte-equality. Any change to the header text, leaf-table format,
+    /// `def` naming, term spacing, or the `stm_size … := by decide` probe
+    /// (incl. `stm_size_of`) breaks this test — a *reviewed* diff, like
+    /// the trusted code it guards.
+    ///
+    /// The `CertBody` inputs are recovered from the golden itself (leaf
+    /// texts from the `-- leaf N: ⟦…⟧` table; the ctx/sst terms from the
+    /// two `def` bodies) rather than hand-transcribed. This is a valid
+    /// regression pin: the golden bytes are fixed, while the recovered
+    /// content is format-independent, so a format change makes the
+    /// re-render diverge from the unchanged golden. (Bonus: no need to
+    /// hand-copy the Unicode leaves or the long fully-parenthesized
+    /// terms, which would themselves be a transcription-error surface.)
+    #[test]
+    fn golden_add_capped_cert() {
+        const GOLDEN: &str = include_str!("testdata/add_capped.cert.lean");
+
+        // vocab_hash() reads $TACTUS_CORE_VOCAB; the golden was emitted
+        // with it unset ("unvendored"). Under a vendored env the header
+        // hash differs by design — skip rather than spuriously fail.
+        if vocab_hash() != "unvendored" {
+            return;
+        }
+
+        let lines: Vec<&str> = GOLDEN.lines().collect();
+        let mut leaf_texts: Vec<String> = Vec::new();
+        let mut ctx_term = String::new();
+        let mut stm_term = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            // A leaf-table row is `-- leaf N: ⟦text⟧` (N numeric). The
+            // digit + ⟦ guard distinguishes it from the header prose line
+            // `-- leaf rendering (stage B/W6)…`, which also begins
+            // `-- leaf `.
+            if let Some(rest) = line.strip_prefix("-- leaf ") {
+                if rest.starts_with(|c: char| c.is_ascii_digit()) {
+                    let open = rest.find('⟦').expect("leaf row carries ⟦");
+                    let close = rest.rfind('⟧').expect("leaf row carries ⟧");
+                    leaf_texts.push(rest[open + '⟦'.len_utf8()..close].to_string());
+                }
+            } else if line.contains("def cert_add_capped_ctx") {
+                ctx_term = lines[i + 1].trim().to_string();
+            } else if line.contains("def cert_add_capped_sst") {
+                stm_term = lines[i + 1].trim().to_string();
+            }
+        }
+        assert_eq!(leaf_texts.len(), 15, "golden leaf-table size drifted");
+        assert!(!ctx_term.is_empty(), "ctx term not recovered from golden");
+        assert!(!stm_term.is_empty(), "sst term not recovered from golden");
+
+        let body = CertBody { ctx_term, stm_term, leaf_texts };
+        let rendered = render_cert("lib", "add_capped", "add_capped", &body);
+        assert_eq!(rendered, GOLDEN, "cert-file format drift vs golden");
+    }
 }

@@ -33,6 +33,32 @@ real structs; battery green flag-on and flag-off.
 
 ## Progress
 
+- (2026-07-13, opus) **Golden-file unit test LANDED early** (§7.5, the one
+  N3c criterion not blocked by N3b). N3a's writeup listed it as the immediate
+  remaining item. Added `sst_serialize::tests::golden_add_capped_cert`:
+  - Golden = the verbatim cert file the rebuilt binary emitted for the real
+    fixture fn `add_capped`, vendored at
+    `source/lean_verify/src/testdata/add_capped.cert.lean` (tracked;
+    `bootstrap-fixture/out/` is gitignored, so the golden needed its own home).
+  - Test recovers the `CertBody` inputs FROM the golden (leaf texts from the
+    `-- leaf N: ⟦…⟧` rows, ctx/sst terms from the two `def` bodies) and
+    re-renders via `render_cert`, asserting byte-equality. Valid regression
+    pin: golden bytes are fixed, recovered content is format-independent, so
+    any header / leaf-table / def-naming / spacing / `stm_size … := by decide`
+    change diverges. Avoids hand-transcribing the Unicode leaves + the long
+    fully-parenthesized terms (a transcription-error surface in itself).
+  - Caught a real parse bug while writing it (the header prose line
+    `-- leaf rendering (stage B/W6)…` also begins `-- leaf `); fixed with a
+    digit-index + `⟦` guard. Confirms the test exercises live logic.
+  - `RUSTC_BOOTSTRAP=1 cargo test -p lean_verify sst_serialize` → 4/4 pass
+    (34s incremental; no verus-binary rebuild). Hermetic: skips under a
+    vendored `$TACTUS_CORE_VOCAB` (golden was emitted "unvendored").
+
+  **Still blocked by N3b for the rest of N3c** (the GoalData literal must join
+  the cert before the full elaborate-both-halves acceptance and the two-run
+  determinism sweep over all three crates). N3a already validated §7.1–7.4 +
+  §7.6 on the rebuilt binary (see bootstrap-02 writeup); this closes §7.5.
+
 ## Writeup
 
 _when done: findings, how the code works, assumptions made_
