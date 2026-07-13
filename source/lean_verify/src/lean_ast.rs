@@ -426,6 +426,76 @@ pub struct Expr {
 impl Expr {
     pub fn new(node: ExprNode) -> Self { Expr { node } }
 
+    /// Visit every direct child expression (one level, no recursion —
+    /// callers recurse themselves so they can stop early or track
+    /// scope). Binder TYPES count as children; `Raw`/`ByBlock` text
+    /// does not (it's opaque to the AST). Exhaustive on purpose: a new
+    /// variant must decide its children here rather than silently
+    /// having none.
+    pub fn for_each_child<'a>(&'a self, mut f: impl FnMut(&'a Expr)) {
+        match &self.node {
+            ExprNode::Var(_)
+            | ExprNode::Lit(_)
+            | ExprNode::LitBool(_)
+            | ExprNode::LitStr(_)
+            | ExprNode::LitChar(_)
+            | ExprNode::Raw(_)
+            | ExprNode::ByBlock { .. } => {}
+            ExprNode::BinOp { lhs, rhs, .. } => {
+                f(lhs);
+                f(rhs);
+            }
+            ExprNode::UnOp { arg, .. } => f(arg),
+            ExprNode::App { head, args } => {
+                f(head);
+                args.iter().for_each(f);
+            }
+            ExprNode::Let { value, body, .. } => {
+                f(value);
+                f(body);
+            }
+            ExprNode::Lambda { binders, body }
+            | ExprNode::Forall { binders, body }
+            | ExprNode::Exists { binders, body } => {
+                binders.iter().for_each(|b| f(&b.ty));
+                f(body);
+            }
+            ExprNode::If { cond, then_, else_ } => {
+                f(cond);
+                f(then_);
+                if let Some(e) = else_ {
+                    f(e);
+                }
+            }
+            ExprNode::Match { scrutinee, arms } => {
+                f(scrutinee);
+                arms.iter().for_each(|a| f(&a.body));
+            }
+            ExprNode::TypeAnnot { expr, ty } => {
+                f(expr);
+                f(ty);
+            }
+            ExprNode::FieldProj { expr, .. } => f(expr),
+            ExprNode::StructUpdate { base, updates } => {
+                f(base);
+                updates.iter().for_each(|(_, e)| f(e));
+            }
+            ExprNode::ArrayLit(es)
+            | ExprNode::VectorLit(es)
+            | ExprNode::Tuple(es)
+            | ExprNode::Anon(es) => es.iter().for_each(f),
+            ExprNode::Index { base, idx, .. } => {
+                f(base);
+                f(idx);
+            }
+            ExprNode::Subtype { ty, pred, .. } => {
+                f(ty);
+                f(pred);
+            }
+            ExprNode::SpanMark { inner, .. } => f(inner),
+        }
+    }
+
     // ── Smart constructors ─────────────────────────────────────────────
     //
     // The AST's wire format puts every non-leaf field behind a `Box<Expr>`
