@@ -11,20 +11,37 @@ inductive lib.LeafList where
   match s with | lib.LeafList.Nil => 1 | lib.LeafList.Cons _ val1 => 1 + lib.LeafList.height val1.deref
 termination_by sizeOf s
 decreasing_by all_goals (simp_all; omega)
+inductive lib.BinderList where
+  | Nil
+  | Cons (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.BinderList)
+  deriving Inhabited
+@[simp] noncomputable def lib.BinderList.height (s : lib.BinderList) : Nat :=
+  match s with | lib.BinderList.Nil => 1 | lib.BinderList.Cons _ _ val2 => 1 + lib.BinderList.height val2.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
+inductive lib.ParamBoundList where
+  | Nil
+  | NoBound (val0 : Tactus.Box lib.ParamBoundList)
+  | Bound (val0 : Int) (val1 : Tactus.Box lib.ParamBoundList)
+  deriving Inhabited
+@[simp] noncomputable def lib.ParamBoundList.height (s : lib.ParamBoundList) : Nat :=
+  match s with | lib.ParamBoundList.Nil => 1 | lib.ParamBoundList.NoBound val0 => 1 + lib.ParamBoundList.height val0.deref | lib.ParamBoundList.Bound _ val1 => 1 + lib.ParamBoundList.height val1.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
 inductive lib.StmData where
   | Assert (val0 : Int)
   | Assume (val0 : Int)
   | Assign (val0 : Int) (val1 : Int)
-  | Call (reqs : Tactus.Box lib.LeafList) (enss : Tactus.Box lib.LeafList)
+  | Call (reqs : Tactus.Box lib.LeafList) (enss : Tactus.Box lib.LeafList) (dest : Int) (dest_typ : Int)
   | DeadEnd (val0 : Tactus.Box lib.StmData)
-  | Ret (val0 : Int)
-  | If (val0 : Int) (val1 : Tactus.Box lib.StmData) (val2 : Tactus.Box lib.StmData)
-  | Loop (invs : Tactus.Box lib.LeafList) (cond : Int) (body : Tactus.Box lib.StmData)
+  | Ret (val0 : Tactus.Box lib.LeafList)
+  | If (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.StmData) (val3 : Tactus.Box lib.StmData)
+  | Loop (invs : Tactus.Box lib.LeafList) (cond : Int) (neg_cond : Int) (binders : Tactus.Box lib.BinderList) (body : Tactus.Box lib.StmData)
   | Skip
   | Seq (val0 : Tactus.Box lib.StmData) (val1 : Tactus.Box lib.StmData)
   deriving Inhabited
 @[simp] noncomputable def lib.StmData.height (s : lib.StmData) : Nat :=
-  match s with | lib.StmData.Assert _ => 1 | lib.StmData.Assume _ => 1 | lib.StmData.Assign _ _ => 1 | lib.StmData.Call _ _ => 1 | lib.StmData.DeadEnd val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Ret _ => 1 | lib.StmData.If _ val1 val2 => 1 + lib.StmData.height val1.deref + lib.StmData.height val2.deref | lib.StmData.Loop _ _ body => 1 + lib.StmData.height body.deref | lib.StmData.Skip => 1 | lib.StmData.Seq val0 val1 => 1 + lib.StmData.height val0.deref + lib.StmData.height val1.deref
+  match s with | lib.StmData.Assert _ => 1 | lib.StmData.Assume _ => 1 | lib.StmData.Assign _ _ => 1 | lib.StmData.Call _ _ _ _ => 1 | lib.StmData.DeadEnd val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Ret _ => 1 | lib.StmData.If _ _ val2 val3 => 1 + lib.StmData.height val2.deref + lib.StmData.height val3.deref | lib.StmData.Loop _ _ _ _ body => 1 + lib.StmData.height body.deref | lib.StmData.Skip => 1 | lib.StmData.Seq val0 val1 => 1 + lib.StmData.height val0.deref + lib.StmData.height val1.deref
 termination_by sizeOf s
 decreasing_by all_goals (simp_all; omega)
 inductive lib.GoalData where
@@ -45,3 +62,22 @@ inductive lib.GoalList where
   match s with | lib.GoalList.Nil => 1 | lib.GoalList.Cons _ val1 => 1 + lib.GoalList.height val1.deref
 termination_by sizeOf s
 decreasing_by all_goals (simp_all; omega)
+inductive lib.FrameList where
+  | FNil
+  | FBind (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
+  | FHyp (val0 : Int) (val1 : Tactus.Box lib.FrameList)
+  | FLet (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
+  deriving Inhabited
+@[simp] noncomputable def lib.FrameList.height (s : lib.FrameList) : Nat :=
+  match s with | lib.FrameList.FNil => 1 | lib.FrameList.FBind _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FHyp _ val1 => 1 + lib.FrameList.height val1.deref | lib.FrameList.FLet _ _ val2 => 1 + lib.FrameList.height val2.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
+structure lib.FnCtxData where
+  typ_params : lib.BinderList
+  params : lib.BinderList
+  param_bounds : lib.ParamBoundList
+  reqs : lib.LeafList
+  enss : lib.LeafList
+  deriving Inhabited
+@[simp] noncomputable def lib.FnCtxData.height (_ : lib.FnCtxData) : Nat :=
+  1
