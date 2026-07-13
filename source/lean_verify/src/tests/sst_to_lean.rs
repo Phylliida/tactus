@@ -1060,6 +1060,7 @@ fn mk_test_emitter() -> ObligationEmitter {
         heartbeats: None,
         counter: 0,
         out: Vec::new(),
+        goal_shapes: Vec::new(),
         tactic_prefix: Vec::new(),
         default_closer: crate::lean_ast::Tactic::Named("tactus_auto".to_string()),
     }

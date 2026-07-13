@@ -3734,12 +3734,16 @@ fn emit_package_exec_fn(
         .ok_or("root exec fn absent from inlined krate")?;
     let krate = &inlined_krate;
     let broadcast_lemmas = sst_to_lean::collect_broadcast_lemma_funs(krate, check, crate_name);
-    // Bootstrap N3 snapshot: serialize the fn's SST literal at the inputs
-    // of `exec_fn_theorems_to_ast` (the single source of obligation shape).
-    // No-op unless `--tactus-emit-cert`; never perturbs verification.
-    crate::sst_serialize::emit_cert(krate, fn_sst, check, crate_name);
-    let theorems = sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check, &broadcast_lemmas)
-        .map_err(|reason| format!("tactus_auto rejected this fn: {}", reason))?;
+    let sst_to_lean::ExecFnObligations { theorems, goal_shapes } =
+        sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check, &broadcast_lemmas)
+            .map_err(|reason| format!("tactus_auto rejected this fn: {}", reason))?;
+    // Bootstrap N3 snapshot: serialize the fn's SST literal (inputs) plus
+    // the production GoalList (N3b, from the just-built obligation spines).
+    // `check` is `&`-borrowed by `exec_fn_theorems_to_ast`, so capturing
+    // here — right after the call — reads the SAME snapshot (the single
+    // source of obligation shape). No-op unless `--tactus-emit-cert`;
+    // never perturbs verification.
+    crate::sst_serialize::emit_cert(krate, fn_sst, check, crate_name, &theorems, &goal_shapes);
 
     let stmts = stmt_partition_for(krate, crate_name, tactic_bodies, defs)
         .ok_or("Stmts partition unavailable")?;
@@ -4031,13 +4035,8 @@ pub fn emit_exec_fn(
     // spec-fn deps).
     let broadcast_lemmas = sst_to_lean::collect_broadcast_lemma_funs(krate, check, crate_name);
 
-    // Bootstrap N3 snapshot: serialize the fn's SST literal at the inputs
-    // of `exec_fn_theorems_to_ast`. No-op unless `--tactus-emit-cert`;
-    // never perturbs verification.
-    crate::sst_serialize::emit_cert(krate, fn_sst, check, crate_name);
-
-    let theorems = match sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check, &broadcast_lemmas) {
-        Ok(r) => r,
+    let (theorems, goal_shapes) = match sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check, &broadcast_lemmas) {
+        Ok(r) => (r.theorems, r.goal_shapes),
         Err(reason) => return Err(CheckResult::Failed {
             errors: vec![TactusDiag {
                 message: format!(
@@ -4052,6 +4051,12 @@ pub fn emit_exec_fn(
             warnings,
         }),
     };
+
+    // Bootstrap N3 snapshot: serialize the fn's SST literal (inputs) plus
+    // the production GoalList (N3b), from the SAME `&`-borrowed `check`
+    // the call above read. No-op unless `--tactus-emit-cert`; never
+    // perturbs verification.
+    crate::sst_serialize::emit_cert(krate, fn_sst, check, crate_name, &theorems, &goal_shapes);
 
     // Exec fns lower matches to if-chains over `IsVariant` and
     // `Field`, which the SST renderer routes to the synthesised

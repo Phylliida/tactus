@@ -100,20 +100,36 @@ this summary over tgt).
 
 ## 5. Goal-side serialization (N3b — the one production-code touch)
 
-To print the production goals as `GoalData`, the Wp assembly marks the LExpr
-nodes IT constructs (binder telescope, hypothesis arrows, let-bindings) with a
-provenance flag — one added field/mark on `lean_ast` nodes created in the
-walker, nothing else changes. `goal_serialize` then walks the theorem
-statement: marked node → structural `GoalData` constructor; unmarked subtree →
-leaf (interned in the same table).
+To print the production goals as `GoalData`, the Wp assembly records the
+*structured spine* of each obligation (binder telescope, hypothesis arrows,
+let-bindings, core leaf) as a `GoalShape`, captured at the walker's single
+`OblCtx::wrap` site before the frames fold into the flat statement.
+`goal_serialize` then turns each spine into a `GoalData` constructor chain,
+interning every spine leaf into the same leaf table as the SST half.
 
 Why provenance instead of shape-directed parsing: a hypothesis can itself BE
 an implication or a `∀` (user-written `a ==> b` in an ensures), so shape is
-ambiguous at the spine tail. Provenance is not circular: the marks only record
+ambiguous at the spine tail. The spine record is not circular: it only records
 where the production *claims* structure is; refWp computes structure
 independently from the SST literal, and the `decide` equality is what
 validates the claim. A mismark surfaces as a bridge failure, never as a silent
 pass.
+
+**RESOLVED 2026-07-13 (N3b — mechanism):** the "provenance" is a structured
+`GoalShape` side-record (`lean_ast::GoalShape`/`GoalSpine`), NOT a mark/flag on
+the shared `lean_ast::Expr`. Two facts made this the right realization:
+(1) the `GoalData` mirror is *already* the spine (`All`/`Imp`/`Let`/`Leaf`),
+so a structured record maps 1:1 with no re-parse; (2) every WP obligation
+statement is built at ONE choke point (`ObligationEmitter::emit_with_extras`),
+fed by `emit_split`/`emit_with_closer`, where `(binders, remaining frames,
+leaf)` are still separate. The walker accumulates a `Vec<Option<GoalShape>>`
+in lockstep with its `Vec<Theorem>` (index-aligned; `None` = bit_vector/query
+stage-A exclusion) and returns both in `ExecFnObligations`. This touches the
+production emitter ONLY (the two `wrap` sites + the return type + the two
+`generate.rs` hook calls), leaving `lean_ast::Expr`'s ~50 match arms and the
+pretty-printer untouched — so byte-identical Lean output with the flag off is
+guaranteed by construction. Faithfulness invariant worth a test: folding a
+`GoalShape` back to an `Expr` reproduces the emitted `Theorem.goal`.
 
 ## 6. File format & plumbing
 

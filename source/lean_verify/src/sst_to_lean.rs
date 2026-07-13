@@ -125,7 +125,7 @@ use vir::ast_visitor::map_expr_visitor;
 use vir::messages::Span;
 use crate::lean_ast::{
     and_all, substitute, AssertKind, Binder as LBinder, BinderKind, Expr as LExpr,
-    ExprNode, HypothesisKind, ObligationKind,
+    ExprNode, GoalShape, GoalSpine, HypothesisKind, ObligationKind,
     PreambleFragment, Tactic, Theorem,
 };
 use crate::expr_shared::{is_mut_ref_typ, varat_pre_name};
@@ -777,6 +777,18 @@ fn check_exp(e: &Exp) -> Result<(), String> {
 /// precondition is enforced by construction — there's no way to
 /// produce a `Wp` tree without having already cleared the shape
 /// checks.
+///
+/// The obligation theorems and their N3b [`GoalShape`]s come out together
+/// in [`ExecFnObligations`]. The shapes are index-aligned with the
+/// theorems (pushed in lockstep at the single emit site) and consumed by
+/// the cert serializer; callers that don't emit certs simply ignore them.
+pub struct ExecFnObligations {
+    pub theorems: Vec<Theorem>,
+    /// Per-theorem goal spine (N3b), index-aligned with `theorems`.
+    /// `None` = documented stage-A exclusion (bit_vector/query).
+    pub goal_shapes: Vec<Option<GoalShape>>,
+}
+
 pub fn exec_fn_theorems_to_ast<'a>(
     krate: &'a KrateX,
     fn_sst: &'a FunctionSst,
@@ -788,7 +800,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // `have _tactus_bc_<i> := <axiom>` tactic prefix so the closer can use
     // it. Empty for fns without `broadcast use` (the common case).
     broadcast_lemmas: &[&'a Fun],
-) -> Result<Vec<Theorem>, String> {
+) -> Result<ExecFnObligations, String> {
     // `&mut` params of the fn being verified (#94 callee-side body).
     // For each, the body and ensures get a SST-level rewrite so that
     // `*old(x)` (`VarAt(x, Pre)`) renders as `Var(<x>_at_pre_tactus)`,
@@ -984,6 +996,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
         base_binders: binders,
         counter: 0,
         out: Vec::new(),
+        goal_shapes: Vec::new(),
         tactic_prefix,
         default_closer,
         heartbeats: fn_sst.x.attrs.tactus_heartbeats,
@@ -1058,7 +1071,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
         }
     }
     walk_obligations(&body_wp, &ctx, &initial_obl_ctx, &mut emitter);
-    Ok(emitter.out)
+    Ok(ExecFnObligations { theorems: emitter.out, goal_shapes: emitter.goal_shapes })
 }
 
 /// Walk a VIR-AST `Expr` body and collect spans of every
@@ -1576,6 +1589,13 @@ struct ObligationEmitter {
     base_binders: Vec<LBinder>,
     counter: usize,
     out: Vec<Theorem>,
+    /// N3b goal-provenance: the structured spine of each emitted
+    /// obligation, pushed in LOCKSTEP with `out` (one per emit), so it is
+    /// index-aligned with `out` by construction. `None` marks a stage-A
+    /// exclusion (bit_vector/query — the `wrap_no_hyps` emit path). Read
+    /// by the cert serializer (`sst_serialize::goal_serialize`) to print
+    /// the production `GoalList`; inert when `--tactus-emit-cert` is off.
+    goal_shapes: Vec<Option<GoalShape>>,
     tactic_prefix: Vec<String>,
     /// The default closer for emitted theorems. Normally
     /// `Tactic::Named("tactus_auto")`; overridden via the
@@ -1611,6 +1631,7 @@ impl ObligationEmitter {
         &mut self, name: String, leaf: LExpr, closer: Tactic, obl: &OblCtx,
     ) {
         let (extras, remaining) = obl.split_leading_binders();
+        let shape = self.build_goal_shape(&extras, &remaining, &leaf);
         let goal = remaining.wrap(leaf);
         // For user-tactic emission (assert-by), inject explicit
         // `intro <names>;` for any frames that COULDN'T extract to
@@ -1671,6 +1692,7 @@ impl ObligationEmitter {
         };
         self.emit_with_extras(
             name, goal, final_closer, obl.closer_preamble.clone(), extras,
+            Some(shape),
         );
     }
 
@@ -1686,10 +1708,44 @@ impl ObligationEmitter {
     /// `obl.new_scope(...)`). See `BUG-loop-local-names-alpha-renamed.md`.
     fn emit_split(&mut self, name: String, leaf: LExpr, obl: &OblCtx) {
         let (extras, remaining) = obl.split_leading_binders();
+        let shape = self.build_goal_shape(&extras, &remaining, &leaf);
         let goal = remaining.wrap(leaf);
         self.emit_with_extras(
             name, goal, obl.closer.clone(), obl.closer_preamble.clone(), extras,
+            Some(shape),
         );
+    }
+
+    /// N3b: build the structured goal spine for an obligation, describing
+    /// the SAME statement `emit_with_extras` will emit — namely
+    /// `∀ base_binders extra_binders, wrap(remaining)(leaf)`. Kept in
+    /// lockstep with the flat `goal` (faithfulness invariant on
+    /// [`GoalShape`]: folding the spine back reproduces `Theorem.goal`).
+    ///
+    /// Spine order is OUTERMOST-first: the theorem's `∀` binders (base,
+    /// then the leading binders `split_leading_binders` extracted), then
+    /// `remaining`'s frames in PUSH order — `OblCtx::wrap` folds
+    /// `frames.iter().rev()`, so the first-pushed frame ends outermost,
+    /// which is exactly forward iteration here — then [`GoalShape::leaf`]
+    /// at the core.
+    fn build_goal_shape(
+        &self,
+        extras: &[LBinder],
+        remaining: &OblCtx,
+        leaf: &LExpr,
+    ) -> GoalShape {
+        let mut spine: Vec<GoalSpine> = Vec::new();
+        for b in self.base_binders.iter().chain(extras.iter()) {
+            spine.push(GoalSpine::All(b.clone()));
+        }
+        for frame in remaining.frames.iter() {
+            spine.push(match frame {
+                CtxFrame::Let(name, v) => GoalSpine::Let(name.clone(), v.clone()),
+                CtxFrame::Hyp(p) => GoalSpine::Imp(p.clone()),
+                CtxFrame::Binder(b) => GoalSpine::All(b.clone()),
+            });
+        }
+        GoalShape { spine, leaf: leaf.clone() }
     }
 
     /// Emit a theorem with explicit closer + preamble + extra binders.
@@ -1706,6 +1762,11 @@ impl ObligationEmitter {
         closer: Tactic,
         requires_preamble: Vec<PreambleFragment>,
         extra_binders: Vec<LBinder>,
+        // N3b goal-provenance spine for this obligation (see
+        // `build_goal_shape`). `None` for the `wrap_no_hyps` bit_vector
+        // path (a documented stage-A exclusion). Pushed in lockstep with
+        // the theorem below so `goal_shapes` stays index-aligned.
+        goal_shape: Option<GoalShape>,
     ) {
         let mut binders = self.base_binders.clone();
         binders.extend(extra_binders);
@@ -1727,6 +1788,8 @@ impl ObligationEmitter {
             _ => closer,
         };
         let tactic = self.compose_tactic(closer);
+        // Lockstep with `out.push` below: one shape per emitted theorem.
+        self.goal_shapes.push(goal_shape);
         self.out.push(Theorem {
             name,
             binders,
@@ -1791,7 +1854,10 @@ impl ObligationEmitter {
         closer: Tactic,
         requires_preamble: Vec<PreambleFragment>,
     ) {
-        self.emit_with_extras(name, goal, closer, requires_preamble, Vec::new());
+        // `None` goal-shape: this path is the `wrap_no_hyps` bit_vector
+        // emit (a documented stage-A exclusion), whose flattened `goal`
+        // has no structured spine the serializer captures.
+        self.emit_with_extras(name, goal, closer, requires_preamble, Vec::new(), None);
     }
 }
 
