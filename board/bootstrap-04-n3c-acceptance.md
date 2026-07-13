@@ -59,6 +59,25 @@ real structs; battery green flag-on and flag-off.
   determinism sweep over all three crates). N3a already validated §7.1–7.4 +
   §7.6 on the rebuilt binary (see bootstrap-02 writeup); this closes §7.5.
 
+- (2026-07-13, opus-n3b) **UNBLOCKED — N3b landed** (bootstrap-03 done). The
+  cert now emits a `-- production goals (N3b)` section: `def cert_<fn>_goals :
+  lib.GoalList` + a `goal_count cert_<fn>_goals = <n> := by decide` probe +
+  per-goal `-- goal i: <theorem name>` comments. N3c's remaining items,
+  concretely (all need the verus-binary rebuild + Lean toolchain):
+  1. Rebuild the binary, emit certs with `--tactus-emit-cert` ON over
+     bootstrap-fixture + w15_probe + tactus-core, confirm the GoalList half
+     **elaborates** and the new `goal_count` probe kernel-computes (§7.2 now
+     covers BOTH `stm_size` and `goal_count`).
+  2. **Companion GoalData golden**: `add_capped`'s current golden
+     (`testdata/add_capped.cert.lean`) predates the goal half — re-emit it with
+     goals populated and pin it (the existing golden test already tolerates the
+     goal section: empty ⇒ omitted; extend the recovery to parse the goal
+     section, or add a second golden).
+  3. Two-run byte-identical determinism sweep, now including the goal half.
+  4. Flag-ON vs flag-OFF suite parity (flag-off unperturbed by construction).
+  Unit-level (`cargo test -p lean_verify`) is already green at 320/0 incl. two
+  new goal tests — see bootstrap-03 writeup.
+
 ## Writeup
 
 _when done: findings, how the code works, assumptions made_

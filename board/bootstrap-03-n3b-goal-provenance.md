@@ -1,9 +1,9 @@
 ---
 title: "N3b — goal-side serialization via Wp provenance marks (the one production touch)"
-status: todo
-claimed_by:
+status: done
+claimed_by: opus-n3b
 created: 2026-07-13T19:38:00Z
-updated: 2026-07-13T19:38:00Z
+updated: 2026-07-13T23:05:00Z
 ---
 
 ## Description
@@ -87,6 +87,156 @@ construction + `goal_serialize`; suite green with flag off.
   §7.5 (see bootstrap-04) will need a companion GoalData golden once N3b
   emits it.
 
+- (2026-07-13, opus-n3b) **DESIGN DECISION RESOLVED — structured-frame
+  capture, NOT a provenance mark on `lean_ast::Expr`.** The prior scaffolding's
+  open question ("wrapper variant vs bool field on LExpr; grep the ~90 match
+  sites") is answered by *not marking the flat LExpr at all*. Evidence gathered
+  this turn:
+
+  1. **The `GoalData` mirror is ALREADY the structured spine** (tactus-core/
+     lib.rs:121): `enum GoalData { Leaf(u64), Imp(u64,Box), All(u64,u64,Box),
+     Let(u64,u64,Box) }`. This is a 1:1 image of `CtxFrame`
+     (`Hyp→Imp`, `Binder→All`, `Let→Let`) + theorem binders (`→All`) + the
+     goal leaf (`→Leaf`). The mirror is built for a structured spine, not for a
+     re-parsed flat statement — so the natural producer is the spine itself,
+     not a marked LExpr.
+  2. **Every WP goal flows through ONE choke point.** All exec-obligation
+     `Theorem`s are constructed at the single `self.out.push(Theorem{..})` in
+     `ObligationEmitter::emit_with_extras` (sst_to_lean.rs:1730). The other
+     `Theorem` ctor (to_lean_fn.rs:640, `proof_fn_to_ast`) is the TACTIC
+     proof-fn path, which §2 excludes ("tactic proof fns get no certificate").
+  3. **The structured `(binders, frames, leaf)` is in hand BEFORE flattening**
+     at the two `wrap()` sites: `emit_split` (1687) and `emit_with_closer`
+     (1610), each computing `remaining.wrap(leaf)`. The bit_vector path
+     `emit_with_preamble`→`wrap_no_hyps` (1787/1933) is a documented stage-A
+     exclusion (§3 "bv/compute/query asserts").
+
+  Why this beats the literal §5 "mark the LExpr":
+  * Zero touches to the shared `lean_ast::Expr` (a new variant hits every one
+    of the ~50 exhaustive matches; a bool-on-variant is fragile through
+    `substitute`/`and_all`/`span_mark`/`select_deterministic`).
+  * Zero touches to the pretty-printer → byte-identical Lean output is
+    guaranteed by construction (acceptance §7.4 flag-on==flag-off is free).
+  * Produces `GoalData` DIRECTLY from the walker's own construction record
+    (the frames), not by re-deriving structure from a re-marked flat tree.
+  * **Still exactly the non-circular provenance §5 demands**: the frame list
+    IS "where the production claims structure"; refWp (W2) recomputes structure
+    from the SST literal independently, and the `decide` equality validates it.
+    A mismark ⇒ bridge failure, never silent pass. The spine is arguably a
+    *purer* provenance record than a re-marked LExpr.
+
+  **Faithfulness invariant to pin in a test (gives the 1:1 the mark-approach
+  wanted, without marks):** folding a captured `GoalShape` back to an LExpr
+  (`All→forall`, `Imp→implies`, `Let→let_bind`, `Leaf→leaf`) must equal the
+  `Theorem.goal` the pp actually prints. Cheap to assert; catches any drift
+  between the side-capture and the emitted statement.
+
+- (2026-07-13, opus-n3b) **PLUMBING mapped (2 callers, 1 push site — no
+  `Theorem`/test churn).** `exec_fn_theorems_to_ast` ends `Ok(emitter.out)`
+  (1061); only 2 real callers (generate.rs:3741 package, :4039 island). Chosen
+  plumbing:
+  * `ObligationEmitter` gains `goal_shapes: Vec<Option<GoalShape>>`, pushed in
+    LOCKSTEP with `out` at the single 1730 push (index-aligned by
+    construction — one push each per emit). *Not* a field on `Theorem` (that
+    would break ~20 test-literal ctors in tests/sanity.rs, tests/lean_pp.rs,
+    tests/generate.rs — churn against "small diff").
+  * Return a small struct `ExecFnObligations { theorems, goal_shapes }`
+    instead of a bare `Vec<Theorem>`; destructure at both callers.
+  * Move `emit_cert` to AFTER `exec_fn_theorems_to_ast` (safe: `check` is
+    `&`-borrowed, not mutated, so the SST snapshot stays faithful) and pass it
+    `&theorems` + `&goal_shapes`. `serialize()` builds the `GoalList` from the
+    shapes, interning each spine LExpr/name into the SAME `LeafTable` the SST
+    walk used (walk order: params→requires→body→ensures→GOALS, appended).
+
+  Spine order (must match `wrap`'s fold — verified against the `wrap` doc at
+  1435): outermost→innermost = base_binders, extras (from
+  `split_leading_binders`), then `remaining.frames` in FORWARD (push) order
+  (since `wrap` iterates `.rev()`, first-pushed ends outermost), then the leaf.
+
+- **NEXT (implementation, staged):** (1) land `GoalShape`/`GoalSpine` +
+  emitter capture + `ExecFnObligations` return + 2-caller destructure —
+  compiles inert, suite green [Increment 1, this turn if budget allows];
+  (2) `goal_serialize` (GoalShape→GoalData term) + `CertBody.goal_term` +
+  render_cert GoalList section + per-goal theorem-name comments + goal_count
+  `decide` probe [Increment 2]; (3) companion GoalData golden + acceptance
+  folds into N3c.
+
 ## Writeup
 
-_when done: findings, how the code works, assumptions made_
+**Landed (2026-07-13, opus-n3b).** N3b goal-side serialization is implemented
+and unit-verified. Certificate files now carry BOTH the SST literal (N3a) and
+the production `GoalList` literal, sharing one leaf table. The mechanism is
+structured-frame capture, not a mark on `lean_ast::Expr` — see the DESIGN §5
+"RESOLVED" note and the Progress log for the full rationale.
+
+### How it works
+
+1. **Capture (production emitter, the one touch).** `lean_ast::GoalShape`
+   (`spine: Vec<GoalSpine>` outermost-first + `leaf: Expr`) and `GoalSpine`
+   (`All(Binder)`/`Imp(Expr)`/`Let(name,Expr)`) mirror `tactus_core.GoalData`.
+   `ObligationEmitter::build_goal_shape` assembles the spine from
+   `(base_binders, extras, remaining.frames, leaf)` at the two `wrap` sites
+   (`emit_split`, `emit_with_closer`); the bit_vector path
+   (`emit_with_preamble`→`wrap_no_hyps`) passes `None`. Shapes accumulate in
+   `ObligationEmitter.goal_shapes` in LOCKSTEP with `out` (one push each at the
+   single `emit_with_extras` site → index-aligned by construction).
+   `exec_fn_theorems_to_ast` now returns `ExecFnObligations { theorems,
+   goal_shapes }`.
+
+2. **Hook (2 generate.rs sites).** `emit_cert` moved to AFTER
+   `exec_fn_theorems_to_ast` (both package + island paths) and takes
+   `&theorems` + `&goal_shapes`. Faithful because `check` is `&`-borrowed by
+   that call — not mutated — so the SST snapshot is the same one N3a took.
+
+3. **Serialize (TCB).** `Serializer::goal_data` folds a `GoalShape` leaf-out
+   into a `lib.GoalData` term; `goal_list` emits one per obligation-with-spine
+   in production order, skipping `None`, and returns the included theorem names
+   for the O4 per-goal comments. `serialize` runs it AFTER the SST walk so SST
+   leaf ids keep their §4 order and matching goal leaves reuse them (cancel at
+   the bridge). `render_cert` appends a `-- production goals (N3b)` section:
+   per-goal name comments, `def cert_<fn>_goals : lib.GoalList`, and a
+   `goal_count … = n := by decide` probe (parallel to N3a's `stm_size` probe).
+   Emitted only when ≥1 obligation carried a spine, so an all-excluded fn's
+   bytes are unchanged.
+
+### Verified
+
+* `cargo build -p lean_verify` clean (only pre-existing warnings).
+* `cargo test -p lean_verify` → **320 passed, 0 failed** (was 318; +2 new goal
+  tests). The N3a golden `add_capped.cert.lean` stays **byte-identical** (empty
+  goals ⇒ section omitted). New unit tests: `goal_data_spine_shape` (pins
+  constructor mapping + outermost-first fold + leaf interning) and
+  `goal_list_skips_none_and_pairs_names` (None-skip + name pairing).
+* Diff scope confirmed: `lean_ast::Expr`'s match arms and the pretty-printer
+  are UNTOUCHED. No `Theorem` field was added (avoided ~20 test-literal ctors);
+  the one non-test ctor site touched is the test `mk_test_emitter`
+  (`goal_shapes: Vec::new()`).
+
+### NOT run here — N3c's acceptance gate (honest scope boundary)
+
+The Lean-level acceptance is bootstrap-04 (N3c), which is blocked-by-N3b
+precisely to run it, and needs the slow verus-binary rebuild + Lean toolchain:
+* Emit real certs with `--tactus-emit-cert` ON and confirm the `GoalList`
+  **elaborates** against the TactusCore olean, and the `goal_count … := by
+  decide` probe **kernel-computes**. (I verified the vocab names/arities by
+  reading `tactus-core/out/lib/TactusDefs_lib_exec__base.lean:47-62` and reused
+  N3a's working `box_`/`paren`/`decide` idioms, so residual risk is low but
+  the term has not actually been elaborated by Lean.)
+* Two-run byte-identical determinism sweep incl. the goal half.
+* Flag-ON vs flag-OFF suite parity (flag-off is unperturbed by construction —
+  `emit_cert` early-returns and the verification path is byte-unchanged).
+* Companion GoalData golden for `add_capped` (its N3a golden predates the goal
+  half; N3c should re-emit it with goals populated).
+
+### Assumptions
+
+* Spine order matches `OblCtx::wrap` (verified against its doc @ sst_to_lean
+  ~1435): theorem binders (base then extracted `extras`) outermost, then
+  `remaining.frames` in push order (wrap folds `.rev()`), then the leaf.
+* Goal-half leaf interning order is core-then-inner-to-outer per goal —
+  arbitrary but deterministic, which is all §4/acceptance §3 require (leaf
+  table is audit-only; the bridge reads no id values).
+* Binder-name / Ret-ensures ids inherit N3a's binder-id caveat (interned
+  rendered-name text; refWp's only consumers `goal_size`/`goal_count` ignore
+  the value). SSA-fresh-per-occurrence and the ret-value substitution are W2
+  refinements, unchanged here.

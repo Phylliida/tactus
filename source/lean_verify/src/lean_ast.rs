@@ -230,6 +230,54 @@ pub struct Theorem {
     pub decreasing_by: Option<String>,
 }
 
+/// N3b goal-provenance capture (DESIGN-N3-serializer.md §5). The Wp
+/// walker records the STRUCTURED spine of each exec-fn obligation
+/// statement here — at the single `OblCtx::wrap` site, before the frames
+/// are folded into the flat `Theorem.goal` — so the serializer prints the
+/// production goal as a `tactus_core.GoalData` literal without re-parsing
+/// the flattened statement (which is ambiguous at the spine tail: a
+/// hypothesis can itself be `a → b` or `∀`).
+///
+/// This IS the "provenance" of §5. Rather than marking nodes in the
+/// shared [`Expr`] type (which would touch every exhaustive match and the
+/// pretty-printer), the walker keeps its own construction record. It is
+/// non-circular exactly as §5 requires: the spine only records where the
+/// production CLAIMS structure; refWp (W2) recomputes structure
+/// independently from the SST literal, and the `decide` equality is what
+/// validates the claim. A mismark surfaces as a bridge failure, never a
+/// silent pass.
+///
+/// Populated only for WP-obligation theorems. `None` (in the
+/// index-aligned `goal_shapes` vector) marks a documented stage-A
+/// exclusion — `bit_vector`/`query` obligations, which use `wrap_no_hyps`
+/// and get no `GoalData`.
+///
+/// Faithfulness invariant (worth pinning in a test): folding a `GoalShape`
+/// back to an `Expr` — `All→forall`, `Imp→implies`, `Let→let_bind`,
+/// `leaf` at the core — must equal the `Theorem.goal` the pp emits.
+#[derive(Debug, Clone)]
+pub struct GoalShape {
+    /// Spine constructors, OUTERMOST first (matching `OblCtx::wrap`'s
+    /// fold: theorem binders wrap the frame stack wraps the leaf).
+    pub spine: Vec<GoalSpine>,
+    /// The obligation predicate at the core of the spine.
+    pub leaf: Expr,
+}
+
+/// One structural node of a [`GoalShape`] spine. Mirrors
+/// `tactus_core.GoalData`'s `All`/`Imp`/`Let` constructors; the `Leaf`
+/// constructor corresponds to [`GoalShape::leaf`].
+#[derive(Debug, Clone)]
+pub enum GoalSpine {
+    /// `∀ (x : T),` — a theorem-level binder or a walker `Binder` frame.
+    All(Binder),
+    /// `h →` — a hypothesis (an assumption, a branch condition, or a
+    /// discharged assertion carried forward).
+    Imp(Expr),
+    /// `let x := v;` — a let-binding frame.
+    Let(crate::lean_name::LeanName, Expr),
+}
+
 /// A piece of preamble that some theorem needs in its elaboration
 /// context. `krate_preamble` collects these from all emitted
 /// theorems, dedups, and emits at file top.

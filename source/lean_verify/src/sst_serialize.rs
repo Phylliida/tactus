@@ -13,9 +13,24 @@
 //! `<TACTUS_LEAN_OUT>/<crate>/cert/<fn>.cert.lean` containing the fn's
 //! post-transform SST body, printed as a Lean term of the `tactus-core`
 //! mirror vocabulary (`lib.StmData` / `lib.LeafList` / …), plus the
-//! `FnCtxData` seed refWp (W2) will recompute obligations from. The
-//! production goals (`GoalList`) join in N3b; the `refWp … = production`
-//! bridge line joins in W2. N3a's job is faithful *input* serialization.
+//! `FnCtxData` seed refWp (W2) will recompute obligations from, plus (N3b)
+//! the production `GoalList` refWp's result is compared against. The
+//! `refWp … = production` bridge line joins in W2.
+//!
+//! # Goal half (N3b) — the one production-emitter touch
+//!
+//! The production goals are captured as *structured* [`GoalShape`] spines
+//! by the Wp walker at its single `wrap` site (before the frames fold
+//! into the flat statement), NOT by marking nodes on the shared
+//! `lean_ast::Expr` type. This is the provenance of DESIGN-N3 §5 realized
+//! without touching the pretty-printer or `Expr`'s ~50 match arms — the
+//! frame list IS the walker's construction record. `goal_serialize`
+//! ([`Serializer::goal_data`]/[`Serializer::goal_list`]) turns each spine
+//! into a `lib.GoalData`, interning every spine leaf into the SAME leaf
+//! table as the SST half so matching leaves cancel across the W2 bridge.
+//! Non-circular exactly as §5 requires: refWp recomputes structure from
+//! the SST literal independently, and the `decide` equality validates the
+//! claim — a mismark fails the bridge, never silent-passes.
 //!
 //! # Snapshot point (faithfulness anchor #1)
 //!
@@ -107,7 +122,7 @@ use std::sync::Mutex;
 use vir::ast::{KrateX, Typ, VarIdent};
 use vir::sst::{Exp, FuncCheckSst, FunctionSst, LoopInv, Stm, StmX};
 
-use crate::lean_ast::Expr as LExpr;
+use crate::lean_ast::{Expr as LExpr, GoalShape, GoalSpine, Theorem};
 use crate::lean_pp::pp_expr;
 use crate::to_lean_type::{param_binder_typ, typ_to_expr};
 
@@ -462,6 +477,82 @@ impl Serializer {
         }
         term
     }
+
+    // ── Goal walk (GoalData / GoalList literal) — N3b ────────────────
+
+    /// Intern an already-built `LExpr` (a goal-spine leaf) by its
+    /// production-rendered text — the SAME `pp_expr` path SST leaves use,
+    /// so a goal leaf whose text matches an SST leaf reuses that id and
+    /// the two cancel across the bridge (§4).
+    fn lexpr_leaf(&mut self, e: &LExpr) -> u64 {
+        self.leaves.intern(pp_expr(e))
+    }
+
+    /// Binder-name id for a spine `∀` node = the interned leaf of the
+    /// binder's source name (`_` for an anonymous / instance binder).
+    /// Same binder-id caveat as `binder_id` — refWp's only consumers
+    /// (`goal_size`/`goal_count`) ignore the value.
+    fn goal_binder_name_leaf(&mut self, b: &crate::lean_ast::Binder) -> u64 {
+        match &b.name {
+            Some(n) => self.text_leaf(n.as_str()),
+            None => self.text_leaf("_"),
+        }
+    }
+
+    /// Render one obligation's [`GoalShape`] as a `lib.GoalData` term. The
+    /// spine is OUTERMOST-first, so fold from the core `Leaf` outward
+    /// (reverse spine). Interning order within a goal is therefore
+    /// core-leaf-then-inner-to-outer — arbitrary but deterministic, which
+    /// is all §4/acceptance §3 require of the goal half (the leaf table is
+    /// audit-only; the bridge never reads id values).
+    fn goal_data(&mut self, shape: &GoalShape) -> String {
+        let leaf_id = self.lexpr_leaf(&shape.leaf);
+        let mut term = format!("{}.GoalData.Leaf {}", NS, leaf_id);
+        for node in shape.spine.iter().rev() {
+            term = match node {
+                GoalSpine::Imp(p) => {
+                    let h = self.lexpr_leaf(p);
+                    format!("{}.GoalData.Imp {} {}", NS, h, box_(&term))
+                }
+                GoalSpine::All(b) => {
+                    let name = self.goal_binder_name_leaf(b);
+                    let typ = self.lexpr_leaf(&b.ty);
+                    format!("{}.GoalData.All {} {} {}", NS, name, typ, box_(&term))
+                }
+                GoalSpine::Let(n, v) => {
+                    let name = self.text_leaf(n.as_str());
+                    let val = self.lexpr_leaf(v);
+                    format!("{}.GoalData.Let {} {} {}", NS, name, val, box_(&term))
+                }
+            };
+        }
+        paren(&term)
+    }
+
+    /// The production `lib.GoalList` — one `GoalData` per WP obligation in
+    /// emit (= production theorem) order. Obligations whose spine is
+    /// `None` (bit_vector/query stage-A exclusions) are skipped. Returns
+    /// the list term plus the included obligations' theorem names, in the
+    /// same order, for the O4 per-goal audit comments (§6).
+    fn goal_list(
+        &mut self,
+        theorems: &[Theorem],
+        shapes: &[Option<GoalShape>],
+    ) -> (String, Vec<String>) {
+        let mut terms: Vec<String> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        for (thm, shape) in theorems.iter().zip(shapes.iter()) {
+            if let Some(shape) = shape {
+                names.push(thm.name.clone());
+                terms.push(self.goal_data(shape));
+            }
+        }
+        let mut term = format!("{}.GoalList.Nil", NS);
+        for t in terms.iter().rev() {
+            term = format!("{}.GoalList.Cons {} {}", NS, box_(t), box_(&term));
+        }
+        (term, names)
+    }
 }
 
 // ── Top-level: build the certificate for one fn ─────────────────────
@@ -472,13 +563,31 @@ struct CertBody {
     ctx_term: String,
     /// The `StmData` body as a Lean term.
     stm_term: String,
+    /// N3b: the production `GoalList` literal (the goal spines refWp's
+    /// result is compared against at the W2 bridge). `GoalList.Nil` +
+    /// empty `goal_names` when no obligation carried a spine.
+    goal_term: String,
+    /// N3b: production theorem names for the emitted goals, in `GoalList`
+    /// order — one per `Cons`, for the O4 per-goal audit comment (§6).
+    goal_names: Vec<String>,
     /// The interned leaf table, in id order.
     leaf_texts: Vec<String>,
 }
 
-/// Serialize `(fn_sst, check)` into a [`CertBody`], or `Err(tag)` on the
-/// first uncaptured construct.
-fn serialize(fn_sst: &FunctionSst, check: &FuncCheckSst) -> Sr<CertBody> {
+/// Serialize `(fn_sst, check)` plus the production obligation goals into
+/// a [`CertBody`], or `Err(tag)` on the first uncaptured construct.
+///
+/// `theorems` / `goal_shapes` are the index-aligned output of
+/// `exec_fn_theorems_to_ast` (N3b): the goal spines interned into the
+/// SAME leaf table as the SST half, appended AFTER the SST walk so SST
+/// leaf ids stay in their §4 first-appearance order and matching goal
+/// leaves reuse them.
+fn serialize(
+    fn_sst: &FunctionSst,
+    check: &FuncCheckSst,
+    theorems: &[Theorem],
+    goal_shapes: &[Option<GoalShape>],
+) -> Sr<CertBody> {
     let mut s = Serializer::default();
 
     // Walk order (§4): params → requires → body → ensures. Interning in
@@ -548,7 +657,18 @@ fn serialize(fn_sst: &FunctionSst, check: &FuncCheckSst) -> Sr<CertBody> {
         paren(&s.leaf_list(&ens_leaves)),
     );
 
-    Ok(CertBody { ctx_term, stm_term, leaf_texts: s.leaves.texts })
+    // Goal half (N3b): after the SST walk, so SST leaf ids are fixed and
+    // matching goal leaves reuse them. One `GoalData` per obligation that
+    // carried a spine; `None` (bit_vector/query) are skipped.
+    let (goal_term, goal_names) = s.goal_list(theorems, goal_shapes);
+
+    Ok(CertBody {
+        ctx_term,
+        stm_term,
+        goal_term,
+        goal_names,
+        leaf_texts: s.leaves.texts,
+    })
 }
 
 /// Emit the certificate for one exec/WP-proof fn. Never propagates
@@ -560,12 +680,18 @@ pub fn emit_cert(
     fn_sst: &FunctionSst,
     check: &FuncCheckSst,
     crate_name: &str,
+    // N3b: the production obligation theorems + their goal spines,
+    // index-aligned (the output of `exec_fn_theorems_to_ast`). Read here
+    // — after that call, but from the SAME `&`-borrowed `check`, so the
+    // SST snapshot is still faithful (§2).
+    theorems: &[Theorem],
+    goal_shapes: &[Option<GoalShape>],
 ) {
     if !cert_emit_enabled() {
         return;
     }
     let fn_name = crate::to_lean_type::lean_name_relative(&fn_sst.x.name.path);
-    match serialize(fn_sst, check) {
+    match serialize(fn_sst, check, theorems, goal_shapes) {
         Ok(body) => match write_cert_file(crate_name, &fn_name, &body) {
             Ok(()) => census_note_certified(),
             Err(io) => {
@@ -642,6 +768,31 @@ fn render_cert(crate_name: &str, fn_name: &str, leaf: &str, body: &CertBody) -> 
         leaf,
         stm_size_of(&body.stm_term),
     ));
+
+    // Goal half (N3b). Emitted only when at least one obligation carried a
+    // spine — an all-excluded fn leaves this section (and the byte stream)
+    // exactly as N3a produced it, so the N3a golden stays valid.
+    if !body.goal_names.is_empty() {
+        out.push('\n');
+        out.push_str("-- ── production goals (N3b) ──────────────────────────────────\n");
+        // O4 obligation pairing: one comment per `GoalList` entry, in
+        // order, carrying the production theorem name.
+        for (i, name) in body.goal_names.iter().enumerate() {
+            out.push_str(&format!("-- goal {}: {}\n", i, sanitize_comment(name)));
+        }
+        out.push_str(&format!(
+            "@[reducible] def cert_{}_goals : {}.GoalList :=\n  {}\n\n",
+            leaf, NS, body.goal_term,
+        ));
+        // Parallel to the SST probe: the GoalList literal kernel-computes
+        // to the obligation count we emitted.
+        out.push_str(&format!(
+            "example : {}.goal_count cert_{}_goals = {} := by decide\n",
+            NS,
+            leaf,
+            body.goal_names.len(),
+        ));
+    }
 
     out
 }
@@ -812,8 +963,92 @@ mod tests {
         assert!(!ctx_term.is_empty(), "ctx term not recovered from golden");
         assert!(!stm_term.is_empty(), "sst term not recovered from golden");
 
-        let body = CertBody { ctx_term, stm_term, leaf_texts };
+        // N3b goal half is absent from this N3a-era golden; empty goals
+        // ⇒ render_cert omits the goal section ⇒ byte stream unchanged.
+        // (N3c adds a companion golden with the GoalList populated.)
+        let body = CertBody {
+            ctx_term,
+            stm_term,
+            goal_term: format!("{}.GoalList.Nil", NS),
+            goal_names: Vec::new(),
+            leaf_texts,
+        };
         let rendered = render_cert("lib", "add_capped", "add_capped", &body);
         assert_eq!(rendered, GOLDEN, "cert-file format drift vs golden");
+    }
+
+    /// N3b: a hand-built `GoalShape` serializes to the expected
+    /// `lib.GoalData` spine — pins the constructor mapping
+    /// (`All`/`Imp`/`Let`/`Leaf`), the outermost-first fold direction
+    /// (theorem binder ends up the outermost `All`), and that every spine
+    /// leaf lands in the shared table.
+    #[test]
+    fn goal_data_spine_shape() {
+        use crate::lean_ast::{Binder, GoalShape, GoalSpine};
+        use crate::lean_name::LeanName;
+
+        // ∀ (nn : Ity), (hyp0) → let mm := vv; (goalpred)  [outermost-first].
+        // Distinct identifiers throughout so no accidental leaf sharing
+        // muddies the structural check.
+        let shape = GoalShape {
+            spine: vec![
+                GoalSpine::All(Binder::explicit(
+                    LeanName::synthetic("nn"),
+                    LExpr::var(LeanName::synthetic("Ity")),
+                )),
+                GoalSpine::Imp(LExpr::var(LeanName::synthetic("hyp0"))),
+                GoalSpine::Let(
+                    LeanName::synthetic("mm"),
+                    LExpr::var(LeanName::synthetic("vv")),
+                ),
+            ],
+            leaf: LExpr::var(LeanName::synthetic("goalpred")),
+        };
+        let mut s = Serializer::default();
+        let term = s.goal_data(&shape);
+        // Leaf-out fold: Leaf wrapped by Let, then Imp, then All outermost.
+        assert!(
+            term.starts_with(&format!("({}.GoalData.All ", NS)),
+            "outermost node should be the ∀ binder: {}", term,
+        );
+        assert!(term.contains(&format!("{}.GoalData.Imp ", NS)), "{}", term);
+        assert!(term.contains(&format!("{}.GoalData.Let ", NS)), "{}", term);
+        assert!(term.contains(&format!("{}.GoalData.Leaf ", NS)), "{}", term);
+        // Each spine leaf reached the table: binder typ, binder name, hyp,
+        // let name, let value, core predicate — all distinct here.
+        for want in ["Ity", "nn", "hyp0", "mm", "vv", "goalpred"] {
+            assert!(s.leaves.texts.iter().any(|t| t == want), "missing leaf {}: {:?}", want, s.leaves.texts);
+        }
+    }
+
+    /// N3b: `goal_list` emits one `Cons` per obligation with a spine and
+    /// skips `None` (bit_vector/query) obligations, pairing each emitted
+    /// goal with its production theorem name.
+    #[test]
+    fn goal_list_skips_none_and_pairs_names() {
+        use crate::lean_ast::{GoalShape, GoalSpine};
+        use crate::lean_name::LeanName;
+
+        let mk = |p: &str| GoalShape {
+            spine: vec![GoalSpine::Imp(LExpr::var(LeanName::synthetic("h")))],
+            leaf: LExpr::var(LeanName::synthetic(p)),
+        };
+        let thm = |n: &str| Theorem {
+            name: n.to_string(),
+            binders: Vec::new(),
+            goal: LExpr::var(LeanName::synthetic("g")),
+            tactic: crate::lean_ast::Tactic::Named("tactus_auto".to_string()),
+            requires_preamble: Vec::new(),
+            heartbeats: None,
+            termination_by: Vec::new(),
+            decreasing_by: None,
+        };
+        let theorems = vec![thm("obl_a"), thm("obl_bv"), thm("obl_c")];
+        let shapes = vec![Some(mk("pa")), None, Some(mk("pc"))];
+
+        let mut s = Serializer::default();
+        let (term, names) = s.goal_list(&theorems, &shapes);
+        assert_eq!(names, vec!["obl_a".to_string(), "obl_c".to_string()]);
+        assert_eq!(term.matches(&format!("{}.GoalList.Cons", NS)).count(), 2, "{}", term);
     }
 }
