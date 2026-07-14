@@ -696,6 +696,73 @@ fn lexpr_to_exprdata_ite_no_else_fails() {
     assert_eq!(s.lexpr_to_exprdata(&ite).unwrap_err(), "ed-if-noelse");
 }
 
+/// W7c (bootstrap-28) — the production `match`-body transcription (the
+/// `tree_head` exemplar: `match t { Tree.Leaf v => v, Tree.Node _l _r => 0 }`).
+/// Interning follows the production walk order: scrutinee first (t=0), then arms
+/// REVERSED (the fold builds the list right-to-left): the Node arm interns its
+/// ctor `lib.Tree.Node`=1 and its field binders reversed (_r=2, _l=3), then the
+/// Leaf arm interns `lib.Tree.Leaf`=4 and `v`=5 (the body reuses `v`=5). The
+/// binder-id list preserves the pattern arg order (`_l`=3 then `_r`=2 in the
+/// Node list). This pins the production shape; cross-side `def_eq` agreement
+/// against the reference `MatchR` is the W7d e2e bridge's job.
+#[test]
+fn lexpr_to_exprdata_match_tree_head() {
+    use crate::lean_ast::MatchArm;
+    use crate::lean_name::LeanName;
+    let mut s = Serializer::default();
+    let leaf_arm = MatchArm {
+        pattern: LPattern::Ctor {
+            name: "lib.Tree.Leaf".to_string(),
+            args: vec![LPattern::Var(LeanName::synthetic("v"))],
+        },
+        body: LExpr::var_synthetic("v"),
+    };
+    let node_arm = MatchArm {
+        pattern: LPattern::Ctor {
+            name: "lib.Tree.Node".to_string(),
+            args: vec![
+                LPattern::Var(LeanName::synthetic("_l")),
+                LPattern::Var(LeanName::synthetic("_r")),
+            ],
+        },
+        body: LExpr::lit_int("0"),
+    };
+    let m = LExpr::match_expr(LExpr::var_synthetic("t"), vec![leaf_arm, node_arm]);
+    assert_eq!(
+        s.lexpr_to_exprdata(&m).unwrap(),
+        format!(
+            "({NS}.ExprData.Match \
+               (Tactus.Box.mk ({NS}.ExprData.Atom 0)) \
+               (Tactus.Box.mk \
+                 ({NS}.ArmList.Cons 4 \
+                    ({NS}.BinderIdList.Cons 5 (Tactus.Box.mk {NS}.BinderIdList.Nil)) \
+                    (Tactus.Box.mk ({NS}.ExprData.Atom 5)) \
+                    (Tactus.Box.mk \
+                      ({NS}.ArmList.Cons 1 \
+                         ({NS}.BinderIdList.Cons 3 (Tactus.Box.mk \
+                            ({NS}.BinderIdList.Cons 2 (Tactus.Box.mk {NS}.BinderIdList.Nil)))) \
+                         (Tactus.Box.mk ({NS}.ExprData.Lit 0)) \
+                         (Tactus.Box.mk {NS}.ArmList.Nil))))))"
+        )
+    );
+}
+
+/// W7c — a non-ctor arm pattern (a bare `_` at the arm head) has no `ArmList`
+/// counterpart in a datatype match; the production arm fails loud (`ed-arm-pat`)
+/// rather than emit a shape the reference `MatchR` side cannot produce. Mirrors
+/// the reference twin's `rawvir-arm-pat`, so the two sides reject in lockstep.
+#[test]
+fn lexpr_to_exprdata_match_nonctor_arm_fails() {
+    use crate::lean_ast::MatchArm;
+    let mut s = Serializer::default();
+    let arm = MatchArm {
+        pattern: LPattern::Wildcard,
+        body: LExpr::lit_int("0"),
+    };
+    let m = LExpr::match_expr(LExpr::var_synthetic("t"), vec![arm]);
+    assert_eq!(s.lexpr_to_exprdata(&m).unwrap_err(), "ed-arm-pat");
+}
+
 // ── W6d.2b-2: the emit-path gate (`oblig_slot` + `goal_data` deep/atom) ──
 //
 // The obligation (reference) side drives: `oblig_slot` deepens a coverable

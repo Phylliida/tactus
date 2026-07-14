@@ -194,7 +194,7 @@ use vir::sst::{BndX, CallFun, Exp, ExpX, FuncCheckSst, FunctionSst, LoopInv, Stm
 
 use crate::lean_ast::{
     AssertKind, BinOp as LBinOp, Expr as LExpr, ExprNode, GoalShape, GoalSpine, ObligationKind,
-    Theorem, UnOp as LUnOp,
+    Pattern as LPattern, Theorem, UnOp as LUnOp,
 };
 use crate::lean_pp::pp_expr;
 use crate::to_lean_type::{param_binder_typ, typ_to_expr};
@@ -1261,7 +1261,91 @@ impl<'a> Serializer<'a> {
                 ))
             }
             ExprNode::If { else_: None, .. } => Err("ed-if-noelse".to_string()),
+            // W7c (bootstrap-28) — first-class `match` in a spec-fn body (the
+            // `tree_head`/`sum_tree` exemplars). Production's `vir_expr_to_ast`
+            // Match arm PRESERVES `match` in def bodies (unlike the obligation
+            // surface, where AST→SST desugars it to `if`-chains) — so this
+            // ExprNode only reaches the def-body entry point (W7d), never an
+            // obligation goal → the arm is verdict-neutral on the current emit
+            // path (the surface-fork finding, bootstrap-28). Structural twin of
+            // the reference `raw_vir_exp` `MatchR` arm: scrutinee recurses, arms
+            // fold right-to-left into the inlined `ArmList::Cons(ctor_id,
+            // binder_ids, body, tail)` (W7b froze the inlined list). Ctor/binder
+            // ids intern identically to the reference by construction — see
+            // `lpattern_ctor_binds` (§7 Q1). Arm-body coercion lives on the
+            // reference `render_arms` side; production transcribes each body
+            // VERBATIM (any branch cast is already an `Int.toNat` App the `Cast`
+            // arm handles), matching `render_arms`' per-arm materialization.
+            // Guards are ABSENT from `lean_ast::MatchArm` (production's
+            // `expr_to_node` dropped them upstream); the reference side is the
+            // one that fails loud on a non-trivial guard, so there is nothing to
+            // re-check here.
+            ExprNode::Match { scrutinee, arms } => {
+                let scrut = self.lexpr_to_exprdata(scrutinee)?;
+                let mut arm_list = format!("{}.ArmList.Nil", NS);
+                for arm in arms.iter().rev() {
+                    let (ctor_id, binds) = self.lpattern_ctor_binds(&arm.pattern)?;
+                    let body = self.lexpr_to_exprdata(&arm.body)?;
+                    arm_list = format!(
+                        "({}.ArmList.Cons {} {} {} {})",
+                        NS,
+                        ctor_id,
+                        paren(&binds),
+                        box_ed(&body),
+                        box_ed(&arm_list)
+                    );
+                }
+                Ok(format!(
+                    "({}.ExprData.Match {} {})",
+                    NS,
+                    box_ed(&scrut),
+                    box_(&arm_list)
+                ))
+            }
             _ => Err(format!("ed-{}", lexpr_construct_tag(&e.node))),
+        }
+    }
+
+    /// A production match-arm pattern (`lean_ast::Pattern`) → its `(ctor_id,
+    /// BinderIdList-text)` — the production twin of the reference
+    /// `pattern_ctor_binds`. The ctor id interns the SAME string the reference
+    /// does: production's `pattern_to_ast` built `Pattern::Ctor { name }` from
+    /// the SHARED `ctor_pattern_name(dt, variant)` helper, and the reference
+    /// interns `text_leaf(ctor_pattern_name(..))`, so `text_leaf(name)` here is
+    /// equal by construction (§7 Q1, no drift). Field binder ids are the
+    /// positional `Pattern::Var(LeanName)` args in the SAME `args.iter()` order
+    /// the reference reads the VIR `fields` — and production built each LeanName
+    /// via `LeanName::from_var_ident(&binding.name)`, so `text_leaf(name)` here
+    /// equals the reference `binder_id(&binding.name)`. Non-ctor patterns
+    /// (Wildcard/Tuple/Or/Binding/Lit at the arm head) fail loud — a def-body
+    /// match on a datatype presents ctor patterns; the reference twin likewise
+    /// fails loud (`rawvir-arm-pat`), so the two agree on rejection.
+    fn lpattern_ctor_binds(&mut self, pat: &LPattern) -> Sr<(u64, String)> {
+        match pat {
+            LPattern::Ctor { name, args } => {
+                let ctor_id = self.text_leaf(name);
+                let mut binds = format!("{}.BinderIdList.Nil", NS);
+                for a in args.iter().rev() {
+                    let bid = self.lpattern_binder_id(a)?;
+                    binds = format!("({}.BinderIdList.Cons {} {})", NS, bid, box_raw(&binds));
+                }
+                Ok((ctor_id, binds))
+            }
+            _ => Err("ed-arm-pat".to_string()),
+        }
+    }
+
+    /// A production ctor-FIELD pattern → its bound-var binder id — the twin of
+    /// the reference `pattern_binder_id`. Only a `Pattern::Var(LeanName)` (the
+    /// fixture's `Leaf(v)` / `Node(_l, _r)` — `_l`/`_r` are NAMED vars, not bare
+    /// `_`) is mirrored, interning the LeanName text. That equals the reference
+    /// `binder_id(&binding.name)` because production built the LeanName via
+    /// `LeanName::from_var_ident(&binding.name)` (= what `binder_id` interns).
+    /// Wildcards / nested patterns fail loud, matching the reference twin.
+    fn lpattern_binder_id(&mut self, pat: &LPattern) -> Sr<u64> {
+        match pat {
+            LPattern::Var(name) => Ok(self.text_leaf(name.as_str())),
+            _ => Err("ed-field-pat".to_string()),
         }
     }
 
