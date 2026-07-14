@@ -660,6 +660,44 @@ fn raw_vir_exp_peels_box_and_reads_var() {
     assert_eq!(bare, format!("({NS}.RawExp.Var 0 {NS}.TypData.TyInt)"));
 }
 
+/// A real spec-fn body arrives wrapped in the frontend's statement-less
+/// block-expr `Block([], Some(tail))` — the shape the LIVE emit path feeds
+/// (`tri`/`sq`/`tree_head`), which the bare-Ite unit pins missed and which hit
+/// `rawvir-block` on the first live run (W7d, bootstrap-33). Production's
+/// `block_to_node` peels an empty block straight to the lowered tail, so the
+/// reference must too: the wrapped body serializes byte-identically to its bare
+/// tail. (Fresh serializer per call so interning starts from 0 for both.)
+#[test]
+fn raw_vir_exp_peels_empty_block_to_tail() {
+    let boolt: Typ = std::sync::Arc::new(TypX::Bool);
+    let mk_ite = || {
+        let cond = mk_vexpr(ExprX::Var(tvar("b")), boolt.clone());
+        let then_ = mk_vexpr(ExprX::Var(tvar("x")), tint());
+        let else_ = mk_vexpr(ExprX::Var(tvar("y")), tint());
+        mk_vexpr(ExprX::If(cond, then_, Some(else_)), tint())
+    };
+    let bare = Serializer::default().raw_vir_exp(&mk_ite()).unwrap();
+    let block = mk_vexpr(ExprX::Block(std::sync::Arc::new(vec![]), Some(mk_ite())), tint());
+    assert_eq!(Serializer::default().raw_vir_exp(&block).unwrap(), bare);
+}
+
+/// A block WITH statements (a `let` in a spec fn) is outside the
+/// fixture-reachable set — it lowers production-side to `let`/`match` nesting
+/// the reference doesn't yet mirror, so it must stay fail-loud (`rawvir-block`)
+/// rather than silently drop the statements.
+#[test]
+fn raw_vir_exp_block_with_stmts_fails() {
+    use vir::ast::StmtX;
+    let mut s = Serializer::default();
+    let tail = mk_vexpr(ExprX::Var(tvar("x")), tint());
+    let stmt = vir::def::Spanned::new(
+        vir::messages::Span::dummy(),
+        StmtX::Expr(mk_vexpr(ExprX::Var(tvar("x")), tint())),
+    );
+    let block = mk_vexpr(ExprX::Block(std::sync::Arc::new(vec![stmt]), Some(tail)), tint());
+    assert_eq!(s.raw_vir_exp(&block).unwrap_err(), "rawvir-block");
+}
+
 /// W7c — the production side transcribes a body if VERBATIM (any branch
 /// coercion is already an `Int.toNat` App the `Cast` arm handles), matching the
 /// reference `render_exp`'s `Ite`. Cond/then/else are bare vars (c=0, t=1, e=2).

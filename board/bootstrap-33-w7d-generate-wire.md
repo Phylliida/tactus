@@ -1,9 +1,9 @@
 ---
 title: "W7d wire — live emit path: call emit_def_cert/emit_dt_cert from generate.rs"
-status: in_progress
+status: done
 claimed_by: opus-w7d-wire
 created: 2026-07-15T12:00:00Z
-updated: 2026-07-14T00:00:00Z
+updated: 2026-07-14T10:25:00Z
 ---
 
 ## Description
@@ -144,40 +144,107 @@ The assembler is done and unit-pinned (bootstrap-32, second increment):
   wire-up with no extra gating needed; a future package-check `cert/*.cert.lean`
   glob still won't match the distinct `.defcert`/`.dtcert` suffixes.
 
+- (2026-07-14, opus-w7d-wire) **LIVE VALIDATION CLOSED — the "Done when" is
+  met end-to-end. One real bug found + fixed on the first live run.**
+
+  1. **vargo release rebuild** (fork vargo on PATH, from `source/`): rc=0,
+     vstd 1530/0. Binary now carries the wire.
+  2. **First live emit** (`--tactus-emit-cert` over `bootstrap-fixture/lib.rs`,
+     `TACTUS_LEAN_OUT=$PWD/bootstrap-fixture/out`): **the datatype cert
+     `lib__Tree.dtcert.lean` was written live, but every spec-fn def cert was
+     REJECTED with `rawvir-block`** (`tri`/`sq`/`tree_head`). Root cause: a real
+     spec-fn body arrives wrapped in the frontend's statement-less block-expr
+     `ExprX::Block([], Some(tail))`; the hand-built unit pins fed a BARE `Ite`,
+     so `raw_vir_exp` never grew a `Block` arm and fell through to the fail-loud
+     `rawvir-{tag}` default. This is exactly the class of gap the live path
+     exists to catch — the reference transcriber was missing the body wrapper
+     the real VIR carries.
+  3. **Fix** (`sst_serialize.rs`, `raw_vir_exp`): peel an empty block to its
+     tail — `ExprX::Block(stmts, Some(tail)) if stmts.is_empty() =>
+     self.raw_vir_exp(tail)`. Mirrors production's `block_to_node`
+     (to_lean_expr.rs:1107-1113), which returns `expr_to_ast(final_expr)` for an
+     empty block — so the DefData body is the lowered tail and the reference now
+     matches. A block WITH stmts (a `let` in a spec fn) stays fail-loud
+     (falls through) — outside the fixture set, needs the reference `Let` arm.
+     +2 regression unit tests (`raw_vir_exp_peels_empty_block_to_tail`,
+     `raw_vir_exp_block_with_stmts_fails`); `cargo test -p lean_verify` 366/0 +
+     7/0.
+  4. **Rebuild + re-emit**: census 14/27 → 19/27; the ONLY remaining def
+     rejection is vstd's poly `set.Set.subset_of` (`rawvir-def-poly`, correctly
+     gated). Four live certs written: `tri.defcert.lean`, `sq.defcert.lean`,
+     `tree_head.defcert.lean`, `lib__Tree.dtcert.lean`.
+  5. **Elaborate live** (`probe-w0/probe17_w7d_live/run.sh`, the probe9-analog
+     for the defs layer — globs the LIVE `.defcert`/`.dtcert` and elaborates
+     each against `tactus-core/out/lib` + prelude): all four **positive OK**
+     (`def_eq`/`dt_eq` close by `decide`) and all four **kill OK** (the
+     `= 1`→`= 0` perturbation is REJECTED — non-vacuous on the live path).
+  6. **Residual-risk check (the board's one open question):** the fully-real
+     `tri.defcert.lean` carries the REAL recursive Ite body
+     (`n==0 ? 0 : n + tri((n-1) as nat)` — self-`Call 0`, `Clip TyNat`/`Cast
+     IntToNat` on the `as nat`, `BinOp 7` subtraction) and its single
+     monomorphic `Nat` param interns to id 1 on BOTH sides — so
+     `fn_binders_without_bound_hyps` did NOT strip anything and the
+     refinement-bound-param divergence did not bite. Honest-scope gap probe16
+     left open (a single fully-real `tri` from one Serializer run on the live
+     path) is now CLOSED.
+
 ## Writeup
 
-_partial — the CODE wire is landed + unit/type validated; the LIVE e2e
-validation is not yet run (needs a vargo release rebuild)._
+**DONE — the W7d live wire is validated end-to-end.** The production emit path
+writes `.defcert.lean` / `.dtcert.lean` files from real `verus --lean-backend
+--tactus-emit-cert` runs, and those live files elaborate + `decide`-close their
+`def_eq`/`dt_eq` bridges against `tactus-core/out/lib`, with a non-vacuous
+mutation-kill on the live path. One real transcriber gap was found by the live
+run and fixed.
 
-### Done (this turn)
-- The production wire: `emit_def_cert` at both `spec_fn_to_ast` sites,
-  `emit_dt_cert` for every emitted datatype, `crate_name` threaded through the
-  shared-defs emitter, two new helpers (`maybe_emit_def_cert`,
-  `collect_emitted_datatypes`). Flag-gated no-op by default; suite 364/0 +
-  7/0, `cargo check` clean.
+### What the live path produces
+Running the freshly-rebuilt fork verus over `bootstrap-fixture/lib.rs` with
+`--tactus-emit-cert` (`TACTUS_LEAN_OUT=$PWD/bootstrap-fixture/out`) writes four
+defs-layer certs into `bootstrap-fixture/out/lib/cert/`:
+- `tri.defcert.lean` — the fully-real recursive spec fn (header + real Ite body
+  from one shared Serializer run).
+- `sq.defcert.lean` — plain `x*x` (`BinOp 8`) body.
+- `tree_head.defcert.lean` — `match`-bodied def.
+- `lib__Tree.dtcert.lean` — the multi-variant recursive datatype (the
+  `Node(Box<Tree>,Box<Tree>)` fields render as `TyBox 0` — the W7a §7 Q4
+  Box→TyBox subtlety, exercised live).
+Each file is self-contained (`import TactusDefs_lib_exec` + `cert_<leaf>_raw` +
+`cert_<leaf>_{def,dt}data` + `example : lib.{def,dt}_eq (lib.render_{def,dt}
+raw) data = 1 := by decide`), so elaborating it IS the bridge.
 
-### Remaining (the live validation — the task's "Done when")
-1. **vargo release rebuild** (fork vargo on PATH — memory
-   `reference_tactus_bootstrap_vargo_path`; bare vargo bails "sources
-   changed"). The emit path only runs inside a real `verus` invocation.
-2. **Run a fixture crate with `--tactus-emit-cert`** that has a monomorphic
-   spec fn (`tri`-shaped) + a multi-variant recursive datatype (`Tree`-shaped)
-   and confirm `{crate}/cert/<leaf>.defcert.lean` + `<leaf>.dtcert.lean` are
-   written.
-3. **Elaborate the live files** against `tactus-core/out/lib` (reuse the
-   probe16 `run.sh` LEAN_PATH, pointed at the LIVE `.defcert`/`.dtcert` instead
-   of the hand-written `probe16_w7d_defbridge.lean`). The `by decide` bridge
-   lines must close. Then perturb one emitted literal and confirm the bridge
-   flips (mutation-kill smoke on the live path).
+### The bug the live path caught (and its fix)
+The unit pins fed `raw_vir_exp` a BARE `Ite`/`Match` body; the REAL VIR spec-fn
+body is wrapped in the frontend's statement-less block-expr `ExprX::Block([],
+Some(tail))`. So the first live emit wrote the datatype cert but rejected every
+def with `rawvir-block`. Fix: `raw_vir_exp` now peels an empty block to its tail
+(`Block(stmts, Some(tail)) if stmts.is_empty() => raw_vir_exp(tail)`), mirroring
+production's `block_to_node` (which returns `expr_to_ast(final_expr)` for an
+empty block). A block WITH statements stays fail-loud — outside the
+fixture-reachable set (it lowers to `let`/`match` nesting the reference doesn't
+yet transcribe). +2 regression unit tests.
 
-### One residual risk to check during live validation
-The unit tests pin that `serialize_def`/`serialize_dt` reproduce probe16's
-literals for the *hand-built* `tri`/`Tree`. The wire feeds a REAL
-`augment(f)` + `spec_fn_to_ast` output. For a monomorphic spec fn the def's
-`binders` (built by `fn_binders_without_bound_hyps`) should equal
-`augmented.params`, so `raw_vir_def` (over params) and `ldef_to_defdata` (over
-binders) agree. If a monomorphic fn ever carries a refinement-BOUND param that
-`fn_binders_without_bound_hyps` strips, the two sides would diverge and that
-fn's `by decide` would fail to elaborate — HARMLESS while probe-only (nobody
-elaborates it), but worth confirming on the first live `tri`. `raw_vir_def`
-already fails loud on poly/`is_mut`, which covers the common divergent shapes.
+### How it's validated (no assumptions left standing)
+- `probe-w0/probe17_w7d_live/run.sh` — the probe9-analog for the defs layer.
+  Globs the LIVE `.defcert`/`.dtcert`, elaborates each against
+  `tactus-core/out/lib` + the tactus prelude. All four: **positive OK** (bridge
+  closes) + **kill OK** (`= 1`→`= 0` rejected).
+- `cargo test -p lean_verify`: 366/0 lib + 7/0 integration.
+- vstd re-verified 1530/0 on both release rebuilds.
+
+### Residual risk — checked, did not bite
+The board flagged that a monomorphic fn carrying a refinement-BOUND param that
+`fn_binders_without_bound_hyps` strips would diverge `raw_vir_def` (over params)
+from `ldef_to_defdata` (over binders). On the real `tri`, the single `Nat` param
+interns to id 1 on BOTH sides and nothing is stripped, so the bridge closes.
+`raw_vir_def` still fails loud on poly/`is_mut` (the common divergent shapes);
+the only live rejection is vstd's poly `set.Set.subset_of` (correctly gated).
+
+### Assumptions / honest scope
+- Still probe-only: the def/dt certs are not yet in any package-check globbed
+  set (distinct `.defcert`/`.dtcert` suffixes). That's deliberate for W7d —
+  joining them to the elaborated package set is a later step (W7e / W4).
+- The transcribers' `#[allow(dead_code)]` can now be dropped (they're reachable
+  via the pub `emit_*` fns) — cosmetic, deferred.
+- W7d certifies that the reference transcription agrees with production via
+  `def_eq`/`dt_eq`; it does NOT certify the transcribers themselves (TCB), the
+  interning, or SST-semantics adequacy (that's W5).
