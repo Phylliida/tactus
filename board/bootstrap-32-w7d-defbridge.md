@@ -3,7 +3,7 @@ title: "W7d — wire def/datatype emission + bridge decide def_eq/dt_eq on the f
 status: in_progress
 claimed_by: opus-w7d
 created: 2026-07-15T07:00:00Z
-updated: 2026-07-15T07:00:00Z
+updated: 2026-07-15T12:00:00Z
 ---
 
 ## Description
@@ -75,12 +75,48 @@ to prove non-vacuity).
     generate.rs wire (needs the release rebuild). Transcribers are still
     `#[allow(dead_code)]`; this probe consumes their pinned output.
 
+- (2026-07-15, opus-w7d-2) **SECOND INCREMENT LANDED — the `render_def_cert` /
+  `render_dt_cert` assembler + `emit_def_cert` / `emit_dt_cert` public entry
+  points, in `sst_serialize.rs` (the `render_cert`/`emit_cert` analog for the
+  defs layer). Pure Rust, 5 new unit tests, full `lean_verify` suite 364/0 — NO
+  vargo rebuild needed.**
+  - **`serialize_def` / `serialize_dt`** (`sst_serialize.rs`) drive BOTH
+    transcribers on ONE shared `Serializer`, so the reference's forward-interned
+    leaf ids are reused by the production side (reference walk runs FIRST + gates
+    — a poly/mut-param def fails loud via `?` before production runs, so no
+    half-cert). Returns the `(raw, defdata)` / `(raw, dtdata)` text pair.
+  - **`render_def_cert` / `render_dt_cert`** assemble the `.defcert.lean` /
+    `.dtcert.lean` file text: `import TactusDefs_lib_exec` + `maxRecDepth 8000` +
+    vocab-hash/honest-scope header + the two literals + the bridge
+    `example : lib.def_eq (lib.render_def cert_…_raw) cert_…_defdata = 1 := by
+    decide` (mutatis mutandis `dt_eq`). Distinct `.defcert`/`.dtcert` suffixes so
+    they never collide with the obligation cert's `.cert.lean`.
+  - **`emit_def_cert` / `emit_dt_cert`** (pub, flag-gated, fail-loud + census)
+    are the generate.rs entry points, taking the VIR side DECOMPOSED (the
+    `raw_vir_def`/`raw_vir_dt` arg shape) so the wire unpacks the
+    `FunctionX`/`DatatypeX` at the call site and the assembler stays
+    unit-testable with the lightweight VIR builders.
+  - **Tests** (`sst_serialize_tests.rs`): `serialize_def_tri_shared_serializer`
+    + `serialize_dt_tree_shared_serializer` assert the shared serializer
+    reproduces the EXACT probe16-proven `(raw, defdata)`/`(raw, dtdata)` pairs
+    (byte-identical to the `raw_vir_*`/`l*_to_*data` unit pins);
+    `serialize_def_poly_gates_on_reference` pins the reference-first short
+    circuit; `render_def_cert_bridge_shape` + `render_dt_cert_bridge_shape` pin
+    that the assembler embeds the literals verbatim and emits the exact
+    `decide` bridge line probe16 proved closes. So: (serialize ⇒ probe16
+    literals) ∧ (render ⇒ probe16 bridge line) composes to a validated cert
+    WITHOUT a Lean rebuild.
+  - **Remaining (the live wire) split out to `bootstrap-33-w7d-generate-wire`.**
+
 ## Writeup
 
-_partial — see Progress + the probe REPORT. Remaining for full W7d:_
-- _the generate.rs production wire (emit `emit_def_cert` at the `spec_fn_to_ast`_
-  _/ datatype call sites, behind the cert-emit flag) — needs a vargo release_
-  _rebuild to validate the full-Ite-body `tri` def end-to-end._
-- _a `render_def_cert` assembly fn in `sst_serialize.rs` (the `render_cert`_
-  _analog for defs) that drives both transcribers on a shared leaf table + emits_
-  _the bridge probe._
+_partial — see Progress + the probe REPORT. Two of three pieces landed:_
+- _✅ the bridge probe (probe16, first increment) — `def_eq`/`dt_eq` close on
+  real transcriber output, kills non-vacuous._
+- _✅ the `render_def_cert`/`render_dt_cert` + `emit_def_cert`/`emit_dt_cert`
+  assembler (second increment) — pure Rust, 5 unit tests, suite 364/0._
+- _⬜ the generate.rs production wire (call `emit_def_cert` at the
+  `spec_fn_to_ast` sites + `emit_dt_cert` at datatype emission, behind the
+  cert-emit flag, decomposing the `FunctionX`/`DatatypeX`) — needs the vargo
+  release rebuild to validate the full-Ite-body `tri` def end-to-end. Tracked in
+  **`bootstrap-33-w7d-generate-wire`**._

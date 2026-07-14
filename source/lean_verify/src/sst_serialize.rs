@@ -2812,6 +2812,217 @@ fn sanitize_comment(text: &str) -> String {
     text.replace('\n', " ⏎ ").replace('\r', "")
 }
 
+// ── W7d (bootstrap-32): defs-layer certificate emission ─────────────────
+//
+// The def/datatype analog of `emit_cert`. Where `emit_cert` bridges the
+// obligation GOALS (`goals_eq`), these bridge the SHARED-DEFS layer: each
+// spec-fn `@[reducible] def` earns a `def_eq (render_def raw) defdata = 1`
+// certificate, each `inductive` a `dt_eq (render_dt raw) dtdata = 1`. The
+// REFERENCE side (`raw_vir_def` / `raw_vir_dt`) reads VIR; PRODUCTION
+// (`ldef_to_defdata` / `ldt_to_dtdata`) reads the already-emitted `lean_ast`.
+//
+// Both sides are driven on ONE `Serializer` (see `serialize_def` /
+// `serialize_dt`), so the interned leaf ids agree by the atom-id-consistency
+// invariant — the reference walk interns every string first, and the
+// production walk reuses those ids. This is the exact `(raw, defdata)` pairing
+// probe16 (`probe-w0/probe16_w7d_defbridge`) proved closes under `decide`
+// against the LANDED tactus-core `render_def` / `def_eq`.
+//
+// Fail-loud like `emit_cert`: an uncertifiable def/datatype (polymorphic,
+// struct-datatype, uncovered body/type) is logged, census'd, and the crate run
+// continues (spec §3). A no-op when the flag is off. The REFERENCE side is the
+// gate — if it fails loud, `?` short-circuits before the production side runs,
+// so the census tag names the reference construct and no half-cert is written.
+
+/// Emit the defs-layer certificate for one spec fn (the `def_eq` bridge).
+/// The VIR side is passed DECOMPOSED (name / typ_params / value params / ret /
+/// body) — exactly the `raw_vir_def` argument shape — so the generate.rs wire
+/// unpacks the `FunctionX` at the call site and this stays unit-testable with
+/// the lightweight VIR builders.
+pub fn emit_def_cert(
+    crate_name: &str,
+    name: &vir::ast::Fun,
+    typ_params: &vir::ast::Idents,
+    params: &vir::ast::Params,
+    ret: &Typ,
+    body: &VirExpr,
+    def: &crate::lean_ast::Def,
+) {
+    if !cert_emit_enabled() {
+        return;
+    }
+    let fn_name = crate::to_lean_type::lean_name_relative(&name.path);
+    match serialize_def(name, typ_params, params, ret, body, def) {
+        Ok((raw, defdata)) => match write_def_cert_file(crate_name, &fn_name, &raw, &defdata) {
+            Ok(()) => census_note_certified(),
+            Err(io) => {
+                eprintln!("tactus: def-cert: {} write failed: {}", fn_name, io);
+                census_note_rejected("io-error");
+            }
+        },
+        Err(tag) => {
+            eprintln!("tactus: def-cert: {} not serialized: {}", fn_name, tag);
+            census_note_rejected(&tag);
+        }
+    }
+}
+
+/// Emit the defs-layer certificate for one datatype (the `dt_eq` bridge).
+/// VIR side DECOMPOSED (name / typ_params / variants), matching `raw_vir_dt`.
+pub fn emit_dt_cert(
+    crate_name: &str,
+    name: &Dt,
+    typ_params: &vir::ast::TypPositives,
+    variants: &vir::ast::Variants,
+    dt: &crate::lean_ast::Datatype,
+) {
+    if !cert_emit_enabled() {
+        return;
+    }
+    let dt_name = dt.name.clone();
+    match serialize_dt(name, typ_params, variants, dt) {
+        Ok((raw, dtdata)) => match write_dt_cert_file(crate_name, &dt_name, &raw, &dtdata) {
+            Ok(()) => census_note_certified(),
+            Err(io) => {
+                eprintln!("tactus: dt-cert: {} write failed: {}", dt_name, io);
+                census_note_rejected("io-error");
+            }
+        },
+        Err(tag) => {
+            eprintln!("tactus: dt-cert: {} not serialized: {}", dt_name, tag);
+            census_note_rejected(&tag);
+        }
+    }
+}
+
+/// Drive both def transcribers on a SHARED `Serializer` (so the reference's
+/// forward-interned leaf ids are reused by the production side), returning the
+/// `(raw_vir_def text, ldef_to_defdata text)` pair the bridge compares. The
+/// reference runs first and gates (poly/mut-param fail loud before production).
+fn serialize_def(
+    name: &vir::ast::Fun,
+    typ_params: &vir::ast::Idents,
+    params: &vir::ast::Params,
+    ret: &Typ,
+    body: &VirExpr,
+    def: &crate::lean_ast::Def,
+) -> Sr<(String, String)> {
+    let mut s = Serializer::default();
+    let raw = s.raw_vir_def(name, typ_params, params, ret, body)?;
+    let defdata = s.ldef_to_defdata(def)?;
+    Ok((raw, defdata))
+}
+
+/// Datatype twin of `serialize_def`: `(raw_vir_dt text, ldt_to_dtdata text)`.
+fn serialize_dt(
+    name: &Dt,
+    typ_params: &vir::ast::TypPositives,
+    variants: &vir::ast::Variants,
+    dt: &crate::lean_ast::Datatype,
+) -> Sr<(String, String)> {
+    let mut s = Serializer::default();
+    let raw = s.raw_vir_dt(name, typ_params, variants)?;
+    let dtdata = s.ldt_to_dtdata(dt)?;
+    Ok((raw, dtdata))
+}
+
+fn write_def_cert_file(
+    crate_name: &str,
+    fn_name: &str,
+    raw: &str,
+    defdata: &str,
+) -> std::io::Result<()> {
+    let leaf = cert_leaf_name(fn_name);
+    let dir = crate::generate::lean_out_root()
+        .join(crate::to_lean_type::sanitize(crate_name))
+        .join("cert");
+    std::fs::create_dir_all(&dir)?;
+    // Distinct `.defcert.lean` suffix so a def cert never collides with the
+    // obligation cert's `.cert.lean` (nor the datatype's `.dtcert.lean`).
+    let path = dir.join(format!("{}.defcert.lean", leaf));
+    let text = render_def_cert(crate_name, fn_name, &leaf, raw, defdata);
+    let mut f = std::fs::File::create(&path)?;
+    f.write_all(text.as_bytes())?;
+    Ok(())
+}
+
+fn write_dt_cert_file(
+    crate_name: &str,
+    dt_name: &str,
+    raw: &str,
+    dtdata: &str,
+) -> std::io::Result<()> {
+    let leaf = cert_leaf_name(dt_name);
+    let dir = crate::generate::lean_out_root()
+        .join(crate::to_lean_type::sanitize(crate_name))
+        .join("cert");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.dtcert.lean", leaf));
+    let text = render_dt_cert(crate_name, dt_name, &leaf, raw, dtdata);
+    let mut f = std::fs::File::create(&path)?;
+    f.write_all(text.as_bytes())?;
+    Ok(())
+}
+
+/// The header block shared by both defs-layer cert kinds (import + options +
+/// provenance/honest-scope). `kind` is the human tag (`"spec fn"` / `"datatype"`).
+fn defcert_header(out: &mut String, crate_name: &str, kind: &str, name: &str) {
+    out.push_str(&format!("import {}\n", CERT_IMPORT));
+    // `render_def`/`render_dt` + `def_eq`/`dt_eq` are shallow struct
+    // projections, but the interned body/ctor lists nest through `Box`; match
+    // the probe's recursion budget so a deep fixture still `decide`s.
+    out.push_str("set_option maxRecDepth 8000\n");
+    out.push_str("set_option linter.unusedVariables false\n");
+    out.push_str("set_option autoImplicit false\n\n");
+    out.push_str(&format!(
+        "-- tactus defs-layer certificate (W7d) — crate `{}`, {} `{}`\n",
+        crate_name, kind, name
+    ));
+    out.push_str(&format!("-- tactus-core-vocab-hash: {}\n", vocab_hash()));
+    out.push_str("-- Certifies that the INDEPENDENT reference transcription of this\n");
+    out.push_str("-- def/datatype (VIR-side `raw_vir_*`, rendered by tactus-core `render_*`)\n");
+    out.push_str("-- agrees with the PRODUCTION `lean_ast`-side transcription (`l*_to_*data`)\n");
+    out.push_str("-- via `def_eq`/`dt_eq`. It does NOT certify the transcribers (they are the\n");
+    out.push_str("-- TCB), the leaf-id interning, the frontend, or SST-semantics adequacy (W5).\n\n");
+}
+
+/// Assemble a def cert file (`<leaf>.defcert.lean`). Determinism-critical: pure
+/// function of its inputs (no timestamps, no HashMap iteration).
+fn render_def_cert(crate_name: &str, fn_name: &str, leaf: &str, raw: &str, defdata: &str) -> String {
+    let mut out = String::new();
+    defcert_header(&mut out, crate_name, "spec fn", fn_name);
+    // The reference RawDef literal + the production DefData literal, built on
+    // the shared leaf table (so their ids line up) — the exact `(raw, defdata)`
+    // shape probe16 proved closes.
+    out.push_str(&format!("def cert_{}_raw : {}.RawDef :=\n  {}\n\n", leaf, NS, raw));
+    out.push_str(&format!(
+        "def cert_{}_defdata : {}.DefData :=\n  {}\n\n",
+        leaf, NS, defdata
+    ));
+    // The bridge: the rendered reference equals the production def (`= 1`).
+    out.push_str(&format!(
+        "example : {}.def_eq ({}.render_def cert_{}_raw) cert_{}_defdata = 1 := by decide\n",
+        NS, NS, leaf, leaf
+    ));
+    out
+}
+
+/// Datatype twin of `render_def_cert` (`<leaf>.dtcert.lean`, `dt_eq`/`render_dt`).
+fn render_dt_cert(crate_name: &str, dt_name: &str, leaf: &str, raw: &str, dtdata: &str) -> String {
+    let mut out = String::new();
+    defcert_header(&mut out, crate_name, "datatype", dt_name);
+    out.push_str(&format!("def cert_{}_raw : {}.RawDt :=\n  {}\n\n", leaf, NS, raw));
+    out.push_str(&format!(
+        "def cert_{}_dtdata : {}.DtData :=\n  {}\n\n",
+        leaf, NS, dtdata
+    ));
+    out.push_str(&format!(
+        "example : {}.dt_eq ({}.render_dt cert_{}_raw) cert_{}_dtdata = 1 := by decide\n",
+        NS, NS, leaf, leaf
+    ));
+    out
+}
+
 /// Structural `stm_size` of an emitted `StmData` term, computed by
 /// counting constructor heads exactly as `tactus-core`'s `stm_size`
 /// does — so the emitted `example : stm_size … = n := by decide` probe
