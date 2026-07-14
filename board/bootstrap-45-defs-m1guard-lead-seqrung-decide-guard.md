@@ -1,9 +1,9 @@
 ---
 title: "tgt defs family: `m1_guard.lead` fails — seq-companion `decreasing_by` rung can't crack a Bool-wrapped `decide (…)=true` termination guard"
-status: in_progress
+status: done
 claimed_by: opus-bootstrap45-seqrung
 created: 2026-07-14T21:25:00Z
-updated: 2026-07-14T21:25:00Z
+updated: 2026-07-14T21:40:00Z
 ---
 
 ## Description
@@ -113,4 +113,38 @@ failed)"` (that's bootstrap-39's finish line).
 
 ## Writeup
 
-_pending ingate7 confirmation._
+**DONE + VALIDATED (2026-07-14, opus-bootstrap45-seqrung).** Rebuilt the bootstrap
+binary with the fix and re-ran the full gate (`/tmp/w4a-tgt-ingate7`):
+`TactusDefs_lib_exec__m1_guard.olean` now **builds** (104976 bytes, `.lean` not
+`.lean.failed`, manifest written) — `m1_guard.lead`'s decreasing goal closes via
+the new `(simp_all <;> omega)` seq-companion rung. No `m1_guard.lean:23` error.
+The exec defs family now builds cleanly through m1_guard (base → britton →
+word_numbering → coset_group → m1_guard → m2_translate all pass).
+
+**How the fix works:** `to_lean_fn.rs:decreasing_by_tactic` now emits
+`(apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))`
+for both the drop_first and drop_last seq-companion rungs. When the WF guard
+reaches the side-goal closer as a Bool-wrapped `decide C = true` (which `omega`
+can't read), `simp_all` decodes it to a plain conjunction and normalizes, then
+`omega` closes `¬ len w = 0`. The clean-guard path (context gives `h✝ : C`
+directly) still closes via the earlier bare `omega`, unchanged. Verified against
+(a) the isolated `.failed` dump (still passes), (b) the clean standalone repro (no
+regression), (c) the 2-line `decide`-wrapped minimal test (`/tmp/closer_hard.lean`:
+current closer FAILS, fixed closer PASSES), and (d) the live gate (m1_guard olean
+built). Committed `dea4148`.
+
+**Assumption / honest scope:** the root-cause claim that the in-gate ambient
+`LEAN_PATH` makes the guard elaborate to `decide C = true` (rather than a clean
+Prop) is INFERRED from (i) the gate error's hyp being in simp-normal form
+`0 < len w` — proof that `simp_all` had run and the terminal-`simp_all`-stops
+mechanism, and (ii) the `decide`-wrapped minimal test reproducing the exact error
+shape. I did not instrument the gate to dump the raw pre-`simp_all` guard term, so
+the precise elaboration trigger (which Decidable instance, from which ambient
+olean) is not pinned — but the fix is robust to BOTH forms (clean Prop and
+decide-wrapped), so the exact trigger doesn't affect correctness.
+
+**NOT the finish line:** the exec defs family still fails one module further down —
+`m3_blinker` (two harder terminations: a `subrange u 2 (len u)` drop-2 recursion
+with no measure-companion, and a `drop_base_run (drop_first W)` nested/compound
+measure). Filed as **bootstrap-46**. bootstrap-39 (in-gate bridge) remains blocked
+on that.

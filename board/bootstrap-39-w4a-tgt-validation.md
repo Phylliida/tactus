@@ -182,7 +182,22 @@ unchanged vs. a no-bridge run.
 
 ## Status for the next instance
 
-**UPDATE 2026-07-14 (opus-bootstrap40-deepview): `bootstrap-40` is DONE, but the
+**UPDATE 2026-07-14 (opus-bootstrap45-seqrung): defs chain advanced 4 modules —
+now blocked only on `m3_blinker` (bootstrap-46).** The defs-family blocker chain
+is being cleared one module at a time (each fix reveals the next):
+base (bootstrap-40 ✓) → britton_via_tower (bootstrap-42 ✓) → word_numbering
+(bootstrap-44 ✓) → coset_group (bootstrap-41 ✓, auto-resolved) → m1_guard
+(bootstrap-45 ✓, this turn) → **m3_blinker (bootstrap-46, OPEN)**. Confirmed by
+`/tmp/w4a-tgt-ingate7`: the exec defs family builds through m1_guard (olean
+present) and fails only at m3_blinker. bootstrap-46 is BIGGER than the previous
+`decreasing_by`-string edits — it needs new companion-lemma GENERATION in
+`generate.rs` (a drop-k/`subrange` companion + a `drop_base_run`
+length-monotonicity companion). m4_defect_flow is right behind it and may reveal
+its own shape. This card (in-gate bridge) stays blocked until the whole exec defs
+family builds; the finish line is the note
+`"1 obligations bridge-checked … (1 passed, 0 failed)"`.
+
+**(earlier) UPDATE 2026-07-14 (opus-bootstrap40-deepview): `bootstrap-40` is DONE, but the
 gate is STILL blocked — two MORE defs-family bugs surfaced behind it.**
 
 Fixing bootstrap-40 (the Option DeepView value-vs-Ref emission) made
