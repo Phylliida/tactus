@@ -287,12 +287,11 @@ arithmetic fns; G2+G3 unlock the datatype/struct/tuple fns.
     closure). This is the shape de-risk — `close_e`/`render_exp` now
     kernel-`decide`s on the REAL refWp Assert arm. See the "W6d.1b-i landing"
     section below.
-  - **W6d.1b-ii — the LeafList obligation slots (`Call.reqs`, `Ret.es`).**
-    Needs a NEW `RawExpList` type (LeafList is shared with hyps/`enss`, so its
-    element type can't change globally) + `close_each_e(f, RawExpList)` mirroring
-    `close_each`. Wire `wp_stm`'s Call + Ret arms. Fixtures: `ref_wp_ret_*`,
-    sum_to's final Ret (Leaf 7), cd19's two Rets (Leaf 5), call_pass_through reqs
-    (Leaf 7).
+  - **W6d.1b-ii — the LeafList obligation slots (`Call.reqs`, `Ret.es`). ✅
+    DONE (2026-07-14, opus-b23).** NEW dedicated `RawExpList` (Danielle's call:
+    distinct type, not a polymorphic LeafList — keeps `LeafE`/`Leaf` unmergeable)
+    + `close_each_e` mirroring `close_each`; wired `wp_stm`'s Call + Ret arms.
+    Verified **54/0**. See the "W6d.1b-ii landing" section below.
   - **W6d.1b-iii — the Loop obligation slots (`inv_hyps` props, `decrease_oblig`).**
     `decrease_oblig` is bare `u64 → RawExp` (easy, like Assert). `inv_hyps` is a
     `BinderList` whose PROP (2nd) slot is the obligation → needs a `(u64 name,
@@ -479,6 +478,72 @@ arithmetic fns; G2+G3 unlock the datatype/struct/tuple fns.
   Ret.es), then **W6d.1b-iii** (Loop decrease_oblig bare-slot + inv_hyps prop
   container), then **W6d.2** (serializer text emission). G4 (`Let`-in-leaf)
   stays deferred to W6e.
+
+- (2026-07-14, opus-b23) **W6d.1b-ii landed — `Call.reqs` / `Ret.es` now carry
+  DEEP `RawExpList` obligations; `close_each_e` verified 54/0.** The second of
+  W6d.1b's three container sub-steps. What changed in `tactus-core/lib.rs` (one
+  datatype-shape churn + fixtures):
+  - **`RawExpList { Nil, Cons(Box<RawExp>, Box<RawExpList>) }`** — a DEDICATED
+    list (Danielle's call, confirmed this turn), NOT a polymorphic `LeafList`.
+    Two reasons: (1) `LeafList` is still shared by `FnCtxData.enss` /
+    `hyps_of_leaves`, where the element MUST stay an opaque `u64` (hypotheses are
+    not deepened); (2) keeping the deep list a distinct type keeps the two
+    element worlds unmergeable — a `LeafE(render_exp …)` can never silently match
+    a stage-A `Leaf(u64)` (the `goal_eq` safety condition). The element is
+    `Box<RawExp>`, mirroring `GoalList::Cons(Box<GoalData>, …)` (compound
+    elements boxed; only primitive-element lists like `LeafList`/`BinderList`
+    inline the head).
+  - **`raw_exp_list_len`** (deep analogue of `leaf_len`) + **`close_each_e(f,
+    RawExpList)`** = `close_e` mapped over the list (deep analogue of
+    `close_each`; each terminal is `LeafE(render_exp(ob))`).
+  - **`StmData`:** `Call.reqs: Box<LeafList> → Box<RawExpList>`; `Ret(Box<LeafList>,
+    RetBind) → Ret(Box<RawExpList>, RetBind)`. `stm_size`'s Call/Ret arms →
+    `raw_exp_list_len`; `wp_stm`'s Call/Ret arms → `close_each_e`. No other
+    `match` arm changed (`frame_after`/`diverges` ignore the es field).
+  - **All fixtures rewired:** every `Ret.es` / `Call.reqs` `LeafList` →
+    `RawExpList` with the ids wrapped `N → Box::new(atom_ob(N))` (opaque ids ride
+    through the deep path as `Var(id,TyBool)` → `Atom(id)`, matching stage-A by
+    id — same discipline as W6d.1b-i's Assert). Expected Ret/Call goals flipped
+    `Leaf(N) → LeafE(Atom N)`: `ref_wp_ret_return_binding` (Leaf 12 ×2), sum_to's
+    final Ret (Leaf 7), b17's diverging Ret (Leaf 7), cd19's two Rets + the
+    mutation-kill head (Let(6,10,·) ×3, Leaf 5), `call_pass_through`'s req goal
+    (`Imp(100, Leaf 7)` ×3, incl. the mutation-kill's first goal so the ONLY diff
+    stays the `99` let-value), and the `stm_size` Call/Ret size tests (values
+    unchanged — `raw_exp_list_len` == `leaf_len` on the same shapes).
+  - **`close_each` (the LeafList version) is now DEAD** — no callers (Loop uses
+    `close_each_binderprop`; Call/Ret use `close_each_e`). Kept + comment-marked
+    SUPERSEDED (pure spec fn, harmless; safe to delete once no stage-A obligation
+    container remains — confirmed no external refs via grep).
+
+  **Verified 54/0** (`--lean-backend --lean-all-proofs`, 46 modules elaborated,
+  "composition + axiom closures kernel-verified" — no `WellFounded.fix`/
+  `Classical`). The `decide` bridge holds through every edited fixture (sum_to
+  monster, cd19 two-way join, call_pass_through both post-shapes + mutation-kill,
+  ret-binding, b17 fall-through). Cache: RawExpList added + StmData field-type
+  change = base-hash churn → whole crate re-elaborated (~2min cold, expected).
+
+  **Serializer coupling reconfirmed at the LEAN-TEXT level (extends W6d.1b-i).**
+  `grep -rn 'StmData::Ret|StmData::Call|LeafList|RawExpList' source/` = ONLY
+  comments, `format!("{}.LeafList.Cons …")` Lean-text builders, and expected-Lean
+  test strings; NO Rust `tactus_core::StmData::Ret/Call` value construction, and
+  `RawExpList` is absent from source entirely (its producer arrives in W6d.2). So
+  the type change does NOT break the Rust build; the **W3 tgt gate + e2e suite
+  stay green by construction.** ⚠ **W6d.2 to-do surfaced:**
+  `source/lean_verify/src/sst_serialize_tests.rs:35` hardcodes the OLD expected
+  string `(lib.StmData.Ret (Tactus.Box.mk lib.LeafList.Nil) lib.RetBind.RetNone)`
+  — it passes today (serializer output unchanged, string-eq only) but must flip
+  `lib.LeafList` → `lib.RawExpList` (and wrap the obligation as a `RawExp`
+  literal) when `oblig_leaf`/Ret emission is wired in W6d.2, or the emitted cert
+  won't type-check against the new tactus-core defs (the W6d.1b-i note, now for
+  Ret/Call too).
+
+  **Next = W6d.1b-iii** (Loop: `decrease_oblig` bare `u64 → RawExp` like Assert;
+  `inv_hyps` `BinderList` PROP slot → a `(u64 name, RawExp prop)` container +
+  `close_each_binderprop_e`; nested_loop's Leaf 35 direct `close` → `close_e`),
+  then **W6d.2** (serializer text emission: `raw_exp` G0 Box/Unbox peel + G7
+  VarAt + LitBool/Field/HasType arms; `oblig_leaf` emits the `RawExp` mirror
+  wrapped in `Span`; `goal_data` emits `LeafE`). G4 (`Let`-in-leaf) stays
+  deferred to W6e.
 
 ## Writeup
 
