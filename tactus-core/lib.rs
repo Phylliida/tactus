@@ -263,6 +263,12 @@ pub enum CastKind {
 pub enum ExprData {
     Atom(u64),                              // var read / spec-fn or type name
     Lit(int),                               // integer literal
+    // G1: bool literal (`True`/`False`) in a leaf. Payload is the nat
+    // encoding (0 = false, 1 = true), NOT a `bool`: the tactus Lean backend
+    // renders a spec `bool` as `Prop`, whose equality needs
+    // `Classical.propDecidable` and sticks `decide` — the whole crate encodes
+    // such tags as `nat` for exactly this reason.
+    LitBool(nat),
     Cast(CastKind, Box<ExprData>),          // Int.toNat / Int.ofNat node
     BinOp(u64, Box<ExprData>, Box<ExprData>),
     App(u64, Box<ExprData>),                // lib.tri (…), lib.tree_head (…)
@@ -278,10 +284,23 @@ pub enum ExprData {
 pub enum RawExp {
     Var(u64, TypData),                              // typed variable read
     Lit(int, TypData),
+    LitBool(nat),                                   // G1: source bool literal (0/1 nat encoding)
     Clip(TypData, Box<RawExp>),                     // explicit `as` cast (Verus Clip)
     BinOp(u64, TypData, Box<RawExp>, Box<RawExp>),  // 2nd slot = op RESULT type
     Call(u64, TypData, Box<RawExp>, TypData),       // fn, ret ty, arg, arg ty
-    Deref(Box<RawExp>),                             // `*t` on a `&`-param
+    // G3: struct/tuple field projection — (field id, field RESULT type, base).
+    // The field id is interned by the serializer to match production's accessor
+    // text (`deref_field()=0` reserved; `.x` interns "x"; tuple `.1` interns
+    // the SHIFTED name production renders).
+    Field(u64, TypData, Box<RawExp>),
+    // G6: an unsigned-overflow `HasType(U(n))` refinement. `render_exp`
+    // reproduces production's `type_bound_predicate` expansion
+    // `0 ≤ e ∧ e < 2^n` (option (i), Danielle 2026-07-14); the width `n` stays
+    // observable and `2^n` is re-derived via `pow2` (independent of
+    // production's `two_pow_lit`). Signed/USize/Char/vacuous ranges are NOT
+    // carried — the serializer fails loud on them (none appear in the fixture).
+    HasType(u64, Box<RawExp>),
+    Deref(Box<RawExp>),                             // `*t` on a `&`-param (dead for the serializer; see G2)
     Span(u64, Box<RawExp>),
 }
 
@@ -461,6 +480,7 @@ pub open spec fn expr_size(e: ExprData) -> nat
     match e {
         ExprData::Atom(_) => 1,
         ExprData::Lit(_) => 1,
+        ExprData::LitBool(_) => 1,
         ExprData::Cast(_k, t) => 1 + expr_size(*t),
         ExprData::BinOp(_op, l, r) => 1 + expr_size(*l) + expr_size(*r),
         ExprData::App(_fn, a) => 1 + expr_size(*a),
@@ -518,9 +538,13 @@ pub open spec fn type_of(re: RawExp) -> TypData
     match re {
         RawExp::Var(_id, ty) => ty,
         RawExp::Lit(_v, ty) => ty,
+        RawExp::LitBool(_b) => TypData::TyBool,
         RawExp::Clip(target, _e) => target,
         RawExp::BinOp(_op, ty, _l, _r) => ty,
         RawExp::Call(_fn, ret, _arg, _argty) => ret,
+        RawExp::Field(_fid, fty, _base) => fty,
+        // The refinement is a proposition (`0 ≤ e ∧ e < 2^n`) → Bool.
+        RawExp::HasType(_n, _inner) => TypData::TyBool,
         RawExp::Deref(e) => deref_type(type_of(*e)),
         RawExp::Span(_loc, e) => type_of(*e),
     }
@@ -542,6 +566,43 @@ pub open spec fn coerce_if(b: nat, e: ExprData) -> ExprData {
 // The interned field id for a `.deref` (the `&`-param dereference field).
 pub open spec fn deref_field() -> u64 { 0 }
 
+// G2: a spec-fn Call arg whose mirror type is `TyRef(T)` gets a `.deref`
+// coercion. Spec fns never take `&T`, so the `TyRef` tag on the arg is the
+// entire signal — no callee param type needed (W6d.0 dump confirmed the arg
+// stays `&T`, the `*t` in spec being transparent). Parallel to
+// needs_nat_coercion; nat-returning for the same `decide`-friendliness reason.
+pub open spec fn needs_ref_deref(operand: TypData) -> nat {
+    if td_tag(operand) == 4 { 1 } else { 0 }
+}
+
+// Wrap `e` in a `.deref` FieldProj iff the predicate fired (mirrors coerce_if).
+pub open spec fn deref_if(b: nat, e: ExprData) -> ExprData {
+    if b == 1 { ExprData::FieldProj(Box::new(e), deref_field()) } else { e }
+}
+
+// G6: 2^n as an int — the upper bound of the unsigned-overflow refinement
+// `0 ≤ e ∧ e < 2^n`. An INDEPENDENT re-derivation of production's
+// `two_pow_str` (a divergence in either surfaces as a bridge mismatch rather
+// than silently agreeing). A finite width→bound TABLE, not recursive
+// doubling: a `decreases n` power lowers to `WellFounded.fix` (recursion on
+// `n - 1` is not a structural `Nat` subterm), which the kernel does NOT reduce
+// under `decide` — so the recursive form freezes `render_exp`. The if-chain
+// over concrete widths reduces via `Nat.decEq`. Covers the fixed-width Verus
+// integer widths (u8/u16/u32/u64/u128); other widths (incl. arch `usize`) hit
+// the `0` sentinel, which never matches production's real bound → a loud
+// bridge mismatch rather than a silent pass. The serializer fails loud on
+// unsupported ranges before this is reached.
+pub open spec fn pow2(n: nat) -> int {
+    if n == 8 { 256 }
+    else if n == 16 { 65536 }
+    else if n == 32 { 4294967296 }
+    else if n == 64 { 18446744073709551616 }
+    // 2^128 exceeds the Rust literal parser (u128::MAX + 1); write it as an
+    // exact spec-`int` product of two in-range 2^64 literals.
+    else if n == 128 { (18446744073709551616 * 18446744073709551616) as int }
+    else { 0 }
+}
+
 // `render_exp` reimplements the cast/coercion decision UNIFORMLY from the
 // type tags, independently of production's renderer. Plainly structural (each
 // call is on a subterm) so the kernel reduces it under `decide`/`rfl`.
@@ -552,6 +613,7 @@ pub open spec fn render_exp(re: RawExp) -> ExprData
     match re {
         RawExp::Var(id, _ty) => ExprData::Atom(id),
         RawExp::Lit(v, _ty) => ExprData::Lit(v),
+        RawExp::LitBool(b) => ExprData::LitBool(b),   // G1: straight through
         // explicit `as` cast: materialize Int.toNat iff there is a real
         // Int→Nat gap between the operand and the clip target.
         RawExp::Clip(target, e) =>
@@ -564,10 +626,33 @@ pub open spec fn render_exp(re: RawExp) -> ExprData
             let r2 = coerce_if(needs_nat_coercion(type_of(*r), ty), render_exp(*r));
             ExprData::BinOp(op, Box::new(l2), Box::new(r2))
         },
-        // call-arg coercion: same predicate, target is the expected param type.
-        RawExp::Call(fnid, _ret, arg, argty) =>
-            ExprData::App(fnid,
-                Box::new(coerce_if(needs_nat_coercion(type_of(*arg), argty), render_exp(*arg)))),
+        // call-arg coercion: nat-coercion at the expected param type (the
+        // Friction-2 site) THEN the G2 ref-deref (a `&T` arg → `.deref`). The
+        // two are mutually exclusive in practice — a `TyRef` arg reads
+        // needs_nat_coercion = 0 — but composed uniformly. When the raw arg is
+        // an explicit `Deref` node (the W6a probe's Case C) it already presents
+        // its pointee type, so needs_ref_deref = 0 and there is no double-deref.
+        RawExp::Call(fnid, _ret, arg, argty) => {
+            let a1 = render_exp(*arg);
+            let a2 = coerce_if(needs_nat_coercion(type_of(*arg), argty), a1);
+            let a3 = deref_if(needs_ref_deref(type_of(*arg)), a2);
+            ExprData::App(fnid, Box::new(a3))
+        },
+        // G3: field projection. `fid` already matches production's accessor id.
+        RawExp::Field(fid, _fty, base) =>
+            ExprData::FieldProj(Box::new(render_exp(*base)), fid),
+        // G6: reproduce production's unsigned-overflow expansion
+        // `0 ≤ e ∧ e < 2^n` (`type_bound_predicate`'s `unsigned` shape). The
+        // opcodes are the canonical table (And = 11, Le = 3, Lt = 2); `e`
+        // renders once and appears in both conjuncts, exactly as production
+        // reuses the one rendered `e_ast`.
+        RawExp::HasType(n, inner) => {
+            let e2 = render_exp(*inner);
+            ExprData::BinOp(11,
+                Box::new(ExprData::BinOp(3, Box::new(ExprData::Lit(0)), Box::new(e2))),
+                Box::new(ExprData::BinOp(2, Box::new(e2),
+                    Box::new(ExprData::Lit(pow2(n as nat))))))
+        },
         RawExp::Deref(e) => ExprData::FieldProj(Box::new(render_exp(*e)), deref_field()),
         RawExp::Span(loc, e) => ExprData::SpanMark(loc, Box::new(render_exp(*e))),
     }
@@ -598,10 +683,12 @@ pub open spec fn ed_tag(e: ExprData) -> nat {
         ExprData::App(_, _) => 4,
         ExprData::FieldProj(_, _) => 5,
         ExprData::SpanMark(_, _) => 6,
+        ExprData::LitBool(_) => 7,
     }
 }
 pub open spec fn ed_atom_id(e: ExprData) -> u64 { match e { ExprData::Atom(x) => x, _ => 0 } }
 pub open spec fn ed_lit_val(e: ExprData) -> int { match e { ExprData::Lit(v) => v, _ => 0 } }
+pub open spec fn ed_litbool_val(e: ExprData) -> nat { match e { ExprData::LitBool(x) => x, _ => 0 } }
 pub open spec fn ed_cast_k(e: ExprData) -> CastKind { match e { ExprData::Cast(k, _) => k, _ => CastKind::IntToNat } }
 pub open spec fn ed_cast_e(e: ExprData) -> ExprData { match e { ExprData::Cast(_, t) => *t, _ => ExprData::Atom(0) } }
 pub open spec fn ed_binop_op(e: ExprData) -> u64 { match e { ExprData::BinOp(op, _, _) => op, _ => 0 } }
@@ -623,6 +710,8 @@ pub open spec fn expr_eq(a: ExprData, b: ExprData) -> nat
             if ed_tag(b) == 0 { if x == ed_atom_id(b) { 1 } else { 0 } } else { 0 },
         ExprData::Lit(v) =>
             if ed_tag(b) == 1 { if v == ed_lit_val(b) { 1 } else { 0 } } else { 0 },
+        ExprData::LitBool(x) =>
+            if ed_tag(b) == 7 { if x == ed_litbool_val(b) { 1 } else { 0 } } else { 0 },
         ExprData::Cast(k, t) =>
             if ed_tag(b) == 2 {
                 if castkind_eq(k, ed_cast_k(b)) == 1 { expr_eq(*t, ed_cast_e(b)) } else { 0 }
@@ -726,6 +815,65 @@ proof fn expr_mirror_kernel_computes()
         // Lit + measures kernel-compute.
         expr_eq(ExprData::Lit(5), ExprData::Lit(5)) == 1,
         expr_eq(ExprData::Lit(5), ExprData::Lit(6)) == 0,
+        // G1 — bool literal straight through (nat encoding: 1 = true);
+        // value mismatch caught.
+        expr_eq(render_exp(RawExp::LitBool(1)), ExprData::LitBool(1)) == 1,
+        expr_eq(render_exp(RawExp::LitBool(1)), ExprData::LitBool(0)) == 0,
+        // G6 — the u64 overflow refinement `0 ≤ x+y ∧ x+y < 2^64`, DERIVED by
+        // render_exp from a `HasType(64)` node (production `type_bound_predicate`
+        // expands identically). `pow2(64)` re-derives the bound independently.
+        // Kill = wrong bound width (2^32).
+        expr_eq(
+            render_exp(RawExp::HasType(64,
+                Box::new(RawExp::BinOp(6, TypData::TyInt,
+                    Box::new(RawExp::Var(1, TypData::TyInt)),
+                    Box::new(RawExp::Var(2, TypData::TyInt)))))),
+            ExprData::BinOp(11,
+                Box::new(ExprData::BinOp(3, Box::new(ExprData::Lit(0)),
+                    Box::new(ExprData::BinOp(6, Box::new(ExprData::Atom(1)), Box::new(ExprData::Atom(2)))))),
+                Box::new(ExprData::BinOp(2,
+                    Box::new(ExprData::BinOp(6, Box::new(ExprData::Atom(1)), Box::new(ExprData::Atom(2)))),
+                    Box::new(ExprData::Lit(18446744073709551616)))))
+        ) == 1,
+        expr_eq(
+            render_exp(RawExp::HasType(64,
+                Box::new(RawExp::BinOp(6, TypData::TyInt,
+                    Box::new(RawExp::Var(1, TypData::TyInt)),
+                    Box::new(RawExp::Var(2, TypData::TyInt)))))),
+            ExprData::BinOp(11,
+                Box::new(ExprData::BinOp(3, Box::new(ExprData::Lit(0)),
+                    Box::new(ExprData::BinOp(6, Box::new(ExprData::Atom(1)), Box::new(ExprData::Atom(2)))))),
+                Box::new(ExprData::BinOp(2,
+                    Box::new(ExprData::BinOp(6, Box::new(ExprData::Atom(1)), Box::new(ExprData::Atom(2)))),
+                    Box::new(ExprData::Lit(4294967296)))))  // BUG: 2^32, not 2^64
+        ) == 0,
+        // G3 — struct field projection `p.x` (field id 5). Kill = dropped proj.
+        expr_eq(
+            render_exp(RawExp::Field(5, TypData::TyInt,
+                Box::new(RawExp::Var(9, TypData::TyNamed(50))))),
+            ExprData::FieldProj(Box::new(ExprData::Atom(9)), 5)
+        ) == 1,
+        expr_eq(
+            render_exp(RawExp::Field(5, TypData::TyInt,
+                Box::new(RawExp::Var(9, TypData::TyNamed(50))))),
+            ExprData::Atom(9)  // BUG: dropped `.x`
+        ) == 0,
+        // G2 — the REAL head_exec path: a bare `&Tree` typed Var arg (NO
+        // explicit Deref node); render_exp DERIVES the `.deref` from the arg's
+        // `TyRef` tag. Distinct from Case C (explicit source Deref). Kill =
+        // deref dropped.
+        expr_eq(
+            render_exp(RawExp::Call(11, TypData::TyNamed(100),
+                Box::new(RawExp::Var(4, TypData::TyRef(100))),
+                TypData::TyNamed(100))),
+            ExprData::App(11, Box::new(ExprData::FieldProj(Box::new(ExprData::Atom(4)), 0)))
+        ) == 1,
+        expr_eq(
+            render_exp(RawExp::Call(11, TypData::TyNamed(100),
+                Box::new(RawExp::Var(4, TypData::TyRef(100))),
+                TypData::TyNamed(100))),
+            ExprData::App(11, Box::new(ExprData::Atom(4)))  // BUG: no auto-deref
+        ) == 0,
         expr_size(ExprData::BinOp(1,
             Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(3)))),
             Box::new(ExprData::Atom(3)))) == 4,

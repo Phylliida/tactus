@@ -3,7 +3,7 @@ title: "W6d — bridge deepened: obligation leaves emit LeafE + refWp closes ove
 status: in_progress
 claimed_by: opus-b23
 created: 2026-07-14T09:30:00Z
-updated: 2026-07-14T09:30:00Z
+updated: 2026-07-14T12:00:00Z
 ---
 
 ## Description
@@ -263,15 +263,20 @@ arithmetic fns; G2+G3 unlock the datatype/struct/tuple fns.
   shift; and surfaced **three gaps the map missed — G0 (Box/Unbox peel, the
   dominant blocker), G6 (HasType overflow class), G7 (VarAt-Pre param reads).**
   W6d.1 scope is bigger than the map implied.
-- **W6d.1 — the shared-crate batch (one clean churn).** In `tactus-core/lib.rs`:
-  add `ExprData::LitBool`/`RawExp::LitBool` (G1); `RawExp::Field` +
-  `render_exp` arm (G3); the `needs_ref_deref` coercion in `render_exp`'s Call
-  arm + `expr_eq`/`type_of` deref support (G2); a `close_e(frame, rawExp)` that
-  folds a frame around `LeafE(render_exp(rawExp))` (mirrors `close`); switch the
-  obligation-emitting `refWp` arms to `close_e` and change `StmData`'s
-  obligation slot(s) `u64 → RawExp`. Extend `expr_mirror_kernel_computes` with
-  the new corpus cases (LitBool, field, derived-deref) as in-crate `decide`
-  guards. Defer G4 (`Let`-in-leaf).
+- **W6d.1a — the expression-mirror vocabulary (shared-crate churn). ✅ DONE
+  (2026-07-14, opus-b23).** In `tactus-core/lib.rs`: added the G1/G3/G6/G2
+  vocabulary + render/eq/type arms + extended `expr_mirror_kernel_computes`
+  with a passing-and-killing case per gap. Verified **50/0** with the Lean
+  backend (`--lean-backend --lean-all-proofs`), clean axiom closure. Verdict-
+  neutral (additive; nothing downstream emits the new variants yet). See the
+  "W6d.1a landing" section below for the shapes + three design deviations. This
+  is the ONE datatype churn; W6d.1b/W6d.2 add no new mirror variants.
+- **W6d.1b — the refWp obligation rewire (NO new mirror variants).** In
+  `tactus-core/lib.rs`: a `close_e(frame, rawExp)` folding a frame around
+  `LeafE(render_exp(rawExp))` (mirrors `close`); switch the obligation-emitting
+  `refWp` arms to `close_e`; change `StmData`'s obligation slot(s) `u64 →
+  RawExp`. This is the cache-churny StmData edit (invalidates the stm layer +
+  the `ref_wp_*` proofs) — batch with W6d.2. Defer G4 (`Let`-in-leaf).
 - **W6d.2 — serializer wiring.** In `sst_serialize.rs`: `oblig_leaf` (and the
   Ret/Loop obligation paths) emit the `RawExp` mirror into `StmData` (drop
   `#[allow(dead_code)]` on `raw_exp`/`typ_data`); `goal_data` emits
@@ -335,6 +340,67 @@ arithmetic fns; G2+G3 unlock the datatype/struct/tuple fns.
   taxonomy + revised W6d.1 priority order (G0→G7→G1→G3→G6→G2) in the section
   above. **Next = W6d.1** — the shared-crate batch, now scoped against real
   shapes. No production code left changed this turn (probe reverted).
+
+- (2026-07-14, opus-b23) **W6d.1a landed — expression-mirror vocabulary
+  verified 50/0.** One edit to `tactus-core/lib.rs` (the single datatype
+  churn), verified with `TACTUS_LEAN_OUT=$PWD/out ../source/target-verus/release/verus
+  --crate-type=lib --lean-backend --lean-all-proofs lib.rs` → **50 verified, 0
+  errors**, "44 modules elaborated … composition + axiom closures
+  kernel-verified" (no `WellFounded.fix`/`Classical`). What landed:
+  - **G1** — `ExprData::LitBool(nat)` + `RawExp::LitBool(nat)`; `render_exp`
+    passes it through; `expr_eq` compares the nat; `ed_tag` = 7;
+    `ed_litbool_val` accessor.
+  - **G3** — `RawExp::Field(u64 field_id, TypData field_ty, Box<RawExp>)`;
+    `render_exp` → `ExprData::FieldProj(render(base), field_id)` (reuses the
+    existing `ExprData::FieldProj`); `type_of(Field) = field_ty`.
+  - **G6** — `RawExp::HasType(u64 width, Box<RawExp>)`; `render_exp` reproduces
+    production's `type_bound_predicate` unsigned expansion
+    `BinOp(And, BinOp(Le, Lit 0, e), BinOp(Lt, e, Lit 2^width))` with the
+    canonical opcodes (And=11/Le=3/Lt=2), `e` rendered once and reused in both
+    conjuncts; `2^width` via the new `pow2`; `type_of(HasType) = TyBool`.
+  - **G2** — `needs_ref_deref` (TyRef arg → 1) + `deref_if`; `render_exp`'s Call
+    arm now composes nat-coercion THEN ref-deref, so a bare `&T`-typed Var arg
+    (the real head_exec shape, no explicit `Deref` node) auto-derefs to
+    `FieldProj(_, deref_field())`. The explicit-`Deref` Case-C path presents its
+    pointee type so `needs_ref_deref = 0` — no double-deref.
+  - **kernel guard** — `expr_mirror_kernel_computes` gained one
+    render+eq==1 (correct) and one render+eq==0 (mutation kill) per gap: G1
+    (value flip), G6 (wrong bound width 2^32 vs 2^64), G3 (dropped `.x`), G2
+    (dropped auto-deref). All decide.
+
+  **Three design deviations, each a general constraint worth remembering:**
+  1. **Spec `bool` → Lean `Prop` → `decide` sticks.** A `bool` field renders as
+     the Lean *proposition* `True`/`False`; its equality needs
+     `Classical.propDecidable` (noncomputable) and freezes `decide`. So the G1
+     payload is a **`nat`** (0/1), matching the crate's uniform nat-tag idiom
+     (`td_tag`/`ck_tag`/every `_eq` returns nat). **No future mirror variant may
+     carry a `bool`.** (First tried a bare-`if x` branch instead of `==` — still
+     stuck, because the *field itself* is Prop, not just the comparison.)
+  2. **Recursive `pow2` doesn't kernel-reduce.** `pow2(n) = if n==0 {1} else
+     {2*pow2(n-1)}` with `decreases n` lowers to `noncomputable def … termination_by`
+     = `WellFounded.fix` (recursion on `Int.toNat(n-1)` is not a structural
+     `Nat` subterm), which the kernel does NOT unfold under `decide` — it froze
+     `render_exp(HasType 64 …)` at an un-normalized `Lit (pow2 64)`.
+     (`render_exp` itself reduces because it's *structural* on `re`.) Fix:
+     `pow2` is a **non-recursive finite width→bound table** (`if n==8 {256}
+     else if n==16 …`), reducing via `Nat.decEq`. Still option-(a) faithful
+     (width `n` observable in the RawExp; independent of production's
+     `two_pow_str`) — just table- not doubling-based. **General rule: anything
+     the reference computes inside a `decide`d render path must be non-recursive
+     or structural-on-a-constructor — no `decreases`-on-arithmetic.**
+  3. **2^128 overflows the Rust macro literal parser** (`u128::MAX + 1`) — write
+     it as `(2^64_lit * 2^64_lit) as int` (exact in spec `int`, still reduces).
+     u8/u16/u32/u64 fit directly.
+
+  **Verdict-neutral / not yet wired.** `close`/refWp still emit `Leaf(u64)`; the
+  new `RawExp` variants have no producer yet (`raw_exp`/`lexpr_to_exprdata` in
+  `sst_serialize.rs` are still `#[allow(dead_code)]` and untouched — they
+  produce *text*, don't match the tactus-core types, so this churn doesn't
+  affect their build). The W3 tgt gate is unaffected by construction.
+  **Next = W6d.1b + W6d.2** (close_e + StmData obligation-slot `u64→RawExp`;
+  then serializer wiring: raw_exp G0 Box/Unbox peel + G7 VarAt + the
+  LitBool/Field/HasType arms; oblig_leaf emits the RawExp mirror wrapped in
+  `Span`; goal_data emits `LeafE`).
 
 ## Writeup
 
