@@ -13,8 +13,8 @@
 //!   covers only single-fn recursion, so statement sequencing is
 //!   binary `Seq`/`Skip` (matching WP composition) instead of a
 //!   statement list — the one cycle a Block list would create.
-//!   One-way nesting (StmData → BinderList/LeafList, GoalList → GoalData)
-//!   is fine.
+//!   One-way nesting (StmData → BinderList/LeafList/RawExpList, GoalList →
+//!   GoalData) is fine.
 //! * Every recursive spec fn carries `#[verifier::structural_decreases]`
 //!   so the emitted defs kernel-compute (decide/rfl) with an empty
 //!   axiom closure.
@@ -50,7 +50,7 @@
 //!   ret-eq path in one uniform slot), not intent refWp re-derives, so
 //!   refWp's Call arm is a pass-through and the `decide` bridge validates
 //!   the serializer's replication against production.
-//! * `Ret` carries a `LeafList` — one annotated-ensures obligation leaf
+//! * `Ret` carries a `RawExpList` — one annotated-ensures DEEP obligation
 //!   per postcondition, rendered at the return site — plus a `RetBind`
 //!   (finding-4): the `let <ret> := <e>` binding production prepends to
 //!   the postcondition frame (`RetNone` for a unit return).
@@ -146,8 +146,9 @@ pub enum StmData {
     Assume(u64),
     /// StmX::Assign — (dest local leaf, rhs leaf).
     Assign(u64, u64),
-    /// StmX::Call — the requires OBLIGATIONS (`reqs`, instantiated at the
-    /// call's actual args) and the entire POST-CALL FRAME (`post`) the
+    /// StmX::Call — the requires OBLIGATIONS (`reqs`, a `RawExpList` of DEEP
+    /// obligations closed via `close_each_e`; W6d.1b-ii) instantiated at the
+    /// call's actual args, and the entire POST-CALL FRAME (`post`) the
     /// walker appends for whatever FOLLOWS the call. "Lowering the mirror"
     /// (DESIGN-W2-refwp.md §2.6): `post` is the frame delta production's
     /// `push_post_call_frames` computes, carried as explicit evidence in one
@@ -161,16 +162,17 @@ pub enum StmData {
     /// the serializer recomputes the frame, it does not copy production's),
     /// and this generalizes to the coming `&mut` post-state / prophecy
     /// frames instead of perpetually growing refWp's Call arm.
-    Call { reqs: Box<LeafList>, post: Box<FrameList> },
+    Call { reqs: Box<RawExpList>, post: Box<FrameList> },
     /// StmX::DeadEnd — verify inside, discard facts after.
     DeadEnd(Box<StmData>),
-    /// StmX::Return — annotated ensures obligation leaves (one span_mark'd
-    /// obligation leaf per postcondition, rendered at the return site like
-    /// production's `WpCtx` postcondition — finding-1's Ret-annotation),
-    /// plus the return-value binding `let <ret> := <e>` production prepends
-    /// before the postcondition (`RetBind`, finding-4). refWp closes each
-    /// ensures under the frame extended by the return binding.
-    Ret(Box<LeafList>, RetBind),
+    /// StmX::Return — annotated ensures obligations (a `RawExpList` of DEEP
+    /// obligations, one span_mark'd obligation per postcondition, closed via
+    /// `close_each_e` at the return site like production's `WpCtx`
+    /// postcondition — finding-1's Ret-annotation; W6d.1b-ii), plus the
+    /// return-value binding `let <ret> := <e>` production prepends before the
+    /// postcondition (`RetBind`, finding-4). refWp closes each ensures under
+    /// the frame extended by the return binding.
+    Ret(Box<RawExpList>, RetBind),
     /// StmX::If — (cond leaf, ¬cond leaf, then, else); absent else = Skip.
     /// Both leaves are ANNOTATED (span_mark'd), byte-matching production's
     /// `Wp::Branch`: the then-branch hyp is `cond_marked =
@@ -309,6 +311,21 @@ pub enum RawExp {
     Span(u64, Box<RawExp>),
 }
 
+// ── W6d.1b-ii: lists of DEEP obligations (Call.reqs / Ret.es) ────────
+// A DEDICATED list, NOT a polymorphic `LeafList`: `LeafList` is still
+// shared by `enss` and `hyps_of_leaves`, where the element MUST stay an
+// opaque `u64` (hypotheses are not deepened). Keeping the deep list a
+// distinct type also keeps the two element worlds unmergeable — a
+// `LeafE(render_exp …)` can never silently match a stage-A `Leaf(u64)`
+// (the `goal_eq` safety condition; Danielle 2026-07-14). The element is
+// `Box<RawExp>`, mirroring `GoalList::Cons(Box<GoalData>, …)` (compound
+// elements are boxed; only primitive-element lists like `LeafList` /
+// `BinderList` inline the head). `close_each_e` maps `close_e` over it.
+pub enum RawExpList {
+    Nil,
+    Cons(Box<RawExp>, Box<RawExpList>),
+}
+
 // ── Goals: the refWp output shape ───────────────────────────────────
 
 pub enum GoalData {
@@ -383,6 +400,18 @@ pub open spec fn leaf_len(l: LeafList) -> nat
     }
 }
 
+// W6d.1b-ii: the deep analogue of `leaf_len` for `RawExpList` (the
+// Call.reqs / Ret.es obligation slots).
+#[verifier::structural_decreases]
+pub open spec fn raw_exp_list_len(l: RawExpList) -> nat
+    decreases l
+{
+    match l {
+        RawExpList::Nil => 0,
+        RawExpList::Cons(_h, t) => 1 + raw_exp_list_len(*t),
+    }
+}
+
 #[verifier::structural_decreases]
 pub open spec fn binder_len(b: BinderList) -> nat
     decreases b
@@ -424,12 +453,12 @@ pub open spec fn stm_size(s: StmData) -> nat
         StmData::Assert(_o, _h) => 1,
         StmData::Assume(_e) => 1,
         StmData::Assign(_d, _r) => 1,
-        // 1 + |reqs| (a LeafList) + frame_len(post) (the FrameList delta) —
+        // 1 + |reqs| (a RawExpList) + frame_len(post) (the FrameList delta) —
         // mirrors the serializer's `stm_size_of` token count: stmt heads +
-        // LeafList `Cons` (reqs) + FrameList `FBind`/`FHyp`/`FLet` (post).
-        StmData::Call { reqs, post } => 1 + leaf_len(*reqs) + frame_len(*post),
+        // RawExpList `Cons` (reqs) + FrameList `FBind`/`FHyp`/`FLet` (post).
+        StmData::Call { reqs, post } => 1 + raw_exp_list_len(*reqs) + frame_len(*post),
         StmData::DeadEnd(b) => 1 + stm_size(*b),
-        StmData::Ret(es, _rb) => 1 + leaf_len(*es),
+        StmData::Ret(es, _rb) => 1 + raw_exp_list_len(*es),
         StmData::If(_c, _nc, t, e) => 1 + stm_size(*t) + stm_size(*e),
         StmData::Loop { inv_hyps, binders, binder_bounds: _, cond_name: _, cond_ann: _, neg_cond_ann: _, d_old_name: _, d_old_val: _, decrease_oblig: _, body } =>
             // Mirrors the serializer's `stm_size_of` token count, which sums
@@ -892,7 +921,7 @@ proof fn skeleton_kernel_computes()
         stm_size(StmData::Seq(
             Box::new(StmData::Assert(atom_ob(0), 0)),
             Box::new(StmData::If(1, 2, Box::new(StmData::Skip),
-                Box::new(StmData::Ret(Box::new(LeafList::Nil), RetBind::RetNone)))),
+                Box::new(StmData::Ret(Box::new(RawExpList::Nil), RetBind::RetNone)))),
         )) == 5,
         goal_size(GoalData::Imp(7, Box::new(GoalData::All(8, 9, Box::new(GoalData::Leaf(10)))))) == 3,
         leaf_len(LeafList::Cons(1, Box::new(LeafList::Cons(2, Box::new(LeafList::Nil))))) == 2
@@ -1018,8 +1047,12 @@ pub open spec fn close_e(f: FrameList, ob: RawExp) -> GoalData
 // not yet one of the deepened `RawExp` shapes (G0–G7).
 pub open spec fn atom_ob(id: u64) -> RawExp { RawExp::Var(id, TypData::TyBool) }
 
-// close(frame, ·) mapped over a LeafList → one goal per leaf (Call reqs,
-// Ret enss, Loop init/maintain invariants).
+// close(frame, ·) mapped over a LeafList → one stage-A goal per leaf.
+// SUPERSEDED by `close_each_e` (W6d.1b-ii): Call.reqs / Ret.es now carry
+// deep `RawExpList` obligations, and Loop init/maintain use
+// `close_each_binderprop`. Retained as the stage-A reference mirror (no
+// callers today); safe to delete once no stage-A obligation container
+// remains.
 #[verifier::structural_decreases]
 pub open spec fn close_each(f: FrameList, l: LeafList) -> GoalList
     decreases l
@@ -1027,6 +1060,20 @@ pub open spec fn close_each(f: FrameList, l: LeafList) -> GoalList
     match l {
         LeafList::Nil => GoalList::Nil,
         LeafList::Cons(h, t) => GoalList::Cons(Box::new(close(f, h)), Box::new(close_each(f, *t))),
+    }
+}
+
+// W6d.1b-ii: close_e(frame, ·) mapped over a RawExpList → one DEEP goal per
+// obligation (Call reqs, Ret enss). The deep analogue of `close_each`; each
+// terminal is `LeafE(render_exp(ob))` instead of `Leaf(u64)`, so the
+// production side's `LeafE(ExprData)` matches constructor-for-constructor.
+#[verifier::structural_decreases]
+pub open spec fn close_each_e(f: FrameList, l: RawExpList) -> GoalList
+    decreases l
+{
+    match l {
+        RawExpList::Nil => GoalList::Nil,
+        RawExpList::Cons(h, t) => GoalList::Cons(Box::new(close_e(f, *h)), Box::new(close_each_e(f, *t))),
     }
 }
 
@@ -1362,9 +1409,9 @@ pub open spec fn wp_stm(f: FrameList, s: StmData) -> GoalList
             GoalList::Cons(Box::new(close_e(f, o)), Box::new(GoalList::Nil)),
         StmData::Assume(_e) => GoalList::Nil,
         StmData::Assign(_x, _rhs) => GoalList::Nil,
-        StmData::Call { reqs, post: _ } => close_each(f, *reqs),
+        StmData::Call { reqs, post: _ } => close_each_e(f, *reqs),
         StmData::DeadEnd(b) => wp_stm(f, *b),
-        StmData::Ret(es, rb) => close_each(ret_frame(f, rb), *es),
+        StmData::Ret(es, rb) => close_each_e(ret_frame(f, rb), *es),
         StmData::If(c, nc, t, e) =>
             goals_append(
                 wp_stm(frame_append(f, FrameList::FHyp(c, Box::new(FrameList::FNil))), *t),
@@ -1625,7 +1672,7 @@ proof fn ref_wp_seed_and_assert()
                 reqs: BinderList::Nil,
                 enss: LeafList::Cons(5, Box::new(LeafList::Cons(6, Box::new(LeafList::Nil)))),
             },
-            StmData::Ret(Box::new(LeafList::Cons(5, Box::new(LeafList::Cons(6, Box::new(LeafList::Nil))))),
+            StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(5)), Box::new(RawExpList::Cons(Box::new(atom_ob(6)), Box::new(RawExpList::Nil))))),
                 RetBind::RetNone),
         )) == 2
 by { decide }
@@ -1706,22 +1753,22 @@ proof fn ref_wp_ret_return_binding()
         goals_eq(
             wp_stm(
                 FrameList::FLet(16, 23, Box::new(FrameList::FNil)),
-                StmData::Ret(Box::new(LeafList::Cons(12, Box::new(LeafList::Nil))),
+                StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(12)), Box::new(RawExpList::Nil))),
                     RetBind::RetLet(13, 16)),
             ),
             GoalList::Cons(
                 Box::new(GoalData::Let(16, 23, Box::new(GoalData::Let(13, 16,
-                    Box::new(GoalData::Leaf(12)))))),
+                    Box::new(GoalData::LeafE(ExprData::Atom(12))))))),
                 Box::new(GoalList::Nil)),
         ) == 1,
         goals_eq(
             wp_stm(
                 FrameList::FLet(16, 23, Box::new(FrameList::FNil)),
-                StmData::Ret(Box::new(LeafList::Cons(12, Box::new(LeafList::Nil))),
+                StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(12)), Box::new(RawExpList::Nil))),
                     RetBind::RetNone),
             ),
             GoalList::Cons(
-                Box::new(GoalData::Let(16, 23, Box::new(GoalData::Leaf(12)))),
+                Box::new(GoalData::Let(16, 23, Box::new(GoalData::LeafE(ExprData::Atom(12))))),
                 Box::new(GoalList::Nil)),
         ) == 1
 by { decide }
@@ -1784,12 +1831,12 @@ proof fn ref_wp_sum_to_loop()
                             StmData::Seq(Box::new(StmData::Assume(20)), Box::new(
                             StmData::Assign(11, 22)))))))))))),
                     }),
-                    Box::new(StmData::Ret(Box::new(LeafList::Cons(7, Box::new(LeafList::Nil))),
+                    Box::new(StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(7)), Box::new(RawExpList::Nil))),
                         RetBind::RetLet(8, 11))),
                 ))))),
             ),
             // production goals (cert_sum_to_goals), 12 in walk order
-                GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(23)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(24)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(25)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(26)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::LeafE(ExprData::Atom(18))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::LeafE(ExprData::Atom(21))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(23)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(24)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(25)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(26)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(39)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 40, Box::new(GoalData::Let(8, 11, Box::new(GoalData::Leaf(7)))))))))))))))))))))))))))), Box::new(GoalList::Nil)))))))))))))))))))))))),
+                GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(23)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(24)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(25)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(26)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::LeafE(ExprData::Atom(18))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::LeafE(ExprData::Atom(21))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(23)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(24)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(25)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(26)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(39)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 40, Box::new(GoalData::Let(8, 11, Box::new(GoalData::LeafE(ExprData::Atom(7))))))))))))))))))))))))))))), Box::new(GoalList::Nil)))))))))))))))))))))))),
         ) == 1
 by { decide }
 
@@ -1906,14 +1953,14 @@ proof fn ref_wp_if_fallthrough_divergence()
                     Box::new(StmData::If(36, 37,
                         Box::new(StmData::Seq(
                             Box::new(StmData::Ret(
-                                Box::new(LeafList::Cons(7, Box::new(LeafList::Nil))),
+                                Box::new(RawExpList::Cons(Box::new(atom_ob(7)), Box::new(RawExpList::Nil))),
                                 RetBind::RetLet(8, 9))),
                             Box::new(StmData::Skip))),
                         Box::new(StmData::Skip))),
                     Box::new(StmData::Assert(atom_ob(40), 39)))),
             GoalList::Cons(
                 Box::new(GoalData::Imp(34, Box::new(GoalData::Imp(36,
-                    Box::new(GoalData::Let(8, 9, Box::new(GoalData::Leaf(7)))))))),
+                    Box::new(GoalData::Let(8, 9, Box::new(GoalData::LeafE(ExprData::Atom(7))))))))),
                 Box::new(GoalList::Cons(
                     Box::new(GoalData::Imp(34, Box::new(GoalData::Imp(37,
                         Box::new(GoalData::LeafE(ExprData::Atom(40))))))),
@@ -1962,14 +2009,14 @@ by { decide }
 // Mutation-kill: refWp's goal 0 (then-branch postcond) binds `let tmp__3 := 0`
 // (val leaf 11 from the cloned then-branch); a goal 0 expecting `:= 99` fails.
 pub open spec fn cd19_ctx() -> FnCtxData { FnCtxData { typ_params: BinderList::Nil, params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)), param_bounds: ParamBoundList::Bound(3, 2, Box::new(ParamBoundList::Nil)), reqs: BinderList::Nil, enss: LeafList::Cons(4, Box::new(LeafList::Nil)) } }
-pub open spec fn cd19_sst() -> StmData { StmData::Seq(Box::new(StmData::Assign(7, 0)), Box::new(StmData::If(8, 9, Box::new(StmData::Seq(Box::new(StmData::Assign(10, 11)), Box::new(StmData::Ret(Box::new(LeafList::Cons(5, Box::new(LeafList::Nil))), RetBind::RetLet(6, 10))))), Box::new(StmData::Seq(Box::new(StmData::Seq(Box::new(StmData::Seq(Box::new(StmData::Assert(atom_ob(13), 12)), Box::new(StmData::Seq(Box::new(StmData::Assume(12)), Box::new(StmData::Seq(Box::new(StmData::Assign(14, 15)), Box::new(StmData::Seq(Box::new(StmData::Assert(atom_ob(17), 16)), Box::new(StmData::Call { reqs: Box::new(LeafList::Nil), post: Box::new(FrameList::FHyp(20, Box::new(FrameList::FLet(18, 19, Box::new(FrameList::FNil))))) }))))))))), Box::new(StmData::Assign(10, 18)))), Box::new(StmData::Ret(Box::new(LeafList::Cons(5, Box::new(LeafList::Nil))), RetBind::RetLet(6, 10)))))))) }
-pub open spec fn cd19_goals() -> GoalList { GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(8, Box::new(GoalData::Let(10, 11, Box::new(GoalData::Let(6, 10, Box::new(GoalData::Leaf(5)))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(9, Box::new(GoalData::LeafE(ExprData::Atom(13))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(9, Box::new(GoalData::Imp(12, Box::new(GoalData::Imp(12, Box::new(GoalData::Let(14, 15, Box::new(GoalData::LeafE(ExprData::Atom(17))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(9, Box::new(GoalData::Imp(12, Box::new(GoalData::Imp(12, Box::new(GoalData::Let(14, 15, Box::new(GoalData::Imp(16, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(18, 19, Box::new(GoalData::Let(10, 18, Box::new(GoalData::Let(6, 10, Box::new(GoalData::Leaf(5)))))))))))))))))))))))))), Box::new(GoalList::Nil)))))))) }
+pub open spec fn cd19_sst() -> StmData { StmData::Seq(Box::new(StmData::Assign(7, 0)), Box::new(StmData::If(8, 9, Box::new(StmData::Seq(Box::new(StmData::Assign(10, 11)), Box::new(StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(5)), Box::new(RawExpList::Nil))), RetBind::RetLet(6, 10))))), Box::new(StmData::Seq(Box::new(StmData::Seq(Box::new(StmData::Seq(Box::new(StmData::Assert(atom_ob(13), 12)), Box::new(StmData::Seq(Box::new(StmData::Assume(12)), Box::new(StmData::Seq(Box::new(StmData::Assign(14, 15)), Box::new(StmData::Seq(Box::new(StmData::Assert(atom_ob(17), 16)), Box::new(StmData::Call { reqs: Box::new(RawExpList::Nil), post: Box::new(FrameList::FHyp(20, Box::new(FrameList::FLet(18, 19, Box::new(FrameList::FNil))))) }))))))))), Box::new(StmData::Assign(10, 18)))), Box::new(StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(5)), Box::new(RawExpList::Nil))), RetBind::RetLet(6, 10)))))))) }
+pub open spec fn cd19_goals() -> GoalList { GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(8, Box::new(GoalData::Let(10, 11, Box::new(GoalData::Let(6, 10, Box::new(GoalData::LeafE(ExprData::Atom(5))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(9, Box::new(GoalData::LeafE(ExprData::Atom(13))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(9, Box::new(GoalData::Imp(12, Box::new(GoalData::Imp(12, Box::new(GoalData::Let(14, 15, Box::new(GoalData::LeafE(ExprData::Atom(17))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(9, Box::new(GoalData::Imp(12, Box::new(GoalData::Imp(12, Box::new(GoalData::Let(14, 15, Box::new(GoalData::Imp(16, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(18, 19, Box::new(GoalData::Let(10, 18, Box::new(GoalData::Let(6, 10, Box::new(GoalData::LeafE(ExprData::Atom(5))))))))))))))))))))))))))), Box::new(GoalList::Nil)))))))) }
 
 proof fn ref_wp_if_twoway_join()
     ensures
         goals_eq(ref_wp(cd19_ctx(), cd19_sst()), cd19_goals()) == 1,
         goal_count(ref_wp(cd19_ctx(), cd19_sst())) == 4,
-        goal_eq(gl_head(ref_wp(cd19_ctx(), cd19_sst())), GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(8, Box::new(GoalData::Let(10, 99, Box::new(GoalData::Let(6, 10, Box::new(GoalData::Leaf(5)))))))))))))) == 0
+        goal_eq(gl_head(ref_wp(cd19_ctx(), cd19_sst())), GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(8, Box::new(GoalData::Let(10, 99, Box::new(GoalData::Let(6, 10, Box::new(GoalData::LeafE(ExprData::Atom(5))))))))))))))) == 0
 by { decide }
 
 // ── bootstrap-02b: the Call pass-through, both post-frame shapes ────
@@ -2008,13 +2055,13 @@ proof fn ref_wp_call_pass_through()
                 FrameList::FHyp(100, Box::new(FrameList::FNil)),
                 StmData::Seq(
                     Box::new(StmData::Call {
-                        reqs: Box::new(LeafList::Cons(7, Box::new(LeafList::Nil))),
+                        reqs: Box::new(RawExpList::Cons(Box::new(atom_ob(7)), Box::new(RawExpList::Nil))),
                         post: Box::new(FrameList::FHyp(9,
                             Box::new(FrameList::FLet(8, 10, Box::new(FrameList::FNil))))),
                     }),
                     Box::new(StmData::Assert(atom_ob(11), 12)))),
             GoalList::Cons(
-                Box::new(GoalData::Imp(100, Box::new(GoalData::Leaf(7)))),
+                Box::new(GoalData::Imp(100, Box::new(GoalData::LeafE(ExprData::Atom(7))))),
                 Box::new(GoalList::Cons(
                     Box::new(GoalData::Imp(100, Box::new(GoalData::Imp(9,
                         Box::new(GoalData::Let(8, 10, Box::new(GoalData::LeafE(ExprData::Atom(11))))))))),
@@ -2026,14 +2073,14 @@ proof fn ref_wp_call_pass_through()
                 FrameList::FHyp(100, Box::new(FrameList::FNil)),
                 StmData::Seq(
                     Box::new(StmData::Call {
-                        reqs: Box::new(LeafList::Cons(7, Box::new(LeafList::Nil))),
+                        reqs: Box::new(RawExpList::Cons(Box::new(atom_ob(7)), Box::new(RawExpList::Nil))),
                         post: Box::new(FrameList::FBind(8, 1,
                             Box::new(FrameList::FHyp(9,
                                 Box::new(FrameList::FHyp(13, Box::new(FrameList::FNil))))))),
                     }),
                     Box::new(StmData::Assert(atom_ob(11), 12)))),
             GoalList::Cons(
-                Box::new(GoalData::Imp(100, Box::new(GoalData::Leaf(7)))),
+                Box::new(GoalData::Imp(100, Box::new(GoalData::LeafE(ExprData::Atom(7))))),
                 Box::new(GoalList::Cons(
                     Box::new(GoalData::Imp(100, Box::new(GoalData::All(8, 1,
                         Box::new(GoalData::Imp(9, Box::new(GoalData::Imp(13,
@@ -2047,13 +2094,13 @@ proof fn ref_wp_call_pass_through()
                 FrameList::FHyp(100, Box::new(FrameList::FNil)),
                 StmData::Seq(
                     Box::new(StmData::Call {
-                        reqs: Box::new(LeafList::Cons(7, Box::new(LeafList::Nil))),
+                        reqs: Box::new(RawExpList::Cons(Box::new(atom_ob(7)), Box::new(RawExpList::Nil))),
                         post: Box::new(FrameList::FHyp(9,
                             Box::new(FrameList::FLet(8, 10, Box::new(FrameList::FNil))))),
                     }),
                     Box::new(StmData::Assert(atom_ob(11), 12)))),
             GoalList::Cons(
-                Box::new(GoalData::Imp(100, Box::new(GoalData::Leaf(7)))),
+                Box::new(GoalData::Imp(100, Box::new(GoalData::LeafE(ExprData::Atom(7))))),
                 Box::new(GoalList::Cons(
                     Box::new(GoalData::Imp(100, Box::new(GoalData::Imp(9,
                         Box::new(GoalData::Let(8, 99, Box::new(GoalData::LeafE(ExprData::Atom(11))))))))),
@@ -2142,14 +2189,14 @@ proof fn amended_shapes_kernel_compute()
         }) == 4,
         // Call: 1 + |reqs=1| + frame_len(post = FBind(5,6,FNil) = 1) == 3
         stm_size(StmData::Call {
-            reqs: Box::new(LeafList::Cons(0, Box::new(LeafList::Nil))),
+            reqs: Box::new(RawExpList::Cons(Box::new(atom_ob(0)), Box::new(RawExpList::Nil))),
             post: Box::new(FrameList::FBind(5, 6, Box::new(FrameList::FNil))),
         }) == 3,
         // Ret: 1 + |es=2| == 3 (RetBind adds no statements to the size).
-        stm_size(StmData::Ret(Box::new(LeafList::Cons(0,
-            Box::new(LeafList::Cons(1, Box::new(LeafList::Nil))))), RetBind::RetNone)) == 3,
-        stm_size(StmData::Ret(Box::new(LeafList::Cons(0,
-            Box::new(LeafList::Cons(1, Box::new(LeafList::Nil))))), RetBind::RetLet(23, 9))) == 3,
+        stm_size(StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(0)),
+            Box::new(RawExpList::Cons(Box::new(atom_ob(1)), Box::new(RawExpList::Nil))))), RetBind::RetNone)) == 3,
+        stm_size(StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(0)),
+            Box::new(RawExpList::Cons(Box::new(atom_ob(1)), Box::new(RawExpList::Nil))))), RetBind::RetLet(23, 9))) == 3,
         binder_len(BinderList::Cons(1, 2, Box::new(BinderList::Nil))) == 1,
         param_bound_len(ParamBoundList::Bound(4, 5,
             Box::new(ParamBoundList::NoBound(Box::new(ParamBoundList::Nil))))) == 2,
