@@ -1047,26 +1047,12 @@ pub open spec fn close_e(f: FrameList, ob: RawExp) -> GoalData
 // not yet one of the deepened `RawExp` shapes (G0–G7).
 pub open spec fn atom_ob(id: u64) -> RawExp { RawExp::Var(id, TypData::TyBool) }
 
-// close(frame, ·) mapped over a LeafList → one stage-A goal per leaf.
-// SUPERSEDED by `close_each_e` (W6d.1b-ii): Call.reqs / Ret.es now carry
-// deep `RawExpList` obligations, and Loop init/maintain use
-// `close_each_binderprop`. Retained as the stage-A reference mirror (no
-// callers today); safe to delete once no stage-A obligation container
-// remains.
-#[verifier::structural_decreases]
-pub open spec fn close_each(f: FrameList, l: LeafList) -> GoalList
-    decreases l
-{
-    match l {
-        LeafList::Nil => GoalList::Nil,
-        LeafList::Cons(h, t) => GoalList::Cons(Box::new(close(f, h)), Box::new(close_each(f, *t))),
-    }
-}
-
 // W6d.1b-ii: close_e(frame, ·) mapped over a RawExpList → one DEEP goal per
-// obligation (Call reqs, Ret enss). The deep analogue of `close_each`; each
-// terminal is `LeafE(render_exp(ob))` instead of `Leaf(u64)`, so the
-// production side's `LeafE(ExprData)` matches constructor-for-constructor.
+// obligation (Call reqs, Ret enss). Each terminal is `LeafE(render_exp(ob))`
+// instead of `Leaf(u64)`, so the production side's `LeafE(ExprData)` matches
+// the reference constructor-for-constructor. (This is the only per-list
+// obligation folder now — the old stage-A `close_each` over `LeafList` was
+// removed when Call/Ret deepened; Loop uses `close_each_binderprop`.)
 #[verifier::structural_decreases]
 pub open spec fn close_each_e(f: FrameList, l: RawExpList) -> GoalList
     decreases l
