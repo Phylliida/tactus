@@ -122,6 +122,11 @@ tactus-core (kernel-compute like everything else). The bridge line is
 (A `deriving DecidableEq` emission knob is the cleaner long-term form —
 recorded as a W1.5-style follow-on, not a W2 blocker.)
 
+**W2a correction (2026-07-14, §5.10):** a `bool`-returning spec fn lowers to
+a NONCOMPUTABLE Lean `Prop`, so `decide` gets stuck on `Classical.choice`.
+`goal_eq`/`goals_eq` therefore return `nat` (1 = equal, 0 = not) and the
+bridge line is `goals_eq (refWp ctx sst) production = 1 := by decide`.
+
 ### 2.4 W2 acceptance
 
 1. Every fixture cert file's bridge line closes by `decide` (and `rfl`).
@@ -181,30 +186,60 @@ bug-FINDING deliverable, independent of the W5 soundness proof.
 
 ## 5. Open questions (answer during W2, record here)
 
-1. Post-`If` continuation: does the production walker duplicate the rest
-   under each branch, or join? Mirror must match; discover empirically from
-   a two-branch fixture cert diff (§2.2).
-2. Fall-through postcondition: where the production emits the ens obligation
-   when the body doesn't end in explicit `Ret`. Related shape question
-   (raised in N2.1 review): the explicit `Ret(LeafList)` bakes the returned
-   value into each leaf at render time, so no frame return-binder is needed
-   for explicit returns. If the fall-through path instead binds the return
-   value as a frame `∀`/`let` (rather than rendering a closed instantiated
-   leaf), `FnCtxData` will need a `return_var: (id, typ)` field — deliberately
-   NOT added in N2.1 (the amendment table omits it). Confirm empirically
-   before adding, so the literal shape doesn't churn.
-3. Loop-body post: are body-end invariant obligations distinct Assert nodes
-   in the SST at the snapshot point (in which case `Loop` handling shrinks),
-   or walker-synthesized (in which case refWp synthesizes identically)?
-   P7's fcx evidence suggests walker-synthesized; confirm.
-4. Overflow-guard asserts: present as SST `Assert` nodes at the snapshot
-   (then free) or walker-injected (then refWp must mirror the injection —
-   preferably argue for serializing post-injection instead).
+**W2a resolution status (2026-07-14, from the on-disk fixture certs +
+authoring refWp — see board bootstrap-06 writeup for full detail):**
+
+1. Post-`If` continuation: **UNRESOLVED — no fixture exercises it.** In the
+   fixtures a mid-`Seq` `If` never appears as an SST node: `max_u64`'s `if` is
+   ABSORBED by the frontend into the returned-value rendering (leaf 7 =
+   `x<y → (let r := let m := y; …)`) before the snapshot. refWp's stage-A
+   choice (`frameAfter(If)=frame`, continuation sees the pre-if frame) is
+   authored but untested. Needs a fixture with a real post-if continuation
+   (feed W3). 
+2. Fall-through postcondition: **the serializer emits an explicit `Ret(enss)`
+   node** — all three fixtures end in `Ret`, so refWp walks the explicit Ret
+   (no synthesis). CONFIRMED the `return_var` question is LIVE: `sum_to`
+   production prepends `Let 39 7` (`let r := acc`) before the postcondition
+   leaf — production DOES bind the return value as a frame let. So a
+   `return_var` field (or serializer-baked let) IS needed for fall-through
+   bodies (finding-4). refWp does not add it yet.
+3. Loop-body post: **WALKER-SYNTHESISED, confirmed.** Init/maintain/decrease
+   invariant obligations are NOT distinct SST Assert nodes; refWp synthesises
+   init+maintain from `Loop.invs` identically. (User asserts inside the body
+   ARE real SST Assert nodes.)
+4. Overflow-guard asserts: **SST `Assert` nodes, serialized post-injection,
+   confirmed.** refWp just folds them (add_capped Assert 8/13; sum_to Assert
+   13/15). No injection mirror needed.
 5. W5 leaf semantics: valuation-parametric SstSem vs. deep-exprs-first —
-   see §4; decide at W5a kickoff.
+   see §4; decide at W5a kickoff. (Untouched by W2a.)
 6. Mutual/SCC exec fns and non-default loop flavors
    (`invariant_except_break`, `no_unwind` interplay): stage-A exclusions —
    confirm the serializer rejects them loudly rather than mis-capturing.
+   (Untouched by W2a.)
+
+**Newly surfaced by W2a (drive bootstrap-15 / W2b):**
+
+7. **Obligation-annotation gap (dominant):** production renders every
+   obligation leaf with a `/- @rust:file:line -/` annotation (a distinct
+   interned leaf); the SST carries the BARE prop leaf (add_capped `Assert 8` →
+   goal `Leaf 15`; sum_to inv `10` → `Leaf 17`). Under strict `goals_eq` NO
+   fixture bridge closes today. The serializer must carry the annotated
+   obligation leaf (Assert then needs a bare hyp-leaf AND an annotated
+   obligation-leaf).
+8. **Hyp-name gap:** bound-hyps/requires render as NAMED `∀`-binders
+   (`All 19 2` = `∀ (h_x_bound : …)`), not arrows; FnCtxData carries only the
+   prop leaf. N2.1-round-2: `ParamBoundList::Bound(name, prop)`, `reqs` as a
+   `BinderList`; then refWp's signature hyps switch `FHyp`→`FBind`.
+9. **Loop-binder gap:** SST `Loop.binders = Nil` (N3a `modified_vars = None`);
+   production quantifies the maintain/use telescope over the loop-modified
+   locals + bound hyps + invs-as-hyps + cond + a `_tactus_d_old` let. Serializer
+   must populate `Loop.binders` + a decreases leaf.
+10. **Backend: `bool` spec fns → noncomputable `Prop`** → `decide` stuck on
+    `Classical.choice`. `goal_eq`/`goals_eq` return `nat` (1/0); the bridge
+    line is `goals_eq (refWp …) production = 1 := by decide`, superseding
+    §2.3's `= true`. Also: nested `match a {…match b…}` emits ambiguously
+    ("redundant alternative"); match the first arg alone + read the second via
+    projection accessors.
 
 ## 6. Sequencing
 
