@@ -681,7 +681,7 @@ fn contains_loc(e: &Exp) -> bool {
 /// "what's beneath the wrappers?" (`peel_value_position`) or
 /// "is there a Loc anywhere here?" (`contains_loc`), and the
 /// difference between them is centralized.
-fn peel_value_position(e: &Exp) -> &Exp {
+pub(crate) fn peel_value_position(e: &Exp) -> &Exp {
     let p = peel_transparent(e);
     match &p.x {
         ExpX::Loc(inner) => peel_transparent(inner),
@@ -5107,7 +5107,7 @@ fn unfold_multi_binder_let(
 /// Returns `None` for non-Let binders or for multi-binder Lets
 /// (multi-binder lets are deferred — see DESIGN.md "Lossy accepted
 /// forms").
-fn match_single_let_bind<'a>(
+pub(crate) fn match_single_let_bind<'a>(
     bnd: &'a vir::sst::Bnd,
     body: &'a Exp,
 ) -> Option<(crate::lean_name::LeanName, &'a Exp, &'a Exp)> {

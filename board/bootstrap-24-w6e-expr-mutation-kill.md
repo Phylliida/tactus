@@ -156,6 +156,32 @@ is independent; W6e is the last correctness rung before the W6 ladder is closed.
   **Next: wire the serializer (G4.2 parts 1+2) to the pinned target above, then
   G4.3 re-emit + flip max_u64 to close-ok.** Task stays in_progress.
 
+- (2026-07-14, opus-b30) **Wiring G4.2 — in progress.** Re-derived the full
+  contract from the source before touching it (load avg 8+, so timings are
+  inflated this session). Confirmed against production:
+  - `emit_done_or_split` (`sst_to_lean.rs:2286`) splits TOP-level `And`s, peels
+    `Let` into the OblCtx spine, and emits a theorem at any other node — so
+    max_u64's `And(impl15, impl16)` splits into two goal leaves that are the
+    WHOLE branch-folded implications (`Implies`-topped, NOT bare `SpanMark`).
+    That is why their ids are NOT in `deep_ids` today (oblig_slot only interns
+    the bare `SpanMark(r≥x/r≥y)` ensures ids) → the honest-fail.
+  - `and_all` (`lean_ast.rs:2049`) is RIGHT-associated → `ens_and = And(e0, e1)`
+    for 2 ensures; the recompute's `conjoin_raw` folds `pending_ens_oblig`
+    right, reusing the ALREADY-deep span slots verbatim (so the per-ensures
+    Friction-2 compare is preserved inside the fold).
+  - `lift_if_value_coerced` (`:4956`): the leaf continuation for max_u64 is
+    `v ↦ let r := (let m := v; m); ens_and`; mirrored at the RawExp level with a
+    wrap-stack (outer→inner `[(r, ens_and), (m, Var m)]`), NO closures (avoids
+    `&mut self` capture).
+  - **Chose the deep_ids coordination that AVOIDS reconstructing production's
+    `ensures_goal` LExpr:** a successful Return-lift recompute bumps a counter;
+    a post-stm-walk pass in `serialize` seeds `deep_ids` with the `Implies`-
+    topped goal-shape leaf ids (the goal shapes ARE production's leaves, passed
+    in — so the id matches by construction) when transcribable. Proved safe:
+    every lifting-return fn is verdict-neutral-or-improving (a lift currently
+    honest-fails; post-change it either bridges or still honest-fails, never a
+    NEW failure), because non-lift returns keep the current path untouched.
+
 ## G4 remaining design (for the next instance — recompute + re-emit)
 
 **The shape mismatch (why max_u64 honest-fails today).** Production emits TWO

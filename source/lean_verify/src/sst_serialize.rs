@@ -190,10 +190,11 @@ use vir::ast::{
     ArithOp, BinaryOp, Constant, InequalityOp, IntRange, KrateX, Typ, TypDecoration, TypX,
     UnaryOp, UnaryOpr, VarIdent,
 };
-use vir::sst::{CallFun, Exp, ExpX, FuncCheckSst, FunctionSst, LoopInv, Stm, StmX};
+use vir::sst::{BndX, CallFun, Exp, ExpX, FuncCheckSst, FunctionSst, LoopInv, Stm, StmX};
 
 use crate::lean_ast::{
-    AssertKind, Expr as LExpr, ExprNode, GoalShape, GoalSpine, ObligationKind, Theorem,
+    AssertKind, BinOp as LBinOp, Expr as LExpr, ExprNode, GoalShape, GoalSpine, ObligationKind,
+    Theorem, UnOp as LUnOp,
 };
 use crate::lean_pp::pp_expr;
 use crate::to_lean_type::{param_binder_typ, typ_to_expr};
@@ -383,6 +384,23 @@ struct Serializer<'a> {
     /// arith returns, generic `T`) the coercion is a no-op, so no
     /// regression on the closing fixtures.
     ret_typ: Option<Typ>,
+    /// G4/W6e — whether EVERY ensures obligation slot went DEEP
+    /// (`oblig_slot` emitted `RawExp.Span`, not `atom_ob`). The Return-lift
+    /// recompute conjoins `pending_ens_oblig` into the branch-folded leaf's
+    /// `let r := …; (ens0 ∧ ens1)` tail; that fold is only faithful when
+    /// every ensures is a real `Span`-deep slot (an `atom_ob` conjunct would
+    /// render to `Atom` and diverge from the goal side's `SpanMark`). Set at
+    /// setup, gated by the recompute — else it falls through to the current
+    /// (opaque, still-honest-failing) Return path.
+    pending_ens_all_deep: bool,
+    /// G4/W6e — count of Return statements whose if-valued return LIFTED and
+    /// was successfully recomputed into branch-folded `Ret([impl…], RetNone)`
+    /// obligations. Zero ⇒ no lift happened ⇒ the post-stm-walk `deep_ids`
+    /// seeding pass is a no-op (verdict-neutral). `>0` ⇒ the goal walk should
+    /// deepen the matching `Implies`-topped goal-shape leaves (their ids are
+    /// seeded from the actual production goal shapes, so they match by
+    /// construction). Non-lift returns never touch this.
+    lifted_return_recomputes: u64,
 }
 
 impl<'a> Serializer<'a> {
@@ -727,6 +745,70 @@ impl<'a> Serializer<'a> {
         }
     }
 
+    // ── G4/W6e: the value-if-lift recompute (reference side) ──────────
+    // Production lifts a fall-through `if` in a return VALUE into each
+    // ensures leaf, so the Return goal is a branch-folded implication
+    // `c → (let r := (let m := v; …); ens0 ∧ ens1)` per branch, split off
+    // the top `And` (`lift_if_value_coerced` → `emit_done_or_split`). The
+    // frozen `refWp` only bridges if the reference SST carries THOSE
+    // obligations, not the ensures-split `Ret([ens…], RetLet)` the plain
+    // path emits. `lift_if_raw` mirrors `lift_if_value_coerced` at the
+    // `RawExp`-text level (the "recompute-not-copy" TCB step), so a
+    // divergence is a bridge mismatch, never a silent pass. Pinned end-to-
+    // end through the real `ref_wp`/`render_exp` by probe14 (bootstrap-24).
+
+    /// The lifted return-obligation tree, before the top-level `And` split.
+    /// A small typed mirror of `lift_if_value_coerced`'s output so the split
+    /// is structural (not text-parsing). `Leaf`/`Implies` carry pre-rendered
+    /// `RawExp` text; `And` only ever appears at nodes the split descends.
+    fn lift_if_raw(&mut self, e: &Exp, wraps: &[RawLet]) -> Sr<LiftedRaw> {
+        let peeled = crate::sst_to_lean::peel_value_position(e);
+        match &peeled.x {
+            // `if c { t } else { e }` → `(c → lift t) ∧ (¬c → lift e)`.
+            // Both branches are return values → same `wraps`.
+            ExpX::If(cond, then_e, else_e) => {
+                let c = self.raw_exp(cond)?;
+                let then_t = self.lift_if_raw(then_e, wraps)?;
+                let else_t = self.lift_if_raw(else_e, wraps)?;
+                let not_c = format!("({}.RawExp.Not {})", NS, box_raw(&c));
+                Ok(LiftedRaw::And(
+                    Box::new(LiftedRaw::Implies(c, Box::new(then_t))),
+                    Box::new(LiftedRaw::Implies(not_c, Box::new(else_t))),
+                ))
+            }
+            // `let name := rhs; body` — lift `rhs`, re-threading `body` as the
+            // innermost wrap. Only the fixture's shape (single binder, body
+            // rendered as-is) is mirrored; a nested let-chain rhs or a
+            // multi-binder let fails loud (fall-through to the honest-failing
+            // plain path), never a silent pass.
+            ExpX::Bind(bnd, body) => {
+                let Some((name, rhs, inner_body)) =
+                    crate::sst_to_lean::match_single_let_bind(bnd, body)
+                else {
+                    return Err("liftraw-bind".to_string());
+                };
+                let peeled_inner = crate::sst_to_lean::peel_value_position(inner_body);
+                if matches!(&peeled_inner.x, ExpX::Bind(b, _) if matches!(&b.x, BndX::Let(_))) {
+                    return Err("liftraw-letchain".to_string());
+                }
+                let name_id = self.text_leaf(name.as_str());
+                let body_raw = self.raw_exp(inner_body)?;
+                let mut new_wraps = wraps.to_vec();
+                new_wraps.push(RawLet { name: name_id, body: body_raw });
+                self.lift_if_raw(rhs, &new_wraps)
+            }
+            // Leaf return value → fold the wrap-stack around it (innermost
+            // first), ending in the conjoined-ensures tail carried by the
+            // outermost `let r` wrap. Production renders the ORIGINAL `e` here
+            // (`sst_exp_to_ast_checked`); `raw_exp` peels its own transparent
+            // wrappers, so a bare-var branch value renders identically.
+            _ => {
+                let v = self.raw_exp(e)?;
+                Ok(LiftedRaw::Leaf(apply_raw_wraps(wraps, &v)))
+            }
+        }
+    }
+
     /// Interned id of a callee spec-fn's rendered name (atom-id bucket, so a
     /// production `App{head: Var(name)}` interns the SAME id). Production
     /// renders the head as `LeanName::from_path(&fun.path)`
@@ -869,6 +951,33 @@ impl<'a> Serializer<'a> {
                 let sub = self.lexpr_to_exprdata(inner)?;
                 Ok(format!("({}.ExprData.SpanMark {} {})", NS, loc, box_ed(&sub)))
             }
+            // G4 (W6e) — the value-if-lift's `let`/`¬` scaffolding. Production
+            // folds a fall-through `if` INTO each ensures leaf as a
+            // branch-folded implication `c → (let r := (let m := v; …); ens)`
+            // (`lift_if_value_coerced`); the goal leaf carries `Let` and `Not`
+            // nodes that the cast-class arms above never produce. Transcribe
+            // them structurally — the binder NAME interns its rendered text
+            // (atom-id bucket), the SAME text the reference `RawExp::Let` binder
+            // interns (`sanitize(ret)` for the return `r`, `from_var_ident` for
+            // an inner let `m`), so the two ids agree by construction. `render_exp`
+            // passes both nodes straight through (no coercion at the Let/Not
+            // node), so the bridge `decide`s the sub-expressions.
+            ExprNode::Let { name, value, body } => {
+                let nid = self.text_leaf(name.as_str());
+                let v = self.lexpr_to_exprdata(value)?;
+                let b = self.lexpr_to_exprdata(body)?;
+                Ok(format!(
+                    "({}.ExprData.Let {} {} {})",
+                    NS,
+                    nid,
+                    box_ed(&v),
+                    box_ed(&b)
+                ))
+            }
+            ExprNode::UnOp { op: LUnOp::Not, arg } => {
+                let sub = self.lexpr_to_exprdata(arg)?;
+                Ok(format!("({}.ExprData.Not {})", NS, box_ed(&sub)))
+            }
             _ => Err(format!("ed-{}", lexpr_construct_tag(&e.node))),
         }
     }
@@ -924,6 +1033,43 @@ impl<'a> Serializer<'a> {
             }
 
             StmX::Return { ret_exp, .. } => {
+                // G4/W6e — the value-if-lift path. When the return VALUE lifts
+                // (`value_lifts`: an `if` in value position production pulls
+                // into each ensures leaf) AND every ensures went deep, recompute
+                // the branch-folded implication obligations `Ret([impl…],
+                // RetNone)` (`lift_if_raw`), mirroring `lift_if_value_coerced`.
+                // The `let r` is folded INTO each obligation, so `RetNone` (NOT
+                // `RetLet`) — refWp must not re-fold it. On success this REPLACES
+                // the plain ensures-split path below (which honest-fails a lifted
+                // return); on ANY recompute failure we fall through to that path
+                // (unchanged, still-honest-failing — never a silent pass). The
+                // counter drives the post-stm-walk `deep_ids` seeding so the goal
+                // side deepens the matching `Implies` leaves. Pinned by probe14.
+                if let (Some(rname), Some(e)) = (self.pending_ret_name, ret_exp) {
+                    if self.pending_ens_all_deep
+                        && !self.pending_ens_oblig.is_empty()
+                        && value_lifts(e)
+                    {
+                        let ens_and = conjoin_raw(&self.pending_ens_oblig);
+                        let base = [RawLet { name: rname, body: ens_and }];
+                        if let Ok(tree) = self.lift_if_raw(e, &base) {
+                            let mut impls: Vec<String> = Vec::new();
+                            split_lifted(tree, &mut impls);
+                            // Only take the branch-folded path when the lift
+                            // actually SPLIT (≥2 obligations) — a degenerate
+                            // 1-leaf result is a non-lift the plain path handles
+                            // identically (and would mis-conjoin the ensures).
+                            if impls.len() >= 2 {
+                                self.lifted_return_recomputes += 1;
+                                let list = raw_exp_list(&impls);
+                                return Ok(format!(
+                                    "({}.StmData.Ret {} {}.RetBind.RetNone)",
+                                    NS, box_(&list), NS
+                                ));
+                            }
+                        }
+                    }
+                }
                 // Annotated ensures obligation leaves drive the `Return`
                 // goal (Ret-annotation, finding-1): span_mark'd like
                 // production's `WpCtx` postcondition so the goal-side
@@ -1624,10 +1770,18 @@ fn serialize<'a>(
     // read of `pending_ens_oblig`; the raw_exp atoms intern in ensures order,
     // exactly where the old `oblig_leaf` interned the span_mark'd leaf.
     let mut ens_oblig: Vec<String> = Vec::new();
+    let mut ens_all_deep = true;
     for e in check.post_condition.ens_exps.iter() {
-        let (_id, slot) = s.oblig_slot(e)?;
+        let (id, slot) = s.oblig_slot(e)?;
+        // `oblig_slot` inserts `id` into `deep_ids` iff it emitted a deep
+        // `RawExp.Span` (else an `atom_ob` fallback). The G4 Return-lift
+        // recompute conjoins these slots into the branch-folded leaf, which
+        // is only faithful when every ensures is a real `Span` (an `atom_ob`
+        // conjunct would render to `Atom` and diverge from the goal side).
+        ens_all_deep &= s.deep_ids.contains(&id);
         ens_oblig.push(slot);
     }
+    s.pending_ens_all_deep = ens_all_deep;
     s.pending_ens_oblig = ens_oblig;
     // Return-var name leaf (finding-4): production binds `let <sanitize(ret)>
     // := <e>` before the postcondition (the `Return` walker's
@@ -1665,6 +1819,33 @@ fn serialize<'a>(
 
     // Body.
     let stm_term = s.stm(&check.body)?;
+
+    // G4/W6e — seed `deep_ids` for the value-if-lift goal leaves. The Return
+    // arm recomputed the branch-folded obligations on the REFERENCE side
+    // (`Ret([impl…], RetNone)`); the goal side must deepen the matching leaves
+    // so `goal_data` emits `LeafE(lexpr_to_exprdata(leaf))` (not `Atom`). Those
+    // leaves are `Implies`-topped whole implications (NOT the bare `SpanMark`
+    // ensures `oblig_slot` already seeded) — production's `emit_done_or_split`
+    // splits the top `And` but leaves each `Implies` intact, so its id was
+    // never in `deep_ids`. We seed straight from the ACTUAL production goal
+    // shapes (`goal_shapes`), so the id matches `goal_data`'s `lexpr_leaf` by
+    // construction. Gated on a successful recompute (`lifted_return_recomputes
+    // > 0`) so a fn with no lift is untouched (verdict-neutral); a leaf whose
+    // transcription FAILS is skipped (goal stays `Atom` → that fn honest-fails,
+    // same as before — never a NEW regression, since a lifted return already
+    // honest-failed on the plain path).
+    if s.lifted_return_recomputes > 0 {
+        for shape in goal_shapes.iter().flatten() {
+            if matches!(
+                &shape.leaf.node,
+                ExprNode::BinOp { op: LBinOp::Implies, .. }
+            ) && s.lexpr_to_exprdata(&shape.leaf).is_ok()
+            {
+                let id = s.lexpr_leaf(&shape.leaf);
+                s.deep_ids.insert(id);
+            }
+        }
+    }
 
     // Assemble the FnCtxData term. `.mk` positional order matches the
     // emitted `structure lib.FnCtxData`: typ_params, params, param_bounds,
@@ -1960,6 +2141,126 @@ fn paren(term: &str) -> String {
 /// (the stage-A W2 leaf match, now carried inside the deep leaf). W6d.2a.
 fn atom_ob_lit(id: u64) -> String {
     format!("({}.RawExp.Var {} {}.TypData.TyBool)", NS, id, NS)
+}
+
+// ── G4/W6e: value-if-lift recompute helpers (free fns / types) ──────
+
+/// One pending `let name := <hole>; body` wrap around a lifted leaf value
+/// (see `Serializer::lift_if_raw`). `body` is pre-rendered `RawExp` text.
+#[derive(Clone)]
+struct RawLet {
+    name: u64,
+    body: String,
+}
+
+/// The lifted return-obligation tree before the top-level `And` split.
+enum LiftedRaw {
+    /// A conjunction the split descends into (the `if`-lift's top node).
+    And(Box<LiftedRaw>, Box<LiftedRaw>),
+    /// `cond → body`. `cond` is pre-rendered `RawExp` text (already `¬`-
+    /// wrapped for the else branch); the split does NOT descend past it.
+    Implies(String, Box<LiftedRaw>),
+    /// A fully-rendered obligation `RawExp` (the `let r := …; ens` leaf).
+    Leaf(String),
+}
+
+/// Fold the wrap-stack (outer→inner) around a leaf value `v`, applying the
+/// INNERMOST wrap first: `apply([(r, ens), (m, m_body)], v)` =
+/// `Let r (Let m v m_body) ens`. Mirrors `lift_if_value_coerced`'s nested
+/// `emit_leaf(let name := <hole>; body)` continuation.
+fn apply_raw_wraps(wraps: &[RawLet], v: &str) -> String {
+    let mut acc = v.to_string();
+    for w in wraps.iter().rev() {
+        acc = format!(
+            "({}.RawExp.Let {} {} {})",
+            NS,
+            w.name,
+            box_raw(&acc),
+            box_raw(&w.body)
+        );
+    }
+    acc
+}
+
+/// Serialize a `LiftedRaw` node (non-split context) to `RawExp` text.
+/// `And` → `BinOp 11 TyBool` (a NESTED conjunction — reachable only under an
+/// `Implies` body from nested ifs, which the split leaves intact).
+fn serialize_lifted(t: &LiftedRaw) -> String {
+    match t {
+        LiftedRaw::And(a, b) => format!(
+            "({}.RawExp.BinOp 11 {}.TypData.TyBool {} {})",
+            NS,
+            NS,
+            box_raw(&serialize_lifted(a)),
+            box_raw(&serialize_lifted(b))
+        ),
+        LiftedRaw::Implies(cond, body) => format!(
+            "({}.RawExp.BinOp 13 {}.TypData.TyBool {} {})",
+            NS,
+            NS,
+            box_raw(cond),
+            box_raw(&serialize_lifted(body))
+        ),
+        LiftedRaw::Leaf(s) => s.clone(),
+    }
+}
+
+/// Split top-level `And`s into separate obligation `RawExp`s (matching
+/// production's `emit_done_or_split`, which recurses only through `And`).
+/// `Implies`/`Leaf` nodes are terminal obligations serialized as-is.
+fn split_lifted(t: LiftedRaw, out: &mut Vec<String>) {
+    match t {
+        LiftedRaw::And(a, b) => {
+            split_lifted(*a, out);
+            split_lifted(*b, out);
+        }
+        other => out.push(serialize_lifted(&other)),
+    }
+}
+
+/// Right-associated conjunction of `RawExp` terms (matching `and_all`,
+/// `lean_ast.rs`): `[e0, e1, e2]` → `And(e0, And(e1, e2))`. `RawExp.BinOp 11
+/// TyBool`. Callers guarantee a non-empty slice.
+fn conjoin_raw(terms: &[String]) -> String {
+    let (last, init) = terms.split_last().expect("conjoin_raw: non-empty");
+    let mut acc = last.clone();
+    for t in init.iter().rev() {
+        acc = format!(
+            "({}.RawExp.BinOp 11 {}.TypData.TyBool {} {})",
+            NS,
+            NS,
+            box_raw(t),
+            box_raw(&acc)
+        );
+    }
+    acc
+}
+
+/// Pure structural test: does the return VALUE `e` lift — i.e. contain an
+/// `if` in a value position `lift_if_value_coerced` would pull into the
+/// ensures leaf? Mirrors the lift's If/single-let-bind recursion WITHOUT
+/// interning, so the Return arm can gate the recompute before running it.
+fn value_lifts(e: &Exp) -> bool {
+    let p = crate::sst_to_lean::peel_value_position(e);
+    match &p.x {
+        ExpX::If(..) => true,
+        ExpX::Bind(bnd, body) => match crate::sst_to_lean::match_single_let_bind(bnd, body) {
+            Some((_, rhs, inner_body)) => {
+                let pi = crate::sst_to_lean::peel_value_position(inner_body);
+                let inner_is_let_chain =
+                    matches!(&pi.x, ExpX::Bind(b, _) if matches!(&b.x, BndX::Let(_)));
+                // The lift recurses into `rhs` (non-let-chain inner) or
+                // `inner_body` (let-chain); check the same position.
+                if inner_is_let_chain {
+                    value_lifts(inner_body)
+                } else {
+                    value_lifts(rhs)
+                }
+            }
+            None => false,
+        },
+        _ => false,
+    }
 }
 
 /// `lib.RawExpList` from RawExp literal terms (order preserved). The element
