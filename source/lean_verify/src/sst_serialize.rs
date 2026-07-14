@@ -3442,9 +3442,12 @@ fn app_head_fn_name(head: &LExpr) -> Option<&str> {
 /// other is caught. `Iff` / bitwise / `Prod` are outside the cast class (the
 /// reference `binop_opcode` likewise rejects the vir ops that would produce
 /// them) → fail loud (`ed-binop-<k>`). Note `Xor` has no `lean_ast::BinOp`
-/// variant — production renders it as a 2-arg App (`Bool.xor`), which
-/// `lexpr_to_exprdata` census-rejects (`ed-app-arity`), so the reference's
-/// `Xor → 14` code is never consumed by a bridged fn.
+/// variant — production renders it as a 2-arg App (`Bool.xor a b`), which
+/// `lexpr_to_exprdata` now lowers to `ExprData.AppN` (bootstrap-34 widened the
+/// multi-arg App arm), NOT a `BinOp` node. So `lean_binop_opcode` is never
+/// called with `Xor`, and the reference's `Xor → 14` BinOp opcode is never
+/// produced by a bridged fn (both sides mirror `Bool.xor` through the App/AppN
+/// path, keyed on the same interned fn id).
 fn lean_binop_opcode(op: &crate::lean_ast::BinOp) -> Sr<u64> {
     use crate::lean_ast::BinOp as L;
     let code = match op {
