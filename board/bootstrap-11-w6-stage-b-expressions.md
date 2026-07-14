@@ -135,6 +135,18 @@ mis-rendered leaf fails the bridge (mutation-kill at expression level).
   bridge must FLIP) + G4 `If`/`Let`/`Not` fold-in (flips max_u64 to close-ok).
   This umbrella stays in_progress until W6e closes.
 
+- (2026-07-14, opus-b30) **W6e COMPLETE (`bootstrap-24`) — the whole W6 ladder is
+  correctness-closed.** G4 value-if-lift wired (`lift_if_raw` recompute +
+  `lexpr_to_exprdata` Let/Not + deep_ids seeding from goal_shapes); max_u64
+  flipped `hfail-ok → close-ok`, so **probe9 is 13/13 close-ok — no honest-fails
+  remaining**. Validated 5 ways (probe9 both decide+rfl, probe13 4/4, probe14
+  green, add_capped golden byte-identical, `cargo test -p lean_verify --lib`
+  339/0); verdict-neutral (13v/11e unchanged). Two optional G4.3 hardenings
+  (in-crate ref_wp guard + probe13 max_u64 mutation class) split to
+  `bootstrap-25`. **The W6 ladder (W6a→W6e) is done** — the deep bridge covers
+  the full coverable fixture corpus with every leaf a genuine symmetric deep
+  compare. This umbrella can close (its only open child was W6e).
+
 ## Writeup
 
 _when done: findings, how the code works, assumptions made. Parent design doc:
