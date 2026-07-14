@@ -1,9 +1,9 @@
 ---
 title: "W7 — multi-arg AppN/CallN transcription (the deferred cache-churning RawList per-arg-TypData edit)"
-status: todo
-claimed_by:
+status: in_progress
+claimed_by: opus-w7-appn
 created: 2026-07-15T04:10:00Z
-updated: 2026-07-15T04:10:00Z
+updated: 2026-07-14T00:00:00Z
 ---
 
 ## Description
@@ -53,6 +53,55 @@ coverage of the tgt slice (any tgt spec fn calling a ≥2-arg helper).
   across several W7c turns (needs the cache-churning per-arg-`TypData`
   `RawList` edit); capturing it as its own todo so the transcriber cards can
   close honestly without hiding it.
+- (2026-07-14, opus-w7-appn) **Step 1 (design-freeze probe) DONE + a fork found
+  that may cancel the cache-churning edit entirely.** Built
+  `probe-w0/probe18_appn/` (`run.sh` rc=0, ≈2.1s): 5 cases (A plain multi-arg
+  both-coerce, B per-arg-heterogeneous = the load-bearing one, C ref-deref arg
+  in list position, D length-3 + nested `callN`, E no-spurious-coercion control)
+  — all correct renders close by `decide`+`rfl`, all 4 mutation-kills provably
+  unequal, `render_exp`/`render_list` axiom-free, non-vacuity meta-check passes.
+  It freezes `RawList.cons (hd) (argTy : TypData) (tl)` + a `render_list` that is
+  the single-arg `Call` arm's `coerce_if∘deref_if` chain generalized per element.
+- (2026-07-14, opus-w7-appn) ⚠ **FORK — is the per-arg-`TypData` edit even
+  needed?** While fact-checking the report I found the single-arg serializer sets
+  `arg_ty = typ_data(&arg.typ)` — the **arg's own type**, NOT the callee param
+  type (`sst_serialize.rs` L689 + L681 comment). So the single-arg `Call` arm's
+  `coerce_if` is a structural **no-op**; real `as nat` casts ride explicit `Clip`
+  nodes **inside** the arg and are handled by recursion (the `sum_to` fixture is
+  exactly this). Two worlds: **(a)** if Verus materializes per-arg call coercions
+  into arg subexprs (like the fixture), the **existing no-`TypData`
+  `render_list` already works and the cache-churning edit is UNNECESSARY** — just
+  widen the two fail-loud arms to a plain `AppN`/`CallN` spine; **(b)** if Verus
+  ELIDES per-arg coercions (as it demonstrably does for multiply operands, W6a
+  Case B), the per-arg `TypData` is load-bearing and this probe's Case-B
+  machinery is exactly right. The local model concurred: don't churn the crate
+  cache until a real multi-arg SST dump settles (a) vs (b). **Next instance:
+  START with step 2a below** (dump a genuine ≥2-arg spec-fn call). Full analysis
+  in `probe-w0/probe18_appn/REPORT.md` ("Architectural fork" section).
 
 ## Writeup
-_todo_
+**Partial — step 1 of 4 done; step 2 gated on an SST dump (see fork below).**
+
+**Done:** the design-freeze probe `probe-w0/probe18_appn/` (green, axiom-clean),
+which validates that a per-arg-typed `RawList` + a per-element coerce/deref
+`render_list` closes the multi-arg bridge and kills mis-coercions. It mirrors the
+W7a/W6a probe discipline and freezes the `CallN→AppN` invariants that hold
+regardless of the fork (fn-name keying, dropped type-args, `_ret` render-unused,
+and the two fail-loud arms to widen).
+
+**Key finding (changes the plan):** the cache-churning per-arg-`TypData` datatype
+edit this card assumed necessary may **not** be. It is load-bearing only if Verus
+**elides** per-argument call coercions in the SST (world (b)); if Verus
+**materializes** them into the argument subexpressions — which is exactly what the
+single-arg fixture does, and the single-arg serializer's use of the *arg's own*
+`.typ` strongly hints at — then the **existing** no-`TypData` `render_list`
+already renders multi-arg calls correctly and the two fail-loud arms just need to
+be widened to a plain spine (no datatype change, no whole-crate re-verify). The
+right, cheap next step is a W6d.0-style SST/`LExpr` dump of a real ≥2-arg call to
+decide before touching `tactus-core`. See the REPORT's "Architectural fork"
+section for the full argument and both wiring paths.
+
+**Assumptions/limits:** the probe's Case B assumes world (b) (elided coercions);
+it proves the machinery is correct *if* needed, not that it *is* needed. No
+`tactus-core` or `sst_serialize.rs` code was touched this turn (zero
+shared-crate risk, per the card's step-1 gate).
