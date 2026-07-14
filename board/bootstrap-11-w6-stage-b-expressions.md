@@ -1,9 +1,9 @@
 ---
 title: "W6 — stage B: deep expressions/types join the certificate"
-status: in_progress
+status: done
 claimed_by: opus-b11
 created: 2026-07-13T19:38:00Z
-updated: 2026-07-14T09:35:00Z
+updated: 2026-07-14T21:10:00Z
 ---
 
 ## Description
@@ -149,8 +149,44 @@ mis-rendered leaf fails the bridge (mutation-kill at expression level).
 
 ## Writeup
 
-_when done: findings, how the code works, assumptions made. Parent design doc:
-`DESIGN-W6-stageB.md`. Ladder: W6a (probe) → W6b (mirror types + reference
-renderer, the shared-crate edit) → W6c (serializer transcriptions) → W6d
-(bridge deepened, DONE `bootstrap-23`) → W6e (mutation-kill + Tier-2,
-`bootstrap-24`)._
+**W6 stage-B is COMPLETE — the certificate now does a symmetric DEEP expression
+compare.** The full ladder landed and is correctness-closed:
+
+- **W6a** (`bootstrap-20`) — standalone `.lean` probe froze the D2
+  deepen-then-diff mechanic + the `ExprData`/`TypData`/`RawExp`/`render_exp`
+  shape on cast/arith/deref classes (correct-closes + mutation-kills, clean
+  kernel axioms).
+- **W6b** (`bootstrap-21`, commit `3f92ae9`) — landed the frozen mirror types +
+  `render_exp`/`render_typ` + sizes into `tactus-core/lib.rs` (the one
+  cache-churning shared-crate edit) with `GoalData::Leaf(u64) → LeafE(ExprData)`.
+- **W6c** (`bootstrap-22`, commit `cca5492`) — both serializer transcriptions:
+  reference-side `ExpX → RawExp` and production-side `LExpr → ExprData`, plus the
+  opcode-alignment invariant test.
+- **W6d** (`bootstrap-23`) — wired both into obligation-leaf emit; both sides emit
+  `LeafE`, `refWp` closes via `render_exp(RawExp)`, bridge `decide`s `expr_eq`
+  live. Deep bridge green across the whole coverable fixture corpus (12/13, G4
+  deferred), verdict-neutral, golden regenerated.
+- **W6e** (`bootstrap-24`, commit `9a1a87d`) — expression-level mutation-kill
+  harness (probe13) + G4 value-if-lift; max_u64 flipped to close-ok ⟹ **probe9
+  13/13 close-ok, no honest-fails remaining**.
+
+**What this bought (trust-inventory row 3, the highest-value silent-unsoundness
+class):** a renderer bug that inserts/drops an `Int.toNat` cast, a `.deref`
+coercion, a field accessor, or a width clip is now CAUGHT by the certificate,
+because the reference renders `RawExp` independently (implementation diversity)
+and the kernel structurally compares. Stage A could not catch this — both sides
+reused production's renderer, so a rendering bug rendered identically on both
+sides and the bridge passed silently.
+
+**Honest scope limit (carried forward):** W6 catches *inconsistent application*
+of a coercion rule (Friction-2), not a rule both sides get wrong (monoculture) —
+that residual is W5's job (soundness of refWp itself). Corpus coverage is also
+census-limited (see `bootstrap-08` W3: 1/9 tgt exec fns bridgeable today); the
+deep bridge's real-run teeth grow as `StmData::Call`/`assert-query` arms unlock
+more exec fns and as W4 flips it default-on.
+
+**Optional follow-ons split out:** `bootstrap-25` (G4 in-crate `ref_wp` decide
+guard + probe13 max_u64 mutation class) — belt-and-suspenders, not required.
+
+Parent design doc: `DESIGN-W6-stageB.md`. Umbrella closed because its only open
+child (W6e) is done.
