@@ -182,7 +182,35 @@ unchanged vs. a no-bridge run.
 
 ## Status for the next instance
 
-**UPDATE 2026-07-14 (opus-bootstrap45-seqrung): defs chain advanced 4 modules —
+**UPDATE 2026-07-14 (opus-bootstrap47-mono): DEFS-FAMILY BLOCKER CHAIN CLEARED —
+the exec defs family now builds end-to-end and the PACKAGE GATE RUNS.** With
+bootstrap-47 (m3_blinker split_q monotonicity companion) landed, a fresh run #2
+(`/tmp/w4a-bs47b`, rebuilt binary) shows: m3_blinker olean built, m4_defect_flow
+built, exec umbrella `TactusDefs_lib_exec.olean` built, **0 `.lean.failed`
+dumps**, runtime `24 verified, 0 errors`, and — the milestone this whole chain
+was for — the gate REACHES the bridge:
+```
+note: tactus: package gate: 12 modules elaborated (6 reused from per-fn checks);
+      composition + axiom closures kernel-verified
+note: tactus: 1 obligations bridge-checked against tactus-core (0 passed, 1 failed)
+      [core-olean fnv1a:ac56d5f007475edd]; failed: runtime__impl__4__clone
+```
+**So this card's coupling is now REACHABLE, but the verdict is `0 passed, 1
+failed` — NOT the expected `1 passed, 0 failed`.** The in-gate obligation bridge
+for `runtime__impl__4__clone` does NOT reproduce probe11's external `close-ok`.
+That is now THE remaining gap for this card (no longer a defs-build blocker).
+Leads for the next instance:
+- The note pins `core-olean fnv1a:ac56d5f007475edd` — check whether the
+  `$TACTUS_CORE_OUT` olean the gate imported matches the one probe11 bridged
+  against (a stale/mismatched tactus-core olean under the bootstrap fork would
+  explain a `decide` flip). Rebuild tactus-core under the bootstrap fork if in
+  doubt.
+- Confirm the in-gate `decide (ref_wp … = goals)` line is byte-identical to
+  probe11's external one (generate.rs:~3319 `run_bridge_step`).
+- Repro recipe unchanged (drop `--emit-lean`), fresh output already at
+  `/tmp/w4a-bs47b` (log `/tmp/w4a-bs47b.log`).
+
+**(earlier) UPDATE 2026-07-14 (opus-bootstrap45-seqrung): defs chain advanced 4 modules —
 now blocked only on `m3_blinker` (bootstrap-46).** The defs-family blocker chain
 is being cleared one module at a time (each fix reveals the next):
 base (bootstrap-40 ✓) → britton_via_tower (bootstrap-42 ✓) → word_numbering
