@@ -187,8 +187,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use vir::ast::{
-    ArithOp, BinaryOp, Constant, InequalityOp, IntRange, KrateX, Typ, TypDecoration, TypX,
-    UnaryOp, UnaryOpr, VarIdent,
+    ArithOp, BinaryOp, CallTarget, Constant, Expr as VirExpr, ExprX, InequalityOp, IntRange, KrateX,
+    PatternX, Place, PlaceX, Typ, TypDecoration, TypX, UnaryOp, UnaryOpr, VarIdent,
 };
 use vir::sst::{BndX, CallFun, Exp, ExpX, FuncCheckSst, FunctionSst, LoopInv, Stm, StmX};
 
@@ -838,6 +838,247 @@ impl<'a> Serializer<'a> {
     fn call_fun_id(&mut self, fun: &vir::ast::Fun) -> u64 {
         let name = crate::lean_name::LeanName::from_path(&fun.path);
         self.text_leaf(name.as_str())
+    }
+
+    // ── W7c-ref (bootstrap-29): VIR `ExprX` → RawExp (the DEF-BODY reference) ─
+    //
+    // Spec-fn *bodies* live on the VIR `vir::ast::Expr` surface, NOT the SST
+    // `vir::sst::Exp` surface `raw_exp` above operates on. The distinction is
+    // load-bearing: a spec-fn `match` body is a native `ExprX::Match` on VIR
+    // (production emits `match t with | …` from it, verified against the
+    // emitted fixture def `lib.tree_head`), but AST→SST lowering DESUGARS that
+    // same match into `if t.isVariant …` (which is why the SST `raw_exp` never
+    // needed a Match arm, and why the obligation-side `head_exec` goal reads
+    // `if tmp__.deref.isLeaf …`). So the def-body REFERENCE transcriber must
+    // read VIR, keeping `Match`/`Ite` first-class (DESIGN-W7-defslayer.md §2 —
+    // the independent second lowering that gives the bridge teeth).
+    //
+    // Reuses the RawExp emitter infra + `typ_data`/`binop_opcode`/`text_leaf`/
+    // `binder_id`/`call_fun_id` (all surface-agnostic — `typ_data` already
+    // takes a `&Typ`). Mirrors the production VIR reading in
+    // `to_lean_expr::expr_to_node`. Census-gated, fail-loud (`rawvir-<k>`) on
+    // shapes outside the fixture-reachable set (`sq`/`tri`/`tree_head`);
+    // quantifiers + multi-arg `Call` are tgt-slice-only and stay fail-loud
+    // until a tgt def forces them. `#[allow(dead_code)]` until W7d wires the
+    // def-body entry point — verdict-neutral by construction (a NEW function,
+    // never on the emit path).
+
+    /// `vir::ast::Expr` (`ExprX`) → `lib.RawExp` text for the def-body class.
+    /// Structurally parallel to `raw_exp` (SST), but on the VIR surface where
+    /// `If`/`Match`/`Ctor`/`Quant` are first-class. Result-type slots
+    /// (`Ite`/`MatchR` `ty`) carry `e.typ` so `render_exp` re-derives per-branch
+    /// / per-arm Int→Nat coercion (the Friction-2 site).
+    #[allow(dead_code)]
+    fn raw_vir_exp(&mut self, e: &VirExpr) -> Sr<String> {
+        match &e.x {
+            // Peel SMT `Box`/`Unbox` coercion wrappers first (as SST `raw_exp`
+            // does) — semantic-identity casts with no expression content; the
+            // inner node's own `typ` drives its tag.
+            ExprX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => self.raw_vir_exp(inner),
+            ExprX::Const(Constant::Int(n)) => {
+                let ty = self.typ_data(&e.typ)?;
+                Ok(format!("({}.RawExp.Lit {} {})", NS, n, paren(&ty)))
+            }
+            ExprX::Const(Constant::Bool(b)) => {
+                Ok(format!("({}.RawExp.LitBool {})", NS, if *b { 1 } else { 0 }))
+            }
+            // A var read: bare `Var`, a `VarAt` (production collapses to bare
+            // `Var`), or a `ReadPlace(Local)` (the new-mut-refs var-read shape
+            // production also collapses to the var — `expr_to_node`'s ReadPlace
+            // + Var arms both resolve to `Var(from_var_ident(v))`). All intern
+            // the SAME `binder_id` + read `e.typ`, matching production's atom.
+            ExprX::Var(vid) | ExprX::VarAt(vid, _) => {
+                let id = self.binder_id(vid);
+                let ty = self.typ_data(&e.typ)?;
+                Ok(format!("({}.RawExp.Var {} {})", NS, id, paren(&ty)))
+            }
+            ExprX::ReadPlace(place, _) => match &place.x {
+                PlaceX::Local(vid) => {
+                    let id = self.binder_id(vid);
+                    let ty = self.typ_data(&e.typ)?;
+                    Ok(format!("({}.RawExp.Var {} {})", NS, id, paren(&ty)))
+                }
+                _ => Err("rawvir-readplace-nonlocal".to_string()),
+            },
+            // Explicit `as` cast — the clip RANGE is the materialization target
+            // (identical to SST `raw_exp`).
+            ExprX::Unary(UnaryOp::Clip { range, .. }, inner) => {
+                let target = match range {
+                    IntRange::Nat => format!("{}.TypData.TyNat", NS),
+                    _ => format!("{}.TypData.TyInt", NS),
+                };
+                let sub = self.raw_vir_exp(inner)?;
+                Ok(format!("({}.RawExp.Clip {} {})", NS, paren(&target), box_raw(&sub)))
+            }
+            ExprX::Binary(op, l, r) => {
+                let opc = binop_opcode(op)?;
+                let ty = self.typ_data(&e.typ)?;
+                let ls = self.raw_vir_exp(l)?;
+                let rs = self.raw_vir_exp(r)?;
+                Ok(format!(
+                    "({}.RawExp.BinOp {} {} {} {})",
+                    NS,
+                    opc,
+                    paren(&ty),
+                    box_raw(&ls),
+                    box_raw(&rs)
+                ))
+            }
+            // Single-argument spec-fn application (`lib.tri (…)`, `lib.sum_tree
+            // (…)`). VIR's callee is `CallTarget::Fun` (not SST's `CallFun`);
+            // extract the `Fun` for the atom-id bucket. Multi-arg / non-`Fun`
+            // targets fail loud (tgt-slice-only — §7 Q3, deferred to `CallN`).
+            ExprX::Call(CallTarget::Fun(_, fun, _typs, ..), args, _post) => {
+                if args.len() != 1 {
+                    return Err("rawvir-call-arity".to_string());
+                }
+                let fn_id = self.call_fun_id(fun);
+                let ret = self.typ_data(&e.typ)?;
+                let arg = &args[0];
+                let arg_ty = self.typ_data(&arg.typ)?;
+                let arg_s = self.raw_vir_exp(arg)?;
+                Ok(format!(
+                    "({}.RawExp.Call {} {} {} {})",
+                    NS,
+                    fn_id,
+                    paren(&ret),
+                    box_raw(&arg_s),
+                    paren(&arg_ty)
+                ))
+            }
+            // Struct/tuple field projection — reuse production's accessor naming
+            // (`field_access_name`) so the field id interns identically (as SST
+            // `raw_exp`). A field with no accessor (1-tuple field-0) is the
+            // identity — mirror the bare base.
+            ExprX::UnaryOpr(UnaryOpr::Field(fop), inner) => {
+                let base = self.raw_vir_exp(inner)?;
+                match crate::expr_shared::field_access_name(fop) {
+                    None => Ok(base),
+                    Some(accessor) => {
+                        let fid = self.text_leaf(&accessor);
+                        let fty = self.typ_data(&e.typ)?;
+                        Ok(format!(
+                            "({}.RawExp.Field {} {} {})",
+                            NS,
+                            fid,
+                            paren(&fty),
+                            box_raw(&base)
+                        ))
+                    }
+                }
+            }
+            // First-class `if c { t } else { e }` in a def body (the `tri`
+            // exemplar). VIR `If`'s else is OPTIONAL; an else-less `if` can't be
+            // a value-position def body → fail loud. `e.typ` is the branch
+            // RESULT type carried for per-branch coercion (like SST `raw_exp`).
+            ExprX::If(cond, then_e, Some(else_e)) => {
+                let ty = self.typ_data(&e.typ)?;
+                let c = self.raw_vir_exp(cond)?;
+                let t = self.raw_vir_exp(then_e)?;
+                let el = self.raw_vir_exp(else_e)?;
+                Ok(format!(
+                    "({}.RawExp.Ite {} {} {} {})",
+                    NS,
+                    paren(&ty),
+                    box_raw(&c),
+                    box_raw(&t),
+                    box_raw(&el)
+                ))
+            }
+            // `match scrut { Ctor pats => body, … }` — THE fixture-forced arm
+            // (`tree_head`/`sum_tree`). The scrutinee is a `Place` (production
+            // renders it via `render_place_with_derefs`). Guards are DROPPED by
+            // production (`expr_to_node`'s Match arm ignores `arm.guard`); mirror
+            // that only for a trivially-true guard — a real guard would be a
+            // silent production mistranslation the bridge must not paper over,
+            // so fail loud. Arms fold right-to-left into the inlined
+            // `RawArmList::Cons(ctor_id, binder_ids, body, tail)` (W7b froze the
+            // inlined list, not a named `MatchArm`). `e.typ` is the arm-body
+            // result type (flows into `render_arms` for per-arm coercion).
+            ExprX::Match(place, arms) => {
+                let scrut = self.raw_vir_place(place)?;
+                let ty = self.typ_data(&e.typ)?;
+                let mut arm_list = format!("{}.RawArmList.Nil", NS);
+                for arm in arms.iter().rev() {
+                    if !matches!(&arm.x.guard.x, ExprX::Const(Constant::Bool(true))) {
+                        return Err("rawvir-match-guard".to_string());
+                    }
+                    let (ctor_id, binds) = self.pattern_ctor_binds(&arm.x.pattern.x)?;
+                    let body = self.raw_vir_exp(&arm.x.body)?;
+                    arm_list = format!(
+                        "({}.RawArmList.Cons {} {} {} {})",
+                        NS,
+                        ctor_id,
+                        paren(&binds),
+                        box_raw(&body),
+                        box_raw(&arm_list)
+                    );
+                }
+                Ok(format!(
+                    "({}.RawExp.MatchR {} {} {})",
+                    NS,
+                    box_raw(&scrut),
+                    box_raw(&arm_list),
+                    paren(&ty)
+                ))
+            }
+            _ => Err(format!("rawvir-{}", vir_expr_construct_tag(&e.x))),
+        }
+    }
+
+    /// A match SCRUTINEE `Place` → `RawExp` text. Only `Local(v)` (a bare var
+    /// read, the fixture's `match t`) is mirrored; deeper places (Field/
+    /// DerefMut/Index/Temporary) fail loud — production renders them via
+    /// `render_place_with_derefs`, an as-yet-unmirrored surface.
+    #[allow(dead_code)]
+    fn raw_vir_place(&mut self, place: &Place) -> Sr<String> {
+        match &place.x {
+            PlaceX::Local(vid) => {
+                let id = self.binder_id(vid);
+                let ty = self.typ_data(&place.typ)?;
+                Ok(format!("({}.RawExp.Var {} {})", NS, id, paren(&ty)))
+            }
+            _ => Err("rawvir-place".to_string()),
+        }
+    }
+
+    /// A ctor match pattern `Ctor(dt, variant, fields)` → its `(ctor_id,
+    /// BinderIdList-text)`. The ctor id interns the SAME string production's
+    /// `pattern_to_ast` builds — via the shared `ctor_pattern_name` helper, so
+    /// the two can't drift (§7 Q1). Field binder ids are the positional pattern
+    /// bindings, in the SAME `fields.iter()` order production reads them (both
+    /// walk the identical VIR `fields` Vec → identical order, no sort). Tuple
+    /// ctors (no named Lean ctor) fail loud.
+    #[allow(dead_code)]
+    fn pattern_ctor_binds(&mut self, pat: &PatternX) -> Sr<(u64, String)> {
+        match pat {
+            PatternX::Constructor(dt, variant, fields) => {
+                let name = crate::to_lean_expr::ctor_pattern_name(dt, variant)
+                    .ok_or_else(|| "rawvir-match-tuplector".to_string())?;
+                let ctor_id = self.text_leaf(&name);
+                let mut binds = format!("{}.BinderIdList.Nil", NS);
+                for f in fields.iter().rev() {
+                    let bid = self.pattern_binder_id(&f.a.x)?;
+                    binds = format!("({}.BinderIdList.Cons {} {})", NS, bid, box_raw(&binds));
+                }
+                Ok((ctor_id, binds))
+            }
+            _ => Err("rawvir-arm-pat".to_string()),
+        }
+    }
+
+    /// A ctor-FIELD pattern → its bound-var binder id. Only a `Var` binding (the
+    /// fixture's `Leaf(v)` / `Node(_l, _r)` — `_l`/`_r` are named vars, not bare
+    /// `_`) is mirrored, interning the SAME `binder_id` production's
+    /// `pattern_to_ast` emits as `LPattern::Var(from_var_ident(name))`.
+    /// Wildcards / nested / ref-ergonomics patterns fail loud (none appear in a
+    /// by-value def-body match).
+    #[allow(dead_code)]
+    fn pattern_binder_id(&mut self, pat: &PatternX) -> Sr<u64> {
+        match pat {
+            PatternX::Var(binding) => Ok(self.binder_id(&binding.name)),
+            _ => Err("rawvir-field-pat".to_string()),
+        }
     }
 
     // ── W6c: production `lean_ast::Expr` → ExprData (the prod-side input) ─
@@ -2528,6 +2769,37 @@ fn exp_construct_tag(e: &ExpX) -> &'static str {
         ExpX::ArrayLiteral(..) => "arrayliteral",
         ExpX::Interp(..) => "interp",
         ExpX::FuelConst(..) => "fuelconst",
+        _ => "other",
+    }
+}
+
+/// Sharp census tag for an un-mirrored VIR `ExprX` (the `_` arm of
+/// `raw_vir_exp`). The deferred-but-expected def-body shapes get named tags
+/// (quantifiers, ctor construction, multi-arg call, blocks); everything else
+/// is `other`.
+fn vir_expr_construct_tag(e: &ExprX) -> &'static str {
+    match e {
+        ExprX::Const(..) => "const-nonint",
+        ExprX::VarLoc(..) => "varloc",
+        ExprX::ConstVar(..) => "constvar",
+        ExprX::StaticVar(..) => "staticvar",
+        ExprX::Loc(..) => "loc",
+        ExprX::Call(..) => "call-nonfun",
+        ExprX::Ctor(..) => "ctor",
+        ExprX::NullaryOpr(..) => "nullaryopr",
+        ExprX::Unary(..) => "unary-nonclip",
+        ExprX::UnaryOpr(..) => "unaryopr",
+        ExprX::BinaryOpr(..) => "binaryopr",
+        ExprX::Multi(..) => "multi",
+        ExprX::Quant(..) => "quant",
+        ExprX::Closure(..) => "closure",
+        ExprX::NonSpecClosure { .. } => "nonspecclosure",
+        ExprX::ArrayLiteral(..) => "arrayliteral",
+        ExprX::ExecFnByName(..) => "execfnbyname",
+        ExprX::Choose { .. } => "choose",
+        ExprX::WithTriggers { .. } => "withtriggers",
+        ExprX::If(..) => "if-noelse",
+        ExprX::Block(..) => "block",
         _ => "other",
     }
 }

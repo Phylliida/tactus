@@ -589,6 +589,77 @@ fn raw_exp_ite_body() {
     );
 }
 
+// ── W7c-ref (bootstrap-29): the VIR-surface def-body transcriber ──────
+// `raw_vir_exp` reads `vir::ast::Expr` (`ExprX`), where def bodies keep `If`/
+// `Match` first-class (unlike SST, where `Match` is desugared). VIR `Expr` is
+// the SAME `Arc<SpannedTyped<_>>` shape as SST `Exp`, so `mk_vexpr` mirrors
+// `mk_exp`. The Match arm's REAL validation is the e2e `def_eq` bridge against
+// the emitted fixture def `lib.tree_head` (W7d) — a hand-built ctor `Path`
+// could render differently from the compiler's under `lean_name`, so a
+// hand-built Match unit test would test the arm against itself, not against
+// production. These tests pin the cheap, surface-specific control flow (Ite,
+// the OPTIONAL-else fail-loud that diverges from SST's 3-branch If, leaf/peel
+// parity).
+
+/// A dummy-span VIR `Expr` carrying the given node + type (the `mk_exp` analog
+/// for the `vir::ast::Expr` surface).
+fn mk_vexpr(x: ExprX, typ: Typ) -> VirExpr {
+    use vir::ast::SpannedTyped;
+    std::sync::Arc::new(SpannedTyped { span: vir::messages::Span::dummy(), typ, x })
+}
+
+/// The def-body `Ite` arm (the `tri` shape). Cond is a bool var (never
+/// coerced); branches are int vars. Interning order b=0, x=1, y=2; the leading
+/// slot is the If node's RESULT type (`TyInt`), which `render_exp` reads for
+/// per-branch coercion. Structurally identical to the SST `raw_exp_ite_body`,
+/// confirming the surfaces converge on the same `RawExp::Ite`.
+#[test]
+fn raw_vir_exp_ite_var_leaves() {
+    let mut s = Serializer::default();
+    let boolt: Typ = std::sync::Arc::new(TypX::Bool);
+    let cond = mk_vexpr(ExprX::Var(tvar("b")), boolt);
+    let then_ = mk_vexpr(ExprX::Var(tvar("x")), tint());
+    let else_ = mk_vexpr(ExprX::Var(tvar("y")), tint());
+    let ite = mk_vexpr(ExprX::If(cond, then_, Some(else_)), tint());
+    assert_eq!(
+        s.raw_vir_exp(&ite).unwrap(),
+        format!(
+            "({NS}.RawExp.Ite {NS}.TypData.TyInt \
+               (Tactus.Box.mk ({NS}.RawExp.Var 0 {NS}.TypData.TyBool)) \
+               (Tactus.Box.mk ({NS}.RawExp.Var 1 {NS}.TypData.TyInt)) \
+               (Tactus.Box.mk ({NS}.RawExp.Var 2 {NS}.TypData.TyInt)))"
+        )
+    );
+}
+
+/// VIR `If`'s else is OPTIONAL (unlike SST's 3-branch `If`); an else-less `if`
+/// can't be a value-position def body → fail loud `if-noelse` (census-tracked,
+/// never a silent pass). This is a genuine VIR-surface divergence from
+/// `raw_exp`, so it gets its own pin.
+#[test]
+fn raw_vir_exp_if_noelse_fails() {
+    let mut s = Serializer::default();
+    let boolt: Typ = std::sync::Arc::new(TypX::Bool);
+    let cond = mk_vexpr(ExprX::Var(tvar("b")), boolt);
+    let then_ = mk_vexpr(ExprX::Var(tvar("x")), tint());
+    let ite = mk_vexpr(ExprX::If(cond, then_, None), tint());
+    assert_eq!(s.raw_vir_exp(&ite).unwrap_err(), "rawvir-if-noelse");
+}
+
+/// Leaf/peel parity with SST `raw_exp`: `Box(Unbox(Var x))` peels transparently
+/// to the bare `Var x` (same binder id + typ) on the VIR surface too — the SMT
+/// coercion wrappers carry no expression content.
+#[test]
+fn raw_vir_exp_peels_box_and_reads_var() {
+    let mut s = Serializer::default();
+    let x = mk_vexpr(ExprX::Var(tvar("x")), tint());
+    let unboxed = mk_vexpr(ExprX::UnaryOpr(UnaryOpr::Unbox(tint()), x.clone()), tint());
+    let boxed = mk_vexpr(ExprX::UnaryOpr(UnaryOpr::Box(tint()), unboxed), tint());
+    let bare = s.raw_vir_exp(&x).unwrap();
+    assert_eq!(s.raw_vir_exp(&boxed).unwrap(), bare);
+    assert_eq!(bare, format!("({NS}.RawExp.Var 0 {NS}.TypData.TyInt)"));
+}
+
 /// W7c — the production side transcribes a body if VERBATIM (any branch
 /// coercion is already an `Int.toNat` App the `Cast` arm handles), matching the
 /// reference `render_exp`'s `Ite`. Cond/then/else are bare vars (c=0, t=1, e=2).
