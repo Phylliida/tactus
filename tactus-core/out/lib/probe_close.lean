@@ -2,14 +2,34 @@ import TactusPrelude
 set_option linter.unusedVariables false
 set_option maxHeartbeats 800000
 set_option autoImplicit false
+inductive lib.CastKind where
+  | IntToNat
+  | NatToInt
+  deriving Inhabited
+@[simp] noncomputable def lib.CastKind.height (_ : lib.CastKind) : Nat :=
+  1
+inductive lib.ExprData where
+  | Atom (val0 : Int)
+  | Lit (val0 : Int)
+  | Cast (val0 : lib.CastKind) (val1 : Tactus.Box lib.ExprData)
+  | BinOp (val0 : Int) (val1 : Tactus.Box lib.ExprData) (val2 : Tactus.Box lib.ExprData)
+  | App (val0 : Int) (val1 : Tactus.Box lib.ExprData)
+  | FieldProj (val0 : Tactus.Box lib.ExprData) (val1 : Int)
+  | SpanMark (val0 : Int) (val1 : Tactus.Box lib.ExprData)
+  deriving Inhabited
+@[simp] noncomputable def lib.ExprData.height (s : lib.ExprData) : Nat :=
+  match s with | lib.ExprData.Atom _ => 1 | lib.ExprData.Lit _ => 1 | lib.ExprData.Cast _ val1 => 1 + lib.ExprData.height val1.deref | lib.ExprData.BinOp _ val1 val2 => 1 + lib.ExprData.height val1.deref + lib.ExprData.height val2.deref | lib.ExprData.App _ val1 => 1 + lib.ExprData.height val1.deref | lib.ExprData.FieldProj val0 _ => 1 + lib.ExprData.height val0.deref | lib.ExprData.SpanMark _ val1 => 1 + lib.ExprData.height val1.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
 inductive lib.GoalData where
   | Leaf (val0 : Int)
   | Imp (val0 : Int) (val1 : Tactus.Box lib.GoalData)
   | All (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.GoalData)
   | Let (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.GoalData)
+  | LeafE (val0 : lib.ExprData)
   deriving Inhabited
 @[simp] noncomputable def lib.GoalData.height (s : lib.GoalData) : Nat :=
-  match s with | lib.GoalData.Leaf _ => 1 | lib.GoalData.Imp _ val1 => 1 + lib.GoalData.height val1.deref | lib.GoalData.All _ _ val2 => 1 + lib.GoalData.height val2.deref | lib.GoalData.Let _ _ val2 => 1 + lib.GoalData.height val2.deref
+  match s with | lib.GoalData.Leaf _ => 1 | lib.GoalData.Imp _ val1 => 1 + lib.GoalData.height val1.deref | lib.GoalData.All _ _ val2 => 1 + lib.GoalData.height val2.deref | lib.GoalData.Let _ _ val2 => 1 + lib.GoalData.height val2.deref | lib.GoalData.LeafE _ => 1
 termination_by sizeOf s
 decreasing_by all_goals (simp_all; omega)
 inductive lib.FrameList where
@@ -23,7 +43,7 @@ inductive lib.FrameList where
 termination_by sizeOf s
 decreasing_by all_goals (simp_all; omega)
 noncomputable def lib.goal_size (g : lib.GoalData) : Nat :=
-  match g with | lib.GoalData.Leaf _e => 1 | lib.GoalData.Imp _h b => 1 + lib.goal_size b.deref | lib.GoalData.All _x _t b => 1 + lib.goal_size b.deref | lib.GoalData.Let _x _v b => 1 + lib.goal_size b.deref
+  match g with | lib.GoalData.Leaf _e => 1 | lib.GoalData.Imp _h b => 1 + lib.goal_size b.deref | lib.GoalData.All _x _t b => 1 + lib.goal_size b.deref | lib.GoalData.Let _x _v b => 1 + lib.goal_size b.deref | lib.GoalData.LeafE _e => 1
 termination_by structural g
 noncomputable def lib.close (f : lib.FrameList) (obligation : Int) : lib.GoalData :=
   match f with | lib.FrameList.FNil => lib.GoalData.Leaf obligation | lib.FrameList.FBind id typ t => lib.GoalData.All id typ (Tactus.Box.mk (lib.close t.deref obligation)) | lib.FrameList.FHyp h t => lib.GoalData.Imp h (Tactus.Box.mk (lib.close t.deref obligation)) | lib.FrameList.FLet id v t => lib.GoalData.Let id v (Tactus.Box.mk (lib.close t.deref obligation))

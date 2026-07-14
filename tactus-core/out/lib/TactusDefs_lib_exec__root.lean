@@ -20,13 +20,71 @@ noncomputable def lib.stm_size (s : lib.StmData) : Nat :=
   match s with | lib.StmData.Assert _o _h => 1 | lib.StmData.Assume _e => 1 | lib.StmData.Assign _d _r => 1 | lib.StmData.Call reqs post => 1 + lib.leaf_len reqs.deref + lib.frame_len post.deref | lib.StmData.DeadEnd b => 1 + lib.stm_size b.deref | lib.StmData.Ret es _rb => 1 + lib.leaf_len es.deref | lib.StmData.If _c _nc t e => 1 + lib.stm_size t.deref + lib.stm_size e.deref | lib.StmData.Loop inv_hyps binders _ _ _ _ _ _ _ body => 1 + lib.binder_len inv_hyps.deref + lib.binder_len binders.deref + lib.stm_size body.deref | lib.StmData.Skip => 1 | lib.StmData.Seq a b => 1 + lib.stm_size a.deref + lib.stm_size b.deref
 termination_by structural s
 noncomputable def lib.goal_size (g : lib.GoalData) : Nat :=
-  match g with | lib.GoalData.Leaf _e => 1 | lib.GoalData.Imp _h b => 1 + lib.goal_size b.deref | lib.GoalData.All _x _t b => 1 + lib.goal_size b.deref | lib.GoalData.Let _x _v b => 1 + lib.goal_size b.deref
+  match g with | lib.GoalData.Leaf _e => 1 | lib.GoalData.Imp _h b => 1 + lib.goal_size b.deref | lib.GoalData.All _x _t b => 1 + lib.goal_size b.deref | lib.GoalData.Let _x _v b => 1 + lib.goal_size b.deref | lib.GoalData.LeafE _e => 1
 termination_by structural g
 noncomputable def lib.goal_count (gs : lib.GoalList) : Nat :=
   match gs with | lib.GoalList.Nil => 0 | lib.GoalList.Cons _g t => 1 + lib.goal_count t.deref
 termination_by structural gs
 noncomputable def lib.fnctx_arity (c : lib.FnCtxData) : Nat :=
   lib.binder_len c.params
+noncomputable def lib.expr_size (e : lib.ExprData) : Nat :=
+  match e with | lib.ExprData.Atom _ => 1 | lib.ExprData.Lit _ => 1 | lib.ExprData.Cast _k t => 1 + lib.expr_size t.deref | lib.ExprData.BinOp _op l r => 1 + lib.expr_size l.deref + lib.expr_size r.deref | lib.ExprData.App _fn a => 1 + lib.expr_size a.deref | lib.ExprData.FieldProj t _f => 1 + lib.expr_size t.deref | lib.ExprData.SpanMark _loc t => 1 + lib.expr_size t.deref
+termination_by structural e
+noncomputable def lib.typ_size (t : lib.TypData) : Nat :=
+  match t with | lib.TypData.TyInt => 1 | lib.TypData.TyNat => 1 | lib.TypData.TyBool => 1 | lib.TypData.TyNamed _ => 1 | lib.TypData.TyRef _ => 1
+noncomputable def lib.td_tag (t : lib.TypData) : Nat :=
+  match t with | lib.TypData.TyInt => 0 | lib.TypData.TyNat => 1 | lib.TypData.TyBool => 2 | lib.TypData.TyNamed _ => 3 | lib.TypData.TyRef _ => 4
+noncomputable def lib.deref_type (t : lib.TypData) : lib.TypData :=
+  match t with | lib.TypData.TyRef inner => lib.TypData.TyNamed inner | lib.TypData.TyInt => lib.TypData.TyInt | lib.TypData.TyNat => lib.TypData.TyNat | lib.TypData.TyBool => lib.TypData.TyBool | lib.TypData.TyNamed n => lib.TypData.TyNamed n
+noncomputable def lib.type_of (re : lib.RawExp) : lib.TypData :=
+  match re with | lib.RawExp.Var _id ty => ty | lib.RawExp.Lit _v ty => ty | lib.RawExp.Clip target _e => target | lib.RawExp.BinOp _op ty _l _r => ty | lib.RawExp.Call _fn ret _arg _argty => ret | lib.RawExp.Deref e => lib.deref_type (lib.type_of e.deref) | lib.RawExp.Span _loc e => lib.type_of e.deref
+termination_by structural re
+noncomputable def lib.needs_nat_coercion (operand : lib.TypData) (op_result : lib.TypData) : Nat :=
+  if lib.td_tag operand = 0 ∧ lib.td_tag op_result = 1 then 1 else 0
+noncomputable def lib.coerce_if (b : Nat) (e : lib.ExprData) : lib.ExprData :=
+  if b = 1 then lib.ExprData.Cast lib.CastKind.IntToNat (Tactus.Box.mk e) else e
+noncomputable def lib.deref_field : Int :=
+  0
+noncomputable def lib.render_exp (re : lib.RawExp) : lib.ExprData :=
+  match re with | lib.RawExp.Var id _ty => lib.ExprData.Atom id | lib.RawExp.Lit v _ty => lib.ExprData.Lit v | lib.RawExp.Clip target e => lib.coerce_if (lib.needs_nat_coercion (lib.type_of e.deref) target) (lib.render_exp e.deref) | lib.RawExp.BinOp op ty l r => let l2 := lib.coerce_if (lib.needs_nat_coercion (lib.type_of l.deref) ty) (lib.render_exp l.deref);
+                                                                                                                                                                                                                                                                        let r2 := lib.coerce_if (lib.needs_nat_coercion (lib.type_of r.deref) ty) (lib.render_exp r.deref);
+                                                                                                                                                                                                                                                                        lib.ExprData.BinOp op (Tactus.Box.mk l2) (Tactus.Box.mk r2) | lib.RawExp.Call fnid _ret arg argty => lib.ExprData.App fnid (Tactus.Box.mk (lib.coerce_if (lib.needs_nat_coercion (lib.type_of arg.deref) argty) (lib.render_exp arg.deref))) | lib.RawExp.Deref e => lib.ExprData.FieldProj (Tactus.Box.mk (lib.render_exp e.deref)) lib.deref_field | lib.RawExp.Span loc e => lib.ExprData.SpanMark loc (Tactus.Box.mk (lib.render_exp e.deref))
+termination_by structural re
+noncomputable def lib.ck_tag (k : lib.CastKind) : Nat :=
+  match k with | lib.CastKind.IntToNat => 0 | lib.CastKind.NatToInt => 1
+noncomputable def lib.castkind_eq (a : lib.CastKind) (b : lib.CastKind) : Nat :=
+  if lib.ck_tag a = lib.ck_tag b then 1 else 0
+noncomputable def lib.ed_tag (e : lib.ExprData) : Nat :=
+  match e with | lib.ExprData.Atom _ => 0 | lib.ExprData.Lit _ => 1 | lib.ExprData.Cast _ _ => 2 | lib.ExprData.BinOp _ _ _ => 3 | lib.ExprData.App _ _ => 4 | lib.ExprData.FieldProj _ _ => 5 | lib.ExprData.SpanMark _ _ => 6
+noncomputable def lib.ed_atom_id (e : lib.ExprData) : Int :=
+  match e with | lib.ExprData.Atom x => x | _ => 0
+noncomputable def lib.ed_lit_val (e : lib.ExprData) : Int :=
+  match e with | lib.ExprData.Lit v => v | _ => 0
+noncomputable def lib.ed_cast_k (e : lib.ExprData) : lib.CastKind :=
+  match e with | lib.ExprData.Cast k _ => k | _ => lib.CastKind.IntToNat
+noncomputable def lib.ed_cast_e (e : lib.ExprData) : lib.ExprData :=
+  match e with | lib.ExprData.Cast _ t => t.deref | _ => lib.ExprData.Atom 0
+noncomputable def lib.ed_binop_op (e : lib.ExprData) : Int :=
+  match e with | lib.ExprData.BinOp op _ _ => op | _ => 0
+noncomputable def lib.ed_binop_l (e : lib.ExprData) : lib.ExprData :=
+  match e with | lib.ExprData.BinOp _ l _ => l.deref | _ => lib.ExprData.Atom 0
+noncomputable def lib.ed_binop_r (e : lib.ExprData) : lib.ExprData :=
+  match e with | lib.ExprData.BinOp _ _ r => r.deref | _ => lib.ExprData.Atom 0
+noncomputable def lib.ed_app_fn (e : lib.ExprData) : Int :=
+  match e with | lib.ExprData.App f _ => f | _ => 0
+noncomputable def lib.ed_app_arg (e : lib.ExprData) : lib.ExprData :=
+  match e with | lib.ExprData.App _ a => a.deref | _ => lib.ExprData.Atom 0
+noncomputable def lib.ed_fp_e (e : lib.ExprData) : lib.ExprData :=
+  match e with | lib.ExprData.FieldProj t _ => t.deref | _ => lib.ExprData.Atom 0
+noncomputable def lib.ed_fp_field (e : lib.ExprData) : Int :=
+  match e with | lib.ExprData.FieldProj _ f => f | _ => 0
+noncomputable def lib.ed_span_loc (e : lib.ExprData) : Int :=
+  match e with | lib.ExprData.SpanMark loc _ => loc | _ => 0
+noncomputable def lib.ed_span_e (e : lib.ExprData) : lib.ExprData :=
+  match e with | lib.ExprData.SpanMark _ t => t.deref | _ => lib.ExprData.Atom 0
+noncomputable def lib.expr_eq (a : lib.ExprData) (b : lib.ExprData) : Nat :=
+  match a with | lib.ExprData.Atom x => if lib.ed_tag b = 0 then if x = lib.ed_atom_id b then 1 else 0 else 0 | lib.ExprData.Lit v => if lib.ed_tag b = 1 then if v = lib.ed_lit_val b then 1 else 0 else 0 | lib.ExprData.Cast k t => if lib.ed_tag b = 2 then if lib.castkind_eq k (lib.ed_cast_k b) = 1 then lib.expr_eq t.deref (lib.ed_cast_e b) else 0 else 0 | lib.ExprData.BinOp op l r => if lib.ed_tag b = 3 then if op = lib.ed_binop_op b then if lib.expr_eq l.deref (lib.ed_binop_l b) = 1 then lib.expr_eq r.deref (lib.ed_binop_r b) else 0 else 0 else 0 | lib.ExprData.App f a2 => if lib.ed_tag b = 4 then if f = lib.ed_app_fn b then lib.expr_eq a2.deref (lib.ed_app_arg b) else 0 else 0 | lib.ExprData.FieldProj t fld => if lib.ed_tag b = 5 then if fld = lib.ed_fp_field b then lib.expr_eq t.deref (lib.ed_fp_e b) else 0 else 0 | lib.ExprData.SpanMark loc t => if lib.ed_tag b = 6 then if loc = lib.ed_span_loc b then lib.expr_eq t.deref (lib.ed_span_e b) else 0 else 0
+termination_by structural a
 noncomputable def lib.frame_append (f : lib.FrameList) (g : lib.FrameList) : lib.FrameList :=
   match f with | lib.FrameList.FNil => g | lib.FrameList.FBind id typ t => lib.FrameList.FBind id typ (Tactus.Box.mk (lib.frame_append t.deref g)) | lib.FrameList.FHyp h t => lib.FrameList.FHyp h (Tactus.Box.mk (lib.frame_append t.deref g)) | lib.FrameList.FLet id v t => lib.FrameList.FLet id v (Tactus.Box.mk (lib.frame_append t.deref g))
 termination_by structural f
@@ -94,7 +152,7 @@ noncomputable def lib.seed_frame (c : lib.FnCtxData) : lib.FrameList :=
 noncomputable def lib.ref_wp (c : lib.FnCtxData) (s : lib.StmData) : lib.GoalList :=
   lib.wp_stm (lib.seed_frame c) s
 noncomputable def lib.gd_tag (g : lib.GoalData) : Nat :=
-  match g with | lib.GoalData.Leaf _ => 0 | lib.GoalData.Imp _ _ => 1 | lib.GoalData.All _ _ _ => 2 | lib.GoalData.Let _ _ _ => 3
+  match g with | lib.GoalData.Leaf _ => 0 | lib.GoalData.Imp _ _ => 1 | lib.GoalData.All _ _ _ => 2 | lib.GoalData.Let _ _ _ => 3 | lib.GoalData.LeafE _ => 4
 noncomputable def lib.gd_leaf_id (g : lib.GoalData) : Int :=
   match g with | lib.GoalData.Leaf x => x | _ => 0
 noncomputable def lib.gd_imp_hyp (g : lib.GoalData) : Int :=
@@ -107,10 +165,12 @@ noncomputable def lib.gd_let_name (g : lib.GoalData) : Int :=
   match g with | lib.GoalData.Let x _ _ => x | _ => 0
 noncomputable def lib.gd_let_val (g : lib.GoalData) : Int :=
   match g with | lib.GoalData.Let _ v _ => v | _ => 0
+noncomputable def lib.gd_leafe_expr (g : lib.GoalData) : lib.ExprData :=
+  match g with | lib.GoalData.LeafE e => e | _ => lib.ExprData.Atom 0
 noncomputable def lib.gd_child (g : lib.GoalData) : lib.GoalData :=
-  match g with | lib.GoalData.Imp _ t => t.deref | lib.GoalData.All _ _ t => t.deref | lib.GoalData.Let _ _ t => t.deref | lib.GoalData.Leaf x => lib.GoalData.Leaf x
+  match g with | lib.GoalData.Imp _ t => t.deref | lib.GoalData.All _ _ t => t.deref | lib.GoalData.Let _ _ t => t.deref | lib.GoalData.Leaf x => lib.GoalData.Leaf x | lib.GoalData.LeafE e => lib.GoalData.LeafE e
 noncomputable def lib.goal_eq (a : lib.GoalData) (b : lib.GoalData) : Nat :=
-  match a with | lib.GoalData.Leaf x => if lib.gd_tag b = 0 then if x = lib.gd_leaf_id b then 1 else 0 else 0 | lib.GoalData.Imp h1 t1 => if lib.gd_tag b = 1 then if h1 = lib.gd_imp_hyp b then lib.goal_eq t1.deref (lib.gd_child b) else 0 else 0 | lib.GoalData.All x1 ty1 t1 => if lib.gd_tag b = 2 then if x1 = lib.gd_all_name b then if ty1 = lib.gd_all_typ b then lib.goal_eq t1.deref (lib.gd_child b) else 0 else 0 else 0 | lib.GoalData.Let x1 v1 t1 => if lib.gd_tag b = 3 then if x1 = lib.gd_let_name b then if v1 = lib.gd_let_val b then lib.goal_eq t1.deref (lib.gd_child b) else 0 else 0 else 0
+  match a with | lib.GoalData.Leaf x => if lib.gd_tag b = 0 then if x = lib.gd_leaf_id b then 1 else 0 else 0 | lib.GoalData.Imp h1 t1 => if lib.gd_tag b = 1 then if h1 = lib.gd_imp_hyp b then lib.goal_eq t1.deref (lib.gd_child b) else 0 else 0 | lib.GoalData.All x1 ty1 t1 => if lib.gd_tag b = 2 then if x1 = lib.gd_all_name b then if ty1 = lib.gd_all_typ b then lib.goal_eq t1.deref (lib.gd_child b) else 0 else 0 else 0 | lib.GoalData.Let x1 v1 t1 => if lib.gd_tag b = 3 then if x1 = lib.gd_let_name b then if v1 = lib.gd_let_val b then lib.goal_eq t1.deref (lib.gd_child b) else 0 else 0 else 0 | lib.GoalData.LeafE e1 => if lib.gd_tag b = 4 then lib.expr_eq e1 (lib.gd_leafe_expr b) else 0
 termination_by structural a
 noncomputable def lib.gl_tag (g : lib.GoalList) : Nat :=
   match g with | lib.GoalList.Nil => 0 | lib.GoalList.Cons _ _ => 1
