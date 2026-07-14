@@ -763,6 +763,126 @@ fn lexpr_to_exprdata_match_nonctor_arm_fails() {
     assert_eq!(s.lexpr_to_exprdata(&m).unwrap_err(), "ed-arm-pat");
 }
 
+// ── W7c (bootstrap-29): quantifier def-body constructors — Forall/Exists on
+// BOTH transcriber sides. tgt-slice-only (no fixture body is quantified);
+// verdict-neutral (the reference `raw_vir_exp` is dead code, and the production
+// arm is unreachable on the emit path — a quantifier-cored obligation makes the
+// SST `raw_exp` fail loud `raw-bind`, so it never enters `deep_ids`, so
+// `goal_data` never calls `lexpr_to_exprdata` on a quantifier goal leaf).
+
+/// Reference `raw_vir_exp` on `∀ (i j : int), p` — VIR carries BOTH binders in
+/// one `Quant`; they nest right-to-left into single-binder `ForallR` (`∀ i j, p`
+/// ⟶ `ForallR i (ForallR j p)`). Interning follows the walk: body `p` first
+/// (bool var → id 0), then binders REVERSED (`j`=1, then `i`=2); binder types are
+/// `TyInt`, the body's own type is `TyBool`.
+#[test]
+fn raw_vir_exp_forall_nests_binders() {
+    use std::sync::Arc;
+    let mut s = Serializer::default();
+    let boolt: Typ = Arc::new(TypX::Bool);
+    let binders: vir::ast::VarBinders<Typ> = Arc::new(vec![
+        Arc::new(vir::ast::VarBinderX { name: tvar("i"), a: tint() }),
+        Arc::new(vir::ast::VarBinderX { name: tvar("j"), a: tint() }),
+    ]);
+    let body = mk_vexpr(ExprX::Var(tvar("p")), boolt.clone());
+    let q = mk_vexpr(
+        ExprX::Quant(vir::ast::Quant { quant: air::ast::Quant::Forall }, binders, body),
+        boolt,
+    );
+    assert_eq!(
+        s.raw_vir_exp(&q).unwrap(),
+        format!(
+            "({NS}.RawExp.ForallR 2 {NS}.TypData.TyInt \
+               (Tactus.Box.mk \
+                 ({NS}.RawExp.ForallR 1 {NS}.TypData.TyInt \
+                    (Tactus.Box.mk ({NS}.RawExp.Var 0 {NS}.TypData.TyBool)))))"
+        )
+    );
+}
+
+/// Reference `raw_vir_exp` on `∃ (i : int), p` — pins the `ExistsR` ctor (the
+/// arm shares `lquant`-style folding with `ForallR`, differing only in the
+/// ctor name off `quant.quant`).
+#[test]
+fn raw_vir_exp_exists_single_binder() {
+    use std::sync::Arc;
+    let mut s = Serializer::default();
+    let boolt: Typ = Arc::new(TypX::Bool);
+    let binders: vir::ast::VarBinders<Typ> =
+        Arc::new(vec![Arc::new(vir::ast::VarBinderX { name: tvar("i"), a: tint() })]);
+    let body = mk_vexpr(ExprX::Var(tvar("p")), boolt.clone());
+    let q = mk_vexpr(
+        ExprX::Quant(vir::ast::Quant { quant: air::ast::Quant::Exists }, binders, body),
+        boolt,
+    );
+    assert_eq!(
+        s.raw_vir_exp(&q).unwrap(),
+        format!(
+            "({NS}.RawExp.ExistsR 1 {NS}.TypData.TyInt \
+               (Tactus.Box.mk ({NS}.RawExp.Var 0 {NS}.TypData.TyBool)))"
+        )
+    );
+}
+
+/// Production `lexpr_to_exprdata` on `∀ (i j : Int), p` — the production node
+/// carries BOTH binders in one `Forall`; `lquant_to_exprdata` nests them
+/// right-to-left into single-binder `ExprData::Forall`, the IDENTICAL nesting
+/// the reference `raw_vir_exp` does over the same order (so `def_eq` agrees by
+/// construction). Interning: body `p`=0, then binders reversed (`j`=1, `i`=2);
+/// each `Int` binder type is recognized back to `TyInt` by `ltyp_to_typdata`.
+#[test]
+fn lexpr_to_exprdata_forall_nests_binders() {
+    use crate::lean_ast::Binder;
+    use crate::lean_name::LeanName;
+    let mut s = Serializer::default();
+    let q = LExpr::new(ExprNode::Forall {
+        binders: vec![
+            Binder::explicit(LeanName::synthetic("i"), LExpr::var_lit("Int")),
+            Binder::explicit(LeanName::synthetic("j"), LExpr::var_lit("Int")),
+        ],
+        body: Box::new(LExpr::var_synthetic("p")),
+    });
+    assert_eq!(
+        s.lexpr_to_exprdata(&q).unwrap(),
+        format!(
+            "({NS}.ExprData.Forall 2 {NS}.TypData.TyInt \
+               (Tactus.Box.mk \
+                 ({NS}.ExprData.Forall 1 {NS}.TypData.TyInt \
+                    (Tactus.Box.mk ({NS}.ExprData.Atom 0)))))"
+        )
+    );
+}
+
+/// Production `ltyp_to_typdata` — the quantifier binder-type recognizer that
+/// inverts `typ_to_expr` back to the `TypData` the reference `typ_data` emits.
+/// Primitive heads map by name; a named datatype maps to `TyNamed(intern(pp))`;
+/// a `Tactus.Ref` application to `TyRef(intern(pp(inner)))`; a non-type node
+/// fails loud. NOTE the documented gap: `Nat` maps to `TyNat` (a `usize`/`char`
+/// binder also renders `Var("Nat")` but the reference maps it to `TyInt`, so
+/// such a binder spuriously fails the bridge — uncertifiable, never unsound).
+#[test]
+fn ltyp_to_typdata_recognizes_types() {
+    let mut s = Serializer::default();
+    assert_eq!(s.ltyp_to_typdata(&LExpr::var_lit("Prop")).unwrap(), format!("{NS}.TypData.TyBool"));
+    assert_eq!(s.ltyp_to_typdata(&LExpr::var_lit("Nat")).unwrap(), format!("{NS}.TypData.TyNat"));
+    assert_eq!(s.ltyp_to_typdata(&LExpr::var_lit("Int")).unwrap(), format!("{NS}.TypData.TyInt"));
+    // Named datatype: id = intern(pp_expr(Var "lib.Tree")). Fresh serializer, so
+    // this is the first interned leaf (id 0).
+    assert_eq!(
+        s.ltyp_to_typdata(&LExpr::var_lit("lib.Tree")).unwrap(),
+        format!("({NS}.TypData.TyNamed 0)")
+    );
+    // `&T` binder → TyRef(intern(pp of the inner type-expr)) — agrees with the
+    // reference `typ_data`'s `TyRef(typ_leaf(inner))` by construction.
+    let refty = LExpr::app(LExpr::var_lit("Tactus.Ref"), vec![LExpr::var_lit("Int")]);
+    assert_eq!(
+        s.ltyp_to_typdata(&refty).unwrap(),
+        format!("({NS}.TypData.TyRef 1)")
+    );
+    // A non-type node (a bool literal) is not a binder type → fail loud.
+    assert_eq!(s.ltyp_to_typdata(&LExpr::lit_bool(true)).unwrap_err(), "ed-quant-bty");
+}
+
 // ── W6d.2b-2: the emit-path gate (`oblig_slot` + `goal_data` deep/atom) ──
 //
 // The obligation (reference) side drives: `oblig_slot` deepens a coverable
