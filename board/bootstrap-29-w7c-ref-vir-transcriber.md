@@ -218,6 +218,21 @@ they must match this side's shapes) and W7d (def emission + bridge).
   `typ_data`↔`ltyp_to_typdata`). Still-to-do multi-arg `Call`→`CallN` (the
   cache-churning `RawList` edit) + datatype `RawDt` are unchanged.
 
+- (2026-07-15, opus-w7c-dt) **Reference datatype `raw_vir_dt` + `dt_field_typ_data`
+  LANDED** (split to `bootstrap-31`, DONE; lib suite 354→359/0, verdict-neutral).
+  A NEW input surface (VIR `DatatypeX`, not `ExprX`): decomposed args
+  `(name: &Dt, typ_params, variants)` so the test avoids the ~13-field
+  `DatatypeX`; W7d passes `&dt.x.{name,typ_params,variants}`. Name via
+  `lean_name(path)`, per-ctor via `sanitize(&v.name)`, positional field types via
+  the new `dt_field_typ_data` which KEEPS the `Box` (`Decorate(Box) → TyBox(pointee)`,
+  else delegate to `typ_data`) — the W7a §7 Q4 mechanic the whole card flagged as
+  the technical hurdle. Gates: `rawvir-dt-poly` (like `raw_vir_def`), `-tuple`,
+  `-struct` (single-variant struct → production `structure`, a different
+  transcription). Paired with production `ldt_to_dtdata` (`bootstrap-28`); id
+  agreement by construction. Interning forward (name=0, ctors decl order);
+  `CtorList`/`TypList` folded reversed. **Fixture-covering DEFINITIONS surface
+  (def header + Ite/Match body + datatype) now complete on the reference side.**
+
 ## Writeup
 _partial (reference transcriber core landed). The def-body REFERENCE transcriber
 `raw_vir_exp` (+ `raw_vir_place`/`pattern_ctor_binds`/`pattern_binder_id`) is

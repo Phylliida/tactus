@@ -288,6 +288,21 @@ emission + bridge `def_eq`/`dt_eq`), W7e (mutation-kill).
   are single-arg). Surviving remainders: AppN (batched) + datatype
   (`RawDt`/`DtData`; no `tactus-core` edit; Box→`TyBox` subtlety).
 
+- (2026-07-15, opus-w7c-dt) **Production datatype `ldt_to_dtdata` + `ldt_field_typdata`
+  LANDED** (split to `bootstrap-31`, DONE; lib suite 354→359/0, verdict-neutral).
+  `lean_ast::Datatype → lib.DtData` — `text_leaf(name)` + per-variant
+  `text_leaf(ctor)` + positional field types via `ldt_field_typdata`, which
+  recognizes the KEPT `Box`: `App(Var "Tactus.Box", [T]) → TyBox(intern(pp(T)))`
+  (else delegate to `ltyp_to_typdata`). Only multi-variant `Inductive`/
+  `IndexedInductive` handled; single-variant `Structure` fails loud
+  `ed-dt-struct`. Paired with the reference `raw_vir_dt` (`bootstrap-29`); id
+  agreement by construction (`lean_name`/`sanitize`/`typ_to_expr`↔`ltyp_to_typdata`).
+  The Box→TyBox subtlety (W7a §7 Q4) is the technical crux: the field keeps its
+  box (the recursion goes through it), unlike the value-position cast layer that
+  peels it. **Fixture-covering DEFINITIONS surface (def header + Ite/Match body +
+  datatype) now complete on the production side.** Only surviving W7c remainder:
+  multi-arg AppN (the cache-churning `RawList` edit; tgt-slice-only).
+
 ## Writeup
 
 _partial — `Ite` + `Match` + `Forall`/`Exists` constructors landed on both
