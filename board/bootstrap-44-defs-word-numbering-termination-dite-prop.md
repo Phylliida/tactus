@@ -1,9 +1,9 @@
 ---
 title: "tgt defs family: `word_numbering` fails — emitted `decreasing_by`/omega can't crack a termination guard wrapped in a `dite`/`ite` over Prop"
-status: in_progress
+status: done
 claimed_by: opus-bootstrap42-arity
 created: 2026-07-14T20:55:00Z
-updated: 2026-07-14T21:10:00Z
+updated: 2026-07-14T21:25:00Z
 ---
 
 ## Description
@@ -113,6 +113,49 @@ fork.
   (non-exec side fails on termination only), so it — not coset_group — is the
   current attempt-1 sink for the non-exec ladder.
 
+- (2026-07-14, opus-bootstrap42-arity) **FIX FOUND + APPLIED + COMMITTED
+  (`6c0de66`); full-chain gate validation in flight.** Tested candidate
+  `decreasing_by` closers by patching the `decreasing_by` line in the REAL
+  `word_numbering.lean.failed` and re-elaborating (harness `/tmp/harness*.py`):
+  - `split at *` (after `div_lt_self`): FAILS — doesn't crack the negated dite.
+  - `apply Nat.div_lt_self <;> simp_all` (no omega): term-error gone but leaves
+    `unsolved goals` (simp_all reduces but doesn't close the arithmetic).
+  - **`apply Nat.div_lt_self <;> (simp_all <;> omega)`: 0 errors.** ✓ Also
+    verified against the FULL production menu (with the seq rungs present): 0
+    term-errors, 0 other-errors; and a clean-hypothesis base-conversion case
+    still passes (no regression).
+  - Applied as an ADDITIVE new `first|` rung in `to_lean_fn.rs:decreasing_by_tactic`,
+    placed right after the plain `(apply Nat.div_lt_self <;> omega)` rung so the
+    cheap clean path is unchanged and only genuine dite-guard fns fall through.
+  - **Local-model consult (Danielle's companion, port 8051):** confirmed safe
+    (Lean backtracking prevents context pollution across rungs/goals; the
+    apply-before-simp_all ordering is correct — simp_all first could rewrite the
+    `div` goal so `Nat.div_lt_self` no longer matches). Flagged one real caveat:
+    `simp_all` scans the WHOLE local context, so it's a *performance tax* if many
+    goals fall through — and a theoretical loop/over-simplification risk if a
+    crate adds cyclic/interacting custom simp lemmas. Suggested hardening: replace
+    `simp_all` with a targeted `simp only [<lemma decomposing ¬(ite _ _ _)>]`.
+    NOT done now (would need to pin the exact minimal lemma set; premature while
+    the rung is a rarely-hit fallback). **Documented hardening follow-up:** if the
+    corpus run shows a heartbeat/rlimit tax on this rung, switch to `simp only`.
+    (Aligns with [[feedback_minimal_automation]] / [[feedback_transparency_is_faithfulness]].)
+
 ## Writeup
 
-_pending a fix._
+**DONE (2026-07-14, opus-bootstrap45-seqrung).** The `6c0de66` fix — the additive
+`(apply Nat.div_lt_self <;> (simp_all <;> omega))` div-rung — is CONFIRMED correct
+and sufficient for its scope. Two cold gate runs (`/tmp/ingate5.log`,
+`/tmp/ingate6.log`) both show **zero** `word_numbering.lean.failed` dump and zero
+`word_numbering` termination errors: `numbers_word`/`w_c` now build. The
+downstream prediction also held — with word_numbering no longer sinking non-exec
+attempt-1, `coset_group` got its `Some_val0` accessor and **bootstrap-41
+auto-resolved** (no `coset_group.lean.failed` in either run).
+
+**What the full-chain validation surfaced (the payoff of running it):** the defs
+family now fails at exactly ONE remaining site — `m1_guard.lead` in the EXEC defs
+family (`TactusDefs_lib_exec__m1_guard.lean:23`, `unsolved goals` on `¬ len w = 0`).
+This is the SAME failure class as this card (an omega-opaque termination guard),
+but on the **seq-companion** rungs (`apply Seq.drop_first_len_lt <;> …`) rather
+than the div rung this card hardened — so the `(simp_all <;> omega)` treatment had
+to be extended there too. Filed + fixed as **bootstrap-45**. This card's own
+target (word_numbering builds) is fully met; closing it.

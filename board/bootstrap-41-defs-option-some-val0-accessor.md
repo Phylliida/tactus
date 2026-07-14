@@ -1,9 +1,9 @@
 ---
 title: "tgt defs family: `coset_group` fails — generated Option accessor `lib.option.Option.Some_val0` not in scope"
-status: todo
-claimed_by:
+status: done
+claimed_by: opus-bootstrap45-seqrung
 created: 2026-07-14T14:40:00Z
-updated: 2026-07-14T14:40:00Z
+updated: 2026-07-14T21:25:00Z
 ---
 
 ## Description
@@ -126,4 +126,24 @@ bootstrap fork (whether via bootstrap-42 or the fallback fix).
 
 ## Writeup
 
-_pending a fix._
+**DONE — AUTO-RESOLVED by bootstrap-44 (2026-07-14, opus-bootstrap45-seqrung).**
+The ROOT CAUSE diagnosis held exactly: this was a *fallback artifact*. coset_group
+only ever failed because the non-exec defs ladder fell back to attempt-2
+(accessors OFF), which it did only because an accessor-independent module sank
+attempt-1 (accessors ON). Once **bootstrap-44** (`6c0de66`) cleared the last
+attempt-1 sink (`word_numbering` termination), the non-exec attempt-1 render wins,
+`Some_val0` is emitted, and coset_group builds.
+
+**Evidence:** two post-bootstrap-44 cold gate runs (`/tmp/w4a-tgt-ingate5`,
+`/tmp/w4a-tgt-ingate6`) produce **no** `TactusDefs_lib__coset_group.lean.failed`
+dump and no `Some_val0` errors anywhere in the logs — coset_group elaborates
+clean. The only remaining defs-family failure is `m1_guard` in the EXEC family
+(bootstrap-45), which is unrelated to accessors.
+
+**Not done (deliberately):** the principled hardening flagged in the ROOT CAUSE
+section — *referenced-only accessor emission in the accessors-OFF fallback*, so a
+future attempt-1 sink can't silently re-strip spec-side accessors — was NOT
+implemented. It remains a latent design flaw (any new attempt-1 sink would
+resurface exactly this class of failure for whichever spec module references a
+variant accessor). If it's worth doing as insurance, it should be its own card;
+it is not needed to unblock the current in-gate bridge push.

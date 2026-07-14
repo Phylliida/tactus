@@ -80,11 +80,26 @@ pub(crate) const TACTIC_BODY_FALLBACK: &str = "sorry";
 ///   theorem emitted next to the corresponding def (see
 ///   `seq_measure_companion_cmd` in `generate.rs`; B3 in
 ///   DESIGN-lean-all-proofs-bugs.md). The side goal `¬ len w = 0` closes
-///   from the branch guard via `assumption`/`omega`/`simp_all` — `omega`
-///   for arithmetic guards (`3 ≤ len w` under F2c's wf_preprocess
-///   threading, which assumption/simp_all can't bridge). In a crate that
-///   never emits the def/companion the `apply` head is unknown and the
-///   branch just fails over.
+///   from the branch guard via `assumption`/`omega`/`(simp_all <;> omega)`/
+///   `simp_all` — `omega` for arithmetic guards (`3 ≤ len w` under F2c's
+///   wf_preprocess threading, which assumption/simp_all can't bridge). The
+///   `(simp_all <;> omega)` rung (bootstrap-45) handles the case where the
+///   THEN-branch guard reaches the termination context as a Bool-wrapped
+///   `decide (len w > 0 ∧ …) = true` hypothesis (a conjunction-guarded
+///   recursive spec fn like `m1_guard.lead`, whose guard elaborates to a
+///   `decide … = true` under the in-gate ambient env's Decidable-instance
+///   resolution): `omega` cannot read `0 < len w` out of an opaque
+///   `decide … = true`, and the bare `simp_all` fallback DECODES the decide
+///   into a plain conjunction but then STOPS (it made progress yet did not
+///   close the arithmetic goal `¬ len w = 0` — and being the last `first`
+///   alternative, `first` accepts that partial success and leaves the goal
+///   unsolved). `(simp_all <;> omega)` decodes+normalizes with `simp_all`,
+///   THEN closes with `omega` — the same shape as the div-rung Prop-`ite`
+///   fix (bootstrap-44), now applied to the seq-companion rungs. Placed
+///   BEFORE the bare `simp_all` so the cheap `assumption`/`omega` clean
+///   path is unchanged and only genuine decide-wrapped guards fall through.
+///   In a crate that never emits the def/companion the `apply` head is
+///   unknown and the branch just fails over.
 /// - `(repeat split) <;> omega` — **Int-typed measures** (F2b,
 ///   DESIGN-lean-all-proofs-followons.md): with `wrap_int_measure`'s
 ///   `Int.toNat` embedding, an Int-abs measure (`if 0 ≤ t then t else
@@ -114,7 +129,7 @@ fn decreasing_by_tactic() -> String {
         None => n.to_string(),
     };
     format!(
-        "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Nat.div_lt_self <;> (simp_all <;> omega)) | (apply {df} <;> (first | assumption | omega | simp_all)) | (apply {dl} <;> (first | assumption | omega | simp_all)) | ((repeat split) <;> omega) | decreasing_tactic)",
+        "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Nat.div_lt_self <;> (simp_all <;> omega)) | (apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | (apply {dl} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | ((repeat split) <;> omega) | decreasing_tactic)",
         df = q("Seq.drop_first_len_lt"),
         dl = q("Seq.drop_last_len_lt"),
     )
