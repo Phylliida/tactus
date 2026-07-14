@@ -89,8 +89,15 @@ pub enum ParamBoundList {
 // ── Statements: the Wp-input mirror (stage-A subset) ────────────────
 
 pub enum StmData {
-    /// StmX::Assert — obligation leaf.
-    Assert(u64),
+    /// StmX::Assert — (annotated obligation leaf, bare hyp leaf). The GOAL
+    /// this assert emits uses the ANNOTATED obligation leaf
+    /// (`/- @rust:LOC -/ prop`, production's `span_mark` render); the
+    /// forward HYP it adds for the rest of the body uses the BARE prop
+    /// leaf. Production renders `cond_ast` once and uses it span_mark'd for
+    /// the goal, bare for the hyp (sst_to_lean::walk_obligations) — the
+    /// fixture certs show goal `Leaf 15` (annotated) alongside forward
+    /// `Imp 8` (bare) for the SAME assert (finding-1).
+    Assert(u64, u64),
     /// StmX::Assume.
     Assume(u64),
     /// StmX::Assign — (dest local leaf, rhs leaf).
@@ -225,7 +232,7 @@ pub open spec fn stm_size(s: StmData) -> nat
     decreases s
 {
     match s {
-        StmData::Assert(_e) => 1,
+        StmData::Assert(_o, _h) => 1,
         StmData::Assume(_e) => 1,
         StmData::Assign(_d, _r) => 1,
         StmData::Call { reqs, enss, dest: _, dest_typ: _ } => 1 + leaf_len(*reqs) + leaf_len(*enss),
@@ -271,7 +278,7 @@ pub open spec fn fnctx_arity(c: FnCtxData) -> nat {
 proof fn skeleton_kernel_computes()
     ensures
         stm_size(StmData::Seq(
-            Box::new(StmData::Assert(0)),
+            Box::new(StmData::Assert(0, 0)),
             Box::new(StmData::If(1, 2, Box::new(StmData::Skip),
                 Box::new(StmData::Ret(Box::new(LeafList::Nil))))),
         )) == 5,
@@ -309,9 +316,11 @@ by {
 //  * The frame IS the goal spine (DESIGN §2.1): `close` folds it entry-
 //    by-entry around one obligation leaf. First (outermost) frame entry =
 //    outermost GoalData constructor.
-//  * `StmData::Assert(e)` emits `close(frame, e)` AND `frame_after` adds
-//    hyp `e`: the fixture certs show TWO `Imp e` after an Assert/Assume
-//    pair — the Assert's forward hyp plus the following Assume's hyp.
+//  * `StmData::Assert(oblig, hyp)` emits `close(frame, oblig)` (the
+//    ANNOTATED obligation leaf, finding-1) AND `frame_after` adds forward
+//    hyp `hyp` (the BARE prop leaf): the fixture certs show TWO `Imp <bare>`
+//    after an Assert/Assume pair — the Assert's bare forward hyp plus the
+//    following Assume's hyp — while the goal uses the span_mark'd obligation.
 //  * Signature bound-hyps and requires render as NAMED ∀-binders
 //    (`All 19 2` = ∀ (h_x_bound : …), `All 17 5` = ∀ (h_req0 : …)), NOT
 //    arrows (finding-2, LANDED). `ParamBoundList::Bound` now carries the
@@ -397,7 +406,7 @@ pub open spec fn frame_after(f: FrameList, s: StmData) -> FrameList
     decreases s
 {
     match s {
-        StmData::Assert(e) => frame_append(f, FrameList::FHyp(e, Box::new(FrameList::FNil))),
+        StmData::Assert(_o, h) => frame_append(f, FrameList::FHyp(h, Box::new(FrameList::FNil))),
         StmData::Assume(e) => frame_append(f, FrameList::FHyp(e, Box::new(FrameList::FNil))),
         StmData::Assign(x, rhs) => frame_append(f, FrameList::FLet(x, rhs, Box::new(FrameList::FNil))),
         StmData::Call { reqs: _, enss, dest, dest_typ } =>
@@ -421,8 +430,8 @@ pub open spec fn wp_stm(f: FrameList, s: StmData) -> GoalList
     decreases s
 {
     match s {
-        StmData::Assert(e) =>
-            GoalList::Cons(Box::new(close(f, e)), Box::new(GoalList::Nil)),
+        StmData::Assert(o, _h) =>
+            GoalList::Cons(Box::new(close(f, o)), Box::new(GoalList::Nil)),
         StmData::Assume(_e) => GoalList::Nil,
         StmData::Assign(_x, _rhs) => GoalList::Nil,
         StmData::Call { reqs, enss: _, dest: _, dest_typ: _ } => close_each(f, *reqs),
@@ -625,7 +634,7 @@ by { decide }
 
 proof fn probe_wp_stm()
     ensures
-        goal_count(wp_stm(FrameList::FNil, StmData::Assert(9))) == 1,
+        goal_count(wp_stm(FrameList::FNil, StmData::Assert(9, 9))) == 1,
         goal_count(wp_stm(FrameList::FNil, StmData::Skip)) == 0
 by { decide }
 
@@ -637,7 +646,7 @@ proof fn probe_ref_wp()
             param_bounds: ParamBoundList::Nil,
             reqs: BinderList::Nil,
             enss: LeafList::Nil,
-        }, StmData::Assert(9))) == 1
+        }, StmData::Assert(9, 9))) == 1
 by { decide }
 
 // ── W2a: end-to-end refWp unit examples (against hand-computed goals) ──
@@ -658,7 +667,7 @@ proof fn ref_wp_seed_and_assert()
                     reqs: BinderList::Nil,
                     enss: LeafList::Nil,
                 },
-                StmData::Assert(9),
+                StmData::Assert(9, 9),
             ),
             GoalList::Cons(
                 Box::new(GoalData::All(0, 1, Box::new(GoalData::All(19, 2, Box::new(GoalData::Leaf(9)))))),
@@ -694,7 +703,7 @@ proof fn ref_wp_seq_threads_frame()
                     reqs: BinderList::Nil,
                     enss: LeafList::Nil,
                 },
-                StmData::Seq(Box::new(StmData::Assert(9)), Box::new(StmData::Assert(10))),
+                StmData::Seq(Box::new(StmData::Assert(9, 9)), Box::new(StmData::Assert(10, 10))),
             ),
             GoalList::Cons(
                 Box::new(GoalData::All(0, 1, Box::new(GoalData::All(19, 2, Box::new(GoalData::Leaf(9)))))),
@@ -711,10 +720,10 @@ by { decide }
 //   params x=0:Int=1, y=3:Int=1; bounds h_x_bound=19:prop2, h_y_bound=18:prop4;
 //   reqs h_req0=17:(x<1000)=5, h_req1=16:(y<1000)=6; obligation leaf 15.
 // Expected spine = All 0 1 (All 19 2 (All 3 1 (All 18 4 (All 17 5
-//   (All 16 6 (Leaf 15)))))) — the first assert goal, verbatim. NB: the
-// Assert here carries the ANNOTATED obligation leaf 15 directly; the raw SST
-// carries the bare leaf 8 (finding-1, separate). This isolates finding-2:
-// GIVEN the annotated obligation, the named-binder seed telescope matches.
+//   (All 16 6 (Leaf 15)))))) — the first assert goal, verbatim. The Assert
+// now carries BOTH roles (finding-1): oblig leaf 15 (annotated, drives the
+// GOAL) and hyp leaf 8 (bare, drives the forward frame — unused here since
+// nothing follows). `wp_stm` reads the oblig, so the goal ends in Leaf 15.
 proof fn ref_wp_add_capped_seed_spine()
     ensures
         goals_eq(
@@ -727,7 +736,7 @@ proof fn ref_wp_add_capped_seed_spine()
                     reqs: BinderList::Cons(17, 5, Box::new(BinderList::Cons(16, 6, Box::new(BinderList::Nil)))),
                     enss: LeafList::Cons(7, Box::new(LeafList::Nil)),
                 },
-                StmData::Assert(15),
+                StmData::Assert(15, 8),
             ),
             GoalList::Cons(
                 Box::new(GoalData::All(0, 1, Box::new(GoalData::All(19, 2,
