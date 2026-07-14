@@ -1,9 +1,9 @@
 ---
 title: "W7c-ref — reference def-body transcriber on the VIR ExprX surface (raw_vir_exp)"
-status: in_progress
+status: done
 claimed_by: opus-w7c-ref
 created: 2026-07-14T23:20:00Z
-updated: 2026-07-15T02:20:00Z
+updated: 2026-07-15T04:15:00Z
 ---
 
 ## Description
@@ -233,16 +233,40 @@ they must match this side's shapes) and W7d (def emission + bridge).
   `CtorList`/`TypList` folded reversed. **Fixture-covering DEFINITIONS surface
   (def header + Ite/Match body + datatype) now complete on the reference side.**
 
+- (2026-07-15, opus-w7d-settle) **CLOSED — W7d cross-validated this transcriber
+  live.** The reference def surface (header `raw_vir_def` + body `raw_vir_exp`
+  Ite/Match/Quant + datatype `raw_vir_dt`) is complete for the fixture-reachable
+  set AND `bootstrap-33` (W7d) proved its output `render_def`/`render_dt`s to the
+  SAME `DefData`/`DtData` production emits: on the LIVE `verus --tactus-emit-cert`
+  run, `tri.defcert` (recursive Ite body), `tree_head.defcert` (Match body),
+  `sq.defcert`, and `lib__Tree.dtcert` (Box→TyBox fields) all close
+  `def_eq`/`dt_eq` by `decide` against real production output (probe17, re-run
+  green this turn). The `raw_vir_exp` empty-block-peel gap the live path caught
+  is fixed + regression-tested (lean_verify 366/0). §7 Q1 ctor/binder-id
+  co-design held under real production output (the shared `ctor_pattern_name`
+  anchor). **Remainders SPLIT to their own cards (not hidden):** multi-arg
+  `Call`→`CallN` → `bootstrap-34` (needs the cache-churning per-arg-`TypData`
+  `RawList` edit; tgt-slice-only, fixture forces none); the `sum_tree`
+  Box-deref-in-match-arm fixture caller is a minor nicety (its arms are already
+  covered by `tree_head`'s Match + the box-peel unit test; `sum_tree` is pruned
+  today with no caller). The deeper content-perturbation kill is `bootstrap-35`
+  (W7e).
+
 ## Writeup
-_partial (reference transcriber core landed). The def-body REFERENCE transcriber
+_DONE (reference transcriber, W7d-validated). The def-body/-header/-datatype
+REFERENCE transcriber
 `raw_vir_exp` (+ `raw_vir_place`/`pattern_ctor_binds`/`pattern_binder_id`) is
 implemented on the VIR `ExprX` surface for the fixture-reachable arms including
 the priority `Match`→`MatchR`, compiles clean, and is unit-tested on the cheap
 structural arms (345/0). The premise that `Match` survives to the def body was
 validated against the emitted fixture (`lib.tree_head` is a native Lean `match`).
 The §7 Q1 ctor-id co-design is solved via the shared `ctor_pattern_name` helper
-(single source of truth, no drift). Verdict-neutral (dead code, no tactus-core
-edit). Remaining before the task closes: production-side Match/Ite arms
-(bootstrap-28), the W7d def-body entry point + e2e `def_eq` bridge (the Match
-arm's real validation), and the def-header/datatype input surfaces. See Progress
-for line refs + the guard/scrutinee/wildcard fail-loud rationale._
+(single source of truth, no drift). The def-header (`raw_vir_def`) and datatype
+(`raw_vir_dt`, Box→`TyBox`) input surfaces landed in later increments
+(`bootstrap-30`/`-31`), and W7d (`bootstrap-33`) wired the def-body entry point
+and cross-validated the whole reference surface LIVE: `tri`/`tree_head`/`sq`/
+`Tree` all close `def_eq`/`dt_eq` by `decide` against real production output
+(probe17, re-run green). Split-out remainders (tracked, not hidden): multi-arg
+`Call`→`CallN` = `bootstrap-34`; deeper content-perturbation kill = `bootstrap-35`
+(W7e). See Progress for line refs + the guard/scrutinee/wildcard fail-loud
+rationale._
