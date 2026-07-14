@@ -3,7 +3,7 @@ title: "W6d — bridge deepened: obligation leaves emit LeafE + refWp closes ove
 status: in_progress
 claimed_by: opus-b23
 created: 2026-07-14T09:30:00Z
-updated: 2026-07-14T12:00:00Z
+updated: 2026-07-14T15:30:00Z
 ---
 
 ## Description
@@ -276,7 +276,30 @@ arithmetic fns; G2+G3 unlock the datatype/struct/tuple fns.
   `LeafE(render_exp(rawExp))` (mirrors `close`); switch the obligation-emitting
   `refWp` arms to `close_e`; change `StmData`'s obligation slot(s) `u64 →
   RawExp`. This is the cache-churny StmData edit (invalidates the stm layer +
-  the `ref_wp_*` proofs) — batch with W6d.2. Defer G4 (`Let`-in-leaf).
+  the `ref_wp_*` proofs). Defer G4 (`Let`-in-leaf). **Split into three sub-steps
+  by container shape** (the obligation lives in three shapes — this decides how
+  much new type surgery each needs):
+  - **W6d.1b-i — the `Assert` obligation slot (BARE `u64` → `RawExp`). ✅ DONE
+    (2026-07-14, opus-b23).** `Assert(u64,u64)` → `Assert(RawExp,u64)`; added
+    `close_e` + `atom_ob(id) = Var(id,TyBool)`; wired `wp_stm`'s Assert arm to
+    `close_e`. All 16 Assert fixtures wrapped (`atom_ob(N)`) + their expected
+    `Leaf(N)` → `LeafE(Atom N)`. Verified **52/0** (Lean backend, clean axiom
+    closure). This is the shape de-risk — `close_e`/`render_exp` now
+    kernel-`decide`s on the REAL refWp Assert arm. See the "W6d.1b-i landing"
+    section below.
+  - **W6d.1b-ii — the LeafList obligation slots (`Call.reqs`, `Ret.es`).**
+    Needs a NEW `RawExpList` type (LeafList is shared with hyps/`enss`, so its
+    element type can't change globally) + `close_each_e(f, RawExpList)` mirroring
+    `close_each`. Wire `wp_stm`'s Call + Ret arms. Fixtures: `ref_wp_ret_*`,
+    sum_to's final Ret (Leaf 7), cd19's two Rets (Leaf 5), call_pass_through reqs
+    (Leaf 7).
+  - **W6d.1b-iii — the Loop obligation slots (`inv_hyps` props, `decrease_oblig`).**
+    `decrease_oblig` is bare `u64 → RawExp` (easy, like Assert). `inv_hyps` is a
+    `BinderList` whose PROP (2nd) slot is the obligation → needs a `(u64 name,
+    RawExp prop)` container + `close_each_binderprop_e`. Wire the Loop maintain/
+    init/decrease arms. Fixtures: sum_to monster (Leaf 23/24/25/26 init+maintain,
+    Leaf 39 decrease), nested_loop (Leaf 35, via direct `close` — switch to
+    `close_e`).
 - **W6d.2 — serializer wiring.** In `sst_serialize.rs`: `oblig_leaf` (and the
   Ret/Loop obligation paths) emit the `RawExp` mirror into `StmData` (drop
   `#[allow(dead_code)]` on `raw_exp`/`typ_data`); `goal_data` emits
@@ -401,6 +424,61 @@ arithmetic fns; G2+G3 unlock the datatype/struct/tuple fns.
   then serializer wiring: raw_exp G0 Box/Unbox peel + G7 VarAt + the
   LitBool/Field/HasType arms; oblig_leaf emits the RawExp mirror wrapped in
   `Span`; goal_data emits `LeafE`).
+
+- (2026-07-14, opus-b23) **W6d.1b-i landed — the `Assert` obligation slot is
+  now a deep `RawExp`; `close_e` verified 52/0.** The first of W6d.1b's three
+  container sub-steps (see the split in the plan above). What changed in
+  `tactus-core/lib.rs` (one datatype-churn edit + fixtures):
+  - **`close_e(f: FrameList, ob: RawExp) -> GoalData`** — mirrors `close`
+    entry-for-entry (same `All`/`Imp`/`Let` spine) but the terminal is
+    `LeafE(render_exp(ob))` instead of `Leaf(u64)`. `#[structural_decreases]`
+    on `f`; placed right after `close` (after `render_exp`, so the def order is
+    clean).
+  - **`atom_ob(id) = Var(id, TyBool)`** — the bare-atom obligation. `render_exp`
+    maps it to `Atom(id)`, so `close_e(f, atom_ob(id))` folds the SAME spine as
+    `close(f, id)` and terminates in `LeafE(Atom id)`. This is what the fixtures
+    (and, W6d.2, the serializer) use wherever the raw SST leaf is not yet one of
+    the deepened `RawExp` shapes (G0–G7) — the opaque ids keep matching by id.
+  - **`StmData::Assert(u64, u64)` → `Assert(RawExp, u64)`** — only the obligation
+    (1st) field deepens; the bare-hyp (2nd) field stays `u64` (hypotheses are
+    not deepened, only obligations). `wp_stm`'s Assert arm now emits
+    `close_e(f, o)`; `frame_after`/`stm_size` already ignored the field
+    (`_o`), so no other match changed.
+  - **All 16 Assert fixture sites** wrapped `N → atom_ob(N)`; their expected
+    `Leaf(N) → LeafE(Atom N)` (Assert-derived only: leaf ids 9/10/11/13/15/17/
+    18/21/40 — the sum_to monster's Leaf 18/21 and cd19's Leaf 13/17 edited
+    surgically; the 13 non-Assert `Leaf(9)`/`Leaf(10)` in `goal_eq`/`goal_size`
+    test data correctly stay `Leaf`).
+  - **`probe_close_e`** guard: `close_e` has the same `goal_size` as `close`,
+    produces `LeafE(Atom 9)`, and `goal_eq(LeafE(Atom 9), Leaf 9) == 0` — the
+    mutation-sensitivity that makes the deep bridge meaningful (a production
+    `LeafE` can never silently match a reference `Leaf`).
+
+  **Verified 52/0** (`--lean-backend --lean-all-proofs`, 46 modules elaborated,
+  composition + axiom closures kernel-verified — no `WellFounded.fix`/`Classical`).
+  Up from 50: the two added proofs. **Cache:** this is a datatype-shape churn
+  (StmData gained a `RawExp` field → base-hash change), so the whole crate
+  re-elaborated — expected, ~2min cold.
+
+  **Key finding that de-risks the rest — the serializer coupling is at the LEAN
+  level, not the Rust build.** `sst_serialize.rs` emits `StmData` as Lean *text*
+  (`format!("({}.StmData.Assert {} {})", NS, oblig, hyp)`), NOT as constructed
+  Rust `tactus_core::StmData` values. So changing tactus-core's `StmData` type
+  does NOT break the serializer's Rust compile, and cert emission is gated
+  (`--tactus-emit-cert`, test-quiet) — **the W3 tgt gate and the e2e suite stay
+  green by construction.** The only place the type change bites is when a cert is
+  actually elaborated (W6d.3): the emitted `.Assert 15 14` text (bare Nat in the
+  RawExp slot) will fail Lean type-check until W6d.2 rewrites `oblig_leaf`'s
+  emission to a `RawExp` literal (e.g. `(lib.RawExp.Var 15 lib.TypData.TyBool)`
+  for the atom case, or the deep G0–G7 shapes). W6d.1b-i is verdict-neutral: no
+  producer emits the new Assert shape yet.
+
+  **Verdict-neutral / not yet wired** (same as W6d.1a): `close`/refWp's other
+  obligation arms (Call/Ret/Loop) still emit `Leaf(u64)`; the serializer is
+  untouched. **Next = W6d.1b-ii** (RawExpList + `close_each_e` for Call.reqs/
+  Ret.es), then **W6d.1b-iii** (Loop decrease_oblig bare-slot + inv_hyps prop
+  container), then **W6d.2** (serializer text emission). G4 (`Let`-in-leaf)
+  stays deferred to W6e.
 
 ## Writeup
 
