@@ -51,6 +51,16 @@ neither. The two B kills pin exactly those two failure modes.
 
 ## ⚠ Architectural fork found — is the per-arg-`TypData` edit even load-bearing?
 
+> **RESOLVED (step 2a, 2026-07-14) → WORLD (a). See `STEP2A-DUMP.md`.** A real
+> multi-arg SST/VIR dump settled it: Verus rejects implicit call-arg coercions
+> (compile error), so every coercion is a materialized `Clip` whose arg node's
+> own `.typ` is the coerced type; a `Call` node carries no per-arg type and needs
+> none. The per-arg-`TypData` edit (step 2b) is **UNNECESSARY and cancelled** —
+> and the no-`TypData` `RawExp::CallN`/`RawList`/`render_list` spine is already
+> landed & verified in `tactus-core`. Remaining work = step 3 (widen 3 serializer
+> arms, Rust-only) + step 4 (bridge test). The analysis below is preserved as the
+> pre-resolution reasoning; read `STEP2A-DUMP.md` for the settled plan.
+
 **Correction to a first-draft claim in this report:** the single-arg serializer
 does **not** put the callee's declared parameter type in the `argTy` slot. Both
 `raw_exp` (SST) and `raw_vir_exp` (VIR) set `arg_ty = self.typ_data(&arg.typ)` —

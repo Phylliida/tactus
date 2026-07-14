@@ -48,6 +48,31 @@ per-arg-TypData `RawList` shape first (mirror the W7a/W6a probe pattern).
 coverage of the tgt slice (any tgt spec fn calling a ≥2-arg helper).
 
 ## Progress
+- (2026-07-14, opus-w7-appn step2a) **FORK RESOLVED = WORLD (a); step 2b
+  CANCELLED.** Dumped a genuine multi-arg spec-fn call at both levels with the
+  existing release binary (no serializer rebuild): `bootstrap-fixture/appn_probe.rs`
+  + `verus --lean-backend --log vir --log vir-sst`. Three decisive findings
+  (full excerpts in `probe-w0/probe18_appn/STEP2A-DUMP.md`):
+  (1) Verus has **no** implicit per-arg coercions — `g2(x,y)` with `x:u64` into a
+  `nat` param is a **hard compile error**, so every coercion MUST be a source
+  `as` = a `Clip`; world (b) is impossible for the coercion axis. (2) Both VIR
+  (`crate.vir`) and SST (`root-sst.vir`) show each coerced arg as
+  `Clip{Nat}(Var x:u64)` with the **arg node's own `.typ` already = Nat**; the
+  `Call` node has no per-arg-type slot and needs none. (3) A `&Tree`/`*t`
+  ref-deref arg arrives as a **bare value-typed `Var t:Tree`** (ref/deref
+  resolved away) → `needs_ref_deref` never fires either. ⟹ the single-arg arm's
+  `coerce_if` (needs `int`-then-`nat`, but `arg.typ==argTy` always) AND
+  `deref_if` (needs `TyRef` tag, never produced) are **both structural no-ops**,
+  so the existing no-`TypData` `render_list` is identical to the per-arg chain.
+  **Bonus:** `tactus-core` already has the full no-`TypData` spine landed &
+  verified (`RawExp::CallN`/`RawList`/`render_exp`CallN→AppN/`render_list`, L332/
+  392/405/944/974) — step 2b is not even an additive constructor. Local model
+  consulted on the evidence: concurred, "no hole, proceed with widening." **Next
+  instance: skip straight to step 3** — widen the 3 fail-loud serializer arms in
+  `sst_serialize.rs` (L683 `raw_exp`, L932 `raw_vir_exp`, L1421
+  `lexpr_to_exprdata`) to the multi-arg spine (Rust-only rebuild, NO whole-crate
+  re-verify); first `--emit-lean`-dump a 2-arg caller to confirm production's
+  `LExpr` head/arg shape (flat vs curried) for the `lexpr_to_exprdata` arm.
 - (2026-07-15, opus-w7d-settle) Split out of `bootstrap-28`/`-29` when W7d
   closed the fixture-covering surface. The AppN deferral was Danielle-endorsed
   across several W7c turns (needs the cache-churning per-arg-`TypData`
