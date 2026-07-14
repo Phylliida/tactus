@@ -6189,7 +6189,7 @@ fn lex_decrease_obligation(levels: &[DecreaseLevel<'_>]) -> LExpr {
 /// `out`. Nested loops inherit the current `locally_declared` set, so
 /// a variable `x` declared in an outer loop body and modified by an
 /// inner loop still counts as modified by the outer.
-fn collect_modifications<'a>(
+pub(crate) fn collect_modifications<'a>(
     stm: &'a Stm,
     locally_declared: &mut HashSet<&'a VarIdent>,
     out: &mut Vec<&'a VarIdent>,
