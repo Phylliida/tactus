@@ -3,7 +3,7 @@ title: "W7 — defs-layer certificate (spec-fn bodies + datatype/height emission
 status: in_progress
 claimed_by: opus-w7
 created: 2026-07-13T19:38:00Z
-updated: 2026-07-14T21:40:00Z
+updated: 2026-07-15T04:15:00Z
 ---
 
 ## Description
@@ -103,6 +103,33 @@ def bodies). **UNBLOCKED** — W6 done (`bootstrap-11` closed).
     to "reuse the RawExp target vocab + `typ_data`/`binop_opcode`, new VIR arms."
     The W7b `MatchR`/`RawArmList` vocab is thereby confirmed REACHABLE. Full
     finding + line refs in `bootstrap-28` Progress.
+
+- (2026-07-15, opus-w7d-settle) **W7c + W7d DONE — the fixture rung of the
+  "Done when" is met.** The def-body/-header/-datatype transcription landed on
+  both sides (`bootstrap-28` production, `bootstrap-29` reference, both now
+  `done`), W7b vocab is in-crate (`bootstrap-27`), and W7d (`bootstrap-33`)
+  wired the live emit path + cross-validated it: a real
+  `verus --lean-backend --tactus-emit-cert` run over `bootstrap-fixture` writes
+  `tri`/`sq`/`tree_head` `.defcert` + `Tree` `.dtcert`, and each closes its
+  `def_eq`/`dt_eq` bridge by `decide` against `tactus-core/out/lib`
+  (`probe17_w7d_live`, re-run green this turn; lean_verify 366/0). One real
+  transcriber gap (spec-fn bodies arrive wrapped in `Block([], Some(tail))`) was
+  caught by the live path and fixed (empty-block peel + regression tests).
+  - **Remaining rungs of THIS umbrella's "Done when":**
+    1. **tgt-slice coverage** — bridge a real tgt-slice def, not just the
+       fixture. The blocker is multi-arg `Call`/`AppN` (tgt spec fns call
+       ≥2-arg helpers), which is deferred as **`bootstrap-34`** (the
+       cache-churning per-arg-`TypData` `RawList` edit).
+    2. **perturbed def fails the bridge** — probe17 already has the vacuity
+       floor (bridge-literal flip); the deeper body/ctor/height content
+       perturbation is **`bootstrap-35`** (W7e).
+    3. **height-function emission** — the datatype cert covers the `Tree` decl;
+       whether a `.height` measure is emitted as its own certified def (the
+       card title's "+ datatype/height emission") is unverified this turn —
+       fold into W7e/34 scoping or confirm it's subsumed by the dtcert.
+  - So the umbrella stays `in_progress` with a much shorter tail: 34 (AppN) →
+    tgt slice, 35 (W7e) → perturbation acceptance, and the height-emission
+    check. The fixture heart is done and green.
 
 ## Writeup
 

@@ -1,9 +1,9 @@
 ---
 title: "W7c — serializer transcriptions for the def-body constructors (Ite/Match/AppN/Forall/Exists + datatype)"
-status: in_progress
+status: done
 claimed_by: opus-w7c
 created: 2026-07-14T22:10:00Z
-updated: 2026-07-15T02:20:00Z
+updated: 2026-07-15T04:15:00Z
 ---
 
 ## Description
@@ -303,10 +303,34 @@ emission + bridge `def_eq`/`dt_eq`), W7e (mutation-kill).
   datatype) now complete on the production side.** Only surviving W7c remainder:
   multi-arg AppN (the cache-churning `RawList` edit; tgt-slice-only).
 
+- (2026-07-15, opus-w7d-settle) **CLOSED — W7d cross-validated both transcriber
+  sides live.** The production side (`lexpr_to_exprdata` Ite/Match/Forall/Exists
+  + `ldef_to_defdata` header + `ldt_to_dtdata` datatype + the `ltyp_to_typdata`
+  binder-type recognizer) is complete for the fixture-covering + first
+  tgt-slice-only (quantifier) set, and `bootstrap-33` (W7d) proved
+  `expr_eq(prod, render_exp(ref))` closes LIVE: the emitted `tri`/`tree_head`/
+  `sq`/`Tree` certs all `decide`-close `def_eq`/`dt_eq` against the real
+  production `DefData`/`DtData` (probe17 re-run green this turn; lean_verify
+  366/0). Verdict-neutrality held through the whole line (golden suite
+  byte-identical). **The ONE remaining §3.1 constructor — multi-arg `AppN` —
+  is SPLIT to `bootstrap-34`** (needs the deferred cache-churning `RawList`
+  per-arg-`TypData` edit; Danielle-endorsed deferral, tgt-slice-only: the
+  fixture calls are single-arg). The deeper content-perturbation kill (beyond
+  probe17's vacuity-floor bridge-literal flip) is `bootstrap-35` (W7e).
+
 ## Writeup
 
-_partial — `Ite` + `Match` + `Forall`/`Exists` constructors landed on both
-transcriber sides (verdict-neutral, tests green, lib suite 351/0). The
+_DONE (production transcriptions, W7d-validated). `Ite` + `Match` +
+`Forall`/`Exists` + def-header + datatype landed on both transcriber sides
+(verdict-neutral, tests green, lib suite 359/0 → lean_verify 366/0 after the
+W7d empty-block fix), and W7d closed the live `def_eq`/`dt_eq` bridge on the
+emitted fixture certs. The one §3.1 remainder, multi-arg `AppN` (needs the
+cache-churning `RawList` per-arg-`TypData` edit), is tracked as `bootstrap-34`;
+W7e content-perturbation mutation-kill is `bootstrap-35`. Superseded partial
+notes below._
+
+_(superseded) partial — `Ite` + `Match` + `Forall`/`Exists` constructors landed
+on both transcriber sides (verdict-neutral, tests green, lib suite 351/0). The
 fixture-covering body set (leaf/Ite/Match) is complete; the first tgt-slice-only
 constructor (quantifiers) is now done too, incl. the `ltyp_to_typdata` binder-type
 recognizer (the §7-Q3-style fork, resolved with a documented usize/char→Nat
