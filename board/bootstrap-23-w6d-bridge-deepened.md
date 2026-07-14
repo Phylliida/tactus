@@ -1,9 +1,9 @@
 ---
 title: "W6d — bridge deepened: obligation leaves emit LeafE + refWp closes over ExprData (corpus coverage map)"
 status: in_progress
-claimed_by: opus-b23
+claimed_by: opus-b24
 created: 2026-07-14T09:30:00Z
-updated: 2026-07-14T21:30:00Z
+updated: 2026-07-14T23:15:00Z
 ---
 
 ## Description
@@ -320,7 +320,15 @@ arithmetic fns; G2+G3 unlock the datatype/struct/tuple fns.
     "W6d.2a landing" section below (Rust 327/0 + two rebuild-free end-to-end
     bridge checks). `raw_exp`/`typ_data`/`lexpr_to_exprdata` stay
     `#[allow(dead_code)]` — 2a does NOT wire them (no deep structure yet).
-  - **W6d.2b — deep transcription (the Friction-2 catcher).** Wire `raw_exp`
+  - **W6d.2b — deep transcription (the Friction-2 catcher).** Split into 2b-1
+    (reference-side `raw_exp` peel/alias arms) + 2b-2 (remaining reference arms +
+    goal-side G1 + the emit gate).
+    - **W6d.2b-1 — reference `raw_exp` G0/G7/G1 arms. ✅ DONE (2026-07-14,
+      opus-b24).** Box/Unbox peel (G0), VarAt→Var (G7), bool literal (G1) added
+      to `raw_exp`; 4 unit tests; `lean_verify` lib 331/0; still dead-code
+      (verdict-neutral). See the "W6d.2b-1 landed" Progress entry below.
+    - **W6d.2b-2 — G6/G3 reference arms + goal-side G1 arm + the emit gate.**
+    Wire `raw_exp`
     (G0 Box/Unbox peel FIRST, then G7 VarAt, G1 LitBool, G3 Field, G6 HasType,
     G2 TyRef→deref) into `oblig_leaf` with the `atom_ob` fallback when a shape
     isn't coverable, and `goal_data` into `lexpr_to_exprdata(shape.leaf)` with
@@ -725,6 +733,74 @@ arithmetic fns; G2+G3 unlock the datatype/struct/tuple fns.
   **Next = W6d.2b** (deep transcription, the Friction-2 catcher — see the split
   plan bullet above) then **W6d.3** (rebuild + re-emit all fixtures + probe9 +
   regenerate the golden). G4 (`Let`-in-leaf) → W6e.
+
+- (2026-07-14, opus-b24) **W6d.2b-1 landed — the reference-side `raw_exp`
+  gained its three dominant-blocker peel/alias arms (G0 Box/Unbox, G7 VarAt, G1
+  bool literal); 4 new unit tests, `lean_verify` lib 331/0.** First sub-step of
+  W6d.2b, same "land the transcription dead, wire later" discipline as W6c (the
+  fn is still `#[allow(dead_code)]` — the emit-path gate is 2b-2). What changed
+  in `sst_serialize.rs` (added `UnaryOpr` to the `vir::ast` import + 3 arms in
+  `raw_exp`):
+  - **G0 — `ExpX::UnaryOpr(Box(_) | Unbox(_), inner) => self.raw_exp(inner)`.**
+    Peels the SMT coercion wrappers transparently (recurse into inner, drop the
+    wrapper), exactly as `typ_data` already peels `Boxed`/`Decorate` at the type
+    level. The inner node's own `typ` drives its tag. This is the #1 unlock the
+    W6d.0 dump identified — every boxed value (spec-fn args, datatype args, field
+    results, tuple elements) is Box-wrapped, so without G0 even `tri (1)` (a
+    `Box[Nat] 1` arg) is unreachable. Placed FIRST in the match to document its
+    peel-first role.
+  - **G7 — `ExpX::Var(vid) | ExpX::VarAt(vid, _) => …`** (merged into the
+    existing `Var` arm via or-pattern). A pre-state param read `VarAt(vid, Pre)`
+    (ensures/decrease leaves) mirrors identically to a plain `Var`: same
+    `binder_id`, read `e.typ`. Production's `vir_expr_to_ast` collapses `VarAt`
+    to a bare `Var`, so the mirrors agree by construction for non-mut params
+    (the fixture's coverable fns). The `&mut`-ensures `x_at_pre_tactus` case
+    diverges — the 2b-2 emit-gate catches it by falling both sides to atom.
+  - **G1 — `ExpX::Const(Constant::Bool(b)) => RawExp.LitBool (0/1)`.** The nat
+    encoding, NOT a `bool` (a spec `bool` renders as `Prop` and sticks `decide`
+    — W6d.1a design deviation 1). `render_exp` passes it straight through to
+    `ExprData::LitBool`.
+  - **4 unit tests** (`sst_serialize_tests.rs`, new `mk_exp`/`tvar`/`tint`
+    helpers): `raw_exp_peels_box_unbox` (Box(Unbox(Var x)) == bare Var x),
+    `raw_exp_peels_box_inside_binop` (peel recurses under a `+`, both operands
+    bare), `raw_exp_varat_reads_like_var` (VarAt(n,Pre) == Var n, same interned
+    id 0), `raw_exp_bool_literal` (true→1, false→0).
+
+  **Verified** — `cargo test -p lean_verify --lib` = **331 passed / 0 failed**
+  (327 baseline + 4). Non-test `cargo build -p lean_verify` clean (only
+  pre-existing warnings). Verdict-neutral by construction: `raw_exp` is still
+  dead (nothing in the emit path calls it), so no cert emission changed; the W3
+  tgt gate + e2e suite are unaffected. This turn touched ONLY the reference-side
+  transcription — no tactus-core churn, no goal-side change, no emit wiring.
+
+  **Precise state for the next instance (what 2b-2 must add):**
+  - **Reference `raw_exp` still fails-loud on G3/G6** — `ExpX::UnaryOpr(Field |
+    HasType, _)` hits the `_ => Err("raw-unaryopr")` arm (the census tag is now
+    slightly coarse: post-G0 the remaining unaryopr fails are exactly Field /
+    HasType / IsVariant / IntegerTypeBound / etc. — worth sharpening
+    `exp_construct_tag` when G3/G6 land). G3 (`RawExp::Field`) + G6
+    (`RawExp::HasType`) reference arms are the remaining coverable shapes; G2
+    (TyRef→deref) is handled by `render_exp`, so `raw_exp` needs no G2 arm (the
+    `&T`-arg tag flows through `typ_data`'s `TyRef`). Priority: G6 (unlocks the
+    arith fns) then G3 (datatype/struct/tuple fns).
+  - **Goal-side `lexpr_to_exprdata` still rejects G1** — it fails
+    `LExpr::lit_bool` with `ed-litbool` (pinned by `lexpr_to_exprdata_census_
+    rejects`). So G1 is HALF-landed: the reference arm exists but a
+    `find_square`-style `ensures true` won't BRIDGE until the goal side gains a
+    matching `ExprNode::LitBool → ExprData.LitBool` arm (and that census-reject
+    test is updated). G0/G7 need NO goal-side change (Box/Unbox are SST-only,
+    absent from production LExpr; VarAt collapses to a bare `Var` the goal side
+    already maps to `ExprData::Atom`).
+  - **2b-2 = the emit-path gate.** Wire `raw_exp` into `oblig_leaf` +
+    `lexpr_to_exprdata` into `goal_data`, with the rule "go deep ONLY when BOTH
+    transcriptions succeed; else BOTH fall back to `atom_ob`/`Atom`" so a
+    ref-deep/goal-atom mismatch never silent-passes. Wrap the obligation
+    `RawExp` in `RawExp::Span` at the `oblig_leaf` level (raw SST has no
+    SpanMark node). This is where the deep bridge first catches Friction-2.
+
+  **Next = W6d.2b-2** (G6 + G3 reference arms + goal-side G1 arm, then the emit
+  gate) → **W6d.3** (rebuild + re-emit + probe9 + regenerate the golden). G4
+  (`Let`-in-leaf) → W6e.
 
 ## Writeup
 

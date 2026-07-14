@@ -351,3 +351,94 @@ fn lexpr_to_exprdata_census_rejects() {
     let bitand = LExpr::binop(L::BitAnd, LExpr::var_synthetic("a"), LExpr::var_synthetic("b"));
     assert_eq!(s.lexpr_to_exprdata(&bitand).unwrap_err(), "ed-binop-bitand");
 }
+
+// ── W6d.2b: raw_exp peel/alias arms (G0 Box/Unbox, G7 VarAt, G1 LitBool) ──
+//
+// The reference-side transcription (`ExpX → RawExp`) gained three arms this
+// step (still `#[allow(dead_code)]` — wiring them into the emit path with the
+// deep/atom fallback gate is a later W6d.2b sub-step). These pin the raw-SST
+// shapes the W6d.0 dump found dominating the fixture's obligation leaves: every
+// boxed value is `Box`/`Unbox`-wrapped (G0, the #1 unlock), ensures params read
+// as `VarAt(_, Pre)` not `Var` (G7), and `ensures true` literals are
+// `Const(Bool)` (G1).
+
+/// A dummy-span SST `Exp` carrying the given node + type.
+fn mk_exp(x: ExpX, typ: Typ) -> Exp {
+    use vir::ast::SpannedTyped;
+    std::sync::Arc::new(SpannedTyped { span: vir::messages::Span::dummy(), typ, x })
+}
+
+/// An `AirLocal` var ident — matches how production renders a binder, so the
+/// reference `binder_id` and the production-side atom intern the same text.
+fn tvar(name: &str) -> VarIdent {
+    VarIdent(std::sync::Arc::new(name.to_string()), vir::ast::VarIdentDisambiguate::AirLocal)
+}
+
+/// The spec `int` type.
+fn tint() -> Typ {
+    std::sync::Arc::new(TypX::Int(IntRange::Int))
+}
+
+/// G0 — `Box(Unbox(Var x))` peels transparently to the SAME `RawExp` as the
+/// bare `Var x`. The dump found these SMT coercion wrappers on every boxed
+/// value; peeling them is the #1 unlock (without it even `tri (1)` fails).
+#[test]
+fn raw_exp_peels_box_unbox() {
+    let mut s = Serializer::default();
+    let x = mk_exp(ExpX::Var(tvar("x")), tint());
+    let unboxed = mk_exp(ExpX::UnaryOpr(UnaryOpr::Unbox(tint()), x.clone()), tint());
+    let boxed = mk_exp(ExpX::UnaryOpr(UnaryOpr::Box(tint()), unboxed), tint());
+    let bare = s.raw_exp(&x).unwrap();
+    assert_eq!(s.raw_exp(&boxed).unwrap(), bare);
+    assert_eq!(bare, format!("({NS}.RawExp.Var 0 {NS}.TypData.TyInt)"));
+}
+
+/// G0 recurses through structure: a `Box`-wrapped operand inside a `+` peels,
+/// leaving both operands bare `Var`s (the shape spec-fn/arith leaves take). Add
+/// opcode = 6; result ty `TyInt`; operands intern a=0, b=1.
+#[test]
+fn raw_exp_peels_box_inside_binop() {
+    use vir::ast::{ArithOp, OverflowBehavior};
+    let mut s = Serializer::default();
+    let a = mk_exp(ExpX::Var(tvar("a")), tint());
+    let b = mk_exp(ExpX::Var(tvar("b")), tint());
+    let boxed_a = mk_exp(ExpX::UnaryOpr(UnaryOpr::Box(tint()), a), tint());
+    let sum = mk_exp(
+        ExpX::Binary(BinaryOp::Arith(ArithOp::Add(OverflowBehavior::Allow)), boxed_a, b),
+        tint(),
+    );
+    assert_eq!(
+        s.raw_exp(&sum).unwrap(),
+        format!(
+            "({NS}.RawExp.BinOp 6 {NS}.TypData.TyInt \
+               (Tactus.Box.mk ({NS}.RawExp.Var 0 {NS}.TypData.TyInt)) \
+               (Tactus.Box.mk ({NS}.RawExp.Var 1 {NS}.TypData.TyInt)))"
+        )
+    );
+}
+
+/// G7 — a pre-state param read `VarAt(n, Pre)` mirrors identically to a plain
+/// `Var n` (production collapses `VarAt` to a bare `Var`), interning the same
+/// binder id (0). The `Var` of the same ident reuses that id.
+#[test]
+fn raw_exp_varat_reads_like_var() {
+    use vir::ast::VarAt;
+    let mut s = Serializer::default();
+    let at = mk_exp(ExpX::VarAt(tvar("n"), VarAt::Pre), tint());
+    assert_eq!(s.raw_exp(&at).unwrap(), format!("({NS}.RawExp.Var 0 {NS}.TypData.TyInt)"));
+    let v = mk_exp(ExpX::Var(tvar("n")), tint());
+    assert_eq!(s.raw_exp(&v).unwrap(), format!("({NS}.RawExp.Var 0 {NS}.TypData.TyInt)"));
+}
+
+/// G1 — a source bool literal maps to `RawExp.LitBool` with the 0/1 nat
+/// encoding (no `bool` payload — a spec `bool` renders as `Prop` and sticks
+/// `decide`; W6d.1a design deviation 1). `true → 1`, `false → 0`.
+#[test]
+fn raw_exp_bool_literal() {
+    let mut s = Serializer::default();
+    let boolt: Typ = std::sync::Arc::new(TypX::Bool);
+    let t = mk_exp(ExpX::Const(Constant::Bool(true)), boolt.clone());
+    let f = mk_exp(ExpX::Const(Constant::Bool(false)), boolt);
+    assert_eq!(s.raw_exp(&t).unwrap(), format!("({NS}.RawExp.LitBool 1)"));
+    assert_eq!(s.raw_exp(&f).unwrap(), format!("({NS}.RawExp.LitBool 0)"));
+}

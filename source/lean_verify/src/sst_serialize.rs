@@ -188,7 +188,7 @@ use std::sync::Mutex;
 
 use vir::ast::{
     ArithOp, BinaryOp, Constant, InequalityOp, IntRange, KrateX, Typ, TypDecoration, TypX,
-    UnaryOp, VarIdent,
+    UnaryOp, UnaryOpr, VarIdent,
 };
 use vir::sst::{CallFun, Exp, ExpX, FuncCheckSst, FunctionSst, LoopInv, Stm, StmX};
 
@@ -548,11 +548,38 @@ impl<'a> Serializer<'a> {
     #[allow(dead_code)]
     fn raw_exp(&mut self, e: &Exp) -> Sr<String> {
         match &e.x {
+            // G0 (W6d.2b) — peel the SMT coercion wrappers FIRST. `Box(_)` /
+            // `Unbox(_)` are semantic-identity `int↔Boxed` casts the solver
+            // needs but that carry no expression content (the W6d.0 dump found
+            // them wrapping every boxed value — spec-fn args, datatype args,
+            // field results, tuple elements). Recurse into the inner and drop
+            // the wrapper, exactly as `typ_data` peels `Boxed`/`Decorate` at
+            // the type level; the inner node's own `typ` drives its tag. This
+            // is the #1 unlock — without it even `tri (1)` (a `Box[Nat] 1`
+            // arg) fails, so nothing downstream is reachable.
+            ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => self.raw_exp(inner),
             ExpX::Const(Constant::Int(n)) => {
                 let ty = self.typ_data(&e.typ)?;
                 Ok(format!("({}.RawExp.Lit {} {})", NS, n, paren(&ty)))
             }
-            ExpX::Var(vid) => {
+            // G1 (W6d.2b) — a source bool literal (`ensures true`, find_square).
+            // `RawExp::LitBool` carries the nat encoding (0/1), NOT a `bool`:
+            // the tactus Lean backend renders a spec `bool` as `Prop`, whose
+            // equality sticks `decide` (W6d.1a design deviation 1). `render_exp`
+            // passes it straight through to `ExprData::LitBool`.
+            ExpX::Const(Constant::Bool(b)) => {
+                Ok(format!("({}.RawExp.LitBool {})", NS, if *b { 1 } else { 0 }))
+            }
+            // G7 (W6d.2b) — a pre-state param read (`VarAt(vid, Pre)`), which
+            // ensures/decrease leaves use instead of a plain `Var`. Production's
+            // renderer collapses `VarAt(x, _)` to a bare `Var(x)`
+            // (`vir_expr_to_ast`), so mirror it identically to the `Var` arm:
+            // intern the SAME `binder_id`, read `e.typ`. (For an `&mut` param an
+            // ensures `VarAt` renders `x_at_pre_tactus`, not bare `x` — a
+            // divergence the W6d.2b emit-gate catches by falling both sides back
+            // to atom; the fixture's coverable fns take non-mut params, where
+            // the bare-`x` collapse matches.)
+            ExpX::Var(vid) | ExpX::VarAt(vid, _) => {
                 let id = self.binder_id(vid);
                 let ty = self.typ_data(&e.typ)?;
                 Ok(format!("({}.RawExp.Var {} {})", NS, id, paren(&ty)))
