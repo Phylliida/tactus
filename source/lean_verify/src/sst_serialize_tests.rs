@@ -330,6 +330,31 @@ fn lexpr_to_exprdata_deref_fieldproj() {
     );
 }
 
+/// W7 (bootstrap-34): a fn-headed multi-arg app (`lib.Point.mk a b`) is
+/// IN-class — it lowers to `ExprData.AppN fn (ExprList a b)`, the production
+/// twin of the reference `RawExp::CallN` (`render_exp` lowers both to `AppN`,
+/// keyed on the same interned fn id). Interning order: the head `lib.Point.mk`
+/// interns first (id 0), then the AppN arm builds the cons-list by folding the
+/// value args in REVERSE (`args.iter().rev()`) — so `b` interns to 1, `a` to 2,
+/// and the resulting list reads `a(2) :: b(1) :: Nil` (source order preserved).
+#[test]
+fn lexpr_to_exprdata_appn_multiarg() {
+    let mut s = Serializer::default();
+    let two = LExpr::app(
+        LExpr::var_synthetic("lib.Point.mk"),
+        vec![LExpr::var_synthetic("a"), LExpr::var_synthetic("b")],
+    );
+    assert_eq!(
+        s.lexpr_to_exprdata(&two).unwrap(),
+        "(lib.ExprData.AppN 0 \
+           (Tactus.Box.mk (lib.ExprList.Cons \
+             (Tactus.Box.mk (lib.ExprData.Atom 2)) \
+             (Tactus.Box.mk (lib.ExprList.Cons \
+               (Tactus.Box.mk (lib.ExprData.Atom 1)) \
+               (Tactus.Box.mk lib.ExprList.Nil))))))"
+    );
+}
+
 /// Out-of-class nodes and multi-arg apps fail loud with sharp `ed-<k>` census
 /// tags — the same fail-loud discipline as the statement walk.
 #[test]
@@ -344,12 +369,18 @@ fn lexpr_to_exprdata_census_rejects() {
             .unwrap_err(),
         "ed-unop"
     );
-    // A 2-arg application (e.g. `lib.Point.mk a b`) is not the single-arg class.
-    let two = LExpr::app(
-        LExpr::var_synthetic("lib.Point.mk"),
+    // A multi-arg app with a NON-fn head (`(*t) a b` — the head is a field
+    // projection, not a `Var`/`App{Var,..}` fn name) is still out of class: the
+    // multi-arg AppN arm's `app_head_fn_name` returns `None` → `ed-app-head`.
+    // (bootstrap-34 widened the App arm so a *fn-headed* multi-arg app is now
+    // IN-class, lowering to `ExprData.AppN` — see the positive
+    // `lexpr_to_exprdata_appn_multiarg` test. bootstrap-43 refocused this
+    // rejection onto the non-fn-head case, which the census still enforces.)
+    let bad_head = LExpr::app(
+        LExpr::field_proj(LExpr::var_synthetic("t"), "deref"),
         vec![LExpr::var_synthetic("a"), LExpr::var_synthetic("b")],
     );
-    assert_eq!(s.lexpr_to_exprdata(&two).unwrap_err(), "ed-app-arity");
+    assert_eq!(s.lexpr_to_exprdata(&bad_head).unwrap_err(), "ed-app-head");
     // A bitwise binop is outside the cast class (both sides reject).
     let bitand = LExpr::binop(L::BitAnd, LExpr::var_synthetic("a"), LExpr::var_synthetic("b"));
     assert_eq!(s.lexpr_to_exprdata(&bitand).unwrap_err(), "ed-binop-bitand");
