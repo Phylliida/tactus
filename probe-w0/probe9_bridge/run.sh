@@ -42,9 +42,15 @@ export LEAN_PATH="$CORE_OUT:$PRELUDE"
 # production's WpCtx postcondition ctx — so the ensures `*t` derefs to `t.deref`
 # and the obligation leaf cancels across the bridge (old leaf 3 vs 6 → one leaf).
 # Removed from the honest-fail set; it must now close-ok like the other fixtures.
+# NOTE (bootstrap-24 G4.3, 2026-07-14): max_u64 was FIXED by the W6e value-if-lift
+# recompute. The serializer now recomputes the branch-folded implication
+# obligations `Ret([x<y -> let r:=(let m:=y;m); r≥x∧r≥y, ¬(x<y) -> …], RetNone)`
+# (`lift_if_raw`, mirroring production's `lift_if_value_coerced`) and deepens the
+# matching `Implies`-topped goal leaves (`lexpr_to_exprdata` Let/Not arms), so the
+# FROZEN refWp reproduces production's two branch-split goals. Removed from the
+# honest-fail set; it must now close-ok. (Pinned end-to-end by probe14.)
 honest_fail_reason() {
   case "$1" in
-    max_u64)   printf '%s' 'branch-in-leaf: frontend lifts the fall-through if INTO the ensures leaf [x<y -> let r:=...]; refWp folds the raw per-ensures leaves. DESIGN 2.4.1.' ;;
     # count_down: FIXED by bootstrap-19 (2026-07-15). The two-way If-join
     # (both branches fall through to a common Ret) is now desugared IN THE
     # SERIALIZER (Option 2): `Seq(If(t,e), rest)` → `If(t;rest, e;rest)`, so
