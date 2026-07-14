@@ -180,6 +180,73 @@ unchanged vs. a no-bridge run.
   lack obligation-cert-emitting exec fns, and could be circular. A cleaner
   unblock is just fixing `bootstrap-40`. Left as a note for the next instance.
 
+## Progress (cont.) — DECIDE-FLIP DIAGNOSED (opus-bootstrap43-census, 2026-07-14)
+
+**The `0 passed, 1 failed` is NOT an olean mismatch or a decide-line diff. The
+two certs are DIFFERENT CHECKS, and the in-gate one correctly flags a known
+`&`-deref divergence class.** Both leads in the "next instance" list below are
+red herrings — resolved by comparing the two certs directly (no heavy run):
+
+- **probe11 external cert** (`probe-w0/probe11_w3_tgt/out/lib/cert/runtime__impl__4__clone.cert.lean`,
+  Jul 13) certifies with **OPAQUE LEAVES** — `_sst = StmData.Ret (LeafList.Cons 3
+  …) (RetLet 4 5)`, `_goals = GoalData.All 0 1 (GoalData.Let 4 5 (GoalData.Leaf
+  3))`. That's stage-A **assembly** only; leaf 3 (`_return = self.deref`) is an
+  opaque id, never expanded. probe11's `close-ok` ran `stm_size`/`goal_count`
+  decides, NOT `goals_eq (ref_wp …)` over expanded leaves.
+- **in-gate cert** (`/tmp/w4a-bs47b/lib/bridge/Bridge_runtime__impl__4__clone.lean`,
+  Jul 14, newer binary) emits the **EXPANDED W6/W7 form** — `_sst` is a full
+  `RawExp.Span 6 (RawExp.BinOp 0 TyBool (RawExp.Var 4 (TyNamed 5)) (RawExp.Var 0
+  (TyRef 5)))`; `_goals = GoalData.LeafE (ExprData.SpanMark 6 (ExprData.BinOp 0
+  (Atom 4) (FieldProj (Atom 0) 0)))`; the bridge decides `goals_eq (ref_wp ctx
+  sst) goals` over the fully-expanded trees (line 40).
+
+**Root cause of the fail (exact term-level divergence):**
+- `ref_wp(sst)` on the BinOp RHS: `render_exp (RawExp.Var 0 (TyRef 5))` =
+  `ExprData.Atom 0`. `render_exp` maps `RawExp.Var id _ty => ExprData.Atom id`
+  (`tactus-core/out/lib/expr_mirror_kernel_computes.lean:65`) — it **ignores the
+  type tag**; only an explicit `RawExp.Deref` node becomes a `FieldProj`.
+- production `_goals` RHS: `ExprData.FieldProj (Atom 0) 0` (`self.deref` — the
+  `&self`-param auto-deref).
+- `Atom 0 ≠ FieldProj (Atom 0) 0` → `expr_eq = 0` → `goals_eq = 0` → decide = 0.
+
+**Why the reference side dropped the deref (and why the emit-gate didn't catch
+it):** the raw SST at that position is a bare `ExpX::Var(self)` with a `&`(Ref)
+type, NOT an explicit `UnaryOpr::Field(deref)` node. Production's goal walk
+(`to_lean_sst_expr`) AUTO-INSERTS the `.deref` FieldProj via `apply_deref_chain`;
+`raw_exp` (`sst_serialize.rs:666`) faithfully mirrors the bare `Var` →
+`RawExp.Var id (TyRef _)` (in-class, no fail-loud). The documented emit-gate that
+keeps `&`-deref divergences fail-loud (`sst_serialize.rs:766-769`) fires on the
+`UnaryOpr::Field` arm — but there's no Field node here, so it never trips. Net:
+the reference emits an in-class ref-typed `Var`, production emits the deref,
+`render_exp` (no type-driven auto-deref) preserves the split → **the bridge
+CORRECTLY reports a true divergence.** It is not a false negative.
+
+**Consequence for this card's done-criterion.** "in-gate note matches probe11's
+`1 passed`" is apples-to-oranges: probe11's cert never ran the expanded leaf
+check. `runtime__impl__4__clone` is a `&self`-deref clone → it lives in the
+**known-divergent `&`-deref class**, so the expanded bridge will `1 failed` on it
+by design until the deref gap is closed. There is NO expanded-form `1 passed` to
+be had on this particular cert. (This also corrects the card's "Corpus fact":
+that cert is bridgeable but NOT closeable in expanded form.)
+
+**FORK for Danielle (recorded; her call — she offered to weigh in on the
+runtime__impl failures):**
+- **(A) Re-scope W4a.** Accept the in-gate expanded bridge is working correctly
+  (it flags the known `&`-deref divergence), treat W4a as validated by the
+  fixture (3/3 in-gate close) + this diagnosis, and for a real in-gate `1 passed`
+  demo either author/find a tgt exec fn in the *coverable* class (no `&`-deref)
+  or gate W4c with the `&`-deref class explicitly excluded (fail-loud, not
+  silent). Lower effort; no TCB change.
+- **(B) Close the deref gap** (unblocks the whole `&self`-method class, common in
+  tgt `runtime`). Reproduce production's `apply_deref_chain` on the reference
+  side. Two spots: (B1) `render_exp` — add `RawExp.Var id (TyRef _) => FieldProj
+  (Atom id) deref_field` (type-driven, shared, mirrors the `needs_nat_coercion`
+  pattern); or (B2) `raw_exp` — wrap ref-typed deref positions in `RawExp.Deref`.
+  ⚠ SOUNDNESS: (B1) touches the TCB reference lowering — it asserts "a `TyRef`
+  Var in value position is ALWAYS an auto-deref," which must be validated against
+  positions where a `&T` var is used AS a reference (not deref'd). Needs care +
+  a rebuild + a heavy in-gate re-run to confirm the decide flips to pass.
+
 ## Status for the next instance
 
 **UPDATE 2026-07-14 (opus-bootstrap47-mono): DEFS-FAMILY BLOCKER CHAIN CLEARED —
