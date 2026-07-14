@@ -425,7 +425,7 @@ fn krate_preamble(
         .chain(bc_lemma_funcs.iter().copied())
         .collect();
     if defs.is_none() {
-        cmds.extend(spec_world_cmds(krate, &ectx, &dep_walk_roots, emit_accessors, &bc_lemma_funcs, false));
+        cmds.extend(spec_world_cmds(krate, crate_name, &ectx, &dep_walk_roots, emit_accessors, &bc_lemma_funcs, false));
     }
     // (defs mode: bc axioms come from the defs module's import — the
     // union emitted there is a superset of this fn's collected set.)
@@ -541,8 +541,70 @@ fn spec_fn_refs(f: &FunctionX) -> Vec<Fun> {
     refs.into_iter().cloned().collect()
 }
 
+// ── W7d (bootstrap-33): defs-layer certificate wire helpers ──────────────
+//
+// The generate-side glue between spec-fn / datatype emission and the
+// flag-gated `sst_serialize::emit_def_cert` / `emit_dt_cert` writers. Both
+// are no-ops unless `--tactus-emit-cert`; the fail-loud + census discipline
+// (an uncertifiable poly/curried/struct fixture is logged + skipped, never
+// aborts the run) lives inside the `emit_*` entry points.
+
+/// Emit the defs-layer `def_eq` certificate for a spec fn whose emitted
+/// commands include a plain `@[reducible] def`. Only the `Command::Def` form
+/// bridges — a `DefCurried` (structural-recursion curried form) or an `Axiom`
+/// (bodyless / `eq_def` / builtin-bodied spec fn) has no `ldef_to_defdata`
+/// mirror and is skipped. `augmented` is the same `FunctionX`
+/// `spec_fn_to_ast` lowered, so its VIR fields correspond to that exact def.
+fn maybe_emit_def_cert(augmented: &FunctionX, emitted: &[Command], crate_name: &str) {
+    if !crate::sst_serialize::cert_emit_enabled() {
+        return;
+    }
+    let def = match emitted.iter().find_map(|c| match c {
+        Command::Def(d) => Some(d),
+        _ => None,
+    }) {
+        Some(d) => d,
+        None => return,
+    };
+    // A `Command::Def` implies a body (bodyless spec fns emit an `Axiom`);
+    // guard anyway so the `&VirExpr` hand-off is total.
+    let body = match &augmented.body {
+        Some(b) => b,
+        None => return,
+    };
+    crate::sst_serialize::emit_def_cert(
+        crate_name,
+        &augmented.name,
+        &augmented.typ_params,
+        &augmented.params,
+        &augmented.ret.x.typ,
+        body,
+        def,
+    );
+}
+
+/// Collect every emitted `Command::Datatype` (recursing into `mutual` blocks)
+/// so the W7d dt-cert pass can pair each VIR datatype with its rendered form.
+fn collect_emitted_datatypes<'a>(
+    cmds: &'a [Command],
+    out: &mut Vec<&'a crate::lean_ast::Datatype>,
+) {
+    for c in cmds {
+        match c {
+            Command::Datatype(d) => out.push(d),
+            Command::Mutual(inner) => collect_emitted_datatypes(inner, out),
+            _ => {}
+        }
+    }
+}
+
 pub(crate) fn spec_world_cmds(
     krate: &KrateX,
+    // W7d: the crate name (unsanitized) — threaded only to reach the
+    // flag-gated `emit_def_cert`/`emit_dt_cert` defs-layer cert writers, which
+    // key their `{crate}/cert/` output dir on `sanitize(crate_name)`. Verdict-
+    // neutral: a no-op unless `--tactus-emit-cert`.
+    crate_name: &str,
     ectx: &crate::emit_ctx::EmitCtx,
     dep_walk_roots: &[&FunctionX],
     emit_accessors: bool,
@@ -560,11 +622,14 @@ pub(crate) fn spec_world_cmds(
     // tripwires keep guarding per-fn emission.
     lenient: bool,
 ) -> Vec<Command> {
-    spec_world_cmds_tagged(krate, ectx, dep_walk_roots, emit_accessors, bc_lemma_funcs, lenient).0
+    spec_world_cmds_tagged(krate, crate_name, ectx, dep_walk_roots, emit_accessors, bc_lemma_funcs, lenient).0
 }
 
 pub(crate) fn spec_world_cmds_tagged(
     krate: &KrateX,
+    // W7d: unsanitized crate name for the defs-layer cert writers (see
+    // `spec_world_cmds`). Flag-gated no-op unless `--tactus-emit-cert`.
+    crate_name: &str,
     ectx: &crate::emit_ctx::EmitCtx,
     dep_walk_roots: &[&FunctionX],
     emit_accessors: bool,
@@ -1022,6 +1087,28 @@ pub(crate) fn spec_world_cmds_tagged(
             &mut || to_lean_fn::datatype_group_to_cmds(&group, emit_accessors, &external_body_paths));
     }
 
+    // W7d: emit the defs-layer `dt_eq` certificate for each datatype that
+    // was actually emitted as an `inductive` above. A flag-gated no-op (the
+    // default emit path is untouched); the reference transcriber gates
+    // poly/tuple/struct fixtures fail-loud + census inside `emit_dt_cert`.
+    // Done as a post-loop pass (not inside the loop closure) purely so the
+    // group-emit line stays byte-identical; matched by rendered name against
+    // the just-pushed `Command::Datatype`s so a mutual SCC pairs correctly.
+    if crate::sst_serialize::cert_emit_enabled() {
+        let mut emitted_dts: Vec<&crate::lean_ast::Datatype> = Vec::new();
+        collect_emitted_datatypes(&cmds, &mut emitted_dts);
+        for dtx in referenced_dts.iter() {
+            let want = match &dtx.name {
+                Dt::Path(p) => crate::to_lean_type::lean_name(p),
+                Dt::Tuple(_) => continue,
+            };
+            if let Some(dt) = emitted_dts.iter().find(|d| d.name == want) {
+                crate::sst_serialize::emit_dt_cert(
+                    crate_name, &dtx.name, &dtx.typ_params, &dtx.variants, dt);
+            }
+        }
+    }
+
     // TraitMethodImpl spec fns ARE emitted as standalone defs in
     // addition to their Instance method. This is the canonical Lean
     // idiom for instance fields with interdependencies: define a
@@ -1322,7 +1409,13 @@ pub(crate) fn spec_world_cmds_tagged(
                     }));
                     step_pushed = push_lenient(&mut cmds, "spec fn", &mut || {
                         let augmented = augment(f);
-                        to_lean_fn::spec_fn_to_ast(&augmented, ectx)
+                        let out = to_lean_fn::spec_fn_to_ast(&augmented, ectx);
+                        // W7d: emit the defs-layer `def_eq` cert for the
+                        // emitted `def` (flag-gated no-op; fail-loud + census
+                        // inside `emit_def_cert`). Inside the closure so the
+                        // panic-catch wraps it too.
+                        maybe_emit_def_cert(&augmented, &out, crate_name);
+                        out
                     });
                     segs.push((cmds.len(), DefsSeg::Base));
                     }
@@ -1360,7 +1453,10 @@ pub(crate) fn spec_world_cmds_tagged(
                         let inner: Vec<Command> = fns.iter()
                             .flat_map(|f| {
                                 let augmented = augment(f);
-                                to_lean_fn::spec_fn_to_ast(&augmented, ectx)
+                                let out = to_lean_fn::spec_fn_to_ast(&augmented, ectx);
+                                // W7d: per-fn `def_eq` cert (flag-gated no-op).
+                                maybe_emit_def_cert(&augmented, &out, crate_name);
+                                out
                             })
                             .collect();
                         vec![Command::Mutual(inner)]
