@@ -1,9 +1,9 @@
 ---
 title: "W7b — land the frozen defs-layer vocabulary in tactus-core (one batched cache-churning edit)"
-status: todo
-claimed_by:
+status: in_progress
+claimed_by: opus-w7b
 created: 2026-07-14T23:00:00Z
-updated: 2026-07-14T23:00:00Z
+updated: 2026-07-14T14:20:00Z
 ---
 
 ## Description
@@ -58,6 +58,58 @@ bridge), W7e (mutation-kill).
   `probe15_w7a_defs.lean`; the Lean mirror is a near-1:1 template for the Rust
   enums (translate `inductive`→`enum`, `List Nat`→a binder-id list type, the
   mutual list inductives→`Box`-nested `enum`s like `RawExpList`).
+
+- (2026-07-14, opus-w7b) **CLAIMED + DE-RISKED the mutual-recursion crux before
+  touching the shared crate** (the W7a "de-risk the novel mechanic first"
+  discipline). The whole W7b edit rests on Verus accepting a MUTUAL
+  `structural_decreases` render/eq/size across the `ExprData ↔ ArmList` Match
+  cycle — but `tactus-core/lib.rs:12-17` explicitly says
+  `structural_decreases` covers ONLY single-fn recursion, and W7a only verified
+  the LEAN side (hand-written `mutual`), not the Verus emission. Ran two
+  standalone Verus probes (`tactus-core/probe_mutual{,2}.rs`, fork verus
+  `--lean-backend --lean-all-proofs`, out in `out_probe{,2}/`). **Final probe:
+  6 verified, 0 errors, package gate kernel-verified.** Four real gotchas found
+  — each would have broken the batched edit mid-way (cache re-churn):
+  1. **✅ Verus DOES accept mutual `structural_decreases` across nested
+     datatypes.** The preamble's "single-fn only" note is conservative/stale.
+     Emits `termination_by structural`, kernel-reduces under `decide` (mutual
+     `expr_size` AND mutual `expr_eq` both confirmed, `#print axioms` clean).
+  2. **⚠ Single-variant enums are the trap.** A single-variant Rust enum
+     (`enum Arm { Arm(..) }`) lowers to a Lean `structure` (ctor `.mk`), but the
+     AUTO-generated `.height` measure references the Rust *variant* name
+     (`Arm.Arm`) → `Invalid pattern: Expected a constructor marked with
+     [match_pattern]` → poisons the whole file → every proof gets `sorry`. FIX:
+     **never use a single-variant enum**; INLINE the arm fields into
+     `ArmList::Cons(u64 ctor, BinderIdList binds, Box<ExprData> body,
+     Box<ArmList> tail)` — the crate's own `BinderList::Cons(u64,u64,Box<..>)`
+     idiom. Clean 2-type cycle `ExprData ↔ ArmList`, no `MatchArm`/`RawArm` type.
+  3. **⚠ W7a's frozen `arms_eq` did NOT actually validate the mutual eq.** Its
+     `arm_eq` compared arm bodies with Lean's DERIVED `DecidableEq` `=`
+     (`marm_body a = marm_body b`), sidestepping the `arms_eq → expr_eq`
+     recursion. The genuine mutual nat-returning `expr_eq ↔ arms_eq` (arms_eq
+     recurses into expr_eq on bodies) was UNPROVEN by W7a. I validated it
+     independently (`/tmp/mut_eq4.lean` + probe_mutual2): it decide-reduces,
+     axioms clean, binder-id-mismatch kill correctly flips to 0. **W7b uses the
+     genuine mutual eq (NOT derived `=`)** — the crate's `expr_eq` is
+     nat-returning tag+projection, so the derived-`=` shortcut isn't available
+     and isn't needed.
+  4. **⚠ Nested `match` on the 2nd arg breaks Lean structural-recursion
+     inference in emission** (`failed to infer structural recursion / Missing
+     cases / Redundant alternative`). ALL eq fns — including binder-list eq —
+     must follow the crate's `goal_eq`/`expr_eq` idiom: match the FIRST arg
+     only, read the 2nd through NON-recursive tag+projection accessors
+     (`bil_is_nil`/`bil_hd`/`bil_tl` etc.), arm bodies a chain of `if`s. (This
+     is exactly WHY the crate hand-writes that idiom instead of nested match.)
+  - **Validated template lives in `tactus-core/probe_mutual2.rs`** (the exact
+     datatypes + spec-fn idioms to lift into lib.rs). Probe files +
+     `out_probe*/` are throwaway (deleted before the real commit).
+  - **NEXT:** land the vocabulary into `lib.rs` per §Description, using the
+     inline-arm shape (gotcha 2) + genuine mutual eq (gotcha 3) + projection
+     idiom (gotcha 4). Verify with:
+     `TACTUS_LEAN_OUT=$PWD/out ../source/target-verus/release/verus
+     --crate-type=lib --lean-backend --lean-all-proofs lib.rs` (from
+     `tactus-core/`; toolchain confirmed ready — verus Jul 14, lean 4.25.0,
+     vstd.vir + prelude cache present). Then re-emit oleans + rerun probe9/13/14.
 
 ## Writeup
 

@@ -86,6 +86,16 @@ pub enum LeafList {
     Cons(u64, Box<LeafList>),
 }
 
+// W7: a list of interned binder ids — the bound-var ids of a `match` arm
+// (`Leaf v` binds `[v]`, `Node l r` binds `[l, r]`, wildcards get a canonical
+// positional id). A DEDICATED u64-list (not `LeafList`) so arm-binder lists
+// stay their own certifiable surface (the crate's one-type-per-role idiom).
+// Self-recursive only — no `structural_decreases` needed on its `_len`.
+pub enum BinderIdList {
+    Nil,
+    Cons(u64, Box<BinderIdList>),
+}
+
 // ── Binder lists: (binder id, typ/kind leaf) pairs, self-recursive ──
 // Reused for value-param telescopes, typ-param telescopes (kind leaf in
 // the second slot), and Loop loop-state binders.
@@ -266,6 +276,12 @@ pub enum TypData {
     TyBool,
     TyNamed(u64),
     TyRef(u64),
+    // W7: a `Box<T>` datatype field type (`Node (val0 : Tactus.Box lib.Tree)`),
+    // kept DISTINCT from `TyRef` (`&T` borrow). Box (owned heap) and Ref deref
+    // identically but are semantically distinct — conflating them would let a
+    // Box/Ref field swap pass the bridge (W7a §7 Q4 verdict). Carries the
+    // pointee's interned id, non-recursive (like TyRef).
+    TyBox(u64),
 }
 
 /// Which materialized cast a `Cast` node denotes.
@@ -300,6 +316,38 @@ pub enum ExprData {
     Let(u64, Box<ExprData>, Box<ExprData>),
     // G4: unary logical negation `¬ e` — max_u64's `¬(x < y)` branch guard.
     Not(Box<ExprData>),
+    // ── W7 body constructors (frozen by probe15_w7a_defs; the mutual cycle +
+    //    eq/size idioms validated in-crate by probe_mutual2) ──
+    // First-class `if c then t else e`. W6 G4 folded goal-side If→Let, but a
+    // spec-fn BODY needs the raw if (e.g. `tri(n) = if n=0 then 0 else …`).
+    Ite(Box<ExprData>, Box<ExprData>, Box<ExprData>),
+    // `match scrut with <arms>` — inductive spec fns are match-bodied. Arms are
+    // INLINED into `ArmList::Cons` (the `BinderList::Cons` idiom), NOT a
+    // single-variant `MatchArm` enum: such an enum lowers to a Lean `structure`
+    // whose auto-generated `.height` mis-names the ctor (`Arm.Arm` vs `Arm.mk`)
+    // → `Invalid pattern`. `ExprData ↔ ArmList` is the one W7 datatype cycle.
+    Match(Box<ExprData>, Box<ArmList>),
+    // Multi-arg application `f a b c` (W6 `App` was single-arg). Args in a
+    // dedicated `ExprList` (the second mutual cycle `ExprData ↔ ExprList`).
+    AppN(u64, Box<ExprList>),
+    // Quantifier nodes `∀/∃ (bid : bty), body`. `GoalData::All` is goal-level
+    // only; a spec-fn body quantifier needs its own expression node.
+    Forall(u64, TypData, Box<ExprData>),
+    Exists(u64, TypData, Box<ExprData>),
+}
+
+// W7: match arms, INLINED (ctor id, bound-var ids, arm body, tail). Mutually
+// recursive with `ExprData` via the boxed body. No separate `MatchArm` type
+// (see the `Match` variant comment). Cf. `BinderList::Cons(u64,u64,Box<..>)`.
+pub enum ArmList {
+    Nil,
+    Cons(u64, BinderIdList, Box<ExprData>, Box<ArmList>),
+}
+
+// W7: the multi-arg `AppN` argument list. Mutually recursive with `ExprData`.
+pub enum ExprList {
+    Nil,
+    Cons(Box<ExprData>, Box<ExprList>),
 }
 
 /// The NEW independent input: the raw SST expression tree, mirrored to data
@@ -334,6 +382,29 @@ pub enum RawExp {
     Let(u64, Box<RawExp>, Box<RawExp>),
     Not(Box<RawExp>),
     Span(u64, Box<RawExp>),
+    // ── W7 body constructors (raw side). `ite`/`matchR`/`callN` carry the
+    //    branch / arm-body / value RESULT type so `render_exp` can materialize
+    //    the `as nat` coercion there (parallel to `BinOp`'s result-type slot).
+    //    No `HasType` addition — the unsigned-overflow refinement is an
+    //    obligation-goal construct, already present, not a body construct. ──
+    Ite(TypData, Box<RawExp>, Box<RawExp>, Box<RawExp>),       // ty = branch result type
+    MatchR(Box<RawExp>, Box<RawArmList>, TypData),            // scrut, arms, arm-body result ty
+    CallN(u64, TypData, Box<RawList>),                        // fn, ret ty, args
+    ForallR(u64, TypData, Box<RawExp>),
+    ExistsR(u64, TypData, Box<RawExp>),
+}
+
+// W7: the raw (VIR-transcribed) match-arm list, mirroring `ArmList` with a
+// `RawExp` body. Inlined arm fields (ctor, binds, body, tail).
+pub enum RawArmList {
+    Nil,
+    Cons(u64, BinderIdList, Box<RawExp>, Box<RawArmList>),
+}
+
+// W7: the raw multi-arg argument list, mirroring `ExprList`.
+pub enum RawList {
+    Nil,
+    Cons(Box<RawExp>, Box<RawList>),
 }
 
 // ── W6d.1b-ii: lists of DEEP obligations (Call.reqs / Ret.es) ────────
@@ -548,6 +619,48 @@ pub open spec fn expr_size(e: ExprData) -> nat
         ExprData::SpanMark(_loc, t) => 1 + expr_size(*t),
         ExprData::Let(_n, v, bd) => 1 + expr_size(*v) + expr_size(*bd),
         ExprData::Not(t) => 1 + expr_size(*t),
+        // W7 body constructors. `Match`/`AppN` recurse through the arm/expr
+        // list measures (the mutual group); binder ids are leaves (not sized).
+        ExprData::Ite(c, t, e) => 1 + expr_size(*c) + expr_size(*t) + expr_size(*e),
+        ExprData::Match(s, arms) => 1 + expr_size(*s) + arms_size(*arms),
+        ExprData::AppN(_fn, args) => 1 + exprlist_size(*args),
+        ExprData::Forall(_bid, _bty, body) => 1 + expr_size(*body),
+        ExprData::Exists(_bid, _bty, body) => 1 + expr_size(*body),
+    }
+}
+
+// W7: the arm-list / expr-list spine measures, MUTUALLY recursive with
+// `expr_size` (validated in-crate by probe_mutual2 — Verus accepts mutual
+// `structural_decreases` across the `ExprData ↔ ArmList`/`ExprList` cycles;
+// the emitted `termination_by structural` kernel-reduces under `decide`).
+#[verifier::structural_decreases]
+pub open spec fn arms_size(a: ArmList) -> nat
+    decreases a
+{
+    match a {
+        ArmList::Nil => 0,
+        ArmList::Cons(_c, _bs, body, tl) => 1 + expr_size(*body) + arms_size(*tl),
+    }
+}
+
+#[verifier::structural_decreases]
+pub open spec fn exprlist_size(l: ExprList) -> nat
+    decreases l
+{
+    match l {
+        ExprList::Nil => 0,
+        ExprList::Cons(h, t) => 1 + expr_size(*h) + exprlist_size(*t),
+    }
+}
+
+// W7: length of a binder-id list (leaf list; self-recursive, no mutual group).
+#[verifier::structural_decreases]
+pub open spec fn binder_id_list_len(b: BinderIdList) -> nat
+    decreases b
+{
+    match b {
+        BinderIdList::Nil => 0,
+        BinderIdList::Cons(_id, t) => 1 + binder_id_list_len(*t),
     }
 }
 
@@ -560,6 +673,7 @@ pub open spec fn typ_size(t: TypData) -> nat {
         TypData::TyBool => 1,
         TypData::TyNamed(_) => 1,
         TypData::TyRef(_) => 1,
+        TypData::TyBox(_) => 1,
     }
 }
 
@@ -571,6 +685,7 @@ pub open spec fn td_tag(t: TypData) -> nat {
         TypData::TyBool => 2,
         TypData::TyNamed(_) => 3,
         TypData::TyRef(_) => 4,
+        TypData::TyBox(_) => 5,
     }
 }
 
@@ -582,11 +697,34 @@ pub open spec fn td_tag(t: TypData) -> nat {
 pub open spec fn deref_type(t: TypData) -> TypData {
     match t {
         TypData::TyRef(inner) => TypData::TyNamed(inner),
+        // W7: `Box<T>` derefs to its pointee `T`, same as `&T` (semantically
+        // distinct owner vs borrow, but identical deref presentation).
+        TypData::TyBox(inner) => TypData::TyNamed(inner),
         TypData::TyInt => TypData::TyInt,
         TypData::TyNat => TypData::TyNat,
         TypData::TyBool => TypData::TyBool,
         TypData::TyNamed(n) => TypData::TyNamed(n),
     }
+}
+
+// W7: the interned id a type carries (0 for the nullary types). Paired with
+// `td_tag` for structural type equality — `TyBox(5)` vs `TyRef(5)` differ by
+// tag (5 vs 4), `TyNamed(5)` vs `TyNamed(7)` differ by id.
+pub open spec fn td_id(t: TypData) -> u64 {
+    match t {
+        TypData::TyNamed(n) => n,
+        TypData::TyRef(n) => n,
+        TypData::TyBox(n) => n,
+        _ => 0,
+    }
+}
+
+// W7: nat-returning type equality (the `Forall`/`Exists` binder-type compare
+// + the def-header layer). Tag + carried-id, no recursion (TypData is flat).
+pub open spec fn typ_eq(a: TypData, b: TypData) -> nat {
+    if td_tag(a) == td_tag(b) {
+        if td_id(a) == td_id(b) { 1 } else { 0 }
+    } else { 0 }
 }
 
 // The rendered type a raw node presents to its parent. Crucially a
@@ -612,6 +750,13 @@ pub open spec fn type_of(re: RawExp) -> TypData
         RawExp::Let(_name, _val, body) => type_of(*body),
         RawExp::Not(_e) => TypData::TyBool,
         RawExp::Span(_loc, e) => type_of(*e),
+        // W7: `ite`/`matchR`/`callN` present their carried result type in one
+        // step (no recursion into arms/branches); quantifiers are propositions.
+        RawExp::Ite(ty, _c, _t, _e) => ty,
+        RawExp::MatchR(_scrut, _arms, ty) => ty,
+        RawExp::CallN(_fn, ret, _args) => ret,
+        RawExp::ForallR(_bid, _bty, _body) => TypData::TyBool,
+        RawExp::ExistsR(_bid, _bty, _body) => TypData::TyBool,
     }
 }
 
@@ -726,6 +871,56 @@ pub open spec fn render_exp(re: RawExp) -> ExprData
             ExprData::Let(name, Box::new(render_exp(*val)), Box::new(render_exp(*body))),
         RawExp::Not(e) => ExprData::Not(Box::new(render_exp(*e))),
         RawExp::Span(loc, e) => ExprData::SpanMark(loc, Box::new(render_exp(*e))),
+        // W7: first-class if. Cond is bool (never coerced); each branch is
+        // materialized iff it renders Int under a Nat result type (Friction-2,
+        // like BinOp operands). `tri`'s branches are already Nat → no cast.
+        RawExp::Ite(ty, c, t, e) => {
+            let t2 = coerce_if(needs_nat_coercion(type_of(*t), ty), render_exp(*t));
+            let e2 = coerce_if(needs_nat_coercion(type_of(*e), ty), render_exp(*e));
+            ExprData::Ite(Box::new(render_exp(*c)), Box::new(t2), Box::new(e2))
+        },
+        // W7: match. Scrutinee is never coerced; each arm body is materialized
+        // like an Ite branch (the carried result type `ty` flows into render_arms).
+        RawExp::MatchR(scrut, arms, ty) =>
+            ExprData::Match(Box::new(render_exp(*scrut)), Box::new(render_arms(*arms, ty))),
+        // W7: multi-arg app. Args rendered straight; per-arg expected-type
+        // coercion is deferred to W7c (no fixture body is multi-arg — §7 Q3).
+        RawExp::CallN(fnid, _ret, args) =>
+            ExprData::AppN(fnid, Box::new(render_list(*args))),
+        // W7: quantifiers pass the binder id + type through; body renders recursively.
+        RawExp::ForallR(bid, bty, body) =>
+            ExprData::Forall(bid, bty, Box::new(render_exp(*body))),
+        RawExp::ExistsR(bid, bty, body) =>
+            ExprData::Exists(bid, bty, Box::new(render_exp(*body))),
+    }
+}
+
+// W7: render the arm list, MUTUALLY recursive with `render_exp`. Binder ids
+// ride STRAIGHT THROUGH (the §7 Q1 discipline — reference and production must
+// intern arm-binder ids identically; a mismatch is a shape diff the bridge
+// catches). Each arm body is coerced at the carried result type `ty`, exactly
+// like an Ite branch.
+#[verifier::structural_decreases]
+pub open spec fn render_arms(a: RawArmList, ty: TypData) -> ArmList
+    decreases a
+{
+    match a {
+        RawArmList::Nil => ArmList::Nil,
+        RawArmList::Cons(c, bs, body, tl) =>
+            ArmList::Cons(c, bs,
+                Box::new(coerce_if(needs_nat_coercion(type_of(*body), ty), render_exp(*body))),
+                Box::new(render_arms(*tl, ty))),
+    }
+}
+
+// W7: render the multi-arg argument list, mutually recursive with `render_exp`.
+#[verifier::structural_decreases]
+pub open spec fn render_list(l: RawList) -> ExprList
+    decreases l
+{
+    match l {
+        RawList::Nil => ExprList::Nil,
+        RawList::Cons(h, t) => ExprList::Cons(Box::new(render_exp(*h)), Box::new(render_list(*t))),
     }
 }
 
@@ -757,6 +952,12 @@ pub open spec fn ed_tag(e: ExprData) -> nat {
         ExprData::LitBool(_) => 7,
         ExprData::Let(_, _, _) => 8,
         ExprData::Not(_) => 9,
+        // W7 body constructors.
+        ExprData::Ite(_, _, _) => 10,
+        ExprData::Match(_, _) => 11,
+        ExprData::AppN(_, _) => 12,
+        ExprData::Forall(_, _, _) => 13,
+        ExprData::Exists(_, _, _) => 14,
     }
 }
 pub open spec fn ed_atom_id(e: ExprData) -> u64 { match e { ExprData::Atom(x) => x, _ => 0 } }
@@ -778,6 +979,49 @@ pub open spec fn ed_let_name(e: ExprData) -> u64 { match e { ExprData::Let(n, _,
 pub open spec fn ed_let_val(e: ExprData) -> ExprData { match e { ExprData::Let(_, v, _) => *v, _ => ExprData::Atom(0) } }
 pub open spec fn ed_let_body(e: ExprData) -> ExprData { match e { ExprData::Let(_, _, b) => *b, _ => ExprData::Atom(0) } }
 pub open spec fn ed_not_e(e: ExprData) -> ExprData { match e { ExprData::Not(t) => *t, _ => ExprData::Atom(0) } }
+// W7: projections for the body constructors (read the 2nd `expr_eq` arg via
+// tag + NON-recursive accessors — the `goal_eq` idiom, no nested match).
+pub open spec fn ed_ite_c(e: ExprData) -> ExprData { match e { ExprData::Ite(c, _, _) => *c, _ => ExprData::Atom(0) } }
+pub open spec fn ed_ite_t(e: ExprData) -> ExprData { match e { ExprData::Ite(_, t, _) => *t, _ => ExprData::Atom(0) } }
+pub open spec fn ed_ite_e(e: ExprData) -> ExprData { match e { ExprData::Ite(_, _, el) => *el, _ => ExprData::Atom(0) } }
+pub open spec fn ed_match_scrut(e: ExprData) -> ExprData { match e { ExprData::Match(s, _) => *s, _ => ExprData::Atom(0) } }
+pub open spec fn ed_match_arms(e: ExprData) -> ArmList { match e { ExprData::Match(_, a) => *a, _ => ArmList::Nil } }
+pub open spec fn ed_appn_fn(e: ExprData) -> u64 { match e { ExprData::AppN(f, _) => f, _ => 0 } }
+pub open spec fn ed_appn_args(e: ExprData) -> ExprList { match e { ExprData::AppN(_, a) => *a, _ => ExprList::Nil } }
+pub open spec fn ed_forall_bid(e: ExprData) -> u64 { match e { ExprData::Forall(x, _, _) => x, _ => 0 } }
+pub open spec fn ed_forall_bty(e: ExprData) -> TypData { match e { ExprData::Forall(_, t, _) => t, _ => TypData::TyInt } }
+pub open spec fn ed_forall_body(e: ExprData) -> ExprData { match e { ExprData::Forall(_, _, b) => *b, _ => ExprData::Atom(0) } }
+pub open spec fn ed_exists_bid(e: ExprData) -> u64 { match e { ExprData::Exists(x, _, _) => x, _ => 0 } }
+pub open spec fn ed_exists_bty(e: ExprData) -> TypData { match e { ExprData::Exists(_, t, _) => t, _ => TypData::TyInt } }
+pub open spec fn ed_exists_body(e: ExprData) -> ExprData { match e { ExprData::Exists(_, _, b) => *b, _ => ExprData::Atom(0) } }
+// ArmList projections (read `arms_eq`'s 2nd arg): head ctor/binds/body + tail.
+pub open spec fn al_is_nil(a: ArmList) -> nat { match a { ArmList::Nil => 1, _ => 0 } }
+pub open spec fn al_hd_ctor(a: ArmList) -> u64 { match a { ArmList::Cons(c, _, _, _) => c, _ => 0 } }
+pub open spec fn al_hd_binds(a: ArmList) -> BinderIdList { match a { ArmList::Cons(_, bs, _, _) => bs, _ => BinderIdList::Nil } }
+pub open spec fn al_hd_body(a: ArmList) -> ExprData { match a { ArmList::Cons(_, _, b, _) => *b, _ => ExprData::Atom(0) } }
+pub open spec fn al_tl(a: ArmList) -> ArmList { match a { ArmList::Cons(_, _, _, t) => *t, _ => ArmList::Nil } }
+// ExprList projections (read `exprlist_eq`'s 2nd arg): head + tail.
+pub open spec fn el_is_nil(l: ExprList) -> nat { match l { ExprList::Nil => 1, _ => 0 } }
+pub open spec fn el_hd(l: ExprList) -> ExprData { match l { ExprList::Cons(h, _) => *h, _ => ExprData::Atom(0) } }
+pub open spec fn el_tl(l: ExprList) -> ExprList { match l { ExprList::Cons(_, t) => *t, _ => ExprList::Nil } }
+// BinderIdList projections + nat-returning equality (arm binder ids — the §7 Q1
+// discipline). Projection idiom (match first arg, read 2nd via accessors) —
+// a nested match on the 2nd arg breaks Lean structural-recursion inference.
+pub open spec fn bil_is_nil(b: BinderIdList) -> nat { match b { BinderIdList::Nil => 1, _ => 0 } }
+pub open spec fn bil_hd(b: BinderIdList) -> u64 { match b { BinderIdList::Cons(x, _) => x, _ => 0 } }
+pub open spec fn bil_tl(b: BinderIdList) -> BinderIdList { match b { BinderIdList::Cons(_, t) => *t, _ => BinderIdList::Nil } }
+#[verifier::structural_decreases]
+pub open spec fn bidl_eq(a: BinderIdList, b: BinderIdList) -> nat
+    decreases a
+{
+    match a {
+        BinderIdList::Nil => bil_is_nil(b),
+        BinderIdList::Cons(x, t) =>
+            if bil_is_nil(b) == 1 { 0 }
+            else if x == bil_hd(b) { bidl_eq(*t, bil_tl(b)) }
+            else { 0 },
+    }
+}
 
 #[verifier::structural_decreases]
 pub open spec fn expr_eq(a: ExprData, b: ExprData) -> nat
@@ -822,6 +1066,66 @@ pub open spec fn expr_eq(a: ExprData, b: ExprData) -> nat
             } else { 0 },
         ExprData::Not(t) =>
             if ed_tag(b) == 9 { expr_eq(*t, ed_not_e(b)) } else { 0 },
+        // ── W7 body constructors. Same tag+projection idiom; `Match`/`AppN`
+        //    recurse through the mutual `arms_eq`/`exprlist_eq`. ──
+        ExprData::Ite(c, t, e) =>
+            if ed_tag(b) == 10 {
+                if expr_eq(*c, ed_ite_c(b)) == 1 {
+                    if expr_eq(*t, ed_ite_t(b)) == 1 { expr_eq(*e, ed_ite_e(b)) } else { 0 }
+                } else { 0 }
+            } else { 0 },
+        ExprData::Match(s, arms) =>
+            if ed_tag(b) == 11 {
+                if expr_eq(*s, ed_match_scrut(b)) == 1 { arms_eq(*arms, ed_match_arms(b)) } else { 0 }
+            } else { 0 },
+        ExprData::AppN(f, args) =>
+            if ed_tag(b) == 12 {
+                if f == ed_appn_fn(b) { exprlist_eq(*args, ed_appn_args(b)) } else { 0 }
+            } else { 0 },
+        ExprData::Forall(bid, bty, body) =>
+            if ed_tag(b) == 13 {
+                if bid == ed_forall_bid(b) {
+                    if typ_eq(bty, ed_forall_bty(b)) == 1 { expr_eq(*body, ed_forall_body(b)) } else { 0 }
+                } else { 0 }
+            } else { 0 },
+        ExprData::Exists(bid, bty, body) =>
+            if ed_tag(b) == 14 {
+                if bid == ed_exists_bid(b) {
+                    if typ_eq(bty, ed_exists_bty(b)) == 1 { expr_eq(*body, ed_exists_body(b)) } else { 0 }
+                } else { 0 }
+            } else { 0 },
+    }
+}
+
+// W7: the arm-list / expr-list structural equalities, MUTUALLY recursive with
+// `expr_eq` (arms_eq recurses INTO expr_eq on arm bodies — the genuine mutual
+// eq W7a's derived-`=` shortcut left unvalidated; validated in-crate by
+// probe_mutual2). Match the first arg, read the second via projections.
+#[verifier::structural_decreases]
+pub open spec fn arms_eq(a: ArmList, b: ArmList) -> nat
+    decreases a
+{
+    match a {
+        ArmList::Nil => al_is_nil(b),
+        ArmList::Cons(c, bs, body, tl) =>
+            if al_is_nil(b) == 1 { 0 }
+            else if c == al_hd_ctor(b) {
+                if bidl_eq(bs, al_hd_binds(b)) == 1 {
+                    if expr_eq(*body, al_hd_body(b)) == 1 { arms_eq(*tl, al_tl(b)) } else { 0 }
+                } else { 0 }
+            } else { 0 },
+    }
+}
+
+#[verifier::structural_decreases]
+pub open spec fn exprlist_eq(a: ExprList, b: ExprList) -> nat
+    decreases a
+{
+    match a {
+        ExprList::Nil => el_is_nil(b),
+        ExprList::Cons(h, t) =>
+            if el_is_nil(b) == 1 { 0 }
+            else if expr_eq(*h, el_hd(b)) == 1 { exprlist_eq(*t, el_tl(b)) } else { 0 },
     }
 }
 
@@ -1019,6 +1323,166 @@ proof fn expr_mirror_kernel_computes()
         // Let/Not measures kernel-compute (Let=1 + Atom=1 + [Not=1 + Atom=1] = 4).
         expr_size(ExprData::Let(10, Box::new(ExprData::Atom(4)),
             Box::new(ExprData::Not(Box::new(ExprData::Atom(0)))))) == 4
+by { decide }
+
+// W7: in-crate kernel-computation guard for the DEFS-layer expression
+// vocabulary — the analog of `expr_mirror_kernel_computes` for the new body
+// constructors, against the LANDED `render_exp`/`expr_eq`/`render_arms`. The
+// real emitted-fixture shapes (probe15_w7a_defs; ground truth
+// TactusDefs_lib_exec__{root,base}.lean): `tri`(Ite), `tree_head`(Match),
+// `Tree.height`(self-recursive Match + Box-`Deref`), + `AppN`/`Forall`. Each
+// correct-closes to 1 and a single mutation flips to 0 (non-vacuous) — pinning
+// that the frozen Match/AppN/Ite/Forall vocabulary kernel-computes IN
+// tactus-core (the mutual `render_arms`/`arms_eq` structural recursion reduces
+// under `decide`, no `WellFounded.fix`). ids/opcodes per probe15 (nId=1 vId=2
+// tId=3 sId=4 lId=5 rId=6 val0=7 val1=8 aId=9 bId=10 kId=15 triId=20
+// treeHeadId=21 heightId=23 gId=24 leafCtor=30 nodeCtor=31 treeTy=100;
+// eqOp=0 addOp=6 subOp=7).
+proof fn defs_expr_vocab_kernel_computes()
+    ensures
+        // ── Ite — `tri`'s body `if n=0 then 0 else n + tri(Int.toNat (n-1))` ──
+        expr_eq(
+            render_exp(RawExp::Ite(TypData::TyNat,
+                Box::new(RawExp::BinOp(0, TypData::TyBool,
+                    Box::new(RawExp::Var(1, TypData::TyNat)), Box::new(RawExp::Lit(0, TypData::TyNat)))),
+                Box::new(RawExp::Lit(0, TypData::TyNat)),
+                Box::new(RawExp::BinOp(6, TypData::TyNat,
+                    Box::new(RawExp::Var(1, TypData::TyNat)),
+                    Box::new(RawExp::Call(20, TypData::TyNat,
+                        Box::new(RawExp::Clip(TypData::TyNat, Box::new(RawExp::BinOp(7, TypData::TyInt,
+                            Box::new(RawExp::Var(1, TypData::TyInt)), Box::new(RawExp::Lit(1, TypData::TyInt)))))),
+                        TypData::TyNat)))))),
+            ExprData::Ite(
+                Box::new(ExprData::BinOp(0, Box::new(ExprData::Atom(1)), Box::new(ExprData::Lit(0)))),
+                Box::new(ExprData::Lit(0)),
+                Box::new(ExprData::BinOp(6, Box::new(ExprData::Atom(1)),
+                    Box::new(ExprData::App(20, Box::new(ExprData::Cast(CastKind::IntToNat,
+                        Box::new(ExprData::BinOp(7, Box::new(ExprData::Atom(1)), Box::new(ExprData::Lit(1)))))))))))
+        ) == 1,
+        // kill: then/else branches swapped.
+        expr_eq(
+            render_exp(RawExp::Ite(TypData::TyNat,
+                Box::new(RawExp::BinOp(0, TypData::TyBool,
+                    Box::new(RawExp::Var(1, TypData::TyNat)), Box::new(RawExp::Lit(0, TypData::TyNat)))),
+                Box::new(RawExp::Lit(0, TypData::TyNat)),
+                Box::new(RawExp::Var(1, TypData::TyNat)))),
+            ExprData::Ite(
+                Box::new(ExprData::BinOp(0, Box::new(ExprData::Atom(1)), Box::new(ExprData::Lit(0)))),
+                Box::new(ExprData::Atom(1)),        // BUG: then/else swapped
+                Box::new(ExprData::Lit(0)))
+        ) == 0,
+        // ── Match — `tree_head(t) = match t {Leaf v => v, Node _ _ => 0}` ──
+        expr_eq(
+            render_exp(RawExp::MatchR(
+                Box::new(RawExp::Var(3, TypData::TyNamed(100))),
+                Box::new(RawArmList::Cons(30, BinderIdList::Cons(2, Box::new(BinderIdList::Nil)),
+                    Box::new(RawExp::Var(2, TypData::TyInt)),
+                    Box::new(RawArmList::Cons(31,
+                        BinderIdList::Cons(5, Box::new(BinderIdList::Cons(6, Box::new(BinderIdList::Nil)))),
+                        Box::new(RawExp::Lit(0, TypData::TyInt)),
+                        Box::new(RawArmList::Nil))))),
+                TypData::TyInt)),
+            ExprData::Match(Box::new(ExprData::Atom(3)),
+                Box::new(ArmList::Cons(30, BinderIdList::Cons(2, Box::new(BinderIdList::Nil)),
+                    Box::new(ExprData::Atom(2)),
+                    Box::new(ArmList::Cons(31,
+                        BinderIdList::Cons(5, Box::new(BinderIdList::Cons(6, Box::new(BinderIdList::Nil)))),
+                        Box::new(ExprData::Lit(0)),
+                        Box::new(ArmList::Nil))))))
+        ) == 1,
+        // kill: Leaf-arm binder id 2 → 99 (body still reads Atom(2)); §7 Q1 —
+        // arm binder ids are part of structural equality.
+        expr_eq(
+            render_exp(RawExp::MatchR(
+                Box::new(RawExp::Var(3, TypData::TyNamed(100))),
+                Box::new(RawArmList::Cons(30, BinderIdList::Cons(2, Box::new(BinderIdList::Nil)),
+                    Box::new(RawExp::Var(2, TypData::TyInt)),
+                    Box::new(RawArmList::Nil))),
+                TypData::TyInt)),
+            ExprData::Match(Box::new(ExprData::Atom(3)),
+                Box::new(ArmList::Cons(30, BinderIdList::Cons(99, Box::new(BinderIdList::Nil)),  // BUG: binder 2→99
+                    Box::new(ExprData::Atom(2)),
+                    Box::new(ArmList::Nil))))
+        ) == 0,
+        // ── Match (self-recursive) + Box-Deref — `Tree.height` Node arm
+        //    `1 + Tree.height val0.deref + Tree.height val1.deref`. §7 Q2: the
+        //    App(height) callee is never reduced (def_eq is syntactic). ──
+        expr_eq(
+            render_exp(RawExp::MatchR(
+                Box::new(RawExp::Var(4, TypData::TyNamed(100))),
+                Box::new(RawArmList::Cons(30, BinderIdList::Cons(99, Box::new(BinderIdList::Nil)),
+                    Box::new(RawExp::Lit(1, TypData::TyNat)),
+                    Box::new(RawArmList::Cons(31,
+                        BinderIdList::Cons(7, Box::new(BinderIdList::Cons(8, Box::new(BinderIdList::Nil)))),
+                        Box::new(RawExp::BinOp(6, TypData::TyNat,
+                            Box::new(RawExp::BinOp(6, TypData::TyNat,
+                                Box::new(RawExp::Lit(1, TypData::TyNat)),
+                                Box::new(RawExp::Call(23, TypData::TyNat,
+                                    Box::new(RawExp::Deref(Box::new(RawExp::Var(7, TypData::TyBox(100))))),
+                                    TypData::TyNamed(100))))),
+                            Box::new(RawExp::Call(23, TypData::TyNat,
+                                Box::new(RawExp::Deref(Box::new(RawExp::Var(8, TypData::TyBox(100))))),
+                                TypData::TyNamed(100))))),
+                        Box::new(RawArmList::Nil))))),
+                TypData::TyNat)),
+            ExprData::Match(Box::new(ExprData::Atom(4)),
+                Box::new(ArmList::Cons(30, BinderIdList::Cons(99, Box::new(BinderIdList::Nil)),
+                    Box::new(ExprData::Lit(1)),
+                    Box::new(ArmList::Cons(31,
+                        BinderIdList::Cons(7, Box::new(BinderIdList::Cons(8, Box::new(BinderIdList::Nil)))),
+                        Box::new(ExprData::BinOp(6,
+                            Box::new(ExprData::BinOp(6, Box::new(ExprData::Lit(1)),
+                                Box::new(ExprData::App(23, Box::new(ExprData::FieldProj(Box::new(ExprData::Atom(7)), 0)))))),
+                            Box::new(ExprData::App(23, Box::new(ExprData::FieldProj(Box::new(ExprData::Atom(8)), 0)))))),
+                        Box::new(ArmList::Nil))))))
+        ) == 1,
+        // kill: Leaf measure 1 → 0.
+        expr_eq(
+            render_exp(RawExp::MatchR(
+                Box::new(RawExp::Var(4, TypData::TyNamed(100))),
+                Box::new(RawArmList::Cons(30, BinderIdList::Cons(99, Box::new(BinderIdList::Nil)),
+                    Box::new(RawExp::Lit(1, TypData::TyNat)),
+                    Box::new(RawArmList::Nil))),
+                TypData::TyNat)),
+            ExprData::Match(Box::new(ExprData::Atom(4)),
+                Box::new(ArmList::Cons(30, BinderIdList::Cons(99, Box::new(BinderIdList::Nil)),
+                    Box::new(ExprData::Lit(0)),          // BUG: Leaf => 0, not 1
+                    Box::new(ArmList::Nil))))
+        ) == 0,
+        // ── AppN — `g a b` (synthetic; §7 Q3 flat arg list) ──
+        expr_eq(
+            render_exp(RawExp::CallN(24, TypData::TyNat,
+                Box::new(RawList::Cons(Box::new(RawExp::Var(9, TypData::TyNat)),
+                    Box::new(RawList::Cons(Box::new(RawExp::Var(10, TypData::TyNat)),
+                        Box::new(RawList::Nil))))))),
+            ExprData::AppN(24, Box::new(ExprList::Cons(Box::new(ExprData::Atom(9)),
+                Box::new(ExprList::Cons(Box::new(ExprData::Atom(10)), Box::new(ExprList::Nil))))))
+        ) == 1,
+        // kill: args swapped.
+        expr_eq(
+            render_exp(RawExp::CallN(24, TypData::TyNat,
+                Box::new(RawList::Cons(Box::new(RawExp::Var(9, TypData::TyNat)),
+                    Box::new(RawList::Cons(Box::new(RawExp::Var(10, TypData::TyNat)),
+                        Box::new(RawList::Nil))))))),
+            ExprData::AppN(24, Box::new(ExprList::Cons(Box::new(ExprData::Atom(10)),  // BUG: swapped
+                Box::new(ExprList::Cons(Box::new(ExprData::Atom(9)), Box::new(ExprList::Nil))))))
+        ) == 0,
+        // ── Forall — `∀ k : Nat, k = k` (synthetic) ──
+        expr_eq(
+            render_exp(RawExp::ForallR(15, TypData::TyNat,
+                Box::new(RawExp::BinOp(0, TypData::TyBool,
+                    Box::new(RawExp::Var(15, TypData::TyNat)), Box::new(RawExp::Var(15, TypData::TyNat)))))),
+            ExprData::Forall(15, TypData::TyNat,
+                Box::new(ExprData::BinOp(0, Box::new(ExprData::Atom(15)), Box::new(ExprData::Atom(15)))))
+        ) == 1,
+        // kill: binder type Nat → Int.
+        expr_eq(
+            render_exp(RawExp::ForallR(15, TypData::TyNat,
+                Box::new(RawExp::BinOp(0, TypData::TyBool,
+                    Box::new(RawExp::Var(15, TypData::TyNat)), Box::new(RawExp::Var(15, TypData::TyNat)))))),
+            ExprData::Forall(15, TypData::TyInt,          // BUG: binder Nat→Int
+                Box::new(ExprData::BinOp(0, Box::new(ExprData::Atom(15)), Box::new(ExprData::Atom(15)))))
+        ) == 0
 by { decide }
 
 // ── In-crate kernel-computation sanity (decide через structural) ────
