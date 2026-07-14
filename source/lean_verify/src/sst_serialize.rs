@@ -64,9 +64,18 @@
 //!   `NoBound`; finding-2: production renders these as NAMED ∀-binders).
 //! * `check.reqs` — requires exps → `FnCtxData.reqs` `BinderList` of
 //!   `(h_req<i> name leaf, req-prop leaf)` (finding-2: NAMED ∀-binders).
-//! * `check.post_condition.ens_exps` — ensures exps → `FnCtxData.enss`
-//!   leaf list (and the fall-through postcondition source; refWp appends
-//!   the implicit `Ret` from these when the body doesn't end in one).
+//! * `check.post_condition.ens_exps` — ensures exps read TWICE: bare via
+//!   `exp_leaf` → `FnCtxData.enss` (refWp does not read this slot), and
+//!   ANNOTATED via `oblig_leaf` → the `StmData::Ret` obligation leaves (the
+//!   `Return` goal, span_mark'd like production's `WpCtx` postcondition —
+//!   finding-1's Ret-annotation).
+//! * `check.post_condition.dest` — the declared `-> (r: T)` return-var name
+//!   → the `RetBind::RetLet` name leaf (`sanitize`d to match production's
+//!   `let_bind_synthetic(sanitize(ret), …)`; finding-4). `None` (unit
+//!   return) ⇒ `RetNone`.
+//! * `StmX::Return { ret_exp }` — the returned expression → the
+//!   `RetBind::RetLet` value leaf (`exp_leaf`), paired with `dest` above to
+//!   reproduce production's `let <ret> := <e>` frame binding.
 //! * `check.body` — the `Stm` tree → `StmData` (the stage-A subset:
 //!   Assert, Assume, Assign, DeadEnd, Return, If, Loop, Block→Seq/Skip).
 //!   `Assert` carries TWO leaves (finding-1): the ANNOTATED obligation
@@ -109,9 +118,12 @@
 //!   The SSA-fresh-per-occurrence discipline (DESIGN-W2-refwp §2.1) is a
 //!   W2 refinement — deferred because N3a's only consumer of ids is
 //!   `stm_size`/`binder_len`, which ignore the id value.
-//! * `Ret` and the fall-through postcondition carry the ens clauses
-//!   PRE-substitution (the ret-value substitution the walker performs is
-//!   deferred to N3b/W2, where the bridge actually constrains it).
+//! * `Ret` ensures obligations and the `RetBind` return value are rendered
+//!   PRE-substitution and WITHOUT the walker's return-value coercion /
+//!   if-value lifting (a returned `if` or a `&`-coerced value diverges from
+//!   the goal-side render). This is a stage-A caveat: a divergence fails the
+//!   `decide` bridge to CLOSE for that fn, never silent-passes. Simple-var
+//!   and simple-arithmetic returns (add_capped `s`, sum_to `acc`) match.
 //! * Field-path `Assign` (`x.f = e`) is rejected (tag `assign-field-path`).
 //!
 //! # Vocabulary versioning
@@ -247,10 +259,18 @@ type Sr<T> = Result<T, String>;
 #[derive(Default)]
 struct Serializer {
     leaves: LeafTable,
-    /// The fn's ensures leaves, needed by the `Return` arm; set once
-    /// before walking the body so the recursion stays a plain
-    /// `&Stm → String`.
-    pending_ens: Vec<u64>,
+    /// The fn's ANNOTATED ensures obligation leaves (span_mark'd, the
+    /// `Return` goal — finding-1's Ret-annotation), set once before
+    /// walking the body so the statement recursion stays a plain
+    /// `&Stm → String`. Production renders each ensures at the return
+    /// site as a `Postcondition` `SpanMark` (`WpCtx::new`); `oblig_leaf`
+    /// byte-matches it so the goal-side postcondition leaf cancels.
+    pending_ens_oblig: Vec<u64>,
+    /// The `sanitize(ret_name)` leaf for the return-value binding
+    /// (finding-4), or `None` for a unit return (no declared `-> (r:T)`).
+    /// The `Return` arm pairs it with the rendered return expression to
+    /// emit `RetBind.RetLet <name> <val>`.
+    pending_ret_name: Option<u64>,
 }
 
 impl Serializer {
@@ -356,12 +376,31 @@ impl Serializer {
                 Ok(format!("({}.StmData.Assign {} {})", NS, dest, rhs_leaf))
             }
 
-            StmX::Return { .. } => {
-                // Stage A: one leaf per postcondition, rendered
-                // PRE-substitution (ret-value substitution deferred to
-                // N3b/W2). Sourced from the fn ctx's ens leaves.
-                let list = self.leaf_list(&self.pending_ens.clone());
-                Ok(format!("({}.StmData.Ret {})", NS, box_(&list)))
+            StmX::Return { ret_exp, .. } => {
+                // Annotated ensures obligation leaves drive the `Return`
+                // goal (Ret-annotation, finding-1): span_mark'd like
+                // production's `WpCtx` postcondition so the goal-side
+                // postcondition leaf reuses the same id and cancels.
+                let list = self.leaf_list(&self.pending_ens_oblig.clone());
+                // Return-value binding (finding-4): production prepends
+                // `let <ret> := <e>` before the postcondition (the walker's
+                // `let_bind_synthetic(sanitize(ret), <e_ast>, …)`, peeled
+                // into a `CtxFrame::Let` by `emit_done_or_split`). Bind ONLY
+                // when BOTH a declared return var AND a return expr exist —
+                // exactly the walker's condition (a `return;` or a fn with no
+                // `-> (r:T)` binds nothing). The value is the return expr via
+                // the SAME `exp_leaf` path the body's Assign rhs uses; the
+                // walker's coercion / if-value lifting is NOT replicated here
+                // (a stage-A caveat — a divergence fails the bridge to close,
+                // never silent-passes).
+                let retbind = match (self.pending_ret_name, ret_exp) {
+                    (Some(nleaf), Some(e)) => {
+                        let vleaf = self.exp_leaf(e)?;
+                        format!("{}.RetBind.RetLet {} {}", NS, nleaf, vleaf)
+                    }
+                    _ => format!("{}.RetBind.RetNone", NS),
+                };
+                Ok(format!("({}.StmData.Ret {} {})", NS, box_(&list), paren(&retbind)))
             }
 
             StmX::If(cond, then_stm, else_stm) => {
@@ -683,13 +722,33 @@ fn serialize(
         req_entries.push((hname, prop));
     }
 
-    // Ensures leaves (also the `Return` arm's source and the
-    // fall-through postcondition).
+    // Ensures leaves (bare) → `FnCtxData.enss`. refWp does NOT read this
+    // slot (the `Return` goal uses the annotated obligations below); it is
+    // kept for the fall-through documentation + O4 audit.
     let mut ens_leaves: Vec<u64> = Vec::new();
     for e in check.post_condition.ens_exps.iter() {
         ens_leaves.push(s.exp_leaf(e)?);
     }
-    s.pending_ens = ens_leaves.clone();
+    // Annotated ensures obligation leaves → the `Return` goal
+    // (Ret-annotation, finding-1): production renders each ensures at the
+    // return site as a span_mark'd `Postcondition` obligation
+    // (`WpCtx::new`); `oblig_leaf` reconstructs the identical text so the
+    // goal-side postcondition leaf reuses this id and the two cancel across
+    // the W2 bridge.
+    let mut ens_oblig: Vec<u64> = Vec::new();
+    for e in check.post_condition.ens_exps.iter() {
+        ens_oblig.push(s.oblig_leaf(e)?);
+    }
+    s.pending_ens_oblig = ens_oblig;
+    // Return-var name leaf (finding-4): production binds `let <sanitize(ret)>
+    // := <e>` before the postcondition (the `Return` walker's
+    // `let_bind_synthetic(sanitize(name), …)`). `dest` is the declared
+    // `-> (r: T)` name; `None` (unit return) ⇒ no binding.
+    s.pending_ret_name = check
+        .post_condition
+        .dest
+        .as_ref()
+        .map(|d| s.text_leaf(&crate::to_lean_type::sanitize(d.0.as_str())));
 
     // Body.
     let stm_term = s.stm(&check.body)?;
