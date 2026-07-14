@@ -55,10 +55,22 @@ def bodies). **UNBLOCKED** — W6 done (`bootstrap-11` closed).
     a wrong-but-*consistent* def lowering is invisible to obligation-level
     bridges. W7 is what closes it (trust-inventory row 4's remaining half).
   - **Ladder split** into `W7a…W7e` (design §6), mirroring W6a…e:
-    - **W7a** (`bootstrap-26`, created) = standalone `.lean` probe, freeze the
-      extended vocabulary on a `tri`-style match-bodied def + the `Tree` datatype,
-      correct-closes + body-mutation-kill, produce the definition-level census.
-      Zero shared-crate risk. **This is the next pickup.**
+    - **W7a** (`bootstrap-26`, **DONE 2026-07-14, opus-w7a**) = standalone
+      `.lean` probe (`probe-w0/probe15_w7a_defs/`), rc=0, axioms clean. Froze
+      the full extended vocabulary (`TypData`+=`box`; `ExprData`+=`ite`/`matchE`/
+      `appN`/`forallE`/`existsE`; `DefData`/`RawDef`/`DtData`/`CtorData` +
+      `render_def`/`render_dt`) on `tri`(Ite) + `tree_head`/`sum_tree`(Match) +
+      `Tree` datatype/`height`. Correct-closes (decide+rfl) + non-vacuous
+      mutation-kills each; all four §7 open questions answered (verdicts in
+      `probe15_w7a_defs/REPORT.md`); definition-level census recorded. **W7b is
+      now UNBLOCKED — shapes frozen, safe to land the one batched edit.**
+    - Key W7a de-risk for W7b: `mutual` inductive + `deriving instance
+      DecidableEq`, and a `mutual` STRUCTURAL `render` recursing through the
+      arm-list/expr-list, both reduce under `decide`/`rfl` with **no
+      `WellFounded.fix`** (verified standalone). So the Rust mirror's
+      `#[verifier::structural_decreases]` on the arm-list-recursive
+      `render_exp`/`expr_size` is expected to hold — the Match/AppN nesting is
+      kernel-reducible in-crate.
     - W7b = the one batched `tactus-core` edit (new constructors + `DefData`/
       `RawDef`/`DtData` + `render_def`/`def_eq`).
     - W7c = serializer transcriptions (extend `lexpr_to_exprdata`/`expx_to_rawexp`
