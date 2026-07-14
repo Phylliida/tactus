@@ -156,5 +156,19 @@ did, so the change can only close the one open divergence, not break a closed on
    serializer). Landing this fix into the tactus tree is a trivial follow-on
    (same one-line edit); noted so a future instance doesn't assume the tgt
    check.sh binary already has it.
+
+   **CORRECTION (2026-07-14, opus-w4): assumption #3 above is a PHANTOM — there
+   is NOTHING to port.** The `sst_serialize.rs` reference-transcriber is a
+   bootstrap-ONLY file; it does not exist in `tactus/source` at all (grepped:
+   no `sst_serialize`, no `struct Serializer`, no `fn typ_data`, no
+   `TypData.TyNat/TyInt`, no cert-emission machinery under
+   `tactus/source/lean_verify/src/`). The bug was purely in the reference
+   transcriber, which only runs in the bootstrap differential gate. The
+   PRODUCTION emitter that `check.sh`'s tactus binary actually uses,
+   `to_lean_type.rs`, is **byte-identical** between the two trees (`diff` clean)
+   and ALREADY had the correct `Nat | USize | Char → "Nat"` mapping
+   (`to_lean_type.rs:96-109`). So `check.sh` verifying tgt crates was never
+   affected by this bug and needs no change. "still on the OLD serializer" was a
+   wrong guess — the tactus tree has no reference serializer to be old about.
 4. `-V cache` warms verification results only; cert EMISSION is uncached and
    re-ran fresh (out dir cleared before re-emit).
