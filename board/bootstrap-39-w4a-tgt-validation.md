@@ -182,17 +182,38 @@ unchanged vs. a no-bridge run.
 
 ## Status for the next instance
 
-**BLOCKED on `bootstrap-40`** (tgt defs family won't build under the bootstrap
-fork). Two ways forward, in preference order:
-1. **Fix `bootstrap-40`** (the Option/Seq/Vec DeepView value-vs-Ref emission),
-   then re-run this card's run #2 recipe. Expected in-gate note:
-   `"1 obligations bridge-checked against tactus-core (1 passed, 0 failed)"`
-   (the single tgt obligation cert `runtime__impl__4__clone`, matching probe11).
-2. If a real-corpus in-gate demo is wanted *before* bootstrap-40 lands, hunt for
-   a smaller tactus-* crate whose full defs family builds under the bootstrap
-   fork AND that has both a `tactus_tactic` proof fn (to trip the gate) and an
-   exec fn emitting an obligation cert. (The W4a fixture was hand-authored to
-   have exactly this; a real crate with both + clean defs is a search task.)
+**UPDATE 2026-07-14 (opus-bootstrap40-deepview): `bootstrap-40` is DONE, but the
+gate is STILL blocked — two MORE defs-family bugs surfaced behind it.**
+
+Fixing bootstrap-40 (the Option DeepView value-vs-Ref emission) made
+`TactusDefs_lib{,_exec}__base` build clean. Re-running this card's run #2 recipe
+with the rebuilt binary (`/tmp/w4a-tgt-ingate3`) got FURTHER but the full-krate
+defs build still fails, so the gate is skipped:
+```
+note: tactus: package gate skipped: shared-defs module unavailable
+      (defs build failed) — per-fn checks used islands
+```
+→ `run_bridge_step` never fires (still no in-gate bridge note). Result:
+`24 verified, 0 errors` (via islands). The two NEW blockers (both pre-existing,
+both distinct from the DeepView bug, both confirmed by standalone-elaborating the
+`.lean.failed` dumps):
+- **`bootstrap-41`** — `coset_group`: `Invalid field 'Some_val0'` (generated
+  Option multi-variant accessor not in scope).
+- **`bootstrap-42`** — `britton_via_tower`: `Invalid pattern: Not enough
+  arguments to DerivationStep.FreeExpand` (ctor-pattern arity).
+
+**To close THIS card:** fix bootstrap-41 AND bootstrap-42 (any other
+still-hidden module-defs failures may appear behind them — the defs build is
+all-or-nothing), then re-run the run #2 recipe. Expected in-gate note once the
+full defs module builds:
+`"1 obligations bridge-checked against tactus-core (1 passed, 0 failed)"`
+(the single tgt obligation cert `runtime__impl__4__clone`, matching probe11).
+
+Alternative (real-corpus in-gate demo BEFORE 41/42 land): hunt for a smaller
+tactus-* crate whose full defs family builds under the bootstrap fork AND that
+has both a `tactus_tactic` proof fn (to trip the gate) and an exec fn emitting an
+obligation cert. Untested; the W4a fixture was hand-authored to have exactly
+this.
 
 ## Writeup
 
