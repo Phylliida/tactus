@@ -1,9 +1,9 @@
 ---
 title: "W7a — defs-layer probe: freeze the extended body vocabulary (Match/Ite/Forall/multi-arg App) + DefData/DtData on tri + Tree; zero shared-crate risk"
-status: todo
-claimed_by:
+status: done
+claimed_by: opus-w7a
 created: 2026-07-14T21:45:00Z
-updated: 2026-07-14T21:45:00Z
+updated: 2026-07-14T22:55:00Z
 ---
 
 ## Description
@@ -79,9 +79,57 @@ batched shared-crate edit) — do not start W7b until this probe freezes the sha
   (already in the fixture as `lib.tri (Int.toNat n)` in `sum_to`'s leaf) + the
   `Tree` inductive / `tree_head` (also fixture-present). Reference probe to mirror
   structurally: `probe-w0/probe12_w6a_castleaf/`.
+- (2026-07-14, opus-w7a) **DONE.** Read the REAL emitted fixture defs first
+  (`TactusDefs_lib_exec__{root,base}.lean`) — `tri`/`tree_head`/`Tree`/
+  `Tree.height` verbatim as ground truth (`sum_tree` is pruned — no caller).
+  De-risked the two novel Lean mechanics with throwaway tests BEFORE writing the
+  probe: (1) `mutual` inductive + `deriving instance DecidableEq` → `decide`/`rfl`
+  reduce, axioms clean; (2) a `mutual` structural `render` recursing through the
+  arm-list/expr-list → reduces under `decide`/`rfl`, **no `WellFounded.fix`**.
+  Both green, so the Match/AppN nested recursion is safe. Wrote
+  `probe15_w7a_defs.lean` (~30 theorems) + `run.sh` + `REPORT.md`. Probe rc=0,
+  every `#print axioms` clean, non-vacuity meta-check passes. One parse snag:
+  `/-- -/` doc comments can't attach to `mutual` — switched those three to plain
+  `/- -/`. Zero `tactus-core` edits.
 
 ## Writeup
 
-_when done: the frozen extended-vocabulary shapes (paste the final Lean
-inductives), the §7 open-question verdicts, the definition-level census, and
-confirmation the mutation-kills are non-vacuous._
+**Result:** `probe15_w7a_defs/` lean **rc=0**, all axioms clean, non-vacuity
+meta-check passes. Case A (`Ite` via `tri`) + Case B (`Match` via
+`tree_head`+`sum_tree`) + Case C (`Tree` datatype + `height`) each correct-close
+(`decide`+`rfl`) with multiple non-vacuous mutation-kills; `Forall`/`AppN` frozen
++ synthetically validated. Full spec, frozen vocabulary (pasted Lean inductives),
+§7 verdicts, and the definition-level census are in **`REPORT.md`**. Highlights:
+
+- **Frozen W7b vocabulary** (additive to W6): `TypData` += `box`; `ExprData`/
+  `RawExp` += `ite` / `matchE`(+`MatchArm`/`ArmList`) / `appN`(+`ExprList`) /
+  `forallE` / `existsE`; new top-level `DefData`/`RawDef`/`DtData`/`CtorData`/
+  `RawDt` + `render_def`/`render_dt`. `Match`/`AppN` recurse through dedicated
+  list inductives (production's `RawExpList` discipline) so `render` is
+  structural and kernel-reduces. No `HasType` (obligation-goal construct).
+
+- **§7 verdicts:** (Q1) arm-binder ids are part of structural eq, ride through
+  `render`, and the production nat-returning `arms_eq` (match-first-arg +
+  tag/projection + recurse) `decide`s — demonstrated by `B_th_binder_kill` +
+  `Q1_arms_eq_{closes,kills}`; wildcards get a canonical positional id.
+  (Q2) `def_eq` is syntactic → never reduces the callee, so a body calling
+  `height` (or itself) `decide`s fine (`C_height_ok_decide`) — height's
+  kernel-computability is irrelevant to the bridge. (Q3) flat `appN` arg list;
+  per-arg coercion at the expected param type is **deferred to W7c** (no fixture
+  body is multi-arg) — flagged, not dropped. (Q4) `CtorData` = positional field
+  TYPES only; **`Box<T>` gets its own `TyBox`, NOT reused `TyRef`** (Box≠Ref;
+  conflation would mask a field-kind bug).
+
+- **Census (definition-level):** `Ite`→`tri`; `Match`→`tree_head`/`sum_tree`/
+  `Tree.height`; `TyBox`→`Tree`/`sum_tree`/`Tree.height`; `AppN`+`Forall`/
+  `Exists`→**no fixture body** (fill_zeros' forall is goal-level), so
+  tgt-slice-only (W7d). `sq`/`Point.height` are W6-vocab-complete. Full table in
+  REPORT.
+
+**Assumptions:** `sum_tree` (Case B′) is a PREDICTED shape (pruned from the
+fixture — no caller), composed mechanically from the source + tree_head/height
+patterns; not emitted-verified. Datatype "render" is transcription not decision
+(teeth = VIR-vs-LExpr diversity, abstracted as two hand inputs). Monoculture
+caveat unchanged (W5's residual). See REPORT §"Assumptions / honesty".
+
+**Blocks:** W7b (the batched shared-crate edit) — shapes now frozen, safe to start.
