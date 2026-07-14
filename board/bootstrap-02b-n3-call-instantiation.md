@@ -1,9 +1,9 @@
 ---
 title: "N3 follow-up — StmData::Call serialization (callee req/ens instantiation)"
-status: in_progress
+status: done
 claimed_by: opus-b02b
 created: 2026-07-13T21:20:00Z
-updated: 2026-07-13T23:10:00Z
+updated: 2026-07-14T23:25:00Z
 ---
 
 ## Description
@@ -235,4 +235,111 @@ after N3b (goal provenance), since the bridge is what pins the instantiation.
   W2b bridge will `decide`-validate against production (non-circular: the
   serializer recomputes `post`, refWp does not copy it).
 
+- (2026-07-14, opus-b02b) **SERIALIZER `post`-builder LANDED + confirmation run
+  GREEN → card DONE.** The two remaining "Concrete next steps" bullets (the
+  serializer builder + doc move) are in, and the W2b bridge validates quad_exec
+  against production. Uncommitted work from the prior sub-session is now
+  reconfirmed with a clean, durable run (the prior run left no log; timestamps
+  showed the certs predated a final `sst_serialize.rs` edit + rebuild, so I
+  re-emitted from scratch to remove the staleness ambiguity):
+    - **`sst_to_lean::cert_call_leaves`** (production DTO helper): renders the
+      instantiated call leaves — the `CallPrecondition` obligation + the
+      post-call frame ingredients (path-tagged `RetEq` / `Forall`) — through
+      production's EXACT renderers (`build_call_substitutions` /
+      `render_call_ensures` / `type_bound_predicate` / `coerce_lexpr`), so the
+      leaf TEXT byte-matches the goal side (leaf content is uncertified §2.5 →
+      MUST reuse the production path). Restricted subset gated with sharp
+      fail-loud tags: `call-trait{,-default}` / `call-dynamic-resolved` /
+      `call-crosscrate` / `call-generic` / `call-mut` / `call-unit-dest`.
+    - **`sst_serialize::call_stm`**: assembles the `StmData.Call { reqs, post }`
+      FrameList STRUCTURE INDEPENDENTLY from those ingredients (RetEq path:
+      `[FHyp(e_bound)] [FHyp(rest)] FLet(dest, E)`), so the frame shape — the
+      thing the bridge validates — is the serializer's own code, not a copy of
+      `push_post_call_frames` (Option-1 non-circularity). The ∀-path fails loud
+      `call-forall-path` (no fixture exercises it yet).
+    - **`stm_size_of`** fixed for the new Call shape: `1 + leaf_len(reqs) +
+      frame_len(post)` (counts FBind/FHyp/FLet entries) — matching tactus-core's
+      `stm_size(Call)`.
+    - Faithfulness doc-comment: `StmX::Call` MOVED from "Deliberately NOT read"
+      to "Read", spelling out the instantiation as the one non-transcription
+      trusted step + the restricted-subset tag list.
+  - **Confirmation run (current binary, cold re-emit):**
+    `certified 13/16 fns` (was 9/14 before the Call arm; the only 3 rejections
+    are `call-generic` = vec_read/vec_push7/fill_zeros — genuinely-unsupported
+    generic-callee shapes). `20 verified, 0 errors`.
+  - **W2b bridge (probe9_bridge/run.sh, 13 certs):** **quad_exec close-ok by
+    decide+rfl** (1.33s/1.27s) — the card's "done when" target. double_exec
+    close-ok; head_exec now close-ok (bootstrap-18); 11 CLOSE + 2 HONEST-FAIL;
+    runner exit 0.
+  - **count_down: DIAGNOSED = sound honest-fail, NOT a Call-arm bug.** It
+    diverges (refWp 3 goals, prod 4). Pinpointed by `decide` (3×4 goal match
+    matrix + rw2 structural confirm, /tmp/pinpoint_*.lean method): the Call
+    node is faithful (the assert + termination goals AROUND the recursive call
+    match production exactly — rw0=prod1, rw1=prod2), but count_down's
+    `if n==0 {0} else {recurse}` is a **two-way If-join** where BOTH branches
+    fall through to a common `Ret`. `frame_after(f, If)` returns the pre-If
+    frame `f` (the merge special case only fires for `diverges(then) &&
+    is_skip(else)` — the bootstrap-17 early-return case), so the common Ret
+    closes under the bare pre-If frame (missing each branch's `tmp__3`), giving
+    ONE malformed postcond where production clones two. This is the documented
+    §2.4.1 two-way-join caveat — SURFACED, not caused, by making count_down
+    emittable. Classified honest-fail in the runner (green); spun out as
+    **board/bootstrap-19** (model the two-way If-join). Local model
+    (127.0.0.1:8051) independently confirmed the exposure-vs-causation read.
+
 ## Writeup
+
+**Status: DONE.** The restricted Call arm is landed and the W2b bridge validates
+it end-to-end. `quad_exec` — the fixture Call fn and the card's stated "done
+when" — serializes to a `StmData.Call { reqs, post }` literal that kernel-computes
+(`stm_size = 20`, `goal_count = 4`, both by `decide`) and **bridges CLOSED by
+`decide` + `rfl`** against tactus-core's `ref_wp`/`goals_eq`. Census dropped the
+generic `call` reject to the genuinely-unsupported shapes only: 13/16 certified,
+3 `call-generic` rejections (vec_read/vec_push7/fill_zeros).
+
+**How it works (the Option-1 split — the one place the serializer does
+non-transcription work):**
+- `sst_to_lean::cert_call_leaves` (in the walker module, reusing production's
+  renderers) does the INSTANTIATION: resolve the callee, substitute the actual
+  args into its requires/ensures, detect the #128 ret-eq shape, coerce the
+  return value to the dest's sort. It returns a plain DTO of RENDERED LEAVES
+  (opaque, uncertified text §2.5) + a path tag (RetEq vs Forall). Reusing
+  production's exact leaf renderers is what makes the leaf text byte-match the
+  goal side across the bridge — that match is tautological/uncertified by
+  design.
+- `sst_serialize::call_stm` (in the TCB serializer) assembles the `FrameList`
+  STRUCTURE from those ingredients, independently of production's
+  `push_post_call_frames`. The frame shape is the CERTIFIED content: the W2b
+  `decide` bridge checks refWp's pass-through (`frame_after(Call) =
+  frame_append(f, post)`, `wp_stm(Call) = close_each(f, reqs)`) reconstructs
+  production's goals from this serializer-built literal. Non-circular: the
+  serializer recomputes `post`, refWp does not copy it.
+- tactus-core side (landed earlier this arc): `StmData::Call { reqs: Box<LeafList>,
+  post: Box<FrameList> }`, refWp Call equations are pure pass-throughs, and the
+  `ref_wp_call_pass_through` decide proof validates BOTH post shapes (ret-eq +
+  ∀-path) on hand-built double_exec-shaped literals with a mutation-kill.
+
+**Restricted subset (deliberate, keeps the TCB addition small + auditable):**
+Static callee, same-crate (in `fn_map`), no `&mut` params, no generics, dest
+present, ret-eq post path. Every other shape fails loud with a sharp census tag
+(`call-trait` / `call-crosscrate` / `call-generic` / `call-mut` /
+`call-unit-dest` / `call-dynamic-resolved` / `call-trait-default` /
+`call-forall-path`) so the census pinpoints exactly which arm is missing next.
+
+**Assumptions / partial / honest caveats:**
+- **∀-path (`call-forall-path`) is coded in the DTO but not assembled** in
+  `call_stm` — no fixture callee currently takes the non-ret-eq path
+  (quad_exec/count_down/double_exec all have `r == E` ensures). Deferred until a
+  ∀-path fixture exists to bridge-validate the FBind assembly. The tactus-core
+  `ref_wp_call_pass_through` proof DOES cover the ∀-path shape, so refWp is ready;
+  only the serializer builder for it is pending.
+- **The instantiation leaves are uncertified (§2.5)** — they reuse production's
+  renderers precisely because stage A does not certify leaf text. A leaf-render
+  bug would be caught by leaf-content divergence at the bridge (honest-fail),
+  never silent-passed; but the SHARED-renderer match for correct leaves is
+  tautological. This is the accepted Option-1 tradeoff.
+- **count_down does NOT close** — it hits the pre-existing §2.4.1 two-way If-join
+  caveat (diagnosed above; not a Call-arm gap). Follow-up board/bootstrap-19.
+- Remaining Call shapes (`call-generic`, `call-mut`, cross-crate, trait dispatch,
+  ∀-path assembly) are each their own future arm; each has a distinct census tag
+  ready to pick up.
