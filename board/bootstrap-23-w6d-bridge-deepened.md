@@ -1,9 +1,9 @@
 ---
 title: "W6d — bridge deepened: obligation leaves emit LeafE + refWp closes over ExprData (corpus coverage map)"
-status: in_progress
-claimed_by: opus-b26
+status: done
+claimed_by: opus-b27
 created: 2026-07-14T09:30:00Z
-updated: 2026-07-15T02:30:00Z
+updated: 2026-07-14T05:05:00Z
 ---
 
 ## Description
@@ -968,9 +968,157 @@ arithmetic fns; G2+G3 unlock the datatype/struct/tuple fns.
   disagreement [→ a transcription bug, or the real Friction-2]. G4 (`Let`-in-leaf)
   → W6e.
 
+- (2026-07-14, opus-b27) **W6d.3 DONE — the deep bridge is LIVE end-to-end.
+  Rebuilt binary + re-emitted all fixtures + probe9 green + golden regenerated +
+  verdict-neutral + deep-mutation non-vacuity confirmed. W6d COMPLETE.** This is
+  the end-to-end validation the emit gate (2b-2) was Lean-verified for in the
+  abstract; W6d.3 runs the real serializer output through the bridge.
+
+  **1. Release binary rebuilt.** FORK vargo (`tactus-bootstrap/tools/vargo`) on
+  PATH (bare `vargo` = the upstream `verus/` submodule → "sources changed"
+  bail). `vargo build --release` from `source/`: `lean_verify` + `rust_verify`
+  recompiled (20.3s), verus binary refreshed (was stale at 01:50, predating the
+  2b-1/2b-2 arms + the emit gate; now 04:49), vstd re-verified **1530/0**.
+
+  **2. Fixtures re-emitted** (`--crate-type=lib --lean-backend --lean-all-proofs
+  --tactus-emit-cert bootstrap-fixture/lib.rs`, `TACTUS_LEAN_OUT=…/bootstrap-
+  fixture/out`, run from the tactus-bootstrap dir so `@rust:` locs read
+  `bootstrap-fixture/lib.rs`). **certified 13/16** (up from 11/16 — the deep
+  arms enabled 2 more); the 3 rejections are `vec_read`/`vec_push7`/`fill_zeros`,
+  all **`call-generic`** (exec-Vec calls / quantifier bind — the documented
+  non-cast-class census remainder, NOT bridge failures). All 13 certs rewrote to
+  the DEEP shape: e.g. `Assert 5 4` → `Assert (RawExp.Span 8 (RawExp.Var 6
+  TyBool)) 6`; the scope_shape/tri_one Ret obligation now carries a full
+  `RawExp.BinOp(Call(tri, arg), Lit)` tree and the goal a matching
+  `ExprData.SpanMark(BinOp(App(tri,·), Lit))` — genuinely deep, not opaque atom.
+  add_capped's overflow leaf `0≤x+y ∧ x+y<2^64` (G6 HasType) expands to 12
+  `ExprData.BinOp` + 6 `Lit` nodes on the goal side.
+
+  **3. probe9 — ALL BRIDGES BEHAVE AS CLASSIFIED ✓.** Every coverable fn closes
+  by BOTH `decide` and `rfl`; the one honest-fail behaves:
+  ```
+  add_capped  close-ok   double_exec close-ok   quad_exec   close-ok
+  count_down  close-ok   find_square close-ok   head_exec   close-ok   (G2 deref)
+  id_generic  close-ok   mk_point    close-ok   swap_pair   close-ok   (G3 field)
+  scope_shape close-ok   sum_to      close-ok   tri_one     close-ok
+  max_u64     hfail-ok   (G4 If-fold in leaf — DEFERRED to W6e, as classified)
+  ```
+  12/13 close-ok, 1/13 hfail-ok. **No `(ref_ok && !goal_ok)` mismatch surfaced**
+  on any coverable fn — the ob-drives asymmetric gate held; the transcribers are
+  duals over the coverable set exactly as 2b-2 predicted, so **no symmetric-gate
+  upgrade is needed** (the fork Danielle flagged did not materialize).
+
+  **4. Verdict-neutral confirmed.** Fixture flag-OFF (no `--tactus-emit-cert`) ==
+  flag-ON: both **`13 verified, 11 errors`**. The 11 errors are the pre-existing
+  `tactus_auto`/Lean proof-SEARCH failures on the hard fixture fns (orthogonal to
+  cert emission, which runs emission-only at the SST snapshot and adds no
+  obligations — documented since bootstrap-15). Emitting the deep cert does not
+  perturb the verifier verdict.
+
+  **5. Golden regenerated.** `source/lean_verify/src/testdata/add_capped.cert.lean`
+  replaced with the fresh deep emission (24→28 leaves — the deep structure interns
+  the `lib.tri`-style call accessors + the `@rust:` loc strings for each `Span`;
+  still 4 goals). Updated the drift assertion `leaf_texts.len()` 24→28 in
+  `sst_serialize_tests.rs`. The golden test re-renders the recovered `CertBody`
+  and asserts byte-equality → still green (a format pin, now pinning the deep
+  format). Full `cargo test -p lean_verify --lib` = **338 passed / 0 failed**
+  (incl. `golden_add_capped_cert`, `stm_size_matches_core`, the goal-spine +
+  emit-gate tests).
+
+  **6. Deep-mutation non-vacuity (bonus — proves the deep compare is
+  load-bearing, not vacuous atom-collapse).** On tri_one: baseline deep bridge
+  closes (`decide` rc=0); mutating ONE deep SST node — the `tri(1)` call arg
+  `RawExp.Lit 1` → `RawExp.Lit 9` — makes `decide` prove the bridge proposition
+  **FALSE** (rc=1). So `ref_wp` genuinely renders the deep `RawExp` (`tri 9 = 1`)
+  and `goals_eq` genuinely `decide`s `expr_eq` against the goal side's `tri 1 =
+  1` — a structurally-wrong deep expression FAILS the bridge, never silent-passes.
+  (This is a spot-check, not the systematic W6e kill — that drops `Int.toNat` on
+  the prod side across the cast class.)
+
+  **Net:** the R2-bridge deep obligation path — `GoalData::LeafE(ExprData)` on
+  both sides, `refWp` closing via `render_exp(RawExp)`, the bridge `decide`ing
+  `expr_eq` — is now LIVE for the entire coverable fixture corpus. The Friction-2
+  inconsistent-coercion class is caught at expression granularity. **G4
+  (`If`-fold `Let`/`Not` in one leaf, max_u64) is the sole deferred gap → W6e.**
+
+  **Committed:** the 2 source-test changes + the fresh `tactus-core/out/lib`
+  oleans (the W6d.1b build artifacts had been left uncommitted since the last
+  olean commit at W6d.1a `b99f6cc`; committing them makes this bridge result
+  reproducible from a clean checkout, per the `7fda99b` stage-B-artifact
+  pattern). `bootstrap-fixture/out` stays gitignored/regenerable.
+
 ## Writeup
 
-_when done: findings, how the code works, assumptions made. Parent design:
-`DESIGN-W6-stageB.md`; ladder rung 4 (`VERIFICATION-PATH.md`). This task's
-lasting artifact is the corpus coverage map + gap taxonomy above — the
-expression-level roadmap the rest of W6 executes against._
+**W6d — bridge deepened — COMPLETE (2026-07-14).** Parent design:
+`DESIGN-W6-stageB.md`; ladder rung 4 (`VERIFICATION-PATH.md`).
+
+**What W6d achieved.** The R2 bridge's obligation leaves are now *structurally
+certified* end-to-end: for the bridgeable fixture corpus, both the production
+emitter and the reference WP produce `GoalData::LeafE(ExprData)` (deep
+expression trees, not opaque `Leaf(u64)` ids), `refWp` closes each obligation
+via `render_exp(rawExp)`, and the kernel `decide`s `goals_eq` = constructor-for-
+constructor `expr_eq`. A serializer that produced a structurally-wrong deep
+expression now FAILS the bridge instead of silent-passing — the Friction-2
+inconsistent-coercion blind spot W6 exists to close.
+
+**How the code works (the deep path, in emission order).**
+1. **Mirror vocabulary** (`tactus-core/lib.rs`, W6d.1a): `ExprData`/`RawExp`
+   gained `LitBool` (G1), `Field`→`FieldProj` (G3), `HasType` (G6, re-expands
+   `0≤e ∧ e<2^width` independently), plus the `needs_ref_deref` TyRef rule (G2).
+   All payloads are `nat` (a spec `bool` renders Prop → freezes `decide`); any
+   computed constant (`pow2`) is a non-recursive width→bound table (a
+   `decreases`-on-arithmetic def lowers to `WellFounded.fix`, which the kernel
+   won't unfold under `decide`).
+2. **Reference fold** (`tactus-core/lib.rs`, W6d.1b): `close_e`/`close_each_e`
+   fold the frame telescope around `LeafE(render_exp(ob))`; the five obligation
+   slots on `StmData` (Assert / Ret.es / Call.reqs / Loop.inv_obligs /
+   decrease_oblig) carry `RawExp`/`RawExpList` (a dedicated deep list, kept
+   distinct from the opaque-`u64` `LeafList` so a `LeafE` can never silently
+   match a stage-A `Leaf`). Loop used Design C (parallel `inv_obligs: RawExpList`
+   beside the untouched `inv_hyps: BinderList`), leaving the delicate frame
+   telescope machinery unchanged.
+3. **Serializer transcription** (`source/lean_verify/src/sst_serialize.rs`,
+   W6d.2): `raw_exp` peels Box/Unbox SMT wrappers (G0 — the dominant unlock),
+   aliases `VarAt(_,Pre)`→`Var` (G7), and emits the G1/G3/G6 shapes;
+   `lexpr_to_exprdata` mirrors on the goal side; `typ_data` peels
+   Boxed/Decorate. The G3 accessor reuses production's own
+   `field_access_name(fop)` so both sides intern the identical string (no
+   parallel re-derivation to drift).
+4. **The emit gate** (W6d.2b-2): `oblig_slot` interns the span-marked leaf id,
+   attempts `raw_exp(e)`, and on success emits `RawExp.Span(loc, ·)` + records
+   the id in `deep_ids`; `goal_data` deepens the matching leaf iff
+   `deep_ids.contains(id)` AND `lexpr_to_exprdata` succeeds. This is the
+   **ob-drives asymmetric gate** (single-pass; the stm walk precedes the goal
+   walk, so a symmetric "both-or-neither" would need a circular goal pre-pass).
+   Forced-atom sites (Call reqs = a production LExpr with no raw SST; the
+   synthesized decrease disjunct; if/loop-cond hypotheses) never enter
+   `deep_ids`, so they stay atom on both sides for free — verdict-neutral.
+   Size-invariance: `stm_size`/`goal_count` count list length / node heads, never
+   RawExp depth, so deep-vs-atom is size-neutral — only `goals_eq`'s structural
+   compare changes.
+
+**Validation (W6d.3).** Rebuild → re-emit (13/16 certified) → probe9 (12/13
+close-ok deep, max_u64 hfail-ok) → verdict-neutral (flag-off == flag-on, 13v/11e)
+→ golden regenerated (28 leaves, 338 tests green) → deep-mutation non-vacuity
+(a deep-node flip fails the bridge). All bridges behave as classified.
+
+**Assumptions / what's partial.**
+- **max_u64 stays honest-fail** (G4): its two ensures leaves are the whole
+  `x<y → (let r := …; r≥x ∧ r≥y)` If-fold living on the goal path — needs
+  `ExprData::Let` + `Not` fold-in. Deferred to W6e. Sound (fail-loud, never
+  silent-pass).
+- **3 census rejections** (`vec_read`/`vec_push7`/`fill_zeros`, `call-generic`):
+  exec-Vec calls and a quantifier bind — outside the cast class, correctly not
+  serialized. Not bridge failures.
+- **11 fixture proof-search errors** are the Lean backend failing to PROVE hard
+  obligations, orthogonal to cert emission (emission-only at the SST snapshot).
+  Same 11 with the flag off. Not caused by, and cannot be caused by, this change.
+- **The deep-mutation is a spot-check**, not the systematic expression-level
+  mutation-kill (drop `Int.toNat` on the prod side across the cast class) — that
+  is **W6e**, together with G4 fold-in.
+
+**Lasting artifact:** the corpus coverage map + gap taxonomy (G0–G7) above — the
+expression-level roadmap the rest of W6 executes against — plus this: the deep
+R2 bridge closing over the whole coverable corpus, with the mechanism both
+Lean-verified (`expr_mirror_kernel_computes`) and now demonstrated on real
+serializer output.

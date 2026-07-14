@@ -105,7 +105,7 @@ fn golden_add_capped_cert() {
             goal_term = lines[i + 1].trim().to_string();
         }
     }
-    assert_eq!(leaf_texts.len(), 24, "golden leaf-table size drifted");
+    assert_eq!(leaf_texts.len(), 28, "golden leaf-table size drifted");
     assert_eq!(goal_names.len(), 4, "golden goal count drifted");
     assert!(!ctx_term.is_empty(), "ctx term not recovered from golden");
     assert!(!stm_term.is_empty(), "sst term not recovered from golden");
