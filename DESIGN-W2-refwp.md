@@ -46,6 +46,65 @@ Requires the flag to ride through tgt's crate-local `check.sh` (one-line
 plumbing there; the memory note "verify tactus-* with the CRATE-LOCAL
 check.sh" applies).
 
+### 1.1 Census run — mechanism validated + two prerequisites the plan missed (opus-b14-cont, 2026-07-14)
+
+Board `bootstrap-05`. The mechanism works end-to-end; two setup facts the
+"one-line plumbing" framing did not anticipate turned up and gate the
+tgt-scale table.
+
+**Prerequisite A — the flag is NOT in the tgt-facing binary.** tgt's
+`check.sh` invokes `../tactus/source/target-verus/release/verus` (the
+`tactus/` checkout, HEAD `f2f80a0`, built Jul 12). That binary predates the
+cert work — `--tactus-emit-cert` is unknown to it (`--help` has no such
+flag). The flag lives only in the `tactus-bootstrap/` checkout (same fork
+`Phylliida/tactus.git`, HEAD ahead by all of bootstrap-01..17). So the census
+must run under `tactus-bootstrap/source/target-verus/release/verus` — either
+point tgt's `check.sh` at it (a `VERUS=` override, still ~one line) or rebuild
+`tactus/` from the bootstrap commits. I used the bootstrap release binary
+directly.
+
+**Prerequisite B — the census is cache-confounded; it must run COLD.** Cert
+emission (`emit_cert`) is gated behind *actual* verification of a fn — a
+cache-hit fn is skipped before the emit path, so it is never censused. A warm
+run of tgt (`-V cache`, 12M warm cache) reported `24 verified, 0 errors, 6322
+cached` and a census note of only **`certified 1/9 fns`** — i.e. the census
+covered just the 9 cert-eligible fns among the 24 that happened to re-verify,
+not the ~3116-fn crate. **A tgt-wide census requires running WITHOUT `-V
+cache`** (omit it — the raw binary does not cache by default; `--no-cache` is
+a `check.sh`-only flag and is rejected by the binary). Cold runs neither read
+nor write the cache, so the warm 12M cache is preserved.
+
+**Verdict-neutrality confirmed at both scales (N3 §7.4 re-check):** `0 errors`
+with the flag on in every run, including the warm tgt run (`24 verified, 0
+errors, 6322 cached`). The flag does not perturb verdicts. ✓
+
+**Fixture-family census (complete, cold, `bootstrap-fixture/lib.rs`, 14 fns):**
+
+| metric | value |
+|---|---|
+| certified | **9 / 14** (64%) |
+| verified / errors (flag ON, cold) | 20 / **0** |
+| verified / errors (flag OFF, cold) | 20 / **0** (identical → zero verdict delta) |
+| cert files written | 9 `*.cert.lean` |
+| wall-clock flag OFF / ON (cold) | 1.073s / 1.047s (**overhead in the noise at this scale**) |
+
+Uncertified constructs (fixture) — ranked:
+
+| construct tag | fn count | fns |
+|---|---|---|
+| `call` (`StmX::Call`) | **5** | quad_exec, count_down, vec_read, vec_push7, fill_zeros |
+
+At fixture scale the **entire** stage-A gap is `StmData::Call` — exactly
+`bootstrap-02b`. (Overhead is unmeasurable here because the fixture verifies
+in ~1s; the "rendering leaves twice" budget only shows at tgt scale.)
+
+**tgt-wide table — pending the cold run.** A cold `--tactus-emit-cert` run over
+all of tgt is launched (`/tmp/n4-tgt-cold.log`). The warm run already surfaced
+two real tag families beyond `call`: `assert-query` (e.g.
+`todd_coxeter_rt.symbol_to_column_exec`, `…inverse_column_exec`). The full
+ranked bucket table (expected big buckets per the plan: trait-method
+obligations, generics, closures, bv) goes here once the cold run lands.
+
 ## 2. W2 — refWp stage A (the heart)
 
 Reference WP authored as `tactus-core` spec fns over the (amended) mirror
