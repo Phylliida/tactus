@@ -1,9 +1,9 @@
 ---
 title: "W6b — land the frozen ExprData/TypData/render_exp mirror types in tactus-core (the one cache-churning edit)"
-status: todo
-claimed_by:
+status: in_progress
+claimed_by: opus-b21
 created: 2026-07-14T02:40:00Z
-updated: 2026-07-14T02:40:00Z
+updated: 2026-07-14T03:10:00Z
 ---
 
 ## Description

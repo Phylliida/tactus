@@ -21,6 +21,14 @@
 //! * Stage A (W2): expressions, types, locals, and binder names
 //!   embedded in statements are OPAQUE LEAF IDS (u64) resolved through
 //!   the serializer's side table of production-rendered Lean terms.
+//! * Stage B (W6): obligation leaves optionally deepen into a structural
+//!   `ExprData` tree (`GoalData::LeafE`), rendered by `render_exp` from the
+//!   raw SST's type tags — ADDITIVE over stage A (refWp still emits
+//!   `Leaf(u64)`; W6c wires the serializer to emit `LeafE`). Shape frozen by
+//!   the W6a probe (probe-w0/probe12_w6a_castleaf); the reference renderer
+//!   RE-DERIVES the `as nat` coercion from type tags, so a production emitter
+//!   that applies it inconsistently diverges and the `decide` bridge catches
+//!   it (DESIGN-W6-stageB.md §2/§3.1).
 //!
 //! N2.1 amendments (DESIGN-W2-refwp.md §0 / §2.1 — the fields refWp's
 //! equations need, added BEFORE the serializer freezes the literal shape):
@@ -213,10 +221,74 @@ pub enum StmData {
     Seq(Box<StmData>, Box<StmData>),
 }
 
+// ── W6b: expression mirror (stage B — cast-class deep leaves) ────────
+// The hybrid-leaf expression vocabulary the W6a probe froze
+// (probe-w0/probe12_w6a_castleaf). Stage-A leaves are opaque interned u64s;
+// stage B additively deepens obligation leaves into a structural expression
+// tree whose cast/coercion decisions the reference renderer RE-DERIVES from
+// the raw SST's type tags (implementation diversity D2). Datatype discipline
+// unchanged: OWN types only, no Seq/Map, one-way nesting (GoalData →
+// ExprData; RawExp → RawExp; ExprData → ExprData — none mutual), every
+// recursive worker `structural_decreases`.
+
+/// Minimal type mirror. The cast decision needs only `Int` (a uN, renders
+/// Lean `Int`) vs `Nat`; `Bool` types comparisons/`Eq` (NOT arith-coercion
+/// sites); `Named`/`Ref` cover user datatypes and `&`-params (the `.deref`
+/// class). Non-recursive (`TyRef` carries the pointee's interned id, not a
+/// TypData) — so `typ_size` needs no `structural_decreases`.
+///
+/// Variant names are `Ty`-prefixed: the tactus Lean backend renders a
+/// nullary constructor as `(Name : TypData)`, so bare `Int`/`Nat`/`Bool`
+/// would resolve to Lean's builtin types instead of these constructors
+/// ("type expected, got (Nat : TypData)"). The prefix avoids the collision.
+pub enum TypData {
+    TyInt,
+    TyNat,
+    TyBool,
+    TyNamed(u64),
+    TyRef(u64),
+}
+
+/// Which materialized cast a `Cast` node denotes.
+pub enum CastKind {
+    IntToNat,   // `Int.toNat` (the materialized `as nat`)
+    NatToInt,   // `Int.ofNat` (the reverse; present for completeness)
+}
+
+/// The HYBRID leaf. Structural cast/binop/app/fieldproj/span decisions are
+/// mirrored; terminal atoms (var reads, spec-fn/type names) stay interned
+/// `u64`. Atoms CARRY their id so a forgotten cast (`Atom 1` vs
+/// `Cast IntToNat (Atom 1)`) is a shape difference the bridge catches (the
+/// §2.1 safety condition).
+pub enum ExprData {
+    Atom(u64),                              // var read / spec-fn or type name
+    Lit(int),                               // integer literal
+    Cast(CastKind, Box<ExprData>),          // Int.toNat / Int.ofNat node
+    BinOp(u64, Box<ExprData>, Box<ExprData>),
+    App(u64, Box<ExprData>),                // lib.tri (…), lib.tree_head (…)
+    FieldProj(Box<ExprData>, u64),          // `.deref`, `.x`, `.1`, …
+    SpanMark(u64, Box<ExprData>),           // `/- @rust:loc -/ <e>` wrapper
+}
+
+/// The NEW independent input: the raw SST expression tree, mirrored to data
+/// and type-annotated. NOT rendered through production's `to_lean_sst_expr`
+/// — that independence is what gives the bridge its diversity. (W6c will
+/// transcribe `vir::sst::ExpX` into this; the type tags read off the SST's
+/// per-node `typ`.)
+pub enum RawExp {
+    Var(u64, TypData),                              // typed variable read
+    Lit(int, TypData),
+    Clip(TypData, Box<RawExp>),                     // explicit `as` cast (Verus Clip)
+    BinOp(u64, TypData, Box<RawExp>, Box<RawExp>),  // 2nd slot = op RESULT type
+    Call(u64, TypData, Box<RawExp>, TypData),       // fn, ret ty, arg, arg ty
+    Deref(Box<RawExp>),                             // `*t` on a `&`-param
+    Span(u64, Box<RawExp>),
+}
+
 // ── Goals: the refWp output shape ───────────────────────────────────
 
 pub enum GoalData {
-    /// A rendered obligation leaf.
+    /// A rendered obligation leaf (stage-A opaque interned id).
     Leaf(u64),
     /// hypothesis leaf → goal.
     Imp(u64, Box<GoalData>),
@@ -224,6 +296,12 @@ pub enum GoalData {
     All(u64, u64, Box<GoalData>),
     /// (binder id, value leaf, body) — let-binding.
     Let(u64, u64, Box<GoalData>),
+    /// W6b (stage B): a DEEP obligation leaf carrying the rendered `ExprData`
+    /// tree instead of an opaque u64. Additive — refWp does NOT yet emit this
+    /// (`close` still produces `Leaf(u64)`); W6c wires the serializer to
+    /// transcribe raw SST exprs and emit `LeafE`. The `goal_eq` bridge already
+    /// compares two `LeafE`s structurally via `expr_eq`.
+    LeafE(ExprData),
 }
 
 /// One-way nesting (GoalList → GoalData, never back): plain recursion.
@@ -350,6 +428,9 @@ pub open spec fn goal_size(g: GoalData) -> nat
         GoalData::Imp(_h, b) => 1 + goal_size(*b),
         GoalData::All(_x, _t, b) => 1 + goal_size(*b),
         GoalData::Let(_x, _v, b) => 1 + goal_size(*b),
+        // A deep leaf is still ONE spine node (like `Leaf`); its expression
+        // depth is measured by `expr_size`, not folded into the goal spine.
+        GoalData::LeafE(_e) => 1,
     }
 }
 
@@ -367,6 +448,289 @@ pub open spec fn goal_count(gs: GoalList) -> nat
 pub open spec fn fnctx_arity(c: FnCtxData) -> nat {
     binder_len(c.params)
 }
+
+// ── W6b: expression measures, reference renderer, structural eq ─────
+// The stage-B counterparts of the skeleton size fns + the goal_eq family,
+// on the expression vocabulary. All structural / kernel-computable.
+
+// Structural size of an expression (spine node count).
+#[verifier::structural_decreases]
+pub open spec fn expr_size(e: ExprData) -> nat
+    decreases e
+{
+    match e {
+        ExprData::Atom(_) => 1,
+        ExprData::Lit(_) => 1,
+        ExprData::Cast(_k, t) => 1 + expr_size(*t),
+        ExprData::BinOp(_op, l, r) => 1 + expr_size(*l) + expr_size(*r),
+        ExprData::App(_fn, a) => 1 + expr_size(*a),
+        ExprData::FieldProj(t, _f) => 1 + expr_size(*t),
+        ExprData::SpanMark(_loc, t) => 1 + expr_size(*t),
+    }
+}
+
+// Structural size of a type mirror. Non-recursive (every TypData is flat) —
+// no `structural_decreases`; the match documents the variant set.
+pub open spec fn typ_size(t: TypData) -> nat {
+    match t {
+        TypData::TyInt => 1,
+        TypData::TyNat => 1,
+        TypData::TyBool => 1,
+        TypData::TyNamed(_) => 1,
+        TypData::TyRef(_) => 1,
+    }
+}
+
+// TypData tag (kernel-computable discriminant; the cast decision reads it).
+pub open spec fn td_tag(t: TypData) -> nat {
+    match t {
+        TypData::TyInt => 0,
+        TypData::TyNat => 1,
+        TypData::TyBool => 2,
+        TypData::TyNamed(_) => 3,
+        TypData::TyRef(_) => 4,
+    }
+}
+
+// The type a `Deref` presents to its parent: `&T` (Ref inner) becomes the
+// pointee `Named inner`; every other type derefs to itself. Factored into a
+// top-level fn (NOT a match nested inside `type_of`'s Deref arm) per the
+// decide-checker flattening caveat (see `ret_frame`). Explicit arms, no
+// wildcard.
+pub open spec fn deref_type(t: TypData) -> TypData {
+    match t {
+        TypData::TyRef(inner) => TypData::TyNamed(inner),
+        TypData::TyInt => TypData::TyInt,
+        TypData::TyNat => TypData::TyNat,
+        TypData::TyBool => TypData::TyBool,
+        TypData::TyNamed(n) => TypData::TyNamed(n),
+    }
+}
+
+// The rendered type a raw node presents to its parent. Crucially a
+// `Clip target` presents `target` (not its operand's type) — that is how an
+// elided-clip operand still reads `Int` to the enclosing op and a
+// materialized one reads `Nat`.
+#[verifier::structural_decreases]
+pub open spec fn type_of(re: RawExp) -> TypData
+    decreases re
+{
+    match re {
+        RawExp::Var(_id, ty) => ty,
+        RawExp::Lit(_v, ty) => ty,
+        RawExp::Clip(target, _e) => target,
+        RawExp::BinOp(_op, ty, _l, _r) => ty,
+        RawExp::Call(_fn, ret, _arg, _argty) => ret,
+        RawExp::Deref(e) => deref_type(type_of(*e)),
+        RawExp::Span(_loc, e) => type_of(*e),
+    }
+}
+
+// The coercion PREDICATE: an operand that renders `Int` under an op/target
+// that renders `Nat` needs the `Int.toNat` the `as nat` denotes. Returns nat
+// (1/0) — a bool-returning spec fn lowers to a noncomputable Prop on which
+// `decide` sticks (finding-5).
+pub open spec fn needs_nat_coercion(operand: TypData, op_result: TypData) -> nat {
+    if td_tag(operand) == 0 && td_tag(op_result) == 1 { 1 } else { 0 }
+}
+
+// Wrap `e` in an `Int.toNat` cast iff the predicate fired.
+pub open spec fn coerce_if(b: nat, e: ExprData) -> ExprData {
+    if b == 1 { ExprData::Cast(CastKind::IntToNat, Box::new(e)) } else { e }
+}
+
+// The interned field id for a `.deref` (the `&`-param dereference field).
+pub open spec fn deref_field() -> u64 { 0 }
+
+// `render_exp` reimplements the cast/coercion decision UNIFORMLY from the
+// type tags, independently of production's renderer. Plainly structural (each
+// call is on a subterm) so the kernel reduces it under `decide`/`rfl`.
+#[verifier::structural_decreases]
+pub open spec fn render_exp(re: RawExp) -> ExprData
+    decreases re
+{
+    match re {
+        RawExp::Var(id, _ty) => ExprData::Atom(id),
+        RawExp::Lit(v, _ty) => ExprData::Lit(v),
+        // explicit `as` cast: materialize Int.toNat iff there is a real
+        // Int→Nat gap between the operand and the clip target.
+        RawExp::Clip(target, e) =>
+            coerce_if(needs_nat_coercion(type_of(*e), target), render_exp(*e)),
+        // nat-typed arith op: each Int-rendering operand is materialized (the
+        // Friction-2 site). A bool-typed op (cmp/Eq) has
+        // `needs_nat_coercion _ Bool = 0`, so operands are left as-is.
+        RawExp::BinOp(op, ty, l, r) => {
+            let l2 = coerce_if(needs_nat_coercion(type_of(*l), ty), render_exp(*l));
+            let r2 = coerce_if(needs_nat_coercion(type_of(*r), ty), render_exp(*r));
+            ExprData::BinOp(op, Box::new(l2), Box::new(r2))
+        },
+        // call-arg coercion: same predicate, target is the expected param type.
+        RawExp::Call(fnid, _ret, arg, argty) =>
+            ExprData::App(fnid,
+                Box::new(coerce_if(needs_nat_coercion(type_of(*arg), argty), render_exp(*arg)))),
+        RawExp::Deref(e) => ExprData::FieldProj(Box::new(render_exp(*e)), deref_field()),
+        RawExp::Span(loc, e) => ExprData::SpanMark(loc, Box::new(render_exp(*e))),
+    }
+}
+
+// ── W6b: structural equality on expressions (the LeafE bridge) ──────
+// Same discipline as `goal_eq`: match the FIRST arg alone (structural +
+// unambiguous), read the second through NON-recursive tag+projection
+// accessors, every arm body a chain of `if`s (never a nested match). Returns
+// nat (1/0) for the `decide` idiom.
+
+pub open spec fn ck_tag(k: CastKind) -> nat {
+    match k {
+        CastKind::IntToNat => 0,
+        CastKind::NatToInt => 1,
+    }
+}
+pub open spec fn castkind_eq(a: CastKind, b: CastKind) -> nat {
+    if ck_tag(a) == ck_tag(b) { 1 } else { 0 }
+}
+
+pub open spec fn ed_tag(e: ExprData) -> nat {
+    match e {
+        ExprData::Atom(_) => 0,
+        ExprData::Lit(_) => 1,
+        ExprData::Cast(_, _) => 2,
+        ExprData::BinOp(_, _, _) => 3,
+        ExprData::App(_, _) => 4,
+        ExprData::FieldProj(_, _) => 5,
+        ExprData::SpanMark(_, _) => 6,
+    }
+}
+pub open spec fn ed_atom_id(e: ExprData) -> u64 { match e { ExprData::Atom(x) => x, _ => 0 } }
+pub open spec fn ed_lit_val(e: ExprData) -> int { match e { ExprData::Lit(v) => v, _ => 0 } }
+pub open spec fn ed_cast_k(e: ExprData) -> CastKind { match e { ExprData::Cast(k, _) => k, _ => CastKind::IntToNat } }
+pub open spec fn ed_cast_e(e: ExprData) -> ExprData { match e { ExprData::Cast(_, t) => *t, _ => ExprData::Atom(0) } }
+pub open spec fn ed_binop_op(e: ExprData) -> u64 { match e { ExprData::BinOp(op, _, _) => op, _ => 0 } }
+pub open spec fn ed_binop_l(e: ExprData) -> ExprData { match e { ExprData::BinOp(_, l, _) => *l, _ => ExprData::Atom(0) } }
+pub open spec fn ed_binop_r(e: ExprData) -> ExprData { match e { ExprData::BinOp(_, _, r) => *r, _ => ExprData::Atom(0) } }
+pub open spec fn ed_app_fn(e: ExprData) -> u64 { match e { ExprData::App(f, _) => f, _ => 0 } }
+pub open spec fn ed_app_arg(e: ExprData) -> ExprData { match e { ExprData::App(_, a) => *a, _ => ExprData::Atom(0) } }
+pub open spec fn ed_fp_e(e: ExprData) -> ExprData { match e { ExprData::FieldProj(t, _) => *t, _ => ExprData::Atom(0) } }
+pub open spec fn ed_fp_field(e: ExprData) -> u64 { match e { ExprData::FieldProj(_, f) => f, _ => 0 } }
+pub open spec fn ed_span_loc(e: ExprData) -> u64 { match e { ExprData::SpanMark(loc, _) => loc, _ => 0 } }
+pub open spec fn ed_span_e(e: ExprData) -> ExprData { match e { ExprData::SpanMark(_, t) => *t, _ => ExprData::Atom(0) } }
+
+#[verifier::structural_decreases]
+pub open spec fn expr_eq(a: ExprData, b: ExprData) -> nat
+    decreases a
+{
+    match a {
+        ExprData::Atom(x) =>
+            if ed_tag(b) == 0 { if x == ed_atom_id(b) { 1 } else { 0 } } else { 0 },
+        ExprData::Lit(v) =>
+            if ed_tag(b) == 1 { if v == ed_lit_val(b) { 1 } else { 0 } } else { 0 },
+        ExprData::Cast(k, t) =>
+            if ed_tag(b) == 2 {
+                if castkind_eq(k, ed_cast_k(b)) == 1 { expr_eq(*t, ed_cast_e(b)) } else { 0 }
+            } else { 0 },
+        ExprData::BinOp(op, l, r) =>
+            if ed_tag(b) == 3 {
+                if op == ed_binop_op(b) {
+                    if expr_eq(*l, ed_binop_l(b)) == 1 { expr_eq(*r, ed_binop_r(b)) } else { 0 }
+                } else { 0 }
+            } else { 0 },
+        ExprData::App(f, a2) =>
+            if ed_tag(b) == 4 {
+                if f == ed_app_fn(b) { expr_eq(*a2, ed_app_arg(b)) } else { 0 }
+            } else { 0 },
+        ExprData::FieldProj(t, fld) =>
+            if ed_tag(b) == 5 {
+                if fld == ed_fp_field(b) { expr_eq(*t, ed_fp_e(b)) } else { 0 }
+            } else { 0 },
+        ExprData::SpanMark(loc, t) =>
+            if ed_tag(b) == 6 {
+                if loc == ed_span_loc(b) { expr_eq(*t, ed_span_e(b)) } else { 0 }
+            } else { 0 },
+    }
+}
+
+// In-crate kernel-computation guard for the expression mirror: the W6a
+// probe's Cases A/B/C + the D negative control, now against the LANDED
+// render_exp/expr_eq — pinning that the frozen shape kernel-computes IN
+// tactus-core (analogous to `skeleton_kernel_computes`). Case B is
+// load-bearing: render_exp DERIVES both `Int.toNat`s from `Mul:Nat` +
+// `operand:Int` (no source cast to copy), so an inconsistent production shape
+// diverges — the documented core win (DESIGN-W6-stageB.md §3.1/§6).
+proof fn expr_mirror_kernel_computes()
+    ensures
+        // Case A — sum_to leaf `Int.toNat r = lib.tri (Int.toNat n)` from raw
+        // `(r as nat) == tri((n as nat))`; kill = LHS Int.toNat dropped.
+        expr_eq(
+            render_exp(RawExp::BinOp(0, TypData::TyBool,
+                Box::new(RawExp::Clip(TypData::TyNat, Box::new(RawExp::Var(1, TypData::TyInt)))),
+                Box::new(RawExp::Call(10, TypData::TyNat,
+                    Box::new(RawExp::Clip(TypData::TyNat, Box::new(RawExp::Var(2, TypData::TyInt)))),
+                    TypData::TyNat)))),
+            ExprData::BinOp(0,
+                Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(1)))),
+                Box::new(ExprData::App(10,
+                    Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(2)))))))
+        ) == 1,
+        expr_eq(
+            render_exp(RawExp::BinOp(0, TypData::TyBool,
+                Box::new(RawExp::Clip(TypData::TyNat, Box::new(RawExp::Var(1, TypData::TyInt)))),
+                Box::new(RawExp::Call(10, TypData::TyNat,
+                    Box::new(RawExp::Clip(TypData::TyNat, Box::new(RawExp::Var(2, TypData::TyInt)))),
+                    TypData::TyNat)))),
+            ExprData::BinOp(0,
+                Box::new(ExprData::Atom(1)),  // BUG: forgotten Int.toNat
+                Box::new(ExprData::App(10,
+                    Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(2)))))))
+        ) == 0,
+        // Case B — `(x as nat) * x`, BOTH inner clips elided: render_exp
+        // DERIVES both casts from the nat-typed Mul. Kill = inconsistent.
+        expr_eq(
+            render_exp(RawExp::BinOp(1, TypData::TyNat,
+                Box::new(RawExp::Var(3, TypData::TyInt)),
+                Box::new(RawExp::Var(3, TypData::TyInt)))),
+            ExprData::BinOp(1,
+                Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(3)))),
+                Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(3)))))
+        ) == 1,
+        expr_eq(
+            render_exp(RawExp::BinOp(1, TypData::TyNat,
+                Box::new(RawExp::Var(3, TypData::TyInt)),
+                Box::new(RawExp::Var(3, TypData::TyInt)))),
+            ExprData::BinOp(1,
+                Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(3)))),
+                Box::new(ExprData::Atom(3)))  // BUG: cast at one operand only
+        ) == 0,
+        // Case C — `lib.tree_head (*t)` on t:&Tree → FieldProj; kill = deref
+        // dropped.
+        expr_eq(
+            render_exp(RawExp::Call(11, TypData::TyNamed(100),
+                Box::new(RawExp::Deref(Box::new(RawExp::Var(4, TypData::TyRef(100))))),
+                TypData::TyNamed(100))),
+            ExprData::App(11, Box::new(ExprData::FieldProj(Box::new(ExprData::Atom(4)), 0)))
+        ) == 1,
+        expr_eq(
+            render_exp(RawExp::Call(11, TypData::TyNamed(100),
+                Box::new(RawExp::Deref(Box::new(RawExp::Var(4, TypData::TyRef(100))))),
+                TypData::TyNamed(100))),
+            ExprData::App(11, Box::new(ExprData::Atom(4)))  // BUG: dropped .deref
+        ) == 0,
+        // Negative control (D): a bool-typed cmp does NOT coerce its bare LHS
+        // (needs_nat_coercion fires only on Nat targets).
+        expr_eq(
+            render_exp(RawExp::BinOp(0, TypData::TyBool,
+                Box::new(RawExp::Var(3, TypData::TyInt)),
+                Box::new(RawExp::Clip(TypData::TyNat, Box::new(RawExp::Var(3, TypData::TyInt)))))),
+            ExprData::BinOp(0,
+                Box::new(ExprData::Atom(3)),
+                Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(3)))))
+        ) == 1,
+        // Lit + measures kernel-compute.
+        expr_eq(ExprData::Lit(5), ExprData::Lit(5)) == 1,
+        expr_eq(ExprData::Lit(5), ExprData::Lit(6)) == 0,
+        expr_size(ExprData::BinOp(1,
+            Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(3)))),
+            Box::new(ExprData::Atom(3)))) == 4,
+        typ_size(TypData::TyRef(7)) == 1
+by { decide }
 
 // ── In-crate kernel-computation sanity (decide через structural) ────
 
@@ -900,6 +1264,7 @@ pub open spec fn gd_tag(g: GoalData) -> nat {
         GoalData::Imp(_, _) => 1,
         GoalData::All(_, _, _) => 2,
         GoalData::Let(_, _, _) => 3,
+        GoalData::LeafE(_) => 4,
     }
 }
 pub open spec fn gd_leaf_id(g: GoalData) -> u64 { match g { GoalData::Leaf(x) => x, _ => 0 } }
@@ -908,6 +1273,11 @@ pub open spec fn gd_all_name(g: GoalData) -> u64 { match g { GoalData::All(x, _,
 pub open spec fn gd_all_typ(g: GoalData) -> u64 { match g { GoalData::All(_, t, _) => t, _ => 0 } }
 pub open spec fn gd_let_name(g: GoalData) -> u64 { match g { GoalData::Let(x, _, _) => x, _ => 0 } }
 pub open spec fn gd_let_val(g: GoalData) -> u64 { match g { GoalData::Let(_, v, _) => v, _ => 0 } }
+// The rendered ExprData of a deep leaf (self-defaulting projection; the
+// goal_eq LeafE arm reads it only after the tag guard confirms b is a LeafE).
+pub open spec fn gd_leafe_expr(g: GoalData) -> ExprData {
+    match g { GoalData::LeafE(e) => e, _ => ExprData::Atom(0) }
+}
 // The single child of a non-leaf node (self for a leaf — never recursed on).
 pub open spec fn gd_child(g: GoalData) -> GoalData {
     match g {
@@ -915,6 +1285,7 @@ pub open spec fn gd_child(g: GoalData) -> GoalData {
         GoalData::All(_, _, t) => *t,
         GoalData::Let(_, _, t) => *t,
         GoalData::Leaf(x) => GoalData::Leaf(x),
+        GoalData::LeafE(e) => GoalData::LeafE(e),
     }
 }
 
@@ -941,6 +1312,12 @@ pub open spec fn goal_eq(a: GoalData, b: GoalData) -> nat
                     if v1 == gd_let_val(b) { goal_eq(*t1, gd_child(b)) } else { 0 }
                 } else { 0 }
             } else { 0 },
+        // Deep leaf: compare the two rendered ExprData trees structurally.
+        // `expr_eq` is a SEPARATE recursion (on ExprData), so `goal_eq`'s
+        // `decreases a` is unaffected — this arm makes no recursive goal_eq
+        // call.
+        GoalData::LeafE(e1) =>
+            if gd_tag(b) == 4 { expr_eq(e1, gd_leafe_expr(b)) } else { 0 },
     }
 }
 
@@ -1508,6 +1885,44 @@ proof fn goal_eq_strictness()
         goals_eq(
             GoalList::Cons(Box::new(GoalData::Leaf(9)), Box::new(GoalList::Nil)),
             GoalList::Nil) == 0
+by { decide }
+
+// ── W6b: the additive LeafE goal variant threads the goal_eq bridge ──
+//
+// Verdict-neutral — refWp does NOT yet emit `LeafE` (`close` still produces
+// `Leaf(u64)`); W6c wires the serializer. This pins that a `LeafE` wrapping
+// a rendered expr kernel-computes through `goal_eq`/`goals_eq`/`goal_size`:
+// a LeafE of the Case-B expr matches itself, the inconsistent mutation does
+// NOT, a LeafE vs a stage-A u64 `Leaf` is a structural (tag) mismatch, and a
+// goals list carrying a LeafE decides.
+proof fn leafe_goal_bridge_kernel_computes()
+    ensures
+        goal_eq(
+            GoalData::LeafE(ExprData::BinOp(1,
+                Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(3)))),
+                Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(3)))))),
+            GoalData::LeafE(ExprData::BinOp(1,
+                Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(3)))),
+                Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(3))))))
+        ) == 1,
+        goal_eq(
+            GoalData::LeafE(ExprData::BinOp(1,
+                Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(3)))),
+                Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(3)))))),
+            GoalData::LeafE(ExprData::BinOp(1,
+                Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(3)))),
+                Box::new(ExprData::Atom(3))))
+        ) == 0,
+        // LeafE vs a stage-A u64 Leaf: tag mismatch either way.
+        goal_eq(GoalData::LeafE(ExprData::Atom(5)), GoalData::Leaf(5)) == 0,
+        goal_eq(GoalData::Leaf(5), GoalData::LeafE(ExprData::Atom(5))) == 0,
+        // goals_eq threads a LeafE goal.
+        goals_eq(
+            GoalList::Cons(Box::new(GoalData::LeafE(ExprData::Atom(9))), Box::new(GoalList::Nil)),
+            GoalList::Cons(Box::new(GoalData::LeafE(ExprData::Atom(9))), Box::new(GoalList::Nil))
+        ) == 1,
+        // goal_size counts a LeafE as one spine node (like Leaf).
+        goal_size(GoalData::Imp(7, Box::new(GoalData::LeafE(ExprData::Atom(9))))) == 2
 by { decide }
 
 proof fn amended_shapes_kernel_compute()
