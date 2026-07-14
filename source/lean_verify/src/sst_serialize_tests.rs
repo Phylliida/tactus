@@ -32,7 +32,11 @@ fn stm_size_matches_core() {
     // skeleton_kernel_computes example: size = 5. `Assert` carries the
     // finding-1 two-leaf form (annotated obligation, bare hyp); `stm_size`
     // counts the head, so the two ids don't change the size.
-    let term = "(lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assert 22 0)) (Tactus.Box.mk (lib.StmData.If 1 2 (Tactus.Box.mk lib.StmData.Skip) (Tactus.Box.mk (lib.StmData.Ret (Tactus.Box.mk lib.LeafList.Nil) lib.RetBind.RetNone)))))";
+    // W6d.2a: Assert's obligation slot is a DEEP `RawExp` (opaque-atom
+    // fallback here); Ret's obligation list is a `RawExpList`. Neither the
+    // inline `RawExp.Var` nor the `RawExpList.Nil` adds a counted `Cons`, so
+    // the size is still 5 (Seq+Assert+If+Skip+Ret heads).
+    let term = "(lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assert (lib.RawExp.Var 22 lib.TypData.TyBool) 0)) (Tactus.Box.mk (lib.StmData.If 1 2 (Tactus.Box.mk lib.StmData.Skip) (Tactus.Box.mk (lib.StmData.Ret (Tactus.Box.mk lib.RawExpList.Nil) lib.RetBind.RetNone)))))";
     assert_eq!(stm_size_of(term), 5);
 }
 
@@ -124,7 +128,7 @@ fn golden_add_capped_cert() {
 
 /// N3b: a hand-built `GoalShape` serializes to the expected
 /// `lib.GoalData` spine — pins the constructor mapping
-/// (`All`/`Imp`/`Let`/`Leaf`), the outermost-first fold direction
+/// (`All`/`Imp`/`Let`/`LeafE`), the outermost-first fold direction
 /// (theorem binder ends up the outermost `All`), and that every spine
 /// leaf lands in the shared table.
 #[test]
@@ -151,14 +155,15 @@ fn goal_data_spine_shape() {
     };
     let mut s = Serializer::default();
     let term = s.goal_data(&shape);
-    // Leaf-out fold: Leaf wrapped by Let, then Imp, then All outermost.
+    // Leaf-out fold: LeafE wrapped by Let, then Imp, then All outermost.
     assert!(
         term.starts_with(&format!("({}.GoalData.All ", NS)),
         "outermost node should be the ∀ binder: {}", term,
     );
     assert!(term.contains(&format!("{}.GoalData.Imp ", NS)), "{}", term);
     assert!(term.contains(&format!("{}.GoalData.Let ", NS)), "{}", term);
-    assert!(term.contains(&format!("{}.GoalData.Leaf ", NS)), "{}", term);
+    // W6d.2a: the core obligation leaf is now `LeafE(ExprData.Atom …)`.
+    assert!(term.contains(&format!("{}.GoalData.LeafE ", NS)), "{}", term);
     // Each spine leaf reached the table: binder typ, binder name, hyp,
     // let name, let value, core predicate — all distinct here.
     for want in ["Ity", "nn", "hyp0", "mm", "vv", "goalpred"] {

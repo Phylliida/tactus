@@ -761,7 +761,12 @@ impl<'a> Serializer<'a> {
             StmX::Assert(_, _, e) | StmX::AssertCompute(_, e, _) => {
                 let hyp = self.exp_leaf(e)?;
                 let oblig = self.oblig_leaf(e)?;
-                Ok(format!("({}.StmData.Assert {} {})", NS, oblig, hyp))
+                // W6d.2a: the obligation slot is now a DEEP `RawExp`. Opaque
+                // fallback — wrap the interned leaf id as `atom_ob(id)` (=
+                // `Var(id, TyBool)`), which refWp's `close_e` renders to
+                // `LeafE(Atom id)`, matching the goal side by the same id
+                // (W6d.2b deepens the coverable shapes via `raw_exp`).
+                Ok(format!("({}.StmData.Assert {} {})", NS, atom_ob_lit(oblig), hyp))
             }
 
             StmX::Assume(e) => {
@@ -792,7 +797,14 @@ impl<'a> Serializer<'a> {
                 // goal (Ret-annotation, finding-1): span_mark'd like
                 // production's `WpCtx` postcondition so the goal-side
                 // postcondition leaf reuses the same id and cancels.
-                let list = self.leaf_list(&self.pending_ens_oblig.clone());
+                // W6d.2a: the ensures obligations are now a DEEP `RawExpList`
+                // (closed via `close_each_e`). Opaque fallback per obligation
+                // (`atom_ob`), same interned ids as the stage-A goal leaves.
+                let list = {
+                    let terms: Vec<String> =
+                        self.pending_ens_oblig.iter().map(|&id| atom_ob_lit(id)).collect();
+                    raw_exp_list(&terms)
+                };
                 // Return-value binding (finding-4): production prepends
                 // `let <ret> := <e>` before the postcondition (the walker's
                 // `let_bind_synthetic(sanitize(ret), <e_ast>, …)`, peeled
@@ -1028,12 +1040,15 @@ impl<'a> Serializer<'a> {
         use crate::sst_to_lean::CertCallPost;
         // reqs: a single-element LeafList — production `and_all`s the
         // callee requires into ONE CallPrecondition obligation — or Nil.
+        // W6d.2a: reqs is now a DEEP `RawExpList` (closed via `close_each_e`).
+        // Single-element opaque fallback (or Nil) — the interned precondition
+        // id rides through as `atom_ob(id)`.
         let reqs = match &leaves.precondition {
             Some(l) => {
                 let id = self.leaves.intern(pp_expr(l));
-                self.leaf_list(&[id])
+                raw_exp_list(&[atom_ob_lit(id)])
             }
-            None => self.leaf_list(&[]),
+            None => raw_exp_list(&[]),
         };
         // dest binder id = interned leaf id of the dest's rendered name
         // (same path as `binder_id`; production Phase-5 binds
@@ -1179,15 +1194,26 @@ impl<'a> Serializer<'a> {
         let d_old_val = self.exp_leaf(&decrease[0])?;
         let decrease_oblig = self.decrease_oblig_leaf(&decrease[0], loop_id)?;
 
+        // W6d.2a: the parallel DEEP invariant obligations (`inv_obligs`,
+        // index-aligned with `inv_hyps`). Each invariant's obligation id rides
+        // through as `atom_ob(id)` — the SAME id serves the opaque frame hyp
+        // (`inv_hyps`) and the deep obligation (`inv_obligs`), split only by
+        // TYPE (opaque `u64` vs structural `RawExp`), not by content.
+        let inv_obligs = {
+            let terms: Vec<String> =
+                inv_entries.iter().map(|&(_, oblig)| atom_ob_lit(oblig)).collect();
+            raw_exp_list(&terms)
+        };
         let inv_hyps = self.binder_list(&inv_entries);
         let binders = self.binder_list(&binder_entries);
         let bounds = self.param_bound_list(&bound_entries);
 
         let body_term = self.stm(body)?;
         Ok(format!(
-            "({}.StmData.Loop {} {} {} {} {} {} {} {} {} {})",
+            "({}.StmData.Loop {} {} {} {} {} {} {} {} {} {} {})",
             NS,
             box_(&inv_hyps),
+            box_(&inv_obligs),
             box_(&binders),
             box_(&bounds),
             cond_name,
@@ -1195,7 +1221,9 @@ impl<'a> Serializer<'a> {
             neg_cond_ann,
             d_old_name,
             d_old_val,
-            decrease_oblig,
+            // W6d.2a: decrease_oblig is now a DEEP `RawExp` (like Assert);
+            // opaque fallback wraps the synthesized `0 ≤ D ∧ D < d_old` leaf id.
+            atom_ob_lit(decrease_oblig),
             box_(&body_term),
         ))
     }
@@ -1263,7 +1291,11 @@ impl<'a> Serializer<'a> {
     /// audit-only; the bridge never reads id values).
     fn goal_data(&mut self, shape: &GoalShape) -> String {
         let leaf_id = self.lexpr_leaf(&shape.leaf);
-        let mut term = format!("{}.GoalData.Leaf {}", NS, leaf_id);
+        // W6d.2a: goals are now DEEP `LeafE(ExprData)`. Opaque fallback — the
+        // whole obligation leaf as one `Atom(id)`, matching refWp's
+        // `close_e(_, atom_ob(id))` = `LeafE(Atom id)` by the same interned id
+        // (W6d.2b transcribes the coverable shapes via `lexpr_to_exprdata`).
+        let mut term = format!("{}.GoalData.LeafE ({}.ExprData.Atom {})", NS, NS, leaf_id);
         for node in shape.spine.iter().rev() {
             term = match node {
                 GoalSpine::Imp(p) => {
@@ -1713,9 +1745,14 @@ fn stm_size_of(stm_term: &str) -> u64 {
         + count(&format!("{}.StmData.Loop", NS))
         + count(&format!("{}.StmData.Skip", NS))
         + count(&format!("{}.StmData.Seq", NS));
-    // Each StmData head contributes its own `1`. LeafList/BinderList
-    // `Cons` under Call/Ret/Loop each add 1 to stm_size.
-    let leaf_cons = count(&format!("{}.LeafList.Cons", NS));
+    // Each StmData head contributes its own `1`. The obligation lists under
+    // Call/Ret/Loop are now `RawExpList`s (W6d.2a) — each `Cons` adds 1, as
+    // tactus-core's `raw_exp_list_len` counts them; BinderList `Cons`
+    // (inv_hyps/binders) likewise. (LeafList `Cons` stays counted for the
+    // pre-W6d.2a golden round-trip, where Ret/Call carried a LeafList; a live
+    // stm_term now emits RawExpList, so only one of the two is ever nonzero.)
+    let leaf_cons = count(&format!("{}.LeafList.Cons", NS))
+        + count(&format!("{}.RawExpList.Cons", NS));
     let binder_cons = count(&format!("{}.BinderList.Cons", NS));
     // Call's `post` FrameList (bootstrap-02b): `frame_len` counts each
     // FBind/FHyp/FLet entry as 1 (FNil as 0), exactly as tactus-core's
@@ -1761,6 +1798,29 @@ fn paren(term: &str) -> String {
     } else {
         format!("({})", t)
     }
+}
+
+/// The opaque-fallback obligation `RawExp` literal: tactus-core's
+/// `atom_ob(id) = RawExp::Var(id, TyBool)`, which `render_exp` maps to
+/// `ExprData::Atom(id)`. Emitted wherever the raw SST obligation leaf is not
+/// yet one of the deepened `RawExp` shapes (G0–G7, W6d.2b) — the interned
+/// `id` still cancels against the goal-side `LeafE(Atom id)` by construction
+/// (the stage-A W2 leaf match, now carried inside the deep leaf). W6d.2a.
+fn atom_ob_lit(id: u64) -> String {
+    format!("({}.RawExp.Var {} {}.TypData.TyBool)", NS, id, NS)
+}
+
+/// `lib.RawExpList` from RawExp literal terms (order preserved). The element
+/// is `Box<RawExp>` (`Cons (Box.mk <re>) (Box.mk <tail>)`, mirroring the
+/// tactus-core `RawExpList::Cons(Box<RawExp>, Box<RawExpList>)`), unlike
+/// `leaf_list`'s inline `u64` head. Feeds `close_each_e` (Call reqs, Ret
+/// enss, Loop inv_obligs). W6d.2a.
+fn raw_exp_list(terms: &[String]) -> String {
+    let mut term = format!("{}.RawExpList.Nil", NS);
+    for t in terms.iter().rev() {
+        term = format!("{}.RawExpList.Cons {} {}", NS, box_(t), box_(&term));
+    }
+    term
 }
 
 // ── W6c: RawExp emit helpers ────────────────────────────────────────
