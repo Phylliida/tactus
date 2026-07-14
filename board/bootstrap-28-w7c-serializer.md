@@ -276,6 +276,18 @@ emission + bridge `def_eq`/`dt_eq`), W7e (mutation-kill).
     (`RawDt`/`DtData`) + def-header — then W7d wires the def-body entry point + the
     e2e `def_eq` bridge (the real cross-side validation of Match AND Forall/Exists).
 
+- (2026-07-15, opus-w7c-defhdr) **Production def-HEADER `ldef_to_defdata` LANDED**
+  (split to `bootstrap-30`, DONE; lib suite 351→354/0, verdict-neutral).
+  `lean_ast::Def → lib.DefData` — `text_leaf(name)` + `def.binders`→`ParamList`
+  (`ltyp_to_typdata`) + `ltyp_to_typdata(ret_ty)` + `lexpr_to_exprdata(body)`.
+  Paired with the reference `raw_vir_def` (`bootstrap-29`). Fixture-covering DEF
+  surface (header + Ite/Match body) now complete on the production side for
+  monomorphic defs; W7d can bridge `def_eq` on `tri`. **Fork decision recorded:**
+  multi-arg AppN stays deferred (the ONLY remaining W7c piece needing the
+  cache-churning `RawList` per-arg-`TypData` edit; tgt-slice-only — fixture calls
+  are single-arg). Surviving remainders: AppN (batched) + datatype
+  (`RawDt`/`DtData`; no `tactus-core` edit; Box→`TyBox` subtlety).
+
 ## Writeup
 
 _partial — `Ite` + `Match` + `Forall`/`Exists` constructors landed on both
