@@ -32,7 +32,7 @@ fn stm_size_matches_core() {
     // skeleton_kernel_computes example: size = 5. `Assert` carries the
     // finding-1 two-leaf form (annotated obligation, bare hyp); `stm_size`
     // counts the head, so the two ids don't change the size.
-    let term = "(lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assert 22 0)) (Tactus.Box.mk (lib.StmData.If 1 2 (Tactus.Box.mk lib.StmData.Skip) (Tactus.Box.mk (lib.StmData.Ret (Tactus.Box.mk lib.LeafList.Nil))))))";
+    let term = "(lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assert 22 0)) (Tactus.Box.mk (lib.StmData.If 1 2 (Tactus.Box.mk lib.StmData.Skip) (Tactus.Box.mk (lib.StmData.Ret (Tactus.Box.mk lib.LeafList.Nil) lib.RetBind.RetNone)))))";
     assert_eq!(stm_size_of(term), 5);
 }
 
