@@ -276,6 +276,27 @@ bug-FINDING deliverable, independent of the W5 soundness proof.
 
 ## 5. Open questions (answer during W2, record here)
 
+**W2b triage (2026-07-14, from the fixture-scale bridge run — board
+bootstrap-07, `probe-w0/probe9_bridge/`):** running the bridge over ALL 11
+fixture certs (not just the four hand-demoed in b15/16/17) found a SECOND
+honest-fail beyond the known `max_u64` branch-in-leaf:
+
+- **head_exec — ref-param deref leaf divergence (NEW).** Ensures
+  `r == tree_head(*t)` on `t: &Tree`. The serializer's `oblig_leaf` (empty
+  RenderCtx) renders `*t` as bare `t` → SST ens leaf `⟦…tree_head t⟧`;
+  production's postcondition renders `t.deref` → goal leaf `⟦…tree_head t.deref⟧`.
+  Pinpoint-proved the obligation leaf is the SOLE divergence (`goals_eq refWp
+  (production with leaf6→leaf3) = 1`). Same source span, different leaf text.
+  This is the reference-parameter sibling of finding-4's documented
+  "empty-RenderCtx does not replicate a coercion/subst" caveat: a SERIALIZER
+  faithfulness gap (not a refWp or production bug), and exactly the kind of
+  divergence W3's differential gate is meant to catch — surfaced early here.
+  Stage A does not certify leaf rendering (§2.5), so the bridge SOUNDLY does not
+  close. Fix (make the serializer render the ensures with production's
+  param-deref subst so head_exec bridges) spun out as its own board card. Both
+  honest-fails are now permanent classified entries in the probe9 runner: a
+  honest-fail that later CLOSES is treated as a regression.
+
 **W2a resolution status (2026-07-14, from the on-disk fixture certs +
 authoring refWp — see board bootstrap-06 writeup for full detail):**
 
