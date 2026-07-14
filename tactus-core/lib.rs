@@ -293,6 +293,13 @@ pub enum ExprData {
     App(u64, Box<ExprData>),                // lib.tri (…), lib.tree_head (…)
     FieldProj(Box<ExprData>, u64),          // `.deref`, `.x`, `.1`, …
     SpanMark(u64, Box<ExprData>),           // `/- @rust:loc -/ <e>` wrapper
+    // G4: goal-side let-binding `let <name> := <value>; <body>` — the If-fold
+    // in max_u64's ensures leaf (`let r := let m := y; m; r ≥ x ∧ r ≥ y`).
+    // Structural; `name` is the interned binder id (matches the reference
+    // side's `RawExp::Let` name so the two agree by construction).
+    Let(u64, Box<ExprData>, Box<ExprData>),
+    // G4: unary logical negation `¬ e` — max_u64's `¬(x < y)` branch guard.
+    Not(Box<ExprData>),
 }
 
 /// The NEW independent input: the raw SST expression tree, mirrored to data
@@ -320,6 +327,12 @@ pub enum RawExp {
     // carried — the serializer fails loud on them (none appear in the fixture).
     HasType(u64, Box<RawExp>),
     Deref(Box<RawExp>),                             // `*t` on a `&`-param (dead for the serializer; see G2)
+    // G4: let-binding + negation mirrors (the max_u64 If-fold). `Let` carries
+    // the interned binder id; `render_exp` maps both STRAIGHT THROUGH —
+    // structural, with no coercion at this node (any Int→Nat coercion lives in
+    // the sub-expressions, materialized at their own BinOp/Call/Clip nodes).
+    Let(u64, Box<RawExp>, Box<RawExp>),
+    Not(Box<RawExp>),
     Span(u64, Box<RawExp>),
 }
 
@@ -533,6 +546,8 @@ pub open spec fn expr_size(e: ExprData) -> nat
         ExprData::App(_fn, a) => 1 + expr_size(*a),
         ExprData::FieldProj(t, _f) => 1 + expr_size(*t),
         ExprData::SpanMark(_loc, t) => 1 + expr_size(*t),
+        ExprData::Let(_n, v, bd) => 1 + expr_size(*v) + expr_size(*bd),
+        ExprData::Not(t) => 1 + expr_size(*t),
     }
 }
 
@@ -593,6 +608,9 @@ pub open spec fn type_of(re: RawExp) -> TypData
         // The refinement is a proposition (`0 ≤ e ∧ e < 2^n`) → Bool.
         RawExp::HasType(_n, _inner) => TypData::TyBool,
         RawExp::Deref(e) => deref_type(type_of(*e)),
+        // G4: a `let`'s type is its body's; `¬ e` is a proposition (Bool).
+        RawExp::Let(_name, _val, body) => type_of(*body),
+        RawExp::Not(_e) => TypData::TyBool,
         RawExp::Span(_loc, e) => type_of(*e),
     }
 }
@@ -701,6 +719,12 @@ pub open spec fn render_exp(re: RawExp) -> ExprData
                     Box::new(ExprData::Lit(pow2(n as nat))))))
         },
         RawExp::Deref(e) => ExprData::FieldProj(Box::new(render_exp(*e)), deref_field()),
+        // G4: structural pass-through — the binder id rides across, value and
+        // body render recursively (their own coercions already materialized at
+        // BinOp/Call/Clip). No coercion decision at the Let/Not node itself.
+        RawExp::Let(name, val, body) =>
+            ExprData::Let(name, Box::new(render_exp(*val)), Box::new(render_exp(*body))),
+        RawExp::Not(e) => ExprData::Not(Box::new(render_exp(*e))),
         RawExp::Span(loc, e) => ExprData::SpanMark(loc, Box::new(render_exp(*e))),
     }
 }
@@ -731,6 +755,8 @@ pub open spec fn ed_tag(e: ExprData) -> nat {
         ExprData::FieldProj(_, _) => 5,
         ExprData::SpanMark(_, _) => 6,
         ExprData::LitBool(_) => 7,
+        ExprData::Let(_, _, _) => 8,
+        ExprData::Not(_) => 9,
     }
 }
 pub open spec fn ed_atom_id(e: ExprData) -> u64 { match e { ExprData::Atom(x) => x, _ => 0 } }
@@ -747,6 +773,11 @@ pub open spec fn ed_fp_e(e: ExprData) -> ExprData { match e { ExprData::FieldPro
 pub open spec fn ed_fp_field(e: ExprData) -> u64 { match e { ExprData::FieldProj(_, f) => f, _ => 0 } }
 pub open spec fn ed_span_loc(e: ExprData) -> u64 { match e { ExprData::SpanMark(loc, _) => loc, _ => 0 } }
 pub open spec fn ed_span_e(e: ExprData) -> ExprData { match e { ExprData::SpanMark(_, t) => *t, _ => ExprData::Atom(0) } }
+// G4: Let/Not projections.
+pub open spec fn ed_let_name(e: ExprData) -> u64 { match e { ExprData::Let(n, _, _) => n, _ => 0 } }
+pub open spec fn ed_let_val(e: ExprData) -> ExprData { match e { ExprData::Let(_, v, _) => *v, _ => ExprData::Atom(0) } }
+pub open spec fn ed_let_body(e: ExprData) -> ExprData { match e { ExprData::Let(_, _, b) => *b, _ => ExprData::Atom(0) } }
+pub open spec fn ed_not_e(e: ExprData) -> ExprData { match e { ExprData::Not(t) => *t, _ => ExprData::Atom(0) } }
 
 #[verifier::structural_decreases]
 pub open spec fn expr_eq(a: ExprData, b: ExprData) -> nat
@@ -781,6 +812,16 @@ pub open spec fn expr_eq(a: ExprData, b: ExprData) -> nat
             if ed_tag(b) == 6 {
                 if loc == ed_span_loc(b) { expr_eq(*t, ed_span_e(b)) } else { 0 }
             } else { 0 },
+        // G4: let equality — name id, then value, then body (body binder is
+        // `bd` so it does not shadow the second-arg parameter `b`).
+        ExprData::Let(n, v, bd) =>
+            if ed_tag(b) == 8 {
+                if n == ed_let_name(b) {
+                    if expr_eq(*v, ed_let_val(b)) == 1 { expr_eq(*bd, ed_let_body(b)) } else { 0 }
+                } else { 0 }
+            } else { 0 },
+        ExprData::Not(t) =>
+            if ed_tag(b) == 9 { expr_eq(*t, ed_not_e(b)) } else { 0 },
     }
 }
 
@@ -924,7 +965,60 @@ proof fn expr_mirror_kernel_computes()
         expr_size(ExprData::BinOp(1,
             Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(3)))),
             Box::new(ExprData::Atom(3)))) == 4,
-        typ_size(TypData::TyRef(7)) == 1
+        typ_size(TypData::TyRef(7)) == 1,
+        // ── G4 — the max_u64 If-fold leaf (the deepest gap) ──
+        // leaf 15: `x < y → (let r := let m := y; m; r ≥ x ∧ r ≥ y)`, i.e.
+        //   Implies(Lt(x,y), Let(r, Let(m, y, m), And(Span(r≥x), Span(r≥y)))).
+        // ids x=0 y=4 r=10 m=14, spans 9/12; opcodes Implies=13 Lt=2 And=11 Ge=5.
+        // render_exp reproduces production's leaf via the new Let arm (structural)
+        // + the frozen BinOp/Span arms (bool targets → no coercion). This is the
+        // reference-side shape the W6e serializer recompute must emit.
+        expr_eq(
+            render_exp(RawExp::BinOp(13, TypData::TyBool,
+                Box::new(RawExp::BinOp(2, TypData::TyBool,
+                    Box::new(RawExp::Var(0, TypData::TyInt)), Box::new(RawExp::Var(4, TypData::TyInt)))),
+                Box::new(RawExp::Let(10,
+                    Box::new(RawExp::Let(14, Box::new(RawExp::Var(4, TypData::TyInt)),
+                        Box::new(RawExp::Var(14, TypData::TyInt)))),
+                    Box::new(RawExp::BinOp(11, TypData::TyBool,
+                        Box::new(RawExp::Span(9, Box::new(RawExp::BinOp(5, TypData::TyBool,
+                            Box::new(RawExp::Var(10, TypData::TyInt)), Box::new(RawExp::Var(0, TypData::TyInt)))))),
+                        Box::new(RawExp::Span(12, Box::new(RawExp::BinOp(5, TypData::TyBool,
+                            Box::new(RawExp::Var(10, TypData::TyInt)), Box::new(RawExp::Var(4, TypData::TyInt)))))))))))),
+            ExprData::BinOp(13,
+                Box::new(ExprData::BinOp(2, Box::new(ExprData::Atom(0)), Box::new(ExprData::Atom(4)))),
+                Box::new(ExprData::Let(10,
+                    Box::new(ExprData::Let(14, Box::new(ExprData::Atom(4)), Box::new(ExprData::Atom(14)))),
+                    Box::new(ExprData::BinOp(11,
+                        Box::new(ExprData::SpanMark(9, Box::new(ExprData::BinOp(5,
+                            Box::new(ExprData::Atom(10)), Box::new(ExprData::Atom(0)))))),
+                        Box::new(ExprData::SpanMark(12, Box::new(ExprData::BinOp(5,
+                            Box::new(ExprData::Atom(10)), Box::new(ExprData::Atom(4)))))))))))
+        ) == 1,
+        // Kill: the inner `let m := y; m` is dropped (Let value → bare `y`). The
+        // reference still binds it, so the shapes diverge (Let-tag vs Atom-tag).
+        expr_eq(
+            render_exp(RawExp::Let(10,
+                Box::new(RawExp::Let(14, Box::new(RawExp::Var(4, TypData::TyInt)),
+                    Box::new(RawExp::Var(14, TypData::TyInt)))),
+                Box::new(RawExp::Var(10, TypData::TyInt)))),
+            ExprData::Let(10, Box::new(ExprData::Atom(4)), Box::new(ExprData::Atom(10)))  // BUG: inner let dropped
+        ) == 0,
+        // Not — `¬(x < y)` (leaf 16's branch guard). render_exp maps the new
+        // Not arm straight through; kill = the `¬` dropped.
+        expr_eq(
+            render_exp(RawExp::Not(Box::new(RawExp::BinOp(2, TypData::TyBool,
+                Box::new(RawExp::Var(0, TypData::TyInt)), Box::new(RawExp::Var(4, TypData::TyInt)))))),
+            ExprData::Not(Box::new(ExprData::BinOp(2, Box::new(ExprData::Atom(0)), Box::new(ExprData::Atom(4)))))
+        ) == 1,
+        expr_eq(
+            render_exp(RawExp::Not(Box::new(RawExp::BinOp(2, TypData::TyBool,
+                Box::new(RawExp::Var(0, TypData::TyInt)), Box::new(RawExp::Var(4, TypData::TyInt)))))),
+            ExprData::BinOp(2, Box::new(ExprData::Atom(0)), Box::new(ExprData::Atom(4)))  // BUG: dropped ¬
+        ) == 0,
+        // Let/Not measures kernel-compute (Let=1 + Atom=1 + [Not=1 + Atom=1] = 4).
+        expr_size(ExprData::Let(10, Box::new(ExprData::Atom(4)),
+            Box::new(ExprData::Not(Box::new(ExprData::Atom(0)))))) == 4
 by { decide }
 
 // ── In-crate kernel-computation sanity (decide через structural) ────
