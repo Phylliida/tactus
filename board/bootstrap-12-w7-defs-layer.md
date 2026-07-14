@@ -81,9 +81,15 @@ def bodies). **UNBLOCKED** — W6 done (`bootstrap-11` closed).
       `bootstrap-27` Progress/Writeup. Frozen `MatchArm`/`CtorData` named types
       folded into inlined list `Cons` (same info, no single-variant risk).
       **W7c now unblocked.**
-    - W7c = serializer transcriptions (extend `lexpr_to_exprdata`/`expx_to_rawexp`
-      for the new body constructors + datatype transcription; target the INLINED
-      arm/ctor shape, not the frozen `MatchArm` type).
+    - W7c (`bootstrap-28`, **IN PROGRESS 2026-07-14, opus-w7c**) = serializer
+      transcriptions (extend `lexpr_to_exprdata` + `raw_exp` for the new body
+      constructors + datatype transcription; target the INLINED arm/ctor shape,
+      not the frozen `MatchArm` type). **`Ite` increment LANDED** (both sides +
+      3 tests, lib suite 342/0, verdict-neutral proven — the new `raw_exp` arm
+      is unreachable on the current emit path, so no rebuild needed;
+      `golden_add_capped_cert` byte-identical). Remaining: Match (needs VIR
+      match-shape investigation), Forall/Exists, multi-arg AppN (+ the W7b-
+      deferred per-arg coercion), datatype + def-header. See `bootstrap-28`.
     - W7d = wire into def emission + bridge `decide`s `def_eq` on fixture + tgt slice.
     - W7e = mutation-kill (perturb body / ctor / height ⟹ bridge flips 1→0).
 
