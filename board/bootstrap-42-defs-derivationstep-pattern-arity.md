@@ -29,11 +29,21 @@ emitter believes differs from the emitted `inductive DerivationStep`'s arity
 (field-count mismatch between the datatype decl and the pattern site — possibly a
 ghost/phantom or erased field the pattern doesn't account for).
 
-## Why it matters / what it blocks
+## Why it matters / what it blocks — PRIMARY remaining blocker for bootstrap-39
 
-Second of two remaining blockers for **bootstrap-39** (the other is
-**bootstrap-41**, `Some_val0`). Any module-defs failure ⟹ `package gate skipped:
-shared-defs module unavailable` ⟹ the in-gate bridge never fires.
+This is the accessor-INDEPENDENT failure that sinks the non-exec defs family's
+attempt 1 (accessors ON) in the `crate_defs.rs` ladder, forcing the fallback to
+attempt 2 (accessors OFF) — which in turn causes **bootstrap-41**'s `Some_val0`
+failure in `coset_group`. So bootstrap-42 is likely the ROOT: fixing it should
+let attempt 1 win (accessors present), which auto-resolves bootstrap-41. Do this
+FIRST. (See bootstrap-41's ROOT CAUSE section for the ladder trace.)
+
+Any module-defs failure ⟹ `package gate skipped: shared-defs module unavailable`
+⟹ the in-gate bridge never fires (bootstrap-39 stays blocked).
+
+**Caveat:** attempt 1's `.failed` dumps are overwritten by attempt 2 on disk, so
+`britton_via_tower` may not be the ONLY attempt-1 blocker. After fixing it,
+re-run and check whether the accessors-ON render surfaces further failures.
 
 ## Provenance / not a regression
 
