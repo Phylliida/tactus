@@ -389,13 +389,28 @@ honest-fail beyond the known `max_u64` branch-in-leaf:
 **W2a resolution status (2026-07-14, from the on-disk fixture certs +
 authoring refWp — see board bootstrap-06 writeup for full detail):**
 
-1. Post-`If` continuation: **UNRESOLVED — no fixture exercises it.** In the
-   fixtures a mid-`Seq` `If` never appears as an SST node: `max_u64`'s `if` is
-   ABSORBED by the frontend into the returned-value rendering (leaf 7 =
-   `x<y → (let r := let m := y; …)`) before the snapshot. refWp's stage-A
-   choice (`frameAfter(If)=frame`, continuation sees the pre-if frame) is
-   authored but untested. Needs a fixture with a real post-if continuation
-   (feed W3). 
+1. Post-`If` continuation: **RESOLVED 2026-07-14 (board bootstrap-19), via
+   Option 2 (serializer desugar) — Option 1 (refWp) proven INFEASIBLE.**
+   count_down (`if n==0 {0} else {recurse}`) is the true two-way join: BOTH
+   branches fall through to a common `Ret`, production clones the continuation
+   into both. **Option 1** (teach `wp_stm` the join) requires the branch
+   subterms at match-depth 2 (a nested `match a.deref`), which the Lean
+   backend lowers to `WellFounded.fix` (`termination_by`) — and `decide`
+   CANNOT reduce that, so every `Seq` bridge goes stuck (20 decide-stuck
+   errors; mutual-recursion and CPS variants fail identically — all need a
+   non-structural measure). refWp is therefore kept FROZEN. **Option 2**
+   (`sst_serialize::block`) bakes the clone into the SST tree:
+   `Seq(If(t,e), rest)` → `If(t;rest, e;rest)` when BOTH branches fall
+   through, so refWp's existing flat If/Seq arms (depth-1 structural) produce
+   production's goals and still kernel-compute. Gated on both-fall-through:
+   diverging-branch cases (find_square's `if {return}`) stay `Seq(If, rest)`
+   for bootstrap-17's `frame_after` special case — desugaring them would hide
+   `rest` from `frame_after(If)` and break a loop's maintain-reclose. Residual
+   (documented): a both-fall-through If *inside a loop* (the loop-body
+   post-frame would be the unrepresentable branch join) — no fixture hits it.
+   In-crate guard `ref_wp_if_twoway_join` (frozen refWp + desugared count_down
+   literal → 4 goals); count_down bridge closes by decide+rfl. The stale
+   `frameAfter(If)=frame` note below is superseded for the two-way case.
 2. Fall-through postcondition: **the serializer emits an explicit `Ret(enss)`
    node** — all three fixtures end in `Ret`, so refWp walks the explicit Ret
    (no synthesis). CONFIRMED the `return_var` question is LIVE: `sum_to`

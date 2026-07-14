@@ -1360,6 +1360,43 @@ proof fn ref_wp_if_fallthrough_divergence()
         ) == 1
 by { decide }
 
+// ── bootstrap-19: the two-way If-join (count_down) — Option 2 ────────
+//
+// `count_down(n) { if n==0 {0} else {count_down(n-1)} }` — BOTH branches
+// fall through to a common `Ret`. Production computes `wp(if C {t} else {e},
+// wp(rest, post))`: it CLONES the continuation `rest` into BOTH branch frames,
+// so the trailing `Ret` yields one postcondition goal PER branch (4 goals),
+// not one under the bare pre-If frame.
+//
+// refWp is FROZEN: teaching `wp_stm` the two-way join forces the branch
+// subterms to match-depth 2, which the Lean backend lowers to
+// `WellFounded.fix` (a `termination_by`), and `decide` cannot reduce that —
+// it breaks EVERY Seq bridge (the bootstrap-19 finding, evidenced by 20
+// decide-stuck errors). So the SERIALIZER desugars instead (Option 2,
+// sst_serialize::block): `Seq(If(t,e), rest)` → `If(t;rest, e;rest)`. refWp's
+// existing FLAT If/Seq arms (depth-1 structural recursion) then reproduce
+// production's goals — and STILL kernel-compute.
+//
+// This literal is the REAL on-disk count_down cert AFTER the desugar
+// (machine-transcribed from bootstrap-fixture/out/lib/cert/count_down.cert
+// .lean): the SST is `Seq(Assign(decrease_init0:=n), If(then;Ret, else;Ret))`
+// — the trailing Ret cloned into each branch. It IS the count_down bridge (the
+// probe9 runner elaborates the same `goals_eq` against the emitted defs). It
+// doubles as a regression guard on the FROZEN refWp: if a future refWp change
+// stops reproducing the join from the desugared SST, this decide flips.
+// Mutation-kill: refWp's goal 0 (then-branch postcond) binds `let tmp__3 := 0`
+// (val leaf 11 from the cloned then-branch); a goal 0 expecting `:= 99` fails.
+pub open spec fn cd19_ctx() -> FnCtxData { FnCtxData { typ_params: BinderList::Nil, params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)), param_bounds: ParamBoundList::Bound(3, 2, Box::new(ParamBoundList::Nil)), reqs: BinderList::Nil, enss: LeafList::Cons(4, Box::new(LeafList::Nil)) } }
+pub open spec fn cd19_sst() -> StmData { StmData::Seq(Box::new(StmData::Assign(7, 0)), Box::new(StmData::If(8, 9, Box::new(StmData::Seq(Box::new(StmData::Assign(10, 11)), Box::new(StmData::Ret(Box::new(LeafList::Cons(5, Box::new(LeafList::Nil))), RetBind::RetLet(6, 10))))), Box::new(StmData::Seq(Box::new(StmData::Seq(Box::new(StmData::Seq(Box::new(StmData::Assert(13, 12)), Box::new(StmData::Seq(Box::new(StmData::Assume(12)), Box::new(StmData::Seq(Box::new(StmData::Assign(14, 15)), Box::new(StmData::Seq(Box::new(StmData::Assert(17, 16)), Box::new(StmData::Call { reqs: Box::new(LeafList::Nil), post: Box::new(FrameList::FHyp(20, Box::new(FrameList::FLet(18, 19, Box::new(FrameList::FNil))))) }))))))))), Box::new(StmData::Assign(10, 18)))), Box::new(StmData::Ret(Box::new(LeafList::Cons(5, Box::new(LeafList::Nil))), RetBind::RetLet(6, 10)))))))) }
+pub open spec fn cd19_goals() -> GoalList { GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(8, Box::new(GoalData::Let(10, 11, Box::new(GoalData::Let(6, 10, Box::new(GoalData::Leaf(5)))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(9, Box::new(GoalData::Leaf(13)))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(9, Box::new(GoalData::Imp(12, Box::new(GoalData::Imp(12, Box::new(GoalData::Let(14, 15, Box::new(GoalData::Leaf(17)))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(9, Box::new(GoalData::Imp(12, Box::new(GoalData::Imp(12, Box::new(GoalData::Let(14, 15, Box::new(GoalData::Imp(16, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(18, 19, Box::new(GoalData::Let(10, 18, Box::new(GoalData::Let(6, 10, Box::new(GoalData::Leaf(5)))))))))))))))))))))))))), Box::new(GoalList::Nil)))))))) }
+
+proof fn ref_wp_if_twoway_join()
+    ensures
+        goals_eq(ref_wp(cd19_ctx(), cd19_sst()), cd19_goals()) == 1,
+        goal_count(ref_wp(cd19_ctx(), cd19_sst())) == 4,
+        goal_eq(gl_head(ref_wp(cd19_ctx(), cd19_sst())), GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(8, Box::new(GoalData::Let(10, 99, Box::new(GoalData::Let(6, 10, Box::new(GoalData::Leaf(5)))))))))))))) == 0
+by { decide }
+
 // ── bootstrap-02b: the Call pass-through, both post-frame shapes ────
 //
 // "Lowering the mirror" (DESIGN-W2-refwp.md §2.6): the reshaped

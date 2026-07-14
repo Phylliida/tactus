@@ -688,9 +688,67 @@ impl<'a> Serializer<'a> {
     }
 
     /// Right-nest a block into `Seq(s0, Seq(s1, …, sn))`. Empty ⇒ Skip.
+    ///
+    /// Two-way If-join desugar (bootstrap-19, Option 2): when a mid-block
+    /// `if C { t } else { e }` is FOLLOWED by a continuation, production
+    /// clones `after` into BOTH branches (`build_wp`: `build_wp(then, after)`
+    /// / `build_wp(else, after)`) so the trailing statements are visited once
+    /// per branch under that branch's cond hyp + body frame. refWp is kept
+    /// FROZEN — teaching `wp_stm` the two-way join forces well-founded
+    /// recursion (the branch subterms sit at match-depth 2), and
+    /// `WellFounded.fix` does NOT reduce under `decide`, breaking every Seq
+    /// bridge (the bootstrap-19 finding). So the serializer bakes the clone
+    /// into the SST TREE here: emit `If(t; rest, e; rest)` instead of
+    /// `Seq(If(t,e), rest)`, and refWp's existing FLAT If/Seq arms (depth-1
+    /// structural recursion) then reproduce production's goals. A branch that
+    /// DIVERGES (`stm_diverges`: Return / DeadEnd / break) discards the
+    /// continuation — production's Return arm ignores `after` — so `rest` is
+    /// NOT cloned into it (the one-sided fall-through, e.g. find_square's
+    /// `if … { return }`). This is NON-transcription (a TCB step, like the
+    /// Call instantiation): the `decide` bridge validates the clone against
+    /// production's independently-computed goals (recompute-not-copy).
     fn block(&mut self, stms: &[Stm]) -> Sr<String> {
         if stms.is_empty() {
             return Ok(self.skip());
+        }
+        if stms.len() > 1 {
+            if let Some((cond, then_stm, else_stm)) = as_if(&stms[0]) {
+                // Desugar ONLY the TRUE two-way join — BOTH branches fall
+                // through to the continuation (count_down). A branch that
+                // DIVERGES (find_square's `if … { return }`) is left as the
+                // frozen `Seq(If, rest)`, handled by bootstrap-17's
+                // `frame_after` fall-through special case. This restriction is
+                // load-bearing, not just conservative: moving `rest` INTO an
+                // If branch hides it from `frame_after(If)` (which, for a
+                // two-way If, returns the BARE pre-If frame), so a loop whose
+                // body ends in such an If would get a wrong maintain-reclose
+                // frame — a `CLOSE-BROKE`, not an honest-fail. The
+                // both-fall-through join only arises at a fn-body TAIL in the
+                // corpus (count_down), where `frame_after` is never queried;
+                // a both-fall-through If inside a loop stays a documented
+                // residual (would need the loop-body post-frame to be the
+                // branch join, which a single linear frame cannot express).
+                let then_div = stm_diverges(then_stm);
+                let else_div = else_stm.as_ref().map_or(false, stm_diverges);
+                if !then_div && !else_div {
+                    let c = self.oblig_leaf(cond)?;
+                    let nc = self.neg_oblig_leaf(cond)?;
+                    // Serialize the then-branch, then the continuation ONCE
+                    // (its leaves intern in then-branch position — matching
+                    // production's after-clone walk order), then reuse the
+                    // `rest` term verbatim in the else branch (interning is
+                    // idempotent). An absent else falls through as `Skip`.
+                    let then_body = self.stm(then_stm)?;
+                    let rest = self.block(&stms[1..])?;
+                    let t = format!("({}.StmData.Seq {} {})", NS, box_(&then_body), box_(&rest));
+                    let else_body = match else_stm {
+                        Some(s) => self.stm(s)?,
+                        None => self.skip(),
+                    };
+                    let e = format!("({}.StmData.Seq {} {})", NS, box_(&else_body), box_(&rest));
+                    return Ok(format!("({}.StmData.If {} {} {} {})", NS, c, nc, box_(&t), box_(&e)));
+                }
+            }
         }
         let head = self.stm(&stms[0])?;
         if stms.len() == 1 {
@@ -1340,6 +1398,47 @@ fn sanitize_comment(text: &str) -> String {
 /// Computed by re-parsing our own emitted text would be fragile; instead
 /// `serialize` could return the size directly. For turn-1 we compute it
 /// from the string by counting the relevant constructor tokens, which is
+/// Does control through `stm` UNCONDITIONALLY diverge (return / dead-end /
+/// loop-break) before reaching its end? The Rust mirror of refWp's
+/// `diverges` (tactus-core/lib.rs) — used by the two-way If-join desugar
+/// (`block`, bootstrap-19) to decide whether a branch DISCARDS the post-if
+/// continuation (production's `build_wp(branch, after)` discards `after` at
+/// a `Return` — the `after` is passed in but the Return arm ignores it).
+/// A `Block` diverges if ANY statement does (the rest is dead code); an
+/// `If` diverges only if BOTH branches do (a missing else falls through).
+/// SOUND either way vs the `decide` bridge: too-weak (cloning `rest` into a
+/// diverging branch) adds a dead-continuation goal refWp emits but
+/// production does not → honest-fail; too-strong (dropping the clone from a
+/// falling-through branch) omits a goal → honest-fail. Never silent-pass
+/// (`goals_eq` is strict-structural).
+fn stm_diverges(stm: &Stm) -> bool {
+    match &stm.x {
+        StmX::Return { .. } => true,
+        StmX::DeadEnd(_) => true,
+        StmX::BreakOrContinue { .. } => true,
+        StmX::Block(stms) => stms.iter().any(stm_diverges),
+        StmX::If(_, then_stm, else_stm) => {
+            stm_diverges(then_stm) && else_stm.as_ref().map_or(false, stm_diverges)
+        }
+        _ => false,
+    }
+}
+
+/// View `stm` as an `if C { t } else { e }`, peeling single-statement
+/// `Block` wrappers (the frontend often wraps a bare `if` in a one-element
+/// block). Returns the cond / then / else so the two-way join desugar
+/// (`block`) can fire whether the head statement is a raw `StmX::If` or a
+/// `Block([If])`. Only SINGLE-element blocks are peeled — a `Block` ending
+/// in an `If` after other statements is NOT an If head (the desugar leaves
+/// it, a sound honest-fail).
+fn as_if(stm: &Stm) -> Option<(&Exp, &Stm, &Option<Stm>)> {
+    match &stm.x {
+        StmX::If(cond, then_stm, else_stm) => Some((cond, then_stm, else_stm)),
+        StmX::Block(stms) if stms.len() == 1 => as_if(&stms[0]),
+        _ => None,
+    }
+}
+
 /// exact for the terms this serializer emits (well-formed, fully
 /// parenthesized). See the N3c golden test for the pin.
 fn stm_size_of(stm_term: &str) -> u64 {
