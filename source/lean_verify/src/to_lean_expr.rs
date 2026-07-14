@@ -59,6 +59,22 @@ pub(crate) fn strip_one_ref_decoration(typ: &Typ) -> Typ {
     }
 }
 
+/// Peel up to `n` outer reference-decoration layers from `typ`. Each
+/// peel mirrors one `.deref` applied to a match scrutinee: match
+/// ergonomics stamps a pattern binding with the scrutinee's OUTER
+/// reference layers (`&self` → `t : &T`), but the scrutinee renders at
+/// VALUE depth (`self.deref`), so the bound var is a bare value at the
+/// Lean level. Peeling stops early at the first non-ref layer, so a
+/// genuine inner `Box`/`Rc`/`Arc` field wrapper survives (that value IS
+/// wrapped at the Lean level). No-op for `n == 0`.
+fn peel_n_ref_decorations(typ: &Typ, n: usize) -> Typ {
+    let mut cur = typ.clone();
+    for _ in 0..n {
+        cur = strip_one_ref_decoration(&cur);
+    }
+    cur
+}
+
 /// Build a `lean_ast::Expr` from a VIR-AST expression with no enclosing
 /// binders. Use `vir_expr_to_ast_with_binders` from inside a fn body to
 /// pass the fn's params as initial context.
@@ -677,14 +693,35 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
             }
         }
 
-        ExprX::Match(place, arms) => ExprNode::Match {
+        ExprX::Match(place, arms) => {
             // The scrutinee must sit at VALUE depth — patterns match
             // datatype constructors, but a place rooted at a
             // Ref-typed binder (e.g. `self` in an instance method,
             // where the class field type is `Tactus.Ref Self → V`)
             // renders at storage depth. Same binder-aware deref
             // bridging as Field projection bases (U2).
-            scrutinee: Box::new(render_place_with_derefs(place, ctx)),
+            let scrutinee = render_place_with_derefs(place, ctx);
+            // How many `.deref`s the scrutinee received to reach value
+            // depth (mirrors `render_place_with_derefs`'s own count).
+            // Match ergonomics stamped each pattern binding with the
+            // SAME outer reference layers (`match &self` → `t : &T`);
+            // since the scrutinee renders deref'd, the bound var is a
+            // bare value at the Lean level, so peel that many outer ref
+            // layers off each binding typ before it enters the binder
+            // map. Without it, a `t.deep_view()` receiver in an arm body
+            // reads `t` as already-Ref and skips the `Ref.mk` wrap,
+            // emitting `deep_view t` (value) where `Tactus.Ref` is
+            // expected — the Option/Seq/Vec DeepView defs-family
+            // elaboration failure (bootstrap-40). No-op when the
+            // scrutinee is already a value (`scrut_derefs == 0`), so
+            // every value-scrutinee case (incl. the P8 `Box` binding
+            // below) is unchanged.
+            let scrut_derefs = {
+                let vid = match &place.x { PlaceX::Local(v) => Some(v), _ => None };
+                lean_level_wrap_count(vid, &place.typ, ctx)
+            };
+            ExprNode::Match {
+            scrutinee: Box::new(scrutinee),
             arms: arms.iter().map(|arm| {
                 // Pattern-bound vars enter the binder map for the arm
                 // body (same idiom as the Quant arm above). Their
@@ -697,12 +734,17 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
                 // the `.deref`. Without it, the use renders bare and
                 // the island fails elaboration (probe-w0 P8).
                 let mut extended = ctx.binder_typs.cloned().unwrap_or_default();
-                collect_pattern_binding_typs(&arm.x.pattern.x, &mut extended);
+                let mut pat_binds = std::collections::HashMap::new();
+                collect_pattern_binding_typs(&arm.x.pattern.x, &mut pat_binds);
+                for (name, typ) in pat_binds {
+                    extended.insert(name, peel_n_ref_decorations(&typ, scrut_derefs));
+                }
                 LMatchArm {
                     pattern: pattern_to_ast(&arm.x.pattern.x),
                     body: expr_to_ast(&arm.x.body, &ctx.with_binder_typs(&extended)),
                 }
             }).collect(),
+            }
         },
 
         ExprX::Ghost { expr, .. } | ExprX::ProofInSpec(expr) => expr_to_node(expr, ctx),

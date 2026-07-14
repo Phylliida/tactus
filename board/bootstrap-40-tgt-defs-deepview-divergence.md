@@ -1,9 +1,9 @@
 ---
 title: "tgt package-gate defs family fails under bootstrap fork: Option<T> DeepView emits deep_view on a bare value (expects Tactus.Ref)"
-status: todo
-claimed_by:
+status: done
+claimed_by: opus-bootstrap40-deepview
 created: 2026-07-14T12:55:00Z
-updated: 2026-07-14T12:55:00Z
+updated: 2026-07-14T14:40:00Z
 ---
 
 ## Description
@@ -83,6 +83,80 @@ package gate reaches `run_bridge_step`. Then `bootstrap-39` can close.
   external path and never built tgt's defs family). Treat provenance as open;
   the failing-source evidence above is the ground truth.
 
+- (2026-07-14, opus-bootstrap40-deepview) **ROOT-CAUSED + FIXED + VALIDATED.**
+  Not a "value-space recursion" gap in the DeepView emitter — it's a
+  **match-ergonomics** miss in the general VIR→Lean match renderer
+  (`to_lean_expr.rs::ExprX::Match`). vstd's instance body is
+  `match self { Some(t) => Some(t.deep_view()), None => None }` where
+  `self : &Option<T>`, so Rust match ergonomics binds `t : &T`. VIR records the
+  pattern binding's typ decorated (`&T`). But the renderer emits the scrutinee at
+  VALUE depth (`self.deref`, via `render_place_with_derefs`), so the Lean-level
+  `t` is a bare value — while its binder-map typ still says `&T`. At the
+  `t.deep_view()` receiver-coercion site the code reads `t`'s typ as
+  already-`Ref` and skips the `Ref.mk` wrap → `deep_view t` (value) where
+  `Tactus.Ref` is expected. Tuple/Vec DeepView dodged it because they use field
+  projection (`self.deref.1`), which reports a value typ and DOES wrap.
+  See the full trace at `to_lean_expr.rs:536` (class-method src_typ) and
+  `:145`/`:208` (structural_typ Var/ReadPlace) — all read the same binder map.
+
 ## Writeup
 
-_pending a fix._
+**Fix (one file, `source/lean_verify/src/to_lean_expr.rs`):** in the
+`ExprX::Match` arm, peel exactly `scrut_derefs` OUTER reference-decoration layers
+off each pattern binding's typ before it enters the arm's binder map, where
+`scrut_derefs` = the number of `.deref`s applied to bring the scrutinee to value
+depth (the same count `render_place_with_derefs` uses). Match ergonomics stamped
+each binding with the scrutinee's outer `&` layers; since the scrutinee renders
+deref'd, the bound var is a bare value at the Lean level, so its binder typ must
+be peeled to match. New helper `peel_n_ref_decorations` (loops the existing
+`strip_one_ref_decoration`, which stops at the first non-ref layer).
+
+**Why it's safe (strict no-op for every prior case):** the peel count is
+`lean_level_wrap_count(scrutinee)` — **0 whenever the scrutinee is already a
+value**. Every existing match in the e2e suite matches a VALUE parameter
+(`match t` with `t: Tree`; grep: zero `match self` in `rust_verify_test/tests/
+tactus.rs`), so `scrut_derefs == 0` and the binder typ is unchanged — including
+the P8 `Box` cases (`test_spec_let_box_use_derefs`,
+`test_structural_decreases_kernel_computes`), whose bound vars stay `Box<T>` and
+use explicit `*a`. Only Ref-typed scrutinees (`match self` in a `&self` instance
+method — the previously-untested shape that carried the bug) change, and there
+the peel strips ONLY the outer ergonomics `&`, leaving genuine inner Box/Rc/Arc
+field wrappers intact.
+
+**Validation (three levels):**
+1. **Minimal repro** (`/tmp/dv-repro/lib.rs`: an exec fn whose `requires`
+   references `Option::<u64>::deep_view`, forcing the instance into the base
+   defs). Post-fix emission (`TactusDefs_lib_exec__base.lean:33`):
+   `... Option.Some (lib.view.DeepView.deep_view (Tactus.Ref.mk t)) ...` — the
+   `Ref.mk t` wrap is present. Base defs family builds to `.olean`, **no
+   `.failed`**.
+2. **Real tgt corpus** (bootstrap-39 run #2 recipe, rebuilt binary): both
+   `TactusDefs_lib__base.olean` AND `TactusDefs_lib_exec__base.olean` now build
+   with **0 Lean errors** (no `.lean.failed`). The exact `base`-defs criterion of
+   this card is met. Run: `24 verified, 0 errors`.
+3. **Unit tests** `cargo test -p lean_verify --lib`: 365 pass, 1 pre-existing
+   failure (`sst_serialize::tests::lexpr_to_exprdata_census_rejects`) that is
+   UNRELATED — it expects a 2-arg app to reject with `ed-app-arity`, but commit
+   `d3349be` (bootstrap-34) deliberately widened those arms to accept multi-arg
+   `ExprData.AppN`; the test is stale from that prior commit (my diff touches
+   only `to_lean_expr.rs`, not `sst_serialize.rs`). Filed as **bootstrap-43**.
+
+**Honest scope — this fix does NOT by itself unblock bootstrap-39.** With the
+base defs now building, the full-krate tgt defs build reaches TWO more, SEPARATE,
+pre-existing defs-family elaboration failures that keep the package gate skipped
+(`note: package gate skipped: shared-defs module unavailable (defs build
+failed)` → islands fallback → bridge never fires):
+- **`coset_group`** — `Invalid field 'Some_val0'`: the generated multi-variant
+  accessor `lib.option.Option.Some_val0` is not in scope when the module's defs
+  elaborate. (Confirmed byte-identical to run #2's failure — pre-existing, not
+  from my fix.) → **bootstrap-41**.
+- **`britton_via_tower`** — `Invalid pattern: Not enough arguments to
+  DerivationStep.FreeExpand` (constructor-pattern arity in the defs emission). →
+  **bootstrap-42**.
+
+Both are distinct root causes from the DeepView value-vs-Ref bug this card names,
+and both must be fixed before the tgt defs family builds whole and the in-gate
+bridge (bootstrap-39) can run. **Assumption:** I mark this card done on its
+titled bug (Option DeepView `deep_view t` → `deep_view (Ref.mk t)`) + its literal
+`__base` build criterion, both verified; the gate-reaches-bridge consequence is
+gated on the two follow-ups.
