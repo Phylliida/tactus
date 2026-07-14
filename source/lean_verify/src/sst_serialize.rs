@@ -1117,6 +1117,85 @@ impl<'a> Serializer<'a> {
         }
     }
 
+    // ── W7c (bootstrap-30): VIR def HEADER → RawDef (the def-header reference) ─
+    //
+    // `raw_vir_exp` covers only the body; a full `RawDef` also needs the header
+    // (name + typed value params + ret type). Transcribed straight from the VIR
+    // `FunctionX` fields, DECOMPOSED into args (name / typ_params / value params
+    // / ret / body) so this + its tests stay independent of the 33-field
+    // `FunctionX`. W7d passes `&f.name`, `&f.typ_params`, `&f.params`,
+    // `&f.ret.x.typ`, and the body `Expr`.
+    //
+    // Id agreement with the production `ldef_to_defdata`, all by construction:
+    //   - name — `call_fun_id` interns `LeanName::from_path(&fun.path)`, which
+    //     IS production's `def.name = lean_name(&f.name.path)` (`from_path`
+    //     delegates to `lean_name`); same string ⟹ same interned id.
+    //   - value params — read the SAME `params` sequence (no `%` filter, no
+    //     sort) production's `fn_binders_without_bound_hyps` reads; per-param id
+    //     via `binder_id` (= `from_var_ident`, production's binder name), type
+    //     via `typ_data`. The value-param TYPE agreement is the SAME
+    //     `typ_data`↔`ltyp_to_typdata` inversion the quantifier binder types use
+    //     (production's `param_binder_typ(non-mut)` IS `typ_to_expr`, which
+    //     `ltyp_to_typdata` inverts to the identical `TypData`).
+    //
+    // POLY GATE (tgt-slice deferral, like AppN): production's `Def.binders`
+    // PREPENDS type-param (`{A : Type}`) + trait-bound binders before the value
+    // params, but `TypData` has no universe/`Type` variant to mirror a
+    // `{A : Type}` binder — so a polymorphic def would give production leading
+    // params the reference can't match. Fail loud on non-empty `typ_params`
+    // (needs a `TypData::TySort` addition — a batched `tactus-core` turn); the
+    // fixture defs (`tri`/`tree_head`) are monomorphic so the gate never trips.
+    // The REFERENCE is the gate: W7d bridges only when BOTH sides succeed, so a
+    // polymorphic def's extra production params are never observed.
+    //
+    // `#[allow(dead_code)]` until W7d wires the def entry point —
+    // verdict-neutral by construction (a NEW fn, never on the emit path; no
+    // `tactus-core` edit).
+
+    /// VIR def header + body → `lib.RawDef` text. Fails loud (`rawvir-def-<k>`)
+    /// on polymorphic / `&mut`-param / uncovered-body-constructor defs.
+    #[allow(dead_code)]
+    fn raw_vir_def(
+        &mut self,
+        name: &vir::ast::Fun,
+        typ_params: &vir::ast::Idents,
+        params: &vir::ast::Params,
+        ret: &Typ,
+        body: &VirExpr,
+    ) -> Sr<String> {
+        if !typ_params.is_empty() {
+            return Err("rawvir-def-poly".to_string());
+        }
+        // Intern FORWARD (declaration order, like the FnCtxData seed walk) so
+        // the ids are stable + predictable; format the `ParamList` reversed.
+        let name_id = self.call_fun_id(name);
+        let mut params_txt: Vec<(u64, String)> = Vec::new();
+        for p in params.iter() {
+            // `&mut` spec params don't occur (spec fns are pure); defer rather
+            // than risk the `typ_data`/`param_binder_typ` mut-wrap agreement.
+            if p.x.is_mut {
+                return Err("rawvir-def-mutparam".to_string());
+            }
+            let pid = self.binder_id(&p.x.name);
+            let pty = self.typ_data(&p.x.typ)?;
+            params_txt.push((pid, pty));
+        }
+        let ret_ty = self.typ_data(ret)?;
+        let body_raw = self.raw_vir_exp(body)?;
+        let mut plist = format!("{}.ParamList.Nil", NS);
+        for (pid, pty) in params_txt.iter().rev() {
+            plist = format!("{}.ParamList.Cons {} {} {}", NS, pid, paren(pty), box_(&plist));
+        }
+        Ok(format!(
+            "({}.RawDef.mk {} {} {} {})",
+            NS,
+            name_id,
+            paren(&plist),
+            paren(&ret_ty),
+            paren(&body_raw)
+        ))
+    }
+
     // ── W6c: production `lean_ast::Expr` → ExprData (the prod-side input) ─
     // The BORING 1:1 side (DESIGN-W6-stageB.md §4.2 / bootstrap-22). The
     // production renderer (`to_lean_sst_expr`) has ALREADY materialized every
@@ -1482,6 +1561,54 @@ impl<'a> Serializer<'a> {
             }
             _ => Err("ed-quant-bty".to_string()),
         }
+    }
+
+    // ── W7c (bootstrap-30): production `lean_ast::Def` → DefData (prod header) ─
+    //
+    // The boring 1:1 header transcription paired with the VIR-side
+    // `raw_vir_def`. Name/binder/type ids agree with the reference BY
+    // CONSTRUCTION: `def.name` = `lean_name(path)` = the reference `call_fun_id`
+    // string; each value-param binder name = `from_var_ident` = the reference
+    // `binder_id`; `binder.ty`/`ret_ty` are `typ_to_expr(vir)`, which
+    // `ltyp_to_typdata` inverts to the same `TypData` the reference `typ_data`
+    // emits from the VIR `Typ`.
+    //
+    // The REFERENCE is the poly gate (fails loud on `typ_params`), so a
+    // polymorphic def's leading `{A : Type}` / trait-bound binders here — which
+    // `ltyp_to_typdata` would spuriously map to `TyNamed` — are never observed by
+    // the bridge (W7d bridges only when both sides succeed). For a monomorphic
+    // def, `def.binders` IS exactly the value params, matching the reference.
+    // `#[allow(dead_code)]` until W7d wires the def entry point (verdict-neutral).
+
+    /// `lean_ast::Def` (a `@[reducible] def`) → `lib.DefData` text. Fails loud
+    /// (`ed-def-<k>`) on an anonymous binder / an uncovered body or param type.
+    #[allow(dead_code)]
+    fn ldef_to_defdata(&mut self, def: &crate::lean_ast::Def) -> Sr<String> {
+        // Intern FORWARD (name, then params in declaration order) so the ids
+        // match the reference `raw_vir_def`'s forward interning; format the
+        // `ParamList` reversed.
+        let name_id = self.text_leaf(&def.name);
+        let mut params_txt: Vec<(u64, String)> = Vec::new();
+        for b in def.binders.iter() {
+            let bname = b.name.as_ref().ok_or_else(|| "ed-def-noname".to_string())?;
+            let pid = self.text_leaf(bname.as_str());
+            let pty = self.ltyp_to_typdata(&b.ty)?;
+            params_txt.push((pid, pty));
+        }
+        let ret_ty = self.ltyp_to_typdata(&def.ret_ty)?;
+        let body = self.lexpr_to_exprdata(&def.body)?;
+        let mut plist = format!("{}.ParamList.Nil", NS);
+        for (pid, pty) in params_txt.iter().rev() {
+            plist = format!("{}.ParamList.Cons {} {} {}", NS, pid, paren(pty), box_(&plist));
+        }
+        Ok(format!(
+            "({}.DefData.mk {} {} {} {})",
+            NS,
+            name_id,
+            paren(&plist),
+            paren(&ret_ty),
+            paren(&body)
+        ))
     }
 
     // ── Statement walk (StmData literal) ────────────────────────────

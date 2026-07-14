@@ -204,6 +204,20 @@ they must match this side's shapes) and W7d (def emission + bridge).
     VIR input surfaces; then W7d wires the def-body entry point + e2e `def_eq`
     bridge (the real cross-side validation of Match AND the new Quant arm).
 
+- (2026-07-15, opus-w7c-defhdr) **Reference def-HEADER `raw_vir_def` LANDED**
+  (split to `bootstrap-30`, DONE; lib suite 351→354/0, verdict-neutral). Wraps
+  the `raw_vir_exp` body with the header: `call_fun_id(name)` +
+  `f.params`→`ParamList` (`binder_id`+`typ_data`) + `typ_data(ret)`. Decomposed
+  args `(name, typ_params, params, ret, body)` so the test avoids the 33-field
+  `FunctionX`; W7d passes `&f.name`/`&f.typ_params`/`&f.params`/`&f.ret.x.typ`/
+  body. Poly gate `rawvir-def-poly` (production's `Def.binders` prepends
+  `{A : Type}` binders `TypData` can't mirror — needs `TypData::TySort`, deferred
+  like AppN) + `&mut`-param gate `rawvir-def-mutparam`. Paired with the
+  production `ldef_to_defdata` (`bootstrap-28`); id agreement by construction
+  (`call_fun_id`=`lean_name`, `binder_id`=`from_var_ident`,
+  `typ_data`↔`ltyp_to_typdata`). Still-to-do multi-arg `Call`→`CallN` (the
+  cache-churning `RawList` edit) + datatype `RawDt` are unchanged.
+
 ## Writeup
 _partial (reference transcriber core landed). The def-body REFERENCE transcriber
 `raw_vir_exp` (+ `raw_vir_place`/`pattern_ctor_binds`/`pattern_binder_id`) is

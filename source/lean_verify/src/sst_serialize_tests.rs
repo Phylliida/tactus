@@ -883,6 +883,122 @@ fn ltyp_to_typdata_recognizes_types() {
     assert_eq!(s.ltyp_to_typdata(&LExpr::lit_bool(true)).unwrap_err(), "ed-quant-bty");
 }
 
+// ── W7c (bootstrap-30): def-header transcription (RawDef / DefData) ──
+
+/// The spec `nat` type.
+fn tnat() -> Typ {
+    std::sync::Arc::new(TypX::Int(IntRange::Nat))
+}
+
+/// A crate-local `Fun` with path `lib::<name>` (krate = None). `call_fun_id`
+/// interns `LeanName::from_path` of this, = production's `def.name`.
+fn mk_fun(name: &str) -> vir::ast::Fun {
+    use vir::ast::{FunX, PathX};
+    let path = std::sync::Arc::new(PathX {
+        krate: None,
+        segments: std::sync::Arc::new(vec![
+            std::sync::Arc::new("lib".to_string()),
+            std::sync::Arc::new(name.to_string()),
+        ]),
+    });
+    std::sync::Arc::new(FunX { path })
+}
+
+/// `Params` from `(name, typ)` pairs — non-mut value params (spec-fn shape).
+fn mk_params(items: Vec<(&str, Typ)>) -> vir::ast::Params {
+    use vir::ast::ParamX;
+    use vir::def::Spanned;
+    use vir::messages::Span;
+    std::sync::Arc::new(
+        items
+            .into_iter()
+            .map(|(n, typ)| {
+                Spanned::new(
+                    Span::dummy(),
+                    ParamX {
+                        name: tvar(n),
+                        typ,
+                        mode: vir::ast::Mode::Spec,
+                        user_mut: false,
+                        is_mut: false,
+                        unwrapped_info: None,
+                    },
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The reference def-header transcriber on a `tri`-shaped header: name
+/// `lib::tri`, one `nat` value param `n`, `nat` ret, a trivial `Var n` body
+/// (the header is under test; the Ite body is `raw_vir_exp`'s own pin). Forward
+/// interning fixes name=0, n=1; the body reuses n=1. The single boxed
+/// `ParamList` tail matches production's `ldef_to_defdata` by construction.
+#[test]
+fn raw_vir_def_tri_header() {
+    let mut s = Serializer::default();
+    let empty_tps: vir::ast::Idents = std::sync::Arc::new(vec![]);
+    let params = mk_params(vec![("n", tnat())]);
+    let body = mk_vexpr(ExprX::Var(tvar("n")), tnat());
+    assert_eq!(
+        s.raw_vir_def(&mk_fun("tri"), &empty_tps, &params, &tnat(), &body).unwrap(),
+        format!(
+            "({NS}.RawDef.mk 0 \
+               ({NS}.ParamList.Cons 1 {NS}.TypData.TyNat (Tactus.Box.mk {NS}.ParamList.Nil)) \
+               {NS}.TypData.TyNat \
+               ({NS}.RawExp.Var 1 {NS}.TypData.TyNat))"
+        )
+    );
+}
+
+/// A polymorphic def (non-empty `typ_params`) fails loud — production's
+/// `Def.binders` would prepend `{A : Type}` binders `TypData` can't mirror.
+/// Deferred (tgt-slice), like AppN; the fixture defs are monomorphic.
+#[test]
+fn raw_vir_def_poly_fails() {
+    let mut s = Serializer::default();
+    let tps: vir::ast::Idents = std::sync::Arc::new(vec![std::sync::Arc::new("A".to_string())]);
+    let params = mk_params(vec![]);
+    let body = mk_vexpr(ExprX::Var(tvar("x")), tint());
+    assert_eq!(
+        s.raw_vir_def(&mk_fun("f"), &tps, &params, &tint(), &body).unwrap_err(),
+        "rawvir-def-poly"
+    );
+}
+
+/// The production def-header transcriber on the SAME `tri`-shaped header — a
+/// `lean_ast::Def` with one explicit `n : Nat` binder + `Nat` ret + `Var n`
+/// body. Emits the `DefData` twin of `raw_vir_def_tri_header`: name=0, param
+/// (1 : TyNat), ret TyNat, body `Atom 1`. Id agreement with the reference is
+/// by construction (shared `lean_name`/`from_var_ident`/`typ_to_expr`
+/// interning); cross-side `def_eq` is the W7d bridge's job.
+#[test]
+fn ldef_to_defdata_tri_header() {
+    use crate::lean_ast::{Binder, Def};
+    use crate::lean_name::LeanName;
+    let mut s = Serializer::default();
+    let n = LeanName::from_var_ident(&tvar("n"));
+    let def = Def {
+        attrs: vec![],
+        name: "lib.tri".to_string(),
+        binders: vec![Binder::explicit(n.clone(), LExpr::var_lit("Nat"))],
+        ret_ty: LExpr::var_lit("Nat"),
+        body: LExpr::var(n),
+        termination_by: vec![],
+        termination_structural: false,
+        decreasing_by: None,
+    };
+    assert_eq!(
+        s.ldef_to_defdata(&def).unwrap(),
+        format!(
+            "({NS}.DefData.mk 0 \
+               ({NS}.ParamList.Cons 1 {NS}.TypData.TyNat (Tactus.Box.mk {NS}.ParamList.Nil)) \
+               {NS}.TypData.TyNat \
+               ({NS}.ExprData.Atom 1))"
+        )
+    );
+}
+
 // ── W6d.2b-2: the emit-path gate (`oblig_slot` + `goal_data` deep/atom) ──
 //
 // The obligation (reference) side drives: `oblig_slot` deepens a coverable
