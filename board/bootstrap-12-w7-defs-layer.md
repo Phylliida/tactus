@@ -119,17 +119,22 @@ def bodies). **UNBLOCKED** — W6 done (`bootstrap-11` closed).
     1. **tgt-slice coverage** — bridge a real tgt-slice def, not just the
        fixture. The blocker is multi-arg `Call`/`AppN` (tgt spec fns call
        ≥2-arg helpers), which is deferred as **`bootstrap-34`** (the
-       cache-churning per-arg-`TypData` `RawList` edit).
-    2. **perturbed def fails the bridge** — probe17 already has the vacuity
-       floor (bridge-literal flip); the deeper body/ctor/height content
-       perturbation is **`bootstrap-35`** (W7e).
-    3. **height-function emission** — the datatype cert covers the `Tree` decl;
-       whether a `.height` measure is emitted as its own certified def (the
-       card title's "+ datatype/height emission") is unverified this turn —
-       fold into W7e/34 scoping or confirm it's subsumed by the dtcert.
-  - So the umbrella stays `in_progress` with a much shorter tail: 34 (AppN) →
-    tgt slice, 35 (W7e) → perturbation acceptance, and the height-emission
-    check. The fixture heart is done and green.
+       cache-churning per-arg-`TypData` `RawList` edit). **This is the ONLY
+       remaining rung.**
+    2. ~~perturbed def fails the bridge~~ — **DONE `bootstrap-35` (W7e)**:
+       `probe19_w7e_kill` perturbs the emitted `_{def,dt}data` term at 6
+       positions / 5 classes (body/opcode/arm-body/ctor-id/field-type) and every
+       one flips the `def_eq`/`dt_eq` bridge 1→0; positives still close.
+    3. ~~height-function emission~~ — **RESOLVED (W7e)**: no separate
+       `Tree.height` cert is emitted (the Lean `.height` is auto-derived by
+       `render_dt` from the datatype decl, not a transcribed production def), so
+       there is nothing standalone to bridge. The ctors + field types that
+       determine it ARE certified via the dtcert and W7e perturbs both. The
+       card-title's "height emission" is thus subsumed by the datatype cert, not
+       a separate obligation.
+  - So the umbrella's tail is now a single rung: **`bootstrap-34` (multi-arg
+    AppN) → tgt-slice `def_eq` coverage**. The fixture heart (transcription +
+    live bridge + content-kill) is done and green.
 
 ## Writeup
 

@@ -1,9 +1,9 @@
 ---
 title: "W7e — defs-layer mutation-kill: perturb body / ctor / height ⟹ def_eq/dt_eq bridge flips 1→0"
-status: todo
-claimed_by:
+status: done
+claimed_by: opus-w7e
 created: 2026-07-15T04:10:00Z
-updated: 2026-07-15T04:10:00Z
+updated: 2026-07-15T04:40:00Z
 ---
 
 ## Description
@@ -49,6 +49,60 @@ this is the W7 acceptance rung.
   (bridge-literal flip) is already green in `probe17`; W7e is the deeper
   content-perturbation kill that proves `def_eq`/`dt_eq` actually compare body
   structure, not just top-level shape.
+- (2026-07-15, opus-w7e) **DONE — `probe-w0/probe19_w7e_kill/run.sh` built and
+  green (6 kills / 5 position classes).** Key mechanic (the thing that makes
+  this a REAL content kill, not another bridge-literal flip): the two
+  transcriber sides use disjoint constructor namespaces (reference
+  `RawExp.`/`RawDt.` vs production `ExprData.`/`DtData.`), and each live cert has
+  the reference `cert_*_raw` and production `cert_*_{def,dt}data` in SEPARATE
+  `def` blocks. So an `awk` region-scoped `gsub` (from `def cert_*_{def,dt}data`
+  to the next blank line) perturbs ONLY the production side; `render_def raw`
+  still expects the original content, so `def_eq`/`dt_eq` genuinely returns 0 and
+  the UNCHANGED `= 1 := by decide` bridge now fails to elaborate. Verified by a
+  manual `tri` spot-check (diff touched only line 18; `decide proved ... = 1 is
+  false`) before writing the probe. A `cmp -s` no-op guard rejects any
+  perturbation whose pattern didn't match (so a silent miss can't masquerade as
+  a kill). Positives de-duped (elaborated once per file).
+  - **Coverage (each a distinct `def_eq`/`dt_eq` recursion arm):**
+    body literal (`tri` `n-1` const `Lit 1→2`), opcode (`sq` `BinOp 8→6`,
+    mul→add), match-arm body literal (`tree_head` Node-arm `Lit 0→9`), match-arm
+    ctor id (`tree_head` `ArmList.Cons 6→9`), datatype ctor id (`Tree`
+    `CtorList.Cons 2→9`), datatype field type (`Tree` `TyBox 0→TyInt`). All six
+    kill; all four positives close.
+  - **Height — resolved (no separate cert to perturb).** Checked: the live
+    fixture emits NO `Tree.height` defcert. The datatype's Lean `.height` is
+    auto-derived by tactus-core `render_dt`/`deriving` from the `Tree` decl, not
+    a transcribed production `DefData`, so there is nothing standalone to bridge
+    or perturb. The ctors + field types that DETERMINE the derived height ARE
+    certified via the dtcert, and this probe perturbs both (ctor-id + field-type
+    kills) — so height-determining content is covered. (The only `.height` in
+    the emitted defs is vstd's poly `set.Set.height`, correctly `rawvir-def-poly`
+    gated, no cert.)
 
 ## Writeup
-_todo_
+**DONE.** `probe-w0/probe19_w7e_kill/run.sh` is the defs-layer content-kill: it
+perturbs each live emitted `.defcert`/`.dtcert` at a distinct structural
+position (body literal, opcode, match-arm body, match-arm ctor id, datatype ctor
+id, datatype field type — 6 kills / 5 classes), scoped to the production
+`_{def,dt}data` block only, and confirms every one flips the `def_eq`/`dt_eq`
+bridge from 1→0 (unchanged `= 1 := by decide` now fails), while every unperturbed
+cert still closes. This is strictly deeper than `probe17`'s vacuity floor (which
+only flips the bridge LITERAL): it proves the bridge inspects body *content*, at
+every recursion arm the fixture reaches.
+
+### How it works
+The reference and production transcriptions live in separate `def` blocks and use
+disjoint constructor namespaces, so an `awk` region-scoped `gsub` over the
+production data block leaves `render_def raw` intact — the two sides genuinely
+disagree after the edit, forcing `def_eq = 0`. A `cmp -s` no-op guard fails the
+run if any pattern silently didn't match (prevents a false "kill OK").
+
+### Assumptions / honest scope
+- Runs against the certs from probe17's regen recipe (fork verus
+  `--tactus-emit-cert` over `bootstrap-fixture`); it does not re-emit them.
+- No separate `Tree.height` cert exists to perturb (auto-derived, not
+  transcribed); height-determining content is covered via the datatype ctor/field
+  kills (see Progress).
+- Like all W7 probes, this certifies the transcribers AGREE under perturbation;
+  it does not certify the transcribers themselves (TCB) or SST-semantics
+  adequacy — that's W5 (`bootstrap-10`).
