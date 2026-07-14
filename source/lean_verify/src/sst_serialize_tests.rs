@@ -1196,6 +1196,172 @@ fn ldt_to_dtdata_structure_fails() {
     assert_eq!(s.ldt_to_dtdata(&dt).unwrap_err(), "ed-dt-struct");
 }
 
+// ── W7d (bootstrap-32): defs-layer certificate emission ──────────────────
+//
+// `serialize_def` / `serialize_dt` drive BOTH transcribers on one shared
+// `Serializer`; the tests assert the returned `(raw, defdata)` / `(raw, dtdata)`
+// pairs are BYTE-IDENTICAL to the two independent unit-test pins above — i.e.
+// the shared serializer keeps the reference and production ids aligned, so it
+// reproduces the EXACT pair `probe16_w7d_defbridge` proved closes `def_eq` /
+// `dt_eq` under `decide`. The `render_*_cert` tests then pin that the assembler
+// embeds those literals verbatim and emits the proven bridge `example` line.
+
+/// `serialize_def` on the `tri` fixture: the shared serializer reproduces the
+/// `raw_vir_def_tri_header` × `ldef_to_defdata_tri_header` pair (name 0, param
+/// 1, body `Var 1` / `Atom 1`) — the probe16-proven `def_eq` inputs.
+#[test]
+fn serialize_def_tri_shared_serializer() {
+    use crate::lean_ast::{Binder, Def};
+    use crate::lean_name::LeanName;
+    // Reference (VIR) side — the `raw_vir_def_tri_header` inputs.
+    let empty_tps: vir::ast::Idents = std::sync::Arc::new(vec![]);
+    let params = mk_params(vec![("n", tnat())]);
+    let body = mk_vexpr(ExprX::Var(tvar("n")), tnat());
+    // Production (`lean_ast`) side — the `ldef_to_defdata_tri_header` `Def`.
+    let n = LeanName::from_var_ident(&tvar("n"));
+    let def = Def {
+        attrs: vec![],
+        name: "lib.tri".to_string(),
+        binders: vec![Binder::explicit(n.clone(), LExpr::var_lit("Nat"))],
+        ret_ty: LExpr::var_lit("Nat"),
+        body: LExpr::var(n),
+        termination_by: vec![],
+        termination_structural: false,
+        decreasing_by: None,
+    };
+    let (raw, defdata) =
+        serialize_def(&mk_fun("tri"), &empty_tps, &params, &tnat(), &body, &def).unwrap();
+    assert_eq!(
+        raw,
+        format!(
+            "({NS}.RawDef.mk 0 \
+               ({NS}.ParamList.Cons 1 {NS}.TypData.TyNat (Tactus.Box.mk {NS}.ParamList.Nil)) \
+               {NS}.TypData.TyNat \
+               ({NS}.RawExp.Var 1 {NS}.TypData.TyNat))"
+        )
+    );
+    assert_eq!(
+        defdata,
+        format!(
+            "({NS}.DefData.mk 0 \
+               ({NS}.ParamList.Cons 1 {NS}.TypData.TyNat (Tactus.Box.mk {NS}.ParamList.Nil)) \
+               {NS}.TypData.TyNat \
+               ({NS}.ExprData.Atom 1))"
+        )
+    );
+}
+
+/// A polymorphic def fails the REFERENCE gate FIRST (`?` short-circuits), so
+/// `serialize_def` returns the reference's `rawvir-def-poly` tag and never runs
+/// production — no half-cert is written.
+#[test]
+fn serialize_def_poly_gates_on_reference() {
+    use crate::lean_ast::Def;
+    let tps: vir::ast::Idents =
+        std::sync::Arc::new(vec![std::sync::Arc::new("A".to_string())]);
+    let params = mk_params(vec![]);
+    let body = mk_vexpr(ExprX::Var(tvar("x")), tint());
+    // The production `Def` is irrelevant — the reference gate fires first.
+    let def = Def {
+        attrs: vec![],
+        name: "lib.f".to_string(),
+        binders: vec![],
+        ret_ty: LExpr::var_lit("Int"),
+        body: LExpr::var_lit("x"),
+        termination_by: vec![],
+        termination_structural: false,
+        decreasing_by: None,
+    };
+    assert_eq!(
+        serialize_def(&mk_fun("f"), &tps, &params, &tint(), &body, &def).unwrap_err(),
+        "rawvir-def-poly"
+    );
+}
+
+/// `render_def_cert` embeds the `(raw, defdata)` literals verbatim and emits the
+/// exact `def_eq (render_def …) … = 1 := by decide` bridge line probe16 pinned.
+#[test]
+fn render_def_cert_bridge_shape() {
+    let text = render_def_cert("mycrate", "lib.tri", "lib__tri", "RAWLIT", "DEFDATALIT");
+    assert!(text.contains(&format!("import {CERT_IMPORT}\n")));
+    assert!(text.contains(&format!("def cert_lib__tri_raw : {NS}.RawDef :=\n  RAWLIT\n")));
+    assert!(text.contains(&format!(
+        "def cert_lib__tri_defdata : {NS}.DefData :=\n  DEFDATALIT\n"
+    )));
+    assert!(text.contains(&format!(
+        "example : {NS}.def_eq ({NS}.render_def cert_lib__tri_raw) cert_lib__tri_defdata = 1 := by decide\n"
+    )));
+}
+
+/// `serialize_dt` on the `Tree` fixture: the shared serializer reproduces the
+/// `raw_vir_dt_tree` × `ldt_to_dtdata_tree` pair (name 0, Leaf=1 [TyInt],
+/// Node=2 [TyBox 0, TyBox 0], Box KEPT) — the probe16-proven `dt_eq` inputs.
+#[test]
+fn serialize_dt_tree_shared_serializer() {
+    use crate::lean_ast::{Datatype, DatatypeKind, Field, Variant as LVariant};
+    // Reference (VIR) side.
+    let path = mk_dt_path("Tree");
+    let empty_tps: vir::ast::TypPositives = std::sync::Arc::new(vec![]);
+    let variants: vir::ast::Variants = std::sync::Arc::new(vec![
+        mk_variant("Leaf", vec![tu64()]),
+        mk_variant("Node", vec![tbox(tdatatype(&path)), tbox(tdatatype(&path))]),
+    ]);
+    // Production (`lean_ast`) side.
+    let box_tree = LExpr::new(ExprNode::App {
+        head: Box::new(LExpr::var_lit("Tactus.Box")),
+        args: vec![LExpr::var_lit("lib.Tree")],
+    });
+    let dt = Datatype {
+        name: "lib.Tree".to_string(),
+        self_name: "Tree".to_string(),
+        typ_params: vec![],
+        kind: DatatypeKind::Inductive {
+            variants: vec![
+                LVariant {
+                    name: "Leaf".to_string(),
+                    fields: vec![Field { name: "val0".to_string(), ty: LExpr::var_lit("Int") }],
+                },
+                LVariant {
+                    name: "Node".to_string(),
+                    fields: vec![
+                        Field { name: "val0".to_string(), ty: box_tree.clone() },
+                        Field { name: "val1".to_string(), ty: box_tree.clone() },
+                    ],
+                },
+            ],
+        },
+        derives: vec!["Inhabited".to_string()],
+    };
+    let (raw, dtdata) =
+        serialize_dt(&Dt::Path(path), &empty_tps, &variants, &dt).unwrap();
+    let expected_ctors = format!(
+        "({NS}.CtorList.Cons 1 \
+           ({NS}.TypList.Cons {NS}.TypData.TyInt (Tactus.Box.mk {NS}.TypList.Nil)) \
+           (Tactus.Box.mk \
+              ({NS}.CtorList.Cons 2 \
+                 ({NS}.TypList.Cons ({NS}.TypData.TyBox 0) \
+                    (Tactus.Box.mk ({NS}.TypList.Cons ({NS}.TypData.TyBox 0) \
+                       (Tactus.Box.mk {NS}.TypList.Nil)))) \
+                 (Tactus.Box.mk {NS}.CtorList.Nil)))))"
+    );
+    assert_eq!(raw, format!("({NS}.RawDt.mk 0 {expected_ctors}"));
+    assert_eq!(dtdata, format!("({NS}.DtData.mk 0 {expected_ctors}"));
+}
+
+/// `render_dt_cert` embeds the `(raw, dtdata)` literals and emits the exact
+/// `dt_eq (render_dt …) … = 1 := by decide` bridge line.
+#[test]
+fn render_dt_cert_bridge_shape() {
+    let text = render_dt_cert("mycrate", "lib.Tree", "lib__Tree", "RAWDT", "DTDATA");
+    assert!(text.contains(&format!("def cert_lib__Tree_raw : {NS}.RawDt :=\n  RAWDT\n")));
+    assert!(text.contains(&format!(
+        "def cert_lib__Tree_dtdata : {NS}.DtData :=\n  DTDATA\n"
+    )));
+    assert!(text.contains(&format!(
+        "example : {NS}.dt_eq ({NS}.render_dt cert_lib__Tree_raw) cert_lib__Tree_dtdata = 1 := by decide\n"
+    )));
+}
+
 // ── W6d.2b-2: the emit-path gate (`oblig_slot` + `goal_data` deep/atom) ──
 //
 // The obligation (reference) side drives: `oblig_slot` deepens a coverable
