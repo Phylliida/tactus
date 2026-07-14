@@ -525,3 +525,78 @@ fn raw_exp_field_tuple() {
         )
     );
 }
+
+// ── W6d.2b-2: the emit-path gate (`oblig_slot` + `goal_data` deep/atom) ──
+//
+// The obligation (reference) side drives: `oblig_slot` deepens a coverable
+// obligation into `RawExp.Span(loc, raw)` and records its leaf id in
+// `deep_ids`; `goal_data` (run after the whole stm walk) deepens the matching
+// goal leaf ONLY when that id is in `deep_ids` AND the goal transcription
+// succeeds — else both fall back to the opaque `Atom(id)` by the same id. A
+// forced-atom obligation (a shape `raw_exp` rejects) stays out of `deep_ids`,
+// so its goal auto-stays atom (verdict-neutral, the W6d.2a behavior).
+
+/// `oblig_slot` on a COVERABLE obligation (`true`): `raw_exp` succeeds, so the
+/// slot is the deep `RawExp.Span(loc, LitBool 1)` (the `Span` wrapper added
+/// here — the raw SST has no SpanMark node — matching production's outermost
+/// span mark that the goal side transcribes) and the leaf id lands in
+/// `deep_ids`. `loc` interns right after the span_mark'd leaf (id → id+1;
+/// `raw_exp` interns nothing for a bool literal).
+#[test]
+fn oblig_slot_deep_wraps_span_and_records() {
+    let mut s = Serializer::default();
+    let boolt: Typ = std::sync::Arc::new(TypX::Bool);
+    let e = mk_exp(ExpX::Const(Constant::Bool(true)), boolt);
+    let (id, slot) = s.oblig_slot(&e).unwrap();
+    assert!(s.deep_ids.contains(&id), "coverable obligation id recorded in deep_ids");
+    assert_eq!(
+        slot,
+        format!("({NS}.RawExp.Span {} (Tactus.Box.mk ({NS}.RawExp.LitBool 1)))", id + 1)
+    );
+}
+
+/// `oblig_slot` on a NON-coverable obligation (`¬true` — `raw_exp` has no `Not`
+/// arm): the slot falls back to the opaque `atom_ob(id)` and the id is NOT
+/// recorded, so the goal walk keeps the matching leaf atom too (the fn still
+/// serializes; only this obligation stays shallow).
+#[test]
+fn oblig_slot_atom_fallback_when_not_coverable() {
+    let mut s = Serializer::default();
+    let boolt: Typ = std::sync::Arc::new(TypX::Bool);
+    let inner = mk_exp(ExpX::Const(Constant::Bool(true)), boolt.clone());
+    let e = mk_exp(ExpX::Unary(UnaryOp::Not, inner), boolt);
+    let (id, slot) = s.oblig_slot(&e).unwrap();
+    assert!(!s.deep_ids.contains(&id), "non-coverable obligation id NOT in deep_ids");
+    assert_eq!(slot, format!("({NS}.RawExp.Var {} {NS}.TypData.TyBool)", id));
+}
+
+/// `goal_data` gate — the SAME goal leaf (`a = b`, which transcribes to a
+/// visibly-distinct `BinOp`) deepens ONLY when its id is in `deep_ids`. Gate
+/// off → opaque `Atom(whole-leaf-id)` (verdict-neutral); gate on → the
+/// structural `BinOp(Eq, Atom a, Atom b)` the ref side's `render_exp` must
+/// match for the bridge to `decide`.
+#[test]
+fn goal_data_gate_deep_only_when_in_deep_ids() {
+    use crate::lean_ast::GoalShape;
+    let shape = GoalShape {
+        spine: vec![],
+        leaf: LExpr::eq(LExpr::var_synthetic("a"), LExpr::var_synthetic("b")),
+    };
+    // Gate OFF: `deep_ids` empty → opaque atom fallback (whole leaf = id 0).
+    let mut off = Serializer::default();
+    assert_eq!(
+        off.goal_data(&shape),
+        "(lib.GoalData.LeafE (lib.ExprData.Atom 0))"
+    );
+    // Gate ON: the leaf id in `deep_ids` (ref side went deep) → the deep BinOp
+    // (whole leaf = id 0, then atoms a=1, b=2).
+    let mut on = Serializer::default();
+    let id = on.lexpr_leaf(&shape.leaf);
+    on.deep_ids.insert(id);
+    assert_eq!(
+        on.goal_data(&shape),
+        "(lib.GoalData.LeafE (lib.ExprData.BinOp 0 \
+           (Tactus.Box.mk (lib.ExprData.Atom 1)) \
+           (Tactus.Box.mk (lib.ExprData.Atom 2))))"
+    );
+}

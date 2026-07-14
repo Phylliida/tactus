@@ -1,9 +1,9 @@
 ---
 title: "W6d — bridge deepened: obligation leaves emit LeafE + refWp closes over ExprData (corpus coverage map)"
 status: in_progress
-claimed_by: opus-b25
+claimed_by: opus-b26
 created: 2026-07-14T09:30:00Z
-updated: 2026-07-14T23:45:00Z
+updated: 2026-07-15T02:30:00Z
 ---
 
 ## Description
@@ -327,17 +327,20 @@ arithmetic fns; G2+G3 unlock the datatype/struct/tuple fns.
       opus-b24).** Box/Unbox peel (G0), VarAt→Var (G7), bool literal (G1) added
       to `raw_exp`; 4 unit tests; `lean_verify` lib 331/0; still dead-code
       (verdict-neutral). See the "W6d.2b-1 landed" Progress entry below.
-    - **W6d.2b-2 — G6/G3 reference arms + goal-side G1 arm + the emit gate.**
-    Wire `raw_exp`
-    (G0 Box/Unbox peel FIRST, then G7 VarAt, G1 LitBool, G3 Field, G6 HasType,
-    G2 TyRef→deref) into `oblig_leaf` with the `atom_ob` fallback when a shape
-    isn't coverable, and `goal_data` into `lexpr_to_exprdata(shape.leaf)` with
-    the same fallback. **Gate: a given obligation goes deep ONLY when BOTH sides
-    succeed and agree** (else BOTH fall back to atom) — a ref-deep/goal-atom
-    mismatch fails that fn's bridge (→ census-tracked, non-bridging). Wrap the
-    obligation `RawExp` in `RawExp::Span` at the `oblig_leaf` level (the raw SST
-    has no SpanMark node — `bootstrap-22`). Keep every non-cast-class shape
-    fail-loud + census-tracked.
+    - **W6d.2b-2 — G6/G3 reference arms + goal-side G1 arm + the emit gate.
+      ✅ DONE** (arms: 2026-07-14 opus-b25; **emit gate: 2026-07-14 opus-b26**).
+      The `raw_exp`/`lexpr_to_exprdata` vocabulary is complete AND now wired into
+      the emit path via a new `oblig_slot` helper (deep-or-atom obligation slot,
+      wrapping coverable `raw_exp(e)` in `RawExp.Span(loc, ·)` + recording the
+      leaf id in `deep_ids`) at all three deepenable sites (Assert / ensures-Ret
+      / Loop-inv), and `goal_data` gates on `deep_ids`. **Coordination = the
+      "ob-drives" asymmetric gate** (single-pass; the symmetric "both fall back"
+      would need a goal pre-pass because the stm walk runs BEFORE the goal walk —
+      circular). Forced-atom sites (Call reqs, Loop decrease, if-cond hyps) never
+      enter `deep_ids` → their goals auto-stay atom (verdict-neutral for free).
+      Verified **`lean_verify` lib 338/0** (+3 gate tests) + confirmed
+      stm_size/goal_count-invariant. See the "W6d.2b-2 emit gate landed"
+      Progress entry below.
 - **W6d.3 — bridge over the bridgeable subset, verdict-neutral.** Re-emit the
   fixture (release-binary rebuild) — this also **regenerates the golden**
   `testdata/add_capped.cert.lean` to the W6d.2a emission (currently stale but
@@ -871,6 +874,99 @@ arithmetic fns; G2+G3 unlock the datatype/struct/tuple fns.
   **W6d.3** (rebuild release binary + re-emit all fixtures + probe9 the coverable
   subset + regenerate the golden `add_capped.cert.lean`). G4 (`Let`-in-leaf) →
   W6e.
+
+- (2026-07-14, opus-b26) **W6d.2b-2 emit gate LANDED — `raw_exp` +
+  `lexpr_to_exprdata` are wired into the emit path; the deep bridge now fires
+  on coverable obligations. `lean_verify` lib 338/0.** This closes W6d.2b's
+  remaining half (the transcription vocabulary was complete + unit-pinned but
+  `#[allow(dead_code)]`; nothing fed it into `oblig_leaf`/`goal_data`). What
+  changed, all in `sst_serialize.rs` (+3 tests):
+
+  - **New `oblig_slot(&mut self, e) -> Sr<(u64, String)>`** — the deep-or-atom
+    obligation SLOT for one raw SST obligation. Interns the span_mark'd leaf id
+    (== goal-side leaf id, the atom-match key), then attempts `raw_exp(e)`. On
+    success (coverable) it emits the DEEP `RawExp.Span(loc, box raw)` and records
+    the id in a new `deep_ids: HashSet<u64>`; on failure it falls back to
+    `atom_ob(id)` (the W6d.2a opaque behavior). **The `Span` wrapper is added
+    HERE** — the raw SST has no SpanMark node (bootstrap-22), so `oblig_slot`
+    wraps the bare `raw_exp` in `RawExp.Span` with `loc =
+    text_leaf(format_rust_loc(&e.span))` — the SAME loc string `oblig_leaf`'s
+    span_mark carries, so the ref `RawExp.Span(loc,·)` → `render_exp` →
+    `ExprData.SpanMark(loc,·)` shares its loc id with the goal side's
+    `ExprData.SpanMark(loc, lexpr(inner))`. Wired at the THREE deepenable sites:
+    Assert arm, ensures setup (`pending_ens_oblig: Vec<u64> → Vec<String>` of
+    pre-built slots), and Loop-inv (`inv_slots` parallel to `inv_entries`).
+  - **`goal_data` gate** — deepens the core leaf into `LeafE(ExprData…)` via
+    `lexpr_to_exprdata(shape.leaf)` ONLY when `deep_ids.contains(leaf_id)` AND
+    the transcription succeeds; else the opaque `Atom(id)` fallback.
+
+  **The coordination is the "ob-drives" asymmetric gate (single-pass, sound).**
+  The stm (obligation) walk runs BEFORE the goal walk (`serialize`: `stm` then
+  `goal_list`), so a truly-symmetric "go deep iff BOTH sides succeed, else BOTH
+  atom" gate would need a goal pre-pass (circular: the ob side would need
+  goal-side success info it can't have yet). Instead: the ob side drives
+  (deep iff `raw_exp` ok, recorded in `deep_ids`); the goal side follows
+  (deep iff `deep_ids` has the id AND `lexpr` ok). Case analysis by
+  (ref_ok, goal_ok):
+  - **(ok, ok)** → both deep → bridge `decide`s `expr_eq(render_exp(raw),
+    lexpr(leaf))` (the Friction-2 catcher). ✓
+  - **(¬ok, ok)** → ob atom (not in `deep_ids`) → goal atom → **both atom,
+    verdict-neutral.** This is the `id_generic` case (`r==t` generic: `raw_exp`
+    fails `typ-typparam` on the operand type; `lexpr` succeeds on `Atom r =
+    Atom t`) — ob-drives keeps it atom, so **no regression** from W6d.2a's
+    all-atom bridging. ✓
+  - **(¬ok, ¬ok)** → both atom. ✓
+  - **(ok, ¬ok)** → ob deep, goal atom → **mismatch → that fn's bridge fails
+    (non-bridging, census-tracked)** — SOUND (a deep-structure vs `Atom` never
+    `expr_eq`-matches, so never a silent pass), only a coverage loss. Not
+    constructable in the fixture (the transcribers are duals over the coverable
+    set). If W6d.3 surfaces one, upgrade to the symmetric pre-pass (documented).
+
+  **Forced-atom sites are handled FOR FREE by ob-drives.** Call reqs (a
+  production LExpr, no raw SST → no `raw_exp`), Loop `decrease_oblig` (a
+  synthesized `0≤D ∧ D<d_old`), and the if-cond / loop-cond HYPOTHESIS slots
+  (`c`/`nc`/`cond_ann`, which are `Imp` hyps, not obligations→goals) never call
+  `oblig_slot`, so their ids never enter `deep_ids` and their goals auto-stay
+  atom on both sides — no special-casing needed.
+
+  **Size-invariance confirmed (critical — else the emitted `stm_size := by
+  decide` probe would break).** tactus-core `stm_size` counts stmt heads +
+  `raw_exp_list_len` (list LENGTH) + `binder_len` + `frame_len` — it NEVER
+  recurses into RawExp depth (`Assert(_o,_h)=>1`; `Ret(es,_)=>1+raw_exp_list_len
+  es`; Loop likewise). So deep-vs-atom is `stm_size`- AND `goal_count`-invariant
+  (one `RawExpList.Cons` / one goal per obligation either way); the serializer's
+  `stm_size_of` matches (counts the same tokens). The ONLY behavioral change is
+  `goals_eq` now comparing deep structure on coverable obligations — exactly the
+  intended Friction-2 comparison point.
+
+  **Verified — `cargo test -p lean_verify --lib` = 338 passed / 0 failed** (335
+  baseline + 3: `oblig_slot_deep_wraps_span_and_records`,
+  `oblig_slot_atom_fallback_when_not_coverable`,
+  `goal_data_gate_deep_only_when_in_deep_ids`). Removed the now-superfluous
+  `#[allow(dead_code)]` from every now-live transcription fn (`raw_exp`,
+  `lexpr_to_exprdata`, `typ_data`, `call_fun_id` + the free helpers) — a
+  clean rebuild shows NO `sst_serialize.rs` dead-code warning, confirming they
+  are all genuinely reached from the emit path. Baseline 8 warnings (all
+  pre-existing, in other files).
+
+  **Verdict-neutral by construction / not yet re-emitted.** The serializer
+  changes only cert TEXT when `--tactus-emit-cert` is on (Lean-text-only
+  coupling — same argument as every W6d.1b/2a sub-step); the Rust build +
+  default e2e suite + W3 tgt gate stay green. No cert was re-emitted this turn
+  (needs the release-binary rebuild = W6d.3). The deep-render MECHANISM itself
+  is already Lean-verified (W6d.1a `expr_mirror_kernel_computes` +
+  `leafe_goal_bridge_kernel_computes`, both `.verified`), so W6d.3 validates the
+  end-to-end wiring (real serializer output → cert → bridge `decide`), not the
+  math.
+
+  **Next = W6d.3** (rebuild release binary + re-emit all 13 fixtures + probe9
+  the coverable subset [add_capped, double_exec, quad_exec, sum_to, scope_shape,
+  tri_one, head_exec, mk_point, swap_pair] + regenerate the golden
+  `add_capped.cert.lean`; confirm flag-on == flag-off verdict, census the
+  fail-loud remainder). If any coverable fn goes non-bridging, check for a
+  (ref_ok && !goal_ok) mismatch [→ symmetric-gate upgrade] or a genuine deep
+  disagreement [→ a transcription bug, or the real Friction-2]. G4 (`Let`-in-leaf)
+  → W6e.
 
 ## Writeup
 

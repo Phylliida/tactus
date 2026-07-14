@@ -311,13 +311,28 @@ type Sr<T> = Result<T, String>;
 #[derive(Default)]
 struct Serializer<'a> {
     leaves: LeafTable,
-    /// The fn's ANNOTATED ensures obligation leaves (span_mark'd, the
-    /// `Return` goal — finding-1's Ret-annotation), set once before
-    /// walking the body so the statement recursion stays a plain
-    /// `&Stm → String`. Production renders each ensures at the return
-    /// site as a `Postcondition` `SpanMark` (`WpCtx::new`); `oblig_leaf`
-    /// byte-matches it so the goal-side postcondition leaf cancels.
-    pending_ens_oblig: Vec<u64>,
+    /// The fn's ANNOTATED ensures obligation SLOTS (deep `RawExp` literals —
+    /// span_mark'd, the `Return` goal, finding-1's Ret-annotation), set once
+    /// before walking the body so the statement recursion stays a plain
+    /// `&Stm → String`. Production renders each ensures at the return site as
+    /// a `Postcondition` `SpanMark` (`WpCtx::new`); `oblig_slot`/`oblig_leaf`
+    /// byte-match it so the goal-side postcondition leaf cancels. W6d.2b: each
+    /// slot is `oblig_slot`'s output — a deep `RawExp.Span(loc, raw)` when the
+    /// ensures is coverable (id recorded in `deep_ids`), else `atom_ob(id)`.
+    pending_ens_oblig: Vec<String>,
+    /// W6d.2b emit gate — the obligation leaf ids that went DEEP on the
+    /// reference (SST) side: `oblig_slot`'s `raw_exp` succeeded, so the slot
+    /// emitted `RawExp.Span(loc, raw)` instead of `atom_ob(id)`. The goal walk
+    /// (`goal_data`, run AFTER the whole stm walk) consults this: it deepens a
+    /// goal's leaf via `lexpr_to_exprdata` ONLY when the leaf's id is here AND
+    /// the goal transcription succeeds — else it falls back to `Atom(id)`.
+    /// "ob-drives" coordination: forced-atom obligation slots (Call reqs,
+    /// Loop decrease, if-cond hyps) never enter this set, so their goals
+    /// auto-stay atom (both sides match by id). A ref-deep/goal-atom mismatch
+    /// (`raw_exp` ok but `lexpr_to_exprdata` fails) leaves the ob side deep +
+    /// the goal atom → that fn's bridge fails (non-bridging, sound — never a
+    /// silent pass). Fresh (empty) per fn (`Serializer::default`).
+    deep_ids: std::collections::HashSet<u64>,
     /// The `sanitize(ret_name)` leaf for the return-value binding
     /// (finding-4), or `None` for a unit return (no declared `-> (r:T)`).
     /// The `Return` arm pairs it with the rendered return expression to
@@ -424,6 +439,42 @@ impl<'a> Serializer<'a> {
         Ok(self.leaves.intern(pp_expr(&marked)))
     }
 
+    /// W6d.2b emit gate — the deep-or-atom obligation SLOT for one raw SST
+    /// obligation `e`. Returns `(id, slot)` where `id` is the interned
+    /// span_mark'd leaf id (== the goal-side leaf id, the atom-fallback match
+    /// key) and `slot` is the `RawExp` literal that fills a `StmData`
+    /// obligation field.
+    ///
+    /// The "ob-drives" rule: attempt the reference transcription `raw_exp(e)`.
+    /// On success the obligation is coverable — emit the DEEP
+    /// `RawExp.Span(loc, raw)` (the raw SST has no SpanMark node — bootstrap-22
+    /// — so the `Span` wrapper is added HERE, matching production's outermost
+    /// `SpanMark` that the goal side transcribes; `loc` interns
+    /// `format_rust_loc(&e.span)`, the SAME text `oblig_leaf`'s span_mark
+    /// carries, so the two `Span`/`SpanMark` locs share an id). Record `id` in
+    /// `deep_ids` so the goal walk deepens the matching leaf too. On failure
+    /// (a non-cast-class shape, or a `typ_data`/arity/range sub-fail) fall back
+    /// to the opaque `atom_ob(id)` — the SAME id the goal side will atom-match
+    /// (verdict-neutral, exactly the W6d.2a behavior). The whole fn still
+    /// serializes; only THIS obligation stays shallow.
+    ///
+    /// `render_exp(RawExp.Span(loc, render(raw)))` = `ExprData.SpanMark(loc,
+    /// render(raw))`, and the goal side emits `ExprData.SpanMark(loc,
+    /// lexpr_to_exprdata(inner))` — so the bridge `decide`s
+    /// `expr_eq(render(raw), lexpr(inner))`, the Friction-2 catcher.
+    fn oblig_slot(&mut self, e: &Exp) -> Sr<(u64, String)> {
+        let id = self.oblig_leaf(e)?;
+        let slot = match self.raw_exp(e) {
+            Ok(raw) => {
+                let loc = self.text_leaf(&crate::obligation_naming::format_rust_loc(&e.span));
+                self.deep_ids.insert(id);
+                format!("({}.RawExp.Span {} {})", NS, loc, box_raw(&raw))
+            }
+            Err(_) => atom_ob_lit(id),
+        };
+        Ok((id, slot))
+    }
+
     /// Render `¬<annotated e>` as a leaf, byte-matching production's
     /// loop-exit hypothesis (finding-3). The `use` telescope pushes
     /// `LExpr::not(cond_marked(&c))` (`sst_to_lean::walk_loop`), i.e. the
@@ -516,7 +567,6 @@ impl<'a> Serializer<'a> {
     /// wrappers. `TyNamed`/`TyRef` ids reuse `typ_leaf`'s interning so the
     /// reference and production sides agree by construction. Fails loud
     /// (census tag `typ-<k>`) on shapes stage B does not yet mirror.
-    #[allow(dead_code)]
     fn typ_data(&mut self, typ: &Typ) -> Sr<String> {
         match &**typ {
             TypX::Bool => Ok(format!("{}.TypData.TyBool", NS)),
@@ -545,7 +595,6 @@ impl<'a> Serializer<'a> {
     /// 2nd `BinOp` slot is the op's RESULT type (`e.typ`), which is what
     /// `render_exp` reads to decide operand coercion. Everything outside the
     /// class fails loud (`raw-<k>`).
-    #[allow(dead_code)]
     fn raw_exp(&mut self, e: &Exp) -> Sr<String> {
         match &e.x {
             // G0 (W6d.2b) — peel the SMT coercion wrappers FIRST. `Box(_)` /
@@ -682,7 +731,6 @@ impl<'a> Serializer<'a> {
     /// production `App{head: Var(name)}` interns the SAME id). Production
     /// renders the head as `LeanName::from_path(&fun.path)`
     /// (`to_lean_sst_expr.rs:1229`), so match that exactly.
-    #[allow(dead_code)]
     fn call_fun_id(&mut self, fun: &vir::ast::Fun) -> u64 {
         let name = crate::lean_name::LeanName::from_path(&fun.path);
         self.text_leaf(name.as_str())
@@ -722,7 +770,6 @@ impl<'a> Serializer<'a> {
     /// (Var/Lit/`Int.toNat`|`Int.ofNat` Cast/App/BinOp) plus the unambiguous
     /// FieldProj/SpanMark structural nodes; fails loud (`ed-<k>`) on anything
     /// else.
-    #[allow(dead_code)]
     fn lexpr_to_exprdata(&mut self, e: &LExpr) -> Sr<String> {
         match &e.node {
             // Terminal atom: a var read or a bare spec-fn / type name. Interns
@@ -840,14 +887,17 @@ impl<'a> Serializer<'a> {
             // hyp first (keeps it in body pre-order), then the annotated
             // obligation — the goal walk (N3b) reuses whichever id.
             StmX::Assert(_, _, e) | StmX::AssertCompute(_, e, _) => {
+                // Intern the BARE hyp first (keeps it in body pre-order), then
+                // the obligation slot (`oblig_slot` interns the span_mark'd
+                // leaf + the deep `raw_exp` atoms after it).
                 let hyp = self.exp_leaf(e)?;
-                let oblig = self.oblig_leaf(e)?;
-                // W6d.2a: the obligation slot is now a DEEP `RawExp`. Opaque
-                // fallback — wrap the interned leaf id as `atom_ob(id)` (=
-                // `Var(id, TyBool)`), which refWp's `close_e` renders to
-                // `LeafE(Atom id)`, matching the goal side by the same id
-                // (W6d.2b deepens the coverable shapes via `raw_exp`).
-                Ok(format!("({}.StmData.Assert {} {})", NS, atom_ob_lit(oblig), hyp))
+                // W6d.2b: the obligation slot is a DEEP `RawExp` when the assert
+                // condition is coverable (`raw_exp` succeeds → `RawExp.Span(loc,
+                // raw)`, id → `deep_ids`); else the opaque `atom_ob(id)` fallback
+                // (same interned id the goal side atom-matches — the W6d.2a
+                // verdict-neutral behavior).
+                let (_id, slot) = self.oblig_slot(e)?;
+                Ok(format!("({}.StmData.Assert {} {})", NS, slot, hyp))
             }
 
             StmX::Assume(e) => {
@@ -878,14 +928,11 @@ impl<'a> Serializer<'a> {
                 // goal (Ret-annotation, finding-1): span_mark'd like
                 // production's `WpCtx` postcondition so the goal-side
                 // postcondition leaf reuses the same id and cancels.
-                // W6d.2a: the ensures obligations are now a DEEP `RawExpList`
-                // (closed via `close_each_e`). Opaque fallback per obligation
-                // (`atom_ob`), same interned ids as the stage-A goal leaves.
-                let list = {
-                    let terms: Vec<String> =
-                        self.pending_ens_oblig.iter().map(|&id| atom_ob_lit(id)).collect();
-                    raw_exp_list(&terms)
-                };
+                // W6d.2b: the ensures obligations are a DEEP `RawExpList`
+                // (closed via `close_each_e`). Each slot was built at setup by
+                // `oblig_slot` — a deep `RawExp.Span(loc, raw)` for a coverable
+                // ensures (id in `deep_ids`), else the `atom_ob(id)` fallback.
+                let list = raw_exp_list(&self.pending_ens_oblig);
                 // Return-value binding (finding-4): production prepends
                 // `let <ret> := <e>` before the postcondition (the walker's
                 // `let_bind_synthetic(sanitize(ret), <e_ast>, …)`, peeled
@@ -1252,14 +1299,20 @@ impl<'a> Serializer<'a> {
         // one span_mark'd `LoopInvariant` leaf for both roles, unlike
         // Assert's bare/annotated split).
         let mut inv_entries: Vec<(u64, u64)> = Vec::new();
+        // W6d.2b: the parallel DEEP invariant obligation slots (index-aligned
+        // with `inv_entries`). `oblig_slot` gives BOTH the opaque leaf id (for
+        // the `inv_hyps` frame binder) AND the deep-or-atom `RawExp` slot (for
+        // `inv_obligs`) — split only by role, never desynced.
+        let mut inv_slots: Vec<String> = Vec::new();
         for li in invs.iter() {
             if !(li.at_entry && li.at_exit) {
                 return Err("loop-nonstandard-invariant".to_string());
             }
             let hname = self.text_leaf(&format!("_h_ctx_{}", hyp_counter));
             hyp_counter += 1;
-            let oblig = self.oblig_leaf(&li.inv)?;
+            let (oblig, slot) = self.oblig_slot(&li.inv)?;
             inv_entries.push((hname, oblig));
+            inv_slots.push(slot);
         }
 
         // The loop condition: one shared `_h_ctx_N` name for both the
@@ -1275,16 +1328,13 @@ impl<'a> Serializer<'a> {
         let d_old_val = self.exp_leaf(&decrease[0])?;
         let decrease_oblig = self.decrease_oblig_leaf(&decrease[0], loop_id)?;
 
-        // W6d.2a: the parallel DEEP invariant obligations (`inv_obligs`,
-        // index-aligned with `inv_hyps`). Each invariant's obligation id rides
-        // through as `atom_ob(id)` — the SAME id serves the opaque frame hyp
-        // (`inv_hyps`) and the deep obligation (`inv_obligs`), split only by
-        // TYPE (opaque `u64` vs structural `RawExp`), not by content.
-        let inv_obligs = {
-            let terms: Vec<String> =
-                inv_entries.iter().map(|&(_, oblig)| atom_ob_lit(oblig)).collect();
-            raw_exp_list(&terms)
-        };
+        // W6d.2b: the parallel DEEP invariant obligations (`inv_obligs`,
+        // index-aligned with `inv_hyps`). Each slot is `oblig_slot`'s output —
+        // a deep `RawExp.Span(loc, raw)` for a coverable invariant (id in
+        // `deep_ids`, so the goal walk deepens too), else `atom_ob(id)`. The
+        // SAME id serves the opaque frame hyp (`inv_hyps`) and the deep
+        // obligation (`inv_obligs`), split only by role, not by content.
+        let inv_obligs = raw_exp_list(&inv_slots);
         let inv_hyps = self.binder_list(&inv_entries);
         let binders = self.binder_list(&binder_entries);
         let bounds = self.param_bound_list(&bound_entries);
@@ -1372,11 +1422,27 @@ impl<'a> Serializer<'a> {
     /// audit-only; the bridge never reads id values).
     fn goal_data(&mut self, shape: &GoalShape) -> String {
         let leaf_id = self.lexpr_leaf(&shape.leaf);
-        // W6d.2a: goals are now DEEP `LeafE(ExprData)`. Opaque fallback — the
-        // whole obligation leaf as one `Atom(id)`, matching refWp's
-        // `close_e(_, atom_ob(id))` = `LeafE(Atom id)` by the same interned id
-        // (W6d.2b transcribes the coverable shapes via `lexpr_to_exprdata`).
-        let mut term = format!("{}.GoalData.LeafE ({}.ExprData.Atom {})", NS, NS, leaf_id);
+        // W6d.2b emit gate — deepen the goal's core leaf into
+        // `LeafE(ExprData…)` ONLY when the matching obligation went DEEP on the
+        // reference side (`deep_ids`, the "ob-drives" coordination — populated
+        // by the whole stm walk, which runs before this) AND the goal-side
+        // transcription `lexpr_to_exprdata(shape.leaf)` succeeds. Then the
+        // bridge `decide`s `expr_eq(render_exp(rawExp), lexpr(leaf))` — the
+        // Friction-2 catcher. Otherwise the opaque `Atom(id)` fallback (the
+        // W6d.2a verdict-neutral behavior), matching refWp's `atom_ob(id)` by
+        // the same interned id. A `deep_ids`-hit whose `lexpr_to_exprdata`
+        // FAILS (ref-deep, goal-atom) makes this fn's bridge fail — sound
+        // (never a silent pass), only a coverage loss for that fn.
+        let atom_core =
+            || format!("{}.GoalData.LeafE ({}.ExprData.Atom {})", NS, NS, leaf_id);
+        let mut term = if self.deep_ids.contains(&leaf_id) {
+            match self.lexpr_to_exprdata(&shape.leaf) {
+                Ok(ed) => format!("{}.GoalData.LeafE {}", NS, ed),
+                Err(_) => atom_core(),
+            }
+        } else {
+            atom_core()
+        };
         for node in shape.spine.iter().rev() {
             term = match node {
                 GoalSpine::Imp(p) => {
@@ -1547,15 +1613,20 @@ fn serialize<'a>(
     for e in check.post_condition.ens_exps.iter() {
         ens_leaves.push(s.exp_leaf(e)?);
     }
-    // Annotated ensures obligation leaves → the `Return` goal
+    // Annotated ensures obligation SLOTS → the `Return` goal
     // (Ret-annotation, finding-1): production renders each ensures at the
     // return site as a span_mark'd `Postcondition` obligation
-    // (`WpCtx::new`); `oblig_leaf` reconstructs the identical text so the
-    // goal-side postcondition leaf reuses this id and the two cancel across
-    // the W2 bridge.
-    let mut ens_oblig: Vec<u64> = Vec::new();
+    // (`WpCtx::new`); `oblig_slot` reconstructs the identical span_mark'd leaf
+    // text (so the goal-side postcondition leaf reuses this id and the two
+    // cancel across the W2 bridge) AND, when the ensures is coverable, emits
+    // the DEEP `RawExp.Span(loc, raw)` (id → `deep_ids`, so the goal walk
+    // deepens too). Built here (before the body) so the Ret arm stays a plain
+    // read of `pending_ens_oblig`; the raw_exp atoms intern in ensures order,
+    // exactly where the old `oblig_leaf` interned the span_mark'd leaf.
+    let mut ens_oblig: Vec<String> = Vec::new();
     for e in check.post_condition.ens_exps.iter() {
-        ens_oblig.push(s.oblig_leaf(e)?);
+        let (_id, slot) = s.oblig_slot(e)?;
+        ens_oblig.push(slot);
     }
     s.pending_ens_oblig = ens_oblig;
     // Return-var name leaf (finding-4): production binds `let <sanitize(ret)>
@@ -1908,7 +1979,6 @@ fn raw_exp_list(terms: &[String]) -> String {
 
 /// Box a `RawExp` sub-term for a recursive field (`Box<RawExp>` in the W6b
 /// mirror), matching `box_`'s `Tactus.Box.mk (…)` literal syntax.
-#[allow(dead_code)]
 fn box_raw(term: &str) -> String {
     box_(term)
 }
@@ -1917,7 +1987,6 @@ fn box_raw(term: &str) -> String {
 /// W6b mirror). Same `Tactus.Box.mk (…)` syntax as `box_raw`; a distinct name
 /// documents the production-side (prod ExprData) vs reference-side (ref
 /// RawExp) role.
-#[allow(dead_code)]
 fn box_ed(term: &str) -> String {
     box_(term)
 }
@@ -1925,7 +1994,6 @@ fn box_ed(term: &str) -> String {
 /// True iff `e` is a bare `Var` whose rendered name equals `name` — the shape
 /// production uses for the `Int.toNat` / `Int.ofNat` cast heads
 /// (`LExpr::var_lit`). `&Box<Expr>` deref-coerces to `&Expr` at the call site.
-#[allow(dead_code)]
 fn is_var_named(e: &LExpr, name: &str) -> bool {
     matches!(&e.node, ExprNode::Var(n) if n.as_str() == name)
 }
@@ -1936,7 +2004,6 @@ fn is_var_named(e: &LExpr, name: &str) -> bool {
 /// reference `RawExp::Call` carries no type args, so we key on the name alone
 /// and drop any type-arg layer — keeping both W6c sides identical on generic
 /// calls. Returns `None` for any other head shape (→ `ed-app-head`).
-#[allow(dead_code)]
 fn app_head_fn_name(head: &LExpr) -> Option<&str> {
     match &head.node {
         ExprNode::Var(n) => Some(n.as_str()),
@@ -1958,7 +2025,6 @@ fn app_head_fn_name(head: &LExpr) -> Option<&str> {
 /// variant — production renders it as a 2-arg App (`Bool.xor`), which
 /// `lexpr_to_exprdata` census-rejects (`ed-app-arity`), so the reference's
 /// `Xor → 14` code is never consumed by a bridged fn.
-#[allow(dead_code)]
 fn lean_binop_opcode(op: &crate::lean_ast::BinOp) -> Sr<u64> {
     use crate::lean_ast::BinOp as L;
     let code = match op {
@@ -1990,7 +2056,6 @@ fn lean_binop_opcode(op: &crate::lean_ast::BinOp) -> Sr<u64> {
 /// Sharp census tag for an un-mirrored `ExprNode` (the `_` arm of
 /// `lexpr_to_exprdata`). Var/Lit/BinOp/App/FieldProj/SpanMark are handled in
 /// the main match and never reach here.
-#[allow(dead_code)]
 fn lexpr_construct_tag(n: &ExprNode) -> &'static str {
     match n {
         ExprNode::LitBool(_) => "litbool",
@@ -2024,7 +2089,6 @@ fn lexpr_construct_tag(n: &ExprNode) -> &'static str {
 /// and the production `LExpr→ExprData` side from `lean_ast::BinOp` (must use
 /// the SAME assignments). Fails loud (`raw-binop-<k>`) on ops outside the
 /// cast class. Keep in sync with the prod-side table when W6d lands it.
-#[allow(dead_code)]
 fn binop_opcode(op: &BinaryOp) -> Sr<u64> {
     let code = match op {
         BinaryOp::Eq(_) => 0,
@@ -2049,7 +2113,6 @@ fn binop_opcode(op: &BinaryOp) -> Sr<u64> {
 
 /// Sharp census tag for an un-mirrored `BinaryOp` (the `_` arm of
 /// `binop_opcode`).
-#[allow(dead_code)]
 fn binop_construct_tag(op: &BinaryOp) -> &'static str {
     match op {
         BinaryOp::HeightCompare { .. } => "height",
@@ -2063,7 +2126,6 @@ fn binop_construct_tag(op: &BinaryOp) -> &'static str {
 }
 
 /// Sharp census tag for an un-mirrored `TypX` (the `_` arm of `typ_data`).
-#[allow(dead_code)]
 /// Width `n` of a fixed-width UNSIGNED integer range a `HasType(U(n))`
 /// refinement carries (G6), peeling SMT `Boxed`/`Decorate` wrappers (parallel
 /// to `typ_data`). Only the unsigned ranges production expands to
@@ -2073,7 +2135,6 @@ fn binop_construct_tag(op: &BinaryOp) -> &'static str {
 /// outside `pow2`'s table would render a `0` bound → a loud bridge mismatch,
 /// still never a silent pass; the Verus fixed widths (8/16/32/64/128) are all
 /// covered.
-#[allow(dead_code)]
 fn uint_bound_width(typ: &Typ) -> Sr<u64> {
     match &**typ {
         TypX::Int(IntRange::U(n)) => Ok(*n as u64),
@@ -2102,7 +2163,6 @@ fn typ_construct_tag(typ: &Typ) -> &'static str {
 }
 
 /// Sharp census tag for an un-mirrored `ExpX` (the `_` arm of `raw_exp`).
-#[allow(dead_code)]
 fn exp_construct_tag(e: &ExpX) -> &'static str {
     match e {
         ExpX::Const(..) => "const-nonint",
