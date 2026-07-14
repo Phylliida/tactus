@@ -1,32 +1,82 @@
--- tactus defs part: root (base = machinery + instance closure; one part per source module, SCC-merged; umbrella = interface)
-import TactusDefs_lib_exec__base
 import TactusPrelude
 set_option linter.unusedVariables false
 set_option maxHeartbeats 800000
 set_option autoImplicit false
-noncomputable def lib.leaf_len (l : lib.LeafList) : Nat :=
-  match l with | lib.LeafList.Nil => 0 | lib.LeafList.Cons _h t => 1 + lib.leaf_len t.deref
-termination_by structural l
-noncomputable def lib.binder_len (b : lib.BinderList) : Nat :=
-  match b with | lib.BinderList.Nil => 0 | lib.BinderList.Cons _id _typ t => 1 + lib.binder_len t.deref
-termination_by structural b
-noncomputable def lib.param_bound_len (p : lib.ParamBoundList) : Nat :=
-  match p with | lib.ParamBoundList.Nil => 0 | lib.ParamBoundList.NoBound t => 1 + lib.param_bound_len t.deref | lib.ParamBoundList.Bound _name _prop t => 1 + lib.param_bound_len t.deref
-termination_by structural p
-noncomputable def lib.frame_len (f : lib.FrameList) : Nat :=
-  match f with | lib.FrameList.FNil => 0 | lib.FrameList.FBind _id _typ t => 1 + lib.frame_len t.deref | lib.FrameList.FHyp _h t => 1 + lib.frame_len t.deref | lib.FrameList.FLet _id _v t => 1 + lib.frame_len t.deref
-termination_by structural f
-noncomputable def lib.stm_size (s : lib.StmData) : Nat :=
-  match s with | lib.StmData.Assert _o _h => 1 | lib.StmData.Assume _e => 1 | lib.StmData.Assign _d _r => 1 | lib.StmData.Call reqs post => 1 + lib.leaf_len reqs.deref + lib.frame_len post.deref | lib.StmData.DeadEnd b => 1 + lib.stm_size b.deref | lib.StmData.Ret es _rb => 1 + lib.leaf_len es.deref | lib.StmData.If _c _nc t e => 1 + lib.stm_size t.deref + lib.stm_size e.deref | lib.StmData.Loop inv_hyps binders _ _ _ _ _ _ _ body => 1 + lib.binder_len inv_hyps.deref + lib.binder_len binders.deref + lib.stm_size body.deref | lib.StmData.Skip => 1 | lib.StmData.Seq a b => 1 + lib.stm_size a.deref + lib.stm_size b.deref
-termination_by structural s
-noncomputable def lib.goal_size (g : lib.GoalData) : Nat :=
-  match g with | lib.GoalData.Leaf _e => 1 | lib.GoalData.Imp _h b => 1 + lib.goal_size b.deref | lib.GoalData.All _x _t b => 1 + lib.goal_size b.deref | lib.GoalData.Let _x _v b => 1 + lib.goal_size b.deref
-termination_by structural g
-noncomputable def lib.goal_count (gs : lib.GoalList) : Nat :=
-  match gs with | lib.GoalList.Nil => 0 | lib.GoalList.Cons _g t => 1 + lib.goal_count t.deref
-termination_by structural gs
-noncomputable def lib.fnctx_arity (c : lib.FnCtxData) : Nat :=
-  lib.binder_len c.params
+inductive lib.LeafList where
+  | Nil
+  | Cons (val0 : Int) (val1 : Tactus.Box lib.LeafList)
+  deriving Inhabited
+@[simp] noncomputable def lib.LeafList.height (s : lib.LeafList) : Nat :=
+  match s with | lib.LeafList.Nil => 1 | lib.LeafList.Cons _ val1 => 1 + lib.LeafList.height val1.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
+inductive lib.BinderList where
+  | Nil
+  | Cons (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.BinderList)
+  deriving Inhabited
+@[simp] noncomputable def lib.BinderList.height (s : lib.BinderList) : Nat :=
+  match s with | lib.BinderList.Nil => 1 | lib.BinderList.Cons _ _ val2 => 1 + lib.BinderList.height val2.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
+inductive lib.ParamBoundList where
+  | Nil
+  | NoBound (val0 : Tactus.Box lib.ParamBoundList)
+  | Bound (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.ParamBoundList)
+  deriving Inhabited
+@[simp] noncomputable def lib.ParamBoundList.height (s : lib.ParamBoundList) : Nat :=
+  match s with | lib.ParamBoundList.Nil => 1 | lib.ParamBoundList.NoBound val0 => 1 + lib.ParamBoundList.height val0.deref | lib.ParamBoundList.Bound _ _ val2 => 1 + lib.ParamBoundList.height val2.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
+inductive lib.RetBind where
+  | RetNone
+  | RetLet (val0 : Int) (val1 : Int)
+  deriving Inhabited
+@[simp] noncomputable def lib.RetBind.height (_ : lib.RetBind) : Nat :=
+  1
+inductive lib.FrameList where
+  | FNil
+  | FBind (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
+  | FHyp (val0 : Int) (val1 : Tactus.Box lib.FrameList)
+  | FLet (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
+  deriving Inhabited
+@[simp] noncomputable def lib.FrameList.height (s : lib.FrameList) : Nat :=
+  match s with | lib.FrameList.FNil => 1 | lib.FrameList.FBind _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FHyp _ val1 => 1 + lib.FrameList.height val1.deref | lib.FrameList.FLet _ _ val2 => 1 + lib.FrameList.height val2.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
+inductive lib.StmData where
+  | Assert (val0 : Int) (val1 : Int)
+  | Assume (val0 : Int)
+  | Assign (val0 : Int) (val1 : Int)
+  | Call (reqs : Tactus.Box lib.LeafList) (post : Tactus.Box lib.FrameList)
+  | DeadEnd (val0 : Tactus.Box lib.StmData)
+  | Ret (val0 : Tactus.Box lib.LeafList) (val1 : lib.RetBind)
+  | If (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.StmData) (val3 : Tactus.Box lib.StmData)
+  | Loop (inv_hyps : Tactus.Box lib.BinderList) (binders : Tactus.Box lib.BinderList) (binder_bounds : Tactus.Box lib.ParamBoundList) (cond_name : Int) (cond_ann : Int) (neg_cond_ann : Int) (d_old_name : Int) (d_old_val : Int) (decrease_oblig : Int) (body : Tactus.Box lib.StmData)
+  | Skip
+  | Seq (val0 : Tactus.Box lib.StmData) (val1 : Tactus.Box lib.StmData)
+  deriving Inhabited
+@[simp] noncomputable def lib.StmData.height (s : lib.StmData) : Nat :=
+  match s with | lib.StmData.Assert _ _ => 1 | lib.StmData.Assume _ => 1 | lib.StmData.Assign _ _ => 1 | lib.StmData.Call _ _ => 1 | lib.StmData.DeadEnd val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Ret _ _ => 1 | lib.StmData.If _ _ val2 val3 => 1 + lib.StmData.height val2.deref + lib.StmData.height val3.deref | lib.StmData.Loop _ _ _ _ _ _ _ _ _ body => 1 + lib.StmData.height body.deref | lib.StmData.Skip => 1 | lib.StmData.Seq val0 val1 => 1 + lib.StmData.height val0.deref + lib.StmData.height val1.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
+inductive lib.GoalData where
+  | Leaf (val0 : Int)
+  | Imp (val0 : Int) (val1 : Tactus.Box lib.GoalData)
+  | All (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.GoalData)
+  | Let (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.GoalData)
+  deriving Inhabited
+@[simp] noncomputable def lib.GoalData.height (s : lib.GoalData) : Nat :=
+  match s with | lib.GoalData.Leaf _ => 1 | lib.GoalData.Imp _ val1 => 1 + lib.GoalData.height val1.deref | lib.GoalData.All _ _ val2 => 1 + lib.GoalData.height val2.deref | lib.GoalData.Let _ _ val2 => 1 + lib.GoalData.height val2.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
+inductive lib.GoalList where
+  | Nil
+  | Cons (val0 : Tactus.Box lib.GoalData) (val1 : Tactus.Box lib.GoalList)
+  deriving Inhabited
+@[simp] noncomputable def lib.GoalList.height (s : lib.GoalList) : Nat :=
+  match s with | lib.GoalList.Nil => 1 | lib.GoalList.Cons _ val1 => 1 + lib.GoalList.height val1.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
 noncomputable def lib.frame_append (f : lib.FrameList) (g : lib.FrameList) : lib.FrameList :=
   match f with | lib.FrameList.FNil => g | lib.FrameList.FBind id typ t => lib.FrameList.FBind id typ (Tactus.Box.mk (lib.frame_append t.deref g)) | lib.FrameList.FHyp h t => lib.FrameList.FHyp h (Tactus.Box.mk (lib.frame_append t.deref g)) | lib.FrameList.FLet id v t => lib.FrameList.FLet id v (Tactus.Box.mk (lib.frame_append t.deref g))
 termination_by structural f
@@ -87,12 +137,12 @@ noncomputable def lib.wp_stm (f : lib.FrameList) (s : lib.StmData) : lib.GoalLis
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        let maintain_reclose := lib.close_each_binderprop endf inv_hyps.deref;
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        let decrease_goal := lib.GoalList.Cons (Tactus.Box.mk (lib.close endf decrease_oblig)) (Tactus.Box.mk lib.GoalList.Nil);
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        let init := lib.close_each_binderprop f inv_hyps.deref;
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       lib.goals_append init (lib.goals_append body_goals (lib.goals_append maintain_reclose decrease_goal)) | lib.StmData.Skip => lib.GoalList.Nil | lib.StmData.Seq a b => lib.goals_append (lib.wp_stm f a.deref) (lib.wp_stm (lib.frame_after f a.deref) b.deref)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       lib.goals_append init (lib.goals_append body_goals (lib.goals_append maintain_reclose decrease_goal)) | lib.StmData.Skip => lib.GoalList.Nil | lib.StmData.Seq a b => match a.deref with | lib.StmData.If c nc t e => let tf := lib.frame_append f (lib.FrameList.FHyp c (Tactus.Box.mk lib.FrameList.FNil));
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             let ef := lib.frame_append f (lib.FrameList.FHyp nc (Tactus.Box.mk lib.FrameList.FNil));
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             let then_goals := if lib.diverges t.deref = 1 then lib.wp_stm tf t.deref else lib.goals_append (lib.wp_stm tf t.deref) (lib.wp_stm (lib.frame_after tf t.deref) b.deref);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             let else_goals := if lib.diverges e.deref = 1 then lib.wp_stm ef e.deref else lib.goals_append (lib.wp_stm ef e.deref) (lib.wp_stm (lib.frame_after ef e.deref) b.deref);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             lib.goals_append then_goals else_goals | _ => lib.goals_append (lib.wp_stm f a.deref) (lib.wp_stm (lib.frame_after f a.deref) b.deref)
 termination_by structural s
-noncomputable def lib.seed_frame (c : lib.FnCtxData) : lib.FrameList :=
-  lib.frame_append (lib.binders_to_frame c.typ_params) (lib.frame_append (lib.seed_params c.params c.param_bounds) (lib.binders_to_frame c.reqs))
-noncomputable def lib.ref_wp (c : lib.FnCtxData) (s : lib.StmData) : lib.GoalList :=
-  lib.wp_stm (lib.seed_frame c) s
 noncomputable def lib.gd_tag (g : lib.GoalData) : Nat :=
   match g with | lib.GoalData.Leaf _ => 0 | lib.GoalData.Imp _ _ => 1 | lib.GoalData.All _ _ _ => 2 | lib.GoalData.Let _ _ _ => 3
 noncomputable def lib.gd_leaf_id (g : lib.GoalData) : Int :=
@@ -121,9 +171,6 @@ noncomputable def lib.gl_tail (g : lib.GoalList) : lib.GoalList :=
 noncomputable def lib.goals_eq (a : lib.GoalList) (b : lib.GoalList) : Nat :=
   match a with | lib.GoalList.Nil => if lib.gl_tag b = 0 then 1 else 0 | lib.GoalList.Cons h1 t1 => if lib.gl_tag b = 1 then if lib.goal_eq h1.deref (lib.gl_head b) = 1 then lib.goals_eq t1.deref (lib.gl_tail b) else 0 else 0
 termination_by structural a
-noncomputable def lib.cd19_ctx : lib.FnCtxData :=
-  lib.FnCtxData.mk lib.BinderList.Nil (lib.BinderList.Cons 0 1 (Tactus.Box.mk lib.BinderList.Nil)) (lib.ParamBoundList.Bound 3 2 (Tactus.Box.mk lib.ParamBoundList.Nil)) lib.BinderList.Nil (lib.LeafList.Cons 4 (Tactus.Box.mk lib.LeafList.Nil))
-noncomputable def lib.cd19_sst : lib.StmData :=
-  lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assign 7 0)) (Tactus.Box.mk (lib.StmData.If 8 9 (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assign 10 11)) (Tactus.Box.mk (lib.StmData.Ret (Tactus.Box.mk (lib.LeafList.Cons 5 (Tactus.Box.mk lib.LeafList.Nil))) (lib.RetBind.RetLet 6 10))))) (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assert 13 12)) (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assume 12)) (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assign 14 15)) (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assert 17 16)) (Tactus.Box.mk (lib.StmData.Call (Tactus.Box.mk lib.LeafList.Nil) (Tactus.Box.mk (lib.FrameList.FHyp 20 (Tactus.Box.mk (lib.FrameList.FLet 18 19 (Tactus.Box.mk lib.FrameList.FNil))))))))))))))) (Tactus.Box.mk (lib.StmData.Assign 10 18)))) (Tactus.Box.mk (lib.StmData.Ret (Tactus.Box.mk (lib.LeafList.Cons 5 (Tactus.Box.mk lib.LeafList.Nil))) (lib.RetBind.RetLet 6 10)))))))
-noncomputable def lib.cd19_goals : lib.GoalList :=
-  lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 3 2 (Tactus.Box.mk (lib.GoalData.Let 7 0 (Tactus.Box.mk (lib.GoalData.Imp 8 (Tactus.Box.mk (lib.GoalData.Let 10 11 (Tactus.Box.mk (lib.GoalData.Let 6 10 (Tactus.Box.mk (lib.GoalData.Leaf 5)))))))))))))) (Tactus.Box.mk (lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 3 2 (Tactus.Box.mk (lib.GoalData.Let 7 0 (Tactus.Box.mk (lib.GoalData.Imp 9 (Tactus.Box.mk (lib.GoalData.Leaf 13)))))))))) (Tactus.Box.mk (lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 3 2 (Tactus.Box.mk (lib.GoalData.Let 7 0 (Tactus.Box.mk (lib.GoalData.Imp 9 (Tactus.Box.mk (lib.GoalData.Imp 12 (Tactus.Box.mk (lib.GoalData.Imp 12 (Tactus.Box.mk (lib.GoalData.Let 14 15 (Tactus.Box.mk (lib.GoalData.Leaf 17)))))))))))))))) (Tactus.Box.mk (lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 3 2 (Tactus.Box.mk (lib.GoalData.Let 7 0 (Tactus.Box.mk (lib.GoalData.Imp 9 (Tactus.Box.mk (lib.GoalData.Imp 12 (Tactus.Box.mk (lib.GoalData.Imp 12 (Tactus.Box.mk (lib.GoalData.Let 14 15 (Tactus.Box.mk (lib.GoalData.Imp 16 (Tactus.Box.mk (lib.GoalData.Imp 20 (Tactus.Box.mk (lib.GoalData.Let 18 19 (Tactus.Box.mk (lib.GoalData.Let 10 18 (Tactus.Box.mk (lib.GoalData.Let 6 10 (Tactus.Box.mk (lib.GoalData.Leaf 5)))))))))))))))))))))))))) (Tactus.Box.mk lib.GoalList.Nil)))))))
+theorem lib.ref_wp_if_fallthrough_divergence :
+    lib.goals_eq (lib.wp_stm (lib.FrameList.FHyp 34 (Tactus.Box.mk lib.FrameList.FNil)) (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.If 36 37 (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Ret (Tactus.Box.mk (lib.LeafList.Cons 7 (Tactus.Box.mk lib.LeafList.Nil))) (lib.RetBind.RetLet 8 9))) (Tactus.Box.mk lib.StmData.Skip))) (Tactus.Box.mk lib.StmData.Skip))) (Tactus.Box.mk (lib.StmData.Assert 40 39)))) (lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.Imp 34 (Tactus.Box.mk (lib.GoalData.Imp 36 (Tactus.Box.mk (lib.GoalData.Let 8 9 (Tactus.Box.mk (lib.GoalData.Leaf 7)))))))) (Tactus.Box.mk (lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.Imp 34 (Tactus.Box.mk (lib.GoalData.Imp 37 (Tactus.Box.mk (lib.GoalData.Leaf 40)))))) (Tactus.Box.mk lib.GoalList.Nil)))) = 1 ∧ lib.goals_eq (lib.wp_stm (lib.FrameList.FHyp 34 (Tactus.Box.mk lib.FrameList.FNil)) (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.If 36 37 (Tactus.Box.mk lib.StmData.Skip) (Tactus.Box.mk lib.StmData.Skip))) (Tactus.Box.mk (lib.StmData.Assert 40 39)))) (lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.Imp 34 (Tactus.Box.mk (lib.GoalData.Imp 36 (Tactus.Box.mk (lib.GoalData.Leaf 40)))))) (Tactus.Box.mk (lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.Imp 34 (Tactus.Box.mk (lib.GoalData.Imp 37 (Tactus.Box.mk (lib.GoalData.Leaf 40)))))) (Tactus.Box.mk lib.GoalList.Nil)))) = 1 := by
+  decide 
