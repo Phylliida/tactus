@@ -194,17 +194,23 @@ note: tactus: package gate skipped: shared-defs module unavailable
       (defs build failed) — per-fn checks used islands
 ```
 → `run_bridge_step` never fires (still no in-gate bridge note). Result:
-`24 verified, 0 errors` (via islands). The two NEW blockers (both pre-existing,
-both distinct from the DeepView bug, both confirmed by standalone-elaborating the
-`.lean.failed` dumps):
-- **`bootstrap-41`** — `coset_group`: `Invalid field 'Some_val0'` (generated
-  Option multi-variant accessor not in scope).
-- **`bootstrap-42`** — `britton_via_tower`: `Invalid pattern: Not enough
-  arguments to DerivationStep.FreeExpand` (ctor-pattern arity).
+`24 verified, 0 errors` (via islands). The two NEW blockers (both pre-existing, both distinct from the DeepView bug),
+now traced to a causal chain (see bootstrap-41's ROOT CAUSE section):
+- **`bootstrap-42`** (PRIMARY) — `britton_via_tower`: `Invalid pattern: Not
+  enough arguments to DerivationStep.FreeExpand` (ctor-pattern arity). Fails
+  independent of accessors, sinks the non-exec defs family's attempt-1
+  (accessors-ON) render in the `crate_defs.rs` ladder.
+- **`bootstrap-41`** (likely a FALLBACK ARTIFACT of 42) — `coset_group`:
+  `Invalid field 'Some_val0'`. Only fails in attempt 2 (accessors OFF), the
+  fallback reached because bootstrap-42 sank attempt 1. coset_group's ONLY errors
+  are the 3 `Some_val0` refs, so once accessors are present (attempt 1 wins after
+  42 is fixed) it should build for free.
 
-**To close THIS card:** fix bootstrap-41 AND bootstrap-42 (any other
-still-hidden module-defs failures may appear behind them — the defs build is
-all-or-nothing), then re-run the run #2 recipe. Expected in-gate note once the
+**To close THIS card:** fix **bootstrap-42** first, re-run the run #2 recipe, and
+check whether bootstrap-41 auto-resolves (attempt-1 accessors-ON render wins).
+Watch for further attempt-1 failures the on-disk attempt-2 `.failed` dumps hide.
+The defs build is all-or-nothing, so ALL module parts must build before the gate
+reaches the bridge. Expected in-gate note once the
 full defs module builds:
 `"1 obligations bridge-checked against tactus-core (1 passed, 0 failed)"`
 (the single tgt obligation cert `runtime__impl__4__clone`, matching probe11).
