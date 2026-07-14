@@ -247,6 +247,96 @@ runtime__impl failures):**
   positions where a `&T` var is used AS a reference (not deref'd). Needs care +
   a rebuild + a heavy in-gate re-run to confirm the decide flips to pass.
 
+## Progress (cont.) — FIX BUILT + VALIDATED AT THE DECIDE LEVEL (opus-w4a-tgtval, 2026-07-14)
+
+**The `&`-deref divergence is closed by a one-site transcriber fix, and I
+proved it directly (no heavy run needed to confirm the term-level close). The
+card's A/B fork is REFINED — the fork's B1 sketch was UNSOUND; the correct fix
+site is the BinOp arm, not the Var arm.**
+
+### Finding that corrects the fork: the deref is context-dependent (BinOp-level), not a blanket Var rule
+
+Read production's structural-binop lowering (`to_lean_sst_expr.rs:1157-1161`):
+```rust
+let dl = count_ref_decorations(&*lhs.typ);
+let dr = count_ref_decorations(&*rhs.typ);
+let m  = dl.min(dr);
+let l  = apply_deref_chain(l, dl - m);   // peel deeper operand DOWN to shallower
+let r  = apply_deref_chain(r, dr - m);
+```
+Production **min-balances**: it peels each operand to the *common* wrapper depth,
+NOT to zero. So `&T == &T` (both depth 1 → m=1 → 0 peels) is left ALONE, while
+`result:T == self:&Self` (0 vs 1 → m=0 → RHS peeled once) gets one `.deref`.
+
+⟹ The card's **B1 sketch — `RawExp.Var id (TyRef _) => FieldProj (Atom id)
+deref_field`, a blanket Var-level deref — is UNSOUND**: it would deref a `&T`
+operand even when compared against another `&T`, where production does not. Any
+correct fix (B1 or B2) must live at the **BinOp arm** and reproduce the
+min-balance from BOTH operand types. (The clone's `self.deref` is a bare
+`Var(self)` peeled by the BinOp balance — NOT a `UnaryOpr::Field` node — so the
+Binary arm is the exact and *sufficient* fix site; the Field-arm fail-loud at
+`sst_serialize.rs:766-769` is a different scenario.)
+
+### What I built: B2-at-BinOp (`sst_serialize.rs`, compiles clean)
+
+`raw_exp`'s `ExpX::Binary` arm now mirrors production's min-balance, wrapping the
+deeper operand in `dl-m` / `dr-m` `RawExp.Deref` nodes (new `wrap_derefs`
+helper). `render_exp` (TCB) is UNCHANGED — it already maps `RawExp.Deref e =>
+FieldProj (render_exp e) deref_field`. Guarded **no-op** whenever either operand
+has zero ref-decorations (every non-`&` cert → `m == both → 0` peels), so it
+CANNOT flip any currently-closing cert (production min-balances all structural
+binops the same way, so B2's derefs == production's derefs by construction).
+Binary bg-rebuilt clean (`/tmp/w4a-b2-build.log`, vstd 1530/0).
+
+### Direct decide-level validation (no corpus rebuild)
+
+Took the real failing in-gate bridge (`/tmp/w4a-bs47b/lib/bridge/
+Bridge_runtime__impl__4__clone.lean`), made two copies, ran each against the
+built tactus-core olean (`LEAN_PATH=tactus-core/out/lib:$PRELUDE`, Nix lean):
+- **control** (unmodified bare `Var 0 (TyRef 5)`): `goals_eq (ref_wp ctx sst)
+  goals = 1` → `decide` proves it **false**, exit 1. Reproduces `0 passed, 1
+  failed`.
+- **fixed** (RHS operand wrapped in `RawExp.Deref`, byte-identical to B2's
+  `wrap_derefs`+`box_raw` output): **all three decides pass**, exit 0.
+  `ref_wp(sst) = FieldProj (Atom 0) 0 = goals`. Divergence **CLOSED**, nothing
+  hidden behind it. (Also confirms B1 would work — same `FieldProj` result.)
+
+### Soundness read (my analysis + Danielle's local model, INDEPENDENTLY): B1 > B2
+
+I flagged that B2 shifts the deref-count into the untrusted transcriber: since
+BOTH production and `raw_exp` compute the peel via the same
+`count_ref_decorations`, the bridge no longer *independently* checks the
+deref-count — a bug in that helper reproduces on both sides and silent-passes
+(**common-mode failure**). The local model agreed unprompted: "Inserting
+`RawExp.Deref` based on type-decoration logic is *semantic lowering*, not
+faithful transcription… better a slightly larger correct TCB than a smaller TCB
+that validates a shared mistake. **Verdict: B1.**"
+
+- **B1-at-BinOp** (the SOUND form, NOT the card's unsound Var sketch): extend the
+  TCB `render_exp` BinOp arm to min-balance-deref from the operand types it
+  ALREADY reads for nat-coercion (`type_of l`, `type_of r`). Feasible + bounded
+  (TypData ref-depth is 0/1). Keeps the deref in the trusted reference where W5
+  validates it and the bridge independently checks production against it. Cost:
+  touches tactus-core `lib.rs` + its `expr_mirror_kernel_computes` lemmas
+  (kernel re-verify); mutually EXCLUSIVE with B2 (both → double-deref).
+- **B2-at-BinOp** (what I landed): TCB-clean, validated, Danielle's stage-rec.
+  Narrow common-mode gap (only bugs *within* `count_ref_decorations`, and W5
+  isn't done yet), so defensible for this stage.
+
+**My recommendation: B2 now (validated, unblocks the in-gate `1 passed`), B1 as
+a tracked soundness follow-up for the TCB (new card `bootstrap-48`).** This
+reverses the "B2 is the end-state" read but matches Danielle's "B2 for this
+stage" instinct while teeing up the principled B1. Her call on whether to
+fast-track B1 — see the decision request in the response.
+
+### Remaining step for THIS card's done-criterion
+
+The decide-level close is proven; the full in-gate coupling (`1 obligations
+bridge-checked … (1 passed, 0 failed)`) is a heavy run I launched with the B2
+binary (`/tmp/w4a-b2-ingate.log`, recipe = card run #2 + `PATH` carrying Nix
+lean). If it prints `(1 passed, 0 failed)` this card is DONE. Result recorded
+below once it lands.
+
 ## Status for the next instance
 
 **UPDATE 2026-07-14 (opus-bootstrap47-mono): DEFS-FAMILY BLOCKER CHAIN CLEARED —
