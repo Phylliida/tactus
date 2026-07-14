@@ -31,8 +31,10 @@
 //!   locals — production computes the set, the literal must carry it).
 //! * `Call` carries the result binder `dest` + its `dest_typ` leaf
 //!   (ensures-hypotheses bind the call result).
-//! * `Ret` carries a `LeafList` — one instantiated-ensures leaf per
-//!   postcondition, rendered at the return site.
+//! * `Ret` carries a `LeafList` — one annotated-ensures obligation leaf
+//!   per postcondition, rendered at the return site — plus a `RetBind`
+//!   (finding-4): the `let <ret> := <e>` binding production prepends to
+//!   the postcondition frame (`RetNone` for a unit return).
 //! * `FnCtxData` (context seed for refWp): typ-param telescope, value
 //!   params, per-param optional bound-hyp leaves, requires, ensures.
 //! * `FrameList` / `CtxFrame`: the ONE ordered goal-spine frame the
@@ -86,6 +88,24 @@ pub enum ParamBoundList {
     Bound(u64, u64, Box<ParamBoundList>),
 }
 
+// ── Return-value binding (finding-4) ────────────────────────────────
+// Production binds the returned value as a frame `let` before the
+// postcondition obligation: a `return e` / tail-expression whose fn
+// declares `-> (r: T)` renders `let r := <e>; <ensures>` (the walker's
+// `Wp::Done(let_bind_synthetic(sanitize(ret), e_ast, ensures_goal))`,
+// peeled into a `CtxFrame::Let` by `emit_done_or_split`). refWp's Ret
+// arm prepends this `let` to the frame before closing each ensures.
+// `RetNone` = a unit return (`return;`) or no declared return var — no
+// binding. `RetLet(name, val)` = the `sanitize(ret)` name leaf and the
+// rendered return-expression value leaf. Distinct constructors (not a
+// sentinel leaf) since 0 is a valid interned leaf, and to keep the
+// trusted SST literal's valid states exhaustive at a glance.
+
+pub enum RetBind {
+    RetNone,
+    RetLet(u64, u64),
+}
+
 // ── Statements: the Wp-input mirror (stage-A subset) ────────────────
 
 pub enum StmData {
@@ -108,9 +128,13 @@ pub enum StmData {
     Call { reqs: Box<LeafList>, enss: Box<LeafList>, dest: u64, dest_typ: u64 },
     /// StmX::DeadEnd — verify inside, discard facts after.
     DeadEnd(Box<StmData>),
-    /// StmX::Return — one instantiated-ensures obligation leaf per
-    /// postcondition (rendered at the return site).
-    Ret(Box<LeafList>),
+    /// StmX::Return — annotated ensures obligation leaves (one span_mark'd
+    /// obligation leaf per postcondition, rendered at the return site like
+    /// production's `WpCtx` postcondition — finding-1's Ret-annotation),
+    /// plus the return-value binding `let <ret> := <e>` production prepends
+    /// before the postcondition (`RetBind`, finding-4). refWp closes each
+    /// ensures under the frame extended by the return binding.
+    Ret(Box<LeafList>, RetBind),
     /// StmX::If — (cond leaf, ¬cond leaf, then, else); absent else = Skip.
     /// The `neg_cond` leaf is the RENDERED else-branch hypothesis text.
     If(u64, u64, Box<StmData>, Box<StmData>),
@@ -237,7 +261,7 @@ pub open spec fn stm_size(s: StmData) -> nat
         StmData::Assign(_d, _r) => 1,
         StmData::Call { reqs, enss, dest: _, dest_typ: _ } => 1 + leaf_len(*reqs) + leaf_len(*enss),
         StmData::DeadEnd(b) => 1 + stm_size(*b),
-        StmData::Ret(es) => 1 + leaf_len(*es),
+        StmData::Ret(es, _rb) => 1 + leaf_len(*es),
         StmData::If(_c, _nc, t, e) => 1 + stm_size(*t) + stm_size(*e),
         StmData::Loop { invs, cond: _, neg_cond: _, binders, body } =>
             1 + leaf_len(*invs) + binder_len(*binders) + stm_size(*body),
@@ -280,7 +304,7 @@ proof fn skeleton_kernel_computes()
         stm_size(StmData::Seq(
             Box::new(StmData::Assert(0, 0)),
             Box::new(StmData::If(1, 2, Box::new(StmData::Skip),
-                Box::new(StmData::Ret(Box::new(LeafList::Nil))))),
+                Box::new(StmData::Ret(Box::new(LeafList::Nil), RetBind::RetNone)))),
         )) == 5,
         goal_size(GoalData::Imp(7, Box::new(GoalData::All(8, 9, Box::new(GoalData::Leaf(10)))))) == 3,
         leaf_len(LeafList::Cons(1, Box::new(LeafList::Cons(2, Box::new(LeafList::Nil))))) == 2
@@ -412,7 +436,7 @@ pub open spec fn frame_after(f: FrameList, s: StmData) -> FrameList
         StmData::Call { reqs: _, enss, dest, dest_typ } =>
             frame_append(f, FrameList::FBind(dest, dest_typ, Box::new(hyps_of_leaves(*enss)))),
         StmData::DeadEnd(_b) => f,          // facts discarded
-        StmData::Ret(_es) => f,             // control does not continue
+        StmData::Ret(_es, _rb) => f,        // control does not continue
         StmData::If(_c, _nc, _t, _e) => f,  // stage A: join frames not merged (§5.1)
         StmData::Loop { invs, cond: _, neg_cond, binders, body: _ } =>
             // use: frame ++ binders ++ (invs as hyps) ++ ¬cond hyp
@@ -421,6 +445,23 @@ pub open spec fn frame_after(f: FrameList, s: StmData) -> FrameList
                     FrameList::FHyp(neg_cond, Box::new(FrameList::FNil))))),
         StmData::Skip => f,
         StmData::Seq(a, b) => frame_after(frame_after(f, *a), *b),
+    }
+}
+
+// The frame each Ret ensures is closed under: the pre-Ret frame `f`
+// extended by the return-value binding (finding-4). Production peels
+// `let <ret> := <e>` off the `Wp::Done` leaf into a `CtxFrame::Let`
+// (emit_done_or_split) shared by every ensures conjunct, so refWp
+// appends one `FLet` before closing each ensures. A `RetNone` (unit
+// return) leaves the frame unchanged. Factored into its own top-level
+// spec fn — NOT a `match` nested inside `wp_stm`'s `Ret` arm — because
+// the tactus Lean backend flattens an inner match past the enclosing
+// arm's siblings (the decide-checker note above; #redundant-alternative).
+pub open spec fn ret_frame(f: FrameList, rb: RetBind) -> FrameList {
+    match rb {
+        RetBind::RetNone => f,
+        RetBind::RetLet(name, val) =>
+            frame_append(f, FrameList::FLet(name, val, Box::new(FrameList::FNil))),
     }
 }
 
@@ -436,7 +477,7 @@ pub open spec fn wp_stm(f: FrameList, s: StmData) -> GoalList
         StmData::Assign(_x, _rhs) => GoalList::Nil,
         StmData::Call { reqs, enss: _, dest: _, dest_typ: _ } => close_each(f, *reqs),
         StmData::DeadEnd(b) => wp_stm(f, *b),
-        StmData::Ret(es) => close_each(f, *es),
+        StmData::Ret(es, rb) => close_each(ret_frame(f, rb), *es),
         StmData::If(c, nc, t, e) =>
             goals_append(
                 wp_stm(frame_append(f, FrameList::FHyp(c, Box::new(FrameList::FNil))), *t),
@@ -683,7 +724,8 @@ proof fn ref_wp_seed_and_assert()
                 reqs: BinderList::Nil,
                 enss: LeafList::Cons(5, Box::new(LeafList::Cons(6, Box::new(LeafList::Nil)))),
             },
-            StmData::Ret(Box::new(LeafList::Cons(5, Box::new(LeafList::Cons(6, Box::new(LeafList::Nil)))))),
+            StmData::Ret(Box::new(LeafList::Cons(5, Box::new(LeafList::Cons(6, Box::new(LeafList::Nil))))),
+                RetBind::RetNone),
         )) == 2
 by { decide }
 
@@ -747,6 +789,40 @@ proof fn ref_wp_add_capped_seed_spine()
         ) == 1
 by { decide }
 
+// Finding-4 + Ret-annotation payoff: the return statement binds `let r := s`
+// before the ANNOTATED postcondition, reproducing add_capped goal 3's tail
+// `… Let 9 14, Let 23 9, Leaf 22`
+// (bootstrap-fixture/out/lib/cert/add_capped.cert.lean). Isolated from the
+// full body: the pre-Ret frame here carries only the last body Assign as
+// FLet(9,14) (leaf 9 = `s`, leaf 14 = `s + 0`); the Ret appends the
+// return binding FLet(23,9) (name 23 = `r`, val 9 = `s`) then closes the
+// annotated obligation leaf 22 (`/- @rust:…85:13 -/ r = x + y`). RetNone
+// (a unit return) leaves the frame unextended — just `… Leaf 22`.
+proof fn ref_wp_ret_return_binding()
+    ensures
+        goals_eq(
+            wp_stm(
+                FrameList::FLet(9, 14, Box::new(FrameList::FNil)),
+                StmData::Ret(Box::new(LeafList::Cons(22, Box::new(LeafList::Nil))),
+                    RetBind::RetLet(23, 9)),
+            ),
+            GoalList::Cons(
+                Box::new(GoalData::Let(9, 14, Box::new(GoalData::Let(23, 9,
+                    Box::new(GoalData::Leaf(22)))))),
+                Box::new(GoalList::Nil)),
+        ) == 1,
+        goals_eq(
+            wp_stm(
+                FrameList::FLet(9, 14, Box::new(FrameList::FNil)),
+                StmData::Ret(Box::new(LeafList::Cons(22, Box::new(LeafList::Nil))),
+                    RetBind::RetNone),
+            ),
+            GoalList::Cons(
+                Box::new(GoalData::Let(9, 14, Box::new(GoalData::Leaf(22)))),
+                Box::new(GoalList::Nil)),
+        ) == 1
+by { decide }
+
 // Mutation sensitivity (DESIGN §2.4.2): goal_eq flips on a single leaf-id
 // change, a binder-id change, or a constructor (structure) change.
 proof fn goal_eq_strictness()
@@ -788,9 +864,11 @@ proof fn amended_shapes_kernel_compute()
             dest: 5,
             dest_typ: 6,
         }) == 2,
-        // Ret: 1 + |es=2| == 3
+        // Ret: 1 + |es=2| == 3 (RetBind adds no statements to the size).
         stm_size(StmData::Ret(Box::new(LeafList::Cons(0,
-            Box::new(LeafList::Cons(1, Box::new(LeafList::Nil))))))) == 3,
+            Box::new(LeafList::Cons(1, Box::new(LeafList::Nil))))), RetBind::RetNone)) == 3,
+        stm_size(StmData::Ret(Box::new(LeafList::Cons(0,
+            Box::new(LeafList::Cons(1, Box::new(LeafList::Nil))))), RetBind::RetLet(23, 9))) == 3,
         binder_len(BinderList::Cons(1, 2, Box::new(BinderList::Nil))) == 1,
         param_bound_len(ParamBoundList::Bound(4, 5,
             Box::new(ParamBoundList::NoBound(Box::new(ParamBoundList::Nil))))) == 2,
