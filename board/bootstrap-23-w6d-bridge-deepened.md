@@ -146,16 +146,119 @@ No action.
 
 ---
 
+## W6d.0 dump results — the map was WRONG in load-bearing ways (2026-07-14)
+
+**Method.** Gated `raw_exp(e)` + `{:#?}` dump added at the top of `oblig_leaf`
+(`sst_serialize.rs`), fixture cold-emitted with
+`TACTUS_DUMP_OBLIG=1 … --tactus-emit-cert`, then **reverted** (clean tree +
+rebuild). 50 obligation leaves dumped — the *actual* raw SST, not inferred from
+rendered certs. This is the ground truth the on-disk-cert reading (Progress
+entry above) could only guess at, and it **corrects the coverage map**: several
+fns the map called "coverable" fail **today**, and two whole gap classes were
+missed. The dump-first discipline paid for itself.
+
+**`raw_exp` verdict over the 50 leaves:** 18 OK · 23 `raw-unaryopr` · 5
+`raw-varat` · 1 `raw-const-nonint` · 1 `typ-typparam` · 1 `raw-call-nonfun` ·
+1 `raw-bind`. Breakdown of the 23 `raw-unaryopr` by outermost `UnaryOpr`:
+**10 HasType · 7 Box · 4 Unbox · 2 Field** (Box/Unbox also nest *inside* the
+Field and deref leaves).
+
+**Corrected gap taxonomy (supersedes G1–G5 above where they conflict):**
+
+- **G0 (NEW — the dominant blocker, map missed it entirely).** `UnaryOpr::Box(_)`
+  / `UnaryOpr::Unbox(_)` SMT-coercion wrappers wrap every boxed value: spec-fn
+  args (`tri(1)` arg = `Box[Nat](Const 1)`), datatype args, field results,
+  tuple elements. Semantic identity. **`raw_exp` must peel them transparently**
+  (recurse into inner, drop the wrapper) exactly as `typ_data` already peels
+  `Boxed`/`Decorate`. Without G0, G2/G3 are unreachable and even `tri_one`
+  (map said "coverable") fails on `raw-unaryopr`. **This is the #1 unlock.**
+
+- **G1 (CONFIRMED).** find_square `ensures true` dumps as literally
+  `ExpX = Const(Bool(true))`. Add `RawExp::LitBool(bool)` + `ExprData::LitBool`.
+  Note the count_down decrease `∧ False` is a *builder-synthesized*
+  `ExprNode::LitBool(false)` (from the decrease-disjunct construction, cf.
+  `and_all([])=LitBool(true)`), NOT a raw-SST const — so G1's `raw_exp` arm is
+  needed only for genuine source bool literals (find_square); the synthesized
+  side is a `lexpr_to_exprdata` `ExprNode::LitBool` arm.
+
+- **G2 (mechanism CONFIRMED, shape CORRECTED, and SIMPLIFIED).** head_exec
+  `r == tree_head(*t)` dumps as `Eq(Var(r):U64, Call(tree_head, [], [arg]))`
+  where `arg = UnaryOpr(Box[&Tree], VarAt(t, Pre))`, arg.typ =
+  `Boxed(Decorate(Ref, Datatype(Tree)))`. So: **(a) the board was RIGHT — there
+  is NO explicit deref node; `*t` in spec is transparent and the arg stays
+  `&Tree`. (b) the board was WRONG about the surface shape — it is NOT a plain
+  `Var(t):&Tree`; it is Box-wrapped around a `VarAt(t,Pre)` read (needs G0 +
+  G7). (c) SIMPLIFICATION — after G0-peel the arg mirror-type is `TyRef(Tree)`,
+  and the render rule is simply: _a spec-fn `Call` arg whose mirror type is
+  `TyRef(T)` gets a `.deref` coercion_ (spec fns never take `&T`, so this is
+  uniform). `render_exp` does NOT need the callee's expected param type — the
+  `TyRef` tag on the arg is sufficient signal. The board's worry about
+  threading the callee param type into `RawExp::Call` is moot.** The existing
+  `RawExp::Deref` variant is **confirmed dead-on-arrival** for the serializer
+  (no explicit-deref SST source exists) — delete it or leave it unused.
+
+- **G3 (CONFIRMED + tuple-index detail).** mk_point `p.x` dumps as
+  `Field(FieldOpr{datatype:Point, variant:"Point", field:"x"})(Unbox(Box(Var
+  p)))`; swap_pair `r.0` as `Unbox(Field(FieldOpr{datatype:Tuple(2),
+  variant:"tuple%2", field:"0"})(…))`. Add `RawExp::Field(u64 field_id,
+  Box<RawExp>)` + peel surrounding Box/Unbox (G0). **Tuple caveat: VIR field
+  `"0"` but production renders `.1` (1-indexed shift — the on-disk cert leaf is
+  `r.1 = b`), so the ref-side field-id must intern the SHIFTED name to match
+  production's atom id.** Struct fields (`"x"`) render `.x` → intern `"x"`
+  directly. Confirm production's `lean_ast` FieldProj field text for both in
+  W6d.1.
+
+- **G6 (NEW — the overflow class, map missed it).** Arithmetic overflow
+  obligations dump as `UnaryOpr::HasType(IntRange)(e)` (add_capped `s = x+y` →
+  `HasType(U64)(x + y)`); production **expands** this to `0 ≤ e ∧ e < 2^bound`.
+  10 of the 23 `raw-unaryopr` leaves are HasType. So add_capped / double_exec /
+  quad_exec / count_down-body / find_square / sum_to-body are **NOT coverable
+  today** (map was wrong). Two options: (i) `raw_exp` emits a `RawExp::HasType`
+  and `render_exp` reproduces the exact `0≤e ∧ e<bound` expansion production
+  uses; or (ii) **preferred** — the reference WP *synthesizes* the bound leaf
+  directly (parallel to `decrease_oblig_leaf`, which already synthesizes
+  `0≤D ∧ D<old`), so HasType never round-trips through `raw_exp`. Pick (ii) to
+  keep the cast layer small. Either way, **G6 gates most of the "easy" fns** —
+  do it in W6d.1, not later.
+
+- **G7 (NEW).** Ensures read params as `VarAt(vid, Pre)` (pre-state), not
+  `ExpX::Var(vid)` — 5 `raw-varat` leaves (add_capped/max_u64/double_exec/
+  quad_exec ensures, head_exec's `t`). `raw_exp` must handle `VarAt(vid, _)`
+  like `Var` (intern the same binder id; production renders it as bare `x`).
+  Low risk. NB: *inside* bodies params still read as plain `Var` (the
+  add_capped 87 overflow has `Var(x)+Var(y)`), so it's specifically the
+  ensures/pre snapshot.
+
+- **G4 (unchanged — DEFER).** The `max_u64` If-fold `Implies+Let+Not` leaf lives
+  on the *goal* path (`goal_data`/`GoalShape`), NOT `oblig_leaf` — the dump only
+  saw max_u64's simple `r≥x`/`r≥y` ensures (G7 varat). Defer to W6e/Tier-2.
+
+- **G5 (CONFIRMED no-gap).** Synthetic vars are atoms. Holds.
+
+- **Also out of scope (fail-loud + census):** `typ-typparam` (id_generic `r==t`,
+  generic type param → `TypData`), `raw-call-nonfun` (count_down `count_down(n-1)`
+  = a `CallFun::Recursive`/exec call, not a spec `Fun`), `raw-bind` (fill_zeros
+  `forall|k| …` quantifier). None are cast-class; keep them census-tracked.
+
+**Net effect on W6d.1 scope:** the shared-crate batch is BIGGER than the map
+implied. Priority order for `raw_exp`/`render_exp`: **G0 (Box/Unbox peel) first
+— it unblocks everything — then G7 (VarAt), G1 (LitBool), G3 (Field + tuple
+shift), G6 (HasType, via reference-WP synthesis per option ii), and G2 (TyRef ⟹
+`.deref` render rule).** With G0+G7+G1 alone, the pure-value fns (tri_one,
+scope_shape, id_generic-minus-typparam) become coverable; G6 unlocks the
+arithmetic fns; G2+G3 unlock the datatype/struct/tuple fns.
+
+---
+
 ## Phased plan (probe-first, each independently checkable)
 
-- **W6d.0 — confirm the SST shapes (NO code).** Dump the raw SST for `head_exec`
-  (G2), `mk_point`/`swap_pair` (G3), `count_down`/`find_square` (G1). Confirm:
-  (a) head_exec's call arg is `Var(t):&Tree` with no explicit deref + what
-  `arg.typ` actually is; (b) the VIR variant for field access; (c) how `True`/
-  `False` appear (`ExpX::Const(Constant::Bool)`?). This resolves the G2/G3
-  "confirm in W6d.0" flags before any shared-crate edit. Recommend a tiny
-  gated `eprintln` of `debug_format` on the obligation `Exp` in `oblig_leaf`,
-  run over the fixture cold-emit, then revert.
+- **W6d.0 — confirm the SST shapes (NO code). ✅ DONE (2026-07-14, opus-b23).**
+  See the "W6d.0 dump results" section above — dumped all 50 obligation leaves,
+  reverted clean. Confirmed G1; confirmed G2's *mechanism* + corrected its
+  *shape* + simplified its render rule; confirmed G3 + found the tuple-index
+  shift; and surfaced **three gaps the map missed — G0 (Box/Unbox peel, the
+  dominant blocker), G6 (HasType overflow class), G7 (VarAt-Pre param reads).**
+  W6d.1 scope is bigger than the map implied.
 - **W6d.1 — the shared-crate batch (one clean churn).** In `tactus-core/lib.rs`:
   add `ExprData::LitBool`/`RawExp::LitBool` (G1); `RawExp::Field` +
   `render_exp` arm (G3); the `needs_ref_deref` coercion in `render_exp`'s Call
@@ -206,6 +309,28 @@ No action.
   deliberate single shared-crate churn — de-risk the shapes in W6d.0 first, per
   the W6a→W6b discipline). **Next = W6d.0** (dump the SST shapes to confirm
   G1/G2/G3 before the lib.rs batch).
+
+- (2026-07-14, opus-b23) **W6d.0 executed — raw-SST dump, gap taxonomy
+  corrected.** Instrumented `oblig_leaf` with a gated `raw_exp(e)` + `{:#?}`
+  dump, cold-emitted the fixture with `--tactus-emit-cert TACTUS_DUMP_OBLIG=1`
+  (50 leaves), then reverted (tree clean, rebuilt green: vstd 1530/0). Ground
+  truth **overturned parts of the on-disk-cert coverage map**: (1) **G0 (NEW)**
+  — pervasive `UnaryOpr::Box/Unbox` SMT wrappers are the #1 blocker (11 of 32
+  failing leaves outermost, nested in most others); `raw_exp` must peel them
+  like `typ_data` peels `Boxed`. (2) **G6 (NEW)** — arith overflow obligations
+  are `UnaryOpr::HasType(range)(e)` that production expands to `0≤e ∧ e<2^bound`
+  (10 leaves); so add_capped/double_exec/quad_exec/count_down/find_square/sum_to
+  are NOT coverable today — prefer synthesizing the bound in the reference WP
+  (parallel to `decrease_oblig_leaf`). (3) **G7 (NEW)** — ensures read params as
+  `VarAt(Pre)` not `Var` (5 leaves). (4) **G2 confirmed+corrected**: no explicit
+  deref node (mechanism right), but arg is `Box[&Tree](VarAt(t,Pre))` not plain
+  `Var(t):&Tree`; render rule simplifies to "spec-fn Call arg of mirror-type
+  `TyRef(T)` ⟹ `.deref`" (no callee param type needed); `RawExp::Deref` is
+  dead-on-arrival. (5) **G3 confirmed** + tuple-index shift (VIR `"0"` →
+  production `.1`). (6) **G1 confirmed** (`Const(Bool(true))`). Full corrected
+  taxonomy + revised W6d.1 priority order (G0→G7→G1→G3→G6→G2) in the section
+  above. **Next = W6d.1** — the shared-crate batch, now scoped against real
+  shapes. No production code left changed this turn (probe reverted).
 
 ## Writeup
 
