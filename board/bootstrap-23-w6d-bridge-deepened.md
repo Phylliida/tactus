@@ -213,13 +213,17 @@ Field and deref leaves).
   `HasType(U64)(x + y)`); production **expands** this to `0 ≤ e ∧ e < 2^bound`.
   10 of the 23 `raw-unaryopr` leaves are HasType. So add_capped / double_exec /
   quad_exec / count_down-body / find_square / sum_to-body are **NOT coverable
-  today** (map was wrong). Two options: (i) `raw_exp` emits a `RawExp::HasType`
-  and `render_exp` reproduces the exact `0≤e ∧ e<bound` expansion production
-  uses; or (ii) **preferred** — the reference WP *synthesizes* the bound leaf
-  directly (parallel to `decrease_oblig_leaf`, which already synthesizes
-  `0≤D ∧ D<old`), so HasType never round-trips through `raw_exp`. Pick (ii) to
-  keep the cast layer small. Either way, **G6 gates most of the "easy" fns** —
-  do it in W6d.1, not later.
+  today** (map was wrong). **DECIDED (Danielle, 2026-07-14): Option (i)** —
+  `raw_exp` emits a first-class `RawExp::HasType(range, e)` and `render_exp`
+  reproduces the exact `0≤e ∧ e<2^bound` expansion production uses. Rejected
+  option (ii) (WP synthesizes the bound directly, parallel to
+  `decrease_oblig_leaf`): synthesizing silently would re-create the same "map
+  blindness" W6d.0 just caught — the deep bridge's whole point is that the
+  reference path *independently re-derives* the structure, so the HasType
+  identity must stay alive until the final render (single source of truth;
+  observable in the raw dump; one-line change in `render_exp` if production ever
+  changes the expansion, e.g. to a bit-vector check). **G6 gates most of the
+  "easy" fns** — do it in W6d.1, not later.
 
 - **G7 (NEW).** Ensures read params as `VarAt(vid, Pre)` (pre-state), not
   `ExpX::Var(vid)` — 5 `raw-varat` leaves (add_capped/max_u64/double_exec/
