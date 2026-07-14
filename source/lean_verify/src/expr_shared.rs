@@ -110,6 +110,23 @@ pub(crate) fn ctor_field_typ(
     })
 }
 
+/// The DECLARED field names of `path::variant`, in declaration order.
+/// `None` when the datatype is unknown (cross-crate opaque / not in the
+/// installed table). Used by `pattern_to_ast` to render a struct-variant
+/// match pattern positionally: Lean requires ALL constructor fields be
+/// present, but a Rust pattern with `{ position, .. }` (or fields in
+/// non-declaration order) leaves the VIR `pats` incomplete / reordered.
+/// The caller fills omitted fields with `_` and reorders to declaration
+/// order using this list.
+pub(crate) fn ctor_field_names(path: &vir::ast::Path, variant: &str) -> Option<Vec<String>> {
+    CTOR_FIELD_TYPS.with(|m| {
+        let m = m.borrow();
+        let (_tps, variants) = m.get(path)?;
+        let fields = variants.get(variant)?;
+        Some(fields.iter().map(|(n, _)| n.clone()).collect())
+    })
+}
+
 pub type RenderFnMap<'a> = HashMap<&'a Fun, &'a FunctionX>;
 
 /// Render-time value substitution map. Each entry maps a variable

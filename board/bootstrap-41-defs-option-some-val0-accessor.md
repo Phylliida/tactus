@@ -108,6 +108,22 @@ bootstrap fork (whether via bootstrap-42 or the fallback fix).
   bootstrap-42 lands; independent fix = don't drop needed accessors in the
   fallback.
 
+- (2026-07-14, opus-bootstrap42-arity) **PREDICTION FALSIFIED — did NOT
+  auto-resolve when bootstrap-42 landed.** bootstrap-42 is now fixed (britton
+  builds), but re-checking run #4 (`/tmp/w4a-tgt-ingate4`, post-fix):
+  `coset_group.lean.failed` STILL has exactly 3× `Some_val0`, unchanged. The
+  ladder is per-SCOPE (whole non-exec defs family), not per-module: with britton
+  no longer sinking attempt-1, a DIFFERENT module now does — **`word_numbering`**
+  (termination-proof failure, accessor-independent, filed as **bootstrap-44**).
+  So the non-exec family STILL falls back to attempt-2 (accessors OFF) and
+  coset_group STILL loses `Some_val0`. The root diagnosis stands (fallback
+  artifact); only the identity of the attempt-1 sink changed (britton →
+  word_numbering). **This card is now gated on bootstrap-44**, not bootstrap-42.
+  Re-check the auto-resolve prediction after bootstrap-44 lands — and if a THIRD
+  attempt-1 sink hides behind word_numbering, this repeats. The principled
+  standalone fix (referenced-only accessor emission in the fallback, per the ROOT
+  CAUSE section) would close this regardless of the attempt-1 sink chain.
+
 ## Writeup
 
 _pending a fix._
