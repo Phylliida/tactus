@@ -1268,10 +1268,36 @@ pub(crate) fn pattern_to_ast(pat: &PatternX) -> LPattern {
                     }
                 },
             };
-            LPattern::Ctor {
-                name,
-                args: pats.iter().map(|p| pattern_to_ast(&p.a.x)).collect(),
-            }
+            // Lean requires EVERY constructor field to appear positionally
+            // in a pattern. A Rust struct-variant pattern can omit fields
+            // (`FreeExpand { position, .. }` binds only `position`) or list
+            // them out of declaration order — VIR's `pats` then carries only
+            // the named binders present, in source order. Emit one arg per
+            // DECLARED field (from the ambient ctor-field table), reordered to
+            // declaration order, filling omitted fields with `_`. Without
+            // this, `..` patterns render too few args and Lean rejects with
+            // "Not enough arguments to <Ctor>" (bootstrap-42: tgt's
+            // `DerivationStep::FreeExpand { position, .. }`). Unknown datatypes
+            // (cross-crate, not in the table) fall back to the prior
+            // iterate-in-order behavior — no worse than today.
+            let args = match dt {
+                Dt::Path(path) => match crate::expr_shared::ctor_field_names(path, variant.as_str()) {
+                    Some(field_names) => {
+                        let bound: std::collections::HashMap<&str, &PatternX> =
+                            pats.iter().map(|p| (p.name.as_str(), &p.a.x)).collect();
+                        field_names.iter().map(|fname| {
+                            match bound.get(fname.as_str()) {
+                                Some(subpat) => pattern_to_ast(subpat),
+                                None => LPattern::Wildcard,
+                            }
+                        }).collect()
+                    }
+                    None => pats.iter().map(|p| pattern_to_ast(&p.a.x)).collect(),
+                },
+                // ctor_pattern_name returned Some ⟹ dt is Dt::Path here.
+                Dt::Tuple(_) => pats.iter().map(|p| pattern_to_ast(&p.a.x)).collect(),
+            };
+            LPattern::Ctor { name, args }
         }
         PatternX::Or(l, r) => LPattern::Or(
             Box::new(pattern_to_ast(&l.x)),
