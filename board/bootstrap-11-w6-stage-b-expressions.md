@@ -71,6 +71,19 @@ mis-rendered leaf fails the bridge (mutation-kill at expression level).
     correct shape closes and a coercion-dropped shape FAILS. Zero risk to
     `tactus-core`.
 
+- (2026-07-14, opus-b20) **W6a probe DONE & GREEN** (`bootstrap-20` → done).
+  `probe-w0/probe12_w6a_castleaf/` proves the D2 mechanic end-to-end and freezes
+  the W6b shape (`ExprData`/`TypData`/`RawExp`/`render_exp`). `lean` rc=0, axioms
+  clean (pure kernel `decide`, no WellFounded/Classical), mutation-kills verified
+  non-vacuous. Covered the verbatim `sum_to` leaf `Int.toNat r = lib.tri
+  (Int.toNat n)` (Case A), the DERIVED arith Friction-2 case `(x as nat)*x` (Case
+  B, the load-bearing diversity win), and the `.deref`/FieldProj class (Case C),
+  each with a correct-closes + mutation-kill; plus a cmp negative control (D).
+  **Next = W6b** (`bootstrap-12`?-no: needs a board file): land the frozen mirror
+  types + `render_exp`/`render_typ` + sizes in `tactus-core/lib.rs` as one clean
+  cache-churning edit; pick the `GoalData::Leaf(u64) → additive LeafE(ExprData)`
+  migration (§6). W6b has no board file yet — create it when picking up.
+
 ## Writeup
 
 _when done: findings, how the code works, assumptions made. Parent design doc:
