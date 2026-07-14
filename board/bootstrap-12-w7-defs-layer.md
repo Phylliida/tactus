@@ -1,9 +1,9 @@
 ---
 title: "W7 — defs-layer certificate (spec-fn bodies + datatype/height emission)"
-status: in_progress
+status: done
 claimed_by: opus-w7
 created: 2026-07-13T19:38:00Z
-updated: 2026-07-15T04:15:00Z
+updated: 2026-07-14T12:10:00Z
 ---
 
 ## Description
@@ -136,6 +136,63 @@ def bodies). **UNBLOCKED** — W6 done (`bootstrap-11` closed).
     AppN) → tgt-slice `def_eq` coverage**. The fixture heart (transcription +
     live bridge + content-kill) is done and green.
 
+- (2026-07-14, opus-w7-tgtslice) **UMBRELLA CLOSED — the last rung (tgt-slice
+  def_eq/dt_eq) is done (`bootstrap-37`).** Emitted 135 real-corpus certs over a
+  `tactus-group-theory` slice; the gate FOUND a genuine reference-transcriber
+  faithfulness bug (`RuntimeSymbol`'s `usize` fields → `TyInt` instead of the
+  emitted `Nat`/`TyNat`) — the organic W3-style payoff. Root-caused to
+  `typ_data` not mirroring `to_lean_type`'s `usize/char → Nat` rule, fixed
+  (`sst_serialize.rs:588`, Rust-only), re-validated: **135/135 close, kills
+  non-vacuous, zero fixture regression** (probe17 8/8, probe9 16/16). Both the
+  fixture heart AND the tgt slice of the "Done when" are now met.
+
 ## Writeup
 
-_when done: findings, how the code works, assumptions made_
+**DONE — W7 (defs-layer certificate) is complete.** The Verus→Lean translator's
+spec-fn definitions, datatype declarations, and (via the datatype cert) their
+derived height measures are now differentially bridge-checked: for each emitted
+def/datatype, an INDEPENDENT reference lowering (VIR→`RawDef`/`RawDt` via
+`raw_vir_*`, rendered by tactus-core `render_def`/`render_dt`) is `decide`-checked
+against the production `LExpr`→`DefData`/`DtData` transcription via `def_eq`/
+`dt_eq`. This closes the remaining half of trust-inventory row 4 (a
+wrong-but-consistent def lowering that no obligation-level bridge could catch).
+
+### The ladder (all rungs done)
+- **W7a** (`bootstrap-26`): standalone probe froze the extended body vocabulary
+  (Match/Ite/Forall/Exists/multi-arg App) + `DefData`/`DtData`.
+- **W7b** (`bootstrap-27`): one batched tactus-core edit landing the vocab +
+  `render_def`/`render_dt` + `def_eq`/`dt_eq`.
+- **W7c** (`bootstrap-28`/`-29`): serializer transcriptions — production
+  `lexpr_to_*data` + reference VIR `raw_vir_*` (on the VIR `ExprX` surface that
+  keeps `Match`/`Quant`/multi-arg `Call`).
+- **W7d** (`bootstrap-32`/`-33`): wired live emission (`emit_def_cert`/
+  `emit_dt_cert` from `generate.rs`); fixture bridges end-to-end (probe17).
+  Caught a real gap live (spec-fn bodies arrive `Block([], Some(tail))`) → fixed.
+- **AppN** (`bootstrap-34`/`-36`): multi-arg `CallN`/`AppN` transcription + live
+  def bridge + obligation-position bridge (probe9).
+- **W7e** (`bootstrap-35`): synthetic mutation-kill — perturb body/opcode/arm-
+  body/ctor-id/field-type ⟹ bridge flips 1→0.
+- **tgt slice** (`bootstrap-37`): the corpus run — 135 real certs, gate found +
+  fixed the `usize`-field `TyInt`/`TyNat` reference bug, 135/135 close.
+
+### How the code works (pointers)
+- Reference transcribers + `emit_def_cert`/`emit_dt_cert`:
+  `source/lean_verify/src/sst_serialize.rs` (`raw_vir_exp`/`raw_vir_def`/
+  `raw_vir_dt`, `typ_data`/`dt_field_typ_data`; production `lexpr_to_exprdata`/
+  `ldt_to_dtdata`/`ldef_to_defdata`). Wired from `generate.rs`
+  (`maybe_emit_def_cert` at the `spec_fn_to_ast` sites + a post-loop datatype
+  pass), flag-gated by `--tactus-emit-cert`.
+- Reference vocabulary + `render_def`/`render_dt`/`def_eq`/`dt_eq`:
+  `tactus-core/lib.rs` (mirrored types + kernel-computable render/eq).
+- Design: `DESIGN-W7-defslayer.md`; probes `probe-w0/probe{15,16,17,18,19,20}_*`.
+
+### Honest scope (what W7 does NOT certify)
+- The transcribers themselves are the TCB (W7 certifies they AGREE, not that
+  either is correct in isolation — that monoculture residual is W5).
+- Leaf-rendering adequacy, interning, frontend, and SST/VIR→Lean SEMANTIC
+  faithfulness (e.g. `usize → Nat` erasing the upper bound) are W5.
+- In-scope constructs only: bodies using Match/Ite/BinOp/Field/Call/quantifiers
+  + multi-variant inductive datatypes. Closures, `let`-blocks, `choose`,
+  `with_triggers`, polymorphic/struct/tuple datatypes, mutual groups, WF-
+  (non-structural) recursion all fail loud (no cert) — a documented, named
+  census of scope gaps, NOT silent divergences (bootstrap-37 REPORT).

@@ -588,7 +588,17 @@ impl<'a> Serializer<'a> {
     fn typ_data(&mut self, typ: &Typ) -> Sr<String> {
         match &**typ {
             TypX::Bool => Ok(format!("{}.TypData.TyBool", NS)),
-            TypX::Int(IntRange::Nat) => Ok(format!("{}.TypData.TyNat", NS)),
+            // Mirror `to_lean_type`'s int-range mapping EXACTLY
+            // (to_lean_type.rs:92-110): `nat`, `usize`, and `char` lower to
+            // Lean `Nat`; unbounded `int`, signed fixed-width, `isize`, AND
+            // unsigned fixed-width (`u8`..`u64`) lower to `Int`. The
+            // datatype-field bridge over the tgt slice (bootstrap-37, real
+            // `RuntimeSymbol { Gen(usize), Inv(usize) }`) caught this: the
+            // emitter renders a `usize` field as `(val0 : Nat)`, so production's
+            // transcriber reads `TyNat`; the reference MUST agree, not `TyInt`.
+            TypX::Int(IntRange::Nat | IntRange::USize | IntRange::Char) => {
+                Ok(format!("{}.TypData.TyNat", NS))
+            }
             TypX::Int(_) => Ok(format!("{}.TypData.TyInt", NS)),
             TypX::Datatype(..) => {
                 let id = self.typ_leaf(typ);
