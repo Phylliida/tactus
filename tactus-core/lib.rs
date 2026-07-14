@@ -288,6 +288,434 @@ by {
 
 // N2.1: the amended shapes kernel-compute (If/Loop/Call/Ret + the new
 // BinderList/ParamBoundList/FrameList/FnCtxData vocabulary).
+// ── W2a: the reference WP (refWp) and its first-order workers ───────
+// DESIGN-W2-refwp.md §2. These emitted defs ARE the checker the
+// certificate runs. Authored snake_case (file convention); the DESIGN
+// names map as: close, frame_after=`frameAfter`, wp_stm=`wpStm`,
+// ref_wp=`refWp`, goal_eq/goals_eq. Every recursive worker is single-
+// datatype structural recursion (no spec_fn continuations — closures are
+// trigger/kernel-hostile, memory: closure-identity arc) with
+// `#[verifier::structural_decreases]` so the defs kernel-compute.
+//
+// Shape decisions (grounded in the on-disk fixture certs — see the W2a
+// board writeup for the full empirical read):
+//  * The frame IS the goal spine (DESIGN §2.1): `close` folds it entry-
+//    by-entry around one obligation leaf. First (outermost) frame entry =
+//    outermost GoalData constructor.
+//  * `StmData::Assert(e)` emits `close(frame, e)` AND `frame_after` adds
+//    hyp `e`: the fixture certs show TWO `Imp e` after an Assert/Assume
+//    pair — the Assert's forward hyp plus the following Assume's hyp.
+//  * Signature bound-hyps and requires render here as anonymous `FHyp`
+//    (→ `Imp`). Production renders them as NAMED forall-binders (`All 19
+//    2` = ∀ (h_x_bound : …)); reproducing that needs a per-hyp NAME leaf
+//    in ParamBoundList / a BinderList-shaped `reqs` — a proposed
+//    N2.1-round-2 amendment (board writeup finding-2). refWp emits FHyp
+//    until then.
+
+// Concatenate two frames (structural on the first).
+#[verifier::structural_decreases]
+pub open spec fn frame_append(f: FrameList, g: FrameList) -> FrameList
+    decreases f
+{
+    match f {
+        FrameList::FNil => g,
+        FrameList::FBind(id, typ, t) => FrameList::FBind(id, typ, Box::new(frame_append(*t, g))),
+        FrameList::FHyp(h, t) => FrameList::FHyp(h, Box::new(frame_append(*t, g))),
+        FrameList::FLet(id, v, t) => FrameList::FLet(id, v, Box::new(frame_append(*t, g))),
+    }
+}
+
+// A LeafList rendered as a chain of anonymous FHyp entries.
+#[verifier::structural_decreases]
+pub open spec fn hyps_of_leaves(l: LeafList) -> FrameList
+    decreases l
+{
+    match l {
+        LeafList::Nil => FrameList::FNil,
+        LeafList::Cons(h, t) => FrameList::FHyp(h, Box::new(hyps_of_leaves(*t))),
+    }
+}
+
+// A BinderList rendered as a chain of FBind entries.
+#[verifier::structural_decreases]
+pub open spec fn binders_to_frame(b: BinderList) -> FrameList
+    decreases b
+{
+    match b {
+        BinderList::Nil => FrameList::FNil,
+        BinderList::Cons(id, typ, t) => FrameList::FBind(id, typ, Box::new(binders_to_frame(*t))),
+    }
+}
+
+// Fold a frame around an obligation leaf → one GoalData spine.
+#[verifier::structural_decreases]
+pub open spec fn close(f: FrameList, obligation: u64) -> GoalData
+    decreases f
+{
+    match f {
+        FrameList::FNil => GoalData::Leaf(obligation),
+        FrameList::FBind(id, typ, t) => GoalData::All(id, typ, Box::new(close(*t, obligation))),
+        FrameList::FHyp(h, t) => GoalData::Imp(h, Box::new(close(*t, obligation))),
+        FrameList::FLet(id, v, t) => GoalData::Let(id, v, Box::new(close(*t, obligation))),
+    }
+}
+
+// close(frame, ·) mapped over a LeafList → one goal per leaf (Call reqs,
+// Ret enss, Loop init/maintain invariants).
+#[verifier::structural_decreases]
+pub open spec fn close_each(f: FrameList, l: LeafList) -> GoalList
+    decreases l
+{
+    match l {
+        LeafList::Nil => GoalList::Nil,
+        LeafList::Cons(h, t) => GoalList::Cons(Box::new(close(f, h)), Box::new(close_each(f, *t))),
+    }
+}
+
+// Append two goal lists (the `++` of DESIGN §2.1).
+#[verifier::structural_decreases]
+pub open spec fn goals_append(a: GoalList, b: GoalList) -> GoalList
+    decreases a
+{
+    match a {
+        GoalList::Nil => b,
+        GoalList::Cons(h, t) => GoalList::Cons(h, Box::new(goals_append(*t, b))),
+    }
+}
+
+// frameAfter: the frame extension visible to whatever FOLLOWS `s`.
+// (DESIGN §2.2. `If` join frames are NOT merged at stage A: the
+// continuation sees the pre-if frame — §5.1.)
+#[verifier::structural_decreases]
+pub open spec fn frame_after(f: FrameList, s: StmData) -> FrameList
+    decreases s
+{
+    match s {
+        StmData::Assert(e) => frame_append(f, FrameList::FHyp(e, Box::new(FrameList::FNil))),
+        StmData::Assume(e) => frame_append(f, FrameList::FHyp(e, Box::new(FrameList::FNil))),
+        StmData::Assign(x, rhs) => frame_append(f, FrameList::FLet(x, rhs, Box::new(FrameList::FNil))),
+        StmData::Call { reqs: _, enss, dest, dest_typ } =>
+            frame_append(f, FrameList::FBind(dest, dest_typ, Box::new(hyps_of_leaves(*enss)))),
+        StmData::DeadEnd(_b) => f,          // facts discarded
+        StmData::Ret(_es) => f,             // control does not continue
+        StmData::If(_c, _nc, _t, _e) => f,  // stage A: join frames not merged (§5.1)
+        StmData::Loop { invs, cond: _, neg_cond, binders, body: _ } =>
+            // use: frame ++ binders ++ (invs as hyps) ++ ¬cond hyp
+            frame_append(f, frame_append(binders_to_frame(*binders),
+                frame_append(hyps_of_leaves(*invs),
+                    FrameList::FHyp(neg_cond, Box::new(FrameList::FNil))))),
+        StmData::Skip => f,
+        StmData::Seq(a, b) => frame_after(frame_after(f, *a), *b),
+    }
+}
+
+// wpStm: the goals of `s` given the frame that precedes it.
+#[verifier::structural_decreases]
+pub open spec fn wp_stm(f: FrameList, s: StmData) -> GoalList
+    decreases s
+{
+    match s {
+        StmData::Assert(e) =>
+            GoalList::Cons(Box::new(close(f, e)), Box::new(GoalList::Nil)),
+        StmData::Assume(_e) => GoalList::Nil,
+        StmData::Assign(_x, _rhs) => GoalList::Nil,
+        StmData::Call { reqs, enss: _, dest: _, dest_typ: _ } => close_each(f, *reqs),
+        StmData::DeadEnd(b) => wp_stm(f, *b),
+        StmData::Ret(es) => close_each(f, *es),
+        StmData::If(c, nc, t, e) =>
+            goals_append(
+                wp_stm(frame_append(f, FrameList::FHyp(c, Box::new(FrameList::FNil))), *t),
+                wp_stm(frame_append(f, FrameList::FHyp(nc, Box::new(FrameList::FNil))), *e)),
+        StmData::Loop { invs, cond, neg_cond: _, binders, body } => {
+            // init: each inv closed under the pre-loop frame; maintain:
+            // body goals ++ each inv re-closed at body end, under
+            // frame ++ binders ++ invs-as-hyps ++ cond-hyp. (`use` is a
+            // frameAfter extension, not a goal.) NOTE: the SST Loop node
+            // currently carries `binders = Nil` (the modified-var havoc set
+            // is not populated at the snapshot — board writeup finding-3),
+            // so this maintain telescope is under-populated vs production;
+            // the decreases/termination obligation is also not synthesized
+            // here (no `decreases` leaf on the Loop node).
+            let mframe = frame_append(f, frame_append(binders_to_frame(*binders),
+                frame_append(hyps_of_leaves(*invs),
+                    FrameList::FHyp(cond, Box::new(FrameList::FNil)))));
+            let body_goals = wp_stm(mframe, *body);
+            let endf = frame_after(mframe, *body);
+            let maintain_post = close_each(endf, *invs);
+            goals_append(close_each(f, *invs), goals_append(body_goals, maintain_post))
+        },
+        StmData::Skip => GoalList::Nil,
+        StmData::Seq(a, b) =>
+            goals_append(wp_stm(f, *a), wp_stm(frame_after(f, *a), *b)),
+    }
+}
+
+// Seed the value-param telescope: each param binder immediately followed
+// by its own bound hyp (empirical spine: ∀x, (h_x_bound), ∀y, (h_y_bound),
+// …). Params → FBind; bound hyps → FHyp (naming caveat above).
+#[verifier::structural_decreases]
+pub open spec fn seed_params(params: BinderList, bounds: ParamBoundList) -> FrameList
+    decreases params
+{
+    match params {
+        BinderList::Nil => FrameList::FNil,
+        BinderList::Cons(id, typ, t) => match bounds {
+            ParamBoundList::Bound(prop, bt) =>
+                FrameList::FBind(id, typ, Box::new(FrameList::FHyp(prop, Box::new(seed_params(*t, *bt))))),
+            ParamBoundList::NoBound(bt) =>
+                FrameList::FBind(id, typ, Box::new(seed_params(*t, *bt))),
+            ParamBoundList::Nil =>
+                FrameList::FBind(id, typ, Box::new(seed_params(*t, ParamBoundList::Nil))),
+        },
+    }
+}
+
+// Seed the initial frame from the signature (DESIGN §2.2): typ-params,
+// then value params interleaved with bound hyps, then reqs.
+pub open spec fn seed_frame(c: FnCtxData) -> FrameList {
+    frame_append(binders_to_frame(c.typ_params),
+        frame_append(seed_params(c.params, c.param_bounds),
+            hyps_of_leaves(c.reqs)))
+}
+
+// refWp: the certificate LHS. Seed the frame, then walk the body. The
+// serializer emits an explicit `Ret` leaf list (all fixtures end in Ret),
+// so refWp does not synthesize a fall-through Ret (§5.2).
+pub open spec fn ref_wp(c: FnCtxData, s: StmData) -> GoalList {
+    wp_stm(seed_frame(c), s)
+}
+
+// Structural equality for the `decide` bridge (DESIGN §2.3). STRICT:
+// every leaf id and binder id must match. A strict checker keeps the TCB
+// honest — where a fixture bridge fails to close it indicts an unfaithful
+// serializer/shape (board writeup), NOT a lax comparison.
+//
+// IMPORTANT (finding-5): these return `nat` (1 = equal, 0 = not), NOT
+// `bool`. The tactus Lean backend lowers a `bool`-returning spec fn to a
+// NONCOMPUTABLE `Prop` def, for which `Decidable (goal_eq a b)` resolves
+// to `Classical.propDecidable` and `decide` gets STUCK on `Classical.choice`.
+// A `nat`-returning def gives the `= 1` conjuncts a concrete `Nat.decEq`
+// instance, and the kernel then reduces the body (nested numeral-`ite`s).
+// The W2b bridge line is therefore `goals_eq (refWp …) production = 1 := by
+// decide`, not `= true` as DESIGN §2.3 sketched.
+// The structural checkers must (a) recurse structurally on their first
+// argument and (b) emit unambiguously. A nested `match a { … match b …}`
+// keeps (a) but breaks (b): the tactus Lean backend flattens the inner
+// match so later outer arms bind past its wildcard ("redundant
+// alternative"). A tuple `match (a, b)` fixes (b) but breaks (a): the
+// child `t1.deref` is no longer seen as a structural subterm of `a`. So
+// match `a` ALONE (single match → structural + unambiguous) and read `b`
+// through NON-recursive projections (a nat constructor tag + field
+// accessors), keeping every arm body a chain of `if`s, never a match.
+
+pub open spec fn gd_tag(g: GoalData) -> nat {
+    match g {
+        GoalData::Leaf(_) => 0,
+        GoalData::Imp(_, _) => 1,
+        GoalData::All(_, _, _) => 2,
+        GoalData::Let(_, _, _) => 3,
+    }
+}
+pub open spec fn gd_leaf_id(g: GoalData) -> u64 { match g { GoalData::Leaf(x) => x, _ => 0 } }
+pub open spec fn gd_imp_hyp(g: GoalData) -> u64 { match g { GoalData::Imp(h, _) => h, _ => 0 } }
+pub open spec fn gd_all_name(g: GoalData) -> u64 { match g { GoalData::All(x, _, _) => x, _ => 0 } }
+pub open spec fn gd_all_typ(g: GoalData) -> u64 { match g { GoalData::All(_, t, _) => t, _ => 0 } }
+pub open spec fn gd_let_name(g: GoalData) -> u64 { match g { GoalData::Let(x, _, _) => x, _ => 0 } }
+pub open spec fn gd_let_val(g: GoalData) -> u64 { match g { GoalData::Let(_, v, _) => v, _ => 0 } }
+// The single child of a non-leaf node (self for a leaf — never recursed on).
+pub open spec fn gd_child(g: GoalData) -> GoalData {
+    match g {
+        GoalData::Imp(_, t) => *t,
+        GoalData::All(_, _, t) => *t,
+        GoalData::Let(_, _, t) => *t,
+        GoalData::Leaf(x) => GoalData::Leaf(x),
+    }
+}
+
+#[verifier::structural_decreases]
+pub open spec fn goal_eq(a: GoalData, b: GoalData) -> nat
+    decreases a
+{
+    match a {
+        GoalData::Leaf(x) =>
+            if gd_tag(b) == 0 { if x == gd_leaf_id(b) { 1 } else { 0 } } else { 0 },
+        GoalData::Imp(h1, t1) =>
+            if gd_tag(b) == 1 {
+                if h1 == gd_imp_hyp(b) { goal_eq(*t1, gd_child(b)) } else { 0 }
+            } else { 0 },
+        GoalData::All(x1, ty1, t1) =>
+            if gd_tag(b) == 2 {
+                if x1 == gd_all_name(b) {
+                    if ty1 == gd_all_typ(b) { goal_eq(*t1, gd_child(b)) } else { 0 }
+                } else { 0 }
+            } else { 0 },
+        GoalData::Let(x1, v1, t1) =>
+            if gd_tag(b) == 3 {
+                if x1 == gd_let_name(b) {
+                    if v1 == gd_let_val(b) { goal_eq(*t1, gd_child(b)) } else { 0 }
+                } else { 0 }
+            } else { 0 },
+    }
+}
+
+pub open spec fn gl_tag(g: GoalList) -> nat {
+    match g {
+        GoalList::Nil => 0,
+        GoalList::Cons(_, _) => 1,
+    }
+}
+pub open spec fn gl_head(g: GoalList) -> GoalData {
+    match g { GoalList::Cons(h, _) => *h, GoalList::Nil => GoalData::Leaf(0) }
+}
+pub open spec fn gl_tail(g: GoalList) -> GoalList {
+    match g { GoalList::Cons(_, t) => *t, GoalList::Nil => GoalList::Nil }
+}
+
+#[verifier::structural_decreases]
+pub open spec fn goals_eq(a: GoalList, b: GoalList) -> nat
+    decreases a
+{
+    match a {
+        GoalList::Nil => if gl_tag(b) == 0 { 1 } else { 0 },
+        GoalList::Cons(h1, t1) =>
+            if gl_tag(b) == 1 {
+                if goal_eq(*h1, gl_head(b)) == 1 { goals_eq(*t1, gl_tail(b)) } else { 0 }
+            } else { 0 },
+    }
+}
+
+// ── W2a: graded reduction probes (isolate what kernel-computes) ─────
+
+proof fn probe_goal_eq_leaf()
+    ensures
+        goal_eq(GoalData::Leaf(5), GoalData::Leaf(5)) == 1,
+        goal_eq(GoalData::Leaf(5), GoalData::Leaf(6)) == 0
+by { decide }
+
+proof fn probe_goal_eq_nested()
+    ensures
+        goal_eq(GoalData::All(0, 1, Box::new(GoalData::Leaf(9))),
+                GoalData::All(0, 1, Box::new(GoalData::Leaf(9)))) == 1,
+        goal_eq(GoalData::All(0, 1, Box::new(GoalData::Leaf(9))),
+                GoalData::All(7, 1, Box::new(GoalData::Leaf(9)))) == 0
+by { decide }
+
+proof fn probe_goals_eq_lit()
+    ensures
+        goals_eq(GoalList::Nil, GoalList::Nil) == 1,
+        goals_eq(GoalList::Cons(Box::new(GoalData::Leaf(9)), Box::new(GoalList::Nil)),
+                 GoalList::Cons(Box::new(GoalData::Leaf(9)), Box::new(GoalList::Nil))) == 1
+by { decide }
+
+proof fn probe_close()
+    ensures
+        goal_size(close(FrameList::FNil, 9)) == 1,
+        goal_size(close(FrameList::FBind(0, 1, Box::new(FrameList::FNil)), 9)) == 2
+by { decide }
+
+proof fn probe_wp_stm()
+    ensures
+        goal_count(wp_stm(FrameList::FNil, StmData::Assert(9))) == 1,
+        goal_count(wp_stm(FrameList::FNil, StmData::Skip)) == 0
+by { decide }
+
+proof fn probe_ref_wp()
+    ensures
+        goal_count(ref_wp(FnCtxData {
+            typ_params: BinderList::Nil,
+            params: BinderList::Nil,
+            param_bounds: ParamBoundList::Nil,
+            reqs: LeafList::Nil,
+            enss: LeafList::Nil,
+        }, StmData::Assert(9))) == 1
+by { decide }
+
+// ── W2a: end-to-end refWp unit examples (against hand-computed goals) ──
+
+// Minimal context: one int param `x` (name leaf 0, type leaf 1) with a
+// bound hyp (prop leaf 2), no reqs. seed_frame = FBind(0,1, FHyp(2, FNil)).
+proof fn ref_wp_seed_and_assert()
+    ensures
+        // refWp folds the seed around a single Assert obligation:
+        //   ∀ (x:Int), h2 → <9>
+        goals_eq(
+            ref_wp(
+                FnCtxData {
+                    typ_params: BinderList::Nil,
+                    params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)),
+                    param_bounds: ParamBoundList::Bound(2, Box::new(ParamBoundList::Nil)),
+                    reqs: LeafList::Nil,
+                    enss: LeafList::Nil,
+                },
+                StmData::Assert(9),
+            ),
+            GoalList::Cons(
+                Box::new(GoalData::All(0, 1, Box::new(GoalData::Imp(2, Box::new(GoalData::Leaf(9)))))),
+                Box::new(GoalList::Nil)),
+        ) == 1,
+        // A Ret of two ensures leaves → two goals sharing the seed spine
+        // (the max_u64 multiplicity, minus the branch-in-leaf divergence).
+        goal_count(ref_wp(
+            FnCtxData {
+                typ_params: BinderList::Nil,
+                params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)),
+                param_bounds: ParamBoundList::Bound(2, Box::new(ParamBoundList::Nil)),
+                reqs: LeafList::Nil,
+                enss: LeafList::Cons(5, Box::new(LeafList::Cons(6, Box::new(LeafList::Nil)))),
+            },
+            StmData::Ret(Box::new(LeafList::Cons(5, Box::new(LeafList::Cons(6, Box::new(LeafList::Nil)))))),
+        )) == 2
+by { decide }
+
+// Seq threads frameAfter: the second Assert sees the first as a forward
+// hyp (Assert-then-Assume behaviour, one hyp here from the Assert alone).
+proof fn ref_wp_seq_threads_frame()
+    ensures
+        // ∀x,h2. <9>   then   ∀x,h2. h9 → <10>
+        goals_eq(
+            ref_wp(
+                FnCtxData {
+                    typ_params: BinderList::Nil,
+                    params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)),
+                    param_bounds: ParamBoundList::Bound(2, Box::new(ParamBoundList::Nil)),
+                    reqs: LeafList::Nil,
+                    enss: LeafList::Nil,
+                },
+                StmData::Seq(Box::new(StmData::Assert(9)), Box::new(StmData::Assert(10))),
+            ),
+            GoalList::Cons(
+                Box::new(GoalData::All(0, 1, Box::new(GoalData::Imp(2, Box::new(GoalData::Leaf(9)))))),
+                Box::new(GoalList::Cons(
+                    Box::new(GoalData::All(0, 1, Box::new(GoalData::Imp(2,
+                        Box::new(GoalData::Imp(9, Box::new(GoalData::Leaf(10)))))))),
+                    Box::new(GoalList::Nil)))),
+        ) == 1
+by { decide }
+
+// Mutation sensitivity (DESIGN §2.4.2): goal_eq flips on a single leaf-id
+// change, a binder-id change, or a constructor (structure) change.
+proof fn goal_eq_strictness()
+    ensures
+        goal_eq(GoalData::Leaf(5), GoalData::Leaf(6)) == 0,
+        goal_eq(GoalData::Leaf(5), GoalData::Leaf(5)) == 1,
+        // differing binder id
+        goal_eq(
+            GoalData::All(0, 1, Box::new(GoalData::Leaf(9))),
+            GoalData::All(7, 1, Box::new(GoalData::Leaf(9)))) == 0,
+        // differing hyp leaf inside an Imp
+        goal_eq(
+            GoalData::Imp(2, Box::new(GoalData::Leaf(9))),
+            GoalData::Imp(3, Box::new(GoalData::Leaf(9)))) == 0,
+        // All vs Imp (structure)
+        goal_eq(
+            GoalData::All(0, 1, Box::new(GoalData::Leaf(9))),
+            GoalData::Imp(1, Box::new(GoalData::Leaf(9)))) == 0,
+        // goals_eq flips when a goal is dropped (length mismatch)
+        goals_eq(
+            GoalList::Cons(Box::new(GoalData::Leaf(9)), Box::new(GoalList::Nil)),
+            GoalList::Nil) == 0
+by { decide }
+
 proof fn amended_shapes_kernel_compute()
     ensures
         // Loop: 1 + |invs=1| + |binders=1| + size(Skip=1) == 4

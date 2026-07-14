@@ -1,9 +1,9 @@
 ---
 title: "W2a — reference WP worker (wpStm/frameAfter/goal_eq) in tactus-core"
-status: in_progress
+status: done
 claimed_by: opus-n3c
 created: 2026-07-13T19:38:00Z
-updated: 2026-07-13T23:55:00Z
+updated: 2026-07-14T00:40:00Z
 ---
 
 ## Description
@@ -105,6 +105,118 @@ cert data this consumes); the bridge itself is W2b.
   there next, with the crux above resolved first (recommend a `bridge-closes`
   fixture subset that excludes if-in-fall-through, per §2.4.1).
 
+## Progress
+
+- (2026-07-14, opus-n3c) **AUTHORED + VERIFIED.** `tactus-core/lib.rs` now
+  carries the full reference-WP family; package gate `30 verified, 0 errors`
+  (lean-only-clean). Canonical check:
+  `TACTUS_LEAN_OUT=$PWD/out ../source/target-verus/release/verus
+  --crate-type=lib --lean-backend --lean-all-proofs lib.rs`.
+
 ## Writeup
 
-_when done: findings, how the code works, assumptions made_
+### What landed (tactus-core/lib.rs)
+
+The DESIGN §2.2 equations, as single-datatype structural spec fns (snake_case;
+DESIGN names in parens):
+
+- `close(frame, oblig)` — folds a `FrameList` around one obligation leaf.
+  First (outermost) frame entry = outermost `GoalData` constructor. FBind→All,
+  FHyp→Imp, FLet→Let, FNil→Leaf.
+- `frame_append`, `hyps_of_leaves`, `binders_to_frame`, `close_each`,
+  `goals_append` — the plumbing (`++`, list→frame conversions).
+- `frame_after` (`frameAfter`) — the frame extension seen by what FOLLOWS a
+  stm. Assert/Assume→+FHyp, Assign→+FLet, Call→+FBind(dest)+enss-hyps,
+  Loop→+binders+invs-hyps+¬cond, DeadEnd/Ret/If/Skip→unchanged, Seq→compose.
+- `wp_stm` (`wpStm`) — goals of a stm given the frame before it. Assert emits
+  `close`; Ret/Call emit `close_each`; If splits under cond/¬cond; Loop emits
+  init ++ body ++ maintain-re-close; Seq threads `frame_after`.
+- `seed_params` / `seed_frame` / `ref_wp` (`refWp`) — seed the frame from the
+  signature (typ-params, then value params interleaved with bound-hyps, then
+  reqs), then `wp_stm` the body.
+- `goal_eq` / `goals_eq` — STRICT structural equality for the `decide` bridge,
+  plus projection accessors (`gd_tag`, `gd_leaf_id`, …, `gd_child`, `gl_tag`,
+  `gl_head`, `gl_tail`).
+- In-crate `decide` examples: `probe_*` (graded reduction coverage),
+  `ref_wp_seed_and_assert`, `ref_wp_seq_threads_frame`, `goal_eq_strictness`
+  (mutation sensitivity — DESIGN §2.4.2).
+
+### §5 open questions — empirical answers (from bootstrap-fixture/out/lib/cert/)
+
+- **§5.1 post-If continuation:** UNRESOLVED for a *mid-Seq* If, because none of
+  the fixtures actually contain one. In `max_u64` the frontend ABSORBS the `if`
+  into the returned-value rendering (leaf 7 = `x<y → (let r := let m := y; …)`)
+  before the SST snapshot, so the If never appears as an SST node. refWp's
+  stage-A choice (`frame_after(If)=frame`; continuation sees the pre-if frame)
+  is thus authored but untested against production. Needs a fixture fn with a
+  genuine post-if continuation (recorded for W3).
+- **§5.2 fall-through postcondition:** the serializer emits an explicit
+  `StmData::Ret(enss)` node — ALL three fixtures end in `Ret`. So refWp does
+  NOT synthesize a fall-through Ret (it walks the explicit one). BUT `sum_to`
+  production prepends `Let 39 7` (`let r := acc`) before the postcondition
+  leaf — production binds the return value as a frame let (finding-4 / open-Q2
+  `return_var`). refWp does not add this yet.
+- **§5.3 loop-body post:** WALKER-SYNTHESISED, confirmed. Init/maintain/decrease
+  invariant obligations are NOT distinct SST Assert nodes; they are synthesised
+  from `Loop.invs` (sum_to goals 0-3 init / 4-5 body-asserts / 6-9 maintain /
+  10 decrease / 11 postcondition). refWp synthesises init+maintain identically.
+- **§5.4 overflow-guard asserts:** SERIALIZED POST-INJECTION, confirmed. They
+  are real SST `Assert` nodes at the snapshot (add_capped Assert 8/13; sum_to
+  Assert 13/15). refWp just folds them — no injection mirror needed.
+
+### Additional findings (the crux for W2b — bridges do NOT close yet)
+
+Under the CURRENT serializer output, refWp will NOT `goals_eq`-close any fixture
+bridge. Not a refWp bug — an unfaithful-literal problem. The strict checker
+(kept deliberately strict) makes each gap visible; the fix is a faithful
+serializer, NOT a lax comparison:
+
+1. **Obligation-annotation gap (dominant).** Production renders every
+   *obligation* leaf with a `/- @rust:file:line -/` source annotation — a
+   DISTINCT interned leaf — while the SST statement carries the BARE prop leaf.
+   add_capped `Assert 8` → production `Leaf 15`; sum_to inv `10` → `Leaf 17`.
+   refWp emits the bare id. Fix: the serializer must carry the annotated
+   obligation leaf on Assert/Loop-inv/Ret (an Assert then needs BOTH a bare
+   forward-hyp leaf and an annotated obligation leaf).
+2. **Hyp-name gap.** Bound-hyps and requires render as NAMED ∀-binders
+   (`All 19 2` = `∀ (h_x_bound : 0≤x∧x<2^64)`), not arrows. FnCtxData carries
+   only the prop leaf (`ParamBoundList::Bound(2)`, `reqs: LeafList`), not the
+   name leaf (19/18/17/16). refWp emits anonymous `FHyp`→`Imp`. Fix (N2.1-round-
+   2): `ParamBoundList` carries `(name_leaf, prop_leaf)`; `reqs` becomes a
+   `BinderList`. Then seed_params switches those FHyp→FBind.
+3. **Loop-binder gap.** SST `Loop.binders = Nil` (the modified-var havoc set is
+   not populated at the raw snapshot — N3a `modified_vars = None`). Production's
+   maintain/use telescopes quantify over i, acc + their bound hyps + invariants-
+   as-hyps + cond/¬cond + a `_tactus_d_old` decreases-let. refWp can't
+   reconstruct this from Nil. Fix: serializer populates `Loop.binders` (body
+   Assign dests + bound hyps) and adds a decreases leaf + d_old let.
+4. **Ret return-binding.** (see §5.2) production binds the return value as a
+   frame let before the fall-through postcondition; refWp does not.
+
+### Backend gotchas discovered (cost real iterations — pin for the next session)
+
+5. **`bool` spec fns → noncomputable `Prop`.** A `bool`-returning spec fn lowers
+   to a NONCOMPUTABLE Lean `Prop` def; `Decidable (goal_eq a b)` then resolves
+   to `Classical.propDecidable` and `decide` gets STUCK on `Classical.choice`.
+   Equality checkers therefore return `nat` (1/0). The W2b bridge line is
+   `goals_eq (refWp …) production = 1 := by decide`, NOT `= true` (DESIGN §2.3
+   sketch superseded). `if Int-eq` itself DOES reduce (probe confirmed).
+6. **Nested `match a { … match b … }` emits ambiguously.** The tactus Lean
+   backend flattens to one line; later OUTER arms bind past the inner match's
+   wildcard → "redundant alternative". A tuple `match (a,b)` fixes emission but
+   BREAKS structural-recursion inference (`t1.deref` no longer a subterm of
+   `a`). Resolution: match the first arg ALONE (structural + unambiguous) and
+   read the second through non-recursive PROJECTION accessors (nat tag + field
+   getters), keeping every arm body a chain of `if`s.
+
+### Assumptions / scope
+
+- refWp is authored to the shape the CURRENT mirror types allow; signature
+  hyps as anonymous `FHyp` pending finding-2. `If` `frame_after` = unchanged
+  (stage-A join-not-merged) pending a real fixture (§5.1).
+- STRICT `goal_eq` is a deliberate design choice: keep the TCB honest, let W3
+  surface divergences. Making it lax to close bridges would be this project's
+  `assume(false)`.
+- Bridges closing + mutation-kill (DESIGN §2.4.1/.2) are W2b (bootstrap-07),
+  gated on the serializer-faithfulness amendments (findings 1-4) — see the new
+  prereq task.
