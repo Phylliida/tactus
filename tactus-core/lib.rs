@@ -35,13 +35,16 @@
 //! * `If` carries a rendered `¬cond` leaf (the else-branch hypothesis;
 //!   refWp cannot synthesize leaf ids).
 //! * `Loop` carries the modified-local havoc set (`binders` +
-//!   `binder_bounds`), the invariants as NAMED `_h_ctx` ∀-hyps
-//!   (`inv_hyps`, annotated obligation leaves), the loop condition
+//!   `binder_bounds`), the invariant HYP leaves as NAMED `_h_ctx` ∀-hyps
+//!   (`inv_hyps`, opaque), the parallel DEEP invariant OBLIGATIONS
+//!   (`inv_obligs`, a `RawExpList` — W6d.1b-iii split the old dual-role
+//!   prop slot: opaque frame-hyp vs deep goal), the loop condition
 //!   (`cond_name`/`cond_ann`/`neg_cond_ann`), the `_tactus_d_old`
-//!   decreases snapshot (`d_old_name`/`d_old_val`) and its obligation
-//!   (`decrease_oblig`). refWp havocs the pre-loop lets, re-quantifies
-//!   the modified locals, and re-closes each invariant + the decrease at
-//!   body end — mirroring production's `walk_loop` (finding-3).
+//!   decreases snapshot (`d_old_name`/`d_old_val`) and its DEEP obligation
+//!   (`decrease_oblig`, a `RawExp`). refWp havocs the pre-loop lets,
+//!   re-quantifies the modified locals, and re-closes each invariant
+//!   (`close_each_e` over `inv_obligs`) + the decrease (`close_e`) at body
+//!   end — mirroring production's `walk_loop` (finding-3).
 //! * `Call` carries the requires obligations (`reqs`) and the WHOLE
 //!   post-call frame (`post: FrameList`) production's
 //!   `push_post_call_frames` computes — "lowering the mirror"
@@ -192,11 +195,18 @@ pub enum StmData {
     /// the loop condition as NAMED ∀-hyps, snapshots the decreases measure in
     /// a `_tactus_d_old` let, and (at body end) closes each invariant + the
     /// decrease obligation. Fields:
-    /// * `inv_hyps` — one `(_h_ctx name leaf, ANNOTATED invariant obligation
-    ///   leaf)` per standard invariant. The prop slot is the annotated leaf
-    ///   used BOTH as the init/maintain obligation AND (via the ∀-telescope)
-    ///   as the maintain/use hypothesis (production reuses the one span_mark'd
-    ///   leaf for both roles — unlike Assert's bare/annotated split).
+    /// * `inv_hyps` — one `(_h_ctx name leaf, invariant HYP leaf)` per standard
+    ///   invariant, consumed by the maintain/use ∀-telescope as the re-asserted
+    ///   HYPOTHESIS (an opaque `u64`, byte-matched — hypotheses are not
+    ///   deepened). W6d.1b-iii split the old dual-role prop slot: the frame
+    ///   keeps the opaque hyp here; the deep obligation moves to `inv_obligs`.
+    /// * `inv_obligs` — the DEEP invariant OBLIGATION `RawExp` per invariant
+    ///   (W6d.1b-iii), index-aligned with `inv_hyps`, closed at init AND
+    ///   maintain-reclose via `close_each_e` → `LeafE(render_exp(ob))`.
+    ///   Production reuses the one span_mark'd leaf for both roles, so in the
+    ///   fixture `inv_hyps`'s prop id == the `Atom` id inside the aligned
+    ///   `inv_obligs` entry (`atom_ob(prop)`); deepening splits them by TYPE
+    ///   (opaque frame-hyp `u64` vs structural goal `RawExp`), not by content.
     /// * `binders` — the modified-local havoc set `(id, typ leaf)`.
     /// * `binder_bounds` — parallel `(NoBound | Bound(_h_ctx name, range
     ///   prop))` per modified local (production re-asserts each mod-var's type
@@ -206,10 +216,12 @@ pub enum StmData {
     ///   the ANNOTATED `¬cond` leaf (use).
     /// * `d_old_name` / `d_old_val` — the `_tactus_d_old_<id>_0` snapshot
     ///   binder and the rendered decreases-measure value (maintain only).
-    /// * `decrease_oblig` — the ANNOTATED `0 ≤ D ∧ D < d_old` obligation,
-    ///   closed at body end alongside the maintain invariants.
+    /// * `decrease_oblig` — the ANNOTATED `0 ≤ D ∧ D < d_old` obligation, a
+    ///   DEEP `RawExp` (W6d.1b-iii, like `Assert`'s obligation slot), closed at
+    ///   body end via `close_e` alongside the maintain invariants.
     Loop {
         inv_hyps: Box<BinderList>,
+        inv_obligs: Box<RawExpList>,
         binders: Box<BinderList>,
         binder_bounds: Box<ParamBoundList>,
         cond_name: u64,
@@ -217,7 +229,7 @@ pub enum StmData {
         neg_cond_ann: u64,
         d_old_name: u64,
         d_old_val: u64,
-        decrease_oblig: u64,
+        decrease_oblig: RawExp,
         body: Box<StmData>,
     },
     /// Empty StmX::Block.
@@ -460,13 +472,14 @@ pub open spec fn stm_size(s: StmData) -> nat
         StmData::DeadEnd(b) => 1 + stm_size(*b),
         StmData::Ret(es, _rb) => 1 + raw_exp_list_len(*es),
         StmData::If(_c, _nc, t, e) => 1 + stm_size(*t) + stm_size(*e),
-        StmData::Loop { inv_hyps, binders, binder_bounds: _, cond_name: _, cond_ann: _, neg_cond_ann: _, d_old_name: _, d_old_val: _, decrease_oblig: _, body } =>
+        StmData::Loop { inv_hyps, inv_obligs, binders, binder_bounds: _, cond_name: _, cond_ann: _, neg_cond_ann: _, d_old_name: _, d_old_val: _, decrease_oblig: _, body } =>
             // Mirrors the serializer's `stm_size_of` token count, which sums
-            // stmt heads + LeafList/BinderList `Cons` — `inv_hyps` and
-            // `binders` are BinderLists (counted); `binder_bounds` is a
-            // ParamBoundList (NOT counted, same as FnCtxData's); the scalar
-            // leaves add 0.
-            1 + binder_len(*inv_hyps) + binder_len(*binders) + stm_size(*body),
+            // stmt heads + LeafList/BinderList/RawExpList `Cons` — `inv_hyps`
+            // and `binders` are BinderLists (counted); `inv_obligs` is the
+            // parallel DEEP-obligation RawExpList (counted, W6d.1b-iii);
+            // `binder_bounds` is a ParamBoundList (NOT counted, same as
+            // FnCtxData's); the scalar leaves add 0.
+            1 + binder_len(*inv_hyps) + raw_exp_list_len(*inv_obligs) + binder_len(*binders) + stm_size(*body),
         StmData::Skip => 1,
         StmData::Seq(a, b) => 1 + stm_size(*a) + stm_size(*b),
     }
@@ -1048,11 +1061,13 @@ pub open spec fn close_e(f: FrameList, ob: RawExp) -> GoalData
 pub open spec fn atom_ob(id: u64) -> RawExp { RawExp::Var(id, TypData::TyBool) }
 
 // W6d.1b-ii: close_e(frame, ·) mapped over a RawExpList → one DEEP goal per
-// obligation (Call reqs, Ret enss). Each terminal is `LeafE(render_exp(ob))`
+// obligation (Call reqs, Ret enss, and — W6d.1b-iii — Loop init/maintain
+// invariants over `inv_obligs`). Each terminal is `LeafE(render_exp(ob))`
 // instead of `Leaf(u64)`, so the production side's `LeafE(ExprData)` matches
 // the reference constructor-for-constructor. (This is the only per-list
-// obligation folder now — the old stage-A `close_each` over `LeafList` was
-// removed when Call/Ret deepened; Loop uses `close_each_binderprop`.)
+// obligation folder now — the old stage-A `close_each` over `LeafList` and
+// `close_each_binderprop` over the `inv_hyps` prop slots were both removed
+// when their obligations deepened.)
 #[verifier::structural_decreases]
 pub open spec fn close_each_e(f: FrameList, l: RawExpList) -> GoalList
     decreases l
@@ -1118,20 +1133,11 @@ pub open spec fn havoc_lets(f: FrameList, mods: BinderList) -> FrameList
     }
 }
 
-// close(f, ·) over each binder's PROP leaf (the 2nd slot) → one goal per
-// binder. Loop init and maintain re-close the ANNOTATED invariant
-// obligations, which live in the prop slots of `inv_hyps` (the same leaves
-// the ∀-telescope re-asserts as hypotheses).
-#[verifier::structural_decreases]
-pub open spec fn close_each_binderprop(f: FrameList, b: BinderList) -> GoalList
-    decreases b
-{
-    match b {
-        BinderList::Nil => GoalList::Nil,
-        BinderList::Cons(_name, prop, t) =>
-            GoalList::Cons(Box::new(close(f, prop)), Box::new(close_each_binderprop(f, *t))),
-    }
-}
+// (W6d.1b-iii: `close_each_binderprop` — the stage-A folder over `inv_hyps`'s
+// prop slots — was removed when the Loop invariant obligations deepened to the
+// parallel `inv_obligs: RawExpList`, folded via `close_each_e`. `inv_hyps` now
+// carries only the opaque frame-HYP leaves, consumed by the maintain/use
+// telescope; it no longer produces obligation goals.)
 
 // Seed the value-param / loop-binder telescope: each binder immediately
 // followed by its own bound hyp (empirical spine `∀x, ∀(h_x_bound), …`).
@@ -1355,7 +1361,7 @@ pub open spec fn frame_after(f: FrameList, s: StmData) -> FrameList
             } else {
                 f
             },
-        StmData::Loop { inv_hyps, binders, binder_bounds, cond_name, cond_ann: _, neg_cond_ann, d_old_name: _, d_old_val: _, decrease_oblig: _, body: _ } =>
+        StmData::Loop { inv_hyps, inv_obligs: _, binders, binder_bounds, cond_name, cond_ann: _, neg_cond_ann, d_old_name: _, d_old_val: _, decrease_oblig: _, body: _ } =>
             // use telescope (finding-3 + bootstrap-16): havoc the pre-loop
             // lets for the modified locals, re-quantify them, re-introduce
             // each invariant + ¬cond. Bounds/invs/cond are NAMED ∀-hyps for
@@ -1402,7 +1408,7 @@ pub open spec fn wp_stm(f: FrameList, s: StmData) -> GoalList
             goals_append(
                 wp_stm(frame_append(f, FrameList::FHyp(c, Box::new(FrameList::FNil))), *t),
                 wp_stm(frame_append(f, FrameList::FHyp(nc, Box::new(FrameList::FNil))), *e)),
-        StmData::Loop { inv_hyps, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann: _, d_old_name, d_old_val, decrease_oblig, body } => {
+        StmData::Loop { inv_hyps, inv_obligs, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann: _, d_old_name, d_old_val, decrease_oblig, body } => {
             // Maintain telescope (finding-3 + bootstrap-16): havoc pre-loop
             // lets for the modified locals, re-quantify them + bounds,
             // re-assert each invariant + the cond, then the `_tactus_d_old`
@@ -1411,20 +1417,24 @@ pub open spec fn wp_stm(f: FrameList, s: StmData) -> GoalList
             // hoist to ∀, extraction STOPS at the first let so d_old wraps
             // as a Let in the goal body). Bounds/invs/cond render as NAMED
             // ∀-hyps for a LEADING loop, bare `Imp`s for a NESTED one
-            // (`loop_maintain_frame` decides via `has_let`).
+            // (`loop_maintain_frame` decides via `has_let`). The HYPOTHESIS
+            // role reads `inv_hyps` (opaque `u64`s); the OBLIGATION role reads
+            // the parallel deep `inv_obligs` (W6d.1b-iii).
             let mframe = loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val);
             let body_goals = wp_stm(mframe, *body);
             let endf = frame_after(mframe, *body);
-            // Walker-synthesised body-end obligations (DESIGN §5 Q3): one per
-            // invariant re-closed, then the decrease obligation.
-            let maintain_reclose = close_each_binderprop(endf, *inv_hyps);
+            // Walker-synthesised body-end obligations (DESIGN §5 Q3): one DEEP
+            // goal per invariant re-closed (`close_each_e` over `inv_obligs` →
+            // `LeafE(render_exp(ob))`), then the DEEP decrease obligation
+            // (`close_e`).
+            let maintain_reclose = close_each_e(endf, *inv_obligs);
             let decrease_goal =
-                GoalList::Cons(Box::new(close(endf, decrease_oblig)), Box::new(GoalList::Nil));
+                GoalList::Cons(Box::new(close_e(endf, decrease_oblig)), Box::new(GoalList::Nil));
             // Emission order = init ++ body ++ maintain-reclose ++ decrease
             // (matches production's per-clause theorem order). Init closes each
-            // annotated invariant under the ACTUAL pre-loop frame `f` (the
+            // deep invariant obligation under the ACTUAL pre-loop frame `f` (the
             // modified-local lets still hold their initial values there).
-            let init = close_each_binderprop(f, *inv_hyps);
+            let init = close_each_e(f, *inv_obligs);
             goals_append(init,
                 goals_append(body_goals,
                     goals_append(maintain_reclose, decrease_goal)))
@@ -1799,6 +1809,10 @@ proof fn ref_wp_sum_to_loop()
                             BinderList::Cons(33, 24, Box::new(
                             BinderList::Cons(32, 25, Box::new(
                             BinderList::Cons(31, 26, Box::new(BinderList::Nil))))))))),
+                        inv_obligs: Box::new(RawExpList::Cons(Box::new(atom_ob(23)), Box::new(
+                            RawExpList::Cons(Box::new(atom_ob(24)), Box::new(
+                            RawExpList::Cons(Box::new(atom_ob(25)), Box::new(
+                            RawExpList::Cons(Box::new(atom_ob(26)), Box::new(RawExpList::Nil))))))))),
                         binders: Box::new(BinderList::Cons(9, 1, Box::new(
                             BinderList::Cons(11, 1, Box::new(BinderList::Nil))))),
                         binder_bounds: Box::new(ParamBoundList::Bound(37, 38, Box::new(
@@ -1808,7 +1822,7 @@ proof fn ref_wp_sum_to_loop()
                         neg_cond_ann: 40,
                         d_old_name: 27,
                         d_old_val: 28,
-                        decrease_oblig: 39,
+                        decrease_oblig: atom_ob(39),
                         body: Box::new(
                             StmData::Seq(Box::new(StmData::Assert(atom_ob(18), 17)), Box::new(
                             StmData::Seq(Box::new(StmData::Assume(17)), Box::new(
@@ -1822,7 +1836,7 @@ proof fn ref_wp_sum_to_loop()
                 ))))),
             ),
             // production goals (cert_sum_to_goals), 12 in walk order
-                GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(23)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(24)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(25)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(26)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::LeafE(ExprData::Atom(18))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::LeafE(ExprData::Atom(21))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(23)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(24)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(25)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(26)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(39)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 40, Box::new(GoalData::Let(8, 11, Box::new(GoalData::LeafE(ExprData::Atom(7))))))))))))))))))))))))))))), Box::new(GoalList::Nil)))))))))))))))))))))))),
+                GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::LeafE(ExprData::Atom(23))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::LeafE(ExprData::Atom(24))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::LeafE(ExprData::Atom(25))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::LeafE(ExprData::Atom(26))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::LeafE(ExprData::Atom(18))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::LeafE(ExprData::Atom(21))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::LeafE(ExprData::Atom(23))))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::LeafE(ExprData::Atom(24))))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::LeafE(ExprData::Atom(25))))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::LeafE(ExprData::Atom(26))))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::LeafE(ExprData::Atom(39))))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 40, Box::new(GoalData::Let(8, 11, Box::new(GoalData::LeafE(ExprData::Atom(7))))))))))))))))))))))))))))), Box::new(GoalList::Nil)))))))))))))))))))))))),
         ) == 1
 by { decide }
 
@@ -1848,9 +1862,12 @@ proof fn ref_wp_nested_loop_nonleading()
     ensures
         // NON-LEADING maintain telescope (an enclosing `let` survives
         // havoc ⇒ `Imp` bounds/invs/cond): matches find_square goal 5's
-        // inner portion `∀b, [24]→[25]→[26]→[27]→[29]→ let(31:=32) Leaf 35`.
+        // inner portion `∀b, [24]→[25]→[26]→[27]→[29]→ let(31:=32) LeafE 35`.
+        // (W6d.1b-iii: the body obligation is now DEEP — `close_e(·, atom_ob
+        // 35)` terminates in `LeafE(Atom 35)`; the telescope FRAME is
+        // unchanged — `loop_maintain_frame` still takes a `BinderList`.)
         goal_eq(
-            close(
+            close_e(
                 loop_maintain_frame(
                     FrameList::FBind(0, 1, Box::new(FrameList::FLet(20, 21, Box::new(FrameList::FNil)))),
                     BinderList::Cons(13, 25, Box::new(BinderList::Cons(15, 26,
@@ -1858,19 +1875,19 @@ proof fn ref_wp_nested_loop_nonleading()
                     BinderList::Cons(23, 1, Box::new(BinderList::Nil)),
                     ParamBoundList::Bound(11, 24, Box::new(ParamBoundList::Nil)),
                     28, 29, 31, 32),
-                35),
+                atom_ob(35)),
             GoalData::All(0, 1, Box::new(GoalData::Let(20, 21, Box::new(
                 GoalData::All(23, 1, Box::new(GoalData::Imp(24, Box::new(
                 GoalData::Imp(25, Box::new(GoalData::Imp(26, Box::new(
                 GoalData::Imp(27, Box::new(GoalData::Imp(29, Box::new(
-                GoalData::Let(31, 32, Box::new(GoalData::Leaf(35))))))))))))))))))),
+                GoalData::Let(31, 32, Box::new(GoalData::LeafE(ExprData::Atom(35)))))))))))))))))))),
         ) == 1,
         // LEADING maintain telescope (no surviving `let`): the SAME loop
         // node renders bounds/invs/cond as NAMED ∀-hyps (_h_ctx 11/13/15/17
         // /28). Only the front frame differs (no `let`) — proving the branch
         // is chosen by context, not baked into the loop node.
         goal_eq(
-            close(
+            close_e(
                 loop_maintain_frame(
                     FrameList::FBind(0, 1, Box::new(FrameList::FNil)),
                     BinderList::Cons(13, 25, Box::new(BinderList::Cons(15, 26,
@@ -1878,17 +1895,17 @@ proof fn ref_wp_nested_loop_nonleading()
                     BinderList::Cons(23, 1, Box::new(BinderList::Nil)),
                     ParamBoundList::Bound(11, 24, Box::new(ParamBoundList::Nil)),
                     28, 29, 31, 32),
-                35),
+                atom_ob(35)),
             GoalData::All(0, 1, Box::new(GoalData::All(23, 1, Box::new(
                 GoalData::All(11, 24, Box::new(GoalData::All(13, 25, Box::new(
                 GoalData::All(15, 26, Box::new(GoalData::All(17, 27, Box::new(
                 GoalData::All(28, 29, Box::new(GoalData::Let(31, 32, Box::new(
-                GoalData::Leaf(35))))))))))))))))),
+                GoalData::LeafE(ExprData::Atom(35)))))))))))))))))),
         ) == 1,
         // NON-LEADING use telescope (¬cond, no d_old): matches find_square
-        // goal 13's inner portion `∀b, [24]→[25]→[26]→[27]→[30]→ Leaf 43`.
+        // goal 13's inner portion `∀b, [24]→[25]→[26]→[27]→[30]→ LeafE 43`.
         goal_eq(
-            close(
+            close_e(
                 loop_use_frame(
                     FrameList::FBind(0, 1, Box::new(FrameList::FLet(20, 21, Box::new(FrameList::FNil)))),
                     BinderList::Cons(13, 25, Box::new(BinderList::Cons(15, 26,
@@ -1896,12 +1913,12 @@ proof fn ref_wp_nested_loop_nonleading()
                     BinderList::Cons(23, 1, Box::new(BinderList::Nil)),
                     ParamBoundList::Bound(11, 24, Box::new(ParamBoundList::Nil)),
                     28, 30),
-                43),
+                atom_ob(43)),
             GoalData::All(0, 1, Box::new(GoalData::Let(20, 21, Box::new(
                 GoalData::All(23, 1, Box::new(GoalData::Imp(24, Box::new(
                 GoalData::Imp(25, Box::new(GoalData::Imp(26, Box::new(
                 GoalData::Imp(27, Box::new(GoalData::Imp(30, Box::new(
-                GoalData::Leaf(43))))))))))))))))),
+                GoalData::LeafE(ExprData::Atom(43)))))))))))))))))),
         ) == 1
 by { decide }
 
@@ -2158,11 +2175,14 @@ by { decide }
 
 proof fn amended_shapes_kernel_compute()
     ensures
-        // Loop: 1 + |inv_hyps=1| + |binders=1| + size(Skip=1) == 4
-        // (binder_bounds is a ParamBoundList — not counted, mirroring the
-        // serializer's `stm_size_of` token sum; the scalar leaves add 0).
+        // Loop: 1 + |inv_hyps=1| + |inv_obligs=1| + |binders=1| + size(Skip=1)
+        // == 5 (binder_bounds is a ParamBoundList — not counted, mirroring the
+        // serializer's `stm_size_of` token sum; the scalar leaves add 0;
+        // W6d.1b-iii added the parallel deep-obligation `inv_obligs` RawExpList,
+        // counted via `raw_exp_list_len`).
         stm_size(StmData::Loop {
             inv_hyps: Box::new(BinderList::Cons(0, 10, Box::new(BinderList::Nil))),
+            inv_obligs: Box::new(RawExpList::Cons(Box::new(atom_ob(10)), Box::new(RawExpList::Nil))),
             binders: Box::new(BinderList::Cons(3, 4, Box::new(BinderList::Nil))),
             binder_bounds: Box::new(ParamBoundList::Bound(20, 21, Box::new(ParamBoundList::Nil))),
             cond_name: 5,
@@ -2170,9 +2190,9 @@ proof fn amended_shapes_kernel_compute()
             neg_cond_ann: 2,
             d_old_name: 6,
             d_old_val: 7,
-            decrease_oblig: 8,
+            decrease_oblig: atom_ob(8),
             body: Box::new(StmData::Skip),
-        }) == 4,
+        }) == 5,
         // Call: 1 + |reqs=1| + frame_len(post = FBind(5,6,FNil) = 1) == 3
         stm_size(StmData::Call {
             reqs: Box::new(RawExpList::Cons(Box::new(atom_ob(0)), Box::new(RawExpList::Nil))),
