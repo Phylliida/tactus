@@ -3,7 +3,7 @@ title: "W6d — bridge deepened: obligation leaves emit LeafE + refWp closes ove
 status: in_progress
 claimed_by: opus-b23
 created: 2026-07-14T09:30:00Z
-updated: 2026-07-14T18:10:00Z
+updated: 2026-07-14T21:30:00Z
 ---
 
 ## Description
@@ -303,15 +303,37 @@ arithmetic fns; G2+G3 unlock the datatype/struct/tuple fns.
     LeafE Atom 39), nested_loop (direct `close(·,35/43)` → `close_e(·,atom_ob
     35/43)`), stm_size test (4 → 5). Verified **52/0**. **W6d.1b COMPLETE** (all
     three container sub-steps i/ii/iii landed).
-- **W6d.2 — serializer wiring.** In `sst_serialize.rs`: `oblig_leaf` (and the
-  Ret/Loop obligation paths) emit the `RawExp` mirror into `StmData` (drop
-  `#[allow(dead_code)]` on `raw_exp`/`typ_data`); `goal_data` emits
-  `GoalData::LeafE(lexpr_to_exprdata(shape.leaf))` (drop `#[allow(dead_code)]`
-  on `lexpr_to_exprdata`). Wrap the obligation `RawExp` in `RawExp::Span` at the
-  `oblig_leaf` level (the raw SST has no SpanMark node — see `bootstrap-22`
-  writeup). Keep every non-cast-class shape fail-loud + census-tracked.
+- **W6d.2 — serializer wiring.** Split into 2a (opaque-fallback plumbing) +
+  2b (deep transcription), same de-risk discipline as W6d.1a→1b.
+  - **W6d.2a — opaque-fallback emission (type-correctness + verdict-neutral).
+    ✅ DONE (2026-07-14, opus-b23).** All FIVE obligation slots switched from
+    the stage-A `u64`/`LeafList` text to the new deep `RawExp`/`RawExpList`
+    literals, using the `atom_ob` opaque fallback (`RawExp.Var id TyBool`, which
+    refWp renders to `LeafE(Atom id)`), and `goal_data` emits `GoalData.LeafE
+    (ExprData.Atom id)`. The interned ids are UNCHANGED, so the bridge stays
+    verdict-neutral (opaque atoms, same cancellation as stage-A) — but the
+    emitted cert now type-checks against the W6d.1b tactus-core defs again. This
+    covers the user-flagged Loop 12-arg format (`inv_obligs` inserted) +
+    `decrease_oblig`→`RawExp`, plus the parallel Assert/Ret/Call changes (they
+    MUST move together — an Assert-carrying cert won't elaborate against
+    `Assert(RawExp,u64)` while any slot still emits a bare Nat). See the
+    "W6d.2a landing" section below (Rust 327/0 + two rebuild-free end-to-end
+    bridge checks). `raw_exp`/`typ_data`/`lexpr_to_exprdata` stay
+    `#[allow(dead_code)]` — 2a does NOT wire them (no deep structure yet).
+  - **W6d.2b — deep transcription (the Friction-2 catcher).** Wire `raw_exp`
+    (G0 Box/Unbox peel FIRST, then G7 VarAt, G1 LitBool, G3 Field, G6 HasType,
+    G2 TyRef→deref) into `oblig_leaf` with the `atom_ob` fallback when a shape
+    isn't coverable, and `goal_data` into `lexpr_to_exprdata(shape.leaf)` with
+    the same fallback. **Gate: a given obligation goes deep ONLY when BOTH sides
+    succeed and agree** (else BOTH fall back to atom) — a ref-deep/goal-atom
+    mismatch fails that fn's bridge (→ census-tracked, non-bridging). Wrap the
+    obligation `RawExp` in `RawExp::Span` at the `oblig_leaf` level (the raw SST
+    has no SpanMark node — `bootstrap-22`). Keep every non-cast-class shape
+    fail-loud + census-tracked.
 - **W6d.3 — bridge over the bridgeable subset, verdict-neutral.** Re-emit the
-  fixture; bridge (probe9-style) the fns whose leaves are all coverable
+  fixture (release-binary rebuild) — this also **regenerates the golden**
+  `testdata/add_capped.cert.lean` to the W6d.2a emission (currently stale but
+  round-trip-green); bridge (probe9-style) the fns whose leaves are all coverable
   (add_capped, double_exec, quad_exec, sum_to, scope_shape, id_generic, tri_one,
   + head_exec/mk_point/swap_pair once G2/G3 land). Confirm flag-on == flag-off
   verdict and the census reports the fail-loud remainder (max_u64 `ed-let`).
@@ -628,6 +650,81 @@ arithmetic fns; G2+G3 unlock the datatype/struct/tuple fns.
   Assert/Call/Ret/Loop obligations + decrease; `raw_exp` G0 Box/Unbox peel + G7
   VarAt + LitBool/Field/HasType arms; `oblig_leaf` emits the `RawExp` mirror
   wrapped in `Span`; `goal_data` emits `LeafE`). G4 (`Let`-in-leaf) → W6e.
+
+- (2026-07-14, opus-b23) **W6d.2a landed — the serializer emits the deep
+  obligation slots (opaque-atom fallback); the emitted cert type-checks against
+  the W6d.1b tactus-core defs again and bridges verdict-neutral. Validated
+  rebuild-free.** One edit to `sst_serialize.rs` (+ 2 unit-test updates) moved
+  ALL FIVE obligation slots off the stage-A `u64`/`LeafList` text:
+  - **Two new emit helpers** (free fns by `paren`): `atom_ob_lit(id)` →
+    `(lib.RawExp.Var id lib.TypData.TyBool)` (= tactus-core `atom_ob`, renders
+    to `Atom id`); `raw_exp_list(terms)` → a `lib.RawExpList` with each element
+    a boxed `RawExp` (mirrors `RawExpList::Cons(Box<RawExp>, …)`, unlike
+    `leaf_list`'s inline `u64`).
+  - **Assert** obligation `oblig` → `atom_ob_lit(oblig)`. **Ret** `es` and
+    **Call** `reqs`: `leaf_list` → `raw_exp_list` of `atom_ob_lit` per id.
+    **Loop**: added `inv_obligs` = `raw_exp_list` of `atom_ob_lit(oblig)` over
+    the SAME `inv_entries` (index-aligned with `inv_hyps` by construction), the
+    format went **10-arg → 11-arg** (`inv_obligs` inserted after `inv_hyps`,
+    matching the tactus-core field order), and `decrease_oblig` →
+    `atom_ob_lit(decrease_oblig)`. **`goal_data`** terminal `GoalData.Leaf id`
+    → `GoalData.LeafE (lib.ExprData.Atom id)`.
+  - **`stm_size_of`** now counts `RawExpList.Cons` (reqs/es/inv_obligs) as well
+    as `LeafList.Cons` — mirrors tactus-core `stm_size = … +
+    raw_exp_list_len(…)`. (LeafList.Cons kept counted so the pre-2a golden
+    round-trip test still balances; a live stm_term now emits only RawExpList.)
+  - `leaf_list` STAYS (it's still `FnCtxData.enss`, an opaque-`u64` hyp list —
+    NOT deepened); `oblig_leaf`/`decrease_oblig_leaf` still return `Sr<u64>`
+    (the interned id) and are wrapped at the emit site — no signature churn.
+
+  **Why all five move together (not just the user-flagged Loop pair):** the
+  bridge is `decide(goals_eq (ref_wp sst) goals)`; refWp's obligation arms ALL
+  switched to `close_e`/`close_each_e` in W6d.1b, so refWp now emits `LeafE` for
+  EVERY obligation and `close` (the `Leaf u64` folder) is dead. A cert that
+  still emitted `Assert <nat> <nat>` (or `GoalData.Leaf`) would fail Lean
+  type-check / mismatch the `LeafE` reference. So type-correctness forces the
+  symmetric flip across Assert/Ret/Call/Loop + goal_data at once — 2a is the
+  smallest INDEPENDENTLY CHECKABLE unit.
+
+  **Verified — Rust `cargo test -p lean_verify --lib` = 327 passed / 0
+  failed** (incl. `stm_size_matches_core` on the new RawExp/RawExpList shapes,
+  `goal_data_spine_shape` on `LeafE`, and the `golden_add_capped_cert`
+  round-trip — still green because it recovers-and-re-renders its own file).
+
+  **Verified — end-to-end bridge, NO binary rebuild.** Transformed two on-disk
+  fixture certs by hand EXACTLY as the new serializer does (a small
+  balanced-paren Python transcription of the actual edits) and elaborated them
+  against the live `tactus-core/out/lib` oleans (the W6d.1b 03:26 build):
+  - `scope_shape` (Assert + Ret + 2 goals): `stm_size … = 8` ✓, `goal_count …
+    = 2` ✓, **`goals_eq (ref_wp ctx sst) goals = 1 := by decide` ✓ (and `by
+    rfl` ✓)** — rc=0, 1.3s. The deep-leaf mechanism closes.
+  - `sum_to` (the Loop + cast-class monster): the 10-arg→11-arg Loop with
+    `inv_obligs` = `[atom_ob 17,19,21,23]` inserted + `decrease` wrapped
+    type-checks; `stm_size` recomputed **25 → 29** (the 4 `inv_obligs` Cons —
+    my `stm_size_of` produces the matching 29, decide ✓); **`goals_eq (ref_wp
+    ctx sst) goals = 1 := by decide` ✓** — rc=0, 1.7s. The Loop plumbing +
+    field order are correct against tactus-core. (The initial `stm_size = 25`
+    error was the STALE probe from the old cert — a positive signal that
+    `inv_obligs` is genuinely-new counted content, not a bug.)
+
+  These are opaque-atom bridges (verdict-neutral): both sides collapse each
+  obligation to `Atom(interned-id)`, so they close by the same id-matching as
+  stage-A. The DEEP structure (which actually catches Friction-2) arrives in
+  W6d.2b when `raw_exp`/`lexpr_to_exprdata` are wired in.
+
+  **Not done / assumptions.** (1) The golden `testdata/add_capped.cert.lean`
+  now reflects the OLD emission (its round-trip test still passes — it's a
+  render_cert format pin, not a serializer-output pin) — regenerate it in
+  W6d.3's re-emit. (2) The full probe9 over ALL 13 re-emitted fixtures still
+  needs the release-binary rebuild (the two hand-transforms cover the two
+  representative shapes; a rebuild+re-emit is the exhaustive W6d.3 check).
+  (3) No production code path other than the serializer changed; the W3 tgt
+  gate + e2e suite stay green by construction (Lean-text-only coupling, same
+  argument as every W6d.1b sub-step).
+
+  **Next = W6d.2b** (deep transcription, the Friction-2 catcher — see the split
+  plan bullet above) then **W6d.3** (rebuild + re-emit all fixtures + probe9 +
+  regenerate the golden). G4 (`Let`-in-leaf) → W6e.
 
 ## Writeup
 
