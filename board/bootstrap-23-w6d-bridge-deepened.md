@@ -1,9 +1,9 @@
 ---
 title: "W6d — bridge deepened: obligation leaves emit LeafE + refWp closes over ExprData (corpus coverage map)"
 status: in_progress
-claimed_by: opus-b24
+claimed_by: opus-b25
 created: 2026-07-14T09:30:00Z
-updated: 2026-07-14T23:15:00Z
+updated: 2026-07-14T23:45:00Z
 ---
 
 ## Description
@@ -801,6 +801,76 @@ arithmetic fns; G2+G3 unlock the datatype/struct/tuple fns.
   **Next = W6d.2b-2** (G6 + G3 reference arms + goal-side G1 arm, then the emit
   gate) → **W6d.3** (rebuild + re-emit + probe9 + regenerate the golden). G4
   (`Let`-in-leaf) → W6e.
+
+- (2026-07-14, opus-b25) **W6d.2b-2 arms landed — the LAST two reference arms
+  (G6 HasType, G3 Field) + the goal-side G1 (LitBool) arm; `lean_verify` lib
+  335/0. The transcriptions are now COMPLETE for the coverable fixture set; only
+  the emit-path gate remains in 2b-2.** Same "land the transcription dead, wire
+  later" discipline as 2b-1 — `raw_exp`/`lexpr_to_exprdata` stay
+  `#[allow(dead_code)]`, so nothing in the emit path calls them and the change
+  is verdict-neutral by construction (no cert emission changed; W3 tgt gate +
+  e2e suite unaffected). What changed in `sst_serialize.rs` (+ tests):
+  - **G6 — `ExpX::UnaryOpr(HasType(t), inner) => RawExp.HasType <width> <box
+    inner>`.** New free helper `uint_bound_width(t)` peels `Boxed`/`Decorate`
+    (like `typ_data`) and returns `n` for `Int(U(n))`; every other range fails
+    loud `hastype-range` (signed/usize/char/int/nat not carried — the
+    `RawExp::HasType` contract). `render_exp` re-expands the carried width to
+    `0 ≤ e ∧ e < 2^n` INDEPENDENTLY (its own `pow2`), so a production/reference
+    bound divergence surfaces as a bridge mismatch, never a silent pass. Unlocks
+    the arithmetic-overflow fns (add_capped/double_exec/quad_exec/count_down-
+    body/find_square/sum_to-body — the 10 HasType leaves the W6d.0 dump found).
+  - **G3 — `ExpX::UnaryOpr(Field(fop), inner) => RawExp.Field <fid> <fty> <box
+    base>`.** **The key transparency win (Danielle's steer): reuse production's
+    own `expr_shared::field_access_name(fop)` for the accessor string** rather
+    than re-deriving the tuple 1-indexed shift in the serializer. The goal-side
+    `FieldProj.field` production emits is ALSO `field_access_name(fop)`, so both
+    sides intern the IDENTICAL string → the atom-id consistency invariant holds
+    by construction, not by a parallel re-derivation that could drift. A 1-tuple
+    field-0 access (`field_access_name` returns `None`) is the identity —
+    production emits no projection, so the arm mirrors the bare base. `fty` =
+    the field node's own `typ` via `typ_data`. NB: a `&`-decorated base needs
+    the `.deref` chain production inserts (`apply_deref_chain`), which this arm
+    does NOT reproduce — such a base DIVERGES (ref `p.x` vs goal `p.deref.x`) and
+    the 2b-2 emit-gate keeps it fail-loud (the fixture's mk_point/swap_pair use
+    plain bases, so it doesn't bite them). Unlocks the struct/tuple fns.
+  - **G1 goal side — `ExprNode::LitBool(b) => ExprData.LitBool (0/1)`** in
+    `lexpr_to_exprdata`. Closes the half-landed G1 (2b-1 added only the
+    reference `RawExp::LitBool` arm). Nat encoding, not `bool` (a spec `bool`
+    renders Prop → sticks `decide`; W6d.1a deviation 1). Now `ensures true`
+    (find_square) bridges — both sides `LitBool 1`.
+  - **Tests (335/0, +4 net):** `lexpr_to_exprdata_bool_literal` (G1 goal
+    true→1/false→0), `raw_exp_hastype_carries_width` (`HasType(U64)(Var s)` →
+    `HasType 64 (box Var 0 TyInt)`), `raw_exp_hastype_rejects_signed`
+    (`I(64)` → `hastype-range` fail-loud), `raw_exp_field_tuple`
+    (`Dt::Tuple(2)` field "1" → accessor "2" via `field_access_name`, interned
+    id 1, base var id 0). The `lexpr_to_exprdata_census_rejects` test's
+    now-invalid `lit_bool → ed-litbool` assertion was replaced with a
+    still-out-of-class `¬p → ed-unop` (bool literals are in-class now). Non-test
+    `cargo build -p lean_verify` clean (exit 0; the 8 warnings are all
+    pre-existing — none reference the new code).
+  - **Census sharpening deferred (minor):** the board's 2b-1 note suggested
+    sharpening `exp_construct_tag`'s coarse `unaryopr` tag once Field/HasType
+    land. With G3/G6 explicit, the remaining `raw-unaryopr` fails are now only
+    IsVariant/IntegerTypeBound/HasResolved/ProofNote/CustomErr/ToDyn — none in
+    the coverable set; left as-is (a `unaryopr_tag` sub-classifier is a
+    nice-to-have, not blocking the emit gate). G6's own `hastype-range` and
+    G3's inherited `typ-*`/`raw-*` sub-fails already distinguish the new arms.
+
+  **Precise state for the next instance — 2b-2's remaining half is the EMIT
+  GATE (the Friction-2 catcher):** wire `raw_exp` into `oblig_leaf` and
+  `lexpr_to_exprdata` into `goal_data(shape.leaf)`, with the rule **"go deep
+  ONLY when BOTH transcriptions succeed AND the leaf is coverable; else BOTH
+  fall back to `atom_ob`/`Atom` by the same interned id"** — a ref-deep/goal-atom
+  (or deep-but-unequal) mismatch must fail that fn's bridge (→ census-tracked,
+  non-bridging), never silent-pass. Wrap the obligation `RawExp` in
+  `RawExp::Span` at the `oblig_leaf` level (raw SST has no SpanMark node —
+  bootstrap-22). The five obligation slots currently emit `atom_ob_lit(id)` /
+  `GoalData.LeafE(ExprData.Atom id)` (W6d.2a opaque fallback); the gate swaps
+  those for the deep `raw_exp`/`lexpr_to_exprdata` output on coverable leaves.
+  All the transcription vocabulary it needs now exists and is unit-pinned. Then
+  **W6d.3** (rebuild release binary + re-emit all fixtures + probe9 the coverable
+  subset + regenerate the golden `add_capped.cert.lean`). G4 (`Let`-in-leaf) →
+  W6e.
 
 ## Writeup
 

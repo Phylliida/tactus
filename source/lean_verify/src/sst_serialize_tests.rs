@@ -336,10 +336,12 @@ fn lexpr_to_exprdata_deref_fieldproj() {
 fn lexpr_to_exprdata_census_rejects() {
     use crate::lean_ast::BinOp as L;
     let mut s = Serializer::default();
-    // A boolean literal is outside the cast class.
+    // A `¬`-wrapped prop is outside the cast class (a `UnOp` node). (Bool
+    // literals are NOW in-class — see `lexpr_to_exprdata_bool_literal` (G1).)
     assert_eq!(
-        s.lexpr_to_exprdata(&LExpr::lit_bool(true)).unwrap_err(),
-        "ed-litbool"
+        s.lexpr_to_exprdata(&LExpr::not(LExpr::var_synthetic("p")))
+            .unwrap_err(),
+        "ed-unop"
     );
     // A 2-arg application (e.g. `lib.Point.mk a b`) is not the single-arg class.
     let two = LExpr::app(
@@ -441,4 +443,85 @@ fn raw_exp_bool_literal() {
     let f = mk_exp(ExpX::Const(Constant::Bool(false)), boolt);
     assert_eq!(s.raw_exp(&t).unwrap(), format!("({NS}.RawExp.LitBool 1)"));
     assert_eq!(s.raw_exp(&f).unwrap(), format!("({NS}.RawExp.LitBool 0)"));
+}
+
+// ── W6d.2b-2: the remaining reference arms (G6 HasType, G3 Field) + the
+// goal-side G1 arm. Still `#[allow(dead_code)]` on both transcriptions — the
+// emit-path gate (wire into `oblig_leaf`/`goal_data` with the both-sides-agree
+// fallback) is the next sub-step.
+
+/// G1 goal side — a production `LitBool` leaf maps to `ExprData.LitBool` with
+/// the SAME 0/1 nat encoding the reference `RawExp.LitBool` renders through, so
+/// an `ensures true` bridges (both sides `LitBool 1`). This closes the
+/// half-landed G1 gap (2b-1 added only the reference arm).
+#[test]
+fn lexpr_to_exprdata_bool_literal() {
+    let mut s = Serializer::default();
+    assert_eq!(
+        s.lexpr_to_exprdata(&LExpr::lit_bool(true)).unwrap(),
+        format!("({NS}.ExprData.LitBool 1)")
+    );
+    assert_eq!(
+        s.lexpr_to_exprdata(&LExpr::lit_bool(false)).unwrap(),
+        format!("({NS}.ExprData.LitBool 0)")
+    );
+}
+
+/// G6 — an unsigned-overflow `HasType(U(64))(e)` refinement carries the width
+/// 64 as a first-class `RawExp.HasType`; `render_exp` re-expands it to
+/// `0 ≤ e ∧ e < 2^64`. The wrapped `e` renders/peels as usual (here a bare
+/// `Var`, id 0). The HasType node's OWN type is irrelevant — the arm reads the
+/// width off the `U(n)` range in the `UnaryOpr`, not off `e.typ`.
+#[test]
+fn raw_exp_hastype_carries_width() {
+    let mut s = Serializer::default();
+    let inner = mk_exp(ExpX::Var(tvar("s")), tint());
+    let u64ty: Typ = std::sync::Arc::new(TypX::Int(IntRange::U(64)));
+    let boolt: Typ = std::sync::Arc::new(TypX::Bool);
+    let ht = mk_exp(ExpX::UnaryOpr(UnaryOpr::HasType(u64ty), inner), boolt);
+    assert_eq!(
+        s.raw_exp(&ht).unwrap(),
+        format!(
+            "({NS}.RawExp.HasType 64 (Tactus.Box.mk ({NS}.RawExp.Var 0 {NS}.TypData.TyInt)))"
+        )
+    );
+}
+
+/// G6 — a non-unsigned refinement (here a signed `I(64)`) is NOT carried; the
+/// arm fails loud (`hastype-range`) so the census tracks it rather than
+/// emitting a bound production never produces.
+#[test]
+fn raw_exp_hastype_rejects_signed() {
+    let mut s = Serializer::default();
+    let inner = mk_exp(ExpX::Var(tvar("s")), tint());
+    let i64ty: Typ = std::sync::Arc::new(TypX::Int(IntRange::I(64)));
+    let boolt: Typ = std::sync::Arc::new(TypX::Bool);
+    let ht = mk_exp(ExpX::UnaryOpr(UnaryOpr::HasType(i64ty), inner), boolt);
+    assert_eq!(s.raw_exp(&ht).unwrap_err(), "hastype-range");
+}
+
+/// G3 — a tuple field projection reuses production's `field_access_name`, so
+/// the reference field id interns the SAME accessor production renders: a
+/// `Dt::Tuple(2)` field `"1"` → `.2` (the 1-indexed shift), interning "2".
+/// The base var `r` interns first (id 0), the accessor "2" second (id 1).
+#[test]
+fn raw_exp_field_tuple() {
+    use vir::ast::{Dt, FieldOpr, VariantCheck};
+    let mut s = Serializer::default();
+    let r = mk_exp(ExpX::Var(tvar("r")), tint());
+    let fop = FieldOpr {
+        datatype: Dt::Tuple(2),
+        variant: std::sync::Arc::new("tuple%2".to_string()),
+        field: std::sync::Arc::new("1".to_string()),
+        get_variant: false,
+        check: VariantCheck::None,
+    };
+    let proj = mk_exp(ExpX::UnaryOpr(UnaryOpr::Field(fop), r), tint());
+    assert_eq!(
+        s.raw_exp(&proj).unwrap(),
+        format!(
+            "({NS}.RawExp.Field 1 {NS}.TypData.TyInt \
+               (Tactus.Box.mk ({NS}.RawExp.Var 0 {NS}.TypData.TyInt)))"
+        )
+    );
 }
