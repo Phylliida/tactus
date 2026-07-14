@@ -59,8 +59,11 @@
 //! * `fn_sst.x.pars` (non-`%`-synthetic) — value-param telescope →
 //!   `FnCtxData.params` (binder-id + typ leaf via `param_binder_typ`).
 //! * per-param `type_bound_predicate` → `FnCtxData.param_bounds`
-//!   (`Bound(leaf)` for int-typed `h_x_bound`, else `NoBound`).
-//! * `check.reqs` — requires exps → `FnCtxData.reqs` leaf list.
+//!   (`Bound(name, prop)` for an int-typed param — `name` = the
+//!   `h_<param>_bound` name leaf, `prop` = the range-predicate leaf — else
+//!   `NoBound`; finding-2: production renders these as NAMED ∀-binders).
+//! * `check.reqs` — requires exps → `FnCtxData.reqs` `BinderList` of
+//!   `(h_req<i> name leaf, req-prop leaf)` (finding-2: NAMED ∀-binders).
 //! * `check.post_condition.ens_exps` — ensures exps → `FnCtxData.enss`
 //!   leaf list (and the fall-through postcondition source; refWp appends
 //!   the implicit `Ret` from these when the body doesn't end in one).
@@ -465,13 +468,14 @@ impl Serializer {
         term
     }
 
-    /// `lib.ParamBoundList` from per-param optional leaves (order
-    /// preserved). `Some(leaf)` ⇒ `Bound(leaf)`, `None` ⇒ `NoBound`.
-    fn param_bound_list(&self, bounds: &[Option<u64>]) -> String {
+    /// `lib.ParamBoundList` from per-param optional `(name, prop)` leaves
+    /// (order preserved). `Some((name, prop))` ⇒ `Bound name prop` — a NAMED
+    /// ∀-binder `∀ (h_x_bound : prop)` (finding-2); `None` ⇒ `NoBound`.
+    fn param_bound_list(&self, bounds: &[Option<(u64, u64)>]) -> String {
         let mut term = format!("{}.ParamBoundList.Nil", NS);
         for b in bounds.iter().rev() {
             term = match b {
-                Some(leaf) => format!("{}.ParamBoundList.Bound {} {}", NS, leaf, box_(&term)),
+                Some((name, prop)) => format!("{}.ParamBoundList.Bound {} {} {}", NS, name, prop, box_(&term)),
                 None => format!("{}.ParamBoundList.NoBound {}", NS, box_(&term)),
             };
         }
@@ -602,9 +606,9 @@ fn serialize(
     }
 
     // Value params (skip Verus-synthetic `%`-named ones): binder-id +
-    // typ leaf, plus the parallel optional bound-hyp leaf.
+    // typ leaf, plus the parallel optional bound-hyp `(name, prop)`.
     let mut param_entries: Vec<(u64, u64)> = Vec::new();
-    let mut param_bounds: Vec<Option<u64>> = Vec::new();
+    let mut param_bounds: Vec<Option<(u64, u64)>> = Vec::new();
     for p in fn_sst.x.pars.iter().filter(|p| !p.x.name.0.contains('%')) {
         let id = s.binder_id(&p.x.name);
         let typ = s.param_typ_leaf(&p.x.typ, p.x.is_mut);
@@ -620,17 +624,27 @@ fn serialize(
         };
         match crate::to_lean_sst_expr::type_bound_predicate(&bound_value, &p.x.typ) {
             Some(pred) => {
-                let leaf = s.leaves.intern(pp_expr(&pred));
-                param_bounds.push(Some(leaf));
+                let prop = s.leaves.intern(pp_expr(&pred));
+                // The bound hyp renders as a NAMED ∀-binder; production mints
+                // the name as `h_<param>_bound` (sst_to_lean::build_param_binders).
+                // Intern the identical text so the goal-walk binder-name leaf
+                // (goal_binder_name_leaf) unifies with this one (finding-2).
+                let hname = s.text_leaf(&format!("h_{}_bound", name.as_str()));
+                param_bounds.push(Some((hname, prop)));
             }
             None => param_bounds.push(None),
         }
     }
 
-    // Requires leaves.
-    let mut req_leaves: Vec<u64> = Vec::new();
-    for r in check.reqs.iter() {
-        req_leaves.push(s.exp_leaf(r)?);
+    // Requires: `(h_req<i>, prop)` pairs — production renders each as a NAMED
+    // ∀-binder `∀ (h_req0 : x < 1000)` (sst_to_lean::build_req_binders), so
+    // reqs is a BinderList, not a leaf list (finding-2). The `h_req<i>` name
+    // text matches production's `format!("h_req{}", i)`.
+    let mut req_entries: Vec<(u64, u64)> = Vec::new();
+    for (i, r) in check.reqs.iter().enumerate() {
+        let prop = s.exp_leaf(r)?;
+        let hname = s.text_leaf(&format!("h_req{}", i));
+        req_entries.push((hname, prop));
     }
 
     // Ensures leaves (also the `Return` arm's source and the
@@ -653,7 +667,7 @@ fn serialize(
         paren(&s.binder_list(&typ_param_entries)),
         paren(&s.binder_list(&param_entries)),
         paren(&s.param_bound_list(&param_bounds)),
-        paren(&s.leaf_list(&req_leaves)),
+        paren(&s.binder_list(&req_entries)),
         paren(&s.leaf_list(&ens_leaves)),
     );
 

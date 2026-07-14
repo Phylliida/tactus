@@ -1,9 +1,9 @@
 ---
 title: "W2b-prereq — serializer faithfulness (annotated obligations, hyp names, loop binders) so bridges CAN close"
-status: todo
-claimed_by:
+status: in_progress
+claimed_by: opus-w2b-f2
 created: 2026-07-14T00:45:00Z
-updated: 2026-07-14T00:45:00Z
+updated: 2026-07-14T02:00:00Z
 ---
 
 ## Description
@@ -65,6 +65,65 @@ kills.
   sequencing: finding-2 (hyp names, smallest, self-contained) → finding-1
   (obligation annotations, dominant) → finding-3 (loop binders, largest) →
   finding-4 (return-binding, confirm-first). Each ends with N3 acceptance green.
+
+- (2026-07-14, opus-w2b-f2) **finding-2 (hyp names) LANDED across all three
+  layers; spec side PROVEN + verified, serializer side compiles.** End-to-end
+  fixture regen is the one remaining (mechanical) step — needs a vargo verus
+  rebuild. Details:
+
+  **Ground truth (add_capped.cert.lean goal 0):** the seed telescope is ALL
+  named `All` binders — `All 0 1 (All 19 2 (All 3 1 (All 18 4 (All 17 5 (All
+  16 6 (Leaf 15))))))` = `∀(x:Int) ∀(h_x_bound:2) ∀(y:Int) ∀(h_y_bound:4)
+  ∀(h_req0:5) ∀(h_req1:6), oblig`. Both bound-hyps (names 19/18) AND requires
+  (names 17/16 = `h_req0`/`h_req1`) are named ∀, never `Imp`.
+
+  **Production naming (must be mirrored byte-for-byte for interner unify):**
+  bound-hyp = `format!("h_{}_bound", name.as_str())` (sst_to_lean.rs:4138,
+  build_param_binders); req = `format!("h_req{}", i)` (sst_to_lean.rs:4271,
+  build_req_binders). `LeanName::synthetic(s).as_str() == s` (verbatim), and
+  the goal-walk interns those via `text_leaf(b.name.as_str())` — so ctx-side
+  and goal-side hit the SAME LeafTable and unify to one id.
+
+  **tactus-core/lib.rs (spec side) — verified 31/0 under the package gate:**
+  - `ParamBoundList::Bound(u64, Box)` → `Bound(u64 name, u64 prop, Box)`.
+  - `FnCtxData.reqs: LeafList` → `reqs: BinderList` (name, prop pairs).
+  - `seed_params` Bound arm: `FHyp(prop,…)` → `FBind(hname, prop,…)` (→ `All`).
+  - `seed_frame` reqs: `hyps_of_leaves(c.reqs)` → `binders_to_frame(c.reqs)`.
+  - `param_bound_len` Bound arm updated; all `decide` literals migrated.
+  - NEW `decide` test `ref_wp_add_capped_seed_spine` reproduces production
+    goal-0's fully-named telescope EXACTLY (leaf ids 0/1/3/19/18/17/16/2/4/5/6
+    /15 from the fixture cert). Isolates finding-2: given the annotated
+    obligation (finding-1), the named seed telescope matches verbatim.
+
+  **source/lean_verify/src/sst_serialize.rs (serializer) — cargo check green
+  (16s, no new warnings):**
+  - `param_bound_list(&[Option<u64>])` → `&[Option<(u64,u64)>]`, emits
+    `Bound name prop`.
+  - param loop mints `hname = text_leaf(format!("h_{}_bound", name))` alongside
+    the prop, pushes `Some((hname, prop))`.
+  - reqs walk: `req_leaves: Vec<u64>` → `req_entries: Vec<(u64,u64)>` with
+    `hname = text_leaf(format!("h_req{}", i))`; `FnCtxData.mk` emits
+    `binder_list(&req_entries)` for the reqs slot (was `leaf_list`).
+  - module doc updated.
+
+  **Remaining for finding-2 (mechanical, needs vargo verus rebuild):**
+  1. `vargo build` the verus fork so the binary carries the new serializer.
+  2. Re-emit the fixture certs (`bootstrap-fixture/`) — confirm add_capped's
+     `cert_add_capped_ctx` now shows `ParamBoundList.Bound <hname> 2 …` and a
+     `BinderList` reqs slot, and that the seed-spine portion of the bridge
+     `goals_eq (refWp ctx) production` closes (finding-1's obligation-leaf gap
+     still blocks the FULL add_capped bridge — that's a separate finding).
+  3. Refresh the golden `source/lean_verify/src/testdata/add_capped.cert.lean`
+     (+ `leaf_texts.len()` assertion in sst_serialize_tests.rs — id count will
+     grow by the interned hname leaves) and re-run N3 acceptance
+     (golden/determinism/verdict-neutral).
+  NB the golden test does NOT re-run `serialize()` (it round-trips the golden
+  bytes through `render_cert`), so it did not spuriously fail — but the golden
+  + on-disk fixture certs are now semantically STALE until step 2/3.
+
+  NEXT after this: finding-1 (obligation annotations — the dominant gap; the
+  Assert node must carry BOTH a bare forward-hyp leaf and an annotated
+  obligation leaf), then finding-3 (loop binders), finding-4 (return-binding).
 
 ## Writeup
 
