@@ -82,12 +82,16 @@ coverage of the tgt slice (any tgt spec fn calling a ≥2-arg helper).
     hash → "incompatible header" on every olean. Do NOT override `LEAN` or
     `TACTUS_PRELUDE`; the runner's defaults are correct. (None of the 4 elan
     toolchains load these oleans; only the Nix lean does.)
-  - **Honest residual:** the def bridge live-tests the VIR (`raw_vir_exp`) +
-    production (`lexpr_to_exprdata`) pair. The SST `raw_exp` arm (obligation-
-    position multi-arg calls) is the mechanical mirror of the validated VIR arm
-    but has no obligation-position ≥2-arg call in the fixture to exercise it
-    live this turn — a cheap follow-on is a proof fn with a multi-arg call in
-    its ensures (whose goal cert flows through `raw_exp`). Also `sum_tree`-style
+  - **Honest residual [CLOSED by bootstrap-36, 2026-07-14]:** the def bridge
+    live-tests the VIR (`raw_vir_exp`) + production (`lexpr_to_exprdata`) pair.
+    The SST `raw_exp` arm (obligation-position multi-arg calls) is the
+    mechanical mirror of the validated VIR arm but had no obligation-position
+    ≥2-arg call in the fixture to exercise it live this turn — a cheap follow-on
+    is a proof fn with a multi-arg call in its ensures (whose goal cert flows
+    through `raw_exp`). **Done in bootstrap-36:** `call_g2_ob`/`call_g3_ob`
+    (F21) drive `RawExp.CallN` into an obligation slot; probe9_bridge closes the
+    refWp bridge over it (close-ok, decide+rfl) and a goal-arg-order kill proves
+    it non-vacuous. Also `sum_tree`-style
     `DefCurried` (structural-recursion) callees still get no def cert (pre-
     existing `maybe_emit_def_cert` gate, orthogonal).
 - (2026-07-14, opus-w7-appn step2a) **FORK RESOLVED = WORLD (a); step 2b

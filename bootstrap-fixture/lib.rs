@@ -86,6 +86,26 @@ proof fn tri_one()
     assert(tri(0) == 0);
 }
 
+// F21 (W7 residual, bootstrap-36): a >=2-arg spec-fn call in OBLIGATION
+// position. `tri_one` above covers the single-arg `Call` arm of `raw_exp`
+// (its `tri(1)==1` ensures emits `RawExp.Call` in the SST obligation slot);
+// these force the WIDENED `raw_exp` `CallN` arm (bootstrap-34, L708) into an
+// obligation slot so the refWp obligation bridge (probe9) exercises the live
+// `CallN -> AppN` render on the SST side — the one path bootstrap-34 left
+// covered only on the DEF side (VIR `raw_vir_exp`). Both are pure-`nat` (no
+// per-arg `as` cast), so the obligation is the flat multi-arg spine. Bodies
+// are empty: `g2`/`g3` are `open spec fn`, so each ensures unfolds
+// definitionally (`g2(x,y)==x+y` -> `x+y==x+y`), no tactic needed.
+proof fn call_g2_ob(x: nat, y: nat)
+    ensures g2(x, y) == x + y,
+{
+}
+
+proof fn call_g3_ob(x: nat, y: nat, z: nat)
+    ensures g3(x, y, z) == x + y + z,
+{
+}
+
 // F5: tactic-block proof fn (verbatim pass-through)
 proof fn add_comm_t(a: int, b: int)
     ensures a + b == b + a
