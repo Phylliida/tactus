@@ -1,9 +1,9 @@
 ---
 title: "tgt defs family: `word_numbering` fails — emitted `decreasing_by`/omega can't crack a termination guard wrapped in a `dite`/`ite` over Prop"
-status: todo
-claimed_by:
+status: in_progress
+claimed_by: opus-bootstrap42-arity
 created: 2026-07-14T20:55:00Z
-updated: 2026-07-14T20:55:00Z
+updated: 2026-07-14T21:10:00Z
 ---
 
 ## Description

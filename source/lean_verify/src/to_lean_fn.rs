@@ -63,6 +63,18 @@ pub(crate) const TACTIC_BODY_FALLBACK: &str = "sorry";
 /// - `apply Nat.div_lt_self <;> omega` — the **division** obligation
 ///   `a / b < a` (base-conversion loops); side goals `0 < a`, `1 < b`
 ///   close from the branch guards.
+/// - `apply Nat.div_lt_self <;> (simp_all <;> omega)` — SAME division
+///   obligation, but for a fn whose branch guard reaches the termination
+///   context wrapped in an `ite`/`dite` over `Prop` (a Prop-valued
+///   recursive spec fn like `numbers_word`: `if alpha = 0 then True else
+///   if m ≤ 1 then False else … ∧ recurse (alpha/m)` hands the goal a
+///   single combined hyp `h✝ : ¬if x : alpha = 0 then True else m ≤ 1`).
+///   `omega` alone can't read `0 < alpha` / `1 < m` out of that Prop-ite;
+///   `simp_all` first decomposes the negated ite into plain arithmetic,
+///   then `omega` closes. Added as its OWN rung after the plain-`omega`
+///   div rung so the cheap clean-hypothesis path is unchanged and the
+///   other measures are untouched (bootstrap-44). Verified against the
+///   real emitted `word_numbering` defs part.
 /// - `apply Seq.drop_{first,last}_len_lt <;> …` — vstd **seq measures**
 ///   `len (drop_first w) < len w`: dispatches to the measure-companion
 ///   theorem emitted next to the corresponding def (see
@@ -102,7 +114,7 @@ fn decreasing_by_tactic() -> String {
         None => n.to_string(),
     };
     format!(
-        "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply {df} <;> (first | assumption | omega | simp_all)) | (apply {dl} <;> (first | assumption | omega | simp_all)) | ((repeat split) <;> omega) | decreasing_tactic)",
+        "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Nat.div_lt_self <;> (simp_all <;> omega)) | (apply {df} <;> (first | assumption | omega | simp_all)) | (apply {dl} <;> (first | assumption | omega | simp_all)) | ((repeat split) <;> omega) | decreasing_tactic)",
         df = q("Seq.drop_first_len_lt"),
         dl = q("Seq.drop_last_len_lt"),
     )
