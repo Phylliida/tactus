@@ -1,9 +1,9 @@
 ---
 title: "W6e — expression-level mutation-kill (the Friction-2 kill) + G4 If/Let/Tuple fold-in"
-status: in_progress
-claimed_by: opus-b28
+status: done
+claimed_by: opus-b30
 created: 2026-07-14T05:05:00Z
-updated: 2026-07-14T18:20:00Z
+updated: 2026-07-14T20:40:00Z
 ---
 
 ## Description
@@ -182,6 +182,45 @@ is independent; W6e is the last correctness rung before the W6 ladder is closed.
     honest-fails; post-change it either bridges or still honest-fails, never a
     NEW failure), because non-lift returns keep the current path untouched.
 
+- (2026-07-14, opus-b30) **G4.2 + G4.3 LANDED — max_u64 flips to close-ok; the
+  W6 ladder's last correctness rung is CLOSED. probe9 is now 13/13.** Wired all
+  three halves and validated end-to-end:
+  - **Reference recompute (`lift_if_raw`, `sst_serialize.rs`).** A wrap-stack
+    mirror of `lift_if_value_coerced` producing a small typed `LiftedRaw` tree
+    (And/Implies/Leaf), then `split_lifted` peels top-`And`s and `serialize_lifted`
+    renders each obligation. The Return arm gates on `value_lifts(e)` (pure
+    structural If-detector) + all-ensures-deep, runs the recompute, and on a
+    ≥2-split emits `Ret([impl…], RetNone)`. The re-emitted `max_u64.cert.lean`
+    SST is now BYTE-FOR-BYTE the probe14 `sst_wired` (ids x=0 y=4 r=10 m=14,
+    spans 11/13, `RawExp.Not` on the else guard, ens_and reusing the deep span
+    slots verbatim).
+  - **Goal transcription (`lexpr_to_exprdata` Let/Not arms).** The `Implies`-
+    topped goal leaf now transcribes to the deep `ExprData` (2× `Let 10`, 1×
+    `Not`, 2× `SpanMark 11` on the goal side — no `Atom 15/16`).
+  - **deep_ids coordination (post-stm-walk pass in `serialize`).** A successful
+    recompute bumps `lifted_return_recomputes`; the pass then seeds `deep_ids`
+    with the `Implies`-topped goal-shape leaf ids (straight from the ACTUAL
+    production `goal_shapes`, so they match `goal_data`'s `lexpr_leaf` by
+    construction). NO `ensures_goal` LExpr reconstruction needed — the coarse
+    counter gate is provably safe (see the no-regression argument above).
+  - **Validated 5 ways:** (1) **probe9 = 13/13 close-ok** (max_u64 read
+    `LAX-REGRESS` the instant I re-emitted → removed its `honest_fail_reason`
+    case → all green, "ALL BRIDGES BEHAVE AS CLASSIFIED ✓"); both `decide` AND
+    `rfl`. (2) probe13 mutation-kill still 4/4. (3) probe14 contract still green.
+    (4) `add_capped.cert` BYTE-IDENTICAL to the golden (non-lift fns fully
+    verdict-neutral). (5) `cargo test -p lean_verify --lib` = **339 passed / 0
+    failed** (updated `lexpr_to_exprdata_census_rejects` — `¬`/`let` are now
+    in-class — + added `lexpr_to_exprdata_g4_not_let`). Fixture verdict
+    unchanged: **13 verified / 11 errors** (the pre-existing `tactus_auto`
+    proof-search failures).
+  - Commits `3d190c4` (wiring), `2b128c9` (probe9 flip), `1a1013d` (tests).
+  **Task DONE — every "Done when" criterion met + triple-validated.** Split the
+  two OPTIONAL G4.3 hardenings (an in-crate `ref_wp`-level `decide` guard in
+  `tactus-core/lib.rs` + a probe13 max_u64 If-fold mutation class) into
+  `bootstrap-25` — they need a tactus-core rebuild and are redundant with the
+  checked-in probe14 + the existing G4.1 kernel guard, so they deserve their own
+  turn.
+
 ## G4 remaining design (for the next instance — recompute + re-emit)
 
 **The shape mismatch (why max_u64 honest-fails today).** Production emits TWO
@@ -266,5 +305,87 @@ the inner `let m`, or swap a branch value) now that its leaves are deep.
 
 ## Writeup
 
-_when done: findings, how the mutation harness works, what each coercion-drop
-kill demonstrates, the G4 fold-in mechanism, and any remaining Tier-2 residue._
+**Outcome.** W6e is complete. The two deliverables both landed and are validated:
+(1) the expression-granularity mutation-kill harness (probe13, item 1, opus-b28),
+and (2) the G4 value-if-lift fold-in (opus-b28 vocab → opus-b29 probe → opus-b30
+wiring). **probe9 is now 13/13 close-ok** — the last documented honest-fail in
+the W6-ladder correctness rung is gone.
+
+**The mutation harness (item 1, `probe-w0/probe13_expr_mutations/`).** Reads the
+four live deep certs, applies ONE GOAL-side structural coercion-drop per class,
+and proves by `decide` that the deep bridge FLIPS `goals_eq 1→0` while the
+un-perturbed baseline closes at 1. The four classes each demonstrate a distinct
+Friction-2 blind spot the symmetric DEEP compare catches that a stage-A string
+compare would silent-pass: **cast_drop** (a dropped `Int.toNat` at a `sum_to`
+ensures), **deref_drop** (a dropped `.deref` at head_exec's G2 receiver),
+**wrong_field** (a wrong accessor id at mk_point's G3 projection), **wrong_width**
+(a wrong `2^n` overflow bound at add_capped's G6 `HasType`). Structural transforms
+(not leaf-id constants) so the suite survives a fixture regen; each asserts it
+fired.
+
+**How the G4 fold-in works.** Production lifts a fall-through `if` in a return
+VALUE into each ensures leaf (`lift_if_value_coerced`, `sst_to_lean.rs:4956`), so
+the Return obligation is a per-branch *branch-folded implication*
+`c → (let r := (let m := v; …); ens0 ∧ ens1)`, and `emit_done_or_split` peels the
+top `And` into one goal per branch (each an `Implies`-topped whole implication,
+NOT a bare `SpanMark`). The plain serializer Return path emitted the
+ensures-SPLIT `Ret([Span ens…], RetLet r v)` instead — split on an orthogonal
+axis (ensures vs branch) — so the frozen `refWp` never bridged (the honest-fail).
+
+The fix has three coordinated parts in `sst_serialize.rs`:
+1. **`lift_if_raw`** mirrors `lift_if_value_coerced` at the `RawExp`-text level
+   with an explicit outer→inner wrap-stack `[(r, ens_and), (m, m_body)]`
+   (no closures — avoids `&mut self` capture). It returns a small typed
+   `LiftedRaw` tree so the top-`And` split (`split_lifted`) is structural, not
+   text-parsing. The conjoined-ensures tail `ens_and` reuses the ALREADY-deep
+   `pending_ens_oblig` span slots, right-folded to match `and_all` — so the
+   per-ensures Friction-2 compare is preserved *inside* the branch fold.
+2. **`lexpr_to_exprdata`** gained `Let`/`Not` arms so the `Implies`-topped goal
+   leaf transcribes to the matching deep `ExprData`. Binder names intern their
+   rendered text (the SAME `sanitize(ret)` / `from_var_ident` text the reference
+   `RawExp::Let` interns), so ids agree by construction.
+3. **deep_ids seeding** (post-stm-walk pass in `serialize`): a successful
+   recompute bumps `lifted_return_recomputes`; the pass then seeds `deep_ids`
+   with the `Implies`-topped goal-shape leaf ids taken from the ACTUAL production
+   `goal_shapes`. This is the key simplification vs the design's first sketch —
+   NO `ensures_goal` LExpr reconstruction is needed, because the goal shapes ARE
+   production's leaves (passed in), so the seeded id equals `goal_data`'s
+   `lexpr_leaf` id automatically.
+
+`render_exp` passes the new `Let`/`Not`/`Span` nodes straight through (no
+coercion at those nodes — coercions live at their own sub-expr BinOp/Call/Clip),
+so the bridge `decide`s the sub-expressions. G4.1 (opus-b28) had already frozen
+this render shape via a kernel guard; probe14 (opus-b29) pinned the full
+`ref_wp`/`goals_eq` contract through the REAL emitted defs — so opus-b30's job
+was purely to make the serializer produce exactly that pinned `RawExp`, which the
+re-emitted `max_u64.cert.lean` does byte-for-byte.
+
+**Assumptions / scope caveats (honest).**
+- **No return-typ coercion in the recompute.** `lift_if_raw` derives the
+  structural form via `raw_exp` and does NOT replay production's per-leaf
+  `coerce_lexpr` (Int.toNat/deref insertion). max_u64 has none (u64 return, bool
+  ensures), so it's a no-op there. A coercion-NEEDING lifted return would render
+  a divergent leaf → the bridge honest-fails (sound — never a silent pass), same
+  stance as the rest of W6d. No such fn is in the fixture.
+- **Fixture-shape lift only.** `lift_if_raw` mirrors the If and single-binder-let
+  (non-let-chain-body) arms; a nested let-chain rhs or multi-binder let fails
+  loud (`liftraw-*`) → fall through to the plain (still-honest-failing) path.
+- **Coarse deep_ids gate.** The seeding pass is gated on
+  `lifted_return_recomputes > 0` (per-fn, not per-return). For a multi-return fn
+  where only some returns recompute, it could seed an `Implies` leaf whose ref
+  return did NOT recompute — but that return already honest-failed, so it's
+  no-worse. No fixture fn hits this.
+- **Verdict-neutrality** confirmed byte-level (add_capped golden identical) and
+  at the verifier verdict (13 verified / 11 errors, unchanged). The 11 errors are
+  the pre-existing `tactus_auto` proof-search failures on the hard fixture fns,
+  orthogonal to cert emission.
+
+**Remaining (optional, → `bootstrap-25`).** The two G4.3 hardenings the design
+mentions but that are NOT in the "Done when": an in-crate `ref_wp`-level `decide`
+guard in `tactus-core/lib.rs` (parallel to `ref_wp_if_twoway_join`) pinning
+`goals_eq(ref_wp(mx_ctx, mx_sst), mx_goals) == 1` + a mutation-kill; and a
+probe13 max_u64 If-fold mutation class. Both need a tactus-core rebuild (a new fn
+invalidates the whole crate's verification) and re-emit; they are redundant with
+the checked-in probe14 (which routes the same contract through the real emitted
+`ref_wp`) and the existing G4.1 kernel guard, so they were deferred rather than
+rushed at the end of a large turn.
