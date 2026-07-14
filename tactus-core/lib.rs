@@ -26,9 +26,14 @@
 //! equations need, added BEFORE the serializer freezes the literal shape):
 //! * `If` carries a rendered `¬cond` leaf (the else-branch hypothesis;
 //!   refWp cannot synthesize leaf ids).
-//! * `Loop` carries a `neg_cond` leaf and a `BinderList` of loop-state
-//!   binders (the maintain/use telescopes quantify over the modified
-//!   locals — production computes the set, the literal must carry it).
+//! * `Loop` carries the modified-local havoc set (`binders` +
+//!   `binder_bounds`), the invariants as NAMED `_h_ctx` ∀-hyps
+//!   (`inv_hyps`, annotated obligation leaves), the loop condition
+//!   (`cond_name`/`cond_ann`/`neg_cond_ann`), the `_tactus_d_old`
+//!   decreases snapshot (`d_old_name`/`d_old_val`) and its obligation
+//!   (`decrease_oblig`). refWp havocs the pre-loop lets, re-quantifies
+//!   the modified locals, and re-closes each invariant + the decrease at
+//!   body end — mirroring production's `walk_loop` (finding-3).
 //! * `Call` carries the result binder `dest` + its `dest_typ` leaf
 //!   (ensures-hypotheses bind the call result).
 //! * `Ret` carries a `LeafList` — one annotated-ensures obligation leaf
@@ -138,10 +143,41 @@ pub enum StmData {
     /// StmX::If — (cond leaf, ¬cond leaf, then, else); absent else = Skip.
     /// The `neg_cond` leaf is the RENDERED else-branch hypothesis text.
     If(u64, u64, Box<StmData>, Box<StmData>),
-    /// StmX::Loop — invariant leaves, condition leaf, ¬condition leaf,
-    /// loop-state binders (the modified locals the telescopes quantify
-    /// over), body.
-    Loop { invs: Box<LeafList>, cond: u64, neg_cond: u64, binders: Box<BinderList>, body: Box<StmData> },
+    /// StmX::Loop — the maintain/use telescopes production builds around a
+    /// loop (finding-3). Production havocs the modified locals, re-quantifies
+    /// them as NAMED ∀-binders (`push_mod_var_frames` +
+    /// `split_leading_binders` → `_h_ctx_N`), re-asserts each invariant and
+    /// the loop condition as NAMED ∀-hyps, snapshots the decreases measure in
+    /// a `_tactus_d_old` let, and (at body end) closes each invariant + the
+    /// decrease obligation. Fields:
+    /// * `inv_hyps` — one `(_h_ctx name leaf, ANNOTATED invariant obligation
+    ///   leaf)` per standard invariant. The prop slot is the annotated leaf
+    ///   used BOTH as the init/maintain obligation AND (via the ∀-telescope)
+    ///   as the maintain/use hypothesis (production reuses the one span_mark'd
+    ///   leaf for both roles — unlike Assert's bare/annotated split).
+    /// * `binders` — the modified-local havoc set `(id, typ leaf)`.
+    /// * `binder_bounds` — parallel `(NoBound | Bound(_h_ctx name, range
+    ///   prop))` per modified local (production re-asserts each mod-var's type
+    ///   bound as a NAMED ∀ right after its ∀-binder, exactly like a param).
+    /// * `cond_name` / `cond_ann` / `neg_cond_ann` — the shared `_h_ctx` name
+    ///   for the loop-condition hyp, the ANNOTATED `cond` leaf (maintain) and
+    ///   the ANNOTATED `¬cond` leaf (use).
+    /// * `d_old_name` / `d_old_val` — the `_tactus_d_old_<id>_0` snapshot
+    ///   binder and the rendered decreases-measure value (maintain only).
+    /// * `decrease_oblig` — the ANNOTATED `0 ≤ D ∧ D < d_old` obligation,
+    ///   closed at body end alongside the maintain invariants.
+    Loop {
+        inv_hyps: Box<BinderList>,
+        binders: Box<BinderList>,
+        binder_bounds: Box<ParamBoundList>,
+        cond_name: u64,
+        cond_ann: u64,
+        neg_cond_ann: u64,
+        d_old_name: u64,
+        d_old_val: u64,
+        decrease_oblig: u64,
+        body: Box<StmData>,
+    },
     /// Empty StmX::Block.
     Skip,
     /// StmX::Block, right-nested pairwise — avoids the StmData/StmList
@@ -263,8 +299,13 @@ pub open spec fn stm_size(s: StmData) -> nat
         StmData::DeadEnd(b) => 1 + stm_size(*b),
         StmData::Ret(es, _rb) => 1 + leaf_len(*es),
         StmData::If(_c, _nc, t, e) => 1 + stm_size(*t) + stm_size(*e),
-        StmData::Loop { invs, cond: _, neg_cond: _, binders, body } =>
-            1 + leaf_len(*invs) + binder_len(*binders) + stm_size(*body),
+        StmData::Loop { inv_hyps, binders, binder_bounds: _, cond_name: _, cond_ann: _, neg_cond_ann: _, d_old_name: _, d_old_val: _, decrease_oblig: _, body } =>
+            // Mirrors the serializer's `stm_size_of` token count, which sums
+            // stmt heads + LeafList/BinderList `Cons` — `inv_hyps` and
+            // `binders` are BinderLists (counted); `binder_bounds` is a
+            // ParamBoundList (NOT counted, same as FnCtxData's); the scalar
+            // leaves add 0.
+            1 + binder_len(*inv_hyps) + binder_len(*binders) + stm_size(*body),
         StmData::Skip => 1,
         StmData::Seq(a, b) => 1 + stm_size(*a) + stm_size(*b),
     }
@@ -422,6 +463,89 @@ pub open spec fn goals_append(a: GoalList, b: GoalList) -> GoalList
     }
 }
 
+// ── Loop havoc + binder-prop obligations (finding-3) ────────────────
+
+// Is `x` one of a BinderList's binder ids? (The Loop havoc set membership
+// test — decides whether a pre-loop `let x := …` is dropped.) Returns `nat`
+// (1 = present, 0 = absent), NOT `bool`: the tactus Lean backend lowers a
+// `bool`-returning spec fn to a noncomputable `Prop`, on which `decide`
+// gets stuck (finding-5 / decide-checker idiom — same reason `goals_eq`
+// returns nat).
+#[verifier::structural_decreases]
+pub open spec fn binder_has_id(b: BinderList, x: u64) -> nat
+    decreases b
+{
+    match b {
+        BinderList::Nil => 0,
+        BinderList::Cons(id, _typ, t) => if id == x { 1 } else { binder_has_id(*t, x) },
+    }
+}
+
+// Loop havoc: production's `push_mod_var_frames` drops any pre-loop
+// `let x := …` (and any hyp mentioning x) for a modified local x before
+// re-quantifying x with a fresh ∀-binder. refWp mirrors the let-drop
+// exactly (the modified-var ids are visible in `binders`). It does NOT
+// drop FHyp entries — leaves are opaque ids, so refWp cannot see whether a
+// hyp mentions a modified var. That divergence only bites a fixture with a
+// pre-loop assert OVER a modified local (an honest fail-to-close, never a
+// silent pass — `goals_eq` is a structural equality). Binder frames are
+// kept (an outer loop's binders are still in scope).
+#[verifier::structural_decreases]
+pub open spec fn havoc_lets(f: FrameList, mods: BinderList) -> FrameList
+    decreases f
+{
+    match f {
+        FrameList::FNil => FrameList::FNil,
+        FrameList::FBind(id, typ, t) => FrameList::FBind(id, typ, Box::new(havoc_lets(*t, mods))),
+        FrameList::FHyp(h, t) => FrameList::FHyp(h, Box::new(havoc_lets(*t, mods))),
+        FrameList::FLet(id, v, t) =>
+            if binder_has_id(mods, id) == 1 {
+                havoc_lets(*t, mods)
+            } else {
+                FrameList::FLet(id, v, Box::new(havoc_lets(*t, mods)))
+            },
+    }
+}
+
+// close(f, ·) over each binder's PROP leaf (the 2nd slot) → one goal per
+// binder. Loop init and maintain re-close the ANNOTATED invariant
+// obligations, which live in the prop slots of `inv_hyps` (the same leaves
+// the ∀-telescope re-asserts as hypotheses).
+#[verifier::structural_decreases]
+pub open spec fn close_each_binderprop(f: FrameList, b: BinderList) -> GoalList
+    decreases b
+{
+    match b {
+        BinderList::Nil => GoalList::Nil,
+        BinderList::Cons(_name, prop, t) =>
+            GoalList::Cons(Box::new(close(f, prop)), Box::new(close_each_binderprop(f, *t))),
+    }
+}
+
+// Seed the value-param / loop-binder telescope: each binder immediately
+// followed by its own bound hyp (empirical spine `∀x, ∀(h_x_bound), …`).
+// Params → FBind; bound hyps → FBind too (finding-2: production renders
+// them as NAMED ∀-binders, so `close` folds them into `All`, not `Imp`).
+// Loop reuses this for the modified-local havoc set + their `_h_ctx`
+// bounds (finding-3). Defined ahead of `frame_after`/`wp_stm` so both the
+// use (frameAfter) and maintain (wpStm) loop telescopes can fold it.
+#[verifier::structural_decreases]
+pub open spec fn seed_params(params: BinderList, bounds: ParamBoundList) -> FrameList
+    decreases params
+{
+    match params {
+        BinderList::Nil => FrameList::FNil,
+        BinderList::Cons(id, typ, t) => match bounds {
+            ParamBoundList::Bound(hname, prop, bt) =>
+                FrameList::FBind(id, typ, Box::new(FrameList::FBind(hname, prop, Box::new(seed_params(*t, *bt))))),
+            ParamBoundList::NoBound(bt) =>
+                FrameList::FBind(id, typ, Box::new(seed_params(*t, *bt))),
+            ParamBoundList::Nil =>
+                FrameList::FBind(id, typ, Box::new(seed_params(*t, ParamBoundList::Nil))),
+        },
+    }
+}
+
 // frameAfter: the frame extension visible to whatever FOLLOWS `s`.
 // (DESIGN §2.2. `If` join frames are NOT merged at stage A: the
 // continuation sees the pre-if frame — §5.1.)
@@ -438,11 +562,15 @@ pub open spec fn frame_after(f: FrameList, s: StmData) -> FrameList
         StmData::DeadEnd(_b) => f,          // facts discarded
         StmData::Ret(_es, _rb) => f,        // control does not continue
         StmData::If(_c, _nc, _t, _e) => f,  // stage A: join frames not merged (§5.1)
-        StmData::Loop { invs, cond: _, neg_cond, binders, body: _ } =>
-            // use: frame ++ binders ++ (invs as hyps) ++ ¬cond hyp
-            frame_append(f, frame_append(binders_to_frame(*binders),
-                frame_append(hyps_of_leaves(*invs),
-                    FrameList::FHyp(neg_cond, Box::new(FrameList::FNil))))),
+        StmData::Loop { inv_hyps, binders, binder_bounds, cond_name, cond_ann: _, neg_cond_ann, d_old_name: _, d_old_val: _, decrease_oblig: _, body: _ } =>
+            // use telescope (finding-3): havoc the pre-loop lets for the
+            // modified locals, re-quantify them + their bounds as NAMED ∀,
+            // re-introduce each invariant as a NAMED ∀-hyp, then ¬cond as a
+            // NAMED ∀-hyp. No `_tactus_d_old` here (decrease is body-only).
+            frame_append(havoc_lets(f, *binders),
+                frame_append(seed_params(*binders, *binder_bounds),
+                    frame_append(binders_to_frame(*inv_hyps),
+                        FrameList::FBind(cond_name, neg_cond_ann, Box::new(FrameList::FNil))))),
         StmData::Skip => f,
         StmData::Seq(a, b) => frame_after(frame_after(f, *a), *b),
     }
@@ -482,49 +610,38 @@ pub open spec fn wp_stm(f: FrameList, s: StmData) -> GoalList
             goals_append(
                 wp_stm(frame_append(f, FrameList::FHyp(c, Box::new(FrameList::FNil))), *t),
                 wp_stm(frame_append(f, FrameList::FHyp(nc, Box::new(FrameList::FNil))), *e)),
-        StmData::Loop { invs, cond, neg_cond: _, binders, body } => {
-            // init: each inv closed under the pre-loop frame; maintain:
-            // body goals ++ each inv re-closed at body end, under
-            // frame ++ binders ++ invs-as-hyps ++ cond-hyp. (`use` is a
-            // frameAfter extension, not a goal.) NOTE: the SST Loop node
-            // currently carries `binders = Nil` (the modified-var havoc set
-            // is not populated at the snapshot — board writeup finding-3),
-            // so this maintain telescope is under-populated vs production;
-            // the decreases/termination obligation is also not synthesized
-            // here (no `decreases` leaf on the Loop node).
-            let mframe = frame_append(f, frame_append(binders_to_frame(*binders),
-                frame_append(hyps_of_leaves(*invs),
-                    FrameList::FHyp(cond, Box::new(FrameList::FNil)))));
+        StmData::Loop { inv_hyps, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann: _, d_old_name, d_old_val, decrease_oblig, body } => {
+            // Maintain telescope (finding-3): havoc pre-loop lets for the
+            // modified locals, re-quantify them + bounds as NAMED ∀, invariants
+            // as NAMED ∀-hyps, cond as a NAMED ∀-hyp, then the `_tactus_d_old`
+            // decreases snapshot as the trailing `let` (production's
+            // `walk_loop` + `split_leading_binders`: leading binders/hyps
+            // hoist to ∀, extraction STOPS at the first let so d_old wraps
+            // as a Let in the goal body).
+            let mframe = frame_append(havoc_lets(f, *binders),
+                frame_append(seed_params(*binders, *binder_bounds),
+                    frame_append(binders_to_frame(*inv_hyps),
+                        frame_append(FrameList::FBind(cond_name, cond_ann, Box::new(FrameList::FNil)),
+                            FrameList::FLet(d_old_name, d_old_val, Box::new(FrameList::FNil))))));
             let body_goals = wp_stm(mframe, *body);
             let endf = frame_after(mframe, *body);
-            let maintain_post = close_each(endf, *invs);
-            goals_append(close_each(f, *invs), goals_append(body_goals, maintain_post))
+            // Walker-synthesised body-end obligations (DESIGN §5 Q3): one per
+            // invariant re-closed, then the decrease obligation.
+            let maintain_reclose = close_each_binderprop(endf, *inv_hyps);
+            let decrease_goal =
+                GoalList::Cons(Box::new(close(endf, decrease_oblig)), Box::new(GoalList::Nil));
+            // Emission order = init ++ body ++ maintain-reclose ++ decrease
+            // (matches production's per-clause theorem order). Init closes each
+            // annotated invariant under the ACTUAL pre-loop frame `f` (the
+            // modified-local lets still hold their initial values there).
+            let init = close_each_binderprop(f, *inv_hyps);
+            goals_append(init,
+                goals_append(body_goals,
+                    goals_append(maintain_reclose, decrease_goal)))
         },
         StmData::Skip => GoalList::Nil,
         StmData::Seq(a, b) =>
             goals_append(wp_stm(f, *a), wp_stm(frame_after(f, *a), *b)),
-    }
-}
-
-// Seed the value-param telescope: each param binder immediately followed
-// by its own bound hyp (empirical spine: ∀x, ∀(h_x_bound), ∀y, ∀(h_y_bound),
-// …). Params → FBind; bound hyps → FBind too (finding-2: production renders
-// them as NAMED ∀-binders `∀ (h_x_bound : …)`, so `close` must fold them
-// into `All`, not `Imp`).
-#[verifier::structural_decreases]
-pub open spec fn seed_params(params: BinderList, bounds: ParamBoundList) -> FrameList
-    decreases params
-{
-    match params {
-        BinderList::Nil => FrameList::FNil,
-        BinderList::Cons(id, typ, t) => match bounds {
-            ParamBoundList::Bound(hname, prop, bt) =>
-                FrameList::FBind(id, typ, Box::new(FrameList::FBind(hname, prop, Box::new(seed_params(*t, *bt))))),
-            ParamBoundList::NoBound(bt) =>
-                FrameList::FBind(id, typ, Box::new(seed_params(*t, *bt))),
-            ParamBoundList::Nil =>
-                FrameList::FBind(id, typ, Box::new(seed_params(*t, ParamBoundList::Nil))),
-        },
     }
 }
 
@@ -825,6 +942,73 @@ proof fn ref_wp_ret_return_binding()
         ) == 1
 by { decide }
 
+// ── finding-3 payoff: sum_to's FULL loop bridge closes by `decide` ──
+//
+// Reconstructs `sum_to`'s ctx + SST (new Loop shape) and asserts refWp
+// reproduces ALL 12 production goals VERBATIM. Leaf ids are the production
+// ones from the fixture cert (bootstrap-fixture/out/lib/cert/sum_to.cert.lean,
+// pre-finding-3 shape — the leaf TABLE is unchanged by finding-3, only the
+// SST Loop node's field layout is). Key ids:
+//   ctx: n=0:Int=1, h_n_bound=3:prop2, h_req0=5:(n≤1000)=4, ens(bare)=6.
+//   pre-loop: Assign i(9):=0(10), Assign acc(11):=0(10).
+//   loop inv_hyps: (_h_ctx_2=34,inv0_ann=23) (_h_ctx_3=33,inv1_ann=24)
+//     (_h_ctx_4=32,inv2_ann=25) (_h_ctx_5=31,inv3_ann=26).
+//   binders i=9:Int=1, acc=11:Int=1; bounds (_h_ctx_0=37,i_bound=38)
+//     (_h_ctx_1=35,acc_bound=36). cond_name _h_ctx_6=29, cond_ann=30,
+//     neg_cond_ann=40. d_old=27:=(n-i)=28, decrease_oblig=39.
+//   body: Assert 18/17, Assume 17, Assign i:=i+1(19), Assert 21/20,
+//     Assume 20, Assign acc:=acc+i(22).
+//   Ret: annotated ens leaf 7, RetLet r=8 := acc=11.
+// The 12 goals = 4 inv-init, 2 body-assert, 4 inv-maintain, 1 decrease, 1
+// postcondition — the exact goal list of `cert_sum_to_goals`. Mutation-kill:
+// any single leaf/binder id or constructor change flips `goals_eq` to 0
+// (goal_eq compares name ids — `goal_eq_strictness`).
+proof fn ref_wp_sum_to_loop()
+    ensures
+        goals_eq(
+            ref_wp(
+                FnCtxData {
+                    typ_params: BinderList::Nil,
+                    params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)),
+                    param_bounds: ParamBoundList::Bound(3, 2, Box::new(ParamBoundList::Nil)),
+                    reqs: BinderList::Cons(5, 4, Box::new(BinderList::Nil)),
+                    enss: LeafList::Cons(6, Box::new(LeafList::Nil)),
+                },
+                StmData::Seq(Box::new(StmData::Assign(9, 10)), Box::new(
+                StmData::Seq(Box::new(StmData::Assign(11, 10)), Box::new(
+                StmData::Seq(
+                    Box::new(StmData::Loop {
+                        inv_hyps: Box::new(BinderList::Cons(34, 23, Box::new(
+                            BinderList::Cons(33, 24, Box::new(
+                            BinderList::Cons(32, 25, Box::new(
+                            BinderList::Cons(31, 26, Box::new(BinderList::Nil))))))))),
+                        binders: Box::new(BinderList::Cons(9, 1, Box::new(
+                            BinderList::Cons(11, 1, Box::new(BinderList::Nil))))),
+                        binder_bounds: Box::new(ParamBoundList::Bound(37, 38, Box::new(
+                            ParamBoundList::Bound(35, 36, Box::new(ParamBoundList::Nil))))),
+                        cond_name: 29,
+                        cond_ann: 30,
+                        neg_cond_ann: 40,
+                        d_old_name: 27,
+                        d_old_val: 28,
+                        decrease_oblig: 39,
+                        body: Box::new(
+                            StmData::Seq(Box::new(StmData::Assert(18, 17)), Box::new(
+                            StmData::Seq(Box::new(StmData::Assume(17)), Box::new(
+                            StmData::Seq(Box::new(StmData::Assign(9, 19)), Box::new(
+                            StmData::Seq(Box::new(StmData::Assert(21, 20)), Box::new(
+                            StmData::Seq(Box::new(StmData::Assume(20)), Box::new(
+                            StmData::Assign(11, 22)))))))))))),
+                    }),
+                    Box::new(StmData::Ret(Box::new(LeafList::Cons(7, Box::new(LeafList::Nil))),
+                        RetBind::RetLet(8, 11))),
+                ))))),
+            ),
+            // production goals (cert_sum_to_goals), 12 in walk order
+                GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(23)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(24)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(25)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(26)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Leaf(18)))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Leaf(21)))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(23)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(24)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(25)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(26)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(39)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 40, Box::new(GoalData::Let(8, 11, Box::new(GoalData::Leaf(7)))))))))))))))))))))))))))), Box::new(GoalList::Nil)))))))))))))))))))))))),
+        ) == 1
+by { decide }
+
 // Mutation sensitivity (DESIGN §2.4.2): goal_eq flips on a single leaf-id
 // change, a binder-id change, or a constructor (structure) change.
 proof fn goal_eq_strictness()
@@ -851,12 +1035,19 @@ by { decide }
 
 proof fn amended_shapes_kernel_compute()
     ensures
-        // Loop: 1 + |invs=1| + |binders=1| + size(Skip=1) == 4
+        // Loop: 1 + |inv_hyps=1| + |binders=1| + size(Skip=1) == 4
+        // (binder_bounds is a ParamBoundList — not counted, mirroring the
+        // serializer's `stm_size_of` token sum; the scalar leaves add 0).
         stm_size(StmData::Loop {
-            invs: Box::new(LeafList::Cons(0, Box::new(LeafList::Nil))),
-            cond: 1,
-            neg_cond: 2,
+            inv_hyps: Box::new(BinderList::Cons(0, 10, Box::new(BinderList::Nil))),
             binders: Box::new(BinderList::Cons(3, 4, Box::new(BinderList::Nil))),
+            binder_bounds: Box::new(ParamBoundList::Bound(20, 21, Box::new(ParamBoundList::Nil))),
+            cond_name: 5,
+            cond_ann: 1,
+            neg_cond_ann: 2,
+            d_old_name: 6,
+            d_old_val: 7,
+            decrease_oblig: 8,
             body: Box::new(StmData::Skip),
         }) == 4,
         // Call: 1 + |reqs=1| + |enss=0| == 2
