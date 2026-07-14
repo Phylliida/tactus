@@ -3,7 +3,7 @@ title: "W7c — serializer transcriptions for the def-body constructors (Ite/Mat
 status: in_progress
 claimed_by: opus-w7c
 created: 2026-07-14T22:10:00Z
-updated: 2026-07-14T22:10:00Z
+updated: 2026-07-15T00:30:00Z
 ---
 
 ## Description
@@ -171,9 +171,70 @@ emission + bridge `def_eq`/`dt_eq`), W7e (mutation-kill).
     to nested `If`/ctor-tests? — determines whether `RawArmList` transcription
     is even reachable). Datatype/def-header is a separate input surface (W7d-ward).
 
+- (2026-07-15, opus-w7c-match) **Production-side `Match` arm LANDED — the
+  fixture-critical constructor, both sides now transcribe `match`; lib suite
+  345→347/0, verdict-neutral.** This pairs with the reference `raw_vir_exp`
+  `MatchR` arm (bootstrap-29, already landed), closing the "big one" the earlier
+  Progress flagged as gated on the VIR-match-shape investigation (now resolved by
+  the surface-fork finding).
+  - **`lexpr_to_exprdata` gained `ExprNode::Match { scrutinee, arms }` →
+    `ExprData::Match(scrut, ArmList)`** (`sst_serialize.rs`, after the `If` arms,
+    before the census fallback). Scrutinee recurses; arms fold right-to-left into
+    the inlined `ArmList::Cons(ctor_id, binder_ids, body, tail)` (the W7b inlined
+    list, not the named `MatchArm`). Body transcribed VERBATIM — any branch cast
+    is already an `Int.toNat` App the `Cast` arm handles, matching the reference
+    `render_arms`' per-arm coercion (coercion lives on the ref side only).
+  - **Two new helpers** = production twins of the reference
+    `pattern_ctor_binds`/`pattern_binder_id`: `lpattern_ctor_binds(&LPattern)`
+    and `lpattern_binder_id(&LPattern)`. §7 Q1 id-agreement holds BY
+    CONSTRUCTION: (a) ctor id — production's `pattern_to_ast` built
+    `Pattern::Ctor { name }` from the SHARED `ctor_pattern_name(dt, variant)`
+    helper (the same helper the reference interns), so `text_leaf(name)` matches;
+    (b) binder ids — production's `Pattern::Var(LeanName)` was built via
+    `LeanName::from_var_ident(&binding.name)`, exactly what the reference
+    `binder_id` interns, and both read the arg/field list in the same
+    `.iter()` order (no sort either side). Non-ctor arm heads fail loud
+    (`ed-arm-pat`); non-Var field patterns fail loud (`ed-field-pat`) — lockstep
+    with the reference's `rawvir-arm-pat`/`rawvir-field-pat`.
+  - **Tests (2 new):** `lexpr_to_exprdata_match_tree_head` pins the full
+    `tree_head`-shaped output (`match t { Leaf v => v, Node _l _r => 0 }`),
+    including the reversed-fold interning order (scrut=0, Node ctor=1, `_r`=2/
+    `_l`=3, Leaf ctor=4, `v`=5, body reuses `v`=5) and the binder-list arg-order
+    preservation. `lexpr_to_exprdata_match_nonctor_arm_fails` pins the
+    `ed-arm-pat` fail-loud. (Unlike the reference Match arm — untestable in
+    isolation because a hand-built ctor `Path` renders differently under
+    `lean_name` — the production input is an ALREADY-rendered `Pattern::Ctor {
+    name: String }`, so a hand-built prod test is honest: it pins the
+    transcription shape, not the naming. Cross-side `def_eq` agreement is still
+    the W7d e2e bridge's job.)
+  - **Verdict-neutral — confirmed, no rebuild.** `lexpr_to_exprdata` enters the
+    live emit path only via `goal_data` (`sst_serialize.rs:1952`) on obligation-
+    GOAL leaves; obligations are SST-surface where `Match` is desugared to
+    `If`-chains, so a goal leaf `LExpr` is NEVER `ExprNode::Match` → the new arm
+    is unreachable today (same argument the `Ite` prod arm used). The full lib
+    suite (incl. `golden_add_capped_cert` + the other goldens) stays byte-
+    identical at 347/0. The arm activates only when W7d wires the def-body entry
+    point.
+  - **NEXT:** Forall/Exists (`ExprNode::Forall/Exists` → `ExprData::Forall/
+    Exists`; needs the binder-type recognizer — prod `Binder.ty` is a rendered
+    type-Expr, must map back to the SAME `TypData` the reference emits from the
+    VIR `Typ`, per the earlier Progress note) + multi-arg AppN (+ the W7b-deferred
+    per-arg coercion) + datatype (`RawDt`/`DtData`) + def-header. All are
+    tgt-slice-only (the fixture forces none), so they can land incrementally as
+    W7d/tgt needs them; the fixture-covering set (leaf/Ite/Match) is now COMPLETE
+    on both sides.
+
 ## Writeup
 
-_partial — `Ite` constructor landed on both transcriber sides (verdict-neutral,
+_partial — `Ite` + `Match` constructors landed on both transcriber sides
+(verdict-neutral, tests green). The fixture-covering body set (leaf/Ite/Match) is
+complete on both sides as of 2026-07-15. Remaining: Forall/Exists, multi-arg
+AppN (+ deferred per-arg coercion), datatype + def-header transcription. See
+Progress for the per-constructor open questions and the verdict-neutrality proof
+method (fixture source analysis: confirm no obligation-position `ExpX::<new-node>`
+before landing each shared `raw_exp` arm)._
+
+_(superseded) partial — `Ite` constructor landed on both transcriber sides (verdict-neutral,
 tests green). Remaining: Match, Forall/Exists, multi-arg AppN (+ deferred
 per-arg coercion), datatype + def-header transcription. See Progress for the
 per-constructor open questions and the verdict-neutrality proof method (fixture

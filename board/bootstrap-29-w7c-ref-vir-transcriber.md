@@ -150,6 +150,17 @@ they must match this side's shapes) and W7d (def emission + bridge).
     inside a match arm), add a fixture caller or use the tgt slice — it's pruned
     today.
 
+- (2026-07-15, opus-w7c-match) **Hand-off item (1) SATISFIED for `Match`** — the
+  production `lexpr_to_exprdata` Match arm + `lpattern_ctor_binds`/
+  `lpattern_binder_id` twins landed in `bootstrap-28` (lib suite 347/0,
+  verdict-neutral). They co-design with THIS side's `MatchR`/`pattern_ctor_binds`
+  exactly as the §7 Q1 anchor prescribed: shared `ctor_pattern_name` for the ctor
+  id, `LeanName::from_var_ident` for the binder ids, same `.iter()` order. So the
+  fixture-covering body set (leaf/Ite/Match) is now complete on BOTH transcriber
+  sides. Remaining hand-off items (2) W7d def-body entry point + e2e `def_eq`
+  bridge — the Match arm's REAL cross-side validation — (3) def-header/datatype,
+  (4) `sum_tree` Box-deref-in-arm fixture caller, are unchanged.
+
 ## Writeup
 _partial (reference transcriber core landed). The def-body REFERENCE transcriber
 `raw_vir_exp` (+ `raw_vir_place`/`pattern_ctor_binds`/`pattern_binder_id`) is
