@@ -141,7 +141,16 @@ pub enum StmData {
     /// ensures under the frame extended by the return binding.
     Ret(Box<LeafList>, RetBind),
     /// StmX::If — (cond leaf, ¬cond leaf, then, else); absent else = Skip.
-    /// The `neg_cond` leaf is the RENDERED else-branch hypothesis text.
+    /// Both leaves are ANNOTATED (span_mark'd), byte-matching production's
+    /// `Wp::Branch`: the then-branch hyp is `cond_marked =
+    /// span_mark(loc, Hypothesis(BranchCondition), cond)`, the else-branch
+    /// hyp is `not(cond_marked)` (`sst_to_lean::walk_obligations`). The
+    /// serializer mints them via `oblig_leaf`/`neg_oblig_leaf` (the
+    /// `AssertKind` never reaches the pp, so an `Obligation(Plain)` mark
+    /// interns to the SAME text as production's `BranchCondition` mark —
+    /// bootstrap-17). The `cond` leaf is the then-branch hyp; `¬cond` is
+    /// BOTH the else-branch hyp AND the fall-through continuation hyp when
+    /// the then-branch DIVERGES (`frame_after`, DESIGN §2.4.1).
     If(u64, u64, Box<StmData>, Box<StmData>),
     /// StmX::Loop — the maintain/use telescopes production builds around a
     /// loop (finding-3). Production havocs the modified locals, re-quantifies
@@ -676,9 +685,49 @@ pub open spec fn loop_use_frame(
     }
 }
 
+// Is `s` the empty block? (`is_skip` guards the If fall-through frame — a
+// diverging then-branch only implies `¬cond` downstream when the else is
+// trivial; a non-trivial else needs the two-way join, which stage A does
+// not model — DESIGN §2.4.1.) `nat` return (1/0), not `bool`, for the
+// decide idiom (finding-5).
+pub open spec fn is_skip(s: StmData) -> nat {
+    match s {
+        StmData::Skip => 1,
+        _ => 0,
+    }
+}
+
+// Does control through `s` UNCONDITIONALLY diverge (return, or a DeadEnd
+// `false` context) before reaching its end? Used by `frame_after`'s If
+// arm: when the then-branch diverges and the else is Skip, production only
+// reaches the post-if continuation via the else path, so the continuation
+// is visited under `¬cond` (production clones `after` into both branches,
+// but the diverging then-branch's clone yields no goals — §2.4.1). A `Seq`
+// diverges if EITHER half does (the second is dead code once the first
+// diverges); an `If` diverges only if BOTH branches do. Everything else
+// (Assert/Assume/Assign/Call/Loop/Skip) falls through. `nat` (1/0) for
+// decide. SOUND either way: a too-weak `diverges` (or a non-Skip else)
+// omits the `¬cond` frame and the continuation goals honest-fail; a
+// too-strong one adds a `¬cond` production never emitted and they ALSO
+// honest-fail (structural `goal_eq`). Never silent-pass.
+#[verifier::structural_decreases]
+pub open spec fn diverges(s: StmData) -> nat
+    decreases s
+{
+    match s {
+        StmData::Ret(_es, _rb) => 1,
+        StmData::DeadEnd(_b) => 1,           // `false` context: control does not continue
+        StmData::Seq(a, b) =>
+            if diverges(*a) == 1 || diverges(*b) == 1 { 1 } else { 0 },
+        StmData::If(_c, _nc, t, e) =>
+            if diverges(*t) == 1 && diverges(*e) == 1 { 1 } else { 0 },
+        _ => 0,
+    }
+}
+
 // frameAfter: the frame extension visible to whatever FOLLOWS `s`.
-// (DESIGN §2.2. `If` join frames are NOT merged at stage A: the
-// continuation sees the pre-if frame — §5.1.)
+// (DESIGN §2.2. `If` join frames are NOT merged at stage A — but a
+// DIVERGING then-branch with a Skip else does forward `¬cond`, §2.4.1.)
 #[verifier::structural_decreases]
 pub open spec fn frame_after(f: FrameList, s: StmData) -> FrameList
     decreases s
@@ -691,7 +740,18 @@ pub open spec fn frame_after(f: FrameList, s: StmData) -> FrameList
             frame_append(f, FrameList::FBind(dest, dest_typ, Box::new(hyps_of_leaves(*enss)))),
         StmData::DeadEnd(_b) => f,          // facts discarded
         StmData::Ret(_es, _rb) => f,        // control does not continue
-        StmData::If(_c, _nc, _t, _e) => f,  // stage A: join frames not merged (§5.1)
+        // If — join frames not merged at stage A (§5.1), EXCEPT the
+        // fall-through case: `if C { <diverges> } rest` reaches `rest` only
+        // when C was false, so the continuation sees `¬C` (the annotated
+        // `nc` leaf — production's `not(cond_marked)`, §2.4.1). Guarded by
+        // `diverges(then) && is_skip(else)`; the general two-way join stays
+        // `f` (honest-fail, documented caveat).
+        StmData::If(_c, nc, t, e) =>
+            if diverges(*t) == 1 && is_skip(*e) == 1 {
+                frame_append(f, FrameList::FHyp(nc, Box::new(FrameList::FNil)))
+            } else {
+                f
+            },
         StmData::Loop { inv_hyps, binders, binder_bounds, cond_name, cond_ann: _, neg_cond_ann, d_old_name: _, d_old_val: _, decrease_oblig: _, body: _ } =>
             // use telescope (finding-3 + bootstrap-16): havoc the pre-loop
             // lets for the modified locals, re-quantify them, re-introduce
@@ -1212,6 +1272,69 @@ proof fn ref_wp_nested_loop_nonleading()
                 GoalData::Imp(25, Box::new(GoalData::Imp(26, Box::new(
                 GoalData::Imp(27, Box::new(GoalData::Imp(30, Box::new(
                 GoalData::Leaf(43))))))))))))))))),
+        ) == 1
+by { decide }
+
+// ── bootstrap-17: If-with-early-return fall-through (§2.4.1) ────────
+//
+// `if C { return } rest` — the then-branch DIVERGES, so production reaches
+// `rest` only via the else path and visits the continuation under `¬C`
+// (production clones `after` into both branches; the diverging then-clone
+// yields no goals). refWp reproduces this with `frame_after(f, If) = f ++
+// FHyp(nc)` guarded by `diverges(then) && is_skip(else)`, and the
+// then-branch hyp is the annotated cond `c` (byte-matching production's
+// `Wp::Branch` `cond_marked` — the serializer mints `c`/`nc` via
+// `oblig_leaf`/`neg_oblig_leaf`). Verified end-to-end against the real
+// find_square cert: with this fix the FULL 17-goal find_square bridge
+// closes by `decide` (`goals_eq (ref_wp ctx sst) goals = 1`), including the
+// previously-excluded goals 6–11.
+//
+// This test isolates the mechanism on a minimal diverging-then If and its
+// NON-diverging contrast, so a regression flips `goals_eq`:
+//   `if C { return 9 } ; assert P`  under a pre-if hyp `[34]`
+// → then-goal `[34]→[36:C]→ let(8:=9) Leaf 7` (the Ret ens, under annotated
+//   cond 36) THEN continuation `[34]→[37:¬C]→ Leaf 40` (the assert, under
+//   the forwarded ¬cond 37). The CONTRAST (then = Skip, non-diverging)
+//   forwards NO ¬cond: just `[34]→ Leaf 40`. Mutation-kill: dropping the
+//   fall-through `FHyp(nc)` (pre-b17 `frame_after(f,If)=f`) removes `Imp 37`
+//   from the diverging continuation; forwarding it unconditionally adds a
+//   spurious `Imp 37` to the contrast. Either flips a `goals_eq`.
+proof fn ref_wp_if_fallthrough_divergence()
+    ensures
+        // DIVERGING then (`Ret` inside) + Skip else ⇒ continuation sees ¬cond.
+        goals_eq(
+            wp_stm(
+                FrameList::FHyp(34, Box::new(FrameList::FNil)),
+                StmData::Seq(
+                    Box::new(StmData::If(36, 37,
+                        Box::new(StmData::Seq(
+                            Box::new(StmData::Ret(
+                                Box::new(LeafList::Cons(7, Box::new(LeafList::Nil))),
+                                RetBind::RetLet(8, 9))),
+                            Box::new(StmData::Skip))),
+                        Box::new(StmData::Skip))),
+                    Box::new(StmData::Assert(40, 39)))),
+            GoalList::Cons(
+                Box::new(GoalData::Imp(34, Box::new(GoalData::Imp(36,
+                    Box::new(GoalData::Let(8, 9, Box::new(GoalData::Leaf(7)))))))),
+                Box::new(GoalList::Cons(
+                    Box::new(GoalData::Imp(34, Box::new(GoalData::Imp(37,
+                        Box::new(GoalData::Leaf(40)))))),
+                    Box::new(GoalList::Nil)))),
+        ) == 1,
+        // NON-diverging then (Skip) + Skip else ⇒ NO ¬cond forwarded: the
+        // continuation assert closes under the bare pre-if frame `[34]`.
+        goals_eq(
+            wp_stm(
+                FrameList::FHyp(34, Box::new(FrameList::FNil)),
+                StmData::Seq(
+                    Box::new(StmData::If(36, 37,
+                        Box::new(StmData::Skip),
+                        Box::new(StmData::Skip))),
+                    Box::new(StmData::Assert(40, 39)))),
+            GoalList::Cons(
+                Box::new(GoalData::Imp(34, Box::new(GoalData::Leaf(40)))),
+                Box::new(GoalList::Nil)),
         ) == 1
 by { decide }
 
