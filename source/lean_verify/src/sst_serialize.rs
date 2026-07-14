@@ -187,8 +187,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use vir::ast::{
-    ArithOp, BinaryOp, CallTarget, Constant, Expr as VirExpr, ExprX, InequalityOp, IntRange, KrateX,
-    PatternX, Place, PlaceX, Typ, TypDecoration, TypX, UnaryOp, UnaryOpr, VarIdent,
+    ArithOp, BinaryOp, CallTarget, Constant, Dt, Expr as VirExpr, ExprX, InequalityOp, IntRange,
+    KrateX, PatternX, Place, PlaceX, Typ, TypDecoration, TypX, UnaryOp, UnaryOpr, VarIdent,
 };
 use vir::sst::{BndX, CallFun, Exp, ExpX, FuncCheckSst, FunctionSst, LoopInv, Stm, StmX};
 
@@ -197,7 +197,7 @@ use crate::lean_ast::{
     Pattern as LPattern, Theorem, UnOp as LUnOp,
 };
 use crate::lean_pp::pp_expr;
-use crate::to_lean_type::{param_binder_typ, typ_to_expr};
+use crate::to_lean_type::{lean_name, param_binder_typ, sanitize, short_name, typ_to_expr};
 
 /// The emitted `tactus-core` namespace. The crate compiled from
 /// `tactus-core/lib.rs` has crate name `lib`, so its inductives emit as
@@ -1196,6 +1196,114 @@ impl<'a> Serializer<'a> {
         ))
     }
 
+    // ── W7c (bootstrap-31): VIR datatype decl → RawDt (the datatype reference) ─
+    //
+    // The datatype `inductive` decls the def bodies (and obligation goals) are
+    // stated over — trust-inventory row 4's other half. A datatype has no body to
+    // lower, so this transcription's teeth are the VIR-vs-LExpr diversity: the
+    // reference reads the VIR `DatatypeX` (name / variant names / positional field
+    // TYPES) while production `ldt_to_dtdata` reads the already-rendered
+    // `lean_ast::Datatype`; a wrong-transcribed ctor name or field type makes
+    // `dt_eq` (tactus-core) `decide` to 0.
+    //
+    // THE BOX SUBTLETY (W7a §7 Q4, the one real technical wrinkle): a datatype
+    // FIELD keeps its `Box` — the recursion in `Node(Box<Tree>, Box<Tree>)` goes
+    // THROUGH the box, so `typ_data`'s SMT-wrapper peel (which drops Box for a
+    // value-position expression type) is WRONG here. Production agrees: it renders
+    // the field via `typ_to_expr`, which maps `Box<T>` to `Tactus.Box T` (NOT
+    // peeled). So the field-type transcriber `dt_field_typ_data` maps
+    // `Decorate(Box) → TyBox(pointee id)` — distinct from `TyRef` (Box≠Ref;
+    // conflating them would mask a field-kind bug) — and the production
+    // `ldt_field_typdata` recognizes `Tactus.Box T` back to the SAME `TyBox` id.
+    //
+    // Id agreement with production `ldt_to_dtdata`, all by construction:
+    //   - datatype name — `lean_name(path)`, = production's `Datatype.name`.
+    //   - ctor name — `sanitize(&v.name)`, EXACTLY production's
+    //     `Variant { name: sanitize(&v.name) }` (to_lean_fn's datatype builder).
+    //   - field types — positional (no accessor names, W7a §7 Q4), read in the
+    //     SAME `.iter()` order (no sort either side); `TyBox` pointee /
+    //     `TyNamed`/`TyInt` ids reuse `typ_leaf`'s interning off the SHARED
+    //     `self.leaves` table, which production's `typ_to_expr`-rendered field
+    //     `Expr` re-interns to the same id (the `ltyp_to_typdata` invariant).
+    //
+    // GATES (fail loud, census `rawvir-dt-<k>`, tgt-slice deferrals):
+    //   - polymorphic (`typ_params` non-empty) — like `raw_vir_def`, production's
+    //     `(A : Type)` params have no `TypData` mirror; fixture `Tree` is monomorphic.
+    //   - single-variant struct (variant name == type short name) — production
+    //     emits a `structure` (ctor = type name, no variant list), a genuinely
+    //     different transcription; `Tree` is a multi-variant `inductive`.
+    //   - tuple datatype (`Dt::Tuple`) — synthetic, no user decl to certify.
+    // The REFERENCE is the gate: W7d bridges only when both sides succeed.
+    //
+    // `#[allow(dead_code)]` until W7d wires the datatype entry point —
+    // verdict-neutral by construction (a NEW fn, never on the emit path; NO
+    // `tactus-core` edit — `RawDt`/`DtData`/`CtorList`/`TypList` all landed in W7b).
+
+    /// A datatype FIELD type → `lib.TypData` text, KEEPING the `Box` (unlike
+    /// `typ_data`, which peels it as an SMT wrapper). `Box<T> → TyBox(pointee)`;
+    /// everything else delegates to `typ_data` (Int/Bool/Nat/named/`&T`).
+    /// KNOWN GAP (documented, not unsound): a non-Box owned wrapper field
+    /// (`Rc<T>`/`Arc<T>`) would delegate to `typ_data`, which PEELS it to the
+    /// pointee while production keeps `Tactus.Rc T` — a peel-vs-keep mismatch that
+    /// SPURIOUSLY fails the bridge (uncertifiable, never wrongly passes). None
+    /// appear in the fixture (`Tree` fields are `u64` / `Box<Tree>`).
+    #[allow(dead_code)]
+    fn dt_field_typ_data(&mut self, typ: &Typ) -> Sr<String> {
+        match &**typ {
+            TypX::Decorate(TypDecoration::Box, _, inner) => {
+                let id = self.typ_leaf(inner);
+                Ok(format!("({}.TypData.TyBox {})", NS, id))
+            }
+            _ => self.typ_data(typ),
+        }
+    }
+
+    /// VIR datatype decl → `lib.RawDt` text. Fails loud (`rawvir-dt-<k>`) on
+    /// polymorphic / single-variant-struct / tuple datatypes.
+    #[allow(dead_code)]
+    fn raw_vir_dt(
+        &mut self,
+        name: &Dt,
+        typ_params: &vir::ast::TypPositives,
+        variants: &vir::ast::Variants,
+    ) -> Sr<String> {
+        if !typ_params.is_empty() {
+            return Err("rawvir-dt-poly".to_string());
+        }
+        let path = match name {
+            Dt::Path(p) => p,
+            Dt::Tuple(_) => return Err("rawvir-dt-tuple".to_string()),
+        };
+        // Production emits a single-variant struct whose variant name == the type
+        // short name as a `structure` (ctor = type name, no variant list) — a
+        // different transcription. Fail loud; `Tree` is multi-variant.
+        if variants.len() == 1 && variants[0].name.as_str() == short_name(path) {
+            return Err("rawvir-dt-struct".to_string());
+        }
+        // Intern FORWARD (name, then per-variant ctor names + field-type ids in
+        // declaration order) so the ids are stable + predictable; format both the
+        // `CtorList` and each `TypList` reversed (the boxed self-recursive tails).
+        let name_id = self.text_leaf(&lean_name(path));
+        let mut ctors_txt: Vec<(u64, String)> = Vec::new();
+        for v in variants.iter() {
+            let ctor_id = self.text_leaf(&sanitize(&v.name));
+            let mut flds_txt: Vec<String> = Vec::new();
+            for f in v.fields.iter() {
+                flds_txt.push(self.dt_field_typ_data(&f.a.0)?);
+            }
+            let mut tylist = format!("{}.TypList.Nil", NS);
+            for ft in flds_txt.iter().rev() {
+                tylist = format!("{}.TypList.Cons {} {}", NS, paren(ft), box_(&tylist));
+            }
+            ctors_txt.push((ctor_id, tylist));
+        }
+        let mut clist = format!("{}.CtorList.Nil", NS);
+        for (cid, tylist) in ctors_txt.iter().rev() {
+            clist = format!("{}.CtorList.Cons {} {} {}", NS, cid, paren(tylist), box_(&clist));
+        }
+        Ok(format!("({}.RawDt.mk {} {})", NS, name_id, paren(&clist)))
+    }
+
     // ── W6c: production `lean_ast::Expr` → ExprData (the prod-side input) ─
     // The BORING 1:1 side (DESIGN-W6-stageB.md §4.2 / bootstrap-22). The
     // production renderer (`to_lean_sst_expr`) has ALREADY materialized every
@@ -1609,6 +1717,75 @@ impl<'a> Serializer<'a> {
             paren(&ret_ty),
             paren(&body)
         ))
+    }
+
+    // ── W7c (bootstrap-31): production `lean_ast::Datatype` → DtData (prod dt) ─
+    //
+    // The boring 1:1 datatype transcription paired with the VIR-side `raw_vir_dt`.
+    // Name / ctor-name / field-type ids agree with the reference BY CONSTRUCTION:
+    // `Datatype.name` = `lean_name(path)` = the reference `raw_vir_dt` name string;
+    // each `Variant.name` was built as `sanitize(&v.name)` (to_lean_fn's datatype
+    // builder) = the reference `sanitize(&v.name)`; each `Field.ty` is
+    // `typ_to_expr(vir_field_typ)`, which `ldt_field_typdata` inverts to the same
+    // `TypData` the reference `dt_field_typ_data` emits — INCLUDING the `Box`:
+    // `typ_to_expr` renders `Box<T>` as `Tactus.Box T` (kept, not peeled), which
+    // `ldt_field_typdata` recognizes back to `TyBox(pointee)`.
+    //
+    // Only the multi-variant `Inductive`/`IndexedInductive` kinds are handled
+    // (they share the ctor-list shape); a single-variant `Structure` fails loud
+    // (`ed-dt-struct`) — the reference gates it out symmetrically. `#[allow(dead_code)]`
+    // until W7d wires the datatype entry point (verdict-neutral).
+
+    /// A datatype FIELD type `Expr` → `lib.TypData` text, recognizing the KEPT
+    /// `Box`: `Tactus.Box T → TyBox(intern(pp(T)))`, matching the reference
+    /// `dt_field_typ_data`'s `typ_leaf(inner)`. Everything else delegates to the
+    /// shared header recognizer `ltyp_to_typdata` (Int/Nat/named/`Tactus.Ref`).
+    #[allow(dead_code)]
+    fn ldt_field_typdata(&mut self, ty: &LExpr) -> Sr<String> {
+        if let ExprNode::App { head, args } = &ty.node {
+            if let ExprNode::Var(h) = &head.node {
+                if h.as_str() == "Tactus.Box" && args.len() == 1 {
+                    let id = self.leaves.intern(pp_expr(&args[0]));
+                    return Ok(format!("({}.TypData.TyBox {})", NS, id));
+                }
+            }
+        }
+        self.ltyp_to_typdata(ty)
+    }
+
+    /// `lean_ast::Datatype` (an `inductive`) → `lib.DtData` text. Fails loud
+    /// (`ed-dt-<k>`) on a single-variant `Structure` / an uncovered field type.
+    #[allow(dead_code)]
+    fn ldt_to_dtdata(&mut self, dt: &crate::lean_ast::Datatype) -> Sr<String> {
+        use crate::lean_ast::DatatypeKind;
+        let variants = match &dt.kind {
+            DatatypeKind::Inductive { variants } | DatatypeKind::IndexedInductive { variants } => {
+                variants
+            }
+            DatatypeKind::Structure { .. } => return Err("ed-dt-struct".to_string()),
+        };
+        // Intern FORWARD (name, then per-variant ctor names + field-type ids in
+        // declaration order) to match the reference `raw_vir_dt`; format the
+        // `CtorList` / `TypList` reversed.
+        let name_id = self.text_leaf(&dt.name);
+        let mut ctors_txt: Vec<(u64, String)> = Vec::new();
+        for v in variants.iter() {
+            let ctor_id = self.text_leaf(&v.name);
+            let mut flds_txt: Vec<String> = Vec::new();
+            for f in v.fields.iter() {
+                flds_txt.push(self.ldt_field_typdata(&f.ty)?);
+            }
+            let mut tylist = format!("{}.TypList.Nil", NS);
+            for ft in flds_txt.iter().rev() {
+                tylist = format!("{}.TypList.Cons {} {}", NS, paren(ft), box_(&tylist));
+            }
+            ctors_txt.push((ctor_id, tylist));
+        }
+        let mut clist = format!("{}.CtorList.Nil", NS);
+        for (cid, tylist) in ctors_txt.iter().rev() {
+            clist = format!("{}.CtorList.Cons {} {} {}", NS, cid, paren(tylist), box_(&clist));
+        }
+        Ok(format!("({}.DtData.mk {} {})", NS, name_id, paren(&clist)))
     }
 
     // ── Statement walk (StmData literal) ────────────────────────────

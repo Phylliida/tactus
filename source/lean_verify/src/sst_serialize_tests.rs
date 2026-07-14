@@ -999,6 +999,203 @@ fn ldef_to_defdata_tri_header() {
     );
 }
 
+// ── W7c (bootstrap-31): datatype transcription (RawDt / DtData) ──
+//
+// The `Tree` fixture datatype (`enum Tree { Leaf(u64), Node(Box<Tree>,
+// Box<Tree>) }`, emitted `inductive lib.Tree | Leaf (Int) | Node (Tactus.Box
+// lib.Tree) (Tactus.Box lib.Tree)`). The load-bearing subtlety is the `Box`:
+// a datatype FIELD keeps it (`TyBox`), unlike a value-position expr type where
+// the cast layer peels it. Both sides map `Box<Tree>` → `TyBox(<lib.Tree id>)`,
+// and since the datatype name interns `lib.Tree` first, the `TyBox` pointee
+// reuses that id (0) — a nice cross-side coincidence the two independent
+// Serializers both produce (real cross-side fidelity is the W7d e2e bridge).
+
+/// A crate-local datatype `Path` `lib::<name>` (the `mk_fun` analog for a Dt);
+/// `lean_name` of it is the interned datatype name.
+fn mk_dt_path(name: &str) -> vir::ast::Path {
+    use vir::ast::PathX;
+    std::sync::Arc::new(PathX {
+        krate: None,
+        segments: std::sync::Arc::new(vec![
+            std::sync::Arc::new("lib".to_string()),
+            std::sync::Arc::new(name.to_string()),
+        ]),
+    })
+}
+
+/// A nullary `TypX::Datatype` at the given path — the self-reference a recursive
+/// `Box<Tree>` field wraps. Its `typ_to_expr` renders to `lean_name(path)`, so
+/// `typ_leaf` interns the SAME string as the datatype name.
+fn tdatatype(path: &vir::ast::Path) -> Typ {
+    std::sync::Arc::new(TypX::Datatype(
+        Dt::Path(path.clone()),
+        std::sync::Arc::new(vec![]),
+        std::sync::Arc::new(vec![]),
+    ))
+}
+
+/// A `Box<T>` decorated (datatype-field) type.
+fn tbox(inner: Typ) -> Typ {
+    std::sync::Arc::new(TypX::Decorate(TypDecoration::Box, None, inner))
+}
+
+/// A `u64` type — renders `TyInt` (the `Leaf(u64)` field's type).
+fn tu64() -> Typ {
+    std::sync::Arc::new(TypX::Int(IntRange::U(64)))
+}
+
+/// A VIR `Variant` from a name + positional field types (field names are
+/// positional `"0"`, `"1"`, … — unread by the transcriber, which keeps only the
+/// TYPES; W7a §7 Q4).
+fn mk_variant(name: &str, fields: Vec<Typ>) -> vir::ast::Variant {
+    use vir::ast::{CtorPrintStyle, Variant, Visibility};
+    let flds: vir::ast::Fields = std::sync::Arc::new(
+        fields
+            .into_iter()
+            .enumerate()
+            .map(|(i, typ)| {
+                std::sync::Arc::new(air::ast::BinderX {
+                    name: std::sync::Arc::new(format!("{}", i)),
+                    a: (typ, vir::ast::Mode::Spec, Visibility { restricted_to: None }),
+                })
+            })
+            .collect(),
+    );
+    Variant { name: std::sync::Arc::new(name.to_string()), fields: flds, ctor_style: CtorPrintStyle::Parens }
+}
+
+/// The reference datatype transcriber on the `Tree` shape. Interning follows the
+/// forward walk: name `lib.Tree`=0, then ctor `Leaf`=1, then ctor `Node`=2; the
+/// `Box<Tree>` field's `TyBox` pointee reuses the `lib.Tree` id (0). The
+/// `CtorList` and each `TypList` are folded reversed (boxed self-recursive
+/// tails). The `Box` is KEPT (`TyBox 0`), NOT peeled to `TyNamed` — the W7a §7 Q4
+/// subtlety this test exists to pin.
+#[test]
+fn raw_vir_dt_tree() {
+    let mut s = Serializer::default();
+    let path = mk_dt_path("Tree");
+    let empty_tps: vir::ast::TypPositives = std::sync::Arc::new(vec![]);
+    let variants: vir::ast::Variants = std::sync::Arc::new(vec![
+        mk_variant("Leaf", vec![tu64()]),
+        mk_variant("Node", vec![tbox(tdatatype(&path)), tbox(tdatatype(&path))]),
+    ]);
+    assert_eq!(
+        s.raw_vir_dt(&Dt::Path(path), &empty_tps, &variants).unwrap(),
+        format!(
+            "({NS}.RawDt.mk 0 \
+               ({NS}.CtorList.Cons 1 \
+                  ({NS}.TypList.Cons {NS}.TypData.TyInt (Tactus.Box.mk {NS}.TypList.Nil)) \
+                  (Tactus.Box.mk \
+                     ({NS}.CtorList.Cons 2 \
+                        ({NS}.TypList.Cons ({NS}.TypData.TyBox 0) \
+                           (Tactus.Box.mk ({NS}.TypList.Cons ({NS}.TypData.TyBox 0) \
+                              (Tactus.Box.mk {NS}.TypList.Nil)))) \
+                        (Tactus.Box.mk {NS}.CtorList.Nil)))))"
+        )
+    );
+}
+
+/// A polymorphic datatype (non-empty `typ_params`) fails loud — like
+/// `raw_vir_def`, production's `(A : Type)` params have no `TypData` mirror.
+#[test]
+fn raw_vir_dt_poly_fails() {
+    let mut s = Serializer::default();
+    let tps: vir::ast::TypPositives = std::sync::Arc::new(vec![(
+        std::sync::Arc::new("A".to_string()),
+        vir::ast::AcceptRecursiveType::RejectInGround,
+    )]);
+    let variants: vir::ast::Variants =
+        std::sync::Arc::new(vec![mk_variant("Leaf", vec![tu64()])]);
+    assert_eq!(
+        s.raw_vir_dt(&Dt::Path(mk_dt_path("Poly")), &tps, &variants).unwrap_err(),
+        "rawvir-dt-poly"
+    );
+}
+
+/// A single-variant struct (variant name == the type short name) fails loud —
+/// production emits a `structure` (ctor = type name, no variant list), a
+/// different transcription. `Tree` (multi-variant) certifies; `Point` (a
+/// one-variant struct) is gated here.
+#[test]
+fn raw_vir_dt_struct_fails() {
+    let mut s = Serializer::default();
+    let variants: vir::ast::Variants =
+        std::sync::Arc::new(vec![mk_variant("Point", vec![tint(), tint()])]);
+    let empty_tps: vir::ast::TypPositives = std::sync::Arc::new(vec![]);
+    assert_eq!(
+        s.raw_vir_dt(&Dt::Path(mk_dt_path("Point")), &empty_tps, &variants).unwrap_err(),
+        "rawvir-dt-struct"
+    );
+}
+
+/// The production datatype transcriber on the SAME `Tree` shape — a
+/// `lean_ast::Datatype` (`Inductive`) with the already-rendered field types
+/// (`Int`, `Tactus.Box lib.Tree`). Emits the `DtData` twin of `raw_vir_dt_tree`
+/// (name=0, Leaf=1 [TyInt], Node=2 [TyBox 0, TyBox 0]); `ldt_field_typdata`
+/// recognizes `Tactus.Box lib.Tree` back to `TyBox` with the same pointee id.
+#[test]
+fn ldt_to_dtdata_tree() {
+    use crate::lean_ast::{Datatype, DatatypeKind, Field, Variant};
+    let mut s = Serializer::default();
+    let box_tree = LExpr::new(ExprNode::App {
+        head: Box::new(LExpr::var_lit("Tactus.Box")),
+        args: vec![LExpr::var_lit("lib.Tree")],
+    });
+    let dt = Datatype {
+        name: "lib.Tree".to_string(),
+        self_name: "Tree".to_string(),
+        typ_params: vec![],
+        kind: DatatypeKind::Inductive {
+            variants: vec![
+                Variant {
+                    name: "Leaf".to_string(),
+                    fields: vec![Field { name: "val0".to_string(), ty: LExpr::var_lit("Int") }],
+                },
+                Variant {
+                    name: "Node".to_string(),
+                    fields: vec![
+                        Field { name: "val0".to_string(), ty: box_tree.clone() },
+                        Field { name: "val1".to_string(), ty: box_tree.clone() },
+                    ],
+                },
+            ],
+        },
+        derives: vec!["Inhabited".to_string()],
+    };
+    assert_eq!(
+        s.ldt_to_dtdata(&dt).unwrap(),
+        format!(
+            "({NS}.DtData.mk 0 \
+               ({NS}.CtorList.Cons 1 \
+                  ({NS}.TypList.Cons {NS}.TypData.TyInt (Tactus.Box.mk {NS}.TypList.Nil)) \
+                  (Tactus.Box.mk \
+                     ({NS}.CtorList.Cons 2 \
+                        ({NS}.TypList.Cons ({NS}.TypData.TyBox 0) \
+                           (Tactus.Box.mk ({NS}.TypList.Cons ({NS}.TypData.TyBox 0) \
+                              (Tactus.Box.mk {NS}.TypList.Nil)))) \
+                        (Tactus.Box.mk {NS}.CtorList.Nil)))))"
+        )
+    );
+}
+
+/// A single-variant `Structure` fails loud (`ed-dt-struct`) — the reference gates
+/// it symmetrically (`rawvir-dt-struct`).
+#[test]
+fn ldt_to_dtdata_structure_fails() {
+    use crate::lean_ast::{Datatype, DatatypeKind, Field};
+    let mut s = Serializer::default();
+    let dt = Datatype {
+        name: "lib.Point".to_string(),
+        self_name: "Point".to_string(),
+        typ_params: vec![],
+        kind: DatatypeKind::Structure {
+            fields: vec![Field { name: "x".to_string(), ty: LExpr::var_lit("Int") }],
+        },
+        derives: vec!["Inhabited".to_string()],
+    };
+    assert_eq!(s.ldt_to_dtdata(&dt).unwrap_err(), "ed-dt-struct");
+}
+
 // ── W6d.2b-2: the emit-path gate (`oblig_slot` + `goal_data` deep/atom) ──
 //
 // The obligation (reference) side drives: `oblig_slot` deepens a coverable
