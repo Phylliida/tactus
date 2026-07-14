@@ -1,0 +1,5 @@
+# Emitted tgt islands + certs are regenerable (cold `--tactus-emit-cert` run;
+# recipe in run.sh header). run.sh + Pinpoint.lean + REPORT.md are the tracked
+# deliverables; the cert is a snapshot inlined into Pinpoint.lean.
+out/
+out_tcr/

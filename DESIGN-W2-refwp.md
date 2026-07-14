@@ -276,6 +276,37 @@ bug-FINDING deliverable, independent of the W5 soundness proof.
 
 ## 5. Open questions (answer during W2, record here)
 
+**W3 triage (2026-07-14, from the tgt differential gate — board bootstrap-08,
+`probe-w0/probe11_w3_tgt/`).** First bridge run over certs emitted from REAL
+corpus code (tactus-group-theory), not the fixtures. Corpus is census-limited:
+stage-A emission is exec-fn-only and tgt has 9 exec fns, of which **1** emits a
+cert (`runtime::impl__4::clone`, a derived Copy-clone) and 8 are loud scope-
+rejections (5 `StmData::Call` = bootstrap-02b; 3 `assert-query`) that emit no
+cert and are NOT bridge subjects. So the gate has exactly one bridgeable subject
+today. Reconfirmed the census buckets by targeted cold `--verify-module` emits
+(runtime: 1 certified / 5 call / 1 assert-query; todd_coxeter_rt: 0 / 2 assert-
+query). Verdict-neutral (`24 verified, 0 errors`, flag on cold).
+
+- **runtime::impl__4::clone — RetBind-value ref-param deref (NEW site, class
+  known).** `fn clone(self: &RuntimeSymbol)`. Bridge `goals_eq refWp production
+  = 1` is FALSE. Pinpoint-proved (`Pinpoint.lean`) the SOLE divergence is the
+  RetBind-value leaf: SST `RetLet(4, 0)` binds `_return := leaf 0 ⟦self⟧`;
+  production binds `_return := leaf 5 ⟦self.deref⟧`. Patching only that leaf
+  (`Let 4 5 → Let 4 0`) closes it. refWp is faithful (`ret_frame` folds the
+  SST's `val` verbatim, lib.rs:777); production is correct; the SERIALIZER
+  renders the `&`-param return-value binding as bare `self`, not applying the
+  `*p → p.deref` subst at the RetBind-value render site (it IS applied at ens
+  leaf 2 / oblig leaf 3 in the same fn — so the miss is site-specific). This is
+  the reference-param sibling of head_exec/bootstrap-18 (obligation-leaf site);
+  a NEW leaf-render site of the SAME class. DESIGN §2.5 leaf rendering not
+  certified → sound honest-fail, not a refWp/production bug. **Batched onto
+  bootstrap-18** (whose fix must now thread production's deref RenderCtx through
+  BOTH the `oblig_leaf`/ens path AND the RetBind-value path). Together the two
+  findings show the deref-subst gap is systemic across leaf-render sites.
+- **No production bugs found; 0 unexplained divergences.** certified fraction
+  1/9 (census-limited). Re-run when the Call + assert-query arms unlock the
+  other 8 exec fns.
+
 **W2b triage (2026-07-14, from the fixture-scale bridge run — board
 bootstrap-07, `probe-w0/probe9_bridge/`):** running the bridge over ALL 11
 fixture certs (not just the four hand-demoed in b15/16/17) found a SECOND
