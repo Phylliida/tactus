@@ -13402,6 +13402,28 @@ test_verify_one_file_with_options! {
     } => Ok(())
 }
 
+// W4a (bootstrap-38): `--tactus-bridge` is opt-in and VERDICT-NEUTRAL. The
+// package gate additionally runs the refWp↔production `decide` bridge over
+// emitted obligation certs (the exec fn below emits one). With no
+// `$TACTUS_CORE_OUT` in the test env the in-gate bridge loudly SKIPS — and
+// the gate verdict is unchanged. An opt-in flag must never perturb the
+// pass/fail result; the bridge-FAIL→error flip is W4c, not W4a.
+test_verify_one_file_with_options! {
+    #[test] test_bridge_opt_in_verdict_neutral ["tactus-package-check", "tactus-bridge"] => verus_code! {
+        spec fn double(n: nat) -> nat { n + n }
+
+        proof fn lemma_a(n: nat) ensures double(n) >= 0 by { unfold double; omega }
+
+        pub fn add_capped(x: u64, y: u64) -> (r: u64)
+            requires x < 1000, y < 1000,
+            ensures r == x + y,
+        {
+            let s = x + y;
+            s
+        }
+    } => Ok(())
+}
+
 // M5 headline: mutual tactic proof fns FAIL island verification
 // (forward references — pinned by the 8-error observation in
 // DESIGN-emit-module.md §M3.5) but VERIFY under package-check, where

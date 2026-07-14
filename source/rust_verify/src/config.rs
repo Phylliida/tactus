@@ -115,6 +115,14 @@ pub struct ArgsX {
     /// verification verdicts. Also drives the N4 census (crate-end
     /// `certified M/N`).
     pub tactus_emit_cert: bool,
+    /// Tactus bootstrap W4a (bootstrap-38): run the refWp↔production
+    /// `decide` bridge over emitted obligation certs INSIDE the package
+    /// gate (the probe `run.sh` logic, promoted in-process). Implies
+    /// `tactus_emit_cert` (the bridge needs the cert files). Opt-in and
+    /// verdict-neutral in W4a — the bridge outcome is a gate note, never a
+    /// verification error (W4c flips that). Needs tactus-core's `out/lib`
+    /// oleans on the elaboration path via `$TACTUS_CORE_OUT`.
+    pub tactus_bridge: bool,
     /// Tactus: this build targets the Lean backend, so VIR lowering should
     /// emit Lean-friendly shapes rather than SMT-shaped ones that Tactus
     /// would otherwise have to normalize back. Currently gates: keeping
@@ -183,6 +191,7 @@ impl ArgsX {
             tactus_emit_module: Default::default(),
             tactus_package_check: Default::default(),
             tactus_emit_cert: Default::default(),
+            tactus_bridge: Default::default(),
             lean_backend: Default::default(),
             lean_all_proofs: Default::default(),
             time: Default::default(),
@@ -368,6 +377,7 @@ pub fn parse_args_with_imports(
     const OPT_TACTUS_PACKAGE_CHECK: &str = "tactus-package-check";
     const OPT_TACTUS_ISLANDS: &str = "tactus-islands";
     const OPT_TACTUS_EMIT_CERT: &str = "tactus-emit-cert";
+    const OPT_TACTUS_BRIDGE: &str = "tactus-bridge";
 
     /// M6.5 default flip: package-check is the default under
     /// --lean-backend (islands remain the automatic per-fn fallback);
@@ -575,6 +585,11 @@ pub fn parse_args_with_imports(
         "",
         OPT_TACTUS_EMIT_CERT,
         "Tactus bootstrap N3: emit per-fn stage-A certificate files (serialized SST literal) beside the fn's artifacts; emission-only, drives the certified M/N census (DESIGN-N3-serializer.md)",
+    );
+    opts.optflag(
+        "",
+        OPT_TACTUS_BRIDGE,
+        "Tactus bootstrap W4a: additionally run the refWp<->production `decide` bridge over emitted obligation certs INSIDE the package gate (implies --tactus-emit-cert). Opt-in and verdict-neutral; needs tactus-core's out/lib oleans via $TACTUS_CORE_OUT (bootstrap-38)",
     );
     opts.optflag(
         "",
@@ -807,7 +822,11 @@ pub fn parse_args_with_imports(
             || tactus_package_check_resolved(&matches),
         tactus_emit_module: matches.opt_present(OPT_TACTUS_EMIT_MODULE),
         tactus_package_check: tactus_package_check_resolved(&matches),
-        tactus_emit_cert: matches.opt_present(OPT_TACTUS_EMIT_CERT),
+        // W4a: --tactus-bridge implies cert emission (the bridge consumes
+        // the emitted cert files).
+        tactus_emit_cert: matches.opt_present(OPT_TACTUS_EMIT_CERT)
+            || matches.opt_present(OPT_TACTUS_BRIDGE),
+        tactus_bridge: matches.opt_present(OPT_TACTUS_BRIDGE),
         lean_backend: matches.opt_present(OPT_LEAN_BACKEND),
         lean_all_proofs: matches.opt_present(OPT_LEAN_ALL_PROOFS),
         time: matches.opt_present(OPT_TIME) || matches.opt_present(OPT_TIME_EXPANDED),
