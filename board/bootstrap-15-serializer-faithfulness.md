@@ -247,11 +247,41 @@ kills.
   ret-name "r" via `text_leaf(sanitize("r"))`, value "s" via `exp_leaf(Var s)`
   (== the interned binder id 9), obligation via `oblig_leaf(ens)` (== leaf 22).
 
-  **Remaining = the batched regen (IN PROGRESS this turn):** vargo build of the
-  verus fork (running) → re-emit fixtures → refresh golden add_capped.cert.lean +
-  `leaf_texts.len()` assertion → hand-run the FULL add_capped bridge
-  `goals_eq (ref_wp ctx sst) prod = 1 := by decide` (all 4 goals). tactus-core
-  already re-verified (32/0). See updated recipe below.
+- (2026-07-14, opus-w2b-f2) **BATCHED REGEN DONE — the full add_capped bridge
+  CLOSES by `decide` (all 4 goals). 🐉 mission accomplished for add_capped.**
+  - vargo release build of the verus fork picked up all four findings'
+    serializer changes (rust_verify+verus rebuilt; vstd re-verified 1530/0).
+  - Re-emitted fixtures (`--tactus-emit-cert`): **20 verified / 0 errors, 11/16
+    certified** (5 rejected `call` = documented stage-A exclusion; unchanged).
+  - Fresh `add_capped.cert` (leaf renumbered, count still 24):
+    `Ret (LeafList.Cons 12) (RetBind.RetLet 13 16)` — annotated postcondition
+    leaf 12 (`/- @rust:…85:13 -/ r = x + y`) + return binding `let r(13):=s(16)`;
+    goal 3 tail = `… Let 16 23, Let 13 16, Leaf 12`. ctx shows finding-2's named
+    binders + BinderList reqs; body shows finding-1's `Assert 15 14`.
+  - **Hand-run (LEAN_PATH = prelude-cache + tactus-core/out/lib):**
+    `goals_eq (ref_wp cert_add_capped_ctx cert_add_capped_sst)
+    cert_add_capped_goals = 1 := by decide` **PASSES (exit 0).**
+  - **Negative controls (mutation-kill, proving it's real):** flipping the RHS to
+    `= 0` → `decide` errors; mutating the SST `RetBind.RetLet 13 16`→`13 99` →
+    `decide` errors (`goals_eq` becomes 0). The return-binding value is
+    load-bearing; a serializer mismatch fails the bridge, never silent-passes.
+  - **max_u64 (branch-in-leaf caveat, as noted): HONEST FAILURE.** Its cert emits
+    a well-formed `Ret ([9,10]) (RetLet 11 12)`, but production's ensures goals
+    are the LIFTED-IF leaves 13/14 (`x<y → (let r := let m := y; m; …)` — the
+    `let r` absorbed INSIDE the leaf by `lift_if_value`), so refWp ≠ production
+    and the bridge `decide`s to 0. Confirms fail-loud: divergence → no close,
+    never a silent pass. (sum_to also won't close yet — needs finding-3.)
+  - Refreshed golden `testdata/add_capped.cert.lean` (`leaf_texts.len()` still
+    24 — no assertion change). 6 serializer tests + tactus-core 32/0 green.
+    `bootstrap-fixture/out` stays gitignored/regenerable.
+
+  **REMAINING FOR THIS TASK'S "done when" = finding-3 (loop binders), the
+  largest.** sum_to's Loop node still carries `binders = Nil` + no annotated
+  inv-obligation leaves / decreases / `_tactus_d_old` let (N3a `modified_vars =
+  None`). Its bridge will NOT close until refWp's maintain/use telescopes match
+  production's loop-modified-local havoc set. See finding-3 detail in the task
+  Description + DESIGN-W2-refwp.md §5(3). Findings 1/2/4 + Ret-annotation are all
+  LANDED, VERIFIED, and demonstrated (add_capped). Next instance: finding-3.
 
 ## Writeup
 
