@@ -78,6 +78,64 @@ emission + bridge `def_eq`/`dt_eq`), W7e (mutation-kill).
       params/ret): a new input surface (VIR datatype decl + fn signature), not
       an `ExpX`; likely its own transcriber pair.
 
+- (2026-07-14, opus-w7c-2) **⚠ SURFACE-FORK FINDING (reframes the reference
+  side) — verified from source + endorsed by Danielle.** The task text assumed
+  the reference def-body transcriber would EXTEND the SST-surface `raw_exp`
+  (`ExpX → RawExp`). That is the wrong surface for def bodies. Chain of facts:
+  1. **VIR `ExprX` HAS `Match`; SST `ExpX` does NOT** — `match` in a spec-fn
+     body is desugared to `If` + variant-tests during AST→SST lowering.
+     (Confirmed: `source/vir/src/sst.rs:69` `enum ExpX` has `If`/`Bind`/`Call`/
+     `Ctor`/`UnaryOpr` but no `Match`; VIR `ExprX::Match` lives in
+     `source/vir/src/ast.rs`.)
+  2. **Def bodies emit from VIR `ExprX` directly**, NOT through SST:
+     `to_lean_fn.rs:315 spec_fn_to_ast` renders `f.body` via
+     `to_lean_expr::vir_expr_to_ast_with_binders` (`to_lean_fn.rs:343`), and
+     `vir_expr_to_ast` **preserves** the shape:
+     `to_lean_expr.rs:680  ExprX::Match(place, arms) → ExprNode::Match{..}`,
+     `:583 ExprX::Quant → ExprNode::Forall/Exists`, multi-arg
+     `ExprX::Call → App`. So production def-body `LExpr`s really do contain
+     `Match`/`Forall`/`Exists`/multi-arg-`App` nodes (`lean_ast.rs` `ExprNode`
+     has all four incl. `Match { scrutinee, arms: Vec<MatchArm> }`).
+  3. **Obligations (W6) go through SST** (Match already desugared) — which is
+     exactly why the SST `raw_exp` never needed `Match`/`Quant`.
+  - **Conclusion (Danielle-endorsed):** the def-body REFERENCE transcriber must
+    be a NEW function on the VIR `vir::ast::Expr` surface (where `Match`/`Quant`/
+    multi-arg-`Call` are live), NOT an extension of SST `raw_exp`. If instead the
+    reference lowered the VIR body to SST, `Match` would desugar to `If`-chains
+    while production keeps `Match` nodes → `def_eq` could never match → bridge
+    always fails. This is DESIGN §2 ("transcribe directly from VIR") being
+    load-bearing; DESIGN §3's "reuse `expx_to_rawexp`" is the optimistic part —
+    the RawExp *target vocab* + helpers (`typ_data` at `sst_serialize.rs:588`
+    already takes a `&Typ` and works on VIR `Typ`; `binop_opcode`; `text_leaf`)
+    ARE reusable, but the transcriber *arms* are new on the VIR surface.
+  - **So the W7b `MatchR`/`RawArmList`/`ForallR`/`ExistsR`/`CallN` vocabulary IS
+    reachable** — the gating "is a spec-fn match body `ExpX::Match` or desugared?"
+    question is answered: **reachable, but only on the VIR def-body surface**,
+    not the SST obligation surface.
+  - **The landed SST `raw_exp::Ite` arm stays** (harmless, verdict-neutral) but
+    it is the *obligation* surface — it does not serve def bodies. The def-body
+    `Ite` belongs on the new VIR reference transcriber (note: VIR `ExprX::If` has
+    an OPTIONAL else, unlike SST's 3-branch `If`).
+  - **Corrected remaining-W7c plan** (Danielle: reference-first — it defines the
+    target shapes the production arms must match, so production-first would be
+    guessing the format):
+    1. **NEW reference VIR transcriber** (`raw_vir_exp` on `vir::ast::Expr`):
+       leaf/`If`→`Ite`/`Binary`/`Call`(multi)→`CallN`/`Ctor`/`Match`→`MatchR`/
+       `Quant`→`ForallR`/`ExistsR`/`Field`. The real long pole → split to
+       `bootstrap-29`. Mirror `to_lean_expr::expr_to_node` for the VIR-node
+       reading; reuse the RawExp emitter + `typ_data`/`binop_opcode`.
+    2. **Production side** = extend `lexpr_to_exprdata` for `Match`/`Forall`/
+       `Exists`/multi-arg-`App` (ExprNode nodes from VIR bodies). NOTE it is now
+       LIVE on the emit path (goal-side deepening, `sst_serialize.rs:1627`), so
+       same verdict-neutral discipline as `raw_exp` — confirm no obligation-goal
+       LExpr carries these before landing each arm (fixture analysis, like the
+       Ite proof). Binder-type wrinkle: prod `Binder.ty` is a rendered type-Expr
+       (`vir_var_binders_to_ast` → `typ_to_expr`, `to_lean_expr.rs:346`); the
+       `ExprData::Forall(bid, bty, body)` `bty` must be recognized back to the
+       SAME `TypData` the reference emits from the VIR `Typ` — a small
+       type-expr→TypData recognizer, co-designed with the reference arm.
+    3. W7d wires the def-body entry point (both sides).
+
 - (2026-07-14, opus-w7c) **`Ite` increment LANDED — both transcriber sides +
   3 tests, full lib suite 342/0 (was 339), verdict-neutral CONFIRMED.**
   - `raw_exp` gained `ExpX::If(cond, then, else) → RawExp::Ite(typ_data(e.typ),
