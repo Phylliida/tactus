@@ -22,10 +22,10 @@ decreasing_by all_goals (simp_all; omega)
 inductive lib.ParamBoundList where
   | Nil
   | NoBound (val0 : Tactus.Box lib.ParamBoundList)
-  | Bound (val0 : Int) (val1 : Tactus.Box lib.ParamBoundList)
+  | Bound (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.ParamBoundList)
   deriving Inhabited
 @[simp] noncomputable def lib.ParamBoundList.height (s : lib.ParamBoundList) : Nat :=
-  match s with | lib.ParamBoundList.Nil => 1 | lib.ParamBoundList.NoBound val0 => 1 + lib.ParamBoundList.height val0.deref | lib.ParamBoundList.Bound _ val1 => 1 + lib.ParamBoundList.height val1.deref
+  match s with | lib.ParamBoundList.Nil => 1 | lib.ParamBoundList.NoBound val0 => 1 + lib.ParamBoundList.height val0.deref | lib.ParamBoundList.Bound _ _ val2 => 1 + lib.ParamBoundList.height val2.deref
 termination_by sizeOf s
 decreasing_by all_goals (simp_all; omega)
 inductive lib.StmData where
@@ -76,7 +76,7 @@ structure lib.FnCtxData where
   typ_params : lib.BinderList
   params : lib.BinderList
   param_bounds : lib.ParamBoundList
-  reqs : lib.LeafList
+  reqs : lib.BinderList
   enss : lib.LeafList
   deriving Inhabited
 @[simp] noncomputable def lib.FnCtxData.height (_ : lib.FnCtxData) : Nat :=

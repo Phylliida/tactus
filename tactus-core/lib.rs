@@ -73,14 +73,17 @@ pub enum BinderList {
 
 // ── Per-param optional bound-hypothesis leaves ──────────────────────
 // Parallel to `FnCtxData.params`. `NoBound` = this param has no range
-// hypothesis (e.g. a datatype-typed param); `Bound(leaf)` = the rendered
-// `h_x_bound` leaf for an int-typed param (P6/P7). Distinct constructors
-// rather than a sentinel leaf id, since 0 is a valid interned leaf.
+// hypothesis (e.g. a datatype-typed param); `Bound(name, prop)` = an
+// int-typed param's range hypothesis, rendered by production as a NAMED
+// ∀-binder `∀ (h_x_bound : 0≤x∧x<2^64)` — `name` is the `h_<param>_bound`
+// name leaf, `prop` the range-predicate leaf (finding-2). Distinct
+// constructors rather than a sentinel leaf id, since 0 is a valid
+// interned leaf.
 
 pub enum ParamBoundList {
     Nil,
     NoBound(Box<ParamBoundList>),
-    Bound(u64, Box<ParamBoundList>),
+    Bound(u64, u64, Box<ParamBoundList>),
 }
 
 // ── Statements: the Wp-input mirror (stage-A subset) ────────────────
@@ -164,7 +167,11 @@ pub struct FnCtxData {
     pub typ_params: BinderList,
     pub params: BinderList,
     pub param_bounds: ParamBoundList,
-    pub reqs: LeafList,
+    // `reqs`: (h_req<i> name leaf, req-prop leaf) pairs. Production renders
+    // each requires as a NAMED ∀-binder `∀ (h_req0 : x < 1000)` (finding-2),
+    // so `reqs` is a `BinderList` (name, prop) — folded via binders_to_frame
+    // into `FBind` spine entries, not anonymous `FHyp`s.
+    pub reqs: BinderList,
     pub enss: LeafList,
 }
 
@@ -197,7 +204,7 @@ pub open spec fn param_bound_len(p: ParamBoundList) -> nat
     match p {
         ParamBoundList::Nil => 0,
         ParamBoundList::NoBound(t) => 1 + param_bound_len(*t),
-        ParamBoundList::Bound(_leaf, t) => 1 + param_bound_len(*t),
+        ParamBoundList::Bound(_name, _prop, t) => 1 + param_bound_len(*t),
     }
 }
 
@@ -305,12 +312,11 @@ by {
 //  * `StmData::Assert(e)` emits `close(frame, e)` AND `frame_after` adds
 //    hyp `e`: the fixture certs show TWO `Imp e` after an Assert/Assume
 //    pair — the Assert's forward hyp plus the following Assume's hyp.
-//  * Signature bound-hyps and requires render here as anonymous `FHyp`
-//    (→ `Imp`). Production renders them as NAMED forall-binders (`All 19
-//    2` = ∀ (h_x_bound : …)); reproducing that needs a per-hyp NAME leaf
-//    in ParamBoundList / a BinderList-shaped `reqs` — a proposed
-//    N2.1-round-2 amendment (board writeup finding-2). refWp emits FHyp
-//    until then.
+//  * Signature bound-hyps and requires render as NAMED ∀-binders
+//    (`All 19 2` = ∀ (h_x_bound : …), `All 17 5` = ∀ (h_req0 : …)), NOT
+//    arrows (finding-2, LANDED). `ParamBoundList::Bound` now carries the
+//    `h_<param>_bound` name leaf and `FnCtxData.reqs` is a `BinderList` of
+//    (h_req<i>, prop); seed_params/seed_frame fold both via `FBind` → `All`.
 
 // Concatenate two frames (structural on the first).
 #[verifier::structural_decreases]
@@ -451,8 +457,10 @@ pub open spec fn wp_stm(f: FrameList, s: StmData) -> GoalList
 }
 
 // Seed the value-param telescope: each param binder immediately followed
-// by its own bound hyp (empirical spine: ∀x, (h_x_bound), ∀y, (h_y_bound),
-// …). Params → FBind; bound hyps → FHyp (naming caveat above).
+// by its own bound hyp (empirical spine: ∀x, ∀(h_x_bound), ∀y, ∀(h_y_bound),
+// …). Params → FBind; bound hyps → FBind too (finding-2: production renders
+// them as NAMED ∀-binders `∀ (h_x_bound : …)`, so `close` must fold them
+// into `All`, not `Imp`).
 #[verifier::structural_decreases]
 pub open spec fn seed_params(params: BinderList, bounds: ParamBoundList) -> FrameList
     decreases params
@@ -460,8 +468,8 @@ pub open spec fn seed_params(params: BinderList, bounds: ParamBoundList) -> Fram
     match params {
         BinderList::Nil => FrameList::FNil,
         BinderList::Cons(id, typ, t) => match bounds {
-            ParamBoundList::Bound(prop, bt) =>
-                FrameList::FBind(id, typ, Box::new(FrameList::FHyp(prop, Box::new(seed_params(*t, *bt))))),
+            ParamBoundList::Bound(hname, prop, bt) =>
+                FrameList::FBind(id, typ, Box::new(FrameList::FBind(hname, prop, Box::new(seed_params(*t, *bt))))),
             ParamBoundList::NoBound(bt) =>
                 FrameList::FBind(id, typ, Box::new(seed_params(*t, *bt))),
             ParamBoundList::Nil =>
@@ -471,11 +479,13 @@ pub open spec fn seed_params(params: BinderList, bounds: ParamBoundList) -> Fram
 }
 
 // Seed the initial frame from the signature (DESIGN §2.2): typ-params,
-// then value params interleaved with bound hyps, then reqs.
+// then value params interleaved with bound hyps, then reqs. reqs are NAMED
+// ∀-binders (finding-2), so they fold in via `binders_to_frame`, not
+// `hyps_of_leaves`.
 pub open spec fn seed_frame(c: FnCtxData) -> FrameList {
     frame_append(binders_to_frame(c.typ_params),
         frame_append(seed_params(c.params, c.param_bounds),
-            hyps_of_leaves(c.reqs)))
+            binders_to_frame(c.reqs)))
 }
 
 // refWp: the certificate LHS. Seed the frame, then walk the body. The
@@ -625,7 +635,7 @@ proof fn probe_ref_wp()
             typ_params: BinderList::Nil,
             params: BinderList::Nil,
             param_bounds: ParamBoundList::Nil,
-            reqs: LeafList::Nil,
+            reqs: BinderList::Nil,
             enss: LeafList::Nil,
         }, StmData::Assert(9))) == 1
 by { decide }
@@ -633,24 +643,25 @@ by { decide }
 // ── W2a: end-to-end refWp unit examples (against hand-computed goals) ──
 
 // Minimal context: one int param `x` (name leaf 0, type leaf 1) with a
-// bound hyp (prop leaf 2), no reqs. seed_frame = FBind(0,1, FHyp(2, FNil)).
+// bound hyp (name leaf 19 = h_x_bound, prop leaf 2), no reqs. seed_frame =
+// FBind(0,1, FBind(19,2, FNil)) — the bound hyp is now a NAMED ∀ (finding-2).
 proof fn ref_wp_seed_and_assert()
     ensures
         // refWp folds the seed around a single Assert obligation:
-        //   ∀ (x:Int), h2 → <9>
+        //   ∀ (x:Int), ∀ (h_x_bound:2), <9>
         goals_eq(
             ref_wp(
                 FnCtxData {
                     typ_params: BinderList::Nil,
                     params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)),
-                    param_bounds: ParamBoundList::Bound(2, Box::new(ParamBoundList::Nil)),
-                    reqs: LeafList::Nil,
+                    param_bounds: ParamBoundList::Bound(19, 2, Box::new(ParamBoundList::Nil)),
+                    reqs: BinderList::Nil,
                     enss: LeafList::Nil,
                 },
                 StmData::Assert(9),
             ),
             GoalList::Cons(
-                Box::new(GoalData::All(0, 1, Box::new(GoalData::Imp(2, Box::new(GoalData::Leaf(9)))))),
+                Box::new(GoalData::All(0, 1, Box::new(GoalData::All(19, 2, Box::new(GoalData::Leaf(9)))))),
                 Box::new(GoalList::Nil)),
         ) == 1,
         // A Ret of two ensures leaves → two goals sharing the seed spine
@@ -659,8 +670,8 @@ proof fn ref_wp_seed_and_assert()
             FnCtxData {
                 typ_params: BinderList::Nil,
                 params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)),
-                param_bounds: ParamBoundList::Bound(2, Box::new(ParamBoundList::Nil)),
-                reqs: LeafList::Nil,
+                param_bounds: ParamBoundList::Bound(19, 2, Box::new(ParamBoundList::Nil)),
+                reqs: BinderList::Nil,
                 enss: LeafList::Cons(5, Box::new(LeafList::Cons(6, Box::new(LeafList::Nil)))),
             },
             StmData::Ret(Box::new(LeafList::Cons(5, Box::new(LeafList::Cons(6, Box::new(LeafList::Nil)))))),
@@ -669,26 +680,61 @@ by { decide }
 
 // Seq threads frameAfter: the second Assert sees the first as a forward
 // hyp (Assert-then-Assume behaviour, one hyp here from the Assert alone).
+// The seed bound hyp is a NAMED ∀ (h_x_bound = 19); the Assert forward hyp
+// stays an anonymous Imp (it is not a signature binder).
 proof fn ref_wp_seq_threads_frame()
     ensures
-        // ∀x,h2. <9>   then   ∀x,h2. h9 → <10>
+        // ∀x,∀(h_x_bound:2). <9>   then   ∀x,∀(h_x_bound:2). h9 → <10>
         goals_eq(
             ref_wp(
                 FnCtxData {
                     typ_params: BinderList::Nil,
                     params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)),
-                    param_bounds: ParamBoundList::Bound(2, Box::new(ParamBoundList::Nil)),
-                    reqs: LeafList::Nil,
+                    param_bounds: ParamBoundList::Bound(19, 2, Box::new(ParamBoundList::Nil)),
+                    reqs: BinderList::Nil,
                     enss: LeafList::Nil,
                 },
                 StmData::Seq(Box::new(StmData::Assert(9)), Box::new(StmData::Assert(10))),
             ),
             GoalList::Cons(
-                Box::new(GoalData::All(0, 1, Box::new(GoalData::Imp(2, Box::new(GoalData::Leaf(9)))))),
+                Box::new(GoalData::All(0, 1, Box::new(GoalData::All(19, 2, Box::new(GoalData::Leaf(9)))))),
                 Box::new(GoalList::Cons(
-                    Box::new(GoalData::All(0, 1, Box::new(GoalData::Imp(2,
+                    Box::new(GoalData::All(0, 1, Box::new(GoalData::All(19, 2,
                         Box::new(GoalData::Imp(9, Box::new(GoalData::Leaf(10)))))))),
                     Box::new(GoalList::Nil)))),
+        ) == 1
+by { decide }
+
+// Finding-2 payoff: refWp on add_capped's ctx reproduces production goal 0's
+// seed telescope EXACTLY — all NAMED ∀-binders, no anonymous arrows. Leaf ids
+// are the production ones (bootstrap-fixture/out/lib/cert/add_capped.cert.lean):
+//   params x=0:Int=1, y=3:Int=1; bounds h_x_bound=19:prop2, h_y_bound=18:prop4;
+//   reqs h_req0=17:(x<1000)=5, h_req1=16:(y<1000)=6; obligation leaf 15.
+// Expected spine = All 0 1 (All 19 2 (All 3 1 (All 18 4 (All 17 5
+//   (All 16 6 (Leaf 15)))))) — the first assert goal, verbatim. NB: the
+// Assert here carries the ANNOTATED obligation leaf 15 directly; the raw SST
+// carries the bare leaf 8 (finding-1, separate). This isolates finding-2:
+// GIVEN the annotated obligation, the named-binder seed telescope matches.
+proof fn ref_wp_add_capped_seed_spine()
+    ensures
+        goals_eq(
+            ref_wp(
+                FnCtxData {
+                    typ_params: BinderList::Nil,
+                    params: BinderList::Cons(0, 1, Box::new(BinderList::Cons(3, 1, Box::new(BinderList::Nil)))),
+                    param_bounds: ParamBoundList::Bound(19, 2,
+                        Box::new(ParamBoundList::Bound(18, 4, Box::new(ParamBoundList::Nil)))),
+                    reqs: BinderList::Cons(17, 5, Box::new(BinderList::Cons(16, 6, Box::new(BinderList::Nil)))),
+                    enss: LeafList::Cons(7, Box::new(LeafList::Nil)),
+                },
+                StmData::Assert(15),
+            ),
+            GoalList::Cons(
+                Box::new(GoalData::All(0, 1, Box::new(GoalData::All(19, 2,
+                    Box::new(GoalData::All(3, 1, Box::new(GoalData::All(18, 4,
+                        Box::new(GoalData::All(17, 5, Box::new(GoalData::All(16, 6,
+                            Box::new(GoalData::Leaf(15)))))))))))))),
+                Box::new(GoalList::Nil)),
         ) == 1
 by { decide }
 
@@ -737,7 +783,7 @@ proof fn amended_shapes_kernel_compute()
         stm_size(StmData::Ret(Box::new(LeafList::Cons(0,
             Box::new(LeafList::Cons(1, Box::new(LeafList::Nil))))))) == 3,
         binder_len(BinderList::Cons(1, 2, Box::new(BinderList::Nil))) == 1,
-        param_bound_len(ParamBoundList::Bound(5,
+        param_bound_len(ParamBoundList::Bound(4, 5,
             Box::new(ParamBoundList::NoBound(Box::new(ParamBoundList::Nil))))) == 2,
         frame_len(FrameList::FBind(1, 2,
             Box::new(FrameList::FHyp(3, Box::new(FrameList::FLet(4, 5, Box::new(FrameList::FNil))))))) == 3,
@@ -746,9 +792,9 @@ proof fn amended_shapes_kernel_compute()
             typ_params: BinderList::Cons(0, 100, Box::new(BinderList::Nil)),
             params: BinderList::Cons(1, 101,
                 Box::new(BinderList::Cons(2, 102, Box::new(BinderList::Nil)))),
-            param_bounds: ParamBoundList::Bound(200,
+            param_bounds: ParamBoundList::Bound(199, 200,
                 Box::new(ParamBoundList::NoBound(Box::new(ParamBoundList::Nil)))),
-            reqs: LeafList::Nil,
+            reqs: BinderList::Nil,
             enss: LeafList::Cons(300, Box::new(LeafList::Nil)),
         }) == 2
 by {
