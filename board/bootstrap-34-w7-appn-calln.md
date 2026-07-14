@@ -1,9 +1,9 @@
 ---
 title: "W7 — multi-arg AppN/CallN transcription (the deferred cache-churning RawList per-arg-TypData edit)"
-status: in_progress
+status: done
 claimed_by: opus-w7-appn
 created: 2026-07-15T04:10:00Z
-updated: 2026-07-14T00:00:00Z
+updated: 2026-07-14T12:00:00Z
 ---
 
 ## Description
@@ -48,6 +48,48 @@ per-arg-TypData `RawList` shape first (mirror the W7a/W6a probe pattern).
 coverage of the tgt slice (any tgt spec fn calling a ≥2-arg helper).
 
 ## Progress
+- (2026-07-14, opus-w7-appn steps 3+4) **DONE — three arms widened, live
+  `def_eq` bridge over `AppN` closes green.** Reconfirmed the flat-arg shape
+  by reading the production construction site directly (stronger than a dump):
+  `to_lean_sst_expr.rs` L1228-1259 builds `head = LExpr::app(Var(name),
+  [typeargs])` then `LExpr::app(head, [v0..vn])` — value args FLAT in one Vec,
+  type args folded into the head, so `app_head_fn_name` peels the SAME head
+  shapes as the single-arg arm and there is no curried nesting. Then:
+  - **Step 3 — widened all three fail-loud arms** in `sst_serialize.rs` to the
+    existing no-`TypData` spine (strict widening: `len == 1` unchanged → `Call`/
+    `App`; `len >= 2` → `CallN`/`AppN`; `len == 0` stays census-rejected):
+    reference SST `raw_exp` (was `raw-call-arity`) → `RawExp::CallN(fn, ret,
+    RawList[args])`; reference VIR `raw_vir_exp` (was `rawvir-call-arity`) →
+    same; production `lexpr_to_exprdata` (was `ed-app-arity`) → `ExprData::AppN(
+    fn, ExprList[args])`, keyed on the SAME interned fn name so `def_eq` agrees
+    by construction. Rust-only rebuild (`vargo build --release`, ~20s incr.);
+    vstd re-verified 1530/0 (no whole-crate churn).
+  - **Step 4 — live bridge closed.** Added F20 to `bootstrap-fixture/lib.rs`:
+    `g2`/`g3` (2-/3-arg all-`nat` spec fns) + `call_g2`/`call_g3` (bodies
+    `g2(x,y)` / `g3(x,y,z)` — the only ≥2-arg calls in the fixture) + a
+    `use_multiarg` exec keep-alive (`ensures true` + ghost refs) so Verus's
+    dead-code pruning doesn't drop them before the def-cert pass (the reason the
+    first re-emit emitted no g2 cert). Re-emit (`--tactus-emit-cert`) →
+    `call_g2.defcert.lean` shows reference `RawExp.CallN 3 TyNat [Var 1, Var 2]`
+    → `render_def` → `AppN 3 [Atom 1, Atom 2]` matching production `AppN 3 [Atom
+    1, Atom 2]` — identical fn_id (3) and flat arg order on both sides. Probe17
+    live runner: **all 8 def/dt certs positive OK + kill non-vacuous** (new
+    call_g2/call_g3/g2/g3 + pre-existing sq/tree_head/tri/Tree unregressed).
+  - **⚠ env gotcha for next instance:** probe17 must use the **Nix** `lean`/
+    `lake` on PATH (`/nix/store/…lean4-4.25.0/bin/lean` = `command -v lean`),
+    which built the `tactus-core/out/lib/*.olean` + the `prelude-e81fbf9a…`
+    cache. The elan `~/.elan/toolchains/…v4.25.0` lean has a DIFFERENT build
+    hash → "incompatible header" on every olean. Do NOT override `LEAN` or
+    `TACTUS_PRELUDE`; the runner's defaults are correct. (None of the 4 elan
+    toolchains load these oleans; only the Nix lean does.)
+  - **Honest residual:** the def bridge live-tests the VIR (`raw_vir_exp`) +
+    production (`lexpr_to_exprdata`) pair. The SST `raw_exp` arm (obligation-
+    position multi-arg calls) is the mechanical mirror of the validated VIR arm
+    but has no obligation-position ≥2-arg call in the fixture to exercise it
+    live this turn — a cheap follow-on is a proof fn with a multi-arg call in
+    its ensures (whose goal cert flows through `raw_exp`). Also `sum_tree`-style
+    `DefCurried` (structural-recursion) callees still get no def cert (pre-
+    existing `maybe_emit_def_cert` gate, orthogonal).
 - (2026-07-14, opus-w7-appn step2a) **FORK RESOLVED = WORLD (a); step 2b
   CANCELLED.** Dumped a genuine multi-arg spec-fn call at both levels with the
   existing release binary (no serializer rebuild): `bootstrap-fixture/appn_probe.rs`
@@ -105,28 +147,47 @@ coverage of the tgt slice (any tgt spec fn calling a ≥2-arg helper).
   in `probe-w0/probe18_appn/REPORT.md` ("Architectural fork" section).
 
 ## Writeup
-**Partial — step 1 of 4 done; step 2 gated on an SST dump (see fork below).**
+**DONE — all four steps complete; multi-arg `AppN`/`CallN` closes the live
+`def_eq` bridge; `tactus-core` untouched (world (a), step 2b cancelled).**
 
-**Done:** the design-freeze probe `probe-w0/probe18_appn/` (green, axiom-clean),
-which validates that a per-arg-typed `RawList` + a per-element coerce/deref
-`render_list` closes the multi-arg bridge and kills mis-coercions. It mirrors the
-W7a/W6a probe discipline and freezes the `CallN→AppN` invariants that hold
-regardless of the fork (fn-name keying, dropped type-args, `_ret` render-unused,
-and the two fail-loud arms to widen).
+**What landed (2 tracked files):**
+- `source/lean_verify/src/sst_serialize.rs` — three fail-loud arms widened to
+  the *existing* no-`TypData` spine already present & verified in `tactus-core`
+  (`RawExp::CallN`/`RawList`/`render_list` → `AppN`, lib.rs L392/405/944/974;
+  `ExprData::AppN`/`ExprList` L332/348). Strict widening: single-arg path is
+  byte-for-byte unchanged (`Call`/`App`); only `len >= 2` (previously the
+  `raw-call-arity`/`rawvir-call-arity`/`ed-app-arity` errors) now transcribes;
+  `len == 0` stays rejected. Reference (SST `raw_exp` + VIR `raw_vir_exp`) emits
+  `CallN`; production (`lexpr_to_exprdata`) emits `AppN`, keyed on the identical
+  interned fn name so `def_eq` agrees by construction.
+- `bootstrap-fixture/lib.rs` — F20: `g2`/`g3` + `call_g2`/`call_g3` (the only
+  ≥2-arg calls in the fixture) + `use_multiarg` keep-alive.
 
-**Key finding (changes the plan):** the cache-churning per-arg-`TypData` datatype
-edit this card assumed necessary may **not** be. It is load-bearing only if Verus
-**elides** per-argument call coercions in the SST (world (b)); if Verus
-**materializes** them into the argument subexpressions — which is exactly what the
-single-arg fixture does, and the single-arg serializer's use of the *arg's own*
-`.typ` strongly hints at — then the **existing** no-`TypData` `render_list`
-already renders multi-arg calls correctly and the two fail-loud arms just need to
-be widened to a plain spine (no datatype change, no whole-crate re-verify). The
-right, cheap next step is a W6d.0-style SST/`LExpr` dump of a real ≥2-arg call to
-decide before touching `tactus-core`. See the REPORT's "Architectural fork"
-section for the full argument and both wiring paths.
+**How it works:** the step-2a SST/VIR dump proved Verus MATERIALIZES every
+call-arg coercion as a `Clip` inside the arg (the arg's own `.typ` already
+carries the coerced type) and resolves `&`/`*` ref decorations away before
+transcription. So the single-arg arm's per-arg `coerce_if`/`deref_if` are both
+structural no-ops, and the plain per-element `render_list` renders every
+producible multi-arg shape faithfully — no per-arg `TypData` field, no datatype
+edit, no whole-crate re-verify. Production builds multi-arg apps FLAT
+(`to_lean_sst_expr.rs` L1228-1259: type args in the head, value args in one
+Vec), so `app_head_fn_name` peels the same head shapes as single-arg.
 
-**Assumptions/limits:** the probe's Case B assumes world (b) (elided coercions);
-it proves the machinery is correct *if* needed, not that it *is* needed. No
-`tactus-core` or `sst_serialize.rs` code was touched this turn (zero
-shared-crate risk, per the card's step-1 gate).
+**Verification:** `vargo build --release` (incr. ~20s), vstd 1530/0. Re-emit
+`--tactus-emit-cert` over the fixture; probe17 live runner → **8/8 def+dt certs
+positive OK, kills non-vacuous**; `call_g2.defcert.lean` shows both sides render
+`fn_id=3`, flat arg order `[1,2]`. Pre-existing certs unregressed.
+
+**Assumptions/limits (honest):**
+1. Live-tested pair is VIR + production (the def bridge). SST `raw_exp` is the
+   mechanical mirror of the validated VIR arm but is exercised only by
+   obligation-position ≥2-arg calls, of which the fixture has none this turn —
+   a proof-fn ensures with a multi-arg call is the cheap follow-on.
+2. Fixture verification-neutrality argued by inspection: `use_multiarg` is
+   `ensures true`; `g2`/`call_g2`/… are pure `open spec fn` defs. Emit reported
+   SST-level 21 verified/0 errors but `--emit-lean` skips the Lean discharge, so
+   full-Lean verification of the fixture goals was not separately run.
+3. `DefCurried` (structural-recursion) callees still get no def cert
+   (`maybe_emit_def_cert` gate — pre-existing, orthogonal to arity).
+4. Env: probe17 needs the **Nix** lean (`command -v lean`), NOT elan v4.25.0 —
+   the oleans/prelude were built with the Nix build hash (see Progress ⚠).

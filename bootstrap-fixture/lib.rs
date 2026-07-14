@@ -48,6 +48,35 @@ pub open spec fn tree_head(t: Tree) -> u64 {
     }
 }
 
+// F20 (W7 / bootstrap-34): multi-arg spec-fn application in a def body — the
+// `AppN`/`CallN` shape. The callers' bodies (`g2(x, y)`, `g3(x, y, z)`) are the
+// only ≥2-arg calls in the fixture, so they force the widened `raw_vir_exp` /
+// `lexpr_to_exprdata` arms and close the `def_eq` bridge over `AppN`. Kept
+// all-`nat` (no per-arg `as` cast) to isolate the flat multi-arg spine from the
+// Cast machinery — the step-2a dump proved any real coercion rides a `Clip`
+// INSIDE the arg, handled by the existing per-node recursion, not the list.
+pub open spec fn g2(a: nat, b: nat) -> nat { a + b }
+
+pub open spec fn call_g2(x: nat, y: nat) -> nat { g2(x, y) }
+
+pub open spec fn g3(a: nat, b: nat, c: nat) -> nat { a + b + c }
+
+pub open spec fn call_g3(x: nat, y: nat, z: nat) -> nat { g3(x, y, z) }
+
+// Keep the F20 spec fns alive through Verus dead-code pruning: an unreferenced
+// `open spec fn` is dropped from the pruned krate before emission, so it would
+// never reach the def-cert pass. A ghost reference in an exec body pulls
+// `call_g2`/`call_g3` — and transitively `g2`/`g3` — into the emitted defs
+// (the `appn_probe.rs` keep-alive pattern). `ensures true` cannot fail, so this
+// is verification-neutral for the e2e/differential gate.
+pub fn use_multiarg(x: u64) -> (r: u64)
+    ensures true,
+{
+    let _g2: Ghost<nat> = Ghost(call_g2(x as nat, x as nat));
+    let _g3: Ghost<nat> = Ghost(call_g3(x as nat, x as nat, x as nat));
+    0
+}
+
 // ── proof-fn shapes ─────────────────────────────────────────────────────────
 
 // F4: plain proof fn, no tactic block (the --lean-all-proofs route; fuel unfold)
