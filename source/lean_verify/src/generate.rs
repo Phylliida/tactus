@@ -1547,6 +1547,18 @@ pub(crate) fn spec_world_cmds_tagged(
                             {
                                 push_lenient(&mut cmds, "seq measure companion", &mut || vec![cmd.clone()]);
                             }
+                            // Drop-k companion (bootstrap-46): emit the general
+                            // `Seq.subrange_tail_len_lt` ONCE, on the drop_first
+                            // pass (not drop_last), so a raw `subrange u k (len u)`
+                            // recursion terminates. Rides drop_first's own seg, so
+                            // later parts' decreasing_by resolves it via imports.
+                            if rel == "Seq.drop_first" {
+                                if let Some(cmd) =
+                                    seq_subrange_tail_companion_cmd(f, &all_fns, bc_lemma_funcs)
+                                {
+                                    push_lenient(&mut cmds, "seq subrange-tail companion", &mut || vec![cmd.clone()]);
+                                }
+                            }
                         }
                         segs.push((cmds.len(), DefsSeg::Base));
                     }
@@ -1652,6 +1664,80 @@ fn seq_measure_companion_cmd(
          {len} A ({df} A s) < {len} A s := by\n  \
          have hx := {ax_n} A s {j_arg} ({k_expr}) (by omega)\n  \
          simp only [{df}]\n  \
+         omega",
+    )))
+}
+
+/// Companion for **drop-k** seq measures: a general
+/// `Seq.subrange_tail_len_lt` proving `len (subrange s j (len s)) < len s`
+/// for any `j ≥ 1`. Unlike `seq_measure_companion_cmd` (which is keyed to a
+/// specific `drop_first`/`drop_last` *def* head), this handles a raw
+/// `subrange u k (len u)` recursion for arbitrary `k` — e.g.
+/// `m3_blinker.ffnf` recursing on `subrange u 2 (len u)`, which has no
+/// `drop_{first,last}` head for `apply` to unify (bootstrap-46).
+///
+/// Emitted ONCE, piggy-backed on the `Seq.drop_first` emission site (by
+/// which point `axiom_seq_subrange_len`, `Seq.len` and `Seq.subrange` are
+/// all in scope and the axiom has landed). The theorem lands in the SAME
+/// `Seq.*` namespace as `drop_first_len_lt` (derived from the drop_first
+/// fn's qualified name), so `DECREASING_BY_TACTIC`'s
+/// `apply {ns}.Seq.subrange_tail_len_lt` rung resolves via the part-import
+/// chain exactly like the drop_first companion. Proven from
+/// `axiom_seq_subrange_len` with a canned tactic (validated against Lean
+/// 4.25.0) — a theorem, not an axiom. Returns `None` when the subrange-len
+/// axiom, `Seq.len` or `Seq.subrange` isn't part of this emission.
+///
+/// LIMITATION: emitted only on the `Seq.drop_first` site, so a crate that
+/// recurses on `subrange s k (len s)` WITHOUT also emitting `Seq.drop_first`
+/// would not get it. Every attested drop-k user (m3_blinker.ffnf) also uses
+/// `drop_first`, so this holds today; a future counterexample is an easy
+/// follow-up (hoist the emission to the axiom-flush site).
+fn seq_subrange_tail_companion_cmd(
+    drop_first_fn: &FunctionX,
+    all_fns: &[&FunctionX],
+    bc_lemma_funcs: &[&FunctionX],
+) -> Option<Command> {
+    let ax = bc_lemma_funcs.iter().find(|a| {
+        crate::to_lean_type::lean_name_relative(&a.name.path) == "seq.axiom_seq_subrange_len"
+    })?;
+    let len_fn = all_fns.iter().find(|a| {
+        crate::to_lean_type::lean_name_relative(&a.name.path) == "seq.Seq.len"
+    })?;
+    let subrange_fn = all_fns.iter().find(|a| {
+        crate::to_lean_type::lean_name_relative(&a.name.path) == "seq.Seq.subrange"
+    })?;
+    // The `seq.Seq` datatype path = the len fn's path minus its last segment.
+    let seq_path = {
+        let lp = &len_fn.name.path;
+        let segs: Vec<_> = lp.segments.iter().take(lp.segments.len() - 1).cloned().collect();
+        if segs.is_empty() {
+            return None;
+        }
+        std::sync::Arc::new(vir::ast::PathX {
+            krate: lp.krate.clone(),
+            segments: std::sync::Arc::new(segs),
+        })
+    };
+    // Name the theorem in drop_first's OWN namespace (`{ns}.Seq.…`), so the
+    // tactic's `q("Seq.subrange_tail_len_lt")` citation resolves identically
+    // to the `drop_first_len_lt` companion. Derive `{ns}.Seq` by stripping
+    // the trailing method segment off drop_first's qualified name
+    // (`lib.Seq.drop_first` → `lib.Seq`).
+    let df = crate::to_lean_type::lean_name(&drop_first_fn.name.path);
+    let ns_seq = match df.rsplit_once('.') {
+        Some((pre, _)) => pre.to_string(),
+        None => return None,
+    };
+    let thm = format!("{ns_seq}.subrange_tail_len_lt");
+    let len = crate::to_lean_type::lean_name(&len_fn.name.path);
+    let subrange = crate::to_lean_type::lean_name(&subrange_fn.name.path);
+    let ax_n = crate::to_lean_type::lean_name(&ax.name.path);
+    let seq_t = crate::to_lean_type::lean_name(&seq_path);
+    Some(Command::Raw(format!(
+        "theorem {thm} (A : Type) [Nonempty A] (s : {seq_t} A) (j : Int)\n    \
+         (h1 : 1 ≤ j) (h2 : j ≤ {len} A s) :\n    \
+         {len} A ({subrange} A s j ({len} A s)) < {len} A s := by\n  \
+         have hx := {ax_n} A s j ({len} A s) (by omega)\n  \
          omega",
     )))
 }

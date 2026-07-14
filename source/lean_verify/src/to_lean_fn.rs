@@ -75,6 +75,20 @@ pub(crate) const TACTIC_BODY_FALLBACK: &str = "sorry";
 ///   div rung so the cheap clean-hypothesis path is unchanged and the
 ///   other measures are untouched (bootstrap-44). Verified against the
 ///   real emitted `word_numbering` defs part.
+/// - `apply Seq.subrange_tail_len_lt <;> …` — **drop-k seq measures**
+///   `len (subrange u j (len u)) < len u` for any `j ≥ 1` (bootstrap-46).
+///   A raw `subrange u k (len u)` recursion (k ≠ 1, so NOT routed through
+///   `drop_first`) — e.g. `m3_blinker.ffnf` recursing on
+///   `subrange u 2 (len u)` — has no `drop_{first,last}` head to unify, so
+///   it dispatches to this GENERAL companion (emitted once beside the
+///   drop_first companion, see `seq_subrange_tail_companion_cmd` in
+///   `generate.rs`). `apply` unifies `j` from the literal subrange start and
+///   leaves side goals `1 ≤ j` (omega) and `j ≤ len u` (from the nested
+///   dite guard `len u ≥ k`, closed by the same
+///   `assumption`/`omega`/`(simp_all <;> omega)`/`simp_all` ladder as the
+///   drop_first rung). Placed BEFORE the drop_first rung; heads are disjoint
+///   (`subrange` vs `Seq.drop_first`) so ordering is immaterial to
+///   correctness.
 /// - `apply Seq.drop_{first,last}_len_lt <;> …` — vstd **seq measures**
 ///   `len (drop_first w) < len w`: dispatches to the measure-companion
 ///   theorem emitted next to the corresponding def (see
@@ -129,7 +143,8 @@ fn decreasing_by_tactic() -> String {
         None => n.to_string(),
     };
     format!(
-        "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Nat.div_lt_self <;> (simp_all <;> omega)) | (apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | (apply {dl} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | ((repeat split) <;> omega) | decreasing_tactic)",
+        "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Nat.div_lt_self <;> (simp_all <;> omega)) | (apply {ds} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | (apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | (apply {dl} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | ((repeat split) <;> omega) | decreasing_tactic)",
+        ds = q("Seq.subrange_tail_len_lt"),
         df = q("Seq.drop_first_len_lt"),
         dl = q("Seq.drop_last_len_lt"),
     )
