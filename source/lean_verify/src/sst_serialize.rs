@@ -83,9 +83,19 @@
 //!   the BARE prop leaf (`exp_leaf` — the forward hyp for the rest of the
 //!   body). Production renders the prop once and uses it span_mark'd for
 //!   the goal, bare for the hyp (`sst_to_lean::walk_obligations`).
-//! * `StmX::Loop{cond|original_cond, invs, modified_vars}` — cond +
-//!   ¬cond leaves, standard-invariant leaves, loop-state binders from
-//!   the havoc set.
+//! * `StmX::Loop{cond|original_cond, invs, decrease, id}` (finding-3) —
+//!   the maintain/use telescopes production builds. `modified_vars` is
+//!   NOT read (it is `None` at this SST stage); the havoc set is
+//!   RE-DERIVED via `sst_to_lean::collect_modifications(body)` filtered
+//!   by `local_typs` (= production's `WpCtx.type_map`), exactly as
+//!   `build_wp_loop` does. Emits: the modified-local `∀`-binders +
+//!   parallel `_h_ctx_N` type-bound hyps, the standard invariants as
+//!   `(_h_ctx_N, ANNOTATED obligation leaf)`, the ANNOTATED cond /
+//!   ¬cond hyps (shared `_h_ctx_N` name), and the single-level decrease
+//!   snapshot (`_tactus_d_old_<id>_0`) + its annotated
+//!   `0 ≤ D ∧ D < d_old` obligation. `_h_ctx_N` names mirror
+//!   `OblCtx::split_leading_binders`' counter byte-for-byte so the
+//!   binder-name ids unify with the goal side.
 //!
 //! ## Deliberately NOT read (each a stage-A exclusion — fail-loud)
 //!
@@ -99,10 +109,11 @@
 //! * `StmX::OpenInvariant` / `ClosureInner` / `BreakOrContinue` —
 //!   concurrency, closures, loop control. `BreakOrContinue` therefore also
 //!   excludes `invariant_except_break` loops.
-//! * `check.unwind`, `check.local_decls` (except the loop havoc set via
-//!   `modified_vars`), masks, recommends, fuel/reveal *state*, decrease
-//!   measures, `assert_id`/`base_error`, `mode`, trait dispatch/impl-subst
-//!   — none bear a stage-A obligation the mirror models.
+//! * `check.unwind`, masks, recommends, fuel/reveal *state*,
+//!   `assert_id`/`base_error`, `mode`, trait dispatch/impl-subst — none
+//!   bear a stage-A obligation the mirror models. (`check.local_decls`
+//!   IS read now — finding-3 uses it as the loop havoc set's typ map;
+//!   loop `decrease` measures ARE read for the decrease obligation.)
 //! * `StmX::Air` / `Fuel` / `RevealString` — transparently ELIDED (the
 //!   walker returns `after` unchanged for these); not obligation-bearing,
 //!   so not a rejection.
@@ -271,6 +282,15 @@ struct Serializer {
     /// The `Return` arm pairs it with the rendered return expression to
     /// emit `RetBind.RetLet <name> <val>`.
     pending_ret_name: Option<u64>,
+    /// `VarIdent → Typ` for the fn's local declarations (finding-3),
+    /// cloned from `check.local_decls` before the body walk. Mirrors
+    /// production's `WpCtx.type_map` (built the SAME way,
+    /// `sst_to_lean.rs`): `build_wp_loop` looks up each modified-local's
+    /// typ here rather than trusting `StmX::Loop.modified_vars` (which is
+    /// `None` at this SST stage). The `Loop` arm re-derives the havoc set
+    /// via `collect_modifications(body)` and filters by this map, exactly
+    /// as production does.
+    local_typs: HashMap<VarIdent, Typ>,
 }
 
 impl Serializer {
@@ -310,6 +330,55 @@ impl Serializer {
             loc,
             Some(e.span.clone()),
             AssertKind::Obligation(ObligationKind::Plain),
+            inner,
+        );
+        Ok(self.leaves.intern(pp_expr(&marked)))
+    }
+
+    /// Render `¬<annotated e>` as a leaf, byte-matching production's
+    /// loop-exit hypothesis (finding-3). The `use` telescope pushes
+    /// `LExpr::not(cond_marked(&c))` (`sst_to_lean::walk_loop`), i.e. the
+    /// NEGATION wraps the span_mark'd cond (unlike `neg_leaf`, which
+    /// negates the bare prop). Reconstructed via the identical
+    /// `span_mark` → `not` → `pp_expr` path, so the interned text equals
+    /// the goal-side `neg_cond_ann` leaf and the two cancel across the
+    /// bridge. `kind` never reaches the pp (see `oblig_leaf`), so `Plain`
+    /// suffices even though production marks the cond `LoopCondition`.
+    fn neg_oblig_leaf(&mut self, e: &Exp) -> Sr<u64> {
+        let inner = crate::to_lean_sst_expr::sst_exp_to_ast_checked(e)
+            .map_err(|reason| format!("leaf-render: {}", reason))?;
+        let loc = crate::obligation_naming::format_rust_loc(&e.span);
+        let marked = LExpr::span_mark(
+            loc,
+            Some(e.span.clone()),
+            AssertKind::Obligation(ObligationKind::Plain),
+            inner,
+        );
+        Ok(self.leaves.intern(pp_expr(&LExpr::not(marked))))
+    }
+
+    /// Render the single-level loop decrease obligation as an ANNOTATED
+    /// leaf, byte-matching production's `decrease_marked` (finding-3).
+    /// Production (`sst_to_lean::lex_decrease_obligation` +
+    /// `build_wp_loop`) builds, for a one-level `decreases D`:
+    ///   `span_mark(loc, LoopDecrease, (0 ≤ D) ∧ (D < _tactus_d_old_<id>_0))`
+    /// where `D = lower_validated(&decrease[0])` (empty `RenderCtx`, so
+    /// identical to `exp_leaf`'s `sst_exp_to_ast_checked`) and the `old`
+    /// snapshot is a synthetic Var of the per-loop d_old name. `kind`
+    /// (`LoopDecrease`) is byte-irrelevant; the loc is `decrease[0].span`.
+    fn decrease_oblig_leaf(&mut self, d: &Exp, loop_id: u64) -> Sr<u64> {
+        let cur = crate::to_lean_sst_expr::sst_exp_to_ast_checked(d)
+            .map_err(|reason| format!("leaf-render: {}", reason))?;
+        let old = LExpr::var_synthetic(format!("_tactus_d_old_{}_0", loop_id));
+        let inner = LExpr::and(
+            LExpr::le(LExpr::lit_int("0"), cur.clone()),
+            LExpr::lt(cur, old),
+        );
+        let loc = crate::obligation_naming::format_rust_loc(&d.span);
+        let marked = LExpr::span_mark(
+            loc,
+            Some(d.span.clone()),
+            AssertKind::Obligation(ObligationKind::LoopDecrease),
             inner,
         );
         Ok(self.leaves.intern(pp_expr(&marked)))
@@ -419,27 +488,17 @@ impl Serializer {
                 original_cond,
                 body,
                 invs,
-                modified_vars,
+                decrease,
+                id,
                 ..
             } => {
-                // Loop-state binders = the havoc set (the modified locals
-                // the maintain/use telescopes quantify over). Extracted
-                // here so `HavocSet`'s (private) type never appears in a
-                // signature. `IndexMap` iteration is insertion-ordered ⇒
-                // deterministic.
-                let binder_entries: Vec<(u64, u64)> = match modified_vars {
-                    Some(hs) => {
-                        let mut entries = Vec::with_capacity(hs.vars.len());
-                        for (vid, (typ, _hvar)) in hs.vars.iter() {
-                            let id = self.binder_id(vid);
-                            let t = self.typ_leaf(typ);
-                            entries.push((id, t));
-                        }
-                        entries
-                    }
-                    None => Vec::new(),
-                };
-                self.loop_stm(cond, original_cond, body, invs, &binder_entries)
+                // finding-3: `modified_vars` is IGNORED (it's `None` at
+                // this SST stage — production's `build_wp` spells it `_`
+                // and RE-DERIVES the havoc set in `build_wp_loop` via
+                // `collect_modifications(body)` + `type_map`). `loop_stm`
+                // mirrors that path. `id` names the `_tactus_d_old`
+                // snapshot; `decrease` is the termination measure.
+                self.loop_stm(cond, original_cond, body, invs, decrease, *id)
             }
 
             StmX::DeadEnd(inner) => {
@@ -478,13 +537,21 @@ impl Serializer {
         Ok(format!("({}.StmData.Seq {} {})", NS, box_(&head), box_(&tail)))
     }
 
+    /// Serialize a `StmX::Loop` into the finding-3 `StmData.Loop` shape:
+    /// the maintain/use telescopes production builds around a loop, made
+    /// explicit so refWp can recompute them. Mirrors `sst_to_lean`'s
+    /// `build_wp_loop` + `walk_loop` + `push_mod_var_frames` +
+    /// `split_leading_binders` + `lex_decrease_obligation`. Every emitted
+    /// leaf is byte-reconstructed via the SAME render path production
+    /// uses, so matching leaves cancel across the W2 bridge.
     fn loop_stm(
         &mut self,
         cond: &Option<(Stm, Exp)>,
         original_cond: &Option<(Stm, Exp)>,
         body: &Stm,
         invs: &[LoopInv],
-        binder_entries: &[(u64, u64)],
+        decrease: &[Exp],
+        loop_id: u64,
     ) -> Sr<String> {
         // Recover the while-condition from `cond` or the preserved
         // `original_cond` (break-lowering nulls `cond`). A genuine
@@ -494,32 +561,108 @@ impl Serializer {
             (None, Some((_, c))) => c,
             (None, None) => return Err("loop-without-cond".to_string()),
         };
-        let c = self.exp_leaf(cond_exp)?;
-        let nc = self.neg_leaf(cond_exp)?;
+        // Stage A: single-level `decreases` only. A multi-level lex
+        // measure needs the full `lex_decrease_obligation` chain +
+        // per-level d_old lets the flat mirror does not carry.
+        if decrease.len() != 1 {
+            return Err("loop-multilevel-decrease".to_string());
+        }
+
+        // Modified locals = production's RE-DERIVED havoc set, NOT the
+        // (None) `StmX::Loop.modified_vars`: `collect_modifications(body)`
+        // in body-traversal order, filtered to those with a `type_map`
+        // entry (`build_wp_loop`:collect + `filter_map(type_map.get)`).
+        let mut mod_names: Vec<&VarIdent> = Vec::new();
+        let mut locally_declared: std::collections::HashSet<&VarIdent> =
+            std::collections::HashSet::new();
+        crate::sst_to_lean::collect_modifications(body, &mut locally_declared, &mut mod_names);
+
+        // The shared `_h_ctx_N` counter (mirrors `OblCtx::
+        // split_leading_binders`: one increment per HYPOTHESIS frame that
+        // trails the mod-var binders — the mod-var bounds, then the
+        // invariants, then the cond — while the ∀-binder frames for the
+        // mod-vars themselves keep their source names).
+        let mut hyp_counter: usize = 0;
+
+        // Havoc-set binders (id, typ leaf) + the parallel bound list.
+        // Each modified local is re-quantified `∀ (x : T)`; an int-typed
+        // one gets a `_h_ctx_N` type-bound hyp right after (production's
+        // `push_mod_var_frames`, BARE `LExpr::var(name)` — no deref,
+        // unlike params).
+        let mut binder_entries: Vec<(u64, u64)> = Vec::new();
+        let mut bound_entries: Vec<Option<(u64, u64)>> = Vec::new();
+        for vid in mod_names.iter() {
+            // `filter_map(type_map.get)`: a mod name with no local-decl
+            // typ is dropped (as production drops it), keeping `binders`
+            // and `bound_entries` parallel.
+            let Some(typ) = self.local_typs.get(*vid).cloned() else {
+                continue;
+            };
+            let bid = self.binder_id(vid);
+            let tleaf = self.typ_leaf(&typ);
+            binder_entries.push((bid, tleaf));
+            let name = crate::lean_name::LeanName::from_var_ident(vid);
+            match crate::to_lean_sst_expr::type_bound_predicate(&LExpr::var(name.clone()), &typ) {
+                Some(pred) => {
+                    let hname = self.text_leaf(&format!("_h_ctx_{}", hyp_counter));
+                    hyp_counter += 1;
+                    let prop = self.leaves.intern(pp_expr(&pred));
+                    bound_entries.push(Some((hname, prop)));
+                }
+                None => bound_entries.push(None),
+            }
+        }
 
         // Standard `invariant` clauses only (at_entry && at_exit). An
         // `invariant_except_break` (at_entry only) or loop-`ensures`
-        // (at_exit only) needs the entry/exit distinction the flat leaf
-        // list does not carry.
-        let mut inv_leaves = Vec::with_capacity(invs.len());
+        // (at_exit only) needs the entry/exit distinction the flat shape
+        // does not carry. Each becomes a `(_h_ctx_N name, ANNOTATED
+        // obligation leaf)` — the annotated leaf serves BOTH the
+        // init/maintain obligation AND the ∀-hyp (production reuses the
+        // one span_mark'd `LoopInvariant` leaf for both roles, unlike
+        // Assert's bare/annotated split).
+        let mut inv_entries: Vec<(u64, u64)> = Vec::new();
         for li in invs.iter() {
             if !(li.at_entry && li.at_exit) {
                 return Err("loop-nonstandard-invariant".to_string());
             }
-            inv_leaves.push(self.exp_leaf(&li.inv)?);
+            let hname = self.text_leaf(&format!("_h_ctx_{}", hyp_counter));
+            hyp_counter += 1;
+            let oblig = self.oblig_leaf(&li.inv)?;
+            inv_entries.push((hname, oblig));
         }
-        let inv_list = self.leaf_list(&inv_leaves);
-        let binders = self.binder_list(binder_entries);
+
+        // The loop condition: one shared `_h_ctx_N` name for both the
+        // maintain hyp (`cond_ann`) and the use hyp (`neg_cond_ann`), the
+        // last hyp in the telescope (counter not consumed further).
+        let cond_name = self.text_leaf(&format!("_h_ctx_{}", hyp_counter));
+        let cond_ann = self.oblig_leaf(cond_exp)?;
+        let neg_cond_ann = self.neg_oblig_leaf(cond_exp)?;
+
+        // Decreases snapshot let (`_tactus_d_old_<id>_0 := D`, maintain
+        // only) + the body-end decrease obligation.
+        let d_old_name = self.text_leaf(&format!("_tactus_d_old_{}_0", loop_id));
+        let d_old_val = self.exp_leaf(&decrease[0])?;
+        let decrease_oblig = self.decrease_oblig_leaf(&decrease[0], loop_id)?;
+
+        let inv_hyps = self.binder_list(&inv_entries);
+        let binders = self.binder_list(&binder_entries);
+        let bounds = self.param_bound_list(&bound_entries);
 
         let body_term = self.stm(body)?;
         Ok(format!(
-            "({}.StmData.Loop {} {} {} {} {})",
+            "({}.StmData.Loop {} {} {} {} {} {} {} {} {} {})",
             NS,
-            box_(&inv_list),
-            c,
-            nc,
+            box_(&inv_hyps),
             box_(&binders),
-            box_(&body_term)
+            box_(&bounds),
+            cond_name,
+            cond_ann,
+            neg_cond_ann,
+            d_old_name,
+            d_old_val,
+            decrease_oblig,
+            box_(&body_term),
         ))
     }
 
@@ -749,6 +892,18 @@ fn serialize(
         .dest
         .as_ref()
         .map(|d| s.text_leaf(&crate::to_lean_type::sanitize(d.0.as_str())));
+
+    // Local-decl typ map (finding-3): the `Loop` arm re-derives its
+    // modified-local havoc set from the body and looks up each var's typ
+    // here — the SAME source production's `WpCtx.type_map` uses
+    // (`check.local_decls`, `sst_to_lean.rs`). Cloned (owned) so the
+    // statement recursion stays a plain `&Stm → String` walk over `&mut
+    // self` without threading `check` through every arm.
+    s.local_typs = check
+        .local_decls
+        .iter()
+        .map(|d| (d.ident.clone(), d.typ.clone()))
+        .collect();
 
     // Body.
     let stm_term = s.stm(&check.body)?;
