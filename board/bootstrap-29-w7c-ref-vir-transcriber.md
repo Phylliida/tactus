@@ -1,9 +1,9 @@
 ---
 title: "W7c-ref — reference def-body transcriber on the VIR ExprX surface (raw_vir_exp)"
-status: todo
-claimed_by:
+status: in_progress
+claimed_by: opus-w7c-ref
 created: 2026-07-14T23:20:00Z
-updated: 2026-07-14T23:20:00Z
+updated: 2026-07-14T23:45:00Z
 ---
 
 ## Description
@@ -86,5 +86,80 @@ they must match this side's shapes) and W7d (def emission + bridge).
     `raw_vir_exp` leaf→Match. Co-design the `MatchR` arm-list binder ids with the
     production `lexpr_to_exprdata` Match arm so `def_eq` agrees by construction.
 
+- (2026-07-14, opus-w7c-ref) **PREMISE EMPIRICALLY VALIDATED + reference core
+  landed (compiles, 345/0, verdict-neutral).**
+  - **The biggest de-risk — Match genuinely survives to `f.body` (ground truth,
+    not "the arm exists").** The `ast.rs:1200` note "*ast_simplify replaces Match
+    with other expressions*" made this load-bearing: if the def-body VIR were
+    post-simplify, `Match` would be desugared and the whole VIR-Match premise
+    wrong. Checked the EMITTED fixture:
+    `bootstrap-fixture/out/lib/TactusDefs_lib_exec__root.lean:14` =
+    `noncomputable def lib.tree_head (t : lib.Tree) : Int := match t with |
+    lib.Tree.Leaf v => v | lib.Tree.Node _l _r => 0` — a **native Lean `match`**.
+    The desugared `if .isLeaf` form appears ONLY on the obligation/SST side
+    (`head_exec.lean:13`, the exec-fn goal). ⟹ `spec_fn_to_ast` reads a
+    PRE-simplify `f.body`; production's `expr_to_node` Match arm
+    (`to_lean_expr.rs:680`) is genuinely reached. Also captured `lib.tri` =
+    `if n = 0 then 0 else n + lib.tri (Int.toNat (n - 1))` (the Ite exemplar,
+    `Clip`→`Int.toNat`). `sum_tree` is PRUNED (no caller) — only `sq`/`tri`/
+    `tree_head` emit, `tree_head` is the reachable Match exemplar.
+  - **Landed `raw_vir_exp` + 3 helpers** in `sst_serialize.rs` (next to
+    `raw_exp`, `#[allow(dead_code)]`): fixture-reachable arms = Box/Unbox peel,
+    `Const(Int/Bool)`, `Var`/`VarAt`/`ReadPlace(Local)`, `Clip`, `Binary` (reuses
+    `binop_opcode`), `Call(CallTarget::Fun, 1-arg)`, `UnaryOpr(Field)`,
+    `If(_,_,Some)`→`Ite` (else-less → fail-loud `if-noelse`, the VIR-vs-SST
+    divergence), and **`Match`→`MatchR`** (the priority arm): scrutinee via
+    `raw_vir_place` (`Local` only), arms right-fold into
+    `RawArmList::Cons(ctor_id, BinderIdList, body, tail)`, guard fail-loud unless
+    trivially-`true` (production's `expr_to_node` silently DROPS `arm.guard` — a
+    real guard is a silent mistranslation the bridge must not paper over).
+    Quantifiers + multi-arg `Call` stay fail-loud (`quant`/`call-nonfun`, tgt-
+    slice-only). Added `vir_expr_construct_tag` (census tags, mirrors
+    `exp_construct_tag`).
+  - **§7 Q1 co-design ANCHOR SOLVED — single source of truth.** Extracted
+    `ctor_pattern_name(dt, variant) -> Option<String>` in `to_lean_expr.rs`; BOTH
+    production `pattern_to_ast` and reference `pattern_ctor_binds` call it, so the
+    Match ctor id string CANNOT drift (was a duplicate-logic risk). Behavior-
+    preserving refactor of the live emit path (all 342 pre-existing tests green).
+    Field binder ids: reference reads the SAME VIR `fields` Vec in the SAME
+    `.iter()` order production does (no sort either side) ⟹ identical ids by
+    construction. (`_l`/`_r` are named `PatternX::Var`, not `Wildcard` — wildcard-
+    in-ctor-field fails loud, unreached.)
+  - **Verdict-neutral by construction:** `raw_vir_exp` is a NEW dead-code fn,
+    never on the emit path; NO `tactus-core` edit (no olean re-emit / base-hash
+    change). The only live touch is the behavior-preserving `ctor_pattern_name`
+    extraction.
+  - **Tests (3 new, lib suite 342→345/0):** `raw_vir_exp_ite_var_leaves`
+    (the `tri` Ite shape — converges with SST `raw_exp_ite_body`),
+    `raw_vir_exp_if_noelse_fails` (the OPTIONAL-else divergence),
+    `raw_vir_exp_peels_box_and_reads_var` (leaf/peel parity). Added `mk_vexpr`
+    (VIR `Expr` is the same `Arc<SpannedTyped<_>>` shape as SST `Exp`, so it
+    mirrors `mk_exp`). **Match arm NOT unit-tested by design** — a hand-built
+    ctor `Path` can render differently under `lean_name` than the compiler's, so
+    a hand-built Match test would test the arm against ITSELF, not production.
+    Its real validation is the e2e `def_eq` bridge (W7d) over the emitted
+    `lib.tree_head`, where §7 Q1 (ctor/binder id interning agreement vs REAL
+    production output) genuinely gets exercised.
+  - **NEXT (hand-off):** (1) production `lexpr_to_exprdata` Match/Ite arms
+    (`bootstrap-28`) — must intern the ctor id from `LPattern::Ctor.name` (=
+    `ctor_pattern_name` output) + binder ids from the arm's `LPattern::Var` args,
+    same order. (2) W7d def-body entry point: `raw_vir_exp(f.body)` → `RawDef` +
+    `render_def`, production `DefData`, bridge `def_eq`. (3) def-header
+    (`RawDef`/`DefData` params+ret) + datatype (`RawDt`/`DtData`) — separate VIR
+    input surfaces, still to transcribe. (4) if W7d needs `sum_tree` (Box-deref
+    inside a match arm), add a fixture caller or use the tgt slice — it's pruned
+    today.
+
 ## Writeup
-_when done_
+_partial (reference transcriber core landed). The def-body REFERENCE transcriber
+`raw_vir_exp` (+ `raw_vir_place`/`pattern_ctor_binds`/`pattern_binder_id`) is
+implemented on the VIR `ExprX` surface for the fixture-reachable arms including
+the priority `Match`→`MatchR`, compiles clean, and is unit-tested on the cheap
+structural arms (345/0). The premise that `Match` survives to the def body was
+validated against the emitted fixture (`lib.tree_head` is a native Lean `match`).
+The §7 Q1 ctor-id co-design is solved via the shared `ctor_pattern_name` helper
+(single source of truth, no drift). Verdict-neutral (dead code, no tactus-core
+edit). Remaining before the task closes: production-side Match/Ite arms
+(bootstrap-28), the W7d def-body entry point + e2e `def_eq` bridge (the Match
+arm's real validation), and the def-header/datatype input surfaces. See Progress
+for line refs + the guard/scrutinee/wildcard fail-loud rationale._

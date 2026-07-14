@@ -1182,33 +1182,49 @@ fn collect_pattern_binding_typs(
     }
 }
 
+/// The Lean constructor name a `PatternX::Constructor(dt, variant, _)`
+/// (or a `ExprX::Ctor`) renders to — the co-design anchor for W7's Match-arm
+/// ctor id (`DESIGN-W7-defslayer.md` §7 Q1). The bridge only agrees if the
+/// PRODUCTION side (`pattern_to_ast` → `lexpr_to_exprdata`) and the REFERENCE
+/// side (`sst_serialize::raw_vir_exp`) intern the *identical* ctor string, so
+/// it lives in ONE place rather than being duplicated across the two
+/// transcribers. Returns `None` for tuple datatypes (rendered as Lean pair
+/// patterns with no named ctor — the reference fails loud on them; none appear
+/// in the fixture, whose `Tree` is a `Dt::Path`).
+pub(crate) fn ctor_pattern_name(dt: &Dt, variant: &Ident) -> Option<String> {
+    match dt {
+        Dt::Path(path) => {
+            let v = if variant.as_str() == short_name(path) {
+                "mk".to_string()
+            } else {
+                sanitize(variant)
+            };
+            Some(format!("{}.{}", lean_name(path), v))
+        }
+        Dt::Tuple(_) => None,
+    }
+}
+
 pub(crate) fn pattern_to_ast(pat: &PatternX) -> LPattern {
     match pat {
         PatternX::Wildcard(_) => LPattern::Wildcard,
         PatternX::Var(binding) => LPattern::Var(crate::lean_name::LeanName::from_var_ident(&binding.name)),
         PatternX::Constructor(dt, variant, pats) => {
-            let name = match dt {
-                Dt::Path(path) => {
-                    let v = if variant.as_str() == short_name(path) {
-                        "mk".to_string()
-                    } else {
-                        sanitize(variant)
-                    };
-                    format!("{}.{}", lean_name(path), v)
-                }
+            let name = match ctor_pattern_name(dt, variant) {
+                Some(n) => n,
                 // Verus tuples render as Lean pair patterns, matching
                 // the expr side (`ExprNode::Tuple`) — the tuple%N
                 // constructor name has no Lean counterpart. 1-tuples
                 // flatten to their element (the type renderer does the
                 // same), so the sub-pattern stands alone.
-                Dt::Tuple(1) => {
-                    return pattern_to_ast(&pats[0].a.x);
-                }
-                Dt::Tuple(_) => {
-                    return LPattern::Tuple(
-                        pats.iter().map(|p| pattern_to_ast(&p.a.x)).collect(),
-                    );
-                }
+                None => match dt {
+                    Dt::Tuple(1) => return pattern_to_ast(&pats[0].a.x),
+                    _ => {
+                        return LPattern::Tuple(
+                            pats.iter().map(|p| pattern_to_ast(&p.a.x)).collect(),
+                        );
+                    }
+                },
             };
             LPattern::Ctor {
                 name,
