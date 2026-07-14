@@ -758,13 +758,14 @@ by { decide }
 
 // Finding-2 payoff: refWp on add_capped's ctx reproduces production goal 0's
 // seed telescope EXACTLY — all NAMED ∀-binders, no anonymous arrows. Leaf ids
-// are the production ones (bootstrap-fixture/out/lib/cert/add_capped.cert.lean):
-//   params x=0:Int=1, y=3:Int=1; bounds h_x_bound=19:prop2, h_y_bound=18:prop4;
-//   reqs h_req0=17:(x<1000)=5, h_req1=16:(y<1000)=6; obligation leaf 15.
-// Expected spine = All 0 1 (All 19 2 (All 3 1 (All 18 4 (All 17 5
-//   (All 16 6 (Leaf 15)))))) — the first assert goal, verbatim. The Assert
+// are the production ones from the REGENERATED cert (2026-07-14 batched regen,
+// bootstrap-fixture/out/lib/cert/add_capped.cert.lean):
+//   params x=0:Int=1, y=4:Int=1; bounds h_x_bound=3:prop2, h_y_bound=6:prop5;
+//   reqs h_req0=8:(x<1000)=7, h_req1=10:(y<1000)=9; obligation leaf 15.
+// Expected spine = All 0 1 (All 3 2 (All 4 1 (All 6 5 (All 8 7
+//   (All 10 9 (Leaf 15)))))) — the first assert goal, verbatim. The Assert
 // now carries BOTH roles (finding-1): oblig leaf 15 (annotated, drives the
-// GOAL) and hyp leaf 8 (bare, drives the forward frame — unused here since
+// GOAL) and hyp leaf 14 (bare, drives the forward frame — unused here since
 // nothing follows). `wp_stm` reads the oblig, so the goal ends in Leaf 15.
 proof fn ref_wp_add_capped_seed_spine()
     ensures
@@ -772,18 +773,18 @@ proof fn ref_wp_add_capped_seed_spine()
             ref_wp(
                 FnCtxData {
                     typ_params: BinderList::Nil,
-                    params: BinderList::Cons(0, 1, Box::new(BinderList::Cons(3, 1, Box::new(BinderList::Nil)))),
-                    param_bounds: ParamBoundList::Bound(19, 2,
-                        Box::new(ParamBoundList::Bound(18, 4, Box::new(ParamBoundList::Nil)))),
-                    reqs: BinderList::Cons(17, 5, Box::new(BinderList::Cons(16, 6, Box::new(BinderList::Nil)))),
-                    enss: LeafList::Cons(7, Box::new(LeafList::Nil)),
+                    params: BinderList::Cons(0, 1, Box::new(BinderList::Cons(4, 1, Box::new(BinderList::Nil)))),
+                    param_bounds: ParamBoundList::Bound(3, 2,
+                        Box::new(ParamBoundList::Bound(6, 5, Box::new(ParamBoundList::Nil)))),
+                    reqs: BinderList::Cons(8, 7, Box::new(BinderList::Cons(10, 9, Box::new(BinderList::Nil)))),
+                    enss: LeafList::Cons(11, Box::new(LeafList::Nil)),
                 },
-                StmData::Assert(15, 8),
+                StmData::Assert(15, 14),
             ),
             GoalList::Cons(
-                Box::new(GoalData::All(0, 1, Box::new(GoalData::All(19, 2,
-                    Box::new(GoalData::All(3, 1, Box::new(GoalData::All(18, 4,
-                        Box::new(GoalData::All(17, 5, Box::new(GoalData::All(16, 6,
+                Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2,
+                    Box::new(GoalData::All(4, 1, Box::new(GoalData::All(6, 5,
+                        Box::new(GoalData::All(8, 7, Box::new(GoalData::All(10, 9,
                             Box::new(GoalData::Leaf(15)))))))))))))),
                 Box::new(GoalList::Nil)),
         ) == 1
@@ -791,34 +792,35 @@ by { decide }
 
 // Finding-4 + Ret-annotation payoff: the return statement binds `let r := s`
 // before the ANNOTATED postcondition, reproducing add_capped goal 3's tail
-// `… Let 9 14, Let 23 9, Leaf 22`
+// `… Let 16 23, Let 13 16, Leaf 12` from the REGENERATED cert
 // (bootstrap-fixture/out/lib/cert/add_capped.cert.lean). Isolated from the
 // full body: the pre-Ret frame here carries only the last body Assign as
-// FLet(9,14) (leaf 9 = `s`, leaf 14 = `s + 0`); the Ret appends the
-// return binding FLet(23,9) (name 23 = `r`, val 9 = `s`) then closes the
-// annotated obligation leaf 22 (`/- @rust:…85:13 -/ r = x + y`). RetNone
-// (a unit return) leaves the frame unextended — just `… Leaf 22`.
+// FLet(16,23) (leaf 16 = `s`, leaf 23 = `s + 0`); the Ret appends the return
+// binding FLet(13,16) (name 13 = `r`, val 16 = `s`) then closes the annotated
+// obligation leaf 12 (`/- @rust:…85:13 -/ r = x + y`). RetNone (a unit
+// return) leaves the frame unextended — just `… Leaf 12`. The FULL 4-goal
+// add_capped bridge was hand-run to close by `decide` this same turn.
 proof fn ref_wp_ret_return_binding()
     ensures
         goals_eq(
             wp_stm(
-                FrameList::FLet(9, 14, Box::new(FrameList::FNil)),
-                StmData::Ret(Box::new(LeafList::Cons(22, Box::new(LeafList::Nil))),
-                    RetBind::RetLet(23, 9)),
+                FrameList::FLet(16, 23, Box::new(FrameList::FNil)),
+                StmData::Ret(Box::new(LeafList::Cons(12, Box::new(LeafList::Nil))),
+                    RetBind::RetLet(13, 16)),
             ),
             GoalList::Cons(
-                Box::new(GoalData::Let(9, 14, Box::new(GoalData::Let(23, 9,
-                    Box::new(GoalData::Leaf(22)))))),
+                Box::new(GoalData::Let(16, 23, Box::new(GoalData::Let(13, 16,
+                    Box::new(GoalData::Leaf(12)))))),
                 Box::new(GoalList::Nil)),
         ) == 1,
         goals_eq(
             wp_stm(
-                FrameList::FLet(9, 14, Box::new(FrameList::FNil)),
-                StmData::Ret(Box::new(LeafList::Cons(22, Box::new(LeafList::Nil))),
+                FrameList::FLet(16, 23, Box::new(FrameList::FNil)),
+                StmData::Ret(Box::new(LeafList::Cons(12, Box::new(LeafList::Nil))),
                     RetBind::RetNone),
             ),
             GoalList::Cons(
-                Box::new(GoalData::Let(9, 14, Box::new(GoalData::Leaf(22)))),
+                Box::new(GoalData::Let(16, 23, Box::new(GoalData::Leaf(12)))),
                 Box::new(GoalList::Nil)),
         ) == 1
 by { decide }
