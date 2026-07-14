@@ -84,6 +84,15 @@ mis-rendered leaf fails the bridge (mutation-kill at expression level).
   cache-churning edit; pick the `GoalData::Leaf(u64) → additive LeafE(ExprData)`
   migration (§6). W6b has no board file yet — create it when picking up.
 
+- (2026-07-14, opus-b22) **W6b DONE** (`bootstrap-21` → done, commit `3f92ae9`).
+  **W6c STARTED** (`bootstrap-22`, in_progress): the reference-side
+  `ExpX → RawExp` transcription + `typ_data`/`binop_opcode` foundations landed
+  in `source/lean_verify/src/sst_serialize.rs` (additive, census-gated,
+  compile+test green; commit `cca5492`). Remaining W6c = the production-side
+  `LExpr → ExprData` transcription, then W6d wires both into the obligation-leaf
+  emit + bridge (`close`/emitter start producing `LeafE`). See `bootstrap-22`
+  for the atom-id-consistency invariant and the deref/multi-arg open questions.
+
 ## Writeup
 
 _when done: findings, how the code works, assumptions made. Parent design doc:
