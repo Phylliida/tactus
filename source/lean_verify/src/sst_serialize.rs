@@ -206,6 +206,13 @@ use crate::to_lean_type::{lean_name, param_binder_typ, sanitize, short_name, typ
 /// change.
 const NS: &str = "lib";
 
+/// The emitted `tactus-core` namespace (`NS`), for cross-module callers
+/// that assemble bridge terms (`generate::run_bridge_step`, W4a). Keeps
+/// the vendored-rename a one-line change here, not several.
+pub fn cert_ns() -> &'static str {
+    NS
+}
+
 /// The Lean module cert files import to bring the vocabulary into scope
 /// (the real emitted root module, built from `tactus-core/lib.rs`). §6's
 /// vendored-olean plumbing points `LEAN_PATH` at it.

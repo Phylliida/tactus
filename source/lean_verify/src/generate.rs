@@ -2345,6 +2345,24 @@ pub(crate) fn package_check_enabled() -> bool {
     PACKAGE_CHECK_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+static BRIDGE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Called once from the verifier with `args.tactus_bridge` (W4a,
+/// bootstrap-38). When on, the package gate additionally elaborates the
+/// refWp↔production `decide` bridge over every emitted obligation cert
+/// (INSIDE the gate — the same `example : goals_eq (ref_wp ctx sst) goals
+/// = 1 := by decide` the probe `run.sh` scripts append externally). Opt-in
+/// and verdict-neutral in W4a: PASS/FAIL is collected and reported, never
+/// turned into a verification error (W4c does that). Needs tactus-core's
+/// oleans on the elaboration path — see `run_bridge_step`.
+pub fn set_bridge_enabled(on: bool) {
+    BRIDGE_ENABLED.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+pub(crate) fn bridge_enabled() -> bool {
+    BRIDGE_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Package oleans built by per-fn checks THIS PROCESS (M5c): the
 /// crate-end gate consults this to skip re-elaborating modules the
 /// per-fn path already built — same-process writes, so no staleness
@@ -3149,6 +3167,13 @@ pub struct PackageGateReport {
     pub skipped_sccs: Vec<String>,
     /// (module leaf, lean output) per failed elaboration.
     pub failures: Vec<(String, String)>,
+    /// W4a (bootstrap-38): the in-gate refWp↔production bridge. `None`
+    /// when `--tactus-bridge` is off (no bridge run) or when tactus-core
+    /// oleans could not be located (a loud note instead of a verdict);
+    /// `Some` carries a one-line summary the gate prints verbatim. The
+    /// bridge is INFORMATIONAL in W4a — its outcome never enters
+    /// `failures` and so never becomes a verification error.
+    pub bridge_note: Option<String>,
 }
 
 /// Crate-level package gate (DESIGN-emit-module.md M4): regenerate the
@@ -3237,7 +3262,7 @@ pub fn check_package(
             modules: 1 + stmt_mods.len(), reused,
             pkg_cached: PKG_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
             island_cached: ISLAND_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
-            skipped_sccs, failures,
+            skipped_sccs, failures, bridge_note: None,
         });
     }
     let pkg_dir = lean_out_root().join(sanitize(crate_name)).join("pkg");
@@ -3251,6 +3276,14 @@ pub fn check_package(
     let link_path = format!("{}:{}", base_path, pkg_dir.display());
     let link_mod = link_module_name(&defs);
     run_lean(&pkg_dir, &link_mod, false, &link_path, &mut failures);
+    // W4a (bootstrap-38): the in-gate refWp↔production bridge, opt-in via
+    // `--tactus-bridge`. Verdict-neutral — its outcome is a note, not a
+    // `failures` entry, so it cannot change the gate's error count in W4a.
+    let bridge_note = if bridge_enabled() && failures.is_empty() {
+        Some(run_bridge_step(crate_name, &base_path))
+    } else {
+        None
+    };
     Ok(PackageGateReport {
         modules: 1 + stmt_mods.len() + leafs.len() + 1,
         reused,
@@ -3258,7 +3291,157 @@ pub fn check_package(
         island_cached: ISLAND_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
         skipped_sccs,
         failures,
+        bridge_note,
     })
+}
+
+/// W4a (bootstrap-38): elaborate the refWp↔production `decide` bridge over
+/// every emitted obligation cert, INSIDE the package gate. This is the
+/// external probe `run.sh` logic (probe9/probe11) promoted in-process: for
+/// each `<out>/<crate>/cert/<leaf>.cert.lean` that carries a
+/// `cert_<leaf>_goals` (an obligation cert — all-excluded fns emit no goal
+/// section and are skipped), append the bridge
+///   `example : lib.goals_eq (lib.ref_wp cert_<leaf>_ctx cert_<leaf>_sst)
+///                            cert_<leaf>_goals = 1 := by decide`
+/// and elaborate it against tactus-core's oleans (which carry `ref_wp` /
+/// `goals_eq` + the mirror ctors that `TactusDefs_lib_exec` imports).
+///
+/// Provenance (the crux, settled for W4a): tactus-core's built `out/lib`
+/// is located via `$TACTUS_CORE_OUT` — the same explicit-env-var
+/// convention as `$TACTUS_PRELUDE` / `$TACTUS_CORE_VOCAB`. Auto-discovery
+/// across checkout layouts is deliberately avoided. When the var is unset
+/// (or the dir is missing `TactusDefs_lib_exec.olean`), the bridge SKIPS
+/// with a loud note — opt-in, so no default gate path breaks. The dir's
+/// olean content-hash is recorded in the note as an audit trail and to
+/// stage W4b's cache key.
+///
+/// Returns the one-line summary the gate prints verbatim.
+fn run_bridge_step(crate_name: &str, base_path: &str) -> String {
+    let core_out = match std::env::var("TACTUS_CORE_OUT") {
+        Ok(d) if !d.is_empty() => PathBuf::from(d),
+        _ => {
+            return "bridge skipped: $TACTUS_CORE_OUT unset (opt-in \
+                    --tactus-bridge needs tactus-core's out/lib oleans)"
+                .to_string();
+        }
+    };
+    if !core_out.join("TactusDefs_lib_exec.olean").exists() {
+        return format!(
+            "bridge skipped: {} has no TactusDefs_lib_exec.olean \
+             (build tactus-core, or point $TACTUS_CORE_OUT at its out/lib)",
+            core_out.display(),
+        );
+    }
+    let core_hash = core_olean_hash(&core_out);
+
+    let cert_dir = lean_out_root().join(sanitize(crate_name)).join("cert");
+    let mut certs: Vec<PathBuf> = match std::fs::read_dir(&cert_dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.to_string_lossy().ends_with(".cert.lean"))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    // Deterministic order (read_dir is unordered): stable note + logs.
+    certs.sort();
+
+    // Bridge modules land beside the pkg modules, in their own subdir.
+    let bridge_dir = lean_out_root().join(sanitize(crate_name)).join("bridge");
+    if std::fs::create_dir_all(&bridge_dir).is_err() {
+        return format!("bridge skipped: could not create {}", bridge_dir.display());
+    }
+    // tactus-core oleans FIRST so `TactusDefs_lib_exec` + `lib.*` resolve.
+    let bridge_path = format!("{}:{}", core_out.display(), base_path);
+
+    let mut checked = 0usize;
+    let mut passed = 0usize;
+    let mut failed_names: Vec<String> = Vec::new();
+    for cert in &certs {
+        let leaf = cert
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.trim_end_matches(".cert.lean"))
+            .unwrap_or("");
+        if leaf.is_empty() {
+            continue;
+        }
+        let body = match std::fs::read_to_string(cert) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        // Only obligation certs (a `cert_<leaf>_goals` def) are bridgeable;
+        // an all-excluded fn emits ctx+sst but no goal section, and the
+        // `= 1` bridge would reference an undefined name (a false FAIL).
+        if !body.contains(&format!("def cert_{}_goals", leaf)) {
+            continue;
+        }
+        checked += 1;
+        let module = format!("Bridge_{}", leaf);
+        let mut text = body;
+        text.push_str(&format!(
+            "\n-- ── W4a in-gate bridge (bootstrap-38) ──\n\
+             set_option maxRecDepth 8000\n\
+             example : {ns}.goals_eq ({ns}.ref_wp cert_{leaf}_ctx cert_{leaf}_sst) \
+             cert_{leaf}_goals = 1 := by decide\n",
+            ns = crate::sst_serialize::cert_ns(),
+            leaf = leaf,
+        ));
+        if std::fs::write(bridge_dir.join(format!("{}.lean", module)), &text).is_err() {
+            failed_names.push(leaf.to_string());
+            continue;
+        }
+        let mut local_failures: Vec<(String, String)> = Vec::new();
+        run_lean(&bridge_dir, &module, false, &bridge_path, &mut local_failures);
+        if local_failures.is_empty() {
+            passed += 1;
+        } else {
+            failed_names.push(leaf.to_string());
+        }
+    }
+
+    let failed = checked - passed;
+    let mut note = format!(
+        "{} obligations bridge-checked against tactus-core ({} passed, {} failed) \
+         [core-olean {}]",
+        checked, passed, failed, core_hash,
+    );
+    if !failed_names.is_empty() {
+        note.push_str(&format!("; failed: {}", failed_names.join(", ")));
+    }
+    note
+}
+
+/// FNV-1a over the sorted `.olean` files in `dir` (name + bytes). A
+/// dependency-free content hash of the tactus-core build the bridge ran
+/// against — audit trail for W4a, and the seed of W4b's bridge cache key
+/// (a core-logic change to `ref_wp`/`goals_eq` flips this digest, so a
+/// future cache cannot silently reuse a stale PASS). Placeholder for the
+/// SHA-256 §6 vendoring will bring, matching `vocab_hash`'s FNV-1a style.
+fn core_olean_hash(dir: &Path) -> String {
+    let mut oleans: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "olean").unwrap_or(false))
+            .collect(),
+        Err(_) => return "unreadable".to_string(),
+    };
+    oleans.sort();
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    for p in &oleans {
+        if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+            mix(name.as_bytes());
+        }
+        if let Ok(bytes) = std::fs::read(p) {
+            mix(&bytes);
+        }
+    }
+    format!("fnv1a:{:016x}", h)
 }
 
 /// Prepend `lean_path` to any inherited `LEAN_PATH` — one definition
