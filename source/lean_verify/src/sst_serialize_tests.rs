@@ -557,6 +557,74 @@ fn raw_exp_field_tuple() {
     );
 }
 
+// ── W7c (bootstrap-28): the def-body constructors (Ite first) ──────
+//
+// A spec-fn body uses more than the obligation-leaf vocabulary: first-class
+// `if`, `match`, quantifiers, multi-arg apply. W7b landed the `tactus-core`
+// mirrors (`RawExp::Ite` / `ExprData::Ite` …); these pin the two transcriber
+// arms. Coercion lives on the reference `render_exp` side (already pinned
+// in-crate by `defs_expr_vocab_kernel_computes`), so the production side is a
+// verbatim structural transcription and the reference side just carries the
+// branch result type.
+
+/// W7c — a body `if c { t } else { e }` maps to `RawExp.Ite` carrying the
+/// branch RESULT type (the If node's own `typ`) so `render_exp` can coerce per
+/// branch. Cond/branches transcribe recursively; here all three are bare Int
+/// vars (interned c=0, t=1, e=2 in walk order), result type `TyInt`.
+#[test]
+fn raw_exp_ite_body() {
+    let mut s = Serializer::default();
+    let c = mk_exp(ExpX::Var(tvar("c")), tint());
+    let t = mk_exp(ExpX::Var(tvar("t")), tint());
+    let e = mk_exp(ExpX::Var(tvar("e")), tint());
+    let ite = mk_exp(ExpX::If(c, t, e), tint());
+    assert_eq!(
+        s.raw_exp(&ite).unwrap(),
+        format!(
+            "({NS}.RawExp.Ite {NS}.TypData.TyInt \
+               (Tactus.Box.mk ({NS}.RawExp.Var 0 {NS}.TypData.TyInt)) \
+               (Tactus.Box.mk ({NS}.RawExp.Var 1 {NS}.TypData.TyInt)) \
+               (Tactus.Box.mk ({NS}.RawExp.Var 2 {NS}.TypData.TyInt)))"
+        )
+    );
+}
+
+/// W7c — the production side transcribes a body if VERBATIM (any branch
+/// coercion is already an `Int.toNat` App the `Cast` arm handles), matching the
+/// reference `render_exp`'s `Ite`. Cond/then/else are bare vars (c=0, t=1, e=2).
+#[test]
+fn lexpr_to_exprdata_ite_body() {
+    let mut s = Serializer::default();
+    let ite = LExpr::new(ExprNode::If {
+        cond: Box::new(LExpr::var_synthetic("c")),
+        then_: Box::new(LExpr::var_synthetic("t")),
+        else_: Some(Box::new(LExpr::var_synthetic("e"))),
+    });
+    assert_eq!(
+        s.lexpr_to_exprdata(&ite).unwrap(),
+        format!(
+            "({NS}.ExprData.Ite \
+               (Tactus.Box.mk ({NS}.ExprData.Atom 0)) \
+               (Tactus.Box.mk ({NS}.ExprData.Atom 1)) \
+               (Tactus.Box.mk ({NS}.ExprData.Atom 2)))"
+        )
+    );
+}
+
+/// W7c — an else-less `if` is not a value-position body; the production arm
+/// fails loud (`ed-if-noelse`) so the census tracks it rather than emitting a
+/// shape the reference side has no counterpart for.
+#[test]
+fn lexpr_to_exprdata_ite_no_else_fails() {
+    let mut s = Serializer::default();
+    let ite = LExpr::new(ExprNode::If {
+        cond: Box::new(LExpr::var_synthetic("c")),
+        then_: Box::new(LExpr::var_synthetic("t")),
+        else_: None,
+    });
+    assert_eq!(s.lexpr_to_exprdata(&ite).unwrap_err(), "ed-if-noelse");
+}
+
 // ── W6d.2b-2: the emit-path gate (`oblig_slot` + `goal_data` deep/atom) ──
 //
 // The obligation (reference) side drives: `oblig_slot` deepens a coverable

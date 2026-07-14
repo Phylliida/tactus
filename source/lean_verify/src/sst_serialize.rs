@@ -741,6 +741,28 @@ impl<'a> Serializer<'a> {
                     }
                 }
             }
+            // W7c (bootstrap-28) — first-class `if c { t } else { e }` in a
+            // spec-fn BODY (`tri(n) = if n == 0 { 0 } else { … }`, the Ite
+            // exemplar). The If node's OWN type (`e.typ`) is the branch RESULT
+            // type carried in the leading slot — `render_exp` reads it to decide
+            // per-branch Int→Nat coercion (Friction-2, exactly like a `BinOp`'s
+            // result-type slot). Cond is bool (never coerced); both branches
+            // transcribe recursively. Distinct from `lift_if_raw`, which peels a
+            // RETURN-VALUE if into per-branch implications — this is the body if.
+            ExpX::If(cond, then_e, else_e) => {
+                let ty = self.typ_data(&e.typ)?;
+                let c = self.raw_exp(cond)?;
+                let t = self.raw_exp(then_e)?;
+                let el = self.raw_exp(else_e)?;
+                Ok(format!(
+                    "({}.RawExp.Ite {} {} {} {})",
+                    NS,
+                    paren(&ty),
+                    box_raw(&c),
+                    box_raw(&t),
+                    box_raw(&el)
+                ))
+            }
             _ => Err(format!("raw-{}", exp_construct_tag(&e.x))),
         }
     }
@@ -978,6 +1000,26 @@ impl<'a> Serializer<'a> {
                 let sub = self.lexpr_to_exprdata(arg)?;
                 Ok(format!("({}.ExprData.Not {})", NS, box_ed(&sub)))
             }
+            // W7c (bootstrap-28) — first-class if in a spec-fn body. Production
+            // materializes any branch coercion INTO the branch (an `Int.toNat`
+            // App the `Cast` arm above already transcribes), so this arm is a
+            // structural VERBATIM transcription — cond/then/else recurse — and
+            // matches the reference `render_exp`'s `Ite(cond, then, else)`. An
+            // else-less `if` cannot occupy value position in a body → fail loud
+            // (`ed-if-noelse`, census-tracked, never a silent pass).
+            ExprNode::If { cond, then_, else_: Some(else_) } => {
+                let c = self.lexpr_to_exprdata(cond)?;
+                let t = self.lexpr_to_exprdata(then_)?;
+                let e2 = self.lexpr_to_exprdata(else_)?;
+                Ok(format!(
+                    "({}.ExprData.Ite {} {} {})",
+                    NS,
+                    box_ed(&c),
+                    box_ed(&t),
+                    box_ed(&e2)
+                ))
+            }
+            ExprNode::If { else_: None, .. } => Err("ed-if-noelse".to_string()),
             _ => Err(format!("ed-{}", lexpr_construct_tag(&e.node))),
         }
     }
