@@ -1417,6 +1417,25 @@ pub(crate) fn spec_world_cmds_tagged(
                         maybe_emit_def_cert(&augmented, &out, crate_name);
                         out
                     });
+                    // bootstrap-47: for a suffix-recursive spec fn (e.g.
+                    // `drop_base_run`), emit its `{fn}_len_le` monotonicity
+                    // companion RIGHT AFTER the def, riding this fn's own
+                    // FnGroup seg — so a later consumer (`split_q`, same or
+                    // an importing part) resolves it via the part-import
+                    // chain — and register its name so that consumer's
+                    // `decreasing_by` chaining rung cites it. Gated on the
+                    // def having landed (`step_pushed`) and on `push_lenient`.
+                    if step_pushed {
+                        if let Some((mono_name, cmd)) =
+                            seq_suffix_mono_companion_cmd(f, &all_fns)
+                        {
+                            if push_lenient(&mut cmds, "seq suffix mono companion",
+                                &mut || vec![cmd.clone()])
+                            {
+                                to_lean_fn::register_suffix_mono_name(mono_name);
+                            }
+                        }
+                    }
                     segs.push((cmds.len(), DefsSeg::Base));
                     }
                 }
@@ -1742,6 +1761,221 @@ fn seq_subrange_tail_companion_cmd(
     )))
 }
 
+// ── bootstrap-47: suffix-recursive length-monotonicity companion ──────────
+//
+// A per-USER-fn companion `{fn}_len_le : len (f W) ≤ len W` for a spec fn
+// `f : Seq E → Seq E` whose body is EXACTLY `if <guard> then W else
+// f(W.drop_first())` (guard exposing `len W = 0` as a top-level disjunct) —
+// e.g. `m3_blinker.drop_base_run`. `split_q` recurses on
+// `drop_base_run(W.drop_first())`; its termination goal
+// `len (drop_base_run (drop_first W)) < len W` needs the COMPOSITION of this
+// monotonicity fact with `drop_first_len_lt`, which `decreasing_by_tactic`'s
+// chaining rung supplies (`Nat.lt_of_le_of_lt`).
+//
+// Unlike the generic `seq_*_companion_cmd` theorems (proven once, generic
+// over the element type), this is MONOMORPHIC — bound to a specific user fn
+// and its concrete Seq element type — and proven by `fun_induction` on the
+// fn's own auto-generated `.induct`. That makes a SOUND detector critical:
+// `push_lenient` only catches Rust panics, not Lean elaboration failures, so
+// a false positive (emitting an unprovable companion) would poison the whole
+// defs file. The detector therefore requires the EXACT structural shape the
+// canned tactic provably discharges (validated standalone against the real
+// oleans, Lean 4.25.0 — see `/tmp/probe_splitq.lean`). A false NEGATIVE is
+// harmless: the fn just keeps failing termination exactly as it does today.
+
+/// If `typ` (decoration/box-peeled) is `Seq<E>`, return `(seq-datatype path,
+/// element typ)`.
+fn seq_datatype_and_elem(typ: &Typ) -> Option<(&vir::ast::Path, &Typ)> {
+    let t = crate::to_lean_type::peel_typ_wrappers(typ);
+    if let TypX::Datatype(Dt::Path(p), args, _) = &**t {
+        if crate::to_lean_type::lean_name_relative(p) == "seq.Seq" && args.len() == 1 {
+            return Some((p, &args[0]));
+        }
+    }
+    None
+}
+
+/// Strip transparent expression wrappers (empty block, ghost, proof-in-spec,
+/// never-to-any) so the structural matchers see through the desugaring of
+/// `{ W }` / `{ f(...) }` block bodies.
+fn peel_mono_expr(e: &Expr) -> &Expr {
+    match &e.x {
+        ExprX::Block(stmts, Some(inner)) if stmts.is_empty() => peel_mono_expr(inner),
+        ExprX::Ghost { expr, .. } => peel_mono_expr(expr),
+        ExprX::ProofInSpec(inner) => peel_mono_expr(inner),
+        ExprX::NeverToAny(inner) => peel_mono_expr(inner),
+        _ => e,
+    }
+}
+
+/// `e` (peeled) is a plain read of the local variable `name`.
+fn is_read_of_var(e: &Expr, name: &VarIdent) -> bool {
+    match &peel_mono_expr(e).x {
+        ExprX::Var(v) => v == name,
+        ExprX::ReadPlace(place, _) => matches!(&place.x, PlaceX::Local(v) if v == name),
+        ExprX::ImplicitReborrowOrSpecRead(place, _, _) =>
+            matches!(&place.x, PlaceX::Local(v) if v == name),
+        _ => false,
+    }
+}
+
+/// `e` (peeled) is `W.drop_first()` for the local `pname`.
+fn is_drop_first_of_var(e: &Expr, pname: &VarIdent) -> bool {
+    if let ExprX::Call(CallTarget::Fun(_, h, _, _, _, _), args, _) = &peel_mono_expr(e).x {
+        if crate::to_lean_type::lean_name_relative(&h.path) == "Seq.drop_first" && args.len() == 1 {
+            return is_read_of_var(&args[0], pname);
+        }
+    }
+    false
+}
+
+/// `e` (peeled) is the self-recursive call `f(W.drop_first())`.
+fn is_self_drop_first_recursion(e: &Expr, self_path: &vir::ast::Path, pname: &VarIdent) -> bool {
+    if let ExprX::Call(CallTarget::Fun(_, g, _, _, _, _), args, _) = &peel_mono_expr(e).x {
+        if g.path == *self_path && args.len() == 1 {
+            return is_drop_first_of_var(&args[0], pname);
+        }
+    }
+    false
+}
+
+/// `e` (peeled) is `W.len() == 0` (either operand order).
+fn is_len_eq_zero(e: &Expr, pname: &VarIdent) -> bool {
+    if let ExprX::Binary(BinaryOp::Eq(_), a, b) = &peel_mono_expr(e).x {
+        return (is_len_of_var(a, pname) && is_int_zero(b))
+            || (is_len_of_var(b, pname) && is_int_zero(a));
+    }
+    false
+}
+
+/// `e` (peeled) is `W.len()` for the local `pname`.
+fn is_len_of_var(e: &Expr, pname: &VarIdent) -> bool {
+    if let ExprX::Call(CallTarget::Fun(_, g, _, _, _, _), args, _) = &peel_mono_expr(e).x {
+        if crate::to_lean_type::lean_name_relative(&g.path) == "seq.Seq.len" && args.len() == 1 {
+            return is_read_of_var(&args[0], pname);
+        }
+    }
+    false
+}
+
+/// `e` (peeled) is the integer literal `0`.
+fn is_int_zero(e: &Expr) -> bool {
+    matches!(&peel_mono_expr(e).x, ExprX::Const(Constant::Int(n)) if n.to_string() == "0")
+}
+
+/// True iff the guard is an OR-tree with `len(pname) == 0` as one of its
+/// top-level disjuncts. This is exactly what makes the `else` branch's
+/// `¬guard` yield `len W ≠ 0` (which `omega` reads, over any opaque
+/// non-arith disjuncts) — and also exactly what makes recursion on
+/// `W.drop_first()` terminate, so the shape is self-consistent.
+fn guard_or_tree_has_len_zero(e: &Expr, pname: &VarIdent) -> bool {
+    match &peel_mono_expr(e).x {
+        ExprX::Binary(BinaryOp::Or, l, r) =>
+            guard_or_tree_has_len_zero(l, pname) || guard_or_tree_has_len_zero(r, pname),
+        _ => is_len_eq_zero(peel_mono_expr(e), pname),
+    }
+}
+
+/// Length-monotonicity companion for a **suffix-recursive** spec fn (see the
+/// section comment above). Returns `(theorem name, command)` — the name is
+/// registered in the mono-companion bag so later fns' `decreasing_by` cite
+/// it — or `None` when `f` is not suffix-recursive or the seq primitives
+/// (`seq.Seq.len`, `Seq.drop_first`) aren't part of this emission.
+fn seq_suffix_mono_companion_cmd(
+    f: &FunctionX,
+    all_fns: &[&FunctionX],
+) -> Option<(String, Command)> {
+    // ── strict structural detection ──
+    if f.mode != Mode::Spec { return None; }
+    if f.params.len() != 1 { return None; }
+    if f.decrease.is_empty() { return None; }
+    let pname = &f.params[0].x.name;
+    let (seq_path, elem) = seq_datatype_and_elem(&f.params[0].x.typ)?;
+    // return type must also be `Seq<_>` (the fn returns its own recursion).
+    seq_datatype_and_elem(&f.ret.x.typ)?;
+    let body = f.body.as_ref()?;
+    let (guard, then_e, else_e) = match &peel_mono_expr(body).x {
+        ExprX::If(g, t, Some(e)) => (g, t, e),
+        _ => return None,
+    };
+    // Exactly one branch is the identity `W`; the other the `f(drop_first W)`
+    // recursion. (`fun_induction`'s base/step cases close regardless of which
+    // branch is which — `omega` for identity, the IH+drop_first chain for
+    // recursion — so position is immaterial.)
+    let then_id = is_read_of_var(then_e, pname);
+    let else_id = is_read_of_var(else_e, pname);
+    let rec_e = if then_id && !else_id {
+        else_e
+    } else if else_id && !then_id {
+        then_e
+    } else {
+        return None;
+    };
+    if !is_self_drop_first_recursion(rec_e, &f.name.path, pname) { return None; }
+    if !guard_or_tree_has_len_zero(guard, pname) { return None; }
+
+    // ── emit the proven companion (monomorphic in the element type) ──
+    let len_fn = all_fns.iter().find(|a| {
+        crate::to_lean_type::lean_name_relative(&a.name.path) == "seq.Seq.len"
+    })?;
+    let drop_first_fn = all_fns.iter().find(|a| {
+        crate::to_lean_type::lean_name_relative(&a.name.path) == "Seq.drop_first"
+    })?;
+    let fn_n = crate::to_lean_type::lean_name(&f.name.path);
+    let len = crate::to_lean_type::lean_name(&len_fn.name.path);
+    let seq_t = crate::to_lean_type::lean_name(seq_path);
+    let df = crate::to_lean_type::lean_name(&drop_first_fn.name.path);
+    // Render the concrete Seq element type; parenthesize if it's an
+    // application (so it stays a single type argument).
+    let elem_str = crate::lean_pp::pp_expr(&crate::to_lean_type::typ_to_expr(elem));
+    let elem_arg = if elem_str.chars().any(|c| c.is_whitespace()) {
+        format!("({elem_str})")
+    } else {
+        elem_str
+    };
+    let mono_name = format!("{fn_n}_len_le");
+    // `fun_induction {fn} W` uses `{fn}.induct` (auto-generated for the WF-
+    // recursive def), giving a base case (guard true → the fn reduces to
+    // `W`) and a step case (guard false → the recursive call, with an IH).
+    //
+    // The proof is deliberately COUNT-FREE (no `rename_i`) and
+    // if-REDUCING, because the in-gate ambient env diverges from a naive
+    // standalone elaboration in two load-bearing ways (the bootstrap-45/46
+    // Decidable-resolution divergence, confirmed by reproducing against the
+    // real emitted oleans with the gate's prelude):
+    //   1. the disjunctive guard `len W = 0 ∨ …` elaborates as a `dite`,
+    //      and `fun_induction` leaves `{fn} x` UNFOLDED in the goal as
+    //      `len (if <guard> then x else {fn} (drop_first x)) ≤ len x` —
+    //      which `omega` cannot simplify;
+    //   2. the base case has only TWO introduced hypotheses (var + guard,
+    //      no IH), so a fixed `rename_i x h ih` overflows ("too many
+    //      variable names").
+    // So: `try split` reduces the goal's `if` (a no-op when the ambient env
+    // already reduced it); then per resulting goal, `omega` closes the
+    // trivial `len x ≤ len x`; `apply Nat.le_trans <;> (assumption |
+    // Nat.le_of_lt ∘ drop_first_len_lt)` chains the IH (found by
+    // `assumption`, accessibility-agnostic) with `len (drop_first x) < len x`
+    // (`apply` reads `x` off the goal, `omega` reads `¬ len x = 0` off the
+    // negated guard); `(simp_all <;> omega)` / `simp_all` mop up the
+    // vacuous guard-contradiction branches `split` can introduce. Validated
+    // against the real emitted `m3_blinker` oleans under BOTH the gate
+    // prelude and a plain-`∨` prelude (bootstrap-47).
+    let cmd = Command::Raw(format!(
+        "theorem {mono_name} (W : {seq_t} {elem_arg}) :\n    \
+         {len} {elem_arg} ({fn_n} W) ≤ {len} {elem_arg} W := by\n  \
+         fun_induction {fn_n} W <;> (try split) <;>\n    \
+         first\n      \
+         | omega\n      \
+         | (apply Nat.le_trans <;>\n          \
+         first\n            \
+         | assumption\n            \
+         | (apply Nat.le_of_lt; apply {df}_len_lt <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)))\n      \
+         | (simp_all <;> omega)\n      \
+         | simp_all",
+    ));
+    Some((mono_name, cmd))
+}
+
 /// Ambient thread-local tables every render path needs installed
 /// first. The SINGLE install chokepoint: every render entry point
 /// (`emit_proof_fn`, `emit_exec_fn`, `crate_defs::for_crate`) calls
@@ -1764,6 +1998,13 @@ pub(crate) fn install_emit_tables(krate: &KrateX, crate_name: &str) {
     // names (`Seq.first`, not `impl__3.first`), so the renames must be
     // consultable while building it.
     install_crate_decls(krate);
+    // bootstrap-47: reset the suffix-mono companion bag at every emission
+    // entry. The defs build (crate_defs::build_defs) routes through here
+    // ONCE before its spec-fn loop, which then populates the bag; per-fn
+    // proof/exec emissions also route through here, clearing any names a
+    // prior defs build left so their `decreasing_by` never cites an
+    // out-of-file companion.
+    to_lean_fn::clear_suffix_mono_names();
 }
 
 /// Build the set of relative Lean names this krate's emission can declare —
