@@ -18,7 +18,7 @@ before the serializer exists, or the literal shape churns:
 |---|---|---|
 | `If` | add negated-cond leaf: `If(cond, neg_cond, then, else)` | the else-branch hypothesis is the RENDERED `¬cond` — a distinct leaf text; refWp can't synthesize leaf ids |
 | `Loop` | add loop-state binder list: `binders: Box<BinderList>` (new list type: `(binder id, typ leaf)` pairs), plus `neg_cond` leaf | maintain/use telescopes quantify over the modified locals (P7); production computes this set — the literal must carry it |
-| `Call` | add `dest: u64` binder id + typ leaf | ensures-hypotheses bind the call result |
+| `Call` | ~~add `dest: u64` binder id + typ leaf~~ → **SUPERSEDED by §2.6: `Call { reqs, post: FrameList }`** | the naive `dest`+`enss` split models only the ∀-path; production's #128 ret-eq path needs the whole post-call frame — landed 2026-07-13 |
 | `Ret` | becomes `Ret(Box<LeafList>)` | the obligation is each ensures INSTANTIATED at the returned value — instantiated texts are leaves rendered at the return site |
 | params (FnCtx, §2.1) | each param carries an optional bound-hyp leaf | int-typed params get `h_x_bound` hypotheses (P6/P7); they are leaves, not structure refWp invents |
 | GoalData spine | interleave-faithful: goals fold a SINGLE ordered frame (see §2.1) | three-parallel-lists loses `∀x, h → let y, h2` ordering |
@@ -238,7 +238,19 @@ frontend, or SST semantics adequacy (W5f). A stage-A pass + the four
 leaf-renderer bugs of 2026-07-11 coexisting is possible and expected — say
 so wherever the certificate is described.
 
-### 2.6 Call arm — the #128 ret-eq fork (opus-b02b, 2026-07-13; DECISION PENDING)
+### 2.6 Call arm — the #128 ret-eq fork (opus-b02b, 2026-07-13; DECIDED = Option 1, tactus-core reshape LANDED 2026-07-13)
+
+**Resolution (Danielle, 2026-07-13):** go with Option 1 — "lower the mirror"
+to `Call { reqs, post: FrameList }`. The tactus-core half is DONE and verified
+(43 verified, 0 errors): the mirror reshape, refWp's pass-through Call arm
+(`wp_stm`/`frame_after`/`stm_size`), and a `ref_wp_call_pass_through` `decide`
+proof over a `double_exec`-shaped literal exercising BOTH post shapes (ret-eq +
+∀-path) plus a mutation-kill. **Remaining:** the serializer's `post`-builder —
+the restricted replication of `resolve_callee` + `build_call_substitutions`
+(simple subset) + `push_post_call_frames` in `sst_serialize.rs`, which is what
+the W2b bridge will then `decide`-validate against production. See board
+`bootstrap-02b` (mirror half) and its follow-up for the serializer builder.
+
 
 Picking up `bootstrap-02b` surfaced a mirror-shape defect: the N2.1-frozen
 `StmData::Call { reqs, enss, dest, dest_typ }` + refWp's
