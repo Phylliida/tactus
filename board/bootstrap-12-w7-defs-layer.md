@@ -92,6 +92,17 @@ def bodies). **UNBLOCKED** — W6 done (`bootstrap-11` closed).
       deferred per-arg coercion), datatype + def-header. See `bootstrap-28`.
     - W7d = wire into def emission + bridge `decide`s `def_eq` on fixture + tgt slice.
     - W7e = mutation-kill (perturb body / ctor / height ⟹ bridge flips 1→0).
+  - **⚠ SURFACE-FORK correction (2026-07-14 opus-w7c-2, Danielle-endorsed):** def
+    bodies live on the VIR `ExprX` surface (which KEEPS `Match`/`Quant`/multi-arg
+    `Call`), NOT SST `ExpX` (where `Match` is desugared and the current `raw_exp`
+    operates). Production emits def bodies from VIR via `spec_fn_to_ast →
+    vir_expr_to_ast` (preserves `Match`). So the reference def-body transcriber
+    is a NEW function on `vir::ast::Expr` (`raw_vir_exp`, split to `bootstrap-29`),
+    NOT an SST-`raw_exp` extension — else `def_eq` compares desugared-`If` vs
+    `Match` and never matches. DESIGN §3's "reuse `expx_to_rawexp`" is corrected
+    to "reuse the RawExp target vocab + `typ_data`/`binop_opcode`, new VIR arms."
+    The W7b `MatchR`/`RawArmList` vocab is thereby confirmed REACHABLE. Full
+    finding + line refs in `bootstrap-28` Progress.
 
 ## Writeup
 
