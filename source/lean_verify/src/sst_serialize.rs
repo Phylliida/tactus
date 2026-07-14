@@ -69,6 +69,11 @@
 //!   the implicit `Ret` from these when the body doesn't end in one).
 //! * `check.body` — the `Stm` tree → `StmData` (the stage-A subset:
 //!   Assert, Assume, Assign, DeadEnd, Return, If, Loop, Block→Seq/Skip).
+//!   `Assert` carries TWO leaves (finding-1): the ANNOTATED obligation
+//!   leaf (`oblig_leaf` — production's `span_mark` render, the goal) and
+//!   the BARE prop leaf (`exp_leaf` — the forward hyp for the rest of the
+//!   body). Production renders the prop once and uses it span_mark'd for
+//!   the goal, bare for the hyp (`sst_to_lean::walk_obligations`).
 //! * `StmX::Loop{cond|original_cond, invs, modified_vars}` — cond +
 //!   ¬cond leaves, standard-invariant leaves, loop-state binders from
 //!   the havoc set.
@@ -125,7 +130,7 @@ use std::sync::Mutex;
 use vir::ast::{KrateX, Typ, VarIdent};
 use vir::sst::{Exp, FuncCheckSst, FunctionSst, LoopInv, Stm, StmX};
 
-use crate::lean_ast::{Expr as LExpr, GoalShape, GoalSpine, Theorem};
+use crate::lean_ast::{AssertKind, Expr as LExpr, GoalShape, GoalSpine, ObligationKind, Theorem};
 use crate::lean_pp::pp_expr;
 use crate::to_lean_type::{param_binder_typ, typ_to_expr};
 
@@ -265,6 +270,31 @@ impl Serializer {
         Ok(self.leaves.intern(pp_expr(&LExpr::not(lexpr))))
     }
 
+    /// Render an obligation as an ANNOTATED leaf, byte-matching
+    /// production's goal leaf (finding-1). Production wraps every
+    /// obligation's rendered prop in a `SpanMark`
+    /// (`sst_to_lean::walk_obligations`); its pp is
+    /// `/- @rust:<loc> -/ <bare prop>`, where `<loc>` is
+    /// `format_rust_loc(&span)` and `<bare prop>` is the SAME render the
+    /// bare hyp leaf uses. We reconstruct via the identical
+    /// `sst_exp_to_ast_checked` → `span_mark` → `pp_expr` path, so the
+    /// interned text equals the goal-side leaf (`goal_data` interns the
+    /// production `SpanMark` the same way) and the two cancel across the
+    /// W2 bridge. `kind` never reaches the pp output (only `rust_loc` +
+    /// `inner` do — see `lean_pp`), so `Plain` suffices for byte-match.
+    fn oblig_leaf(&mut self, e: &Exp) -> Sr<u64> {
+        let inner = crate::to_lean_sst_expr::sst_exp_to_ast_checked(e)
+            .map_err(|reason| format!("leaf-render: {}", reason))?;
+        let loc = crate::obligation_naming::format_rust_loc(&e.span);
+        let marked = LExpr::span_mark(
+            loc,
+            Some(e.span.clone()),
+            AssertKind::Obligation(ObligationKind::Plain),
+            inner,
+        );
+        Ok(self.leaves.intern(pp_expr(&marked)))
+    }
+
     fn typ_leaf(&mut self, typ: &Typ) -> u64 {
         self.leaves.intern(pp_expr(&typ_to_expr(typ)))
     }
@@ -291,10 +321,16 @@ impl Serializer {
             StmX::Block(stms) => self.block(&stms[..]),
 
             // AssertCompute dispatches identically to Assert in the
-            // walker; fold it here.
+            // walker; fold it here. Two-role emission (finding-1): the
+            // ANNOTATED obligation leaf drives the goal (production
+            // span_mark's it); the BARE prop leaf drives the forward hyp
+            // the assert adds for the rest of the body. Intern the bare
+            // hyp first (keeps it in body pre-order), then the annotated
+            // obligation — the goal walk (N3b) reuses whichever id.
             StmX::Assert(_, _, e) | StmX::AssertCompute(_, e, _) => {
-                let id = self.exp_leaf(e)?;
-                Ok(format!("({}.StmData.Assert {})", NS, id))
+                let hyp = self.exp_leaf(e)?;
+                let oblig = self.oblig_leaf(e)?;
+                Ok(format!("({}.StmData.Assert {} {})", NS, oblig, hyp))
             }
 
             StmX::Assume(e) => {

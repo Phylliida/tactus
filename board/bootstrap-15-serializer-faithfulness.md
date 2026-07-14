@@ -3,7 +3,7 @@ title: "W2b-prereq — serializer faithfulness (annotated obligations, hyp names
 status: in_progress
 claimed_by: opus-w2b-f2
 created: 2026-07-14T00:45:00Z
-updated: 2026-07-14T02:00:00Z
+updated: 2026-07-14T04:30:00Z
 ---
 
 ## Description
@@ -124,6 +124,80 @@ kills.
   NEXT after this: finding-1 (obligation annotations — the dominant gap; the
   Assert node must carry BOTH a bare forward-hyp leaf and an annotated
   obligation leaf), then finding-3 (loop binders), finding-4 (return-binding).
+
+- (2026-07-14, opus-w2b-f1) **finding-1 ASSERT SPLIT LANDED across spec +
+  serializer; serializer VALIDATED (lean_verify 320+7/0), spec side coded but
+  pending the combined Lean regen.** Decision recorded: rather than regen for
+  finding-2 alone then regen again for finding-1 (two heavy vargo rebuilds),
+  BATCH the datatype changes (task note: "Plan the datatype changes together —
+  base-hash invalidation") so ONE combined regen closes finding-2 + finding-1.
+
+  **What changed (code):**
+  - `tactus-core/lib.rs`: `StmData::Assert(u64)` → `StmData::Assert(u64, u64)`
+    = `Assert(oblig, hyp)`. `wp_stm` reads the ANNOTATED obligation leaf for
+    the goal (`close(f, oblig)`); `frame_after` adds the BARE prop leaf as the
+    forward hyp (`FHyp(hyp)`). `stm_size` unchanged (head = 1). All `decide`
+    literals migrated to 2-arg; `ref_wp_add_capped_seed_spine` now
+    `Assert(15, 8)` (annotated 15 / bare 8) and still expects `…(Leaf 15)`.
+  - `source/lean_verify/src/sst_serialize.rs`: new `oblig_leaf(e)` — rebuilds
+    production's obligation leaf via the SAME path
+    (`sst_exp_to_ast_checked` → `LExpr::span_mark(format_rust_loc(&e.span),
+    …, Plain, inner)` → `pp_expr`), so its interned text is byte-identical to
+    the goal-side leaf (`goal_data` interns production's own `SpanMark` the
+    same way) and the two cancel across the bridge. Assert arm emits
+    `Assert <oblig> <hyp>` (bare interned first to keep body pre-order).
+    Verified against production: `walk_obligations` (sst_to_lean.rs:1907-1936)
+    renders `cond_ast` ONCE and uses it span_mark'd for the goal, bare for the
+    Hyp frame; `lean_pp` (:899-909) emits only `/- @rust:<loc> -/ ` + inner
+    (kind/rust_span do NOT reach the text → `Plain` is byte-safe).
+
+  **Hand-verified this closes add_capped goals 0/1/2 (asserts) after regen:**
+  goal 0 = `close(seed, 15)` = `∀0 1,∀19 2,∀3 1,∀18 4,∀17 5,∀16 6, Leaf 15` ✓;
+  goal 1 (tmp__1) = `…Imp 8, Imp 8, Let 9 10, Let 11 12, Leaf 20` ✓ (the two
+  `Imp 8` are the Assert(15,8) bare-hyp + the following `Assume 8`); goal 2 ✓.
+
+  **Why the FULL add_capped bridge is not closable yet (goal 3 = postcondition):**
+  production goal 3 ends `… Let 9 14, Let 23 9, Leaf 22`. Two more findings:
+  1. Ret must carry ANNOTATED ensures leaves (Leaf 22 = `/- @rust:…85:13 -/
+     r = x + y`, not bare 7). SERIALIZER-ONLY (no datatype change): thread a
+     second, span_mark'd ens list (via `oblig_leaf` over `check.post_condition
+     .ens_exps`, loc = `ens.span`) into the `Return` arm — mirror of
+     WpCtx::new's postcondition SpanMark (sst_to_lean.rs:529-564). Leave
+     `FnCtxData.enss` bare (refWp doesn't read it).
+  2. finding-4 return-binding: the `Let 23 9` = `let r := s`. Source located:
+     `check.post_condition.dest` (the return var, sst_to_lean.rs:519 `ret_name`)
+     + `ret_typ` (:524); the walker writes `Done(let ret := e; ensures_goal)`
+     (:311, doc :57 `… let dest := ret;`). refWp needs a `FnCtxData.return_var`
+     (name leaf + value leaf) that `ref_wp`'s Ret prepends as an `FLet` before
+     the postcondition. `9` here = the returned local `s` (last `Assign 9 …`
+     dest), so the "value" is the ret expression rendered at the return site —
+     confirm empirically whether it's `post_condition.dest`'s bound value or
+     the fall-through body value before adding the field (task note: avoid
+     churn). This is the ONE remaining piece for add_capped's full bridge.
+
+  Then finding-3 (loops, for sum_to): Loop needs annotated inv-obligation
+  leaves (init/maintain goals) separate from the bare inv-hyp leaves, PLUS the
+  populated binders + decreases leaf + `_tactus_d_old` let. Largest; do last.
+
+  **Batched-regen recipe (does finding-2 + finding-1 at once):**
+  1. FORK vargo on PATH (`tactus-bootstrap/tools/vargo/target/release`), from
+     `source/`: `vargo build --release …` to refresh the verus binary with the
+     new serializer.
+  2. Re-emit fixtures: `--lean-backend --emit-lean --lean-all-proofs
+     --tactus-emit-cert` over `bootstrap-fixture/lib.rs`. Confirm add_capped's
+     cert now shows `StmData.Assert <oblig> <hyp>` and `ParamBoundList.Bound
+     <hname> <prop>` (finding-2). NB the ENTIRE leaf table renumbers — finding-2
+     interns `h_x_bound` early in the param walk, so the goal-side hnames (old
+     19/18/17/16) collapse to low ids. Cannot hand-author the golden.
+  3. Verify `tactus-core/lib.rs` (package gate, ~30+ verified) — the spec
+     change is coded but has NOT run through Lean yet.
+  4. Refresh golden `source/lean_verify/src/testdata/add_capped.cert.lean` from
+     the real emission + fix `assert_eq!(leaf_texts.len(), …)` in
+     sst_serialize_tests.rs (id count changes). Re-run N3 acceptance
+     (golden/determinism/verdict-neutral) + hand-run the add_capped goals-0/1/2
+     bridge (`goals_eq (ref_wp ctx sst) prod_prefix = 1 := by decide`).
+
+  Landed at code level; NOT yet Lean-verified end-to-end (needs the regen).
 
 ## Writeup
 
