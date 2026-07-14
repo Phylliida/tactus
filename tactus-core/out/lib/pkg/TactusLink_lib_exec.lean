@@ -1,4 +1,5 @@
 import TactusDefs_lib_exec
+import lib__expr_mirror_kernel_computes
 import lib__skeleton_kernel_computes
 import lib__seq_size_unfolds
 import lib__probe_goal_eq_leaf
@@ -17,9 +18,13 @@ import lib__ref_wp_if_fallthrough_divergence
 import lib__ref_wp_if_twoway_join
 import lib__ref_wp_call_pass_through
 import lib__goal_eq_strictness
+import lib__leafe_goal_bridge_kernel_computes
 import lib__amended_shapes_kernel_compute
 set_option linter.unusedVariables false
 set_option maxHeartbeats 800000
+noncomputable def lib.expr_mirror_kernel_computes_closed : lib.expr_mirror_kernel_computes_stmt :=
+  lib.expr_mirror_kernel_computes
+#tactus_check_axioms lib.expr_mirror_kernel_computes_closed []
 noncomputable def lib.skeleton_kernel_computes_closed : lib.skeleton_kernel_computes_stmt :=
   lib.skeleton_kernel_computes
 #tactus_check_axioms lib.skeleton_kernel_computes_closed []
@@ -74,6 +79,9 @@ noncomputable def lib.ref_wp_call_pass_through_closed : lib.ref_wp_call_pass_thr
 noncomputable def lib.goal_eq_strictness_closed : lib.goal_eq_strictness_stmt :=
   lib.goal_eq_strictness
 #tactus_check_axioms lib.goal_eq_strictness_closed []
+noncomputable def lib.leafe_goal_bridge_kernel_computes_closed : lib.leafe_goal_bridge_kernel_computes_stmt :=
+  lib.leafe_goal_bridge_kernel_computes
+#tactus_check_axioms lib.leafe_goal_bridge_kernel_computes_closed []
 noncomputable def lib.amended_shapes_kernel_compute_closed : lib.amended_shapes_kernel_compute_stmt :=
   lib.amended_shapes_kernel_compute
 #tactus_check_axioms lib.amended_shapes_kernel_compute_closed []

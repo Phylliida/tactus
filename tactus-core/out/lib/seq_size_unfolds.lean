@@ -59,14 +59,34 @@ inductive lib.StmData where
   match s with | lib.StmData.Assert _ _ => 1 | lib.StmData.Assume _ => 1 | lib.StmData.Assign _ _ => 1 | lib.StmData.Call _ _ => 1 | lib.StmData.DeadEnd val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Ret _ _ => 1 | lib.StmData.If _ _ val2 val3 => 1 + lib.StmData.height val2.deref + lib.StmData.height val3.deref | lib.StmData.Loop _ _ _ _ _ _ _ _ _ body => 1 + lib.StmData.height body.deref | lib.StmData.Skip => 1 | lib.StmData.Seq val0 val1 => 1 + lib.StmData.height val0.deref + lib.StmData.height val1.deref
 termination_by sizeOf s
 decreasing_by all_goals (simp_all; omega)
+inductive lib.CastKind where
+  | IntToNat
+  | NatToInt
+  deriving Inhabited
+@[simp] noncomputable def lib.CastKind.height (_ : lib.CastKind) : Nat :=
+  1
+inductive lib.ExprData where
+  | Atom (val0 : Int)
+  | Lit (val0 : Int)
+  | Cast (val0 : lib.CastKind) (val1 : Tactus.Box lib.ExprData)
+  | BinOp (val0 : Int) (val1 : Tactus.Box lib.ExprData) (val2 : Tactus.Box lib.ExprData)
+  | App (val0 : Int) (val1 : Tactus.Box lib.ExprData)
+  | FieldProj (val0 : Tactus.Box lib.ExprData) (val1 : Int)
+  | SpanMark (val0 : Int) (val1 : Tactus.Box lib.ExprData)
+  deriving Inhabited
+@[simp] noncomputable def lib.ExprData.height (s : lib.ExprData) : Nat :=
+  match s with | lib.ExprData.Atom _ => 1 | lib.ExprData.Lit _ => 1 | lib.ExprData.Cast _ val1 => 1 + lib.ExprData.height val1.deref | lib.ExprData.BinOp _ val1 val2 => 1 + lib.ExprData.height val1.deref + lib.ExprData.height val2.deref | lib.ExprData.App _ val1 => 1 + lib.ExprData.height val1.deref | lib.ExprData.FieldProj val0 _ => 1 + lib.ExprData.height val0.deref | lib.ExprData.SpanMark _ val1 => 1 + lib.ExprData.height val1.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
 inductive lib.GoalData where
   | Leaf (val0 : Int)
   | Imp (val0 : Int) (val1 : Tactus.Box lib.GoalData)
   | All (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.GoalData)
   | Let (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.GoalData)
+  | LeafE (val0 : lib.ExprData)
   deriving Inhabited
 @[simp] noncomputable def lib.GoalData.height (s : lib.GoalData) : Nat :=
-  match s with | lib.GoalData.Leaf _ => 1 | lib.GoalData.Imp _ val1 => 1 + lib.GoalData.height val1.deref | lib.GoalData.All _ _ val2 => 1 + lib.GoalData.height val2.deref | lib.GoalData.Let _ _ val2 => 1 + lib.GoalData.height val2.deref
+  match s with | lib.GoalData.Leaf _ => 1 | lib.GoalData.Imp _ val1 => 1 + lib.GoalData.height val1.deref | lib.GoalData.All _ _ val2 => 1 + lib.GoalData.height val2.deref | lib.GoalData.Let _ _ val2 => 1 + lib.GoalData.height val2.deref | lib.GoalData.LeafE _ => 1
 termination_by sizeOf s
 decreasing_by all_goals (simp_all; omega)
 inductive lib.GoalList where

@@ -40,6 +40,9 @@ inductive lib.GoalList where
   match s with | lib.GoalList.Nil => 1 | lib.GoalList.Cons _ val1 => 1 + lib.GoalList.height val1.deref
 termination_by sizeOf s
 decreasing_by all_goals (simp_all; omega)
+noncomputable def lib.goal_size (g : lib.GoalData) : Nat :=
+  match g with | lib.GoalData.Leaf _e => 1 | lib.GoalData.Imp _h b => 1 + lib.goal_size b.deref | lib.GoalData.All _x _t b => 1 + lib.goal_size b.deref | lib.GoalData.Let _x _v b => 1 + lib.goal_size b.deref | lib.GoalData.LeafE _e => 1
+termination_by structural g
 noncomputable def lib.ck_tag (k : lib.CastKind) : Nat :=
   match k with | lib.CastKind.IntToNat => 0 | lib.CastKind.NatToInt => 1
 noncomputable def lib.castkind_eq (a : lib.CastKind) (b : lib.CastKind) : Nat :=
@@ -105,6 +108,6 @@ noncomputable def lib.gl_tail (g : lib.GoalList) : lib.GoalList :=
 noncomputable def lib.goals_eq (a : lib.GoalList) (b : lib.GoalList) : Nat :=
   match a with | lib.GoalList.Nil => if lib.gl_tag b = 0 then 1 else 0 | lib.GoalList.Cons h1 t1 => if lib.gl_tag b = 1 then if lib.goal_eq h1.deref (lib.gl_head b) = 1 then lib.goals_eq t1.deref (lib.gl_tail b) else 0 else 0
 termination_by structural a
-theorem lib.probe_goals_eq_lit :
-    lib.goals_eq lib.GoalList.Nil lib.GoalList.Nil = 1 ∧ lib.goals_eq (lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.Leaf 9)) (Tactus.Box.mk lib.GoalList.Nil)) (lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.Leaf 9)) (Tactus.Box.mk lib.GoalList.Nil)) = 1 := by
+theorem lib.leafe_goal_bridge_kernel_computes :
+    lib.goal_eq (lib.GoalData.LeafE (lib.ExprData.BinOp 1 (Tactus.Box.mk (lib.ExprData.Cast lib.CastKind.IntToNat (Tactus.Box.mk (lib.ExprData.Atom 3)))) (Tactus.Box.mk (lib.ExprData.Cast lib.CastKind.IntToNat (Tactus.Box.mk (lib.ExprData.Atom 3)))))) (lib.GoalData.LeafE (lib.ExprData.BinOp 1 (Tactus.Box.mk (lib.ExprData.Cast lib.CastKind.IntToNat (Tactus.Box.mk (lib.ExprData.Atom 3)))) (Tactus.Box.mk (lib.ExprData.Cast lib.CastKind.IntToNat (Tactus.Box.mk (lib.ExprData.Atom 3)))))) = 1 ∧ lib.goal_eq (lib.GoalData.LeafE (lib.ExprData.BinOp 1 (Tactus.Box.mk (lib.ExprData.Cast lib.CastKind.IntToNat (Tactus.Box.mk (lib.ExprData.Atom 3)))) (Tactus.Box.mk (lib.ExprData.Cast lib.CastKind.IntToNat (Tactus.Box.mk (lib.ExprData.Atom 3)))))) (lib.GoalData.LeafE (lib.ExprData.BinOp 1 (Tactus.Box.mk (lib.ExprData.Cast lib.CastKind.IntToNat (Tactus.Box.mk (lib.ExprData.Atom 3)))) (Tactus.Box.mk (lib.ExprData.Atom 3)))) = 0 ∧ lib.goal_eq (lib.GoalData.LeafE (lib.ExprData.Atom 5)) (lib.GoalData.Leaf 5) = 0 ∧ lib.goal_eq (lib.GoalData.Leaf 5) (lib.GoalData.LeafE (lib.ExprData.Atom 5)) = 0 ∧ lib.goals_eq (lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.Atom 9))) (Tactus.Box.mk lib.GoalList.Nil)) (lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.Atom 9))) (Tactus.Box.mk lib.GoalList.Nil)) = 1 ∧ lib.goal_size (lib.GoalData.Imp 7 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.Atom 9)))) = 2 := by
   decide 
