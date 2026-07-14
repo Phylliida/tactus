@@ -14,6 +14,7 @@ import lib__ref_wp_ret_return_binding
 import lib__ref_wp_sum_to_loop
 import lib__ref_wp_nested_loop_nonleading
 import lib__ref_wp_if_fallthrough_divergence
+import lib__ref_wp_call_pass_through
 import lib__goal_eq_strictness
 import lib__amended_shapes_kernel_compute
 set_option linter.unusedVariables false
@@ -63,6 +64,9 @@ noncomputable def lib.ref_wp_nested_loop_nonleading_closed : lib.ref_wp_nested_l
 noncomputable def lib.ref_wp_if_fallthrough_divergence_closed : lib.ref_wp_if_fallthrough_divergence_stmt :=
   lib.ref_wp_if_fallthrough_divergence
 #tactus_check_axioms lib.ref_wp_if_fallthrough_divergence_closed []
+noncomputable def lib.ref_wp_call_pass_through_closed : lib.ref_wp_call_pass_through_stmt :=
+  lib.ref_wp_call_pass_through
+#tactus_check_axioms lib.ref_wp_call_pass_through_closed []
 noncomputable def lib.goal_eq_strictness_closed : lib.goal_eq_strictness_stmt :=
   lib.goal_eq_strictness
 #tactus_check_axioms lib.goal_eq_strictness_closed []
