@@ -93,6 +93,22 @@ mis-rendered leaf fails the bridge (mutation-kill at expression level).
   emit + bridge (`close`/emitter start producing `LeafE`). See `bootstrap-22`
   for the atom-id-consistency invariant and the deref/multi-arg open questions.
 
+- (2026-07-14, opus-b22 cont.) **W6c DONE** (`bootstrap-22` → done). Landed the
+  production-side `lexpr_to_exprdata` (`LExpr → lib.ExprData`) + the production
+  half of the opcode table (`lean_binop_opcode`), completing BOTH W6c
+  transcriptions. Additive/census-gated/`#[allow(dead_code)]` → verdict-neutral
+  (`golden_add_capped_cert` byte-identical). 4 new tests green incl. the
+  **`binop_opcode_alignment`** invariant test (ref `binop_opcode(op) ==` prod
+  `lean_binop_opcode(binop_to_ast(op))` for every structural op — guards the
+  bridge against a FALSE opcode divergence) and `lexpr_to_exprdata_case_a` (the
+  verbatim `sum_to` leaf → the exact `expr_mirror_kernel_computes` shape). Full
+  writeup + honest scope limits (type-args dropped both sides; Case-C deref
+  ref-side still open; `TypeAnnot`/neg-lit census-deferred) in `bootstrap-22`.
+  **Next = W6d** (`bootstrap-??`, needs a board file): wire both transcriptions
+  into the obligation-leaf emit so `close`/the emitter produce `LeafE(ExprData)`
+  and the bridge `decide`s `expr_eq` on live fixtures; the fixture census will
+  surface any `ed-typeannot`/deref gaps to resolve there.
+
 ## Writeup
 
 _when done: findings, how the code works, assumptions made. Parent design doc:

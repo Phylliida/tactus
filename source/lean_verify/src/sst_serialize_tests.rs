@@ -243,3 +243,106 @@ fn binop_opcode_canonical() {
     let bad = binop_opcode(&BinaryOp::StrGetChar);
     assert_eq!(bad.unwrap_err(), "raw-binop-strgetchar");
 }
+
+/// The two W6c opcode tables MUST agree: for every structural vir op, the
+/// reference `binop_opcode(vir_op)` equals the production
+/// `lean_binop_opcode(binop_to_ast(vir_op))`. Pinning the whole cast class +
+/// the boolean ops THROUGH production's `binop_to_ast` lowering makes a future
+/// edit to one table without the other a caught test failure — the invariant
+/// that keeps `expr_eq(prod, render_exp(ref))` from a FALSE opcode divergence.
+#[test]
+fn binop_opcode_alignment() {
+    use crate::expr_shared::binop_to_ast;
+    use vir::ast::{
+        ArithOp, BinaryOp, Div0Behavior, InequalityOp, Mode, OverflowBehavior,
+    };
+    let ob = OverflowBehavior::Allow;
+    let d0 = Div0Behavior::Allow;
+    let vir_ops = [
+        BinaryOp::Eq(Mode::Spec),
+        BinaryOp::Ne,
+        BinaryOp::Inequality(InequalityOp::Lt),
+        BinaryOp::Inequality(InequalityOp::Le),
+        BinaryOp::Inequality(InequalityOp::Gt),
+        BinaryOp::Inequality(InequalityOp::Ge),
+        BinaryOp::Arith(ArithOp::Add(ob)),
+        BinaryOp::Arith(ArithOp::Sub(ob)),
+        BinaryOp::Arith(ArithOp::Mul(ob)),
+        BinaryOp::Arith(ArithOp::EuclideanDiv(d0)),
+        BinaryOp::Arith(ArithOp::EuclideanMod(d0)),
+        BinaryOp::And,
+        BinaryOp::Or,
+        BinaryOp::Implies,
+    ];
+    for op in &vir_ops {
+        let ref_code = binop_opcode(op).expect("cast-class op has a reference opcode");
+        let lean = binop_to_ast(op).expect("cast-class op lowers to a lean_ast::BinOp");
+        let prod_code = lean_binop_opcode(&lean).expect("lowered op has a production opcode");
+        assert_eq!(ref_code, prod_code, "opcode mismatch for {op:?}");
+    }
+}
+
+/// `lexpr_to_exprdata` transcribes the Case-A production leaf `Int.toNat r =
+/// lib.tri (Int.toNat n)` verbatim into the `ExprData::BinOp(Eq, Cast(r),
+/// App(tri, Cast(n)))` shape the W6b `expr_mirror_kernel_computes` proof pins.
+/// Atom ids come from first-appearance interning order (r=0, lib.tri=1, n=2).
+#[test]
+fn lexpr_to_exprdata_case_a() {
+    let mut s = Serializer::default();
+    // Int.toNat r
+    let lhs = LExpr::app1(LExpr::var_lit("Int.toNat"), LExpr::var_synthetic("r"));
+    // lib.tri (Int.toNat n)
+    let rhs = LExpr::app1(
+        LExpr::var_synthetic("lib.tri"),
+        LExpr::app1(LExpr::var_lit("Int.toNat"), LExpr::var_synthetic("n")),
+    );
+    let whole = LExpr::eq(lhs, rhs);
+    assert_eq!(
+        s.lexpr_to_exprdata(&whole).unwrap(),
+        "(lib.ExprData.BinOp 0 \
+           (Tactus.Box.mk (lib.ExprData.Cast lib.CastKind.IntToNat \
+             (Tactus.Box.mk (lib.ExprData.Atom 0)))) \
+           (Tactus.Box.mk (lib.ExprData.App 1 \
+             (Tactus.Box.mk (lib.ExprData.Cast lib.CastKind.IntToNat \
+               (Tactus.Box.mk (lib.ExprData.Atom 2)))))))"
+    );
+}
+
+/// Case-C production side: `lib.tree_head (*t)` renders as an App over a
+/// `.deref` FieldProj. The deref field id is the reference `deref_field()` (0),
+/// so the prod ExprData matches `render_exp`'s `FieldProj(_, 0)`.
+#[test]
+fn lexpr_to_exprdata_deref_fieldproj() {
+    let mut s = Serializer::default();
+    let deref = LExpr::field_proj(LExpr::var_synthetic("t"), "deref");
+    let call = LExpr::app1(LExpr::var_synthetic("lib.tree_head"), deref);
+    // heads intern in order: lib.tree_head=0, t=1.
+    assert_eq!(
+        s.lexpr_to_exprdata(&call).unwrap(),
+        "(lib.ExprData.App 0 \
+           (Tactus.Box.mk (lib.ExprData.FieldProj \
+             (Tactus.Box.mk (lib.ExprData.Atom 1)) 0)))"
+    );
+}
+
+/// Out-of-class nodes and multi-arg apps fail loud with sharp `ed-<k>` census
+/// tags — the same fail-loud discipline as the statement walk.
+#[test]
+fn lexpr_to_exprdata_census_rejects() {
+    use crate::lean_ast::BinOp as L;
+    let mut s = Serializer::default();
+    // A boolean literal is outside the cast class.
+    assert_eq!(
+        s.lexpr_to_exprdata(&LExpr::lit_bool(true)).unwrap_err(),
+        "ed-litbool"
+    );
+    // A 2-arg application (e.g. `lib.Point.mk a b`) is not the single-arg class.
+    let two = LExpr::app(
+        LExpr::var_synthetic("lib.Point.mk"),
+        vec![LExpr::var_synthetic("a"), LExpr::var_synthetic("b")],
+    );
+    assert_eq!(s.lexpr_to_exprdata(&two).unwrap_err(), "ed-app-arity");
+    // A bitwise binop is outside the cast class (both sides reject).
+    let bitand = LExpr::binop(L::BitAnd, LExpr::var_synthetic("a"), LExpr::var_synthetic("b"));
+    assert_eq!(s.lexpr_to_exprdata(&bitand).unwrap_err(), "ed-binop-bitand");
+}

@@ -192,7 +192,9 @@ use vir::ast::{
 };
 use vir::sst::{CallFun, Exp, ExpX, FuncCheckSst, FunctionSst, LoopInv, Stm, StmX};
 
-use crate::lean_ast::{AssertKind, Expr as LExpr, GoalShape, GoalSpine, ObligationKind, Theorem};
+use crate::lean_ast::{
+    AssertKind, Expr as LExpr, ExprNode, GoalShape, GoalSpine, ObligationKind, Theorem,
+};
 use crate::lean_pp::pp_expr;
 use crate::to_lean_type::{param_binder_typ, typ_to_expr};
 
@@ -613,6 +615,134 @@ impl<'a> Serializer<'a> {
     fn call_fun_id(&mut self, fun: &vir::ast::Fun) -> u64 {
         let name = crate::lean_name::LeanName::from_path(&fun.path);
         self.text_leaf(name.as_str())
+    }
+
+    // ── W6c: production `lean_ast::Expr` → ExprData (the prod-side input) ─
+    // The BORING 1:1 side (DESIGN-W6-stageB.md §4.2 / bootstrap-22). The
+    // production renderer (`to_lean_sst_expr`) has ALREADY materialized every
+    // cast decision into the `lean_ast::Expr` tree — `Int.toNat`/`Int.ofNat`
+    // as `App { head: Var("Int.toNat"), .. }`, `*p` as `FieldProj { field:
+    // "deref" }`. We transcribe that tree VERBATIM into `lib.ExprData` text;
+    // no cast decision is re-made here (that is `render_exp`'s job on the ref
+    // side). The bridge then `decide`s `expr_eq(prod, render_exp(ref))`, so a
+    // production emitter that inserts an `Int.toNat` inconsistently (Friction
+    // 2) diverges from the reference's uniform derivation → the `decide`
+    // fails.
+    //
+    // Atom-id consistency (the load-bearing invariant): terminal atoms — var
+    // reads, spec-fn App heads, non-`deref` field names — intern their
+    // rendered text via `self.leaves`, the SAME table the reference
+    // `raw_exp`/`render_exp` atoms use. A `Var(name)` here interns
+    // `name.as_str()`; the reference `RawExp::Var` interned
+    // `LeanName::from_var_ident(vid).as_str()` — and production renders a var
+    // read as exactly `Var(LeanName::from_var_ident(vid))`, so the two ids are
+    // equal by construction. Likewise an App head `Var(LeanName::from_path(&
+    // fun.path))` matches the reference `call_fun_id`. So `expr_eq` matches on
+    // atoms and the diversity is confined to the structural cast layer.
+    //
+    // Structural binops map through `lean_binop_opcode` into the SAME
+    // canonical opcode table `raw_exp` maps into (`binop_opcode`); the
+    // `binop_opcode_alignment` test pins that the two tables agree through
+    // `binop_to_ast`. Everything outside the cast class fails loud (`ed-<k>`),
+    // same census discipline as the stm walk. Not yet called by the emit path
+    // (that is W6d); `#[allow(dead_code)]` keeps it verdict-neutral until then.
+
+    /// `lean_ast::Expr → lib.ExprData` mirror text. Recognizes the cast class
+    /// (Var/Lit/`Int.toNat`|`Int.ofNat` Cast/App/BinOp) plus the unambiguous
+    /// FieldProj/SpanMark structural nodes; fails loud (`ed-<k>`) on anything
+    /// else.
+    #[allow(dead_code)]
+    fn lexpr_to_exprdata(&mut self, e: &LExpr) -> Sr<String> {
+        match &e.node {
+            // Terminal atom: a var read or a bare spec-fn / type name. Interns
+            // its rendered text (atom-id bucket) — matches the reference side.
+            ExprNode::Var(name) => {
+                let id = self.text_leaf(name.as_str());
+                Ok(format!("({}.ExprData.Atom {})", NS, id))
+            }
+            // Integer literal. `ExprNode::Lit` holds the pre-formatted decimal
+            // (or hex) text; the mirror `Lit` carries an `int`. Emitted raw,
+            // exactly as the reference `raw_exp` emits the BigInt — a negative
+            // literal would need parenthesizing on BOTH sides (none arises in
+            // the cast class; shared open item).
+            ExprNode::Lit(s) => Ok(format!("({}.ExprData.Lit {})", NS, s)),
+            // Materialized `as`-cast: production emits `Int.toNat x` /
+            // `Int.ofNat x` as a single-arg App with a literal head (see
+            // `coerce_lexpr` / `wrap_int_measure`). Map to the `Cast` node the
+            // reference `render_exp` DERIVES — so the two agree only when the
+            // production cast decision matched the reference's uniform one.
+            ExprNode::App { head, args }
+                if is_var_named(head, "Int.toNat") && args.len() == 1 =>
+            {
+                let sub = self.lexpr_to_exprdata(&args[0])?;
+                Ok(format!(
+                    "({}.ExprData.Cast {}.CastKind.IntToNat {})",
+                    NS,
+                    NS,
+                    box_ed(&sub)
+                ))
+            }
+            ExprNode::App { head, args }
+                if is_var_named(head, "Int.ofNat") && args.len() == 1 =>
+            {
+                let sub = self.lexpr_to_exprdata(&args[0])?;
+                Ok(format!(
+                    "({}.ExprData.Cast {}.CastKind.NatToInt {})",
+                    NS,
+                    NS,
+                    box_ed(&sub)
+                ))
+            }
+            // Single-value-arg spec-fn application (`lib.tri x`). The head is a
+            // bare `Var(name)` (nullary-generic callee, e.g. `tri`) or a
+            // type-arg application `App { head: Var(name), .. }` — production
+            // applies the fn name to its type args FIRST, then to the value
+            // arg. The reference `RawExp::Call` carries NO type args (it drops
+            // `_typs`), so drop them here too and key on the fn name; the two
+            // sides stay identical on generic calls (both mirror only the head
+            // + value arg). Multi-value-arg / non-Var-head apps fail loud.
+            ExprNode::App { head, args } if args.len() == 1 => match app_head_fn_name(head) {
+                Some(name) => {
+                    let fn_id = self.text_leaf(name);
+                    let arg = self.lexpr_to_exprdata(&args[0])?;
+                    Ok(format!("({}.ExprData.App {} {})", NS, fn_id, box_ed(&arg)))
+                }
+                None => Err("ed-app-head".to_string()),
+            },
+            ExprNode::App { .. } => Err("ed-app-arity".to_string()),
+            // Structural binary op — reconcile into the canonical opcode table.
+            ExprNode::BinOp { op, lhs, rhs } => {
+                let opc = lean_binop_opcode(op)?;
+                let l = self.lexpr_to_exprdata(lhs)?;
+                let r = self.lexpr_to_exprdata(rhs)?;
+                Ok(format!(
+                    "({}.ExprData.BinOp {} {} {})",
+                    NS,
+                    opc,
+                    box_ed(&l),
+                    box_ed(&r)
+                ))
+            }
+            // Field projection. A `.deref` (the `&`-param dereference
+            // production inserts) uses the reference `deref_field()` id (0);
+            // any real field name interns its text (atom-id bucket), matching
+            // a reference FieldProj on the same field.
+            ExprNode::FieldProj { expr, field } => {
+                let sub = self.lexpr_to_exprdata(expr)?;
+                let fid = if field == "deref" { 0 } else { self.text_leaf(field) };
+                Ok(format!("({}.ExprData.FieldProj {} {})", NS, box_ed(&sub), fid))
+            }
+            // Source-span obligation wrapper. Production's `rust_loc` string is
+            // `format_rust_loc(&span)`; the reference wraps the obligation in
+            // `RawExp::Span` at the `oblig_leaf` level (W6d) with the SAME
+            // interned loc, so the two SpanMark loc ids agree.
+            ExprNode::SpanMark { rust_loc, inner, .. } => {
+                let loc = self.text_leaf(rust_loc);
+                let sub = self.lexpr_to_exprdata(inner)?;
+                Ok(format!("({}.ExprData.SpanMark {} {})", NS, loc, box_ed(&sub)))
+            }
+            _ => Err(format!("ed-{}", lexpr_construct_tag(&e.node))),
+        }
     }
 
     // ── Statement walk (StmData literal) ────────────────────────────
@@ -1640,6 +1770,110 @@ fn paren(term: &str) -> String {
 #[allow(dead_code)]
 fn box_raw(term: &str) -> String {
     box_(term)
+}
+
+/// Box an `ExprData` sub-term for a recursive field (`Box<ExprData>` in the
+/// W6b mirror). Same `Tactus.Box.mk (…)` syntax as `box_raw`; a distinct name
+/// documents the production-side (prod ExprData) vs reference-side (ref
+/// RawExp) role.
+#[allow(dead_code)]
+fn box_ed(term: &str) -> String {
+    box_(term)
+}
+
+/// True iff `e` is a bare `Var` whose rendered name equals `name` — the shape
+/// production uses for the `Int.toNat` / `Int.ofNat` cast heads
+/// (`LExpr::var_lit`). `&Box<Expr>` deref-coerces to `&Expr` at the call site.
+#[allow(dead_code)]
+fn is_var_named(e: &LExpr, name: &str) -> bool {
+    matches!(&e.node, ExprNode::Var(n) if n.as_str() == name)
+}
+
+/// The effective fn name of an App head: a bare `Var(name)` (the no-type-args
+/// callee, e.g. `tri`), or a type-arg application `App { head: Var(name), .. }`
+/// (production applies the fn to its type args before the value arg). The
+/// reference `RawExp::Call` carries no type args, so we key on the name alone
+/// and drop any type-arg layer — keeping both W6c sides identical on generic
+/// calls. Returns `None` for any other head shape (→ `ed-app-head`).
+#[allow(dead_code)]
+fn app_head_fn_name(head: &LExpr) -> Option<&str> {
+    match &head.node {
+        ExprNode::Var(n) => Some(n.as_str()),
+        ExprNode::App { head: inner, .. } => match &inner.node {
+            ExprNode::Var(n) => Some(n.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Production-side counterpart of `binop_opcode`: map the `lean_ast::BinOp`
+/// production chose (via `binop_to_ast`) into the SAME canonical opcode table.
+/// The `binop_opcode_alignment` test pins that the two tables agree through
+/// `binop_to_ast` on every structural op, so a future edit to one without the
+/// other is caught. `Iff` / bitwise / `Prod` are outside the cast class (the
+/// reference `binop_opcode` likewise rejects the vir ops that would produce
+/// them) → fail loud (`ed-binop-<k>`). Note `Xor` has no `lean_ast::BinOp`
+/// variant — production renders it as a 2-arg App (`Bool.xor`), which
+/// `lexpr_to_exprdata` census-rejects (`ed-app-arity`), so the reference's
+/// `Xor → 14` code is never consumed by a bridged fn.
+#[allow(dead_code)]
+fn lean_binop_opcode(op: &crate::lean_ast::BinOp) -> Sr<u64> {
+    use crate::lean_ast::BinOp as L;
+    let code = match op {
+        L::Eq => 0,
+        L::Ne => 1,
+        L::Lt => 2,
+        L::Le => 3,
+        L::Gt => 4,
+        L::Ge => 5,
+        L::Add => 6,
+        L::Sub => 7,
+        L::Mul => 8,
+        L::Div => 9,
+        L::Mod => 10,
+        L::And => 11,
+        L::Or => 12,
+        L::Implies => 13,
+        L::Iff => return Err("ed-binop-iff".to_string()),
+        L::BitAnd => return Err("ed-binop-bitand".to_string()),
+        L::BitOr => return Err("ed-binop-bitor".to_string()),
+        L::BitXor => return Err("ed-binop-bitxor".to_string()),
+        L::Shr => return Err("ed-binop-shr".to_string()),
+        L::Shl => return Err("ed-binop-shl".to_string()),
+        L::Prod => return Err("ed-binop-prod".to_string()),
+    };
+    Ok(code)
+}
+
+/// Sharp census tag for an un-mirrored `ExprNode` (the `_` arm of
+/// `lexpr_to_exprdata`). Var/Lit/BinOp/App/FieldProj/SpanMark are handled in
+/// the main match and never reach here.
+#[allow(dead_code)]
+fn lexpr_construct_tag(n: &ExprNode) -> &'static str {
+    match n {
+        ExprNode::LitBool(_) => "litbool",
+        ExprNode::LitStr(_) => "litstr",
+        ExprNode::LitChar(_) => "litchar",
+        ExprNode::UnOp { .. } => "unop",
+        ExprNode::Let { .. } => "let",
+        ExprNode::Lambda { .. } => "lambda",
+        ExprNode::Forall { .. } => "forall",
+        ExprNode::Exists { .. } => "exists",
+        ExprNode::If { .. } => "if",
+        ExprNode::Match { .. } => "match",
+        ExprNode::TypeAnnot { .. } => "typeannot",
+        ExprNode::StructUpdate { .. } => "structupdate",
+        ExprNode::ArrayLit(_) => "arraylit",
+        ExprNode::VectorLit(_) => "vectorlit",
+        ExprNode::Tuple(_) => "tuple",
+        ExprNode::Index { .. } => "index",
+        ExprNode::Anon(_) => "anon",
+        ExprNode::Subtype { .. } => "subtype",
+        ExprNode::Raw(_) => "raw",
+        ExprNode::ByBlock { .. } => "byblock",
+        _ => "other",
+    }
 }
 
 /// The CANONICAL binary-opcode table — a fixed small-int namespace living in
