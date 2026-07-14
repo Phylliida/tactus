@@ -510,12 +510,14 @@ arithmetic fns; G2+G3 unlock the datatype/struct/tuple fns.
     (`Imp(100, Leaf 7)` ×3, incl. the mutation-kill's first goal so the ONLY diff
     stays the `99` let-value), and the `stm_size` Call/Ret size tests (values
     unchanged — `raw_exp_list_len` == `leaf_len` on the same shapes).
-  - **`close_each` (the LeafList version) is now DEAD** — no callers (Loop uses
-    `close_each_binderprop`; Call/Ret use `close_each_e`). Kept + comment-marked
-    SUPERSEDED (pure spec fn, harmless; safe to delete once no stage-A obligation
-    container remains — confirmed no external refs via grep).
+  - **`close_each` (the LeafList version) DELETED** — it went dead when Call/Ret
+    deepened (Loop uses `close_each_binderprop`; Call/Ret use `close_each_e`).
+    Confirmed no callers in-file or in `source/` (grep). Deleted rather than kept
+    (local model's steer, aligns with the "no dead code" discipline: the crate
+    already fully re-elaborates from the datatype churn, so git is the undo
+    buffer — retaining superseded logic is pure debt).
 
-  **Verified 54/0** (`--lean-backend --lean-all-proofs`, 46 modules elaborated,
+  **Verified 53/0** (`--lean-backend --lean-all-proofs`, 46 modules elaborated,
   "composition + axiom closures kernel-verified" — no `WellFounded.fix`/
   `Classical`). The `decide` bridge holds through every edited fixture (sum_to
   monster, cd19 two-way join, call_pass_through both post-shapes + mutation-kill,
