@@ -34,6 +34,39 @@ inductive lib.RetBind where
   deriving Inhabited
 @[simp] noncomputable def lib.RetBind.height (_ : lib.RetBind) : Nat :=
   1
+inductive lib.TypData where
+  | TyInt
+  | TyNat
+  | TyBool
+  | TyNamed (val0 : Int)
+  | TyRef (val0 : Int)
+  deriving Inhabited
+@[simp] noncomputable def lib.TypData.height (_ : lib.TypData) : Nat :=
+  1
+inductive lib.RawExp where
+  | Var (val0 : Int) (val1 : lib.TypData)
+  | Lit (val0 : Int) (val1 : lib.TypData)
+  | LitBool (val0 : Nat)
+  | Clip (val0 : lib.TypData) (val1 : Tactus.Box lib.RawExp)
+  | BinOp (val0 : Int) (val1 : lib.TypData) (val2 : Tactus.Box lib.RawExp) (val3 : Tactus.Box lib.RawExp)
+  | Call (val0 : Int) (val1 : lib.TypData) (val2 : Tactus.Box lib.RawExp) (val3 : lib.TypData)
+  | Field (val0 : Int) (val1 : lib.TypData) (val2 : Tactus.Box lib.RawExp)
+  | HasType (val0 : Int) (val1 : Tactus.Box lib.RawExp)
+  | Deref (val0 : Tactus.Box lib.RawExp)
+  | Span (val0 : Int) (val1 : Tactus.Box lib.RawExp)
+  deriving Inhabited
+@[simp] noncomputable def lib.RawExp.height (s : lib.RawExp) : Nat :=
+  match s with | lib.RawExp.Var _ _ => 1 | lib.RawExp.Lit _ _ => 1 | lib.RawExp.LitBool _ => 1 | lib.RawExp.Clip _ val1 => 1 + lib.RawExp.height val1.deref | lib.RawExp.BinOp _ _ val2 val3 => 1 + lib.RawExp.height val2.deref + lib.RawExp.height val3.deref | lib.RawExp.Call _ _ val2 _ => 1 + lib.RawExp.height val2.deref | lib.RawExp.Field _ _ val2 => 1 + lib.RawExp.height val2.deref | lib.RawExp.HasType _ val1 => 1 + lib.RawExp.height val1.deref | lib.RawExp.Deref val0 => 1 + lib.RawExp.height val0.deref | lib.RawExp.Span _ val1 => 1 + lib.RawExp.height val1.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
+inductive lib.RawExpList where
+  | Nil
+  | Cons (val0 : Tactus.Box lib.RawExp) (val1 : Tactus.Box lib.RawExpList)
+  deriving Inhabited
+@[simp] noncomputable def lib.RawExpList.height (s : lib.RawExpList) : Nat :=
+  match s with | lib.RawExpList.Nil => 1 | lib.RawExpList.Cons _ val1 => 1 + lib.RawExpList.height val1.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
 inductive lib.FrameList where
   | FNil
   | FBind (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
@@ -45,30 +78,21 @@ inductive lib.FrameList where
 termination_by sizeOf s
 decreasing_by all_goals (simp_all; omega)
 inductive lib.StmData where
-  | Assert (val0 : Int) (val1 : Int)
+  | Assert (val0 : lib.RawExp) (val1 : Int)
   | Assume (val0 : Int)
   | Assign (val0 : Int) (val1 : Int)
-  | Call (reqs : Tactus.Box lib.LeafList) (post : Tactus.Box lib.FrameList)
+  | Call (reqs : Tactus.Box lib.RawExpList) (post : Tactus.Box lib.FrameList)
   | DeadEnd (val0 : Tactus.Box lib.StmData)
-  | Ret (val0 : Tactus.Box lib.LeafList) (val1 : lib.RetBind)
+  | Ret (val0 : Tactus.Box lib.RawExpList) (val1 : lib.RetBind)
   | If (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.StmData) (val3 : Tactus.Box lib.StmData)
-  | Loop (inv_hyps : Tactus.Box lib.BinderList) (binders : Tactus.Box lib.BinderList) (binder_bounds : Tactus.Box lib.ParamBoundList) (cond_name : Int) (cond_ann : Int) (neg_cond_ann : Int) (d_old_name : Int) (d_old_val : Int) (decrease_oblig : Int) (body : Tactus.Box lib.StmData)
+  | Loop (inv_hyps : Tactus.Box lib.BinderList) (inv_obligs : Tactus.Box lib.RawExpList) (binders : Tactus.Box lib.BinderList) (binder_bounds : Tactus.Box lib.ParamBoundList) (cond_name : Int) (cond_ann : Int) (neg_cond_ann : Int) (d_old_name : Int) (d_old_val : Int) (decrease_oblig : lib.RawExp) (body : Tactus.Box lib.StmData)
   | Skip
   | Seq (val0 : Tactus.Box lib.StmData) (val1 : Tactus.Box lib.StmData)
   deriving Inhabited
 @[simp] noncomputable def lib.StmData.height (s : lib.StmData) : Nat :=
-  match s with | lib.StmData.Assert _ _ => 1 | lib.StmData.Assume _ => 1 | lib.StmData.Assign _ _ => 1 | lib.StmData.Call _ _ => 1 | lib.StmData.DeadEnd val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Ret _ _ => 1 | lib.StmData.If _ _ val2 val3 => 1 + lib.StmData.height val2.deref + lib.StmData.height val3.deref | lib.StmData.Loop _ _ _ _ _ _ _ _ _ body => 1 + lib.StmData.height body.deref | lib.StmData.Skip => 1 | lib.StmData.Seq val0 val1 => 1 + lib.StmData.height val0.deref + lib.StmData.height val1.deref
+  match s with | lib.StmData.Assert _ _ => 1 | lib.StmData.Assume _ => 1 | lib.StmData.Assign _ _ => 1 | lib.StmData.Call _ _ => 1 | lib.StmData.DeadEnd val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Ret _ _ => 1 | lib.StmData.If _ _ val2 val3 => 1 + lib.StmData.height val2.deref + lib.StmData.height val3.deref | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ body => 1 + lib.StmData.height body.deref | lib.StmData.Skip => 1 | lib.StmData.Seq val0 val1 => 1 + lib.StmData.height val0.deref + lib.StmData.height val1.deref
 termination_by sizeOf s
 decreasing_by all_goals (simp_all; omega)
-inductive lib.TypData where
-  | TyInt
-  | TyNat
-  | TyBool
-  | TyNamed (val0 : Int)
-  | TyRef (val0 : Int)
-  deriving Inhabited
-@[simp] noncomputable def lib.TypData.height (_ : lib.TypData) : Nat :=
-  1
 inductive lib.CastKind where
   | IntToNat
   | NatToInt
@@ -87,22 +111,6 @@ inductive lib.ExprData where
   deriving Inhabited
 @[simp] noncomputable def lib.ExprData.height (s : lib.ExprData) : Nat :=
   match s with | lib.ExprData.Atom _ => 1 | lib.ExprData.Lit _ => 1 | lib.ExprData.LitBool _ => 1 | lib.ExprData.Cast _ val1 => 1 + lib.ExprData.height val1.deref | lib.ExprData.BinOp _ val1 val2 => 1 + lib.ExprData.height val1.deref + lib.ExprData.height val2.deref | lib.ExprData.App _ val1 => 1 + lib.ExprData.height val1.deref | lib.ExprData.FieldProj val0 _ => 1 + lib.ExprData.height val0.deref | lib.ExprData.SpanMark _ val1 => 1 + lib.ExprData.height val1.deref
-termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
-inductive lib.RawExp where
-  | Var (val0 : Int) (val1 : lib.TypData)
-  | Lit (val0 : Int) (val1 : lib.TypData)
-  | LitBool (val0 : Nat)
-  | Clip (val0 : lib.TypData) (val1 : Tactus.Box lib.RawExp)
-  | BinOp (val0 : Int) (val1 : lib.TypData) (val2 : Tactus.Box lib.RawExp) (val3 : Tactus.Box lib.RawExp)
-  | Call (val0 : Int) (val1 : lib.TypData) (val2 : Tactus.Box lib.RawExp) (val3 : lib.TypData)
-  | Field (val0 : Int) (val1 : lib.TypData) (val2 : Tactus.Box lib.RawExp)
-  | HasType (val0 : Int) (val1 : Tactus.Box lib.RawExp)
-  | Deref (val0 : Tactus.Box lib.RawExp)
-  | Span (val0 : Int) (val1 : Tactus.Box lib.RawExp)
-  deriving Inhabited
-@[simp] noncomputable def lib.RawExp.height (s : lib.RawExp) : Nat :=
-  match s with | lib.RawExp.Var _ _ => 1 | lib.RawExp.Lit _ _ => 1 | lib.RawExp.LitBool _ => 1 | lib.RawExp.Clip _ val1 => 1 + lib.RawExp.height val1.deref | lib.RawExp.BinOp _ _ val2 val3 => 1 + lib.RawExp.height val2.deref + lib.RawExp.height val3.deref | lib.RawExp.Call _ _ val2 _ => 1 + lib.RawExp.height val2.deref | lib.RawExp.Field _ _ val2 => 1 + lib.RawExp.height val2.deref | lib.RawExp.HasType _ val1 => 1 + lib.RawExp.height val1.deref | lib.RawExp.Deref val0 => 1 + lib.RawExp.height val0.deref | lib.RawExp.Span _ val1 => 1 + lib.RawExp.height val1.deref
 termination_by sizeOf s
 decreasing_by all_goals (simp_all; omega)
 inductive lib.GoalData where

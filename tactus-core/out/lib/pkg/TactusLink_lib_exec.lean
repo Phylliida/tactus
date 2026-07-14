@@ -6,6 +6,7 @@ import lib__probe_goal_eq_leaf
 import lib__probe_goal_eq_nested
 import lib__probe_goals_eq_lit
 import lib__probe_close
+import lib__probe_close_e
 import lib__probe_wp_stm
 import lib__probe_ref_wp
 import lib__ref_wp_seed_and_assert
@@ -43,6 +44,9 @@ noncomputable def lib.probe_goals_eq_lit_closed : lib.probe_goals_eq_lit_stmt :=
 noncomputable def lib.probe_close_closed : lib.probe_close_stmt :=
   lib.probe_close
 #tactus_check_axioms lib.probe_close_closed []
+noncomputable def lib.probe_close_e_closed : lib.probe_close_e_stmt :=
+  lib.probe_close_e
+#tactus_check_axioms lib.probe_close_e_closed []
 noncomputable def lib.probe_wp_stm_closed : lib.probe_wp_stm_stmt :=
   lib.probe_wp_stm
 #tactus_check_axioms lib.probe_wp_stm_closed []

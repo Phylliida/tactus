@@ -4,5 +4,5 @@ set_option linter.unusedVariables false
 set_option maxHeartbeats 800000
 set_option autoImplicit false
 theorem lib.probe_ref_wp :
-    lib.goal_count (lib.ref_wp (lib.FnCtxData.mk lib.BinderList.Nil lib.BinderList.Nil lib.ParamBoundList.Nil lib.BinderList.Nil lib.LeafList.Nil) (lib.StmData.Assert 9 9)) = 1 := by
+    lib.goal_count (lib.ref_wp (lib.FnCtxData.mk lib.BinderList.Nil lib.BinderList.Nil lib.ParamBoundList.Nil lib.BinderList.Nil lib.LeafList.Nil) (lib.StmData.Assert (lib.atom_ob 9) 9)) = 1 := by
   decide 
