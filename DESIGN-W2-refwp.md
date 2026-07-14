@@ -98,12 +98,43 @@ At fixture scale the **entire** stage-A gap is `StmData::Call` — exactly
 `bootstrap-02b`. (Overhead is unmeasurable here because the fixture verifies
 in ~1s; the "rendering leaves twice" budget only shows at tgt scale.)
 
-**tgt-wide table — pending the cold run.** A cold `--tactus-emit-cert` run over
-all of tgt is launched (`/tmp/n4-tgt-cold.log`). The warm run already surfaced
-two real tag families beyond `call`: `assert-query` (e.g.
-`todd_coxeter_rt.symbol_to_column_exec`, `…inverse_column_exec`). The full
-ranked bucket table (expected big buckets per the plan: trait-method
-obligations, generics, closures, bv) goes here once the cold run lands.
+**tgt-wide census (COMPLETE — cold run, `src/lib.rs`, 3116 fns, 1m40s).**
+
+The single most important finding reframes the whole census: **stage-A cert
+emission is EXEC-FN-ONLY.** `emit_cert` is called only from
+`emit_package_exec_fn` / its island sibling (`generate.rs:3746`, `:4059`) —
+i.e. per verified *exec* fn's WP obligations. tgt is a proof/spec-heavy group
+theory crate (3571 `spec`/`proof` fn decls); it has **9 exec fns total**, so
+the crate-wide census denominator is 9, not 3116. The plan's "expected big
+buckets — trait-method obligations, generics, closures, bv" live in
+proof/spec fns and are **out of scope for stage A entirely** — they never
+reach the serializer. Consequence: the **`bootstrap-fixture` family is the
+real serializer stress corpus**; tgt's value here is (a) verdict-neutrality at
+scale and (b) confirming the exec-fn construct gaps on real code.
+
+| metric | value |
+|---|---|
+| verified / errors (flag ON, cold) | 3116 / **0** |
+| verified / errors (flag OFF, cold) | 3116 / **0** (identical → **zero verdict delta at scale**) |
+| cert-eligible fns (= exec fns) | **9** |
+| certified | **1 / 9** (`runtime::impl_4::clone`) |
+| wall-clock flag ON / OFF (cold) | 100s / 99.56s (**overhead ~0.4s, <0.5%** — emission touches 9/3116 fns) |
+
+Ranked per-construct rejection buckets (tgt exec fns) — this IS the stage-B
+roadmap for exec-fn certs:
+
+| construct tag | fn count | fns |
+|---|---|---|
+| `call` (`StmX::Call`) | **5** | runtime::find_cancellation_exec, copy_word, apply_hom_gen, apply_hom_inv, apply_hom_symbol_exec |
+| `assert-query` | **3** | todd_coxeter_rt::symbol_to_column_exec, inverse_column_exec; runtime::is_inverse_pair_exec |
+
+**Roadmap read-out.** tgt exec-fn stage-A coverage is gated by exactly two
+arms: `bootstrap-02b` (`StmData::Call`) clears the 5 `call` fns, and an
+`assert-query` arm clears the remaining 3. Landing both takes tgt from **1/9
+→ 9/9** exec-fn certs. No other construct blocks a tgt exec fn. Combined with
+the fixture (whose entire gap is also `call`), **`StmData::Call` is the
+single highest-leverage next serializer arm** across both corpora
+(5 + 5 = 10 fns unlocked), with `assert-query` a distant second (3 fns).
 
 ## 2. W2 — refWp stage A (the heart)
 
