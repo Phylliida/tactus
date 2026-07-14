@@ -238,6 +238,52 @@ frontend, or SST semantics adequacy (W5f). A stage-A pass + the four
 leaf-renderer bugs of 2026-07-11 coexisting is possible and expected — say
 so wherever the certificate is described.
 
+### 2.6 Call arm — the #128 ret-eq fork (opus-b02b, 2026-07-13; DECISION PENDING)
+
+Picking up `bootstrap-02b` surfaced a mirror-shape defect: the N2.1-frozen
+`StmData::Call { reqs, enss, dest, dest_typ }` + refWp's
+`frame_after(Call) = FBind(dest, dest_typ, hyps_of_leaves(enss))` models ONLY
+the naive ∀-path (`∀ dest, ens → …`). Production's `push_post_call_frames`
+(`sst_to_lean.rs:3250`) has a `#128 ret-eq` optimization: when a callee's
+ensures has a conjunct `r == E` (E ∌ r) it DROPS the `∀ ret` and emits
+`[E_bound →] [rest →] let dest := E`. The fixture callee `double_exec`
+(`ensures r == 2*x`) hits exactly this, so refWp cannot reproduce
+`quad_exec`'s goals and the bridge won't close. Full analysis + option table
+in board `bootstrap-02b`. Recommended resolution (local model concurs):
+
+**"Lower the mirror" — `Call { reqs: Box<LeafList>, post: Box<FrameList> }`.**
+The post-call frame becomes explicit EVIDENCE the serializer transcribes,
+not intent refWp re-derives. refWp collapses to a pass-through:
+
+```
+wp_stm(f, Call{reqs, post})     = close_each(f, *reqs)          -- obligations
+frame_after(f, Call{reqs, post}) = frame_append(f, *post)        -- append verbatim
+stm_size(Call{reqs, post})       = 1 + leaf_len(*reqs) + frame_len(*post)
+```
+
+The serializer builds `post` by INDEPENDENTLY replicating the simple subset
+of `push_post_call_frames` (ret-eq detect via `vir_find_ret_eq`, `E_bound`
+via `type_bound_predicate`, the `coerce_lexpr` bridge), so both frame shapes
+land in one uniform slot:
+- ∀-path → `FBind(dest, ret_typ, [FHyp(ret_bound)] FHyp(ens))`
+- ret-eq → `[FHyp(E_bound)] [FHyp(rest)] FLet(dest, E)`
+
+The `decide` bridge then validates the serializer's replication against
+production (non-circular — the serializer recomputes, does NOT copy). This
+generalizes to the coming `&mut` post-state / prophecy frames instead of
+perpetually growing refWp's Call arm.
+
+**Note for the implementer:** this `{reqs, post: FrameList}` reshape is
+IDENTICAL for the two leading options — Option 1 (serializer replicates
+`post`) and Option 2 (provenance-capture `post` from the walk) differ ONLY in
+how `post` is populated, not in the mirror/refWp shape. So the tactus-core
+side is safe to build ahead of the Option 1-vs-2 call; only the serializer's
+`post`-builder waits on it. (Option 1'—keep `enss/dest/dest_typ` + add a
+ret-eq VARIANT—and Option 3—restrict to ∀-path, fail-loud on ret-eq—do NOT
+share this reshape.) `frame_len` already exists (lib.rs:288). Add a
+`ref_wp_call_*` in-crate `decide` proof over a hand-built `double_exec`-shaped
+literal (one ret-eq, one ∀-path) before wiring the serializer.
+
 ## 3. W3 — the differential gate (the payoff before any proof)
 
 Run serializer + bridge over tgt: every fn where `decide` says NO is a bug in

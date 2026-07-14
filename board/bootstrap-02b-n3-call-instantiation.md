@@ -1,9 +1,9 @@
 ---
 title: "N3 follow-up — StmData::Call serialization (callee req/ens instantiation)"
-status: todo
-claimed_by:
+status: in_progress
+claimed_by: opus-b02b
 created: 2026-07-13T21:20:00Z
-updated: 2026-07-13T21:20:00Z
+updated: 2026-07-13T22:20:00Z
 ---
 
 ## Description
@@ -96,5 +96,111 @@ after N3b (goal provenance), since the bridge is what pins the instantiation.
   still backwards. It just confirms: when W2b lands, THIS is the first
   serializer arm to build (and its faithfulness is exactly what the bridge
   will `decide`-check).
+
+- (2026-07-13, opus-b02b) **PICKED UP (W2b gate now cleared) + found a
+  genuine mirror-shape fork before writing any TCB code. Surfacing to
+  Danielle.** The deferral was correct until W2b landed; it has (bootstrap-07
+  done, bootstrap-18 done), so the sequencing gate is clear. On reading the
+  production `walk_call` path against the ALREADY-AUTHORED refWp Call
+  equations, the current mirror shape does NOT reproduce production's goals
+  for the fixture target `quad_exec`. Details, all confirmed from source:
+
+  **The mirror models the naive ∀-path; production takes the #128 ret-eq
+  path for the fixture.**
+    - `StmData::Call { reqs, enss, dest, dest_typ }` (tactus-core/lib.rs:133)
+      with `frame_after(Call) = FBind(dest, dest_typ, hyps_of_leaves(enss))`
+      (lib.rs:739) and `wp_stm(Call) = close_each(f, reqs)` (lib.rs:795). I.e.
+      refWp models the post-call frame as `∀ (dest:dest_typ), ens0 → ens1 →
+      …` — the naive "quantify the result, assume the ensures" shape from
+      DESIGN-W2 §2.2. These Call equations have NO in-crate decide proof yet
+      (all `ref_wp_*` proofs cover Assert/Seq/Ret/Loop/If — none exercise
+      Call), so they were authored to spec, never validated against
+      production.
+    - Production's `push_post_call_frames` (sst_to_lean.rs:3250) has a
+      `#128 ret-eq` optimization (`vir_find_ret_eq` :3695, `push_ret_frames`
+      :3802): when a callee's ensures has a conjunct `r == E` with E not
+      mentioning r, it DROPS the `∀ ret` entirely and emits
+      `[E_bound →] [rest_ensures →] let dest := E`.
+    - `double_exec` (the fixture callee) is `ensures r == 2*x` → hits ret-eq.
+      For `let a = double_exec(x)` production's post-call frame is:
+      `Imp(0 ≤ 2*x ∧ 2*x < 2^64) → Let(a, <bridged 2*x>) → <cont>`
+      (E_bound from `type_bound_predicate(2*x, u64)` = unsigned range;
+      rest_ensures empty → elided; dest_value = coerce_lexpr(2*x,u64,u64) =
+      2*x). The precondition obligation goal is `close(f, [x < 1000 marked
+      CallPrecondition])` — a single conjoined obligation
+      (`emit_call_precondition_theorem` `and_all`s the requires).
+    - So refWp gives `All(a, u64, Imp(ens))` where production gives
+      `Imp(E_bound) Let(a, 2*x)`. **Structural mismatch → the decide bridge
+      cannot close for quad_exec with the current mirror.**
+
+  **Key facts that shape the fix:**
+    - The requires-obligation goal (`close(frame, req_conj)`, one conjoined
+      obligation) is IDENTICAL in both the ∀-path and ret-eq path. Only the
+      post-call FRAME differs.
+    - BOTH production frame shapes are expressible with existing frame
+      primitives: ∀-path = `FBind(dest, ret_typ, [FHyp(ret_bound)] FHyp(ens))`;
+      ret-eq path = `[FHyp(E_bound)] [FHyp(rest)] FLet(dest, E)`.
+    - The raw SST `StmX::Call` does NOT contain the post-call frame — it is
+      COMPUTED downstream in `push_post_call_frames`. So ANY option that
+      certifies quad_exec must either replicate that computation in the
+      serializer (the ~150-line TCB step the card warned about) or capture it
+      from production's walk via provenance.
+
+  **Options (full analysis; recommending #1 = "lower the mirror"):**
+    1. **`Call { reqs: LeafList, post: FrameList }` — transcribe the post-call
+       frame.** refWp becomes `wp_stm(Call)=close_each(f,reqs)`,
+       `frame_after(Call)=frame_append(f, post)` (a pass-through appender).
+       The serializer INDEPENDENTLY replicates `push_post_call_frames`
+       (ret-eq detect + bound synth + coerce) for the simple subset to build
+       `post`. Handles ∀-path + ret-eq uniformly and generalizes to future
+       `&mut` post-states/prophecies. The `decide` bridge validates the
+       serializer's replication against production (non-circular — serializer
+       does NOT copy production's frame, it recomputes it). Cost: mirror
+       reshape (rewrite the frozen N2.1 Call fields + refWp Call equations +
+       the stm_size/decide sanity arms; invalidates the tactus-core fn cache
+       once) + ~150 lines of replicated instantiation in the TCB.
+    2. **Capture the post-call frame delta via provenance** (like N3b goal
+       shapes) instead of replicating. Least TCB, but refWp's Call handling is
+       then a pass-through over a COPIED frame → the call's frame contribution
+       is tautologically matched (weaker independent check for calls).
+    3. **Restrict to the ∀-path; fail-loud on ret-eq.** Tiny, no mirror
+       change, but quad_exec still fails and most exec fns have `r == E`
+       ensures → certifies ≈nothing. Not worth it.
+    4. **Desugar Call into primitive StmData nodes** (DeadEnd/Assert for the
+       precondition-only obligation, Assume/Assign for the frame). No mirror
+       change, refWp untouched — but "clever" desugaring in the TCB (against
+       the module's boring-beats-clever discipline) and still replicates the
+       path choice.
+
+  **Recommendation: Option 1.** It matches the architecture's north star
+  (serializer = faithful transcription of what production does; refWp = dumb
+  structural checker; bridge = the meaningful test). The local model
+  (127.0.0.1:8051) independently reached the same conclusion, framing it as
+  "lowering the mirror": move the frame from *derived intent* to *explicit
+  evidence*, so the bridge actually validates the #128 optimization and the
+  fix is permanent across the coming `&mut`/prophecy frame shapes rather than
+  perpetually chasing production's frame-synth logic in refWp.
+
+  **Blocked on a Danielle call** (the card invited exactly this fork): does
+  she want the mirror reshaped to `post: FrameList` (Option 1), or the
+  lighter provenance-capture (Option 2), or keep the contract-view
+  `enss/dest/dest_typ` and add a ret-eq VARIANT (a middle path — less general
+  than FrameList, but preserves the readable Call node)? Asking now.
+
+  **Concrete next steps once decided (Option 1 path):**
+    - tactus-core: change `Call` to `{ reqs: Box<LeafList>, post: Box<FrameList> }`;
+      rewrite `frame_after`/`wp_stm`/`stm_size`/`frame_len`(n/a) arms; add a
+      `ref_wp_call_*` decide proof for a hand-built double_exec-shaped literal
+      (both a ret-eq and a ∀-path case).
+    - serializer `sst_serialize.rs`: replace the `Err("call")` arm with a
+      restricted builder mirroring `resolve_callee` + the simple subset of
+      `build_call_substitutions` + `push_post_call_frames` (Static +
+      same-crate + no-`&mut` + no-generic only; keep trait/`&mut`/cross-crate
+      fail-loud with sharper tags `call-mut`/`call-trait`/`call-crosscrate`).
+      Move the Call bullet from "Deliberately NOT read" to "Read" in the
+      module faithfulness doc, spelling out the instantiation as the one
+      non-transcription trusted step.
+    - Validate via the W2b bridge: quad_exec cert must decide-close; a
+      negative-control mutation (swap the E in `let a := E`) must flip.
 
 ## Writeup
