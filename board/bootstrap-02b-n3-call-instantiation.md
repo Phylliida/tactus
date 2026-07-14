@@ -3,7 +3,7 @@ title: "N3 follow-up — StmData::Call serialization (callee req/ens instantiati
 status: in_progress
 claimed_by: opus-b02b
 created: 2026-07-13T21:20:00Z
-updated: 2026-07-13T22:20:00Z
+updated: 2026-07-13T23:10:00Z
 ---
 
 ## Description
@@ -202,5 +202,37 @@ after N3b (goal provenance), since the bridge is what pins the instantiation.
       non-transcription trusted step.
     - Validate via the W2b bridge: quad_exec cert must decide-close; a
       negative-control mutation (swap the E in `let a := E`) must flip.
+
+- (2026-07-13, opus-b02b) **DECISION IN (Danielle: Option 1) → tactus-core
+  half LANDED & verified.** Implemented the whole tactus-core side of the
+  "Concrete next steps" above (committed; `lean-backend --lean-all-proofs`:
+  **43 verified, 0 errors**, `out/lib/` regenerated):
+    - `StmData::Call { reqs: Box<LeafList>, post: Box<FrameList> }` (was
+      `{ reqs, enss, dest, dest_typ }`). Datatype change → tactus-core fn
+      cache invalidated once and the module re-verified, as warned.
+    - refWp is now a **pass-through**: `wp_stm(f, Call) = close_each(f, *reqs)`;
+      `frame_after(f, Call) = frame_append(f, *post)` (append the transcribed
+      post-call frame verbatim); `stm_size = 1 + leaf_len(reqs) +
+      frame_len(post)`. `amended_shapes_kernel_compute` Call-size sanity
+      updated.
+    - **`ref_wp_call_pass_through` decide proof (the double_exec-shaped
+      validation §2.6 asked for):** models `let a = double_exec(x); assert Q`
+      under a one-hyp ambient frame `[100]`, proving refWp reproduces
+      production's goals for BOTH post shapes:
+        · ret-eq (#128): `post = FHyp(E_bound) FLet(a, 2*x)` ⇒
+          `[100→(x<2^63)]`, `[100→(0≤2x∧2x<2^64)→ let a:=2x; Q]` (no ∀).
+        · ∀-path: `post = FBind(a,u64) FHyp(ret_bound) FHyp(ens)` ⇒
+          `[100→(x<2^63)]`, `[100→∀a,(0≤a∧a<2^64)→(a>x)→ Q]`.
+      Plus a mutation-kill (swap `let a := E` value 10→99 ⇒ `goals_eq = 0`).
+    - DESIGN-W2-refwp.md §2.6 marked DECIDED + §0 table Call row superseded.
+
+  **Proves** the reshape is sound and refWp's pass-through reproduces
+  production goals for both `push_post_call_frames` paths on hand-built
+  literals. **Does NOT yet** serialize `quad_exec` — the card's "done when"
+  needs the serializer `post`-builder (the second + third bullets of
+  "Concrete next steps" above, unchanged and now UNBLOCKED). Card stays
+  `in_progress`; next pickup = that serializer builder, whose faithfulness the
+  W2b bridge will `decide`-validate against production (non-circular: the
+  serializer recomputes `post`, refWp does not copy it).
 
 ## Writeup
