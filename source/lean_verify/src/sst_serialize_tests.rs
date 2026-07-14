@@ -336,10 +336,11 @@ fn lexpr_to_exprdata_deref_fieldproj() {
 fn lexpr_to_exprdata_census_rejects() {
     use crate::lean_ast::BinOp as L;
     let mut s = Serializer::default();
-    // A `¬`-wrapped prop is outside the cast class (a `UnOp` node). (Bool
-    // literals are NOW in-class — see `lexpr_to_exprdata_bool_literal` (G1).)
+    // A `-`-negated int (`UnOp::Neg`) is outside the class. (Bool literals are
+    // in-class via G1; `¬` (`UnOp::Not`) and `let` are in-class via G4 — see
+    // `lexpr_to_exprdata_g4_not_let` below.)
     assert_eq!(
-        s.lexpr_to_exprdata(&LExpr::not(LExpr::var_synthetic("p")))
+        s.lexpr_to_exprdata(&LExpr::neg(LExpr::var_synthetic("p")))
             .unwrap_err(),
         "ed-unop"
     );
@@ -352,6 +353,36 @@ fn lexpr_to_exprdata_census_rejects() {
     // A bitwise binop is outside the cast class (both sides reject).
     let bitand = LExpr::binop(L::BitAnd, LExpr::var_synthetic("a"), LExpr::var_synthetic("b"));
     assert_eq!(s.lexpr_to_exprdata(&bitand).unwrap_err(), "ed-binop-bitand");
+}
+
+/// G4 (W6e) — the value-if-lift goal leaves carry `¬` (`UnOp::Not`) and `let`
+/// (`ExprNode::Let`) nodes production folds into each branch obligation. Both
+/// transcribe structurally; the binder name interns its rendered text (the
+/// SAME text the reference `RawExp::Let` interns), and `render_exp` passes both
+/// straight through so the bridge `decide`s the sub-expressions.
+#[test]
+fn lexpr_to_exprdata_g4_not_let() {
+    let mut s = Serializer::default();
+    // `¬ p` → `ExprData.Not (Atom 0)` (p interns to 0).
+    assert_eq!(
+        s.lexpr_to_exprdata(&LExpr::not(LExpr::var_synthetic("p")))
+            .unwrap(),
+        "(lib.ExprData.Not (Tactus.Box.mk (lib.ExprData.Atom 0)))"
+    );
+    // `let m := y; m` → `ExprData.Let m (Atom y) (Atom m)`. Fresh serializer so
+    // ids are deterministic: m=0 (binder), y=1 (value read), m=0 (body read).
+    let mut s2 = Serializer::default();
+    let letexpr = LExpr::let_bind_synthetic(
+        "m",
+        LExpr::var_synthetic("y"),
+        LExpr::var_synthetic("m"),
+    );
+    assert_eq!(
+        s2.lexpr_to_exprdata(&letexpr).unwrap(),
+        "(lib.ExprData.Let 0 \
+           (Tactus.Box.mk (lib.ExprData.Atom 1)) \
+           (Tactus.Box.mk (lib.ExprData.Atom 0)))"
+    );
 }
 
 // ── W6d.2b: raw_exp peel/alias arms (G0 Box/Unbox, G7 VarAt, G1 LitBool) ──
