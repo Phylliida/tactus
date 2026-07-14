@@ -196,3 +196,50 @@ fn goal_list_skips_none_and_pairs_names() {
     assert_eq!(names, vec!["obl_a".to_string(), "obl_c".to_string()]);
     assert_eq!(term.matches(&format!("{}.GoalList.Cons", NS)).count(), 2, "{}", term);
 }
+
+// ── W6c: reference-side raw-expr transcription (ExpX → RawExp) ──────
+
+/// `typ_data` maps the cast-class base types to their `lib.TypData` tags.
+/// Nat → `TyNat`, every other integer range (uN/int/usize) → `TyInt`,
+/// bool → `TyBool`. These are the only tags the `needs_nat_coercion`
+/// decision reads, so pinning them pins the cast decision's inputs.
+#[test]
+fn typ_data_base_tags() {
+    use std::sync::Arc;
+    let mut s = Serializer::default();
+    let nat: Typ = Arc::new(TypX::Int(IntRange::Nat));
+    let u64t: Typ = Arc::new(TypX::Int(IntRange::U(64)));
+    let intt: Typ = Arc::new(TypX::Int(IntRange::Int));
+    let boolt: Typ = Arc::new(TypX::Bool);
+    assert_eq!(s.typ_data(&nat).unwrap(), format!("{}.TypData.TyNat", NS));
+    assert_eq!(s.typ_data(&u64t).unwrap(), format!("{}.TypData.TyInt", NS));
+    assert_eq!(s.typ_data(&intt).unwrap(), format!("{}.TypData.TyInt", NS));
+    assert_eq!(s.typ_data(&boolt).unwrap(), format!("{}.TypData.TyBool", NS));
+}
+
+/// `typ_data` peels the SMT-only `Boxed` wrapper (a uN inside a `Boxed`
+/// still tags `TyInt`), so a boxed operand still drives the coercion.
+#[test]
+fn typ_data_peels_boxed() {
+    use std::sync::Arc;
+    let mut s = Serializer::default();
+    let boxed_u64: Typ = Arc::new(TypX::Boxed(Arc::new(TypX::Int(IntRange::U(64)))));
+    assert_eq!(s.typ_data(&boxed_u64).unwrap(), format!("{}.TypData.TyInt", NS));
+}
+
+/// `binop_opcode` is the canonical fixed opcode table shared by both W6c
+/// transcriptions. Pin the cast-class ops used by the fixture (Eq for the
+/// `sum_to` postcond, Mul for the derived-coercion Case B) and that an
+/// out-of-class op fails loud with a sharp census tag.
+#[test]
+fn binop_opcode_canonical() {
+    use vir::ast::{ArithOp, BinaryOp, Mode, OverflowBehavior};
+    assert_eq!(binop_opcode(&BinaryOp::Eq(Mode::Spec)).unwrap(), 0);
+    assert_eq!(
+        binop_opcode(&BinaryOp::Arith(ArithOp::Mul(OverflowBehavior::Allow))).unwrap(),
+        8
+    );
+    // A bitwise op is outside the cast class → sharp census tag.
+    let bad = binop_opcode(&BinaryOp::StrGetChar);
+    assert_eq!(bad.unwrap_err(), "raw-binop-strgetchar");
+}
