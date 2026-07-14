@@ -53,6 +53,29 @@ serializer divergence). Low priority relative to W3/N3-Call, but small and
 well-isolated. Consider batching with any other RenderCtx-subst faithfulness
 gaps W3 surfaces on tgt.
 
+## Second site (batched here — found by W3, board bootstrap-08, 2026-07-14)
+
+W3's differential gate over tgt found a SECOND instance of this exact class at a
+DIFFERENT leaf-render site. `runtime::impl__4::clone`
+(`fn clone(self: &RuntimeSymbol)`): the serializer renders the **RetBind value**
+(the `let _return := *self` return-var binding) as bare `self` (leaf 0), while
+production renders `self.deref` (leaf 5). Pinpoint-proved
+(`probe-w0/probe11_w3_tgt/Pinpoint.lean`) it is the SOLE divergence of that
+bridge. So the `*p → p.deref` `&`-param subst is missed at TWO leaf-render
+sites, not one:
+
+1. **obligation / ensures leaf** — `oblig_leaf` over `ens_exps` (head_exec, the
+   original finding above).
+2. **RetBind value leaf** — the return-var `let` binding (`clone`, this site).
+
+**Both must be fixed together.** The fix should thread production's postcondition
+RenderCtx (the one that maps a `&`-param `VarIdent` to its `.deref` form) through
+BOTH render paths, not just `oblig_leaf`. A single deref-subst RenderCtx applied
+consistently at every ensures/return leaf-render site closes both `head_exec`
+and `clone`. Validate by moving BOTH out of their runners' `honest_fail_reason`
+sets (`probe9_bridge` for head_exec, `probe11_w3_tgt` for clone) and confirming
+a negative-control mutation still flips.
+
 ## Progress
 
 ## Writeup
