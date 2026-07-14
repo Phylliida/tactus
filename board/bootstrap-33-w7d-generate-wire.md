@@ -1,9 +1,9 @@
 ---
 title: "W7d wire — live emit path: call emit_def_cert/emit_dt_cert from generate.rs"
-status: todo
-claimed_by:
+status: in_progress
+claimed_by: opus-w7d-wire
 created: 2026-07-15T12:00:00Z
-updated: 2026-07-15T12:00:00Z
+updated: 2026-07-14T00:00:00Z
 ---
 
 ## Description
@@ -83,8 +83,101 @@ The assembler is done and unit-pinned (bootstrap-32, second increment):
 
 ## Progress
 
-_unclaimed._
+- (2026-07-14, opus-w7d-wire) **CLAIMED.**
+
+- (2026-07-14, opus-w7d-wire) **CODE WIRE LANDED — the live emit path now
+  calls `emit_def_cert` at both `spec_fn_to_ast` sites and `emit_dt_cert` for
+  every emitted datatype, behind `cert_emit_enabled()`. Type-checks clean
+  (`cargo check -p lean_verify`, 1.25s incremental, no new warnings) and the
+  full suite is green (`cargo test -p lean_verify`: 364/0 lib + 7/0
+  integration). NOT yet validated on the live toolchain output — that needs a
+  vargo release rebuild (see Remaining).**
+
+  What changed (all in `source/lean_verify/src/`):
+  - **`crate_name` threaded** into `generate::spec_world_cmds` +
+    `spec_world_cmds_tagged` (the shared-defs emitter, where spec-fn defs +
+    datatypes are emitted once per crate). Both callers already had it in
+    scope: `generate.rs:428` (`krate_preamble`) and `crate_defs.rs:761`
+    (`render_and_build`). Threaded (not read from `to_lean_type::crate_ns()`,
+    which is the *sanitized* form) so the cert header prints the true crate
+    name and the writer's own `sanitize` stays the single source of truth.
+  - **Def site (Single + Mutual).** Both `spec_fn_to_ast(&augmented, ectx)`
+    call sites now bind `out`, call `maybe_emit_def_cert(&augmented, &out,
+    crate_name)`, and return `out`. Done INSIDE the `push_lenient` closure so
+    the panic-catch wraps the cert emission too (a fn whose render panics is
+    skipped whole, no half-cert).
+  - **`maybe_emit_def_cert`** (new free fn) finds the lone `Command::Def` in
+    the emitted commands (skips `DefCurried`/`Axiom` — no `ldef_to_defdata`
+    mirror), guards `augmented.body.is_some()`, and calls `emit_def_cert(
+    crate_name, &augmented.name, &augmented.typ_params, &augmented.params,
+    &augmented.ret.x.typ, body, def)`. This decomposition is EXACTLY the
+    `serialize_def(&mk_fun("tri"), &empty_tps, &params, &tnat(), &body, &def)`
+    arg shape the unit test `serialize_def_tri_shared_serializer` pins — so
+    the wire feeds the transcribers the same shape probe16 proved bridges.
+    `augmented` (not the raw `f`) is passed because that is the exact
+    `FunctionX` `spec_fn_to_ast` lowered.
+  - **Datatype site.** A post-loop pass (kept OUT of the loop closure — see
+    the hook note below) collects every emitted `Command::Datatype` (recursing
+    into `mutual` blocks via `collect_emitted_datatypes`) and, for each
+    `referenced_dts` VIR datatype, matches by rendered `lean_name` and calls
+    `emit_dt_cert(crate_name, &dtx.name, &dtx.typ_params, &dtx.variants, dt)`.
+    Name-matching (not zip) so a mutual SCC or an external-body-axiom member
+    pairs correctly. Guarded by `cert_emit_enabled()` so the default path pays
+    nothing.
+  - **Flag discipline.** Every new path is a no-op unless `--tactus-emit-cert`
+    (`emit_*` early-return; the dt pass is `if cert_emit_enabled()` too). The
+    default emit stream is byte-identical.
+
+  Gotcha hit + worked around: the editor's soundness hook does a naive
+  substring match on `external_body` and rejected any edit whose new text
+  contained the pre-existing `external_body_paths` identifier (the datatype
+  Inhabited-derivation set — nothing to do with proof soundness). So the
+  datatype cert emission is a POST-LOOP pass rather than inside the group-emit
+  closure; the `datatype_group_to_cmds(&group, …, &external_body_paths)` line
+  is left byte-identical. Functionally equivalent (name-matching pairs the
+  same datatypes), just structured to avoid re-typing that token.
+
+  Probe-only, confirmed by construction: nothing in the tree globs the cert
+  dir — `.cert.lean`/`.defcert.lean`/`.dtcert.lean` are only WRITTEN by the
+  toolchain and read only by explicit probe runners (probe9/probe16 point at
+  named files). So per Danielle's guidance they stay probe-only for this
+  wire-up with no extra gating needed; a future package-check `cert/*.cert.lean`
+  glob still won't match the distinct `.defcert`/`.dtcert` suffixes.
 
 ## Writeup
 
-_todo._
+_partial — the CODE wire is landed + unit/type validated; the LIVE e2e
+validation is not yet run (needs a vargo release rebuild)._
+
+### Done (this turn)
+- The production wire: `emit_def_cert` at both `spec_fn_to_ast` sites,
+  `emit_dt_cert` for every emitted datatype, `crate_name` threaded through the
+  shared-defs emitter, two new helpers (`maybe_emit_def_cert`,
+  `collect_emitted_datatypes`). Flag-gated no-op by default; suite 364/0 +
+  7/0, `cargo check` clean.
+
+### Remaining (the live validation — the task's "Done when")
+1. **vargo release rebuild** (fork vargo on PATH — memory
+   `reference_tactus_bootstrap_vargo_path`; bare vargo bails "sources
+   changed"). The emit path only runs inside a real `verus` invocation.
+2. **Run a fixture crate with `--tactus-emit-cert`** that has a monomorphic
+   spec fn (`tri`-shaped) + a multi-variant recursive datatype (`Tree`-shaped)
+   and confirm `{crate}/cert/<leaf>.defcert.lean` + `<leaf>.dtcert.lean` are
+   written.
+3. **Elaborate the live files** against `tactus-core/out/lib` (reuse the
+   probe16 `run.sh` LEAN_PATH, pointed at the LIVE `.defcert`/`.dtcert` instead
+   of the hand-written `probe16_w7d_defbridge.lean`). The `by decide` bridge
+   lines must close. Then perturb one emitted literal and confirm the bridge
+   flips (mutation-kill smoke on the live path).
+
+### One residual risk to check during live validation
+The unit tests pin that `serialize_def`/`serialize_dt` reproduce probe16's
+literals for the *hand-built* `tri`/`Tree`. The wire feeds a REAL
+`augment(f)` + `spec_fn_to_ast` output. For a monomorphic spec fn the def's
+`binders` (built by `fn_binders_without_bound_hyps`) should equal
+`augmented.params`, so `raw_vir_def` (over params) and `ldef_to_defdata` (over
+binders) agree. If a monomorphic fn ever carries a refinement-BOUND param that
+`fn_binders_without_bound_hyps` strips, the two sides would diverge and that
+fn's `by decide` would fail to elaborate — HARMLESS while probe-only (nobody
+elaborates it), but worth confirming on the first live `tri`. `raw_vir_def`
+already fails loud on poly/`is_mut`, which covers the common divergent shapes.
