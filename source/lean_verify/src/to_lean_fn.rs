@@ -137,13 +137,80 @@ pub(crate) const TACTIC_BODY_FALLBACK: &str = "sorry";
 /// companion), so the rung cites the absolute name like every other
 /// emitted reference. `crate_ns() == None` (ns-less unit-test renders)
 /// keeps the bare form.
+thread_local! {
+    /// Names of length-monotonicity companions (`{fn}_len_le`,
+    /// bootstrap-47) emitted so far in the current defs build.
+    /// `decreasing_by_tactic` splices a `Nat.lt_of_le_of_lt` chaining rung
+    /// citing these so a NESTED suffix measure like
+    /// `len (drop_base_run (drop_first W)) < len W` (m3_blinker.split_q)
+    /// closes: the `≤` subgoal unifies one of these monos, the `<` subgoal
+    /// unifies the `drop_first` companion. Populated by the defs loop as
+    /// each suffix-recursive spec fn's companion lands (dep-order emits a
+    /// consumer AFTER the companions it needs). Cleared per emission entry
+    /// (`generate::install_emit_tables`), so per-fn proof/exec files never
+    /// inherit a prior build's names. Read here as a GROWING BAG —
+    /// `first | apply m1 | apply m2 | …` offloads the "which mono?" choice
+    /// to Lean unification (only the mono whose `≤`-head matches fires;
+    /// names not imported in a given file fail over harmlessly inside
+    /// `first`, exactly like the existing seq-companion rungs).
+    static SUFFIX_MONO_NAMES: std::cell::RefCell<Vec<String>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+/// Reset the suffix-mono companion bag (bootstrap-47). Called from
+/// `generate::install_emit_tables`, the single choke point every emission
+/// entry routes through — so each defs build starts empty and per-fn
+/// proof/exec files never cite a prior build's companion names.
+pub(crate) fn clear_suffix_mono_names() {
+    SUFFIX_MONO_NAMES.with(|s| s.borrow_mut().clear());
+}
+
+/// Register a length-monotonicity companion name so later fns'
+/// `decreasing_by` can cite it in the chaining rung (bootstrap-47). Deduped
+/// (idempotent); order is the dep-order emission order, which is
+/// deterministic, keeping the emitted `decreasing_by` strings stable
+/// across runs (cache-friendly).
+pub(crate) fn register_suffix_mono_name(name: String) {
+    SUFFIX_MONO_NAMES.with(|s| {
+        let mut v = s.borrow_mut();
+        if !v.contains(&name) {
+            v.push(name);
+        }
+    });
+}
+
 fn decreasing_by_tactic() -> String {
     let q = |n: &str| match crate::to_lean_type::crate_ns() {
         Some(ns) => format!("{}.{}", ns, n),
         None => n.to_string(),
     };
+    // bootstrap-47: chaining rung for NESTED suffix measures
+    // (`len (g (drop_first W)) < len W`, g length-non-increasing). Spliced
+    // ONLY when ≥1 mono companion is in scope, so files without any keep
+    // their exact prior `decreasing_by` string (no cache churn).
+    // `apply Nat.lt_of_le_of_lt` splits `a < c` into `a ≤ ?b` and `?b < c`;
+    // `<;>` runs the inner `first` on both — a mono closes the `≤` subgoal
+    // (binding `?b := len (drop_first W)`), the `drop_first` companion
+    // closes the `<`. Placed LAST before `decreasing_tactic`: its outer
+    // `apply Nat.lt_of_le_of_lt` matches ANY `_ < _` goal (not head-
+    // disjoint), so simple direct-measure goals must reach their own rungs
+    // first; only genuinely-nested goals fall through to here.
+    let chain_rung = SUFFIX_MONO_NAMES.with(|s| {
+        let monos = s.borrow();
+        if monos.is_empty() {
+            String::new()
+        } else {
+            let applies: String = monos.iter()
+                .map(|m| format!("apply {} | ", m))
+                .collect();
+            format!(
+                " | (apply Nat.lt_of_le_of_lt <;> (first | {applies}(apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))))",
+                df = q("Seq.drop_first_len_lt"),
+            )
+        }
+    });
     format!(
-        "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Nat.div_lt_self <;> (simp_all <;> omega)) | (apply {ds} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | (apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | (apply {dl} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | ((repeat split) <;> omega) | decreasing_tactic)",
+        "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Nat.div_lt_self <;> (simp_all <;> omega)) | (apply {ds} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | (apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | (apply {dl} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | ((repeat split) <;> omega){chain_rung} | decreasing_tactic)",
         ds = q("Seq.subrange_tail_len_lt"),
         df = q("Seq.drop_first_len_lt"),
         dl = q("Seq.drop_last_len_lt"),
