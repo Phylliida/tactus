@@ -679,23 +679,49 @@ impl<'a> Serializer<'a> {
             // Single-argument spec-fn application (`lib.tri (…)`). The fn id
             // interns the callee name text (atom-id bucket); ret ty = the
             // call node's typ; arg ty = the argument node's typ.
+            //
+            // W7 (bootstrap-34): multi-arg (`args.len() >= 2`) widens to
+            // `RawExp::CallN(fn, ret, RawList[args])` — the flat-arg spine
+            // `render_exp` maps to `ExprData::AppN` (lib.rs L944). No per-arg
+            // `TypData`: the step-2a SST dump proved Verus MATERIALIZES every
+            // call-arg coercion as a `Clip` INSIDE the arg (its own `.typ`
+            // already carries the coerced type), so the single-arg arm's
+            // `arg_ty`/coerce machinery is a structural no-op per element and
+            // the plain `render_list` renders every producible shape faithfully
+            // (STEP2A-DUMP.md). `len == 0` (a genuine no-dummy nullary call)
+            // stays census-rejected as before.
             ExpX::Call(CallFun::Fun(fun, _), _typs, args) => {
-                if args.len() != 1 {
-                    return Err("raw-call-arity".to_string());
-                }
                 let fn_id = self.call_fun_id(fun);
                 let ret = self.typ_data(&e.typ)?;
-                let arg = &args[0];
-                let arg_ty = self.typ_data(&arg.typ)?;
-                let arg_s = self.raw_exp(arg)?;
-                Ok(format!(
-                    "({}.RawExp.Call {} {} {} {})",
-                    NS,
-                    fn_id,
-                    paren(&ret),
-                    box_raw(&arg_s),
-                    paren(&arg_ty)
-                ))
+                if args.len() == 1 {
+                    let arg = &args[0];
+                    let arg_ty = self.typ_data(&arg.typ)?;
+                    let arg_s = self.raw_exp(arg)?;
+                    Ok(format!(
+                        "({}.RawExp.Call {} {} {} {})",
+                        NS,
+                        fn_id,
+                        paren(&ret),
+                        box_raw(&arg_s),
+                        paren(&arg_ty)
+                    ))
+                } else if args.len() >= 2 {
+                    let mut arg_list = format!("{}.RawList.Nil", NS);
+                    for arg in args.iter().rev() {
+                        let a = self.raw_exp(arg)?;
+                        arg_list =
+                            format!("({}.RawList.Cons {} {})", NS, box_raw(&a), box_raw(&arg_list));
+                    }
+                    Ok(format!(
+                        "({}.RawExp.CallN {} {} {})",
+                        NS,
+                        fn_id,
+                        paren(&ret),
+                        box_raw(&arg_list)
+                    ))
+                } else {
+                    Err("raw-call-arity".to_string())
+                }
             }
             // G6 (W6d.2b) — an unsigned-overflow refinement `HasType(U(n))(e)`,
             // which production EXPANDS to `0 ≤ e ∧ e < 2^n`
@@ -926,25 +952,46 @@ impl<'a> Serializer<'a> {
             }
             // Single-argument spec-fn application (`lib.tri (…)`, `lib.sum_tree
             // (…)`). VIR's callee is `CallTarget::Fun` (not SST's `CallFun`);
-            // extract the `Fun` for the atom-id bucket. Multi-arg / non-`Fun`
-            // targets fail loud (tgt-slice-only — §7 Q3, deferred to `CallN`).
+            // extract the `Fun` for the atom-id bucket. Non-`Fun` targets fail
+            // loud (tgt-slice-only — §7 Q3).
+            //
+            // W7 (bootstrap-34): multi-arg (`args.len() >= 2`) widens to
+            // `RawExp::CallN` exactly as the SST `raw_exp` arm above — same
+            // flat, no-per-arg-`TypData` spine, co-designed so `def_eq` agrees
+            // with the production `AppN` by construction. `len == 0` stays
+            // census-rejected.
             ExprX::Call(CallTarget::Fun(_, fun, _typs, ..), args, _post) => {
-                if args.len() != 1 {
-                    return Err("rawvir-call-arity".to_string());
-                }
                 let fn_id = self.call_fun_id(fun);
                 let ret = self.typ_data(&e.typ)?;
-                let arg = &args[0];
-                let arg_ty = self.typ_data(&arg.typ)?;
-                let arg_s = self.raw_vir_exp(arg)?;
-                Ok(format!(
-                    "({}.RawExp.Call {} {} {} {})",
-                    NS,
-                    fn_id,
-                    paren(&ret),
-                    box_raw(&arg_s),
-                    paren(&arg_ty)
-                ))
+                if args.len() == 1 {
+                    let arg = &args[0];
+                    let arg_ty = self.typ_data(&arg.typ)?;
+                    let arg_s = self.raw_vir_exp(arg)?;
+                    Ok(format!(
+                        "({}.RawExp.Call {} {} {} {})",
+                        NS,
+                        fn_id,
+                        paren(&ret),
+                        box_raw(&arg_s),
+                        paren(&arg_ty)
+                    ))
+                } else if args.len() >= 2 {
+                    let mut arg_list = format!("{}.RawList.Nil", NS);
+                    for arg in args.iter().rev() {
+                        let a = self.raw_vir_exp(arg)?;
+                        arg_list =
+                            format!("({}.RawList.Cons {} {})", NS, box_raw(&a), box_raw(&arg_list));
+                    }
+                    Ok(format!(
+                        "({}.RawExp.CallN {} {} {})",
+                        NS,
+                        fn_id,
+                        paren(&ret),
+                        box_raw(&arg_list)
+                    ))
+                } else {
+                    Err("rawvir-call-arity".to_string())
+                }
             }
             // Struct/tuple field projection — reuse production's accessor naming
             // (`field_access_name`) so the field id interns identically (as SST
@@ -1418,7 +1465,32 @@ impl<'a> Serializer<'a> {
                 }
                 None => Err("ed-app-head".to_string()),
             },
-            ExprNode::App { .. } => Err("ed-app-arity".to_string()),
+            // W7 (bootstrap-34): multi-value-arg spec-fn application. Production
+            // builds these FLAT — `LExpr::app(head, [v0..vn])` with the type-arg
+            // layer already folded into `head` (`to_lean_sst_expr.rs` L1228 +
+            // `to_lean_expr` twin), so `app_head_fn_name` peels the SAME
+            // `Var(name)` / `App{Var(name), typeargs}` head shapes as the
+            // single-arg arm. Map to `ExprData::AppN(fn, ExprList[args])`, the
+            // production twin of the reference `RawExp::CallN` (which
+            // `render_exp` lowers to the identical `AppN` — lib.rs L944), keying
+            // the fn id on the SAME interned name so `def_eq` agrees by
+            // construction. A non-fn head (e.g. a `CallLambda` closure) fails
+            // loud, mirroring the reference (whose `raw_*_exp` has no
+            // `CallLambda` arm → census-rejects). `LExpr::app` collapses empty
+            // args to the head, so this arm only sees `len >= 2`.
+            ExprNode::App { head, args } => match app_head_fn_name(head) {
+                Some(name) => {
+                    let fn_id = self.text_leaf(name);
+                    let mut arg_list = format!("{}.ExprList.Nil", NS);
+                    for arg in args.iter().rev() {
+                        let a = self.lexpr_to_exprdata(arg)?;
+                        arg_list =
+                            format!("({}.ExprList.Cons {} {})", NS, box_ed(&a), box_ed(&arg_list));
+                    }
+                    Ok(format!("({}.ExprData.AppN {} {})", NS, fn_id, box_ed(&arg_list)))
+                }
+                None => Err("ed-app-head".to_string()),
+            },
             // Structural binary op — reconcile into the canonical opcode table.
             ExprNode::BinOp { op, lhs, rhs } => {
                 let opc = lean_binop_opcode(op)?;
