@@ -199,6 +199,60 @@ kills.
 
   Landed at code level; NOT yet Lean-verified end-to-end (needs the regen).
 
+- (2026-07-14, opus-w2b-f2) **finding-4 (return binding) + Ret-annotation
+  LANDED across spec + serializer; spec side PROVEN + verified (32/0), serializer
+  compiles + all 320 lib tests pass.** With finding-1/2 already coded, this makes
+  ALL FOUR add_capped findings code-complete → the batched regen can close the
+  ENTIRE add_capped bridge (goals 0/1/2/3) in one go, per Danielle's option (b).
+
+  **What changed (spec, tactus-core/lib.rs):**
+  - NEW `RetBind` enum: `RetNone | RetLet(u64 name, u64 val)` (a small
+    non-recursive datatype — chosen over reusing `FrameList` for exhaustive,
+    audit-in-one-sitting valid states in the trusted SST literal; the local
+    model concurred).
+  - `StmData::Ret(Box<LeafList>)` → `Ret(Box<LeafList>, RetBind)`: the LeafList
+    now carries ANNOTATED ensures obligation leaves (the `Return` goal), the
+    RetBind the return-value `let`.
+  - NEW top-level `ret_frame(f, rb)` = `f` extended by `FLet(name,val,FNil)` for
+    RetLet, `f` for RetNone. Factored OUT of `wp_stm`'s Ret arm (NOT a nested
+    match) because the decide-checker note (lib.rs §520-528) warns the tactus
+    Lean backend flattens an inner match past the enclosing arm's siblings.
+  - `wp_stm` Ret arm: `close_each(ret_frame(f, rb), *es)`. `frame_after`/`stm_size`
+    Ret arms updated (RetBind adds nothing to size). All `decide` literals migrated.
+  - NEW `decide` test `ref_wp_ret_return_binding` isolates it: under a pre-Ret
+    frame `FLet(9,14)`, `Ret([22], RetLet(23,9))` closes to
+    `Let 9 14 (Let 23 9 (Leaf 22))` = add_capped goal 3's tail EXACTLY; RetNone
+    variant closes to `Let 9 14 (Leaf 22)` (no extra let).
+
+  **What changed (serializer, sst_serialize.rs):**
+  - `serialize()` interns, up front: the ANNOTATED ensures obligations (via
+    `oblig_leaf` — same span_mark path as finding-1's Assert, so the goal-side
+    postcondition leaf reuses the id) into `pending_ens_oblig`, and the
+    `sanitize(dest)` ret-name leaf into `pending_ret_name` (`None` for unit).
+  - The `Return` arm emits `StmData.Ret <annotated-enss> <retbind>`, where
+    `retbind = RetLet(nleaf, exp_leaf(ret_exp))` iff BOTH a declared return var
+    AND a return expr exist (matching the walker's `let_bind_synthetic` gate),
+    else `RetNone`. Value via the SAME `exp_leaf` path Assign rhs uses.
+  - `FnCtxData.enss` stays BARE (refWp doesn't read it). `pending_ens` field
+    replaced. Module faithfulness-contract doc updated (reads: annotated enss,
+    `dest`, `Return.ret_exp`; caveat: coercion/if-lifting NOT replicated →
+    honest fail-to-close, never silent-pass).
+
+  **Empirical confirmation (from the on-disk stale cert + production walker):**
+  add_capped goal 3 = `… Let 9 14, Let 23 9, Leaf 22`. Verified: production's
+  `emit_done_or_split` peels the `Wp::Done(let_bind_synthetic(sanitize("r"),
+  <render s>, span_mark'd ensures))` leaf into a `CtxFrame::Let("r", "s")` →
+  `GoalSpine::Let` → goal leaf 23=`⟦r⟧`, val leaf 9=`⟦s⟧`, obligation leaf
+  22=`⟦/- @rust:…85:13 -/ r = x + y⟧`. The serializer now reproduces all three:
+  ret-name "r" via `text_leaf(sanitize("r"))`, value "s" via `exp_leaf(Var s)`
+  (== the interned binder id 9), obligation via `oblig_leaf(ens)` (== leaf 22).
+
+  **Remaining = the batched regen (IN PROGRESS this turn):** vargo build of the
+  verus fork (running) → re-emit fixtures → refresh golden add_capped.cert.lean +
+  `leaf_texts.len()` assertion → hand-run the FULL add_capped bridge
+  `goals_eq (ref_wp ctx sst) prod = 1 := by decide` (all 4 goals). tactus-core
+  already re-verified (32/0). See updated recipe below.
+
 ## Writeup
 
 _when done: findings, how the code works, assumptions made_
