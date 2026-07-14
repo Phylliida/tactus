@@ -1,9 +1,9 @@
 ---
 title: "W7d — wire def/datatype emission + bridge decide def_eq/dt_eq on the fixture"
-status: in_progress
+status: done
 claimed_by: opus-w7d
 created: 2026-07-15T07:00:00Z
-updated: 2026-07-15T12:00:00Z
+updated: 2026-07-14T10:25:00Z
 ---
 
 ## Description
@@ -115,8 +115,16 @@ _partial — see Progress + the probe REPORT. Two of three pieces landed:_
   real transcriber output, kills non-vacuous._
 - _✅ the `render_def_cert`/`render_dt_cert` + `emit_def_cert`/`emit_dt_cert`
   assembler (second increment) — pure Rust, 5 unit tests, suite 364/0._
-- _⬜ the generate.rs production wire (call `emit_def_cert` at the
+- _✅ the generate.rs production wire (call `emit_def_cert` at the
   `spec_fn_to_ast` sites + `emit_dt_cert` at datatype emission, behind the
-  cert-emit flag, decomposing the `FunctionX`/`DatatypeX`) — needs the vargo
-  release rebuild to validate the full-Ite-body `tri` def end-to-end. Tracked in
-  **`bootstrap-33-w7d-generate-wire`**._
+  cert-emit flag, decomposing the `FunctionX`/`DatatypeX`) — LANDED + LIVE-
+  VALIDATED in **`bootstrap-33-w7d-generate-wire`** (2026-07-14). Vargo release
+  rebuild done, live emit writes `tri`/`sq`/`tree_head`.defcert + `lib__Tree`
+  .dtcert, all four elaborate + `decide`-close their `def_eq`/`dt_eq` bridges
+  against `tactus-core/out/lib` with a non-vacuous live mutation-kill. The live
+  run surfaced + fixed a real gap (`raw_vir_exp` missing the `ExprX::Block([],
+  Some(tail))` spec-fn-body wrapper the bare-Ite unit pins never fed)._
+
+_W7d is DONE. Follow-on hardening (mutation-kill breadth, joining the def/dt
+certs to a package-globbed set, dropping the transcribers' `#[allow(dead_code)]`,
+and a reference `Let` arm for stmt-bearing spec-fn bodies) is W7e / W4 scope._

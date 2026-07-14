@@ -1058,6 +1058,19 @@ impl<'a> Serializer<'a> {
                 }
                 Ok(acc)
             }
+            // A spec-fn body arrives wrapped in the frontend's statement-less
+            // block-expr `Block([], Some(tail))` (the `tri`/`sq`/`tree_head`
+            // shape — the hand-built unit tests fed a bare tail, so this was
+            // first hit only on the live emit path, W7d). Production's
+            // `block_to_node` peels an empty block straight to
+            // `expr_to_ast(tail)` (to_lean_expr.rs:1107-1113), so the DefData
+            // body is the lowered tail; peel identically here so the reference
+            // `ExprData` matches. A block WITH statements (a `let` in a spec
+            // fn) lowers production-side to `let`/`match` nesting — outside the
+            // fixture-reachable set, and mirroring it needs the reference `Let`
+            // arm production's `block_to_node` builds — so fail loud until a def
+            // forces it (falls through to `rawvir-block`).
+            ExprX::Block(stmts, Some(tail)) if stmts.is_empty() => self.raw_vir_exp(tail),
             _ => Err(format!("rawvir-{}", vir_expr_construct_tag(&e.x))),
         }
     }
