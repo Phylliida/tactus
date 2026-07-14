@@ -1,9 +1,9 @@
 ---
 title: "W2b-prereq — serializer faithfulness (annotated obligations, hyp names, loop binders) so bridges CAN close"
 status: in_progress
-claimed_by: opus-w2b-f2
+claimed_by: opus-w2b-f3
 created: 2026-07-14T00:45:00Z
-updated: 2026-07-14T04:30:00Z
+updated: 2026-07-14T06:30:00Z
 ---
 
 ## Description
@@ -282,6 +282,115 @@ kills.
   production's loop-modified-local havoc set. See finding-3 detail in the task
   Description + DESIGN-W2-refwp.md §5(3). Findings 1/2/4 + Ret-annotation are all
   LANDED, VERIFIED, and demonstrated (add_capped). Next instance: finding-3.
+
+- (2026-07-14, opus-w2b-f3) **finding-3 SPEC SIDE LANDED + VERIFIED (36/0) —
+  the FULL sum_to loop bridge closes by `decide` against the real cert's 12
+  production goals, mutation-kill confirmed. Serializer side is the one
+  remaining step (recipe below).**
+
+  **Ground truth (from `bootstrap-fixture/out/lib/cert/sum_to.cert.lean` — its
+  leaf TABLE + 12 `cert_sum_to_goals` are unchanged by finding-3; only the SST
+  Loop node's field layout changes).** Decoded production's `walk_loop` +
+  `push_mod_var_frames` (havoc) + `split_leading_binders` (leading Binder/Hyp
+  frames hoist to NAMED ∀, extraction STOPS at first Let) + `lex_decrease_
+  obligation`. The maintain telescope is NOT `f ++ …`; it HAVOCS the pre-loop
+  `let i:=0, let acc:=0` (modified locals) then re-quantifies i,acc as ∀ +
+  re-asserts each invariant/cond as NAMED `_h_ctx_N` ∀, then a `_tactus_d_old`
+  let. Init closes under the ACTUAL pre-loop frame (lets intact).
+
+  **Spec changes (tactus-core/lib.rs, VERIFIED 36/0 under the package gate):**
+  - `StmData::Loop` reshaped (10 fields): `inv_hyps: BinderList` (invariants as
+    (_h_ctx name, ANNOTATED obligation leaf) — the annotated leaf serves BOTH
+    the init/maintain obligation AND the ∀-hyp, unlike Assert's bare/annotated
+    split), `binders: BinderList` (mod-local havoc set), `binder_bounds:
+    ParamBoundList` (mod-locals' `_h_ctx` type-bound hyps, parallel to binders),
+    `cond_name`/`cond_ann`/`neg_cond_ann`, `d_old_name`/`d_old_val`,
+    `decrease_oblig`. Replaces old `{invs, cond, neg_cond, binders}`.
+  - `wp_stm` Loop: `havoc_lets(f, binders)` drops pre-loop lets for mod locals →
+    `seed_params(binders, binder_bounds)` (reused! interleaves ∀mv + ∀bound) →
+    `binders_to_frame(inv_hyps)` → `FBind(cond_name, cond_ann)` → `FLet(d_old)`.
+    Emits `init ++ body ++ maintain-reclose ++ decrease` (walker-synthesised
+    body-end obligations, DESIGN §5 Q3). `close_each_binderprop` closes over a
+    BinderList's PROP slots.
+  - `frame_after` Loop (use telescope): havoc + seed_params + inv_hyps +
+    `FBind(cond_name, neg_cond_ann)` — NO d_old.
+  - New helpers: `binder_has_id` (returns **nat** 1/0, NOT bool — a bool spec fn
+    lowers to a noncomputable Prop and `decide` gets stuck; this bit me, cost
+    one gate cycle), `havoc_lets`, `close_each_binderprop`. `seed_params` moved
+    ahead of frame_after/wp_stm (both use it now).
+  - **HAVOC CAVEAT (documented, sound):** `havoc_lets` drops FLet for mod-local
+    ids but KEEPS FHyp (leaves are opaque — refWp can't tell if a hyp mentions a
+    mod var; production's `push_mod_var_frames` DOES drop such hyps). Only bites
+    a fixture with a pre-loop assert OVER a modified local → honest fail-to-
+    close, never silent-pass (`goals_eq` is structural). sum_to has none.
+  - `stm_size` Loop arm: `1 + binder_len(inv_hyps) + binder_len(binders) +
+    stm_size(body)` — binder_bounds (a ParamBoundList) is NOT counted, matching
+    the serializer's `stm_size_of` token sum (counts LeafList/BinderList Cons +
+    stmt heads only). So sum_to's `stm_size` example auto-recomputes 23→25 at
+    regen (binders goes Nil→2); no manual sync.
+  - NEW `decide` test `ref_wp_sum_to_loop`: reconstructs sum_to's ctx + SST (new
+    Loop shape, cert leaf ids) and asserts `goals_eq(ref_wp …, <all 12 goals>)
+    == 1`. Goals were machine-generated (balanced-paren script) + parsed back
+    and diffed against a standalone Python refWp model — both match the cert
+    verbatim. Mutation-kill: perturbing SST `decrease_oblig: 39→99` flips the
+    gate to 35v/1err.
+
+  **SERIALIZER RECIPE (the one remaining step — needs a vargo rebuild to test
+  end-to-end; write it WITH the regen loop so `_h_ctx` names + the decrease-
+  obligation text can be validated against production iteratively):**
+
+  1. **⚠ Do NOT read `StmX::Loop.modified_vars` — production IGNORES it.**
+     `build_wp` spells it `_` (sst_to_lean.rs:5084); `build_wp_loop` RE-DERIVES
+     the havoc set via `collect_modifications(body)` (:6014-6017) + type lookup
+     `ctx.type_map.get(id)`. The current serializer's `binder_entries` reads the
+     (None at this SST stage) `modified_vars` HavocSet → that's why binders=Nil.
+     FIX: make `collect_modifications` `pub(crate)` (it's private at :6192) and
+     call it; build a `VarIdent→Typ` map from `fn_sst.x.pars` + `check.local_
+     decls` for the types. MUST match production's mod-var ORDER (collect_
+     modifications = body traversal order; sum_to = [i, acc]).
+  2. **`_h_ctx_N` counter (shared, matters — `goal_eq` compares binder-name
+     ids!):** mirror `split_leading_binders` (:1510). counter=0; for each mod
+     var: if `type_bound_predicate(&LExpr::var(from_var_ident(vid)), typ)` is
+     Some → bound name = `_h_ctx_{counter}`, counter++ (NoBound → no incr); then
+     each standard invariant → `_h_ctx_{counter}`, counter++; then cond →
+     `_h_ctx_{counter}`. (Mod-var bounds use `LExpr::var(name)` — NO deref,
+     unlike params — per walk_loop:2532.) Distinct from params' `h_x_bound`.
+  3. **inv_hyps:** per standard invariant, `(text_leaf("_h_ctx_N"),
+     oblig_leaf(&li.inv))`. `oblig_leaf` already byte-matches production's
+     span_mark'd `LoopInvariant` leaf (kind never reaches pp → Plain is safe).
+     This REPLACES the current bare `inv_leaves`/`inv_list`.
+  4. **cond_ann = `oblig_leaf(cond_exp)`** (matches `cond_marked` = span_mark
+     over cond, walk_loop:2390); **neg_cond_ann** = a NEW helper interning
+     `pp(LExpr::not(span_mark(loc, span, _, inner)))` (production's
+     `LExpr::not(cond_marked)`, :2476). cond_name = `text_leaf("_h_ctx_N")`.
+  5. **d_old:** bind `id` + `decrease` in the `StmX::Loop` match (currently
+     `..`). Error on `decrease.len() != 1` (stage-A single-level, like the
+     nonstandard-invariant guard). `d_old_name = text_leaf(&format!("_tactus_
+     d_old_{}_0", id))` (build_wp_loop:6002). `d_old_val = exp_leaf(&decrease[0])`
+     (= production's `lower_validated(&level.value)`, the maintain d_old let).
+  6. **decrease_oblig:** reconstruct `lex_decrease_obligation` single-level
+     (:6160) then span_mark it (:6084). inner = `LExpr::and(LExpr::le(LExpr::
+     lit_int("0"), cur), LExpr::lt(cur, old))` with `cur = sst_exp_to_ast_
+     checked(&decrease[0])`, `old = LExpr::var_synthetic(format!("_tactus_d_old_
+     {}_0", id))`; then `span_mark(format_rust_loc(&decrease[0].span),
+     Some(decrease[0].span.clone()), Obligation(LoopDecrease-or-Plain), inner)`,
+     intern its pp. (All LExpr builders — le/lt/and/not/var_synthetic/lit_int/
+     span_mark — are in lean_ast.rs and already reachable.)
+  7. Emit `StmData.Loop <inv_hyps> <binders> <binder_bounds> <cond_name>
+     <cond_ann> <neg_cond_ann> <d_old_name> <d_old_val> <decrease_oblig>
+     <body>` (positional order = the amended `enum StmData.Loop` in the emitted
+     `tactus-core/out/lib` defs). `binder_list`/`param_bound_list` builders
+     already exist. `stm_size_of` needs NO change (already counts BinderList
+     Cons generically).
+  8. **Regen + validate:** vargo release build the verus fork (FORK vargo on
+     PATH), re-emit fixtures (`--tactus-emit-cert`), confirm sum_to.cert's Loop
+     now carries the populated fields, refresh any golden, then hand-run
+     `goals_eq (ref_wp cert_sum_to_ctx cert_sum_to_sst) cert_sum_to_goals = 1
+     := by decide` (LEAN_PATH = prelude-cache + tactus-core/out/lib). Negative
+     control: mutate a d_old/decrease leaf → decide errors. find_square (nested
+     loops) is a stretch goal — likely needs multi-level decrease + the nested-
+     loop `_h_ctx` counter across two loops; keep it a documented stage-A caveat
+     if it doesn't close.
 
 ## Writeup
 
