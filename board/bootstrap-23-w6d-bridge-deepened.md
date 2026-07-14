@@ -3,7 +3,7 @@ title: "W6d — bridge deepened: obligation leaves emit LeafE + refWp closes ove
 status: in_progress
 claimed_by: opus-b23
 created: 2026-07-14T09:30:00Z
-updated: 2026-07-14T15:30:00Z
+updated: 2026-07-14T18:10:00Z
 ---
 
 ## Description
@@ -292,13 +292,17 @@ arithmetic fns; G2+G3 unlock the datatype/struct/tuple fns.
     distinct type, not a polymorphic LeafList — keeps `LeafE`/`Leaf` unmergeable)
     + `close_each_e` mirroring `close_each`; wired `wp_stm`'s Call + Ret arms.
     Verified **54/0**. See the "W6d.1b-ii landing" section below.
-  - **W6d.1b-iii — the Loop obligation slots (`inv_hyps` props, `decrease_oblig`).**
-    `decrease_oblig` is bare `u64 → RawExp` (easy, like Assert). `inv_hyps` is a
-    `BinderList` whose PROP (2nd) slot is the obligation → needs a `(u64 name,
-    RawExp prop)` container + `close_each_binderprop_e`. Wire the Loop maintain/
-    init/decrease arms. Fixtures: sum_to monster (Leaf 23/24/25/26 init+maintain,
-    Leaf 39 decrease), nested_loop (Leaf 35, via direct `close` — switch to
-    `close_e`).
+  - **W6d.1b-iii — the Loop obligation slots (`inv_obligs`, `decrease_oblig`).
+    ✅ DONE (2026-07-14, opus-b23).** `decrease_oblig` bare `u64 → RawExp` (like
+    Assert). The invariant obligations moved to a NEW parallel field
+    `inv_obligs: RawExpList` (Design C — see the landing note below), folded via
+    the already-proven `close_each_e`; `inv_hyps` stays a `BinderList` (name,
+    HYP) for the frame telescope, UNTOUCHED. Wired the Loop init/maintain/
+    decrease arms; deleted the dead `close_each_binderprop`. Fixtures: sum_to
+    monster (init+maintain Leaf 23/24/25/26 → LeafE Atom, decrease Leaf 39 →
+    LeafE Atom 39), nested_loop (direct `close(·,35/43)` → `close_e(·,atom_ob
+    35/43)`), stm_size test (4 → 5). Verified **52/0**. **W6d.1b COMPLETE** (all
+    three container sub-steps i/ii/iii landed).
 - **W6d.2 — serializer wiring.** In `sst_serialize.rs`: `oblig_leaf` (and the
   Ret/Loop obligation paths) emit the `RawExp` mirror into `StmData` (drop
   `#[allow(dead_code)]` on `raw_exp`/`typ_data`); `goal_data` emits
@@ -546,6 +550,84 @@ arithmetic fns; G2+G3 unlock the datatype/struct/tuple fns.
   VarAt + LitBool/Field/HasType arms; `oblig_leaf` emits the `RawExp` mirror
   wrapped in `Span`; `goal_data` emits `LeafE`). G4 (`Let`-in-leaf) stays
   deferred to W6e.
+
+- (2026-07-14, opus-b23) **W6d.1b-iii landed — the Loop obligation slots are
+  now DEEP; verified 52/0. W6d.1b (all three container sub-steps) COMPLETE.**
+  The third and final container sub-step.
+
+  **The plan's `(name, RawExp)` container was BROKEN — corrected to Design C.**
+  The board's stated fix ("`inv_hyps` … needs a `(u64 name, RawExp prop)`
+  container") does NOT work: `inv_hyps`'s prop slot has a DUAL ROLE — it is the
+  init/maintain OBLIGATION (via `close_each_binderprop` → must deepen) AND the
+  maintain/use frame HYPOTHESIS (via `binders_to_frame` → `FBind(name, prop, …)`
+  and `binderprops_to_hyps` → `FHyp(prop, …)`, both of which need a bare `u64`
+  — hypotheses are not deepened). Turning the prop slot into a `RawExp` breaks
+  the two frame builders (FrameList holds `u64` hyps only). Two fixes: (A) a
+  unified 3-field `InvHypList::Cons(name, hyp:u64, oblig:RawExp, tail)` +
+  new frame builders + touch `loop_maintain_frame`/`loop_use_frame` signatures;
+  or (C) keep `inv_hyps: BinderList` (name, hyp) UNCHANGED for the frame and add
+  a SEPARATE `inv_obligs: RawExpList` for the deep obligations, reusing the
+  already-proven `close_each_e` (from W6d.1b-ii). **Chose Design C** (local model
+  concurred, 127.0.0.1:8051, 2026-07-14): it reuses `close_each_e`, leaves the
+  delicate leading/non-leading telescope machinery (`loop_maintain_frame`/
+  `loop_use_frame`/`binders_to_frame`/`binderprops_to_hyps`/`has_let`) ENTIRELY
+  untouched (near-zero proof-breakage), and the "two parallel lists must stay
+  index-aligned" cost is a serializer construction-time concern (one pass emits
+  both), not a runtime one. Design A's co-location (can't desync) wasn't worth
+  the signature churn + ~4 new fns on the proven telescope path.
+
+  **What changed in `tactus-core/lib.rs`** (one datatype-shape churn + fixtures):
+  - **`StmData::Loop` gained `inv_obligs: Box<RawExpList>`** (the parallel deep
+    invariant obligations, index-aligned with `inv_hyps`); **`decrease_oblig:
+    u64 → RawExp`** (deep, like `Assert`).
+  - **`wp_stm` Loop arm:** `init` and `maintain_reclose` switched from
+    `close_each_binderprop(·, inv_hyps)` → `close_each_e(·, inv_obligs)` (each
+    terminal now `LeafE(render_exp(ob))`); `decrease_goal` from `close(endf,
+    decrease_oblig)` → `close_e(endf, decrease_oblig)`. The telescope frames
+    (`loop_maintain_frame(f, *inv_hyps, …)`) STILL read `inv_hyps` (BinderList)
+    for the hypothesis role — unchanged.
+  - **`close_each_binderprop` DELETED** (dead — was the only-per-`inv_hyps`-prop
+    obligation folder; Loop now uses `close_each_e` like Call/Ret). Confirmed no
+    callers in-file or in `source/`.
+  - **`frame_after` / `stm_size` Loop arms:** added `inv_obligs` to the match
+    patterns; `stm_size` counts it via `raw_exp_list_len` (mirrors the
+    serializer's token sum — the cert literal now carries both `inv_hyps` pairs
+    AND the `inv_obligs` list, so it's genuinely bigger).
+  - **Fixtures:** sum_to monster gained `inv_obligs = [atom_ob(23..26)]`,
+    `decrease_oblig: atom_ob(39)`; its 4 init + 4 maintain `Leaf(23..26)` and
+    the decrease `Leaf(39)` flipped to `LeafE(Atom …)` (the body-assert and Ret
+    leaves were already deep from -i/-ii). nested_loop unit test switched its
+    three direct `close(·, 35/43)` → `close_e(·, atom_ob 35/43)` +
+    `Leaf → LeafE(Atom)` (the `loop_maintain_frame`/`loop_use_frame` CALLS are
+    unchanged — still `BinderList` args, proving the frame path is untouched).
+    stm_size test 4 → 5.
+
+  **Verified 52/0** (`--lean-backend --lean-all-proofs`, 46 modules elaborated /
+  44 reused, "composition + axiom closures kernel-verified" — no
+  `WellFounded.fix`/`Classical`). **NB on the count:** it is **52**, not the
+  "53/54" the W6d.1b-ii writeup reported — that writeup's header (54) and body
+  (53) disagreed; a spec-fn add/delete doesn't change the verified count (spec
+  fns aren't counted), and no proof fn was added/removed across -i/-ii/-iii, so
+  52 has been the true baseline since W6d.1b-i. This sub-step is count-neutral.
+
+  **Serializer coupling reconfirmed Lean-text-only (extends -i/-ii); TWO W6d.2
+  to-dos surfaced.** No `source/` Rust code constructs `tactus_core::StmData::
+  Loop` (only `bootstrap_coverage.rs:27` matches production `vir::sst::StmX::
+  Loop`), so the datatype churn does NOT break the Rust build — the **W3 tgt
+  gate + e2e suite stay green by construction** (same argument as -i/-ii;
+  cert-elaboration-against-new-defs is W6d.2/3, and I did NOT re-run the full
+  suite this turn). ⚠ **W6d.2 must fix, or the first Loop cert won't type-check:**
+  (1) `sst_serialize.rs:1188` emits `StmData.Loop` as an **11-arg** `format!` —
+  now needs **12 args** + a `RawExpList` literal for `inv_obligs` (parallel to
+  the `inv_hyps` BinderList emission); (2) `decrease_oblig_leaf`
+  (`sst_serialize.rs:459`, returns `Sr<u64>` = a bare Nat leaf) must emit a
+  `RawExp` literal instead (like `oblig_leaf`'s Assert path). Plus the standing
+  `sst_serialize_tests.rs:35` note from -ii (LeafList → RawExpList for Ret/Call).
+
+  **Next = W6d.2** (serializer text emission, now for ALL deepened slots —
+  Assert/Call/Ret/Loop obligations + decrease; `raw_exp` G0 Box/Unbox peel + G7
+  VarAt + LitBool/Field/HasType arms; `oblig_leaf` emits the `RawExp` mirror
+  wrapped in `Span`; `goal_data` emits `LeafE`). G4 (`Let`-in-leaf) → W6e.
 
 ## Writeup
 
