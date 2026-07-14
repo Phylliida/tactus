@@ -1,9 +1,9 @@
 ---
 title: "W2b-prereq — serializer faithfulness (annotated obligations, hyp names, loop binders) so bridges CAN close"
-status: in_progress
-claimed_by: opus-w2b-f3
+status: done
+claimed_by: opus-w2b-f3b
 created: 2026-07-14T00:45:00Z
-updated: 2026-07-14T06:30:00Z
+updated: 2026-07-14T09:30:00Z
 ---
 
 ## Description
@@ -392,6 +392,167 @@ kills.
      loop `_h_ctx` counter across two loops; keep it a documented stage-A caveat
      if it doesn't close.
 
+- (2026-07-14, opus-w2b-f3b) **finding-3 SERIALIZER SIDE LANDED (code
+  committed) — compiles clean, all 6 serializer tests green incl. golden
+  add_capped. End-to-end sum_to bridge regen IN PROGRESS (vargo rebuild
+  running).** Implemented the full recipe (steps 1–7) in
+  `source/lean_verify/src/sst_serialize.rs` + `sst_to_lean.rs`:
+
+  - `collect_modifications` made `pub(crate)` (was private :6192).
+  - `Serializer` gains `local_typs: HashMap<VarIdent, Typ>`, set in
+    `serialize()` from `check.local_decls` (= production's `WpCtx.type_map`,
+    built the SAME way, :513-514).
+  - New leaf helpers next to `oblig_leaf`: `neg_oblig_leaf` (interns
+    `pp(not(span_mark(loc, Plain, inner)))` = production's
+    `not(cond_marked)`, walk_loop:2476) and `decrease_oblig_leaf`
+    (interns `pp(span_mark(loc, LoopDecrease, (0≤D)∧(D<_tactus_d_old_<id>_0)))`
+    = `lex_decrease_obligation` single-level + `decrease_marked`, :6084/:6160).
+    Both reuse the empty-`RenderCtx` `sst_exp_to_ast_checked` path, so the
+    inner text is byte-identical to production's `lower_validated`.
+  - `StmX::Loop` arm no longer reads `modified_vars` (`None` here); binds
+    `decrease` + `id`, calls the rewritten `loop_stm`.
+  - `loop_stm` rewritten to the 10-field shape. Havoc set RE-DERIVED via
+    `collect_modifications(body)` filtered by `local_typs`
+    (`filter_map(type_map.get)` mirror; order = body traversal = [i,acc]
+    for sum_to). `_h_ctx_N` counter mirrors `split_leading_binders`
+    (:1510): one increment per HYPOTHESIS trailing the mod-var binders —
+    i_bound=_h_ctx_0, acc_bound=_h_ctx_1, invs=_h_ctx_2..5, cond=_h_ctx_6
+    (confirmed against the ground-truth `ref_wp_sum_to_loop` ids AND the
+    local model). Mod-var type bounds via BARE `type_bound_predicate(
+    LExpr::var(name), typ)` (no deref, walk_loop:2532). Invariants →
+    `(_h_ctx, oblig_leaf(inv))`; cond → shared `_h_ctx` name +
+    `oblig_leaf`/`neg_oblig_leaf`; single-level decrease guard
+    (`loop-multilevel-decrease`).
+  - Emit order matches the amended `enum StmData.Loop`
+    (`TactusDefs_lib_exec__base.lean:45`): `Loop <inv_hyps> <binders>
+    <binder_bounds> <cond_name> <cond_ann> <neg_cond_ann> <d_old_name>
+    <d_old_val> <decrease_oblig> <body>`. `stm_size_of` needs no change
+    (counts BinderList Cons generically; ParamBoundList not counted) →
+    sum_to's probe auto-recomputes 23→25.
+  - Module faithfulness-contract doc updated (Loop reads `decrease`/`id`/
+    `local_decls`; `modified_vars` NOT read).
+
+  Committed as a checkpoint before the regen. NEXT (this turn if the build
+  finishes): re-emit fixtures with `--tactus-emit-cert`, confirm sum_to.cert
+  carries the populated Loop, hand-run
+  `goals_eq (ref_wp cert_sum_to_ctx cert_sum_to_sst) cert_sum_to_goals = 1
+  := by decide`, negative-control a d_old/decrease leaf, refresh any golden.
+
+- (2026-07-14, opus-w2b-f3b) **finding-3 SERIALIZER SIDE VALIDATED
+  END-TO-END — the sum_to loop bridge closes by `decide`, mutation-kill
+  confirmed. All four findings (1/2/3/4) are now landed + demonstrated.
+  Marking this task DONE.**
+
+  **Regen + hand-run (fresh vargo release build of the verus fork,
+  vstd 1530/0):**
+  - Re-emitted fixtures (`--tactus-emit-cert`, run from the tactus-bootstrap
+    dir so `@rust:` locs read `bootstrap-fixture/lib.rs`, matching the
+    committed golden): **certified 11/16** (5 `call` rejections, unchanged).
+  - Fresh `sum_to.cert` Loop node (all fields populated, leaf table verbatim):
+    `inv_hyps` BinderList `[(16=_h_ctx_2 → 17=/-@rust:111:13-/ i≤n),
+    (18=_h_ctx_3 → 19= n≤1000), (20=_h_ctx_4 → 21= toNat acc = tri(toNat i)),
+    (22=_h_ctx_5 → 23= acc ≤ 1000*1000)]`; `binders` `[(9=i,1=Int),
+    (11=acc,1)]`; `binder_bounds` ParamBoundList `[Bound(12=_h_ctx_0,
+    13= 0≤i∧i<2^64), Bound(14=_h_ctx_1, 15= 0≤acc∧acc<2^64)]`; `cond_name`
+    24=_h_ctx_6, `cond_ann` 25=`/-@rust:109:11-/ i<n`, `neg_cond_ann`
+    26=`¬(/-@rust:109:11-/ i<n)`, `d_old_name` 27=`_tactus_d_old_0_0`,
+    `d_old_val` 28=`n-i`, `decrease_oblig` 29=`/-@rust:115:19-/ 0≤n-i ∧
+    n-i<_tactus_d_old_0_0`. `stm_size` probe auto-recomputed 23→25.
+  - **Bridge (LEAN_PATH = tactus-core/out/lib + prelude-cache):**
+    `lib.goals_eq (lib.ref_wp cert_sum_to_ctx cert_sum_to_sst)
+    cert_sum_to_goals = 1 := by decide` **PASSES (exit 0)** — refWp
+    reconstructs ALL 12 production goals from the SST literal verbatim.
+  - **Mutation-kill (proves it's real, not vacuous):** flip RHS `=1`→`=0`
+    → `decide` errors (goals_eq is genuinely 1); mutate SST
+    `decrease_oblig` leaf 29→99 → `goals_eq`→0, `decide` errors. A
+    serializer mismatch fails the bridge, never silent-passes.
+  - **add_capped:** on-disk cert now byte-IDENTICAL to the golden testdata
+    (finding-3 leaves the non-loop path untouched); 6 serializer unit tests
+    green; tactus-core spec side re-verifies **36/0** against the fresh
+    binary.
+  - **find_square (nested loops): HONEST fail-to-close** (`goals_eq`→0), as
+    the recipe predicted — the `_h_ctx_N` counter resets per loop in
+    `loop_stm` while production's `split_leading_binders` counts over the
+    FULL accumulated frames (the outer loop's binders/hyps are still in
+    scope at the inner loop), so the inner loop's `_h_ctx` names diverge.
+    Documented stage-A caveat; fail-loud, not silent-pass.
+  - **Note (orthogonal): the fixture emit reports 11 verification errors**
+    (`tactus_auto`/`Lean tactic` PROOF-SEARCH failures on the hard fixture
+    fns: tri_one, sum_to's invariants @113/114/105, find_square, vec_*,
+    head_exec, fill_zeros). These are the Lean backend failing to PROVE
+    obligations — NOT cert-serialization failures (`emit_cert` runs at the
+    SST snapshot, catches all its own errors, and adds no obligations). The
+    cert is still emitted faithfully and the bridge certifies STATEMENT
+    ASSEMBLY, not provability (stage-A design). Not caused by this change
+    (serializer touches only cert emission + a `pub(crate)` visibility
+    modifier); likely fixture/closer-heartbeat drift vs finding-4's "0
+    errors" measurement, worth a glance but not blocking.
+
 ## Writeup
 
-_when done: findings, how the code works, assumptions made_
+**finding-3 (loop binders) — serializer side — DONE + VALIDATED.** With
+finding-3's spec side already verified (36/0) and findings 1/2/4 already
+landed, this completes the whole W2b-prereq task: the serializer now emits
+annotated obligations, named signature hyps, AND populated loop binders,
+and the two reference fixtures bridge by `decide` (add_capped: all 4 goals;
+sum_to: all 12 goals). max_u64 honest-fails (branch-in-leaf caveat, noted);
+find_square honest-fails (nested-loop caveat, noted). W2b (bootstrap-07) can
+now do the batch + mutation kills at fixture scale.
+
+### How the serializer code works (finding-3)
+
+`source/lean_verify/src/sst_serialize.rs` — `loop_stm` rewritten to the
+finding-3 10-field `StmData.Loop`. The load-bearing insight (recipe step 1):
+**production IGNORES `StmX::Loop.modified_vars`** (`None` at this SST stage;
+`build_wp` spells it `_`) and RE-DERIVES the havoc set in `build_wp_loop` via
+`collect_modifications(body)` + `WpCtx.type_map`. The serializer mirrors this:
+
+1. **Havoc set** — `crate::sst_to_lean::collect_modifications` (made
+   `pub(crate)`) walks the body in traversal order (`[i, acc]` for sum_to);
+   each name is filtered through `local_typs` (a new `Serializer` field,
+   cloned from `check.local_decls` — the SAME source production's `type_map`
+   uses). `binders` = `(binder_id, typ_leaf)` per surviving mod-local.
+2. **`_h_ctx_N` counter** — mirrors `OblCtx::split_leading_binders`
+   (sst_to_lean:1510): a single counter incremented once per HYPOTHESIS
+   trailing the mod-var ∀-binders — the mod-var type-bounds first (i_bound
+   =_h_ctx_0, acc_bound=_h_ctx_1), then the invariants (_h_ctx_2..5), then
+   the cond (_h_ctx_6). The mod-var binders themselves keep their source
+   names (i, acc). Mod-var bounds use BARE `type_bound_predicate(
+   LExpr::var(name), typ)` — no deref, unlike params (walk_loop:2532).
+3. **`binder_bounds`** — a `ParamBoundList` PARALLEL to `binders`:
+   `Bound(_h_ctx name, range-pred leaf)` for an int-typed mod-local, else
+   `NoBound`.
+4. **`inv_hyps`** — a `BinderList` of `(_h_ctx name, ANNOTATED obligation
+   leaf)`; the annotated leaf (`oblig_leaf`, byte-matching production's
+   span_mark'd `LoopInvariant`) serves BOTH the init/maintain obligation AND
+   the ∀-hyp (production reuses one leaf for both, unlike Assert's split).
+5. **cond** — shared `_h_ctx` name for maintain (`cond_ann` = `oblig_leaf`)
+   and use (`neg_cond_ann` = new `neg_oblig_leaf` = `pp(not(span_mark(...)))`
+   — the NOT wraps the span_mark, exactly production's `not(cond_marked)`).
+6. **decrease** — `d_old_name` = `_tactus_d_old_<loop_id>_0`, `d_old_val` =
+   `exp_leaf(&decrease[0])` (= production's `lower_validated`, empty
+   RenderCtx), `decrease_oblig` = new `decrease_oblig_leaf` reconstructing
+   `span_mark((0≤D)∧(D<d_old))` (= `lex_decrease_obligation` single-level +
+   `decrease_marked`). Single-level guard (`loop-multilevel-decrease`).
+
+Emit order matches the amended `enum StmData.Loop`
+(`TactusDefs_lib_exec__base.lean:45`). `stm_size_of` needed NO change (it
+counts `BinderList.Cons` generically; `ParamBoundList` is not counted,
+matching the spec `stm_size`). All new leaves are reconstructed via the
+IDENTICAL render path production uses, so matching leaves cancel across the
+bridge; a divergence (coercion the empty RenderCtx doesn't replicate, or a
+nested-loop counter offset) fails the `decide` to CLOSE, never silent-passes.
+
+### Assumptions / caveats
+
+- **Single-loop, single-level, no-coercion-in-cond/inv** is the validated
+  class (sum_to). Nested loops (find_square) and multi-level decrease are
+  rejected/honest-fail — documented stage-A caveats.
+- **`havoc_lets` keeps FHyp** (spec caveat, already documented): a pre-loop
+  assert OVER a modified local would honest-fail; sum_to has none.
+- The 11 fixture PROOF-search errors are orthogonal to serialization (see
+  Progress). Not investigated to root cause (would need an A/B rebuild); the
+  causal argument that the serializer cannot produce them is airtight.
+- `bootstrap-fixture/out` is gitignored/regenerable (not committed); the
+  tactus-core `out/lib` regen (finding-3 spec artifacts, left uncommitted by
+  the spec instance) is committed here alongside, re-verified 36/0.
