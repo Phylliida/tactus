@@ -1,9 +1,9 @@
 ---
 title: "W7b — land the frozen defs-layer vocabulary in tactus-core (one batched cache-churning edit)"
-status: in_progress
+status: done
 claimed_by: opus-w7b
 created: 2026-07-14T23:00:00Z
-updated: 2026-07-14T14:20:00Z
+updated: 2026-07-14T15:40:00Z
 ---
 
 ## Description
@@ -113,5 +113,84 @@ bridge), W7e (mutation-kill).
 
 ## Writeup
 
-_when done: the landed diff summary, re-verify counts, olean re-emit
-confirmation, probe9/13/14 status, and any shape adjustments from the freeze._
+**DONE — the full frozen defs-layer vocabulary is landed in `tactus-core/lib.rs`,
+crate re-verifies 65/0, oleans re-emitted, probe9/13/14 all green.** Two
+commits: `aa4baed` (expression vocabulary) + `fde32fb` (def-header layer).
+
+### What landed (`tactus-core/lib.rs`)
+
+- **`TypData += TyBox(u64)`** — Box<T> field type, distinct from `TyRef` (§7 Q4).
+  Extended `typ_size`, `td_tag` (tag 5), `deref_type` (`TyBox inner → TyNamed
+  inner`), + new `td_id`/`typ_eq` (nat type equality).
+- **`ExprData += Ite / Match / AppN / Forall / Exists`** with the mutual cycle
+  `ExprData ↔ ArmList`/`ExprList` + `BinderIdList`. Extended `expr_size` (+ mutual
+  `arms_size`/`exprlist_size`), `ed_tag` (10–14) + projections, `expr_eq`
+  (+ mutual `arms_eq`/`exprlist_eq`, `bidl_eq`).
+- **`RawExp += Ite / MatchR / CallN / ForallR / ExistsR`** + `RawArmList`/`RawList`.
+  Extended `type_of` + `render_exp` (+ mutual `render_arms`/`render_list`).
+- **Def-header layer:** `ParamList`/`TypList`/`CtorList` + `DefData`/`RawDef` +
+  `DtData`/`RawDt` (structs); `render_def` (header copy + independent
+  `render_exp` body), `render_dt` (transcription); `def_eq`/`dt_eq` +
+  `param_list_eq`/`typ_list_eq`/`ctor_list_eq`.
+- **Two in-crate kernel-computes guards** (analogs of
+  `expr_mirror_kernel_computes`): `defs_expr_vocab_kernel_computes` pins
+  `render_exp`/`expr_eq` on the real fixture shapes — `tri`(Ite),
+  `tree_head`(Match + §Q1 binder-id kill), `Tree.height`(self-recursive Match +
+  Box-`Deref`), `AppN`, `Forall`; `defs_mirror_kernel_computes` pins
+  `render_def`/`def_eq` (§Q2 self-recursive def, App callee not unfolded) +
+  `render_dt`/`dt_eq` on the real `Tree = Leaf(Int)|Node(Box,Box)` (§Q4
+  Box-vs-Int field kill). Each correct=1 + mutation=0, all `by { decide }`.
+
+### How it works / key decisions (the four de-risk gotchas, from Progress)
+
+1. **Mutual `structural_decreases` DOES work** across nested datatypes (the
+   preamble's `lib.rs:12-17` "single-fn only" note is stale). Verus emits
+   `termination_by structural`, which kernel-reduces under `decide`.
+2. **No single-variant enums.** They lower to a Lean `structure` whose
+   auto-`.height` mis-names the ctor (`.Arm` vs `.mk`) → `Invalid pattern`.
+   Arms/ctors are INLINED into their list `Cons` (the `BinderList` idiom);
+   `MatchArm`/`RawCtor`/`CtorData` from the freeze are folded away.
+3. **Genuine mutual `arms_eq → expr_eq`** (arm bodies compared by the recursive
+   `expr_eq`, not W7a's derived-`=` shortcut — which never actually validated
+   the mutual eq). Validated in-crate.
+4. **Projection idiom everywhere** (match 1st arg, read 2nd via tag/projection
+   accessors, no nested match — a nested match breaks Lean structural-recursion
+   inference in emission).
+
+### Verify / re-emit recipe (confirmed working)
+
+    cd tactus-core
+    TACTUS_LEAN_OUT=$PWD/out ../source/target-verus/release/verus \
+      --crate-type=lib --lean-backend --lean-all-proofs lib.rs     # 65/0, re-emits out/lib
+    cd .. && bash probe-w0/probe9_bridge/run.sh                     # 13/13 close-ok
+    bash probe-w0/probe13_expr_mutations/run.sh                     # PASS
+    bash probe-w0/probe14_g4_ifjoin/run.sh                          # OK
+
+### Assumptions / honesty (what's partial)
+
+- **`defs_mirror_kernel_computes` uses a COMPACT self-recursive def body, not
+  the full `tri` Ite tree, at the def level.** Rationale: `render_def` only
+  copies the header + calls `render_exp` on the body, and `render_exp` is
+  pinned EXHAUSTIVELY on the full `tri`/`tree_head`/`height` shapes one level
+  down by `defs_expr_vocab_kernel_computes`. Re-embedding the full tri body in
+  the def guard would be pure redundancy. The def guard's job — header/param/ret
+  handling + `def_eq` composition + §Q2 (App callee not unfolded) — is fully
+  pinned by the compact recursive def + the wrong-param-type / dropped-recursion
+  kills. The `Tree` DtData IS the real fixture datatype.
+- **Frozen `MatchArm`/`RawCtor`/`CtorData` named types were NOT landed as
+  separate types** — folded into the inlined `ArmList`/`CtorList::Cons` (gotcha
+  2). Same information, no single-variant-struct height risk. W7c consumers
+  should target the inlined shape.
+- **AppN per-arg expected-type coercion still deferred** (§7 Q3) — `render_list`
+  renders args straight; W7c must carry per-arg param types (no fixture body is
+  multi-arg, so untested against real output here).
+- **De-risk probes (`probe_mutual{,2}.rs`) were throwaway and removed** before
+  the commits; their findings are in this task's Progress. Handwritten Lean
+  isolation files were in `/tmp` (not committed).
+
+### Unblocks
+
+W7c (serializer transcriptions: extend `lexpr_to_exprdata`/`expx_to_rawexp` for
+the new body constructors + datatype transcription → build `RawExp::{Ite,MatchR,
+CallN,ForallR}` / `RawDef` / `RawDt` from VIR), W7d (wire into def emission +
+bridge `def_eq`/`dt_eq` on the fixture + tgt slice), W7e (mutation-kill).

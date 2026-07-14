@@ -71,10 +71,19 @@ def bodies). **UNBLOCKED** — W6 done (`bootstrap-11` closed).
       `#[verifier::structural_decreases]` on the arm-list-recursive
       `render_exp`/`expr_size` is expected to hold — the Match/AppN nesting is
       kernel-reducible in-crate.
-    - W7b = the one batched `tactus-core` edit (new constructors + `DefData`/
-      `RawDef`/`DtData` + `render_def`/`def_eq`).
+    - W7b (`bootstrap-27`, **DONE 2026-07-14, opus-w7b**) = the batched
+      `tactus-core` edit. Landed all new constructors + `DefData`/`RawDef`/
+      `DtData`/`RawDt` + `render_def`/`render_dt`/`def_eq`/`dt_eq` + two in-crate
+      kernel-computes guards. Crate 65/0, oleans re-emitted, probe9/13/14 green
+      (`aa4baed`+`fde32fb`). De-risk found 4 gotchas (mutual `structural_decreases`
+      DOES work; inline arms to dodge the single-variant-enum `.height` bug;
+      genuine mutual `arms_eq→expr_eq`; projection idiom, no nested match) — see
+      `bootstrap-27` Progress/Writeup. Frozen `MatchArm`/`CtorData` named types
+      folded into inlined list `Cons` (same info, no single-variant risk).
+      **W7c now unblocked.**
     - W7c = serializer transcriptions (extend `lexpr_to_exprdata`/`expx_to_rawexp`
-      + datatype transcription).
+      for the new body constructors + datatype transcription; target the INLINED
+      arm/ctor shape, not the frozen `MatchArm` type).
     - W7d = wire into def emission + bridge `decide`s `def_eq` on fixture + tgt slice.
     - W7e = mutation-kill (perturb body / ctor / height ⟹ bridge flips 1→0).
 
