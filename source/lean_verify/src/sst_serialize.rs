@@ -302,14 +302,6 @@ impl Serializer {
         Ok(self.leaves.intern(pp_expr(&lexpr)))
     }
 
-    /// Render `¬e` as a leaf (the walker's else-branch / loop-exit
-    /// hypothesis text — same `LExpr::not` call `Wp::Branch` uses).
-    fn neg_leaf(&mut self, e: &Exp) -> Sr<u64> {
-        let lexpr = crate::to_lean_sst_expr::sst_exp_to_ast_checked(e)
-            .map_err(|reason| format!("leaf-render: {}", reason))?;
-        Ok(self.leaves.intern(pp_expr(&LExpr::not(lexpr))))
-    }
-
     /// Render an obligation as an ANNOTATED leaf, byte-matching
     /// production's goal leaf (finding-1). Production wraps every
     /// obligation's rendered prop in a `SpanMark`
@@ -338,8 +330,8 @@ impl Serializer {
     /// Render `¬<annotated e>` as a leaf, byte-matching production's
     /// loop-exit hypothesis (finding-3). The `use` telescope pushes
     /// `LExpr::not(cond_marked(&c))` (`sst_to_lean::walk_loop`), i.e. the
-    /// NEGATION wraps the span_mark'd cond (unlike `neg_leaf`, which
-    /// negates the bare prop). Reconstructed via the identical
+    /// NEGATION wraps the span_mark'd cond (NOT the bare prop).
+    /// Reconstructed via the identical
     /// `span_mark` → `not` → `pp_expr` path, so the interned text equals
     /// the goal-side `neg_cond_ann` leaf and the two cancel across the
     /// bridge. `kind` never reaches the pp (see `oblig_leaf`), so `Plain`
@@ -473,8 +465,19 @@ impl Serializer {
             }
 
             StmX::If(cond, then_stm, else_stm) => {
-                let c = self.exp_leaf(cond)?;
-                let nc = self.neg_leaf(cond)?;
+                // The branch hyps are the ANNOTATED cond / ¬cond, byte-matching
+                // production's `Wp::Branch`: it pushes `cond_marked =
+                // span_mark(loc, Hypothesis(BranchCondition), lower(cond))` as
+                // the then-branch hyp and `not(cond_marked)` as the else-branch
+                // hyp (`sst_to_lean::walk_obligations`). `oblig_leaf` /
+                // `neg_oblig_leaf` reconstruct the SAME span_mark → pp text
+                // (the `AssertKind` never reaches the pp — see `oblig_leaf`),
+                // so the If node's cond/¬cond leaves reuse the goal-side branch
+                // hyp ids and refWp's `Imp c`/`Imp nc` cancel across the bridge
+                // (bootstrap-17). The BARE cond is never an obligation and is
+                // used nowhere, so we do not intern it.
+                let c = self.oblig_leaf(cond)?;
+                let nc = self.neg_oblig_leaf(cond)?;
                 let t = self.stm(then_stm)?;
                 let e = match else_stm {
                     Some(s) => self.stm(s)?,
