@@ -83,4 +83,18 @@ after N3b (goal provenance), since the bridge is what pins the instantiation.
   rather than the *subject* of the check — exactly backwards. So this stays
   todo behind W2 (see bootstrap-06/07); no change to the sequencing.
 
+- (2026-07-14, opus-b14-cont) **N4 census (`bootstrap-05`) quantified this
+  arm's payoff — it is the highest-leverage serializer arm by a wide margin,
+  but the sequencing is UNCHANGED (still behind W2b).** Cold census over both
+  corpora: `StmData::Call` blocks **5 fixture + 5 tgt = 10 exec fns** (fixture
+  {quad_exec, count_down, vec_read, vec_push7, fill_zeros}; tgt
+  runtime::{find_cancellation_exec, copy_word, apply_hom_gen, apply_hom_inv,
+  apply_hom_symbol_exec}). It is the *entire* fixture gap and 5/8 of the tgt
+  exec-fn gap; the only other blocker is `assert-query` (3 tgt fns). See
+  DESIGN-W2-refwp.md §1.1. This does NOT reopen the deferral — landing an
+  unvalidated substitution mirror in the TCB before the W2b bridge exists is
+  still backwards. It just confirms: when W2b lands, THIS is the first
+  serializer arm to build (and its faithfulness is exactly what the bridge
+  will `decide`-check).
+
 ## Writeup
