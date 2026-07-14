@@ -630,6 +630,50 @@ impl<'a> Serializer<'a> {
                     paren(&arg_ty)
                 ))
             }
+            // G6 (W6d.2b) — an unsigned-overflow refinement `HasType(U(n))(e)`,
+            // which production EXPANDS to `0 ≤ e ∧ e < 2^n`
+            // (`type_bound_predicate`). Carry the width `n` as a first-class
+            // `RawExp::HasType`; `render_exp` reproduces that exact expansion
+            // (option (i), Danielle 2026-07-14) so the width stays observable
+            // and the `2^n` bound is re-derived INDEPENDENTLY of production's
+            // `two_pow_lit` (a divergence surfaces as a bridge mismatch, never a
+            // silent pass). Only fixed-width UNSIGNED ranges are carried;
+            // signed / usize / char / int / nat refinements fail loud
+            // (`hastype-range`) — none appear in the fixture's coverable set.
+            ExpX::UnaryOpr(UnaryOpr::HasType(t), inner) => {
+                let width = uint_bound_width(t)?;
+                let sub = self.raw_exp(inner)?;
+                Ok(format!("({}.RawExp.HasType {} {})", NS, width, box_raw(&sub)))
+            }
+            // G3 (W6d.2b) — struct/tuple field projection. Reuse production's
+            // exact accessor-naming (`field_access_name`) so the reference field
+            // id and the goal-side `FieldProj.field` (which production ALSO
+            // derived via `field_access_name`) intern the IDENTICAL string — the
+            // atom-id consistency invariant holds by construction, rather than
+            // by re-deriving the tuple 1-indexed shift here. A 1-tuple's field-0
+            // access is the identity (production emits no projection); mirror the
+            // bare base. The field's own `typ` is the result type
+            // (`type_of (Field …) = fty`). NB: a `&`-decorated base needs the
+            // `.deref` chain production inserts (`apply_deref_chain`) that this
+            // arm does NOT reproduce — such a base DIVERGES and the W6d.2b
+            // emit-gate keeps it fail-loud (never silent-passes).
+            ExpX::UnaryOpr(UnaryOpr::Field(fop), inner) => {
+                let base = self.raw_exp(inner)?;
+                match crate::expr_shared::field_access_name(fop) {
+                    None => Ok(base),
+                    Some(accessor) => {
+                        let fid = self.text_leaf(&accessor);
+                        let fty = self.typ_data(&e.typ)?;
+                        Ok(format!(
+                            "({}.RawExp.Field {} {} {})",
+                            NS,
+                            fid,
+                            paren(&fty),
+                            box_raw(&base)
+                        ))
+                    }
+                }
+            }
             _ => Err(format!("raw-{}", exp_construct_tag(&e.x))),
         }
     }
@@ -693,6 +737,16 @@ impl<'a> Serializer<'a> {
             // literal would need parenthesizing on BOTH sides (none arises in
             // the cast class; shared open item).
             ExprNode::Lit(s) => Ok(format!("({}.ExprData.Lit {})", NS, s)),
+            // G1 (W6d.2b) — a bool-literal leaf (`ensures true`, find_square; or
+            // a builder-synthesized `∧ False` decrease disjunct). Maps to
+            // `ExprData::LitBool` with the 0/1 nat encoding, matching the
+            // reference `RawExp::LitBool` after `render_exp` (which passes it
+            // straight through). The nat encoding (not a `bool`) is required —
+            // a spec `bool` renders as Lean `Prop` and sticks `decide`
+            // (W6d.1a design deviation 1).
+            ExprNode::LitBool(b) => {
+                Ok(format!("({}.ExprData.LitBool {})", NS, if *b { 1 } else { 0 }))
+            }
             // Materialized `as`-cast: production emits `Int.toNat x` /
             // `Int.ofNat x` as a single-arg App with a literal head (see
             // `coerce_lexpr` / `wrap_int_measure`). Map to the `Cast` node the
@@ -2010,6 +2064,24 @@ fn binop_construct_tag(op: &BinaryOp) -> &'static str {
 
 /// Sharp census tag for an un-mirrored `TypX` (the `_` arm of `typ_data`).
 #[allow(dead_code)]
+/// Width `n` of a fixed-width UNSIGNED integer range a `HasType(U(n))`
+/// refinement carries (G6), peeling SMT `Boxed`/`Decorate` wrappers (parallel
+/// to `typ_data`). Only the unsigned ranges production expands to
+/// `0 ≤ e ∧ e < 2^n` are accepted; every other range fails loud
+/// (`hastype-range`), matching the `RawExp::HasType` contract
+/// (signed/usize/char/vacuous ranges are not carried). A `U(n)` whose width is
+/// outside `pow2`'s table would render a `0` bound → a loud bridge mismatch,
+/// still never a silent pass; the Verus fixed widths (8/16/32/64/128) are all
+/// covered.
+#[allow(dead_code)]
+fn uint_bound_width(typ: &Typ) -> Sr<u64> {
+    match &**typ {
+        TypX::Int(IntRange::U(n)) => Ok(*n as u64),
+        TypX::Decorate(_, _, inner) | TypX::Boxed(inner) => uint_bound_width(inner),
+        _ => Err("hastype-range".to_string()),
+    }
+}
+
 fn typ_construct_tag(typ: &Typ) -> &'static str {
     match &**typ {
         TypX::Real => "real",
