@@ -96,14 +96,37 @@
 //!   `0 ≤ D ∧ D < d_old` obligation. `_h_ctx_N` names mirror
 //!   `OblCtx::split_leading_binders`' counter byte-for-byte so the
 //!   binder-name ids unify with the goal side.
+//! * `StmX::Call` (bootstrap-02b — THE one non-transcription trusted
+//!   step). The callee's `requires`/`ensures` are VIR-AST clauses that
+//!   must be INSTANTIATED at THIS call's actual args before they can be
+//!   rendered — the serializer cannot transcribe them verbatim. The
+//!   instantiation (callee resolution + param→arg substitution + the
+//!   #128 ret-eq detection + the return-typ coerce) is done by
+//!   `sst_to_lean::cert_call_leaves`, which reuses production's EXACT
+//!   renderers (`build_call_substitutions` / `render_call_ensures` /
+//!   `type_bound_predicate`) so the leaf TEXT byte-matches the goal
+//!   side (leaf content is uncertified — see the trusted-surface caveats
+//!   — so it MUST reuse the production path to match). The resulting
+//!   `StmData::Call { reqs, post }` FrameList STRUCTURE is then assembled
+//!   INDEPENDENTLY by `call_stm` (this module), so the frame shape — the
+//!   content the W2 `decide` bridge validates — is the serializer's own
+//!   code, not a copy of production's `push_post_call_frames` (Option 1,
+//!   DESIGN-W2-refwp.md §2.6). Restricted subset: Static + same-crate +
+//!   no-`&mut` + no-generic + ret-eq path + dest present. Every other
+//!   shape fails loud (sharp census tags below).
 //!
 //! ## Deliberately NOT read (each a stage-A exclusion — fail-loud)
 //!
-//! * `StmX::Call` — the callee's req/ens must be INSTANTIATED at the
-//!   actual args (walker-side `build_wp_call`), a non-transcription
-//!   trusted step; deferred to keep N3a pure transcription (census tag
-//!   `call`; the amended `StmData::Call` shape is exercised by the
-//!   in-crate `decide` proofs meanwhile).
+//! * `StmX::Call` shapes OUTSIDE the restricted subset above — each a
+//!   sharp fail-loud tag (so the census pinpoints the missing arm):
+//!   `call-trait` (trait-method-impl callee), `call-crosscrate` (callee
+//!   not in `fn_map`), `call-mut` (`&mut` param — needs the existential /
+//!   rebind / prophecy machinery), `call-generic` (type params —
+//!   instantiated-typ leaves), `call-unit-dest` (unit-returning call, no
+//!   dest binder), `call-dynamic-resolved` / `call-trait-default`
+//!   (non-Static resolution), and `call-forall-path` (a callee with no
+//!   `r == E` ensures — the ∀-path frame assembly, pending a validating
+//!   fixture).
 //! * `StmX::AssertBitVector` / `AssertQuery` — bv/compute/query asserts
 //!   and their isolated contexts (tags `assert-bitvector`/`assert-query`).
 //! * `StmX::OpenInvariant` / `ClosureInner` / `BreakOrContinue` —
@@ -615,8 +638,43 @@ impl<'a> Serializer<'a> {
             // unchanged. Elide (⇒ Skip in a Seq position).
             StmX::Air(_) | StmX::Fuel(..) | StmX::RevealString(_) => Ok(self.skip()),
 
+            // Call (bootstrap-02b): the one place the serializer does
+            // non-transcription work — it INSTANTIATES the callee's
+            // requires/ensures at this call's actual args. The leaf
+            // RENDERING (opaque, uncertified — DESIGN §2.5) reuses
+            // production's exact path via `cert_call_leaves` so the text
+            // byte-matches the goal side; the frame STRUCTURE (the
+            // certified content) is assembled HERE, independently of
+            // `push_post_call_frames`, so the W2 `decide` bridge validates
+            // it (Option 1, DESIGN-W2-refwp.md §2.6). Restricted subset:
+            // Static + same-crate + no-`&mut` + no-generic + ret-eq; every
+            // other shape fails loud from `cert_call_leaves` (sharp tags:
+            // call-trait / call-crosscrate / call-mut / call-generic /
+            // call-unit-dest / call-dynamic-resolved / call-trait-default)
+            // or here (`call-forall-path`).
+            StmX::Call {
+                fun,
+                resolved_method,
+                is_trait_default,
+                typ_args,
+                args,
+                dest,
+                ..
+            } => {
+                let leaves = crate::sst_to_lean::cert_call_leaves(
+                    fun,
+                    resolved_method,
+                    is_trait_default,
+                    typ_args,
+                    args,
+                    dest.as_ref(),
+                    &stm.span,
+                    &self.fn_map,
+                    &self.caller_param_typs,
+                )?;
+                self.call_stm(leaves)
+            }
             // Fail-loud stage-A exclusions.
-            StmX::Call { .. } => Err("call".to_string()),
             StmX::AssertBitVector { .. } => Err("assert-bitvector".to_string()),
             StmX::AssertQuery { .. } => Err("assert-query".to_string()),
             StmX::BreakOrContinue { .. } => Err("break-or-continue".to_string()),
@@ -640,6 +698,62 @@ impl<'a> Serializer<'a> {
         }
         let tail = self.block(&stms[1..])?;
         Ok(format!("({}.StmData.Seq {} {})", NS, box_(&head), box_(&tail)))
+    }
+
+    /// Assemble the `StmData.Call { reqs, post }` literal from the
+    /// production-rendered leaves (`cert_call_leaves`, bootstrap-02b).
+    /// `reqs` is the single conjoined precondition obligation (or Nil);
+    /// `post` is the post-call FrameList — built HERE from the
+    /// path-tagged ingredients, so the frame STRUCTURE is the
+    /// serializer's own (independent) code and the W2 `decide` bridge
+    /// validates it against production's `push_post_call_frames`. Only
+    /// the ret-eq path is assembled this turn; the ∀-path fails loud
+    /// (`call-forall-path`) pending a validating fixture.
+    fn call_stm(&mut self, leaves: crate::sst_to_lean::CertCallLeaves) -> Sr<String> {
+        use crate::sst_to_lean::CertCallPost;
+        // reqs: a single-element LeafList — production `and_all`s the
+        // callee requires into ONE CallPrecondition obligation — or Nil.
+        let reqs = match &leaves.precondition {
+            Some(l) => {
+                let id = self.leaves.intern(pp_expr(l));
+                self.leaf_list(&[id])
+            }
+            None => self.leaf_list(&[]),
+        };
+        // dest binder id = interned leaf id of the dest's rendered name
+        // (same path as `binder_id`; production Phase-5 binds
+        // `let <dest> := …`).
+        let dest_id = self.text_leaf(leaves.dest_name.as_str());
+        let post = match leaves.post {
+            CertCallPost::RetEq { e_bound, rest, dest_value } => {
+                // Frame (outer→inner): [FHyp(E_bound)] [FHyp(rest)]
+                // FLet(dest, E). Built innermost-out so E_bound ends up
+                // outermost — matching `push_ret_frames`' push order
+                // (E_bound Hyp, then rest Hyp, then Phase-5 dest Let).
+                let dv = self.leaves.intern(pp_expr(&dest_value));
+                let fnil = format!("{}.FrameList.FNil", NS);
+                let mut post = format!(
+                    "({}.FrameList.FLet {} {} {})", NS, dest_id, dv, box_(&fnil));
+                if let Some(rest) = rest {
+                    let r = self.leaves.intern(pp_expr(&rest));
+                    post = format!("({}.FrameList.FHyp {} {})", NS, r, box_(&post));
+                }
+                if let Some(eb) = e_bound {
+                    let b = self.leaves.intern(pp_expr(&eb));
+                    post = format!("({}.FrameList.FHyp {} {})", NS, b, box_(&post));
+                }
+                post
+            }
+            CertCallPost::Forall { .. } => {
+                // The ∀-path (no callee `r == E`) needs the FBind +
+                // ret_bound + ens + Approach-A `use_dest_name` assembly.
+                // Deferred until a ∀-path fixture exists to bridge-validate
+                // it — no fixture Call fn currently takes it
+                // (quad_exec / count_down / vec_read are all ret-eq).
+                return Err("call-forall-path".to_string());
+            }
+        };
+        Ok(format!("({}.StmData.Call {} {})", NS, box_(&reqs), box_(&post)))
     }
 
     /// Serialize a `StmX::Loop` into the finding-3 `StmData.Loop` shape:
@@ -1217,7 +1331,7 @@ fn sanitize_comment(text: &str) -> String {
 /// does — so the emitted `example : stm_size … = n := by decide` probe
 /// carries the right `n`. Mirrors `lib.stm_size` (lib.rs):
 ///   Assert/Assume/Assign/Skip → 1
-///   Call → 1 + |reqs| + |enss|
+///   Call → 1 + |reqs| + frame_len(post)
 ///   DeadEnd/Ret → 1 + inner list/stm
 ///   If → 1 + size(t) + size(e)
 ///   Loop → 1 + |invs| + |binders| + size(body)
@@ -1247,7 +1361,13 @@ fn stm_size_of(stm_term: &str) -> u64 {
     // `Cons` under Call/Ret/Loop each add 1 to stm_size.
     let leaf_cons = count(&format!("{}.LeafList.Cons", NS));
     let binder_cons = count(&format!("{}.BinderList.Cons", NS));
-    stmt_heads + leaf_cons + binder_cons
+    // Call's `post` FrameList (bootstrap-02b): `frame_len` counts each
+    // FBind/FHyp/FLet entry as 1 (FNil as 0), exactly as tactus-core's
+    // `stm_size(Call) = 1 + leaf_len(reqs) + frame_len(post)`.
+    let frame_entries = count(&format!("{}.FrameList.FBind", NS))
+        + count(&format!("{}.FrameList.FHyp", NS))
+        + count(&format!("{}.FrameList.FLet", NS));
+    stmt_heads + leaf_cons + binder_cons + frame_entries
 }
 
 /// Content hash of the vendored `tactus-core` vocabulary

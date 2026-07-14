@@ -45,6 +45,7 @@ export LEAN_PATH="$CORE_OUT:$PRELUDE"
 honest_fail_reason() {
   case "$1" in
     max_u64)   printf '%s' 'branch-in-leaf: frontend lifts the fall-through if INTO the ensures leaf [x<y -> let r:=...]; refWp folds the raw per-ensures leaves. DESIGN 2.4.1.' ;;
+    count_down) printf '%s' 'two-way If-join not merged at stage A (DESIGN 2.4.1): `if n==0 {0} else {recurse}` — BOTH branches fall through to a common Ret. frame_after(If) returns the pre-If frame (the merge special case needs diverges(then) && is_skip(else)), so the common Ret closes under the bare pre-If frame (missing each branch tmp__3 binding) -> 1 malformed postcond where production clones 2. refWp=3 goals, prod=4; the assert+termination goals AROUND the recursive call match production exactly (Call arm is faithful — quad_exec closes). Surfaced (not caused) by bootstrap-02b making count_down emittable. Follow-up: bootstrap-19 (model the two-way If-join).' ;;
     *)         printf '%s' '' ;;
   esac
 }
