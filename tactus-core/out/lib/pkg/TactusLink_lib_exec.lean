@@ -1,6 +1,7 @@
 import TactusDefs_lib_exec
 import lib__expr_mirror_kernel_computes
 import lib__defs_expr_vocab_kernel_computes
+import lib__defs_mirror_kernel_computes
 import lib__skeleton_kernel_computes
 import lib__seq_size_unfolds
 import lib__probe_goal_eq_leaf
@@ -30,6 +31,9 @@ noncomputable def lib.expr_mirror_kernel_computes_closed : lib.expr_mirror_kerne
 noncomputable def lib.defs_expr_vocab_kernel_computes_closed : lib.defs_expr_vocab_kernel_computes_stmt :=
   lib.defs_expr_vocab_kernel_computes
 #tactus_check_axioms lib.defs_expr_vocab_kernel_computes_closed []
+noncomputable def lib.defs_mirror_kernel_computes_closed : lib.defs_mirror_kernel_computes_stmt :=
+  lib.defs_mirror_kernel_computes
+#tactus_check_axioms lib.defs_mirror_kernel_computes_closed []
 noncomputable def lib.skeleton_kernel_computes_closed : lib.skeleton_kernel_computes_stmt :=
   lib.skeleton_kernel_computes
 #tactus_check_axioms lib.skeleton_kernel_computes_closed []
