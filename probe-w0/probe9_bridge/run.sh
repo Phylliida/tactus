@@ -36,10 +36,15 @@ export LEAN_PATH="$CORE_OUT:$PRELUDE"
 # divergence where the bridge SOUNDLY does not close). Each has a recorded
 # reason (see REPORT.md + DESIGN-W2-refwp.md §5 triage). Everything else must
 # CLOSE. A honest-fail that suddenly CLOSES is a regression and fails the run.
+# NOTE (bootstrap-18, 2026-07-13): head_exec was FIXED and is now expected-CLOSE.
+# The serializer's oblig_leaf / neg_oblig_leaf now render through the binder-aware
+# render_ctx() (with_binder_typs(caller_param_typs) + with_fn_map) — byte-for-byte
+# production's WpCtx postcondition ctx — so the ensures `*t` derefs to `t.deref`
+# and the obligation leaf cancels across the bridge (old leaf 3 vs 6 → one leaf).
+# Removed from the honest-fail set; it must now close-ok like the other fixtures.
 honest_fail_reason() {
   case "$1" in
     max_u64)   printf '%s' 'branch-in-leaf: frontend lifts the fall-through if INTO the ensures leaf [x<y -> let r:=...]; refWp folds the raw per-ensures leaves. DESIGN 2.4.1.' ;;
-    head_exec) printf '%s' 'ref-param deref: ensures r==tree_head(*t) renders *t as bare t via the serializer empty-RenderCtx oblig_leaf [leaf 3], but production postcondition renders t.deref [leaf 6]. Sole divergence = the oblig leaf. DESIGN 2.5 leaf-rendering not certified; sibling of finding-4 coercion caveat.' ;;
     *)         printf '%s' '' ;;
   esac
 }
