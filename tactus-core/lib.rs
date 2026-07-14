@@ -407,6 +407,62 @@ pub enum RawList {
     Cons(Box<RawExp>, Box<RawList>),
 }
 
+// ── W7 def-header layer: the DEFINITIONS the obligations are stated in
+//    terms of — `@[reducible] def` spec-fn bodies + `inductive` datatype
+//    decls (trust-inventory row 4). `render_def` is an INDEPENDENT second
+//    lowering (VIR-body → Lean-def), NOT production's renderer — that
+//    diversity is what gives the bridge teeth (DESIGN-W7-defslayer §2). ──
+
+// (param id, param TYPE, tail) — like BinderList but the 2nd slot is a TypData
+// (a wrong param type is a real, certifiable bug; W7a §7 Q4). Self-recursive.
+pub enum ParamList {
+    Nil,
+    Cons(u64, TypData, Box<ParamList>),
+}
+
+// positional field types of one datatype constructor (no accessor names — the
+// accessor surface is separately certifiable; W7a §7 Q4).
+pub enum TypList {
+    Nil,
+    Cons(TypData, Box<TypList>),
+}
+
+// one `inductive` ctor INLINED (name, positional field types, tail) — no
+// separate `CtorData` type (same single-variant-struct avoidance as ArmList).
+pub enum CtorList {
+    Nil,
+    Cons(u64, TypList, Box<CtorList>),
+}
+
+// `@[reducible] def <name> <params> : <ret> := <body>` — production-style and
+// raw (VIR-transcribed) headers around a body ExprData / RawExp. Structs (one
+// ctor): spec field access is a projection, no tag+idiom needed (cf. FnCtxData).
+pub struct DefData {
+    pub name: u64,
+    pub params: ParamList,
+    pub ret: TypData,
+    pub body: ExprData,
+}
+pub struct RawDef {
+    pub name: u64,
+    pub params: ParamList,
+    pub ret: TypData,
+    pub body: RawExp,
+}
+
+// `inductive <name> where <ctors>`. Datatype render is TRANSCRIPTION not
+// decision (no body to lower); the bridge teeth are the VIR-vs-LExpr
+// transcription diversity, abstracted as two inputs (a wrong-transcribed field
+// type / ctor is the kill). RawDt/DtData share the ctor shape.
+pub struct DtData {
+    pub name: u64,
+    pub ctors: CtorList,
+}
+pub struct RawDt {
+    pub name: u64,
+    pub ctors: CtorList,
+}
+
 // ── W6d.1b-ii: lists of DEEP obligations (Call.reqs / Ret.es) ────────
 // A DEDICATED list, NOT a polymorphic `LeafList`: `LeafList` is still
 // shared by `enss` and `hyps_of_leaves`, where the element MUST stay an
@@ -924,6 +980,18 @@ pub open spec fn render_list(l: RawList) -> ExprList
     }
 }
 
+// W7: reference def lowering — copy the header (name/params/ret transcribed
+// straight from VIR) and render the body INDEPENDENTLY via `render_exp`.
+pub open spec fn render_def(d: RawDef) -> DefData {
+    DefData { name: d.name, params: d.params, ret: d.ret, body: render_exp(d.body) }
+}
+
+// W7: reference datatype lowering — ctor names + positional field types
+// straight through (no body; the diversity is the VIR-vs-LExpr transcription).
+pub open spec fn render_dt(d: RawDt) -> DtData {
+    DtData { name: d.name, ctors: d.ctors }
+}
+
 // ── W6b: structural equality on expressions (the LeafE bridge) ──────
 // Same discipline as `goal_eq`: match the FIRST arg alone (structural +
 // unambiguous), read the second through NON-recursive tag+projection
@@ -1127,6 +1195,78 @@ pub open spec fn exprlist_eq(a: ExprList, b: ExprList) -> nat
             if el_is_nil(b) == 1 { 0 }
             else if expr_eq(*h, el_hd(b)) == 1 { exprlist_eq(*t, el_tl(b)) } else { 0 },
     }
+}
+
+// ── W7 def-header layer: nat-returning equalities for the def/dt structs ──
+// The list eqs follow the same match-first-arg + projection idiom; `def_eq`/
+// `dt_eq` are non-recursive struct projections (spec field access, cf.
+// `fnctx_arity`).
+
+// ParamList projections + equality (param id + type).
+pub open spec fn pl_is_nil(p: ParamList) -> nat { match p { ParamList::Nil => 1, _ => 0 } }
+pub open spec fn pl_hd_id(p: ParamList) -> u64 { match p { ParamList::Cons(id, _, _) => id, _ => 0 } }
+pub open spec fn pl_hd_ty(p: ParamList) -> TypData { match p { ParamList::Cons(_, ty, _) => ty, _ => TypData::TyInt } }
+pub open spec fn pl_tl(p: ParamList) -> ParamList { match p { ParamList::Cons(_, _, t) => *t, _ => ParamList::Nil } }
+#[verifier::structural_decreases]
+pub open spec fn param_list_eq(a: ParamList, b: ParamList) -> nat
+    decreases a
+{
+    match a {
+        ParamList::Nil => pl_is_nil(b),
+        ParamList::Cons(id, ty, t) =>
+            if pl_is_nil(b) == 1 { 0 }
+            else if id == pl_hd_id(b) {
+                if typ_eq(ty, pl_hd_ty(b)) == 1 { param_list_eq(*t, pl_tl(b)) } else { 0 }
+            } else { 0 },
+    }
+}
+
+// TypList projections + equality (positional field types).
+pub open spec fn tyl_is_nil(l: TypList) -> nat { match l { TypList::Nil => 1, _ => 0 } }
+pub open spec fn tyl_hd(l: TypList) -> TypData { match l { TypList::Cons(ty, _) => ty, _ => TypData::TyInt } }
+pub open spec fn tyl_tl(l: TypList) -> TypList { match l { TypList::Cons(_, t) => *t, _ => TypList::Nil } }
+#[verifier::structural_decreases]
+pub open spec fn typ_list_eq(a: TypList, b: TypList) -> nat
+    decreases a
+{
+    match a {
+        TypList::Nil => tyl_is_nil(b),
+        TypList::Cons(ty, t) =>
+            if tyl_is_nil(b) == 1 { 0 }
+            else if typ_eq(ty, tyl_hd(b)) == 1 { typ_list_eq(*t, tyl_tl(b)) } else { 0 },
+    }
+}
+
+// CtorList projections + equality (ctor name + positional field types).
+pub open spec fn cl_is_nil(c: CtorList) -> nat { match c { CtorList::Nil => 1, _ => 0 } }
+pub open spec fn cl_hd_name(c: CtorList) -> u64 { match c { CtorList::Cons(nm, _, _) => nm, _ => 0 } }
+pub open spec fn cl_hd_fields(c: CtorList) -> TypList { match c { CtorList::Cons(_, f, _) => f, _ => TypList::Nil } }
+pub open spec fn cl_tl(c: CtorList) -> CtorList { match c { CtorList::Cons(_, _, t) => *t, _ => CtorList::Nil } }
+#[verifier::structural_decreases]
+pub open spec fn ctor_list_eq(a: CtorList, b: CtorList) -> nat
+    decreases a
+{
+    match a {
+        CtorList::Nil => cl_is_nil(b),
+        CtorList::Cons(nm, flds, t) =>
+            if cl_is_nil(b) == 1 { 0 }
+            else if nm == cl_hd_name(b) {
+                if typ_list_eq(flds, cl_hd_fields(b)) == 1 { ctor_list_eq(*t, cl_tl(b)) } else { 0 }
+            } else { 0 },
+    }
+}
+
+// def / dt equality: name + params + ret + body (body via the deep `expr_eq`);
+// name + ctors. Non-recursive (struct-field projections + the list/expr eqs).
+pub open spec fn def_eq(a: DefData, b: DefData) -> nat {
+    if a.name == b.name {
+        if param_list_eq(a.params, b.params) == 1 {
+            if typ_eq(a.ret, b.ret) == 1 { expr_eq(a.body, b.body) } else { 0 }
+        } else { 0 }
+    } else { 0 }
+}
+pub open spec fn dt_eq(a: DtData, b: DtData) -> nat {
+    if a.name == b.name { ctor_list_eq(a.ctors, b.ctors) } else { 0 }
 }
 
 // In-crate kernel-computation guard for the expression mirror: the W6a
@@ -1482,6 +1622,102 @@ proof fn defs_expr_vocab_kernel_computes()
                     Box::new(RawExp::Var(15, TypData::TyNat)), Box::new(RawExp::Var(15, TypData::TyNat)))))),
             ExprData::Forall(15, TypData::TyInt,          // BUG: binder Nat→Int
                 Box::new(ExprData::BinOp(0, Box::new(ExprData::Atom(15)), Box::new(ExprData::Atom(15)))))
+        ) == 0
+by { decide }
+
+// W7: in-crate kernel-computation guard for the DEF-HEADER layer — pins
+// `render_def`/`render_dt` + `def_eq`/`dt_eq` (and the `param_list_eq`/
+// `typ_list_eq`/`ctor_list_eq` list eqs) against the landed code. A def with a
+// self-recursive App body (§7 Q2: `def_eq` is syntactic — the App(20) callee is
+// compared as a node, never unfolded) + the REAL `Tree` datatype (§7 Q4: the
+// Box-vs-Int positional-field kill). Each correct=1 + mutation=0, decide-reducible.
+proof fn defs_mirror_kernel_computes()
+    ensures
+        // def_eq: header + self-recursive body `f(n) = n + f(n)` (name 20,
+        // param (1:Nat), ret Nat). render_def copies the header, renders the
+        // body via render_exp; the App(20) callee is NOT reduced.
+        def_eq(
+            render_def(RawDef {
+                name: 20,
+                params: ParamList::Cons(1, TypData::TyNat, Box::new(ParamList::Nil)),
+                ret: TypData::TyNat,
+                body: RawExp::BinOp(6, TypData::TyNat,
+                    Box::new(RawExp::Var(1, TypData::TyNat)),
+                    Box::new(RawExp::Call(20, TypData::TyNat,
+                        Box::new(RawExp::Var(1, TypData::TyNat)), TypData::TyNat))),
+            }),
+            DefData {
+                name: 20,
+                params: ParamList::Cons(1, TypData::TyNat, Box::new(ParamList::Nil)),
+                ret: TypData::TyNat,
+                body: ExprData::BinOp(6, Box::new(ExprData::Atom(1)),
+                    Box::new(ExprData::App(20, Box::new(ExprData::Atom(1))))),
+            }
+        ) == 1,
+        // kill: wrong PARAM TYPE (Nat → Int) — the typed-param bug (§7 Q4).
+        def_eq(
+            render_def(RawDef {
+                name: 20,
+                params: ParamList::Cons(1, TypData::TyNat, Box::new(ParamList::Nil)),
+                ret: TypData::TyNat,
+                body: RawExp::Var(1, TypData::TyNat),
+            }),
+            DefData {
+                name: 20,
+                params: ParamList::Cons(1, TypData::TyInt, Box::new(ParamList::Nil)),  // BUG: Nat→Int
+                ret: TypData::TyNat,
+                body: ExprData::Atom(1),
+            }
+        ) == 0,
+        // kill: wrong BODY (recursive call dropped) — the App(20) present in the
+        // reference, an Atom in the mutation.
+        def_eq(
+            render_def(RawDef {
+                name: 20,
+                params: ParamList::Cons(1, TypData::TyNat, Box::new(ParamList::Nil)),
+                ret: TypData::TyNat,
+                body: RawExp::BinOp(6, TypData::TyNat,
+                    Box::new(RawExp::Var(1, TypData::TyNat)),
+                    Box::new(RawExp::Call(20, TypData::TyNat,
+                        Box::new(RawExp::Var(1, TypData::TyNat)), TypData::TyNat))),
+            }),
+            DefData {
+                name: 20,
+                params: ParamList::Cons(1, TypData::TyNat, Box::new(ParamList::Nil)),
+                ret: TypData::TyNat,
+                body: ExprData::BinOp(6, Box::new(ExprData::Atom(1)),
+                    Box::new(ExprData::Atom(1))),   // BUG: recursive App dropped
+            }
+        ) == 0,
+        // dt_eq: the REAL `Tree = Leaf(Int) | Node(Box Tree, Box Tree)`.
+        dt_eq(
+            render_dt(RawDt {
+                name: 100,
+                ctors: CtorList::Cons(30, TypList::Cons(TypData::TyInt, Box::new(TypList::Nil)),
+                    Box::new(CtorList::Cons(31,
+                        TypList::Cons(TypData::TyBox(100), Box::new(TypList::Cons(TypData::TyBox(100), Box::new(TypList::Nil)))),
+                        Box::new(CtorList::Nil)))),
+            }),
+            DtData {
+                name: 100,
+                ctors: CtorList::Cons(30, TypList::Cons(TypData::TyInt, Box::new(TypList::Nil)),
+                    Box::new(CtorList::Cons(31,
+                        TypList::Cons(TypData::TyBox(100), Box::new(TypList::Cons(TypData::TyBox(100), Box::new(TypList::Nil)))),
+                        Box::new(CtorList::Nil)))),
+            }
+        ) == 1,
+        // kill: Leaf field Int → Box<Tree> (the Box-vs-Int / positional-field kill).
+        dt_eq(
+            render_dt(RawDt {
+                name: 100,
+                ctors: CtorList::Cons(30, TypList::Cons(TypData::TyInt, Box::new(TypList::Nil)),
+                    Box::new(CtorList::Nil)),
+            }),
+            DtData {
+                name: 100,
+                ctors: CtorList::Cons(30, TypList::Cons(TypData::TyBox(100), Box::new(TypList::Nil)),  // BUG: Int→Box
+                    Box::new(CtorList::Nil)),
+            }
         ) == 0
 by { decide }
 
