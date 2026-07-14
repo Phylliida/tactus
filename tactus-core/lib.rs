@@ -34,8 +34,14 @@
 //!   (`decrease_oblig`). refWp havocs the pre-loop lets, re-quantifies
 //!   the modified locals, and re-closes each invariant + the decrease at
 //!   body end — mirroring production's `walk_loop` (finding-3).
-//! * `Call` carries the result binder `dest` + its `dest_typ` leaf
-//!   (ensures-hypotheses bind the call result).
+//! * `Call` carries the requires obligations (`reqs`) and the WHOLE
+//!   post-call frame (`post: FrameList`) production's
+//!   `push_post_call_frames` computes — "lowering the mirror"
+//!   (DESIGN-W2-refwp.md §2.6): the post-call frame becomes explicit
+//!   EVIDENCE the serializer transcribes (the naive ∀-path OR the #128
+//!   ret-eq path in one uniform slot), not intent refWp re-derives, so
+//!   refWp's Call arm is a pass-through and the `decide` bridge validates
+//!   the serializer's replication against production.
 //! * `Ret` carries a `LeafList` — one annotated-ensures obligation leaf
 //!   per postcondition, rendered at the return site — plus a `RetBind`
 //!   (finding-4): the `let <ret> := <e>` binding production prepends to
@@ -127,10 +133,22 @@ pub enum StmData {
     Assume(u64),
     /// StmX::Assign — (dest local leaf, rhs leaf).
     Assign(u64, u64),
-    /// StmX::Call, contract view: instantiated requires (obligations)
-    /// and ensures (assumptions after the call), plus the result binder
-    /// `dest` and its type leaf `dest_typ` (frameAfter binds the result).
-    Call { reqs: Box<LeafList>, enss: Box<LeafList>, dest: u64, dest_typ: u64 },
+    /// StmX::Call — the requires OBLIGATIONS (`reqs`, instantiated at the
+    /// call's actual args) and the entire POST-CALL FRAME (`post`) the
+    /// walker appends for whatever FOLLOWS the call. "Lowering the mirror"
+    /// (DESIGN-W2-refwp.md §2.6): `post` is the frame delta production's
+    /// `push_post_call_frames` computes, carried as explicit evidence in one
+    /// uniform slot — EITHER the naive ∀-path
+    /// (`FBind(dest, ret_typ, [FHyp(ret_bound)] FHyp(ens))`) OR the #128
+    /// ret-eq path (`[FHyp(E_bound)] [FHyp(rest)] FLet(dest, E)`, chosen when
+    /// a callee ensures conjunct is `r == E` with `E ∌ r`). refWp is then a
+    /// pass-through — `frame_after` appends `post` verbatim, `wp_stm` closes
+    /// each req — so the `decide` bridge validates the serializer's
+    /// `push_post_call_frames` replication against production (non-circular:
+    /// the serializer recomputes the frame, it does not copy production's),
+    /// and this generalizes to the coming `&mut` post-state / prophecy
+    /// frames instead of perpetually growing refWp's Call arm.
+    Call { reqs: Box<LeafList>, post: Box<FrameList> },
     /// StmX::DeadEnd — verify inside, discard facts after.
     DeadEnd(Box<StmData>),
     /// StmX::Return — annotated ensures obligation leaves (one span_mark'd
@@ -304,7 +322,10 @@ pub open spec fn stm_size(s: StmData) -> nat
         StmData::Assert(_o, _h) => 1,
         StmData::Assume(_e) => 1,
         StmData::Assign(_d, _r) => 1,
-        StmData::Call { reqs, enss, dest: _, dest_typ: _ } => 1 + leaf_len(*reqs) + leaf_len(*enss),
+        // 1 + |reqs| (a LeafList) + frame_len(post) (the FrameList delta) —
+        // mirrors the serializer's `stm_size_of` token count: stmt heads +
+        // LeafList `Cons` (reqs) + FrameList `FBind`/`FHyp`/`FLet` (post).
+        StmData::Call { reqs, post } => 1 + leaf_len(*reqs) + frame_len(*post),
         StmData::DeadEnd(b) => 1 + stm_size(*b),
         StmData::Ret(es, _rb) => 1 + leaf_len(*es),
         StmData::If(_c, _nc, t, e) => 1 + stm_size(*t) + stm_size(*e),
@@ -736,8 +757,9 @@ pub open spec fn frame_after(f: FrameList, s: StmData) -> FrameList
         StmData::Assert(_o, h) => frame_append(f, FrameList::FHyp(h, Box::new(FrameList::FNil))),
         StmData::Assume(e) => frame_append(f, FrameList::FHyp(e, Box::new(FrameList::FNil))),
         StmData::Assign(x, rhs) => frame_append(f, FrameList::FLet(x, rhs, Box::new(FrameList::FNil))),
-        StmData::Call { reqs: _, enss, dest, dest_typ } =>
-            frame_append(f, FrameList::FBind(dest, dest_typ, Box::new(hyps_of_leaves(*enss)))),
+        // Pass-through: append the serializer-transcribed post-call frame
+        // verbatim (the ∀-path or #128 ret-eq shape both live in `post`).
+        StmData::Call { reqs: _, post } => frame_append(f, *post),
         StmData::DeadEnd(_b) => f,          // facts discarded
         StmData::Ret(_es, _rb) => f,        // control does not continue
         // If — join frames not merged at stage A (§5.1), EXCEPT the
@@ -792,7 +814,7 @@ pub open spec fn wp_stm(f: FrameList, s: StmData) -> GoalList
             GoalList::Cons(Box::new(close(f, o)), Box::new(GoalList::Nil)),
         StmData::Assume(_e) => GoalList::Nil,
         StmData::Assign(_x, _rhs) => GoalList::Nil,
-        StmData::Call { reqs, enss: _, dest: _, dest_typ: _ } => close_each(f, *reqs),
+        StmData::Call { reqs, post: _ } => close_each(f, *reqs),
         StmData::DeadEnd(b) => wp_stm(f, *b),
         StmData::Ret(es, rb) => close_each(ret_frame(f, rb), *es),
         StmData::If(c, nc, t, e) =>
@@ -1338,6 +1360,95 @@ proof fn ref_wp_if_fallthrough_divergence()
         ) == 1
 by { decide }
 
+// ── bootstrap-02b: the Call pass-through, both post-frame shapes ────
+//
+// "Lowering the mirror" (DESIGN-W2-refwp.md §2.6): the reshaped
+// `Call { reqs, post: FrameList }` makes refWp a pass-through — `wp_stm`
+// closes each req obligation under the pre-call frame, `frame_after`
+// appends `post` verbatim — so BOTH production post-call frame shapes
+// (`push_post_call_frames`) reproduce production's goals through the SAME
+// refWp arm. This is the `double_exec`-shaped validation the design note
+// asks for (one ret-eq, one ∀-path) before the serializer's `post`-builder
+// is wired.
+//
+// Model: `let a = double_exec(x); assert Q` under a one-hyp ambient frame
+// `[100]` (standing in for the seed telescope). The call emits ONE
+// precondition obligation (`double_exec`'s requires, instantiated →
+// CallPrecondition leaf 7) and appends `post`; the following assert closes
+// its obligation (leaf 11) under `[100] ++ post`.
+//
+// * RET-EQ (#128): `double_exec` ensures `r == 2*x`, so production drops the
+//   `∀ a`: `post = FHyp(E_bound=9) FLet(a=8, 2*x=10)`. The continuation is
+//   `100 → (0≤2x∧2x<2^64) → let a := 2x; Q` — no quantifier.
+// * ∀-PATH: a callee whose ensures is NOT a ret-eq (e.g. `r > x`) quantifies
+//   the result: `post = FBind(a=8, u64=1) FHyp(ret_bound=9) FHyp(ens=13)`.
+//   The continuation is `100 → ∀a, (0≤a∧a<2^64) → (a>x) → Q`.
+//
+// Both certify the SAME `Call { reqs: [7], post }` node through the pass-
+// through — the only difference is the `post` the serializer will build.
+// Mutation-kill (negative control the card asks for): swapping the bound
+// value E in `let a := E` (10 → 99) flips `goals_eq` to 0.
+proof fn ref_wp_call_pass_through()
+    ensures
+        // RET-EQ post: no ∀; E_bound hyp then a `let a := 2*x`.
+        goals_eq(
+            wp_stm(
+                FrameList::FHyp(100, Box::new(FrameList::FNil)),
+                StmData::Seq(
+                    Box::new(StmData::Call {
+                        reqs: Box::new(LeafList::Cons(7, Box::new(LeafList::Nil))),
+                        post: Box::new(FrameList::FHyp(9,
+                            Box::new(FrameList::FLet(8, 10, Box::new(FrameList::FNil))))),
+                    }),
+                    Box::new(StmData::Assert(11, 12)))),
+            GoalList::Cons(
+                Box::new(GoalData::Imp(100, Box::new(GoalData::Leaf(7)))),
+                Box::new(GoalList::Cons(
+                    Box::new(GoalData::Imp(100, Box::new(GoalData::Imp(9,
+                        Box::new(GoalData::Let(8, 10, Box::new(GoalData::Leaf(11)))))))),
+                    Box::new(GoalList::Nil)))),
+        ) == 1,
+        // ∀-PATH post: quantify the result, then ret_bound → ens hyps.
+        goals_eq(
+            wp_stm(
+                FrameList::FHyp(100, Box::new(FrameList::FNil)),
+                StmData::Seq(
+                    Box::new(StmData::Call {
+                        reqs: Box::new(LeafList::Cons(7, Box::new(LeafList::Nil))),
+                        post: Box::new(FrameList::FBind(8, 1,
+                            Box::new(FrameList::FHyp(9,
+                                Box::new(FrameList::FHyp(13, Box::new(FrameList::FNil))))))),
+                    }),
+                    Box::new(StmData::Assert(11, 12)))),
+            GoalList::Cons(
+                Box::new(GoalData::Imp(100, Box::new(GoalData::Leaf(7)))),
+                Box::new(GoalList::Cons(
+                    Box::new(GoalData::Imp(100, Box::new(GoalData::All(8, 1,
+                        Box::new(GoalData::Imp(9, Box::new(GoalData::Imp(13,
+                            Box::new(GoalData::Leaf(11)))))))))),
+                    Box::new(GoalList::Nil)))),
+        ) == 1,
+        // Mutation-kill: the ret-eq goals with a WRONG let value (10 → 99)
+        // must NOT match — the bridge is sensitive to the transcribed E.
+        goals_eq(
+            wp_stm(
+                FrameList::FHyp(100, Box::new(FrameList::FNil)),
+                StmData::Seq(
+                    Box::new(StmData::Call {
+                        reqs: Box::new(LeafList::Cons(7, Box::new(LeafList::Nil))),
+                        post: Box::new(FrameList::FHyp(9,
+                            Box::new(FrameList::FLet(8, 10, Box::new(FrameList::FNil))))),
+                    }),
+                    Box::new(StmData::Assert(11, 12)))),
+            GoalList::Cons(
+                Box::new(GoalData::Imp(100, Box::new(GoalData::Leaf(7)))),
+                Box::new(GoalList::Cons(
+                    Box::new(GoalData::Imp(100, Box::new(GoalData::Imp(9,
+                        Box::new(GoalData::Let(8, 99, Box::new(GoalData::Leaf(11)))))))),
+                    Box::new(GoalList::Nil)))),
+        ) == 0
+by { decide }
+
 // Mutation sensitivity (DESIGN §2.4.2): goal_eq flips on a single leaf-id
 // change, a binder-id change, or a constructor (structure) change.
 proof fn goal_eq_strictness()
@@ -1379,13 +1490,11 @@ proof fn amended_shapes_kernel_compute()
             decrease_oblig: 8,
             body: Box::new(StmData::Skip),
         }) == 4,
-        // Call: 1 + |reqs=1| + |enss=0| == 2
+        // Call: 1 + |reqs=1| + frame_len(post = FBind(5,6,FNil) = 1) == 3
         stm_size(StmData::Call {
             reqs: Box::new(LeafList::Cons(0, Box::new(LeafList::Nil))),
-            enss: Box::new(LeafList::Nil),
-            dest: 5,
-            dest_typ: 6,
-        }) == 2,
+            post: Box::new(FrameList::FBind(5, 6, Box::new(FrameList::FNil))),
+        }) == 3,
         // Ret: 1 + |es=2| == 3 (RetBind adds no statements to the size).
         stm_size(StmData::Ret(Box::new(LeafList::Cons(0,
             Box::new(LeafList::Cons(1, Box::new(LeafList::Nil))))), RetBind::RetNone)) == 3,
