@@ -11,6 +11,7 @@ import lib__ref_wp_seed_and_assert
 import lib__ref_wp_seq_threads_frame
 import lib__ref_wp_add_capped_seed_spine
 import lib__ref_wp_ret_return_binding
+import lib__ref_wp_sum_to_loop
 import lib__goal_eq_strictness
 import lib__amended_shapes_kernel_compute
 set_option linter.unusedVariables false
@@ -51,6 +52,9 @@ noncomputable def lib.ref_wp_add_capped_seed_spine_closed : lib.ref_wp_add_cappe
 noncomputable def lib.ref_wp_ret_return_binding_closed : lib.ref_wp_ret_return_binding_stmt :=
   lib.ref_wp_ret_return_binding
 #tactus_check_axioms lib.ref_wp_ret_return_binding_closed []
+noncomputable def lib.ref_wp_sum_to_loop_closed : lib.ref_wp_sum_to_loop_stmt :=
+  lib.ref_wp_sum_to_loop
+#tactus_check_axioms lib.ref_wp_sum_to_loop_closed []
 noncomputable def lib.goal_eq_strictness_closed : lib.goal_eq_strictness_stmt :=
   lib.goal_eq_strictness
 #tactus_check_axioms lib.goal_eq_strictness_closed []
