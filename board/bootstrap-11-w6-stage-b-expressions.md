@@ -3,7 +3,7 @@ title: "W6 — stage B: deep expressions/types join the certificate"
 status: in_progress
 claimed_by: opus-b11
 created: 2026-07-13T19:38:00Z
-updated: 2026-07-14T00:30:00Z
+updated: 2026-07-14T09:35:00Z
 ---
 
 ## Description
@@ -108,6 +108,18 @@ mis-rendered leaf fails the bridge (mutation-kill at expression level).
   into the obligation-leaf emit so `close`/the emitter produce `LeafE(ExprData)`
   and the bridge `decide`s `expr_eq` on live fixtures; the fixture census will
   surface any `ed-typeannot`/deref gaps to resolve there.
+
+- (2026-07-14, opus-b23) **W6d opened as `bootstrap-23`** (board file created).
+  Extracted the obligation-leaf coverage map for all 13 fixture certs from disk
+  (the expression-level roadmap) and confirmed the symmetric-deepen architecture
+  is forced (both sides must emit `LeafE`; local model concurs). Surfaced five
+  gap classes — two the design docs missed (**G1** `True`/`False` bool literals,
+  **G3** struct/tuple field projection) plus **G2** which CORRECTS the frozen
+  W6b shape (the ref-side `.deref` is a DERIVED decoration-coercion, not the
+  explicit `RawExp::Deref` node the W6a probe/`render_exp` assume — see
+  `expr_shared.rs:1038-1051`). G4 (`max_u64` If-fallthrough `Let`-in-leaf)
+  deferred to W6e. Full map + phased plan (W6d.0 SST-shape confirm → W6d.1
+  shared-crate batch → W6d.2 wiring → W6d.3 bridge) in `bootstrap-23`.
 
 ## Writeup
 
