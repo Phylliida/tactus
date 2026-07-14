@@ -1022,6 +1022,42 @@ impl<'a> Serializer<'a> {
                     paren(&ty)
                 ))
             }
+            // W7c (bootstrap-29): a quantifier body `∀/∃ (b : bty), body`. VIR
+            // carries ALL binders of one quantifier in a single `Quant`; nest
+            // them right-to-left into single-binder `ForallR`/`ExistsR` (the
+            // W7b vocab is single-binder) — `∀ x y, P` ⟶ `ForallR x (ForallR y
+            // P)`. Production's `ExprNode::Forall{binders, body}` arm does the
+            // IDENTICAL right-to-left nesting over the SAME `q_binders.iter()`
+            // order (`vir_var_binders_to_ast` preserves it), so `def_eq` agrees
+            // by construction. Binder-NAME ids intern via `binder_id` (=
+            // production's `from_var_ident`); binder-TYPE via `typ_data` (the
+            // same `TypData` production's `ltyp_to_typdata` recognizer
+            // re-derives from the rendered binder type). An empty binder list
+            // can't occur for a real quantifier → fail loud; a binder type
+            // `typ_data` can't map (e.g. a bare type param) fails loud there.
+            ExprX::Quant(quant, q_binders, body) => {
+                if q_binders.is_empty() {
+                    return Err("rawvir-quant-empty".to_string());
+                }
+                let ctor = match quant.quant {
+                    air::ast::Quant::Forall => "ForallR",
+                    air::ast::Quant::Exists => "ExistsR",
+                };
+                let mut acc = self.raw_vir_exp(body)?;
+                for b in q_binders.iter().rev() {
+                    let bid = self.binder_id(&b.name);
+                    let bty = self.typ_data(&b.a)?;
+                    acc = format!(
+                        "({}.RawExp.{} {} {} {})",
+                        NS,
+                        ctor,
+                        bid,
+                        paren(&bty),
+                        box_raw(&acc)
+                    );
+                }
+                Ok(acc)
+            }
             _ => Err(format!("rawvir-{}", vir_expr_construct_tag(&e.x))),
         }
     }
@@ -1302,6 +1338,20 @@ impl<'a> Serializer<'a> {
                     box_(&arm_list)
                 ))
             }
+            // W7c (bootstrap-29): a quantifier body `∀/∃ (b : bty), body`.
+            // Production emits ONE `Forall`/`Exists` node carrying ALL binders;
+            // `lquant_to_exprdata` nests them right-to-left into single-binder
+            // `ExprData::Forall`/`Exists` — the identical nesting the reference
+            // `raw_vir_exp` `Quant` arm does over the SAME binder order, so
+            // `def_eq` agrees by construction. Verdict-neutral on the current
+            // emit path: a goal leaf reaches `lexpr_to_exprdata` only via the
+            // `deep_ids` gate (`goal_data`), which requires the reference SST
+            // `raw_exp` to have gone deep on the matching obligation — but
+            // `raw_exp` has NO quantifier arm (`ExpX::Bind` ⟶ `raw-bind`
+            // fail-loud), so a quantifier-cored obligation never enters
+            // `deep_ids`. The arm activates only at the W7d def-body entry point.
+            ExprNode::Forall { binders, body } => self.lquant_to_exprdata("Forall", binders, body),
+            ExprNode::Exists { binders, body } => self.lquant_to_exprdata("Exists", binders, body),
             _ => Err(format!("ed-{}", lexpr_construct_tag(&e.node))),
         }
     }
@@ -1346,6 +1396,91 @@ impl<'a> Serializer<'a> {
         match pat {
             LPattern::Var(name) => Ok(self.text_leaf(name.as_str())),
             _ => Err("ed-field-pat".to_string()),
+        }
+    }
+
+    /// Fold a production quantifier node (`Forall`/`Exists`, which carries ALL
+    /// its binders in one `Vec<Binder>`) into the nested single-binder
+    /// `ExprData::Forall`/`Exists` mirror — right-to-left, so `∀ x y, P` ⟶
+    /// `Forall x (Forall y P)`, matching the reference `raw_vir_exp` `Quant`
+    /// arm's identical nesting over the SAME binder order. Binder-NAME ids
+    /// intern via `text_leaf(from_var_ident)` (= the reference `binder_id`);
+    /// binder-TYPE via `ltyp_to_typdata`. A nameless (instance-bracket) binder
+    /// can't be a quantifier var → fail loud (`ed-quant-noname`); an empty
+    /// binder list likewise (`ed-quant-empty`).
+    fn lquant_to_exprdata(
+        &mut self,
+        ctor: &str,
+        binders: &[crate::lean_ast::Binder],
+        body: &LExpr,
+    ) -> Sr<String> {
+        if binders.is_empty() {
+            return Err("ed-quant-empty".to_string());
+        }
+        let mut acc = self.lexpr_to_exprdata(body)?;
+        for b in binders.iter().rev() {
+            let name = b.name.as_ref().ok_or_else(|| "ed-quant-noname".to_string())?;
+            let bid = self.text_leaf(name.as_str());
+            let bty = self.ltyp_to_typdata(&b.ty)?;
+            acc = format!(
+                "({}.ExprData.{} {} {} {})",
+                NS,
+                ctor,
+                bid,
+                paren(&bty),
+                box_ed(&acc)
+            );
+        }
+        Ok(acc)
+    }
+
+    /// Recognize a production quantifier binder's RENDERED type-`Expr` (built by
+    /// `typ_to_expr`) back to the `lib.TypData` text the reference `typ_data`
+    /// emits from the same VIR `Typ` — the inverse that makes the two sides'
+    /// quantifier binder types agree for `def_eq`. Primitive heads map by name
+    /// (`Prop`→TyBool, `Int`→TyInt, `Nat`→TyNat); a `Tactus.Ref`/`Tactus.MutRef`
+    /// application → `TyRef(intern(pp(inner)))`; any other head (a named
+    /// datatype, bare or applied) → `TyNamed(intern(pp(whole-ty)))`. The interned
+    /// ids agree by construction: production's binder `ty` IS `typ_to_expr(vir)`,
+    /// and the reference's `typ_leaf`/`TyRef`/`TyNamed` id is
+    /// `intern(pp(typ_to_expr(vir)))` off the SAME `self.leaves` table (`typ_leaf`
+    /// = `intern(pp_expr(typ_to_expr(typ)))`; `typ_to_expr` peels Box/Decorate
+    /// transparently, exactly like `typ_data`).
+    ///
+    /// KNOWN GAP (documented, not unsound): `typ_to_expr` collapses BOTH `nat`
+    /// and `usize`/`char` to `Var("Nat")`, but the reference `typ_data` maps only
+    /// true `nat` to `TyNat` (`usize`/`char` → `TyInt`). So a `nat` binder
+    /// certifies; a `usize`/`char` binder yields prod `TyNat` vs ref `TyInt` → the
+    /// bridge SPURIOUSLY fails (uncertifiable, never wrongly passes). Similarly a
+    /// bare type-PARAM binder (`Var("T")`) is indistinguishable from a nullary
+    /// datatype here → maps to `TyNamed`, while the reference `typ_data` fails
+    /// loud on `TypParam`; the reference is the gate (W7d bridges only when BOTH
+    /// sides succeed), so production's extra `TyNamed` is simply unused.
+    /// Disambiguating either would require a `typ_to_expr` change (its own turn).
+    fn ltyp_to_typdata(&mut self, ty: &LExpr) -> Sr<String> {
+        match &ty.node {
+            ExprNode::Var(n) => match n.as_str() {
+                "Prop" => Ok(format!("{}.TypData.TyBool", NS)),
+                "Nat" => Ok(format!("{}.TypData.TyNat", NS)),
+                "Int" => Ok(format!("{}.TypData.TyInt", NS)),
+                _ => {
+                    let id = self.leaves.intern(pp_expr(ty));
+                    Ok(format!("({}.TypData.TyNamed {})", NS, id))
+                }
+            },
+            ExprNode::App { head, args } => {
+                if let ExprNode::Var(h) = &head.node {
+                    if (h.as_str() == "Tactus.Ref" || h.as_str() == "Tactus.MutRef")
+                        && args.len() == 1
+                    {
+                        let id = self.leaves.intern(pp_expr(&args[0]));
+                        return Ok(format!("({}.TypData.TyRef {})", NS, id));
+                    }
+                }
+                let id = self.leaves.intern(pp_expr(ty));
+                Ok(format!("({}.TypData.TyNamed {})", NS, id))
+            }
+            _ => Err("ed-quant-bty".to_string()),
         }
     }
 

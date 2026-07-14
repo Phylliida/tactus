@@ -3,7 +3,7 @@ title: "W7c-ref — reference def-body transcriber on the VIR ExprX surface (raw
 status: in_progress
 claimed_by: opus-w7c-ref
 created: 2026-07-14T23:20:00Z
-updated: 2026-07-14T23:45:00Z
+updated: 2026-07-15T02:20:00Z
 ---
 
 ## Description
@@ -160,6 +160,49 @@ they must match this side's shapes) and W7d (def emission + bridge).
   sides. Remaining hand-off items (2) W7d def-body entry point + e2e `def_eq`
   bridge — the Match arm's REAL cross-side validation — (3) def-header/datatype,
   (4) `sum_tree` Box-deref-in-arm fixture caller, are unchanged.
+
+- (2026-07-15, opus-w7c-quant) **`Quant`→`ForallR`/`ExistsR` arm LANDED on the
+  reference `raw_vir_exp`** (paired with the production `Forall`/`Exists` arms in
+  `bootstrap-28`); lib suite 347→351/0, verdict-neutral. This is the first of the
+  tgt-slice-only remainders (fixture forces no quantifier — the `Quant` arm is
+  reachable only from the W7d def-body entry point).
+  - **Arm** (`sst_serialize.rs`, before the `rawvir-` census fallback): VIR
+    `ExprX::Quant(quant, q_binders, body)` — VIR carries ALL binders of one
+    quantifier in a single `Quant`, so nest them **right-to-left** into the
+    single-binder `RawExp::ForallR`/`ExistsR` (W7b vocab is single-binder):
+    `∀ x y, P` ⟶ `ForallR x (ForallR y P)`. `quant.quant` (an `air::ast::Quant`)
+    picks the ctor. Binder-NAME ids via `binder_id` (= `from_var_ident`, prod's
+    interning); binder-TYPE via `typ_data`; empty binder list → fail loud
+    (`rawvir-quant-empty`); a binder type `typ_data` can't map (bare type param
+    etc.) fails loud there. The nesting ORDER matches production's identical
+    right-to-left fold over the SAME `q_binders.iter()` order (production's
+    `ExprNode::Forall{binders}` is built by `vir_var_binders_to_ast`, an
+    order-preserving map) ⟹ `def_eq` agrees by construction.
+  - **§7-Q-style co-design fork RESOLVED (Danielle-endorsed, 2026-07-15):** the
+    production side must invert the RENDERED binder type-`Expr` (prod
+    `Binder.ty = typ_to_expr(vir)`) back to the SAME `TypData` the reference
+    `typ_data` emits. Landed as `ltyp_to_typdata` (bootstrap-28). Primitive heads
+    map by name; named datatype → `TyNamed(intern(pp(ty)))` and `&T` →
+    `TyRef(intern(pp(inner)))` — both agree with `typ_data`'s
+    `typ_leaf = intern(pp(typ_to_expr(vir)))` off the SHARED `self.leaves` table.
+    **Known gap (documented, NOT unsound):** `typ_to_expr` collapses `usize`/
+    `char`→`Var("Nat")` while `typ_data` maps them to `TyInt` (only true `nat`→
+    `TyNat`) ⟹ a `nat` binder certifies but a `usize`/`char` binder SPURIOUSLY
+    fails the bridge (uncertifiable, never wrongly passes). Same for a bare
+    type-PARAM binder (indistinguishable from a nullary datatype on the prod
+    side → `TyNamed`, while the ref `typ_data` fails loud on `TypParam`; the ref
+    is the gate). Disambiguating needs a `typ_to_expr` change — its own turn.
+  - **Tests (2 new here):** `raw_vir_exp_forall_nests_binders` (∀ i j : int,
+    pins the right-to-left `ForallR` nesting + `TyInt` binder types +
+    `TyBool` body), `raw_vir_exp_exists_single_binder` (pins the `ExistsR`
+    ctor). Verdict-neutral: `raw_vir_exp` is still dead code (no emit-path wire).
+  - **NEXT (unchanged from below + the surviving W7c remainders):** multi-arg
+    `Call`→`CallN` (the `raw_vir_exp` `Call` arm's `args.len()!=1` fail-loud) —
+    deferred by Danielle because a faithful `render_list` needs per-arg `TypData`
+    (auto-borrow deref), a cache-churning `RawList` edit (own batch, like W7b);
+    then datatype (`RawDt`/`DtData`) + def-header (`RawDef`/`DefData`), separate
+    VIR input surfaces; then W7d wires the def-body entry point + e2e `def_eq`
+    bridge (the real cross-side validation of Match AND the new Quant arm).
 
 ## Writeup
 _partial (reference transcriber core landed). The def-body REFERENCE transcriber

@@ -3,7 +3,7 @@ title: "W7c — serializer transcriptions for the def-body constructors (Ite/Mat
 status: in_progress
 claimed_by: opus-w7c
 created: 2026-07-14T22:10:00Z
-updated: 2026-07-15T00:30:00Z
+updated: 2026-07-15T02:20:00Z
 ---
 
 ## Description
@@ -224,15 +224,71 @@ emission + bridge `def_eq`/`dt_eq`), W7e (mutation-kill).
     W7d/tgt needs them; the fixture-covering set (leaf/Ite/Match) is now COMPLETE
     on both sides.
 
+- (2026-07-15, opus-w7c-quant) **`Forall`/`Exists` arms LANDED on the production
+  `lexpr_to_exprdata`** (paired with the reference `raw_vir_exp` `Quant` arm,
+  bootstrap-29); lib suite 347→351/0, verdict-neutral. First of the tgt-slice-only
+  remainders after the fixture set (leaf/Ite/Match). Danielle-endorsed fork
+  decision: do Forall/Exists first (no `tactus-core` edit — `render_exp`'s
+  `ForallR`/`ExistsR` + `render` already landed in W7b), defer AppN (its faithful
+  `render_list` needs a cache-churning `RawList` per-arg-`TypData` edit).
+  - **Arms** (`sst_serialize.rs`, after the `Match` arm): `ExprNode::Forall
+    {binders, body}` / `Exists{..}` → `lquant_to_exprdata("Forall"/"Exists", ..)`.
+    Production emits ONE node carrying ALL binders; the helper nests them
+    **right-to-left** into single-binder `ExprData::Forall`/`Exists` — the
+    IDENTICAL nesting the reference `raw_vir_exp` `Quant` arm does over the SAME
+    binder order (`vir_var_binders_to_ast` is order-preserving) ⟹ `def_eq` agrees
+    by construction. Binder-NAME ids via `text_leaf(from_var_ident)` (= ref
+    `binder_id`); a nameless (instance-bracket) binder → fail loud
+    (`ed-quant-noname`); empty list → `ed-quant-empty`.
+  - **`ltyp_to_typdata` — the binder-TYPE recognizer (the §7-Q3-style fork,
+    RESOLVED).** Prod `Binder.ty` is a RENDERED type-`Expr` (`typ_to_expr(vir)`),
+    not a `TypData`; the recognizer inverts it back to the SAME `TypData` the
+    reference `typ_data` emits from the VIR `Typ`: `Var("Prop")`→TyBool,
+    `Var("Int")`→TyInt, `Var("Nat")`→TyNat; `Tactus.Ref`/`MutRef` app →
+    `TyRef(intern(pp(inner)))`; any other head → `TyNamed(intern(pp(whole)))`.
+    **Id-agreement is BY CONSTRUCTION** — the ref's `typ_leaf`/`TyRef`/`TyNamed`
+    id is `intern(pp(typ_to_expr(vir)))` off the SAME `self.leaves` table, and
+    prod's `Binder.ty` IS `typ_to_expr(vir)`, so `pp` (hence the interned id)
+    coincides; both peel Box/Decorate transparently. **Documented gap (NOT
+    unsound):** `typ_to_expr` collapses `usize`/`char`→`Var("Nat")` while
+    `typ_data` maps them to `TyInt` (only true `nat`→`TyNat`), so a `usize`/`char`
+    (or bare type-param) binder SPURIOUSLY fails the bridge — uncertifiable,
+    never wrongly passes. `nat`/`int`/`bool`/named-datatype binders certify (the
+    common tgt-slice case). Disambiguating needs a `typ_to_expr` change (own turn).
+  - **Verdict-neutral — confirmed, no rebuild.** `lexpr_to_exprdata` enters the
+    live emit path only via `goal_data`'s `deep_ids` gate: a goal leaf is
+    transcribed only if the matching obligation went DEEP on the reference SST
+    side (`raw_exp`). But `raw_exp` has NO quantifier arm (`ExpX::Bind` ⟶
+    `raw-bind` fail-loud), so a quantifier-cored obligation never enters
+    `deep_ids` ⟹ the Forall/Exists arm is UNREACHABLE today (activates only at
+    the W7d def-body entry point). The whole golden suite (`golden_add_capped_cert`
+    et al.) stays byte-identical at 351/0. (Note this is a DIFFERENT neutrality
+    mechanism than Match's: Match was unreachable because SST desugars it;
+    Forall/Exists because the SST reference has no quantifier arm.)
+  - **Tests (2 new here):** `lexpr_to_exprdata_forall_nests_binders` (∀ i j : Int,
+    pins the right-to-left `ExprData::Forall` nesting + `Int`-binder→`TyInt`
+    recognition + interning order), `ltyp_to_typdata_recognizes_types`
+    (Prop/Nat/Int/named-datatype/`Tactus.Ref`/fail-loud — pins the recognizer
+    contract incl. the documented `Nat`-gap boundary).
+  - **NEXT (surviving W7c remainders):** multi-arg `AppN` (needs the deferred
+    cache-churning `RawList` per-arg-`TypData` edit for a faithful auto-borrow
+    `render_list`; single-arg `App`/`Call` already covers the fixture) + datatype
+    (`RawDt`/`DtData`) + def-header — then W7d wires the def-body entry point + the
+    e2e `def_eq` bridge (the real cross-side validation of Match AND Forall/Exists).
+
 ## Writeup
 
-_partial — `Ite` + `Match` constructors landed on both transcriber sides
-(verdict-neutral, tests green). The fixture-covering body set (leaf/Ite/Match) is
-complete on both sides as of 2026-07-15. Remaining: Forall/Exists, multi-arg
-AppN (+ deferred per-arg coercion), datatype + def-header transcription. See
+_partial — `Ite` + `Match` + `Forall`/`Exists` constructors landed on both
+transcriber sides (verdict-neutral, tests green, lib suite 351/0). The
+fixture-covering body set (leaf/Ite/Match) is complete; the first tgt-slice-only
+constructor (quantifiers) is now done too, incl. the `ltyp_to_typdata` binder-type
+recognizer (the §7-Q3-style fork, resolved with a documented usize/char→Nat
+incompleteness that is uncertifiable-not-unsound). Remaining: multi-arg AppN
+(deferred — its faithful `render_list` needs a cache-churning `RawList` per-arg
+`TypData` edit), datatype (`RawDt`/`DtData`) + def-header transcription. See
 Progress for the per-constructor open questions and the verdict-neutrality proof
-method (fixture source analysis: confirm no obligation-position `ExpX::<new-node>`
-before landing each shared `raw_exp` arm)._
+method (Ite/Match: no obligation-position `ExpX::<new-node>`; Forall/Exists: the
+SST `raw_exp` has no quantifier arm ⟹ never in `deep_ids`)._
 
 _(superseded) partial — `Ite` constructor landed on both transcriber sides (verdict-neutral,
 tests green). Remaining: Match, Forall/Exists, multi-arg AppN (+ deferred
