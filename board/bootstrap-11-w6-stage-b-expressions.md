@@ -121,9 +121,24 @@ mis-rendered leaf fails the bridge (mutation-kill at expression level).
   deferred to W6e. Full map + phased plan (W6d.0 SST-shape confirm → W6d.1
   shared-crate batch → W6d.2 wiring → W6d.3 bridge) in `bootstrap-23`.
 
+- (2026-07-14, opus-b27) **W6d COMPLETE (`bootstrap-23`) — the deep bridge is
+  LIVE end-to-end.** Rebuilt the binary + re-emitted all fixtures + probe9 green
+  (12/13 close-ok DEEP, max_u64 hfail-ok/G4), verdict-neutral (flag-off ==
+  flag-on), golden regenerated (338 tests), deep-mutation non-vacuity confirmed.
+  `GoalData::LeafE(ExprData)` on both sides, `refWp` closing via
+  `render_exp(RawExp)`, bridge `decide`s `expr_eq` — the Friction-2
+  inconsistent-coercion class is caught at expression granularity across the
+  whole coverable corpus (head_exec G2 deref, mk_point/swap_pair G3 field,
+  add_capped G6 HasType, sum_to cast class). **Only remaining rung = W6e**
+  (`bootstrap-24`, created this turn): the systematic expression-level
+  mutation-kill (drop `Int.toNat`/`.deref`/accessor/width on the prod side ⟹
+  bridge must FLIP) + G4 `If`/`Let`/`Not` fold-in (flips max_u64 to close-ok).
+  This umbrella stays in_progress until W6e closes.
+
 ## Writeup
 
 _when done: findings, how the code works, assumptions made. Parent design doc:
 `DESIGN-W6-stageB.md`. Ladder: W6a (probe) → W6b (mirror types + reference
 renderer, the shared-crate edit) → W6c (serializer transcriptions) → W6d
-(bridge deepened) → W6e (mutation-kill + Tier-2)._
+(bridge deepened, DONE `bootstrap-23`) → W6e (mutation-kill + Tier-2,
+`bootstrap-24`)._
