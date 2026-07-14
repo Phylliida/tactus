@@ -48,10 +48,18 @@ export LEAN_PATH="$CORE_OUT:$PRELUDE"
 
 # DOCUMENTED honest-fails: a serializer leaf-rendering divergence the bridge
 # SOUNDLY does not close. Each has a recorded, pinpoint-proved reason.
+#
+# NOTE (bootstrap-18, 2026-07-13): runtime__impl__4__clone was FIXED and is now
+# expected-CLOSE. Its RetBind value (the return-var `let _return := *self`) is a
+# bare `Var(self) : &RuntimeSymbol` whose `.deref` comes from production's
+# per-leaf return-typ coercion (lift_if_value_coerced base case → coerce_leaf),
+# NOT from binder_typs (a bare Var carries no explicit *self to deref). The
+# serializer now applies that SAME coercion — coerce_lexpr(render(e), &e.typ,
+# ret_typ) — in the Return arm, so the RetBind value renders `self.deref`
+# (leaf 5) and the SST RetLet 4 5 matches the goal's Let 4 5. Removed from the
+# honest-fail set; it must now close-ok.
 honest_fail_reason() {
   case "$1" in
-    runtime__impl__4__clone)
-      printf '%s' 'ref-param deref @ RetBind value (W3, board bootstrap-08). fn clone(self: &RuntimeSymbol). SST RetBind.RetLet(4,0) binds _return := leaf0 ⟦self⟧; production binds _return := leaf5 ⟦self.deref⟧. Pinpoint-proved the RetLet value leaf (0 vs 5) is the SOLE divergence: goals_eq refWp (goals with Let 4 5 → Let 4 0) = 1 (Pinpoint.lean). Same *self source, different leaf text — the serializer does not apply production'"'"'s &-param *p→p.deref subst at the RetBind-value render site. NEW site, SAME class as head_exec/bootstrap-18 (which is the obligation-leaf site). DESIGN §2.5 leaf rendering not certified; a serializer faithfulness gap, NOT a refWp or production bug.' ;;
     *) printf '%s' '' ;;
   esac
 }

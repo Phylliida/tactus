@@ -121,20 +121,33 @@
 //! ## Trusted-surface caveats (leaf content is opaque; stage A does not
 //! certify it — W6 does)
 //!
-//! * Leaves are rendered by the PRODUCTION renderer
-//!   (`sst_exp_to_ast_checked`, EMPTY `RenderCtx`) then pretty-printed
+//! * Most leaves are rendered by the PRODUCTION renderer with an EMPTY
+//!   `RenderCtx` (`sst_exp_to_ast_checked`), then pretty-printed
 //!   (`lean_pp::pp_expr`) and interned by text: identical text ⇒ same id.
-//!   Leaf-renderer bugs are therefore NOT caught here.
+//!   Obligation leaves (`oblig_leaf` / `neg_oblig_leaf`) and the RetBind
+//!   return value instead use the binder-aware `render_ctx()` (next bullet).
+//!   Leaf-renderer bugs beyond that are NOT caught here.
 //! * Binder id = the interned leaf id of the binder's rendered name.
 //!   The SSA-fresh-per-occurrence discipline (DESIGN-W2-refwp §2.1) is a
 //!   W2 refinement — deferred because N3a's only consumer of ids is
 //!   `stm_size`/`binder_len`, which ignore the id value.
 //! * `Ret` ensures obligations and the `RetBind` return value are rendered
-//!   PRE-substitution and WITHOUT the walker's return-value coercion /
-//!   if-value lifting (a returned `if` or a `&`-coerced value diverges from
-//!   the goal-side render). This is a stage-A caveat: a divergence fails the
-//!   `decide` bridge to CLOSE for that fn, never silent-passes. Simple-var
-//!   and simple-arithmetic returns (add_capped `s`, sum_to `acc`) match.
+//!   through `render_ctx()` — byte-for-byte production's `WpCtx`
+//!   postcondition ctx `with_fn_map(&fn_map).with_binder_typs(&caller_param_typs)`
+//!   (bootstrap-18) — so an explicit `&`-param deref (`*p`) in the ensures
+//!   renders as `p.deref`, matching the goal side (closes head_exec's
+//!   obligation leaf). The `RetBind` return VALUE additionally applies
+//!   production's per-leaf return-typ coercion (`lift_if_value_coerced`
+//!   base case → `coerce_leaf`): the rendered value is coerced from its own
+//!   Exp typ to the declared `ret_typ`, inserting the `.deref` for a bare
+//!   `&`-value return (`fn clone(self: &S) -> S` → `self.deref`) that
+//!   `binder_typs` alone can't reach — closing the clone RetBind divergence.
+//!   Still NOT replicated: if-value LIFTING (a genuinely-liftable `if`
+//!   return renders as one leaf here vs production's lifted `And`/`Imp`
+//!   structure). A return needing that still diverges and HONEST-FAILS the
+//!   `decide` bridge, never silent-passes. Simple-var / simple-arith returns
+//!   (add_capped `s`, sum_to `acc`), explicit `&`-param derefs, and bare
+//!   `&`-value returns now match.
 //! * Field-path `Assign` (`x.f = e`) is rejected (tag `assign-field-path`).
 //!
 //! # Vocabulary versioning
@@ -268,7 +281,7 @@ impl LeafTable {
 type Sr<T> = Result<T, String>;
 
 #[derive(Default)]
-struct Serializer {
+struct Serializer<'a> {
     leaves: LeafTable,
     /// The fn's ANNOTATED ensures obligation leaves (span_mark'd, the
     /// `Return` goal — finding-1's Ret-annotation), set once before
@@ -291,15 +304,67 @@ struct Serializer {
     /// via `collect_modifications(body)` and filters by this map, exactly
     /// as production does.
     local_typs: HashMap<VarIdent, Typ>,
+    /// `VarIdent → Typ` for the fn's value params at their body-shadow
+    /// Lean typ (bootstrap-18), built EXACTLY as production's
+    /// `caller_param_typs` (`sst_to_lean::exec_fn_theorems_to_ast`): strip
+    /// one outer ref decoration for `&mut`-style params, else as-declared.
+    /// Threaded into `render_ctx()` so obligation / RetBind-value leaf
+    /// rendering derefs `&`-params (`*p → p.deref`) the SAME way
+    /// production's `WpCtx` postcondition `RenderCtx` (`with_binder_typs`)
+    /// does — closing the head_exec / clone leaf-render divergences.
+    caller_param_typs: HashMap<VarIdent, Typ>,
+    /// The fn_map (callee resolution) threaded into `render_ctx()`
+    /// alongside `caller_param_typs`, mirroring production's postcondition
+    /// ctx (`WpCtx::new`, `with_fn_map(&fn_map)`). Load-bearing for the
+    /// `&`-param deref at CALL-ARG positions: a plain-spec-fn call whose
+    /// callee is in the map takes the migrated B5a typed-arg path
+    /// (`exp_to_typed`), which bridges each `&`-param arg to the callee's
+    /// declared param typ and so inserts the `.deref` (head_exec's
+    /// `tree_head(*t)`). Absent the map the call falls off that path and
+    /// the arg renders bare. Borrows the krate; empty (`Default`) until
+    /// set in `serialize()`.
+    fn_map: crate::expr_shared::RenderFnMap<'a>,
+    /// The fn's declared return typ (bootstrap-18), derived EXACTLY as
+    /// production's `WpCtx.ret_typ` (`sst_to_lean.rs:524`): the
+    /// `post_condition.dest` VarIdent looked up in `local_typs` (=
+    /// production's `type_map` = `check.local_decls`). `None` for unit
+    /// returns or a dest with no decl entry. Threaded into the RetBind
+    /// value render so the return value coerces from its own Exp typ to
+    /// this — mirroring production's per-leaf return-typ coercion
+    /// (`lift_if_value_coerced` base case, `coerce_leaf`). This inserts a
+    /// `.deref` for a `&`-value return (`fn clone(self: &S) -> S` returns
+    /// bare `Var(self) : &S` coerced to `S` → `self.deref`), closing the
+    /// clone RetBind-value divergence that `binder_typs` alone can't (a
+    /// bare Var read carries no explicit `*self` for `binder_typs` to
+    /// deref). For a return whose Exp typ already equals this (u64→u64,
+    /// arith returns, generic `T`) the coercion is a no-op, so no
+    /// regression on the closing fixtures.
+    ret_typ: Option<Typ>,
 }
 
-impl Serializer {
+impl<'a> Serializer<'a> {
     // ── Leaf rendering ──────────────────────────────────────────────
 
     fn exp_leaf(&mut self, e: &Exp) -> Sr<u64> {
         let lexpr = crate::to_lean_sst_expr::sst_exp_to_ast_checked(e)
             .map_err(|reason| format!("leaf-render: {}", reason))?;
         Ok(self.leaves.intern(pp_expr(&lexpr)))
+    }
+
+    /// The binder-aware `RenderCtx` for rendering THIS fn's obligation and
+    /// RetBind-value leaves (bootstrap-18). Byte-for-byte production's
+    /// `WpCtx` postcondition ctx (`sst_to_lean.rs:511`,
+    /// `RenderCtx::with_fn_map(&fn_map).with_binder_typs(&caller_param_typs)`)
+    /// so a `&`-param deref (`*p`) renders as `p.deref`, matching the
+    /// goal-side leaf. BOTH ingredients are load-bearing: `binder_typs`
+    /// gives the Var read its `&T` actual typ; `fn_map` puts a
+    /// plain-spec-fn call on the migrated typed-arg path that bridges (and
+    /// so derefs) that arg. For a fn with no ref params both are inert, so
+    /// this is bit-for-bit the old empty-ctx render there (no regression on
+    /// the closing fixtures).
+    fn render_ctx(&self) -> crate::expr_shared::RenderCtx<'_> {
+        crate::expr_shared::RenderCtx::with_fn_map(&self.fn_map)
+            .with_binder_typs(&self.caller_param_typs)
     }
 
     /// Render an obligation as an ANNOTATED leaf, byte-matching
@@ -315,7 +380,11 @@ impl Serializer {
     /// W2 bridge. `kind` never reaches the pp output (only `rust_loc` +
     /// `inner` do — see `lean_pp`), so `Plain` suffices for byte-match.
     fn oblig_leaf(&mut self, e: &Exp) -> Sr<u64> {
-        let inner = crate::to_lean_sst_expr::sst_exp_to_ast_checked(e)
+        // Render through the binder-aware ctx (bootstrap-18) so a `&`-param
+        // deref matches production's postcondition leaf. The ctx's `&self`
+        // borrow ends with this statement (`inner` is owned), before
+        // `intern` takes `&mut self`.
+        let inner = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(e, &self.render_ctx())
             .map_err(|reason| format!("leaf-render: {}", reason))?;
         let loc = crate::obligation_naming::format_rust_loc(&e.span);
         let marked = LExpr::span_mark(
@@ -337,7 +406,8 @@ impl Serializer {
     /// bridge. `kind` never reaches the pp (see `oblig_leaf`), so `Plain`
     /// suffices even though production marks the cond `LoopCondition`.
     fn neg_oblig_leaf(&mut self, e: &Exp) -> Sr<u64> {
-        let inner = crate::to_lean_sst_expr::sst_exp_to_ast_checked(e)
+        // Binder-aware render (bootstrap-18) — see `oblig_leaf`.
+        let inner = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(e, &self.render_ctx())
             .map_err(|reason| format!("leaf-render: {}", reason))?;
         let loc = crate::obligation_naming::format_rust_loc(&e.span);
         let marked = LExpr::span_mark(
@@ -456,7 +526,39 @@ impl Serializer {
                 // never silent-passes).
                 let retbind = match (self.pending_ret_name, ret_exp) {
                     (Some(nleaf), Some(e)) => {
-                        let vleaf = self.exp_leaf(e)?;
+                        // Render the return value with the binder-aware ctx
+                        // (bootstrap-18) so an explicit `&`-param `*p` derefs
+                        // to `p.deref`, then apply production's per-leaf
+                        // return-typ coercion (`lift_if_value_coerced` base
+                        // case → `coerce_leaf`): coerce the rendered value
+                        // from its OWN Exp typ to the declared `ret_typ`. This
+                        // inserts the `.deref` for a bare `&`-value return
+                        // (`fn clone(self: &S) -> S` returns `Var(self) : &S`
+                        // → coerced to `S` → `self.deref`) that `binder_typs`
+                        // alone can't reach (no explicit deref in the Exp). For
+                        // a return whose Exp typ already equals `ret_typ`
+                        // (u64→u64, arith, generic `T`) the coerce is a no-op.
+                        // Scoped so the `&self` borrows (render_ctx, ret_typ)
+                        // end (`vtext` is owned) before `intern` takes
+                        // `&mut self`. if-value LIFTING is still NOT replicated
+                        // (a genuinely-liftable-if return renders as one leaf
+                        // here vs production's lifted And/Imp structure) — that
+                        // case honest-fails the bridge, never silent-passes.
+                        let vtext = {
+                            let lexpr = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(
+                                e,
+                                &self.render_ctx(),
+                            )
+                            .map_err(|reason| format!("leaf-render: {}", reason))?;
+                            let coerced = match &self.ret_typ {
+                                Some(rt) => {
+                                    crate::expr_shared::coerce_lexpr(lexpr, &e.typ, rt)
+                                }
+                                None => lexpr,
+                            };
+                            pp_expr(&coerced)
+                        };
+                        let vleaf = self.leaves.intern(vtext);
                         format!("{}.RetBind.RetLet {} {}", NS, nleaf, vleaf)
                     }
                     _ => format!("{}.RetBind.RetNone", NS),
@@ -807,13 +909,41 @@ struct CertBody {
 /// SAME leaf table as the SST half, appended AFTER the SST walk so SST
 /// leaf ids stay in their §4 first-appearance order and matching goal
 /// leaves reuse them.
-fn serialize(
+fn serialize<'a>(
+    krate: &'a KrateX,
     fn_sst: &FunctionSst,
     check: &FuncCheckSst,
     theorems: &[Theorem],
     goal_shapes: &[Option<GoalShape>],
 ) -> Sr<CertBody> {
-    let mut s = Serializer::default();
+    let mut s: Serializer<'a> = Serializer::default();
+
+    // fn_map for `render_ctx()` (bootstrap-18) — built EXACTLY as
+    // production's (sst_to_lean.rs:503): borrows the krate for the
+    // serializer's lifetime. Callee resolution puts plain-spec-fn calls in
+    // obligations on the migrated typed-arg path so `&`-param call args
+    // deref (head_exec's `tree_head(*t)` → `tree_head t.deref`).
+    s.fn_map = krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
+
+    // Value params at body-shadow Lean typ (bootstrap-18) — built EXACTLY
+    // as production's `caller_param_typs` (sst_to_lean.rs,
+    // exec_fn_theorems_to_ast): strip one outer ref decoration for
+    // `&mut`-style params, else as-declared. Set before any leaf render so
+    // `render_ctx()` derefs `&`-params consistently across obligation and
+    // RetBind-value leaves.
+    s.caller_param_typs = fn_sst
+        .x
+        .pars
+        .iter()
+        .map(|p| {
+            let typ = if crate::expr_shared::is_mut_ref_typ(&p.x.typ, p.x.is_mut) {
+                crate::to_lean_expr::strip_one_ref_decoration(&p.x.typ)
+            } else {
+                p.x.typ.clone()
+            };
+            (p.x.name.clone(), typ)
+        })
+        .collect();
 
     // Walk order (§4): params → requires → body → ensures. Interning in
     // this order fixes leaf ids deterministically.
@@ -908,6 +1038,18 @@ fn serialize(
         .map(|d| (d.ident.clone(), d.typ.clone()))
         .collect();
 
+    // Declared return typ (bootstrap-18) — mirrors production's
+    // `WpCtx.ret_typ` (sst_to_lean.rs:524): the `post_condition.dest`
+    // VarIdent looked up in `local_typs` (production's `type_map`). Used by
+    // the `Return` arm to coerce the return value to this typ (inserting a
+    // `&`-value `.deref`), exactly as production's per-leaf return-typ
+    // coercion. Must be set AFTER `local_typs`.
+    s.ret_typ = check
+        .post_condition
+        .dest
+        .as_ref()
+        .and_then(|dest| s.local_typs.get(dest).cloned());
+
     // Body.
     let stm_term = s.stm(&check.body)?;
 
@@ -943,7 +1085,7 @@ fn serialize(
 /// serialized: <tag>`), counted, and the crate run continues (fail-loud
 /// rule, spec §3). A no-op when the flag is off.
 pub fn emit_cert(
-    _krate: &KrateX,
+    krate: &KrateX,
     fn_sst: &FunctionSst,
     check: &FuncCheckSst,
     crate_name: &str,
@@ -958,7 +1100,7 @@ pub fn emit_cert(
         return;
     }
     let fn_name = crate::to_lean_type::lean_name_relative(&fn_sst.x.name.path);
-    match serialize(fn_sst, check, theorems, goal_shapes) {
+    match serialize(krate, fn_sst, check, theorems, goal_shapes) {
         Ok(body) => match write_cert_file(crate_name, &fn_name, &body) {
             Ok(()) => census_note_certified(),
             Err(io) => {
