@@ -546,6 +546,136 @@ pub open spec fn seed_params(params: BinderList, bounds: ParamBoundList) -> Fram
     }
 }
 
+// ── Nested-loop (non-leading) telescope support (bootstrap-16) ───────
+//
+// Production names a loop's mod-var bounds / invariants / condition as
+// `_h_ctx_N` ∀-hyps ONLY when the loop's frames are LEADING —
+// `split_leading_binders` (sst_to_lean) hoists a prefix of Binder/Hyp
+// frames from the front of the accumulated context, STOPPING at the
+// first `let`. An enclosing loop pushes a `_tactus_d_old := D` `let`
+// frame (walk_loop), so a NESTED (inner) loop's bounds/invs/cond come
+// AFTER that let → they are NOT leading → production renders them as
+// bare (unnamed) `Imp` hypotheses, while the mod-var ∀-binders themselves
+// keep their source names. refWp re-derives leading-ness from the
+// pre-loop frame `f` after havoc drops the modified locals' own pre-loop
+// lets: LEADING iff no `let` survives in front. Ground truth: the
+// find_square inner loop's maintain telescope (goal 5) is
+// `All 23 1, Imp 24, Imp 25, Imp 26, Imp 27, Imp 29` — an ∀ over `b`
+// then FIVE bare `Imp`s (b-bound, three invs, cond), not named ∀-hyps.
+// (The prior instance's "`_h_ctx` counter offset" read was imprecise:
+// the inner hyps are UNNAMED, not renamed with a shifted counter.)
+
+// Does the frame contain any surviving `let` binder? After havoc, a
+// surviving `let` = an enclosing loop's `_tactus_d_old` snapshot (or a
+// non-modified pre-loop local) ⇒ this loop's leading-binder extraction
+// already stopped ⇒ its hyps render as bare `Imp`. Returns nat (the
+// `decide` idiom — a bool spec fn lowers to a noncomputable Prop).
+#[verifier::structural_decreases]
+pub open spec fn has_let(f: FrameList) -> nat
+    decreases f
+{
+    match f {
+        FrameList::FNil => 0,
+        FrameList::FBind(_id, _typ, t) => has_let(*t),
+        FrameList::FHyp(_h, t) => has_let(*t),
+        FrameList::FLet(_id, _v, _t) => 1,
+    }
+}
+
+// A BinderList's PROP slots as anonymous `FHyp` entries — the
+// non-leading counterpart of `binders_to_frame`. Each invariant's
+// ANNOTATED obligation leaf (the prop slot) becomes a bare `Imp`
+// hypothesis; the `_h_ctx` name slot is dropped (unnamed).
+#[verifier::structural_decreases]
+pub open spec fn binderprops_to_hyps(b: BinderList) -> FrameList
+    decreases b
+{
+    match b {
+        BinderList::Nil => FrameList::FNil,
+        BinderList::Cons(_name, prop, t) => FrameList::FHyp(prop, Box::new(binderprops_to_hyps(*t))),
+    }
+}
+
+// The non-leading counterpart of `seed_params`: each mod-var stays a
+// NAMED ∀-binder (production keeps the source name on the binder), but
+// its type-bound renders as a bare `Imp` (unnamed) instead of a named ∀.
+#[verifier::structural_decreases]
+pub open spec fn seed_binders_hyp_bounds(binders: BinderList, bounds: ParamBoundList) -> FrameList
+    decreases binders
+{
+    match binders {
+        BinderList::Nil => FrameList::FNil,
+        BinderList::Cons(id, typ, t) => match bounds {
+            ParamBoundList::Bound(_hname, prop, bt) =>
+                FrameList::FBind(id, typ, Box::new(FrameList::FHyp(prop, Box::new(seed_binders_hyp_bounds(*t, *bt))))),
+            ParamBoundList::NoBound(bt) =>
+                FrameList::FBind(id, typ, Box::new(seed_binders_hyp_bounds(*t, *bt))),
+            ParamBoundList::Nil =>
+                FrameList::FBind(id, typ, Box::new(seed_binders_hyp_bounds(*t, ParamBoundList::Nil))),
+        },
+    }
+}
+
+// The maintain telescope a loop pushes around its body (finding-3 +
+// bootstrap-16): havoc the pre-loop lets for the modified locals, then
+// re-quantify them + bounds, re-assert each invariant + the cond, and
+// the `_tactus_d_old` snapshot let. Whether the bounds/invs/cond render
+// as NAMED ∀-hyps (`_h_ctx_N`, leading loop) or bare `Imp`s (nested
+// loop) is decided by `has_let` on the havoc'd frame. Factored into a
+// top-level fn (not a nested `if`/`match` inside `wp_stm`'s arm) per the
+// decide-checker flattening caveat.
+pub open spec fn loop_maintain_frame(
+    f: FrameList,
+    inv_hyps: BinderList,
+    binders: BinderList,
+    binder_bounds: ParamBoundList,
+    cond_name: u64,
+    cond_ann: u64,
+    d_old_name: u64,
+    d_old_val: u64,
+) -> FrameList {
+    let hv = havoc_lets(f, binders);
+    let d_old = FrameList::FLet(d_old_name, d_old_val, Box::new(FrameList::FNil));
+    if has_let(hv) == 0 {
+        frame_append(hv,
+            frame_append(seed_params(binders, binder_bounds),
+                frame_append(binders_to_frame(inv_hyps),
+                    frame_append(FrameList::FBind(cond_name, cond_ann, Box::new(FrameList::FNil)),
+                        d_old))))
+    } else {
+        frame_append(hv,
+            frame_append(seed_binders_hyp_bounds(binders, binder_bounds),
+                frame_append(binderprops_to_hyps(inv_hyps),
+                    frame_append(FrameList::FHyp(cond_ann, Box::new(FrameList::FNil)),
+                        d_old))))
+    }
+}
+
+// The use telescope (what FOLLOWS the loop): same havoc + re-quantify,
+// but ¬cond instead of cond, and NO `_tactus_d_old` (the decrease is
+// body-only). Leading/non-leading decided identically.
+pub open spec fn loop_use_frame(
+    f: FrameList,
+    inv_hyps: BinderList,
+    binders: BinderList,
+    binder_bounds: ParamBoundList,
+    cond_name: u64,
+    neg_cond_ann: u64,
+) -> FrameList {
+    let hv = havoc_lets(f, binders);
+    if has_let(hv) == 0 {
+        frame_append(hv,
+            frame_append(seed_params(binders, binder_bounds),
+                frame_append(binders_to_frame(inv_hyps),
+                    FrameList::FBind(cond_name, neg_cond_ann, Box::new(FrameList::FNil)))))
+    } else {
+        frame_append(hv,
+            frame_append(seed_binders_hyp_bounds(binders, binder_bounds),
+                frame_append(binderprops_to_hyps(inv_hyps),
+                    FrameList::FHyp(neg_cond_ann, Box::new(FrameList::FNil)))))
+    }
+}
+
 // frameAfter: the frame extension visible to whatever FOLLOWS `s`.
 // (DESIGN §2.2. `If` join frames are NOT merged at stage A: the
 // continuation sees the pre-if frame — §5.1.)
@@ -563,14 +693,13 @@ pub open spec fn frame_after(f: FrameList, s: StmData) -> FrameList
         StmData::Ret(_es, _rb) => f,        // control does not continue
         StmData::If(_c, _nc, _t, _e) => f,  // stage A: join frames not merged (§5.1)
         StmData::Loop { inv_hyps, binders, binder_bounds, cond_name, cond_ann: _, neg_cond_ann, d_old_name: _, d_old_val: _, decrease_oblig: _, body: _ } =>
-            // use telescope (finding-3): havoc the pre-loop lets for the
-            // modified locals, re-quantify them + their bounds as NAMED ∀,
-            // re-introduce each invariant as a NAMED ∀-hyp, then ¬cond as a
-            // NAMED ∀-hyp. No `_tactus_d_old` here (decrease is body-only).
-            frame_append(havoc_lets(f, *binders),
-                frame_append(seed_params(*binders, *binder_bounds),
-                    frame_append(binders_to_frame(*inv_hyps),
-                        FrameList::FBind(cond_name, neg_cond_ann, Box::new(FrameList::FNil))))),
+            // use telescope (finding-3 + bootstrap-16): havoc the pre-loop
+            // lets for the modified locals, re-quantify them, re-introduce
+            // each invariant + ¬cond. Bounds/invs/cond are NAMED ∀-hyps for
+            // a LEADING loop, bare `Imp`s for a NESTED one (`loop_use_frame`
+            // decides via `has_let`). No `_tactus_d_old` (decrease is
+            // body-only).
+            loop_use_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, neg_cond_ann),
         StmData::Skip => f,
         StmData::Seq(a, b) => frame_after(frame_after(f, *a), *b),
     }
@@ -611,18 +740,16 @@ pub open spec fn wp_stm(f: FrameList, s: StmData) -> GoalList
                 wp_stm(frame_append(f, FrameList::FHyp(c, Box::new(FrameList::FNil))), *t),
                 wp_stm(frame_append(f, FrameList::FHyp(nc, Box::new(FrameList::FNil))), *e)),
         StmData::Loop { inv_hyps, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann: _, d_old_name, d_old_val, decrease_oblig, body } => {
-            // Maintain telescope (finding-3): havoc pre-loop lets for the
-            // modified locals, re-quantify them + bounds as NAMED ∀, invariants
-            // as NAMED ∀-hyps, cond as a NAMED ∀-hyp, then the `_tactus_d_old`
+            // Maintain telescope (finding-3 + bootstrap-16): havoc pre-loop
+            // lets for the modified locals, re-quantify them + bounds,
+            // re-assert each invariant + the cond, then the `_tactus_d_old`
             // decreases snapshot as the trailing `let` (production's
             // `walk_loop` + `split_leading_binders`: leading binders/hyps
             // hoist to ∀, extraction STOPS at the first let so d_old wraps
-            // as a Let in the goal body).
-            let mframe = frame_append(havoc_lets(f, *binders),
-                frame_append(seed_params(*binders, *binder_bounds),
-                    frame_append(binders_to_frame(*inv_hyps),
-                        frame_append(FrameList::FBind(cond_name, cond_ann, Box::new(FrameList::FNil)),
-                            FrameList::FLet(d_old_name, d_old_val, Box::new(FrameList::FNil))))));
+            // as a Let in the goal body). Bounds/invs/cond render as NAMED
+            // ∀-hyps for a LEADING loop, bare `Imp`s for a NESTED one
+            // (`loop_maintain_frame` decides via `has_let`).
+            let mframe = loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val);
             let body_goals = wp_stm(mframe, *body);
             let endf = frame_after(mframe, *body);
             // Walker-synthesised body-end obligations (DESIGN §5 Q3): one per
@@ -1006,6 +1133,85 @@ proof fn ref_wp_sum_to_loop()
             ),
             // production goals (cert_sum_to_goals), 12 in walk order
                 GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(23)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(24)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(25)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::Let(9, 10, Box::new(GoalData::Let(11, 10, Box::new(GoalData::Leaf(26)))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Leaf(18)))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Leaf(21)))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(23)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(24)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(25)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(26)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::Let(27, 28, Box::new(GoalData::Imp(17, Box::new(GoalData::Imp(17, Box::new(GoalData::Let(9, 19, Box::new(GoalData::Imp(20, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(11, 22, Box::new(GoalData::Leaf(39)))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 40, Box::new(GoalData::Let(8, 11, Box::new(GoalData::Leaf(7)))))))))))))))))))))))))))), Box::new(GoalList::Nil)))))))))))))))))))))))),
+        ) == 1
+by { decide }
+
+// ── bootstrap-16: nested-loop (non-leading) telescope ──────────────
+//
+// A NESTED loop's bounds/invs/cond render as bare `Imp`s (production's
+// `split_leading_binders` stops at the enclosing loop's `_tactus_d_old`
+// `let`), NOT as named `_h_ctx` ∀-hyps — while the same loop node under a
+// LEADING frame renders those as named ∀. `loop_maintain_frame` /
+// `loop_use_frame` pick the branch via `has_let` on the havoc'd frame.
+// Leaf ids below are find_square's REAL inner-loop ids (from
+// bootstrap-fixture/out/lib/cert/find_square.cert.lean): b=23:Int=1,
+// b-bound=24 named _h_ctx_0=11, invs 25/26/27 named _h_ctx_1/2/3=13/15/17,
+// cond _h_ctx_?=28, cond_ann=29, neg_cond_ann=30, d_old=31:=32, assert
+// oblig=35. The pre-loop frame `limit=0:Int=1` + the outer loop's
+// `_tactus_d_old_0_0 := 20:=21` `let` is the enclosing context (the `let`
+// is what makes the inner loop NON-leading). Verified end-to-end against
+// the real cert: find_square goals 0–5 + 12–16 close by `decide` under
+// this fix (goals 6–11 remain the separately-excluded if-in-fall-through
+// case, DESIGN §2.4.1). Mutation-kill: a leading↔non-leading flip changes
+// every inner `Imp`↔`All`, so `goal_eq` flips.
+proof fn ref_wp_nested_loop_nonleading()
+    ensures
+        // NON-LEADING maintain telescope (an enclosing `let` survives
+        // havoc ⇒ `Imp` bounds/invs/cond): matches find_square goal 5's
+        // inner portion `∀b, [24]→[25]→[26]→[27]→[29]→ let(31:=32) Leaf 35`.
+        goal_eq(
+            close(
+                loop_maintain_frame(
+                    FrameList::FBind(0, 1, Box::new(FrameList::FLet(20, 21, Box::new(FrameList::FNil)))),
+                    BinderList::Cons(13, 25, Box::new(BinderList::Cons(15, 26,
+                        Box::new(BinderList::Cons(17, 27, Box::new(BinderList::Nil)))))),
+                    BinderList::Cons(23, 1, Box::new(BinderList::Nil)),
+                    ParamBoundList::Bound(11, 24, Box::new(ParamBoundList::Nil)),
+                    28, 29, 31, 32),
+                35),
+            GoalData::All(0, 1, Box::new(GoalData::Let(20, 21, Box::new(
+                GoalData::All(23, 1, Box::new(GoalData::Imp(24, Box::new(
+                GoalData::Imp(25, Box::new(GoalData::Imp(26, Box::new(
+                GoalData::Imp(27, Box::new(GoalData::Imp(29, Box::new(
+                GoalData::Let(31, 32, Box::new(GoalData::Leaf(35))))))))))))))))))),
+        ) == 1,
+        // LEADING maintain telescope (no surviving `let`): the SAME loop
+        // node renders bounds/invs/cond as NAMED ∀-hyps (_h_ctx 11/13/15/17
+        // /28). Only the front frame differs (no `let`) — proving the branch
+        // is chosen by context, not baked into the loop node.
+        goal_eq(
+            close(
+                loop_maintain_frame(
+                    FrameList::FBind(0, 1, Box::new(FrameList::FNil)),
+                    BinderList::Cons(13, 25, Box::new(BinderList::Cons(15, 26,
+                        Box::new(BinderList::Cons(17, 27, Box::new(BinderList::Nil)))))),
+                    BinderList::Cons(23, 1, Box::new(BinderList::Nil)),
+                    ParamBoundList::Bound(11, 24, Box::new(ParamBoundList::Nil)),
+                    28, 29, 31, 32),
+                35),
+            GoalData::All(0, 1, Box::new(GoalData::All(23, 1, Box::new(
+                GoalData::All(11, 24, Box::new(GoalData::All(13, 25, Box::new(
+                GoalData::All(15, 26, Box::new(GoalData::All(17, 27, Box::new(
+                GoalData::All(28, 29, Box::new(GoalData::Let(31, 32, Box::new(
+                GoalData::Leaf(35))))))))))))))))),
+        ) == 1,
+        // NON-LEADING use telescope (¬cond, no d_old): matches find_square
+        // goal 13's inner portion `∀b, [24]→[25]→[26]→[27]→[30]→ Leaf 43`.
+        goal_eq(
+            close(
+                loop_use_frame(
+                    FrameList::FBind(0, 1, Box::new(FrameList::FLet(20, 21, Box::new(FrameList::FNil)))),
+                    BinderList::Cons(13, 25, Box::new(BinderList::Cons(15, 26,
+                        Box::new(BinderList::Cons(17, 27, Box::new(BinderList::Nil)))))),
+                    BinderList::Cons(23, 1, Box::new(BinderList::Nil)),
+                    ParamBoundList::Bound(11, 24, Box::new(ParamBoundList::Nil)),
+                    28, 30),
+                43),
+            GoalData::All(0, 1, Box::new(GoalData::Let(20, 21, Box::new(
+                GoalData::All(23, 1, Box::new(GoalData::Imp(24, Box::new(
+                GoalData::Imp(25, Box::new(GoalData::Imp(26, Box::new(
+                GoalData::Imp(27, Box::new(GoalData::Imp(30, Box::new(
+                GoalData::Leaf(43))))))))))))))))),
         ) == 1
 by { decide }
 
