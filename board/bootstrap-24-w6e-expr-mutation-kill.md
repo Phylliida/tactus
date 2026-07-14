@@ -3,7 +3,7 @@ title: "W6e — expression-level mutation-kill (the Friction-2 kill) + G4 If/Let
 status: in_progress
 claimed_by: opus-b28
 created: 2026-07-14T05:05:00Z
-updated: 2026-07-14T16:45:00Z
+updated: 2026-07-14T18:20:00Z
 ---
 
 ## Description
@@ -112,6 +112,49 @@ is independent; W6e is the last correctness rung before the W6 ladder is closed.
   transform is now mapped (`lift_if_value_coerced`, `sst_to_lean.rs:4956`), so
   the next instance starts warm, not cold. **Task stays in_progress: item 1 DONE
   + banked; item 2 (G4) = vocabulary DONE, recompute+re-emit remain.**
+
+- (2026-07-14, opus-b29) **G4.2 PROBE LANDED — the If-fold contract is pinned +
+  Lean-verified BEFORE the serializer (`probe-w0/probe14_g4_ifjoin/`).** Followed
+  the "probe first" discipline exactly: hand-built the reference recompute
+  RawExps (`impl15`/`impl16` = the two branch-folded implications), rendered them
+  through the LANDED `render_exp`, and diffed against the independently-written
+  deep goal ExprData (`deep15`/`deep16`). Crucially, routed the WHOLE thing
+  through the REAL emitted `ref_wp`/`goals_eq` (import `TactusDefs_lib_exec`), not
+  a re-inlined copy — so the probe is the faithful wired bridge. One `lean`
+  elaboration (rc=0, 1.5s) proves, all by `decide`:
+  - **(0) BEFORE:** the current opaque cert (`Ret([Span 11 (r≥x),Span 13 (r≥y)],
+    RetLet 10 14)` vs `LeafE(Atom 15/16)`) bridges to **0** — i.e. probe9's
+    `max_u64 hfail-ok` is a REAL shape mismatch (ensures-split + `Let 10 14`
+    wrapper vs branch-split opaque atom), not an artifact.
+  - **(A) AFTER:** the WIRED `Ret([impl15,impl16], RetNone)` bridges to **1**, and
+    `goal_count = 2` on both sides. Confirms the design's `RetNone` call:
+    `ret_frame(f, RetNone) = f` (NO outer `Let` re-fold — the `let r` is already
+    inside each leaf), so `close_each_e` emits exactly the 2 branch-folded goals.
+  - **(B)** `expr_eq (render_exp impl15) deep15 = 1` and same for 16 — the direct
+    render-diff ask.
+  - **(C)** SIX single-drop mutation-kills each flip 1→0: 2 goal-side (buggy
+    `lexpr_to_exprdata`: drop inner `let m`; drop `¬` guard) + 4 reference-side
+    (buggy `lift_if_raw`: drop inner `let m`; wrong branch value y→x; drop a
+    Span; wrong span loc 11→99). The ref-side kills are the G4.2-specific payoff
+    (the recompute is the new/risky code). Plus a run.sh non-vacuity meta-check
+    (decide refuses `¬(render diff)`).
+  - **CONCRETE CORRECTION for the wiring:** the REAL SpanMark loc ids are **11
+    and 13** (the loc-STRING leaves `@95:13`/`@95:21`, reused verbatim from the
+    live SST's ensures spans), NOT the G4.1 kernel guard's placeholder **9/12**
+    (which are the spanned-NODE leaf ids). The loc field is an interned
+    loc-string id, interned once globally by text, so it is identical wherever
+    `@95:13` appears — SST ensures span AND goal leaf 15/16. Local model concurred
+    (127.0.0.1:8051): using 9/12 there would conflate the span *container* with
+    the *coordinate* and break the bridge. **When wiring G4.2: reference
+    `lift_if_raw` must reuse the ensures Exps' own span locs (11/13), and
+    `lexpr_to_exprdata` transcribes production's leaf-15/16 SpanMark loc to the
+    same 11/13 — they agree by construction.** m-binder id (probe uses 14) stays
+    to be confirmed at G4.3 re-emit, but is render-transparent (Let arm passes the
+    name straight through on both sides), so it does not affect the shape.
+  - probe13 mutation-kill still green (4/4); no shared code touched (probe is
+    standalone against the frozen emitted defs), so probe9 unaffected.
+  **Next: wire the serializer (G4.2 parts 1+2) to the pinned target above, then
+  G4.3 re-emit + flip max_u64 to close-ok.** Task stays in_progress.
 
 ## G4 remaining design (for the next instance — recompute + re-emit)
 
