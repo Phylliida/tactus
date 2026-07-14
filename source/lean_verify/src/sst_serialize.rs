@@ -186,8 +186,11 @@ use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use vir::ast::{KrateX, Typ, VarIdent};
-use vir::sst::{Exp, FuncCheckSst, FunctionSst, LoopInv, Stm, StmX};
+use vir::ast::{
+    ArithOp, BinaryOp, Constant, InequalityOp, IntRange, KrateX, Typ, TypDecoration, TypX,
+    UnaryOp, VarIdent,
+};
+use vir::sst::{CallFun, Exp, ExpX, FuncCheckSst, FunctionSst, LoopInv, Stm, StmX};
 
 use crate::lean_ast::{AssertKind, Expr as LExpr, GoalShape, GoalSpine, ObligationKind, Theorem};
 use crate::lean_pp::pp_expr;
@@ -485,6 +488,130 @@ impl<'a> Serializer<'a> {
     /// name (see the module doc's binder-id caveat).
     fn binder_id(&mut self, vid: &VarIdent) -> u64 {
         let name = crate::lean_name::LeanName::from_var_ident(vid);
+        self.text_leaf(name.as_str())
+    }
+
+    // ── W6c: raw-SST → RawExp transcription (the reference-side input) ─
+    // The NEW, INDEPENDENT input (DESIGN-W6-stageB.md §4.2, D2 diversity):
+    // mirror the RAW SST expression tree to `lib.RawExp` text, reading each
+    // node's `typ` for the `TypData` tags — NOT rendered through
+    // production's `to_lean_sst_expr`. The landed `render_exp` (W6b) then
+    // re-derives the cast/coercion decisions from those tags in Lean, so a
+    // production emitter that inserts an `Int.toNat` inconsistently
+    // (Friction 2) diverges → the bridge `decide` fails.
+    //
+    // Atom-id consistency invariant (load-bearing): atoms (var reads, call
+    // heads) intern their rendered text via `self.leaves`, EXACTLY as the
+    // production `LExpr→ExprData` side will — so `expr_eq(prod, ref)` matches
+    // on atoms and the diversity is confined to the structural cast layer.
+    //
+    // Not yet called by the emit path (that is W6d); `#[allow(dead_code)]`
+    // keeps it verdict-neutral until then.
+
+    /// Map a source `Typ` to `lib.TypData` mirror text. The cast decision
+    /// only needs the Int-vs-Nat distinction; datatypes/params collapse to
+    /// `TyNamed`, `&T`/`&mut T` to `TyRef`. Peels SMT `Decorate`/`Boxed`
+    /// wrappers. `TyNamed`/`TyRef` ids reuse `typ_leaf`'s interning so the
+    /// reference and production sides agree by construction. Fails loud
+    /// (census tag `typ-<k>`) on shapes stage B does not yet mirror.
+    #[allow(dead_code)]
+    fn typ_data(&mut self, typ: &Typ) -> Sr<String> {
+        match &**typ {
+            TypX::Bool => Ok(format!("{}.TypData.TyBool", NS)),
+            TypX::Int(IntRange::Nat) => Ok(format!("{}.TypData.TyNat", NS)),
+            TypX::Int(_) => Ok(format!("{}.TypData.TyInt", NS)),
+            TypX::Datatype(..) => {
+                let id = self.typ_leaf(typ);
+                Ok(format!("({}.TypData.TyNamed {})", NS, id))
+            }
+            // `&T` / `&mut T` present the pointee, tagged `TyRef` so the
+            // reference `deref_type` (W6b) resolves the `.deref`.
+            TypX::Decorate(TypDecoration::Ref, _, inner)
+            | TypX::Decorate(TypDecoration::MutRef, _, inner) => {
+                let id = self.typ_leaf(inner);
+                Ok(format!("({}.TypData.TyRef {})", NS, id))
+            }
+            // Other decorations (Box/Rc/Arc/Ghost/Tracked/…) are SMT-only
+            // wrappers — peel and recurse.
+            TypX::Decorate(_, _, inner) => self.typ_data(inner),
+            TypX::Boxed(inner) => self.typ_data(inner),
+            _ => Err(format!("typ-{}", typ_construct_tag(typ))),
+        }
+    }
+
+    /// `ExpX → lib.RawExp` for the cast class (Var/Lit/Clip/BinOp/App). The
+    /// 2nd `BinOp` slot is the op's RESULT type (`e.typ`), which is what
+    /// `render_exp` reads to decide operand coercion. Everything outside the
+    /// class fails loud (`raw-<k>`).
+    #[allow(dead_code)]
+    fn raw_exp(&mut self, e: &Exp) -> Sr<String> {
+        match &e.x {
+            ExpX::Const(Constant::Int(n)) => {
+                let ty = self.typ_data(&e.typ)?;
+                Ok(format!("({}.RawExp.Lit {} {})", NS, n, paren(&ty)))
+            }
+            ExpX::Var(vid) => {
+                let id = self.binder_id(vid);
+                let ty = self.typ_data(&e.typ)?;
+                Ok(format!("({}.RawExp.Var {} {})", NS, id, paren(&ty)))
+            }
+            // Explicit `as` cast: the clip's RANGE is the target type the
+            // reference materializes against (`type_of (Clip target _) =
+            // target`). `Nat` range → `TyNat`, uN/int range → `TyInt`.
+            ExpX::Unary(UnaryOp::Clip { range, .. }, inner) => {
+                let target = match range {
+                    IntRange::Nat => format!("{}.TypData.TyNat", NS),
+                    _ => format!("{}.TypData.TyInt", NS),
+                };
+                let sub = self.raw_exp(inner)?;
+                Ok(format!("({}.RawExp.Clip {} {})", NS, paren(&target), box_raw(&sub)))
+            }
+            ExpX::Binary(op, l, r) => {
+                let opc = binop_opcode(op)?;
+                let ty = self.typ_data(&e.typ)?;
+                let ls = self.raw_exp(l)?;
+                let rs = self.raw_exp(r)?;
+                Ok(format!(
+                    "({}.RawExp.BinOp {} {} {} {})",
+                    NS,
+                    opc,
+                    paren(&ty),
+                    box_raw(&ls),
+                    box_raw(&rs)
+                ))
+            }
+            // Single-argument spec-fn application (`lib.tri (…)`). The fn id
+            // interns the callee name text (atom-id bucket); ret ty = the
+            // call node's typ; arg ty = the argument node's typ.
+            ExpX::Call(CallFun::Fun(fun, _), _typs, args) => {
+                if args.len() != 1 {
+                    return Err("raw-call-arity".to_string());
+                }
+                let fn_id = self.call_fun_id(fun);
+                let ret = self.typ_data(&e.typ)?;
+                let arg = &args[0];
+                let arg_ty = self.typ_data(&arg.typ)?;
+                let arg_s = self.raw_exp(arg)?;
+                Ok(format!(
+                    "({}.RawExp.Call {} {} {} {})",
+                    NS,
+                    fn_id,
+                    paren(&ret),
+                    box_raw(&arg_s),
+                    paren(&arg_ty)
+                ))
+            }
+            _ => Err(format!("raw-{}", exp_construct_tag(&e.x))),
+        }
+    }
+
+    /// Interned id of a callee spec-fn's rendered name (atom-id bucket, so a
+    /// production `App{head: Var(name)}` interns the SAME id). Production
+    /// renders the head as `LeanName::from_path(&fun.path)`
+    /// (`to_lean_sst_expr.rs:1229`), so match that exactly.
+    #[allow(dead_code)]
+    fn call_fun_id(&mut self, fun: &vir::ast::Fun) -> u64 {
+        let name = crate::lean_name::LeanName::from_path(&fun.path);
         self.text_leaf(name.as_str())
     }
 
@@ -1503,6 +1630,109 @@ fn paren(term: &str) -> String {
         t.to_string()
     } else {
         format!("({})", t)
+    }
+}
+
+// ── W6c: RawExp emit helpers ────────────────────────────────────────
+
+/// Box a `RawExp` sub-term for a recursive field (`Box<RawExp>` in the W6b
+/// mirror), matching `box_`'s `Tactus.Box.mk (…)` literal syntax.
+#[allow(dead_code)]
+fn box_raw(term: &str) -> String {
+    box_(term)
+}
+
+/// The CANONICAL binary-opcode table — a fixed small-int namespace living in
+/// `ExprData::BinOp`'s op slot (compared position-wise by `expr_eq`, so it
+/// never collides with the interned atom-id namespace). Both W6c
+/// transcriptions map into it: `raw_exp` from `vir::ast::BinaryOp` (here),
+/// and the production `LExpr→ExprData` side from `lean_ast::BinOp` (must use
+/// the SAME assignments). Fails loud (`raw-binop-<k>`) on ops outside the
+/// cast class. Keep in sync with the prod-side table when W6d lands it.
+#[allow(dead_code)]
+fn binop_opcode(op: &BinaryOp) -> Sr<u64> {
+    let code = match op {
+        BinaryOp::Eq(_) => 0,
+        BinaryOp::Ne => 1,
+        BinaryOp::Inequality(InequalityOp::Lt) => 2,
+        BinaryOp::Inequality(InequalityOp::Le) => 3,
+        BinaryOp::Inequality(InequalityOp::Gt) => 4,
+        BinaryOp::Inequality(InequalityOp::Ge) => 5,
+        BinaryOp::Arith(ArithOp::Add(_)) => 6,
+        BinaryOp::Arith(ArithOp::Sub(_)) => 7,
+        BinaryOp::Arith(ArithOp::Mul(_)) => 8,
+        BinaryOp::Arith(ArithOp::EuclideanDiv(_)) => 9,
+        BinaryOp::Arith(ArithOp::EuclideanMod(_)) => 10,
+        BinaryOp::And => 11,
+        BinaryOp::Or => 12,
+        BinaryOp::Implies => 13,
+        BinaryOp::Xor => 14,
+        _ => return Err(format!("raw-binop-{}", binop_construct_tag(op))),
+    };
+    Ok(code)
+}
+
+/// Sharp census tag for an un-mirrored `BinaryOp` (the `_` arm of
+/// `binop_opcode`).
+#[allow(dead_code)]
+fn binop_construct_tag(op: &BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::HeightCompare { .. } => "height",
+        BinaryOp::Bitwise(..) => "bitwise",
+        BinaryOp::RealArith(..) => "realarith",
+        BinaryOp::IeeeFloat(..) => "ieeefloat",
+        BinaryOp::StrGetChar => "strgetchar",
+        BinaryOp::Index(..) => "index",
+        _ => "other",
+    }
+}
+
+/// Sharp census tag for an un-mirrored `TypX` (the `_` arm of `typ_data`).
+#[allow(dead_code)]
+fn typ_construct_tag(typ: &Typ) -> &'static str {
+    match &**typ {
+        TypX::Real => "real",
+        TypX::Float(..) => "float",
+        TypX::SpecFn(..) => "specfn",
+        TypX::AnonymousClosure(..) => "closure",
+        TypX::FnDef(..) => "fndef",
+        TypX::Dyn(..) => "dyn",
+        TypX::Opaque { .. } => "opaque",
+        TypX::Primitive(..) => "primitive",
+        TypX::TypParam(..) => "typparam",
+        TypX::Projection { .. } => "projection",
+        TypX::PointeeMetadata(..) => "pointeemeta",
+        TypX::TypeId => "typeid",
+        TypX::ConstInt(..) => "constint",
+        _ => "other",
+    }
+}
+
+/// Sharp census tag for an un-mirrored `ExpX` (the `_` arm of `raw_exp`).
+#[allow(dead_code)]
+fn exp_construct_tag(e: &ExpX) -> &'static str {
+    match e {
+        ExpX::Const(..) => "const-nonint",
+        ExpX::StaticVar(..) => "staticvar",
+        ExpX::VarLoc(..) => "varloc",
+        ExpX::VarAt(..) => "varat",
+        ExpX::Loc(..) => "loc",
+        ExpX::Old(..) => "old",
+        ExpX::Call(..) => "call-nonfun",
+        ExpX::CallLambda(..) => "calllambda",
+        ExpX::Ctor(..) => "ctor",
+        ExpX::NullaryOpr(..) => "nullaryopr",
+        ExpX::Unary(..) => "unary-nonclip",
+        ExpX::UnaryOpr(..) => "unaryopr",
+        ExpX::BinaryOpr(..) => "binaryopr",
+        ExpX::If(..) => "if",
+        ExpX::WithTriggers(..) => "withtriggers",
+        ExpX::Bind(..) => "bind",
+        ExpX::ExecFnByName(..) => "execfnbyname",
+        ExpX::ArrayLiteral(..) => "arrayliteral",
+        ExpX::Interp(..) => "interp",
+        ExpX::FuelConst(..) => "fuelconst",
+        _ => "other",
     }
 }
 
