@@ -81,6 +81,17 @@ W6.
   exact tactic string is the next rung (bootstrap-59). **So loop closure is now
   precisely scoped, with NO open feasibility question — only the discharge string +
   scaling to `wp_stm_sound`, then the tactus-core authoring itself.**
+- (2026-07-15, opus-bootstrap59-authoring) **Q2 discharge string NAILED — bootstrap-59
+  DONE** (probe32 now `19 verified, 0 errors`, axiom closure `[propext]` only; both
+  `all_true_append` AND the recursive-induction `wp_sound` + `wp_sound_bites` verify).
+  The reusable idiom for authoring the tactus-core soundness proofs:
+  `#[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split
+  (simp_all (config := { zetaDelta := true }) [and_assoc]))")]` + per-arm `u_*`
+  unfold-lemma CALLS in the induction body (height-recursive spec fns get no Lean
+  eq-lemmas, so unfolds must enter the VC as hyps). See bootstrap-59 writeup + probe32
+  `REPORT.md §Q2`. **The last open feasibility question is closed** — the umbrella's
+  remaining tail is pure authoring/scaling (W5a-0 in tactus-core, then up the ladder),
+  bearing the base-hash re-verify cost, not a mechanism unknown.
 
 ## Writeup
 
