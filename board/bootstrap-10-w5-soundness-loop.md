@@ -55,6 +55,17 @@ W6.
   tactus-core rebuild). See bootstrap-49. The loop's *math* is now demonstrated on
   its first fragment; the ladder (W5a-1 → W5b → … → tactus-core authoring =
   loop closure) continues from there.
+- (2026-07-14, opus-w5a1-if-params) **W5a-1 PASS** (branching fragment + ∀-params,
+  arbitrary frame telescope; `isHypFrame` restriction lifted). See bootstrap-49 +
+  `probe-w0/probe22_w5a1_sem/`.
+- (2026-07-14, opus-w5b-callret) **W5b PASS** (bootstrap-50) — Call + Ret +
+  DeadEnd + Assign, and the If fall-through goes LIVE. Fragment now
+  `{Skip, Assume, Assert, Assign, Seq, If, Call, Ret, DeadEnd}`. Design lift:
+  `addedHyp` → `closeSem (frameDelta a)` (Call's `post` binds variables); Lemma B
+  is now a corollary of `frame_after = frame_append ∘ frameDelta`. rc=0, ~3.5s,
+  axiom closure `[propext, Quot.sound]`. `probe-w0/probe23_w5b_sem/`. **Ladder
+  remaining: W5c Loop (bootstrap-51) → W5d &mut/prophecy → W5e closures → W5f
+  adequacy spine → tactus-core authoring (loop closure).**
 
 ## Writeup
 

@@ -216,3 +216,19 @@ O6).
   (`¬cond`-forwarding, §2.2/§2.4.1) is out-of-fragment (needs Ret/DeadEnd) and
   collapses in-fragment via `diverges_zero_of_inFragment` → **W5b**
   (bootstrap-50) makes it live. **Next: W5b — Call + Ret/ret_frame.**
+- **2026-07-14 (opus-w5b-callret): W5b DONE (bootstrap-50 closed).** W5b probe at
+  `probe-w0/probe23_w5b_sem/` — rc=0, ~3.5s, axiom closure `[propext,
+  Quot.sound]`. Adds `Call`/`Ret`/`DeadEnd`/`Assign` to the fragment (now
+  `{Skip, Assume, Assert, Assign, Seq, If, Call, Ret, DeadEnd}`). **Design lift:**
+  Call's `post` frame binds variables, which W5a-1's single-`Prop` `addedHyp`
+  cannot model, so the `Seq` continuation generalised to `closeSem (frameDelta a)
+  st body` and Lemma B became a corollary of the STRUCTURAL identity
+  `frame_after f s = frame_append f (frameDelta s)` (`frame_after_eq_append`, +
+  new `frame_append_assoc`/`frame_append_fnil_right`) + probe22's
+  `closeSem_append`. This **retires `addedHyp` and `diverges_zero_of_inFragment`**.
+  Call/Ret close via `holdsAll_close_each_e` (`obligsSafe`) + `closeSem_ret_frame`
+  (RetLet binds the return value). The **If fall-through is now LIVE** — `Ret`/
+  `DeadEnd` make `diverges = 1` reachable in-fragment, so `if C { ret } rest`
+  forwards `¬C` (the W5a-1 caveat is discharged). `execSafe`'s Seq arm recurses
+  under `closeSem`'s lambda and `termination_by structural` accepts it. **Next:
+  W5c — Loop + havoc (bootstrap-51).**
