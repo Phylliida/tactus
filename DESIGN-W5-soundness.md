@@ -57,6 +57,47 @@ Concretely the semantics is parameterised by three oracles (see §2), and
 is currently trivial (all leaves range over the value universe `Int`); it
 sharpens into a real leaf-table typing constraint at W5a-1/W6.
 
+### 1.1 O5 decision (W5d) — PROPHECY = ∀-FINAL-VALUE, as spec adequacy (2026-07-15)
+
+`DESIGN-bootstrap.md` O5 posed: model `&mut`/prophecy by **∀-quantifying the
+final value** vs a **two-state** framing — "pick whichever makes W5d provable,
+document as part of spec adequacy."
+
+**DECIDED: ∀-final-value.** Rationale, grounded in the ACTUAL Verus encoding
+(read off `verus/source/vir`, not first principles):
+
+1. **It is what Verus does.** `&mut x` introduces a fresh prophesied final value
+   `x_fut`; the caller does not know it, so it is **∀-quantified** (the standard
+   RustHornBelt trick). `resolve` is `Assume(has_resolved(place))` — a
+   **hypothesis** placed as a **statement** at the resolution point
+   (`vir/src/ast.rs:1087` "`assume(has_resolved(place))`";
+   `vir/src/resolution_inference.rs:77` "insert `Assume(HasResolved(p))`"), NOT
+   an obligation to prove.
+2. **The frame telescope already IS this model.** `closeSem`'s `FBind` arm is
+   `∀ n, closeSem tail (upd st x_fut n) body` — literally the ∀-final
+   quantification; the emitted `frame_after (Assume e) = frame_append f (FHyp e)`
+   threads the resolve pin `FHyp(x == x_fut)` into the **continuation**. So the
+   W5c `execSafeF` iff (total over `StmData`, arbitrary telescope) **subsumes**
+   prophecy with **no new arm** — consistent with `DESIGN-W2-refwp` §2.6
+   (`&mut` post-state flows through the same `post: FrameList` machinery as
+   `Call`).
+3. **Two-state is unnecessary.** `old(*x)` (an ordinary local id) and `x_fut`
+   (the ∀-binder) are **distinct ids in one state** `St := Int → Int`; that is a
+   projection of the two-state model into a single valuation, and it suffices —
+   the ∀-final trick is precisely what lets a single-state WP talk about the
+   final value without a genuine post-state.
+4. **Temporal placement is the only real subtlety, and it is handled by the
+   statement structure.** Because `resolve` is a *statement*, `frame_after`
+   places its pin downstream (continuation obligations see it, upstream ones do
+   not) — proven by `prophecy_sound` (gated `∀ x_fut, resolve → P`) vs
+   `prophecy_swapped_sound` (ungated `∀ x_fut, P`). A hand-placed pre-frame
+   `FHyp` would trivialize the borrow; the reference does not do that.
+
+Landed as **probe25** (`probe-w0/probe25_w5d_sem/`), rc=0, axiom closure
+`[propext, Quot.sound]`. Caller-side shape only (the site where the ∀-final trick
+bites); the callee side (`&mut` param proving its ensures) is the ordinary `Ret`
+obligation already covered by W5b/W5c.
+
 ---
 
 ## 2. The semantic model (the objects W5 introduces)
@@ -255,3 +296,24 @@ O6).
   (wp_stm f s) st ↔ execSafeF f s st`, sound + faithful). Decrease is MODELED
   (emitted + must hold at body-end); the well-founded termination argument stays
   its own family (O6). **Next: W5d — &mut/prophecy (bootstrap-52).**
+- **2026-07-15 (opus-w5d-prophecy): W5d DONE (bootstrap-52 closed).** W5d probe
+  at `probe-w0/probe25_w5d_sem/` — rc=0, ~3.0s, zero warnings, axiom closure
+  `[propext, Quot.sound]` on all four theorems. **O5 RESOLVED = ∀-final-value
+  model** (§1 addendum below). W5d is a **frame/statement-level model, not a new
+  arm** — per `DESIGN-W2-refwp` §2.6, `&mut` post-state flows through the same
+  `post: FrameList`/statement machinery as `Call`, so the W5c `execSafeF` iff
+  (total over StmData, arbitrary telescope) already subsumes it. Verified against
+  the ACTUAL Verus encoding (not first principles): `&mut x` → a fresh
+  ∀-quantified final `x_fut` (= an `FBind`; `closeSem`'s FBind arm IS the
+  ∀-final quantification), and `resolve` = `Assume(has_resolved)` — a HYPOTHESIS
+  placed as a STATEMENT (`vir/src/ast.rs:1087`, `resolution_inference.rs:77`),
+  NOT an obligation. The emitted `frame_after (Assume e) = frame_append f (FHyp
+  e)` threads the resolve pin into the CONTINUATION. Main result `prophecy_sound`:
+  the reference WP for `resolve; assert P(*x)` reduces EXACTLY to `∀ x_fut,
+  resolve(x_fut) → P(x_fut)`. **Temporal-placement subtlety** (flagged by
+  Danielle's local model — the worry that an FHyp shifts the pin to the wrong end
+  of the borrow): discharged by `prophecy_swapped_sound` — the swapped
+  `assert; resolve` reduces to the UNGATED `∀ x_fut, P(x_fut)`, so the two forms
+  DIFFER (they could not if resolve were a pre-body FHyp), proving `frame_after`
+  places the pin temporally-correctly. Negative control (drop the resolve gate)
+  fails elaboration ⇒ the iff bites. **Next: W5e — closures (bootstrap-53).**
