@@ -1,9 +1,9 @@
 ---
 title: "W5a — reference-WP soundness, straight-line fragment (Skip/Assume/Assert/Seq → If + seed ∀-params)"
-status: in_progress
-claimed_by: opus-w5a-kickoff
+status: done
+claimed_by: opus-w5a1-if-params
 created: 2026-07-14T21:30:00Z
-updated: 2026-07-14T21:30:00Z
+updated: 2026-07-14T22:45:00Z
 ---
 
 ## Description
@@ -60,6 +60,28 @@ tactus-core authoring step (loop closure) — but the probe unblocks immediately
   generate equational theorems for the emitted structural defs; sizeOf WF recursion
   through Box; no Mathlib → no `tauto`). **W5a-1 is next** (add If + FBind/∀ seed
   params + real All/Let denotation).
+- (2026-07-14, opus-w5a1-if-params) **W5a-1 PROBE COMPLETE — TASK DONE.**
+  `probe-w0/probe22_w5a1_sem/` (`w5a1_sem.lean` + `run.sh` + `REPORT.md`)
+  elaborates against the REAL emitted `lib.wp_stm`/`lib.frame_after`/
+  `lib.frame_append`/`lib.close_e`/`lib.goals_append`/`lib.diverges`/
+  `lib.is_skip`/`lib.seed_frame` — no tactus-core rebuild — **rc=0, ~3.1s.**
+  Three lifts over W5a-0: (1) **`If`** (flat two-way, `wp_stm`'s If arm;
+  `execSafe (If c nc t e) = (hp c → execSafe t) ∧ (hp nc → execSafe e)`);
+  (2) **FBind/∀ seed params + FLet lets** via a GENERAL frame telescope
+  `closeSem` (FBind→∀, FHyp→→, FLet→let) that REPLACES W5a-0's
+  `isHypFrame f → frameHyps f st → execSafe s st` with the restriction-free
+  `closeSem f st (execSafe s ·)` — **the isHypFrame guard is gone**;
+  (3) **real All/Let denotation** for `holds` (were placeholders, now reached &
+  faithful). Proves `wp_stm_sound` (arbitrary telescope) + `ref_wp_sound` over
+  the genuine all-FBind `lib.seed_frame` + two non-vacuity witnesses (if-branch
+  obligation under `hp c`; ∀-param seed obligation for all valuations).
+  **Axiom closure `[propext, Quot.sound]`** — no `Classical.choice`, no
+  `sorryAx`. New lemmas: `closeSem_congr`/`_triv`/`_and` (telescope algebra) +
+  Lemmas A/B/C/D generalised to the full telescope + `diverges_zero_of_inFragment`
+  (kills the If fall-through in-fragment). Honest caveat: the `frame_after` If
+  fall-through `¬cond`-forwarding is out-of-fragment (needs Ret/DeadEnd) → W5b.
+  Detail in `probe-w0/probe22_w5a1_sem/REPORT.md`. **NEXT = W5b (bootstrap-50):
+  Call + Ret/ret_frame; the If fall-through goes live there.**
 
 ## Writeup
 
@@ -83,3 +105,35 @@ interpretation (`hp`/`he`) fully opaque (valuation-parametric). Full detail in
   re-verify + olean re-emit). This is the deliberate probe-first split
   (`DESIGN-W5-soundness.md` §4): prove the concept before the expensive
   integration, exactly as W0/probe14 did.
+
+---
+
+**W5a-1 DONE (probe, `probe-w0/probe22_w5a1_sem/`).** The reference WP is sound on
+the BRANCHING fragment `{Skip, Assume, Assert, Seq, If}` over an **arbitrary frame
+telescope** — the `isHypFrame` restriction is lifted. rc=0, ~3.1s, axiom closure
+`[propext, Quot.sound]`. Full detail in `probe-w0/probe22_w5a1_sem/REPORT.md`.
+
+- **What's proven / verified:** `wp_stm_sound : inFragment s → holdsAll (wp_stm
+  f s) st → closeSem f st (execSafe s ·)` (main, no frame restriction);
+  `ref_wp_sound` over the genuine all-`FBind` `lib.seed_frame`; two non-vacuity
+  witnesses (if-branch obligation delivered under `hp c`; ∀-param seed obligation
+  for all valuations). All elaborate against the genuine emitted defs
+  (`lib.wp_stm`/`frame_after`/`frame_append`/`close_e`/`goals_append`/`diverges`/
+  `is_skip`/`seed_frame`).
+- **The design lift:** W5a-0's `frameHyps f st → execSafe s st` (hyp-frames only)
+  becomes `closeSem f st (execSafe s ·)`, a general frame-telescope
+  interpretation folding `FBind → ∀ (upd)`, `FHyp → →`, `FLet → let (upd ∘ lv)`.
+  The three telescope lemmas (`closeSem_congr`/`_triv`/`_and`) + the generalised
+  bridging Lemmas A/B/C/D carry the DESIGN §3 skeleton to the full telescope. A
+  third oracle `lv : Int→St→Int` (let values) joins `hp`/`he`.
+- **Honest partial / caveats:** the `frame_after` **If fall-through**
+  (`¬cond`-forwarding when the then-branch diverges & else is Skip) is
+  out-of-fragment — divergence needs `Ret`/`DeadEnd`, so
+  `diverges_zero_of_inFragment` collapses it to `frame_after f (If) = f`
+  in-fragment (faithful, not a shortcut); it goes live at **W5b**. Guard leaves
+  `hp c`/`hp nc` are independent (conservative reading). Still Val-level, partial
+  correctness (adequacy spine = W5f; Loop = W5c). Still probe-first: authoring the
+  model in tactus-core (loop closure) remains deferred.
+- **`ref_wp_sound` now needs no `isHypFrame` hypothesis** — the genuine
+  `lib.seed_frame` (all `FBind`) is handled directly by `closeSem`'s ∀ arm. This
+  was the concrete blocker W5a-1 set out to remove; it is removed.
