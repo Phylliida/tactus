@@ -710,6 +710,8 @@ theorem u_edenote_exists (E : SymEnv) (x : Int) (ty : lib.TypData) (b : Tactus.B
     edenote E (lib.ExprData.Exists x ty b) st = (∃ n : Int, edenote E b.deref (upd st x n)) := rfl
 theorem u_edenote_appn (E : SymEnv) (f : Int) (args : Tactus.Box lib.ExprList) (st : St) :
     edenote E (lib.ExprData.AppN f args) st = (eval E (lib.ExprData.AppN f args) st ≠ 0) := rfl
+theorem u_eval_fieldproj (E : SymEnv) (x : Tactus.Box lib.ExprData) (fld : Int) (st : St) :
+    eval E (lib.ExprData.FieldProj x fld) st = E.proj (eval E x.deref st) fld := rfl
 
 -- W5f v2 Match-decode unfold lemmas (same `:= rfl` idiom).
 theorem u_edenote_atom (E : SymEnv) (id : Int) (st : St) :
@@ -963,6 +965,33 @@ theorem adequacy_leaf_appn_grounded (E : SymEnv) (mId nId fId ltId : Int)
   simp only [u_edenote_binop, hop, u_eval_appn, u_evalList_cons, u_evalList_nil,
     u_eval_atom, u_eval_lit, hfnN]
 
+-- ══ FACT 12 — adequacy_leaf_proj. THE FieldProj render→denote step: a record field
+--    access inside a Bool obligation, `base.f < 10`, DENOTES `E.proj (⟦base⟧) f < 10`
+--    where `E.proj` is the projection oracle. Over the REAL render_exp: `RawExp.Field
+--    f TyInt base → ExprData.FieldProj (render_exp base) f` (an Int-typed field, so
+--    the outer BinOp deref logic is a no-op, exactly as FACT 5/8). Stated for an
+--    ARBITRARY `base : RawExp` — the honest content here is the FieldProj arm
+--    selection + the projection-oracle read; grounding (board bootstrap-57 rung 2)
+--    instantiates `base` to the emitted constructor `Point.mk a b` and PINS
+--    `E.proj` mutually consistent with the `fnN` constructor encoding (the
+--    field-encoding adequacy theorem lives at the pin, not here). ══
+theorem adequacy_leaf_proj (E : SymEnv) (fld ltId : Int) (base : lib.RawExp) (st : St)
+    (hop : E.opk ltId = OpKind.lt) :
+    edenote E (lib.render_exp
+      (lib.RawExp.BinOp ltId lib.TypData.TyBool
+        (Tactus.Box.mk (lib.RawExp.Field fld lib.TypData.TyInt (Tactus.Box.mk base)))
+        (Tactus.Box.mk (lib.RawExp.Lit 10 lib.TypData.TyInt)))) st
+      ↔ (E.proj (eval E (lib.render_exp base) st) fld < 10) := by
+  have hr : lib.render_exp
+      (lib.RawExp.BinOp ltId lib.TypData.TyBool
+        (Tactus.Box.mk (lib.RawExp.Field fld lib.TypData.TyInt (Tactus.Box.mk base)))
+        (Tactus.Box.mk (lib.RawExp.Lit 10 lib.TypData.TyInt)))
+      = lib.ExprData.BinOp ltId
+          (Tactus.Box.mk (lib.ExprData.FieldProj (Tactus.Box.mk (lib.render_exp base)) fld))
+          (Tactus.Box.mk (lib.ExprData.Lit 10)) := rfl
+  rw [hr]
+  simp only [u_edenote_binop, hop, u_eval_fieldproj, u_eval_lit]
+
 -- ══════════════════════════════════════════════════════════════════════
 -- W5f v2 MATCH decode (board bootstrap-56) — the faithful `Match` facts. Each
 -- over the REAL `lib.render_exp`/`lib.render_arms`. The scrutinee is a var of a
@@ -1124,6 +1153,7 @@ end W5f
 #print axioms W5f.adequacy_leaf_exists         -- v2: Exists binder threading
 #print axioms W5f.adequacy_leaf_ite            -- v2: Ite (decidable, no Classical)
 #print axioms W5f.adequacy_leaf_appn_grounded  -- v2: AppN grounding + evalList fold
+#print axioms W5f.adequacy_leaf_proj           -- v2: FieldProj render→denote (rung-2 base)
 #print axioms W5f.adequacy_leaf_match_hd       -- v2 Match: tag→arm0 select + binder thread
 #print axioms W5f.adequacy_leaf_match_tl       -- v2 Match: miss arm0 → walk to arm1
 #print axioms W5f.adequacy_leaf_match_prop_hd  -- v2 Match: prop-position edenoteArms

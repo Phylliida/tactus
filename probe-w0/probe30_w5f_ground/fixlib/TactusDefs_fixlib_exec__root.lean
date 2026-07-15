@@ -20,6 +20,13 @@
 -- dependency beyond Nat, so this module imports only `TactusPrelude` (the fixture's
 -- `__base` cone — Seq/Set/Tree machinery — is not needed for the rung-1 fns; rung 3's
 -- `fixlib.tree_head`/`fixlib.Tree` will pull it in when that rung lands).
+--
+-- RUNG 2 addition (board bootstrap-57): the `Point` record, VERBATIM-renamed from the
+-- emitter's `bootstrap-fixture/out/lib/TactusDefs_lib_exec__base.lean:40-43`
+-- (`structure lib.Point where x : Int; y : Int deriving Inhabited`) — only `lib.` →
+-- `fixlib.`. This is the REAL emitted datatype; rung-2 grounds the `proj` leaf oracle
+-- against its genuine `.x`/`.y` structure projections (not a hand-written pair), the
+-- faithful analog of rung-1 grounding `fn` against `fixlib.sq`.
 -- ══════════════════════════════════════════════════════════════════════
 import TactusPrelude
 set_option linter.unusedVariables false
@@ -31,3 +38,7 @@ noncomputable def fixlib.g2 (a : Nat) (b : Nat) : Nat :=
   a + b
 noncomputable def fixlib.g3 (a : Nat) (b : Nat) (c : Nat) : Nat :=
   a + b + c
+structure fixlib.Point where
+  x : Int
+  y : Int
+  deriving Inhabited

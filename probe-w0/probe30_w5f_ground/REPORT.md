@@ -1,8 +1,10 @@
-# probe30 — W5f v2 grounding, RUNG 1 (board bootstrap-57)
+# probe30 — W5f v2 grounding, RUNGS 1+2 (board bootstrap-57)
 
-**Status: PASS ✓** (`./run.sh`, ~1.2s elaborate). Grounds the CALL-fragment leaf
-oracles `fn`/`fnN` of the W5f-v2 reference-WP soundness model to REAL emitted defs,
-discharging probe29's FACT 5/8 free hypotheses by `rfl`.
+**Status: PASS ✓** (`./run.sh`, ~1.6s elaborate). Grounds the leaf oracles `fn`/`fnN`
+(rung 1, CALL fragment) and `proj`/`FieldProj` (rung 2, over the real emitted
+`fixlib.Point` record) of the W5f-v2 reference-WP soundness model to REAL emitted
+defs — discharging probe29's FACT 5/8 free hypotheses by `rfl`, and proving the
+FACT 12 field-projection consistency as a genuine base-2^64 **encoding theorem**.
 
 ## What this closes
 
@@ -47,9 +49,44 @@ render path's `needs_nat_coercion`/`coerce_if` decision made explicit at the pin
 (FACT 5's `Call … TyInt … TyInt` shape carries no cast node, so the coercion is
 honest to place here).
 
+## RUNG 2 — proj/FieldProj grounded to the real `fixlib.Point`
+
+`proj : Int → Int → Int` reads an **Int** base, so a 2-field record can't survive the
+flat-Int `eval` as itself — grounding proj is an **encoding theorem**, not an `rfl`
+discharge (recon note A). Because `Point` has ONE constructor (no tag decode), the
+encoding is a plain base-2^64 pairing:
+
+```
+POW = 2^64
+embPoint p          = p.x * POW + p.y        -- REAL fixlib.Point projections
+crateEnv.fnN 1      = mkPointLift            -- = embPoint (fixlib.Point.mk a b)
+crateEnv.proj v fld = if fld = xFieldId then v / POW
+                      else if fld = yFieldId then v % POW else 0
+```
+
+The consistency theorems `proj_x_consistent` / `proj_y_consistent`:
+`crateEnv.proj (embPoint (fixlib.Point.mk a b)) xFieldId = a` (resp. `= b`), closed by
+`omega` given the field bound `0 ≤ b < 2^64` — **exactly the fixture obligation's own
+`h_b_bound`** (`mk_point.lean`). `embPoint (fixlib.Point.mk a b)` reduces (`rfl`, via
+the genuine `.x`/`.y` structure projections of the real emitted record) to `a·POW+b`;
+`omega` recovers each field. This is what "grounded to emitter output" means for proj:
+the flat-Int oracle provably **agrees** with the real `fixlib.Point` projection.
+
+New FACT 12 in probe29 (`adequacy_leaf_proj`): the FieldProj render→denote step —
+`(base.f < 10)` denotes `E.proj ⟦base⟧ f < 10`, abstract `E`, `[propext]` (like FACT
+5/8). The grounded facts `ground_proj_x`/`ground_proj_y` compose FACT 12 with the
+encoding theorem over base = the emitted constructor `Point.mk a b` (rendered as an
+AppN, recon note B), exposing the REAL `(fixlib.Point.mk (st a) (st b)).x`/`.y` in the
+RHS. All four rung-2 theorems carry `[propext, Quot.sound]` (standard core axioms; the
+`Quot.sound` enters via `omega`'s Int div/mod) — **no `Classical.choice`, no `sorryAx`**.
+
+The `fixlib.Point` structure is itself a **verbatim rename** of the emitter's
+`bootstrap-fixture/out/lib/TactusDefs_lib_exec__base.lean` `structure lib.Point`
+(only `lib.`→`fixlib.`) — the real emitted datatype, the faithful analog of rung-1's
+`fixlib.sq`.
+
 ## Remaining (this card stays in_progress)
 
-- **RUNG 2** — `proj`/`FieldProj` over `lib.Point`/mk_point. Same crateEnv shape.
 - **RUNG 3** (deferred) — `ctorTag`/`ctorField` over a real enum+match
   (`fixlib.Tree`/`tree_head`). This is the **Hard Rung**: a genuine encoding-adequacy
   theorem (choose `emb : Tree → Int`, prove `ctorTag`/`ctorField` consistent with the
