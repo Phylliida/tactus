@@ -27,6 +27,19 @@
 -- `fixlib.`. This is the REAL emitted datatype; rung-2 grounds the `proj` leaf oracle
 -- against its genuine `.x`/`.y` structure projections (not a hand-written pair), the
 -- faithful analog of rung-1 grounding `fn` against `fixlib.sq`.
+--
+-- RUNG 3 addition (board bootstrap-57): the `Tree` ENUM + `tree_head` match-bodied fn,
+-- VERBATIM-renamed from the emitter's
+-- `bootstrap-fixture/out/lib/TactusDefs_lib_exec__base.lean:22-25` (the `inductive
+-- lib.Tree | Leaf (val0 : Int) | Node (val0 val1 : Box Tree)`) and
+-- `…__root.lean:13-14` (`def lib.tree_head (t:Tree):Int := match t with | Leaf v => v
+-- | Node _l _r => 0`) — only `lib.` → `fixlib.`. This is the REAL emitted enum + the
+-- ONLY real Match-carrying user fn on the slice (recon C); rung-3 grounds the
+-- `ctorTag`/`ctorField` leaf oracles against a genuine encoding of this `Tree`, tied to
+-- this `tree_head`. The emitted per-ctor accessor/`height` simp defs
+-- (`Tree.isLeaf`/`Leaf_val0`/…, `__base.lean:26-39`) are NOT needed for the grounding
+-- (the match denotes through `ctorTag`/`ctorField`, not the Lean projections) and — like
+-- the unused sq/g2/g3 deps — are omitted; `Tree` needs only `Tactus.Box` (prelude).
 -- ══════════════════════════════════════════════════════════════════════
 import TactusPrelude
 set_option linter.unusedVariables false
@@ -42,3 +55,9 @@ structure fixlib.Point where
   x : Int
   y : Int
   deriving Inhabited
+inductive fixlib.Tree where
+  | Leaf (val0 : Int)
+  | Node (val0 : Tactus.Box fixlib.Tree) (val1 : Tactus.Box fixlib.Tree)
+  deriving Inhabited
+noncomputable def fixlib.tree_head (t : fixlib.Tree) : Int :=
+  match t with | fixlib.Tree.Leaf v => v | fixlib.Tree.Node _l _r => 0

@@ -72,6 +72,50 @@ noncomputable def mkPointLift : List Int → Int :=
     | a :: b :: _ => embPoint (fixlib.Point.mk a b)
     | _           => 0
 
+-- ══ RUNG 3 encoding — ground `ctorTag`/`ctorField` (the Match decode oracles) over the
+--    REAL emitted ENUM `fixlib.Tree` + the REAL match-bodied `fixlib.tree_head`. This is
+--    the Hard Rung (recon note A): a genuine encoding theorem, not an rfl discharge —
+--    CHOOSE `embTree : fixlib.Tree → Int` and PROVE the `ctorTag`/`ctorField` oracles
+--    invert the constructor tag + fields w.r.t. it. The flat-Int model stores a Tree
+--    value as ONE Int, and the emitted `tree_head`'s match (`Leaf v => v | Node _ _ => 0`)
+--    maps EXACTLY onto FACT 9/10/11's 2-arm shape (arm0 = 1 binder, body reads it; arm1 =
+--    2 binders, body 0). So grounding = pin the scrutinee slot to `embTree t` and
+--    discharge FACT 9/10/11's `htag`/`hmiss`/`htag1` by the encoding consistency.
+--
+--    THE ENCODING (parity tag; low-bit = constructor). `Leaf v` ↦ EVEN `2·v` (the value
+--    survives in the high bits, recoverable by `/2` — for ALL Int v, incl. negative);
+--    `Node l r` ↦ ODD `2·(embTree l + embTree r)+1` (RECURSES through both children, so
+--    it is a genuine whole-tree fold, not a constant). `ctorTag n = if n%2=0 then 0 else
+--    1` picks the arm — robust to the Int emod/tdiv sign convention (odd is NEVER ≡0 mod
+--    2 under either; Danielle's model flagged the naked `n%2` trap for negative-odd, so
+--    the guarded form is used). `ctorField n _ = n/2` recovers the Leaf payload.
+--
+--    SCOPE (honest, per Danielle's model + card): `tree_head` never READS Node children
+--    (returns 0 for every Node), so its faithful grounding needs the Node PARITY (tag)
+--    only, NOT Node-child DECODE. Full injective Node decode = an invertible unbounded
+--    pairing, which is OUTSIDE omega's Presburger fragment (no Mathlib here) — that is
+--    the genuine remaining hard kernel, explicitly DEFERRED. What lands here: the tags
+--    (both ctors) + the Leaf field are grounded to a real encoding of the real `Tree`,
+--    tying the flat-Int Match evaluation to the REAL `fixlib.tree_head t` for ALL t. ══
+def leafTag : Int := 0                          -- Tree.Leaf constructor id (even → low bit 0)
+def nodeTag : Int := 1                          -- Tree.Node constructor id (odd → low bit 1)
+
+-- the embedding: pack the REAL emitted `fixlib.Tree` base-2 with the ctor tag in the low
+-- bit. Well-founded (through `Tactus.Box`, mirroring the emitted `Tree.height`); its two
+-- head equations are the `embTree_leaf`/`embTree_node` rfl-grade lemmas below.
+noncomputable def embTree (t : fixlib.Tree) : Int :=
+  match t with
+  | fixlib.Tree.Leaf v => 2 * v
+  | fixlib.Tree.Node l r => 2 * (embTree l.deref + embTree r.deref) + 1
+termination_by sizeOf t
+decreasing_by all_goals (simp_all; omega)
+
+theorem embTree_leaf (v : Int) : embTree (fixlib.Tree.Leaf v) = 2 * v := by
+  simp only [embTree]
+theorem embTree_node (l r : Tactus.Box fixlib.Tree) :
+    embTree (fixlib.Tree.Node l r) = 2 * (embTree l.deref + embTree r.deref) + 1 := by
+  simp only [embTree]
+
 -- ── the per-crate SymEnv literal (P5 match-literal discipline, cf. probe5's
 --    `crateEnv`). fn/fnN PINNED to the renamed emitter output; proj PINNED to the
 --    base-2^64 decode of the `fixlib.Point` embedding (rung 2). av/avP given their
@@ -89,8 +133,10 @@ noncomputable def crateEnv : SymEnv where
   fnN       := fun f => match f with | 0 => g2Lift | 1 => mkPointLift | _ => fun _ => 0
   proj      := fun v fld => if fld = xFieldId then v / POW
                             else if fld = yFieldId then v % POW else 0
-  ctorTag   := fun _ => 0
-  ctorField := fun _ _ => 0
+  -- RUNG 3: pinned to the `fixlib.Tree` parity encoding. `ctorTag` reads the low bit
+  -- (guarded form — sign-convention-robust); `ctorField` recovers the packed payload.
+  ctorTag   := fun n => if n % 2 = 0 then leafTag else nodeTag
+  ctorField := fun n _ => n / 2
 
 -- ── the free hypotheses of FACT 5/8, now DISCHARGED (not passed in) by rfl. This is
 --    the whole point: the oracle lookups reduce to the real emitted defs. ──
@@ -199,6 +245,103 @@ theorem ground_proj_y (aId bId : Int) (st : St) (hb : 0 ≤ st bId ∧ st bId < 
     proj_y_consistent (st aId) (st bId) hb
   rw [hy]
 
+-- ══════════════════════════════════════════════════════════════════════
+-- RUNG 3 — ground `ctorTag`/`ctorField` to the REAL `fixlib.Tree` + `fixlib.tree_head`.
+-- ══════════════════════════════════════════════════════════════════════
+
+-- ── the rendered `tree_head` match, shared by the three grounded facts. Matches FACT
+--    9/10/11's inline `MatchR` exactly (abbrev ⇒ reducibly interchangeable with the
+--    fact's own expression, so the `rw [FACT]` fires). arm0 = Leaf (ctor c0, binds
+--    [xId], body reads xId); arm1 = Node (ctor c1, binds [yId,zId], body 0). ──
+abbrev treeHeadMatchR (scrutId c0 c1 xId yId zId : Int) : lib.RawExp :=
+  lib.RawExp.MatchR
+    (Tactus.Box.mk (lib.RawExp.Var scrutId (lib.TypData.TyNamed 100)))
+    (Tactus.Box.mk (lib.RawArmList.Cons c0
+      (lib.BinderIdList.Cons xId (Tactus.Box.mk lib.BinderIdList.Nil))
+      (Tactus.Box.mk (lib.RawExp.Var xId lib.TypData.TyInt))
+      (Tactus.Box.mk (lib.RawArmList.Cons c1
+        (lib.BinderIdList.Cons yId (Tactus.Box.mk (lib.BinderIdList.Cons zId (Tactus.Box.mk lib.BinderIdList.Nil))))
+        (Tactus.Box.mk (lib.RawExp.Lit 0 lib.TypData.TyInt))
+        (Tactus.Box.mk lib.RawArmList.Nil)))))
+    lib.TypData.TyInt
+
+-- ══ RUNG 3 ENCODING CONSISTENCY (the encoding theorem) — the `ctorTag`/`ctorField`
+--    oracles invert the constructor tag + Leaf field w.r.t. `embTree`. omega round-trips
+--    over the parity encoding (recon note A: a genuine proof, not an rfl discharge). ══
+theorem ctorTag_leaf (v : Int) :
+    crateEnv.ctorTag (embTree (fixlib.Tree.Leaf v)) = leafTag := by
+  show (if (embTree (fixlib.Tree.Leaf v)) % 2 = 0 then (0:Int) else 1) = 0
+  rw [embTree_leaf]; omega
+theorem ctorTag_node (l r : Tactus.Box fixlib.Tree) :
+    crateEnv.ctorTag (embTree (fixlib.Tree.Node l r)) = nodeTag := by
+  show (if (embTree (fixlib.Tree.Node l r)) % 2 = 0 then (0:Int) else 1) = 1
+  rw [embTree_node]; omega
+theorem ctorTag_node_ne_leaf (l r : Tactus.Box fixlib.Tree) :
+    crateEnv.ctorTag (embTree (fixlib.Tree.Node l r)) ≠ leafTag := by
+  rw [ctorTag_node]; decide
+theorem ctorField_leaf (v : Int) :
+    crateEnv.ctorField (embTree (fixlib.Tree.Leaf v)) 0 = v := by
+  show (embTree (fixlib.Tree.Leaf v)) / 2 = v
+  rw [embTree_leaf]; omega
+
+-- ══ RUNG 3a — the LEAF-arm VALUE leaf pinned to emitter output. The scrutinee slot holds
+--    `embTree (Leaf v)`; FACT 9 selects arm0 (`htag` discharged by `ctorTag_leaf`, NOT
+--    passed in) and reads the threaded binder; the encoding grounds the whole match to the
+--    REAL `fixlib.tree_head (Leaf v)` (= v). ══
+theorem ground_match_leaf_val (scrutId xId yId zId : Int) (st : St) (v : Int)
+    (hscrut : st scrutId = embTree (fixlib.Tree.Leaf v)) :
+    eval crateEnv (lib.render_exp (treeHeadMatchR scrutId leafTag nodeTag xId yId zId)) st
+      = fixlib.tree_head (fixlib.Tree.Leaf v) := by
+  have htag : crateEnv.ctorTag (crateEnv.av scrutId st) = leafTag := by
+    show crateEnv.ctorTag (st scrutId) = leafTag
+    rw [hscrut]; exact ctorTag_leaf v
+  rw [adequacy_leaf_match_hd crateEnv scrutId leafTag nodeTag xId yId zId st htag]
+  -- RHS: `av xId (upd st xId (ctorField (st scrutId) 0))` → `(st scrutId)/2` → `(2v)/2` = v;
+  --      `tree_head (Leaf v)` reduces (rfl) to v.
+  show (if xId = xId then (crateEnv.ctorField (st scrutId) 0) else st xId)
+      = fixlib.tree_head (fixlib.Tree.Leaf v)
+  rw [if_pos rfl]
+  show (st scrutId) / 2 = v
+  rw [hscrut, embTree_leaf]; omega
+
+-- ══ RUNG 3b — the NODE-arm VALUE leaf pinned to emitter output. The scrutinee slot holds
+--    `embTree (Node l r)`; FACT 10 walks PAST arm0 (`hmiss` by `ctorTag_node_ne_leaf`) to
+--    arm1 (`htag1` by `ctorTag_node`), whose body is 0 = the REAL `fixlib.tree_head (Node
+--    l r)`. Exercises the recursive arm walk over the real enum's Node ctor. ══
+theorem ground_match_node_val (scrutId xId yId zId : Int) (st : St)
+    (l r : Tactus.Box fixlib.Tree) (hscrut : st scrutId = embTree (fixlib.Tree.Node l r)) :
+    eval crateEnv (lib.render_exp (treeHeadMatchR scrutId leafTag nodeTag xId yId zId)) st
+      = fixlib.tree_head (fixlib.Tree.Node l r) := by
+  have hmiss : crateEnv.ctorTag (crateEnv.av scrutId st) ≠ leafTag := by
+    show crateEnv.ctorTag (st scrutId) ≠ leafTag
+    rw [hscrut]; exact ctorTag_node_ne_leaf l r
+  have htag1 : crateEnv.ctorTag (crateEnv.av scrutId st) = nodeTag := by
+    show crateEnv.ctorTag (st scrutId) = nodeTag
+    rw [hscrut]; exact ctorTag_node l r
+  rw [adequacy_leaf_match_tl crateEnv scrutId leafTag nodeTag xId yId zId st hmiss htag1]
+  -- FACT 10 gives `= 0`; `fixlib.tree_head (Node l r)` reduces (rfl) to 0.
+  rfl
+
+-- ══ RUNG 3c — the LEAF-arm PROP leaf pinned to emitter output. The prop-position mirror
+--    (FACT 11 / `edenote`): the arm-0 body's Prop reading is `avP xId (…)` = `(st slot ≠
+--    0)`, grounded to the REAL `fixlib.tree_head (Leaf v) ≠ 0` (= `v ≠ 0`). ══
+theorem ground_match_leaf_prop (scrutId xId yId zId : Int) (st : St) (v : Int)
+    (hscrut : st scrutId = embTree (fixlib.Tree.Leaf v)) :
+    edenote crateEnv (lib.render_exp (treeHeadMatchR scrutId leafTag nodeTag xId yId zId)) st
+      ↔ (fixlib.tree_head (fixlib.Tree.Leaf v) ≠ 0) := by
+  have htag : crateEnv.ctorTag (crateEnv.av scrutId st) = leafTag := by
+    show crateEnv.ctorTag (st scrutId) = leafTag
+    rw [hscrut]; exact ctorTag_leaf v
+  rw [adequacy_leaf_match_prop_hd crateEnv scrutId leafTag nodeTag xId yId zId st htag]
+  -- RHS: `avP xId (upd st xId (ctorField (st scrutId) 0))` = `((st scrutId)/2 ≠ 0)` =
+  --      `((2v)/2 ≠ 0)` = `(v ≠ 0)`; `tree_head (Leaf v) ≠ 0` reduces to `v ≠ 0`.
+  show (if xId = xId then (crateEnv.ctorField (st scrutId) 0) else st xId) ≠ 0
+      ↔ (v ≠ 0)
+  rw [if_pos rfl]
+  show ((st scrutId) / 2 ≠ 0) ↔ (v ≠ 0)
+  have h2 : (2 * v) / 2 = v := by omega
+  rw [hscrut, embTree_leaf, h2]
+
 end W5fGround
 
 -- axiom closure (regression guard): the grounded CALL-fragment facts close over ONLY
@@ -214,3 +357,13 @@ end W5fGround
 #print axioms W5fGround.proj_y_consistent    -- rung 2: base-2^64 y-decode round-trip
 #print axioms W5fGround.ground_proj_x        -- rung 2: (Point.mk a b).x grounded
 #print axioms W5fGround.ground_proj_y        -- rung 2: (Point.mk a b).y grounded
+-- rung 3: the ctorTag/ctorField parity-encoding consistency (the encoding theorem) +
+-- the three grounded Match facts tied to the REAL fixlib.tree_head. Expect [propext,
+-- Quot.sound] (omega Int div/mod + the wf-rec embTree unfold) — no Classical.choice, no
+-- sorryAx (matches rung-2's proj_*_consistent axiom profile).
+#print axioms W5fGround.ctorTag_leaf         -- rung 3: Leaf tag decode (parity)
+#print axioms W5fGround.ctorTag_node         -- rung 3: Node tag decode (parity)
+#print axioms W5fGround.ctorField_leaf       -- rung 3: Leaf field decode (/2)
+#print axioms W5fGround.ground_match_leaf_val  -- rung 3: Match Leaf arm → tree_head (=v)
+#print axioms W5fGround.ground_match_node_val  -- rung 3: Match Node arm → tree_head (=0)
+#print axioms W5fGround.ground_match_leaf_prop -- rung 3: Match Leaf arm, prop position

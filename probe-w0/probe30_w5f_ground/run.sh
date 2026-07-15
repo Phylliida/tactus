@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# W5f v2 GROUNDING probe — RUNGS 1+2 (board bootstrap-57). Grounds the leaf oracles
-# fn/fnN (rung 1, CALL fragment) and proj/FieldProj (rung 2, over the real emitted
-# fixlib.Point record) to REAL emitted defs. Imports (obstacle D solved by rename):
+# W5f v2 GROUNDING probe — RUNGS 1+2+3 (board bootstrap-57). Grounds the leaf oracles
+# fn/fnN (rung 1, CALL fragment), proj/FieldProj (rung 2, over the real emitted
+# fixlib.Point record), and ctorTag/ctorField (rung 3, over the real emitted fixlib.Tree
+# enum + fixlib.tree_head match) to REAL emitted defs. Imports (obstacle D solved by rename):
 #   - tactus-core  TactusDefs_lib_exec        (lib.render_exp / lib.RawExp / …)
-#   - probe29      w5f_v2_match_sem           (W5f.SymEnv / edenote / FACT 5,8,12)
-#   - fixture      TactusDefs_fixlib_exec__root (fixlib.sq/g2 + fixlib.Point, renamed cone)
+#   - probe29      w5f_v2_match_sem           (W5f.SymEnv / edenote / FACT 5,8,9,10,11,12)
+#   - fixture      TactusDefs_fixlib_exec__root (fixlib.sq/g2 + fixlib.Point + fixlib.Tree, renamed cone)
 #
 # The probe29 + fixlib oleans are built once by this script if missing/stale.
 # Usage: probe-w0/probe30_w5f_ground/run.sh    (LEAN=<lean> to override)
@@ -19,7 +20,7 @@ FIXLIB="$HERE/fixlib"
 LEAN_BIN="${LEAN:-$(command -v lean)}"
 SRC="$HERE/ground.lean"
 
-echo "== W5f v2 grounding probe — RUNG 1 (fn/fnN pinned to renamed emitter output) =="
+echo "== W5f v2 grounding probe — RUNGS 1+2+3 (fn/fnN, proj, ctorTag/ctorField pinned to emitter output) =="
 echo "core out : $CORE_OUT"
 echo "probe29  : $PROBE29"
 echo "fixlib   : $FIXLIB"
@@ -51,7 +52,7 @@ t1=$(date +%s%N)
 echo
 echo "elapsed: $(( (t1 - t0) / 1000000 )) ms"
 if [ $rc -eq 0 ]; then
-  echo "PASS ✓ — RUNGS 1+2 land: fn/fnN → fixlib.sq/g2 (rfl); proj → fixlib.Point.x/.y (base-2^64 encoding thm, omega) (rc=0)"
+  echo "PASS ✓ — RUNGS 1+2+3 land: fn/fnN → fixlib.sq/g2 (rfl); proj → fixlib.Point.x/.y (base-2^64 encoding thm, omega); ctorTag/ctorField → fixlib.Tree/tree_head (parity encoding thm, omega) (rc=0)"
 else
   echo "FAIL ✗ — rc=$rc"
 fi
