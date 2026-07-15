@@ -1,9 +1,9 @@
 ---
-title: "W4a validation — in-gate bridge over the REAL tgt corpus (BLOCKED on bootstrap-40 defs divergence)"
-status: in_progress
+title: "W4a validation — in-gate bridge over the REAL tgt corpus (DONE: 1 passed, 0 failed)"
+status: done
 claimed_by: opus-w4a-tgtval
 created: 2026-07-14T12:40:00Z
-updated: 2026-07-14T13:05:00Z
+updated: 2026-07-14T17:14:00Z
 ---
 
 ## Description
@@ -465,7 +465,70 @@ has both a `tactus_tactic` proof fn (to trip the gate) and an exec fn emitting a
 obligation cert. Untested; the W4a fixture was hand-authored to have exactly
 this.
 
+## Progress (cont.) — ✅ DONE: `1 passed, 0 failed` on the real tgt corpus in-gate (opus-w4a-tgtval, 2026-07-14 17:14)
+
+**The card's done-criterion is MET.** A clean foreground in-gate run with the B2
+binary (6ea3030) over tgt's `runtime` module printed exactly the target note:
+
+```
+note: tactus: package gate: 12 modules elaborated (6 reused from per-fn checks);
+      composition + axiom closures kernel-verified
+note: tactus: 1 obligations bridge-checked against tactus-core
+      (1 passed, 0 failed) [core-olean fnv1a:ac56d5f007475edd]
+verification results:: 24 verified, 0 errors (partial verification with `--verify-*`)
+```
+
+- **Verdict flip confirmed as the B2 fix, not a stale olean.** The `core-olean
+  fnv1a:ac56d5f007475edd` is **byte-identical** to the pre-B2 run's hash
+  (bootstrap47-mono, `0 passed, 1 failed`). Same tactus-core; the only change is
+  the B2 binary now emits the `RawExp.Deref`-wrapped RHS in the obligation cert,
+  so the expanded `goals_eq (ref_wp ctx sst) goals = 1 := by decide` closes.
+  This is the corpus-level confirmation of the decide-level close proved earlier.
+- **Verdict-neutral (opt-in flag).** `24 verified, 0 errors` matches the earlier
+  no-bridge baselines (bootstrap47-mono's `/tmp/w4a-bs47b.log`, and the run-#1
+  `--emit-lean` run). `--tactus-bridge` only appends the note; it changes no
+  verification obligation (`config.rs:829` gates only the note; the implied
+  `--tactus-emit-cert` writes cert files but adds no proof burden).
+- **Obligation cert present:** `runtime__impl__4__clone.cert.lean` (2667 B)
+  emitted during runtime-module verification into `$TACTUS_LEAN_OUT/lib/cert/`,
+  which `run_bridge_step` reads (the `.defcert.lean`/`.dtcert.lean` twins are
+  correctly excluded by the `.cert.lean` suffix filter, `generate.rs:3668`).
+
+**Operational lesson (root cause of the repeated cut-offs — for the next
+instance).** Every prior in-gate coupling run died mid-flight with NO verdict
+(`/tmp/w4a-b2-ingate{,3}.log` both stop mid cert-emission at 16:56 / 17:01). This
+is **die-with-parent**: in the autonomous board-loop each iteration is an
+*ephemeral* `claude -p …` process under a bwrap with `--die-with-parent`, so when
+a turn ends EVERY descendant dies — a harness `run_in_background` task AND a bare
+`&`/`nohup` alike (the previous "tracked-bg" relaunch died for exactly this
+reason). **Fix that actually works: run the ~5–6 min job in the FOREGROUND,
+blocking, in a single `Bash` call** (`timeout 570000`). The process then lives and
+dies inside one tool call — no turn boundary to cross. This run: 17:08:12 →
+17:13:39 (5m27s) at load ~7.8, `rc=0`. Recorded in memory too.
+
+Repro (exact): fresh `TACTUS_LEAN_OUT`, `TACTUS_CORE_OUT=…/tactus-core/out/lib`,
+Nix lean on PATH, then foreground:
+```
+verus --lean-backend --crate-type=lib …/tactus-group-theory/src/lib.rs \
+      --tactus-bridge --verify-module runtime
+```
+(NO `--emit-lean`, NO `-V cache`.) Log: `/tmp/w4a-b2-ingate4.log` (bridge note
+line 758, summary line 786).
+
+**Follow-ups (not blockers for this card):** `bootstrap-48` tracks the B1 TCB
+hardening (move the min-balance deref into the trusted `render_exp` to close the
+narrow `count_ref_decorations` common-mode gap) — a W5-era soundness item, not
+needed for W4a. `bootstrap-09` (W4) is the next step: bridge on by default in
+package mode.
+
 ## Writeup
+
+> ✅ **CLOSED 2026-07-14.** Done-criterion met: in-gate `1 obligations
+> bridge-checked against tactus-core (1 passed, 0 failed)` on the real tgt
+> corpus (see the final Progress note above). The two deliverables below (the
+> `--emit-lean` recipe correction and the defs-family blocker diagnosis) remain
+> accurate history; the "NOT achieved" note at the end reflects an *earlier*
+> turn and is superseded by the close.
 
 **Two concrete deliverables this turn (both real, both checked):**
 
