@@ -1,10 +1,12 @@
-# probe30 — W5f v2 grounding, RUNGS 1+2 (board bootstrap-57)
+# probe30 — W5f v2 grounding, RUNGS 1+2+3 (board bootstrap-57)
 
-**Status: PASS ✓** (`./run.sh`, ~1.6s elaborate). Grounds the leaf oracles `fn`/`fnN`
-(rung 1, CALL fragment) and `proj`/`FieldProj` (rung 2, over the real emitted
-`fixlib.Point` record) of the W5f-v2 reference-WP soundness model to REAL emitted
-defs — discharging probe29's FACT 5/8 free hypotheses by `rfl`, and proving the
-FACT 12 field-projection consistency as a genuine base-2^64 **encoding theorem**.
+**Status: PASS ✓** (`./run.sh`, ~2.1s elaborate). Grounds the leaf oracles `fn`/`fnN`
+(rung 1, CALL fragment), `proj`/`FieldProj` (rung 2, over the real emitted
+`fixlib.Point` record), and `ctorTag`/`ctorField` (rung 3, over the real emitted
+`fixlib.Tree` enum + `fixlib.tree_head` match) of the W5f-v2 reference-WP soundness
+model to REAL emitted defs — discharging probe29's FACT 5/8 free hypotheses by `rfl`,
+and proving the FACT 12 field-projection + FACT 9/10/11 Match-decode consistency as
+genuine **encoding theorems**.
 
 ## What this closes
 
@@ -85,11 +87,56 @@ The `fixlib.Point` structure is itself a **verbatim rename** of the emitter's
 (only `lib.`→`fixlib.`) — the real emitted datatype, the faithful analog of rung-1's
 `fixlib.sq`.
 
-## Remaining (this card stays in_progress)
+## RUNG 3 — ctorTag/ctorField grounded to the real `fixlib.Tree` + `fixlib.tree_head`
 
-- **RUNG 3** (deferred) — `ctorTag`/`ctorField` over a real enum+match
-  (`fixlib.Tree`/`tree_head`). This is the **Hard Rung**: a genuine encoding-adequacy
-  theorem (choose `emb : Tree → Int`, prove `ctorTag`/`ctorField` consistent with the
-  constructor encoding), not an `rfl` discharge. Deferred per Danielle's steer —
-  bodies are already fn-pinned (bootstrap-56 census), so direct Match-in-goal is the
-  rare case.
+The **Hard Rung** (recon note A): the flat-Int model stores a whole `Tree` value as ONE
+Int, so `ctorTag`/`ctorField` grounding is a genuine **encoding theorem**, not an `rfl`
+discharge. The emitted `tree_head` (`Leaf v => v | Node _ _ => 0`) maps EXACTLY onto FACT
+9/10/11's 2-arm shape (arm0 = 1 binder, body reads it; arm1 = 2 binders, body 0), so
+grounding = pin the scrutinee slot to `embTree t` and discharge the FACTs'
+`htag`/`hmiss`/`htag1` by the encoding consistency.
+
+The encoding (parity tag; low bit = constructor):
+
+```
+leafTag = 0, nodeTag = 1
+embTree (Leaf v)   = 2 * v                                  -- EVEN (value survives in high bits)
+embTree (Node l r) = 2 * (embTree l.deref + embTree r.deref) + 1   -- ODD (recurses through BOTH children)
+crateEnv.ctorTag   = fun n => if n % 2 = 0 then leafTag else nodeTag  -- low-bit read
+crateEnv.ctorField = fun n _ => n / 2                       -- Leaf payload recover
+```
+
+Consistency (`ctorTag_leaf`/`ctorTag_node`/`ctorTag_node_ne_leaf`/`ctorField_leaf`): closed
+by `omega` over the parity encoding. `embTree` is well-founded (recurses through
+`Tactus.Box`, mirroring the emitted `Tree.height`); its two head equations
+(`embTree_leaf`/`embTree_node`) come out by `simp only [embTree]`.
+
+**The sign trap (flagged by Danielle's local model):** the naked `n % 2` is unsound for
+negative-odd Ints under the Int emod/tdiv convention. The **guarded** form `if n % 2 = 0
+then 0 else 1` is used instead — robust to the convention (odd is never `≡ 0 mod 2` under
+either; `omega` proves `(2v)%2=0`, `(2p+1)%2 ≠ 0` for ALL Int).
+
+The three grounded facts tie the flat-Int Match evaluation to the REAL `fixlib.tree_head`:
+- `ground_match_leaf_val` — scrutinee = `embTree (Leaf v)`, FACT 9 selects arm0, `= tree_head (Leaf v)` (= v).
+- `ground_match_node_val` — scrutinee = `embTree (Node l r)`, FACT 10 walks past arm0 to arm1, `= tree_head (Node l r)` (= 0).
+- `ground_match_leaf_prop` — prop-position mirror (FACT 11), `↔ tree_head (Leaf v) ≠ 0` (= `v ≠ 0`).
+
+All rung-3 theorems carry `[propext, Quot.sound]` (standard; `Quot.sound` via `omega`'s
+Int div/mod + the wf-rec `embTree` unfold) — **no `Classical.choice`, no `sorryAx`**. The
+`fixlib.Tree` enum + `fixlib.tree_head` are a **verbatim rename** of the emitter's
+`bootstrap-fixture/out/lib/TactusDefs_lib_exec__base.lean:22-25` +`…__root.lean:13-14`
+(only `lib.`→`fixlib.`) — the REAL emitted enum and the only real Match-carrying user fn
+on the slice (recon C).
+
+## Scope / remaining (honest)
+
+`tree_head` never READS Node children (returns 0 for every Node), so its faithful
+grounding needs the Node **parity (tag)** only, NOT Node-child **decode**. Full injective
+Node decode = an invertible **unbounded pairing** for the two children — which is OUTSIDE
+`omega`'s Presburger fragment (no Mathlib here; base-2^64 like rung 2 fails at depth > 1),
+so it is the genuine remaining hard kernel and is **explicitly deferred**. What lands: the
+tags (both ctors) + the Leaf field grounded to a real recursive encoding of the real
+`Tree`, tying the Match evaluation to the real `tree_head t` for ALL t. Per the card +
+Danielle's steer, this is the right scope — bodies are already fn-pinned (bootstrap-56
+census), so direct Match-in-goal is the rare case, and node-child inspection would be a
+follow-on only if the census ever finds a live one.
