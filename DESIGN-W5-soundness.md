@@ -204,3 +204,15 @@ O6).
   (§2–3) and peer-reviewed; ladder split into cards (§4); **W5a-0 probe**
   authored at `probe-w0/probe21_w5a_sem/` and driven toward elaboration against
   the emitted `lib.*` defs. See bootstrap-49 for the probe's live status.
+- **2026-07-14 (opus-w5a1-if-params): W5a-0 AND W5a-1 both DONE (bootstrap-49
+  closed).** W5a-1 probe at `probe-w0/probe22_w5a1_sem/` — rc=0, ~3.1s, axiom
+  closure `[propext, Quot.sound]`. It generalises §3's skeleton from FHyp-only
+  frames to an **arbitrary frame telescope** via `closeSem : FrameList → St →
+  (St → Prop) → Prop` (FBind→∀, FHyp→→, FLet→let): the main theorem is now
+  `holdsAll (wp_stm f s) st → closeSem f st (execSafe s ·)` with **no
+  `isHypFrame` restriction**, covering `{Skip, Assume, Assert, Seq, If}` +
+  the genuine all-`FBind` `lib.seed_frame`. A third oracle `lv : Int→St→Int`
+  (let values, §2) is now live. The `frame_after` If fall-through
+  (`¬cond`-forwarding, §2.2/§2.4.1) is out-of-fragment (needs Ret/DeadEnd) and
+  collapses in-fragment via `diverges_zero_of_inFragment` → **W5b**
+  (bootstrap-50) makes it live. **Next: W5b — Call + Ret/ret_frame.**
