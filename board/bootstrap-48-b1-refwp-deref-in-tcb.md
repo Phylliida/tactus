@@ -1,9 +1,9 @@
 ---
 title: "B1 (soundness follow-up) — move the structural-binop deref-balance into the TCB render_exp (close bootstrap-39's common-mode gap)"
-status: todo
-claimed_by:
+status: in_progress
+claimed_by: opus-bootstrap48-b1exec
 created: 2026-07-14T17:00:00Z
-updated: 2026-07-14T17:00:00Z
+updated: 2026-07-14T17:36:00Z
 ---
 
 ## Description
@@ -153,6 +153,42 @@ an audited assumption.** Recording this so it isn't silently inherited.
     failed` with the peel now independently checked in the TCB. Ordering puts the
     irreversible revert AFTER the TCB peel is proven correct, so a surprise in
     step 1 leaves B2 intact.
+
+- (2026-07-14, opus-bootstrap48-b1exec) **GREEN-LIT by Danielle in session; EXECUTING.
+  STEP 1 (the crux) DONE — TCB change verified GREEN IN ISOLATION.**
+  - `render_exp`'s BinOp arm (`tactus-core/lib.rs:890`) now min-balance-derefs from
+    the operand TypData: `dl=needs_ref_deref(type_of *l)`, `dr=…`, peel each by
+    `if dl>dr {1} else {0}` / `if dr>dl {1} else {0}` (the 0/1 specialization of
+    production's `dl-min(dl,dr)`; avoids nat subtraction so it reduces under
+    `decide`). Chose the recon's recommended sub-forks: (a) `deref_if` single-peel
+    (0/1 depth), (b) feed UNPEELED `type_of` to `needs_nat_coercion` — proven
+    immaterial (a ref operand is tag 4, its peel `TyNamed` tag 3; coercion fires
+    only on tag 0 `TyInt`, so it's 0 either way, AND every ref-carrying op is a
+    Bool-result structural compare ⟹ coercion off across the whole ref region).
+  - `expr_mirror_kernel_computes` (companion `decide` table) gained **4 additive
+    cases**: (1) the real clone shape `result:TyNamed(5) == self:TyRef(5)` → RHS
+    peeled one `.deref`, LHS bare [==1]; (2) kill: RHS peel dropped [==0]; (3)
+    NEGATIVE CONTROL `&Self == &Self` (both depth 1) → min-balance m=1 → NEITHER
+    peeled [==1] (this is exactly what an unsound blanket per-operand Var-deref
+    would get wrong); (4) kill: one matched-depth operand over-peeled [==0].
+  - **`verus --crate-type=lib --lean-backend --lean-all-proofs lib.rs` → 65 verified,
+    0 errors** (`/tmp/b1-core-verify.log`; package gate: 50 modules, composition +
+    axiom closures kernel-verified). Every EXISTING BinOp case (A/B/D, G6, G2/C
+    ref-call) re-verified green untouched → confirms the min-balance is a genuine
+    no-op on non-ref operands (additive-only, as the recon predicted). The crux
+    check passed with B2 STILL PRESENT (tactus-core verify doesn't invoke the
+    serializer, so it's independent of B2 — exactly why the recon ordered it first).
+  - **Faithfulness cross-check:** read production `count_ref_decorations`
+    (`expr_shared.rs:891`) — it counts REF decorations only (descends `Boxed`
+    WITHOUT incrementing, line 902), matching the TCB's `needs_ref_deref` firing on
+    tag 4 (`TyRef`) and 0 on tag 5 (`TyBox`). So the mirror is exact for the
+    depth-0/1 scope and FAIL-LOUD beyond (TCB underpeels ⟹ goals diverge ⟹ bridge
+    fails, never silent-pass).
+  - Committed this verified TCB half as a checkpoint BEFORE the irreversible B2
+    revert (recon's ordering: a surprise in step 1 leaves B2 intact). NEXT: revert
+    `6ea3030`'s `sst_serialize.rs` hunk → rebuild verus binary → re-emit tactus-core
+    `out/lib` (`--tactus-emit-module`) → re-run the in-gate bridge (expect `1
+    passed, 0 failed` with the peel now independently checked in the TCB).
 
 ## Writeup
 _when done_
