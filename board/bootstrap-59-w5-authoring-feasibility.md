@@ -1,9 +1,9 @@
 ---
 title: "W5 loop-closure AUTHORING — feasibility (spec_fn oracle + recursive-induction proof fn in tactus-core) + the discharge idiom"
-status: in_progress
+status: done
 claimed_by: opus-bootstrap59-authoring
 created: 2026-07-14T23:59:00Z
-updated: 2026-07-14T23:59:00Z
+updated: 2026-07-15T00:00:00Z
 ---
 
 ## Description
@@ -75,10 +75,61 @@ authoring in tactus-core.
   `all_true_append` verifies clean, then scale to the real `wp_stm_sound` + frame
   lemmas, then author into tactus-core (the umbrella bootstrap-10 close).
 
+- (2026-07-15, opus-bootstrap59-authoring) **DISCHARGE STRING NAILED — probe now
+  `19 verified, 0 errors`; card DONE.** Iterated the closer by direct-`lean` runs
+  against the emitted VC oleans (fast loop, no full re-emit), then confirmed by a full
+  `--lean-all-proofs` re-emit. The idiom:
+
+  ```
+  #[verifier::tactus_tactic("first | tactus_auto |
+     (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
+  ```
+
+  Three necessary ingredients (each pinned to a concrete failure mode):
+  1. `zetaDelta := true` — the body-established unfold equalities are `let`-bound LOCAL
+     Props (`h : tmp__k := (… = …)`); plain `simp_all` won't unfold local let-fvars →
+     "made no progress". `zetaDelta` exposes them as equations.
+  2. `tactus_case_split` (a REAL `cases`), NOT the `a == Cons(g,t)` bridge assert —
+     with `zetaDelta` the bridge is self-referential (`a = Cons a.Cons_val0 …`) → simp
+     rewrites `a` forever → maxRecDepth; dropping it leaves opaque `match a` projections
+     → unsolved. `cases` substitutes a fresh constructor properly. (Bridge asserts
+     removed from the source as redundant scaffolding.)
+  3. `[and_assoc]` — residual is `A∧(B∧C) ↔ (A∧B)∧C`; simp doesn't reassociate ∧ by
+     default. (`wp_sound_bites`, no datatype local, uses the `tactus_case_split`-free
+     variant.)
+
+  Also added `u_wp_*` / `u_exec_safe_*` one-step unfold lemmas (empty-body, verify) and
+  made `wp_sound`/`wp_sound_bites` CALL them per-arm — the height-recursive spec fns get
+  NO Lean eq-lemmas (`Stm.rec_1` encoding) and the `u_*` proof fns aren't exported as
+  `lib.u_*` simp lemmas, so the unfolds must enter the VC context as hyps via body calls.
+  This IS probe21's `simp only [named u_* lemmas]` idiom, at the Rust-source level.
+
+  **Axiom closure of the three top-level soundness postconditions (`all_true_append`,
+  `wp_sound`, `wp_sound_bites`) = `[propext]` only** — no sorryAx / Classical.choice /
+  stray axioms. Fully kernel-checked, non-circular. `run.sh` is now a real pass/fail gate
+  (PASS == 0 errors).
+
 ## Writeup
 
-_partial — see `probe-w0/probe32_authoring_feasibility/REPORT.md` for the full,
-measured breakdown. This card stays in_progress until the induction-postcondition
-`tactus_tactic` string closes `all_true_append` with a clean axiom closure; at that
-point the tactus-core authoring of W5a-0 (loop closure proper) can begin under
-bootstrap-10._
+**DONE.** The W5 loop-closure AUTHORING path is de-risked end-to-end: the two mechanism
+unknowns (Q1 `spec_fn` oracle + recursive structural spec fns; Q2 recursive
+structural-induction proof fns) both resolve POSITIVE, verified by a real
+`--lean-all-proofs` tactus run on the isolated probe crate
+(`probe-w0/probe32_authoring_feasibility/`, `19 verified, 0 errors`, `run.sh` PASS,
+axiom closure `[propext]`).
+
+**The exact discharge idiom** (the thing this card exists to find) is the per-fn
+attribute `#[verifier::tactus_tactic("first | tactus_auto | (intros <;>
+tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]`, paired
+with per-constructor `u_*` unfold-lemma CALLS in each match arm of the induction body.
+See `REPORT.md §Q2` for the per-ingredient necessity argument and the concrete
+failure-mode each one fixes (all measured against emitted VCs).
+
+**Assumptions / honesty:** (a) `simp_all` is a T2 dev-tactic per DESIGN-transparent-
+automation §2 — a T1 polish (`simp only [named lemmas]`) is possible but was not squeezed
+here; the discovery closer is what's committed. (b) This probe is the STRIPPED mechanism
+spine (frame machinery elided — its soundness is proven in the hand-Lean probe21..31); it
+demonstrates the idiom carries the recursive-induction shape, not the full frame
+telescope. (c) The idiom is now ready to reuse when authoring W5a-0 (loop closure proper)
+in tactus-core under **bootstrap-10** — that step is scaling + the base-hash re-verify
+cost, not a new feasibility question.
