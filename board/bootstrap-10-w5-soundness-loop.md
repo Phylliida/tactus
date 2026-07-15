@@ -1,9 +1,9 @@
 ---
 title: "W5 — soundness of the reference WP (the bootstrap loop closes) [staged, very large]"
-status: todo
-claimed_by:
+status: in_progress
+claimed_by: opus-w5a-kickoff
 created: 2026-07-13T19:38:00Z
-updated: 2026-07-13T19:38:00Z
+updated: 2026-07-14T21:30:00Z
 ---
 
 ## Description
@@ -41,6 +41,25 @@ W6.
 
 ## Progress
 
+- (2026-07-14, opus-w5a-kickoff) **W5 OPENED.** B1 (bootstrap-48) closed the
+  common-mode soundness gap this loop was blocked on. Decided open Q §5.5 =
+  **valuation-parametric** (leaf oracle; option b) — preserves W5∥W6 parallelism,
+  front-loads leaf-typing, yields the stronger any-oracle theorem (confirmed with
+  Danielle's local model). Authored the detailed ladder + semantic model +
+  proof skeleton in **`DESIGN-W5-soundness.md`**, and split the umbrella into
+  sub-cards: **bootstrap-49 (W5a)**, **-50 (W5b Call/Ret)**, **-51 (W5c Loop)**,
+  **-52 (W5d &mut/prophecy)**, **-53 (W5e closures + W5f adequacy spine)**.
+- (2026-07-14, cont.) **First rung landed: W5a-0 probe PASS** — the reference WP
+  proven sound on `{Skip, Assume, Assert, Seq}` over the REAL emitted `lib.wp_stm`
+  (`probe-w0/probe21_w5a_sem/`, rc=0, axiom closure `[propext, Quot.sound]`, no
+  tactus-core rebuild). See bootstrap-49. The loop's *math* is now demonstrated on
+  its first fragment; the ladder (W5a-1 → W5b → … → tactus-core authoring =
+  loop closure) continues from there.
+
 ## Writeup
 
-_when done: findings, how the code works, assumptions made_
+_umbrella still in progress. First rung (W5a-0) done + validated — see
+bootstrap-49 + `probe-w0/probe21_w5a_sem/REPORT.md` + `DESIGN-W5-soundness.md`.
+The loop closes only when the whole ladder is authored as Rust spec/proof fns in
+tactus-core and emitted as a kernel-checked package; that final step is
+explicitly staged and not yet begun._
