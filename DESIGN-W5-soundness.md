@@ -139,6 +139,44 @@ the operational semantics *at the data/Val level* in tactus; a thin hand-Lean
 `holds` to the user-facing `Prop`s) is deferred to **W5f** — W5 v1 states
 soundness at the Val level only, which is already the full drift-detector.
 
+### 2.1.1 W5f decision (the adequacy-spine structure) — PIN-THE-ORACLES (2026-07-15)
+
+The card (`bootstrap-54`) flagged a fork: wait for / co-design with W6's
+`render_exp` semantics, or state the spine parametrically. **W6 is now done**
+(`bootstrap-11`), so the spine co-designs with it. **DECIDED** (probe27, cross-
+checked with Danielle's local model):
+
+> `toProp := holds` **with the oracle triple PINNED** to concrete interpretations.
+> The structural arms (Imp/All/Let) then bridge in ONE generic induction
+> (definitional — `adequacy_spine` is `Iff.rfl`); ALL genuine content
+> concentrates in **(a)** a concrete leaf denotation `edenote` and **(b)**
+> per-user-type binder-embedding lemmas at the All arm.
+
+This keeps the state space from exploding: the spine induction is generic (proved
+once), and each user datatype contributes exactly ONE embedding lemma at the All
+arm, not a re-proof of the spine.
+
+**The SymEnv realization (why the pin is env-lookup, not new opacity).** The
+emitted `ExprData.BinOp` **opcode is an interned `u64` id** (the serializer's
+string table), NOT a fixed enum — `render_exp` rides it straight through
+opaquely. So a *faithful* leaf denotation cannot know "op 2 means `<`" globally;
+it grounds the interned ids through a **`SymEnv`** (`E.opk`/`E.av`/`E.fn`/… — the
+per-crate environment literal of master plan §4.3, `probe4_denote` P4/P5).
+`edenote (E : SymEnv)` thus replaces W5's **opacity** (`he` a free oracle) with
+concrete **lookup**; the SymEnv is a concrete generated literal that
+kernel-reduces, so the leaf bridge closes by `rfl`/`simp` (the P4 argument).
+Pinning the oracle is *not* a second opacity layer — it is the honest
+non-circular grounding.
+
+**The binder-embedding lemma (the one real trap).** The Val model quantifies the
+All arm over **all** of `Int` (`∀ n : Int`); the user reads `∀ u : U` over their
+actual type. The per-type lemma `(∀ n:Int, P n) → (∀ u:U, P (emb u))` bridges
+them (sound by over-approximation — the emitted all-`Int` goal is *stronger*).
+The trap (flagged by the local model): a nested leaf in the body reads the bound
+value from the threaded state — resolved because instantiating `n := emb u`
+threads `upd st x (emb u)` into the body, decoding the value correctly; the body
+is arbitrary, so it composes through nesting (probe27 `toProp_all_embed`).
+
 ### 2.2 Operational safety (`execSafe`) — no re-derivation of the frame
 
 Reviewed as an honest reading (Danielle's local model, 2026-07-14: "defines
@@ -344,3 +382,28 @@ O6).
   `closures.rs::check_closure_well_formed`) — a spec-adequacy point. **Next: W5f —
   adequacy spine (bootstrap-54); the whole StmData vocabulary + prophecy +
   closures are now sound at the Val level.**
+- **2026-07-15 (opus-w5f-spine): W5f v1 FIRST RUNG DONE (bootstrap-54, probe27).**
+  Probe at `probe-w0/probe27_w5f_spine/` — rc=0, ~3.2s, zero warnings, axiom
+  closures `[propext]` (leaf bridges) / none (embedding) / `[propext, Quot.sound]`
+  (concrete soundness + carried core). **Fork RESOLVED = pin-the-oracles** (§2.1.1
+  above): `toProp := holds` at a concrete oracle triple, factored into a concrete
+  leaf denotation `edenote (E : SymEnv)` + per-type binder-embedding lemmas; the
+  spine induction is generic (`adequacy_spine` is `Iff.rfl`). **Co-designs with W6
+  (now done):** consumes the real emitted `lib.render_exp` as the data-level
+  bridge. Four facts over the REAL emitted defs: (1) `adequacy_leaf_cmp`
+  (`edenote (render_exp (x<10))` ≡ `E.av x st < 10`); (2) `adequacy_leaf_overflow`
+  (`edenote (render_exp (HasType 64 e))` ≡ `0 ≤ e ∧ e < 2^64` — the §2 cast/
+  overflow silent-unsoundness class, now checked DENOTATIONALLY); (3)
+  `toProp_all_embed` (the Int↔U binder embedding, resolving the model-flagged
+  state-threading trap; instantiated at `U:=Nat, emb:=Int.ofNat`); (4)
+  `soundness_concrete` (carried `ref_wp_sound` at the concrete triple — emitted
+  goals read concretely ⟺ safety). **The SymEnv realization:** the emitted BinOp
+  opcode is an interned id (not a fixed enum), so `edenote` grounds ids through a
+  `SymEnv` (opacity → env-lookup, the P4/P5 shape) — not a second opacity layer.
+  **Scope:** the arithmetic/logical obligation fragment (atoms/lits/arith/cmp/
+  logical/casts/apps/proj/let/span — what P4 + the fixture obligations use); the
+  W7 body nodes (`Ite`/`Match`/`AppN`/`Forall`/`Exists`) are sentinel-stubbed → a
+  v2 rung (a `Defs`-layer denotation grounding `E.fn` in `render_def` bodies).
+  **The W5 ladder (W5a–e Val-level + W5f v1 adequacy) is now complete for the
+  stage-A obligation fragment: the reference WP is sound AND its soundness lifts
+  to the user-facing Props on that fragment.**
