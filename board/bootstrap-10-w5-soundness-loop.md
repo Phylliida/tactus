@@ -66,6 +66,21 @@ W6.
   axiom closure `[propext, Quot.sound]`. `probe-w0/probe23_w5b_sem/`. **Ladder
   remaining: W5c Loop (bootstrap-51) → W5d &mut/prophecy → W5e closures → W5f
   adequacy spine → tactus-core authoring (loop closure).**
+- (2026-07-14, opus-bootstrap59-authoring) **Loop-closure AUTHORING de-risked
+  (bootstrap-59, probe32).** The whole ladder (W5a–f + match/pairing rungs) is now
+  proven as hand-Lean probes; the umbrella's remaining step is *authoring* it as
+  tactus-core spec/proof fns (this card's "explicitly staged" tail). Before touching
+  tactus-core, ran an isolated feasibility probe
+  (`probe-w0/probe32_authoring_feasibility/`, real tactus binary, `--lean-all-proofs`):
+  **Q1 CONFIRMED** — `spec_fn` leaf-oracle params + recursive structural `open spec
+  fn`s (the valuation-parametric model, DESIGN-W5 §1 opt b) author, verify, and emit
+  kernel-clean in tactus (8 verified). **Q2** — the recursive-induction proof-fn
+  structure is accepted (`structural_decreases` gives termination; the IH threads);
+  the one remaining blocker is the **compound-postcondition discharge**, for which the
+  mechanism is found (`#[verifier::tactus_tactic]` per-fn custom Lean closer) but the
+  exact tactic string is the next rung (bootstrap-59). **So loop closure is now
+  precisely scoped, with NO open feasibility question — only the discharge string +
+  scaling to `wp_stm_sound`, then the tactus-core authoring itself.**
 
 ## Writeup
 
