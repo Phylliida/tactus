@@ -337,6 +337,44 @@ binary (`/tmp/w4a-b2-ingate.log`, recipe = card run #2 + `PATH` carrying Nix
 lean). If it prints `(1 passed, 0 failed)` this card is DONE. Result recorded
 below once it lands.
 
+## Progress (cont.) — B1/B2 DECISION MADE + IN-GATE RUN RELAUNCHED (tracked-bg) (2026-07-14)
+
+**Root cause of the previous cut-off (important operational fact).** The B2
+in-gate run (`/tmp/w4a-b2-ingate.log`) did NOT complete: the log stops at 16:56
+mid cert-emission — no package-gate note, no `verified/errors` summary, no bridge
+note — ~10 min after launch, well under its 1800s timeout. That is **not** a load
+or timeout death: it's the known `die-with-parent` behavior (see memory
+`reference_bootstrap_hold_turn_for_long_suites`) — the bg process was killed when
+the launching turn ended. So the in-gate coupling was never actually exercised
+under the B2 binary yet; the last run that REACHED the gate
+(`/tmp/w4a-bs47b.log`, `0 passed, 1 failed`) was the PRE-B2 binary.
+
+**Fix: relaunched in the harness's TRACKED-background mode** (`run_in_background`,
+which survives the turn and re-invokes on exit — unlike a bare `&`). Script:
+`/tmp/w4a-b2-ingate3.sh` → log `/tmp/w4a-b2-ingate3.log`, out `/tmp/w4a-b2-ingate3`.
+Same corrected recipe (NO `--emit-lean`, NO `-V cache`, Nix lean on PATH, B2
+binary 6ea3030 built 16:46). Confirmed before launch: binary is newer than the
+committed B2 source (`sst_serialize.rs` 16:45 < binary 16:46), `wrap_derefs`
+present at `sst_serialize.rs:3442`, core exec olean present. Since the defs-family
+chain is fully cleared (bootstrap-40..47) — proven by the pre-B2 run reaching the
+gate — the only remaining question is whether the B2 binary now emits the
+Deref-wrapped RHS cert and the gate reports `1 passed`. Result recorded once the
+tracked run exits.
+
+**B1-vs-B2 decision — RESOLVED: keep B2 for this stage; B1 stays tracked debt
+(bootstrap-48).** Danielle recommended B2 for this stage and offered the call to
+me. My independent read agrees, and settles it on three points: (1) the
+common-mode gap is narrow — confined to the `count_ref_decorations` helper — and
+produces **no false verifications today**; it only narrows the bridge's
+*independent-check* guarantee for that one helper. (2) **W5** (the actual
+soundness proof of `ref_wp`) is not done; until it is, the TCB isn't "trusted" in
+the strong sense anyway, so hardening it with B1 now is premature. (3) B1 touches
+tactus-core `lib.rs` + re-verifies the `expr_mirror_kernel_computes` kernel
+lemmas, which **invalidates the core olean every cert imports** — a real cost that
+would stall W4 validation. Net: no revert, no pivot; momentum on W4 validation.
+The gap is honestly recorded in bootstrap-48 as a soundness item W5 must own (not
+a nice-to-have).
+
 ## Status for the next instance
 
 **UPDATE 2026-07-14 (opus-bootstrap47-mono): DEFS-FAMILY BLOCKER CHAIN CLEARED —

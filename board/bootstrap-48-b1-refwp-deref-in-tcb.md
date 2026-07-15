@@ -45,16 +45,36 @@ identical to the existing `needs_nat_coercion` coercion the arm already does.
   failed`) — now with the deref logic in the TCB, independently checked.
 - e2e suite green; the bootstrap-38 fixture still 3/3 in-gate close.
 
-**Blocked by / relationship:** do NOT start until Danielle rules on B1-vs-B2 for
-bootstrap-39 (she recommended B2 "for this stage"; this card is the principled
-upgrade). If she keeps B2, this stays `todo` as recorded tech-debt. If she
-fast-tracks B1, revert the B2 commit first.
+**Blocked by / relationship:** DECISION MADE 2026-07-14 — **B2 kept for this
+stage; this card stays `todo` as recorded tech-debt.** Danielle recommended B2
+and delegated the call; the next instance (opus-w4a-tgtval, 2026-07-14) confirmed
+B2 on three grounds (narrow gap, W5-not-done, core-olean-invalidation cost — see
+bootstrap-39's "B1/B2 DECISION MADE" progress note). Do NOT start B1 opportunistically:
+it is mutually exclusive with B2 (keeping both double-derefs) and requires
+reverting the B2 commit (`6ea3030`) first. Pick this up only when W5 is being
+built or Danielle fast-tracks it.
+
+**Why this is a real (if narrow) soundness item, not cosmetics — for W5.** The
+bridge's entire value is that `render_exp` (TCB) computes goals *independently* of
+production, so a production bug is caught by disagreement. B2 breaks that for the
+deref-count ONLY: both production and `raw_exp` peel via the same
+`count_ref_decorations`, so a bug in that helper reproduces on both sides of
+`goals_eq` and silent-passes. This is bounded — `count_ref_decorations` is a
+small, auditable helper over TypData ref-depth (0/1) — but W5 cannot claim the
+reference "independently validates" production's deref-lowering while B2 stands.
+**W5 must either (a) adopt B1 first (move the balance into the TCB), or (b)
+explicitly carve `count_ref_decorations` correctness out of its soundness claim as
+an audited assumption.** Recording this so it isn't silently inherited.
 
 ## Progress
 - (2026-07-14, opus-w4a-tgtval) Filed as the soundness follow-up to bootstrap-39.
   B2 landed there (validated at decide level). See bootstrap-39's "FIX BUILT +
   VALIDATED" section for the full B1/B2 analysis, the unsound-Var-sketch
   correction, and the local-model verdict.
+- (2026-07-14, opus-w4a-tgtval, cont.) DECISION recorded: B2 kept for this stage,
+  this card stays tracked tech-debt. Added the W5-ownership framing above so the
+  common-mode gap is an explicit soundness obligation for the W5 loop, not a
+  buried nicety.
 
 ## Writeup
 _when done_
