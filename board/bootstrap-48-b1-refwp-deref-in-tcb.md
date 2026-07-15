@@ -1,9 +1,9 @@
 ---
 title: "B1 (soundness follow-up) — move the structural-binop deref-balance into the TCB render_exp (close bootstrap-39's common-mode gap)"
-status: in_progress
+status: done
 claimed_by: opus-bootstrap48-b1exec
 created: 2026-07-14T17:00:00Z
-updated: 2026-07-14T17:36:00Z
+updated: 2026-07-14T18:05:00Z
 ---
 
 ## Description
@@ -190,5 +190,147 @@ an audited assumption.** Recording this so it isn't silently inherited.
     `out/lib` (`--tactus-emit-module`) → re-run the in-gate bridge (expect `1
     passed, 0 failed` with the peel now independently checked in the TCB).
 
+- (2026-07-14, opus-bootstrap48-b1exec, cont.) **STEPS 2–3 DONE; B1 VALIDATED AT
+  THE DECIDE LEVEL WITH THE REAL BINARY OUTPUT. Full tgt in-gate run in flight.**
+  - **B2 revert (step 2):** dropped `6ea3030`'s two hunks from `sst_serialize.rs`
+    — the 5-line min-balance in the `ExpX::Binary` arm and the `wrap_derefs` fn.
+    `git diff 6ea3030^ -- sst_serialize.rs` (code lines only) is EMPTY: the revert
+    restored the exact pre-B2 code, differing only in a one-line B1 pointer comment.
+    raw_exp now emits BARE operands; the peel lives solely in the TCB.
+  - **verus binary rebuild:** fork vargo (`tactus-bootstrap/tools/vargo/…`) from
+    `source/`, `vargo build --release` → verus/rust_verify rebuilt 17:40:22,
+    **vstd 1530 verified, 0 errors** (`/tmp/b1-verus-rebuild.log`). B2 revert now
+    compiled into the binary.
+  - **tactus-core out/lib re-emit (step 3):** the earlier isolation verify used no
+    `TACTUS_LEAN_OUT`, so it verified but didn't rewrite out/lib. Correct recipe
+    (from bootstrap-23:405): `TACTUS_LEAN_OUT=$PWD/out ../source/target-verus/
+    release/verus --crate-type=lib --lean-backend --lean-all-proofs lib.rs` from
+    `tactus-core/` → **65 verified, 0 errors**; `TactusDefs_lib_exec__root.olean`
+    refreshed 17:43 (618416→621056 bytes). Confirmed B1 in the emitted defs:
+    `needs_ref_deref`/`deref_if` now appear in `TactusDefs_lib_exec__root.lean`'s
+    `render_exp` (7 hits).
+  - **⭐ DECIDE-LEVEL BRIDGE VALIDATION (the substance of "1 passed"):** bootstrap-39
+    left the REAL bare-`Var` control bridge on disk at
+    `/tmp/w4a-bs47b/lib/bridge/Bridge_runtime__impl__4__clone.lean`. Its sst is
+    `BinOp Eq (Var 4 : TyNamed 5) (Var 0 : TyRef 5)` — bare, no `Deref` — which is
+    EXACTLY what B1's binary now emits (B2 gone). Elaborated it against the FRESH
+    B1 olean (`LEAN_PATH=tactus-core/out/lib:prelude`, Nix lean):
+    `goals_eq (ref_wp ctx sst) goals = 1 := by decide` → **rc 0, CLOSES** (1223ms).
+    Under the OLD olean this same file FAILED (bootstrap-39's recorded control) —
+    a clean differential proving the `.deref` peel now lives in and is checked by
+    the TCB `render_exp`. **Non-vacuity control:** flipping the expected value
+    `1→0` errors (`decide proved … = 0 is false`, rc 1) — the decide genuinely
+    evaluates `goals_eq` to 1. This is STRONGER than B2's original validation: the
+    sst here is the binary's genuine output, not a hand-edited mock.
+  - **Regression (bootstrap-25's designed post-olean-rebuild checks):**
+    **probe13 (expr mutations) PASS ✓** (4 deep baselines close; all 4
+    coercion-drop kills flip 1→0 — directly exercises the changed `render_exp`);
+    **probe9 (bridge) ALL CLOSE ✓** (quad_exec/scope_shape/sum_to/swap_pair/
+    tri_one/use_multiarg). So B1's min-balance is a proven no-op on the curated
+    non-ref bridges.
+  - **⚠ NOTE on the "bootstrap-38 fixture 3/3" done-criterion:** running the FULL
+    `bootstrap-fixture/lib.rs` under `--tactus-bridge` errors on `tactus_auto
+    failed for sum_to/find_square` + `vec_read` stmt-olean build — but these are
+    the FIXTURE'S OWN proof-automation failures (pre-existing; the full fixture is
+    not a clean full-package-check target). bootstrap-38's "3/3" was a CURATED
+    SUBSET (add_capped/max_u64/double_exec + lemma_dbl), not the full lib.rs. Proof
+    it's orthogonal to B1: probe9 shows `sum_to`'s BRIDGE closes fine. The curated
+    subset temp-fixture wasn't preserved; probe9/13 are the equivalent (and
+    stronger, olean-coupled) regression signal, and they pass.
+  - **IN FLIGHT:** full tgt in-gate run (`runtime` module, cold, `--tactus-bridge`,
+    recipe = bootstrap-39 run #2) launched (`/tmp/b1-tgt-ingate.log`); expect
+    `1 obligation bridge-checked (1 passed, 0 failed)` — the headline done-criterion
+    now with the peel independently checked in the TCB. Result recorded next.
+
+- (2026-07-14, opus-bootstrap48-b1exec, FINAL) **DONE.** Two definitive results:
+  - **Headline done-criterion — the FRESH B1-binary cert bridges CLEAN.** The
+    cold tgt in-gate run (`--emit-lean --tactus-bridge --verify-module runtime`,
+    exit 0) emitted `/tmp/b1-tgt-ingate/lib/cert/runtime__impl__4__clone.cert.lean`
+    with the sst `BinOp Eq (Var 4 : TyNamed 5) (Var 0 : TyRef 5)` — BARE operand,
+    B2 gone. (`--emit-lean` is codegen-only so it didn't run the in-process bridge;
+    I ran the identical decide externally, the bootstrap-38-established equivalence.)
+    Appended the exact in-gate line `goals_eq (ref_wp ctx sst) goals = 1 := by
+    decide` and elaborated against the B1 olean → **rc 0, CLOSES** = `1 passed, 0
+    failed`, now with the `.deref` peel derived and checked INDEPENDENTLY in the TCB.
+  - **e2e suite: `551 passed; 0 failed` (152s, rc 0)** — the B2 revert regresses no
+    test. (Debug rebuild of `lean_verify`/`rust_verify` was clean, warnings only.)
+
 ## Writeup
-_when done_
+
+**B1 — structural-binop deref-balance moved into the TCB. DONE + validated
+end-to-end.** Closes bootstrap-39's common-mode soundness gap: the bridge now
+checks production's `&`-deref count against a reference computed INDEPENDENTLY in
+the trusted `render_exp`, instead of both sides sharing production's
+`count_ref_decorations` (B2).
+
+**What changed (2 code sites + re-emitted oleans):**
+1. `tactus-core/lib.rs:890` — `render_exp`'s `BinOp` arm now min-balance-derefs.
+   `dl=needs_ref_deref(type_of *l)`, `dr=needs_ref_deref(type_of *r)`; peel left by
+   `if dl>dr {1} else {0}`, right by `if dr>dl {1} else {0}` (the 0/1
+   specialization of production's `dl-min(dl,dr)` monus — avoids nat subtraction so
+   it reduces under `decide`). Then the existing nat-coercion, unchanged. The peel
+   and coercion PROVABLY never co-fire (ref operand tag 4 / its peel `TyNamed` tag
+   3 vs coercion-needs tag 0 `TyInt`; and every ref-carrying op is a Bool-result
+   structural compare), so feeding the unpeeled `type_of` to `needs_nat_coercion`
+   is immaterial.
+2. `source/lean_verify/src/sst_serialize.rs` — reverted `6ea3030` (B2): dropped the
+   `ExpX::Binary`-arm min-balance and the `wrap_derefs` fn. `raw_exp` emits BARE
+   operands again. `git diff 6ea3030^` on code lines is empty (exact revert; only a
+   one-line B1 pointer comment differs).
+3. `tactus-core/out/lib/*` — re-emitted with the B1 binary so the reference oleans
+   carry the new `render_exp` (`TactusDefs_lib_exec__root.olean` grew 618416→621056
+   bytes; `needs_ref_deref`/`deref_if` now appear in its `render_exp`).
+
+**Companion (`expr_mirror_kernel_computes`, additive-only):** 4 new `decide` cases
+— the real clone shape `result:TyNamed == self:TyRef` peels the RHS [==1]; its
+deref-drop kill [==0]; a `&Self == &Self` matched-depth NEGATIVE CONTROL that must
+leave BOTH bare (m=1) [==1] (exactly what an unsound blanket per-operand deref
+would break); and its over-peel kill [==0]. Every pre-existing BinOp case (A/B/D,
+G6, G2/C) re-verified untouched, confirming the min-balance is a genuine no-op on
+non-ref operands.
+
+**Faithfulness:** production `count_ref_decorations` (`expr_shared.rs:891`) counts
+REF decorations only (descends `Boxed` without incrementing), matching the TCB's
+`needs_ref_deref` firing on tag 4 (`TyRef`) and 0 on tag 5 (`TyBox`). Exact for the
+depth-0/1 scope; FAIL-LOUD beyond (if production could peel >1 where TypData holds
+one `TyRef`, the TCB underpeels ⟹ `goals_eq` diverges ⟹ bridge fails, never
+silent-pass). This fail-loud independence is the entire point of B1 over B2.
+
+**Sub-fork decisions (from the recon's two open sub-choices):** (a) `deref_if`
+single-peel given 0/1 depth — chosen (recursive `deref_n` unneeded; fail-loud if
+depth ever >1); (b) feed UNPEELED type to `needs_nat_coercion` — chosen, proven
+immaterial above. The soundness-scope caveat (a hypothetical future op with a
+`TyRef` operand yet `TyNat` result) remains only hypothetical: no such op exists;
+the `&Self==&Self` control + the non-interaction proof document the assumption. If
+one is ever added, feed the peeled type — but note even then it's a no-op, since a
+peeled ref is `TyNamed` (tag 3), never `TyInt` (tag 0).
+
+**Validation ladder (all green):**
+- tactus-core verify IN ISOLATION (B2 still present, serializer-independent): 65/0.
+- verus binary rebuilt (B2 reverted): vstd 1530/0.
+- tactus-core re-emit with B1: 65/0.
+- decide-level bridge on the on-disk bare control (`/tmp/w4a-bs47b`): CLOSES against
+  B1 olean (FAILED under old olean per bootstrap-39 = clean differential); flip
+  `1→0` errors (non-vacuous).
+- FRESH B1-binary tgt cert bridge: CLOSES (rc 0) = `1 passed, 0 failed`.
+- probe13 (expr mutations) PASS; probe9 (bridge) ALL CLOSE.
+- e2e suite 551/0.
+
+**Assumptions / honest caveats:**
+- The literal "bootstrap-38 fixture 3/3" was NOT reproduced with its exact curated
+  temp-fixture (add_capped/max_u64/double_exec/lemma_dbl) — that file wasn't
+  preserved, and the FULL `bootstrap-fixture/lib.rs` has PRE-EXISTING `tactus_auto`
+  failures (`sum_to`/`find_square`) + a `vec_read` stmt-olean failure that are the
+  fixture's own proof-automation, orthogonal to B1 (probe9 shows `sum_to`'s BRIDGE
+  closes). Substituted by the equivalent, olean-coupled, MAINTAINED regression:
+  probe9 ALL CLOSE + probe13 PASS + e2e's `test_exec_package_check_smoke` /
+  `test_bridge_opt_in_verdict_neutral` (in the 551/0). This is a proportionate
+  substitution, not a skipped check — but flagged in case a literal 3/3 is wanted.
+- The tgt in-gate `1 passed` was validated via the EXTERNAL decide on the fresh
+  cert (identical to what the in-gate `check_package` runs in-process), not by
+  parsing an in-process "N passed, 0 failed" note — because the `--emit-lean`
+  recipe is codegen-only. Same decide, same verdict.
+
+**W5 impact:** the common-mode gap this card recorded is now CLOSED. W5's soundness
+claim can state that `render_exp` validates production's deref-lowering
+independently — no `count_ref_decorations`-correctness carve-out needed.
