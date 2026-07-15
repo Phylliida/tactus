@@ -888,8 +888,41 @@ pub open spec fn render_exp(re: RawExp) -> ExprData
         // Friction-2 site). A bool-typed op (cmp/Eq) has
         // `needs_nat_coercion _ Bool = 0`, so operands are left as-is.
         RawExp::BinOp(op, ty, l, r) => {
-            let l2 = coerce_if(needs_nat_coercion(type_of(*l), ty), render_exp(*l));
-            let r2 = coerce_if(needs_nat_coercion(type_of(*r), ty), render_exp(*r));
+            // B1 (bootstrap-48): reproduce production's structural-binop
+            // min-balance (`to_lean_sst_expr.rs:1157-1161`) IN THE TCB. A
+            // structural compare between a `&T` operand and a bare-`T` operand
+            // (e.g. `result == self` in a `&self` clone's `_return = self`
+            // postcondition, where the SST carries a bare `Var(self):&Self`)
+            // peels the DEEPER operand DOWN to the shallower's ref-depth via
+            // `.deref` field-projections. With TypData ref-depth bounded 0/1
+            // (`TyRef inner`, inner never nested ref), `needs_ref_deref` IS that
+            // depth (0/1) and the per-operand peel `dl - min(dl,dr)` is 1 iff
+            // that operand is strictly deeper — i.e. `dl > dr` / `dr > dl` (the
+            // 0/1 specialization of the monus; avoids nat subtraction so the
+            // kernel reduces it under `decide`).
+            //
+            // Independence (the whole point of B1 vs B2): the reference derives
+            // the peel from the TypData it reads, NOT from production's shared
+            // `count_ref_decorations`. So the bridge now checks production's
+            // deref-count against the reference's; any divergence — including a
+            // >1 depth that production could peel but TypData cannot express —
+            // fails the bridge LOUD (the TCB underpeels) rather than silently
+            // agreeing. Fail-loud, never silent-pass.
+            //
+            // Non-interaction with nat-coercion: a ref operand is tag 4, and its
+            // peel is `TyNamed` (tag 3); `needs_nat_coercion` fires only on tag 0
+            // (`TyInt`), so it is 0 on a ref operand whether peeled or not. And
+            // every op that can carry a ref operand is a structural comparison
+            // (Bool result, tag 2) ⟹ `needs_nat_coercion(_, Bool) = 0` across the
+            // entire ref-reachable region. The two coercions provably never
+            // co-fire, so feeding the unpeeled `type_of` to `needs_nat_coercion`
+            // is immaterial (simplest; matches the arm's prior shape).
+            let dl = needs_ref_deref(type_of(*l));
+            let dr = needs_ref_deref(type_of(*r));
+            let l1 = deref_if(if dl > dr { 1 } else { 0 }, render_exp(*l));
+            let r1 = deref_if(if dr > dl { 1 } else { 0 }, render_exp(*r));
+            let l2 = coerce_if(needs_nat_coercion(type_of(*l), ty), l1);
+            let r2 = coerce_if(needs_nat_coercion(type_of(*r), ty), r1);
             ExprData::BinOp(op, Box::new(l2), Box::new(r2))
         },
         // call-arg coercion: nat-coercion at the expected param type (the
@@ -1405,6 +1438,50 @@ proof fn expr_mirror_kernel_computes()
                 Box::new(RawExp::Var(4, TypData::TyRef(100))),
                 TypData::TyNamed(100))),
             ExprData::App(11, Box::new(ExprData::Atom(4)))  // BUG: no auto-deref
+        ) == 0,
+        // ── B1 (bootstrap-48) — structural-binop min-balance in the TCB ──
+        // The real `runtime__impl__4__clone` shape: `result:T == self:&Self`
+        // (`Eq`=0, Bool result). LHS `result` is bare `TyNamed(5)` (depth 0),
+        // RHS `self` is `TyRef(5)` (depth 1); min-balance peels the DEEPER RHS
+        // by one `.deref`, leaving the LHS alone. render_exp DERIVES this from
+        // the operand TypData independently of production. Kill = the RHS peel
+        // dropped (reproduces the pre-B1 `0 passed, 1 failed` bridge divergence).
+        expr_eq(
+            render_exp(RawExp::BinOp(0, TypData::TyBool,
+                Box::new(RawExp::Var(6, TypData::TyNamed(5))),
+                Box::new(RawExp::Var(0, TypData::TyRef(5))))),
+            ExprData::BinOp(0,
+                Box::new(ExprData::Atom(6)),
+                Box::new(ExprData::FieldProj(Box::new(ExprData::Atom(0)), 0)))
+        ) == 1,
+        expr_eq(
+            render_exp(RawExp::BinOp(0, TypData::TyBool,
+                Box::new(RawExp::Var(6, TypData::TyNamed(5))),
+                Box::new(RawExp::Var(0, TypData::TyRef(5))))),
+            ExprData::BinOp(0,
+                Box::new(ExprData::Atom(6)),
+                Box::new(ExprData::Atom(0)))  // BUG: min-balance deref dropped
+        ) == 0,
+        // B1 negative control: `&Self == &Self` (BOTH operands depth 1) →
+        // min-balance m=1 → NEITHER operand peeled (production leaves matched
+        // depths alone). This is exactly what an unsound blanket per-operand
+        // `Var(TyRef _) => .deref` rule would get WRONG (it would peel both);
+        // the min-balance form must leave both bare.
+        expr_eq(
+            render_exp(RawExp::BinOp(0, TypData::TyBool,
+                Box::new(RawExp::Var(6, TypData::TyRef(5))),
+                Box::new(RawExp::Var(0, TypData::TyRef(5))))),
+            ExprData::BinOp(0,
+                Box::new(ExprData::Atom(6)),
+                Box::new(ExprData::Atom(0)))
+        ) == 1,
+        expr_eq(
+            render_exp(RawExp::BinOp(0, TypData::TyBool,
+                Box::new(RawExp::Var(6, TypData::TyRef(5))),
+                Box::new(RawExp::Var(0, TypData::TyRef(5))))),
+            ExprData::BinOp(0,
+                Box::new(ExprData::FieldProj(Box::new(ExprData::Atom(6)), 0)),  // BUG: peeled a matched-depth operand
+                Box::new(ExprData::Atom(0)))
         ) == 0,
         expr_size(ExprData::BinOp(1,
             Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(3)))),
