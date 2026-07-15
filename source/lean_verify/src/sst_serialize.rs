@@ -684,35 +684,13 @@ impl<'a> Serializer<'a> {
                 let ty = self.typ_data(&e.typ)?;
                 let ls = self.raw_exp(l)?;
                 let rs = self.raw_exp(r)?;
-                // B2 (bootstrap-39): mirror production's structural-binop
-                // decoration balancing (`to_lean_sst_expr.rs:1157-1161`). A
-                // structural comparison between a `&T` operand and a bare-`T`
-                // operand — e.g. `result == self` in a `&self` clone's
-                // `_return = self.deref` postcondition, where the SST holds a
-                // bare `Var(self)` of `&Self` type — peels the DEEPER operand
-                // down to the shallower with `.deref` field-projections;
-                // `render_exp` maps each `RawExp.Deref` to `FieldProj …
-                // deref_field`, matching the goal side (previously the
-                // reference emitted a bare `Atom self` and the bridge — by
-                // design — flagged the `&`-deref divergence).
-                //
-                // This stays in the TRANSCRIBER, not the TCB `render_exp`:
-                // `count_ref_decorations` reads the SST TYPE decorations, so
-                // wrapping in that many `Deref` nodes is faithful type
-                // transcription, exactly like `typ_data` mirroring `TypX::Ref`.
-                // It is a NO-OP whenever either operand has zero ref layers
-                // (every non-`&` cert → `m == both → 0` peels), so it cannot
-                // regress a currently-closing obligation. Min-balance is
-                // faithful for every op that can carry ref operands: only
-                // structural comparisons (Eq/Ne/Inequality) ever see two
-                // ref-typed operands, and those are exactly the ops production
-                // min-balances; boolean/non-structural operands are never
-                // ref-typed, so min == full == 0 peels there.
-                let dl = crate::expr_shared::count_ref_decorations(&l.typ);
-                let dr = crate::expr_shared::count_ref_decorations(&r.typ);
-                let m = dl.min(dr);
-                let ls = wrap_derefs(&ls, dl - m);
-                let rs = wrap_derefs(&rs, dr - m);
+                // B1 (bootstrap-48): emit the operands BARE. The structural-binop
+                // `&`-deref min-balance (production `to_lean_sst_expr.rs:1157-1161`)
+                // now lives in the TCB reference `render_exp`'s BinOp arm
+                // (`tactus-core/lib.rs`), which derives the peel INDEPENDENTLY from
+                // the operand TypData — so the bridge checks production's
+                // deref-count against the reference's rather than sharing
+                // `count_ref_decorations` (B2's common-mode gap). Reverts 6ea3030.
                 Ok(format!(
                     "({}.RawExp.BinOp {} {} {} {})",
                     NS,
@@ -3430,21 +3408,6 @@ fn raw_exp_list(terms: &[String]) -> String {
 /// mirror), matching `box_`'s `Tactus.Box.mk (…)` literal syntax.
 fn box_raw(term: &str) -> String {
     box_(term)
-}
-
-/// Wrap `term` in `n` `lib.RawExp.Deref` nodes (each boxing its child),
-/// peeling `n` reference-decoration layers off a RawExp literal. The
-/// literal-level dual of production's `apply_deref_chain` (which appends
-/// `.deref` field-projections to an `LExpr`): here `render_exp` turns each
-/// emitted `RawExp.Deref` into `FieldProj … deref_field`, reproducing the
-/// same peel. `n = 0` is the identity (returns `term` unchanged). B2
-/// (bootstrap-39).
-fn wrap_derefs(term: &str, n: usize) -> String {
-    let mut out = term.to_string();
-    for _ in 0..n {
-        out = format!("({}.RawExp.Deref {})", NS, box_raw(&out));
-    }
-    out
 }
 
 /// Box an `ExprData` sub-term for a recursive field (`Box<ExprData>` in the
