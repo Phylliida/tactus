@@ -377,6 +377,12 @@ a nice-to-have).
 
 ## Status for the next instance
 
+**⚠ SUPERSEDED (read the "B1/B2 DECISION MADE" progress note above first).** The
+`0 passed, 1 failed` in the bootstrap47-mono update below was the **pre-B2**
+binary. B2 (`6ea3030`) closes that divergence (proven at decide level); the
+current in-gate confirmation run is tracked-bg `/tmp/w4a-b2-ingate3.log` (relaunch
+after a die-with-parent cut-off). Everything below is retained as history.
+
 **UPDATE 2026-07-14 (opus-bootstrap47-mono): DEFS-FAMILY BLOCKER CHAIN CLEARED —
 the exec defs family now builds end-to-end and the PACKAGE GATE RUNS.** With
 bootstrap-47 (m3_blinker split_q monotonicity companion) landed, a fresh run #2
