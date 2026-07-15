@@ -177,6 +177,37 @@ value from the threaded state — resolved because instantiating `n := emb u`
 threads `upd st x (emb u)` into the body, decoding the value correctly; the body
 is arbitrary, so it composes through nesting (probe27 `toProp_all_embed`).
 
+### 2.1.2 W5f v2 decision (grounding the W7 body fragment) — SymEnv FN-PIN (2026-07-15)
+
+W5f v1 (probe27) covered the arith/logical obligation fragment; the **W7 body
+constructors** (`Ite`/`Match`/`AppN`/`Forall`/`Exists`) were stubbed. v2
+(`bootstrap-55`, probe28) widens `edenote`/`eval` to them. The card asked how
+`E.fn` gets grounded in the emitted def bodies. **DECIDED:**
+
+> The grounding is a **SymEnv fn-pin, NOT an in-Lean `DefData` interpreter.** An
+> interpreter over `DefData` bodies *cannot be a structural `def`* — a recursive
+> spec fn's body re-enters its own call, so `eval` would need fuel / a fixpoint.
+> Instead (the P5 shape) the concrete crate `SymEnv` literal **pins** `fn`/`fnN`
+> to the **already-emitted Lean spec fns**. Recursion + termination live in the
+> emitted defs (structural by W1.5); `eval`/`evalList` stay structural (each
+> App/AppN arm = ONE oracle application over recursively-eval'd args); the
+> rfl-bridge closes because the concrete env literal kernel-reduces.
+
+**Independent of the W7 `def_eq` bridge.** W7's `def_eq` is *syntactic* (never
+reduces bodies, §7.2); W5f v2 is the *denotational* counterpart. The denotation
+layer needs only that the emitted defs exist and are pinned in the crate literal —
+so v2 does NOT co-locate with the W7 defs-certificate machinery. Consequence: a
+match-*bodied* fn is grounded through the fn oracle, so `eval` never interprets its
+`Match`; eval-level body-node interpretation is only needed for nodes appearing
+DIRECTLY in obligation goals.
+
+**Per-node (probe28):** `App`/`AppN` grounded via `fn`/`fnN` (`eval`/`evalList` a
+mutual structural pair); `Forall`/`Exists` genuine `∀`/`∃` (binder threaded via
+`upd`, composes); `Ite` a decidable Bool-as-Int condition (O9 value/prop split, no
+`Classical`). **`Match` remains scoped** — faithful eval-level Match needs the
+flat-Int datatype-value-decode layer (`bootstrap-56`). Five v2 facts, all over the
+real `lib.render_exp`, close over `[propext]`/`Quot.sound`/none.
+
 ### 2.2 Operational safety (`execSafe`) — no re-derivation of the frame
 
 Reviewed as an honest reading (Danielle's local model, 2026-07-14: "defines
@@ -407,3 +438,18 @@ O6).
   **The W5 ladder (W5a–e Val-level + W5f v1 adequacy) is now complete for the
   stage-A obligation fragment: the reference WP is sound AND its soundness lifts
   to the user-facing Props on that fragment.**
+- **2026-07-15 (opus-w5f-v2): W5f v2 DONE (bootstrap-55, probe28) — body fragment
+  widened.** Probe at `probe-w0/probe28_w5f_v2/` — rc=0, ~3.5s, extends probe27
+  verbatim. `eval`/`edenote`/`evalList` now TOTAL over the full `ExprData` vocab;
+  faithful denotations for **four of five** W7 body constructors. **Grounding fork
+  RESOLVED = SymEnv fn-pin** (§2.1.2 above): pin `fn`/`fnN` to the emitted Lean
+  defs, NOT an in-Lean interpreter (which couldn't be structural); independent of
+  the W7 `def_eq` syntactic bridge. Five v2 facts over the REAL `lib.render_exp`:
+  `adequacy_leaf_app_grounded` (`g(n)<10` ≡ `g(av n)<10`, `g:=E.fn`),
+  `adequacy_leaf_forall`/`_exists` (genuine `∀`/`∃`, binder threaded via `upd`,
+  composes), `adequacy_leaf_ite` (decidable Bool-as-Int cond — O9 split, no
+  `Classical`), `adequacy_leaf_appn_grounded` (n-ary `h [av m, av n]<100`,
+  `h:=E.fnN`, exercising the `evalList` fold). Axioms `[propext]`/`Quot.sound`/
+  none — no `sorryAx`, no `Classical.choice`. **`Match` scoped** → bootstrap-56
+  (flat-Int datatype-value-decode; the fn-pin already covers match-*bodied* fns,
+  so only `match`-in-obligation is affected).
