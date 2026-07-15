@@ -123,6 +123,48 @@ reusing the probe5 match-literal pattern.
   instance:** start rung 1 = get a probe to import both tactus-core `render_exp` and a
   renamed copy of the fixture's `lib.sq` cone (obstacle D), then specialize FACT 5.
 
+- (2026-07-16, next instance) **✅ RUNG 1 LANDED — fn/fnN grounded, real Lean, PASS.**
+  New probe `probe-w0/probe30_w5f_ground/` (ground.lean + run.sh + REPORT.md +
+  fixlib/). What landed:
+  - **Obstacle D solved by module RENAME (option a, verbatim-body).** Created
+    `fixlib/TactusDefs_fixlib_exec__root.lean`: the fixture's emitted `sq`/`g2`/`g3`
+    bodies **character-for-character verbatim** from
+    `bootstrap-fixture/out/lib/TactusDefs_lib_exec__root.lean` (`x*x` / `a+b` /
+    `a+b+c`, incl. the emitter's blanket `noncomputable` + set_option header), with
+    ONLY the module name (`TactusDefs_lib_exec__root`→`TactusDefs_fixlib_exec__root`)
+    and namespace prefix (`lib.`→`fixlib.`) rewritten. Verified verbatim by diff
+    (only grep group-separators differ). Imports just `TactusPrelude` (sq/g2/g3 have
+    no dep beyond Nat, so the fixture `__base` cone is not pulled — rung 3 will pull
+    it for `fixlib.Tree`). This is a rename of emitter OUTPUT, not a hand-authored fn.
+  - **Import-both plumbing works.** A probe now imports tactus-core's
+    `TactusDefs_lib_exec` (render_exp) AND the renamed `TactusDefs_fixlib_exec__root`
+    (fixlib.sq/g2) AND probe29 compiled to olean (`w5f_v2_match_sem`, giving
+    `W5f.SymEnv`/`edenote`/FACT 5/8). run.sh builds the two dep oleans if stale then
+    elaborates ground.lean over all four sources.
+  - **Concrete `crateEnv : W5f.SymEnv`** (P5 match-literal): `fn`/`fnN` PINNED to
+    `sqLift`/`g2Lift` = the renamed emitter fns lifted across the **Nat/Int seam**
+    (`fun x:Int => (fixlib.sq x.toNat : Int)` — the render path's
+    `needs_nat_coercion` made explicit at the pin, since FACT 5's `Call … TyInt`
+    shape carries no cast node). av/avP given natural readings (`fun id st => st id` /
+    `≠0`); proj/ctorTag/ctorField stubbed 0 (rungs 2/3).
+  - **Free hypotheses DISCHARGED by rfl, not passed in:** `hfn_sq : crateEnv.fn sqId
+    = sqLift := rfl`, `hfnN_g2 : crateEnv.fnN g2Id = g2Lift := rfl` (Int-literal
+    match-table iota-reduces — de-risked by micro-test first). `#print axioms`:
+    hfn_sq/hfnN_g2 **depend on NO axioms**; the specialized facts
+    `ground_app_sq`/`ground_appn_g2` carry only `[propext]` (what FACT 5/8 already
+    have — no new axioms from grounding).
+  - **The specialized facts** `ground_app_sq`/`ground_appn_g2` state the denotation
+    with `fixlib.sq`/`fixlib.g2` EXPOSED in the RHS (`… ↔ (fixlib.sq (st nId).toNat :
+    Int) < 10`), closed by a bare term-mode application of FACT 5/8 — Lean typechecks
+    the grounded RHS against the fact's `g (av …)` RHS by defeq. Elapsed ~1.2s, PASS.
+  - **Verdict:** the CALL leaf is pinned to emitter output; the "free hypothesis" gap
+    is closed for the fn/fnN (App/AppN) fragment — where the bootstrap-56 census says
+    user spec-fn calls actually land (bodies are fn-pinned). **Remaining:** RUNG 2
+    (proj/FieldProj over `lib.Point`/mk_point) is the natural next; RUNG 3
+    (ctorTag/ctorField = the Hard Rung encoding theorem over `fixlib.Tree`) stays
+    DEFERRED per Danielle's steer (census shows direct Match-in-goal is currently
+    zero; bodies already fn-pinned).
+
 ## Writeup
 
 _when done: the concrete `crateEnv` literal, which oracles are pinned to which real
