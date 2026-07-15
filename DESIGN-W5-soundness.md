@@ -229,8 +229,8 @@ tactus-core (which forces the whole-crate re-verify + olean re-emit).
 | **W5b** | `Call` (the exec call rule `DESIGN-emit-module` §4.4 leaves open) + `Ret`/`ret_frame`; the post-call frame as ∀/#128-ret-eq. | bootstrap-50 |
 | **W5c** | `Loop` + havoc (`loop_maintain_frame`/`loop_use_frame`, init/maintain/decrease obligations); the WP loop rule — where the structured bugs live. | bootstrap-51 |
 | **W5d** | `&mut` / prophecy — model `final`/resolve by ∀-quantifying the final value (the standard trick). Hardest modeling; do last. | bootstrap-52 |
-| **W5e** | closures. | bootstrap-53 |
-| **W5f** | adequacy spine: hand-Lean `TGoal.toProp` + structural induction relating §2.1 Val-level `holds` to user-facing `Prop`s (lifts soundness from Val level to the theorems users prove). | (spun out when W5a–e land) |
+| **W5e** | closures — `Seq (DeadEnd body) (Assume external_spec)`; no new arm (DONE). | bootstrap-53 |
+| **W5f** | adequacy spine: hand-Lean `TGoal.toProp` + structural induction relating §2.1 Val-level `holds` to user-facing `Prop`s (lifts soundness from Val level to the theorems users prove). | bootstrap-54 |
 
 Partial correctness first; termination/decreases obligations are their own
 family (as Verus itself splits them) — modeled in `SstSem` via a well-founded
@@ -317,3 +317,30 @@ O6).
   DIFFER (they could not if resolve were a pre-body FHyp), proving `frame_after`
   places the pin temporally-correctly. Negative control (drop the resolve gate)
   fails elaboration ⇒ the iff bites. **Next: W5e — closures (bootstrap-53).**
+- **2026-07-15 (opus-w5e-closures): W5e DONE (bootstrap-53 closed).** W5e probe
+  at `probe-w0/probe26_w5e_sem/` — rc=0, ~3.0s, zero warnings, axiom closure
+  `[propext, Quot.sound]` on all six theorems. **Closures need NO new StmData
+  arm** — like prophecy (W5d), a closure IS `Seq (DeadEnd body) (Assume
+  external_spec)`, both constructors already in the 10-constructor vocabulary.
+  Verified against the ACTUAL Verus encoding (not first principles): a
+  `NonSpecClosure` (`ast.rs:1058`) lowers to `ClosureInner{body}` +
+  `Assume(external_spec)` (`ast_to_sst.rs:1964`); `ClosureInner` compiles to
+  `StmtX::DeadEnd(body)` (`sst_to_air.rs:2566`); the body
+  (`exec_closure_body_stms`, `:3556`) is assume-requires / body / assert-ensures —
+  pure W5a–c statements. Spec closures (`ExprX::Closure`) → a pure `BndX::Lambda`
+  opaque leaf. The load-bearing emitted fact is `frame_after f (DeadEnd b) = f`
+  (the DeadEnd quarantines the body's hyps from the continuation). **Main result
+  `closure_creation_sound`:** the reference WP for `Seq (DeadEnd body) (Assume
+  ext)` reduces EXACTLY to `execSafeF f body st` — closure creation = body
+  obligation under the enclosing frame; wrapper + Assume add nothing. **Isolation
+  subtlety** (flagged by Danielle's local model — the "creation vs. invocation"
+  quantification worry; its param premise was wrong for the reference but the
+  structural instinct was right): discharged by `closure_deadend_isolates`
+  (DeadEnd-wrapped assume → UNGATED continuation) vs `seq_assume_gates` (bare
+  assume → GATED), which DIFFER (impossible if the DeadEnd failed to isolate) +
+  negative control. ∀-params is via the outer `∀ st` (params are fresh ids, not
+  frame binders — matching AIR fresh constants); creation-time-context reliance is
+  sound by the **frozen-environment invariant** (Verus forbids mutable capture,
+  `closures.rs::check_closure_well_formed`) — a spec-adequacy point. **Next: W5f —
+  adequacy spine (bootstrap-54); the whole StmData vocabulary + prophecy +
+  closures are now sound at the Val level.**
