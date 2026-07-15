@@ -232,3 +232,26 @@ O6).
   forwards `¬C` (the W5a-1 caveat is discharged). `execSafe`'s Seq arm recurses
   under `closeSem`'s lambda and `termination_by structural` accepts it. **Next:
   W5c — Loop + havoc (bootstrap-51).**
+- **2026-07-15 (opus-w5c-loops): W5c DONE (bootstrap-51 closed).** W5c probe at
+  `probe-w0/probe24_w5c_sem/` — rc=0, ~2.9s, axiom closure `[propext,
+  Quot.sound]`. Adds `Loop` (init / body / maintain-reclose / decrease + the
+  havoc'd maintain/use telescopes), completing the whole `StmData` vocabulary.
+  **The havoc fork (bootstrap-51):** a Loop's `frame_after`/maintain frames are
+  `frame_append (havoc_lets f binders) tail` — `havoc_lets` DROPS mod-locals'
+  pre-loop lets from the MIDDLE of `f`, so `frame_after f (Loop) ≠ frame_append
+  f Δ` and the W5b `frameDelta`/`frame_after_eq_append` lift BREAKS; and no
+  clean `closeSem f ↔ closeSem (havoc f)` bridge exists (intermediate opaque
+  FHyp over a mod var). **Resolution (Opt-2, confirmed w/ Danielle's local
+  model):** the operational predicate CARRIES the frame — `execSafeF f s st` —
+  mirroring `wp_stm`'s threading; the Loop havocs `f` internally via the emitted
+  `loop_maintain_frame`, and the four goal groups are each `holdsAll
+  (close_each_e <opaque frame> obligs)` (frame-agnostic `holdsAll_close_each_e`)
+  ⇒ the havoc is never decomposed. Two payoffs: (1) `execSafeF` is TOTAL on
+  `StmData` ⇒ the theorem **sheds `inFragment` entirely** (soundness over the
+  whole vocabulary); (2) W5b's `frameDelta`/`frame_after_eq_append`/
+  `closeSem_frame_after`/`frame_append_*`/`closeSem_append`/`closeSem_ret_frame`/
+  `retApply`/`diverges`/`is_skip` machinery is all DROPPED — Seq/If/Ret carry
+  the threaded frame directly, and the theorem is now an **iff** (`holdsAll
+  (wp_stm f s) st ↔ execSafeF f s st`, sound + faithful). Decrease is MODELED
+  (emitted + must hold at body-end); the well-founded termination argument stays
+  its own family (O6). **Next: W5d — &mut/prophecy (bootstrap-52).**
