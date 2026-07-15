@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# W5f v2 GROUNDING probe — RUNG 1 (board bootstrap-57). Grounds the CALL-fragment
-# leaf oracles fn/fnN to REAL emitted defs. Imports (obstacle D solved by rename):
+# W5f v2 GROUNDING probe — RUNGS 1+2 (board bootstrap-57). Grounds the leaf oracles
+# fn/fnN (rung 1, CALL fragment) and proj/FieldProj (rung 2, over the real emitted
+# fixlib.Point record) to REAL emitted defs. Imports (obstacle D solved by rename):
 #   - tactus-core  TactusDefs_lib_exec        (lib.render_exp / lib.RawExp / …)
-#   - probe29      w5f_v2_match_sem           (W5f.SymEnv / edenote / FACT 5,8)
-#   - fixture      TactusDefs_fixlib_exec__root (fixlib.sq / fixlib.g2, renamed cone)
+#   - probe29      w5f_v2_match_sem           (W5f.SymEnv / edenote / FACT 5,8,12)
+#   - fixture      TactusDefs_fixlib_exec__root (fixlib.sq/g2 + fixlib.Point, renamed cone)
 #
 # The probe29 + fixlib oleans are built once by this script if missing/stale.
 # Usage: probe-w0/probe30_w5f_ground/run.sh    (LEAN=<lean> to override)
@@ -50,7 +51,7 @@ t1=$(date +%s%N)
 echo
 echo "elapsed: $(( (t1 - t0) / 1000000 )) ms"
 if [ $rc -eq 0 ]; then
-  echo "PASS ✓ — RUNG 1 lands: fn/fnN grounded to fixlib.sq/fixlib.g2, hfn/hfnN by rfl (rc=0)"
+  echo "PASS ✓ — RUNGS 1+2 land: fn/fnN → fixlib.sq/g2 (rfl); proj → fixlib.Point.x/.y (base-2^64 encoding thm, omega) (rc=0)"
 else
   echo "FAIL ✗ — rc=$rc"
 fi

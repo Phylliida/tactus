@@ -3,7 +3,7 @@ title: "W5f v2 follow-on — GROUND the leaf-denotation oracles (fn/fnN/proj/cto
 status: in_progress
 claimed_by: opus-bootstrap57-groundoracles
 created: 2026-07-16T02:30:00Z
-updated: 2026-07-16T02:30:00Z
+updated: 2026-07-14T21:45:00Z
 ---
 
 ## Description
@@ -164,6 +164,46 @@ reusing the probe5 match-literal pattern.
     (ctorTag/ctorField = the Hard Rung encoding theorem over `fixlib.Tree`) stays
     DEFERRED per Danielle's steer (census shows direct Match-in-goal is currently
     zero; bodies already fn-pinned).
+
+- (2026-07-14, opus-bootstrap57-rung2) **✅ RUNG 2 LANDED — proj/FieldProj grounded to
+  the real `fixlib.Point`, real Lean, PASS** (probe30 `./run.sh` rc=0, ~1.6s). Two
+  pieces:
+  - **New FACT 12 `adequacy_leaf_proj` in probe29** (`w5f_v2_match_sem.lean`): the
+    FieldProj render→denote step — `edenote E (render (BinOp lt (Field f TyInt base)
+    (Lit 10))) ↔ E.proj (eval E (render base)) f < 10`, abstract `E`, arbitrary
+    `base`, in the `< 10` frame (matches FACT 5/8, reuses the pinned `ltId=2`).
+    Proof = `rw [hr]; simp only [u_edenote_binop, hop, u_eval_fieldproj, u_eval_lit]`
+    (added `u_eval_fieldproj` unfold lemma). Carries `[propext]` like FACT 5/8. The
+    honest content is the FieldProj arm-selection + projection-oracle read; the
+    encoding lives at the pin (recon note A), NOT in this fact.
+  - **The encoding theorem in probe30** (`ground.lean`). `proj : Int→Int→Int` reads an
+    Int base ⇒ a 2-field record can't survive the flat-Int `eval` as itself ⇒
+    grounding proj is a genuine encoding proof, not an rfl discharge (recon A —
+    "the medium rung"). Since `Point` has ONE ctor (no tag decode) the encoding is a
+    plain **base-2^64 pairing**: `embPoint p = p.x*2^64 + p.y` (the REAL emitted
+    `fixlib.Point.mk`/`.x`/`.y` — a verbatim rename of the fixture's `__base`
+    `structure lib.Point`, added to the fixlib cone), `crateEnv.fnN mkPointId =
+    embPoint∘Point.mk`, `crateEnv.proj v fld = if fld=xId then v/2^64 else if fld=yId
+    then v%2^64 else 0`. Consistency `proj_x_consistent`/`proj_y_consistent`:
+    `proj (embPoint (Point.mk a b)) xId = a` (resp `= b`) — closed by **`omega`**,
+    consuming EXACTLY the fixture obligation's own field bound `0 ≤ b < 2^64`
+    (`h_b_bound` in mk_point.lean). Grounded facts `ground_proj_x`/`ground_proj_y`
+    compose FACT 12 over base = the emitted constructor `Point.mk a b` (renders AppN,
+    recon B), exposing the REAL `(fixlib.Point.mk (st a)(st b)).x`/`.y` in the RHS.
+    All 4 rung-2 theorems: `[propext, Quot.sound]` (standard core axioms; Quot.sound
+    via omega's Int div/mod) — **no Classical.choice, no sorryAx**. Rung-1 facts
+    unchanged.
+  - **Model consulted** (127.0.0.1:8051): endorsed base-2^64 over Cantor (linear+div/mod
+    → omega-clean, mirrors packed 128-bit layout, reuses the real bound), the `<10`
+    frame (compositional grounding proj→lt, not proj alone), and flagged pinning
+    `xId ≠ yId` distinct (done: xFieldId=0, yFieldId=1). No faithfulness gap: proj's
+    meaning is now formally "the value passed to the constructor," tied to the real
+    `fixlib.Point.x`.
+  - **Remaining:** RUNG 3 (ctorTag/ctorField = the Hard Rung enum+Match encoding
+    theorem over `fixlib.Tree`) stays DEFERRED per Danielle's steer — census shows
+    direct Match-in-goal is currently zero; bodies already fn-pinned. Card stays
+    in_progress for rung 3, but rungs 1+2 close the "free hypothesis" gap for the
+    App/AppN/FieldProj fragment (where user calls + field accesses actually land).
 
 ## Writeup
 
