@@ -1,9 +1,9 @@
 ---
 title: "W5-auth-0 — de-risk recursion-under-lambda for execSafeF + freeze the authored model shape (probe33)"
-status: todo
-claimed_by:
+status: done
+claimed_by: fable-b60
 created: 2026-07-16T17:15:00Z
-updated: 2026-07-16T17:15:00Z
+updated: 2026-07-16T18:05:00Z
 ---
 
 ## Description
@@ -53,3 +53,43 @@ frozen model interface is written down.
 
 **Blocked by:** nothing. Spec: `DESIGN-W5-soundness.md` §2 (model), probe24
 (`probe-w0/probe24_w5c_sem/`) for the exact hand-Lean equations being mirrored.
+
+## Progress
+
+- (2026-07-16, fable-b60) Recon against probe24 sharpened the question: the
+  W5c frame-carrying lift already removed recursion-under-lambda (Seq is a
+  plain conjunction; the theorem is a direct implication). The genuinely
+  untested shapes were M1 spec-closure literals (`upd`), M2 nested spec_fn
+  types (state-consuming oracles), M3 recursion under `forall` (FBind/All
+  arms), M4 induction THROUGH the ∀ arm. Authored probe33 as a mini-W5c
+  exercising all four.
+- (2026-07-16, fable-b60) Run 1: 31/32 — M1/M2/M3 pass first try; the M4
+  failure exposed backend fact F1 (calls inside `assert forall ... by` are
+  DROPPED — render as `True`, self-calls emit no termination VC). Run 2
+  (st-generic lemma, u_* still under the binder): 3 errors — F1 is general,
+  not self-call-specific. Hand-tested the fix shape against the emitted defs
+  olean, then re-authored: **run 3 = 32 verified, 0 errors.**
+
+## Writeup
+
+**DONE — PASS (`probe-w0/probe33_w5auth_shape/`, `32 verified, 0 errors`,
+~65s, axiom closures ⊆ [propext, Classical.choice, Quot.sound], no sorryAx).**
+
+All four mechanism shapes work; two backend facts discovered, and the
+authoring idiom they force is frozen in REPORT.md (binding for
+bootstrap-61..64):
+
+1. **F1**: proof-fn calls inside `assert forall ... by` blocks are dropped
+   from the VC (`True →`); never inject facts under a binder.
+2. **F2**: ∀st-quantified equation hyps DO rewrite under inner binders via
+   simp_all — so the idiom is **state-generic ensures** (`ensures forall|st|
+   #[trigger] lhs == rhs`) for every state-dependent lemma; IHs and u_*
+   unfolds become plain arm-body calls. st-as-param stays fine when no binder
+   is crossed (both shapes coexist, validated).
+3. u_* one-step unfolds close with closer `first | tactus_auto | (intros <;>
+   rfl)` (definitional on constructor literals under the ∀st wrap).
+4. The probe32 induction discharge closer is unchanged and suffices.
+
+The frozen model interface for bootstrap-61 (names/types/continuation
+decision — two first-order `close_sem_*` fns, NO ContK datatype, NO
+higher-order continuation params) is tabulated in probe33's REPORT.md.
