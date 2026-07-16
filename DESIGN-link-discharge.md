@@ -217,11 +217,14 @@ follow-up, not a day-one requirement.
 
 ## 7. Ladder
 
-- **L0 (probe34, no production code)**: hand-write `wp_stm_sound_closed`
-  + `ref_wp_sound_closed` in a standalone probe against the CURRENT
-  emission — validates the fix shape, the discriminator discharge, the
-  positional weave application, and the termination-VC consumption
-  before any codegen. Freeze the generated-term shapes from it.
+- **L0 (probe34, no production code) — DONE 2026-07-16**: validated the
+  fix shape / discriminator discharge / positional weave application /
+  termination-VC consumption on `holds_all_append_closed` (recursive,
+  bound-free chain) + the holds_close_e FNil arm; `theorem` keyword works
+  incl. recursion (Q3). Targets shifted from wp_stm_sound/ref_wp_sound
+  because L0 FOUND the bound gap (Q4/F1) that blocks their u_* callees —
+  the wp chain discharges only after Q4 is resolved (R-a recommended).
+  Shapes frozen in `probe-w0/probe34_link_discharge/REPORT.md`.
 - **L1**: spine recording at the weave chokepoint + clean-statement
   rendering + non-recursive discharge codegen; fixture green.
 - **L2**: structural-fix synthesis for single-datatype-param recursion;
