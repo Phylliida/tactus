@@ -22,18 +22,38 @@ Two halves:
    lake env lean file.lean`.
 
 2. **Derivability census.** Extend `tools/rung-attrib/fast_attrib.py` (or a
-   sibling harness) to squeeze ALL 145 T2 theorems in the Brick-1 pool and, for
-   each minimized lemma list, classify:
-   - **DERIVABLE**: every lemma is computable from what the emitter knows at that
-     obligation site — for preconditions: the callee's requires-mentioned spec-fn
-     defs; for postconditions: the fn's own ensures-mentioned defs; plus the
-     broadcast axiom set already in scope as `_tactus_bc` hyps, and datatype
-     accessor/ctor lemmas of mentioned types.
+   sibling harness) to squeeze ALL 145 T2 theorems in the Brick-1 pool and
+   classify each minimized lemma list on TWO axes:
+
+   **Axis 1 — derivable?** (LOCALITY CONSTRAINT, 2026-07-16 conversation: the
+   candidate lemma set is a function of the obligation's OWN semantic inputs
+   only — the goal's mentioned symbols and the callee's spec. NOT "whatever
+   `_tactus_bc` hyps happen to be in scope" — ambient-scope dependence means
+   distant edits move the derived list, deterministic-but-surprising.)
+   - **DERIVABLE**: every lemma is computable from the site's semantic inputs —
+     preconditions: callee's requires-mentioned spec-fn defs; postconditions:
+     own ensures-mentioned defs; plus named axioms/accessor lemmas OF SYMBOLS
+     THE GOAL MENTIONS (e.g. goal mentions Seq.subrange → the named subrange
+     axioms).
    - **GOAL-SPECIFIC**: needs lemmas outside that computable set (creative
-     choices — these are inline-proof candidates).
-   Report per-kind rates (preconditions are 81% T2 and the doc predicts their
-   lists are "small and formulaic" — test that prediction), plus the pred-twin
-   dedup view (~70 effective theorems).
+     choices — inline-proof candidates).
+
+   **Axis 2 — terminal shape** (the predictability ladder):
+   - **UNFOLD-THEN-DECIDE**: closes as `simp only [defs] <;> omega/rfl/decide`
+     where simp does pure definitional unfolding and a decision procedure
+     finishes. Statable spec: "succeeds iff the goal, after unfolding these
+     named defs, is in the decided fragment" — fragment-style predictability,
+     the strongest tier.
+   - **REWRITE-CLOSURE**: needs named-lemma rewriting beyond unfolding
+     (quantified seq axiom instantiation etc.) — deterministic and visible,
+     but success is rewriting reachability, operationally predicted.
+   - **HEURISTIC-NEEDED**: neither → inline proof, no machinery.
+
+   Report per-kind × per-axis rates (preconditions are 81% T2 and the doc
+   predicts their lists are "small and formulaic" — test that prediction), plus
+   the pred-twin dedup view (~70 effective theorems). The unfold-then-decide
+   share is the headline number: it measures how much of T2 gets FULLY
+   predictable (not just deterministic) treatment.
 
 Output: `MEASUREMENT-s2a-derivability.md` + per-theorem CSV. This census is the
 decision data for mainline-04 — if the derivable share is high, pin STORAGE is
