@@ -1,0 +1,47 @@
+---
+title: "S2b — settle pin storage: derivation-first vs any persistent store (design, w/ Danielle)"
+status: todo
+claimed_by:
+created: 2026-07-16T17:28:00Z
+updated: 2026-07-16T17:28:00Z
+---
+
+## Description
+
+Design decision, made WITH Danielle, informed by mainline-03's census. Danielle
+flagged the design doc's §3.2 pin sidecar as suspect ("a lil sussy — I'd like to
+do things the right way") — and the suspicion has a precise form: **a committed
+sidecar is a THIRD surface**, in tension with the standing two-surface end state
+(emitter-derived tactics + inline proofs). Tactic text in a sidecar is neither
+derivable nor in the source.
+
+Candidates, ranked by minimality:
+
+1. **No storage — derivation rules** (primary candidate). Pins are a pure
+   function of the goal, recomputed at every emission: the emitter derives
+   `simp only [site-knowable lemmas] (<;> omega)` per obligation kind. This is
+   S1's pattern generalized (S1 derives `omega` for the linear fragment, stores
+   nothing, deterministic because derivation is deterministic). Determinism ✓
+   (named lemmas break loudly on renames), speed ✓ (no search on the hot path),
+   auditability ✓ (artifact reads as a proof). Viable iff mainline-03 shows a
+   high derivable share.
+2. **Inline proofs for the residue** — the source IS the store, and it already
+   exists. Squeeze results that aren't derivable get suggested as inline proof
+   text ("this obligation needed `simp only [X, Y]` — consider writing it"),
+   user applies. Complements 1; together they preserve two surfaces exactly.
+3. **Committed emitted artifacts as the store** — middle ground if the residue
+   is large: the .lean artifact already contains the tactic text; committing
+   artifacts makes drift a reviewable diff without inventing a new format.
+   Costs: generated files in repo, size, merge noise.
+4. **Sidecar per §3.2** (fallback only) — obligation-id-keyed JSON, cache-key
+   invalidation. Keep only if 1+2 leave an unbearable gap AND 3's costs bite.
+
+Decision criteria: two-surface end state; §3.3 goals (determinism, speed,
+auditability); review surface (a pin diff should be reviewable as a proof
+change); no ambient context (the guiding rule).
+
+**Done when:** decision recorded in `DESIGN-transparent-automation.md` (amend §3
+with the chosen shape + rationale + census numbers), and mainline-05's scope is
+rewritten to match.
+
+**Blocked by:** mainline-03 (needs the derivability numbers).
