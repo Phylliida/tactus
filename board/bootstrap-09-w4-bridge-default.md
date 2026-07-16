@@ -3,7 +3,7 @@ title: "W4 — kernel bridge on by default in package mode"
 status: in_progress
 claimed_by: opus-w4
 created: 2026-07-13T19:38:00Z
-updated: 2026-07-14T13:30:00Z
+updated: 2026-07-16T17:15:00Z
 ---
 
 ## Description
@@ -112,3 +112,13 @@ before defaulting on). R1 package layers already landed (M6).
 ## Writeup
 
 _when done: findings, how the code works, assumptions made_
+
+## Progress
+
+- (2026-07-16, fable-plan) **Decomposed into cards** (board session with
+  Danielle): **bootstrap-67** (W4b — cert/bridge content-keyed caching +
+  cold/warm cost numbers on fixture + tgt) → **bootstrap-68** (W4c — the
+  default flip, bridge failure = verification error, red-path e2e pin; closes
+  this umbrella). The original blocker (bootstrap-08 W3) is done; the in-gate
+  bridge is validated on real tgt (bootstrap-39). Coverage widening is tracked
+  separately (bootstrap-69 assert-query, -70 call-generic, -71 ∀-path).
