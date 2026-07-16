@@ -8,3 +8,4 @@
 lean-project/
 bootstrap-fixture/target/
 board/.active_session.json
+/target/

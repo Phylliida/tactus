@@ -3,7 +3,7 @@ title: "W5 — soundness of the reference WP (the bootstrap loop closes) [staged
 status: in_progress
 claimed_by: opus-w5a-kickoff
 created: 2026-07-13T19:38:00Z
-updated: 2026-07-14T21:30:00Z
+updated: 2026-07-16T17:15:00Z
 ---
 
 ## Description
@@ -92,6 +92,16 @@ W6.
   `REPORT.md §Q2`. **The last open feasibility question is closed** — the umbrella's
   remaining tail is pure authoring/scaling (W5a-0 in tactus-core, then up the ladder),
   bearing the base-hash re-verify cost, not a mechanism unknown.
+
+- (2026-07-16, fable-plan) **Authoring tail decomposed into cards** (board
+  session with Danielle): **bootstrap-60** (probe33 — de-risk the one uncovered
+  shape question, recursion-under-lambda in execSafeF's Seq arm, + freeze the
+  authored model interface) → **bootstrap-61** (semantic model in tactus-core,
+  one batched cache-churning edit) → **bootstrap-62** (straight-line + If
+  proofs) → **bootstrap-63** (Call/Ret/DeadEnd/Assign + frame algebra) →
+  **bootstrap-64** (Loop arm; scaffolds dropped → total `wp_stm_sound`) →
+  **bootstrap-65** (prophecy + closure corollaries) → **bootstrap-66** (compose
+  with the adequacy spine + permanent runner; closes this umbrella).
 
 ## Writeup
 
