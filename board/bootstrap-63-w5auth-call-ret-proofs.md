@@ -1,9 +1,9 @@
 ---
 title: "W5-auth-3 — soundness proofs, Call/Ret/DeadEnd/Assign arms + frame-delta algebra (probe23 authored)"
-status: todo
-claimed_by:
+status: done
+claimed_by: fable-b63
 created: 2026-07-16T17:15:00Z
-updated: 2026-07-16T17:15:00Z
+updated: 2026-07-16T21:30:00Z
 ---
 
 ## Description
@@ -30,3 +30,22 @@ induction covering `{Skip, Assume, Assert, Assign, Seq, If, Call, Ret,
 DeadEnd}`; axiom closure clean; the If fall-through no longer scaffolded.
 
 **Blocked by:** bootstrap-62.
+
+## Progress
+
+- (2026-07-16, fable-b63) Scope shifted per bootstrap-61's plan note: the
+  frameDelta algebra of hand-Lean W5b is NOT needed in the authored version
+  (the W5c frame-carrying formulation retired it before authoring began);
+  this rung = the obligs bridge. Landed: `cso_nil_true` + `cso_cons_split`
+  (both st-generic FrameList inductions; with defunctionalized continuations
+  the hand-Lean closeSem congr/triv/mono/and helper zoo collapses into these
+  two) + `holds_all_close_each_e` (the frame-agnostic Call/Ret/Loop-groups
+  bridge, st-param). First-try green: **121 verified, 0 errors**.
+
+## Writeup
+
+The one new closer ingredient: `cso_cons_split`'s FBind arm needs
+∀-distribution over ∧, so its closer carries `[and_assoc, forall_and]`.
+Everything else is the probe33 idiom verbatim. `holds_all_close_each_e`
+takes the frame as an OPAQUE argument — this is what lets bootstrap-64's
+Loop arm never decompose the havoc'd mframe/endf (the W5c Opt-2 payoff).

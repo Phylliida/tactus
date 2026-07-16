@@ -3386,4 +3386,416 @@ pub proof fn u_esf_seq(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, a
             && exec_safe_f(hp, he, lv, frame_after(f, *a), *b, st))
 {}
 
+// ── W5 data-side one-step unfolds (bootstrap-62): the reference fns the
+//    soundness proofs rewrite with. Data-only (no st) — probe32 empty
+//    shape, default closer. ──
+
+pub proof fn u_close_e_nil(ob: RawExp)
+    ensures close_e(FrameList::FNil, ob) == GoalData::LeafE(render_exp(ob))
+{}
+pub proof fn u_close_e_bind(x: u64, ty: u64, t: Box<FrameList>, ob: RawExp)
+    ensures close_e(FrameList::FBind(x, ty, t), ob) == GoalData::All(x, ty, Box::new(close_e(*t, ob)))
+{}
+pub proof fn u_close_e_hyp(h: u64, t: Box<FrameList>, ob: RawExp)
+    ensures close_e(FrameList::FHyp(h, t), ob) == GoalData::Imp(h, Box::new(close_e(*t, ob)))
+{}
+pub proof fn u_close_e_let(x: u64, v: u64, t: Box<FrameList>, ob: RawExp)
+    ensures close_e(FrameList::FLet(x, v, t), ob) == GoalData::Let(x, v, Box::new(close_e(*t, ob)))
+{}
+pub proof fn u_cce_nil(f: FrameList)
+    ensures close_each_e(f, RawExpList::Nil) == GoalList::Nil
+{}
+pub proof fn u_cce_cons(f: FrameList, h: Box<RawExp>, t: Box<RawExpList>)
+    ensures close_each_e(f, RawExpList::Cons(h, t))
+        == GoalList::Cons(Box::new(close_e(f, *h)), Box::new(close_each_e(f, *t)))
+{}
+pub proof fn u_gapp_nil(b: GoalList)
+    ensures goals_append(GoalList::Nil, b) == b
+{}
+pub proof fn u_gapp_cons(h: Box<GoalData>, t: Box<GoalList>, b: GoalList)
+    ensures goals_append(GoalList::Cons(h, t), b)
+        == GoalList::Cons(h, Box::new(goals_append(*t, b)))
+{}
+pub proof fn u_wp_assert(f: FrameList, o: RawExp, h: u64)
+    ensures wp_stm(f, StmData::Assert(o, h))
+        == GoalList::Cons(Box::new(close_e(f, o)), Box::new(GoalList::Nil))
+{}
+pub proof fn u_wp_assume(f: FrameList, e: u64)
+    ensures wp_stm(f, StmData::Assume(e)) == GoalList::Nil
+{}
+pub proof fn u_wp_assign(f: FrameList, x: u64, rhs: u64)
+    ensures wp_stm(f, StmData::Assign(x, rhs)) == GoalList::Nil
+{}
+pub proof fn u_wp_call(f: FrameList, reqs: Box<RawExpList>, post: Box<FrameList>)
+    ensures wp_stm(f, StmData::Call { reqs, post }) == close_each_e(f, *reqs)
+{}
+pub proof fn u_wp_deadend(f: FrameList, b: Box<StmData>)
+    ensures wp_stm(f, StmData::DeadEnd(b)) == wp_stm(f, *b)
+{}
+pub proof fn u_wp_ret(f: FrameList, es: Box<RawExpList>, rb: RetBind)
+    ensures wp_stm(f, StmData::Ret(es, rb)) == close_each_e(ret_frame(f, rb), *es)
+{}
+pub proof fn u_wp_if(f: FrameList, c: u64, nc: u64, t: Box<StmData>, e: Box<StmData>)
+    ensures wp_stm(f, StmData::If(c, nc, t, e))
+        == goals_append(
+            wp_stm(frame_append(f, FrameList::FHyp(c, Box::new(FrameList::FNil))), *t),
+            wp_stm(frame_append(f, FrameList::FHyp(nc, Box::new(FrameList::FNil))), *e))
+{}
+pub proof fn u_wp_loop(f: FrameList,
+    inv_hyps: Box<BinderList>, inv_obligs: Box<RawExpList>, binders: Box<BinderList>,
+    binder_bounds: Box<ParamBoundList>, cond_name: u64, cond_ann: u64, neg_cond_ann: u64,
+    d_old_name: u64, d_old_val: u64, decrease_oblig: RawExp, body: Box<StmData>)
+    ensures wp_stm(f, StmData::Loop {
+            inv_hyps, inv_obligs, binders, binder_bounds, cond_name, cond_ann,
+            neg_cond_ann, d_old_name, d_old_val, decrease_oblig, body,
+        })
+        == goals_append(close_each_e(f, *inv_obligs),
+            goals_append(
+                wp_stm(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val), *body),
+                goals_append(
+                    close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val), *body), *inv_obligs),
+                    GoalList::Cons(
+                        Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val), *body), decrease_oblig)),
+                        Box::new(GoalList::Nil)))))
+{}
+pub proof fn u_wp_skip(f: FrameList)
+    ensures wp_stm(f, StmData::Skip) == GoalList::Nil
+{}
+pub proof fn u_wp_seq(f: FrameList, a: Box<StmData>, b: Box<StmData>)
+    ensures wp_stm(f, StmData::Seq(a, b))
+        == goals_append(wp_stm(f, *a), wp_stm(frame_after(f, *a), *b))
+{}
+
+// ── W5 support lemma A (bootstrap-62, hand-Lean `holds_close_e`): a
+//    frame-closed obligation goal holds iff the obligation holds under the
+//    frame's ∀/→/let telescope. ST-GENERIC (probe33 idiom): induction over
+//    f, IH + unfolds as plain arm-body calls, ∀st-equations rewrite under
+//    the FBind binder in the postcondition VC. ──
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
+#[verifier::structural_decreases]
+pub proof fn holds_close_e(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
+    ensures forall|st: St|
+        #[trigger] holds(hp, he, lv, close_e(f, o), st) == close_sem_e(hp, he, lv, f, st, o)
+    decreases f
+{
+    match f {
+        FrameList::FNil => {
+            u_close_e_nil(o);
+            u_holds_leafe(hp, he, lv, render_exp(o));
+            u_cse_nil(hp, he, lv, o);
+        }
+        FrameList::FBind(x, ty, t) => {
+            u_close_e_bind(x, ty, t, o);
+            u_holds_all_binder(hp, he, lv, x, ty, Box::new(close_e(*t, o)));
+            u_cse_bind(hp, he, lv, x, ty, t, o);
+            holds_close_e(hp, he, lv, *t, o);                   // IH (st-generic)
+        }
+        FrameList::FHyp(h, t) => {
+            u_close_e_hyp(h, t, o);
+            u_holds_imp(hp, he, lv, h, Box::new(close_e(*t, o)));
+            u_cse_hyp(hp, he, lv, h, t, o);
+            holds_close_e(hp, he, lv, *t, o);                   // IH (st-generic)
+        }
+        FrameList::FLet(x, v, t) => {
+            u_close_e_let(x, v, t, o);
+            u_holds_let(hp, he, lv, x, v, Box::new(close_e(*t, o)));
+            u_cse_let(hp, he, lv, x, v, t, o);
+            holds_close_e(hp, he, lv, *t, o);                   // IH (st-generic)
+        }
+    }
+}
+
+// ── W5 support lemma D (bootstrap-62, hand-Lean `holdsAll_append`):
+//    holds_all distributes over goals_append. st stays a PARAM (no binder
+//    crossed in the GoalList induction — probe33 idiom note 2). ──
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
+#[verifier::structural_decreases]
+pub proof fn holds_all_append(hp: HpOracle, he: HeOracle, lv: LvOracle, a: GoalList, b: GoalList, st: St)
+    ensures holds_all(hp, he, lv, goals_append(a, b), st)
+        == (holds_all(hp, he, lv, a, st) && holds_all(hp, he, lv, b, st))
+    decreases a
+{
+    match a {
+        GoalList::Nil => {
+            u_gapp_nil(b);
+            u_holds_all_nil(hp, he, lv);
+        }
+        GoalList::Cons(g, t) => {
+            u_gapp_cons(g, t, b);
+            u_holds_all_cons(hp, he, lv, g, t);
+            u_holds_all_cons(hp, he, lv, g, Box::new(goals_append(*t, b)));
+            holds_all_append(hp, he, lv, *t, b, st);            // IH
+        }
+    }
+}
+
+// ── W5 obligs-bridge structure lemmas (bootstrap-63). With the
+//    defunctionalized continuations, hand-Lean's closeSem congr/triv/
+//    mono/and helper zoo collapses into two telescope inductions:
+//    triviality on Nil and ∧-splitting on Cons. Both ST-GENERIC. ──
+
+// close_sem_obligs over the empty list is trivially true through any
+// telescope (hand-Lean `closeSem_triv` specialized).
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
+#[verifier::structural_decreases]
+pub proof fn cso_nil_true(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList)
+    ensures forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, RawExpList::Nil) == true
+    decreases f
+{
+    match f {
+        FrameList::FNil => {
+            u_cso_nil(hp, he, lv, RawExpList::Nil);
+            u_obligs_nil(he);
+        }
+        FrameList::FBind(x, ty, t) => {
+            u_cso_bind(hp, he, lv, x, ty, t, RawExpList::Nil);
+            cso_nil_true(hp, he, lv, *t);                       // IH (st-generic)
+        }
+        FrameList::FHyp(h, t) => {
+            u_cso_hyp(hp, he, lv, h, t, RawExpList::Nil);
+            cso_nil_true(hp, he, lv, *t);                       // IH (st-generic)
+        }
+        FrameList::FLet(x, v, t) => {
+            u_cso_let(hp, he, lv, x, v, t, RawExpList::Nil);
+            cso_nil_true(hp, he, lv, *t);                       // IH (st-generic)
+        }
+    }
+}
+
+// close_sem_obligs over a Cons splits into head (close_sem_e) ∧ tail —
+// the ∧ distributes through the whole telescope (hand-Lean
+// `closeSem_and_iff` + `closeSem_congr`, collapsed).
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc, forall_and]))")]
+#[verifier::structural_decreases]
+pub proof fn cso_cons_split(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, h: Box<RawExp>, t: Box<RawExpList>)
+    ensures forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, RawExpList::Cons(h, t))
+        == (close_sem_e(hp, he, lv, f, st, *h) && close_sem_obligs(hp, he, lv, f, st, *t))
+    decreases f
+{
+    match f {
+        FrameList::FNil => {
+            u_cso_nil(hp, he, lv, RawExpList::Cons(h, t));
+            u_obligs_cons(he, h, t);
+            u_cse_nil(hp, he, lv, *h);
+            u_cso_nil(hp, he, lv, *t);
+        }
+        FrameList::FBind(x, ty, tl) => {
+            u_cso_bind(hp, he, lv, x, ty, tl, RawExpList::Cons(h, t));
+            u_cse_bind(hp, he, lv, x, ty, tl, *h);
+            u_cso_bind(hp, he, lv, x, ty, tl, *t);
+            cso_cons_split(hp, he, lv, *tl, h, t);              // IH (st-generic)
+        }
+        FrameList::FHyp(hh, tl) => {
+            u_cso_hyp(hp, he, lv, hh, tl, RawExpList::Cons(h, t));
+            u_cse_hyp(hp, he, lv, hh, tl, *h);
+            u_cso_hyp(hp, he, lv, hh, tl, *t);
+            cso_cons_split(hp, he, lv, *tl, h, t);              // IH (st-generic)
+        }
+        FrameList::FLet(x, v, tl) => {
+            u_cso_let(hp, he, lv, x, v, tl, RawExpList::Cons(h, t));
+            u_cse_let(hp, he, lv, x, v, tl, *h);
+            u_cso_let(hp, he, lv, x, v, tl, *t);
+            cso_cons_split(hp, he, lv, *tl, h, t);              // IH (st-generic)
+        }
+    }
+}
+
+// ── W5 support lemma B/C (bootstrap-63, hand-Lean `holdsAll_close_each_e`):
+//    a closed obligation list holds iff every obligation holds under the
+//    telescope. Works for ANY frame — incl. the Loop's havoc'd mframe/endf,
+//    so the havoc is never decomposed. st stays a PARAM (the RawExpList
+//    induction crosses no binder). ──
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
+#[verifier::structural_decreases]
+pub proof fn holds_all_close_each_e(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, l: RawExpList, st: St)
+    ensures holds_all(hp, he, lv, close_each_e(f, l), st)
+        == close_sem_obligs(hp, he, lv, f, st, l)
+    decreases l
+{
+    match l {
+        RawExpList::Nil => {
+            u_cce_nil(f);
+            u_holds_all_nil(hp, he, lv);
+            cso_nil_true(hp, he, lv, f);
+        }
+        RawExpList::Cons(h, t) => {
+            u_cce_cons(f, h, t);
+            u_holds_all_cons(hp, he, lv, Box::new(close_e(f, *h)), Box::new(close_each_e(f, *t)));
+            holds_close_e(hp, he, lv, f, *h);
+            cso_cons_split(hp, he, lv, f, h, t);
+            holds_all_close_each_e(hp, he, lv, f, *t, st);      // IH
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// W5 MAIN THEOREM (bootstrap-64, hand-Lean probe24 `wp_stm_sound`):
+// reference-WP soundness AND faithfulness on the FULL StmData vocabulary
+// — Skip/Assume/Assign/Assert/Call/Ret/DeadEnd/If/Seq/Loop — over an
+// arbitrary frame telescope. TOTAL: no fragment predicate. The Loop arm
+// never decomposes its havoc'd frames (mframe/endf stay opaque args to
+// the frame-agnostic bridge lemmas — the W5c Opt-2 resolution).
+// ═════════════════════════════════════════════════════════════════════
+// Closer note: the explicit `cases s <;> simp_all <;> omega` branch runs
+// FIRST — on the Loop termination VC `tactus_auto` itself burns the whole
+// whnf heartbeat budget (the 11-field Loop height reduction), so it cannot
+// be the first alternative; generic tactus_case_split tries `f` (the first
+// datatype local) before `s`; and the If/Seq termination goals
+// (`height t < 1 + height t + height e`) need omega after the simp
+// reduction. All five recursive-call termination VCs close in ~3s under
+// this branch (hand-isolated on the emitted theorems).
+#[verifier::tactus_tactic("first | (intros <;> cases s <;> simp_all (config := { zetaDelta := true }) [and_assoc] <;> omega) | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
+#[verifier::structural_decreases]
+pub proof fn wp_stm_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, s: StmData, st: St)
+    ensures holds_all(hp, he, lv, wp_stm(f, s), st) == exec_safe_f(hp, he, lv, f, s, st)
+    decreases s
+{
+    match s {
+        StmData::Assert(o, h) => {
+            u_wp_assert(f, o, h);
+            u_holds_all_cons(hp, he, lv, Box::new(close_e(f, o)), Box::new(GoalList::Nil));
+            u_holds_all_nil(hp, he, lv);
+            holds_close_e(hp, he, lv, f, o);
+            u_esf_assert(hp, he, lv, f, o, h);
+        }
+        StmData::Assume(e) => {
+            u_wp_assume(f, e);
+            u_holds_all_nil(hp, he, lv);
+            u_esf_assume(hp, he, lv, f, e);
+        }
+        StmData::Assign(x, rhs) => {
+            u_wp_assign(f, x, rhs);
+            u_holds_all_nil(hp, he, lv);
+            u_esf_assign(hp, he, lv, f, x, rhs);
+        }
+        StmData::Call { reqs, post } => {
+            u_wp_call(f, reqs, post);
+            holds_all_close_each_e(hp, he, lv, f, *reqs, st);
+            u_esf_call(hp, he, lv, f, reqs, post);
+        }
+        StmData::DeadEnd(b) => {
+            u_wp_deadend(f, b);
+            u_esf_deadend(hp, he, lv, f, b);
+            wp_stm_sound(hp, he, lv, f, *b, st);                // IH
+        }
+        StmData::Ret(es, rb) => {
+            u_wp_ret(f, es, rb);
+            holds_all_close_each_e(hp, he, lv, ret_frame(f, rb), *es, st);
+            u_esf_ret(hp, he, lv, f, es, rb);
+        }
+        StmData::If(c, nc, t, e) => {
+            u_wp_if(f, c, nc, t, e);
+            u_esf_if(hp, he, lv, f, c, nc, t, e);
+            holds_all_append(hp, he, lv,
+                wp_stm(frame_append(f, FrameList::FHyp(c, Box::new(FrameList::FNil))), *t),
+                wp_stm(frame_append(f, FrameList::FHyp(nc, Box::new(FrameList::FNil))), *e), st);
+            wp_stm_sound(hp, he, lv, frame_append(f, FrameList::FHyp(c, Box::new(FrameList::FNil))), *t, st);   // IH
+            wp_stm_sound(hp, he, lv, frame_append(f, FrameList::FHyp(nc, Box::new(FrameList::FNil))), *e, st);  // IH
+        }
+        StmData::Loop { inv_hyps, inv_obligs, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, d_old_name, d_old_val, decrease_oblig, body } => {
+            // NO `let mframe/endf` bindings and the IH comes FIRST: Rust lets
+            // ride into every subsequent VC (incl. the height-decrease
+            // termination VC) and zetaDelta then forces simp to normalize
+            // `loop_maintain_frame`/`frame_after` on symbolic args — a whnf
+            // heartbeat explosion. Inlined, the termination goal is just the
+            // height inequality.
+            wp_stm_sound(hp, he, lv,
+                loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val),
+                *body, st);                                                  // IH (body, havoc'd frame opaque)
+            u_wp_loop(f, inv_hyps, inv_obligs, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, d_old_name, d_old_val, decrease_oblig, body);
+            u_esf_loop(hp, he, lv, f, inv_hyps, inv_obligs, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, d_old_name, d_old_val, decrease_oblig, body);
+            // the three ++ splits (init ++ (body ++ (reclose ++ decrease)))
+            holds_all_append(hp, he, lv, close_each_e(f, *inv_obligs),
+                goals_append(wp_stm(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val), *body),
+                    goals_append(close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val), *body), *inv_obligs),
+                        GoalList::Cons(Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val), *body), decrease_oblig)), Box::new(GoalList::Nil)))), st);
+            holds_all_append(hp, he, lv, wp_stm(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val), *body),
+                goals_append(close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val), *body), *inv_obligs),
+                    GoalList::Cons(Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val), *body), decrease_oblig)), Box::new(GoalList::Nil))), st);
+            holds_all_append(hp, he, lv, close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val), *body), *inv_obligs),
+                GoalList::Cons(Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val), *body), decrease_oblig)), Box::new(GoalList::Nil)), st);
+            // the four goal groups (body group = the IH fact above)
+            holds_all_close_each_e(hp, he, lv, f, *inv_obligs, st);          // init
+            holds_all_close_each_e(hp, he, lv, frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val), *body), *inv_obligs, st);  // maintain-reclose
+            u_holds_all_cons(hp, he, lv, Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val), *body), decrease_oblig)), Box::new(GoalList::Nil));
+            u_holds_all_nil(hp, he, lv);
+            holds_close_e(hp, he, lv, frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val), *body), decrease_oblig);  // decrease
+        }
+        StmData::Skip => {
+            u_wp_skip(f);
+            u_holds_all_nil(hp, he, lv);
+            u_esf_skip(hp, he, lv, f);
+        }
+        StmData::Seq(a, b) => {
+            u_wp_seq(f, a, b);
+            u_esf_seq(hp, he, lv, f, a, b);
+            holds_all_append(hp, he, lv, wp_stm(f, *a), wp_stm(frame_after(f, *a), *b), st);
+            wp_stm_sound(hp, he, lv, f, *a, st);                             // IH
+            wp_stm_sound(hp, he, lv, frame_after(f, *a), *b, st);            // IH (shifted frame)
+        }
+    }
+}
+
+// ref_wp unfold + top-level soundness through the genuine seed_frame.
+pub proof fn u_ref_wp(c: FnCtxData, s: StmData)
+    ensures ref_wp(c, s) == wp_stm(seed_frame(c), s)
+{}
+
+/// THE LOOP-CLOSURE THEOREM (hand-Lean `ref_wp_sound`): the emitted
+/// certificate goals all hold at a state iff the statement is
+/// operationally safe under the per-fn seed frame — for EVERY oracle
+/// triple consistent with the leaf typing (valuation-parametric).
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc])")]
+pub proof fn ref_wp_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, c: FnCtxData, s: StmData, st: St)
+    ensures holds_all(hp, he, lv, ref_wp(c, s), st) == exec_safe_f(hp, he, lv, seed_frame(c), s, st)
+{
+    u_ref_wp(c, s);
+    wp_stm_sound(hp, he, lv, seed_frame(c), s, st);
+}
+
+// ── Non-vacuity: the theorem BITES (the leaf arms demand the ACTUAL
+//    obligations, never `true`). ──
+
+// (1) Assert under the empty frame: the emitted goal forces the deep
+//     obligation at the very state.
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc])")]
+pub proof fn wp_sound_bites_assert(hp: HpOracle, he: HeOracle, lv: LvOracle, o: RawExp, h: u64, st: St)
+    requires holds_all(hp, he, lv, wp_stm(FrameList::FNil, StmData::Assert(o, h)), st)
+    ensures he(render_exp(o), st)
+{
+    wp_stm_sound(hp, he, lv, FrameList::FNil, StmData::Assert(o, h), st);
+    u_esf_assert(hp, he, lv, FrameList::FNil, o, h);
+    u_cse_nil(hp, he, lv, o);
+}
+
+// (2) Loop INIT (probe24 witness 1): the invariant obligation must hold
+//     on ENTRY at the pre-loop state — deliverable only from the emitted
+//     init goal (he is opaque).
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc])")]
+pub proof fn wp_sound_bites_loop_init(hp: HpOracle, he: HeOracle, lv: LvOracle,
+    inv_hyps: Box<BinderList>, ob: Box<RawExp>, binders: Box<BinderList>,
+    binder_bounds: Box<ParamBoundList>, cond_name: u64, cond_ann: u64, neg_cond_ann: u64,
+    d_old_name: u64, d_old_val: u64, decrease_oblig: RawExp, body: Box<StmData>, st: St)
+    requires holds_all(hp, he, lv, wp_stm(FrameList::FNil, StmData::Loop {
+            inv_hyps,
+            inv_obligs: Box::new(RawExpList::Cons(ob, Box::new(RawExpList::Nil))),
+            binders, binder_bounds, cond_name, cond_ann, neg_cond_ann,
+            d_old_name, d_old_val, decrease_oblig, body,
+        }), st)
+    ensures he(render_exp(*ob), st)
+{
+    wp_stm_sound(hp, he, lv, FrameList::FNil, StmData::Loop {
+        inv_hyps,
+        inv_obligs: Box::new(RawExpList::Cons(ob, Box::new(RawExpList::Nil))),
+        binders, binder_bounds, cond_name, cond_ann, neg_cond_ann,
+        d_old_name, d_old_val, decrease_oblig, body,
+    }, st);
+    u_esf_loop(hp, he, lv, FrameList::FNil, inv_hyps,
+        Box::new(RawExpList::Cons(ob, Box::new(RawExpList::Nil))),
+        binders, binder_bounds, cond_name, cond_ann, neg_cond_ann,
+        d_old_name, d_old_val, decrease_oblig, body);
+    u_cso_nil(hp, he, lv, RawExpList::Cons(ob, Box::new(RawExpList::Nil)));
+    u_obligs_cons(he, ob, Box::new(RawExpList::Nil));
+}
+
 } // verus!
