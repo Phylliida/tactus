@@ -63,15 +63,13 @@ unnecessary and the whole arc stays two-surface.
 squeeze API confirmed working on our toolchain, and ≥3 hand-validated squeezed
 theorems demonstrating the minimized forms elaborate.
 
-**Blocked by:** PREREQUISITE discovered 2026-07-16 (mainline-02 writeup): fresh
-`--lean-all-proofs --emit-lean` artifacts on main emit `import
-TactusDefs_lib_exec`, but the defs module doesn't build on main (bootstrap-40/41
-regressions, fixed on bootstrap branch) — so freshly-harvested artifacts don't
-elaborate. Options: (a) do bootstrap-72 (sync bootstrap→main) first — also
-heals the package gate, preferred; (b) merge bootstrap into the `squeeze`
-branch only; (c) fix the emit/live divergence (emit-only should honor a FAILED
-ladder record and emit standalone artifacts — see mainline-02 writeup) which
-this census tooling wants anyway. Work happens on the `squeeze` branch
-(worktree `../tactus-squeeze`, provisioned 2026-07-16: z3 + tree-sitter +
-vargo binary copied in; build its own release binary only when emitter code
-changes start).
+**Blocked by:** NOTHING — prerequisite CLEARED 2026-07-16: bootstrap-72 sync
+done (merge `a254eb8`, full battery green, tgt package gate live again).
+Fresh artifact harvest with the merged binary → `/tmp/census-emit`. Note for
+the harness: post-sync artifacts import `TactusDefs_lib_exec`, so elaboration
+needs the defs oleans on LEAN_PATH (or harvest from a live run's island
+texts); the emit/live-divergence bug from mainline-02's writeup remains real
+for trees where defs FAIL, just no longer bites here. Work happens on the
+`squeeze` branch (worktree `../tactus-squeeze`, provisioned 2026-07-16: z3 +
+tree-sitter + vargo binary copied in; build its own release binary only when
+emitter code changes start).
