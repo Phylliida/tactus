@@ -1,10 +1,11 @@
 # probe34 — Link-discharge L0 (bootstrap-73)
 
-**Verdict: PASS, first elaboration.** The discharge-term shapes the Link
-generator will emit are validated by hand against the current tactus-core
-emission (`closed.lean`, rc=0). Axiom closures: `holds_all_append_closed`
-= `[propext, Classical.choice, Quot.sound]`, `holds_close_e_fnil_arm_closed`
-= `[propext, Quot.sound]` — Lean core only.
+**Verdict: PASS.** The discharge-term shapes the Link generator will emit
+are validated by hand against the current tactus-core emission
+(`closed.lean`, rc=0), including the Q4/R-b wf-guarded rung. Axiom
+closures: `holds_all_append_closed` and the four-arm `holds_close_e_closed`
+= `[propext, Classical.choice, Quot.sound]`,
+`holds_close_e_fnil_arm_closed` = `[propext, Quot.sound]` — Lean core only.
 
 ## What is frozen for the generator (L1/L2)
 
@@ -47,30 +48,45 @@ and the caller's clean ∀-quantified fact underivable. The discharge pass
 is exactly the machine that catches this class forever; surfacing it is
 the L0 payoff.
 
-**Resolution options for L1 (Danielle's call, design §8 gains a Q4):**
+**Resolution — R-b, VALIDATED IN THIS PROBE (and an honest walk-back).**
 
-- **R-a (weave the guard, recommended)**: the weave includes the callee's
-  bound premises in the woven fact (`0 ≤ x ∧ x < N → <fact>`) whenever
-  the callee has them — i.e. the woven premise becomes the callee's
-  closed statement instantiated, verbatim. Composition then works
-  unconditionally. Cost: caller VC goals gain a guard hypothesis; the
-  existing closers likely absorb it (simp intro), but every affected
-  proof re-verifies once (VC-shape change = cache invalidation for
-  affected fns).
-- **R-b (wf-guarded clean forms)**: leave the weave alone; the clean
-  closed theorem for a fn whose discharge crosses the gap takes a
-  well-formedness premise (`FrameList.wf f` = all scalar fields bounded)
-  and dispatch supplies field bounds from it. Cost: a new wf predicate
-  family per datatype + wf-threading; the clean statements are no longer
-  premise-free (though the premise is honest).
-- **R-c (status quo + tag)**: discharge only gap-free fns; tag the rest
-  `discharge-bound-gap`. Honest but leaves wp_stm_sound/ref_wp_sound
-  undischargeable (their u_* callees carry scalar params) — does NOT
-  unblock bootstrap-66. Only acceptable as an interim L1 milestone.
+- **R-a (weave the guard) — WITHDRAWN after deeper analysis.** It was
+  initially recommended (and Danielle approved it), but tracing where the
+  guard burden lands shows it BREAKS the callers: the guarded woven
+  premise (`bounds → fact`) reaches the caller's VC, and the caller must
+  *prove* the guard to use the fact — impossible at extrinsically-typed
+  projections. The W5 proofs themselves would stop verifying. Repairing
+  that requires emitting projection-bound hypotheses in match arms, whose
+  justification at the top level needs wf premises anyway — R-a converges
+  to R-b with extra churn.
+- **R-b (wf-guarded clean forms) — VALIDATED here, and cheaper than first
+  costed: ZERO changes to any VC, closer, or existing proof.** The bare
+  woven premise is exactly what the callee's theorem produces once its
+  bound binders are instantiated — so the generator supplies bounds at
+  DISPATCH time, from a `wf` premise on the clean theorem.
+  `∀ d, wf d → fact` is also the semantically faithful statement: wf is
+  precisely the image of the Verus u64 typing inside the extrinsic Lean
+  model (O9). Demonstrated: `flWf` (hand version of the generated
+  predicate) + the FULL four-arm `holds_close_e_closed` under it —
+  axiom closure `[propext, Classical.choice, Quot.sound]`. On concrete
+  serialized literals wf is free (`decide` leaves).
+- **R-c (tag-and-skip)**: remains the honest interim for shapes L1/L2
+  don't cover yet.
 
-Note for R-a: this makes the invariant "a woven premise IS the callee's
-closed statement" — the same statement-identity-by-construction principle
-the rest of the architecture uses, which is why it is recommended.
+**L2 design consequence (the wf family lives in tactus-core).** Dispatch
+at COMPUTED datatype args (e.g. wp_stm_sound's Loop arm calling at
+`loop_maintain_frame f …`) needs wf-PRESERVATION facts
+(`wf f → wf (frame_append f g)` etc.). The right home for these is
+tactus-core itself: wf predicates as ordinary structural spec fns
+(bool, kernel-computing) and preservation lemmas as ordinary proof fns —
+emitted, kernel-checked, and CONSUMED BY NAME by the generator exactly
+like the termination VC theorems. The generator never synthesizes math.
+
+**flWf emission note:** recursion through `Box.deref` gets no Lean
+equational theorems (the known `rec_1` fact) — `simp [flWf]` is
+unavailable; iota on literals + anonymous constructors work fine. The
+generated wf in the defs family inherits the same discipline as every
+other mirror fn.
 
 ## Fragility note (why the probe pins shapes, not names)
 
@@ -84,6 +100,8 @@ names — the probe accepts it as scaffolding, the product does not.
 
 - `closed.lean` — u_* re-exports, `holds_all_append_closed` (the full
   fix-synthesis demonstrator: recursive, bound-free chain),
-  `holds_close_e_fnil_arm_closed` (the arm that composes; the other three
-  arms are F1-blocked), consumption smoke (`exact`/`rw` downstream use).
+  `holds_close_e_fnil_arm_closed` (the bound-free arm), the R-b rung
+  (`flWf` + the FULL four-arm `holds_close_e_closed` under wf — the Q4
+  resolution, validated), a concrete-literal wf witness, and the
+  consumption smoke (`exact`/`rw` downstream use).
 - `run.sh` — elaborates against tactus-core/out/lib + preludes.
