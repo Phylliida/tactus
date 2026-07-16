@@ -3,7 +3,7 @@ title: "W5-auth-6 — compose the loop closure: adequacy spine over the authored
 status: todo
 claimed_by:
 created: 2026-07-16T17:15:00Z
-updated: 2026-07-16T22:40:00Z
+updated: 2026-07-16T23:30:00Z
 ---
 
 ## Description
@@ -33,7 +33,10 @@ authored, emitted, and kernel-checked as part of the tactus-core package
 closure is recorded; bootstrap-10 status = done with writeup; VERIFICATION-PATH
 updated.
 
-**Blocked by:** bootstrap-64, bootstrap-65.
+**Blocked by:** bootstrap-64, bootstrap-65 (done), and now **bootstrap-73**
+(Link discharge — Danielle resolved the design fork 2026-07-16: option iii,
+no hand chain-discharge, no drift gate; the spine will consume
+`lib.ref_wp_sound_closed` by plain `exact`).
 
 ## Progress
 
@@ -60,3 +63,11 @@ updated.
     emit-module feature: "export closed clean form for fns whose callees
     are all closed"). Option (iii) is likely the durable one — surface to
     Danielle at pickup.
+
+- (2026-07-16, fable-b65) **Design fork RESOLVED (Danielle: do it right, no
+  temporary hacks) = option (iii) as a general Link-layer completion.**
+  Spec written: `DESIGN-link-discharge.md`; execution card bootstrap-73.
+  Key recon refinement baked into the spec: the Link ALREADY discharges
+  the binder channel (tactic-referenced helper deps, generate.rs:3984);
+  the gap is the weave channel (body lemma calls → `∀ Unit, fact →`
+  premises) + recursion. This card resumes after bootstrap-73 L2.
