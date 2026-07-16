@@ -1,9 +1,9 @@
 ---
 title: "S2b — settle pin storage: derivation-first vs any persistent store (design, w/ Danielle)"
-status: todo
-claimed_by:
+status: done
+claimed_by: kimi + Danielle
 created: 2026-07-16T17:28:00Z
-updated: 2026-07-16T17:28:00Z
+updated: 2026-07-16T22:45:00Z
 ---
 
 ## Description
@@ -64,3 +64,30 @@ with the chosen shape + rationale + census numbers), and mainline-05's scope is
 rewritten to match.
 
 **Blocked by:** mainline-03 (needs the derivability numbers).
+
+## Writeup
+
+**DECIDED 2026-07-16, Danielle, on the mainline-03 census data** (295 real
+theorems: 95.6% derivable; one fixed 43-lemma site-invariant list + omega tail
+validated 280/280):
+
+- **Candidate 1 — derivation-first, NO STORE.** The sidecar (candidate 4) and
+  committed artifacts (candidate 3) are dead: a store would persist what a
+  constant already provides. The derived tactic is the uniform text
+  `simp_all only [CORE: 43 fixed core lemmas] <;> omega` — rule budget ONE,
+  locality satisfied by construction (the list is site-INVARIANT, stronger
+  than "site-computable").
+- **Candidate 2 — inline proofs for the residue.** 13 theorems / 2 clusters /
+  3 effective sites. The Option-accessor rule exception ("accessor lemmas of
+  mentioned symbols' field types") was CONSIDERED AND DECLINED — rule budget
+  stays at one; the cluster gets inline proofs in gt source.
+- **Predictability honesty accepted:** the pool is REWRITE-CLOSURE, 0%
+  unfold-then-decide; the accepted story is "fixed core normalizer + omega
+  decider tail". Recorded in DESIGN-transparent-automation.md §3.4 with the
+  census numbers and the three protocol facts downstream work must respect.
+- mainline-05's scope rewritten to match (uniform derived tactic replacing
+  `tactus_auto` as the default closer; suggestion report for residue;
+  validation = full-pool 0-regression diff, not just the T2 subset).
+- mainline-15 pairing noted: residue inline proofs will cite full dotted
+  names; the `open <crate> in` ergonomics question stays open but does NOT
+  block 05.
