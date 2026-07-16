@@ -425,7 +425,7 @@ fn krate_preamble(
         .chain(bc_lemma_funcs.iter().copied())
         .collect();
     if defs.is_none() {
-        cmds.extend(spec_world_cmds(krate, &ectx, &dep_walk_roots, emit_accessors, &bc_lemma_funcs, false));
+        cmds.extend(spec_world_cmds(krate, crate_name, &ectx, &dep_walk_roots, emit_accessors, &bc_lemma_funcs, false));
     }
     // (defs mode: bc axioms come from the defs module's import — the
     // union emitted there is a superset of this fn's collected set.)
@@ -541,8 +541,70 @@ fn spec_fn_refs(f: &FunctionX) -> Vec<Fun> {
     refs.into_iter().cloned().collect()
 }
 
+// ── W7d (bootstrap-33): defs-layer certificate wire helpers ──────────────
+//
+// The generate-side glue between spec-fn / datatype emission and the
+// flag-gated `sst_serialize::emit_def_cert` / `emit_dt_cert` writers. Both
+// are no-ops unless `--tactus-emit-cert`; the fail-loud + census discipline
+// (an uncertifiable poly/curried/struct fixture is logged + skipped, never
+// aborts the run) lives inside the `emit_*` entry points.
+
+/// Emit the defs-layer `def_eq` certificate for a spec fn whose emitted
+/// commands include a plain `@[reducible] def`. Only the `Command::Def` form
+/// bridges — a `DefCurried` (structural-recursion curried form) or an `Axiom`
+/// (bodyless / `eq_def` / builtin-bodied spec fn) has no `ldef_to_defdata`
+/// mirror and is skipped. `augmented` is the same `FunctionX`
+/// `spec_fn_to_ast` lowered, so its VIR fields correspond to that exact def.
+fn maybe_emit_def_cert(augmented: &FunctionX, emitted: &[Command], crate_name: &str) {
+    if !crate::sst_serialize::cert_emit_enabled() {
+        return;
+    }
+    let def = match emitted.iter().find_map(|c| match c {
+        Command::Def(d) => Some(d),
+        _ => None,
+    }) {
+        Some(d) => d,
+        None => return,
+    };
+    // A `Command::Def` implies a body (bodyless spec fns emit an `Axiom`);
+    // guard anyway so the `&VirExpr` hand-off is total.
+    let body = match &augmented.body {
+        Some(b) => b,
+        None => return,
+    };
+    crate::sst_serialize::emit_def_cert(
+        crate_name,
+        &augmented.name,
+        &augmented.typ_params,
+        &augmented.params,
+        &augmented.ret.x.typ,
+        body,
+        def,
+    );
+}
+
+/// Collect every emitted `Command::Datatype` (recursing into `mutual` blocks)
+/// so the W7d dt-cert pass can pair each VIR datatype with its rendered form.
+fn collect_emitted_datatypes<'a>(
+    cmds: &'a [Command],
+    out: &mut Vec<&'a crate::lean_ast::Datatype>,
+) {
+    for c in cmds {
+        match c {
+            Command::Datatype(d) => out.push(d),
+            Command::Mutual(inner) => collect_emitted_datatypes(inner, out),
+            _ => {}
+        }
+    }
+}
+
 pub(crate) fn spec_world_cmds(
     krate: &KrateX,
+    // W7d: the crate name (unsanitized) — threaded only to reach the
+    // flag-gated `emit_def_cert`/`emit_dt_cert` defs-layer cert writers, which
+    // key their `{crate}/cert/` output dir on `sanitize(crate_name)`. Verdict-
+    // neutral: a no-op unless `--tactus-emit-cert`.
+    crate_name: &str,
     ectx: &crate::emit_ctx::EmitCtx,
     dep_walk_roots: &[&FunctionX],
     emit_accessors: bool,
@@ -560,11 +622,14 @@ pub(crate) fn spec_world_cmds(
     // tripwires keep guarding per-fn emission.
     lenient: bool,
 ) -> Vec<Command> {
-    spec_world_cmds_tagged(krate, ectx, dep_walk_roots, emit_accessors, bc_lemma_funcs, lenient).0
+    spec_world_cmds_tagged(krate, crate_name, ectx, dep_walk_roots, emit_accessors, bc_lemma_funcs, lenient).0
 }
 
 pub(crate) fn spec_world_cmds_tagged(
     krate: &KrateX,
+    // W7d: unsanitized crate name for the defs-layer cert writers (see
+    // `spec_world_cmds`). Flag-gated no-op unless `--tactus-emit-cert`.
+    crate_name: &str,
     ectx: &crate::emit_ctx::EmitCtx,
     dep_walk_roots: &[&FunctionX],
     emit_accessors: bool,
@@ -1022,6 +1087,28 @@ pub(crate) fn spec_world_cmds_tagged(
             &mut || to_lean_fn::datatype_group_to_cmds(&group, emit_accessors, &external_body_paths));
     }
 
+    // W7d: emit the defs-layer `dt_eq` certificate for each datatype that
+    // was actually emitted as an `inductive` above. A flag-gated no-op (the
+    // default emit path is untouched); the reference transcriber gates
+    // poly/tuple/struct fixtures fail-loud + census inside `emit_dt_cert`.
+    // Done as a post-loop pass (not inside the loop closure) purely so the
+    // group-emit line stays byte-identical; matched by rendered name against
+    // the just-pushed `Command::Datatype`s so a mutual SCC pairs correctly.
+    if crate::sst_serialize::cert_emit_enabled() {
+        let mut emitted_dts: Vec<&crate::lean_ast::Datatype> = Vec::new();
+        collect_emitted_datatypes(&cmds, &mut emitted_dts);
+        for dtx in referenced_dts.iter() {
+            let want = match &dtx.name {
+                Dt::Path(p) => crate::to_lean_type::lean_name(p),
+                Dt::Tuple(_) => continue,
+            };
+            if let Some(dt) = emitted_dts.iter().find(|d| d.name == want) {
+                crate::sst_serialize::emit_dt_cert(
+                    crate_name, &dtx.name, &dtx.typ_params, &dtx.variants, dt);
+            }
+        }
+    }
+
     // TraitMethodImpl spec fns ARE emitted as standalone defs in
     // addition to their Instance method. This is the canonical Lean
     // idiom for instance fields with interdependencies: define a
@@ -1322,8 +1409,33 @@ pub(crate) fn spec_world_cmds_tagged(
                     }));
                     step_pushed = push_lenient(&mut cmds, "spec fn", &mut || {
                         let augmented = augment(f);
-                        to_lean_fn::spec_fn_to_ast(&augmented, ectx)
+                        let out = to_lean_fn::spec_fn_to_ast(&augmented, ectx);
+                        // W7d: emit the defs-layer `def_eq` cert for the
+                        // emitted `def` (flag-gated no-op; fail-loud + census
+                        // inside `emit_def_cert`). Inside the closure so the
+                        // panic-catch wraps it too.
+                        maybe_emit_def_cert(&augmented, &out, crate_name);
+                        out
                     });
+                    // bootstrap-47: for a suffix-recursive spec fn (e.g.
+                    // `drop_base_run`), emit its `{fn}_len_le` monotonicity
+                    // companion RIGHT AFTER the def, riding this fn's own
+                    // FnGroup seg — so a later consumer (`split_q`, same or
+                    // an importing part) resolves it via the part-import
+                    // chain — and register its name so that consumer's
+                    // `decreasing_by` chaining rung cites it. Gated on the
+                    // def having landed (`step_pushed`) and on `push_lenient`.
+                    if step_pushed {
+                        if let Some((mono_name, cmd)) =
+                            seq_suffix_mono_companion_cmd(f, &all_fns)
+                        {
+                            if push_lenient(&mut cmds, "seq suffix mono companion",
+                                &mut || vec![cmd.clone()])
+                            {
+                                to_lean_fn::register_suffix_mono_name(mono_name);
+                            }
+                        }
+                    }
                     segs.push((cmds.len(), DefsSeg::Base));
                     }
                 }
@@ -1360,7 +1472,10 @@ pub(crate) fn spec_world_cmds_tagged(
                         let inner: Vec<Command> = fns.iter()
                             .flat_map(|f| {
                                 let augmented = augment(f);
-                                to_lean_fn::spec_fn_to_ast(&augmented, ectx)
+                                let out = to_lean_fn::spec_fn_to_ast(&augmented, ectx);
+                                // W7d: per-fn `def_eq` cert (flag-gated no-op).
+                                maybe_emit_def_cert(&augmented, &out, crate_name);
+                                out
                             })
                             .collect();
                         vec![Command::Mutual(inner)]
@@ -1450,6 +1565,18 @@ pub(crate) fn spec_world_cmds_tagged(
                                 seq_measure_companion_cmd(f, &rel, &all_fns, bc_lemma_funcs)
                             {
                                 push_lenient(&mut cmds, "seq measure companion", &mut || vec![cmd.clone()]);
+                            }
+                            // Drop-k companion (bootstrap-46): emit the general
+                            // `Seq.subrange_tail_len_lt` ONCE, on the drop_first
+                            // pass (not drop_last), so a raw `subrange u k (len u)`
+                            // recursion terminates. Rides drop_first's own seg, so
+                            // later parts' decreasing_by resolves it via imports.
+                            if rel == "Seq.drop_first" {
+                                if let Some(cmd) =
+                                    seq_subrange_tail_companion_cmd(f, &all_fns, bc_lemma_funcs)
+                                {
+                                    push_lenient(&mut cmds, "seq subrange-tail companion", &mut || vec![cmd.clone()]);
+                                }
                             }
                         }
                         segs.push((cmds.len(), DefsSeg::Base));
@@ -1560,6 +1687,295 @@ fn seq_measure_companion_cmd(
     )))
 }
 
+/// Companion for **drop-k** seq measures: a general
+/// `Seq.subrange_tail_len_lt` proving `len (subrange s j (len s)) < len s`
+/// for any `j ≥ 1`. Unlike `seq_measure_companion_cmd` (which is keyed to a
+/// specific `drop_first`/`drop_last` *def* head), this handles a raw
+/// `subrange u k (len u)` recursion for arbitrary `k` — e.g.
+/// `m3_blinker.ffnf` recursing on `subrange u 2 (len u)`, which has no
+/// `drop_{first,last}` head for `apply` to unify (bootstrap-46).
+///
+/// Emitted ONCE, piggy-backed on the `Seq.drop_first` emission site (by
+/// which point `axiom_seq_subrange_len`, `Seq.len` and `Seq.subrange` are
+/// all in scope and the axiom has landed). The theorem lands in the SAME
+/// `Seq.*` namespace as `drop_first_len_lt` (derived from the drop_first
+/// fn's qualified name), so `DECREASING_BY_TACTIC`'s
+/// `apply {ns}.Seq.subrange_tail_len_lt` rung resolves via the part-import
+/// chain exactly like the drop_first companion. Proven from
+/// `axiom_seq_subrange_len` with a canned tactic (validated against Lean
+/// 4.25.0) — a theorem, not an axiom. Returns `None` when the subrange-len
+/// axiom, `Seq.len` or `Seq.subrange` isn't part of this emission.
+///
+/// LIMITATION: emitted only on the `Seq.drop_first` site, so a crate that
+/// recurses on `subrange s k (len s)` WITHOUT also emitting `Seq.drop_first`
+/// would not get it. Every attested drop-k user (m3_blinker.ffnf) also uses
+/// `drop_first`, so this holds today; a future counterexample is an easy
+/// follow-up (hoist the emission to the axiom-flush site).
+fn seq_subrange_tail_companion_cmd(
+    drop_first_fn: &FunctionX,
+    all_fns: &[&FunctionX],
+    bc_lemma_funcs: &[&FunctionX],
+) -> Option<Command> {
+    let ax = bc_lemma_funcs.iter().find(|a| {
+        crate::to_lean_type::lean_name_relative(&a.name.path) == "seq.axiom_seq_subrange_len"
+    })?;
+    let len_fn = all_fns.iter().find(|a| {
+        crate::to_lean_type::lean_name_relative(&a.name.path) == "seq.Seq.len"
+    })?;
+    let subrange_fn = all_fns.iter().find(|a| {
+        crate::to_lean_type::lean_name_relative(&a.name.path) == "seq.Seq.subrange"
+    })?;
+    // The `seq.Seq` datatype path = the len fn's path minus its last segment.
+    let seq_path = {
+        let lp = &len_fn.name.path;
+        let segs: Vec<_> = lp.segments.iter().take(lp.segments.len() - 1).cloned().collect();
+        if segs.is_empty() {
+            return None;
+        }
+        std::sync::Arc::new(vir::ast::PathX {
+            krate: lp.krate.clone(),
+            segments: std::sync::Arc::new(segs),
+        })
+    };
+    // Name the theorem in drop_first's OWN namespace (`{ns}.Seq.…`), so the
+    // tactic's `q("Seq.subrange_tail_len_lt")` citation resolves identically
+    // to the `drop_first_len_lt` companion. Derive `{ns}.Seq` by stripping
+    // the trailing method segment off drop_first's qualified name
+    // (`lib.Seq.drop_first` → `lib.Seq`).
+    let df = crate::to_lean_type::lean_name(&drop_first_fn.name.path);
+    let ns_seq = match df.rsplit_once('.') {
+        Some((pre, _)) => pre.to_string(),
+        None => return None,
+    };
+    let thm = format!("{ns_seq}.subrange_tail_len_lt");
+    let len = crate::to_lean_type::lean_name(&len_fn.name.path);
+    let subrange = crate::to_lean_type::lean_name(&subrange_fn.name.path);
+    let ax_n = crate::to_lean_type::lean_name(&ax.name.path);
+    let seq_t = crate::to_lean_type::lean_name(&seq_path);
+    Some(Command::Raw(format!(
+        "theorem {thm} (A : Type) [Nonempty A] (s : {seq_t} A) (j : Int)\n    \
+         (h1 : 1 ≤ j) (h2 : j ≤ {len} A s) :\n    \
+         {len} A ({subrange} A s j ({len} A s)) < {len} A s := by\n  \
+         have hx := {ax_n} A s j ({len} A s) (by omega)\n  \
+         omega",
+    )))
+}
+
+// ── bootstrap-47: suffix-recursive length-monotonicity companion ──────────
+//
+// A per-USER-fn companion `{fn}_len_le : len (f W) ≤ len W` for a spec fn
+// `f : Seq E → Seq E` whose body is EXACTLY `if <guard> then W else
+// f(W.drop_first())` (guard exposing `len W = 0` as a top-level disjunct) —
+// e.g. `m3_blinker.drop_base_run`. `split_q` recurses on
+// `drop_base_run(W.drop_first())`; its termination goal
+// `len (drop_base_run (drop_first W)) < len W` needs the COMPOSITION of this
+// monotonicity fact with `drop_first_len_lt`, which `decreasing_by_tactic`'s
+// chaining rung supplies (`Nat.lt_of_le_of_lt`).
+//
+// Unlike the generic `seq_*_companion_cmd` theorems (proven once, generic
+// over the element type), this is MONOMORPHIC — bound to a specific user fn
+// and its concrete Seq element type — and proven by `fun_induction` on the
+// fn's own auto-generated `.induct`. That makes a SOUND detector critical:
+// `push_lenient` only catches Rust panics, not Lean elaboration failures, so
+// a false positive (emitting an unprovable companion) would poison the whole
+// defs file. The detector therefore requires the EXACT structural shape the
+// canned tactic provably discharges (validated standalone against the real
+// oleans, Lean 4.25.0 — see `/tmp/probe_splitq.lean`). A false NEGATIVE is
+// harmless: the fn just keeps failing termination exactly as it does today.
+
+/// If `typ` (decoration/box-peeled) is `Seq<E>`, return `(seq-datatype path,
+/// element typ)`.
+fn seq_datatype_and_elem(typ: &Typ) -> Option<(&vir::ast::Path, &Typ)> {
+    let t = crate::to_lean_type::peel_typ_wrappers(typ);
+    if let TypX::Datatype(Dt::Path(p), args, _) = &**t {
+        if crate::to_lean_type::lean_name_relative(p) == "seq.Seq" && args.len() == 1 {
+            return Some((p, &args[0]));
+        }
+    }
+    None
+}
+
+/// Strip transparent expression wrappers (empty block, ghost, proof-in-spec,
+/// never-to-any) so the structural matchers see through the desugaring of
+/// `{ W }` / `{ f(...) }` block bodies.
+fn peel_mono_expr(e: &Expr) -> &Expr {
+    match &e.x {
+        ExprX::Block(stmts, Some(inner)) if stmts.is_empty() => peel_mono_expr(inner),
+        ExprX::Ghost { expr, .. } => peel_mono_expr(expr),
+        ExprX::ProofInSpec(inner) => peel_mono_expr(inner),
+        ExprX::NeverToAny(inner) => peel_mono_expr(inner),
+        _ => e,
+    }
+}
+
+/// `e` (peeled) is a plain read of the local variable `name`.
+fn is_read_of_var(e: &Expr, name: &VarIdent) -> bool {
+    match &peel_mono_expr(e).x {
+        ExprX::Var(v) => v == name,
+        ExprX::ReadPlace(place, _) => matches!(&place.x, PlaceX::Local(v) if v == name),
+        ExprX::ImplicitReborrowOrSpecRead(place, _, _) =>
+            matches!(&place.x, PlaceX::Local(v) if v == name),
+        _ => false,
+    }
+}
+
+/// `e` (peeled) is `W.drop_first()` for the local `pname`.
+fn is_drop_first_of_var(e: &Expr, pname: &VarIdent) -> bool {
+    if let ExprX::Call(CallTarget::Fun(_, h, _, _, _, _), args, _) = &peel_mono_expr(e).x {
+        if crate::to_lean_type::lean_name_relative(&h.path) == "Seq.drop_first" && args.len() == 1 {
+            return is_read_of_var(&args[0], pname);
+        }
+    }
+    false
+}
+
+/// `e` (peeled) is the self-recursive call `f(W.drop_first())`.
+fn is_self_drop_first_recursion(e: &Expr, self_path: &vir::ast::Path, pname: &VarIdent) -> bool {
+    if let ExprX::Call(CallTarget::Fun(_, g, _, _, _, _), args, _) = &peel_mono_expr(e).x {
+        if g.path == *self_path && args.len() == 1 {
+            return is_drop_first_of_var(&args[0], pname);
+        }
+    }
+    false
+}
+
+/// `e` (peeled) is `W.len() == 0` (either operand order).
+fn is_len_eq_zero(e: &Expr, pname: &VarIdent) -> bool {
+    if let ExprX::Binary(BinaryOp::Eq(_), a, b) = &peel_mono_expr(e).x {
+        return (is_len_of_var(a, pname) && is_int_zero(b))
+            || (is_len_of_var(b, pname) && is_int_zero(a));
+    }
+    false
+}
+
+/// `e` (peeled) is `W.len()` for the local `pname`.
+fn is_len_of_var(e: &Expr, pname: &VarIdent) -> bool {
+    if let ExprX::Call(CallTarget::Fun(_, g, _, _, _, _), args, _) = &peel_mono_expr(e).x {
+        if crate::to_lean_type::lean_name_relative(&g.path) == "seq.Seq.len" && args.len() == 1 {
+            return is_read_of_var(&args[0], pname);
+        }
+    }
+    false
+}
+
+/// `e` (peeled) is the integer literal `0`.
+fn is_int_zero(e: &Expr) -> bool {
+    matches!(&peel_mono_expr(e).x, ExprX::Const(Constant::Int(n)) if n.to_string() == "0")
+}
+
+/// True iff the guard is an OR-tree with `len(pname) == 0` as one of its
+/// top-level disjuncts. This is exactly what makes the `else` branch's
+/// `¬guard` yield `len W ≠ 0` (which `omega` reads, over any opaque
+/// non-arith disjuncts) — and also exactly what makes recursion on
+/// `W.drop_first()` terminate, so the shape is self-consistent.
+fn guard_or_tree_has_len_zero(e: &Expr, pname: &VarIdent) -> bool {
+    match &peel_mono_expr(e).x {
+        ExprX::Binary(BinaryOp::Or, l, r) =>
+            guard_or_tree_has_len_zero(l, pname) || guard_or_tree_has_len_zero(r, pname),
+        _ => is_len_eq_zero(peel_mono_expr(e), pname),
+    }
+}
+
+/// Length-monotonicity companion for a **suffix-recursive** spec fn (see the
+/// section comment above). Returns `(theorem name, command)` — the name is
+/// registered in the mono-companion bag so later fns' `decreasing_by` cite
+/// it — or `None` when `f` is not suffix-recursive or the seq primitives
+/// (`seq.Seq.len`, `Seq.drop_first`) aren't part of this emission.
+fn seq_suffix_mono_companion_cmd(
+    f: &FunctionX,
+    all_fns: &[&FunctionX],
+) -> Option<(String, Command)> {
+    // ── strict structural detection ──
+    if f.mode != Mode::Spec { return None; }
+    if f.params.len() != 1 { return None; }
+    if f.decrease.is_empty() { return None; }
+    let pname = &f.params[0].x.name;
+    let (seq_path, elem) = seq_datatype_and_elem(&f.params[0].x.typ)?;
+    // return type must also be `Seq<_>` (the fn returns its own recursion).
+    seq_datatype_and_elem(&f.ret.x.typ)?;
+    let body = f.body.as_ref()?;
+    let (guard, then_e, else_e) = match &peel_mono_expr(body).x {
+        ExprX::If(g, t, Some(e)) => (g, t, e),
+        _ => return None,
+    };
+    // Exactly one branch is the identity `W`; the other the `f(drop_first W)`
+    // recursion. (`fun_induction`'s base/step cases close regardless of which
+    // branch is which — `omega` for identity, the IH+drop_first chain for
+    // recursion — so position is immaterial.)
+    let then_id = is_read_of_var(then_e, pname);
+    let else_id = is_read_of_var(else_e, pname);
+    let rec_e = if then_id && !else_id {
+        else_e
+    } else if else_id && !then_id {
+        then_e
+    } else {
+        return None;
+    };
+    if !is_self_drop_first_recursion(rec_e, &f.name.path, pname) { return None; }
+    if !guard_or_tree_has_len_zero(guard, pname) { return None; }
+
+    // ── emit the proven companion (monomorphic in the element type) ──
+    let len_fn = all_fns.iter().find(|a| {
+        crate::to_lean_type::lean_name_relative(&a.name.path) == "seq.Seq.len"
+    })?;
+    let drop_first_fn = all_fns.iter().find(|a| {
+        crate::to_lean_type::lean_name_relative(&a.name.path) == "Seq.drop_first"
+    })?;
+    let fn_n = crate::to_lean_type::lean_name(&f.name.path);
+    let len = crate::to_lean_type::lean_name(&len_fn.name.path);
+    let seq_t = crate::to_lean_type::lean_name(seq_path);
+    let df = crate::to_lean_type::lean_name(&drop_first_fn.name.path);
+    // Render the concrete Seq element type; parenthesize if it's an
+    // application (so it stays a single type argument).
+    let elem_str = crate::lean_pp::pp_expr(&crate::to_lean_type::typ_to_expr(elem));
+    let elem_arg = if elem_str.chars().any(|c| c.is_whitespace()) {
+        format!("({elem_str})")
+    } else {
+        elem_str
+    };
+    let mono_name = format!("{fn_n}_len_le");
+    // `fun_induction {fn} W` uses `{fn}.induct` (auto-generated for the WF-
+    // recursive def), giving a base case (guard true → the fn reduces to
+    // `W`) and a step case (guard false → the recursive call, with an IH).
+    //
+    // The proof is deliberately COUNT-FREE (no `rename_i`) and
+    // if-REDUCING, because the in-gate ambient env diverges from a naive
+    // standalone elaboration in two load-bearing ways (the bootstrap-45/46
+    // Decidable-resolution divergence, confirmed by reproducing against the
+    // real emitted oleans with the gate's prelude):
+    //   1. the disjunctive guard `len W = 0 ∨ …` elaborates as a `dite`,
+    //      and `fun_induction` leaves `{fn} x` UNFOLDED in the goal as
+    //      `len (if <guard> then x else {fn} (drop_first x)) ≤ len x` —
+    //      which `omega` cannot simplify;
+    //   2. the base case has only TWO introduced hypotheses (var + guard,
+    //      no IH), so a fixed `rename_i x h ih` overflows ("too many
+    //      variable names").
+    // So: `try split` reduces the goal's `if` (a no-op when the ambient env
+    // already reduced it); then per resulting goal, `omega` closes the
+    // trivial `len x ≤ len x`; `apply Nat.le_trans <;> (assumption |
+    // Nat.le_of_lt ∘ drop_first_len_lt)` chains the IH (found by
+    // `assumption`, accessibility-agnostic) with `len (drop_first x) < len x`
+    // (`apply` reads `x` off the goal, `omega` reads `¬ len x = 0` off the
+    // negated guard); `(simp_all <;> omega)` / `simp_all` mop up the
+    // vacuous guard-contradiction branches `split` can introduce. Validated
+    // against the real emitted `m3_blinker` oleans under BOTH the gate
+    // prelude and a plain-`∨` prelude (bootstrap-47).
+    let cmd = Command::Raw(format!(
+        "theorem {mono_name} (W : {seq_t} {elem_arg}) :\n    \
+         {len} {elem_arg} ({fn_n} W) ≤ {len} {elem_arg} W := by\n  \
+         fun_induction {fn_n} W <;> (try split) <;>\n    \
+         first\n      \
+         | omega\n      \
+         | (apply Nat.le_trans <;>\n          \
+         first\n            \
+         | assumption\n            \
+         | (apply Nat.le_of_lt; apply {df}_len_lt <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)))\n      \
+         | (simp_all <;> omega)\n      \
+         | simp_all",
+    ));
+    Some((mono_name, cmd))
+}
+
 /// Ambient thread-local tables every render path needs installed
 /// first. The SINGLE install chokepoint: every render entry point
 /// (`emit_proof_fn`, `emit_exec_fn`, `crate_defs::for_crate`) calls
@@ -1582,6 +1998,13 @@ pub(crate) fn install_emit_tables(krate: &KrateX, crate_name: &str) {
     // names (`Seq.first`, not `impl__3.first`), so the renames must be
     // consultable while building it.
     install_crate_decls(krate);
+    // bootstrap-47: reset the suffix-mono companion bag at every emission
+    // entry. The defs build (crate_defs::build_defs) routes through here
+    // ONCE before its spec-fn loop, which then populates the bag; per-fn
+    // proof/exec emissions also route through here, clearing any names a
+    // prior defs build left so their `decreasing_by` never cites an
+    // out-of-file companion.
+    to_lean_fn::clear_suffix_mono_names();
 }
 
 /// Build the set of relative Lean names this krate's emission can declare —
@@ -2247,6 +2670,24 @@ pub fn set_package_check_enabled(on: bool) {
 }
 pub(crate) fn package_check_enabled() -> bool {
     PACKAGE_CHECK_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+static BRIDGE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Called once from the verifier with `args.tactus_bridge` (W4a,
+/// bootstrap-38). When on, the package gate additionally elaborates the
+/// refWp↔production `decide` bridge over every emitted obligation cert
+/// (INSIDE the gate — the same `example : goals_eq (ref_wp ctx sst) goals
+/// = 1 := by decide` the probe `run.sh` scripts append externally). Opt-in
+/// and verdict-neutral in W4a: PASS/FAIL is collected and reported, never
+/// turned into a verification error (W4c does that). Needs tactus-core's
+/// oleans on the elaboration path — see `run_bridge_step`.
+pub fn set_bridge_enabled(on: bool) {
+    BRIDGE_ENABLED.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+pub(crate) fn bridge_enabled() -> bool {
+    BRIDGE_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Package oleans built by per-fn checks THIS PROCESS (M5c): the
@@ -3053,6 +3494,13 @@ pub struct PackageGateReport {
     pub skipped_sccs: Vec<String>,
     /// (module leaf, lean output) per failed elaboration.
     pub failures: Vec<(String, String)>,
+    /// W4a (bootstrap-38): the in-gate refWp↔production bridge. `None`
+    /// when `--tactus-bridge` is off (no bridge run) or when tactus-core
+    /// oleans could not be located (a loud note instead of a verdict);
+    /// `Some` carries a one-line summary the gate prints verbatim. The
+    /// bridge is INFORMATIONAL in W4a — its outcome never enters
+    /// `failures` and so never becomes a verification error.
+    pub bridge_note: Option<String>,
 }
 
 /// Crate-level package gate (DESIGN-emit-module.md M4): regenerate the
@@ -3141,7 +3589,7 @@ pub fn check_package(
             modules: 1 + stmt_mods.len(), reused,
             pkg_cached: PKG_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
             island_cached: ISLAND_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
-            skipped_sccs, failures,
+            skipped_sccs, failures, bridge_note: None,
         });
     }
     let pkg_dir = lean_out_root().join(sanitize(crate_name)).join("pkg");
@@ -3155,6 +3603,14 @@ pub fn check_package(
     let link_path = format!("{}:{}", base_path, pkg_dir.display());
     let link_mod = link_module_name(&defs);
     run_lean(&pkg_dir, &link_mod, false, &link_path, &mut failures);
+    // W4a (bootstrap-38): the in-gate refWp↔production bridge, opt-in via
+    // `--tactus-bridge`. Verdict-neutral — its outcome is a note, not a
+    // `failures` entry, so it cannot change the gate's error count in W4a.
+    let bridge_note = if bridge_enabled() && failures.is_empty() {
+        Some(run_bridge_step(crate_name, &base_path))
+    } else {
+        None
+    };
     Ok(PackageGateReport {
         modules: 1 + stmt_mods.len() + leafs.len() + 1,
         reused,
@@ -3162,7 +3618,157 @@ pub fn check_package(
         island_cached: ISLAND_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
         skipped_sccs,
         failures,
+        bridge_note,
     })
+}
+
+/// W4a (bootstrap-38): elaborate the refWp↔production `decide` bridge over
+/// every emitted obligation cert, INSIDE the package gate. This is the
+/// external probe `run.sh` logic (probe9/probe11) promoted in-process: for
+/// each `<out>/<crate>/cert/<leaf>.cert.lean` that carries a
+/// `cert_<leaf>_goals` (an obligation cert — all-excluded fns emit no goal
+/// section and are skipped), append the bridge
+///   `example : lib.goals_eq (lib.ref_wp cert_<leaf>_ctx cert_<leaf>_sst)
+///                            cert_<leaf>_goals = 1 := by decide`
+/// and elaborate it against tactus-core's oleans (which carry `ref_wp` /
+/// `goals_eq` + the mirror ctors that `TactusDefs_lib_exec` imports).
+///
+/// Provenance (the crux, settled for W4a): tactus-core's built `out/lib`
+/// is located via `$TACTUS_CORE_OUT` — the same explicit-env-var
+/// convention as `$TACTUS_PRELUDE` / `$TACTUS_CORE_VOCAB`. Auto-discovery
+/// across checkout layouts is deliberately avoided. When the var is unset
+/// (or the dir is missing `TactusDefs_lib_exec.olean`), the bridge SKIPS
+/// with a loud note — opt-in, so no default gate path breaks. The dir's
+/// olean content-hash is recorded in the note as an audit trail and to
+/// stage W4b's cache key.
+///
+/// Returns the one-line summary the gate prints verbatim.
+fn run_bridge_step(crate_name: &str, base_path: &str) -> String {
+    let core_out = match std::env::var("TACTUS_CORE_OUT") {
+        Ok(d) if !d.is_empty() => PathBuf::from(d),
+        _ => {
+            return "bridge skipped: $TACTUS_CORE_OUT unset (opt-in \
+                    --tactus-bridge needs tactus-core's out/lib oleans)"
+                .to_string();
+        }
+    };
+    if !core_out.join("TactusDefs_lib_exec.olean").exists() {
+        return format!(
+            "bridge skipped: {} has no TactusDefs_lib_exec.olean \
+             (build tactus-core, or point $TACTUS_CORE_OUT at its out/lib)",
+            core_out.display(),
+        );
+    }
+    let core_hash = core_olean_hash(&core_out);
+
+    let cert_dir = lean_out_root().join(sanitize(crate_name)).join("cert");
+    let mut certs: Vec<PathBuf> = match std::fs::read_dir(&cert_dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.to_string_lossy().ends_with(".cert.lean"))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    // Deterministic order (read_dir is unordered): stable note + logs.
+    certs.sort();
+
+    // Bridge modules land beside the pkg modules, in their own subdir.
+    let bridge_dir = lean_out_root().join(sanitize(crate_name)).join("bridge");
+    if std::fs::create_dir_all(&bridge_dir).is_err() {
+        return format!("bridge skipped: could not create {}", bridge_dir.display());
+    }
+    // tactus-core oleans FIRST so `TactusDefs_lib_exec` + `lib.*` resolve.
+    let bridge_path = format!("{}:{}", core_out.display(), base_path);
+
+    let mut checked = 0usize;
+    let mut passed = 0usize;
+    let mut failed_names: Vec<String> = Vec::new();
+    for cert in &certs {
+        let leaf = cert
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.trim_end_matches(".cert.lean"))
+            .unwrap_or("");
+        if leaf.is_empty() {
+            continue;
+        }
+        let body = match std::fs::read_to_string(cert) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        // Only obligation certs (a `cert_<leaf>_goals` def) are bridgeable;
+        // an all-excluded fn emits ctx+sst but no goal section, and the
+        // `= 1` bridge would reference an undefined name (a false FAIL).
+        if !body.contains(&format!("def cert_{}_goals", leaf)) {
+            continue;
+        }
+        checked += 1;
+        let module = format!("Bridge_{}", leaf);
+        let mut text = body;
+        text.push_str(&format!(
+            "\n-- ── W4a in-gate bridge (bootstrap-38) ──\n\
+             set_option maxRecDepth 8000\n\
+             example : {ns}.goals_eq ({ns}.ref_wp cert_{leaf}_ctx cert_{leaf}_sst) \
+             cert_{leaf}_goals = 1 := by decide\n",
+            ns = crate::sst_serialize::cert_ns(),
+            leaf = leaf,
+        ));
+        if std::fs::write(bridge_dir.join(format!("{}.lean", module)), &text).is_err() {
+            failed_names.push(leaf.to_string());
+            continue;
+        }
+        let mut local_failures: Vec<(String, String)> = Vec::new();
+        run_lean(&bridge_dir, &module, false, &bridge_path, &mut local_failures);
+        if local_failures.is_empty() {
+            passed += 1;
+        } else {
+            failed_names.push(leaf.to_string());
+        }
+    }
+
+    let failed = checked - passed;
+    let mut note = format!(
+        "{} obligations bridge-checked against tactus-core ({} passed, {} failed) \
+         [core-olean {}]",
+        checked, passed, failed, core_hash,
+    );
+    if !failed_names.is_empty() {
+        note.push_str(&format!("; failed: {}", failed_names.join(", ")));
+    }
+    note
+}
+
+/// FNV-1a over the sorted `.olean` files in `dir` (name + bytes). A
+/// dependency-free content hash of the tactus-core build the bridge ran
+/// against — audit trail for W4a, and the seed of W4b's bridge cache key
+/// (a core-logic change to `ref_wp`/`goals_eq` flips this digest, so a
+/// future cache cannot silently reuse a stale PASS). Placeholder for the
+/// SHA-256 §6 vendoring will bring, matching `vocab_hash`'s FNV-1a style.
+fn core_olean_hash(dir: &Path) -> String {
+    let mut oleans: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "olean").unwrap_or(false))
+            .collect(),
+        Err(_) => return "unreadable".to_string(),
+    };
+    oleans.sort();
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    for p in &oleans {
+        if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+            mix(name.as_bytes());
+        }
+        if let Ok(bytes) = std::fs::read(p) {
+            mix(&bytes);
+        }
+    }
+    format!("fnv1a:{:016x}", h)
 }
 
 /// Prepend `lean_path` to any inherited `LEAN_PATH` — one definition
@@ -3734,8 +4340,16 @@ fn emit_package_exec_fn(
         .ok_or("root exec fn absent from inlined krate")?;
     let krate = &inlined_krate;
     let broadcast_lemmas = sst_to_lean::collect_broadcast_lemma_funs(krate, check, crate_name);
-    let theorems = sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check, &broadcast_lemmas)
-        .map_err(|reason| format!("tactus_auto rejected this fn: {}", reason))?;
+    let sst_to_lean::ExecFnObligations { theorems, goal_shapes } =
+        sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check, &broadcast_lemmas)
+            .map_err(|reason| format!("tactus_auto rejected this fn: {}", reason))?;
+    // Bootstrap N3 snapshot: serialize the fn's SST literal (inputs) plus
+    // the production GoalList (N3b, from the just-built obligation spines).
+    // `check` is `&`-borrowed by `exec_fn_theorems_to_ast`, so capturing
+    // here — right after the call — reads the SAME snapshot (the single
+    // source of obligation shape). No-op unless `--tactus-emit-cert`;
+    // never perturbs verification.
+    crate::sst_serialize::emit_cert(krate, fn_sst, check, crate_name, &theorems, &goal_shapes);
 
     let stmts = stmt_partition_for(krate, crate_name, tactic_bodies, defs)
         .ok_or("Stmts partition unavailable")?;
@@ -4027,8 +4641,8 @@ pub fn emit_exec_fn(
     // spec-fn deps).
     let broadcast_lemmas = sst_to_lean::collect_broadcast_lemma_funs(krate, check, crate_name);
 
-    let theorems = match sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check, &broadcast_lemmas) {
-        Ok(r) => r,
+    let (theorems, goal_shapes) = match sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check, &broadcast_lemmas) {
+        Ok(r) => (r.theorems, r.goal_shapes),
         Err(reason) => return Err(CheckResult::Failed {
             errors: vec![TactusDiag {
                 message: format!(
@@ -4043,6 +4657,12 @@ pub fn emit_exec_fn(
             warnings,
         }),
     };
+
+    // Bootstrap N3 snapshot: serialize the fn's SST literal (inputs) plus
+    // the production GoalList (N3b), from the SAME `&`-borrowed `check`
+    // the call above read. No-op unless `--tactus-emit-cert`; never
+    // perturbs verification.
+    crate::sst_serialize::emit_cert(krate, fn_sst, check, crate_name, &theorems, &goal_shapes);
 
     // Exec fns lower matches to if-chains over `IsVariant` and
     // `Field`, which the SST renderer routes to the synthesised

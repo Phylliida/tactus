@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# W6a probe runner (board bootstrap-20). Pure Lean core — no prelude, no
+# tactus-core oleans, no Mathlib. Elaborates the standalone probe; the file's
+# own `theorem`s ARE the bridge (correct shapes close by decide+rfl; mutated
+# shapes are provably unequal). rc=0 ⇒ every bridge behaved as classified.
+#
+# Also runs the non-vacuity meta-check: asserting ¬(a=a) on a CORRECT shape must
+# FAIL (nonzero) — proving the `_kill` theorems test genuine inequality, not that
+# `decide` rubber-stamps every negation.
+#
+# Usage: probe-w0/probe12_w6a_castleaf/run.sh   (LEAN=<lean> to override)
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LEAN_BIN="${LEAN:-$(command -v lean)}"
+SRC="$HERE/probe12_w6a_castleaf.lean"
+
+echo "== W6a cast-leaf probe =="
+echo "lean : $LEAN_BIN"
+echo "src  : $SRC"
+echo
+
+t0=$(date +%s%N); "$LEAN_BIN" "$SRC"; rc=$?; t1=$(date +%s%N)
+echo "--- probe rc=$rc  wall=$(( (t1 - t0) / 1000000 ))ms ---"
+
+# non-vacuity meta-check (expected to FAIL)
+META="$(mktemp --suffix=.lean)"; trap 'rm -f "$META"' EXIT
+cat "$SRC" > "$META"
+cat >> "$META" <<'EOF'
+theorem META_should_fail : ¬ (render_exp raw_sum_to = prod_sum_to_ok) := by decide
+EOF
+"$LEAN_BIN" "$META" >/dev/null 2>&1; mrc=$?
+if [ "$mrc" -ne 0 ]; then echo "meta-check OK: decide refuses the false ¬ (rc=$mrc)"; else echo "META-CHECK REGRESSION: decide accepted ¬(a=a)"; rc=1; fi
+
+echo
+if [ "$rc" -eq 0 ]; then echo "W6A PROBE OK ✓ (all bridges behave; kills non-vacuous)"; else echo "W6A PROBE FAILED ✗"; fi
+exit "$rc"

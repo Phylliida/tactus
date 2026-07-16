@@ -125,7 +125,7 @@ use vir::ast_visitor::map_expr_visitor;
 use vir::messages::Span;
 use crate::lean_ast::{
     and_all, substitute, AssertKind, Binder as LBinder, BinderKind, Expr as LExpr,
-    ExprNode, HypothesisKind, ObligationKind,
+    ExprNode, GoalShape, GoalSpine, HypothesisKind, ObligationKind,
     PreambleFragment, Tactic, Theorem,
 };
 use crate::expr_shared::{is_mut_ref_typ, varat_pre_name};
@@ -681,7 +681,7 @@ fn contains_loc(e: &Exp) -> bool {
 /// "what's beneath the wrappers?" (`peel_value_position`) or
 /// "is there a Loc anywhere here?" (`contains_loc`), and the
 /// difference between them is centralized.
-fn peel_value_position(e: &Exp) -> &Exp {
+pub(crate) fn peel_value_position(e: &Exp) -> &Exp {
     let p = peel_transparent(e);
     match &p.x {
         ExpX::Loc(inner) => peel_transparent(inner),
@@ -777,6 +777,18 @@ fn check_exp(e: &Exp) -> Result<(), String> {
 /// precondition is enforced by construction — there's no way to
 /// produce a `Wp` tree without having already cleared the shape
 /// checks.
+///
+/// The obligation theorems and their N3b [`GoalShape`]s come out together
+/// in [`ExecFnObligations`]. The shapes are index-aligned with the
+/// theorems (pushed in lockstep at the single emit site) and consumed by
+/// the cert serializer; callers that don't emit certs simply ignore them.
+pub struct ExecFnObligations {
+    pub theorems: Vec<Theorem>,
+    /// Per-theorem goal spine (N3b), index-aligned with `theorems`.
+    /// `None` = documented stage-A exclusion (bit_vector/query).
+    pub goal_shapes: Vec<Option<GoalShape>>,
+}
+
 pub fn exec_fn_theorems_to_ast<'a>(
     krate: &'a KrateX,
     fn_sst: &'a FunctionSst,
@@ -788,7 +800,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // `have _tactus_bc_<i> := <axiom>` tactic prefix so the closer can use
     // it. Empty for fns without `broadcast use` (the common case).
     broadcast_lemmas: &[&'a Fun],
-) -> Result<Vec<Theorem>, String> {
+) -> Result<ExecFnObligations, String> {
     // `&mut` params of the fn being verified (#94 callee-side body).
     // For each, the body and ensures get a SST-level rewrite so that
     // `*old(x)` (`VarAt(x, Pre)`) renders as `Var(<x>_at_pre_tactus)`,
@@ -984,6 +996,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
         base_binders: binders,
         counter: 0,
         out: Vec::new(),
+        goal_shapes: Vec::new(),
         tactic_prefix,
         default_closer,
         heartbeats: fn_sst.x.attrs.tactus_heartbeats,
@@ -1058,7 +1071,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
         }
     }
     walk_obligations(&body_wp, &ctx, &initial_obl_ctx, &mut emitter);
-    Ok(emitter.out)
+    Ok(ExecFnObligations { theorems: emitter.out, goal_shapes: emitter.goal_shapes })
 }
 
 /// Walk a VIR-AST `Expr` body and collect spans of every
@@ -1202,7 +1215,7 @@ fn closure_decl_wp<'a>(
 /// types (`Expr` vs `Exp`), and the AST-side filter only needs to
 /// catch HasResolved (closure-spec stuff doesn't reach the AST as
 /// AssertAssume — it's pure SST).
-fn is_synthetic_assume_to_drop(e: &Exp) -> bool {
+pub(crate) fn is_synthetic_assume_to_drop(e: &Exp) -> bool {
     match &e.x {
         ExpX::UnaryOpr(UnaryOpr::HasResolved(_), _) => true,
         ExpX::Binary(BinaryOp::Implies, _lhs, rhs) => is_synthetic_assume_to_drop(rhs),
@@ -1576,6 +1589,13 @@ struct ObligationEmitter {
     base_binders: Vec<LBinder>,
     counter: usize,
     out: Vec<Theorem>,
+    /// N3b goal-provenance: the structured spine of each emitted
+    /// obligation, pushed in LOCKSTEP with `out` (one per emit), so it is
+    /// index-aligned with `out` by construction. `None` marks a stage-A
+    /// exclusion (bit_vector/query — the `wrap_no_hyps` emit path). Read
+    /// by the cert serializer (`sst_serialize::goal_serialize`) to print
+    /// the production `GoalList`; inert when `--tactus-emit-cert` is off.
+    goal_shapes: Vec<Option<GoalShape>>,
     tactic_prefix: Vec<String>,
     /// The default closer for emitted theorems. Normally
     /// `Tactic::Named("tactus_auto")`; overridden via the
@@ -1611,6 +1631,7 @@ impl ObligationEmitter {
         &mut self, name: String, leaf: LExpr, closer: Tactic, obl: &OblCtx,
     ) {
         let (extras, remaining) = obl.split_leading_binders();
+        let shape = self.build_goal_shape(&extras, &remaining, &leaf);
         let goal = remaining.wrap(leaf);
         // For user-tactic emission (assert-by), inject explicit
         // `intro <names>;` for any frames that COULDN'T extract to
@@ -1671,6 +1692,7 @@ impl ObligationEmitter {
         };
         self.emit_with_extras(
             name, goal, final_closer, obl.closer_preamble.clone(), extras,
+            Some(shape),
         );
     }
 
@@ -1686,10 +1708,44 @@ impl ObligationEmitter {
     /// `obl.new_scope(...)`). See `BUG-loop-local-names-alpha-renamed.md`.
     fn emit_split(&mut self, name: String, leaf: LExpr, obl: &OblCtx) {
         let (extras, remaining) = obl.split_leading_binders();
+        let shape = self.build_goal_shape(&extras, &remaining, &leaf);
         let goal = remaining.wrap(leaf);
         self.emit_with_extras(
             name, goal, obl.closer.clone(), obl.closer_preamble.clone(), extras,
+            Some(shape),
         );
+    }
+
+    /// N3b: build the structured goal spine for an obligation, describing
+    /// the SAME statement `emit_with_extras` will emit — namely
+    /// `∀ base_binders extra_binders, wrap(remaining)(leaf)`. Kept in
+    /// lockstep with the flat `goal` (faithfulness invariant on
+    /// [`GoalShape`]: folding the spine back reproduces `Theorem.goal`).
+    ///
+    /// Spine order is OUTERMOST-first: the theorem's `∀` binders (base,
+    /// then the leading binders `split_leading_binders` extracted), then
+    /// `remaining`'s frames in PUSH order — `OblCtx::wrap` folds
+    /// `frames.iter().rev()`, so the first-pushed frame ends outermost,
+    /// which is exactly forward iteration here — then [`GoalShape::leaf`]
+    /// at the core.
+    fn build_goal_shape(
+        &self,
+        extras: &[LBinder],
+        remaining: &OblCtx,
+        leaf: &LExpr,
+    ) -> GoalShape {
+        let mut spine: Vec<GoalSpine> = Vec::new();
+        for b in self.base_binders.iter().chain(extras.iter()) {
+            spine.push(GoalSpine::All(b.clone()));
+        }
+        for frame in remaining.frames.iter() {
+            spine.push(match frame {
+                CtxFrame::Let(name, v) => GoalSpine::Let(name.clone(), v.clone()),
+                CtxFrame::Hyp(p) => GoalSpine::Imp(p.clone()),
+                CtxFrame::Binder(b) => GoalSpine::All(b.clone()),
+            });
+        }
+        GoalShape { spine, leaf: leaf.clone() }
     }
 
     /// Emit a theorem with explicit closer + preamble + extra binders.
@@ -1706,6 +1762,11 @@ impl ObligationEmitter {
         closer: Tactic,
         requires_preamble: Vec<PreambleFragment>,
         extra_binders: Vec<LBinder>,
+        // N3b goal-provenance spine for this obligation (see
+        // `build_goal_shape`). `None` for the `wrap_no_hyps` bit_vector
+        // path (a documented stage-A exclusion). Pushed in lockstep with
+        // the theorem below so `goal_shapes` stays index-aligned.
+        goal_shape: Option<GoalShape>,
     ) {
         let mut binders = self.base_binders.clone();
         binders.extend(extra_binders);
@@ -1727,6 +1788,8 @@ impl ObligationEmitter {
             _ => closer,
         };
         let tactic = self.compose_tactic(closer);
+        // Lockstep with `out.push` below: one shape per emitted theorem.
+        self.goal_shapes.push(goal_shape);
         self.out.push(Theorem {
             name,
             binders,
@@ -1791,7 +1854,10 @@ impl ObligationEmitter {
         closer: Tactic,
         requires_preamble: Vec<PreambleFragment>,
     ) {
-        self.emit_with_extras(name, goal, closer, requires_preamble, Vec::new());
+        // `None` goal-shape: this path is the `wrap_no_hyps` bit_vector
+        // emit (a documented stage-A exclusion), whose flattened `goal`
+        // has no structured spine the serializer captures.
+        self.emit_with_extras(name, goal, closer, requires_preamble, Vec::new(), None);
     }
 }
 
@@ -3867,6 +3933,268 @@ fn push_ret_frames(
     (dest_value, use_dest_name)
 }
 
+// ── Cert serializer support (bootstrap-02b) ─────────────────────────
+//
+// The certificate serializer (`sst_serialize::stm`'s `StmX::Call` arm)
+// needs the SAME instantiated call leaves production emits — the
+// precondition obligation and the post-call frame's rendered hyps /
+// let-value — so its `StmData::Call { reqs, post }` literal byte-matches
+// the goal side across the W2 `decide` bridge (DESIGN-W2-refwp.md §2.6).
+//
+// This helper renders exactly those leaves through production's renderer
+// (leaf TEXT is NOT stage-A-certified, DESIGN §2.5, so it MUST reuse the
+// production path to match), and returns them as a plain data DTO. The
+// serializer then INDEPENDENTLY assembles the `FrameList` STRUCTURE from
+// these ingredients — so the frame shape (the thing the bridge actually
+// validates) is the serializer's own code, not a copy of
+// `push_post_call_frames`. That split is the Option-1 non-circularity
+// (local-model-reviewed 2026-07-13): shared leaves (tautological but
+// uncertified) + independent structure (certified).
+//
+// Restricted subset: Static callee, same-crate (in `fn_map`), no `&mut`
+// params, no generics, dest present. Everything else fails loud with a
+// sharp census tag — the TCB addition stays small and auditable.
+
+/// The instantiated leaves of one call site's contract, rendered by
+/// production for the cert serializer to wrap in a `FrameList`.
+pub(crate) struct CertCallLeaves {
+    /// The single `CallPrecondition`-annotated requires obligation
+    /// (production `and_all`s the callee's requires into ONE leaf), or
+    /// `None` when the callee has no `requires`.
+    pub precondition: Option<LExpr>,
+    /// The call's dest binder name (`let <dest> := …`).
+    pub dest_name: crate::lean_name::LeanName,
+    /// The post-call frame ingredients, path-tagged. The serializer
+    /// chooses the `FrameList` shape from the tag.
+    pub post: CertCallPost,
+}
+
+/// Post-call frame ingredients, split by which `push_ret_frames` path
+/// production takes. The serializer reads the tag and assembles the
+/// corresponding `FrameList` — this enum is INGREDIENTS, not a built
+/// frame, so the ordering decision stays in the (independent) serializer.
+pub(crate) enum CertCallPost {
+    /// #128 ret-eq (`ensures r == E`). Serializer builds the frame
+    /// `[FHyp(e_bound)] [FHyp(rest)] FLet(dest, dest_value)`.
+    RetEq {
+        /// `type_bound_predicate` on RAW E (numeric rets only; `None`
+        /// for Bool/struct/generic rets).
+        e_bound: Option<LExpr>,
+        /// The remaining ensures conjuncts (eq dropped, `ret := E`
+        /// substituted), or `None` when nothing non-trivial remains.
+        rest: Option<LExpr>,
+        /// The bridged E — the value bound to `dest`.
+        dest_value: LExpr,
+    },
+    /// ∀-path (no ret-eq). Serializer builds `FBind(binder, ret_typ)
+    /// [FHyp(ret_bound)] [FHyp(ens)] [FLet(dest, dest_value)]` (the
+    /// alias `FLet` is dropped when `use_dest_name`, Approach A).
+    Forall {
+        ret_typ: LExpr,
+        ret_bound: Option<LExpr>,
+        ens: Option<LExpr>,
+        binder_name: crate::lean_name::LeanName,
+        dest_value: LExpr,
+        use_dest_name: bool,
+    },
+}
+
+/// Render the instantiated call leaves for `sst_serialize`'s cert
+/// `StmX::Call` arm. See the section comment above. `Err(tag)` is the
+/// serializer's fail-loud signal (a sharp census tag naming the
+/// unsupported call shape). Mirrors the SIMPLE subset of `walk_call` +
+/// `resolve_callee` + `build_call_substitutions` + `push_post_call_frames`
+/// — reusing their leaf renderers, gating out every shape whose frame
+/// contribution this restricted arm doesn't model.
+pub(crate) fn cert_call_leaves<'a>(
+    fun: &'a Fun,
+    resolved_method: &'a Option<(Fun, vir::ast::Typs)>,
+    is_trait_default: &Option<bool>,
+    typ_args: &'a vir::ast::Typs,
+    args: &'a vir::sst::Exps,
+    dest: Option<&Dest>,
+    call_span: &Span,
+    fn_map: &'a crate::expr_shared::RenderFnMap<'a>,
+    caller_param_typs: &HashMap<VarIdent, Typ>,
+) -> Result<CertCallLeaves, String> {
+    // ── Phase A: restricted-subset resolution (mirrors resolve_callee's
+    // Static arm; everything else is a sharp fail-loud tag). ──
+    if matches!(is_trait_default, Some(true)) {
+        return Err("call-trait-default".to_string());
+    }
+    let callee_fun = match resolved_method {
+        Some(_) => return Err("call-dynamic-resolved".to_string()),
+        None => fun,
+    };
+    let Some(callee) = fn_map.get(callee_fun).copied() else {
+        return Err("call-crosscrate".to_string());
+    };
+    if matches!(callee.kind, FunctionKind::TraitMethodImpl { .. }) {
+        return Err("call-trait".to_string());
+    }
+    // Same-fn spec source (non-trait): specs live on the callee itself.
+    let spec_callee = callee;
+    // No generics — keeps `typ_subst` empty (the restricted subset does
+    // not model type-arg-instantiated leaves).
+    if !callee.typ_params.is_empty() {
+        return Err("call-generic".to_string());
+    }
+    // No `&mut` params — the mut-arg existential / rebind / prophecy
+    // machinery is out of the restricted subset.
+    if callee.params.iter()
+        .any(|p| crate::expr_shared::is_mut_ref_typ(&p.x.typ, p.x.is_mut))
+    {
+        return Err("call-mut".to_string());
+    }
+    // Unit-returning calls carry no dest; the restricted arm requires a
+    // dest (the FLet target). A synthetic-unit-binder shape is a future
+    // extension (card note).
+    let Some(dest_ident) = dest.and_then(|d| extract_simple_var_ident(&d.dest)) else {
+        return Err("call-unit-dest".to_string());
+    };
+
+    // ── Phase B: drop-dummy + arg validation (mirrors build_wp_call). ──
+    let args: &'a [Exp] =
+        if vir::ast_simplify::injects_zero_arg_dummy(callee, false) && args.len() == 1 {
+            &args[..0]
+        } else {
+            &args[..]
+        };
+    let validated_args: Vec<crate::to_lean_sst_expr::Validated<'a>> = args.iter()
+        .map(crate::to_lean_sst_expr::Validated::check)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|reason| format!("leaf-render: {}", reason))?;
+
+    // ── Phase C: substitution maps + render ctxs (reuse production). ──
+    // Shell obl/emitter: in the restricted subset (no let-binder ledger,
+    // no prophecies) neither affects the rendered leaf text — the ret-eq
+    // path substitutes `fresh_ret_name` OUT, and the emitter's id counter
+    // only names theorems (not leaves). Constructed here (in-module).
+    let obl = OblCtx::new(Tactic::Named("tactus_auto".to_string()));
+    let mut emitter = ObligationEmitter {
+        fn_name: String::new(),
+        base_binders: Vec::new(),
+        counter: 0,
+        out: Vec::new(),
+        goal_shapes: Vec::new(),
+        tactic_prefix: Vec::new(),
+        default_closer: Tactic::Named("tactus_auto".to_string()),
+        heartbeats: None,
+    };
+    let arg_rctx = crate::expr_shared::RenderCtx::with_fn_map(fn_map)
+        .with_binder_typs(caller_param_typs);
+    let subst = build_call_substitutions(
+        callee, spec_callee, &typ_args[..], &validated_args, &[],
+        caller_param_typs, &arg_rctx, &obl, &mut emitter,
+    );
+    let inlined = crate::call_inlining::collect_inlined_at_call(callee, spec_callee);
+    let render_ctx_req = crate::expr_shared::RenderCtx::with_fn_map_and_value_subst_pair(
+        fn_map, &subst.req_value_subst, &subst.req_value_subst,
+    );
+    let render_ctx_ens = crate::expr_shared::RenderCtx::with_fn_map_and_value_subst_pair(
+        fn_map, &subst.ens_value_subst, &subst.ens_value_subst_pre,
+    );
+
+    // ── Phase D: precondition leaf (mirror emit_call_precondition_theorem,
+    // WITHOUT emitting a theorem — the leaf IS the whole obligation). ──
+    let precondition = if inlined.requires.is_empty() {
+        None
+    } else {
+        let loc = format_rust_loc(call_span);
+        let requires_conj = and_all(
+            inlined.requires.iter()
+                .map(|expr| {
+                    let rewritten = rewrite_varat_for_mut_params(expr, &subst.mut_param_names);
+                    vir_expr_to_ast_for_inlining_with_ctx(&rewritten, &render_ctx_req)
+                })
+                .collect(),
+        );
+        Some(LExpr::span_mark(
+            loc.clone(),
+            Some(call_span.clone()),
+            AssertKind::Obligation(ObligationKind::CallPrecondition),
+            substitute(&requires_conj, &subst.typ_subst),
+        ))
+    };
+
+    // ── Phase E: post-call frame ingredients (mirror push_post_call_frames
+    // / push_ret_frames, no mut/prophecy). Structure assembly is the
+    // serializer's job; here we only render the leaves + tag the path. ──
+    let ret = &callee.ret.x;
+    let ret_eq = vir_find_ret_eq(&inlined.ensures, &subst);
+    let substituted_ensures = render_call_ensures(
+        &inlined.ensures, &subst, None, callee, &render_ctx_ens,
+        ret_eq.as_ref().map(|q| (q.clause_idx, q.conjunct_idx)),
+    );
+
+    let post = match ret_eq {
+        Some(q) => {
+            let e_raw = render_call_ensure_expr(q.rhs, &subst, None, callee, &render_ctx_ens);
+            // Bridge E to the dest's declared render sort (numeric rets:
+            // Int.toNat; datatype rets: wrapper .mk). `&mut` rets are
+            // excluded by the restricted subset, so the bridge always
+            // applies (identity when sort + wrappers already match).
+            let dest_value = crate::expr_shared::coerce_lexpr(
+                e_raw.clone(), &q.rhs.typ, &ret.typ,
+            );
+            // Bound goes on RAW E (`0 ≤ E ∧ E < hi` over E's own sort).
+            let e_bound = crate::to_lean_sst_expr::type_bound_predicate(&e_raw, &ret.typ);
+            // REST: eq conjunct already dropped by render_call_ensures'
+            // skip; substitute fresh_ret → bridged E, keep only if
+            // non-trivial (matches push_ret_frames).
+            let rest = substituted_ensures.and_then(|rest_ens| {
+                if is_trivial_true(&rest_ens) {
+                    return None;
+                }
+                let mut m: HashMap<crate::lean_name::LeanName, LExpr> = HashMap::new();
+                m.insert(subst.fresh_ret_name.clone(), dest_value.clone());
+                let rs = substitute(&rest_ens, &m);
+                if is_trivial_true(&rs) { None } else { Some(rs) }
+            });
+            CertCallPost::RetEq { e_bound, rest, dest_value }
+        }
+        None => {
+            let ret_typ = substitute(&typ_to_expr(&ret.typ), &subst.typ_subst);
+            let dest_lean = crate::lean_name::LeanName::from_var_ident(dest_ident);
+            // Approach A: name the ∀-bound result with the dest's own name
+            // (skip the alias FLet) unless the dest is free in the ensures.
+            let use_dest_name = substituted_ensures.as_ref()
+                .is_none_or(|ens| !crate::lean_ast::mentions_free_var(ens, dest_lean.as_str()));
+            let binder_name = if use_dest_name {
+                dest_lean.clone()
+            } else {
+                subst.fresh_ret_name.clone()
+            };
+            let ret_bound = crate::to_lean_sst_expr::type_bound_predicate(
+                &LExpr::var(binder_name.clone()), &ret.typ,
+            );
+            let ens = substituted_ensures.map(|conj| {
+                if use_dest_name {
+                    let mut m: HashMap<crate::lean_name::LeanName, LExpr> = HashMap::new();
+                    m.insert(subst.fresh_ret_name.clone(), LExpr::var(binder_name.clone()));
+                    substitute(&conj, &m)
+                } else {
+                    conj
+                }
+            });
+            CertCallPost::Forall {
+                ret_typ,
+                ret_bound,
+                ens,
+                binder_name: binder_name.clone(),
+                dest_value: LExpr::var(binder_name),
+                use_dest_name,
+            }
+        }
+    };
+
+    Ok(CertCallLeaves {
+        precondition,
+        dest_name: crate::lean_name::LeanName::from_var_ident(dest_ident),
+        post,
+    })
+}
+
 /// Phase 4: caller-side rebindings for &mut args. Placed AFTER
 /// ensures so the ensures Hyp references the fresh existential,
 /// not the rebound caller name.
@@ -4779,7 +5107,7 @@ fn unfold_multi_binder_let(
 /// Returns `None` for non-Let binders or for multi-binder Lets
 /// (multi-binder lets are deferred — see DESIGN.md "Lossy accepted
 /// forms").
-fn match_single_let_bind<'a>(
+pub(crate) fn match_single_let_bind<'a>(
     bnd: &'a vir::sst::Bnd,
     body: &'a Exp,
 ) -> Option<(crate::lean_name::LeanName, &'a Exp, &'a Exp)> {
@@ -6123,7 +6451,7 @@ fn lex_decrease_obligation(levels: &[DecreaseLevel<'_>]) -> LExpr {
 /// `out`. Nested loops inherit the current `locally_declared` set, so
 /// a variable `x` declared in an outer loop body and modified by an
 /// inner loop still counts as modified by the outer.
-fn collect_modifications<'a>(
+pub(crate) fn collect_modifications<'a>(
     stm: &'a Stm,
     locally_declared: &mut HashSet<&'a VarIdent>,
     out: &mut Vec<&'a VarIdent>,

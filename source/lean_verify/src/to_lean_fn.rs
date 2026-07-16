@@ -63,16 +63,57 @@ pub(crate) const TACTIC_BODY_FALLBACK: &str = "sorry";
 /// - `apply Nat.div_lt_self <;> omega` — the **division** obligation
 ///   `a / b < a` (base-conversion loops); side goals `0 < a`, `1 < b`
 ///   close from the branch guards.
+/// - `apply Nat.div_lt_self <;> (simp_all <;> omega)` — SAME division
+///   obligation, but for a fn whose branch guard reaches the termination
+///   context wrapped in an `ite`/`dite` over `Prop` (a Prop-valued
+///   recursive spec fn like `numbers_word`: `if alpha = 0 then True else
+///   if m ≤ 1 then False else … ∧ recurse (alpha/m)` hands the goal a
+///   single combined hyp `h✝ : ¬if x : alpha = 0 then True else m ≤ 1`).
+///   `omega` alone can't read `0 < alpha` / `1 < m` out of that Prop-ite;
+///   `simp_all` first decomposes the negated ite into plain arithmetic,
+///   then `omega` closes. Added as its OWN rung after the plain-`omega`
+///   div rung so the cheap clean-hypothesis path is unchanged and the
+///   other measures are untouched (bootstrap-44). Verified against the
+///   real emitted `word_numbering` defs part.
+/// - `apply Seq.subrange_tail_len_lt <;> …` — **drop-k seq measures**
+///   `len (subrange u j (len u)) < len u` for any `j ≥ 1` (bootstrap-46).
+///   A raw `subrange u k (len u)` recursion (k ≠ 1, so NOT routed through
+///   `drop_first`) — e.g. `m3_blinker.ffnf` recursing on
+///   `subrange u 2 (len u)` — has no `drop_{first,last}` head to unify, so
+///   it dispatches to this GENERAL companion (emitted once beside the
+///   drop_first companion, see `seq_subrange_tail_companion_cmd` in
+///   `generate.rs`). `apply` unifies `j` from the literal subrange start and
+///   leaves side goals `1 ≤ j` (omega) and `j ≤ len u` (from the nested
+///   dite guard `len u ≥ k`, closed by the same
+///   `assumption`/`omega`/`(simp_all <;> omega)`/`simp_all` ladder as the
+///   drop_first rung). Placed BEFORE the drop_first rung; heads are disjoint
+///   (`subrange` vs `Seq.drop_first`) so ordering is immaterial to
+///   correctness.
 /// - `apply Seq.drop_{first,last}_len_lt <;> …` — vstd **seq measures**
 ///   `len (drop_first w) < len w`: dispatches to the measure-companion
 ///   theorem emitted next to the corresponding def (see
 ///   `seq_measure_companion_cmd` in `generate.rs`; B3 in
 ///   DESIGN-lean-all-proofs-bugs.md). The side goal `¬ len w = 0` closes
-///   from the branch guard via `assumption`/`omega`/`simp_all` — `omega`
-///   for arithmetic guards (`3 ≤ len w` under F2c's wf_preprocess
-///   threading, which assumption/simp_all can't bridge). In a crate that
-///   never emits the def/companion the `apply` head is unknown and the
-///   branch just fails over.
+///   from the branch guard via `assumption`/`omega`/`(simp_all <;> omega)`/
+///   `simp_all` — `omega` for arithmetic guards (`3 ≤ len w` under F2c's
+///   wf_preprocess threading, which assumption/simp_all can't bridge). The
+///   `(simp_all <;> omega)` rung (bootstrap-45) handles the case where the
+///   THEN-branch guard reaches the termination context as a Bool-wrapped
+///   `decide (len w > 0 ∧ …) = true` hypothesis (a conjunction-guarded
+///   recursive spec fn like `m1_guard.lead`, whose guard elaborates to a
+///   `decide … = true` under the in-gate ambient env's Decidable-instance
+///   resolution): `omega` cannot read `0 < len w` out of an opaque
+///   `decide … = true`, and the bare `simp_all` fallback DECODES the decide
+///   into a plain conjunction but then STOPS (it made progress yet did not
+///   close the arithmetic goal `¬ len w = 0` — and being the last `first`
+///   alternative, `first` accepts that partial success and leaves the goal
+///   unsolved). `(simp_all <;> omega)` decodes+normalizes with `simp_all`,
+///   THEN closes with `omega` — the same shape as the div-rung Prop-`ite`
+///   fix (bootstrap-44), now applied to the seq-companion rungs. Placed
+///   BEFORE the bare `simp_all` so the cheap `assumption`/`omega` clean
+///   path is unchanged and only genuine decide-wrapped guards fall through.
+///   In a crate that never emits the def/companion the `apply` head is
+///   unknown and the branch just fails over.
 /// - `(repeat split) <;> omega` — **Int-typed measures** (F2b,
 ///   DESIGN-lean-all-proofs-followons.md): with `wrap_int_measure`'s
 ///   `Int.toNat` embedding, an Int-abs measure (`if 0 ≤ t then t else
@@ -96,13 +137,81 @@ pub(crate) const TACTIC_BODY_FALLBACK: &str = "sorry";
 /// companion), so the rung cites the absolute name like every other
 /// emitted reference. `crate_ns() == None` (ns-less unit-test renders)
 /// keeps the bare form.
+thread_local! {
+    /// Names of length-monotonicity companions (`{fn}_len_le`,
+    /// bootstrap-47) emitted so far in the current defs build.
+    /// `decreasing_by_tactic` splices a `Nat.lt_of_le_of_lt` chaining rung
+    /// citing these so a NESTED suffix measure like
+    /// `len (drop_base_run (drop_first W)) < len W` (m3_blinker.split_q)
+    /// closes: the `≤` subgoal unifies one of these monos, the `<` subgoal
+    /// unifies the `drop_first` companion. Populated by the defs loop as
+    /// each suffix-recursive spec fn's companion lands (dep-order emits a
+    /// consumer AFTER the companions it needs). Cleared per emission entry
+    /// (`generate::install_emit_tables`), so per-fn proof/exec files never
+    /// inherit a prior build's names. Read here as a GROWING BAG —
+    /// `first | apply m1 | apply m2 | …` offloads the "which mono?" choice
+    /// to Lean unification (only the mono whose `≤`-head matches fires;
+    /// names not imported in a given file fail over harmlessly inside
+    /// `first`, exactly like the existing seq-companion rungs).
+    static SUFFIX_MONO_NAMES: std::cell::RefCell<Vec<String>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+/// Reset the suffix-mono companion bag (bootstrap-47). Called from
+/// `generate::install_emit_tables`, the single choke point every emission
+/// entry routes through — so each defs build starts empty and per-fn
+/// proof/exec files never cite a prior build's companion names.
+pub(crate) fn clear_suffix_mono_names() {
+    SUFFIX_MONO_NAMES.with(|s| s.borrow_mut().clear());
+}
+
+/// Register a length-monotonicity companion name so later fns'
+/// `decreasing_by` can cite it in the chaining rung (bootstrap-47). Deduped
+/// (idempotent); order is the dep-order emission order, which is
+/// deterministic, keeping the emitted `decreasing_by` strings stable
+/// across runs (cache-friendly).
+pub(crate) fn register_suffix_mono_name(name: String) {
+    SUFFIX_MONO_NAMES.with(|s| {
+        let mut v = s.borrow_mut();
+        if !v.contains(&name) {
+            v.push(name);
+        }
+    });
+}
+
 fn decreasing_by_tactic() -> String {
     let q = |n: &str| match crate::to_lean_type::crate_ns() {
         Some(ns) => format!("{}.{}", ns, n),
         None => n.to_string(),
     };
+    // bootstrap-47: chaining rung for NESTED suffix measures
+    // (`len (g (drop_first W)) < len W`, g length-non-increasing). Spliced
+    // ONLY when ≥1 mono companion is in scope, so files without any keep
+    // their exact prior `decreasing_by` string (no cache churn).
+    // `apply Nat.lt_of_le_of_lt` splits `a < c` into `a ≤ ?b` and `?b < c`;
+    // `<;>` runs the inner `first` on both — a mono closes the `≤` subgoal
+    // (binding `?b := len (drop_first W)`), the `drop_first` companion
+    // closes the `<`. Placed LAST before `decreasing_tactic`: its outer
+    // `apply Nat.lt_of_le_of_lt` matches ANY `_ < _` goal (not head-
+    // disjoint), so simple direct-measure goals must reach their own rungs
+    // first; only genuinely-nested goals fall through to here.
+    let chain_rung = SUFFIX_MONO_NAMES.with(|s| {
+        let monos = s.borrow();
+        if monos.is_empty() {
+            String::new()
+        } else {
+            let applies: String = monos.iter()
+                .map(|m| format!("apply {} | ", m))
+                .collect();
+            format!(
+                " | (apply Nat.lt_of_le_of_lt <;> (first | {applies}(apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))))",
+                df = q("Seq.drop_first_len_lt"),
+            )
+        }
+    });
     format!(
-        "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply {df} <;> (first | assumption | omega | simp_all)) | (apply {dl} <;> (first | assumption | omega | simp_all)) | ((repeat split) <;> omega) | decreasing_tactic)",
+        "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Nat.div_lt_self <;> (simp_all <;> omega)) | (apply {ds} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | (apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | (apply {dl} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | ((repeat split) <;> omega){chain_rung} | decreasing_tactic)",
+        ds = q("Seq.subrange_tail_len_lt"),
         df = q("Seq.drop_first_len_lt"),
         dl = q("Seq.drop_last_len_lt"),
     )

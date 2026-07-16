@@ -1,0 +1,290 @@
+---
+title: "W5f v2 follow-on — GROUND the leaf-denotation oracles (fn/fnN/proj/ctorTag/ctorField) to REAL emitted defs, discharging the free hypotheses"
+status: done
+claimed_by: opus-bootstrap57-groundoracles
+created: 2026-07-16T02:30:00Z
+updated: 2026-07-14T22:40:00Z
+---
+
+## Description
+
+Spun out of bootstrap-55/56 (W5f v2). The reference-WP soundness model (probe29,
+`w5f_v2_match_sem.lean`) defines a flat-Int operational semantics `eval`/`edenote`
+over the emitted mirror `ExprData`, parameterized by an ABSTRACT `SymEnv` whose
+oracle fields are:
+
+```
+av   : Int → St → Int         avP  : Int → St → Prop
+opk  : Int → OpKind           fn   : Int → Int → Int          -- App   (unary spec-fn)
+fnN  : Int → List Int → Int   proj : Int → Int → Int          -- AppN / FieldProj
+ctorTag   : Int → Int         ctorField : Int → Nat → Int      -- Match decode
+```
+
+**Every adequacy fact** (FACT 5 `app_grounded`, FACT 8 `appn_grounded`, FACT 9/10/11
+`match_*`) is stated over an **abstract `E : SymEnv` with FREE hypotheses** —
+`hfn : E.fn fId = g`, `hfnN : E.fnN fId = h`, `htag : E.ctorTag v = c0`. The honest
+content today is arm-selection / binder-threading / call-shape; the oracles
+themselves are unconstrained.
+
+**This card grounds them:** build a CONCRETE `crateEnv : SymEnv` literal (the P5
+match-literal pattern, cf. probe5_symenv's `crateEnv`) that PINS `fn`/`fnN`/`proj`/
+`ctorTag`/`ctorField` to the **actual emitted defs**, and re-derive the adequacy
+facts as specializations where the hypotheses **discharge by `rfl`/`decide`** — so
+the leaf denotation is tied to real emitter output, not a free assumption.
+
+**Done when:** a probe elaborates a concrete `crateEnv` over real emitted user
+spec-fns/datatype and the specialized adequacy facts close with the `hfn`/`hfnN`/
+`htag`-style hypotheses discharged by `rfl`/`decide` (not passed in), over standard
+axioms only. Staged — see rungs. Rung 1 alone is a meaningful close of the "free
+hypothesis" gap for the CALL fragment.
+
+## Recon (done 2026-07-16 — the design fork is settled)
+
+**A. The emitter emits REAL Lean inductives, not a flat-Int encoding.** A datatype
+value renders as a genuine Lean constructor + projection: `bootstrap-fixture/out/lib/
+mk_point.lean`'s obligation is literally `let p := lib.Point.mk a b; p.x = a` over a
+real `lib.Point` inductive. Consequence: `ctorTag`/`ctorField` have **no
+emitter-produced Int-encoding to invert by `rfl`**. Grounding them means CHOOSING an
+embedding `emb : U → Int` and PROVING `fnN`/`ctorTag`/`ctorField` mutually consistent
+w.r.t. it — a real encoding/adequacy theorem, not a discharge. (Confirmed w/
+Danielle's local model: "you are no longer performing grounding, you are proving an
+encoding theorem — the Hard Rung.")
+
+**B. The ExprData vocab has NO `Ctor` node** (tags 0–14: Atom/Lit/LitBool/Cast/BinOp/
+App/FieldProj/SpanMark/Let/Not/Ite/Match/AppN/Forall/Exists — see
+`TactusDefs_lib_exec__root.lean:103` `ed_tag`). So a constructor application
+`Point.mk a b` renders through `App`/`AppN` (denoted by `fn`/`fnN`), and a field
+access `p.x` renders as `FieldProj` (tag 5, denoted by `proj`). **`Match` (tag 11) is
+the SOLE consumer of `ctorTag`/`ctorField`.** `render_exp`'s `RawExp.Field` →
+`ExprData.FieldProj`, `RawExp.CallN` → `ExprData.AppN`, `RawExp.MatchR` →
+`ExprData.Match` (root.lean:72–84).
+
+**C. Real emitted user spec-fns exist — in the FIXTURE, not tactus-core.**
+`bootstrap-fixture/out/lib/TactusDefs_lib_exec__root.lean` defines:
+`lib.sq (x:Nat):Nat`, `lib.tri (n:Nat):Nat` (match-free unary), `lib.g2/g3` (N-ary),
+and **`lib.tree_head (t:lib.Tree):Int`** — a MATCH-bodied fn over a real `lib.Tree`
+datatype (this is the `tree_head.defcert.lean` the bootstrap-56 census flagged, the
+only real `Match`-carrying cert on the slice → the natural rung-3 fixture).
+tactus-core's own emitted defs are ALL `noncomputable` `ExprData→ExprData` machinery
+(`pow2 : Nat→Int` is the only Int-returning one) — **no clean same-crate `Int→Int`
+user fn to ground against.** So honest grounding is inherently cross-crate.
+
+**D. CRUX obstacle — module-name collision.** Both crates emit the SAME module names
+(`TactusDefs_lib_exec__root`, `__base`, `__seq_Seq`, …) into the SAME `lib`
+namespace. `lib.sq` lives in the fixture's `__root`; `render_exp` lives in
+tactus-core's `__root`. Same module name, different contents → a probe cannot put
+both on `LEAN_PATH` (the loader resolves one olean per module name). Symbols are
+disjoint (no `lib.sq` in tactus-core, no `render_exp` in the fixture), so a **module
+RENAME** (re-emit/re-elaborate the fixture's def cone under a distinct module prefix,
+e.g. `TactusDefs_fixlib_*`) makes the two importable together. This is the one-time
+"plumbing tax" rung 1 pays. (Danielle's model: prefer this over a probe-local
+hand-written fn — option (b) proves the MODEL satisfiable but bypasses the
+emitter-output pin, which "invalidates the bootstrap claim.")
+
+**E. Prior art.** `probe5_symenv.lean` already realizes a concrete `crateEnv :
+SymEnv` and closes `gdenote crateEnv [] [] g1 = rendered1 := by rfl` — BUT for an
+OLDER toy SymEnv (`.U`/`.tequ`). The current W5f-v2 SymEnv (probe28/29) has NO
+concrete literal; its facts are all abstract. So this is fresh for the current model,
+reusing the probe5 match-literal pattern.
+
+## Staging (validated with Danielle's model)
+
+- **RUNG 1 — ground `fn`/`fnN` (the CALL fragment).** Solve obstacle D: re-emit (or
+  copy+rename) the fixture's def cone so a probe imports BOTH tactus-core's
+  `render_exp` AND the renamed fixture's `lib.sq`/`lib.g2`. Build `crateEnv` pinning
+  `fn sqId = <lib.sq lifted to Int>` / `fnN g2Id = <lib.g2 …>`. Specialize FACT 5/8
+  so `hfn`/`hfnN` discharge by `rfl`. NOTE the Nat/Int seam: `lib.sq : Nat→Nat` but
+  the goal language is Int and `g : Int→Int` — this exercises the real
+  `needs_nat_coercion`/`coerce_if` render path (a feature, the realistic case), so
+  either lift `lib.sq` through `Int.toNat`/`Int.ofNat` in the pin or state the fact
+  at the coerced shape. Rung 1 = "the CALL leaf is pinned to emitter output."
+- **RUNG 2 — ground `proj`/`FieldProj`.** Same setup over `lib.Point` (mk_point
+  fixture): `p.x` renders `FieldProj (…) xFieldId`; pin `proj (embPoint p) xFieldId =
+  <x-field of p>` consistent with the `Point.mk` encoding. Uses the same crateEnv.
+- **RUNG 3 (the Hard Rung) — ground `ctorTag`/`ctorField` over a real ENUM+match.**
+  Target `lib.tree_head`/`lib.Tree`. Choose `emb : lib.Tree → Int`, define
+  `fnN`(constructor)/`ctorTag`/`ctorField` from it, and PROVE the consistency the
+  FACT 9/10/11 hypotheses assume (`ctorTag (emb (Ctor …)) = tagOf Ctor`,
+  `ctorField (emb (Ctor a b)) i = emb·aᵢ`). This is the encoding theorem, not an
+  `rfl`. Because bodies (where Match lives) are already handled by the `fn`-pin
+  (bootstrap-56 census), rung 3 is completeness for the RARE direct-Match-in-goal
+  case — do it last, and only if the census ever finds a live one.
+
+## Progress
+
+- (2026-07-16, opus-bootstrap57-groundoracles) **CLAIMED + full recon + design fork
+  settled; NO Lean landed this turn** (rung 1's module-rename is real plumbing, not a
+  one-sitting change — recording the de-risked path so the next instance starts
+  clean, per the W4/bootstrap-39 recon idiom). Findings A–E above. Consulted
+  Danielle's local model on the fork: confirmed (1) ctorTag/ctorField grounding is an
+  encoding theorem not a discharge, (2) the module collision is real, (3) the 3-rung
+  decomposition is correct, and steered rung 1 to the module-RENAME (option a) over a
+  probe-local hand-written fn, for bootstrap honesty. **Crisp entry for next
+  instance:** start rung 1 = get a probe to import both tactus-core `render_exp` and a
+  renamed copy of the fixture's `lib.sq` cone (obstacle D), then specialize FACT 5.
+
+- (2026-07-16, next instance) **✅ RUNG 1 LANDED — fn/fnN grounded, real Lean, PASS.**
+  New probe `probe-w0/probe30_w5f_ground/` (ground.lean + run.sh + REPORT.md +
+  fixlib/). What landed:
+  - **Obstacle D solved by module RENAME (option a, verbatim-body).** Created
+    `fixlib/TactusDefs_fixlib_exec__root.lean`: the fixture's emitted `sq`/`g2`/`g3`
+    bodies **character-for-character verbatim** from
+    `bootstrap-fixture/out/lib/TactusDefs_lib_exec__root.lean` (`x*x` / `a+b` /
+    `a+b+c`, incl. the emitter's blanket `noncomputable` + set_option header), with
+    ONLY the module name (`TactusDefs_lib_exec__root`→`TactusDefs_fixlib_exec__root`)
+    and namespace prefix (`lib.`→`fixlib.`) rewritten. Verified verbatim by diff
+    (only grep group-separators differ). Imports just `TactusPrelude` (sq/g2/g3 have
+    no dep beyond Nat, so the fixture `__base` cone is not pulled — rung 3 will pull
+    it for `fixlib.Tree`). This is a rename of emitter OUTPUT, not a hand-authored fn.
+  - **Import-both plumbing works.** A probe now imports tactus-core's
+    `TactusDefs_lib_exec` (render_exp) AND the renamed `TactusDefs_fixlib_exec__root`
+    (fixlib.sq/g2) AND probe29 compiled to olean (`w5f_v2_match_sem`, giving
+    `W5f.SymEnv`/`edenote`/FACT 5/8). run.sh builds the two dep oleans if stale then
+    elaborates ground.lean over all four sources.
+  - **Concrete `crateEnv : W5f.SymEnv`** (P5 match-literal): `fn`/`fnN` PINNED to
+    `sqLift`/`g2Lift` = the renamed emitter fns lifted across the **Nat/Int seam**
+    (`fun x:Int => (fixlib.sq x.toNat : Int)` — the render path's
+    `needs_nat_coercion` made explicit at the pin, since FACT 5's `Call … TyInt`
+    shape carries no cast node). av/avP given natural readings (`fun id st => st id` /
+    `≠0`); proj/ctorTag/ctorField stubbed 0 (rungs 2/3).
+  - **Free hypotheses DISCHARGED by rfl, not passed in:** `hfn_sq : crateEnv.fn sqId
+    = sqLift := rfl`, `hfnN_g2 : crateEnv.fnN g2Id = g2Lift := rfl` (Int-literal
+    match-table iota-reduces — de-risked by micro-test first). `#print axioms`:
+    hfn_sq/hfnN_g2 **depend on NO axioms**; the specialized facts
+    `ground_app_sq`/`ground_appn_g2` carry only `[propext]` (what FACT 5/8 already
+    have — no new axioms from grounding).
+  - **The specialized facts** `ground_app_sq`/`ground_appn_g2` state the denotation
+    with `fixlib.sq`/`fixlib.g2` EXPOSED in the RHS (`… ↔ (fixlib.sq (st nId).toNat :
+    Int) < 10`), closed by a bare term-mode application of FACT 5/8 — Lean typechecks
+    the grounded RHS against the fact's `g (av …)` RHS by defeq. Elapsed ~1.2s, PASS.
+  - **Verdict:** the CALL leaf is pinned to emitter output; the "free hypothesis" gap
+    is closed for the fn/fnN (App/AppN) fragment — where the bootstrap-56 census says
+    user spec-fn calls actually land (bodies are fn-pinned). **Remaining:** RUNG 2
+    (proj/FieldProj over `lib.Point`/mk_point) is the natural next; RUNG 3
+    (ctorTag/ctorField = the Hard Rung encoding theorem over `fixlib.Tree`) stays
+    DEFERRED per Danielle's steer (census shows direct Match-in-goal is currently
+    zero; bodies already fn-pinned).
+
+- (2026-07-14, opus-bootstrap57-rung2) **✅ RUNG 2 LANDED — proj/FieldProj grounded to
+  the real `fixlib.Point`, real Lean, PASS** (probe30 `./run.sh` rc=0, ~1.6s). Two
+  pieces:
+  - **New FACT 12 `adequacy_leaf_proj` in probe29** (`w5f_v2_match_sem.lean`): the
+    FieldProj render→denote step — `edenote E (render (BinOp lt (Field f TyInt base)
+    (Lit 10))) ↔ E.proj (eval E (render base)) f < 10`, abstract `E`, arbitrary
+    `base`, in the `< 10` frame (matches FACT 5/8, reuses the pinned `ltId=2`).
+    Proof = `rw [hr]; simp only [u_edenote_binop, hop, u_eval_fieldproj, u_eval_lit]`
+    (added `u_eval_fieldproj` unfold lemma). Carries `[propext]` like FACT 5/8. The
+    honest content is the FieldProj arm-selection + projection-oracle read; the
+    encoding lives at the pin (recon note A), NOT in this fact.
+  - **The encoding theorem in probe30** (`ground.lean`). `proj : Int→Int→Int` reads an
+    Int base ⇒ a 2-field record can't survive the flat-Int `eval` as itself ⇒
+    grounding proj is a genuine encoding proof, not an rfl discharge (recon A —
+    "the medium rung"). Since `Point` has ONE ctor (no tag decode) the encoding is a
+    plain **base-2^64 pairing**: `embPoint p = p.x*2^64 + p.y` (the REAL emitted
+    `fixlib.Point.mk`/`.x`/`.y` — a verbatim rename of the fixture's `__base`
+    `structure lib.Point`, added to the fixlib cone), `crateEnv.fnN mkPointId =
+    embPoint∘Point.mk`, `crateEnv.proj v fld = if fld=xId then v/2^64 else if fld=yId
+    then v%2^64 else 0`. Consistency `proj_x_consistent`/`proj_y_consistent`:
+    `proj (embPoint (Point.mk a b)) xId = a` (resp `= b`) — closed by **`omega`**,
+    consuming EXACTLY the fixture obligation's own field bound `0 ≤ b < 2^64`
+    (`h_b_bound` in mk_point.lean). Grounded facts `ground_proj_x`/`ground_proj_y`
+    compose FACT 12 over base = the emitted constructor `Point.mk a b` (renders AppN,
+    recon B), exposing the REAL `(fixlib.Point.mk (st a)(st b)).x`/`.y` in the RHS.
+    All 4 rung-2 theorems: `[propext, Quot.sound]` (standard core axioms; Quot.sound
+    via omega's Int div/mod) — **no Classical.choice, no sorryAx**. Rung-1 facts
+    unchanged.
+  - **Model consulted** (127.0.0.1:8051): endorsed base-2^64 over Cantor (linear+div/mod
+    → omega-clean, mirrors packed 128-bit layout, reuses the real bound), the `<10`
+    frame (compositional grounding proj→lt, not proj alone), and flagged pinning
+    `xId ≠ yId` distinct (done: xFieldId=0, yFieldId=1). No faithfulness gap: proj's
+    meaning is now formally "the value passed to the constructor," tied to the real
+    `fixlib.Point.x`.
+  - **Remaining:** RUNG 3 (ctorTag/ctorField = the Hard Rung enum+Match encoding
+    theorem over `fixlib.Tree`) stays DEFERRED per Danielle's steer — census shows
+    direct Match-in-goal is currently zero; bodies already fn-pinned. Card stays
+    in_progress for rung 3, but rungs 1+2 close the "free hypothesis" gap for the
+    App/AppN/FieldProj fragment (where user calls + field accesses actually land).
+
+- (2026-07-14, opus-bootstrap57-groundoracles) **✅ RUNG 3 LANDED — ctorTag/ctorField
+  grounded to the real `fixlib.Tree` enum + `fixlib.tree_head` match, real Lean, PASS**
+  (`probe30/run.sh` rc=0, ~2.0s). This closes the card (all 3 rungs land). What landed:
+  - **The real enum added to the fixlib cone (verbatim rename).**
+    `fixlib/TactusDefs_fixlib_exec__root.lean` now also carries `inductive fixlib.Tree |
+    Leaf (Int) | Node (Box Tree)(Box Tree)` + `fixlib.tree_head` = `match … | Leaf v => v
+    | Node _ _ => 0`, character-for-character from
+    `bootstrap-fixture/out/lib/TactusDefs_lib_exec__base.lean:22-25` + `…__root.lean:13-14`
+    (only `lib.`→`fixlib.`). The REAL emitted enum + the only real Match-carrying user fn
+    on the slice (recon C). Needs only `Tactus.Box` (prelude) — no extra deps pulled.
+  - **The emitted `tree_head` maps EXACTLY onto FACT 9/10/11's 2-arm shape** (arm0 = Leaf,
+    1 binder, body reads it; arm1 = Node, 2 binders, body 0). So grounding = pin the
+    scrutinee slot `av scrut st = embTree t` and discharge the FACTs' `htag`/`hmiss`/
+    `htag1` by an encoding-consistency lemma (NOT passed in).
+  - **The encoding (parity tag, low-bit = ctor), pinned into `crateEnv`.** `embTree (Leaf
+    v) = 2·v` (even), `embTree (Node l r) = 2·(embTree l.deref + embTree r.deref)+1` (odd;
+    recurses through BOTH children — a genuine whole-tree fold, wf through `Tactus.Box`
+    like the emitted `Tree.height`). `crateEnv.ctorTag = fun n => if n%2=0 then leafTag
+    else nodeTag`; `crateEnv.ctorField = fun n _ => n/2`. The rung-2 stubs (`ctorTag/
+    ctorField := 0`) are replaced; rungs 1+2 unaffected (they read only fn/fnN/proj/av).
+  - **The sign trap (Danielle's local model caught it).** Naked `n%2` is unsound for
+    negative-odd Ints under the Int emod/tdiv convention (`-1 % 2` can be `-1`, not `1`).
+    Used the **guarded** `if n%2=0 then 0 else 1` — robust either way (odd is never `≡0
+    mod 2`; `omega` proves `(2v)%2=0` and `(2p+1)%2≠0` for ALL Int). Consulted the model
+    on the fork too: it endorsed **Option A** (land tree_head-faithful now, defer full
+    injective Node-child decode) over investing in an unbounded pairing this turn.
+  - **The encoding theorem** (`ctorTag_leaf`/`ctorTag_node`/`ctorTag_node_ne_leaf`/
+    `ctorField_leaf`): omega round-trips over the parity encoding; `embTree`'s head
+    equations come out by `simp only [embTree]`. The three grounded facts tie the flat-Int
+    Match eval to the REAL `fixlib.tree_head`: `ground_match_leaf_val` (arm0 → `= v`),
+    `ground_match_node_val` (walk to arm1 → `= 0`), `ground_match_leaf_prop` (prop mirror →
+    `↔ v ≠ 0`). All rung-3 theorems: `[propext, Quot.sound]` (standard; `Quot.sound` via
+    omega Int div/mod + the wf-rec unfold) — **no Classical.choice, no sorryAx**, matching
+    rung-2's `proj_*_consistent` profile.
+  - **Scope (honest, NOT overclaimed):** `tree_head` never READS Node children (returns 0
+    for every Node), so its faithful grounding needs Node PARITY (tag) only, not Node-child
+    DECODE. Full injective Node decode = an invertible unbounded pairing (Cantor/2-adic),
+    OUTSIDE omega's Presburger fragment (no Mathlib; base-2^64 fails at depth>1) — the
+    genuine remaining hard kernel, **explicitly deferred** as a scoped follow-on (only if
+    the census ever finds a live Node-child-inspecting Match-in-goal). This card's claim is
+    "tree_head Match grounded to the real enum," which holds for ALL trees.
+
+## Writeup
+
+**All 3 rungs land (probe `probe-w0/probe30_w5f_ground/`, `./run.sh` PASS rc=0, ~2.0s).**
+The W5f-v2 reference-WP soundness model (probe29 `w5f_v2_match_sem.lean`) states every
+leaf-adequacy fact over an ABSTRACT `E : SymEnv` with FREE oracle hypotheses. This card
+builds a concrete `crateEnv : W5f.SymEnv` literal that PINS each oracle to REAL emitted
+defs and re-derives the facts as specializations with the hypotheses discharged.
+
+- **Concrete `crateEnv`** (P5 match-literal): `av id st = st id`; `avP id st = st id ≠ 0`;
+  `opk` maps interned opcodes (2=lt,3=le,11=and); `fn 0 = sqLift`, `fnN 0 = g2Lift`,
+  `fnN 1 = mkPointLift`; `proj` = base-2^64 Point decode; `ctorTag`/`ctorField` = the
+  `fixlib.Tree` parity encoding.
+- **Rung 1 (fn/fnN, CALL fragment)** — `crateEnv.fn 0 = sqLift`/`fnN 0 = g2Lift` pinned to
+  the RENAMED emitter fns `fixlib.sq`/`fixlib.g2` (obstacle D: both crates emit module
+  `TactusDefs_lib_exec__root` in namespace `lib`, so the fixture's cone is re-emitted under
+  `TactusDefs_fixlib_exec__root` / `fixlib.` — a verbatim-body rename of emitter OUTPUT, so
+  the pin is honest). FACT 5/8's `hfn`/`hfnN` discharge by `rfl` (depend on NO axioms). The
+  Nat/Int seam (`fixlib.sq : Nat→Nat` vs the goal's `Int→Int`) is made explicit at the pin
+  via `Int.toNat`/`ofNat` — the render path's `needs_nat_coercion` decision.
+- **Rung 2 (proj/FieldProj)** — a record can't survive the flat-Int `eval`, so proj
+  grounding is an ENCODING theorem: `embPoint p = p.x·2^64 + p.y` (real `fixlib.Point`
+  projections), `proj v fld = v/2^64` (x) `| v%2^64` (y); `proj_x/y_consistent` closed by
+  `omega` reusing the fixture's own `0 ≤ b < 2^64` field bound. New FACT 12 in probe29 does
+  the FieldProj render→denote step; `ground_proj_x/y` compose it over the emitted `Point.mk`.
+- **Rung 3 (ctorTag/ctorField)** — the Hard Rung, detailed in the progress log above:
+  parity encoding of the real `fixlib.Tree`, three grounded facts tying the Match eval to
+  the real `fixlib.tree_head`, guarded-tag to avoid the Int-sign trap, all `[propext,
+  Quot.sound]`. Full injective Node-child decode (unbounded pairing) is the one honestly
+  deferred piece — a scoped follow-on, not part of this card's grounding claim.
+
+**Assumptions / honesty notes.** (1) Grounding is inherently CROSS-CRATE: tactus-core has
+no clean same-crate `Int→Int` user fn / user enum to ground against (its emitted defs are
+all `noncomputable ExprData→ExprData` machinery), so the real user datatypes live in the
+bootstrap-fixture and are imported via the module-rename. (2) The renamed fixlib defs are
+verbatim emitter output (bodies char-for-char; only module name + `lib.`→`fixlib.` prefix
+changed) — a hand-authored fn would bypass the emitter-output pin and invalidate the
+bootstrap claim (recon D). (3) Rungs 1 (fn/fnN) discharge by `rfl`; rungs 2 (proj) and 3
+(ctorTag/ctorField) are genuine encoding-adequacy theorems (omega), because a record /
+enum value cannot survive the flat-Int model as itself. (4) The deferred item is full
+Node-child decode only; the card's actual deliverable (tree_head Match grounded for ALL
+trees) is complete and machine-checked over standard axioms.

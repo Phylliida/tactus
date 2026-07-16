@@ -59,6 +59,22 @@ pub(crate) fn strip_one_ref_decoration(typ: &Typ) -> Typ {
     }
 }
 
+/// Peel up to `n` outer reference-decoration layers from `typ`. Each
+/// peel mirrors one `.deref` applied to a match scrutinee: match
+/// ergonomics stamps a pattern binding with the scrutinee's OUTER
+/// reference layers (`&self` → `t : &T`), but the scrutinee renders at
+/// VALUE depth (`self.deref`), so the bound var is a bare value at the
+/// Lean level. Peeling stops early at the first non-ref layer, so a
+/// genuine inner `Box`/`Rc`/`Arc` field wrapper survives (that value IS
+/// wrapped at the Lean level). No-op for `n == 0`.
+fn peel_n_ref_decorations(typ: &Typ, n: usize) -> Typ {
+    let mut cur = typ.clone();
+    for _ in 0..n {
+        cur = strip_one_ref_decoration(&cur);
+    }
+    cur
+}
+
 /// Build a `lean_ast::Expr` from a VIR-AST expression with no enclosing
 /// binders. Use `vir_expr_to_ast_with_binders` from inside a fn body to
 /// pass the fn's params as initial context.
@@ -677,14 +693,35 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
             }
         }
 
-        ExprX::Match(place, arms) => ExprNode::Match {
+        ExprX::Match(place, arms) => {
             // The scrutinee must sit at VALUE depth — patterns match
             // datatype constructors, but a place rooted at a
             // Ref-typed binder (e.g. `self` in an instance method,
             // where the class field type is `Tactus.Ref Self → V`)
             // renders at storage depth. Same binder-aware deref
             // bridging as Field projection bases (U2).
-            scrutinee: Box::new(render_place_with_derefs(place, ctx)),
+            let scrutinee = render_place_with_derefs(place, ctx);
+            // How many `.deref`s the scrutinee received to reach value
+            // depth (mirrors `render_place_with_derefs`'s own count).
+            // Match ergonomics stamped each pattern binding with the
+            // SAME outer reference layers (`match &self` → `t : &T`);
+            // since the scrutinee renders deref'd, the bound var is a
+            // bare value at the Lean level, so peel that many outer ref
+            // layers off each binding typ before it enters the binder
+            // map. Without it, a `t.deep_view()` receiver in an arm body
+            // reads `t` as already-Ref and skips the `Ref.mk` wrap,
+            // emitting `deep_view t` (value) where `Tactus.Ref` is
+            // expected — the Option/Seq/Vec DeepView defs-family
+            // elaboration failure (bootstrap-40). No-op when the
+            // scrutinee is already a value (`scrut_derefs == 0`), so
+            // every value-scrutinee case (incl. the P8 `Box` binding
+            // below) is unchanged.
+            let scrut_derefs = {
+                let vid = match &place.x { PlaceX::Local(v) => Some(v), _ => None };
+                lean_level_wrap_count(vid, &place.typ, ctx)
+            };
+            ExprNode::Match {
+            scrutinee: Box::new(scrutinee),
             arms: arms.iter().map(|arm| {
                 // Pattern-bound vars enter the binder map for the arm
                 // body (same idiom as the Quant arm above). Their
@@ -697,12 +734,17 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
                 // the `.deref`. Without it, the use renders bare and
                 // the island fails elaboration (probe-w0 P8).
                 let mut extended = ctx.binder_typs.cloned().unwrap_or_default();
-                collect_pattern_binding_typs(&arm.x.pattern.x, &mut extended);
+                let mut pat_binds = std::collections::HashMap::new();
+                collect_pattern_binding_typs(&arm.x.pattern.x, &mut pat_binds);
+                for (name, typ) in pat_binds {
+                    extended.insert(name, peel_n_ref_decorations(&typ, scrut_derefs));
+                }
                 LMatchArm {
                     pattern: pattern_to_ast(&arm.x.pattern.x),
                     body: expr_to_ast(&arm.x.body, &ctx.with_binder_typs(&extended)),
                 }
             }).collect(),
+            }
         },
 
         ExprX::Ghost { expr, .. } | ExprX::ProofInSpec(expr) => expr_to_node(expr, ctx),
@@ -1182,38 +1224,80 @@ fn collect_pattern_binding_typs(
     }
 }
 
+/// The Lean constructor name a `PatternX::Constructor(dt, variant, _)`
+/// (or a `ExprX::Ctor`) renders to — the co-design anchor for W7's Match-arm
+/// ctor id (`DESIGN-W7-defslayer.md` §7 Q1). The bridge only agrees if the
+/// PRODUCTION side (`pattern_to_ast` → `lexpr_to_exprdata`) and the REFERENCE
+/// side (`sst_serialize::raw_vir_exp`) intern the *identical* ctor string, so
+/// it lives in ONE place rather than being duplicated across the two
+/// transcribers. Returns `None` for tuple datatypes (rendered as Lean pair
+/// patterns with no named ctor — the reference fails loud on them; none appear
+/// in the fixture, whose `Tree` is a `Dt::Path`).
+pub(crate) fn ctor_pattern_name(dt: &Dt, variant: &Ident) -> Option<String> {
+    match dt {
+        Dt::Path(path) => {
+            let v = if variant.as_str() == short_name(path) {
+                "mk".to_string()
+            } else {
+                sanitize(variant)
+            };
+            Some(format!("{}.{}", lean_name(path), v))
+        }
+        Dt::Tuple(_) => None,
+    }
+}
+
 pub(crate) fn pattern_to_ast(pat: &PatternX) -> LPattern {
     match pat {
         PatternX::Wildcard(_) => LPattern::Wildcard,
         PatternX::Var(binding) => LPattern::Var(crate::lean_name::LeanName::from_var_ident(&binding.name)),
         PatternX::Constructor(dt, variant, pats) => {
-            let name = match dt {
-                Dt::Path(path) => {
-                    let v = if variant.as_str() == short_name(path) {
-                        "mk".to_string()
-                    } else {
-                        sanitize(variant)
-                    };
-                    format!("{}.{}", lean_name(path), v)
-                }
+            let name = match ctor_pattern_name(dt, variant) {
+                Some(n) => n,
                 // Verus tuples render as Lean pair patterns, matching
                 // the expr side (`ExprNode::Tuple`) — the tuple%N
                 // constructor name has no Lean counterpart. 1-tuples
                 // flatten to their element (the type renderer does the
                 // same), so the sub-pattern stands alone.
-                Dt::Tuple(1) => {
-                    return pattern_to_ast(&pats[0].a.x);
-                }
-                Dt::Tuple(_) => {
-                    return LPattern::Tuple(
-                        pats.iter().map(|p| pattern_to_ast(&p.a.x)).collect(),
-                    );
-                }
+                None => match dt {
+                    Dt::Tuple(1) => return pattern_to_ast(&pats[0].a.x),
+                    _ => {
+                        return LPattern::Tuple(
+                            pats.iter().map(|p| pattern_to_ast(&p.a.x)).collect(),
+                        );
+                    }
+                },
             };
-            LPattern::Ctor {
-                name,
-                args: pats.iter().map(|p| pattern_to_ast(&p.a.x)).collect(),
-            }
+            // Lean requires EVERY constructor field to appear positionally
+            // in a pattern. A Rust struct-variant pattern can omit fields
+            // (`FreeExpand { position, .. }` binds only `position`) or list
+            // them out of declaration order — VIR's `pats` then carries only
+            // the named binders present, in source order. Emit one arg per
+            // DECLARED field (from the ambient ctor-field table), reordered to
+            // declaration order, filling omitted fields with `_`. Without
+            // this, `..` patterns render too few args and Lean rejects with
+            // "Not enough arguments to <Ctor>" (bootstrap-42: tgt's
+            // `DerivationStep::FreeExpand { position, .. }`). Unknown datatypes
+            // (cross-crate, not in the table) fall back to the prior
+            // iterate-in-order behavior — no worse than today.
+            let args = match dt {
+                Dt::Path(path) => match crate::expr_shared::ctor_field_names(path, variant.as_str()) {
+                    Some(field_names) => {
+                        let bound: std::collections::HashMap<&str, &PatternX> =
+                            pats.iter().map(|p| (p.name.as_str(), &p.a.x)).collect();
+                        field_names.iter().map(|fname| {
+                            match bound.get(fname.as_str()) {
+                                Some(subpat) => pattern_to_ast(subpat),
+                                None => LPattern::Wildcard,
+                            }
+                        }).collect()
+                    }
+                    None => pats.iter().map(|p| pattern_to_ast(&p.a.x)).collect(),
+                },
+                // ctor_pattern_name returned Some ⟹ dt is Dt::Path here.
+                Dt::Tuple(_) => pats.iter().map(|p| pattern_to_ast(&p.a.x)).collect(),
+            };
+            LPattern::Ctor { name, args }
         }
         PatternX::Or(l, r) => LPattern::Or(
             Box::new(pattern_to_ast(&l.x)),
