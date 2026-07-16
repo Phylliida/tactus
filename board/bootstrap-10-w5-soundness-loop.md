@@ -3,7 +3,7 @@ title: "W5 — soundness of the reference WP (the bootstrap loop closes) [staged
 status: in_progress
 claimed_by: opus-w5a-kickoff
 created: 2026-07-13T19:38:00Z
-updated: 2026-07-16T17:15:00Z
+updated: 2026-07-16T22:40:00Z
 ---
 
 ## Description
@@ -102,6 +102,19 @@ W6.
   **bootstrap-64** (Loop arm; scaffolds dropped → total `wp_stm_sound`) →
   **bootstrap-65** (prophecy + closure corollaries) → **bootstrap-66** (compose
   with the adequacy spine + permanent runner; closes this umbrella).
+
+- (2026-07-16, fable-b6x) **THE AUTHORING TAIL IS LANDED — bootstrap-60
+  through 65 all DONE in one session** (each first-try green except three
+  termination-VC ergonomics iterations on the Loop arm, all documented):
+  probe33 froze the shape (state-generic ensures; calls under binders are
+  dropped — F1/F2) → semantic model in tactus-core (98/0) → support lemmas
+  (118/0) → obligs bridge (121/0) → **total `wp_stm_sound` + `ref_wp_sound`
+  (126/0)** → prophecy/closure corollaries (138/0). tactus-core package
+  gate green throughout, axiom closures ⊆ [propext, Classical.choice,
+  Quot.sound]. The soundness proof of the reference WP is now an ordinary
+  kernel-checked part of the tactus-core package, re-verified on every
+  crate check. Remaining: bootstrap-66 (adequacy-spine composition +
+  permanent runner + docs) — recon findings on its card.
 
 ## Writeup
 
