@@ -3753,6 +3753,196 @@ pub proof fn ref_wp_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, c: FnCtxData
     wp_stm_sound(hp, he, lv, seed_frame(c), s, st);
 }
 
+// ── W5 frame-algebra one-step unfolds (bootstrap-65): the frame_after /
+//    frame_append arms the prophecy/closure corollaries reduce through.
+//    Data-only, probe32 empty shape. ──
+
+pub proof fn u_fa_assume(f: FrameList, e: u64)
+    ensures frame_after(f, StmData::Assume(e))
+        == frame_append(f, FrameList::FHyp(e, Box::new(FrameList::FNil)))
+{}
+pub proof fn u_fa_deadend(f: FrameList, b: Box<StmData>)
+    ensures frame_after(f, StmData::DeadEnd(b)) == f
+{}
+pub proof fn u_fa_seq(f: FrameList, a: Box<StmData>, b: Box<StmData>)
+    ensures frame_after(f, StmData::Seq(a, b)) == frame_after(frame_after(f, *a), *b)
+{}
+pub proof fn u_fapp_fnil(g: FrameList)
+    ensures frame_append(FrameList::FNil, g) == g
+{}
+pub proof fn u_fapp_fbind(x: u64, ty: u64, t: Box<FrameList>, g: FrameList)
+    ensures frame_append(FrameList::FBind(x, ty, t), g)
+        == FrameList::FBind(x, ty, Box::new(frame_append(*t, g)))
+{}
+pub proof fn u_fapp_fhyp(h: u64, t: Box<FrameList>, g: FrameList)
+    ensures frame_append(FrameList::FHyp(h, t), g)
+        == FrameList::FHyp(h, Box::new(frame_append(*t, g)))
+{}
+
+// ═════════════════════════════════════════════════════════════════════
+// W5 MODEL-LEVEL COROLLARIES (bootstrap-65, hand-Lean probe25/probe26).
+// Neither prophecy nor closures add a StmData arm — both Verus encodings
+// use existing constructors — so these are corollaries of wp_stm_sound +
+// the frame algebra, each paired with a DISCRIMINATOR theorem (the two
+// reduced forms differing is what proves the placement/isolation is
+// real, not vacuous).
+// ═════════════════════════════════════════════════════════════════════
+
+/// W5d MAIN (probe25 `prophecy_sound`): the reference WP for
+/// `resolve; assert P(*x)` under the borrow frame `∀ x_fut` reduces
+/// EXACTLY to the ∀-final-value reading — the obligation must hold for
+/// EVERY prophesied final value, UNDER the resolve pin. (`resolve` is a
+/// `StmData::Assume` — Verus's `Assume(has_resolved)`.)
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc])")]
+pub proof fn prophecy_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, xfut: u64, ty: u64, resolve: u64, h: u64, obl: RawExp, st: St)
+    ensures holds_all(hp, he, lv,
+            wp_stm(FrameList::FBind(xfut, ty, Box::new(FrameList::FNil)),
+                StmData::Seq(
+                    Box::new(StmData::Assume(resolve)),
+                    Box::new(StmData::Assert(obl, h)))), st)
+        == (forall|n: int| #[trigger] hp(resolve, upd(st, xfut, n))
+                ==> he(render_exp(obl), upd(st, xfut, n)))
+{
+    wp_stm_sound(hp, he, lv, FrameList::FBind(xfut, ty, Box::new(FrameList::FNil)),
+        StmData::Seq(Box::new(StmData::Assume(resolve)), Box::new(StmData::Assert(obl, h))), st);
+    u_esf_seq(hp, he, lv, FrameList::FBind(xfut, ty, Box::new(FrameList::FNil)),
+        Box::new(StmData::Assume(resolve)), Box::new(StmData::Assert(obl, h)));
+    u_esf_assume(hp, he, lv, FrameList::FBind(xfut, ty, Box::new(FrameList::FNil)), resolve);
+    u_fa_assume(FrameList::FBind(xfut, ty, Box::new(FrameList::FNil)), resolve);
+    u_fapp_fbind(xfut, ty, Box::new(FrameList::FNil), FrameList::FHyp(resolve, Box::new(FrameList::FNil)));
+    u_fapp_fnil(FrameList::FHyp(resolve, Box::new(FrameList::FNil)));
+    u_esf_assert(hp, he, lv,
+        FrameList::FBind(xfut, ty, Box::new(FrameList::FHyp(resolve, Box::new(FrameList::FNil)))), obl, h);
+    u_cse_bind(hp, he, lv, xfut, ty, Box::new(FrameList::FHyp(resolve, Box::new(FrameList::FNil))), obl);
+    u_cse_hyp(hp, he, lv, resolve, Box::new(FrameList::FNil), obl);
+    u_cse_nil(hp, he, lv, obl);
+}
+
+/// W5d DISCRIMINATOR (probe25 `prophecy_swapped_sound`): the swapped
+/// `assert P(*x); resolve` reduces to the UNGATED `∀ x_fut, P(x_fut)` —
+/// the pin never reaches an upstream obligation. The two reduced forms
+/// DIFFERING is the proof that `frame_after` places the resolve pin
+/// temporally correctly.
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc])")]
+pub proof fn prophecy_swapped_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, xfut: u64, ty: u64, resolve: u64, h: u64, obl: RawExp, st: St)
+    ensures holds_all(hp, he, lv,
+            wp_stm(FrameList::FBind(xfut, ty, Box::new(FrameList::FNil)),
+                StmData::Seq(
+                    Box::new(StmData::Assert(obl, h)),
+                    Box::new(StmData::Assume(resolve)))), st)
+        == (forall|n: int| #[trigger] he(render_exp(obl), upd(st, xfut, n)))
+{
+    wp_stm_sound(hp, he, lv, FrameList::FBind(xfut, ty, Box::new(FrameList::FNil)),
+        StmData::Seq(Box::new(StmData::Assert(obl, h)), Box::new(StmData::Assume(resolve))), st);
+    u_esf_seq(hp, he, lv, FrameList::FBind(xfut, ty, Box::new(FrameList::FNil)),
+        Box::new(StmData::Assert(obl, h)), Box::new(StmData::Assume(resolve)));
+    u_esf_assert(hp, he, lv, FrameList::FBind(xfut, ty, Box::new(FrameList::FNil)), obl, h);
+    u_fa_assume(FrameList::FBind(xfut, ty, Box::new(FrameList::FNil)), resolve);
+    u_esf_assume(hp, he, lv,
+        frame_after(FrameList::FBind(xfut, ty, Box::new(FrameList::FNil)), StmData::Assert(obl, h)), resolve);
+    u_cse_bind(hp, he, lv, xfut, ty, Box::new(FrameList::FNil), obl);
+    u_cse_nil(hp, he, lv, obl);
+}
+
+/// W5e MAIN (probe26 `closure_creation_sound`): the reference WP for a
+/// closure creation — `Seq (DeadEnd body) (Assume external_spec)`, the
+/// actual Verus lowering — reduces EXACTLY to the body obligation under
+/// the ENCLOSING frame: wrapper and Assume add nothing.
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc])")]
+pub proof fn closure_creation_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, body: Box<StmData>, ext: u64, st: St)
+    ensures holds_all(hp, he, lv,
+            wp_stm(f, StmData::Seq(
+                Box::new(StmData::DeadEnd(body)),
+                Box::new(StmData::Assume(ext)))), st)
+        == exec_safe_f(hp, he, lv, f, *body, st)
+{
+    wp_stm_sound(hp, he, lv, f,
+        StmData::Seq(Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(ext))), st);
+    u_esf_seq(hp, he, lv, f, Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(ext)));
+    u_esf_deadend(hp, he, lv, f, body);
+    u_fa_deadend(f, body);
+    u_esf_assume(hp, he, lv, frame_after(f, StmData::DeadEnd(body)), ext);
+}
+
+/// W5e ISOLATION (probe26 `closure_deadend_isolates`): the closure body's
+/// local assumption does NOT leak — `Seq (DeadEnd (Assume q)) (Assert P)`
+/// leaves the assert UNGATED by q.
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc])")]
+pub proof fn closure_deadend_isolates(hp: HpOracle, he: HeOracle, lv: LvOracle, q: u64, h: u64, obl: RawExp, st: St)
+    ensures holds_all(hp, he, lv,
+            wp_stm(FrameList::FNil, StmData::Seq(
+                Box::new(StmData::DeadEnd(Box::new(StmData::Assume(q)))),
+                Box::new(StmData::Assert(obl, h)))), st)
+        == he(render_exp(obl), st)
+{
+    wp_stm_sound(hp, he, lv, FrameList::FNil, StmData::Seq(
+        Box::new(StmData::DeadEnd(Box::new(StmData::Assume(q)))),
+        Box::new(StmData::Assert(obl, h))), st);
+    u_esf_seq(hp, he, lv, FrameList::FNil,
+        Box::new(StmData::DeadEnd(Box::new(StmData::Assume(q)))),
+        Box::new(StmData::Assert(obl, h)));
+    u_esf_deadend(hp, he, lv, FrameList::FNil, Box::new(StmData::Assume(q)));
+    u_esf_assume(hp, he, lv, FrameList::FNil, q);
+    u_fa_deadend(FrameList::FNil, Box::new(StmData::Assume(q)));
+    u_esf_assert(hp, he, lv, FrameList::FNil, obl, h);
+    u_cse_nil(hp, he, lv, obl);
+}
+
+/// W5e DISCRIMINATOR (probe26 `seq_assume_gates`): the BARE
+/// `Seq (Assume q) (Assert P)` (no DeadEnd) GATES the assert by q. The
+/// two reduced forms differing is the proof the DeadEnd quarantines.
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc])")]
+pub proof fn seq_assume_gates(hp: HpOracle, he: HeOracle, lv: LvOracle, q: u64, h: u64, obl: RawExp, st: St)
+    ensures holds_all(hp, he, lv,
+            wp_stm(FrameList::FNil, StmData::Seq(
+                Box::new(StmData::Assume(q)),
+                Box::new(StmData::Assert(obl, h)))), st)
+        == (hp(q, st) ==> he(render_exp(obl), st))
+{
+    wp_stm_sound(hp, he, lv, FrameList::FNil, StmData::Seq(
+        Box::new(StmData::Assume(q)), Box::new(StmData::Assert(obl, h))), st);
+    u_esf_seq(hp, he, lv, FrameList::FNil,
+        Box::new(StmData::Assume(q)), Box::new(StmData::Assert(obl, h)));
+    u_esf_assume(hp, he, lv, FrameList::FNil, q);
+    u_fa_assume(FrameList::FNil, q);
+    u_fapp_fnil(FrameList::FHyp(q, Box::new(FrameList::FNil)));
+    u_esf_assert(hp, he, lv, FrameList::FHyp(q, Box::new(FrameList::FNil)), obl, h);
+    u_cse_hyp(hp, he, lv, q, Box::new(FrameList::FNil), obl);
+    u_cse_nil(hp, he, lv, obl);
+}
+
+/// W5e CONTRACT FORWARDING (probe26 `closure_forwards_contract`): after
+/// the closure, the continuation DOES see the external spec — the Assume
+/// threads the contract forward (the analog of the W5d resolve pin).
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc])")]
+pub proof fn closure_forwards_contract(hp: HpOracle, he: HeOracle, lv: LvOracle, body: Box<StmData>, ext: u64, h: u64, obl: RawExp, st: St)
+    ensures holds_all(hp, he, lv,
+            wp_stm(FrameList::FNil, StmData::Seq(
+                Box::new(StmData::Seq(
+                    Box::new(StmData::DeadEnd(body)),
+                    Box::new(StmData::Assume(ext)))),
+                Box::new(StmData::Assert(obl, h)))), st)
+        == (exec_safe_f(hp, he, lv, FrameList::FNil, *body, st)
+            && (hp(ext, st) ==> he(render_exp(obl), st)))
+{
+    wp_stm_sound(hp, he, lv, FrameList::FNil, StmData::Seq(
+        Box::new(StmData::Seq(Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(ext)))),
+        Box::new(StmData::Assert(obl, h))), st);
+    u_esf_seq(hp, he, lv, FrameList::FNil,
+        Box::new(StmData::Seq(Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(ext)))),
+        Box::new(StmData::Assert(obl, h)));
+    u_esf_seq(hp, he, lv, FrameList::FNil, Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(ext)));
+    u_esf_deadend(hp, he, lv, FrameList::FNil, body);
+    u_fa_deadend(FrameList::FNil, body);
+    u_esf_assume(hp, he, lv, frame_after(FrameList::FNil, StmData::DeadEnd(body)), ext);
+    u_fa_seq(FrameList::FNil, Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(ext)));
+    u_fa_assume(frame_after(FrameList::FNil, StmData::DeadEnd(body)), ext);
+    u_fapp_fnil(FrameList::FHyp(ext, Box::new(FrameList::FNil)));
+    u_esf_assert(hp, he, lv, FrameList::FHyp(ext, Box::new(FrameList::FNil)), obl, h);
+    u_cse_hyp(hp, he, lv, ext, Box::new(FrameList::FNil), obl);
+    u_cse_nil(hp, he, lv, obl);
+}
+
 // ── Non-vacuity: the theorem BITES (the leaf arms demand the ACTUAL
 //    obligations, never `true`). ──
 
