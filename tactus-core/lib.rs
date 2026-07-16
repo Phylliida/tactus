@@ -3093,4 +3093,297 @@ by {
     decide
 }
 
+// ═════════════════════════════════════════════════════════════════════
+// W5 SEMANTIC MODEL (bootstrap-61) — the operational side of the
+// soundness loop, authored per the hand-Lean probes (probe21–26, probe24
+// = the frame-carrying W5c formulation) in the shape frozen by probe33
+// (bootstrap-60). Valuation-parametric (DESIGN-W5-soundness.md §1 opt b):
+// three opaque leaf oracles, a function-typed state, and a semantic
+// telescope with the continuation DEFUNCTIONALIZED into the exact two
+// shapes `exec_safe_f` needs (`close_sem_e` = one deep obligation;
+// `close_sem_obligs` = an obligation list) — no higher-order continuation
+// params, no ContK datatype (probe33 REPORT, frozen interface).
+//
+// Authoring discipline (probe33 F1/F2, binding here and in the proofs):
+// facts can NEVER be injected under a binder (proof-fn calls inside
+// `assert forall … by` are dropped by the backend), so every
+// state-dependent lemma over these defs is ST-GENERIC — ∀st lives in the
+// ENSURES. The soundness proofs (bootstrap-62..64) build on that idiom.
+// ═════════════════════════════════════════════════════════════════════
+
+/// The semantic state: an assignment of Int values to interned binder
+/// ids (hand-Lean `St := Int → Int`).
+pub type St = spec_fn(u64) -> int;
+
+/// Opaque prop-leaf oracle (hypotheses + stage-A `Leaf` obligations).
+pub type HpOracle = spec_fn(u64, St) -> bool;
+/// Deep-obligation oracle (`render_exp` output stays opaque to W5).
+pub type HeOracle = spec_fn(ExprData, St) -> bool;
+/// Let-value oracle (`FLet` / `GoalData::Let` / `RetLet` value leaves).
+pub type LvOracle = spec_fn(u64, St) -> int;
+
+/// Point-update on the semantic state (spec closure — probe33 M1).
+pub open spec fn upd(st: St, x: u64, n: int) -> St {
+    |k: u64| if k == x { n } else { st(k) }
+}
+
+/// Goal denotation (Val-level toProp), faithful on every GoalData arm.
+#[verifier::structural_decreases]
+pub open spec fn holds(hp: HpOracle, he: HeOracle, lv: LvOracle, g: GoalData, st: St) -> bool
+    decreases g
+{
+    match g {
+        GoalData::Leaf(id) => hp(id, st),
+        GoalData::Imp(h, t) => hp(h, st) ==> holds(hp, he, lv, *t, st),
+        GoalData::All(x, _ty, t) =>
+            forall|n: int| #[trigger] holds(hp, he, lv, *t, upd(st, x, n)),
+        GoalData::Let(x, v, t) => holds(hp, he, lv, *t, upd(st, x, lv(v, st))),
+        GoalData::LeafE(e) => he(e, st),
+    }
+}
+
+#[verifier::structural_decreases]
+pub open spec fn holds_all(hp: HpOracle, he: HeOracle, lv: LvOracle, gs: GoalList, st: St) -> bool
+    decreases gs
+{
+    match gs {
+        GoalList::Nil => true,
+        GoalList::Cons(g, t) => holds(hp, he, lv, *g, st) && holds_all(hp, he, lv, *t, st),
+    }
+}
+
+/// The conjunction of DEEP obligations in a RawExpList at a state (the
+/// semantic content of a `close_each_e` list — Call reqs / Ret enss /
+/// Loop init + maintain-reclose invariants).
+#[verifier::structural_decreases]
+pub open spec fn obligs_safe(he: HeOracle, l: RawExpList, st: St) -> bool
+    decreases l
+{
+    match l {
+        RawExpList::Nil => true,
+        RawExpList::Cons(h, t) => he(render_exp(*h), st) && obligs_safe(he, *t, st),
+    }
+}
+
+/// Frame-telescope interpretation, continuation = "the deep obligation
+/// `o` holds at the inner state" (FBind→∀, FHyp→→, FLet→let). The
+/// defunctionalized form of hand-Lean
+/// `closeSem f st (fun st' => he (render_exp o) st')`.
+#[verifier::structural_decreases]
+pub open spec fn close_sem_e(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, o: RawExp) -> bool
+    decreases f
+{
+    match f {
+        FrameList::FNil => he(render_exp(o), st),
+        FrameList::FBind(x, _ty, t) =>
+            forall|n: int| #[trigger] close_sem_e(hp, he, lv, *t, upd(st, x, n), o),
+        FrameList::FHyp(h, t) => hp(h, st) ==> close_sem_e(hp, he, lv, *t, st, o),
+        FrameList::FLet(x, v, t) => close_sem_e(hp, he, lv, *t, upd(st, x, lv(v, st)), o),
+    }
+}
+
+/// Frame-telescope interpretation, continuation = "every obligation in
+/// `l` holds at the inner state" (the second and last continuation shape
+/// `exec_safe_f` needs).
+#[verifier::structural_decreases]
+pub open spec fn close_sem_obligs(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, l: RawExpList) -> bool
+    decreases f
+{
+    match f {
+        FrameList::FNil => obligs_safe(he, l, st),
+        FrameList::FBind(x, _ty, t) =>
+            forall|n: int| #[trigger] close_sem_obligs(hp, he, lv, *t, upd(st, x, n), l),
+        FrameList::FHyp(h, t) => hp(h, st) ==> close_sem_obligs(hp, he, lv, *t, st, l),
+        FrameList::FLet(x, v, t) => close_sem_obligs(hp, he, lv, *t, upd(st, x, lv(v, st)), l),
+    }
+}
+
+/// Operational safety — FRAME-CARRYING (the W5c lift, probe24): mirrors
+/// `wp_stm f s`'s frame threading; each obligation is closed under the
+/// frame that precedes it, sequential composition threads `frame_after`,
+/// and the Loop havocs `f` internally through `loop_maintain_frame` —
+/// the havoc'd frames stay opaque, never decomposed. TOTAL on StmData
+/// (no fragment predicate). Non-circular: the leaf arms require the
+/// ACTUAL obligation (`he(render_exp(o))`), never `true`.
+#[verifier::structural_decreases]
+pub open spec fn exec_safe_f(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, s: StmData, st: St) -> bool
+    decreases s
+{
+    match s {
+        StmData::Assert(o, _h) => close_sem_e(hp, he, lv, f, st, o),
+        StmData::Assume(_e) => true,
+        StmData::Assign(_x, _rhs) => true,
+        StmData::Call { reqs, post: _ } => close_sem_obligs(hp, he, lv, f, st, *reqs),
+        StmData::DeadEnd(b) => exec_safe_f(hp, he, lv, f, *b, st),
+        StmData::Ret(es, rb) => close_sem_obligs(hp, he, lv, ret_frame(f, rb), st, *es),
+        StmData::If(c, nc, t, e) =>
+            exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(c, Box::new(FrameList::FNil))), *t, st)
+                && exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(nc, Box::new(FrameList::FNil))), *e, st),
+        StmData::Loop { inv_hyps, inv_obligs, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann: _, d_old_name, d_old_val, decrease_oblig, body } => {
+            let mframe = loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val);
+            let endf = frame_after(mframe, *body);
+            close_sem_obligs(hp, he, lv, f, st, *inv_obligs)
+                && exec_safe_f(hp, he, lv, mframe, *body, st)
+                && close_sem_obligs(hp, he, lv, endf, st, *inv_obligs)
+                && close_sem_e(hp, he, lv, endf, st, decrease_oblig)
+        },
+        StmData::Skip => true,
+        StmData::Seq(a, b) =>
+            exec_safe_f(hp, he, lv, f, *a, st)
+                && exec_safe_f(hp, he, lv, frame_after(f, *a), *b, st),
+    }
+}
+
+// ── W5 model one-step unfold pins (the u_* idiom, probe32/33): the
+//    backend gives height-recursive spec fns no Lean eq-lemmas, so these
+//    st-generic empty-body lemmas both PIN that every arm emits and
+//    unfolds kernel-clean, and serve the soundness proofs as arm-body
+//    rewrite rules (∀st-equations usable under binders — probe33 F2). ──
+
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_holds_leaf(hp: HpOracle, he: HeOracle, lv: LvOracle, id: u64)
+    ensures forall|st: St| #[trigger] holds(hp, he, lv, GoalData::Leaf(id), st) == hp(id, st)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_holds_imp(hp: HpOracle, he: HeOracle, lv: LvOracle, h: u64, t: Box<GoalData>)
+    ensures forall|st: St| #[trigger] holds(hp, he, lv, GoalData::Imp(h, t), st)
+        == (hp(h, st) ==> holds(hp, he, lv, *t, st))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_holds_all_binder(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, t: Box<GoalData>)
+    ensures forall|st: St| #[trigger] holds(hp, he, lv, GoalData::All(x, ty, t), st)
+        == (forall|n: int| #[trigger] holds(hp, he, lv, *t, upd(st, x, n)))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_holds_let(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<GoalData>)
+    ensures forall|st: St| #[trigger] holds(hp, he, lv, GoalData::Let(x, v, t), st)
+        == holds(hp, he, lv, *t, upd(st, x, lv(v, st)))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_holds_leafe(hp: HpOracle, he: HeOracle, lv: LvOracle, e: ExprData)
+    ensures forall|st: St| #[trigger] holds(hp, he, lv, GoalData::LeafE(e), st) == he(e, st)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_holds_all_nil(hp: HpOracle, he: HeOracle, lv: LvOracle)
+    ensures forall|st: St| #[trigger] holds_all(hp, he, lv, GoalList::Nil, st) == true
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_holds_all_cons(hp: HpOracle, he: HeOracle, lv: LvOracle, g: Box<GoalData>, t: Box<GoalList>)
+    ensures forall|st: St| #[trigger] holds_all(hp, he, lv, GoalList::Cons(g, t), st)
+        == (holds(hp, he, lv, *g, st) && holds_all(hp, he, lv, *t, st))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_obligs_nil(he: HeOracle)
+    ensures forall|st: St| #[trigger] obligs_safe(he, RawExpList::Nil, st) == true
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_obligs_cons(he: HeOracle, h: Box<RawExp>, t: Box<RawExpList>)
+    ensures forall|st: St| #[trigger] obligs_safe(he, RawExpList::Cons(h, t), st)
+        == (he(render_exp(*h), st) && obligs_safe(he, *t, st))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_cse_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e(hp, he, lv, FrameList::FNil, st, o)
+        == he(render_exp(o), st)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_cse_bind(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, t: Box<FrameList>, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e(hp, he, lv, FrameList::FBind(x, ty, t), st, o)
+        == (forall|n: int| #[trigger] close_sem_e(hp, he, lv, *t, upd(st, x, n), o))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_cse_hyp(hp: HpOracle, he: HeOracle, lv: LvOracle, h: u64, t: Box<FrameList>, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e(hp, he, lv, FrameList::FHyp(h, t), st, o)
+        == (hp(h, st) ==> close_sem_e(hp, he, lv, *t, st, o))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_cse_let(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<FrameList>, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e(hp, he, lv, FrameList::FLet(x, v, t), st, o)
+        == close_sem_e(hp, he, lv, *t, upd(st, x, lv(v, st)), o)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_cso_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, FrameList::FNil, st, l)
+        == obligs_safe(he, l, st)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_cso_bind(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, t: Box<FrameList>, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, FrameList::FBind(x, ty, t), st, l)
+        == (forall|n: int| #[trigger] close_sem_obligs(hp, he, lv, *t, upd(st, x, n), l))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_cso_hyp(hp: HpOracle, he: HeOracle, lv: LvOracle, h: u64, t: Box<FrameList>, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, FrameList::FHyp(h, t), st, l)
+        == (hp(h, st) ==> close_sem_obligs(hp, he, lv, *t, st, l))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_cso_let(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<FrameList>, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, FrameList::FLet(x, v, t), st, l)
+        == close_sem_obligs(hp, he, lv, *t, upd(st, x, lv(v, st)), l)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_esf_assert(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp, h: u64)
+    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Assert(o, h), st)
+        == close_sem_e(hp, he, lv, f, st, o)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_esf_assume(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, e: u64)
+    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Assume(e), st) == true
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_esf_assign(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, x: u64, rhs: u64)
+    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Assign(x, rhs), st) == true
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_esf_call(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, reqs: Box<RawExpList>, post: Box<FrameList>)
+    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Call { reqs, post }, st)
+        == close_sem_obligs(hp, he, lv, f, st, *reqs)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_esf_deadend(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, b: Box<StmData>)
+    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::DeadEnd(b), st)
+        == exec_safe_f(hp, he, lv, f, *b, st)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_esf_ret(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, es: Box<RawExpList>, rb: RetBind)
+    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Ret(es, rb), st)
+        == close_sem_obligs(hp, he, lv, ret_frame(f, rb), st, *es)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_esf_if(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, c: u64, nc: u64, t: Box<StmData>, e: Box<StmData>)
+    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::If(c, nc, t, e), st)
+        == (exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(c, Box::new(FrameList::FNil))), *t, st)
+            && exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(nc, Box::new(FrameList::FNil))), *e, st))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_esf_loop(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList,
+    inv_hyps: Box<BinderList>, inv_obligs: Box<RawExpList>, binders: Box<BinderList>,
+    binder_bounds: Box<ParamBoundList>, cond_name: u64, cond_ann: u64, neg_cond_ann: u64,
+    d_old_name: u64, d_old_val: u64, decrease_oblig: RawExp, body: Box<StmData>)
+    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Loop {
+            inv_hyps, inv_obligs, binders, binder_bounds, cond_name, cond_ann,
+            neg_cond_ann, d_old_name, d_old_val, decrease_oblig, body,
+        }, st)
+        == (close_sem_obligs(hp, he, lv, f, st, *inv_obligs)
+            && exec_safe_f(hp, he, lv,
+                loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val),
+                *body, st)
+            && close_sem_obligs(hp, he, lv,
+                frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val), *body),
+                st, *inv_obligs)
+            && close_sem_e(hp, he, lv,
+                frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val), *body),
+                st, decrease_oblig))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_esf_skip(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList)
+    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Skip, st) == true
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_esf_seq(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, a: Box<StmData>, b: Box<StmData>)
+    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Seq(a, b), st)
+        == (exec_safe_f(hp, he, lv, f, *a, st)
+            && exec_safe_f(hp, he, lv, frame_after(f, *a), *b, st))
+{}
+
 } // verus!
