@@ -40,6 +40,25 @@ Decision criteria: two-surface end state; §3.3 goals (determinism, speed,
 auditability); review surface (a pin diff should be reviewable as a proof
 change); no ambient context (the guiding rule).
 
+**Transparency constraints on candidate 1** (Danielle probe, 2026-07-16 —
+"deterministic and easy for the user to understand and predict"):
+- **Locality**: derived list = f(goal's mentioned symbols, callee's spec) ONLY;
+  never ambient scope contents. Otherwise distant edits move the list —
+  deterministic but surprising, the rlimit cliff in miniature.
+- **Rule budget**: derivation rules must be few, kind-indexed, one statable
+  line each ("preconditions: unfold callee's requires-mentioned defs, then
+  omega"). A rule needing conditionals on goal structure beyond kind +
+  mentioned symbols is tactus_auto rebuilt inside the emitter → that goal is
+  inline-proof territory. Same discipline as "keep tactus_auto minimal."
+- **Predictability honesty**: bare `simp only [list]` is weaker than omega —
+  success is rewriting REACHABILITY, not fragment membership; the T1 criterion
+  is not met by arbitrary derived rewrite sets. The UNFOLD-THEN-DECIDE shape
+  (`simp only [defs] <;> omega`) recovers fragment-style predictability
+  ("true linear arith after unfolding these named defs"). Prefer rules whose
+  terminal step is a decision procedure; mainline-03's axis-2 census measures
+  how far that reaches. Rewrite-closure rules are acceptable only where the
+  census shows them formulaic per kind; everything else → inline.
+
 **Done when:** decision recorded in `DESIGN-transparent-automation.md` (amend §3
 with the chosen shape + rationale + census numbers), and mainline-05's scope is
 rewritten to match.
