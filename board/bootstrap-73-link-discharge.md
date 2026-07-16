@@ -1,7 +1,7 @@
 ---
 title: "Link discharge — premise-free closed theorems per proof fn (spec: DESIGN-link-discharge.md)"
-status: todo
-claimed_by:
+status: in_progress
+claimed_by: fable-b73
 created: 2026-07-16T23:30:00Z
 updated: 2026-07-16T23:30:00Z
 ---
@@ -42,3 +42,25 @@ in-harness, counts + cost recorded, suite + gates green.
 **Blocked by:** nothing. **Blocks:** bootstrap-66 (spine composition
 waits for `ref_wp_sound_closed`). Open knobs Q1–Q3 in the doc §8 for
 Danielle (naming / default-on / theorem-vs-def).
+
+## Progress
+
+- (2026-07-16, fable-b73) **L0 DONE (probe34) — PASS first elaboration,
+  and it earned its keep: found the BOUND GAP (F1/Q4).**
+  - Validated (shapes frozen in the probe REPORT): `theorem` + recursive
+    fix (`termination_by height` + `decreasing_by` consuming the emitted
+    termination VC — consumed twice, once as the woven height premise,
+    once for the fix), positional application through interleaved
+    Units/lets (zeta), `by simp` discriminators, u_* clean forms as
+    direct re-exports, statement-identity across the weave for
+    scalar-free callees. Axiom closures core-only. Consumption smoke =
+    the bootstrap-66 `exact` shape.
+  - **F1 (the finding)**: scalar-param callees carry `h_*_bound` premises;
+    woven facts are bare and instantiated at unbounded extrinsic
+    projections → the assume-guarantee chain does not compose verbatim
+    there. Latent today (all such callees are rfl-class unfolds), but a
+    bound-needing ensures would make the clean composed fact underivable.
+    Resolution options R-a/R-b/R-c in the REPORT; **R-a (weave the
+    callee's guard — woven premise IS the callee's closed statement)
+    recommended; Danielle's call before L1.** wp_stm_sound/ref_wp_sound
+    discharge is Q4-gated.
