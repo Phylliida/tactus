@@ -77,3 +77,37 @@ Danielle (naming / default-on / theorem-vs-def).
   name — generator synthesizes no math). L0 is now fully closed including
   the Q4 spike; next = L1 (spine recording + clean-statement rendering +
   non-recursive codegen, now with the wf-premise rule).
+
+- (2026-07-16/17, fable-b73) **L1 RECON COMPLETE — production touchpoint
+  map** (so the implementing session starts warm):
+  - **Weave chokepoint** = the exec-call machinery: `walk_call` /
+    `push_post_call_frames` (`sst_to_lean.rs:~3040ff`, `_tactus_ret_N`
+    gensym at :3060). Proof-body lemma calls flow through the SAME path
+    (proof fns return unit → 1 Unit binder + the instantiated ensures as
+    hyp frames). Spine recording hooks here: per call, record (callee
+    stable name; per callee-binder: rendered arg LExpr | bound-proof
+    recipe | SELF marker).
+  - **Bound-proof recipes for L1 (non-recursive)**: caller's own
+    `h_<param>_bound` binder when the arg IS a caller signature param
+    (covers the W5 corollaries); `(by decide)` for literals; anything
+    else → census tag `discharge-bound-gap` (R-c interim; L2's wf
+    resolves it — wf predicates + preservation lemmas AUTHORED IN
+    TACTUS-CORE, consumed by name).
+  - **Clean statement** = "what callers see": the fn's ensures rendered
+    by the SAME caller-side renderer that produces woven facts, ∀-closed
+    over params + bound hyps. Statement identity across the weave by
+    construction — no separate rendering path.
+  - **Persistence**: the Link builder (`generate.rs:4027
+    build_link_module`) re-derives from the krate and runs even when pkg
+    emission is cache-skipped → the spine must be a SIDECAR persisted at
+    emission (the existing `.manifest` pattern), read back by the Link.
+    PkgEmitOutcome (`generate.rs:3246`) is the carrier to the writer.
+  - **Emission point**: closed_clean theorems join `build_link_module`'s
+    output after the existing eta-closed defs, in the same topo order
+    (`ordered`), with `#tactus_check_axioms` each; stable names via the
+    fn path (NOT the line-numbered VC names).
+  - Suggested L1 slices: (a) spine recording + sidecar write/read,
+    verdict-neutral; (b) clean-stmt rendering + closed_clean for the
+    ZERO-SPINE class (u_* re-exports) — first green artifact; (c) the
+    non-recursive discharge with bound recipes (W5 corollaries close);
+    (d) census tags + gate-note counts. Mutation-kill pins land with (c).
