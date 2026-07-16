@@ -21,6 +21,7 @@ pub mod sanity;
 pub mod tactic_select;
 pub mod source_util;
 pub mod sourcemap;
+pub mod sst_serialize;
 pub mod sst_to_lean;
 #[cfg(test)]
 pub(crate) mod test_fixtures;

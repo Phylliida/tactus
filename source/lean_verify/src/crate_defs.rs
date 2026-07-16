@@ -759,7 +759,7 @@ fn render_and_build(
     // namespace open, options) — replicated per partition part.
     let head: Vec<Command> = cmds.clone();
     let (item_cmds, segs) = crate::generate::spec_world_cmds_tagged(
-        inlined_krate, ectx, &walk_roots, emit_accessors, &bc_union, true,
+        inlined_krate, crate_name, ectx, &walk_roots, emit_accessors, &bc_union, true,
     );
     cmds.extend(item_cmds.iter().cloned());
 

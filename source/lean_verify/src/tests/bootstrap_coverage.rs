@@ -4,6 +4,13 @@
 //! is the loud reminder to extend `tactus-core/lib.rs`'s `StmData` (or
 //! record the variant as deliberately uncovered) and the serializer.
 //! See DESIGN-bootstrap.md §12 N2.
+//!
+//! Scope note: this tripwire tracks StmX *variant* coverage only. The
+//! stage-A *field* shapes within the covered variants (If's ¬cond leaf,
+//! Loop's neg_cond/binders, Call's dest/dest_typ, Return's ensures
+//! leaves) were enriched by N2.1 — specced in DESIGN-W2-refwp.md §0/§2.1
+//! and pinned by `tactus-core/lib.rs`'s in-crate `decide` sanity proofs,
+//! not here (no StmX is constructed below).
 
 /// Never called — the exhaustive match IS the test (compile-time).
 #[allow(dead_code)]

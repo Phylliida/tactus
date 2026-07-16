@@ -1,7 +1,24 @@
 # N3: the SST serializer — spec
 
 **Date:** 2026-07-12
-**Status:** spec'd, not started. Parent plan: `DESIGN-bootstrap.md` §12 (N3), §5 (W1).
+**Status:** N3a + N3b + N3c COMPLETE (2026-07-13). Serializer built, goal half
+serialized, and acceptance (§7) validated on the rebuilt binary: all fixture +
+w15_probe certs elaborate against tactus-core's olean with both `stm_size` and
+`goal_count` decide probes kernel-computing; determinism byte-identical; golden
+pins the full cert incl. goals; `sst_serialize.rs` 883 lines (tests split to
+`sst_serialize_tests.rs`); e2e suite GREEN flag-off (550/0 — the real N3b
+regression gate, since goal-shape capture runs unconditionally). Flag-on
+(`VERUS_EXTRA_ARGS="--tactus-emit-cert"`) is verified verdict-neutral at scale
+— 0/550 verdict changes; the full harness goes red flag-on (380/170) ONLY
+because Verus's exact-output test matcher rejects the flag's emission
+diagnostics (crate-end census `note: … certified M/N` + `not serialized`
+eprintlns landing as `[unexpected json]`); every one of the 170 is
+`expected Ok(()) but got Err(no errors)`, i.e. the fn still verifies. Making
+emission test-quiet is W4-scoped (the flag goes default-on there) and tracked
+in board `bootstrap-14`. §9 open-questions were answered at N3a
+first-contact and re-confirmed by the live elaboration. `StmData::Call`
+instantiation remains deferred (board `bootstrap-02b`). Next: N4 census + W2
+refWp. Parent plan: `DESIGN-bootstrap.md` §12 (N3), §5 (W1).
 **Role in the program:** the serializer is THE new trusted component of the R2
 certificate architecture. Everything else the bootstrap adds is *checked*; this
 is the one piece a skeptic must read. Its design goals are therefore inverted
@@ -100,20 +117,36 @@ this summary over tgt).
 
 ## 5. Goal-side serialization (N3b — the one production-code touch)
 
-To print the production goals as `GoalData`, the Wp assembly marks the LExpr
-nodes IT constructs (binder telescope, hypothesis arrows, let-bindings) with a
-provenance flag — one added field/mark on `lean_ast` nodes created in the
-walker, nothing else changes. `goal_serialize` then walks the theorem
-statement: marked node → structural `GoalData` constructor; unmarked subtree →
-leaf (interned in the same table).
+To print the production goals as `GoalData`, the Wp assembly records the
+*structured spine* of each obligation (binder telescope, hypothesis arrows,
+let-bindings, core leaf) as a `GoalShape`, captured at the walker's single
+`OblCtx::wrap` site before the frames fold into the flat statement.
+`goal_serialize` then turns each spine into a `GoalData` constructor chain,
+interning every spine leaf into the same leaf table as the SST half.
 
 Why provenance instead of shape-directed parsing: a hypothesis can itself BE
 an implication or a `∀` (user-written `a ==> b` in an ensures), so shape is
-ambiguous at the spine tail. Provenance is not circular: the marks only record
+ambiguous at the spine tail. The spine record is not circular: it only records
 where the production *claims* structure is; refWp computes structure
 independently from the SST literal, and the `decide` equality is what
 validates the claim. A mismark surfaces as a bridge failure, never as a silent
 pass.
+
+**RESOLVED 2026-07-13 (N3b — mechanism):** the "provenance" is a structured
+`GoalShape` side-record (`lean_ast::GoalShape`/`GoalSpine`), NOT a mark/flag on
+the shared `lean_ast::Expr`. Two facts made this the right realization:
+(1) the `GoalData` mirror is *already* the spine (`All`/`Imp`/`Let`/`Leaf`),
+so a structured record maps 1:1 with no re-parse; (2) every WP obligation
+statement is built at ONE choke point (`ObligationEmitter::emit_with_extras`),
+fed by `emit_split`/`emit_with_closer`, where `(binders, remaining frames,
+leaf)` are still separate. The walker accumulates a `Vec<Option<GoalShape>>`
+in lockstep with its `Vec<Theorem>` (index-aligned; `None` = bit_vector/query
+stage-A exclusion) and returns both in `ExecFnObligations`. This touches the
+production emitter ONLY (the two `wrap` sites + the return type + the two
+`generate.rs` hook calls), leaving `lean_ast::Expr`'s ~50 match arms and the
+pretty-printer untouched — so byte-identical Lean output with the flag off is
+guaranteed by construction. Faithfulness invariant worth a test: folding a
+`GoalShape` back to an `Expr` reproduces the emitted `Theorem.goal`.
 
 ## 6. File format & plumbing
 
@@ -169,14 +202,48 @@ pass.
 
 ## 9. Open questions (decide during N3a, record here)
 
-* `FuncCheckSst` field inventory: exact names/shapes to be transcribed into
-  the contract table on first read of the struct (§3 is the intent, the code
-  is the truth).
-* Loop desugaring: does `check` present loops as `StmX::Loop` or already
-  split (P7 saw loop-triple obligations)? The mirror follows whatever the
-  snapshot point sees; if pre-split, `StmData::Loop` may be dead in practice
-  and the tripwire note should say so.
-* Call contract view: whether instantiated req/ens exps are directly present
-  at the snapshot point or need the same instantiation the walker performs —
-  if the latter, that instantiation becomes part of the trusted surface and
-  must be flagged in the contract table.
+**ANSWERED 2026-07-13 (N3a first contact — `source/vir/src/sst.rs` +
+`sst_to_lean.rs::build_wp`):**
+
+* `FuncCheckSst` field inventory (sst.rs:356): `reqs: Exps`,
+  `post_condition: Arc<PostConditionSst>` (`dest: Option<VarIdent>`,
+  `ens_exps: Exps`, `ens_spec_precondition_stms`, `kind`), `unwind: UnwindSst`,
+  `body: Stm`, `local_decls: Arc<Vec<LocalDecl>>`,
+  `local_decls_decreases_init: Stms`, `statics`. **The serializer transcribes
+  raw `check.body`** (a single `Stm`) — the mut-ref rewrite and WpCtx build
+  happen INSIDE `exec_fn_theorems_to_ast`, downstream of the snapshot, so they
+  are not the serializer's input. `FnCtxData` reads: params/typ_params from
+  `fn_sst.x` (`pars` filtered by `!is_synthetic_param`, `typ_params`), req
+  leaves from `check.reqs`, ens leaves + ens-binder from `check.post_condition`.
+
+* Loop desugaring: **NOT pre-split.** `StmX::Loop` arrives whole —
+  `cond: Option<(Stm,Exp)>`, Tactus's `original_cond: Option<(Stm,Exp)>`,
+  `invs: LoopInvs` (`LoopInv{at_entry, at_exit, inv}`), `decrease: Exps`,
+  `modified_vars: Option<Arc<HavocSet>>`. `StmData::Loop` is LIVE. The
+  init/maintain/use obligation TRIPLE is walker-synthesized (`build_wp_loop`),
+  not distinct SST Assert nodes (confirms §5-Q3's P7 guess) — refWp will
+  synthesize them identically from the Loop literal. Serializer recovers
+  `cond`/`neg_cond` from `cond`-or-`original_cond`, loop-state binders from
+  `modified_vars`. **CAVEAT found in N3a e2e (W2 must handle):** on the
+  fixture's `sum_to`, `modified_vars` is `None` at the RAW `check.body`
+  snapshot (the havoc set is populated by a later pass, not present
+  pre-walker), so the emitted `Loop` literal has `binders = Nil` — the
+  maintain/use telescope binders (i, acc) are absent. Faithful to the
+  snapshot, but refWp will need the modified set: either consult a
+  later-populated havoc source at the snapshot, or compute the modified set
+  inside refWp from the loop body's assigns. Decide at W2.
+
+* Call contract view: **the latter — instantiation IS part of the trusted
+  surface.** `StmX::Call` at the snapshot carries only the callee `Fun`,
+  `typ_args`, `args`, `dest: Option<Dest>` — NOT instantiated req/ens exps.
+  `build_wp_call` performs the instantiation (callee lookup in `fn_map` + arg
+  substitution). The serializer must do the same substitution to render the
+  `Call{reqs, enss}` leaves, and this is flagged in the contract doc-comment as
+  a trusted-surface item (the one non-transcription step). [N3a status: Call is
+  captured STRUCTURALLY with placeholder-instantiation deferred — see writeup;
+  the substitution helper is the sharpest remaining N3a/N3b edge.]
+
+* Overflow-guard asserts: **present verbatim** as `StmX::Assert` at the
+  snapshot (Verus's overflow pass precedes SST hand-off). No walker-injection to
+  mirror. `AssertCompute` folds to `StmData::Assert` (walker dispatches them
+  identically).

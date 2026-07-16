@@ -18,7 +18,7 @@ before the serializer exists, or the literal shape churns:
 |---|---|---|
 | `If` | add negated-cond leaf: `If(cond, neg_cond, then, else)` | the else-branch hypothesis is the RENDERED `¬cond` — a distinct leaf text; refWp can't synthesize leaf ids |
 | `Loop` | add loop-state binder list: `binders: Box<BinderList>` (new list type: `(binder id, typ leaf)` pairs), plus `neg_cond` leaf | maintain/use telescopes quantify over the modified locals (P7); production computes this set — the literal must carry it |
-| `Call` | add `dest: u64` binder id + typ leaf | ensures-hypotheses bind the call result |
+| `Call` | ~~add `dest: u64` binder id + typ leaf~~ → **SUPERSEDED by §2.6: `Call { reqs, post: FrameList }`** | the naive `dest`+`enss` split models only the ∀-path; production's #128 ret-eq path needs the whole post-call frame — landed 2026-07-13 |
 | `Ret` | becomes `Ret(Box<LeafList>)` | the obligation is each ensures INSTANTIATED at the returned value — instantiated texts are leaves rendered at the return site |
 | params (FnCtx, §2.1) | each param carries an optional bound-hyp leaf | int-typed params get `h_x_bound` hypotheses (P6/P7); they are leaves, not structure refWp invents |
 | GoalData spine | interleave-faithful: goals fold a SINGLE ordered frame (see §2.1) | three-parallel-lists loses `∀x, h → let y, h2` ordering |
@@ -45,6 +45,96 @@ counts IS the deliverable:
 Requires the flag to ride through tgt's crate-local `check.sh` (one-line
 plumbing there; the memory note "verify tactus-* with the CRATE-LOCAL
 check.sh" applies).
+
+### 1.1 Census run — mechanism validated + two prerequisites the plan missed (opus-b14-cont, 2026-07-14)
+
+Board `bootstrap-05`. The mechanism works end-to-end; two setup facts the
+"one-line plumbing" framing did not anticipate turned up and gate the
+tgt-scale table.
+
+**Prerequisite A — the flag is NOT in the tgt-facing binary.** tgt's
+`check.sh` invokes `../tactus/source/target-verus/release/verus` (the
+`tactus/` checkout, HEAD `f2f80a0`, built Jul 12). That binary predates the
+cert work — `--tactus-emit-cert` is unknown to it (`--help` has no such
+flag). The flag lives only in the `tactus-bootstrap/` checkout (same fork
+`Phylliida/tactus.git`, HEAD ahead by all of bootstrap-01..17). So the census
+must run under `tactus-bootstrap/source/target-verus/release/verus` — either
+point tgt's `check.sh` at it (a `VERUS=` override, still ~one line) or rebuild
+`tactus/` from the bootstrap commits. I used the bootstrap release binary
+directly.
+
+**Prerequisite B — the census is cache-confounded; it must run COLD.** Cert
+emission (`emit_cert`) is gated behind *actual* verification of a fn — a
+cache-hit fn is skipped before the emit path, so it is never censused. A warm
+run of tgt (`-V cache`, 12M warm cache) reported `24 verified, 0 errors, 6322
+cached` and a census note of only **`certified 1/9 fns`** — i.e. the census
+covered just the 9 cert-eligible fns among the 24 that happened to re-verify,
+not the ~3116-fn crate. **A tgt-wide census requires running WITHOUT `-V
+cache`** (omit it — the raw binary does not cache by default; `--no-cache` is
+a `check.sh`-only flag and is rejected by the binary). Cold runs neither read
+nor write the cache, so the warm 12M cache is preserved.
+
+**Verdict-neutrality confirmed at both scales (N3 §7.4 re-check):** `0 errors`
+with the flag on in every run, including the warm tgt run (`24 verified, 0
+errors, 6322 cached`). The flag does not perturb verdicts. ✓
+
+**Fixture-family census (complete, cold, `bootstrap-fixture/lib.rs`, 14 fns):**
+
+| metric | value |
+|---|---|
+| certified | **9 / 14** (64%) |
+| verified / errors (flag ON, cold) | 20 / **0** |
+| verified / errors (flag OFF, cold) | 20 / **0** (identical → zero verdict delta) |
+| cert files written | 9 `*.cert.lean` |
+| wall-clock flag OFF / ON (cold) | 1.073s / 1.047s (**overhead in the noise at this scale**) |
+
+Uncertified constructs (fixture) — ranked:
+
+| construct tag | fn count | fns |
+|---|---|---|
+| `call` (`StmX::Call`) | **5** | quad_exec, count_down, vec_read, vec_push7, fill_zeros |
+
+At fixture scale the **entire** stage-A gap is `StmData::Call` — exactly
+`bootstrap-02b`. (Overhead is unmeasurable here because the fixture verifies
+in ~1s; the "rendering leaves twice" budget only shows at tgt scale.)
+
+**tgt-wide census (COMPLETE — cold run, `src/lib.rs`, 3116 fns, 1m40s).**
+
+The single most important finding reframes the whole census: **stage-A cert
+emission is EXEC-FN-ONLY.** `emit_cert` is called only from
+`emit_package_exec_fn` / its island sibling (`generate.rs:3746`, `:4059`) —
+i.e. per verified *exec* fn's WP obligations. tgt is a proof/spec-heavy group
+theory crate (3571 `spec`/`proof` fn decls); it has **9 exec fns total**, so
+the crate-wide census denominator is 9, not 3116. The plan's "expected big
+buckets — trait-method obligations, generics, closures, bv" live in
+proof/spec fns and are **out of scope for stage A entirely** — they never
+reach the serializer. Consequence: the **`bootstrap-fixture` family is the
+real serializer stress corpus**; tgt's value here is (a) verdict-neutrality at
+scale and (b) confirming the exec-fn construct gaps on real code.
+
+| metric | value |
+|---|---|
+| verified / errors (flag ON, cold) | 3116 / **0** |
+| verified / errors (flag OFF, cold) | 3116 / **0** (identical → **zero verdict delta at scale**) |
+| cert-eligible fns (= exec fns) | **9** |
+| certified | **1 / 9** (`runtime::impl_4::clone`) |
+| wall-clock flag ON / OFF (cold) | 100s / 99.56s (**overhead ~0.4s, <0.5%** — emission touches 9/3116 fns) |
+
+Ranked per-construct rejection buckets (tgt exec fns) — this IS the stage-B
+roadmap for exec-fn certs:
+
+| construct tag | fn count | fns |
+|---|---|---|
+| `call` (`StmX::Call`) | **5** | runtime::find_cancellation_exec, copy_word, apply_hom_gen, apply_hom_inv, apply_hom_symbol_exec |
+| `assert-query` | **3** | todd_coxeter_rt::symbol_to_column_exec, inverse_column_exec; runtime::is_inverse_pair_exec |
+
+**Roadmap read-out.** tgt exec-fn stage-A coverage is gated by exactly two
+arms: `bootstrap-02b` (`StmData::Call`) clears the 5 `call` fns, and an
+`assert-query` arm clears the remaining 3. Landing both takes tgt from **1/9
+→ 9/9** exec-fn certs. No other construct blocks a tgt exec fn. Combined with
+the fixture (whose entire gap is also `call`), **`StmData::Call` is the
+single highest-leverage next serializer arm** across both corpora
+(5 + 5 = 10 fns unlocked), with `assert-query` a distant second (3 fns).
 
 ## 2. W2 — refWp stage A (the heart)
 
@@ -122,6 +212,11 @@ tactus-core (kernel-compute like everything else). The bridge line is
 (A `deriving DecidableEq` emission knob is the cleaner long-term form —
 recorded as a W1.5-style follow-on, not a W2 blocker.)
 
+**W2a correction (2026-07-14, §5.10):** a `bool`-returning spec fn lowers to
+a NONCOMPUTABLE Lean `Prop`, so `decide` gets stuck on `Classical.choice`.
+`goal_eq`/`goals_eq` therefore return `nat` (1 = equal, 0 = not) and the
+bridge line is `goals_eq (refWp ctx sst) production = 1 := by decide`.
+
 ### 2.4 W2 acceptance
 
 1. Every fixture cert file's bridge line closes by `decide` (and `rfl`).
@@ -142,6 +237,64 @@ certify: leaf rendering (stage B/W6), the serializer (it's the TCB), the
 frontend, or SST semantics adequacy (W5f). A stage-A pass + the four
 leaf-renderer bugs of 2026-07-11 coexisting is possible and expected — say
 so wherever the certificate is described.
+
+### 2.6 Call arm — the #128 ret-eq fork (opus-b02b, 2026-07-13; DECIDED = Option 1, tactus-core reshape LANDED 2026-07-13)
+
+**Resolution (Danielle, 2026-07-13):** go with Option 1 — "lower the mirror"
+to `Call { reqs, post: FrameList }`. The tactus-core half is DONE and verified
+(43 verified, 0 errors): the mirror reshape, refWp's pass-through Call arm
+(`wp_stm`/`frame_after`/`stm_size`), and a `ref_wp_call_pass_through` `decide`
+proof over a `double_exec`-shaped literal exercising BOTH post shapes (ret-eq +
+∀-path) plus a mutation-kill. **Remaining:** the serializer's `post`-builder —
+the restricted replication of `resolve_callee` + `build_call_substitutions`
+(simple subset) + `push_post_call_frames` in `sst_serialize.rs`, which is what
+the W2b bridge will then `decide`-validate against production. See board
+`bootstrap-02b` (mirror half) and its follow-up for the serializer builder.
+
+
+Picking up `bootstrap-02b` surfaced a mirror-shape defect: the N2.1-frozen
+`StmData::Call { reqs, enss, dest, dest_typ }` + refWp's
+`frame_after(Call) = FBind(dest, dest_typ, hyps_of_leaves(enss))` models ONLY
+the naive ∀-path (`∀ dest, ens → …`). Production's `push_post_call_frames`
+(`sst_to_lean.rs:3250`) has a `#128 ret-eq` optimization: when a callee's
+ensures has a conjunct `r == E` (E ∌ r) it DROPS the `∀ ret` and emits
+`[E_bound →] [rest →] let dest := E`. The fixture callee `double_exec`
+(`ensures r == 2*x`) hits exactly this, so refWp cannot reproduce
+`quad_exec`'s goals and the bridge won't close. Full analysis + option table
+in board `bootstrap-02b`. Recommended resolution (local model concurs):
+
+**"Lower the mirror" — `Call { reqs: Box<LeafList>, post: Box<FrameList> }`.**
+The post-call frame becomes explicit EVIDENCE the serializer transcribes,
+not intent refWp re-derives. refWp collapses to a pass-through:
+
+```
+wp_stm(f, Call{reqs, post})     = close_each(f, *reqs)          -- obligations
+frame_after(f, Call{reqs, post}) = frame_append(f, *post)        -- append verbatim
+stm_size(Call{reqs, post})       = 1 + leaf_len(*reqs) + frame_len(*post)
+```
+
+The serializer builds `post` by INDEPENDENTLY replicating the simple subset
+of `push_post_call_frames` (ret-eq detect via `vir_find_ret_eq`, `E_bound`
+via `type_bound_predicate`, the `coerce_lexpr` bridge), so both frame shapes
+land in one uniform slot:
+- ∀-path → `FBind(dest, ret_typ, [FHyp(ret_bound)] FHyp(ens))`
+- ret-eq → `[FHyp(E_bound)] [FHyp(rest)] FLet(dest, E)`
+
+The `decide` bridge then validates the serializer's replication against
+production (non-circular — the serializer recomputes, does NOT copy). This
+generalizes to the coming `&mut` post-state / prophecy frames instead of
+perpetually growing refWp's Call arm.
+
+**Note for the implementer:** this `{reqs, post: FrameList}` reshape is
+IDENTICAL for the two leading options — Option 1 (serializer replicates
+`post`) and Option 2 (provenance-capture `post` from the walk) differ ONLY in
+how `post` is populated, not in the mirror/refWp shape. So the tactus-core
+side is safe to build ahead of the Option 1-vs-2 call; only the serializer's
+`post`-builder waits on it. (Option 1'—keep `enss/dest/dest_typ` + add a
+ret-eq VARIANT—and Option 3—restrict to ∀-path, fail-loud on ret-eq—do NOT
+share this reshape.) `frame_len` already exists (lib.rs:288). Add a
+`ref_wp_call_*` in-crate `decide` proof over a hand-built `double_exec`-shaped
+literal (one ret-eq, one ∀-path) before wiring the serializer.
 
 ## 3. W3 — the differential gate (the payoff before any proof)
 
@@ -181,23 +334,127 @@ bug-FINDING deliverable, independent of the W5 soundness proof.
 
 ## 5. Open questions (answer during W2, record here)
 
-1. Post-`If` continuation: does the production walker duplicate the rest
-   under each branch, or join? Mirror must match; discover empirically from
-   a two-branch fixture cert diff (§2.2).
-2. Fall-through postcondition: where the production emits the ens obligation
-   when the body doesn't end in explicit `Ret`.
-3. Loop-body post: are body-end invariant obligations distinct Assert nodes
-   in the SST at the snapshot point (in which case `Loop` handling shrinks),
-   or walker-synthesized (in which case refWp synthesizes identically)?
-   P7's fcx evidence suggests walker-synthesized; confirm.
-4. Overflow-guard asserts: present as SST `Assert` nodes at the snapshot
-   (then free) or walker-injected (then refWp must mirror the injection —
-   preferably argue for serializing post-injection instead).
+**W3 triage (2026-07-14, from the tgt differential gate — board bootstrap-08,
+`probe-w0/probe11_w3_tgt/`).** First bridge run over certs emitted from REAL
+corpus code (tactus-group-theory), not the fixtures. Corpus is census-limited:
+stage-A emission is exec-fn-only and tgt has 9 exec fns, of which **1** emits a
+cert (`runtime::impl__4::clone`, a derived Copy-clone) and 8 are loud scope-
+rejections (5 `StmData::Call` = bootstrap-02b; 3 `assert-query`) that emit no
+cert and are NOT bridge subjects. So the gate has exactly one bridgeable subject
+today. Reconfirmed the census buckets by targeted cold `--verify-module` emits
+(runtime: 1 certified / 5 call / 1 assert-query; todd_coxeter_rt: 0 / 2 assert-
+query). Verdict-neutral (`24 verified, 0 errors`, flag on cold).
+
+- **runtime::impl__4::clone — RetBind-value ref-param deref (NEW site, class
+  known).** `fn clone(self: &RuntimeSymbol)`. Bridge `goals_eq refWp production
+  = 1` is FALSE. Pinpoint-proved (`Pinpoint.lean`) the SOLE divergence is the
+  RetBind-value leaf: SST `RetLet(4, 0)` binds `_return := leaf 0 ⟦self⟧`;
+  production binds `_return := leaf 5 ⟦self.deref⟧`. Patching only that leaf
+  (`Let 4 5 → Let 4 0`) closes it. refWp is faithful (`ret_frame` folds the
+  SST's `val` verbatim, lib.rs:777); production is correct; the SERIALIZER
+  renders the `&`-param return-value binding as bare `self`, not applying the
+  `*p → p.deref` subst at the RetBind-value render site (it IS applied at ens
+  leaf 2 / oblig leaf 3 in the same fn — so the miss is site-specific). This is
+  the reference-param sibling of head_exec/bootstrap-18 (obligation-leaf site);
+  a NEW leaf-render site of the SAME class. DESIGN §2.5 leaf rendering not
+  certified → sound honest-fail, not a refWp/production bug. **Batched onto
+  bootstrap-18** (whose fix must now thread production's deref RenderCtx through
+  BOTH the `oblig_leaf`/ens path AND the RetBind-value path). Together the two
+  findings show the deref-subst gap is systemic across leaf-render sites.
+- **No production bugs found; 0 unexplained divergences.** certified fraction
+  1/9 (census-limited). Re-run when the Call + assert-query arms unlock the
+  other 8 exec fns.
+
+**W2b triage (2026-07-14, from the fixture-scale bridge run — board
+bootstrap-07, `probe-w0/probe9_bridge/`):** running the bridge over ALL 11
+fixture certs (not just the four hand-demoed in b15/16/17) found a SECOND
+honest-fail beyond the known `max_u64` branch-in-leaf:
+
+- **head_exec — ref-param deref leaf divergence (NEW).** Ensures
+  `r == tree_head(*t)` on `t: &Tree`. The serializer's `oblig_leaf` (empty
+  RenderCtx) renders `*t` as bare `t` → SST ens leaf `⟦…tree_head t⟧`;
+  production's postcondition renders `t.deref` → goal leaf `⟦…tree_head t.deref⟧`.
+  Pinpoint-proved the obligation leaf is the SOLE divergence (`goals_eq refWp
+  (production with leaf6→leaf3) = 1`). Same source span, different leaf text.
+  This is the reference-parameter sibling of finding-4's documented
+  "empty-RenderCtx does not replicate a coercion/subst" caveat: a SERIALIZER
+  faithfulness gap (not a refWp or production bug), and exactly the kind of
+  divergence W3's differential gate is meant to catch — surfaced early here.
+  Stage A does not certify leaf rendering (§2.5), so the bridge SOUNDLY does not
+  close. Fix (make the serializer render the ensures with production's
+  param-deref subst so head_exec bridges) spun out as its own board card. Both
+  honest-fails are now permanent classified entries in the probe9 runner: a
+  honest-fail that later CLOSES is treated as a regression.
+
+**W2a resolution status (2026-07-14, from the on-disk fixture certs +
+authoring refWp — see board bootstrap-06 writeup for full detail):**
+
+1. Post-`If` continuation: **RESOLVED 2026-07-14 (board bootstrap-19), via
+   Option 2 (serializer desugar) — Option 1 (refWp) proven INFEASIBLE.**
+   count_down (`if n==0 {0} else {recurse}`) is the true two-way join: BOTH
+   branches fall through to a common `Ret`, production clones the continuation
+   into both. **Option 1** (teach `wp_stm` the join) requires the branch
+   subterms at match-depth 2 (a nested `match a.deref`), which the Lean
+   backend lowers to `WellFounded.fix` (`termination_by`) — and `decide`
+   CANNOT reduce that, so every `Seq` bridge goes stuck (20 decide-stuck
+   errors; mutual-recursion and CPS variants fail identically — all need a
+   non-structural measure). refWp is therefore kept FROZEN. **Option 2**
+   (`sst_serialize::block`) bakes the clone into the SST tree:
+   `Seq(If(t,e), rest)` → `If(t;rest, e;rest)` when BOTH branches fall
+   through, so refWp's existing flat If/Seq arms (depth-1 structural) produce
+   production's goals and still kernel-compute. Gated on both-fall-through:
+   diverging-branch cases (find_square's `if {return}`) stay `Seq(If, rest)`
+   for bootstrap-17's `frame_after` special case — desugaring them would hide
+   `rest` from `frame_after(If)` and break a loop's maintain-reclose. Residual
+   (documented): a both-fall-through If *inside a loop* (the loop-body
+   post-frame would be the unrepresentable branch join) — no fixture hits it.
+   In-crate guard `ref_wp_if_twoway_join` (frozen refWp + desugared count_down
+   literal → 4 goals); count_down bridge closes by decide+rfl. The stale
+   `frameAfter(If)=frame` note below is superseded for the two-way case.
+2. Fall-through postcondition: **the serializer emits an explicit `Ret(enss)`
+   node** — all three fixtures end in `Ret`, so refWp walks the explicit Ret
+   (no synthesis). CONFIRMED the `return_var` question is LIVE: `sum_to`
+   production prepends `Let 39 7` (`let r := acc`) before the postcondition
+   leaf — production DOES bind the return value as a frame let. So a
+   `return_var` field (or serializer-baked let) IS needed for fall-through
+   bodies (finding-4). refWp does not add it yet.
+3. Loop-body post: **WALKER-SYNTHESISED, confirmed.** Init/maintain/decrease
+   invariant obligations are NOT distinct SST Assert nodes; refWp synthesises
+   init+maintain from `Loop.invs` identically. (User asserts inside the body
+   ARE real SST Assert nodes.)
+4. Overflow-guard asserts: **SST `Assert` nodes, serialized post-injection,
+   confirmed.** refWp just folds them (add_capped Assert 8/13; sum_to Assert
+   13/15). No injection mirror needed.
 5. W5 leaf semantics: valuation-parametric SstSem vs. deep-exprs-first —
-   see §4; decide at W5a kickoff.
+   see §4; decide at W5a kickoff. (Untouched by W2a.)
 6. Mutual/SCC exec fns and non-default loop flavors
    (`invariant_except_break`, `no_unwind` interplay): stage-A exclusions —
    confirm the serializer rejects them loudly rather than mis-capturing.
+   (Untouched by W2a.)
+
+**Newly surfaced by W2a (drive bootstrap-15 / W2b):**
+
+7. **Obligation-annotation gap (dominant):** production renders every
+   obligation leaf with a `/- @rust:file:line -/` annotation (a distinct
+   interned leaf); the SST carries the BARE prop leaf (add_capped `Assert 8` →
+   goal `Leaf 15`; sum_to inv `10` → `Leaf 17`). Under strict `goals_eq` NO
+   fixture bridge closes today. The serializer must carry the annotated
+   obligation leaf (Assert then needs a bare hyp-leaf AND an annotated
+   obligation-leaf).
+8. **Hyp-name gap:** bound-hyps/requires render as NAMED `∀`-binders
+   (`All 19 2` = `∀ (h_x_bound : …)`), not arrows; FnCtxData carries only the
+   prop leaf. N2.1-round-2: `ParamBoundList::Bound(name, prop)`, `reqs` as a
+   `BinderList`; then refWp's signature hyps switch `FHyp`→`FBind`.
+9. **Loop-binder gap:** SST `Loop.binders = Nil` (N3a `modified_vars = None`);
+   production quantifies the maintain/use telescope over the loop-modified
+   locals + bound hyps + invs-as-hyps + cond + a `_tactus_d_old` let. Serializer
+   must populate `Loop.binders` + a decreases leaf.
+10. **Backend: `bool` spec fns → noncomputable `Prop`** → `decide` stuck on
+    `Classical.choice`. `goal_eq`/`goals_eq` return `nat` (1/0); the bridge
+    line is `goals_eq (refWp …) production = 1 := by decide`, superseding
+    §2.3's `= true`. Also: nested `match a {…match b…}` emits ambiguously
+    ("redundant alternative"); match the first arg alone + read the second via
+    projection accessors.
 
 ## 6. Sequencing
 
