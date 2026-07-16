@@ -7,6 +7,15 @@ import lib__u_holds_leafe
 import lib__u_cse_nil
 import lib__holds_all_append
 import lib__holds_close_e
+import lib__u_close_e_bind
+import lib__u_holds_all_binder
+import lib__u_cse_bind
+import lib__u_close_e_hyp
+import lib__u_holds_imp
+import lib__u_cse_hyp
+import lib__u_close_e_let
+import lib__u_holds_let
+import lib__u_cse_let
 set_option linter.unusedVariables false
 set_option autoImplicit false
 
@@ -103,6 +112,116 @@ theorem holds_close_e_fnil_arm_closed
     () (_tactus_postcondition_u_holds_leafe_at_lib_3264_13_1 hp he lv (lib.render_exp o))
     () (_tactus_postcondition_u_cse_nil_at_lib_3286_13_1 hp he lv o)
 
+-- ══════════════════════════════════════════════════════════════════════
+-- R-b RUNG (Q4 resolution candidate): wf-guarded clean forms.
+-- The generated-per-datatype wf predicate (hand version): all scalar
+-- fields in u64 range — the image of the Verus type inside the extrinsic
+-- Lean model. The clean theorem carries `flWf f`; the DISPATCH supplies
+-- the bounds the callee theorems demand. Zero changes to any VC.
+-- ══════════════════════════════════════════════════════════════════════
+
+abbrev U64MAX : Int := 18446744073709551616
+
+def flWf (f : lib.FrameList) : Prop :=
+  match f with
+  | lib.FrameList.FNil => True
+  | lib.FrameList.FBind x ty t =>
+      (0 ≤ x ∧ x < U64MAX) ∧ (0 ≤ ty ∧ ty < U64MAX) ∧ flWf t.deref
+  | lib.FrameList.FHyp h t => (0 ≤ h ∧ h < U64MAX) ∧ flWf t.deref
+  | lib.FrameList.FLet x v t =>
+      (0 ≤ x ∧ x < U64MAX) ∧ (0 ≤ v ∧ v < U64MAX) ∧ flWf t.deref
+termination_by structural f
+
+-- The FULL clean theorem for holds_close_e — all four arms, the three
+-- F1-blocked ones now discharged with bounds from the wf premise.
+theorem holds_close_e_closed
+    (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop)
+    (lv : Int → (Int → Int) → Int) (f : lib.FrameList) (o : lib.RawExp)
+    (hwf : flWf f) :
+    ∀ (st : Int → Int),
+      lib.holds hp he lv (lib.close_e f o) st = lib.close_sem_e hp he lv f st o :=
+  match f, hwf with
+  | lib.FrameList.FNil, _ => holds_close_e_fnil_arm_closed hp he lv o
+  | lib.FrameList.FBind x ty t, ⟨hx, hty, hwt⟩ =>
+      have hdec := _tactus_termination_holds_close_e_at_lib_3491_13_8
+        hp he lv (lib.FrameList.FBind x ty t) o (by simp) (by simp)
+        () (_tactus_postcondition_u_close_e_bind_at_lib_3397_13_1 x hx ty hty t o)
+        () (_tactus_postcondition_u_holds_all_binder_at_lib_3254_13_1 hp he lv x hx ty hty
+              (Tactus.Box.mk (lib.close_e t.deref o)))
+        () (_tactus_postcondition_u_cse_bind_at_lib_3291_13_1 hp he lv x hx ty hty t o)
+      _tactus_postcondition_holds_close_e_at_lib_3477_13_10
+        hp he lv (lib.FrameList.FBind x ty t) o (by simp) (by simp)
+        () (_tactus_postcondition_u_close_e_bind_at_lib_3397_13_1 x hx ty hty t o)
+        () (_tactus_postcondition_u_holds_all_binder_at_lib_3254_13_1 hp he lv x hx ty hty
+              (Tactus.Box.mk (lib.close_e t.deref o)))
+        () (_tactus_postcondition_u_cse_bind_at_lib_3291_13_1 hp he lv x hx ty hty t o)
+        hdec
+        () (holds_close_e_closed hp he lv t.deref o hwt)
+  | lib.FrameList.FHyp h t, ⟨hh, hwt⟩ =>
+      have hdec := _tactus_termination_holds_close_e_at_lib_3497_13_14
+        hp he lv (lib.FrameList.FHyp h t) o (by simp) (by simp) (by simp)
+        () (_tactus_postcondition_u_close_e_hyp_at_lib_3400_13_1 h hh t o)
+        () (_tactus_postcondition_u_holds_imp_at_lib_3249_13_1 hp he lv h hh
+              (Tactus.Box.mk (lib.close_e t.deref o)))
+        () (_tactus_postcondition_u_cse_hyp_at_lib_3296_13_1 hp he lv h hh t o)
+      _tactus_postcondition_holds_close_e_at_lib_3477_13_16
+        hp he lv (lib.FrameList.FHyp h t) o (by simp) (by simp) (by simp)
+        () (_tactus_postcondition_u_close_e_hyp_at_lib_3400_13_1 h hh t o)
+        () (_tactus_postcondition_u_holds_imp_at_lib_3249_13_1 hp he lv h hh
+              (Tactus.Box.mk (lib.close_e t.deref o)))
+        () (_tactus_postcondition_u_cse_hyp_at_lib_3296_13_1 hp he lv h hh t o)
+        hdec
+        () (holds_close_e_closed hp he lv t.deref o hwt)
+  | lib.FrameList.FLet x v t, ⟨hx, hv, hwt⟩ =>
+      have hdec := _tactus_termination_holds_close_e_at_lib_3503_13_20
+        hp he lv (lib.FrameList.FLet x v t) o (by simp) (by simp) (by simp)
+        () (_tactus_postcondition_u_close_e_let_at_lib_3403_13_1 x hx v hv t o)
+        () (_tactus_postcondition_u_holds_let_at_lib_3259_13_1 hp he lv x hx v hv
+              (Tactus.Box.mk (lib.close_e t.deref o)))
+        () (_tactus_postcondition_u_cse_let_at_lib_3301_13_1 hp he lv x hx v hv t o)
+      _tactus_postcondition_holds_close_e_at_lib_3477_13_22
+        hp he lv (lib.FrameList.FLet x v t) o (by simp) (by simp) (by simp)
+        () (_tactus_postcondition_u_close_e_let_at_lib_3403_13_1 x hx v hv t o)
+        () (_tactus_postcondition_u_holds_let_at_lib_3259_13_1 hp he lv x hx v hv
+              (Tactus.Box.mk (lib.close_e t.deref o)))
+        () (_tactus_postcondition_u_cse_let_at_lib_3301_13_1 hp he lv x hx v hv t o)
+        hdec
+        () (holds_close_e_closed hp he lv t.deref o hwt)
+termination_by lib.FrameList.height f
+decreasing_by
+  · exact (_tactus_termination_holds_close_e_at_lib_3491_13_8
+        hp he lv (lib.FrameList.FBind x ty t) o (by simp) (by simp)
+        () (_tactus_postcondition_u_close_e_bind_at_lib_3397_13_1 x hx ty hty t o)
+        () (_tactus_postcondition_u_holds_all_binder_at_lib_3254_13_1 hp he lv x hx ty hty
+              (Tactus.Box.mk (lib.close_e t.deref o)))
+        () (_tactus_postcondition_u_cse_bind_at_lib_3291_13_1 hp he lv x hx ty hty t o)
+      ).resolve_right (fun h => h.2.elim)
+  · exact (_tactus_termination_holds_close_e_at_lib_3497_13_14
+        hp he lv (lib.FrameList.FHyp h t) o (by simp) (by simp) (by simp)
+        () (_tactus_postcondition_u_close_e_hyp_at_lib_3400_13_1 h hh t o)
+        () (_tactus_postcondition_u_holds_imp_at_lib_3249_13_1 hp he lv h hh
+              (Tactus.Box.mk (lib.close_e t.deref o)))
+        () (_tactus_postcondition_u_cse_hyp_at_lib_3296_13_1 hp he lv h hh t o)
+      ).resolve_right (fun h => h.2.elim)
+  · exact (_tactus_termination_holds_close_e_at_lib_3503_13_20
+        hp he lv (lib.FrameList.FLet x v t) o (by simp) (by simp) (by simp)
+        () (_tactus_postcondition_u_close_e_let_at_lib_3403_13_1 x hx v hv t o)
+        () (_tactus_postcondition_u_holds_let_at_lib_3259_13_1 hp he lv x hx v hv
+              (Tactus.Box.mk (lib.close_e t.deref o)))
+        () (_tactus_postcondition_u_cse_let_at_lib_3301_13_1 hp he lv x hx v hv t o)
+      ).resolve_right (fun h => h.2.elim)
+
+-- wf is free on CONCRETE data (the serialized-literal case): decidable
+-- field-by-field.
+-- (note: flWf recurses through Box.deref ⇒ Lean generates NO equational
+--  theorems for it — the crate's own known `rec_1` emission fact — so no
+--  `simp [flWf]`; but iota reduction on literals is fine, hence the
+--  anonymous-constructor + decide shape. The GENERATED wf will live in the
+--  emitted defs family where the same discipline already applies.)
+example : flWf (lib.FrameList.FBind 3 4 (Tactus.Box.mk
+    (lib.FrameList.FHyp 7 (Tactus.Box.mk lib.FrameList.FNil)))) :=
+  ⟨⟨by decide, by decide⟩, ⟨by decide, by decide⟩, ⟨by decide, by decide⟩, trivial⟩
+
 -- ── consumption smoke: a downstream file uses the clean theorem by `exact`
 --    (the bootstrap-66 spine shape) ──
 example (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop)
@@ -116,3 +235,4 @@ end Probe34
 
 #print axioms Probe34.holds_all_append_closed
 #print axioms Probe34.holds_close_e_fnil_arm_closed
+#print axioms Probe34.holds_close_e_closed

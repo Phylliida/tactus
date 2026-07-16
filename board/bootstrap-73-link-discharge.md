@@ -64,3 +64,16 @@ Danielle (naming / default-on / theorem-vs-def).
     callee's guard — woven premise IS the callee's closed statement)
     recommended; Danielle's call before L1.** wp_stm_sound/ref_wp_sound
     discharge is Q4-gated.
+
+- (2026-07-16, fable-b73) **Q4 RESOLVED = R-b, validated in probe34 (rc=0,
+  core-only axiom closures).** Walk-back: R-a (approved earlier on my
+  recommendation) turns out to push an unprovable guard into caller VCs
+  at extrinsic projections — withdrawn with analysis in the REPORT;
+  Danielle's no-hacks steer + the honesty norm made this a walk-back, not
+  a patch. R-b validated end-to-end: hand `flWf` + the FULL four-arm
+  `holds_close_e_closed` under `wf f`, bounds supplied at dispatch, zero
+  changes to any VC/closer/proof. New L2 ingredient: wf predicates +
+  wf-preservation lemmas live IN TACTUS-CORE (spec/proof fns, consumed by
+  name — generator synthesizes no math). L0 is now fully closed including
+  the Q4 spike; next = L1 (spine recording + clean-statement rendering +
+  non-recursive codegen, now with the wf-premise rule).
