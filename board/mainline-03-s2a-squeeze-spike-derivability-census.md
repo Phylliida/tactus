@@ -63,4 +63,15 @@ unnecessary and the whole arc stays two-surface.
 squeeze API confirmed working on our toolchain, and ≥3 hand-validated squeezed
 theorems demonstrating the minimized forms elaborate.
 
-**Blocked by:** nothing (harness + pool exist from Brick 1).
+**Blocked by:** PREREQUISITE discovered 2026-07-16 (mainline-02 writeup): fresh
+`--lean-all-proofs --emit-lean` artifacts on main emit `import
+TactusDefs_lib_exec`, but the defs module doesn't build on main (bootstrap-40/41
+regressions, fixed on bootstrap branch) — so freshly-harvested artifacts don't
+elaborate. Options: (a) do bootstrap-72 (sync bootstrap→main) first — also
+heals the package gate, preferred; (b) merge bootstrap into the `squeeze`
+branch only; (c) fix the emit/live divergence (emit-only should honor a FAILED
+ladder record and emit standalone artifacts — see mainline-02 writeup) which
+this census tooling wants anyway. Work happens on the `squeeze` branch
+(worktree `../tactus-squeeze`, provisioned 2026-07-16: z3 + tree-sitter +
+vargo binary copied in; build its own release binary only when emitter code
+changes start).
