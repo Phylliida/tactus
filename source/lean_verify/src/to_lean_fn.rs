@@ -8,7 +8,7 @@
 use vir::ast::*;
 use crate::lean_ast::{
     and_all, Axiom, Binder as LBinder, BinderKind, Command, Datatype, Instance, InstanceMethod,
-    DatatypeKind, Def, Expr as LExpr, Field,
+    BinOp, DatatypeKind, Def, Expr as LExpr, ExprNode, Field,
     MatchArm, Pattern as LPattern, Theorem, Tactic, Variant,
 };
 use crate::to_lean_type::{lean_name, sanitize, short_name, typ_to_expr};
@@ -41,6 +41,12 @@ pub(crate) const TACTIC_BODY_FALLBACK: &str = "sorry";
 /// `decreasing_by` tactic for recursive spec/proof fns whose `decreases`
 /// measure produces an obligation Lean's default `decreasing_tactic`
 /// can't discharge on its own.
+///
+/// **Post-mainline-10: per-measure dispatch, not a `first`-chain.** The
+/// emitter classifies the rendered measure + self-call args and selects
+/// ONE rung (see `decreasing_kind`); the historical static chain
+/// documented below is retired — the per-rung notes remain accurate for
+/// the selected texts.
 ///
 /// **This is termination-replay, not verification.** Verus's own
 /// `decreases` checker already certified termination before Tactus ran;
@@ -179,42 +185,289 @@ pub(crate) fn register_suffix_mono_name(name: String) {
     });
 }
 
-fn decreasing_by_tactic() -> String {
+/// Per-measure decreasing dispatch (mainline-10, replacing the
+/// `DECREASING_BY_TACTIC` static `first`-chain): the emitter KNOWS the
+/// measure shape it just rendered and the self-call arguments it
+/// emitted in the body, so it selects ONE rung at emission instead of
+/// trying seven at elaboration ("dispatch counts too: the emitter picks
+/// one tactic — it knows the goal class it built").
+///
+/// Classification signals, all from the RENDERED body (self-call args,
+/// detected by the fn's full dotted name) plus the rendered measure:
+/// * nested suffix (`g (drop_first W)` with `g` a non-len lowercase
+///   fn) + registered monotonicity companions → the chaining rung
+/// * `Seq.subrange` / `Seq.drop_first` / `Seq.drop_last` in a self-call
+///   arg → the matching seq companion rung (side-goal ladder kept —
+///   guard shapes vary per call site)
+/// * `/` (BinOp::Div) in a self-call arg → the div rung (inner 2-ladder:
+///   the bootstrap-44 Prop-ite guard case is guard-dependent, not
+///   measure-dependent)
+/// * `%` (BinOp::Mod) in a self-call arg → the mod rung
+/// * a constructor-shaped self-call arg (capitalized head) →
+///   `decreasing_tactic` (structural measures are Lean's default's
+///   domain — that is also what the old chain fell through to)
+/// * an `If`/`Match` in the measure (Int-abs shapes, F2b) →
+///   `(repeat split) <;> omega`
+/// * everything else → `omega` (plain arithmetic measures AND
+///   Int.toNat-wrapped ones with linear self-call args — verified
+///   against find_cancellation_from's real obligation: the
+///   `Int.toNat` wrap does not need `split` when the self-call arg is
+///   linear).
+///
+/// Failure semantics: a misclassified obligation fails LOUD at its
+/// named def (the S2c rule) — the taxonomy below is validated against
+/// the gt gate + tutorial + e2e termination tests (the F2b/F2c pins).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecreasingKind {
+    Chaining,
+    SeqSubrange,
+    SeqDropFirst,
+    SeqDropLast,
+    Modular,
+    Div,
+    Split,
+    Linear,
+    Structural,
+}
+
+#[derive(Default, Clone)]
+struct DecSignals {
+    subrange: bool,
+    drop_first: bool,
+    drop_last: bool,
+    nested_suffix: bool,
+    div: bool,
+    mod_: bool,
+    ctor: bool,
+    has_if: bool,
+}
+
+impl DecSignals {
+    fn merge(&mut self, other: &DecSignals) {
+        self.subrange |= other.subrange;
+        self.drop_first |= other.drop_first;
+        self.drop_last |= other.drop_last;
+        self.nested_suffix |= other.nested_suffix;
+        self.div |= other.div;
+        self.mod_ |= other.mod_;
+        self.ctor |= other.ctor;
+        self.has_if |= other.has_if;
+    }
+}
+
+fn collect_self_call_signals(
+    e: &LExpr,
+    self_name: &str,
+    lets: &std::collections::HashMap<String, DecSignals>,
+    out: &mut DecSignals,
+) {
+    match &e.node {
+        ExprNode::Let { name, value, body } => {
+            // Self-calls hide inside let VALUES too
+            // (`let rest_count := f (drop_first w) n` — britton's
+            // stable_letter_count): search the value for self-calls
+            // BEFORE registering the var's argument-shape signals for
+            // later self-calls in the body.
+            collect_self_call_signals(value, self_name, lets, out);
+            let mut vsig = DecSignals::default();
+            collect_arg_signals(value, &mut vsig, false, lets);
+            let mut lets2 = lets.clone();
+            lets2.insert(name.as_str().to_string(), vsig);
+            collect_self_call_signals(body, self_name, &lets2, out);
+        }
+        ExprNode::App { head, args } => {
+            if let ExprNode::Var(n) = &head.node {
+                if n.as_str() == self_name {
+                    for a in args {
+                        if let Some(vsig) = var_signals(a, lets) {
+                            out.merge(vsig);
+                        } else {
+                            collect_arg_signals(a, out, false, lets);
+                        }
+                    }
+                    return;
+                }
+            }
+            for a in args {
+                collect_self_call_signals(a, self_name, lets, out);
+            }
+            collect_self_call_signals(head, self_name, lets, out);
+        }
+        _ => e.for_each_child(|c| collect_self_call_signals(c, self_name, lets, out)),
+    }
+}
+
+/// Signals of a self-call arg that is a let-bound Var (through SpanMark /
+/// TypeAnnot wrappers).
+fn var_signals<'a>(
+    e: &'a LExpr,
+    lets: &'a std::collections::HashMap<String, DecSignals>,
+) -> Option<&'a DecSignals> {
+    match &e.node {
+        ExprNode::Var(n) => lets.get(n.as_str()),
+        ExprNode::SpanMark { inner, .. } | ExprNode::TypeAnnot { expr: inner, .. } => {
+            var_signals(inner, lets)
+        }
+        _ => None,
+    }
+}
+
+/// Signals from one self-call ARGUMENT. `suffix_ctx` is true while
+/// inside a lowercase non-`len` fn application (a length-non-increasing
+/// suffix fn like `drop_base_run`) — a drop/companion head found there
+/// means the measure is a NESTED suffix (the chaining rung's domain),
+/// not a direct drop measure. `lets` resolves let-bound vars
+/// (`after := drop_first W` behind `drop_base_run after`).
+fn collect_arg_signals(
+    e: &LExpr,
+    out: &mut DecSignals,
+    suffix_ctx: bool,
+    lets: &std::collections::HashMap<String, DecSignals>,
+) {
+    match &e.node {
+        ExprNode::Var(n) => {
+            if let Some(vsig) = lets.get(n.as_str()) {
+                if suffix_ctx && (vsig.drop_first || vsig.drop_last || vsig.subrange) {
+                    out.nested_suffix = true;
+                }
+                out.merge(vsig);
+            }
+        }
+        ExprNode::App { head, args } => {
+            let mut ctx = suffix_ctx;
+            if let ExprNode::Var(n) = &head.node {
+                let s = n.as_str();
+                if s.ends_with(".subrange") {
+                    if suffix_ctx { out.nested_suffix = true; }
+                    out.subrange = true;
+                } else if s.ends_with(".drop_first") {
+                    if suffix_ctx { out.nested_suffix = true; }
+                    out.drop_first = true;
+                } else if s.ends_with(".drop_last") {
+                    if suffix_ctx { out.nested_suffix = true; }
+                    out.drop_last = true;
+                } else if s.ends_with(".len") {
+                    // the measure head itself — not a suffix context
+                } else {
+                    let last = s.rsplit('.').next().unwrap_or(s);
+                    if last.chars().next().map_or(false, |c| c.is_uppercase()) {
+                        out.ctor = true;
+                    } else {
+                        ctx = true;
+                    }
+                }
+            }
+            for a in args {
+                collect_arg_signals(a, out, ctx, lets);
+            }
+            collect_arg_signals(head, out, suffix_ctx, lets);
+        }
+        ExprNode::BinOp { op: BinOp::Div, lhs, rhs } => {
+            out.div = true;
+            collect_arg_signals(lhs, out, suffix_ctx, lets);
+            collect_arg_signals(rhs, out, suffix_ctx, lets);
+        }
+        ExprNode::BinOp { op: BinOp::Mod, lhs, rhs } => {
+            out.mod_ = true;
+            collect_arg_signals(lhs, out, suffix_ctx, lets);
+            collect_arg_signals(rhs, out, suffix_ctx, lets);
+        }
+        _ => {
+            if matches!(&e.node, ExprNode::If { .. } | ExprNode::Match { .. }) {
+                out.has_if = true;
+            }
+            e.for_each_child(|c| collect_arg_signals(c, out, suffix_ctx, lets));
+        }
+    }
+}
+
+fn has_if_shape(e: &LExpr) -> bool {
+    if matches!(&e.node, ExprNode::If { .. } | ExprNode::Match { .. }) {
+        return true;
+    }
+    let mut found = false;
+    e.for_each_child(|c| {
+        if has_if_shape(c) {
+            found = true;
+        }
+    });
+    found
+}
+
+fn decreasing_kind(measure: &LExpr, self_name: &str, body: &LExpr, have_monos: bool) -> DecreasingKind {
+    let mut sig = DecSignals::default();
+    collect_self_call_signals(body, self_name, &std::collections::HashMap::new(), &mut sig);
+    if sig.nested_suffix && have_monos {
+        return DecreasingKind::Chaining;
+    }
+    if sig.subrange {
+        return DecreasingKind::SeqSubrange;
+    }
+    if sig.drop_first {
+        return DecreasingKind::SeqDropFirst;
+    }
+    if sig.drop_last {
+        return DecreasingKind::SeqDropLast;
+    }
+    if sig.mod_ {
+        return DecreasingKind::Modular;
+    }
+    if sig.div {
+        return DecreasingKind::Div;
+    }
+    if sig.ctor {
+        return DecreasingKind::Structural;
+    }
+    if sig.has_if || has_if_shape(measure) {
+        return DecreasingKind::Split;
+    }
+    DecreasingKind::Linear
+}
+
+fn decreasing_by_tactic(measure: &LExpr, self_name: &str, body: &LExpr) -> String {
     let q = |n: &str| match crate::to_lean_type::crate_ns() {
         Some(ns) => format!("{}.{}", ns, n),
         None => n.to_string(),
     };
-    // bootstrap-47: chaining rung for NESTED suffix measures
-    // (`len (g (drop_first W)) < len W`, g length-non-increasing). Spliced
-    // ONLY when ≥1 mono companion is in scope, so files without any keep
-    // their exact prior `decreasing_by` string (no cache churn).
-    // `apply Nat.lt_of_le_of_lt` splits `a < c` into `a ≤ ?b` and `?b < c`;
-    // `<;>` runs the inner `first` on both — a mono closes the `≤` subgoal
-    // (binding `?b := len (drop_first W)`), the `drop_first` companion
-    // closes the `<`. Placed LAST before `decreasing_tactic`: its outer
-    // `apply Nat.lt_of_le_of_lt` matches ANY `_ < _` goal (not head-
-    // disjoint), so simple direct-measure goals must reach their own rungs
-    // first; only genuinely-nested goals fall through to here.
-    let chain_rung = SUFFIX_MONO_NAMES.with(|s| {
-        let monos = s.borrow();
-        if monos.is_empty() {
-            String::new()
-        } else {
-            let applies: String = monos.iter()
-                .map(|m| format!("apply {} | ", m))
-                .collect();
+    let kind = decreasing_kind(
+        measure,
+        self_name,
+        body,
+        !SUFFIX_MONO_NAMES.with(|s| s.borrow().is_empty()),
+    );
+    match kind {
+        // bootstrap-47's chaining rung, selected only when the nesting
+        // is actually present (see decreasing_by_tactic's old LAST rung).
+        DecreasingKind::Chaining => {
+            let monos = SUFFIX_MONO_NAMES.with(|s| s.borrow().clone());
+            let applies: String = monos.iter().map(|m| format!("apply {} | ", m)).collect();
             format!(
-                " | (apply Nat.lt_of_le_of_lt <;> (first | {applies}(apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))))",
+                "all_goals (apply Nat.lt_of_le_of_lt <;> (first | {applies}(apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))))",
                 df = q("Seq.drop_first_len_lt"),
             )
         }
-    });
-    format!(
-        "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Nat.div_lt_self <;> (simp_all <;> omega)) | (apply {ds} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | (apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | (apply {dl} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | ((repeat split) <;> omega){chain_rung} | decreasing_tactic)",
-        ds = q("Seq.subrange_tail_len_lt"),
-        df = q("Seq.drop_first_len_lt"),
-        dl = q("Seq.drop_last_len_lt"),
-    )
+        DecreasingKind::SeqSubrange => format!(
+            "all_goals (apply {} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))",
+            q("Seq.subrange_tail_len_lt")
+        ),
+        DecreasingKind::SeqDropFirst => format!(
+            "all_goals (apply {} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))",
+            q("Seq.drop_first_len_lt")
+        ),
+        DecreasingKind::SeqDropLast => format!(
+            "all_goals (apply {} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))",
+            q("Seq.drop_last_len_lt")
+        ),
+        DecreasingKind::Modular => "all_goals (apply Nat.mod_lt <;> omega)".to_string(),
+        // Inner 2-ladder: the Prop-ite guard case (bootstrap-44) is
+        // guard-shape dependent, which the measure can't predict.
+        DecreasingKind::Div => {
+            "all_goals (apply Nat.div_lt_self <;> (first | omega | (simp_all <;> omega)))".to_string()
+        }
+        DecreasingKind::Split => "all_goals ((repeat split) <;> omega)".to_string(),
+        DecreasingKind::Structural => "all_goals decreasing_tactic".to_string(),
+        DecreasingKind::Linear => "all_goals omega".to_string(),
+    }
 }
 
 /// True when this param needs a body shadow because the shadow is
@@ -528,9 +781,11 @@ pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Vec<Com
             // Lean's default tactic can't discharge (notably the modular
             // `a % b < b` of Euclidean gcd) still verify. Non-recursive defs
             // (empty `termination_by`) get `None` — a bare `decreasing_by`
-            // without `termination_by` is a Lean error. See DECREASING_BY_TACTIC.
+            // without `termination_by` is a Lean error. Per-measure dispatch
+            // (mainline-10): ONE rung selected from the rendered measure +
+            // self-call args — see decreasing_kind.
             let decreasing_by = (!termination_by.is_empty() && !termination_structural)
-                .then(decreasing_by_tactic);
+                .then(|| decreasing_by_tactic(&termination_by[0], name.as_str(), &body));
             vec![Command::Def(Def { attrs, name, binders, ret_ty, body, termination_by, termination_structural, decreasing_by })]
         }
         None => {
@@ -744,8 +999,19 @@ pub fn proof_fn_to_ast(
     // so a measure Lean's default tactic can't discharge (the modular
     // `a % b < b`) still verifies. Gated on non-empty `termination_by` — a
     // bare `decreasing_by` on a non-recursive theorem is a Lean error.
-    let decreasing_by = (!termination_by.is_empty())
-        .then(decreasing_by_tactic);
+    // The body is rendered here ONLY so the per-measure classifier can see
+    // the self-call args (mainline-10); it is not emitted.
+    let decreasing_by = (!termination_by.is_empty()).then(|| {
+        let body_for_signals = f.body.as_ref().map(|b| {
+            crate::to_lean_expr::vir_expr_to_ast_with_binders(b, &binder_ctx, &crate::expr_shared::RenderCtx::empty())
+        });
+        match &body_for_signals {
+            Some(body) => decreasing_by_tactic(&termination_by[0], lean_name(&f.name.path).as_str(), body),
+            // No inspectable body → the safe default (what the old chain
+            // fell through to).
+            None => "all_goals decreasing_tactic".to_string(),
+        }
+    });
     Theorem {
         name: lean_name(&f.name.path),
         binders,
