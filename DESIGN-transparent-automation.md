@@ -234,6 +234,29 @@ Rust span.
   next to the axiom-closure one: **"no artifact imports the search module."**
 - `prelude.rs`'s content-hashed olean cache extends naturally to two oleans.
 
+**LANDED (2026-07-17, mainline-08).** `TactusPrelude.lean` split at the
+vocabulary/tactics boundary (the `axiom Tactus.hasResolved` line):
+`TactusDefs.lean` = vocabulary + `#tactus_check_axioms` (the check audits the
+axioms defined there — it belongs with them); `TactusSearch.lean` =
+`import TactusDefs` + the four ladder tactics. `prelude.rs` builds both oleans
+into the content-hashed cache (hash over both sources; defs first, then search
+with the defs dir on `LEAN_PATH`). Emission: the defs module and standalone
+headers now emit `import TactusDefs`. The Search import is not "discover-mode
+gated" — there IS no discover-mode emission post-S2c — instead every artifact
+is scanned at the `pp_commands` chokepoint and gets `import TactusSearch`
+exactly when one of its theorems cites a search tactic in its closer (user
+overrides / inline proofs only; the derived closer and B4's peel never name
+them). The marker/lockstep invariant: injection happens before landmark
+computation, so sourcemaps stay aligned. Measured on the gt gate: **4 files**
+import TactusSearch (apply_hom_gen/inv, todd_coxeter ×2 — the known
+user-override sites); everything else is TactusDefs-only — mainline-09's gate
+claim is now textually assertable. Validated: gt gate 3116/0 (package gate
+live), tutorial 10/10, suite at main-line parity, lean_verify 374/374 + 7
+integration. **Follow-up:** `ensure_prelude_olean` has no cross-process lock —
+two concurrent tactus runs on one machine can race the shared cache dir
+(observed 2026-07-17 as tutorial-chapter flakes during a concurrent gt gate;
+solo runs all green). A lockfile would fix it.
+
 ---
 
 ## 6. Brick 1: instrument before deciding

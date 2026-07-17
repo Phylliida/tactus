@@ -218,7 +218,8 @@ fn dotted_names_pass_through() {
 /// place to fail loudly.
 #[test]
 fn extract_prelude_names_recognises_current_prelude() {
-    let names = extract_prelude_names(crate::prelude::TACTUS_PRELUDE);
+    let mut names = extract_prelude_names(crate::prelude::TACTUS_DEFS);
+    names.extend(extract_prelude_names(crate::prelude::TACTUS_SEARCH));
     // Axioms.
     assert!(names.contains("arch_word_bits"),
         "expected `arch_word_bits` in extracted prelude names; got {:?}", names);

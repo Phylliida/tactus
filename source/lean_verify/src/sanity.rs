@@ -494,7 +494,10 @@ fn name_resolves(name: &str, defined: &HashSet<String>, scope: &HashSet<String>)
     )
 }
 
-/// Cached set of top-level names defined in `TactusPrelude.lean`.
+/// Cached set of top-level names defined in `TactusDefs.lean` +
+/// `TactusSearch.lean` (the B5 prelude split — both modules' names
+/// may legitimately appear in generated code: the vocabulary from
+/// Defs, and the ladder from Search in user tactic texts).
 ///
 /// Resolved lazily on first use via `extract_prelude_names`. Used by
 /// `name_resolves` to allow generated AST nodes to reference prelude
@@ -504,7 +507,11 @@ fn name_resolves(name: &str, defined: &HashSet<String>, scope: &HashSet<String>)
 fn cached_prelude_names() -> &'static HashSet<String> {
     use std::sync::OnceLock;
     static CACHE: OnceLock<HashSet<String>> = OnceLock::new();
-    CACHE.get_or_init(|| extract_prelude_names(crate::prelude::TACTUS_PRELUDE))
+    CACHE.get_or_init(|| {
+        let mut names = extract_prelude_names(crate::prelude::TACTUS_DEFS);
+        names.extend(extract_prelude_names(crate::prelude::TACTUS_SEARCH));
+        names
+    })
 }
 
 /// Parse `TactusPrelude.lean` text and extract top-level names that
