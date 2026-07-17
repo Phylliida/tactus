@@ -187,6 +187,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use vir::ast::{
+    AssertQueryMode,
     ArithOp, BinaryOp, CallTarget, Constant, Dt, Expr as VirExpr, ExprX, InequalityOp, IntRange,
     KrateX, PatternX, Place, PlaceX, Typ, TypDecoration, TypX, UnaryOp, UnaryOpr, VarIdent,
 };
@@ -2134,7 +2135,22 @@ impl<'a> Serializer<'a> {
             }
             // Fail-loud stage-A exclusions.
             StmX::AssertBitVector { .. } => Err("assert-bitvector".to_string()),
-            StmX::AssertQuery { .. } => Err("assert-query".to_string()),
+            // NonLinear `assert … by(nonlinear_arith)`: an isolated
+            // query — the body's obligations under a Hyp-stripped scope
+            // (`OblCtx::new_scope` keeps Let/Binder, drops Hyp), no
+            // frame delta for the continuation. Mirrors
+            // `StmData::AssertQueryNl` / `strip_hyps` in tactus-core.
+            // Tactus-tactic mode has a DIFFERENT goal structure (the
+            // `have := by <tactic>` render, not an isolated goal list)
+            // — sharper tag, still fail-loud.
+            StmX::AssertQuery { mode: AssertQueryMode::NonLinear, body, .. } => {
+                let b = self.stm(body)?;
+                Ok(format!("({}.StmData.AssertQueryNl {})", NS, box_(&b)))
+            }
+            StmX::AssertQuery { mode: AssertQueryMode::Tactus { .. }, .. } =>
+                Err("assert-query-tactus".to_string()),
+            StmX::AssertQuery { mode: AssertQueryMode::BitVector, .. } =>
+                Err("assert-query-bitvector".to_string()),
             StmX::BreakOrContinue { .. } => Err("break-or-continue".to_string()),
             StmX::OpenInvariant(_) => Err("open-invariant".to_string()),
             StmX::ClosureInner { .. } => Err("closure-inner".to_string()),
@@ -3194,7 +3210,10 @@ fn stm_size_of(stm_term: &str) -> u64 {
     // feed size, plus statement heads. This is a deliberate structural
     // token count over OUR OWN output grammar (not general Lean).
     let count = |needle: &str| stm_term.matches(needle).count() as u64;
-    let stmt_heads = count(&format!("{}.StmData.Assert", NS))
+    // NOTE the trailing space on `Assert `: `AssertQueryNl` contains
+    // `Assert` as a prefix and must not double-count.
+    let stmt_heads = count(&format!("{}.StmData.Assert ", NS))
+        + count(&format!("{}.StmData.AssertQueryNl", NS))
         + count(&format!("{}.StmData.Assume", NS))
         + count(&format!("{}.StmData.Assign", NS))
         + count(&format!("{}.StmData.Call", NS))
