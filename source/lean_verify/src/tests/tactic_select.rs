@@ -219,16 +219,16 @@ fn derived_closer_is_search_free_and_census_exact() {
     // no search tactic named, kernel rungs + generated intro/refine
     // prefix + fixed CORE set + omega tail.
     let goal = bin(BinOp::Eq, var("x"), var("y"));
-    let derived = derived_closer(&goal, &Default::default(), &[]);
+    let derived = derived_closer(&goal, &Default::default(), &[], false);
     assert!(!derived.contains("tactus_auto"));
     assert!(!derived.contains("case_split"));
     assert!(!derived.contains("tactus_first"));
     assert!(!derived.contains("tactus_peel"));
-    assert!(derived.starts_with("first | rfl | decide | omega | ("));
+    assert!(derived.starts_with("first | with_reducible rfl | decide | omega | ("));
     assert!(derived.ends_with("] <;> omega)"));
     // A flat goal has no structure to peel: the kernel branch is just
     // the leaf ladder.
-    assert!(derived.contains("first | rfl | decide | omega"));
+    assert!(derived.contains("first | with_reducible rfl | decide | omega"));
     // The CORE set is the census union + extensions: 51 lemmas (50 separators).
     assert_eq!(CORE_LEMMAS.matches(", ").count(), 50);
     // Mathlib-context name hygiene: bare `not_imp` is ambiguous with

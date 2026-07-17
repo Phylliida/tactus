@@ -1472,25 +1472,49 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
             // are always non-var nested exprs. Residual edge (pinned,
             // doc §12): a spec-side `let x = e;` used in a Box slot
             // whose binder is env-invisible would still render bare.
-            fn is_var_like(e: &Exp) -> bool {
+            fn root_var(e: &Exp) -> Option<&vir::ast::VarIdent> {
                 match &e.x {
-                    ExpX::Var(_) | ExpX::VarLoc(_) | ExpX::VarAt(..) => true,
+                    ExpX::Var(v) => Some(v),
+                    ExpX::VarLoc(v) => Some(v),
+                    ExpX::VarAt(v, _) => Some(v),
                     // Peel ALL unary wrappers: poly Box/Unbox, mode
                     // coercions, clips — a place-read under any of
                     // these renders at storage depth (claims can lie
                     // bare); and for non-ref-typed results the skipped
                     // coercion is identity anyway.
-                    ExpX::Unary(_, inner) => is_var_like(inner),
-                    ExpX::UnaryOpr(_, inner) => is_var_like(inner),
-                    ExpX::Loc(inner) => is_var_like(inner),
-                    _ => false,
+                    ExpX::Unary(_, inner) => root_var(inner),
+                    ExpX::UnaryOpr(_, inner) => root_var(inner),
+                    ExpX::Loc(inner) => root_var(inner),
+                    _ => None,
                 }
             }
+            // Var-like args skip the slot ONLY when their binder is
+            // invisible to the renderer (no let-binder-env entry): the
+            // typed spine then renders them at raw storage depth, and
+            // a claim-based bridge would double-wrap Box::new
+            // temporaries whose SST claim lies bare. When the binder
+            // IS in the env (the Wp::Let walk records every peeled
+            // binder — the Return→Wp::Let route made ctor-arg temps
+            // visible), the typed spine has already bridged the value
+            // to its CLAIM depth accurately, so the declared slot must
+            // apply — otherwise a bridged `tmp.deref : T` lands bare
+            // in a `Tactus.Box T` slot (test_sst_ctor_box_slot_coercion).
+            let var_binder_invisible = |e: &Exp| -> bool {
+                match root_var(e) {
+                    None => false,
+                    Some(v) => {
+                        let name = crate::lean_name::LeanName::from_var_ident(v);
+                        !ctx.let_binder_typs
+                            .map(|m| m.contains_key(&name))
+                            .unwrap_or(false)
+                    }
+                }
+            };
             let rendered = fields.iter()
                 .map(|f| -> Result<LExpr, String> {
                     let typed = exp_to_typed(&f.a, ctx)?;
                     let slot = match dt {
-                        _ if is_var_like(&f.a) => None,
+                        _ if var_binder_invisible(&f.a) => None,
                         Dt::Path(path) => crate::expr_shared::ctor_field_typ(
                             path, variant.as_str(), f.name.as_str(), &typ_args,
                         ),
