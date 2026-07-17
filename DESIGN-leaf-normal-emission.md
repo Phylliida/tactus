@@ -73,6 +73,29 @@ exactly two causes, and both argue for this doc's principles:
 
 ### N1 — Let-hoisting (goal-position lets → binders + equation hypotheses)
 
+> **STATUS (2026-07-17, `e522317`): LANDED for default-closer emission —
+> e2e suite 547/4 (+12 vs the 535/16 baseline, 0 regressions; the 4
+> residue tests were red at baseline too).** Three iterations:
+> 1. v1 regressed to 520/31 — three findings: Prop-typed condition-temp
+>    lets hoist into propositional equations that loop simp
+>    (`eq_iff_iff`) and starve omega/decide; S1's classifier ignored
+>    unmentioned hypothesis binders, so a hoisted equation with an
+>    out-of-fragment RHS (`val = Int.ofNat 1`) let bare omega get
+>    selected into a loud failure; the structural rung's goal-text scan
+>    missed everything that moved into binder types.
+> 2. Bool-typed lets excluded from hoisting (fall back to the wrap —
+>    N2's condition splitting is their real home); classifier chases
+>    hoisted equations to a fixpoint before claiming the fragment.
+> 3. The structural rung scans binder TYPES for mentions, unfolds, and
+>    cases targets (the Cause-A class closed for good).
+>
+> Predictions confirmed: the mul_overflow phantom dissolved exactly as
+> §0 argued (flat goal → S1 bare omega, no `first`-chain runs), and the
+> SCC/termination/match families all closed. Residue: LetRaw-path tuple
+> lets + a user-simp-prefix/derived-intro mismatch (two tests), the
+> mut-ref `.deref` rendering probe, Seq-view atoms (one each). Gates
+> run: e2e suite + lean_verify units; pending: tutorial, gt gate, pool.
+
 Emit `let tmp__1 := x; G[tmp__1]` as theorem-level
 `(tmp__1 : Int) (h_tmp__1 : tmp__1 = x)` with goal `G[tmp__1]`.
 
