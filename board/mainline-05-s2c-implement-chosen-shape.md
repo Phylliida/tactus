@@ -1,9 +1,9 @@
 ---
 title: "S2c — implement the derivation-first squeeze (uniform CORE tactic + residue inline proofs)"
-status: in_progress
+status: done
 claimed_by: kimi
 created: 2026-07-16T17:28:00Z
-updated: 2026-07-16T22:50:00Z
+updated: 2026-07-17T01:05:00Z
 ---
 
 ## Description
@@ -118,3 +118,52 @@ DESIGN-transparent-automation.md §3.4).
     Z3-path storage-safety errors IDENTICAL on the main-line binary
     (verified side-by-side, 14v/4e both) — pre-existing, outside the
     Lean backend entirely.
+- (2026-07-17 ~01:05Z, kimi) **DONE.** Final closer histogram (fresh
+  `--lean-all-proofs` emit, 2956 fns / 42,759 obligation theorems):
+  DERIVED (kernel rungs + 51-CORE normalizer) 42,712 (99.87%) ·
+  S1 omega 10 · S1 peel∘omega 14 · user-composed `first | tactus_auto`
+  14 theorems (3 pre-existing gt override sites: apply_hom_gen,
+  apply_hom_inv, todd_coxeter_rt ×2 — counted residue for the F7/mainline-15
+  migration, NOT default emission) · other (user inline proofs, no
+  search) 9. Default emission is 0% search by construction.
+
+## Writeup
+
+**Done-when review:** derivation rules landed with 0 regressions ✓ (pool
+gate 389/397 at every CORE revision, gt gate 3116/0, tutorial 10/10);
+residue applied in gt ✓ (4 fn-level overrides, search-free, covering all
+8 residue theorems; proof texts recorded in the progress log); new
+histogram committed ✓ (above). Suggestion report: the failure path IS
+the report — a goal outside the derived tactic fails LOUD at its named
+obligation with source span (observed repeatedly during validation);
+`squeeze_census.py` is the squeeze tool for turning such a failure into
+an inline-proof candidate. That workflow is the honest state of
+"suggestions": no separate machinery was built, and none was needed —
+the residue count after the full battery is the 3 pre-existing gt
+user-override sites above.
+
+**What landed (tactus-squeeze):** `DERIVED_CLOSER` in
+`lean_verify/src/tactic_select.rs` (`first | rfl | decide |
+(tactus_peel <;> (first | rfl | decide | omega)) | (simp_all only
+[CORE: 51] <;> omega)`), substituted at the `emit_with_extras`
+chokepoint when S1's classifier has no fragment answer; the same
+substitution at the AssertQuery (`by(nonlinear_arith)`) scope fallback
+composition point (sst_to_lean.rs:2059). User closers never overridden.
+CORE history: 43 (census union) → 51 after three probe-tested
+extensions — full protocol + rationale in MEASUREMENT-s2a §6.1.
+
+**Findings recorded for follow-ups:**
+- mainline-06 folds in: preconditions needed NO kind-specific rule —
+  the uniform derived tactic covers 174/183 T2 preconditions, the
+  residue proofs are kind-agnostic. Marking 06 done with this pointer.
+- mainline-07 (B4) note: the derived tactic's second branch uses
+  `tactus_peel`; when peel goes to codegen, that branch becomes the
+  explicit intro/refine prefix + omega — the census theorems that need
+  it are the `wrapped` class S1 already detects.
+- mainline-10 note: the DECREASING_BY first-chain is now the LAST
+  search-shaped dispatch in default emission.
+- The 3 remaining user-override sites with `tactus_auto` (14 theorems)
+  are the counted residue for the F7/mainline-15 migration.
+- Dependency-injection contract surfaced for user docs (MEASUREMENT §6.2):
+  recursive self-calls pass injected stmt binders explicitly; cross-fn
+  proof-fn references stay unqualified to hit the local binder.
