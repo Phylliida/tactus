@@ -125,7 +125,8 @@ use vir::ast_visitor::map_expr_visitor;
 use vir::messages::Span;
 use crate::lean_ast::{
     and_all, substitute, AssertKind, Binder as LBinder, BinderKind, Expr as LExpr,
-    ExprNode, GoalShape, GoalSpine, HypothesisKind, ObligationKind,
+    CallFactInfo, ExprNode, GoalShape, GoalSpine, HypProvenance,
+    HypothesisKind, ObligationKind, SpineArg, SpineArgTag,
     PreambleFragment, Tactic, Theorem,
 };
 use crate::expr_shared::{is_mut_ref_typ, varat_pre_name};
@@ -699,6 +700,76 @@ pub(crate) fn peel_value_position(e: &Exp) -> &Exp {
 /// variant, prefer `Validated::check(&Exp)?` — that wraps the same
 /// validation in a typestate so the walker's `lower(&Validated<'_>)`
 /// is panic-free by construction (#100).
+/// Extract the lowered-match discriminator from a branch cond (L2,
+/// link_discharge): an `IsVariant(scrutinee)` test, possibly under
+/// value-position wrappers. `positive` comes from the caller (then-
+/// vs else-path — the walker negates at the push site, the Exp is
+/// always the positive test). `None` = not a variant test (plain if).
+fn branch_test_of(cond: &Exp, positive: bool) -> Option<crate::lean_ast::BranchTest> {
+    // Fixpoint-peel every transparent wrapper the SST may interpose
+    // (Loc, Box/Unbox, CoerceMode, Trigger, CustomErr spans) and fold
+    // an explicit `Not` into the polarity — the lowered-match chain
+    // wraps inner discriminators differently per nesting level.
+    let mut peeled = peel_value_position(cond);
+    let mut positive = positive;
+    loop {
+        match &peeled.x {
+            ExpX::Unary(UnaryOp::Not, inner) => {
+                positive = !positive;
+                peeled = peel_value_position(inner);
+            }
+            ExpX::UnaryOpr(UnaryOpr::CustomErr(_), inner) => {
+                peeled = peel_value_position(inner);
+            }
+            // Lowered-match discriminators arrive as left-nested
+            // `And(And(IsVariant, true), true)` chains — one trivial
+            // `true` per pattern field. Fold true-conjuncts away; a
+            // conjunction of two REAL tests stays unextracted (None).
+            ExpX::Binary(vir::ast::BinaryOp::And, l, r) => {
+                let lp = peel_value_position(l);
+                let rp = peel_value_position(r);
+                let is_true = |e: &Exp| matches!(
+                    &e.x, ExpX::Const(vir::ast::Constant::Bool(true)));
+                if is_true(rp) {
+                    peeled = lp;
+                } else if is_true(lp) {
+                    peeled = rp;
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    match &peeled.x {
+        ExpX::UnaryOpr(UnaryOpr::IsVariant { datatype, variant }, inner) => {
+            let dt = match datatype {
+                vir::ast::Dt::Path(p) => crate::to_lean_type::lean_name_relative(p),
+                _ => return None,
+            };
+            let inner = peel_transparent(inner);
+            let scrut = match &inner.x {
+                ExpX::Var(v) => {
+                    crate::lean_name::LeanName::from_var_ident(v).as_str().to_string()
+                }
+                _ => return None,
+            };
+            Some(crate::lean_ast::BranchTest {
+                scrutinee: scrut,
+                datatype: dt,
+                variant: variant.to_string(),
+                positive,
+            })
+        }
+        _ => {
+            if std::env::var("TACTUS_BRANCH_DEBUG").is_ok() {
+                eprintln!("BRANCH-DEBUG unextracted cond: {:?}", peeled.x);
+            }
+            None
+        }
+    }
+}
+
 fn check_exp(e: &Exp) -> Result<(), String> {
     sst_exp_to_ast_checked(e).map(|_| ())
 }
@@ -1285,8 +1356,11 @@ enum CtxFrame {
     Let(crate::lean_name::LeanName, LExpr),
     /// `P →` wrapping. Pushed for assumes, branch conditions, and
     /// assertions that already passed (the asserted condition
-    /// becomes a hypothesis for the rest of the body).
-    Hyp(LExpr),
+    /// becomes a hypothesis for the rest of the body). Carries its
+    /// provenance for the Link-discharge spine (L1,
+    /// DESIGN-link-discharge.md §3.1) — documentation-plus-data only,
+    /// never affects the rendered theorem.
+    Hyp(LExpr, HypProvenance),
     /// `∀ (x : T),` wrapping. `walk_call` pushes one for the
     /// callee's return value; `walk_loop` pushes one per modified
     /// variable in maintain / use ctx.
@@ -1466,7 +1540,7 @@ impl OblCtx {
         for frame in self.frames.iter().rev() {
             goal = match frame {
                 CtxFrame::Let(name, v) => LExpr::let_bind(name.clone(), v.clone(), goal),
-                CtxFrame::Hyp(p) => LExpr::implies(p.clone(), goal),
+                CtxFrame::Hyp(p, _) => LExpr::implies(p.clone(), goal),
                 CtxFrame::Binder(b) => LExpr::forall(vec![b.clone()], goal),
             };
         }
@@ -1488,7 +1562,7 @@ impl OblCtx {
             CtxFrame::Binder(b) => b.name.as_ref()
                 .map(|n| n.as_str().to_string())
                 .unwrap_or_else(|| "_".to_string()),
-            CtxFrame::Hyp(_) => "_".to_string(),
+            CtxFrame::Hyp(..) => "_".to_string(),
         }).collect()
     }
 
@@ -1507,20 +1581,23 @@ impl OblCtx {
     /// Stopping at the first Let preserves the source ordering of
     /// `_tactus_d_old := D` lets and any other let-bound context.
     /// Hyps get synthetic names so they're addressable.
-    fn split_leading_binders(&self) -> (Vec<LBinder>, OblCtx) {
-        let mut binders: Vec<LBinder> = Vec::new();
+    fn split_leading_binders(&self) -> (Vec<(LBinder, Option<HypProvenance>)>, OblCtx) {
+        let mut binders: Vec<(LBinder, Option<HypProvenance>)> = Vec::new();
         let mut remaining = self.clone();
         let mut hyp_counter: usize = 0;
         let mut saw_binder = false;
         loop {
             match remaining.frames.front() {
                 Some(CtxFrame::Binder(b)) => {
-                    binders.push(b.clone());
+                    binders.push((b.clone(), None));
                     remaining.frames.pop_front();
                     saw_binder = true;
                 }
-                Some(CtxFrame::Hyp(p)) if saw_binder => {
-                    binders.push(LBinder::explicit(crate::lean_name::LeanName::synthetic(format!("_h_ctx_{}", hyp_counter)), p.clone()));
+                Some(CtxFrame::Hyp(p, prov)) if saw_binder => {
+                    binders.push((
+                        LBinder::explicit(crate::lean_name::LeanName::synthetic(format!("_h_ctx_{}", hyp_counter)), p.clone()),
+                        Some(prov.clone()),
+                    ));
                     hyp_counter += 1;
                     remaining.frames.pop_front();
                 }
@@ -1564,7 +1641,7 @@ impl OblCtx {
         for frame in self.frames.iter().rev() {
             goal = match frame {
                 CtxFrame::Let(name, v) => LExpr::let_bind(name.clone(), v.clone(), goal),
-                CtxFrame::Hyp(_) => goal,
+                CtxFrame::Hyp(..) => goal,
                 CtxFrame::Binder(b) => LExpr::forall(vec![b.clone()], goal),
             };
         }
@@ -1632,6 +1709,7 @@ impl ObligationEmitter {
     ) {
         let (extras, remaining) = obl.split_leading_binders();
         let shape = self.build_goal_shape(&extras, &remaining, &leaf);
+        let extras: Vec<LBinder> = extras.into_iter().map(|(b, _)| b).collect();
         let goal = remaining.wrap(leaf);
         // For user-tactic emission (assert-by), inject explicit
         // `intro <names>;` for any frames that COULDN'T extract to
@@ -1709,6 +1787,7 @@ impl ObligationEmitter {
     fn emit_split(&mut self, name: String, leaf: LExpr, obl: &OblCtx) {
         let (extras, remaining) = obl.split_leading_binders();
         let shape = self.build_goal_shape(&extras, &remaining, &leaf);
+        let extras: Vec<LBinder> = extras.into_iter().map(|(b, _)| b).collect();
         let goal = remaining.wrap(leaf);
         self.emit_with_extras(
             name, goal, obl.closer.clone(), obl.closer_preamble.clone(), extras,
@@ -1730,19 +1809,22 @@ impl ObligationEmitter {
     /// at the core.
     fn build_goal_shape(
         &self,
-        extras: &[LBinder],
+        extras: &[(LBinder, Option<HypProvenance>)],
         remaining: &OblCtx,
         leaf: &LExpr,
     ) -> GoalShape {
         let mut spine: Vec<GoalSpine> = Vec::new();
-        for b in self.base_binders.iter().chain(extras.iter()) {
-            spine.push(GoalSpine::All(b.clone()));
+        for b in self.base_binders.iter() {
+            spine.push(GoalSpine::All(b.clone(), None));
+        }
+        for (b, prov) in extras.iter() {
+            spine.push(GoalSpine::All(b.clone(), prov.clone()));
         }
         for frame in remaining.frames.iter() {
             spine.push(match frame {
                 CtxFrame::Let(name, v) => GoalSpine::Let(name.clone(), v.clone()),
-                CtxFrame::Hyp(p) => GoalSpine::Imp(p.clone()),
-                CtxFrame::Binder(b) => GoalSpine::All(b.clone()),
+                CtxFrame::Hyp(p, prov) => GoalSpine::Imp(p.clone(), prov.clone()),
+                CtxFrame::Binder(b) => GoalSpine::All(b.clone(), None),
             });
         }
         GoalShape { spine, leaf: leaf.clone() }
@@ -1880,7 +1962,7 @@ fn obl_with_choose_hyps(exp: &Exp, ctx: &WpCtx, obl: &OblCtx) -> OblCtx {
     .unwrap_or_default();
     let mut out = obl.clone();
     for h in hyps {
-        out = out.with_frame(CtxFrame::Hyp(h));
+        out = out.with_frame(CtxFrame::Hyp(h, HypProvenance::Other));
     }
     out
 }
@@ -1931,18 +2013,28 @@ fn walk_obligations<'a>(
             e.emit_split(name, goal, obl);
             // Reuse cond_ast for the body's hypothesis frame —
             // rendering is deterministic, so re-running it on the
-            // same Exp would only repeat work.
-            let new_obl = obl.with_frame(CtxFrame::Hyp(cond_ast));
+            // same Exp would only repeat work. Provenance: a passed
+            // Termination assert carried forward IS the woven
+            // height-decrease fact (Link-discharge L1).
+            let prov = if matches!(kind, AssertKind::Obligation(ObligationKind::Termination)) {
+                HypProvenance::HeightFact
+            } else {
+                HypProvenance::Other
+            };
+            let new_obl = obl.with_frame(CtxFrame::Hyp(cond_ast, prov));
             walk_obligations(body, ctx, &new_obl, e);
         }
         Wp::Assume(p, body) => {
             // No theorem; the assumption just enters the context.
             // B2b: witness facts for chooses inline in the assumption.
             let obl = &obl_with_choose_hyps(p.raw(), ctx, obl);
-            let new_obl = obl.with_frame(CtxFrame::Hyp(lower_validated_with_ctx(
-                p,
-                &ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs),
-            )));
+            let new_obl = obl.with_frame(CtxFrame::Hyp(
+                lower_validated_with_ctx(
+                    p,
+                    &ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs),
+                ),
+                HypProvenance::Other,
+            ));
             walk_obligations(body, ctx, &new_obl, e);
         }
         Wp::Hyp { hyp, body } => {
@@ -1950,7 +2042,7 @@ fn walk_obligations<'a>(
             // negation from #114's cond_setup transform). Push as
             // CtxFrame::Hyp directly — same effect as Wp::Assume's
             // arm, minus the `lower` call that already happened.
-            let new_obl = obl.with_frame(CtxFrame::Hyp(hyp.clone()));
+            let new_obl = obl.with_frame(CtxFrame::Hyp(hyp.clone(), HypProvenance::Branch(None)));
             walk_obligations(body, ctx, &new_obl, e);
         }
         Wp::AssertBitVector { req_conj, ens_conj, rust_loc, rust_span, body } => {
@@ -2132,12 +2224,18 @@ fn walk_obligations<'a>(
             );
             walk_obligations(
                 then_branch, ctx,
-                &obl.with_frame(CtxFrame::Hyp(cond_marked.clone())),
+                &obl.with_frame(CtxFrame::Hyp(
+                    cond_marked.clone(),
+                    HypProvenance::Branch(branch_test_of(cond.raw(), true)),
+                )),
                 e,
             );
             walk_obligations(
                 else_branch, ctx,
-                &obl.with_frame(CtxFrame::Hyp(LExpr::not(cond_marked))),
+                &obl.with_frame(CtxFrame::Hyp(
+                    LExpr::not(cond_marked),
+                    HypProvenance::Branch(branch_test_of(cond.raw(), false)),
+                )),
                 e,
             );
         }
@@ -2245,7 +2343,7 @@ fn walk_assert_by_tactus<'a>(
                 e.emit_split(name, goal, obl);
             }
             // Cond as hypothesis for body theorems (reuse cond_ast).
-            let new_obl = obl.with_frame(CtxFrame::Hyp(cond_ast));
+            let new_obl = obl.with_frame(CtxFrame::Hyp(cond_ast, HypProvenance::Other));
             walk_obligations(body, ctx, &new_obl, e);
         }
         None => {
@@ -2435,10 +2533,10 @@ fn walk_loop<'a>(
     let mut maintain_obl = obl.clone();
     push_mod_var_frames(&mut maintain_obl, modified_vars);
     for inv in &entry_invs_marked {
-        maintain_obl.frames.push_back(CtxFrame::Hyp(inv.clone()));
+        maintain_obl.frames.push_back(CtxFrame::Hyp(inv.clone(), HypProvenance::Other));
     }
     if let Some(c) = cond {
-        maintain_obl.frames.push_back(CtxFrame::Hyp(cond_marked(&c)));
+        maintain_obl.frames.push_back(CtxFrame::Hyp(cond_marked(&c), HypProvenance::Branch(None)));
     }
     // `let _tactus_d_old_<id>_<i> := D_i` — one pre-body snapshot
     // per lex level. Referenced by the body's continue_leaf as
@@ -2470,10 +2568,10 @@ fn walk_loop<'a>(
     let mut use_obl = obl.clone();
     push_mod_var_frames(&mut use_obl, modified_vars);
     for inv in &exit_invs_marked {
-        use_obl.frames.push_back(CtxFrame::Hyp(inv.clone()));
+        use_obl.frames.push_back(CtxFrame::Hyp(inv.clone(), HypProvenance::Other));
     }
     if let Some(c) = cond {
-        use_obl.frames.push_back(CtxFrame::Hyp(LExpr::not(cond_marked(&c))));
+        use_obl.frames.push_back(CtxFrame::Hyp(LExpr::not(cond_marked(&c)), HypProvenance::Branch(None)));
     }
     walk_obligations(after, ctx, &use_obl, e);
 }
@@ -2518,7 +2616,7 @@ fn push_mod_var_frames<'a>(
         mod_names.iter().map(|n| n.as_str()).collect();
     obl.frames.retain(|frame| match frame {
         CtxFrame::Let(name, _) => !mod_names.contains(name),
-        CtxFrame::Hyp(p) => !mod_name_strs.iter()
+        CtxFrame::Hyp(p, _) => !mod_name_strs.iter()
             .any(|n| crate::lean_ast::mentions_free_var(p, n)),
         CtxFrame::Binder(_) => true,
     });
@@ -2530,7 +2628,7 @@ fn push_mod_var_frames<'a>(
         let name = crate::lean_name::LeanName::from_var_ident(ident);
         obl.frames.push_back(CtxFrame::Binder(LBinder::explicit(name.clone(), typ_to_expr(typ))));
         if let Some(pred) = type_bound_predicate(&LExpr::var(name.clone()), typ) {
-            obl.frames.push_back(CtxFrame::Hyp(pred));
+            obl.frames.push_back(CtxFrame::Hyp(pred, HypProvenance::Other));
         }
         // Ledger the binder's typ (the ∀-binder IS the storage truth):
         // without an entry, typed-spine Var lookups inside the loop's
@@ -3311,7 +3409,9 @@ fn push_post_call_frames(
         )
     });
     let (dest_value, use_dest_name) =
-        push_ret_frames(substituted_ensures, eq_extraction, callee, subst, dest, &mut new_obl);
+        push_ret_frames(
+            substituted_ensures, eq_extraction, callee, subst, dest,
+            Some(build_call_fact_info(callee, subst, e)), &mut new_obl);
 
     // Phase 4.
     push_mut_rebinds(callee, subst, &mut new_obl);
@@ -3448,7 +3548,7 @@ fn push_mut_arg_binders(
             info.fresh.clone(), typ.clone(),
         ).into_slot(&inner_typ);
         if let Some(pred) = type_bound_predicate(&inner_form, typ) {
-            new_obl.frames.push_back(CtxFrame::Hyp(pred));
+            new_obl.frames.push_back(CtxFrame::Hyp(pred, HypProvenance::Other));
         }
     }
 }
@@ -3479,7 +3579,7 @@ fn push_prophecy_frames(
         let inner_form = crate::typed_expr::TypedExpr::var(rp.var.clone(), ret_typ.clone())
             .into_slot(&rp.inner_typ);
         if let Some(pred) = type_bound_predicate(&inner_form, ret_typ) {
-            new_obl.frames.push_back(CtxFrame::Hyp(pred));
+            new_obl.frames.push_back(CtxFrame::Hyp(pred, HypProvenance::Other));
         }
         if let Some(d) = dest {
             new_obl.register_prophecy(d, rp.var.clone());
@@ -3799,14 +3899,70 @@ fn vir_find_ret_eq<'a>(ensures: &[&'a Expr], subst: &CallSubstitutions) -> Optio
 /// conservative fallback: `coerce_lexpr` bridges E to the dest's
 /// declared render sort unconditionally for integer rets. `None` →
 /// the ∀-path, with `substituted_ensures` the full conjunction.
+/// Build the Link-discharge spine entry for one call (L1,
+/// DESIGN-link-discharge.md §3.1). Args are the ENSURES-path
+/// instantiation (what the woven fact was rendered with) in callee
+/// param order; tags classify each arg for the bound-hyp discharge
+/// recipe (caller param binder / literal / expr). Pure provenance —
+/// never affects the rendered theorem.
+fn build_call_fact_info(
+    callee: &FunctionX,
+    subst: &CallSubstitutions,
+    e: &ObligationEmitter,
+) -> CallFactInfo {
+    let args = callee
+        .params
+        .iter()
+        .map(|p| {
+            let pname = crate::lean_name::LeanName::from_var_ident(&p.x.name);
+            match subst.ens_value_subst.get(&pname) {
+                // The subst stores the arg at its ACTUAL typ; the ensures
+                // renderer coerces per use-site (U2). The instantiation the
+                // woven fact was rendered with is the arg AT THE PARAM'S
+                // typ — apply the same bridge (identity when they match).
+                Some((lexpr, actual_typ)) => {
+                    let coerced = crate::expr_shared::coerce_lexpr(
+                        lexpr.clone(), actual_typ, &p.x.typ);
+                    SpineArg {
+                    text: crate::lean_pp::pp_expr(&coerced),
+                    tag: match &coerced.node {
+                        ExprNode::Var(n)
+                            if e.base_binders.iter().any(|b| b.name.as_ref() == Some(n)) =>
+                        {
+                            SpineArgTag::CallerParam(n.as_str().to_string())
+                        }
+                        ExprNode::Lit(_) => SpineArgTag::Literal,
+                        _ => SpineArgTag::Expr,
+                    },
+                }},
+                // A param the ensures path never keyed — record a hole;
+                // the generator censuses it rather than guessing.
+                None => SpineArg {
+                    text: format!("_tactus_spine_unresolved_{}", pname.as_str()),
+                    tag: SpineArgTag::Expr,
+                },
+            }
+        })
+        .collect();
+    let callee_name = crate::to_lean_type::lean_name_relative(&callee.name.path);
+    CallFactInfo { is_self: callee_name == e.fn_name, callee: callee_name, args }
+}
+
 fn push_ret_frames(
     substituted_ensures: Option<LExpr>,
     eq_extraction: Option<(LExpr, Typ)>,
     callee: &FunctionX,
     subst: &CallSubstitutions,
     dest: Option<&VarIdent>,
+    call_fact: Option<CallFactInfo>,
     new_obl: &mut OblCtx,
 ) -> (LExpr, bool) {
+    // Link-discharge L1: the woven ensures hyp carries this call's
+    // spine entry so the generator can discharge it positionally.
+    let ens_prov = match call_fact {
+        Some(info) => HypProvenance::CallFact(info),
+        None => HypProvenance::Other,
+    };
     let ret = &callee.ret.x;
     // `(raw E, bridged E, rest)`: the BOUND hyp goes on raw E (faithful
     // and strongest — `0 ≤ E` over ℤ is exactly what justifies the
@@ -3879,7 +4035,7 @@ fn push_ret_frames(
             // into a ℕ dest, `0 ≤ E` is exactly the fact that makes
             // the `Int.toNat E` bridge lossless).
             if let Some(pred) = type_bound_predicate(raw_e, &ret.typ) {
-                new_obl.frames.push_back(CtxFrame::Hyp(pred));
+                new_obl.frames.push_back(CtxFrame::Hyp(pred, HypProvenance::Other));
             }
             // The eq clause that gave us E has been dropped from
             // `rest_ensures`. Substitute fresh_ret_name → E in the
@@ -3893,7 +4049,7 @@ fn push_ret_frames(
                 ret_to_e.insert(subst.fresh_ret_name.clone(), bridged_e.clone());
                 let rest_substituted = substitute(rest_ensures, &ret_to_e);
                 if !is_trivial_true(&rest_substituted) {
-                    new_obl.frames.push_back(CtxFrame::Hyp(rest_substituted));
+                    new_obl.frames.push_back(CtxFrame::Hyp(rest_substituted, ens_prov.clone()));
                 }
             }
             bridged_e.clone()
@@ -3912,7 +4068,7 @@ fn push_ret_frames(
             if let Some(pred) = type_bound_predicate(
                 &LExpr::var(binder_name.clone()), &ret.typ,
             ) {
-                new_obl.frames.push_back(CtxFrame::Hyp(pred));
+                new_obl.frames.push_back(CtxFrame::Hyp(pred, HypProvenance::Other));
             }
             if let Some(conj) = substituted_ensures {
                 // The ensures references `fresh_ret_name`; when we renamed
@@ -3925,7 +4081,7 @@ fn push_ret_frames(
                 } else {
                     conj
                 };
-                new_obl.frames.push_back(CtxFrame::Hyp(conj));
+                new_obl.frames.push_back(CtxFrame::Hyp(conj, ens_prov.clone()));
             }
             LExpr::var(binder_name.clone())
         }
@@ -4285,9 +4441,15 @@ fn walk_let<'a>(
             )
             .expect("walk_let if-cond: sub of validated Exp tree");
             walk_let(name, then_e, dest_typ, body, ctx,
-                &obl.with_frame(CtxFrame::Hyp(c_ast.clone())), e);
+                &obl.with_frame(CtxFrame::Hyp(
+                    c_ast.clone(),
+                    HypProvenance::Branch(branch_test_of(cond, true)),
+                )), e);
             walk_let(name, else_e, dest_typ, body, ctx,
-                &obl.with_frame(CtxFrame::Hyp(LExpr::not(c_ast))), e);
+                &obl.with_frame(CtxFrame::Hyp(
+                    LExpr::not(c_ast),
+                    HypProvenance::Branch(branch_test_of(cond, false)),
+                )), e);
             return;
         }
         // `let outer := (let z := zval; bodyval); rest`
