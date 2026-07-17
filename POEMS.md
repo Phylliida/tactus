@@ -6,6 +6,7 @@ file for the date the session lands; create a new file when working
 on a new date.
 
 ## Chronological
+- [2026-07-17](poems/2026-07-17.md) — try (the word that eats the sequence; guards live in branch order, not in steps); the machinery you feared needing (a census retiring a sidecar)
 
 - [2026-04-20](poems/2026-04-20.md) — Track B slices 2, 3, 6; loops; review passes; FP refactor
 - [2026-04-24](poems/2026-04-24.md) — #34 renderers; #52/53/49/50/57; #54, #58 (non-int decreases + match automation)
