@@ -27,3 +27,17 @@ or the bridge extension landed with a pinning e2e test and 0 regressions.
 
 **Blocked by:** nothing (re-count is independent; ride mainline-12's re-measure
 for the count if convenient).
+
+## Status update (2026-07-17, after S2c/B4/B6/B10)
+
+The `tmp__` family got a big new data point: factorial's 154:18
+failure was exactly this shape — `let tmp__1 := result; … 0 ≤ tmp__1 *
+(i+1)` with the let-var OPAQUE to omega (context let bindings are
+never unfolded by omega). Fixed in B4's peel (Let case now emits
+`intro <name>; subst <name>` — zeta-substitution), which may heal
+part of the 61. **Re-count first** (as the task says) with the
+current binary: any survivor whose goal has a goal-position `let`
+should be re-tested, because the zeta fix changes that whole family.
+The typed-spine bridge extension remains the fallback for survivors.
+The `=~=`-in-exec-proof-block parse-error item (from the B5b writeup)
+is unverified since — still needs the status check this task asks for.
