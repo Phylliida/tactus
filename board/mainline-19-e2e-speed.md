@@ -46,19 +46,16 @@ crate (tactus-core) gets exactly one verification bucket, so
   results both sides: 141 verified / 0 errors, Link discharge 69
   closed / 0 pending.
 
-## Side-finding (pre-existing on main, filed here for visibility)
+## Side-finding — RETRACTED as observed, see mainline-20
 
-N1 let-hoist emission is NONDETERMINISTIC: the same binary on the same
-input emits the let-form on one run and the hoisted-∀-binder form on
-another (HashMap iteration order somewhere in the hoist decision), and
-the hoist form has a Box coercion bug (`Tree.Node tmp__5.deref` where
-the ctor slot wants `Tactus.Box`). This is what makes the residue-4
-tests flaky rather than stably red/green. Deserves its own board card.
-Where to look: `hoist_all` (sst_to_lean.rs) gates on every `Let` frame
-carrying `Some(typ)` — the flip means the TYPES on those frames come and
-go across runs, so the nondeterminism is upstream in whatever threads
-`binder_typs`/frame types (HashMap iteration order suspect), not in the
-hoist code itself.
+The "same binary flips let-form ↔ hoist-form" observation was
+measurement contamination: the main checkout's release binary was being
+rebuilt by a parallel session between probe runs (the Return→Wp::Let
+work itself). The `.deref` slot bug seen in the "variant" was that
+work's transient dev state, fixed by 52dc41a. Pinned-binary hammering
+shows emission is byte-stable. The REAL (latent) hash-order hazards
+found during the investigation are fixed in c169674 — full story and
+audit in board/mainline-20-emission-determinism.md.
 
 ## Follow-up (not on branch)
 
