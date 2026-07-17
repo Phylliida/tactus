@@ -1,6 +1,6 @@
 ---
 title: "B5 — prelude split: TactusDefs (artifacts) / TactusSearch (dev-only)"
-status: in_progress
+status: done
 claimed_by: kimi
 created: 2026-07-16T17:28:00Z
 updated: 2026-07-16T17:28:00Z
@@ -63,3 +63,38 @@ still importing Search); suite green.
   the shared content-hashed cache dir (oleans rename into place before
   the marker lands; a concurrent reader can rebuild-in-place). Solo
   battery: 10/10. Fix shape: lockfile around ensure_prelude_olean.
+
+## Writeup
+
+**Done-when review:** two-olean build works warm+cold ✓ (cold: the
+hash changed at split time, first gate run built both oleans fresh;
+warm: all subsequent runs reuse); a package-check artifact elaborates
+against TactusDefs only ✓ — 11 of 15 gt pkg files have NO
+TactusSearch import; the 4 that have it are exactly the known
+user-override sites (apply_hom_gen/inv, todd_coxeter ×2), where the
+import is required and intended; suite green at main-line parity ✓
+(138/140, same 2 pre-existing Z3-path state_machines failures).
+
+**What landed:** `TactusPrelude.lean` → `TactusDefs.lean` (vocabulary
++ `#tactus_check_axioms`) + `TactusSearch.lean` (ladder, importing
+Defs). prelude.rs: two source consts, hash over both, two-olean build
+in dependency order, marker = sources + toolchain fingerprint.
+Emission: defs module + standalone headers emit `import TactusDefs`.
+Search import: injected at the `pp_commands` chokepoint exactly when a
+theorem's closer cites a search tactic (comments stripped, whole-word,
+5 names; user texts only — default emission never names them).
+sanity.rs name extraction reads both files; integration test
+concatenates both halves inline.
+
+**Design deviation (recorded):** the task's "imported only in discover
+mode" has no referent post-S2c (there is no discover-mode emission).
+Replacement semantics: Search import appears exactly when a user
+tactic text needs it — the B6 gate claim ("no artifact imports the
+search module") is textually assertable per-file, and 11/15 gt pkg
+files already satisfy it; the 4 exceptions are user-chosen override
+sites (counted residue).
+
+**Follow-up filed (board mainline-18):** `ensure_prelude_olean` has no
+cross-process lock — concurrent tactus runs can race the shared cache
+dir (observed as tutorial flakes during a concurrent gt gate; solo
+runs all green).
