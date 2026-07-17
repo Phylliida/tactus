@@ -754,9 +754,11 @@ pub(crate) fn is_variant_node(variant: &Ident, inner: LExpr) -> ExprNode {
 // visible Lean tactics defined in `TactusPrelude.lean`. Users may
 // reference these in `proof { … }` blocks or via the
 // `#[verifier::tactus_tactic("…")]` attribute. Examples:
-//   `tactus_auto`, `tactus_peel`, `tactus_first`,
+//   `tactus_auto`, `tactus_first`,
 //   `tactus_case_split`, `tactus_usize_bound`.
 // No leading underscore because they're meant to be human-typed.
+// (`tactus_peel` was deleted in B4: the emitter generates the peel
+// structure explicitly instead of calling a recursive macro.)
 //
 // **Convention 4: Bare names in `TactusPrelude.lean`** — axioms /
 // defs that are user-visible but read-only. Examples:
