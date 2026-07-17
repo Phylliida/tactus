@@ -3,7 +3,7 @@ title: "Link discharge — premise-free closed theorems per proof fn (spec: DESI
 status: in_progress
 claimed_by: fable-b73
 created: 2026-07-16T23:30:00Z
-updated: 2026-07-18T09:00:00Z
+updated: 2026-07-18T14:00:00Z
 ---
 
 ## Description
@@ -301,3 +301,34 @@ Danielle (naming / default-on / theorem-vs-def).
   Caller side (link_discharge): resolve wf args by text — param→hwf,
   proj.deref→comp, `lib.g …`→g_wf application (top-level token split),
   ctor→⟨⟩; bounds→(by omega).
+
+- (2026-07-18, fable-b73) **R-c LANDED — 67/67 CLOSED, 0 PENDING. THE
+  LINK DISCHARGE LAYER IS COMPLETE FOR TACTUS-CORE.** Gate: 67 per-fn
+  closed theorems (6 fix + 9 straight-line + 52 zero-spine), crate
+  138/0, vstd 1530/0. The Link module carries 14 generated wf defs
+  (incl. the RawExp mutual block + FnCtxData struct-projection form),
+  11 machine-synthesized preservation lemmas (frame_append, ret_frame,
+  frame_after, havoc_lets, seed_params, seed_binders_hyp_bounds,
+  binders_to_frame, binderprops_to_hyps, loop_maintain_frame,
+  loop_use_frame, seed_frame), ZERO synthesis censuses.
+  What R-c took beyond probe35/36 (all census/gate-guided):
+  - wf_synth.rs: body-isomorphic term synthesis over lean_ast::Expr
+    (spec_fn_to_ast Defs); nullary ctors are Vars; single-conjunct wf
+    clauses bind BARE (no ⟨⟩ pattern — not an inductive); named
+    bound_proof components over `(by omega)` (tactic goals in
+    term-mode match arms POSTPONE outside the arm context — the 686
+    lesson); FieldProj struct projection via .1/.2 conjunct paths.
+  - Two-phase→iterative demand-driven driver: fixpoint → parse
+    wf-transport pendings → closure over body refs → topo synthesis →
+    re-fixpoint, until quiescent.
+  - Caller-side resolve_wf_text: lets-chase (tmp__N), raw projection
+    keys (unboxed RetBind), boxed-var→deref keys, ctor-literal ⟨⟩
+    with resolve_bound_text (comps/h_bounds over omega), depth-aware
+    strip_outer_parens (trim_matches MANGLES nested ctor texts).
+  - Straight-line RETRY LOOP: resolver failures naming own params
+    become own wf hypotheses (corollaries' stm-literal args).
+  - decreasing_by simplified to `all_goals (simp [Dt.height] <;>
+    omega)` — height eqns exist (WF-compiled); term-thm bullets were
+    ILLEGAL anyway (multi-self-call arms ⇒ self-refs in decreasing_by).
+  - Mutual wf SCC emission with per-def termination_by; seed-scan
+    skips non-cycle waiters.
