@@ -53,6 +53,7 @@ pub struct References<'a> {
 pub fn collect_references<'a>(
     spec_fn_map: &HashMap<&Fun, &'a FunctionX>,
     all_fn_map: &HashMap<&Fun, &'a FunctionX>,
+    all_fns: &[&'a FunctionX],
     proof_fns: &[&'a FunctionX],
 ) -> References<'a> {
     let mut refs = References { datatypes: HashSet::new(), traits: HashSet::new() };
@@ -64,7 +65,7 @@ pub fn collect_references<'a>(
     let mut visited: HashSet<&Fun> = HashSet::new();
     let mut worklist: Vec<&'a Fun> = Vec::new();
     seed_worklist(proof_fns, &mut worklist);
-    seed_impl_proof_method_bodies(all_fn_map, &mut worklist);
+    seed_impl_proof_method_bodies(all_fns, all_fn_map, &mut worklist);
     while let Some(fun) = worklist.pop() {
         if visited.contains(fun) { continue; }
         visited.insert(fun);
@@ -198,11 +199,16 @@ pub fn order_spec_fns<'a>(
     proof_fns: &[&'a FunctionX],
 ) -> Vec<FnGroup<'a>> {
     let mut needed: HashSet<&Fun> = HashSet::new();
-    let mut edges: HashMap<&'a Fun, HashSet<&'a Fun>> = HashMap::new();
+    // Edge lists are Vec (insertion order = deterministic AST-walk
+    // order), NOT HashSet: Tarjan's DFS follows neighbor order, and
+    // hash-set iteration order varies per process (RandomState), which
+    // shuffled SCC output — and with it emitted defs order — across
+    // otherwise-identical runs.
+    let mut edges: HashMap<&'a Fun, Vec<&'a Fun>> = HashMap::new();
     let mut worklist: Vec<&'a Fun> = Vec::new();
 
     seed_worklist(proof_fns, &mut worklist);
-    seed_impl_proof_method_bodies(all_fn_map, &mut worklist);
+    seed_impl_proof_method_bodies(all_fns, all_fn_map, &mut worklist);
 
     while let Some(fun) = worklist.pop() {
         if needed.contains(fun) { continue; }
@@ -217,8 +223,11 @@ pub fn order_spec_fns<'a>(
             for c in &callees {
                 if !needed.contains(c) { worklist.push(c); }
             }
+            // Dedup preserving first-occurrence order (the HashSet this
+            // replaced deduped too, but with unstable iteration order).
+            let mut seen_callees: HashSet<&Fun> = HashSet::new();
             edges.insert(fun, callees.into_iter()
-                .filter(|c| spec_fn_map.contains_key(c))
+                .filter(|c| spec_fn_map.contains_key(c) && seen_callees.insert(*c))
                 .collect());
         } else if let Some(f) = all_fn_map.get(fun) {
             // Exec/proof callee: walk inlined require/ensure clauses
@@ -461,10 +470,16 @@ fn seed_worklist<'a>(proof_fns: &[&'a FunctionX], worklist: &mut Vec<&'a Fun>) {
 /// Over-emitting spec fn defs is harmless: they're inert dead code
 /// in the preamble if nothing else references them.
 fn seed_impl_proof_method_bodies<'a>(
+    all_fns: &[&'a FunctionX],
     all_fn_map: &HashMap<&Fun, &'a FunctionX>,
     worklist: &mut Vec<&'a Fun>,
 ) {
-    for (_, f) in all_fn_map {
+    // Iterate the slice, not `all_fn_map`: map iteration order varies
+    // per process and would leak into worklist order. (Downstream
+    // consumers re-order deterministically today, but a deterministic
+    // seed keeps that from being load-bearing.)
+    let _ = all_fn_map;
+    for f in all_fns {
         if !matches!(f.kind, FunctionKind::TraitMethodImpl { .. }) { continue; }
         if !matches!(f.mode, Mode::Proof) { continue; }
         // Always walk ensures — these reach into the class field
@@ -509,15 +524,23 @@ pub fn order_datatypes<'a>(
         .collect();
 
     // Build edges: A → B for every B referenced in A's field types
-    // (including self).
-    let mut edges: HashMap<&'a Path, HashSet<&'a Path>> = HashMap::new();
-    for (a_path, dt) in &dt_by_path {
-        let mut deps: HashSet<&'a Path> = HashSet::new();
+    // (including self). Edge lists are Vec in deterministic walk order,
+    // deduped via a side set — Tarjan follows neighbor order, and
+    // hash-set iteration order varies per process (see the fn-graph
+    // twin above).
+    let mut edges: HashMap<&'a Path, Vec<&'a Path>> = HashMap::new();
+    for dt in referenced_datatypes.iter() {
+        let a_path = match &dt.name {
+            Dt::Path(p) => p,
+            Dt::Tuple(_) => continue,
+        };
+        let mut deps: Vec<&'a Path> = Vec::new();
+        let mut seen: HashSet<&'a Path> = HashSet::new();
         for variant in dt.variants.iter() {
             for field in variant.fields.iter() {
                 walk_typ_paths(&field.a.0, &mut |p: &'a Path| {
-                    if dt_by_path.contains_key(p) {
-                        deps.insert(p);
+                    if dt_by_path.contains_key(p) && seen.insert(p) {
+                        deps.push(p);
                     }
                 });
             }
@@ -818,7 +841,7 @@ pub(crate) fn collect_fun_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a Fun>) {
 /// a 60-line algorithm.
 fn tarjan_scc_path<'a>(
     nodes: &[&'a Path],
-    edges: &HashMap<&'a Path, HashSet<&'a Path>>,
+    edges: &HashMap<&'a Path, Vec<&'a Path>>,
 ) -> Vec<Vec<&'a Path>> {
     struct State<'a> {
         counter: usize,
@@ -831,7 +854,7 @@ fn tarjan_scc_path<'a>(
 
     fn visit<'a>(
         v: &'a Path,
-        edges: &HashMap<&'a Path, HashSet<&'a Path>>,
+        edges: &HashMap<&'a Path, Vec<&'a Path>>,
         s: &mut State<'a>,
     ) {
         s.index.insert(v, s.counter);
@@ -882,7 +905,7 @@ fn tarjan_scc_path<'a>(
 /// Tarjan's SCC algorithm using borrowed `&Fun` references. Zero Arc clones.
 fn tarjan_scc<'a>(
     fns: &[&'a FunctionX],
-    edges: &HashMap<&'a Fun, HashSet<&'a Fun>>,
+    edges: &HashMap<&'a Fun, Vec<&'a Fun>>,
 ) -> Vec<Vec<&'a Fun>> {
     struct State<'a> {
         counter: usize,
@@ -895,7 +918,7 @@ fn tarjan_scc<'a>(
 
     fn visit<'a>(
         v: &'a Fun,
-        edges: &HashMap<&'a Fun, HashSet<&'a Fun>>,
+        edges: &HashMap<&'a Fun, Vec<&'a Fun>>,
         s: &mut State<'a>,
     ) {
         s.index.insert(v, s.counter);
