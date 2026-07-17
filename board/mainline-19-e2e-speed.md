@@ -41,7 +41,10 @@ crate (tactus-core) gets exactly one verification bucket, so
 - e2e suite: 218s baseline (main binary, direct) → **119s**, CPU 81 →
   50 min. 547/4 — the 4 = the known squeeze residue-4 set, 0 regressions.
 - 6-fn crate, debug: 50.2s → 12.5s.
-- tactus-core cold release comparison: in progress at time of writing.
+- tactus-core cold release (`--lean-backend --lean-all-proofs`, fresh
+  TACTUS_LEAN_OUT): main 7m45s → branch **1m31s** (5.1x), identical
+  results both sides: 141 verified / 0 errors, Link discharge 69
+  closed / 0 pending.
 
 ## Side-finding (pre-existing on main, filed here for visibility)
 
