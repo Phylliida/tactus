@@ -199,6 +199,25 @@ Wins beyond transparency: each subgoal gets its own tactic position, so sourcema
 spans point at the *specific* conjunct that failed rather than at a macro
 invocation — better error UX for free. The macro is then deleted from the prelude.
 
+**LANDED (2026-07-17, mainline-07).** `render_peel` in
+`lean_verify/src/tactic_select.rs` walks the goal tree and emits the intro/refine
+prefix: `intro` per ∀ binder / antecedent / goal-let (with anonymous-constructor
+patterns for ∧/×-typed hypotheses), then `refine ⟨by <leaf>, …⟩` mirroring the
+conjunction tree exactly (flattening picks the right-nested reading, so
+left-nested trees must be mirrored). Used by S1's `PeelOmega` and as the second
+branch of the derived closer:
+`first | rfl | decide | omega | (<explicit peel>; first | rfl | decide | omega)
+| (simp_all only [CORE] <;> omega)`.
+The kernel ladder runs FIRST so prefix-transformed goals (user proof text
+consuming the statement's wrappers) close there — the branch order is the guard,
+making the peel steps safely unguarded. Two designs were falsified on the way:
+`try`-guards (`try` takes the following tactic *sequence* as its argument and
+no-ops the whole chain) and newline-separated steps (breaks `first`-alternative
+layout). The macro is deleted from `TactusPrelude.lean`; sanity allowlists and
+gt's 4 S2c residue overrides updated. Validated: gt gate 3116/0, tutorial 10/10,
+suite 138/140 (= main-line), false-conjunct probe reports the specific conjunct's
+Rust span.
+
 ---
 
 ## 5. Prelude split
