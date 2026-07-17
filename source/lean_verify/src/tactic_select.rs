@@ -251,21 +251,50 @@ pub(crate) fn derived_closer(
     binders: &[Binder],
     user_prefix: bool,
 ) -> String {
-    // `with_reducible rfl`, not bare `rfl`: full-delta rfl on a goal
-    // containing casts of STUCK match applications (abstract
-    // scrutinees) recurses past maxRecDepth, and that exception is
-    // NOT recoverable by `first` — the whole chain aborts even though
-    // a later arm (omega) closes the goal (sum_vals, typed-renderer
-    // adversarial probes). Reducible-transparency rfl fails fast and
-    // catchably on stuck terms; the delta power bare rfl provided is
-    // covered by the structural rung's goal-mentioned spec-fn
-    // unfolds.
+    // Which `rfl` the kernel ladder gets is DERIVED from the goal's
+    // core shape (after peeling the ∀/let/→ spine):
+    //
+    // * Plain `Eq`/`Iff`/`Ne` core → bare `rfl`. One-step unfold
+    //   lemmas of RECURSIVE spec fns on constructor args (tactus-core's
+    //   u_* ladder: `wp_stm f (Assert o h) = Cons (close_e f o) Nil`)
+    //   close ONLY by full-delta defeq — kernel iota handles the
+    //   rec_1/PProd encoding that simp's equation generation cannot
+    //   ("invalid projection"), so no simp arm can substitute.
+    //
+    // * Anything else (∧/∨/comparison cores) → `with_reducible rfl`.
+    //   Full-delta rfl on an ∧-of-arithmetic goal with casts of stuck
+    //   match applications recurses past maxRecDepth, and that
+    //   exception is NOT recoverable by `first` — the whole chain
+    //   aborts even though a later arm (omega) closes the goal
+    //   (sum_vals, typed-renderer adversarial probes). Reducible rfl
+    //   fails fast and catchably there, and non-equation goals never
+    //   needed delta rfl.
+    let rfl_form = if goal_core_is_equation(goal) { "rfl" } else { "with_reducible rfl" };
+    let kernel = format!("first | {} | decide | omega", rfl_form);
     format!(
-        "first | with_reducible rfl | decide | omega | ({}) | ({}) | ({})",
-        render_peel(goal, "first | with_reducible rfl | decide | omega"),
+        "first | {} | decide | omega | ({}) | ({}) | ({})",
+        rfl_form,
+        render_peel(goal, &kernel),
         core_simp(),
         structural_rung(goal, dts, binders, user_prefix)
     )
+}
+
+/// True when the goal's core — after peeling the leading ∀-binder /
+/// goal-let / implication spine — is a bare equation (`Eq`/`Iff`/`Ne`).
+/// Decides which `rfl` the derived kernel ladder uses; see the caller.
+fn goal_core_is_equation(goal: &Expr) -> bool {
+    let mut cur = goal;
+    loop {
+        match &cur.node {
+            ExprNode::SpanMark { inner, .. } => cur = inner,
+            ExprNode::Forall { body, .. } => cur = body,
+            ExprNode::Let { body, .. } => cur = body,
+            ExprNode::BinOp { op: BinOp::Implies, rhs, .. } => cur = rhs,
+            ExprNode::BinOp { op: BinOp::Eq | BinOp::Iff | BinOp::Ne, .. } => return true,
+            _ => return false,
+        }
+    }
 }
 
 /// Name inventory of the `@[simp]` defs the datatype emission
