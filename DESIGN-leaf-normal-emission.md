@@ -239,15 +239,20 @@ its absence is how the S2c regression shipped.
 > Bonus: cross_crate_probe_5 promoted Err→Ok — the axiomatic-Seq gap
 > its 2026-05-12 comment predicted would close, closed.
 >
-> **Remaining (1): `vec_field_index_clone`** — the postcondition
-> needs Seq EXTENSIONALITY: the clone call's ensures gives pointwise
-> `cloned Int (index (view tmp__1) i) (index (view (mk tmp__3)) i)`
-> + equal lens, and the `=~= ==> ==` bridge conjunct renders
-> vacuously as `A → A` (both sides render as Lean `Eq`). Closing
-> needs axiom_seq_ext instantiation from pointwise facts — Z3 did
-> this by broadcast E-matching; a derived closer needs the CALL
-> provenance (which ensures shape landed) to emit the ext step.
-> First real customer for N3.
+> **Remaining (1): `vec_field_index_clone`** — diagnosis CORRECTED
+> and pinned with a machine-checked witness, see
+> `BUG-vecfield-clone-ensures.md` + `probe-vecfield-clone/`. NOT an
+> extensionality gap: `axiom_seq_ext_equal` is in the haves and (via
+> the `=~=`→`Eq` collapse) renders as full extensionality — a 20-line
+> hand proof closes the theorem given ONE extra fact,
+> `strictly_cloned Int a b → a = b`. That fact is unrecoverable
+> today: `strictly_cloned`'s body is `call_ensures(T::clone, …)`,
+> and BuiltinSpecFun bodies are deliberately axiomatized (no Lean
+> encoding). Blocking arc = call_ensures/trait-ensures encoding
+> (B6-adjacent); secondary = an ext-capable closer step (N3
+> provenance script or Seq-eq structural-rung extension) since
+> simp_all+omega cannot do the ∀-instantiation/disjunction/ext dance
+> even with the fact granted (second probe).
 
 ## 3a-old. Residue notebook (squeeze debt, 4 e2e tests)
 
