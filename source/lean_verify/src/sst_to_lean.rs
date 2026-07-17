@@ -324,6 +324,11 @@ pub struct WpCtx<'a> {
     /// `Var(borrow_mut_local)` in arg position (no surrounding
     /// `Loc`) as a valid mut target.
     pub mut_ref_locals: HashSet<String>,
+    /// Declared datatypes by path (N2 match splitting,
+    /// DESIGN-leaf-normal-emission.md §2): `branch_ctor_frames` looks
+    /// up variant field lists here to upgrade a positive `IsVariant`
+    /// branch hypothesis into field binders + a constructor equation.
+    pub datatypes: HashMap<&'a vir::ast::Path, &'a vir::ast::DatatypeX>,
     /// Map from a BorrowMut local's sanitized name to the user-local
     /// `VarIdent` it bridges. Populated by walking the SST body
     /// looking for `Assign(user_local, Var(borrow_mut_local))` —
@@ -502,6 +507,14 @@ impl<'a> WpCtx<'a> {
             check_exp(&rewritten)?;
         }
         let fn_map: FnMap = krate.functions.iter().map(|f| (&f.x.name, &f.x)).collect();
+        let datatypes: HashMap<&vir::ast::Path, &vir::ast::DatatypeX> = krate
+            .datatypes
+            .iter()
+            .filter_map(|d| match &d.x.name {
+                vir::ast::Dt::Path(p) => Some((p, &d.x)),
+                _ => None,
+            })
+            .collect();
         // RenderCtx with the fn_map for class-method-call coercion at
         // trait dispatch sites in the ensures rendering below (cross-crate
         // trait method decls aren't in fn_map and gracefully fall back to
@@ -571,6 +584,7 @@ impl<'a> WpCtx<'a> {
         );
         Ok(Self {
             fn_map,
+            datatypes,
             type_map,
             assert_by_var_typs,
             ret_name,
@@ -705,7 +719,147 @@ pub(crate) fn peel_value_position(e: &Exp) -> &Exp {
 /// value-position wrappers. `positive` comes from the caller (then-
 /// vs else-path — the walker negates at the push site, the Exp is
 /// always the positive test). `None` = not a variant test (plain if).
+/// Rich result of peeling a branch condition down to an `IsVariant`
+/// discriminator: everything `BranchTest` records plus the borrowed
+/// pieces `branch_ctor_frames` needs (the variant ident to find the
+/// field list, the scrutinee's instantiated typ for generic field
+/// substitution).
+struct BranchIsVariant<'e> {
+    dt_path: &'e vir::ast::Path,
+    variant: &'e str,
+    scrut: crate::lean_name::LeanName,
+    scrut_typ: &'e Typ,
+    /// The peeled scrutinee expression itself — `branch_ctor_frames`
+    /// LOWERS this through the walk's render ctx to build the
+    /// equation's LHS (a `&T` scrutinee renders as `x.deref`; hand-
+    /// building `Var(x)` would equate the Ref with the constructor).
+    inner: &'e Exp,
+    positive: bool,
+}
+
 fn branch_test_of(cond: &Exp, positive: bool) -> Option<crate::lean_ast::BranchTest> {
+    let p = branch_isvariant_of(cond, positive)?;
+    Some(crate::lean_ast::BranchTest {
+        scrutinee: p.scrut.as_str().to_string(),
+        datatype: crate::to_lean_type::lean_name_relative(p.dt_path),
+        variant: p.variant.to_string(),
+        positive: p.positive,
+    })
+}
+
+/// N2 match splitting, v1 slice (DESIGN-leaf-normal-emission.md §2):
+/// upgrade a POSITIVE `IsVariant` branch hypothesis into constructor
+/// form — field binders + the equation `scrut = Dt.Variant f0 f1 …` —
+/// instead of the opaque discriminator proposition `scrut.is<V>`.
+///
+/// The two forms are equivalent (`isV s ↔ ∃ fs, s = V fs`, and
+/// `(∃x, P x) → G ≡ ∀x, P x → G`), but the equation is leaf-normal:
+/// simp substitutes the constructor application everywhere the
+/// scrutinee occurs, so generated accessors / discriminators / height
+/// equation lemmas reduce without an in-tactic `cases`. Under N1
+/// hoisting the field binders and the equation land as theorem-level
+/// binders directly.
+///
+/// Returns `None` (caller keeps the plain hypothesis) when:
+/// * the condition does not peel to a positive `IsVariant` on a plain
+///   `Var` scrutinee;
+/// * the datatype is not in the krate map (external) or is a
+///   single-variant STRUCT (renders as a Lean `structure`; its
+///   "constructor" is `.mk` and matches on it don't produce
+///   discriminator chains anyway);
+/// * the scrutinee's typ does not expose the instantiation args
+///   (needed to substitute generic field typs).
+fn branch_ctor_frames(
+    cond: &Exp,
+    ctx: &WpCtx,
+    obl: &OblCtx,
+) -> Option<Vec<CtxFrame>> {
+    use crate::lean_name::LeanName;
+    let p = branch_isvariant_of(cond, true)?;
+    if !p.positive {
+        // Polarity flipped by an odd number of `Not`s — the then-arm
+        // of this if is the NEGATIVE test; no constructor to equate.
+        return None;
+    }
+    let dx = ctx.datatypes.get(p.dt_path)?;
+    let short = crate::to_lean_type::short_name(p.dt_path);
+    if dx.variants.len() == 1 && dx.variants[0].name.as_str() == short {
+        return None;
+    }
+    let variant = dx.variants.iter().find(|v| v.name.as_str() == p.variant)?;
+    // Instantiated typ args from the scrutinee's typ. Wrapper
+    // decorations (Ref/MutRef/Box/Rc/Arc — the ones `typ_to_expr`
+    // renders as distinct `Tactus.*` types) each add one `.deref`
+    // projection on the equation's LHS: the scrutinee VALUE is the
+    // wrapper, the constructor equation is about the wrapped
+    // datatype (matching the `x.deref.<accessor>` chains the arm
+    // body renders). Transparent decorations (Ghost/Tracked/Never/
+    // ConstPtr) and `Boxed` (poly coercion) project nothing.
+    let mut sty: &Typ = p.scrut_typ;
+    let mut derefs: usize = 0;
+    let typ_args = loop {
+        match &**sty {
+            vir::ast::TypX::Decorate(deco, _, t) => {
+                use vir::ast::TypDecoration::*;
+                match deco {
+                    Ref | MutRef | Box | Rc | Arc => derefs += 1,
+                    Ghost | Tracked | Never | ConstPtr => {}
+                }
+                sty = t;
+            }
+            vir::ast::TypX::Boxed(t) => sty = t,
+            vir::ast::TypX::Datatype(vir::ast::Dt::Path(sp), args, _)
+                if sp == p.dt_path =>
+            {
+                break args;
+            }
+            _ => return None,
+        }
+    };
+    let dt_lean = crate::to_lean_type::lean_name(p.dt_path);
+    let var_san = crate::to_lean_type::sanitize(p.variant);
+    let mut frames: Vec<CtxFrame> = Vec::new();
+    let mut args: Vec<LExpr> = Vec::new();
+    for f in variant.fields.iter() {
+        let fty = vir::sst_util::subst_typ_for_datatype(
+            &dx.typ_params, typ_args, &f.a.0,
+        );
+        let fname = LeanName::synthetic(format!(
+            "{}_{}", p.scrut.as_str(), crate::to_lean_fn::field_name(&f.name),
+        ));
+        frames.push(CtxFrame::Binder(LBinder::explicit(
+            fname.clone(),
+            crate::to_lean_type::typ_to_expr(&fty),
+        )));
+        args.push(LExpr::var(fname));
+    }
+    let ctor = LExpr::var_synthetic(format!("{}.{}", dt_lean, var_san));
+    let app = if args.is_empty() { ctor } else { LExpr::app(ctor, args) };
+    // Equation LHS: the scrutinee lowered exactly as the condition
+    // itself would be — a `&T` scrutinee renders `x.deref`, matching
+    // the accessor chains in the arm body.
+    let mut lhs = sst_exp_to_ast_checked_with_ctx(
+        p.inner,
+        &ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs),
+    )
+    .ok()?;
+    for _ in 0..derefs {
+        lhs = LExpr::field_proj(lhs, "deref");
+    }
+    let eq = LExpr::span_mark(
+        format_rust_loc(&cond.span),
+        Some(cond.span.clone()),
+        AssertKind::Hypothesis(HypothesisKind::BranchCondition),
+        LExpr::eq(lhs, app),
+    );
+    frames.push(CtxFrame::Hyp(
+        eq,
+        HypProvenance::Branch(branch_test_of(cond, true)),
+    ));
+    Some(frames)
+}
+
+fn branch_isvariant_of(cond: &Exp, positive: bool) -> Option<BranchIsVariant<'_>> {
     // Fixpoint-peel every transparent wrapper the SST may interpose
     // (Loc, Box/Unbox, CoerceMode, Trigger, CustomErr spans) and fold
     // an explicit `Not` into the polarity — the lowered-match chain
@@ -743,21 +897,21 @@ fn branch_test_of(cond: &Exp, positive: bool) -> Option<crate::lean_ast::BranchT
     }
     match &peeled.x {
         ExpX::UnaryOpr(UnaryOpr::IsVariant { datatype, variant }, inner) => {
-            let dt = match datatype {
-                vir::ast::Dt::Path(p) => crate::to_lean_type::lean_name_relative(p),
+            let dt_path = match datatype {
+                vir::ast::Dt::Path(p) => p,
                 _ => return None,
             };
             let inner = peel_transparent(inner);
             let scrut = match &inner.x {
-                ExpX::Var(v) => {
-                    crate::lean_name::LeanName::from_var_ident(v).as_str().to_string()
-                }
+                ExpX::Var(v) => crate::lean_name::LeanName::from_var_ident(v),
                 _ => return None,
             };
-            Some(crate::lean_ast::BranchTest {
-                scrutinee: scrut,
-                datatype: dt,
-                variant: variant.to_string(),
+            Some(BranchIsVariant {
+                dt_path,
+                variant,
+                scrut,
+                scrut_typ: &inner.typ,
+                inner,
                 positive,
             })
         }
@@ -2518,14 +2672,23 @@ fn walk_obligations<'a>(
                     &ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs),
                 ),
             );
-            walk_obligations(
-                then_branch, ctx,
-                &obl.with_frame(CtxFrame::Hyp(
+            // N2: positive IsVariant tests upgrade to field binders +
+            // a constructor equation (leaf-normal); other conditions
+            // keep the plain hypothesis.
+            let then_obl = match branch_ctor_frames(cond.raw(), ctx, obl) {
+                Some(frames) => {
+                    let mut o = obl.clone();
+                    for f in frames {
+                        o = o.with_frame(f);
+                    }
+                    o
+                }
+                None => obl.with_frame(CtxFrame::Hyp(
                     cond_marked.clone(),
                     HypProvenance::Branch(branch_test_of(cond.raw(), true)),
                 )),
-                e,
-            );
+            };
+            walk_obligations(then_branch, ctx, &then_obl, e);
             walk_obligations(
                 else_branch, ctx,
                 &obl.with_frame(CtxFrame::Hyp(
@@ -4738,11 +4901,23 @@ fn walk_let<'a>(
                 &ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs),
             )
             .expect("walk_let if-cond: sub of validated Exp tree");
-            walk_let(name, then_e, dest_typ, body, ctx,
-                &obl.with_frame(CtxFrame::Hyp(
+            // N2: same constructor-equation upgrade as the
+            // statement-level if (value-position discriminator forks
+            // come from lowered matches in let RHSs).
+            let then_obl = match branch_ctor_frames(cond, ctx, obl) {
+                Some(frames) => {
+                    let mut o = obl.clone();
+                    for f in frames {
+                        o = o.with_frame(f);
+                    }
+                    o
+                }
+                None => obl.with_frame(CtxFrame::Hyp(
                     c_ast.clone(),
                     HypProvenance::Branch(branch_test_of(cond, true)),
-                )), e);
+                )),
+            };
+            walk_let(name, then_e, dest_typ, body, ctx, &then_obl, e);
             walk_let(name, else_e, dest_typ, body, ctx,
                 &obl.with_frame(CtxFrame::Hyp(
                     LExpr::not(c_ast),
