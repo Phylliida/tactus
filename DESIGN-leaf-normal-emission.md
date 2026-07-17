@@ -119,6 +119,25 @@ Emit `let tmp__1 := x; G[tmp__1]` as theorem-level
 
 ### N2 — Match splitting (per-arm theorems with constructor equations)
 
+> **STATUS (2026-07-17, session 2): v1 slice LANDED — suite 547/4,
+> identical to the N1 baseline (0 regressions, 0 residue movement).**
+> Positive IsVariant branch hypotheses now emit as field binders + a
+> constructor equation at both if-fork sites. Probe-driven shape rules
+> that matter: constructor names are crate-qualified (`lean_name`);
+> the equation LHS is the scrutinee LOWERED through the walk's render
+> ctx; each wrapper typ decoration (Ref/MutRef/Box/Rc/Arc) adds one
+> `.deref` projection on the LHS so the equation matches the arm
+> body's accessor chains. Measurement: 84 constructor-equation
+> theorems across the e2e artifacts; structural-rung `cases` targets
+> survive in only 10 files, and the survivors are exactly the
+> not-yet-covered classes — spec-level matches in ensures (goal-
+> position match expressions, not branch forks), `Dt::Tuple`
+> scrutinees, and the mut-ref shadow family (which also has a
+> pre-existing spurious-`.deref` rendering bug, see residue).
+> Tooling note: `cargo build -p lean_verify` does NOT refresh
+> `target-verus/release/verus` — probe runs need `vargo build`, and a
+> mid-suite binary rebuild taints the suite run.
+
 Extend the existing if-split (clamp_low already emits one theorem per branch,
 via `BranchTest`) to expression-level matches and datatype-discriminator ites:
 one theorem per arm, with hypothesis `h : c = Choice.Left x` (fresh binders
