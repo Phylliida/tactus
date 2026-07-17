@@ -1,0 +1,73 @@
+import TactusDefs_lib_exec
+set_option linter.unusedVariables false
+set_option autoImplicit false
+set_option maxRecDepth 8000
+
+-- ══════════════════════════════════════════════════════════════════════
+-- W5f PROBE (board bootstrap-54) — the ADEQUACY SPINE: lift the Val-level
+-- goal denotation `holds` (proven sound at the Val level by W5a–e / probe21–26)
+-- up to the USER-FACING `Prop`s the user actually proves. Proven over the REAL
+-- emitted `lib.wp_stm` / `lib.ref_wp` / `lib.render_exp` / `lib.type_of` /
+-- `lib.needs_nat_coercion` / … (tactus-core/out/lib), NO tactus-core rebuild.
+--
+-- CARRIES OVER the full W5e core (probe26): the frame-carrying `execSafeF` and
+-- the iff soundness theorem `wp_stm_sound : holdsAll (wp_stm f s) st ↔
+-- execSafeF f s st` TOTAL over the whole StmData vocabulary, over an ARBITRARY
+-- frame telescope, with the goal denotation `holds` PARAMETRIC over three
+-- opaque leaf oracles (hp/he/lv). That is W5 v1: soundness at the Val level.
+--
+-- WHAT W5f ADDS (DESIGN-W5-soundness.md §2.1 note + §4 W5f row; master plan
+-- §4.3 "adequacy spine"): W5 v1 states soundness with hp/he/lv OPAQUE. W5f
+-- PINS a concrete interpretation of the leaf oracles and shows the resulting
+-- `holds` denotes the user-facing `Prop`. THE DESIGN DECISION (this probe, cross-
+-- checked w/ Danielle's local model 2026-07-15):
+--
+--   toProp := `holds` with the oracle triple PINNED to concrete interpretations.
+--   The structural arms (Imp/All/Let) then bridge in ONE generic induction; ALL
+--   genuine content concentrates in (a) a concrete leaf denotation `edenote`
+--   and (b) per-user-type binder-embedding lemmas at the All arm. This keeps the
+--   state space from exploding: the spine induction is generic (proved once), and
+--   each user datatype contributes exactly ONE embedding lemma, not a re-proof.
+--
+-- THE SymEnv REALIZATION (why `edenote` is env-grounded, not hardcoded): the
+-- emitted `ExprData.BinOp` opcode is an INTERNED u64 id (the serializer's string
+-- table), NOT a fixed enum — `render_exp` rides it straight through opaquely. So
+-- a FAITHFUL leaf denotation cannot know "op 2 means <" globally; it must ground
+-- the interned ids through a `SymEnv` — exactly the per-crate environment literal
+-- of master plan §4.3 / probe4_denote P4/P5. `edenote (E : SymEnv)` replaces W5's
+-- OPACITY (`he` a free oracle) with concrete LOOKUP (`E.opk`, `E.av`, …); the
+-- SymEnv is a concrete generated literal that kernel-reduces, so the leaf bridge
+-- closes by `rfl`/`simp` (the P4 argument), catching nothing new about
+-- determinism but pinning MEANING.
+--
+-- CO-DESIGN WITH W6 (now DONE): W5 was valuation-parametric precisely so the
+-- oracle interpretation could be DEFERRED (DESIGN-W5-soundness §1, option b). W6
+-- landed `render_exp : RawExp → ExprData` (deep expression rendering). W5f pins
+-- `he := edenote ∘ (id on ExprData)` and consumes W6's `render_exp` as the
+-- data-level bridge: `edenote E (render_exp re)` denotes exactly the user Prop —
+-- so the highest-value silent-unsoundness class (the `as nat` cast / unsigned-
+-- overflow refinement, DESIGN-W6-stageB §2) gets a DENOTATIONAL check here.
+--
+-- THE FOUR W5f FACTS this probe establishes:
+--   1. adequacy_leaf_cmp     : `edenote E (render_exp (x < 10))` denotes exactly
+--      `E.av x st < 10` — over the REAL render_exp (exercises the BinOp arm:
+--      ref-deref balance + nat-coercion decisions, both no-ops here, Bool result).
+--   2. adequacy_leaf_overflow: `edenote E (render_exp (HasType 64 e))` denotes
+--      exactly `0 ≤ E.av e st ∧ E.av e st < 2^64` — over the REAL render_exp
+--      (exercises the G6 unsigned-overflow EXPANSION + `pow2`, the §2 cast class).
+--   3. toProp_all_embed      : the per-user-type binder embedding at the All arm
+--      — the emitted `∀ (n:Int)` goal (Val model quantifies over ALL of Int)
+--      IMPLIES the user-facing `∀ (u:U)` goal for any embedding `emb : U ↪ Int`,
+--      THROUGH the state-thread `upd st x (emb u)` (the model-flagged trap: a
+--      nested leaf reads the bound value; instantiating n := emb u decodes it
+--      correctly). Sound by over-approximation. Composes through nesting.
+--   4. soundness_concrete    : the carried `ref_wp_sound` INSTANTIATED at the
+--      concrete oracle triple — "the emitted goals, read CONCRETELY via edenote,
+--      hold" ⟺ "operational safety". The Val-level drift-detector lifted to
+--      concrete user obligations.
+--
+-- Design + model: DESIGN-W5-soundness.md §2.1/§4 (W5f) + master plan §4.3/§8.5 +
+-- board bootstrap-54. Extends probe26 (W5e). SymEnv shape follows probe4_denote.
+-- ══════════════════════════════════════════════════════════════════════
+
+namespace W5f
