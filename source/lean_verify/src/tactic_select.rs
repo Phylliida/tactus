@@ -43,16 +43,94 @@ pub(crate) enum Selection {
     /// Bare arithmetic goal: `omega`.
     Omega,
     /// Arithmetic goal behind leading ∀ / `let` / `→` wrappers:
-    /// `tactus_peel <;> omega` (peel intros the spine, omega closes).
+    /// explicit intro/refine prefix + `omega` (B4 — no more
+    /// `tactus_peel` macro; the emitter generates the structure).
     PeelOmega,
 }
 
 impl Selection {
-    pub(crate) fn tactic_text(self) -> &'static str {
+    pub(crate) fn tactic_text(self, goal: &Expr) -> String {
         match self {
-            Selection::Omega => "omega",
-            Selection::PeelOmega => "tactus_peel <;> omega",
+            Selection::Omega => "omega".to_string(),
+            Selection::PeelOmega => render_peel(goal, "omega"),
         }
+    }
+}
+
+/// Explicit structural peel (B4, `DESIGN-transparent-automation.md` §4):
+/// the emitter BUILT every goal it closes, so it walks the goal tree and
+/// emits the exact intro/refine sequence — `intro` per ∀ binder /
+/// implication antecedent / goal-position `let` (with anonymous-
+/// constructor patterns for ∧- and ×-typed hypotheses), then a single
+/// `refine ⟨…⟩` mirroring the goal's conjunction tree, each conjunct
+/// closed by a `by <leaf>` block. Replaces the recursive `tactus_peel`
+/// prelude macro: no search, no macro expansion in artifacts, and each
+/// conjunct gets its own tactic position so sourcemap spans point at
+/// the SPECIFIC failing conjunct instead of a macro invocation.
+///
+/// `leaf` is the tactic text applied at each peeled leaf (e.g. `omega`,
+/// or `first | rfl | decide | omega` for the derived closer's kernel
+/// branch). A goal with no peelable structure renders as just `leaf`.
+///
+/// The sequence is `;`-joined on one line and steps are UNGUARDED by
+/// design. Two earlier designs failed empirically (2026-07-17):
+/// `try`-guards are unusable because `try` takes the following tactic
+/// SEQUENCE as its argument (`try (intro _); first | …` no-ops the
+/// whole chain), and newline-separated steps break the layout of
+/// parenthesized `first`-alternatives (whose content must stay indented
+/// past the paren's column). The correct guard is BRANCH ORDER: the
+/// derived closer tries the bare kernel ladder first (`first | rfl |
+/// decide | omega`), so goals a prefix already peeled/transformed close
+/// there; this branch's unguarded steps only run on goals that actually
+/// have the structure the statement says to peel (or fail loudly and
+/// fall through to the CORE branch).
+pub(crate) fn render_peel(goal: &Expr, leaf: &str) -> String {
+    match &goal.node {
+        ExprNode::SpanMark { inner, .. } => render_peel(inner, leaf),
+        ExprNode::Forall { binders, body } => {
+            let mut out: Vec<String> = binders
+                .iter()
+                .map(|b| format!("intro {}", conj_pattern(&b.ty)))
+                .collect();
+            out.push(render_peel(body, leaf));
+            out.join("; ")
+        }
+        ExprNode::Let { body, .. } => {
+            format!("intro _; {}", render_peel(body, leaf))
+        }
+        ExprNode::BinOp { op: BinOp::Implies, lhs, rhs } => {
+            format!("intro {}; {}", conj_pattern(lhs), render_peel(rhs, leaf))
+        }
+        ExprNode::BinOp { op: BinOp::And, .. } => {
+            format!("refine {}", conj_term(goal, leaf))
+        }
+        _ => leaf.to_string(),
+    }
+}
+
+/// Term-level mirror of a goal's conjunction tree: `A ∧ (B ∧ C)` becomes
+/// `⟨by <peel A>, ⟨by <peel B>, by <peel C⟩⟩` — explicit nesting (the
+/// anonymous-constructor flattening picks the right-nested reading
+/// first, so left-nested trees must be mirrored, not flattened).
+fn conj_term(goal: &Expr, leaf: &str) -> String {
+    match &goal.node {
+        ExprNode::SpanMark { inner, .. } => conj_term(inner, leaf),
+        ExprNode::BinOp { op: BinOp::And, lhs, rhs } => {
+            format!("⟨{}, {}⟩", conj_term(lhs, leaf), conj_term(rhs, leaf))
+        }
+        _ => format!("by {}", render_peel(goal, leaf)),
+    }
+}
+
+/// Anonymous-constructor intro pattern mirroring a ∧/×-typed tree:
+/// `(P ∧ Q) ∧ R` → `⟨⟨_, _⟩, _⟩`; plain `_` for other types.
+fn conj_pattern(ty: &Expr) -> String {
+    match &ty.node {
+        ExprNode::SpanMark { inner, .. } => conj_pattern(inner),
+        ExprNode::BinOp { op: BinOp::And | BinOp::Prod, lhs, rhs } => {
+            format!("⟨{}, {}⟩", conj_pattern(lhs), conj_pattern(rhs))
+        }
+        _ => "_".to_string(),
     }
 }
 
@@ -100,11 +178,53 @@ impl Selection {
 /// or spec-fn applications over it stay irelatable (tutorial
 /// fib_iter 123-invariant). 51 lemmas.
 ///
+/// CORE simp list (the fixed normalizer half of the derived closer —
+/// the full derivation rule spec is in `render_peel`'s and
+/// `derived_closer`'s docs; history: census union of 43 + four
+/// probe-tested extensions to 51, MEASUREMENT-s2a §6.1).
+pub(crate) const CORE_SIMP: &str = "simp_all only [Classical.not_forall, Decidable.not_not, Int.add_emod_left, Int.cast_ofNat_Int, Int.natCast_add, Int.neg_add_emod_self, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.sub_zero, Int.toNat_natCast_add_one, Int.zero_add, Int.zero_sub, Int.mul_add, Int.add_mul, Int.toNat_zero, Int.toNat_one, Int.add_sub_cancel, Nat.add_le_add_iff_right, Nat.add_left_cancel_iff, Nat.add_zero, Nat.le_add_left, Nat.le_add_right, Nat.le_refl, Nat.not_le, Nat.not_lt, Nat.reduceLeDiff, Nat.sub_le_iff_le_add, Nat.zero_add, Nat.zero_le, Nat.mul_add, Nat.add_mul, Nat.add_sub_cancel, and_imp, and_self, and_true, eq_iff_iff, forall_const, forall_eq, ge_iff_le, gt_iff_lt, iff_true, imp_false, imp_self, implies_true, not_and, not_exists, not_false_eq_true, Classical.not_imp, not_or, not_true_eq_false, true_and] <;> omega";
+
+/// Marker text written where the DERIVED closer would go when the goal
+/// isn't known yet — the `by(nonlinear_arith)` AssertQuery scope
+/// composes its fallback ONCE per scope but obligations arrive
+/// per-theorem. `emit_with_extras` substitutes `derived_closer(goal)`
+/// for this token at emission. If it ever leaks into an artifact it
+/// fails LOUD (unknown identifier) — substitution is total.
+pub(crate) const DERIVED_MARKER: &str = "tactus_derived_marker__";
+
+/// Derived default closer (S2c of the squeeze arc; decision:
+/// `DESIGN-transparent-automation.md` §3.4; measured basis:
+/// `MEASUREMENT-s2a-derivability.md`). Selected when `tactus_auto`
+/// would run and `select_deterministic` finds no arithmetic-fragment
+/// answer. The ONE derivation rule of the arc (rule budget: one —
+/// Danielle, 2026-07-16):
+///
+///   kernel rungs (rfl / decide — definitional equalities, decidable
+///   atoms), then the explicitly-peeled kernel rungs (B4: the emitter
+///   walks the goal and generates the intro/refine prefix itself —
+///   wrapped goals whose leaf is kernel-closeable after intro; the
+///   prefix is empty on flat goals, making this branch a harmless
+///   duplicate of the first), then the fixed core normalizer with an
+///   omega tail.
+///
+/// Every branch is a decision procedure, a generated structural prefix,
+/// or a FIXED, site-invariant rewrite set: no search, no ambient-scope
+/// reads, named lemmas that break loudly on renames. CORE is the
+/// 51-lemma set documented at CORE_SIMP (validation: 389/397 of the
+/// full Brick-1 pool with only the 8 census-residue failures, covered
+/// by inline proofs — and 0 regressions at every extension step).
+///
 /// Failure semantics: a goal outside every branch fails LOUD at its
 /// named obligation — that is the suggestion signal for an inline
 /// proof, per §3.4. `tactus_auto` remains in the prelude for
 /// discover-mode overrides; it no longer appears in default emission.
-pub(crate) const DERIVED_CLOSER: &str = "first | rfl | decide | (tactus_peel <;> (first | rfl | decide | omega)) | (simp_all only [Classical.not_forall, Decidable.not_not, Int.add_emod_left, Int.cast_ofNat_Int, Int.natCast_add, Int.neg_add_emod_self, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.sub_zero, Int.toNat_natCast_add_one, Int.zero_add, Int.zero_sub, Int.mul_add, Int.add_mul, Int.toNat_zero, Int.toNat_one, Int.add_sub_cancel, Nat.add_le_add_iff_right, Nat.add_left_cancel_iff, Nat.add_zero, Nat.le_add_left, Nat.le_add_right, Nat.le_refl, Nat.not_le, Nat.not_lt, Nat.reduceLeDiff, Nat.sub_le_iff_le_add, Nat.zero_add, Nat.zero_le, Nat.mul_add, Nat.add_mul, Nat.add_sub_cancel, and_imp, and_self, and_true, eq_iff_iff, forall_const, forall_eq, ge_iff_le, gt_iff_lt, iff_true, imp_false, imp_self, implies_true, not_and, not_exists, not_false_eq_true, Classical.not_imp, not_or, not_true_eq_false, true_and] <;> omega)";
+pub(crate) fn derived_closer(goal: &Expr) -> String {
+    format!(
+        "first | rfl | decide | omega | ({}) | ({})",
+        render_peel(goal, "first | rfl | decide | omega"),
+        CORE_SIMP
+    )
+}
 
 /// Names that are known to be Int/Nat-valued (term layer) or
 /// let-bound propositions (prop layer) in the current scope. A bare

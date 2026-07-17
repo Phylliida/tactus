@@ -1781,18 +1781,30 @@ impl ObligationEmitter {
         // DERIVED_CLOSER): kernel rungs + the fixed CORE normalizer,
         // no `tactus_auto` search. User-supplied closers
         // (`tactus_tactic`, bit_vector) are never overridden.
-        let closer = match &closer {
+        let mut closer = match &closer {
             Tactic::Named(n) if n == "tactus_auto" => {
                 match crate::tactic_select::select_deterministic(&goal, &binders) {
-                    Some(sel) => Tactic::Raw(sel.tactic_text().to_string()),
+                    Some(sel) => Tactic::Raw(sel.tactic_text(&goal)),
                     // S2c (§3.4): no fragment answer → the derived
-                    // default closer (kernel rungs + fixed CORE
-                    // normalizer), replacing the `tactus_auto` search.
-                    None => Tactic::Raw(crate::tactic_select::DERIVED_CLOSER.to_string()),
+                    // default closer (kernel rungs + explicit peel +
+                    // fixed CORE normalizer), replacing the
+                    // `tactus_auto` search.
+                    None => Tactic::Raw(crate::tactic_select::derived_closer(&goal)),
                 }
             }
             _ => closer,
         };
+        // AssertQuery scopes compose their fallback before the goal is
+        // known (once per scope, many theorems); the marker they plant
+        // is expanded to the per-goal derived closer here.
+        if let Tactic::Raw(text) = &closer {
+            if text.contains(crate::tactic_select::DERIVED_MARKER) {
+                closer = Tactic::Raw(text.replace(
+                    crate::tactic_select::DERIVED_MARKER,
+                    &crate::tactic_select::derived_closer(&goal),
+                ));
+            }
+        }
         let tactic = self.compose_tactic(closer);
         // Lockstep with `out.push` below: one shape per emitted theorem.
         self.goal_shapes.push(goal_shape);
@@ -2048,16 +2060,15 @@ fn walk_obligations<'a>(
             //   debugging an unprovable goal know to look for
             //   a `proof { }` block, not a misdirected
             //   automation failure.
-            // S2c (§3.4): when the enclosing closer is the DEFAULT
-            // (`tactus_auto`), the fallback slot gets the derived
-            // closer instead — same substitution as the
-            // `emit_with_extras` chokepoint, one composition level
-            // down — so default emission contains no search tactic
-            // even inside `by(nonlinear_arith)` scopes. User-chosen
-            // closers compose through unchanged.
+            // S2c (§3.4) + B4 (§4): when the enclosing closer is the
+            // DEFAULT (`tactus_auto`), the fallback slot gets a marker
+            // that `emit_with_extras` expands into the PER-GOAL derived
+            // closer at emission — the scope composition happens once
+            // but obligations (and their goal shapes) arrive per
+            // theorem. User-chosen closers compose through unchanged.
             let outer = match &obl.closer {
                 Tactic::Named(n) if n == "tactus_auto" => {
-                    format!("({})", crate::tactic_select::DERIVED_CLOSER)
+                    crate::tactic_select::DERIVED_MARKER.to_string()
                 }
                 other => tactic_as_str(other),
             };

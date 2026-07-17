@@ -215,21 +215,104 @@ fn term_bound_let_var_in_eq_ok() {
 
 #[test]
 fn derived_closer_is_search_free_and_census_exact() {
-    // S2c's derived default closer (§3.4): the B6 gate property in
-    // miniature — no search tactic named, kernel rungs + peel branch +
-    // fixed CORE set + omega tail.
-    assert!(!DERIVED_CLOSER.contains("tactus_auto"));
-    assert!(!DERIVED_CLOSER.contains("case_split"));
-    assert!(!DERIVED_CLOSER.contains("tactus_first"));
-    assert!(DERIVED_CLOSER
-        .starts_with("first | rfl | decide | (tactus_peel <;> (first | rfl | decide | omega)) | (simp_all only ["));
-    assert!(DERIVED_CLOSER.ends_with("] <;> omega)"));
-    // The CORE set is the census union + the distribution/toNat/
-    // cancellation extensions: 51 lemmas (50 separators).
-    assert_eq!(DERIVED_CLOSER.matches(", ").count(), 50);
+    // S2c's derived default closer (§3.4) + B4's explicit peel (§4):
+    // no search tactic named, kernel rungs + generated intro/refine
+    // prefix + fixed CORE set + omega tail.
+    let goal = bin(BinOp::Eq, var("x"), var("y"));
+    let derived = derived_closer(&goal);
+    assert!(!derived.contains("tactus_auto"));
+    assert!(!derived.contains("case_split"));
+    assert!(!derived.contains("tactus_first"));
+    assert!(!derived.contains("tactus_peel"));
+    assert!(derived.starts_with("first | rfl | decide | omega | ("));
+    assert!(derived.ends_with("] <;> omega)"));
+    // A flat goal has no structure to peel: the kernel branch is just
+    // the leaf ladder.
+    assert!(derived.contains("first | rfl | decide | omega"));
+    // The CORE set is the census union + extensions: 51 lemmas (50 separators).
+    assert_eq!(CORE_SIMP.matches(", ").count(), 50);
     // Mathlib-context name hygiene: bare `not_imp` is ambiguous with
-    // `_root_.not_imp`; the qualified form is mandatory (see the
-    // DERIVED_CLOSER doc comment).
-    assert!(DERIVED_CLOSER.contains("Classical.not_imp"));
-    assert!(!DERIVED_CLOSER.contains(", not_imp,"));
+    // `_root_.not_imp`; the qualified form is mandatory.
+    assert!(CORE_SIMP.contains("Classical.not_imp"));
+    assert!(!CORE_SIMP.contains(", not_imp,"));
+}
+
+#[test]
+fn peel_flat_goal_is_leaf() {
+    // No structure: the peel is exactly the leaf tactic.
+    let goal = bin(BinOp::Eq, var("x"), var("y"));
+    assert_eq!(render_peel(&goal, "LEAF"), "LEAF");
+}
+
+#[test]
+fn peel_forall_and_implies_intros() {
+    // ⊢ ∀ (j : Nat), P j → Q j  ⇒  intro _; intro _; LEAF
+    let inner = bin(
+        BinOp::Implies,
+        bin(BinOp::Le, var("j"), lit("3")),
+        bin(BinOp::Le, var("j"), lit("5")),
+    );
+    let goal = Expr::new(ExprNode::Forall {
+        binders: vec![binder("j", var("Nat"))],
+        body: Box::new(inner),
+    });
+    assert_eq!(render_peel(&goal, "LEAF"), "intro _; intro _; LEAF");
+}
+
+#[test]
+fn peel_destructures_conjunction_hypotheses() {
+    // ⊢ (P ∧ Q) → R  ⇒  intro ⟨_, _⟩; LEAF
+    let goal = bin(
+        BinOp::Implies,
+        bin(BinOp::And, var("P"), var("Q")),
+        var("R"),
+    );
+    assert_eq!(render_peel(&goal, "LEAF"), "intro ⟨_, _⟩; LEAF");
+}
+
+#[test]
+fn peel_conjunction_refine_mirrors_tree() {
+    // ⊢ (A ∧ B) ∧ C  ⇒  refine ⟨⟨by LEAF, by LEAF⟩, by LEAF⟩
+    // (explicit nesting — flattening picks the right-nested reading)
+    let goal = bin(
+        BinOp::And,
+        bin(BinOp::And, var("A"), var("B")),
+        var("C"),
+    );
+    assert_eq!(
+        render_peel(&goal, "LEAF"),
+        "refine ⟨⟨by LEAF, by LEAF⟩, by LEAF⟩"
+    );
+}
+
+#[test]
+fn peel_right_nested_conjunction() {
+    // ⊢ A ∧ (B ∧ C)  ⇒  refine ⟨by LEAF, ⟨by LEAF, by LEAF⟩⟩
+    let goal = bin(
+        BinOp::And,
+        var("A"),
+        bin(BinOp::And, var("B"), var("C")),
+    );
+    assert_eq!(
+        render_peel(&goal, "LEAF"),
+        "refine ⟨by LEAF, ⟨by LEAF, by LEAF⟩⟩"
+    );
+}
+
+#[test]
+fn peel_mixed_wrappers() {
+    // ⊢ ∀ (x : Int), (P ∧ Q) → (A ∧ B)  ⇒
+    //   intro _; intro ⟨_, _⟩; refine ⟨by LEAF, by LEAF⟩
+    let goal = Expr::new(ExprNode::Forall {
+        binders: vec![binder("x", var("Int"))],
+        body: Box::new(bin(
+            BinOp::Implies,
+            bin(BinOp::And, var("P"), var("Q")),
+            bin(BinOp::And, var("A"), var("B")),
+        )),
+    });
+    assert_eq!(
+        render_peel(&goal, "LEAF"),
+        "intro _; intro ⟨_, _⟩; refine ⟨by LEAF, by LEAF⟩"
+    );
 }
