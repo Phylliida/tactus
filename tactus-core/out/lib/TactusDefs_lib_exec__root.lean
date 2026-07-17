@@ -34,12 +34,12 @@ mutual
 noncomputable def lib.expr_size (e : lib.ExprData) : Nat :=
   match e with | lib.ExprData.Atom _ => 1 | lib.ExprData.Lit _ => 1 | lib.ExprData.LitBool _ => 1 | lib.ExprData.Cast _k t => 1 + lib.expr_size t.deref | lib.ExprData.BinOp _op l r => 1 + lib.expr_size l.deref + lib.expr_size r.deref | lib.ExprData.App _fn a => 1 + lib.expr_size a.deref | lib.ExprData.FieldProj t _f => 1 + lib.expr_size t.deref | lib.ExprData.SpanMark _loc t => 1 + lib.expr_size t.deref | lib.ExprData.Let _n v bd => 1 + lib.expr_size v.deref + lib.expr_size bd.deref | lib.ExprData.Not t => 1 + lib.expr_size t.deref | lib.ExprData.Ite c t e => 1 + lib.expr_size c.deref + lib.expr_size t.deref + lib.expr_size e.deref | lib.ExprData.Match s arms => 1 + lib.expr_size s.deref + lib.arms_size arms.deref | lib.ExprData.AppN _fn args => 1 + lib.exprlist_size args.deref | lib.ExprData.Forall _bid _bty body => 1 + lib.expr_size body.deref | lib.ExprData.Exists _bid _bty body => 1 + lib.expr_size body.deref
 termination_by structural e
-noncomputable def lib.exprlist_size (l : lib.ExprList) : Nat :=
-  match l with | lib.ExprList.Nil => 0 | lib.ExprList.Cons h t => 1 + lib.expr_size h.deref + lib.exprlist_size t.deref
-termination_by structural l
 noncomputable def lib.arms_size (a : lib.ArmList) : Nat :=
   match a with | lib.ArmList.Nil => 0 | lib.ArmList.Cons _c _bs body tl => 1 + lib.expr_size body.deref + lib.arms_size tl.deref
 termination_by structural a
+noncomputable def lib.exprlist_size (l : lib.ExprList) : Nat :=
+  match l with | lib.ExprList.Nil => 0 | lib.ExprList.Cons h t => 1 + lib.expr_size h.deref + lib.exprlist_size t.deref
+termination_by structural l
 end
 
 noncomputable def lib.typ_size (t : lib.TypData) : Nat :=

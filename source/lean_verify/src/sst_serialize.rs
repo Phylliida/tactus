@@ -2510,7 +2510,7 @@ impl<'a> Serializer<'a> {
                     let h = self.lexpr_leaf(p);
                     format!("{}.GoalData.Imp {} {}", NS, h, box_(&term))
                 }
-                GoalSpine::All(b) => {
+                GoalSpine::All(b, _) => {
                     let name = self.goal_binder_name_leaf(b);
                     let typ = self.lexpr_leaf(&b.ty);
                     format!("{}.GoalData.All {} {} {}", NS, name, typ, box_(&term))
