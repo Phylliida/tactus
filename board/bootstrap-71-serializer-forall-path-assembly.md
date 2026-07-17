@@ -1,6 +1,6 @@
 ---
 title: "serializer arm — ∀-path Call assembly (FBind post frame; refWp side already proven)"
-status: todo
+status: in_progress
 claimed_by:
 created: 2026-07-16T17:15:00Z
 updated: 2026-07-16T17:15:00Z
@@ -25,3 +25,23 @@ post-call frame. The DTO already carries the path tag; tactus-core's
 mutation-kill; census tag `call-forall-path` retired; suite green.
 
 **Blocked by:** nothing.
+
+## Progress
+
+- (2026-07-18, fable-b74) **∀-path arm landed.** `call_stm`'s Forall
+  assembly: `FBind(binder, ret_typ)` wrapping `[FHyp(ret_bound)]
+  [FHyp(ens)] [FLet(dest, binder) unless use_dest_name]` — the DTO
+  already carried every ingredient incl. the `use_dest_name` flag.
+  F21 fixture added (clamped_inc: `ensures r >= x, r <= x + 1` — no
+  ret-eq conjunct; use_clamped caller). **use_clamped certifies**;
+  fixture 28/35 certified. fill_zeros re-tags `call-mut` (its loop
+  push; Vec::new's ∀-path no longer the blocker).
+- **Validation:** decide-close blocked by bootstrap-74 (as everywhere).
+  Reduce-comparison: both sides agree through the ∀-binder with
+  IDENTICAL interned props (bound=12, ens=11) and identical final leaf;
+  divergence is exactly the two known N1 patterns (hyp Imp→named-All,
+  let→witness pair). Frame assembly is correct pending b74 decide +
+  mutation-kill.
+- **tgt:** b70+b71 moved the census: call-generic 0 (was the gate),
+  4× call-forall-path expected to certify with this arm (re-census in
+  flight).

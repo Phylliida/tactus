@@ -287,6 +287,24 @@ pub fn swap_pair(a: u64, b: u64) -> (r: (u64, u64))
     (b, a)
 }
 
+// F21 (bootstrap-71): ∀-path Call — callee ensures carry no `r == E`
+// conjunct, so the post-call frame takes the FBind ∀-path
+// (`FBind(dest, ret_typ, FHyp(ret_bound) FHyp(ens))`), not the #128
+// ret-eq substitution path.
+pub fn clamped_inc(x: u64) -> (r: u64)
+    ensures r >= x, r <= x + 1,
+{
+    if x < 0xFFFF_FFFF_FFFF_FFFF { x + 1 } else { x }
+}
+
+pub fn use_clamped(a: u64) -> (r: u64)
+    requires a < 1000,
+    ensures r >= a,
+{
+    let t = clamped_inc(a);
+    t
+}
+
 // F20 (bootstrap-69): assert-query NonLinear — an isolated
 // `by(nonlinear_arith)` query inside an exec fn. The serializer emits
 // `StmData.AssertQueryNl`; the refWp mirror recurses on the body under
