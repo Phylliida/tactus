@@ -272,10 +272,67 @@ pub enum GoalSpine {
     /// `∀ (x : T),` — a theorem-level binder or a walker `Binder` frame.
     All(Binder),
     /// `h →` — a hypothesis (an assumption, a branch condition, or a
-    /// discharged assertion carried forward).
-    Imp(Expr),
+    /// discharged assertion carried forward). Carries its provenance
+    /// for the Link-discharge generator.
+    Imp(Expr, HypProvenance),
     /// `let x := v;` — a let-binding frame.
     Let(crate::lean_name::LeanName, Expr),
+}
+
+/// Provenance of a hypothesis frame in a [`GoalSpine`] — recorded for
+/// the Link-discharge generator (DESIGN-link-discharge.md §3.1). The
+/// discharge term must supply a proof for every `Imp` it applies
+/// through, and the recipe depends on where the hypothesis came from.
+/// Documentation-plus-data only: never affects the rendered theorem.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HypProvenance {
+    /// A callee-ensures fact woven by a proof-body call: discharged by
+    /// the callee's closed theorem instantiated at `args` (or by the
+    /// synthesized fix's own recursive call when `is_self`).
+    CallFact(CallFactInfo),
+    /// A branch / discriminator condition (if-cond, lowered-match
+    /// `isX` chain, loop cond): discharged by `(by simp)` on a
+    /// constructor-refined arm.
+    Branch,
+    /// The woven height-decrease fact of a recursive call (a passed
+    /// Termination assert carried forward): discharged by the emitted
+    /// termination VC theorem.
+    HeightFact,
+    /// Anything else (assumes, invariants, passed plain asserts…) —
+    /// not dischargeable mechanically; census-tagged by the generator.
+    Other,
+}
+
+/// Instantiation record for one woven callee fact.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallFactInfo {
+    /// Callee's stable dotted Lean name (e.g. `lib.u_gapp_cons`).
+    pub callee: String,
+    /// The call is a self-recursion (an IH premise for the fix).
+    pub is_self: bool,
+    /// Rendered instantiation, in callee param order.
+    pub args: Vec<SpineArg>,
+}
+
+/// One rendered call argument plus the bound-discharge recipe hint.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpineArg {
+    /// Rendered Lean text of the argument.
+    pub text: String,
+    /// Recipe hint for discharging the callee's `h_*_bound` binder (if
+    /// any) at this arg position.
+    pub tag: SpineArgTag,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpineArgTag {
+    /// The arg is exactly a caller signature param — the caller's own
+    /// `h_<name>_bound` binder discharges the callee's bound hyp.
+    CallerParam(String),
+    /// A literal numeral — bounds discharge by `decide`.
+    Literal,
+    /// Anything else — needs L2's wf machinery (or a census tag).
+    Expr,
 }
 
 /// A piece of preamble that some theorem needs in its elaboration

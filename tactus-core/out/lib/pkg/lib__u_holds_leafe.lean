@@ -1,0 +1,8 @@
+import TactusStmts_lib_exec__lib__u_holds_leafe
+import TactusDefs_lib_exec
+set_option linter.unusedVariables false
+set_option maxHeartbeats 800000
+set_option autoImplicit false
+theorem _tactus_postcondition_u_holds_leafe_at_lib_3264_13_1 (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (e : lib.ExprData) :
+    /- @rust:lib.rs:3264:13 -/ ∀ (st : Int → Int), lib.holds hp he lv (lib.GoalData.LeafE e) st = he e st := by
+  first | tactus_auto | (intros <;> rfl)

@@ -4317,6 +4317,85 @@ fn bridge_qualified_helper_refs(text: &str, deps: &[&FunctionX]) -> String {
 /// Exec fns are never in tactic-level mutual SCCs (obligation theorems
 /// don't reference each other), so the outcome is always
 /// `PkgEmitOutcome::Single`.
+/// L1 Link-discharge sidecar writer (DESIGN-link-discharge.md §3.1).
+/// One JSON file per pkg module (`<leaf>.spine.json`), one record per
+/// emitted VC: the ordered spine descriptors the Link generator needs
+/// to build a positional discharge term. Slice (a): write-only.
+fn write_spine_sidecar(
+    pkg_lean_path: &std::path::Path,
+    leaf: &str,
+    records: &[(String, Option<crate::lean_ast::GoalShape>)],
+) -> std::io::Result<()> {
+    use crate::lean_ast::{GoalSpine, HypProvenance, SpineArgTag};
+    fn esc(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+    let mut j = String::new();
+    j.push_str(&format!("{{\"fn\":\"{}\",\"vcs\":[", esc(leaf)));
+    for (i, (name, shape)) in records.iter().enumerate() {
+        if i > 0 { j.push(','); }
+        j.push_str(&format!("{{\"name\":\"{}\",", esc(name)));
+        match shape {
+            None => j.push_str("\"spine\":null}"),
+            Some(sh) => {
+                j.push_str("\"spine\":[");
+                for (k, node) in sh.spine.iter().enumerate() {
+                    if k > 0 { j.push(','); }
+                    match node {
+                        GoalSpine::All(b) => j.push_str(&format!(
+                            "{{\"k\":\"all\",\"name\":\"{}\",\"ty\":\"{}\"}}",
+                            esc(b.name.as_ref().map(|n| n.as_str()).unwrap_or("_")),
+                            esc(&crate::lean_pp::pp_expr(&b.ty)),
+                        )),
+                        GoalSpine::Let(n, v) => j.push_str(&format!(
+                            "{{\"k\":\"let\",\"name\":\"{}\",\"v\":\"{}\"}}",
+                            esc(n.as_str()), esc(&crate::lean_pp::pp_expr(v)))),
+                        GoalSpine::Imp(_, prov) => match prov {
+                            HypProvenance::Branch =>
+                                j.push_str("{\"k\":\"imp\",\"p\":\"branch\"}"),
+                            HypProvenance::HeightFact =>
+                                j.push_str("{\"k\":\"imp\",\"p\":\"height\"}"),
+                            HypProvenance::Other =>
+                                j.push_str("{\"k\":\"imp\",\"p\":\"other\"}"),
+                            HypProvenance::CallFact(info) => {
+                                j.push_str(&format!(
+                                    "{{\"k\":\"imp\",\"p\":\"call\",\"callee\":\"{}\",\"self\":{},\"args\":[",
+                                    esc(&info.callee), info.is_self));
+                                for (a, arg) in info.args.iter().enumerate() {
+                                    if a > 0 { j.push(','); }
+                                    let tag = match &arg.tag {
+                                        SpineArgTag::CallerParam(n) => format!("param:{}", n),
+                                        SpineArgTag::Literal => "lit".to_string(),
+                                        SpineArgTag::Expr => "expr".to_string(),
+                                    };
+                                    j.push_str(&format!(
+                                        "{{\"text\":\"{}\",\"tag\":\"{}\"}}",
+                                        esc(&arg.text), esc(&tag)));
+                                }
+                                j.push_str("]}");
+                            }
+                        },
+                    }
+                }
+                j.push_str("]}");
+            }
+        }
+    }
+    j.push_str("]}\n");
+    std::fs::write(pkg_lean_path.with_extension("spine.json"), j)
+}
+
 fn emit_package_exec_fn(
     krate: &KrateX,
     vir_fn: &FunctionX,
@@ -4350,6 +4429,13 @@ fn emit_package_exec_fn(
     // source of obligation shape). No-op unless `--tactus-emit-cert`;
     // never perturbs verification.
     crate::sst_serialize::emit_cert(krate, fn_sst, check, crate_name, &theorems, &goal_shapes);
+    // L1 Link-discharge: capture (name, shape) pairs for the spine
+    // sidecar before `theorems` is consumed below.
+    let spine_records: Vec<(String, Option<crate::lean_ast::GoalShape>)> = theorems
+        .iter()
+        .map(|t| t.name.clone())
+        .zip(goal_shapes.iter().cloned())
+        .collect();
 
     let stmts = stmt_partition_for(krate, crate_name, tactic_bodies, defs)
         .ok_or("Stmts partition unavailable")?;
@@ -4471,6 +4557,14 @@ fn emit_package_exec_fn(
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let changed = write_lean_file_tracked(&path, &rendered.text)?;
+    // L1 Link-discharge sidecar (DESIGN-link-discharge.md §3.1): persist
+    // each VC's spine descriptors next to the pkg module so the Link
+    // builder can generate discharge terms even on cache-skipped runs.
+    // Slice (a): write-only — nothing consumes it yet. Best-effort: a
+    // sidecar failure must not fail verification.
+    if let Err(e) = write_spine_sidecar(&path, &leaf, &spine_records) {
+        eprintln!("tactus: spine sidecar write failed for {leaf}: {e}");
+    }
     record_exec_link_entry(&defs.scope, ExecLinkEntry {
         leaf: leaf.clone(),
         obligations: thm_names.into_iter()

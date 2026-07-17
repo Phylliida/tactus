@@ -1,0 +1,1 @@
+{"fn":"lib__u_holds_leafe","vcs":[{"name":"_tactus_postcondition_u_holds_leafe_at_lib_3264_13_1","spine":[{"k":"all","name":"hp","ty":"Int → (Int → Int) → Prop"},{"k":"all","name":"he","ty":"lib.ExprData → (Int → Int) → Prop"},{"k":"all","name":"lv","ty":"Int → (Int → Int) → Int"},{"k":"all","name":"e","ty":"lib.ExprData"}]}]}

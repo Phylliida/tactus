@@ -111,3 +111,33 @@ Danielle (naming / default-on / theorem-vs-def).
     ZERO-SPINE class (u_* re-exports) — first green artifact; (c) the
     non-recursive discharge with bound recipes (W5 corollaries close);
     (d) census tags + gate-note counts. Mutation-kill pins land with (c).
+
+- (2026-07-17, fable-b73) **L1 SLICE (a) LANDED — spine recording + sidecar
+  persistence, verdict-neutral.**
+  - `lean_ast.rs`: `GoalSpine::Imp` gains `HypProvenance` (CallFact{callee,
+    is_self, args:[{text, tag}]} | Branch | HeightFact | Other); new types
+    CallFactInfo/SpineArg/SpineArgTag. Provenance is documentation-plus-
+    data: never affects the rendered theorem.
+  - `sst_to_lean.rs`: `CtxFrame::Hyp` carries provenance; ~20 push sites
+    classified honestly (if/match/loop conds + #114 cond_setup = Branch;
+    passed Termination assert = HeightFact — the woven decrease fact;
+    woven callee ensures = CallFact via `build_call_fact_info`, threaded
+    through `push_ret_frames`; everything else Other). Args recorded in
+    callee param order, COERCED TO THE PARAM'S TYP via the same
+    `coerce_lexpr` bridge the ensures renderer uses (U2) — so `*t`
+    records as `t.deref`, matching the woven fact verbatim. Tags:
+    param:<name> (caller signature param → its h_*_bound discharges) /
+    lit / expr.
+  - `generate.rs`: `write_spine_sidecar` — `pkg/<leaf>.spine.json` per
+    pkg module, one record per VC: ordered spine descriptors (all{name,
+    ty} / let{name, v} / imp{p,...}), written best-effort next to the
+    module so the Link builder can read it on cache-skipped runs.
+  - Validation: vstd 1530/0; tactus-core regen 138/0 + gate green; 67
+    sidecars; `holds_all_append`'s + `holds_close_e`'s sidecars match
+    probe34's hand-written discharge 1:1 (incl. height-before-IH and the
+    `Tactus.Box.mk tmp__2` instantiation with its defining let);
+    wp_stm_sound's Loop arm at full scale = 16 VCs, 11 calls in order,
+    8 discriminators, 1 height fact, SELF-marked IH.
+  - NEXT: slice (b) — clean-statement rendering + closed_clean for the
+    zero-spine class (u_* re-exports) in the Link builder, reading the
+    sidecars.
