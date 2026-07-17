@@ -775,6 +775,15 @@ fn branch_ctor_frames(
     obl: &OblCtx,
 ) -> Option<Vec<CtxFrame>> {
     use crate::lean_name::LeanName;
+    // Same rule as N1's emit_split gate: only DEFAULT-closer scopes
+    // get the leaf-normal upgrade. A fn-level `tactus_tactic` pin is
+    // a user tactic written against the un-upgraded goal shape
+    // (positional intros over the discriminator hypothesis — see
+    // tgt apply_hom_symbol_exec, the N2 gt-gate regression
+    // 2026-07-17); changing the shape under it breaks it.
+    if !matches!(&obl.closer, Tactic::Named(n) if n == "tactus_auto") {
+        return None;
+    }
     let p = branch_isvariant_of(cond, true)?;
     if !p.positive {
         // Polarity flipped by an odd number of `Not`s — the then-arm
