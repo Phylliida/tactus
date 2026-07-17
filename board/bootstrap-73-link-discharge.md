@@ -3,7 +3,7 @@ title: "Link discharge — premise-free closed theorems per proof fn (spec: DESI
 status: in_progress
 claimed_by: fable-b73
 created: 2026-07-16T23:30:00Z
-updated: 2026-07-17T02:30:00Z
+updated: 2026-07-17T03:30:00Z
 ---
 
 ## Description
@@ -161,3 +161,25 @@ Danielle (naming / default-on / theorem-vs-def).
   - NEXT: slice (c) — non-recursive discharge with bound recipes (the
     prophecy/closure corollaries close; needs the positional application
     generator over the sidecar spine); then L2 (fix synthesis + wf).
+
+- (2026-07-17, fable-b73, slice-b addendum) Suite initially FAILED 3
+  (test_deadend_*): the census eprintln landed in the diagnostics stream
+  as a bare line the harness flags (`[unexpected json]`). Fixed the
+  right way: counts ride `PackageGateReport` (statics, the
+  PKG_CACHED_VERDICTS pattern) and print via `reporter.report_now
+  (note_bare(...))` — the same structured channel as the package-gate
+  note. Also: the stable theorem references the per-VC `<vc>_closed`
+  def (not the raw theorem) so BINDER-channel helper hyps are already
+  applied — uniform across both premise channels. Suite 551/0.
+  Committed `5a408af`.
+- **Slice (c) lead**: the CLEAN STATEMENT for premise-carrying fns =
+  "the fn's ensures as callers see it, ∀-closed over params+bounds" —
+  which is exactly what the BROADCAST-LEMMA AXIOM emission already
+  renders (krate_preamble's lemma-axiom path via
+  collect_broadcast_lemma_funs). Reuse that renderer rather than
+  building a new one — statement identity with the weave by
+  construction. Then the discharge term = positional application over
+  the sidecar spine (probe34 shapes): `()` per Unit binder,
+  `lib.<callee>_closed <args>` per call imp, bound recipes per tag
+  (param:<n> → caller's h_<n>_bound binder; lit → by decide; expr →
+  census `discharge-bound-gap` until L2 wf).
