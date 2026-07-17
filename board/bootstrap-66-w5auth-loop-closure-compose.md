@@ -1,6 +1,6 @@
 ---
 title: "W5-auth-6 — compose the loop closure: adequacy spine over the authored theorem + permanent runner; close bootstrap-10"
-status: in-progress
+status: done
 claimed_by:
 created: 2026-07-16T17:15:00Z
 updated: 2026-07-16T23:30:00Z
@@ -89,3 +89,14 @@ no hand chain-discharge, no drift gate; the spine will consume
   - Alignment check needed: spine holdsAll/execSafeF vs authored
     lib.holds_all/lib.exec_safe_f (spine mirrors them; expect rfl or a
     thin bridging lemma; St = Int → Int both sides).
+
+- (2026-07-18, fable-b74-session) **DONE — THE LOOP IS CLOSED
+  (`217844b`, probe-w0/probe37_loop_closure).** Spine v3: Val-level spec
+  = authored model via abbrevs (upd stays a computable defeq twin);
+  hand wp_stm_sound/ref_wp_sound DELETED; FACT 4 = iff_of_eq
+  (lib.ref_wp_sound_closed …) + wf hyps — definitional unification,
+  ZERO bridging. Closure [propext, Classical.choice, Quot.sound], no
+  sorryAx; all v1/v2/match adequacy facts carried unchanged. Runner
+  builds the Link olean from the live emission (the gate ships .lean
+  only). Docs: VERIFICATION-PATH rung 5 REACHED + DESIGN-W5 §5 final
+  status; bootstrap-10 umbrella closed.

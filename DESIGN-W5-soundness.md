@@ -453,3 +453,30 @@ O6).
   none — no `sorryAx`, no `Classical.choice`. **`Match` scoped** → bootstrap-56
   (flat-Int datatype-value-decode; the fn-pin already covers match-*bodied* fns,
   so only `match`-in-obligation is affected).
+
+## 5. Final status — THE LOOP IS CLOSED (2026-07-18)
+
+The W5 arc is complete, end to end:
+
+- **Model + proofs authored in tactus** (bootstrap-60..65): `holds`/
+  `holds_all`/`close_sem_e`/`close_sem_obligs`/`exec_safe_f` +
+  `wp_stm_sound` (11-arm induction) + `ref_wp_sound` + the nine
+  prophecy/closure corollaries — verified lean-only-clean, 138/0.
+- **Per-fn kernel closure** (bootstrap-73): the Link discharge layer
+  makes every one of those theorems a premise-free `_closed` theorem
+  (67/67, 0 pending) — option (iii) of the bootstrap-66 design fork, no
+  hand chain-discharge, no drift gate. Residual interface: the R-b wf
+  hypotheses (`StmDataWf s`, `FnCtxDataWf c`), by-construction for
+  serializer output.
+- **Composition** (bootstrap-66, `probe-w0/probe37_loop_closure/`): the
+  adequacy spine's Val-level spec IS the authored model (abbrevs); FACT 4
+  = `iff_of_eq (lib.ref_wp_sound_closed …)` — definitional unification,
+  zero bridging lemmas; the ~200-line hand `wp_stm_sound` induction is
+  deleted. Composed closure `[propext, Classical.choice, Quot.sound]`,
+  no sorryAx. Runner = `probe37_loop_closure/run.sh` (builds the Link
+  olean from the live emission; exit-0 discipline).
+
+What remains trusted above this theorem is exactly VERIFICATION-PATH §5's
+permanent residue: the adequacy spine (denotation, oracle pins, binder
+embeddings) as the written-down SPEC, the serializer, the frontend, the
+kernel. The claim ladder's rung 5 is reached.
