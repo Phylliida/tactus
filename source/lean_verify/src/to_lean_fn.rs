@@ -812,9 +812,22 @@ pub(crate) fn datatype_simp_def_inventory(
     let mut by_type = std::collections::HashMap::new();
     let mut variants = std::collections::HashMap::new();
     // Spec fns with bodies: emitted as Lean defs, unfoldable by name.
+    // NON-RECURSIVE only (empty decreases): a non-recursive def's
+    // unfold is just its body — always clean under simp. Recursive
+    // spec fns need Lean-generated equational theorems, and that
+    // generation FAILS outright for the nested/mutual class compiled
+    // via `rec_1` + PProd ("invalid projection x✝.2.1" — e.g.
+    // tactus-core's exec_safe_f/strip_hyps/close_e ladder), killing
+    // every simp arm in the chain. The residue tests this list exists
+    // for (sview, sym_val, is_gen_spec, singleton_len) are all
+    // non-recursive.
     let spec_fns: std::collections::HashSet<String> = functions
         .iter()
-        .filter(|f| f.x.mode == vir::ast::Mode::Spec && f.x.body.is_some())
+        .filter(|f| {
+            f.x.mode == vir::ast::Mode::Spec
+                && f.x.body.is_some()
+                && f.x.decrease.is_empty()
+        })
         .map(|f| crate::to_lean_type::lean_name(&f.x.name.path))
         .collect();
     for d in datatypes.iter() {
