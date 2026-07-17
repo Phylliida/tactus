@@ -1063,6 +1063,7 @@ fn mk_test_emitter() -> ObligationEmitter {
         goal_shapes: Vec::new(),
         tactic_prefix: Vec::new(),
         default_closer: crate::lean_ast::Tactic::Named("tactus_auto".to_string()),
+        dt_inventory: Default::default(),
     }
 }
 

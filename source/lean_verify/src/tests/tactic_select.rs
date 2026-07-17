@@ -219,7 +219,7 @@ fn derived_closer_is_search_free_and_census_exact() {
     // no search tactic named, kernel rungs + generated intro/refine
     // prefix + fixed CORE set + omega tail.
     let goal = bin(BinOp::Eq, var("x"), var("y"));
-    let derived = derived_closer(&goal);
+    let derived = derived_closer(&goal, &Default::default());
     assert!(!derived.contains("tactus_auto"));
     assert!(!derived.contains("case_split"));
     assert!(!derived.contains("tactus_first"));
@@ -230,11 +230,11 @@ fn derived_closer_is_search_free_and_census_exact() {
     // the leaf ladder.
     assert!(derived.contains("first | rfl | decide | omega"));
     // The CORE set is the census union + extensions: 51 lemmas (50 separators).
-    assert_eq!(CORE_SIMP.matches(", ").count(), 50);
+    assert_eq!(CORE_LEMMAS.matches(", ").count(), 50);
     // Mathlib-context name hygiene: bare `not_imp` is ambiguous with
     // `_root_.not_imp`; the qualified form is mandatory.
-    assert!(CORE_SIMP.contains("Classical.not_imp"));
-    assert!(!CORE_SIMP.contains(", not_imp,"));
+    assert!(CORE_LEMMAS.contains("Classical.not_imp"));
+    assert!(!CORE_LEMMAS.contains(", not_imp,"));
 }
 
 #[test]
