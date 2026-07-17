@@ -218,7 +218,8 @@ fn dotted_names_pass_through() {
 /// place to fail loudly.
 #[test]
 fn extract_prelude_names_recognises_current_prelude() {
-    let names = extract_prelude_names(crate::prelude::TACTUS_PRELUDE);
+    let mut names = extract_prelude_names(crate::prelude::TACTUS_DEFS);
+    names.extend(extract_prelude_names(crate::prelude::TACTUS_SEARCH));
     // Axioms.
     assert!(names.contains("arch_word_bits"),
         "expected `arch_word_bits` in extracted prelude names; got {:?}", names);
@@ -228,7 +229,6 @@ fn extract_prelude_names_recognises_current_prelude() {
     assert!(names.contains("isize_hi"));
     // syntax-introduced tactic names.
     assert!(names.contains("tactus_first"));
-    assert!(names.contains("tactus_peel"));
     // macro-introduced tactic names.
     assert!(names.contains("tactus_auto"));
     assert!(names.contains("tactus_usize_bound"));
@@ -330,7 +330,7 @@ fn cached_prelude_names_includes_legacy_allowlist() {
     let cached = cached_prelude_names();
     for legacy in &["arch_word_bits", "arch_word_bits_valid",
                     "usize_hi", "isize_hi",
-                    "tactus_peel", "tactus_usize_bound"] {
+                    "tactus_usize_bound"] {
         assert!(cached.contains(*legacy),
             "legacy allowlist name `{}` missing from auto-derived set; \
              did TactusPrelude.lean change?", legacy);
@@ -348,7 +348,6 @@ fn name_resolves_accepts_prelude_name() {
     let scope = HashSet::new();
     assert!(name_resolves("arch_word_bits", &defined, &scope));
     assert!(name_resolves("usize_hi", &defined, &scope));
-    assert!(name_resolves("tactus_peel", &defined, &scope));
     // Sanity: a made-up name is still rejected.
     assert!(!name_resolves("not_a_prelude_name_xyz", &defined, &scope));
 }

@@ -1063,6 +1063,7 @@ fn mk_test_emitter() -> ObligationEmitter {
         goal_shapes: Vec::new(),
         tactic_prefix: Vec::new(),
         default_closer: crate::lean_ast::Tactic::Named("tactus_auto".to_string()),
+        dt_inventory: Default::default(),
     }
 }
 
@@ -1093,15 +1094,20 @@ fn wp_hyp_walker_wraps_done_leaf_with_hyp_frame() {
     let printed = crate::lean_pp::pp_expr(
         &crate::lean_ast::strip_span_marks(&theorem.goal),
     );
-    // After wrap: the Hyp frame becomes `p_test_hyp → ...` and
-    // the Done leaf is `q_test_done`. The printer renders `→`
-    // explicitly; both names should appear.
-    assert!(printed.contains("p_test_hyp"),
-        "expected hyp `p_test_hyp` in goal; got: {}", printed);
+    // N1 let-hoisting: the default-closer path hoists the Hyp frame
+    // to a theorem-level binder `(_h_hoist_1 : p_test_hyp)` and the
+    // goal is the FLAT leaf. (Pre-N1 this asserted `p → q` in the
+    // goal — the hyp moved from goal to binders, provenance intact.)
     assert!(printed.contains("q_test_done"),
-        "expected leaf `q_test_done` in goal; got: {}", printed);
-    assert!(printed.contains("→"),
-        "expected `→` (implication from hyp); got: {}", printed);
+        "expected flat leaf `q_test_done` as goal; got: {}", printed);
+    assert!(!printed.contains("→"),
+        "expected FLAT goal (hyp hoisted to binder); got: {}", printed);
+    let hyp_binder = theorem.binders.iter().any(|b| {
+        crate::lean_pp::pp_expr(&crate::lean_ast::strip_span_marks(&b.ty))
+            .contains("p_test_hyp")
+    });
+    assert!(hyp_binder,
+        "expected hyp `p_test_hyp` as a theorem-binder type");
 }
 
 #[test]

@@ -141,6 +141,50 @@ deterministic); `bv_decide`'s caveat is compiled execution, already a tracked kn
 - **Auditability:** the emitted `.lean` artifact reads as a proof, not as an
   invocation of a search procedure.
 
+### 3.4 DECISION (2026-07-16, Danielle): derivation-first — the pin store is dead
+
+The S2a census (`MEASUREMENT-s2a-derivability.md`, 295 real theorems under the
+145 T2 buckets) settled §3.2: **no storage at all**. 95.6% of the pool is
+derivable, and the derivation is the strongest possible form — a **single fixed,
+site-invariant 43-lemma `simp_all only [CORE]` list**, with `<;> omega` on the
+composed-rung theorems, validated to close **280/280** of the derivable pool
+(94.9% of all T2). The list doesn't even read the goal; locality, determinism,
+and auditability are satisfied by construction. Candidates ranked in
+mainline-04 resolve: **1 (no storage — derivation rules) chosen**;
+**2 (inline proofs for the residue)** complements; 3 and 4 (committed artifacts,
+§3.2 sidecar) rejected — a store would persist what a constant already provides.
+
+The chosen shape per obligation, when the closer would be `tactus_auto`:
+
+    first | rfl | decide | (tactus_peel <;> (first | rfl | decide | omega))
+          | (simp_all only [CORE — fixed core lemmas] <;> omega)
+
+Uniform text (the tail is a no-op on goals the simp closes outright), one
+statable rule ("every WP obligation closes under kernel rungs or the fixed
+core normalizer, with omega deciding the arithmetic residue"), no per-kind
+conditionals. Rule budget: **one** (Danielle's transparency constraint).
+CORE was 43 lemmas at the census and is **51** after mainline-05
+validation (three probe-tested extensions + one Mathlib-context name
+qualification — full history and the extension probe protocol in
+MEASUREMENT-s2a-derivability.md §6.1). The residue — 13 theorems
+in 2 clusters (Option accessors ×7 in coset_group; no-replay-closes ×6 → 3
+effective sites) — gets inline proofs in source, NOT a rule exception: the
+"accessor lemmas of mentioned symbols' field types" line was considered and
+explicitly declined to keep the budget at one.
+
+**Predictability honesty (accepted by Danielle 2026-07-16):** the pool is
+REWRITE-CLOSURE, 0% UNFOLD-THEN-DECIDE — no theorem needed definitional
+unfoldings. The predictability story is "fixed normalizer + decider tail", not
+fragment membership; accepted because a single fixed list for all kinds is the
+most formulaic possible rewrite-closure rule.
+
+**Protocol facts downstream work must respect** (from the census):
+- `simp_all?` suggestions do not always replay standalone — the minimized form
+  is list-plus-`<;> omega`-tail, not the bare list (13/295 needed the tail).
+- "T2 label ⇒ `simp_all` closes" is false (composed-rung/case-split winners).
+- Failure mode of the fixed list on new obligation shapes is LOUD (unclosed
+  goal at a named obligation) — acceptable per §3.3.
+
 ---
 
 ## 4. `tactus_peel` → codegen
@@ -154,6 +198,25 @@ the emitter *built* that conjunction; it knows the exact tree. Emit the explicit
 Wins beyond transparency: each subgoal gets its own tactic position, so sourcemap
 spans point at the *specific* conjunct that failed rather than at a macro
 invocation — better error UX for free. The macro is then deleted from the prelude.
+
+**LANDED (2026-07-17, mainline-07).** `render_peel` in
+`lean_verify/src/tactic_select.rs` walks the goal tree and emits the intro/refine
+prefix: `intro` per ∀ binder / antecedent / goal-let (with anonymous-constructor
+patterns for ∧/×-typed hypotheses), then `refine ⟨by <leaf>, …⟩` mirroring the
+conjunction tree exactly (flattening picks the right-nested reading, so
+left-nested trees must be mirrored). Used by S1's `PeelOmega` and as the second
+branch of the derived closer:
+`first | rfl | decide | omega | (<explicit peel>; first | rfl | decide | omega)
+| (simp_all only [CORE] <;> omega)`.
+The kernel ladder runs FIRST so prefix-transformed goals (user proof text
+consuming the statement's wrappers) close there — the branch order is the guard,
+making the peel steps safely unguarded. Two designs were falsified on the way:
+`try`-guards (`try` takes the following tactic *sequence* as its argument and
+no-ops the whole chain) and newline-separated steps (breaks `first`-alternative
+layout). The macro is deleted from `TactusPrelude.lean`; sanity allowlists and
+gt's 4 S2c residue overrides updated. Validated: gt gate 3116/0, tutorial 10/10,
+suite 138/140 (= main-line), false-conjunct probe reports the specific conjunct's
+Rust span.
 
 ---
 
@@ -170,6 +233,29 @@ invocation — better error UX for free. The macro is then deleted from the prel
   core/Mathlib T1 procedures. The gate can then assert a second one-line claim
   next to the axiom-closure one: **"no artifact imports the search module."**
 - `prelude.rs`'s content-hashed olean cache extends naturally to two oleans.
+
+**LANDED (2026-07-17, mainline-08).** `TactusPrelude.lean` split at the
+vocabulary/tactics boundary (the `axiom Tactus.hasResolved` line):
+`TactusDefs.lean` = vocabulary + `#tactus_check_axioms` (the check audits the
+axioms defined there — it belongs with them); `TactusSearch.lean` =
+`import TactusDefs` + the four ladder tactics. `prelude.rs` builds both oleans
+into the content-hashed cache (hash over both sources; defs first, then search
+with the defs dir on `LEAN_PATH`). Emission: the defs module and standalone
+headers now emit `import TactusDefs`. The Search import is not "discover-mode
+gated" — there IS no discover-mode emission post-S2c — instead every artifact
+is scanned at the `pp_commands` chokepoint and gets `import TactusSearch`
+exactly when one of its theorems cites a search tactic in its closer (user
+overrides / inline proofs only; the derived closer and B4's peel never name
+them). The marker/lockstep invariant: injection happens before landmark
+computation, so sourcemaps stay aligned. Measured on the gt gate: **4 files**
+import TactusSearch (apply_hom_gen/inv, todd_coxeter ×2 — the known
+user-override sites); everything else is TactusDefs-only — mainline-09's gate
+claim is now textually assertable. Validated: gt gate 3116/0 (package gate
+live), tutorial 10/10, suite at main-line parity, lean_verify 374/374 + 7
+integration. **Follow-up:** `ensure_prelude_olean` has no cross-process lock —
+two concurrent tactus runs on one machine can race the shared cache dir
+(observed 2026-07-17 as tutorial-chapter flakes during a concurrent gt gate;
+solo runs all green). A lockfile would fix it.
 
 ---
 

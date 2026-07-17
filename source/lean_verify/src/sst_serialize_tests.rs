@@ -183,7 +183,7 @@ fn goal_list_skips_none_and_pairs_names() {
     use crate::lean_name::LeanName;
 
     let mk = |p: &str| GoalShape {
-        spine: vec![GoalSpine::Imp(LExpr::var(LeanName::synthetic("h")))],
+        spine: vec![GoalSpine::Imp(LExpr::var(LeanName::synthetic("h")), crate::lean_ast::HypProvenance::Other)],
         leaf: LExpr::var(LeanName::synthetic(p)),
     };
     let thm = |n: &str| Theorem {

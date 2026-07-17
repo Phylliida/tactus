@@ -43,16 +43,538 @@ pub(crate) enum Selection {
     /// Bare arithmetic goal: `omega`.
     Omega,
     /// Arithmetic goal behind leading ∀ / `let` / `→` wrappers:
-    /// `tactus_peel <;> omega` (peel intros the spine, omega closes).
+    /// explicit intro/refine prefix + `omega` (B4 — no more
+    /// `tactus_peel` macro; the emitter generates the structure).
     PeelOmega,
 }
 
 impl Selection {
-    pub(crate) fn tactic_text(self) -> &'static str {
+    pub(crate) fn tactic_text(self, goal: &Expr) -> String {
         match self {
-            Selection::Omega => "omega",
-            Selection::PeelOmega => "tactus_peel <;> omega",
+            Selection::Omega => "omega".to_string(),
+            Selection::PeelOmega => render_peel(goal, "omega"),
         }
+    }
+}
+
+/// Explicit structural peel (B4, `DESIGN-transparent-automation.md` §4):
+/// the emitter BUILT every goal it closes, so it walks the goal tree and
+/// emits the exact intro/refine sequence — `intro` per ∀ binder /
+/// implication antecedent / goal-position `let` (with anonymous-
+/// constructor patterns for ∧- and ×-typed hypotheses), then a single
+/// `refine ⟨…⟩` mirroring the goal's conjunction tree, each conjunct
+/// closed by a `by <leaf>` block. Replaces the recursive `tactus_peel`
+/// prelude macro: no search, no macro expansion in artifacts, and each
+/// conjunct gets its own tactic position so sourcemap spans point at
+/// the SPECIFIC failing conjunct instead of a macro invocation.
+///
+/// `leaf` is the tactic text applied at each peeled leaf (e.g. `omega`,
+/// or `first | rfl | decide | omega` for the derived closer's kernel
+/// branch). A goal with no peelable structure renders as just `leaf`.
+///
+/// The sequence is `;`-joined on one line and steps are UNGUARDED by
+/// design. Two earlier designs failed empirically (2026-07-17):
+/// `try`-guards are unusable because `try` takes the following tactic
+/// SEQUENCE as its argument (`try (intro _); first | …` no-ops the
+/// whole chain), and newline-separated steps break the layout of
+/// parenthesized `first`-alternatives (whose content must stay indented
+/// past the paren's column). The correct guard is BRANCH ORDER: the
+/// derived closer tries the bare kernel ladder first (`first | rfl |
+/// decide | omega`), so goals a prefix already peeled/transformed close
+/// there; this branch's unguarded steps only run on goals that actually
+/// have the structure the statement says to peel (or fail loudly and
+/// fall through to the CORE branch).
+pub(crate) fn render_peel(goal: &Expr, leaf: &str) -> String {
+    match &goal.node {
+        ExprNode::SpanMark { inner, .. } => render_peel(inner, leaf),
+        ExprNode::Forall { binders, body } => {
+            let mut out: Vec<String> = binders
+                .iter()
+                .map(|b| format!("intro {}", conj_pattern(&b.ty)))
+                .collect();
+            out.push(render_peel(body, leaf));
+            out.join("; ")
+        }
+        ExprNode::Let { body, .. } => {
+            format!("intro _; {}", render_peel(body, leaf))
+        }
+        ExprNode::BinOp { op: BinOp::Implies, lhs, rhs } => {
+            format!("intro {}; {}", conj_pattern(lhs), render_peel(rhs, leaf))
+        }
+        ExprNode::BinOp { op: BinOp::And, .. } => {
+            format!("refine {}", conj_term(goal, leaf))
+        }
+        _ => leaf.to_string(),
+    }
+}
+
+/// Term-level mirror of a goal's conjunction tree: `A ∧ (B ∧ C)` becomes
+/// `⟨by <peel A>, ⟨by <peel B>, by <peel C⟩⟩` — explicit nesting (the
+/// anonymous-constructor flattening picks the right-nested reading
+/// first, so left-nested trees must be mirrored, not flattened).
+fn conj_term(goal: &Expr, leaf: &str) -> String {
+    match &goal.node {
+        ExprNode::SpanMark { inner, .. } => conj_term(inner, leaf),
+        ExprNode::BinOp { op: BinOp::And, lhs, rhs } => {
+            format!("⟨{}, {}⟩", conj_term(lhs, leaf), conj_term(rhs, leaf))
+        }
+        _ => format!("by {}", render_peel(goal, leaf)),
+    }
+}
+
+/// Anonymous-constructor intro pattern mirroring a ∧/×-typed tree:
+/// `(P ∧ Q) ∧ R` → `⟨⟨_, _⟩, _⟩`; plain `_` for other types.
+fn conj_pattern(ty: &Expr) -> String {
+    match &ty.node {
+        ExprNode::SpanMark { inner, .. } => conj_pattern(inner),
+        ExprNode::BinOp { op: BinOp::And | BinOp::Prod, lhs, rhs } => {
+            format!("⟨{}, {}⟩", conj_pattern(lhs), conj_pattern(rhs))
+        }
+        _ => "_".to_string(),
+    }
+}
+
+/// Derived default closer (S2c of the squeeze arc; decision:
+/// `DESIGN-transparent-automation.md` §3.4; measured basis:
+/// `MEASUREMENT-s2a-derivability.md`). Selected when `tactus_auto`
+/// would run and `select_deterministic` finds no arithmetic-fragment
+/// answer. The ONE derivation rule of the arc (rule budget: one —
+/// Danielle, 2026-07-16):
+///
+///   kernel rungs (rfl / decide — definitional equalities, decidable
+///   atoms), then the peeled kernel rungs (wrapped goals whose leaf is
+///   kernel-closeable after intro — `tactus_peel` no-ops when there is
+///   nothing to intro, so this branch is safe on flat goals), then the
+///   fixed core normalizer with an omega tail.
+///
+/// Every branch is a decision procedure or a FIXED, site-invariant
+/// rewrite set: no search, no ambient-scope reads, named lemmas that
+/// break loudly on renames. The 43-lemma CORE set below is the union
+/// of every squeezed `simp_all?` used-list in the Brick-1 T2 pool,
+/// validated to close 389/397 of the full pool (the 8 residue are the
+/// census's known clusters — inline-proof surface, §3.4). CORE alone
+/// closes 268/280 of the T2 winners; the `<;> omega` tail takes the
+/// 12 composed-rung theorems (`simp_all?` suggestions do not always
+/// replay standalone — census §5.1). Name hygiene: `not_imp` is cited
+/// as `Classical.not_imp` — bare `not_imp` is ambiguous against
+/// `_root_.not_imp` once any Mathlib import is in scope (tutorial
+/// chapters import `Mathlib.Tactic.Linarith`); every other bare name
+/// in the list was probe-tested unambiguous in simp-argument position
+/// in BOTH core-only and Mathlib contexts (2026-07-16).
+/// 2026-07-16 extension (+4): `Int/Nat.mul_add, Int/Nat.add_mul` —
+/// the old default-set `simp_all` distributed products into ring-normal
+/// form before its omega rung; the fixed set must do the same or
+/// loop-body obligations like `2 * result = i * (i+1) → 2 * (result +
+/// (i+1)) = (i+1) * (i+2)` leave omega with irelatable opaque product
+/// atoms (tutorial sum_iter regression, caught by the 10-chapter
+/// battery). Also 47 lemmas, still site-invariant.
+/// 2026-07-16 extension (+2): `Int.toNat_zero, Int.toNat_one` — the
+/// default set reduced `Int.toNat 0/1` literals; without them,
+/// base-case obligations (`Int.toNat r = fib (Int.toNat n)` under
+/// `n = 0`) leave `↑(fib (Int.toNat 0))` opaque to omega (tutorial
+/// fib_iter/fib_fast/pow_by_squaring regressions). 49 lemmas.
+/// 2026-07-16 extension (+2): `Int/Nat.add_sub_cancel` — loop-body
+/// index bookkeeping `(i + 1 - 1).toNat` must reduce to `i.toNat`
+/// or spec-fn applications over it stay irelatable (tutorial
+/// fib_iter 123-invariant). 51 lemmas.
+///
+/// CORE simp list (the fixed normalizer half of the derived closer —
+/// the full derivation rule spec is in `render_peel`'s and
+/// `derived_closer`'s docs; history: census union of 43 + four
+/// probe-tested extensions to 51, MEASUREMENT-s2a §6.1).
+pub(crate) const CORE_LEMMAS: &str = "Classical.not_forall, Decidable.not_not, Int.add_emod_left, Int.cast_ofNat_Int, Int.natCast_add, Int.neg_add_emod_self, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.sub_zero, Int.toNat_natCast_add_one, Int.zero_add, Int.zero_sub, Int.mul_add, Int.add_mul, Int.toNat_zero, Int.toNat_one, Int.add_sub_cancel, Nat.add_le_add_iff_right, Nat.add_left_cancel_iff, Nat.add_zero, Nat.le_add_left, Nat.le_add_right, Nat.le_refl, Nat.not_le, Nat.not_lt, Nat.reduceLeDiff, Nat.sub_le_iff_le_add, Nat.zero_add, Nat.zero_le, Nat.mul_add, Nat.add_mul, Nat.add_sub_cancel, and_imp, and_self, and_true, eq_iff_iff, forall_const, forall_eq, ge_iff_le, gt_iff_lt, iff_true, imp_false, imp_self, implies_true, not_and, not_exists, not_false_eq_true, Classical.not_imp, not_or, not_true_eq_false, true_and";
+
+/// The fixed CORE normalizer rung, exactly the v2 text (the list is
+/// spliced from `CORE_LEMMAS` so the structural rung below can reuse
+/// it without a second copy). Behavior is pool-validated; the
+/// structural rung is a separate, ADDITIVE branch — this one does not
+/// change.
+pub(crate) fn core_simp() -> String {
+    format!("simp_all only [{}] <;> omega", CORE_LEMMAS)
+}
+
+/// Logic additions used ONLY by the structural rung's simp set (kept
+/// out of `CORE_LEMMAS` so rung 3 stays byte-identical to its
+/// pool-validated form): truth-value collapse for disjunctive
+/// postconditions (`r = 0 ∨ r = x` ground-reduces one disjunct to
+/// `True`, which omega cannot consume — simp must finish the
+/// collapse) and ite collapse over reduced Prop discriminators
+/// (`if True then a else b` after `is<Variant>` unfolds on a
+/// constructor). Probe-tested on the e2e exec corpus (2026-07-17,
+/// the 26-test squeeze-regression sweep).
+pub(crate) const STRUCTURAL_EXTRA_LEMMAS: &str = "true_or, or_true, if_true, if_false";
+
+/// Marker text written where the DERIVED closer would go when the goal
+/// isn't known yet — the `by(nonlinear_arith)` AssertQuery scope
+/// composes its fallback ONCE per scope but obligations arrive
+/// per-theorem. `emit_with_extras` substitutes `derived_closer(goal)`
+/// for this token at emission. If it ever leaks into an artifact it
+/// fails LOUD (unknown identifier) — substitution is total.
+pub(crate) const DERIVED_MARKER: &str = "tactus_derived_marker__";
+
+/// Derived default closer (S2c of the squeeze arc; decision:
+/// `DESIGN-transparent-automation.md` §3.4; measured basis:
+/// `MEASUREMENT-s2a-derivability.md`). Selected when `tactus_auto`
+/// would run and `select_deterministic` finds no arithmetic-fragment
+/// answer. The ONE derivation rule of the arc (rule budget: one —
+/// Danielle, 2026-07-16):
+///
+///   kernel rungs (rfl / decide — definitional equalities, decidable
+///   atoms), then the explicitly-peeled kernel rungs (B4: the emitter
+///   walks the goal and generates the intro/refine prefix itself —
+///   wrapped goals whose leaf is kernel-closeable after intro; the
+///   prefix is empty on flat goals, making this branch a harmless
+///   duplicate of the first), then the fixed core normalizer with an
+///   omega tail, then the STRUCTURAL rung (`structural_rung` below):
+///   named intros + `cases` on the goal's own datatype scrutinees +
+///   `simp_all +zetaDelta` over CORE plus the goal-mentioned
+///   generated datatype defs.
+///
+/// Every branch is a decision procedure, a generated structural prefix,
+/// or a FIXED, site-invariant rewrite set — or, for the structural
+/// rung, a set DERIVED deterministically from the goal text itself
+/// (the goal's own scrutinees and the crate's own generated defs; no
+/// ambient-scope reads, no search, unfold names break loudly on
+/// renames). CORE is the 51-lemma set documented at CORE_LEMMAS
+/// (validation: 389/397 of the full Brick-1 pool with only the 8
+/// census-residue failures, covered by inline proofs — and 0
+/// regressions at every extension step).
+///
+/// Failure semantics: a goal outside every branch fails LOUD at its
+/// named obligation — that is the suggestion signal for an inline
+/// proof, per §3.4. `tactus_auto` remains in the prelude for
+/// discover-mode overrides; it no longer appears in default emission.
+pub(crate) fn derived_closer(
+    goal: &Expr,
+    dts: &DtDefInventory,
+    binders: &[Binder],
+) -> String {
+    format!(
+        "first | rfl | decide | omega | ({}) | ({}) | ({})",
+        render_peel(goal, "first | rfl | decide | omega"),
+        core_simp(),
+        structural_rung(goal, dts, binders)
+    )
+}
+
+/// Name inventory of the `@[simp]` defs the datatype emission
+/// generates alongside each inductive (discriminators `is<Variant>`,
+/// accessors `<Variant>_<field>`, the `height` measure). Keyed by the
+/// datatype's full Lean type name; values are the SHORT def names.
+/// Built by `to_lean_fn::datatype_simp_def_inventory` (which mirrors
+/// the emission naming in `multi_variant_accessor_defs` /
+/// `datatype_height_cmd` — keep them in sync). Used by
+/// `structural_rung` to derive per-goal unfold lists: `simp_all only`
+/// excludes the `@[simp]` attribute set by design, so the defs a goal
+/// actually mentions must be named explicitly.
+#[derive(Debug, Default)]
+pub(crate) struct DtDefInventory {
+    pub by_type: std::collections::HashMap<String, std::collections::HashSet<String>>,
+}
+
+/// The STRUCTURAL rung (2026-07-17, the squeeze-regression fix): the
+/// last branch of the derived closer, for goals whose arithmetic is
+/// gated behind the exec WP calculus's structure — goal-position lets
+/// (which `omega` treats as opaque atoms and plain `simp_all` will
+/// not substitute: `zetaDelta` is off by default), datatype
+/// discriminator/accessor applications on abstract scrutinees (stuck
+/// matches until a `cases` splits the scrutinee), and `height`
+/// termination measures (equation lemmas fire only on constructor
+/// applications, i.e. after the same `cases`).
+///
+/// Shape: `intro <goal-spine names>; intros; cases _tactus_scrut_i :
+/// <scrutinee> <;> … <;> simp_all +zetaDelta only [CORE, extras,
+/// <goal-mentioned generated defs>] <;> omega`.
+///
+/// Everything here is DERIVED from the goal text plus the crate's own
+/// generated-def inventory — deterministic, replayable, no search:
+/// * intro names come from the goal's binder spine (named, not `_`,
+///   so scrutinee terms can reference them; Lean shadowing keeps
+///   duplicates sound, and the trailing `intros` mops any remainder);
+/// * scrutinees are the (let-substituted, span-stripped) bases of the
+///   goal's discriminator/accessor projections and match scrutinees,
+///   first-occurrence order, deduped, capped at 3 (a goal needing
+///   more fails loud — inline-proof surface, §3.4);
+/// * unfold names are the generated defs the goal mentions, resolved
+///   against types the goal/binders actually name (so a short field
+///   name can never pull in a def of an unmentioned datatype).
+///
+/// The rung is ADDITIVE: it runs only after rfl/decide/omega, the
+/// peeled kernel rungs, and the pool-validated CORE rung have all
+/// failed, so its reach cannot regress previously-closing goals.
+pub(crate) fn structural_rung(
+    goal: &Expr,
+    dts: &DtDefInventory,
+    binders: &[Binder],
+) -> String {
+    let mut scan = StructuralScan::new(dts);
+    // Binder TYPES participate fully: hypothesis propositions live
+    // there (extracted requires-hyps pre-N1; ALL hyps and let
+    // equations after N1 hoisting), and datatype mentions often
+    // appear only there (`c : test_crate.Choice` — the 2026-07-17
+    // Cause-A gap). Scrutinee targets found in a binder type
+    // reference theorem binders, which `cases` can name directly.
+    for b in binders {
+        scan.collect_mentioned_types(&b.ty);
+    }
+    scan.collect_mentioned_types(goal);
+    let env = std::collections::HashMap::new();
+    for b in binders {
+        scan.walk(&b.ty, &env);
+    }
+    scan.walk(goal, &env);
+
+    let mut steps: Vec<String> = Vec::new();
+    let intro_names = spine_intro_names(goal);
+    if !intro_names.is_empty() {
+        steps.push(format!("intro {}", intro_names.join(" ")));
+    }
+    steps.push("intros".to_string());
+    let prefix = steps.join("; ");
+
+    let mut unfolds: Vec<String> = scan.unfolds.into_iter().collect();
+    unfolds.sort();
+    let simp_list = if unfolds.is_empty() {
+        format!("{}, {}", CORE_LEMMAS, STRUCTURAL_EXTRA_LEMMAS)
+    } else {
+        format!("{}, {}, {}", CORE_LEMMAS, STRUCTURAL_EXTRA_LEMMAS, unfolds.join(", "))
+    };
+    let tail = format!("simp_all +zetaDelta only [{}] <;> omega", simp_list);
+
+    let cases: Vec<String> = scan.targets.iter().take(3).enumerate()
+        .map(|(i, t)| format!("cases _tactus_scrut_{} : {}", i, t))
+        .collect();
+    if cases.is_empty() {
+        format!("{}; {}", prefix, tail)
+    } else {
+        format!("{}; {} <;> {}", prefix, cases.join(" <;> "), tail)
+    }
+}
+
+/// Named intro tokens for the goal's leading binder spine (∀ binders,
+/// goal-position lets, implication antecedents). Names mirror the
+/// binders so `structural_rung`'s scrutinee terms can reference them
+/// after intro; antecedents intro as `_` (hypotheses are consumed by
+/// `simp_all`, never referenced by name). Stops at the first
+/// non-spine node.
+fn spine_intro_names(goal: &Expr) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = goal;
+    loop {
+        match &cur.node {
+            ExprNode::SpanMark { inner, .. } => cur = inner,
+            ExprNode::Forall { binders, body } => {
+                for b in binders {
+                    out.push(match &b.name {
+                        Some(n) => n.as_str().to_string(),
+                        None => "_".to_string(),
+                    });
+                }
+                cur = body;
+            }
+            ExprNode::Let { name, body, .. } => {
+                out.push(name.as_str().to_string());
+                cur = body;
+            }
+            ExprNode::BinOp { op: BinOp::Implies, rhs, .. } => {
+                out.push("_".to_string());
+                cur = rhs;
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Goal walker backing `structural_rung`. Two passes: type-mention
+/// collection (pass 1) so short accessor names resolve only against
+/// datatypes the goal actually names, then the substituting walk
+/// (pass 2) that gathers unfold names and cases targets.
+struct StructuralScan<'a> {
+    dts: &'a DtDefInventory,
+    mentioned_types: std::collections::HashSet<String>,
+    unfolds: std::collections::BTreeSet<String>,
+    targets: Vec<String>,
+    targets_seen: std::collections::HashSet<String>,
+}
+
+impl<'a> StructuralScan<'a> {
+    fn new(dts: &'a DtDefInventory) -> Self {
+        StructuralScan {
+            dts,
+            mentioned_types: Default::default(),
+            unfolds: Default::default(),
+            targets: Vec::new(),
+            targets_seen: Default::default(),
+        }
+    }
+
+    /// Pass 1: every full name the goal mentions (`Var` nodes — type
+    /// ascriptions, constructor heads, def applications) marks its
+    /// dotted prefixes as mentioned types.
+    fn collect_mentioned_types(&mut self, e: &Expr) {
+        if let ExprNode::Var(n) = &e.node {
+            let s = n.as_str();
+            for (i, ch) in s.char_indices() {
+                if ch == '.' && self.dts.by_type.contains_key(&s[..i]) {
+                    self.mentioned_types.insert(s[..i].to_string());
+                }
+            }
+            if self.dts.by_type.contains_key(s) {
+                self.mentioned_types.insert(s.to_string());
+            }
+        }
+        e.for_each_child(&mut |c| self.collect_mentioned_types(c));
+    }
+
+    /// Full unfold names for a short accessor/discriminator name,
+    /// resolved against mentioned types only.
+    fn resolve_short(&self, short: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for t in &self.mentioned_types {
+            if self.dts.by_type.get(t).map_or(false, |set| set.contains(short)) {
+                out.push(format!("{}.{}", t, short));
+            }
+        }
+        out
+    }
+
+    fn push_target(&mut self, e: &Expr, env: &std::collections::HashMap<String, Expr>) {
+        let sub = subst_lets(e, env);
+        let text = crate::lean_pp::pp_expr(&sub);
+        // Guards: single-line, modest size (a monster term as a cases
+        // target helps nobody — fail loud instead), not a literal.
+        if text.contains('\n') || text.len() > 120 || text.is_empty() {
+            return;
+        }
+        if matches!(sub.node, ExprNode::Lit(_) | ExprNode::LitBool(_)) {
+            return;
+        }
+        if self.targets_seen.insert(text.clone()) {
+            self.targets.push(text);
+        }
+    }
+
+    fn walk(&mut self, e: &Expr, env: &std::collections::HashMap<String, Expr>) {
+        match &e.node {
+            ExprNode::SpanMark { inner, .. } => self.walk(inner, env),
+            ExprNode::Let { name, value, body } => {
+                self.walk(value, env);
+                let mut env2 = env.clone();
+                env2.insert(name.as_str().to_string(), subst_lets(value, env));
+                self.walk(body, &env2);
+            }
+            ExprNode::Forall { binders, body }
+            | ExprNode::Exists { binders, body }
+            | ExprNode::Lambda { binders, body } => {
+                let mut env2 = env.clone();
+                for b in binders {
+                    self.walk(&b.ty, env);
+                    if let Some(n) = &b.name {
+                        env2.remove(n.as_str());
+                    }
+                }
+                self.walk(body, &env2);
+            }
+            ExprNode::FieldProj { expr, field } => {
+                self.walk(expr, env);
+                let resolved = self.resolve_short(field);
+                if !resolved.is_empty() {
+                    for name in resolved {
+                        self.unfolds.insert(name);
+                    }
+                    self.push_target(expr, env);
+                }
+            }
+            ExprNode::Match { scrutinee, arms } => {
+                self.walk(scrutinee, env);
+                self.push_target(scrutinee, env);
+                for arm in arms {
+                    self.walk(&arm.body, env);
+                }
+            }
+            ExprNode::App { head, args } => {
+                if let ExprNode::Var(n) = &head.node {
+                    let s = n.as_str();
+                    if let Some(dot) = s.rfind('.') {
+                        let (t, short) = (&s[..dot], &s[dot + 1..]);
+                        if self.dts.by_type.get(t).map_or(false, |set| set.contains(short)) {
+                            self.unfolds.insert(s.to_string());
+                        }
+                    }
+                }
+                self.walk(head, env);
+                for a in args {
+                    self.walk(a, env);
+                }
+            }
+            _ => e.for_each_child(&mut |c| self.walk(c, env)),
+        }
+    }
+}
+
+/// Substituting clone: goal-`let` bindings inlined (matching what
+/// `+zetaDelta` will do in the rung's simp), `SpanMark` comments
+/// stripped (they would inject `/- @rust … -/` into tactic text).
+/// Binder shadowing removes env entries, so capture is respected.
+fn subst_lets(e: &Expr, env: &std::collections::HashMap<String, Expr>) -> Expr {
+    match &e.node {
+        ExprNode::SpanMark { inner, .. } => subst_lets(inner, env),
+        ExprNode::Var(n) => match env.get(n.as_str()) {
+            Some(v) => v.clone(),
+            None => e.clone(),
+        },
+        ExprNode::Let { name, value, body } => {
+            let mut env2 = env.clone();
+            env2.insert(name.as_str().to_string(), subst_lets(value, env));
+            subst_lets(body, &env2)
+        }
+        ExprNode::Forall { binders, body } => {
+            let mut env2 = env.clone();
+            let bs = binders.iter().map(|b| {
+                let b2 = crate::lean_ast::Binder {
+                    name: b.name.clone(),
+                    ty: subst_lets(&b.ty, env),
+                    kind: b.kind,
+                };
+                if let Some(n) = &b.name {
+                    env2.remove(n.as_str());
+                }
+                b2
+            }).collect();
+            Expr::new(ExprNode::Forall { binders: bs, body: Box::new(subst_lets(body, &env2)) })
+        }
+        ExprNode::Exists { binders, body } => {
+            let mut env2 = env.clone();
+            let bs = binders.iter().map(|b| {
+                let b2 = crate::lean_ast::Binder {
+                    name: b.name.clone(),
+                    ty: subst_lets(&b.ty, env),
+                    kind: b.kind,
+                };
+                if let Some(n) = &b.name {
+                    env2.remove(n.as_str());
+                }
+                b2
+            }).collect();
+            Expr::new(ExprNode::Exists { binders: bs, body: Box::new(subst_lets(body, &env2)) })
+        }
+        ExprNode::Lambda { binders, body } => {
+            let mut env2 = env.clone();
+            let bs = binders.iter().map(|b| {
+                let b2 = crate::lean_ast::Binder {
+                    name: b.name.clone(),
+                    ty: subst_lets(&b.ty, env),
+                    kind: b.kind,
+                };
+                if let Some(n) = &b.name {
+                    env2.remove(n.as_str());
+                }
+                b2
+            }).collect();
+            Expr::new(ExprNode::Lambda { binders: bs, body: Box::new(subst_lets(body, &env2)) })
+        }
+        _ => Expr::new(crate::lean_ast::map_children(&e.node, |c| subst_lets(c, env))),
     }
 }
 
@@ -93,6 +615,39 @@ pub(crate) fn select_deterministic(goal: &Expr, binders: &[Binder]) -> Option<Se
             if frag_type(&b.ty) {
                 env.int_vars.insert(name.as_str().to_string());
             }
+        }
+    }
+
+    // N1 (let-hoisting): definitional-equation hypotheses `h : x = v`
+    // CONSTRAIN their variable — when the goal mentions `x`, omega
+    // needs the equation, so `v` must be in-fragment or the selection
+    // is a completeness misfire (observed: `val = Int.ofNat 1` — the
+    // classifier saw only Int-typed `val` in the goal, selected bare
+    // omega, and omega treated the un-normalized `Int.ofNat` atom as
+    // opaque). Chase mentions through equation RHSs to a fixpoint
+    // (chained lets: `x = y + 1`, `y = z * 2`, …), rejecting on any
+    // out-of-fragment equation over a mentioned variable.
+    loop {
+        let mut changed = false;
+        for b in binders {
+            let ExprNode::BinOp { op: BinOp::Eq, lhs, rhs } = &b.ty.node else {
+                continue;
+            };
+            let ExprNode::Var(v) = &lhs.node else { continue };
+            if !used.contains(v.as_str()) {
+                continue;
+            }
+            if !frag_term(rhs, &env) {
+                return None;
+            }
+            let before = used.len();
+            collect_var_names(rhs, &mut used);
+            if used.len() != before {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
 
