@@ -244,12 +244,16 @@ pub(crate) const DERIVED_MARKER: &str = "tactus_derived_marker__";
 /// named obligation — that is the suggestion signal for an inline
 /// proof, per §3.4. `tactus_auto` remains in the prelude for
 /// discover-mode overrides; it no longer appears in default emission.
-pub(crate) fn derived_closer(goal: &Expr, dts: &DtDefInventory) -> String {
+pub(crate) fn derived_closer(
+    goal: &Expr,
+    dts: &DtDefInventory,
+    binders: &[Binder],
+) -> String {
     format!(
         "first | rfl | decide | omega | ({}) | ({}) | ({})",
         render_peel(goal, "first | rfl | decide | omega"),
         core_simp(),
-        structural_rung(goal, dts)
+        structural_rung(goal, dts, binders)
     )
 }
 
@@ -298,10 +302,26 @@ pub(crate) struct DtDefInventory {
 /// The rung is ADDITIVE: it runs only after rfl/decide/omega, the
 /// peeled kernel rungs, and the pool-validated CORE rung have all
 /// failed, so its reach cannot regress previously-closing goals.
-pub(crate) fn structural_rung(goal: &Expr, dts: &DtDefInventory) -> String {
+pub(crate) fn structural_rung(
+    goal: &Expr,
+    dts: &DtDefInventory,
+    binders: &[Binder],
+) -> String {
     let mut scan = StructuralScan::new(dts);
+    // Binder TYPES participate fully: hypothesis propositions live
+    // there (extracted requires-hyps pre-N1; ALL hyps and let
+    // equations after N1 hoisting), and datatype mentions often
+    // appear only there (`c : test_crate.Choice` — the 2026-07-17
+    // Cause-A gap). Scrutinee targets found in a binder type
+    // reference theorem binders, which `cases` can name directly.
+    for b in binders {
+        scan.collect_mentioned_types(&b.ty);
+    }
     scan.collect_mentioned_types(goal);
     let env = std::collections::HashMap::new();
+    for b in binders {
+        scan.walk(&b.ty, &env);
+    }
     scan.walk(goal, &env);
 
     let mut steps: Vec<String> = Vec::new();
@@ -595,6 +615,39 @@ pub(crate) fn select_deterministic(goal: &Expr, binders: &[Binder]) -> Option<Se
             if frag_type(&b.ty) {
                 env.int_vars.insert(name.as_str().to_string());
             }
+        }
+    }
+
+    // N1 (let-hoisting): definitional-equation hypotheses `h : x = v`
+    // CONSTRAIN their variable — when the goal mentions `x`, omega
+    // needs the equation, so `v` must be in-fragment or the selection
+    // is a completeness misfire (observed: `val = Int.ofNat 1` — the
+    // classifier saw only Int-typed `val` in the goal, selected bare
+    // omega, and omega treated the un-normalized `Int.ofNat` atom as
+    // opaque). Chase mentions through equation RHSs to a fixpoint
+    // (chained lets: `x = y + 1`, `y = z * 2`, …), rejecting on any
+    // out-of-fragment equation over a mentioned variable.
+    loop {
+        let mut changed = false;
+        for b in binders {
+            let ExprNode::BinOp { op: BinOp::Eq, lhs, rhs } = &b.ty.node else {
+                continue;
+            };
+            let ExprNode::Var(v) = &lhs.node else { continue };
+            if !used.contains(v.as_str()) {
+                continue;
+            }
+            if !frag_term(rhs, &env) {
+                return None;
+            }
+            let before = used.len();
+            collect_var_names(rhs, &mut used);
+            if used.len() != before {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
 

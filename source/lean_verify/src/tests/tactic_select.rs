@@ -219,7 +219,7 @@ fn derived_closer_is_search_free_and_census_exact() {
     // no search tactic named, kernel rungs + generated intro/refine
     // prefix + fixed CORE set + omega tail.
     let goal = bin(BinOp::Eq, var("x"), var("y"));
-    let derived = derived_closer(&goal, &Default::default());
+    let derived = derived_closer(&goal, &Default::default(), &[]);
     assert!(!derived.contains("tactus_auto"));
     assert!(!derived.contains("case_split"));
     assert!(!derived.contains("tactus_first"));

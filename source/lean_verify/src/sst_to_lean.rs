@@ -1121,11 +1121,11 @@ pub fn exec_fn_theorems_to_ast<'a>(
     let add_pre_capture = |obl: OblCtx, raw_name: &str, lean_name: &crate::lean_name::LeanName| -> OblCtx {
         let pre_name = crate::lean_name::LeanName::synthetic(varat_pre_name(raw_name));
         let inner = LExpr::field_proj(LExpr::var(lean_name.clone()), "deref");
-        obl.with_frame(CtxFrame::Let(pre_name, inner))
+        obl.with_frame(CtxFrame::Let(pre_name, inner, None))
     };
     let add_body_shadow = |obl: OblCtx, lean_name: crate::lean_name::LeanName| -> OblCtx {
         let inner = LExpr::field_proj(LExpr::var(lean_name.clone()), "deref");
-        obl.with_frame(CtxFrame::Let(lean_name, inner))
+        obl.with_frame(CtxFrame::Let(lean_name, inner, None))
     };
     for par in fn_sst.x.pars.iter() {
         let lean_name = crate::lean_name::LeanName::from_var_ident(&par.x.name);
@@ -1339,6 +1339,80 @@ pub use crate::obligation_naming::{format_span_loc, kind_to_name};
 pub(crate) use crate::obligation_naming::sanitize_loc_for_name;
 use crate::obligation_naming::{build_theorem_name, detect_assert_kind, format_rust_loc};
 
+/// Rename free variable references per `env` (N1 let-hoisting: after a
+/// shadowed binding is freshened, every later reference in frame
+/// values / hypothesis props / the leaf must follow). Shadow-aware:
+/// an expression-level binder for a name removes its env entry inside
+/// that scope, so capture is respected. `SpanMark`s and all other
+/// structure are preserved verbatim.
+fn rename_frame_vars(
+    e: &LExpr,
+    env: &HashMap<String, crate::lean_name::LeanName>,
+) -> LExpr {
+    if env.is_empty() {
+        return e.clone();
+    }
+    use crate::lean_ast::ExprNode;
+    let shadowed = |env: &HashMap<String, crate::lean_name::LeanName>,
+                    names: Vec<String>| {
+        let mut e2 = env.clone();
+        for n in names {
+            e2.remove(&n);
+        }
+        e2
+    };
+    match &e.node {
+        ExprNode::Var(n) => match env.get(n.as_str()) {
+            Some(new) => LExpr::var(new.clone()),
+            None => e.clone(),
+        },
+        ExprNode::Let { name, value, body } => {
+            let value2 = rename_frame_vars(value, env);
+            let env2 = shadowed(env, vec![name.as_str().to_string()]);
+            LExpr::new(ExprNode::Let {
+                name: name.clone(),
+                value: Box::new(value2),
+                body: Box::new(rename_frame_vars(body, &env2)),
+            })
+        }
+        ExprNode::Forall { binders, body }
+        | ExprNode::Exists { binders, body }
+        | ExprNode::Lambda { binders, body } => {
+            let binders2: Vec<LBinder> = binders
+                .iter()
+                .map(|b| {
+                    let mut b2 = b.clone();
+                    b2.ty = rename_frame_vars(&b.ty, env);
+                    b2
+                })
+                .collect();
+            let names = binders
+                .iter()
+                .filter_map(|b| b.name.as_ref().map(|n| n.as_str().to_string()))
+                .collect();
+            let env2 = shadowed(env, names);
+            let body2 = Box::new(rename_frame_vars(body, &env2));
+            LExpr::new(match &e.node {
+                ExprNode::Forall { .. } => ExprNode::Forall { binders: binders2, body: body2 },
+                ExprNode::Exists { .. } => ExprNode::Exists { binders: binders2, body: body2 },
+                _ => ExprNode::Lambda { binders: binders2, body: body2 },
+            })
+        }
+        ExprNode::Subtype { name, ty, pred } => {
+            let ty2 = rename_frame_vars(ty, env);
+            let env2 = shadowed(env, vec![name.as_str().to_string()]);
+            LExpr::new(ExprNode::Subtype {
+                name: name.clone(),
+                ty: Box::new(ty2),
+                pred: Box::new(rename_frame_vars(pred, &env2)),
+            })
+        }
+        _ => LExpr::new(crate::lean_ast::map_children(&e.node, |c| {
+            rename_frame_vars(c, env)
+        })),
+    }
+}
+
 /// One frame of accumulated context as the obligation walker descends
 /// into a Wp tree. Pushed at scope-introducing points (let bindings,
 /// branch hypotheses, assert hypotheses, assume hypotheses); popped
@@ -1356,7 +1430,13 @@ use crate::obligation_naming::{build_theorem_name, detect_assert_kind, format_ru
 enum CtxFrame {
     /// `let x := v;` wrapping. The walker pushes this at every
     /// `Wp::Let` (or while peeling a `Bind(Let)` inside a let-RHS).
-    Let(crate::lean_name::LeanName, LExpr),
+    /// The third field is the binding's VIR type when the push site
+    /// has it (N1 let-hoisting, DESIGN-leaf-normal-emission.md §2:
+    /// a typed Let frame can hoist to a theorem-level binder + an
+    /// equation hypothesis; a `None` frame blocks hoisting for its
+    /// obligation, which falls back to goal-position wrapping —
+    /// the fallback count is the N1 coverage meter).
+    Let(crate::lean_name::LeanName, LExpr, Option<Typ>),
     /// `P →` wrapping. Pushed for assumes, branch conditions, and
     /// assertions that already passed (the asserted condition
     /// becomes a hypothesis for the rest of the body). Carries its
@@ -1542,12 +1622,149 @@ impl OblCtx {
     fn wrap(&self, mut goal: LExpr) -> LExpr {
         for frame in self.frames.iter().rev() {
             goal = match frame {
-                CtxFrame::Let(name, v) => LExpr::let_bind(name.clone(), v.clone(), goal),
+                CtxFrame::Let(name, v, _) => LExpr::let_bind(name.clone(), v.clone(), goal),
                 CtxFrame::Hyp(p, _) => LExpr::implies(p.clone(), goal),
                 CtxFrame::Binder(b) => LExpr::forall(vec![b.clone()], goal),
             };
         }
         goal
+    }
+
+    /// N1 let-hoisting (DESIGN-leaf-normal-emission.md §2): hoist EVERY
+    /// frame to a theorem-level binder, producing a FLAT goal.
+    ///
+    /// * `Let(x, v, Some(T))` → `(x : T)` + equation hypothesis
+    ///   `(h_x : x = v)`. The equation replaces the definitional let:
+    ///   `omega` consumes equations natively, `simp_all` rewrites with
+    ///   them — no `+zetaDelta`, no opaque let-fvar atoms, no
+    ///   substitution blowup (hoisting is linear where substitution of
+    ///   chained assignment lets is exponential).
+    /// * `Hyp(P, prov)` → `(_h_hoist_i : P)`, provenance carried (same
+    ///   representation `split_leading_binders` already uses).
+    /// * `Binder(b)` → itself.
+    ///
+    /// Shadowing: WP assignment lets rebind names (`let x := x + 1`)
+    /// with the RHS scoped to the PREVIOUS binding. A binder telescope
+    /// cannot express that with duplicate names (the equation's RHS
+    /// would resolve to the new binder — self-reference), so later
+    /// bindings of a taken name are freshened (`x_hoist1`, …) and all
+    /// subsequent references are renamed via `rename_frame_vars`. The
+    /// FIRST binding keeps its source name.
+    ///
+    /// Returns `None` — caller falls back to goal-position `wrap` —
+    /// when any `Let` frame lacks its typ (the N1 coverage meter:
+    /// `LetRaw`, ensures-leaf let peels, and mut-ref shadows don't
+    /// carry one yet).
+    fn hoist_all(
+        &self,
+        leaf: &LExpr,
+        taken_names: &std::collections::HashSet<String>,
+    ) -> Option<(Vec<(LBinder, Option<HypProvenance>)>, LExpr)> {
+        use crate::lean_name::LeanName;
+        for f in self.frames.iter() {
+            match f {
+                CtxFrame::Let(_, _, None) => return None,
+                // Bool-typed lets are the WP's if-condition temps
+                // (`let tmp__1 := x < 50`). Hoisted, they become
+                // Prop-typed binders with PROPOSITIONAL equations
+                // (`tmp__1 = (x < 50)`) — omega cannot consume a
+                // Prop equation, `decide` cannot touch the free
+                // binder, and CORE's `eq_iff_iff` family loops simp
+                // on them (nested_if maxRecDepth regression,
+                // 2026-07-17). Keep those obligations on the
+                // goal-position wrap until N2 splits the conditions
+                // properly.
+                CtxFrame::Let(_, _, Some(t))
+                    if matches!(&**t, vir::ast::TypX::Bool) =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        let mut out: Vec<(LBinder, Option<HypProvenance>)> = Vec::new();
+        let mut env: HashMap<String, LeanName> = HashMap::new();
+        let mut bound: std::collections::HashSet<String> = taken_names.clone();
+        let mut fresh = |base: &str, bound: &mut std::collections::HashSet<String>| -> LeanName {
+            let mut i = 1usize;
+            loop {
+                let cand = format!("{}_hoist{}", base, i);
+                if !bound.contains(&cand) {
+                    bound.insert(cand.clone());
+                    return LeanName::synthetic(cand);
+                }
+                i += 1;
+            }
+        };
+        let mut hyp_counter = 0usize;
+        for frame in self.frames.iter() {
+            match frame {
+                CtxFrame::Let(name, v, typ) => {
+                    let typ = typ.as_ref().expect("checked above");
+                    let v2 = rename_frame_vars(v, &env);
+                    let src = name.as_str().to_string();
+                    let chosen = if bound.contains(&src) {
+                        let f = fresh(&src, &mut bound);
+                        env.insert(src, f.clone());
+                        f
+                    } else {
+                        bound.insert(src.clone());
+                        env.remove(&src);
+                        name.clone()
+                    };
+                    let eq_name = fresh(&format!("_h_{}", chosen.as_str()), &mut bound);
+                    out.push((
+                        LBinder::explicit(
+                            chosen.clone(),
+                            crate::to_lean_type::typ_to_expr(typ),
+                        ),
+                        None,
+                    ));
+                    out.push((
+                        LBinder::explicit(
+                            eq_name,
+                            LExpr::eq(LExpr::var(chosen), v2),
+                        ),
+                        // Definitional-equation hypothesis; census-Other
+                        // for the Link-discharge spine until a dedicated
+                        // provenance variant exists (doc §5 Q1).
+                        Some(HypProvenance::Other),
+                    ));
+                }
+                CtxFrame::Hyp(p, prov) => {
+                    let p2 = rename_frame_vars(p, &env);
+                    hyp_counter += 1;
+                    let h_name = {
+                        let base = format!("_h_hoist_{}", hyp_counter);
+                        if bound.contains(&base) {
+                            fresh(&base, &mut bound)
+                        } else {
+                            bound.insert(base.clone());
+                            LeanName::synthetic(base)
+                        }
+                    };
+                    out.push((LBinder::explicit(h_name, p2), Some(prov.clone())));
+                }
+                CtxFrame::Binder(b) => {
+                    let ty2 = rename_frame_vars(&b.ty, &env);
+                    let mut b2 = b.clone();
+                    b2.ty = ty2;
+                    if let Some(n) = &b.name {
+                        let src = n.as_str().to_string();
+                        if bound.contains(&src) {
+                            let f = fresh(&src, &mut bound);
+                            env.insert(src, f.clone());
+                            b2.name = Some(f);
+                        } else {
+                            bound.insert(src.clone());
+                            env.remove(&src);
+                        }
+                    }
+                    out.push((b2, None));
+                }
+            }
+        }
+        Some((out, rename_frame_vars(leaf, &env)))
     }
 
     /// Build an explicit-named `intro` list for any frames that did
@@ -1561,7 +1778,7 @@ impl OblCtx {
     /// daggers. Empty result means no injection is needed.
     fn intro_names_for_user_tactic(&self) -> Vec<String> {
         self.frames.iter().map(|f| match f {
-            CtxFrame::Let(name, _) => name.as_str().to_string(),
+            CtxFrame::Let(name, ..) => name.as_str().to_string(),
             CtxFrame::Binder(b) => b.name.as_ref()
                 .map(|n| n.as_str().to_string())
                 .unwrap_or_else(|| "_".to_string()),
@@ -1643,7 +1860,7 @@ impl OblCtx {
     fn wrap_no_hyps(&self, mut goal: LExpr) -> LExpr {
         for frame in self.frames.iter().rev() {
             goal = match frame {
-                CtxFrame::Let(name, v) => LExpr::let_bind(name.clone(), v.clone(), goal),
+                CtxFrame::Let(name, v, _) => LExpr::let_bind(name.clone(), v.clone(), goal),
                 CtxFrame::Hyp(..) => goal,
                 CtxFrame::Binder(b) => LExpr::forall(vec![b.clone()], goal),
             };
@@ -1795,6 +2012,40 @@ impl ObligationEmitter {
     /// set; overridden inside `AssertQuery` scopes via
     /// `obl.new_scope(...)`). See `BUG-loop-local-names-alpha-renamed.md`.
     fn emit_split(&mut self, name: String, leaf: LExpr, obl: &OblCtx) {
+        // N1 let-hoisting (DESIGN-leaf-normal-emission.md): DEFAULT-closer
+        // obligations emit with EVERY frame hoisted to a theorem binder
+        // and a flat goal — lets become binder + equation-hypothesis
+        // pairs, so the goal reaches the closers with no goal-position
+        // lets (no `+zetaDelta`, no opaque let-fvar omega atoms) and
+        // flat arithmetic goals classify into S1's omega fragment.
+        // User closers (`tactus_tactic` overrides, AssertQuery scopes)
+        // keep the goal-position wrap — their tactic bodies were
+        // written against that shape. Falls back to the wrap when a
+        // Let frame lacks its typ (see `hoist_all`).
+        let is_default = matches!(&obl.closer, Tactic::Named(n) if n == "tactus_auto");
+        if is_default {
+            let taken: std::collections::HashSet<String> = self
+                .base_binders
+                .iter()
+                .filter_map(|b| b.name.as_ref().map(|n| n.as_str().to_string()))
+                .collect();
+            if let Some((extras, flat_leaf)) = obl.hoist_all(&leaf, &taken) {
+                let mut empty = obl.clone();
+                empty.frames = im::Vector::new();
+                let shape = self.build_goal_shape(&extras, &empty, &flat_leaf);
+                let extras_b: Vec<LBinder> =
+                    extras.into_iter().map(|(b, _)| b).collect();
+                self.emit_with_extras(
+                    name,
+                    flat_leaf,
+                    obl.closer.clone(),
+                    obl.closer_preamble.clone(),
+                    extras_b,
+                    Some(shape),
+                );
+                return;
+            }
+        }
         let (extras, remaining) = obl.split_leading_binders();
         let shape = self.build_goal_shape(&extras, &remaining, &leaf);
         let extras: Vec<LBinder> = extras.into_iter().map(|(b, _)| b).collect();
@@ -1832,7 +2083,7 @@ impl ObligationEmitter {
         }
         for frame in remaining.frames.iter() {
             spine.push(match frame {
-                CtxFrame::Let(name, v) => GoalSpine::Let(name.clone(), v.clone()),
+                CtxFrame::Let(name, v, _) => GoalSpine::Let(name.clone(), v.clone()),
                 CtxFrame::Hyp(p, prov) => GoalSpine::Imp(p.clone(), prov.clone()),
                 CtxFrame::Binder(b) => GoalSpine::All(b.clone(), None),
             });
@@ -1884,6 +2135,7 @@ impl ObligationEmitter {
                     None => Tactic::Raw(crate::tactic_select::derived_closer(
                         &goal,
                         &self.dt_inventory,
+                        &binders,
                     )),
                 }
             }
@@ -1896,7 +2148,9 @@ impl ObligationEmitter {
             if text.contains(crate::tactic_select::DERIVED_MARKER) {
                 closer = Tactic::Raw(text.replace(
                     crate::tactic_select::DERIVED_MARKER,
-                    &crate::tactic_select::derived_closer(&goal, &self.dt_inventory),
+                    &crate::tactic_select::derived_closer(
+                        &goal, &self.dt_inventory, &binders,
+                    ),
                 ));
             }
         }
@@ -2200,7 +2454,7 @@ fn walk_obligations<'a>(
             // to re-validate or to fork on value-position ifs (the
             // closure case that produces this doesn't have if-shaped
             // RHSs by construction).
-            let new_obl = obl.with_frame(CtxFrame::Let(name.clone(), value.clone()));
+            let new_obl = obl.with_frame(CtxFrame::Let(name.clone(), value.clone(), None));
             walk_obligations(body, ctx, &new_obl, e);
         }
         Wp::ClosureBody { closure_params, body, after } => {
@@ -2437,7 +2691,7 @@ fn emit_done_or_split(leaf: &LExpr, obl: &OblCtx, e: &mut ObligationEmitter) {
         // label the body's contents.
         ExprNode::Let { name, value, body } => {
             let new_obl = obl.with_frame(CtxFrame::Let(
-                name.clone(), value.as_ref().clone(),
+                name.clone(), value.as_ref().clone(), None,
             ));
             emit_done_or_split(body, &new_obl, e);
         }
@@ -2591,6 +2845,7 @@ fn walk_loop<'a>(
         maintain_obl.frames.push_back(CtxFrame::Let(
             crate::lean_name::LeanName::synthetic(level.d_old_name.clone()),
             lower_validated(&level.value),
+            Some(level.value.raw().typ.clone()),
         ));
     }
     walk_obligations(body, ctx, &maintain_obl, e);
@@ -2657,7 +2912,7 @@ fn push_mod_var_frames<'a>(
     let mod_name_strs: std::collections::HashSet<&str> =
         mod_names.iter().map(|n| n.as_str()).collect();
     obl.frames.retain(|frame| match frame {
-        CtxFrame::Let(name, _) => !mod_names.contains(name),
+        CtxFrame::Let(name, ..) => !mod_names.contains(name),
         CtxFrame::Hyp(p, _) => !mod_name_strs.iter()
             .any(|n| crate::lean_ast::mentions_free_var(p, n)),
         CtxFrame::Binder(_) => true,
@@ -3480,9 +3735,9 @@ fn push_post_call_frames(
         } else {
             callee.ret.x.typ.clone()
         };
-        new_obl = new_obl.with_let_binder(dest_lean.clone(), ret_typ_subst, true);
+        new_obl = new_obl.with_let_binder(dest_lean.clone(), ret_typ_subst.clone(), true);
         if !use_dest_name {
-            new_obl.frames.push_back(CtxFrame::Let(dest_lean, dest_value));
+            new_obl.frames.push_back(CtxFrame::Let(dest_lean, dest_value, Some(ret_typ_subst)));
         }
     }
 
@@ -4439,7 +4694,7 @@ fn push_mut_rebinds(
                 build_nested_field_update(LExpr::var(local_name.clone()), field_oprs, coerced_fresh)
             }
         };
-        new_obl.frames.push_back(CtxFrame::Let(local_name, new_value));
+        new_obl.frames.push_back(CtxFrame::Let(local_name, new_value, None));
     }
 }
 
@@ -4529,7 +4784,7 @@ fn walk_let<'a>(
                             crate::to_lean_sst_expr::sst_actual_is_trusted(&b.a, &rctx);
                         let b_value = b_typed.into_slot(&b.a.typ);
                         chain_obl = chain_obl
-                            .with_frame(CtxFrame::Let(b_name.clone(), b_value))
+                            .with_frame(CtxFrame::Let(b_name.clone(), b_value, Some(b.a.typ.clone())))
                             .with_let_binder(b_name, b.a.typ.clone(), b_trusted);
                     }
                     walk_let(name, inner_body, dest_typ, body, ctx, &chain_obl, e);
@@ -4560,7 +4815,7 @@ fn walk_let<'a>(
     let trusted = crate::to_lean_sst_expr::sst_actual_is_trusted(val, &rctx);
     let coerced = val_typed.into_slot(dest_typ);
     let new_obl = obl
-        .with_frame(CtxFrame::Let(name.clone(), coerced))
+        .with_frame(CtxFrame::Let(name.clone(), coerced, Some(dest_typ.clone())))
         .with_let_binder(name.clone(), dest_typ.clone(), trusted);
     walk_obligations(body, ctx, &new_obl, e);
 }
