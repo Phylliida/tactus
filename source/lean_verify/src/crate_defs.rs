@@ -737,7 +737,7 @@ fn render_and_build(
             }
         }
     }
-    cmds.push(Command::Raw(crate::prelude::TACTUS_PRELUDE_IMPORT.to_string()));
+    cmds.push(Command::Raw(crate::prelude::TACTUS_DEFS_IMPORT.to_string()));
     // Option B: no namespace wrapper (decls carry full dotted names).
     let _ = &ns;
     cmds.push(Command::Raw("set_option autoImplicit false".to_string()));
