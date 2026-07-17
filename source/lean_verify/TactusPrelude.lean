@@ -471,30 +471,6 @@ macro "tactus_auto" : tactic => `(tactic|
     | tactus_case_split (simp_all)
     | fail "tactus: auto-tactic failed — add explicit proof block")
 
--- Recursively peel goal structure: split any top-level `∧`, introduce
--- any leading `∀` / `→`, and recurse on the resulting subgoals. Each
--- branch either removes one layer of the goal tree or hits a leaf and
--- exits via `skip`, so termination is bounded by goal size.
---
--- Used by the tactic we emit for exec fns that contain loops — those
--- produce goals shaped like `init ∧ maintain ∧ use`, with nested
--- `∀ (v : T), bounds → ...` inside each conjunct. Sequential / nested
--- loops stack the same structure, so a bounded-depth peeler would
--- have to guess the bound; recursion just follows the structure.
-syntax "tactus_peel" : tactic
-macro_rules
-  | `(tactic| tactus_peel) => `(tactic|
-      first
-        | (apply And.intro <;> tactus_peel)
-        -- Destructure conjunctive hypotheses on intro so leaf tactics
-        -- that can't split `∧`-hypotheses themselves (not omega — it
-        -- handles them — but future additions like `linarith` /
-        -- `positivity`) get each conjunct as its own hypothesis.
-        -- Matched before plain `intro _` so conjunctions go this path.
-        | (intro ⟨_, _⟩; tactus_peel)
-        | (intro _; tactus_peel)
-        | skip)
-
 -- ── Axiom-closure enforcement (DESIGN-axiom-closure-check.md) ────────
 -- `#tactus_check_axioms thm [ax₁, …]` computes `thm`'s axiom closure
 -- (the same walk `#print axioms` uses) and FAILS ELABORATION if the
