@@ -51,6 +51,11 @@ another (HashMap iteration order somewhere in the hoist decision), and
 the hoist form has a Box coercion bug (`Tree.Node tmp__5.deref` where
 the ctor slot wants `Tactus.Box`). This is what makes the residue-4
 tests flaky rather than stably red/green. Deserves its own board card.
+Where to look: `hoist_all` (sst_to_lean.rs) gates on every `Let` frame
+carrying `Some(typ)` — the flip means the TYPES on those frames come and
+go across runs, so the nondeterminism is upstream in whatever threads
+`binder_typs`/frame types (HashMap iteration order suspect), not in the
+hoist code itself.
 
 ## Follow-up (not on branch)
 
