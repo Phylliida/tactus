@@ -1,9 +1,9 @@
 ---
 title: "S3 — precondition-specific derivation seeding (the 81%-T2 kind)"
-status: todo
-claimed_by:
+status: done
+claimed_by: kimi (folded into mainline-05)
 created: 2026-07-16T17:28:00Z
-updated: 2026-07-16T17:28:00Z
+updated: 2026-07-17T01:10:00Z
 ---
 
 ## Description
@@ -26,3 +26,16 @@ rung-attribution re-run (record before/after), 0 regressions on the 114-fn
 pool.
 
 **Blocked by:** mainline-05 (or merges into it).
+
+## Writeup
+
+FOLDED INTO mainline-05, and superseded by its result in the best possible
+way: preconditions needed NO kind-specific rule at all. The uniform derived
+tactic (`first | rfl | decide | (tactus_peel <;> (first | rfl | decide |
+omega)) | (simp_all only [CORE: 51] <;> omega)`) covers 174/183 T2
+preconditions in the census, and the 6 precondition residue theorems were
+closed by kind-AGNOSTIC inline proofs (if_pos/if_neg discharge, structured
+assembly, absurdity — see mainline-05's writeup). The callee-specific lemma
+seeding this task proposed would have been rule #2; the rule budget stays at
+ONE (Danielle's constraint), and the precondition T2 share in default
+emission is 0% search by construction (final histogram in mainline-05).
