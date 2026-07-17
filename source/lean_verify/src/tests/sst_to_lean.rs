@@ -918,6 +918,7 @@ fn block_stm(stms: Vec<Stm>) -> Stm {
 fn mk_test_ctx() -> WpCtx<'static> {
     WpCtx {
         fn_map: HashMap::new(),
+        datatypes: HashMap::new(),
         type_map: HashMap::new(),
         assert_by_var_typs: HashMap::new(),
         ret_name: None,
