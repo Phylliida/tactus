@@ -59,3 +59,62 @@ DESIGN-transparent-automation.md §3.4).
   the feasibility gate: full-pool validation of the uniform derived tactic
   (census covered T2 winners only; the 68 lower-rung theorems must also
   still close).
+- (2026-07-16 ~23:15Z, kimi) **Feasibility gate DONE, tactic shape settled
+  empirically.** Five gate variants over the full pool (397 real theorems):
+  bare `CORE <;> omega` = 19 failures (11 were lower-rung winners needing
+  kernel/delta closure — spec-fn-app equalities, let-var atoms); adding
+  `first | rfl | decide` = 9; peel-first regressed (peel's destructive
+  intro broke 12 CORE theorems); peel-inside-first = 10 (higman collision:
+  peel mangled decide-shaped goals before decide could fire); FINAL =
+  `first | rfl | decide | (tactus_peel <;> (first | rfl | decide | omega))
+  | (simp_all only [CORE] <;> omega)` = **8 failures, exactly the known
+  census residue**. 389/397 = 98.0%. Note: 5 of the census's 7
+  "goal-specific" theorems (coset assoc_lhs Option cluster) PASS under
+  CORE — used-lists ≠ necessary-lists; residue shrank accordingly.
+- (2026-07-16 ~23:30Z, kimi) **Emitter rule landed + binary built.**
+  `DERIVED_CLOSER` const in `tactic_select.rs` (rule spec in the comment
+  per board convention); `sst_to_lean.rs` chokepoint: S1 selects first,
+  else DERIVED replaces tactus_auto; user closers untouched. Unit test
+  pins the search-free property + exact 43-lemma set (14/14 green).
+  Worktree binary rebuilt (rust_verify release); emit probe confirms
+  DERIVED text in fresh artifacts and Lean-verifies them live.
+- (2026-07-16 ~23:45Z, kimi) **Residue proofs authored + applied** (all
+  verified in scratch against the census artifacts):
+  - coset lemma_trace_inv_rep_to_zero (611/613): CORE + Option.isSome +
+    Option.Some_val0 <;> omega.
+  - apply_hom_symbol_exec pre (414/422): `intro tmp hg; subst tmp;
+    rw [if_pos hg / if_neg hg] at h_req0; exact h_req0` — the if-then-else
+    requires is never discharged by simp; explicit if_pos/if_neg needed.
+  - britton + pred-twin lemma_stable_pair_inv_gen (7191/7224): structured
+    conjunction assembly from h_req3; (7193/7226): absurdity — the branch
+    is unreachable (h_req3 gives rep≠empty, antecedent gives ¬¬(rep=empty)).
+  Applied as fn-level `tactus_tactic` overrides of the form
+  `first | <DERIVED> | <site proof(s)>` — search-free, matching the
+  two-surface end state (NOT the old `first | tactus_auto | …` idiom).
+  gt gate (cold, no -V cache) running.
+- (2026-07-17 ~00:10Z, kimi) **gt gate GREEN (3116/0, package gate live)
+  — then the tutorial battery caught three real gaps.** Extended CORE
+  43→51 with probe-tested additions: `Classical.not_imp` (bare not_imp
+  ambiguous under any Mathlib import), `Int/Nat.mul_add+add_mul`
+  (product distribution for omega's atom relation), `Int.toNat_zero/one`
+  (literal cast reduction), `Int/Nat.add_sub_cancel` (index arithmetic).
+  Full extension protocol + per-gap rationale: MEASUREMENT-s2a §6.1.
+  ALSO landed: the AssertQuery (`by(nonlinear_arith)`) scope fallback now
+  substitutes DERIVED for the default closer at composition time — the
+  378 default-emission theorems that still textually contained
+  `tactus_auto` after the chokepoint change are search-free too.
+  Tutorial pre-existing failures fixed source-side (nullary-lemma
+  applications ×2, dependency-injection call contract ×3 — §6.2).
+- (2026-07-17 ~00:40Z, kimi) **FINAL BATTERY — all green:**
+  - full-pool gate v8: 389/397 (same 8 residue, covered by the gt
+    overrides) — zero regressions at every extension step (v6/v7/v8).
+  - gt gate: **3116 verified / 0 errors**, package gate live (one
+    concurrent-run trait-check panic observed once; solo rerun clean —
+    flagged as infra flakiness, not a proof issue).
+  - tutorial: **10/10** (was 8/10 on main-line — fib_iter + factorial +
+    matrix_fib had pre-existing M6-era failures, now fixed).
+  - suite: lean_verify 14/14 tactic_select; rust_verify_test examples
+    138/140 — the 2 failures (state_machines fifo, flat_combine) are
+    Z3-path storage-safety errors IDENTICAL on the main-line binary
+    (verified side-by-side, 14v/4e both) — pre-existing, outside the
+    Lean backend entirely.

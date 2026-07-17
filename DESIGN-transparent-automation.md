@@ -156,12 +156,17 @@ mainline-04 resolve: **1 (no storage — derivation rules) chosen**;
 
 The chosen shape per obligation, when the closer would be `tactus_auto`:
 
-    simp_all only [CORE — 43 fixed core lemmas] <;> omega
+    first | rfl | decide | (tactus_peel <;> (first | rfl | decide | omega))
+          | (simp_all only [CORE — fixed core lemmas] <;> omega)
 
 Uniform text (the tail is a no-op on goals the simp closes outright), one
-statable rule ("every WP obligation closes under the fixed core normalizer,
-with omega deciding the arithmetic residue"), no per-kind conditionals. Rule
-budget: **one** (Danielle's transparency constraint). The residue — 13 theorems
+statable rule ("every WP obligation closes under kernel rungs or the fixed
+core normalizer, with omega deciding the arithmetic residue"), no per-kind
+conditionals. Rule budget: **one** (Danielle's transparency constraint).
+CORE was 43 lemmas at the census and is **51** after mainline-05
+validation (three probe-tested extensions + one Mathlib-context name
+qualification — full history and the extension probe protocol in
+MEASUREMENT-s2a-derivability.md §6.1). The residue — 13 theorems
 in 2 clusters (Option accessors ×7 in coset_group; no-replay-closes ×6 → 3
 effective sites) — gets inline proofs in source, NOT a rule exception: the
 "accessor lemmas of mentioned symbols' field types" line was considered and
