@@ -150,10 +150,45 @@ pub struct PpOutput {
     pub landmarks: Landmarks,
 }
 
+/// B5 (prelude split): if any theorem in `cmds` cites a search-ladder
+/// tactic in its closer, the file needs `import TactusSearch`. Injected
+/// here — the single chokepoint every artifact path flows through —
+/// rather than at each emission site, so future paths can't forget.
+/// Default emission never triggers (the S2c derived closer and B4's
+/// explicit peel name no search tactics); only user tactic texts
+/// (fn-level overrides, inline proofs) can. Cost is one scan plus a
+/// command-list clone when it fires (rare); the injection lands before
+/// landmark computation, so sourcemap alignment is preserved.
+fn maybe_inject_search_import(cmds: &[Command]) -> std::borrow::Cow<'_, [Command]> {
+    let needs = cmds.iter().any(|c| match c {
+        Command::Theorem(t) => match &t.tactic {
+            Tactic::Raw(s) | Tactic::Named(s) => crate::prelude::needs_search_import(s),
+        },
+        _ => false,
+    });
+    if !needs {
+        return std::borrow::Cow::Borrowed(cmds);
+    }
+    let mut out = cmds.to_vec();
+    // Insert after the leading import block — Lean requires all
+    // `import` statements before any other command.
+    let mut idx = 0;
+    for (i, c) in out.iter().enumerate() {
+        match c {
+            Command::Import(_) => idx = i + 1,
+            Command::Raw(s) if s.starts_with("import ") => idx = i + 1,
+            _ => {}
+        }
+    }
+    out.insert(idx, Command::Import("TactusSearch".to_string()));
+    std::borrow::Cow::Owned(out)
+}
+
 pub fn pp_commands(cmds: &[Command]) -> PpOutput {
+    let cmds = maybe_inject_search_import(cmds);
     let mut out = String::new();
     let mut lm = Landmarks::new();
-    for cmd in cmds {
+    for cmd in cmds.iter() {
         write_command(&mut out, cmd, &mut lm);
     }
     PpOutput { text: out, landmarks: lm }
