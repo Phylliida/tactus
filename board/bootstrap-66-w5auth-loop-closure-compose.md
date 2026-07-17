@@ -1,6 +1,6 @@
 ---
 title: "W5-auth-6 — compose the loop closure: adequacy spine over the authored theorem + permanent runner; close bootstrap-10"
-status: todo
+status: in-progress
 claimed_by:
 created: 2026-07-16T17:15:00Z
 updated: 2026-07-16T23:30:00Z
@@ -71,3 +71,21 @@ no hand chain-discharge, no drift gate; the spine will consume
   the binder channel (tactic-referenced helper deps, generate.rs:3984);
   the gap is the weave channel (body lemma calls → `∀ Unit, fact →`
   premises) + recursion. This card resumes after bootstrap-73 L2.
+
+- (2026-07-18, fable-b74-session) **UNBLOCKED — bootstrap-73 delivered
+  option (iii) in full. Interface recon from the live emission:**
+  `lib.ref_wp_sound_closed (hp he lv c s st) (hwf_s : StmDataWf s)
+  (hwf_c : FnCtxDataWf c) : holds_all hp he lv (ref_wp c s) st =
+  exec_safe_f hp he lv (seed_frame c) s st` — premise-free modulo the
+  two R-b wf hypotheses (discharged for serializer output by
+  construction; kernel-decidable per literal). Composition plan:
+  - New runner probe (spine-v3): probe28/29/30 spine with the ~300-line
+    hand `wp_stm_sound`/`ref_wp_sound` DELETED; FACT 4 consumes the
+    authored theorem via `Eq.to_iff`/`iff_of_eq` (authored gives Prop
+    `=`, spine wants `↔`) + wf hyps threaded into soundness_concrete.
+  - Loader note: TactusLink_lib_exec has NO olean in pkg (gate
+    elaborates in-memory) — the runner builds it first (`lean -o`),
+    then imports; StmDataWf/FnCtxDataWf live in that module.
+  - Alignment check needed: spine holdsAll/execSafeF vs authored
+    lib.holds_all/lib.exec_safe_f (spine mirrors them; expect rfl or a
+    thin bridging lemma; St = Int → Int both sides).
