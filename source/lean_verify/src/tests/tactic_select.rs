@@ -212,3 +212,24 @@ fn term_bound_let_var_in_eq_ok() {
         Some(Selection::PeelOmega)
     );
 }
+
+#[test]
+fn derived_closer_is_search_free_and_census_exact() {
+    // S2c's derived default closer (§3.4): the B6 gate property in
+    // miniature — no search tactic named, kernel rungs + peel branch +
+    // fixed CORE set + omega tail.
+    assert!(!DERIVED_CLOSER.contains("tactus_auto"));
+    assert!(!DERIVED_CLOSER.contains("case_split"));
+    assert!(!DERIVED_CLOSER.contains("tactus_first"));
+    assert!(DERIVED_CLOSER
+        .starts_with("first | rfl | decide | (tactus_peel <;> (first | rfl | decide | omega)) | (simp_all only ["));
+    assert!(DERIVED_CLOSER.ends_with("] <;> omega)"));
+    // The CORE set is the census union + the distribution/toNat/
+    // cancellation extensions: 51 lemmas (50 separators).
+    assert_eq!(DERIVED_CLOSER.matches(", ").count(), 50);
+    // Mathlib-context name hygiene: bare `not_imp` is ambiguous with
+    // `_root_.not_imp`; the qualified form is mandatory (see the
+    // DERIVED_CLOSER doc comment).
+    assert!(DERIVED_CLOSER.contains("Classical.not_imp"));
+    assert!(!DERIVED_CLOSER.contains(", not_imp,"));
+}

@@ -141,6 +141,50 @@ deterministic); `bv_decide`'s caveat is compiled execution, already a tracked kn
 - **Auditability:** the emitted `.lean` artifact reads as a proof, not as an
   invocation of a search procedure.
 
+### 3.4 DECISION (2026-07-16, Danielle): derivation-first — the pin store is dead
+
+The S2a census (`MEASUREMENT-s2a-derivability.md`, 295 real theorems under the
+145 T2 buckets) settled §3.2: **no storage at all**. 95.6% of the pool is
+derivable, and the derivation is the strongest possible form — a **single fixed,
+site-invariant 43-lemma `simp_all only [CORE]` list**, with `<;> omega` on the
+composed-rung theorems, validated to close **280/280** of the derivable pool
+(94.9% of all T2). The list doesn't even read the goal; locality, determinism,
+and auditability are satisfied by construction. Candidates ranked in
+mainline-04 resolve: **1 (no storage — derivation rules) chosen**;
+**2 (inline proofs for the residue)** complements; 3 and 4 (committed artifacts,
+§3.2 sidecar) rejected — a store would persist what a constant already provides.
+
+The chosen shape per obligation, when the closer would be `tactus_auto`:
+
+    first | rfl | decide | (tactus_peel <;> (first | rfl | decide | omega))
+          | (simp_all only [CORE — fixed core lemmas] <;> omega)
+
+Uniform text (the tail is a no-op on goals the simp closes outright), one
+statable rule ("every WP obligation closes under kernel rungs or the fixed
+core normalizer, with omega deciding the arithmetic residue"), no per-kind
+conditionals. Rule budget: **one** (Danielle's transparency constraint).
+CORE was 43 lemmas at the census and is **51** after mainline-05
+validation (three probe-tested extensions + one Mathlib-context name
+qualification — full history and the extension probe protocol in
+MEASUREMENT-s2a-derivability.md §6.1). The residue — 13 theorems
+in 2 clusters (Option accessors ×7 in coset_group; no-replay-closes ×6 → 3
+effective sites) — gets inline proofs in source, NOT a rule exception: the
+"accessor lemmas of mentioned symbols' field types" line was considered and
+explicitly declined to keep the budget at one.
+
+**Predictability honesty (accepted by Danielle 2026-07-16):** the pool is
+REWRITE-CLOSURE, 0% UNFOLD-THEN-DECIDE — no theorem needed definitional
+unfoldings. The predictability story is "fixed normalizer + decider tail", not
+fragment membership; accepted because a single fixed list for all kinds is the
+most formulaic possible rewrite-closure rule.
+
+**Protocol facts downstream work must respect** (from the census):
+- `simp_all?` suggestions do not always replay standalone — the minimized form
+  is list-plus-`<;> omega`-tail, not the bare list (13/295 needed the tail).
+- "T2 label ⇒ `simp_all` closes" is false (composed-rung/case-split winners).
+- Failure mode of the fixed list on new obligation shapes is LOUD (unclosed
+  goal at a named obligation) — acceptable per §3.3.
+
 ---
 
 ## 4. `tactus_peel` → codegen

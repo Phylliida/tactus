@@ -1858,13 +1858,19 @@ impl ObligationEmitter {
         // linear-arithmetic fragment, select `omega` /
         // `tactus_peel <;> omega` directly. omega is complete for the
         // fragment, so this can only replace a search with its
-        // certain answer — never lose a pass. User-supplied closers
+        // certain answer — never lose a pass. Goals outside the
+        // fragment get the S2c derived default closer (see
+        // DERIVED_CLOSER): kernel rungs + the fixed CORE normalizer,
+        // no `tactus_auto` search. User-supplied closers
         // (`tactus_tactic`, bit_vector) are never overridden.
         let closer = match &closer {
             Tactic::Named(n) if n == "tactus_auto" => {
                 match crate::tactic_select::select_deterministic(&goal, &binders) {
                     Some(sel) => Tactic::Raw(sel.tactic_text().to_string()),
-                    None => closer,
+                    // S2c (§3.4): no fragment answer → the derived
+                    // default closer (kernel rungs + fixed CORE
+                    // normalizer), replacing the `tactus_auto` search.
+                    None => Tactic::Raw(crate::tactic_select::DERIVED_CLOSER.to_string()),
                 }
             }
             _ => closer,
@@ -2134,7 +2140,19 @@ fn walk_obligations<'a>(
             //   debugging an unprovable goal know to look for
             //   a `proof { }` block, not a misdirected
             //   automation failure.
-            let outer = tactic_as_str(&obl.closer);
+            // S2c (§3.4): when the enclosing closer is the DEFAULT
+            // (`tactus_auto`), the fallback slot gets the derived
+            // closer instead — same substitution as the
+            // `emit_with_extras` chokepoint, one composition level
+            // down — so default emission contains no search tactic
+            // even inside `by(nonlinear_arith)` scopes. User-chosen
+            // closers compose through unchanged.
+            let outer = match &obl.closer {
+                Tactic::Named(n) if n == "tactus_auto" => {
+                    format!("({})", crate::tactic_select::DERIVED_CLOSER)
+                }
+                other => tactic_as_str(other),
+            };
             let primary_str = tactic_as_str(primary);
             let composed = Tactic::Raw(format!(
                 "first | (intros; {}) | ({}) | \

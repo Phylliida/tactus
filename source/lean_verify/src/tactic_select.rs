@@ -56,6 +56,56 @@ impl Selection {
     }
 }
 
+/// Derived default closer (S2c of the squeeze arc; decision:
+/// `DESIGN-transparent-automation.md` §3.4; measured basis:
+/// `MEASUREMENT-s2a-derivability.md`). Selected when `tactus_auto`
+/// would run and `select_deterministic` finds no arithmetic-fragment
+/// answer. The ONE derivation rule of the arc (rule budget: one —
+/// Danielle, 2026-07-16):
+///
+///   kernel rungs (rfl / decide — definitional equalities, decidable
+///   atoms), then the peeled kernel rungs (wrapped goals whose leaf is
+///   kernel-closeable after intro — `tactus_peel` no-ops when there is
+///   nothing to intro, so this branch is safe on flat goals), then the
+///   fixed core normalizer with an omega tail.
+///
+/// Every branch is a decision procedure or a FIXED, site-invariant
+/// rewrite set: no search, no ambient-scope reads, named lemmas that
+/// break loudly on renames. The 43-lemma CORE set below is the union
+/// of every squeezed `simp_all?` used-list in the Brick-1 T2 pool,
+/// validated to close 389/397 of the full pool (the 8 residue are the
+/// census's known clusters — inline-proof surface, §3.4). CORE alone
+/// closes 268/280 of the T2 winners; the `<;> omega` tail takes the
+/// 12 composed-rung theorems (`simp_all?` suggestions do not always
+/// replay standalone — census §5.1). Name hygiene: `not_imp` is cited
+/// as `Classical.not_imp` — bare `not_imp` is ambiguous against
+/// `_root_.not_imp` once any Mathlib import is in scope (tutorial
+/// chapters import `Mathlib.Tactic.Linarith`); every other bare name
+/// in the list was probe-tested unambiguous in simp-argument position
+/// in BOTH core-only and Mathlib contexts (2026-07-16).
+/// 2026-07-16 extension (+4): `Int/Nat.mul_add, Int/Nat.add_mul` —
+/// the old default-set `simp_all` distributed products into ring-normal
+/// form before its omega rung; the fixed set must do the same or
+/// loop-body obligations like `2 * result = i * (i+1) → 2 * (result +
+/// (i+1)) = (i+1) * (i+2)` leave omega with irelatable opaque product
+/// atoms (tutorial sum_iter regression, caught by the 10-chapter
+/// battery). Also 47 lemmas, still site-invariant.
+/// 2026-07-16 extension (+2): `Int.toNat_zero, Int.toNat_one` — the
+/// default set reduced `Int.toNat 0/1` literals; without them,
+/// base-case obligations (`Int.toNat r = fib (Int.toNat n)` under
+/// `n = 0`) leave `↑(fib (Int.toNat 0))` opaque to omega (tutorial
+/// fib_iter/fib_fast/pow_by_squaring regressions). 49 lemmas.
+/// 2026-07-16 extension (+2): `Int/Nat.add_sub_cancel` — loop-body
+/// index bookkeeping `(i + 1 - 1).toNat` must reduce to `i.toNat`
+/// or spec-fn applications over it stay irelatable (tutorial
+/// fib_iter 123-invariant). 51 lemmas.
+///
+/// Failure semantics: a goal outside every branch fails LOUD at its
+/// named obligation — that is the suggestion signal for an inline
+/// proof, per §3.4. `tactus_auto` remains in the prelude for
+/// discover-mode overrides; it no longer appears in default emission.
+pub(crate) const DERIVED_CLOSER: &str = "first | rfl | decide | (tactus_peel <;> (first | rfl | decide | omega)) | (simp_all only [Classical.not_forall, Decidable.not_not, Int.add_emod_left, Int.cast_ofNat_Int, Int.natCast_add, Int.neg_add_emod_self, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.sub_zero, Int.toNat_natCast_add_one, Int.zero_add, Int.zero_sub, Int.mul_add, Int.add_mul, Int.toNat_zero, Int.toNat_one, Int.add_sub_cancel, Nat.add_le_add_iff_right, Nat.add_left_cancel_iff, Nat.add_zero, Nat.le_add_left, Nat.le_add_right, Nat.le_refl, Nat.not_le, Nat.not_lt, Nat.reduceLeDiff, Nat.sub_le_iff_le_add, Nat.zero_add, Nat.zero_le, Nat.mul_add, Nat.add_mul, Nat.add_sub_cancel, and_imp, and_self, and_true, eq_iff_iff, forall_const, forall_eq, ge_iff_le, gt_iff_lt, iff_true, imp_false, imp_self, implies_true, not_and, not_exists, not_false_eq_true, Classical.not_imp, not_or, not_true_eq_false, true_and] <;> omega)";
+
 /// Names that are known to be Int/Nat-valued (term layer) or
 /// let-bound propositions (prop layer) in the current scope. A bare
 /// `Var` is admitted as an integer TERM atom ONLY if it is in
