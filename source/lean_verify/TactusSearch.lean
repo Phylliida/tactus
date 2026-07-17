@@ -7,6 +7,11 @@
 --
 -- (Split from the former TactusPrelude.lean, 2026-07-17.)
 import TactusDefs
+-- TactusDefs slims its import to `Lean.Elab.Command`, whose closure
+-- lacks `bv_decide` (syntax AND elaborator) — the `tactus_bit_vector`
+-- macro below quotes `bv_decide` tactic syntax, so the import is
+-- needed here even before any use.
+import Lean.Elab.Tactic.BVDecide
 -- `tactus_first | t1 | t2 | …` desugars to `first | (t1; done) |
 -- (t2; done) | …`. Each alternative is required to fully close
 -- the goal — without `done`, a tactic that succeeds while

@@ -421,6 +421,28 @@ impl FuncDetails {
 /// failing assert / invariant / call rather than the enclosing fn
 /// signature) and whose `help` carries the generated `.lean` path
 /// for offline inspection. Falls back to `fn_span` when the
+/// One deferred Tactus Lean check, collected during `verify_bucket`'s
+/// op walk and executed on a bounded worker pool after it — see the
+/// `tactus_lean_jobs` comment there. Everything is an `Arc` clone or
+/// an owned string, so a job is cheap and `Send`.
+enum TactusLeanJob {
+    Proof {
+        vir_fn: vir::ast::Function,
+        function: vir::sst::FunctionSst,
+        tactic_body: String,
+        /// Source path + tactic start byte from `attrs.tactic_span`,
+        /// for resolving `ProofFnBodyLine` diagnostic offsets back to
+        /// source-line spans at report time.
+        file_path: String,
+        start_byte: usize,
+    },
+    Exec {
+        vir_fn: vir::ast::Function,
+        function: vir::sst::FunctionSst,
+        check_sst: std::sync::Arc<vir::sst::FuncCheckSst>,
+    },
+}
+
 /// diagnostic doesn't carry a span (pre-Lean rejections like
 /// sanity-check failures).
 ///
@@ -1710,6 +1732,21 @@ impl Verifier {
         let tactus_tactic_bodies: std::sync::OnceLock<
             std::collections::HashMap<vir::ast::Fun, String>
         > = std::sync::OnceLock::new();
+        // Deferred Tactus Lean checks. The `lean` subprocess is the
+        // entire cost of a check (~1-2s each: process start + prelude
+        // olean import dominate, elaboration is milliseconds for a
+        // typical fn), and a single-module crate gets exactly ONE
+        // bucket — so running each check inline made every Lean check
+        // in the crate strictly sequential regardless of
+        // `--num-threads`. Instead the op walk collects one job per
+        // lean-routed fn and a bounded worker pool runs them after the
+        // walk. All cross-fn `lean_verify` state (defs-family memo,
+        // stmt-olean memo, pkg registries) is OnceLock/Mutex-guarded —
+        // the same machinery already runs concurrently across bucket
+        // worker threads on multi-module crates. Results are reported
+        // on this thread, in collection order, so output stays
+        // deterministic.
+        let mut tactus_lean_jobs: Vec<TactusLeanJob> = Vec::new();
         while let Some(mut function_opgen) = opgen.next()? {
             let diagnostics_to_report: std::cell::RefCell<
                 Option<PanicOnDropVec<(Message, MessageLevel)>>,
@@ -1880,62 +1917,19 @@ impl Verifier {
                                 }
                                 continue;
                             }
-                            match lean_verify::check_proof_fn(
-                                vir_krate,
-                                &vir_fn.x,
-                                tactic_text,
-                                &vir_fn.x.attrs.lean_imports,
-                                crate_name,
-                                &tactic_bodies,
-                            ) {
-                                lean_verify::CheckResult::Success { warnings } => {
-                                    self.count_verified += 1;
-                                    for w in warnings {
-                                        reporter.report(
-                                            &message(MessageLevel::Warning, w, fn_span).to_any()
-                                        );
-                                    }
-                                }
-                                lean_verify::CheckResult::Failed { errors, warnings } => {
-                                    for w in warnings {
-                                        reporter.report(
-                                            &message(MessageLevel::Warning, w, fn_span).to_any()
-                                        );
-                                    }
-                                    // Resolve proof-fn body line offsets to source-line spans
-                                    // before reporting. Each Lean diagnostic inside the tactic
-                                    // body becomes a per-line `-->` arrow instead of all
-                                    // collapsing to the fn signature.
-                                    for mut diag in errors {
-                                        self.count_errors += 1;
-                                        if let lean_verify::DiagLocation::ProofFnBodyLine(offset) = diag.location {
-                                            if let Some(parent_data) =
-                                                crate::spans::raw_span_data(&fn_span.raw_span)
-                                            {
-                                                if let Some(resolved) = crate::spans::tactic_body_line_span(
-                                                    parent_data,
-                                                    &fn_span.start_loc,
-                                                    file_path,
-                                                    start_byte,
-                                                    offset,
-                                                ) {
-                                                    diag.location = lean_verify::DiagLocation::Direct(resolved);
-                                                }
-                                            }
-                                        }
-                                        emit_tactus_diag(reporter, diag, fn_span);
-                                    }
-                                }
-                                lean_verify::CheckResult::Error(e) => {
-                                    self.count_errors += 1;
-                                    let fn_name = vir::ast_util::fun_as_friendly_rust_name(&function.x.name);
-                                    reporter.report(&message(
-                                        MessageLevel::Error,
-                                        format!("failed to invoke Lean for {}: {}. Is Lean 4 installed?", fn_name, e),
-                                        fn_span,
-                                    ).to_any());
-                                }
-                            }
+                            // Defer the actual Lean run to the post-walk
+                            // worker pool (see `tactus_lean_jobs` above);
+                            // everything up to here (validation, tactic
+                            // text extraction) stays inline so its
+                            // errors report at the same point they
+                            // always did.
+                            tactus_lean_jobs.push(TactusLeanJob::Proof {
+                                vir_fn: vir_fn.clone(),
+                                function: function.clone(),
+                                tactic_body: tactic_text.to_string(),
+                                file_path: file_path.clone(),
+                                start_byte,
+                            });
                             continue;
                         }
 
@@ -2030,47 +2024,13 @@ impl Verifier {
                                 }
                                 continue;
                             }
-                            match lean_verify::check_exec_fn(
-                                vir_krate,
-                                &vir_fn.x,
-                                function,
-                                check_sst,
-                                &vir_fn.x.attrs.lean_imports,
-                                crate_name,
-                                &tactic_bodies,
-                            ) {
-                                lean_verify::CheckResult::Success { warnings } => {
-                                    self.count_verified += 1;
-                                    for w in warnings {
-                                        reporter.report(
-                                            &message(MessageLevel::Warning, w, fn_span).to_any()
-                                        );
-                                    }
-                                }
-                                lean_verify::CheckResult::Failed { errors, warnings } => {
-                                    for w in warnings {
-                                        reporter.report(
-                                            &message(MessageLevel::Warning, w, fn_span).to_any()
-                                        );
-                                    }
-                                    for diag in errors {
-                                        self.count_errors += 1;
-                                        emit_tactus_diag(reporter, diag, fn_span);
-                                    }
-                                }
-                                lean_verify::CheckResult::Error(e) => {
-                                    self.count_errors += 1;
-                                    let fn_name = vir::ast_util::fun_as_friendly_rust_name(
-                                        &function.x.name);
-                                    reporter.report(&message(
-                                        MessageLevel::Error,
-                                        format!(
-                                            "failed to invoke Lean for {}: {}. Is Lean 4 installed?",
-                                            fn_name, e),
-                                        fn_span,
-                                    ).to_any());
-                                }
-                            }
+                            // Defer the Lean run to the post-walk worker
+                            // pool, same as the tactic-proof-fn branch.
+                            tactus_lean_jobs.push(TactusLeanJob::Exec {
+                                vir_fn: vir_fn.clone(),
+                                function: function.clone(),
+                                check_sst: check_sst.clone(),
+                            });
                             continue;
                         }
 
@@ -2420,6 +2380,125 @@ impl Verifier {
                 }
             }
         }
+        // Run the deferred Tactus Lean checks (collected during the op
+        // walk above) on a bounded worker pool, then report results on
+        // this thread in collection order. See the `tactus_lean_jobs`
+        // declaration for why this exists.
+        if !tactus_lean_jobs.is_empty() {
+            let vir_krate =
+                self.vir_crate.as_ref().expect("vir_crate should be initialized").clone();
+            let crate_name: String = self.crate_name.as_deref().unwrap_or("crate").to_string();
+            let tactic_bodies =
+                tactus_tactic_bodies.get_or_init(|| build_tactic_bodies_map(&vir_krate));
+            let workers = tactus_lean_jobs.len().min(std::cmp::max(1, self.args.num_threads));
+            let results: Vec<std::sync::OnceLock<lean_verify::CheckResult>> =
+                (0..tactus_lean_jobs.len()).map(|_| std::sync::OnceLock::new()).collect();
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let jobs = &tactus_lean_jobs;
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    let vir_krate = &vir_krate;
+                    let crate_name = &crate_name;
+                    let results = &results;
+                    let next = &next;
+                    scope.spawn(move || loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(job) = jobs.get(i) else { break };
+                        let result = match job {
+                            TactusLeanJob::Proof { vir_fn, tactic_body, .. } => {
+                                lean_verify::check_proof_fn(
+                                    vir_krate,
+                                    &vir_fn.x,
+                                    tactic_body,
+                                    &vir_fn.x.attrs.lean_imports,
+                                    crate_name,
+                                    tactic_bodies,
+                                )
+                            }
+                            TactusLeanJob::Exec { vir_fn, function, check_sst } => {
+                                lean_verify::check_exec_fn(
+                                    vir_krate,
+                                    &vir_fn.x,
+                                    function,
+                                    check_sst,
+                                    &vir_fn.x.attrs.lean_imports,
+                                    crate_name,
+                                    tactic_bodies,
+                                )
+                            }
+                        };
+                        let _ = results[i].set(result);
+                    });
+                }
+            });
+            for (job, cell) in tactus_lean_jobs.iter().zip(results.into_iter()) {
+                let result = cell.into_inner().expect("worker resolved every claimed job");
+                let (function, proof_loc) = match job {
+                    TactusLeanJob::Proof { function, file_path, start_byte, .. } => {
+                        (function, Some((file_path.as_str(), *start_byte)))
+                    }
+                    TactusLeanJob::Exec { function, .. } => (function, None),
+                };
+                let fn_span = &function.span;
+                match result {
+                    lean_verify::CheckResult::Success { warnings } => {
+                        self.count_verified += 1;
+                        for w in warnings {
+                            reporter.report(&message(MessageLevel::Warning, w, fn_span).to_any());
+                        }
+                    }
+                    lean_verify::CheckResult::Failed { errors, warnings } => {
+                        for w in warnings {
+                            reporter.report(&message(MessageLevel::Warning, w, fn_span).to_any());
+                        }
+                        // Resolve proof-fn body line offsets to source-line
+                        // spans before reporting (proof jobs only). Each Lean
+                        // diagnostic inside the tactic body becomes a per-line
+                        // `-->` arrow instead of all collapsing to the fn
+                        // signature.
+                        for mut diag in errors {
+                            self.count_errors += 1;
+                            if let (
+                                Some((file_path, start_byte)),
+                                lean_verify::DiagLocation::ProofFnBodyLine(offset),
+                            ) = (proof_loc, &diag.location)
+                            {
+                                if let Some(parent_data) =
+                                    crate::spans::raw_span_data(&fn_span.raw_span)
+                                {
+                                    if let Some(resolved) = crate::spans::tactic_body_line_span(
+                                        parent_data,
+                                        &fn_span.start_loc,
+                                        file_path,
+                                        start_byte,
+                                        *offset,
+                                    ) {
+                                        diag.location = lean_verify::DiagLocation::Direct(resolved);
+                                    }
+                                }
+                            }
+                            emit_tactus_diag(reporter, diag, fn_span);
+                        }
+                    }
+                    lean_verify::CheckResult::Error(e) => {
+                        self.count_errors += 1;
+                        let fn_name = vir::ast_util::fun_as_friendly_rust_name(&function.x.name);
+                        reporter.report(
+                            &message(
+                                MessageLevel::Error,
+                                format!(
+                                    "failed to invoke Lean for {}: {}. Is Lean 4 installed?",
+                                    fn_name, e
+                                ),
+                                fn_span,
+                            )
+                            .to_any(),
+                        );
+                    }
+                }
+            }
+        }
+
         // if spinning off all, the regular profile loop inside has already profiled everything
         if let (Some(profile_all_file_name), false) = (profile_all_file_name, self.args.spinoff_all)
         {

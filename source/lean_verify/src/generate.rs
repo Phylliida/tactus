@@ -4166,11 +4166,16 @@ fn build_link_module(
     // closed forms append after the proof-fn loop (obligations are
     // LEAVES: nothing references them, their deps are proof fns whose
     // closed forms precede them).
-    let exec_entries: Vec<ExecLinkEntry> = EXEC_LINK_REGISTRY
+    let mut exec_entries: Vec<ExecLinkEntry> = EXEC_LINK_REGISTRY
         .get_or_init(Default::default)
         .lock().unwrap_or_else(|p| p.into_inner())
         .remove(&defs.scope)
         .unwrap_or_default();
+    // Registration order is COMPLETION order now that per-fn checks
+    // run on a worker pool (verifier.rs tactus_lean_jobs) — sort so
+    // the Link file's content stays deterministic run-to-run (entries
+    // are leaves; nothing orders against them).
+    exec_entries.sort_by(|a, b| a.leaf.cmp(&b.leaf));
     for e in &exec_entries {
         cmds.push(Command::Import(e.leaf.clone()));
     }

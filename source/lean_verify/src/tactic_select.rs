@@ -202,7 +202,8 @@ pub(crate) fn core_simp() -> String {
 /// (`if True then a else b` after `is<Variant>` unfolds on a
 /// constructor). Probe-tested on the e2e exec corpus (2026-07-17,
 /// the 26-test squeeze-regression sweep).
-pub(crate) const STRUCTURAL_EXTRA_LEMMAS: &str = "true_or, or_true, if_true, if_false";
+pub(crate) const STRUCTURAL_EXTRA_LEMMAS: &str =
+    "true_or, or_true, if_true, if_false, reduceCtorEq";
 
 /// Marker text written where the DERIVED closer would go when the goal
 /// isn't known yet — the `by(nonlinear_arith)` AssertQuery scope
@@ -248,13 +249,52 @@ pub(crate) fn derived_closer(
     goal: &Expr,
     dts: &DtDefInventory,
     binders: &[Binder],
+    user_prefix: bool,
 ) -> String {
+    // Which `rfl` the kernel ladder gets is DERIVED from the goal's
+    // core shape (after peeling the ∀/let/→ spine):
+    //
+    // * Plain `Eq`/`Iff`/`Ne` core → bare `rfl`. One-step unfold
+    //   lemmas of RECURSIVE spec fns on constructor args (tactus-core's
+    //   u_* ladder: `wp_stm f (Assert o h) = Cons (close_e f o) Nil`)
+    //   close ONLY by full-delta defeq — kernel iota handles the
+    //   rec_1/PProd encoding that simp's equation generation cannot
+    //   ("invalid projection"), so no simp arm can substitute.
+    //
+    // * Anything else (∧/∨/comparison cores) → `with_reducible rfl`.
+    //   Full-delta rfl on an ∧-of-arithmetic goal with casts of stuck
+    //   match applications recurses past maxRecDepth, and that
+    //   exception is NOT recoverable by `first` — the whole chain
+    //   aborts even though a later arm (omega) closes the goal
+    //   (sum_vals, typed-renderer adversarial probes). Reducible rfl
+    //   fails fast and catchably there, and non-equation goals never
+    //   needed delta rfl.
+    let rfl_form = if goal_core_is_equation(goal) { "rfl" } else { "with_reducible rfl" };
+    let kernel = format!("first | {} | decide | omega", rfl_form);
     format!(
-        "first | rfl | decide | omega | ({}) | ({}) | ({})",
-        render_peel(goal, "first | rfl | decide | omega"),
+        "first | {} | decide | omega | ({}) | ({}) | ({})",
+        rfl_form,
+        render_peel(goal, &kernel),
         core_simp(),
-        structural_rung(goal, dts, binders)
+        structural_rung(goal, dts, binders, user_prefix)
     )
+}
+
+/// True when the goal's core — after peeling the leading ∀-binder /
+/// goal-let / implication spine — is a bare equation (`Eq`/`Iff`/`Ne`).
+/// Decides which `rfl` the derived kernel ladder uses; see the caller.
+fn goal_core_is_equation(goal: &Expr) -> bool {
+    let mut cur = goal;
+    loop {
+        match &cur.node {
+            ExprNode::SpanMark { inner, .. } => cur = inner,
+            ExprNode::Forall { body, .. } => cur = body,
+            ExprNode::Let { body, .. } => cur = body,
+            ExprNode::BinOp { op: BinOp::Implies, rhs, .. } => cur = rhs,
+            ExprNode::BinOp { op: BinOp::Eq | BinOp::Iff | BinOp::Ne, .. } => return true,
+            _ => return false,
+        }
+    }
 }
 
 /// Name inventory of the `@[simp]` defs the datatype emission
@@ -270,6 +310,21 @@ pub(crate) fn derived_closer(
 #[derive(Debug, Default)]
 pub(crate) struct DtDefInventory {
     pub by_type: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Sanitized variant names per datatype (same keys as `by_type`).
+    /// The structural rung derives `{Dt}.{Variant}.injEq` from these
+    /// for every goal-mentioned datatype: N2's hoisted constructor
+    /// equations meet `cases`-introduced constructor applications as
+    /// equation-vs-equation goals, which need injectivity (and
+    /// `reduceCtorEq` disjointness) to resolve under `simp_all only`.
+    pub variants: std::collections::HashMap<String, Vec<String>>,
+    /// Full Lean names of the crate's SPEC fns (defs the emitter
+    /// generates). A goal-mentioned spec fn joins the structural
+    /// rung's unfold list: N1 hoisting turns goal-position lets into
+    /// hypothesis equations, losing the DEFINITIONAL transparency
+    /// `rfl` used to exploit (`let r := {a := 0}; sview r = 0` closed
+    /// by defeq; `(h : r = {a := 0}) ⊢ sview r = 0` needs `sview`
+    /// unfolded by simp). Derived: only goal-mentioned names enter.
+    pub spec_fns: std::collections::HashSet<String>,
 }
 
 /// The STRUCTURAL rung (2026-07-17, the squeeze-regression fix): the
@@ -306,6 +361,7 @@ pub(crate) fn structural_rung(
     goal: &Expr,
     dts: &DtDefInventory,
     binders: &[Binder],
+    user_prefix: bool,
 ) -> String {
     let mut scan = StructuralScan::new(dts);
     // Binder TYPES participate fully: hypothesis propositions live
@@ -325,14 +381,37 @@ pub(crate) fn structural_rung(
     scan.walk(goal, &env);
 
     let mut steps: Vec<String> = Vec::new();
+    // Named spine intros mirror the EMITTED goal. A user tactic
+    // prefix (`proof { simp_all … }`) runs before this rung and may
+    // reshape the goal arbitrarily (simp zeta-reduces goal lets,
+    // closes trivial antecedents) — the emitted-shape names then
+    // fail `introN` loudly. Under a prefix, use bare `intros` only:
+    // cases targets are let-substituted at derivation (they
+    // reference params/theorem binders, not spine names), so they
+    // survive the prefix.
     let intro_names = spine_intro_names(goal);
-    if !intro_names.is_empty() {
+    if !user_prefix && !intro_names.is_empty() {
         steps.push(format!("intro {}", intro_names.join(" ")));
     }
     steps.push("intros".to_string());
     let prefix = steps.join("; ");
 
     let mut unfolds: Vec<String> = scan.unfolds.into_iter().collect();
+    // Injectivity for every mentioned datatype's constructors: with
+    // N1/N2 the hypotheses carry constructor EQUATIONS (`s = Left v`),
+    // and `cases` introduces its own constructor applications — the
+    // resulting `Left a = Left b` / `Right a = Left b` goals need
+    // `.injEq` (and `reduceCtorEq`, in STRUCTURAL_EXTRA_LEMMAS) to
+    // resolve under `simp_all only`. Derived, not searched: only
+    // mentioned datatypes contribute.
+    for t in &scan.mentioned_types {
+        if let Some(vs) = dts.variants.get(t) {
+            for v in vs {
+                unfolds.push(format!("{}.{}.injEq", t, v));
+            }
+        }
+    }
+    unfolds.extend(scan.mentioned_spec_fns.into_iter());
     unfolds.sort();
     let simp_list = if unfolds.is_empty() {
         format!("{}, {}", CORE_LEMMAS, STRUCTURAL_EXTRA_LEMMAS)
@@ -393,6 +472,7 @@ fn spine_intro_names(goal: &Expr) -> Vec<String> {
 struct StructuralScan<'a> {
     dts: &'a DtDefInventory,
     mentioned_types: std::collections::HashSet<String>,
+    mentioned_spec_fns: std::collections::HashSet<String>,
     unfolds: std::collections::BTreeSet<String>,
     targets: Vec<String>,
     targets_seen: std::collections::HashSet<String>,
@@ -403,6 +483,7 @@ impl<'a> StructuralScan<'a> {
         StructuralScan {
             dts,
             mentioned_types: Default::default(),
+            mentioned_spec_fns: Default::default(),
             unfolds: Default::default(),
             targets: Vec::new(),
             targets_seen: Default::default(),
@@ -422,6 +503,9 @@ impl<'a> StructuralScan<'a> {
             }
             if self.dts.by_type.contains_key(s) {
                 self.mentioned_types.insert(s.to_string());
+            }
+            if self.dts.spec_fns.contains(s) {
+                self.mentioned_spec_fns.insert(s.to_string());
             }
         }
         e.for_each_child(&mut |c| self.collect_mentioned_types(c));
