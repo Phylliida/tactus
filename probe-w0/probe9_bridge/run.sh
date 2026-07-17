@@ -25,12 +25,15 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CERT_DIR="$ROOT/bootstrap-fixture/out/lib/cert"
 CORE_OUT="$ROOT/tactus-core/out/lib"
-PRELUDE="${TACTUS_PRELUDE:-$HOME/.cache/tactus/prelude-e81fbf9a86375c12}"
+# All prelude caches (slim-prelude work mints new hashes; the collapsed
+# bare TactusDefs ships inside the prelude — glob them all, probe37-style).
+PRELUDES="$(ls -d "$HOME"/.cache/tactus/prelude-* 2>/dev/null | tr '\n' ':')"
+PRELUDE="${PRELUDES%:}"
 LEAN_BIN="${LEAN:-$(command -v lean)}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-export LEAN_PATH="$CORE_OUT:$PRELUDE"
+export LEAN_PATH="$CORE_OUT:$CORE_OUT/pkg:$PRELUDE"
 
 # fns that are DOCUMENTED honest-fails (a leaf-rendering / stage-A-scope
 # divergence where the bridge SOUNDLY does not close). Each has a recorded
