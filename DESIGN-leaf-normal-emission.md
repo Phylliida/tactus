@@ -221,6 +221,71 @@ its absence is how the S2c regression shipped.
 
 ---
 
+## 3a. Residue notebook (squeeze debt — RESOLVED to 1, 2026-07-18)
+
+> **STATUS: the proper Return→Wp::Let landed (session 3) with four
+> derived-closer completions — suite 550/1, gt gate green.** The
+> experiment's two blockers resolved as predicted: the ctor slot gate
+> became env-aware (var-like args with walker-visible binders take
+> the declared slot), and the route is gated on default-closer AND
+> no-proof-block-prefix (body scan). Completions the fixes forced,
+> each derived-not-searched: `.injEq` (field-carrying variants) +
+> `reduceCtorEq` for equation-vs-equation goals; goal-mentioned USER
+> spec fn unfolds (hoisting trades rfl's definitional transparency
+> for hypothesis equations — simp carries the delta now); prefix-
+> aware rung (bare `intros` under user prefixes); `with_reducible
+> rfl` (bare rfl on stuck matches dies with maxRecDepth, which
+> `first` cannot catch — the closing omega arm never ran).
+> Bonus: cross_crate_probe_5 promoted Err→Ok — the axiomatic-Seq gap
+> its 2026-05-12 comment predicted would close, closed.
+>
+> **Remaining (1): `vec_field_index_clone`** — the postcondition
+> needs Seq EXTENSIONALITY: the clone call's ensures gives pointwise
+> `cloned Int (index (view tmp__1) i) (index (view (mk tmp__3)) i)`
+> + equal lens, and the `=~= ==> ==` bridge conjunct renders
+> vacuously as `A → A` (both sides render as Lean `Eq`). Closing
+> needs axiom_seq_ext instantiation from pointwise facts — Z3 did
+> this by broadcast E-matching; a derived closer needs the CALL
+> provenance (which ensures shape landed) to emit the ext step.
+> First real customer for N3.
+
+## 3a-old. Residue notebook (squeeze debt, 4 e2e tests)
+
+Probed 2026-07-17 late session. Current split and the experiment that
+maps them:
+
+* **`let_bound_tuple_projection` + `typed_renderer_adversarial_probes`
+  + `match_enum` family root:** the `StmX::Return` arm hand-builds
+  `Done(let ret := e; ensures)` as a RAW LExpr — the ret-let is
+  untyped (blocks N1 hoisting via the leaf-peel `None`-typ path) and
+  a match in return position never forks (blocks N2; the
+  `tmp__.deref.isGen` value-position if stays in the postcondition
+  goal). On top, a user `proof {}` simp prefix rewrites the goal
+  before the derived closer's positional intros run (`introN` fails
+  on the transformed state).
+* **Experiment (built, validated, REVERTED):** `Return(Some e)` →
+  `Wp::Let(ret_name, Validated(e), ret_typ, Done(ensures))`, reusing
+  walk_let's typed frames + if-fork + N2 equations. Result 540/11:
+  it FIXED `mut_ref_is_variant_probe` (confirming the spurious
+  `.deref` lives in the old Return-leaf rendering) but broke 8 —
+  decisively, `lift_if_value_coerced`'s PER-LEAF slot coercion is
+  load-bearing exactly as its comment says (`sst_ctor_box_slot_
+  coercion`: `tmp__5.deref : Tree` where `Tactus.Box Tree` expected),
+  and return-position forking changes goal shapes for USER closers
+  (`match_enum_with_per_arm_proof`) — the fork itself needs the same
+  default-closer gate as the N2 ctor upgrade.
+* **The proper version (next session):** same route, plus (1)
+  replicate `lift_if_value_coerced`'s slot coercion in the Wp::Let
+  path (or teach `into_slot` the per-leaf behavior — needs the
+  typed-renderer doc open), (2) gate return-position forking on the
+  fn's default closer (statically known from the attr — thread
+  `fn_closer_is_default` through WpCtx), (3) re-audit the two
+  `call_result_*_in_assert` omega misfires that appeared under the
+  new shape (S1 classifier interaction).
+* **`vec_field_index_clone`:** untouched by the experiment — Seq-view
+  atoms in omega; needs its own look (likely unfold/axiom coverage,
+  not emission shape).
+
 ## 3b. Far pole (reference point, not scheduled): certificate replay
 
 The tier ladder has a known floor. A Z3 `unsat` is a finite object —

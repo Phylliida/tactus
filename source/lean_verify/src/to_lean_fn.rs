@@ -807,8 +807,29 @@ pub fn proof_fn_to_ast(
 /// simp list when the goal itself mentions it.
 pub(crate) fn datatype_simp_def_inventory(
     datatypes: &[vir::ast::Datatype],
+    functions: &[vir::ast::Function],
 ) -> crate::tactic_select::DtDefInventory {
     let mut by_type = std::collections::HashMap::new();
+    let mut variants = std::collections::HashMap::new();
+    // Spec fns with bodies: emitted as Lean defs, unfoldable by name.
+    // NON-RECURSIVE only (empty decreases): a non-recursive def's
+    // unfold is just its body — always clean under simp. Recursive
+    // spec fns need Lean-generated equational theorems, and that
+    // generation FAILS outright for the nested/mutual class compiled
+    // via `rec_1` + PProd ("invalid projection x✝.2.1" — e.g.
+    // tactus-core's exec_safe_f/strip_hyps/close_e ladder), killing
+    // every simp arm in the chain. The residue tests this list exists
+    // for (sview, sym_val, is_gen_spec, singleton_len) are all
+    // non-recursive.
+    let spec_fns: std::collections::HashSet<String> = functions
+        .iter()
+        .filter(|f| {
+            f.x.mode == vir::ast::Mode::Spec
+                && f.x.body.is_some()
+                && f.x.decrease.is_empty()
+        })
+        .map(|f| crate::to_lean_type::lean_name(&f.x.name.path))
+        .collect();
     for d in datatypes.iter() {
         if matches!(d.x.transparency, DatatypeTransparency::Never) {
             continue;
@@ -822,17 +843,26 @@ pub(crate) fn datatype_simp_def_inventory(
         let is_single_variant_struct =
             d.x.variants.len() == 1 && d.x.variants[0].name.as_str() == short;
         if !is_single_variant_struct {
+            let mut var_names = Vec::new();
             for v in d.x.variants.iter() {
                 let var_san = sanitize(&v.name);
                 defs.insert(format!("is{}", var_san));
                 for f in v.fields.iter() {
                     defs.insert(format!("{}_{}", var_san, field_name(&f.name)));
                 }
+                // `.injEq` exists only for FIELD-CARRYING ctors —
+                // Lean generates no injEq for nullary variants
+                // (`Option.None.injEq` is an unknown identifier and
+                // poisons the simp list).
+                if !v.fields.is_empty() {
+                    var_names.push(var_san);
+                }
             }
+            variants.insert(path.clone(), var_names);
         }
         by_type.insert(path, defs);
     }
-    crate::tactic_select::DtDefInventory { by_type }
+    crate::tactic_select::DtDefInventory { by_type, variants, spec_fns }
 }
 
 pub fn datatype_to_cmds(
