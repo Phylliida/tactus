@@ -169,6 +169,58 @@ theorems:
 composed-rung theorems, covers the entire derivable pool. Validator:
 `tools/rung-attrib/union_core_test.py` (committed alongside).
 
+## 6.1 Post-census extensions (mainline-05 validation fallout): 43 → 51
+
+Landing the derived closer in the emitter and re-validating against the
+full Brick-1 pool AND the tutorial battery surfaced four gaps the
+gt-only census could not see. Each was closed by a probe-tested fixed
+extension — the set stays site-invariant; every addition was checked
+to resolve unambiguously in simp-argument position in BOTH core-only
+and Mathlib contexts:
+
+| when | change | why |
+|---|---|---|
+| census | 43 lemmas | union of all squeezed lists; validates 280/280 |
+| mainline-05 | `not_imp` → `Classical.not_imp` | bare `not_imp` is ambiguous with `_root_.not_imp` under ANY Mathlib import (tutorial imports `Mathlib.Tactic.Linarith`); `#check` resolution is NOT representative — ambiguity only bites in simp-argument position |
+| mainline-05 | +`Int/Nat.mul_add, Int/Nat.add_mul` | the old default-set `simp_all` distributed products into ring-normal form before its omega rung; without distribution, loop-body obligations (`2 * result = i * (i+1) → …`) leave omega irelatable opaque product atoms (sum_iter) |
+| mainline-05 | +`Int.toNat_zero, Int.toNat_one` | default set reduced `Int.toNat 0/1` literals; base-case obligations (`Int.toNat r = fib (Int.toNat n)` under `n = 0`) otherwise leave `↑(fib (Int.toNat 0))` opaque (fib_iter/fib_fast/pow_by_squaring) |
+| mainline-05 | +`Int/Nat.add_sub_cancel` | loop-body index bookkeeping `(i + 1 - 1).toNat` → `i.toNat` (fib_iter 123-invariant) |
+
+**51 lemmas** final. Pool re-validation after EVERY extension: 389/397
+with the same 8 census residue, zero regressions (full-pool gate v6–v8).
+gt gate re-run after each: 3116 verified / 0 errors, package gate live.
+Tutorial: 9/10 (see §6.2 for the 10th — not a closer issue).
+
+Lesson for future CORE extensions: the probe protocol is (1) candidate
+lemma from the omega counterexample's opaque atom, (2) `simp only [X]`
+resolution test in core-only AND `Mathlib.Tactic.Linarith` contexts,
+(3) closure test on the failing theorem, (4) full-pool gate + gt gate
+re-run. Never extend from a single context.
+
+## 6.2 The remaining tutorial chapter (matrix_fib): emission-contract
+findings, not closer gaps
+
+matrix_fib's failures were in USER tactic blocks, all one contract —
+the M6 dependency-injection shape for proof-fn references:
+
+1. **Nullary-lemma application** (also factorial, fib_iter): user text
+   applied the nullary lemma `fact_10_bound 0` / `fib_10_bound 0`.
+   Fixed in chapter source (drop the spurious argument).
+2. **Recursive self-calls need explicit dependency binders**: a proof
+   fn's theorem takes its proof-dependencies as leading stmt binders
+   (`mat_pow_square (mat_mul_assoc : …) (m) (k)`), so the recursive
+   call in user text must pass them:
+   `mat_pow_square mat_mul_assoc m (k - 1)`.
+3. **Cross-fn references must be UNQUALIFIED to hit the injected
+   binder**: `matrix_fib.fib_mono …` in another fn's tactic block
+   escapes the binder rewrite and fails resolution (the theorem's pkg
+   is not imported); the unqualified `fib_mono …` resolves to the
+   local stmt binder.
+
+These are USER-SURFACE contract points, worth a doc note wherever the
+dependency-injection mechanism is specified (not a mainline-05
+blocker). The chapters were patched at 3 sites total.
+
 ## 7. The residue: 13 theorems, 2 clusters (3 sites after twin dedup)
 
 **Cluster A — Option accessors (7 theorems, all coset_group).**
