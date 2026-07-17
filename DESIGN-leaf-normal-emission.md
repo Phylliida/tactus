@@ -137,6 +137,16 @@ Emit `let tmp__1 := x; G[tmp__1]` as theorem-level
 > Tooling note: `cargo build -p lean_verify` does NOT refresh
 > `target-verus/release/verus` — probe runs need `vargo build`, and a
 > mid-suite binary rebuild taints the suite run.
+>
+> **Follow-up same session:** (1) the upgrade is gated on the DEFAULT
+> closer — a fn-level `tactus_tactic` pin is positional against the
+> un-upgraded shape (tgt apply_hom_symbol_exec broke until gated;
+> same rule as N1's emit_split gate). (2) bootstrap merged into main
+> (R-c wf-preservation synthesizer). (3) `tools/check-no-search.py`
+> written to the tgt check.sh spec — package-layout scope; current
+> emission is derivation-first with 0 violations. Full battery green
+> on the merged state: units, suite 547/4 (squeeze-debt residue), gt
+> gate + package gate + no-search claim, tutorial 9/9.
 
 Extend the existing if-split (clamp_low already emits one theorem per branch,
 via `BranchTest`) to expression-level matches and datatype-discriminator ites:
