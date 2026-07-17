@@ -875,19 +875,37 @@ one part per source module, SCC-merged; umbrella = interface)", header)));
     let base_name = format!("{}__base", umbrella_name);
     // (module name, file cmds, imported module names) in build order.
     let mut files: Vec<(String, Vec<Command>, Vec<String>)> = Vec::new();
-    files.push((base_name.clone(), make_file("base", &[], &plan.base), Vec::new()));
-    for (suffix, items, imports) in &plan.parts {
-        let name = format!("{}__{}", umbrella_name, suffix);
-        let mut imp: Vec<String> = vec![base_name.clone()];
-        imp.extend(imports.iter().map(|i| format!("{}__{}", umbrella_name, i)));
-        files.push((name, make_file(suffix, &imp, items), imp));
+    if plan.parts.is_empty() {
+        // Single-file collapse: with no per-module parts, base +
+        // umbrella merge into ONE module named `umbrella_name` —
+        // consumers import that name either way, and concatenating
+        // base items then umbrella items elaborates in exactly the
+        // order the two-file split did (umbrella imported base).
+        // Saves one full `lean` process (each pays the prelude olean
+        // import) per crate; on e2e-test-sized crates the defs chain
+        // halves.
+        let items: Vec<usize> =
+            plan.base.iter().chain(plan.umbrella.iter()).cloned().collect();
+        files.push((
+            umbrella_name.to_string(),
+            make_file("base+umbrella (single-file collapse)", &[], &items),
+            Vec::new(),
+        ));
+    } else {
+        files.push((base_name.clone(), make_file("base", &[], &plan.base), Vec::new()));
+        for (suffix, items, imports) in &plan.parts {
+            let name = format!("{}__{}", umbrella_name, suffix);
+            let mut imp: Vec<String> = vec![base_name.clone()];
+            imp.extend(imports.iter().map(|i| format!("{}__{}", umbrella_name, i)));
+            files.push((name, make_file(suffix, &imp, items), imp));
+        }
+        let all_parts: Vec<String> = files.iter().map(|(n, _, _)| n.clone()).collect();
+        files.push((
+            umbrella_name.to_string(),
+            make_file("umbrella", &all_parts, &plan.umbrella),
+            all_parts,
+        ));
     }
-    let all_parts: Vec<String> = files.iter().map(|(n, _, _)| n.clone()).collect();
-    files.push((
-        umbrella_name.to_string(),
-        make_file("umbrella", &all_parts, &plan.umbrella),
-        all_parts,
-    ));
 
     // M5e superset waiver: per part, a MANIFEST of one hash per item
     // command (DefaultHasher — key-stable across runs of one binary).
