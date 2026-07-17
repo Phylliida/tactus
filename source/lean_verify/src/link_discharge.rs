@@ -146,6 +146,199 @@ pub struct Ctx<'a> {
     /// Present only for scalar-carrying datatypes (those with a
     /// generated `{Dt}Wf` predicate).
     pub wf: &'a HashMap<String, WfInfo>,
+    /// R-c: synthesized preservation lemmas (`{g}_wf`), by spec fn.
+    pub wf_lemmas: &'a HashMap<String, crate::wf_synth::FnWfSig>,
+    /// R-c: per-datatype conjunct specs (ctor-literal wf resolution).
+    pub wf_specs: &'a HashMap<String, crate::wf_synth::DtWfSpec>,
+    /// Crate namespace (`lib`) — for parsing spec-fn heads in arg texts.
+    pub ns: &'a str,
+}
+
+/// Strip balanced outer paren layers: `((X))` → `X`, but `(A) (B)`
+/// stays intact (the closing paren of the first token is not the last
+/// char). Depth-aware — never produces unbalanced fragments.
+fn strip_outer_parens(mut t: &str) -> &str {
+    t = t.trim();
+    loop {
+        if !(t.starts_with('(') && t.ends_with(')')) {
+            return t;
+        }
+        let mut depth = 0i32;
+        let mut ok = true;
+        for (i, c) in t.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 && i != t.len() - 1 {
+                        ok = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !ok || depth != 0 {
+            return t;
+        }
+        t = t[1..t.len() - 1].trim();
+    }
+}
+
+/// Split an application text into top-level (paren-depth-0) tokens.
+fn split_top(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut cur = String::new();
+    for c in text.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                cur.push(c);
+            }
+            ' ' if depth == 0 => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// A bound-conjunct proof for an argument TEXT: the arm's destructured
+/// component or a lead `h_*_bound` binder when nameable — `(by omega)`
+/// only as a context-free fallback (tactic goals in term-position match
+/// arms can be postponed outside the arm, losing pattern hypotheses).
+fn resolve_bound_text(text: &str, env: &AppEnv) -> String {
+    let t = strip_outer_parens(text);
+    if let Some((comp, false)) = env.arm_comps.get(t) {
+        return comp.clone();
+    }
+    let hb = format!("h_{}_bound", t);
+    if env.own_lead.iter().any(|n| matches!(n, Node::All { name, .. } if *name == hb)) {
+        return hb;
+    }
+    if let Some(v) = env.lets.get(t) {
+        return resolve_bound_text(v, env);
+    }
+    "(by omega)".to_string()
+}
+
+/// R-c: resolve a wf proof for an argument TEXT — own param hypothesis,
+/// arm component (`x.deref`), synthesized `{g}_wf` application, or a
+/// constructor's anonymous-constructor proof. Bounds ride `(by omega)`.
+fn resolve_wf_text(text: &str, want_dt: &str, env: &AppEnv) -> Result<String, String> {
+    let t = strip_outer_parens(text);
+    if let Some(b) = env.own_wf.get(t) {
+        return Ok(b.clone());
+    }
+    if let Some(stripped) = t.strip_suffix(".deref") {
+        if let Some((comp, true)) = env.arm_comps.get(stripped) {
+            return Ok(comp.clone());
+        }
+        // (Boxed-param wf hyps are keyed by `p.deref` in own_wf, so
+        // the first lookup above already catches them.)
+        if let Some(v) = env.lets.get(stripped) {
+            return resolve_wf_text(&format!("({}).deref", v), want_dt, env);
+        }
+    }
+    if let Some((comp, true)) = env.arm_comps.get(t) {
+        return Ok(comp.clone());
+    }
+    if let Some(v) = env.lets.get(t) {
+        return resolve_wf_text(v, want_dt, env);
+    }
+    let toks = split_top(t);
+    let head = toks.first().map(|s| s.as_str()).unwrap_or("");
+    let Some(rest) = head.strip_prefix(&format!("{}.", env.ns)) else {
+        return Err(format!("wf-transport for arg `{}` ({}Wf)", text, want_dt));
+    };
+    if let Some((d, v)) = rest.split_once('.') {
+        // Constructor application `lib.D.V a b …`.
+        if d != want_dt {
+            return Err(format!("ctor {} where {}Wf wanted", d, want_dt));
+        }
+        let spec = env
+            .wf_specs
+            .get(d)
+            .ok_or_else(|| format!("no wf spec for {}", d))?;
+        let conjs = spec
+            .variants
+            .get(v)
+            .ok_or_else(|| format!("unknown variant {}.{}", d, v))?;
+        let mut parts = Vec::new();
+        for (idx, kind) in conjs {
+            let arg = toks
+                .get(idx + 1)
+                .ok_or_else(|| format!("ctor {}.{} arity in `{}`", d, v, text))?;
+            match kind {
+                crate::wf_synth::ConjKind::Bound => parts.push(resolve_bound_text(arg, env)),
+                crate::wf_synth::ConjKind::Rec { dt, boxed } => {
+                    let inner = if *boxed {
+                        let a = strip_outer_parens(arg);
+                        match a.strip_prefix("Tactus.Box.mk ") {
+                            Some(x) => x.to_string(),
+                            // Bare Box-typed var: its wf is the wf of
+                            // `v.deref` — resolvable via an own-wf
+                            // hypothesis on the deref.
+                            None if !a.contains(' ') => format!("{}.deref", a),
+                            None => {
+                                return Err(format!(
+                                    "boxed ctor arg `{}` not Box.mk", arg
+                                ))
+                            }
+                        }
+                    } else {
+                        arg.clone()
+                    };
+                    parts.push(resolve_wf_text(&inner, dt, env)?);
+                }
+            }
+        }
+        return Ok(match parts.len() {
+            0 => "trivial".to_string(),
+            1 => parts.into_iter().next().unwrap(),
+            _ => format!("⟨{}⟩", parts.join(", ")),
+        });
+    }
+    // Spec-fn application `lib.g a b …` with a synthesized lemma.
+    let sig = env
+        .wf_lemmas
+        .get(rest)
+        .ok_or_else(|| format!("wf-transport for arg `{}` ({}Wf, no {}_wf)", text, want_dt, rest))?;
+    if sig.ret_dt != want_dt {
+        return Err(format!("{} returns {}Wf, wanted {}Wf", rest, sig.ret_dt, want_dt));
+    }
+    if toks.len() != sig.params.len() + 1 {
+        return Err(format!("`{}` arity vs {}_wf", text, rest));
+    }
+    let mut out = format!("({}_wf", rest);
+    for (a, (_, kind)) in toks[1..].iter().zip(&sig.params) {
+        out.push(' ');
+        out.push_str(a);
+        match kind {
+            crate::wf_synth::ParamKind::Bounded(_) => {
+                out.push(' ');
+                out.push_str(&resolve_bound_text(a, env));
+            }
+            crate::wf_synth::ParamKind::Dt(d) => {
+                out.push(' ');
+                out.push_str(&resolve_wf_text(a, d, env)?);
+            }
+            crate::wf_synth::ParamKind::Other => {}
+        }
+    }
+    out.push(')');
+    Ok(out)
 }
 
 /// Signature metadata of an already-closed fn: the wf hypotheses its
@@ -182,7 +375,7 @@ fn pend(reason: impl Into<String>) -> Outcome {
 }
 
 /// Word-boundary occurrence check (is `name` referenced in `text`?).
-fn referenced(name: &str, text: &str) -> bool {
+pub(crate) fn referenced(name: &str, text: &str) -> bool {
     let bytes = text.as_bytes();
     let mut start = 0;
     while let Some(pos) = text[start..].find(name) {
@@ -205,7 +398,7 @@ fn referenced(name: &str, text: &str) -> bool {
 }
 
 /// Word-boundary global replace (companion to [`referenced`]).
-fn replace_word(text: &str, name: &str, with: &str) -> String {
+pub(crate) fn replace_word(text: &str, name: &str, with: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
@@ -301,6 +494,13 @@ struct AppEnv<'a> {
     arm_comps: &'a HashMap<String, (String, bool)>,
     /// The being-built fn's own wf params (IH signature mirror).
     own_meta: &'a ClosedMeta,
+    /// R-c resolution tables (from Ctx).
+    wf_lemmas: &'a HashMap<String, crate::wf_synth::FnWfSig>,
+    wf_specs: &'a HashMap<String, crate::wf_synth::DtWfSpec>,
+    ns: &'a str,
+    /// The VC's term-mode lets (name → value text) — wf-arg texts often
+    /// name a let (`tmp__3`); resolution chases the value.
+    lets: &'a HashMap<String, String>,
 }
 
 /// Build the positional application of `vc`'s theorem through the
@@ -465,10 +665,12 @@ fn app_args(vc: &Vc, upto: Option<usize>, env: &AppEnv) -> Result<Vec<String>, S
                                     t.push_str(b);
                                 }
                                 _ => {
-                                    return Err(format!(
-                                        "wf-transport for arg `{}` of {} ({}Wf)",
-                                        feeder.text, callee, dt
-                                    ))
+                                    // R-c: spec-fn results / constructors
+                                    // resolve via synthesized lemmas.
+                                    let p = resolve_wf_text(&feeder.text, dt, env)
+                                        .map_err(|e| format!("{} (of {})", e, callee))?;
+                                    t.push(' ');
+                                    t.push_str(&p);
                                 }
                             }
                         }
@@ -567,13 +769,14 @@ fn own_wf_demands(
                         let a = &args[i];
                         if let Some(t) = a.tag.strip_prefix("param:") {
                             needs.insert(t.to_string(), dt.clone());
-                        } else if a.text.ends_with(".deref") && projections_exist {
-                            // scrutinee child — covered by scrut wf
                         } else {
-                            return Err(format!(
-                                "wf-transport for arg `{}` of {} ({}Wf)",
-                                a.text, callee, dt
-                            ));
+                            // Everything else (scrutinee children,
+                            // spec-fn results, ctors, let names) is
+                            // resolved at APPLICATION time, where the
+                            // arm context and let tables exist — and
+                            // where the precise error text (with the
+                            // let-expanded value) feeds R-c demand
+                            // collection.
                         }
                     }
                 }
@@ -607,6 +810,24 @@ fn close_zero_spine(rel: &str, sc: &FnSidecar) -> Option<Outcome> {
         kind: "zero-spine",
         meta: ClosedMeta::default(),
     })
+}
+
+/// Parse a resolver failure into an own-wf-hypothesis demand: the
+/// failing arg must be one of OUR params (`c`) or a boxed param's
+/// deref (`inv_hyps.deref`). Returns (arg-key, dt).
+fn parse_own_wf_demand(err: &str, param_names: &[&str]) -> Option<(String, String)> {
+    let start = err.find("wf-transport for arg `")? + 22;
+    let rest = &err[start..];
+    let end = rest.find('`')?;
+    let x = &rest[..end];
+    let base = x.strip_suffix(".deref").unwrap_or(x);
+    if !param_names.contains(&base) {
+        return None;
+    }
+    let after = &rest[end..];
+    let dstart = after.find(" (")? + 2;
+    let dend = after[dstart..].find("Wf")? + dstart;
+    Some((x.to_string(), after[dstart..dend].to_string()))
 }
 
 /// Straight-line: no branches, no heights, no self-calls.
@@ -646,12 +867,67 @@ fn close_straight_line(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, 
         })
         .collect();
     // R-b: propagated wf demands become own signature hypotheses.
-    let wf_params = own_wf_demands(sc, ctx, &param_names, None, false)?;
-    let own_wf: HashMap<String, String> = wf_params
+    // R-c: resolver failures naming OWN params (or their derefs) are
+    // ALSO own-hypothesis demands — retry, accumulating them, until
+    // the build settles or fails for a non-parameter reason.
+    let mut wf_params = own_wf_demands(sc, ctx, &param_names, None, false)?;
+    let no_comps: HashMap<String, (String, bool)> = HashMap::new();
+    let let_table: HashMap<String, String> = p0
+        .spine
         .iter()
-        .map(|(p, _)| (p.clone(), format!("hwf_{}", p)))
+        .filter_map(|n| match n {
+            Node::Let { name, v } => Some((name.clone(), v.clone())),
+            _ => None,
+        })
         .collect();
-    let meta = ClosedMeta { wf_params: wf_params.clone() };
+    let (apps, own_wf, meta) = loop {
+        let own_wf: HashMap<String, String> = wf_params
+            .iter()
+            .map(|(p, _)| {
+                let base = p.strip_suffix(".deref").unwrap_or(p);
+                (p.clone(), format!("hwf_{}", base))
+            })
+            .collect();
+        let meta = ClosedMeta { wf_params: wf_params.clone() };
+        let env = AppEnv {
+            fn_rel: rel,
+            scrut_subst: None,
+            hdec_names: &[],
+            sidecars: ctx.sidecars,
+            own_lead: lead,
+            closed: ctx.closed,
+            own_wf: &own_wf,
+            arm_comps: &no_comps,
+            own_meta: &meta,
+            wf_lemmas: ctx.wf_lemmas,
+            wf_specs: ctx.wf_specs,
+            ns: ctx.ns,
+            lets: &let_table,
+        };
+        let mut apps = Vec::new();
+        let mut err: Option<String> = None;
+        for p in &posts {
+            match app_text(p, None, &env) {
+                Ok(a) => apps.push(a),
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        match err {
+            None => break (apps, own_wf, meta),
+            Some(e) => {
+                let demand = parse_own_wf_demand(&e, &param_names);
+                match demand {
+                    Some((x, d)) if !wf_params.iter().any(|(p, _)| *p == x) => {
+                        wf_params.push((x, d));
+                    }
+                    _ => return Err(e),
+                }
+            }
+        }
+    };
     let mut binders: Vec<String> = lead
         .iter()
         .map(|n| match n {
@@ -660,24 +936,10 @@ fn close_straight_line(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, 
         })
         .collect();
     for (p, dt) in &wf_params {
-        binders.push(format!("(hwf_{} : {}Wf {})", p, dt, p));
+        let base = p.strip_suffix(".deref").unwrap_or(p);
+        binders.push(format!("(hwf_{} : {}Wf {})", base, dt, p));
     }
-    let no_comps: HashMap<String, (String, bool)> = HashMap::new();
-    let env = AppEnv {
-        fn_rel: rel,
-        scrut_subst: None,
-        hdec_names: &[],
-        sidecars: ctx.sidecars,
-        own_lead: lead,
-        closed: ctx.closed,
-        own_wf: &own_wf,
-        arm_comps: &no_comps,
-        own_meta: &meta,
-    };
-    let mut apps = Vec::new();
-    for p in &posts {
-        apps.push(app_text(p, None, &env)?);
-    }
+    let _ = &own_wf;
     let body_ty = posts
         .iter()
         .map(|p| format!("({})", strip_mark(&p.leaf)))
@@ -896,7 +1158,7 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
     };
 
     let mut arms_text: Vec<String> = Vec::new();
-    let mut dec_bullets: Vec<String> = Vec::new();
+    let mut any_heights = false;
     for sig in &arm_sigs {
         let variant = variant_of_sig(sig)?;
         let accessors: &Vec<String> = variants
@@ -995,7 +1257,9 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
                     format!("h_wf_{}", c.accessor)
                 };
                 // Bind the component to the PROJECTION-LET name that
-                // projects this accessor (if the arm projects it).
+                // projects this accessor (if the arm projects it) AND
+                // to the raw projection text (`tmp___0.Ret_val1`) —
+                // unboxed rec conjuncts feed wf resolution directly.
                 if let Some(pi) = field_accessor.iter().position(|a| {
                     a.as_deref() == Some(c.accessor.as_str())
                 }) {
@@ -1003,12 +1267,17 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
                         arm_comps.insert(pn.clone(), (bname.clone(), c.rec));
                     }
                 }
+                arm_comps.insert(
+                    format!("{}.{}_{}", base, variant, c.accessor),
+                    (bname.clone(), c.rec),
+                );
                 names.push(bname);
             }
-            Some(if names.is_empty() {
-                "_".to_string()
-            } else {
-                format!("⟨{}⟩", names.join(", "))
+            Some(match names.len() {
+                0 => "_".to_string(),
+                // Single-conjunct wf clause: bare Prop, no ⟨⟩ pattern.
+                1 => names.into_iter().next().unwrap(),
+                _ => format!("⟨{}⟩", names.join(", ")),
             })
         } else {
             None
@@ -1018,6 +1287,17 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
             .iter()
             .enumerate()
             .filter_map(|(i, n)| matches!(n, Node::Height).then_some(i))
+            .collect();
+        if !heights.is_empty() {
+            any_heights = true;
+        }
+        let let_table: HashMap<String, String> = arm_posts[0]
+            .spine
+            .iter()
+            .filter_map(|n| match n {
+                Node::Let { name, v } => Some((name.clone(), v.clone())),
+                _ => None,
+            })
             .collect();
         let mut hdec_names = Vec::new();
         let mut haves = Vec::new();
@@ -1031,7 +1311,18 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
             own_wf: &own_wf,
             arm_comps: &arm_comps,
             own_meta: &meta,
+            wf_lemmas: ctx.wf_lemmas,
+            wf_specs: ctx.wf_specs,
+            ns: ctx.ns,
+            lets: &let_table,
         };
+        // Height premises weave in via `have hdec := <term-thm app>`
+        // INSIDE the arm (self-refs legal there). The decreasing goals
+        // themselves close DIRECTLY — height defs are WF-compiled, so
+        // their equations exist and `simp [height] <;> omega` decides
+        // every structural-child inequality. Term-thm applications in
+        // decreasing_by would be illegal anyway: multi-self-call arms'
+        // later term VCs carry self-referencing premises.
         for (j, hi) in heights.iter().enumerate() {
             let tvc = arm_terms
                 .iter()
@@ -1042,29 +1333,11 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
             } else {
                 format!("hdec{}", j)
             };
-            let tapp = app_text(tvc, None, &env0)?;
+            let tapp = {
+                let env_j = AppEnv { hdec_names: &hdec_names, ..env0 };
+                app_text(tvc, None, &env_j)?
+            };
             haves.push(format!("have {} := {}", name, tapp));
-            // decreasing_by goals see pattern binders but NOT the
-            // arm's term-mode lets — inline them (probe34 shape).
-            let arm_lets: Vec<(String, String)> = arm_posts[0]
-                .spine
-                .iter()
-                .filter_map(|n| match n {
-                    Node::Let { name, v } if !projections.contains(name) => Some((
-                        name.clone(),
-                        if alias_name == Some(name.as_str()) {
-                            pattern.clone()
-                        } else {
-                            v.clone()
-                        },
-                    )),
-                    _ => None,
-                })
-                .collect();
-            dec_bullets.push(format!(
-                "  · exact ({}\n      ).resolve_right (fun h => h.2.elim)",
-                expand_lets(&tapp, &arm_lets)
-            ));
             hdec_names.push(name);
         }
         let env = AppEnv {
@@ -1077,6 +1350,10 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
             own_wf: &own_wf,
             arm_comps: &arm_comps,
             own_meta: &meta,
+            wf_lemmas: ctx.wf_lemmas,
+            wf_specs: ctx.wf_specs,
+            ns: ctx.ns,
+            lets: &let_table,
         };
         let lets = replay_lets(
             arm_posts[0],
@@ -1158,10 +1435,14 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
         arms_text.join("\n")
     );
     text.push_str(&format!("termination_by {}\n", measure));
-    if !dec_bullets.is_empty() {
-        text.push_str("decreasing_by\n");
-        text.push_str(&dec_bullets.join("\n"));
-        text.push('\n');
+    if any_heights {
+        // `<;>`: simp may CLOSE a goal outright — a sequenced `; omega`
+        // then dies with "no goals"; `<;>` applies omega only to
+        // whatever simp leaves.
+        text.push_str(&format!(
+            "decreasing_by all_goals (simp [{}.height] <;> omega)\n",
+            dt
+        ));
     }
     Ok(Outcome::Closed { text, kind: "fix", meta })
 }
