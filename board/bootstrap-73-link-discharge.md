@@ -3,7 +3,7 @@ title: "Link discharge — premise-free closed theorems per proof fn (spec: DESI
 status: in_progress
 claimed_by: fable-b73
 created: 2026-07-16T23:30:00Z
-updated: 2026-07-16T23:30:00Z
+updated: 2026-07-17T02:30:00Z
 ---
 
 ## Description
@@ -141,3 +141,23 @@ Danielle (naming / default-on / theorem-vs-def).
   - NEXT: slice (b) — clean-statement rendering + closed_clean for the
     zero-spine class (u_* re-exports) in the Link builder, reading the
     sidecars.
+
+- (2026-07-17, fable-b73) **L1 SLICE (b) LANDED — first green artifacts:
+  52 per-fn closed theorems under STABLE names.**
+  - `ExecLinkEntry` gains `fn_name` (stable dotted) + `is_proof`; the
+    Link builder reads each proof fn's spine sidecar and, for the
+    ZERO-SPINE class (exactly one postcondition VC, binders-only spine —
+    the VC statement IS the clean statement), emits
+    `theorem lib.<fn>_closed : <vc>_stmt := <vc>` + axiom check. True
+    exec fns skipped by design; woven-premise fns counted pending.
+  - Gate note: "Link discharge: 52 per-fn closed theorem(s) (zero-spine);
+    15 proof fn(s) pending (woven premises — slices c/L2)". The 52 = the
+    entire u_* family + friends; the 15 pending = the support lemmas +
+    wp_stm_sound + ref_wp_sound + corollaries, exactly the c/L2 targets.
+  - Validation: vstd 1530/0; tactus-core 138/0, gate green (the Link
+    elaborates + axiom-checks all 52); consumption smoke = downstream
+    `exact lib.u_holds_all_binder_closed …` in the gate's own
+    elaboration environment, rc=0. `theorem` keyword throughout (Q3).
+  - NEXT: slice (c) — non-recursive discharge with bound recipes (the
+    prophecy/closure corollaries close; needs the positional application
+    generator over the sidecar spine); then L2 (fix synthesis + wf).

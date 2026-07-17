@@ -2801,6 +2801,12 @@ struct ExecLinkEntry {
     /// (obligation theorem name, helper deps in BINDER ORDER — the
     /// closed form applies `<dep>_closed` in exactly this order).
     obligations: Vec<(String, Vec<vir::ast::Path>)>,
+    /// Stable dotted fn name (`lib.u_gapp_nil`) — the per-FN closed
+    /// theorem's name root (Link-discharge L1).
+    fn_name: String,
+    /// Mode::Proof — only proof fns get per-fn closed theorems (true
+    /// exec fns are skipped by design, DESIGN-link-discharge.md §3.4).
+    is_proof: bool,
 }
 
 static EXEC_LINK_REGISTRY: std::sync::OnceLock<
@@ -2821,6 +2827,11 @@ fn record_exec_link_entry(scope: &str, entry: ExecLinkEntry) {
 /// Lean entirely this run on a cross-run cached verdict. Reported in
 /// the package gate note.
 static PKG_CACHED_VERDICTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Link-discharge L1 census (per process, reported via the gate note).
+static DISCHARGE_CLOSED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static DISCHARGE_PENDING: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static ISLAND_CACHED_VERDICTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -3501,6 +3512,10 @@ pub struct PackageGateReport {
     /// bridge is INFORMATIONAL in W4a — its outcome never enters
     /// `failures` and so never becomes a verification error.
     pub bridge_note: Option<String>,
+    /// Link-discharge L1 census: per-fn closed theorems emitted
+    /// (zero-spine class) / proof fns pending (woven premises).
+    pub discharge_closed: usize,
+    pub discharge_pending: usize,
 }
 
 /// Crate-level package gate (DESIGN-emit-module.md M4): regenerate the
@@ -3588,6 +3603,8 @@ pub fn check_package(
         return Ok(PackageGateReport {
             modules: 1 + stmt_mods.len(), reused,
             pkg_cached: PKG_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
+            discharge_closed: DISCHARGE_CLOSED.load(std::sync::atomic::Ordering::Relaxed),
+            discharge_pending: DISCHARGE_PENDING.load(std::sync::atomic::Ordering::Relaxed),
             island_cached: ISLAND_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
             skipped_sccs, failures, bridge_note: None,
         });
@@ -3615,6 +3632,8 @@ pub fn check_package(
         modules: 1 + stmt_mods.len() + leafs.len() + 1,
         reused,
         pkg_cached: PKG_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
+        discharge_closed: DISCHARGE_CLOSED.load(std::sync::atomic::Ordering::Relaxed),
+        discharge_pending: DISCHARGE_PENDING.load(std::sync::atomic::Ordering::Relaxed),
         island_cached: ISLAND_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
         skipped_sccs,
         failures,
@@ -4234,6 +4253,57 @@ fn build_link_module(
             )));
         }
     }
+    // Link-discharge L1 slice (b) (DESIGN-link-discharge.md §3.2 leaf
+    // case): per-FN closed theorems for the ZERO-SPINE class — proof
+    // fns with exactly one postcondition VC whose spine is binders-only
+    // (no woven premises, no lets). For these the VC statement IS the
+    // clean statement, so the closed theorem is the pkg theorem under
+    // the fn's STABLE name (consumers never touch line-numbered VC
+    // names). Non-qualifying proof fns are counted as pending (slices
+    // c/L2); true exec fns are skipped by design.
+    let mut zero_spine_closed = 0usize;
+    let mut discharge_pending = 0usize;
+    for e in &exec_entries {
+        if !e.is_proof {
+            continue;
+        }
+        let spine_path = lean_out_root().join(sanitize(crate_name)).join("pkg")
+            .join(format!("{}.spine.json", e.leaf));
+        let qualifies = std::fs::read_to_string(&spine_path).ok()
+            .and_then(|txt| serde_json::from_str::<serde_json::Value>(&txt).ok())
+            .and_then(|v| {
+                let vcs = v.get("vcs")?.as_array()?.clone();
+                let posts: Vec<&serde_json::Value> = vcs.iter()
+                    .filter(|vc| vc.get("name").and_then(|n| n.as_str())
+                        .is_some_and(|n| n.contains("_tactus_postcondition_")))
+                    .collect();
+                if posts.len() != 1 || vcs.len() != 1 {
+                    return Some(None);
+                }
+                let spine = posts[0].get("spine")?.as_array()?;
+                let binders_only = spine.iter()
+                    .all(|n| n.get("k").and_then(|k| k.as_str()) == Some("all"));
+                Some(binders_only.then(|| posts[0].get("name")
+                    .and_then(|n| n.as_str()).map(|s| s.to_string())).flatten())
+            })
+            .flatten();
+        match qualifies {
+            Some(vc_name) => {
+                cmds.push(Command::Raw(format!(
+                    "theorem {}_closed : {}_stmt := {}
+", e.fn_name, vc_name, vc_name
+                )));
+                cmds.push(Command::Raw(format!(
+                    "#tactus_check_axioms {}_closed [{}]
+", e.fn_name, boundary_list
+                )));
+                zero_spine_closed += 1;
+            }
+            None => discharge_pending += 1,
+        }
+    }
+    DISCHARGE_CLOSED.store(zero_spine_closed, std::sync::atomic::Ordering::Relaxed);
+    DISCHARGE_PENDING.store(discharge_pending, std::sync::atomic::Ordering::Relaxed);
     let rendered = pp_commands(&cmds);
     let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
         .join(format!("{}.lean", link_module_name(defs)));
@@ -4571,6 +4641,8 @@ fn emit_package_exec_fn(
             .zip(per_thm_deps.iter())
             .map(|(n, ds)| (n, ds.iter().map(|f| f.name.path.clone()).collect()))
             .collect(),
+        fn_name: lean_name(&vir_fn.name.path),
+        is_proof: matches!(vir_fn.mode, vir::ast::Mode::Proof),
     });
     Ok(PkgEmitOutcome::Single { leaf, path, source_map, stmt_modules, changed })
 }
