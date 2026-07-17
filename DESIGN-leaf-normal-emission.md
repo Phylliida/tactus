@@ -94,7 +94,11 @@ exactly two causes, and both argue for this doc's principles:
 > SCC/termination/match families all closed. Residue: LetRaw-path tuple
 > lets + a user-simp-prefix/derived-intro mismatch (two tests), the
 > mut-ref `.deref` rendering probe, Seq-view atoms (one each). Gates
-> run: e2e suite + lean_verify units; pending: tutorial, gt gate, pool.
+> run — ALL GREEN: e2e suite 547/4 (residue pre-existing), lean_verify
+> units, gt gate (2840 verified / 0 errors, package gate live), tutorial
+> chapters 9/9 (note: bare binary invocations need the lean-project
+> LEAN_PATH exported or the package gate can't resolve Mathlib).
+> Pool-gate re-measure still open (squeeze census tooling).
 
 Emit `let tmp__1 := x; G[tmp__1]` as theorem-level
 `(tmp__1 : Int) (h_tmp__1 : tmp__1 = x)` with goal `G[tmp__1]`.
