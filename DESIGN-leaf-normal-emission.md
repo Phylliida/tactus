@@ -131,6 +131,21 @@ named from the source arm).
   datatype-scrutinee matches, cap depth, fall back to N3's script above the
   cap); spec-level matches inside expressions; theorem-count/artifact-size
   measurement.
+* **v1 slice (settled 2026-07-17, Danielle's N2 go):** the WP already
+  forks value-position ifs into Branch-provenance `Hyp` frames, and
+  `branch_test_of` already extracts `BranchTest { scrutinee, datatype,
+  variant, positive }` from the lowered-match `IsVariant` chains — it is
+  currently documentation-only. Upgrade the POSITIVE-test frames at push
+  time: instead of `Hyp(scrut.is<V>)`, push field `Binder`s (fresh names
+  per variant field) + `Hyp(scrut = Dt.V f0 f1 …, Branch(bt))`. N1's
+  hoisting then lands the equation as a theorem binder, and accessor /
+  height applications reduce by simp with the goal-mentioned generated
+  defs — no `cases` in-tactic. Negative tests stay `¬ is<V>` in v1
+  (multi-variant negatives need the arm-product policy first).
+  Plumbing: a per-datatype field-type map alongside `DtDefInventory`
+  (field binders need `typ_to_expr` of each field). Validation: the
+  same gate set as N1; expect the structural rung's `cases` targets to
+  go quiet for lowered-match goals — measure that share.
 
 ### N3 — Provenance-driven residual scripts
 
@@ -172,6 +187,35 @@ Validation corpus note: the e2e tactus suite is IN the battery from N0 on —
 its absence is how the S2c regression shipped.
 
 ---
+
+## 3b. Far pole (reference point, not scheduled): certificate replay
+
+The tier ladder has a known floor. A Z3 `unsat` is a finite object —
+finitely many quantifier instantiations plus ground theory steps — so
+every soundly-Verus-accepted VC has a Lean proof, and *replaying a found
+proof* dodges every decidability obstruction that binds provers. Three
+routes, best-first for tactus's transparency ethos:
+
+1. **Instantiation logging** — dump Z3's quantifier instantiations per
+   VC and emit them as explicit `have := axiom … args` lines + a ground
+   closer (omega / bv_decide / congruence). Name-is-spec readable; the
+   same "information flows forward" principle as N3 — Z3's e-matching
+   already found the instances, don't re-search for them. Residue:
+   nonlinear (nlsat doesn't decompose this way) → nlinarith /
+   Positivstellensatz certificates, a fenced gap.
+2. **cvc5 + lean-smt** — same AIR queries through cvc5's well-specified
+   proof production, reconstructed in Lean. Opaque-er artifacts,
+   near-total coverage.
+3. **Z3 proof objects** — under-specified format, coarse theory steps;
+   Isabelle-era art shows it's possible and unpleasant.
+
+Combined with the bootstrap R2 arch (the VC-generation half), any of
+these completes end-to-end kernel-checked Verus: Z3 demoted from
+trusted oracle to untrusted proof-finder. Recorded here so the N4
+fallback-share progress bar has a defined zero — "loud failure" can
+eventually mean "spend a certificate," not only "write an inline
+proof." (Danielle, 2026-07-17: direction endorsed as worth thinking
+toward; not scheduled.)
 
 ## 4. Relation to other arcs
 
