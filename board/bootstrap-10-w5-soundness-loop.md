@@ -1,6 +1,6 @@
 ---
 title: "W5 — soundness of the reference WP (the bootstrap loop closes) [staged, very large]"
-status: in_progress
+status: done
 claimed_by: opus-w5a-kickoff
 created: 2026-07-13T19:38:00Z
 updated: 2026-07-16T22:40:00Z
@@ -123,3 +123,12 @@ bootstrap-49 + `probe-w0/probe21_w5a_sem/REPORT.md` + `DESIGN-W5-soundness.md`.
 The loop closes only when the whole ladder is authored as Rust spec/proof fns in
 tactus-core and emitted as a kernel-checked package; that final step is
 explicitly staged and not yet begun._
+
+- (2026-07-18, fable-b74-session) **UMBRELLA CLOSED — W5 COMPLETE.**
+  Full arc: W5a–e model+proofs authored (bootstrap-60..65) → per-fn
+  kernel closure via Link discharge (bootstrap-73, 67/67) → composition
+  (bootstrap-66/probe37): adequacy spine consumes ref_wp_sound_closed
+  by plain application; hand soundness induction deleted. The claim:
+  kernel-checked obligations ⟹ the operational spec, with the adequacy
+  spine as the designed permanent residue. Writeup =
+  DESIGN-W5-soundness.md §5 + VERIFICATION-PATH.md §4 rung 5 / §7.
