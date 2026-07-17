@@ -136,7 +136,7 @@ impl LeanName {
 
     /// For hardcoded literal names referenced in generated Lean: prelude
     /// definitions (`"Nat"`, `"Int"`, `"True"`), Tactus tactics
-    /// (`"tactus_auto"`, `"tactus_peel"`), Mathlib refs (`"Int.toNat"`).
+    /// (`"tactus_auto"`, `"tactus_first"`), Mathlib refs (`"Int.toNat"`).
     /// Caller guarantees the string is a valid Lean identifier.
     pub fn lit(s: impl Into<String>) -> Self {
         Self(s.into())

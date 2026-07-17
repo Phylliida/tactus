@@ -787,6 +787,54 @@ pub fn proof_fn_to_ast(
 ///
 /// Returns an empty `Vec` for `Dt::Tuple` (no declaration needed —
 /// tuples are rendered as `T × U` products).
+/// Name inventory of the `@[simp]` defs `datatype_to_cmds` /
+/// `datatype_group_to_cmds` emit per datatype, for
+/// `tactic_select::structural_rung`'s derived unfold lists. MUST
+/// mirror the emission naming exactly (discriminators from the
+/// `is{Variant}` loop, accessors from `multi_variant_accessor_defs`'
+/// `{Variant}_{field_name}` loop, `height` from
+/// `datatype_height_cmd`) — a drifted name here surfaces as an
+/// unknown-identifier failure of the structural rung (the `first`
+/// combinator recovers, so drift degrades to a loud goal failure,
+/// never a wrong proof).
+///
+/// Gates mirrored: external-body datatypes emit no defs (opaque
+/// axioms); tuples emit nothing; single-variant STRUCTS (variant
+/// named like the type) emit no accessors (they render as Lean
+/// `structure` with real projections). `height` is emitted for every
+/// declared `Dt::Path` datatype. Over-inclusion relative to the
+/// referenced-datatype pruning is harmless: a name only enters a
+/// simp list when the goal itself mentions it.
+pub(crate) fn datatype_simp_def_inventory(
+    datatypes: &[vir::ast::Datatype],
+) -> crate::tactic_select::DtDefInventory {
+    let mut by_type = std::collections::HashMap::new();
+    for d in datatypes.iter() {
+        if matches!(d.x.transparency, DatatypeTransparency::Never) {
+            continue;
+        }
+        let (path, short) = match &d.x.name {
+            Dt::Path(p) => (lean_name(p), short_name(p).to_string()),
+            Dt::Tuple(_) => continue,
+        };
+        let mut defs: std::collections::HashSet<String> = Default::default();
+        defs.insert("height".to_string());
+        let is_single_variant_struct =
+            d.x.variants.len() == 1 && d.x.variants[0].name.as_str() == short;
+        if !is_single_variant_struct {
+            for v in d.x.variants.iter() {
+                let var_san = sanitize(&v.name);
+                defs.insert(format!("is{}", var_san));
+                for f in v.fields.iter() {
+                    defs.insert(format!("{}_{}", var_san, field_name(&f.name)));
+                }
+            }
+        }
+        by_type.insert(path, defs);
+    }
+    crate::tactic_select::DtDefInventory { by_type }
+}
+
 pub fn datatype_to_cmds(
     dt: &DatatypeX,
     emit_accessors: bool,
