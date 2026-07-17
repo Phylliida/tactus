@@ -27,3 +27,21 @@ call whether to spend a session here.
 either one landed win or an explicit "not worth it" close.
 
 **Blocked by:** nothing.
+
+## Status update (2026-07-17, after S2c/B4/B6/B10)
+
+Fresh data points from this session's many gate runs: warm gt gates
+ran ~85-100s end-to-end (verus-side emission + harvest + cached Lean
+verdicts); full defs rebuilds from a wiped tree ran ~4-6 min. Note:
+the B6 check.sh now deletes `*.lean` pre-run (the no-search claim
+needs current-emission-only scanning) — that adds the .lean rewrite
+cost per run but keeps olean/.verified caches, so the gate stays in
+the same ballpark. The suite (`vargo test -p rust_verify_test
+--release`) is ~4-8 min in this worktree. If this task gets picked
+up, the first suspect list from the island-cache arc still stands,
+plus two new ones from this session: (a) the emit-time per-theorem
+Lean-file writes (write_lean_file_tracked — hundreds of small writes
+per run), (b) the defs may_skip/sourceless-lean quirk noticed during
+B10 forensics (deleting .lean while keeping .olean leaves parts
+skipped-but-sourceless — harmless but worth understanding before
+profiling around it).
