@@ -2506,7 +2506,7 @@ impl<'a> Serializer<'a> {
         };
         for node in shape.spine.iter().rev() {
             term = match node {
-                GoalSpine::Imp(p) => {
+                GoalSpine::Imp(p, _) => {
                     let h = self.lexpr_leaf(p);
                     format!("{}.GoalData.Imp {} {}", NS, h, box_(&term))
                 }
