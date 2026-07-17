@@ -332,3 +332,15 @@ Danielle (naming / default-on / theorem-vs-def).
     ILLEGAL anyway (multi-self-call arms ⇒ self-refs in decreasing_by).
   - Mutual wf SCC emission with per-def termination_by; seed-scan
     skips non-cycle waiters.
+
+- (2026-07-18, fable-b73) **Post-merge adaptation (main ef71e0f+0fca784 =
+  N1 let-hoisting + N2 match-splitting): 67/67 RESTORED.** N2 reshapes
+  branch arms: `¬disc → ∀ (field binders), scrut = Ctor fields → body`
+  — the positive discriminator is now a CONSTRUCTOR EQUATION (still
+  closes via the existing `(by simp)` branch arg — rfl-shaped after
+  pattern substitution). Weave extensions: (1) mid-spine `all` nodes
+  named `{scrut|alias}_{accessor}` instantiate with the arm pattern's
+  positional token (AppEnv.arm_accessors maps named fields like
+  `tmp___0_reqs` → Call's field index); (2) fix-arm patterns always
+  name binders (`_pb{i}`, never bare `_`) — field binders must be
+  instantiable terms.

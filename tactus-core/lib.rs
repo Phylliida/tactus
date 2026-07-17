@@ -242,6 +242,16 @@ pub enum StmData {
         decrease_oblig: RawExp,
         body: Box<StmData>,
     },
+    /// StmX::AssertQuery (mode NonLinear) — an ISOLATED verification
+    /// query (`assert … by(nonlinear_arith)`): production emits the
+    /// body's obligations under a scope that keeps Let/Binder frames
+    /// and DROPS Hyp frames (`OblCtx::new_scope`, sst_to_lean.rs), then
+    /// control falls through with NO frame delta — the proven facts
+    /// re-enter the main flow via the `Assume` statements Verus itself
+    /// emits after the query (same as assert-by/DeadEnd). The mirror:
+    /// `wp_stm` recurses on the body under `strip_hyps(f)`;
+    /// `frame_after` is `f`.
+    AssertQueryNl(Box<StmData>),
     /// Empty StmX::Block.
     Skip,
     /// StmX::Block, right-nested pairwise — avoids the StmData/StmList
@@ -610,6 +620,7 @@ pub open spec fn stm_size(s: StmData) -> nat
         // RawExpList `Cons` (reqs) + FrameList `FBind`/`FHyp`/`FLet` (post).
         StmData::Call { reqs, post } => 1 + raw_exp_list_len(*reqs) + frame_len(*post),
         StmData::DeadEnd(b) => 1 + stm_size(*b),
+        StmData::AssertQueryNl(b) => 1 + stm_size(*b),
         StmData::Ret(es, _rb) => 1 + raw_exp_list_len(*es),
         StmData::If(_c, _nc, t, e) => 1 + stm_size(*t) + stm_size(*e),
         StmData::Loop { inv_hyps, inv_obligs, binders, binder_bounds: _, cond_name: _, cond_ann: _, neg_cond_ann: _, d_old_name: _, d_old_val: _, decrease_oblig: _, body } =>
@@ -2204,6 +2215,22 @@ pub open spec fn diverges(s: StmData) -> nat
     }
 }
 
+// The AssertQuery scope frame: production's `OblCtx::new_scope` keeps
+// Let and Binder frames and drops Hyps — the isolated query context
+// (sst_to_lean.rs; NonLinear semantics: enclosing-scope hypotheses are
+// not available to the separate query).
+#[verifier::structural_decreases]
+pub open spec fn strip_hyps(f: FrameList) -> FrameList
+    decreases f
+{
+    match f {
+        FrameList::FNil => FrameList::FNil,
+        FrameList::FBind(x, ty, t) => FrameList::FBind(x, ty, Box::new(strip_hyps(*t))),
+        FrameList::FHyp(_h, t) => strip_hyps(*t),
+        FrameList::FLet(x, v, t) => FrameList::FLet(x, v, Box::new(strip_hyps(*t))),
+    }
+}
+
 // frameAfter: the frame extension visible to whatever FOLLOWS `s`.
 // (DESIGN §2.2. `If` join frames are NOT merged at stage A — but a
 // DIVERGING then-branch with a Skip else does forward `¬cond`, §2.4.1.)
@@ -2219,6 +2246,7 @@ pub open spec fn frame_after(f: FrameList, s: StmData) -> FrameList
         // verbatim (the ∀-path or #128 ret-eq shape both live in `post`).
         StmData::Call { reqs: _, post } => frame_append(f, *post),
         StmData::DeadEnd(_b) => f,          // facts discarded
+        StmData::AssertQueryNl(_b) => f,    // isolated query: no frame delta
         StmData::Ret(_es, _rb) => f,        // control does not continue
         // If — join frames not merged at stage A (§5.1), EXCEPT the
         // fall-through case: `if C { <diverges> } rest` reaches `rest` only
@@ -2274,6 +2302,7 @@ pub open spec fn wp_stm(f: FrameList, s: StmData) -> GoalList
         StmData::Assign(_x, _rhs) => GoalList::Nil,
         StmData::Call { reqs, post: _ } => close_each_e(f, *reqs),
         StmData::DeadEnd(b) => wp_stm(f, *b),
+        StmData::AssertQueryNl(b) => wp_stm(strip_hyps(f), *b),
         StmData::Ret(es, rb) => close_each_e(ret_frame(f, rb), *es),
         StmData::If(c, nc, t, e) =>
             goals_append(
@@ -3215,6 +3244,7 @@ pub open spec fn exec_safe_f(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameL
         StmData::Assign(_x, _rhs) => true,
         StmData::Call { reqs, post: _ } => close_sem_obligs(hp, he, lv, f, st, *reqs),
         StmData::DeadEnd(b) => exec_safe_f(hp, he, lv, f, *b, st),
+        StmData::AssertQueryNl(b) => exec_safe_f(hp, he, lv, strip_hyps(f), *b, st),
         StmData::Ret(es, rb) => close_sem_obligs(hp, he, lv, ret_frame(f, rb), st, *es),
         StmData::If(c, nc, t, e) =>
             exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(c, Box::new(FrameList::FNil))), *t, st)
@@ -3344,6 +3374,10 @@ pub proof fn u_esf_deadend(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameLis
     ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::DeadEnd(b), st)
         == exec_safe_f(hp, he, lv, f, *b, st)
 {}
+pub proof fn u_esf_aqnl(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, b: Box<StmData>)
+    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::AssertQueryNl(b), st)
+        == exec_safe_f(hp, he, lv, strip_hyps(f), *b, st)
+{}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
 pub proof fn u_esf_ret(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, es: Box<RawExpList>, rb: RetBind)
     ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Ret(es, rb), st)
@@ -3431,6 +3465,9 @@ pub proof fn u_wp_call(f: FrameList, reqs: Box<RawExpList>, post: Box<FrameList>
 {}
 pub proof fn u_wp_deadend(f: FrameList, b: Box<StmData>)
     ensures wp_stm(f, StmData::DeadEnd(b)) == wp_stm(f, *b)
+{}
+pub proof fn u_wp_aqnl(f: FrameList, b: Box<StmData>)
+    ensures wp_stm(f, StmData::AssertQueryNl(b)) == wp_stm(strip_hyps(f), *b)
 {}
 pub proof fn u_wp_ret(f: FrameList, es: Box<RawExpList>, rb: RetBind)
     ensures wp_stm(f, StmData::Ret(es, rb)) == close_each_e(ret_frame(f, rb), *es)
@@ -3677,6 +3714,11 @@ pub proof fn wp_stm_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList
             u_wp_deadend(f, b);
             u_esf_deadend(hp, he, lv, f, b);
             wp_stm_sound(hp, he, lv, f, *b, st);                // IH
+        }
+        StmData::AssertQueryNl(b) => {
+            u_wp_aqnl(f, b);
+            u_esf_aqnl(hp, he, lv, f, b);
+            wp_stm_sound(hp, he, lv, strip_hyps(f), *b, st);    // IH at the stripped frame
         }
         StmData::Ret(es, rb) => {
             u_wp_ret(f, es, rb);
