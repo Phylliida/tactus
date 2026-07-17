@@ -10,9 +10,27 @@ use lean_verify::prelude::{TACTUS_DEFS, TACTUS_SEARCH};
 /// invocation used by the main verifier, not stdin piping.
 fn run(lean: &str) -> Option<lean_verify::lean_process::LeanResult> {
     // Inline-concatenation form of the two-module prelude: TactusSearch's
-    // `import TactusDefs` line is replaced by the defs text itself.
-    let search_inline = TACTUS_SEARCH.replace("import TactusDefs\n", "");
-    let full = format!("{}{}{}", TACTUS_DEFS, search_inline, lean);
+    // `import TactusDefs` becomes the defs text itself. Lean requires
+    // ALL imports at the top of the file, and TactusSearch carries its
+    // own imports beyond TactusDefs (e.g. `Lean.Elab.Tactic.BVDecide`
+    // since the slim-prelude change) — so hoist every import line from
+    // both modules to the front, deduped, then concatenate the
+    // import-free bodies.
+    let mut imports: Vec<&str> = Vec::new();
+    let mut body = String::new();
+    for text in [TACTUS_DEFS, TACTUS_SEARCH] {
+        for line in text.lines() {
+            if let Some(m) = line.strip_prefix("import ") {
+                if m.trim() != "TactusDefs" && !imports.contains(&line) {
+                    imports.push(line);
+                }
+            } else {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+    }
+    let full = format!("{}\n{}{}", imports.join("\n"), body, lean);
     let pid = std::process::id();
     let uniq = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
