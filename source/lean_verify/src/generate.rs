@@ -2801,6 +2801,12 @@ struct ExecLinkEntry {
     /// (obligation theorem name, helper deps in BINDER ORDER — the
     /// closed form applies `<dep>_closed` in exactly this order).
     obligations: Vec<(String, Vec<vir::ast::Path>)>,
+    /// Stable dotted fn name (`lib.u_gapp_nil`) — the per-FN closed
+    /// theorem's name root (Link-discharge L1).
+    fn_name: String,
+    /// Mode::Proof — only proof fns get per-fn closed theorems (true
+    /// exec fns are skipped by design, DESIGN-link-discharge.md §3.4).
+    is_proof: bool,
 }
 
 static EXEC_LINK_REGISTRY: std::sync::OnceLock<
@@ -2822,6 +2828,13 @@ fn record_exec_link_entry(scope: &str, entry: ExecLinkEntry) {
 /// the package gate note.
 static PKG_CACHED_VERDICTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// Link-discharge L1 census (per process, reported via the gate note).
+static DISCHARGE_CLOSED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static DISCHARGE_PENDING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static DISCHARGE_DETAIL: std::sync::OnceLock<std::sync::Mutex<String>> =
+    std::sync::OnceLock::new();
 static ISLAND_CACHED_VERDICTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -3501,6 +3514,12 @@ pub struct PackageGateReport {
     /// bridge is INFORMATIONAL in W4a — its outcome never enters
     /// `failures` and so never becomes a verification error.
     pub bridge_note: Option<String>,
+    /// Link-discharge L1 census: per-fn closed theorems emitted
+    /// (zero-spine class) / proof fns pending (woven premises).
+    pub discharge_closed: usize,
+    pub discharge_pending: usize,
+    /// One-line kind/reason breakdown for the gate note.
+    pub discharge_detail: String,
 }
 
 /// Crate-level package gate (DESIGN-emit-module.md M4): regenerate the
@@ -3588,6 +3607,10 @@ pub fn check_package(
         return Ok(PackageGateReport {
             modules: 1 + stmt_mods.len(), reused,
             pkg_cached: PKG_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
+            discharge_closed: DISCHARGE_CLOSED.load(std::sync::atomic::Ordering::Relaxed),
+            discharge_pending: DISCHARGE_PENDING.load(std::sync::atomic::Ordering::Relaxed),
+            discharge_detail: DISCHARGE_DETAIL.get_or_init(Default::default)
+                .lock().unwrap_or_else(|p| p.into_inner()).clone(),
             island_cached: ISLAND_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
             skipped_sccs, failures, bridge_note: None,
         });
@@ -3615,6 +3638,10 @@ pub fn check_package(
         modules: 1 + stmt_mods.len() + leafs.len() + 1,
         reused,
         pkg_cached: PKG_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
+        discharge_closed: DISCHARGE_CLOSED.load(std::sync::atomic::Ordering::Relaxed),
+        discharge_pending: DISCHARGE_PENDING.load(std::sync::atomic::Ordering::Relaxed),
+            discharge_detail: DISCHARGE_DETAIL.get_or_init(Default::default)
+                .lock().unwrap_or_else(|p| p.into_inner()).clone(),
         island_cached: ISLAND_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
         skipped_sccs,
         failures,
@@ -4234,6 +4261,307 @@ fn build_link_module(
             )));
         }
     }
+    // Link-discharge (bootstrap-73 L1/L2): per-fn closed theorems
+    // synthesized from the spine sidecars — zero-spine re-exports,
+    // straight-line positional applications, and fix synthesis for
+    // lowered-match recursion (probe34 shapes). Fixpoint over the
+    // callee-dependency order; everything unsynthesizable is PENDING
+    // with a reason, reported via the package-gate note. True exec
+    // fns are skipped by design (DESIGN-link-discharge.md §3.4).
+    let ns = sanitize(crate_name);
+    // Field accessor naming — matches `field_access_name`: `val<N>` for
+    // tuple-style numeric field idents, sanitized name otherwise.
+    let accessor_of = |f: &vir::ast::Binder<(vir::ast::Typ, vir::ast::Mode, vir::ast::Visibility)>| -> String {
+        match f.name.as_str().parse::<usize>() {
+            Ok(n) => format!("val{}", n),
+            Err(_) => crate::to_lean_type::sanitize(f.name.as_str()),
+        }
+    };
+    let mut dt_variants: std::collections::HashMap<String, Vec<(String, Vec<String>)>> =
+        Default::default();
+    // Per-dt field table WITH VIR typs (the Lean model erases u64→Int;
+    // bounds live only in the Verus typing — R-b builds wf from here).
+    let mut dt_fields: std::collections::HashMap<
+        String, Vec<(String, Vec<(String, vir::ast::Typ)>)>> = Default::default();
+    for d in inlined_krate.datatypes.iter() {
+        if let vir::ast::Dt::Path(p) = &d.x.name {
+            let rel = crate::to_lean_type::lean_name_relative(p);
+            dt_variants.insert(
+                rel.clone(),
+                d.x.variants.iter()
+                    .map(|v| (v.name.to_string(),
+                              v.fields.iter().map(|f| accessor_of(f)).collect()))
+                    .collect(),
+            );
+            dt_fields.insert(
+                rel,
+                d.x.variants.iter()
+                    .map(|v| (v.name.to_string(),
+                              v.fields.iter()
+                                  .map(|f| (accessor_of(f), f.a.0.clone()))
+                                  .collect()))
+                    .collect(),
+            );
+        }
+    }
+    // R-b wf predicates. A field is a BOUND conjunct when its VIR typ
+    // carries a range (`type_bound_predicate` fires — u64 etc.); a REC
+    // conjunct when it is a (Box-wrapped) scalar-carrying datatype.
+    let bound_var = crate::lean_name::LeanName::synthetic("x".to_string());
+    let field_bound_pred = |t: &vir::ast::Typ, var: &str| -> Option<String> {
+        let v = crate::lean_ast::Expr::var(crate::lean_name::LeanName::synthetic(var.to_string()));
+        crate::to_lean_sst_expr::type_bound_predicate(&v, t)
+            .map(|p| crate::lean_pp::pp_expr(&p))
+    };
+    let is_bounded = |t: &vir::ast::Typ| -> bool {
+        let v = crate::lean_ast::Expr::var(bound_var.clone());
+        crate::to_lean_sst_expr::type_bound_predicate(&v, t).is_some()
+    };
+    let field_dt = |t: &vir::ast::Typ| -> Option<(String, bool)> {
+        let txt = crate::lean_pp::pp_expr(&crate::to_lean_type::typ_to_expr(t));
+        match txt.strip_prefix("Tactus.Box ") {
+            Some(r) => r.strip_prefix(&format!("{}.", ns)).map(|x| (x.to_string(), true)),
+            None => txt.strip_prefix(&format!("{}.", ns)).map(|x| (x.to_string(), false)),
+        }
+    };
+    // Scalar-carrying fixpoint.
+    let mut scalar_carrying: std::collections::HashSet<String> = Default::default();
+    loop {
+        let mut grew = false;
+        for (rel, vars) in &dt_fields {
+            if scalar_carrying.contains(rel) {
+                continue;
+            }
+            let carries = vars.iter().any(|(_, fs)| fs.iter().any(|(_, t)| {
+                is_bounded(t)
+                    || field_dt(t).map(|(d, _)| scalar_carrying.contains(&d)).unwrap_or(false)
+            }));
+            if carries {
+                scalar_carrying.insert(rel.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    // Wf structure + def texts, topological over rec-field edges
+    // (cross-dt cycles would need mutual blocks — none exist here;
+    // census loudly if one appears).
+    let mut wf_infos: std::collections::HashMap<String, crate::link_discharge::WfInfo> =
+        Default::default();
+    let mut wf_def_texts: std::collections::HashMap<String, String> = Default::default();
+    let mut wf_deps: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for rel in &scalar_carrying {
+        let vars = &dt_fields[rel];
+        let mut info_vars: std::collections::HashMap<String, Vec<crate::link_discharge::WfComp>> =
+            Default::default();
+        let mut clauses: Vec<String> = Vec::new();
+        let mut deps: Vec<String> = Vec::new();
+        let mut self_rec = false;
+        for (vname, fs) in vars {
+            let mut comps: Vec<crate::link_discharge::WfComp> = Vec::new();
+            let mut conj_texts: Vec<String> = Vec::new();
+            let mut pat_vars: Vec<String> = Vec::new();
+            for (i, (acc, t)) in fs.iter().enumerate() {
+                let var = format!("x{}", i);
+                if let Some(pred) = field_bound_pred(t, &var) {
+                    comps.push(crate::link_discharge::WfComp {
+                        accessor: acc.clone(), rec: false });
+                    conj_texts.push(format!("({})", pred));
+                    pat_vars.push(var);
+                } else if let Some((d, boxed)) = field_dt(t) {
+                    if scalar_carrying.contains(&d) {
+                        comps.push(crate::link_discharge::WfComp {
+                            accessor: acc.clone(), rec: true });
+                        conj_texts.push(format!(
+                            "{}Wf {}{}", d, var, if boxed { ".deref" } else { "" }));
+                        pat_vars.push(var);
+                        if d == *rel { self_rec = true; } else { deps.push(d); }
+                    } else {
+                        pat_vars.push("_".to_string());
+                    }
+                } else {
+                    pat_vars.push("_".to_string());
+                }
+            }
+            let pat = if fs.is_empty() {
+                format!("{}.{}.{}", ns, rel, vname)
+            } else {
+                format!("{}.{}.{} {}", ns, rel, vname, pat_vars.join(" "))
+            };
+            let body = if conj_texts.is_empty() {
+                "True".to_string()
+            } else {
+                conj_texts.join(" ∧ ")
+            };
+            clauses.push(format!("  | {} => {}", pat, body));
+            info_vars.insert(vname.clone(), comps);
+        }
+        let mut text = format!(
+            "def {}Wf (x : {}.{}) : Prop :=\n  match x with\n{}\n",
+            rel, ns, rel, clauses.join("\n"));
+        if self_rec {
+            text.push_str("termination_by structural x\n");
+        }
+        wf_infos.insert(rel.clone(), crate::link_discharge::WfInfo { variants: info_vars });
+        wf_def_texts.insert(rel.clone(), text);
+        wf_deps.insert(rel.clone(), deps);
+    }
+    let mut sidecars: std::collections::HashMap<String, crate::link_discharge::FnSidecar> =
+        Default::default();
+    let mut discharge_fns: Vec<(String, String)> = Vec::new(); // (rel, dotted)
+    let mut pending: std::collections::HashMap<String, String> = Default::default();
+    for e in &exec_entries {
+        if !e.is_proof {
+            continue;
+        }
+        let rel = e
+            .fn_name
+            .strip_prefix(&format!("{}.", ns))
+            .unwrap_or(&e.fn_name)
+            .to_string();
+        let spine_path = lean_out_root()
+            .join(&ns)
+            .join("pkg")
+            .join(format!("{}.spine.json", e.leaf));
+        match std::fs::read_to_string(&spine_path)
+            .ok()
+            .and_then(|t| crate::link_discharge::parse_sidecar(&t))
+        {
+            Some(sc) => {
+                sidecars.insert(rel.clone(), sc);
+                discharge_fns.push((rel, e.fn_name.clone()));
+            }
+            None => {
+                pending.insert(rel, "sidecar missing/unparseable".to_string());
+            }
+        }
+    }
+    let mut closed: std::collections::HashMap<String, crate::link_discharge::ClosedMeta> =
+        Default::default();
+    let mut closed_texts: Vec<(String, String, &'static str)> = Vec::new();
+    loop {
+        let mut round: Vec<(String, String, String, &'static str,
+            crate::link_discharge::ClosedMeta)> = Vec::new();
+        for (rel, dotted) in &discharge_fns {
+            if closed.contains_key(rel) {
+                continue;
+            }
+            let ctx = crate::link_discharge::Ctx {
+                sidecars: &sidecars,
+                closed: &closed,
+                variants: &dt_variants,
+                wf: &wf_infos,
+            };
+            match crate::link_discharge::try_close(rel, &sidecars[rel], &ctx) {
+                crate::link_discharge::Outcome::Closed { text, kind, meta } => {
+                    round.push((rel.clone(), dotted.clone(), text, kind, meta));
+                }
+                crate::link_discharge::Outcome::Pending(r) => {
+                    pending.insert(rel.clone(), r);
+                }
+            }
+        }
+        if round.is_empty() {
+            break;
+        }
+        for (rel, dotted, text, kind, meta) in round {
+            pending.remove(&rel);
+            closed.insert(rel, meta);
+            closed_texts.push((dotted, text, kind));
+        }
+    }
+    if !closed_texts.is_empty() {
+        cmds.push(Command::Raw(format!("namespace {}\n", ns)));
+        // R-b: wf defs referenced by the closed theorems, dependencies
+        // first (transitively). Unreferenced wf defs are not emitted.
+        let all_text: String = closed_texts.iter().map(|(_, t, _)| t.as_str())
+            .collect::<Vec<_>>().join("\u{1}");
+        let mut wf_needed: Vec<String> = Vec::new();
+        let mut stack: Vec<String> = wf_def_texts.keys()
+            .filter(|d| all_text.contains(&format!("{}Wf", d)))
+            .cloned().collect();
+        while let Some(d) = stack.pop() {
+            if wf_needed.contains(&d) {
+                continue;
+            }
+            for dep in wf_deps.get(&d).cloned().unwrap_or_default() {
+                if !wf_needed.contains(&dep) {
+                    stack.push(dep);
+                }
+            }
+            wf_needed.push(d);
+        }
+        // Dependencies-first order: repeatedly emit defs whose deps are done.
+        let mut emitted: std::collections::HashSet<String> = Default::default();
+        while emitted.len() < wf_needed.len() {
+            let mut progressed = false;
+            for d in &wf_needed {
+                if emitted.contains(d) {
+                    continue;
+                }
+                if wf_deps[d].iter().all(|x| emitted.contains(x) || !wf_needed.contains(x)) {
+                    cmds.push(Command::Raw(format!("{}\n", wf_def_texts[d])));
+                    emitted.insert(d.clone());
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                cmds.push(Command::Raw(
+                    "-- wf defs: cross-datatype cycle (needs mutual) — SKIPPED\n".to_string()));
+                break;
+            }
+        }
+        for (_, text, _) in &closed_texts {
+            cmds.push(Command::Raw(format!("{}\n", text)));
+        }
+        cmds.push(Command::Raw(format!("end {}\n", ns)));
+        for (dotted, _, _) in &closed_texts {
+            cmds.push(Command::Raw(format!(
+                "#tactus_check_axioms {}_closed [{}]\n",
+                dotted, boundary_list
+            )));
+        }
+    }
+    let mut kind_counts: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    for (_, _, k) in &closed_texts {
+        *kind_counts.entry(k).or_default() += 1;
+    }
+    let mut reason_counts: std::collections::BTreeMap<&str, usize> = Default::default();
+    for r in pending.values() {
+        *reason_counts.entry(r.as_str()).or_default() += 1;
+    }
+    let detail = format!(
+        "{}{}",
+        kind_counts
+            .iter()
+            .map(|(k, n)| format!("{} {}", n, k))
+            .collect::<Vec<_>>()
+            .join(" + "),
+        if pending.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; pending: {}",
+                reason_counts
+                    .iter()
+                    .map(|(r, n)| if *n > 1 {
+                        format!("{}x {}", n, r)
+                    } else {
+                        r.to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    );
+    DISCHARGE_CLOSED.store(closed_texts.len(), std::sync::atomic::Ordering::Relaxed);
+    DISCHARGE_PENDING.store(pending.len(), std::sync::atomic::Ordering::Relaxed);
+    *DISCHARGE_DETAIL
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = detail;
     let rendered = pp_commands(&cmds);
     let path = lean_out_root().join(sanitize(crate_name)).join("pkg")
         .join(format!("{}.lean", link_module_name(defs)));
@@ -4317,6 +4645,125 @@ fn bridge_qualified_helper_refs(text: &str, deps: &[&FunctionX]) -> String {
 /// Exec fns are never in tactic-level mutual SCCs (obligation theorems
 /// don't reference each other), so the outcome is always
 /// `PkgEmitOutcome::Single`.
+/// L1 Link-discharge sidecar writer (DESIGN-link-discharge.md §3.1).
+/// One JSON file per pkg module (`<leaf>.spine.json`), one record per
+/// emitted VC: the ordered spine descriptors the Link generator needs
+/// to build a positional discharge term. Slice (a): write-only.
+fn write_spine_sidecar(
+    pkg_lean_path: &std::path::Path,
+    leaf: &str,
+    records: &[(String, Option<crate::lean_ast::GoalShape>)],
+) -> std::io::Result<()> {
+    use crate::lean_ast::{GoalSpine, HypProvenance, SpineArgTag};
+    fn esc(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+    let mut j = String::new();
+    j.push_str(&format!("{{\"fn\":\"{}\",\"vcs\":[", esc(leaf)));
+    for (i, (name, shape)) in records.iter().enumerate() {
+        if i > 0 { j.push(','); }
+        j.push_str(&format!("{{\"name\":\"{}\",", esc(name)));
+        match shape {
+            None => j.push_str("\"spine\":null}"),
+            Some(sh) => {
+                j.push_str(&format!("\"leaf\":\"{}\",", esc(&crate::lean_pp::pp_expr(&sh.leaf))));
+                j.push_str("\"spine\":[");
+                for (k, node) in sh.spine.iter().enumerate() {
+                    if k > 0 { j.push(','); }
+                    match node {
+                        GoalSpine::All(b, prov) => {
+                            j.push_str(&format!(
+                                "{{\"k\":\"all\",\"name\":\"{}\",\"ty\":\"{}\"",
+                                esc(b.name.as_ref().map(|n| n.as_str()).unwrap_or("_")),
+                                esc(&crate::lean_pp::pp_expr(&b.ty)),
+                            ));
+                            // Absorbed-hyp provenance: same fields as the
+                            // corresponding Imp so the discharge generator
+                            // treats this binder as the premise it is.
+                            match prov {
+                                None | Some(HypProvenance::Other) if prov.is_none() => {}
+                                Some(HypProvenance::CallFact(info)) => {
+                                    j.push_str(&format!(
+                                        ",\"p\":\"call\",\"callee\":\"{}\",\"self\":{},\"args\":[",
+                                        esc(&info.callee), info.is_self));
+                                    for (a, arg) in info.args.iter().enumerate() {
+                                        if a > 0 { j.push(','); }
+                                        let tag = match &arg.tag {
+                                            SpineArgTag::CallerParam(n) => format!("param:{}", n),
+                                            SpineArgTag::Literal => "lit".to_string(),
+                                            SpineArgTag::Expr => "expr".to_string(),
+                                        };
+                                        j.push_str(&format!(
+                                            "{{\"text\":\"{}\",\"tag\":\"{}\"}}",
+                                            esc(&arg.text), esc(&tag)));
+                                    }
+                                    j.push(']');
+                                }
+                                Some(HypProvenance::Branch(None)) =>
+                                    j.push_str(",\"p\":\"branch\""),
+                                Some(HypProvenance::Branch(Some(t))) => j.push_str(&format!(
+                                    ",\"p\":\"branch\",\"scrut\":\"{}\",\"dt\":\"{}\",\"variant\":\"{}\",\"pos\":{}",
+                                    esc(&t.scrutinee), esc(&t.datatype), esc(&t.variant), t.positive)),
+                                Some(HypProvenance::HeightFact) =>
+                                    j.push_str(",\"p\":\"height\""),
+                                Some(HypProvenance::Other) =>
+                                    j.push_str(",\"p\":\"other\""),
+                                None => {}
+                            }
+                            j.push('}');
+                        }
+                        GoalSpine::Let(n, v) => j.push_str(&format!(
+                            "{{\"k\":\"let\",\"name\":\"{}\",\"v\":\"{}\"}}",
+                            esc(n.as_str()), esc(&crate::lean_pp::pp_expr(v)))),
+                        GoalSpine::Imp(_, prov) => match prov {
+                            HypProvenance::Branch(None) =>
+                                j.push_str("{\"k\":\"imp\",\"p\":\"branch\"}"),
+                            HypProvenance::Branch(Some(t)) => j.push_str(&format!(
+                                "{{\"k\":\"imp\",\"p\":\"branch\",\"scrut\":\"{}\",\"dt\":\"{}\",\"variant\":\"{}\",\"pos\":{}}}",
+                                esc(&t.scrutinee), esc(&t.datatype), esc(&t.variant), t.positive)),
+                            HypProvenance::HeightFact =>
+                                j.push_str("{\"k\":\"imp\",\"p\":\"height\"}"),
+                            HypProvenance::Other =>
+                                j.push_str("{\"k\":\"imp\",\"p\":\"other\"}"),
+                            HypProvenance::CallFact(info) => {
+                                j.push_str(&format!(
+                                    "{{\"k\":\"imp\",\"p\":\"call\",\"callee\":\"{}\",\"self\":{},\"args\":[",
+                                    esc(&info.callee), info.is_self));
+                                for (a, arg) in info.args.iter().enumerate() {
+                                    if a > 0 { j.push(','); }
+                                    let tag = match &arg.tag {
+                                        SpineArgTag::CallerParam(n) => format!("param:{}", n),
+                                        SpineArgTag::Literal => "lit".to_string(),
+                                        SpineArgTag::Expr => "expr".to_string(),
+                                    };
+                                    j.push_str(&format!(
+                                        "{{\"text\":\"{}\",\"tag\":\"{}\"}}",
+                                        esc(&arg.text), esc(&tag)));
+                                }
+                                j.push_str("]}");
+                            }
+                        },
+                    }
+                }
+                j.push_str("]}");
+            }
+        }
+    }
+    j.push_str("]}\n");
+    std::fs::write(pkg_lean_path.with_extension("spine.json"), j)
+}
+
 fn emit_package_exec_fn(
     krate: &KrateX,
     vir_fn: &FunctionX,
@@ -4350,6 +4797,13 @@ fn emit_package_exec_fn(
     // source of obligation shape). No-op unless `--tactus-emit-cert`;
     // never perturbs verification.
     crate::sst_serialize::emit_cert(krate, fn_sst, check, crate_name, &theorems, &goal_shapes);
+    // L1 Link-discharge: capture (name, shape) pairs for the spine
+    // sidecar before `theorems` is consumed below.
+    let spine_records: Vec<(String, Option<crate::lean_ast::GoalShape>)> = theorems
+        .iter()
+        .map(|t| t.name.clone())
+        .zip(goal_shapes.iter().cloned())
+        .collect();
 
     let stmts = stmt_partition_for(krate, crate_name, tactic_bodies, defs)
         .ok_or("Stmts partition unavailable")?;
@@ -4471,12 +4925,22 @@ fn emit_package_exec_fn(
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let changed = write_lean_file_tracked(&path, &rendered.text)?;
+    // L1 Link-discharge sidecar (DESIGN-link-discharge.md §3.1): persist
+    // each VC's spine descriptors next to the pkg module so the Link
+    // builder can generate discharge terms even on cache-skipped runs.
+    // Slice (a): write-only — nothing consumes it yet. Best-effort: a
+    // sidecar failure must not fail verification.
+    if let Err(e) = write_spine_sidecar(&path, &leaf, &spine_records) {
+        eprintln!("tactus: spine sidecar write failed for {leaf}: {e}");
+    }
     record_exec_link_entry(&defs.scope, ExecLinkEntry {
         leaf: leaf.clone(),
         obligations: thm_names.into_iter()
             .zip(per_thm_deps.iter())
             .map(|(n, ds)| (n, ds.iter().map(|f| f.name.path.clone()).collect()))
             .collect(),
+        fn_name: lean_name(&vir_fn.name.path),
+        is_proof: matches!(vir_fn.mode, vir::ast::Mode::Proof),
     });
     Ok(PkgEmitOutcome::Single { leaf, path, source_map, stmt_modules, changed })
 }

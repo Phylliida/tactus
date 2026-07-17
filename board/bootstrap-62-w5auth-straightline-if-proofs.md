@@ -1,9 +1,9 @@
 ---
 title: "W5-auth-2 — soundness proofs, straight-line + If fragment (probe21/22 arms authored)"
-status: todo
-claimed_by:
+status: done
+claimed_by: fable-b62
 created: 2026-07-16T17:15:00Z
-updated: 2026-07-16T17:15:00Z
+updated: 2026-07-16T21:30:00Z
 ---
 
 ## Description
@@ -40,3 +40,21 @@ short progress note records which scaffolding (if any) was used for the If
 fall-through.
 
 **Blocked by:** bootstrap-61.
+
+## Progress
+
+- (2026-07-16, fable-b62) Scope shifted per bootstrap-61's plan note: this
+  rung = the SUPPORT layer, not a fragment-guarded induction (no scaffolding
+  ever existed — see bootstrap-64). Landed: 18 data-side u_* unfolds
+  (close_e/close_each_e/goals_append/wp_stm, ALL arms incl. the expanded Loop
+  equation) + `holds_close_e` (st-generic, the M4-at-scale goal↔semantics
+  alignment through the FBind ∀-arm and FLet) + `holds_all_append`. First-try
+  green: **118 verified, 0 errors**, gate 48/50 reused.
+
+## Writeup
+
+Support layer for the wp_stm_sound induction. The probe33 idiom carried
+without modification: st-generic ensures for holds_close_e (its FrameList
+induction crosses the FBind binder), st-as-param for holds_all_append (no
+binder crossed). Data unfolds are probe32 empty-body shape, default closer —
+including u_wp_loop's giant let-expanded equation (closed by tactus_auto).

@@ -141,11 +141,14 @@ fn goal_data_spine_shape() {
     // muddies the structural check.
     let shape = GoalShape {
         spine: vec![
-            GoalSpine::All(Binder::explicit(
-                LeanName::synthetic("nn"),
-                LExpr::var(LeanName::synthetic("Ity")),
-            )),
-            GoalSpine::Imp(LExpr::var(LeanName::synthetic("hyp0"))),
+            GoalSpine::All(
+                Binder::explicit(
+                    LeanName::synthetic("nn"),
+                    LExpr::var(LeanName::synthetic("Ity")),
+                ),
+                None,
+            ),
+            GoalSpine::Imp(LExpr::var(LeanName::synthetic("hyp0")), crate::lean_ast::HypProvenance::Other),
             GoalSpine::Let(
                 LeanName::synthetic("mm"),
                 LExpr::var(LeanName::synthetic("vv")),

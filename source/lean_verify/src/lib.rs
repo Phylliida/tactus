@@ -11,6 +11,7 @@ pub mod lean_ast;
 pub mod lean_name;
 pub mod lean_pp;
 pub mod lean_process;
+pub mod link_discharge;
 pub mod mut_ref_normalize;
 pub mod nonempty;
 pub mod obligation_naming;

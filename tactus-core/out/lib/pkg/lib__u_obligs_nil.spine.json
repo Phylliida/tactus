@@ -1,0 +1,1 @@
+{"fn":"lib__u_obligs_nil","vcs":[{"name":"_tactus_postcondition_u_obligs_nil_at_lib_3277_13_1","leaf":"/- @rust:lib.rs:3277:13 -/ ∀ (st : Int → Int), lib.obligs_safe he lib.RawExpList.Nil st = True","spine":[{"k":"all","name":"he","ty":"lib.ExprData → (Int → Int) → Prop"}]}]}
