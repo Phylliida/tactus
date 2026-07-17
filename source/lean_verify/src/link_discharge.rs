@@ -136,14 +136,44 @@ pub fn parse_sidecar(txt: &str) -> Option<FnSidecar> {
 pub struct Ctx<'a> {
     /// Relative fn name → its sidecar (all proof fns in the crate).
     pub sidecars: &'a HashMap<String, FnSidecar>,
-    /// Relative fn names whose `<rel>_closed` is already emitted.
-    pub closed: &'a HashSet<String>,
-    /// Datatype (relative name) → ordered [(variant, arity)].
-    pub variants: &'a HashMap<String, Vec<(String, usize)>>,
+    /// Relative fn names whose `<rel>_closed` is already emitted,
+    /// with the wf params their synthesized signature carries.
+    pub closed: &'a HashMap<String, ClosedMeta>,
+    /// Datatype (relative name) → ordered [(variant, field
+    /// accessors in declaration order — `val<N>` or the field name)].
+    pub variants: &'a HashMap<String, Vec<(String, Vec<String>)>>,
+    /// R-b: datatype (relative) → wf-conjunct structure per variant.
+    /// Present only for scalar-carrying datatypes (those with a
+    /// generated `{Dt}Wf` predicate).
+    pub wf: &'a HashMap<String, WfInfo>,
+}
+
+/// Signature metadata of an already-closed fn: the wf hypotheses its
+/// clean statement takes, in binder order (appended after the VC's
+/// leading Alls). `(param name, datatype rel name)`.
+#[derive(Clone, Default)]
+pub struct ClosedMeta {
+    pub wf_params: Vec<(String, String)>,
+}
+
+/// Wf-conjunct structure of one datatype: variant → ordered conjunct
+/// fields. Order MUST match the generated `{Dt}Wf` match clauses —
+/// the arm destructuring components are positional.
+pub struct WfInfo {
+    pub variants: HashMap<String, Vec<WfComp>>,
+}
+
+/// One wf conjunct: `accessor` names the field (`val0`, `cond_ann`);
+/// `rec` = a recursive `{Dt2}Wf child.deref` conjunct (vs a scalar
+/// bound). Component binder names: `hwf_{accessor}` for rec,
+/// `h_wf_{accessor}` for bounds.
+pub struct WfComp {
+    pub accessor: String,
+    pub rec: bool,
 }
 
 pub enum Outcome {
-    Closed { text: String, kind: &'static str },
+    Closed { text: String, kind: &'static str, meta: ClosedMeta },
     Pending(String),
 }
 
@@ -174,6 +204,58 @@ fn referenced(name: &str, text: &str) -> bool {
     false
 }
 
+/// Word-boundary global replace (companion to [`referenced`]).
+fn replace_word(text: &str, name: &str, with: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(pos) = text[i..].find(name) {
+            let at = i + pos;
+            let before_ok = at == 0 || {
+                let c = bytes[at - 1] as char;
+                !(c.is_alphanumeric() || c == '_')
+            };
+            let j = at + name.len();
+            let after_ok = j >= bytes.len() || {
+                let c = bytes[j] as char;
+                !(c.is_alphanumeric() || c == '_')
+            };
+            out.push_str(&text[i..at]);
+            if before_ok && after_ok {
+                out.push_str(with);
+            } else {
+                out.push_str(name);
+            }
+            i = j;
+        } else {
+            out.push_str(&text[i..]);
+            break;
+        }
+    }
+    out
+}
+
+/// Expand let-bound names to their (parenthesized, transitively
+/// expanded) values. Used where arm-scoped term lets are NOT in scope
+/// — the `decreasing_by` bullets (the equation compiler's goals see
+/// pattern binders but not the arm's term-mode lets).
+fn expand_lets(text: &str, lets: &[(String, String)]) -> String {
+    let mut expanded: Vec<(String, String)> = Vec::new();
+    for (n, v) in lets {
+        let mut ev = v.clone();
+        for (pn, pv) in &expanded {
+            ev = replace_word(&ev, pn, &format!("({})", pv));
+        }
+        expanded.push((n.clone(), ev));
+    }
+    let mut out = text.to_string();
+    for (n, v) in expanded.iter().rev() {
+        out = replace_word(&out, n, &format!("({})", v));
+    }
+    out
+}
+
 /// Strip a leading `/- ... -/ ` span-mark comment from a rendered leaf.
 fn strip_mark(s: &str) -> &str {
     let t = s.trim_start();
@@ -196,60 +278,6 @@ fn leading_alls(spine: &[Node]) -> (&[Node], usize) {
     (&spine[..n], n)
 }
 
-/// Does this fn's own or any callee's clean signature carry
-/// `h_*_bound` binders? (The wf-rung gap — pending until R-b.)
-fn bound_gap(sc: &FnSidecar, ctx: &Ctx) -> Option<String> {
-    let has_bounds = |spine: &[Node]| {
-        leading_alls(spine).0.iter().any(|n| match n {
-            Node::All { name, .. } => name.starts_with("h_") && name.ends_with("_bound"),
-            _ => false,
-        })
-    };
-    // Own bound binders are plain leading Alls — positionally harmless
-    // — EXCEPT when a self-call (IH) must reproduce them interleaved,
-    // which needs the wf rung.
-    let recursive = sc.vcs.iter().any(|v| {
-        v.spine.iter().any(|n| matches!(n, Node::Call { is_self: true, .. }))
-    });
-    for vc in &sc.vcs {
-        if recursive && has_bounds(&vc.spine) {
-            return Some("own scalar bounds on recursive fn (wf rung)".to_string());
-        }
-        for n in &vc.spine {
-            if let Node::Call { callee, is_self: false, args } = n {
-                let csc = match ctx.sidecars.get(callee) {
-                    Some(c) => c,
-                    None => return Some(format!("no sidecar for callee {}", callee)),
-                };
-                // A bounded callee param is dischargeable when its arg
-                // is a caller param (own h_*_bound binder) or a literal
-                // (by omega); only EXPR-fed bounds need the wf rung.
-                let Some(first) = csc.vcs.first() else { continue };
-                let mut arg_i = 0usize;
-                for a in leading_alls(&first.spine).0 {
-                    if let Node::All { name, .. } = a {
-                        if name.starts_with("h_") && name.ends_with("_bound") {
-                            let feeder = args.get(arg_i.wrapping_sub(1));
-                            match feeder.map(|f| f.tag.as_str()) {
-                                Some(t) if t.starts_with("param:") || t == "lit" => {}
-                                _ => {
-                                    return Some(format!(
-                                        "bound-gap via {} (wf rung)",
-                                        callee
-                                    ))
-                                }
-                            }
-                        } else {
-                            arg_i += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 // ── positional application builder ──────────────────────────────────
 
 struct AppEnv<'a> {
@@ -263,6 +291,16 @@ struct AppEnv<'a> {
     sidecars: &'a HashMap<String, FnSidecar>,
     /// The caller's own leading Alls (bound-recipe lookups).
     own_lead: &'a [Node],
+    /// Already-closed callees' signature metadata (wf args).
+    closed: &'a HashMap<String, ClosedMeta>,
+    /// The caller's OWN wf params (param → binder name).
+    own_wf: &'a HashMap<String, String>,
+    /// Fix-arm component lookup: projection-let name →
+    /// (component binder name, rec?). Bound components discharge
+    /// expr-fed scalar bounds; rec components feed the IH's wf arg.
+    arm_comps: &'a HashMap<String, (String, bool)>,
+    /// The being-built fn's own wf params (IH signature mirror).
+    own_meta: &'a ClosedMeta,
 }
 
 /// Build the positional application of `vc`'s theorem through the
@@ -354,10 +392,21 @@ fn app_args(vc: &Vc, upto: Option<usize>, env: &AppEnv) -> Result<Vec<String>, S
                                 }
                                 "lit" => t.push_str(" (by omega)"),
                                 _ => {
-                                    return Err(format!(
-                                        "expr-fed bound at {} (wf rung)",
-                                        callee
-                                    ))
+                                    // R-b: an expr-fed bound whose arg is a
+                                    // scrutinee projection discharges by the
+                                    // arm's wf component.
+                                    match env.arm_comps.get(feeder.text.as_str()) {
+                                        Some((comp, false)) => {
+                                            t.push(' ');
+                                            t.push_str(comp);
+                                        }
+                                        _ => {
+                                            return Err(format!(
+                                                "expr-fed bound at {} (wf-transport)",
+                                                callee
+                                            ))
+                                        }
+                                    }
                                 }
                             }
                         } else {
@@ -371,6 +420,58 @@ fn app_args(vc: &Vc, upto: Option<usize>, env: &AppEnv) -> Result<Vec<String>, S
                     }
                     if arg_i != cargs.len() {
                         return Err("recorded args exceed callee params".into());
+                    }
+                    // R-b: append the callee's wf args (its synthesized
+                    // signature ends with wf params, in meta order).
+                    let meta = if *is_self {
+                        Some(env.own_meta.clone())
+                    } else {
+                        env.closed.get(callee.as_str()).cloned()
+                    };
+                    if let Some(meta) = meta {
+                        let pnames: Vec<&str> = callee_lead
+                            .iter()
+                            .filter_map(|n| match n {
+                                Node::All { name, .. }
+                                    if !(name.starts_with("h_")
+                                        && name.ends_with("_bound")) =>
+                                {
+                                    Some(name.as_str())
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        for (wp, dt) in &meta.wf_params {
+                            let i = pnames
+                                .iter()
+                                .position(|p| p == wp)
+                                .ok_or_else(|| format!("wf param {} not in {}", wp, callee))?;
+                            let feeder = &cargs[i];
+                            if let Some(stripped) = feeder.text.strip_suffix(".deref") {
+                                // Scrutinee child: the arm's rec component.
+                                if let Some((comp, true)) = env.arm_comps.get(stripped) {
+                                    t.push(' ');
+                                    t.push_str(comp);
+                                    continue;
+                                }
+                            }
+                            match feeder.tag.as_str() {
+                                tag if tag.starts_with("param:") => {
+                                    let p = &tag[6..];
+                                    let b = env.own_wf.get(p).ok_or_else(|| {
+                                        format!("needs own wf for param {} ({}Wf)", p, dt)
+                                    })?;
+                                    t.push(' ');
+                                    t.push_str(b);
+                                }
+                                _ => {
+                                    return Err(format!(
+                                        "wf-transport for arg `{}` of {} ({}Wf)",
+                                        feeder.text, callee, dt
+                                    ))
+                                }
+                            }
+                        }
                     }
                 }
                 t.push(')');
@@ -422,6 +523,74 @@ fn replay_lets(
     out
 }
 
+/// R-b pre-pass: the wf params THIS fn's signature must carry —
+/// every callee wf param fed by one of our own params, plus (fix
+/// only) the scrutinee when any expr-fed bound or wf demand resolves
+/// to a scrutinee projection. Returns (param, dt) in param order.
+fn own_wf_demands(
+    sc: &FnSidecar,
+    ctx: &Ctx,
+    param_names: &[&str],
+    scrut_param: Option<&str>,
+    projections_exist: bool,
+) -> Result<Vec<(String, String)>, String> {
+    let mut needs: HashMap<String, String> = HashMap::new(); // param → dt
+    let mut scrut_dt: Option<String> = None;
+    for vc in &sc.vcs {
+        for n in &vc.spine {
+            let Node::Call { callee, is_self, args } = n else { continue };
+            // Callee wf demands (self excluded: own demand mirrors).
+            if !is_self {
+                if let Some(meta) = ctx.closed.get(callee.as_str()) {
+                    let callee_lead: Vec<&Node> = ctx
+                        .sidecars
+                        .get(callee.as_str())
+                        .and_then(|c| c.vcs.first())
+                        .map(|v| leading_alls(&v.spine).0.iter().collect())
+                        .unwrap_or_default();
+                    let pnames: Vec<&str> = callee_lead
+                        .iter()
+                        .filter_map(|cn| match cn {
+                            Node::All { name, .. }
+                                if !(name.starts_with("h_") && name.ends_with("_bound")) =>
+                            {
+                                Some(name.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    for (wp, dt) in &meta.wf_params {
+                        let i = pnames
+                            .iter()
+                            .position(|p| p == wp)
+                            .ok_or_else(|| format!("wf param {} not in {}", wp, callee))?;
+                        let a = &args[i];
+                        if let Some(t) = a.tag.strip_prefix("param:") {
+                            needs.insert(t.to_string(), dt.clone());
+                        } else if a.text.ends_with(".deref") && projections_exist {
+                            // scrutinee child — covered by scrut wf
+                        } else {
+                            return Err(format!(
+                                "wf-transport for arg `{}` of {} ({}Wf)",
+                                a.text, callee, dt
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let _ = (scrut_param, projections_exist);
+    let mut out = Vec::new();
+    for p in param_names {
+        if let Some(dt) = needs.get(*p) {
+            out.push((p.to_string(), dt.clone()));
+        }
+    }
+    let _ = scrut_dt;
+    Ok(out)
+}
+
 // ── the closers ─────────────────────────────────────────────────────
 
 /// Zero-spine: single binders-only postcondition VC.
@@ -436,6 +605,7 @@ fn close_zero_spine(rel: &str, sc: &FnSidecar) -> Option<Outcome> {
     Some(Outcome::Closed {
         text: format!("theorem {}_closed : {}_stmt := {}_closed\n", rel, vc, vc),
         kind: "zero-spine",
+        meta: ClosedMeta::default(),
     })
 }
 
@@ -456,7 +626,7 @@ fn close_straight_line(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, 
     for vc in &sc.vcs {
         for n in &vc.spine {
             if let Node::Call { callee, is_self: false, .. } = n {
-                if !ctx.closed.contains(callee) {
+                if !ctx.closed.contains_key(callee.as_str()) {
                     return Err(format!("awaits {}_closed", callee));
                 }
             }
@@ -464,23 +634,49 @@ fn close_straight_line(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, 
     }
     let p0 = posts[0];
     let (lead, _) = leading_alls(&p0.spine);
-    let binders: Vec<String> = lead
+    let param_names: Vec<&str> = lead
+        .iter()
+        .filter_map(|n| match n {
+            Node::All { name, .. }
+                if !(name.starts_with("h_") && name.ends_with("_bound")) =>
+            {
+                Some(name.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    // R-b: propagated wf demands become own signature hypotheses.
+    let wf_params = own_wf_demands(sc, ctx, &param_names, None, false)?;
+    let own_wf: HashMap<String, String> = wf_params
+        .iter()
+        .map(|(p, _)| (p.clone(), format!("hwf_{}", p)))
+        .collect();
+    let meta = ClosedMeta { wf_params: wf_params.clone() };
+    let mut binders: Vec<String> = lead
         .iter()
         .map(|n| match n {
             Node::All { name, ty } => format!("({} : {})", name, ty),
             _ => unreachable!(),
         })
         .collect();
+    for (p, dt) in &wf_params {
+        binders.push(format!("(hwf_{} : {}Wf {})", p, dt, p));
+    }
+    let no_comps: HashMap<String, (String, bool)> = HashMap::new();
     let env = AppEnv {
         fn_rel: rel,
         scrut_subst: None,
         hdec_names: &[],
         sidecars: ctx.sidecars,
         own_lead: lead,
+        closed: ctx.closed,
+        own_wf: &own_wf,
+        arm_comps: &no_comps,
+        own_meta: &meta,
     };
     let mut apps = Vec::new();
     for p in &posts {
-        apps.push(app_text(p, None, &env).map_err(|e| e)?);
+        apps.push(app_text(p, None, &env)?);
     }
     let body_ty = posts
         .iter()
@@ -498,7 +694,7 @@ fn close_straight_line(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, 
         text.push_str(&format!("  {}\n", l));
     }
     text.push_str(&format!("  {}\n", term));
-    Ok(Outcome::Closed { text, kind: "straight-line" })
+    Ok(Outcome::Closed { text, kind: "straight-line", meta })
 }
 
 /// Fix synthesis: lowered-match recursion (single scrutinee).
@@ -508,11 +704,10 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
     if sc.vcs.iter().any(|v| !v.is_post && !v.is_term) {
         return Err("assert VCs in recursive fn".into());
     }
-    // Callee availability.
     for vc in &sc.vcs {
         for n in &vc.spine {
             if let Node::Call { callee, is_self: false, .. } = n {
-                if !ctx.closed.contains(callee) {
+                if !ctx.closed.contains_key(callee.as_str()) {
                     return Err(format!("awaits {}_closed", callee));
                 }
             }
@@ -541,13 +736,17 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
     let (lead, _) = leading_alls(&p0.spine);
     let param_names: Vec<&str> = lead
         .iter()
-        .map(|n| match n {
-            Node::All { name, .. } => name.as_str(),
-            _ => unreachable!(),
+        .filter_map(|n| match n {
+            Node::All { name, .. }
+                if !(name.starts_with("h_") && name.ends_with("_bound")) =>
+            {
+                Some(name.as_str())
+            }
+            _ => None,
         })
         .collect();
     // Resolve the scrutinee var through the alias let to a param.
-    let mut alias_of: HashMap<&str, &str> = HashMap::new(); // let name → value
+    let mut alias_of: HashMap<&str, &str> = HashMap::new();
     for n in &p0.spine {
         if let Node::Let { name, v } = n {
             alias_of.insert(name, v);
@@ -568,7 +767,89 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
     let alias_name: Option<&str> =
         if scrut_param == scrut_var { None } else { Some(scrut_var) };
 
-    // Arm signature = the branch-test sequence of a VC's spine.
+    // R-b: does this fn need `hwf : {Dt}Wf {scrut}`? Yes when any
+    // expr-fed bounded callee arg exists (only scrutinee-projection
+    // components can discharge them) or any callee/self wf demand is
+    // fed by a scrutinee child (`.deref` text).
+    let mut need_scrut_wf = false;
+    for vc in &sc.vcs {
+        for n in &vc.spine {
+            let Node::Call { callee, is_self, args } = n else { continue };
+            let callee_rel = if *is_self { rel } else { callee.as_str() };
+            let callee_lead: Vec<&Node> = ctx
+                .sidecars
+                .get(callee_rel)
+                .and_then(|c| c.vcs.first())
+                .map(|v| leading_alls(&v.spine).0.iter().collect())
+                .unwrap_or_default();
+            let mut arg_i = 0usize;
+            for cn in &callee_lead {
+                let Node::All { name, .. } = cn else { continue };
+                if name.starts_with("h_") && name.ends_with("_bound") {
+                    if let Some(a) = args.get(arg_i.wrapping_sub(1)) {
+                        if a.tag == "expr" {
+                            need_scrut_wf = true;
+                        }
+                    }
+                } else {
+                    arg_i += 1;
+                }
+            }
+            if !is_self {
+                if let Some(meta) = ctx.closed.get(callee.as_str()) {
+                    // Scrut wf is needed only when a deref-of-child arg
+                    // feeds a WF-PARAM position specifically.
+                    let pnames: Vec<&str> = callee_lead
+                        .iter()
+                        .filter_map(|cn| match cn {
+                            Node::All { name, .. }
+                                if !(name.starts_with("h_")
+                                    && name.ends_with("_bound")) =>
+                            {
+                                Some(name.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    for (wp, _) in &meta.wf_params {
+                        if let Some(i) = pnames.iter().position(|p| p == wp) {
+                            if args.get(i).map(|a| a.text.ends_with(".deref"))
+                                == Some(true)
+                            {
+                                need_scrut_wf = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let wf_info = ctx.wf.get(dt);
+    if need_scrut_wf && wf_info.is_none() {
+        return Err(format!("no wf predicate for {}", dt));
+    }
+    // Self-recursion through a scrut child ⇒ the IH needs the child's
+    // wf ⇒ we must take scrut wf whenever the fn is recursive AND has
+    // a wf predicate demand anywhere. (A recursive fn with no bound
+    // demands anywhere keeps its plain signature — holds_all_append.)
+    let propagated = own_wf_demands(sc, ctx, &param_names, Some(scrut_param), true)?;
+    let mut wf_params: Vec<(String, String)> = Vec::new();
+    for p in &param_names {
+        if *p == scrut_param && need_scrut_wf {
+            wf_params.push((p.to_string(), dt.to_string()));
+        } else if let Some((_, d)) = propagated.iter().find(|(q, _)| q == p) {
+            wf_params.push((p.to_string(), d.clone()));
+        }
+    }
+    let own_wf: HashMap<String, String> = wf_params
+        .iter()
+        .map(|(p, _)| {
+            let b = if p == scrut_param { "hwf".to_string() } else { format!("hwf_{}", p) };
+            (p.clone(), b)
+        })
+        .collect();
+    let meta = ClosedMeta { wf_params: wf_params.clone() };
+
     let sig_of = |vc: &Vc| -> Vec<(String, bool)> {
         vc.spine
             .iter()
@@ -596,7 +877,6 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
         }
     };
 
-    // Group posts into arms (first-appearance order) and conjuncts.
     let mut arm_sigs: Vec<Vec<(String, bool)>> = Vec::new();
     for p in &posts {
         let sig = sig_of(p);
@@ -619,14 +899,14 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
     let mut dec_bullets: Vec<String> = Vec::new();
     for sig in &arm_sigs {
         let variant = variant_of_sig(sig)?;
-        let arity = variants
+        let accessors: &Vec<String> = variants
             .iter()
             .find(|(v, _)| *v == variant)
-            .map(|(_, a)| *a)
+            .map(|(_, a)| a)
             .ok_or_else(|| format!("variant {} not in datatype {}", variant, dt))?;
+        let arity = accessors.len();
         let arm_posts: Vec<&Vc> = posts.iter().copied().filter(|p| sig_of(p) == *sig).collect();
         let arm_terms: Vec<&Vc> = terms.iter().copied().filter(|t| sig_of(t) == *sig).collect();
-        // One post per conjunct, in conjunct order.
         if arm_posts.len() != conjuncts.len() {
             return Err("arm/conjunct grid mismatch".into());
         }
@@ -640,17 +920,33 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
                     .ok_or_else(|| "arm missing a conjunct".to_string())
             })
             .collect::<Result<_, _>>()?;
-        // Pattern binders from projection lets off the alias.
         let base = alias_name.unwrap_or(scrut_param);
         let mut field_names: Vec<Option<String>> = vec![None; arity];
+        let mut field_accessor: Vec<Option<String>> = vec![None; arity];
         let mut projections: HashSet<String> = HashSet::new();
+        // Projection lets: `<base>.<Variant>_<accessor>` — accessor is
+        // `val<N>` (positional) or the field name. Field INDEX comes
+        // from the wf/variant field table via accessor order; for
+        // `val<N>` it is N directly, for named accessors we take the
+        // conjunct-table order (generate.rs records accessors in
+        // declaration order per variant).
+
         for n in &arm_posts[0].spine {
             if let Node::Let { name, v } = n {
-                let pref = format!("{}.{}_val", base, variant);
-                if let Some(idx) = v.strip_prefix(&pref) {
-                    if let Ok(i) = idx.parse::<usize>() {
+                let pref = format!("{}.{}_", base, variant);
+                if let Some(acc) = v.strip_prefix(&pref) {
+                    // Accessor → field index: `val<N>` is positional;
+                    // named accessors index into the declaration-order
+                    // accessor list from the krate.
+                    let idx = if let Some(num) = acc.strip_prefix("val") {
+                        num.parse::<usize>().ok()
+                    } else {
+                        accessors.iter().position(|a| a == acc)
+                    };
+                    if let Some(i) = idx {
                         if i < arity {
                             field_names[i] = Some(name.clone());
+                            field_accessor[i] = Some(acc.to_string());
                             projections.insert(name.clone());
                         }
                     }
@@ -684,9 +980,39 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
         } else {
             format!("{}.{} {}", dt, variant, binder_texts.join(" "))
         };
-        // Termination VCs of this arm: match each Height position in
-        // the (per-arm identical) post spine to the term VC whose spine
-        // is the prefix ending right there.
+        // R-b: arm wf destructuring + component lookup table.
+        let mut arm_comps: HashMap<String, (String, bool)> = HashMap::new();
+        let wf_pattern: Option<String> = if need_scrut_wf {
+            let comps: Vec<&WfComp> = wf_info
+                .and_then(|w| w.variants.get(&variant))
+                .map(|cs| cs.iter().collect())
+                .unwrap_or_default();
+            let mut names = Vec::new();
+            for c in &comps {
+                let bname = if c.rec {
+                    format!("hwf_{}", c.accessor)
+                } else {
+                    format!("h_wf_{}", c.accessor)
+                };
+                // Bind the component to the PROJECTION-LET name that
+                // projects this accessor (if the arm projects it).
+                if let Some(pi) = field_accessor.iter().position(|a| {
+                    a.as_deref() == Some(c.accessor.as_str())
+                }) {
+                    if let Some(pn) = &field_names[pi] {
+                        arm_comps.insert(pn.clone(), (bname.clone(), c.rec));
+                    }
+                }
+                names.push(bname);
+            }
+            Some(if names.is_empty() {
+                "_".to_string()
+            } else {
+                format!("⟨{}⟩", names.join(", "))
+            })
+        } else {
+            None
+        };
         let heights: Vec<usize> = arm_posts[0]
             .spine
             .iter()
@@ -701,6 +1027,10 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
             hdec_names: &[],
             sidecars: ctx.sidecars,
             own_lead: lead,
+            closed: ctx.closed,
+            own_wf: &own_wf,
+            arm_comps: &arm_comps,
+            own_meta: &meta,
         };
         for (j, hi) in heights.iter().enumerate() {
             let tvc = arm_terms
@@ -714,9 +1044,26 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
             };
             let tapp = app_text(tvc, None, &env0)?;
             haves.push(format!("have {} := {}", name, tapp));
+            // decreasing_by goals see pattern binders but NOT the
+            // arm's term-mode lets — inline them (probe34 shape).
+            let arm_lets: Vec<(String, String)> = arm_posts[0]
+                .spine
+                .iter()
+                .filter_map(|n| match n {
+                    Node::Let { name, v } if !projections.contains(name) => Some((
+                        name.clone(),
+                        if alias_name == Some(name.as_str()) {
+                            pattern.clone()
+                        } else {
+                            v.clone()
+                        },
+                    )),
+                    _ => None,
+                })
+                .collect();
             dec_bullets.push(format!(
                 "  · exact ({}\n      ).resolve_right (fun h => h.2.elim)",
-                tapp
+                expand_lets(&tapp, &arm_lets)
             ));
             hdec_names.push(name);
         }
@@ -726,6 +1073,10 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
             hdec_names: &hdec_names,
             sidecars: ctx.sidecars,
             own_lead: lead,
+            closed: ctx.closed,
+            own_wf: &own_wf,
+            arm_comps: &arm_comps,
+            own_meta: &meta,
         };
         let lets = replay_lets(
             arm_posts[0],
@@ -741,7 +1092,11 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
         } else {
             format!("⟨{}⟩", apps.join(",\n     "))
         };
-        let mut arm = format!("  | {} =>\n", pattern);
+        let arm_head = match &wf_pattern {
+            Some(wp) => format!("  | {}, {} =>\n", pattern, wp),
+            None => format!("  | {} =>\n", pattern),
+        };
+        let mut arm = arm_head;
         for l in &lets {
             arm.push_str(&format!("      {}\n", l));
         }
@@ -752,8 +1107,6 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
         arms_text.push(arm);
     }
 
-    // termination_by: the measure is the RHS of the `<` in a term leaf,
-    // with spine lets (decrease snapshots) substituted by their values.
     let measure = {
         let t0 = terms.first().ok_or("recursive fn without termination VC")?;
         let leaf = strip_mark(&t0.leaf);
@@ -775,24 +1128,33 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
         m
     };
 
-    let binders: Vec<String> = lead
+    let mut binders: Vec<String> = lead
         .iter()
         .map(|n| match n {
             Node::All { name, ty } => format!("({} : {})", name, ty),
             _ => unreachable!(),
         })
         .collect();
+    for (p, d) in &wf_params {
+        let b = &own_wf[p];
+        binders.push(format!("({} : {}Wf {})", b, d, p));
+    }
     let body_ty = conjuncts
         .iter()
         .map(|c| format!("({})", c))
         .collect::<Vec<_>>()
         .join("\n      ∧ ");
+    let match_head = if need_scrut_wf {
+        format!("match {}, hwf with", scrut_param)
+    } else {
+        format!("match {} with", scrut_param)
+    };
     let mut text = format!(
-        "theorem {}_closed {} :\n    {} :=\n  match {} with\n{}\n",
+        "theorem {}_closed {} :\n    {} :=\n  {}\n{}\n",
         rel,
         binders.join(" "),
         body_ty,
-        scrut_param,
+        match_head,
         arms_text.join("\n")
     );
     text.push_str(&format!("termination_by {}\n", measure));
@@ -801,16 +1163,13 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
         text.push_str(&dec_bullets.join("\n"));
         text.push('\n');
     }
-    Ok(Outcome::Closed { text, kind: "fix" })
+    Ok(Outcome::Closed { text, kind: "fix", meta })
 }
 
 /// One fn: classify and synthesize.
 pub fn try_close(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Outcome {
     if let Some(o) = close_zero_spine(rel, sc) {
         return o;
-    }
-    if let Some(gap) = bound_gap(sc, ctx) {
-        return pend(gap);
     }
     let has_branch = sc.vcs.iter().any(|v| v.spine.iter().any(|n| matches!(n, Node::Branch { .. })));
     let has_self = sc.vcs.iter().any(|v| {

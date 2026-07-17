@@ -477,6 +477,14 @@ noncomputable def _tactus_postcondition_wp_sound_bites_loop_init_at_lib_3975_13_
   _tactus_postcondition_wp_sound_bites_loop_init_at_lib_3975_13_5
 #tactus_check_axioms _tactus_postcondition_wp_sound_bites_loop_init_at_lib_3975_13_5_closed []
 namespace lib
+def FrameListWf (x : lib.FrameList) : Prop :=
+  match x with
+  | lib.FrameList.FNil => True
+  | lib.FrameList.FBind x0 x1 x2 => (0 ≤ x0 ∧ x0 < 18446744073709551616) ∧ (0 ≤ x1 ∧ x1 < 18446744073709551616) ∧ FrameListWf x2.deref
+  | lib.FrameList.FHyp x0 x1 => (0 ≤ x0 ∧ x0 < 18446744073709551616) ∧ FrameListWf x1.deref
+  | lib.FrameList.FLet x0 x1 x2 => (0 ≤ x0 ∧ x0 < 18446744073709551616) ∧ (0 ≤ x1 ∧ x1 < 18446744073709551616) ∧ FrameListWf x2.deref
+termination_by structural x
+
 theorem u_holds_leaf_closed : _tactus_postcondition_u_holds_leaf_at_lib_3245_13_1_stmt := _tactus_postcondition_u_holds_leaf_at_lib_3245_13_1_closed
 
 theorem u_holds_imp_closed : _tactus_postcondition_u_holds_imp_at_lib_3249_13_1_stmt := _tactus_postcondition_u_holds_imp_at_lib_3249_13_1_closed
@@ -581,6 +589,33 @@ theorem u_fapp_fbind_closed : _tactus_postcondition_u_fapp_fbind_at_lib_3774_13_
 
 theorem u_fapp_fhyp_closed : _tactus_postcondition_u_fapp_fhyp_at_lib_3778_13_1_stmt := _tactus_postcondition_u_fapp_fhyp_at_lib_3778_13_1_closed
 
+theorem holds_close_e_closed (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (f : lib.FrameList) (o : lib.RawExp) (hwf : FrameListWf f) :
+    (∀ (st : Int → Int), lib.holds hp he lv (lib.close_e f o) st = lib.close_sem_e hp he lv f st o) :=
+  match f, hwf with
+  | FrameList.FNil, _ =>
+      let tmp__1 := lib.render_exp o;
+      _tactus_postcondition_holds_close_e_at_lib_3477_13_4 hp he lv (FrameList.FNil) o (by simp) () (u_close_e_nil_closed o) () (u_holds_leafe_closed hp he lv tmp__1) () (u_cse_nil_closed hp he lv o)
+  | FrameList.FBind x ty t, ⟨h_wf_val0, h_wf_val1, hwf_val2⟩ =>
+      let tmp__2 := lib.close_e t.deref o;
+      have hdec := _tactus_termination_holds_close_e_at_lib_3491_13_8 hp he lv (FrameList.FBind x ty t) o (by simp) (by simp) () (u_close_e_bind_closed x h_wf_val0 ty h_wf_val1 t o) () (u_holds_all_binder_closed hp he lv x h_wf_val0 ty h_wf_val1 (Tactus.Box.mk tmp__2)) () (u_cse_bind_closed hp he lv x h_wf_val0 ty h_wf_val1 t o)
+      _tactus_postcondition_holds_close_e_at_lib_3477_13_10 hp he lv (FrameList.FBind x ty t) o (by simp) (by simp) () (u_close_e_bind_closed x h_wf_val0 ty h_wf_val1 t o) () (u_holds_all_binder_closed hp he lv x h_wf_val0 ty h_wf_val1 (Tactus.Box.mk tmp__2)) () (u_cse_bind_closed hp he lv x h_wf_val0 ty h_wf_val1 t o) hdec () (holds_close_e_closed hp he lv t.deref o hwf_val2)
+  | FrameList.FHyp h t, ⟨h_wf_val0, hwf_val1⟩ =>
+      let tmp__3 := lib.close_e t.deref o;
+      have hdec := _tactus_termination_holds_close_e_at_lib_3497_13_14 hp he lv (FrameList.FHyp h t) o (by simp) (by simp) (by simp) () (u_close_e_hyp_closed h h_wf_val0 t o) () (u_holds_imp_closed hp he lv h h_wf_val0 (Tactus.Box.mk tmp__3)) () (u_cse_hyp_closed hp he lv h h_wf_val0 t o)
+      _tactus_postcondition_holds_close_e_at_lib_3477_13_16 hp he lv (FrameList.FHyp h t) o (by simp) (by simp) (by simp) () (u_close_e_hyp_closed h h_wf_val0 t o) () (u_holds_imp_closed hp he lv h h_wf_val0 (Tactus.Box.mk tmp__3)) () (u_cse_hyp_closed hp he lv h h_wf_val0 t o) hdec () (holds_close_e_closed hp he lv t.deref o hwf_val1)
+  | FrameList.FLet x v t, ⟨h_wf_val0, h_wf_val1, hwf_val2⟩ =>
+      let tmp__4 := lib.close_e t.deref o;
+      have hdec := _tactus_termination_holds_close_e_at_lib_3503_13_20 hp he lv (FrameList.FLet x v t) o (by simp) (by simp) (by simp) () (u_close_e_let_closed x h_wf_val0 v h_wf_val1 t o) () (u_holds_let_closed hp he lv x h_wf_val0 v h_wf_val1 (Tactus.Box.mk tmp__4)) () (u_cse_let_closed hp he lv x h_wf_val0 v h_wf_val1 t o)
+      _tactus_postcondition_holds_close_e_at_lib_3477_13_22 hp he lv (FrameList.FLet x v t) o (by simp) (by simp) (by simp) () (u_close_e_let_closed x h_wf_val0 v h_wf_val1 t o) () (u_holds_let_closed hp he lv x h_wf_val0 v h_wf_val1 (Tactus.Box.mk tmp__4)) () (u_cse_let_closed hp he lv x h_wf_val0 v h_wf_val1 t o) hdec () (holds_close_e_closed hp he lv t.deref o hwf_val2)
+termination_by lib.FrameList.height f
+decreasing_by
+  · exact (_tactus_termination_holds_close_e_at_lib_3491_13_8 hp he lv (FrameList.FBind x ty t) o (by simp) (by simp) () (u_close_e_bind_closed x h_wf_val0 ty h_wf_val1 t o) () (u_holds_all_binder_closed hp he lv x h_wf_val0 ty h_wf_val1 (Tactus.Box.mk (lib.close_e t.deref o))) () (u_cse_bind_closed hp he lv x h_wf_val0 ty h_wf_val1 t o)
+      ).resolve_right (fun h => h.2.elim)
+  · exact (_tactus_termination_holds_close_e_at_lib_3497_13_14 hp he lv (FrameList.FHyp h t) o (by simp) (by simp) (by simp) () (u_close_e_hyp_closed h h_wf_val0 t o) () (u_holds_imp_closed hp he lv h h_wf_val0 (Tactus.Box.mk (lib.close_e t.deref o))) () (u_cse_hyp_closed hp he lv h h_wf_val0 t o)
+      ).resolve_right (fun h => h.2.elim)
+  · exact (_tactus_termination_holds_close_e_at_lib_3503_13_20 hp he lv (FrameList.FLet x v t) o (by simp) (by simp) (by simp) () (u_close_e_let_closed x h_wf_val0 v h_wf_val1 t o) () (u_holds_let_closed hp he lv x h_wf_val0 v h_wf_val1 (Tactus.Box.mk (lib.close_e t.deref o))) () (u_cse_let_closed hp he lv x h_wf_val0 v h_wf_val1 t o)
+      ).resolve_right (fun h => h.2.elim)
+
 theorem holds_all_append_closed (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (a : lib.GoalList) (b : lib.GoalList) (st : Int → Int) :
     (lib.holds_all hp he lv (lib.goals_append a b) st = (lib.holds_all hp he lv a st ∧ lib.holds_all hp he lv b st)) :=
   match a with
@@ -592,7 +627,76 @@ theorem holds_all_append_closed (hp : Int → (Int → Int) → Prop) (he : lib.
       _tactus_postcondition_holds_all_append_at_lib_3514_13_9 hp he lv (GoalList.Cons g t) b st (by simp) () (u_gapp_cons_closed g t b) () (u_holds_all_cons_closed hp he lv g t) () (u_holds_all_cons_closed hp he lv g (Tactus.Box.mk tmp__1)) hdec () (holds_all_append_closed hp he lv t.deref b st)
 termination_by lib.GoalList.height a
 decreasing_by
-  · exact (_tactus_termination_holds_all_append_at_lib_3527_13_7 hp he lv (GoalList.Cons g t) b st (by simp) () (u_gapp_cons_closed g t b) () (u_holds_all_cons_closed hp he lv g t) () (u_holds_all_cons_closed hp he lv g (Tactus.Box.mk tmp__1))
+  · exact (_tactus_termination_holds_all_append_at_lib_3527_13_7 hp he lv (GoalList.Cons g t) b st (by simp) () (u_gapp_cons_closed g t b) () (u_holds_all_cons_closed hp he lv g t) () (u_holds_all_cons_closed hp he lv g (Tactus.Box.mk (lib.goals_append t.deref b)))
+      ).resolve_right (fun h => h.2.elim)
+
+theorem cso_nil_true_closed (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (f : lib.FrameList) (hwf : FrameListWf f) :
+    (∀ (st : Int → Int), lib.close_sem_obligs hp he lv f st lib.RawExpList.Nil = True) :=
+  match f, hwf with
+  | FrameList.FNil, _ =>
+      let tmp__1 := lib.RawExpList.Nil;
+      _tactus_postcondition_cso_nil_true_at_lib_3542_13_3 hp he lv (FrameList.FNil) (by simp) () (u_cso_nil_closed hp he lv tmp__1) () (u_obligs_nil_closed he)
+  | FrameList.FBind x ty t, ⟨h_wf_val0, h_wf_val1, hwf_val2⟩ =>
+      let tmp__2 := lib.RawExpList.Nil;
+      have hdec := _tactus_termination_cso_nil_true_at_lib_3552_13_5 hp he lv (FrameList.FBind x ty t) (by simp) (by simp) () (u_cso_bind_closed hp he lv x h_wf_val0 ty h_wf_val1 t tmp__2)
+      _tactus_postcondition_cso_nil_true_at_lib_3542_13_7 hp he lv (FrameList.FBind x ty t) (by simp) (by simp) () (u_cso_bind_closed hp he lv x h_wf_val0 ty h_wf_val1 t tmp__2) hdec () (cso_nil_true_closed hp he lv t.deref hwf_val2)
+  | FrameList.FHyp h t, ⟨h_wf_val0, hwf_val1⟩ =>
+      let tmp__3 := lib.RawExpList.Nil;
+      have hdec := _tactus_termination_cso_nil_true_at_lib_3556_13_9 hp he lv (FrameList.FHyp h t) (by simp) (by simp) (by simp) () (u_cso_hyp_closed hp he lv h h_wf_val0 t tmp__3)
+      _tactus_postcondition_cso_nil_true_at_lib_3542_13_11 hp he lv (FrameList.FHyp h t) (by simp) (by simp) (by simp) () (u_cso_hyp_closed hp he lv h h_wf_val0 t tmp__3) hdec () (cso_nil_true_closed hp he lv t.deref hwf_val1)
+  | FrameList.FLet x v t, ⟨h_wf_val0, h_wf_val1, hwf_val2⟩ =>
+      let tmp__4 := lib.RawExpList.Nil;
+      have hdec := _tactus_termination_cso_nil_true_at_lib_3560_13_13 hp he lv (FrameList.FLet x v t) (by simp) (by simp) (by simp) () (u_cso_let_closed hp he lv x h_wf_val0 v h_wf_val1 t tmp__4)
+      _tactus_postcondition_cso_nil_true_at_lib_3542_13_15 hp he lv (FrameList.FLet x v t) (by simp) (by simp) (by simp) () (u_cso_let_closed hp he lv x h_wf_val0 v h_wf_val1 t tmp__4) hdec () (cso_nil_true_closed hp he lv t.deref hwf_val2)
+termination_by lib.FrameList.height f
+decreasing_by
+  · exact (_tactus_termination_cso_nil_true_at_lib_3552_13_5 hp he lv (FrameList.FBind x ty t) (by simp) (by simp) () (u_cso_bind_closed hp he lv x h_wf_val0 ty h_wf_val1 t (lib.RawExpList.Nil))
+      ).resolve_right (fun h => h.2.elim)
+  · exact (_tactus_termination_cso_nil_true_at_lib_3556_13_9 hp he lv (FrameList.FHyp h t) (by simp) (by simp) (by simp) () (u_cso_hyp_closed hp he lv h h_wf_val0 t (lib.RawExpList.Nil))
+      ).resolve_right (fun h => h.2.elim)
+  · exact (_tactus_termination_cso_nil_true_at_lib_3560_13_13 hp he lv (FrameList.FLet x v t) (by simp) (by simp) (by simp) () (u_cso_let_closed hp he lv x h_wf_val0 v h_wf_val1 t (lib.RawExpList.Nil))
+      ).resolve_right (fun h => h.2.elim)
+
+theorem cso_cons_split_closed (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (f : lib.FrameList) (h : Tactus.Box lib.RawExp) (t : Tactus.Box lib.RawExpList) (hwf : FrameListWf f) :
+    (∀ (st : Int → Int), lib.close_sem_obligs hp he lv f st (lib.RawExpList.Cons h t) = (lib.close_sem_e hp he lv f st h.deref ∧ lib.close_sem_obligs hp he lv f st t.deref)) :=
+  match f, hwf with
+  | FrameList.FNil, _ =>
+      let tmp__1 := lib.RawExpList.Cons h t;
+      _tactus_postcondition_cso_cons_split_at_lib_3571_13_5 hp he lv (FrameList.FNil) h t (by simp) () (u_cso_nil_closed hp he lv tmp__1) () (u_obligs_cons_closed he h t) () (u_cse_nil_closed hp he lv h.deref) () (u_cso_nil_closed hp he lv t.deref)
+  | FrameList.FBind x ty tl, ⟨h_wf_val0, h_wf_val1, hwf_val2⟩ =>
+      let tmp__2 := lib.RawExpList.Cons h t;
+      have hdec := _tactus_termination_cso_cons_split_at_lib_3586_13_9 hp he lv (FrameList.FBind x ty tl) h t (by simp) (by simp) () (u_cso_bind_closed hp he lv x h_wf_val0 ty h_wf_val1 tl tmp__2) () (u_cse_bind_closed hp he lv x h_wf_val0 ty h_wf_val1 tl h.deref) () (u_cso_bind_closed hp he lv x h_wf_val0 ty h_wf_val1 tl t.deref)
+      _tactus_postcondition_cso_cons_split_at_lib_3571_13_11 hp he lv (FrameList.FBind x ty tl) h t (by simp) (by simp) () (u_cso_bind_closed hp he lv x h_wf_val0 ty h_wf_val1 tl tmp__2) () (u_cse_bind_closed hp he lv x h_wf_val0 ty h_wf_val1 tl h.deref) () (u_cso_bind_closed hp he lv x h_wf_val0 ty h_wf_val1 tl t.deref) hdec () (cso_cons_split_closed hp he lv tl.deref h t hwf_val2)
+  | FrameList.FHyp hh tl, ⟨h_wf_val0, hwf_val1⟩ =>
+      let tmp__3 := lib.RawExpList.Cons h t;
+      have hdec := _tactus_termination_cso_cons_split_at_lib_3592_13_15 hp he lv (FrameList.FHyp hh tl) h t (by simp) (by simp) (by simp) () (u_cso_hyp_closed hp he lv hh h_wf_val0 tl tmp__3) () (u_cse_hyp_closed hp he lv hh h_wf_val0 tl h.deref) () (u_cso_hyp_closed hp he lv hh h_wf_val0 tl t.deref)
+      _tactus_postcondition_cso_cons_split_at_lib_3571_13_17 hp he lv (FrameList.FHyp hh tl) h t (by simp) (by simp) (by simp) () (u_cso_hyp_closed hp he lv hh h_wf_val0 tl tmp__3) () (u_cse_hyp_closed hp he lv hh h_wf_val0 tl h.deref) () (u_cso_hyp_closed hp he lv hh h_wf_val0 tl t.deref) hdec () (cso_cons_split_closed hp he lv tl.deref h t hwf_val1)
+  | FrameList.FLet x v tl, ⟨h_wf_val0, h_wf_val1, hwf_val2⟩ =>
+      let tmp__4 := lib.RawExpList.Cons h t;
+      have hdec := _tactus_termination_cso_cons_split_at_lib_3598_13_21 hp he lv (FrameList.FLet x v tl) h t (by simp) (by simp) (by simp) () (u_cso_let_closed hp he lv x h_wf_val0 v h_wf_val1 tl tmp__4) () (u_cse_let_closed hp he lv x h_wf_val0 v h_wf_val1 tl h.deref) () (u_cso_let_closed hp he lv x h_wf_val0 v h_wf_val1 tl t.deref)
+      _tactus_postcondition_cso_cons_split_at_lib_3571_13_23 hp he lv (FrameList.FLet x v tl) h t (by simp) (by simp) (by simp) () (u_cso_let_closed hp he lv x h_wf_val0 v h_wf_val1 tl tmp__4) () (u_cse_let_closed hp he lv x h_wf_val0 v h_wf_val1 tl h.deref) () (u_cso_let_closed hp he lv x h_wf_val0 v h_wf_val1 tl t.deref) hdec () (cso_cons_split_closed hp he lv tl.deref h t hwf_val2)
+termination_by lib.FrameList.height f
+decreasing_by
+  · exact (_tactus_termination_cso_cons_split_at_lib_3586_13_9 hp he lv (FrameList.FBind x ty tl) h t (by simp) (by simp) () (u_cso_bind_closed hp he lv x h_wf_val0 ty h_wf_val1 tl (lib.RawExpList.Cons h t)) () (u_cse_bind_closed hp he lv x h_wf_val0 ty h_wf_val1 tl h.deref) () (u_cso_bind_closed hp he lv x h_wf_val0 ty h_wf_val1 tl t.deref)
+      ).resolve_right (fun h => h.2.elim)
+  · exact (_tactus_termination_cso_cons_split_at_lib_3592_13_15 hp he lv (FrameList.FHyp hh tl) h t (by simp) (by simp) (by simp) () (u_cso_hyp_closed hp he lv hh h_wf_val0 tl (lib.RawExpList.Cons h t)) () (u_cse_hyp_closed hp he lv hh h_wf_val0 tl h.deref) () (u_cso_hyp_closed hp he lv hh h_wf_val0 tl t.deref)
+      ).resolve_right (fun h => h.2.elim)
+  · exact (_tactus_termination_cso_cons_split_at_lib_3598_13_21 hp he lv (FrameList.FLet x v tl) h t (by simp) (by simp) (by simp) () (u_cso_let_closed hp he lv x h_wf_val0 v h_wf_val1 tl (lib.RawExpList.Cons h t)) () (u_cse_let_closed hp he lv x h_wf_val0 v h_wf_val1 tl h.deref) () (u_cso_let_closed hp he lv x h_wf_val0 v h_wf_val1 tl t.deref)
+      ).resolve_right (fun h => h.2.elim)
+
+theorem holds_all_close_each_e_closed (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (f : lib.FrameList) (l : lib.RawExpList) (st : Int → Int) (hwf_f : FrameListWf f) :
+    (lib.holds_all hp he lv (lib.close_each_e f l) st = lib.close_sem_obligs hp he lv f st l) :=
+  match l with
+  | RawExpList.Nil =>
+      _tactus_postcondition_holds_all_close_each_e_at_lib_3611_13_4 hp he lv f (RawExpList.Nil) st (by simp) () (u_cce_nil_closed f) () (u_holds_all_nil_closed hp he lv) () (cso_nil_true_closed hp he lv f hwf_f)
+  | RawExpList.Cons h t =>
+      let tmp__1 := lib.close_e f h.deref;
+      let tmp__2 := lib.close_each_e f t.deref;
+      have hdec := _tactus_termination_holds_all_close_each_e_at_lib_3626_13_9 hp he lv f (RawExpList.Cons h t) st (by simp) () (u_cce_cons_closed f h t) () (u_holds_all_cons_closed hp he lv (Tactus.Box.mk tmp__1) (Tactus.Box.mk tmp__2)) () (holds_close_e_closed hp he lv f h.deref hwf_f) () (cso_cons_split_closed hp he lv f h t hwf_f)
+      _tactus_postcondition_holds_all_close_each_e_at_lib_3611_13_11 hp he lv f (RawExpList.Cons h t) st (by simp) () (u_cce_cons_closed f h t) () (u_holds_all_cons_closed hp he lv (Tactus.Box.mk tmp__1) (Tactus.Box.mk tmp__2)) () (holds_close_e_closed hp he lv f h.deref hwf_f) () (cso_cons_split_closed hp he lv f h t hwf_f) hdec () (holds_all_close_each_e_closed hp he lv f t.deref st hwf_f)
+termination_by lib.RawExpList.height l
+decreasing_by
+  · exact (_tactus_termination_holds_all_close_each_e_at_lib_3626_13_9 hp he lv f (RawExpList.Cons h t) st (by simp) () (u_cce_cons_closed f h t) () (u_holds_all_cons_closed hp he lv (Tactus.Box.mk (lib.close_e f h.deref)) (Tactus.Box.mk (lib.close_each_e f t.deref))) () (holds_close_e_closed hp he lv f h.deref hwf_f) () (cso_cons_split_closed hp he lv f h t hwf_f)
       ).resolve_right (fun h => h.2.elim)
 
 end lib
@@ -648,4 +752,8 @@ end lib
 #tactus_check_axioms lib.u_fapp_fnil_closed []
 #tactus_check_axioms lib.u_fapp_fbind_closed []
 #tactus_check_axioms lib.u_fapp_fhyp_closed []
+#tactus_check_axioms lib.holds_close_e_closed []
 #tactus_check_axioms lib.holds_all_append_closed []
+#tactus_check_axioms lib.cso_nil_true_closed []
+#tactus_check_axioms lib.cso_cons_split_closed []
+#tactus_check_axioms lib.holds_all_close_each_e_closed []

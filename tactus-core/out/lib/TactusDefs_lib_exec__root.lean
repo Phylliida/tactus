@@ -34,12 +34,12 @@ mutual
 noncomputable def lib.expr_size (e : lib.ExprData) : Nat :=
   match e with | lib.ExprData.Atom _ => 1 | lib.ExprData.Lit _ => 1 | lib.ExprData.LitBool _ => 1 | lib.ExprData.Cast _k t => 1 + lib.expr_size t.deref | lib.ExprData.BinOp _op l r => 1 + lib.expr_size l.deref + lib.expr_size r.deref | lib.ExprData.App _fn a => 1 + lib.expr_size a.deref | lib.ExprData.FieldProj t _f => 1 + lib.expr_size t.deref | lib.ExprData.SpanMark _loc t => 1 + lib.expr_size t.deref | lib.ExprData.Let _n v bd => 1 + lib.expr_size v.deref + lib.expr_size bd.deref | lib.ExprData.Not t => 1 + lib.expr_size t.deref | lib.ExprData.Ite c t e => 1 + lib.expr_size c.deref + lib.expr_size t.deref + lib.expr_size e.deref | lib.ExprData.Match s arms => 1 + lib.expr_size s.deref + lib.arms_size arms.deref | lib.ExprData.AppN _fn args => 1 + lib.exprlist_size args.deref | lib.ExprData.Forall _bid _bty body => 1 + lib.expr_size body.deref | lib.ExprData.Exists _bid _bty body => 1 + lib.expr_size body.deref
 termination_by structural e
-noncomputable def lib.arms_size (a : lib.ArmList) : Nat :=
-  match a with | lib.ArmList.Nil => 0 | lib.ArmList.Cons _c _bs body tl => 1 + lib.expr_size body.deref + lib.arms_size tl.deref
-termination_by structural a
 noncomputable def lib.exprlist_size (l : lib.ExprList) : Nat :=
   match l with | lib.ExprList.Nil => 0 | lib.ExprList.Cons h t => 1 + lib.expr_size h.deref + lib.exprlist_size t.deref
 termination_by structural l
+noncomputable def lib.arms_size (a : lib.ArmList) : Nat :=
+  match a with | lib.ArmList.Nil => 0 | lib.ArmList.Cons _c _bs body tl => 1 + lib.expr_size body.deref + lib.arms_size tl.deref
+termination_by structural a
 end
 
 noncomputable def lib.typ_size (t : lib.TypData) : Nat :=
@@ -83,12 +83,12 @@ noncomputable def lib.render_exp (re : lib.RawExp) : lib.ExprData :=
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                let e2 := lib.coerce_if (lib.needs_nat_coercion (lib.type_of e.deref) ty) (lib.render_exp e.deref);
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                lib.ExprData.Ite (Tactus.Box.mk (lib.render_exp c.deref)) (Tactus.Box.mk t2) (Tactus.Box.mk e2) | lib.RawExp.MatchR scrut arms ty => lib.ExprData.Match (Tactus.Box.mk (lib.render_exp scrut.deref)) (Tactus.Box.mk (lib.render_arms arms.deref ty)) | lib.RawExp.CallN fnid _ret args => lib.ExprData.AppN fnid (Tactus.Box.mk (lib.render_list args.deref)) | lib.RawExp.ForallR bid bty body => lib.ExprData.Forall bid bty (Tactus.Box.mk (lib.render_exp body.deref)) | lib.RawExp.ExistsR bid bty body => lib.ExprData.Exists bid bty (Tactus.Box.mk (lib.render_exp body.deref))
 termination_by structural re
-noncomputable def lib.render_arms (a : lib.RawArmList) (ty : lib.TypData) : lib.ArmList :=
-  match a with | lib.RawArmList.Nil => lib.ArmList.Nil | lib.RawArmList.Cons c bs body tl => lib.ArmList.Cons c bs (Tactus.Box.mk (lib.coerce_if (lib.needs_nat_coercion (lib.type_of body.deref) ty) (lib.render_exp body.deref))) (Tactus.Box.mk (lib.render_arms tl.deref ty))
-termination_by structural a
 noncomputable def lib.render_list (l : lib.RawList) : lib.ExprList :=
   match l with | lib.RawList.Nil => lib.ExprList.Nil | lib.RawList.Cons h t => lib.ExprList.Cons (Tactus.Box.mk (lib.render_exp h.deref)) (Tactus.Box.mk (lib.render_list t.deref))
 termination_by structural l
+noncomputable def lib.render_arms (a : lib.RawArmList) (ty : lib.TypData) : lib.ArmList :=
+  match a with | lib.RawArmList.Nil => lib.ArmList.Nil | lib.RawArmList.Cons c bs body tl => lib.ArmList.Cons c bs (Tactus.Box.mk (lib.coerce_if (lib.needs_nat_coercion (lib.type_of body.deref) ty) (lib.render_exp body.deref))) (Tactus.Box.mk (lib.render_arms tl.deref ty))
+termination_by structural a
 end
 
 noncomputable def lib.render_def (d : lib.RawDef) : lib.DefData :=
