@@ -27,6 +27,14 @@ pairs (hoisting is linear; substitution duplicated). Bool-typed lets
 are excluded (stay wrap → still `Let`-shaped). N2 match-splitting
 similarly reshapes match goals per-arm.
 
+**Pattern 2 (use_clamped evidence, 2026-07-18):** FHyp rendering
+changed UNIFORMLY — production emits hypotheses as NAMED binders
+(`All(h, prop)`, the theorem-binder form) where refWp renders
+`Imp(prop)`. This is a rendering-layer change, suggesting part of the
+reconciliation belongs in tactus-core's `close_e` (mechanical: FHyp →
+named All) rather than serializer assembly — the hoisted-let pairs
+remain serializer territory (they need production's hoist classifier).
+
 **Reconciliation options:**
 - (A) **Serializer assembly (recommended — Option-2 precedent):** the
   serializer's goals/SST transcription re-derives production's hoist

@@ -2279,13 +2279,32 @@ impl<'a> Serializer<'a> {
                 }
                 post
             }
-            CertCallPost::Forall { .. } => {
-                // The ∀-path (no callee `r == E`) needs the FBind +
-                // ret_bound + ens + Approach-A `use_dest_name` assembly.
-                // Deferred until a ∀-path fixture exists to bridge-validate
-                // it — no fixture Call fn currently takes it
-                // (quad_exec / count_down / vec_read are all ret-eq).
-                return Err("call-forall-path".to_string());
+            CertCallPost::Forall { ret_typ, ret_bound, ens, binder_name, dest_value, use_dest_name } => {
+                // ∀-path (bootstrap-71; no callee `r == E` conjunct).
+                // Frame (outer→inner): FBind(binder, ret_typ)
+                // [FHyp(ret_bound)] [FHyp(ens)] [FLet(dest, binder)] —
+                // matching `push_ret_frames`' ∀-path push order (binder,
+                // bound Hyp, ens Hyp) + the Phase-5 alias let, which is
+                // SKIPPED when Approach A named the ∀-binder with the
+                // dest's own name (`use_dest_name` ⟺ binder == dest).
+                let fnil = format!("{}.FrameList.FNil", NS);
+                let mut post = if use_dest_name {
+                    fnil
+                } else {
+                    let dv = self.leaves.intern(pp_expr(&dest_value));
+                    format!("({}.FrameList.FLet {} {} {})", NS, dest_id, dv, box_(&fnil))
+                };
+                if let Some(e) = ens {
+                    let i = self.leaves.intern(pp_expr(&e));
+                    post = format!("({}.FrameList.FHyp {} {})", NS, i, box_(&post));
+                }
+                if let Some(rb) = ret_bound {
+                    let b = self.leaves.intern(pp_expr(&rb));
+                    post = format!("({}.FrameList.FHyp {} {})", NS, b, box_(&post));
+                }
+                let bn = self.text_leaf(binder_name.as_str());
+                let ty = self.leaves.intern(pp_expr(&ret_typ));
+                format!("({}.FrameList.FBind {} {} {})", NS, bn, ty, box_(&post))
             }
         };
         Ok(format!("({}.StmData.Call {} {})", NS, box_(&reqs), box_(&post)))
