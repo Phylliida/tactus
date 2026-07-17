@@ -3,7 +3,7 @@ title: "Link discharge — premise-free closed theorems per proof fn (spec: DESI
 status: in_progress
 claimed_by: fable-b73
 created: 2026-07-16T23:30:00Z
-updated: 2026-07-17T03:30:00Z
+updated: 2026-07-17T17:00:00Z
 ---
 
 ## Description
@@ -183,3 +183,46 @@ Danielle (naming / default-on / theorem-vs-def).
   `lib.<callee>_closed <args>` per call imp, bound recipes per tag
   (param:<n> → caller's h_<n>_bound binder; lit → by decide; expr →
   census `discharge-bound-gap` until L2 wf).
+
+- (2026-07-17, fable-b73) **FIX SYNTHESIS LANDED (L2 core) — the generator
+  machine-writes probe34's recursive discharge and the kernel checks it.**
+  Plan inverted on data: ALL nine corollaries call wp_stm_sound, so
+  "slice (c) closes corollaries" was wrong — everything funnels through
+  the wf rung. Today = the shared machinery:
+  - **Sidecar v2**: `HypProvenance::Branch(Option<BranchTest>)` (scrut/
+    dt/variant/pos from the VIR `IsVariant` at the branch push) + per-VC
+    `leaf` texts + absorbed-hyp provenance (`GoalSpine::All` carries
+    `Option<HypProvenance>`; `split_leading_binders` was NAMING leading
+    hyps `_h_ctx_N` and dropping their CallFact — now preserved through
+    the shape, fold-neutral for the W2 cert bridge).
+  - **`link_discharge.rs`** (new module): sidecar parser + classifier +
+    three closers — zero-spine re-export, straight-line positional
+    application, and FIX SYNTHESIS (match on scrutinee resolved through
+    alias lets, arm patterns from projection-let accessor names +
+    BranchTest variants, per-arm `have hdec := <termination VC at
+    prefix args>` (term spine = post spine prefix!), IH = self `_closed`
+    call, `termination_by` parsed from the term leaf with let
+    substitution, `decreasing_by · exact (...).resolve_right (fun h =>
+    h.2.elim)`). Referenced lets replayed as term-mode `let`s (no text
+    substitution). Fixpoint driver in `build_link_module`; census via
+    `PackageGateReport.discharge_detail`.
+  - **Bound recipes**: interleaved application per the callee's leading-
+    All order — `param:<n>` → caller's own `h_<n>_bound`, `lit` →
+    `(by omega)`, `expr`-fed bounds = the only true wf-gap. This moved
+    all 9 corollaries from misc bound-gap reasons to the single honest
+    blocker "awaits wp_stm_sound_closed".
+  - **State**: 53 closed (52 zero-spine + 1 fix = holds_all_append —
+    generated text structurally identical to probe34's hand version),
+    14 pending: 9× awaits wp_stm_sound, holds_all_close_each_e awaits
+    cso_nil_true, and 4 wf-rung fns (holds_close_e, cso_nil_true,
+    cso_cons_split via u_cso/u_close_e bounds; wp_stm_sound via
+    u_wp_assert/u_esf_*). Gate green, tactus-core 138/0, vstd 1530/0.
+  - **NEXT = the wf rung (R-b)**, the single gate to +14: per-datatype
+    wf predicates (probe34 flWf shape, `termination_by structural`),
+    `hwf` params on the 4 fns' clean stmts + destructuring in arms +
+    components at expr-fed bound sites, wf PROPAGATION to callers
+    (ref_wp_sound passes own param s → needs own StmWf s; its
+    tmp__1 = seed_frame c arg needs a wf-transport lemma for
+    seed_frame — the one semantic (non-mechanical) piece; consider
+    emitting wf-preservation obligations OR scoping transport to
+    constructor-built values first).

@@ -700,6 +700,37 @@ pub(crate) fn peel_value_position(e: &Exp) -> &Exp {
 /// variant, prefer `Validated::check(&Exp)?` — that wraps the same
 /// validation in a typestate so the walker's `lower(&Validated<'_>)`
 /// is panic-free by construction (#100).
+/// Extract the lowered-match discriminator from a branch cond (L2,
+/// link_discharge): an `IsVariant(scrutinee)` test, possibly under
+/// value-position wrappers. `positive` comes from the caller (then-
+/// vs else-path — the walker negates at the push site, the Exp is
+/// always the positive test). `None` = not a variant test (plain if).
+fn branch_test_of(cond: &Exp, positive: bool) -> Option<crate::lean_ast::BranchTest> {
+    let peeled = peel_value_position(cond);
+    match &peeled.x {
+        ExpX::UnaryOpr(UnaryOpr::IsVariant { datatype, variant }, inner) => {
+            let dt = match datatype {
+                vir::ast::Dt::Path(p) => crate::to_lean_type::lean_name_relative(p),
+                _ => return None,
+            };
+            let inner = peel_transparent(inner);
+            let scrut = match &inner.x {
+                ExpX::Var(v) => {
+                    crate::lean_name::LeanName::from_var_ident(v).as_str().to_string()
+                }
+                _ => return None,
+            };
+            Some(crate::lean_ast::BranchTest {
+                scrutinee: scrut,
+                datatype: dt,
+                variant: variant.to_string(),
+                positive,
+            })
+        }
+        _ => None,
+    }
+}
+
 fn check_exp(e: &Exp) -> Result<(), String> {
     sst_exp_to_ast_checked(e).map(|_| ())
 }
@@ -1511,20 +1542,23 @@ impl OblCtx {
     /// Stopping at the first Let preserves the source ordering of
     /// `_tactus_d_old := D` lets and any other let-bound context.
     /// Hyps get synthetic names so they're addressable.
-    fn split_leading_binders(&self) -> (Vec<LBinder>, OblCtx) {
-        let mut binders: Vec<LBinder> = Vec::new();
+    fn split_leading_binders(&self) -> (Vec<(LBinder, Option<HypProvenance>)>, OblCtx) {
+        let mut binders: Vec<(LBinder, Option<HypProvenance>)> = Vec::new();
         let mut remaining = self.clone();
         let mut hyp_counter: usize = 0;
         let mut saw_binder = false;
         loop {
             match remaining.frames.front() {
                 Some(CtxFrame::Binder(b)) => {
-                    binders.push(b.clone());
+                    binders.push((b.clone(), None));
                     remaining.frames.pop_front();
                     saw_binder = true;
                 }
-                Some(CtxFrame::Hyp(p, _)) if saw_binder => {
-                    binders.push(LBinder::explicit(crate::lean_name::LeanName::synthetic(format!("_h_ctx_{}", hyp_counter)), p.clone()));
+                Some(CtxFrame::Hyp(p, prov)) if saw_binder => {
+                    binders.push((
+                        LBinder::explicit(crate::lean_name::LeanName::synthetic(format!("_h_ctx_{}", hyp_counter)), p.clone()),
+                        Some(prov.clone()),
+                    ));
                     hyp_counter += 1;
                     remaining.frames.pop_front();
                 }
@@ -1636,6 +1670,7 @@ impl ObligationEmitter {
     ) {
         let (extras, remaining) = obl.split_leading_binders();
         let shape = self.build_goal_shape(&extras, &remaining, &leaf);
+        let extras: Vec<LBinder> = extras.into_iter().map(|(b, _)| b).collect();
         let goal = remaining.wrap(leaf);
         // For user-tactic emission (assert-by), inject explicit
         // `intro <names>;` for any frames that COULDN'T extract to
@@ -1713,6 +1748,7 @@ impl ObligationEmitter {
     fn emit_split(&mut self, name: String, leaf: LExpr, obl: &OblCtx) {
         let (extras, remaining) = obl.split_leading_binders();
         let shape = self.build_goal_shape(&extras, &remaining, &leaf);
+        let extras: Vec<LBinder> = extras.into_iter().map(|(b, _)| b).collect();
         let goal = remaining.wrap(leaf);
         self.emit_with_extras(
             name, goal, obl.closer.clone(), obl.closer_preamble.clone(), extras,
@@ -1734,19 +1770,22 @@ impl ObligationEmitter {
     /// at the core.
     fn build_goal_shape(
         &self,
-        extras: &[LBinder],
+        extras: &[(LBinder, Option<HypProvenance>)],
         remaining: &OblCtx,
         leaf: &LExpr,
     ) -> GoalShape {
         let mut spine: Vec<GoalSpine> = Vec::new();
-        for b in self.base_binders.iter().chain(extras.iter()) {
-            spine.push(GoalSpine::All(b.clone()));
+        for b in self.base_binders.iter() {
+            spine.push(GoalSpine::All(b.clone(), None));
+        }
+        for (b, prov) in extras.iter() {
+            spine.push(GoalSpine::All(b.clone(), prov.clone()));
         }
         for frame in remaining.frames.iter() {
             spine.push(match frame {
                 CtxFrame::Let(name, v) => GoalSpine::Let(name.clone(), v.clone()),
                 CtxFrame::Hyp(p, prov) => GoalSpine::Imp(p.clone(), prov.clone()),
-                CtxFrame::Binder(b) => GoalSpine::All(b.clone()),
+                CtxFrame::Binder(b) => GoalSpine::All(b.clone(), None),
             });
         }
         GoalShape { spine, leaf: leaf.clone() }
@@ -1964,7 +2003,7 @@ fn walk_obligations<'a>(
             // negation from #114's cond_setup transform). Push as
             // CtxFrame::Hyp directly — same effect as Wp::Assume's
             // arm, minus the `lower` call that already happened.
-            let new_obl = obl.with_frame(CtxFrame::Hyp(hyp.clone(), HypProvenance::Branch));
+            let new_obl = obl.with_frame(CtxFrame::Hyp(hyp.clone(), HypProvenance::Branch(None)));
             walk_obligations(body, ctx, &new_obl, e);
         }
         Wp::AssertBitVector { req_conj, ens_conj, rust_loc, rust_span, body } => {
@@ -2146,12 +2185,18 @@ fn walk_obligations<'a>(
             );
             walk_obligations(
                 then_branch, ctx,
-                &obl.with_frame(CtxFrame::Hyp(cond_marked.clone(), HypProvenance::Branch)),
+                &obl.with_frame(CtxFrame::Hyp(
+                    cond_marked.clone(),
+                    HypProvenance::Branch(branch_test_of(cond.raw(), true)),
+                )),
                 e,
             );
             walk_obligations(
                 else_branch, ctx,
-                &obl.with_frame(CtxFrame::Hyp(LExpr::not(cond_marked), HypProvenance::Branch)),
+                &obl.with_frame(CtxFrame::Hyp(
+                    LExpr::not(cond_marked),
+                    HypProvenance::Branch(branch_test_of(cond.raw(), false)),
+                )),
                 e,
             );
         }
@@ -2452,7 +2497,7 @@ fn walk_loop<'a>(
         maintain_obl.frames.push_back(CtxFrame::Hyp(inv.clone(), HypProvenance::Other));
     }
     if let Some(c) = cond {
-        maintain_obl.frames.push_back(CtxFrame::Hyp(cond_marked(&c), HypProvenance::Branch));
+        maintain_obl.frames.push_back(CtxFrame::Hyp(cond_marked(&c), HypProvenance::Branch(None)));
     }
     // `let _tactus_d_old_<id>_<i> := D_i` — one pre-body snapshot
     // per lex level. Referenced by the body's continue_leaf as
@@ -2487,7 +2532,7 @@ fn walk_loop<'a>(
         use_obl.frames.push_back(CtxFrame::Hyp(inv.clone(), HypProvenance::Other));
     }
     if let Some(c) = cond {
-        use_obl.frames.push_back(CtxFrame::Hyp(LExpr::not(cond_marked(&c)), HypProvenance::Branch));
+        use_obl.frames.push_back(CtxFrame::Hyp(LExpr::not(cond_marked(&c)), HypProvenance::Branch(None)));
     }
     walk_obligations(after, ctx, &use_obl, e);
 }
@@ -4357,9 +4402,15 @@ fn walk_let<'a>(
             )
             .expect("walk_let if-cond: sub of validated Exp tree");
             walk_let(name, then_e, dest_typ, body, ctx,
-                &obl.with_frame(CtxFrame::Hyp(c_ast.clone(), HypProvenance::Branch)), e);
+                &obl.with_frame(CtxFrame::Hyp(
+                    c_ast.clone(),
+                    HypProvenance::Branch(branch_test_of(cond, true)),
+                )), e);
             walk_let(name, else_e, dest_typ, body, ctx,
-                &obl.with_frame(CtxFrame::Hyp(LExpr::not(c_ast), HypProvenance::Branch)), e);
+                &obl.with_frame(CtxFrame::Hyp(
+                    LExpr::not(c_ast),
+                    HypProvenance::Branch(branch_test_of(cond, false)),
+                )), e);
             return;
         }
         // `let outer := (let z := zval; bodyval); rest`

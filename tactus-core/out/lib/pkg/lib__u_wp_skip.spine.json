@@ -1,1 +1,1 @@
-{"fn":"lib__u_wp_skip","vcs":[{"name":"_tactus_postcondition_u_wp_skip_at_lib_3462_13_1","spine":[{"k":"all","name":"f","ty":"lib.FrameList"}]}]}
+{"fn":"lib__u_wp_skip","vcs":[{"name":"_tactus_postcondition_u_wp_skip_at_lib_3462_13_1","leaf":"/- @rust:lib.rs:3462:13 -/ lib.wp_stm f lib.StmData.Skip = lib.GoalList.Nil","spine":[{"k":"all","name":"f","ty":"lib.FrameList"}]}]}

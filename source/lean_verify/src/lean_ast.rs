@@ -269,8 +269,13 @@ pub struct GoalShape {
 /// constructor corresponds to [`GoalShape::leaf`].
 #[derive(Debug, Clone)]
 pub enum GoalSpine {
-    /// `∀ (x : T),` — a theorem-level binder or a walker `Binder` frame.
-    All(Binder),
+    /// `∀ (x : T),` — a theorem-level binder or a walker `Binder`
+    /// frame. The second field carries hypothesis provenance when this
+    /// binder is an ABSORBED leading hyp (`split_leading_binders` names
+    /// leading `P →` frames as `(_h_ctx_N : P)` theorem binders —
+    /// positionally identical, so the discharge generator treats a
+    /// provenance-carrying All exactly like the corresponding Imp).
+    All(Binder, Option<HypProvenance>),
     /// `h →` — a hypothesis (an assumption, a branch condition, or a
     /// discharged assertion carried forward). Carries its provenance
     /// for the Link-discharge generator.
@@ -292,8 +297,10 @@ pub enum HypProvenance {
     CallFact(CallFactInfo),
     /// A branch / discriminator condition (if-cond, lowered-match
     /// `isX` chain, loop cond): discharged by `(by simp)` on a
-    /// constructor-refined arm.
-    Branch,
+    /// constructor-refined arm. Carries the variant test when the cond
+    /// is a lowered-match `IsVariant` check — the discharge generator
+    /// reconstructs match arms from these (L2).
+    Branch(Option<BranchTest>),
     /// The woven height-decrease fact of a recursive call (a passed
     /// Termination assert carried forward): discharged by the emitted
     /// termination VC theorem.
@@ -322,6 +329,23 @@ pub struct SpineArg {
     /// Recipe hint for discharging the callee's `h_*_bound` binder (if
     /// any) at this arg position.
     pub tag: SpineArgTag,
+}
+
+/// A lowered-match discriminator: `scrutinee is variant` (or its
+/// negation). Recorded from the VIR `IsVariant` unary op at the
+/// branch-cond push; `None` on Branch means a non-variant condition
+/// (plain if, loop cond).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BranchTest {
+    /// The tested variable (walker-local — often the match's
+    /// scrutinee-alias let, resolved to a param by the generator).
+    pub scrutinee: String,
+    /// Datatype's rendered relative name (e.g. `GoalList`).
+    pub datatype: String,
+    /// Variant name (e.g. `Cons`).
+    pub variant: String,
+    /// true = the positive `isX` arm; false = the negated else-path.
+    pub positive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

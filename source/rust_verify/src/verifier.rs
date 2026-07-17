@@ -3286,9 +3286,10 @@ impl Verifier {
                     // only; counts also gate acceptance in bootstrap-73.
                     if report.discharge_closed + report.discharge_pending > 0 {
                         reporter.report_now(&note_bare(format!(
-                            "tactus: Link discharge: {} per-fn closed theorem(s) \
-                             (zero-spine); {} proof fn(s) pending (woven premises)",
+                            "tactus: Link discharge: {} per-fn closed theorem(s), \
+                             {} pending ({})",
                             report.discharge_closed, report.discharge_pending,
+                            report.discharge_detail,
                         )).to_any());
                     }
                     // W4a: the in-gate refWp↔production bridge (opt-in

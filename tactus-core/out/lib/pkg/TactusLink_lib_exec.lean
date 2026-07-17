@@ -476,107 +476,176 @@ noncomputable def _tactus_postcondition_wp_sound_bites_assert_at_lib_3954_13_4_c
 noncomputable def _tactus_postcondition_wp_sound_bites_loop_init_at_lib_3975_13_5_closed : _tactus_postcondition_wp_sound_bites_loop_init_at_lib_3975_13_5_stmt :=
   _tactus_postcondition_wp_sound_bites_loop_init_at_lib_3975_13_5
 #tactus_check_axioms _tactus_postcondition_wp_sound_bites_loop_init_at_lib_3975_13_5_closed []
-theorem lib.u_holds_leaf_closed : _tactus_postcondition_u_holds_leaf_at_lib_3245_13_1_stmt := _tactus_postcondition_u_holds_leaf_at_lib_3245_13_1
+namespace lib
+theorem u_holds_leaf_closed : _tactus_postcondition_u_holds_leaf_at_lib_3245_13_1_stmt := _tactus_postcondition_u_holds_leaf_at_lib_3245_13_1_closed
+
+theorem u_holds_imp_closed : _tactus_postcondition_u_holds_imp_at_lib_3249_13_1_stmt := _tactus_postcondition_u_holds_imp_at_lib_3249_13_1_closed
+
+theorem u_holds_all_binder_closed : _tactus_postcondition_u_holds_all_binder_at_lib_3254_13_1_stmt := _tactus_postcondition_u_holds_all_binder_at_lib_3254_13_1_closed
+
+theorem u_holds_let_closed : _tactus_postcondition_u_holds_let_at_lib_3259_13_1_stmt := _tactus_postcondition_u_holds_let_at_lib_3259_13_1_closed
+
+theorem u_holds_leafe_closed : _tactus_postcondition_u_holds_leafe_at_lib_3264_13_1_stmt := _tactus_postcondition_u_holds_leafe_at_lib_3264_13_1_closed
+
+theorem u_holds_all_nil_closed : _tactus_postcondition_u_holds_all_nil_at_lib_3268_13_1_stmt := _tactus_postcondition_u_holds_all_nil_at_lib_3268_13_1_closed
+
+theorem u_holds_all_cons_closed : _tactus_postcondition_u_holds_all_cons_at_lib_3272_13_1_stmt := _tactus_postcondition_u_holds_all_cons_at_lib_3272_13_1_closed
+
+theorem u_obligs_nil_closed : _tactus_postcondition_u_obligs_nil_at_lib_3277_13_1_stmt := _tactus_postcondition_u_obligs_nil_at_lib_3277_13_1_closed
+
+theorem u_obligs_cons_closed : _tactus_postcondition_u_obligs_cons_at_lib_3281_13_1_stmt := _tactus_postcondition_u_obligs_cons_at_lib_3281_13_1_closed
+
+theorem u_cse_nil_closed : _tactus_postcondition_u_cse_nil_at_lib_3286_13_1_stmt := _tactus_postcondition_u_cse_nil_at_lib_3286_13_1_closed
+
+theorem u_cse_bind_closed : _tactus_postcondition_u_cse_bind_at_lib_3291_13_1_stmt := _tactus_postcondition_u_cse_bind_at_lib_3291_13_1_closed
+
+theorem u_cse_hyp_closed : _tactus_postcondition_u_cse_hyp_at_lib_3296_13_1_stmt := _tactus_postcondition_u_cse_hyp_at_lib_3296_13_1_closed
+
+theorem u_cse_let_closed : _tactus_postcondition_u_cse_let_at_lib_3301_13_1_stmt := _tactus_postcondition_u_cse_let_at_lib_3301_13_1_closed
+
+theorem u_cso_nil_closed : _tactus_postcondition_u_cso_nil_at_lib_3306_13_1_stmt := _tactus_postcondition_u_cso_nil_at_lib_3306_13_1_closed
+
+theorem u_cso_bind_closed : _tactus_postcondition_u_cso_bind_at_lib_3311_13_1_stmt := _tactus_postcondition_u_cso_bind_at_lib_3311_13_1_closed
+
+theorem u_cso_hyp_closed : _tactus_postcondition_u_cso_hyp_at_lib_3316_13_1_stmt := _tactus_postcondition_u_cso_hyp_at_lib_3316_13_1_closed
+
+theorem u_cso_let_closed : _tactus_postcondition_u_cso_let_at_lib_3321_13_1_stmt := _tactus_postcondition_u_cso_let_at_lib_3321_13_1_closed
+
+theorem u_esf_assert_closed : _tactus_postcondition_u_esf_assert_at_lib_3326_13_1_stmt := _tactus_postcondition_u_esf_assert_at_lib_3326_13_1_closed
+
+theorem u_esf_assume_closed : _tactus_postcondition_u_esf_assume_at_lib_3331_13_1_stmt := _tactus_postcondition_u_esf_assume_at_lib_3331_13_1_closed
+
+theorem u_esf_assign_closed : _tactus_postcondition_u_esf_assign_at_lib_3335_13_1_stmt := _tactus_postcondition_u_esf_assign_at_lib_3335_13_1_closed
+
+theorem u_esf_call_closed : _tactus_postcondition_u_esf_call_at_lib_3339_13_1_stmt := _tactus_postcondition_u_esf_call_at_lib_3339_13_1_closed
+
+theorem u_esf_deadend_closed : _tactus_postcondition_u_esf_deadend_at_lib_3344_13_1_stmt := _tactus_postcondition_u_esf_deadend_at_lib_3344_13_1_closed
+
+theorem u_esf_ret_closed : _tactus_postcondition_u_esf_ret_at_lib_3349_13_1_stmt := _tactus_postcondition_u_esf_ret_at_lib_3349_13_1_closed
+
+theorem u_esf_if_closed : _tactus_postcondition_u_esf_if_at_lib_3354_13_1_stmt := _tactus_postcondition_u_esf_if_at_lib_3354_13_1_closed
+
+theorem u_esf_loop_closed : _tactus_postcondition_u_esf_loop_at_lib_3363_13_1_stmt := _tactus_postcondition_u_esf_loop_at_lib_3363_13_1_closed
+
+theorem u_esf_skip_closed : _tactus_postcondition_u_esf_skip_at_lib_3380_13_1_stmt := _tactus_postcondition_u_esf_skip_at_lib_3380_13_1_closed
+
+theorem u_esf_seq_closed : _tactus_postcondition_u_esf_seq_at_lib_3384_13_1_stmt := _tactus_postcondition_u_esf_seq_at_lib_3384_13_1_closed
+
+theorem u_close_e_nil_closed : _tactus_postcondition_u_close_e_nil_at_lib_3394_13_1_stmt := _tactus_postcondition_u_close_e_nil_at_lib_3394_13_1_closed
+
+theorem u_close_e_bind_closed : _tactus_postcondition_u_close_e_bind_at_lib_3397_13_1_stmt := _tactus_postcondition_u_close_e_bind_at_lib_3397_13_1_closed
+
+theorem u_close_e_hyp_closed : _tactus_postcondition_u_close_e_hyp_at_lib_3400_13_1_stmt := _tactus_postcondition_u_close_e_hyp_at_lib_3400_13_1_closed
+
+theorem u_close_e_let_closed : _tactus_postcondition_u_close_e_let_at_lib_3403_13_1_stmt := _tactus_postcondition_u_close_e_let_at_lib_3403_13_1_closed
+
+theorem u_cce_nil_closed : _tactus_postcondition_u_cce_nil_at_lib_3406_13_1_stmt := _tactus_postcondition_u_cce_nil_at_lib_3406_13_1_closed
+
+theorem u_cce_cons_closed : _tactus_postcondition_u_cce_cons_at_lib_3409_13_1_stmt := _tactus_postcondition_u_cce_cons_at_lib_3409_13_1_closed
+
+theorem u_gapp_nil_closed : _tactus_postcondition_u_gapp_nil_at_lib_3413_13_1_stmt := _tactus_postcondition_u_gapp_nil_at_lib_3413_13_1_closed
+
+theorem u_gapp_cons_closed : _tactus_postcondition_u_gapp_cons_at_lib_3416_13_1_stmt := _tactus_postcondition_u_gapp_cons_at_lib_3416_13_1_closed
+
+theorem u_wp_assert_closed : _tactus_postcondition_u_wp_assert_at_lib_3420_13_1_stmt := _tactus_postcondition_u_wp_assert_at_lib_3420_13_1_closed
+
+theorem u_wp_assume_closed : _tactus_postcondition_u_wp_assume_at_lib_3424_13_1_stmt := _tactus_postcondition_u_wp_assume_at_lib_3424_13_1_closed
+
+theorem u_wp_assign_closed : _tactus_postcondition_u_wp_assign_at_lib_3427_13_1_stmt := _tactus_postcondition_u_wp_assign_at_lib_3427_13_1_closed
+
+theorem u_wp_call_closed : _tactus_postcondition_u_wp_call_at_lib_3430_13_1_stmt := _tactus_postcondition_u_wp_call_at_lib_3430_13_1_closed
+
+theorem u_wp_deadend_closed : _tactus_postcondition_u_wp_deadend_at_lib_3433_13_1_stmt := _tactus_postcondition_u_wp_deadend_at_lib_3433_13_1_closed
+
+theorem u_wp_ret_closed : _tactus_postcondition_u_wp_ret_at_lib_3436_13_1_stmt := _tactus_postcondition_u_wp_ret_at_lib_3436_13_1_closed
+
+theorem u_wp_if_closed : _tactus_postcondition_u_wp_if_at_lib_3439_13_1_stmt := _tactus_postcondition_u_wp_if_at_lib_3439_13_1_closed
+
+theorem u_wp_loop_closed : _tactus_postcondition_u_wp_loop_at_lib_3448_13_1_stmt := _tactus_postcondition_u_wp_loop_at_lib_3448_13_1_closed
+
+theorem u_wp_skip_closed : _tactus_postcondition_u_wp_skip_at_lib_3462_13_1_stmt := _tactus_postcondition_u_wp_skip_at_lib_3462_13_1_closed
+
+theorem u_wp_seq_closed : _tactus_postcondition_u_wp_seq_at_lib_3465_13_1_stmt := _tactus_postcondition_u_wp_seq_at_lib_3465_13_1_closed
+
+theorem u_ref_wp_closed : _tactus_postcondition_u_ref_wp_at_lib_3741_13_1_stmt := _tactus_postcondition_u_ref_wp_at_lib_3741_13_1_closed
+
+theorem u_fa_assume_closed : _tactus_postcondition_u_fa_assume_at_lib_3761_13_1_stmt := _tactus_postcondition_u_fa_assume_at_lib_3761_13_1_closed
+
+theorem u_fa_deadend_closed : _tactus_postcondition_u_fa_deadend_at_lib_3765_13_1_stmt := _tactus_postcondition_u_fa_deadend_at_lib_3765_13_1_closed
+
+theorem u_fa_seq_closed : _tactus_postcondition_u_fa_seq_at_lib_3768_13_1_stmt := _tactus_postcondition_u_fa_seq_at_lib_3768_13_1_closed
+
+theorem u_fapp_fnil_closed : _tactus_postcondition_u_fapp_fnil_at_lib_3771_13_1_stmt := _tactus_postcondition_u_fapp_fnil_at_lib_3771_13_1_closed
+
+theorem u_fapp_fbind_closed : _tactus_postcondition_u_fapp_fbind_at_lib_3774_13_1_stmt := _tactus_postcondition_u_fapp_fbind_at_lib_3774_13_1_closed
+
+theorem u_fapp_fhyp_closed : _tactus_postcondition_u_fapp_fhyp_at_lib_3778_13_1_stmt := _tactus_postcondition_u_fapp_fhyp_at_lib_3778_13_1_closed
+
+theorem holds_all_append_closed (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (a : lib.GoalList) (b : lib.GoalList) (st : Int → Int) :
+    (lib.holds_all hp he lv (lib.goals_append a b) st = (lib.holds_all hp he lv a st ∧ lib.holds_all hp he lv b st)) :=
+  match a with
+  | GoalList.Nil =>
+      _tactus_postcondition_holds_all_append_at_lib_3514_13_3 hp he lv (GoalList.Nil) b st (by simp) () (u_gapp_nil_closed b) () (u_holds_all_nil_closed hp he lv)
+  | GoalList.Cons g t =>
+      let tmp__1 := lib.goals_append t.deref b;
+      have hdec := _tactus_termination_holds_all_append_at_lib_3527_13_7 hp he lv (GoalList.Cons g t) b st (by simp) () (u_gapp_cons_closed g t b) () (u_holds_all_cons_closed hp he lv g t) () (u_holds_all_cons_closed hp he lv g (Tactus.Box.mk tmp__1))
+      _tactus_postcondition_holds_all_append_at_lib_3514_13_9 hp he lv (GoalList.Cons g t) b st (by simp) () (u_gapp_cons_closed g t b) () (u_holds_all_cons_closed hp he lv g t) () (u_holds_all_cons_closed hp he lv g (Tactus.Box.mk tmp__1)) hdec () (holds_all_append_closed hp he lv t.deref b st)
+termination_by lib.GoalList.height a
+decreasing_by
+  · exact (_tactus_termination_holds_all_append_at_lib_3527_13_7 hp he lv (GoalList.Cons g t) b st (by simp) () (u_gapp_cons_closed g t b) () (u_holds_all_cons_closed hp he lv g t) () (u_holds_all_cons_closed hp he lv g (Tactus.Box.mk tmp__1))
+      ).resolve_right (fun h => h.2.elim)
+
+end lib
 #tactus_check_axioms lib.u_holds_leaf_closed []
-theorem lib.u_holds_imp_closed : _tactus_postcondition_u_holds_imp_at_lib_3249_13_1_stmt := _tactus_postcondition_u_holds_imp_at_lib_3249_13_1
 #tactus_check_axioms lib.u_holds_imp_closed []
-theorem lib.u_holds_all_binder_closed : _tactus_postcondition_u_holds_all_binder_at_lib_3254_13_1_stmt := _tactus_postcondition_u_holds_all_binder_at_lib_3254_13_1
 #tactus_check_axioms lib.u_holds_all_binder_closed []
-theorem lib.u_holds_let_closed : _tactus_postcondition_u_holds_let_at_lib_3259_13_1_stmt := _tactus_postcondition_u_holds_let_at_lib_3259_13_1
 #tactus_check_axioms lib.u_holds_let_closed []
-theorem lib.u_holds_leafe_closed : _tactus_postcondition_u_holds_leafe_at_lib_3264_13_1_stmt := _tactus_postcondition_u_holds_leafe_at_lib_3264_13_1
 #tactus_check_axioms lib.u_holds_leafe_closed []
-theorem lib.u_holds_all_nil_closed : _tactus_postcondition_u_holds_all_nil_at_lib_3268_13_1_stmt := _tactus_postcondition_u_holds_all_nil_at_lib_3268_13_1
 #tactus_check_axioms lib.u_holds_all_nil_closed []
-theorem lib.u_holds_all_cons_closed : _tactus_postcondition_u_holds_all_cons_at_lib_3272_13_1_stmt := _tactus_postcondition_u_holds_all_cons_at_lib_3272_13_1
 #tactus_check_axioms lib.u_holds_all_cons_closed []
-theorem lib.u_obligs_nil_closed : _tactus_postcondition_u_obligs_nil_at_lib_3277_13_1_stmt := _tactus_postcondition_u_obligs_nil_at_lib_3277_13_1
 #tactus_check_axioms lib.u_obligs_nil_closed []
-theorem lib.u_obligs_cons_closed : _tactus_postcondition_u_obligs_cons_at_lib_3281_13_1_stmt := _tactus_postcondition_u_obligs_cons_at_lib_3281_13_1
 #tactus_check_axioms lib.u_obligs_cons_closed []
-theorem lib.u_cse_nil_closed : _tactus_postcondition_u_cse_nil_at_lib_3286_13_1_stmt := _tactus_postcondition_u_cse_nil_at_lib_3286_13_1
 #tactus_check_axioms lib.u_cse_nil_closed []
-theorem lib.u_cse_bind_closed : _tactus_postcondition_u_cse_bind_at_lib_3291_13_1_stmt := _tactus_postcondition_u_cse_bind_at_lib_3291_13_1
 #tactus_check_axioms lib.u_cse_bind_closed []
-theorem lib.u_cse_hyp_closed : _tactus_postcondition_u_cse_hyp_at_lib_3296_13_1_stmt := _tactus_postcondition_u_cse_hyp_at_lib_3296_13_1
 #tactus_check_axioms lib.u_cse_hyp_closed []
-theorem lib.u_cse_let_closed : _tactus_postcondition_u_cse_let_at_lib_3301_13_1_stmt := _tactus_postcondition_u_cse_let_at_lib_3301_13_1
 #tactus_check_axioms lib.u_cse_let_closed []
-theorem lib.u_cso_nil_closed : _tactus_postcondition_u_cso_nil_at_lib_3306_13_1_stmt := _tactus_postcondition_u_cso_nil_at_lib_3306_13_1
 #tactus_check_axioms lib.u_cso_nil_closed []
-theorem lib.u_cso_bind_closed : _tactus_postcondition_u_cso_bind_at_lib_3311_13_1_stmt := _tactus_postcondition_u_cso_bind_at_lib_3311_13_1
 #tactus_check_axioms lib.u_cso_bind_closed []
-theorem lib.u_cso_hyp_closed : _tactus_postcondition_u_cso_hyp_at_lib_3316_13_1_stmt := _tactus_postcondition_u_cso_hyp_at_lib_3316_13_1
 #tactus_check_axioms lib.u_cso_hyp_closed []
-theorem lib.u_cso_let_closed : _tactus_postcondition_u_cso_let_at_lib_3321_13_1_stmt := _tactus_postcondition_u_cso_let_at_lib_3321_13_1
 #tactus_check_axioms lib.u_cso_let_closed []
-theorem lib.u_esf_assert_closed : _tactus_postcondition_u_esf_assert_at_lib_3326_13_1_stmt := _tactus_postcondition_u_esf_assert_at_lib_3326_13_1
 #tactus_check_axioms lib.u_esf_assert_closed []
-theorem lib.u_esf_assume_closed : _tactus_postcondition_u_esf_assume_at_lib_3331_13_1_stmt := _tactus_postcondition_u_esf_assume_at_lib_3331_13_1
 #tactus_check_axioms lib.u_esf_assume_closed []
-theorem lib.u_esf_assign_closed : _tactus_postcondition_u_esf_assign_at_lib_3335_13_1_stmt := _tactus_postcondition_u_esf_assign_at_lib_3335_13_1
 #tactus_check_axioms lib.u_esf_assign_closed []
-theorem lib.u_esf_call_closed : _tactus_postcondition_u_esf_call_at_lib_3339_13_1_stmt := _tactus_postcondition_u_esf_call_at_lib_3339_13_1
 #tactus_check_axioms lib.u_esf_call_closed []
-theorem lib.u_esf_deadend_closed : _tactus_postcondition_u_esf_deadend_at_lib_3344_13_1_stmt := _tactus_postcondition_u_esf_deadend_at_lib_3344_13_1
 #tactus_check_axioms lib.u_esf_deadend_closed []
-theorem lib.u_esf_ret_closed : _tactus_postcondition_u_esf_ret_at_lib_3349_13_1_stmt := _tactus_postcondition_u_esf_ret_at_lib_3349_13_1
 #tactus_check_axioms lib.u_esf_ret_closed []
-theorem lib.u_esf_if_closed : _tactus_postcondition_u_esf_if_at_lib_3354_13_1_stmt := _tactus_postcondition_u_esf_if_at_lib_3354_13_1
 #tactus_check_axioms lib.u_esf_if_closed []
-theorem lib.u_esf_loop_closed : _tactus_postcondition_u_esf_loop_at_lib_3363_13_1_stmt := _tactus_postcondition_u_esf_loop_at_lib_3363_13_1
 #tactus_check_axioms lib.u_esf_loop_closed []
-theorem lib.u_esf_skip_closed : _tactus_postcondition_u_esf_skip_at_lib_3380_13_1_stmt := _tactus_postcondition_u_esf_skip_at_lib_3380_13_1
 #tactus_check_axioms lib.u_esf_skip_closed []
-theorem lib.u_esf_seq_closed : _tactus_postcondition_u_esf_seq_at_lib_3384_13_1_stmt := _tactus_postcondition_u_esf_seq_at_lib_3384_13_1
 #tactus_check_axioms lib.u_esf_seq_closed []
-theorem lib.u_close_e_nil_closed : _tactus_postcondition_u_close_e_nil_at_lib_3394_13_1_stmt := _tactus_postcondition_u_close_e_nil_at_lib_3394_13_1
 #tactus_check_axioms lib.u_close_e_nil_closed []
-theorem lib.u_close_e_bind_closed : _tactus_postcondition_u_close_e_bind_at_lib_3397_13_1_stmt := _tactus_postcondition_u_close_e_bind_at_lib_3397_13_1
 #tactus_check_axioms lib.u_close_e_bind_closed []
-theorem lib.u_close_e_hyp_closed : _tactus_postcondition_u_close_e_hyp_at_lib_3400_13_1_stmt := _tactus_postcondition_u_close_e_hyp_at_lib_3400_13_1
 #tactus_check_axioms lib.u_close_e_hyp_closed []
-theorem lib.u_close_e_let_closed : _tactus_postcondition_u_close_e_let_at_lib_3403_13_1_stmt := _tactus_postcondition_u_close_e_let_at_lib_3403_13_1
 #tactus_check_axioms lib.u_close_e_let_closed []
-theorem lib.u_cce_nil_closed : _tactus_postcondition_u_cce_nil_at_lib_3406_13_1_stmt := _tactus_postcondition_u_cce_nil_at_lib_3406_13_1
 #tactus_check_axioms lib.u_cce_nil_closed []
-theorem lib.u_cce_cons_closed : _tactus_postcondition_u_cce_cons_at_lib_3409_13_1_stmt := _tactus_postcondition_u_cce_cons_at_lib_3409_13_1
 #tactus_check_axioms lib.u_cce_cons_closed []
-theorem lib.u_gapp_nil_closed : _tactus_postcondition_u_gapp_nil_at_lib_3413_13_1_stmt := _tactus_postcondition_u_gapp_nil_at_lib_3413_13_1
 #tactus_check_axioms lib.u_gapp_nil_closed []
-theorem lib.u_gapp_cons_closed : _tactus_postcondition_u_gapp_cons_at_lib_3416_13_1_stmt := _tactus_postcondition_u_gapp_cons_at_lib_3416_13_1
 #tactus_check_axioms lib.u_gapp_cons_closed []
-theorem lib.u_wp_assert_closed : _tactus_postcondition_u_wp_assert_at_lib_3420_13_1_stmt := _tactus_postcondition_u_wp_assert_at_lib_3420_13_1
 #tactus_check_axioms lib.u_wp_assert_closed []
-theorem lib.u_wp_assume_closed : _tactus_postcondition_u_wp_assume_at_lib_3424_13_1_stmt := _tactus_postcondition_u_wp_assume_at_lib_3424_13_1
 #tactus_check_axioms lib.u_wp_assume_closed []
-theorem lib.u_wp_assign_closed : _tactus_postcondition_u_wp_assign_at_lib_3427_13_1_stmt := _tactus_postcondition_u_wp_assign_at_lib_3427_13_1
 #tactus_check_axioms lib.u_wp_assign_closed []
-theorem lib.u_wp_call_closed : _tactus_postcondition_u_wp_call_at_lib_3430_13_1_stmt := _tactus_postcondition_u_wp_call_at_lib_3430_13_1
 #tactus_check_axioms lib.u_wp_call_closed []
-theorem lib.u_wp_deadend_closed : _tactus_postcondition_u_wp_deadend_at_lib_3433_13_1_stmt := _tactus_postcondition_u_wp_deadend_at_lib_3433_13_1
 #tactus_check_axioms lib.u_wp_deadend_closed []
-theorem lib.u_wp_ret_closed : _tactus_postcondition_u_wp_ret_at_lib_3436_13_1_stmt := _tactus_postcondition_u_wp_ret_at_lib_3436_13_1
 #tactus_check_axioms lib.u_wp_ret_closed []
-theorem lib.u_wp_if_closed : _tactus_postcondition_u_wp_if_at_lib_3439_13_1_stmt := _tactus_postcondition_u_wp_if_at_lib_3439_13_1
 #tactus_check_axioms lib.u_wp_if_closed []
-theorem lib.u_wp_loop_closed : _tactus_postcondition_u_wp_loop_at_lib_3448_13_1_stmt := _tactus_postcondition_u_wp_loop_at_lib_3448_13_1
 #tactus_check_axioms lib.u_wp_loop_closed []
-theorem lib.u_wp_skip_closed : _tactus_postcondition_u_wp_skip_at_lib_3462_13_1_stmt := _tactus_postcondition_u_wp_skip_at_lib_3462_13_1
 #tactus_check_axioms lib.u_wp_skip_closed []
-theorem lib.u_wp_seq_closed : _tactus_postcondition_u_wp_seq_at_lib_3465_13_1_stmt := _tactus_postcondition_u_wp_seq_at_lib_3465_13_1
 #tactus_check_axioms lib.u_wp_seq_closed []
-theorem lib.u_ref_wp_closed : _tactus_postcondition_u_ref_wp_at_lib_3741_13_1_stmt := _tactus_postcondition_u_ref_wp_at_lib_3741_13_1
 #tactus_check_axioms lib.u_ref_wp_closed []
-theorem lib.u_fa_assume_closed : _tactus_postcondition_u_fa_assume_at_lib_3761_13_1_stmt := _tactus_postcondition_u_fa_assume_at_lib_3761_13_1
 #tactus_check_axioms lib.u_fa_assume_closed []
-theorem lib.u_fa_deadend_closed : _tactus_postcondition_u_fa_deadend_at_lib_3765_13_1_stmt := _tactus_postcondition_u_fa_deadend_at_lib_3765_13_1
 #tactus_check_axioms lib.u_fa_deadend_closed []
-theorem lib.u_fa_seq_closed : _tactus_postcondition_u_fa_seq_at_lib_3768_13_1_stmt := _tactus_postcondition_u_fa_seq_at_lib_3768_13_1
 #tactus_check_axioms lib.u_fa_seq_closed []
-theorem lib.u_fapp_fnil_closed : _tactus_postcondition_u_fapp_fnil_at_lib_3771_13_1_stmt := _tactus_postcondition_u_fapp_fnil_at_lib_3771_13_1
 #tactus_check_axioms lib.u_fapp_fnil_closed []
-theorem lib.u_fapp_fbind_closed : _tactus_postcondition_u_fapp_fbind_at_lib_3774_13_1_stmt := _tactus_postcondition_u_fapp_fbind_at_lib_3774_13_1
 #tactus_check_axioms lib.u_fapp_fbind_closed []
-theorem lib.u_fapp_fhyp_closed : _tactus_postcondition_u_fapp_fhyp_at_lib_3778_13_1_stmt := _tactus_postcondition_u_fapp_fhyp_at_lib_3778_13_1
 #tactus_check_axioms lib.u_fapp_fhyp_closed []
+#tactus_check_axioms lib.holds_all_append_closed []
