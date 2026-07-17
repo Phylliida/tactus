@@ -90,40 +90,6 @@ inductive lib.RetBind where
   match x with | lib.RetBind.RetLet _ val1 => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.RetBind.height (_ : lib.RetBind) : Nat :=
   1
-inductive lib.FrameList where
-  | FNil
-  | FBind (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
-  | FHyp (val0 : Int) (val1 : Tactus.Box lib.FrameList)
-  | FLet (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
-  deriving Inhabited
-@[simp] noncomputable def lib.FrameList.isFNil (x : lib.FrameList) : Prop :=
-  match x with | lib.FrameList.FNil => True | _ => False
-@[simp] noncomputable def lib.FrameList.isFBind (x : lib.FrameList) : Prop :=
-  match x with | lib.FrameList.FBind _ _ _ => True | _ => False
-@[simp] noncomputable def lib.FrameList.isFHyp (x : lib.FrameList) : Prop :=
-  match x with | lib.FrameList.FHyp _ _ => True | _ => False
-@[simp] noncomputable def lib.FrameList.isFLet (x : lib.FrameList) : Prop :=
-  match x with | lib.FrameList.FLet _ _ _ => True | _ => False
-@[simp] noncomputable def lib.FrameList.FBind_val0 (x : lib.FrameList) : Int :=
-  match x with | lib.FrameList.FBind val0 _ _ => val0 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.FrameList.FBind_val1 (x : lib.FrameList) : Int :=
-  match x with | lib.FrameList.FBind _ val1 _ => val1 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.FrameList.FBind_val2 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
-  match x with | lib.FrameList.FBind _ _ val2 => val2 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.FrameList.FHyp_val0 (x : lib.FrameList) : Int :=
-  match x with | lib.FrameList.FHyp val0 _ => val0 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.FrameList.FHyp_val1 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
-  match x with | lib.FrameList.FHyp _ val1 => val1 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.FrameList.FLet_val0 (x : lib.FrameList) : Int :=
-  match x with | lib.FrameList.FLet val0 _ _ => val0 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.FrameList.FLet_val1 (x : lib.FrameList) : Int :=
-  match x with | lib.FrameList.FLet _ val1 _ => val1 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.FrameList.FLet_val2 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
-  match x with | lib.FrameList.FLet _ _ val2 => val2 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.FrameList.height (s : lib.FrameList) : Nat :=
-  match s with | lib.FrameList.FNil => 1 | lib.FrameList.FBind _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FHyp _ val1 => 1 + lib.FrameList.height val1.deref | lib.FrameList.FLet _ _ val2 => 1 + lib.FrameList.height val2.deref
-termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
 inductive lib.TypData where
   | TyInt
   | TyNat
@@ -172,13 +138,13 @@ inductive lib.RawExp where
   | ForallR (val0 : Int) (val1 : lib.TypData) (val2 : Tactus.Box lib.RawExp)
   | ExistsR (val0 : Int) (val1 : lib.TypData) (val2 : Tactus.Box lib.RawExp)
   deriving Inhabited
-inductive lib.RawList where
-  | Nil
-  | Cons (val0 : Tactus.Box lib.RawExp) (val1 : Tactus.Box lib.RawList)
-  deriving Inhabited
 inductive lib.RawArmList where
   | Nil
   | Cons (val0 : Int) (val1 : lib.BinderIdList) (val2 : Tactus.Box lib.RawExp) (val3 : Tactus.Box lib.RawArmList)
+  deriving Inhabited
+inductive lib.RawList where
+  | Nil
+  | Cons (val0 : Tactus.Box lib.RawExp) (val1 : Tactus.Box lib.RawList)
   deriving Inhabited
 end
 
@@ -302,14 +268,6 @@ end
   match x with | lib.RawExp.ExistsR _ val1 _ => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.RawExp.ExistsR_val2 (x : lib.RawExp) : Tactus.Box lib.RawExp :=
   match x with | lib.RawExp.ExistsR _ _ val2 => val2 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.RawList.isNil (x : lib.RawList) : Prop :=
-  match x with | lib.RawList.Nil => True | _ => False
-@[simp] noncomputable def lib.RawList.isCons (x : lib.RawList) : Prop :=
-  match x with | lib.RawList.Cons _ _ => True | _ => False
-@[simp] noncomputable def lib.RawList.Cons_val0 (x : lib.RawList) : Tactus.Box lib.RawExp :=
-  match x with | lib.RawList.Cons val0 _ => val0 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.RawList.Cons_val1 (x : lib.RawList) : Tactus.Box lib.RawList :=
-  match x with | lib.RawList.Cons _ val1 => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.RawArmList.isNil (x : lib.RawArmList) : Prop :=
   match x with | lib.RawArmList.Nil => True | _ => False
 @[simp] noncomputable def lib.RawArmList.isCons (x : lib.RawArmList) : Prop :=
@@ -322,17 +280,25 @@ end
   match x with | lib.RawArmList.Cons _ _ val2 _ => val2 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.RawArmList.Cons_val3 (x : lib.RawArmList) : Tactus.Box lib.RawArmList :=
   match x with | lib.RawArmList.Cons _ _ _ val3 => val3 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.RawList.isNil (x : lib.RawList) : Prop :=
+  match x with | lib.RawList.Nil => True | _ => False
+@[simp] noncomputable def lib.RawList.isCons (x : lib.RawList) : Prop :=
+  match x with | lib.RawList.Cons _ _ => True | _ => False
+@[simp] noncomputable def lib.RawList.Cons_val0 (x : lib.RawList) : Tactus.Box lib.RawExp :=
+  match x with | lib.RawList.Cons val0 _ => val0 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.RawList.Cons_val1 (x : lib.RawList) : Tactus.Box lib.RawList :=
+  match x with | lib.RawList.Cons _ val1 => val1 | _ => Classical.ofNonempty
 mutual
 @[simp] noncomputable def lib.RawExp.height (s : lib.RawExp) : Nat :=
   match s with | lib.RawExp.Var _ _ => 1 | lib.RawExp.Lit _ _ => 1 | lib.RawExp.LitBool _ => 1 | lib.RawExp.Clip _ val1 => 1 + lib.RawExp.height val1.deref | lib.RawExp.BinOp _ _ val2 val3 => 1 + lib.RawExp.height val2.deref + lib.RawExp.height val3.deref | lib.RawExp.Call _ _ val2 _ => 1 + lib.RawExp.height val2.deref | lib.RawExp.Field _ _ val2 => 1 + lib.RawExp.height val2.deref | lib.RawExp.HasType _ val1 => 1 + lib.RawExp.height val1.deref | lib.RawExp.Deref val0 => 1 + lib.RawExp.height val0.deref | lib.RawExp.Let _ val1 val2 => 1 + lib.RawExp.height val1.deref + lib.RawExp.height val2.deref | lib.RawExp.Not val0 => 1 + lib.RawExp.height val0.deref | lib.RawExp.Span _ val1 => 1 + lib.RawExp.height val1.deref | lib.RawExp.Ite _ val1 val2 val3 => 1 + lib.RawExp.height val1.deref + lib.RawExp.height val2.deref + lib.RawExp.height val3.deref | lib.RawExp.MatchR val0 val1 _ => 1 + lib.RawExp.height val0.deref + lib.RawArmList.height val1.deref | lib.RawExp.CallN _ _ val2 => 1 + lib.RawList.height val2.deref | lib.RawExp.ForallR _ _ val2 => 1 + lib.RawExp.height val2.deref | lib.RawExp.ExistsR _ _ val2 => 1 + lib.RawExp.height val2.deref
 termination_by sizeOf s
 decreasing_by all_goals (simp_all; omega)
-@[simp] noncomputable def lib.RawList.height (s : lib.RawList) : Nat :=
-  match s with | lib.RawList.Nil => 1 | lib.RawList.Cons val0 val1 => 1 + lib.RawExp.height val0.deref + lib.RawList.height val1.deref
-termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
 @[simp] noncomputable def lib.RawArmList.height (s : lib.RawArmList) : Nat :=
   match s with | lib.RawArmList.Nil => 1 | lib.RawArmList.Cons _ _ val2 val3 => 1 + lib.RawExp.height val2.deref + lib.RawArmList.height val3.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
+@[simp] noncomputable def lib.RawList.height (s : lib.RawList) : Nat :=
+  match s with | lib.RawList.Nil => 1 | lib.RawList.Cons val0 val1 => 1 + lib.RawExp.height val0.deref + lib.RawList.height val1.deref
 termination_by sizeOf s
 decreasing_by all_goals (simp_all; omega)
 end
@@ -351,6 +317,40 @@ inductive lib.RawExpList where
   match x with | lib.RawExpList.Cons _ val1 => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.RawExpList.height (s : lib.RawExpList) : Nat :=
   match s with | lib.RawExpList.Nil => 1 | lib.RawExpList.Cons _ val1 => 1 + lib.RawExpList.height val1.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all; omega)
+inductive lib.FrameList where
+  | FNil
+  | FBind (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
+  | FHyp (val0 : Int) (val1 : Tactus.Box lib.FrameList)
+  | FLet (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
+  deriving Inhabited
+@[simp] noncomputable def lib.FrameList.isFNil (x : lib.FrameList) : Prop :=
+  match x with | lib.FrameList.FNil => True | _ => False
+@[simp] noncomputable def lib.FrameList.isFBind (x : lib.FrameList) : Prop :=
+  match x with | lib.FrameList.FBind _ _ _ => True | _ => False
+@[simp] noncomputable def lib.FrameList.isFHyp (x : lib.FrameList) : Prop :=
+  match x with | lib.FrameList.FHyp _ _ => True | _ => False
+@[simp] noncomputable def lib.FrameList.isFLet (x : lib.FrameList) : Prop :=
+  match x with | lib.FrameList.FLet _ _ _ => True | _ => False
+@[simp] noncomputable def lib.FrameList.FBind_val0 (x : lib.FrameList) : Int :=
+  match x with | lib.FrameList.FBind val0 _ _ => val0 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FBind_val1 (x : lib.FrameList) : Int :=
+  match x with | lib.FrameList.FBind _ val1 _ => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FBind_val2 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
+  match x with | lib.FrameList.FBind _ _ val2 => val2 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FHyp_val0 (x : lib.FrameList) : Int :=
+  match x with | lib.FrameList.FHyp val0 _ => val0 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FHyp_val1 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
+  match x with | lib.FrameList.FHyp _ val1 => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FLet_val0 (x : lib.FrameList) : Int :=
+  match x with | lib.FrameList.FLet val0 _ _ => val0 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FLet_val1 (x : lib.FrameList) : Int :=
+  match x with | lib.FrameList.FLet _ val1 _ => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FLet_val2 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
+  match x with | lib.FrameList.FLet _ _ val2 => val2 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.height (s : lib.FrameList) : Nat :=
+  match s with | lib.FrameList.FNil => 1 | lib.FrameList.FBind _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FHyp _ val1 => 1 + lib.FrameList.height val1.deref | lib.FrameList.FLet _ _ val2 => 1 + lib.FrameList.height val2.deref
 termination_by sizeOf s
 decreasing_by all_goals (simp_all; omega)
 inductive lib.StmData where
