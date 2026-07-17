@@ -1071,6 +1071,9 @@ pub fn exec_fn_theorems_to_ast<'a>(
         tactic_prefix,
         default_closer,
         heartbeats: fn_sst.x.attrs.tactus_heartbeats,
+        dt_inventory: std::sync::Arc::new(
+            crate::to_lean_fn::datatype_simp_def_inventory(&krate.datatypes),
+        ),
     };
 
     // Initial OblCtx frames per `&mut` param. Two frames per:
@@ -1685,6 +1688,13 @@ struct ObligationEmitter {
     /// emitted from this fn gets the heartbeats value attached
     /// (rendered as `set_option maxHeartbeats N in` by the pp).
     heartbeats: Option<u32>,
+    /// Generated-datatype def names (discriminators / accessors /
+    /// heights) for the structural rung's derived unfold lists — see
+    /// `tactic_select::structural_rung`. Built once per fn from the
+    /// krate (`to_lean_fn::datatype_simp_def_inventory`); empty for
+    /// shell emitters (leaf rendering), where the derived closer is
+    /// never consulted.
+    dt_inventory: std::sync::Arc<crate::tactic_select::DtDefInventory>,
 }
 
 impl ObligationEmitter {
@@ -1869,9 +1879,12 @@ impl ObligationEmitter {
                     Some(sel) => Tactic::Raw(sel.tactic_text(&goal)),
                     // S2c (§3.4): no fragment answer → the derived
                     // default closer (kernel rungs + explicit peel +
-                    // fixed CORE normalizer), replacing the
-                    // `tactus_auto` search.
-                    None => Tactic::Raw(crate::tactic_select::derived_closer(&goal)),
+                    // fixed CORE normalizer + structural rung),
+                    // replacing the `tactus_auto` search.
+                    None => Tactic::Raw(crate::tactic_select::derived_closer(
+                        &goal,
+                        &self.dt_inventory,
+                    )),
                 }
             }
             _ => closer,
@@ -1883,7 +1896,7 @@ impl ObligationEmitter {
             if text.contains(crate::tactic_select::DERIVED_MARKER) {
                 closer = Tactic::Raw(text.replace(
                     crate::tactic_select::DERIVED_MARKER,
-                    &crate::tactic_select::derived_closer(&goal),
+                    &crate::tactic_select::derived_closer(&goal, &self.dt_inventory),
                 ));
             }
         }
@@ -4265,6 +4278,7 @@ pub(crate) fn cert_call_leaves<'a>(
         tactic_prefix: Vec::new(),
         default_closer: Tactic::Named("tactus_auto".to_string()),
         heartbeats: None,
+        dt_inventory: Default::default(),
     };
     let arg_rctx = crate::expr_shared::RenderCtx::with_fn_map(fn_map)
         .with_binder_typs(caller_param_typs);
