@@ -3,7 +3,7 @@ title: "Link discharge — premise-free closed theorems per proof fn (spec: DESI
 status: in_progress
 claimed_by: fable-b73
 created: 2026-07-16T23:30:00Z
-updated: 2026-07-17T19:30:00Z
+updated: 2026-07-18T09:00:00Z
 ---
 
 ## Description
@@ -264,3 +264,21 @@ Danielle (naming / default-on / theorem-vs-def).
     equation lemmas for Box-recursing defs) — structural defs should
     iota-reduce on ctor scrutinees, but PROBE FIRST (hand-write
     ret_frame_wf against the current emission before mechanizing).
+
+- (2026-07-18 am, fable-b73) **PROBE35 PASS (`e919c3f`, probe-w0/
+  probe35_wf_preservation): wf-preservation archetype VALIDATED, first
+  elaboration, ZERO axioms.** `frame_append_wf` (structural recursion
+  through Box.deref — rec_1 territory) + `ret_frame_wf` (the actual
+  wp_stm_sound demand site) both elaborate as pure terms: match-mirror
+  + anonymous constructors + `termination_by structural`. No tactics,
+  no equation lemmas — defeq iota whnfs through spec fn + wf pred +
+  Box.mk/.deref. **Key insight: the proof term is ISOMORPHIC to the
+  spec fn's own body** — ctor ↦ ⟨comps⟩, rec call ↦ rec lemma, spec-fn
+  call ↦ its _wf lemma, let ↦ let, if ↦ dependent if. Synthesizer =
+  defs-renderer walk emitting ⟨⟩-terms instead of values.
+  Demand set for 67/67 (~12 lemmas, one archetype): ret_frame,
+  frame_append, frame_after, loop_maintain_frame, loop_use_frame,
+  havoc_lets, seed_params, binders_to_frame, seed_binders_hyp_bounds,
+  binderprops_to_hyps, seed_frame (+ RetBindWf conjunct via StmData
+  scrut component). NEXT = R-c: the preservation synthesizer in
+  generate.rs over the same IR the defs renderer consumes.
