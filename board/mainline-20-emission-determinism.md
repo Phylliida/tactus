@@ -66,4 +66,4 @@ false-red pattern). Order is now pinned by construction.
 
 - Pinned-binary hammer: 25/25 per probe, 3/3 tactus-core (fbc2aff3…),
   141/0 each rep, on the branch synced to main @ eca810f.
-- e2e suite via vargo: see branch record (target: match main's 550/1).
+- e2e suite via vargo on the hardened branch: **550/1 in 77s** — identical failure set to main (test_exec_vec_field_index_clone, the known N3-customer residue). Zero regressions.
