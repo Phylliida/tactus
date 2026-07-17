@@ -154,6 +154,24 @@ pub struct Ctx<'a> {
     pub ns: &'a str,
 }
 
+/// N2 match-splitting: a mid-spine `∀ ({scrut}_val{i} : T)` field
+/// binder. In a fix arm the scrutinee is destructured, so the right
+/// instantiation is the pattern's i-th argument.
+fn n2_field_binder_token(name: &str, env: &AppEnv) -> Option<String> {
+    let (p, pat) = env.scrut_subst?;
+    let base = if let Some(rest) = name.strip_prefix(p) {
+        rest
+    } else if let Some(a) = env.scrut_alias {
+        name.strip_prefix(a)?
+    } else {
+        return None;
+    };
+    let acc = base.strip_prefix('_')?;
+    let idx = env.arm_accessors.iter().position(|a| a == acc)?;
+    let toks: Vec<&str> = pat.split_whitespace().collect();
+    toks.get(idx + 1).map(|t| t.to_string())
+}
+
 /// Strip balanced outer paren layers: `((X))` → `X`, but `(A) (B)`
 /// stays intact (the closing paren of the first token is not the last
 /// char). Depth-aware — never produces unbalanced fragments.
@@ -477,6 +495,13 @@ struct AppEnv<'a> {
     fn_rel: &'a str,
     /// Scrutinee param name → the arm's pattern expression (fix arms).
     scrut_subst: Option<(&'a str, &'a str)>,
+    /// The scrutinee's projection-let alias (`tmp___0`) — N2 field
+    /// binders (`tmp___0_val0`) are named after it.
+    scrut_alias: Option<&'a str>,
+    /// The current arm's variant field accessors, in declaration order
+    /// (`val0`… positional / `reqs`… named) — maps an N2 field binder
+    /// suffix to its pattern position.
+    arm_accessors: &'a [String],
     /// Names for the `have hdec{j}` bindings, consumed in order.
     hdec_names: &'a [String],
     /// Callee sidecars — the callee's leading Alls give the
@@ -524,6 +549,12 @@ fn app_args(vc: &Vc, upto: Option<usize>, env: &AppEnv) -> Result<Vec<String>, S
                     }
                 } else if ty == "Unit" {
                     args.push("()".to_string());
+                } else if let Some(tok) = n2_field_binder_token(name, env) {
+                    // N2 match-splitting field binder ({scrut}_val{i}):
+                    // instantiate with the arm's pattern binder; the
+                    // constructor-equation premise that follows becomes
+                    // rfl-shaped and closes via the usual `(by simp)`.
+                    args.push(tok);
                 } else {
                     return Err(format!("value-returning callee binder {}", name));
                 }
@@ -892,6 +923,8 @@ fn close_straight_line(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, 
         let env = AppEnv {
             fn_rel: rel,
             scrut_subst: None,
+            scrut_alias: None,
+            arm_accessors: &[],
             hdec_names: &[],
             sidecars: ctx.sidecars,
             own_lead: lead,
@@ -1233,8 +1266,9 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
             .enumerate()
             .map(|(i, n)| match n {
                 Some(n) => n.clone(),
-                None if alias_referenced => format!("_pb{}", i),
-                None => "_".to_string(),
+                // Always named (never `_`): N2 field binders in the VC
+                // statement instantiate with the pattern's tokens.
+                None => format!("_pb{}", i),
             })
             .collect();
         let pattern = if arity == 0 {
@@ -1242,6 +1276,11 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
         } else {
             format!("{}.{} {}", dt, variant, binder_texts.join(" "))
         };
+        let arm_accessor_list: Vec<String> = field_accessor
+            .iter()
+            .enumerate()
+            .map(|(i, a)| a.clone().unwrap_or_else(|| format!("val{}", i)))
+            .collect();
         // R-b: arm wf destructuring + component lookup table.
         let mut arm_comps: HashMap<String, (String, bool)> = HashMap::new();
         let wf_pattern: Option<String> = if need_scrut_wf {
@@ -1304,6 +1343,8 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
         let env0 = AppEnv {
             fn_rel: rel,
             scrut_subst: Some((scrut_param, &pattern)),
+            scrut_alias: alias_name,
+            arm_accessors: &arm_accessor_list,
             hdec_names: &[],
             sidecars: ctx.sidecars,
             own_lead: lead,
@@ -1343,6 +1384,8 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
         let env = AppEnv {
             fn_rel: rel,
             scrut_subst: Some((scrut_param, &pattern)),
+            scrut_alias: alias_name,
+            arm_accessors: &arm_accessor_list,
             hdec_names: &hdec_names,
             sidecars: ctx.sidecars,
             own_lead: lead,
