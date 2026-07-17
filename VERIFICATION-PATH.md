@@ -93,11 +93,20 @@ the previous:
 4. **After W6 (stage B, deep expressions):** leaves become mirrored data;
    expression and type rendering join the certificate. *Trusted: the
    serializer (now including leaf serialization), the frontend.*
-5. **After W5 (soundness loop):** the reference WP is no longer just an
-   independent implementation — it is PROVEN sound against a written-down
-   operational semantics of SST (fuel big-step, partial correctness first),
-   the proof authored in tactus and kernel-checked like everything else.
-   The claim becomes: *kernel-checked obligations ⟹ the operational spec.*
+5. **After W5 (soundness loop) — ✅ REACHED 2026-07-18 (probe37, board
+   bootstrap-66/-10):** the reference WP is no longer just an independent
+   implementation — it is PROVEN sound against a written-down operational
+   semantics of SST, the proof authored in tactus and kernel-checked like
+   everything else (`lib.ref_wp_sound_closed`, Link module, bootstrap-73's
+   per-fn discharge), consumed by the adequacy spine by plain application
+   (`probe-w0/probe37_loop_closure/`, composed closure = `[propext,
+   Classical.choice, Quot.sound]`, no sorryAx). The claim now held:
+   *kernel-checked obligations ⟹ the operational spec* — with the §5
+   residue (adequacy spine as trusted SPEC) exactly as designed. Scope
+   honesty: the operational model is the W5a–e statement family (assert/
+   assume/assign/call/ret/if/seq/loop/deadend frames, partial correctness;
+   termination = its own obligation family); wf-hypothesis interface
+   (`StmDataWf`/`FnCtxDataWf`) is discharged per serialized literal.
 6. **After W7/W8 (defs layer + authority flip):** the spec-world definitions
    join the certificate and the package verdict becomes the verdict. The §1
    end-state claim holds in full.
@@ -142,7 +151,16 @@ Stated up front so nobody discovers it later:
 * *Trust extensions sneaking in* → R0b's per-theorem axiom closure + T's
   automation transparency; both per-run facts, not one-time audits.
 
-## 7. Current position (2026-07-12)
+## 7. Current position (2026-07-18)
+
+**Rung 5 of the §4 ladder is REACHED** — the W5 soundness loop is closed
+(probe37; bootstrap-73's Link discharge made `ref_wp_sound_closed`
+premise-free, bootstrap-66 re-pointed the adequacy spine at it and deleted
+the spine's hand soundness induction). tactus-core: 67/67 per-fn closed
+theorems, 0 pending, gate 138/0. Discharge layer survived the N1/N2
+statement reshape (field binders + ctor equations) with weave extensions.
+
+## 7.1 Previous position (2026-07-12)
 
 Done: W0 probes (8), W1.5 structural emission, four emitter bugs + one
 soundness hole found and fixed with pinning tests, emit-module + main fully

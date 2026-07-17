@@ -248,3 +248,56 @@ follow-up, not a day-one requirement.
   the existing Link uses `noncomputable def` (needed where stmts are
   `@[reducible] def : Prop`). Follow the existing convention unless it
   fights the elaborator.
+
+## 9. Final status — COMPLETE for tactus-core (2026-07-18), lessons ledger
+
+67/67 per-fn closed theorems, 0 pending (6 fix + 9 straight-line + 52
+zero-spine), surviving the N1/N2 statement reshape. What the build taught,
+beyond §3's design (each found by a gate error, none by foresight):
+
+- **R-b (wf defs)**: extrinsically-typed obligations demand `{Dt}Wf`
+  predicates. Mutual inductive families need `mutual … end` wf blocks
+  with per-def `termination_by structural x` INSIDE the block; SCC
+  extraction must skip non-cycle waiters when seeding. Struct-emitted
+  dts (single variant named after the type) have no matchable ctor —
+  projection-form wf defs. Single-conjunct wf clauses are bare Props:
+  no `⟨…⟩` patterns, bind bare.
+- **R-c (preservation synthesis, `wf_synth.rs`)**: for spec fns feeding
+  wf-demanding positions, synthesize `g_wf` lemmas whose proof terms are
+  ISOMORPHIC to g's body (ctor ↦ ⟨comps⟩, rec ↦ rec, call ↦ callee _wf,
+  match ↦ match-mirror destructure, if-in-arm ↦
+  `(congrArg DWf (if_pos h)).mpr` defeq transport, top-level if ↦
+  `unfold`+`by_cases` — non-recursive defs keep equations). Everything
+  rides defeq iota; the rec_1 equation-lemma gap never bites in term
+  position. Demand-driven iterative driver: fixpoint → parse wf-transport
+  pendings → closure over body refs → topo synth → re-fixpoint.
+- **The 686 lesson (load-bearing)**: tactic goals inside term-mode match
+  arms can be POSTPONED outside the arm's context, losing pattern-bound
+  hypotheses — `(by omega)` is only safe context-free; every
+  context-dependent bound rides a NAMED component/hypothesis.
+- **Caller-side resolution**: value texts resolve to wf proofs by
+  lets-chasing (`tmp__N`), raw projection keys (unboxed fields), boxed
+  bare vars as `{v}.deref` own-hyp keys, ctor literals as ⟨…⟩ with named
+  bound comps, and synthesized-lemma application with interleaved
+  value/hyp args. Paren handling MUST be depth-aware
+  (`strip_outer_parens`) — `trim_matches` mangles nested ctor texts.
+  Straight-line closers RETRY, converting resolver failures naming own
+  params into own wf hypotheses (corollaries' stm-literal args).
+- **decreasing_by**: term-thm bullets are ILLEGAL in multi-self-call arms
+  (later termination VCs carry self-referencing premises). Heights are
+  WF-compiled → equations exist → the uniform
+  `all_goals (simp [{Dt}.height] <;> omega)` closes every goal
+  (`<;>`, not `;` — simp may close outright).
+- **N1/N2 adaptation**: match-split statements carry
+  `∀ field-binders, scrut = Ctor fields →` — field binders instantiate
+  with the arm pattern's tokens (accessor-mapped for named fields);
+  patterns always name binders (`_pb{i}`, never `_`); the ctor equation
+  closes via the existing `(by simp)` branch argument.
+- **Consumption (bootstrap-66/probe37)**: the adequacy spine consumes
+  `ref_wp_sound_closed` by `iff_of_eq` with DEFINITIONAL unification —
+  the option-(iii) bet paid in full. The wf hypotheses are the honest
+  residual interface, by-construction for serializer output.
+
+Next frontier: the gt census (2900+ fns of trait/generic/Seq-view shapes
+tactus-core doesn't have) — every pending is a work-item toward
+universality.
