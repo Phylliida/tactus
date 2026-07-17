@@ -1923,7 +1923,7 @@ fn fn_binders_with_bounds(f: &FunctionX, include_bound_hyps: bool, unemittable: 
 }
 
 
-fn field_name(name: &str) -> String {
+pub(crate) fn field_name(name: &str) -> String {
     if name.parse::<usize>().is_ok() {
         format!("val{}", name)
     } else {
