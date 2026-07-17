@@ -221,7 +221,35 @@ its absence is how the S2c regression shipped.
 
 ---
 
-## 3a. Residue notebook (squeeze debt, 4 e2e tests)
+## 3a. Residue notebook (squeeze debt — RESOLVED to 1, 2026-07-18)
+
+> **STATUS: the proper Return→Wp::Let landed (session 3) with four
+> derived-closer completions — suite 550/1, gt gate green.** The
+> experiment's two blockers resolved as predicted: the ctor slot gate
+> became env-aware (var-like args with walker-visible binders take
+> the declared slot), and the route is gated on default-closer AND
+> no-proof-block-prefix (body scan). Completions the fixes forced,
+> each derived-not-searched: `.injEq` (field-carrying variants) +
+> `reduceCtorEq` for equation-vs-equation goals; goal-mentioned USER
+> spec fn unfolds (hoisting trades rfl's definitional transparency
+> for hypothesis equations — simp carries the delta now); prefix-
+> aware rung (bare `intros` under user prefixes); `with_reducible
+> rfl` (bare rfl on stuck matches dies with maxRecDepth, which
+> `first` cannot catch — the closing omega arm never ran).
+> Bonus: cross_crate_probe_5 promoted Err→Ok — the axiomatic-Seq gap
+> its 2026-05-12 comment predicted would close, closed.
+>
+> **Remaining (1): `vec_field_index_clone`** — the postcondition
+> needs Seq EXTENSIONALITY: the clone call's ensures gives pointwise
+> `cloned Int (index (view tmp__1) i) (index (view (mk tmp__3)) i)`
+> + equal lens, and the `=~= ==> ==` bridge conjunct renders
+> vacuously as `A → A` (both sides render as Lean `Eq`). Closing
+> needs axiom_seq_ext instantiation from pointwise facts — Z3 did
+> this by broadcast E-matching; a derived closer needs the CALL
+> provenance (which ensures shape landed) to emit the ext step.
+> First real customer for N3.
+
+## 3a-old. Residue notebook (squeeze debt, 4 e2e tests)
 
 Probed 2026-07-17 late session. Current split and the experiment that
 maps them:
