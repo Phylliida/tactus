@@ -3281,6 +3281,16 @@ impl Verifier {
                          axiom closures kernel-verified",
                         report.modules, reuse, cached,
                     )).to_any());
+                    // Link-discharge L1 census (DESIGN-link-discharge.md
+                    // §5): per-fn closed theorems formed vs pending. Note
+                    // only; counts also gate acceptance in bootstrap-73.
+                    if report.discharge_closed + report.discharge_pending > 0 {
+                        reporter.report_now(&note_bare(format!(
+                            "tactus: Link discharge: {} per-fn closed theorem(s) \
+                             (zero-spine); {} proof fn(s) pending (woven premises)",
+                            report.discharge_closed, report.discharge_pending,
+                        )).to_any());
+                    }
                     // W4a: the in-gate refWp↔production bridge (opt-in
                     // --tactus-bridge). Informational in W4a — a note only,
                     // never an error (W4c flips bridge FAIL → error).
