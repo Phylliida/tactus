@@ -663,7 +663,8 @@ pub(crate) fn spec_world_cmds_tagged(
     let mut segs: Vec<(usize, DefsSeg)> = vec![(0, DefsSeg::Base)];
     let all_fns: Vec<&FunctionX> = krate.functions.iter().map(|f| &f.x).collect();
     let spec_fn_map = dep_order::build_spec_fn_map(&all_fns);
-    let mut refs = dep_order::collect_references(&spec_fn_map, &ectx.fn_map, dep_walk_roots);
+    let mut refs =
+        dep_order::collect_references(&spec_fn_map, &ectx.fn_map, &all_fns, dep_walk_roots);
 
     // Transitive trait-bound closure: when a trait emits its class
     // declaration, parent-trait bounds (e.g., `trait Sub: Super`
@@ -4360,7 +4361,11 @@ fn build_link_module(
         Default::default();
     let mut wf_def_texts: std::collections::HashMap<String, String> = Default::default();
     let mut wf_deps: std::collections::HashMap<String, Vec<String>> = Default::default();
-    for rel in &scalar_carrying {
+    // Sorted iteration: hash-set order varies per process, and this
+    // loop's order reaches emitted wf-def text order downstream.
+    let mut scalar_carrying_sorted: Vec<&String> = scalar_carrying.iter().collect();
+    scalar_carrying_sorted.sort();
+    for rel in scalar_carrying_sorted {
         let vars = &dt_fields[rel];
         let mut info_vars: std::collections::HashMap<String, Vec<crate::link_discharge::WfComp>> =
             Default::default();
@@ -4495,7 +4500,11 @@ fn build_link_module(
     }
     let mut wf_sigs: std::collections::HashMap<String, crate::wf_synth::FnWfSig> =
         Default::default();
-    for (rel, fx) in &spec_fn_x {
+    // Sorted for run-to-run determinism (map iteration order is not).
+    let mut spec_fn_x_sorted: Vec<(&String, &&vir::ast::FunctionX)> =
+        spec_fn_x.iter().collect();
+    spec_fn_x_sorted.sort_by_key(|(rel, _)| *rel);
+    for (rel, fx) in spec_fn_x_sorted {
         let Some((ret_d, false)) = field_dt(&fx.ret.x.typ) else { continue };
         if !scalar_carrying.contains(&ret_d) {
             continue;
@@ -4571,7 +4580,11 @@ fn build_link_module(
             // resolution (Loop arm behind Ret arm etc.).
             let _ = &synth_phase_done;
             let mut queue: Vec<String> = Vec::new();
-            for reason in pending.values() {
+            // Iterate key-sorted: values() order varies per process
+            // and the queue order reaches synthesized-lemma order.
+            let mut pending_sorted: Vec<(&String, &String)> = pending.iter().collect();
+            pending_sorted.sort_by_key(|(k, _)| *k);
+            for (_, reason) in pending_sorted {
                 let Some(start) = reason.find("wf-transport for arg `") else { continue };
                 let _ = start;
                 let rest = &reason[start + 22..];
@@ -4686,6 +4699,9 @@ fn build_link_module(
         let mut stack: Vec<String> = wf_def_texts.keys()
             .filter(|d| all_text.contains(&format!("{}Wf", d)))
             .cloned().collect();
+        // keys() order varies per process; wf_needed's order (and with
+        // it emitted wf-def order) must not.
+        stack.sort();
         while let Some(d) = stack.pop() {
             if wf_needed.contains(&d) {
                 continue;
