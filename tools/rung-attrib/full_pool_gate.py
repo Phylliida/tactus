@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
-"""mainline-05 feasibility gate: does the uniform derived tactic
-`simp_all only [CORE] <;> omega` close the FULL Brick-1 pool (all
-buckets, all rungs — including lower-rung winners), not just T2?"""
+"""mainline-05 feasibility gate (v5 shape): does the uniform derived
+tactic close the FULL Brick-1 pool (all buckets, all rungs — including
+lower-rung winners), not just T2?
+
+NOTE (2026-07-17, post-B4/B10): the TAC constant below is the
+pre-B4 v5 derived text — it cites `tactus_peel`, which is DELETED from
+the prelude (mainline-07). For reuse (F7 re-measure etc.), replace TAC
+with the current derived closer's branch structure
+(`first | rfl | decide | omega | (<explicit peel per goal — see
+render_peel in tactic_select.rs>) | (simp_all only [CORE: 51] <;> omega)`);
+the combined-file harness, error attribution, and counting logic are
+all unchanged and directly reusable."""
 import csv, os, re, subprocess, sys
 from collections import defaultdict
 
