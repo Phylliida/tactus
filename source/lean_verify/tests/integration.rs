@@ -3,13 +3,16 @@
 //! Run: nix-shell -p lean4 --run "cargo test -p lean_verify --test integration"
 
 use lean_verify::lean_process::check_lean_file;
-use lean_verify::prelude::TACTUS_PRELUDE;
+use lean_verify::prelude::{TACTUS_DEFS, TACTUS_SEARCH};
 
-/// Write `lean` (prefixed with the Tactus prelude) to a tmp file and invoke
-/// Lean on it. Matches the "file artifact" invocation used by the main
-/// verifier, not stdin piping.
+/// Write `lean` (prefixed with the Tactus prelude — both B5 halves) to a
+/// tmp file and invoke Lean on it. Matches the "file artifact"
+/// invocation used by the main verifier, not stdin piping.
 fn run(lean: &str) -> Option<lean_verify::lean_process::LeanResult> {
-    let full = format!("{}{}", TACTUS_PRELUDE, lean);
+    // Inline-concatenation form of the two-module prelude: TactusSearch's
+    // `import TactusDefs` line is replaced by the defs text itself.
+    let search_inline = TACTUS_SEARCH.replace("import TactusDefs\n", "");
+    let full = format!("{}{}{}", TACTUS_DEFS, search_inline, lean);
     let pid = std::process::id();
     let uniq = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

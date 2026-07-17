@@ -371,7 +371,7 @@ fn krate_preamble(
             // prelude used to be inlined here, re-elaborated in every file
             // (~1.3s/check). `check_lean_file` puts the cache dir holding
             // `TactusPrelude.olean` on the child's LEAN_PATH.
-            cmds.push(Command::Raw(crate::prelude::TACTUS_PRELUDE_IMPORT.to_string()));
+            cmds.push(Command::Raw(crate::prelude::TACTUS_DEFS_IMPORT.to_string()));
         }
     }
     // Theorem-required PreludeAddendums go after the prelude — they

@@ -1,28 +1,46 @@
-//! The Tactus prelude for Lean — source constant + prebuilt-module cache.
+//! The Tactus prelude for Lean — source constants + prebuilt-module cache.
+//!
+//! **B5 split (DESIGN-transparent-automation.md §5):** the former single
+//! `TactusPrelude.lean` is now TWO modules:
+//!
+//! * **`TactusDefs.lean`** — the vocabulary: defs, instances, decoration
+//!   types, the arch-word axiom pair, and the `#tactus_check_axioms`
+//!   axiom-closure enforcement command. NO tactics. This is the file in
+//!   the trust/audit story; every generated artifact imports it.
+//! * **`TactusSearch.lean`** — `import TactusDefs` + the discover-mode
+//!   search ladder (`tactus_first` / `tactus_auto` / `tactus_case_split`
+//!   / `tactus_usize_bound` / `tactus_bit_vector`). Imported ONLY by
+//!   artifacts whose USER tactic texts reference those tactics (fn-level
+//!   overrides, inline proofs) — never by default emission (S2c/B4
+//!   removed the default search path). See `needs_search_import`.
 //!
 //! Historically the prelude was inlined verbatim into every generated
 //! `.lean` file (`Command::Raw(TACTUS_PRELUDE)`), costing ~1.3s of
 //! re-elaboration per check (measured 2026-06-12, CRATEDEFS.md step 0).
-//! Generated files now emit `import TactusPrelude` instead, against a
-//! `.olean` built once per prelude version into a content-hashed cache
-//! dir under `lean_out_root()`; `check_lean_file` puts that dir on the
-//! child's `LEAN_PATH`.
+//! Generated files now emit `import TactusDefs` instead, against
+//! `.olean`s built once per prelude version into a content-hashed cache
+//! dir (see `prelude_cache_dir`); `check_lean_file` puts that dir on
+//! the child's `LEAN_PATH`.
 //!
 //! Consequence: generated files are no longer standalone — checking one
 //! by hand needs the cache dir on `LEAN_PATH` (see BUILD.md).
 
 use std::path::PathBuf;
 
-/// The Tactus prelude source. As the prelude grows (Seq, Set, etc.),
-/// edit TactusPrelude.lean directly — it's a real .lean file that can be
-/// syntax-highlighted and tested independently. Still the source of
-/// truth for `sanity.rs`'s prelude-name extraction.
-pub const TACTUS_PRELUDE: &str = include_str!("../TactusPrelude.lean");
+/// The TactusDefs source. As the vocabulary grows (Seq, Set, etc.),
+/// edit TactusDefs.lean directly — it's a real .lean file that can be
+/// syntax-highlighted and tested independently. One half of the source
+/// of truth for `sanity.rs`'s prelude-name extraction.
+pub const TACTUS_DEFS: &str = include_str!("../TactusDefs.lean");
+
+/// The TactusSearch source (the search ladder). The other half of
+/// `sanity.rs`'s extraction input.
+pub const TACTUS_SEARCH: &str = include_str!("../TactusSearch.lean");
 
 /// Header emitted in generated files in place of the inline prelude:
 /// the import plus the prelude's file-scoped `set_option`s, which do
 /// NOT propagate through `import` and must be restated per file.
-pub const TACTUS_PRELUDE_IMPORT: &str = "import TactusPrelude\n\
+pub const TACTUS_DEFS_IMPORT: &str = "import TactusDefs\n\
 set_option linter.unusedVariables false\n\
 set_option maxHeartbeats 800000";
 
@@ -32,19 +50,46 @@ set_option maxHeartbeats 800000";
 pub const TACTUS_SET_OPTIONS: &str = "set_option linter.unusedVariables false\n\
 set_option maxHeartbeats 800000";
 
-/// Fixed cache dir for the prebuilt prelude module:
-/// `{cache_root}/prelude`, where the cache root is USER-LEVEL
+/// Search-ladder tactic names, whole-word matched. If any of these
+/// appears in a generated file's tactic text, the file needs
+/// `import TactusSearch` — see `inject_search_import` in generate.rs.
+pub const SEARCH_TACTIC_NAMES: [&str; 5] = [
+    "tactus_auto",
+    "tactus_first",
+    "tactus_case_split",
+    "tactus_bit_vector",
+    "tactus_usize_bound",
+];
+
+/// Does this rendered file reference a search-ladder tactic in tactic
+/// position? Scans with line comments stripped (user `--` comments may
+/// mention the names; those don't need the import).
+pub fn needs_search_import(source: &str) -> bool {
+    let stripped = crate::generate::strip_lean_line_comments(source);
+    SEARCH_TACTIC_NAMES.iter().any(|name| {
+        stripped
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|tok| tok == *name)
+    })
+}
+
+/// Fixed cache dir for the prebuilt prelude modules:
+/// `{cache_root}/prelude-<hash>`, where the cache root is USER-LEVEL
 /// (`$TACTUS_PRELUDE_CACHE` → `$XDG_CACHE_HOME/tactus` →
-/// `~/.cache/tactus` → `{lean_out_root}/_prelude_cache` as a last
+/// `~/.cache/tactus` → `{lean_out_root()}/_prelude_cache` as a last
 /// resort), NOT `lean_out_root()`: the e2e harness isolates each
 /// test's lean-out dir, and a per-test cache would rebuild the
-/// identical olean 505 times per suite run.
+/// identical oleans 505 times per suite run.
 ///
-/// ONE dir, no version coexistence: when the prelude changes, the next
-/// check rebuilds in place and artifacts generated against the old
-/// prelude simply fail — regenerate them by re-running tactus. (A
-/// content-hashed multi-version layout was tried first and dropped:
-/// backwards compatibility with stale artifacts isn't worth the code.)
+/// ONE dir per prelude VERSION, content-addressed over BOTH module
+/// sources: when either file changes, the next check rebuilds into a
+/// fresh hash dir and artifacts generated against the old version
+/// simply fail — regenerate them by re-running tactus. Two tactus
+/// binaries with different preludes (e.g. two checkouts on one
+/// machine) coexist instead of rebuilding the same dir back and
+/// forth (the "concurrent mixed-version builders" race was observed
+/// for real). Old version dirs linger (~8MB each); `rm -rf` the
+/// cache root recovers.
 pub fn prelude_cache_dir() -> PathBuf {
     let root = if let Ok(d) = std::env::var("TACTUS_PRELUDE_CACHE") {
         PathBuf::from(d)
@@ -55,64 +100,88 @@ pub fn prelude_cache_dir() -> PathBuf {
     } else {
         crate::generate::lean_out_root().join("_prelude_cache")
     };
-    // Content-addressed: one dir PER PRELUDE VERSION, so two tactus
-    // binaries with different preludes (e.g. two checkouts on one
-    // machine) coexist instead of rebuilding the same dir back and
-    // forth — the "concurrent mixed-version builders" race below was
-    // observed for real once a branch changed the prelude while the
-    // main checkout kept running. Old version dirs linger (~4MB each);
-    // `rm -rf` the cache root recovers.
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    TACTUS_PRELUDE.hash(&mut h);
+    TACTUS_DEFS.hash(&mut h);
+    TACTUS_SEARCH.hash(&mut h);
     root.join(format!("prelude-{:016x}", h.finish()))
 }
 
-pub fn ensure_prelude_olean() -> Result<PathBuf, String> {
-    let dir = prelude_cache_dir();
-    let marker = dir.join("TactusPrelude.lean");
-    let olean = dir.join("TactusPrelude.olean");
-    // The marker records which prelude version the olean was built
-    // from. It is written AFTER the olean rename, so on any crash the
-    // mismatch forces a rebuild (never a stale olean behind a fresh
-    // marker). Mixed-version races are structurally gone now that the
-    // dir is content-addressed (`prelude_cache_dir`); the marker stays
-    // as belt-and-suspenders against partial writes.
-    // Marker = prelude source + toolchain fingerprint: a toolchain
-    // bump with unchanged prelude source previously reused a stale
-    // olean (latent gap — nothing later necessarily elaborates against
-    // it to notice).
-    let marker_content = format!(
-        "{}\n-- toolchain: {}\n", TACTUS_PRELUDE, crate::project::toolchain_fingerprint());
-    if olean.exists() && std::fs::read_to_string(&marker).ok().as_deref() == Some(&marker_content) {
-        return Ok(dir);
-    }
-    // Build in a pid-unique subdir: `lean -o` derives the module name
-    // from the source path relative to its root dir (the cwd) and
-    // refuses sources outside it — cwd = the subdir makes the module
-    // exactly `TactusPrelude`.
-    let build = dir.join(format!("build-{}", std::process::id()));
+/// Build one module of the prelude into `build_dir` (pid-unique), with
+/// `lean_path` prepended for imports (TactusSearch imports TactusDefs,
+/// so the search build sees the defs build dir). `lean -o` derives the
+/// module name from the source path relative to its root dir (the cwd)
+/// and refuses sources outside it — cwd = the subdir makes the module
+/// exactly `<name>`.
+fn build_module(
+    dir: &std::path::Path,
+    name: &str,
+    source: &str,
+    lean_path: &std::path::Path,
+) -> Result<(), String> {
+    let build = dir.join(format!("build-{}-{}", std::process::id(), name));
     std::fs::create_dir_all(&build)
         .map_err(|e| format!("could not create {}: {}", build.display(), e))?;
-    std::fs::write(build.join("TactusPrelude.lean"), TACTUS_PRELUDE)
-        .map_err(|e| format!("could not write prelude source: {}", e))?;
-    let output = std::process::Command::new("lean")
-        .args(["-o", "TactusPrelude.olean", "TactusPrelude.lean"])
+    let src_path = build.join(format!("{}.lean", name));
+    std::fs::write(&src_path, source)
+        .map_err(|e| format!("could not write {} source: {}", name, e))?;
+    let mut cmd = std::process::Command::new("lean");
+    cmd.args(["-o", &format!("{}.olean", name), &format!("{}.lean", name)])
         .current_dir(&build)
+        .env("LEAN_PATH", lean_path);
+    let output = cmd
         .output()
         .map_err(|e| format!("failed to spawn lean for prelude build: {}. Is Lean 4 installed?", e))?;
     if !output.status.success() {
         let _ = std::fs::remove_dir_all(&build);
         return Err(format!(
-            "prelude .olean build failed (this is a Tactus bug — the prelude should always elaborate):\n{}{}",
+            "prelude .olean build failed for {} (this is a Tactus bug — the prelude should always elaborate):\n{}{}",
+            name,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         ));
     }
-    std::fs::rename(build.join("TactusPrelude.olean"), &olean)
-        .map_err(|e| format!("could not move prelude olean into place: {}", e))?;
+    std::fs::rename(build.join(format!("{}.olean", name)), dir.join(format!("{}.olean", name)))
+        .map_err(|e| format!("could not move {} olean into place: {}", name, e))?;
+    let _ = std::fs::remove_dir_all(&build);
+    Ok(())
+}
+
+pub fn ensure_prelude_olean() -> Result<PathBuf, String> {
+    let dir = prelude_cache_dir();
+    let defs_lean = dir.join("TactusDefs.lean");
+    let search_lean = dir.join("TactusSearch.lean");
+    let defs_olean = dir.join("TactusDefs.olean");
+    let search_olean = dir.join("TactusSearch.olean");
+    // The marker records which prelude version the oleans were built
+    // from. It is written AFTER the olean renames, so on any crash the
+    // mismatch forces a rebuild (never a stale olean behind a fresh
+    // marker). Marker = both module sources + toolchain fingerprint:
+    // a toolchain bump with unchanged sources previously reused a stale
+    // olean (latent gap — nothing later necessarily elaborates against
+    // it to notice).
+    let marker = dir.join("PRELUDE-MARKER");
+    let marker_content = format!(
+        "{}\n-- ══ TactusSearch ══\n{}\n-- toolchain: {}\n",
+        TACTUS_DEFS, TACTUS_SEARCH, crate::project::toolchain_fingerprint()
+    );
+    let fresh = defs_olean.exists()
+        && search_olean.exists()
+        && std::fs::read_to_string(&marker).ok().as_deref() == Some(&marker_content);
+    if fresh {
+        return Ok(dir);
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not create {}: {}", dir.display(), e))?;
+    std::fs::write(&defs_lean, TACTUS_DEFS)
+        .map_err(|e| format!("could not write TactusDefs source: {}", e))?;
+    std::fs::write(&search_lean, TACTUS_SEARCH)
+        .map_err(|e| format!("could not write TactusSearch source: {}", e))?;
+    // Dependency order: TactusDefs stands alone; TactusSearch imports
+    // it, so the search build's LEAN_PATH includes the defs dir.
+    build_module(&dir, "TactusDefs", TACTUS_DEFS, &dir)?;
+    build_module(&dir, "TactusSearch", TACTUS_SEARCH, &dir)?;
     std::fs::write(&marker, &marker_content)
         .map_err(|e| format!("could not write prelude marker: {}", e))?;
-    let _ = std::fs::remove_dir_all(&build);
     Ok(dir)
 }

@@ -1,9 +1,9 @@
 ---
 title: "B4 — tactus_peel → codegen explicit structure; delete the macro"
-status: in_progress
+status: done
 claimed_by: kimi
 created: 2026-07-16T17:28:00Z
-updated: 2026-07-16T17:28:00Z
+updated: 2026-07-17T03:40:00Z
 ---
 
 ## Description
@@ -69,3 +69,43 @@ mainline-05 if concurrent.
   confirmed: a deliberately-false middle loop-invariant conjunct
   reports its own Rust span (`at …:13:13 (loop invariant)`) — the
   specific conjunct, not a macro invocation.
+
+## Writeup
+
+**Done-when review, all satisfied:** no emitted artifact references
+`tactus_peel` (fresh `--lean-all-proofs` emit, 2956 fns: **0**
+references); macro deleted from `TactusPrelude.lean`; suite green at
+main-line parity (138/140, the 2 failures being the pre-existing
+Z3-path state_machines cases verified identical on main-line); 0
+regressions on the pool (gt gate **3116 verified / 0 errors**, package
+gate live); tutorial **10/10**; sourcemap spans verified on a
+multi-conjunct loop example (false middle conjunct reports its own
+Rust span at the specific invariant clause).
+
+**What landed:** `render_peel` in `lean_verify/src/tactic_select.rs` —
+walks the goal tree: `intro` per ∀ binder / antecedent / goal-let
+(anonymous-constructor patterns for ∧/×-typed hypotheses), `refine
+⟨by <leaf>, …⟩` mirroring the conjunction tree exactly (left-nested
+trees must be mirrored, not flattened). S1's `PeelOmega` and the
+derived closer's second branch use it:
+`first | rfl | decide | omega | (<peel>; first | rfl | decide | omega)
+| (simp_all only [CORE: 51] <;> omega)`. The AssertQuery fallback is
+a marker (`DERIVED_MARKER`) expanded per-goal at the emit chokepoint
+(scope composition happens once, goal shapes arrive per-theorem).
+
+**Falsified designs (the transferable lessons):** (1) `refine`
+flattening is right-nested-only; (2) `try`-guards — `try` takes the
+following tactic SEQUENCE as argument, so `try (intro _); first | …`
+no-ops the whole chain; (3) newline-separated steps inside
+parenthesized `first`-alternatives break layout (and `first`
+alternatives cannot span lines). Final rule: `;`-joined unguarded
+steps inside parenthesized alternatives, with the guard living in the
+branch ORDER (bare kernel ladder first, so prefix-transformed goals
+never need the peel branch).
+
+**Follow-ons noted:** the prelude still carries `tactus_first`,
+`tactus_case_split`, `tactus_auto` (discover-mode; B5/B6 territory);
+the derived closer's CORE branch and the kernel rungs are the only
+default-emission tactics now — the "no search tactic in default
+artifacts" gate claim (mainline-09) is one prelude-split away from
+being assertable.
