@@ -287,4 +287,19 @@ pub fn swap_pair(a: u64, b: u64) -> (r: (u64, u64))
     (b, a)
 }
 
+// F20 (bootstrap-69): assert-query NonLinear — an isolated
+// `by(nonlinear_arith)` query inside an exec fn. The serializer emits
+// `StmData.AssertQueryNl`; the refWp mirror recurses on the body under
+// `strip_hyps(f)` (Let/Binder frames kept, Hyp frames dropped) with no
+// frame delta for the continuation — the proven fact re-enters via the
+// Assume production itself emits after the query.
+pub fn mul_bound(a: u64, b: u64) -> (r: u64)
+    requires a < 100, b < 100,
+    ensures r == a * b, r < 10000,
+{
+    assert(a * b < 10000) by(nonlinear_arith)
+        requires a < 100, b < 100;
+    a * b
+}
+
 } // verus!
