@@ -257,6 +257,29 @@ two concurrent tactus runs on one machine can race the shared cache dir
 (observed 2026-07-17 as tutorial-chapter flakes during a concurrent gt gate;
 solo runs all green). A lockfile would fix it.
 
+**B6 gate claim — LANDED (2026-07-17, mainline-09).** The one-line claim,
+asserted at gate-crates' `check.sh` over the emitted artifact tree by
+`tools/check-no-search.py`:
+
+  **No emitted artifact imports the search module, and no search-ladder
+  tactic (`tactus_auto`, `tactus_first`, `tactus_case_split`,
+  `tactus_bit_vector`, `tactus_usize_bound`) appears in tactic position
+  (comments stripped, whole-word).**
+
+The claim holds with **zero allowed residue** on both current gate crates:
+gt (3,116 verified / 0 errors; claim verified over `target/tactus-lean`)
+and the tutorial (141 artifacts). Enabling that zero-residue state: the 3
+pre-existing gt user override sites were migrated off the ladder —
+`first | tactus_auto | …` first branches became the kernel+CORE text,
+and `tactus_usize_bound` was inlined as
+`rcases arch_word_bits_valid with h | h <;> (simp_all only [usize_hi,
+isize_hi, h]; first | decide | omega)` (the prelude macro's `subst h`
+form is broken-but-masked: `arch_word_bits` is a constant, `subst`
+can't fire on it, and `tactus_auto` always won the first branch at
+every site — recorded here, macro left for the discover-mode cleanup).
+The counted-residue mechanism (`--allow <file>`) exists in the checker
+for crates that can't yet reach zero (ct, per mainline-17).
+
 ---
 
 ## 6. Brick 1: instrument before deciding
