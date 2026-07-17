@@ -4350,6 +4350,9 @@ fn build_link_module(
     // census loudly if one appears).
     let mut wf_infos: std::collections::HashMap<String, crate::link_discharge::WfInfo> =
         Default::default();
+    // R-c: richer conjunct table for the preservation synthesizer.
+    let mut wf_specs: std::collections::HashMap<String, crate::wf_synth::DtWfSpec> =
+        Default::default();
     let mut wf_def_texts: std::collections::HashMap<String, String> = Default::default();
     let mut wf_deps: std::collections::HashMap<String, Vec<String>> = Default::default();
     for rel in &scalar_carrying {
@@ -4359,8 +4362,11 @@ fn build_link_module(
         let mut clauses: Vec<String> = Vec::new();
         let mut deps: Vec<String> = Vec::new();
         let mut self_rec = false;
+        let mut spec_vars: std::collections::HashMap<String, Vec<(usize, crate::wf_synth::ConjKind)>> =
+            Default::default();
         for (vname, fs) in vars {
             let mut comps: Vec<crate::link_discharge::WfComp> = Vec::new();
+            let mut spec_conjs: Vec<(usize, crate::wf_synth::ConjKind)> = Vec::new();
             let mut conj_texts: Vec<String> = Vec::new();
             let mut pat_vars: Vec<String> = Vec::new();
             for (i, (acc, t)) in fs.iter().enumerate() {
@@ -4368,12 +4374,15 @@ fn build_link_module(
                 if let Some(pred) = field_bound_pred(t, &var) {
                     comps.push(crate::link_discharge::WfComp {
                         accessor: acc.clone(), rec: false });
+                    spec_conjs.push((i, crate::wf_synth::ConjKind::Bound));
                     conj_texts.push(format!("({})", pred));
                     pat_vars.push(var);
                 } else if let Some((d, boxed)) = field_dt(t) {
                     if scalar_carrying.contains(&d) {
                         comps.push(crate::link_discharge::WfComp {
                             accessor: acc.clone(), rec: true });
+                        spec_conjs.push((i, crate::wf_synth::ConjKind::Rec {
+                            dt: d.clone(), boxed }));
                         conj_texts.push(format!(
                             "{}Wf {}{}", d, var, if boxed { ".deref" } else { "" }));
                         pat_vars.push(var);
@@ -4397,14 +4406,42 @@ fn build_link_module(
             };
             clauses.push(format!("  | {} => {}", pat, body));
             info_vars.insert(vname.clone(), comps);
+            spec_vars.insert(vname.clone(), spec_conjs);
         }
-        let mut text = format!(
-            "def {}Wf (x : {}.{}) : Prop :=\n  match x with\n{}\n",
-            rel, ns, rel, clauses.join("\n"));
-        if self_rec {
+        // Struct-style dts (single variant named after the type) emit
+        // as Lean `structure`s — no matchable constructor; use field
+        // projections instead.
+        let is_struct = vars.len() == 1 && vars[0].0 == *rel;
+        let mut text = if is_struct {
+            let (_, fs) = &vars[0];
+            let mut conj_texts: Vec<String> = Vec::new();
+            for (acc, t) in fs.iter() {
+                let proj = format!("x.{}", acc);
+                if let Some(pred) = field_bound_pred(t, &proj) {
+                    conj_texts.push(format!("({})", pred));
+                } else if let Some((d, boxed)) = field_dt(t) {
+                    if scalar_carrying.contains(&d) {
+                        conj_texts.push(format!(
+                            "{}Wf {}{}", d, proj, if boxed { ".deref" } else { "" }));
+                    }
+                }
+            }
+            let body = if conj_texts.is_empty() {
+                "True".to_string()
+            } else {
+                conj_texts.join(" ∧ ")
+            };
+            format!("def {}Wf (x : {}.{}) : Prop :=\n  {}\n", rel, ns, rel, body)
+        } else {
+            format!(
+                "def {}Wf (x : {}.{}) : Prop :=\n  match x with\n{}\n",
+                rel, ns, rel, clauses.join("\n"))
+        };
+        if self_rec && !is_struct {
             text.push_str("termination_by structural x\n");
         }
         wf_infos.insert(rel.clone(), crate::link_discharge::WfInfo { variants: info_vars });
+        wf_specs.insert(rel.clone(), crate::wf_synth::DtWfSpec { variants: spec_vars });
         wf_def_texts.insert(rel.clone(), text);
         wf_deps.insert(rel.clone(), deps);
     }
@@ -4438,9 +4475,65 @@ fn build_link_module(
             }
         }
     }
+    // R-c: candidate spec fns for wf-preservation synthesis — every
+    // spec fn with a body whose return type is a scalar-carrying dt.
+    let mut spec_fn_x: std::collections::HashMap<String, &vir::ast::FunctionX> =
+        Default::default();
+    for f in inlined_krate.functions.iter() {
+        if f.x.mode != vir::ast::Mode::Spec || f.x.body.is_none() {
+            continue;
+        }
+        spec_fn_x.insert(
+            crate::to_lean_type::lean_name_relative(&f.x.name.path),
+            &f.x,
+        );
+    }
+    let mut wf_sigs: std::collections::HashMap<String, crate::wf_synth::FnWfSig> =
+        Default::default();
+    for (rel, fx) in &spec_fn_x {
+        let Some((ret_d, false)) = field_dt(&fx.ret.x.typ) else { continue };
+        if !scalar_carrying.contains(&ret_d) {
+            continue;
+        }
+        let params: Vec<(String, crate::wf_synth::ParamKind)> = fx
+            .params
+            .iter()
+            .map(|pr| {
+                let name = crate::lean_name::LeanName::from_var_ident(&pr.x.name)
+                    .into_string();
+                let kind = if let Some(pred) = field_bound_pred(&pr.x.typ, &name) {
+                    crate::wf_synth::ParamKind::Bounded(pred)
+                } else {
+                    match field_dt(&pr.x.typ) {
+                        Some((d, false)) if scalar_carrying.contains(&d) => {
+                            crate::wf_synth::ParamKind::Dt(d)
+                        }
+                        _ => crate::wf_synth::ParamKind::Other,
+                    }
+                };
+                (name, kind)
+            })
+            .collect();
+        wf_sigs.insert(rel.clone(), crate::wf_synth::FnWfSig { params, ret_dt: ret_d });
+    }
+    let ectx_link = crate::emit_ctx::EmitCtx::build(krate, tactic_bodies);
+    let def_of = |rel: &str| -> Option<crate::lean_ast::Def> {
+        let fx = spec_fn_x.get(rel)?;
+        let cmds = crate::to_lean_fn::spec_fn_to_ast(fx, &ectx_link);
+        cmds.into_iter().find_map(|c| match c {
+            Command::Def(d) if d.name == format!("{}.{}", ns, rel) => Some(d),
+            _ => None,
+        })
+    };
+
+    let mut wf_lemma_texts: Vec<String> = Vec::new();
+    let mut wf_lemma_sigs: std::collections::HashMap<String, crate::wf_synth::FnWfSig> =
+        Default::default();
+    let mut wf_census: Vec<String> = Vec::new();
     let mut closed: std::collections::HashMap<String, crate::link_discharge::ClosedMeta> =
         Default::default();
     let mut closed_texts: Vec<(String, String, &'static str)> = Vec::new();
+    let mut synth_phase_done = true;
     loop {
         let mut round: Vec<(String, String, String, &'static str,
             crate::link_discharge::ClosedMeta)> = Vec::new();
@@ -4453,6 +4546,9 @@ fn build_link_module(
                 closed: &closed,
                 variants: &dt_variants,
                 wf: &wf_infos,
+                wf_lemmas: &wf_lemma_sigs,
+                wf_specs: &wf_specs,
+                ns: &ns,
             };
             match crate::link_discharge::try_close(rel, &sidecars[rel], &ctx) {
                 crate::link_discharge::Outcome::Closed { text, kind, meta } => {
@@ -4464,7 +4560,106 @@ fn build_link_module(
             }
         }
         if round.is_empty() {
-            break;
+            // R-c demand collection: wf-transport pendings name the
+            // offending value; the head spec fn is the demand. Iterate:
+            // deeper demands surface only after earlier lemmas unblock
+            // resolution (Loop arm behind Ret arm etc.).
+            let _ = &synth_phase_done;
+            let mut queue: Vec<String> = Vec::new();
+            for reason in pending.values() {
+                let Some(start) = reason.find("wf-transport for arg `") else { continue };
+                let _ = start;
+                let rest = &reason[start + 22..];
+                let Some(end) = rest.find('`') else { continue };
+                let text = &rest[..end];
+                let head = text
+                    .trim_start_matches('(')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                if let Some(g) = head.strip_prefix(&format!("{}.", ns)) {
+                    if wf_sigs.contains_key(g)
+                        && !wf_lemma_sigs.contains_key(g)
+                        && !queue.contains(&g.to_string())
+                    {
+                        queue.push(g.to_string());
+                    }
+                }
+            }
+            if queue.is_empty() {
+                break;
+            }
+            // Closure over def-body spec-fn refs.
+            let mut want: Vec<String> = Vec::new();
+            let mut defs: std::collections::HashMap<String, crate::lean_ast::Def> =
+                Default::default();
+            while let Some(g) = queue.pop() {
+                if want.contains(&g) {
+                    continue;
+                }
+                match def_of(&g) {
+                    Some(d) => {
+                        for r in crate::wf_synth::body_spec_refs(&d, &ns, &wf_sigs) {
+                            if !want.contains(&r) {
+                                queue.push(r);
+                            }
+                        }
+                        defs.insert(g.clone(), d);
+                        want.push(g);
+                    }
+                    None => wf_census.push(format!("{}: def unavailable", g)),
+                }
+            }
+            // Topological synthesis (callees first); cycles census.
+            // Previously-synthesized lemmas count as done (their texts
+            // are already emitted; dependents may reference them).
+            let mut done: std::collections::HashSet<String> =
+                wf_lemma_sigs.keys().cloned().collect();
+            loop {
+                let mut progressed = false;
+                for g in &want {
+                    if done.contains(g) || !defs.contains_key(g) {
+                        continue;
+                    }
+                    let refs = crate::wf_synth::body_spec_refs(&defs[g], &ns, &wf_sigs);
+                    if !refs.iter().all(|r| r == g || done.contains(r) || !defs.contains_key(r)) {
+                        continue;
+                    }
+                    let sctx = crate::wf_synth::SynthCtx {
+                        ns: &ns,
+                        dts: &wf_specs,
+                        sigs: &wf_sigs,
+                        accessors: &dt_variants,
+                        done: &done,
+                    };
+                    match crate::wf_synth::synth_wf_lemma(&sctx, g, &defs[g], &wf_sigs[g]) {
+                        Ok(text) => {
+                            wf_lemma_texts.push(text);
+                            wf_lemma_sigs.insert(g.clone(), wf_sigs[g].clone());
+                            done.insert(g.clone());
+                            synth_phase_done = false;
+                        }
+                        Err(e) => {
+                            wf_census.push(format!("{}: {}", g, e));
+                            defs.remove(g);
+                        }
+                    }
+                    progressed = true;
+                }
+                if !progressed {
+                    break;
+                }
+            }
+            for g in &want {
+                if !done.contains(g) && defs.contains_key(g) {
+                    wf_census.push(format!("{}: dependency cycle", g));
+                }
+            }
+            if synth_phase_done {
+                break; // no NEW lemma this round — quiesced for real
+            }
+            synth_phase_done = true;
+            continue; // re-run the fixpoint with lemmas available
         }
         for (rel, dotted, text, kind, meta) in round {
             pending.remove(&rel);
@@ -4476,8 +4671,12 @@ fn build_link_module(
         cmds.push(Command::Raw(format!("namespace {}\n", ns)));
         // R-b: wf defs referenced by the closed theorems, dependencies
         // first (transitively). Unreferenced wf defs are not emitted.
-        let all_text: String = closed_texts.iter().map(|(_, t, _)| t.as_str())
-            .collect::<Vec<_>>().join("\u{1}");
+        let all_text: String = closed_texts
+            .iter()
+            .map(|(_, t, _)| t.as_str())
+            .chain(wf_lemma_texts.iter().map(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\u{1}");
         let mut wf_needed: Vec<String> = Vec::new();
         let mut stack: Vec<String> = wf_def_texts.keys()
             .filter(|d| all_text.contains(&format!("{}Wf", d)))
@@ -4493,7 +4692,10 @@ fn build_link_module(
             }
             wf_needed.push(d);
         }
-        // Dependencies-first order: repeatedly emit defs whose deps are done.
+        // Dependencies-first order: repeatedly emit defs whose deps are
+        // done. Cross-datatype cycles (mutual inductive families, e.g.
+        // RawExp/RawArmList/RawList) emit as a `mutual … end` block with
+        // per-def `termination_by structural` (probe36 shape).
         let mut emitted: std::collections::HashSet<String> = Default::default();
         while emitted.len() < wf_needed.len() {
             let mut progressed = false;
@@ -4508,10 +4710,88 @@ fn build_link_module(
                 }
             }
             if !progressed {
-                cmds.push(Command::Raw(
-                    "-- wf defs: cross-datatype cycle (needs mutual) — SKIPPED\n".to_string()));
-                break;
+                // Stuck ⇒ a cycle among the remaining. Extract the SCC of
+                // an arbitrary remaining dt: reachable ∩ reaching, within
+                // the remaining set.
+                let remaining: Vec<String> = wf_needed
+                    .iter()
+                    .filter(|d| !emitted.contains(*d))
+                    .cloned()
+                    .collect();
+                let reach = |from: &str, back: bool| -> std::collections::HashSet<String> {
+                    let mut seen: std::collections::HashSet<String> = Default::default();
+                    let mut stack = vec![from.to_string()];
+                    while let Some(x) = stack.pop() {
+                        if !seen.insert(x.clone()) {
+                            continue;
+                        }
+                        for y in &remaining {
+                            let edge = if back {
+                                wf_deps.get(y).map(|ds| ds.contains(&x)).unwrap_or(false)
+                            } else {
+                                wf_deps.get(&x).map(|ds| ds.contains(y)).unwrap_or(false)
+                            };
+                            if edge && !seen.contains(y) {
+                                stack.push(y.clone());
+                            }
+                        }
+                    }
+                    seen
+                };
+                // Try every remaining dt as seed — the stuck set mixes
+                // genuine cycle members with dts merely WAITING on the
+                // cycle (singleton SCCs); only a real, dep-ready cycle
+                // unblocks progress.
+                let mut found: Option<Vec<String>> = None;
+                for seed in &remaining {
+                    let fwd = reach(seed, false);
+                    let bwd = reach(seed, true);
+                    let mut scc: Vec<String> = remaining
+                        .iter()
+                        .filter(|d| fwd.contains(*d) && bwd.contains(*d))
+                        .cloned()
+                        .collect();
+                    scc.sort();
+                    let deps_ok = scc.iter().all(|d| {
+                        wf_deps[d].iter().all(|x| {
+                            scc.contains(x) || emitted.contains(x) || !wf_needed.contains(x)
+                        })
+                    });
+                    if scc.len() >= 2 && deps_ok {
+                        found = Some(scc);
+                        break;
+                    }
+                }
+                let scc = found.unwrap_or_default();
+                if scc.len() < 2 {
+                    cmds.push(Command::Raw(
+                        "-- wf defs: unresolvable dependency order — SKIPPED\n".to_string(),
+                    ));
+                    break;
+                }
+                let mut block = String::from("mutual\n");
+                for d in &scc {
+                    let mut t = wf_def_texts[d].clone();
+                    // Mutual members recurse even when only cross-dt:
+                    // every member needs the structural clause.
+                    if !t.contains("termination_by") {
+                        t.push_str("termination_by structural x\n");
+                    }
+                    block.push_str(&t);
+                    block.push('\n');
+                }
+                block.push_str("end\n");
+                cmds.push(Command::Raw(block));
+                for d in scc {
+                    emitted.insert(d);
+                }
             }
+        }
+        for c in &wf_census {
+            cmds.push(Command::Raw(format!("-- wf lemma not synthesized: {}\n", c)));
+        }
+        for text in &wf_lemma_texts {
+            cmds.push(Command::Raw(format!("{}\n", text)));
         }
         for (_, text, _) in &closed_texts {
             cmds.push(Command::Raw(format!("{}\n", text)));
