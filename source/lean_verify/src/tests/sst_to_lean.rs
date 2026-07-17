@@ -919,6 +919,7 @@ fn mk_test_ctx() -> WpCtx<'static> {
     WpCtx {
         fn_map: HashMap::new(),
         datatypes: HashMap::new(),
+        fn_closer_is_default: true,
         type_map: HashMap::new(),
         assert_by_var_typs: HashMap::new(),
         ret_name: None,
@@ -1058,6 +1059,7 @@ fn mk_test_emitter() -> ObligationEmitter {
     ObligationEmitter {
         fn_name: "test_fn".to_string(),
         base_binders: Vec::new(),
+        baseline_prefix_len: 0,
         heartbeats: None,
         counter: 0,
         out: Vec::new(),
@@ -1222,7 +1224,7 @@ fn wpctx_new_empty_reqs_and_ensures_succeeds() {
     let krate = empty_krate();
     let check = empty_func_check(vec![], vec![]);
     let mut_param_names = HashSet::new();
-    let result = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new(), HashMap::new());
+    let result = WpCtx::new(&krate, &check, true, &mut_param_names, HashMap::new(), HashMap::new());
     assert!(result.is_ok(), "empty WpCtx should construct: {:?}", result.err());
     let ctx = result.unwrap();
     assert!(ctx.fn_map.is_empty(), "fn_map should be empty for empty krate");
@@ -1241,7 +1243,7 @@ fn wpctx_new_rejects_unsupported_form_in_reqs() {
     let bad_req = old_exp("snapshot", "x");
     let check = empty_func_check(vec![bad_req], vec![]);
     let mut_param_names = HashSet::new();
-    let result = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new(), HashMap::new());
+    let result = WpCtx::new(&krate, &check, true, &mut_param_names, HashMap::new(), HashMap::new());
     assert!(result.is_err(),
         "WpCtx::new must reject ExpX::Old in reqs; got Ok(_)");
     let err = result.err().unwrap();
@@ -1260,7 +1262,7 @@ fn wpctx_new_rejects_unsupported_form_in_ensures() {
     let bad_ens = old_exp("snapshot", "y");
     let check = empty_func_check(vec![], vec![bad_ens]);
     let mut_param_names = HashSet::new();
-    let result = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new(), HashMap::new());
+    let result = WpCtx::new(&krate, &check, true, &mut_param_names, HashMap::new(), HashMap::new());
     assert!(result.is_err(),
         "WpCtx::new must reject ExpX::Old in ens_exps; got Ok(_)");
 }
@@ -1318,7 +1320,7 @@ fn walk_loop_skips_init_for_ensures_kind_invariant() {
     let krate = empty_krate();
     let check = empty_func_check(vec![], vec![]);
     let mut_param_names = HashSet::new();
-    let ctx = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new(), HashMap::new())
+    let ctx = WpCtx::new(&krate, &check, true, &mut_param_names, HashMap::new(), HashMap::new())
         .expect("empty ctx");
     let mut emitter = mk_test_emitter();
 
@@ -1371,7 +1373,7 @@ fn walk_loop_emits_init_for_at_entry_invariant() {
     let krate = empty_krate();
     let check = empty_func_check(vec![], vec![]);
     let mut_param_names = HashSet::new();
-    let ctx = WpCtx::new(&krate, &check, &mut_param_names, HashMap::new(), HashMap::new())
+    let ctx = WpCtx::new(&krate, &check, true, &mut_param_names, HashMap::new(), HashMap::new())
         .expect("empty ctx");
     let mut emitter = mk_test_emitter();
 

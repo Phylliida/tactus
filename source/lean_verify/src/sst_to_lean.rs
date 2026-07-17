@@ -329,6 +329,11 @@ pub struct WpCtx<'a> {
     /// up variant field lists here to upgrade a positive `IsVariant`
     /// branch hypothesis into field binders + a constructor equation.
     pub datatypes: HashMap<&'a vir::ast::Path, &'a vir::ast::DatatypeX>,
+    /// True when the fn has NO fn-level `tactus_tactic` override — its
+    /// obligations run the default closer. Gates emission-shape
+    /// upgrades (the Return→Wp::Let route): a fn-level user tactic is
+    /// positional against the legacy goal shape and must keep it.
+    pub fn_closer_is_default: bool,
     /// Map from a BorrowMut local's sanitized name to the user-local
     /// `VarIdent` it bridges. Populated by walking the SST body
     /// looking for `Assign(user_local, Var(borrow_mut_local))` —
@@ -466,6 +471,7 @@ impl<'a> WpCtx<'a> {
     pub fn new(
         krate: &'a KrateX,
         check: &'a FuncCheckSst,
+        fn_attr_closer_is_default: bool,
         // For callee-side `&mut` body verification (#94): set of
         // sanitized param-name strings for the fn's `&mut` params.
         // Each ens_exp is rewritten so `*old(x)` → `<x>_at_pre_tactus`
@@ -582,9 +588,35 @@ impl<'a> WpCtx<'a> {
                 ))
             }).collect::<Result<Vec<_>, String>>()?
         );
+        // The Return→Wp::Let route additionally requires NO user
+        // `proof { tac }` tactic prefix anywhere in the body: a
+        // prefix flows onto every theorem in its scope and is
+        // positional against the legacy goal shape (a user
+        // `cases k with …; split` script overshoots forked per-arm
+        // goals — `test_exec_match_enum_with_per_arm_proof`).
+        // Assert-by closers are fine: they close only their own
+        // theorem.
+        let mut has_proof_block_prefix = false;
+        let _ = vir::sst_visitor::stm_visitor_dfs::<(), _>(
+            &check.body,
+            &mut |stm: &vir::sst::Stm| {
+                if let vir::sst::StmX::AssertQuery {
+                    mode: vir::ast::AssertQueryMode::Tactus {
+                        kind: vir::ast::TactusKind::ProofBlock, ..
+                    },
+                    ..
+                } = &stm.x
+                {
+                    has_proof_block_prefix = true;
+                }
+                vir::visitor::VisitorControlFlow::Recurse
+            },
+        );
+        let fn_closer_is_default = fn_attr_closer_is_default && !has_proof_block_prefix;
         Ok(Self {
             fn_map,
             datatypes,
+            fn_closer_is_default,
             type_map,
             assert_by_var_typs,
             ret_name,
@@ -1172,7 +1204,14 @@ pub fn exec_fn_theorems_to_ast<'a>(
         })
         .collect();
 
-    let ctx = WpCtx::new(krate, check, &mut_param_names, borrow_mut_links, caller_param_typs)?;
+    let ctx = WpCtx::new(
+        krate,
+        check,
+        fn_sst.x.attrs.tactus_tactic.is_none(),
+        &mut_param_names,
+        borrow_mut_links,
+        caller_param_typs,
+    )?;
 
     let mut binders = build_param_binders(fn_sst);
     binders.extend(build_borrow_mut_binders(check));
@@ -1225,6 +1264,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
             .join("\n");
         tactic_prefix.push(haves);
     }
+    let baseline_prefix_len = tactic_prefix.len();
     let mut emitter = ObligationEmitter {
         fn_name,
         base_binders: binders,
@@ -1232,10 +1272,11 @@ pub fn exec_fn_theorems_to_ast<'a>(
         out: Vec::new(),
         goal_shapes: Vec::new(),
         tactic_prefix,
+        baseline_prefix_len,
         default_closer,
         heartbeats: fn_sst.x.attrs.tactus_heartbeats,
         dt_inventory: std::sync::Arc::new(
-            crate::to_lean_fn::datatype_simp_def_inventory(&krate.datatypes),
+            crate::to_lean_fn::datatype_simp_def_inventory(&krate.datatypes, &krate.functions),
         ),
     };
 
@@ -2057,6 +2098,11 @@ struct ObligationEmitter {
     /// the production `GoalList`; inert when `--tactus-emit-cert` is off.
     goal_shapes: Vec<Option<GoalShape>>,
     tactic_prefix: Vec<String>,
+    /// `tactic_prefix.len()` at construction — the broadcast-lemma
+    /// `have` block only. Entries beyond this are USER prefixes
+    /// (walk-pushed `proof { tac }` scopes), which reshape goals;
+    /// the derived closer drops its named intros under them.
+    baseline_prefix_len: usize,
     /// The default closer for emitted theorems. Normally
     /// `Tactic::Named("tactus_auto")`; overridden via the
     /// `#[verifier::tactus_tactic("...")]` attribute on the fn.
@@ -2299,6 +2345,7 @@ impl ObligationEmitter {
                         &goal,
                         &self.dt_inventory,
                         &binders,
+                        self.tactic_prefix.len() > self.baseline_prefix_len,
                     )),
                 }
             }
@@ -2313,6 +2360,7 @@ impl ObligationEmitter {
                     crate::tactic_select::DERIVED_MARKER,
                     &crate::tactic_select::derived_closer(
                         &goal, &self.dt_inventory, &binders,
+                        self.tactic_prefix.len() > self.baseline_prefix_len,
                     ),
                 ));
             }
@@ -4703,6 +4751,7 @@ pub(crate) fn cert_call_leaves<'a>(
         out: Vec::new(),
         goal_shapes: Vec::new(),
         tactic_prefix: Vec::new(),
+        baseline_prefix_len: 0,
         default_closer: Tactic::Named("tactus_auto".to_string()),
         heartbeats: None,
         dt_inventory: Default::default(),
@@ -5894,6 +5943,24 @@ fn build_wp<'a>(
         // produce `Wp::Done`).
         StmX::Return { ret_exp: Some(e), assert_id: _, base_error: _, inside_body: _ } => {
             check_exp(e)?;
+            // Leaf-normal route (DESIGN-leaf-normal-emission.md §3a):
+            // bind the returned value as a TYPED `Wp::Let` over the
+            // ensures leaf. `walk_let` then peels `Bind(Let)` wrappers
+            // into typed frames (hoistable under N1) and FORKS value-
+            // position ifs (N2 constructor equations for matches in
+            // return position). Gated on the DEFAULT closer — a
+            // fn-level tactus_tactic is positional against the legacy
+            // `Done(let ret := e; …)` shape and keeps it.
+            if ctx.fn_closer_is_default {
+                if let (Some(name), Some(ret_typ)) = (ctx.ret_name, ctx.ret_typ.as_ref()) {
+                    return Ok(Wp::Let(
+                        crate::lean_name::LeanName::synthetic(sanitize(name)),
+                        crate::to_lean_sst_expr::Validated::check(e)?,
+                        ret_typ.clone(),
+                        Box::new(Wp::Done(ctx.ensures_goal.clone())),
+                    ));
+                }
+            }
             let ensures_goal = ctx.ensures_goal.clone();
             let ret_name = ctx.ret_name;
             // Coerce the returned value to the declared return typ via

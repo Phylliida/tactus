@@ -838,7 +838,7 @@ where
     }
 }
 
-pub(crate) fn stm_visitor_dfs<T, F>(stm: &Stm, f: &mut F) -> VisitorControlFlow<T>
+pub fn stm_visitor_dfs<T, F>(stm: &Stm, f: &mut F) -> VisitorControlFlow<T>
 where
     F: FnMut(&Stm) -> VisitorControlFlow<T>,
 {

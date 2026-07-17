@@ -9862,13 +9862,17 @@ test_verify_one_file! {
         {
             1
         }
-    } => Err(e) => {
-        // Cross-crate names resolve (no "unknown constant"); closer
-        // can't close the axiomatic equality. Both behaviours expected.
-        let s = format!("{:?}", e);
-        assert!(s.contains("tactus_auto failed") && !s.contains("Unknown constant"),
-            "expected closer failure (not unknown-constant), got: {}", s);
-    }
+    } => Ok(())
+    // 2026-07-18 (residue round): PROMOTED from the long-standing Err
+    // pin. The documented gap ("no semantic info about the axiomatized
+    // Seq operations") closed from two sides meeting: the broadcast
+    // preamble now `have`s the seq axioms (`axiom_seq_push_len`,
+    // `axiom_seq_empty`, …) into every obligation, and the structural
+    // rung's goal-mentioned SPEC-FN unfolds put `singleton_len` in the
+    // simp set — so simp_all unfolds the spec fn and rewrites through
+    // the axiom equations to `r = 1`. Exactly the mechanism the old
+    // comment predicted ("once vstd's proof fns participate in the
+    // preamble, the lemma names would resolve").
 }
 
 // === Multi-element seq! literals (F3, DESIGN-lean-all-proofs-followons.md) ===
