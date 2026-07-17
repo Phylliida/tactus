@@ -282,3 +282,22 @@ Danielle (naming / default-on / theorem-vs-def).
   binderprops_to_hyps, seed_frame (+ RetBindWf conjunct via StmData
   scrut component). NEXT = R-c: the preservation synthesizer in
   generate.rs over the same IR the defs renderer consumes.
+
+- (2026-07-18, fable-b73) **PROBE36 FULL PASS (`b781b80`): every R-c
+  emission shape validated, all axiom-free.** (1) mutual wf defs =
+  per-def `termination_by structural x` INSIDE `mutual…end` (StmDataWf
+  needs RawExpWf conjuncts → the mutual family is demanded, mutual-
+  block emission replaces the census SKIP); (2) if-in-arm: rw[if_pos]
+  FAILS on rec_1-blind goals → `(congrArg DWf (if_pos h)).mpr p` defeq
+  transport; (3) nested match on 2nd wf scrutinee: plain; (4) non-
+  recursive comps (loop_maintain_frame): `unfold` works (equation
+  lemmas exist for non-rec defs) + by_cases + rw + composition;
+  (5) bound hyps pass WHOLE (⟨h_x_bound, h_y_bound, trivial⟩).
+  R-c = synthesizer over lean_ast::Expr (spec_fn_to_ast gives Def
+  bodies): proof term isomorphic to body; Var→hyp/comp, Ctor→⟨⟩,
+  spec-call→_wf lemma, self→rec, Match→match-mirror+destructure,
+  If→dite+congrArg, Let→let+have. Lemma sigs: binders from Def +
+  h_*_bound per u64 param + hwf_* per scalar-carrying-dt param.
+  Caller side (link_discharge): resolve wf args by text — param→hwf,
+  proj.deref→comp, `lib.g …`→g_wf application (top-level token split),
+  ctor→⟨⟩; bounds→(by omega).
