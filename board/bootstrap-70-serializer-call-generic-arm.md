@@ -54,3 +54,9 @@ written reason; suite green.
   Fixture: 14 certs (+vec_read).
 - Remaining for done: full vec_read bridge-close after b74 lands; tgt
   re-census (in flight); suite green (in flight).
+- (2026-07-18, fable-b74) **tgt payoff confirmed: exec wp-cert corpus
+  1 → 3** — runtime.apply_hom_gen + runtime.apply_hom_inv certify
+  (b70 generic gate + b71 ∀-path together took them through); census
+  267/1649, call-generic AND call-forall-path both zero, one call-mut
+  (copy_word) left in runtime. Full bridge-close of the new certs
+  pends bootstrap-74.
