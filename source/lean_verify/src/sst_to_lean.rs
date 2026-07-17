@@ -706,7 +706,41 @@ pub(crate) fn peel_value_position(e: &Exp) -> &Exp {
 /// vs else-path — the walker negates at the push site, the Exp is
 /// always the positive test). `None` = not a variant test (plain if).
 fn branch_test_of(cond: &Exp, positive: bool) -> Option<crate::lean_ast::BranchTest> {
-    let peeled = peel_value_position(cond);
+    // Fixpoint-peel every transparent wrapper the SST may interpose
+    // (Loc, Box/Unbox, CoerceMode, Trigger, CustomErr spans) and fold
+    // an explicit `Not` into the polarity — the lowered-match chain
+    // wraps inner discriminators differently per nesting level.
+    let mut peeled = peel_value_position(cond);
+    let mut positive = positive;
+    loop {
+        match &peeled.x {
+            ExpX::Unary(UnaryOp::Not, inner) => {
+                positive = !positive;
+                peeled = peel_value_position(inner);
+            }
+            ExpX::UnaryOpr(UnaryOpr::CustomErr(_), inner) => {
+                peeled = peel_value_position(inner);
+            }
+            // Lowered-match discriminators arrive as left-nested
+            // `And(And(IsVariant, true), true)` chains — one trivial
+            // `true` per pattern field. Fold true-conjuncts away; a
+            // conjunction of two REAL tests stays unextracted (None).
+            ExpX::Binary(vir::ast::BinaryOp::And, l, r) => {
+                let lp = peel_value_position(l);
+                let rp = peel_value_position(r);
+                let is_true = |e: &Exp| matches!(
+                    &e.x, ExpX::Const(vir::ast::Constant::Bool(true)));
+                if is_true(rp) {
+                    peeled = lp;
+                } else if is_true(lp) {
+                    peeled = rp;
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
     match &peeled.x {
         ExpX::UnaryOpr(UnaryOpr::IsVariant { datatype, variant }, inner) => {
             let dt = match datatype {
@@ -727,7 +761,12 @@ fn branch_test_of(cond: &Exp, positive: bool) -> Option<crate::lean_ast::BranchT
                 positive,
             })
         }
-        _ => None,
+        _ => {
+            if std::env::var("TACTUS_BRANCH_DEBUG").is_ok() {
+                eprintln!("BRANCH-DEBUG unextracted cond: {:?}", peeled.x);
+            }
+            None
+        }
     }
 }
 

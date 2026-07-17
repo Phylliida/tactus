@@ -3,7 +3,7 @@ title: "Link discharge — premise-free closed theorems per proof fn (spec: DESI
 status: in_progress
 claimed_by: fable-b73
 created: 2026-07-16T23:30:00Z
-updated: 2026-07-17T17:00:00Z
+updated: 2026-07-17T19:30:00Z
 ---
 
 ## Description
@@ -226,3 +226,41 @@ Danielle (naming / default-on / theorem-vs-def).
     seed_frame — the one semantic (non-mechanical) piece; consider
     emitting wf-preservation obligations OR scoping transport to
     constructor-built values first).
+
+- (2026-07-17 pm, fable-b73) **WF RUNG (R-b) LANDED — 57 closed, all five
+  scrutinee-matched fixes green.** Danielle's call: option (a), explicit
+  and transparent. What landed:
+  - **Wf predicate generation** (generate.rs): per scalar-carrying
+    datatype (transitively computed from VIR field typs — the Lean
+    model erases u64→Int, so bounds come from `type_bound_predicate`
+    on the VIR side), probe34's flWf shape with `termination_by
+    structural`, emitted dependencies-first into the Link namespace,
+    only when referenced. Named + positional accessors (`Loop_cond_ann`,
+    `val0`) both handled via krate field tables.
+  - **hwf threading** (link_discharge.rs): clean stmts gain
+    `(hwf : {Dt}Wf scrut)` / propagated `(hwf_p : ...)` binders;
+    `match scrut, hwf with | pat, ⟨comps⟩ =>` destructuring; components
+    discharge expr-fed bounds (`h_wf_<field>`) and feed the IH
+    (`hwf_<field>`); `ClosedMeta.wf_params` propagates demands
+    caller-ward through the fixpoint.
+  - **Three debugging rounds, all census-guided**: (1) inner match
+    discriminators arrive as left-nested `And(IsVariant, true)` chains
+    (pattern-field tests) — branch_test_of now folds true-conjuncts +
+    explicit Not; (2) `need_scrut_wf` false-positive on any-deref-arg
+    dragged the whole RawExp closure in (incl. the RawExp/RawArmList/
+    RawList MUTUAL family — cross-dt wf cycles stay census'd/SKIPPED,
+    mutual wf blocks = future rung if demanded); fixed to wf-param-
+    position-only; (3) `decreasing_by` bullets can't see arm-scoped
+    term lets — transitive `expand_lets` inlining (probe34's shape).
+  - **State: 57 closed (5 fix + 52 zero-spine), 10 pending** = 9×
+    awaits wp_stm_sound + wp_stm_sound itself on ONE remaining class:
+    **wf-transport for spec-fn results** (`tmp__3 := lib.ret_frame f rb`
+    feeding holds_all_close_each_e's FrameListWf; also frame_append /
+    loop-frame sites). Gate green, 138/0, vstd 1530/0.
+  - **NEXT (final rung to 67/67): preservation-lemma synthesis** —
+    `theorem ret_frame_wf : FrameListWf f → RetBindWf rb → FrameListWf
+    (ret_frame f rb)` etc., proof = structural induction mirroring the
+    spec fn's own match (VIR body analysis); NOTE the rec_1 gap (no
+    equation lemmas for Box-recursing defs) — structural defs should
+    iota-reduce on ctor scrutinees, but PROBE FIRST (hand-write
+    ret_frame_wf against the current emission before mechanizing).
