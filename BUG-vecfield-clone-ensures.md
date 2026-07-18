@@ -1,9 +1,23 @@
 # The final e2e residue: `test_exec_vec_field_index_clone` — full diagnosis
 
-**Status (2026-07-18): root cause pinned with a machine-checked witness.
-Not fixable by closer work. Two-layer gap; the blocking layer is the
-`call_ensures` / trait-ensures encoding (B6-adjacent), not sequence
-extensionality as previously guessed.**
+**Status (2026-07-18 evening): CLOSED — suite 551/0.** Both layers
+landed the same day the diagnosis was pinned: vstd gained
+`vec_clone_view_eq_u8` (broadcast, PROVED from u8's clone spec + seq
+ext — the semantic content the axiomatized `call_ensures` body
+withholds, surfaced as a lemma instead), and the derived closer gained
+equation-ELIMINATOR arms (signature-derived `apply` candidates from
+the broadcast set, last in the first| chain, both orientations).
+Hand-validated in the probe before implementation; test pin flipped
+Err→Ok per its own instructions. The general `call_ensures`/
+trait-ensures encoding (B6) remains the principled long-term arc —
+this closure removes its only current e2e customer but cad-01's
+Lean discharge still wants it.
+
+Original diagnosis (kept for the record): root cause pinned with a
+machine-checked witness. Not fixable by closer work alone. Two-layer
+gap; the blocking layer is the `call_ensures` / trait-ensures
+encoding (B6-adjacent), not sequence extensionality as previously
+guessed.
 
 Repro: `probe-vecfield-clone/run.sh` (regenerate the artifact first —
 instructions in the script header).
