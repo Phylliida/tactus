@@ -250,6 +250,7 @@ pub(crate) fn derived_closer(
     dts: &DtDefInventory,
     binders: &[Binder],
     user_prefix: bool,
+    eliminators: &[String],
 ) -> String {
     // Which `rfl` the kernel ladder gets is DERIVED from the goal's
     // core shape (after peeling the ∀/let/→ spine):
@@ -271,13 +272,98 @@ pub(crate) fn derived_closer(
     //   needed delta rfl.
     let rfl_form = if goal_core_is_equation(goal) { "rfl" } else { "with_reducible rfl" };
     let kernel = format!("first | {} | decide | omega", rfl_form);
+    let rung = structural_rung(goal, dts, binders, user_prefix);
+    // Equation-eliminator arms, LAST in the chain: for each broadcast
+    // lemma whose conclusion is a non-Prop equation (derived from
+    // signatures at emit time — see the emitter's `eliminators`
+    // field), `apply` it against the goal in both orientations, each
+    // leg closed by hypothesis or the rung's simp ladder. The whole
+    // apply+legs is one backtrackable arm per orientation — `first`
+    // does NOT re-enter a committed `(first | A | B) <;> C` when C
+    // fails, so the orientation split must wrap the legs. Only
+    // equation-core goals get the arms (apply against a non-equation
+    // goal cannot unify anyway), and being last they run only where
+    // every existing arm already failed.
+    let elim_arms: String = if eliminators.is_empty() || !goal_core_is_equation(goal) {
+        String::new()
+    } else {
+        let legs = format!("(first | assumption | ({}))", rung_tail(goal, dts, binders));
+        eliminators
+            .iter()
+            .map(|e| {
+                format!(
+                    " | (apply {e} <;> {legs}) | ((apply Eq.symm; apply {e}) <;> {legs})",
+                    e = e,
+                    legs = legs,
+                )
+            })
+            .collect()
+    };
     format!(
-        "first | {} | decide | omega | ({}) | ({}) | ({})",
+        "first | {} | decide | omega | ({}) | ({}) | ({}){}",
         rfl_form,
         render_peel(goal, &kernel),
         core_simp(),
-        structural_rung(goal, dts, binders, user_prefix)
+        rung,
+        elim_arms
     )
+}
+
+/// Pass-1/2 scan shared by `structural_rung` and `rung_tail`.
+/// Binder TYPES participate fully: hypothesis propositions live
+/// there (extracted requires-hyps pre-N1; ALL hyps and let
+/// equations after N1 hoisting), and datatype mentions often
+/// appear only there (`c : test_crate.Choice` — the 2026-07-17
+/// Cause-A gap). Scrutinee targets found in a binder type
+/// reference theorem binders, which `cases` can name directly.
+fn run_structural_scan<'a>(
+    goal: &Expr,
+    dts: &'a DtDefInventory,
+    binders: &[Binder],
+) -> StructuralScan<'a> {
+    let mut scan = StructuralScan::new(dts);
+    for b in binders {
+        scan.collect_mentioned_types(&b.ty);
+    }
+    scan.collect_mentioned_types(goal);
+    let env = std::collections::HashMap::new();
+    for b in binders {
+        scan.walk(&b.ty, &env);
+    }
+    scan.walk(goal, &env);
+    scan
+}
+
+/// The `simp_all … <;> omega` tail from an already-sorted unfold
+/// list plus the scan's injEq derivation. Shared by
+/// `structural_rung` (full rung) and `rung_tail` (legs of the
+/// equation-eliminator arms — no intros, no cases: leg goals have
+/// their own spines and the repro-validated leg form is the bare
+/// simp ladder).
+fn simp_tail_from_unfolds(unfolds: &mut Vec<String>, scan: &StructuralScan) -> String {
+    for t in &scan.mentioned_types {
+        if let Some(vs) = scan.dts.variants.get(t) {
+            for v in vs {
+                unfolds.push(format!("{}.{}.injEq", t, v));
+            }
+        }
+    }
+    unfolds.sort();
+    unfolds.dedup();
+    let simp_list = if unfolds.is_empty() {
+        format!("{}, {}", CORE_LEMMAS, STRUCTURAL_EXTRA_LEMMAS)
+    } else {
+        format!("{}, {}, {}", CORE_LEMMAS, STRUCTURAL_EXTRA_LEMMAS, unfolds.join(", "))
+    };
+    format!("simp_all +zetaDelta only [{}] <;> omega", simp_list)
+}
+
+/// Leg ladder for eliminator arms: the structural simp tail alone.
+fn rung_tail(goal: &Expr, dts: &DtDefInventory, binders: &[Binder]) -> String {
+    let scan = run_structural_scan(goal, dts, binders);
+    let mut unfolds: Vec<String> = scan.unfolds.iter().cloned().collect();
+    unfolds.extend(scan.mentioned_spec_fns.iter().cloned());
+    simp_tail_from_unfolds(&mut unfolds, &scan)
 }
 
 /// True when the goal's core — after peeling the leading ∀-binder /
@@ -363,22 +449,7 @@ pub(crate) fn structural_rung(
     binders: &[Binder],
     user_prefix: bool,
 ) -> String {
-    let mut scan = StructuralScan::new(dts);
-    // Binder TYPES participate fully: hypothesis propositions live
-    // there (extracted requires-hyps pre-N1; ALL hyps and let
-    // equations after N1 hoisting), and datatype mentions often
-    // appear only there (`c : test_crate.Choice` — the 2026-07-17
-    // Cause-A gap). Scrutinee targets found in a binder type
-    // reference theorem binders, which `cases` can name directly.
-    for b in binders {
-        scan.collect_mentioned_types(&b.ty);
-    }
-    scan.collect_mentioned_types(goal);
-    let env = std::collections::HashMap::new();
-    for b in binders {
-        scan.walk(&b.ty, &env);
-    }
-    scan.walk(goal, &env);
+    let scan = run_structural_scan(goal, dts, binders);
 
     let mut steps: Vec<String> = Vec::new();
     // Named spine intros mirror the EMITTED goal. A user tactic
@@ -396,29 +467,11 @@ pub(crate) fn structural_rung(
     steps.push("intros".to_string());
     let prefix = steps.join("; ");
 
-    let mut unfolds: Vec<String> = scan.unfolds.into_iter().collect();
-    // Injectivity for every mentioned datatype's constructors: with
-    // N1/N2 the hypotheses carry constructor EQUATIONS (`s = Left v`),
-    // and `cases` introduces its own constructor applications — the
-    // resulting `Left a = Left b` / `Right a = Left b` goals need
-    // `.injEq` (and `reduceCtorEq`, in STRUCTURAL_EXTRA_LEMMAS) to
-    // resolve under `simp_all only`. Derived, not searched: only
-    // mentioned datatypes contribute.
-    for t in &scan.mentioned_types {
-        if let Some(vs) = dts.variants.get(t) {
-            for v in vs {
-                unfolds.push(format!("{}.{}.injEq", t, v));
-            }
-        }
-    }
-    unfolds.extend(scan.mentioned_spec_fns.into_iter());
+    let mut unfolds: Vec<String> = scan.unfolds.iter().cloned().collect();
+    // (constructor .injEq derivation lives in simp_tail_from_unfolds)
+    unfolds.extend(scan.mentioned_spec_fns.iter().cloned());
     unfolds.sort();
-    let simp_list = if unfolds.is_empty() {
-        format!("{}, {}", CORE_LEMMAS, STRUCTURAL_EXTRA_LEMMAS)
-    } else {
-        format!("{}, {}, {}", CORE_LEMMAS, STRUCTURAL_EXTRA_LEMMAS, unfolds.join(", "))
-    };
-    let tail = format!("simp_all +zetaDelta only [{}] <;> omega", simp_list);
+    let tail = simp_tail_from_unfolds(&mut unfolds, &scan);
 
     let cases: Vec<String> = scan.targets.iter().take(3).enumerate()
         .map(|(i, t)| format!("cases _tactus_scrut_{} : {}", i, t))

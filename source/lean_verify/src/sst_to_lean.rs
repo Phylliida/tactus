@@ -1257,6 +1257,33 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // simp_all-usable at concrete instantiations (N0 probe). Uniform:
     // harmless for unbracketed axioms.
     let mut tactic_prefix: Vec<String> = Vec::new();
+    // Equation-ELIMINATOR lemmas among the haves (derived from lemma
+    // SIGNATURES, not searched at proof time): a broadcast lemma with
+    // a single ensures whose top shape is an equation at a non-bool
+    // type is a goal-directed eliminator — `apply`ing it against an
+    // equation goal leaves its requires as legs. The derived closer
+    // appends `apply`-arms for these LAST in the first| chain, so
+    // they only run on goals every existing arm already failed
+    // (vec_clone_view_eq_u8 closing view-equality from a vec clone's
+    // pointwise ensures is the motivating case — the final e2e
+    // residue; see BUG-vecfield-clone-ensures.md).
+    let eliminators: Vec<String> = broadcast_lemmas
+        .iter()
+        .filter_map(|fun| {
+            let fx = krate.functions.iter().find(|f| &f.x.name == *fun)?;
+            if fx.x.ensure.0.len() != 1 {
+                return None;
+            }
+            match &fx.x.ensure.0[0].x {
+                vir::ast::ExprX::Binary(vir::ast::BinaryOp::Eq(_), l, _)
+                    if !matches!(&*vir::ast_util::undecorate_typ(&l.typ), vir::ast::TypX::Bool) =>
+                {
+                    Some(crate::to_lean_type::lean_name(&fun.path))
+                }
+                _ => None,
+            }
+        })
+        .collect();
     if !broadcast_lemmas.is_empty() {
         let haves: String = broadcast_lemmas.iter().enumerate()
             .map(|(i, f)| format!("have _tactus_bc_{} := @{}", i, lean_name(&f.path)))
@@ -1272,6 +1299,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
         out: Vec::new(),
         goal_shapes: Vec::new(),
         tactic_prefix,
+        eliminators,
         baseline_prefix_len,
         default_closer,
         heartbeats: fn_sst.x.attrs.tactus_heartbeats,
@@ -2098,6 +2126,11 @@ struct ObligationEmitter {
     /// the production `GoalList`; inert when `--tactus-emit-cert` is off.
     goal_shapes: Vec<Option<GoalShape>>,
     tactic_prefix: Vec<String>,
+    /// Lean names of equation-eliminator broadcast lemmas in scope
+    /// (single-ensure, non-Prop equation conclusion — computed from
+    /// lemma signatures at construction). The derived closer appends
+    /// last-resort `apply`-arms for these.
+    eliminators: Vec<String>,
     /// `tactic_prefix.len()` at construction — the broadcast-lemma
     /// `have` block only. Entries beyond this are USER prefixes
     /// (walk-pushed `proof { tac }` scopes), which reshape goals;
@@ -2346,6 +2379,7 @@ impl ObligationEmitter {
                         &self.dt_inventory,
                         &binders,
                         self.tactic_prefix.len() > self.baseline_prefix_len,
+                        &self.eliminators,
                     )),
                 }
             }
@@ -2361,6 +2395,7 @@ impl ObligationEmitter {
                     &crate::tactic_select::derived_closer(
                         &goal, &self.dt_inventory, &binders,
                         self.tactic_prefix.len() > self.baseline_prefix_len,
+                        &self.eliminators,
                     ),
                 ));
             }
@@ -4751,6 +4786,7 @@ pub(crate) fn cert_call_leaves<'a>(
         out: Vec::new(),
         goal_shapes: Vec::new(),
         tactic_prefix: Vec::new(),
+        eliminators: Vec::new(),
         baseline_prefix_len: 0,
         default_closer: Tactic::Named("tactus_auto".to_string()),
         heartbeats: None,
