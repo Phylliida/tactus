@@ -239,7 +239,13 @@ its absence is how the S2c regression shipped.
 > Bonus: cross_crate_probe_5 promoted Err→Ok — the axiomatic-Seq gap
 > its 2026-05-12 comment predicted would close, closed.
 >
-> **Remaining (1): `vec_field_index_clone`** — diagnosis CORRECTED
+> **RESIDUE ZERO (2026-07-18 evening): suite 551/0 — vec_field CLOSED
+> same-day.** vstd `vec_clone_view_eq_u8` (proved broadcast surface
+> for what the axiomatized call_ensures body withholds) + derived
+> equation-eliminator arms (signature-derived apply candidates, last
+> in chain, both orientations). See BUG-vecfield-clone-ensures.md.
+>
+> Historical: **Remaining (1): `vec_field_index_clone`** — diagnosis CORRECTED
 > and pinned with a machine-checked witness, see
 > `BUG-vecfield-clone-ensures.md` + `probe-vecfield-clone/`. NOT an
 > extensionality gap: `axiom_seq_ext_equal` is in the haves and (via
