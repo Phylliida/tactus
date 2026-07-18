@@ -18,7 +18,12 @@
 //! permanently disables routing for the run — correctness never
 //! depends on the driver, only speed.
 //!
-//! Gate: `TACTUS_DRIVER=0` (or `off`) disables routing entirely.
+//! Gate: OPT-IN via `TACTUS_DRIVER=1`. Measured on current crates the
+//! driver is a large CPU win (-60..85%) but wall-neutral-to-negative
+//! (tactus-core -3s; gt +26s — its snapshots import the 107-part defs
+//! closure, and its per-fn lean mass is small). Wall-bound daily gates
+//! keep the process path; CPU-bound contexts (thermals, shared boxes,
+//! low-core machines where CPU IS wall) opt in.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -35,8 +40,8 @@ static DISABLED: AtomicBool = AtomicBool::new(false);
 
 fn env_enabled() -> bool {
     match std::env::var("TACTUS_DRIVER") {
-        Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("off")),
-        Err(_) => true,
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("on"),
+        Err(_) => false,
     }
 }
 
