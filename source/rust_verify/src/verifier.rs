@@ -2391,6 +2391,37 @@ impl Verifier {
             let tactic_bodies =
                 tactus_tactic_bodies.get_or_init(|| build_tactic_bodies_map(&vir_krate));
             let workers = tactus_lean_jobs.len().min(std::cmp::max(1, self.args.num_threads));
+            // Persistent-driver prime (DESIGN-lean-driver.md): build
+            // stmt oleans and the wide import snapshot once, so the
+            // per-fn checks below elaborate in-driver (~ms) instead of
+            // spawning a lean process (~2s) each. No-op / fallback on
+            // any failure.
+            let prime_jobs: Vec<lean_verify::PrimeJob> = tactus_lean_jobs.iter()
+                .map(|j| match j {
+                    TactusLeanJob::Proof { vir_fn, tactic_body, .. } => {
+                        lean_verify::PrimeJob::Proof {
+                            f: &vir_fn.x,
+                            tactic_body,
+                            imports: &vir_fn.x.attrs.lean_imports,
+                        }
+                    }
+                    TactusLeanJob::Exec { vir_fn, function, check_sst } => {
+                        lean_verify::PrimeJob::Exec {
+                            f: &vir_fn.x,
+                            fn_sst: function,
+                            check: check_sst,
+                            imports: &vir_fn.x.attrs.lean_imports,
+                        }
+                    }
+                })
+                .collect();
+            // Claim-order permutation: largest pkg module first, so
+            // the slowest check overlaps the rest instead of tailing.
+            // Result collection below indexes by original job id, so
+            // execution order never affects report order.
+            let claim_order = lean_verify::prime_lean_driver(
+                &vir_krate, &crate_name, tactic_bodies, &prime_jobs, workers,
+            );
             let results: Vec<std::sync::OnceLock<lean_verify::CheckResult>> =
                 (0..tactus_lean_jobs.len()).map(|_| std::sync::OnceLock::new()).collect();
             let next = std::sync::atomic::AtomicUsize::new(0);
@@ -2401,8 +2432,10 @@ impl Verifier {
                     let crate_name = &crate_name;
                     let results = &results;
                     let next = &next;
+                    let claim_order = &claim_order;
                     scope.spawn(move || loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let c = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&i) = claim_order.get(c) else { break };
                         let Some(job) = jobs.get(i) else { break };
                         let result = match job {
                             TactusLeanJob::Proof { vir_fn, tactic_body, .. } => {

@@ -2924,6 +2924,165 @@ fn ensure_stmt_olean(
 /// the whole crate; on the happy path the proof-only ladder is never
 /// attempted. Selection is memoized per scope inside `for_crate`, so
 /// the choice is stable within a run.
+/// One lean-routed verification job, as data for `prime_lean_driver` —
+/// mirrors the verifier's `TactusLeanJob` without importing its type.
+pub enum PrimeJob<'a> {
+    Proof { f: &'a FunctionX, tactic_body: &'a str, imports: &'a [String] },
+    Exec {
+        f: &'a FunctionX,
+        fn_sst: &'a FunctionSst,
+        check: &'a FuncCheckSst,
+        imports: &'a [String],
+    },
+}
+
+/// Package-emission outcomes produced by the prime pass, consumed by
+/// the per-fn check paths. The stash (rather than re-emitting in the
+/// worker) matters for M5e: emission computes each module's `changed`
+/// flag by comparing against the on-disk content BEFORE writing — a
+/// second emission would always see "unchanged" and could take the
+/// cross-run cache shortcut on a fn that genuinely changed this run.
+static PRIME_OUTCOMES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<Fun, Result<PkgEmitOutcome, String>>>,
+> = std::sync::OnceLock::new();
+
+fn stash_prime_outcome(f: &Fun, outcome: Result<PkgEmitOutcome, String>) {
+    PRIME_OUTCOMES.get_or_init(Default::default)
+        .lock().unwrap()
+        .insert(f.clone(), outcome);
+}
+
+fn take_prime_outcome(f: &Fun) -> Option<Result<PkgEmitOutcome, String>> {
+    PRIME_OUTCOMES.get()?.lock().unwrap().remove(f)
+}
+
+/// Prime the persistent-driver pool for this crate's per-fn package
+/// phase (DESIGN-lean-driver.md). Called once before the verifier's
+/// worker pool:
+/// 1. spawn `workers` drivers, base snapshot (defs umbrella) on each;
+/// 2. run package EMISSION for every job (pure Rust, stashing each
+///    outcome for the worker's check path), collecting the full stmt
+///    module set;
+/// 3. build stmt oleans through the drivers (workers-parallel, memo
+///    shared with the check path via `ensure_stmt_olean`);
+/// 4. establish the WIDE snapshot (defs + every stmt) on each driver,
+///    so per-fn pkg checks elaborate as ~ms branches.
+/// A no-op when the driver is disabled, the crate is below the routing
+/// floor, or the crate has no package defs. Failure never surfaces —
+/// checks fall back to process-per-file.
+/// Returns a claim-order permutation of `jobs` (largest emitted pkg
+/// module first — pkg text size is a good proxy for elaboration time,
+/// and starting the slowest check first minimizes the pool's critical
+/// path). Identity order when priming is skipped.
+pub fn prime_lean_driver(
+    krate: &KrateX,
+    crate_name: &str,
+    tactic_bodies: &std::collections::HashMap<Fun, String>,
+    jobs: &[PrimeJob],
+    workers: usize,
+) -> Vec<usize> {
+    let identity = || (0..jobs.len()).collect::<Vec<usize>>();
+    if !crate::driver_client::enabled() {
+        return identity();
+    }
+    // Routing economics: the driver's fixed cost (boot + two
+    // importModules ≈ 3.5s) beats process-per-file (~2s/fn) only once
+    // a crate has enough lean-routed fns. Below the floor the ordinary
+    // path is faster — tiny e2e crates stay as they are; big crates
+    // (tactus-core, gt) amortize the prime across hundreds of ms-cost
+    // checks.
+    let min_jobs = std::env::var("TACTUS_DRIVER_MIN_JOBS").ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(6);
+    if jobs.len() < min_jobs {
+        return identity();
+    }
+    install_emit_tables(krate, crate_name);
+    let Some(defs) = unified_package_defs(krate, crate_name, tactic_bodies) else {
+        return identity();
+    };
+    let Ok(prelude_dir) = crate::prelude::ensure_prelude_olean() else {
+        return identity();
+    };
+    let base_path = format!("{}:{}", prelude_dir.display(), defs.dir.display());
+    let merged = merged_lean_path(&base_path);
+    if !crate::driver_client::spawn_pool(&merged, workers, &[defs.module_name.clone()]) {
+        return identity();
+    }
+
+    // Emission pass: write pkg + stmt modules for every job, stash the
+    // outcome, collect the stmt set (module → any-changed) and each
+    // job's pkg module size (for the claim-order permutation).
+    let mut stmts: std::collections::BTreeMap<String, bool> = Default::default();
+    let mut sizes: Vec<u64> = vec![0; jobs.len()];
+    for (ji, job) in jobs.iter().enumerate() {
+        let (name, outcome) = match job {
+            PrimeJob::Proof { f, tactic_body, imports } => (
+                &f.name,
+                emit_package_proof_fn(
+                    krate, f, tactic_body, imports, crate_name, tactic_bodies, &defs,
+                ),
+            ),
+            PrimeJob::Exec { f, fn_sst, check, imports } => (
+                &f.name,
+                emit_package_exec_fn(
+                    krate, f, fn_sst, check, imports, crate_name, tactic_bodies, &defs,
+                ),
+            ),
+        };
+        match &outcome {
+            Ok(PkgEmitOutcome::Single { stmt_modules, path, .. })
+            | Ok(PkgEmitOutcome::Mutual { stmt_modules, path, .. }) => {
+                for (m, ch) in stmt_modules {
+                    *stmts.entry(m.clone()).or_default() |= *ch;
+                }
+                sizes[ji] = std::fs::metadata(path).map(|md| md.len()).unwrap_or(0);
+            }
+            _ => {}
+        }
+        stash_prime_outcome(name, outcome);
+    }
+
+    // Stmt oleans, workers-parallel through the drivers (the memo in
+    // `ensure_stmt_olean` makes the worker-phase calls no-ops).
+    let stmt_list: Vec<(&String, bool)> = stmts.iter().map(|(m, ch)| (m, *ch)).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..workers.max(1).min(stmt_list.len().max(1)) {
+            let stmt_list = &stmt_list;
+            let next = &next;
+            let defs = &defs;
+            let prelude_dir = &prelude_dir;
+            scope.spawn(move || loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some((m, ch)) = stmt_list.get(i) else { break };
+                let may_skip = !*ch && !defs.breaking;
+                let _ = ensure_stmt_olean(m.as_str(), defs, prelude_dir, may_skip);
+            });
+        }
+    });
+
+    // Wide snapshot over defs + every stmt whose olean exists (a
+    // failed stmt build must not sink the snapshot; its pkg checks
+    // fall back).
+    let mut wide: Vec<String> = vec![defs.module_name.clone()];
+    wide.extend(stmt_list.iter()
+        .filter(|(m, _)| defs.dir.join(format!("{m}.olean")).exists())
+        .map(|(m, _)| (*m).clone()));
+    crate::driver_client::add_snapshot_all("wide", &wide);
+    // Search-ladder variant: pkg files whose closers needed the search
+    // rung additionally import TactusSearch. Give them their own
+    // superset snapshot — minimal-covering selection keeps everyone
+    // else on plain "wide".
+    let mut wide_search = wide.clone();
+    wide_search.push("TactusSearch".to_string());
+    crate::driver_client::add_snapshot_all("wide_search", &wide_search);
+
+    let mut order = identity();
+    order.sort_by_key(|&i| std::cmp::Reverse(sizes[i]));
+    order
+}
+
 fn unified_package_defs(
     krate: &KrateX,
     crate_name: &str,
@@ -2955,9 +3114,14 @@ fn check_proof_fn_via_package(
         Err(e) => return Some(CheckResult::Error(e)),
     };
     let base_path = format!("{}:{}", prelude_dir.display(), defs.dir.display());
-    match emit_package_proof_fn(
-        krate, proof_fn, tactic_body, imports, crate_name, tactic_bodies, &defs,
-    ) {
+    // Consume the prime pass's stashed emission if there is one (see
+    // PRIME_OUTCOMES: re-emitting would corrupt the changed flags).
+    let emitted = take_prime_outcome(&proof_fn.name).unwrap_or_else(|| {
+        emit_package_proof_fn(
+            krate, proof_fn, tactic_body, imports, crate_name, tactic_bodies, &defs,
+        )
+    });
+    match emitted {
         Ok(PkgEmitOutcome::Single { leaf, path, source_map, stmt_modules, changed }) => {
             // Cross-run cache (M5e): everything this module sees is
             // unchanged (own text, stmt imports, defs non-breaking) and
@@ -3823,6 +3987,11 @@ fn run_lean_json(
     produce_olean: bool,
     lean_path: &str,
 ) -> Result<lean_process::LeanResult, String> {
+    if let Some(r) =
+        crate::driver_client::try_check(dir, module, produce_olean, &merged_lean_path(lean_path))
+    {
+        return Ok(r);
+    }
     let mut args: Vec<String> = vec!["--json".to_string()];
     if produce_olean {
         args.push("-o".to_string());
@@ -3860,6 +4029,21 @@ fn run_lean(
     lean_path: &str,
     failures: &mut Vec<(String, String)>,
 ) {
+    if let Some(r) =
+        crate::driver_client::try_check(dir, module, produce_olean, &merged_lean_path(lean_path))
+    {
+        if !r.success {
+            let text = r.diagnostics.iter()
+                .map(|d| {
+                    let (l, c) = d.pos.as_ref().map(|p| (p.line, p.column)).unwrap_or((0, 0));
+                    format!("{module}.lean:{l}:{c}: {}: {}", d.severity, d.data)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            failures.push((module.to_string(), text));
+        }
+        return;
+    }
     let mut args: Vec<String> = Vec::new();
     if produce_olean {
         args.push("-o".to_string());
@@ -5279,9 +5463,14 @@ fn check_exec_fn_via_package(
         Err(e) => return Some(CheckResult::Error(e)),
     };
     let base_path = format!("{}:{}", prelude_dir.display(), defs.dir.display());
-    match emit_package_exec_fn(
-        krate, vir_fn, fn_sst, check, imports, crate_name, tactic_bodies, &defs,
-    ) {
+    // Consume the prime pass's stashed emission if there is one (see
+    // PRIME_OUTCOMES: re-emitting would corrupt the changed flags).
+    let emitted = take_prime_outcome(&vir_fn.name).unwrap_or_else(|| {
+        emit_package_exec_fn(
+            krate, vir_fn, fn_sst, check, imports, crate_name, tactic_bodies, &defs,
+        )
+    });
+    match emitted {
         Ok(PkgEmitOutcome::Single { leaf, path, source_map, stmt_modules, changed }) => {
             let olean = path.with_extension("olean");
             let cacheable = !changed
