@@ -291,6 +291,32 @@ pub broadcast proof fn vec_clone_deep_view_proof<T: DeepView, A: Allocator>(
 {
 }
 
+/// For element types whose `clone` is exactly equality (the integer
+/// primitives — their specs `ensures res == x` live in std_specs/num.rs),
+/// a vec clone's pointwise `cloned` facts upgrade to view EQUALITY.
+/// Z3 derives this on demand by unfolding `cloned` through
+/// `call_ensures`; the Tactus Lean backend cannot (BuiltinSpecFun
+/// bodies are axiomatized — see tactus/BUG-vecfield-clone-ensures.md),
+/// so the fact must exist as a broadcast SURFACE. Proved, not assumed:
+/// no new trust either side. Same trigger discipline as
+/// `vec_clone_deep_view_proof` above. The pattern generalizes to the
+/// other integer primitives when needed.
+pub broadcast proof fn vec_clone_view_eq_u8<A: Allocator>(v1: Vec<u8, A>, v2: Vec<u8, A>)
+    requires
+        #[trigger] vec_clone_trigger(v1, v2),
+        v1@.len() == v2@.len(),
+        forall|i| #![all_triggers] 0 <= i < v1@.len() ==> cloned::<u8>(v1@[i], v2@[i]),
+    ensures
+        v1@ == v2@,
+{
+    broadcast use super::super::seq::group_seq_axioms;
+    assert(v1@ =~= v2@) by {
+        assert forall|i: int| 0 <= i < v1@.len() implies v1@[i] == v2@[i] by {
+            assert(cloned::<u8>(v1@[i], v2@[i]));
+        }
+    }
+}
+
 pub assume_specification<T, A: Allocator>[ Vec::<T, A>::truncate ](vec: &mut Vec<T, A>, len: usize)
     ensures
         len <= old(vec).len() ==> vec@ == old(vec)@.subrange(0, len as int),
@@ -544,6 +570,7 @@ pub broadcast group group_vec_axioms {
     axiom_spec_len,
     axiom_vec_index_decreases,
     vec_clone_deep_view_proof,
+    vec_clone_view_eq_u8,
     axiom_spec_into_iter,
     axiom_vec_has_resolved,
     axiom_vec_decreases_to_view,

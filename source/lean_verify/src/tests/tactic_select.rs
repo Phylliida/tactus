@@ -219,7 +219,7 @@ fn derived_closer_is_search_free_and_census_exact() {
     // no search tactic named, kernel rungs + generated intro/refine
     // prefix + fixed CORE set + omega tail.
     let goal = bin(BinOp::Eq, var("x"), var("y"));
-    let derived = derived_closer(&goal, &Default::default(), &[], false);
+    let derived = derived_closer(&goal, &Default::default(), &[], false, &[]);
     assert!(!derived.contains("tactus_auto"));
     assert!(!derived.contains("case_split"));
     assert!(!derived.contains("tactus_first"));
@@ -234,7 +234,7 @@ fn derived_closer_is_search_free_and_census_exact() {
     // the leaf ladder.
     assert!(derived.contains("first | rfl | decide | omega"));
     let goal_le = bin(BinOp::Le, var("x"), var("y"));
-    let derived_le = derived_closer(&goal_le, &Default::default(), &[], false);
+    let derived_le = derived_closer(&goal_le, &Default::default(), &[], false, &[]);
     assert!(derived_le.starts_with("first | with_reducible rfl | decide | omega | ("));
     // The CORE set is the census union + extensions: 51 lemmas (50 separators).
     assert_eq!(CORE_LEMMAS.matches(", ").count(), 50);

@@ -2978,30 +2978,17 @@ test_verify_one_file! {
         {
             h.imgs[i].clone()
         }
-    } => Err(err) => {
-        // Artifact-correctness pin: the ONLY acceptable failure class
-        // is the auto-tactic one. Any mismatch / Invalid field / parse
-        // marker = the rendering regressed.
-        let msgs: Vec<_> = err.errors.iter().map(|e| &e.message).collect();
-        assert!(
-            err.errors.iter().any(|e| e.message.contains("auto-tactic failed")),
-            "expected the auto-tactic-only failure (closer grew? flip to Ok!), got: {:?}",
-            msgs,
-        );
-        assert!(
-            !err.errors.iter().any(|e| {
-                e.message.contains("ismatch")
-                    || e.message.contains("Invalid field")
-                    // Anchored forms only — the message embeds the whole
-                    // goal text, so a bare "unexpected" could false-trip
-                    // on hypothesis/identifier names.
-                    || e.message.contains("unexpected token")
-                    || e.message.contains("unexpected identifier")
-            }),
-            "RENDERING REGRESSION — ill-typed artifact is back: {:?}",
-            msgs,
-        );
-    }
+    } => Ok(())
+    // 2026-07-18: FLIPPED to Ok, exactly as the note above prescribed
+    // ("flip to Ok when a … closer rung covers extensionality").
+    // Two-part fix (BUG-vecfield-clone-ensures.md + probe-vecfield-clone/):
+    // (1) vstd gained `vec_clone_view_eq_u8` (broadcast, PROVED not
+    // assumed — u8's clone spec + seq ext) because the Lean backend
+    // axiomatizes `strictly_cloned`'s call_ensures body and cannot
+    // derive pointwise equality the way Z3 does; (2) the derived
+    // closer gained equation-ELIMINATOR arms — for broadcast lemmas
+    // whose signature-derived conclusion is a non-Prop equation,
+    // last-resort `apply <lemma> <;> legs` in both orientations.
 }
 
 // ── B5a regression (DESIGN-B5-typed-spine-calls.md): a spec-fn CALL
