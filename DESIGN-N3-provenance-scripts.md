@@ -1,6 +1,17 @@
 # DESIGN — N3: Provenance-Driven Proof Scripts
 
 **Status:** DRAFT v0.1 (2026-07-19), for iteration with Danielle.
+**M0 LANDED (2026-07-19):** provenance completion + census harness.
+`Other` split into `Requires/HoistEq/CtorEq/LoopInv/AssertFact/
+AssumeFact` (+ `LoopPhase`); CallFactInfo carries the coarse ensures
+shape summary (form D's input); every emitted theorem carries the
+fixed-format `-- tactus-closer: <class>` comment (s1-omega /
+rung-only / rung:formB / rung:formE / rung:formB+formE / user);
+the N4 summary line prints unconditionally at crate end (algebra:
+0 s1 / 3 formB / 806 formE / 28 formB+formE / 37 rung-only / 0 user).
+Link-discharge's sidecar parser falls unknown tags through to Other
+— no consumer change needed. Requires marked by binder POSITION
+(`req_binder_start`), never by name-sniffing.
 **M1 LANDED (2026-07-19):** form E (two-phase) + UnfoldOnce (form B)
 rung arms — tactus-algebra 205 → 177 failing obligations, 85 → 87
 verified fns, zero fn-level regressions; rust_verify_test 138/140

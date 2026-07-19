@@ -40,6 +40,7 @@ pub use generate::{
     check_exec_fn, check_package, check_proof_fn, emit_exec_fn, emit_proof_fn,
     prime_lean_driver, sourcemap_path, PrimeJob,
     CheckResult, DiagLocation, EmitOutput, PackageGateReport, TactusDiag,
+    closer_census_report,
 };
 pub use to_lean_fn::LeanSourceMap;
 pub use sourcemap::{Sidecar, SidecarFn};

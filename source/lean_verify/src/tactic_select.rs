@@ -273,6 +273,7 @@ pub(crate) fn derived_closer(
     user_prefix: bool,
     eliminators: &[String],
     broadcast_count: usize,
+    census: Option<&mut crate::lean_ast::CloserCensus>,
 ) -> String {
     // Which `rfl` the kernel ladder gets is DERIVED from the goal's
     // core shape (after peeling the ∀/let/→ spine):
@@ -340,6 +341,7 @@ pub(crate) fn derived_closer(
         "if_true, if_false, reduceIte, reduceCtorEq, Nat.succ_ne_zero, Nat.add_one, Nat.zero_add, Nat.add_zero{}",
         bc_exclusions
     );
+    let form_b_fires = recursive_lhs_head(uo_core, dts).is_some();
     let unfold_once_arm: String = match recursive_lhs_head(uo_core, dts) {
         None => String::new(),
         Some(f) => format!(
@@ -360,6 +362,7 @@ pub(crate) fn derived_closer(
     // never sees the ite guards hidden inside unfolded spec fns.
     // (Phase 1 closing the goal outright is fine: the `first|`
     // succeeds vacuously on zero goals.)
+    let mut form_e_fires = false;
     let form_e_arm: String = {
         let scan = run_structural_scan(goal, dts, binders);
         let mut unfolds: Vec<String> = scan.unfolds.iter().cloned().collect();
@@ -370,12 +373,23 @@ pub(crate) fn derived_closer(
         if unfolds.is_empty() {
             String::new()
         } else {
+            form_e_fires = true;
             format!(
                 " | (simp_all only [{}]; first | omega | (split <;> simp_all <;> omega) | (split <;> simp_all))",
                 unfolds.join(", ")
             )
         }
     };
+    // N3-M0 census: which M1 arms the author attached (the S1/derived
+    // choice is made by the caller; the script classes land in M2).
+    if let Some(c) = census {
+        *c = match (form_b_fires, form_e_fires) {
+            (true, true) => crate::lean_ast::CloserCensus::RungFormBE,
+            (true, false) => crate::lean_ast::CloserCensus::RungFormB,
+            (false, true) => crate::lean_ast::CloserCensus::RungFormE,
+            (false, false) => crate::lean_ast::CloserCensus::RungOnly,
+        };
+    }
     // Equation-eliminator arms, LAST in the chain: for each broadcast
     // lemma whose conclusion is a non-Prop equation (derived from
     // signatures at emit time — see the emitter's `eliminators`

@@ -219,7 +219,7 @@ fn derived_closer_is_search_free_and_census_exact() {
     // no search tactic named, kernel rungs + generated intro/refine
     // prefix + fixed CORE set + omega tail.
     let goal = bin(BinOp::Eq, var("x"), var("y"));
-    let derived = derived_closer(&goal, &Default::default(), &[], false, &[], 0);
+    let derived = derived_closer(&goal, &Default::default(), &[], false, &[], 0, None);
     assert!(!derived.contains("tactus_auto"));
     assert!(!derived.contains("case_split"));
     assert!(!derived.contains("tactus_first"));
@@ -236,7 +236,7 @@ fn derived_closer_is_search_free_and_census_exact() {
     // the leaf ladder.
     assert!(derived.contains("first | rfl | decide | omega"));
     let goal_le = bin(BinOp::Le, var("x"), var("y"));
-    let derived_le = derived_closer(&goal_le, &Default::default(), &[], false, &[], 0);
+    let derived_le = derived_closer(&goal_le, &Default::default(), &[], false, &[], 0, None);
     assert!(derived_le.starts_with("first | with_reducible rfl | decide | omega | ("));
     // The CORE set is the census union + extensions: 51 lemmas (50 separators).
     assert_eq!(CORE_LEMMAS.matches(", ").count(), 50);
@@ -264,7 +264,7 @@ fn unfold_once_arm_for_recursive_lhs_head() {
         recursive_spec_fns: ["lib.poly.pmul".to_string()].into_iter().collect(),
         ..Default::default()
     };
-    let derived = derived_closer(&goal, &dts, &[], false, &[], 0);
+    let derived = derived_closer(&goal, &dts, &[], false, &[], 0, None);
     assert!(derived.contains("rw [lib.poly.pmul]"), "{derived}");
     assert!(derived.contains("simp_all only [if_true, if_false, reduceIte, reduceCtorEq, Nat.succ_ne_zero"), "{derived}");
     // The arm is one measured step followed by kernel/ladder closes.
@@ -287,7 +287,7 @@ fn no_unfold_once_arm_for_nonrecursive_or_rhs_heads() {
         app("lib.poly.coeff", vec![var("p"), var("i")]),
         var("z"),
     );
-    let derived = derived_closer(&goal_coeff, &dts, &[], false, &[], 0);
+    let derived = derived_closer(&goal_coeff, &dts, &[], false, &[], 0, None);
     assert!(!derived.contains("rw ["), "{derived}");
     // Recursive fn present but only on the RHS: no rw arm (first-match
     // discipline keeps the rewrite to exactly the LHS head).
@@ -296,7 +296,7 @@ fn no_unfold_once_arm_for_nonrecursive_or_rhs_heads() {
         var("z"),
         app("lib.poly.pmul", vec![var("p"), var("q")]),
     );
-    let derived = derived_closer(&goal_rhs, &dts, &[], false, &[], 0);
+    let derived = derived_closer(&goal_rhs, &dts, &[], false, &[], 0, None);
     assert!(!derived.contains("rw ["), "{derived}");
 }
 
@@ -337,7 +337,7 @@ fn unfold_once_arm_looks_through_n1_let_wrapper() {
         recursive_spec_fns: ["lib.poly.pmul".to_string()].into_iter().collect(),
         ..Default::default()
     };
-    let derived = derived_closer(&goal, &dts, &[], false, &[], 2);
+    let derived = derived_closer(&goal, &dts, &[], false, &[], 2, None);
     assert!(derived.contains("intro t; subst t; rw [lib.poly.pmul]"), "{derived}");
     // The wrapper is never intro'd BEFORE the rw in the UnfoldOnce arm
     // (the structural rung's own `intro t tmp` is its own business —
@@ -371,13 +371,13 @@ fn form_e_arm_is_two_phase() {
         spec_fns: ["lib.poly.coeff".to_string()].into_iter().collect(),
         ..Default::default()
     };
-    let derived = derived_closer(&goal, &dts, &[], false, &[], 0);
+    let derived = derived_closer(&goal, &dts, &[], false, &[], 0, None);
     assert!(
         derived.contains(" | (simp_all only [lib.poly.coeff]; first | omega | (split <;> simp_all <;> omega) | (split <;> simp_all))"),
         "{derived}"
     );
     // No goal-mentioned unfolds → no form E arm at all.
-    let bare = derived_closer(&bin(BinOp::Eq, var("x"), var("y")), &Default::default(), &[], false, &[], 0);
+    let bare = derived_closer(&bin(BinOp::Eq, var("x"), var("y")), &Default::default(), &[], false, &[], 0, None);
     assert!(!bare.contains("split"), "{bare}");
 }
 
@@ -461,3 +461,39 @@ fn peel_mixed_wrappers() {
     );
 }
 
+
+#[test]
+fn census_marks_which_arms_fired() {
+    // N3-M0 census (DESIGN-N3 §8): derived_closer records which M1
+    // arms it attached, via the out-param.
+    let app = |f: &str, args: Vec<Expr>| Expr::new(ExprNode::App {
+        head: Box::new(var(f)),
+        args,
+    });
+    let dts = DtDefInventory {
+        spec_fns: ["lib.poly.coeff".to_string()].into_iter().collect(),
+        recursive_spec_fns: ["lib.poly.pmul".to_string()].into_iter().collect(),
+        ..Default::default()
+    };
+    // Recursive-LHS head + a goal-mentioned spec fn → both arms.
+    let goal = bin(
+        BinOp::Eq,
+        app("lib.poly.pmul", vec![var("p"), var("q")]),
+        app("lib.poly.coeff", vec![var("s"), var("i")]),
+    );
+    let mut c = crate::lean_ast::CloserCensus::RungOnly;
+    derived_closer(&goal, &dts, &[], false, &[], 0, Some(&mut c));
+    assert_eq!(c, crate::lean_ast::CloserCensus::RungFormBE);
+    // No recursive head → form E only.
+    let goal2 = bin(BinOp::Eq, app("lib.poly.coeff", vec![var("p"), var("i")]), var("z"));
+    let mut c = crate::lean_ast::CloserCensus::RungOnly;
+    derived_closer(&goal2, &dts, &[], false, &[], 0, Some(&mut c));
+    assert_eq!(c, crate::lean_ast::CloserCensus::RungFormE);
+    // Bare goal → plain rung.
+    let mut c = crate::lean_ast::CloserCensus::RungFormB;
+    derived_closer(&bin(BinOp::Eq, var("x"), var("y")), &dts, &[], false, &[], 0, Some(&mut c));
+    assert_eq!(c, crate::lean_ast::CloserCensus::RungOnly);
+    // The artifact comment spellings are the fixed N4 format.
+    assert_eq!(crate::lean_ast::CloserCensus::RungFormBE.as_str(), "rung:formB+formE");
+    assert_eq!(crate::lean_ast::CloserCensus::S1Omega.as_str(), "s1-omega");
+}
