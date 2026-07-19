@@ -928,6 +928,24 @@ one part per source module, SCC-merged; umbrella = interface)", header)));
     };
     let mut breaking: std::collections::HashSet<String> = Default::default();
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    // Decision pass (serial, no lean runs): render, compare manifests,
+    // decide which files need building, and propagate `breaking`
+    // exactly as the old build-in-order loop did — own_superset is a
+    // pure manifest comparison, independent of the lean run itself.
+    struct PartBuild {
+        name: String,
+        rendered_text: String,
+        lean_path: std::path::PathBuf,
+        olean_path: std::path::PathBuf,
+        /// Written only AFTER a successful build: a fresh manifest
+        /// over a stale olean would let consumers treat the old build
+        /// as a pure append and skip re-elaboration.
+        manifest_path: std::path::PathBuf,
+        manifest_text: String,
+        level: usize,
+    }
+    let mut to_build: Vec<PartBuild> = Vec::new();
+    let mut build_level: std::collections::HashMap<String, usize> = Default::default();
     for (name, cmds, imports) in &files {
         let rendered = crate::lean_pp::pp_commands(cmds);
         let lean_path = dir.join(format!("{}.lean", name));
@@ -953,14 +971,78 @@ one part per source module, SCC-merged; umbrella = interface)", header)));
         let old_manifest: Option<Vec<u64>> = std::fs::read_to_string(&manifest_path)
             .ok()
             .map(|t| t.lines().filter_map(|l| u64::from_str_radix(l, 16).ok()).collect());
-        build_olean(dir, name, &rendered.text, &olean_path, &lean_path)
-            .map_err(|e| format!("defs part `{}`: {}", name, e))?;
-        write_manifest()?;
+        // Level = 1 + deepest import that is itself being rebuilt this
+        // run (imports satisfied by an existing olean don't order us).
+        let level = imports.iter()
+            .filter_map(|i| build_level.get(i))
+            .max()
+            .map(|l| l + 1)
+            .unwrap_or(0);
+        build_level.insert(name.clone(), level);
+        to_build.push(PartBuild {
+            name: name.clone(),
+            rendered_text: rendered.text,
+            lean_path,
+            olean_path,
+            manifest_path,
+            manifest_text: new_manifest.iter()
+                .map(|h| format!("{:016x}\n", h)).collect(),
+            level,
+        });
         let own_superset = old_manifest
             .map(|o| is_subsequence(&o, &new_manifest))
             .unwrap_or(false); // no manifest = first build = breaking
         if import_breaking || !own_superset {
             breaking.insert(name.clone());
+        }
+    }
+    // Build pass: level-parallel over the dependency DAG (the old loop
+    // was fully serial — 107 parts × ~0.9s = ~95s of gt's lean phase).
+    // Files within a level are independent by construction.
+    if !to_build.is_empty() {
+        let jobs = std::env::var("TACTUS_DEFS_BUILD_JOBS").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8)
+            })
+            .max(1);
+        let max_level = to_build.iter().map(|p| p.level).max().unwrap_or(0);
+        for lvl in 0..=max_level {
+            let level_parts: Vec<&PartBuild> =
+                to_build.iter().filter(|p| p.level == lvl).collect();
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let errors: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            std::thread::scope(|scope| {
+                for _ in 0..jobs.min(level_parts.len()) {
+                    let level_parts = &level_parts;
+                    let next = &next;
+                    let errors = &errors;
+                    scope.spawn(move || loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(p) = level_parts.get(i) else { break };
+                        match build_olean(
+                            dir, &p.name, &p.rendered_text, &p.olean_path, &p.lean_path,
+                        ) {
+                            Ok(()) => {
+                                if let Err(e) =
+                                    std::fs::write(&p.manifest_path, &p.manifest_text)
+                                {
+                                    errors.lock().unwrap().push(format!(
+                                        "defs part `{}` manifest: {}", p.name, e));
+                                }
+                            }
+                            Err(e) => {
+                                errors.lock().unwrap()
+                                    .push(format!("defs part `{}`: {}", p.name, e));
+                            }
+                        }
+                    });
+                }
+            });
+            let errs = errors.into_inner().unwrap();
+            if let Some(e) = errs.into_iter().next() {
+                return Err(e);
+            }
         }
     }
     Ok(CrateDefs {
@@ -983,7 +1065,9 @@ fn build_olean(
     let prelude_dir = crate::prelude::ensure_prelude_olean()?;
     // cwd = a build subdir so `lean -o` derives the module name from
     // the bare file name (it refuses sources outside its root dir).
-    let build = dir.join(format!("build-{}", std::process::id()));
+    // Per-module (not just per-pid): parts build in parallel now, and
+    // the failure path removes the whole build dir.
+    let build = dir.join(format!("build-{}-{}", std::process::id(), module_name));
     std::fs::create_dir_all(&build).map_err(|e| e.to_string())?;
     let src_name = format!("{}.lean", module_name);
     let out_name = format!("{}.olean", module_name);
