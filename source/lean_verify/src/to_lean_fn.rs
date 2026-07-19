@@ -219,6 +219,14 @@ pub(crate) fn register_suffix_mono_name(name: String) {
 /// the gt gate + tutorial + e2e termination tests (the F2b/F2c pins).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecreasingKind {
+    /// No usable evidence: the body contains RAW user tactic text the
+    /// signal walker cannot read (inline-proof fns — `have _ih :=
+    /// mod_rec b (a % b)` lives in a string), or no signal fired and
+    /// the measure is not arithmetic-shaped (deref-wrapped structural
+    /// args give the walker nothing). Emits the proven general ladder
+    /// (the pre-mainline-10 static chain) rather than gambling that
+    /// bare omega covers an unknown shape.
+    Ladder,
     Chaining,
     SeqSubrange,
     SeqDropFirst,
@@ -240,6 +248,12 @@ struct DecSignals {
     mod_: bool,
     ctor: bool,
     has_if: bool,
+    /// Add/Sub arithmetic in a self-call arg (`f (n - 1)`): positive
+    /// evidence the measure descends arithmetically — bare `omega`
+    /// suffices. Distinguishes true Linear cases from the NO-evidence
+    /// ones (opaque bodies, deref-shaped args), which get the general
+    /// ladder instead of gambling on omega.
+    arith: bool,
 }
 
 impl DecSignals {
@@ -252,6 +266,7 @@ impl DecSignals {
         self.mod_ |= other.mod_;
         self.ctor |= other.ctor;
         self.has_if |= other.has_if;
+            self.arith |= other.arith;
     }
 }
 
@@ -372,6 +387,11 @@ fn collect_arg_signals(
             collect_arg_signals(lhs, out, suffix_ctx, lets);
             collect_arg_signals(rhs, out, suffix_ctx, lets);
         }
+        ExprNode::BinOp { op: BinOp::Add | BinOp::Sub, lhs, rhs } => {
+            out.arith = true;
+            collect_arg_signals(lhs, out, suffix_ctx, lets);
+            collect_arg_signals(rhs, out, suffix_ctx, lets);
+        }
         _ => {
             if matches!(&e.node, ExprNode::If { .. } | ExprNode::Match { .. }) {
                 out.has_if = true;
@@ -395,6 +415,9 @@ fn has_if_shape(e: &LExpr) -> bool {
 }
 
 fn decreasing_kind(measure: &LExpr, self_name: &str, body: &LExpr, have_monos: bool) -> DecreasingKind {
+    if contains_raw(body) {
+        return DecreasingKind::Ladder;
+    }
     let mut sig = DecSignals::default();
     collect_self_call_signals(body, self_name, &std::collections::HashMap::new(), &mut sig);
     if sig.nested_suffix && have_monos {
@@ -421,7 +444,37 @@ fn decreasing_kind(measure: &LExpr, self_name: &str, body: &LExpr, have_monos: b
     if sig.has_if || has_if_shape(measure) {
         return DecreasingKind::Split;
     }
-    DecreasingKind::Linear
+    if sig.arith || measure_is_arith_shaped(measure) {
+        return DecreasingKind::Linear;
+    }
+    DecreasingKind::Ladder
+}
+
+/// Body contains a raw-text node (`Raw` / `ByBlock`) the signal
+/// walker cannot see into — inline user proofs.
+fn contains_raw(e: &LExpr) -> bool {
+    if matches!(&e.node, ExprNode::Raw(_) | ExprNode::ByBlock { .. }) {
+        return true;
+    }
+    let mut found = false;
+    e.for_each_child(|c| {
+        if contains_raw(c) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Measure is itself an arithmetic expression (`a + b`, literals) —
+/// bare omega is justified even with no self-call signals.
+fn measure_is_arith_shaped(e: &LExpr) -> bool {
+    matches!(
+        &e.node,
+        ExprNode::BinOp {
+            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
+            ..
+        } | ExprNode::Lit(_)
+    )
 }
 
 fn decreasing_by_tactic(measure: &LExpr, self_name: &str, body: &LExpr) -> String {
@@ -467,6 +520,31 @@ fn decreasing_by_tactic(measure: &LExpr, self_name: &str, body: &LExpr) -> Strin
         DecreasingKind::Split => "all_goals ((repeat split) <;> omega)".to_string(),
         DecreasingKind::Structural => "all_goals decreasing_tactic".to_string(),
         DecreasingKind::Linear => "all_goals omega".to_string(),
+        // The pre-mainline-10 static chain, verbatim — proven against
+        // the full suite for months. Selected only when the dispatch
+        // has NO evidence (see DecreasingKind::Ladder).
+        DecreasingKind::Ladder => {
+            let chain_rung = SUFFIX_MONO_NAMES.with(|s| {
+                let monos = s.borrow();
+                if monos.is_empty() {
+                    String::new()
+                } else {
+                    let applies: String = monos.iter()
+                        .map(|m| format!("apply {} | ", m))
+                        .collect();
+                    format!(
+                        " | (apply Nat.lt_of_le_of_lt <;> (first | {applies}(apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))))",
+                        df = q("Seq.drop_first_len_lt"),
+                    )
+                }
+            });
+            format!(
+                "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Nat.div_lt_self <;> (simp_all <;> omega)) | (apply {ds} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | (apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | (apply {dl} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | ((repeat split) <;> omega){chain_rung} | decreasing_tactic)",
+                ds = q("Seq.subrange_tail_len_lt"),
+                df = q("Seq.drop_first_len_lt"),
+                dl = q("Seq.drop_last_len_lt"),
+            )
+        }
     }
 }
 

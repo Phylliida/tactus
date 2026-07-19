@@ -243,6 +243,32 @@ fn dec_classifies_let_bound_drop_first() {
     ), DecreasingKind::SeqDropFirst);
 }
 
+/// Inline-proof fns hide their self-calls in RAW tactic text the
+/// walker can't read (`have _ih := mod_rec b (a % b)`) — no evidence,
+/// so the general ladder (test_proof_fn_recursive_mod_decreases
+/// regression from the mainline-10 merge).
+#[test]
+fn dec_classifies_raw_body_as_ladder() {
+    let body = LExpr::new(ExprNode::ByBlock { tactic: "have _ih := mod_rec b (a % b)\nomega".into() });
+    assert_eq!(decreasing_kind(&dec_var("b"), "test_crate.mod_rec", &body, false), DecreasingKind::Ladder);
+}
+
+/// Deref-wrapped structural args (`f a.deref`, Box fields) give the
+/// walker no signal and the measure is a bare var — general ladder,
+/// whose decreasing_tactic arm closes the sizeOf goal
+/// (test_spec_let_box_use_derefs regression from the mainline-10 merge).
+#[test]
+fn dec_classifies_deref_arg_as_ladder() {
+    let body = dec_app(
+        dec_var("test_crate.f"),
+        vec![LExpr::new(ExprNode::FieldProj {
+            expr: Box::new(dec_var("a")),
+            field: "deref".into(),
+        })],
+    );
+    assert_eq!(decreasing_kind(&dec_var("t"), "test_crate.f", &body, false), DecreasingKind::Ladder);
+}
+
 /// Self-calls inside let VALUES are seen:
 /// `let rc := f (drop_first w) n` is a drop_first measure
 /// (britton.stable_letter_count regression).
