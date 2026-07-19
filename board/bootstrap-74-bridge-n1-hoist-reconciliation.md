@@ -226,3 +226,39 @@ REMAINING (precise map, in order):
 5. Then slice 2 (serializer): _h_hoist_i naming, FLetH classification
    (type_map + non-Bool), Call-post/RetBind conversion, deepener
    follow-up. Gate ALWAYS with --lean-all-proofs.
+
+### Slice 1b COMPLETE (2026-07-20): 182/0, package gate green
+
+Proof layer landed across two commits (`3918809` green, `+` discharge
+recovery). Final architecture:
+- One-step pins are MODE-LEVEL (u_cew/u_ceh, u_csew/u_cseh,
+  u_csow/u_csoh + u_gate_* + dispatch pins); dispatcher-level cons
+  unfolds are FALSE across mode boundaries and were removed.
+- Dispatch pins are REQUIRES-FREE (`gate == 1 ==> ...` in ensures) —
+  requires-carrying pins under `if` emit branch-guarded precondition
+  VCs the Link discharge cannot compose; implication form keeps every
+  caller straight-line, and the three dispatchers call BOTH mode
+  chains unconditionally.
+- Closer recipes that worked: dispatch pins `simp_all
+  [lib.close_sem_e]` (namespaced! bare name = unknown identifier);
+  dispatchers `by_cases _hgate : lib.has_plain_flet f = 1 <;>
+  simp_all (config := { zetaDelta := true })` (case the GATE not the
+  datatype; zetaDelta bridges Verus tmp__N lets).
+- has_plain_flet is NAT-valued (bool spec fn gates emit
+  Classical.propDecidable ites that stick `decide` — the file's
+  has_let idiom).
+- prophecy/gates/isolates corollaries are now STRUCTURAL pins (pin
+  placement visible in the goal shape; discriminators preserved as
+  shape differences); forwards_contract semantic with the honest
+  hoisted ∀-reading.
+- Fixtures: only let-free-frame goals changed (Imp→All(0,·));
+  wrap-forced fixtures (any plain FLet in scope) byte-identical.
+
+Link discharge: 102 closed / 4 pending — residual = the structural
+pins' own emitted proofs hoist tmp__N/let equation hyps with
+census-Other provenance (DESIGN-leaf-normal-emission §5 Q1, known
+open; emitter-side). Went 69/0 → 92/14 → 102/4; the wp_stm_sound
+cascade is fully discharged.
+
+NEXT = slice 2 (serializer): _h_hoist_i naming, FLetH classification,
+Call-post/RetBind conversion, deepener; then fixtures/certs bridge.
