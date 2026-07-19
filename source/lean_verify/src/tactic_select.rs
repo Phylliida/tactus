@@ -95,8 +95,21 @@ pub(crate) fn render_peel(goal: &Expr, leaf: &str) -> String {
             out.push(render_peel(body, leaf));
             out.join("; ")
         }
-        ExprNode::Let { body, .. } => {
-            format!("intro _; {}", render_peel(body, leaf))
+        ExprNode::Let { name, body, .. } => {
+            // A goal-position `let` must be ZETA-REDUCED, not merely
+            // intro'd: `intro _` produces a context let-var that omega
+            // treats as an OPAQUE atom (it never unfolds context let
+            // bindings), so `0 ≤ tmp__1 * (i+1)` stays disconnected from
+            // the `result ≤ …` hypotheses (factorial 154:18 failure).
+            // `intro <name>; subst <name>` substitutes the value through
+            // the goal — the kernel leaf (and omega's own arithmetic)
+            // then see the real expression.
+            format!(
+                "intro {}; subst {}; {}",
+                name.as_str(),
+                name.as_str(),
+                render_peel(body, leaf)
+            )
         }
         ExprNode::BinOp { op: BinOp::Implies, lhs, rhs } => {
             format!("intro {}; {}", conj_pattern(lhs), render_peel(rhs, leaf))

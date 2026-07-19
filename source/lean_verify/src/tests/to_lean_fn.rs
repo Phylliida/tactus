@@ -124,3 +124,157 @@ fn helper_hyp_binder_uses_short_name_and_stmt_type() {
         Some("helper".to_string()));
     assert_eq!(crate::lean_pp::pp_expr(&b.ty), "word.helper_stmt");
 }
+
+// ── mainline-10: per-measure decreasing dispatch ─────────────────────
+
+fn dec_var(s: &str) -> LExpr {
+    LExpr::new(ExprNode::Var(crate::lean_name::LeanName::lit(s)))
+}
+fn dec_app(head: LExpr, args: Vec<LExpr>) -> LExpr {
+    LExpr::new(ExprNode::App { head: Box::new(head), args })
+}
+fn dec_bin(op: BinOp, l: LExpr, r: LExpr) -> LExpr {
+    LExpr::new(ExprNode::BinOp { op, lhs: Box::new(l), rhs: Box::new(r) })
+}
+
+/// The recursive fn `test_crate.f` calling itself with `n - 1` is a
+/// LINEAR measure → omega.
+#[test]
+fn dec_classifies_linear_measure() {
+    let body = dec_app(dec_var("test_crate.f"), vec![dec_bin(BinOp::Sub, dec_var("n"), dec_var("1"))]);
+    assert_eq!(decreasing_kind(&dec_var("n"), "test_crate.f", &body, false), DecreasingKind::Linear);
+}
+
+/// `gcd a (b % a)` in the self-call → the mod rung.
+#[test]
+fn dec_classifies_modular_measure() {
+    let body = dec_app(
+        dec_var("test_crate.gcd"),
+        vec![dec_var("a"), dec_bin(BinOp::Mod, dec_var("b"), dec_var("a"))],
+    );
+    assert_eq!(decreasing_kind(&dec_var("b"), "test_crate.gcd", &body, false), DecreasingKind::Modular);
+}
+
+/// `f (a / 2)` in the self-call → the div rung.
+#[test]
+fn dec_classifies_div_measure() {
+    let body = dec_app(dec_var("test_crate.f"), vec![dec_bin(BinOp::Div, dec_var("a"), dec_var("2"))]);
+    assert_eq!(decreasing_kind(&dec_var("a"), "test_crate.f", &body, false), DecreasingKind::Div);
+}
+
+/// `f (Seq.subrange w 1 (Seq.len w))` → the subrange companion rung.
+#[test]
+fn dec_classifies_subrange_measure() {
+    let body = dec_app(
+        dec_var("test_crate.f"),
+        vec![dec_app(dec_var("lib.seq.Seq.subrange"), vec![dec_var("w"), dec_var("1"), dec_var("n")])],
+    );
+    assert_eq!(decreasing_kind(&dec_var("w"), "test_crate.f", &body, false), DecreasingKind::SeqSubrange);
+}
+
+/// `f (Seq.len (drop_base_run (Seq.drop_first W)))` with monos → chaining.
+#[test]
+fn dec_classifies_nested_suffix_chaining() {
+    let body = dec_app(
+        dec_var("test_crate.f"),
+        vec![dec_app(
+            dec_var("lib.seq.Seq.len"),
+            vec![dec_var("T"),
+                 dec_app(dec_var("lib.m.drop_base_run"),
+                         vec![dec_var("T"),
+                              dec_app(dec_var("lib.seq.Seq.drop_first"), vec![dec_var("T"), dec_var("W")])])],
+        )],
+    );
+    assert_eq!(decreasing_kind(&dec_var("W"), "test_crate.f", &body, true), DecreasingKind::Chaining);
+    // …but without registered monos the same shape degrades to drop_first.
+    assert_eq!(decreasing_kind(&dec_var("W"), "test_crate.f", &body, false), DecreasingKind::SeqDropFirst);
+}
+
+/// Constructor-shaped self-call arg → structural (Lean's default).
+#[test]
+fn dec_classifies_structural_measure() {
+    let body = dec_app(
+        dec_var("test_crate.f"),
+        vec![dec_app(dec_var("lib.symbol.Symbol.Gen"), vec![dec_var("i")])],
+    );
+    assert_eq!(decreasing_kind(&dec_var("s"), "test_crate.f", &body, false), DecreasingKind::Structural);
+}
+
+/// An If in the measure (Int-abs shape) → the split rung.
+#[test]
+fn dec_classifies_int_if_measure() {
+    let measure = LExpr::new(ExprNode::If {
+        cond: Box::new(dec_bin(BinOp::Le, dec_var("0"), dec_var("t"))),
+        then_: Box::new(dec_var("t")),
+        else_: Some(Box::new(LExpr::new(ExprNode::UnOp { op: crate::lean_ast::UnOp::Neg, arg: Box::new(dec_var("t")) }))),
+    });
+    let body = dec_app(dec_var("test_crate.f"), vec![dec_bin(BinOp::Sub, dec_var("t"), dec_var("1"))]);
+    assert_eq!(decreasing_kind(&measure, "test_crate.f", &body, false), DecreasingKind::Split);
+}
+
+/// The dispatch emits ONE rung, never a `first`-chain.
+#[test]
+fn dec_emitted_text_has_no_outer_first() {
+    let body = dec_app(dec_var("test_crate.f"), vec![dec_bin(BinOp::Mod, dec_var("b"), dec_var("a"))]);
+    let text = decreasing_by_tactic(&dec_var("b"), "test_crate.f", &body);
+    assert!(!text.starts_with("all_goals (first"));
+    assert!(text.contains("Nat.mod_lt"));
+}
+
+/// Let-bound self-call args carry their value's signals:
+/// `let rest := drop_first w; f data rest …` is a drop_first measure
+/// (britton_via_tower.translate_word_at regression).
+#[test]
+fn dec_classifies_let_bound_drop_first() {
+    // let rest := Seq.drop_first T w; test_crate.f data rest (base + 1)
+    let body = LExpr::new(ExprNode::Let {
+        name: crate::lean_name::LeanName::lit("rest"),
+        value: Box::new(dec_app(dec_var("lib.seq.Seq.drop_first"), vec![dec_var("T"), dec_var("w")])),
+        body: Box::new(dec_app(
+            dec_var("test_crate.f"),
+            vec![dec_var("data"), dec_var("rest"), dec_bin(BinOp::Add, dec_var("base"), dec_var("1"))],
+        )),
+    });
+    assert_eq!(
+        decreasing_kind(&dec_app(dec_var("lib.seq.Seq.len"), vec![dec_var("T"), dec_var("w")])),
+        "test_crate.f",
+        &body,
+        false
+    ), DecreasingKind::SeqDropFirst);
+}
+
+/// Self-calls inside let VALUES are seen:
+/// `let rc := f (drop_first w) n` is a drop_first measure
+/// (britton.stable_letter_count regression).
+#[test]
+fn dec_classifies_self_call_in_let_value() {
+    // if len w = 0 then 0 else let rc := test_crate.f (Seq.drop_first T w) n; rc
+    let body = LExpr::new(ExprNode::If {
+        cond: Box::new(dec_bin(BinOp::Eq, dec_var("lenw"), dec_var("0"))),
+        then_: Box::new(dec_var("0")),
+        else_: Some(Box::new(LExpr::new(ExprNode::Let {
+            name: crate::lean_name::LeanName::lit("rc"),
+            value: Box::new(dec_app(
+                dec_var("test_crate.f"),
+                vec![dec_app(dec_var("lib.seq.Seq.drop_first"), vec![dec_var("T"), dec_var("w")]), dec_var("n")],
+            )),
+            body: Box::new(dec_var("rc")),
+        }))),
+    });
+    assert_eq!(decreasing_kind(&dec_var("w"), "test_crate.f", &body, false), DecreasingKind::SeqDropFirst);
+}
+
+/// Nested suffix behind a let-var: `let after := drop_first W;
+/// split_q (drop_base_run after)` → Chaining (m3_blinker.split_q).
+#[test]
+fn dec_classifies_nested_suffix_behind_let() {
+    let body = LExpr::new(ExprNode::Let {
+        name: crate::lean_name::LeanName::lit("after"),
+        value: Box::new(dec_app(dec_var("lib.seq.Seq.drop_first"), vec![dec_var("T"), dec_var("W")])),
+        body: Box::new(dec_app(
+            dec_var("test_crate.split_q"),
+            vec![dec_app(dec_var("test_crate.drop_base_run"), vec![dec_var("after")])],
+        )),
+    });
+    assert_eq!(decreasing_kind(&dec_var("W"), "test_crate.split_q", &body, true), DecreasingKind::Chaining);
+}
